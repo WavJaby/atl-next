@@ -36,6 +36,8 @@ type GlobalFlags struct {
 	Triple map[Side]string
 	// per bionic Side: rust/config's RustTriple, rustc's --target there (rust/compiler.go); its std is rustup's for that target (rust-toolchain.toml toolchain). Glibc sides compile for rustc's default host triple
 	RustTriple map[Side]string
+	// the cross host's link flags (HostCross.linkFlags) on every host link; nil when the host is the build machine
+	HostLink []string
 }
 
 // toolchainOS: the android.OsType identifier the side's toolchain factory is registered for (cc/config registerToolchainFactory); the host side is linux_glibc.
@@ -84,6 +86,34 @@ func toolchainLocation(f string) int {
 		return 1
 	}
 	return 0
+}
+
+// HostCross: the target of a host whose arch is not the build machine's (xtask native: the host row's clang, sysroot and isa). Zero = the build machine's own, no flags.
+// The distro clang compiles and links for any target it knows given --target and --sysroot (the sysroot's libraries, crt objects and GCC runtime dir are found under it). -march pins the ISA baseline: no V or Zbs reaches an object (readelf -A Tag_RISCV_arch).
+// No -fuse-ld here: Soong's lldflags give every host link -fuse-ld=lld already (readLldflags).
+type HostCross struct {
+	Target  string // clang --target
+	Sysroot string // the sysroot directory (a fetched sysroot_debs row)
+	ISA     string // -march
+}
+
+// set: the host is cross. main.go requires its three fields together.
+func (h HostCross) set() bool { return h != (HostCross{}) }
+
+// compileFlags: the target flags of every host compile, ahead of the Soong toolchain's (instruction set first, compiler.go).
+func (h HostCross) compileFlags() []string {
+	if !h.set() {
+		return nil
+	}
+	return []string{"--target=" + h.Target, "--sysroot=" + h.Sysroot, "-march=" + h.ISA}
+}
+
+// linkFlags: the target and sysroot of every host link. clang adds the sysroot's library and GCC runtime dirs itself (checked on riscv64: a link with no -L).
+func (h HostCross) linkFlags() []string {
+	if !h.set() {
+		return nil
+	}
+	return []string{"--target=" + h.Target, "--sysroot=" + h.Sysroot}
 }
 
 // common: the side's Global.CommonFlags for a module in dir.
@@ -290,6 +320,11 @@ func readGlobalFlags(tree string, cfg Config, dev DeviceArch) (GlobalFlags, erro
 			return g, err
 		}
 		g.Yasm[side] = strings.Fields(yasm)
+	}
+	// the cross host's target flags lead its compiles, ahead of the toolchain's (if it has one); its link flags go on every host link (HostLink)
+	if cfg.HostCross.set() {
+		g.Head[Host] = slices.Concat(cfg.HostCross.compileFlags(), g.Head[Host])
+		g.HostLink = cfg.HostCross.linkFlags()
 	}
 	if err := readRustTriples(tree, cfg, idents, archFields, g.RustTriple); err != nil {
 		return g, err

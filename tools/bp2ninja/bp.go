@@ -134,6 +134,8 @@ type Config struct {
 	NativeBridgeBits int
 	// the guest row's soong_arch_variant (Soong's TARGET_NATIVE_BRIDGE_ARCH_VARIANT); "" = Soong's baseline
 	NativeBridgeArchVariant string
+	// the cross host's target (xtask native, when the build machine is another arch: the host row's clang, sysroot, isa); zero = the build machine's own triple, no flags
+	HostCross HostCross
 }
 
 // Multilib is Soong's multilib name for the arch: `multilib: { lib32/lib64 }` blocks, cc_genrule's CC_MULTILIB.

@@ -91,15 +91,29 @@ func stlLinkFlags(sel string) []string {
 // libcxxProvider: the libc++ headers the compiler's own -stdlib=libc++ searches, the first directory named c++/v1 in its search list.
 // Derived from the compiler the build uses, so the headers are the ones its libc++ is installed with. The probe is a query (no output
 // kept, no build), the only place -stdlib=libc++ remains.
-func libcxxProvider(cxx string) (string, error) {
-	out, err := exec.Command(cxx, "-stdlib=libc++", "-x", "c++", "-E", "-v", "/dev/null").CombinedOutput()
+// cross: a cross host's target flags (HostCross.compileFlags); its headers must lie in its sysroot (libcxxInSysroot).
+func libcxxProvider(cxx string, cross HostCross) (string, error) {
+	args := append(append([]string{}, cross.compileFlags()...), "-stdlib=libc++", "-x", "c++", "-E", "-v", "/dev/null")
+	out, err := exec.Command(cxx, args...).CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("probing libc++ headers with %s: %v: %s", cxx, err, out)
 	}
-	if dir, ok := parseLibcxxSearch(string(out)); ok {
-		return dir, nil
+	dir, ok := parseLibcxxSearch(string(out))
+	if !ok {
+		return "", fmt.Errorf("%s -stdlib=libc++ searches no c++/v1 directory", cxx)
 	}
-	return "", fmt.Errorf("%s -stdlib=libc++ searches no c++/v1 directory", cxx)
+	if err := libcxxInSysroot(dir, cross); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// libcxxInSysroot: a cross host's libc++ headers come from its sysroot only. The distro's own install searches its include dir (LLVM's here, found beside the driver even with --sysroot), which is the build machine's libc++: a probe would return it and the target would compile against it.
+func libcxxInSysroot(dir string, cross HostCross) error {
+	if !cross.set() || strings.HasPrefix(dir, cross.Sysroot+"/") {
+		return nil
+	}
+	return fmt.Errorf("libc++ headers %s are not under the sysroot %s of %s: the target's libc++ is missing from its sysroot", dir, cross.Sysroot, cross.Target)
 }
 
 // parseLibcxxSearch: the first directory of the `#include <...>` search list in clang's -v output that is named c++/v1.

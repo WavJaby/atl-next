@@ -206,7 +206,7 @@ func TestLibcxxProviderIsCompilersHeaders(t *testing.T) {
 	if _, err := exec.LookPath(cxx); err != nil {
 		t.Skip(cxx + " not installed")
 	}
-	dir, err := libcxxProvider(cxx)
+	dir, err := libcxxProvider(cxx, HostCross{})
 	if err != nil {
 		t.Fatal(err)
 	}

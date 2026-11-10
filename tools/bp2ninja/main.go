@@ -68,11 +68,19 @@ func main() {
 	release := flag.String("release", "", "build/release config (TARGET_RELEASE): build flags and aconfig values (aconfig flag libraries; Java goals)")
 	measure := flag.Bool("measure", false, "write <out>/measure.txt (module types and source kinds the goals reach, measure.go) instead of a build")
 	cxxProbe := flag.String("device-cxx-flags", "", "tree dir: instead of a build, write <out>/compat (the libc provider from -provided) and print as JSON {argv, android} the C++ command line a device module there gets with nothing of its own, and the -D__ANDROID__ define in it (xtask check step libcxx); takes no goals")
-	libcxxHeaders := flag.Bool("libcxx-headers", false, "print the libc++ headers directory -cxx searches (stl.go libcxxProvider) and exit, for builds outside the converter that must compile C++ against the same libc++ (xtask upstream.rs); takes no other flag")
+	libcxxHeaders := flag.Bool("libcxx-headers", false, "print the libc++ headers directory -cxx searches (stl.go libcxxProvider) and exit, for builds outside the converter that must compile C++ against the same libc++ (xtask upstream.rs); takes -cxx and the -host-* flags too")
+	hostTarget := flag.String("host-target", "", "cross host (the build machine is another arch): the clang triple of the host's code (arches.toml clang); with -host-sysroot and -host-isa, all three or none")
+	hostSysroot := flag.String("host-sysroot", "", "cross host: the target's sysroot directory (a fetched sysroot_debs row, deps.toml)")
+	hostISA := flag.String("host-isa", "", "cross host: -march of the host's code (arches.toml isa)")
 	nbExports := flag.String("nb-exports", "", "module: instead of a build, print as JSON the include flags its -native-bridge variant hands dependents (exportsOf), for builds outside the converter that compile against bionic's headers (xtask runtimes: libc_headers); takes no goals")
 	flag.Parse()
+	cross := HostCross{Target: *hostTarget, Sysroot: *hostSysroot, ISA: *hostISA}
+	if cross.set() && (cross.Target == "" || cross.Sysroot == "" || cross.ISA == "") {
+		fmt.Fprintln(os.Stderr, "bp2ninja: -host-target, -host-sysroot and -host-isa go together")
+		os.Exit(2)
+	}
 	if *libcxxHeaders {
-		dir, err := libcxxProvider(*cxx)
+		dir, err := libcxxProvider(*cxx, cross)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "bp2ninja:", err)
 			os.Exit(1)
@@ -124,7 +132,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -native-bridge-arch-variant needs -native-bridge")
 		os.Exit(1)
 	}
-	cfg := Config{Arch: *arch, PointerBits: *bits, ArchVariant: *variant, ABI: *abi, NativeBridge: *nbArch, NativeBridgeBits: *nbBits, NativeBridgeArchVariant: *nbArchVariant}
+	cfg := Config{Arch: *arch, PointerBits: *bits, ArchVariant: *variant, ABI: *abi, NativeBridge: *nbArch, NativeBridgeBits: *nbBits, NativeBridgeArchVariant: *nbArchVariant, HostCross: cross}
 	// the probe compiles, links nothing: its libc provider may be headers only, so checkLibs does not apply
 	if *cxxProbe != "" {
 		if err := deviceCxxFlags(*tree, *out, cfg, provided, *cxx, *cxxProbe); err != nil {
@@ -190,7 +198,7 @@ func deviceCxxFlags(tree, out string, cfg Config, provided map[string]Provided, 
 		return err
 	}
 	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, nodes: map[key]*Node{}}
-	if g.libcxx, err = libcxxProvider(cxx); err != nil {
+	if g.libcxx, err = libcxxProvider(cxx, HostCross{}); err != nil {
 		return err
 	}
 	b, err := json.Marshal(struct {
@@ -223,7 +231,7 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	// not passed (toolchainLocation, keepFlag): reported on every run, so a change in what is dropped shows
 	fmt.Printf("bp2ninja: Soong global flags not passed (diagnostics, debug info, prebuilt toolchain location): %s\n", strings.Join(soong.Flags.Skipped, " "))
 	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, provided: provided, nbProvided: nbProvided, partial: partial, rustAndroid: rustAndroid, defines: defines, stand: stand, rtInclude: tools.RtInclude, bionicStaticRust: tools.BionicStaticRust, nodes: map[key]*Node{}}
-	if g.libcxx, err = libcxxProvider(tools.CXX); err != nil {
+	if g.libcxx, err = libcxxProvider(tools.CXX, cfg.HostCross); err != nil {
 		return err
 	}
 	// the release first: select(release_flag(…)) and the soong config variables it sets are evaluated with it
