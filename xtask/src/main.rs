@@ -81,6 +81,7 @@ mod qemu;
 mod qemu_gate;
 mod qemu_linker;
 mod qemu_spike;
+mod qemu_thread;
 mod remote;
 mod run_apk;
 mod runpath_gate;
@@ -331,6 +332,10 @@ enum Test {
     ///
     /// Builds first (as `xtask qemu --pic --execute`); needs the arm64 NB build (`xtask native --host x86_64 --native-bridge arm64 nb:libc nb:native_bridge_guest_linker nb:libnative_bridge_vdso nb:libnative_bridge_guest_libc nb:libdl nb:libm nb:ld-android`) and `--nb` pointing at its `<out>/nb/arm64`. Logs in `<out>/qemu/<target>-linux-user-pic/qemu-linker/`.
     QemuLinker(qemu_linker::Args),
+    /// The QEMU crossing's guest threads on the real arm64 NB images (QEMU bridge plan Q5-6): a guest `pthread_create` attaches its own engine CPU, the provider's foreach reaches a guest callback, a key destructor runs at thread exit; then each break must turn its run red.
+    ///
+    /// Builds first (as `xtask qemu --pic --execute`); needs the arm64 NB build (as `test qemu-linker`) and `--nb` pointing at its `<out>/nb/arm64`. Logs in `<out>/qemu/<target>-linux-user-pic/qemu-thread/`.
+    QemuThread(qemu_thread::Args),
     /// The identity native-bridge gates g1-g5 (x86_64 engine, no QEMU) with their `ATL_NB*` env taken from this checkout's out dir (`nb/x86_64`, the staged `app/`), not set by hand.
     ///
     /// Needs the x86_64 NB build and `xtask test app` (it stages `app/root` and `app/jni-fixture`). Logs in `<out>/nb-identity/`.
@@ -470,6 +475,9 @@ fn main() -> Result<ExitCode> {
             test: Test::QemuLinker(args),
         } => qemu_linker::run(&root, &args),
         Command::Test {
+            test: Test::QemuThread(args),
+        } => qemu_thread::run(&root, &args),
+        Command::Test {
             test: Test::NbIdentity(args),
         } => nb_identity::run(&root, &args),
     };
@@ -518,6 +526,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::Qemu(_) => "qemu-gate",
             Test::QemuSpike(_) => "qemu-spike",
             Test::QemuLinker(_) => "qemu-linker",
+            Test::QemuThread(_) => "qemu-thread",
             Test::NbIdentity(_) => "nb-identity",
         },
         _ => return None,

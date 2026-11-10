@@ -31,7 +31,7 @@ static NEXT: AtomicUsize = AtomicUsize::new(0);
 // one generated slot per binding: the pool and the table are sized by the same build-time count
 const _: () = assert!(std::mem::size_of::<pool::Pool>() == THUNKS * THUNK_BYTES);
 
-/// JNI table slots, as the x86 engine (`JNINativeInterface` has 233). The QEMU JNI stubs come with the JNI slice (Q5).
+/// JNI table slots, as the x86 engine (`JNINativeInterface` has 233). The QEMU JNI stubs come with the JNI slice (Q6).
 pub const JNI_STUBS: usize = crate::engine::bindings::JNI_STUBS;
 
 /// A guest-callable address that crosses to host function `target`: the address of a free pool slot, which the binding trap routes to `target`. None when the pool is used up.
@@ -44,9 +44,9 @@ pub fn bind(target: usize) -> Option<usize> {
     Some((&raw const pool::POOL) as usize + slot * THUNK_BYTES)
 }
 
-/// The guest-callable address of JNI table slot `slot`. Aborts until the QEMU JNI stubs land (Q5).
+/// The guest-callable address of JNI table slot `slot`. Aborts until the QEMU JNI stubs land (Q6).
 pub fn jni_stub(_slot: usize) -> usize {
-    unsupported("qemu crossing: JNI stubs land in Q5")
+    unsupported("qemu crossing: JNI stubs land in Q6")
 }
 
 /// The two instruction words at `addr`.

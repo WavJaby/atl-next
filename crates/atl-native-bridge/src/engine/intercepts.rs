@@ -44,11 +44,17 @@ extern "C" fn run(start: *mut c_void) -> *mut c_void {
     // SAFETY: the box `pthread_create` made for this thread.
     let Start { routine, arg } = *unsafe { Box::from_raw(start.cast::<Start>()) };
     let ht = thread::attach_current();
+    // deliberate break (`ATL_NB_BREAK=qt_routine_arg`): the routine gets the wrong argument (qemu-thread gate)
+    let arg = if cfg!(atl_nb_qt_routine_arg) {
+        arg + 1
+    } else {
+        arg
+    };
     // SAFETY: the guest's `void* (*)(void*)`, this thread's record.
     unsafe { call_guest(&mut *ht, routine, arg, 0, 0, 0) as *mut c_void }
 }
 
-/// `int pthread_key_create(pthread_key_t*, void (*)(void*))`: glibc's key without a destructor; the guest's is stored here and runs at thread exit (thread.rs `detach`). The store is the same under QEMU; a non-NULL value at exit traps there (plan O2, Q5).
+/// `int pthread_key_create(pthread_key_t*, void (*)(void*))`: glibc's key without a destructor; the guest's is stored here and runs at thread exit (thread.rs `detach`). The store is the same under QEMU; the destructor crosses on the exiting thread (thread.rs `detach`).
 pub(super) extern "C" fn pthread_key_create(key: *mut libc::pthread_key_t, dtor: usize) -> i32 {
     // SAFETY: `key` is the guest's, same ABI (gated above).
     let rc = unsafe { libc::pthread_key_create(key, None) };

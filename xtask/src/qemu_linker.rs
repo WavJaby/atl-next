@@ -30,11 +30,11 @@ const RUN_TIMEOUT_SECS: u32 = 240;
 const SKIP_RELOC: &str = "skip_reloc";
 
 /// One harness: its cargo test, the prefix and letters of its check lines, its breaks.
-struct Harness {
-    test: &'static str,
-    prefix: &'static str,
-    checks: &'static [char],
-    breaks: &'static [&'static str],
+pub(crate) struct Harness {
+    pub(crate) test: &'static str,
+    pub(crate) prefix: &'static str,
+    pub(crate) checks: &'static [char],
+    pub(crate) breaks: &'static [&'static str],
 }
 
 const HARNESSES: [Harness; 3] = [
@@ -195,7 +195,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 }
 
 /// `<TESTDATA>/<stem>.c` built for the guest by the NDK clang: `flags` before the source, `libs` after it, output `bin`.
-fn guest_build(
+pub(crate) fn guest_build(
     root: &Path,
     target: &NdkTarget,
     stem: &str,
@@ -252,7 +252,7 @@ fn skip_relative(so: &Path, out: &Path) -> Result<()> {
 }
 
 /// One harness run: plain (every check ok, exit 0) or a break (not every check ok, and a nonzero exit). `dllibs` is the guest library directory of `qemu_dlopen` (ATL_NB_DLLIBS).
-fn harness(
+pub(crate) fn harness(
     root: &Path,
     dir: &Path,
     h: &Harness,

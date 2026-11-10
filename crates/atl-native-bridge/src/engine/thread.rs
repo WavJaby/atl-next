@@ -2,7 +2,7 @@
 //! The guest's per-thread bionic record (plan 4.2 "bionic thread record"): a `pthread_internal_t` and the `bionic_tls` it points to, laid out as build.rs generated from bionic's `pthread_internal.h` / `bionic_tls.h` (atl-bridgegen, guest view).
 //! NBS bionic never creates its main thread's record: `__libc_init_main_thread_early` takes `__native_bridge_get_host_pthread()`'s answer as both the TCB's thread record and (in `_late`) the `TLS_SLOT_BIONIC_TLS` value. berberis answers host `pthread_self()` because its host is bionic; ours is glibc, so the engine builds one per host thread.
 //! Set here: `tid`, the cached pid (bit-field), `bionic_tls`. Everything else zero, as bionic's own `__allocate_thread` leaves a fresh mapping before `__init_thread` (pthread_create.cpp).
-//! Attach: a host thread's first down call (or a guest `pthread_create`'s new thread) gets that record, its own guest static TLS and a `HostThread`; detach at thread exit (a host key's destructor) runs the guest keys' destructors on guest FS, then frees all three.
+//! Attach: a host thread's first down call (or a guest `pthread_create`'s new thread) gets that record, its own guest static TLS, a `HostThread` and the engine's guest CPU (`Engine::attach`); detach at thread exit (a host key's destructor) runs the guest keys' destructors on guest FS, then frees the TLS and record and detaches the CPU.
 
 use std::alloc::{Layout, alloc_zeroed};
 use std::cell::Cell;
@@ -114,12 +114,13 @@ pub fn adopt(ht: *mut HostThread) {
     register_detach(ht);
 }
 
-/// The calling thread's record, attaching it first: guest static TLS (`alloc_static_tls`, the TCB words) and a crossing record. Aborts if no guest runs (a down stub exists only for a loaded library, so a guest does).
+/// The calling thread's record, attaching it first: the engine's guest CPU (`Engine::attach`), guest static TLS (`alloc_static_tls`, the TCB words) and a crossing record. Aborts if no guest runs (a down stub exists only for a loaded library, so a guest does).
 pub fn attach_current() -> *mut HostThread {
     let cur = CURRENT.with(Cell::get);
     if !cur.is_null() {
         return cur;
     }
+    active().attach().unwrap_or_else(|e| super::unsupported(&e));
     let ht = static_tls()
         .ok_or_else(|| "attach: no guest static TLS (guest not started)".to_owned())
         .and_then(|t| alloc_static_tls(&t))
@@ -163,13 +164,11 @@ extern "C" fn detach(value: *mut libc::c_void) {
                 continue;
             }
             ran = true;
-            // plan O2 (Q5): under QEMU a guest destructor needs the crossing on the exiting thread; only the boot thread has one until guest threads land (Q5), so a non-NULL value traps here. Delete with the QEMU shim list in build.rs.
-            if active() == Active::Qemu {
-                super::unsupported(
-                    "qemu crossing: a guest destructor runs at thread exit: pending: shim under QEMU, Q5",
-                );
+            // deliberate break (`ATL_NB_BREAK=qt_skip_dtor`): the guest destructor never runs (qemu-thread gate)
+            if cfg!(atl_nb_qt_skip_dtor) {
+                continue;
             }
-            // SAFETY: as above; `dtor` is the guest's `void (*)(void*)`, `ht` this thread's record.
+            // SAFETY: as above; `dtor` is the guest's `void (*)(void*)`, `ht` this thread's record, and this thread's engine CPU is still attached (`Engine::detach` comes last).
             unsafe {
                 libc::pthread_setspecific(key, std::ptr::null());
                 call_guest(&mut *ht, dtor, v as usize, 0, 0, 0);
@@ -191,6 +190,7 @@ extern "C" fn detach(value: *mut libc::c_void) {
     }
     release_record();
     CURRENT.with(|c| c.set(std::ptr::null_mut()));
+    active().detach();
     let d = DETACHED.fetch_add(1, Ordering::Relaxed) + 1;
     #[allow(
         clippy::print_stderr,

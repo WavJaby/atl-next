@@ -106,6 +106,22 @@ impl Active {
             .clone()
     }
 
+    /// Gives the calling thread its guest CPU ([`Engine::attach`]).
+    fn attach(self) -> Result<(), String> {
+        match self {
+            Active::Identity => identity::CROSSING.attach(),
+            Active::Qemu => qemu::CROSSING.attach(),
+        }
+    }
+
+    /// Takes the calling thread's guest CPU back ([`Engine::detach`]).
+    fn detach(self) {
+        match self {
+            Active::Identity => identity::CROSSING.detach(),
+            Active::Qemu => qemu::CROSSING.detach(),
+        }
+    }
+
     /// Whether this host can run the engine's crossing.
     pub fn supported(self) -> bool {
         match self {
@@ -302,6 +318,10 @@ pub trait Engine {
     fn start(&self) -> Result<(), String>;
     /// Registers guest memory `[start, start + len)` with `prot` (`PROT_*`). Identity: nothing to register, host memory is guest memory. QEMU: page flags.
     fn map(&self, start: usize, len: usize, prot: u32) -> Result<(), String>;
+    /// Gives the calling thread its guest CPU before its first guest call (thread.rs `attach_current`: a guest `pthread_create` thread, or any host thread that runs guest code). Once per thread; a second call is a no-op. Identity: nothing, the thread's `HostThread` record is its CPU. QEMU: an engine CPU (`atl_engine_v1.attach`).
+    fn attach(&self) -> Result<(), String>;
+    /// Takes the calling thread's guest CPU back at thread exit, after its guest destructors ran (thread.rs `detach`). Identity: nothing. QEMU: `atl_engine_v1.detach`.
+    fn detach(&self);
     /// Runs guest `f(args)` on `cpu` with thread pointer `tp`; returns x0. Nests: may run from inside a host function the guest called.
     ///
     /// # Safety

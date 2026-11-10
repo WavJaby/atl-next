@@ -749,6 +749,13 @@ impl super::Engine for Identity {
         Ok(())
     }
 
+    /// Nothing per thread: the thread's `HostThread` record (thread.rs) is its guest CPU.
+    fn attach(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn detach(&self) {}
+
     unsafe fn call(
         &self,
         cpu: &mut HostThread,

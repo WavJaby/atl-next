@@ -55,6 +55,11 @@ harness = false
 name = "qemu_dlopen"
 harness = false
 
+# Q5-6 gate: guest threads under QEMU: a guest pthread_create attaches its own engine CPU, the provider's foreach reaches a guest callback, a guest key destructor runs at thread exit (QEMU bridge plan Q5-6); selects the QEMU engine, needs the engine `.so` (ATL_ENGINE_SO)
+[[test]]
+name = "qemu_thread"
+harness = false
+
 [dependencies]
 atl-android-paths = { path = "../atl-android-paths" }
 atl-engine-api = { path = "../atl-engine-api" }

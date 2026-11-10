@@ -340,10 +340,8 @@ fn libc_stubs(qemu: bool) -> &'static str {
     }
 }
 
-/// Why a Shim row traps in the QEMU guest (plan O2): every hand-written host side calls guest code on a guest thread or converts guest records, which needs the QEMU crossing's guest calls on any thread (Q5).
-const QEMU_SHIM_PENDING: &str = "pending: shim under QEMU, Q5";
-/// Shims the QEMU guest binds despite [`QEMU_SHIM_PENDING`]: `pthread_key_create` and `pthread_key_delete` store the guest destructor as the x86 crossing does (intercepts.rs); a destructor runs at thread exit, which traps under QEMU (thread.rs `detach`, plan O2). Delete this list when Q5 binds the other shims.
-const QEMU_BOUND_SHIMS: &[&str] = &["pthread_key_create", "pthread_key_delete"];
+/// Why the NDK shims (`JNIEnv*` takers) trap in the QEMU guest: their env is the QEMU JNI table, which lands with the JNI slice (plan Q6, D-C).
+const QEMU_NDK_PENDING: &str = "pending: NDK shim under QEMU, Q6";
 /// The QEMU guest's arches.toml row (engine/qemu/mod.rs `GUEST_ISA`).
 const QEMU_GUEST_ARCH: &str = "arm64";
 /// The prototypes of the proxy libraries: EGL and the GLES 1.x / 2.x / 3.x headers with their extensions (AOSP's Khronos headers), parsed once per view.
@@ -415,7 +413,7 @@ fn stub_names(up: &Upstreams, rel: &str) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// The libc rows: per NBS libc stub, its entry -- [`SHIMS`] (+ [`SIGNAL_SHIMS`] for the x86_64 list; a trap under QEMU), [`GLIBC`], the provider's [`PROVIDER_APIS`], else a named trap. A name in those lists that the stub list lacks fails the build (a stale row).
+/// The libc rows: per NBS libc stub, its entry -- [`SHIMS`] (+ [`SIGNAL_SHIMS`] for the x86_64 list), [`GLIBC`], the provider's [`PROVIDER_APIS`], else a named trap. A name in those lists that the stub list lacks fails the build (a stale row).
 fn libc_entries(
     names: &[String],
     qemu: bool,
@@ -441,11 +439,7 @@ fn libc_entries(
         .iter()
         .map(|name| {
             if shims.contains(&name.as_str()) {
-                if qemu && !QEMU_BOUND_SHIMS.contains(&name.as_str()) {
-                    trap(name, QEMU_SHIM_PENDING)
-                } else {
-                    "Entry::Shim".to_owned()
-                }
+                "Entry::Shim".to_owned()
             } else if let Some((_, sym)) = GLIBC.iter().find(|(n, _)| n == name) {
                 format!("Entry::Generic(Host::Glibc, {sym:?})")
             } else if provider.contains(&name.as_str()) {
@@ -593,7 +587,7 @@ fn bindings_table(
             let entry = match (guest_view.functions.get(name), host_ir.functions.get(name)) {
                 (Some(_), Some(_)) if NDK_SHIMS.contains(&name.as_str()) => {
                     if qemu {
-                        trap(QEMU_SHIM_PENDING)
+                        trap(QEMU_NDK_PENDING)
                     } else {
                         "Entry::Shim".to_owned()
                     }
@@ -703,6 +697,10 @@ const BREAKS: &[(&str, &str)] = &[
     ("host_qemu", "atl_nb_host_qemu"),
     // Q5-5 (engine/mod.rs `decide`): a second ISA needing another engine accepted in one process (unit test `engine::tests::selection`)
     ("second_isa", "atl_nb_second_isa"),
+    // Q5-6 (engine/thread.rs `detach`): a guest key destructor never runs at thread exit (qemu-thread gate, `qt_last_value`)
+    ("qt_skip_dtor", "atl_nb_qt_skip_dtor"),
+    // Q5-6 (engine/intercepts.rs `run`): a guest thread's routine gets the wrong argument (qemu-thread gate, `qt_join`)
+    ("qt_routine_arg", "atl_nb_qt_routine_arg"),
 ];
 
 /// The cfgs `ATL_NB_BREAK` names, in order; an unknown name fails the build, naming it and the known ones.
