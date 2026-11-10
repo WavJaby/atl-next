@@ -92,7 +92,7 @@ pub struct Partial {
 /// Row key = Android.bp module name.
 pub type Providers = BTreeMap<String, Provider>;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Provider {
     /// None on a `rust_os` or `defines` row.

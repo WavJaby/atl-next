@@ -231,11 +231,17 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         fetch::add_and_fetch(root, &[])?;
     }
     // modules provided outside the tree, before the converter: it links their artifacts; each provider is built or resolved once (crates by cargo-c, upstreams by their own build system, system libraries as installed), then each module gets one entry joining its row's providers in order
-    // plan A3: a cross host builds no providers (the build machine's compiler and pkg-config would build them for the wrong arch), so the build steps below see an empty table; the converter fails a goal closure that reaches a provided module (-cross-providers)
+    // plan A2: a cross host builds no crate or upstream provider (its compiler would build it for the wrong arch; plan A3), so only its system rows are built here, resolved in the target sysroot; the converter fails a goal closure that reaches any other provided module (-cross-providers)
+    let is_system = |row: &providers::Provider| {
+        row.provider
+            .as_deref()
+            .is_some_and(|p| p.starts_with("system:"))
+    };
     let cross_names: Vec<&str> = providers
         .iter()
         .filter(|(_, row)| {
             !row.is_none()
+                && !is_system(row)
                 && !row
                     .provider
                     .as_deref()
@@ -249,13 +255,30 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         Vec::new()
     };
-    let unbuilt = providers::Providers::new();
-    let to_build = if cross.is_some() {
-        &unbuilt
+    let built_here: providers::Providers = if cross.is_some() {
+        providers
+            .iter()
+            .filter(|(_, row)| is_system(row))
+            .map(|(m, row)| (m.clone(), row.clone()))
+            .collect()
     } else {
-        &providers
+        providers.clone()
     };
+    let to_build = &built_here;
     let crates = build_crates(root, &out, to_build)?;
+    // a cross host's system rows resolve in its sysroot: the build machine's pkg-config path and library dirs never apply
+    let target_root = cross
+        .as_ref()
+        .map(|c| deps::sysroot_root(root, &c.sysroot))
+        .transpose()?;
+    let target = match (&cross, &target_root) {
+        (Some(c), Some(dir)) => Some(system::Sysroot {
+            name: &c.sysroot,
+            root: dir,
+            triple: &c.clang,
+        }),
+        _ => None,
+    };
     let mut systems = BTreeMap::new();
     for (_, row) in providers::systems(to_build) {
         if systems.contains_key(row) {
@@ -265,7 +288,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .pkgconfig
             .as_deref()
             .context("providers.toml checked the pkgconfig")?;
-        let p = system::resolve(row, pkg)?;
+        let p = system::resolve(row, pkg, target)?;
         println!(
             "native: system {row} (pkg-config {pkg}) -> {}",
             p.lib.display()
