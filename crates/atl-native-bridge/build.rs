@@ -483,6 +483,7 @@ fn bindings_table(
     provider_soname: &str,
     qemu: bool,
     x86_disp_bias: usize,
+    x86_counted: bool,
 ) -> Result<String> {
     let mut lists: Vec<(&str, Vec<String>)> = Vec::new();
     for &(soname, dir) in PROXY_LIBS {
@@ -657,7 +658,7 @@ fn bindings_table(
     if !qemu {
         std::fs::write(
             out.join("x86_entries.s"),
-            atl_bridgegen::x86::entries_asm(thunks, JNI_STUBS, x86_disp_bias),
+            atl_bridgegen::x86::entries_asm(thunks, JNI_STUBS, x86_disp_bias, x86_counted),
         )?;
     }
     code.push_str(&format!(
@@ -718,9 +719,13 @@ const BREAKS: &[(&str, &str)] = &[
     ("qt_routine_arg", "atl_nb_qt_routine_arg"),
     // Q5-7 (bridgegen x86.rs `entries_asm`, disp_bias): every identity pool call's displacement one byte short, so each lands one byte past its shell (identity gates g1-g5 and unit test `thunk_slots_call_their_shell`)
     ("x86_disp", X86_DISP_CFG),
+    // Q5-8b (bridgegen x86.rs `entries_asm`, `counted`): the identity shells call no counter, so every identity crossing counts 0 (identity gate `identity_crossing`, check t)
+    ("id_count", X86_COUNT_CFG),
 ];
 /// The cfg of the `x86_disp` break, read here: it selects the generator's displacement bias, no crate code.
 const X86_DISP_CFG: &str = "atl_nb_x86_disp";
+/// The cfg of the `id_count` break: with it the identity shells are generated plain, feature or not.
+const X86_COUNT_CFG: &str = "atl_nb_id_count";
 
 /// The cfgs `ATL_NB_BREAK` names, in order; an unknown name fails the build, naming it and the known ones.
 fn selected_breaks() -> Result<Vec<&'static str>> {
@@ -822,10 +827,21 @@ fn main() -> Result<()> {
         atl_bridgegen::x86::constants_rust(),
     )?;
     let x86_disp_bias = usize::from(selected_breaks()?.contains(&X86_DISP_CFG));
+    // the counted shells: feature `crossing-count` (cargo's env for build scripts), unless the `id_count` break is selected
+    let x86_counted = std::env::var_os("CARGO_FEATURE_CROSSING_COUNT").is_some()
+        && !selected_breaks()?.contains(&X86_COUNT_CFG);
     for (name, qemu) in [("identity", false), ("qemu", true)] {
         std::fs::write(
             out.join(format!("bindings_table_{name}.rs")),
-            bindings_table(&up, &host, &out, &provider_soname, qemu, x86_disp_bias)?,
+            bindings_table(
+                &up,
+                &host,
+                &out,
+                &provider_soname,
+                qemu,
+                x86_disp_bias,
+                x86_counted,
+            )?,
         )?;
     }
     println!("cargo::rerun-if-changed={}", arches.display());

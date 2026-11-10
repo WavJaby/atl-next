@@ -70,6 +70,12 @@ name = "qemu_crossing"
 harness = false
 required-features = ["crossing-count"]
 
+# Q5-8b gate: the crossing counter on the identity side: thunk and JNI shell crossings counted exactly per host target, 2^16 crossings dump once (QEMU bridge plan Q5-8b); needs feature `crossing-count`
+[[test]]
+name = "identity_crossing"
+harness = false
+required-features = ["crossing-count"]
+
 [dependencies]
 atl-android-paths = { path = "../atl-android-paths" }
 atl-engine-api = { path = "../atl-engine-api" }

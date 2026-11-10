@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: MIT
-//! Crossing counter (QEMU bridge plan section 5, Q5-8; feature `crossing-count`, absent from shipped builds).
+//! Crossing counter (QEMU bridge plan section 5, Q5-8 / Q5-8b; feature `crossing-count`, absent from shipped builds).
 //!
-//! Per pool slot: the host target that ran and the crossings it took (`count_binding`, called by `dispatch::call_binding`). Per [`Mem`] kind: a histogram of the sizes the counted `memcpy`/`memset`/`memcmp` shims were given. Bin = bit length of the size: bin 0 = size 0, bin k = 2^(k-1) <= size < 2^k.
+//! Per pool slot: the host target that ran and the crossings it took. Three pools, each its own slot space: QEMU's binding slots (`count_binding`, called by `dispatch::call_binding`), and the identity engine's host thunks and JNI stubs (`atl_nb_count_host` / `atl_nb_count_jni`, called by the counted shells of `atl-bridgegen` `x86::entries_asm`). Per [`Mem`] kind: a histogram of the sizes the counted `memcpy`/`memset`/`memcmp` shims were given. Bin = bit length of the size: bin 0 = size 0, bin k = 2^(k-1) <= size < 2^k.
 //!
-//! Every 2^16 crossings the 16-bit tick wraps and [`dump`] writes the slots and histogram bins that are non-zero to fd 2. The dump allocates nothing, calls no libc function and touches no TLS: its line buffer is on the stack and it writes with a raw `syscall`, because the identity side (Q5-8b) counts on guest FS, where glibc's wrapper would read the host thread pointer (errno, cancellation).
+//! Every 2^16 crossings the 16-bit tick wraps and [`dump`] writes the slots and histogram bins that are non-zero to fd 2. The dump allocates nothing, calls no libc function and touches no TLS: its line buffer is on the stack and it writes with a raw `syscall`, because the identity side counts on guest FS, where glibc's wrapper would read the host thread pointer (errno, cancellation).
 //! Counts are relaxed atomics: exact, lock-free, and a crossing costs a few stores.
 
 use std::ffi::{c_int, c_void};
 use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
 
 use crate::engine::bindings::qemu::THUNKS;
+use crate::engine::identity::{JNI_STUBS, THUNKS as HOST_THUNKS};
 
 /// Histogram bins: the bit lengths 0..=64 of a `usize` size.
 pub const BINS: usize = usize::BITS as usize + 1;
@@ -43,19 +44,44 @@ impl Slot {
 }
 
 static SLOTS: [Slot; THUNKS] = [const { Slot::new() }; THUNKS];
+/// Identity: the host thunk pool (`bind`) and the JNI stub pool, each its own slot space.
+static HOST: [Slot; HOST_THUNKS] = [const { Slot::new() }; HOST_THUNKS];
+static JNI: [Slot; JNI_STUBS] = [const { Slot::new() }; JNI_STUBS];
 static HIST: [[AtomicU64; BINS]; 3] = [const { [const { AtomicU64::new(0) }; BINS] }; 3];
 /// Crossings modulo 2^16: wraps (dumps) every 65536.
 static TICK: AtomicU16 = AtomicU16::new(0);
 static DUMPS: AtomicU64 = AtomicU64::new(0);
 
-/// Counts one crossing of pool slot `slot` to host `target`; dumps when the tick wraps.
+/// Counts one crossing of QEMU's pool slot `slot` to host `target`.
 pub fn count_binding(slot: usize, target: usize) {
-    let s = &SLOTS[slot];
+    count(&SLOTS, slot, target);
+}
+
+/// The identity thunk shell's counter (`x86.rs` counted shells): host-thunk slot `slot` ran `target`. Called on guest FS with the argument registers saved: no TLS, no libc.
+#[unsafe(no_mangle)]
+pub extern "C" fn atl_nb_count_host(slot: usize, target: usize) {
+    count(&HOST, slot, target);
+}
+
+/// The identity JNI shell's counter: as [`atl_nb_count_host`], for JNI stub slot `slot`.
+#[unsafe(no_mangle)]
+pub extern "C" fn atl_nb_count_jni(slot: usize, target: usize) {
+    count(&JNI, slot, target);
+}
+
+/// Counts one crossing of `pool`'s slot `slot` to host `target`; dumps when the tick wraps.
+fn count(pool: &[Slot], slot: usize, target: usize) {
+    let s = &pool[slot];
     s.target.store(target, Ordering::Relaxed);
     s.calls.fetch_add(1, Ordering::Relaxed);
     if TICK.fetch_add(1, Ordering::Relaxed) == u16::MAX {
         dump();
     }
+}
+
+/// Every counted pool with its name in the dump: QEMU's `slot`, identity's `host` and `jni`.
+fn pools() -> [(&'static str, &'static [Slot]); 3] {
+    [("slot", &SLOTS), ("host", &HOST), ("jni", &JNI)]
 }
 
 /// Records a size given to a counted shim: its bin is the size's bit length.
@@ -107,7 +133,7 @@ pub struct Snapshot {
 /// The counters now. Allocates (the result is a `Vec`): for gates on the host thread, never from a crossing.
 pub fn snapshot() -> Snapshot {
     let mut targets: Vec<(usize, u64)> = Vec::new();
-    for s in SLOTS.iter() {
+    for s in pools().iter().flat_map(|&(_, pool)| pool.iter()) {
         let calls = s.calls.load(Ordering::Relaxed);
         if calls == 0 {
             continue;
@@ -127,23 +153,27 @@ pub fn snapshot() -> Snapshot {
     }
 }
 
-/// Writes the dump number, the non-empty slots (`slot <k> <target> <calls>`) and the non-empty histogram bins (`<kind> bin <b> <count>`) to fd 2. No allocation, no libc, no TLS.
+/// Writes the dump number, the non-empty slots (`<pool> <k> <target> <calls>`) and the non-empty histogram bins (`<kind> bin <b> <count>`) to fd 2. No allocation, no libc, no TLS.
 fn dump() {
     let n = DUMPS.fetch_add(1, Ordering::Relaxed) + 1;
     let mut out = Out::new();
     out.text("crossing-count: dump ");
     out.dec(n);
     out.text(" (every 65536 crossings)\n");
-    for (slot, s) in SLOTS.iter().enumerate() {
-        let calls = s.calls.load(Ordering::Relaxed);
-        if calls != 0 {
-            out.text("  slot ");
-            out.dec(slot as u64);
-            out.text(" ");
-            out.hex(s.target.load(Ordering::Relaxed));
-            out.text(" ");
-            out.dec(calls);
-            out.text("\n");
+    for (name, pool) in pools() {
+        for (slot, s) in pool.iter().enumerate() {
+            let calls = s.calls.load(Ordering::Relaxed);
+            if calls != 0 {
+                out.text("  ");
+                out.text(name);
+                out.text(" ");
+                out.dec(slot as u64);
+                out.text(" ");
+                out.hex(s.target.load(Ordering::Relaxed));
+                out.text(" ");
+                out.dec(calls);
+                out.text("\n");
+            }
         }
     }
     for (kind, name) in Mem::NAMES.iter().enumerate() {

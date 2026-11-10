@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test crossing`: the crossing counter under QEMU (QEMU bridge plan Q5-8; counters.rs, feature `crossing-count`). The harness `tests/qemu_crossing.rs` checks on the real arm64 NB images: the fixture's N calls per binding count N, its sizes fall in their literal bins, and 2^16 crossings dump exactly once. Then the `qe_id` break (every binding calls its neighbour) must turn it red. Last, the library built without the feature has no counter symbol (`nm -C`), and the same probe finds one with the feature on (positive control).
+//! `xtask test crossing`: the crossing counter (QEMU bridge plan Q5-8 / Q5-8b; counters.rs, feature `crossing-count`).
+//!
+//! Identity side (Q5-8b, `tests/identity_crossing.rs`): in-process on the host, no image. Thunk and JNI shell crossings counted exactly per host target, 2^16 crossings dump once. The `id_count` break (the shells count nothing) must turn it red.
+//!
+//! QEMU side (Q5-8): `tests/qemu_crossing.rs` on the real arm64 NB images: the fixture's N calls per binding count N, sizes fall in their literal bins, 2^16 crossings dump exactly once. Then the `qe_id` break (every binding calls its neighbour) must turn it red. Last, the library built without the feature has no counter symbol (`nm -C`), and the same probe finds one with the feature on (positive control).
 //!
 //! Library: the engine `.so` (`qemu_spike::engine_so_file`), as `qemu-thread` uses it. Fixture: `xtask/testdata/crossing/fixture.c` (PIE, NDK clang, `-fno-builtin`). Boot: `xtask/testdata/qemu-linker/boot.c` (static).
-//! Images: `--nb <dir>` is the arm64 NB out dir (`<out>/nb/arm64`), built as for `test qemu-thread`.
+//! Images: `--nb <dir>` is the arm64 NB out dir (`<out>/nb/arm64`), built as for `test qemu-thread`; the identity side needs none.
 //! Cargo runs go through `unit_use` with the feature selected here. Output: `<out>/qemu/<target>-linux-user-pic/crossing/`, one log per run; `cargo-probe` holds the feature-off and feature-on cdylib builds of the probe.
 
 use std::path::{Path, PathBuf};
@@ -20,15 +24,20 @@ use crate::verdict::{Failure, Verdict};
 const TESTDATA: &str = "xtask/testdata/crossing";
 const PACKAGE: &str = "atl-native-bridge";
 const TEST: &str = "qemu_crossing";
+const IDENTITY_TEST: &str = "identity_crossing";
 const FEATURE: &str = "crossing-count";
-/// The harness's checks, `crossing: (x) ok` each: s started, r fixture results, c calls per binding, h size bins, w 2^16 window.
+/// The QEMU harness's checks, `crossing: (x) ok` each: s started, r fixture results, c calls per binding, h size bins, w 2^16 window.
 const CHECKS: [char; 5] = ['s', 'r', 'c', 'h', 'w'];
-/// build.rs `BREAKS`: each binding trap calls its neighbour's host function.
+/// The identity harness's checks: s started, t thunk crossings per target, j JNI crossings per target, w 2^16 window, f FS back on the host.
+const IDENTITY_CHECKS: [char; 5] = ['s', 't', 'j', 'w', 'f'];
+/// build.rs `BREAKS`: each binding trap calls its neighbour's host function (QEMU).
 const BREAK: &str = "qe_id";
+/// build.rs `BREAKS`: the identity shells are generated plain, so the counter is never called.
+const IDENTITY_BREAK: &str = "id_count";
 /// Bound on one cargo run, as qemu_linker's harness runs (its `RUN_TIMEOUT_SECS`).
 const RUN_TIMEOUT_SECS: u32 = 240;
-/// The symbol prefix of the counter module in `nm -C` output (a demangled Rust path).
-const COUNTER_SYMBOL: &str = "atl_native_bridge::counters";
+/// Symbol prefixes of the counters in `nm -C` output: the QEMU module's demangled Rust path, and the identity counters' `no_mangle` names.
+const COUNTER_SYMBOLS: [&str; 2] = ["atl_native_bridge::counters", "atl_nb_count_"];
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -45,9 +54,18 @@ pub struct Args {
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let b = qemu::plan(root, &args.arch, args.out.as_deref(), true)?;
-    qemu::execute(root, &b)?;
     let dir = b.dir.join("crossing");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let mut fails = Vec::new();
+
+    for brk in [None, Some(IDENTITY_BREAK)] {
+        let name = format!("crossing-identity-{}", brk.unwrap_or("plain"));
+        if let Err(e) = harness(root, &dir, &[], brk, &name, IDENTITY_TEST, &IDENTITY_CHECKS) {
+            fails.push(Failure::step(&name, format!("{e:#}")));
+        }
+    }
+
+    qemu::execute(root, &b)?;
     let so = qemu_spike::engine_so_file(root, &b, &dir.join("engine"))?;
     let linker = args.nb.join("native_bridge_guest_linker/linker64");
     let vdso = args
@@ -74,10 +92,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         ("ATL_NB_VDSO", &vdso),
     ];
 
-    let mut fails = Vec::new();
     for brk in [None, Some(BREAK)] {
         let name = format!("crossing-{}", brk.unwrap_or("plain"));
-        if let Err(e) = harness(root, &dir, &env, brk, &name) {
+        if let Err(e) = harness(root, &dir, &env, brk, &name, TEST, &CHECKS) {
             fails.push(Failure::step(&name, format!("{e:#}")));
         }
     }
@@ -86,7 +103,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     let verdict = Verdict {
         cmd: "crossing",
-        total: Some((3, "runs")),
+        total: Some((5, "runs")),
         skipped: Vec::new(),
         failures: fails,
     };
@@ -98,13 +115,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     })
 }
 
-/// One harness run: `cargo test --features crossing-count --test qemu_crossing` with `env`, log in `dir/<name>.log`. The plain run needs every check ok and exit 0; the break run must not pass.
+/// One harness run: `cargo test --features crossing-count --test <test>` with `env`, log in `dir/<name>.log`. The plain run needs every check in `checks` ok and exit 0; the break run must not pass.
 fn harness(
     root: &Path,
     dir: &Path,
     env: &[(&str, &Path)],
     brk: Option<&str>,
     name: &str,
+    test: &str,
+    checks: &[char],
 ) -> Result<()> {
     // `timeout -s KILL` kills the run's whole process group: a hung run is a failed run
     let mut cmd = Command::new("timeout");
@@ -119,7 +138,7 @@ fn harness(
         "--features",
         FEATURE,
         "--test",
-        TEST,
+        test,
         "--target-dir",
     ])
     .arg(dir.join("cargo"))
@@ -141,7 +160,7 @@ fn harness(
     let ok = |c: char| text.lines().any(|l| l == format!("crossing: ({c}) ok"));
     match brk {
         None => {
-            let red: Vec<char> = CHECKS.into_iter().filter(|&c| !ok(c)).collect();
+            let red: Vec<char> = checks.iter().copied().filter(|&c| !ok(c)).collect();
             ensure!(
                 red.is_empty() && run.status.success(),
                 "checks {red:?} not ok ({}), log {}",
@@ -151,7 +170,7 @@ fn harness(
         }
         Some(_) => {
             ensure!(
-                !CHECKS.into_iter().all(ok),
+                !checks.iter().copied().all(ok),
                 "break left every check ok, log {}",
                 log.display()
             );
@@ -202,7 +221,7 @@ fn build_lib(root: &Path, target: &Path, feature: bool) -> Result<()> {
     Ok(())
 }
 
-/// Lines of `nm -C lib` that name a symbol of the counter module.
+/// Lines of `nm -C lib` that name a symbol of a counter (the QEMU module or the identity wrappers).
 fn counter_symbols(lib: &Path) -> Result<usize> {
     let out = Command::new("nm")
         .arg("-C")
@@ -211,7 +230,10 @@ fn counter_symbols(lib: &Path) -> Result<usize> {
         .with_context(|| format!("running nm on {}", lib.display()))?;
     ensure!(out.status.success(), "nm failed on {}", lib.display());
     let text = String::from_utf8_lossy(&out.stdout);
-    Ok(text.lines().filter(|l| l.contains(COUNTER_SYMBOL)).count())
+    Ok(text
+        .lines()
+        .filter(|l| COUNTER_SYMBOLS.iter().any(|s| l.contains(s)))
+        .count())
 }
 
 /// `fixture.c` for the guest: a PIE executable on the NDK's libc.so, `-fno-builtin` so each call reaches the binding.

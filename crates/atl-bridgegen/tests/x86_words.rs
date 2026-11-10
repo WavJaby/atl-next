@@ -94,13 +94,13 @@ fn entries_text_layout() {
         "    .long atl_nb_jni_up - . - 4\n",
         "    .p2align 3\n",
     );
-    assert_eq!(entries_asm(2, 1, 0), want);
+    assert_eq!(entries_asm(2, 1, 0, false), want);
 }
 
 #[test]
 fn displacement_break_is_one_byte_short() {
     // disp_bias 1: `target - . - 3` gives rel32 = target - (slot + 4), so the call lands at target + 1
-    let text = entries_asm(1, 1, 1);
+    let text = entries_asm(1, 1, 1, false);
     assert!(
         text.contains("    .long atl_nb_cross_to_host - . - 3\n"),
         "{text}"
@@ -113,5 +113,39 @@ fn displacement_break_is_one_byte_short() {
 #[should_panic(expected = "leaves no displacement end")]
 fn bias_past_the_displacement_is_refused() {
     // CALL_LEN 5: a bias of 4 would leave the displacement with no bytes to its end
-    entries_asm(1, 1, 4);
+    entries_asm(1, 1, 4, false);
+}
+
+#[test]
+fn counted_shells_save_restore_and_call_the_counter() {
+    // literal layout, not the emitter's constants: 200 B save area (rdi, rsi, rdx, rcx, r8, r9, rax at 0..56, %r11 at 56, the index at 64, xmm0-7 at 72..200); rsp is 8 mod 16 after the pop, so 200 B keeps it 16-aligned at the call
+    let text = entries_asm(2, 1, 0, true);
+    assert!(
+        text.contains(".hidden atl_nb_count_host, atl_nb_count_jni\n"),
+        "{text}"
+    );
+    assert_eq!(text.matches("    sub $200, %rsp\n").count(), 2, "{text}");
+    assert_eq!(text.matches("    add $200, %rsp\n").count(), 2, "{text}");
+    assert_eq!(
+        text.matches("    call atl_nb_count_host\n").count(),
+        1,
+        "{text}"
+    );
+    assert_eq!(
+        text.matches("    call atl_nb_count_jni\n").count(),
+        1,
+        "{text}"
+    );
+    assert!(text.contains("    shr $3, %rdi\n"), "{text}");
+    assert!(text.contains("    movups %xmm7, 184(%rsp)\n"), "{text}");
+    assert!(text.contains("    movups 184(%rsp), %xmm7\n"), "{text}");
+    // 8 saves (`movups %xmmN, off(%rsp)`) + 8 restores (`movups off(%rsp), %xmmN`) per shell, two shells: every movups line starts with the same prefix
+    assert_eq!(text.matches("    movups ").count(), 32, "{text}");
+    assert_eq!(text.matches("    movups %xmm").count(), 16, "{text}");
+    // the plain shells: no counter, no save area
+    let plain = entries_asm(2, 1, 0, false);
+    assert!(
+        !plain.contains("count") && !plain.contains("$200"),
+        "{plain}"
+    );
 }
