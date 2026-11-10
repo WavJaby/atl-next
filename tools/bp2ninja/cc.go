@@ -197,7 +197,7 @@ type Graph struct {
 	dropped map[string]bool
 	// providers.toml rows built outside the tree (provided.go)
 	provided map[string]Provided
-	// cross host: the crate, upstream and srcs providers.toml rows, named but never built here (plan A3); crossProviderUse fails a goal closure that reaches one
+	// cross host: the upstream providers.toml rows, named but never built here (plan A3a); crossProviderUse fails a goal closure that reaches one
 	crossProviders map[string]bool
 	// bionic sides' provided modules: the LLVM runtimes archives built for the guest (xtask runtimes) under Soong's module names (libc++_static_noexcept, libclang_rt.builtins, ...)
 	nbProvided map[string]Provided
@@ -299,7 +299,7 @@ func (g *Graph) ccGoalSide(goal string) Side {
 	return Device
 }
 
-// crossProviderUse: a cross host builds no crate or upstream provider yet (plan A3), so a goal closure reaching one fails here rather than linking the tree's copy built for the wrong arch.
+// crossProviderUse: a cross host builds no upstream provider yet (plan A3a), so a goal closure reaching one fails here rather than linking the tree's copy built for the wrong arch.
 func (g *Graph) crossProviderUse() error {
 	if !g.cfg.HostCross.set() {
 		return nil
@@ -313,7 +313,7 @@ func (g *Graph) crossProviderUse() error {
 	if len(used) == 0 {
 		return nil
 	}
-	return fmt.Errorf("cross host: providers not supported until A3: %s", strings.Join(sortedKeys(used), " "))
+	return fmt.Errorf("cross host: upstream providers not supported until A3a: %s", strings.Join(sortedKeys(used), " "))
 }
 
 // lookup finds a module by Soong reference: `name`, `//dir:name`, `name#tag`; prebuilts, imports

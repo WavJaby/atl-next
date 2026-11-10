@@ -63,7 +63,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     })
 }
 
-fn plan(root: &Path, arch: &str, cargo: &[String]) -> Result<Plan> {
+/// A cross host's cargo target: its rust triple, and the environment cargo runs for it (linker, RUSTFLAGS).
+pub struct CargoTarget {
+    pub triple: String,
+    pub env: Vec<(String, String)>,
+}
+
+/// The cargo target of cross host `arch`, once its rows are satisfied. `cross` runs cargo with it; `native` builds the host's crates with it.
+pub fn cargo_target(root: &Path, arch: &str) -> Result<CargoTarget> {
     let arches = arches::load(root)?;
     let host = arches
         .get(arch)
@@ -79,7 +86,7 @@ fn plan(root: &Path, arch: &str, cargo: &[String]) -> Result<Plan> {
     let problems = deps::host_rows_problems(root, arch)?;
     ensure!(
         problems.is_empty(),
-        "cross --arch {arch}: {}",
+        "cross host {arch}: {}",
         problems.join("; ")
     );
     let sysroot = deps::sysroot_root(root, sysroot)?;
@@ -97,13 +104,20 @@ fn plan(root: &Path, arch: &str, cargo: &[String]) -> Result<Plan> {
         .collect();
     let rustflags = rustflags(&features, clang, &sysroot, &lib);
     let driver = deps::binary(root, "clang")?;
-    let args = with_target(cargo, &host.rust)?;
-    Ok(Plan {
+    Ok(CargoTarget {
+        triple: host.rust.clone(),
         env: vec![
             (env_key(&host.rust, "LINKER"), driver),
             (env_key(&host.rust, "RUSTFLAGS"), rustflags),
         ],
-        args,
+    })
+}
+
+fn plan(root: &Path, arch: &str, cargo: &[String]) -> Result<Plan> {
+    let target = cargo_target(root, arch)?;
+    Ok(Plan {
+        args: with_target(cargo, &target.triple)?,
+        env: target.env,
     })
 }
 

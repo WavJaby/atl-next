@@ -21,12 +21,12 @@
 # Every row:
 #   scope    build | runtime | test (static checks count as test)
 #   used_by  typed references, each checked to exist: crate:<workspace crate>,
-#            upstream:<sources.toml name or aosp>, xtask:<subcommand>, host:<arch> (the sysroot named by
+#            upstream:<sources.toml name or aosp>, xtask:<subcommand>, host:<arch> (the sysroot or rust std named by
 #            arches.toml [<arch>.host]: that cross host's native build uses it; checked against that row),
 #            optional:<crate, upstream or xtask reference> (that consumer runs without the row: a fallback path)
 # Cross-only row: every used_by is xtask:cross or host:<arch>. Plain `check` and `deps --check` skip it and name it;
 # `deps --check --host <arch>` checks it, and so does `cross --arch <arch>` at start (its sysroot and the rustup
-# target of its [<arch>.host] rust). `native --host <arch>` checks its sysroot.
+# target of its [<arch>.host] rust). `native --host <arch>` checks the same rows at its start.
 # Optional row: every used_by is optional:. Plain `check`, `deps --check` and `--host` skip it and name it, so a
 # machine without it is green; the consumer takes its fallback (the Play token on stdin, not the Secret Service).
 # Not here: Rust itself (rust-toolchain.toml via rustup, the one prerequisite xtask cannot check); Gradle and the
@@ -326,11 +326,11 @@ rustup_target = "aarch64-linux-android"
 scope = ["build"]
 used_by = ["xtask:native"]
 
-# the riscv64 cross build's std (`xtask cross --arch riscv64`)
+# the riscv64 cross build's std (`xtask cross --arch riscv64`, and the native build of the riscv64 host's crates)
 [rust-std-riscv64]
 rustup_target = "riscv64gc-unknown-linux-gnu"
 scope = ["build"]
-used_by = ["xtask:cross"]
+used_by = ["xtask:cross", "host:riscv64"]
 
 # the riscv64 cross link's glibc, kernel headers and GCC runtime: Debian trixie's cross packages (arch all), pinned to trixie main
 # (linux-libc-dev from main, not backports). libgcc-14-dev lays out usr/lib/gcc-cross/riscv64-linux-gnu/14, the GCC install clang

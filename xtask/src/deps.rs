@@ -61,8 +61,14 @@ pub struct Consumers {
     pub xtask: BTreeSet<String>,
     /// `[aosp.projects]` paths of sources.toml: what an `aosp` row may name.
     pub projects: BTreeSet<String>,
-    /// Cross hosts (arches.toml `[<arch>.host]` with a `sysroot`): arch -> the sysroot row it names. What `host:<arch>` may name.
-    pub hosts: BTreeMap<String, String>,
+    /// Cross hosts (arches.toml `[<arch>.host]` with a `sysroot`): arch -> the rows it names. What `host:<arch>` may name.
+    pub hosts: BTreeMap<String, HostRows>,
+}
+
+/// The rows of a cross host: its sysroot (`sysroot`) and the rust std of its target (`rust`, a `rustup_target` row).
+pub struct HostRows {
+    pub sysroot: String,
+    pub rust: String,
 }
 
 impl Consumers {
@@ -74,7 +80,12 @@ impl Consumers {
             projects: sources.aosp.projects.keys().cloned().collect(),
             hosts: arches
                 .iter()
-                .filter_map(|(arch, a)| Some((arch.clone(), a.host.as_ref()?.sysroot.clone()?)))
+                .filter_map(|(arch, a)| {
+                    let host = a.host.as_ref()?;
+                    let sysroot = host.sysroot.clone()?;
+                    let rust = host.rust.clone();
+                    Some((arch.clone(), HostRows { sysroot, rust }))
+                })
                 .collect(),
         }
     }
@@ -230,10 +241,14 @@ fn validate(name: &str, dep: &Dep, consumers: &Consumers) -> Result<()> {
     ensure!(!dep.used_by.is_empty(), "empty used_by");
     for reference in &dep.used_by {
         match reference.strip_prefix(HOST_REF) {
-            // the native build of cross host `arch` uses this row only if its arches.toml [<arch>.host] names it as sysroot
+            // the native build of cross host `arch` uses this row only if its arches.toml [<arch>.host] names it as sysroot, or its rust target's std
             Some(arch) => ensure!(
-                consumers.hosts.get(arch).is_some_and(|row| row == name),
-                "`{reference}`: arches.toml [{arch}.host] does not name this row as its sysroot"
+                consumers
+                    .hosts
+                    .get(arch)
+                    .is_some_and(|host| host.sysroot == name
+                        || dep.rustup_target.as_deref() == Some(host.rust.as_str())),
+                "`{reference}`: arches.toml [{arch}.host] does not name this row as its sysroot or rust target's std"
             ),
             // an optional consumer runs without this row; its target is checked like any other reference
             None => consumers.resolve(reference.strip_prefix(OPTIONAL_REF).unwrap_or(reference))?,
@@ -393,7 +408,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
 }
 
-/// The `used_by` prefix of a cross host's native build: `host:<arch>` names the sysroot of its `[<arch>.host]` row.
+/// The `used_by` prefix of a cross host's native build: `host:<arch>` names the sysroot or the rust std of its `[<arch>.host]` row.
 const HOST_REF: &str = "host:";
 /// The `used_by` reference of a cross build (`xtask cross --arch`).
 const CROSS_TASK: &str = "xtask:cross";
@@ -968,7 +983,13 @@ mod tests {
             upstreams: set(&["aosp"]),
             xtask: set(&["check", "cross"]),
             projects: set(&["prebuilts/jdk/jdk21", "prebuilts/r8"]),
-            hosts: BTreeMap::from([("riscv64".to_owned(), "riscv64-sysroot".to_owned())]),
+            hosts: BTreeMap::from([(
+                "riscv64".to_owned(),
+                HostRows {
+                    sysroot: "riscv64-sysroot".to_owned(),
+                    rust: "riscv64gc-unknown-linux-gnu".to_owned(),
+                },
+            )]),
         }
     }
 
@@ -991,6 +1012,20 @@ mod tests {
         assert!(err(&other).contains("does not name this row as its sysroot"));
         let unknown = format!("[riscv64-sysroot]\n{pins}used_by = [\"host:x86_64\"]\n");
         assert!(err(&unknown).contains("does not name this row as its sysroot"));
+        // a cross host's rust std row is the other row its native build uses
+        let std = "[rust-std-riscv64]\nrustup_target = \"riscv64gc-unknown-linux-gnu\"\nscope = [\"build\"]\n";
+        assert!(
+            parse(
+                &format!("{std}used_by = [\"xtask:cross\", \"host:riscv64\"]\n"),
+                &consumers()
+            )
+            .is_ok()
+        );
+        let other_std = "[rust-std-x86-64]\nrustup_target = \"x86_64-unknown-linux-gnu\"\nscope = [\"build\"]\n";
+        assert!(
+            err(&format!("{other_std}used_by = [\"host:riscv64\"]\n"))
+                .contains("does not name this row as its sysroot")
+        );
     }
 
     #[test]

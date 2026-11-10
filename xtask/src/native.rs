@@ -172,6 +172,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         })?;
     let cross = arches::cross_target(&args.host, host, build_name)?;
     let cross_flags = cross_args(root, cross.as_ref())?;
+    // a cross host's cargo target (rust std, sysroot, linker): checked before any build starts
+    let cross_cargo = cross
+        .as_ref()
+        .map(|_| crate::cross::cargo_target(root, &args.host))
+        .transpose()?;
     let layout = Layout::of(root)?;
     let ws = layout.workspace();
     // the task copies are bound over it: main entered the namespace (tree::enter)
@@ -231,23 +236,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         fetch::add_and_fetch(root, &[])?;
     }
     // modules provided outside the tree, before the converter: it links their artifacts; each provider is built or resolved once (crates by cargo-c, upstreams by their own build system, system libraries as installed), then each module gets one entry joining its row's providers in order
-    // plan A2: a cross host builds no crate or upstream provider (its compiler would build it for the wrong arch; plan A3), so only its system rows are built here, resolved in the target sysroot; the converter fails a goal closure that reaches any other provided module (-cross-providers)
-    let is_system = |row: &providers::Provider| {
+    // plan A3b: a cross host builds its crate and system providers for its target (cross::cargo_target); upstream ones wait for plan A3a, so the converter fails a goal closure that reaches one (-cross-providers)
+    let is_upstream = |row: &providers::Provider| {
         row.provider
             .as_deref()
-            .is_some_and(|p| p.starts_with("system:"))
+            .is_some_and(|p| p.starts_with("upstream:"))
     };
     let cross_names: Vec<&str> = providers
         .iter()
-        .filter(|(_, row)| {
-            !row.is_none()
-                && !is_system(row)
-                && !row
-                    .provider
-                    .as_deref()
-                    .is_some_and(|p| p.starts_with("module:"))
-                && (row.provider.is_some() || !row.srcs.is_empty())
-        })
+        .filter(|(_, row)| is_upstream(row))
         .map(|(m, _)| m.as_str())
         .collect();
     let cross_provider_args: Vec<String> = if cross.is_some() {
@@ -258,14 +255,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let built_here: providers::Providers = if cross.is_some() {
         providers
             .iter()
-            .filter(|(_, row)| is_system(row))
+            .filter(|(_, row)| !is_upstream(row))
             .map(|(m, row)| (m.clone(), row.clone()))
             .collect()
     } else {
         providers.clone()
     };
     let to_build = &built_here;
-    let crates = build_crates(root, &out, to_build)?;
+    let crates = build_crates(root, &out, to_build, cross_cargo.as_ref())?;
     // a cross host's system rows resolve in its sysroot: the build machine's pkg-config path and library dirs never apply
     let target_root = cross
         .as_ref()
@@ -1152,10 +1149,12 @@ fn remove_path(path: &Path) -> Result<()> {
 /// directory, so concurrent checkouts do not share artifacts. Each crate is built once, however many rows name it (atl-bionic: libc, libasync_safe).
 /// A crate installing no header (its callers include upstream headers) gets no include dir.
 /// cargo-c installs into a DESTDIR staging tree that is replaced each run; `sync_tree` copies only what changed into the installed paths, so an unchanged header or library keeps its mtime and its dependants stay clean.
+/// A cross host's crates are built for its target: cargo's `--target` and environment come from `cross` (cross::cargo_target).
 fn build_crates<'a>(
     root: &Path,
     out: &Path,
     providers: &'a providers::Providers,
+    cross: Option<&crate::cross::CargoTarget>,
 ) -> Result<BTreeMap<&'a str, Provided>> {
     let crates: BTreeSet<&str> = providers::crates(providers)
         .into_iter()
@@ -1167,16 +1166,21 @@ fn build_crates<'a>(
         let include = out.join("gen").join(krate).join("include");
         let dest = out.join("cinstall").join(krate);
         remove_path(&dest)?;
+        let mut cargo = Command::new("cargo");
+        cargo.args([
+            "cinstall",
+            "--release",
+            "--library-type",
+            "cdylib",
+            "-p",
+            krate,
+        ]);
+        if let Some(target) = cross {
+            cargo.arg("--target").arg(&target.triple);
+            cargo.envs(target.env.iter().map(|(k, v)| (k, v)));
+        }
         let status = crate::unit_use::status(
-            Command::new("cargo")
-                .args([
-                    "cinstall",
-                    "--release",
-                    "--library-type",
-                    "cdylib",
-                    "-p",
-                    krate,
-                ])
+            cargo
                 .arg("--target-dir")
                 .arg(out.join("cargo"))
                 .arg("--destdir")

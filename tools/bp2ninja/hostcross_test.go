@@ -70,7 +70,7 @@ cc_library { name: "optout", device_supported: false }`})
 	}
 }
 
-// A cross host builds no providers (plan A3): a goal whose closure reaches a provided module fails, naming it; a closure without one passes.
+// A cross host builds no upstream provider (plan A3a): a goal whose closure reaches one fails, naming it; a closure without one passes.
 func TestCrossProviderUse(t *testing.T) {
 	g := graphFor(t, map[string]string{"p/Android.bp": `
 cc_library { name: "libgoal", host_supported: true, shared_libs: ["libprovided"] }
@@ -88,7 +88,7 @@ cc_library { name: "libprovided", host_supported: true }
 	if g.node("libgoal", Host, Shared, "goal") == nil {
 		t.Fatal("libgoal: no host node")
 	}
-	if err := g.crossProviderUse(); err == nil || !strings.Contains(err.Error(), "cross host: providers not supported until A3: libprovided") {
+	if err := g.crossProviderUse(); err == nil || !strings.Contains(err.Error(), "cross host: upstream providers not supported until A3a: libprovided") {
 		t.Errorf("closure reaching a provider: %v", err)
 	}
 }
