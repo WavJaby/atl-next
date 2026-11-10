@@ -29,10 +29,7 @@ reason = "dEQP conformance runner (EGL/GLES ground-truth suite of the GL bridge,
 # GPL-2.0-only WITH Classpath-exception-2.0: owner decision 2026-10-29 (libcore ojluni natives, libjdwp); the exception permits linking with independent modules of any licence, so it is a linking exception in the sense of the GPL-2.0-only rule. Listed when the converter first linked libcore (2026-11-02).
 # SunPro: owner decision 2026-11-02 (fdlibm, via libcore's libfdlibm); Sun's all-permissive notice (use, copy, modify, distribute if the notice is kept), GPL-3-compatible.
 # Apache-2.0 WITH LLVM-exception: owner decision 2026-11-06 (llvm-project runtimes libc++/libc++abi/libunwind/compiler-rt builtins for the bionic targets, and 2026-11-07 the host LLVM of llvm_host.rs: llvm-project's LICENSE.TXT); the exception only removes Apache-2.0 attribution duties for compiled-in runtime code, so it stays GPL-3-compatible as Apache-2.0 is.
-# BSL-1.0, HPND-sell-variant: accepted 2026-11-06 (Mesa: c11 threads emulation, loader_dri_helper); both permissive and on the FSF list of GPL-compatible licences.
 # TU-Berlin-2.0: accepted 2026-11-07 (libgsm, via the GSM soft decoder the Codec2 store lists); all-permissive (use/copy/modify/distribute for any purpose if the notice is kept), the same class as LicenseRef-AGG-2.3, GPL-3-compatible.
-# CC0-1.0, NCSA: owner decision 2026-11-07, for the host LLVM build (llvm_host.rs, plan llvmpipe S1): BLAKE3 (llvm/lib/Support/BLAKE3, `SPDX-License-Identifier: CC0-1.0`, a public-domain dedication, the class of LicenseRef-Public-Domain but a named instrument) and LLVM's legacy University-of-Illinois header (llvm/lib/TargetParser/CSKYTargetParser.cpp). Both permissive and on the FSF list of GPL-compatible licences.
-# GPL-1.0-or-later WITH Linux-syscall-note: owner decision 2026-11-08, following the 2026-10-31 syscall-note decision (Mesa's copy of the kernel uapi sync_file.h, pulled in by iris); "or later" makes it GPL-3-compatible, and the note frees uapi-header users as above.
 # GPL-3.0-or-later WITH Bison-exception-2.2: plan angle S0 (owner 2026-11-09, "全部照建議"); checked-in Bison parser output of ANGLE's translator and preprocessor and of third_party/glslang. The notice is GPL-3.0-or-later plus the Bison skeleton exception, which frees a parser's users (as GCC-exception-3.1 does); the phrase rules read it.
 allow = [
     "Apache-2.0",
@@ -40,14 +37,10 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "blessing",
-    "BSL-1.0",
-    "CC0-1.0",
     "FTL",
-    "GPL-1.0-or-later WITH Linux-syscall-note",
     "GPL-2.0-only WITH Classpath-exception-2.0",
     "GPL-2.0-only WITH Linux-syscall-note",
     "GPL-3.0-or-later WITH Bison-exception-2.2",
-    "HPND-sell-variant",
     "ICU",
     "IJG",
     "ISC",
@@ -59,7 +52,6 @@ allow = [
     "MIT-Khronos-old",
     "MIT-Modern-Variant",
     "MPL-2.0",
-    "NCSA",
     "SGI-B-2.0",
     "SunPro",
     "TU-Berlin-2.0",
@@ -103,277 +95,6 @@ reason = "EGL platform entry list of AOSP libEGL (hooks.h platform_impl_t), no n
 [upstream.aosp.paths."frameworks/native/opengl/include/GLES3/gl3ext.h"]
 licence = "SGI-B-2.0"
 reason = "Khronos' GLES3 extension header: \"This document is licensed under the SGI Free Software B License Version 2.0\" (lines 7-8); a pointer notice the phrase rules do not read"
-
-# Mesa (G1). Mesa's Android.bp names 11 licence kinds, so files without a notice the rules read need a row each.
-[upstream.aosp.paths."external/mesa3d/include/GLES3/gl3ext.h"]
-licence = "SGI-B-2.0"
-reason = "Khronos' GLES3 extension header: \"This document is licensed under the SGI Free Software B License Version 2.0\" (lines 7-8); a pointer notice the phrase rules do not read"
-
-[upstream.aosp.paths."external/mesa3d/src/c11/impl/time.c"]
-licence = "BSL-1.0"
-reason = "\"Distributed under the Boost Software License, Version 1.0.\" with the full text, which the phrase rules miss: its \"[[derivative work]]s\" carries wiki markup"
-
-[upstream.aosp.paths."external/mesa3d/src/c11/threads.h"]
-licence = "BSL-1.0"
-reason = "\"Distributed under the Boost Software License, Version 1.0.\" with the full text, which the phrase rules miss: its \"[[derivative work]]s\" carries wiki markup"
-
-[upstream.aosp.paths."external/mesa3d/src/loader/loader_dri_helper.c"]
-licence = "HPND-sell-variant"
-reason = "\"Permission to use, copy, modify, distribute, and sell this software ... without fee\" + no-advertising clause + \"THE COPYRIGHT HOLDERS DISCLAIM ALL WARRANTIES\": the SPDX HPND-sell-variant text"
-
-[upstream.aosp.paths."external/mesa3d/src/intel/compiler/brw_disasm.c"]
-licence = "HPND-sell-variant"
-reason = "same notice as loader_dri_helper.c (Keith Packard 2008 / Intel 2014): the SPDX HPND-sell-variant text"
-
-[upstream.aosp.paths."external/mesa3d/src/intel/compiler/elk/elk_disasm.c"]
-licence = "HPND-sell-variant"
-reason = "same notice as brw_disasm.c, which it was copied from: the SPDX HPND-sell-variant text"
-
-[upstream.aosp.paths."external/mesa3d/src/loader/loader_dri_helper.h"]
-licence = "HPND-sell-variant"
-reason = "\"Permission to use, copy, modify, distribute, and sell this software ... without fee\" + no-advertising clause + \"THE COPYRIGHT HOLDERS DISCLAIM ALL WARRANTIES\": the SPDX HPND-sell-variant text"
-
-[upstream.aosp.paths."external/mesa3d/src/util/fast_idiv_by_const.c"]
-licence = "MIT AND LicenseRef-Public-Domain"
-reason = "AMD's MIT notice, then code imported from libdivide's reference whose author wrote \"Any copyright is dedicated to the Public Domain\"; the second notice stops the phrase rules"
-
-[upstream.aosp.paths."external/mesa3d/src/util/blake3/"]
-licence = "CC0-1.0 OR Apache-2.0"
-reason = "README: \"a verbatim copy from https://github.com/BLAKE3-team/BLAKE3, tag 1.5.1\" (local changes listed); that tag's LICENSE: \"released into the public domain with CC0 1.0. Alternatively, it is licensed under the Apache License 2.0\" (fetched 2026-11-06). No file carries a notice; the Apache arm is the allowed one"
-
-[upstream.aosp.paths."external/mesa3d/src/util/blake3/mesa_blake3_visibility.h"]
-licence = "MIT"
-reason = "Mesa's addition to its BLAKE3 copy (README Changes: \"Add mesa_blake3_visibility.h\"), no notice: Mesa docs/license.rst \"The core Mesa library is licensed according to the terms of the MIT license\""
-
-# Mesa llvmpipe (S2): five files with no notice at all (no copyright line, no grant); Android.bp names 11 kinds for the directory, so each file needs its row. Reason: Mesa docs/license.rst (MIT).
-[upstream.aosp.paths."external/mesa3d/src/gallium/drivers/llvmpipe/lp_linear_priv.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no notice in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/drivers/llvmpipe/lp_linear_sampler_tmp.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no notice in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/drivers/llvmpipe/lp_public.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no notice in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/drivers/llvmpipe/lp_rast_debug.c"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no notice in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/drivers/llvmpipe/lp_state_setup.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no notice in the file"
-
-# Mesa files with no licence grant (none, a copyright line only, or "No copyright claimed"); no notice or SPDX tag in their directories names a licence other than MIT. Reason: Mesa docs/license.rst "The core Mesa library is licensed according to the terms of the MIT license".
-[upstream.aosp.paths."external/mesa3d/include/pci_ids/crocus_pci_ids.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/include/pci_ids/iris_pci_ids.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/drivers/iris/driinfo_iris.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/drivers/iris/iris_fine_fence.c"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/intel/common/intel_debug_identifier.c"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/intel/common/intel_debug_identifier.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/include/pci_ids/i915_pci_ids.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/include/pci_ids/r300_pci_ids.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/include/pci_ids/r600_pci_ids.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/include/pci_ids/virtio_gpu_pci_ids.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/include/pci_ids/vmwgfx_pci_ids.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/compiler/nir/nir_inline_helpers.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/egl/main/eglentrypoint.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/auxiliary/draw/draw_gs_tmp.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/auxiliary/draw/draw_mesh_prim_tmp.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/auxiliary/draw/draw_prim_assembler_tmp.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/auxiliary/draw/draw_pt_decompose.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/auxiliary/draw/draw_so_emit_tmp.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/auxiliary/driver_trace/tr_video.c"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/auxiliary/driver_trace/tr_video.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/auxiliary/pipe-loader/driinfo_gallium.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/auxiliary/target-helpers/drm_helper.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/auxiliary/target-helpers/drm_helper_public.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/auxiliary/target-helpers/inline_debug_helper.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/auxiliary/target-helpers/sw_helper.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/auxiliary/target-helpers/sw_helper_public.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/auxiliary/tgsi/tgsi_info_opcodes.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/auxiliary/util/u_dual_blend.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/auxiliary/util/u_threaded_context_calls.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/auxiliary/util/u_transfer.c"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/auxiliary/util/u_transfer.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/drivers/softpipe/sp_public.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/frontends/dri/dri_query_renderer.c"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/frontends/dri/dri_query_renderer.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/include/frontend/drisw_api.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/include/frontend/drm_driver.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/include/frontend/sw_driver.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/include/frontend/winsys_handle.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/gallium/targets/dri/dri_target.c"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/loader/pci_id_driver_map.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/mapi/u_current.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/mesa/main/atifragshader.h"]
-licence = "MIT"
-reason = "copyright line only; atifragshader.c, same author and line (\"Copyright (C) 2004 David Airlie\"), carries the MIT grant"
-
-[upstream.aosp.paths."external/mesa3d/src/mesa/main/es1_conversion.c"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/mesa/main/extensions_table.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/mesa/main/glconfig.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/mesa/main/querymatrix.c"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst); \"Copyright 2008 VMware, Inc. All Rights Reserved.\" only, VMware's 2008 files beside it carry the MIT grant"
-
-[upstream.aosp.paths."external/mesa3d/src/mesa/state_tracker/st_atom_list.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/mesa/state_tracker/st_cb_drawtex.c"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst); \"Copyright 2008 VMware, Inc.\" only, VMware's 2008 files beside it carry the MIT grant"
-
-[upstream.aosp.paths."external/mesa3d/src/mesa/state_tracker/st_cb_drawtex.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst); \"Copyright 2008 VMware, Inc.\" only, VMware's 2008 files beside it carry the MIT grant"
-
-[upstream.aosp.paths."external/mesa3d/src/util/box.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/util/format/u_format_etc.c"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst), no grant in the file"
-
-[upstream.aosp.paths."external/mesa3d/src/util/u_atomic.h"]
-licence = "MIT"
-reason = "Mesa default (docs/license.rst); the file says \"No copyright claimed on this file.\", which is no dedication"
 
 # ANGLE (plan angle S0, 2026-11-09). Its Android.bp names several licence kinds for the package, so a file whose notice the phrase rules do not read needs a row.
 [upstream.aosp.paths."external/angle/src/third_party/volk/"]
