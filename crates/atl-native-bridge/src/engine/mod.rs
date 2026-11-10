@@ -219,13 +219,16 @@ impl Active {
         }
     }
 
-    /// A host-callable address that runs guest `target` (loader.rs trampolines). The QEMU crossing has none: unsupported until Q6.
-    pub fn down(self, target: usize, kind: identity::Down) -> Result<usize, String> {
+    /// A host-callable address that runs guest `target` (loader.rs trampolines): a down call of `kind` whose arguments follow `shorty` (ART's JNI signature; None for JNI_OnLoad / JNI_OnUnload). QEMU places the arguments by it (place.rs `down`); identity's stub passes the caller's registers through.
+    pub fn down(
+        self,
+        target: usize,
+        kind: identity::Down,
+        shorty: Option<&[u8]>,
+    ) -> Result<usize, String> {
         match self {
             Active::Identity => identity::down(target, kind),
-            Active::Qemu => {
-                Err("qemu crossing: host->guest trampolines are unsupported until Q6".into())
-            }
+            Active::Qemu => qemu::down(target, kind, shorty),
         }
     }
 

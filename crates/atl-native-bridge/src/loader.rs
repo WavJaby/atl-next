@@ -136,17 +136,21 @@ pub fn symbol(handle: usize, name: &CStr) -> Option<usize> {
     r.ok().filter(|&f| f != 0)
 }
 
-/// A host-callable trampoline into guest function `f` taking a first argument of `kind` (one per function and kind: ART may ask again for the same symbol).
-pub fn trampoline(f: usize, kind: Down) -> Result<usize, String> {
-    static STUBS: Mutex<Vec<(usize, Down, usize)>> = Mutex::new(Vec::new());
+/// A host-callable trampoline into guest function `f` taking a first argument of `kind`, with ART's JNI `shorty` (None for JNI_OnLoad / JNI_OnUnload). One per function, kind and shorty: ART may ask again for the same symbol.
+pub fn trampoline(f: usize, kind: Down, shorty: Option<&[u8]>) -> Result<usize, String> {
+    type Stub = (usize, Down, Option<Vec<u8>>, usize);
+    static STUBS: Mutex<Vec<Stub>> = Mutex::new(Vec::new());
     let mut stubs = STUBS
         .lock()
         .map_err(|_| "trampolines poisoned".to_owned())?;
-    if let Some(&(_, _, t)) = stubs.iter().find(|&&(g, k, _)| g == f && k == kind) {
-        return Ok(t);
+    if let Some(stub) = stubs
+        .iter()
+        .find(|s| s.0 == f && s.1 == kind && s.2.as_deref() == shorty)
+    {
+        return Ok(stub.3);
     }
-    let t = active().down(f, kind)?;
-    stubs.push((f, kind, t));
+    let t = active().down(f, kind, shorty)?;
+    stubs.push((f, kind, shorty.map(<[u8]>::to_vec), t));
     Ok(t)
 }
 

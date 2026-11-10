@@ -770,6 +770,8 @@ const BREAKS: &[(&str, &str)] = &[
 const X86_DISP_CFG: &str = "atl_nb_x86_disp";
 /// The cfg of the `id_count` break: with it the identity shells are generated plain, feature or not.
 const X86_COUNT_CFG: &str = "atl_nb_id_count";
+/// Down shells of the QEMU engine (Q6-4, x86.rs `down_entries_asm`): one per host->guest trampoline a process binds (each native method, JNI_OnLoad, JNI_OnUnload). Fixed; a binding past it fails with an error (place.rs `down`).
+const DOWN_SLOTS: usize = 1024;
 
 /// The cfgs `ATL_NB_BREAK` names, in order; an unknown name fails the build, naming it and the known ones.
 fn selected_breaks() -> Result<Vec<&'static str>> {
@@ -875,6 +877,18 @@ fn main() -> Result<()> {
     // the counted shells: feature `crossing-count` (cargo's env for build scripts), unless the `id_count` break is selected
     let x86_counted = std::env::var_os("CARGO_FEATURE_CROSSING_COUNT").is_some()
         && !selected_breaks()?.contains(&X86_COUNT_CFG);
+    // Q6-4: the QEMU engine's down shells (x86.rs `down_entries_asm`) and their sizes for place.rs
+    std::fs::write(
+        out.join("x86_down.s"),
+        atl_bridgegen::x86::down_entries_asm(DOWN_SLOTS),
+    )?;
+    std::fs::write(
+        out.join("down_pool.rs"),
+        format!(
+            "pub const DOWN_SLOTS: usize = {DOWN_SLOTS};\npub const DOWN_SHELL: usize = {};\n",
+            atl_bridgegen::x86::DOWN_SHELL
+        ),
+    )?;
     for (name, qemu) in [("identity", false), ("qemu", true)] {
         std::fs::write(
             out.join(format!("bindings_table_{name}.rs")),

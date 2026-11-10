@@ -112,9 +112,9 @@ pub unsafe fn getTrampoline(
     unsafe { getTrampolineWithJNICallType(handle, name, shorty, len, kJNICallTypeRegular) }
 }
 
-/// What a JNI function's first argument is: ART calls `JNI_OnLoad` with a JavaVM (java_vm_ext.cc `LoadNativeLibrary`, through `getTrampolineWithJNICallType` like any method); `@CriticalNative` methods get no env; every other method a JNIEnv.
+/// What a JNI function's first argument is: ART calls `JNI_OnLoad` and `JNI_OnUnload` with a JavaVM (java_vm_ext.cc, through the trampoline lookup with no shorty); `@CriticalNative` methods get no env; every other method a JNIEnv.
 fn down_kind(name: Option<&CStr>, jni_call_type: u32) -> Down {
-    if name == Some(c"JNI_OnLoad") {
+    if name == Some(c"JNI_OnLoad") || name == Some(c"JNI_OnUnload") {
         Down::Vm
     } else if jni_call_type == kJNICallTypeCriticalNative {
         Down::Plain
@@ -123,9 +123,18 @@ fn down_kind(name: Option<&CStr>, jni_call_type: u32) -> Down {
     }
 }
 
+/// The JNI shorty of a method as ART passes it, or None. ART's `JNI_OnLoad` and `JNI_OnUnload` lookups pass NULL; the lookup of a method passes its shorty with `len` 0, so the string is read to its NUL.
+///
+/// # Safety
+/// `shorty` is null or a NUL-terminated string (native_bridge.h).
+unsafe fn shorty_arg(shorty: *const c_char) -> Option<Vec<u8>> {
+    // SAFETY: the header's contract.
+    (!shorty.is_null()).then(|| unsafe { CStr::from_ptr(shorty) }.to_bytes().to_vec())
+}
+
 /// The trampoline of guest function `f`, or null with the reason for `getError`.
-fn trampoline(f: usize, kind: Down) -> *mut c_void {
-    loader::trampoline(f, kind)
+fn trampoline(f: usize, kind: Down, shorty: Option<&[u8]>) -> *mut c_void {
+    loader::trampoline(f, kind, shorty)
         .map_err(fail)
         .map_or(std::ptr::null_mut(), |t| t as *mut c_void)
 }
@@ -222,14 +231,14 @@ pub unsafe fn getExportedNamespace(_name: *const c_char) -> *mut native_bridge_n
 
 pub unsafe fn preZygoteFork() {}
 
-/// Guest `dlsym` -> a down trampoline whose crossing hands the guest its own env/vm (engine/jni.rs); arguments otherwise pass through (identity ABI), so the shorty is not read.
+/// Guest `dlsym` -> a down trampoline whose crossing hands the guest its own env/vm (engine/jni.rs) and places the arguments by the shorty (QEMU: dispatch.rs `down_params`; identity passes them through).
 ///
 /// # Safety
-/// `name` is null or a NUL-terminated string (native_bridge.h).
+/// `name` is null or a NUL-terminated string, `shorty` null or NUL-terminated (native_bridge.h).
 pub unsafe fn getTrampolineWithJNICallType(
     handle: *mut c_void,
     name: *const c_char,
-    _shorty: *const c_char,
+    shorty: *const c_char,
     _len: u32,
     jni_call_type: u32,
 ) -> *mut c_void {
@@ -237,19 +246,30 @@ pub unsafe fn getTrampolineWithJNICallType(
     let Some(name) = (unsafe { str_arg(name) }) else {
         return std::ptr::null_mut();
     };
+    // SAFETY: the header's contract.
+    let shorty = unsafe { shorty_arg(shorty) };
     loader::symbol(handle as usize, name).map_or(std::ptr::null_mut(), |f| {
-        trampoline(f, down_kind(Some(name), jni_call_type))
+        trampoline(f, down_kind(Some(name), jni_call_type), shorty.as_deref())
     })
 }
 
 /// `RegisterNatives` with a guest pointer (jni_internal.cc, after `isNativeBridgeFunctionPointer`): the same trampoline as a looked-up method.
+///
+/// # Safety
+/// `shorty` is null or NUL-terminated (native_bridge.h).
 pub unsafe fn getTrampolineForFunctionPointer(
     method: *const c_void,
-    _shorty: *const c_char,
+    shorty: *const c_char,
     _len: u32,
     jni_call_type: u32,
 ) -> *mut c_void {
-    trampoline(method as usize, down_kind(None, jni_call_type))
+    // SAFETY: the header's contract.
+    let shorty = unsafe { shorty_arg(shorty) };
+    trampoline(
+        method as usize,
+        down_kind(None, jni_call_type),
+        shorty.as_deref(),
+    )
 }
 
 /// Whether `method` is guest code: inside an object the guest linker loaded.

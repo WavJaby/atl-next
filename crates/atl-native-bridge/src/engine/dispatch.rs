@@ -10,6 +10,7 @@ use super::jni::{self, Class, Refused};
 use super::unsupported;
 use crate::engine::bindings::JNI_STUBS;
 use crate::engine::bindings::qemu::THUNKS;
+use crate::engine::identity::Down;
 
 /// A trap from the engine, decoded from `atl_trap_kind`. `Boot` x0 = the auxv QEMU built for the boot executable (x1, its return stub, the engine keeps); `Call` and `Bind` carry their lanes (`atl_lanes`: x0..x7, v0..v7, eight stack words); `Report` x0.
 #[derive(Clone, Copy, Debug)]
@@ -251,4 +252,199 @@ fn refuse(r: Refused) -> ! {
     unsupported(&format!(
         "qemu crossing: refused {why} (refusals of this kind: {n})"
     ))
+}
+
+/// Host->guest entry (Q6-4, x86.rs `down_entries_asm`): the shell of down slot `slot` calls it with its frame's lanes.
+///
+/// # Safety
+/// `host` is the shell's frame, an `AtlLanes` live for the call and not otherwise accessed until it returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn atl_nb_down_dispatch(slot: usize, host: *mut AtlLanes) {
+    // SAFETY: the shell's frame, per the contract above.
+    down_body(slot, unsafe { &mut *host });
+}
+
+/// The host->guest body of down slot `slot` (Q6-4): `host` is the shell's frame with the host call's lanes; the guest call's lanes are placed by the slot's classes (`place`), and the guest's answer goes back in `host.x[0]` and `host.v[0]`.
+fn down_body(slot: usize, host: &mut AtlLanes) {
+    let Some(d) = super::qemu::down_slot(slot) else {
+        unsupported("qemu crossing: down shell without a binding")
+    };
+    let Some(mut guest) = place(&d.params, host) else {
+        refuse_down(d.target)
+    };
+    // the first argument of a JNI method, or of JNI_OnLoad, is the host's env or vm: the guest's own object stands for it (jni.rs), and it is the first integer, in x0
+    match d.kind {
+        Down::Env => guest.x[0] = jni::guest_env(guest.x[0] as usize) as u64,
+        Down::Vm => guest.x[0] = jni::guest_vm(guest.x[0] as usize) as u64,
+        Down::Plain => {}
+    }
+    super::qemu::call_down(d.target, &mut guest);
+    host.x[0] = guest.x[0];
+    host.v[0] = guest.v[0];
+}
+
+/// The lane classes of a down call's arguments (Q6-4). A JNI method's env and class (or `this`) come first, a `@CriticalNative` method's none; JNI_OnLoad and JNI_OnUnload, which ART calls with no shorty, take `(JavaVM*, void*)`. The shorty is `ArtMethod::GetShorty`: its first byte is the result, each further byte one parameter.
+pub(in crate::engine) fn down_params(
+    kind: Down,
+    shorty: Option<&[u8]>,
+) -> Result<Vec<Class>, String> {
+    let (implicit, s): (&[Class], &[u8]) = match (kind, shorty) {
+        (Down::Vm, None) => return Ok(vec![Class::Int, Class::Int]),
+        (Down::Env, Some(s)) => (&[Class::Int, Class::Int], s),
+        (Down::Plain, Some(s)) => (&[], s),
+        (kind, shorty) => {
+            return Err(format!("down call of kind {kind:?} with shorty {shorty:?}"));
+        }
+    };
+    let Some((ret, args)) = s.split_first() else {
+        return Err("down call with an empty shorty".into());
+    };
+    if !b"VZBCSIJFDL".contains(ret) {
+        return Err(format!("shorty result {:?}: no such type", *ret as char));
+    }
+    let mut params = implicit.to_vec();
+    for &c in args {
+        params.push(match c {
+            b'F' | b'D' => Class::Fp,
+            b'Z' | b'B' | b'C' | b'S' | b'I' | b'J' | b'L' => Class::Int,
+            other => {
+                return Err(format!(
+                    "shorty parameter {:?}: no such type",
+                    other as char
+                ));
+            }
+        });
+    }
+    Ok(params)
+}
+
+/// The guest call's lanes for a host call whose arguments have the classes `params` (Q6-4). Both ABIs take an integer from the integer registers (six on SysV, eight on AAPCS64) and a float or double from the fp registers (eight each), in declaration order; the rest go to the stack, one word each, in declaration order. Each side reads its words from its own image: `host` is the SysV image (x[0..6], v[0..8], the eight stack words), the result the AAPCS64 one. `None` when the host call needs more than eight stack words (R-1). The guest side never overflows the image: AAPCS64 has at least as many registers per class, so its stack words are a subset of the host's.
+fn place(params: &[Class], host: &AtlLanes) -> Option<AtlLanes> {
+    let mut guest = AtlLanes::default();
+    let (mut host_x, mut host_v, mut host_stack) = (0, 0, 0);
+    let (mut guest_x, mut guest_v, mut guest_stack) = (0, 0, 0);
+    for &class in params {
+        let word = match class {
+            Class::Int if host_x < 6 => {
+                host_x += 1;
+                host.x[host_x - 1]
+            }
+            Class::Fp if host_v < 8 => {
+                host_v += 1;
+                host.v[host_v - 1]
+            }
+            _ => {
+                let word = *host.stack.get(host_stack)?;
+                host_stack += 1;
+                word
+            }
+        };
+        match class {
+            Class::Int if guest_x < 8 => {
+                guest.x[guest_x] = word;
+                guest_x += 1;
+            }
+            Class::Fp if guest_v < 8 => {
+                guest.v[guest_v] = word;
+                guest_v += 1;
+            }
+            _ => {
+                guest.stack[guest_stack] = word;
+                guest_stack += 1;
+            }
+        }
+    }
+    Some(guest)
+}
+
+/// Refuses a down call whose host arguments need more than eight stack words (R-1, Q6-4): the lane image cannot carry them. Named and counted: a shorty this size fails on every call, so the count says how often it was asked.
+fn refuse_down(target: usize) -> ! {
+    static REFUSED: AtomicUsize = AtomicUsize::new(0);
+    let n = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+    unsupported(&format!(
+        "qemu crossing: refused down call to {target:#x}: its arguments need more than eight stack words, the lane image holds eight (R-1, refusals: {n})"
+    ))
+}
+
+#[cfg(test)]
+mod down_tests {
+    use super::*;
+
+    /// Nine integers: SysV takes six in %rdi..%r9 and three from the stack; AAPCS64 takes eight in x0..x7 and one from its stack. Expected values follow from those two rules.
+    #[test]
+    fn nine_integers_split_across_both_banks() {
+        let host = AtlLanes {
+            x: [10, 11, 12, 13, 14, 15, 0, 0],
+            stack: [100, 101, 102, 0, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        let guest = place(&[Class::Int; 9], &host).expect("three stack words fit");
+        assert_eq!(guest.x, [10, 11, 12, 13, 14, 15, 100, 101]);
+        assert_eq!(guest.stack[0], 102);
+    }
+
+    /// Eight doubles fill %xmm0..7 on both sides; a ninth double is the first stack word on both; an integer after them is %rdi on SysV and x0 on AAPCS64.
+    #[test]
+    fn ninth_double_is_the_first_stack_word() {
+        let host = AtlLanes {
+            x: [77, 0, 0, 0, 0, 0, 0, 0],
+            v: [1, 2, 3, 4, 5, 6, 7, 8],
+            stack: [9, 0, 0, 0, 0, 0, 0, 0],
+        };
+        let mut params = vec![Class::Fp; 9];
+        params.push(Class::Int);
+        let guest = place(&params, &host).expect("one stack word");
+        assert_eq!(
+            (guest.v, guest.stack[0], guest.x[0]),
+            ([1, 2, 3, 4, 5, 6, 7, 8], 9, 77)
+        );
+    }
+
+    /// The seventh integer is a stack word on SysV but a register on AAPCS64: the stack word crosses into x6, and the fp argument after it is xmm0 on SysV and v0 on AAPCS64.
+    #[test]
+    fn a_stack_integer_lands_in_a_guest_register() {
+        let host = AtlLanes {
+            x: [1, 2, 3, 4, 5, 6, 0, 0],
+            v: [8, 0, 0, 0, 0, 0, 0, 0],
+            stack: [7, 0, 0, 0, 0, 0, 0, 0],
+        };
+        let mut params = vec![Class::Int; 7];
+        params.push(Class::Fp);
+        let guest = place(&params, &host).expect("one stack word");
+        assert_eq!(guest.x, [1, 2, 3, 4, 5, 6, 7, 0]);
+        assert_eq!((guest.v[0], guest.stack), (8, [0; 8]));
+    }
+
+    /// Fourteen integers need eight stack words on SysV (six registers): the image holds them. Fifteen need nine: refused (R-1).
+    #[test]
+    fn nine_host_stack_words_are_refused() {
+        assert!(place(&[Class::Int; 14], &AtlLanes::default()).is_some());
+        assert!(place(&[Class::Int; 15], &AtlLanes::default()).is_none());
+    }
+
+    /// The shorty `DIDJ` (result double; int, double, long) under a JNI method: env and class first, then the three. JNI_OnLoad (no shorty) is `(JavaVM*, void*)`; a shorty without a method's env is refused.
+    #[test]
+    fn shorty_gives_the_classes() {
+        assert_eq!(
+            down_params(Down::Env, Some(&b"DIDJ"[..])),
+            Ok(vec![
+                Class::Int,
+                Class::Int,
+                Class::Int,
+                Class::Fp,
+                Class::Int
+            ])
+        );
+        assert_eq!(
+            down_params(Down::Plain, Some(&b"VF"[..])),
+            Ok(vec![Class::Fp])
+        );
+        assert_eq!(
+            down_params(Down::Vm, None),
+            Ok(vec![Class::Int, Class::Int])
+        );
+        assert!(down_params(Down::Env, None).is_err());
+        assert!(down_params(Down::Vm, Some(&b"V"[..])).is_err());
+        assert!(down_params(Down::Env, Some(&b"QI"[..])).is_err());
+    }
 }

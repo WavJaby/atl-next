@@ -24,9 +24,10 @@ use super::{Config, HostThread, unsupported};
 mod place;
 
 pub use super::dispatch::{Answer, OnTrap, Trap, on_trap};
+pub(super) use place::down_slot;
 pub use place::{
-    JNI_STUBS, bind, bind_result, is_stub, jni_stub, patch_entry, patch_hook, patch_site, register,
-    register_data,
+    JNI_STUBS, bind, bind_result, down, is_stub, jni_stub, patch_entry, patch_hook, patch_site,
+    register, register_data,
 };
 
 /// The guest ISA (atl-android-paths `native_bridge_bin` / `native_bridge_lib` directory): QEMU runs aarch64 guests.
@@ -230,6 +231,15 @@ fn call_on(tp: &mut u64, f: u64, lanes: &mut AtlLanes) {
         .unwrap_or_else(|| unsupported("engine table has no call_ex"));
     // SAFETY: handle and cpu are the engine's; cpu was attached on this thread (CPU is set only by attach_current); tp and lanes are writable and live for the call.
     unsafe { ex(e.handle, cpu, tp, f, lanes) }
+}
+
+/// Runs guest `f` for a host->guest down call (Q6-4, dispatch.rs `down_body`): on the calling thread's record (`thread::attach_current`, which attaches the CPU and the guest TCB on demand), with the record's thread pointer in and out, and `lanes` in and out (`call_ex`).
+pub(super) fn call_down(f: usize, lanes: &mut AtlLanes) {
+    // SAFETY: the record is this thread's and lives until its exit (thread.rs `attach_current`, `detach`); no other borrow of it is live here.
+    let ht = unsafe { &mut *super::thread::attach_current() };
+    let mut tp = ht.guest_fs() as u64;
+    call_on(&mut tp, f as u64, lanes);
+    ht.set_guest_fs(tp as usize);
 }
 
 /// Calls guest `f(args)` (integer arguments, at most eight) on this thread's CPU with thread pointer 0 (the boot executable has none); returns x0. For the gates; the crossing uses [`call_guest`].
