@@ -229,40 +229,6 @@ min_reason = "observed 2026-11-07; older is untested"
 scope = ["build"]
 used_by = ["xtask:native"]
 
-# the host intel_clc (intel_clc.rs, build-time only, never in an app process): Mesa finds LLVM through llvm-config, links the shared libLLVM, libclang-cpp and the SPIR-V translator, and reads libclc's spirv64 bitcode
-[llvm-dev]
-debian = "llvm-19-dev"
-arch = "llvm"
-binary = "llvm-config-19"
-min = "19.1.7"
-min_reason = "observed 2026-11-07; older is untested"
-scope = ["build"]
-used_by = ["xtask:native"]
-
-[libclang-cpp]
-debian = "libclang-cpp19-dev"
-arch = "clang"
-scope = ["build"]
-used_by = ["xtask:native"]
-
-[llvm-spirv-lib]
-debian = "libllvmspirvlib-19-dev"
-arch = "spirv-llvm-translator"
-pkgconfig = "LLVMSPIRVLib"
-min = "19.1.0"
-min_reason = "observed 2026-11-08; Mesa needs the translator of the same LLVM major as llvm-config"
-scope = ["build"]
-used_by = ["xtask:native"]
-
-[libclc]
-debian = "libclc-19-dev"
-arch = "libclc"
-pkgconfig = "libclc"
-min = "0.2.0"
-min_reason = "observed 2026-11-08; older is untested"
-scope = ["build"]
-used_by = ["xtask:native"]
-
 # the tcg smoke programs of QEMU's tests/tcg run through its generated Makefiles (qemu_gate.rs)
 [make]
 debian = "make"
