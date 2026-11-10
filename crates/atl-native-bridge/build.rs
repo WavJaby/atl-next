@@ -474,6 +474,7 @@ fn bindings_table(
     out: &std::path::Path,
     provider_soname: &str,
     qemu: bool,
+    x86_disp_bias: usize,
 ) -> Result<String> {
     let mut lists: Vec<(&str, Vec<String>)> = Vec::new();
     for &(soname, dir) in PROXY_LIBS {
@@ -645,6 +646,12 @@ fn bindings_table(
             ),
         )?;
     }
+    if !qemu {
+        std::fs::write(
+            out.join("x86_entries.s"),
+            atl_bridgegen::x86::entries_asm(thunks, JNI_STUBS, x86_disp_bias),
+        )?;
+    }
     code.push_str(&format!(
         "/// Thunk pool slots: the stub rows, the fixed bindings and the JNI slots, rounded to a power of two.\npub const THUNKS: usize = {thunks};\n\n/// JNI stubs: one per slot of the largest JNI table (build.rs `JNI_STUBS`).\npub const JNI_STUBS: usize = {JNI_STUBS};\n\n/// The bionic provider's soname (cargo-c's, build.rs `provider_soname`): `Host::Provider` resolves on its handle.\npub const PROVIDER_SONAME: &str = {provider_soname:?};\n\n"
     ));
@@ -701,7 +708,11 @@ const BREAKS: &[(&str, &str)] = &[
     ("qt_skip_dtor", "atl_nb_qt_skip_dtor"),
     // Q5-6 (engine/intercepts.rs `run`): a guest thread's routine gets the wrong argument (qemu-thread gate, `qt_join`)
     ("qt_routine_arg", "atl_nb_qt_routine_arg"),
+    // Q5-7 (bridgegen x86.rs `entries_asm`, disp_bias): every identity pool call's displacement one byte short, so each lands one byte past its shell (identity gates g1-g5 and unit test `thunk_slots_call_their_shell`)
+    ("x86_disp", X86_DISP_CFG),
 ];
+/// The cfg of the `x86_disp` break, read here: it selects the generator's displacement bias, no crate code.
+const X86_DISP_CFG: &str = "atl_nb_x86_disp";
 
 /// The cfgs `ATL_NB_BREAK` names, in order; an unknown name fails the build, naming it and the known ones.
 fn selected_breaks() -> Result<Vec<&'static str>> {
@@ -797,10 +808,16 @@ fn main() -> Result<()> {
     std::fs::write(out.join("jni_tables.rs"), jni_tables(&up, &target)?)?;
     std::fs::write(out.join("provider.rs"), provider(&up, &host, &out)?)?;
     let provider_soname = provider_soname(&manifest)?;
+    // Q5-7: the identity engine's byte templates (patch encodings), and its shells and pools (`bindings_table`)
+    std::fs::write(
+        out.join("x86_encodings.rs"),
+        atl_bridgegen::x86::constants_rust(),
+    )?;
+    let x86_disp_bias = usize::from(selected_breaks()?.contains(&X86_DISP_CFG));
     for (name, qemu) in [("identity", false), ("qemu", true)] {
         std::fs::write(
             out.join(format!("bindings_table_{name}.rs")),
-            bindings_table(&up, &host, &out, &provider_soname, qemu)?,
+            bindings_table(&up, &host, &out, &provider_soname, qemu, x86_disp_bias)?,
         )?;
     }
     println!("cargo::rerun-if-changed={}", arches.display());

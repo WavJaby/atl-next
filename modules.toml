@@ -210,7 +210,7 @@ uses = []
 
 [generators]
 crates = ["atl-bridgegen"]
-# build-dependency of crates whose types are generated from upstream headers
+# build-dependency of crates whose types are generated from upstream headers, and of atl-native-bridge's x86 entry shells, call pools and patch templates (bridgegen x86.rs, QEMU bridge plan Q5-7)
 exports = ["atl-bridgegen"]
 uses = ["layout"]
 
