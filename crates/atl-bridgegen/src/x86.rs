@@ -225,8 +225,8 @@ pub const DOWN_V_AT: usize = 64;
 /// Offset of `stack` in the down call's lanes.
 pub const DOWN_STACK_AT: usize = 128;
 
-/// Assembly for the down shells (QEMU host->guest, Q6-4), `.text`, for the engine's `global_asm!`: slot k is `movl $k, %r11d; jmp atl_nb_down_entry`. A host SysV call enters the shell; the entry builds the call's lanes on its own frame (x[0..6] = %rdi..%r9, v[0..8] = %xmm0..7, stack = the eight words above the return address), calls `atl_nb_down_dispatch(slot, lanes)` (engine/dispatch.rs), and returns %rax = lanes.x[0] and %xmm0 = lanes.v[0]. Both answers are always set; the caller reads the one its prototype names. The shells use only %r10, %r11 and the frame; %rbp is saved and restored.
-pub fn down_entries_asm(slots: usize) -> String {
+/// Assembly for the down shells (QEMU host->guest, Q6-4), `.text`, for the engine's `global_asm!`: slot k is `movl $k, %r11d; jmp atl_nb_down_entry`. A host SysV call enters the shell; the entry builds the call's lanes on its own frame (x[0..6] = %rdi..%r9, v[0..8] = %xmm0..7, stack = the eight words above the return address), calls `atl_nb_down_dispatch(slot, lanes)` (engine/dispatch.rs), and returns %rax = lanes.x[0] and %xmm0 = lanes.v[0]. Both answers are always set; the caller reads the one its prototype names. The shells use only %r10, %r11 and the frame; %rbp is saved and restored. `drop_stack` and `swap_v` are the breaks `down_drop_stack` and `down_swap_v` (build.rs `BREAKS`): the stack words start one word late, and %xmm0 and %xmm1 are exchanged on entry. Both false in every shipped build.
+pub fn down_entries_asm(slots: usize, drop_stack: bool, swap_v: bool) -> String {
     let mut s = String::from(
         ".text\n.p2align 4\n.hidden atl_nb_down_pool\n.globl atl_nb_down_pool\natl_nb_down_pool:\n",
     );
@@ -252,14 +252,17 @@ pub fn down_entries_asm(slots: usize) -> String {
         writeln!(s, "    movq $0, {}(%rsp)", 8 * i).expect("writing to a String");
     }
     for i in 0..8 {
-        writeln!(s, "    movsd %xmm{i}, {}(%rsp)", DOWN_V_AT + 8 * i).expect("writing to a String");
+        let src = if swap_v && i < 2 { 1 - i } else { i };
+        writeln!(s, "    movsd %xmm{src}, {}(%rsp)", DOWN_V_AT + 8 * i)
+            .expect("writing to a String");
     }
-    // the caller's first stack argument: above the return address, which the push of %rbp moved one word down
+    // the caller's first stack argument: above the return address, which the push of %rbp moved one word down; `drop_stack` starts one word later
+    let first = 16 + 8 * usize::from(drop_stack);
     for i in 0..8 {
         writeln!(
             s,
             "    mov {}(%rbp), %r10\n    mov %r10, {}(%rsp)",
-            16 + 8 * i,
+            first + 8 * i,
             DOWN_STACK_AT + 8 * i
         )
         .expect("writing to a String");

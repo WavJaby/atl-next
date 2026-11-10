@@ -3,7 +3,7 @@
 //! The fake records what each call got and answers with spec values: GetVersion gives JNI_VERSION_1_6 (jni.h), CallStaticIntMethod(a, b) gives a * 10 + b, so a swapped pair shows as 32, not 23. CallStaticDoubleMethod and CallStaticFloatMethod check the lanes they were given (the stack spill, the fp arguments) and answer from them.
 //! Driver: run without `ATL_QJ_CASE`, it first runs each refusal case in a child process (QEMU starts once per process), then the plain case in this process. A refusal case must abort by name: SIGABRT and its message on stderr.
 //! Env (xtask qemu_jni.rs sets it; unset prints SKIP): ATL_ENGINE_SO (the engine `.so`), ATL_NB_BOOT (testdata/qemu-linker/boot.c, static), ATL_NB_JNIEXE (fixture.c, PIE), ATL_NB_LINKER, ATL_NB_VDSO (the arm64 NB images; `<nb>/libnative_bridge_guest_libc` among the guest library directories).
-//! Checks: (s) started; (v) GetVersion returned JNI_VERSION_1_6; (e) all 11 calls reached the fake, each with the host env it was given; (c) FindClass and GetStaticMethodID got the names and the handles they issued, CallStaticIntMethod got (cls, mid, 2, 3), and the fixture got 23; (j) GetJavaVM, a special with its own host thunk, returned the guest vm of the fake vm; (t) NewStringUTF and GetStringUTFChars round-tripped "abc"; (d) SetDoubleField got 2.5, CallStaticDoubleMethod got its lanes and returned DOUBLE_EXPECT; (f) CallStaticFloatMethod returned FLOAT_EXPECT; (a) glibc atof, bound with result class Fp, returned ATOF_EXPECT in v0; (p) glibc snprintf, bound through `qemu::bind` and called from the guest with a double vararg, wrote SNPRINTF_EXPECT (the `%al` row); (r) a reserved slot, (l) a va_list entry, (g) a forged id past the table: each refused by name.
+//! Checks: (s) started; (v) GetVersion returned JNI_VERSION_1_6; (e) all 11 calls reached the fake, each with the host env it was given; (c) FindClass and GetStaticMethodID got the names and the handles they issued, CallStaticIntMethod got (cls, mid, 2, 3), and the fixture got 23; (j) GetJavaVM, a special with its own host thunk, returned the guest vm of the fake vm; (t) NewStringUTF and GetStringUTFChars round-tripped "abc"; (d) SetDoubleField got 2.5, CallStaticDoubleMethod got its lanes and returned DOUBLE_EXPECT; (f) CallStaticFloatMethod returned FLOAT_EXPECT; (a) glibc atof, bound with result class Fp, returned ATOF_EXPECT in v0; (p) glibc snprintf, bound through `qemu::bind` and called from the guest with a double vararg, wrote SNPRINTF_EXPECT (the `%al` row); (r) a reserved slot, (l) a va_list entry, (g) a forged id past the table: each refused by name. Q6-4 down calls, each through `qemu::down` with the host env or vm: (o) JNI_OnLoad returned JNI_VERSION_1_6 and got the guest vm and the reserved pointer; (m) nativeMix (14 arguments, a double result) got the guest env and class and returned MIX_EXPECT; (x) nativeScale (a float result) got the guest env and class and returned SCALE_EXPECT; (R) a down call of 15 integers is refused by name in its child.
 //! Output: `qemu-jni: (x) ok` per check, `(x) FAIL <why>` otherwise, exit 0 when all pass.
 #![expect(
     clippy::disallowed_types,
@@ -22,6 +22,7 @@ use std::process::{Command, ExitCode};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
+use atl_native_bridge::engine::identity::Down;
 use atl_native_bridge::engine::jni::{Class, guest_env, guest_vm};
 use atl_native_bridge::engine::{Config, Guest, qemu};
 use object::{Object, ObjectSymbol, read::elf::ElfFile64};
@@ -65,13 +66,41 @@ const FORGED_SLOT: usize = 240;
 /// The JNI calls fixture.c makes: GetVersion, FindClass, GetStaticMethodID, CallStaticIntMethod, GetJavaVM, NewStringUTF, GetStringUTFChars, ReleaseStringUTFChars, SetDoubleField, CallStaticDoubleMethod, CallStaticFloatMethod.
 const CALLS: usize = 11;
 /// The words of `out`: fixture.c's results at 0..7; the snprintf row (`p`) takes the pool address of its binding at 8, the buffer's address at 9, its size at 11 and returns snprintf's result at 10; the atof row (`a`) takes its binding at 12 and its argument at 13 and returns the result's bits at 14.
-const OUT_WORDS: usize = 15;
+/// Q6-4: the down calls' records (fixture.c `qj_seen`, copied by qj_run): JNI_OnLoad's vm at 15 and reserved at 16, nativeMix's env at 17 and class at 18, nativeScale's env at 19 and class at 20.
+const OUT_WORDS: usize = 21;
 /// The snprintf row (`p`): glibc's `snprintf("%d %.2f", 7, 2.5)` (C99 7.21.6.1: `%d` writes 7, `%.2f` writes 2.50), so the text and its length. The buffer has room for it and its NUL.
 const SNPRINTF_EXPECT: &str = "7 2.50";
 const SNP_CAP: usize = 16;
 /// The atof row (`a`): glibc's `atof("2.5")`, a double result in xmm0 that the binding answers in v0 (class Fp).
 const ATOF_TEXT: &[u8] = b"2.5\0";
 const ATOF_EXPECT: f64 = 2.5;
+
+/// The down calls (Q6-4; fixture.c `JNI_OnLoad`, `nativeMix`, `nativeScale`): their symbols, the reserved pointer JNI_OnLoad is given, and the shorties ART passes (the result, then each parameter: I int, J long, D double, F float).
+const ON_LOAD: &str = "JNI_OnLoad";
+const MIX: &str = "nativeMix";
+const SCALE: &str = "nativeScale";
+const RESERVED: usize = 0x0bad_f00d;
+const MIX_SHORTY: &[u8] = b"DIDJIDJIDJIDJ";
+const SCALE_SHORTY: &[u8] = b"FFI";
+/// nativeMix's arguments after env and class, in order: int, double, long, int, double, long, int, double, long, int, double, long.
+const MIX_A: i32 = 2;
+const MIX_B: f64 = 0.5;
+const MIX_C: i64 = 3;
+const MIX_D: i32 = 5;
+const MIX_E: f64 = 0.25;
+const MIX_F: i64 = 7;
+const MIX_G: i32 = 11;
+const MIX_H: f64 = 0.125;
+const MIX_I: i64 = 13;
+const MIX_J: i32 = 17;
+const MIX_K: f64 = 0.0625;
+const MIX_L: i64 = 19;
+/// nativeMix's answer: each argument times its weight 10^0 .. 10^11: 2 + 0.5*10 + 3*10^2 + 5*10^3 + 0.25*10^4 + 7*10^5 + 11*10^6 + 0.125*10^7 + 13*10^8 + 17*10^9 + 0.0625*10^10 + 19*10^11 = 1918937957807, exact in a double (below 2^53).
+const MIX_EXPECT: f64 = 1_918_937_957_807.0;
+/// nativeScale's arguments (1.5 and 6) and answer (1.5 * 6 + 0.25 = 9.25); all exact in a float.
+const SCALE_X: f32 = 1.5;
+const SCALE_N: i32 = 6;
+const SCALE_EXPECT: f32 = 9.25;
 
 // glibc's snprintf and atof, bound through the engine for their rows: the fixture calls them as guest functions
 unsafe extern "C" {
@@ -89,11 +118,20 @@ static STR_CHARS: &[u8] = b"abc\0";
 const REFUSE_RESERVED: i64 = 1;
 const REFUSE_VALIST: i64 = 2;
 const REFUSE_FORGED: i64 = 3;
+/// The R-1 case (`downstack`): not a fixture value; its child refuses a down call of `R1_INTS` integers before the guest runs it.
+const REFUSE_DOWN_STACK: i64 = 4;
+const R1_INTS: usize = 15;
 /// The refusal cases: name (`ATL_QJ_CASE`), the check letter, the value `qj_run` takes for it, and the words its named abort must carry.
 const CASES: &[(&str, char, i64, &str)] = &[
     ("reserved", 'r', REFUSE_RESERVED, "is reserved"),
     ("valist", 'l', REFUSE_VALIST, "takes a va_list"),
     ("forged", 'g', REFUSE_FORGED, "past the env table"),
+    (
+        "downstack",
+        'R',
+        REFUSE_DOWN_STACK,
+        "more than eight stack words",
+    ),
 ];
 
 /// The refusal case this process runs (0: the plain run): `qj_run`'s third argument.
@@ -121,10 +159,13 @@ struct Fake {
 }
 static FAKE: OnceLock<Fake> = OnceLock::new();
 
-/// What the checks compare against: the executable's entry and `qj_run`'s address, both from its ELF file (the load bias is their difference).
+/// What the checks compare against: the executable's entry and the addresses of `qj_run` and the down calls' functions, all from its ELF file (the load bias is the entry's difference).
 struct Expected {
     e_entry: u64,
     run: u64,
+    on_load: u64,
+    mix: u64,
+    scale: u64,
 }
 static EXPECTED: OnceLock<Expected> = OnceLock::new();
 
@@ -144,15 +185,48 @@ fn check(letter: char, result: Result<(), String>) -> bool {
 fn expected(exe: &Path) -> Result<Expected, String> {
     let bytes = std::fs::read(exe).map_err(|e| format!("{}: {e}", exe.display()))?;
     let elf = ElfFile64::<object::Endianness>::parse(&*bytes).map_err(|e| e.to_string())?;
-    let sym = elf
-        .symbols()
-        .find(|s| s.name().is_ok_and(|n| n == SYMBOL))
-        .ok_or_else(|| format!("{}: no symbol {SYMBOL}", exe.display()))?;
+    let address = |name: &str| {
+        elf.symbols()
+            .find(|s| s.name().is_ok_and(|n| n == name))
+            .map(|s| s.address())
+            .ok_or_else(|| format!("{}: no symbol {name}", exe.display()))
+    };
     Ok(Expected {
         e_entry: elf.entry(),
-        run: sym.address(),
+        run: address(SYMBOL)?,
+        on_load: address(ON_LOAD)?,
+        mix: address(MIX)?,
+        scale: address(SCALE)?,
     })
 }
+
+/// `qemu::down` for the guest function at `addr` in the ELF file, relocated by `bias`: the host-callable entry, bound as ART binds one.
+fn bind_down(addr: u64, bias: u64, kind: Down, shorty: Option<&[u8]>) -> usize {
+    qemu::down(bias.wrapping_add(addr) as usize, kind, shorty).expect("a free down shell")
+}
+
+/// The C prototypes of the down calls: JNI_OnLoad(JavaVM*, void*); nativeMix(JNIEnv*, jclass, then its 12 parameters); nativeScale(JNIEnv*, jclass, jfloat, jint); the R-1 call of 1 result and R1_INTS integers.
+type OnLoadFn = extern "C" fn(usize, usize) -> i32;
+type MixFn =
+    extern "C" fn(usize, usize, i32, f64, i64, i32, f64, i64, i32, f64, i64, i32, f64, i64) -> f64;
+type ScaleFn = extern "C" fn(usize, usize, f32, i32) -> f32;
+type R1Fn = extern "C" fn(
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+) -> usize;
 
 /// Counts a call, and counts it in `ENV_BAD` when its env is not the host env the fake gave (the route must pass the host object).
 fn seen(env: usize) {
@@ -372,6 +446,17 @@ fn started(r: Result<Guest, String>) -> u64 {
     // the guest env standing for the fake host env, made on this thread after BOOT (jni.rs `guest_env`)
     let env = guest_env(fake.env);
     let refuse = CASE.load(Ordering::Relaxed);
+    if refuse == REFUSE_DOWN_STACK {
+        // R-1 (Q6-4): 15 integers take six host registers and nine stack words, one more than the lane image holds: the shell refuses the call by name before the guest runs it
+        let mut shorty = vec![b'I'; R1_INTS + 1];
+        shorty[0] = b'V';
+        let entry = bind_down(x.on_load, bias, Down::Plain, Some(&shorty));
+        // SAFETY: `entry` is a down shell with R1_INTS integer parameters (R1Fn); the shell refuses the call and the process aborts, so the guest never runs it
+        let r1 = unsafe { std::mem::transmute::<usize, R1Fn>(entry) };
+        let _ = r1(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        println!("qemu-jni: FAIL refusal case {refuse} returned: the down call was not refused");
+        return 1;
+    }
     let mut out = [0i64; OUT_WORDS];
     // the forged-id case calls the stub of a JNI id past the env table
     out[7] = if refuse == REFUSE_FORGED {
@@ -388,6 +473,30 @@ fn started(r: Result<Guest, String>) -> u64 {
     out[12] =
         qemu::bind_result(atof as *const () as usize, Class::Fp).expect("a free pool slot") as i64;
     out[13] = ATOF_TEXT.as_ptr() as i64;
+    // the down calls (Q6-4): the host calls guest functions through `qemu::down`, as ART calls them: JNI_OnLoad with the host vm, nativeMix and nativeScale with the host env and class. They run before qj_run, which copies what the guest recorded to out[15..]
+    // SAFETY: a down shell bound for JNI_OnLoad (Vm kind, no shorty); OnLoadFn is its prototype, rax its answer
+    let on_load = unsafe {
+        std::mem::transmute::<usize, OnLoadFn>(bind_down(x.on_load, bias, Down::Vm, None))
+    };
+    // SAFETY: a down shell bound for nativeMix (Env kind, MIX_SHORTY); MixFn is its prototype, xmm0 its answer
+    let mix = unsafe {
+        std::mem::transmute::<usize, MixFn>(bind_down(x.mix, bias, Down::Env, Some(MIX_SHORTY)))
+    };
+    // SAFETY: a down shell bound for nativeScale (Env kind, SCALE_SHORTY); ScaleFn is its prototype, xmm0 its answer
+    let scale = unsafe {
+        std::mem::transmute::<usize, ScaleFn>(bind_down(
+            x.scale,
+            bias,
+            Down::Env,
+            Some(SCALE_SHORTY),
+        ))
+    };
+    let on_load_ret = on_load(fake.vm, RESERVED);
+    let mix_ret = mix(
+        fake.env, CLASS, MIX_A, MIX_B, MIX_C, MIX_D, MIX_E, MIX_F, MIX_G, MIX_H, MIX_I, MIX_J,
+        MIX_K, MIX_L,
+    );
+    let scale_ret = scale(fake.env, CLASS, SCALE_X, SCALE_N);
     // SAFETY: `run` is qj_run (ELF symbol plus the load bias), a function of a JNIEnv*, a long long[OUT_WORDS] and a long long (fixture.c); `env` is this thread's guest env and `out` stays writable for the call.
     unsafe { guest.call(run, env, out.as_mut_ptr() as usize, refuse as usize) };
     if refuse != 0 {
@@ -520,6 +629,52 @@ fn started(r: Result<Guest, String>) -> u64 {
                 "snprintf returned {}, wrote {printed:?}; expected {}, {SNPRINTF_EXPECT:?}",
                 out[10],
                 SNPRINTF_EXPECT.len()
+            ))
+        },
+    );
+    let vm = guest_vm(fake.vm);
+    let on_load_ok =
+        on_load_ret == JNI_VERSION_1_6 && out[15] == vm as i64 && out[16] == RESERVED as i64;
+    ok &= check(
+        'o',
+        if on_load_ok {
+            Ok(())
+        } else {
+            Err(format!(
+                "JNI_OnLoad returned {on_load_ret:#x} (expected {JNI_VERSION_1_6:#x}), received vm {:#x} (expected {vm:#x}) and reserved {:#x} (expected {RESERVED:#x})",
+                out[15], out[16]
+            ))
+        },
+    );
+    let mix_ok = mix_ret.to_bits() == MIX_EXPECT.to_bits()
+        && out[17] == guest_env(fake.env) as i64
+        && out[18] == CLASS as i64;
+    ok &= check(
+        'm',
+        if mix_ok {
+            Ok(())
+        } else {
+            Err(format!(
+                "nativeMix returned {mix_ret} (expected {MIX_EXPECT}), received env {:#x} (expected {:#x}) and class {:#x} (expected {CLASS:#x})",
+                out[17],
+                guest_env(fake.env),
+                out[18]
+            ))
+        },
+    );
+    let scale_ok = scale_ret.to_bits() == SCALE_EXPECT.to_bits()
+        && out[19] == guest_env(fake.env) as i64
+        && out[20] == CLASS as i64;
+    ok &= check(
+        'x',
+        if scale_ok {
+            Ok(())
+        } else {
+            Err(format!(
+                "nativeScale returned {scale_ret} (expected {SCALE_EXPECT}), received env {:#x} (expected {:#x}) and class {:#x} (expected {CLASS:#x})",
+                out[19],
+                guest_env(fake.env),
+                out[20]
             ))
         },
     );

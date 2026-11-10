@@ -13,6 +13,9 @@
 #define OBJ 0xb7e
 #define FIELD 0xf1d
 
+// Q6-4: the down calls (tests/qemu_jni.rs `started`) run JNI_OnLoad and two native methods here; each records what it was given, and qj_run copies the record to out[15..20]
+static long long qj_seen[6];
+
 // refuse: the third argument of qj_run; each value calls a JNI entry the host refuses by name (dispatch.rs `refuse`)
 #define REFUSE_NONE 0
 #define REFUSE_RESERVED 1
@@ -78,6 +81,32 @@ void qj_run(JNIEnv *env, long long *out, long long refuse) {
     } au;
     au.d = a;
     out[14] = au.i;
+    // Q6-4: JNI_OnLoad's vm and reserved, nativeMix's env and class, nativeScale's env and class
+    for (int k = 0; k < 6; k++) {
+        out[15 + k] = qj_seen[k];
+    }
+}
+
+// JNI_OnLoad(vm, reserved): ART calls it with no shorty, the host through a down shell (Vm kind); records both, returns JNI_VERSION_1_6 (jni.h)
+jint JNI_OnLoad(JavaVM *vm, void *reserved) {
+    qj_seen[0] = (long long)(intptr_t)vm;
+    qj_seen[1] = (long long)(intptr_t)reserved;
+    return JNI_VERSION_1_6;
+}
+
+// nativeMix: 14 parameters, ten of integer class and four double, so the call spills to the stack on both ABIs (AAPCS64 takes eight integers in registers, SysV six)
+// Each argument has its own weight, 10^0 .. 10^11 by position, so a misplaced one changes the sum (expected value: tests/qemu_jni.rs MIX_EXPECT)
+jdouble nativeMix(JNIEnv *env, jclass cls, jint a, jdouble b, jlong c, jint d, jdouble e, jlong f, jint g, jdouble h, jlong i, jint j, jdouble k, jlong l) {
+    qj_seen[2] = (long long)(intptr_t)env;
+    qj_seen[3] = (long long)(intptr_t)cls;
+    return a + b * 1e1 + c * 1e2 + d * 1e3 + e * 1e4 + f * 1e5 + g * 1e6 + h * 1e7 + i * 1e8 + j * 1e9 + k * 1e10 + l * 1e11;
+}
+
+// nativeScale: a float result from a float and an int (expected value: tests/qemu_jni.rs SCALE_EXPECT)
+jfloat nativeScale(JNIEnv *env, jclass cls, jfloat x, jint n) {
+    qj_seen[4] = (long long)(intptr_t)env;
+    qj_seen[5] = (long long)(intptr_t)cls;
+    return x * n + 0.25f;
 }
 
 // the executable needs a main (as qemu-thread's fixture has one); the guest linker starts it, the host calls qj_run

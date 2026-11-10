@@ -273,11 +273,15 @@ fn down_body(slot: usize, host: &mut AtlLanes) {
         refuse_down(d.target)
     };
     // the first argument of a JNI method, or of JNI_OnLoad, is the host's env or vm: the guest's own object stands for it (jni.rs), and it is the first integer, in x0
+    #[cfg(not(atl_nb_down_noenv))]
     match d.kind {
         Down::Env => guest.x[0] = jni::guest_env(guest.x[0] as usize) as u64,
         Down::Vm => guest.x[0] = jni::guest_vm(guest.x[0] as usize) as u64,
         Down::Plain => {}
     }
+    // break `down_noenv` (qemu-jni gate, checks o, m and x): the kind is not read, so the guest gets the host's env or vm
+    #[cfg(atl_nb_down_noenv)]
+    let _ = d.kind;
     super::qemu::call_down(d.target, &mut guest);
     host.x[0] = guest.x[0];
     host.v[0] = guest.v[0];
@@ -314,6 +318,15 @@ pub(in crate::engine) fn down_params(
                 ));
             }
         });
+    }
+    // break `shorty_swap` (qemu-jni gate, checks m, x and R): the first shorty parameter's class is flipped, so the host's argument reads the other bank; the 15-integer R-1 call then fits in eight stack words and is not refused
+    #[cfg(atl_nb_shorty_swap)]
+    if let Some(p) = params.get_mut(2) {
+        *p = if *p == Class::Int {
+            Class::Fp
+        } else {
+            Class::Int
+        };
     }
     Ok(params)
 }
