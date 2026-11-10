@@ -21,6 +21,8 @@ pub struct Arch {
     pub pointer_bits: u32,
     pub soong_arch_variant: Option<String>,
     pub kernel_arch: String,
+    /// Records of `asm-<kernel_arch>/asm/ptrace.h` the `<sys/ptrace.h>` shape wrapper declares (atl-bionic build.rs).
+    pub uapi_records: Vec<String>,
     pub host: Option<Host>,
     pub guest: Option<Guest>,
 }
@@ -160,6 +162,32 @@ pub fn check_kernel_arch(layout: &atl_layout::Layout, arches: &Arches) -> Result
         )
     })?;
     kernel_arch_matches(&text, arches).with_context(|| format!("{FILE} vs {}", path.display()))
+}
+
+/// Every row's `uapi_records` are declared by its `asm-<kernel_arch>/asm/ptrace.h` in the bionic checkout `layout` resolves (`struct <name> {`).
+/// Needs the fetched tree, as check_kernel_arch does.
+pub fn check_uapi_records(layout: &atl_layout::Layout, arches: &Arches) -> Result<()> {
+    for (name, arch) in arches {
+        let rel = format!(
+            "aosp/bionic/libc/kernel/uapi/asm-{}/asm/ptrace.h",
+            arch.kernel_arch
+        );
+        let path = layout.locate(Path::new(&rel)).dir;
+        let text = std::fs::read_to_string(&path).with_context(|| {
+            format!(
+                "reading {}: run `cargo xtask fetch --execute`",
+                path.display()
+            )
+        })?;
+        for record in &arch.uapi_records {
+            ensure!(
+                text.contains(&format!("struct {record} {{")),
+                "{name}: uapi_records names {record}, which {} does not declare",
+                path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn kernel_arch_matches(android_bp: &str, arches: &Arches) -> Result<()> {
@@ -499,14 +527,14 @@ mod tests {
     }
 
     const GUEST: &str = "android_abis = [\"x\"]\nclang = \"c\"\nqemu_target = \"q\"\n";
-    const K: &str = "kernel_arch = \"k\"\n";
+    const K: &str = "kernel_arch = \"k\"\nuapi_records = [\"r\"]\n";
 
     #[test]
     fn kernel_arch_against_bionic() {
         let bp = "cc_library_headers {\n    name: \"libc_uapi_headers\",\n    arch: {\n        a: {\n            export_system_include_dirs: [\"kernel/uapi/asm-ka\"],\n        },\n    },\n}\n\ncc_library_headers {\n    name: \"other\",\n    arch: {\n        a: {\n            export_system_include_dirs: [\"kernel/uapi/asm-wrong\"],\n        },\n    },\n}\n";
         let row = |k: &str| {
             parse(&format!(
-                "[a]\npointer_bits = 32\nkernel_arch = \"{k}\"\n[a.guest]\n{GUEST}"
+                "[a]\npointer_bits = 32\nkernel_arch = \"{k}\"\nuapi_records = [\"r\"]\n[a.guest]\n{GUEST}"
             ))
             .unwrap()
         };
@@ -541,6 +569,12 @@ mod tests {
     #[test]
     fn row_without_role() {
         assert!(err(&format!("[a]\npointer_bits = 64\n{K}")).contains("neither"));
+    }
+
+    #[test]
+    fn uapi_records_column_is_required() {
+        let text = format!("[a]\npointer_bits = 32\nkernel_arch = \"k\"\n[a.guest]\n{GUEST}");
+        assert!(err(&text).contains("uapi_records"));
     }
 
     #[test]

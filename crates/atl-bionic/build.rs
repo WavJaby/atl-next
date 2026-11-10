@@ -344,20 +344,17 @@ const EXTRA_INCLUDES: &[(&str, &str)] = &[
 struct UapiRecords {
     /// Include name; the file is the host arch's own, as bionic's search order finds it (`asm-<kernel_arch>`).
     uapi: &'static str,
-    records: &'static [&'static str],
     host_header: &'static str,
     /// Generated, under `capi/include`.
     header: &'static str,
 }
 
-/// `struct pt_regs`: libmemunreachable ThreadCapture.cpp takes the stack pointer's index in the
-/// `PTRACE_GETREGSET` buffer from it after `<sys/ptrace.h>`, which reaches it on bionic through
-/// `<linux/ptrace.h>`. The record only: uapi's `PTRACE_*` macros would turn glibc's C++ `enum
-/// __ptrace_request` enumerators into numbers. An arch whose uapi names it otherwise (arm64
-/// `user_pt_regs`) fails the generation until its record is listed.
+/// The register-set records of the host arch's uapi `asm/ptrace.h`, named by its arches.toml `uapi_records`:
+/// libmemunreachable ThreadCapture.cpp reads the stack pointer's index in the `PTRACE_GETREGSET` buffer from
+/// them after `<sys/ptrace.h>`, which reaches them on bionic through `<linux/ptrace.h>`. Records only: uapi's
+/// `PTRACE_*` macros would turn glibc's C++ `enum __ptrace_request` enumerators into numbers.
 const UAPI_RECORDS: &[UapiRecords] = &[UapiRecords {
     uapi: "asm/ptrace.h",
-    records: &["pt_regs"],
     host_header: "sys/ptrace.h",
     header: "atl-bionic/uapi/asm/ptrace.h",
 }];
@@ -683,7 +680,7 @@ fn generate(up: &Upstreams, host: &ArchRow, libcxx: &Path, out: &Path) -> Result
     })
 }
 
-/// The header declaring `row`'s records as bionic's uapi does, with their layout asserted.
+/// The header declaring the host's `uapi_records` as bionic's uapi does, with their layout asserted.
 fn uapi_records(
     up: &Upstreams,
     host: &ArchRow,
@@ -699,12 +696,13 @@ fn uapi_records(
         .display()
         .to_string();
     let iface = atl_bridgegen::interface(row.uapi, &label, &Source::c(&file, &[]), &[target])?;
+    let records: Vec<&str> = host.uapi_records.iter().map(String::as_str).collect();
     let kept = Kept {
-        records: row.records,
+        records: &records,
         ..Kept::default()
     };
     let text = atl_bridgegen::c::header(&iface, &host.arch, &[], &[], &kept)
-        .with_context(|| format!("{label}: {:?}", row.records))?;
+        .with_context(|| format!("{label}: {records:?}"))?;
     Ok((Path::new("capi/include").join(row.header), text))
 }
 

@@ -163,6 +163,7 @@ impl Step {
                 let arches = arches::load(root)?;
                 let layout = Layout::of(root)?;
                 arches::check_kernel_arch(&layout, &arches)?;
+                arches::check_uapi_records(&layout, &arches)?;
                 arches::check_prebuilt_os(&layout, &arches)?;
                 arches::check_cross(root, &arches)?;
                 arches::check_qemu_target(&layout, &arches)?;

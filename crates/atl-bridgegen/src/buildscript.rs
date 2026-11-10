@@ -186,6 +186,8 @@ pub struct ArchRow {
     /// clang triple of bionic on this arch (`[<arch>.guest] clang`): the view bionic's own headers are
     /// parsed in, whatever libc the host build uses.
     pub bionic_clang: String,
+    /// Records of `asm-<kernel_arch>/asm/ptrace.h` that bionic-view consumers read by layout (arches.toml `uapi_records`).
+    pub uapi_records: Vec<String>,
 }
 
 /// The checkout holding `manifest_dir`: the nearest ancestor with arches.toml.
@@ -273,10 +275,26 @@ fn arch_row(arch: &str, row: &toml::Value) -> Result<ArchRow> {
         .and_then(|g| g.get("clang"))
         .and_then(|c| c.as_str())
         .with_context(|| format!("arches.toml [{arch}.guest]: no clang triple"))?;
+    let uapi_records = row
+        .get("uapi_records")
+        .and_then(|r| r.as_array())
+        .with_context(|| format!("arches.toml [{arch}]: no uapi_records"))?
+        .iter()
+        .map(|r| {
+            r.as_str()
+                .map(str::to_owned)
+                .with_context(|| format!("arches.toml [{arch}]: uapi_records holds a non-string"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        !uapi_records.is_empty(),
+        "arches.toml [{arch}]: uapi_records is empty"
+    );
     Ok(ArchRow {
         arch: arch.to_owned(),
         kernel_arch: kernel_arch.to_owned(),
         bionic_clang: bionic_clang.to_owned(),
+        uapi_records,
     })
 }
 
@@ -471,13 +489,14 @@ mod tests {
 
     #[test]
     fn host_row_by_rust_triple() {
-        let text = "[a]\nkernel_arch = \"ka\"\n[a.host]\nrust = \"a-unknown-linux-gnu\"\n[a.guest]\nclang = \"a-linux-android\"\n[b]\nkernel_arch = \"kb\"\n[b.guest]\nclang = \"b-linux-android\"\n";
+        let text = "[a]\nkernel_arch = \"ka\"\nuapi_records = [\"r\"]\n[a.host]\nrust = \"a-unknown-linux-gnu\"\n[a.guest]\nclang = \"a-linux-android\"\n[b]\nkernel_arch = \"kb\"\n[b.guest]\nclang = \"b-linux-android\"\n";
         assert_eq!(
             host_arch(text, "a-unknown-linux-gnu").unwrap(),
             ArchRow {
                 arch: "a".into(),
                 kernel_arch: "ka".into(),
                 bionic_clang: "a-linux-android".into(),
+                uapi_records: vec!["r".into()],
             }
         );
         // a guest-only row is never a host

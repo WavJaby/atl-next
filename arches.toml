@@ -7,6 +7,7 @@
 #   soong_arch_variant  ISA baseline AOSP code is built for in either role (TARGET_ARCH_VARIANT / TARGET_NATIVE_BRIDGE_ARCH_VARIANT); absent = Soong's baseline for the arch.
 #                     Soong has no baseline for arm/arm64 and rejects a missing or unknown variant there.
 #   kernel_arch       Linux kernel arch: the uapi `asm-<kernel_arch>` directory (bionic `libc_uapi_headers` arch block, checked against the fetched tree)
+#   uapi_records      records `asm-<kernel_arch>/asm/ptrace.h` declares that AOSP's <sys/ptrace.h> consumers read by layout: the arch's branch of libmemunreachable ThreadCapture.cpp (pt_regs on arm/x86, user_pt_regs on arm64, user_regs_struct on riscv64). atl-bionic emits them; checked against that header (xtask check tables)
 # `[<arch>.host]` present = we build and run on it (one 64-bit process per app):
 #   rust              Rust target triple of the host build
 #   meson_cpu_family  meson `cpu_family` (QEMU cross files)
@@ -32,6 +33,7 @@
 [arm]
 pointer_bits = 32
 kernel_arch = "arm"
+uapi_records = ["pt_regs"]
 # AOSP's generic boards use it for 32-bit arm
 soong_arch_variant = "armv7-a-neon"
 
@@ -43,6 +45,7 @@ qemu_target = "arm"
 [arm64]
 pointer_bits = 64
 kernel_arch = "arm64"
+uapi_records = ["user_pt_regs"]
 # ARMv8.0: what every arm64 app may assume
 soong_arch_variant = "armv8-a"
 
@@ -60,6 +63,7 @@ qemu_target = "aarch64"
 [riscv64]
 pointer_bits = 64
 kernel_arch = "riscv"
+uapi_records = ["user_regs_struct"]
 
 [riscv64.host]
 rust = "riscv64gc-unknown-linux-gnu"
@@ -80,6 +84,7 @@ qemu_target = "riscv64"
 [x86]
 pointer_bits = 32
 kernel_arch = "x86"
+uapi_records = ["pt_regs"]
 
 [x86.guest]
 android_abis = ["x86"]
@@ -89,6 +94,7 @@ qemu_target = "i386"
 [x86_64]
 pointer_bits = 64
 kernel_arch = "x86"
+uapi_records = ["pt_regs"]
 
 [x86_64.host]
 rust = "x86_64-unknown-linux-gnu"
