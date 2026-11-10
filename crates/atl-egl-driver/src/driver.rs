@@ -212,7 +212,10 @@ impl Driver {
             let gl = ctx.make_current()?;
             Orientation::probe(&host, &gl.string(atl_egl_host::ffi::GL_EXTENSIONS))
         };
-        #[allow(clippy::print_stderr, reason = "one line, once per process: which tier ran")]
+        #[allow(
+            clippy::print_stderr,
+            reason = "one line, once per process: which tier ran"
+        )]
         {
             eprintln!("libGLES_atl: window tier {tier}");
         }

@@ -5,6 +5,7 @@
 //! Orientation (driver.rs `Orientation`): the buffer is stored top-down, as its consumer reads it; the driver sets no buffer transform and the app's own (`ANativeWindow_setBuffersTransform`) passes through.
 //! - `FlipY` tier: framebuffer 0 is the buffer's FBO, rendering top-down (`GL_MESA_framebuffer_flip_y`, as Mesa's platform_android does for its window surfaces).
 //! - `Blit` tier: framebuffer 0 is a per-context back FBO (colour + depth/stencil, rendering bottom-up as GL does); swap blits it into the buffer's colour-only FBO with y inverted. Cost: one full-surface copy per frame + one colour renderbuffer per context.
+//!
 //! Damage rects the fronts convert assuming top-down buffers are then right as they are.
 
 use std::collections::HashMap;
@@ -217,7 +218,11 @@ impl WindowSurface {
         let dst = self.buffer_fbo(d, ctx, id)?;
         let (w, h) = (self.width, self.height);
         // the `no_blit_flip` break (build.rs `BREAKS`): the copy keeps GL's bottom-up rows
-        let (y0, y1) = if cfg!(atl_egl_no_blit_flip) { (0, h) } else { (h, 0) };
+        let (y0, y1) = if cfg!(atl_egl_no_blit_flip) {
+            (0, h)
+        } else {
+            (h, 0)
+        };
         let gl = &d.gl;
         // SAFETY: the current context; both FBOs are its own and complete; the app's scissor test (the one fragment state a blit obeys) is restored.
         unsafe {
