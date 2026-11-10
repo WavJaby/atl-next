@@ -61,6 +61,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 
+use crate::Refusals;
 use crate::front::{Probe, Reached};
 
 /// `bits/` holds both libcs' private headers ("never include directly"): never included by name.
@@ -300,13 +301,22 @@ fn walk(inputs: &Inputs, probe: &Probe, includable: &dyn Fn(&str) -> bool) -> Re
 /// no public bionic header the host also has brings in, or bionic defines two ways; on a substitute the
 /// host has, bionic lacks or that does not substitute (`substitute_macros`).
 pub fn derive(inputs: &Inputs) -> Result<Shape> {
+    let mut refusals = Refusals::default();
+    let shape = derive_all(inputs, &mut refusals)?;
+    refusals.finish()?;
+    Ok(shape)
+}
+
+/// `derive`, each refusal recorded in `refusals` and its item left out, so one run reports all of them. An error is a
+/// failure to read the inputs, not a refusal.
+pub fn derive_all(inputs: &Inputs, refusals: &mut Refusals) -> Result<Shape> {
     let views = [&inputs.default, &inputs.gnu];
     let host_has = |n: &str| {
         views
             .iter()
             .any(|v| v.host.get(n).is_some_and(Probe::usable))
     };
-    let uapi: BTreeMap<String, PathBuf> = inputs
+    let mut uapi: BTreeMap<String, PathBuf> = inputs
         .kernel
         .iter()
         .filter(|(n, _)| !inputs.scan.contains_key(*n) && !host_has(n))
@@ -317,6 +327,7 @@ pub fn derive(inputs: &Inputs) -> Result<Shape> {
     } else {
         HostText::read(inputs)?
     };
+    let mut refused = Vec::new();
     for (name, file) in &uapi {
         let text =
             std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
@@ -325,40 +336,47 @@ pub fn derive(inputs: &Inputs) -> Result<Shape> {
             .filter(|d| host_text.clashes(d))
             .filter_map(|d| macro_name(&d).map(str::to_owned))
             .collect();
-        ensure!(
-            clashes.is_empty(),
-            "bionic-only uapi header <{name}>: host headers use its macros {clashes:?} as identifiers"
-        );
+        if !clashes.is_empty() {
+            refusals.push(anyhow::anyhow!(
+                "bionic-only uapi header <{name}>: host headers use its macros {clashes:?} as identifiers"
+            ));
+            refused.push(name.clone());
+        }
+    }
+    for name in refused {
+        uapi.remove(&name);
     }
 
-    let d = derive_view(inputs, &inputs.default, &host_text)?;
-    let g = derive_view(inputs, &inputs.gnu, &host_text)?;
+    let d = derive_view(inputs, &inputs.default, &host_text, refusals)?;
+    let g = derive_view(inputs, &inputs.gnu, &host_text, refusals)?;
     let unused: Vec<&str> = inputs
         .homes
         .iter()
         .map(|(f, _)| *f)
         .filter(|f| !d.homes_used.contains(*f) && !g.homes_used.contains(*f))
         .collect();
-    ensure!(
-        unused.is_empty(),
-        "homes no header needs any more (delete them): {unused:?}"
-    );
+    if !unused.is_empty() {
+        refusals.push(anyhow::anyhow!(
+            "homes no header needs any more (delete them): {unused:?}"
+        ));
+    }
     for (header, inc) in inputs.extra {
         let row = ((*header).to_owned(), (*inc).to_owned());
-        ensure!(
-            !(d.reached.contains(&row) && g.reached.contains(&row)),
-            "extra include of <{header}>: the host's already reaches <{inc}> (delete the row)"
-        );
+        if d.reached.contains(&row) && g.reached.contains(&row) {
+            refusals.push(anyhow::anyhow!(
+                "extra include of <{header}>: the host's already reaches <{inc}> (delete the row)"
+            ));
+        }
     }
     for &m in inputs.macros {
         if d.emitted.contains(m) || g.emitted.contains(m) {
             continue;
         }
-        ensure!(
-            !(d.host_macros.contains(m) && g.host_macros.contains(m)),
-            "the host's headers define {m}: drop it from the forwarded macros"
-        );
-        bail!("no public bionic header the host also has defines {m} or brings it in");
+        refusals.push(if d.host_macros.contains(m) && g.host_macros.contains(m) {
+            anyhow::anyhow!("the host's headers define {m}: drop it from the forwarded macros")
+        } else {
+            anyhow::anyhow!("no public bionic header the host also has defines {m} or brings it in")
+        });
     }
 
     let mut out: BTreeMap<String, Wrapper> = BTreeMap::new();
@@ -367,10 +385,10 @@ pub fn derive(inputs: &Inputs) -> Result<Shape> {
     for name in names {
         let (dw, gw) = (d.wrappers.get(name), g.wrappers.get(name));
         let substitute = dw.or(gw).is_some_and(|w| w.substitute);
-        ensure!(
-            dw.into_iter().chain(gw).all(|w| w.substitute == substitute),
-            "<{name}>: a substitute in one view only"
-        );
+        if !dw.into_iter().chain(gw).all(|w| w.substitute == substitute) {
+            refusals.push(anyhow::anyhow!("<{name}>: a substitute in one view only"));
+            continue;
+        }
         let (dw, gw) = (dw.unwrap_or(&none), gw.unwrap_or(&none));
         out.insert(
             name.clone(),
@@ -384,7 +402,10 @@ pub fn derive(inputs: &Inputs) -> Result<Shape> {
             },
         );
     }
-    for name in cxx_linkage(inputs.cxx, inputs.cxx_std)? {
+    for name in refusals
+        .take(cxx_linkage(inputs.cxx, inputs.cxx_std))
+        .unwrap_or_default()
+    {
         out.entry(name).or_default().c_linkage = true;
     }
     // the hidden names: host headers using an emitted macro as an identifier, whichever view reaches them;
@@ -423,8 +444,8 @@ pub fn derive(inputs: &Inputs) -> Result<Shape> {
 }
 
 /// The host headers (include names) whose own file declares functions with C++ linkage in C++ `cxx`
-/// probes. Fails on another file doing so: a private one, which no wrapper includes by its name. Files under
-/// the C++ standard library's directory `std` are C++ by design and skipped.
+/// probes. Fails, naming every one, on another file doing so: a private one, which no wrapper includes by its name. Files
+/// under the C++ standard library's directory `std` are C++ by design and skipped.
 fn cxx_linkage(cxx: &BTreeMap<String, Probe>, std: &Path) -> Result<BTreeSet<String>> {
     let own: BTreeMap<&PathBuf, &String> = cxx
         .iter()
@@ -432,21 +453,31 @@ fn cxx_linkage(cxx: &BTreeMap<String, Probe>, std: &Path) -> Result<BTreeSet<Str
         .filter_map(|(n, p)| p.file.as_ref().map(|f| (f, n)))
         .collect();
     let mut out = BTreeSet::new();
+    // one file reached by many probes is one refusal
+    let mut private: BTreeMap<&PathBuf, &BTreeSet<String>> = BTreeMap::new();
     for probe in cxx.values() {
         for (file, reached) in &probe.files {
             if reached.cxx_linkage.is_empty() || file.starts_with(std) {
                 continue;
             }
-            let name = own.get(file).with_context(|| {
-                format!(
-                    "{} declares {:?} with C++ linkage, and is no probed header's own file",
-                    file.display(),
-                    reached.cxx_linkage
-                )
-            })?;
-            out.insert((*name).clone());
+            match own.get(file) {
+                Some(name) => {
+                    out.insert((*name).clone());
+                }
+                None => {
+                    private.insert(file, &reached.cxx_linkage);
+                }
+            }
         }
     }
+    let mut refusals = Refusals::default();
+    for (file, functions) in private {
+        refusals.push(anyhow::anyhow!(
+            "{} declares {functions:?} with C++ linkage, and is no probed header's own file",
+            file.display()
+        ));
+    }
+    refusals.finish()?;
     Ok(out)
 }
 
@@ -505,20 +536,27 @@ struct ViewShape {
     emitted: BTreeSet<String>,
 }
 
-/// The shape of one view's probes `p` (`derive`).
-fn derive_view(inputs: &Inputs, p: &Probes, host_text: &HostText) -> Result<ViewShape> {
+/// The shape of one view's probes `p` (`derive_all`): a refused header, row or macro is recorded and left out.
+fn derive_view(
+    inputs: &Inputs,
+    p: &Probes,
+    host_text: &HostText,
+    refusals: &mut Refusals,
+) -> Result<ViewShape> {
     let host_has = |n: &str| p.host.get(n).is_some_and(Probe::usable);
     let host_all: BTreeSet<&String> = p.host.values().flat_map(visible).collect();
     let mut out = ViewShape::default();
     for s in inputs.substitutes {
-        ensure!(
-            !host_has(s),
-            "the host has <{s}>: drop it from the substitutes"
-        );
-        ensure!(
-            p.bionic.get(*s).is_some_and(Probe::usable),
-            "substitute <{s}>: bionic has no usable such public header"
-        );
+        if host_has(s) {
+            refusals.push(anyhow::anyhow!(
+                "the host has <{s}>: drop it from the substitutes"
+            ));
+        }
+        if !p.bionic.get(*s).is_some_and(Probe::usable) {
+            refusals.push(anyhow::anyhow!(
+                "substitute <{s}>: bionic has no usable such public header"
+            ));
+        }
     }
     // what an included name gives: the host's header, or for a substitute bionic's (generated whole), so
     // `<endian.h>` includes the `<sys/endian.h>` substitute (`betoh64`) instead of walking it as private
@@ -558,101 +596,107 @@ fn derive_view(inputs: &Inputs, p: &Probes, host_text: &HostText) -> Result<View
         } else {
             &shaped
         };
-        let host_reached = host.map_or_else(
-            || BTreeSet::from([name.as_str()]),
-            |h| reached_names(name, h),
-        );
-        let walk = walk(inputs, bionic, &|n: &str| shaped.contains_key(n))?;
-        let mut extras: BTreeSet<String> = walk
-            .includable
-            .into_iter()
-            .filter(|n| n != name && !host_reached.contains(n.as_str()))
-            .collect();
-        let mut seen: BTreeSet<&String> = host
-            .into_iter()
-            .flat_map(visible)
-            .chain(extras.iter().flat_map(|e| visible(shaped[e.as_str()])))
-            .collect();
-        let root = bionic
-            .file
-            .as_ref()
-            .context("usable probe without a file")?;
-        // a substitute's own names are walked as a private file's: the host declares them elsewhere
-        let own = host.is_none().then(|| (name.clone(), root.clone()));
-        let files: Vec<(String, PathBuf)> = own.into_iter().chain(walk.private).collect();
-        let (defines, overrides) = if host.is_none() {
-            substitute_macros(inputs, name, bionic, &files, &host_all, host_text)?
-        } else {
-            Default::default()
-        };
-        if let Some(o) = inputs
-            .overrides
-            .iter()
-            .find(|o| o.substitute == name.as_str())
-        {
-            ensure!(host.is_none(), "override row <{name}>: not a substitute");
-            ensure!(
-                shaped.contains_key(o.host),
-                "override row <{name}>: the host has no <{}>",
-                o.host
+        let mut header = || -> Result<()> {
+            let host_reached = host.map_or_else(
+                || BTreeSet::from([name.as_str()]),
+                |h| reached_names(name, h),
             );
-            extras.insert(o.host.to_owned());
-        }
-        for (label, file) in files {
-            let needed: BTreeSet<&String> = bionic.files[&file]
-                .names
-                .iter()
-                .filter(|n| !seen.contains(n) && host_all.contains(n))
+            let walk = walk(inputs, bionic, &|n: &str| shaped.contains_key(n))?;
+            let mut extras: BTreeSet<String> = walk
+                .includable
+                .into_iter()
+                .filter(|n| n != name && !host_reached.contains(n.as_str()))
                 .collect();
-            if needed.is_empty() {
-                continue;
-            }
-            let Some(&(_, home)) = inputs.homes.iter().find(|(f, _)| *f == label) else {
-                out.gaps.push(Gap {
-                    header: name.clone(),
-                    homes: home_candidates(p.host, &needed),
-                    file: label,
-                    names: needed.iter().map(|n| (*n).clone()).collect(),
-                    guard: Guard::Always,
-                });
-                continue;
+            let mut seen: BTreeSet<&String> = host
+                .into_iter()
+                .flat_map(visible)
+                .chain(extras.iter().flat_map(|e| visible(shaped[e.as_str()])))
+                .collect();
+            let root = bionic
+                .file
+                .as_ref()
+                .context("usable probe without a file")?;
+            // a substitute's own names are walked as a private file's: the host declares them elsewhere
+            let own = host.is_none().then(|| (name.clone(), root.clone()));
+            let files: Vec<(String, PathBuf)> = own.into_iter().chain(walk.private).collect();
+            let (defines, overrides) = if host.is_none() {
+                substitute_macros(inputs, name, bionic, &files, &host_all, host_text)?
+            } else {
+                Default::default()
             };
-            out.homes_used.insert(label.clone());
-            let home_probe = p
-                .host
-                .get(home)
-                .filter(|p| p.usable())
-                .with_context(|| format!("home of {label}: the host has no <{home}>"))?;
-            let declared: BTreeSet<&String> = visible(home_probe).collect();
-            let lacking: Vec<&&String> = needed.iter().filter(|n| !declared.contains(*n)).collect();
-            ensure!(
-                lacking.is_empty(),
-                "home of {label}: <{home}> does not declare {lacking:?}, which bionic's <{name}> brings in"
-            );
-            seen.extend(declared);
-            extras.insert(home.to_owned());
-        }
-        let includes = reduce(&extras, shaped);
-        if host.is_none() {
-            out.wrappers.insert(
-                name.clone(),
-                Plain {
-                    substitute: true,
-                    includes,
-                    defines,
-                    overrides,
-                },
-            );
-        } else if !includes.is_empty() {
-            out.wrappers.entry(name.clone()).or_default().includes = includes;
-        }
+            if let Some(o) = inputs
+                .overrides
+                .iter()
+                .find(|o| o.substitute == name.as_str())
+            {
+                ensure!(host.is_none(), "override row <{name}>: not a substitute");
+                ensure!(
+                    shaped.contains_key(o.host),
+                    "override row <{name}>: the host has no <{}>",
+                    o.host
+                );
+                extras.insert(o.host.to_owned());
+            }
+            for (label, file) in files {
+                let needed: BTreeSet<&String> = bionic.files[&file]
+                    .names
+                    .iter()
+                    .filter(|n| !seen.contains(n) && host_all.contains(n))
+                    .collect();
+                if needed.is_empty() {
+                    continue;
+                }
+                let Some(&(_, home)) = inputs.homes.iter().find(|(f, _)| *f == label) else {
+                    out.gaps.push(Gap {
+                        header: name.clone(),
+                        homes: home_candidates(p.host, &needed),
+                        file: label,
+                        names: needed.iter().map(|n| (*n).clone()).collect(),
+                        guard: Guard::Always,
+                    });
+                    continue;
+                };
+                out.homes_used.insert(label.clone());
+                let home_probe = p
+                    .host
+                    .get(home)
+                    .filter(|p| p.usable())
+                    .with_context(|| format!("home of {label}: the host has no <{home}>"))?;
+                let declared: BTreeSet<&String> = visible(home_probe).collect();
+                let lacking: Vec<&&String> =
+                    needed.iter().filter(|n| !declared.contains(*n)).collect();
+                ensure!(
+                    lacking.is_empty(),
+                    "home of {label}: <{home}> does not declare {lacking:?}, which bionic's <{name}> brings in"
+                );
+                seen.extend(declared);
+                extras.insert(home.to_owned());
+            }
+            let includes = reduce(&extras, shaped);
+            if host.is_none() {
+                out.wrappers.insert(
+                    name.clone(),
+                    Plain {
+                        substitute: true,
+                        includes,
+                        defines,
+                        overrides,
+                    },
+                );
+            } else if !includes.is_empty() {
+                out.wrappers.entry(name.clone()).or_default().includes = includes;
+            }
+            Ok(())
+        };
+        refusals.take(header());
     }
     for (header, inc) in inputs.extra {
-        let host = p
-            .host
-            .get(*header)
-            .filter(|p| p.usable())
-            .with_context(|| format!("extra include of <{header}>: the host has no such header"))?;
+        let Some(host) = p.host.get(*header).filter(|p| p.usable()) else {
+            refusals.push(anyhow::anyhow!(
+                "extra include of <{header}>: the host has no such header"
+            ));
+            continue;
+        };
         if reached_names(header, host).contains(inc) {
             out.reached
                 .insert(((*header).to_owned(), (*inc).to_owned()));
@@ -673,7 +717,10 @@ fn derive_view(inputs: &Inputs, p: &Probes, host_text: &HostText) -> Result<View
             out.host_macros.insert((*m).to_owned());
             continue;
         }
-        for (header, def) in macro_homes(inputs, p, m, &host_has)? {
+        let Some(homes) = refusals.take(macro_homes(inputs, p, m, &host_has)) else {
+            continue;
+        };
+        for (header, def) in homes {
             out.emitted.insert((*m).to_owned());
             out.wrappers.entry(header).or_default().defines.push(def);
         }
@@ -1506,7 +1553,10 @@ mod tests {
         let err = cxx_linkage(&cxx, &root.join("elsewhere"))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("v1/new") && err.contains("operator delete"), "{err}");
+        assert!(
+            err.contains("v1/new") && err.contains("operator delete"),
+            "{err}"
+        );
         // a private file has no wrapper to put it in extern "C"
         let cxx = front::probe_includes(Lang::Cxx, &t, &["a.h"]).unwrap();
         let err = cxx_linkage(&cxx, std).unwrap_err().to_string();
@@ -1614,6 +1664,16 @@ mod tests {
         // a macro the host defines, or no bionic header brings in, is refused
         assert!(derived_with(&dir, home, &["q"], &[]).is_err());
         assert!(derived_with(&dir, home, &["__nowhere"], &[]).is_err());
+        // both in one run: every refusal is reported, not the first
+        let both = derived_with(&dir, home, &["q", "__nowhere"], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            both.starts_with("2 refusals:")
+                && both.contains("the host's headers define q")
+                && both.contains("defines __nowhere or brings it in"),
+            "{both}"
+        );
         assert!(with_home.gaps.is_empty());
 
         // without the home: reported, with both host headers declaring q (one file each, by name);

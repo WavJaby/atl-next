@@ -41,6 +41,36 @@ pub fn interface(
     })
 }
 
+/// A generation run's guard refusals, collected so one run reports all of them before it fails; each guard stays as strict as
+/// a first-error stop. A refused item is left out of the output, so a later check may refuse what follows from that (cascade).
+#[derive(Debug, Default)]
+pub struct Refusals(Vec<String>);
+
+impl Refusals {
+    /// Records `e` with its context chain.
+    pub fn push(&mut self, e: anyhow::Error) {
+        self.0.push(format!("{e:#}"));
+    }
+
+    /// `r`'s value, or `None` with its error recorded.
+    pub fn take<T>(&mut self, r: Result<T>) -> Option<T> {
+        r.map_err(|e| self.push(e)).ok()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Fails listing every refusal, if any.
+    pub fn finish(self) -> Result<()> {
+        match self.0.as_slice() {
+            [] => Ok(()),
+            [one] => anyhow::bail!("{one}"),
+            all => anyhow::bail!("{} refusals:\n- {}", all.len(), all.join("\n- ")),
+        }
+    }
+}
+
 /// The IR as JSON: maps are ordered, so equal interfaces give equal bytes.
 pub fn to_json(iface: &ir::Interface) -> Result<String> {
     Ok(serde_json::to_string_pretty(iface)? + "\n")
