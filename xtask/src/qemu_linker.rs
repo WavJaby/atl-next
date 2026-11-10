@@ -11,7 +11,7 @@
 //!
 //! Pass: every check prints ok and the run exits 0; each break must turn its run red. Output: `<out>/qemu/<target>-linux-user-pic/qemu-linker/`, one log per run.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -19,12 +19,12 @@ use anyhow::{Context, Result, ensure};
 use object::{Object, ObjectSection};
 
 use crate::atld_run;
-use crate::deps;
 use crate::jni_fixture::{self, NdkTarget};
 use crate::qemu::{self, GUEST_API};
 use crate::qemu_spike;
 use crate::unit_use::{self, Echo, Units};
 use crate::verdict::{Failure, Verdict};
+use atl_broker::bwrap;
 
 const TESTDATA: &str = "xtask/testdata/qemu-linker";
 const PACKAGE: &str = "atl-native-bridge";
@@ -306,24 +306,26 @@ fn staged(
     }
     let system = atl_android_paths::SYSTEM;
     // bwrap's root is a tmpfs, so /system can be made on it; every host top-level entry is bound as it is (devices included: cargo, sccache), except one named /system
-    let mut wrap: Vec<OsString> = vec![deps::binary(root, "bubblewrap")?.into()];
+    let mut a = bwrap::Args::new();
     for entry in std::fs::read_dir("/").context("listing /")? {
         let path = entry?.path();
         if path == Path::new(system) {
             continue;
         }
-        if let Ok(target) = std::fs::read_link(&path) {
-            wrap.extend(["--symlink".into(), target.into(), path.into()]);
-        } else {
-            wrap.extend(["--dev-bind".into(), path.clone().into(), path.into()]);
-        }
+        match std::fs::read_link(&path) {
+            Ok(target) => a.symlink(target, &path),
+            Err(_) => a.dev_bind(&path, &path),
+        };
     }
-    wrap.extend([
-        "--ro-bind".into(),
-        stage.join(system.trim_start_matches('/')).into(),
-    ]);
-    // no `--` before the command: unit_use inserts cargo's --message-format before the first `--` (cargo's own); the command is an absolute path, never taken for an option
-    wrap.extend([system.into(), "--die-with-parent".into()]);
+    a.ro_bind(stage.join(system.trim_start_matches('/')), system)
+        .die_with_parent();
+    let mut wrap: Vec<OsString> = vec![bwrap::PROGRAM.into()];
+    wrap.extend(a.end());
+    // drop bwrap's closing `--`: unit_use inserts cargo's --message-format before the first `--` it finds, which must be cargo's; the command (cargo) is never taken for an option
+    ensure!(
+        wrap.pop().as_deref() == Some(OsStr::new("--")),
+        "bwrap::Args::end did not close with --"
+    );
     let env: [(&str, &Path); 1] = [("ATL_NB_STAGED", Path::new("1"))];
     harness_in(root, dir, &STAGED, &env, dir, brk, name, &wrap)
 }
