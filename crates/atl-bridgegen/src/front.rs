@@ -157,6 +157,8 @@ pub struct Reached {
     /// specification, not `static` (internal linkage has no language linkage that matters). A C header
     /// meant for C++ callers declares none (`__BEGIN_DECLS`); `extern "C++"` ones are deliberate.
     pub cxx_linkage: BTreeSet<String>,
+    /// Parameter names of the function declarations it holds: byte offset of the name -> name. A macro defined empty leaves such a name harmless in a prototype (shape.rs `HostText::clashes`); every other use of it still clashes.
+    pub params: BTreeMap<usize, String>,
 }
 
 /// One include directive.
@@ -469,6 +471,16 @@ fn declared(
                 reached.names.extend(e.get_name());
                 if cxx_linkage && e.get_storage_class() != Some(StorageClass::Static) {
                     reached.cxx_linkage.extend(e.get_name());
+                }
+                // parameter names by offset in this file; a name a macro expansion spells is located at the expansion, which spells the macro, not the name
+                for p in e.get_arguments().unwrap_or_default() {
+                    let (Some(name), Some(at)) = (p.get_name(), p.get_location()) else {
+                        continue;
+                    };
+                    let at = at.get_file_location();
+                    if at.file.as_ref().is_some_and(|f| f.get_path() == path) {
+                        reached.params.insert(at.offset as usize, name);
+                    }
                 }
             }
             EntityKind::VarDecl | EntityKind::TypedefDecl => {

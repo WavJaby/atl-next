@@ -36,12 +36,8 @@
 //! includes a host header (bionic's `sys/_system_properties.h` is `#include <sys/system_properties.h>`);
 //! only substitutes do: every other wrapper keeps bionic's shape of the host's headers.
 //!
-//! Kernel uapi headers only bionic carries (`kernel`; Android kernel features a desktop distro's
-//! headers lack: `linux/incrementalfs.h`, `linux/ashmem.h`): every one the host does not resolve is
-//! forwarded -- a generated header including bionic's file by absolute path, so depfiles (and the licence
-//! gate) name bionic's file, not a copy. Derived, never listed; a name the host resolves is never
-//! shadowed. Refused when a host header uses one of its macros as an identifier without defining it the
-//! same way, as for substitutes.
+//! Kernel uapi headers only bionic carries (`kernel`; Android kernel features a desktop distro's headers lack: `linux/incrementalfs.h`, `linux/ashmem.h`): every one the host does not resolve is forwarded -- a generated header including bionic's file by absolute path, so depfiles (and the licence gate) name bionic's file, not a copy. Derived, never listed; a name the host resolves is never shadowed.
+//! Refused when a host header uses one of its macros as an identifier without defining it the same way, as for substitutes; a macro defined empty is spared where the use is a prototype's parameter name (`HostText::clashes`).
 //!
 //! Views: everything above is derived twice, from probes without feature macros and with `_GNU_SOURCE`
 //! (`Inputs::gnu`). clang++ predefines `_GNU_SOURCE`, so device C++ sees bionic's `__USE_GNU` sections
@@ -678,22 +674,36 @@ fn derive_view(inputs: &Inputs, p: &Probes, host_text: &HostText) -> Result<View
     Ok(out)
 }
 
-/// What the host headers' text says, for a substitute's macros: every identifier they use, and every
-/// macro definition they write (`NAME body`, whitespace collapsed).
+/// What the host headers' text says, for a substitute's and a uapi header's macros: every identifier they use, every macro definition they write (`NAME body`, whitespace collapsed).
 #[derive(Default)]
 struct HostText {
     idents: BTreeSet<String>,
+    /// The identifiers used other than as a parameter name of a function declaration (`Reached::params`).
+    non_param: BTreeSet<String>,
     defines: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl HostText {
-    /// Every header the clash scan reads (`scanned`).
+    /// Every header the clash scan reads (`scanned`). A use is a parameter name where a probe of either view parsed it as one (`Reached::params`); a file no probe reaches has none, so each of its uses counts.
     fn read(inputs: &Inputs) -> Result<Self> {
+        let mut by_file: BTreeMap<&Path, BTreeMap<usize, &str>> = BTreeMap::new();
+        for probe in inputs.default.host.values().chain(inputs.gnu.host.values()) {
+            for (file, reached) in &probe.files {
+                let params = by_file.entry(file.as_path()).or_default();
+                params.extend(reached.params.iter().map(|(at, name)| (*at, name.as_str())));
+            }
+        }
         let mut out = Self::default();
         for path in scanned(inputs).values() {
             let text = std::fs::read_to_string(path)
                 .with_context(|| format!("reading {}", path.display()))?;
-            out.idents.extend(identifiers(&text).map(str::to_owned));
+            let params = by_file.get(path.as_path());
+            for (at, ident) in identifier_spans(&text) {
+                out.idents.insert(ident.to_owned());
+                if !params.is_some_and(|p| p.get(&at) == Some(&ident)) {
+                    out.non_param.insert(ident.to_owned());
+                }
+            }
             for def in defines_in(&text) {
                 if let Some(name) = macro_name(&def) {
                     out.defines
@@ -706,13 +716,17 @@ impl HostText {
         Ok(out)
     }
 
-    /// Defining `def` (`NAME body`) would change what a host header means: it uses the name and does
-    /// not define it exactly so itself (the kernel's `__LITTLE_ENDIAN_BITFIELD` is bionic's too).
+    /// Defining `def` (`NAME body`) would change what a host header means: it uses the name and does not define it exactly so itself (the kernel's `__LITTLE_ENDIAN_BITFIELD` is bionic's too). Defined empty (`NAME`), a parameter name stays harmless: `const char *NAME` is `const char *` (linux/compiler.h's `__user` in glibc's `getgrouplist`), so only the other uses count.
     fn clashes(&self, def: &str) -> bool {
         let Some(name) = macro_name(def) else {
             return false;
         };
-        self.idents.contains(name)
+        let used = if def == name {
+            &self.non_param
+        } else {
+            &self.idents
+        };
+        used.contains(name)
             && self
                 .defines
                 .get(name)
@@ -963,6 +977,11 @@ pub fn uses_identifier(text: &str, ident: &str) -> bool {
 /// The identifiers of C source `text`, in order: outside comments and string / character literals.
 /// Number tokens come out too (`1234`, `1u`); they never equal an identifier.
 pub fn identifiers(text: &str) -> impl Iterator<Item = &str> {
+    identifier_spans(text).map(|(_, ident)| ident)
+}
+
+/// `identifiers` with each one's byte offset in `text`.
+pub fn identifier_spans(text: &str) -> impl Iterator<Item = (usize, &str)> {
     let b = text.as_bytes();
     let word = |c: u8| c == b'_' || c.is_ascii_alphanumeric();
     let mut i = 0;
@@ -987,7 +1006,7 @@ pub fn identifiers(text: &str) -> impl Iterator<Item = &str> {
                     while i < b.len() && word(b[i]) {
                         i += 1;
                     }
-                    return Some(&text[start..i]);
+                    return Some((start, &text[start..i]));
                 }
                 _ => i += 1,
             }
@@ -1631,5 +1650,88 @@ mod tests {
             "// generated by atl-bridgegen from uapi/k/v.h, do not edit\n#include \"/b/uapi/k/v.h\"\n"
         );
         assert!(print_forward(Path::new("k/v.h"), "x").is_err());
+    }
+
+    /// Derives a fake libc (bionic's `pa.h` is empty, the host's `pa.h` is `host`) with one bionic-only uapi header `k/c.h` = `uapi_def`: the shape, or the refusal.
+    fn uapi_clash(tag: &str, uapi_def: &str, host: &str) -> Result<Shape> {
+        let dir =
+            Tmp(std::env::temp_dir().join(format!("atl-shape-uapi-{tag}-{}", std::process::id())));
+        let files: &[(&str, &str)] = &[
+            ("bionic/pa.h", "int pa;\n"),
+            ("host/pa.h", host),
+            ("uapi/k/c.h", uapi_def),
+        ];
+        for (rel, text) in files {
+            let path = dir.0.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let include = dir.0.join("bionic");
+        let uapi = [dir.0.join("uapi")];
+        let bionic_t = sysroot(&[include.clone(), uapi[0].clone()]);
+        let host_t = sysroot(&[dir.0.join("host")]);
+        let gnu = |mut t: Target| {
+            t.args.push("-D_GNU_SOURCE".to_owned());
+            t
+        };
+        let bionic = front::probe_includes(Lang::C, &bionic_t, &["pa.h"])?;
+        let bionic_gnu = front::probe_includes(Lang::C, &gnu(bionic_t), &["pa.h"])?;
+        let names: Vec<String> = host_names(&[&bionic, &bionic_gnu], &include, &uapi, &[])
+            .into_iter()
+            .collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let host_p = front::probe_includes(Lang::C, &host_t, &names)?;
+        let host_gnu =
+            front::probe_includes(Lang::C, &gnu(sysroot(&[dir.0.join("host")])), &names)?;
+        let cxx = front::probe_includes(Lang::Cxx, &gnu(sysroot(&[dir.0.join("host")])), &names)?;
+        let scan = front::resolve_includes(Lang::C, &host_t, &["k/c.h"])?;
+        let kernel = front::resolve_includes(Lang::C, &sysroot(&uapi), &["k/c.h"])?;
+        derive(&Inputs {
+            default: Probes {
+                bionic: &bionic,
+                host: &host_p,
+            },
+            gnu: Probes {
+                bionic: &bionic_gnu,
+                host: &host_gnu,
+            },
+            bionic_include: &include,
+            uapi: &uapi,
+            homes: &[],
+            macros: &[],
+            substitutes: &[],
+            overrides: &[],
+            declared: &[],
+            scan: &scan,
+            kernel: &kernel,
+            extra: &[],
+            cxx: &cxx,
+        })
+    }
+
+    /// `__user` in linux/compiler.h is defined empty: a host use is harmless only as a parameter name of a prototype (glibc's `getgrouplist (const char *__user, ...)`). A field name clashes, and any use clashes under a non-empty define.
+    #[test]
+    fn uapi_clash_spares_only_parameter_names_of_empty_macros() {
+        let shape = uapi_clash(
+            "param",
+            "#define __user\n",
+            "extern int f (const char *__user, int);\nstatic int g (int __user);\n",
+        )
+        .expect("parameter names of an empty macro are harmless");
+        assert!(shape.uapi.contains_key("k/c.h"));
+        let e = uapi_clash("field", "#define __user\n", "struct s { int __user; };\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("<k/c.h>: host headers use its macros [\"__user\"]"),
+            "{e}"
+        );
+        let e = uapi_clash("body", "#define __user 1\n", "extern int f (int __user);\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("<k/c.h>: host headers use its macros [\"__user\"]"),
+            "{e}"
+        );
     }
 }
