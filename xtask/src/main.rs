@@ -328,7 +328,7 @@ enum Test {
     ///
     /// Builds first (as `xtask qemu --pic --execute`); needs the arm64 NB build (as `test qemu-linker`) and `--nb` pointing at its `<out>/nb/arm64`. Logs in `<out>/qemu/<target>-linux-user-pic/qemu-thread/`.
     QemuThread(qemu_thread::Args),
-    /// The crossing counter under QEMU (QEMU bridge plan Q5-8, feature `crossing-count`): the fixture's N calls per binding count N, sizes fall in their literal bins, 2^16 crossings dump once; the `qe_id` break must turn it red; the library without the feature has no counter symbol. Builds first (as `xtask qemu --pic --execute`); needs the arm64 NB build (as `test qemu-thread`) and `--nb` pointing at its `<out>/nb/arm64`. Logs in `<out>/qemu/<target>-linux-user-pic/crossing/`.
+    /// The crossing counter of both engines (QEMU bridge plan Q5-8, feature `crossing-count`): identity host-thunk and JNI shells, then QEMU; the fixture's N calls per binding count N, sizes fall in their literal bins, 2^16 crossings dump once; the `id_count` and `qe_id` breaks must turn it red; the library without the feature has no counter symbol. Builds first (as `xtask qemu --pic --execute`); needs the arm64 NB build (as `test qemu-thread`) and `--nb` pointing at its `<out>/nb/arm64`. Logs in `<out>/qemu/<target>-linux-user-pic/crossing/`.
     Crossing(crossing::Args),
     /// The identity native-bridge gates g1-g5 (x86_64 engine, no QEMU) with their `ATL_NB*` env taken from this checkout's out dir (`nb/x86_64`, the staged `app/`), not set by hand.
     ///
