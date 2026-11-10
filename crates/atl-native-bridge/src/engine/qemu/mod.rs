@@ -441,7 +441,11 @@ mod tests {
         let thunk = bind(target as *const () as usize).expect("a free pool slot");
         let base = &raw const pool::POOL as usize;
         let id = u32::try_from((thunk - base) / THUNK_BYTES).expect("slot fits an id");
-        // a * 100 + h with a = 1, h = 8
-        assert_eq!(call_binding(id, [1, 2, 3, 4, 5, 6, 7, 8]), 108);
+        // a * 100 + h with a = 1, h = 8 (x7: the seventh and eighth integer words reach the target from the stack)
+        let lanes = atl_engine_api::AtlLanesV1 {
+            x: [1, 2, 3, 4, 5, 6, 7, 8],
+            ..Default::default()
+        };
+        assert_eq!(call_binding(id, &lanes).x0, 108);
     }
 }

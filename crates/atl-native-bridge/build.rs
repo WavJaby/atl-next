@@ -745,6 +745,12 @@ const BREAKS: &[(&str, &str)] = &[
     ("jni_guest_env", "atl_nb_jni_guest_env"),
     // Q6-2 (engine/dispatch.rs `call_jni`): x3 and x4 exchanged, so CallStaticIntMethod(2, 3) reaches the host as (3, 2) (qemu-jni gate, `c`)
     ("jni_swap", "atl_nb_jni_swap"),
+    // Q6-3 (engine/dispatch.rs `call_host`): the fp lanes reach the host as zeros (qemu-jni gate, `d` and `f`)
+    ("v_drop", "atl_nb_v_drop"),
+    // Q6-3 (engine/dispatch.rs `call_host`): the stack words reach the host one word early (qemu-jni gate, `d`)
+    ("drop_stack", "atl_nb_drop_stack"),
+    // Q6-3 (engine/dispatch.rs `fp_result`): an fp result is read from x0 (qemu-jni gate, `d` and `f`)
+    ("ret_int", "atl_nb_ret_int"),
     // Q6-1 (engine/qemu/mod.rs `host_trap_ex`): the stack words a trap delivers arrive one word late (qemu-abi gate, `k`)
     ("qa_stack_off", "atl_qa_stack_off"),
     // Q6-1 (engine/qemu/mod.rs `host_trap_ex`): the FP lanes a trap delivers arrive one register late (qemu-abi gate, `v`)

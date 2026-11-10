@@ -14,10 +14,11 @@ mod slots {
 }
 use slots::{env, vm};
 
-/// Per slot, the lane descriptor (build.rs `jni_lanes`); not read yet: the QEMU JNI route takes it (Q6-3).
+/// Per slot, the lane descriptor (build.rs `jni_lanes`): [`lane_of`] reads it.
 mod lanes {
     include!(concat!(env!("OUT_DIR"), "/jni_lanes.rs"));
 }
+pub(super) use lanes::Class;
 
 const _: () = assert!(
     env::SLOTS.len() <= super::bindings::JNI_STUBS && vm::SLOTS.len() <= super::bindings::JNI_STUBS
@@ -37,19 +38,16 @@ struct GuestObj {
 }
 const _: () = assert!(std::mem::offset_of!(GuestObj, host) == 8);
 
-/// A guest function table: slot i = JNI stub i, a special's host function, or null for jni.h's `reserved*`.
+/// A guest function table: slot i = JNI stub i (a reserved slot's stub refuses by name when called, dispatch.rs `refuse`), or a special's host function.
 fn table(names: &[&str], specials: &[(usize, usize)], host: usize) -> Box<[usize]> {
     names
         .iter()
         .enumerate()
-        .map(|(slot, name)| {
+        .map(|(slot, _)| {
             if let Some(&(_, f)) = specials.iter().find(|&&(s, _)| s == slot) {
                 return active()
                     .bind(f)
                     .unwrap_or_else(|| super::unsupported("JNI specials: host thunks used up"));
-            }
-            if name.starts_with("reserved") {
-                return 0;
             }
             direct_break(slot, host).unwrap_or_else(|| active().jni_stub(slot))
         })
@@ -162,6 +160,42 @@ pub fn guest_vm(host: usize) -> usize {
 pub(super) unsafe fn host_of(guest: usize) -> usize {
     // SAFETY: caller contract.
     unsafe { (*(guest as *const GuestObj)).host }
+}
+
+/// Why a guest JNI call is refused (dispatch.rs `refuse`, the named abort of owner decision D-4).
+pub(super) enum Refused {
+    /// The id is past the table of its object (`table`: "env" or "vm", `len` entries).
+    Forged {
+        id: usize,
+        table: &'static str,
+        len: usize,
+    },
+    /// A jni.h `reserved*` field: no function behind it.
+    Reserved { id: usize },
+    /// A `...V` variant: its `va_list` is a pointer the host would have to read, not converted (Q6-3).
+    VaList { name: &'static str },
+}
+
+/// The lane descriptor of guest JNI call `id` made on guest object `guest`. The table is the vm's for the process's one guest vm (`guest_vm`), else the env's. Refused: an id past the table, a reserved slot, a parameter of class `VaList`.
+pub(super) fn lane_of(guest: usize, id: usize) -> Result<&'static lanes::Lane, Refused> {
+    let (table, name): (&'static [Option<lanes::Lane>], &'static str) = if VM.get() == Some(&guest)
+    {
+        (&lanes::vm::LANES, "vm")
+    } else {
+        (&lanes::env::LANES, "env")
+    };
+    match table.get(id) {
+        None => Err(Refused::Forged {
+            id,
+            table: name,
+            len: table.len(),
+        }),
+        Some(None) => Err(Refused::Reserved { id }),
+        Some(Some(lane)) if lane.params.contains(&Class::VaList) => {
+            Err(Refused::VaList { name: lane.name })
+        }
+        Some(Some(lane)) => Ok(lane),
+    }
 }
 
 /// The host env behind guest env `guest` (0 = 0), for the NDK shims (ndk.rs): an NDK function takes a `JNIEnv*` and calls the host library through it.
