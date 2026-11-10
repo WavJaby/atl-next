@@ -50,6 +50,7 @@ mod gralloc;
 mod host_art;
 mod host_disk;
 mod instrument;
+mod isa_gate;
 mod jni_fixture;
 mod keepset;
 mod land;
@@ -140,6 +141,8 @@ enum Command {
     ///
     /// Dry run by default: prints the environment and the cargo command. `--execute` runs it. The sysroot must be fetched first (`deps --fetch`).
     Cross(cross::Args),
+    /// Static gate over a cross host's ELF outputs: each riscv64 ELF's Tag_RISCV_arch within the row's isa, its GLIBC needs within glibc_floor (isa_gate.rs).
+    IsaGate(isa_gate::Args),
     /// Upstream checkouts under <workspace>/src at the pins in sources.toml. `--test-apks` fetches the test APKs of test-apks.toml instead.
     ///
     /// Dry run by default (offline): shows what each checkout needs. The AOSP manifest (pinned in
@@ -369,6 +372,7 @@ fn main() -> Result<ExitCode> {
         Command::Check(args) => check::run(&root, &args),
         Command::Deps(args) => deps::run(&root, &args),
         Command::Cross(args) => cross::run(&root, &args),
+        Command::IsaGate(args) => isa_gate::run(&root, &args),
         Command::Fetch(args) => fetch::run(&root, &args),
         Command::Aosp(args) => aosp::run(&root, &args),
         Command::Keepset(args) => keepset::run(&root, &args),

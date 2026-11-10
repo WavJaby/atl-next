@@ -527,6 +527,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if let Some(first) = runpath_gate(&out)? {
         failed.push(Failure::step("runpath gate", first));
     }
+    if let Some(first) = isa_floor_gate(&out, host)? {
+        failed.push(Failure::step("isa gate", first));
+    }
     if let Some(first) = licence_gate(root, &layout, &sources, &out, args.verbose)? {
         failed.push(Failure::step("licence gate", first));
     }
@@ -1244,6 +1247,19 @@ fn runpath_gate(out: &Path) -> Result<Option<String>> {
         println!("native:   runpath: {v}");
     }
     Ok(violations.first().cloned())
+}
+
+/// The ISA and glibc-floor gate (isa_gate.rs) over this cross host's outputs; its first violation, None when it passes. The build machine's row has no isa: not checked.
+fn isa_floor_gate(out: &Path, host: &arches::Host) -> Result<Option<String>> {
+    if host.isa.is_none() {
+        return Ok(None);
+    }
+    let report = crate::isa_gate::check(out, host)?;
+    println!("native: isa gate: {}", crate::isa_gate::summary(&report));
+    for v in report.violations.iter().take(5) {
+        println!("native:   isa: {v}");
+    }
+    Ok(report.violations.first().cloned())
 }
 
 /// The licence gate (licence_gate.rs) over the device artifacts ninja produced, failed ones aside; false on a denied or unresolved file or a stale artifact.

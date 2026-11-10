@@ -37,6 +37,8 @@ pub struct Host {
     pub isa: Option<String>,
     pub clang: Option<String>,
     pub sysroot: Option<String>,
+    /// Newest GLIBC_x.y an output may need (dotted, `2.39`): the glibc of the oldest machine the outputs run on. Required with isa.
+    pub glibc_floor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -123,6 +125,15 @@ fn validate(arches: &Arches) -> Result<()> {
             arch.host.is_some() || arch.guest.is_some(),
             "{name}: neither [{name}.host] nor [{name}.guest]"
         );
+        if let Some(host) = &arch.host {
+            ensure!(
+                host.isa.is_none() || host.glibc_floor.is_some(),
+                "{name}: isa without glibc_floor (the outputs' glibc floor)"
+            );
+            if let Some(floor) = &host.glibc_floor {
+                dotted_version(floor).with_context(|| format!("{name}: glibc_floor"))?;
+            }
+        }
         if let Some(guest) = &arch.guest {
             ensure!(!guest.android_abis.is_empty(), "{name}: empty android_abis");
             for abi in &guest.android_abis {
@@ -202,6 +213,41 @@ pub fn isa_extensions(isa: &str) -> Result<Vec<String>> {
         );
     }
     Ok(extensions)
+}
+
+/// The extensions an `isa` row allows, implied ones included: `rv64gc_zba_zbb` -> a c d f i m zaamo zalrsc zba zbb zca zcd zicsr zifencei zmmul.
+/// The base is the riscv64gc Rust target's (G = IMAFD_Zicsr_Zifencei, plus C); the implications are the RISC-V unprivileged ISA's. rv64 only: zcf (C with F) is an rv32 rule.
+pub fn isa_closure(isa: &str) -> Result<BTreeSet<String>> {
+    const BASE: [&str; 8] = ["i", "m", "a", "f", "d", "c", "zicsr", "zifencei"];
+    const IMPLIED: [(&[&str], &[&str]); 6] = [
+        (&["m"], &["zmmul"]),
+        (&["a"], &["zaamo", "zalrsc"]),
+        (&["f"], &["zicsr"]),
+        (&["d"], &["f"]),
+        (&["c"], &["zca"]),
+        (&["c", "d"], &["zcd"]),
+    ];
+    let mut set: BTreeSet<String> = BASE.iter().map(|e| e.to_string()).collect();
+    set.extend(isa_extensions(isa)?);
+    loop {
+        let before = set.len();
+        for (premises, implied) in IMPLIED {
+            if premises.iter().all(|p| set.contains(*p)) {
+                set.extend(implied.iter().map(|e| e.to_string()));
+            }
+        }
+        if set.len() == before {
+            return Ok(set);
+        }
+    }
+}
+
+/// `2.39` -> `[2, 39]`: a dotted numeric version (glibc_floor, and the GLIBC_ names), compared as a vector.
+pub fn dotted_version(text: &str) -> Result<Vec<u32>> {
+    text.split('.')
+        .map(|part| part.parse::<u32>())
+        .collect::<std::result::Result<Vec<u32>, _>>()
+        .with_context(|| format!("`{text}` is not a dotted version"))
 }
 
 /// The cross columns of every host row that has them: `isa` extensions are rustc target features of its Rust
@@ -392,6 +438,27 @@ mod tests {
     }
 
     #[test]
+    fn isa_closure_adds_the_implied_extensions() {
+        // written from the ISA manual's rules (G, M, A, F, D, C), not computed by isa_closure
+        let want = [
+            "a", "c", "d", "f", "i", "m", "zaamo", "zalrsc", "zba", "zbb", "zca", "zcd", "zicsr",
+            "zifencei", "zmmul",
+        ];
+        let got: Vec<String> = super::isa_closure("rv64gc_zba_zbb")
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn dotted_versions_compare_as_vectors() {
+        assert_eq!(super::dotted_version("2.39").unwrap(), [2, 39]);
+        assert!(super::dotted_version("2.41").unwrap() > super::dotted_version("2.39").unwrap());
+        assert!(super::dotted_version("2.").is_err());
+    }
+
+    #[test]
     fn cross_target_needs_all_three_columns_off_the_build_machine() {
         let row = |clang: Option<&str>, sysroot: Option<&str>, isa: Option<&str>| super::Host {
             rust: "t".into(),
@@ -402,6 +469,7 @@ mod tests {
             isa: isa.map(Into::into),
             clang: clang.map(Into::into),
             sysroot: sysroot.map(Into::into),
+            glibc_floor: None,
         };
         // the build machine's own row is native, whatever it lists
         assert_eq!(
