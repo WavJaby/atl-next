@@ -22,13 +22,24 @@
 #   scope    build | runtime | test (static checks count as test)
 #   used_by  typed references, each checked to exist: crate:<workspace crate>,
 #            upstream:<sources.toml name or aosp>, xtask:<subcommand>, host:<arch> (the sysroot named by
-#            arches.toml [<arch>.host]: that cross host's native build uses it; checked against that row)
+#            arches.toml [<arch>.host]: that cross host's native build uses it; checked against that row),
+#            optional:<crate, upstream or xtask reference> (that consumer runs without the row: a fallback path)
 # Cross-only row: every used_by is xtask:cross or host:<arch>. Plain `check` and `deps --check` skip it and name it;
 # `deps --check --host <arch>` checks it, and so does `cross --arch <arch>` at start (its sysroot and the rustup
 # target of its [<arch>.host] rust). `native --host <arch>` checks its sysroot.
-# Not here: Rust itself (rust-toolchain.toml via rustup, the one prerequisite xtask cannot check); Gradle,
-# the Android SDK and apkeep (no repo consumer: the test APKs are pinned in test-apks.toml and downloaded with curl).
+# Optional row: every used_by is optional:. Plain `check`, `deps --check` and `--host` skip it and name it, so a
+# machine without it is green; the consumer takes its fallback (the Play token on stdin, not the Secret Service).
+# Not here: Rust itself (rust-toolchain.toml via rustup, the one prerequisite xtask cannot check); Gradle and the
+# Android SDK (no repo consumer: the test APKs are pinned in test-apks.toml and downloaded with curl; the Play ones with apkeep).
 # Rows are added when a consumer first needs them.
+
+# Google Play downloads (`xtask fetch --test-apks --play`, the google-play rows of test-apks.toml): apkeep runs with the
+# token as its `-t` argument. Its Play protocol and split file names were read from 1.1.0's USAGE-google-play.md and source.
+[apkeep]
+cargo = "apkeep"
+version = "1.1.0"
+scope = ["test"]
+used_by = ["xtask:fetch"]
 
 [bison]
 debian = "bison"
@@ -363,6 +374,15 @@ min = "0.10.0"
 min_reason = "observed 2026-11-07; older is untested"
 scope = ["build"]
 used_by = ["xtask:native"]
+
+# Tier 1 of the Google Play token: `secret-tool lookup` in the Secret Service (test_apks.rs). Optional: without it the
+# token comes on stdin. No `binary` field: a distro row with one needs a `min` observed on a machine, and none has
+# secret-tool installed; the executable name lives in test_apks.rs, as apkeep's does.
+[secret-tool]
+debian = "libsecret-tools"
+arch = "libsecret"
+scope = ["test"]
+used_by = ["optional:xtask:fetch"]
 
 # ChildGuard (nested_wayland.rs): `setpriv --pdeathsig TERM` ends the child when xtask dies
 [setpriv]

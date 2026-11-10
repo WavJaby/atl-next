@@ -235,7 +235,8 @@ fn validate(name: &str, dep: &Dep, consumers: &Consumers) -> Result<()> {
                 consumers.hosts.get(arch).is_some_and(|row| row == name),
                 "`{reference}`: arches.toml [{arch}.host] does not name this row as its sysroot"
             ),
-            None => consumers.resolve(reference)?,
+            // an optional consumer runs without this row; its target is checked like any other reference
+            None => consumers.resolve(reference.strip_prefix(OPTIONAL_REF).unwrap_or(reference))?,
         }
     }
     Ok(())
@@ -404,6 +405,14 @@ pub fn cross_only(dep: &Dep) -> bool {
         .all(|r| r == CROSS_TASK || r.starts_with(HOST_REF))
 }
 
+/// The `used_by` prefix of a consumer that runs without the row (a fallback): `optional:xtask:fetch`.
+const OPTIONAL_REF: &str = "optional:";
+
+/// A row only optional consumers use: each one runs without it. Plain `check` and `deps --check` skip it and name it.
+pub fn optional_only(dep: &Dep) -> bool {
+    dep.used_by.iter().all(|r| r.starts_with(OPTIONAL_REF))
+}
+
 /// A cross row of host `arch` (rust target `rust`): its sysroot (`host:<arch>`) or the rust std of its target.
 fn is_host_row(dep: &Dep, arch: &str, rust: &str) -> bool {
     dep.used_by
@@ -421,7 +430,7 @@ fn host_rust(arches: &arches::Arches, arch: &str) -> Result<String> {
         .with_context(|| format!("{}: no [{arch}.host] row", arches::FILE))
 }
 
-/// What a deps check found: rows checked, one `name: problem` per unmet row, and the cross-only rows left out.
+/// What a deps check found: rows checked, one `name: problem` per unmet row, and the rows left out (`name (cross-only)` or `name (optional)`).
 #[derive(Default)]
 pub struct Report {
     pub rows: usize,
@@ -436,7 +445,7 @@ impl Report {
             return format!("ok ({} rows)", self.rows);
         }
         format!(
-            "ok ({} rows, {} cross-only skipped: {})",
+            "ok ({} rows, {} skipped: {})",
             self.rows,
             self.skipped.len(),
             self.skipped.join(", ")
@@ -445,7 +454,7 @@ impl Report {
 }
 
 /// Every deps.toml row against this host, read-only: required rows always, cross-only rows only when `host`
-/// names their arch. `deps --check` and `xtask check`'s deps step both run it.
+/// names their arch, optional rows never (their consumer runs without them). `deps --check` and `xtask check`'s deps step both run it.
 pub fn host_problems(root: &Path, host: Option<&str>) -> Result<Report> {
     let arches = arches::load(root)?;
     let target = match host {
@@ -453,10 +462,11 @@ pub fn host_problems(root: &Path, host: Option<&str>) -> Result<Report> {
         None => None,
     };
     check_rows(root, &arches, |_, dep| {
-        !cross_only(dep)
-            || target
-                .as_ref()
-                .is_some_and(|(arch, rust)| is_host_row(dep, arch, rust))
+        !optional_only(dep)
+            && (!cross_only(dep)
+                || target
+                    .as_ref()
+                    .is_some_and(|(arch, rust)| is_host_row(dep, arch, rust)))
     })
 }
 
@@ -486,7 +496,12 @@ fn check_rows(
     let mut report = Report::default();
     for (name, dep) in &deps {
         if !select(name.as_str(), dep) {
-            report.skipped.push(name.clone());
+            let why = if optional_only(dep) {
+                "optional"
+            } else {
+                "cross-only"
+            };
+            report.skipped.push(format!("{name} ({why})"));
             continue;
         }
         report.rows += 1;
@@ -990,13 +1005,34 @@ mod tests {
     }
 
     #[test]
+    fn optional_refs_name_a_checked_consumer() {
+        let pins = "debian = \"libsecret-tools\"\nscope = [\"test\"]\n";
+        let ok = format!("[secret-tool]\n{pins}used_by = [\"optional:xtask:check\"]\n");
+        assert!(parse(&ok, &consumers()).is_ok());
+        let unknown = format!("[secret-tool]\n{pins}used_by = [\"optional:xtask:nope\"]\n");
+        assert!(err(&unknown).contains("no such xtask"));
+    }
+
+    #[test]
+    fn optional_means_every_consumer_is_optional() {
+        let row = |used: &str| -> Dep {
+            toml::from_str(&format!("scope = [\"test\"]\nused_by = {used}\n")).unwrap()
+        };
+        assert!(optional_only(&row("[\"optional:xtask:check\"]")));
+        assert!(!optional_only(&row(
+            "[\"optional:xtask:check\", \"xtask:cross\"]"
+        )));
+        assert!(!optional_only(&row("[\"xtask:check\"]")));
+    }
+
+    #[test]
     fn skipped_rows_are_named_in_the_ok_line() {
         let report = Report {
             rows: 3,
             problems: Vec::new(),
             skipped: vec!["a".into(), "b".into()],
         };
-        assert_eq!(report.ok_line(), "ok (3 rows, 2 cross-only skipped: a, b)");
+        assert_eq!(report.ok_line(), "ok (3 rows, 2 skipped: a, b)");
         assert_eq!(
             Report {
                 rows: 3,
