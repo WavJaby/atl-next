@@ -180,9 +180,20 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     tree::verify(&overlays)?;
     let cache = CompilerCache::of(args, ws, &tree::describe(&overlays));
     // go.work and the converter binary live in the build dir, so concurrent checkouts (each in its own dir) do not overwrite each other's converter
+    // a cross host's outputs go under its arch's dir, so two arches in one slot never write the same path; the build machine's stay at the out dir, where its gates read them
     let out = slot::out_dir(root, args.out.as_deref(), "--out", |workspace| {
-        workspace.join("out").join("native").join(&args.host)
+        let native = workspace.join("out").join("native");
+        if cross.is_some() {
+            native
+        } else {
+            native.join(&args.host)
+        }
     })?;
+    let out = if cross.is_some() {
+        out.join(&args.host)
+    } else {
+        out
+    };
     // the state the crates will be built from, taken first; the record goes until they are
     let state = build_state::of_build(root)?;
     std::fs::create_dir_all(&out)?;
