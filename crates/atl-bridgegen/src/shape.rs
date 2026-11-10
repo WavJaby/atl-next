@@ -36,7 +36,7 @@
 //! includes a host header (bionic's `sys/_system_properties.h` is `#include <sys/system_properties.h>`);
 //! only substitutes do: every other wrapper keeps bionic's shape of the host's headers.
 //!
-//! Kernel uapi headers only bionic carries (`kernel`; Android kernel features a desktop distro's headers lack: `linux/incrementalfs.h`, `linux/ashmem.h`): every one the host does not resolve is forwarded -- a generated header including bionic's file by absolute path, so depfiles (and the licence gate) name bionic's file, not a copy. Derived, never listed; a name the host resolves is never shadowed.
+//! Kernel uapi headers only bionic carries (`kernel`; Android kernel features a desktop distro's headers lack: `linux/incrementalfs.h`, `linux/ashmem.h`): every one the host does not resolve and bionic's own arch view includes alone is forwarded -- a generated header including bionic's file by absolute path, so depfiles (and the licence gate) name bionic's file, not a copy. Derived, never listed; a name the host resolves is never shadowed. bionic copies the kernel's generic uapi to every arch, so a name its arch view cannot include (riscv64 `linux/a.out.h`) is a gap, as the kernel's per-arch export drops it.
 //! Refused when a host header uses one of its macros as an identifier without defining it the same way, as for substitutes; a macro defined empty is spared where the use is a prototype's parameter name (`HostText::clashes`).
 //!
 //! Views: everything above is derived twice, from probes without feature macros and with `_GNU_SOURCE`
@@ -142,6 +142,11 @@ pub struct Inputs<'a> {
     /// bionic's kernel uapi headers by include name, each the file bionic's search order finds; `scan`
     /// is the host's resolution of the same names.
     pub kernel: &'a BTreeMap<String, PathBuf>,
+    /// Errors of each `uapi_candidates` name included alone in bionic's own view of this arch (`kernel/uapi` +
+    /// `asm-<arch>`, as bionic's `libc_uapi_headers` selects). bionic copies the kernel's generic uapi for every arch, so
+    /// some names do not compile on some (riscv64 `linux/a.out.h`: no `asm/a.out.h`); one with errors is not forwarded
+    /// (`Shape::uapi_gaps`). A candidate missing here is a refusal.
+    pub bionic_uapi_errors: &'a BTreeMap<String, Vec<String>>,
     /// The host's view of every name in `host_names` read as C++ with `_GNU_SOURCE`, as device C++
     /// includes them (`Reached::cxx_linkage`).
     pub cxx: &'a BTreeMap<String, Probe>,
@@ -244,6 +249,32 @@ pub struct Shape {
     pub gaps: Vec<Gap>,
     /// bionic's kernel uapi headers the host lacks, by include name -> bionic's file (`print_forward`).
     pub uapi: BTreeMap<String, PathBuf>,
+    /// Forward candidates bionic's own arch view cannot include alone -> its first error: bionic's state, reported, not
+    /// failed on (`print_uapi_gaps`).
+    pub uapi_gaps: BTreeMap<String, String>,
+}
+
+/// bionic's kernel uapi headers the host resolves under no name (neither `scan` nor a host probe), by include name ->
+/// bionic's file: what may be forwarded, before `Inputs::bionic_uapi_errors` and the clash check.
+pub fn uapi_candidates(inputs: &Inputs) -> BTreeMap<String, PathBuf> {
+    let host_has = |n: &str| {
+        [&inputs.default, &inputs.gnu]
+            .iter()
+            .any(|v| v.host.get(n).is_some_and(Probe::usable))
+    };
+    inputs
+        .kernel
+        .iter()
+        .filter(|(n, _)| !inputs.scan.contains_key(*n) && !host_has(n))
+        .map(|(n, f)| (n.clone(), f.clone()))
+        .collect()
+}
+
+/// `Shape::uapi_gaps` as text, one per line: `<name>: bionic's own <arch> view cannot include it: <error>`.
+pub fn print_uapi_gaps(arch: &str, gaps: &BTreeMap<String, String>) -> String {
+    gaps.iter()
+        .map(|(n, e)| format!("<{n}>: bionic's own {arch} view cannot include it: {e}\n"))
+        .collect()
 }
 
 /// Names bionic's `header` brings in through private `file` that the wrapped host header lacks.
@@ -310,18 +341,23 @@ pub fn derive(inputs: &Inputs) -> Result<Shape> {
 /// `derive`, each refusal recorded in `refusals` and its item left out, so one run reports all of them. An error is a
 /// failure to read the inputs, not a refusal.
 pub fn derive_all(inputs: &Inputs, refusals: &mut Refusals) -> Result<Shape> {
-    let views = [&inputs.default, &inputs.gnu];
-    let host_has = |n: &str| {
-        views
-            .iter()
-            .any(|v| v.host.get(n).is_some_and(Probe::usable))
-    };
-    let mut uapi: BTreeMap<String, PathBuf> = inputs
-        .kernel
-        .iter()
-        .filter(|(n, _)| !inputs.scan.contains_key(*n) && !host_has(n))
-        .map(|(n, f)| (n.clone(), f.clone()))
-        .collect();
+    let mut uapi = uapi_candidates(inputs);
+    let mut uapi_gaps = BTreeMap::new();
+    uapi.retain(|name, _| match inputs.bionic_uapi_errors.get(name) {
+        None => {
+            refusals.push(anyhow::anyhow!(
+                "bionic-only uapi header <{name}>: not probed in bionic's own view"
+            ));
+            false
+        }
+        Some(errs) => match errs.first() {
+            None => true,
+            Some(e) => {
+                uapi_gaps.insert(name.clone(), e.clone());
+                false
+            }
+        },
+    });
     let host_text = if inputs.substitutes.is_empty() && uapi.is_empty() {
         HostText::default()
     } else {
@@ -440,6 +476,7 @@ pub fn derive_all(inputs: &Inputs, refusals: &mut Refusals) -> Result<Shape> {
         wrappers: out,
         gaps: merge_gaps(d.gaps, g.gaps),
         uapi,
+        uapi_gaps,
     })
 }
 
@@ -1332,6 +1369,7 @@ mod tests {
             ("uapi/k/u.h", "int kern;\n"),
             ("uapi/k/v.h", "#define __kv 1\n"),
             ("uapi/k/m.h", "#define __mac 1\n"),
+            ("uapi/k/x.h", "#include <asm/x.h>\n"),
             ("host/w.h", "#include <sys/cdefs.h>\nint w;\n"),
             ("host/n.h", "int n;\n"),
             ("host/sys/cdefs.h", "int cdefs;\n"),
@@ -1458,7 +1496,8 @@ mod tests {
         let cxx = front::probe_includes(Lang::Cxx, &gnu(sysroot(&[dir.0.join("host")])), &names)?;
         let scan = front::resolve_includes(Lang::C, &host_t, kernel)?;
         let kernel = front::resolve_includes(Lang::C, &sysroot(&uapi), kernel)?;
-        derive(&Inputs {
+        let no_errors = BTreeMap::new();
+        let mut inputs = Inputs {
             default: Probes {
                 bionic: &bionic,
                 host: &host,
@@ -1479,7 +1518,43 @@ mod tests {
             extra,
             cxx: &cxx,
             cxx_std: &dir.0.join("c++"),
-        })
+            bionic_uapi_errors: &no_errors,
+        };
+        let candidates: Vec<String> = uapi_candidates(&inputs).into_keys().collect();
+        let names: Vec<&str> = candidates.iter().map(String::as_str).collect();
+        let errors = front::include_errors(Lang::C, &sysroot(&uapi), &names)?;
+        inputs.bionic_uapi_errors = &errors;
+        derive(&inputs)
+    }
+
+    /// A bionic-only uapi header bionic's own view cannot include alone (`k/x.h` needs the absent `asm/x.h`, as riscv64
+    /// `linux/a.out.h`) is a gap, not a forward; `k/v.h` is still forwarded.
+    #[test]
+    fn uapi_forward_needs_bionic_view_includable() {
+        let dir = libcs("uapi-view");
+        let s = derived_kernel(
+            &dir,
+            &[("bits/p.h", "q.h")],
+            &["__mac", "__pm", "__gm", "__tm"],
+            &["e.h", "o.h"],
+            &[],
+            &["k/u.h", "k/v.h", "k/x.h"],
+        )
+        .unwrap();
+        assert_eq!(
+            s.uapi,
+            BTreeMap::from([("k/v.h".to_owned(), dir.0.join("uapi/k/v.h"))])
+        );
+        assert_eq!(s.uapi_gaps.keys().collect::<Vec<_>>(), ["k/x.h"]);
+        assert!(
+            s.uapi_gaps["k/x.h"].contains("'asm/x.h' file not found"),
+            "{:?}",
+            s.uapi_gaps
+        );
+        assert!(
+            print_uapi_gaps("riscv64", &s.uapi_gaps)
+                .starts_with("<k/x.h>: bionic's own riscv64 view cannot include it: ")
+        );
     }
 
     /// A substitute including a generated declaration header (bionic sys/_system_properties.h ->
@@ -1769,7 +1844,9 @@ mod tests {
         let cxx = front::probe_includes(Lang::Cxx, &gnu(sysroot(&[dir.0.join("host")])), &names)?;
         let scan = front::resolve_includes(Lang::C, &host_t, &["k/c.h"])?;
         let kernel = front::resolve_includes(Lang::C, &sysroot(&uapi), &["k/c.h"])?;
+        let errors = BTreeMap::from([("k/c.h".to_owned(), Vec::new())]);
         derive(&Inputs {
+            bionic_uapi_errors: &errors,
             default: Probes {
                 bionic: &bionic,
                 host: &host_p,

@@ -13,9 +13,9 @@
 //! - `OUT_DIR/capi/include/<header>`, also: include wrappers giving the host libc's headers bionic's
 //!   header shape (`atl_bridgegen::shape`), installed with the declarations, so they reach exactly the
 //!   units that see bionic's headers, substitutes for the bionic-only headers in `SUBSTITUTES`, and
-//!   forwards to bionic's kernel uapi headers the host lacks (`shape::Shape::uapi`). Each must add no
+//!   forwards to bionic's kernel uapi headers the host lacks and bionic's own arch view includes alone (`shape::Shape::uapi`). Each must add no
 //!   error to its host header (a substitute or forward: compile alone), as C and C++.
-//!   `OUT_DIR/shape_gaps.txt`: what they leave different (names bionic's private files bring in).
+//!   `OUT_DIR/shape_gaps.txt`: what they leave different (names bionic's private files bring in; uapi headers not forwarded because bionic's own arch view cannot include them).
 //!   `OUT_DIR/capi/include/atl-bionic/uapi/<header>`: kernel uapi records code reads by layout
 //!   (`UAPI_RECORDS`), alone, layout asserted; a shape wrapper includes each.
 //!
@@ -731,7 +731,7 @@ fn uapi_records(
 struct ShapeOut {
     /// Include name -> text.
     wrappers: Vec<(String, String)>,
-    /// `shape::print_gaps`.
+    /// `shape::print_gaps`, then `shape::print_uapi_gaps`.
     gaps: String,
     /// The host headers they were derived from.
     host_inputs: BTreeSet<PathBuf>,
@@ -784,7 +784,8 @@ fn shape(
         &strs(&kernel.keys().cloned().collect::<Vec<_>>()),
     )?;
     let declared: Vec<&str> = APIS.iter().filter_map(|a| a.header).collect();
-    let inputs = shape::Inputs {
+    let no_errors = BTreeMap::new();
+    let mut inputs = shape::Inputs {
         default: shape::Probes {
             bionic: &bionic,
             host: &host_probes,
@@ -810,7 +811,17 @@ fn shape(
         extra,
         cxx: &host_cxx,
         cxx_std,
+        bionic_uapi_errors: &no_errors,
     };
+    // C only: a missing file fails both languages; check_wrappers checks C and C++ of what is forwarded
+    let candidates: Vec<String> = shape::uapi_candidates(&inputs).into_keys().collect();
+    let uapi_errors = front::include_errors(
+        Lang::C,
+        &bionic_target(up, host, level, None),
+        &strs(&candidates),
+    )
+    .context("bionic's uapi forward candidates in bionic's own view")?;
+    inputs.bionic_uapi_errors = &uapi_errors;
     let derived = shape::derive_all(&inputs, refusals)?;
     refusals.take(shape::check_guards(derived.wrappers.keys()));
     let mut wrappers: Vec<(String, String)> = Vec::new();
@@ -853,7 +864,8 @@ fn shape(
         .collect();
     Ok(ShapeOut {
         wrappers,
-        gaps: shape::print_gaps(&derived.gaps),
+        gaps: shape::print_gaps(&derived.gaps)
+            + &shape::print_uapi_gaps(&host.arch, &derived.uapi_gaps),
         host_inputs,
     })
 }
