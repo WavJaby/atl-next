@@ -72,15 +72,13 @@ const FRAMEWORK_JNI: [&str; 2] = ["libsoundpool", "libmedia_jni"];
 /// The NDK libraries whose host side the NativeBridge core loads from SYSTEM_LIB (C3, bindings.rs `Host::System`): their guest proxies forward to them.
 const NDK_HOST_LIBS: [&str; 2] = ["libandroid", "libjnigraphics"];
 
-/// [`Runtime::with_gralloc`] + `with_gl_driver`: the allocator HAL's AIDL crate, the GL fronts, and the libraries Mesa's Android platform links (mesa.rs PC_MODULES),
-/// and the host LLVM that Mesa's llvmpipe JITs through (llvm_host.rs): every gate whose native build builds Mesa declares it here, once.
+/// [`Runtime::with_gralloc`] + `with_gl_driver`: the allocator HAL's AIDL crate, the GL fronts, and the host LLVM that llvmpipe JITs through (llvm_host.rs): declared once here for every gate using them.
 pub fn gralloc_goals() -> Goals {
     Goals::host(&GL_FRONTS)
         .with(Goals::host(&ANGLE_FRONTS))
         .with(Goals::host(&[
             "android.hardware.graphics.allocator-V2-rust",
         ]))
-        .with(Goals::host(&crate::mesa::pc_goals()))
         .with(crate::llvm_host::goals())
 }
 

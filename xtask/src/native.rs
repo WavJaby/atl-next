@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! `xtask native`: AOSP native modules built for this Linux host by our Blueprint converter (`tools/bp2ninja`, plan D7-2): builds the converter with the distro Go against the pinned `build/blueprint` (converter.rs),
-//! builds the providers.toml modules provided outside the tree (`crate:` with cargo-c, `upstream:` by their recipe; `system:` resolved with pkg-config, system.rs), converts the goals' closure into ninja, builds it with `ninja -k 0`, then Mesa with its own meson build against those libraries (mesa.rs `build_after_ninja`; skipped when the goals lack them),
+//! builds the providers.toml modules provided outside the tree (`crate:` with cargo-c, `upstream:` by their recipe; `system:` resolved with pkg-config, system.rs), converts the goals' closure into ninja, builds it with `ninja -k 0`,
 //! summarises the failures by module and runs the provided gate (provided_gate.rs) and the table check: providers.toml rows the converter finds wrong, and `none` rows a still-built module needs (none_gate.rs). Either fails the run.
 //! After a clean build it builds the workspace packages that link converter modules the graph holds (packages.rs: the launcher against libsigchain, atl-aidl against libbinder_rs).
 
@@ -52,9 +52,6 @@ pub struct Args {
     /// Compile without the compiler cache, e.g. to rule it out while debugging a build.
     #[arg(long)]
     no_compiler_cache: bool,
-    /// Deliberate break of Mesa's configure (mesa.rs `Break`): `llvm-config-19` must fail the native's Mesa step, `no-llvmpipe` / `no-iris` must fail its driver-export check.
-    #[arg(long = "break", value_enum)]
-    deliberate_break: Option<crate::mesa::Break>,
     /// Build nothing: open $SHELL inside the task-copy namespace (task copies bound over src/aosp), e.g. to run `ninja` by hand on the slot; outside it ninja reads the unpatched src/aosp.
     #[arg(long)]
     pub shell: bool,
@@ -452,7 +449,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .stderr(std::fs::File::create(out.join("ninja.err"))?)
         .status()
         .context("running ninja")?;
-    // the host LLVM (llvm_host.rs) when a goal asks for it: CMake under the same token, before Mesa, which links it (plan S2)
+    // the host LLVM (llvm_host.rs) when a goal asks for it: CMake under the same token
     let llvm_step = if args.goals.iter().any(|g| g == crate::llvm_host::GOAL) {
         let cc = flag_or_row(&args.cc, root, "clang")?;
         let cxx = flag_or_row(&args.cxx, root, "clang-cxx")?;
@@ -470,14 +467,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if llvm_step.is_some() {
         built_goals.remove(crate::llvm_host::GOAL);
     }
-    // Mesa's own meson build against what ninja built (mesa.rs), still under the token: it compiles as much as a converter module
-    let mesa_step = crate::mesa::build_after_ninja(
-        &out,
-        &tree.join(crate::mesa::MESA_TREE),
-        &args.host,
-        &crate::deps::binary(root, "llvm-dev")?,
-        args.deliberate_break,
-    )?;
     drop(token);
     let provided_libs: BTreeSet<&Path> = provided
         .values()
@@ -489,28 +478,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if let Some(first) = llvm_step {
         failed.push(Failure::step("llvm", first));
     }
-    let mesa_build = match mesa_step {
-        crate::mesa::Step::Failed(first) => {
-            failed.push(Failure::step("mesa", first));
-            None
-        }
-        crate::mesa::Step::Built(b) => Some(b),
-        crate::mesa::Step::Skipped => None,
-    };
     if let Some(first) = gate(&out, provided_libs.into_iter())? {
         failed.push(Failure::step("provided gate", first));
     }
     if let Some(first) = runpath_gate(&out)? {
         failed.push(Failure::step("runpath gate", first));
     }
-    if let Some(first) = licence_gate(
-        root,
-        &layout,
-        &sources,
-        &out,
-        mesa_build.as_deref(),
-        args.verbose,
-    )? {
+    if let Some(first) = licence_gate(root, &layout, &sources, &out, args.verbose)? {
         failed.push(Failure::step("licence gate", first));
     }
     if status.success() {
@@ -1230,7 +1204,6 @@ fn licence_gate(
     layout: &Layout,
     sources: &sources::Sources,
     out: &Path,
-    mesa_build: Option<&Path>,
     verbose: bool,
 ) -> Result<Option<String>> {
     let licenses = licenses::load(root, &sources.upstream_names())?;
@@ -1242,18 +1215,7 @@ fn licence_gate(
         .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
         .collect();
     let report = licence_gate::check(&out, &roots, &licenses, &test_only)?;
-    let first = licence_report("licence gate", &report, verbose);
-    let Some(build) = mesa_build else {
-        return Ok(first);
-    };
-    let mesa = licence_gate::check_build_outputs(
-        &out,
-        &std::fs::canonicalize(build)?,
-        crate::mesa::OUTPUTS,
-        &roots,
-        &licenses,
-    )?;
-    Ok(first.or(licence_report("licence gate (Mesa)", &mesa, verbose)))
+    Ok(licence_report("licence gate", &report, verbose))
 }
 
 /// Prints a licence gate report under `label`; its first problem, None when it passes.
@@ -1369,13 +1331,7 @@ mod tests {
     /// Each check `run` can fail by name exits nonzero alone; only none failed exits 0.
     #[test]
     fn verdict_fails_on_every_check() {
-        for check in [
-            "ninja",
-            "mesa",
-            "provided gate",
-            "licence gate",
-            "table check",
-        ] {
+        for check in ["ninja", "provided gate", "licence gate", "table check"] {
             assert_eq!(
                 verdict(vec![Failure::step(check, "x")]),
                 ExitCode::FAILURE,

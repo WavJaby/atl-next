@@ -187,37 +187,10 @@ pub fn check(
     Ok(report)
 }
 
-/// The licence gate over an external build inside `out` that makes shipped artifacts itself (Mesa's meson build dir, mesa.rs `build_after_ninja`): its link outputs `artifacts` (build-relative), all of class `runtime`.
-pub fn check_build_outputs(
-    out: &Path,
-    build: &Path,
-    artifacts: &[&str],
-    roots: &[Root],
-    licenses: &Licenses,
-) -> Result<Report> {
-    let artifacts: Vec<&Path> = artifacts.iter().map(Path::new).collect();
-    let mut report = Report {
-        artifacts: artifacts.len(),
-        ..Report::default()
-    };
-    check_external(
-        build,
-        out,
-        Reach::Links(&artifacts),
-        &[],
-        roots,
-        licenses,
-        &mut report,
-    )?;
-    Ok(report)
-}
-
 /// What of an external ninja build reaches a shipped artifact.
 enum Reach<'a> {
     /// Archive members a converter link loaded (`--trace`): (archive, member, artifact). Mapped to objects by archive file name (an install copies the archive under the same name).
     Members(&'a [(&'a Path, &'a str, &'a Path)]),
-    /// The build's own link outputs (build-relative). Over-counts: those links run without `--trace`, so an artifact reaches every object of its link edge and of each build-dir input's edge (static archives, other libraries of the build), transitively, loaded or not. Shared libraries among the inputs are their own artifacts or the converter's, system files the platform's.
-    Links(&'a [&'a Path]),
     /// Every object the build compiled (its depfile records), each its own artifact: for a build whose archives later links load (the runtimes), a superset, so a pass holds for any link.
     All,
 }
@@ -236,7 +209,6 @@ fn check_external(
     let deps = parse_deps(&ninja(build, &["-t", "deps"])?);
     let objects: BTreeMap<PathBuf, &Path> = match reach {
         Reach::Members(loaded) => member_objects(build, loaded, report)?,
-        Reach::Links(artifacts) => link_objects(build, artifacts)?,
         Reach::All => {
             report.artifacts += deps.len();
             deps.keys().map(|o| (o.clone(), o.as_path())).collect()
@@ -293,29 +265,6 @@ fn check_external(
     Ok(())
 }
 
-/// `Reach::Links`: build-relative object -> first artifact reaching it.
-fn link_objects<'a>(build: &Path, artifacts: &[&'a Path]) -> Result<BTreeMap<PathBuf, &'a Path>> {
-    let mut objects = BTreeMap::new();
-    for artifact in artifacts {
-        let (mut todo, mut seen) = (vec![artifact.to_path_buf()], BTreeSet::new());
-        while let Some(t) = todo.pop() {
-            if !seen.insert(t.clone()) {
-                continue;
-            }
-            let query = ninja(build, &["-t", "query", &t.display().to_string()])?;
-            for input in edge_inputs(&query) {
-                if input.extension().is_some_and(|e| e == "o") {
-                    objects.entry(input).or_insert(*artifact);
-                } else if !input.is_absolute() {
-                    // a static archive, the versioned file behind a `.so` symlink edge, a library of the build linked into another (counted twice), a version script (no edge)
-                    todo.push(input);
-                }
-            }
-        }
-    }
-    Ok(objects)
-}
-
 /// `Reach::Members`: object (as the build's edges name it) -> first artifact loading it.
 fn member_objects<'a>(
     build: &Path,
@@ -358,27 +307,6 @@ fn member_objects<'a>(
         objects.entry(object).or_insert(*artifact);
     }
     Ok(objects)
-}
-
-/// `ninja -t query <target>`: every input of its edge, explicit and implicit (`| x`), order-only (`|| x`) skipped.
-fn edge_inputs(text: &str) -> Vec<PathBuf> {
-    let mut inputs = false;
-    let mut out = Vec::new();
-    for line in text.lines() {
-        if !line.starts_with(' ') {
-            inputs = false;
-        } else if let Some(section) = line.strip_prefix("  ")
-            && !section.starts_with(' ')
-        {
-            inputs = section.starts_with("input:");
-        } else if inputs {
-            let input = line.trim();
-            if !input.starts_with("||") {
-                out.push(PathBuf::from(input.trim_start_matches('|').trim()));
-            }
-        }
-    }
-    out
 }
 
 /// `judge` over reached files (file -> first artifact reaching it), canonicalized first.
@@ -1014,20 +942,6 @@ mod tests {
         let q = parse_query(text);
         assert_eq!(q[Path::new("/o/libx.a")], [PathBuf::from("/o/obj/a.cpp.o")]);
         assert_eq!(q[Path::new("/o/liby.a")], [PathBuf::from("/o/obj/b.c.o")]);
-    }
-
-    #[test]
-    fn edge_inputs_keep_implicit_drop_order_only() {
-        // ninja 1.12 `-t query` layout of a meson link edge (sampled from Mesa's build.ninja)
-        let text = "src/egl/libEGL_mesa.so.1.0.0:\n  input: cpp_LINKER\n    src/egl/a.c.o\n    src/util/libmesa_util.a\n    | /o/device/liblog/liblog.so\n    || src/gen.h\n  outputs:\n    src/egl/libEGL_mesa.so\n";
-        assert_eq!(
-            edge_inputs(text),
-            [
-                PathBuf::from("src/egl/a.c.o"),
-                PathBuf::from("src/util/libmesa_util.a"),
-                PathBuf::from("/o/device/liblog/liblog.so"),
-            ]
-        );
     }
 
     #[test]

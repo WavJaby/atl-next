@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
 //! Host LLVM for the in-process JIT (llvmpipe's gallivm, plan llvmpipe S1): LLVM's own CMake build of the pinned llvm-project `llvm/` project, static archives only (owner D2), for the host's `llvm_target` (arches.toml).
-//! `xtask native --for llvm` builds it after ninja, under the build token, before Mesa (native.rs); `xtask test llvm` is the JIT gate. The build's compiled files pass the licence gate (`licence`). Distro libLLVM never enters an app process (owner D1).
-//! Output: `<out>/upstream/llvm/<host>/build/` is the CMake build dir: `bin/llvm-config` and `bin/lli` (the tools; `LLVM_BUILD_TOOLS=OFF` leaves them out of `all`), `lib/*.a`, `include/`. Nothing is installed: the build tree is the output (Mesa's meson reads `llvm-config` from it).
+//! `xtask native --for llvm` builds it after ninja, under the build token (native.rs); `xtask test llvm` is the JIT gate. The build's compiled files pass the licence gate (`licence`). Distro libLLVM never enters an app process (owner D1).
+//! Output: `<out>/upstream/llvm/<host>/build/` is the CMake build dir: `bin/llvm-config` and `bin/lli` (the tools; `LLVM_BUILD_TOOLS=OFF` leaves them out of `all`), `lib/*.a`, `include/`. Nothing is installed: the build tree is the output.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 
 use crate::gate_goals::Goals;
 use crate::licence_gate;
@@ -19,7 +19,7 @@ pub const GOAL: &str = "llvm";
 /// What `llvm-config --version` prints at the pin: MAJOR.MINOR.PATCH 20.0.0 plus the release branch's suffix `git` (observed 2026-11-07; the branch is a snapshot, not the 20.0.0 tag).
 pub const VERSION: &str = "20.0.0git";
 
-/// Built after `all`, which leaves tools out under `LLVM_BUILD_TOOLS=OFF`: `llvm-config` (Mesa's meson, S2) and `lli` (the JIT gate).
+/// Built after `all`, which leaves tools out under `LLVM_BUILD_TOOLS=OFF`: `llvm-config` and `lli` (the JIT gate).
 const TOOLS: &[&str] = &["llvm-config", "lli"];
 
 /// The JIT gate's program returns `EXPECTED`; `--break` makes it return `BREAK_RETURN` and the gate must fail.
@@ -68,11 +68,6 @@ pub fn goals() -> Goals {
 /// `<out>/upstream/llvm/<host>/`: holds `build/`, the CMake build dir.
 pub fn dir(out: &Path, host: &str) -> PathBuf {
     out.join("upstream").join("llvm").join(host)
-}
-
-/// The host's `llvm-config` in the build dir: the one Mesa's meson is configured with (mesa.rs `native_file`).
-pub fn config(out: &Path, host: &str) -> PathBuf {
-    tool(&dir(out, host).join("build"), "llvm-config")
 }
 
 /// The `llvm_target` of the `[<host>.host]` row: the LLVM target this host builds and JITs for.
@@ -228,26 +223,6 @@ fn ir(code: i32) -> String {
 /// `llvm-config --version` of `config`.
 pub fn version_of(config: &Path) -> Result<String> {
     stdout_of(Command::new(config).arg("--version"))
-}
-
-/// Refuses a `llvm-config` that is not the pinned LLVM: Mesa is configured only against the host LLVM this module builds (mesa.rs `configure`).
-pub fn check_config(config: &Path) -> Result<()> {
-    let version = version_of(config)?;
-    ensure!(
-        version == VERSION,
-        "{} reports LLVM {version}, expected {VERSION}",
-        config.display()
-    );
-    Ok(())
-}
-
-/// Whether `config`'s LLVM has RTTI (`llvm-config --has-rtti`, YES/NO). Mesa's meson checks its `cpp_rtti` against it (mesa.rs `native_file`).
-pub fn has_rtti(config: &Path) -> Result<bool> {
-    match stdout_of(Command::new(config).arg("--has-rtti"))?.as_str() {
-        "YES" => Ok(true),
-        "NO" => Ok(false),
-        other => bail!("{} --has-rtti printed {other:?}", config.display()),
-    }
 }
 
 /// Trimmed stdout of a command that must succeed; otherwise its exit status and stderr.

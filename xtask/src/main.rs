@@ -49,7 +49,6 @@ mod gralloc;
 mod host_art;
 mod host_disk;
 mod instrument;
-mod intel_clc;
 mod jni_fixture;
 mod keepset;
 mod land;
@@ -58,7 +57,6 @@ mod licence_gate;
 mod licenses;
 mod llvm_host;
 mod manifest;
-mod mesa;
 mod modules;
 mod native;
 mod native_load;
@@ -170,10 +168,6 @@ enum Command {
     /// Task copies (`xtask patch --edit`) replace their src/ checkout. With AOSP ones, `native` and `check` re-execute inside a mount namespace (`bwrap --dev-bind / /`) where each is bind-mounted over src/aosp/<project>, so the tree path is always src/aosp; the slot's `built-from` record names each bound copy and its state.
     /// Risk: `ninja` run by hand outside the namespace reads the unpatched src/aosp; `native --shell <goal> --host <h>` opens $SHELL inside it.
     Native(native::Args),
-    /// Mesa `platforms=android` build inputs from a converter out dir: pkg-config files for the AOSP libraries Mesa looks up, and a meson native file with the G1 options.
-    ///
-    /// Writes only under --dest; the out dir is read. Mesa's meson is then run as-is with `--native-file <dest>/native.ini`.
-    MesaConfig(mesa::Args),
     /// The pinned QEMU's user-mode executable for a guest arch (`qemu-<target>`), built with no patch.
     ///
     /// Dry run unless `--execute`: then QEMU's own `configure` and ninja build `qemu-<target>` into `<out>/qemu/<target>-linux-user`, and its `--version` must name the sources.toml pin.
@@ -318,7 +312,7 @@ enum Test {
     EglDriver(egl_driver::Args),
     /// GLES on the real driver in an app process: a pbuffer cleared and read back, and an extension outside entries.in through eglGetProcAddress (patch 0010); then a deliberate break that both checks must catch.
     ///
-    /// Needs the fronts, Mesa, gralloc and the services in --out (`xtask native`).
+    /// Needs the fronts, gralloc and the services in --out (`xtask native`).
     Gl(gl_probe::Args),
     /// QEMU's `qemu-<target>` against ground truth: a bionic hello built by the NDK clang, and QEMU's own tests/tcg smoke programs.
     ///
@@ -373,7 +367,6 @@ fn main() -> Result<ExitCode> {
         Command::Aosp(args) => aosp::run(&root, &args),
         Command::Keepset(args) => keepset::run(&root, &args),
         Command::Native(args) => native::run(&root, &args),
-        Command::MesaConfig(args) => mesa::run(&root, &args),
         Command::Qemu(args) => qemu::run(&root, &args),
         Command::Slot { slot } => slot::run(&root, &slot),
         Command::Patch(args) => patch::run(&root, &args),

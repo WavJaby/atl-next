@@ -31,7 +31,7 @@ pub struct Args {
     /// The host arch (an arches.toml row with `[host]`): the default --out.
     #[arg(long)]
     host: String,
-    /// Native build directory holding ART, the services, the fronts and Mesa (default: this checkout's slot, see `xtask slot`; else <workspace>/out/native/<host>).
+    /// Native build directory holding ART, the services and the fronts (default: this checkout's slot, see `xtask slot`; else <workspace>/out/native/<host>).
     #[arg(long)]
     out: Option<PathBuf>,
     /// Java pipeline build directory: boot jars, aapt2, d8 (default: this checkout's slot; else <workspace>/out/java/build).

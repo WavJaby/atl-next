@@ -27,7 +27,7 @@ type graphFile struct {
 	Artifacts map[string]artifact `json:"artifacts"`
 	// the cc link driver every link here runs (Tools.CXX): an rlib's Link arguments are its arguments (its stl's -nostdlib++ / -lc++), so an outside build links with it too
 	LinkDriver string `json:"link_driver"`
-	// the product variables this build sets (productvars.go), what an upstream built outside the converter for the same product is configured with (Mesa's platform-sdk-version)
+	// the product variables this build sets (productvars.go), what an upstream built outside the converter for the same product is configured with (platform_sdk_version)
 	ProductVariables map[string]Val `json:"product_variables"`
 	// the device platform flags (devicePlatform)
 	Device platform `json:"device"`
@@ -163,7 +163,7 @@ func (g *Graph) noneExports(name string, side Side) []string {
 	return append([]string{}, sortedKeys(dirs)...)
 }
 
-// platform: what every device module gets from the toolchain and its default system_shared_libs, without module flags or dependencies -- how a build outside the converter compiles and links device code (Mesa's meson, via xtask mesa-config).
+// platform: what every device module gets from the toolchain and its default system_shared_libs, without module flags or dependencies -- how a build outside the converter compiles and links device code.
 type platform struct {
 	CC   string   `json:"cc"` // the C compiler (Tools.CC); the C++ one is link_driver
 	C    []string `json:"c"`
