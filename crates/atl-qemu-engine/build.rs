@@ -115,6 +115,12 @@ const BREAKS: &[(&str, &str)] = &[
     ("ignore-size", "atl_qe_ignore_size"),
     // gate (u): attach copies the oldest live attached CPU (a running parent) instead of the parked boot CPU, keeping its sp: the child's frames land on the parent's stack
     ("copy-caller", "atl_qe_copy_caller"),
+    // gate (v): attach registers no guest alternate stack, so an SA_ONSTACK handler for a stack overflow has nowhere to run and QEMU kills the process
+    ("no-altstack", "atl_qe_no_altstack"),
+    // gate (v): every attached CPU registers the first CPU's alternate stack
+    ("shared-altstack", "atl_qe_shared_altstack"),
+    // gate (v): the alternate stack is 8 KiB instead of bionic's 32 KiB
+    ("small-altstack", "atl_qe_small_altstack"),
 ];
 
 fn selected_breaks() -> Result<Vec<&'static str>> {

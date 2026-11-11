@@ -35,9 +35,9 @@ const CPU_LOOP: &str = "linux-user/aarch64/cpu_loop.c";
 const UACCESS: &str = "linux-user/uaccess.c";
 const QEMU_H: &str = "linux-user/qemu.h";
 const PACKAGE: &str = "atl-qemu-engine";
-const GATES: [char; 21] = [
+const GATES: [char; 22] = [
     'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 's', 't', 'u',
-    'x', 'y',
+    'v', 'x', 'y',
 ];
 /// Thunk slots in the fixture's pool, as the NB pool is sized (atl-native-bridge build.rs: stub rows + fixed bindings + JNI slots, rounded to a power of two; 3860 + 6 + 256 > 4096). Gate (l) uses the last slot, 8191.
 const POOL_SLOTS: u32 = 8192;
@@ -364,6 +364,33 @@ const RUNS: &[RunSpec] = &[
         base: "0",
         engine_break: Some("no-noreturn"),
         red: Some('e'),
+    },
+    // gate (v): no guest alternate stack, so the SA_ONSTACK handler for the overflow cannot run and QEMU kills the child
+    RunSpec {
+        name: "no-altstack",
+        swap: None,
+        pool_skew: false,
+        base: "0",
+        engine_break: Some("no-altstack"),
+        red: Some('v'),
+    },
+    // gate (v): one alternate stack for every CPU, so the two threads' ranges overlap
+    RunSpec {
+        name: "shared-altstack",
+        swap: None,
+        pool_skew: false,
+        base: "0",
+        engine_break: Some("shared-altstack"),
+        red: Some('v'),
+    },
+    // gate (v): an 8 KiB alternate stack, not bionic's 32 KiB
+    RunSpec {
+        name: "small-altstack",
+        swap: None,
+        pool_skew: false,
+        base: "0",
+        engine_break: Some("small-altstack"),
+        red: Some('v'),
     },
 ];
 

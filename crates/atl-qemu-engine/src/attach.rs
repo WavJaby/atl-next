@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Host threads as guest CPUs. linux-user makes a CPU only for a guest `clone` (syscall.c `do_fork` + `clone_func`) and frees one only in the guest's `exit` (syscall.c `TARGET_NR_exit`). A host thread that calls into the guest goes through neither, so [`attach`] does those steps on the calling thread through QEMU's exported functions, and dropping the [`Cpu`] does `exit`'s.
-//! Attach, in `do_fork` / `clone_func` order: `rcu_register_thread`; `tcg_register_thread` (user mode: sets this thread's `tcg_ctx`, NULL until then); `cpu_copy` of the boot CPU; a zeroed TaskState with `init_task_state` plus the parent's `bprm`, `info`, `signal_mask`, `gcs_el0_locked`, hung on `CPUState.opaque`; `thread_cpu` (read by `lock_user` for every syscall buffer); `task_settid`. Then ours: `helper_retaddr` registered for fault classification (signal.rs) and a guest stack.
+//! Attach, in `do_fork` / `clone_func` order: `rcu_register_thread`; `tcg_register_thread` (user mode: sets this thread's `tcg_ctx`, NULL until then); `cpu_copy` of the boot CPU; a zeroed TaskState with `init_task_state` plus the parent's `bprm`, `info`, `signal_mask`, `gcs_el0_locked`, hung on `CPUState.opaque`; `thread_cpu` (read by `lock_user` for every syscall buffer); `task_settid`. Then ours: `helper_retaddr` registered for fault classification (signal.rs), a guest stack, and a guest alternate signal stack (bionic gives every pthread one; a host thread entering the guest is such a thread).
 //! Not done, with why: `clone_lock` is static in syscall.c, so attach serialises on its own lock and a guest clone may overlap an attach; a boot CPU with GCS on is refused (`do_fork` would give the child its own GCS stack); `child_tidptr` and the random seed are guest clone arguments a host thread has none of.
 //! Parallel code: `begin_parallel_context` (linux-user/user-internals.h, static inline) runs for the boot CPU at BOOT ([`parallel`]), the only point where the flush's serial-context assert holds without a clone; every copy inherits `CF_PARALLEL` from it.
 
@@ -15,6 +15,7 @@ type PtrFn = unsafe extern "C" fn(*mut c_void);
 type CpuCopyFn = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
 type CflagsHasFn = unsafe extern "C" fn(*mut c_void, u32) -> bool;
 type CflagsSetFn = unsafe extern "C" fn(*mut c_void, u32);
+type SigaltstackFn = unsafe extern "C" fn(u64, u64, *mut c_void) -> i64;
 
 /// linux-user's functions a host-attached CPU needs, resolved once with the library.
 pub(crate) struct Api {
@@ -39,6 +40,8 @@ pub(crate) struct Api {
     tb_flush: VoidFn,
     /// `void process_queued_cpu_work(CPUState *)` (cpu-common.c): runs a CPU's queued work (see attach).
     process_queued_cpu_work: PtrFn,
+    /// `abi_long do_sigaltstack(abi_ulong uss, abi_ulong uoss, CPUArchState *)` (linux-user/signal.c): the guest `sigaltstack` syscall; returns 0 or a negative target errno.
+    do_sigaltstack: SigaltstackFn,
 }
 
 /// dlsym `$name` and type it as `$ty`, the prototype the field doc names.
@@ -65,6 +68,7 @@ impl Api {
             tcg_cflags_set: func!(h, c"tcg_cflags_set", CflagsSetFn),
             tb_flush: func!(h, c"tb_flush__exclusive_or_serial", VoidFn),
             process_queued_cpu_work: func!(h, c"process_queued_cpu_work", PtrFn),
+            do_sigaltstack: func!(h, c"do_sigaltstack", SigaltstackFn),
         })
     }
 }
@@ -157,6 +161,9 @@ pub struct Cpu {
     stack: usize,
     len: usize,
     guard: usize,
+    /// Base of the guest alternate signal stack ([`ALT_STACK`] bytes, `alt_guard` below), 0 when none is registered.
+    alt: usize,
+    alt_guard: usize,
 }
 
 impl Cpu {
@@ -178,6 +185,15 @@ impl Cpu {
     /// Guard bytes right below [`Cpu::stack_base`] (the request rounded up, or the default).
     pub fn stack_guard(&self) -> usize {
         self.guard
+    }
+
+    /// The guest alternate signal stack registered for this CPU: `(base, len)`, `(0, 0)` when none is.
+    pub fn alt_stack(&self) -> (usize, usize) {
+        if self.alt == 0 {
+            (0, 0)
+        } else {
+            (self.alt, ALT_STACK)
+        }
     }
 }
 
@@ -252,6 +268,13 @@ pub(crate) fn attach(boot_env: usize, size: usize, guard: usize) -> Result<Cpu, 
     if template == boot_env {
         Guest::new(env.cast()).set_x(31, (stack + len) as u64);
     }
+    // the breaks that leave this thread without its own TaskState or thread_cpu would register on the boot CPU or dereference NULL; they are red at (m) already
+    let alt_guard = page_size();
+    let alt = if ts.is_null() || cfg!(atl_qe_skip_thread_cpu) {
+        0
+    } else {
+        alt_stack(api, env, alt_guard)?
+    };
     #[cfg(atl_qe_copy_caller)]
     LIVE.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -262,6 +285,8 @@ pub(crate) fn attach(boot_env: usize, size: usize, guard: usize) -> Result<Cpu, 
         stack,
         len,
         guard,
+        alt,
+        alt_guard,
     })
 }
 
@@ -300,6 +325,70 @@ fn guest_stack(len: usize, guard: usize) -> Result<usize, String> {
     if let Some(&s) = SHARED_STACK.get() {
         return Ok(s);
     }
+    // break `no-guard`: the guard page is ordinary stack memory, RW on the host and VALID for QEMU
+    let stack = guarded_mapping(len, guard, !cfg!(atl_qe_no_guard))?;
+    #[cfg(atl_qe_shared_stack)]
+    let _ = SHARED_STACK.set(stack);
+    Ok(stack)
+}
+
+/// The alternate signal stack's usable bytes: bionic's per-thread `SIGNAL_STACK_SIZE_WITHOUT_GUARD` for LP64 (libc/bionic/pthread_internal.h, 32 KiB: "ucontext is comically large on aarch64"), plus one guard page below as bionic's `SIGNAL_STACK_SIZE` adds. Break `small-altstack`: 8 KiB, the size the gate's size check names red.
+const ALT_STACK: usize = if cfg!(atl_qe_small_altstack) {
+    8 << 10
+} else {
+    32 << 10
+};
+
+/// Break `shared-altstack`: the first alternate stack attach made, registered for every later CPU too (never freed).
+#[cfg(atl_qe_shared_altstack)]
+static SHARED_ALT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// `target_stack_t` (linux-user/generic/signal.h) for aarch64: abi_ulong ss_sp, abi_int ss_flags, abi_ulong ss_size.
+#[repr(C)]
+struct TargetStack {
+    sp: u64,
+    flags: i32,
+    size: u64,
+}
+
+/// bionic's per-thread alternate signal stack (`__init_alternate_signal_stack`): a guard page + [`ALT_STACK`] bytes, registered with QEMU's `do_sigaltstack` on `env` (this thread's CPU, `thread_cpu` set, sp already on the guest stack so the EPERM check passes) as the guest's own `sigaltstack` syscall would. A guest handler with SA_ONSTACK then runs there (`target_sigsp`), also when the fault is a guest stack overflow. Returns the alternate stack's base, or 0 when break `no-altstack` registers none.
+fn alt_stack(api: &Api, env: *mut u8, guard: usize) -> Result<usize, String> {
+    if cfg!(atl_qe_no_altstack) {
+        return Ok(0);
+    }
+    #[cfg(atl_qe_shared_altstack)]
+    let base = match SHARED_ALT.get() {
+        Some(&b) => b,
+        None => {
+            let b = guarded_mapping(ALT_STACK, guard, true)?;
+            let _ = SHARED_ALT.set(b);
+            b
+        }
+    };
+    #[cfg(not(atl_qe_shared_altstack))]
+    let base = guarded_mapping(ALT_STACK, guard, true)?;
+    // the syscall's argument must be guest-readable memory: the alternate stack's own top, unused until the first SA_ONSTACK delivery
+    let uss = (base + ALT_STACK - std::mem::size_of::<TargetStack>()) & !15;
+    // SAFETY: uss lies inside the RW mapping just made (or the shared one, idle: no handler runs during attach).
+    unsafe {
+        (uss as *mut TargetStack).write(TargetStack {
+            sp: base as u64,
+            flags: 0,
+            size: ALT_STACK as u64,
+        });
+    }
+    // SAFETY: env is this thread's complete CPU with thread_cpu set (attach); uss a guest-readable target_stack_t.
+    let r = unsafe { (api.do_sigaltstack)(uss as u64, 0, env.cast()) };
+    if r != 0 {
+        return Err(format!(
+            "attach: do_sigaltstack refused the alternate stack: {r}"
+        ));
+    }
+    Ok(base)
+}
+
+/// One PROT_NONE mapping of `guard` + `len` bytes (page multiples); the top `len` (plus the guard when `!guarded`) made RW on the host and READ|WRITE|VALID for QEMU. Returns mapping + guard.
+fn guarded_mapping(len: usize, guard: usize, guarded: bool) -> Result<usize, String> {
     // SAFETY: a fresh private anonymous mapping, all PROT_NONE; unmapped in detach.
     let p = unsafe {
         libc::mmap(
@@ -312,10 +401,9 @@ fn guest_stack(len: usize, guard: usize) -> Result<usize, String> {
         )
     };
     if p == libc::MAP_FAILED {
-        return Err("attach: mmap of the guest stack failed".to_owned());
+        return Err("attach: mmap of a guest stack failed".to_owned());
     }
-    // break `no-guard`: the guard page is ordinary stack memory, RW on the host and VALID for QEMU
-    let low = if cfg!(atl_qe_no_guard) { 0 } else { guard };
+    let low = if guarded { guard } else { 0 };
     let open = p as usize + low;
     // SAFETY: [open, p + guard + len) lies inside the mapping just made.
     if unsafe {
@@ -328,7 +416,7 @@ fn guest_stack(len: usize, guard: usize) -> Result<usize, String> {
     {
         // SAFETY: the mapping just made, unused.
         unsafe { libc::munmap(p, guard + len) };
-        return Err("attach: mprotect of the guest stack failed".to_owned());
+        return Err("attach: mprotect of a guest stack failed".to_owned());
     }
     set_pages(
         open,
@@ -336,26 +424,29 @@ fn guest_stack(len: usize, guard: usize) -> Result<usize, String> {
         page::READ | page::WRITE | page::VALID,
         0,
     )?;
-    let stack = p as usize + guard;
-    #[cfg(atl_qe_shared_stack)]
-    let _ = SHARED_STACK.set(stack);
-    Ok(stack)
+    Ok(p as usize + guard)
+}
+
+/// Undo [`guarded_mapping`]: clear VALID (a no-op on the never-registered guard; covering it keeps the unguarded variant consistent) and unmap.
+fn unmap_guarded(base: usize, len: usize, guard: usize) {
+    let map = base - guard;
+    let _ = set_pages(map, guard + len, 0, page::VALID);
+    // SAFETY: the mapping guarded_mapping made; no guest code runs on it any more.
+    unsafe { libc::munmap(map as *mut c_void, guard + len) };
 }
 
 impl Drop for Cpu {
-    /// The guest `exit` path (syscall.c `TARGET_NR_exit`) for this thread's CPU: unparent and unref the CPU, clear `thread_cpu`, free the TaskState, leave RCU. Plus ours: the stack and the fault slot.
+    /// The guest `exit` path (syscall.c `TARGET_NR_exit`) for this thread's CPU: unparent and unref the CPU, clear `thread_cpu`, free the TaskState, leave RCU. Plus ours: the stacks and the fault slot.
     fn drop(&mut self) {
         let api = &lib().thread;
         let _held = ATTACH
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !cfg!(atl_qe_shared_stack) {
-            let (guard, len) = (self.guard, self.len);
-            let map = self.stack - guard;
-            // clearing VALID on the never-registered guard is a no-op; covering it keeps the no-guard break's pages consistent too
-            let _ = set_pages(map, guard + len, 0, page::VALID);
-            // SAFETY: the mapping guest_stack made (guard + stack); no guest code runs on it any more.
-            unsafe { libc::munmap(map as *mut c_void, guard + len) };
+            unmap_guarded(self.stack, self.len, self.guard);
+        }
+        if self.alt != 0 && !cfg!(atl_qe_shared_altstack) {
+            unmap_guarded(self.alt, ALT_STACK, self.alt_guard);
         }
         #[cfg(atl_qe_copy_caller)]
         LIVE.lock()

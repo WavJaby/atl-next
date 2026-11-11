@@ -358,6 +358,79 @@ __attribute__((noinline)) u64 fx_sig_recover(u64 addr) {
     return x_seen;
 }
 
+// (v) guest alternate signal stack: fx_overflow() first probes sigaltstack(2) outside any handler and reports (REPORT, in order) the ENOMEM result of a V_SMALL-byte stack (below MINSIGSTKSZ), then ss_sp, ss_size, ss_flags of the registered stack (flags 0: not on it).
+// It then installs an SA_ONSTACK|SA_SIGINFO SIGSEGV handler and recurses with V_FRAME-byte frames (below one guard page, so the first stray store lands in the guard) until the stack overflows. The handler reports si_addr, its own sp, ss_flags seen there (SS_ONSTACK) and the EPERM result of changing the stack while on it, then siglongjmps out: fx_overflow returns V_LONGJMP.
+// Raw svc for sigaltstack: errno needs bionic TLS, which a host-attached CPU only has as the host's 8-word box. Values: sigaltstack(2) errors EPERM (1), ENOMEM (12) as negative returns; SS_ONSTACK = 1; bionic's LP64 SIGNAL_STACK_SIZE_WITHOUT_GUARD = 32 KiB (pthread_internal.h).
+#define V_SMALL 1024
+#define V_FRAME 512
+#define V_LONGJMP 13
+#define V_ALT_SIZE (32 * 1024)
+#define NR_SIGALTSTACK 132
+static sigjmp_buf v_jmp;
+
+static long raw_sigaltstack(const stack_t *ss, stack_t *old) {
+    register long x0 __asm__("x0") = (long)ss;
+    register long x1 __asm__("x1") = (long)old;
+    register long x8 __asm__("x8") = NR_SIGALTSTACK;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x1), "r"(x8) : "memory");
+    return x0;
+}
+
+static void report(u64 v) {
+    register u64 x0 __asm__("x0") = v;
+    __asm__ volatile("svc #0x7a12" : : "r"(x0) : "memory");
+}
+
+static void overflow_handler(int sig, siginfo_t *info, void *ucv) {
+    (void)sig;
+    (void)ucv;
+    volatile char here = 0;
+    stack_t cur, mine;
+    report((u64)(uintptr_t)info->si_addr);
+    report((u64)(uintptr_t)&here);
+    raw_sigaltstack(0, &cur);
+    report((u64)cur.ss_flags);
+    mine = cur;
+    mine.ss_flags = 0;
+    report((u64)raw_sigaltstack(&mine, 0));
+    siglongjmp(v_jmp, 1);
+}
+
+// depth bound: 1 Gi frames of V_FRAME bytes exceed any guest stack, so it never ends the recursion; it only keeps the compiler from flagging infinite recursion
+__attribute__((noinline)) static u64 overflow(u64 depth) {
+    volatile char frame[V_FRAME];
+    for (int i = V_FRAME - 1; i >= 0; i--) {
+        frame[i] = (char)depth;
+    }
+    if (depth > (1ull << 30)) {
+        return 0;
+    }
+    return overflow(depth + 1) + frame[0];
+}
+
+__attribute__((noinline)) u64 fx_overflow(void) {
+    stack_t small, cur;
+    memset(&small, 0, sizeof small);
+    small.ss_sp = &small;
+    small.ss_size = V_SMALL;
+    report((u64)raw_sigaltstack(&small, 0));
+    raw_sigaltstack(0, &cur);
+    report((u64)(uintptr_t)cur.ss_sp);
+    report((u64)cur.ss_size);
+    report((u64)cur.ss_flags);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = overflow_handler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    if (sigaction(SIGSEGV, &sa, 0) != 0) {
+        return 0;
+    }
+    if (sigsetjmp(v_jmp, 1)) {
+        return V_LONGJMP;
+    }
+    return overflow(0);
+}
+
 // The gate table, read by the host (crates/atl-qemu-engine/tests/spike.rs `t`): u64 words, in this order.
 static const u64 table[] = {
     // 0..3: entry points
@@ -395,6 +468,8 @@ static const u64 table[] = {
     (u64)fx_churn, (u64)fx_sp,
     // 46..47: (x), (y) fx_sig_recover and the address it faults at
     (u64)fx_sig_recover, X_ADDR,
+    // 48..53: (v) fx_overflow, its return after the longjmp, the alternate stack's size, SS_ONSTACK, -EPERM, -ENOMEM
+    (u64)fx_overflow, V_LONGJMP, V_ALT_SIZE, SS_ONSTACK, (u64)-EPERM, (u64)-ENOMEM,
 };
 
 int main(void) {

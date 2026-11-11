@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
-//! Spike gates (QEMU bridge plan Q2/Q3, Q5-2), harness-less: `start` boots QEMU on its helper thread, whose BOOT trap runs gates (a)-(l) there and parks; the host threads then run (n), (u), (m), (o), (p), (s), (t) on their own guest CPUs, and the process exits 0 when every gate is ok.
+//! Spike gates (QEMU bridge plan Q2/Q3, Q5-2), harness-less: `start` boots QEMU on its helper thread, whose BOOT trap runs gates (a)-(l) there and parks; the host threads then run (n), (u), (m), (o), (p), (s), (t), (v) on their own guest CPUs, and the process exits 0 when every gate is ok.
 //! Env (xtask qemu_spike.rs sets it; without it the run prints SKIP): `ATL_QEMU_SPIKE_SO` = the spike library, `ATL_QEMU_SPIKE_FIXTURE` = the static guest program, `ATL_QEMU_SIGCHAIN_OBJ` = AOSP libsigchain's object (build.rs links it and sets cfg `atl_qe_sigchain`). Args: `--guest-base <n>` (QEMU's `-B`, default 0 = identity).
 //! Expected values come from the fixture's table (fixture.c), never from the engine. One line per gate: `spike: (x) ok` or `spike: (x) FAIL <why>`.
-//! Gates: (a) trap arguments, (b) nested host/guest calls, (c) host memory, (d) guest store fault, (e) host fault order behind sigchain, (h) implicit null check through sigchain, (f) write into translated code, (g) second guest thread, (i) fatal guest fault on one thread, (j) the same on a second thread (both end by SIGSEGV), (k) host fault with previous action SIG_IGN (ends by SIGSEGV), (l) binding thunks from the guest pool (bit 15 of the svc immediate, id = slot); (n) helper boot: `start` returned with the BOOT answer, the helper stays parked, the creator thread attaches and calls; (m) two host threads attach at once and call concurrently, each with its own thread pointer and syscalls; (o) a write(2) on host heap memory, accepted under identity mapping (access_ok patch 0002), (p) a write straddling a QEMU-mapped page into host memory QEMU does not map; (s) four attached threads fill their guest stacks across one barrier and find their own words intact; (t) a guest store into the guard page below an attached CPU's stack is a guest SIGSEGV at that address (forked child); (u) 50 host threads attach, call and detach while another attached thread's guest loop churns guest mmap/munmap, translation and host calls (deadline: a hang prints FAIL); (x) a guest SA_SIGINFO handler leaving by siglongjmp gets its si_addr through the engine's special handler, the host mask survives the no-return exit, and later host faults on that thread still reach the previous action and ART's special; (y) a host `sigaction(SIGSEGV)` after boot does not take guest faults.
+//! Gates: (a) trap arguments, (b) nested host/guest calls, (c) host memory, (d) guest store fault, (e) host fault order behind sigchain, (h) implicit null check through sigchain, (f) write into translated code, (g) second guest thread, (i) fatal guest fault on one thread, (j) the same on a second thread (both end by SIGSEGV), (k) host fault with previous action SIG_IGN (ends by SIGSEGV), (l) binding thunks from the guest pool (bit 15 of the svc immediate, id = slot); (n) helper boot: `start` returned with the BOOT answer, the helper stays parked, the creator thread attaches and calls; (m) two host threads attach at once and call concurrently, each with its own thread pointer and syscalls; (o) a write(2) on host heap memory, accepted under identity mapping (access_ok patch 0002), (p) a write straddling a QEMU-mapped page into host memory QEMU does not map; (s) four attached threads fill their guest stacks across one barrier and find their own words intact; (t) a guest store into the guard page below an attached CPU's stack is a guest SIGSEGV at that address (forked child); (u) 50 host threads attach, call and detach while another attached thread's guest loop churns guest mmap/munmap, translation and host calls (deadline: a hang prints FAIL); (v) two attached threads, both alive, each overflow their guest stack into its guard: an SA_ONSTACK SIGSEGV handler runs on the thread's own alternate stack (32 KiB, disjoint from the other's), sees SS_ONSTACK and EPERM there, siglongjmps out (forked child: with no alternate stack QEMU kills it); (x) a guest SA_SIGINFO handler leaving by siglongjmp gets its si_addr through the engine's special handler, the host mask survives the no-return exit, and later host faults on that thread still reach the previous action and ART's special; (y) a host `sigaction(SIGSEGV)` after boot does not take guest faults.
 //! Signals: the harness registers on the linked sigchain what ART does -- an ART FaultManager stand-in, then the engine's special (`signal::special`) with a full mask and `SIGCHAIN_ALLOW_NORETURN` -- and sets the pre-QEMU user action.
 #![allow(clippy::print_stdout, reason = "test harness output is its verdict")]
 
@@ -66,7 +66,13 @@ mod spike {
         pub const SP: usize = 45;
         pub const X_FN: usize = 46;
         pub const X_ADDR: usize = 47;
-        pub const LEN: usize = 48;
+        pub const OVERFLOW: usize = 48;
+        pub const V_LONGJMP: usize = 49;
+        pub const V_ALT_SIZE: usize = 50;
+        pub const V_ONSTACK: usize = 51;
+        pub const V_EPERM: usize = 52;
+        pub const V_ENOMEM: usize = 53;
+        pub const LEN: usize = 54;
     }
 
     /// What the host answers a CALL with during gate (a): any value the guest cannot produce itself.
@@ -120,6 +126,8 @@ mod spike {
         static A_SEEN: Cell<Option<[u64; 8]>> = const { Cell::new(None) };
         /// Gate (s): the guest buffer address fx_stack_fill passed in its CALL.
         static S_BUF: Cell<u64> = const { Cell::new(0) };
+        /// Gate (v): this thread's fx_overflow reports, in the fixture's order.
+        static V_REPORTS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
         /// The binding traps of the current gate-(l) call: (id, x0..x7).
         static BINDS: RefCell<Vec<(u32, [u64; 8])>> = const { RefCell::new(Vec::new()) };
     }
@@ -277,6 +285,7 @@ mod spike {
             ('p', gate_p),
             ('s', gate_s),
             ('t', gate_t),
+            ('v', gate_v),
         ] {
             // a panic (an engine assert on this thread) is the gate's failure, not the harness's
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&booted)))
@@ -345,6 +354,10 @@ mod spike {
                     // SAFETY: the forked child ends here; the parent reads the status.
                     unsafe { libc::_exit(T_ADDR_EXIT) };
                 }
+                0
+            }
+            Trap::Report(v) if GATE.with(Cell::get) == 'V' => {
+                V_REPORTS.with(|r| r.borrow_mut().push(v));
                 0
             }
             Trap::Report(v) => {
@@ -1130,6 +1143,206 @@ mod spike {
                 (false, c) => format!("child exited {c}, expected death by SIGSEGV"),
             },
         )
+    }
+
+    /// Gate (v): attached threads, alive together, so a shared or reused alternate stack shows as overlapping ranges.
+    const V_THREADS: usize = 2;
+    /// Gate (v): fx_overflow's REPORT count (fixture.c order: ENOMEM, ss_sp, ss_size, ss_flags; then in the handler si_addr, sp, ss_flags, EPERM).
+    const V_REPORT_COUNT: usize = 8;
+    /// Gate (v) child: exit status when a check line printed FAIL.
+    const V_CHECK_EXIT: c_int = 48;
+
+    /// One gate-(v) thread's facts: guest stack (base, guard), engine alt stack (base, len), fx_overflow's return and reports.
+    struct VRun {
+        stack: (usize, usize),
+        alt: (usize, usize),
+        ret: u64,
+        reports: Vec<u64>,
+    }
+
+    /// One gate-(v) thread: attach, wait until every thread is attached, run fx_overflow one thread at a time (the guest's jmp_buf is a global), wait again so no CPU detaches (and frees its stacks) before all ran.
+    fn overflow_thread(
+        booted: &Booted,
+        attached: &Barrier,
+        turn: &Mutex<()>,
+    ) -> Result<VRun, String> {
+        GATE.with(|c| c.set('V'));
+        let cpu = booted.attach();
+        attached.wait();
+        // both waits happen on every path, so a failed attach does not strand the other thread at the second
+        let ret = cpu.as_ref().ok().map(|cpu| {
+            let _turn = turn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let tcb: Box<[u64; 8]> = Box::new([0; 8]);
+            cpu.guest()
+                .call_on(tcb.as_ptr() as u64, w(t::OVERFLOW), &[])
+                .0
+        });
+        attached.wait();
+        let (cpu, ret) = (cpu?, ret.unwrap_or_default());
+        Ok(VRun {
+            stack: (cpu.stack_base(), cpu.stack_guard()),
+            alt: cpu.alt_stack(),
+            ret,
+            reports: V_REPORTS.with(|r| r.borrow().clone()),
+        })
+    }
+
+    /// Gate (v) checks for thread `i` against the fixture's table; one FAIL line per miss.
+    fn check_overflow(i: usize, r: &VRun) -> bool {
+        let (base, guard) = r.stack;
+        let (alt, alt_len) = r.alt;
+        let size = w(t::V_ALT_SIZE);
+        if r.reports.len() != V_REPORT_COUNT {
+            println!(
+                "spike: (v) child FAIL thread {i}: {} reports, expected {V_REPORT_COUNT}; fx_overflow = {}",
+                r.reports.len(),
+                r.ret
+            );
+            return false;
+        }
+        let p = &r.reports;
+        let checks = [
+            (
+                r.ret == w(t::V_LONGJMP),
+                format!(
+                    "fx_overflow = {}, expected the longjmp return {}",
+                    r.ret,
+                    w(t::V_LONGJMP)
+                ),
+            ),
+            (
+                p[0] == w(t::V_ENOMEM),
+                format!(
+                    "sigaltstack below MINSIGSTKSZ = {}, expected -ENOMEM",
+                    p[0] as i64
+                ),
+            ),
+            (
+                p[2] == size,
+                format!(
+                    "alternate stack ss_size = {}, expected bionic's {size}",
+                    p[2]
+                ),
+            ),
+            (
+                p[1] == alt as u64 && alt_len as u64 == p[2],
+                format!(
+                    "guest ss_sp {:#x} size {} != engine's [{alt:#x}, +{alt_len})",
+                    p[1], p[2]
+                ),
+            ),
+            (
+                p[3] == 0,
+                format!("ss_flags outside the handler = {}, expected 0", p[3]),
+            ),
+            (
+                p[4] >= (base - guard) as u64 && p[4] < base as u64,
+                format!(
+                    "si_addr {:#x} outside the guard [{:#x}, {base:#x})",
+                    p[4],
+                    base - guard
+                ),
+            ),
+            (
+                p[5] >= p[1] && p[5] < p[1] + p[2],
+                format!(
+                    "handler sp {:#x} outside the alternate stack [{:#x}, {:#x})",
+                    p[5],
+                    p[1],
+                    p[1] + p[2]
+                ),
+            ),
+            (
+                p[6] == w(t::V_ONSTACK),
+                format!("ss_flags in the handler = {}, expected SS_ONSTACK", p[6]),
+            ),
+            (
+                p[7] == w(t::V_EPERM),
+                format!(
+                    "sigaltstack on the alternate stack = {}, expected -EPERM",
+                    p[7] as i64
+                ),
+            ),
+        ];
+        let mut ok = true;
+        for (pass, why) in checks {
+            if !pass {
+                println!("spike: (v) child FAIL thread {i}: {why}");
+                ok = false;
+            }
+        }
+        if ok {
+            println!(
+                "spike: (v) child: thread {i} fault {:#x} in guard below {base:#x}, handler sp {:#x} on alt [{alt:#x}, +{alt_len:#x})",
+                p[4], p[5]
+            );
+        }
+        ok
+    }
+
+    /// Gate (v), Q7-2: in a forked child, V_THREADS attached threads overflow their guest stacks into the guard; each SA_ONSTACK SIGSEGV handler must run on its own thread's alternate stack (attach registers one per CPU, D-Q7-2) and siglongjmp out. Without an alternate stack QEMU cannot build the frame on the overflowed stack and kills the child by SIGSEGV (force_sigsegv).
+    fn gate_v(booted: &Booted) -> Result<(), String> {
+        let pid = fork_child()?;
+        if pid == 0 {
+            let attached = Barrier::new(V_THREADS);
+            let turn = Mutex::new(());
+            let runs: Vec<Result<VRun, String>> = std::thread::scope(|s| {
+                let hs: Vec<_> = (0..V_THREADS)
+                    .map(|_| s.spawn(|| overflow_thread(booted, &attached, &turn)))
+                    .collect();
+                hs.into_iter()
+                    .map(|h| h.join().unwrap_or_else(|_| Err("panicked".to_owned())))
+                    .collect()
+            });
+            let mut ok = true;
+            let mut ranges = Vec::new();
+            for (i, r) in runs.iter().enumerate() {
+                match r {
+                    Ok(r) => {
+                        ok &= check_overflow(i, r);
+                        ranges.push((i, "alt", r.alt.0, r.alt.0 + r.alt.1));
+                        ranges.push((i, "stack", r.stack.0 - r.stack.1, r.stack.0));
+                    }
+                    Err(e) => {
+                        println!("spike: (v) child FAIL thread {i}: {e}");
+                        ok = false;
+                    }
+                }
+            }
+            for (k, a) in ranges.iter().enumerate() {
+                for b in &ranges[k + 1..] {
+                    if a.2 < b.3 && b.2 < a.3 {
+                        println!(
+                            "spike: (v) child FAIL thread {} {} [{:#x}, {:#x}) overlaps thread {} {} [{:#x}, {:#x})",
+                            a.0, a.1, a.2, a.3, b.0, b.1, b.2, b.3
+                        );
+                        ok = false;
+                    }
+                }
+            }
+            // SAFETY: the child ends without running the parent's exit path; its CPUs are already detached.
+            unsafe { libc::_exit(if ok { 0 } else { V_CHECK_EXIT }) };
+        }
+        let mut status = 0;
+        // SAFETY: waits for the child just forked.
+        if unsafe { libc::waitpid(pid, &mut status, 0) } != pid {
+            return Err("waitpid failed".to_owned());
+        }
+        match (libc::WIFSIGNALED(status), libc::WEXITSTATUS(status)) {
+            (false, 0) => Ok(()),
+            (true, _) => Err(format!(
+                "child killed by signal {}: the SA_ONSTACK handler had no alternate stack to run on",
+                libc::WTERMSIG(status)
+            )),
+            // QEMU's fatal path re-raises the host SIGSEGV, which reaches the harness's pre-QEMU handler (gate e's) and exits with its code
+            (false, PREVIOUS_EXIT | ORDER_EXIT) => Err(
+                "child killed: QEMU's fatal guest SIGSEGV reached the pre-QEMU handler; the SA_ONSTACK handler had no alternate stack to run on".to_owned(),
+            ),
+            (false, V_CHECK_EXIT) => Err("child check lines failed (above)".to_owned()),
+            (false, c) => Err(format!("child exited {c}")),
+        }
     }
 
     /// Gate (k) in its child: a host-only fault while the previous SIGSEGV action is SIG_IGN. A synchronous fault cannot be ignored, so the child must end by SIGSEGV; surviving the store exits 3.
