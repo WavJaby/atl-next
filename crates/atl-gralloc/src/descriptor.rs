@@ -27,7 +27,7 @@ pub struct Descriptor {
     pub reserved_size: i64,
     /// `additionalOptions` names: any is unrecognised (no option exists in our set).
     pub option_names: Vec<String>,
-    /// DRM modifiers the buffer may use, any one; empty = LINEAR only. Not in the AIDL: the modifier set is device policy the allocator adds.
+    /// DRM modifiers the buffer may use, any one; empty = no modifier serves this usage on the device (refused). Not in the AIDL: the modifier set is device policy the allocator adds (`atl-gralloc-service` `modifiers_for`).
     pub modifiers: Vec<u64>,
 }
 
@@ -42,8 +42,8 @@ pub enum Refusal {
     /// A reserved region was requested (`getReservedRegion` is not offered).
     ReservedRegion,
     UnrecognisedOption(String),
-    /// No modifier of the set is one the backend allocates (LINEAR only).
-    UnsupportedModifiers(Vec<u64>),
+    /// The device policy left no modifier for this usage (the usage bits): CPU access + render target where LINEAR is not renderable, or a GPU-only buffer whose probed set is empty.
+    NoModifierForUsage(u64),
 }
 
 impl std::fmt::Display for Refusal {
@@ -54,7 +54,10 @@ impl std::fmt::Display for Refusal {
             Self::UnsupportedUsage(u) => write!(f, "usage bits {u:#x} are not supported"),
             Self::ReservedRegion => write!(f, "reserved regions are not supported"),
             Self::UnrecognisedOption(n) => write!(f, "unrecognised option {n}"),
-            Self::UnsupportedModifiers(m) => write!(f, "no supported modifier in {m:#x?}"),
+            Self::NoModifierForUsage(u) => write!(
+                f,
+                "no supported modifier for usage {u:#x} on this device (CPU access needs LINEAR, which a render target needs renderable; GPU-only needs a probed modifier)"
+            ),
         }
     }
 }
@@ -69,7 +72,7 @@ pub struct Checked {
     pub height: u32,
     pub usage: u64,
     pub format: &'static FormatInfo,
-    /// The allowed modifiers, never empty (an empty request means `[LINEAR]`).
+    /// The allowed modifiers, never empty.
     pub modifiers: Vec<u64>,
 }
 
@@ -112,13 +115,8 @@ impl Descriptor {
         if let Some(n) = self.option_names.first() {
             return Err(Refusal::UnrecognisedOption(n.clone()));
         }
-        let modifiers = if self.modifiers.is_empty() {
-            vec![format::DRM_FORMAT_MOD_LINEAR]
-        } else {
-            self.modifiers.clone()
-        };
-        if !modifiers.contains(&format::DRM_FORMAT_MOD_LINEAR) {
-            return Err(Refusal::UnsupportedModifiers(modifiers));
+        if self.modifiers.is_empty() {
+            return Err(Refusal::NoModifierForUsage(self.usage));
         }
         Ok(Checked {
             name: self.name_text(),
@@ -126,7 +124,7 @@ impl Descriptor {
             height,
             usage: self.usage,
             format,
-            modifiers,
+            modifiers: self.modifiers.clone(),
         })
     }
 }
@@ -145,21 +143,26 @@ mod tests {
             usage: 0x33 | usage::GPU_TEXTURE,
             reserved_size: 0,
             option_names: vec![],
-            modifiers: vec![],
+            modifiers: vec![format::DRM_FORMAT_MOD_LINEAR],
         }
     }
 
-    /// Empty = LINEAR; a set naming LINEAR is kept; a set without it is refused (the backend allocates LINEAR only).
+    /// The policy's set is kept as given, tiled ones included; an empty set is refused naming the usage.
     #[test]
-    fn modifiers_default_to_linear() {
+    fn modifier_set_kept_and_empty_refused() {
         const X_TILED: u64 = (1 << 56) | 1; // I915_FORMAT_MOD_X_TILED (drm_fourcc.h: vendor INTEL = 1, value 1)
-        let c = ok().check().expect("accepted");
-        assert_eq!(c.modifiers, [format::DRM_FORMAT_MOD_LINEAR]);
         let mut d = ok();
-        d.modifiers = vec![X_TILED, format::DRM_FORMAT_MOD_LINEAR];
-        assert_eq!(d.check().expect("accepted").modifiers, d.modifiers);
         d.modifiers = vec![X_TILED];
-        assert_eq!(d.check(), Err(Refusal::UnsupportedModifiers(vec![X_TILED])));
+        assert_eq!(d.check().expect("accepted").modifiers, [X_TILED]);
+        d.modifiers = vec![];
+        let e = d.check().expect_err("empty");
+        assert_eq!(e, Refusal::NoModifierForUsage(d.usage));
+        // usage 0x133 = CPU 0x33 | GPU_TEXTURE 0x100 (ok())
+        assert!(
+            e.to_string()
+                .contains("no supported modifier for usage 0x133"),
+            "{e}"
+        );
     }
 
     #[test]

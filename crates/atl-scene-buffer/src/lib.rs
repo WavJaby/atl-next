@@ -8,7 +8,7 @@ use std::io;
 use std::os::fd::BorrowedFd;
 
 use atl_compositor::scene::{SceneBuffer, SceneFd};
-use atl_gralloc::format::{self, COMPONENT_A, RGBA_8888, RGBX_8888};
+use atl_gralloc::format::{self, COMPONENT_A, DRM_FORMAT_MOD_LINEAR, RGBA_8888, RGBX_8888};
 use atl_gralloc::handle::FD_DMABUF;
 use atl_gralloc::layout::Layout;
 use atl_gralloc_dmabuf::{Mapping, SYNC_READ, begin_cpu_access, end_cpu_access};
@@ -116,6 +116,15 @@ pub fn read_pixels(buffer: &SceneBuffer) -> Result<Pixels, String> {
     if stride < width {
         return Err(format!("stride {stride} is less than width {width}"));
     }
+    // a gralloc handle states its layout; only LINEAR rows can be indexed (a tiled GPU-only buffer would read as garbage). A plain file (no gralloc ints) is linear by construction.
+    if let Ok(layout) = atl_gralloc::layout::from_handle(buffer.fds.len(), &buffer.ints)
+        && layout.modifier != DRM_FORMAT_MOD_LINEAR
+    {
+        return Err(format!(
+            "modifier {:#x} is not LINEAR: the CPU cannot index a tiled buffer",
+            layout.modifier
+        ));
+    }
     let stride_bytes = usize::try_from(stride)
         .ok()
         .and_then(|s| s.checked_mul(info.bytes_per_pixel as usize))
@@ -213,6 +222,38 @@ mod tests {
         );
         b.ints[0] = 0;
         assert!(DmabufView::of(&b).is_err(), "foreign magic");
+    }
+
+    /// A gralloc handle naming a tiled modifier is refused by name; the same handle with LINEAR reads.
+    #[test]
+    fn read_pixels_refuses_a_tiled_handle() {
+        use atl_gralloc::format::DRM_FORMAT_ABGR8888;
+        use atl_gralloc::handle::Params;
+        let dmabuf = memfd_with(&[0; 16]);
+        let page = memfd_with(&[0; 8]);
+        let mut params = Params {
+            width: 2,
+            height: 2,
+            pixel_format: RGBA_8888,
+            fourcc: DRM_FORMAT_ABGR8888,
+            pitch: 8,
+            size: 16,
+            usage: 0,
+            // NVIDIA block-linear (gralloc-modifiers S1)
+            modifier: 0x0300_0000_00e0_8014,
+            id: 7,
+        };
+        let mut b = buffer(&dmabuf, 2, 2, 2);
+        b.fds.push(SceneFd::new(page.as_raw_fd()));
+        b.ints = params.to_ints().to_vec();
+        let e = read_pixels(&b).expect_err("tiled");
+        assert!(
+            e.contains("modifier 0x300000000e08014 is not LINEAR"),
+            "{e}"
+        );
+        params.modifier = DRM_FORMAT_MOD_LINEAR;
+        b.ints = params.to_ints().to_vec();
+        read_pixels(&b).expect("linear reads");
     }
 
     /// 2x2 pixels in rows of 3 pixels (stride 12 bytes): the padding pixel of each row is part of the copy, so the row pitch survives.

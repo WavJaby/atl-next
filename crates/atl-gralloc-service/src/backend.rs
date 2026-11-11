@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The GBM backend: linear dma-bufs from the host's DRM device.
+//! The GBM backend: dma-bufs from the host's DRM device, LINEAR or a layout GBM picks from the request's modifier set.
 //! GBM objects are not `Send`, so one thread owns the device and serves allocation requests over a channel; the binder threads only send requests.
 //! Node choice is by trial, not by driver name: every `renderD*` then every `card*` node under the DRM directory is opened and asked for a test buffer, and the first that gives one wins.
 //! Render nodes are tried first because on real GPUs they allocate without master rights; a driver that only allocates dumb / linear buffers on its card node (the kernel's `vgem`, which the WSL setup uses: measured 2026-11-04 on 6.6.87.2-microsoft-standard-WSL2, `DRM_IOCTL_MODE_CREATE_DUMB` on `renderD128` fails EACCES, on `card0` works) is found the same way.
@@ -19,7 +19,7 @@ use atl_gralloc::format::{
     BLOB, BLOB_ROW_BYTES, DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR, RGBA_8888,
 };
 use atl_gralloc::usage;
-use gbm::{BufferObjectFlags, Device, Format};
+use gbm::{BufferObjectFlags, Device, Format, Modifier};
 use rustix::fs::{SeekFrom, seek};
 
 use crate::prime;
@@ -30,19 +30,21 @@ pub const DRM_DIR: &str = "/dev/dri";
 /// The size of the buffer a node is asked for to prove it allocates. Any valid size does; 64 x 64 is what the gate allocates.
 const PROBE_EDGE: i32 = 64;
 
-/// GBM flags per usage bit, OR'd over the request's usage. Empty now: every buffer is LINEAR (the only modifier `Checked` admits), which [`flags_for`] adds. Step 2 adds GPU_RENDER_TARGET / GPU_TEXTURE -> RENDERING here, with non-linear modifiers.
-const USAGE_FLAGS: &[(u64, BufferObjectFlags)] = &[];
+/// GBM flags per usage bit for a modifier-set allocation, OR'd over the request's usage: the GPU reads and draws it.
+const USAGE_FLAGS: &[(u64, BufferObjectFlags)] = &[
+    (usage::GPU_RENDER_TARGET, BufferObjectFlags::RENDERING),
+    (usage::GPU_TEXTURE, BufferObjectFlags::RENDERING),
+];
 
-/// The GBM flags for a request: the usage table plus LINEAR when the modifier set allows only LINEAR.
+/// The GBM flags for a request: exactly LINEAR when the set is `[LINEAR]` (the linear tier and CPU usage: the flags every buffer had before modifier sets, kept so vgem / WSL allocate as before), else the usage table.
 fn flags_for(usage: u64, modifiers: &[u64]) -> BufferObjectFlags {
-    let mut flags = USAGE_FLAGS
+    if modifiers == [DRM_FORMAT_MOD_LINEAR] {
+        return BufferObjectFlags::LINEAR;
+    }
+    USAGE_FLAGS
         .iter()
         .filter(|(bit, _)| usage & bit != 0)
-        .fold(BufferObjectFlags::empty(), |acc, (_, f)| acc | *f);
-    if modifiers == [DRM_FORMAT_MOD_LINEAR] {
-        flags |= BufferObjectFlags::LINEAR;
-    }
-    flags
+        .fold(BufferObjectFlags::empty(), |acc, (_, f)| acc | *f)
 }
 
 /// The request a node must serve to be chosen: the window buffer shape the gate allocates.
@@ -56,20 +58,24 @@ fn probe_request() -> Checked {
         usage: usage::CPU_MASK,
         reserved_size: 0,
         option_names: vec![],
-        modifiers: vec![],
+        modifiers: vec![DRM_FORMAT_MOD_LINEAR],
     }
     .check()
     .expect("the probe request is in the supported set")
 }
 
-/// Counters of the backend's fallbacks.
+/// Counters of the backend's tiers and fallbacks.
 #[derive(Debug, Default)]
 pub struct Counters {
-    /// LINEAR buffers the driver reported with modifier INVALID, stored as LINEAR. vgem does this (WSL); retired with the GBM modifier path (G5).
+    /// LINEAR buffers the driver reported with modifier INVALID, stored as LINEAR. vgem does this (WSL).
     pub modifier_invalid_linear: AtomicU64,
+    /// Buffers allocated from a probed modifier set (`gbm_bo_create_with_modifiers2`): the modifier tier.
+    pub alloc_modifier: AtomicU64,
+    /// Buffers allocated with set `[LINEAR]` (GBM LINEAR flag): CPU usage, or the linear tier (no probe list). The node probe's own buffer included.
+    pub alloc_linear: AtomicU64,
 }
 
-/// One linear buffer.
+/// One buffer.
 #[derive(Debug)]
 pub struct Dmabuf {
     pub fd: OwnedFd,
@@ -77,7 +83,7 @@ pub struct Dmabuf {
     pub pitch: u32,
     /// Bytes the dma-buf holds.
     pub size: u64,
-    /// The layout's DRM modifier: `LINEAR` (0) for what we asked for, even when the driver answers "invalid" for it (vgem does).
+    /// The layout's DRM modifier: the one GBM picked from the set; `LINEAR` (0) for a `[LINEAR]` request even when the driver answers "invalid" for it (vgem does).
     pub modifier: u64,
 }
 
@@ -149,7 +155,7 @@ fn gbm_format(fourcc: u32) -> Result<Format, BackendError> {
         .map_err(|_| BackendError::Alloc(format!("fourcc {fourcc:#x} is not a DRM format")))
 }
 
-/// The one allocation entry: GBM flags from [`flags_for`], LINEAR only now (the CPU path maps the dma-buf and indexes it by pitch, the layout atl-gralloc's plane layout states).
+/// The one allocation entry. Set `[LINEAR]`: plain create with the LINEAR flag (the CPU path maps the dma-buf and indexes it by pitch). Any other set: GBM picks inside it (`with_modifiers2`); the result must be one plane, the only layout the handle carries.
 fn alloc(
     dev: &Device<std::fs::File>,
     c: &Checked,
@@ -163,9 +169,27 @@ fn alloc(
     } else {
         (c.width, c.height)
     };
-    let bo = dev
-        .create_buffer_object::<()>(width, height, format, flags_for(c.usage, &c.modifiers))
-        .map_err(|e| BackendError::Alloc(e.to_string()))?;
+    let linear = c.modifiers == [DRM_FORMAT_MOD_LINEAR];
+    let flags = flags_for(c.usage, &c.modifiers);
+    let bo = if linear {
+        dev.create_buffer_object::<()>(width, height, format, flags)
+    } else {
+        dev.create_buffer_object_with_modifiers2::<()>(
+            width,
+            height,
+            format,
+            c.modifiers.iter().map(|&m| Modifier::from(m)),
+            flags,
+        )
+    }
+    .map_err(|e| BackendError::Alloc(format!("{e} (modifiers {:#x?})", c.modifiers)))?;
+    if bo.plane_count() != 1 {
+        return Err(BackendError::Alloc(format!(
+            "modifier {:#x} has {} planes; the handle carries one",
+            u64::from(bo.modifier()),
+            bo.plane_count()
+        )));
+    }
     if blob && bo.stride() != BLOB_ROW_BYTES {
         return Err(BackendError::Alloc(format!(
             "BLOB backing pitch {} != {BLOB_ROW_BYTES}: rows not contiguous",
@@ -181,12 +205,24 @@ fn alloc(
         .map_err(|e| BackendError::Alloc(format!("sizing the dma-buf: {e}")))?;
     let mut modifier = u64::from(bo.modifier());
     // vgem answers INVALID for the LINEAR buffer it was asked for; only then is INVALID read as LINEAR
-    if modifier == DRM_FORMAT_MOD_INVALID && c.modifiers == [DRM_FORMAT_MOD_LINEAR] {
+    if modifier == DRM_FORMAT_MOD_INVALID && linear {
         counters
             .modifier_invalid_linear
             .fetch_add(1, Ordering::Relaxed);
         modifier = DRM_FORMAT_MOD_LINEAR;
     }
+    if !c.modifiers.contains(&modifier) {
+        return Err(BackendError::Alloc(format!(
+            "GBM chose modifier {modifier:#x} outside the set {:#x?}",
+            c.modifiers
+        )));
+    }
+    let tier = if linear {
+        &counters.alloc_linear
+    } else {
+        &counters.alloc_modifier
+    };
+    tier.fetch_add(1, Ordering::Relaxed);
     Ok(Dmabuf {
         fd,
         pitch,
@@ -345,16 +381,20 @@ mod tests {
         assert!(e.to_string().contains("/dev/null"), "{e}");
     }
 
-    /// LINEAR-only modifier sets get GBM LINEAR; any other set gets no LINEAR flag (the usage table is empty now).
+    /// `[LINEAR]` gets exactly GBM LINEAR whatever the usage (the pre-modifier flags); any other set gets RENDERING for GPU draw / sample usage and no LINEAR.
     #[test]
     fn flags_follow_the_modifier_set() {
-        let any = usage::CPU_MASK | usage::GPU_TEXTURE;
+        let gpu = usage::GPU_RENDER_TARGET | usage::GPU_TEXTURE;
         assert_eq!(
-            flags_for(any, &[DRM_FORMAT_MOD_LINEAR]),
+            flags_for(usage::CPU_MASK | gpu, &[DRM_FORMAT_MOD_LINEAR]),
             BufferObjectFlags::LINEAR
         );
         assert_eq!(
-            flags_for(any, &[DRM_FORMAT_MOD_LINEAR, 1]),
+            flags_for(gpu, &[DRM_FORMAT_MOD_LINEAR, 1]),
+            BufferObjectFlags::RENDERING
+        );
+        assert_eq!(
+            flags_for(usage::COMPOSER_OVERLAY, &[1]),
             BufferObjectFlags::empty()
         );
     }

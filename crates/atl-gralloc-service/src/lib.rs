@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! The graphics allocator HAL service (AIDL `android.hardware.graphics.allocator.IAllocator`, instance `default`) AOSP libui's Gralloc5 allocates through.
 //!
-//! - `backend`: linear dma-bufs from the host's DRM device through GBM, on a thread of their own (GBM objects are not `Send`).
+//! - `policy`: the modifier set per usage, from atld's probe lists.
+//! - `backend`: dma-bufs from the host's DRM device through GBM (LINEAR, or GBM's pick inside the set), on a thread of their own (GBM objects are not `Send`).
 //! - `prime`: the dma-buf export (DRM PRIME ioctl) and the GEM handle read out of GBM, the crate's only `unsafe`.
 //! - `allocator`: one allocation -- the dma-buf, the shared metadata page, the handle parameters.
 //! - `service` (feature `converter`): the `IAllocator` implementation on AOSP's Rust stub; served by the bin `atl-gralloc-allocator`.
@@ -12,6 +13,7 @@
 
 pub mod allocator;
 pub mod backend;
+pub mod policy;
 #[allow(unsafe_code)]
 mod prime;
 #[cfg(feature = "converter")]

@@ -14,12 +14,12 @@ use atl_aidl::graphics_allocator::aidl::android::hardware::graphics::allocator::
 use atl_aidl::graphics_allocator::aidl::android::hardware::graphics::allocator::IAllocator::{
     BnAllocator, IAllocator,
 };
-use atl_gralloc::descriptor::Descriptor;
-use atl_gralloc::format::DRM_FORMAT_MOD_LINEAR;
+use atl_gralloc::descriptor::{Descriptor, Refusal};
 use atl_gralloc::{handle, vintf};
 use binder::{BinderFeatures, Interface, ParcelFileDescriptor, SpIBinder, Status};
 
 use crate::allocator::Allocator;
+use crate::policy::modifiers_for;
 
 fn log(msg: std::fmt::Arguments<'_>) {
     let _ = writeln!(std::io::stderr(), "gralloc: {msg}");
@@ -30,8 +30,8 @@ fn error(e: AllocationError) -> Status {
     Status::new_service_specific_error(e.0, None)
 }
 
-/// `BufferDescriptorInfo` as the core's request.
-fn descriptor(info: &BufferDescriptorInfo) -> Descriptor {
+/// `BufferDescriptorInfo` as the core's request, its modifier set from [`modifiers_for`].
+fn descriptor(info: &BufferDescriptorInfo, probe: &[(u32, Vec<u64>)]) -> Descriptor {
     Descriptor {
         // the name is C chars in an i8/u8 array; the core treats it as bytes up to the first NUL
         name: info.name.to_vec(),
@@ -47,13 +47,15 @@ fn descriptor(info: &BufferDescriptorInfo) -> Descriptor {
             .iter()
             .map(|o| o.name.clone())
             .collect(),
-        // device policy, not AIDL: LINEAR only until the GBM modifier path (G5)
-        modifiers: vec![DRM_FORMAT_MOD_LINEAR],
+        // device policy, not AIDL
+        modifiers: modifiers_for(info.usage.0 as u64, info.format.0, probe),
     }
 }
 
 struct Service {
     allocator: Arc<Allocator>,
+    /// atld's probe lists per fourcc.
+    probe: Vec<(u32, Vec<u64>)>,
 }
 
 impl Interface for Service {}
@@ -71,13 +73,17 @@ impl IAllocator for Service {
         info: &BufferDescriptorInfo,
         count: i32,
     ) -> binder::Result<AllocationResult> {
-        let checked = match descriptor(info).check() {
+        let d = descriptor(info, &self.probe);
+        let checked = match d.check() {
             Ok(c) => c,
             Err(refusal) => {
                 log(format_args!(
                     "refused allocate2({}): {refusal}",
-                    descriptor(info).name_text()
+                    d.name_text()
                 ));
+                if matches!(refusal, Refusal::NoModifierForUsage(_)) {
+                    self.allocator.count_no_modifier();
+                }
                 return Err(error(AllocationError::UNSUPPORTED));
             }
         };
@@ -107,7 +113,7 @@ impl IAllocator for Service {
     }
 
     fn r#isSupported(&self, info: &BufferDescriptorInfo) -> binder::Result<bool> {
-        Ok(descriptor(info).check().is_ok())
+        Ok(descriptor(info, &self.probe).check().is_ok())
     }
 
     fn r#getIMapperLibrarySuffix(&self) -> binder::Result<String> {
@@ -115,7 +121,7 @@ impl IAllocator for Service {
     }
 }
 
-/// The allocator service binder over `allocator`.
-pub fn new_binder(allocator: Arc<Allocator>) -> SpIBinder {
-    BnAllocator::new_binder(Service { allocator }, BinderFeatures::default()).as_binder()
+/// The allocator service binder over `allocator`, with atld's probe lists (`probe`, per fourcc; empty on the linear tier).
+pub fn new_binder(allocator: Arc<Allocator>, probe: Vec<(u32, Vec<u64>)>) -> SpIBinder {
+    BnAllocator::new_binder(Service { allocator, probe }, BinderFeatures::default()).as_binder()
 }

@@ -25,7 +25,7 @@ struct Args {
     /// The DRM node to allocate from (default: the first of /dev/dri's render then card nodes that allocates a linear buffer).
     #[arg(long)]
     drm_node: Option<PathBuf>,
-    /// The modifier set atld's display probe found for one fourcc, `<FOURCC>=<hex>,...` (atl_gralloc::node::modifier_arg), repeatable. Logged only: allocation stays LINEAR until the usage policy lands.
+    /// The modifier set atld's display probe found for one fourcc, `<FOURCC>=<hex>,...` (atl_gralloc::node::modifier_arg), repeatable. GPU-only buffers of that fourcc allocate inside it (policy.rs `modifiers_for`); a fourcc without one stays LINEAR.
     #[arg(long, value_parser = parse_modifiers)]
     modifiers: Vec<(u32, Vec<u64>)>,
 }
@@ -54,7 +54,7 @@ fn main() -> Result<()> {
     ProcessState::start_thread_pool();
     binder::add_service(
         &vintf::allocator_service_name(),
-        service::new_binder(Arc::clone(&allocator)),
+        service::new_binder(Arc::clone(&allocator), a.modifiers),
     )
     .context("addService (is the instance declared in the VINTF manifest?)")?;
     writeln!(std::io::stderr(), "{}", allocator.counters_line())?;

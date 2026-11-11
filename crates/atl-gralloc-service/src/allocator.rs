@@ -3,6 +3,7 @@
 
 use std::io::Write;
 use std::os::fd::OwnedFd;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use atl_gralloc::descriptor::Checked;
@@ -51,36 +52,75 @@ impl From<BackendError> for AllocError {
 pub struct Allocator {
     backend: Backend,
     counter: AtomicU32,
-    /// The `modifier_invalid_linear` value last printed.
-    counters_logged: AtomicU64,
+    /// Requests refused because the device policy left no modifier for their usage (`Refusal::NoModifierForUsage`).
+    refused_no_modifier: AtomicU64,
+    /// The [`Self::log_key`] last printed.
+    counters_logged: Mutex<LogKey>,
     pid: u32,
 }
 
+/// (modifier_invalid_linear, refused_no_modifier, alloc_linear != 0, alloc_modifier != 0)
+type LogKey = (u64, u64, bool, bool);
+
 impl Allocator {
     pub fn new(backend: Backend) -> Self {
-        // the probe allocation may already have counted; the start line prints that value
-        let at_start = backend
-            .counters()
-            .modifier_invalid_linear
-            .load(Ordering::Relaxed);
-        Self {
+        let a = Self {
             backend,
             counter: AtomicU32::new(1),
-            counters_logged: AtomicU64::new(at_start),
+            refused_no_modifier: AtomicU64::new(0),
+            counters_logged: Mutex::new((0, 0, false, false)),
             pid: std::process::id(),
-        }
+        };
+        // the probe allocation may already have counted; the start line prints that value
+        let key = a.log_key();
+        *a.counters_logged.lock().unwrap_or_else(|p| p.into_inner()) = key;
+        a
     }
 
     pub fn backend(&self) -> &Backend {
         &self.backend
     }
 
-    /// `gralloc: counters <name>=<n> ...`: printed at start and whenever a counter changes (the gate reads the last one).
+    /// Counts one `NoModifierForUsage` refusal and prints the counters.
+    pub fn count_no_modifier(&self) {
+        self.refused_no_modifier.fetch_add(1, Ordering::Relaxed);
+        self.log_counters_if_changed();
+    }
+
+    /// What decides a reprint: `modifier_invalid_linear` and `refused_no_modifier` by value, each tier counter by whether it is non-zero (so a tier's first buffer prints, its later ones do not).
+    fn log_key(&self) -> LogKey {
+        let c = self.backend.counters();
+        let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        (
+            load(&c.modifier_invalid_linear),
+            load(&self.refused_no_modifier),
+            load(&c.alloc_linear) != 0,
+            load(&c.alloc_modifier) != 0,
+        )
+    }
+
+    fn log_counters_if_changed(&self) {
+        let key = self.log_key();
+        let mut last = self
+            .counters_logged
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if std::mem::replace(&mut *last, key) != key {
+            // stderr is the allocator's log (service.rs `log`); a failed write loses one diagnostic line, not the buffer
+            let _ = writeln!(std::io::stderr(), "{}", self.counters_line());
+        }
+    }
+
+    /// `gralloc: counters <name>=<n> ...`: printed at start and whenever [`Self::log_key`] changes (the gate reads the last one).
     pub fn counters_line(&self) -> String {
         let c = self.backend.counters();
+        let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
         format!(
-            "gralloc: counters modifier_invalid_linear={}",
-            c.modifier_invalid_linear.load(Ordering::Relaxed)
+            "gralloc: counters modifier_invalid_linear={} alloc_linear={} alloc_modifier={} refused_no_modifier={}",
+            load(&c.modifier_invalid_linear),
+            load(&c.alloc_linear),
+            load(&c.alloc_modifier),
+            load(&self.refused_no_modifier),
         )
     }
 
@@ -99,15 +139,7 @@ impl Allocator {
     /// Allocates one buffer for `d`.
     pub fn allocate(&self, d: &Checked) -> Result<Allocation, AllocError> {
         let dmabuf = self.backend.allocate(d)?;
-        let n = self
-            .backend
-            .counters()
-            .modifier_invalid_linear
-            .load(Ordering::Relaxed);
-        if self.counters_logged.swap(n, Ordering::Relaxed) != n {
-            // stderr is the allocator's log (service.rs `log`); a failed write loses one diagnostic line, not the buffer
-            let _ = writeln!(std::io::stderr(), "{}", self.counters_line());
-        }
+        self.log_counters_if_changed();
         let row = u64::from(d.width) * u64::from(d.format.bytes_per_pixel);
         if u64::from(dmabuf.pitch) < row || !dmabuf.pitch.is_multiple_of(d.format.bytes_per_pixel) {
             return Err(AllocError::Inconsistent("pitch"));
@@ -158,7 +190,7 @@ mod tests {
             usage: 0x33,
             reserved_size: 0,
             option_names: vec![],
-            modifiers: vec![],
+            modifiers: vec![atl_gralloc::format::DRM_FORMAT_MOD_LINEAR],
         }
         .check()
         .expect("valid")

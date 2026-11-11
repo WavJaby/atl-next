@@ -378,7 +378,8 @@ fn gralloc_buffer(alloc: &Path) -> Result<Buffer> {
         usage: usage::CPU_MASK | usage::GPU_RENDER_TARGET | usage::GPU_TEXTURE,
         reserved_size: 0,
         option_names: vec![],
-        modifiers: vec![],
+        // CPU usage -> LINEAR (gralloc's policy, policy.rs `modifiers_for`)
+        modifiers: vec![DRM_FORMAT_MOD_LINEAR],
     }
     .check()
     .map_err(|e| anyhow!("descriptor refused: {e:?}"))?;
