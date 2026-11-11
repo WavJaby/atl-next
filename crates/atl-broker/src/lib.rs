@@ -8,6 +8,7 @@
 //! [`control`] is how the system services ask atld (which owns the broker) to start and kill processes.
 #![forbid(unsafe_code)]
 
+pub mod app_env;
 pub mod bwrap;
 pub mod control;
 pub mod gpu;
@@ -562,19 +563,20 @@ pub struct Broker {
     app_seccomp: bool,
     /// The sandbox stub every app process runs under (bwrap execs it, it restricts itself and execs the program).
     stub: PathBuf,
+    /// Variables every spawn gets on top of its own ([`Broker::with_env`]): the launcher's explicit additions, e.g. a harness's debug or break variables.
+    app_env: Vec<(OsString, OsString)>,
 }
 
 fn other(what: impl std::fmt::Display) -> io::Error {
     io::Error::other(what.to_string())
 }
 
-/// One bwrap run: its arguments up to `--`, then the program; `inherit` = the fds the child alone gets (cleared close-on-exec just before the spawn, closed right after it). Returns bwrap and the host pid it reports on `info_r`.
+/// One bwrap run: its arguments up to `--`, then the program; `env` its whole environment (bwrap adds PWD); `inherit` = the fds the child alone gets (cleared close-on-exec just before the spawn, closed right after it). Returns bwrap and the host pid it reports on `info_r`.
 struct Launch<'a> {
     bwrap_args: Vec<OsString>,
     program: &'a Path,
     args: &'a [OsString],
     env: Vec<(OsString, OsString)>,
-    clear_env: bool,
     stdin: Stdio,
     stdout: Stdio,
     stderr: Stdio,
@@ -596,10 +598,8 @@ fn launch(l: Launch<'_>, info_r: io::PipeReader, inherit: Vec<OwnedFd>) -> io::R
         reason = "the one launcher of the runtime: every process atld starts is a bwrap run built here"
     )]
     let mut cmd = std::process::Command::new(BWRAP);
-    if l.clear_env {
-        cmd.env_clear();
-    }
-    cmd.args(&l.bwrap_args)
+    cmd.env_clear()
+        .args(&l.bwrap_args)
         .arg(l.program)
         .args(l.args)
         .envs(l.env)
@@ -649,9 +649,8 @@ impl Broker {
                 bwrap_args,
                 program: stub,
                 args: &args,
+                // binderd reads no variable
                 env: vec![],
-                // binderd reads no variable; the host's would only widen what it sees
-                clear_env: true,
                 stdin: theirs.into(),
                 stdout: Stdio::null(),
                 stderr: log.into(),
@@ -669,7 +668,14 @@ impl Broker {
             spawning: Mutex::new(()),
             app_seccomp: true,
             stub: stub.to_path_buf(),
+            app_env: Vec::new(),
         }
+    }
+
+    /// Every spawn also gets `vars`, after its own entries (atld `--app-env`): the explicit route for what is not the desktop's to give (app_env::APP_ENV).
+    pub fn with_env(mut self, vars: Vec<(OsString, OsString)>) -> Self {
+        self.app_env = vars;
+        self
     }
 
     /// Apps start without the seccomp filter: the deliberate-failure check that shows what the filter answers (atld `--no-app-seccomp`, test only).
@@ -726,7 +732,10 @@ impl Broker {
         // the stub applies the grants, then execs the program with the spawn's arguments
         let mut args = stub_args(&grants, spawn.rights.contains(&Right::Net), &spawn.program);
         args.extend(spawn.args.iter().cloned());
-        let mut env = spawn.env;
+        // the desktop's variables the sandbox reads (app_env::APP_ENV), then the spawn's own and the launcher's additions, later winning on a clash; nothing else of atld's environment
+        let mut env = app_env::forwarded(|k| std::env::var_os(k));
+        env.extend(spawn.env);
+        env.extend(self.app_env.iter().cloned());
         env.push((CONTROL_ENV.into(), theirs.as_raw_fd().to_string().into()));
         let mut inherit: Vec<OwnedFd> = vec![theirs, info_w.into()];
         inherit.extend(seccomp);
@@ -736,7 +745,6 @@ impl Broker {
                 program: Path::new(SANDBOX_STUB_AT),
                 args: &args,
                 env,
-                clear_env: false,
                 stdin: spawn.stdin.map_or_else(Stdio::null, Stdio::from),
                 stdout: spawn.stdout,
                 stderr: spawn.stderr,

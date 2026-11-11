@@ -5,7 +5,8 @@
 //! The UI baseline grants (each a grant class every UI app gets, not a manifest right), each with one shown and one refused path: the compositor socket (atl_platform_host::app_access::socket_of; a second socket beside it refused), the fontconfig file (config_file_of; a file beside it refused),
 //! the DRM node's sysfs (atl_broker::drm_sysfs over /dev/dri: the device dir's `uevent` read, `/sys/devices/system/cpu/online` refused). Font dirs are not probed: the face dirs fontconfig lists are bound the same way as the file.
 //! The TCP judgement needs Landlock ABI >= 4 (the network rights): below it the gate prints the net check as not judged and counts nothing for it. WSL is ABI 3, so the net branch is asserted on the Arch laptop only.
-//! Deliberate break, by hand: restore the writable host root in atl-broker `host_root` (every host dir bound rw); `home-read` must then fail. The gate removes the two $HOME names it makes.
+//! The environment (judge_env): only atl-broker app_env::APP_ENV names, the spawn's own and the sandbox's fixed ones; the broker's HOME must not arrive.
+//! Deliberate breaks, by hand: restore the writable host root in atl-broker `host_root` (every host dir bound rw); `home-read` must then fail. Drop `env_clear` in atl-broker `launch`; the `env:` checks must then fail. The gate removes the two $HOME names it makes.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -17,7 +18,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use atl_android_paths::DATA;
-use atl_broker::{Broker, Mount, drm_sysfs, rights_of, to_log};
+use atl_broker::app_env::APP_ENV;
+use atl_broker::{Broker, CONTROL_ENV, Mount, drm_sysfs, rights_of, to_log};
 use atl_platform_host::app_access;
 
 use crate::binder;
@@ -58,6 +60,13 @@ const EROFS: i32 = 30;
 const HOME_REFUSED: &[i32] = &[ENOENT, EACCES];
 /// The outside write: refused by the mount (EROFS), the grant (EACCES), or the mode (EPERM).
 const WRITE_REFUSED: &[i32] = &[EPERM, EACCES, EROFS];
+
+/// The variable the gate puts in the probe's spawn env: the explicit route must still work.
+const EXPLICIT_ENV: &str = "ATL_SANDBOX_PROBE_EXPLICIT";
+/// A variable of the broker's own environment that is not the desktop's to give: the real home path. The gate reads HOME itself, so it is always set here.
+const SENTINEL_ENV: &str = "HOME";
+/// The variable bwrap itself sets in the sandbox (bubblewrap.c, after --chdir).
+const BWRAP_PWD: &str = "PWD";
 
 /// One probe run: its checks' line, the Landlock ABI its stub reported (None: no line), and the failures the judgement finds.
 struct Probed {
@@ -227,6 +236,7 @@ fn probe_once(
         .arg(&ui.sysfs)
         .arg(SYS_OTHER);
     let mut spawn = binder::spawn_of(&cmd, APP_UID)?;
+    spawn.env.push((EXPLICIT_ENV.into(), "1".into()));
     spawn.mounts.push(Mount {
         host: host_own,
         at: own_dir.into(),
@@ -266,7 +276,53 @@ fn probe_once(
         None => fails.push(format!("probe still running after {LIMIT:?}, killed")),
     }
     fails.extend(judge(&line, internet, abi));
+    fails.extend(judge_env(&line, |k| std::env::var_os(k).is_some()));
     Ok(Probed { line, abi, fails })
+}
+
+/// The probe's environment against this process's (the broker's host, as atld is): HOME (set here, the run needs it) must not reach the app; every name must be an app_env::APP_ENV name, the spawn's own ([`EXPLICIT_ENV`], which must arrive: the probe reports env at all), the binder fd variable, or bwrap's PWD;
+/// and every APP_ENV name `host_has` must arrive.
+fn judge_env(line: &str, host_has: impl Fn(&str) -> bool) -> Vec<String> {
+    let names: Vec<&str> = line
+        .split(' ')
+        .find_map(|kv| kv.strip_prefix("env="))
+        .map(|v| v.split(',').filter(|n| !n.is_empty()).collect())
+        .unwrap_or_default();
+    let mut fails = Vec::new();
+    if names.contains(&SENTINEL_ENV) {
+        fails.push(format!(
+            "env: {SENTINEL_ENV} from the broker's environment reached the app sandbox"
+        ));
+    }
+    if !names.contains(&EXPLICIT_ENV) {
+        fails.push(format!(
+            "env: the spawn's own {EXPLICIT_ENV} did not arrive (env={})",
+            names.join(",")
+        ));
+    }
+    let stray: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|n| !APP_ENV.contains(n) && ![EXPLICIT_ENV, CONTROL_ENV, BWRAP_PWD].contains(n))
+        .collect();
+    if !stray.is_empty() {
+        fails.push(format!(
+            "env: names outside the allow-list reached the app: {}",
+            stray.join(",")
+        ));
+    }
+    let lost: Vec<&str> = APP_ENV
+        .iter()
+        .copied()
+        .filter(|n| host_has(n) && !names.contains(n))
+        .collect();
+    if !lost.is_empty() {
+        fails.push(format!(
+            "env: allow-listed names set here did not arrive: {}",
+            lost.join(",")
+        ));
+    }
+    fails
 }
 
 /// The verdict on one probe line: the file checks in every run; the TCP connect by the run's rights, judged only where Landlock enforces the network rights (ABI >= NET_ABI).

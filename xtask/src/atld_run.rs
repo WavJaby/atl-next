@@ -1253,13 +1253,15 @@ impl Runtime {
         }
         if let Some(mode) = &self.ui {
             // the compositor logs each frame's `present` line at debug (atl-composer ui_window.rs): the UI runs that read them enable it
-            // GTK's dmabuf debug lines: the window gate's import verdict (gdk_dmabuf.rs)
+            // GTK's dmabuf debug lines: the window gate's import verdict (gdk_dmabuf.rs); both read in the app processes, so they go as --app-env (atld forwards nothing else of its own)
             cmd.args(["--ui", mode])
-                .env("RUST_LOG", "info,atl_composer=debug")
-                .env("GDK_DEBUG", crate::gdk_dmabuf::GDK_DEBUG);
+                .arg("--app-env")
+                .arg("RUST_LOG=info,atl_composer=debug")
+                .arg("--app-env")
+                .arg(format!("GDK_DEBUG={}", crate::gdk_dmabuf::GDK_DEBUG));
         }
         if let Some(rule) = self.ui_break {
-            cmd.env("ATL_UI_BREAK", rule);
+            cmd.arg("--app-env").arg(format!("ATL_UI_BREAK={rule}"));
         }
         cmd.envs(self.desktop_env.iter().map(|(k, v)| (k, v)));
         if !self.audio_service {

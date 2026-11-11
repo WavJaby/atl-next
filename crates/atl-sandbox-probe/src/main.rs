@@ -3,7 +3,7 @@
 //! Usage: `atl-sandbox-probe HOME_FILE HOME_NEW OUTSIDE OWN_FILE PORT SOCKET OTHER_SOCKET FONTCONF FONTCONF_SIBLING SYSFS SYS_OTHER`:
 //! HOME_FILE an existing file in the real $HOME, HOME_NEW a name in it that does not exist, OUTSIDE a file the app's grants do not cover for writing, OWN_FILE a path in the app's own data dir, PORT a loopback TCP port the gate listens on;
 //! SOCKET the granted compositor socket and OTHER_SOCKET a host socket beside it, FONTCONF the granted fontconfig file and FONTCONF_SIBLING a file beside it, SYSFS a file in the granted DRM device's sysfs and SYS_OTHER a sysfs file outside it.
-//! Checks: `home-read`, `home-create`, `outside-write`, `own-write` + `own-read`, `net-connect`, then `socket` / `socket-other` (unix connect), `fontconf` / `fontconf-sibling`, `drm-sysfs` / `sys-other` (reads). An outcome is `ok` or `err:<errno>`. Exits 0 once every check ran; the gate judges the outcomes.
+//! Checks: `home-read`, `home-create`, `outside-write`, `own-write` + `own-read`, `net-connect`, then `socket` / `socket-other` (unix connect), `fontconf` / `fontconf-sibling`, `drm-sysfs` / `sys-other` (reads). An outcome is `ok` or `err:<errno>`. Last, `env=<names>`: the names of its whole environment, sorted, comma-joined, no values. Exits 0 once every check ran; the gate judges the outcomes.
 //! Built on std, stays inside the app seccomp filter (allow-all but setpriority) and the stub's Landlock domain: no probe of its own beyond the file calls.
 #![forbid(unsafe_code)]
 
@@ -83,7 +83,12 @@ fn main() -> ExitCode {
         ("drm-sysfs", read(p(sysfs))),
         ("sys-other", read(p(sys_other))),
     ];
-    let line: Vec<String> = checks.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let mut line: Vec<String> = checks.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let mut names: Vec<String> = std::env::vars_os()
+        .map(|(k, _)| k.to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    line.push(format!("env={}", names.join(",")));
     let _ = writeln!(io::stdout(), "probe: {}", line.join(" "));
     ExitCode::SUCCESS
 }

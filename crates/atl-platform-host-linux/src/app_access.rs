@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! What an app process reads from the desktop, so the broker can show exactly that in the app sandbox.
-//! - the compositor's socket, for the UI side (atl-platform-ui-linux: GTK 4 on Wayland): `WAYLAND_DISPLAY` absolute, else under `XDG_RUNTIME_DIR`, `wayland-0` when unset (libwayland wl_display_connect); the app inherits both variables, so the same path resolves inside.
+//! - the compositor's socket, for the UI side (atl-platform-ui-linux: GTK 4 on Wayland): `WAYLAND_DISPLAY` absolute, else under `XDG_RUNTIME_DIR`, `wayland-0` when unset (libwayland wl_display_connect); the broker forwards both variables (atl-broker app_env::APP_ENV), so the same path resolves inside.
 //! - the PipeWire server's socket, for audio (every app, UI or not): atld names it to the launcher (`--pipewire-socket`), which connects to that path and reads no environment for it.
 //! - fontconfig's config: `FONTCONFIG_FILE` when set (absolute; else the distro's under /etc, which the app root already shows) and the dirs of every face it lists. No cache dir: read-only it saves nothing, and fontconfig rescans the dirs without it.
 //!

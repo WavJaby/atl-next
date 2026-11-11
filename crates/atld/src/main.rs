@@ -145,6 +145,9 @@ struct Args {
     /// Test only: apps start without the app seccomp filter (atl-broker seccomp.rs), the deliberate-failure check of its thread-priority rule: without the filter queued-work-looper dies with SecurityException.
     #[arg(long)]
     no_app_seccomp: bool,
+    /// A variable every sandboxed process gets (repeat): `KEY=VALUE`. The only way besides the desktop's forwarded names (atl-broker app_env::APP_ENV) a value reaches an app; e.g. a run's RUST_LOG or GDK_DEBUG.
+    #[arg(long = "app-env", value_parser = app_env_var)]
+    app_env: Vec<(OsString, OsString)>,
     /// Test only: passed to the services (`--no-ime-death-link`), the deliberate break of the ime gate's death sub-gate.
     #[arg(long)]
     no_ime_death_link: bool,
@@ -396,6 +399,14 @@ fn vintf_layout(a: &Args, r: &Root) -> Result<()> {
 
 /// Partitions `--file` may place files in: the root's `system` and `vendor` (Root::system, Root::vendor).
 const FILE_PARTITIONS: &[&str] = &["system", "vendor"];
+
+/// `--app-env`'s `KEY=VALUE`; the key non-empty.
+fn app_env_var(s: &str) -> Result<(OsString, OsString), String> {
+    match s.split_once('=') {
+        Some((k, v)) if !k.is_empty() => Ok((k.into(), v.into())),
+        _ => Err(format!("{s}: not KEY=VALUE")),
+    }
+}
 
 /// `--file`'s `<host path>=<absolute path below a FILE_PARTITIONS partition>` -> (host, path relative to the root).
 fn partition_file(s: &str) -> Result<(PathBuf, PathBuf), String> {
@@ -1101,6 +1112,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         &a.sandbox_stub,
         std::fs::File::create(r.log("binderd"))?,
     )?;
+    let broker = broker.with_env(a.app_env.clone());
     let broker = if a.no_app_seccomp {
         broker.without_app_seccomp()
     } else {
