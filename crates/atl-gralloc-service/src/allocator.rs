@@ -56,6 +56,8 @@ pub struct Allocator {
     refused_no_modifier: AtomicU64,
     /// The [`Self::log_key`] last printed.
     counters_logged: Mutex<LogKey>,
+    /// Modifiers already named by a `gralloc: modifier ... first used` line.
+    modifiers_seen: Mutex<Vec<u64>>,
     pid: u32,
 }
 
@@ -69,6 +71,7 @@ impl Allocator {
             counter: AtomicU32::new(1),
             refused_no_modifier: AtomicU64::new(0),
             counters_logged: Mutex::new((0, 0, false, false)),
+            modifiers_seen: Mutex::new(Vec::new()),
             pid: std::process::id(),
         };
         // the probe allocation may already have counted; the start line prints that value
@@ -140,6 +143,24 @@ impl Allocator {
     pub fn allocate(&self, d: &Checked) -> Result<Allocation, AllocError> {
         let dmabuf = self.backend.allocate(d)?;
         self.log_counters_if_changed();
+        {
+            let mut seen = self
+                .modifiers_seen
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if !seen.contains(&dmabuf.modifier) {
+                seen.push(dmabuf.modifier);
+                // one line per distinct modifier: names which layout GBM picked, without a line per buffer
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "gralloc: modifier {:#x} first used ({}, usage {:#x}, set of {})",
+                    dmabuf.modifier,
+                    d.name,
+                    d.usage,
+                    d.modifiers.len()
+                );
+            }
+        }
         let row = u64::from(d.width) * u64::from(d.format.bytes_per_pixel);
         if u64::from(dmabuf.pitch) < row || !dmabuf.pitch.is_multiple_of(d.format.bytes_per_pixel) {
             return Err(AllocError::Inconsistent("pitch"));
