@@ -269,7 +269,7 @@ impl Step {
                 Ok(())
             }
             Step::Drift => patch::check(root),
-            Step::Seam => crate::binder::seam_check(root),
+            Step::Seam => crate::seam_gate::check(root),
             Step::AndroidPaths => crate::android_paths::check(root),
             Step::BwrapFlags => crate::bwrap_flags::check(root),
             Step::Soong => crate::soong::check(root),

@@ -76,7 +76,7 @@ impl Consumers {
         Self {
             crates: workspace.crates.clone(),
             upstreams: sources.upstream_names(),
-            xtask: crate::subcommands(),
+            xtask: crate::cli::subcommands(),
             projects: sources.aosp.projects.keys().cloned().collect(),
             hosts: arches
                 .iter()
