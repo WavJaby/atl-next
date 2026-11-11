@@ -2,7 +2,8 @@
 //! Spike gates (QEMU bridge plan Q2/Q3, Q5-2), harness-less: `start` boots QEMU on its helper thread, whose BOOT trap runs gates (a)-(l) there and parks; the host threads then run (n), (u), (m), (o), (p), (s), (t) on their own guest CPUs, and the process exits 0 when every gate is ok.
 //! Env (xtask qemu_spike.rs sets it; without it the run prints SKIP): `ATL_QEMU_SPIKE_SO` = the spike library, `ATL_QEMU_SPIKE_FIXTURE` = the static guest program, `ATL_QEMU_SIGCHAIN_OBJ` = AOSP libsigchain's object (build.rs links it and sets cfg `atl_qe_sigchain`). Args: `--guest-base <n>` (QEMU's `-B`, default 0 = identity).
 //! Expected values come from the fixture's table (fixture.c), never from the engine. One line per gate: `spike: (x) ok` or `spike: (x) FAIL <why>`.
-//! Gates: (a) trap arguments, (b) nested host/guest calls, (c) host memory, (d) guest store fault, (e) host fault order behind sigchain, (h) implicit null check through sigchain, (f) write into translated code, (g) second guest thread, (i) fatal guest fault on one thread, (j) the same on a second thread (both end by SIGSEGV), (k) host fault with previous action SIG_IGN (ends by SIGSEGV), (l) binding thunks from the guest pool (bit 15 of the svc immediate, id = slot); (n) helper boot: `start` returned with the BOOT answer, the helper stays parked, the creator thread attaches and calls; (m) two host threads attach at once and call concurrently, each with its own thread pointer and syscalls; (o) a write(2) on host heap memory, accepted under identity mapping (access_ok patch 0002), (p) a write straddling a QEMU-mapped page into host memory QEMU does not map; (s) four attached threads fill their guest stacks across one barrier and find their own words intact; (t) a guest store into the guard page below an attached CPU's stack is a guest SIGSEGV at that address (forked child); (u) 50 host threads attach, call and detach while another attached thread's guest loop churns guest mmap/munmap, translation and host calls (deadline: a hang prints FAIL).
+//! Gates: (a) trap arguments, (b) nested host/guest calls, (c) host memory, (d) guest store fault, (e) host fault order behind sigchain, (h) implicit null check through sigchain, (f) write into translated code, (g) second guest thread, (i) fatal guest fault on one thread, (j) the same on a second thread (both end by SIGSEGV), (k) host fault with previous action SIG_IGN (ends by SIGSEGV), (l) binding thunks from the guest pool (bit 15 of the svc immediate, id = slot); (n) helper boot: `start` returned with the BOOT answer, the helper stays parked, the creator thread attaches and calls; (m) two host threads attach at once and call concurrently, each with its own thread pointer and syscalls; (o) a write(2) on host heap memory, accepted under identity mapping (access_ok patch 0002), (p) a write straddling a QEMU-mapped page into host memory QEMU does not map; (s) four attached threads fill their guest stacks across one barrier and find their own words intact; (t) a guest store into the guard page below an attached CPU's stack is a guest SIGSEGV at that address (forked child); (u) 50 host threads attach, call and detach while another attached thread's guest loop churns guest mmap/munmap, translation and host calls (deadline: a hang prints FAIL); (x) a guest SA_SIGINFO handler leaving by siglongjmp gets its si_addr through the engine's special handler, the host mask survives the no-return exit, and later host faults on that thread still reach the previous action and ART's special; (y) a host `sigaction(SIGSEGV)` after boot does not take guest faults.
+//! Signals: the harness registers on the linked sigchain what ART does -- an ART FaultManager stand-in, then the engine's special (`signal::special`) with a full mask and `SIGCHAIN_ALLOW_NORETURN` -- and sets the pre-QEMU user action.
 #![allow(clippy::print_stdout, reason = "test harness output is its verdict")]
 
 #[cfg(feature = "qemu")]
@@ -63,7 +64,9 @@ mod spike {
         pub const T_SURVIVED: usize = 43;
         pub const CHURN: usize = 44;
         pub const SP: usize = 45;
-        pub const LEN: usize = 46;
+        pub const X_FN: usize = 46;
+        pub const X_ADDR: usize = 47;
+        pub const LEN: usize = 48;
     }
 
     /// What the host answers a CALL with during gate (a): any value the guest cannot produce itself.
@@ -83,6 +86,17 @@ mod spike {
     const S_THREADS: usize = 4;
     /// Gate (t) child: exit status when the guard fault reported an address other than the store's.
     const T_ADDR_EXIT: c_int = 47;
+    /// Gate (y) child: the late host handler took the host fault, after the guest fault went to the guest (the pass).
+    const Y_OK: c_int = 48;
+    /// Gate (y) child: the late host handler took the guest fault.
+    const Y_STOLE: c_int = 49;
+    /// Gate (y) child: fx_sig_recover answered another si_addr (the guest handler did not run as expected).
+    const Y_MISSED: c_int = 50;
+    /// Gate (y) child: its host store did not fault.
+    const Y_SURVIVED: c_int = 51;
+
+    /// Gate (y) child: set before its host fault, so the late handler can tell the host fault from a stolen guest one.
+    static Y_HOST_PHASE: AtomicBool = AtomicBool::new(false);
 
     /// Gate (u): host threads that attach, call and detach while the parent's guest loop runs. 50: the slice's count, enough that attaches land across many parent iterations.
     const U_CHILDREN: usize = 50;
@@ -180,7 +194,10 @@ mod spike {
             true
         }
 
-        /// ART claims SIGSEGV and SIGBUS through sigchain before QEMU's `main`, as its FaultManager does.
+        /// `SIGCHAIN_ALLOW_NORETURN` (art/sigchainlib/sigchain.h): the handler may leave by longjmp. Break `no-noreturn` (gate x) drops it.
+        const ALLOW_NORETURN: u64 = if cfg!(atl_qe_no_noreturn) { 0 } else { 0x1 };
+
+        /// ART's two registrations before QEMU's `main`, in ART's order: its FaultManager claims SIGSEGV and SIGBUS (fault_handler.cc, empty mask, no flags), then `InitializeNativeBridge` adds the bridge's `getSignalHandler` answer -- the engine's special -- with a full mask and `SIGCHAIN_ALLOW_NORETURN` (native_bridge_art_interface.cc).
         pub fn register() {
             for sig in [libc::SIGSEGV, libc::SIGBUS] {
                 let mut sa = SigchainAction {
@@ -191,6 +208,17 @@ mod spike {
                 };
                 // SAFETY: sigchain copies sa into its table; art_special has the special-handler signature.
                 unsafe { AddSpecialSignalHandlerFn(sig, &mut sa) };
+                // SAFETY: a zeroed sigset_t is a valid buffer for sigfillset.
+                let mut full: libc::sigset_t = unsafe { std::mem::zeroed() };
+                // SAFETY: full is a live sigset_t.
+                unsafe { libc::sigfillset(&mut full) };
+                let mut engine = SigchainAction {
+                    sc_sigaction: atl_qemu_engine::signal::special,
+                    sc_mask: full,
+                    sc_flags: ALLOW_NORETURN,
+                };
+                // SAFETY: as above; the engine's special has the special-handler signature.
+                unsafe { AddSpecialSignalHandlerFn(sig, &mut engine) };
             }
         }
     }
@@ -363,6 +391,8 @@ mod spike {
             ('i', gate_i),
             ('j', gate_j),
             ('l', gate_l),
+            ('x', gate_x),
+            ('y', gate_y),
         ] {
             GATE.with(|c| c.set(gate));
             REPORTS.lock().expect("reports").clear();
@@ -609,6 +639,142 @@ mod spike {
             }
         }
         Ok(())
+    }
+
+    /// This thread's blocked-signal mask, read with the raw syscall (one kernel sigset word), so sigchain's filter does not touch the answer.
+    fn host_mask() -> u64 {
+        let mut old = 0u64;
+        // SAFETY: rt_sigprocmask(SIG_BLOCK, NULL, &old, 8): a query; old is one kernel sigset word.
+        unsafe {
+            libc::syscall(
+                libc::SYS_rt_sigprocmask,
+                libc::c_long::from(libc::SIG_BLOCK),
+                std::ptr::null::<u64>(),
+                &raw mut old,
+                8usize,
+            )
+        };
+        old
+    }
+
+    /// fx_sig_recover's answer must be the fault address (table X_ADDR); its X_NONE / X_FAILED answers are named.
+    fn check_recover(seen: u64) -> Result<(), String> {
+        if seen == w(t::X_ADDR) {
+            return Ok(());
+        }
+        Err(format!(
+            "guest handler saw si_addr {seen:#x}, expected {:#x} (fixture: 1 = no fault, 2 = sigaction failed)",
+            w(t::X_ADDR)
+        ))
+    }
+
+    /// Gate (x), the special route (Q7-1): a guest SA_SIGINFO handler that leaves by siglongjmp gets si_addr = the store's address, through one code-route fault. After QEMU's no-return exit from the special (sigchain set a full `sc_mask` for it) SIGSEGV and SIGBUS are unblocked and the host mask gained no standard signal; it may gain the guest's own blocked realtime signals, which QEMU mirrors. Then, on this thread in forked children: a host fault still reaches the previous action after both specials declined it (the restored user action), and ART's special still claims an implicit null check (sigchain's per-thread handling flag was not left set by the longjmp).
+    fn gate_x(g: Guest) -> Result<(), String> {
+        let mask_before = host_mask();
+        let before = atl_qemu_engine::signal::routed().code;
+        let seen = g.call(w(t::X_FN), &[w(t::X_ADDR)]);
+        let faults = atl_qemu_engine::signal::routed().code - before;
+        let mask_after = host_mask();
+        let guest_mask = reports()
+            .first()
+            .map_or_else(|| "not reported".to_owned(), |m| format!("{m:#x}"));
+        println!(
+            "spike: (x) guest handler saw si_addr {seen:#x}; host mask {mask_before:#x} before, {mask_after:#x} after; guest blocked set after {guest_mask}"
+        );
+        check_recover(seen)?;
+        if faults != 1 {
+            return Err(format!(
+                "{faults} translated-code faults routed to QEMU's handler, expected 1"
+            ));
+        }
+        // a leaked sc_mask (sigchain's full set, set raw) blocks every signal, SIGSEGV and SIGBUS included; QEMU itself sets the host mask to the guest's blocked set minus SIGSEGV/SIGBUS (process_pending_signals), and guest realtime signals map to host realtime ones (signal_table_init)
+        let fault_bits = (1u64 << (libc::SIGSEGV - 1)) | (1u64 << (libc::SIGBUS - 1));
+        let realtime = !0u64 << (libc::SIGRTMIN() - 1);
+        let gained = mask_after & !mask_before;
+        if mask_after & fault_bits != 0 || gained & !realtime != 0 {
+            return Err(format!(
+                "host signal mask {mask_after:#x} after the guest's no-return exit, {mask_before:#x} before: SIGSEGV/SIGBUS blocked or a standard signal gained"
+            ));
+        }
+        let pid = fork_child()?;
+        if pid == 0 {
+            // SAFETY: deliberate null store, the fault under test.
+            unsafe { std::ptr::null_mut::<u64>().write_volatile(1) };
+            // SAFETY: not reached unless the store did not fault.
+            unsafe { libc::_exit(0) };
+        }
+        match wait_child(pid) {
+            Ok(PREVIOUS_EXIT) => {}
+            Ok(ORDER_EXIT) => {
+                return Err(
+                    "host fault after the guest fault skipped the special handlers (sigchain's handling flag left set)"
+                        .to_owned(),
+                );
+            }
+            Ok(code) => {
+                return Err(format!(
+                    "host fault after the guest fault: child exit {code}, expected the previous action's {PREVIOUS_EXIT}"
+                ));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "host fault after the guest fault did not reach the previous action: {e}"
+                ));
+            }
+        }
+        let pid = fork_child()?;
+        if pid == 0 {
+            // SAFETY: deliberate null load in the probe; a claim does not return here.
+            unsafe { atl_managed_probe(std::ptr::null_mut()) };
+            // SAFETY: not reached unless the load did not fault.
+            unsafe { libc::_exit(0) };
+        }
+        match wait_child(pid)? {
+            NPE_EXIT => Ok(()),
+            code => Err(format!(
+                "implicit null check after the guest fault: child exit {code}, expected ART's claim ({NPE_EXIT})"
+            )),
+        }
+    }
+
+    /// Gate (y) child: the host's own SIGSEGV handler, installed after boot.
+    extern "C" fn late_handler(_: c_int) {
+        let code = if Y_HOST_PHASE.load(Ordering::Relaxed) {
+            Y_OK
+        } else {
+            Y_STOLE
+        };
+        // SAFETY: async-signal-safe exit, no unwinding.
+        unsafe { libc::_exit(code) };
+    }
+
+    /// Gate (y): a host `sigaction(SIGSEGV)` after boot (sigchain records it as the user action, as a game engine's or crash reporter's call is) does not take guest faults. In a forked child: the late handler is installed, the guest's fault still reaches the guest handler with its address, and a host fault then reaches the late handler.
+    fn gate_y(g: Guest) -> Result<(), String> {
+        let pid = fork_child()?;
+        if pid == 0 {
+            // SAFETY: a plain handler for SIGSEGV; zeroed mask and flags are valid.
+            unsafe {
+                let mut act: libc::sigaction = std::mem::zeroed();
+                act.sa_sigaction = late_handler as *const () as usize;
+                libc::sigaction(libc::SIGSEGV, &act, std::ptr::null_mut());
+            }
+            if g.call(w(t::X_FN), &[w(t::X_ADDR)]) != w(t::X_ADDR) {
+                // SAFETY: the forked child ends here.
+                unsafe { libc::_exit(Y_MISSED) };
+            }
+            Y_HOST_PHASE.store(true, Ordering::Relaxed);
+            // SAFETY: deliberate null store, the host fault under test.
+            unsafe { std::ptr::null_mut::<u64>().write_volatile(1) };
+            // SAFETY: not reached unless the store did not fault.
+            unsafe { libc::_exit(Y_SURVIVED) };
+        }
+        match wait_child(pid)? {
+            Y_OK => Ok(()),
+            Y_STOLE => Err("the host's sigaction after boot took the guest fault".to_owned()),
+            Y_MISSED => Err("the guest handler did not see its fault address".to_owned()),
+            Y_SURVIVED => Err("the host store did not fault".to_owned()),
+            code => Err(format!("child exit {code}, expected {Y_OK}")),
+        }
     }
 
     /// A pipe for the guest's write(2) calls: (read end, write end), both non-blocking.

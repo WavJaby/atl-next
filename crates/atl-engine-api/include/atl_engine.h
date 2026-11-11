@@ -9,10 +9,11 @@
 #ifndef ATL_ENGINE_H
 #define ATL_ENGINE_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #define ATL_ENGINE_ABI_MAJOR 2
-#define ATL_ENGINE_ABI_MINOR 1
+#define ATL_ENGINE_ABI_MINOR 2
 
 /* Page protection, QEMU's page flags (include/exec/page-protection.h). */
 #define ATL_PROT_READ 0x1u
@@ -71,6 +72,8 @@ typedef struct atl_engine {
     void (*call_ex)(atl_engine_handle *engine, atl_cpu *cpu, uint64_t *tp, uint64_t f, atl_lanes *lanes);
     /* 2.1. attach with a sized guest stack: stack in (size, guard) and out (base, len). attach is attach_ex with both 0. */
     int (*attach_ex)(atl_engine_handle *engine, atl_stack *stack, atl_cpu **out);
+    /* 2.2. The engine's part of a host SIGSEGV / SIGBUS handler, for a special handler in front of the process's user action (ART sigchain via NativeBridge getSignalHandler). info is the kernel's siginfo_t *, ucontext its ucontext_t *. True: the engine took the signal (a guest fault, delivered to the guest; or the translator's own fatal exit). False: not the engine's, pass it on. Signal context, on the thread that took the signal, with every signal blocked; may not return (it longjmps into the guest CPU loop), so the caller registers it as no-return (sigchain SIGCHAIN_ALLOW_NORETURN). False before create has booted. */
+    bool (*fault)(int sig, void *info, void *ucontext);
 } atl_engine;
 
 #endif /* ATL_ENGINE_H */

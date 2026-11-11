@@ -37,6 +37,10 @@ pub enum Active {
 
 static ACTIVE: OnceLock<Active> = OnceLock::new();
 
+/// A sigchain special handler (`art::SigchainAction::sc_sigaction`; NativeBridge `getSignalHandler`'s answer): true when it took the signal.
+pub type SignalHandler =
+    unsafe extern "C" fn(i32, *mut crate::generated::siginfo_t, *mut std::ffi::c_void) -> bool;
+
 /// The process's engine: [`select`]'s choice, identity when none was made (fixed from the first call on).
 pub fn active() -> Active {
     *ACTIVE.get_or_init(|| Active::Identity)
@@ -120,6 +124,14 @@ impl Active {
         match self {
             Active::Identity => identity::CROSSING.detach(),
             Active::Qemu => qemu::CROSSING.detach(),
+        }
+    }
+
+    /// The special handler ART registers for `sig` (NativeBridge `getSignalHandler`). Identity: none, its signals take the kernel-level rewrap (signal.rs). QEMU: the engine's guest-fault route for SIGSEGV and SIGBUS.
+    pub fn signal_handler(self, sig: i32) -> Option<SignalHandler> {
+        match self {
+            Active::Identity => None,
+            Active::Qemu => qemu::signal_handler(sig),
         }
     }
 

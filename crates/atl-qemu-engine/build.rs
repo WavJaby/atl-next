@@ -61,24 +61,30 @@ const FIELD_OFFSETS: &[(&str, &str)] = &[
 ];
 
 const BREAK_ENV: &str = "ATL_QEMU_ENGINE_BREAK";
-/// AOSP libsigchain's object (art/sigchainlib/sigchain.cc, built as-is by `xtask test qemu-spike`); the spike harness links it.
+/// AOSP libsigchain's object (art/sigchainlib/sigchain.cc, built as-is by `xtask test qemu-spike`); the spike harness links it and registers the engine's special handler on it, as ART does.
 const SIGCHAIN_ENV: &str = "ATL_QEMU_SIGCHAIN_OBJ";
 /// The deliberate breaks: name -> cfg. Red with it, green without (xtask qemu_spike.rs runs each).
 const BREAKS: &[(&str, &str)] = &[
     // gate (a): the CALL trap answers the callback's result with bit 0 flipped
     ("ret-reg", "atl_qe_ret_reg"),
-    // gate (d): a fault in TCG code goes to the pre-QEMU handler instead of QEMU's
+    // gate (d): the special declines a fault in TCG code, so it reaches the pre-QEMU handler instead of QEMU's
     ("fault-route", "atl_qe_fault_route"),
-    // gate (e): a host-only fault goes to QEMU's handler (which aborts) instead of the pre-QEMU one
+    // gate (e): the special hands a host-only fault to QEMU's handler (which aborts) instead of declining it
     ("chain-order", "atl_qe_chain_order"),
-    // gate (f): a host write to a write-protected translated-code page goes to the previous handler, not to QEMU's (which un-protects it)
+    // gate (f): the special declines a host write to a write-protected translated-code page instead of handing it to QEMU's handler (which un-protects it)
     ("drop-accerr", "atl_qe_drop_accerr"),
     // gate (g): every thread classifies its faults with the BOOT thread's helper_retaddr
     ("boot-only", "atl_qe_boot_only"),
-    // gates (i), (j): no fatal special handler, so QEMU's die_with_signal kill is consumed by sigchain's SIG_DFL revert (exit 1 / hang)
+    // gates (i), (j): the special leaves QEMU's die_with_signal kill to sigchain's SIG_DFL revert, which consumes it (exit 1 / hang)
     ("no-fatal", "atl_qe_no_fatal"),
     // gate (k): a host fault with previous action SIG_IGN keeps re-running under sigchain's SIG_IGN return
     ("ign-loop", "atl_qe_ign_loop"),
+    // gates (x), (e): BOOT does not restore the pre-QEMU action, so a host fault after a guest one reaches QEMU's handler (die_from_signal)
+    ("no-restore", "atl_qe_no_restore"),
+    // gate (y): the old route, guest faults through the current user action (QEMU's handler, not restored): a host sigaction after boot takes them
+    ("user-route", "atl_qe_user_route"),
+    // gate (e): the harness registers the special without SIGCHAIN_ALLOW_NORETURN, so QEMU's longjmp leaves sigchain's per-thread handling flag set and later faults skip every special
+    ("no-noreturn", "atl_qe_no_noreturn"),
     // gate (l): the bind decode tests bit 14, so a binding thunk (bit 15) reaches QEMU's syscall path
     ("bind-decode", "atl_qe_bind_decode"),
     // gate (m): attach hands every host thread the boot CPU instead of a `cpu_copy`

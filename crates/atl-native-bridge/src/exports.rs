@@ -163,10 +163,11 @@ pub unsafe fn isCompatibleWith(bridge_version: u32) -> bool {
     bridge_version <= VERSION
 }
 
+/// ART asks for every signal after `initialize` (native_bridge_art_interface.cc `InitializeNativeBridge`, interface >= 2) and registers each answer as a sigchain special with a full mask and `SIGCHAIN_ALLOW_NORETURN`.
 pub unsafe fn getSignalHandler(
-    _signal: i32,
+    signal: i32,
 ) -> Option<unsafe extern "C" fn(i32, *mut siginfo_t, *mut c_void) -> bool> {
-    None
+    engine::active().signal_handler(signal)
 }
 
 /// Guest `dlclose`; 0 or -1 with the text for `getError`.
@@ -294,6 +295,8 @@ mod tests {
         unsafe {
             assert!(itf.isCompatibleWith.unwrap()(3));
             assert!(!itf.isCompatibleWith.unwrap()(VERSION + 1));
+            // identity takes the kernel-level rewrap, no sigchain special
+            assert!(itf.getSignalHandler.unwrap()(libc::SIGSEGV).is_none());
             // no guest installed on a build host: the start fails and says why
             assert!(itf.loadLibrary.unwrap()(path.as_ptr(), 2).is_null());
             let err = CStr::from_ptr(itf.getError.unwrap()()).to_str().unwrap();

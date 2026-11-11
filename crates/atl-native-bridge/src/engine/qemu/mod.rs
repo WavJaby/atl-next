@@ -113,6 +113,27 @@ pub fn boot(library: &Path, boot_exe: &Path, on_trap: OnTrap) -> Result<(), Stri
         .map_err(|_| "qemu crossing: engine set twice".to_owned())
 }
 
+/// NativeBridge `getSignalHandler` under this engine: [`fault`] for SIGSEGV and SIGBUS, whose guest faults the engine owns; none for any other signal.
+pub fn signal_handler(sig: i32) -> Option<super::SignalHandler> {
+    (sig == libc::SIGSEGV || sig == libc::SIGBUS).then_some(fault as super::SignalHandler)
+}
+
+/// The special handler ART registers from [`signal_handler`] (full mask, `SIGCHAIN_ALLOW_NORETURN`): the engine's `fault` entry, which may not return. ART asks at `initialize`, which boots the engine first; a signal before [`boot`] published the engine is declined.
+///
+/// # Safety
+/// Sigchain calls it with the kernel's siginfo and ucontext of one delivery.
+unsafe extern "C" fn fault(
+    sig: i32,
+    info: *mut crate::generated::siginfo_t,
+    uc: *mut c_void,
+) -> bool {
+    let Some(f) = ENGINE.get().and_then(|e| e.table.fault) else {
+        return false;
+    };
+    // SAFETY: the delivery's siginfo and ucontext, passed through as the ABI's fault takes them.
+    unsafe { f(sig, info.cast(), uc) }
+}
+
 /// The engine's host trap for BOOT and REPORT (`atl_host.trap`): decodes the kind, records BOOT's auxv, and calls the callback [`boot`] installed. Answers x0.
 ///
 /// # Safety

@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: MIT
-//! The fault chain for SIGSEGV and SIGBUS, in front of QEMU's handler and behind ART's sigchain.
-//! QEMU's `signal_init` (linux-user/signal.c) overwrites every core-dump signal's handler without chaining the old one, and its `host_sigsegv_handler` calls `die_from_signal` for a fault it does not own.
-//! So: [`capture_previous`] before QEMU's `main` records the handler the process had (sigchain's user action, or the app's); [`install`] at BOOT, after `signal_init`, sets [`atl_fault`] as the action in front of QEMU's.
-//! With libsigchain linked (AOSP art/sigchainlib: this executable's `sigaction`), the order per signal is sigchain's special handlers (ART's fault manager), then [`atl_fault`], then QEMU's handler for a guest fault or the previous handler for a host fault.
+//! SIGSEGV and SIGBUS: guest faults through a special handler, everything else through the process's user action.
+//! [`special`] is a sigchain special handler (AOSP art/sigchainlib `SigchainAction`). In an ART process ART registers it: NativeBridge `getSignalHandler` (native_bridge.h, interface >= 2) answers the bridge's forwarder to this engine's `fault` entry, and `InitializeNativeBridge` (art/runtime/native_bridge_art_interface.cc) adds it with a full `sc_mask` and `SIGCHAIN_ALLOW_NORETURN`, behind ART's FaultManager (fault_handler.cc). The spike harness registers it the same way.
+//! Sigchain's `Handler` (sigchain.cc) runs the specials in order, then the user action. A guest fault: [`special`] runs QEMU's handler and claims it. Anything else: declined, so the user action runs.
+//! The user action: QEMU's `signal_init` (linux-user/signal.c) overwrites it with `host_signal_handler` and never chains the old one, and that handler calls `die_from_signal` for a fault it does not own. So [`capture_previous`] before QEMU's `main` records the action the process had, and [`install`] at BOOT, after `signal_init`, takes QEMU's for [`special`] and puts the previous one back.
+//! Why a special, not the user action: a host `sigaction(SIGSEGV)` after boot (a game engine, a crash reporter; sigchain records it as the user action) replaces only the user action, so guest faults still reach QEMU, and host faults reach that newer handler as the kernel would deliver them.
+//! No-return: QEMU's handler leaves a guest fault by `siglongjmp` into its CPU loop (`cpu_loop_exit_sigsegv`). Without `SIGCHAIN_ALLOW_NORETURN` sigchain sets its per-thread "handling" flag around the special and the longjmp skips the restore, so that thread's later faults skip every special (sigchain.cc 440-470). The mask sigchain sets for the special (`sc_mask`) does not outlive the longjmp: QEMU restores the interrupted mask first (`host_sigsegv_handler`: `sigprocmask(SIG_SETMASK, host_signal_mask(uc))`).
 //! A fault is a guest fault when its thread is a guest thread and QEMU's own tests say so, in QEMU's order: `helper_retaddr != 0` (a helper or the translator touching guest memory, accel/tcg/user-exec.c `adjust_signal_pc`); the host pc in the code buffer (`in_code_gen_buffer(pc - tcg_splitwx_diff)`); or a write with SEGV_ACCERR to a guest page with `PAGE_WRITE_ORG`, which QEMU write-protected for translated code.
 //! The last case is the one QEMU un-protects (`page_unprotect` invalidates the translations; the host write retries). For any other SEGV_ACCERR write QEMU dies, so only that case is routed.
-//! A guest thread registers its `helper_retaddr` at its first trap (BOOT, or the THREAD trap in trap.rs for a guest-created thread), a host-attached one in attach.rs; detach unregisters it. A guest-created thread that faults before its first trap is classified as a host fault; closing that window needs a QEMU thread-start hook, which is a patch (owner decision).
-//! Signal context: atomics, thread-local `Cell`s, data set before install, `in_code_gen_buffer`, `page_get_flags` (QEMU's own handler calls it in the same context; it may take QEMU's mmap lock) and `sigaction`; nothing allocates. [`atl_fault`] holds no value with a destructor: QEMU's handler may longjmp over its frame.
+//! Guest threads: every bridge guest thread is a host thread with an attached CPU, registered at attach (attach.rs); the BOOT thread at [`install`]; a raw guest clone (QEMU's own clone path) at its THREAD trap (trap.rs). Detach unregisters. A raw clone that faults before its THREAD trap is classified as a host fault; closing that window needs a QEMU thread-start hook, which is a patch (owner decision).
+//! `sigaction` route: the plain symbol, the one QEMU's own objects bind to (in the engine `.so` both share one dynamic reference; xtask qemu_spike.rs checks it is undefined there). The process's global lookup binds it: libsigchain's in an ART process, whose launcher lists libsigchain before libc (xtask packages.rs). Engine and QEMU therefore always read and write the same table. Raw syscalls only where sigchain must be bypassed ([`kernel_default`], the fatal unblock).
+//! Signal context: atomics, thread-local `Cell`s, data set before install, `in_code_gen_buffer`, `page_get_flags` (QEMU's own handler calls it in the same context; it may take QEMU's mmap lock) and `sigaction`; nothing allocates. [`special`] holds no value with a destructor: QEMU's handler may longjmp over its frame.
 
 use std::cell::Cell;
 use std::ffi::{c_int, c_void};
@@ -23,26 +26,18 @@ const PF_WRITE: u64 = 0x2;
 /// `si_code` of a SIGSEGV protection violation (uapi asm-generic/siginfo.h); the libc crate does not export it.
 const SEGV_ACCERR: c_int = 2;
 
-/// Per signal (index as [`SIGNALS`]): the handler before QEMU's `main`, and QEMU's.
-struct Chain {
-    previous: [libc::sigaction; 2],
-    qemu: [libc::sigaction; 2],
-}
-
-/// The previous handlers alone, captured before QEMU's handlers exist.
-struct Previous([libc::sigaction; 2]);
+/// Per signal (index as [`SIGNALS`]): a sigaction record.
+struct Actions([libc::sigaction; 2]);
 
 // SAFETY: sigaction records hold handler addresses and masks only; written once before any reader.
-unsafe impl Sync for Previous {}
-// SAFETY: as for Previous.
-unsafe impl Sync for Chain {}
-// SAFETY: as for Previous.
-unsafe impl Send for Previous {}
-// SAFETY: as for Previous.
-unsafe impl Send for Chain {}
+unsafe impl Sync for Actions {}
+// SAFETY: as for Sync.
+unsafe impl Send for Actions {}
 
-static PREVIOUS: OnceLock<Previous> = OnceLock::new();
-static CHAIN: OnceLock<Chain> = OnceLock::new();
+/// The user action before QEMU's `main`; [`install`] restores it.
+static PREVIOUS: OnceLock<Actions> = OnceLock::new();
+/// QEMU's handlers as `signal_init` installed them; [`special`] runs them for guest faults. Set at [`install`]: until then [`special`] declines everything.
+static QEMU: OnceLock<Actions> = OnceLock::new();
 /// `helper_retaddr` of the BOOT thread: the only slot the `boot-only` break reads.
 static BOOT_SLOT: AtomicUsize = AtomicUsize::new(0);
 
@@ -59,7 +54,7 @@ enum Reason {
     Accerr,
 }
 
-/// Faults routed so far, by the reason they were classified as guest faults, and those that went to the previous handler.
+/// Faults [`special`] saw so far, by the reason they were classified as guest faults, and those it declined.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Routed {
     /// `helper_retaddr != 0`: a fault in a QEMU helper, or in the translator's fetch.
@@ -68,7 +63,7 @@ pub struct Routed {
     pub code: u64,
     /// A write to a write-protected translated-code page: QEMU un-protects it and the write retries.
     pub accerr: u64,
-    /// Not a guest fault: the previous handler.
+    /// Not a guest fault: passed on to the user action (or ended as the kernel would, [`host_disposition`]).
     pub host: u64,
 }
 
@@ -87,18 +82,21 @@ pub fn routed() -> Routed {
     }
 }
 
-fn query(sig: c_int) -> libc::sigaction {
+/// The current action for `sig` (under sigchain: its user-action record); None if `sigaction` fails.
+fn current(sig: c_int) -> Option<libc::sigaction> {
     // SAFETY: a zeroed sigaction is a valid out buffer.
     let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
     // SAFETY: query only (null new action); old is a valid out pointer.
-    let rc = unsafe { libc::sigaction(sig, std::ptr::null(), &mut old) };
-    assert_eq!(rc, 0, "sigaction({sig}) query failed");
-    old
+    (unsafe { libc::sigaction(sig, std::ptr::null(), &mut old) } == 0).then_some(old)
 }
 
-/// Records the process's current SIGSEGV/SIGBUS handlers. Before QEMU's `main` ([`crate::run`]).
+fn query(sig: c_int) -> libc::sigaction {
+    current(sig).unwrap_or_else(|| panic!("sigaction({sig}) query failed"))
+}
+
+/// Records the process's current SIGSEGV/SIGBUS actions. Before QEMU's `main` ([`crate::run`]).
 pub(crate) fn capture_previous() {
-    let _ = PREVIOUS.set(Previous(SIGNALS.map(query)));
+    let _ = PREVIOUS.set(Actions(SIGNALS.map(query)));
 }
 
 /// Registers the calling thread as a guest thread. Its `helper_retaddr` is resolved on this thread, so it is this thread's instance. Returns the slot.
@@ -108,34 +106,37 @@ pub(crate) fn register_thread() -> usize {
     slot
 }
 
-/// The calling thread is no guest thread any more (its CPU is detached): its faults go to the previous handler.
+/// The calling thread is no guest thread any more (its CPU is detached): its faults are host faults.
 pub(crate) fn unregister_thread() {
     SLOT.with(|s| s.set(0));
 }
 
-/// Puts [`atl_fault`] in front of QEMU's handlers and registers the BOOT thread. At BOOT: after QEMU's `signal_init`, on the guest thread.
+/// At BOOT, after QEMU's `signal_init`, on the guest thread: registers the BOOT thread, takes QEMU's handlers for [`special`] and restores the previous user action.
 pub(crate) fn install() {
-    if CHAIN.get().is_some() {
+    if QEMU.get().is_some() {
         return;
     }
-    let previous = PREVIOUS.get().expect("capture_previous before install").0;
+    let previous = &PREVIOUS.get().expect("capture_previous before install").0;
     BOOT_SLOT.store(register_thread(), Ordering::Release);
     let qemu = SIGNALS.map(query);
-    if CHAIN.set(Chain { previous, qemu }).is_err() {
+    for (act, sig) in qemu.iter().zip(SIGNALS) {
+        // deliver calls it as a three-argument function
+        assert!(
+            act.sa_flags & libc::SA_SIGINFO != 0 && act.sa_sigaction > libc::SIG_IGN,
+            "signal {sig}: QEMU's handler is no SA_SIGINFO function"
+        );
+    }
+    if QEMU.set(Actions(qemu)).is_err() {
         return;
     }
-    for (i, sig) in SIGNALS.into_iter().enumerate() {
-        // QEMU's mask and flags (sigfillset, SA_SIGINFO): the same blocking as the handler it replaces
-        let mut act = qemu[i];
-        act.sa_sigaction = atl_fault as *const () as usize;
-        act.sa_flags |= libc::SA_SIGINFO;
-        // SAFETY: act is a complete sigaction (copied from the handler query); the handler has the SA_SIGINFO signature.
-        let rc = unsafe { libc::sigaction(sig, &act, std::ptr::null_mut()) };
-        assert_eq!(rc, 0, "sigaction({sig}) install failed");
+    // break `no-restore` (gates e, x): QEMU's handler stays the user action, so host faults reach its die_from_signal; break `user-route` (gate y) keeps it too, as the guest route
+    if cfg!(atl_qe_no_restore) || cfg!(atl_qe_user_route) {
+        return;
     }
-    #[cfg(atl_qe_sigchain)]
-    if !cfg!(atl_qe_no_fatal) {
-        fatal::register();
+    for (act, sig) in previous.iter().zip(SIGNALS) {
+        // SAFETY: act is a complete record from the capture query.
+        let rc = unsafe { libc::sigaction(sig, act, std::ptr::null_mut()) };
+        assert_eq!(rc, 0, "sigaction({sig}) restore failed");
     }
 }
 
@@ -173,7 +174,7 @@ fn is_tb_write(info: *mut libc::siginfo_t, uc: *mut c_void) -> bool {
     flags & PAGE_WRITE_ORG != 0
 }
 
-/// Why a fault belongs to QEMU, or None for the previous handler. A thread that is not a guest thread never belongs to QEMU: QEMU's handler would read `thread_cpu`, which is NULL there.
+/// Why a fault belongs to QEMU, or None. A thread that is not a guest thread never belongs to QEMU: QEMU's handler would read `thread_cpu`, which is NULL there.
 fn classify(info: *mut libc::siginfo_t, uc: *mut c_void) -> Option<Reason> {
     let slot = if cfg!(atl_qe_boot_only) {
         BOOT_SLOT.load(Ordering::Acquire)
@@ -192,32 +193,16 @@ fn classify(info: *mut libc::siginfo_t, uc: *mut c_void) -> Option<Reason> {
     if unsafe { (lib().in_code_gen_buffer)(pc as *const c_void) } {
         return Some(Reason::Code);
     }
-    // break `drop-accerr` (gate f): the write-protected page's fault goes to the previous handler
+    // break `drop-accerr` (gate f): the write-protected page's fault is declined
     (!cfg!(atl_qe_drop_accerr) && is_tb_write(info, uc)).then_some(Reason::Accerr)
 }
 
-/// Runs `act`'s handler for `sig` as the kernel would have. SIG_DFL / SIG_IGN: restore that disposition and return, so the faulting instruction re-runs under it.
+/// Runs QEMU's handler `act` (an SA_SIGINFO function, checked at [`install`]) as the kernel would have. It returns (a retried write) or longjmps into the CPU loop.
 fn deliver(act: &libc::sigaction, sig: c_int, info: *mut libc::siginfo_t, uc: *mut c_void) {
-    match act.sa_sigaction {
-        // The kernel default, not the record: a synchronous fault cannot be ignored, and sigchain's SIG_IGN return re-faults forever (sigchain.cc Handler). Re-run under the default, the kernel ends the process.
-        libc::SIG_DFL | libc::SIG_IGN if !cfg!(atl_qe_ign_loop) => kernel_default(sig),
-        // break `ign-loop` (gate k): the chain records the action only, so a SIG_IGN previous action re-faults forever
-        libc::SIG_DFL | libc::SIG_IGN => {
-            // SAFETY: act is the complete record captured by sigaction.
-            unsafe { libc::sigaction(sig, act, std::ptr::null_mut()) };
-        }
-        h if act.sa_flags & libc::SA_SIGINFO != 0 => {
-            // SAFETY: an SA_SIGINFO handler takes (int, siginfo_t *, void *).
-            let f: extern "C" fn(c_int, *mut libc::siginfo_t, *mut c_void) =
-                unsafe { std::mem::transmute(h) };
-            f(sig, info, uc);
-        }
-        h => {
-            // SAFETY: a plain handler takes (int).
-            let f: extern "C" fn(c_int) = unsafe { std::mem::transmute(h) };
-            f(sig);
-        }
-    }
+    // SAFETY: an SA_SIGINFO handler takes (int, siginfo_t *, void *); install checked the flag and that it is a function.
+    let f: extern "C" fn(c_int, *mut libc::siginfo_t, *mut c_void) =
+        unsafe { std::mem::transmute(act.sa_sigaction) };
+    f(sig, info, uc);
 }
 
 /// Kernel SIG_DFL for `sig`, bypassing sigchain: its `sigaction` only records the action while the signal is claimed, so the kernel would keep the chain's handler. Zeroed kernel `struct sigaction` (handler, flags, restorer, mask) = SIG_DFL, no flags, empty mask.
@@ -235,74 +220,52 @@ fn kernel_default(sig: c_int) {
     };
 }
 
-/// QEMU's fatal path under sigchain. `die_with_signal` (linux-user/signal.c) does `sigaction(sig, SIG_DFL)`, `kill(getpid(), sig)`, `sigsuspend`. The chain records SIG_DFL as the user action; its SIG_DFL branch (sigchain.cc Handler) reverts the kernel action and returns, which consumes the signal: exit 1 on one thread, a sleep forever on several.
-#[cfg(atl_qe_sigchain)]
-mod fatal {
-    use std::ffi::{c_int, c_void};
+/// Ends the process by `sig` from inside the handler: kernel default, unblock, re-send to this thread, which delivers on the way out.
+fn die_by(sig: c_int) {
+    kernel_default(sig);
+    let set = 1u64 << (sig - 1);
+    // SAFETY: raw rt_sigprocmask(SIG_UNBLOCK, &set, NULL, 8) on this thread; set is one kernel sigset word. The chain's sigprocmask would strip the claimed signal from the mask.
+    unsafe {
+        libc::syscall(
+            libc::SYS_rt_sigprocmask,
+            libc::c_long::from(libc::SIG_UNBLOCK),
+            &raw const set,
+            std::ptr::null::<u64>(),
+            8usize,
+        )
+    };
+    // SAFETY: tgkill to this thread: unblocked now, so it is delivered on the way out of the handler, with the kernel default (process exit).
+    unsafe {
+        libc::syscall(
+            libc::SYS_tgkill,
+            libc::c_long::from(libc::getpid()),
+            libc::c_long::from(libc::gettid()),
+            libc::c_long::from(sig),
+        )
+    };
+}
 
-    use super::kernel_default;
-
-    /// `art::SigchainAction` (art/sigchainlib/sigchain.h): one special handler, its mask and flags.
-    #[repr(C)]
-    struct SigchainAction {
-        sc_sigaction: extern "C" fn(c_int, *mut libc::siginfo_t, *mut c_void) -> bool,
-        sc_mask: libc::sigset_t,
-        sc_flags: u64,
-    }
-
-    unsafe extern "C" {
-        fn AddSpecialSignalHandlerFn(signal: c_int, sa: *mut SigchainAction);
-    }
-
-    /// Runs before the chain's user action. A process-sent signal (si_code <= SI_USER) whose user action is SIG_DFL ends the process by that signal; any other fault is declined.
-    extern "C" fn special(sig: c_int, info: *mut libc::siginfo_t, _uc: *mut c_void) -> bool {
-        // SAFETY: the kernel's siginfo of this delivery.
-        if unsafe { (*info).si_code } > libc::SI_USER {
-            return false;
+/// A signal that is not the engine's, where sigchain's handling of the user action differs from the kernel's; true when handled here. Otherwise false: sigchain runs the user action.
+/// SIG_DFL and a process-sent signal (`si_code <= SI_USER`): QEMU's fatal path `die_with_signal` (linux-user/signal.c) does `sigaction(sig, SIG_DFL)`, `kill(getpid(), sig)`, `sigsuspend`; sigchain's SIG_DFL branch reverts the kernel action and returns, which consumes the signal (exit 1 on one thread, a sleep forever on several). Ended here by the signal, as the kernel would.
+/// SIG_IGN and a kernel fault: the kernel cannot ignore a synchronous fault and ends the process; sigchain's SIG_IGN return re-runs the instruction forever. Set to the kernel default, so the re-run ends it.
+fn host_disposition(sig: c_int, info: *mut libc::siginfo_t) -> bool {
+    // SAFETY: the kernel's siginfo of this delivery.
+    let code = unsafe { (*info).si_code };
+    let Some(user) = current(sig) else {
+        return false;
+    };
+    match user.sa_sigaction {
+        // break `no-fatal` (gates i, j): the kill is left to sigchain's SIG_DFL revert
+        libc::SIG_DFL if code <= libc::SI_USER && !cfg!(atl_qe_no_fatal) => {
+            die_by(sig);
+            true
         }
-        // SAFETY: a zeroed sigaction is a valid out buffer; a null new action is a query, which sigchain answers from its user-action record.
-        let mut user: libc::sigaction = unsafe { std::mem::zeroed() };
-        // SAFETY: query only (see above).
-        unsafe { libc::sigaction(sig, std::ptr::null(), &mut user) };
-        if user.sa_sigaction != libc::SIG_DFL {
-            return false;
+        // break `ign-loop` (gate k): sigchain's SIG_IGN return re-faults forever
+        libc::SIG_IGN if code > libc::SI_USER && !cfg!(atl_qe_ign_loop) => {
+            kernel_default(sig);
+            true
         }
-        kernel_default(sig);
-        let set = 1u64 << (sig - 1);
-        // SAFETY: raw rt_sigprocmask(SIG_UNBLOCK, &set, NULL, 8) on this thread; set is one kernel sigset word. The chain's sigprocmask would strip the claimed signal from the mask.
-        unsafe {
-            libc::syscall(
-                libc::SYS_rt_sigprocmask,
-                libc::c_long::from(libc::SIG_UNBLOCK),
-                &raw const set,
-                std::ptr::null::<u64>(),
-                8usize,
-            )
-        };
-        // SAFETY: tgkill to this thread: unblocked now, so it is delivered on the way out of the handler, with the kernel default (process exit).
-        unsafe {
-            libc::syscall(
-                libc::SYS_tgkill,
-                libc::c_long::from(libc::getpid()),
-                libc::c_long::from(libc::gettid()),
-                libc::c_long::from(sig),
-            )
-        };
-        true
-    }
-
-    /// Registers [`special`] for SIGSEGV and SIGBUS. Sigchain keeps two special handlers per signal (`fatal("too many special signal handlers")`); ART's FaultManager takes one.
-    pub(super) fn register() {
-        for sig in [libc::SIGSEGV, libc::SIGBUS] {
-            let mut sa = SigchainAction {
-                sc_sigaction: special,
-                // SAFETY: a zeroed sigset_t is the empty set.
-                sc_mask: unsafe { std::mem::zeroed() },
-                sc_flags: 0,
-            };
-            // SAFETY: sigchain copies sa into its table; special has the special-handler signature.
-            unsafe { AddSpecialSignalHandlerFn(sig, &mut sa) };
-        }
+        _ => false,
     }
 }
 
@@ -315,24 +278,30 @@ fn count(reason: Reason) {
     counter.fetch_add(1, Ordering::Relaxed);
 }
 
-extern "C" fn atl_fault(sig: c_int, info: *mut libc::siginfo_t, uc: *mut c_void) {
-    let Some(chain) = CHAIN.get() else {
-        return;
+/// The special handler for SIGSEGV and SIGBUS (`art::SigchainAction::sc_sigaction`): true when the engine took the signal. A guest fault goes to QEMU's handler, which may not return; anything else is declined unless [`host_disposition`] ends it. Declines everything before [`install`].
+pub extern "C" fn special(sig: c_int, info: *mut libc::siginfo_t, uc: *mut c_void) -> bool {
+    let Some(qemu) = QEMU.get() else {
+        return false;
     };
-    let i = usize::from(sig != SIGNALS[0]);
-    // break `fault-route` (gate d): no guest fault reaches QEMU; break `chain-order` (gate e): every fault, host ones too, goes to QEMU
-    let reason = if cfg!(atl_qe_fault_route) {
+    let Some(i) = SIGNALS.iter().position(|&s| s == sig) else {
+        return false;
+    };
+    // break `fault-route` (gate d): no guest fault reaches QEMU; break `user-route` (gate y): guest faults go to the user action, which keeps QEMU's handler (install)
+    let reason = if cfg!(atl_qe_fault_route) || cfg!(atl_qe_user_route) {
         None
     } else {
         classify(info, uc)
     };
     if let Some(reason) = reason {
         count(reason);
-        deliver(&chain.qemu[i], sig, info, uc);
-    } else if cfg!(atl_qe_chain_order) {
-        deliver(&chain.qemu[i], sig, info, uc);
-    } else {
-        HOST_FAULTS.fetch_add(1, Ordering::Relaxed);
-        deliver(&chain.previous[i], sig, info, uc);
+        deliver(&qemu.0[i], sig, info, uc);
+        return true;
     }
+    // break `chain-order` (gate e): every fault, host ones too, goes to QEMU
+    if cfg!(atl_qe_chain_order) {
+        deliver(&qemu.0[i], sig, info, uc);
+        return true;
+    }
+    HOST_FAULTS.fetch_add(1, Ordering::Relaxed);
+    host_disposition(sig, info)
 }

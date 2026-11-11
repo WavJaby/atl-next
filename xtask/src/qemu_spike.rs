@@ -35,8 +35,9 @@ const CPU_LOOP: &str = "linux-user/aarch64/cpu_loop.c";
 const UACCESS: &str = "linux-user/uaccess.c";
 const QEMU_H: &str = "linux-user/qemu.h";
 const PACKAGE: &str = "atl-qemu-engine";
-const GATES: [char; 19] = [
+const GATES: [char; 21] = [
     'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 's', 't', 'u',
+    'x', 'y',
 ];
 /// Thunk slots in the fixture's pool, as the NB pool is sized (atl-native-bridge build.rs: stub rows + fixed bindings + JNI slots, rounded to a power of two; 3860 + 6 + 256 > 4096). Gate (l) uses the last slot, 8191.
 const POOL_SLOTS: u32 = 8192;
@@ -336,6 +337,33 @@ const RUNS: &[RunSpec] = &[
         base: "0",
         engine_break: Some("copy-caller"),
         red: Some('u'),
+    },
+    // gate (x): QEMU's handler stays the user action, so the host fault after the guest one dies in its die_from_signal instead of reaching the previous action
+    RunSpec {
+        name: "no-restore",
+        swap: None,
+        pool_skew: false,
+        base: "0",
+        engine_break: Some("no-restore"),
+        red: Some('x'),
+    },
+    // gate (y): guest faults go through the user action, which the child's later sigaction replaces
+    RunSpec {
+        name: "user-route",
+        swap: None,
+        pool_skew: false,
+        base: "0",
+        engine_break: Some("user-route"),
+        red: Some('y'),
+    },
+    // gate (e): the special registered without SIGCHAIN_ALLOW_NORETURN: after gate (d)'s guest fault longjmps out, the boot thread's faults skip both specials; (e)'s child reaches the previous action with no special call ("ran before the special handler"), and gate (f)'s host write then ends the run in the previous handler
+    RunSpec {
+        name: "no-noreturn",
+        swap: None,
+        pool_skew: false,
+        base: "0",
+        engine_break: Some("no-noreturn"),
+        red: Some('e'),
     },
 ];
 
@@ -647,7 +675,7 @@ fn sigchain(root: &Path, dir: &Path) -> Result<PathBuf> {
 }
 
 /// The engine `.so` (QEMU bridge plan Q5-1a): atl-qemu-engine's `engine-so` build (the C ABI, as a staticlib) linked with the PIC build's objects into `libatl_engine_<arch>.so`, the version script keeping `atl_engine` and the TLS exports.
-/// Gates: the defined dynamic symbols are exactly those names; the C ABI boots the Q4-4 boot executable, its AT_ENTRY equals llvm-readelf's e_entry, and BOOT maps and attaches (D9). Breaks: a TLS export dropped (exports gate red); the table at major + 1 (the host refuses it: boot gate red); the boot env published after BOOT, or create returning before BOOT (boot gate red); the boot executable without its BOOT svc (`qemu::SKIP_BOOT`: boot gate red, its error printed).
+/// Gates: the defined dynamic symbols are exactly those names; `sigaction` and `sigprocmask` are undefined references ([`sigaction_gate`]); the C ABI boots the Q4-4 boot executable, its AT_ENTRY equals llvm-readelf's e_entry, and BOOT maps and attaches (D9). Breaks: a TLS export dropped (exports gate red); the table at major + 1 (the host refuses it: boot gate red); the boot env published after BOOT, or create returning before BOOT (boot gate red); the boot executable without its BOOT svc (`qemu::SKIP_BOOT`: boot gate red, its error printed).
 fn engine_so(
     root: &Path,
     b: &Build,
@@ -673,6 +701,9 @@ fn engine_so(
     )?;
     if let Err(e) = exports_gate(&so, &expected) {
         fails.push(Failure::step("engine-so exports", format!("{e:#}")));
+    }
+    if let Err(e) = sigaction_gate(&so) {
+        fails.push(Failure::step("engine-so sigaction", format!("{e:#}")));
     }
     if let Err(e) = boot_gate(root, b, &out, "plain", &so, &boot, entry) {
         fails.push(Failure::step("engine-so boot", format!("{e:#}")));
@@ -849,6 +880,24 @@ fn exports_gate(so: &Path, expected: &BTreeSet<String>) -> Result<()> {
         &got == expected,
         "defined dynamic symbols {got:?}, expected {expected:?}"
     );
+    Ok(())
+}
+
+/// The signal-table route (Q7-1, R-Q7-2): `sigaction` and `sigprocmask` are undefined dynamic references of the engine `.so`, one per name for QEMU's objects and the engine's Rust alike, so the process's global lookup binds both to the same object (libsigchain in an ART process, whose launcher lists it before libc: packages.rs). A definition inside the `.so`, or no reference, would split or bypass that route.
+fn sigaction_gate(so: &Path) -> Result<()> {
+    let data = std::fs::read(so).with_context(|| format!("reading {}", so.display()))?;
+    let file = object::File::parse(&*data).with_context(|| format!("parsing {}", so.display()))?;
+    for name in ["sigaction", "sigprocmask"] {
+        let undefined = file
+            .dynamic_symbols()
+            .filter(|s| s.name() == Ok(name))
+            .map(|s| s.is_undefined())
+            .collect::<Vec<_>>();
+        ensure!(
+            undefined == [true],
+            "{name}: dynamic symbol entries {undefined:?} (true = undefined), expected one undefined reference"
+        );
+    }
     Ok(())
 }
 

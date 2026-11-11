@@ -4,8 +4,8 @@
 //! Start: [`start`] spawns a boot helper thread that dlopens the spike library (QEMU's PIC objects linked `-shared`, `main` aliased `atl_qemu_user_main`) and runs QEMU's own `main` on a static guest ELF: QEMU's init, loader and `cpu_loop`, nothing replayed here.
 //! Hand-over: the guest's bootstrap `svc #BOOT` (x0 = payload, x1 = its `svc #RET` stub) reaches P1's hook ([`trap`]), which runs the BOOT callback on the helper, hands its answer to `start`'s caller and parks the helper for the life of the process. QEMU's `main` never returns to a library caller, so the boot thread is spent; no QEMU change.
 //! Guest calls: in a trap callback on the trapping CPU ([`Guest::call`]), or on any host thread through its own CPU ([`Booted::attach`], a `cpu_copy` of the boot CPU with linux-user's per-thread state, `attach`); `svc #CALL` and binding traps reach the one [`OnTrap`] callback on the thread that trapped.
-//! Faults: [`signal`] puts its handler in front of QEMU's at BOOT (QEMU's `signal_init` overwrites earlier handlers and never chains them): guest faults go to QEMU's, host-only faults to the handler that was installed before `start`; with libsigchain linked, ART's special handlers run before it.
-//! Guest threads: each registers its per-thread QEMU state (`helper_retaddr`) at its first trap (BOOT, or THREAD in [`trap`]) or at attach; [`signal`] classifies every fault on the thread that took it.
+//! Faults: [`signal::special`] is a sigchain special handler (ART registers it through NativeBridge `getSignalHandler`, the spike harness as ART does): guest faults go to QEMU's handler; everything else passes on to the process's user action, which BOOT restores to the one from before QEMU (`signal_init` overwrites it and never chains).
+//! Guest threads: each registers its per-thread QEMU state (`helper_retaddr`) at attach, the BOOT thread at BOOT, a raw guest clone at its THREAD trap ([`trap`]); [`signal`] classifies every fault on the thread that took it.
 #![cfg_attr(
     not(feature = "qemu"),
     doc = "Built without feature `qemu`: no engine code (needs `ATL_QEMU_BUILD`, see Cargo.toml)."
@@ -97,6 +97,7 @@ mod abi_check {
     const _: () = assert!(offset_of!(AtlEngine, call_ex) as u64 == l::ATL_OFFSET_ENGINE_CALL_EX);
     const _: () =
         assert!(offset_of!(AtlEngine, attach_ex) as u64 == l::ATL_OFFSET_ENGINE_ATTACH_EX);
+    const _: () = assert!(offset_of!(AtlEngine, fault) as u64 == l::ATL_OFFSET_ENGINE_FAULT);
     const _: () = assert!(size_of::<AtlStack>() as u64 == l::ATL_SIZEOF_STACK);
     const _: () = assert!(offset_of!(AtlStack, size) as u64 == l::ATL_OFFSET_STACK_SIZE);
     const _: () = assert!(offset_of!(AtlStack, guard) as u64 == l::ATL_OFFSET_STACK_GUARD);
@@ -322,6 +323,11 @@ mod capi {
         unsafe { *tp = tp_out };
     }
 
+    /// The engine's part of a host SIGSEGV / SIGBUS special handler ([`crate::signal::special`]).
+    unsafe extern "C" fn fault(sig: c_int, info: *mut c_void, uc: *mut c_void) -> bool {
+        crate::signal::special(sig, info.cast(), uc)
+    }
+
     /// The table the engine `.so` exports (version script: `atl_engine` is the only global symbol of its kind).
     #[cfg(atl_qe_abi_major_next)]
     const BREAK_MAJOR: u32 = 1;
@@ -341,5 +347,6 @@ mod capi {
         detach: Some(detach),
         call_ex: Some(call_ex),
         attach_ex: Some(attach_ex),
+        fault: Some(fault),
     };
 }

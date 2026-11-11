@@ -4,6 +4,7 @@
 // Trap immediates, as crates/atl-qemu-engine/src/trap.rs: 0x7a10 CALL (x0 = host answer), 0x7a11 RET (a host call returns), 0x7a12 REPORT (x0 = value), 0x7a13 BOOT (x0 = table, x1 = return stub; never returns: the host parks the boot thread), 0x7a14 THREAD (a guest thread's first instruction); 0x8000|k a binding thunk (pool slot k, gate l).
 #include <errno.h>
 #include <pthread.h>
+#include <setjmp.h>
 #include <signal.h>
 #include <stdint.h>
 #include <string.h>
@@ -322,6 +323,41 @@ __attribute__((naked, noinline)) u64 fx_sp(void) {
     __asm__ volatile("mov x0, sp\n\tret");
 }
 
+// (x), (y) a guest SA_SIGINFO handler that leaves by siglongjmp, as crash reporters recover: fx_sig_recover(addr) installs it, stores to addr, REPORTs its blocked set afterwards, and returns the si_addr the handler saw (X_NONE if the store did not fault, X_FAILED if sigaction failed).
+// X_ADDR is in page 1, below mmap_min_addr (65536): never mapped, so the store faults with that address.
+#define X_ADDR 0x1230
+#define X_NONE 1
+#define X_FAILED 2
+static sigjmp_buf x_env;
+static volatile u64 x_seen;
+static void x_handler(int sig, siginfo_t *info, void *ucv) {
+    (void)sig;
+    (void)ucv;
+    x_seen = (u64)(uintptr_t)info->si_addr;
+    siglongjmp(x_env, 1);
+}
+
+__attribute__((noinline)) u64 fx_sig_recover(u64 addr) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = x_handler;
+    sa.sa_flags = SA_SIGINFO;
+    if (sigaction(SIGSEGV, &sa, 0) != 0) {
+        return X_FAILED;
+    }
+    x_seen = X_NONE;
+    if (sigsetjmp(x_env, 1) == 0) {
+        *(volatile u64 *)(uintptr_t)addr = 1;
+    }
+    // the guest's blocked set after the siglongjmp, word 0 (bit n-1 = signal n), reported for the host's mask check
+    sigset64_t blocked;
+    sigemptyset64(&blocked);
+    sigprocmask64(SIG_BLOCK, 0, &blocked);
+    register u64 x0 __asm__("x0") = *(u64 *)&blocked;
+    __asm__ volatile("svc #0x7a12" : : "r"(x0) : "memory");
+    return x_seen;
+}
+
 // The gate table, read by the host (crates/atl-qemu-engine/tests/spike.rs `t`): u64 words, in this order.
 static const u64 table[] = {
     // 0..3: entry points
@@ -357,6 +393,8 @@ static const u64 table[] = {
     (u64)fx_guard_store, T_SURVIVED,
     // 44..45: (u) fx_churn, the parent's loop; fx_sp, a child's entry sp
     (u64)fx_churn, (u64)fx_sp,
+    // 46..47: (x), (y) fx_sig_recover and the address it faults at
+    (u64)fx_sig_recover, X_ADDR,
 };
 
 int main(void) {

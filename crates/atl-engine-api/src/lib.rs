@@ -8,7 +8,7 @@ use core::ffi::{c_char, c_int, c_void};
 /// Major version: a host refuses an engine with another major.
 pub const ABI_MAJOR: u32 = 2;
 /// Minor version: additions only, appended to a struct.
-pub const ABI_MINOR: u32 = 1;
+pub const ABI_MINOR: u32 = 2;
 
 /// `ATL_PROT_READ`.
 pub const PROT_READ: u32 = 0x1;
@@ -119,6 +119,9 @@ pub type CallExFn = unsafe extern "C" fn(
     f: u64,
     lanes: *mut AtlLanes,
 );
+/// `atl_engine::fault` (2.2): `info` is the kernel's `siginfo_t *`, `ucontext` its `ucontext_t *`; true when the engine took the signal. Signal context; may not return (header).
+pub type FaultFn =
+    unsafe extern "C" fn(sig: c_int, info: *mut c_void, ucontext: *mut c_void) -> bool;
 
 /// `atl_engine`: the table the engine `.so` exports as `atl_engine`.
 #[repr(C)]
@@ -144,9 +147,11 @@ pub struct AtlEngine {
     pub call_ex: Option<CallExFn>,
     /// 2.1: gives the calling thread a guest CPU on a sized guest stack.
     pub attach_ex: Option<AttachExFn>,
+    /// 2.2: the engine's part of a host SIGSEGV / SIGBUS handler (a sigchain special handler).
+    pub fault: Option<FaultFn>,
 }
 
-/// Admits an engine table this host can drive, or refuses it by name. Refuses another major, a size below this host's table size (minor versions only append), and a minor below 1 or a table without `attach_ex`. The core loader and the gate both call it.
+/// Admits an engine table this host can drive, or refuses it by name. Refuses another major, a size below this host's table size (minor versions only append), and a minor below 2 or a table without `attach_ex` or `fault`. The core loader and the gate both call it.
 pub fn check_engine_table(table: &AtlEngine) -> Result<(), String> {
     if table.major != ABI_MAJOR {
         return Err(format!(
@@ -161,10 +166,10 @@ pub fn check_engine_table(table: &AtlEngine) -> Result<(), String> {
             table.major, table.minor, table.size
         ));
     }
-    // host and engine are built together, so no older-minor fallback: the host calls attach_ex (2.1) unconditionally
-    if table.minor < 1 || table.attach_ex.is_none() {
+    // host and engine are built together, so no older-minor fallback: the host calls attach_ex (2.1) and fault (2.2) unconditionally
+    if table.minor < ABI_MINOR || table.attach_ex.is_none() || table.fault.is_none() {
         return Err(format!(
-            "engine ABI {}.{} has no attach_ex, host needs 2.1",
+            "engine ABI {}.{} lacks attach_ex (2.1) or fault (2.2), host needs {ABI_MAJOR}.{ABI_MINOR}",
             table.major, table.minor
         ));
     }
@@ -188,19 +193,27 @@ mod tests {
             detach: None,
             call_ex: None,
             attach_ex: None,
+            fault: None,
         };
-        // "2.1" is the spec, typed here: ABI_MAJOR/ABI_MINOR are the code under test
+        // "2.2" is the spec, typed here: ABI_MAJOR/ABI_MINOR are the code under test
         assert_eq!(
             check_engine_table(&table),
-            Err("engine ABI 1.1 refused, host speaks 2.1".to_owned())
+            Err("engine ABI 1.1 refused, host speaks 2.2".to_owned())
         );
     }
 
     #[test]
-    fn refuses_a_2_0_engine_without_attach_ex_by_name() {
+    fn refuses_a_2_1_engine_without_fault_by_name() {
+        extern "C" fn attach_ex(
+            _: *mut AtlEngineHandle,
+            _: *mut AtlStack,
+            _: *mut *mut AtlCpu,
+        ) -> c_int {
+            0
+        }
         let table = AtlEngine {
             major: 2,
-            minor: 0,
+            minor: 1,
             size: core::mem::size_of::<AtlEngine>() as u32,
             create: None,
             destroy: None,
@@ -208,11 +221,12 @@ mod tests {
             attach: None,
             detach: None,
             call_ex: None,
-            attach_ex: None,
+            attach_ex: Some(attach_ex),
+            fault: None,
         };
         assert_eq!(
             check_engine_table(&table),
-            Err("engine ABI 2.0 has no attach_ex, host needs 2.1".to_owned())
+            Err("engine ABI 2.1 lacks attach_ex (2.1) or fault (2.2), host needs 2.2".to_owned())
         );
     }
 }
