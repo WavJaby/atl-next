@@ -32,8 +32,8 @@ pub fn go_work(root: &Path, layout: &Layout, dir: &Path) -> Result<PathBuf> {
                 checkout.display()
             )
         })?;
-        let (module, requires) = parse_go_mod(&go_mod)
-            .with_context(|| format!("{}/go.mod", checkout.display()))?;
+        let (module, requires) =
+            parse_go_mod(&go_mod).with_context(|| format!("{}/go.mod", checkout.display()))?;
         text.push_str(&format!("replace {module} => {}\n", checkout.display()));
         real.push(module);
         required.extend(requires);
@@ -70,10 +70,10 @@ fn parse_go_mod(text: &str) -> Result<(String, Vec<String>)> {
             module = Some(rest.trim().to_owned());
         } else if line == "require (" {
             in_block = true;
-        } else if let Some(rest) = line.strip_prefix("require ") {
-            if let Some(path) = rest.split_whitespace().next() {
-                requires.push(path.to_owned());
-            }
+        } else if let Some(rest) = line.strip_prefix("require ")
+            && let Some(path) = rest.split_whitespace().next()
+        {
+            requires.push(path.to_owned());
         }
     }
     let module = module.context("no module line")?;
