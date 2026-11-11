@@ -140,21 +140,26 @@ droidstubs { name: "ds", srcs: ["A.java"], merge_inclusion_annotations_dirs: ["a
 func TestGensrcsCommands(t *testing.T) {
 	// paths.go genPathWithExtAndTrimExt: tree path with the extension replaced; trim_extension cut, then output_extension appended
 	ins := []srcFile{{path: "lib/x/A.txt", root: "lib"}, {path: "/o/gen/device/g/sub/B.txt", root: "/o/gen/device/g", gen: &Node{}}}
-	outs, cmd := gensrcsCommands("/o/gen/device/m", "sed 's/a/b/' $(in) > $(out)", "java", "", ins, func(string, ...any) {})
+	outs, tasks := gensrcsTasks("/o/gen/device/m", "sed 's/a/b/' $(in) > $(out)", "java", "", gensrcsShardSize, ins, func(string, ...any) {})
 	if want := []string{"/o/gen/device/m/gensrcs/lib/x/A.java", "/o/gen/device/m/gensrcs/sub/B.java"}; !reflect.DeepEqual(outs, want) {
 		t.Errorf("outs %v, want %v", outs, want)
+	}
+	// one shard (2 inputs <= 50): writes the final directory itself, $(genDir) = <gen>/gensrcs, script genrule.sh (genrule.go NewGenSrcs)
+	if len(tasks) != 1 || !reflect.DeepEqual(tasks[0].outs, outs) || tasks[0].copyTo != nil || tasks[0].genDir != "/o/gen/device/m/gensrcs" ||
+		tasks[0].script != "/o/gen/device/m/genrule.sh" {
+		t.Errorf("tasks %+v", tasks)
 	}
 	// `bash -c` + proptools.ShellEscape of each command: single-quoted, each ' as '"'"'
 	want := `bash -c 'sed '"'"'s/a/b/'"'"' lib/x/A.txt > /o/gen/device/m/gensrcs/lib/x/A.java' && ` +
 		`bash -c 'sed '"'"'s/a/b/'"'"' /o/gen/device/g/sub/B.txt > /o/gen/device/m/gensrcs/sub/B.java'`
-	if cmd != want {
-		t.Errorf("cmd %q, want %q", cmd, want)
+	if tasks[0].cmd != want {
+		t.Errorf("cmd %q, want %q", tasks[0].cmd, want)
 	}
-	outs, _ = gensrcsCommands("/g", "x", "java", ".in.txt", []srcFile{{path: "a/b.in.txt", root: "a"}}, func(string, ...any) {})
+	outs, _ = gensrcsTasks("/g", "x", "java", ".in.txt", gensrcsShardSize, []srcFile{{path: "a/b.in.txt", root: "a"}}, func(string, ...any) {})
 	if !reflect.DeepEqual(outs, []string{"/g/gensrcs/a/b.java"}) {
 		t.Errorf("trim: %v", outs)
 	}
-	outs, _ = gensrcsCommands("/g", "x", "", ".tmpl", []srcFile{{path: "a/b.java.tmpl", root: "a"}}, func(string, ...any) {})
+	outs, _ = gensrcsTasks("/g", "x", "", ".tmpl", gensrcsShardSize, []srcFile{{path: "a/b.java.tmpl", root: "a"}}, func(string, ...any) {})
 	if !reflect.DeepEqual(outs, []string{"/g/gensrcs/a/b.java"}) {
 		t.Errorf("trim only: %v", outs)
 	}

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -23,7 +24,7 @@ import (
 //     lays it out (genToolData, sandboxPrelude).
 //   - Anything that cannot be built (unsupported tool, unresolved input, bad cmd) still gets its build edge, whose script prints
 //     `error: ...` and fails, so consumers see a failed genrule step, not a ninja "missing and no known rule" for every compile.
-//   - gensrcs: a genrule whose command runs once per input (gensrcsCommands).
+//   - gensrcs: a genrule whose command runs once per input, in shards of 50 inputs (gensrcsTasks).
 //   - Not supported, reported as problems: use_nsjail, device_first_srcs / device_common_srcs / common_os_srcs, $(build_number_file).
 //     `$(depfile)` is no genrule variable in Soong ("unknown variable"), so it is none here.
 
@@ -37,6 +38,7 @@ type genLabel struct {
 	tool   *Node    // cc tool: its path exists after emit (n.out)
 	interp string   // script tool: command that runs files[0], e.g. python3
 	err    string   // label that could not be resolved; using it fails the command
+	out    bool     // an `out` entry: under write_if_changed it names the sandbox copy, as $(out) does (sbox PathForOutput)
 }
 
 // genRule is what a genrule node builds.
@@ -54,8 +56,31 @@ type genRule struct {
 	deps     []string // what consumers wait for: the outputs, or one phony behind many
 	phony    string
 	script   string
-	edge     *genEdge // a generator that is one tool edge, not a script (cc_preprocess_no_configuration, preprocess.go)
-	broken   string   // first reason the command cannot run
+	edge     *genEdge  // a generator that is one tool edge, not a script (cc_preprocess_no_configuration, preprocess.go)
+	broken   string    // first reason the command cannot run
+	genDir   string    // the module's gen directory
+	tasks    []genTask // gensrcs' shards; nil = one task running cmd into outs (taskList)
+	merge    string    // sharded gensrcs: script of the edge that copies the shards' outputs to outs (genrule.go gensrcsMerge)
+	// write_if_changed (genrule.go Write_if_changed -> sbox --write-if-changed): the command writes into a sandbox and an output replaces
+	// its old file only when the bytes differ, so `restat` stops consumers of an unchanged output (cmd/sbox/sbox.go moveFiles)
+	writeIfChanged bool
+}
+
+// genTask is one command edge of a genrule (genrule.go generateTask): a genrule has one, a gensrcs one per shard.
+type genTask struct {
+	cmd    string   // before genExpander
+	outs   []string // what the command writes: $(out)
+	copyTo []string // sharded gensrcs: final path of each of outs, under <genDir>/gensrcs
+	genDir string   // $(genDir), emptied before the command runs (sbox clearOutputDirectory)
+	script string
+}
+
+// taskList: the rule's command edges; a genrule's one task runs cmd in the module's gen directory.
+func (r *genRule) taskList() []genTask {
+	if r.tasks != nil {
+		return r.tasks
+	}
+	return []genTask{{cmd: r.cmd, outs: r.outs, genDir: r.genDir, script: r.script}}
 }
 
 func isGenType(t string) bool {
@@ -110,7 +135,7 @@ func (g *Graph) genNode(ref string, side Side, from string) *Node {
 
 // newGenRule: an empty rule of n whose first failure is a problem and the reason its script fails.
 func (g *Graph) newGenRule(n *Node) (*genRule, func(string, ...any)) {
-	r := &genRule{script: filepath.Join(g.genDir(n, ""), "genrule.sh")}
+	r := &genRule{genDir: g.genDir(n, ""), script: filepath.Join(g.genDir(n, ""), "genrule.sh")}
 	return r, func(format string, args ...any) {
 		msg := fmt.Sprintf(format, args...)
 		g.problem("%s: %s", n.mod.Name, msg)
@@ -206,8 +231,13 @@ func (g *Graph) buildGenRule(n *Node) *genRule {
 		addLabel(l)
 	}
 	genDir := g.genDir(n, "")
+	r.writeIfChanged = p.boolean("write_if_changed", false)
 	if g.baseType(m.Type) == "gensrcs" {
-		r.outs, r.cmd = gensrcsCommands(genDir, r.cmd, p.str("output_extension"), p.str("trim_extension"), inputs, fail)
+		r.outs, r.tasks = gensrcsTasks(genDir, r.cmd, p.str("output_extension"), p.str("trim_extension"), int(p.integer("shard_size", gensrcsShardSize)),
+			inputs, fail)
+		if len(r.tasks) > 1 {
+			r.merge = filepath.Join(genDir, "genrule_merge.sh")
+		}
 	}
 	seen := map[string]bool{}
 	for _, o := range p.strs("out") {
@@ -217,7 +247,7 @@ func (g *Graph) buildGenRule(n *Node) *genRule {
 		}
 		seen[path] = true
 		r.outs = append(r.outs, path)
-		addLabel(genLabel{name: o, files: []string{path}})
+		addLabel(genLabel{name: o, files: []string{path}, out: true})
 	}
 	if len(r.outs) == 0 {
 		fail("must have at least one output file")
@@ -426,7 +456,17 @@ func pythonTool(g *Graph, m *Module) (files []string, why string) {
 // generateCommonBuildActions); paths are absolute, shell-escaped like proptools.ShellEscape.
 type genExpander struct {
 	r      *genRule
-	genDir string
+	genDir string              // $(genDir)
+	outs   []string            // $(out)
+	at     func(string) string // where the command writes an output path: itself, or its sandbox copy under write_if_changed
+}
+
+// place: where the command writes output path p (at, default p itself).
+func (e *genExpander) place(p string) string {
+	if e.at == nil {
+		return p
+	}
+	return e.at(p)
 }
 
 func (e *genExpander) words(l genLabel) []string {
@@ -435,6 +475,9 @@ func (e *genExpander) words(l genLabel) []string {
 	}
 	var out []string
 	for _, f := range l.files {
+		if l.out {
+			f = e.place(f)
+		}
 		w := shellEscape(f)
 		if l.interp != "" {
 			w = l.interp + " " + w
@@ -486,7 +529,7 @@ func (e *genExpander) expand(cmd string) (string, error) {
 		case "in":
 			return strings.Join(mapStrings(e.r.inputs, shellEscape), " "), nil
 		case "out":
-			return strings.Join(mapStrings(e.r.outs, shellEscape), " "), nil
+			return strings.Join(mapStrings(mapStrings(e.outs, e.place), shellEscape), " "), nil
 		case "genDir":
 			return shellEscape(e.genDir), nil
 		case "build_number_file":
@@ -589,14 +632,22 @@ func mapStrings(in []string, f func(string) string) []string {
 	return out
 }
 
-// genScript is the script of a genrule node: its expanded command, or the failure that stops it.
-func (g *Graph) genScript(n *Node) string {
+// genSandbox: the directory a write_if_changed task's command writes into, below its gen directory (sbox's sandbox is in the out dir too).
+const genSandbox = ".sbox-out"
+
+// genScript is the script of one task of a genrule node: its expanded command, or the failure that stops it.
+func (g *Graph) genScript(n *Node, t genTask) string {
 	r := n.rule
 	msg := r.broken
+	runDir, at := t.genDir, func(p string) string { return p }
+	if r.writeIfChanged {
+		runDir = filepath.Join(t.genDir, genSandbox)
+		at = func(p string) string { return filepath.Join(runDir, strings.TrimPrefix(p, t.genDir+"/")) }
+	}
 	body := ""
 	if msg == "" {
 		var err error
-		body, err = (&genExpander{r, g.genDir(n, "")}).expand(r.cmd)
+		body, err = (&genExpander{r: r, genDir: runDir, outs: t.outs, at: at}).expand(t.cmd)
 		if err != nil {
 			g.problem("%s: %v", n.mod.Name, err)
 			msg = err.Error()
@@ -605,49 +656,73 @@ func (g *Graph) genScript(n *Node) string {
 	if msg != "" {
 		return "echo " + shellEscape(fmt.Sprintf("error: genrule %s: %s", n.name, msg)) + " >&2\nexit 1\n"
 	}
-	outs := strings.Join(mapStrings(r.outs, shellEscape), " ")
 	// Soong's command never sees a previous run's outputs: sbox runs it in a fresh sandbox and removes the whole output dir first
 	// (cmd/sbox/sbox.go runCommand -> clearOutputDirectory, alwaysWrite). Without this, `>> $(out)` appends to a reused file and
 	// `mkdir $(genDir)/x` fails on a rerun (mimemap-res.jar). Kept: what the converter itself wrote there (this script, res.list, ...).
-	genDir := g.genDir(n, "")
+	// write_if_changed (onlyWriteIfChanged) removes only files that are no output; the command writes into the emptied sandbox.
 	keep := map[string]bool{}
 	for f := range g.genFiles {
-		if rel, err := filepath.Rel(genDir, f); err == nil && !strings.HasPrefix(rel, "..") {
+		if rel, err := filepath.Rel(t.genDir, f); err == nil && !strings.HasPrefix(rel, "..") {
 			keep[strings.Split(rel, string(filepath.Separator))[0]] = true
 		}
 	}
-	keep[filepath.Base(r.script)] = true
+	if rel, err := filepath.Rel(t.genDir, t.script); err == nil && !strings.HasPrefix(rel, "..") {
+		keep[rel] = true
+	}
 	var notKept []string
 	for _, k := range sortedKeys(keep) {
 		notKept = append(notKept, "! -name "+shellEscape(k))
 	}
 	// then the outputs' directories, which sbox's sandbox has before the command runs (commands write into them without mkdir)
 	var outDirs []string
-	for _, o := range r.outs {
-		outDirs = append(outDirs, filepath.Dir(o))
+	for _, o := range t.outs {
+		outDirs = append(outDirs, filepath.Dir(at(o)))
 	}
 	slices.Sort(outDirs)
 	outDirs = slices.Compact(outDirs)
-	clear := fmt.Sprintf("mkdir -p %s && find %s -mindepth 1 -maxdepth 1 %s -exec rm -rf -- {} + && mkdir -p %s || exit 1\n", shellEscape(genDir),
-		shellEscape(genDir), strings.Join(notKept, " "), strings.Join(mapStrings(outDirs, shellEscape), " "))
+	gd := shellEscape(t.genDir)
+	var clear string
+	if r.writeIfChanged {
+		var excl []string
+		for _, k := range sortedKeys(keep) {
+			excl = append(excl, "! -path "+shellEscape(filepath.Join(t.genDir, k)), "! -path "+shellEscape(filepath.Join(t.genDir, k)+"/*"))
+		}
+		for _, o := range t.outs {
+			excl = append(excl, "! -path "+shellEscape(o))
+		}
+		clear = fmt.Sprintf("mkdir -p %s && find %s -mindepth 1 ! -type d %s -delete && rm -rf %s && mkdir -p %s || exit 1\n", gd, gd,
+			strings.Join(excl, " "), shellEscape(runDir), strings.Join(mapStrings(outDirs, shellEscape), " "))
+	} else {
+		clear = fmt.Sprintf("mkdir -p %s && find %s -mindepth 1 -maxdepth 1 %s -exec rm -rf -- {} + && mkdir -p %s || exit 1\n", gd, gd,
+			strings.Join(notKept, " "), strings.Join(mapStrings(outDirs, shellEscape), " "))
+	}
 	// sbox validates the outputs after the command (validateOutputFiles); ninja would only notice a missing
 	// one in a consumer
-	check := "\nrc=$?\n[ $rc -eq 0 ] || exit $rc\nfor f in " + outs +
+	check := "\nrc=$?\n[ $rc -eq 0 ] || exit $rc\nfor f in " + strings.Join(mapStrings(mapStrings(t.outs, at), shellEscape), " ") +
 		"; do\n  [ -e \"$f\" ] || { echo \"error: genrule " + n.name + ": $f was not created\" >&2; exit 1; }\ndone\n"
+	if r.writeIfChanged {
+		// sbox moveFiles(onlyWriteIfChanged): an output whose bytes are unchanged keeps its old file and mtime; a changed one is moved
+		// into place and stamped now (a tool may write an old mtime)
+		for _, o := range t.outs {
+			check += fmt.Sprintf("cmp -s %s %s || { mkdir -p %s && mv -f %s %s && touch %s; } || exit 1\n", shellEscape(at(o)), shellEscape(o),
+				shellEscape(filepath.Dir(o)), shellEscape(at(o)), shellEscape(o), shellEscape(o))
+		}
+		check += "rm -rf " + shellEscape(runDir) + "\n"
+	}
 	if len(r.toolData) > 0 {
-		body = sandboxPrelude(filepath.Join(g.genDir(n, ""), "sbox"), r.toolData) + body
+		body = sandboxPrelude(filepath.Join(r.genDir, "sbox"), r.toolData) + body
 	}
 	return clear + body + check
 }
 
-// emitGen writes the build edge of one genrule node and records its script for the caller to write.
+// emitGen writes the build edges of one genrule node (one per task, then a sharded gensrcs' merge) and records their scripts for the
+// caller to write. Every task depends on all inputs, as Soong's (cmd.Implicits(srcFiles): a command may name the other srcs).
 func (g *Graph) emitGen(b *strings.Builder, n *Node) {
 	r := n.rule
 	if r.edge != nil {
 		g.emitEdge(b, *r.edge)
 		return
 	}
-	g.genFile(r.script, g.genScript(n))
 	var implicit []string
 	for _, f := range append(append([]string{}, r.inputs...), r.implicit...) {
 		if !filepath.IsAbs(f) {
@@ -658,55 +733,118 @@ func (g *Graph) emitGen(b *strings.Builder, n *Node) {
 	for _, t := range r.tools {
 		implicit = append(implicit, t.out)
 	}
-	implicit = append(implicit, r.script)
-	fmt.Fprintf(b, "build %s: genrule | %s\n  name = %s\n  script = %s\n", join(r.outs), join(implicit), esc(n.name), esc(r.script))
+	tasks := r.taskList()
+	for i, t := range tasks {
+		g.genFile(t.script, g.genScript(n, t))
+		name := n.name
+		if len(tasks) > 1 {
+			name += " " + strconv.Itoa(i) // genrule.go: desc "generate <shard>"
+		}
+		fmt.Fprintf(b, "build %s: genrule | %s\n  name = %s\n  script = %s\n", join(t.outs), join(append(implicit[:len(implicit):len(implicit)], t.script)),
+			esc(name), esc(t.script))
+	}
+	if r.merge != "" {
+		g.genFile(r.merge, genMergeScript(r))
+		var from []string
+		for _, t := range tasks {
+			from = append(from, t.outs...)
+		}
+		fmt.Fprintf(b, "build %s: genrule | %s\n  name = %s\n  script = %s\n", join(r.outs), join(append(from, r.merge)), esc(n.name+" merge shards"),
+			esc(r.merge))
+	}
 	if r.phony != "" {
 		fmt.Fprintf(b, "build %s: phony %s\n", esc(r.phony), join(r.outs))
 	}
 }
 
-// gensrcsCommands is gensrcs' task generator (genrule.go NewGenSrcs): one output per input under <genDir>/gensrcs, and the command run
-// once per input with $(in) / $(out) bound, each as `bash -c '…'`, joined with &&; the other variables are expanded later as a genrule's.
-// Output path (paths.go genPathWithExtAndTrimExt): a tree file's tree-relative path, a generated file's path below its generator's
-// directory, with trim_extension cut and output_extension appended, else the extension replaced. Not sharded: shards only split the work.
-func gensrcsCommands(genDir, raw, ext, trim string, inputs []srcFile, fail func(string, ...any)) (outs []string, cmd string) {
-	var cmds []string
+// gensrcsShardSize: inputs per gensrcs task unless shard_size says otherwise (genrule.go defaultShardSize).
+const gensrcsShardSize = 50
+
+// gensrcsTasks is gensrcs' task generator (genrule.go NewGenSrcs): the inputs split into shards of shardSize (android.ShardPaths), each
+// one task whose command runs once per input with $(in) / $(out) bound, each as `bash -c '…'`, joined with &&; the other variables
+// are expanded later as a genrule's, $(genDir) being the task's directory. One shard writes the final outputs, <genDir>/gensrcs/<rel>,
+// directly; with more, shard i writes <genDir>/<i>/<rel> and copyTo names the final path, which the merge edge fills (genMergeScript).
+// rel (paths.go genPathWithExtAndTrimExt): a tree file's tree-relative path, a generated file's path below its generator's directory,
+// with trim_extension cut and output_extension appended, else the extension replaced.
+// Differs from Soong: duplicate inputs are dropped before sharding (Soong shards them as listed; RuleBuilder keeps an output once
+// within a shard, and a duplicate across shards would be two rules for one output there), so shard boundaries count distinct inputs.
+func gensrcsTasks(genDir, raw, ext, trim string, shardSize int, inputs []srcFile, fail func(string, ...any)) (outs []string, tasks []genTask) {
+	if shardSize < 1 {
+		fail("shard_size %d is not positive", shardSize)
+		shardSize = gensrcsShardSize
+	}
+	var uniq []srcFile
 	seen := map[string]bool{}
 	for _, f := range inputs {
 		// an input listed twice (two filegroups naming one proto) is one command: RuleBuilder keeps an output once
-		if seen[f.path] {
-			continue
+		if !seen[f.path] {
+			seen[f.path] = true
+			uniq = append(uniq, f)
 		}
-		seen[f.path] = true
-		rel := f.path
-		if f.gen != nil {
-			rel = strings.TrimPrefix(f.path, f.root+"/")
-		}
-		switch {
-		case trim != "" && ext != "":
-			rel = strings.TrimSuffix(rel, trim) + "." + ext
-		case trim != "":
-			rel = strings.TrimSuffix(rel, trim)
-		default:
-			rel = strings.TrimSuffix(rel, filepath.Ext(rel)) + "." + ext
-		}
-		out := filepath.Join(genDir, "gensrcs", rel)
-		outs = append(outs, out)
-		c, err := expandVars(raw, func(name string) (string, error) {
-			switch name {
-			case "in":
-				return shellEscape(f.path), nil
-			case "out":
-				return shellEscape(out), nil
-			}
-			return "$(" + name + ")", nil
-		})
-		if err != nil {
-			fail("cmd: %v", err)
-		}
-		cmds = append(cmds, "bash -c "+shellEscape(c))
 	}
-	return outs, strings.Join(cmds, " && ")
+	shards := (len(uniq) + shardSize - 1) / shardSize
+	final := filepath.Join(genDir, "gensrcs")
+	for i := 0; i < shards; i++ {
+		t := genTask{genDir: final, script: filepath.Join(genDir, "genrule.sh")}
+		if shards > 1 {
+			t.genDir = filepath.Join(genDir, strconv.Itoa(i))
+			t.script = filepath.Join(genDir, "genrule_"+strconv.Itoa(i)+".sh")
+		}
+		var cmds []string
+		for _, f := range uniq[i*shardSize : min((i+1)*shardSize, len(uniq))] {
+			rel := f.path
+			if f.gen != nil {
+				rel = strings.TrimPrefix(f.path, f.root+"/")
+			}
+			switch {
+			case trim != "" && ext != "":
+				rel = strings.TrimSuffix(rel, trim) + "." + ext
+			case trim != "":
+				rel = strings.TrimSuffix(rel, trim)
+			default:
+				rel = strings.TrimSuffix(rel, filepath.Ext(rel)) + "." + ext
+			}
+			out := filepath.Join(t.genDir, rel)
+			outs = append(outs, filepath.Join(final, rel))
+			t.outs = append(t.outs, out)
+			if shards > 1 {
+				t.copyTo = append(t.copyTo, filepath.Join(final, rel))
+			}
+			c, err := expandVars(raw, func(name string) (string, error) {
+				switch name {
+				case "in":
+					return shellEscape(f.path), nil
+				case "out":
+					return shellEscape(out), nil
+				}
+				return "$(" + name + ")", nil
+			})
+			if err != nil {
+				fail("cmd: %v", err)
+			}
+			cmds = append(cmds, "bash -c "+shellEscape(c))
+		}
+		t.cmd = strings.Join(cmds, " && ")
+		tasks = append(tasks, t)
+	}
+	return outs, tasks
+}
+
+// genMergeScript is gensrcsMerge for a sharded gensrcs: the final directory emptied, then each shard's declared outputs copied into it at
+// the same relative path. Soong zips the shards (soong_zip -C <shard> -f <out>…) and zipsync extracts the zip into the emptied final directory;
+// same result, without the zip round trip and without soong_zip / zipsync, which only Java goals have (-build-tools).
+func genMergeScript(r *genRule) string {
+	final := filepath.Join(r.genDir, "gensrcs")
+	var b strings.Builder
+	fmt.Fprintf(&b, "rm -rf %s && mkdir -p %s || exit 1\n", shellEscape(final), shellEscape(final))
+	for _, t := range r.tasks {
+		rels := make([]string, len(t.outs))
+		for i, o := range t.outs {
+			rels[i] = shellEscape(strings.TrimPrefix(o, t.genDir+"/"))
+		}
+		fmt.Fprintf(&b, "(cd %s && cp --parents -- %s %s) || exit 1\n", shellEscape(t.genDir), strings.Join(rels, " "), shellEscape(final))
+	}
+	return b.String()
 }
 
 // genFile records a file emit generates, for writeGenFiles.

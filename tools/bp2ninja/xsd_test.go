@@ -37,7 +37,7 @@ cc_library_static { name: "libvintf_like", srcs: ["v.cpp"], generated_sources: [
 	if !slices.Equal(cpp.rule.outs, wantOuts) || cpp.rule.broken != "" {
 		t.Errorf("outs %q broken %q", cpp.rule.outs, cpp.rule.broken)
 	}
-	script := g.genScript(cpp)
+	script := g.genScript(cpp, cpp.rule.taskList()[0])
 	if !strings.Contains(script, " p/A.xsd -p com.android.apex -o "+gen("apex-tiny")+"/cpp -c -w -t -r apex-info-list\n") || cpp.rule.script != gen("apex-tiny")+"/cpp.sh" {
 		t.Errorf("script %s: %q", cpp.rule.script, script)
 	}

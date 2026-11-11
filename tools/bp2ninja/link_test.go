@@ -256,3 +256,32 @@ cc_library_static { name: "libsk", srcs: ["font.c"], system_shared_libs: [] }
 		}
 	}
 }
+
+// cc/builder.go toc rule (lines 214-223) + TransformSharedObjectToToc (--elf), cc/library.go tocFile (<lib>.so.toc), cc.go depsToPaths (a dependent's link
+// depends on TableOfContents, its command line still names the .so): a relink that keeps the dynamic symbols leaves the toc's mtime, so `restat` skips dependents.
+func TestSharedLibraryToc(t *testing.T) {
+	g := graphFor(t, map[string]string{"p/Android.bp": `
+cc_library_shared { name: "libdep", srcs: ["d.cc"] }
+cc_binary { name: "bin", srcs: ["b.cc"], shared_libs: ["libdep"] }
+`})
+	if g.node("bin", Device, Binary, "goal") == nil {
+		t.Fatal(g.problems)
+	}
+	ninja := g.emit(Tools{CC: "cc", CXX: "c++", AR: "ar", LLVM: "/llvm"})
+	so := filepath.Join(g.out, "device/libdep/libdep.so")
+	rule := "rule toc\n  command = CLANG_BIN=$clangbin $root/build/soong/scripts/toc.sh --elf -i $in -o $out -d $out.d\n  depfile = $out.d\n  deps = gcc\n  restat = 1\n"
+	edge := "build " + so + ".toc: toc " + so + " | " + filepath.Join(g.tree, "build/soong/scripts/toc.sh") + "\n"
+	for _, want := range []string{rule, edge, "\nclangbin = /llvm/bin\n"} {
+		if !strings.Contains(ninja, want) {
+			t.Errorf("ninja lacks %q", want)
+		}
+	}
+	_, implicit := linkEdge(t, ninja, filepath.Join(g.out, "device/bin/bin"))
+	if deps := strings.Fields(implicit); !slices.Contains(deps, so+".toc") || slices.Contains(deps, so) {
+		t.Errorf("bin's link depends on %q: want libdep.so.toc, not libdep.so", implicit)
+	}
+	m := regexp.MustCompile(`(?m)^build ` + regexp.QuoteMeta(filepath.Join(g.out, "device/bin/bin")) + `: link .*\n  mode = .*\n  libs = (.*)\n`).FindStringSubmatch(ninja)
+	if m == nil || !strings.Contains(m[1], so) {
+		t.Errorf("bin's link line does not name %s: %v", so, m)
+	}
+}

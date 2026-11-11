@@ -139,8 +139,10 @@ type Node struct {
 	// exported include flags, transitive through export_*_lib_headers
 	exports []string
 	out     string // archive, shared object or binary
-	objs    []string
-	gen     []string // files generated for it (generator headers, genrule output): its compiles wait for them
+	// a linked shared library's table of contents (cc/library.go tocFile, <out>.toc): what links naming it depend on (linkDep)
+	toc  string
+	objs []string
+	gen  []string // files generated for it (generator headers, genrule output): its compiles wait for them
 	// source generators (gensrc.go): their edges, include flags and cflags for n's compiles
 	edges     []genEdge
 	genCflags []string

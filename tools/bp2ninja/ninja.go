@@ -156,6 +156,12 @@ rule link
   rspfile_content = $in
   restat = 1
   description = link $out
+rule toc
+  command = CLANG_BIN=$clangbin $root/` + tocScript + ` --elf -i $in -o $out -d $out.d
+  depfile = $out.d
+  deps = gcc
+  restat = 1
+  description = toc $in
 rule partial_ld
   command = $cxx -fuse-ld=lld -nostdlib -no-pie -Wl,-r $in -o $out $mode
   description = ld -r $out
@@ -225,6 +231,10 @@ rule fail
 // Per whitespace-separated token, since clang packs several short paths on one line; a token starting with `/` or `\` (absolute, line continuation) stays. Paths with escaped spaces are not handled (none in the tree).
 const rootDeps = `sed -i -E "s#(^|[[:space:]])([^/[:space:]\\][^[:space:]]*)#\1$root/\2#g" $out.d`
 
+// tocScript: Soong's table-of-contents extractor (cc/builder.go tocPath): the soname and dynamic symbol table via $CLANG_BIN/llvm-readelf, the file
+// replaced only when it differs, so the `restat` toc edge stops dependents' relinks while those stay equal.
+const tocScript = "build/soong/scripts/toc.sh"
+
 // commitIfChanged: a command that wrote $out.tmp keeps the old $out (and its mtime) when every byte is equal (cmp), else moves the new one in. In
 // a `restat = 1` rule ninja then skips the dependents of an unchanged output (Soong: java/builder.go javac and turbine, java/sdk.go
 // commitChangeForRestat). Exact: any differing byte replaces the file.
@@ -252,8 +262,9 @@ func (g *Graph) nodeOut(n *Node) string {
 func (g *Graph) emit(tools Tools) string {
 	var b strings.Builder
 	// rustfmt: bindgen.go's ${config.RustBin}/rustfmt, the toolchain's own beside rustc
-	fmt.Fprintf(&b, "%sar = %s\ncxx = %s\nbison = %s\nflex = %s\nm4 = %s\nyasm = %s\nrustc = %s\nroot = %s\nclang = %s\nlibclang = %s\nrustfmt = %s\nlauncher = %s\nobjcopy = %s\n\n", header, esc(tools.AR), esc(tools.CXX), esc(tools.Bison),
-		esc(tools.Flex), esc(tools.M4), esc(tools.Yasm), esc(tools.Rustc), esc(g.tree), esc(tools.CC), esc(tools.LibClang), esc(filepath.Join(filepath.Dir(tools.Rustc), "rustfmt")), esc(tools.Launcher), esc(filepath.Join(tools.LLVM, "bin", "llvm-objcopy")))
+	fmt.Fprintf(&b, "%sar = %s\ncxx = %s\nbison = %s\nflex = %s\nm4 = %s\nyasm = %s\nrustc = %s\nroot = %s\nclang = %s\nlibclang = %s\nrustfmt = %s\nlauncher = %s\nobjcopy = %s\nclangbin = %s\n\n", header, esc(tools.AR), esc(tools.CXX), esc(tools.Bison),
+		esc(tools.Flex), esc(tools.M4), esc(tools.Yasm), esc(tools.Rustc), esc(g.tree), esc(tools.CC), esc(tools.LibClang), esc(filepath.Join(filepath.Dir(tools.Rustc), "rustfmt")), esc(tools.Launcher), esc(filepath.Join(tools.LLVM, "bin", "llvm-objcopy")),
+		esc(filepath.Join(tools.LLVM, "bin")))
 	// before the cc edges: ninja needs a rule defined before its first use
 	b.WriteString(g.acfg.ninja())
 	b.WriteString(g.aidlPreNinja())
@@ -261,6 +272,10 @@ func (g *Graph) emit(tools Tools) string {
 	for _, n := range g.order {
 		if out := g.nodeOut(n); out != "" {
 			n.out = out
+			// its link edge below also writes the toc; set before any dependent's link names it (linkDep)
+			if n.kind == Shared && n.rust == nil && !n.provided {
+				n.toc = out + ".toc"
+			}
 		}
 	}
 	// genrules: tools' paths are known now (a Rust source variant's steps are its edges)
@@ -349,6 +364,10 @@ func (g *Graph) emit(tools Tools) string {
 			}
 			if len(begin)+len(end) > 0 {
 				fmt.Fprintf(&b, "  crtbegin = %s\n  crtend = %s\n", join(begin), join(end))
+			}
+			if n.toc != "" {
+				// cc/builder.go TransformSharedObjectToToc: upstream toc.sh as is, --elf (Linux and Android), the tool its dependency
+				fmt.Fprintf(&b, "build %s: toc %s | %s\n", esc(n.toc), esc(n.out), esc(g.abs(tocScript)))
 			}
 			if linkOut != n.out {
 				fmt.Fprintf(&b, "build %s: prefix_symbols %s\n  prefix = %s\n", esc(n.out), esc(linkOut), shellQuote([]string{prefix}))
@@ -547,6 +566,15 @@ func (g *Graph) linkFlags(n *Node) []string {
 	return out
 }
 
+// linkDep: what a link naming shared library d depends on: its table of contents where it has one (cc.go depsToPaths: depFile = TableOfContents),
+// so a relink of d that keeps its dynamic symbols and soname stops at the restat toc edge instead of relinking every dependent; else d itself.
+func (d *Node) linkDep() string {
+	if d.toc != "" {
+		return d.toc
+	}
+	return d.out
+}
+
 // linkLibs: provided shared objects, whole archives, the generated Rust staticlib, the static closure (provided archives included), shared libraries (also those static dependencies need), and the glibc system libraries bionic folds into libc.
 // Provided shared objects come first, so they lead the output's DT_NEEDED and the process's lookup order: their strong definitions beat weak fallbacks elsewhere (libbase's and libcutils' __system_property_*); xtask's provided gate checks the result. Soong links system_shared_libs last (LateSharedLibs), where bionic's libc has no fallbacks to beat.
 // An archive has no place in DT_NEEDED or the lookup order: its members are copied into the output, so it links in the group like any static library.
@@ -622,7 +650,7 @@ func (g *Graph) linkLibs(n *Node) (libs, inputs []string) {
 		if d.kind == Shared && !d.provided {
 			// host: absolute build-tree rpath, build tools (aidl) run from here
 			libs = addRpath(append(libs, d.out), filepath.Dir(d.out))
-			inputs = append(inputs, d.out)
+			inputs = append(inputs, d.linkDep())
 		}
 	}
 	// runtime_libs of n and of what it links whole or static (cc.go): where Soong installs them beside the module, the build tree has their own dirs; glibc's dlopen searches the caller's DT_RUNPATH, so libartpalette finds libartpalette-system

@@ -75,6 +75,13 @@ func (o *Obj) boolean(k string, def bool) bool {
 	return def
 }
 
+func (o *Obj) integer(k string, def int64) int64 {
+	if i, ok := o.get(k).(int64); ok {
+		return i
+	}
+	return def
+}
+
 // merge applies src onto dst the way Soong extends properties: lists append, maps merge, scalars
 // replace. Used for defaults (defaults first, the module's own after) and for target/arch blocks.
 func merge(dst, src *Obj) *Obj {
