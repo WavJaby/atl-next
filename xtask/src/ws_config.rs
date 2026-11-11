@@ -8,6 +8,8 @@
 //! parallel_builds = 2  # machine-wide full native builds
 //! [cache]
 //! sccache_size = "5G"  # shared C/C++ compiler cache
+//! [fetch]
+//! for = ["cts"]        # gates whose sources.toml [aosp.needed_by] projects fetch checks out (`native --for` names, `all-gates`); absent = core only
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -78,19 +80,73 @@ pub struct WsConfig {
     pub parallel_builds: Setting<u32>,
     /// `cache.sccache_size`: `SCCACHE_CACHE_SIZE`.
     pub sccache_size: Setting<String>,
+    /// `fetch.for`: gates (`gate_goals` names or `all-gates`) whose `needed_by` projects fetch checks out; empty = core only.
+    pub fetch_for: Setting<Vec<String>>,
 }
 
 impl WsConfig {
     /// The one line `slot list` prints.
     pub fn summary(&self) -> String {
         format!(
-            "{}: slots {}, parallel_builds {}, sccache_size {}",
+            "{}: slots {}, parallel_builds {}, sccache_size {}, fetch.for {}",
             self.path.display(),
             self.slots,
             self.parallel_builds,
-            self.sccache_size
+            self.sccache_size,
+            self.fetch_for_shown()
         )
     }
+
+    /// `fetch.for` as a report shows it.
+    pub fn fetch_for_shown(&self) -> String {
+        let from = match self.fetch_for.origin {
+            Origin::File => "file",
+            Origin::Default => "default",
+        };
+        if self.fetch_for.value.is_empty() {
+            format!("[] = core only ({from})")
+        } else {
+            format!("[{}] ({from})", self.fetch_for.value.join(", "))
+        }
+    }
+}
+
+/// `fetch --for`: add `gates` to `[fetch] for` in `ws`'s file (created if absent; comments and order kept). Returns the new list; refuses a name that is not a `--for` value.
+pub fn add_fetch_for(ws: &Path, gates: &[String]) -> Result<Vec<String>> {
+    let cfg = load(ws)?;
+    let mut list = cfg.fetch_for.value.clone();
+    for g in gates {
+        ensure!(
+            crate::gate_goals::is_for_value(g),
+            "--for {g}: not a gate (gate_goals.rs GATES) or `{}`",
+            crate::gate_goals::ALL
+        );
+        if !list.contains(g) {
+            list.push(g.clone());
+        }
+    }
+    let text = match std::fs::read_to_string(&cfg.path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", cfg.path.display())),
+    };
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .with_context(|| format!("{}: not valid TOML", cfg.path.display()))?;
+    let fetch = doc
+        .entry("fetch")
+        .or_insert(toml_edit::table())
+        .as_table_mut()
+        .with_context(|| format!("{}: `fetch` must be a table", cfg.path.display()))?;
+    fetch["for"] = toml_edit::value(
+        list.iter()
+            .map(String::as_str)
+            .collect::<toml_edit::Array>(),
+    );
+    let out = doc.to_string();
+    parse(&out, &cfg.path).context("workspace.toml after adding --for")?;
+    std::fs::write(&cfg.path, out).with_context(|| format!("writing {}", cfg.path.display()))?;
+    Ok(list)
 }
 
 /// The config of workspace `ws`: its file's values over the defaults.
@@ -109,6 +165,7 @@ fn defaults(path: PathBuf) -> WsConfig {
         slots: Setting::default(DEFAULT_SLOTS),
         parallel_builds: Setting::default(DEFAULT_PARALLEL_BUILDS),
         sccache_size: Setting::default(DEFAULT_SCCACHE_SIZE.to_owned()),
+        fetch_for: Setting::default(Vec::new()),
     }
 }
 
@@ -131,8 +188,9 @@ pub fn parse(text: &str, path: &Path) -> Result<WsConfig> {
                     cfg.parallel_builds = Setting::file(count(value, &at)?);
                 }
                 ("cache", "sccache_size") => cfg.sccache_size = Setting::file(size(value, &at)?),
+                ("fetch", "for") => cfg.fetch_for = Setting::file(gates(value, &at)?),
                 _ => bail!(
-                    "{at} is not a known key (known: build.slots, build.parallel_builds, cache.sccache_size)"
+                    "{at} is not a known key (known: build.slots, build.parallel_builds, cache.sccache_size, fetch.for)"
                 ),
             }
         }
@@ -147,6 +205,27 @@ fn count(value: &toml::Value, at: &str) -> Result<u32> {
     };
     let n = u32::try_from(*n).ok().filter(|&n| n > 0);
     n.with_context(|| format!("{at} must be a positive integer, not {value}"))
+}
+
+/// A list of distinct `--for` values (gate names, `all-gates`).
+fn gates(value: &toml::Value, at: &str) -> Result<Vec<String>> {
+    let toml::Value::Array(items) = value else {
+        bail!("{at} must be a list of gate names, not {value}");
+    };
+    let mut out: Vec<String> = Vec::new();
+    for item in items {
+        let toml::Value::String(g) = item else {
+            bail!("{at}: {item} is not a gate name string");
+        };
+        ensure!(
+            crate::gate_goals::is_for_value(g),
+            "{at}: `{g}` is not a gate (gate_goals.rs GATES) or `{}`",
+            crate::gate_goals::ALL
+        );
+        ensure!(!out.contains(g), "{at}: `{g}` is listed twice");
+        out.push(g.clone());
+    }
+    Ok(out)
 }
 
 /// A size in sccache's syntax: digits then one of K, M, G, T (sccache `config.rs` `parse_size`: a suffix-less number is bytes, which no cache this size wants, so a unit is required here).
@@ -263,7 +342,61 @@ mod tests {
         let cfg = parse("[build]\nslots = 2\n", path()).expect("valid");
         assert_eq!(
             cfg.summary(),
-            "/ws/workspace.toml: slots 2 (file), parallel_builds 2 (default), sccache_size 5G (default)"
+            "/ws/workspace.toml: slots 2 (file), parallel_builds 2 (default), sccache_size 5G (default), fetch.for [] = core only (default)"
         );
+    }
+
+    // gate names from gate_goals.rs GATES (`cts`, `gl`) and its `--for` value `all-gates`
+    #[test]
+    fn fetch_for_takes_gate_names_and_refuses_others() {
+        assert_eq!(
+            parse("", path()).unwrap().fetch_for,
+            Setting::default(vec![])
+        );
+        let cfg = parse("[fetch]\nfor = [\"cts\", \"all-gates\"]\n", path()).expect("valid");
+        assert_eq!(
+            cfg.fetch_for,
+            Setting::file(vec!["cts".to_owned(), "all-gates".to_owned()])
+        );
+        for (text, why) in [
+            ("[fetch]\nfor = [\"nope\"]\n", "`nope` is not a gate"),
+            (
+                "[fetch]\nfor = [\"cts\", \"cts\"]\n",
+                "`cts` is listed twice",
+            ),
+            ("[fetch]\nfor = \"cts\"\n", "must be a list"),
+            ("[fetch]\nfor = [1]\n", "not a gate name string"),
+            (
+                "[fetch]\nfrom = [\"cts\"]\n",
+                "`fetch.from` is not a known key",
+            ),
+        ] {
+            let m = err(text);
+            assert!(
+                m.contains("/ws/workspace.toml") && m.contains(why),
+                "{text}: {m}"
+            );
+        }
+    }
+
+    #[test]
+    fn add_fetch_for_keeps_the_file_and_refuses_unknown_gates() {
+        let dir = std::env::temp_dir().join(format!("xtask-wscfg-{}-for", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        std::fs::write(dir.join(FILE), "# mine\n[build]\nslots = 2\n").expect("file");
+        assert_eq!(add_fetch_for(&dir, &["cts".into()]).unwrap(), ["cts"]);
+        assert_eq!(
+            add_fetch_for(&dir, &["cts".into(), "gl".into()]).unwrap(),
+            ["cts", "gl"]
+        );
+        let e = format!("{:#}", add_fetch_for(&dir, &["nope".into()]).unwrap_err());
+        assert!(e.contains("--for nope: not a gate"), "{e}");
+        let text = std::fs::read_to_string(dir.join(FILE)).unwrap();
+        let cfg = load(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+        assert!(text.starts_with("# mine\n[build]\nslots = 2\n"), "{text}");
+        assert_eq!(cfg.fetch_for.value, ["cts", "gl"]);
+        assert_eq!(cfg.slots, Setting::file(2));
     }
 }

@@ -136,6 +136,12 @@ pub struct Args {
     /// Delete and clone again the checkouts of these pinned AOSP projects (tree paths) whose keep-set differs from sources.toml [aosp.sparse]: a keep-set is fixed at creation. Only a checkout at its pin with no uncommitted changes; the remote must still resolve the pin. Dry run unless --execute.
     #[arg(long, value_name = "PATH", num_args = 1.., conflicts_with_all = ["bump", "add", "migrate_git_dirs", "test_apks"])]
     recreate: Vec<String>,
+    /// Also fetch the sources.toml [aosp.needed_by] projects of these gates (`native --for` names, `all-gates`); with --execute, adds them to `<workspace>/workspace.toml` [fetch] for, which keeps them requested. Without either, fetch checks out core only.
+    #[arg(long = "for", value_name = "GATE", num_args = 1.., value_delimiter = ',', conflicts_with_all = ["bump", "migrate_git_dirs", "test_apks"])]
+    for_gates: Vec<String>,
+    /// Delete these checkouts (dirs under src/, as fetch lists them): only one that is not pinned, or pinned but not requested by [fetch] for; refused while it has a task copy, uncommitted changes or a local branch. Dry run unless --execute.
+    #[arg(long = "drop", value_name = "DIR", num_args = 1.., conflicts_with_all = ["bump", "add", "migrate_git_dirs", "test_apks", "recreate", "for_gates"])]
+    drop_dirs: Vec<String>,
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
@@ -164,6 +170,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         crate::git_dirs::migrate(&scope, args.execute)?;
         return Ok(ExitCode::SUCCESS);
     }
+    if !args.drop_dirs.is_empty() {
+        return drop(root, &args.drop_dirs, args.execute).map(|ok| {
+            if ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        });
+    }
     Ok(if fetch(root, args)? {
         ExitCode::SUCCESS
     } else {
@@ -185,6 +200,8 @@ pub fn add_and_fetch(root: &Path, paths: &[String]) -> Result<()> {
         play_email: None,
         store_token: false,
         recreate: Vec::new(),
+        for_gates: Vec::new(),
+        drop_dirs: Vec::new(),
     };
     ensure!(fetch(root, &args)?, "fetch failed (rows above)");
     Ok(())
@@ -238,11 +255,32 @@ fn fetch(root: &Path, args: &Args) -> Result<bool> {
         all.insert(0, sources.manifest_checkout());
         return bump(root, &all, args.write, jobs);
     }
+    let wanted = requested(layout.workspace(), &args.for_gates, args.execute)?;
+    // an unrequested checkout already present stays in step (drift checks every present one); only a missing one is skipped
+    let (all, skipped): (Vec<Checkout>, Vec<Checkout>) = all.into_iter().partition(|c| {
+        sources.unrequested(c, &wanted.list).is_none() || layout.src().join(&c.dir).exists()
+    });
     let results = par::map(&all, jobs, |c| sync(&ctx, c));
     for (c, result) in all.iter().zip(results) {
         rows.add(c, result);
     }
     println!("fetch: {} checkouts at pin", rows.at_pin);
+    println!("fetch: for {}", wanted.shown);
+    for c in &skipped {
+        let gates = sources.unrequested(c, &wanted.list).unwrap_or_default();
+        println!(
+            "fetch: {:<40} skipped: not requested (needed_by [{}]; `fetch --for <gate>`)",
+            c.dir.display(),
+            gates.join(", ")
+        );
+    }
+    for d in droppable(&layout, &sources, &wanted.list)? {
+        println!(
+            "fetch: {:<40} {}: `fetch --drop {0}` removes it",
+            d.dir.display(),
+            d.why
+        );
+    }
     if args.execute
         && let Some(m) = &manifest
     {
@@ -256,6 +294,209 @@ fn fetch(root: &Path, args: &Args) -> Result<bool> {
         );
     }
     Ok(rows.failed == 0)
+}
+
+/// The gates a fetch serves: workspace.toml `fetch.for` plus `--for` (written to the file only with `execute`).
+struct Requested {
+    list: Vec<String>,
+    shown: String,
+}
+
+fn requested(ws: &Path, extra: &[String], execute: bool) -> Result<Requested> {
+    if execute && !extra.is_empty() {
+        crate::ws_config::add_fetch_for(ws, extra)?;
+    }
+    let cfg = crate::ws_config::load(ws)?;
+    let mut list = cfg.fetch_for.value.clone();
+    for g in extra {
+        ensure!(
+            crate::gate_goals::is_for_value(g),
+            "--for {g}: not a gate (gate_goals.rs GATES) or `{}`",
+            crate::gate_goals::ALL
+        );
+        if !list.contains(g) {
+            list.push(g.clone());
+        }
+    }
+    let mut shown = cfg.fetch_for_shown();
+    if !execute && list != cfg.fetch_for.value {
+        shown = format!(
+            "[{}] (dry run: --execute writes --for to the file)",
+            list.join(", ")
+        );
+    }
+    Ok(Requested { list, shown })
+}
+
+/// A present checkout this workspace has no use for.
+struct Droppable {
+    /// Under src/, as `Checkout::dir`.
+    dir: PathBuf,
+    why: String,
+}
+
+/// Checkouts present under src/ that are not pinned, or pinned but not requested by `wanted`: what `--drop` may remove. Found by their git dirs (`src/.git-dirs/<dir>.git`, `Layout::git_dir`).
+fn droppable(layout: &Layout, sources: &Sources, wanted: &[String]) -> Result<Vec<Droppable>> {
+    let mut pinned: BTreeMap<PathBuf, Checkout> = sources
+        .checkouts(None)
+        .into_iter()
+        .map(|c| (c.dir.clone(), c))
+        .collect();
+    let m = sources.manifest_checkout();
+    pinned.insert(m.dir.clone(), m);
+    let mut out = Vec::new();
+    // the store root: parent of a top-level dir's git dir (`atl_layout::git_store` names no root of its own)
+    let any = layout.git_dir(Path::new("x"));
+    let store = any.parent().context("git store has no parent")?;
+    for dir in stored_checkouts(store)? {
+        match pinned.get(&dir) {
+            None => out.push(Droppable {
+                dir,
+                why: "present, not pinned in sources.toml".into(),
+            }),
+            Some(c) => {
+                if let Some(gates) = sources.unrequested(c, wanted) {
+                    out.push(Droppable {
+                        dir,
+                        why: format!("present, not requested (needed_by [{}])", gates.join(", ")),
+                    });
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Checkout dirs whose git dir is under `store` (`<dir>.git` holding a HEAD), relative to it.
+fn stored_checkouts(store: &Path) -> Result<Vec<PathBuf>> {
+    fn walk(store: &Path, at: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+        let here = store.join(at);
+        let entries = match std::fs::read_dir(&here) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", here.display())),
+        };
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            match name.strip_suffix(".git") {
+                Some(dir) if entry.path().join("HEAD").is_file() => out.push(at.join(dir)),
+                _ => walk(store, &at.join(&name), out)?,
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(store, Path::new(""), &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
+/// `--drop`: each dir must be droppable (not pinned, or not requested) and pass [`drop_refusal`]; all are judged before any is removed.
+fn drop(root: &Path, dirs: &[String], execute: bool) -> Result<bool> {
+    let layout = Layout::of(root)?;
+    let sources = sources::load(root)?;
+    let wanted = crate::ws_config::load(layout.workspace())?.fetch_for.value;
+    drop_in(&layout, &sources, &wanted, dirs, execute)
+}
+
+fn drop_in(
+    layout: &Layout,
+    sources: &Sources,
+    wanted: &[String],
+    dirs: &[String],
+    execute: bool,
+) -> Result<bool> {
+    let free = droppable(layout, sources, wanted)?;
+    let pinned: Vec<PathBuf> = sources.checkouts(None).into_iter().map(|c| c.dir).collect();
+    let mut ok = true;
+    let mut go = Vec::new();
+    for d in dirs {
+        let dir = PathBuf::from(d.trim_end_matches('/'));
+        let verdict = match free.iter().find(|f| f.dir == dir) {
+            None => Err(format!(
+                "not a present checkout that is unpinned or unrequested (fetch lists those); requested: [{}]",
+                wanted.join(", ")
+            )),
+            Some(f) => match drop_refusal(layout, &dir, &pinned)? {
+                Some(why) => Err(why),
+                None => Ok(f.why.clone()),
+            },
+        };
+        match verdict {
+            Ok(why) => {
+                println!(
+                    "fetch: {:<40} {why} -> {}",
+                    dir.display(),
+                    if execute { "dropped" } else { "would drop" }
+                );
+                go.push(dir);
+            }
+            Err(why) => {
+                ok = false;
+                println!("fetch: {:<40} drop refused: {why}", dir.display());
+            }
+        }
+    }
+    if !ok {
+        println!("fetch: nothing dropped (refusals above)");
+        return Ok(false);
+    }
+    if execute {
+        for dir in &go {
+            remove_checkout(&layout.src().join(dir), &layout.git_dir(dir))?;
+        }
+    } else {
+        println!("fetch: dry run; --execute drops {} checkouts", go.len());
+    }
+    Ok(true)
+}
+
+/// Why checkout `dir` (under src/) must not be deleted: a pinned checkout inside it, a task copy of it, uncommitted changes, or a local branch (its commits may be the only copy). `--recreate`'s guards, less the pin it would clone again.
+fn drop_refusal(layout: &Layout, dir: &Path, pinned: &[PathBuf]) -> Result<Option<String>> {
+    if let Some(inner) = pinned.iter().find(|p| *p != dir && p.starts_with(dir)) {
+        return Ok(Some(format!(
+            "pinned checkout {} is inside it",
+            inner.display()
+        )));
+    }
+    // a task copy is a linked worktree: an entry under `<git dir>/worktrees`, whose `gitdir` file names the copy's `.git`
+    let linked = layout.git_dir(dir).join("worktrees");
+    let mut copies = Vec::new();
+    if linked.is_dir() {
+        for entry in
+            std::fs::read_dir(&linked).with_context(|| format!("reading {}", linked.display()))?
+        {
+            let entry = entry?.path();
+            let at = std::fs::read_to_string(entry.join("gitdir"))
+                .unwrap_or_else(|_| entry.display().to_string());
+            copies.push(at.trim().trim_end_matches("/.git").to_owned());
+        }
+    }
+    if !copies.is_empty() {
+        return Ok(Some(format!(
+            "task copy {} exists: `xtask patch --done` first",
+            copies.join(", ")
+        )));
+    }
+    let tree = layout.src().join(dir);
+    Ok(match inspect(&tree)? {
+        Local::Missing => None,
+        Local::Unborn { files: true } => {
+            Some("git repository without commits holding files".into())
+        }
+        Local::Unborn { files: false } => None,
+        Local::Present { dirty: true, .. } => Some("uncommitted changes".into()),
+        Local::Present {
+            branch: Some(b), ..
+        } => Some(format!(
+            "on local branch {b}: its commits may exist nowhere else"
+        )),
+        Local::Present { .. } => None,
+    })
 }
 
 /// What every checkout's sync shares.
@@ -1057,6 +1298,127 @@ mod tests {
             Action::Blocked(_)
         ));
         std::fs::remove_dir_all(&src).unwrap();
+    }
+
+    /// `--drop`: an unpinned or unrequested checkout goes (dry run first); a requested one, a dirty one, one on a local branch and one with a task copy are refused, and one refusal drops nothing.
+    #[test]
+    fn drop_guards() {
+        let remote = Remote::new("drop");
+        let ws = remote.dir.with_extension("ws");
+        let _ = std::fs::remove_dir_all(&ws);
+        let layout = Layout::new(&ws, None);
+        let url = format!("file://{}", remote.dir.display());
+        let make = |dir: &str| {
+            let d = Path::new(dir);
+            create_checkout(
+                &layout.src().join(d),
+                &layout.git_dir(d),
+                &url,
+                "refs/tags/v1",
+                &Sparse::Full,
+                None,
+            )
+            .unwrap();
+            layout.src().join(d)
+        };
+        let sha = &remote.first;
+        let sources = sources::parse(&format!(
+            "[aosp]\nremote = \"https://h/\"\ntag = \"t\"\nmanifest = \"{sha}\"\n[aosp.projects]\ncts = \"{sha}\"\ncore = \"{sha}\"\n[aosp.needed_by]\ncts = [\"cts\"]\n"
+        ))
+        .unwrap();
+        for d in [
+            "aosp/cts",
+            "aosp/core",
+            "aosp/gone",
+            "aosp/dirty",
+            "aosp/branch",
+            "aosp/copied",
+        ] {
+            make(d);
+        }
+        std::fs::write(layout.src().join("aosp/dirty/x"), "").unwrap();
+        git(Some(&layout.src().join("aosp/dirty")), &["add", "x"]).unwrap();
+        git(
+            Some(&layout.src().join("aosp/branch")),
+            &["checkout", "-q", "-b", "mine"],
+        )
+        .unwrap();
+        let copy = ws.join("src-wt/t/aosp/copied").display().to_string();
+        git(
+            Some(&layout.src().join("aosp/copied")),
+            &["worktree", "add", "-q", "--detach", &copy],
+        )
+        .unwrap();
+        let v = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let listed: Vec<String> = droppable(&layout, &sources, &[])
+            .unwrap()
+            .iter()
+            .map(|d| format!("{} {}", d.dir.display(), d.why))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                "aosp/branch present, not pinned in sources.toml",
+                "aosp/copied present, not pinned in sources.toml",
+                "aosp/cts present, not requested (needed_by [cts])",
+                "aosp/dirty present, not pinned in sources.toml",
+                "aosp/gone present, not pinned in sources.toml",
+            ]
+        );
+        // requested: cts is kept, core always
+        assert!(
+            droppable(&layout, &sources, &v(&["all-gates"]))
+                .unwrap()
+                .iter()
+                .all(|d| d.dir != Path::new("aosp/cts"))
+        );
+        let refused = |dir: &str| !drop_in(&layout, &sources, &[], &v(&[dir]), true).unwrap();
+        for d in ["aosp/core", "aosp/dirty", "aosp/branch", "aosp/copied"] {
+            assert!(refused(d), "{d} dropped");
+            assert!(layout.src().join(d).is_dir(), "{d} removed");
+        }
+        assert!(!drop_in(&layout, &sources, &v(&["cts"]), &v(&["aosp/cts"]), true).unwrap());
+        // one refusal: nothing goes
+        assert!(
+            !drop_in(
+                &layout,
+                &sources,
+                &[],
+                &v(&["aosp/gone", "aosp/dirty"]),
+                true
+            )
+            .unwrap()
+        );
+        assert!(layout.src().join("aosp/gone").is_dir());
+        // dry run changes nothing; execute removes tree and git dir
+        assert!(
+            drop_in(
+                &layout,
+                &sources,
+                &[],
+                &v(&["aosp/gone", "aosp/cts"]),
+                false
+            )
+            .unwrap()
+        );
+        assert!(layout.src().join("aosp/gone").is_dir());
+        assert!(
+            drop_in(
+                &layout,
+                &sources,
+                &[],
+                &v(&["aosp/gone", "aosp/cts/"]),
+                true
+            )
+            .unwrap()
+        );
+        for d in ["aosp/gone", "aosp/cts"] {
+            assert!(
+                !layout.src().join(d).exists() && !layout.git_dir(Path::new(d)).exists(),
+                "{d} kept"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]

@@ -310,6 +310,11 @@ fn resolve(mut g: Goals) -> Result<Goals> {
     Ok(g)
 }
 
+/// Whether `name` is a `--for` value: a [`GATES`] name or [`ALL`].
+pub fn is_for_value(name: &str) -> bool {
+    name == ALL || GATES.iter().any(|(n, _)| *n == name)
+}
+
 fn names() -> String {
     GATES.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")
 }

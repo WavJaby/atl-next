@@ -3,6 +3,7 @@
 //! Why this order: `src/<up>` is one checkout shared by every worktree and holds origin/main's pins and patches (`fetch::Main`), so a branch's unlanded patches exist only in its task copies (`src-wt/<branch>/<up>`), which only the branch's worktree resolves (`atl-layout`).
 //! Main has no task copies, so `check` run on main sees `src/` alone. That is why the branch is checked in its own worktree before the push, and why its copies go only after main and `src/` reached the new commit.
 //! Nothing reaches origin before the push. A task copy is a worktree of `src/` on `atl-patches-<branch>`: it leaves every other worktree's checkout alone.
+//! This process is main's xtask, so it never parses the branch's tables: a branch may change their schema. What they say comes from the branch's own xtask in its worktree (`--facts` child, `patch --edit`, `check`).
 //! Cleanup runs in a child `cargo xtask land <branch> --cleanup --execute` in main: this process's binary predates the sync, so it cannot parse the tables the sync brought in.
 
 use std::path::{Path, PathBuf};
@@ -13,7 +14,7 @@ use anyhow::{Context, Result, bail, ensure};
 use atl_layout::{Layout, MAIN};
 
 use crate::fetch;
-use crate::git::{Ident, git, git_raw};
+use crate::git::{git, git_raw};
 use crate::patch;
 use crate::slot;
 use crate::slot_prune;
@@ -36,10 +37,27 @@ pub struct Args {
     /// Internal: the cleanup stage's child (`cleanup_execute`); runs only the cleanup. Needs `--execute`.
     #[arg(long, hide = true, requires = "execute")]
     cleanup: bool,
+    /// Internal: the preflight's child in the branch's worktree (`facts_child`); prints what the branch's tables say, read-only.
+    #[arg(long, hide = true, conflicts_with_all = ["execute", "cleanup"])]
+    facts: bool,
 }
 
-/// What `land` runs beside its git work: the check of a checkout, the fetch of the main checkout and the cleanup child. Tests substitute all three.
+/// What the branch's own tables say, as the branch's xtask reads them (`branch_facts`).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BranchFacts {
+    /// Upstreams needing a task copy in the worktree.
+    edits: Vec<String>,
+    /// Upstreams whose task copy exists already.
+    copies: Vec<String>,
+}
+
+/// `(worktree, branch)` -> the branch's facts; `facts_child` in production.
+type FactsFn<'a> = dyn Fn(&Path, &str) -> Result<BranchFacts> + 'a;
+
+/// What `land` runs beside its git work: the check of a checkout, the fetch of the main checkout, the branch's task copies and the cleanup child. Tests substitute them.
 struct Runner<'a> {
+    /// `xtask patch --edit <up>` in the worktree, by the branch's xtask (`edit_execute`).
+    edit: &'a dyn Fn(&Path, &str) -> Result<String>,
     /// The checkout's verdict line, Ok only when that check passed (`check_verdict`).
     check: &'a dyn Fn(&Path) -> Result<String>,
     /// `xtask fetch --execute` in the main checkout.
@@ -98,8 +116,18 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         println!("{}", clean_up_child(root, &args.branch)?);
         return Ok(ExitCode::SUCCESS);
     }
+    if args.facts {
+        let f = branch_facts(root)?;
+        for e in &f.edits {
+            println!("{FACT_EDIT}{e}");
+        }
+        for c in &f.copies {
+            println!("{FACT_COPY}{c}");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     let started = Instant::now();
-    let plan = Plan::new(root, &args.branch, args.execute)?;
+    let plan = Plan::new(root, &args.branch, args.execute, &facts_child)?;
     let stages = plan.stages();
     // preflight = origin fetch + read-only checks; not a stage, so outside the table
     println!("land: preflight ({}) ok", timing::secs(started.elapsed()));
@@ -114,6 +142,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     let runner = Runner {
+        edit: &edit_execute,
         check: &check_verdict,
         fetch: &fetch_execute,
         cleanup: &cleanup_execute,
@@ -129,7 +158,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 
 impl Plan {
     /// The read-only preflight: every refusal is an error and nothing is written. `update` first fetches origin's refs (`--execute`); a dry run judges origin/main as last fetched.
-    fn new(repo: &Path, branch: &str, update: bool) -> Result<Self> {
+    /// `facts`: what the branch's own tables say (`facts_child` = the branch's xtask in its worktree); this process never parses them, since its binary is main's.
+    fn new(repo: &Path, branch: &str, update: bool, facts: &FactsFn<'_>) -> Result<Self> {
         ensure!(branch != MAIN, "`{MAIN}` is the trunk: land a task branch");
         ensure!(
             !branch.contains('/'),
@@ -194,33 +224,7 @@ impl Plan {
             first(&dirty)
         );
         patch::check(repo).context("src/ is not origin/main's pin + patches: `cargo xtask fetch --execute` in the main checkout, then land again")?;
-
-        let layout = Layout::of(repo)?;
-        let wt_layout = Layout::of(&wt)?;
-        let sources = branch_sources(repo, &wt, branch)?;
-        let main = fetch::Main::load(repo)?;
-        let manifest = sources.manifest_checkout();
-        let manifest_stored = patch::stored(&wt.join("patches").join(&manifest.dir))?;
-        if let Some(why) = main.refusal(&manifest, &manifest_stored) {
-            bail!("{why}");
-        }
-        let mut edits = Vec::new();
-        for c in sources.checkouts(None) {
-            if !main.lists(&c) {
-                // nothing on main reads a new upstream, so the shared checkout serves it; it has to be there to be checked
-                ensure!(
-                    layout.src().join(&c.dir).exists(),
-                    "upstream {} is new to origin/main and not fetched: `cargo xtask fetch --execute` in {} creates it, then land again",
-                    c.dir.display(),
-                    wt.display()
-                );
-                continue;
-            }
-            let stored = patch::stored(&wt.join("patches").join(&c.dir))?;
-            if main.refusal(&c, &stored).is_some() && wt_layout.locate(&c.dir).task.is_none() {
-                edits.push(c.dir.display().to_string());
-            }
-        }
+        let BranchFacts { edits, copies } = facts(&wt, branch)?;
         Ok(Plan {
             repo: repo.to_path_buf(),
             branch: branch.to_owned(),
@@ -228,7 +232,7 @@ impl Plan {
             origin,
             head,
             edits,
-            copies: copies_of(&wt_layout, &sources),
+            copies,
         })
     }
 
@@ -334,7 +338,7 @@ impl Plan {
 
     fn run_stage(&self, stage: &Stage, runner: &Runner) -> Result<String> {
         match stage {
-            Stage::Edit(up) => self.edit(up),
+            Stage::Edit(up) => (runner.edit)(&self.wt, up),
             Stage::Verify => (runner.check)(self.wt.as_path())
                 .with_context(|| format!("nothing pushed: check in {} failed", self.wt.display())),
             Stage::Push => {
@@ -356,21 +360,6 @@ impl Plan {
         }
     }
 
-    fn edit(&self, up: &str) -> Result<String> {
-        let sources = sources::load(&self.wt)?;
-        let c = sources
-            .checkouts(None)
-            .into_iter()
-            .find(|c| c.dir.display().to_string() == up)
-            .with_context(|| format!("no upstream {up} in the branch's {}", sources::FILE))?;
-        patch::edit(
-            &c,
-            &Layout::of(&self.wt)?,
-            &self.wt,
-            &Ident::of_repo(&self.wt)?,
-        )
-    }
-
     fn sync(&self, runner: &Runner) -> Result<String> {
         let pushed = format!("pushed: origin/main is {}", short(&self.head));
         git(Some(&self.repo), &["fetch", "-q", "origin"])
@@ -388,6 +377,89 @@ impl Plan {
         })?;
         Ok(format!("main and src/ at {}", short(&self.head)))
     }
+}
+
+/// `--facts` output line prefixes.
+const FACT_EDIT: &str = "land-facts: edit ";
+const FACT_COPY: &str = "land-facts: copy ";
+
+/// The branch's facts from its own tables, read by whichever xtask runs this: the `--facts` child in the worktree `wt`, i.e. the branch's xtask, so a table schema the branch changes is read by the code that changed it.
+/// origin/main's tables (`fetch::Main`) are read through the refs the worktree shares with the main checkout.
+fn branch_facts(wt: &Path) -> Result<BranchFacts> {
+    let layout = Layout::of(wt)?;
+    let sources = sources::load(wt)?;
+    let main = fetch::Main::load(wt)?;
+    let manifest = sources.manifest_checkout();
+    let manifest_stored = patch::stored(&wt.join("patches").join(&manifest.dir))?;
+    if let Some(why) = main.refusal(&manifest, &manifest_stored) {
+        bail!("{why}");
+    }
+    let mut edits = Vec::new();
+    for c in sources.checkouts(None) {
+        if !main.lists(&c) {
+            // nothing on main reads a new upstream, so the shared checkout serves it; it has to be there to be checked
+            ensure!(
+                layout.src().join(&c.dir).exists(),
+                "upstream {} is new to origin/main and not fetched: `cargo xtask fetch --execute` in {} creates it, then land again",
+                c.dir.display(),
+                wt.display()
+            );
+            continue;
+        }
+        let stored = patch::stored(&wt.join("patches").join(&c.dir))?;
+        if main.refusal(&c, &stored).is_some() && layout.locate(&c.dir).task.is_none() {
+            edits.push(c.dir.display().to_string());
+        }
+    }
+    Ok(BranchFacts {
+        edits,
+        copies: copies_of(&layout, &sources),
+    })
+}
+
+/// `cargo xtask land <branch> --facts` in the worktree, run by the branch's xtask (the binary its Verify stage runs too): main's binary cannot read a table schema the branch changes.
+fn facts_child(wt: &Path, branch: &str) -> Result<BranchFacts> {
+    let mut cmd = crate::cargo_command();
+    cmd.args(["xtask", "land", branch, "--facts"])
+        .current_dir(wt);
+    let run = unit_use::run(&mut cmd, Units::Plain, Echo::Nothing)
+        .with_context(|| format!("running cargo xtask land --facts in {}", wt.display()))?;
+    ensure!(
+        run.status.success(),
+        "the branch's xtask in {} could not read its tables ({}): {}",
+        wt.display(),
+        run.status,
+        run.stderr
+            .rfind("Error:")
+            .map_or(run.stderr.trim_end(), |at| run.stderr[at..].trim_end())
+    );
+    Ok(parse_facts(&run.stdout))
+}
+
+fn parse_facts(stdout: &str) -> BranchFacts {
+    let mut f = BranchFacts::default();
+    for line in stdout.lines() {
+        if let Some(e) = line.strip_prefix(FACT_EDIT) {
+            f.edits.push(e.to_owned());
+        } else if let Some(c) = line.strip_prefix(FACT_COPY) {
+            f.copies.push(c.to_owned());
+        }
+    }
+    f
+}
+
+/// `cargo xtask patch --edit <up>` in the worktree, run by the branch's xtask: the task copy is built from the branch's tables.
+fn edit_execute(wt: &Path, up: &str) -> Result<String> {
+    let mut cmd = crate::cargo_command();
+    cmd.args(["xtask", "patch", "--edit", up]).current_dir(wt);
+    let run = unit_use::run(&mut cmd, Units::Plain, Echo::Both)
+        .with_context(|| format!("running cargo xtask patch --edit in {}", wt.display()))?;
+    ensure!(
+        run.status.success(),
+        "cargo xtask patch --edit {up} exited with {}",
+        run.status
+    );
+    Ok(format!("task copy of {up}"))
 }
 
 /// `cargo xtask check` in `dir`, run by that checkout's own xtask: its verdict line, or an error carrying it when the check did not pass.
@@ -560,22 +632,6 @@ fn first(lines: &[&str]) -> String {
     lines.iter().take(3).copied().collect::<Vec<_>>().join(", ")
 }
 
-/// The branch's sources.toml, read by this (main's) xtask. A file main's own sources.toml reads fine but the branch's does not is a schema change: this xtask cannot judge
-/// the branch, and the bare parse error (`TOML parse error at line 1, column 1`) does not say so. `root` resolves from xtask's manifest dir, so the branch's xtask cannot land
-/// into main either: the land goes by hand.
-fn branch_sources(repo: &Path, wt: &Path, branch: &str) -> Result<sources::Sources> {
-    sources::load(wt).or_else(|e| {
-        if sources::load(repo).is_err() {
-            return Err(e);
-        }
-        bail!(
-            "branch {branch} changes the sources.toml schema: main's xtask cannot read {} ({e:#}). Land by hand: `cargo xtask check` in that worktree (the branch's xtask), then in {} `git merge --ff-only {branch}`, `git push`, `cargo xtask fetch --execute` (now the branch's xtask)",
-            wt.display(),
-            repo.display()
-        )
-    })
-}
-
 /// A commit as the messages show it.
 fn short(sha: &str) -> &str {
     sha.get(..12).unwrap_or(sha)
@@ -587,38 +643,64 @@ mod tests {
 
     const SOURCES: &str = "[aosp]\nremote = \"https://android.googlesource.com/\"\ntag = \"android-16.0.0_r1\"\nmanifest = \"0123456789abcdef0123456789abcdef01234567\"\nprojects = {}\n";
 
-    /// A branch whose sources.toml main's schema cannot read (a renamed table) is named as a schema change; when main's own file fails too, the plain error stays.
+    /// The branch's facts in this process: the tests' stand-in for `facts_child` (this code is the branch's xtask here).
+    fn in_process(wt: &Path, _: &str) -> Result<BranchFacts> {
+        branch_facts(wt)
+    }
+
+    fn no_edit(_: &Path, up: &str) -> Result<String> {
+        panic!("edit stage ran for {up}")
+    }
+
+    /// A branch adding a sources.toml key this xtask refuses (a schema change, as F1's `[aosp.needed_by]` was to main's) still plans and lands: the preflight takes the branch's tables only from `facts` (the branch's xtask), never parses them itself.
     #[test]
-    fn schema_change_is_named() {
-        let root = std::env::temp_dir().join(format!("xtask-land-schema-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let (repo, wt) = (root.join("repo"), root.join("wt"));
-        std::fs::create_dir_all(&repo).unwrap();
-        std::fs::create_dir_all(&wt).unwrap();
-        write(&repo, "sources.toml", SOURCES);
+    fn branch_tables_are_read_by_the_branchs_xtask() {
+        let env = Env::new("schema");
         write(
-            &wt,
+            &env.wt,
             "sources.toml",
-            &SOURCES.replace("[aosp]", "[platform]"),
+            &format!("{SOURCES}[aosp.needed_by]\nfuture_key = 1\n[future]\nx = 1\n"),
         );
-        let e = format!(
-            "{:#}",
-            branch_sources(&repo, &wt, "b").expect_err("new schema")
-        );
+        commit(&env.wt, "schema change");
         assert!(
-            e.contains("branch b changes the sources.toml schema"),
-            "{e}"
+            sources::load(&env.wt).is_err(),
+            "the fixture must be a schema this xtask refuses"
         );
-        write(&wt, "sources.toml", SOURCES);
-        assert!(branch_sources(&repo, &wt, "b").is_ok());
-        write(&repo, "sources.toml", "not toml [");
-        write(&wt, "sources.toml", "not toml [");
-        let e = format!(
-            "{:#}",
-            branch_sources(&repo, &wt, "b").expect_err("both broken")
+        let asked = std::cell::RefCell::new(Vec::new());
+        let facts = |wt: &Path, branch: &str| -> Result<BranchFacts> {
+            asked
+                .borrow_mut()
+                .push((wt.to_path_buf(), branch.to_owned()));
+            Ok(BranchFacts {
+                edits: Vec::new(),
+                copies: vec!["up".to_owned()],
+            })
+        };
+        let plan = Plan::new(&env.repo, "land", true, &facts)
+            .expect("main's binary must not parse the branch's tables");
+        assert_eq!(*asked.borrow(), [(env.wt.clone(), "land".to_owned())]);
+        assert_eq!(plan.copies, ["up"]);
+        let check_fn = |_: &Path| -> Result<String> { Ok("check: ok (12 steps)".to_owned()) };
+        let fetch_fn = |_: &Path| -> Result<()> { Ok(()) };
+        let cleanup_fn = |_: &Path, _: &str| -> Result<String> { Ok("cleaned".to_owned()) };
+        let line = plan.execute(
+            &plan.stages(),
+            &Runner {
+                edit: &no_edit,
+                check: &check_fn,
+                fetch: &fetch_fn,
+                cleanup: &cleanup_fn,
+            },
         );
-        assert!(!e.contains("schema"), "{e}");
-        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(line, "land: ok (5 steps)");
+        // the child's output is what the parent plans from
+        assert_eq!(
+            parse_facts("noise\nland-facts: edit aosp/x\nland-facts: copy up\n"),
+            BranchFacts {
+                edits: vec!["aosp/x".into()],
+                copies: vec!["up".into()]
+            }
+        );
     }
 
     /// Temp tree: `origin.git` (bare, the remote), `ws/repo` (the main checkout on main, pushed) and `ws/wt/land` (a worktree on `land`, one commit ahead). No upstreams, so `check` has nothing to fetch.
@@ -724,7 +806,7 @@ mod tests {
     fn dry_run_lists_the_stages_and_changes_nothing() {
         let env = Env::new("dry");
         let before = env.origin_main();
-        let plan = Plan::new(&env.repo, "land", false).unwrap();
+        let plan = Plan::new(&env.repo, "land", false, &in_process).unwrap();
         let stages = plan.stages();
         let names: Vec<&str> = stages.iter().map(Stage::name).collect();
         assert_eq!(names, ["verify", "push", "sync", "verify-main", "cleanup"]);
@@ -744,7 +826,7 @@ mod tests {
         let env = Env::new("nonff");
         env.advance_origin();
         let moved = env.origin_main();
-        let err = Plan::new(&env.repo, "land", true)
+        let err = Plan::new(&env.repo, "land", true, &in_process)
             .err()
             .expect("a branch behind origin/main must be refused");
         assert!(format!("{err:#}").contains("not a fast-forward"), "{err:#}");
@@ -755,7 +837,7 @@ mod tests {
     fn failing_check_stops_before_the_push() {
         let env = Env::new("failing");
         let before = env.origin_main();
-        let plan = Plan::new(&env.repo, "land", true).unwrap();
+        let plan = Plan::new(&env.repo, "land", true, &in_process).unwrap();
         let stages = plan.stages();
         let check_fn = |_: &Path| -> Result<String> {
             bail!("check: FAILED 1 of 12 steps: drift; first error (drift): \"x\"")
@@ -769,6 +851,7 @@ mod tests {
         let line = plan.execute(
             &stages,
             &Runner {
+                edit: &no_edit,
                 check: &check_fn,
                 fetch: &fetch_fn,
                 cleanup: &cleanup_fn,
@@ -788,7 +871,7 @@ mod tests {
     fn passing_checks_land_and_clean_up() {
         let env = Env::new("landed");
         let head = git(Some(&env.wt), &["rev-parse", "HEAD"]).unwrap();
-        let plan = Plan::new(&env.repo, "land", true).unwrap();
+        let plan = Plan::new(&env.repo, "land", true, &in_process).unwrap();
         let check_fn = |_: &Path| -> Result<String> { Ok("check: ok (12 steps)".to_owned()) };
         let fetch_fn = |_: &Path| -> Result<()> { Ok(()) };
         // the cleanup child, run in this process: the stage must reach it through the runner
@@ -803,6 +886,7 @@ mod tests {
         let line = plan.execute(
             &stages,
             &Runner {
+                edit: &no_edit,
                 check: &check_fn,
                 fetch: &fetch_fn,
                 cleanup: &cleanup_fn,

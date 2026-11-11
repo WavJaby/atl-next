@@ -87,6 +87,19 @@ pub enum Pin {
 }
 
 impl Sources {
+    /// Whether a workspace requesting gates `wanted` (`workspace.toml` `fetch.for`) needs checkout `c`: core (no `[aosp.needed_by]` row, every git upstream, the manifest), else a listed gate requested, `all-gates` requesting every gate.
+    /// `None` = needed; `Some(gates)` = not requested, with the row's gates.
+    pub fn unrequested<'a>(&'a self, c: &Checkout, wanted: &[String]) -> Option<&'a [String]> {
+        let Pin::Aosp(path) = &c.pin else {
+            return None;
+        };
+        let gates = self.aosp.needed_by.get(path)?;
+        let hit = wanted
+            .iter()
+            .any(|w| w == crate::gate_goals::ALL || gates.contains(w));
+        (!hit).then_some(gates.as_slice())
+    }
+
     /// Upstream names as other tables reference them: each git upstream, plus `aosp`.
     pub fn upstream_names(&self) -> std::collections::BTreeSet<String> {
         self.git
@@ -413,6 +426,29 @@ mod tests {
         assert!(err(&row("cts", "\"deqp-gl\"")).contains("`deqp-gl` is not a gate"));
         assert!(err(&row("cts", "\"all-gates\"")).contains("`all-gates` is not a gate"));
         assert!(err(&row("cts", "\"cts\", \"cts\"")).contains("`cts` is listed twice"));
+    }
+
+    /// The needed set: a project with no needed_by row is core; a row's project is needed only when one of its gates, or `all-gates`, is requested.
+    #[test]
+    fn needed_set_follows_needed_by() {
+        let s = parse(&format!(
+            "{AOSP}cts = \"{SHA}\"\nbionic = \"{SHA}\"\n[aosp.needed_by]\ncts = [\"cts\", \"instrument\"]\n"
+        ))
+        .unwrap();
+        let all = s.checkouts(None);
+        let by = |p: &str| {
+            all.iter()
+                .find(|c| c.dir == std::path::Path::new("aosp").join(p))
+                .unwrap()
+        };
+        let w = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(s.unrequested(by("bionic"), &[]), None);
+        assert_eq!(s.unrequested(&s.manifest_checkout(), &[]), None);
+        let row = ["cts".to_owned(), "instrument".to_owned()];
+        assert_eq!(s.unrequested(by("cts"), &[]), Some(&row[..]));
+        assert_eq!(s.unrequested(by("cts"), &w(&["gl"])), Some(&row[..]));
+        assert_eq!(s.unrequested(by("cts"), &w(&["gl", "instrument"])), None);
+        assert_eq!(s.unrequested(by("cts"), &w(&["all-gates"])), None);
     }
 
     #[test]
