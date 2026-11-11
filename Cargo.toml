@@ -2,7 +2,7 @@
 
 [workspace]
 resolver = "3"
-members = ["xtask", "crates/*"]
+members = ["xtask", "xtask-harness", "crates/*"]
 
 [workspace.package]
 edition = "2024"
@@ -85,5 +85,6 @@ debug = "line-tables-only"
 
 # `cargo xtask` runs the dev profile; xtask's in-process scans (keepset over three ~700 MB build.ninja) are generic std code that opt-level 0 leaves ~3x slower.
 # Measured on 16 cores: keepset 20 s at 0, 10 s at 1, 7 s at 2; an xtask code edit rebuilds in 2 / 6 / 8 s. Only the xtask crate: its dependencies and every other crate keep dev's opt-level.
+# xtask-harness stays at 0: it is edited and rebuilt with every gate change, and its own code orchestrates processes and checks small outputs; the scans it calls are xtask's, optimised above.
 [profile.dev.package.xtask]
 opt-level = 2

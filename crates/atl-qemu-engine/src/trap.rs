@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! P1's hook (patches/qemu 0001): QEMU's aarch64 `cpu_loop` calls `atl_svc_hook(env, imm16)` on every `svc`; this strong definition replaces the patch's weak default.
 //! Answer: 0 handled (resume at pc, already past the svc), 1 leave this `cpu_loop` (a guest call returned), <0 not ours (QEMU's syscall path).
-//! Immediates: Linux ignores the svc immediate and bionic uses `svc #0`, so nonzero values in the 0x7a1x range are ours, and so is any immediate with bit 15 ([`BIND`]: a binding thunk, id = the low 15 bits). The guest fixture (xtask/testdata/qemu-spike/fixture.c) repeats them.
+//! Immediates: Linux ignores the svc immediate and bionic uses `svc #0`, so nonzero values in the 0x7a1x range are ours, and so is any immediate with bit 15 ([`BIND`]: a binding thunk, id = the low 15 bits). The guest fixture (xtask-harness/testdata/qemu-spike/fixture.c) repeats them.
 
 use std::cell::Cell;
 use std::ffi::{c_int, c_void};

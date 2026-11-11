@@ -477,12 +477,12 @@ impl<'a> Selection<'a> {
     }
 
     /// cargo `sub` on the selected packages
-    /// Links resolve the needs of converter libraries through the stage's dirs (binder::lib_env) as `-rpath-link`, link time only: those libraries carry no runpath (runpath_gate), and ld.bfd, unlike the converter's lld, wants every needed library's own needs found.
+    /// Links resolve the needs of converter libraries through the stage's dirs (crate::stage_env::lib_env) as `-rpath-link`, link time only: those libraries carry no runpath (runpath_gate), and ld.bfd, unlike the converter's lld, wants every needed library's own needs found.
     /// One global flag, not per-module build-script lines: `rustc-link-arg` reaches only its own package's links, never a dependent's.
     /// The list goes through a response file the link driver expands: rustflags enter every unit's hash, so the list itself in them kept a whole new unit tree per device set.
     /// cargo does not track the file, on purpose: -rpath-link only resolves needs at link time, nothing of it reaches the output, and a changed linked module reruns the build script (`link_lines`), so that relink reads the list written here.
     fn cargo(&self, sub: &str, target: &Path) -> Result<std::process::Command> {
-        let stage = crate::binder::lib_env(self.out)?
+        let stage = crate::stage_env::lib_env(self.out)?
             .into_iter()
             .map(|(_, v)| v)
             .collect::<Vec<_>>()
@@ -541,13 +541,13 @@ impl<'a> Selection<'a> {
     /// Same flags as `build`, its own target dir ([`test_target_dir`]). The converter's rlibs are device crates, built panic=abort, and stable libtest links only unwinding crates, so tests run with
     /// `-Z panic-abort-tests` as Soong builds device rust tests (build/soong/rust/test.go `compilerFlags`, under its global RUSTC_BOOTSTRAP). The bootstrap is set for this test build only:
     /// `build` and the clippy steps stay on stable, so an unstable feature in our code still fails there.
-    /// Test binaries run in the stage's library environment (binder::lib_env), as every runtime process: converter device libraries carry no runpath (runpath_gate), so their own needs are found only there.
+    /// Test binaries run in the stage's library environment (crate::stage_env::lib_env), as every runtime process: converter device libraries carry no runpath (runpath_gate), so their own needs are found only there.
     fn test(&self) -> Result<()> {
         let status = crate::unit_use::status(
             self.cargo("test", &test_target_dir(self.out))?
                 .args(["-Z", "panic-abort-tests", "--lib", "--bins"])
                 .env("RUSTC_BOOTSTRAP", "1")
-                .envs(crate::binder::lib_env(self.out)?),
+                .envs(crate::stage_env::lib_env(self.out)?),
         )
         .context("running cargo test (converter packages)")?;
         ensure!(status.success(), "tests of {} failed", self.names());

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The Rust half of `xtask test compositor` (xtask/testdata/compositor/java/CompositorTruth.java): atl-compositor's codecs against libgui's C++ on host ART. Test-only, never shipped.
+//! The Rust half of `xtask test compositor` (xtask-harness/testdata/compositor/java/CompositorTruth.java): atl-compositor's codecs against libgui's C++ on host ART. Test-only, never shipped.
 //! Java marshals SurfaceControl.Transactions with libgui's own writer; `checkTransaction` decodes those bytes (every one consumed), compares every value Java set, and re-encodes them byte-equal.
 //! `rustTransaction` / `rustCompleted` / `rustRelease` go the other way: atl-compositor's bytes, replayed by Java into a real Parcel, are read by libgui's C++ readers.
 //! A Java Parcel's data and object table are read through libbinder's C++ accessors (the NDK refuses to marshal a Parcel that holds objects).

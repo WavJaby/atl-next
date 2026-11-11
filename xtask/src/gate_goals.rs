@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The native goals each runtime gate reads, declared once in the gate's own module (`pub fn goals() -> Goals`) and listed by name in [`GATES`].
+//! The native goals each runtime gate reads, declared once here by gate name in [`GATES`] (the gates themselves live in xtask-harness; `native --for` must not link them).
 //! `xtask native --for <gate>[,<gate>]` builds their union; a gate's [`crate::build_state::gate_out`] refuses a slot whose record lacks one (built-from state + goals, build_state.rs),
 //! naming the missing goals and the `--for` command, so no gate discovers a missing input mid-run. The native-bridge guest is part of the same record (`nb:` goals), so stale `<out>/nb` is refused the same way.
 
@@ -62,33 +62,212 @@ pub fn nb_key(arch: &str, module: &str) -> String {
     format!("nb:{arch}:{module}")
 }
 
-/// A gate module's `goals`.
+/// AOSP Loader.cpp `load_wrapper`'s libraries: the GL fronts the converter builds; what atld_run's `with_gl_driver` places and the `gl-proxies` check reads.
+pub const GL_FRONTS: [&str; 4] = ["libEGL", "libGLESv1_CM", "libGLESv2", "libGLESv3"];
+/// ANGLE's three libraries: AOSP's Loader dlopens them by name in the default namespace when an app's GL selection is ANGLE (Loader.cpp `load_angle`), so they are placed beside the fronts.
+pub const ANGLE_FRONTS: [&str; 3] = ["libEGL_angle", "libGLESv1_CM_angle", "libGLESv2_angle"];
+/// The extractor plugins atld_run's `platform_rows` places: every atld run reads them, so [`runtime`] builds them.
+pub const EXTRACTOR_PLUGINS: [&str; 2] = ["liboggextractor", "libwavextractor"];
+/// Framework JNI libraries an app loads by name (`System.loadLibrary`): libsoundpool (SoundPool.java:119) and libmedia_jni (MediaPlayer.java:623), built as AOSP's source as-is. Their closures build with them; stage_art links every built `device/<module>/*.so` into the ART lib dir, which atld's LD_LIBRARY_PATH names, so no placement row is needed.
+pub const FRAMEWORK_JNI: [&str; 2] = ["libsoundpool", "libmedia_jni"];
+/// The native-bridge guest's linker and main executable (NBS modules; `app_process64` = argv[1] of the guest linker, atl-native-bridge engine/mod.rs).
+pub const NB_LINKER: &str = "native_bridge_guest_linker";
+pub const NB_EXE: &str = "native_bridge_guest_app_process";
+/// The guest libraries `app_process64`'s closure needs (its and their `DT_NEEDED`), by module: NBS's guest libc and linker helpers, AOSP's guest libcutils / libutils / liblog (NBS `NATIVE_BRIDGE_ORIG_GUEST_LIBS`), the GL / window proxies (`libnative_bridge_guest_*`, installed under their stems) that route GL calls to the host fronts (GS2), AOSP's guest zlib and libstdc++ (C12: DT_NEEDED of the legacy fixture, not of app_process), and the NDK proxies libandroid, libandroid_runtime and libjnigraphics (C3: DT_NEEDED of the fixtures' asset and bitmap calls), and the vdso. libc++.so comes from the runtimes build (runtimes.rs `shared_libcxx`). Installed file names: atld_run `nb_lib_file`.
+pub const NB_GUEST_LIBS: [&str; 21] = [
+    "libnative_bridge_guest_libc",
+    "libm",
+    "libdl",
+    "ld-android",
+    "liblog",
+    "libbase",
+    "libvndksupport",
+    "libdl_android",
+    "libcutils",
+    "libutils",
+    "libz",
+    "libstdc++",
+    "libnative_bridge_guest_libEGL",
+    "libnative_bridge_guest_libGLESv1_CM",
+    "libnative_bridge_guest_libGLESv2",
+    "libnative_bridge_guest_libGLESv3",
+    "libnative_bridge_guest_libnativewindow",
+    "libnative_bridge_guest_libandroid",
+    "libnative_bridge_guest_libandroid_runtime",
+    "libnative_bridge_guest_libjnigraphics",
+    "libnative_bridge_vdso",
+];
+
+/// What every atld run (atld_run `Runtime`) reads: ART and its boot jars' JNI libraries, servicemanager, framework-res, the converter crates the service packages link (packages.rs), and the Codec2 store's libraries (codec2_store.rs: its constructor dlopens each one in every app process that decodes).
+pub fn runtime() -> Goals {
+    Goals::host(&[
+        "servicemanager",
+        "framework-res",
+        "platform-bootclasspath",
+        // the APEX jars' JNI libraries (libframework-connectivity-tiramisu-jni: TrafficStats' static init aborts ZygoteInit without it)
+        "platform-bootclasspath-jni",
+        "libart",
+        "libnativehelper",
+        "libjavacore",
+        "libopenjdk",
+        "libicu_jni",
+        "libandroid_runtime",
+        "libandroid",
+        "libjnigraphics",
+        "libsigchain",
+        "libbinder",
+        "libutils",
+        "libinput",
+        "libbinder_rs",
+        "libatl_parcelables",
+        "atl-aidl-stubs-rust",
+        "libgui_aidl_types_rs",
+        "librustutils",
+    ])
+    .with(Goals::host(&EXTRACTOR_PLUGINS))
+    .with(Goals::host(&FRAMEWORK_JNI))
+    .with(Goals::codec_store())
+}
+
+/// atld_run `with_gralloc` + `with_gl_driver`: the allocator HAL's AIDL crate and the GL fronts.
+pub fn gralloc() -> Goals {
+    Goals::host(&GL_FRONTS)
+        .with(Goals::host(&ANGLE_FRONTS))
+        .with(Goals::host(&[
+            "android.hardware.graphics.allocator-V2-rust",
+        ]))
+}
+
+/// atld_run `with_native_bridge_guest`: the guest linker, app_process and [`NB_GUEST_LIBS`], plus the host side that loads them.
+pub fn nb_guest() -> Goals {
+    let mut nb = vec![NB_LINKER, NB_EXE];
+    nb.extend(NB_GUEST_LIBS);
+    Goals::nb(&nb).with(Goals::host(&["libnativeloader", "libnativebridge"]))
+}
+
+/// `xtask test app` (and run-apk, audio-app, drive): atl-audio-bridge (the server's mixer, game audio A2) links AudioMixerBase's library and the utilities its gain conversion uses; the launcher builds it in every app run.
+fn app() -> Goals {
+    runtime()
+        .with(gralloc())
+        .with(nb_guest())
+        .with(Goals::host(&["libaudioprocessing_base", "libaudioutils"]))
+}
+
+fn runtime_gralloc() -> Goals {
+    runtime().with(gralloc())
+}
+
+fn window() -> Goals {
+    runtime_gralloc().with(nb_guest())
+}
+
+fn binder() -> Goals {
+    Goals::host(&[
+        "servicemanager",
+        "service",
+        "atl-aidl-stubs-rust",
+        "libbinder_rs",
+        "libatl_parcelables",
+    ])
+}
+
+/// Host ART with the boot classpath and its JNI libraries: what nb-isa runs, and native-load's base.
+const HOST_ART: [&str; 8] = [
+    "platform-bootclasspath",
+    "libart",
+    "libnativehelper",
+    "libjavacore",
+    "libopenjdk",
+    "libicu_jni",
+    "libandroid_runtime",
+    "libsigchain",
+];
+
+fn native_load() -> Goals {
+    Goals::host(&HOST_ART)
+        .with(Goals::host(&[
+            "servicemanager",
+            "service",
+            "libcodec2_aidl_noisurface",
+            "libresourcemanagerservice",
+            "liboggextractor",
+            "libwavextractor",
+            "libmedia_jni",
+        ]))
+        .with(Goals::codec_store())
+}
+
+fn instrument() -> Goals {
+    runtime().with(Goals::host(&[
+        "am",
+        "android.test.runner.impl",
+        "android.test.base.impl",
+        "android.test.mock.impl",
+    ]))
+}
+
+/// The NDK libraries with guest proxies (C3): the NativeBridge core loads their host side from SYSTEM_LIB (bindings.rs `Host::System`), atld_run places it there, and the `gl-proxies` step checks them beside the GL fronts.
+pub const NDK_PROXIED: [&str; 2] = ["libandroid", "libjnigraphics"];
+
+/// What the `gl-proxies` step checks: GL fronts then [`NDK_PROXIED`], each a host library at atld_run `gl_front`.
+pub fn gl_proxied() -> Vec<&'static str> {
+    GL_FRONTS.iter().copied().chain(NDK_PROXIED).collect()
+}
+
+/// The checked libraries and their guest proxies (`libnative_bridge_guest_<lib>`).
+fn gl_proxies() -> Goals {
+    let libs = gl_proxied();
+    let proxies: Vec<String> = libs
+        .iter()
+        .map(|f| format!("libnative_bridge_guest_{f}"))
+        .collect();
+    let proxies: Vec<&str> = proxies.iter().map(String::as_str).collect();
+    Goals::host(&libs).with(Goals::nb(&proxies))
+}
+
+/// A gate's goals.
 type GoalsOf = fn() -> Goals;
 
-/// Every gate that reads a native out dir: `xtask test <name>`, `xtask run-apk`, and the `xtask check` steps that read built files.
+/// Every gate that reads a native out dir: `xtask test <name>`, `xtask run-apk`, and the `xtask check` steps that read built files. Declared here, not in the gates' own modules: `xtask native --for` (bootstrap) reads them, and the gates live in xtask-harness.
 pub const GATES: &[(&str, GoalsOf)] = &[
-    ("app", crate::app::goals),
-    ("audio-app", crate::audio_app::goals),
-    ("binder", crate::binder::goals),
-    ("broadcast", crate::broadcast::goals),
-    ("provider", crate::provider::goals),
-    ("composer", crate::composer::goals),
-    ("compositor", crate::compositor::goals),
-    ("drive", crate::drive_gate::goals),
-    ("cts", crate::cts::goals),
-    ("gl", crate::gl_probe::goals),
-    ("gl-dispatch", crate::gl_dispatch::goals),
-    ("gl-proxies", crate::gl_proxies::goals),
-    ("gles2-fixture", crate::gles2_fixture::goals),
-    ("gralloc", crate::gralloc::goals),
-    ("instrument", crate::instrument::goals),
-    ("native-load", crate::native_load::goals),
-    ("nb-isa", crate::nb_isa::goals),
-    ("parcel", crate::parcel::goals),
-    ("run-apk", crate::run_apk::goals),
-    ("sandbox", crate::sandbox::goals),
-    ("sensors", crate::sensors::goals),
-    ("window", crate::window::goals),
+    ("app", app),
+    ("audio-app", app),
+    ("binder", binder),
+    ("broadcast", runtime),
+    ("provider", runtime),
+    ("composer", runtime_gralloc),
+    ("compositor", || {
+        Goals::host(&["servicemanager", "service", "libgui"]).with(native_load())
+    }),
+    ("drive", app),
+    ("cts", instrument),
+    ("gl", runtime_gralloc),
+    ("gl-dispatch", || Goals::host(&["libEGL", "libGLESv2"])),
+    ("gl-proxies", gl_proxies),
+    ("gles2-fixture", Goals::default),
+    ("gralloc", || {
+        Goals::host(&[
+            "servicemanager",
+            "service",
+            "libnativewindow",
+            "libui",
+            "android.hardware.graphics.allocator-V2-rust",
+        ])
+    }),
+    ("instrument", instrument),
+    ("native-load", native_load),
+    ("nb-isa", || Goals::host(&HOST_ART)),
+    ("parcel", || {
+        native_load().with(Goals::host(&[
+            "libbinder_rs",
+            "libatl_parcelables",
+            "atl-aidl-stubs-rust",
+        ]))
+    }),
+    ("run-apk", app),
+    ("sandbox", Goals::default),
+    ("sensors", runtime_gralloc),
+    ("window", window),
 ];
 
 /// The goals of gate `name`, expanded ([`resolve`]).

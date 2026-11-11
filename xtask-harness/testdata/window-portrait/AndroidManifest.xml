@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- `xtask test window`, stage portrait: the window fixture (java/ links to it), fixed to portrait and resizeable. Its opening size is AOSP's size for a portrait app on the landscape gate output (portrait_expected, xtask-harness/src/window.rs). -->
+
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.atlwindow"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
+
+    <application android:label="ATL window test">
+        <activity android:name=".Main" android:exported="true" android:hardwareAccelerated="false"
+            android:screenOrientation="portrait" android:resizeableActivity="true"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

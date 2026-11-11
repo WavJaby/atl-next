@@ -1,120 +1,74 @@
 // SPDX-License-Identifier: MIT
-//! `cargo xtask` -- the single build/check driver of this repo. Read-only or dry-run by default. The binary (main.rs) only calls `cli::main`.
+//! `cargo xtask` -- the single build/check driver of this repo, the bootstrap tool: links only definition crates (no product crate, no build script reading fetched trees), so it builds in a fresh checkout. Read-only or dry-run by default. The binary (main.rs) only calls `cli::main`.
+//! The runtime gates (`test`, `run-apk`, `remote`) live in xtask-harness, which links this library and the product; `cli` passes those commands through to it.
 #![forbid(unsafe_code)]
 // Terminal output is this tool's product, not logging.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 #![expect(
     clippy::disallowed_types,
-    reason = "a build tool: it runs compilers, git and test drivers on the host; the runtime processes of its gates start through atl_broker"
+    reason = "a build tool: it runs compilers, git and cargo on the host"
 )]
 
-mod android_paths;
-mod aosp;
-mod apk_sig;
-mod app;
-mod app_imports;
-mod arches;
-mod atld_run;
-mod audio_app;
-mod audio_pcm;
-mod binder;
-mod broadcast;
-mod build_pool;
-mod build_state;
-mod bwrap_flags;
-mod cdylib;
-mod check;
-mod codec2_store;
-mod composer;
-mod compositor;
-mod converter;
-mod cross;
-mod crossing;
-mod cts;
-mod cts_report;
-mod cts_table;
-mod deps;
-mod drive;
-mod drive_gate;
-mod egl_driver;
-mod fetch;
-mod gate_goals;
-mod gdk_dmabuf;
-mod git;
-mod git_dirs;
-mod gl_dispatch;
-mod gl_probe;
-mod gl_proxies;
-mod gl_scene;
-mod gles2_fixture;
-mod gralloc;
-mod host_art;
-mod host_disk;
-mod instrument;
-mod isa_gate;
-mod jni_fixture;
-mod keepset;
-mod land;
-mod libcxx_gate;
-mod licence_gate;
-mod licenses;
-mod manifest;
-mod modules;
-mod native;
-mod native_load;
-mod nb_identity;
-mod nb_isa;
-mod ndk_surface;
-mod nested_wayland;
-mod none_gate;
-mod notice;
-mod observe;
-mod packages;
-mod par;
-mod parcel;
-mod patch;
-mod platform_ui;
-mod provided_gate;
-mod provider;
-mod providers;
-mod prune;
-mod qemu;
-mod qemu_abi;
-mod qemu_gate;
-mod qemu_gl;
-mod qemu_jni;
-mod qemu_linker;
-mod qemu_spike;
-mod qemu_thread;
-mod remote;
-mod run_apk;
-mod runpath_gate;
-mod runtimes;
-mod sandbox;
-mod screencopy;
-mod seam_gate;
-mod sensors;
-mod service_mirrors;
-mod services;
-mod slot;
-mod slot_prune;
-mod soong;
-mod sources;
-mod spdx;
-mod system;
-mod test_apks;
-mod test_fonts;
-mod timing;
-mod tree;
-mod tree_gate;
-mod triage;
-mod unit_use;
-mod upstream;
-mod verdict;
-mod wayland_proxy;
-mod window;
-mod workspace;
-mod ws_config;
+pub mod android_paths;
+pub mod aosp;
+pub mod apk_sig;
+pub mod arches;
+pub mod build_pool;
+pub mod build_state;
+pub mod bwrap_flags;
+pub mod cdylib;
+pub mod check;
+pub mod codec2_store;
+pub mod converter;
+pub mod cross;
+pub mod cts_table;
+pub mod deps;
+pub mod fetch;
+pub mod gate_goals;
+pub mod git;
+pub mod git_dirs;
+pub mod harness;
+pub mod host_art;
+pub mod host_disk;
+pub mod isa_gate;
+pub mod keepset;
+pub mod land;
+pub mod libcxx_gate;
+pub mod licence_gate;
+pub mod licenses;
+pub mod modules;
+pub mod native;
+pub mod ndk;
+pub mod ndk_surface;
+pub mod none_gate;
+pub mod notice;
+pub mod packages;
+pub mod par;
+pub mod patch;
+pub mod provided_gate;
+pub mod providers;
+pub mod prune;
+pub mod qemu;
+pub mod runpath_gate;
+pub mod runtimes;
+pub mod seam_gate;
+pub mod service_mirrors;
+pub mod slot;
+pub mod slot_prune;
+pub mod soong;
+pub mod sources;
+pub mod spdx;
+pub mod stage_env;
+pub mod system;
+pub mod test_apks;
+pub mod timing;
+pub mod tree;
+pub mod triage;
+pub mod unit_use;
+pub mod upstream;
+pub mod verdict;
+pub mod workspace;
+pub mod ws_config;
 
 pub mod cli;
 
@@ -123,12 +77,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 /// `cargo` of the pinned toolchain: `CARGO` is set by `cargo run`.
-fn cargo_command() -> std::process::Command {
+pub fn cargo_command() -> std::process::Command {
     std::process::Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
 }
 
 /// The checkout the command runs in (main repo or worktree): the git toplevel of the cwd. Not the checkout that compiled the binary; a binary built in main also runs in worktrees.
-fn checkout_root() -> Result<PathBuf> {
+pub fn checkout_root() -> Result<PathBuf> {
     toplevel_in(&std::env::current_dir().context("reading the current directory")?)
 }
 

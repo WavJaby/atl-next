@@ -29,7 +29,6 @@ pub struct Arch {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[expect(dead_code, reason = "read by xtask deps/fetch/build, not written yet")]
 pub struct Host {
     pub rust: String,
     pub meson_cpu_family: String,

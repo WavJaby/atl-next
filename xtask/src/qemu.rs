@@ -19,7 +19,7 @@ use crate::arches;
 use crate::build_pool;
 use crate::deps;
 use crate::git::git;
-use crate::jni_fixture::{self, NdkTarget};
+use crate::ndk::{self, NdkTarget};
 use crate::patch;
 use crate::slot;
 use crate::sources;
@@ -123,7 +123,7 @@ pub fn plan(root: &Path, arch: &str, out: Option<&Path>, pic: bool) -> Result<Bu
     let arches = arches::load(root)?;
     let target = arches::qemu_target(&arches, arch)?.to_owned();
     let (src, version) = pinned(root)?;
-    let ndk = jni_fixture::default_ndk(root)?;
+    let ndk = ndk::default_ndk(root)?;
     let guest_cc = NdkTarget::new(root, &ndk, arch, GUEST_API)?
         .wrapper()
         .to_owned();

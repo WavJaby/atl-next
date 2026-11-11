@@ -841,7 +841,7 @@ pub fn nb_module_dir(out: &Path, arch: &str, m: &str) -> PathBuf {
 /// Do not share one socket across builds or views.
 /// The on-disk entries stay shared: sccache 0.10 c.rs `hash_key` keys on compiler digest + common/arch args (-D yes, -I/-isystem no) + 7 whitelisted env vars + the preprocessed text, so a differing patched file gives a differing key.
 #[derive(Debug, PartialEq)]
-pub(crate) struct CompilerCache {
+pub struct CompilerCache {
     launcher: String,
     dir: PathBuf,
     socket: PathBuf,
@@ -865,7 +865,7 @@ impl CompilerCache {
     }
 
     /// A new cache in `dir` of limit `size` as seen from source view `view` (task-bind gate: a scratch dir). Its server is shared with no other cache.
-    pub(crate) fn for_view(launcher: &str, dir: PathBuf, view: &str, size: String) -> Self {
+    pub fn for_view(launcher: &str, dir: PathBuf, view: &str, size: String) -> Self {
         Self {
             size,
             launcher: launcher.into(),
@@ -892,7 +892,7 @@ impl CompilerCache {
     }
 
     /// The environment of every sccache client ninja runs; the first one starts the server with it.
-    pub(crate) fn env(&self) -> [(&'static str, std::ffi::OsString); 4] {
+    pub fn env(&self) -> [(&'static str, std::ffi::OsString); 4] {
         [
             ("SCCACHE_DIRECT", "false".into()),
             ("SCCACHE_DIR", self.dir.clone().into()),
@@ -904,7 +904,7 @@ impl CompilerCache {
     /// Connects to the server on this cache's socket, starting one when none answers: `--show-stats` does both (measured: with no server it starts one, with one it only reports).
     /// `--start-server` is not called: on a live socket it starts a second server that takes the socket and orphans the first (measured: every run left one behind).
     /// sccache has no fallback to a plain compile when its server cannot start or its dir is unwritable (measured: every compile fails), so that fails here, once, naming the way out.
-    pub(crate) fn start(&self) -> Result<()> {
+    pub fn start(&self) -> Result<()> {
         std::fs::create_dir_all(&self.dir)
             .with_context(|| format!("creating the compiler cache {}", self.dir.display()))?;
         let out = Command::new(&self.launcher)

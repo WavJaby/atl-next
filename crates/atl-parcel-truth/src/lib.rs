@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! JNI library of `xtask test parcel` (ParcelTruth.java, xtask/testdata/parcel): `roundTrip(class, bytes, mode)` decodes a Java Parcel's marshalled bytes with atl-parcelables' codec of
+//! JNI library of `xtask test parcel` (ParcelTruth.java, xtask-harness/testdata/parcel): `roundTrip(class, bytes, mode)` decodes a Java Parcel's marshalled bytes with atl-parcelables' codec of
 //! that class, requires every byte consumed, re-encodes, and returns the bytes; `lastError()` says why it returned null; `refused()` lists atl-parcelables' refusal counters.
 //! Bytes enter and leave AOSP's C++ Parcel through libbinder_ndk's AParcel_unmarshal / AParcel_marshal, the libbinder_rs parcel the codecs work on. Test-only, never shipped.
 //! `roundTripParcel(class, in, out)` and `rustHasFileDescriptors(class, in)` work on Java `Parcel` objects themselves (AParcel_fromJavaParcel: a view of the Parcel's android::Parcel), since marshalled bytes carry no binder or descriptor objects.

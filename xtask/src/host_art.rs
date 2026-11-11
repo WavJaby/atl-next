@@ -34,7 +34,7 @@ pub struct HostArt {
     /// The staged ART's library dir, every run's LD_LIBRARY_PATH (stage_art).
     pub lib_path: PathBuf,
     pub launcher: PathBuf,
-    property_service: PathBuf,
+    pub property_service: PathBuf,
     /// The converter's build.prop, the property service's input.
     pub build_prop: PathBuf,
     pub boot: Vec<PathBuf>,
@@ -326,23 +326,6 @@ impl HostArt {
     }
 }
 
-impl HostArt {
-    /// What the runtime reads from the staged ART: its tree and library dir (whole, remote.rs `Inputs`), the launcher, the property service's input and the boot jars.
-    pub fn runtime_inputs(&self) -> crate::remote::Inputs {
-        crate::remote::Inputs {
-            files: [
-                self.launcher.clone(),
-                self.property_service.clone(),
-                self.build_prop.clone(),
-            ]
-            .into_iter()
-            .chain(self.boot.iter().cloned())
-            .collect(),
-            dirs: vec![self.art.clone(), self.lib_path.clone()],
-        }
-    }
-}
-
 /// The lib dirs of the providers `xtask native` built outside the tree: `<out>/crates/<crate>/lib`, `<out>/upstream/<name>/prefix/lib`.
 fn provided_lib_dirs(out: &Path) -> Result<Vec<PathBuf>> {
     let mut dirs = Vec::new();
@@ -473,7 +456,7 @@ pub fn output(cmd: &mut Command, what: &str) -> Result<String> {
 }
 
 /// [`PROPERTY_SERVICE`], release, in the cargo target dir `target` (cargo's own staleness check: a no-op when current); its path.
-pub(crate) fn build_property_service(root: &Path, target: &Path) -> Result<PathBuf> {
+pub fn build_property_service(root: &Path, target: &Path) -> Result<PathBuf> {
     crate::unit_use::exec(
         crate::cargo_command()
             .current_dir(root)

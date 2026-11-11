@@ -10,19 +10,12 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 atl-android-paths = { path = "../crates/atl-android-paths" }
-atl-bridgegen = { path = "../crates/atl-bridgegen" }
-atl-broker = { path = "../crates/atl-broker" }
 atl-bwrap = { path = "../crates/atl-bwrap" }
-atl-cpu-pressure = { path = "../crates/atl-cpu-pressure" }
-atl-gralloc = { path = "../crates/atl-gralloc" }
 atl-fonts-table = { path = "../crates/atl-fonts-table" }
 atl-layout = { path = "../crates/atl-layout" }
-atl-native-bridge = { path = "../crates/atl-native-bridge" }
-atl-platform-host = { path = "../crates/atl-platform-host" }
 atl-services-types = { path = "../crates/atl-services-types" }
 clap.workspace = true
 object.workspace = true
-png.workspace = true
 roxmltree.workspace = true
 rustix.workspace = true
 serde.workspace = true
@@ -31,7 +24,6 @@ sha2.workspace = true
 spdx.workspace = true
 toml.workspace = true
 toml_edit.workspace = true
-read-fonts.workspace = true
 
 [lints]
 workspace = true

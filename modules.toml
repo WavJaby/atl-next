@@ -246,7 +246,15 @@ uses = ["android-paths"]
 crates = ["atl-fonts-table"]
 exports = ["atl-fonts-table"]
 
+# the bootstrap tool (`cargo xtask`): fetch, native, check and the other non-runtime commands; definition crates only, so it builds in a fresh checkout. Its library is what the harness reuses (layout, slots, build records, native goals, verdict lines)
 [xtask]
 crates = ["xtask"]
-# broker: its control protocol, mounts and launcher, used by the runtime gates; bwrap: the build-tree namespace's argv (tree.rs); services-types: the package manifest records xtask writes for atld, and gl-drivers.toml's parser (step tables); gralloc: the VINTF declarations and mapper library name the gralloc gate and atld share; native-bridge: its library name, staged for atld runs, and its `isSupported` classifier the jni-fixture gate runs on the fixture; android-paths: the guest paths of the records it writes and the roots its android-paths check step scans for; fonts-table: the tables step checks fonts.toml; cpu-pressure: the cadence window's starvation share (judge_window); generators: the aarch64 thunk-pool emitter (atl_bridgegen::aarch64) writes the QEMU spike fixture's pool, and the spike check reads it back
-uses = ["layout", "broker", "bwrap", "services-types", "gralloc", "platform-host", "native-bridge", "android-paths", "fonts-table", "cpu-pressure", "generators"]
+exports = ["xtask"]
+# bwrap: the build-tree namespace's argv (tree.rs); services-types: the package manifest records xtask writes for atld, and gl-drivers.toml's parser (step tables); android-paths: the roots its android-paths check step scans for; fonts-table: the tables step checks fonts.toml
+uses = ["layout", "bwrap", "services-types", "android-paths", "fonts-table"]
+
+# the runtime harness: `cargo xtask test|run-apk|remote` and the check steps that need product logic (gl-proxies), run by xtask as a process
+[xtask-harness]
+crates = ["xtask-harness"]
+# xtask: its library; broker: its control protocol, mounts and launcher, used by the runtime gates; bwrap: the task-bind gate's namespace argv; services-types: the package manifest records the gates write for atld; gralloc: the VINTF declarations and mapper library name the gralloc gate and atld share; native-bridge: its library name, staged for atld runs, its binding table (step gl-proxies) and its `isSupported` classifier the jni-fixture gate runs on the fixture; android-paths: the guest paths of the records it writes; platform-host: the app sandbox's access and the PipeWire socket; cpu-pressure: the cadence window's starvation share (judge_window); generators: the aarch64 thunk-pool emitter (atl_bridgegen::aarch64) writes the QEMU spike fixture's pool, and the spike check reads it back
+uses = ["xtask", "layout", "broker", "bwrap", "services-types", "gralloc", "platform-host", "native-bridge", "android-paths", "cpu-pressure", "generators"]

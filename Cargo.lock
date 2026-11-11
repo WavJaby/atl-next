@@ -2595,11 +2595,32 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "atl-android-paths",
+ "atl-bwrap",
+ "atl-fonts-table",
+ "atl-layout",
+ "atl-services-types",
+ "clap",
+ "object",
+ "roxmltree",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "spdx",
+ "toml",
+ "toml_edit",
+]
+
+[[package]]
+name = "xtask-harness"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atl-android-paths",
  "atl-bridgegen",
  "atl-broker",
  "atl-bwrap",
  "atl-cpu-pressure",
- "atl-fonts-table",
  "atl-gralloc",
  "atl-layout",
  "atl-native-bridge",
@@ -2614,9 +2635,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "spdx",
  "toml",
- "toml_edit",
+ "xtask",
 ]
 
 [[package]]

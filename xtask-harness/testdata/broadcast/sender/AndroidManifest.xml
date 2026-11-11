@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- `xtask test broadcast`: the launched app. It holds BROADCAST_STICKY (a normal permission, install-granted on request); xtask-harness/src/broadcast.rs lists what it checks. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.atlbcast"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
+    <uses-permission android:name="android.permission.BROADCAST_STICKY" />
+
+    <application android:label="ATL broadcast sender">
+        <!-- no window and no hardware rendering: the gate is about broadcasts; a hardware-accelerated activity makes ActivityThread.handleLaunchActivity preload HWUI (HardwareRenderer.preload), whose EGL
+             context this run's GPU setup does not provide, and its RenderThread aborts the process before the receivers run -->
+        <activity android:name=".Main" android:exported="true"
+            android:hardwareAccelerated="false"
+            android:theme="@android:style/Theme.NoDisplay">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
