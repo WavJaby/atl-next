@@ -283,6 +283,45 @@ __attribute__((noinline)) u64 fx_guard_store(u64 addr) {
     return T_SURVIVED;
 }
 
+// (u) attach while a parent runs: fx_churn() is the parent's loop. Iteration i: fill U_WORDS stack words with U_PATTERN + i; mmap a fresh RWX page (guest mmap -> QEMU mmap_lock + page flags), write `movz x0, #(i & 0xffff); ret` there and call it (a translation on that page), munmap it (TB invalidation of the page); fx_sum(U_N) through the guest call path; then CALL(i): the host answers 1 to go on, 0 to stop. Any wrong value, failed mmap/munmap or changed stack word counts one in the result, so an undisturbed loop returns 0.
+#define U_WORDS 512
+#define U_PATTERN 0x75000000000ull
+#define U_N 1000ull
+#define MOVZ_X0 0xd2800000u
+#define RET 0xd65f03c0u
+__attribute__((noinline)) u64 fx_churn(void) {
+    volatile u64 buf[U_WORDS];
+    u64 bad = 0;
+    for (u64 i = 0;; i++) {
+        for (u64 k = 0; k < U_WORDS; k++) {
+            buf[k] = U_PATTERN + i + k;
+        }
+        uint32_t *code = mmap(0, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (code == MAP_FAILED) {
+            bad++;
+        } else {
+            code[0] = MOVZ_X0 | (uint32_t)((i & 0xffff) << 5);
+            code[1] = RET;
+            __builtin___clear_cache((char *)code, (char *)(code + 2));
+            bad += ((u64(*)(void))code)() != (i & 0xffff);
+            bad += munmap(code, 4096) != 0;
+        }
+        bad += fx_sum(U_N) != U_N * (U_N - 1) / 2;
+        u64 go = call_host(i);
+        for (u64 k = 0; k < U_WORDS; k++) {
+            bad += buf[k] != U_PATTERN + i + k;
+        }
+        if (!go) {
+            return bad;
+        }
+    }
+}
+
+// (u) fx_sp(): the sp the call runs on, before any frame of its own; a child checks it is inside its own stack before it writes 64 KiB there.
+__attribute__((naked, noinline)) u64 fx_sp(void) {
+    __asm__ volatile("mov x0, sp\n\tret");
+}
+
 // The gate table, read by the host (crates/atl-qemu-engine/tests/spike.rs `t`): u64 words, in this order.
 static const u64 table[] = {
     // 0..3: entry points
@@ -316,6 +355,8 @@ static const u64 table[] = {
     (u64)fx_stack_fill, S_WORDS,
     // 42..43: (t) fx_guard_store and its return when the store did not fault
     (u64)fx_guard_store, T_SURVIVED,
+    // 44..45: (u) fx_churn, the parent's loop; fx_sp, a child's entry sp
+    (u64)fx_churn, (u64)fx_sp,
 };
 
 int main(void) {

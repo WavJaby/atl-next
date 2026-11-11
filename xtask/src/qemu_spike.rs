@@ -35,8 +35,8 @@ const CPU_LOOP: &str = "linux-user/aarch64/cpu_loop.c";
 const UACCESS: &str = "linux-user/uaccess.c";
 const QEMU_H: &str = "linux-user/qemu.h";
 const PACKAGE: &str = "atl-qemu-engine";
-const GATES: [char; 18] = [
-    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 's', 't',
+const GATES: [char; 19] = [
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 's', 't', 'u',
 ];
 /// Thunk slots in the fixture's pool, as the NB pool is sized (atl-native-bridge build.rs: stub rows + fixed bindings + JNI slots, rounded to a power of two; 3860 + 6 + 256 > 4096). Gate (l) uses the last slot, 8191.
 const POOL_SLOTS: u32 = 8192;
@@ -327,6 +327,15 @@ const RUNS: &[RunSpec] = &[
         base: "0",
         engine_break: Some("no-guard"),
         red: Some('t'),
+    },
+    // gate (u): a child attached while the parent runs copies the parent's live CPU and sp, so its frames sit outside its own stack
+    RunSpec {
+        name: "copy-caller",
+        swap: None,
+        pool_skew: false,
+        base: "0",
+        engine_break: Some("copy-caller"),
+        red: Some('u'),
     },
 ];
 

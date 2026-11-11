@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
-//! Spike gates (QEMU bridge plan Q2/Q3, Q5-2), harness-less: `start` boots QEMU on its helper thread, whose BOOT trap runs gates (a)-(l) there and parks; the host threads then run (n), (m), (o), (p) on their own guest CPUs, and the process exits 0 when every gate is ok.
+//! Spike gates (QEMU bridge plan Q2/Q3, Q5-2), harness-less: `start` boots QEMU on its helper thread, whose BOOT trap runs gates (a)-(l) there and parks; the host threads then run (n), (u), (m), (o), (p), (s), (t) on their own guest CPUs, and the process exits 0 when every gate is ok.
 //! Env (xtask qemu_spike.rs sets it; without it the run prints SKIP): `ATL_QEMU_SPIKE_SO` = the spike library, `ATL_QEMU_SPIKE_FIXTURE` = the static guest program, `ATL_QEMU_SIGCHAIN_OBJ` = AOSP libsigchain's object (build.rs links it and sets cfg `atl_qe_sigchain`). Args: `--guest-base <n>` (QEMU's `-B`, default 0 = identity).
 //! Expected values come from the fixture's table (fixture.c), never from the engine. One line per gate: `spike: (x) ok` or `spike: (x) FAIL <why>`.
-//! Gates: (a) trap arguments, (b) nested host/guest calls, (c) host memory, (d) guest store fault, (e) host fault order behind sigchain, (h) implicit null check through sigchain, (f) write into translated code, (g) second guest thread, (i) fatal guest fault on one thread, (j) the same on a second thread (both end by SIGSEGV), (k) host fault with previous action SIG_IGN (ends by SIGSEGV), (l) binding thunks from the guest pool (bit 15 of the svc immediate, id = slot); (n) helper boot: `start` returned with the BOOT answer, the helper stays parked, the creator thread attaches and calls; (m) two host threads attach at once and call concurrently, each with its own thread pointer and syscalls; (o) a write(2) on host heap memory, accepted under identity mapping (access_ok patch 0002), (p) a write straddling a QEMU-mapped page into host memory QEMU does not map; (s) four attached threads fill their guest stacks across one barrier and find their own words intact; (t) a guest store into the guard page below an attached CPU's stack is a guest SIGSEGV at that address (forked child).
+//! Gates: (a) trap arguments, (b) nested host/guest calls, (c) host memory, (d) guest store fault, (e) host fault order behind sigchain, (h) implicit null check through sigchain, (f) write into translated code, (g) second guest thread, (i) fatal guest fault on one thread, (j) the same on a second thread (both end by SIGSEGV), (k) host fault with previous action SIG_IGN (ends by SIGSEGV), (l) binding thunks from the guest pool (bit 15 of the svc immediate, id = slot); (n) helper boot: `start` returned with the BOOT answer, the helper stays parked, the creator thread attaches and calls; (m) two host threads attach at once and call concurrently, each with its own thread pointer and syscalls; (o) a write(2) on host heap memory, accepted under identity mapping (access_ok patch 0002), (p) a write straddling a QEMU-mapped page into host memory QEMU does not map; (s) four attached threads fill their guest stacks across one barrier and find their own words intact; (t) a guest store into the guard page below an attached CPU's stack is a guest SIGSEGV at that address (forked child); (u) 50 host threads attach, call and detach while another attached thread's guest loop churns guest mmap/munmap, translation and host calls (deadline: a hang prints FAIL).
 #![allow(clippy::print_stdout, reason = "test harness output is its verdict")]
 
 #[cfg(feature = "qemu")]
@@ -61,7 +61,9 @@ mod spike {
         pub const S_WORDS: usize = 41;
         pub const GUARD_STORE: usize = 42;
         pub const T_SURVIVED: usize = 43;
-        pub const LEN: usize = 44;
+        pub const CHURN: usize = 44;
+        pub const SP: usize = 45;
+        pub const LEN: usize = 46;
     }
 
     /// What the host answers a CALL with during gate (a): any value the guest cannot produce itself.
@@ -81,6 +83,15 @@ mod spike {
     const S_THREADS: usize = 4;
     /// Gate (t) child: exit status when the guard fault reported an address other than the store's.
     const T_ADDR_EXIT: c_int = 47;
+
+    /// Gate (u): host threads that attach, call and detach while the parent's guest loop runs. 50: the slice's count, enough that attaches land across many parent iterations.
+    const U_CHILDREN: usize = 50;
+    /// Gate (u): wall-clock bound on the whole gate; past it the watchdog prints the FAIL line and ends the process (a hang). Measured gate time is far below (log line `(u) observed`).
+    const U_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+    /// Gate (u): the parent's next expected CALL(i); its CALL answers 0 (stop) once `U_STOP` is set.
+    static U_NEXT: AtomicU64 = AtomicU64::new(0);
+    static U_SEQ_BAD: AtomicU64 = AtomicU64::new(0);
+    static U_STOP: AtomicBool = AtomicBool::new(false);
 
     /// Gate (s): every thread's fx_stack_fill holds here (its CALL) until all have filled.
     static S_BARRIER: Barrier = Barrier::new(S_THREADS);
@@ -231,6 +242,8 @@ mod spike {
         let mut ok = booted.answer() == 0;
         for (gate, f) in [
             ('n', gate_n as fn(&Booted) -> Result<(), String>),
+            // (u) before (m): break `copy-caller` also breaks (m) by a crash, and (u) must print its own check line first
+            ('u', gate_u),
             ('m', gate_m),
             ('o', gate_o),
             ('p', gate_p),
@@ -281,6 +294,18 @@ mod spike {
                 's' => {
                     S_BUF.with(|b| b.set(regs[0]));
                     S_BARRIER.wait();
+                    0
+                }
+                // gate (u) parent: fx_churn's CALL(i) must count 0, 1, 2, ... (an uninterrupted loop); answer go on until the children are done
+                'u' => {
+                    if U_NEXT.fetch_add(1, Ordering::SeqCst) != regs[0] {
+                        U_SEQ_BAD.fetch_add(1, Ordering::SeqCst);
+                    }
+                    u64::from(!U_STOP.load(Ordering::SeqCst))
+                }
+                // gate (u) child: fx_stack_fill's buffer, no barrier
+                'v' => {
+                    S_BUF.with(|b| b.set(regs[0]));
                     0
                 }
                 other => panic!("CALL during gate {other:?}"),
@@ -947,6 +972,126 @@ mod spike {
         unsafe { std::ptr::null_mut::<u64>().write_volatile(1) };
         // SAFETY: not reached unless the store did not fault.
         unsafe { libc::_exit(3) }
+    }
+
+    /// One gate-(u) child: attach while the parent runs, fx_sp (entry sp inside its own stack, checked before any large write, so a wrong stack fails here instead of crashing on another thread's frames), fx_stack_fill(pattern), fx_sum(M_N1), detach -> (stack base, top, guest buffer, changed words, sum, parent iteration at attach).
+    fn churn_child(
+        booted: &Booted,
+        pattern: u64,
+    ) -> Result<(usize, usize, u64, u64, u64, u64), String> {
+        let cpu = booted.attach()?;
+        let at = U_NEXT.load(Ordering::SeqCst);
+        GATE.with(|c| c.set('v'));
+        let tcb: Box<[u64; 8]> = Box::new([0; 8]);
+        let g = cpu.guest();
+        let (base, top) = (cpu.stack_base(), cpu.stack_top());
+        let (sp, _) = g.call_on(tcb.as_ptr() as u64, w(t::SP), &[]);
+        if sp < base as u64 || sp >= top as u64 {
+            // the CPU stays attached (never dropped): its stack may hold another thread's live frames
+            std::mem::forget(cpu);
+            return Err(format!(
+                "entry sp {sp:#x} outside its own stack [{base:#x}, {top:#x})"
+            ));
+        }
+        let (bad, _) = g.call_on(tcb.as_ptr() as u64, w(t::STACK_FILL), &[pattern]);
+        let (sum, _) = g.call_on(tcb.as_ptr() as u64, w(t::SUM), &[w(t::M_N1)]);
+        let r = (
+            cpu.stack_base(),
+            cpu.stack_top(),
+            S_BUF.with(Cell::get),
+            bad,
+            sum,
+            at,
+        );
+        drop(cpu);
+        Ok(r)
+    }
+
+    /// Gate (u), G5 (R10 S4): a parent host thread attaches and runs fx_churn (guest mmap/munmap of RWX pages, a translation on each, guest calls, one host CALL per iteration); once it runs, U_CHILDREN host threads attach at once, each runs fx_stack_fill with its own pattern and fx_sum, and detaches. Attach copies the parked boot CPU under ATTACH + qemu_cpu_list_lock + mmap_lock (attach.rs); this measures that argument.
+    /// Expected: every child 0 changed words, buffer inside its own stack, fx_sum = M_S1; the parent's CALLs counted 0, 1, 2, ... with no gap, it iterated while children attached and after the last detach, and fx_churn returned 0. A watchdog bounds the gate: a hang prints the FAIL line and exits.
+    fn gate_u(booted: &Booted) -> Result<(), String> {
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            if done_rx.recv_timeout(U_DEADLINE) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                println!(
+                    "spike: (u) FAIL hang: not done after {} s (parent at iteration {})",
+                    U_DEADLINE.as_secs(),
+                    U_NEXT.load(Ordering::SeqCst)
+                );
+                // SAFETY: exit without unwinding or running the stuck threads' destructors.
+                unsafe { libc::_exit(1) };
+            }
+        });
+        let words = w(t::S_WORDS);
+        let t0 = std::time::Instant::now();
+        let (start, end, seen, parent) = std::thread::scope(|s| {
+            let parent = s.spawn(|| -> Result<(usize, usize, u64), String> {
+                let cpu = booted.attach()?;
+                GATE.with(|c| c.set('u'));
+                let tcb: Box<[u64; 8]> = Box::new([0; 8]);
+                let (bad, _) = cpu.guest().call_on(tcb.as_ptr() as u64, w(t::CHURN), &[]);
+                let r = (cpu.stack_base(), cpu.stack_top(), bad);
+                drop(cpu);
+                Ok(r)
+            });
+            // the children start only once the parent's loop runs (bounded by the watchdog)
+            while U_NEXT.load(Ordering::SeqCst) == 0 && !parent.is_finished() {
+                std::thread::yield_now();
+            }
+            let start = U_NEXT.load(Ordering::SeqCst);
+            let children: Vec<_> = (0..U_CHILDREN)
+                .map(|i| s.spawn(move || churn_child(booted, (i as u64 + 1) << 40)))
+                .collect();
+            let seen: Vec<_> = children
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|_| Err("panicked".to_owned())))
+                .collect();
+            let end = U_NEXT.load(Ordering::SeqCst);
+            // the parent must still loop after the last detach: wait for two more iterations, then stop it
+            while U_NEXT.load(Ordering::SeqCst) <= end + 1 && !parent.is_finished() {
+                std::thread::yield_now();
+            }
+            U_STOP.store(true, Ordering::SeqCst);
+            let p = parent.join().unwrap_or_else(|_| Err("panicked".to_owned()));
+            (start, end, seen, p)
+        });
+        let _ = done_tx.send(());
+        let (pbase, ptop, pbad) = parent.map_err(|e| format!("parent: {e}"))?;
+        let iters = U_NEXT.load(Ordering::SeqCst);
+        let seq_bad = U_SEQ_BAD.load(Ordering::SeqCst);
+        let ats: Vec<u64> = seen
+            .iter()
+            .filter_map(|c| c.as_ref().ok().map(|c| c.5))
+            .collect();
+        let (lo, hi) = (
+            ats.iter().min().copied().unwrap_or(0),
+            ats.iter().max().copied().unwrap_or(0),
+        );
+        println!(
+            "spike: (u) observed {U_CHILDREN} children in {:?}: parent iteration {start} at the first spawn, attaches at {lo}..={hi}, {end} at the last join, {iters} in all; parent stack [{pbase:#x}, {ptop:#x}), fx_churn = {pbad}, {seq_bad} CALLs out of order",
+            t0.elapsed()
+        );
+        for (i, c) in seen.iter().enumerate() {
+            let (base, top, buf, bad, sum, _) = c.clone().map_err(|e| format!("child {i}: {e}"))?;
+            let buf_end = buf + words * 8;
+            if bad != 0 || sum != w(t::M_S1) || buf < base as u64 || buf_end > top as u64 {
+                return Err(format!(
+                    "child {i}: buffer [{buf:#x}, {buf_end:#x}) vs own stack [{base:#x}, {top:#x}), {bad} of {words} words changed, fx_sum = {sum} (expected {})",
+                    w(t::M_S1)
+                ));
+            }
+        }
+        if pbad != 0 || seq_bad != 0 {
+            return Err(format!(
+                "parent: fx_churn counted {pbad} wrong values, {seq_bad} CALLs out of order"
+            ));
+        }
+        if end <= start || iters <= end + 1 {
+            return Err(format!(
+                "no overlap: parent iteration {start} at the first spawn, {end} at the last join, {iters} in all"
+            ));
+        }
+        Ok(())
     }
 
     /// Gate (k), first: a child sets SIG_IGN before QEMU captures the previous action, so its BOOT trap faults with that action. The verdict waits in `K_RESULT` for `gates`; the parent then runs its own gates.

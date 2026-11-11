@@ -118,6 +118,10 @@ fn stack_sizes(size: usize, guard: usize) -> Result<(usize, usize), String> {
 #[cfg(atl_qe_shared_stack)]
 static SHARED_STACK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
+/// Break `copy-caller`: the attached CPUs alive now, oldest first (under ATTACH).
+#[cfg(atl_qe_copy_caller)]
+static LIVE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
 /// Serialises attach and detach (linux-user holds `clone_lock` across the same steps; it is static in syscall.c).
 static ATTACH: Mutex<()> = Mutex::new(());
 
@@ -212,11 +216,20 @@ pub(crate) fn attach(boot_env: usize, size: usize, guard: usize) -> Result<Cpu, 
             (api.tcg_register_thread)();
         }
     }
+    // break `copy-caller`: the template is the oldest live attached CPU (a parent running guest code) when there is one
+    #[cfg(atl_qe_copy_caller)]
+    let template = LIVE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .first()
+        .map_or(boot_env, |&e| e as *mut u8);
+    #[cfg(not(atl_qe_copy_caller))]
+    let template = boot_env;
     let (env, ts) = if cfg!(atl_qe_shared_cpu) {
         (boot_env, std::ptr::null_mut())
     } else {
-        // SAFETY: boot_env is the boot CPU's live CPUArchState; cpu_copy creates, resets and fills a new CPU from it (do_fork's call).
-        let env = unsafe { (api.cpu_copy)(boot_env.cast()) }.cast::<u8>();
+        // SAFETY: template is the boot CPU's CPUArchState, parked in BOOT and so stable (break `copy-caller`: a running CPU); cpu_copy creates, resets and fills a new CPU from it (do_fork's call).
+        let env = unsafe { (api.cpu_copy)(template.cast()) }.cast::<u8>();
         (env, task_state(api, boot_env, env)?)
     };
     let cpu = env_cpu(env);
@@ -235,7 +248,14 @@ pub(crate) fn attach(boot_env: usize, size: usize, guard: usize) -> Result<Cpu, 
     }
     crate::signal::register_thread();
     let stack = guest_stack(len, guard)?;
-    Guest::new(env.cast()).set_x(31, (stack + len) as u64);
+    // break `copy-caller` keeps the template's sp when the template is not the boot CPU
+    if template == boot_env {
+        Guest::new(env.cast()).set_x(31, (stack + len) as u64);
+    }
+    #[cfg(atl_qe_copy_caller)]
+    LIVE.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(env as usize);
     Ok(Cpu {
         env,
         ts,
@@ -337,6 +357,10 @@ impl Drop for Cpu {
             // SAFETY: the mapping guest_stack made (guard + stack); no guest code runs on it any more.
             unsafe { libc::munmap(map as *mut c_void, guard + len) };
         }
+        #[cfg(atl_qe_copy_caller)]
+        LIVE.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|&e| e != self.env as usize);
         crate::signal::unregister_thread();
         if !self.ts.is_null() {
             let cpu = env_cpu(self.env).cast::<c_void>();

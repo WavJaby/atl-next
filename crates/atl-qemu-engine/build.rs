@@ -107,6 +107,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("no-guard", "atl_qe_no_guard"),
     // gate (qemu-abi, z): attach_ex drops the requested stack size, every stack gets the 1 MiB default
     ("ignore-size", "atl_qe_ignore_size"),
+    // gate (u): attach copies the oldest live attached CPU (a running parent) instead of the parked boot CPU, keeping its sp: the child's frames land on the parent's stack
+    ("copy-caller", "atl_qe_copy_caller"),
 ];
 
 fn selected_breaks() -> Result<Vec<&'static str>> {
