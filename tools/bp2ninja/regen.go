@@ -3,16 +3,19 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
 // build.ninja regenerates itself: ninja is the one engine deciding what is out of date, the conversion included.
 // The caller (xtask native) writes the converter's flags and goals into an argument file. `bp2ninja -bootstrap <file>` writes a build.ninja holding only the edge that runs `bp2ninja -args <file>`;
 // ninja runs it (output and deps record missing) and every later time an input changed: its depfile lists every input the conversion read (inputs.go), the argument file and the converter binary among them,
-// so a flag, goal or converter change reruns it as a tree change does. Bootstrapping through ninja, not by converting directly, leaves the deps log holding the record from the first run on.
+// so a flag, goal or converter change reruns it as a tree change does. Directory entries reach it through the probe check edges' results (inputs.go), not as directories. Bootstrapping through ninja, not by converting directly, leaves the deps log holding the record from the first run on.
 // The command line never changes, so `generator = 1` (no rerun on a command change, not cleaned) loses nothing.
 
 // argsFlag: `-args <file>`: the converter's arguments are the file's lines; bootstrapFlag: `-bootstrap <file>`: only write the build.ninja that runs `-args <file>`.
@@ -59,12 +62,38 @@ func expandArgs(argv []string) ([]string, *regenSetup, error) {
 	return out, &regenSetup{exe: exe, args: file, bootstrap: argv[0] == bootstrapFlag}, nil
 }
 
-// writeBootstrap writes <out>/build.ninja holding only the regeneration edge.
+// writeBootstrap writes <out>/build.ninja holding only the regeneration edge: no probes exist yet, so no check edges.
 func (r *regenSetup) writeBootstrap(out string) error {
 	if err := os.MkdirAll(out, 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(out, regenOutputs[0]), []byte(r.ninja()), 0o644)
+	return os.WriteFile(filepath.Join(out, regenOutputs[0]), []byte(r.regenEdge(nil)), 0o644)
+}
+
+// manifest: the check edges of the directory probes (inputs.go) and the regeneration edge depending on their results.
+// A missing result is created here, before build.ninja is written: the check edge, on its first run, then finds it older than build.ninja (a result created by the check would be newer -> a second conversion on every first build).
+func (r *regenSetup) manifest(out string) (string, error) {
+	var b strings.Builder
+	b.WriteString("rule bp2ninja_globs\n  command = " + esc(r.exe) + " " + checkGlobsFlag + " $in $out\n" +
+		"  description = bp2ninja: directory entries changed, asking $in again\n" +
+		"  depfile = $out.d\n  deps = gcc\n  restat = 1\n")
+	var results []string
+	for n := 0; n < globShards; n++ {
+		result := globFile(n, "result")
+		if err := os.MkdirAll(filepath.Join(out, globDir), 0o755); err != nil {
+			return "", err
+		}
+		f, err := os.OpenFile(filepath.Join(out, result), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err == nil {
+			f.Close()
+		} else if !errors.Is(err, fs.ErrExist) {
+			return "", err
+		}
+		b.WriteString("build " + esc(result) + ": bp2ninja_globs " + esc(globFile(n, "json")) + "\n")
+		results = append(results, result)
+	}
+	b.WriteString(r.regenEdge(results))
+	return b.String(), nil
 }
 
 // regenOutputs: the outputs of the regeneration edge, relative to the out dir: ninja finds the manifest's edge by the name it loaded (`build.ninja` under -C), not by an absolute path.
@@ -73,12 +102,12 @@ var regenOutputs = []string{"build.ninja", "problems.txt", "graph.json", "missin
 // regenDepfile: the edge's depfile, relative to the out dir.
 const regenDepfile = "build.ninja.d"
 
-// ninja: the regeneration rule and edge.
-func (r *regenSetup) ninja() string {
+// regenEdge: the regeneration rule and edge; globResults are implicit inputs beside r.implicit.
+func (r *regenSetup) regenEdge(globResults []string) string {
 	return "rule bp2ninja\n  command = " + esc(r.exe) + " " + argsFlag + " " + esc(r.args) + "\n" +
 		"  description = bp2ninja: an input of build.ninja changed, converting again\n" +
 		"  depfile = " + regenDepfile + "\n  deps = gcc\n  generator = 1\n" +
-		"build " + strings.Join(regenOutputs, " ") + ": bp2ninja" + implicitDeps(r.implicit) + "\n"
+		"build " + strings.Join(regenOutputs, " ") + ": bp2ninja" + implicitDeps(append(slices.Clone(r.implicit), globResults...)) + "\n"
 }
 
 func implicitDeps(paths []string) string {
@@ -92,7 +121,10 @@ func implicitDeps(paths []string) string {
 	return s
 }
 
-// writeDepfile writes the edge's depfile into out: every input recorded so far.
-func (r *regenSetup) writeDepfile(out string) error {
-	return writeDepfile(filepath.Join(out, regenDepfile), regenOutputs[0])
+// writeInputs writes into out what the conversion read so far: the files as the edge's depfile, the directory probes as the check edges' lists.
+func (r *regenSetup) writeInputs(out string) error {
+	if err := writeProbes(out); err != nil {
+		return err
+	}
+	return writeDepfile(filepath.Join(out, regenDepfile), regenOutputs[0], inputs)
 }

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -32,6 +33,9 @@ func TestMain(m *testing.M) {
 func fakeConvert() error {
 	if len(os.Args) == 4 && os.Args[1] == scanLoadsFlag {
 		return scanLoads(os.Args[2], os.Args[3])
+	}
+	if len(os.Args) == 4 && os.Args[1] == checkGlobsFlag {
+		return checkGlobs(os.Args[2], os.Args[3])
 	}
 	argv, regen, err := expandArgs(os.Args[1:])
 	if err != nil {
@@ -70,7 +74,11 @@ func fakeConvert() error {
 		ninja += g.bootLoadsNinja(regen.exe)
 		regen.implicit = append(regen.implicit, filepath.Join(buildDir, bootLoadsFile))
 	}
-	ninja += regen.ninja()
+	m, err := regen.manifest(*out)
+	if err != nil {
+		return err
+	}
+	ninja += m
 	if err := os.WriteFile(filepath.Join(*out, "build.ninja"), []byte(ninja), 0o644); err != nil {
 		return err
 	}
@@ -80,7 +88,7 @@ func fakeConvert() error {
 	}
 	fmt.Fprintln(log, "converted")
 	log.Close()
-	return regen.writeDepfile(*out)
+	return regen.writeInputs(*out)
 }
 
 // Each input class of the conversion reruns it exactly once through ninja, and a no-change run or an edit to a file it never read reruns nothing.
@@ -157,19 +165,32 @@ func TestRegenerationIsExact(t *testing.T) {
 	}
 	noWork("the first run")
 	// file timestamps come from the kernel's coarse clock (ticks of up to 10 ms): the sleep puts each edit's mtime past the last conversion's outputs
-	step := func(what string, edit func(), want int) {
+	// returns ninja's output
+	step := func(what string, edit func(), want int) string {
 		t.Helper()
 		time.Sleep(50 * time.Millisecond)
 		before := conversions()
 		edit()
-		run("ninja", "-C", out)
+		b := run("ninja", "-C", out)
 		if got := conversions() - before; got != want {
 			t.Errorf("%s: %d conversions, want %d", what, got, want)
 		}
 		noWork(what)
+		return b
 	}
 	step("no change", func() {}, 0)
 	step("a source file the conversion never read", func() { write(filepath.Join(tree, "a/a.c"), "int b;\n", 0o644) }, 0)
+	// sed -i and most editors: a new file renamed over the old one; the directory's mtime moves, its entries do not -> one probe shard asked again, no conversion (Soong: a glob whose deps changed is re-run, soong_build only on different matches)
+	saved := step("a source file saved by rename in a walked directory", func() {
+		write(filepath.Join(tree, "a/a.c.tmp"), "int c;\n", 0o644)
+		if err := os.Rename(filepath.Join(tree, "a/a.c.tmp"), filepath.Join(tree, "a/a.c")); err != nil {
+			t.Fatal(err)
+		}
+	}, 0)
+	if !strings.Contains(saved, "asking "+globDir+"/") {
+		t.Errorf("a save by rename ran no probe check:\n%s", saved)
+	}
+	step("a new source file in a walked directory", func() { write(filepath.Join(tree, "a/b.c"), "int d;\n", 0o644) }, 1)
 	step("a blueprint file read", func() { write(filepath.Join(tree, "a/Android.bp"), "cc_library { name: \"b\" }\n", 0o644) }, 1)
 	step("a new blueprint file in a new directory", func() { write(filepath.Join(tree, "b/c/Android.bp"), "cc_library { name: \"c\" }\n", 0o644) }, 1)
 	step("a removed blueprint file", func() {
@@ -196,7 +217,8 @@ func TestFilesystemReadsAreRecorded(t *testing.T) {
 	raw := regexp.MustCompile(`\bos\.(ReadFile|Open|Stat|Lstat|ReadDir|Readlink)\(|\bfilepath\.(Glob|EvalSymlinks|WalkDir|Walk)\(|\bexec\.Command\(|\bparser\.ParseFile\(`)
 	allowed := map[string]int{
 		"inputs.go":    12, // the wrappers
-		"walk.go":      7,  // records each directory it lets WalkDir list
+		"globs.go":     11, // a listing's link texts, askProbe (the check edge's second ask), the shard lists and results (outputs)
+		"walk.go":      4,  // a link entry's resolution: the link text is in its listed parent's answer
 		"cc.go":        4,  // writeCompat: placeLink, placeFile, pruneCompat (outputs)
 		"genrule.go":   1,  // writeGenFiles (outputs)
 		"artplugin.go": 1,  // parses sources already read into memory
@@ -237,15 +259,27 @@ func TestRecorderRules(t *testing.T) {
 	if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	saved := inputs
-	defer func() { inputs = saved }()
+	savedInputs, savedProbes := inputs, probes
+	defer func() { inputs, probes = savedInputs, savedProbes }()
+	// recorded as "<file>" or "<kind> <path> @<anchor>...", paths below dir
 	check := func(what string, call func(), want ...string) {
 		t.Helper()
-		inputs = map[string]bool{}
+		inputs, probes = map[string]bool{}, map[[2]string]probe{}
 		call()
 		var got []string
 		for p := range inputs {
 			got = append(got, strings.TrimPrefix(p, dir))
+		}
+		for _, p := range probes {
+			s := p.Kind + " " + strings.TrimPrefix(p.Path, dir)
+			for _, a := range p.Anchors {
+				s += " @" + strings.TrimPrefix(a, dir)
+			}
+			// the answer is the one a second ask gets: what the check edge compares
+			if again, err := askProbe(p); err != nil || again != p.Answer {
+				t.Errorf("%s: %s answered %q, asked again %q (%v)", what, s, p.Answer, again, err)
+			}
+			got = append(got, s)
 		}
 		slices.Sort(got)
 		slices.Sort(want)
@@ -258,17 +292,86 @@ func TestRecorderRules(t *testing.T) {
 	check("a file read in the build dir", func() { readFile(f) }, "/a/keep/f.txt")
 	check("a stat in the build dir", func() { statPath(f) })
 	buildDir = ""
-	check("a missing file read", func() { readFile(filepath.Join(dir, "a/no/such")) }, "/a")
-	check("a stat", func() { statPath(f) }, "/a/keep")
-	check("a missing stat", func() { statPath(filepath.Join(dir, "a/keep/x/y")) }, "/a/keep")
-	check("a listing", func() { readDir(filepath.Join(dir, "a")) }, "/a")
-	check("a glob", func() { glob(filepath.Join(dir, "a/keep/*.txt")) }, "/a/keep")
+	check("a missing file read", func() { readFile(filepath.Join(dir, "a/no/such")) }, "stat /a/no/such @/a/no")
+	check("a stat", func() { statPath(f) }, "stat /a/keep/f.txt @/a/keep")
+	check("a missing stat", func() { statPath(filepath.Join(dir, "a/keep/x/y")) }, "stat /a/keep/x/y @/a/keep/x")
+	check("a listing", func() { readDir(filepath.Join(dir, "a")) }, "list /a @/a")
+	check("a glob", func() { glob(filepath.Join(dir, "a/keep/*.txt")) }, "glob /a/keep/*.txt @/a/keep")
 	check("a walk", func() {
-		walkTree(dir, func(path string, d os.DirEntry, err error) error {
+		walkTree(filepath.Join(dir, "a"), func(path string, d os.DirEntry, err error) error {
 			if d != nil && d.IsDir() && d.Name() == "skip" {
 				return filepath.SkipDir
 			}
 			return nil
 		})
-	}, "", "/a", "/a/keep")
+	}, "lstat /a @", "list /a @/a", "list /a/keep @/a/keep")
+}
+
+// The check edge's command: a save by rename keeps every answer (result untouched), a new entry changes one (result rewritten, naming it); the depfile names each anchor, a missing one by its nearest existing ancestor.
+func TestCheckGlobs(t *testing.T) {
+	dir := t.TempDir()
+	write := func(path, text string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, path), []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// the probed tree; the list and result sit beside it, as the out dir beside the source tree
+	src := filepath.Join(dir, "src")
+	if err := os.Mkdir(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write("src/f.c", "a\n")
+	savedProbes, savedBuild := probes, buildDir
+	defer func() { probes, buildDir = savedProbes, savedBuild }()
+	probes, buildDir = map[[2]string]probe{}, ""
+	readDir(src)
+	statPath(filepath.Join(src, "gone/x"))
+	list := filepath.Join(dir, "p.json")
+	var ps []probe
+	for _, p := range probes {
+		ps = append(ps, p)
+	}
+	b, err := json.Marshal(ps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write("p.json", string(b))
+	result := filepath.Join(dir, "r.result")
+	write("r.result", "")
+	old := time.Unix(1, 0)
+	if err := os.Chtimes(result, old, old); err != nil {
+		t.Fatal(err)
+	}
+	checked := func(what string, rewritten bool) {
+		t.Helper()
+		if err := checkGlobs(list, result); err != nil {
+			t.Fatal(err)
+		}
+		st, err := os.Stat(result)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := !st.ModTime().Equal(old); got != rewritten {
+			t.Errorf("%s: result rewritten %v, want %v", what, got, rewritten)
+		}
+	}
+	write("src/f.c.tmp", "b\n")
+	if err := os.Rename(filepath.Join(src, "f.c.tmp"), filepath.Join(src, "f.c")); err != nil {
+		t.Fatal(err)
+	}
+	checked("a save by rename", false)
+	d, err := os.ReadFile(result + ".d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// the listing's anchor is src; the missing gone/x's anchor gone/ is missing too -> src
+	if want := depfileEscape(result) + ": \\\n  " + depfileEscape(src) + "\n"; string(d) != want {
+		t.Errorf("depfile %q, want %q", d, want)
+	}
+	write("src/g.c", "c\n")
+	checked("a new entry", true)
+	if r, _ := os.ReadFile(result); !strings.Contains(string(r), "list "+src) {
+		t.Errorf("result %q does not name the changed listing", r)
+	}
 }

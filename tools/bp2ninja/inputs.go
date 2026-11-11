@@ -14,14 +14,28 @@ import (
 	"strings"
 )
 
-// Every path whose state the conversion depends on, for the depfile of build.ninja's regeneration edge (regen.go): ninja reruns the converter exactly when one changed.
-// What counts, by how the converter looked: a file read -> the file (its content); a directory listed (walk, ReadDir, glob) -> the directory (an entry added or removed changes its mtime);
-// a path only stat'ed or resolved, or read but missing -> its parent directory (existence and type change with the parent's entries, a content edit does not reach the output);
-// a missing directory -> its nearest existing ancestor (a missing depfile entry would make ninja rerun on every run).
+// What the conversion depends on, for build.ninja's regeneration edge (regen.go): ninja reruns the converter exactly when one changed. Two classes, by how the converter looked.
+// A file read -> the file (its content): `inputs`, the regeneration edge's depfile.
+// A question about a directory's entries -> a probe holding the question and the answer the conversion got (globs.go): a listing (readDir, walkTree) -> the entries' names, types and link texts; a glob -> its matches;
+// a path stat'ed, resolved, or read but missing -> its type or target, or missing. A probe's anchors are the directories whose entries decide its answer.
+// Probes mirror Soong's glob results (soong_build writes `.globs`, soong_ui re-runs a glob whose deps changed and touches `.glob_results` only when its matches differ: build/soong/ui/build/soong.go checkGlobs, the regen's implicit `.glob_results` at :247;
+// an existence check is a one-path glob: android/paths.go existsWithDependencies). Here ninja runs the check: each shard's check edge (regen.go manifest) depends on its anchors and rewrites its result, restat, only on a different answer.
+// So a save by rename (sed -i, most editors: the directory's mtime moves, its entries do not) reruns one shard's check, not the conversion.
 // A directory of the build dir (-out) never counts: its entries are build outputs, the conversion's own among them (build.ninja.d, compat/), which change after every conversion -> regeneration forever (measured).
 // A file there that the conversion reads does (xtask's argument file and JSON inputs).
 // Files the converter writes (compat/, generated files) and reads back only to write if changed are not inputs: those calls use os directly.
 var inputs = map[string]bool{}
+
+// probe: one question about directory entries and the answer the conversion got (Soong pathtools.GlobResult: Pattern, Matches, Deps).
+type probe struct {
+	Kind    string   `json:"k"`
+	Path    string   `json:"p"`
+	Answer  string   `json:"a"`
+	Anchors []string `json:"d"` // absolute; may be missing: a depfile names the nearest existing ancestor (a missing depfile entry would make ninja rerun on every run)
+}
+
+// probes: by kind + path; the first answer stands (the conversion used it).
+var probes = map[[2]string]probe{}
 
 // buildDir: -out, absolute; set before the conversion reads anything (main).
 var buildDir string
@@ -32,30 +46,32 @@ func record(path string) {
 	}
 }
 
-// recordDir: a directory listed, or holding a path looked at, unless it is the build dir's.
-func recordDir(abs string) {
-	if buildDir != "" && (abs == buildDir || strings.HasPrefix(abs, buildDir+"/")) {
-		return
-	}
-	inputs[abs] = true
+func inBuildDir(abs string) bool {
+	return buildDir != "" && (abs == buildDir || strings.HasPrefix(abs, buildDir+"/"))
 }
 
-// recordParent: path was stat'ed or resolved, or is missing.
-func recordParent(path string) { recordExisting(filepath.Dir(path)) }
-
-// recordExisting: directory path or, missing, its nearest existing ancestor.
-func recordExisting(path string) {
+// recordProbe keeps a question with its answer; anchors in the build dir are dropped, and a probe with none left is not kept.
+func recordProbe(kind, path, answer string, anchors ...string) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return
 	}
-	for {
-		if _, err := os.Stat(abs); err == nil || abs == "/" {
-			recordDir(abs)
-			return
+	var keep []string
+	for _, a := range anchors {
+		if a, err := filepath.Abs(a); err == nil && !inBuildDir(a) {
+			keep = append(keep, a)
 		}
-		abs = filepath.Dir(abs)
 	}
+	key := [2]string{kind, abs}
+	if _, seen := probes[key]; seen || len(keep) == 0 {
+		return
+	}
+	probes[key] = probe{kind, abs, answer, keep}
+}
+
+// recordUnread: a read that failed is a stat of the path: it may appear.
+func recordUnread(path string) {
+	recordProbe(probeStat, path, statAnswer(os.Stat(path)), filepath.Dir(path))
 }
 
 // readFile is os.ReadFile, recorded.
@@ -64,7 +80,7 @@ func readFile(path string) ([]byte, error) {
 	if err == nil {
 		record(path)
 	} else {
-		recordParent(path)
+		recordUnread(path)
 	}
 	return b, err
 }
@@ -75,49 +91,55 @@ func openFile(path string) (*os.File, error) {
 	if err == nil {
 		record(path)
 	} else {
-		recordParent(path)
+		recordUnread(path)
 	}
 	return f, err
 }
 
-// statPath is os.Stat, its answer depending on the parent's entries.
+// statPath is os.Stat: the answer is the type, which changes with the parent's entries (a content edit does not reach the output).
 func statPath(path string) (fs.FileInfo, error) {
-	recordParent(path)
-	return os.Stat(path)
+	info, err := os.Stat(path)
+	recordProbe(probeStat, path, statAnswer(info, err), filepath.Dir(path))
+	return info, err
 }
 
-// lstatPath is os.Lstat, its answer depending on the parent's entries.
+// lstatPath is os.Lstat, as statPath.
 func lstatPath(path string) (fs.FileInfo, error) {
-	recordParent(path)
-	return os.Lstat(path)
+	info, err := os.Lstat(path)
+	recordProbe(probeLstat, path, statAnswer(info, err), filepath.Dir(path))
+	return info, err
 }
 
 // readLink is os.Readlink: a retargeted link is a new entry of its parent.
 func readLink(path string) (string, error) {
-	recordParent(path)
-	return os.Readlink(path)
+	target, err := os.Readlink(path)
+	recordProbe(probeReadlink, path, stringAnswer(target, err), filepath.Dir(path))
+	return target, err
 }
 
-// evalSymlinks is filepath.EvalSymlinks; the resolved path's parent is recorded too.
+// evalSymlinks is filepath.EvalSymlinks; anchored at the path's parent and the resolved path's.
 func evalSymlinks(path string) (string, error) {
-	recordParent(path)
 	real, err := filepath.EvalSymlinks(path)
+	anchors := []string{filepath.Dir(path)}
 	if err == nil {
-		recordParent(real)
+		anchors = append(anchors, filepath.Dir(real))
 	}
+	recordProbe(probeRealpath, path, stringAnswer(real, err), anchors...)
 	return real, err
 }
 
 // readDir is os.ReadDir, recorded as a listing.
 func readDir(dir string) ([]fs.DirEntry, error) {
-	recordExisting(dir)
-	return os.ReadDir(dir)
+	entries, err := os.ReadDir(dir)
+	recordProbe(probeList, dir, listAnswer(dir, entries, err), dir)
+	return entries, err
 }
 
-// glob is filepath.Glob over one directory level: the directory holding the pattern's wildcard part is the listing.
+// glob is filepath.Glob over one directory level: the directory holding the pattern's wildcard part decides the matches.
 func glob(pattern string) ([]string, error) {
-	recordExisting(filepath.Dir(pattern))
-	return filepath.Glob(pattern)
+	matches, err := filepath.Glob(pattern)
+	recordProbe(probeGlob, pattern, globAnswer(matches, err), filepath.Dir(pattern))
+	return matches, err
 }
 
 // parseGoFile is go/parser.ParseFile reading the file itself (Soong's sources), recorded.
@@ -126,7 +148,7 @@ func parseGoFile(path string) (*ast.File, error) {
 	if err == nil {
 		record(path)
 	} else {
-		recordParent(path)
+		recordUnread(path)
 	}
 	return f, err
 }
@@ -157,10 +179,10 @@ func depfileSpellable(path string) bool {
 	return true
 }
 
-// writeDepfile writes the recorded inputs as a depfile of target, one path per line, sorted. A path the depfile cannot spell stands as its nearest ancestor that it can: coarser for those (a change below it is missed), never a split path.
-func writeDepfile(path, target string) error {
+// writeDepfile writes paths as a depfile of target, one per line, sorted. A path the depfile cannot spell stands as its nearest ancestor that it can: coarser for those (a change below it is missed), never a split path.
+func writeDepfile(path, target string, paths map[string]bool) error {
 	set := map[string]bool{}
-	for p := range inputs {
+	for p := range paths {
 		for !depfileSpellable(p) {
 			p = filepath.Dir(p)
 		}

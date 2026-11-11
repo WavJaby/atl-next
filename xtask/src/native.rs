@@ -1317,6 +1317,9 @@ fn write_if_changed(path: &Path, text: &str) -> Result<()> {
 /// The licence gate edge's report in the out dir (tools/bp2ninja licence.go licenceReport).
 pub(crate) const LICENCE_REPORT: &str = "licence-gate.json";
 
+/// The directory probe check edges' lists and results in the out dir (tools/bp2ninja globs.go globDir).
+pub(crate) const GLOB_DIR: &str = "globs";
+
 /// The command of build.ninja's licence gate edge (bp2ninja -licence-gate): this xtask binary's hidden `licence-gate`, run from the checkout (xtask finds its root from the working directory).
 fn licence_gate_command(root: &Path, out: &Path) -> Result<String> {
     let exe = std::env::current_exe().context("the xtask binary")?;

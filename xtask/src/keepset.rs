@@ -728,11 +728,12 @@ fn scan_ninja(file: &Path, prefixes: &Prefixes, from: &str, reads: &mut Reads) -
 
 /// The header reads of a graph's deps log (ninja_deps.rs, read-only, so safe beside a build of that slot): each path a step's record names, once.
 /// Unique paths rather than a target map: the log holds ~8M dependency entries per graph and only the paths matter here.
-/// Not the records of build.ninja's regeneration edge (every directory and blueprint the converter walked; ninja files them under each of its outputs, graph.json and problems.txt too) or of the licence gate edge (what it checked): those read whatever the checkout holds, they do not need it held.
+/// Not the records of build.ninja's regeneration edge (every file the converter read; ninja files them under each of its outputs, graph.json and problems.txt too), of its directory probe checks (`globs/<n>.result`: every directory it walked) or of the licence gate edge (what it checked): those read whatever the checkout holds, they do not need it held.
 fn scan_deps(out: &Path, prefixes: &Prefixes, from: &str, reads: &mut Reads) -> Result<()> {
     let log = crate::ninja_deps::read(out)?;
     let not_a_step = |o: &Path| {
         o == Path::new("build.ninja")
+            || o.starts_with(crate::native::GLOB_DIR)
             || o.file_name() == Some(std::ffi::OsStr::new(crate::native::LICENCE_REPORT))
     };
     for dep in log.dependencies(not_a_step) {

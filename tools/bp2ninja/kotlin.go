@@ -129,7 +129,7 @@ func (g *Graph) kotlinc(n *jNode, out, hdr string, java, kt, srcjars, waits []st
 }
 
 // kotlincRule: kotlin.go's kotlinc rule. The module XML is gen-kotlin-build-file.py's: classpath entries, then each source of the rsp file
-// and the srcjars' list (javaSourceRoots for .java, sources for .kt).
+// and the srcjars' list (javaSourceRoots for .java, sources for .kt). Soong's restat + soong_zip -write_if_changed: a recompile with the same classes stops at the jars.
 func (j *javaGraph) kotlincRule(g *Graph) string {
 	c := j.cfg
 	xml := `{ printf '<modules>\n  <module name="%s" type="java-production" outputDir="%s">\n' "$name" "$classes"; ` +
@@ -142,6 +142,6 @@ func (j *javaGraph) kotlincRule(g *Graph) string {
 		"  command = rm -rf $classes $hclasses $srcjardir $buildfile $emptydir && mkdir -p $classes $hclasses $srcjardir $emptydir && " + unpack + " && " + xml + " && " +
 		"JAVA_HOME=$jdk PATH=$jdk/bin:$$PATH " + esc(g.abs(c.Kotlinc)) + " " + strings.Join(c.KotlincGlobal, " ") + " " + strings.Join(c.KotlincJdk9Opts, " ") +
 		" -J-Xmx" + c.JavacHeapSize + " $flags -jvm-target $target -Xbuild-file=$buildfile -kotlin-home $emptydir -Xplugin=" + esc(g.abs(c.KotlinAbiGen)) +
-		" -P plugin:org.jetbrains.kotlin.jvm.abi:outputDir=$hclasses && $soongzip -jar -o $kjar -C $classes -D $classes && $soongzip -jar -o $hdr -C $hclasses -D $hclasses && rm -rf $srcjardir $classes $hclasses\n" +
-		"  rspfile = $kjar.rsp\n  rspfile_content = $in\n  description = kotlinc $kjar\n"
+		" -P plugin:org.jetbrains.kotlin.jvm.abi:outputDir=$hclasses && $soongzip -jar -o $kjar -C $classes -D $classes -write_if_changed && $soongzip -jar -o $hdr -C $hclasses -D $hclasses -write_if_changed && rm -rf $srcjardir $classes $hclasses\n" +
+		"  rspfile = $kjar.rsp\n  rspfile_content = $in\n  restat = 1\n  description = kotlinc $kjar\n"
 }

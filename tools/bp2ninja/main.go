@@ -49,6 +49,7 @@ func main() {
 	ar := flag.String("ar", "llvm-ar", "archiver")
 	bison := flag.String("bison", "bison", "parser generator for .yy/.y sources")
 	flex := flag.String("flex", "flex", "lexer generator for .ll/.l sources")
+	m4 := flag.String("m4", "m4", "macro processor flex runs, set as its M4 (Soong's lex rule sets M4= beside flex)")
 	yasm := flag.String("yasm", "yasm", "assembler for .asm (NASM syntax) sources, Soong's yasm rule")
 	licenceGate := flag.String("licence-gate", "", "command of the licence gate edge over the device link outputs (licence.go): reads them from $out.rsp, writes its report to $out and its depfile to $out.d; empty = no edge")
 	launcher := flag.String("launcher", "", "compiler cache run in front of every C/C++ compile (sccache); empty = compile directly")
@@ -78,6 +79,17 @@ func main() {
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "usage: bp2ninja [flags] goal...\n       bp2ninja %s|%s <file>   (the flags and goals, one per line; build.ninja regenerates itself: regen.go)\n", argsFlag, bootstrapFlag)
 		flag.PrintDefaults()
+	}
+	if len(os.Args) > 1 && os.Args[1] == checkGlobsFlag {
+		if len(os.Args) != 4 {
+			fmt.Fprintf(os.Stderr, "bp2ninja: %s <list> <result>\n", checkGlobsFlag)
+			os.Exit(2)
+		}
+		if err := checkGlobs(os.Args[2], os.Args[3]); err != nil {
+			fmt.Fprintln(os.Stderr, "bp2ninja:", err)
+			os.Exit(1)
+		}
+		return
 	}
 	if len(os.Args) > 1 && os.Args[1] == scanLoadsFlag {
 		if len(os.Args) != 4 {
@@ -199,7 +211,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -provided / -srcs:", err)
 		os.Exit(1)
 	}
-	if err := run(*tree, *out, cfg, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion, *libclang, *llvm, *launcher, *rtInclude, *bionicStaticRust, *licenceGate}, javaSetup{jt, *release, *measure}, omitted, provided, nbProvided, partial, android, moduleDefines, stand, aidlCrates, *nbExports, regen, flag.Args()); err != nil {
+	if err := run(*tree, *out, cfg, Tools{*cc, *cxx, *ar, *bison, *flex, *m4, *yasm, *rustc, *rustVersion, *libclang, *llvm, *launcher, *rtInclude, *bionicStaticRust, *licenceGate}, javaSetup{jt, *release, *measure}, omitted, provided, nbProvided, partial, android, moduleDefines, stand, aidlCrates, *nbExports, regen, flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja:", err)
 		os.Exit(1)
 	}
@@ -435,7 +447,11 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 			ninja += s
 			regen.implicit = append(regen.implicit, filepath.Join(buildDir, bootLoadsFile))
 		}
-		ninja += regen.ninja()
+		m, err := regen.manifest(out)
+		if err != nil {
+			return err
+		}
+		ninja += m
 	}
 	if err := os.WriteFile(filepath.Join(out, "build.ninja"), []byte(ninja), 0o644); err != nil {
 		return err
@@ -458,7 +474,7 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	}
 	// last: graphJSON reads too, so every input is recorded by now
 	if regen != nil {
-		if err := regen.writeDepfile(out); err != nil {
+		if err := regen.writeInputs(out); err != nil {
 			return err
 		}
 	}

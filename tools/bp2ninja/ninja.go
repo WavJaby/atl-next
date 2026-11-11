@@ -48,7 +48,7 @@ func globTree(base, pattern, dir string) []string {
 // LibClang: the directory of CC's libclang.so, which bindgen loads at run time (LIBCLANG_PATH): the cc side's clang parses the headers bindgen reads.
 // Launcher: compiler cache prefixed to the cc rule only (empty = none), except compiles with debug info (debugInfo). Not yasm (sccache does not know it) nor rustc: sccache 0.10 refuses rustc's `-o`, keys Rust on the cwd (= the out dir, so no hit across out dirs) and restores the dep-info of the out dir that filled the entry.
 // BionicStaticRust: -bionic-static-rust (rust.go rustStaticlib). LicenceGate: -licence-gate (licence.go).
-type Tools struct{ CC, CXX, AR, Bison, Flex, Yasm, Rustc, RustVersion, LibClang, LLVM, Launcher, RtInclude, BionicStaticRust, LicenceGate string }
+type Tools struct{ CC, CXX, AR, Bison, Flex, M4, Yasm, Rustc, RustVersion, LibClang, LLVM, Launcher, RtInclude, BionicStaticRust, LicenceGate string }
 
 func esc(s string) string {
 	return strings.NewReplacer("$", "$$", " ", "$ ", ":", "$:", "\n", "$\n").Replace(s)
@@ -77,6 +77,8 @@ func shellQuote(list []string) string {
 // header: the rules. Every rule that can run Python (genrule: script tools and shebang scripts; javagen logtags) sets PYTHONDONTWRITEBYTECODE=1:
 // Python otherwise writes __pycache__ beside the scripts, into the shared src/ checkouts, which the drift test then refuses.
 // link writes $out.trace, lld's --trace list of the objects and archive members it loaded: the linked set xtask's licence gate checks (like a depfile, a side file, not a ninja output).
+// link has Soong's `restat` (cc/builder.go ld: an output the linker left untouched stops there); the gate stays exact: lld writes $out anew on every link, and every trace is in the gate edge's depfile, rewritten by `>` on every link.
+// Soong's rsp also holds the lib flags; ours keeps $libs on the command line (archives and -l flags, short). ar, no_addrsig, lex: Soong's commands (cc/builder.go ar, noAddrSig; cc/gen.go lex: M4= pins flex's m4 against an ambient $M4).
 // Every depfile rule is `deps = gcc`, as Soong's are: ninja folds the depfile into .ninja_deps after the step. Without it ninja re-parses the depfile at load and refuses one naming an
 // undeclared output -- protoc's --dependency_out lists every file it wrote, e.g. protoc-gen-rust's mod.rs, which several edges write into one dir and so none can declare.
 // cc runs from the tree root, as Soong's $relPwd does: a relative flag names a tree file (-fprofile-list=external/cronet/exclude_coverage.list), and `ninja -C out` would run it from the out dir.
@@ -88,18 +90,21 @@ rule cc
   deps = gcc
   description = cc $in
 rule ar
-  command = rm -f $out && $ar crsD $out $in
+  command = rm -f $out && $ar crsD $out @$out.rsp
+  rspfile = $out.rsp
+  rspfile_content = $in
   description = ar $out
 rule link
   command = $cxx $mode -o $out $crtbegin @$out.rsp $libs $crtend -Wl,--trace >$out.trace
   rspfile = $out.rsp
   rspfile_content = $in
+  restat = 1
   description = link $out
 rule partial_ld
   command = $cxx -fuse-ld=lld -nostdlib -no-pie -Wl,-r $in -o $out $mode
   description = ld -r $out
 rule no_addrsig
-  command = $objcopy --remove-section=.llvm_addrsig $in $out
+  command = rm -f $out && $objcopy --remove-section=.llvm_addrsig $in $out
   description = no addrsig $out
 rule prefix_symbols
   command = $objcopy --prefix-symbols=$prefix $in $out
@@ -131,7 +136,7 @@ rule yacc
   command = $bison -d --defines=$hdr -o $src $in
   description = bison $in
 rule lex
-  command = $flex -o$out $in
+  command = M4=$m4 $flex -o$out $in
   description = flex $in
 rule yasm
   command = $yasm $flags -o $out $in && $yasm $flags -M $in >$out.d
@@ -191,8 +196,8 @@ func (g *Graph) nodeOut(n *Node) string {
 func (g *Graph) emit(tools Tools) string {
 	var b strings.Builder
 	// rustfmt: bindgen.go's ${config.RustBin}/rustfmt, the toolchain's own beside rustc
-	fmt.Fprintf(&b, "%sar = %s\ncxx = %s\nbison = %s\nflex = %s\nyasm = %s\nrustc = %s\nroot = %s\nclang = %s\nlibclang = %s\nrustfmt = %s\nlauncher = %s\nobjcopy = %s\n\n", header, esc(tools.AR), esc(tools.CXX), esc(tools.Bison),
-		esc(tools.Flex), esc(tools.Yasm), esc(tools.Rustc), esc(g.tree), esc(tools.CC), esc(tools.LibClang), esc(filepath.Join(filepath.Dir(tools.Rustc), "rustfmt")), esc(tools.Launcher), esc(filepath.Join(tools.LLVM, "bin", "llvm-objcopy")))
+	fmt.Fprintf(&b, "%sar = %s\ncxx = %s\nbison = %s\nflex = %s\nm4 = %s\nyasm = %s\nrustc = %s\nroot = %s\nclang = %s\nlibclang = %s\nrustfmt = %s\nlauncher = %s\nobjcopy = %s\n\n", header, esc(tools.AR), esc(tools.CXX), esc(tools.Bison),
+		esc(tools.Flex), esc(tools.M4), esc(tools.Yasm), esc(tools.Rustc), esc(g.tree), esc(tools.CC), esc(tools.LibClang), esc(filepath.Join(filepath.Dir(tools.Rustc), "rustfmt")), esc(tools.Launcher), esc(filepath.Join(tools.LLVM, "bin", "llvm-objcopy")))
 	// before the cc edges: ninja needs a rule defined before its first use
 	b.WriteString(g.acfg.ninja())
 	b.WriteString(g.aidlPreNinja())
