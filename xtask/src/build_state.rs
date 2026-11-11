@@ -19,11 +19,39 @@ const RECORD: &str = "built-from";
 /// `test-apks.toml` feeds only `run-apk`, `fetch --test-apks` and the `tables` check: a row or pin change needs no native run.
 /// Trade-off: native's own code (xtask/src/native.rs, the converter driver) is in it too; a change there reaches the slot only through a native run anyway.
 const GATE_SIDE: &[&str] = &["xtask", "test-apks.toml"];
+/// The root manifest: it enters the state as [`native_manifest`], not as the file.
+const MANIFEST: &str = "Cargo.toml";
+/// The cargo profile native builds crates with (`cargo cinstall --release`, native.rs build_crates); no other profile reaches its outputs. Change both together.
+const NATIVE_PROFILE: &str = "release";
 
-/// The checkout's source state: the hash of its top-level tree entries, [`GATE_SIDE`] left out.
+/// The part of the root manifest a native build reads: the parsed TOML (comments and layout drop out) with every profile but [`NATIVE_PROFILE`] removed and,
+/// in that one, the per-package overrides of gate-side packages (a [`GATE_SIDE`] directory holds the package of its name: `xtask`).
+/// So `[profile.dev.package.xtask]` or a comment edit keeps the slot current; members, `[workspace.*]`, `[patch]`, lints and the release profile still count.
+fn native_manifest(text: &str) -> Result<String> {
+    let mut doc: toml::Table = toml::from_str(text).context("parsing the root Cargo.toml")?;
+    if let Some(toml::Value::Table(profiles)) = doc.get_mut("profile") {
+        profiles.retain(|name, _| name == NATIVE_PROFILE);
+        if let Some(toml::Value::Table(profile)) = profiles.get_mut(NATIVE_PROFILE)
+            && let Some(toml::Value::Table(pkgs)) = profile.get_mut("package")
+        {
+            pkgs.retain(|name, _| !GATE_SIDE.contains(&name));
+            // an emptied `package` table reads as no overrides, as if never written
+            if pkgs.is_empty() {
+                profile.remove("package");
+            }
+        }
+    }
+    toml::to_string(&doc).context("writing the root Cargo.toml's native part")
+}
+
+/// The checkout's source state: the hash of its top-level tree entries, [`GATE_SIDE`] left out, the root manifest as [`native_manifest`].
 pub fn of_checkout(root: &Path) -> Result<String> {
     let git_dir = PathBuf::from(git(root, &["rev-parse", "--absolute-git-dir"], None)?);
-    let scratch = std::env::temp_dir().join(format!("xtask-build-state-{}", std::process::id()));
+    // one scratch index per call: concurrent calls in one process (parallel tests) would share git's `<index>.lock`
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let scratch =
+        std::env::temp_dir().join(format!("xtask-build-state-{}-{call}", std::process::id()));
     let index = git_dir.join("index");
     if index.exists() {
         std::fs::copy(&index, &scratch).context("copying the git index")?;
@@ -32,15 +60,26 @@ pub fn of_checkout(root: &Path) -> Result<String> {
         git(root, &["add", "-A"], Some(&scratch))?;
         let tree = git(root, &["write-tree"], Some(&scratch))?;
         let listing = git(root, &["ls-tree", &tree], None)?;
-        let kept: Vec<&str> = listing
-            .lines()
-            .filter(|l| {
-                !l.split('\t')
-                    .nth(1)
-                    .is_some_and(|name| GATE_SIDE.contains(&name))
-            })
-            .collect();
-        git_stdin(root, &["mktree"], &format!("{}\n", kept.join("\n")))
+        let mut kept = Vec::new();
+        for line in listing.lines() {
+            match line.split_once('\t') {
+                Some((_, name)) if GATE_SIDE.contains(&name) => {}
+                Some((mode, MANIFEST)) if mode.contains(" blob ") => {
+                    let text = std::fs::read_to_string(root.join(MANIFEST))
+                        .context("reading the root Cargo.toml")?;
+                    let native = native_manifest(&text)?;
+                    // only hashed, not stored: mktree --missing takes the id as is
+                    let id = git_stdin(root, &["hash-object", "--stdin"], &native)?;
+                    kept.push(format!("100644 blob {id}\t{MANIFEST}"));
+                }
+                _ => kept.push(line.to_owned()),
+            }
+        }
+        git_stdin(
+            root,
+            &["mktree", "--missing"],
+            &format!("{}\n", kept.join("\n")),
+        )
     })();
     let _ = std::fs::remove_file(&scratch);
     result
@@ -250,5 +289,50 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&d);
         let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// The root manifest counts only where a native build reads it: the release profile (minus xtask's override), members, workspace deps.
+    /// Each case writes a variant of BASE and compares its state with BASE's; the expected verdict is the rule's, per line.
+    #[test]
+    fn manifest_counts_only_native_parts() {
+        const BASE: &str = "[workspace]\nmembers = [\"xtask\", \"crates/*\"]\n\n[workspace.dependencies]\nlibc = \"0.2\"\n\n\
+            [profile.release]\nopt-level = 3\n\n[profile.dev]\ndebug = \"line-tables-only\"\n\n[profile.dev.package.xtask]\nopt-level = 2\n";
+        let d = repo("manifest");
+        let state_of = |text: &str| {
+            std::fs::write(d.join(MANIFEST), text).unwrap();
+            of_checkout(&d).unwrap()
+        };
+        let base = state_of(BASE);
+        let same = [
+            (
+                "xtask's dev opt-level",
+                BASE.replace("opt-level = 2", "opt-level = 0"),
+            ),
+            ("dev profile", BASE.replace("\"line-tables-only\"", "true")),
+            ("a comment", format!("# note\n{BASE}")),
+            (
+                "xtask's release override",
+                format!("{BASE}\n[profile.release.package.xtask]\nopt-level = 1\n"),
+            ),
+        ];
+        for (what, text) in same {
+            assert_eq!(state_of(&text), base, "{what} is not native input");
+        }
+        let changed = [
+            (
+                "release opt-level",
+                BASE.replace("opt-level = 3", "opt-level = 2"),
+            ),
+            ("a workspace dep", BASE.replace("\"0.2\"", "\"0.3\"")),
+            ("members", BASE.replace("\"crates/*\"", "\"crates/a\"")),
+            (
+                "a product crate's release override",
+                format!("{BASE}\n[profile.release.package.atl-x]\nopt-level = 1\n"),
+            ),
+        ];
+        for (what, text) in changed {
+            assert_ne!(state_of(&text), base, "{what} is native input");
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
