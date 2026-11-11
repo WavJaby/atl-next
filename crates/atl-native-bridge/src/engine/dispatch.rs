@@ -95,7 +95,7 @@ fn call_jni(id: u32, lanes: &AtlLanes) -> Answer {
 }
 
 /// The host call's image, SysV x86_64: integer words x0..x7 then the eight stack words (SysV takes the sixth and later integer words from the stack, in order), and fp lanes v0..v7 in xmm0..7. Both ABIs assign integer and fp arguments to registers by class in declaration order, so the guest's lanes are the callee's register image as they stand; the descriptor's parameter classes need no walk. Eight fp words always pass, so the call sets %al = 8: a variadic callee (glibc printf) saves its xmm arguments only when %al is nonzero. 8 is the ABI's upper bound on the vector registers used; the descriptor cannot count a variadic call's fp arguments, so the exact count is not built.
-/// Not represented: fp arguments past eight, or an integer and an fp argument both overflowing the registers (R-1). x86_64 host only (R-3).
+/// Not represented: fp arguments past eight, or more than 16 integers (R-1). A proxy row with such a prototype is a named trap from build time (atl_bridgegen::jni `lane_refusal`); a JNI or `bind` caller has no prototype and is not checked. x86_64 host only (R-3).
 #[cfg(not(atl_nb_al_zero))]
 type HostWords = unsafe extern "C" fn(u64, ...) -> u64;
 /// The same image, for a result in xmm0.

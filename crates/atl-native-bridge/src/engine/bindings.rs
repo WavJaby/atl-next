@@ -78,15 +78,17 @@ pub struct Lib {
 pub const JNI_STUBS: usize = identity::JNI_STUBS;
 const _: () = assert!(identity::JNI_STUBS == qemu::JNI_STUBS);
 
-/// One row of the table, for gates outside the engine (xtask `gl-proxies`).
+/// One row of the table, for gates outside the engine (xtask `gl-proxies`, tests/qemu_gl.rs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Binding {
     Generic {
         host: Host,
         symbol: &'static str,
+        /// the result class the binding answers by (the prototype's `ret`)
+        ret: Class,
     },
     Shim,
-    /// why the stub traps: `unbound: …` (no host side) or `pending: …` (a binding class still to build)
+    /// why the stub traps: `unbound: …` (no host side), `pending: …` (a binding class still to build) or `refused: R-1 …` (QEMU: a prototype the lane image cannot carry, build.rs)
     Trap(&'static str),
 }
 
@@ -96,7 +98,7 @@ pub fn rows() -> impl Iterator<Item = (&'static str, &'static str, Binding)> {
     t.libs.iter().flat_map(move |l| {
         l.stubs.iter().map(move |&(name, e)| {
             let b = match e {
-                Entry::Generic(host, symbol, _) => Binding::Generic { host, symbol },
+                Entry::Generic(host, symbol, ret) => Binding::Generic { host, symbol, ret },
                 Entry::Shim => Binding::Shim,
                 Entry::Trap(i) => Binding::Trap(t.trap_names[i].2),
             };
@@ -268,6 +270,7 @@ mod tests {
             if let Binding::Generic {
                 host: Host::Glibc,
                 symbol: s,
+                ..
             } = b
             {
                 assert!(

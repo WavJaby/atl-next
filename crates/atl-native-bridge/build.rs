@@ -640,7 +640,13 @@ fn bindings_table(
                 (Some(sig), Some(_)) => {
                     let ret = atl_bridgegen::jni::result_class(&sig.ret)
                         .with_context(|| format!("{name}: result class"))?;
-                    format!("Entry::Generic(Host::System, {name:?}, Class::{ret:?})")
+                    // QEMU crosses by the lane image (dispatch.rs `call_host`): a prototype it cannot carry traps by name here, at bind time (R-1, Q7-4); identity passes the call through natively
+                    let params = atl_bridgegen::jni::param_classes(sig)
+                        .with_context(|| format!("{name}: parameter classes"))?;
+                    match atl_bridgegen::jni::lane_refusal(&params).filter(|_| qemu) {
+                        Some(why) => trap(why),
+                        None => format!("Entry::Generic(Host::System, {name:?}, Class::{ret:?})"),
+                    }
                 }
                 _ => trap(missing_prototype(soname)),
             };

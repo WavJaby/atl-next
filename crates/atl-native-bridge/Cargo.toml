@@ -79,6 +79,11 @@ harness = false
 name = "qemu_abi"
 harness = false
 
+# Q7-4 gate: GLES2 proxy calls under QEMU: fp arguments, a ninth (stack) argument and an fp result reach a host recorder bit for bit, bound by the QEMU table's rows (QEMU bridge plan Q7-4); selects the QEMU engine, needs the engine `.so` (ATL_ENGINE_SO) and the static fixture (ATL_QEMU_GL_FIXTURE)
+[[test]]
+name = "qemu_gl"
+harness = false
+
 # Q5-8 gate: the crossing counter under QEMU: a fixture's N calls per binding count N, sizes fall in their literal bins, 2^16 crossings dump once (QEMU bridge plan Q5-8); selects the QEMU engine, needs the engine `.so` (ATL_ENGINE_SO) and feature `crossing-count`
 [[test]]
 name = "qemu_crossing"

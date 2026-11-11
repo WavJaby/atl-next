@@ -115,6 +115,25 @@ pub fn result_class(ty: &Ty) -> Result<Class> {
     }
 }
 
+/// A function's parameter classes in declaration order (a proxy binding's descriptor, from the same prototype as its [`result_class`]).
+pub fn param_classes(sig: &Signature) -> Result<Vec<Class>> {
+    sig.params.iter().map(param).collect()
+}
+
+/// Why a host call of parameter classes `params` cannot cross the QEMU binding route, else `None` (R-1, Q7-4). That route (atl-native-bridge dispatch.rs `call_host`) passes the guest's lanes as one SysV image: x0..x7, then v0..v7 in xmm0..7, then the eight guest stack words. SysV takes integers 1-6 from registers and the rest from the stack in declaration order, interleaved with any fp argument past the eighth; AAPCS64 does the same with eight integer registers. So with at most eight fp arguments the host's stack words are integers 7.. = x6, x7, then the guest's stack words: exactly the image. A ninth fp argument sits among them on both sides at a position the image does not keep. More than 16 integers need a ninth guest stack word, past the eight a trap delivers. A `va_list` is a pointer to a platform struct, not a lane value.
+pub fn lane_refusal(params: &[Class]) -> Option<&'static str> {
+    let count = |c| params.iter().filter(|&&p| p == c).count();
+    if count(Class::VaList) > 0 {
+        Some("refused: R-1, a va_list parameter has no lane")
+    } else if count(Class::Fp) > 8 {
+        Some("refused: R-1, a ninth fp argument interleaves with the stack integers")
+    } else if count(Class::Int) > 16 {
+        Some("refused: R-1, more than 16 integers need a ninth stack word")
+    } else {
+        None
+    }
+}
+
 /// A parameter's class. `va_list` is matched by name first: the IR keeps the typedef name, and its type differs by platform (an array on x86-64, a struct on AArch64).
 fn param(ty: &Ty) -> Result<Class> {
     match ty {
@@ -227,6 +246,32 @@ mod tests {
             .map(|name| result_class(&view.functions[*name].ret).unwrap())
             .collect();
         assert_eq!(got, [Void, Int, Int, Int, Fp, Fp]);
+    }
+
+    /// R-1 at bind time (Q7-4), classes from GL-shaped prototypes. Fit: glTexImage2D (9 integers: one guest stack word), glUniform4f (int + 4 fp), 8 fp + 16 integers (the image's edge). Refused, each by its own reason: 9 floats, 17 integers, a va_list. Expected outcomes follow from the rule in `lane_refusal`'s doc (SysV 6 + AAPCS64 8 integer registers, 8 fp registers each, 8 trap stack words), not from the code.
+    #[test]
+    fn lane_refusal_names_the_r1_shapes() {
+        let iface = parse(
+            "r1",
+            "typedef unsigned int GLenum;\ntypedef int GLint;\ntypedef int GLsizei;\ntypedef float GLfloat;\ntypedef __builtin_va_list va_list;\nvoid glTexImage2D(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *);\nvoid glUniform4f(GLint, GLfloat, GLfloat, GLfloat, GLfloat);\nvoid edge(float, float, float, float, float, float, float, float, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int);\nvoid nine_fp(float, float, float, float, float, float, float, float, float);\nvoid ints17(int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int);\nvoid vl(int, va_list);\n",
+        );
+        let view = &iface.arches["x86_64"];
+        let refusal = |name: &str| lane_refusal(&param_classes(&view.functions[name]).unwrap());
+        assert_eq!(refusal("glTexImage2D"), None);
+        assert_eq!(refusal("glUniform4f"), None);
+        assert_eq!(refusal("edge"), None);
+        let named = [
+            ("nine_fp", "ninth fp"),
+            ("ints17", "16 integers"),
+            ("vl", "va_list"),
+        ];
+        for (name, why) in named {
+            let r = refusal(name).unwrap_or_default();
+            assert!(
+                r.starts_with("refused: R-1") && r.contains(why),
+                "{name}: {r:?}"
+            );
+        }
     }
 
     /// The emitted text type-checks under rustc, with one 8-slot table.

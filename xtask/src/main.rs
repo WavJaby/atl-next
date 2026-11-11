@@ -79,6 +79,7 @@ mod prune;
 mod qemu;
 mod qemu_abi;
 mod qemu_gate;
+mod qemu_gl;
 mod qemu_jni;
 mod qemu_linker;
 mod qemu_spike;
@@ -337,6 +338,8 @@ enum Test {
     QemuJni(qemu_jni::Args),
     /// The engine ABI (QEMU bridge plan Q6-1), both directions: a guest host call's integer lanes, FP lanes and stack words reach the host, and the host's FP answer returns in the guest's v0; `call_ex` puts the host's lanes in the guest's registers and stack, and returns the callee's FP result. The `qa_stack_off`, `qa_v_lane`, `call-stack` and `call-v` breaks must each turn it red. Builds first (as `xtask qemu --pic --execute`); needs no NB images. Logs in `<out>/qemu/<target>-linux-user-pic/qemu-abi/`.
     QemuAbi(qemu_abi::Args),
+    /// GLES2 proxy calls under QEMU (QEMU bridge plan Q7-4): fp arguments, 9-argument calls with the ninth on the guest stack and the fp result reach a host recorder bit for bit, each bound by its QEMU binding-table row. The `v_drop`, `drop_stack` and `ret_int` breaks must each turn it red. Builds first (as `xtask qemu --pic --execute`); needs no NB images. Logs in `<out>/qemu/<target>-linux-user-pic/qemu-gl/`.
+    QemuGl(qemu_gl::Args),
     /// The crossing counter of both engines (QEMU bridge plan Q5-8, feature `crossing-count`): identity host-thunk and JNI shells, then QEMU; the fixture's N calls per binding count N, sizes fall in their literal bins, 2^16 crossings dump once; the `id_count` and `qe_id` breaks must turn it red; the library without the feature has no counter symbol. Builds first (as `xtask qemu --pic --execute`); needs the arm64 NB build (as `test qemu-thread`) and `--nb` pointing at its `<out>/nb/arm64`. Logs in `<out>/qemu/<target>-linux-user-pic/crossing/`.
     Crossing(crossing::Args),
     /// The identity native-bridge gates g1-g5 (x86_64 engine, no QEMU) with their `ATL_NB*` env taken from this checkout's out dir (`nb/x86_64`, the staged `app/`), not set by hand.
@@ -484,6 +487,9 @@ fn main() -> Result<ExitCode> {
             test: Test::QemuAbi(args),
         } => qemu_abi::run(&root, &args),
         Command::Test {
+            test: Test::QemuGl(args),
+        } => qemu_gl::run(&root, &args),
+        Command::Test {
             test: Test::Crossing(args),
         } => crossing::run(&root, &args),
         Command::Test {
@@ -537,6 +543,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::QemuThread(_) => "qemu-thread",
             Test::QemuJni(_) => "qemu-jni",
             Test::QemuAbi(_) => "qemu-abi",
+            Test::QemuGl(_) => "qemu-gl",
             Test::Crossing(_) => "crossing",
             Test::NbIdentity(_) => "nb-identity",
         },
