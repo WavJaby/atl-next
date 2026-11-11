@@ -23,18 +23,12 @@ func TestHostCrossFlags(t *testing.T) {
 	}
 }
 
-// arm64 is the fixture arch with no (Linux, Arm64) toolchain, as a riscv64 host has none (TestToolchainYasm): its host side takes the cross flags ahead of the common ones and no x86 toolchain flag.
+// arm64 has no (linux_glibc, arm64) toolchain in Soong, as a riscv64 host has none (TestToolchainYasm): its host side takes the cross flags ahead of the common ones and no x86 toolchain flag.
 // Break: a host side that takes the x86 toolchain (-m64, -march=x86-64, --gcc-toolchain) or loses HostLink fails here.
 func TestHostCrossHostSide(t *testing.T) {
-	tree := flagsTree(t, flagsGlobal)
-	plain, err := readGlobalFlags(tree, Config{Arch: "arm64", PointerBits: 64}, DeviceArch{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	cross, err := readGlobalFlags(tree, Config{Arch: "arm64", PointerBits: 64, HostCross: riscvCross}, DeviceArch{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	arm64 := DeviceArch{Variant: "armv8-a"}
+	plain := mustFlags(t, Config{Arch: "arm64", PointerBits: 64, ArchVariant: arm64.Variant}, arm64)
+	cross := mustFlags(t, Config{Arch: "arm64", PointerBits: 64, ArchVariant: arm64.Variant, HostCross: riscvCross}, arm64)
 	if plain.NoToolchain[Host] == "" || cross.NoToolchain[Host] == "" {
 		t.Fatalf("arm64 host has a Soong toolchain: %q", plain.NoToolchain[Host])
 	}

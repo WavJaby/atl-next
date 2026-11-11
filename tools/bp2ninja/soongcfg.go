@@ -160,17 +160,6 @@ func archIdent(tree, arch string) (string, error) {
 	return "", fmt.Errorf("build/soong/android/arch.go: no newArch(%q)", arch)
 }
 
-// typeName: the identifier of a type expression, through one pointer.
-func typeName(e ast.Expr) string {
-	if s, ok := e.(*ast.StarExpr); ok {
-		e = s.X
-	}
-	if id, ok := e.(*ast.Ident); ok {
-		return id.Name
-	}
-	return ""
-}
-
 func isIdent(e ast.Expr, name string) bool {
 	id, ok := e.(*ast.Ident)
 	return ok && id.Name == name

@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Thu, 12 Nov 2026 03:15:40 +0800
+Subject: [PATCH] Add EvalNinjaString to read package variables as data
+
+EvalNinjaString expands the variable references of a ninja string,
+recursively, for a given config, in a scope importing the named
+package contexts. It lets a tool read the variables a primary builder
+registers (StaticVariable, VariableFunc) without a Context: evaluation
+is otherwise reachable only through Variable.value, which is
+unexported.
+
+Upstream-Status: Inappropriate [ATL-specific: only ATL's Blueprint-to-ninja converter reads Soong's variables outside soong_build]
+Patch-Reason: the converter imports Soong's cc/config and rust/config packages to take its toolchain flags from Soong's own code instead of a reimplementation; their values are ninja variables, and blueprint exports no way to evaluate one outside a Context. Neither the launcher, loader nor environment can supply a Go API.
+---
+SPDX-License-Identifier: Apache-2.0
+ package_ctx.go | 69 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 69 insertions(+)
+
+diff --git a/package_ctx.go b/package_ctx.go
+index db43bec7d0386f2836b0d7bf5b39b7ac289ecc08..a812cd7f6495c4e8a3aae4f2e363dabf8d854d5c 100644
+--- a/package_ctx.go
++++ b/package_ctx.go
+@@ -915,3 +915,72 @@ func NewBuiltinRule(name string) Rule {
+ func (p *packageContext) AddNinjaFileDeps(deps ...string) {
+ 	p.ninjaFileDeps = append(p.ninjaFileDeps, deps...)
+ }
++
++// EvalNinjaString returns str (Ninja syntax) with every variable reference
++// expanded, recursively, to the value the variable has for config, as if
++// written to a .ninja file and read back by Ninja. References are resolved in
++// a scope that imports the package contexts of imports by their short names
++// (as PackageContext.Import does), so str may reference "${pkg.Var}".
++//
++// It lets a tool read the variables a primary builder registers as data,
++// without a Context. A VariableFunc that globs fails; rule arguments have no
++// value and fail.
++func EvalNinjaString(str string, config interface{}, imports ...string) (string, error) {
++	scope := newScope(nil)
++	for _, path := range imports {
++		pkg, ok := packageContexts[path]
++		if !ok {
++			return "", fmt.Errorf("no package context for %q", path)
++		}
++		if err := scope.AddImport(pkg.shortName, pkg.scope); err != nil {
++			return "", err
++		}
++	}
++	ninjaStr, err := parseNinjaString(scope, str)
++	if err != nil {
++		return "", err
++	}
++	return evalNinjaString(ninjaStr, config, map[Variable]bool{})
++}
++
++func evalNinjaString(n *ninjaString, config interface{}, visiting map[Variable]bool) (string, error) {
++	// "$$" is the only escape a parsed literal span can hold
++	unescape := strings.NewReplacer("$$", "$")
++	if n.variables == nil {
++		return unescape.Replace(n.str), nil
++	}
++	w := &strings.Builder{}
++	i := 0
++	for _, ref := range *n.variables {
++		w.WriteString(unescape.Replace(n.str[i:ref.start]))
++		i = int(ref.end)
++		if ref.variable == nil {
++			w.WriteString(" ")
++			continue
++		}
++		if visiting[ref.variable] {
++			return "", fmt.Errorf("variable %s references itself", ref.variable)
++		}
++		value, err := ref.variable.value(noGlobContext{}, config)
++		if err != nil {
++			return "", fmt.Errorf("%s: %w", ref.variable, err)
++		}
++		visiting[ref.variable] = true
++		s, err := evalNinjaString(value, config, visiting)
++		delete(visiting, ref.variable)
++		if err != nil {
++			return "", err
++		}
++		w.WriteString(s)
++	}
++	w.WriteString(unescape.Replace(n.str[i:]))
++	return w.String(), nil
++}
++
++// noGlobContext is the VariableFuncContext of EvalNinjaString: there is no
++// Context to glob in.
++type noGlobContext struct{}
++
++func (noGlobContext) GlobWithDeps(string, []string) ([]string, error) {
++	return nil, errors.New("EvalNinjaString: no Context to glob in")
++}

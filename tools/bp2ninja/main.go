@@ -205,7 +205,7 @@ func main() {
 	}
 }
 
-// loadSoong: SoongConfig for cfg, every part read from the pinned tree.
+// loadSoong: SoongConfig for cfg, every part read from the pinned tree or computed by the compiled pinned Soong (readGlobalFlags).
 func loadSoong(tree string, cfg Config) (SoongConfig, error) {
 	soong, err := readSoongConfig(tree)
 	if err != nil {
@@ -214,7 +214,7 @@ func loadSoong(tree string, cfg Config) (SoongConfig, error) {
 	if soong.Device, err = readDeviceArch(tree, cfg); err != nil {
 		return soong, err
 	}
-	if soong.Flags, err = readGlobalFlags(tree, cfg, soong.Device); err != nil {
+	if soong.Flags, err = readGlobalFlags(cfg, soong.Device); err != nil {
 		return soong, err
 	}
 	if soong.RustFeatures, err = readRustFeatureGate(tree); err != nil {

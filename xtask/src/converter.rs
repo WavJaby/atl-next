@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The Blueprint -> ninja converter `tools/bp2ninja` as Go sees it: one go.work naming this checkout's converter and the pinned `build/blueprint` (that path differs per checkout and task copy), offline.
+//! The Blueprint -> ninja converter `tools/bp2ninja` as Go sees it: one go.work naming this checkout's converter and the pinned Go modules it compiles (`MODULES`; their paths differ per checkout and task copy), offline.
 //! `xtask native` builds it from here; `xtask check` step `converter` gofmt-checks, builds, vets and tests it, so a converter that does not compile fails before any native run.
 
 use std::path::{Path, PathBuf};
@@ -10,28 +10,77 @@ use atl_layout::Layout;
 
 const DIR: &str = "tools/bp2ninja";
 
-/// Writes `<dir>/go.work` for the checkout at `root` and returns its path.
+/// The pinned Go modules the converter compiles: blueprint (the Blueprint parser), Soong (its toolchain config packages, read as data) and the protobuf runtime Soong's `android` package imports.
+const MODULES: [&str; 3] = [
+    "aosp/build/blueprint",
+    "aosp/build/soong",
+    "aosp/external/golang-protobuf",
+];
+
+/// Writes `<dir>/go.work` for the checkout at `root` and returns its path: each of `MODULES` replaced by its checkout, and every other module their go.mod files require by an empty stub module under `<dir>/stub/`.
+/// Those requirements (starlark-go, go-cmp, the v1 protobuf API, ...) are never imported by the converter's packages, but go loads their go.mod files to build the module graph; a stub has no packages, so a new import of one fails the build instead of reaching the network.
 pub fn go_work(root: &Path, layout: &Layout, dir: &Path) -> Result<PathBuf> {
-    let blueprint = layout.locate(Path::new("aosp/build/blueprint")).dir;
-    ensure!(
-        blueprint.join("go.mod").is_file(),
-        "{} is not fetched (cargo xtask fetch --execute)",
-        blueprint.display()
-    );
     std::fs::create_dir_all(dir)?;
+    let mut text = format!("go 1.24\n\nuse {}\n\n", root.join(DIR).display());
+    let mut real = Vec::new();
+    let mut required = Vec::new();
+    for upstream in MODULES {
+        let checkout = layout.locate(Path::new(upstream)).dir;
+        let go_mod = std::fs::read_to_string(checkout.join("go.mod")).with_context(|| {
+            format!(
+                "{} is not fetched (cargo xtask fetch --execute)",
+                checkout.display()
+            )
+        })?;
+        let (module, requires) = parse_go_mod(&go_mod)
+            .with_context(|| format!("{}/go.mod", checkout.display()))?;
+        text.push_str(&format!("replace {module} => {}\n", checkout.display()));
+        real.push(module);
+        required.extend(requires);
+    }
+    required.sort();
+    required.dedup();
+    let stubs = dir.join("stub");
+    let _ = std::fs::remove_dir_all(&stubs);
+    for module in required.iter().filter(|m| !real.contains(m)) {
+        let stub = stubs.join(module);
+        std::fs::create_dir_all(&stub)?;
+        std::fs::write(stub.join("go.mod"), format!("module {module}\n"))?;
+        text.push_str(&format!("replace {module} => {}\n", stub.display()));
+    }
     let file = dir.join("go.work");
-    std::fs::write(
-        &file,
-        format!(
-            "go 1.24\n\nuse {}\n\nreplace github.com/google/blueprint => {}\n",
-            root.join(DIR).display(),
-            blueprint.display()
-        ),
-    )?;
+    std::fs::write(&file, text)?;
     Ok(file)
 }
 
-/// `go <args>` in the converter's directory under `go_work`: the pinned blueprint is the only dependency, so no toolchain or module downloads.
+/// A go.mod's module path and the module paths it requires (single-line and block `require`).
+fn parse_go_mod(text: &str) -> Result<(String, Vec<String>)> {
+    let mut module = None;
+    let mut requires = Vec::new();
+    let mut in_block = false;
+    for line in text.lines() {
+        let line = line.split("//").next().unwrap_or("").trim();
+        if in_block {
+            if line == ")" {
+                in_block = false;
+            } else if let Some(path) = line.split_whitespace().next() {
+                requires.push(path.to_owned());
+            }
+        } else if let Some(rest) = line.strip_prefix("module ") {
+            module = Some(rest.trim().to_owned());
+        } else if line == "require (" {
+            in_block = true;
+        } else if let Some(rest) = line.strip_prefix("require ") {
+            if let Some(path) = rest.split_whitespace().next() {
+                requires.push(path.to_owned());
+            }
+        }
+    }
+    let module = module.context("no module line")?;
+    Ok((module, requires))
+}
+
+/// `go <args>` in the converter's directory under `go_work`: every dependency is a pinned checkout or a stub, so no toolchain or module downloads.
 pub fn go(root: &Path, go_work: &Path, args: &[&str]) -> Result<()> {
     let status = Command::new("go")
         .args(args)
@@ -144,5 +193,22 @@ mod tests {
         std::fs::remove_dir_all(&tmp).unwrap();
         assert!(clean.unwrap().is_empty());
         assert_eq!(dirty.unwrap(), ["bad.go"]);
+    }
+
+    /// Both require forms, comments and the module line (golang-protobuf's go.mod shape: block form; Soong's: block form with versions).
+    #[test]
+    fn go_mod_requires() {
+        let text = "module google.golang.org/protobuf\n\ngo 1.11\n\nrequire github.com/x/single v1.0.0 // indirect\n\nrequire (\n\tgithub.com/golang/protobuf v1.5.0\n\t// a comment\n\tgithub.com/google/go-cmp v0.5.5\n)\n";
+        let (module, requires) = parse_go_mod(text).unwrap();
+        assert_eq!(module, "google.golang.org/protobuf");
+        assert_eq!(
+            requires,
+            [
+                "github.com/x/single",
+                "github.com/golang/protobuf",
+                "github.com/google/go-cmp"
+            ]
+        );
+        assert!(parse_go_mod("go 1.11\n").is_err());
     }
 }
