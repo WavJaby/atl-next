@@ -37,12 +37,17 @@ fn table() -> Table {
             traps: identity::TRAPS,
             provider_soname: identity::PROVIDER_SONAME,
         },
-        Active::Qemu => Table {
-            libs: qemu::LIBS,
-            trap_names: qemu::TRAP_NAMES,
-            traps: qemu::TRAPS,
-            provider_soname: qemu::PROVIDER_SONAME,
-        },
+        Active::Qemu => qemu_table(),
+    }
+}
+
+/// The QEMU engine's table, whatever engine this process runs.
+fn qemu_table() -> Table {
+    Table {
+        libs: qemu::LIBS,
+        trap_names: qemu::TRAP_NAMES,
+        traps: qemu::TRAPS,
+        provider_soname: qemu::PROVIDER_SONAME,
     }
 }
 
@@ -94,7 +99,15 @@ pub enum Binding {
 
 /// Every (library, stub name, binding) of the process engine's table, in table order.
 pub fn rows() -> impl Iterator<Item = (&'static str, &'static str, Binding)> {
-    let t = table();
+    rows_of(table())
+}
+
+/// Every row of the QEMU engine's table, from any process (xtask `app-imports`: an APK's arm64 imports against it).
+pub fn qemu_rows() -> impl Iterator<Item = (&'static str, &'static str, Binding)> {
+    rows_of(qemu_table())
+}
+
+fn rows_of(t: Table) -> impl Iterator<Item = (&'static str, &'static str, Binding)> {
     t.libs.iter().flat_map(move |l| {
         l.stubs.iter().map(move |&(name, e)| {
             let b = match e {

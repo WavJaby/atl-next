@@ -12,6 +12,7 @@ mod android_paths;
 mod aosp;
 mod apk_sig;
 mod app;
+mod app_imports;
 mod arches;
 mod atld_run;
 mod audio_app;
@@ -340,6 +341,8 @@ enum Test {
     QemuAbi(qemu_abi::Args),
     /// GLES2 proxy calls under QEMU (QEMU bridge plan Q7-4): fp arguments, 9-argument calls with the ninth on the guest stack and the fp result reach a host recorder bit for bit, each bound by its QEMU binding-table row. The `v_drop`, `drop_stack` and `ret_int` breaks must each turn it red. Builds first (as `xtask qemu --pic --execute`); needs no NB images. Logs in `<out>/qemu/<target>-linux-user-pic/qemu-gl/`.
     QemuGl(qemu_gl::Args),
+    /// Static audit of an APK's arm64 imports against the QEMU binding table (QEMU Q7 plan Q7-5): every dynamic undefined symbol of each `lib/arm64-v8a/*.so` is bound (same APK, a Generic/Shim row, guest bionic), trapped (with its reason) or unknown; red when a gated APK (default Cut the Rope 3.63.0) has a trapped or strong unknown import, each printed with its owning slice. `--info` APKs (default the Battle Cats TW arm64 split) are reported only. Executes nothing.
+    AppImports(app_imports::Args),
     /// The crossing counter of both engines (QEMU bridge plan Q5-8, feature `crossing-count`): identity host-thunk and JNI shells, then QEMU; the fixture's N calls per binding count N, sizes fall in their literal bins, 2^16 crossings dump once; the `id_count` and `qe_id` breaks must turn it red; the library without the feature has no counter symbol. Builds first (as `xtask qemu --pic --execute`); needs the arm64 NB build (as `test qemu-thread`) and `--nb` pointing at its `<out>/nb/arm64`. Logs in `<out>/qemu/<target>-linux-user-pic/crossing/`.
     Crossing(crossing::Args),
     /// The identity native-bridge gates g1-g5 (x86_64 engine, no QEMU) with their `ATL_NB*` env taken from this checkout's out dir (`nb/x86_64`, the staged `app/`), not set by hand.
@@ -490,6 +493,9 @@ fn main() -> Result<ExitCode> {
             test: Test::QemuGl(args),
         } => qemu_gl::run(&root, &args),
         Command::Test {
+            test: Test::AppImports(args),
+        } => app_imports::run(&root, &args),
+        Command::Test {
             test: Test::Crossing(args),
         } => crossing::run(&root, &args),
         Command::Test {
@@ -544,6 +550,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::QemuJni(_) => "qemu-jni",
             Test::QemuAbi(_) => "qemu-abi",
             Test::QemuGl(_) => "qemu-gl",
+            Test::AppImports(_) => "app-imports",
             Test::Crossing(_) => "crossing",
             Test::NbIdentity(_) => "nb-identity",
         },
