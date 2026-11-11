@@ -41,6 +41,10 @@ exports = ["atl-android-paths"]
 crates = ["atld"]
 uses = ["binder", "broker", "gralloc", "platform-host", "property-service", "services", "android-paths", "fonts"]
 
+# the user's launch surface (plan gpu-selection S2.5): `run --gpu`, the per-app GPU preference, the `.desktop` writer; it execs the ATL command (or switcherooctl) and links no ATL crate
+[launch]
+crates = ["atl-launch"]
+
 # the app process's entry: JNI invocation of the converter's ART, liblog's logger, bionic's property and target-SDK API, all resolved at run time; bionic only for its API's names; the process's SurfaceFlinger (composer), started in app mode; UI mode's GTK session (platform-ui), attached before Java
 [launcher]
 crates = ["atl-app-launcher"]

@@ -376,6 +376,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "atl-launch"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
 name = "atl-layout"
 version = "0.0.0"
 dependencies = [

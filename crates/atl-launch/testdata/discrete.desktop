@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: MIT
+[Desktop Entry]
+Type=Application
+Version=1.4
+Name=Example Game
+Exec=atl-launch run -- "/opt/atl/run game" 100%%
+PrefersNonDefaultGPU=true
