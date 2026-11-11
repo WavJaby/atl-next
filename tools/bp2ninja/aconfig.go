@@ -27,6 +27,13 @@ type aconfigGraph struct {
 	tool  string
 	decls map[string]*aconfigDecl
 	b     strings.Builder
+	// valueSets, values: aconfigValues' indexes (valueSet, valueFiles)
+	valueSets map[*Module]map[string][]*Module
+	values    map[*Module][]string
+}
+
+func newAconfigGraph(tool string) *aconfigGraph {
+	return &aconfigGraph{tool: tool, decls: map[string]*aconfigDecl{}, valueSets: map[*Module]map[string][]*Module{}, values: map[*Module][]string{}}
 }
 
 // aconfigDecl is what an aconfig_declarations module hands its users (AconfigDeclarationsProviderData).
@@ -78,39 +85,61 @@ func (g *Graph) aconfigValues(pkg string) []string {
 			g.notFound(set)
 			continue
 		}
-		var mods []string
-		mods = append(mods, vs.Props.strs("values")...)
-		dirs := map[string]bool{}
-		for _, bp := range g.globs(vs.Dir, vs.Props.strs("srcs")) {
-			dirs[filepath.Dir(bp)] = true
-		}
-		var found []*Module
-		for _, list := range g.mods[Device] {
-			for _, m := range list {
-				if m.Type == "aconfig_values" && (dirs[m.Dir] || slices.Contains(mods, m.Name)) && m.Props.str("package") == pkg {
-					found = append(found, m)
-				}
-			}
-		}
-		slices.SortFunc(found, func(a, b *Module) int {
-			if a.Dir != b.Dir {
-				if a.Dir < b.Dir {
-					return -1
-				}
-				return 1
-			}
-			if a.Name < b.Name {
-				return -1
-			}
-			return 1
-		})
-		for _, m := range found {
-			files := g.globs(m.Dir, m.Props.strs("srcs"))
-			slices.Sort(files)
-			out = append(out, files...)
+		for _, m := range g.acfg.valueSet(g, vs)[pkg] {
+			out = append(out, g.acfg.valueFiles(g, m)...)
 		}
 	}
 	return out
+}
+
+// valueSet: an aconfig_value_set's aconfig_values modules by package, each list sorted by dir then name; indexed once per set (per package it re-globbed the set and scanned every device module).
+func (a *aconfigGraph) valueSet(g *Graph, vs *Module) map[string][]*Module {
+	if idx, ok := a.valueSets[vs]; ok {
+		return idx
+	}
+	mods := vs.Props.strs("values")
+	dirs := map[string]bool{}
+	for _, bp := range g.globs(vs.Dir, vs.Props.strs("srcs")) {
+		dirs[filepath.Dir(bp)] = true
+	}
+	var found []*Module
+	for _, list := range g.mods[Device] {
+		for _, m := range list {
+			if m.Type == "aconfig_values" && (dirs[m.Dir] || slices.Contains(mods, m.Name)) {
+				found = append(found, m)
+			}
+		}
+	}
+	slices.SortFunc(found, func(a, b *Module) int {
+		if a.Dir != b.Dir {
+			if a.Dir < b.Dir {
+				return -1
+			}
+			return 1
+		}
+		if a.Name < b.Name {
+			return -1
+		}
+		return 1
+	})
+	idx := map[string][]*Module{}
+	for _, m := range found {
+		pkg := m.Props.str("package")
+		idx[pkg] = append(idx[pkg], m)
+	}
+	a.valueSets[vs] = idx
+	return idx
+}
+
+// valueFiles: an aconfig_values module's files, sorted; globbed once.
+func (a *aconfigGraph) valueFiles(g *Graph, m *Module) []string {
+	if files, ok := a.values[m]; ok {
+		return files
+	}
+	files := g.globs(m.Dir, m.Props.strs("srcs"))
+	slices.Sort(files)
+	a.values[m] = files
+	return files
 }
 
 // aconfigDeclarations builds (once) the aconfig_declarations module ref names: create-cache over its declarations with the release's values.

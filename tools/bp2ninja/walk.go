@@ -11,9 +11,9 @@ import (
 // walkTree is filepath.WalkDir (lexical order, fn before a directory's entries, SkipDir) that also enters a symlinked directory whose link text is absolute, reporting it as a directory under its link path.
 // Absolute = leaves the tree: xtask's AOSP link farm (src-wt/<task>/aosp-tree) is real directories plus absolute links into src/aosp and the task copies; AOSP's own links and the manifest's linkfiles are relative and stay unfollowed.
 // Each link target, and a real root, is entered once by real path, so a link cycle ends.
-// Its own recursion, not WalkDir's: each directory fn lets it enter is listed once, by readDir, so that listing is the recorded probe (inputs.go); a skipped directory is only an entry of its listed parent. The root is lstat'ed through the recorder: a missing root that appears changes the answer.
+// Its own recursion, not WalkDir's: each directory fn lets it enter is listed (listDir) and recorded as a probe of kind (inputs.go): probeList when fn reads every entry, probeBpList when it reads only the blueprint walk's (discover); a skipped directory is only an entry of its listed parent. The root is lstat'ed through the recorder: a missing root that appears changes the answer.
 // A listing error is handed to fn as WalkDir's second call does; SkipDir from a non-directory skips the rest of its parent; SkipAll is not used here.
-func walkTree(root string, fn fs.WalkDirFunc) error {
+func walkTree(root, kind string, fn fs.WalkDirFunc) error {
 	info, err := lstatPath(root)
 	if err != nil {
 		return fn(root, nil, err)
@@ -24,14 +24,14 @@ func walkTree(root string, fn fs.WalkDirFunc) error {
 			entered[real] = true
 		}
 	}
-	if err := walkEntry(root, fs.FileInfoToDirEntry(info), fn, entered); err != filepath.SkipDir {
+	if err := walkEntry(root, kind, fs.FileInfoToDirEntry(info), fn, entered); err != filepath.SkipDir {
 		return err
 	}
 	return nil
 }
 
 // walkEntry visits path; SkipDir returned for a directory is consumed here, from a file it reaches the caller.
-func walkEntry(path string, d fs.DirEntry, fn fs.WalkDirFunc, entered map[string]bool) error {
+func walkEntry(path, kind string, d fs.DirEntry, fn fs.WalkDirFunc, entered map[string]bool) error {
 	if d.Type()&fs.ModeSymlink != 0 {
 		target, lerr := os.Readlink(path)
 		info, serr := os.Stat(path)
@@ -51,7 +51,8 @@ func walkEntry(path string, d fs.DirEntry, fn fs.WalkDirFunc, entered map[string
 		}
 		return err
 	}
-	entries, err := readDir(path)
+	entries, err := listDir(path)
+	recordListing(kind, path, entries, err)
 	if err != nil {
 		if err := fn(path, d, err); err != nil && err != filepath.SkipDir {
 			return err
@@ -59,7 +60,7 @@ func walkEntry(path string, d fs.DirEntry, fn fs.WalkDirFunc, entered map[string
 		return nil
 	}
 	for _, e := range entries {
-		if err := walkEntry(filepath.Join(path, e.Name()), e, fn, entered); err != nil {
+		if err := walkEntry(filepath.Join(path, e.Name()), kind, e, fn, entered); err != nil {
 			if err == filepath.SkipDir {
 				return nil
 			}

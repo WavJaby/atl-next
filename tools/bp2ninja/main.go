@@ -299,7 +299,7 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 			return err
 		}
 		g.genFile(filepath.Join(out, buildPropFile), prop)
-		g.acfg = &aconfigGraph{decls: map[string]*aconfigDecl{}}
+		g.acfg = newAconfigGraph("")
 	}
 	g.mods = map[Side]map[string][]*Module{}
 	for _, side := range cfg.sides() {
@@ -428,11 +428,20 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	if err := g.checkPartial(); err != nil {
 		return err
 	}
-	ninja := g.emit(tools)
-	if g.java != nil {
-		ninja += g.java.ninja(g)
+	// build.ninja is written part by part as each is made (it is ~0.8 GB: one concatenated string plus its copies set the peak RSS), into a temporary file renamed at the end, so a failed run leaves the previous one
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		return err
 	}
-	ninja += g.licenceNinja(tools.LicenceGate)
+	ninja, err := newNinjaFile(filepath.Join(out, "build.ninja"))
+	if err != nil {
+		return err
+	}
+	defer ninja.discard()
+	ninja.WriteString(g.emit(tools))
+	if g.java != nil {
+		ninja.WriteString(g.java.ninja(g))
+	}
+	ninja.WriteString(g.licenceNinja(tools.LicenceGate))
 	// compat/ has one reader, the device-side compile (ninja.go compileFlags): a plan without one writes nothing and needs no libc provider for api-level.h
 	if g.hasDeviceObjs() {
 		if err := writeCompat(tree, out, provided); err != nil {
@@ -444,16 +453,16 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	}
 	if regen != nil {
 		if s := g.bootLoadsNinja(regen.exe); s != "" {
-			ninja += s
+			ninja.WriteString(s)
 			regen.implicit = append(regen.implicit, filepath.Join(buildDir, bootLoadsFile))
 		}
 		m, err := regen.manifest(out)
 		if err != nil {
 			return err
 		}
-		ninja += m
+		ninja.WriteString(m)
 	}
-	if err := os.WriteFile(filepath.Join(out, "build.ninja"), []byte(ninja), 0o644); err != nil {
+	if err := ninja.commit(); err != nil {
 		return err
 	}
 	if err := os.WriteFile(filepath.Join(out, "problems.txt"), []byte(strings.Join(g.problems, "\n")+"\n"), 0o644); err != nil {

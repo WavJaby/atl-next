@@ -30,7 +30,7 @@ func TestWalkFollowsAbsoluteLinksOnce(t *testing.T) {
 		}
 	}
 	var got []string
-	err := walkTree(farm, func(path string, d os.DirEntry, err error) error {
+	err := walkTree(farm, probeList, func(path string, d os.DirEntry, err error) error {
 		if err == nil && !d.IsDir() && d.Type()&os.ModeSymlink == 0 {
 			rel, _ := filepath.Rel(farm, path)
 			got = append(got, rel)

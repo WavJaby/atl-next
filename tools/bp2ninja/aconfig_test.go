@@ -33,7 +33,7 @@ func aconfigGraphFor(t *testing.T) *Graph {
 	g.release = &Release{Name: "r", ValueSets: []string{"vs"}, flags: map[string]string{
 		"RELEASE_ACONFIG_FLAG_DEFAULT_PERMISSION": "READ_WRITE", "RELEASE_ACONFIG_REQUIRE_ALL_READ_ONLY": "",
 	}}
-	g.acfg = &aconfigGraph{tool: "/aconfig", decls: map[string]*aconfigDecl{}}
+	g.acfg = newAconfigGraph("/aconfig")
 	return g
 }
 

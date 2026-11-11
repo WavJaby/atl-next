@@ -3,7 +3,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"maps"
 	"os"
 	"path/filepath"
@@ -250,6 +252,7 @@ func (g *Graph) bootLoadSources(n *jNode, done map[*jNode]bool) {
 
 // bootLoadsNinja: the scan edge writing <out>/bootjni-loads.txt from the boot jars' sources (none when goal platform-bootclasspath-jni is not built).
 // restat + write-if-changed: an edit that keeps the names stops there; the regeneration edge takes the file as an input (regenSetup.implicit).
+// The sources are the rsp file's content and the edge's depfile, not its inputs: a deleted source is then a missing depfile entry (the scan reruns without it, and its stat reruns the conversion), where an input would stop ninja before the regeneration ("missing and no known rule to make it") until build.ninja was deleted.
 func (g *Graph) bootLoadsNinja(exe string) string {
 	if g.bootLoads == nil {
 		return ""
@@ -258,27 +261,35 @@ func (g *Graph) bootLoadsNinja(exe string) string {
 	for _, p := range dedupKeep(g.bootLoads) {
 		srcs = append(srcs, esc(p))
 	}
-	return "rule scanloads\n  command = " + esc(exe) + " " + scanLoadsFlag + " $out.rsp $out\n  rspfile = $out.rsp\n  rspfile_content = $in\n  restat = 1\n" +
+	return "rule scanloads\n  command = " + esc(exe) + " " + scanLoadsFlag + " $out.rsp $out\n  rspfile = $out.rsp\n  rspfile_content = $srcs\n  depfile = $out.d\n  deps = gcc\n  restat = 1\n" +
 		"  description = scan the boot jars' sources for loadLibrary\n" +
-		"build " + esc(filepath.Join(buildDir, bootLoadsFile)) + ": scanloads " + strings.Join(srcs, " ") + " | " + esc(exe) + "\n"
+		"build " + esc(filepath.Join(buildDir, bootLoadsFile)) + ": scanloads | " + esc(exe) + "\n  srcs = " + strings.Join(srcs, " ") + "\n"
 }
 
 // scanLoads (`-scan-loads <list> <out>`): the names the files listed in <list> (whitespace-separated) pass to loadLibrary("name"), sorted, each once, into <out>,
-// rewritten only when they changed. A name held in a constant or built at run time is not seen.
+// rewritten only when they changed; <out>.d names the files read. A missing file is skipped: deleted since the conversion, which its stat reruns. A name held in a constant or built at run time is not seen.
 func scanLoads(list, out string) error {
 	b, err := readFile(list)
 	if err != nil {
 		return err
 	}
 	names := map[string]bool{}
+	read := map[string]bool{}
 	for _, f := range strings.Fields(string(b)) {
 		src, err := readFile(f)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
 		if err != nil {
 			return err
 		}
+		read[f] = true
 		for _, m := range reLoadLibrary.FindAllSubmatch(src, -1) {
 			names[string(m[1])] = true
 		}
+	}
+	if err := writeDepfile(out+".d", out, read); err != nil {
+		return err
 	}
 	text := ""
 	for _, n := range sortedKeys(names) {

@@ -70,7 +70,12 @@ func fakeConvert() error {
 	}
 	ninja := fmt.Sprintf("rule touch\n  command = touch $out\nbuild product: touch\n# %d blueprint files, goals %v, loads %v\n", len(files), fs.Args(), sortedKeys(readBootLoads()))
 	if *scan != "" {
-		g := &Graph{bootLoads: []string{filepath.Join(*tree, *scan)}}
+		// as bootLoadSources: a missing source is stat'ed and left out
+		g := &Graph{bootLoads: []string{}}
+		p := filepath.Join(*tree, *scan)
+		if _, err := statPath(p); err == nil {
+			g.bootLoads = append(g.bootLoads, p)
+		}
 		ninja += g.bootLoadsNinja(regen.exe)
 		regen.implicit = append(regen.implicit, filepath.Join(buildDir, bootLoadsFile))
 	}
@@ -190,7 +195,9 @@ func TestRegenerationIsExact(t *testing.T) {
 	if !strings.Contains(saved, "asking "+globDir+"/") {
 		t.Errorf("a save by rename ran no probe check:\n%s", saved)
 	}
-	step("a new source file in a walked directory", func() { write(filepath.Join(tree, "a/b.c"), "int d;\n", 0o644) }, 1)
+	// the blueprint walk asks only for the entries it uses (subdirectories, links, Android.bp), as Soong reruns only when the Android.bp set changes; a glob's listing keeps every entry (TestRecorderRules)
+	step("a new source file in a walked directory", func() { write(filepath.Join(tree, "a/b.c"), "int d;\n", 0o644) }, 0)
+	step("a new directory in a walked directory", func() { write(filepath.Join(tree, "a/d/x.c"), "int e;\n", 0o644) }, 1)
 	step("a blueprint file read", func() { write(filepath.Join(tree, "a/Android.bp"), "cc_library { name: \"b\" }\n", 0o644) }, 1)
 	step("a new blueprint file in a new directory", func() { write(filepath.Join(tree, "b/c/Android.bp"), "cc_library { name: \"c\" }\n", 0o644) }, 1)
 	step("a removed blueprint file", func() {
@@ -209,6 +216,13 @@ func TestRegenerationIsExact(t *testing.T) {
 		write(javaSrc, "class A { static { System.loadLibrary(\"x\"); System.loadLibrary(\"y\"); } }\n", 0o644)
 	}, 1)
 	loads("[x y]")
+	// the scan names its sources in a depfile, not as inputs: ninja would refuse a deleted input before reaching the regeneration
+	step("a scanned source deleted", func() {
+		if err := os.Remove(javaSrc); err != nil {
+			t.Fatal(err)
+		}
+	}, 1)
+	loads("[]")
 }
 
 // Every filesystem access of the conversion goes through the recorder (inputs.go), so the depfile cannot miss an input class: a raw call outside the listed sites fails here.
@@ -259,18 +273,18 @@ func TestRecorderRules(t *testing.T) {
 	if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	savedInputs, savedProbes := inputs, probes
-	defer func() { inputs, probes = savedInputs, savedProbes }()
-	// recorded as "<file>" or "<kind> <path> @<anchor>...", paths below dir
+	saved := rec
+	defer func() { rec = saved }()
+	// recorded as "<file>" or "<kind> <path> @<anchor>...", paths below dir; each call is a run of its own
 	check := func(what string, call func(), want ...string) {
 		t.Helper()
-		inputs, probes = map[string]bool{}, map[[2]string]probe{}
+		rec = newRecorder()
 		call()
 		var got []string
-		for p := range inputs {
+		for p := range rec.inputs {
 			got = append(got, strings.TrimPrefix(p, dir))
 		}
-		for _, p := range probes {
+		for _, p := range rec.probes {
 			s := p.Kind + " " + strings.TrimPrefix(p.Path, dir)
 			for _, a := range p.Anchors {
 				s += " @" + strings.TrimPrefix(a, dir)
@@ -298,13 +312,28 @@ func TestRecorderRules(t *testing.T) {
 	check("a listing", func() { readDir(filepath.Join(dir, "a")) }, "list /a @/a")
 	check("a glob", func() { glob(filepath.Join(dir, "a/keep/*.txt")) }, "glob /a/keep/*.txt @/a/keep")
 	check("a walk", func() {
-		walkTree(filepath.Join(dir, "a"), func(path string, d os.DirEntry, err error) error {
+		walkTree(filepath.Join(dir, "a"), probeList, func(path string, d os.DirEntry, err error) error {
 			if d != nil && d.IsDir() && d.Name() == "skip" {
 				return filepath.SkipDir
 			}
 			return nil
 		})
 	}, "lstat /a @", "list /a @/a", "list /a/keep @/a/keep")
+	check("a blueprint walk", func() {
+		walkTree(filepath.Join(dir, "a"), probeBpList, func(string, os.DirEntry, error) error { return nil })
+	},
+		"lstat /a @", "bplist /a @/a", "bplist /a/keep @/a/keep", "bplist /a/skip @/a/skip")
+	// its answer: subdirectories, links and Android.bp only (os.FileMode.String: a regular file's type is "----------", a directory's "d---------")
+	if err := os.WriteFile(filepath.Join(dir, "a/Android.bp"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(filepath.Join(dir, "a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := listingAnswer(probeBpList, filepath.Join(dir, "a"), entries, nil), "Android.bp\t----------\nkeep\td---------\nskip\td---------\n"; got != want {
+		t.Errorf("bplist answer %q, want %q", got, want)
+	}
 }
 
 // The check edge's command: a save by rename keeps every answer (result untouched), a new entry changes one (result rewritten, naming it); the depfile names each anchor, a missing one by its nearest existing ancestor.
@@ -322,14 +351,14 @@ func TestCheckGlobs(t *testing.T) {
 		t.Fatal(err)
 	}
 	write("src/f.c", "a\n")
-	savedProbes, savedBuild := probes, buildDir
-	defer func() { probes, buildDir = savedProbes, savedBuild }()
-	probes, buildDir = map[[2]string]probe{}, ""
+	saved, savedBuild := rec, buildDir
+	defer func() { rec, buildDir = saved, savedBuild }()
+	rec, buildDir = newRecorder(), ""
 	readDir(src)
 	statPath(filepath.Join(src, "gone/x"))
 	list := filepath.Join(dir, "p.json")
 	var ps []probe
-	for _, p := range probes {
+	for _, p := range rec.probes {
 		ps = append(ps, p)
 	}
 	b, err := json.Marshal(ps)

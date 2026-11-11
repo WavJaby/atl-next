@@ -3,8 +3,10 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -31,17 +33,30 @@ func globTree(base, pattern, dir string) []string {
 	re.WriteString("$")
 	rx := regexp.MustCompile(re.String())
 	var out []string
-	walkTree(base, func(path string, d fs.DirEntry, err error) error {
+	for _, rel := range treeFiles(base) {
+		if rx.MatchString(rel) {
+			out = append(out, filepath.Join(dir, rel))
+		}
+	}
+	return out
+}
+
+// treeFiles: the non-directories below base, relative, in walk order; walked once per run (recorder.trees): many globs share a base (every `**/*.aconfig` or Java srcs glob of one big module directory).
+func treeFiles(base string) []string {
+	if files, ok := rec.trees[base]; ok {
+		return files
+	}
+	files := []string{}
+	walkTree(base, probeList, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
 		}
 		rel, _ := filepath.Rel(base, path)
-		if rx.MatchString(rel) {
-			out = append(out, filepath.Join(dir, rel))
-		}
+		files = append(files, rel)
 		return nil
 	})
-	return out
+	rec.trees[base] = files
+	return files
 }
 
 // Tools are the host programs the generated rules call. RustVersion: Rustc's version, Soong's ANDROID_RUST_VERSION, which crates read (rustversion).
@@ -50,8 +65,49 @@ func globTree(base, pattern, dir string) []string {
 // BionicStaticRust: -bionic-static-rust (rust.go rustStaticlib). LicenceGate: -licence-gate (licence.go).
 type Tools struct{ CC, CXX, AR, Bison, Flex, M4, Yasm, Rustc, RustVersion, LibClang, LLVM, Launcher, RtInclude, BionicStaticRust, LicenceGate string }
 
+// ninjaFile: build.ninja written through a buffer into <path>.tmp; commit renames it into place, discard (deferred) removes an uncommitted one. A write error is kept by the buffer and returned by commit.
+type ninjaFile struct {
+	*bufio.Writer
+	f    *os.File
+	path string
+	done bool
+}
+
+func newNinjaFile(path string) (*ninjaFile, error) {
+	f, err := os.Create(path + ".tmp")
+	if err != nil {
+		return nil, err
+	}
+	return &ninjaFile{bufio.NewWriterSize(f, 1<<20), f, path, false}, nil
+}
+
+func (n *ninjaFile) commit() error {
+	err := n.Flush()
+	if cerr := n.f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	if err := os.Rename(n.f.Name(), n.path); err != nil {
+		return err
+	}
+	n.done = true
+	return nil
+}
+
+func (n *ninjaFile) discard() {
+	if !n.done {
+		n.f.Close()
+		os.Remove(n.f.Name())
+	}
+}
+
+// ninjaEscaper: built once; a Replacer per call was 76 % of the converter's allocations (its tables are built on first use).
+var ninjaEscaper = strings.NewReplacer("$", "$$", " ", "$ ", ":", "$:", "\n", "$\n")
+
 func esc(s string) string {
-	return strings.NewReplacer("$", "$$", " ", "$ ", ":", "$:", "\n", "$\n").Replace(s)
+	return ninjaEscaper.Replace(s)
 }
 
 func join(list []string) string {

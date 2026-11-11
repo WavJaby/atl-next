@@ -334,7 +334,7 @@ type parsed struct {
 // skipping .git and directories holding Soong's prune marker .find-ignore.
 func discover(tree string) ([]parsed, error) {
 	var files []string
-	err := walkTree(tree, func(path string, d fs.DirEntry, err error) error {
+	err := walkTree(tree, probeBpList, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}

@@ -126,5 +126,5 @@ func (r *regenSetup) writeInputs(out string) error {
 	if err := writeProbes(out); err != nil {
 		return err
 	}
-	return writeDepfile(filepath.Join(out, regenDepfile), regenOutputs[0], inputs)
+	return writeDepfile(filepath.Join(out, regenDepfile), regenOutputs[0], rec.inputs)
 }

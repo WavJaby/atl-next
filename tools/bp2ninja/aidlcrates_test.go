@@ -260,10 +260,13 @@ func TestAidlCrates(t *testing.T) {
 	if err := g.addAidlCrates(map[string]AidlCrate{"pkg": {IncludeDirs: []string{"inc"}, Types: []string{"a.IFoo"}}}); err == nil || !strings.Contains(err.Error(), "already has a module") {
 		t.Errorf("name clash: %v", err)
 	}
-	// a codec file for a type nothing declares
+	// a codec file for a type nothing declares, seen by a later run (a run lists a directory once)
 	if err := os.WriteFile(filepath.Join(dir, "src/codecs/a/Nope.rs"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
+	saved := rec
+	defer func() { rec = saved }()
+	rec = newRecorder()
 	other := *parcelables
 	other.Module = "libq"
 	err := g.addAidlCrates(map[string]AidlCrate{"y": {IncludeDirs: []string{"inc"}, Types: []string{"a.IFoo"}, Parcelables: &other}})

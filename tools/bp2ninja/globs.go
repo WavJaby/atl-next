@@ -24,6 +24,8 @@ const (
 	probeReadlink = "readlink"
 	probeRealpath = "realpath"
 	probeGlob     = "glob"
+	// probeBpList: the blueprint walk's listing (bp.go discover): the entries it reads, subdirectories, links and Android.bp files; another new file changes nothing it does, as Soong reruns only when the Android.bp set changes
+	probeBpList = "bplist"
 )
 
 func errAnswer(err error) string {
@@ -33,13 +35,16 @@ func errAnswer(err error) string {
 	return "error: " + err.Error()
 }
 
-// listAnswer: name, type and, for a link, its text, per entry: a retargeted link changes the answer, a rewritten file does not.
-func listAnswer(dir string, entries []fs.DirEntry, err error) string {
+// listingAnswer: name, type and, for a link, its text, per entry the kind's question reads (probeList: all): a retargeted link changes the answer, a rewritten file does not.
+func listingAnswer(kind, dir string, entries []fs.DirEntry, err error) string {
 	if err != nil {
 		return errAnswer(err)
 	}
 	var b strings.Builder
 	for _, e := range entries {
+		if kind == probeBpList && !e.IsDir() && e.Type()&fs.ModeSymlink == 0 && e.Name() != "Android.bp" {
+			continue
+		}
 		b.WriteString(e.Name() + "\t" + e.Type().String())
 		if e.Type()&fs.ModeSymlink != 0 {
 			target, _ := os.Readlink(filepath.Join(dir, e.Name()))
@@ -74,9 +79,9 @@ func globAnswer(matches []string, err error) string {
 // askProbe asks a recorded question again.
 func askProbe(p probe) (string, error) {
 	switch p.Kind {
-	case probeList:
+	case probeList, probeBpList:
 		entries, err := os.ReadDir(p.Path)
-		return listAnswer(p.Path, entries, err), nil
+		return listingAnswer(p.Kind, p.Path, entries, err), nil
 	case probeStat:
 		return statAnswer(os.Stat(p.Path)), nil
 	case probeLstat:
@@ -112,7 +117,7 @@ func globFile(n int, ext string) string {
 // writeProbes writes each shard's probe list into out, only when it changed: its check edge reruns on a newer list.
 func writeProbes(out string) error {
 	shards := make([][]probe, globShards)
-	for _, p := range probes {
+	for _, p := range rec.probes {
 		n := shardOf(p)
 		shards[n] = append(shards[n], p)
 	}

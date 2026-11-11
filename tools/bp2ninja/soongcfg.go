@@ -111,7 +111,7 @@ type DeviceArch struct {
 func (d DeviceArch) blocks() []string {
 	var out []string
 	if d.Variant != "" {
-		out = append(out, strings.NewReplacer("-", "_", ".", "_").Replace(d.Variant))
+		out = append(out, dashDotToUnderscore.Replace(d.Variant))
 	}
 	return append(out, d.Features...)
 }

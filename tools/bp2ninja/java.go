@@ -1354,8 +1354,10 @@ func isResourceExcluded(path string) bool {
 
 // matchEscape is pathtools.MatchEscape: soong_zip -f takes a glob.
 func matchEscape(s string) string {
-	return strings.NewReplacer(`\`, `\\`, `*`, `\*`, `?`, `\?`, `[`, `\[`).Replace(s)
+	return matchEscaper.Replace(s)
 }
+
+var matchEscaper = strings.NewReplacer(`\`, `\\`, `*`, `\*`, `?`, `\?`, `[`, `\[`)
 
 // globDirs resolves directory paths / globs below dir (tree-relative results).
 func (g *Graph) globDirs(dir string, pats []string) []string {

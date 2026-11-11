@@ -431,7 +431,10 @@ func (g *Graph) synthAidl(ref string, side Side) *Module {
 }
 
 // fixRustName: aidl_utils.go's function of the same name, `-` and `.` -> `_`.
-func fixRustName(name string) string { return strings.NewReplacer("-", "_", ".", "_").Replace(name) }
+func fixRustName(name string) string { return dashDotToUnderscore.Replace(name) }
+
+// dashDotToUnderscore: `-` and `.` -> `_` (also Soong's arch variant block name, soongcfg.go DeviceArch.blocks).
+var dashDotToUnderscore = strings.NewReplacer("-", "_", ".", "_")
 
 // aidlLibraryDirs: the import dirs of an aidl_library (build/soong/aidl_library): <module dir>/strip_import_prefix, then those of its aidl_library
 // deps. Its srcs / hdrs files are found through these dirs and the depfile, so they are not listed as inputs.

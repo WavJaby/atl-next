@@ -15,7 +15,7 @@ import (
 )
 
 // What the conversion depends on, for build.ninja's regeneration edge (regen.go): ninja reruns the converter exactly when one changed. Two classes, by how the converter looked.
-// A file read -> the file (its content): `inputs`, the regeneration edge's depfile.
+// A file read -> the file (its content): `recorder.inputs`, the regeneration edge's depfile.
 // A question about a directory's entries -> a probe holding the question and the answer the conversion got (globs.go): a listing (readDir, walkTree) -> the entries' names, types and link texts; a glob -> its matches;
 // a path stat'ed, resolved, or read but missing -> its type or target, or missing. A probe's anchors are the directories whose entries decide its answer.
 // Probes mirror Soong's glob results (soong_build writes `.globs`, soong_ui re-runs a glob whose deps changed and touches `.glob_results` only when its matches differ: build/soong/ui/build/soong.go checkGlobs, the regen's implicit `.glob_results` at :247;
@@ -24,7 +24,27 @@ import (
 // A directory of the build dir (-out) never counts: its entries are build outputs, the conversion's own among them (build.ninja.d, compat/), which change after every conversion -> regeneration forever (measured).
 // A file there that the conversion reads does (xtask's argument file and JSON inputs).
 // Files the converter writes (compat/, generated files) and reads back only to write if changed are not inputs: those calls use os directly.
-var inputs = map[string]bool{}
+// rec: the run's recorder; a test starts a run with a new one.
+var rec = newRecorder()
+
+type recorder struct {
+	inputs map[string]bool
+	// probes: by kind + path; the first answer stands (the conversion used it).
+	probes map[[2]string]probe
+	// listings: readDir's answers by the path as asked: a directory is listed once per run, so the conversion sees the recorded answer (globs re-walked the same subtrees per pattern: ~half the converter's wall time).
+	listings map[string]listing
+	// trees: treeFiles' answers by base (ninja.go), made of the listings above
+	trees map[string][]string
+}
+
+type listing struct {
+	entries []fs.DirEntry
+	err     error
+}
+
+func newRecorder() *recorder {
+	return &recorder{map[string]bool{}, map[[2]string]probe{}, map[string]listing{}, map[string][]string{}}
+}
 
 // probe: one question about directory entries and the answer the conversion got (Soong pathtools.GlobResult: Pattern, Matches, Deps).
 type probe struct {
@@ -34,15 +54,12 @@ type probe struct {
 	Anchors []string `json:"d"` // absolute; may be missing: a depfile names the nearest existing ancestor (a missing depfile entry would make ninja rerun on every run)
 }
 
-// probes: by kind + path; the first answer stands (the conversion used it).
-var probes = map[[2]string]probe{}
-
 // buildDir: -out, absolute; set before the conversion reads anything (main).
 var buildDir string
 
 func record(path string) {
 	if abs, err := filepath.Abs(path); err == nil {
-		inputs[abs] = true
+		rec.inputs[abs] = true
 	}
 }
 
@@ -63,10 +80,10 @@ func recordProbe(kind, path, answer string, anchors ...string) {
 		}
 	}
 	key := [2]string{kind, abs}
-	if _, seen := probes[key]; seen || len(keep) == 0 {
+	if _, seen := rec.probes[key]; seen || len(keep) == 0 {
 		return
 	}
-	probes[key] = probe{kind, abs, answer, keep}
+	rec.probes[key] = probe{kind, abs, answer, keep}
 }
 
 // recordUnread: a read that failed is a stat of the path: it may appear.
@@ -128,11 +145,31 @@ func evalSymlinks(path string) (string, error) {
 	return real, err
 }
 
-// readDir is os.ReadDir, recorded as a listing.
+// readDir is os.ReadDir, recorded as a listing of every entry.
 func readDir(dir string) ([]fs.DirEntry, error) {
-	entries, err := os.ReadDir(dir)
-	recordProbe(probeList, dir, listAnswer(dir, entries, err), dir)
+	entries, err := listDir(dir)
+	recordListing(probeList, dir, entries, err)
 	return entries, err
+}
+
+// listDir is os.ReadDir, listed once per run (recorder.listings) and not recorded: its caller records the question it asked (recordListing).
+func listDir(dir string) ([]fs.DirEntry, error) {
+	if l, ok := rec.listings[dir]; ok {
+		return l.entries, l.err
+	}
+	entries, err := os.ReadDir(dir)
+	rec.listings[dir] = listing{entries, err}
+	return entries, err
+}
+
+// recordListing records a listing as a probe of kind (probeList, probeBpList); the answer is formatted only for a question not yet recorded.
+func recordListing(kind, dir string, entries []fs.DirEntry, err error) {
+	if abs, aerr := filepath.Abs(dir); aerr == nil {
+		if _, seen := rec.probes[[2]string{kind, abs}]; seen {
+			return
+		}
+	}
+	recordProbe(kind, dir, listingAnswer(kind, dir, entries, err), dir)
 }
 
 // glob is filepath.Glob over one directory level: the directory holding the pattern's wildcard part decides the matches.
@@ -165,8 +202,10 @@ func command(name string, args ...string) *exec.Cmd {
 
 // depfileEscape: a path as ninja's depfile parser reads it (depfile_parser.in.cc): `\` before space and `#`, `$$` for `$`.
 func depfileEscape(path string) string {
-	return strings.NewReplacer(" ", `\ `, "#", `\#`, "$", "$$").Replace(path)
+	return depfileEscaper.Replace(path)
 }
+
+var depfileEscaper = strings.NewReplacer(" ", `\ `, "#", `\#`, "$", "$$")
 
 // depfileSpellable: ninja's depfile lexer takes a path only of [A-Za-z0-9+,/_:.~(){}%=@[]!-], bytes >= 0x80 and the escaped space, `#`, `$`; any other byte splits it (measured: blueprint's testdata dir `escapes/**/b` read as `.../escapes` and a missing `/b`, regenerating forever).
 func depfileSpellable(path string) bool {
