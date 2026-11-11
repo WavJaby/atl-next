@@ -204,6 +204,9 @@ impl WindowSurface {
             height: h,
         };
         if status != g::GL_FRAMEBUFFER_COMPLETE as u32 {
+            log(&format!(
+                "back: framebuffer incomplete ({status:#x}), EGL_BAD_ALLOC"
+            ));
             delete_back(d, &b);
             return Err(e::EGL_BAD_ALLOC);
         }
@@ -304,7 +307,12 @@ impl WindowSurface {
             self.flip_into_buffer(d, ctx)?;
         }
         let fence = if d.native_fence {
-            Some(d.display.export_fence().map_err(|_| e::EGL_BAD_ALLOC)?)
+            Some(d.display.export_fence().map_err(|err| {
+                log(&format!(
+                    "swap: native fence export failed ({err}), EGL_BAD_ALLOC"
+                ));
+                e::EGL_BAD_ALLOC
+            })?)
         } else {
             // SAFETY: a context is current on this thread.
             unsafe { (d.gl.glFinish)() };
@@ -410,7 +418,13 @@ pub fn import(d: &'static Driver, p: &Params, fd: i32) -> Result<Image<'static>,
             pitch: p.pitch,
             modifier: p.modifier,
         })
-        .map_err(|_| e::EGL_BAD_ALLOC)
+        .map_err(|err| {
+            log(&format!(
+                "import: dma-buf {}x{} fourcc {:#x} pitch {} modifier {:#x} refused ({err}), EGL_BAD_ALLOC",
+                p.width, p.height, p.fourcc, p.pitch, p.modifier
+            ));
+            e::EGL_BAD_ALLOC
+        })
 }
 
 /// `depth` as depth and stencil of the bound FBO, when non-zero.
@@ -480,6 +494,9 @@ fn target(
     };
     let t = Target { fbo, texture };
     if status != g::GL_FRAMEBUFFER_COMPLETE as u32 {
+        log(&format!(
+            "target: buffer framebuffer incomplete ({status:#x}), EGL_BAD_ALLOC"
+        ));
         delete_target(d, &t);
         return Err(e::EGL_BAD_ALLOC);
     }
