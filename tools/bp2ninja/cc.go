@@ -185,6 +185,8 @@ func genClosure(n *Node, seen map[*Node]bool, out *[]string) {
 type Graph struct {
 	tree, out string
 	cfg       Config
+	// the boot jars' sources the loadLibrary scan edge reads (bootclasspath.go bootLoadsNinja); nil = goal platform-bootclasspath-jni not built
+	bootLoads []string
 	soong     SoongConfig
 	// link outputs under <out>/device, in emit order: the inputs of the licence gate edge (licence.go)
 	deviceLinks []string

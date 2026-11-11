@@ -30,6 +30,9 @@ func TestMain(m *testing.M) {
 }
 
 func fakeConvert() error {
+	if len(os.Args) == 4 && os.Args[1] == scanLoadsFlag {
+		return scanLoads(os.Args[2], os.Args[3])
+	}
 	argv, regen, err := expandArgs(os.Args[1:])
 	if err != nil {
 		return err
@@ -39,6 +42,7 @@ func fakeConvert() error {
 	}
 	fs := flag.NewFlagSet("fake", flag.ContinueOnError)
 	tree, out, provided := fs.String("tree", "", ""), fs.String("out", "", ""), fs.String("provided", "", "")
+	scan := fs.String("scan", "", "tree file the loadLibrary scan edge reads, as bootJniLibs' boot jar sources")
 	if err := fs.Parse(argv); err != nil {
 		return err
 	}
@@ -60,7 +64,13 @@ func fakeConvert() error {
 			return err
 		}
 	}
-	ninja := fmt.Sprintf("rule touch\n  command = touch $out\nbuild product: touch\n# %d blueprint files, goals %v\n", len(files), fs.Args()) + regen.ninja()
+	ninja := fmt.Sprintf("rule touch\n  command = touch $out\nbuild product: touch\n# %d blueprint files, goals %v, loads %v\n", len(files), fs.Args(), sortedKeys(readBootLoads()))
+	if *scan != "" {
+		g := &Graph{bootLoads: []string{filepath.Join(*tree, *scan)}}
+		ninja += g.bootLoadsNinja(regen.exe)
+		regen.implicit = append(regen.implicit, filepath.Join(buildDir, bootLoadsFile))
+	}
+	ninja += regen.ninja()
 	if err := os.WriteFile(filepath.Join(*out, "build.ninja"), []byte(ninja), 0o644); err != nil {
 		return err
 	}
@@ -104,7 +114,9 @@ func TestRegenerationIsExact(t *testing.T) {
 	provided := filepath.Join(out, "provided.json")
 	write(provided, "{}\n", 0o644)
 	args := filepath.Join(out, "bp2ninja.args")
-	argLines := "-tree\n" + tree + "\n-out\n" + out + "\n-provided\n" + provided + "\n"
+	javaSrc := filepath.Join(tree, "a/A.java")
+	write(javaSrc, "class A { static { System.loadLibrary(\"x\"); } }\n", 0o644)
+	argLines := "-tree\n" + tree + "\n-out\n" + out + "\n-provided\n" + provided + "\n-scan\na/A.java\n"
 	write(args, argLines+"a\n", 0o644)
 	env := append(os.Environ(), fakeConverterEnv+"=1")
 	run := func(name string, argv ...string) string {
@@ -126,9 +138,17 @@ func TestRegenerationIsExact(t *testing.T) {
 		t.Fatalf("bootstrap converted (%d): it only writes the edge", n)
 	}
 	run("ninja", "-C", out)
-	if n := conversions(); n != 1 {
-		t.Fatalf("first ninja run: %d conversions, want 1", n)
+	// 2: the first conversion has no scan output yet (no loadLibrary names); its build.ninja holds the scan edge, whose output reruns it
+	if n := conversions(); n != 2 {
+		t.Fatalf("first ninja run: %d conversions, want 2", n)
 	}
+	loads := func(want string) {
+		t.Helper()
+		if b, _ := os.ReadFile(filepath.Join(out, "build.ninja")); !strings.Contains(string(b), "loads "+want+"\n") {
+			t.Errorf("build.ninja does not hold loads %s", want)
+		}
+	}
+	loads("[x]")
 	noWork := func(after string) {
 		t.Helper()
 		if b := run("ninja", "-C", out, "-n", "-d", "explain"); !strings.Contains(b, "no work to do") {
@@ -160,6 +180,14 @@ func TestRegenerationIsExact(t *testing.T) {
 	step("the argument file (a goal added)", func() { write(args, argLines+"a\nb\n", 0o644) }, 1)
 	step("a JSON input", func() { write(provided, "{\"x\": {}}\n", 0o644) }, 1)
 	step("the converter binary", func() { write(conv, string(bin), 0o755) }, 1)
+	// the boot jars' sources reach the conversion only through the scan edge's names (bootclasspath.go readBootLoads)
+	step("a scanned source edit that keeps its loadLibrary names", func() {
+		write(javaSrc, "class A { int f; static { System.loadLibrary(\"x\"); } }\n", 0o644)
+	}, 0)
+	step("a scanned source edit that adds a loadLibrary name", func() {
+		write(javaSrc, "class A { static { System.loadLibrary(\"x\"); System.loadLibrary(\"y\"); } }\n", 0o644)
+	}, 1)
+	loads("[x y]")
 }
 
 // Every filesystem access of the conversion goes through the recorder (inputs.go), so the depfile cannot miss an input class: a raw call outside the listed sites fails here.

@@ -34,6 +34,8 @@ const (
 	bootclasspathGoal  = "platform-bootclasspath"
 	bootclasspathFile  = "bootclasspath.txt"
 	bootJniGoal        = "platform-bootclasspath-jni"
+	bootLoadsFile      = "bootjni-loads.txt" // in -out: the names the boot jars pass to loadLibrary, one per line, sorted (scanLoads)
+	scanLoadsFlag      = "-scan-loads"
 	artBootJarsMk      = "build/make/core/envsetup.mk"
 	productBootJarsMk  = "build/make/target/product/default_art_config.mk"
 	productConfigMk    = "build/make/core/product_config.mk"
@@ -148,16 +150,27 @@ func (g *Graph) bootJniLibs() ([]string, error) {
 	}
 	// the jars' Java graph is made only to read their sources; its problems and missing modules (API stubs, R8, ...) are the Java build's to report (goal platform-bootclasspath), not this native build's
 	problems, missing := len(g.problems), maps.Clone(g.missing)
-	loaded := map[string]bool{}
+	done := map[*jNode]bool{}
+	g.bootLoads = []string{}
 	for _, b := range jars {
 		if n := g.bootJarNode(b, bootJniGoal); n != nil {
-			for _, l := range g.loadLibraries(n, map[*jNode]bool{}) {
-				loaded[l] = true
-			}
+			g.bootLoadSources(n, done)
 		}
 	}
 	g.problems, g.missing = g.problems[:problems], missing
-	return g.loadedJniLibs(candidates, loaded), nil
+	return g.loadedJniLibs(candidates, readBootLoads()), nil
+}
+
+// readBootLoads: the names of the scan edge's output (bootLoadsNinja), not of the sources: a source edit reruns only the scan, and the conversion only when the names changed.
+// Missing (first conversion, before the edge exists): none; the edge then builds it and, being an input of the regeneration edge, reruns the conversion.
+func readBootLoads() map[string]bool {
+	loaded := map[string]bool{}
+	if b, err := readFile(filepath.Join(buildDir, bootLoadsFile)); err == nil {
+		for _, l := range strings.Fields(string(b)) {
+			loaded[l] = true
+		}
+	}
+	return loaded
 }
 
 // apexJniLibs: the `jni_libs` of every APEX of jars (see bootJniLibs), in boot classpath order, each once.
@@ -213,31 +226,68 @@ func (g *Graph) loadedJniLibs(candidates []string, loaded map[string]bool) []str
 
 var reLoadLibrary = regexp.MustCompile(`\bloadLibrary\(\s*"([^"]+)"\s*\)`)
 
-// loadLibraries: the names n's sources, and its static libs' (their classes are in n's jar), pass to loadLibrary("name"), in first-seen order. A name
-// held in a constant or built at run time is not seen; generated sources are not read (none of the JNI loads in the boot jars is generated).
-func (g *Graph) loadLibraries(n *jNode, done map[*jNode]bool) []string {
+// bootLoadSources adds to g.bootLoads the sources of n and of its static libs (their classes are in n's jar), each once, for the scan edge. Generated sources
+// are not scanned (none of the JNI loads in the boot jars is generated); a missing one is left out (stat'ed: its appearance reruns the conversion), as ninja
+// refuses an input no edge makes.
+func (g *Graph) bootLoadSources(n *jNode, done map[*jNode]bool) {
 	if done[n] {
-		return nil
+		return
 	}
 	done[n] = true
-	var out []string
 	for _, f := range n.javaSrcs {
 		if filepath.IsAbs(f) {
 			continue
 		}
-		b, err := readFile(filepath.Join(g.tree, f))
-		if err != nil {
-			g.problem("%s: reading %s: %v", n.name, f, err)
-			continue
-		}
-		for _, m := range reLoadLibrary.FindAllSubmatch(b, -1) {
-			out = append(out, string(m[1]))
+		p := filepath.Join(g.tree, f)
+		if _, err := statPath(p); err == nil {
+			g.bootLoads = append(g.bootLoads, p)
 		}
 	}
 	for _, s := range n.statics {
-		out = append(out, g.loadLibraries(s, done)...)
+		g.bootLoadSources(s, done)
 	}
-	return dedupKeep(out)
+}
+
+// bootLoadsNinja: the scan edge writing <out>/bootjni-loads.txt from the boot jars' sources (none when goal platform-bootclasspath-jni is not built).
+// restat + write-if-changed: an edit that keeps the names stops there; the regeneration edge takes the file as an input (regenSetup.implicit).
+func (g *Graph) bootLoadsNinja(exe string) string {
+	if g.bootLoads == nil {
+		return ""
+	}
+	var srcs []string
+	for _, p := range dedupKeep(g.bootLoads) {
+		srcs = append(srcs, esc(p))
+	}
+	return "rule scanloads\n  command = " + esc(exe) + " " + scanLoadsFlag + " $out.rsp $out\n  rspfile = $out.rsp\n  rspfile_content = $in\n  restat = 1\n" +
+		"  description = scan the boot jars' sources for loadLibrary\n" +
+		"build " + esc(filepath.Join(buildDir, bootLoadsFile)) + ": scanloads " + strings.Join(srcs, " ") + " | " + esc(exe) + "\n"
+}
+
+// scanLoads (`-scan-loads <list> <out>`): the names the files listed in <list> (whitespace-separated) pass to loadLibrary("name"), sorted, each once, into <out>,
+// rewritten only when they changed. A name held in a constant or built at run time is not seen.
+func scanLoads(list, out string) error {
+	b, err := readFile(list)
+	if err != nil {
+		return err
+	}
+	names := map[string]bool{}
+	for _, f := range strings.Fields(string(b)) {
+		src, err := readFile(f)
+		if err != nil {
+			return err
+		}
+		for _, m := range reLoadLibrary.FindAllSubmatch(src, -1) {
+			names[string(m[1])] = true
+		}
+	}
+	text := ""
+	for _, n := range sortedKeys(names) {
+		text += n + "\n"
+	}
+	if old, err := readFile(out); err == nil && string(old) == text {
+		return nil
+	}
+	return os.WriteFile(out, []byte(text), 0o644)
 }
 
 // bootJarsFinal applies product_config.mk's boot jar lines (qualify-platform-jars, the core-icu4j move, the APEX sort); its file must

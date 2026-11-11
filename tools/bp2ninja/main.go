@@ -79,6 +79,17 @@ func main() {
 		fmt.Fprintf(flag.CommandLine.Output(), "usage: bp2ninja [flags] goal...\n       bp2ninja %s|%s <file>   (the flags and goals, one per line; build.ninja regenerates itself: regen.go)\n", argsFlag, bootstrapFlag)
 		flag.PrintDefaults()
 	}
+	if len(os.Args) > 1 && os.Args[1] == scanLoadsFlag {
+		if len(os.Args) != 4 {
+			fmt.Fprintf(os.Stderr, "bp2ninja: %s <list> <out>\n", scanLoadsFlag)
+			os.Exit(2)
+		}
+		if err := scanLoads(os.Args[2], os.Args[3]); err != nil {
+			fmt.Fprintln(os.Stderr, "bp2ninja:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	argv, regen, err := expandArgs(os.Args[1:])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja:", err)
@@ -420,6 +431,10 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 		return err
 	}
 	if regen != nil {
+		if s := g.bootLoadsNinja(regen.exe); s != "" {
+			ninja += s
+			regen.implicit = append(regen.implicit, filepath.Join(buildDir, bootLoadsFile))
+		}
 		ninja += regen.ninja()
 	}
 	if err := os.WriteFile(filepath.Join(out, "build.ninja"), []byte(ninja), 0o644); err != nil {

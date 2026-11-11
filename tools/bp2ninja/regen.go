@@ -26,6 +26,8 @@ type regenSetup struct {
 	exe       string // the converter binary
 	args      string // the argument file, absolute
 	bootstrap bool
+	// outputs of edges in build.ninja the conversion reads (the loadLibrary scan, bootclasspath.go): implicit inputs, so ninja brings them up to date before deciding on a regeneration
+	implicit []string
 }
 
 // expandArgs: argv as given, or with `-args <file>` / `-bootstrap <file>` the file's lines and the setup of the regeneration edge.
@@ -76,7 +78,18 @@ func (r *regenSetup) ninja() string {
 	return "rule bp2ninja\n  command = " + esc(r.exe) + " " + argsFlag + " " + esc(r.args) + "\n" +
 		"  description = bp2ninja: an input of build.ninja changed, converting again\n" +
 		"  depfile = " + regenDepfile + "\n  deps = gcc\n  generator = 1\n" +
-		"build " + strings.Join(regenOutputs, " ") + ": bp2ninja\n"
+		"build " + strings.Join(regenOutputs, " ") + ": bp2ninja" + implicitDeps(r.implicit) + "\n"
+}
+
+func implicitDeps(paths []string) string {
+	s := ""
+	for _, p := range paths {
+		s += " " + esc(p)
+	}
+	if s != "" {
+		s = " |" + s
+	}
+	return s
 }
 
 // writeDepfile writes the edge's depfile into out: every input recorded so far.

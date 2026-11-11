@@ -195,12 +195,22 @@ cc_library_shared { name: "libcomputed" }
 	})
 	dep := &jNode{jKey: jKey{"dep", Device}, javaSrcs: []string{"j/B.java"}}
 	jar := &jNode{jKey: jKey{"jar", Device}, javaSrcs: []string{"j/A.java", "j/C.java", "/out/gen/G.java"}, statics: []*jNode{dep}}
-	got := g.loadLibraries(jar, map[*jNode]bool{})
-	if want := []string{"loaded", "stemmed", "static-dep"}; !reflect.DeepEqual(got, want) {
-		t.Errorf("loadLibrary names\n got %v\nwant %v", got, want)
+	// the scan edge's path: the sources the conversion lists, then -scan-loads over them
+	g.bootLoadSources(jar, map[*jNode]bool{})
+	dir := t.TempDir()
+	list, out := filepath.Join(dir, "list"), filepath.Join(dir, "loads")
+	if err := os.WriteFile(list, []byte(strings.Join(g.bootLoads, "\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := scanLoads(list, out); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(out)
+	if want := "loaded\nstatic-dep\nstemmed\n"; string(got) != want {
+		t.Errorf("loadLibrary names\n got %q\nwant %q", got, want)
 	}
 	loaded := map[string]bool{}
-	for _, l := range got {
+	for _, l := range strings.Fields(string(got)) {
 		loaded[l] = true
 	}
 	cands := []string{"libloaded", "libunloaded", "libstatic-dep", "libby-stem", "libcomputed"}
