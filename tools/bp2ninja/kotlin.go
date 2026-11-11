@@ -140,7 +140,7 @@ func (j *javaGraph) kotlincRule(g *Graph) string {
 	unpack := `(for j in $srcjars; do if unzip -Z1 $$j 2>/dev/null | grep -q '\.\(java\|kt\)$$'; then unzip -qo $$j '*.java' '*.kt' -d $srcjardir 2>/dev/null; rc=$$?; [ $$rc -le 1 ] || [ $$rc -eq 11 ] || exit 1; fi; done) && find $srcjardir -name '*.java' -o -name '*.kt' | sort > $srcjardir/list`
 	return "rule kotlinc\n" +
 		"  command = rm -rf $classes $hclasses $srcjardir $buildfile $emptydir && mkdir -p $classes $hclasses $srcjardir $emptydir && " + unpack + " && " + xml + " && " +
-		"JAVA_HOME=$jdk PATH=$jdk/bin:$$PATH " + esc(g.abs(c.Kotlinc)) + " " + strings.Join(c.KotlincGlobal, " ") + " " + strings.Join(c.KotlincJdk9Opts, " ") +
+		esc(g.abs(c.Kotlinc)) + " " + strings.Join(c.KotlincGlobal, " ") + " " + strings.Join(c.KotlincJdk9Opts, " ") +
 		" -J-Xmx" + c.JavacHeapSize + " $flags -jvm-target $target -Xbuild-file=$buildfile -kotlin-home $emptydir -Xplugin=" + esc(g.abs(c.KotlinAbiGen)) +
 		" -P plugin:org.jetbrains.kotlin.jvm.abi:outputDir=$hclasses && $soongzip -jar -o $kjar -C $classes -D $classes -write_if_changed && $soongzip -jar -o $hdr -C $hclasses -D $hclasses -write_if_changed && rm -rf $srcjardir $classes $hclasses\n" +
 		"  rspfile = $kjar.rsp\n  rspfile_content = $in\n  restat = 1\n  description = kotlinc $kjar\n"

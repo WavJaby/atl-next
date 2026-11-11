@@ -5,6 +5,7 @@
 //! After a clean build it builds the workspace packages that link converter modules the graph holds (packages.rs: the launcher against libsigchain, atl-aidl against libbinder_rs).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -160,15 +161,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     };
     // the converter and its prebuilt build-only tools run on the build machine, so the prebuilt directory is that row's whatever the host; a host of another arch is compiled for its own row's target
     let (build_name, build) = arches::build_machine(root, &arches)?;
-    let prebuilt_os = build
-        .host
-        .as_ref()
-        .and_then(|h| h.soong_prebuilt_os.clone())
-        .with_context(|| {
-            format!(
-                "{build_name}: no soong_prebuilt_os (the JDK and build tools the converter's host Java tools need)"
-            )
-        })?;
+    let prebuilt_os = prebuilt_os(build_name, build)?;
     let cross = arches::cross_target(&args.host, host, build_name)?;
     let cross_flags = cross_args(root, cross.as_ref())?;
     // a cross host's cargo target (rust std, sysroot, linker): checked before any build starts
@@ -359,15 +352,21 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let release = aosp::target_release(&tree)?;
     // the table check: providers.toml rows the converter finds wrong against the tree, then the none gate
     let mut table: Vec<String> = Vec::new();
+    // host Java tools (xsdc for xsd_config's C++ output, ...) are built by the converter's Java pipeline where a goal reaches one; nothing Java is emitted otherwise
+    let (jdk, build_tools) =
+        arches::java_tools(&tree, &prebuilt_os, &deps::aosp_project(root, "jdk")?);
+    // every ninja run's environment: the compiler cache's variables and the pinned JDK
+    let env: Vec<(&'static str, OsString)> = cache
+        .iter()
+        .flat_map(CompilerCache::env)
+        .chain(java_env(&jdk))
+        .collect();
     let mut round = 0;
     loop {
         round += 1;
         // the converter's tree scan skips the directories prune.rs marks (bp.go discover); the table is re-read every round
         let sources = sources::load(root)?;
         prune::apply(&tree, &prune::load(root, &sources)?)?;
-        // host Java tools (xsdc for xsd_config's C++ output, ...) are built by the converter's Java pipeline where a goal reaches one; nothing Java is emitted otherwise
-        let (jdk, build_tools) =
-            arches::java_tools(&tree, &prebuilt_os, &deps::aosp_project(root, "jdk")?);
         let path = |p: &Path| p.display().to_string();
         let mut argv: Vec<String> = vec![
             "-tree".into(),
@@ -434,7 +433,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         argv.extend(nb.flags.iter().cloned());
         argv.extend(args.goals.iter().cloned());
         argv.extend(aidl_goals.iter().cloned());
-        convert(&converter, &out, &argv)?;
+        convert(&converter, &out, &argv, &env)?;
         let problems = std::fs::read_to_string(out.join("problems.txt")).unwrap_or_default();
         if args.fetch_missing {
             let missing = std::fs::read_to_string(out.join("missing.txt")).unwrap_or_default();
@@ -500,12 +499,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     )
     .with_context(|| format!("parsing {}", graph_file.display()))?;
     if let Some(p) = &nb.pass2 {
-        runtimes_pass2(root, args, &out, &tree, &graph, p)?;
+        runtimes_pass2(root, args, &out, &tree, &graph, p, &env)?;
     }
     let status = Command::new("ninja")
         .args(["-k", "0", "-C"])
         .arg(&out)
-        .envs(cache.iter().flat_map(CompilerCache::env))
+        .envs(env.iter().cloned())
         .stdout(std::fs::File::create(&log)?)
         .stderr(std::fs::File::create(out.join("ninja.err"))?)
         .status()
@@ -752,6 +751,7 @@ fn runtimes_pass2(
     tree: &Path,
     graph: &triage::Graph,
     p: &Pass2,
+    env: &[(&'static str, OsString)],
 ) -> Result<()> {
     let libs = runtimes::SYSROOT_MODULES
         .iter()
@@ -768,6 +768,7 @@ fn runtimes_pass2(
         .args(["-C"])
         .arg(out)
         .args(&libs)
+        .envs(env.iter().cloned())
         .stdout(std::fs::File::create(&log)?)
         .stderr(std::fs::File::create(out.join("ninja-pass2.err"))?)
         .status()
@@ -821,9 +822,43 @@ pub(crate) fn shell_env(
     args: &Args,
     repo: &Path,
     view: &str,
-) -> Result<Vec<(&'static str, std::ffi::OsString)>> {
-    let workspace = Layout::of(repo)?.workspace().to_path_buf();
-    Ok(CompilerCache::of(args, &workspace, view)?.map_or_else(Vec::new, |c| c.env().to_vec()))
+) -> Result<Vec<(&'static str, OsString)>> {
+    let layout = Layout::of(repo)?;
+    let arches = arches::load(repo)?;
+    let (build_name, build) = arches::build_machine(repo, &arches)?;
+    let (jdk, _) = arches::java_tools(
+        &tree::shared_tree(&layout),
+        &prebuilt_os(build_name, build)?,
+        &deps::aosp_project(repo, "jdk")?,
+    );
+    let mut env = CompilerCache::of(args, layout.workspace(), view)?
+        .map_or_else(Vec::new, |c| c.env().to_vec());
+    env.extend(java_env(&jdk));
+    Ok(env)
+}
+
+/// The build machine's PrebuiltOS (Soong's HostPrebuiltTag): the prebuilts directory of the JDK and build tools the converter's host Java tools run with.
+fn prebuilt_os(build_name: &str, build: &arches::Arch) -> Result<String> {
+    build
+        .host
+        .as_ref()
+        .and_then(|h| h.soong_prebuilt_os.clone())
+        .with_context(|| {
+            format!(
+                "{build_name}: no soong_prebuilt_os (the JDK and build tools the converter's host Java tools need)"
+            )
+        })
+}
+
+/// The pinned JDK `jdk` in a ninja run's environment, as Soong's ninja gets it (build/soong/ui/build/config.go NewConfig: JAVA_HOME = prebuilts/jdk/jdk21/<PrebuiltOS>, its bin first on PATH).
+/// Edges find `java` there, not on the build machine: java_binary_host wrappers (build/soong/scripts/jar-wrapper.sh) `exec java` from PATH, and rules (d8, kotlinc, sdkparcelables) carry no PATH of their own.
+fn java_env(jdk: &Path) -> [(&'static str, OsString); 2] {
+    let mut path = OsString::from(jdk.join("bin"));
+    if let Some(p) = std::env::var_os("PATH") {
+        path.push(":");
+        path.push(p);
+    }
+    [("JAVA_HOME", jdk.into()), ("PATH", path)]
 }
 
 /// Where `--native-bridge <arch>` put module `m`'s outputs.
@@ -1295,7 +1330,12 @@ fn goals_of_args(text: &str) -> BTreeSet<String> {
 
 /// Brings `<out>/build.ninja` up to date with `argv` (the converter's flags and goals): ninja decides whether to convert again, from the regeneration edge's depfile (every file the last conversion read, this argument file among them).
 /// Bootstrap (`bp2ninja -bootstrap`: a build.ninja holding only that edge) when there is no build.ninja, or the argument file is new: a build.ninja from before it cannot rerun on it.
-fn convert(converter: &Path, out: &Path, argv: &[String]) -> Result<()> {
+fn convert(
+    converter: &Path,
+    out: &Path,
+    argv: &[String],
+    env: &[(&'static str, OsString)],
+) -> Result<()> {
     let args_file = out.join(CONVERTER_ARGS);
     let bootstrap = !args_file.is_file() || !out.join("build.ninja").is_file();
     let text: String = argv.iter().map(|a| format!("{a}\n")).collect();
@@ -1316,6 +1356,7 @@ fn convert(converter: &Path, out: &Path, argv: &[String]) -> Result<()> {
         .arg("-C")
         .arg(out)
         .arg("build.ninja")
+        .envs(env.iter().cloned())
         .status()
         .context("running ninja build.ninja")?;
     ensure!(status.success(), "bp2ninja failed (its output above)");
@@ -1487,6 +1528,22 @@ mod tests {
             BTreeSet::from(["libbase".to_owned(), "nb:libc".to_owned()])
         );
         assert!(goals_of_args("-tree\n/t\n").is_empty());
+    }
+
+    /// Soong's ninja environment (config.go NewConfig): JAVA_HOME is the JDK, whose bin precedes the inherited PATH, so `java` resolves to the JDK's.
+    #[test]
+    fn java_env_puts_jdk_first() {
+        let jdk = Path::new("/t/prebuilts/jdk/jdk21/linux-x86");
+        let [(home_key, home), (path_key, path)] = java_env(jdk);
+        assert_eq!((home_key, home.as_os_str()), ("JAVA_HOME", jdk.as_os_str()));
+        assert_eq!(path_key, "PATH");
+        let path = path.into_string().unwrap();
+        let mut dirs = path.split(':');
+        assert_eq!(dirs.next(), Some("/t/prebuilts/jdk/jdk21/linux-x86/bin"));
+        assert_eq!(
+            dirs.collect::<Vec<_>>().join(":"),
+            std::env::var("PATH").unwrap_or_default()
+        );
     }
 
     /// Each check `run` can fail by name exits nonzero alone; only none failed exits 0.

@@ -1422,7 +1422,7 @@ rule header
   restat = 1
   description = header $out
 rule d8
-  command = rm -rf $outdir && mkdir -p $outdir && PATH=$jdk/bin:$$PATH $d8 %s $flags --output $outdir --no-dex-input-jar $in && $soongzip $zipflags -o $outdir/classes.dex.jar -C $outdir -f "$outdir/classes*.dex" && $mergezips -D -stripFile "**/*.class" $out $outdir/classes.dex.jar $in && rm -f $outdir/classes*.dex $outdir/classes.dex.jar
+  command = rm -rf $outdir && mkdir -p $outdir && $d8 %s $flags --output $outdir --no-dex-input-jar $in && $soongzip $zipflags -o $outdir/classes.dex.jar -C $outdir -f "$outdir/classes*.dex" && $mergezips -D -stripFile "**/*.class" $out $outdir/classes.dex.jar $in && rm -f $outdir/classes*.dex $outdir/classes.dex.jar
   description = d8 $out
 rule zipalign
   command = if ! $zipalign -c -p 4 $in > /dev/null; then $zipalign -f -p 4 $in $out; else cp -f $in $out; fi

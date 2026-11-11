@@ -47,9 +47,9 @@ func (g *Graph) sdkFrameworkAidl(name, from string) string {
 
 // sdkAidlRules commit only changed bytes and restat, as Soong does for the combined file (sdk.go commitChangeForRestat): every jaidl edge
 // reads it, so stubs whose Parcelables did not change stop the rebuild there. The tool is a jar-wrapper.sh script, which execs `java` from
-// PATH: the JDK goes first on it, as for d8.
+// PATH: the build's environment puts the pinned JDK first on it, as Soong's does for its ninja.
 const sdkAidlRules = `rule sdkparcelables
-  command = rm -f $out.tmp && PATH=$jdk/bin:$$PATH $tool $in $out.tmp --guarantee_stable && ` + commitIfChanged + `
+  command = rm -f $out.tmp && $tool $in $out.tmp --guarantee_stable && ` + commitIfChanged + `
   restat = 1
   description = sdkparcelables $out
 rule sortu
