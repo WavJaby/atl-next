@@ -91,11 +91,7 @@ impl Args {
                 Some(_) => {}
             }
         }
-        let extra = wanted
-            .host
-            .into_iter()
-            .chain(wanted.nb.iter().map(|m| format!("{NB_GOAL}{m}")));
-        for g in extra {
+        for g in wanted.converter() {
             if !a.goals.contains(&g) {
                 a.goals.push(g);
             }
@@ -617,7 +613,7 @@ fn verdict(failed: Vec<Failure>) -> ExitCode {
 }
 
 /// The converter's goal prefix for a native bridge variant (tools/bp2ninja cc.go nbGoalPrefix).
-const NB_GOAL: &str = "nb:";
+pub(crate) const NB_GOAL: &str = "nb:";
 
 /// Converter flags of the native bridge side, empty without --native-bridge: the guest row's arch, pointer width and Soong arch variant, and `-nb-provided` = the guest LLVM runtimes,
 /// built (runtimes.rs) against the include flags the converter evaluates for bionic's `libc_headers` on that side (`-nb-exports`), so they see the headers the guest libc is compiled with.
@@ -1277,6 +1273,26 @@ fn isa_floor_gate(out: &Path, host: &arches::Host) -> Result<Option<String>> {
 /// The converter's argument file in the out dir (tools/bp2ninja regen.go): build.ninja's regeneration edge reads it, so a changed flag or goal reruns the conversion.
 const CONVERTER_ARGS: &str = "bp2ninja.args";
 
+/// The goals `<out>`'s converter argument file names, None without one: what its build.ninja was converted for. The file is one argument per line, flags first, then the goals (bp2ninja main.go `flag.Args()`); every flag [`convert`]'s argv holds takes a value, so flag and value lines pair up.
+pub(crate) fn converter_goals(out: &Path) -> Result<Option<BTreeSet<String>>> {
+    let file = out.join(CONVERTER_ARGS);
+    if !file.is_file() {
+        return Ok(None);
+    }
+    let text =
+        std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+    Ok(Some(goals_of_args(&text)))
+}
+
+fn goals_of_args(text: &str) -> BTreeSet<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+    while lines.get(i).is_some_and(|l| l.starts_with('-')) {
+        i += 2;
+    }
+    lines.into_iter().skip(i).map(str::to_owned).collect()
+}
+
 /// Brings `<out>/build.ninja` up to date with `argv` (the converter's flags and goals): ninja decides whether to convert again, from the regeneration edge's depfile (every file the last conversion read, this argument file among them).
 /// Bootstrap (`bp2ninja -bootstrap`: a build.ninja holding only that edge) when there is no build.ninja, or the argument file is new: a build.ninja from before it cannot rerun on it.
 fn convert(converter: &Path, out: &Path, argv: &[String]) -> Result<()> {
@@ -1461,6 +1477,17 @@ fn wanted(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The argv shape [`convert`] writes: flag/value pairs (an empty value, a value starting with `-`), then the goals.
+    #[test]
+    fn args_file_goals_follow_the_flags() {
+        let text = "-tree\n/t\n-arch-variant\n\n-defines\n-DX=1\nlibbase\nnb:libc\n";
+        assert_eq!(
+            goals_of_args(text),
+            BTreeSet::from(["libbase".to_owned(), "nb:libc".to_owned()])
+        );
+        assert!(goals_of_args("-tree\n/t\n").is_empty());
+    }
 
     /// Each check `run` can fail by name exits nonzero alone; only none failed exits 0.
     #[test]

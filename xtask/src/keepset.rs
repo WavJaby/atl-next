@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! `cargo xtask keepset`: each `[aosp.sparse]` keep-set derived from the build graphs, and the rows checked against it.
 //!
-//! A read is a tree path a graph names: every token of `<out>/build.ninja` (inputs, implicit and order-only inputs, `cp =` bindings such as a javac classpath), the header reads of its deps log (ninja_deps.rs), the strings of `graph.json` (include dirs), the `Android.bp` of every module a graph or a `cts.toml` row names, and the `<os>/bin` dir of each host row's `soong_prebuilt_os` (`arches.toml`). Reads come from every out dir given (default: each `out/slot-<n>` with a build.ninja).
+//! A read is a tree path a graph names: every token of `<out>/build.ninja` (inputs, implicit and order-only inputs, `cp =` bindings such as a javac classpath), the header reads of its deps log (ninja_deps.rs), the strings of `graph.json` (include dirs), the `Android.bp` of every module a graph or a `cts.toml` row names, and the `<os>/bin` dir of each host row's `soong_prebuilt_os` (`arches.toml`).
+//! Reads come from one graph: this checkout's own slot (slot.rs record), refused unless its converter argument file names every gate's goals (gate_goals.rs `all_converter`, the set `native --for all-gates` builds), so one graph holds the reads of all goals and another checkout's slot (mid-build, other converter code) never enters the check.
 //! Cone mode keeps whole dirs: a project's keep-set is the minimal cover of its reads by non-nested dirs. A dir read keeps itself, a file read keeps its parent dir; root files are always kept. Dir or file is decided on disk.
 //! A read through a tracked symlink needs the link (its project) and the target (the project owning it); see [`locate`].
 //! `[aosp.needed_by]` is checked against per-gate reads ([`groups`]); `cts.toml` rows are reads of gate `cts`.
@@ -22,8 +23,6 @@ use crate::git::git;
 use crate::sources::{self, Aosp, Sources};
 use crate::{arches, cts_table};
 
-/// Out dirs hold `slot-<n>/` (slot.rs); a graph is one with a build.ninja.
-const OUT: &str = "out";
 const NINJA: &str = "build.ninja";
 const GRAPH: &str = "graph.json";
 /// The project of the prebuilt build-only tools: `arches.toml` `soong_prebuilt_os` names `<project>/<os>/bin`.
@@ -35,9 +34,6 @@ const CTS_READ: &str = "cts.toml";
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// Read this out dir, `out/slot-<n>` (repeatable). Default: every slot with a build.ninja.
-    #[arg(long = "slot", value_name = "N")]
-    slots: Vec<u32>,
     /// Fail (exit 1) when a read falls outside its [aosp.sparse] row. Read-only.
     #[arg(long, conflicts_with = "write")]
     check: bool,
@@ -59,8 +55,8 @@ pub struct Need {
 
 /// The reads of the graphs, classified by owning pinned project.
 pub struct Derived {
-    /// Labels of the out dirs read, e.g. `slot-3`.
-    graphs: Vec<String>,
+    /// Label of the out dir read, e.g. `slot-3`.
+    graph: String,
     owned: BTreeMap<String, Vec<Need>>,
     /// Tree paths no pinned project owns (an unpinned project, or a file outside every project).
     unowned: Vec<String>,
@@ -187,7 +183,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             "--project {p}: not a pinned [aosp.projects] path"
         );
     }
-    let derived = derive(root, &layout, &sources, &args.slots)?;
+    let graph = match own_graph(root, &layout)? {
+        Ok(g) => g,
+        Err(why) => bail!("{why}"),
+    };
+    let derived = derive(root, &layout, &sources, &graph)?;
     if args.write {
         write(root, &derived, &args.projects)?;
         return Ok(ExitCode::SUCCESS);
@@ -200,16 +200,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     })
 }
 
-/// Step `keepset` of `xtask check`: every row covers the reads of every workspace graph. `Some(why)` (skipped) without one.
-pub fn check_workspace(root: &Path) -> Result<Option<String>> {
+/// Step `keepset` of `xtask check`: every row covers the reads of this checkout's slot graph. `Some(why)` (skipped) without a slot or a graph: main's land verify holds no slot. A graph converted for fewer goals fails.
+pub fn check_own(root: &Path) -> Result<Option<String>> {
     let layout = Layout::of(root)?;
-    if graphs(layout.workspace(), &[])?.is_empty() {
-        return Ok(Some(
-            "no out/slot-<n>/build.ninja in the workspace: run `cargo xtask native` first".into(),
-        ));
-    }
+    let graph = match own_graph(root, &layout)? {
+        Ok(g) => g,
+        Err(why) => return Ok(Some(why)),
+    };
     let sources = sources::load(root)?;
-    let derived = derive(root, &layout, &sources, &[])?;
+    let derived = derive(root, &layout, &sources, &graph)?;
     let bad = uncovered(&sources, &derived);
     ensure!(
         bad.is_empty(),
@@ -225,42 +224,49 @@ pub fn check_workspace(root: &Path) -> Result<Option<String>> {
     Ok(None)
 }
 
-/// `(label, out dir)` of each graph: the `--slot` values, or every `out/slot-<n>` holding a build.ninja.
-fn graphs(ws: &Path, slots: &[u32]) -> Result<Vec<(String, PathBuf)>> {
-    let out = ws.join(OUT);
-    let mut found = Vec::new();
-    if slots.is_empty() {
-        if !out.is_dir() {
-            return Ok(found);
-        }
-        for entry in fs::read_dir(&out).with_context(|| format!("reading {}", out.display()))? {
-            let name = entry?.file_name().to_string_lossy().into_owned();
-            if let Some(n) = slot_number(&name)
-                && out.join(&name).join(NINJA).is_file()
-            {
-                found.push((format!("slot-{n}"), out.join(&name)));
-            }
-        }
-        found.sort();
-    } else {
-        for n in slots {
-            let dir = out.join(format!("slot-{n}"));
-            ensure!(
-                dir.join(NINJA).is_file(),
-                "--slot {n}: no {} (build the slot first)",
-                dir.join(NINJA).display()
-            );
-            found.push((format!("slot-{n}"), dir));
-        }
+/// `(label, out dir)` of the checkout's own slot graph; `Ok(Err(why))` when there is none to read yet.
+fn own_graph(root: &Path, layout: &Layout) -> Result<Result<(String, PathBuf), String>> {
+    let slot = crate::slot::record_slot(root)?;
+    let required = crate::gate_goals::all_converter()?;
+    select_graph(layout.workspace(), slot, &required)
+}
+
+/// The graph of slot `slot` under `ws`, refused (Err) when its argument file lacks a goal of `required`. No other slot is read: another checkout's graph may be mid-conversion from other code.
+fn select_graph(
+    ws: &Path,
+    slot: Option<u32>,
+    required: &BTreeSet<String>,
+) -> Result<Result<(String, PathBuf), String>> {
+    const FIX: &str = "cargo xtask native --for all-gates";
+    let Some(n) = slot else {
+        return Ok(Err(format!(
+            "this checkout holds no slot: run `cargo xtask slot assign <n> --execute`, then `{FIX}`"
+        )));
+    };
+    let label = format!("slot-{n}");
+    let dir = crate::slot::slot_dir(ws, n);
+    if !dir.join(NINJA).is_file() {
+        return Ok(Err(format!(
+            "no {}: run `{FIX}`",
+            dir.join(NINJA).display()
+        )));
     }
-    Ok(found)
+    let converted = crate::native::converter_goals(&dir)?.unwrap_or_default();
+    let missing: Vec<&str> = required
+        .iter()
+        .filter(|g| !converted.contains(*g))
+        .map(String::as_str)
+        .collect();
+    ensure!(
+        missing.is_empty(),
+        "{label}'s graph was not converted for every gate's goals, so it lacks the reads of {} goal(s): {}: run `{FIX}`",
+        missing.len(),
+        missing.join(" ")
+    );
+    Ok(Ok((label, dir)))
 }
 
-fn slot_number(name: &str) -> Option<u32> {
-    name.strip_prefix("slot-")?.parse().ok()
-}
-
-/// One independent scan of one graph: [`derive`] runs them all in parallel, each into its own [`Reads`], merged after.
+/// One independent scan of the graph: [`derive`] runs them in parallel, each into its own [`Reads`], merged after.
 #[derive(Clone, Copy)]
 enum Scan {
     Ninja,
@@ -268,19 +274,17 @@ enum Scan {
     Json,
 }
 
-/// Reads of the graphs and tables, classified. Per graph, build.ninja, its deps log and graph.json are scanned in parallel (each single-threaded and independent; serial they were ~3/4 of the step).
-fn derive(root: &Path, layout: &Layout, sources: &Sources, slots: &[u32]) -> Result<Derived> {
-    let ws = layout.workspace();
-    let prefixes = Prefixes::new(ws);
-    let outs = graphs(ws, slots)?;
-    let units: Vec<(&str, &Path, Scan)> = outs
-        .iter()
-        .flat_map(|(label, out)| {
-            [Scan::Ninja, Scan::Deps, Scan::Json].map(|s| (label.as_str(), out.as_path(), s))
-        })
-        .collect();
-    let workers = std::thread::available_parallelism().map_or(1, usize::from);
-    let scanned = crate::par::map(&units, workers, |&(label, out, scan)| {
+/// Reads of the graph and tables, classified. build.ninja, its deps log and graph.json are scanned in parallel (each single-threaded and independent; serial they were ~3/4 of the step).
+fn derive(
+    root: &Path,
+    layout: &Layout,
+    sources: &Sources,
+    (label, out): &(String, PathBuf),
+) -> Result<Derived> {
+    let prefixes = Prefixes::new(layout.workspace());
+    let (label, out) = (label.as_str(), out.as_path());
+    let units = [Scan::Ninja, Scan::Deps, Scan::Json];
+    let scanned = crate::par::map(&units, units.len(), |&scan| {
         let mut reads = Reads::default();
         let mut modules = BTreeMap::new();
         match scan {
@@ -351,7 +355,7 @@ fn derive(root: &Path, layout: &Layout, sources: &Sources, slots: &[u32]) -> Res
         }
     }
     let mut derived = Derived {
-        graphs: outs.iter().map(|(label, _)| label.clone()).collect(),
+        graph: label.to_owned(),
         owned: BTreeMap::new(),
         unowned: Vec::new(),
         missing: Vec::new(),
@@ -893,8 +897,8 @@ fn uncovered(sources: &Sources, derived: &Derived) -> Vec<String> {
 fn show(layout: &Layout, sources: &Sources, derived: &Derived, only: &[String]) -> usize {
     let tree = layout.src().join("aosp");
     println!(
-        "keepset: graphs {}; {} project(s) read; unowned {} tree path(s); absent from the pinned tree {}",
-        derived.graphs.join(" "),
+        "keepset: graph {}; {} project(s) read; unowned {} tree path(s); absent from the pinned tree {}",
+        derived.graph,
         derived.owned.len(),
         derived.unowned.len(),
         derived.missing.len()
@@ -1158,6 +1162,58 @@ mod tests {
             .filter(|k| !needs.iter().any(|n| covers(k, &n.keep)))
             .count();
         assert_eq!(unused, 1);
+    }
+
+    /// A scratch workspace: slot 1 half-converted (partial goals, garbage graph, as another checkout mid-build), slot 2 converted for the full set `{a, nb:b}`, slot 3 for `{a}` only.
+    fn scratch_ws(tag: &str) -> PathBuf {
+        let ws = std::env::temp_dir().join(format!("xtask-keepset-{tag}-{}", std::process::id()));
+        let slot = |n: u32, ninja: &str, args: &str| {
+            let dir = crate::slot::slot_dir(&ws, n);
+            fs::create_dir_all(&dir).expect("slot dir");
+            fs::write(dir.join(NINJA), ninja).expect("build.ninja");
+            fs::write(dir.join("bp2ninja.args"), args).expect("args");
+        };
+        slot(1, "build $broken: \n", "-tree\n/t\na\n");
+        slot(2, "", "-tree\n/t\na\nnb:b\naidl-extra\n");
+        slot(3, "", "-tree\n/t\na\n");
+        ws
+    }
+
+    fn full() -> BTreeSet<String> {
+        BTreeSet::from(["a".to_owned(), "nb:b".to_owned()])
+    }
+
+    /// Only the checkout's own slot is read, whatever state the others are in.
+    #[test]
+    fn reads_only_the_own_slot() {
+        let ws = scratch_ws("own");
+        let got = select_graph(&ws, Some(2), &full())
+            .expect("full set")
+            .expect("a graph");
+        assert_eq!(got, ("slot-2".to_owned(), crate::slot::slot_dir(&ws, 2)));
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// A graph converted for fewer goals is refused, naming the slot, each missing goal and the command.
+    #[test]
+    fn partial_goal_set_is_refused() {
+        let ws = scratch_ws("partial");
+        let err = select_graph(&ws, Some(3), &full()).expect_err("partial set");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("slot-3") && msg.contains("1 goal(s): nb:b"),
+            "{msg}"
+        );
+        assert!(msg.contains("cargo xtask native --for all-gates"), "{msg}");
+        let none = select_graph(&ws, None, &full())
+            .expect("no slot")
+            .expect_err("skip");
+        assert!(none.contains("cargo xtask slot assign"), "{none}");
+        let unbuilt = select_graph(&ws, Some(4), &full())
+            .expect("no graph")
+            .expect_err("skip");
+        assert!(unbuilt.contains("build.ninja"), "{unbuilt}");
+        fs::remove_dir_all(&ws).expect("cleanup");
     }
 
     #[test]

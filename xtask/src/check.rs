@@ -37,7 +37,7 @@ enum Step {
     Tables,
     /// deps.toml rows against this host: installed at the required version (`deps --check`)
     Deps,
-    /// every [aosp.sparse] row covers the reads of every workspace out dir's build graph (keepset.rs); skipped without one
+    /// every [aosp.sparse] row covers the reads of this checkout's slot graph, converted for every gate's goals (keepset.rs); skipped without a slot or graph
     Keepset,
     /// modules.toml equals the real cross-module crate graph
     Modules,
@@ -141,8 +141,8 @@ impl Step {
     /// Runs the step; `Some(why)` when it checked only part of its input (named skipped, as [`Step::skip`]).
     fn run(self, root: &Path, out: &Path) -> Result<Option<String>> {
         if self == Step::Keepset {
-            // reads the workspace's graphs (every out/slot-<n>), not this checkout's out dir
-            return crate::keepset::check_workspace(root);
+            // reads the checkout's slot record (keepset.rs own_graph), not an explicit --out
+            return crate::keepset::check_own(root);
         }
         if self == Step::ConverterPackages {
             // the packages link the slot's converter rlibs: a slot built before a rebase fails late (E0432 on main's new parcelables), so refuse it by name, as the runtime gates do

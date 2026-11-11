@@ -55,6 +55,24 @@ impl Goals {
         r.extend(self.nb.iter().map(|m| nb_key(host_arch, m)));
         r
     }
+
+    /// As the converter's argument file names them (native.rs `CONVERTER_ARGS`): `<module>`, then `nb:<module>`.
+    pub fn converter(&self) -> Vec<String> {
+        self.host
+            .iter()
+            .cloned()
+            .chain(
+                self.nb
+                    .iter()
+                    .map(|m| format!("{}{m}", crate::native::NB_GOAL)),
+            )
+            .collect()
+    }
+}
+
+/// Every gate's goals (`native --for all-gates`), as the converter's argument file names them: the set a slot's graph must cover for keepset to read it (keepset.rs).
+pub fn all_converter() -> Result<BTreeSet<String>> {
+    Ok(union(&[ALL.to_owned()])?.converter().into_iter().collect())
 }
 
 /// The record's name of nb goal `module` built with `--native-bridge <arch>`.
