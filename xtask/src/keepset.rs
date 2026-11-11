@@ -3,7 +3,9 @@
 //!
 //! A read is a tree path a graph names: every token of `<out>/build.ninja` (inputs, implicit and order-only inputs, `cp =` bindings such as a javac classpath), the header reads of its deps log (ninja_deps.rs), the strings of `graph.json` (include dirs), the `Android.bp` of every module a graph or a `cts.toml` row names, and the `<os>/bin` dir of each host row's `soong_prebuilt_os` (`arches.toml`). Reads come from every out dir given (default: each `out/slot-<n>` with a build.ninja).
 //! Cone mode keeps whole dirs: a project's keep-set is the minimal cover of its reads by non-nested dirs. A dir read keeps itself, a file read keeps its parent dir; root files are always kept. Dir or file is decided on disk.
-//! `--check` (step `keepset` of `xtask check`) fails when a read falls outside its row. A row dir no read needs is listed, not failed. `--write --project P` writes the derived set; a checkout changes only through `xtask fetch --recreate`.
+//! A read through a tracked symlink needs the link (its project) and the target (the project owning it); see [`locate`].
+//! `[aosp.needed_by]` is checked against per-gate reads ([`groups`]); `cts.toml` rows are reads of gate `cts`.
+//! `--check` (step `keepset` of `xtask check`) fails when a read falls outside its row or a `needed_by` row disagrees with the gates' reads. A row dir no read needs is listed, not failed. `--write --project P` writes the derived set; a checkout changes only through `xtask fetch --recreate`.
 //! Limits: a header read exists only for an edge some deps log has built, so an unbuilt edge contributes its include dirs from graph.json instead. The converter parses every `Android.bp` of the tree; only the ones a graph names are reads here, and the gates build what a dropped one would break.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,6 +28,10 @@ const NINJA: &str = "build.ninja";
 const GRAPH: &str = "graph.json";
 /// The project of the prebuilt build-only tools: `arches.toml` `soong_prebuilt_os` names `<project>/<os>/bin`.
 const BUILD_TOOLS: &str = "prebuilts/build-tools";
+/// `from` of a graph module's `Android.bp` read: attributed per gate ([`GateReads`]), not core.
+const MODULE_READ: &str = "android.bp (graph module)";
+/// `from` of a `cts.toml` row's `Android.bp` read: a read of gate `cts`.
+const CTS_READ: &str = "cts.toml";
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -60,6 +66,116 @@ pub struct Derived {
     unowned: Vec<String>,
     /// Reads absent from their project's HEAD tree: a graph older than the pin, or a path a link or copy creates.
     missing: Vec<String>,
+    /// Gate attribution for `[aosp.needed_by]` ([`groups`]).
+    gates: GateReads,
+}
+
+/// Which gates read which projects. Graph modules are attributed per gate by the closure of the gate's goals over graph.json `deps`; every other graph read (a ninja token, a deps-log header, a graph.json string, a module outside every gate's closure) is a `core` read: it cannot be split by gate, so it counts as read by every build.
+#[derive(Default)]
+pub struct GateReads {
+    /// Module name -> module names it depends on, over every graph.
+    deps: BTreeMap<String, BTreeSet<String>>,
+    /// Module name -> projects owning its `Android.bp` files.
+    module_projects: BTreeMap<String, BTreeSet<String>>,
+    /// Gate -> its goals as module names.
+    goals: BTreeMap<String, BTreeSet<String>>,
+    /// Projects read by a non-module graph read (the `core` reads).
+    core: BTreeSet<String>,
+    /// Projects read by `cts.toml` rows: reads of gate `cts`.
+    cts: BTreeSet<String>,
+}
+
+/// The gate `cts.toml` rows belong to (gate_goals.rs `GATES`).
+const CTS_GATE: &str = "cts";
+/// The reader name of core reads in a [`groups`] failure.
+const CORE: &str = "core (a graph read no gate's goal closure explains)";
+
+impl GateReads {
+    /// Gate -> projects it reads: owners of every module in its goals' closure, plus the `cts.toml` projects for gate `cts`.
+    fn per_gate(&self) -> BTreeMap<String, BTreeSet<String>> {
+        let mut out = BTreeMap::new();
+        for (gate, goals) in &self.goals {
+            let mut seen: BTreeSet<&str> = BTreeSet::new();
+            let mut todo: Vec<&str> = goals.iter().map(String::as_str).collect();
+            while let Some(m) = todo.pop() {
+                if seen.insert(m) {
+                    todo.extend(self.deps.get(m).into_iter().flatten().map(String::as_str));
+                }
+            }
+            let mut projects: BTreeSet<String> = seen
+                .iter()
+                .flat_map(|m| self.module_projects.get(*m).into_iter().flatten().cloned())
+                .collect();
+            if gate == CTS_GATE {
+                projects.extend(self.cts.iter().cloned());
+            }
+            out.insert(gate.clone(), projects);
+        }
+        out
+    }
+
+    /// Projects some graph module reads although no gate's closure holds the module: core reads.
+    fn orphan_module_projects(&self) -> BTreeSet<String> {
+        let mut reached: BTreeSet<&str> = BTreeSet::new();
+        let mut todo: Vec<&str> = self.goals.values().flatten().map(String::as_str).collect();
+        while let Some(m) = todo.pop() {
+            if reached.insert(m) {
+                todo.extend(self.deps.get(m).into_iter().flatten().map(String::as_str));
+            }
+        }
+        self.module_projects
+            .iter()
+            .filter(|(m, _)| !reached.contains(m.as_str()) && self.deps.contains_key(*m))
+            .flat_map(|(_, p)| p.iter().cloned())
+            .collect()
+    }
+}
+
+/// `[aosp.needed_by]` against the gates' reads, one line per failure:
+/// (a) a reader outside a row's list (core included) reads the project; (b) a listed gate reads nothing there; (c) a project only gate-table reads (`cts.toml`) reach and no graph reads has no row (it would be fetched for every build).
+fn groups(sources: &Sources, gates: &GateReads) -> Vec<String> {
+    let per_gate = gates.per_gate();
+    let mut core = gates.core.clone();
+    core.extend(gates.orphan_module_projects());
+    let read_by_graph = |p: &str| {
+        core.contains(p)
+            || per_gate
+                .iter()
+                .any(|(g, ps)| ps.contains(p) && (g != CTS_GATE || !gates.cts.contains(p)))
+    };
+    let mut out = Vec::new();
+    for (project, listed) in &sources.aosp.needed_by {
+        let mut readers: Vec<&str> = per_gate
+            .iter()
+            .filter(|(_, ps)| ps.contains(project))
+            .map(|(g, _)| g.as_str())
+            .collect();
+        if core.contains(project) {
+            readers.push(CORE);
+        }
+        for r in &readers {
+            if !listed.iter().any(|l| l == r) {
+                out.push(format!(
+                    "{project}: read by {r}, not in its needed_by {listed:?}"
+                ));
+            }
+        }
+        for l in listed {
+            if !readers.contains(&l.as_str()) {
+                out.push(format!(
+                    "{project}: needed_by names gate `{l}`, which reads nothing there"
+                ));
+            }
+        }
+    }
+    for project in &gates.cts {
+        if !sources.aosp.needed_by.contains_key(project) && !read_by_graph(project) {
+            out.push(format!(
+                "{project}: read only by gate `{CTS_GATE}` (cts.toml), no [aosp.needed_by] row: add `\"{project}\" = [\"{CTS_GATE}\"]`"
+            ));
+        }
+    }
+    out
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
@@ -98,6 +214,12 @@ pub fn check_workspace(root: &Path) -> Result<Option<String>> {
     ensure!(
         bad.is_empty(),
         "[aosp.sparse] rows miss reads of the build graphs (cargo xtask keepset --check):\n  {}",
+        bad.join("\n  ")
+    );
+    let bad = groups(&sources, &derived.gates);
+    ensure!(
+        bad.is_empty(),
+        "[aosp.needed_by] rows disagree with the gates' reads (cargo xtask keepset --check):\n  {}",
         bad.join("\n  ")
     );
     Ok(None)
@@ -160,7 +282,7 @@ fn derive(root: &Path, layout: &Layout, sources: &Sources, slots: &[u32]) -> Res
     let workers = std::thread::available_parallelism().map_or(1, usize::from);
     let scanned = crate::par::map(&units, workers, |&(label, out, scan)| {
         let mut reads = Reads::default();
-        let mut modules = BTreeSet::new();
+        let mut modules = BTreeMap::new();
         match scan {
             Scan::Ninja => scan_ninja(
                 &out.join(NINJA),
@@ -181,25 +303,43 @@ fn derive(root: &Path, layout: &Layout, sources: &Sources, slots: &[u32]) -> Res
         Ok::<_, anyhow::Error>((reads, modules))
     });
     let mut reads = Reads::default();
-    let mut graph_modules = BTreeSet::new();
+    let mut gates = GateReads::default();
     for r in scanned {
         let (part, modules) = r?;
         reads.merge(part);
-        graph_modules.extend(modules);
+        for (m, deps) in modules {
+            gates.deps.entry(m).or_default().extend(deps);
+        }
     }
     let index = Index::load(root, &sources.aosp)?;
     let projects: Vec<&str> = sources.aosp.projects.keys().map(String::as_str).collect();
-    for name in &graph_modules {
+    for name in gates.deps.keys() {
         for file in module_files(&index, name, &projects) {
-            reads.add(&file, "android.bp (graph module)");
+            reads.add(&file, MODULE_READ);
+            if let Some(p) = owner(&file, &projects) {
+                gates
+                    .module_projects
+                    .entry(name.clone())
+                    .or_default()
+                    .insert(p.to_owned());
+            }
         }
     }
     for (name, row) in cts_table::load(root)? {
         for module in std::iter::once(name).chain(row.apps) {
             for file in module_files(&index, &module, &projects) {
-                reads.add(&file, "cts.toml");
+                reads.add(&file, CTS_READ);
+                if let Some(p) = owner(&file, &projects) {
+                    gates.cts.insert(p.to_owned());
+                }
             }
         }
+    }
+    for (gate, _) in crate::gate_goals::GATES {
+        let g = crate::gate_goals::of(gate)?;
+        gates
+            .goals
+            .insert((*gate).to_owned(), g.host.into_iter().chain(g.nb).collect());
     }
     for arch in arches::load(root)?.values() {
         if let Some(os) = arch
@@ -215,31 +355,49 @@ fn derive(root: &Path, layout: &Layout, sources: &Sources, slots: &[u32]) -> Res
         owned: BTreeMap::new(),
         unowned: Vec::new(),
         missing: Vec::new(),
+        gates,
     };
     // dir or file, and presence, come from the owning checkout's HEAD tree, so a sparse checkout classifies the same as a full one
     let mut trees = Trees::new(layout.src().join("aosp"));
     let links = manifest_links(root, &sources.aosp)?;
     for (rel, from) in &reads.0 {
-        match locate(&mut trees, &projects, &links, rel)? {
-            Some((project, path, is_dir)) => {
-                let keep = if is_dir { path.as_str() } else { parent(&path) };
-                derived.owned.entry(project).or_default().push(Need {
-                    keep: keep.to_owned(),
-                    path,
-                    from: from.clone(),
-                });
+        let core = from.iter().any(|f| f != MODULE_READ && f != CTS_READ);
+        let located = locate(&mut trees, &projects, &links, rel)?;
+        if located.is_empty() {
+            if owner(rel, &projects).is_none() {
+                derived.unowned.push(rel.clone());
+            } else {
+                derived.missing.push(rel.clone());
             }
-            None if owner(rel, &projects).is_none() => derived.unowned.push(rel.clone()),
-            None => derived.missing.push(rel.clone()),
+        }
+        for (project, path, is_dir) in located {
+            if core {
+                derived.gates.core.insert(project.clone());
+            }
+            let keep = if is_dir { path.as_str() } else { parent(&path) };
+            derived.owned.entry(project).or_default().push(Need {
+                keep: keep.to_owned(),
+                path,
+                from: from.clone(),
+            });
         }
     }
     Ok(derived)
 }
 
+/// One entry of a HEAD tree.
+#[derive(Debug, Clone, PartialEq)]
+enum Entry {
+    Dir,
+    File,
+    /// A tracked symlink (mode 120000): its target, as written (relative to the link's dir).
+    Link(String),
+}
+
 /// Each checkout's HEAD tree, listed once on first use.
 struct Trees {
     root: PathBuf,
-    cache: BTreeMap<String, BTreeMap<String, bool>>,
+    cache: BTreeMap<String, BTreeMap<String, Entry>>,
 }
 
 impl Trees {
@@ -250,7 +408,7 @@ impl Trees {
         }
     }
 
-    fn of(&mut self, project: &str) -> Result<&BTreeMap<String, bool>> {
+    fn of(&mut self, project: &str) -> Result<&BTreeMap<String, Entry>> {
         if !self.cache.contains_key(project) {
             let listing = project_tree(&self.root.join(project))?;
             self.cache.insert(project.to_owned(), listing);
@@ -261,19 +419,91 @@ impl Trees {
     }
 }
 
-/// Path -> whether it is a dir, for every entry of a checkout's HEAD tree (`ls-tree -r -t`). A blobless partial clone keeps every tree, so a sparse checkout lists what its keep-set omits too. Empty when the checkout is absent.
-fn project_tree(dir: &Path) -> Result<BTreeMap<String, bool>> {
+/// Path -> entry for every entry of a checkout's HEAD tree (`ls-tree -r -t`). A blobless partial clone keeps every tree, so a sparse checkout lists what its keep-set omits too. Empty when the checkout is absent.
+/// A symlink's target is its blob, read with lazy fetch off (`GIT_NO_LAZY_FETCH`: a check never touches the network); a blob a blobless clone never fetched falls back to the link on disk, else the entry stays a file (its reads then report absent).
+fn project_tree(dir: &Path) -> Result<BTreeMap<String, Entry>> {
     if !dir.join(".git").exists() {
         return Ok(BTreeMap::new());
     }
     let text = git(Some(dir), &["ls-tree", "-r", "-t", "-z", "HEAD"])?;
     let mut out = BTreeMap::new();
+    let mut links = Vec::new();
     for record in text.split('\0').filter(|r| !r.is_empty()) {
         let (meta, path) = record
             .split_once('\t')
             .with_context(|| format!("ls-tree record without a tab: {record}"))?;
-        let kind = meta.split_whitespace().nth(1).unwrap_or_default();
-        out.insert(path.to_owned(), kind == "tree");
+        let mut meta = meta.split_whitespace();
+        let (mode, kind, oid) = (meta.next(), meta.next(), meta.next());
+        let entry = match (mode, kind) {
+            (_, Some("tree")) => Entry::Dir,
+            (Some("120000"), _) => {
+                links.push((path.to_owned(), oid.unwrap_or_default().to_owned()));
+                Entry::File
+            }
+            _ => Entry::File,
+        };
+        out.insert(path.to_owned(), entry);
+    }
+    if !links.is_empty() {
+        let input: String = links.iter().map(|(_, oid)| format!("{oid}\n")).collect();
+        let batch = link_blobs(dir, &input)?;
+        for ((path, _), target) in links.iter().zip(batch) {
+            let target = target.or_else(|| {
+                fs::read_link(dir.join(path))
+                    .ok()
+                    .map(|t| t.display().to_string())
+            });
+            if let Some(t) = target {
+                out.insert(path.clone(), Entry::Link(t));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `git cat-file --batch` of newline-separated oids, lazy fetch off: each blob's text, `None` where the object is missing locally.
+fn link_blobs(dir: &Path, oids: &str) -> Result<Vec<Option<String>>> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("git")
+        .current_dir(dir)
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .args(["cat-file", "--batch"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("git cat-file in {}", dir.display()))?;
+    let mut stdin = child.stdin.take().context("cat-file stdin")?;
+    let input = oids.to_owned();
+    let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+    let out = child.wait_with_output()?;
+    writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("cat-file writer panicked"))??;
+    parse_batch(&out.stdout)
+}
+
+/// `cat-file --batch` output: `<oid> blob <size>\n<bytes>\n` per object, `<oid> missing\n` for an absent one.
+fn parse_batch(mut bytes: &[u8]) -> Result<Vec<Option<String>>> {
+    let mut out = Vec::new();
+    while !bytes.is_empty() {
+        let nl = bytes
+            .iter()
+            .position(|&b| b == b'\n')
+            .context("cat-file header without a newline")?;
+        let header = std::str::from_utf8(&bytes[..nl])?;
+        bytes = &bytes[nl + 1..];
+        let fields: Vec<&str> = header.split_whitespace().collect();
+        match fields.as_slice() {
+            [_, "missing"] => out.push(None),
+            [_, _, size] => {
+                let n: usize = size.parse().context("cat-file size")?;
+                ensure!(bytes.len() > n, "cat-file output cut short");
+                out.push(Some(String::from_utf8_lossy(&bytes[..n]).into_owned()));
+                bytes = &bytes[n + 1..];
+            }
+            _ => bail!("cat-file header `{header}`"),
+        }
     }
     Ok(out)
 }
@@ -306,31 +536,95 @@ fn link_target(rel: &str, links: &[(String, String)]) -> Option<String> {
     })
 }
 
-/// Where a read lives in the pinned trees: (owning project, project-relative path, is dir). Follows manifest links (at most two hops). `None`: no pinned tree holds it.
+/// Hops a read may take through manifest links and tracked symlinks before it counts as absent (a cycle ends here too).
+const MAX_HOPS: usize = 8;
+
+/// Where a read lives in the pinned trees: each (owning project, project-relative path, is dir) the read needs. Empty: no pinned tree holds it.
+/// Follows manifest links and tracked in-tree symlinks. A read through a symlink needs the link itself (a file of its project, kept by its parent dir) and the target; a target that leaves the link's project is a tree path like any other and belongs to the project owning it, since that checkout holds the bytes read -- the link's project still owns the link entry.
 fn locate(
     trees: &mut Trees,
     projects: &[&str],
     links: &[(String, String)],
     rel: &str,
-) -> Result<Option<(String, String, bool)>> {
+) -> Result<Vec<(String, String, bool)>> {
     let mut rel = rel.to_owned();
-    for _ in 0..3 {
+    let mut via = Vec::new();
+    for _ in 0..MAX_HOPS {
         let Some(project) = owner(&rel, projects) else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
-        let path = rel[project.len()..].trim_start_matches('/');
+        let path = rel[project.len()..].trim_start_matches('/').to_owned();
         if path.is_empty() {
-            return Ok(Some((project.to_owned(), String::new(), true)));
+            via.push((project.to_owned(), String::new(), true));
+            return Ok(via);
         }
-        if let Some(&dir) = trees.of(project)?.get(path) {
-            return Ok(Some((project.to_owned(), path.to_owned(), dir)));
+        let tree = trees.of(project)?;
+        match tree.get(&path) {
+            Some(Entry::Dir) => {
+                via.push((project.to_owned(), path, true));
+                return Ok(via);
+            }
+            Some(Entry::File) => {
+                via.push((project.to_owned(), path, false));
+                return Ok(via);
+            }
+            Some(Entry::Link(_)) | None => {}
+        }
+        if let Some((link, target)) = through_symlink(tree, &path) {
+            via.push((project.to_owned(), link, false));
+            match target {
+                Some(t) => {
+                    rel = format!("{project}/{t}");
+                    rel = normalize(&rel).unwrap_or_default();
+                    if rel.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    continue;
+                }
+                None => return Ok(Vec::new()),
+            }
         }
         match link_target(&rel, links) {
             Some(target) => rel = target,
-            None => return Ok(None),
+            None => return Ok(Vec::new()),
         }
     }
-    Ok(None)
+    Ok(Vec::new())
+}
+
+/// The deepest-first symlink on `path`'s way: (link path, the path read with the link replaced by its target, relative to the project, may hold `..`). `None` when no prefix of `path` is a tracked symlink.
+fn through_symlink(tree: &BTreeMap<String, Entry>, path: &str) -> Option<(String, Option<String>)> {
+    let mut prefix = path;
+    loop {
+        if let Some(Entry::Link(target)) = tree.get(prefix) {
+            let rest = &path[prefix.len()..];
+            let base = parent(prefix);
+            let joined = if target.starts_with('/') {
+                return Some((prefix.to_owned(), None));
+            } else if base.is_empty() {
+                format!("{target}{rest}")
+            } else {
+                format!("{base}/{target}{rest}")
+            };
+            return Some((prefix.to_owned(), Some(joined)));
+        }
+        prefix = prefix.rsplit_once('/')?.0;
+    }
+}
+
+/// `a/./b/../c` -> `a/c`. `None` when `..` climbs above the tree root.
+fn normalize(path: &str) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    for c in path.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            c => parts.push(c),
+        }
+    }
+    Some(parts.join("/"))
 }
 
 /// Tree-relative path -> the graphs and tables that read it.
@@ -473,8 +767,8 @@ fn scan_json(value: &serde_json::Value, prefixes: &Prefixes, from: &str, reads: 
     }
 }
 
-/// The module names a graph.json names: its goals, the keys and values of `deps`, and the keys of `artifacts`.
-fn json_modules(json: &serde_json::Value) -> BTreeSet<String> {
+/// The module names a graph.json names (its goals, the keys and values of `deps`, the keys of `artifacts`), each with the module names its `deps` entry lists.
+fn json_modules(json: &serde_json::Value) -> BTreeMap<String, BTreeSet<String>> {
     let strings = |v: Option<&serde_json::Value>| -> Vec<String> {
         match v {
             Some(serde_json::Value::Array(items)) => items
@@ -484,24 +778,29 @@ fn json_modules(json: &serde_json::Value) -> BTreeSet<String> {
             _ => Vec::new(),
         }
     };
-    let mut names = BTreeSet::new();
-    names.extend(
-        strings(json.get("goals"))
-            .iter()
-            .map(|s| module_name(s).to_owned()),
-    );
+    let mut names: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for s in strings(json.get("goals")) {
+        names.entry(module_name(&s).to_owned()).or_default();
+    }
     if let Some(deps) = json.get("deps").and_then(serde_json::Value::as_object) {
         for (module, needs) in deps {
-            names.insert(module_name(module).to_owned());
-            names.extend(
-                strings(Some(needs))
-                    .iter()
-                    .map(|s| module_name(s).to_owned()),
-            );
+            let needs: Vec<String> = strings(Some(needs))
+                .iter()
+                .map(|s| module_name(s).to_owned())
+                .collect();
+            for n in &needs {
+                names.entry(n.clone()).or_default();
+            }
+            names
+                .entry(module_name(module).to_owned())
+                .or_default()
+                .extend(needs);
         }
     }
     if let Some(artifacts) = json.get("artifacts").and_then(serde_json::Value::as_object) {
-        names.extend(artifacts.keys().map(|k| module_name(k).to_owned()));
+        for k in artifacts.keys() {
+            names.entry(module_name(k).to_owned()).or_default();
+        }
     }
     names
 }
@@ -648,7 +947,11 @@ fn show(layout: &Layout, sources: &Sources, derived: &Derived, only: &[String]) 
             println!("  apparent bytes: keep-set {kept} of {total} (root files not counted)");
         }
     }
-    uncovered(sources, derived).len()
+    let groups = groups(sources, &derived.gates);
+    for g in &groups {
+        println!("needed_by: {g}");
+    }
+    uncovered(sources, derived).len() + groups.len()
 }
 
 /// Apparent size of a tree: regular files under `path`, symlinks not followed.
@@ -865,5 +1168,156 @@ mod tests {
             need("LICENSE", ""),
         ];
         assert_eq!(keep_set(&needs), ["35", "tools"]);
+    }
+
+    /// Trees with fixed listings: `system/core` holds `include/utils -> ../libutils/include/utils` (the F0 case) and `include/far -> ../../../external/x/inc`, which leaves the project.
+    fn trees() -> Trees {
+        let mut t = Trees::new(PathBuf::from("/none"));
+        let core: BTreeMap<String, Entry> = [
+            ("include", Entry::Dir),
+            (
+                "include/utils",
+                Entry::Link("../libutils/include/utils".into()),
+            ),
+            ("include/far", Entry::Link("../../../external/x/inc".into())),
+            ("include/loop", Entry::Link("loop".into())),
+            ("libutils/include/utils", Entry::Dir),
+            ("libutils/include/utils/FastStrcmp.h", Entry::File),
+        ]
+        .into_iter()
+        .map(|(p, e)| (p.to_owned(), e))
+        .collect();
+        let x: BTreeMap<String, Entry> = [("inc", Entry::Dir), ("inc/a.h", Entry::File)]
+            .into_iter()
+            .map(|(p, e)| (p.to_owned(), e))
+            .collect();
+        t.cache.insert("system/core".into(), core);
+        t.cache.insert("external/x".into(), x);
+        t
+    }
+
+    #[test]
+    fn symlink_reads_need_link_and_target() {
+        let mut t = trees();
+        let projects = ["system/core", "external/x"];
+        let got = locate(
+            &mut t,
+            &projects,
+            &[],
+            "system/core/include/utils/FastStrcmp.h",
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            [
+                ("system/core".into(), "include/utils".into(), false),
+                (
+                    "system/core".into(),
+                    "libutils/include/utils/FastStrcmp.h".into(),
+                    false
+                ),
+            ]
+        );
+        // leaving the project: the link stays system/core's, the bytes are external/x's
+        let got = locate(&mut t, &projects, &[], "system/core/include/far/a.h").unwrap();
+        assert_eq!(
+            got,
+            [
+                ("system/core".into(), "include/far".into(), false),
+                ("external/x".into(), "inc/a.h".into(), false),
+            ]
+        );
+        // a self-loop ends at MAX_HOPS as absent; a dangling target is absent
+        assert!(
+            locate(&mut t, &projects, &[], "system/core/include/loop/z")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            locate(&mut t, &projects, &[], "system/core/include/utils/nope.h")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cat_file_batch_output() {
+        let out = b"aa blob 3\nx/y\nbb missing\ncc blob 0\n\n";
+        assert_eq!(
+            parse_batch(out).unwrap(),
+            [Some("x/y".to_owned()), None, Some(String::new())]
+        );
+        assert_eq!(normalize("a/./b/../c"), Some("a/c".into()));
+        assert_eq!(normalize("a/../.."), None);
+    }
+
+    /// Fixture: gate `cts` and `instrument` share goal `inst`; gate `gl` has goal `egl`. `inst` -> `libc`; `egl` -> `angle`.
+    fn gate_reads() -> GateReads {
+        let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
+        let mut g = GateReads::default();
+        for (m, d) in [
+            ("inst", &["libc"][..]),
+            ("egl", &["angle"]),
+            ("libc", &[]),
+            ("angle", &[]),
+        ] {
+            g.deps.insert(m.into(), set(d));
+        }
+        g.module_projects.insert("libc".into(), set(&["bionic"]));
+        g.module_projects
+            .insert("angle".into(), set(&["external/angle"]));
+        g.goals.insert("cts".into(), set(&["inst"]));
+        g.goals.insert("instrument".into(), set(&["inst"]));
+        g.goals.insert("gl".into(), set(&["egl"]));
+        g.cts = set(&["cts"]);
+        g
+    }
+
+    fn sources_with(needed_by: &str) -> Sources {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        sources::parse(&format!(
+            "[aosp]\nremote = \"https://h/\"\ntag = \"t\"\nmanifest = \"{sha}\"\n[aosp.projects]\ncts = \"{sha}\"\nbionic = \"{sha}\"\n\"external/angle\" = \"{sha}\"\n[aosp.needed_by]\n{needed_by}"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn needed_by_against_gate_reads() {
+        let g = gate_reads();
+        assert!(groups(&sources_with("cts = [\"cts\"]\n"), &g).is_empty());
+        assert!(groups(&sources_with("\"external/angle\" = [\"gl\"]\n"), &g).len() == 1); // cts lacks its row
+        // the break: cts without its row is named with the row to add
+        let e = groups(&sources_with(""), &g);
+        assert_eq!(
+            e,
+            [
+                "cts: read only by gate `cts` (cts.toml), no [aosp.needed_by] row: add `\"cts\" = [\"cts\"]`"
+            ]
+        );
+        // (a) a gate outside the list reads it: bionic is read by cts and instrument
+        let e = groups(&sources_with("cts = [\"cts\"]\nbionic = [\"cts\"]\n"), &g);
+        assert_eq!(
+            e,
+            ["bionic: read by instrument, not in its needed_by [\"cts\"]"]
+        );
+        // (b) a listed gate reads nothing there
+        let e = groups(&sources_with("cts = [\"cts\", \"gl\"]\n"), &g);
+        assert_eq!(
+            e,
+            ["cts: needed_by names gate `gl`, which reads nothing there"]
+        );
+        // (a) core: a non-module graph read
+        let mut core = gate_reads();
+        core.core.insert("external/angle".into());
+        let e = groups(
+            &sources_with("cts = [\"cts\"]\n\"external/angle\" = [\"gl\"]\n"),
+            &core,
+        );
+        assert_eq!(
+            e,
+            [format!(
+                "external/angle: read by {CORE}, not in its needed_by [\"gl\"]"
+            )]
+        );
     }
 }

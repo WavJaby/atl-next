@@ -13,6 +13,8 @@
 #   sparse    optional, `[aosp.sparse]`: AOSP tree path (a `projects` key) -> keep-set, cone-mode directories (tree-relative; root files always kept). Absent = whole tree.
 #             A keep-set checkout is a blobless partial clone; each listed dir must exist at the pin; the keep-set is fixed at creation.
 #             Derived by `cargo xtask keepset --write --project <path>` from the build graphs; applied by `cargo xtask fetch --recreate <path>`.
+#   needed_by optional, `[aosp.needed_by]`: AOSP tree path (a `projects` key) -> gates that read it (gate_goals.rs GATES names; cts.toml rows are reads of gate `cts`). Absent = core: every build reads it.
+#             Step `keepset` fails when a gate outside the list reads the project (a core graph read included), when a listed gate reads nothing there, and when only cts.toml reaches a project without a row.
 # [<name>] -- any other git upstream (checkout src/<name>, patches patches/<name>/):
 #   git       clone URL
 #   tag       release tag; or
@@ -49,11 +51,6 @@ cts = "d3cf8ecdfe20325e5d0815c9ef527b332b041d61"
 "external/conscrypt" = "156a72a6cf2c27ff27ca526942258af8ae6b13fd"
 "external/cpu_features" = "3aed778c722edb68321d66a5e1cd7b35ae2c891c"
 "external/cronet" = "3d00a6f18075427606068c038ea2695053213440"
-"external/deqp" = "230a1897a8c33452735a02a17c63f3c9c6bcb2b1"
-"external/deqp-deps/SPIRV-Headers" = "aa7b8a45763915dc5ad8f9537232e84e3796a33a"
-"external/deqp-deps/SPIRV-Tools" = "7935793a768d7f6c6b0671cc61fda3286841da0e"
-"external/deqp-deps/amber" = "166c03c471039f3efc935a68d89b52521870ffd9"
-"external/deqp-deps/glslang" = "0733c837682fd25e3363b598947126ff1838908c"
 "external/dexmaker" = "73e46f3a1e0771fd9cd76e1b50f98b764df565dc"
 "external/dlmalloc" = "2b0d5c4ab4e2c677384c02f3eb04cce63b6f10f0"
 "external/dng_sdk" = "4bcadf0d12acea137f176d15852ec275560da806"
@@ -206,7 +203,6 @@ libnativehelper = "5c36ece5ac42b20f0e384d9e57400f2f22aad9fb"
 "packages/modules/Wifi" = "14c1216a43e60884e189a66d93d7c179a86ca4f5"
 "packages/modules/common" = "4a82c9d59605469556d3492be4a9ba17ac5f4f23"
 "packages/providers/MediaProvider" = "d3bb9ac8e6daab448635eaa30e85e2e8d8cbad8e"
-"packages/services/Car" = "61256ae811853028effed5c2c7227aebc347dc5e"
 "packages/services/Telecomm" = "e3af993ac0f53e1a0e2ee8b7be3d67cb9970a616"
 "packages/services/Telephony" = "3066368aaebabf12ee002da3a6ceb46169a79071"
 platform_testing = "7b48625b052b94b1ef24573ef5e8ffa5e2ea9783"
@@ -261,6 +257,10 @@ sdk = "31cc765be3e9407422fb47dafbef9434b051868e"
 "tools/apksig" = "61f88cbe6f81b4536d1ef124daf3caa4ad014afd"
 "tools/metalava" = "a2548e478c121d5801137d636f6e83af37eafc99"
 "tools/platform-compat" = "db0de6104d8527114a7ae441b0a9c35f885d2876"
+
+# Projects only some gates read. Checked against the gates' reads by step `keepset` (cargo xtask keepset --check).
+[aosp.needed_by]
+cts = ["cts"] # cts.toml rows' modules; no build graph reads it
 
 # Keep-sets. A row's comment, when it has one, names what the row drops and why. Rows without one were derived by `keepset --write`: each keeps the dirs the build graphs read and drops the rest. Cone mode keeps whole dirs, so a file read keeps its entire parent dir.
 # Rows are checked against the build graphs by `cargo xtask keepset --check` (step `keepset` of `xtask check`): every read of a graph must fall in its project's dirs. The fetch checks each dir exists at the pin.

@@ -12,8 +12,5 @@
 ["build/make/target/product/generic"]
 reason = "generic system image modules (android_system_image); ATL builds libraries, never device images"
 
-["packages/services/Car/packages"]
-reason = "car apps; the Car project is pinned only for the team modules frameworks/hardware/interfaces tests name"
-
 ["packages/modules/Virtualization/build/microdroid"]
 reason = "Microdroid VM images (android_filesystem); framework-minus-apex needs only Virtualization's framework stubs"

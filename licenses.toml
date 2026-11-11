@@ -14,9 +14,6 @@
 # `xtask native`'s licence gate applies this to every source and header linked into a device artifact (all `runtime`), test-only ones aside.
 # Rows are added when a compiled set first needs them.
 
-[test_only.deqp-binary]
-reason = "dEQP conformance runner (EGL/GLES ground-truth suite of the GL bridge, plan S11), run from the build dir; carries vulkancts and glslang (Bison parser) sources no runtime library links"
-
 [artifact.runtime]
 # BSD-2-Clause, BSD-3-Clause, ISC, public domain: owner decision 2026-10-31; all on the FSF list of GPL-3-compatible licences, so within a future qemu-bridge list.
 # LicenseRef-Public-Domain: a "placed in the public domain" notice is a dedication, not a licence, and the SPDX list has no id for it (CC0-1.0 / Unlicense are specific instruments those notices do not use).

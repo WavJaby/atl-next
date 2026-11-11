@@ -29,6 +29,9 @@ pub struct Aosp {
     /// AOSP tree path -> cone-mode keep-set. Absent = whole tree. Keys are `projects` keys.
     #[serde(default)]
     pub sparse: BTreeMap<String, Vec<String>>,
+    /// AOSP tree path -> the gates (gate_goals.rs `GATES` names) that read it. Absent = core: every build reads it. Step `keepset` checks each list against the gates' reads.
+    #[serde(default)]
+    pub needed_by: BTreeMap<String, Vec<String>>,
 }
 
 /// Directory of the manifest checkout under `src/`: outside the AOSP tree, which the converter scans.
@@ -209,6 +212,26 @@ fn validate(sources: &Sources) -> Result<()> {
             );
         }
     }
+    for (path, gates) in &aosp.needed_by {
+        ensure!(
+            aosp.projects.contains_key(path),
+            "aosp.needed_by `{path}`: not a pinned [aosp.projects] path"
+        );
+        ensure!(
+            !gates.is_empty(),
+            "aosp.needed_by `{path}`: empty list (drop the row: the project is core)"
+        );
+        for (i, g) in gates.iter().enumerate() {
+            ensure!(
+                crate::gate_goals::GATES.iter().any(|(n, _)| n == g),
+                "aosp.needed_by `{path}`: `{g}` is not a gate (gate_goals.rs GATES)"
+            );
+            ensure!(
+                !gates[..i].contains(g),
+                "aosp.needed_by `{path}`: `{g}` is listed twice"
+            );
+        }
+    }
     for (name, up) in &sources.git {
         ensure!(
             is_name(name),
@@ -375,6 +398,21 @@ mod tests {
         let other = format!("{AOSP}\"art\" = \"{SHA}\"\n");
         let co = parse(&other).unwrap().checkouts(None);
         assert!(co[0].sparse.is_empty());
+    }
+
+    /// Refusals per the `needed_by` column: key must be pinned, list non-empty, each entry a `GATES` name (`all-gates` is a `--for` value, not a gate), once.
+    #[test]
+    fn needed_by_rows_checked() {
+        let row = |key: &str, gates: &str| {
+            format!("{AOSP}cts = \"{SHA}\"\n[aosp.needed_by]\n\"{key}\" = [{gates}]\n")
+        };
+        let ok = parse(&row("cts", "\"cts\"")).unwrap();
+        assert_eq!(ok.aosp.needed_by["cts"], ["cts"]);
+        assert!(err(&row("external/icu", "\"cts\"")).contains("`external/icu`: not a pinned"));
+        assert!(err(&row("cts", "")).contains("empty list"));
+        assert!(err(&row("cts", "\"deqp-gl\"")).contains("`deqp-gl` is not a gate"));
+        assert!(err(&row("cts", "\"all-gates\"")).contains("`all-gates` is not a gate"));
+        assert!(err(&row("cts", "\"cts\", \"cts\"")).contains("`cts` is listed twice"));
     }
 
     #[test]
