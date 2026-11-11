@@ -14,6 +14,7 @@ pub mod image;
 mod intercepts;
 pub mod jni;
 mod ndk;
+mod netdb;
 mod provider;
 pub mod qemu;
 pub mod signal;

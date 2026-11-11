@@ -3,7 +3,7 @@
 //! The guest's threads are glibc threads (the stub libc's `pthread_create` is the host shim). Each attaches its own engine CPU on its first guest call, runs its routine, and at exit runs its guest key destructor through a crossing on that thread.
 //! Env (xtask qemu_thread.rs sets it; unset prints SKIP): ATL_ENGINE_SO (the engine `.so`), ATL_NB_BOOT (the engine boot executable, crates/atl-qemu-boot), ATL_NB_THREADEXE (fixture.c, PIE), ATL_NB_LINKER, ATL_NB_VDSO (the arm64 NB images; `<nb>/libnative_bridge_guest_libc` among the guest library directories).
 //! Expected values come from the property store and the fixture's C source, never from the engine: xtask seeds `atl.qt.p.<i>` and `atl.qt.expect` into the area (ATL_PROP_AREA), and the provider's foreach must count exactly `atl.qt.expect` of them; qt_join(x) = x + 1000 (fixture.c `QT_JOIN_OFFSET`); the destructor stores the value its thread's key held at exit.
-//! Checks: (s) started, (p) foreach counts the seeded properties, (j) pthread_create's routine got its argument and its result reached pthread_join, (d) the key destructor ran at thread exit with the thread's value, (g) a guest thread's `pthread_getattr_np(pthread_self())` contains its sp and reports the size its attr asked for (fixture.c `QT_SMALL_STACK`), or 1 MiB without an attr, with a guard of one host page (the engine's default, bionic `PTHREAD_GUARD_SIZE`), (i) two host threads in concurrent down calls each keep a 64 KiB stack pattern intact while the other's is live, with sp in their own reported range and the two ranges disjoint, (k) guest setjmp / longjmp round trip from a deeper frame (fixture.c `QT_JMP_VALUE`, volatile local kept), (m) siglongjmp restores the mask sigsetjmp(b, 1) saved (SIGUSR1 unblocked again). Both run the guest libc's bionic setjmp.S: the NBS patch drops the arm64 setjmp stubs, so no host side exists. (x) a guest thread's pthread_exit, one frame below its routine, hands join its value (fixture.c `QT_EXIT_OFFSET`) and its key destructor runs with the thread's value.
+//! Checks: (s) started, (p) foreach counts the seeded properties, (j) pthread_create's routine got its argument and its result reached pthread_join, (d) the key destructor ran at thread exit with the thread's value, (g) a guest thread's `pthread_getattr_np(pthread_self())` contains its sp and reports the size its attr asked for (fixture.c `QT_SMALL_STACK`), or 1 MiB without an attr, with a guard of one host page (the engine's default, bionic `PTHREAD_GUARD_SIZE`), (i) two host threads in concurrent down calls each keep a 64 KiB stack pattern intact while the other's is live, with sp in their own reported range and the two ranges disjoint, (k) guest setjmp / longjmp round trip from a deeper frame (fixture.c `QT_JMP_VALUE`, volatile local kept), (m) siglongjmp restores the mask sigsetjmp(b, 1) saved (SIGUSR1 unblocked again). Both run the guest libc's bionic setjmp.S: the NBS patch drops the arm64 setjmp stubs, so no host side exists. (x) a guest thread's pthread_exit, one frame below its routine, hands join its value (fixture.c `QT_EXIT_OFFSET`) and its key destructor runs with the thread's value. (r) getaddrinfo("localhost", "80", AF_INET stream, AI_CANONNAME) read in bionic's addrinfo layout (family, socktype, protocol, addrlen, port 80, 127.0.0.1, canonname), getnameinfo numeric back to "127.0.0.1" / "80", freeaddrinfo, gethostbyname("127.0.0.1") (engine/netdb.rs; fixture.c `qt_resolve`).
 //! Output: `qemu-thread: (x) ok` per check, `(x) FAIL <why>` otherwise, and one `qemu-thread: call-cost` line (not a check: the round trip of a no-op guest call on this thread). Exit 0 when all pass.
 #![expect(
     clippy::disallowed_types,
@@ -24,7 +24,7 @@ use atl_native_bridge::engine::{Config, Guest, qemu};
 use object::{Object, ObjectSymbol, read::elf::ElfFile64};
 
 /// The fixture functions the host calls, in the order `Expected::values` holds them.
-const SYMBOLS: [&str; 17] = [
+const SYMBOLS: [&str; 18] = [
     "qt_props_count",
     "qt_props_expected",
     "qt_join",
@@ -42,6 +42,7 @@ const SYMBOLS: [&str; 17] = [
     "qt_jmp",
     "qt_sigjmp",
     "qt_exit_run",
+    "qt_resolve",
 ];
 /// bionic `PTHREAD_STACK_SIZE_DEFAULT` order (1 MiB; R-10 plan D2): the guest stack of a thread created without an attr.
 const DEFAULT_STACK: u64 = 1 << 20;
@@ -231,6 +232,19 @@ fn started(r: Result<Guest, String>) -> u64 {
         } else {
             Err(format!(
                 "join reported {exited:#x} (expected {want:#x}), destructor stored {last:#x} (expected {EXIT_ARG:#x})"
+            ))
+        },
+    );
+
+    // SAFETY: as above; qt_resolve runs the resolver stubs, which cross to their host sides.
+    let resolve = unsafe { guest.call(addr(17), 0, 0, 0) } as u64;
+    ok &= check(
+        'r',
+        if resolve == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "qt_resolve failed steps {resolve:#b} (bit 1 getaddrinfo, 2 family/socktype/protocol, 3 addrlen, 4 sockaddr, 5 canonname, 6 getnameinfo, 7 its text, 8 gethostbyname)"
             ))
         },
     );

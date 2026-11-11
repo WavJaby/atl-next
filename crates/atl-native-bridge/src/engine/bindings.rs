@@ -136,6 +136,9 @@ fn shim(name: &str) -> Option<usize> {
         "pthread_getattr_np" => super::intercepts::pthread_getattr_np as *const () as usize,
         // Q7-7: QEMU table only (build.rs `QEMU_SHIMS`)
         "pthread_exit" => super::intercepts::pthread_exit as *const () as usize,
+        "getaddrinfo" => super::netdb::getaddrinfo as *const () as usize,
+        "freeaddrinfo" => super::netdb::freeaddrinfo as *const () as usize,
+        "getnameinfo" => super::netdb::getnameinfo as *const () as usize,
         "__system_property_foreach" => super::provider::foreach as *const () as usize,
         "__system_property_read_callback" => super::provider::read_callback as *const () as usize,
         "sigaction" | "sigaction64" => super::signal::sigaction as *const () as usize,

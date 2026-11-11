@@ -4,7 +4,7 @@
 //! Library: the engine `.so` (`qemu_spike::engine_so_file`), as `qemu-linker` uses it. Fixture: `xtask/testdata/qemu-thread/fixture.c` (PIE, NDK clang, DT_NEEDED libc.so). Boot: the engine boot executable (`qemu::boot_exe`, crates/atl-qemu-boot).
 //! Images: `--nb <dir>` is the arm64 NB out dir (`<out>/nb/arm64`), built as for `test qemu-linker`.
 //! A guest thread's `pthread_getattr_np` reports the guest stack its attr sized (R-10 S3, check g), and concurrent down calls from two host threads keep disjoint stacks (check i).
-//! Harness: `tests/qemu_thread.rs` (harness-less; checks s, p, j, d, k, m, x, g, i) run through `qemu_linker::harness`. Breaks (`ATL_NB_BREAK`): `qt_exit_resume`, `qt_skip_dtor`, `qt_routine_arg`, `qt_attr_size`, `qt_getattr_glibc`. Checks k and m (guest setjmp family) have no flag break: their break is a guest libc built without NBS patch 0006, whose setjmp stubs then have no host row (`--nb` on such a build: k red).
+//! Harness: `tests/qemu_thread.rs` (harness-less; checks s, p, j, d, k, m, x, r, g, i) run through `qemu_linker::harness`. Breaks (`ATL_NB_BREAK`): `qt_exit_resume`, `dns_glibc_order`, `qt_skip_dtor`, `qt_routine_arg`, `qt_attr_size`, `qt_getattr_glibc`. Checks k and m (guest setjmp family) have no flag break: their break is a guest libc built without NBS patch 0006, whose setjmp stubs then have no host row (`--nb` on such a build: k red).
 //! Property area (check p): the guest cannot set properties (the provider's set is ENOENT), so the gate writes `SEEDED` `atl.qt.p.<i>` properties and `atl.qt.expect` into a copy of the native out dir's build.prop, and the area writer (atl-property-service, the broker's own) lays out the area the provider maps through `ATL_PROP_AREA`.
 //! Output: `<out>/qemu/<target>-linux-user-pic/qemu-thread/`, one log per run; the plain run's log carries the call-cost line.
 
@@ -30,9 +30,10 @@ const SEED_EXPECT: &str = "atl.qt.expect";
 const HARNESS: Harness = Harness {
     test: "qemu_thread",
     prefix: "qemu-thread",
-    checks: &['s', 'p', 'j', 'd', 'k', 'm', 'x', 'g', 'i'],
+    checks: &['s', 'p', 'j', 'd', 'k', 'm', 'x', 'r', 'g', 'i'],
     breaks: &[
         "qt_exit_resume",
+        "dns_glibc_order",
         "qt_skip_dtor",
         "qt_routine_arg",
         "qt_attr_size",

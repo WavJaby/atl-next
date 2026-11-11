@@ -40,6 +40,8 @@ const THREAD_HEADERS: &[&str] = &[
     "bionic/libc/private/bionic_tls.h",
     // TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE
     "bionic/libc/platform/bionic/tls_defines.h",
+    // struct addrinfo / hostent and the AI_ / NI_ / EAI_ values: the resolver's host side converts or gates them (engine/netdb.rs)
+    "bionic/libc/include/netdb.h",
     "frameworks/libs/native_bridge_support/android_api/linker/include/native_bridge_support/linker/static_tls_config.h",
 ];
 /// Their include directories: `bionic/…`, `private/…`, `platform/bionic/…` (bionic/libc), `async_safe/log.h`, `native_bridge_support/linker/…`.
@@ -67,7 +69,7 @@ fn bionic_thread(
     let unit = out.join(format!("bionic_thread_{}.cc", host.arch));
     std::fs::write(
         &unit,
-        "#include \"bionic/pthread_internal.h\"\n#include \"native_bridge_support/linker/static_tls_config.h\"\n",
+        "#include \"bionic/pthread_internal.h\"\n#include \"native_bridge_support/linker/static_tls_config.h\"\n#include <netdb.h>\n",
     )?;
     let also: Vec<PathBuf> = THREAD_HEADERS.iter().map(|h| up.aosp(h)).collect();
     let src = Source {
@@ -79,6 +81,30 @@ fn bionic_thread(
             "TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE",
             "MIN_TLS_SLOT",
             "MAX_TLS_SLOT",
+            // engine/netdb.rs: the flags bionic's getaddrinfo accepts (AI_MASK) and getnameinfo's, and every error code
+            "AI_MASK",
+            "AI_PASSIVE",
+            "AI_CANONNAME",
+            "AI_NUMERICHOST",
+            "AI_NUMERICSERV",
+            "AI_ADDRCONFIG",
+            "NI_NOFQDN",
+            "NI_NUMERICHOST",
+            "NI_NAMEREQD",
+            "NI_NUMERICSERV",
+            "NI_DGRAM",
+            "EAI_ADDRFAMILY",
+            "EAI_AGAIN",
+            "EAI_BADFLAGS",
+            "EAI_FAIL",
+            "EAI_FAMILY",
+            "EAI_MEMORY",
+            "EAI_NODATA",
+            "EAI_NONAME",
+            "EAI_SERVICE",
+            "EAI_SOCKTYPE",
+            "EAI_SYSTEM",
+            "EAI_OVERFLOW",
         ],
     };
     let iface = atl_bridgegen::interface(
@@ -176,7 +202,13 @@ const SHIMS: &[&str] = &[
 /// Shims of the x86_64 stub list only (`libc_stubs`): signal.rs registers the guest handler with sigchain behind ART's claims.
 const SIGNAL_SHIMS: &[&str] = &["sigaction", "sigaction64"];
 /// Shims of the arm64 (QEMU) stub list only: intercepts.rs `pthread_exit` ends the start routine's guest call through the engine's `end_call` (ABI 2.3), which the identity engine has no counterpart of.
-const QEMU_SHIMS: &[&str] = &["pthread_exit"];
+const QEMU_SHIMS: &[&str] = &[
+    "pthread_exit",
+    // engine/netdb.rs: struct addrinfo and the AI_ / NI_ / EAI_ values differ between bionic and glibc, so these convert (layouts generated from bionic's netdb.h)
+    "getaddrinfo",
+    "freeaddrinfo",
+    "getnameinfo",
+];
 /// Q5-8: the QEMU table's libc rows that bind to counted shims under `crossing-count` (counters.rs `memcpy`, `memset`, `memcmp`), which record the size argument and then run glibc's.
 const COUNTED_SHIMS: &[&str] = &["memcpy", "memset", "memcmp"];
 /// NDK functions taking a `JNIEnv*` (C3, engine/ndk.rs): the generic crossing would hand the host library the guest's env, so each binds `Entry::Shim` in its library. Any NDK proxy library may list them; each must be in one (`bindings_table`).
@@ -241,6 +273,8 @@ const GLIBC: &[(&str, &str)] = &[
     ("pthread_sigqueue", "pthread_sigqueue"),
     ("pthread_getspecific", "pthread_getspecific"),
     ("pthread_setspecific", "pthread_setspecific"),
+    // struct hostent is the same in bionic and glibc (engine/netdb.rs layout gate); the answer is glibc's static storage, as bionic's is its own. h_errno stays glibc's: the guest's h_errno is not set
+    ("gethostbyname", "gethostbyname"),
 ];
 
 /// The provider's soname, as cargo-c names a cdylib (`lib<crate>.so.<v>`): `<v>` is the version's semver-compatible prefix -- the major from 1.0, `0.<minor>` below it, the whole `0.0.<patch>` below that (measured: `libatl_bionic.so.0.0.0`, readelf SONAME). Read from atl-bionic's own manifest so a version bump moves it.
@@ -770,6 +804,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("qt_exit_resume", "atl_nb_qt_exit_resume"),
     // Q6-2 (engine/dispatch.rs `call_jni`): the host JNI function gets the guest's env instead of the host object (qemu-jni gate, `e`)
     ("jni_guest_env", "atl_nb_jni_guest_env"),
+    // Q7-7 (engine/netdb.rs `guest_node`): the guest addrinfo copy keeps glibc's field order (ai_addr before ai_canonname), so the guest reads its address from the name (qemu-thread gate, `r`)
+    ("dns_glibc_order", "atl_nb_dns_glibc_order"),
     // Q6-2 (engine/dispatch.rs `call_jni`): x3 and x4 exchanged, so CallStaticIntMethod(2, 3) reaches the host as (3, 2) (qemu-jni gate, `c`)
     ("jni_swap", "atl_nb_jni_swap"),
     // Q6-3 (engine/dispatch.rs `call_host`): the fp lanes reach the host as zeros (qemu-jni gate, `d` and `f`)
