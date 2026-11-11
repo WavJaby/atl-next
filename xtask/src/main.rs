@@ -321,7 +321,7 @@ enum Test {
     ///
     /// Builds first (as `xtask qemu --execute`). Pass = every program's output and exit status as the checks say; the logs are in `<out>/qemu/<target>-linux-user/gate/`.
     Qemu(qemu_gate::Args),
-    /// The QEMU engine spike (atl-qemu-engine, QEMU bridge plan Q2): QEMU's PIC objects linked `-shared` + P1, driven from a host harness; gates (a)-(e), then each break must turn its gate red.
+    /// The QEMU engine spike (atl-qemu-engine, QEMU bridge plan Q2): QEMU's PIC objects linked `-shared` + P1, driven from a host harness; every gate in `qemu_spike::GATES`, then each break must turn its gate red.
     ///
     /// Builds first (as `xtask qemu --pic --execute`). Logs in `<out>/qemu/<target>-linux-user-pic/spike/`.
     QemuSpike(qemu_spike::Args),
