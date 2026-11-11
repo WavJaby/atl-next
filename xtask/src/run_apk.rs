@@ -56,6 +56,9 @@ pub struct Args {
     /// Deliberate-failure check: apps run without the app seccomp filter (atl-broker seccomp.rs). Without the filter the app's queued-work looper dies with SecurityException.
     #[arg(long)]
     no_app_seccomp: bool,
+    /// Deliberate-failure check: every device ABI maps to the host ISA (atld_run `with_broken_instruction_set`), so a foreign-ABI app gets the host ISA from the broker and its bridge runs identity.
+    #[arg(long)]
+    break_isa: bool,
     /// A pointer script the app injects into its window from its first present (atl-composer `input::parse_script`): `down:X,Y up:X,Y` in the content's physical pixels, `wait:MS` between steps,
     /// e.g. `wait:6000 down:792,28 up:792,28` taps (792, 28) 6 s after the first frame. The verdict is still about the last resumed activity, so wait for each tap's answer to settle.
     #[arg(long, value_name = "SCRIPT", conflicts_with = "drive")]
@@ -132,6 +135,7 @@ impl Args {
             log_tags: "*:i".to_owned(),
             verbose: false,
             no_app_seccomp: false,
+            break_isa: false,
             pointer: None,
             drive: Some(script),
             break_blank_capture,
@@ -287,6 +291,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         log_tags: "*:i".to_owned(),
         verbose: false,
         no_app_seccomp: false,
+        break_isa: false,
         pointer: a.pointer.clone(),
         drive: None,
         break_blank_capture: false,
@@ -447,6 +452,11 @@ fn runtime(root: &Path, args: &Args) -> Result<Runtime> {
     .with_ui("gtk");
     let rt = if args.no_app_seccomp {
         rt.without_app_seccomp()
+    } else {
+        rt
+    };
+    let rt = if args.break_isa {
+        rt.with_broken_instruction_set()
     } else {
         rt
     };

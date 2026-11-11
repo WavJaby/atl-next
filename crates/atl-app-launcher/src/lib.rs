@@ -181,13 +181,16 @@ fn start_ui() -> Result<atl_platform_ui::PlatformUi> {
 
 /// AndroidRuntime::startVm's NativeBridge option from `ro.dalvik.vm.native.bridge` (unset, empty or "0": none), plus `-Xforce-nb-testing`: a non-zygote ART unloads the bridge unless forced
 /// (runtime.cc `InitNonZygoteOrPostFork` action kUnload), and our app processes are not zygote forks; bridge 1 runs same-ISA bionic code through it (bridge-1 plan section 2, R4).
-fn native_bridge_options(property: Option<String>) -> Vec<std::ffi::CString> {
+/// With `isa` (`--instruction-set`, every app process) also `-Xnative-bridge-isa:<isa>` (patches/aosp/art 0004), host ISA included: ART hands it to the bridge's `initialize`, which picks identity or a
+/// translator, the one route the app's ISA takes. No bridge: no option (ART would refuse a foreign ISA with nothing to run it).
+fn native_bridge_options(property: Option<String>, isa: Option<&str>) -> Vec<std::ffi::CString> {
     match property {
         Some(lib) if !lib.is_empty() && lib != "0" => [
             format!("-XX:NativeBridge={lib}"),
             "-Xforce-nb-testing".to_owned(),
         ]
         .into_iter()
+        .chain(isa.map(|isa| format!("-Xnative-bridge-isa:{isa}")))
         .filter_map(|o| std::ffi::CString::new(o).ok())
         .collect(),
         _ => Vec::new(),
@@ -218,6 +221,7 @@ fn run() -> Result<i32> {
     if launch.app {
         vm_options.extend(native_bridge_options(
             rt.property(c"ro.dalvik.vm.native.bridge"),
+            launch.instruction_set.as_deref(),
         ));
     }
     let vm = rt.create_vm(&vm_options)?;
@@ -280,7 +284,7 @@ mod nb_tests {
 
     #[test]
     fn native_bridge_option_follows_the_property() {
-        let o = native_bridge_options(Some("libx.so".into()));
+        let o = native_bridge_options(Some("libx.so".into()), None);
         assert_eq!(
             o,
             [
@@ -288,8 +292,11 @@ mod nb_tests {
                 c"-Xforce-nb-testing".to_owned()
             ]
         );
-        assert!(native_bridge_options(Some("0".into())).is_empty());
-        assert!(native_bridge_options(Some(String::new())).is_empty());
-        assert!(native_bridge_options(None).is_empty());
+        let o = native_bridge_options(Some("libx.so".into()), Some("arm64"));
+        assert_eq!(o.last().unwrap().as_c_str(), c"-Xnative-bridge-isa:arm64");
+        assert_eq!(o.len(), 3);
+        assert!(native_bridge_options(Some("0".into()), Some("arm64")).is_empty());
+        assert!(native_bridge_options(Some(String::new()), None).is_empty());
+        assert!(native_bridge_options(None, Some("x86_64")).is_empty());
     }
 }

@@ -451,8 +451,9 @@ fn needs_es1(lib: &Path) -> Result<bool> {
 }
 
 /// The install step, until the package manager installs from a real APK (the installer process: AOSP ParsingPackageUtils on ART, plan 4b): for each package its uid, `/data/app/<package>/base.apk` (the APK copied), its
-/// native libraries (`lib/<isa>/`, [`native_libs::extract`]), credential- and device-protected data directories, and ART's dalvik-cache; the records the services read.
-fn install(a: &Args, r: &Root) -> Result<Vec<PackageRecord>> {
+/// native libraries (`lib/<isa>/`, [`native_libs::extract`]), credential- and device-protected data directories, and ART's dalvik-cache; the records the services read, and each package's instruction set
+/// ([`native_libs::instruction_set`] of its `primaryCpuAbi`), decided here once as PackageManager does.
+fn install(a: &Args, r: &Root) -> Result<(Vec<PackageRecord>, InstructionSets)> {
     ensure!(
         a.first_uid >= AID_APP_START,
         "--first-uid {}: not an app uid",
@@ -461,6 +462,7 @@ fn install(a: &Args, r: &Root) -> Result<Vec<PackageRecord>> {
     std::fs::create_dir_all(r.data().join("dalvik-cache"))?;
     let owner = gl_driver::owner_table(gl_driver::OWNER_TABLE).map_err(anyhow::Error::msg)?;
     let mut records = Vec::new();
+    let mut isas = InstructionSets::new();
     for (i, file) in a.packages.iter().enumerate() {
         let text =
             std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
@@ -496,6 +498,10 @@ fn install(a: &Args, r: &Root) -> Result<Vec<PackageRecord>> {
             let needs = needs_es1(&r.data().join(&app).join(native_libs::LIB_DIR_NAME))?;
             gl_driver::select(&owner, name, needs)
         };
+        isas.insert(
+            name.clone(),
+            native_libs::instruction_set(libs.primary_cpu_abi.as_deref(), &source.abis).to_owned(),
+        );
         records.push(PackageRecord {
             gl_driver: gl,
             uid: a.first_uid + u32::try_from(i)?,
@@ -535,8 +541,11 @@ fn install(a: &Args, r: &Root) -> Result<Vec<PackageRecord>> {
         r.root.join("packages.json"),
         serde_json::to_vec_pretty(&records)?,
     )?;
-    Ok(records)
+    Ok((records, isas))
 }
+
+/// Package name -> its instruction set (arches.toml row key), what the broker passes the launcher as `--instruction-set`.
+type InstructionSets = std::collections::HashMap<String, String>;
 
 /// Writes the default property area (system processes map it) and returns the properties it holds, to which each app process's area adds its own.
 /// Sources as init's property service loads them: /system/build.prop, then /vendor/build.prop when `--file` places one (the device's: `ro.hardware.egl`).
@@ -605,6 +614,8 @@ struct Host {
     gpu: Option<(String, NodeSource)>,
     /// The installed packages: an app process mounts its own directories (package_mounts).
     packages: Vec<PackageRecord>,
+    /// Each installed package's instruction set (install).
+    instruction_sets: InstructionSets,
 }
 
 /// A host path read-only at the same path in the sandbox: the runtime's shared host paths name themselves in both trees.
@@ -681,12 +692,15 @@ impl Host {
     }
 
     /// The launcher running `class` as zygote's child runs it (`--app`), as `uid`, in the sandbox with /system, /data and its property area; its log is `log/<name>.log` (appended to: a process
-    /// that starts again keeps the earlier run's lines).
+    /// that starts again keeps the earlier run's lines). `instruction_set`: an app package's ([`InstructionSets`]), passed as zygote args carry it; None for a process of no package (the shell's), which runs
+    /// the runtime's own ISA.
+    #[allow(clippy::too_many_arguments)]
     fn app_spawn(
         &self,
         uid: u32,
         name: &str,
         target_sdk: i32,
+        instruction_set: Option<&str>,
         boot: &[String],
         class: &str,
         args: &[String],
@@ -695,6 +709,7 @@ impl Host {
         let launcher_args: Vec<OsString> =
             [format!("--target-sdk={target_sdk}"), "--app".to_owned()]
                 .into_iter()
+                .chain(instruction_set.map(|isa| format!("--instruction-set={isa}")))
                 .chain(
                     self.pipewire
                         .iter()
@@ -855,20 +870,25 @@ impl Host {
     /// The services' start request: ProcessList.startProcessLocked's Process.start, as an app process in the sandbox.
     fn start_app(self: &Arc<Self>, req: &StartRequest) -> Result<i32> {
         ensure!(req.uid >= AID_APP_START, "{}: not an app uid", req.uid);
-        let mut spawn = self.app_spawn(
-            req.uid,
-            &req.process_name,
-            req.target_sdk,
-            &self.boot,
-            &req.entry_point,
-            &req.args,
-        )?;
-        self.external_storage(&mut spawn, &req.package);
         let record = self
             .packages
             .iter()
             .find(|p| p.name == req.package)
             .with_context(|| format!("{}: not an installed package", req.package))?;
+        let isa = self
+            .instruction_sets
+            .get(&req.package)
+            .with_context(|| format!("{}: no instruction set recorded", req.package))?;
+        let mut spawn = self.app_spawn(
+            req.uid,
+            &req.process_name,
+            req.target_sdk,
+            Some(isa),
+            &self.boot,
+            &req.entry_point,
+            &req.args,
+        )?;
+        self.external_storage(&mut spawn, &req.package);
         spawn.mounts.extend(self.package_mounts(record)?);
         spawn.rights = atl_broker::rights_of(record.granted_permissions.as_slice());
         let pid = self.start(spawn, false, true)?;
@@ -1101,7 +1121,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         .iter()
         .map(|jar| link_into_framework(&r, jar))
         .collect::<Result<Vec<_>>>()?;
-    let records = install(a, &r)?;
+    let (records, instruction_sets) = install(a, &r)?;
     if let Some(p) = &a.launch
         && !records.iter().any(|rec| &rec.name == p)
     {
@@ -1335,6 +1355,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         },
         pipewire: atl_platform_host::app_access::pipewire_socket(),
         packages: records,
+        instruction_sets,
         root: Root {
             root: r.root.clone(),
         },
@@ -1420,7 +1441,7 @@ fn run(a: &Args) -> Result<ExitCode> {
 
     if let (Some(class), Some(uid), Some(name)) = (&a.run_class, a.run_uid, &a.run_name) {
         let boot: Vec<String> = host.boot.iter().cloned().chain(run_boot).collect();
-        let spawn = host.app_spawn(uid, name, PLATFORM_SDK, &boot, class, &a.run_args)?;
+        let spawn = host.app_spawn(uid, name, PLATFORM_SDK, None, &boot, class, &a.run_args)?;
         let pid = host.start(spawn, true, false)?;
         log(format_args!("{name}: uid {uid}, host pid {pid}: {class}"));
     }

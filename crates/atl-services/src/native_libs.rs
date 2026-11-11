@@ -49,6 +49,19 @@ fn library_entry(entry: &str) -> Option<(&str, &str)> {
         .then_some((abi, file))
 }
 
+/// The app's instruction set from its `primaryCpuAbi` (`VMRuntime.getInstructionSet`, as ProcessList passes `--instruction-set` to zygote): the row of `supported` naming that ABI; none (no native code) or
+/// an ABI not in `supported` -> `supported[0]`'s, the preferred one (`InstructionSets.getPrimaryInstructionSet`). `supported` is non-empty.
+pub fn instruction_set<'a>(
+    primary_cpu_abi: Option<&str>,
+    supported: &'a [SupportedAbi],
+) -> &'a str {
+    primary_cpu_abi
+        .and_then(|abi| supported.iter().find(|s| s.abi == abi))
+        .unwrap_or(&supported[0])
+        .isa
+        .as_str()
+}
+
 /// Extracts the libraries of the chosen ABI of `apk` into `<app_dir>/lib/<isa>/`; `guest_app_dir` is the same directory as the app sees it (`/data/app/<package>`).
 /// Without a supported ABI the directory is still `lib/<isa of supported[0]>` (`InstructionSets.getPrimaryInstructionSet` falls back to the preferred one), and nothing is created.
 pub fn extract(
@@ -67,7 +80,7 @@ pub fn extract(
         .collect::<Result<Vec<String>, _>>()
         .with_context(|| format!("{}: entry names", apk.display()))?;
     let chosen = find_supported_abi(names.iter().map(String::as_str), supported);
-    let isa = &supported[chosen.unwrap_or(0)].isa;
+    let isa = instruction_set(chosen.map(|i| supported[i].abi.as_str()), supported);
     let native_library_dir = format!("{guest_app_dir}/{LIB_DIR_NAME}/{isa}");
     let Some(i) = chosen else {
         return Ok(NativeLibs {
@@ -120,6 +133,16 @@ mod tests {
             "lib/mips/libg.so",
         ];
         assert_eq!(find_supported_abi(entries, &s), Some(1));
+    }
+
+    #[test]
+    fn instruction_set_follows_the_primary_abi_else_the_preferred() {
+        let s = abis(&[("x86_64", "x86_64"), ("arm64-v8a", "arm64")]);
+        assert_eq!(instruction_set(Some("arm64-v8a"), &s), "arm64");
+        assert_eq!(instruction_set(Some("x86_64"), &s), "x86_64");
+        // no native code, or an ABI the device does not list: the preferred row's
+        assert_eq!(instruction_set(None, &s), "x86_64");
+        assert_eq!(instruction_set(Some("mips"), &s), "x86_64");
     }
 
     #[test]

@@ -88,6 +88,35 @@ pub fn nb_guest_goals() -> Goals {
     Goals::nb(&nb).with(Goals::host(&["libnativeloader", "libnativebridge"]))
 }
 
+/// The device's ABI list (`ro.product.cpu.abilist`'s role), each with its instruction set (arches.toml row key): the host row's `android_abis` first (native), then the other `[guest]` rows' as
+/// translated, 64-bit before 32-bit, rows in key order within each (arches.toml: preference follows host match and pointer_bits). An app whose only native code is foreign thus installs with
+/// that ISA, which the broker passes the launcher; host-native libraries still win when an APK carries both.
+pub fn device_abis(arches: &crate::arches::Arches, host: &str) -> Result<Vec<SupportedAbi>> {
+    let native = arches
+        .get(host)
+        .and_then(|a| a.guest.as_ref())
+        .with_context(|| format!("{host}: no [guest] row in arches.toml"))?;
+    let mut translated: Vec<(&String, &crate::arches::Arch)> = arches
+        .iter()
+        .filter(|(name, a)| name.as_str() != host && a.guest.is_some())
+        .collect();
+    // stable: key order kept within one pointer width
+    translated.sort_by_key(|(_, a)| std::cmp::Reverse(a.pointer_bits));
+    let rows = std::iter::once((host, native)).chain(
+        translated
+            .into_iter()
+            .filter_map(|(name, a)| a.guest.as_ref().map(|g| (name.as_str(), g))),
+    );
+    Ok(rows
+        .flat_map(|(isa, g)| {
+            g.android_abis.iter().map(move |abi| SupportedAbi {
+                abi: abi.clone(),
+                isa: isa.to_owned(),
+            })
+        })
+        .collect())
+}
+
 /// The QEMU engine in a test image, as (host file, Android path): the engine `.so` `so` at atl-android-paths `engine_library(isa)`, the boot executable `boot` at `engine_boot(isa)`, where `engine::select` of guest ISA `isa` boots them.
 /// Test images only: the engine `.so` is the QEMU bridge (GPL-3.0-or-later), and no product image ships it until its licence row and corresponding-source archive exist (QEMU Q6 plan D-8).
 pub fn qemu_engine_files(isa: &str, so: &Path, boot: &Path) -> [(PathBuf, String); 2] {
@@ -229,7 +258,7 @@ pub struct Runtime {
     platform_files: Vec<(PathBuf, String)>,
     /// The directory of the NativeBridge core (atl-native-bridge `LIBRARY`), which ART of every app process opens by name (`ro.dalvik.vm.native.bridge`).
     native_bridge: PathBuf,
-    /// The device's ABIs, preferred first (`ro.product.cpu.abilist`'s role), for the install's native-library extraction: the host row's `android_abis` (arches.toml); translated ABIs join when the bridge runs guest code.
+    /// The device's ABIs, preferred first (`ro.product.cpu.abilist`'s role), for the install's native-library extraction and each app's instruction set ([`device_abis`]).
     abis: Vec<SupportedAbi>,
     /// The headless pointer script (atld `--headless-pointer`), when [`Runtime::with_headless_pointer`] set it.
     headless_pointer: Option<String>,
@@ -561,18 +590,7 @@ impl Runtime {
             atl_native_bridge::LIBRARY,
         )?;
         let arches = crate::arches::load(root)?;
-        let guest = arches
-            .get(host)
-            .and_then(|a| a.guest.as_ref())
-            .with_context(|| format!("{host}: no [guest] row in arches.toml"))?;
-        let abis = guest
-            .android_abis
-            .iter()
-            .map(|abi| SupportedAbi {
-                abi: abi.clone(),
-                isa: host.to_owned(),
-            })
-            .collect();
+        let abis = device_abis(&arches, host)?;
         let licenses = crate::licenses::load(root, &crate::sources::load(root)?.upstream_names())?;
         let test_only = crate::licenses::test_only_outputs(&licenses, &out)?;
         Ok(Runtime {
@@ -773,6 +791,15 @@ impl Runtime {
     /// Apps start with `--no-audio-service`: they serve neither AudioFlinger nor AudioPolicyService (audio_app.rs `--break-serve`, test only).
     pub fn without_audio_service(mut self) -> Self {
         self.audio_service = false;
+        self
+    }
+
+    /// Every device ABI maps to the host's instruction set, so the broker passes the host ISA for a foreign-ABI app (run-apk `--break-isa`, test only): its translated-ISA check must go red.
+    pub fn with_broken_instruction_set(mut self) -> Self {
+        let host = self.abis[0].isa.clone();
+        for a in &mut self.abis {
+            a.isa.clone_from(&host);
+        }
         self
     }
 

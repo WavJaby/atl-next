@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The command line: `atl-app-launcher [--target-sdk=<n>] [--app] [--pipewire-socket=<path>] [--no-audio-service] [--break-cblk] [--no-media-player-service] [--break-mix] <VM option>... <class> [<arg>...]`.
+//! The command line: `atl-app-launcher [--target-sdk=<n>] [--app] [--instruction-set=<isa>] [--pipewire-socket=<path>] [--no-audio-service] [--break-cblk] [--no-media-player-service] [--break-mix] <VM option>... <class> [<arg>...]`.
 //! VM options are dalvikvm's (art/dalvikvm/dalvikvm.cc): every argument up to the first not starting with `-` goes to `JNI_CreateJavaVM`, `-cp` / `-classpath` taking the next one with it; the class follows, then main's arguments.
 //! Launcher options start with `--` and come first; ART takes no option of that form.
 
@@ -14,6 +14,9 @@ pub struct Launch {
     pub target_sdk: i32,
     /// An app process (lib.rs app mode): the class runs as zygote's child runs it, not as dalvikvm's main.
     pub app: bool,
+    /// The app's instruction set (arches.toml row key), as zygote's `--instruction-set` carries it from the package's `primaryCpuAbi`; the broker passes it for every app process, the bridge's
+    /// ISA (lib.rs `native_bridge_options`). None: a process of no package; ART runs its own ISA.
+    pub instruction_set: Option<String>,
     /// The audio server's socket atld grants (read-only at this path in the sandbox): the PCM output connects there, and nothing else is looked up. None: none granted; the process starts without audio and its tracks fail.
     pub pipewire_socket: Option<PathBuf>,
     /// Test only: the process serves neither AudioFlinger nor AudioPolicyService (lib.rs serve_media_services), the audio gate's deliberate break.
@@ -32,6 +35,7 @@ pub struct Launch {
 
 const TARGET_SDK: &str = "--target-sdk=";
 const APP: &str = "--app";
+const INSTRUCTION_SET: &str = "--instruction-set=";
 const PIPEWIRE_SOCKET: &str = "--pipewire-socket=";
 const NO_AUDIO_SERVICE: &str = "--no-audio-service";
 const BREAK_CBLK: &str = "--break-cblk";
@@ -46,6 +50,7 @@ pub fn parse(argv: impl IntoIterator<Item = OsString>) -> Result<Launch, String>
     let mut launch = Launch {
         target_sdk: 0,
         app: false,
+        instruction_set: None,
         pipewire_socket: None,
         no_audio_service: false,
         break_cblk: false,
@@ -60,6 +65,14 @@ pub fn parse(argv: impl IntoIterator<Item = OsString>) -> Result<Launch, String>
         let text = arg.to_string_lossy();
         if text == APP {
             launch.app = true;
+            pending = it.next().transpose()?;
+            continue;
+        }
+        if let Some(isa) = text.strip_prefix(INSTRUCTION_SET) {
+            if isa.is_empty() {
+                return Err(format!("{INSTRUCTION_SET}: empty"));
+            }
+            launch.instruction_set = Some(isa.to_owned());
             pending = it.next().transpose()?;
             continue;
         }
@@ -161,6 +174,15 @@ mod tests {
         let l = p(&["--break-mix", "Main"]).unwrap();
         assert!(l.break_mix && !l.break_cblk);
         assert!(!p(&["Main"]).unwrap().break_mix);
+    }
+
+    #[test]
+    fn instruction_set_is_a_launcher_option() {
+        let l = p(&["--app", "--instruction-set=arm64", "Main"]).unwrap();
+        assert_eq!(l.instruction_set.as_deref(), Some("arm64"));
+        assert_eq!(l.class.as_deref(), Some("Main"));
+        assert_eq!(p(&["Main"]).unwrap().instruction_set, None);
+        assert!(p(&["--instruction-set=", "Main"]).is_err());
     }
 
     #[test]
