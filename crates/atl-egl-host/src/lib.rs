@@ -105,6 +105,32 @@ impl Host {
             .collect())
     }
 
+    /// The initialised display of the first EGL device on `node` (its render node or primary node path) that initialises, with the device's name (render node, else primary node).
+    /// Several devices may name one node and not all initialise: glvnd lists a Mesa device for the NVIDIA node that fails eglInitialize (laptop 2026-11-11). None: no device names the node; an error: some do, none initialises.
+    pub fn display_on_node(self: &Arc<Self>, node: &str) -> Result<Option<(Display, String)>> {
+        let mut failures = Vec::new();
+        for d in self.devices()?.into_iter().filter(|d| {
+            d.render_node.as_deref() == Some(node) || d.drm_file.as_deref() == Some(node)
+        }) {
+            match d.display() {
+                Ok(display) => {
+                    let name = d
+                        .render_node
+                        .or(d.drm_file)
+                        .unwrap_or_else(|| node.to_owned());
+                    return Ok(Some((display, name)));
+                }
+                Err(e) => failures.push(format!("{e:#}")),
+            }
+        }
+        ensure!(
+            failures.is_empty(),
+            "no EGL device on {node} initialises: {}",
+            failures.join("; ")
+        );
+        Ok(None)
+    }
+
     /// What the desktop's Wayland-platform display renders on, under this process's environment: the render node of its EGL device (`EGL_EXT_device_query` -> `EGL_DRM_RENDER_NODE_FILE_EXT`), None when that device has none (WSLg's d3d12, a software device), and its GL_RENDERER.
     /// The native display is EGL_DEFAULT_DISPLAY: the vendor's Wayland platform connects to the default compositor itself (`WAYLAND_DISPLAY`), so no Wayland call is made here. Only the Wayland platform expresses the desktop's GPU choice; device enumeration order is glvnd's vendor order (gpu-selection S1).
     pub fn wayland_display_node(self: &Arc<Self>) -> Result<WaylandNode> {
@@ -161,14 +187,16 @@ impl Host {
         Ok(WaylandNode {
             render_node,
             renderer,
+            display,
         })
     }
 }
 
-/// The Wayland display's device, as [`Host::wayland_display_node`] found it.
+/// The Wayland display's device, as [`Host::wayland_display_node`] found it, and the display itself (what the presenter imports with).
 pub struct WaylandNode {
     pub render_node: Option<String>,
     pub renderer: String,
+    pub display: Display,
 }
 
 /// One EGL device: a GPU (named by its DRM nodes) or Mesa's software rasteriser.

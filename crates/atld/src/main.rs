@@ -1210,15 +1210,22 @@ fn run(a: &Args) -> Result<ExitCode> {
                             text.trim()
                         )
                     })?;
-                node.map(|n| (n, renderer.clone()))
+                let modifiers = node::parse_modifiers_lines(&text);
+                node.map(|n| (n, renderer.clone(), modifiers))
                     .ok_or(format!("renderer {renderer}"))
             }
         };
         let mut spawn = system_spawn("gralloc", program, vec![], false, None)?;
         // the display's GPU only; the trial tier tries every node, so it sees every GPU
         spawn.devices = match &display_node {
-            Ok((n, _)) => {
+            Ok((n, _, modifiers)) => {
                 spawn.args = vec!["--drm-node".into(), n.into()];
+                for (fourcc, mods) in modifiers {
+                    let arg = node::modifier_arg(*fourcc, mods);
+                    log(format_args!("gpu: modifiers {arg} (probe)"));
+                    spawn.args.push("--modifiers".into());
+                    spawn.args.push(arg.into());
+                }
                 gpu::device_class(Path::new(n))
             }
             Err(_) => gpu::all_device_classes(),
@@ -1238,7 +1245,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         log(format_args!("gralloc ready"));
         gralloc = Some(p);
         let source = match display_node {
-            Ok((n, renderer)) => {
+            Ok((n, renderer, _)) => {
                 ensure!(
                     allocated == n,
                     "gralloc allocates on {allocated}, the display renders on {n}"

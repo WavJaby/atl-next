@@ -12,7 +12,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use atl_gralloc::vintf;
+use atl_gralloc::format::DRM_FORMAT_MOD_LINEAR;
+use atl_gralloc::{node, vintf};
 use atl_gralloc_service::allocator::Allocator;
 use atl_gralloc_service::backend::{Backend, DRM_DIR};
 use atl_gralloc_service::service;
@@ -24,10 +25,28 @@ struct Args {
     /// The DRM node to allocate from (default: the first of /dev/dri's render then card nodes that allocates a linear buffer).
     #[arg(long)]
     drm_node: Option<PathBuf>,
+    /// The modifier set atld's display probe found for one fourcc, `<FOURCC>=<hex>,...` (atl_gralloc::node::modifier_arg), repeatable. Logged only: allocation stays LINEAR until the usage policy lands.
+    #[arg(long, value_parser = parse_modifiers)]
+    modifiers: Vec<(u32, Vec<u64>)>,
+}
+
+fn parse_modifiers(s: &str) -> Result<(u32, Vec<u64>), String> {
+    node::parse_modifier_arg(s).ok_or_else(|| format!("{s}: want <FOURCC>=0x<hex>,..."))
 }
 
 fn main() -> Result<()> {
     let a = Args::parse();
+    // tier per fourcc: the probe's list, else the linear baseline (no display node: WSLg, headless)
+    for fourcc in node::probed_fourccs() {
+        let line = match a.modifiers.iter().find(|(f, _)| *f == fourcc) {
+            Some((_, mods)) => format!("{} (probe)", node::modifier_arg(fourcc, mods)),
+            None => format!(
+                "{} (no probe list)",
+                node::modifier_arg(fourcc, &[DRM_FORMAT_MOD_LINEAR])
+            ),
+        };
+        writeln!(std::io::stderr(), "gralloc: modifiers {line}")?;
+    }
     let backend =
         Backend::start(DRM_DIR.as_ref(), a.drm_node.as_deref()).context("gralloc backend")?;
     let node = backend.node().to_owned();

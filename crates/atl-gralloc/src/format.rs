@@ -81,6 +81,11 @@ const FORMATS: &[FormatInfo] = &[
     },
 ];
 
+/// Every supported row.
+pub fn all() -> &'static [FormatInfo] {
+    FORMATS
+}
+
 /// The row of `pixel_format`, if supported.
 pub fn lookup(pixel_format: i32) -> Option<&'static FormatInfo> {
     FORMATS.iter().find(|f| f.pixel_format == pixel_format)

@@ -9,8 +9,8 @@ use std::ffi::{CStr, CString, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use anyhow::{Context as _, Result, anyhow};
-use atl_egl_host::{Display, Host};
+use anyhow::{Context as _, Result, anyhow, bail};
+use atl_egl_host::{Device, Display, Host};
 use atl_gralloc::format::{self, RGBA_8888, RGBX_8888};
 use atl_gralloc::node::{self, NodeSource};
 
@@ -408,28 +408,25 @@ fn choose_display(host: &Arc<Host>) -> Result<(Display, String)> {
     let source = get(node::NODE_SOURCE_PROPERTY)?;
     let source = NodeSource::parse(&source)
         .with_context(|| format!("{}={source}: unknown", node::NODE_SOURCE_PROPERTY))?;
-    let devices = host.devices()?;
-    let on_node = devices.iter().find(|d| {
-        d.render_node.as_deref() == Some(node.as_str())
-            || d.drm_file.as_deref() == Some(node.as_str())
-    });
-    let device = match source {
-        NodeSource::Display => on_node.with_context(|| {
-            let listed: Vec<_> = devices.iter().map(|d| d.render_node.clone()).collect();
-            format!("gralloc's node {node} (display) has no EGL device; devices {listed:?}")
-        })?,
-        NodeSource::Trial => on_node
-            .or_else(|| devices.iter().find(|d| d.is_software()))
-            .with_context(|| {
-                format!("no EGL device on gralloc's node {node} and no software device")
-            })?,
-    };
-    let name = device
-        .render_node
-        .clone()
-        .or_else(|| device.drm_file.clone())
-        .unwrap_or_else(|| "software".to_owned());
-    Ok((device.display()?, name))
+    if let Some(on_node) = host.display_on_node(&node)? {
+        return Ok(on_node);
+    }
+    match source {
+        NodeSource::Display => {
+            let listed: Vec<_> = host.devices()?.into_iter().map(|d| d.render_node).collect();
+            bail!("gralloc's node {node} (display) has no EGL device; devices {listed:?}")
+        }
+        NodeSource::Trial => {
+            let software = host
+                .devices()?
+                .into_iter()
+                .find(Device::is_software)
+                .with_context(|| {
+                    format!("no EGL device on gralloc's node {node} and no software device")
+                })?;
+            Ok((software.display()?, "software".to_owned()))
+        }
+    }
 }
 
 /// bionic `__system_property_get` as the process's global scope has it (atl-bionic in an app process; the driver probe exports its own): the value, None when unset or empty.

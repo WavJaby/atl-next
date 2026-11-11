@@ -5,7 +5,8 @@
 //! then map the dma-buf (atl-gralloc-dmabuf, DMA_BUF_IOCTL_SYNC bracket) and compare every pixel with what [`FILLS`] gives at that pixel (last fill wins; GL's origin is the buffer's first row).
 //! Clear colours are c / 255, which GL's float -> unorm8 conversion (ES 3.2 §2.3.5.2, round(f x 255)) maps back to c, so the expected bytes are exact.
 //! `--matrix` runs every pair, each in a child process of its own so one driver crash names its pair and the rest still run. Output: one `p0a:` line per pair.
-//! `--display-node`: the GPU selector atld runs once per UI run (gpu-selection G1): the Wayland display's device render node + renderer, one `gpu-probe:` line.
+//! `--display-node`: the GPU selector atld runs once per UI run (gpu-selection G1): the Wayland display's device render node + renderer, one `gpu-probe:` line;
+//! where the display names a node, one `gpu-modifiers:` line per gralloc fourcc: renderable on that node's EGL device (`external_only` false) ∩ imported by the Wayland display, 1-plane layouts.
 
 #![forbid(unsafe_code)]
 #![expect(
@@ -21,7 +22,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, ensure};
 use atl_egl_host::ffi::{GL_EXTENSIONS, GL_RENDERER, GL_VERSION};
-use atl_egl_host::{Device, DmabufPlane, Host};
+use atl_egl_host::{Device, Display, DmabufPlane, Host};
 use atl_gralloc::descriptor::Descriptor;
 use atl_gralloc::format::{DRM_FORMAT_ABGR8888, DRM_FORMAT_MOD_LINEAR, RGBA_8888};
 use atl_gralloc::{node, usage};
@@ -68,13 +69,25 @@ struct Args {
 fn main() -> ExitCode {
     let args = Args::parse();
     if args.display_node {
-        return match Host::load().and_then(|h| h.wayland_display_node()) {
-            Ok(n) => {
-                out(&node::display_line(n.render_node.as_deref(), &n.renderer));
-                ExitCode::SUCCESS
-            }
+        let n = match Host::load().and_then(|h| h.wayland_display_node().map(|n| (h, n))) {
+            Ok(n) => n,
             Err(e) => {
                 out(&format!("{} FAIL {e:#}", node::DISPLAY_LINE));
+                return ExitCode::FAILURE;
+            }
+        };
+        out(&node::display_line(
+            n.1.render_node.as_deref(),
+            &n.1.renderer,
+        ));
+        // no node: allocation-only tier (WSLg d3d12, software), no modifier lines -> gralloc's linear baseline
+        let Some(render_node) = n.1.render_node.as_deref() else {
+            return ExitCode::SUCCESS;
+        };
+        return match modifier_lines(&n.0, render_node, &n.1.display) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                out(&format!("{} FAIL {e:#}", node::MODIFIERS_LINE));
                 ExitCode::FAILURE
             }
         };
@@ -94,6 +107,34 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// One [`node::MODIFIERS_LINE`] per gralloc fourcc: renderable on `render_node`'s EGL device display ∩ imported by the Wayland display, 1-plane layouts (atl_gralloc::node::modifier_set).
+fn modifier_lines(
+    host: &std::sync::Arc<Host>,
+    render_node: &str,
+    presenter: &Display,
+) -> Result<()> {
+    let (device, _) = host
+        .display_on_node(render_node)?
+        .with_context(|| format!("no EGL device on the display's node {render_node}"))?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(render_node)
+        .with_context(|| format!("open {render_node}"))?;
+    let gbm = gbm::Device::new(file).context("gbm device")?;
+    for fourcc in node::probed_fourccs() {
+        let format = gbm::Format::try_from(fourcc)
+            .map_err(|_| anyhow!("fourcc {} unknown to gbm", node::fourcc_name(fourcc)))?;
+        let set = node::modifier_set(
+            &device.modifiers(fourcc)?,
+            &presenter.modifiers(fourcc)?,
+            |m| gbm.format_modifier_plane_count(format, gbm::Modifier::from(m)),
+        );
+        out(&node::modifiers_line(fourcc, &set));
+    }
+    Ok(())
 }
 
 fn out(line: &str) {
