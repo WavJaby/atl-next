@@ -17,7 +17,6 @@ use atl_layout::Layout;
 
 use crate::aosp::{self, Index};
 use crate::git::git;
-use crate::licence_gate;
 use crate::sources::{self, Aosp, Sources};
 use crate::{arches, cts_table};
 
@@ -139,35 +138,54 @@ fn slot_number(name: &str) -> Option<u32> {
     name.strip_prefix("slot-")?.parse().ok()
 }
 
-/// Reads of the graphs and tables, classified. A graph's deps log is read through licence_gate's `ninja -t deps` parser.
+/// One independent scan of one graph: [`derive`] runs them all in parallel, each into its own [`Reads`], merged after.
+#[derive(Clone, Copy)]
+enum Scan {
+    Ninja,
+    Deps,
+    Json,
+}
+
+/// Reads of the graphs and tables, classified. Per graph, build.ninja, its deps log and graph.json are scanned in parallel (each single-threaded and independent; serial they were ~3/4 of the step).
 fn derive(root: &Path, layout: &Layout, sources: &Sources, slots: &[u32]) -> Result<Derived> {
     let ws = layout.workspace();
     let prefixes = Prefixes::new(ws);
     let outs = graphs(ws, slots)?;
-    let mut reads = Reads::default();
-    let mut graph_modules = BTreeSet::new();
-    for (label, out) in &outs {
-        scan_ninja(
-            &out.join(NINJA),
-            &prefixes,
-            &format!("{label}/{NINJA}"),
-            &mut reads,
-        )?;
-        let deps = licence_gate::ninja(out, &["-t", "deps"])?;
-        for ds in licence_gate::parse_deps(&deps).values() {
-            for d in ds {
-                let s = d.to_string_lossy();
-                for rel in prefixes.rels(&s) {
-                    reads.add(rel, &format!("{label}/deps"));
-                }
+    let units: Vec<(&str, &Path, Scan)> = outs
+        .iter()
+        .flat_map(|(label, out)| {
+            [Scan::Ninja, Scan::Deps, Scan::Json].map(|s| (label.as_str(), out.as_path(), s))
+        })
+        .collect();
+    let workers = std::thread::available_parallelism().map_or(1, usize::from);
+    let scanned = crate::par::map(&units, workers, |&(label, out, scan)| {
+        let mut reads = Reads::default();
+        let mut modules = BTreeSet::new();
+        match scan {
+            Scan::Ninja => scan_ninja(
+                &out.join(NINJA),
+                &prefixes,
+                &format!("{label}/{NINJA}"),
+                &mut reads,
+            )?,
+            Scan::Deps => scan_deps(out, &prefixes, &format!("{label}/deps"), &mut reads)?,
+            Scan::Json => {
+                let text = fs::read_to_string(out.join(GRAPH))
+                    .with_context(|| format!("reading {}", out.join(GRAPH).display()))?;
+                let json: serde_json::Value = serde_json::from_str(&text)
+                    .with_context(|| format!("parsing {GRAPH} of {label}"))?;
+                scan_json(&json, &prefixes, &format!("{label}/{GRAPH}"), &mut reads);
+                modules = json_modules(&json);
             }
         }
-        let text = fs::read_to_string(out.join(GRAPH))
-            .with_context(|| format!("reading {}", out.join(GRAPH).display()))?;
-        let json: serde_json::Value =
-            serde_json::from_str(&text).with_context(|| format!("parsing {GRAPH} of {label}"))?;
-        scan_json(&json, &prefixes, &format!("{label}/{GRAPH}"), &mut reads);
-        graph_modules.extend(json_modules(&json));
+        Ok::<_, anyhow::Error>((reads, modules))
+    });
+    let mut reads = Reads::default();
+    let mut graph_modules = BTreeSet::new();
+    for r in scanned {
+        let (part, modules) = r?;
+        reads.merge(part);
+        graph_modules.extend(modules);
     }
     let index = Index::load(root, &sources.aosp)?;
     let projects: Vec<&str> = sources.aosp.projects.keys().map(String::as_str).collect();
@@ -330,6 +348,12 @@ impl Reads {
                 .insert(rel.to_owned(), BTreeSet::from([from.to_owned()]));
         }
     }
+
+    fn merge(&mut self, other: Reads) {
+        for (rel, from) in other.0 {
+            self.0.entry(rel).or_default().extend(from);
+        }
+    }
 }
 
 /// The shared tree `<ws>/src/aosp/` and task copies `<ws>/src-wt/<task>/aosp/` (a task copy holds the same project paths).
@@ -405,6 +429,50 @@ fn scan_ninja(file: &Path, prefixes: &Prefixes, from: &str, reads: &mut Reads) -
             }
         }
     }
+    Ok(())
+}
+
+/// The header reads of a graph's deps log: `ninja -t deps` streamed, each dependency line (indented, under a `<target>: #deps ...` header; licence_gate `parse_deps` format) a read.
+/// Streamed rather than parsed into a target map: the log lists ~8M dependency lines per graph and only the paths matter here.
+fn scan_deps(out: &Path, prefixes: &Prefixes, from: &str, reads: &mut Reads) -> Result<()> {
+    let mut child = std::process::Command::new("ninja")
+        .arg("-C")
+        .arg(out)
+        .args(["-t", "deps"])
+        .stdout(std::process::Stdio::piped())
+        // shown as it comes: a piped stderr read only after stdout ends could fill and stall ninja
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .context("running ninja -t deps")?;
+    let stdout = child.stdout.take().context("ninja -t deps stdout")?;
+    let mut in_record = false;
+    let mut line = Vec::new();
+    let mut r = BufReader::new(stdout);
+    loop {
+        line.clear();
+        if r.read_until(b'\n', &mut line)
+            .with_context(|| format!("reading ninja -t deps of {}", out.display()))?
+            == 0
+        {
+            break;
+        }
+        let text = String::from_utf8_lossy(&line);
+        if text.starts_with(' ') {
+            if in_record {
+                for rel in prefixes.rels(text.trim()) {
+                    reads.add(rel, from);
+                }
+            }
+        } else {
+            in_record = text.contains(": #deps");
+        }
+    }
+    let status = child.wait().context("waiting for ninja -t deps")?;
+    ensure!(
+        status.success(),
+        "ninja -t deps in {} exited with {status} (its stderr above)",
+        out.display()
+    );
     Ok(())
 }
 
@@ -735,6 +803,18 @@ mod tests {
                 "r/o",
             ]
         );
+    }
+
+    /// A deps log ninja cannot read (no build.ninja) fails the scan instead of reading as no header reads.
+    #[test]
+    fn deps_scan_fails_when_ninja_does() {
+        let dir = std::env::temp_dir().join(format!("xtask-keepset-deps-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("test dir");
+        let mut reads = Reads::default();
+        let err = scan_deps(&dir, &Prefixes::new(Path::new(WS)), "t", &mut reads)
+            .expect_err("no build.ninja");
+        assert!(format!("{err:#}").contains("ninja -t deps"), "{err:#}");
+        fs::remove_dir_all(&dir).expect("test dir cleanup");
     }
 
     #[test]

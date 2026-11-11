@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! `cargo xtask slot prune`: deletes the cargo units of the target trees that no recorded build used for `--older-than` days, and the incremental sessions no build will load.
-//! Trees (a profile dir holding `.fingerprint`, or `<triple>/<profile>`) under these roots: each slot's `cargo`, `cargo-converter`, `target` (the default of a slotted checkout) and `gl/cargo*`; with `--all` also `repo/target` and `out/egl-driver/<checkout>/cargo*`, which no slot owns.
+//! Trees (a profile dir holding `.fingerprint`, or `<triple>/<profile>`) under these roots: each slot's `cargo`, `cargo-converter`, `cargo-converter-test`, `target` (the default of a slotted checkout) and `gl/cargo*`; with `--all` also `repo/target` and `out/egl-driver/<checkout>/cargo*`, which no slot owns.
 //! Use is the record each recorded build writes (`unit_use`): a unit's last reported build, fresh or rebuilt. A unit with no entry is judged by its fingerprint dir's mtime, which cargo moves when it rebuilds the unit: approximate, and the worst case is one rebuild.
 //! A unit is `.fingerprint/<pkg>-<hash>/`, `build/<pkg>-<hash>/` (build-script output), the `deps/` and `examples/` files `*-<hash>` or `*-<hash>.<ext>`, and the uplifted hard links (`<tree>/<name>`) of those files; `<hash>` is 16 lowercase hex digits.
 //! Incremental (`<tree>/incremental/<crate>/`): keeps the newest finalized session, the one rustc loads (`rustc_incremental/src/persist/fs.rs`, `find_source_directory_in_iter`, rustc 1.99.1; rustc reads an older one only when copying the newest fails). Removed: every other finalized session, `-working` sessions older than 10 s (rustc's own grace), and lock files whose session is gone. A held lock is never touched.
@@ -29,7 +29,12 @@ const SECS_PER_DAY: u64 = 86_400;
 const MIB: f64 = 1_048_576.0;
 const GIB: f64 = 1_073_741_824.0;
 /// Target roots directly under a slot: xtask's `--target-dir` names, and `target`, the default a slotted checkout links to (slot.rs).
-const SLOT_ROOTS: [&str; 3] = ["cargo", "cargo-converter", "target"];
+const SLOT_ROOTS: [&str; 4] = [
+    "cargo",
+    crate::packages::TARGET_DIR,
+    crate::packages::TEST_TARGET_DIR,
+    "target",
+];
 /// `<slot>/gl/cargo*`: the GL probes' target roots.
 const GL_DIR: &str = "gl";
 /// `<ws>/out/egl-driver/<checkout>/cargo*`: EGL driver probes, not under a slot.
@@ -305,7 +310,7 @@ fn check_slot_dir(ws: &Path, dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The roots of slot `slot`: `cargo`, `cargo-converter`, `target`, and `gl/cargo*`.
+/// The roots of slot `slot`: [`SLOT_ROOTS`] and `gl/cargo*`.
 fn slot_roots(slot: &Path) -> Result<Vec<PathBuf>> {
     let mut roots: Vec<PathBuf> = SLOT_ROOTS.iter().map(|name| slot.join(name)).collect();
     roots.extend(prefixed(&slot.join(GL_DIR), CARGO_ROOT)?);
@@ -1263,7 +1268,7 @@ mod tests {
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 
-    /// The root names of a slot: the three target names xtask gives cargo, and the `cargo*` probes under `gl/`.
+    /// The root names of a slot: the target names xtask gives cargo (build, converter build, converter test), the checkout default `target`, and the `cargo*` probes under `gl/`.
     #[test]
     fn slot_roots_are_the_target_names_and_the_gl_cargo_probes() {
         let ws = scratch("roots");
@@ -1282,6 +1287,7 @@ mod tests {
             [
                 "cargo",
                 "cargo-converter",
+                "cargo-converter-test",
                 "gl/cargo",
                 "gl/cargo-undefined-gl",
                 "target"

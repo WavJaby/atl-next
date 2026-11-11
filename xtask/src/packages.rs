@@ -346,7 +346,19 @@ pub fn workspace_aidl_crates(root: &Path) -> Result<(BTreeMap<String, AidlCrate>
 /// The cargo target dir of the converter's builds (`Selection::cargo`), read back by parcel.rs, compositor.rs.
 /// Not `<out>/cargo`: the link driver (`--config target.<triple>.linker`) is checked per unit (`ConfigSettingsChanged`) but is not in the unit hash, so a plain build sharing the dir overwrites the other's fingerprints and every alternation recompiles (measured: 26-38 units per run).
 pub fn target_dir(out: &Path) -> PathBuf {
-    out.join("cargo-converter")
+    out.join(TARGET_DIR)
+}
+
+/// [`target_dir`]'s name under the out dir (slot_prune's roots).
+pub const TARGET_DIR: &str = "cargo-converter";
+/// [`test_target_dir`]'s name under the out dir (slot_prune's roots).
+pub const TEST_TARGET_DIR: &str = "cargo-converter-test";
+
+/// The cargo target dir of the converter packages' unit tests (`Selection::test`), apart from [`target_dir`]: the test build runs under `RUSTC_BOOTSTRAP=1`, which proc-macro2's build script probes
+/// (`rerun-if-env-changed`), turning on its nightly cfgs; that changes no unit hash, so in one shared dir clippy and test rebuilt each other's whole proc-macro tree every `xtask check`
+/// (measured: 64 then 128 units recompiled on an unchanged slot, 53 s then 86 s).
+fn test_target_dir(out: &Path) -> PathBuf {
+    out.join(TEST_TARGET_DIR)
 }
 
 /// graph.json, the fields read here (bp2ninja graph.go).
@@ -418,7 +430,7 @@ pub struct Built {
 struct Selection<'a> {
     root: &'a Path,
     out: &'a Path,
-    /// cargo's target dir: `out/cargo`, the one `xtask native` builds in
+    /// cargo's target dir of `build` and `lint` ([`target_dir`]), the one `xtask native` builds in
     target: PathBuf,
     graph: Graph,
     selected: Vec<&'a Package>,
@@ -469,15 +481,15 @@ impl<'a> Selection<'a> {
     /// One global flag, not per-module build-script lines: `rustc-link-arg` reaches only its own package's links, never a dependent's.
     /// The list goes through a response file the link driver expands: rustflags enter every unit's hash, so the list itself in them kept a whole new unit tree per device set.
     /// cargo does not track the file, on purpose: -rpath-link only resolves needs at link time, nothing of it reaches the output, and a changed linked module reruns the build script (`link_lines`), so that relink reads the list written here.
-    fn cargo(&self, sub: &str) -> Result<std::process::Command> {
+    fn cargo(&self, sub: &str, target: &Path) -> Result<std::process::Command> {
         let stage = crate::binder::lib_env(self.out)?
             .into_iter()
             .map(|(_, v)| v)
             .collect::<Vec<_>>()
             .join(":");
         let rpath_link = format!("-Wl,-rpath-link,{stage}");
-        let rsp = self.target.join(RPATH_LINK_FILE);
-        std::fs::create_dir_all(&self.target).with_context(|| self.target.display().to_string())?;
+        let rsp = target.join(RPATH_LINK_FILE);
+        std::fs::create_dir_all(target).with_context(|| target.display().to_string())?;
         std::fs::write(&rsp, &rpath_link).with_context(|| rsp.display().to_string())?;
         let link_arg = if std::env::var_os(FLAGS_BREAK).is_some() {
             rpath_link
@@ -488,7 +500,7 @@ impl<'a> Selection<'a> {
         cmd.current_dir(self.root)
             .args([sub, "--release", "--locked"])
             .arg("--target-dir")
-            .arg(&self.target);
+            .arg(target);
         for p in &self.selected {
             cmd.args([
                 "-p",
@@ -517,7 +529,7 @@ impl<'a> Selection<'a> {
     /// The code behind feature `converter` is linted where it is built (`xtask check` step clippy runs without the feature).
     fn lint(&self) -> Result<()> {
         let status = crate::unit_use::status(
-            self.cargo("clippy")?
+            self.cargo("clippy", &self.target)?
                 .args(["--lib", "--bins", "--", "-D", "warnings"]),
         )
         .context("running cargo clippy (converter packages)")?;
@@ -526,13 +538,13 @@ impl<'a> Selection<'a> {
     }
 
     /// Unit tests with feature `converter` on: `xtask check` step test runs without it, so `#[cfg(test)]` code in converter-gated modules (atl-services `package`, ...) runs only here.
-    /// Same target dir and flags as `build`. The converter's rlibs are device crates, built panic=abort, and stable libtest links only unwinding crates, so tests run with
+    /// Same flags as `build`, its own target dir ([`test_target_dir`]). The converter's rlibs are device crates, built panic=abort, and stable libtest links only unwinding crates, so tests run with
     /// `-Z panic-abort-tests` as Soong builds device rust tests (build/soong/rust/test.go `compilerFlags`, under its global RUSTC_BOOTSTRAP). The bootstrap is set for this test build only:
     /// `build` and the clippy steps stay on stable, so an unstable feature in our code still fails there.
     /// Test binaries run in the stage's library environment (binder::lib_env), as every runtime process: converter device libraries carry no runpath (runpath_gate), so their own needs are found only there.
     fn test(&self) -> Result<()> {
         let status = crate::unit_use::status(
-            self.cargo("test")?
+            self.cargo("test", &test_target_dir(self.out))?
                 .args(["-Z", "panic-abort-tests", "--lib", "--bins"])
                 .env("RUSTC_BOOTSTRAP", "1")
                 .envs(crate::binder::lib_env(self.out)?),
@@ -556,7 +568,7 @@ pub fn build(root: &Path, out: &Path) -> Result<Vec<Built>> {
     if sel.selected.is_empty() {
         return Ok(Vec::new());
     }
-    let status = crate::unit_use::status(&mut sel.cargo("build")?)
+    let status = crate::unit_use::status(&mut sel.cargo("build", &sel.target)?)
         .context("running cargo build (converter packages)")?;
     ensure!(status.success(), "building {} failed", sel.names());
     sel.lint()?;
