@@ -8,8 +8,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // shWords: the argv /bin/sh makes of a ninja command fragment (ninja turns `$$` into `$` first).
@@ -75,6 +77,62 @@ cc_library_static { name: "libdbg", srcs: ["d.cc"], cflags: ["-g"] }
 				t.Errorf("launcher %q: %s runs %q, want %q first", launcher, m[1], argv, want)
 			}
 		}
+	}
+}
+
+// A ninja run with nothing changed since the last one runs no step. An edge ninja finds dirty on every run reruns its dependents too: measured on xtask native,
+// ~4000 edges re-ran per no-change run. The causes, each faked as the real tool does it: depfile entries ninja cannot find (clang several paths per line, a tree-relative
+// one among them, -fprofile-list=<tree path>; protoc's --dependency_out without a final newline); a declared output the tool never writes (aidl on `parcelable Foo;`);
+// a write-if-changed output older than a rebuilt tool it depends on (soong_zip -write_if_changed after a relinked protoc).
+func TestNoChangeRebuildRunsNothing(t *testing.T) {
+	dir := t.TempDir()
+	root, out := filepath.Join(dir, "tree"), filepath.Join(dir, "out")
+	write := func(path, text string, mode os.FileMode) {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(text), mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, f := range []string{"a.c", "rel.list", "p.proto", "q.proto", "P.aidl", "tool"} {
+		write(filepath.Join(root, f), "x\n", 0o644)
+	}
+	tool := filepath.Join(root, "tool")
+	// argv as the cc rule passes it: -MD -MF <dep> -c <in> -o <out>
+	cc := filepath.Join(dir, "fakecc")
+	write(cc, "#!/bin/sh\nprintf '%s: %s rel.list \\\\\\n  %s\\n' \"$7\" \"$5\" \"$5\" > \"$3\" && : > \"$7\"\n", 0o755)
+	// as jaidl passes it: --ninja -d<dep> <tree-relative src> <out>; a parcelable declaration: a depfile, no Java
+	aidl := filepath.Join(dir, "fakeaidl")
+	write(aidl, "#!/bin/sh\nprintf '%s : \\\\\\n  %s\\n' \"$4\" \"$3\" > \"${2#-d}\"\n", 0o755)
+	// soong_zip -srcjar -write_if_changed -o <out> ...: the output exists, so it stays unchanged
+	zip := filepath.Join(dir, "fakezip")
+	write(zip, "#!/bin/sh\n[ -e \"$4\" ] || : > \"$4\"\n", 0o755)
+	tmp := filepath.Join(out, "p.tmp")
+	protoc := func(k int, java, proto string) string {
+		return "printf '%s: %s' " + filepath.Join(tmp, java) + " " + filepath.Join(root, proto) + " > " + filepath.Join(tmp+".d", strconv.Itoa(k)+".d")
+	}
+	aidlOut := filepath.Join(out, "a.tmp", "P.java")
+	ninja := "root = " + root + "\ncc = " + cc + "\nsoongzip = " + zip + "\naidl = " + aidl + "\n" + header + javaGenRules +
+		"build " + filepath.Join(out, "a.o") + ": cc " + filepath.Join(root, "a.c") + "\n" +
+		"build " + filepath.Join(out, "p.srcjar") + ": jproto " + filepath.Join(root, "p.proto") + " " + filepath.Join(root, "q.proto") + " | " + tool + "\n" +
+		"  tmp = " + tmp + "\n  cmds = " + protoc(0, "P.java", "p.proto") + " && " + protoc(1, "Q.java", "q.proto") + "\n" +
+		"build " + aidlOut + ": jaidl " + filepath.Join(root, "P.aidl") + " | " + tool + "\n  src = P.aidl\n" +
+		"build " + filepath.Join(out, "a.srcjar") + ": srcjar " + aidlOut + "\n  dir = " + filepath.Join(out, "a.tmp") + "\n"
+	write(filepath.Join(out, "build.ninja"), ninja, 0o644)
+	if b, err := exec.Command("ninja", "-C", out).CombinedOutput(); err != nil {
+		t.Fatalf("first build: %v\n%s", err, b)
+	}
+	// a relinked tool: its dependents rerun once, the write-if-changed srcjars keep their mtime. The sleep puts the tool's mtime past the outputs':
+	// file timestamps come from the kernel's coarse clock (ticks of up to 10 ms), and an equal mtime is not newer, which hides the stale-output case.
+	time.Sleep(50 * time.Millisecond)
+	write(tool, "y\n", 0o644)
+	if b, err := exec.Command("ninja", "-C", out).CombinedOutput(); err != nil {
+		t.Fatalf("build after the tool changed: %v\n%s", err, b)
+	}
+	b, err := exec.Command("ninja", "-C", out, "-n", "-d", "explain").CombinedOutput()
+	if err != nil || !strings.Contains(string(b), "no work to do") {
+		t.Errorf("a no-change rebuild runs steps (%v):\n%s", err, b)
 	}
 }
 

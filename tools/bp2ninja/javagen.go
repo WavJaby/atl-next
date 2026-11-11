@@ -277,22 +277,30 @@ func (g *Graph) javaProto(n *jNode, files []srcFile, _ javaDeps) (java, srcjars 
 func shellEsc(s string) string { return shellQuote([]string{s}) }
 
 // javaGenRules: the rules of the generators.
-// jaidl: $src is $in as Soong passes it (tree-relative from the tree root); the depfile's tree-relative lines (aidl writes one path per
-// `  path \` line) get the root prefixed, as ninja resolves them from the build dir.
+// jaidl: $src is $in as Soong passes it (tree-relative from the tree root); the depfile's tree-relative paths get the root prefixed (rootDeps).
+// aidl writes no Java for a parcelable declaration (`parcelable Foo;`): jaidl leaves an empty $out then, as ninja reruns an edge whose output is missing, every run;
+// srcjar skips empty files (aidl's real output never is), so the srcjar holds what aidl wrote, as Soong's. $out is removed first, so the placeholder is new
+// on every run like aidl's real output: one kept from an earlier run stays older than a relinked aidl, and the edge would rerun every time.
+// srcjar, jproto: soong_zip -write_if_changed keeps an unchanged srcjar's mtime; `restat` lets ninja skip the dependents, else the srcjar stays older than its
+// newest input and the edge and everything downstream rebuild on every run.
+// jproto: protoc ends each --dependency_out without a newline; `awk 1` terminates every file's last line, else `cat` glues one file's last input to the next file's first
+// output, both read as inputs: a path that never exists, so the edge would rebuild on every run.
 const javaGenRules = `rule jaidl
-  command = cd "$root" && $aidl --ninja -d$out.d $flags $src $out && sed -i "s|^  \([^/]\)|  $root/\1|" $out.d
+  command = rm -f $out && cd "$root" && $aidl --ninja -d$out.d $flags $src $out && { [ -e $out ] || : > $out; } && ` + rootDeps + `
   depfile = $out.d
   deps = gcc
   description = aidl $in
 rule srcjar
-  command = (for f in $in; do [ ! -e $$f ] || echo $$f; done) > $out.list && $soongzip -srcjar -write_if_changed -o $out -C $dir -l $out.list
+  command = (for f in $in; do [ ! -s $$f ] || echo $$f; done) > $out.list && $soongzip -srcjar -write_if_changed -o $out -C $dir -l $out.list
+  restat = 1
   description = srcjar $out
 rule logtags
   command = PYTHONDONTWRITEBYTECODE=1 python3 $script -o $out $in
   description = logtags $in
 rule jproto
-  command = rm -rf $tmp $tmp.d && mkdir -p $tmp $tmp.d && $cmds && cat $tmp.d/*.d > $out.d && $soongzip -srcjar -write_if_changed -o $out -C $tmp -D $tmp && rm -rf $tmp $tmp.d
+  command = rm -rf $tmp $tmp.d && mkdir -p $tmp $tmp.d && $cmds && awk 1 $tmp.d/*.d > $out.d && $soongzip -srcjar -write_if_changed -o $out -C $tmp -D $tmp && rm -rf $tmp $tmp.d
   depfile = $out.d
   deps = gcc
+  restat = 1
   description = protoc $out
 `

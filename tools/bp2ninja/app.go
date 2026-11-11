@@ -881,6 +881,7 @@ func (g *Graph) appOutputs(name, tag string, side Side, from string) (files []sr
 // appRules are the rules the android modules' edges use; command shapes follow the Soong rules of the same names (aapt2.go aapt2Compile,
 // aapt2CompileZip, aapt2Link, mergeAssets, extractAssets; android_manifest.go manifestFixer, manifestMerger; aar.go resourceProcessorBusyBox,
 // unzipAAR; app_builder.go combineApk, TransformJniLibsToJar). mergeAssets and combineApk are stubs.go's `mergezips` (`merge_zips $out $in`).
+// aapt2link restats: its R srcjar is written only if changed (javagen.go srcjar says why that needs restat).
 const appRules = `rule aapt2compile
   command = $aapt2 compile -o $outdir $cflags $in
   description = aapt2 compile $outdir
@@ -889,6 +890,7 @@ rule aapt2compilezip
   description = aapt2 compile zip $out
 rule aapt2link
   command = $preamble$aapt2 link -o $pkg $flags --proguard $proguard --output-text-symbols $rtxt $inflags$postamble
+  restat = 1
   description = aapt2 link $pkg
 rule manifestfixer
   command = PYTHONDONTWRITEBYTECODE=1 $tool $args $in $out
