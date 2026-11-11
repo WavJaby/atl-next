@@ -4,6 +4,7 @@ package main
 
 import (
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -18,11 +19,11 @@ type headerSrcs struct {
 	ver                                javaVersion
 }
 
-// compileJavaHeader: turbine over the module's java sources and srcjars when it has any (`java <JavaVmFlags> -jar turbine.jar --output
-// <jar>.tmp --sources @rsp --javacopts <CommonJdkFlags> <javacflags> -source V -target V -- --source_jars <srcjars> <--system dir |
-// --bootclasspath jars> --classpath <jars>`, classpath space-separated (FormTurbineClassPath), java9 classpath first for Java 9+), then
-// always merged with the extra jars and the static libraries' headers into turbine-combined, META-INF/TRANSITIVE stripped. Returns that jar.
-func (g *Graph) compileJavaHeader(n *jNode, h headerSrcs, d javaDeps, jar string, validations []string) string {
+// turbine is compileJavaHeader's first half: turbine over the module's java sources and srcjars when it has any (`java <JavaVmFlags> -jar
+// turbine.jar --output <jar>.tmp --sources @rsp --javacopts <CommonJdkFlags> <javacflags> -source V -target V -- --source_jars <srcjars>
+// <--system dir | --bootclasspath jars> --classpath <jars>`, classpath space-separated (FormTurbineClassPath), java9 classpath first for
+// Java 9+). Returns localHeaderJars: that jar, then the extra jars; sharded javac compiles against them (javacShards).
+func (g *Graph) turbine(n *jNode, h headerSrcs, d javaDeps, jar string) []string {
 	var local []string
 	if len(h.java)+len(h.srcjars) > 0 {
 		turbine := g.jtoolJar("turbine", n.name)
@@ -52,9 +53,15 @@ func (g *Graph) compileJavaHeader(n *jNode, h headerSrcs, d javaDeps, jar string
 		})
 		local = append(local, out)
 	}
+	return append(local, h.extra...)
+}
+
+// compileJavaHeader's second half: the local header jars (turbine) always merged with the static libraries' headers into turbine-combined,
+// META-INF/TRANSITIVE stripped. Returns that jar.
+func (g *Graph) compileJavaHeader(n *jNode, local []string, d javaDeps, jar string, validations []string) string {
 	// depset PREORDER of the local header jars and TransitiveStaticLibsHeaderJars (a repackaged lib contributes both of its headers)
 	header := filepath.Join(n.dir, "turbine-combined", jar)
-	g.java.edgeV("combine", []string{header}, dedupKeep(append(append(local, h.extra...), d.staticHeaders...)), nil, nil, validations, [][2]string{
+	g.java.edgeV("combine", []string{header}, dedupKeep(append(slices.Clone(local), d.staticHeaders...)), nil, nil, validations, [][2]string{
 		{"args", "-stripDir META-INF/TRANSITIVE -stripFile module-info.class -stripFile 'META-INF/versions/*/module-info.class'"}})
 	return header
 }
@@ -62,7 +69,7 @@ func (g *Graph) compileJavaHeader(n *jNode, h headerSrcs, d javaDeps, jar string
 // turbineHeaders is headers_only: the turbine header through jarjar_rules ("turbine") and the inherited rename rules ("repackage-turbine")
 // is the module's header and implementation alike; nothing else is compiled.
 func (g *Graph) turbineHeaders(n *jNode, h headerSrcs, d javaDeps, jar, repackage string) {
-	header := g.compileJavaHeader(n, h, d, jar, nil)
+	header := g.compileJavaHeader(n, g.turbine(n, h, d, jar), d, jar, nil)
 	if rules := g.jarjarRulesFile(n); rules != "" {
 		jj := filepath.Join(n.dir, "jarjar", "turbine", jar)
 		g.jarjar(n, jj, header, rules, 1)

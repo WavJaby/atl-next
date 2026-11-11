@@ -23,7 +23,7 @@ import (
 //   - A genrule named in libs / static_libs whose command cannot run is dropped from the jars with a problem, not failed downstream
 //     (notices-for-stubs-jar: NOTICE files for API stubs jars, needs gen_notice).
 //   - Generated sources: javagen.go (.aidl, .logtags, .proto), kotlin.go (.kt), jarjar.go (jarjar_rules, inherited rename rules), aapt.go
-//     (an android_app's R sources). javac_shard_size is ignored: shards compile the same classes, javac runs once per module.
+//     (an android_app's R sources). javac_shard_size shards javac as Soong does (javacShards).
 //   - Not supported, reported as problems: errorprone, jacoco, lint, hiddenapi, dexpreopt, R8 (optimize), services, kapt.
 
 // JavaTools are the host programs and directories the Java rules run, given by the caller (all absolute). Soong's equivalents:
@@ -831,13 +831,24 @@ func (g *Graph) javaLibWith(n *jNode, extra javaExtra) {
 		hdr.extra = append(hdr.extra, kh)
 		d.classpath = append([]string{kh}, d.classpath...)
 	}
+	hdr.extra = append(hdr.extra, extra.combined...)
+	// Turbine headers (javaHeaders) are device-only and off when a plugin generates API; turbine runs before javac, whose shards compile against it
+	turbine := n.side == Device && !d.disableTurbine
+	var localHdr, shardJars []string
+	if turbine {
+		localHdr = g.turbine(n, hdr, d, jar)
+	}
 	if len(java)+len(srcjars) > 0 {
-		classes := out("javac")
-		g.javac(n, classes, java, srcjars, waits, flags, ver, d)
-		localImpl = append(localImpl, g.repackage(n, classes, repackage, "javac", jar))
+		if size := javacShardSize(n); turbine && size > 0 {
+			shardJars = g.javacShards(n, size, localHdr, java, srcjars, waits, flags, ver, d, repackage, jar)
+			localImpl = append(localImpl, shardJars...)
+		} else {
+			classes := out("javac")
+			g.javac(n, classes, java, srcjars, waits, flags, ver, d)
+			localImpl = append(localImpl, g.repackage(n, classes, repackage, "javac", jar))
+		}
 	}
 	localImpl = append(localImpl, extra.combined...)
-	hdr.extra = append(hdr.extra, extra.combined...)
 
 	// resources (java_resource_dirs, java_resources)
 	resArgs, resDeps, resWaits := g.javaResources(n)
@@ -893,6 +904,24 @@ func (g *Graph) javaLibWith(n *jNode, extra javaExtra) {
 		g.genFile(manifest, "Main-Class: "+mc+"\n")
 	}
 	implJars := dedupKeep(append(append([]string{}, localImpl...), d.staticImpl...))
+	rules := g.jarjarRulesFile(n)
+	// jarjarIfNecessary: the implementation jar in jarjar_shards shards, the resources in one
+	jjShards := 1
+	if v := p.str("jarjar_shards"); v != "" {
+		if k, err := strconv.Atoi(v); err == nil && k > 0 {
+			jjShards = k
+		} else {
+			g.problem("%s: jarjar_shards must be an integer represented as a string", n.name)
+		}
+	}
+	// a sharded module's implementation in pieces, each through jarjar and d8 on its own (shardPieces)
+	var pieces []string
+	if len(shardJars) > 0 {
+		pieces = g.shardPieces(n, shardJars, implJars, rules, jjShards, jar)
+		if rules != "" {
+			implJars = pieces
+		}
+	}
 	var impl string
 	switch {
 	case len(implJars) == 0 && manifest == "":
@@ -902,20 +931,13 @@ func (g *Graph) javaLibWith(n *jNode, extra javaExtra) {
 		impl = out("combined")
 		j.combine(impl, implJars, manifest)
 	}
-	if rules := g.jarjarRulesFile(n); rules != "" && impl != "" {
-		// jarjarIfNecessary: the implementation jar in jarjar_shards shards, the resources in one
-		shards := 1
-		if v := p.str("jarjar_shards"); v != "" {
-			if k, err := strconv.Atoi(v); err == nil && k > 0 {
-				shards = k
-			} else {
-				g.problem("%s: jarjar_shards must be an integer represented as a string", n.name)
-			}
+	if rules != "" && impl != "" {
+		if pieces == nil {
+			jj := out("jarjar")
+			g.jarjar(n, jj, impl, rules, jjShards)
+			impl = jj
 		}
-		jj := out("jarjar")
-		g.jarjar(n, jj, impl, rules, shards)
-		impl = jj
-		implJars = []string{jj}
+		implJars = []string{impl}
 		if len(n.res) > 0 {
 			rc := n.res[0]
 			if len(n.res) > 1 {
@@ -936,7 +958,7 @@ func (g *Graph) javaLibWith(n *jNode, extra javaExtra) {
 	}
 	n.impl = implJars
 	if impl != "" {
-		g.javaHeaders(n, impl, hdr, d, repackage, validations, jar)
+		g.javaHeaders(n, impl, turbine, localHdr, d, repackage, validations, jar)
 	}
 
 	// implementation + resources
@@ -949,7 +971,7 @@ func (g *Graph) javaLibWith(n *jNode, extra javaExtra) {
 	// java_binary / java_binary_host are installable by default (java.go BinaryFactory, BinaryHostFactory); the wrapper script is not built
 	compileDex := p.boolean("compile_dex", false) || p.boolean("installable", n.typ == "java_binary" || n.typ == "java_test_helper_library") || isApp(n.typ)
 	if n.side == Device && compileDex && impl != "" {
-		g.javaDex(n, d, s, jar)
+		g.javaDex(n, d, s, jar, pieces)
 	}
 	if n.typ == "java_binary_host" {
 		g.javaBinary(n, stem)
@@ -963,9 +985,9 @@ func (g *Graph) javaLibWith(n *jNode, extra javaExtra) {
 //     hidden_from_bootclasspath) still resolve. A method-body edit leaves turbine's bytes alone, so dependents' javac does not rerun.
 //   - Host (Soong: Turbine is device-only) and device modules with an API-generating plugin: the implementation jar without
 //     META-INF/services (convertImplementationJarToHeaderJar); no repackaged header.
-func (g *Graph) javaHeaders(n *jNode, impl string, hdr headerSrcs, d javaDeps, repackage string, validations []string, jar string) {
-	if n.side == Device && !d.disableTurbine {
-		header := g.compileJavaHeader(n, hdr, d, jar, validations)
+func (g *Graph) javaHeaders(n *jNode, impl string, turbine bool, localHdr []string, d javaDeps, repackage string, validations []string, jar string) {
+	if turbine {
+		header := g.compileJavaHeader(n, localHdr, d, jar, validations)
 		if rules := g.jarjarRulesFile(n); rules != "" {
 			jj := filepath.Join(n.dir, "jarjar", "turbine", jar)
 			g.jarjar(n, jj, header, rules, 1)
@@ -999,6 +1021,12 @@ func (n *jNode) output() []string {
 // javac is transformJavaToClasses (builder.go): java >= 9 compiles against system modules (--system, none on device when there are
 // none) with java9Classpath first on the classpath; older targets against the bootclasspath (explicitly empty on device).
 func (g *Graph) javac(n *jNode, out string, java, srcjars, waits, flags []string, ver javaVersion, d javaDeps) {
+	g.javacIn(n, out, "", java, srcjars, waits, flags, ver, d)
+}
+
+// javacIn is javac with its working directories (classes, anno, srcjars beside out) suffixed by a shard index, as Soong's
+// (transformJavaToClasses: srcjars<i>, classes<i>, anno<i>); processors record the unpacked srcjar paths (.uau).
+func (g *Graph) javacIn(n *jNode, out, suffix string, java, srcjars, waits, flags []string, ver javaVersion, d javaDeps) {
 	boot, implicit := "", []string{}
 	cp := d.classpath
 	if ver.modules() {
@@ -1026,8 +1054,8 @@ func (g *Graph) javac(n *jNode, out string, java, srcjars, waits, flags []string
 	}
 	dir := filepath.Dir(out)
 	vars := [][2]string{{"flags", ninjaRaw(flags)}, {"bootcp", boot}, {"processor", processor}, {"srcjars", join(srcjars)},
-		{"ver", ver.String()}, {"outdir", esc(filepath.Join(dir, "classes"))}, {"annodir", esc(filepath.Join(dir, "anno"))},
-		{"srcjardir", esc(filepath.Join(dir, "srcjars"))}}
+		{"ver", ver.String()}, {"outdir", esc(filepath.Join(dir, "classes"+suffix))}, {"annodir", esc(filepath.Join(dir, "anno"+suffix))},
+		{"srcjardir", esc(filepath.Join(dir, "srcjars"+suffix))}}
 	if len(cp) > 0 {
 		vars = append(vars, [2]string{"cp", "-classpath " + esc(strings.Join(cp, ":"))})
 	}
@@ -1041,7 +1069,7 @@ func (g *Graph) javac(n *jNode, out string, java, srcjars, waits, flags []string
 }
 
 // javaDex is dexer.compileDex with d8 plus the dex-withres merge (base.go), dex.go dexCommonFlags / d8Flags.
-func (g *Graph) javaDex(n *jNode, d javaDeps, s sdkSpec, jar string) {
+func (g *Graph) javaDex(n *jNode, d javaDeps, s sdkSpec, jar string, pieces []string) {
 	p := n.props
 	j := g.java
 	var flags []string
@@ -1098,9 +1126,13 @@ func (g *Graph) javaDex(n *jNode, d javaDeps, s sdkSpec, jar string) {
 	}
 	dex := filepath.Join(n.dir, "dex", jar)
 	d8 := g.jtool("d8", n.name)
-	j.edge("d8", []string{dex}, []string{n.implRes}, append(libs, d8), nil, [][2]string{
-		{"flags", ninjaRaw(flags)}, {"outdir", esc(filepath.Join(n.dir, "dex"))}, {"zipflags", zipFlags}, {"d8", esc(d8)},
-	})
+	if pieces != nil {
+		g.dexPieces(n, dex, pieces, flags, libs, zipFlags, d8)
+	} else {
+		j.edge("d8", []string{dex}, []string{n.implRes}, append(libs, d8), nil, [][2]string{
+			{"flags", ninjaRaw(flags)}, {"outdir", esc(filepath.Join(n.dir, "dex"))}, {"zipflags", zipFlags}, {"d8", esc(d8)},
+		})
+	}
 	if uncompress {
 		a := filepath.Join(n.dir, "aligned", jar)
 		j.edge("zipalign", []string{a}, []string{dex}, nil, nil, nil)
@@ -1447,6 +1479,7 @@ rule installexec
 	b.WriteString(syspropJavaRule)
 	b.WriteString(sdkAidlRules)
 	b.WriteString(j.turbineRule())
+	b.WriteString(j.shardRules())
 	b.WriteString(j.kotlincRule(g))
 	return b.String()
 }
