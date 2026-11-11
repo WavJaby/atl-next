@@ -674,7 +674,13 @@ struct Package {
 
 /// The Soong package holding directory `at` (inside the checkout `dir` of AOSP project `project`, a tree path): the nearest of `at` and its ancestors up to `dir` whose `Android.bp` (+ its `build = [...]` files) declares a licence -- a `license` module with kinds, or a licence reference.
 /// Soong gives a module its package's default, and one project may hold hundreds of packages under different licences (external/rust/android-crates-io: a crate each). Inner `Err`: no package declares a licence.
-fn package(dir: &Path, project: &Path, at: &Path) -> Result<Result<Package, String>> {
+/// `seen` gets what the answer depends on: each blueprint read, and the directory of each one absent (its entries say when one appears).
+fn package(
+    dir: &Path,
+    project: &Path,
+    at: &Path,
+    seen: &mut dyn FnMut(&Path),
+) -> Result<Result<Package, String>> {
     let mut pkg = dir.join(at);
     loop {
         let mut bps = vec![pkg.join("Android.bp")];
@@ -682,8 +688,10 @@ fn package(dir: &Path, project: &Path, at: &Path) -> Result<Result<Package, Stri
         let mut refs = BTreeSet::new();
         while let Some(bp) = bps.pop() {
             let Ok(bytes) = std::fs::read(&bp) else {
+                seen(bp.parent().unwrap_or(&pkg));
                 continue;
             };
+            seen(&bp);
             let parsed = parse_bp(&String::from_utf8_lossy(&bytes));
             bps.extend(
                 parsed
@@ -717,14 +725,15 @@ fn package(dir: &Path, project: &Path, at: &Path) -> Result<Result<Package, Stri
 }
 
 /// The Soong package holding directory `at` (`package`) and its licence kinds: those of its `license` modules plus those of every `license` module it references (`Index::license_of`).
-/// Returns the package's tree path; inner `Err`: no package declares a licence, or a reference the index cannot resolve to one `license` module with kinds.
+/// Returns the package's tree path; inner `Err`: no package declares a licence, or a reference the index cannot resolve to one `license` module with kinds. `seen`: as `package`'s.
 pub fn package_kinds(
     dir: &Path,
     project: &Path,
     at: &Path,
     index: &Index,
+    seen: &mut dyn FnMut(&Path),
 ) -> Result<Result<(PathBuf, BTreeSet<String>), String>> {
-    let p = match package(dir, project, at)? {
+    let p = match package(dir, project, at, seen)? {
         Ok(p) => p,
         Err(why) => return Ok(Err(why)),
     };
@@ -753,7 +762,7 @@ pub fn package_texts(
     index: &Index,
     read: &dyn Fn(&Path) -> Result<Option<String>>,
 ) -> Result<Result<BTreeMap<PathBuf, String>, String>> {
-    let p = match package(dir, project, at)? {
+    let p = match package(dir, project, at, &mut |_| {})? {
         Ok(p) => p,
         Err(why) => return Ok(Err(why)),
     };

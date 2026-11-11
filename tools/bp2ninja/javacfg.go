@@ -5,9 +5,7 @@ package main
 import (
 	"fmt"
 	"go/ast"
-	"go/parser"
 	"go/token"
-	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -72,7 +70,7 @@ func readJavaConfig(tree, jdk string) (JavaConfig, error) {
 			return c, fmt.Errorf("build/soong/java/config: %s not found", name)
 		}
 	}
-	rel, err := os.ReadFile(filepath.Join(jdk, "release"))
+	rel, err := readFile(filepath.Join(jdk, "release"))
 	if err != nil {
 		return c, err
 	}
@@ -88,7 +86,7 @@ func readJavaConfig(tree, jdk string) (JavaConfig, error) {
 // `pctx.StaticVariable("Name", <expr>)` / `pctx.SourcePathVariable` (a tree path). Slices are stored as their elements; a joined string (strings.Join) also as a slice,
 // split on the join separator " ", which is how Soong's flags are joined and later split by the shell.
 func goConstants(path string, lists map[string][]string, strs map[string]string) error {
-	f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	f, err := parseGoFile(path)
 	if err != nil {
 		return err
 	}

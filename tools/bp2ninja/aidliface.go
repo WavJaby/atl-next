@@ -4,7 +4,6 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -463,7 +462,7 @@ func (g *Graph) aidlLibraryDirs(ref string, side Side, from string, seen map[str
 
 // readHash:`tail -1 <file>` of a .hash file, ok=false when there is none.
 func (g *Graph) readHash(rel string) (string, bool) {
-	b, err := os.ReadFile(g.abs(rel))
+	b, err := readFile(g.abs(rel))
 	if err != nil {
 		return "", false
 	}

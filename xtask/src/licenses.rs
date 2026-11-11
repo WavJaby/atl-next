@@ -38,7 +38,7 @@ pub struct Licenses {
 /// The AOSP module index an AOSP project's licence references resolve through; read on first use (~10 MB, and most commands never need it).
 #[derive(Debug, Default)]
 pub(crate) struct AospIndex {
-    file: Option<PathBuf>,
+    pub(crate) file: Option<PathBuf>,
     loaded: OnceLock<Result<crate::aosp::Index, String>>,
 }
 
@@ -191,12 +191,14 @@ pub fn aosp_default(package: &Path, kinds: &BTreeSet<String>) -> Unlabelled {
 impl Licenses {
     /// Licence of the notice-less files in directory `at` of a checkout keyed `key`, checked out at `dir`; `project` = its AOSP tree path (empty for the AOSP tree root and other upstreams), `at` relative to `dir`.
     /// An AOSP file's is derived from the Android.bp of its Soong package (`aosp::package_kinds`, `aosp_default`) and the AOSP module index its licence references resolve through, never stored; another upstream's is its `unlabelled`, whatever `at`.
+    /// `seen` gets each blueprint path the answer depends on (`aosp::package`; the licence gate's depfile).
     pub fn unlabelled(
         &self,
         key: &str,
         project: &Path,
         dir: &Path,
         at: &Path,
+        seen: &mut dyn FnMut(&Path),
     ) -> Result<Unlabelled> {
         if key == AOSP {
             if project.as_os_str().is_empty() {
@@ -206,7 +208,7 @@ impl Licenses {
                 Ok(i) => i,
                 Err(why) => return Ok(Unlabelled::Missing(why.to_owned())),
             };
-            let kinds = crate::aosp::package_kinds(dir, project, at, index)
+            let kinds = crate::aosp::package_kinds(dir, project, at, index, seen)
                 .with_context(|| format!("reading the Android.bp files of {}", dir.display()))?;
             return Ok(match kinds {
                 Ok((package, kinds)) => aosp_default(&package, &kinds),
@@ -648,7 +650,9 @@ mod tests {
         ]));
         let x = Path::new("external/x");
         let at = |licenses: &Licenses, dir: &str| {
-            licenses.unlabelled(AOSP, x, &tmp, Path::new(dir)).unwrap()
+            licenses
+                .unlabelled(AOSP, x, &tmp, Path::new(dir), &mut |_| {})
+                .unwrap()
         };
         let root = at(&licenses, "");
         let fallback = at(&licenses, "sub");
@@ -674,7 +678,7 @@ mod tests {
         let nearest = at(&licenses, "sub");
         write("sub/Android.bp", &own.replace("\"l\"", "\"gone\""));
         let dangling = at(&licenses, "sub");
-        let no_project = licenses.unlabelled(AOSP, Path::new(""), &tmp, Path::new(""));
+        let no_project = licenses.unlabelled(AOSP, Path::new(""), &tmp, Path::new(""), &mut |_| {});
         // without an index, references cannot be followed
         let unindexed = parse(RUNTIME_MIT, &upstreams()).unwrap();
         let no_index = at(&unindexed, "");
@@ -708,12 +712,12 @@ mod tests {
         let none = Path::new("");
         assert_eq!(
             licenses
-                .unlabelled("qemu", none, none, Path::new("linux-user"))
+                .unlabelled("qemu", none, none, Path::new("linux-user"), &mut |_| {})
                 .unwrap(),
             Unlabelled::Licence("GPL-2.0-or-later".into())
         );
         assert!(matches!(
-            licenses.unlabelled("boringssl", none, none, none).unwrap(),
+            licenses.unlabelled("boringssl", none, none, none, &mut |_| {}).unwrap(),
             Unlabelled::Missing(m) if m.contains("no `unlabelled`")
         ));
     }

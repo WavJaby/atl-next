@@ -3,7 +3,6 @@
 package main
 
 import (
-	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -83,7 +82,7 @@ func (g *Graph) prebuiltApiJar(name string) (*Module, string) {
 				continue
 			}
 			path := filepath.Join(m.Dir, parts[1], parts[0], parts[2]+".jar")
-			if _, err := os.Stat(g.abs(path)); err == nil {
+			if _, err := statPath(g.abs(path)); err == nil {
 				return m, path
 			}
 		}

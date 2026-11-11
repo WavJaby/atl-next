@@ -4,7 +4,6 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -103,7 +102,7 @@ func (g *Graph) javaAidl(n *jNode, files []srcFile, d javaDeps) (java, srcjars [
 	}
 	incs = append(incs, a.strs("include_dirs")...)
 	incs = append(incs, n.mod.Dir)
-	if st, err := os.Stat(g.abs(filepath.Join(n.mod.Dir, "src"))); err == nil && st.IsDir() {
+	if st, err := statPath(g.abs(filepath.Join(n.mod.Dir, "src"))); err == nil && st.IsDir() {
 		incs = append(incs, filepath.Join(n.mod.Dir, "src"))
 	}
 	// tree-relative, run from the tree root as Soong's: aidl writes the source path into the generated code (UnsupportedAppUsage

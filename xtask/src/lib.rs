@@ -41,6 +41,7 @@ pub mod modules;
 pub mod native;
 pub mod ndk;
 pub mod ndk_surface;
+pub mod ninja_deps;
 pub mod none_gate;
 pub mod notice;
 pub mod packages;

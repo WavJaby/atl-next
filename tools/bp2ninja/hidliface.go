@@ -3,7 +3,6 @@
 package main
 
 import (
-	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -193,7 +192,7 @@ func (g *Graph) newHidlIface(m *Module, side Side) *hidlIface {
 		return nil
 	}
 	cur := filepath.Join(rm.Dir, "current.txt")
-	if _, err := os.Stat(g.abs(cur)); err == nil {
+	if _, err := statPath(g.abs(cur)); err == nil {
 		h.current = cur
 	} else if useCurrent {
 		g.problem("%s: hidl_package_root %s: use_current but %s does not exist", m.Name, root, cur)
@@ -364,7 +363,7 @@ func (g *Graph) hidlRule(n *Node) *genRule {
 	r.hasTools = true
 	r.labels = []genLabel{g.genTool(n, r, "hidl-gen", fail)}
 	for _, s := range h.srcs {
-		if _, err := os.Stat(g.abs(s)); err != nil {
+		if _, err := statPath(g.abs(s)); err != nil {
 			fail("input %s does not exist", s)
 		}
 		r.inputs = append(r.inputs, s)

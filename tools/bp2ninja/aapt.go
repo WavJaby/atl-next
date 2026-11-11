@@ -4,7 +4,6 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -69,7 +68,7 @@ func (g *Graph) resourceGlob(dir string) []string {
 
 // globDirExists: whether dir is an existing directory of the tree.
 func globDirExists(g *Graph, dir string) (bool, error) {
-	if st, err := os.Stat(g.abs(dir)); err != nil || !st.IsDir() {
+	if st, err := statPath(g.abs(dir)); err != nil || !st.IsDir() {
 		return false, fmt.Errorf("%s: not a directory", dir)
 	}
 	return true, nil

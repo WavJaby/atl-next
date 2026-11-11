@@ -124,7 +124,8 @@ pub fn run(root: &std::path::Path, args: &Args) -> Result<std::process::ExitCode
         let rel = prefix.join(inside).display().to_string();
         let text = String::from_utf8_lossy(&std::fs::read(f)?).into_owned();
         let at = inside.parent().unwrap_or(std::path::Path::new(""));
-        let unlabelled = || licenses.unlabelled(&c.licence_key, &prefix, &checkout, at);
+        let unlabelled =
+            || licenses.unlabelled(&c.licence_key, &prefix, &checkout, at, &mut |_| {});
         match resolve(&rel, &text, upstream, unlabelled) {
             Ok(id) => {
                 if args.files.is_some() && !matches!(licenses.allows("runtime", &id), Ok(true)) {

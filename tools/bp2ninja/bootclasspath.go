@@ -225,7 +225,7 @@ func (g *Graph) loadLibraries(n *jNode, done map[*jNode]bool) []string {
 		if filepath.IsAbs(f) {
 			continue
 		}
-		b, err := os.ReadFile(filepath.Join(g.tree, f))
+		b, err := readFile(filepath.Join(g.tree, f))
 		if err != nil {
 			g.problem("%s: reading %s: %v", n.name, f, err)
 			continue
@@ -243,7 +243,7 @@ func (g *Graph) loadLibraries(n *jNode, done map[*jNode]bool) []string {
 // bootJarsFinal applies product_config.mk's boot jar lines (qualify-platform-jars, the core-icu4j move, the APEX sort); its file must
 // still carry the core-icu4j move, else this mirror is stale.
 func bootJarsFinal(tree string, vars map[string][]string) (boot, apex []bootJar, err error) {
-	b, err := os.ReadFile(filepath.Join(tree, productConfigMk))
+	b, err := readFile(filepath.Join(tree, productConfigMk))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -329,7 +329,7 @@ var (
 // variables, release flags or makeEnv. A condition it cannot evaluate is fine unless its body assigns a list variable (error); `define`
 // blocks are skipped. Returns an error for `$(error …)` reached on a taken branch.
 func readMakeLists(path string, vars map[string][]string, rel *Release) error {
-	b, err := os.ReadFile(path)
+	b, err := readFile(path)
 	if err != nil {
 		return err
 	}

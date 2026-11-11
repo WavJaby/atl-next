@@ -186,6 +186,8 @@ type Graph struct {
 	tree, out string
 	cfg       Config
 	soong     SoongConfig
+	// link outputs under <out>/device, in emit order: the inputs of the licence gate edge (licence.go)
+	deviceLinks []string
 	// the libc++ headers of the stl provider: -isystem of every libc++ C++ compile (stl.go libcxxProvider)
 	libcxx string
 	// bionic sides: compiler-rt's public headers (sanitizer/, xray/), which prebuilts/clang's resource dir carries and the distro clang's lacks (-clang-rt-include)
@@ -495,7 +497,7 @@ func libcHeaderLinks(provided map[string]Provided) (map[string]string, error) {
 	for _, name := range libcCompat {
 		for _, dir := range p.Include {
 			f := filepath.Join(dir, name)
-			if _, err := os.Stat(f); err == nil {
+			if _, err := statPath(f); err == nil {
 				out[name] = f
 				break
 			}

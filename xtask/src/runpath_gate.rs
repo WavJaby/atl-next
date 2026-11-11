@@ -9,7 +9,48 @@ use anyhow::{Context, Result};
 use object::read::elf::{ElfFile, FileHeader};
 use object::{Endianness, elf};
 
-/// Every runpath entry of `artifacts` (the fresh link outputs under `<out>/device` and `<out>/nb/<arch>`, licence_gate::link_outputs), as `<artifact>: <tag> <value>`; plus how many ELF artifacts were read.
+/// The link outputs of this out dir's build.ninja under any of `under` that exist (`ninja -t targets rule link`): the current graph's artifacts, not leftovers of an earlier goal set.
+pub(crate) fn link_outputs(out: &Path, under: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    Ok(crate::licence_gate::lines(&crate::licence_gate::ninja(
+        out,
+        &["-t", "targets", "rule", "link"],
+    )?)
+    .map(PathBuf::from)
+    .filter(|p| under.iter().any(|u| p.starts_with(u)) && p.is_file())
+    .collect())
+}
+
+/// `artifacts` split into (fresh, stale): stale = a failed build left an earlier link's output (`relinked`).
+pub(crate) fn fresh(out: &Path, artifacts: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let stale = relinked(out, &artifacts);
+    artifacts.into_iter().partition(|a| !stale.contains(a))
+}
+
+/// The artifacts whose link edge ninja would run (dry run, `-k 0`: past edges that would fail): those a failed build left as an earlier link's output.
+/// Read from the dry run's `[i/n] link <out>` lines, bp2ninja's link rule description. A dry run that cannot start leaves every artifact stale: what it would have told is unknown.
+fn relinked(out: &Path, artifacts: &[PathBuf]) -> std::collections::BTreeSet<PathBuf> {
+    if artifacts.is_empty() {
+        return std::collections::BTreeSet::new();
+    }
+    // its exit status is not read: a dry run fails where a missing input has no rule, and still prints every edge it would run
+    let Ok(output) = std::process::Command::new("ninja")
+        .arg("-C")
+        .arg(out)
+        .args(["-n", "-k", "0"])
+        .args(artifacts)
+        .output()
+    else {
+        return artifacts.iter().cloned().collect();
+    };
+    crate::licence_gate::lines(&String::from_utf8_lossy(&output.stdout))
+        .filter_map(|l| {
+            let (_, rest) = l.split_once("] link ")?;
+            l.starts_with('[').then(|| PathBuf::from(rest))
+        })
+        .collect()
+}
+
+/// Every runpath entry of `artifacts` (the fresh link outputs under `<out>/device` and `<out>/nb/<arch>`, `link_outputs`), as `<artifact>: <tag> <value>`; plus how many ELF artifacts were read.
 pub fn check(out: &Path, artifacts: &[PathBuf]) -> Result<(usize, Vec<String>)> {
     let mut read = 0;
     let mut violations = Vec::new();

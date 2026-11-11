@@ -4,7 +4,6 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -683,7 +682,7 @@ const busyboxPath = "prebuilts/bazel/common/android_tools/android_tools/all_andr
 
 func (g *Graph) busyboxJar(from string) string {
 	p := g.abs(busyboxPath)
-	if _, err := os.Stat(p); err != nil {
+	if _, err := statPath(p); err != nil {
 		g.problem("%s: %s does not exist", from, busyboxPath)
 		g.missingPaths = addKey(g.missingPaths, filepath.Dir(busyboxPath))
 	}

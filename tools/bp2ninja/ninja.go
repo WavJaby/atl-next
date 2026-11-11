@@ -5,7 +5,6 @@ package main
 import (
 	"fmt"
 	"io/fs"
-	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -48,8 +47,8 @@ func globTree(base, pattern, dir string) []string {
 // Tools are the host programs the generated rules call. RustVersion: Rustc's version, Soong's ANDROID_RUST_VERSION, which crates read (rustversion).
 // LibClang: the directory of CC's libclang.so, which bindgen loads at run time (LIBCLANG_PATH): the cc side's clang parses the headers bindgen reads.
 // Launcher: compiler cache prefixed to the cc rule only (empty = none), except compiles with debug info (debugInfo). Not yasm (sccache does not know it) nor rustc: sccache 0.10 refuses rustc's `-o`, keys Rust on the cwd (= the out dir, so no hit across out dirs) and restores the dep-info of the out dir that filled the entry.
-// BionicStaticRust: -bionic-static-rust (rust.go rustStaticlib).
-type Tools struct{ CC, CXX, AR, Bison, Flex, Yasm, Rustc, RustVersion, LibClang, LLVM, Launcher, RtInclude, BionicStaticRust string }
+// BionicStaticRust: -bionic-static-rust (rust.go rustStaticlib). LicenceGate: -licence-gate (licence.go).
+type Tools struct{ CC, CXX, AR, Bison, Flex, Yasm, Rustc, RustVersion, LibClang, LLVM, Launcher, RtInclude, BionicStaticRust, LicenceGate string }
 
 func esc(s string) string {
 	return strings.NewReplacer("$", "$$", " ", "$ ", ":", "$:", "\n", "$\n").Replace(s)
@@ -279,6 +278,9 @@ func (g *Graph) emit(tools Tools) string {
 				linkOut = filepath.Join(filepath.Dir(n.out), "unprefixed", filepath.Base(n.out))
 			}
 			fmt.Fprintf(&b, "build %s: link %s | %s\n  mode = %s\n  libs = %s\n", esc(linkOut), join(n.objs), join(inputs), shellQuote(mode), shellQuote(libs))
+			if strings.HasPrefix(linkOut, filepath.Join(g.out, "device")+"/") {
+				g.deviceLinks = append(g.deviceLinks, linkOut)
+			}
 			if len(begin)+len(end) > 0 {
 				fmt.Fprintf(&b, "  crtbegin = %s\n  crtend = %s\n", join(begin), join(end))
 			}
@@ -344,7 +346,7 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 	if cc {
 		for _, d := range p.strs("include_dirs") {
 			// a tree path, not a module reference: an absent one is usually an unfetched project (tflite -> external/gemmlowp)
-			if _, err := os.Stat(g.abs(d)); err != nil {
+			if _, err := statPath(g.abs(d)); err != nil {
 				g.problem("%s: include dir %s does not exist", n.mod.Name, d)
 				g.missingPaths = addKey(g.missingPaths, filepath.Clean(d))
 			}

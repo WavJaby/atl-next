@@ -95,6 +95,9 @@ enum Command {
     /// file has no notice at all. An unrecognised notice is reported, never guessed. The licence
     /// gate applies the same resolution to what a build links.
     Licence(notice::Args),
+    /// The licence gate as build.ninja's edge over the device link outputs (licence_gate.rs): ninja runs it, `native` reads its report.
+    #[command(hide = true)]
+    LicenceGate(licence_gate::EdgeArgs),
     /// Churn of the AOSP code the Rust system services mirror (services.toml) between two AOSP revisions: what a tag bump must be reviewed against.
     ///
     /// Per service, most churn first; per entry lines added + deleted, of the whole file or of the named declaration's body (overloads together), GONE when it vanished. Read-only.
@@ -156,6 +159,7 @@ pub fn main() -> Result<ExitCode> {
         Command::Patch(args) => patch::run(&root, &args),
         Command::Land(args) => land::run(&root, &args),
         Command::Licence(args) => notice::run(&root, &args),
+        Command::LicenceGate(args) => licence_gate::run_edge(&root, &args),
         Command::UpgradeDiff(args) => {
             let layout = atl_layout::Layout::of(&root)?;
             service_mirrors::upgrade_diff(&root, &args, &|project| {

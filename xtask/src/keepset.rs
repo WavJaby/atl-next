@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! `cargo xtask keepset`: each `[aosp.sparse]` keep-set derived from the build graphs, and the rows checked against it.
 //!
-//! A read is a tree path a graph names: every token of `<out>/build.ninja` (inputs, implicit and order-only inputs, `cp =` bindings such as a javac classpath), the header reads of `ninja -t deps`, the strings of `graph.json` (include dirs), the `Android.bp` of every module a graph or a `cts.toml` row names, and the `<os>/bin` dir of each host row's `soong_prebuilt_os` (`arches.toml`). Reads come from every out dir given (default: each `out/slot-<n>` with a build.ninja).
+//! A read is a tree path a graph names: every token of `<out>/build.ninja` (inputs, implicit and order-only inputs, `cp =` bindings such as a javac classpath), the header reads of its deps log (ninja_deps.rs), the strings of `graph.json` (include dirs), the `Android.bp` of every module a graph or a `cts.toml` row names, and the `<os>/bin` dir of each host row's `soong_prebuilt_os` (`arches.toml`). Reads come from every out dir given (default: each `out/slot-<n>` with a build.ninja).
 //! Cone mode keeps whole dirs: a project's keep-set is the minimal cover of its reads by non-nested dirs. A dir read keeps itself, a file read keeps its parent dir; root files are always kept. Dir or file is decided on disk.
 //! `--check` (step `keepset` of `xtask check`) fails when a read falls outside its row. A row dir no read needs is listed, not failed. `--write --project P` writes the derived set; a checkout changes only through `xtask fetch --recreate`.
 //! Limits: a header read exists only for an edge some deps log has built, so an unbuilt edge contributes its include dirs from graph.json instead. The converter parses every `Android.bp` of the tree; only the ones a graph names are reads here, and the gates build what a dropped one would break.
@@ -432,47 +432,20 @@ fn scan_ninja(file: &Path, prefixes: &Prefixes, from: &str, reads: &mut Reads) -
     Ok(())
 }
 
-/// The header reads of a graph's deps log: `ninja -t deps` streamed, each dependency line (indented, under a `<target>: #deps ...` header; licence_gate `parse_deps` format) a read.
-/// Streamed rather than parsed into a target map: the log lists ~8M dependency lines per graph and only the paths matter here.
+/// The header reads of a graph's deps log (ninja_deps.rs, read-only, so safe beside a build of that slot): each path a step's record names, once.
+/// Unique paths rather than a target map: the log holds ~8M dependency entries per graph and only the paths matter here.
+/// Not the records of build.ninja's regeneration edge (every directory and blueprint the converter walked; ninja files them under each of its outputs, graph.json and problems.txt too) or of the licence gate edge (what it checked): those read whatever the checkout holds, they do not need it held.
 fn scan_deps(out: &Path, prefixes: &Prefixes, from: &str, reads: &mut Reads) -> Result<()> {
-    let mut child = std::process::Command::new("ninja")
-        .arg("-C")
-        .arg(out)
-        .args(["-t", "deps"])
-        .stdout(std::process::Stdio::piped())
-        // shown as it comes: a piped stderr read only after stdout ends could fill and stall ninja
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .context("running ninja -t deps")?;
-    let stdout = child.stdout.take().context("ninja -t deps stdout")?;
-    let mut in_record = false;
-    let mut line = Vec::new();
-    let mut r = BufReader::new(stdout);
-    loop {
-        line.clear();
-        if r.read_until(b'\n', &mut line)
-            .with_context(|| format!("reading ninja -t deps of {}", out.display()))?
-            == 0
-        {
-            break;
-        }
-        let text = String::from_utf8_lossy(&line);
-        if text.starts_with(' ') {
-            if in_record {
-                for rel in prefixes.rels(text.trim()) {
-                    reads.add(rel, from);
-                }
-            }
-        } else {
-            in_record = text.contains(": #deps");
+    let log = crate::ninja_deps::read(out)?;
+    let not_a_step = |o: &Path| {
+        o == Path::new("build.ninja")
+            || o.file_name() == Some(std::ffi::OsStr::new(crate::native::LICENCE_REPORT))
+    };
+    for dep in log.dependencies(not_a_step) {
+        for rel in prefixes.rels(&dep.display().to_string()) {
+            reads.add(rel, from);
         }
     }
-    let status = child.wait().context("waiting for ninja -t deps")?;
-    ensure!(
-        status.success(),
-        "ninja -t deps in {} exited with {status} (its stderr above)",
-        out.display()
-    );
     Ok(())
 }
 
@@ -805,15 +778,15 @@ mod tests {
         );
     }
 
-    /// A deps log ninja cannot read (no build.ninja) fails the scan instead of reading as no header reads.
+    /// A missing deps log fails the scan instead of reading as no header reads.
     #[test]
-    fn deps_scan_fails_when_ninja_does() {
+    fn deps_scan_fails_without_a_log() {
         let dir = std::env::temp_dir().join(format!("xtask-keepset-deps-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("test dir");
         let mut reads = Reads::default();
         let err = scan_deps(&dir, &Prefixes::new(Path::new(WS)), "t", &mut reads)
-            .expect_err("no build.ninja");
-        assert!(format!("{err:#}").contains("ninja -t deps"), "{err:#}");
+            .expect_err("no deps log");
+        assert!(format!("{err:#}").contains(".ninja_deps"), "{err:#}");
         fs::remove_dir_all(&dir).expect("test dir cleanup");
     }
 

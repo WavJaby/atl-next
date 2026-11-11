@@ -211,12 +211,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     std::fs::create_dir_all(&out)?;
     let go_work = converter::go_work(root, &layout, &tool_dir)?;
     let converter = tool_dir.join("bp2ninja");
-    converter::go(
-        root,
-        &go_work,
-        &["build", "-o", &converter.display().to_string(), "."],
-    )
-    .context("building bp2ninja")?;
+    converter::build(root, &go_work, &converter).context("building bp2ninja")?;
     let sources = sources::load(root)?;
     let workspace = workspace::load(root)?;
     let deps = deps::load(root, &deps::Consumers::new(&workspace, &sources, &arches))?;
@@ -345,9 +340,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         })
         .collect();
     let provided_file = out.join("provided.json");
-    std::fs::write(&provided_file, serde_json::to_string_pretty(&provided)?)?;
+    write_if_changed(&provided_file, &serde_json::to_string_pretty(&provided)?)?;
     let srcs_file = out.join("srcs.json");
-    std::fs::write(&srcs_file, serde_json::to_string_pretty(&partial)?)?;
+    write_if_changed(&srcs_file, &serde_json::to_string_pretty(&partial)?)?;
     // workspace packages' AIDL crates (packages.rs aidl_crates): always converted and built, so those packages build whatever the goals
     // cross host: not converted, their packages are not built (plan A3)
     let (aidl_crates, aidl_goals) = if cross.is_some() {
@@ -356,9 +351,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         packages::workspace_aidl_crates(root)?
     };
     let aidl_crates_file = out.join("aidl-crates.json");
-    std::fs::write(
+    write_if_changed(
         &aidl_crates_file,
-        serde_json::to_string_pretty(&aidl_crates)?,
+        &serde_json::to_string_pretty(&aidl_crates)?,
     )?;
     let rust = rust_toolchain(root)?;
     let libclang = libclang_dir(&flag_or_row(&args.cc, root, "clang")?)?;
@@ -377,17 +372,20 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         // host Java tools (xsdc for xsd_config's C++ output, ...) are built by the converter's Java pipeline where a goal reaches one; nothing Java is emitted otherwise
         let (jdk, build_tools) =
             arches::java_tools(&tree, &prebuilt_os, &deps::aosp_project(root, "jdk")?);
-        let status = Command::new(&converter)
-            .arg("-tree")
-            .arg(&tree)
-            .arg("-jdk")
-            .arg(&jdk)
-            .arg("-build-tools")
-            .arg(&build_tools)
-            .arg("-out")
-            .arg(&out)
-            .args(&cross_flags)
-            .args([
+        let path = |p: &Path| p.display().to_string();
+        let mut argv: Vec<String> = vec![
+            "-tree".into(),
+            path(&tree),
+            "-jdk".into(),
+            path(&jdk),
+            "-build-tools".into(),
+            path(&build_tools),
+            "-out".into(),
+            path(&out),
+        ];
+        argv.extend(cross_flags.iter().cloned());
+        argv.extend(
+            [
                 "-arch",
                 &args.host,
                 "-pointer-bits",
@@ -412,28 +410,35 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 &stand_in,
                 "-rust-version",
                 &rust.version,
-            ])
-            .arg("-rustc")
-            .arg(&rust.rustc)
-            .arg("-libclang")
-            .arg(&libclang)
-            .arg("-llvm")
-            .arg(&llvm)
-            .arg("-provided")
-            .arg(&provided_file)
-            .arg("-srcs")
-            .arg(&srcs_file)
-            .arg("-aidl-crates")
-            .arg(&aidl_crates_file)
-            .arg("-release")
-            .arg(&release)
-            .args(cache.iter().flat_map(CompilerCache::converter_args))
-            .args(&nb.flags)
-            .args(&args.goals)
-            .args(&aidl_goals)
-            .status()
-            .context("running bp2ninja")?;
-        ensure!(status.success(), "bp2ninja failed");
+                "-rustc",
+                &path(&rust.rustc),
+                "-libclang",
+                &path(&libclang),
+                "-llvm",
+                &path(&llvm),
+                "-provided",
+                &path(&provided_file),
+                "-srcs",
+                &path(&srcs_file),
+                "-aidl-crates",
+                &path(&aidl_crates_file),
+                "-release",
+                &release,
+                "-licence-gate",
+                &licence_gate_command(root, &out)?,
+            ]
+            .map(str::to_owned),
+        );
+        argv.extend(
+            cache
+                .iter()
+                .flat_map(CompilerCache::converter_args)
+                .map(str::to_owned),
+        );
+        argv.extend(nb.flags.iter().cloned());
+        argv.extend(args.goals.iter().cloned());
+        argv.extend(aidl_goals.iter().cloned());
+        convert(&converter, &out, &argv)?;
         let problems = std::fs::read_to_string(out.join("problems.txt")).unwrap_or_default();
         if args.fetch_missing {
             let missing = std::fs::read_to_string(out.join("missing.txt")).unwrap_or_default();
@@ -526,7 +531,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if let Some(first) = isa_floor_gate(&out, host)? {
         failed.push(Failure::step("isa gate", first));
     }
-    if let Some(first) = licence_gate(root, &layout, &sources, &out, args.verbose)? {
+    if let Some(first) = licence_gate(&out, status.success(), args.verbose)? {
         failed.push(Failure::step("licence gate", first));
     }
     if status.success() {
@@ -707,7 +712,7 @@ fn native_bridge_flags(
         },
     );
     let file = out.join("nb-provided.json");
-    std::fs::write(&file, serde_json::to_string_pretty(&provided)?)?;
+    write_if_changed(&file, &serde_json::to_string_pretty(&provided)?)?;
     let mut flags = side;
     flags.extend([
         "-nb-provided".to_owned(),
@@ -1240,10 +1245,10 @@ fn gate<'a>(out: &Path, libs: impl Iterator<Item = &'a Path>) -> Result<Option<S
     Ok(report.violations.first().map(ToString::to_string))
 }
 
-/// The runpath gate (runpath_gate.rs) over this graph's fresh link outputs under `<out>/device` and `<out>/nb/` (stale ones are the licence gate's to report), plus the converter-built Rust packages' libraries (`<out>/crates/*/lib`, packages.rs: cargo links them, not ninja); its first violation, None when it passes.
+/// The runpath gate (runpath_gate.rs) over this graph's fresh link outputs under `<out>/device` and `<out>/nb/` (a stale one's failed link is ninja's to report), plus the converter-built Rust packages' libraries (`<out>/crates/*/lib`, packages.rs: cargo links them, not ninja); its first violation, None when it passes.
 fn runpath_gate(out: &Path) -> Result<Option<String>> {
-    let all = crate::licence_gate::link_outputs(out, &[out.join("device"), out.join(NB_DIR)])?;
-    let (mut artifacts, _) = crate::licence_gate::fresh(out, all);
+    let all = crate::runpath_gate::link_outputs(out, &[out.join("device"), out.join(NB_DIR)])?;
+    let (mut artifacts, _) = crate::runpath_gate::fresh(out, all);
     artifacts.extend(crate::runpath_gate::package_libs(&out.join("crates"))?);
     let (read, violations) = crate::runpath_gate::check(out, &artifacts)?;
     println!(
@@ -1269,37 +1274,95 @@ fn isa_floor_gate(out: &Path, host: &arches::Host) -> Result<Option<String>> {
     Ok(report.violations.first().cloned())
 }
 
-/// The licence gate (licence_gate.rs) over the device artifacts ninja produced, failed ones aside; false on a denied or unresolved file or a stale artifact.
-/// The licence gate's first problem, None when it passes: a denied file, an unresolved one, then a stale artifact.
-fn licence_gate(
-    root: &Path,
-    layout: &Layout,
-    sources: &sources::Sources,
-    out: &Path,
-    verbose: bool,
-) -> Result<Option<String>> {
-    let licenses = licenses::load(root, &sources.upstream_names())?;
-    let roots = licence_gate::roots(layout, &sources.checkouts(None));
-    let out = std::fs::canonicalize(out)?;
-    licenses::check_test_only(&licenses)?;
-    let test_only = licenses::test_only_outputs(&licenses, &out)?
-        .into_iter()
-        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
-        .collect();
-    let report = licence_gate::check(&out, &roots, &licenses, &test_only)?;
+/// The converter's argument file in the out dir (tools/bp2ninja regen.go): build.ninja's regeneration edge reads it, so a changed flag or goal reruns the conversion.
+const CONVERTER_ARGS: &str = "bp2ninja.args";
+
+/// Brings `<out>/build.ninja` up to date with `argv` (the converter's flags and goals): ninja decides whether to convert again, from the regeneration edge's depfile (every file the last conversion read, this argument file among them).
+/// Bootstrap (`bp2ninja -bootstrap`: a build.ninja holding only that edge) when there is no build.ninja, or the argument file is new: a build.ninja from before it cannot rerun on it.
+fn convert(converter: &Path, out: &Path, argv: &[String]) -> Result<()> {
+    let args_file = out.join(CONVERTER_ARGS);
+    let bootstrap = !args_file.is_file() || !out.join("build.ninja").is_file();
+    let text: String = argv.iter().map(|a| format!("{a}\n")).collect();
+    ensure!(
+        argv.iter().all(|a| !a.contains('\n')),
+        "a converter argument holds a newline"
+    );
+    write_if_changed(&args_file, &text)?;
+    if bootstrap {
+        let status = Command::new(converter)
+            .arg("-bootstrap")
+            .arg(&args_file)
+            .status()
+            .context("running bp2ninja -bootstrap")?;
+        ensure!(status.success(), "bp2ninja -bootstrap failed");
+    }
+    let status = Command::new("ninja")
+        .arg("-C")
+        .arg(out)
+        .arg("build.ninja")
+        .status()
+        .context("running ninja build.ninja")?;
+    ensure!(status.success(), "bp2ninja failed (its output above)");
+    Ok(())
+}
+
+/// Writes `text` to `path` unless it already holds it: an unchanged input keeps its mtime, so the edges reading it stay clean.
+fn write_if_changed(path: &Path, text: &str) -> Result<()> {
+    if std::fs::read(path).ok().as_deref() == Some(text.as_bytes()) {
+        return Ok(());
+    }
+    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
+}
+
+/// The licence gate edge's report in the out dir (tools/bp2ninja licence.go licenceReport).
+pub(crate) const LICENCE_REPORT: &str = "licence-gate.json";
+
+/// The command of build.ninja's licence gate edge (bp2ninja -licence-gate): this xtask binary's hidden `licence-gate`, run from the checkout (xtask finds its root from the working directory).
+fn licence_gate_command(root: &Path, out: &Path) -> Result<String> {
+    let exe = std::env::current_exe().context("the xtask binary")?;
+    let quote = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
+    Ok(format!(
+        "cd {} && {} licence-gate --out {} --artifacts $out.rsp --report $out --depfile $out.d",
+        quote(root),
+        quote(&exe),
+        quote(out)
+    ))
+}
+
+/// The licence gate's first problem from its edge's report, None when it passes. After a failed build the report counts only when ninja would not rerun the edge (`ninja -n`): otherwise an artifact it reads failed to build, so it did not run.
+fn licence_gate(out: &Path, built: bool, verbose: bool) -> Result<Option<String>> {
+    let file = out.join(LICENCE_REPORT);
+    if !built {
+        let dry = Command::new("ninja")
+            .arg("-C")
+            .arg(out)
+            .arg("-n")
+            .arg(&file)
+            .output()
+            .context("running ninja -n for the licence gate")?;
+        if !String::from_utf8_lossy(&dry.stdout).contains("no work to do") {
+            println!("native: licence gate: not run (an artifact it checks did not build)");
+            return Ok(Some(
+                "not run: an artifact it checks did not build".to_owned(),
+            ));
+        }
+    }
+    let report: licence_gate::Report = serde_json::from_str(
+        &std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?,
+    )
+    .with_context(|| file.display().to_string())?;
     Ok(licence_report("licence gate", &report, verbose))
 }
 
 /// Prints a licence gate report under `label`; its first problem, None when it passes.
 fn licence_report(label: &str, report: &licence_gate::Report, verbose: bool) -> Option<String> {
     println!(
-        "native: {label}: {} artifacts ({} test-only skipped), {} files checked, not checked: {} generated, {} system, {} stale artifacts; {} licences denied, {} files unresolved",
+        "native: {label}: {} artifacts ({} test-only skipped), {} files checked, not checked: {} generated, {} system; {} licences denied, {} files unresolved",
         report.artifacts,
         report.test_only,
         report.checked,
         report.generated,
         report.system,
-        report.stale.len(),
         report.denied.len(),
         report.unresolved.len()
     );
@@ -1321,9 +1384,6 @@ fn licence_report(label: &str, report: &licence_gate::Report, verbose: bool) -> 
     {
         println!("native:   licence: unresolved {u}");
     }
-    for s in report.stale.iter().take(shown(report.stale.len())) {
-        println!("native:   licence: stale {s} (its link did not run in this build: not checked)");
-    }
     if report.ok() {
         return None;
     }
@@ -1339,7 +1399,6 @@ fn licence_report(label: &str, report: &licence_gate::Report, verbose: bool) -> 
             })
         })
         .chain(report.unresolved.iter().map(|u| format!("unresolved {u}")))
-        .chain(report.stale.iter().map(|s| format!("stale {s}")))
         .next();
     Some(first.unwrap_or_else(|| format!("{label} failed")))
 }

@@ -50,6 +50,7 @@ func main() {
 	bison := flag.String("bison", "bison", "parser generator for .yy/.y sources")
 	flex := flag.String("flex", "flex", "lexer generator for .ll/.l sources")
 	yasm := flag.String("yasm", "yasm", "assembler for .asm (NASM syntax) sources, Soong's yasm rule")
+	licenceGate := flag.String("licence-gate", "", "command of the licence gate edge over the device link outputs (licence.go): reads them from $out.rsp, writes its report to $out and its depfile to $out.d; empty = no edge")
 	launcher := flag.String("launcher", "", "compiler cache run in front of every C/C++ compile (sccache); empty = compile directly")
 	rustc := flag.String("rustc", "rustc", "Rust compiler of Rust modules (rust.go), with its own sysroot")
 	rustVersion := flag.String("rust-version", "", "-rustc's version x.y.z (Soong's ANDROID_RUST_VERSION)")
@@ -74,7 +75,28 @@ func main() {
 	hostISA := flag.String("host-isa", "", "cross host: -march of the host's code (arches.toml isa)")
 	hostLibcxx := flag.String("host-libcxx", "", "cross host: the sysroot's libc++ headers directory, derived by xtask (cross::libcxx_dir: the one c++/v1 holding __config); under -host-sysroot")
 	nbExports := flag.String("nb-exports", "", "module: instead of a build, print as JSON the include flags its -native-bridge variant hands dependents (exportsOf), for builds outside the converter that compile against bionic's headers (xtask runtimes: libc_headers); takes no goals")
-	flag.Parse()
+	flag.Usage = func() {
+		fmt.Fprintf(flag.CommandLine.Output(), "usage: bp2ninja [flags] goal...\n       bp2ninja %s|%s <file>   (the flags and goals, one per line; build.ninja regenerates itself: regen.go)\n", argsFlag, bootstrapFlag)
+		flag.PrintDefaults()
+	}
+	argv, regen, err := expandArgs(os.Args[1:])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "bp2ninja:", err)
+		os.Exit(2)
+	}
+	if err := flag.CommandLine.Parse(argv); err != nil {
+		os.Exit(2)
+	}
+	if abs, err := filepath.Abs(*out); err == nil && *out != "" {
+		buildDir = abs
+	}
+	if regen != nil && regen.bootstrap {
+		if err := regen.writeBootstrap(*out); err != nil {
+			fmt.Fprintln(os.Stderr, "bp2ninja:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	cross := HostCross{Target: *hostTarget, Sysroot: *hostSysroot, ISA: *hostISA, Libcxx: *hostLibcxx}
 	if cross.set() && (cross.Target == "" || cross.Sysroot == "" || cross.ISA == "" || cross.Libcxx == "") {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -host-target, -host-sysroot, -host-isa and -host-libcxx go together")
@@ -166,7 +188,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -provided / -srcs:", err)
 		os.Exit(1)
 	}
-	if err := run(*tree, *out, cfg, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion, *libclang, *llvm, *launcher, *rtInclude, *bionicStaticRust}, javaSetup{jt, *release, *measure}, omitted, provided, nbProvided, partial, android, moduleDefines, stand, aidlCrates, *nbExports, flag.Args()); err != nil {
+	if err := run(*tree, *out, cfg, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion, *libclang, *llvm, *launcher, *rtInclude, *bionicStaticRust, *licenceGate}, javaSetup{jt, *release, *measure}, omitted, provided, nbProvided, partial, android, moduleDefines, stand, aidlCrates, *nbExports, regen, flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja:", err)
 		os.Exit(1)
 	}
@@ -225,7 +247,7 @@ type javaSetup struct {
 	measure bool
 }
 
-func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[string]bool, provided, nbProvided map[string]Provided, partial map[string]Partial, rustAndroid map[string]bool, defines map[string][]string, stand map[string]string, aidlCrates map[string]AidlCrate, nbExports string, goals []string) error {
+func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[string]bool, provided, nbProvided map[string]Provided, partial map[string]Partial, rustAndroid map[string]bool, defines map[string][]string, stand map[string]string, aidlCrates map[string]AidlCrate, nbExports string, regen *regenSetup, goals []string) error {
 	files, err := discover(tree)
 	if err != nil {
 		return err
@@ -387,6 +409,7 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	if g.java != nil {
 		ninja += g.java.ninja(g)
 	}
+	ninja += g.licenceNinja(tools.LicenceGate)
 	// compat/ has one reader, the device-side compile (ninja.go compileFlags): a plan without one writes nothing and needs no libc provider for api-level.h
 	if g.hasDeviceObjs() {
 		if err := writeCompat(tree, out, provided); err != nil {
@@ -395,6 +418,9 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	}
 	if err := g.writeGenFiles(); err != nil {
 		return err
+	}
+	if regen != nil {
+		ninja += regen.ninja()
 	}
 	if err := os.WriteFile(filepath.Join(out, "build.ninja"), []byte(ninja), 0o644); err != nil {
 		return err
@@ -412,6 +438,12 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	// always written, empty included: a stale list of an earlier run must never be read as current
 	for file, set := range map[string]map[string]bool{"missing.txt": g.missing, "missing-paths.txt": g.missingPaths} {
 		if err := os.WriteFile(filepath.Join(out, file), []byte(strings.Join(sortedKeys(set), "\n")+"\n"), 0o644); err != nil {
+			return err
+		}
+	}
+	// last: graphJSON reads too, so every input is recorded by now
+	if regen != nil {
+		if err := regen.writeDepfile(out); err != nil {
 			return err
 		}
 	}

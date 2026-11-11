@@ -342,7 +342,7 @@ func discover(tree string) ([]parsed, error) {
 			if d.Name() == ".git" || d.Name() == "out" && path == filepath.Join(tree, "out") {
 				return filepath.SkipDir
 			}
-			if _, err := os.Stat(filepath.Join(path, ".find-ignore")); err == nil {
+			if _, err := statPath(filepath.Join(path, ".find-ignore")); err == nil {
 				return filepath.SkipDir
 			}
 			return nil
@@ -379,7 +379,7 @@ func discover(tree string) ([]parsed, error) {
 	for len(files) > 0 {
 		path := files[0]
 		files = files[1:]
-		f, err := os.Open(path)
+		f, err := openFile(path)
 		if err != nil {
 			return nil, err
 		}

@@ -5,9 +5,7 @@ package main
 import (
 	"fmt"
 	"go/ast"
-	"go/parser"
 	"go/token"
-	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -37,7 +35,7 @@ type SoongConfig struct {
 // Fails when the list selects no linker: the converter's links take theirs from it, and xtask's licence gate parses lld's --trace format.
 func readLldflags(tree string) ([]string, error) {
 	path := filepath.Join(tree, "build/soong/cc/config/global.go")
-	f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	f, err := parseGoFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -66,7 +64,7 @@ const gcSections = "-Wl,--gc-sections"
 func readDeviceLink(tree string) (DeviceLink, error) {
 	var d DeviceLink
 	path := filepath.Join(tree, "build/soong/cc/config/global.go")
-	f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	f, err := parseGoFile(path)
 	if err != nil {
 		return d, err
 	}
@@ -82,7 +80,7 @@ func readDeviceLink(tree string) (DeviceLink, error) {
 		return d, err
 	}
 	for _, rel := range []string{"build/soong/cc/library.go", "build/soong/cc/binary.go"} {
-		src, err := parser.ParseFile(token.NewFileSet(), filepath.Join(tree, rel), nil, 0)
+		src, err := parseGoFile(filepath.Join(tree, rel))
 		if err != nil {
 			return d, err
 		}
@@ -122,7 +120,7 @@ func (d DeviceArch) blocks() []string {
 func readDeviceArch(tree string, cfg Config) (DeviceArch, error) {
 	d := DeviceArch{Variant: cfg.ArchVariant}
 	parse := func(rel string) (*ast.File, error) {
-		return parser.ParseFile(token.NewFileSet(), filepath.Join(tree, rel), nil, 0)
+		return parseGoFile(filepath.Join(tree, rel))
 	}
 	ident, err := archIdent(tree, cfg.Arch)
 	if err != nil {
@@ -148,7 +146,7 @@ func readDeviceArch(tree string, cfg Config) (DeviceArch, error) {
 
 // archIdent: Soong's ArchType identifier for the arch name: `X86_64 = newArch("x86_64", "lib64")` in android/arch.go.
 func archIdent(tree, arch string) (string, error) {
-	f, err := parser.ParseFile(token.NewFileSet(), filepath.Join(tree, "build/soong/android/arch.go"), nil, 0)
+	f, err := parseGoFile(filepath.Join(tree, "build/soong/android/arch.go"))
 	if err != nil {
 		return "", err
 	}
@@ -235,7 +233,7 @@ const bionicHeader = "bionic/libc/include/android/api-level.h"
 
 func readSoongConfig(tree string) (SoongConfig, error) {
 	path := filepath.Join(tree, "build/soong/cc/config/global.go")
-	f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	f, err := parseGoFile(path)
 	if err != nil {
 		return SoongConfig{}, err
 	}
@@ -270,7 +268,7 @@ func readSoongConfig(tree string) (SoongConfig, error) {
 					if lit, ok := x.Rhs[0].(*ast.CompositeLit); ok {
 						for _, e := range lit.Elts {
 							if d := str(e); d != "" {
-								if _, err := os.Stat(filepath.Join(tree, d)); err == nil {
+								if _, err := statPath(filepath.Join(tree, d)); err == nil {
 									cfg.GlobalIncludes = append(cfg.GlobalIncludes, d)
 								}
 							}
@@ -312,7 +310,7 @@ func stringList(e ast.Expr) ([]string, bool) {
 // systemSharedLibs: cc/config/bionic.go bionicDefaultSharedLibraries.
 func systemSharedLibs(tree string) ([]string, error) {
 	path := filepath.Join(tree, "build/soong/cc/config/bionic.go")
-	f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	f, err := parseGoFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -354,7 +352,7 @@ const defaultSourceDefine = "-D_DEFAULT_SOURCE"
 // FutureApiLevelInt must equal bionic's __ANDROID_API_FUTURE__, the level api-level.h falls back to (and atl-bionic reads headers at); otherwise the two sources disagree on what platform code is and the build stops.
 func apiLevel(tree string) (string, error) {
 	path := filepath.Join(tree, "build/soong/android/config.go")
-	f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	f, err := parseGoFile(path)
 	if err != nil {
 		return "", err
 	}
@@ -373,7 +371,7 @@ func apiLevel(tree string) (string, error) {
 		return true
 	})
 	hdr := filepath.Join(tree, bionicHeader)
-	b, err := os.ReadFile(hdr)
+	b, err := readFile(hdr)
 	if err != nil {
 		return "", err
 	}

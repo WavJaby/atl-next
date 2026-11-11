@@ -5,7 +5,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 )
@@ -89,7 +88,7 @@ func readJSON[T any](path string) (map[string]T, error) {
 	if path == "" {
 		return nil, nil
 	}
-	text, err := os.ReadFile(path)
+	text, err := readFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -163,7 +162,7 @@ func (g *Graph) checkPartial() error {
 			}
 			if len(built) > 0 && !listed {
 				bad = append(bad, fmt.Sprintf("%s: %s is not one of its sources", name, s))
-			} else if _, err := os.Stat(g.abs(path)); len(built) == 0 && err != nil {
+			} else if _, err := statPath(g.abs(path)); len(built) == 0 && err != nil {
 				bad = append(bad, fmt.Sprintf("%s: %s does not exist", name, path))
 			}
 		}

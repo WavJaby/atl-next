@@ -49,6 +49,24 @@ pub fn go(root: &Path, go_work: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Builds the converter to `dest` with go's own cache deciding what to compile; `dest` keeps its file (and mtime) when the build is byte-identical, since `go build -o` rewrites it every time (measured) and the binary is an input of build.ninja's regeneration edge (tools/bp2ninja regen.go).
+pub fn build(root: &Path, go_work: &Path, dest: &Path) -> Result<()> {
+    let mut fresh = dest.as_os_str().to_owned();
+    fresh.push(".new");
+    let fresh = PathBuf::from(fresh);
+    go(
+        root,
+        go_work,
+        &["build", "-o", &fresh.display().to_string(), "."],
+    )?;
+    if std::fs::read(dest).ok() == Some(std::fs::read(&fresh)?) {
+        std::fs::remove_file(&fresh)?;
+    } else {
+        std::fs::rename(&fresh, dest)?;
+    }
+    Ok(())
+}
+
 /// Go files under `dir` that `gofmt` would rewrite (`gofmt -l`), relative to `dir`.
 fn unformatted(dir: &Path) -> Result<Vec<String>> {
     let out = Command::new("gofmt")

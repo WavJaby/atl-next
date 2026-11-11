@@ -4,7 +4,6 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 )
@@ -64,7 +63,7 @@ func buildProp(r *Release, buildID string) (string, error) {
 // readBuildID: BUILD_ID of build/make/core/build_id.mk, the one assignment it holds.
 func readBuildID(tree string) (string, error) {
 	path := filepath.Join(tree, "build/make/core/build_id.mk")
-	text, err := os.ReadFile(path)
+	text, err := readFile(path)
 	if err != nil {
 		return "", err
 	}

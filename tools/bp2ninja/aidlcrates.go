@@ -4,7 +4,6 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -189,7 +188,7 @@ func (g *Graph) compiledCopy(crate string, f *aidlScanned) (path, root string, e
 			return "", "", fmt.Errorf("%s declares %s with its own rust_type beside its interface: move it to its own file", f.path, d.name)
 		}
 	}
-	b, err := os.ReadFile(g.abs(f.path))
+	b, err := readFile(g.abs(f.path))
 	if err != nil {
 		return "", "", err
 	}
@@ -224,7 +223,7 @@ func (g *Graph) indexAidl(dirs []string) (*aidlIndex, error) {
 	x := &aidlIndex{files: map[string]*aidlScanned{}}
 	frozen := g.aidlFrozenDirs()
 	for _, d := range dirs {
-		if st, err := os.Stat(g.abs(d)); err != nil || !st.IsDir() {
+		if st, err := statPath(g.abs(d)); err != nil || !st.IsDir() {
 			return nil, fmt.Errorf("include dir %s: not a directory in the tree", d)
 		}
 		paths := globTree(g.abs(d), "**/*.aidl", d)
@@ -233,7 +232,7 @@ func (g *Graph) indexAidl(dirs []string) (*aidlIndex, error) {
 			if underAny(p, frozen) {
 				continue
 			}
-			b, err := os.ReadFile(g.abs(p))
+			b, err := readFile(g.abs(p))
 			if err != nil {
 				return nil, err
 			}
@@ -456,7 +455,7 @@ func (g *Graph) addParcelables(name string, p *AidlParcelables, x *aidlIndex, sp
 		return fmt.Errorf("parcelables: module, crate and dir are required")
 	}
 	root := filepath.Join(p.Dir, "src", "lib.rs")
-	if _, err := os.Stat(root); err != nil {
+	if _, err := statPath(root); err != nil {
 		return fmt.Errorf("parcelables %s: %w", p.Module, err)
 	}
 	// hand-written codecs: src/codecs/<package path>/<flattened class>.rs (mod.rs files are module glue), keyed by that Rust path below the crate

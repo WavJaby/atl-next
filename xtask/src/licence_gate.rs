@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: MIT
-//! The licence gate after `xtask native`'s build (CLAUDE.md licence rules): every file that reaches a shipped artifact carries a licence licenses.toml allows in it.
-//! - Shipped artifacts: the device-side link outputs ninja produced (`ninja -t targets rule link`, under `<out>/device/`), all of class `runtime`. Host outputs are build tools and never ship.
+//! The licence gate over `xtask native`'s build (CLAUDE.md licence rules): every file that reaches a shipped artifact carries a licence licenses.toml allows in it.
+//! It is one edge of build.ninja (bp2ninja -licence-gate), so ninja alone decides when it runs: `xtask licence-gate` (hidden, `run_edge`) reads the edge's inputs from its rspfile, writes the report (`$out`, JSON) and,
+//! as its depfile, every file it read or reached plus its own binary and tables, so a changed artifact, reached file, licence header, licenses.toml row or gate build reruns it and nothing else does.
+//! The edge runs only once every artifact linked, so each is this build's (no stale artifact to tell apart). Findings are the report's, not the edge's status: `native` prints it and fails the run.
+//! - Shipped artifacts: the device-side link outputs (bp2ninja emits the edge over those under `<out>/device/`), all of class `runtime`. Host outputs are build tools and never ship.
 //! - Reached files, per artifact: the objects its link loaded, from `<artifact>.trace` (bp2ninja's link rule runs lld with `--trace`: each object on the command line and each archive member loaded -- those symbol resolution pulled in, every member of a `--whole-archive`); a member is mapped back to its object through the archive's ninja edge (`ninja -t query`). Members are named by file name, so where two objects of one archive share one, both count.
 //!   An archive whose members are none of its inputs but which has a depfile record was compiled whole by its own edge (rustc's generated staticlib): the archive is the object, whichever of its codegen units ld loaded.
-//!   Then each object's source and headers, from its depfile (`ninja -t deps`); a depfile entry with a record of its own (an rlib, which bp2ninja's rustc rule lists after rustc's dep-info) stands for what it is made of, transitively. So a Rust archive reaches every crate of its closure's sources; the toolchain sysroot's std/core/alloc are rustc's own inputs, in no depfile, and are not reached -- like the C toolchain's crt objects and libc++, the platform's.
+//!   Then each object's source and headers, from its deps log record (ninja_deps.rs); a dependency with a record of its own (an rlib, which bp2ninja's rustc rule lists after rustc's dep-info) stands for what it is made of, transitively. So a Rust archive reaches every crate of its closure's sources; the toolchain sysroot's std/core/alloc are rustc's own inputs, in no depfile, and are not reached -- like the C toolchain's crt objects and libc++, the platform's.
 //! - A file's licence: `notice::resolve` with the `[upstream.<key>]` of the checkout holding it; AOSP projects share key `aosp`, their paths relative to the tree root (`external/dng_sdk/...`).
 //!
-//! - A member of an archive no edge of this build makes (built by an upstream's own CMake/ninja build: `xtask runtimes`, providers.toml `upstream:`) is mapped to its object through that build's edges and depfiles (`external_build`).
+//! - A member of an archive no edge of this build makes (built by an upstream's own CMake/ninja build: `xtask runtimes`, providers.toml `upstream:`) is mapped to its object through that build's edges and deps log (`external_build`).
 //!
 //! Not checked, only counted: files generated into a build dir (aidl, protobuf, sysprop, genrule outputs, our crates' generated headers; their generators' inputs are not followed) -- except staged copies of sources (`Staged`), judged as the source they copy; system files under `/usr` and `/lib*` (toolchain, distro headers and libraries: the platform's, not ours to ship).
 //! A file anywhere else fails: nothing passes because the gate cannot place it.
-//! Stale artifacts fail unread: after a failed build an artifact whose relink did not run is an earlier link's, and its trace may name archive members the current graph lacks (`relinked`).
+//! Not in the depfile: build.ninja and the deps logs. An archive's members or an object's headers change only through an edit to an input already listed (a source, a header, a blueprint) or a relinked artifact, and a regenerated build.ninja alone would rerun the whole gate.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -32,8 +35,8 @@ pub struct Root {
     pub prefix: PathBuf,
 }
 
-/// One gate run.
-#[derive(Debug, Default)]
+/// One gate run; the edge's output (`run_edge`), read back by `native`.
+#[derive(Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Report {
     pub artifacts: usize,
     /// Artifacts of `[test_only]` modules, not checked: never shipped.
@@ -46,40 +49,151 @@ pub struct Report {
     pub denied: BTreeMap<String, BTreeMap<String, String>>,
     /// Files with no licence the rules can name, or that the gate cannot place.
     pub unresolved: Vec<String>,
-    /// Link outputs ninja would link again (their link or one of its inputs failed): file and trace are an earlier link's, the trace may name members their archives no longer have, so neither is read. Never a pass.
-    pub stale: Vec<String>,
 }
 
 impl Report {
     pub fn ok(&self) -> bool {
-        self.denied.is_empty() && self.unresolved.is_empty() && self.stale.is_empty()
+        self.denied.is_empty() && self.unresolved.is_empty()
     }
 }
 
-/// Runs the gate over the build directory `out` (canonical). It runs after failed builds too, to report them: a state the build left behind is a report line, never an error.
+/// What a gate run depends on beyond its artifacts, for the edge's depfile: every file read or reached (canonical where it was placed), each blueprint the licence fallback tried.
+pub type Inputs = BTreeSet<PathBuf>;
+
+/// `xtask licence-gate`: the gate as build.ninja's edge (bp2ninja -licence-gate); hidden, ninja runs it.
+#[derive(clap::Args)]
+pub struct EdgeArgs {
+    /// The build directory.
+    #[arg(long)]
+    out: PathBuf,
+    /// The edge's rspfile: its inputs, the device link outputs, separated by white space.
+    #[arg(long)]
+    artifacts: PathBuf,
+    /// Where the report goes (JSON `Report`): the edge's output.
+    #[arg(long)]
+    report: PathBuf,
+    /// Where the depfile goes: every input of this run (`Inputs`, the gate's binary and tables).
+    #[arg(long)]
+    depfile: PathBuf,
+}
+
+/// The tables a gate run reads, relative to the checkout.
+const TABLES: &[&str] = &[licenses::FILE, "deny.toml", crate::sources::FILE];
+
+/// Runs the gate as an edge: the report always (findings are its content, exit 0), the depfile last. An error (a table that does not load, an unreadable trace dir) fails the edge.
+pub fn run_edge(root: &Path, args: &EdgeArgs) -> Result<std::process::ExitCode> {
+    let layout = atl_layout::Layout::of(root)?;
+    let sources = crate::sources::load(root)?;
+    let licenses = licenses::load(root, &sources.upstream_names())?;
+    licenses::check_test_only(&licenses)?;
+    let out = std::fs::canonicalize(&args.out)?;
+    let roots = roots(&layout, &sources.checkouts(None));
+    let test_only = licenses::test_only_outputs(&licenses, &out)?
+        .into_iter()
+        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+        .collect();
+    let listed = std::fs::read_to_string(&args.artifacts)
+        .with_context(|| format!("reading {}", args.artifacts.display()))?;
+    let artifacts = shell_words(&listed)
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    let mut inputs = Inputs::new();
+    inputs.extend(TABLES.iter().map(|t| root.join(t)));
+    inputs.extend(licenses.aosp_index.file.clone());
+    inputs.insert(std::env::current_exe().context("the gate's own binary")?);
+    let report = check(&out, artifacts, &roots, &licenses, &test_only, &mut inputs)?;
+    std::fs::write(&args.report, serde_json::to_string_pretty(&report)?)
+        .with_context(|| format!("writing {}", args.report.display()))?;
+    write_depfile(&args.depfile, &args.report, &inputs)?;
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// The paths of ninja's `$in` (an rspfile's content): separated by spaces, each one holding a byte outside ninja's shell-safe set single-quoted, `'` itself as `'\''` (util.cc GetShellEscapedString; measured: `'…/android.hardware.graphics.common@1.0.so'`).
+fn shell_words(text: &str) -> Vec<String> {
+    let (mut words, mut word, mut quoted, mut started) = (Vec::new(), String::new(), false, false);
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                quoted = !quoted;
+                started = true;
+            }
+            '\\' if !quoted => {
+                word.extend(chars.next());
+                started = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            }
+            c => {
+                word.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        words.push(word);
+    }
+    words
+}
+
+/// A depfile naming `inputs` for `target`: a missing one as its nearest existing ancestor (ninja reruns an edge whose depfile names a missing file every time; a file deleted since the deps log was written reappears in its directory's entries).
+/// Escaped as ninja's depfile parser reads it: `\` before space and `#`, `$$` for `$`. Its lexer takes no other byte outside [A-Za-z0-9+,/_:.~(){}%=@[]!-] and >= 0x80: a path holding one (a `*`) would split into a missing path and rerun the edge forever, so it stands as its nearest ancestor that spells (tools/bp2ninja inputs.go depfileSpellable, measured there).
+fn write_depfile(path: &Path, target: &Path, inputs: &Inputs) -> Result<()> {
+    let esc = |p: &Path| {
+        p.display()
+            .to_string()
+            .replace(' ', "\\ ")
+            .replace('#', "\\#")
+            .replace('$', "$$")
+    };
+    let spellable = |p: &Path| {
+        p.as_os_str().as_encoded_bytes().iter().all(|&c| {
+            c.is_ascii_alphanumeric() || c >= 0x80 || b"+,/_:.~(){}%=@[]!- #$".contains(&c)
+        })
+    };
+    let mut text = format!("{}:", esc(target));
+    let mut listed = BTreeSet::new();
+    for p in inputs {
+        let existing = p
+            .ancestors()
+            .find(|a| a.exists() && spellable(a))
+            .unwrap_or(Path::new("/"));
+        if listed.insert(existing) {
+            text.push_str(&format!(" \\\n  {}", esc(existing)));
+        }
+    }
+    text.push('\n');
+    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Runs the gate over the device link outputs `artifacts` of the build directory `out` (canonical), all of this build (the edge runs after their links); what it read and reached goes to `inputs`.
 /// Artifacts in `test_only` (licenses::test_only_outputs) are skipped: what they alone reach ships nowhere.
 pub fn check(
     out: &Path,
+    mut artifacts: Vec<PathBuf>,
     roots: &[Root],
     licenses: &Licenses,
     test_only: &BTreeSet<PathBuf>,
+    inputs: &mut Inputs,
 ) -> Result<Report> {
-    let mut artifacts = link_outputs(out, &[out.join("device")])?;
     let mut report = Report::default();
     artifacts.retain(|a| {
         let keep = !test_only.contains(a);
         report.test_only += usize::from(!keep);
         keep
     });
-    let stale;
-    (artifacts, stale) = fresh(out, artifacts);
-    report.stale = stale.iter().map(|a| a.display().to_string()).collect();
     report.artifacts = artifacts.len();
     // object -> first artifact loading it
     let mut objects: BTreeMap<PathBuf, &Path> = BTreeMap::new();
     let mut members: Vec<(PathBuf, String, &Path)> = Vec::new();
     for artifact in &artifacts {
         let trace = trace_of(artifact);
+        inputs.insert(trace.clone());
         let text = match std::fs::read_to_string(&trace) {
             Ok(t) => t,
             Err(e) => {
@@ -108,7 +222,7 @@ pub fn check(
         .collect();
     let mut args = vec!["-t".to_owned(), "query".to_owned()];
     args.extend(archives.iter().map(|a| a.display().to_string()));
-    let inputs = if archives.is_empty() {
+    let archive_inputs = if archives.is_empty() {
         BTreeMap::new()
     } else {
         parse_query(&ninja(
@@ -116,11 +230,11 @@ pub fn check(
             &args.iter().map(String::as_str).collect::<Vec<_>>(),
         )?)
     };
-    let deps = parse_deps(&ninja(out, &["-t", "deps"])?);
+    let deps = crate::ninja_deps::read(out)?.deps();
     // archives no edge of this build makes: external build dir -> (archive, member, artifact)
     let mut external: BTreeMap<PathBuf, Vec<(&Path, &str, &Path)>> = BTreeMap::new();
     for (archive, member, artifact) in &members {
-        let Some(objs) = inputs.get(archive) else {
+        let Some(objs) = archive_inputs.get(archive) else {
             if is_system(archive) {
                 report.system += 1;
             } else if let Some(b) = external_build(archive, out) {
@@ -172,7 +286,7 @@ pub fn check(
             files.entry(f.to_path_buf()).or_insert(artifact);
         }
     }
-    judge_files(files, roots, out, licenses, &mut report)?;
+    judge_files(files, roots, out, licenses, &mut report, inputs)?;
     for (build, loaded) in external {
         check_external(
             &build,
@@ -182,6 +296,7 @@ pub fn check(
             roots,
             licenses,
             &mut report,
+            inputs,
         )?;
     }
     Ok(report)
@@ -195,8 +310,9 @@ enum Reach<'a> {
     All,
 }
 
-/// One external ninja build: what reaches shipped artifacts (`reach`) -> objects through the build's own edges -> each object's depfile (`ninja -t deps`) -> staged copies mapped to
+/// One external ninja build: what reaches shipped artifacts (`reach`) -> objects through the build's own edges -> each object's deps log record -> staged copies mapped to
 /// their sources (`staged`) -> judged; files under `out` (the dir holding the build) count as generated.
+#[allow(clippy::too_many_arguments)]
 fn check_external(
     build: &Path,
     out: &Path,
@@ -205,8 +321,9 @@ fn check_external(
     roots: &[Root],
     licenses: &Licenses,
     report: &mut Report,
+    inputs: &mut Inputs,
 ) -> Result<()> {
-    let deps = parse_deps(&ninja(build, &["-t", "deps"])?);
+    let deps = crate::ninja_deps::read(build)?.deps();
     let objects: BTreeMap<PathBuf, &Path> = match reach {
         Reach::Members(loaded) => member_objects(build, loaded, report)?,
         Reach::All => {
@@ -236,8 +353,9 @@ fn check_external(
             placed.entry(abs(f)).or_insert(artifact);
         }
     }
+    inputs.extend(placed.keys().cloned());
     let (placed, configured) = unstage(placed, staged);
-    judge(placed, roots, out, licenses, report)?;
+    judge(placed, roots, out, licenses, report, inputs)?;
     for (file, s, artifact) in configured {
         let text = String::from_utf8_lossy(
             &std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?,
@@ -309,20 +427,23 @@ fn member_objects<'a>(
     Ok(objects)
 }
 
-/// `judge` over reached files (file -> first artifact reaching it), canonicalized first.
+/// `judge` over reached files (file -> first artifact reaching it), canonicalized first; each reached path, as named and as placed, is an input.
 fn judge_files(
     files: BTreeMap<PathBuf, &Path>,
     roots: &[Root],
     out: &Path,
     licenses: &Licenses,
     report: &mut Report,
+    inputs: &mut Inputs,
 ) -> Result<()> {
     let mut placed: BTreeMap<PathBuf, &Path> = BTreeMap::new();
     for (file, artifact) in files {
-        let real = std::fs::canonicalize(&file).unwrap_or(file);
+        let real = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+        inputs.insert(file);
         placed.entry(real).or_insert(artifact);
     }
-    judge(placed, roots, out, licenses, report)
+    inputs.extend(placed.keys().cloned());
+    judge(placed, roots, out, licenses, report, inputs)
 }
 
 /// The CMake/ninja build an archive outside this build's edges came from: the nearest ancestor below `out` holding `build.ninja` (the archive sits in its build dir, as `xtask runtimes` leaves it) or `build/build.ninja` (an install prefix beside its build dir, as `upstream::build` leaves it).
@@ -389,6 +510,7 @@ pub fn check_build(
     licenses: &Licenses,
 ) -> Result<Report> {
     let mut report = Report::default();
+    // not an edge (runtimes.rs gates its own builds after each run): no depfile
     check_external(
         build,
         build,
@@ -397,6 +519,7 @@ pub fn check_build(
         roots,
         licenses,
         &mut report,
+        &mut Inputs::new(),
     )?;
     Ok(report)
 }
@@ -446,6 +569,7 @@ fn judge(
     out: &Path,
     licenses: &Licenses,
     report: &mut Report,
+    inputs: &mut Inputs,
 ) -> Result<()> {
     for (file, artifact) in placed {
         let name = artifact
@@ -463,7 +587,12 @@ fn judge(
                     .ok()
                     .and_then(Path::parent)
                     .unwrap_or(Path::new(""));
-                let fallback = || licenses.unlabelled(&root.key, &root.prefix, &root.dir, at);
+                let fallback = || {
+                    let mut seen = |p: &Path| {
+                        inputs.insert(p.to_path_buf());
+                    };
+                    licenses.unlabelled(&root.key, &root.prefix, &root.dir, at, &mut seen)
+                };
                 match notice::resolve(&rel, &text, licenses.upstream.get(&root.key), fallback) {
                     Ok(expr) => {
                         report.checked += 1;
@@ -492,45 +621,8 @@ fn trace_of(artifact: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// The link outputs of this out dir's build.ninja under any of `under` that exist (`ninja -t targets rule link`): the current graph's artifacts, not leftovers of an earlier goal set.
-pub(crate) fn link_outputs(out: &Path, under: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    Ok(lines(&ninja(out, &["-t", "targets", "rule", "link"])?)
-        .map(PathBuf::from)
-        .filter(|p| under.iter().any(|u| p.starts_with(u)) && p.is_file())
-        .collect())
-}
-
-/// `artifacts` split into (fresh, stale): stale = a failed build left an earlier link's output (`relinked`).
-pub(crate) fn fresh(out: &Path, artifacts: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    let stale = relinked(out, &artifacts);
-    artifacts.into_iter().partition(|a| !stale.contains(a))
-}
-
-/// The artifacts whose link edge ninja would run (dry run, `-k 0`: past edges that would fail): those a failed build left as an earlier link's output.
-/// Read from the dry run's `[i/n] link <out>` lines, bp2ninja's link rule description. A dry run that cannot start leaves every artifact stale: what it would have told is unknown.
-fn relinked(out: &Path, artifacts: &[PathBuf]) -> BTreeSet<PathBuf> {
-    if artifacts.is_empty() {
-        return BTreeSet::new();
-    }
-    // its exit status is not read: a dry run fails where a missing input has no rule, and still prints every edge it would run
-    let Ok(output) = Command::new("ninja")
-        .arg("-C")
-        .arg(out)
-        .args(["-n", "-k", "0"])
-        .args(artifacts)
-        .output()
-    else {
-        return artifacts.iter().cloned().collect();
-    };
-    lines(&String::from_utf8_lossy(&output.stdout))
-        .filter_map(|l| {
-            let (_, rest) = l.split_once("] link ")?;
-            l.starts_with('[').then(|| PathBuf::from(rest))
-        })
-        .collect()
-}
-
-fn ninja(out: &Path, args: &[&str]) -> Result<String> {
+/// `ninja -C out <args>`'s stdout: manifest tools only (`-t query`, `-t targets`), which load no log and so are safe inside a running build.
+pub(crate) fn ninja(out: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("ninja")
         .arg("-C")
         .arg(out)
@@ -546,7 +638,7 @@ fn ninja(out: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn lines(text: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn lines(text: &str) -> impl Iterator<Item = &str> {
     text.lines().map(str::trim).filter(|l| !l.is_empty())
 }
 
@@ -623,22 +715,6 @@ fn parse_query(text: &str) -> BTreeMap<PathBuf, Vec<PathBuf>> {
             if !input.starts_with('|') {
                 out.entry(t.clone()).or_default().push(input.into());
             }
-        }
-    }
-    out
-}
-
-/// `ninja -t deps`: target -> the dependencies its depfile recorded (an object's source first, then its headers).
-fn parse_deps(text: &str) -> BTreeMap<PathBuf, Vec<PathBuf>> {
-    let mut out: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
-    let mut target = None::<PathBuf>;
-    for line in text.lines() {
-        if line.starts_with(' ') {
-            if let Some(t) = &target {
-                out.entry(t.clone()).or_default().push(line.trim().into());
-            }
-        } else {
-            target = line.rsplit_once(": #deps").map(|(t, _)| PathBuf::from(t));
         }
     }
     out
@@ -743,7 +819,15 @@ mod tests {
                 l = lib.display(),
             ),
         );
-        let report = build_and_check(&src, &out);
+        let (report, inputs) = build_and_check(&src, &out);
+        let canon = |p: PathBuf| std::fs::canonicalize(p).unwrap();
+        let (main, used, used_h, unused, stray) = (
+            canon(src.join("main.c")),
+            canon(src.join("used.c")),
+            canon(src.join("used.h")),
+            canon(src.join("unused.c")),
+            canon(elsewhere.join("stray.h")),
+        );
         std::fs::remove_dir_all(&tmp).unwrap();
         assert_eq!(report.artifacts, 1);
         let denied: Vec<(&str, Vec<&str>)> = report
@@ -757,74 +841,80 @@ mod tests {
         assert_eq!(report.unresolved.len(), 1, "{:?}", report.unresolved);
         assert!(report.unresolved[0].contains("stray.h: in no checkout"));
         assert!(!report.ok());
-    }
-
-    /// After a failed build: libt.so linked once from main.o + libz.a(used.o); then libz.a's input is renamed (used.o -> renamed.o) and main.c breaks, so its relink never runs.
-    /// libt.so and its trace stay from the first link and name libz.a(used.o), a member no longer among libz.a's ninja inputs: the gate must report libt.so stale and read neither, not fail.
-    #[test]
-    fn gate_reports_a_stale_artifact() {
-        let tmp = std::env::temp_dir().join(format!("xtask-licence-stale-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let (src, out) = (tmp.join("src"), tmp.join("out"));
-        for d in [&src, &out] {
-            std::fs::create_dir_all(d).unwrap();
-        }
-        let write = |p: &Path, s: &str| std::fs::write(p, s).unwrap();
-        write(
-            &src.join("main.c"),
-            "// SPDX-License-Identifier: MIT\nint used(void);\nint entry(void) { return used(); }\n",
-        );
-        for n in ["used", "renamed"] {
-            write(
-                &src.join(format!("{n}.c")),
-                "// SPDX-License-Identifier: MIT\nint used(void) { return 1; }\n",
+        // the edge's depfile: every reached file (judged or not) and the trace, never the unloaded member's source
+        for f in [&main, &used, &used_h, &stray] {
+            assert!(
+                inputs.contains(f),
+                "{} not an input: {inputs:?}",
+                f.display()
             );
         }
-        let lib = out.join("device/libt/libt.so");
-        let ninja = |member: &str| {
-            format!(
-                "rule cc\n  command = clang-19 -fPIC -MD -MF $out.d -c $in -o $out\n  depfile = $out.d\n  deps = gcc\n\
-                 rule ar\n  command = rm -f $out && llvm-ar-19 crsD $out $in\n\
-                 rule link\n  command = clang-19 -fuse-ld=lld -shared -o $out $in -Wl,--trace >$out.trace\n  description = link $out\n\
-                 build {o}/main.o: cc {s}/main.c\nbuild {o}/{member}.o: cc {s}/{member}.c\n\
-                 build {o}/libz.a: ar {o}/{member}.o\nbuild {l}: link {o}/main.o {o}/libz.a\n",
-                o = out.display(),
-                s = src.display(),
-                l = lib.display(),
-            )
-        };
-        write(&out.join("build.ninja"), &ninja("used"));
-        let report = build_and_check(&src, &out);
-        assert!(report.ok() && report.artifacts == 1, "{report:?}");
-        write(&out.join("build.ninja"), &ninja("renamed"));
-        write(&src.join("main.c"), "int broken(\n");
-        let failed = Command::new("ninja").arg("-C").arg(&out).output().unwrap();
-        assert!(!failed.status.success() && lib.is_file());
-        let roots = [Root {
-            dir: std::fs::canonicalize(&src).unwrap(),
-            key: "aosp".into(),
-            prefix: PathBuf::new(),
-        }];
-        let licenses = licenses::parse(
-            "[artifact.runtime]\nallow = [\"MIT\"]\n",
-            &["aosp".to_owned()].into(),
-        )
-        .unwrap();
-        let report = check(
-            &std::fs::canonicalize(&out).unwrap(),
-            &roots,
-            &licenses,
-            &BTreeSet::new(),
-        );
-        std::fs::remove_dir_all(&tmp).unwrap();
-        let report = report.expect("the gate reports a stale artifact, it does not fail");
-        assert_eq!(report.stale, [lib.display().to_string()]);
-        assert_eq!((report.artifacts, report.checked), (0, 0));
-        assert!(!report.ok());
+        assert!(inputs.iter().any(|p| p.ends_with("libt.so.trace")));
+        assert!(!inputs.contains(&unused));
     }
 
-    /// Runs ninja in `out`, then the gate with `src` as the one checkout (key `aosp`) and only MIT allowed.
-    fn build_and_check(src: &Path, out: &Path) -> Report {
+    /// `$in` as ninja writes it into an rspfile, read back by real ninja (the oracle): an edge over a plain path, one with `@` (quoted), one with `'` (escaped inside quotes), one with a space.
+    #[test]
+    fn rspfile_paths_round_trip() {
+        let tmp = std::env::temp_dir().join(format!("xtask-licence-rsp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let names = ["plain.so", "hal@2.0.so", "it's.so", "a b.so"];
+        for n in names {
+            std::fs::write(tmp.join(n), "").unwrap();
+        }
+        let ins: Vec<String> = names.iter().map(|n| n.replace(' ', "$ ")).collect();
+        std::fs::write(
+            tmp.join("build.ninja"),
+            format!(
+                "rule keep\n  command = cp $out.rsp $out\n  rspfile = $out.rsp\n  rspfile_content = $in\nbuild list: keep {}\n",
+                ins.join(" ")
+            ),
+        )
+        .unwrap();
+        let ok = Command::new("ninja")
+            .arg("-C")
+            .arg(&tmp)
+            .status()
+            .unwrap()
+            .success();
+        let text = std::fs::read_to_string(tmp.join("list")).unwrap_or_default();
+        std::fs::remove_dir_all(&tmp).unwrap();
+        assert!(ok);
+        assert_eq!(shell_words(&text), names);
+    }
+
+    /// The depfile names a missing input by its nearest existing ancestor (a named missing file reruns the edge on every build) and escapes what ninja's depfile parser reads specially.
+    #[test]
+    fn depfile_lists_existing_paths_escaped() {
+        let tmp = std::env::temp_dir().join(format!("xtask-licence-dep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let dir = tmp.join("a b#c");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f.h"), "").unwrap();
+        std::fs::create_dir_all(dir.join("**")).unwrap();
+        std::fs::write(dir.join("**/s.h"), "").unwrap();
+        let inputs = Inputs::from([
+            dir.join("f.h"),
+            dir.join("gone/x.h"),
+            dir.join("gone/y.h"),
+            dir.join("**/s.h"),
+        ]);
+        let dep = tmp.join("r.json.d");
+        write_depfile(&dep, Path::new("r.json"), &inputs).unwrap();
+        let text = std::fs::read_to_string(&dep).unwrap();
+        std::fs::remove_dir_all(&tmp).unwrap();
+        let d = dir
+            .display()
+            .to_string()
+            .replace(' ', "\\ ")
+            .replace('#', "\\#");
+        // inputs in order: **/s.h -> the dir (`*` does not spell), f.h, gone/x.h -> the dir again (listed once, gone/y.h too)
+        assert_eq!(text, format!("r.json: \\\n  {d} \\\n  {d}/f.h\n"));
+    }
+
+    /// Runs ninja in `out`, then the gate with `src` as the one checkout (key `aosp`) and only MIT allowed, over every device link output.
+    fn build_and_check(src: &Path, out: &Path) -> (Report, Inputs) {
         let status = Command::new("ninja")
             .arg("-C")
             .arg(out)
@@ -846,13 +936,19 @@ mod tests {
             key: "aosp".into(),
             prefix: PathBuf::new(),
         }];
-        check(
-            &std::fs::canonicalize(out).unwrap(),
+        let out = std::fs::canonicalize(out).unwrap();
+        let artifacts = crate::runpath_gate::link_outputs(&out, &[out.join("device")]).unwrap();
+        let mut inputs = Inputs::new();
+        let report = check(
+            &out,
+            artifacts,
             &roots,
             &licenses,
             &BTreeSet::new(),
+            &mut inputs,
         )
-        .unwrap()
+        .unwrap();
+        (report, inputs)
     }
 
     /// bp2ninja's Rust shape (rustc rule with dep-info depfile + `$crates`, a generated staticlib of `extern crate` roots): `device/libr.so` links `main.cpp.o` and `librustlibs.a`, built by rustc from root.rs (MIT) over the rlib `libdep.rlib` from dep.rs (LicenseRef-Bad) + its module dep_mod.rs (MIT).
@@ -907,7 +1003,7 @@ mod tests {
                 l = lib.display(),
             ),
         );
-        let report = build_and_check(&src, &out);
+        let (report, _) = build_and_check(&src, &out);
         std::fs::remove_dir_all(&tmp).unwrap();
         let denied: Vec<(&str, Vec<&str>)> = report
             .denied
@@ -942,17 +1038,6 @@ mod tests {
         let q = parse_query(text);
         assert_eq!(q[Path::new("/o/libx.a")], [PathBuf::from("/o/obj/a.cpp.o")]);
         assert_eq!(q[Path::new("/o/liby.a")], [PathBuf::from("/o/obj/b.c.o")]);
-    }
-
-    #[test]
-    fn deps_by_object() {
-        let text = "/o/a.o: #deps 2, deps mtime 1 (VALID)\n    /t/a.cpp\n    /t/a.h\n\n/o/b.o: #deps 1, deps mtime 1 (STALE)\n    /t/b.c\n\n";
-        let d = parse_deps(text);
-        assert_eq!(
-            d[Path::new("/o/a.o")],
-            [PathBuf::from("/t/a.cpp"), PathBuf::from("/t/a.h")]
-        );
-        assert_eq!(d[Path::new("/o/b.o")], [PathBuf::from("/t/b.c")]);
     }
 
     /// A staged copy identical to a source of the second `from` dir is that source; a changed one (configure_file output) stays, to be judged on its own notice.

@@ -21,7 +21,14 @@ func walkTree(root string, fn fs.WalkDirFunc) error {
 	var visit fs.WalkDirFunc
 	visit = func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.Type()&fs.ModeSymlink == 0 {
-			return fn(path, d, err)
+			r := fn(path, d, err)
+			// a directory fn lets WalkDir list is a listing input (inputs.go); a skipped one is only an entry of its listed parent
+			if r == nil && err == nil && d.IsDir() {
+				if abs, err := filepath.Abs(path); err == nil {
+					recordDir(abs)
+				}
+			}
+			return r
 		}
 		target, lerr := os.Readlink(path)
 		info, serr := os.Stat(path)

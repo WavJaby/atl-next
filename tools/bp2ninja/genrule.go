@@ -191,7 +191,7 @@ func (g *Graph) buildGenRule(n *Node) *genRule {
 				r.objs = append(r.objs, f.obj)
 			} else if f.gen == nil && !strings.HasPrefix(f.path, g.out+"/") {
 				// a file of the build (an app's package, a Java module's jar) is made by an edge, not in the tree yet
-				if _, err := os.Stat(g.abs(f.path)); err != nil {
+				if _, err := statPath(g.abs(f.path)); err != nil {
 					fail("input %s does not exist", f.path)
 				}
 			}
@@ -255,7 +255,7 @@ func (g *Graph) genTool(n *Node, r *genRule, ref string, fail func(string, ...an
 			return bad("tool %s is a python_binary_host %s (unsupported)", ref, why)
 		}
 		for _, f := range files {
-			if _, err := os.Stat(g.abs(f)); err != nil {
+			if _, err := statPath(g.abs(f)); err != nil {
 				return bad("tool %s: script %s does not exist", ref, f)
 			}
 		}
@@ -267,7 +267,7 @@ func (g *Graph) genTool(n *Node, r *genRule, ref string, fail func(string, ...an
 	case bt == "blueprint_go_binary" && g.java != nil:
 		// J2: Soong's Go host tools (soong_zip, merge_zips, …) come prebuilt from prebuilts/build-tools, the -build-tools directory
 		p := filepath.Join(g.java.tools.BuildTools, tm.Name)
-		if _, err := os.Stat(p); err != nil {
+		if _, err := statPath(p); err != nil {
 			return bad("tool %s is a blueprint_go_binary with no prebuilt in %s", ref, g.java.tools.BuildTools)
 		}
 		l.files = []string{p}

@@ -1111,7 +1111,7 @@ fn patch_licence(dir: &Path, commit: &str, scope: &Scope, licenses: &Licenses) -
             .or_else(|_| git(Some(dir), &["show", &format!("{commit}:{path}")]))?;
         let rel = scope.prefix.join(path).display().to_string();
         let at = Path::new(path).parent().unwrap_or(Path::new(""));
-        let unlabelled = || licenses.unlabelled(scope.key, scope.prefix, dir, at);
+        let unlabelled = || licenses.unlabelled(scope.key, scope.prefix, dir, at, &mut |_| {});
         let expr = notice::resolve(&rel, &text, licenses.upstream.get(scope.key), unlabelled)?;
         ::spdx::Expression::parse(&expr).with_context(|| format!("{path}: bad SPDX `{expr}`"))?;
         exprs.insert(expr);

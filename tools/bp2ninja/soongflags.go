@@ -5,9 +5,7 @@ package main
 import (
 	"fmt"
 	"go/ast"
-	"go/parser"
 	"go/token"
-	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -176,7 +174,7 @@ func (t ThirdParty) is(dir string) bool {
 func readThirdParty(tree string) (ThirdParty, error) {
 	var t ThirdParty
 	path := filepath.Join(tree, "build/soong/android/paths.go")
-	f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	f, err := parseGoFile(path)
 	if err != nil {
 		return t, err
 	}
@@ -441,7 +439,7 @@ func newSoongEval(tree, pkg string) (*soongEval, error) {
 	dir := filepath.Join(tree, pkg)
 	e := &soongEval{tree: tree, dir: dir, vars: map[string]any{}, funcs: map[string]*ast.FuncDecl{}, methods: map[string]map[string]*ast.FuncDecl{}, embeds: map[string][]string{},
 		statics: map[string]any{}, varFuncs: map[string]*ast.FuncLit{}, factory: map[[2]string]string{}}
-	entries, err := os.ReadDir(dir)
+	entries, err := readDir(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -451,7 +449,7 @@ func newSoongEval(tree, pkg string) (*soongEval, error) {
 		if !strings.HasSuffix(en.Name(), ".go") || strings.HasSuffix(en.Name(), "_test.go") {
 			continue
 		}
-		f, err := parser.ParseFile(token.NewFileSet(), filepath.Join(dir, en.Name()), nil, 0)
+		f, err := parseGoFile(filepath.Join(dir, en.Name()))
 		if err != nil {
 			return nil, err
 		}

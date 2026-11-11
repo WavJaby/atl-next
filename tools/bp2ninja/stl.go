@@ -4,7 +4,6 @@ package main
 
 import (
 	"fmt"
-	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -99,7 +98,7 @@ func libcxxProvider(cxx string, cross HostCross) (string, error) {
 		}
 		return cross.Libcxx, nil
 	}
-	out, err := exec.Command(cxx, "-stdlib=libc++", "-x", "c++", "-E", "-v", "/dev/null").CombinedOutput()
+	out, err := command(cxx, "-stdlib=libc++", "-x", "c++", "-E", "-v", "/dev/null").CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("probing libc++ headers with %s: %v: %s", cxx, err, out)
 	}

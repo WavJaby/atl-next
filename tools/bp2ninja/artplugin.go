@@ -87,7 +87,7 @@ type artPlugin struct {
 // readArtPlugin: the plugin at the pin; nil without art/build (no art_* module in the tree then). llvm = -llvm, required once the plugin is read.
 func readArtPlugin(tree string, cfg Config, llvm string) (*artPlugin, error) {
 	dir := filepath.Join(tree, artPluginDir)
-	entries, err := os.ReadDir(dir)
+	entries, err := readDir(dir)
 	if os.IsNotExist(err) {
 		return nil, nil
 	}
@@ -97,7 +97,7 @@ func readArtPlugin(tree string, cfg Config, llvm string) (*artPlugin, error) {
 	src := map[string][]byte{}
 	for _, e := range entries {
 		if strings.HasSuffix(e.Name(), ".go") && !strings.HasSuffix(e.Name(), "_test.go") {
-			if src[e.Name()], err = os.ReadFile(filepath.Join(dir, e.Name())); err != nil {
+			if src[e.Name()], err = readFile(filepath.Join(dir, e.Name())); err != nil {
 				return nil, err
 			}
 		}
@@ -388,7 +388,7 @@ func defaultDeviceCodegenArches(device []string) []string {
 func readArtConfig(tree string) (base map[Side]string, err error) {
 	base = map[Side]string{}
 	path := filepath.Join(tree, "build/soong/android/config.go")
-	f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	f, err := parseGoFile(path)
 	if err != nil {
 		return base, err
 	}
@@ -418,7 +418,7 @@ var readBarrierExpr = regexp.MustCompile(`\$\(call add_json_bool,\s*ArtUseReadBa
 
 func readBarrierDefault(tree string) error {
 	path := filepath.Join(tree, "build/make/core/soong_config.mk")
-	b, err := os.ReadFile(path)
+	b, err := readFile(path)
 	if err != nil {
 		return err
 	}

@@ -5,7 +5,6 @@ package main
 import (
 	"fmt"
 	"go/ast"
-	"go/parser"
 	"go/token"
 	"path/filepath"
 	"regexp"
@@ -374,7 +373,7 @@ func (r RustFeatureGate) bootstrap(dir string) string {
 func readRustFeatureGate(tree string) (RustFeatureGate, error) {
 	var r RustFeatureGate
 	parse := func(rel string) (*ast.File, error) {
-		return parser.ParseFile(token.NewFileSet(), filepath.Join(tree, rel), nil, 0)
+		return parseGoFile(filepath.Join(tree, rel))
 	}
 	const builderGo, pathsGo = "build/soong/rust/builder.go", "build/soong/android/paths.go"
 	builder, err := parse(builderGo)

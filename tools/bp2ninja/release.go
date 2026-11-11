@@ -4,7 +4,6 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -47,7 +46,7 @@ func readRelease(tree, name string) (*Release, error) {
 			return nil
 		}
 		seen[cfg] = true
-		text, err := os.ReadFile(filepath.Join(dir, "release_configs", cfg+".textproto"))
+		text, err := readFile(filepath.Join(dir, "release_configs", cfg+".textproto"))
 		if err != nil {
 			return err
 		}
@@ -68,17 +67,17 @@ func readRelease(tree, name string) (*Release, error) {
 	if err := walk(name); err != nil {
 		return nil, err
 	}
-	decls, _ := filepath.Glob(filepath.Join(dir, "flag_declarations", "*.textproto"))
+	decls, _ := glob(filepath.Join(dir, "flag_declarations", "*.textproto"))
 	for _, f := range decls {
 		if n, v, ok := flagValue(f); ok {
 			r.flags[n] = v
-			if b, err := os.ReadFile(f); err == nil && reBool.Match(b) {
+			if b, err := readFile(f); err == nil && reBool.Match(b) {
 				r.bools[n] = true
 			}
 		}
 	}
 	for _, cfg := range r.Chain {
-		vals, _ := filepath.Glob(filepath.Join(dir, "flag_values", cfg, "*.textproto"))
+		vals, _ := glob(filepath.Join(dir, "flag_values", cfg, "*.textproto"))
 		for _, f := range vals {
 			if n, v, ok := flagValue(f); ok {
 				r.flags[n] = v
@@ -100,7 +99,7 @@ var reConfigSet = regexp.MustCompile(`^\$\(call (soong_config_set|soong_config_s
 // unset or false flag "false"; the others leave an empty value unset. Variables computed by make expressions or product variables are not
 // read: their selects take the default branch.
 func readConfigVars(path string, r *Release) (map[string]string, error) {
-	b, err := os.ReadFile(path)
+	b, err := readFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -164,7 +163,7 @@ func (r *Release) ConfigVar(ns, name string) (string, bool) {
 
 // flagValue reads one flag declaration or value file: bool flags are "true" / "" as Soong's GetBuildFlag reports them.
 func flagValue(path string) (name, value string, ok bool) {
-	b, err := os.ReadFile(path)
+	b, err := readFile(path)
 	if err != nil {
 		return "", "", false
 	}
