@@ -15,12 +15,13 @@ use atl_layout::{Layout, MAIN};
 use crate::fetch;
 use crate::git::{Ident, git, git_raw};
 use crate::patch;
-use crate::slot::{self, SLOTS};
+use crate::slot;
 use crate::slot_prune;
 use crate::sources::{self, Sources};
 use crate::timing::{self, Timings};
 use crate::unit_use::{self, Echo, Units};
 use crate::verdict::{self, Failure, Verdict};
+use crate::ws_config;
 
 /// The note a task keeps in its worktree: untracked by design, copied to `out/` when the branch lands.
 const STATE_NOTE: &str = ".state-note.md";
@@ -458,8 +459,9 @@ fn clean_up_child(repo: &Path, branch: &str) -> Result<String> {
 
 /// After a land: `slot prune --execute` over the pool's slots. The trees no slot owns (`repo/target`, EGL probes) are not pruned here: `slot prune --all` does that by hand. A busy slot is skipped; a failure is logged, never fatal, since the land is already pushed.
 fn prune_slots_after_land(repo: &Path, ws: &Path) {
-    let slots: Vec<u32> = (1..=SLOTS).collect();
     let swept = slot::holders_of(repo).and_then(|holders| {
+        let pool = slot::pool(&ws_config::load(ws)?, &holders)?;
+        let slots: Vec<u32> = (1..=pool).collect();
         slot_prune::sweep(
             ws,
             &holders,

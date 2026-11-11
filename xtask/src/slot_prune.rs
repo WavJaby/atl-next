@@ -19,7 +19,7 @@ use anyhow::{Context, Result, ensure};
 use rustix::fs::{FlockOperation, flock};
 
 use crate::build_pool;
-use crate::slot::{self, Holder, SLOTS};
+use crate::slot::{self, Holder};
 use crate::unit_use::{self, BUILD, DEPS, EXAMPLES, FINGERPRINT};
 
 /// Default `--older-than`, in days: a unit no cargo build used for this long is stale. First guess, not measured. A shorter cutoff frees more but recompiles stable dependencies more often; a rebuilt dependency also recompiles its dependents (2026-11-08: pruning one unit recompiled it and its dependent crate). Re-fit from the rebuild counts after a few lands.
@@ -126,6 +126,7 @@ struct Found {
 pub fn run(
     ws: &Path,
     holders: &[Holder],
+    pool: u32,
     slot: Option<u32>,
     all: bool,
     older_than: u64,
@@ -137,10 +138,13 @@ pub fn run(
     );
     let slots: Vec<u32> = match slot {
         Some(n) => {
-            ensure!((1..=SLOTS).contains(&n), "slot {n} is outside 1..={SLOTS}");
+            ensure!(
+                (1..=pool).contains(&n),
+                "slot {n} is outside 1..={pool} (`build.slots`)"
+            );
             vec![n]
         }
-        None => (1..=SLOTS).collect(),
+        None => (1..=pool).collect(),
     };
     let sweep = sweep(ws, holders, &slots, all, older_than, execute)?;
     Ok(if sweep.failed == 0 {
@@ -281,9 +285,11 @@ pub fn prune_unslotted(ws: &Path, cutoff: u64, now: u64, execute: bool) -> Resul
     prune_trees(ws, &found, cutoff, now, execute)
 }
 
-/// The pool number `n` when `dir` is exactly `<ws>/out/slot-<n>` with `n` in the pool.
+/// The slot number `n` when `dir` is exactly `<ws>/out/slot-<n>`, `n` >= 1 in canonical spelling. Whether `n` is within `build.slots` is the callers' check (`slot::pool`, `run`), so this reads no config.
 pub fn pool_slot(ws: &Path, dir: &Path) -> Option<u32> {
-    (1..=SLOTS).find(|&n| slot::slot_dir(ws, n) == dir)
+    let name = dir.strip_prefix(ws.join("out")).ok()?.to_str()?;
+    let n: u32 = name.strip_prefix("slot-")?.parse().ok()?;
+    (n >= 1 && slot::slot_dir(ws, n) == dir).then_some(n)
 }
 
 /// The slot dir must be a pool slot whose canonical path is directly under `<ws>/out`.
@@ -1458,10 +1464,10 @@ mod tests {
         let ws = Path::new("/ws");
         assert_eq!(pool_slot(ws, &ws.join("out/slot-2")), Some(2));
         assert_eq!(pool_slot(ws, &ws.join("out/slot-0")), None);
-        assert_eq!(
-            pool_slot(ws, &ws.join(format!("out/slot-{}", SLOTS + 1))),
-            None
-        );
+        // any number: the pool size is checked against the config elsewhere
+        assert_eq!(pool_slot(ws, &ws.join("out/slot-9")), Some(9));
+        assert_eq!(pool_slot(ws, &ws.join("out/slot-01")), None);
+        assert_eq!(pool_slot(ws, &ws.join("out/slot-x")), None);
         assert_eq!(pool_slot(ws, &ws.join("out/native")), None);
         assert_eq!(pool_slot(ws, &ws.join("out/slot-1/cargo")), None);
         assert_eq!(pool_slot(ws, Path::new("/elsewhere/out/slot-1")), None);

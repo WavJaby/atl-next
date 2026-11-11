@@ -113,6 +113,7 @@ mod verdict;
 mod wayland_proxy;
 mod window;
 mod workspace;
+mod ws_config;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -183,7 +184,7 @@ enum Command {
     Qemu(qemu::Args),
     /// Build-output slots: the out dir each checkout builds into by default (`show`, `list`, `assign`).
     ///
-    /// The pool is `slot::SLOTS` dirs <workspace>/out/slot-<n>; a checkout holds at most one, recorded in its git dir. `native`, `check` and `test` build into it without `--out` / `--java-out`. A slotted checkout's `target/` links to the slot's `target/`, so its cargo builds go there too.
+    /// The pool is `build.slots` dirs <workspace>/out/slot-<n> (<workspace>/workspace.toml, default 3; `list` prints the effective limits); a checkout holds at most one, recorded in its git dir. `native`, `check` and `test` build into it without `--out` / `--java-out`. A slotted checkout's `target/` links to the slot's `target/`, so its cargo builds go there too.
     Slot {
         #[command(subcommand)]
         slot: slot::Slot,

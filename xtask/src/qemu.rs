@@ -267,7 +267,7 @@ pub fn execute(root: &Path, b: &Build) -> Result<PathBuf> {
     let ws = Layout::of(root)?.workspace().to_owned();
     let _token = build_pool::acquire(
         &build_pool::dir(&ws),
-        build_pool::TOKENS,
+        build_pool::tokens(&ws)?,
         &build_pool::this_holder(root),
         build_pool::POLL,
         |line| println!("qemu: {line}"),

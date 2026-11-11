@@ -19,7 +19,7 @@ use crate::verdict::{Failure, Verdict};
 use crate::{
     arches, build_pool, converter, deps, fetch, licence_gate, licenses, ndk_surface, none_gate,
     packages, patch, provided_gate, providers, prune, runtimes, slot, sources, system, tree,
-    triage, upstream, workspace,
+    triage, upstream, workspace, ws_config,
 };
 
 #[derive(clap::Args, Clone)]
@@ -186,7 +186,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let tree = tree::shared_tree(&layout);
     let overlays = tree::overlays_of(root)?;
     tree::verify(&overlays)?;
-    let cache = CompilerCache::of(args, ws, &tree::describe(&overlays));
+    let cache = CompilerCache::of(args, ws, &tree::describe(&overlays))?;
     // go.work and the converter binary live in the build dir, so concurrent checkouts (each in its own dir) do not overwrite each other's converter
     // a cross host's outputs go under its arch's dir, so two arches in one slot never write the same path; the build machine's stay at the out dir, where its gates read them
     let out = slot::out_dir(root, args.out.as_deref(), "--out", |workspace| {
@@ -483,18 +483,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     let log = out.join("ninja.log");
     // only ninja queues for a machine-wide token (build_pool.rs); the gates below run after it is released
+    let tokens = build_pool::tokens(ws)?;
     let token = build_pool::acquire(
         &build_pool::dir(ws),
-        build_pool::TOKENS,
+        tokens,
         &build_pool::this_holder(root),
         build_pool::POLL,
         |line| println!("native: {line}"),
     )?;
-    println!(
-        "native: build token {} of {}",
-        token.index,
-        build_pool::TOKENS
-    );
+    println!("native: build token {} of {tokens}", token.index);
     let graph_file = out.join("graph.json");
     let graph: triage::Graph = serde_json::from_str(
         &std::fs::read_to_string(&graph_file)
@@ -613,10 +610,6 @@ fn verdict(failed: Vec<Failure>) -> ExitCode {
         ExitCode::FAILURE
     }
 }
-
-/// Size limit of the compiler cache (sccache evicts least recently used entries past it).
-/// One clean build of the libandroid_runtime closure stores ~80 MB (2026-11-01, zstd entries): 2 GB keeps ~25 such generations (main + task branches whose flags, pins or patches differ) and leaves room for the goal closure to grow several-fold before this needs a new measurement.
-const CACHE_SIZE: &str = "2G";
 
 /// The converter's goal prefix for a native bridge variant (tools/bp2ninja cc.go nbGoalPrefix).
 const NB_GOAL: &str = "nb:";
@@ -829,7 +822,7 @@ pub(crate) fn shell_env(
     view: &str,
 ) -> Result<Vec<(&'static str, std::ffi::OsString)>> {
     let workspace = Layout::of(repo)?.workspace().to_path_buf();
-    Ok(CompilerCache::of(args, &workspace, view).map_or_else(Vec::new, |c| c.env().to_vec()))
+    Ok(CompilerCache::of(args, &workspace, view)?.map_or_else(Vec::new, |c| c.env().to_vec()))
 }
 
 /// Where `--native-bridge <arch>` put module `m`'s outputs.
@@ -852,23 +845,29 @@ pub(crate) struct CompilerCache {
     launcher: String,
     dir: PathBuf,
     socket: PathBuf,
+    /// `SCCACHE_CACHE_SIZE`: sccache evicts least recently used entries past it.
+    size: String,
 }
 
 impl CompilerCache {
-    /// None with `--no-compiler-cache`. `view` = the overlay set the build sees (`tree::describe`, empty for a plain build).
-    fn of(args: &Args, workspace: &Path, view: &str) -> Option<Self> {
-        (!args.no_compiler_cache).then(|| {
-            Self::for_view(
-                &args.compiler_cache,
-                workspace.join("cache").join("sccache"),
-                view,
-            )
-        })
+    /// The workspace's shared cache, sized by `cache.sccache_size` (`ws_config`); None with `--no-compiler-cache`. `view` = the overlay set the build sees (`tree::describe`, empty for a plain build).
+    fn of(args: &Args, workspace: &Path, view: &str) -> Result<Option<Self>> {
+        if args.no_compiler_cache {
+            return Ok(None);
+        }
+        let size = ws_config::load(workspace)?.sccache_size.value;
+        Ok(Some(Self::for_view(
+            &args.compiler_cache,
+            workspace.join("cache").join("sccache"),
+            view,
+            size,
+        )))
     }
 
-    /// A new cache in `dir` as seen from source view `view` (task-bind gate: a scratch dir). Its server is shared with no other cache.
-    pub(crate) fn for_view(launcher: &str, dir: PathBuf, view: &str) -> Self {
+    /// A new cache in `dir` of limit `size` as seen from source view `view` (task-bind gate: a scratch dir). Its server is shared with no other cache.
+    pub(crate) fn for_view(launcher: &str, dir: PathBuf, view: &str, size: String) -> Self {
         Self {
+            size,
             launcher: launcher.into(),
             socket: dir.join(format!(
                 "server-{:016x}-{:016x}.sock",
@@ -897,7 +896,7 @@ impl CompilerCache {
         [
             ("SCCACHE_DIRECT", "false".into()),
             ("SCCACHE_DIR", self.dir.clone().into()),
-            ("SCCACHE_CACHE_SIZE", CACHE_SIZE.into()),
+            ("SCCACHE_CACHE_SIZE", self.size.clone().into()),
             ("SCCACHE_SERVER_UDS", self.socket.clone().into()),
         ]
     }
@@ -925,9 +924,10 @@ impl CompilerCache {
             String::from_utf8_lossy(&out.stderr).trim()
         );
         println!(
-            "native: compiler cache {} in {} (limit {CACHE_SIZE})",
+            "native: compiler cache {} in {} (limit {})",
             self.launcher,
-            self.dir.display()
+            self.dir.display(),
+            self.size
         );
         Ok(())
     }
@@ -1528,31 +1528,47 @@ nope
             let argv = [&["native", "--host", "x86_64"], extra, &["libfoo"]].concat();
             <Cli as clap::Parser>::try_parse_from(argv).unwrap().native
         };
+        // no /ws/workspace.toml: the cache takes the default size
         let ws = Path::new("/ws");
-        let on = CompilerCache::of(&parse(&[]), ws, "").expect("on by default");
+        let of =
+            |argv: &[&str], view: &str| CompilerCache::of(&parse(argv), ws, view).expect("config");
+        let on = of(&[], "").expect("on by default");
         assert_eq!(on.converter_args(), ["-launcher", "sccache"]);
         assert_eq!(on.dir, Path::new("/ws/cache/sccache"));
         let env: BTreeMap<_, _> = on.env().into_iter().collect();
         assert_eq!(env["SCCACHE_DIR"], "/ws/cache/sccache");
         assert_eq!(env["SCCACHE_DIRECT"], "false");
+        // the spec's default limit (owner 2026-11-11)
+        assert_eq!(env["SCCACHE_CACHE_SIZE"], "5G");
         // view hash = FNV-1a 64 offset basis for the empty view (the plain build); then this cache's token
         let uds = env["SCCACHE_SERVER_UDS"].to_string_lossy().into_owned();
         assert!(uds.starts_with("/ws/cache/sccache/server-cbf29ce484222325-"));
         assert!(uds.ends_with(".sock"));
         // another source view -> another server, same on-disk cache
-        let task = CompilerCache::of(&parse(&[]), ws, "bionic=/ws/src-wt/t/bionic").unwrap();
+        let task = of(&[], "bionic=/ws/src-wt/t/bionic").expect("on");
         assert_ne!(task.socket, on.socket);
         assert_eq!(task.dir, on.dir);
         // the same view again -> still another server: no build inherits an earlier build's
-        let again = CompilerCache::of(&parse(&[]), ws, "").unwrap();
+        let again = of(&[], "").expect("on");
         assert_ne!(again.socket, on.socket);
-        let other =
-            CompilerCache::of(&parse(&["--compiler-cache", "/opt/sccache"]), ws, "").unwrap();
+        let other = of(&["--compiler-cache", "/opt/sccache"], "").expect("on");
         assert_eq!(other.converter_args(), ["-launcher", "/opt/sccache"]);
-        assert_eq!(
-            CompilerCache::of(&parse(&["--no-compiler-cache"]), ws, ""),
-            None
-        );
+        assert_eq!(of(&["--no-compiler-cache"], ""), None);
+
+        // a workspace file's size reaches the clients' environment
+        let sized = std::env::temp_dir().join(format!("atl-cc-size-{}", std::process::id()));
+        std::fs::create_dir_all(&sized).expect("scratch dir");
+        std::fs::write(
+            sized.join(ws_config::FILE),
+            "[cache]\nsccache_size = \"7G\"\n",
+        )
+        .expect("file");
+        let cache = CompilerCache::of(&parse(&[]), &sized, "")
+            .expect("config")
+            .expect("on");
+        std::fs::remove_dir_all(&sized).expect("cleanup");
+        let env: BTreeMap<_, _> = cache.env().into_iter().collect();
+        assert_eq!(env["SCCACHE_CACHE_SIZE"], "7G");
     }
 
     /// sccache leaves its socket file behind; a dropped cache's file must go with it.
@@ -1561,7 +1577,12 @@ nope
         let dir = std::env::temp_dir().join(format!("atl-cc-socket-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch dir");
         // no such launcher: the stop fails quietly and the file must still go
-        let cache = CompilerCache::for_view("atl-no-such-compiler-launcher", dir.clone(), "");
+        let cache = CompilerCache::for_view(
+            "atl-no-such-compiler-launcher",
+            dir.clone(),
+            "",
+            ws_config::DEFAULT_SCCACHE_SIZE.to_owned(),
+        );
         let socket = cache.socket.clone();
         std::fs::write(&socket, b"").expect("stand-in socket file");
         drop(cache);

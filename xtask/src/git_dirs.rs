@@ -301,10 +301,11 @@ pub fn migrate(scope: &Scope, execute: bool) -> Result<Summary> {
     let mut s = Summary::default();
     // held for the whole run: no ninja build starts while the git dirs move.
     // A few tries: a token's flock is shared with every child the last holder's process forked until that child's exec, so a token released a moment ago can still read as held (seen with parallel tests).
+    let tokens = build_pool::tokens(scope.ws)?;
     let take = || {
         build_pool::try_take_all(
             &build_pool::dir(scope.ws),
-            build_pool::TOKENS,
+            tokens,
             &format!("migrate-git-dirs pid {}", std::process::id()),
         )
     };

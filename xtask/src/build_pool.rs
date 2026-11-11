@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Machine-wide build tokens: `xtask native` holds one while ninja runs, so at most [`TOKENS`] full native builds run at once whatever the number of checkouts and slots.
+//! Machine-wide build tokens: `xtask native` holds one while ninja runs, so at most [`tokens`] full native builds run at once whatever the number of checkouts and slots.
 //! Only the ninja build queues; tests, `check` and cargo builds never take a token.
 //! A token is an exclusive `flock` on `<workspace>/cache/build-pool/token-<i>`: the kernel drops it when the holder's file closes, so exit, error, panic and SIGKILL all free it -- no stale-lock cleanup exists or is needed.
 //! The holder writes `<checkout> pid <pid>` into its token file; a waiter prints those once, then retries every [`POLL`].
@@ -12,8 +12,10 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use rustix::fs::{FlockOperation, flock};
 
-/// Concurrent full native builds. 2 = the owner's limit on the dev machine (20 cores, 31 GB RAM): one ninja `-k 0` build already takes every core, and its peak link steps (ART, libcore) take several GB each, so a third build only adds memory pressure.
-pub const TOKENS: u32 = 2;
+/// Concurrent full native builds of workspace `ws`: `build.parallel_builds` (`ws_config::DEFAULT_PARALLEL_BUILDS` explains the default).
+pub fn tokens(ws: &Path) -> Result<u32> {
+    Ok(crate::ws_config::load(ws)?.parallel_builds.value)
+}
 
 /// Retry interval while every token is held; builds take minutes, so a second of extra wait is noise.
 pub const POLL: Duration = Duration::from_secs(1);

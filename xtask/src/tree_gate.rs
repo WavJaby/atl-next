@@ -272,8 +272,10 @@ fn compiler_cache(scratch: &Path, target: &Path, copy: &Path) -> Result<()> {
     )?;
     let task_ov = [overlay(copy, target)];
     let dir = scratch.join("sccache");
-    let plain = CompilerCache::for_view("sccache", dir.clone(), &tree::describe(&[]));
-    let task = CompilerCache::for_view("sccache", dir, &tree::describe(&task_ov));
+    // a scratch cache of a few objects: any limit holds them
+    let size = || crate::ws_config::DEFAULT_SCCACHE_SIZE.to_owned();
+    let plain = CompilerCache::for_view("sccache", dir.clone(), &tree::describe(&[]), size());
+    let task = CompilerCache::for_view("sccache", dir, &tree::describe(&task_ov), size());
     let result = (|| -> Result<()> {
         // the plain build's server, started outside the namespace
         plain.start()?;
@@ -326,6 +328,7 @@ fn compiler_cache(scratch: &Path, target: &Path, copy: &Path) -> Result<()> {
             "sccache",
             scratch.join("sccache"),
             &tree::describe(&task_ov),
+            size(),
         );
         let o = compile(&fresh, true, "fresh.o")?;
         ensure!(

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Build-output slots: the out dir a checkout builds into when `--out` / `--java-out` is not given.
 //!
-//! The pool is `SLOTS` dirs `<workspace>/out/slot-<n>`. A checkout holds at most one slot, recorded as its number in `atl-out-slot` inside its git dir (`.git/worktrees/<name>/` for a linked worktree, `.git/` for the main checkout): the record goes with the worktree, and nothing tracked depends on it.
+//! The pool is `build.slots` (`ws_config`) dirs `<workspace>/out/slot-<n>`. A checkout holds at most one slot, recorded as its number in `atl-out-slot` inside its git dir (`.git/worktrees/<name>/` for a linked worktree, `.git/` for the main checkout): the record goes with the worktree, and nothing tracked depends on it.
 //! Resolution per flag: explicit flag > the checkout's slot > the old default. The old default prints a note naming `cargo xtask slot assign`, so it is never taken silently.
 //! A record that cannot be read as a slot in the pool is an error, never a silent fallback.
 //! A slot held by a live other checkout is refused unless `--force`; a record whose checkout directory is gone is stale and may be reassigned.
@@ -20,10 +20,27 @@ use atl_layout::Layout;
 use crate::build_pool::{self, SlotLock};
 use crate::git::git;
 use crate::slot_prune;
+use crate::ws_config::{self, WsConfig};
 
-/// Slots in the pool = checkouts that hold an out dir at once, i.e. agents working in parallel. Disk is the limit: each slot is a whole out dir (9-15 GB measured 2026-11-07), so one per worktree is too much; 3 keeps the vhdx's host drive from filling between owner compactions (2026-11-08: 52.8 GB free, vhdx 146 GB vs 113 GB used; owner cut 5 -> 3).
-/// Concurrent builds are a separate limit (CPU/RAM), [`crate::build_pool::TOKENS`]: a slot holder mostly edits and tests, and queues only for ninja.
-pub const SLOTS: u32 = 3;
+/// The pool size (`build.slots`, `ws_config::DEFAULT_SLOTS` explains the default), refused while any record holds a slot above it: lowering the limit would strand that checkout's out dir and record.
+pub fn pool(cfg: &WsConfig, holders: &[Holder]) -> Result<u32> {
+    let n = cfg.slots.value;
+    let above: Vec<String> = holders
+        .iter()
+        .filter(|h| h.slot > n)
+        .map(|h| {
+            let stale = if h.live { "" } else { " (stale)" };
+            format!("slot {} by {}{stale}", h.slot, h.checkout.display())
+        })
+        .collect();
+    ensure!(
+        above.is_empty(),
+        "{}: `build.slots` = {n} is below slots still held: {}; land or move those checkouts (a stale one: delete its `{RECORD}` record), or raise `build.slots`",
+        cfg.path.display(),
+        above.join(", ")
+    );
+    Ok(n)
+}
 
 /// File in a checkout's git dir holding its slot number.
 const RECORD: &str = "atl-out-slot";
@@ -73,7 +90,7 @@ pub enum Slot {
     /// Without N: the lowest slot no live checkout holds. A slot held by a live other checkout is refused unless --force, which takes it over; that checkout then builds into the old default and its `target/` link is removed (a build it runs there fails).
     /// An own real `target/` is moved into the slot when the slot has no target yet, else removed.
     Assign {
-        /// Slot number, 1..=SLOTS.
+        /// Slot number, 1..=build.slots.
         slot: Option<u32>,
         /// Write the record and the link (default: print the plan only).
         #[arg(long)]
@@ -86,7 +103,7 @@ pub enum Slot {
     ///
     /// Name a slot, or `--all` for every slot plus the trees no slot owns (`repo/target`, `out/egl-driver/*/cargo*`). A slot a build holds, and a tree whose `.cargo-lock` a build holds, is skipped with a line saying so. Use is what each recorded build wrote (`<tree>/.atl-unit-use.json`, `unit_use`); a unit with no entry is judged by its fingerprint dir's mtime. Incremental: per crate, the newest finalized session stays, with the held and the young ones.
     Prune {
-        /// Slot number, 1..=SLOTS.
+        /// Slot number, 1..=build.slots.
         #[arg(conflicts_with = "all")]
         slot: Option<u32>,
         /// Every slot of the pool.
@@ -145,6 +162,9 @@ pub fn out_dir(
         Some(_) => None,
         None => read_record(&record_of(root)?)?,
     };
+    if slot.is_some() {
+        pool(&ws_config::load(&workspace)?, &holders_of(root)?)?;
+    }
     let fallback = fallback(&workspace);
     let target = resolve(explicit, slot, &workspace, fallback);
     if target.source == Source::Fallback {
@@ -196,11 +216,12 @@ fn read_record(path: &Path) -> Result<Option<u32>> {
     })
 }
 
+/// A slot number >= 1; whether it is in the pool is [`pool`]'s check, which names every holder above the limit.
 fn parse(text: &str) -> Result<u32> {
     let n: u32 = text
         .parse()
         .with_context(|| format!("{text:?} is not a slot number"))?;
-    ensure!((1..=SLOTS).contains(&n), "slot {n} is outside 1..={SLOTS}");
+    ensure!(n >= 1, "slot {n} is not a slot number (slots start at 1)");
     Ok(n)
 }
 
@@ -257,7 +278,7 @@ fn holder(slot: u32, checkout: PathBuf, record: PathBuf) -> Holder {
     }
 }
 
-/// Plan for giving the checkout whose record is `record` slot `want` (None: the lowest slot no live other checkout holds).
+/// Plan for giving the checkout whose record is `record` slot `want` (None: the lowest slot no live other checkout holds) of a pool of `slots`.
 /// A slot held by a live other checkout is refused unless `force`; stale holders are released without it.
 pub fn plan_assign(
     record: &Path,
@@ -265,6 +286,7 @@ pub fn plan_assign(
     holders: &[Holder],
     want: Option<u32>,
     force: bool,
+    slots: u32,
 ) -> Result<Plan> {
     let others = |n: u32| -> Vec<Holder> {
         holders
@@ -275,14 +297,17 @@ pub fn plan_assign(
     };
     let slot = match want {
         Some(n) => {
-            ensure!((1..=SLOTS).contains(&n), "slot {n} is outside 1..={SLOTS}");
+            ensure!(
+                (1..=slots).contains(&n),
+                "slot {n} is outside 1..={slots} (`build.slots`)"
+            );
             n
         }
         None => {
             if let Some(n) = current {
                 return Ok(Plan::Keep(n));
             }
-            match (1..=SLOTS).find(|&n| others(n).iter().all(|h| !h.live)) {
+            match (1..=slots).find(|&n| others(n).iter().all(|h| !h.live)) {
                 Some(n) => n,
                 None => bail!(
                     "every slot is held by a live checkout (`cargo xtask slot list`); name one with --force to take it over"
@@ -536,13 +561,16 @@ pub fn run(root: &Path, cmd: &Slot) -> Result<ExitCode> {
         Some(root),
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?);
+    let cfg = ws_config::load(ws)?;
+    let all = holders(&common)?;
+    let slots = pool(&cfg, &all)?;
     match cmd {
         Slot::Prune {
             slot,
-            all,
+            all: every,
             older_than,
             execute,
-        } => return slot_prune::run(ws, &holders(&common)?, *slot, *all, *older_than, *execute),
+        } => return slot_prune::run(ws, &all, slots, *slot, *every, *older_than, *execute),
         Slot::Show => match read_record(&record)? {
             Some(n) => {
                 let dir = slot_dir(ws, n);
@@ -560,8 +588,8 @@ pub fn run(root: &Path, cmd: &Slot) -> Result<ExitCode> {
             ),
         },
         Slot::List => {
-            let all = holders(&common)?;
-            for n in 1..=SLOTS {
+            println!("{}", cfg.summary());
+            for n in 1..=slots {
                 let dir = slot_dir(ws, n).display().to_string();
                 let held: Vec<&Holder> = all.iter().filter(|h| h.slot == n).collect();
                 if held.is_empty() {
@@ -587,9 +615,8 @@ pub fn run(root: &Path, cmd: &Slot) -> Result<ExitCode> {
             execute,
             force,
         } => {
-            let all = holders(&common)?;
             let current = read_record(&record)?;
-            let plan = plan_assign(&record, current, &all, *slot, *force)?;
+            let plan = plan_assign(&record, current, &all, *slot, *force, slots)?;
             let (to, release) = match &plan {
                 Plan::Keep(n) => (*n, &[][..]),
                 Plan::Assign { slot: to, release } => (*to, release.as_slice()),
@@ -629,6 +656,9 @@ pub fn run(root: &Path, cmd: &Slot) -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pool size of the plan tests: any size above 2 works, 3 is the spec's default.
+    const POOL: u32 = 3;
 
     fn holder_at(slot: u32, checkout: &str, live: bool) -> Holder {
         Holder {
@@ -672,20 +702,68 @@ mod tests {
     #[test]
     fn slot_number_must_be_in_the_pool() {
         assert_eq!(parse("1").expect("slot 1"), 1);
+        assert_eq!(
+            parse("9").expect("above the pool parses; pool() refuses it"),
+            9
+        );
         assert!(parse("0").is_err());
-        assert!(parse(&(SLOTS + 1).to_string()).is_err());
         assert!(parse("two").is_err());
+    }
+
+    fn cfg_with(text: &str) -> WsConfig {
+        ws_config::parse(text, Path::new("/ws/workspace.toml")).expect("config")
+    }
+
+    #[test]
+    fn lowering_slots_under_a_held_slot_is_refused_naming_the_holders() {
+        let held = [
+            holder_at(1, "wt-a", true),
+            holder_at(3, "wt-c", true),
+            holder_at(2, "wt-gone", false),
+        ];
+        let refused = pool(&cfg_with("[build]\nslots = 1\n"), &held);
+        let m = format!("{:#}", refused.expect_err("slots 2 and 3 are held"));
+        assert!(
+            m.contains("/ws/workspace.toml") && m.contains("`build.slots` = 1"),
+            "{m}"
+        );
+        assert!(
+            m.contains("slot 3 by wt-c") && m.contains("slot 2 by wt-gone (stale)"),
+            "{m}"
+        );
+        assert!(!m.contains("wt-a"), "{m}");
+        assert_eq!(
+            pool(&cfg_with("[build]\nslots = 3\n"), &held).expect("fits"),
+            3
+        );
+        // the spec's default pool is 3
+        assert_eq!(pool(&cfg_with(""), &held).expect("default"), 3);
+    }
+
+    #[test]
+    fn assign_follows_the_configured_pool() {
+        let record = Path::new("/git/this/atl-out-slot");
+        assert!(plan_assign(record, None, &[], Some(4), false, 3).is_err());
+        assert_eq!(
+            plan_assign(record, None, &[], Some(4), false, 4).expect("pool of 4"),
+            Plan::Assign {
+                slot: 4,
+                release: vec![],
+            }
+        );
+        let one_live = [holder_at(1, "wt-a", true)];
+        assert!(plan_assign(record, None, &one_live, None, false, 1).is_err());
     }
 
     #[test]
     fn held_slot_is_refused_unless_forced() {
         let record = Path::new("/git/this/atl-out-slot");
         let held = [holder_at(1, "wt-a", true)];
-        let refused = plan_assign(record, None, &held, Some(1), false);
+        let refused = plan_assign(record, None, &held, Some(1), false, POOL);
         let message = format!("{:#}", refused.expect_err("live holder must refuse"));
         assert!(message.contains("is held by wt-a"), "{message}");
         assert_eq!(
-            plan_assign(record, None, &held, Some(1), true).expect("forced"),
+            plan_assign(record, None, &held, Some(1), true, POOL).expect("forced"),
             Plan::Assign {
                 slot: 1,
                 release: vec![held[0].clone()],
@@ -698,7 +776,7 @@ mod tests {
         let record = Path::new("/git/this/atl-out-slot");
         let held = [holder_at(2, "wt-gone", false)];
         assert_eq!(
-            plan_assign(record, None, &held, Some(2), false).expect("stale"),
+            plan_assign(record, None, &held, Some(2), false, POOL).expect("stale"),
             Plan::Assign {
                 slot: 2,
                 release: vec![held[0].clone()],
@@ -711,16 +789,16 @@ mod tests {
         let record = Path::new("/git/this/atl-out-slot");
         let held = [holder_at(1, "wt-a", true), holder_at(2, "wt-gone", false)];
         assert_eq!(
-            plan_assign(record, None, &held, None, false).expect("pick"),
+            plan_assign(record, None, &held, None, false, POOL).expect("pick"),
             Plan::Assign {
                 slot: 2,
                 release: vec![held[1].clone()],
             }
         );
-        let all_live: Vec<Holder> = (1..=SLOTS)
+        let all_live: Vec<Holder> = (1..=POOL)
             .map(|n| holder_at(n, &format!("wt-{n}"), true))
             .collect();
-        assert!(plan_assign(record, None, &all_live, None, false).is_err());
+        assert!(plan_assign(record, None, &all_live, None, false, POOL).is_err());
     }
 
     #[test]
@@ -733,11 +811,11 @@ mod tests {
             live: true,
         }];
         assert_eq!(
-            plan_assign(record, Some(2), &own, None, false).expect("keep"),
+            plan_assign(record, Some(2), &own, None, false, POOL).expect("keep"),
             Plan::Keep(2)
         );
         assert_eq!(
-            plan_assign(record, Some(2), &own, Some(2), false).expect("keep"),
+            plan_assign(record, Some(2), &own, Some(2), false, POOL).expect("keep"),
             Plan::Keep(2)
         );
     }
