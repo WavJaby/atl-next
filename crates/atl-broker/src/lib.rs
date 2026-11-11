@@ -476,8 +476,17 @@ pub fn drm_sysfs(devices: &[PathBuf]) -> io::Result<(Vec<Mount>, Vec<Link>)> {
             }
         }
     }
+    // + each device's driver module state (`<device>/driver/module` -> /sys/module/<m>/initstate): NVIDIA's EGL declines its GPU without reading it (measured: laptop, nvidia 615.78, Wayland offload falls back to Mesa);
+    // the file, not the module dir, whose parameters are none of a process's business
+    let states: Vec<PathBuf> = dirs
+        .iter()
+        .filter_map(|d| std::fs::canonicalize(d.join("driver/module")).ok())
+        .map(|m| m.join("initstate"))
+        .filter(|f| f.is_file())
+        .collect();
     let mounts = dirs
         .into_iter()
+        .chain(states)
         .map(|d| Mount {
             host: d.clone(),
             at: d,
