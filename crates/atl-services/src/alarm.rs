@@ -17,9 +17,9 @@ use atl_parcelables::android::os::WorkSource;
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, Strong, ThreadState};
 
 use crate::alarm_table::{Alarm, AlarmTable};
-use crate::counters;
-use crate::packages::Packages;
-use crate::permission::{self, Permissions};
+use atl_services_types::counters;
+use atl_services_types::packages::Packages;
+use atl_services_types::permission::{self, Permissions};
 
 /// The interface name counters use.
 const INTERFACE: &str = "IAlarmManager";
@@ -94,7 +94,7 @@ impl IAlarmManager for AlarmService {
     }
 
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        counters::unimplemented(INTERFACE, method)
+        crate::unimplemented(INTERFACE, method)
     }
 
     /// set (:2684): the caller must be the package's uid, and a repeating alarm takes no listener (:2701). Stored under its key, replacing the alarm that key held (setImplLocked:2271).

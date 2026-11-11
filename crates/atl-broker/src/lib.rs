@@ -9,7 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod app_env;
-pub mod bwrap;
+
 pub mod control;
 pub mod gpu;
 mod seccomp;
@@ -34,7 +34,7 @@ use rustix::process::{Pid, Signal, kill_process};
 pub const CONTROL_ENV: &str = "ATL_BINDER_FD";
 /// Android's socket directory in every sandbox; liblog's logd socket lives in it (`/dev/socket/logdw`, logd_writer.cpp).
 const SOCKET_DIR: &str = "/dev/socket";
-use bwrap::{Access, PROGRAM as BWRAP};
+use atl_bwrap::{self as bwrap, Access, PROGRAM as BWRAP};
 
 /// One bind mount into the sandbox.
 #[derive(Debug, Clone, PartialEq, Eq)]

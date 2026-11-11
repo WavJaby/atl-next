@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! bubblewrap's command line, spelled once: every bwrap flag any of our code passes is a method here (F1.1). Users: the broker's profiles and xtask's build-tree namespace (`tree::namespace_args`), a different concept that shares only the flag spelling.
 //! Flag meanings: bubblewrap's bwrap.c `usage()` / bwrap(1). Order matters to bwrap (mounts apply in argv order), so the builder keeps call order.
+#![forbid(unsafe_code)]
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};

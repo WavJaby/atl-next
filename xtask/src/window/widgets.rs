@@ -10,10 +10,10 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use atl_services::display_model::DisplayModel;
+use atl_services_types::display_model::DisplayModel;
 use std::sync::Mutex;
 
-use atl_services::input_devices;
+use atl_services_types::input_devices;
 
 use super::capture;
 use super::{

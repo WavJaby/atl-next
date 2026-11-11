@@ -2,7 +2,7 @@
 //! `xtask test window`: the window path, one stage at a time. Stage `resume` (M3 plan step 1): the window fixture (xtask/testdata/window: a software activity painting four solid colours)
 //! is started the Android way by atld, as `xtask test app` starts its fixture; the services send ResumeActivityItem after LaunchActivityItem (activity.rs), so ActivityThread runs onResume.
 //! Pass: the stage's marker is logged, and the app neither logs FATAL EXCEPTION, nor dies, nor waits on a service nothing serves ([`UNSERVED_WAIT`]: a hang shows only as that line) within [`WINDOW_MS`] after it. The app's log lines and the services' counter lines carry the same
-//! wall clock (logcat's first field; `at=` on a counter line, atl_services::counters), so every counted call is printed as before or after the marker, with its offset.
+//! wall clock (logcat's first field; `at=` on a counter line, atl_services_types::counters), so every counted call is printed as before or after the marker, with its offset.
 //! Always printed: the counters before the marker, the calls after it, the services' crash reports and the app's log after it; on failure also the atld, app and services log tails.
 //! `--self-test` checks the verdict on synthetic logs: a crash or a death inside the window fails, one just past it does not, a missing marker and an atld exit fail.
 //! Stage `frames` (M3 slice 5) runs the same verdict over its longer window, then two sub-gates on the fixture's frames: (a) the first frame reaches the compositor and its pixels are the
@@ -22,7 +22,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use atl_layout::Layout;
-use atl_services::display_model::DisplayModel;
+use atl_services_types::display_model::DisplayModel;
 
 use crate::atld_run::{
     Counter, Event, MS_PER_S, Run, Runtime, events, parse_stamp, run_display, totals,

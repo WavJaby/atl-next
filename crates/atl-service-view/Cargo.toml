@@ -17,7 +17,7 @@ converter = ["atl-aidl/converter"]
 
 [dependencies]
 atl-aidl = { path = "../atl-aidl" }
-atl-services = { path = "../atl-services" }
+atl-services-types = { path = "../atl-services-types" }
 cxx.workspace = true
 
 [build-dependencies]

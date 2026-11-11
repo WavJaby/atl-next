@@ -9,9 +9,9 @@
 //! Refused, not modelled: implicit intents (intent filters), other packages, singleInstance, other processes, intent flags except NEW_TASK, task affinity
 //! across tasks (NEW_TASK into another affinity), more than one task per package, bringing a running app's task to front.
 
-use crate::counters;
-use crate::packages::ActivityDecl;
-use crate::permission::{SHELL_UID, SYSTEM_UID};
+use atl_services_types::counters;
+use atl_services_types::packages::ActivityDecl;
+use atl_services_types::permission::{SHELL_UID, SYSTEM_UID};
 
 /// ActivityManager.START_SUCCESS: the activity is started (the record is pushed and its launch sent).
 pub const START_SUCCESS: i32 = 0;
@@ -253,7 +253,7 @@ mod tests {
             task_affinity: None,
             process: None,
             meta_data: vec![],
-            screen_orientation: crate::packages::SCREEN_ORIENTATION_UNSPECIFIED,
+            screen_orientation: atl_services_types::packages::SCREEN_ORIENTATION_UNSPECIFIED,
             resizeable: true,
             min_aspect_ratio: None,
             max_aspect_ratio: None,

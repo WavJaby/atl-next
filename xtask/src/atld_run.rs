@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use atl_layout::Layout;
-use atl_services::display_model::DisplayModel;
-use atl_services::native_libs::SupportedAbi;
-use atl_services::packages::{Library, Manifest};
+use atl_services_types::display_model::DisplayModel;
+use atl_services_types::native_libs::SupportedAbi;
+use atl_services_types::packages::{Library, Manifest};
 use serde::{Deserialize, Serialize};
 
 use crate::gate_goals::Goals;
@@ -387,8 +387,8 @@ impl Run {
     }
 }
 
-/// The program name ([`atl_broker::bwrap::PROGRAM`]) every process atld starts runs as: the broker launches nothing else.
-const BROKER_CHILD_COMM: &str = atl_broker::bwrap::PROGRAM;
+/// The program name ([`atl_bwrap::PROGRAM`]) every process atld starts runs as: the broker launches nothing else.
+const BROKER_CHILD_COMM: &str = atl_bwrap::PROGRAM;
 
 /// atld's live children that did not come from the broker, as `<pid> <comm>`: every child of `atld` whose comm is not bwrap's. Read from `/proc/*/stat` (ppid, comm): `/proc/<pid>/task/*/children` needs CONFIG_PROC_CHILDREN, which the WSL kernel lacks.
 /// A process that exits between the directory listing and its stat read is skipped; atld is alive when this runs, so its sandboxes are too. A child between fork and exec carries its forker's comm: match it by pid, not comm.
@@ -1410,7 +1410,7 @@ pub fn without_stamp(line: &str) -> &str {
 }
 
 /// Every counter line of the services' log, in log order: `services: unimplemented|answered|refused|sent <interface>.<method> <n> at=<stamp>`
-/// (atl_services::counters), and `parcelables: refused <what> <n> at=<stamp>` (atl_parcelables `refuse`). A line without a parsable stamp is not one.
+/// (atl_services_types::counters), and `parcelables: refused <what> <n> at=<stamp>` (atl_parcelables `refuse`). A line without a parsable stamp is not one.
 pub fn events(services_log: &str) -> Vec<Event> {
     const KINDS: [(&str, &str); 5] = [
         ("services: unimplemented ", "unimplemented"),

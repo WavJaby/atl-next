@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! ATL's M2 system services in Rust (owner decision 2026-11-03: AOSP's Java system_server on ART would add resident memory, startup time and a large build closure; not measured; more services and methods later, per service).
 //! Each implements a converter-built AIDL stub (atl-aidl) and only the methods M2 needs; the rest keep the stub's default body (aidl `--rust_unimplemented_hook`), which lands in
-//! [`counters::unimplemented`]: counted per (interface, method) and answered UNKNOWN_TRANSACTION, what Java's Binder.onTransact gives an unknown code.
+//! [`unimplemented`]: counted per (interface, method) and answered UNKNOWN_TRANSACTION, what Java's Binder.onTransact gives an unknown code.
 //! `@EnforcePermission` methods ask [`permission::enforce`] first (fail-closed). Policy modules are plain Rust; the binder modules need feature `converter`.
 #![forbid(unsafe_code)]
 
@@ -15,25 +15,16 @@ pub mod activity_stack;
 pub mod activity_start;
 pub mod alarm_table;
 pub mod broadcast;
-pub mod compositor_registry;
 pub mod config_diff;
-pub mod counters;
 pub mod desktop_bounds;
-pub mod display_model;
 pub mod focus;
 pub mod ime_bind;
-pub mod input_devices;
-pub mod manifest_flags;
-pub mod native_libs;
 pub mod observer_rules;
-pub mod packages;
 pub mod pending_intent_table;
-pub mod permission;
 pub mod players;
 pub mod process_control;
 pub mod sensor;
 pub mod shared_memory;
-pub mod size_buckets;
 pub mod tasks;
 pub mod window_layout;
 
@@ -55,7 +46,6 @@ pub mod connectivity;
 pub mod content;
 #[cfg(feature = "converter")]
 pub mod display;
-pub mod gl_driver;
 #[cfg(feature = "converter")]
 pub mod input;
 #[cfg(feature = "converter")]
@@ -86,3 +76,11 @@ pub mod ui_agent;
 pub mod user;
 #[cfg(feature = "converter")]
 pub mod window;
+
+/// The stubs' `unimplemented` hook: counted ([`atl_services_types::counters`]), then UNKNOWN_TRANSACTION (frameworks/base core/java/android/os/Binder.java onTransact returns false for a code it does not know,
+/// which the caller sees as UNKNOWN_TRANSACTION; a Java proxy then reads an empty reply: no exception, a null / zero result).
+#[cfg(feature = "converter")]
+pub fn unimplemented(interface: &'static str, method: &str) -> binder::Status {
+    atl_services_types::counters::count_unimplemented(interface, method);
+    binder::StatusCode::UNKNOWN_TRANSACTION.into()
+}

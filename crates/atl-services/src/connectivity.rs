@@ -12,8 +12,7 @@ use atl_parcelables::android::net::{Network, NetworkInfo};
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, ThreadState};
 use std::sync::Arc;
 
-use crate::counters;
-use crate::permission::Permissions;
+use atl_services_types::permission::Permissions;
 
 /// The interface name counters use.
 const INTERFACE: &str = "IConnectivityManager";
@@ -45,7 +44,7 @@ impl Interface for ConnectivityService {}
 
 impl IConnectivityManager for ConnectivityService {
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        counters::unimplemented(INTERFACE, method)
+        crate::unimplemented(INTERFACE, method)
     }
 
     /// ConnectivityService.getActiveNetworkInfo: no agent for the uid -> null.

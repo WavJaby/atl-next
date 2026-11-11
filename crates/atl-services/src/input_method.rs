@@ -37,11 +37,11 @@ use binder::{
     ThreadState,
 };
 
-use crate::counters;
 use crate::focus::FocusedProcess;
 use crate::ime_bind::{self, Bind, ClientBind, Peer};
-use crate::permission::Permissions;
 use crate::ui_agent::{IUiAgent, UiAgents};
+use atl_services_types::counters;
+use atl_services_types::permission::Permissions;
 use std::sync::Arc;
 
 /// The interface name counters use.
@@ -275,7 +275,7 @@ impl Interface for SessionCallback {}
 
 impl IInputMethodSessionCallback for SessionCallback {
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        counters::unimplemented("IInputMethodSessionCallback", method)
+        crate::unimplemented("IInputMethodSessionCallback", method)
     }
 
     fn r#sessionCreated(&self, session: Option<&Session>) -> binder::Result<()> {
@@ -322,7 +322,7 @@ impl IInputMethodManager for InputMethodManager {
     }
 
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        counters::unimplemented(INTERFACE, method)
+        crate::unimplemented(INTERFACE, method)
     }
 
     /// InputMethodManagerService.addClient (:1791-1805), as createRealInstance calls it (InputMethodManager.java:1652): the client is kept for its uid with a fresh bind state (a restarted app's

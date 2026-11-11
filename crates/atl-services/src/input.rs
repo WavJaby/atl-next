@@ -8,13 +8,13 @@ use atl_parcelables::android::view::{InputDevice, PointerIcon};
 use atl_parcelables::codecs::android::view::InputDevice::set_key_character_map;
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, ThreadState};
 
-use crate::counters;
-use crate::input_devices::{
+use crate::ui_agent::{IUiAgent, UiAgents};
+use atl_services_types::counters;
+use atl_services_types::input_devices::{
     KEYBOARD, POINTER, SOURCE_KEYBOARD, SOURCE_MOUSE, SOURCE_TOUCHPAD, SOURCE_TOUCHSCREEN,
     TOUCHPAD, TOUCHSCREEN, VIRTUAL_KEYBOARD,
 };
-use crate::permission::Permissions;
-use crate::ui_agent::{IUiAgent, UiAgents};
+use atl_services_types::permission::Permissions;
 use std::sync::Arc;
 
 /// The interface name counters use.
@@ -111,7 +111,7 @@ impl IInputManager for InputManager {
     }
 
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        counters::unimplemented(INTERFACE, method)
+        crate::unimplemented(INTERFACE, method)
     }
 
     /// Null selects the default VelocityTracker strategy; InputManagerGlobal.java:159 keeps null as is.

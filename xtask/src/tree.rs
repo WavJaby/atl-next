@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, bail, ensure};
-use atl_broker::bwrap;
+use atl_bwrap as bwrap;
 use atl_layout::Layout;
 
 use crate::sources::{Checkout, Pin};

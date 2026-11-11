@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
 
 use crate::desktop_bounds::{ActivityInput, Rect, initial_bounds};
-use crate::display_model::DisplayModel;
+use atl_services_types::display_model::DisplayModel;
 
 /// A Task's identity, assigned by the services (positive). The wire carries it as an i32: compositor_registry SET_BOUNDS and the IUiAgent TASK transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

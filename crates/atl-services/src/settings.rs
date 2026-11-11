@@ -6,7 +6,7 @@
 use binder::binder_impl::{Binder, BorrowedParcel, FIRST_CALL_TRANSACTION, TransactionCode};
 use binder::{BinderFeatures, Interface, SpIBinder, StatusCode, declare_binder_interface};
 
-use crate::counters;
+use atl_services_types::counters;
 
 /// IContentProvider.descriptor ("android.content.IContentProvider", IContentProvider.java).
 pub const DESCRIPTOR: &str = "android.content.IContentProvider";

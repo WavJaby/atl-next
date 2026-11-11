@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, ensure};
 
 use crate::atld_run::{MS_PER_S, Run, Runtime, last_resumed, parse_stamp, run_display, settled};
-use atl_services::packages::Manifest;
+use atl_services_types::packages::Manifest;
 
 use crate::nested_wayland::NestedCompositor;
 use crate::{arches, drive, manifest, observe, remote, test_apks, verdict, window};

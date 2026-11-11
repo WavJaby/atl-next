@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, ensure};
 use atl_layout::Layout;
-use atl_services::packages::MetaValue;
+use atl_services_types::packages::MetaValue;
 
 use crate::atld_run::{Run, Runtime};
 use crate::manifest;

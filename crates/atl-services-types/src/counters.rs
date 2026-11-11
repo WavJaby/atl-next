@@ -89,14 +89,6 @@ pub fn wall_stamp() -> String {
     format!("{}.{:03}", now.as_secs(), now.subsec_millis())
 }
 
-/// The stubs' `unimplemented` hook: counted, then UNKNOWN_TRANSACTION (frameworks/base core/java/android/os/Binder.java onTransact returns false for a code it does not know,
-/// which the caller sees as UNKNOWN_TRANSACTION; a Java proxy then reads an empty reply: no exception, a null / zero result).
-#[cfg(feature = "converter")]
-pub fn unimplemented(interface: &'static str, method: &str) -> binder::Status {
-    count_unimplemented(interface, method);
-    binder::StatusCode::UNKNOWN_TRANSACTION.into()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

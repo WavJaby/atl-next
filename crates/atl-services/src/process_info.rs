@@ -5,8 +5,6 @@
 use atl_aidl::aidl::android::os::IProcessInfoService::{BnProcessInfoService, IProcessInfoService};
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status};
 
-use crate::counters;
-
 /// The interface name counters use.
 const INTERFACE: &str = "IProcessInfoService";
 /// ActivityManager.PROCESS_STATE_TOP = ProcessStateEnum.TOP (2).
@@ -32,7 +30,7 @@ fn fill(pids: Option<&[i32]>, out: &mut Option<Vec<i32>>, value: i32) -> binder:
 
 impl IProcessInfoService for ProcessInfoService {
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        counters::unimplemented(INTERFACE, method)
+        crate::unimplemented(INTERFACE, method)
     }
 
     /// ProcessInfoService.getProcessStatesFromPids -> AMS getProcessStatesAndOomScoresForPIDs(pids, states, null).

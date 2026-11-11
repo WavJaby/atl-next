@@ -33,11 +33,11 @@ use atl_broker::{Broker, Link, Mount, Process, Spawn, gpu, kill_sandbox, to_log}
 use atl_gralloc::node::{self, NodeSource};
 use atl_gralloc::vintf;
 use atl_property_service::{LinearTier, Property};
-use atl_services::compositor_registry;
-use atl_services::display_model::DisplayModel;
-use atl_services::gl_driver;
-use atl_services::native_libs::{self, SupportedAbi};
-use atl_services::packages::{Library, Manifest, PackageRecord, PermissionDecl};
+use atl_services_types::compositor_registry;
+use atl_services_types::display_model::DisplayModel;
+use atl_services_types::gl_driver;
+use atl_services_types::native_libs::{self, SupportedAbi};
+use atl_services_types::packages::{Library, Manifest, PackageRecord, PermissionDecl};
 use clap::Parser;
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 
@@ -98,10 +98,10 @@ struct Args {
     /// (SystemConfig's `<library name file dependency>`).
     #[arg(long = "shared-library", value_parser = Library::parse_arg)]
     shared_libraries: Vec<(String, Library)>,
-    /// A package to install (repeat): a JSON file `{"apk": <host path>, "manifest": {...}}` (atl_services::packages::Manifest, which xtask reads from the APK with aapt2).
+    /// A package to install (repeat): a JSON file `{"apk": <host path>, "manifest": {...}}` (atl_services_types::packages::Manifest, which xtask reads from the APK with aapt2).
     #[arg(long = "package", required = true)]
     packages: Vec<PathBuf>,
-    /// The platform's permission definitions (framework-res's `<permission>` elements): a JSON array of atl_services::packages::PermissionDecl, the install-time grant rule's platform half.
+    /// The platform's permission definitions (framework-res's `<permission>` elements): a JSON array of atl_services_types::packages::PermissionDecl, the install-time grant rule's platform half.
     /// Omitted: only the packages' own definitions count, so no platform permission is granted.
     #[arg(long)]
     platform_permissions: Option<PathBuf>,
@@ -114,7 +114,7 @@ struct Args {
     /// A package whose launcher activity the services start once they are up.
     #[arg(long)]
     launch: Option<String>,
-    /// The display the services answer with (`WxH@hz,dpi`, atl_services::display_model): forwarded to atl-system-services; omitted, the desktop's first monitor (atl-platform-host, DisplayModel::from_monitor).
+    /// The display the services answer with (`WxH@hz,dpi`, atl_services_types::display_model): forwarded to atl-system-services; omitted, the desktop's first monitor (atl-platform-host, DisplayModel::from_monitor).
     #[arg(long, value_parser = DisplayModel::parse_arg)]
     display: Option<DisplayModel>,
     /// The headless pointer script, `down:x,y move:x,y up:x,y` (atl-composer `input::parse_script`): every app process gets it as `ro.atl.headless.pointer`, and the app injects it after its first frame. Omitted: no input.
@@ -321,14 +321,14 @@ fn font_layout(a: &Args, r: &Root) -> Result<Vec<PathBuf>> {
         let p = a.font_data.join(f);
         std::fs::read_to_string(&p).with_context(|| p.display().to_string())
     };
-    let table = atl_fonts::Table::parse(atl_fonts::FONTS_TOML)?;
+    let table = atl_fonts_table::Table::parse(atl_fonts_table::FONTS_TOML)?;
     let src = atl_platform_host::PlatformFonts::new()?;
     let model = atl_fonts::build(
         &src,
         &atl_fonts::FileReader,
         &table,
-        atl_fonts::parse_aliases(&data("alias.json")?)?,
-        &atl_fonts::parse_order(&data("fallback_order.json")?)?,
+        atl_fonts_table::parse_aliases(&data("alias.json")?)?,
+        &atl_fonts_table::parse_order(&data("fallback_order.json")?)?,
     )?;
     let etc = r.system().join("etc");
     std::fs::create_dir_all(&etc)?;
@@ -531,7 +531,7 @@ fn install(a: &Args, r: &Root) -> Result<(Vec<PackageRecord>, InstructionSets)> 
                     .iter()
                     .flat_map(|o| o.permissions.iter().map(move |d| (o.name.as_str(), d))),
             );
-            atl_services::permission::install_grants(&p.name, &p.requested_permissions, defs)
+            atl_services_types::permission::install_grants(&p.name, &p.requested_permissions, defs)
         })
         .collect();
     for (record, granted) in records.iter_mut().zip(grants) {

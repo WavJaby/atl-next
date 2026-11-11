@@ -16,10 +16,10 @@ use atl_aidl::aidl::android::app::INotificationManager::{
 use atl_aidl::mangled::_7_android_3_app_22_ITransientNotification as ITransientNotification;
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, Strong, ThreadState};
 
-use crate::counters;
-use crate::packages::Packages;
-use crate::permission::{self, Permissions};
 use crate::tasks::Tasks;
+use atl_services_types::counters;
+use atl_services_types::packages::Packages;
+use atl_services_types::permission::{self, Permissions};
 
 /// The interface name counters use.
 const INTERFACE: &str = "INotificationManager";
@@ -181,7 +181,7 @@ impl INotificationManager for NotificationManager {
     }
 
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        counters::unimplemented(INTERFACE, method)
+        crate::unimplemented(INTERFACE, method)
     }
 
     /// enqueueToast (:3969): queued per (pkg, token); a known one only takes the new duration (record.update). Refused (false, as AOSP): no package or TN, MAX_PACKAGE_TOASTS

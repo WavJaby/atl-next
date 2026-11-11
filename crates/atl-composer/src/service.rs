@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! `android.gui.ISurfaceComposer` ("SurfaceFlingerAIDL"), `ISurfaceComposerClient` and `IDisplayEventConnection` on the converter's stubs: the calls BLASTBufferQueue, Choreographer's DisplayEventReceiver,
 //! SurfaceControl and ViewRootImpl make through libgui. Answers follow SurfaceFlinger's (SurfaceFlinger.cpp `getStaticDisplayInfo` / `getDynamicDisplayInfoFromId` / `getDisplayState`) for the one display
-//! the display model describes; every other method keeps the stub's default body, counted (atl_services::counters) and answered UNKNOWN_TRANSACTION.
+//! the display model describes; every other method keeps the stub's default body, counted (atl_services_types::counters) and answered UNKNOWN_TRANSACTION.
 
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex};
@@ -30,7 +30,7 @@ use atl_aidl::aidl::android::gui::Size::Size;
 use atl_aidl::aidl::android::gui::StaticDisplayInfo::StaticDisplayInfo;
 use atl_compositor::event::ConnectionId;
 use atl_libgui_parcel::parcel::WireParcel;
-use atl_services::{counters, display_model};
+use atl_services_types::{counters, display_model};
 use binder::{BinderFeatures, SpIBinder, Status, StatusCode, Strong};
 use gui_aidl_types_rs::{BitTube, LayerMetadata, VsyncEventData};
 

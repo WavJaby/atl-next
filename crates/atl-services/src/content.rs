@@ -19,9 +19,9 @@ use binder::{
     Status, StatusCode, Strong, ThreadState,
 };
 
-use crate::counters;
 use crate::observer_rules::{Watch, segments};
-use crate::permission::{self, Permissions};
+use atl_services_types::counters;
+use atl_services_types::permission::{self, Permissions};
 
 /// The interface name counters use.
 const INTERFACE: &str = "IContentService";
@@ -97,7 +97,7 @@ impl IContentService for ContentService {
     }
 
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        counters::unimplemented(INTERFACE, method)
+        crate::unimplemented(INTERFACE, method)
     }
 
     /// ContentService.registerContentObserver (:365-400). A null URI or observer is an IllegalArgumentException. The death link is set before the registration is kept, so a dead

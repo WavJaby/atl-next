@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use atl_services::display_model::DisplayModel;
+use atl_services_types::display_model::DisplayModel;
 
 use super::capture;
 use super::{ACK_WAIT, Liveness, Sub, await_event, opening_size, wait_for_line};

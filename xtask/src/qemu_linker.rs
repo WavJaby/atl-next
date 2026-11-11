@@ -24,7 +24,7 @@ use crate::qemu::{self, GUEST_API};
 use crate::qemu_spike;
 use crate::unit_use::{self, Echo, Units};
 use crate::verdict::{Failure, Verdict};
-use atl_broker::bwrap;
+use atl_bwrap as bwrap;
 
 const TESTDATA: &str = "xtask/testdata/qemu-linker";
 const PACKAGE: &str = "atl-native-bridge";

@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-use atl_services::packages::{
+use atl_services_types::packages::{
     ActivityDecl, InstrumentationDecl, IntentFilterDecl, Manifest, MetaValue, PermissionDecl,
     ProviderDecl, ReceiverDecl, SCREEN_ORIENTATION_UNSPECIFIED, UsesLibrary,
 };
@@ -1153,7 +1153,7 @@ mod tests {
     /// (manifest_flags' default test), and the activity's other boolean (`exported`) is kept as written but sets no flag.
     #[test]
     fn the_window_fixture_record() {
-        use atl_services::manifest_flags::{activity_flags, application_flags};
+        use atl_services_types::manifest_flags::{activity_flags, application_flags};
         let m = parse(WINDOW).expect("parse");
         assert_eq!(m.name, "com.example.atlwindow");
         assert_eq!((m.min_sdk, m.target_sdk), (21, 36));

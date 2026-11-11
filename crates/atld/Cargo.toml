@@ -13,10 +13,12 @@ atl-binderd = { path = "../atl-binderd" }
 atl-android-paths = { path = "../atl-android-paths" }
 atl-broker = { path = "../atl-broker" }
 atl-fonts = { path = "../atl-fonts" }
+atl-fonts-table = { path = "../atl-fonts-table" }
 atl-gralloc = { path = "../atl-gralloc" }
 atl-platform-host = { path = "../atl-platform-host" }
 atl-property-service = { path = "../atl-property-service" }
 atl-services = { path = "../atl-services" }
+atl-services-types = { path = "../atl-services-types" }
 clap.workspace = true
 md-5 = "0.11"
 pem-rfc7468 = { version = "1", features = ["alloc"] }

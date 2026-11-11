@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+use atl_fonts_table::parse_aliases;
 use atl_platform_host::{Face, FontError, FontQuery, FontSource};
 
 use super::*;
@@ -317,50 +318,4 @@ fn a_variable_family_takes_supported_axes_only_in_font_fallback() {
     // 100..900 step 100 inside wght 100..900 = 9 weights, x2 for ital 0/1
     assert_eq!(legacy.matches("<font ").count(), 18);
     assert!(legacy.contains("<font weight=\"700\" style=\"italic\" postScriptName=\"Roboto-Regular\">0/Roboto-Regular.ttf\n            <axis tag=\"wght\" stylevalue=\"700\"/>\n            <axis tag=\"ital\" stylevalue=\"1\"/>"));
-}
-
-#[test]
-fn the_tracked_table_matches_aosp_names() {
-    let t = table(FONTS_TOML);
-    // the ten named families of android-16.0.0_r1 frameworks/base/data/fonts/fonts.xml
-    let aosp: String = [
-        "casual",
-        "cursive",
-        "monospace",
-        "roboto-flex",
-        "sans-serif",
-        "sans-serif-condensed",
-        "sans-serif-smallcaps",
-        "serif",
-        "serif-monospace",
-        "source-sans-pro",
-    ]
-    .iter()
-    .map(|n| format!("<family name=\"{n}\">"))
-    .collect();
-    t.check_against_aosp(&aosp).expect("same names");
-    assert!(
-        t.check_against_aosp("<family name=\"sans-serif\">")
-            .is_err()
-    );
-}
-
-#[test]
-fn table_cross_references_are_checked() {
-    assert!(Table::parse("[serif]\nquery = \"serif\"\naccept = \"required\"\n").is_err()); // sans-serif not first
-    assert!(Table::parse("[sans-serif]\nquery = \"s\"\naccept = \"required\"\n[serif]\nquery = \"serif\"\naccept = \"differs\"\nfrom = \"nope\"\n").is_err());
-    assert!(
-        Table::parse(
-            "[sans-serif]\nquery = \"s\"\naccept = \"required\"\n[x]\nnone = \"r\"\nquery = \"q\"\n"
-        )
-        .is_err()
-    );
-}
-
-#[test]
-fn comments_outside_strings_are_stripped() {
-    assert_eq!(
-        strip_comments("{ \"a\": \"//x\" } // y"),
-        "{ \"a\": \"//x\" } \n"
-    );
 }

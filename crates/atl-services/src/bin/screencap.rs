@@ -21,8 +21,8 @@ use atl_aidl::aidl::android::gui::IScreenCaptureListener::{
     BnScreenCaptureListener, IScreenCaptureListener,
 };
 use atl_aidl::aidl::android::gui::ISurfaceComposer::ISurfaceComposer;
-use atl_services::compositor_registry::{GET_COMPOSER, SERVICE};
 use atl_services::registry_service::ICompositorRegistry;
+use atl_services_types::compositor_registry::{GET_COMPOSER, SERVICE};
 use binder::binder_impl::IBinderInternal;
 use binder::{BinderFeatures, ExceptionCode, ProcessState, SpIBinder, Status, Strong};
 use gui_aidl_types_rs::ScreenCaptureResults;

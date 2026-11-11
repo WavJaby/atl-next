@@ -11,8 +11,8 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use crate::packages::IntentFilterDecl;
-use crate::permission;
+use atl_services_types::packages::IntentFilterDecl;
+use atl_services_types::permission;
 
 /// Context.RECEIVER_EXPORTED / RECEIVER_NOT_EXPORTED (Context.java:781, :795).
 pub const RECEIVER_EXPORTED: i32 = 0x2;

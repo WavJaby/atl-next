@@ -26,8 +26,8 @@ use atl_libgui_parcel::wire::set_binder_key;
 use atl_parcelables::android::view::SurfaceControl_Transaction;
 use atl_parcelables::codecs::android::view::SurfaceControl_Transaction::TransactionObject;
 use atl_platform_ui::PresentTiming;
-use atl_services::counters;
-use atl_services::display_model::DisplayModel;
+use atl_services_types::counters;
+use atl_services_types::display_model::DisplayModel;
 use binder::binder_impl::{Binder, BorrowedParcel, TransactionCode};
 use binder::{
     BinderFeatures, Interface, SpIBinder, StatusCode, WpIBinder, declare_binder_interface,

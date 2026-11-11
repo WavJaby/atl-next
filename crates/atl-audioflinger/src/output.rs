@@ -14,7 +14,7 @@ use std::thread;
 use atl_audio_bridge::{Mix, MixCell, MixGuard, Track as Server};
 use atl_platform_ui::PlatformAudioHost;
 use atl_platform_ui::audio::{AudioHost, PcmOutput, PcmSpec};
-use atl_services::counters;
+use atl_services_types::counters;
 
 use crate::Options;
 

@@ -18,7 +18,7 @@ use atl_parcelables::android::os::Bundle;
 use binder::Strong;
 
 use crate::activity::log;
-use crate::counters;
+use atl_services_types::counters;
 
 const BQ: &str = "BroadcastQueue";
 /// ActivityManager.PROCESS_STATE_UNKNOWN: the reported process state, not tracked.

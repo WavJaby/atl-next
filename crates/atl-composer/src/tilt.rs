@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use atl_services::compositor_registry::TiltConfig;
+use atl_services_types::compositor_registry::TiltConfig;
 
 /// SensorManager.GRAVITY_EARTH.
 const GRAVITY: f32 = 9.806_65;

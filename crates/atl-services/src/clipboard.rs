@@ -7,8 +7,7 @@
 use atl_aidl::aidl::android::content::IClipboard::{BnClipboard, EnforcePermission, IClipboard};
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, ThreadState};
 
-use crate::counters;
-use crate::permission::Permissions;
+use atl_services_types::permission::Permissions;
 use std::sync::Arc;
 
 /// The interface name counters use.
@@ -45,7 +44,7 @@ impl IClipboard for ClipboardService {
     }
 
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        counters::unimplemented(INTERFACE, method)
+        crate::unimplemented(INTERFACE, method)
     }
 }
 

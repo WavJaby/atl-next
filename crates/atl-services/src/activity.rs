@@ -56,16 +56,17 @@ use crate::broadcast::{self, BroadcastFilter, Broadcasts, IntentKey, StickyRefus
 use crate::broadcast_queue::{self, Job};
 use crate::config_diff::{self, Config, Delivery};
 use crate::desktop_bounds::ActivityInput;
-use crate::display_model::DisplayModel;
-use crate::packages::{ActivityDecl, PackageRecord, Packages};
 use crate::pending_intent::{self, PendingIntents};
 use crate::pending_intent_table::Key;
-use crate::permission::{self, Permissions, ROOT_UID, SHELL_UID, SYSTEM_UID};
 use crate::process_control::ProcessControl;
 use crate::shared_memory::ApplicationSharedMemory;
-use crate::size_buckets::SizeBuckets;
 use crate::tasks::{TaskId, TaskSize, Tasks, initial_size};
-use crate::{counters, package, settings};
+use crate::{package, settings};
+use atl_services_types::counters;
+use atl_services_types::display_model::DisplayModel;
+use atl_services_types::packages::{ActivityDecl, PackageRecord, Packages};
+use atl_services_types::permission::{self, Permissions, ROOT_UID, SHELL_UID, SYSTEM_UID};
+use atl_services_types::size_buckets::SizeBuckets;
 
 const AM: &str = "IActivityManager";
 const ACC: &str = "IActivityClientController";
@@ -1215,7 +1216,7 @@ impl IActivityManager for ActivityManager {
     }
 
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        counters::unimplemented(AM, method)
+        crate::unimplemented(AM, method)
     }
 
     /// ActivityManagerService.checkPermissionForDevice (:6193-6200) -> checkComponentPermission: the install-time grants of `uid`'s packages (permission::check, rule A); one device.
@@ -1353,10 +1354,13 @@ impl IActivityManager for ActivityManager {
             .as_binder()
             .link_to_death(&mut death)
             .map_err(|e| illegal_state(&format!("linkToDeath: {e:?}")))?;
-        let core_settings = match crate::gl_driver::selection(inner.packages.all()) {
+        let core_settings = match atl_services_types::gl_driver::selection(inner.packages.all()) {
             Some((pkgs, values)) => Bundle::from_strings(&[
-                (crate::gl_driver::SELECTION_PKGS, pkgs.as_str()),
-                (crate::gl_driver::SELECTION_VALUES, values.as_str()),
+                (atl_services_types::gl_driver::SELECTION_PKGS, pkgs.as_str()),
+                (
+                    atl_services_types::gl_driver::SELECTION_VALUES,
+                    values.as_str(),
+                ),
             ]),
             None => Bundle::default(),
         };
@@ -1557,13 +1561,13 @@ impl IActivityManager for ActivityManager {
         }
         let no_restart = flags & INSTR_FLAG_NO_RESTART != 0;
         if flags & INSTR_FLAG_NO_RESTART != 0 {
-            return Err(counters::unimplemented(
+            return Err(crate::unimplemented(
                 AM,
                 "startInstrumentation (INSTR_FLAG_NO_RESTART)",
             ));
         }
         if flags >> 5 != 0 {
-            return Err(counters::unimplemented(
+            return Err(crate::unimplemented(
                 AM,
                 "startInstrumentation (INSTR_FLAG_INSTRUMENT_SDK_SANDBOX)",
             ));
@@ -1782,7 +1786,7 @@ impl IActivityManager for ActivityManager {
             )));
         }
         if kind == pending_intent::INTENT_SENDER_ACTIVITY_RESULT {
-            return Err(counters::unimplemented(
+            return Err(crate::unimplemented(
                 AM,
                 "getIntentSenderWithFeature (activity result)",
             ));
@@ -2138,15 +2142,13 @@ struct ReportedBuckets {
 }
 
 /// The parcelable's thresholds, as size_buckets.rs reads them.
-impl From<&SizeConfigurationBuckets> for SizeBuckets {
-    fn from(b: &SizeConfigurationBuckets) -> Self {
-        SizeBuckets {
-            horizontal: b.horizontal.clone(),
-            vertical: b.vertical.clone(),
-            smallest: b.smallest.clone(),
-            screen_layout_size: b.screen_layout_size.clone(),
-            screen_layout_long_set: b.screen_layout_long_set,
-        }
+fn buckets_of(b: &SizeConfigurationBuckets) -> SizeBuckets {
+    SizeBuckets {
+        horizontal: b.horizontal.clone(),
+        vertical: b.vertical.clone(),
+        smallest: b.smallest.clone(),
+        screen_layout_size: b.screen_layout_size.clone(),
+        screen_layout_long_set: b.screen_layout_long_set,
     }
 }
 
@@ -2182,7 +2184,7 @@ impl Interface for ActivityClientController {}
 
 impl IActivityClientController for ActivityClientController {
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        counters::unimplemented(ACC, method)
+        crate::unimplemented(ACC, method)
     }
 
     /// ActivityClientController.activityResumed:200-206 -> ActivityRecord.activityResumedLocked:6173, which finds the record by token, then clears its saved state, sets its splash-exit
@@ -2305,7 +2307,7 @@ impl IActivityClientController for ActivityClientController {
             return Ok(());
         };
         counters::answered(ACC, "reportSizeConfigurations (kept per activity)");
-        self.buckets.set(token, sizes.map(SizeBuckets::from));
+        self.buckets.set(token, sizes.map(buckets_of));
         Ok(())
     }
 

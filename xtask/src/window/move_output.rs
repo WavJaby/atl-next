@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use atl_services::display_model::DisplayModel;
+use atl_services_types::display_model::DisplayModel;
 
 use super::{
     ACK_WAIT, CREATE_LINE, DRAW_LINE, INPUT_SETTLE, Liveness, RELAUNCH_COUNTER, RELAUNCHED_COUNTER,

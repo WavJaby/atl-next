@@ -6,7 +6,7 @@ use atl_audioflinger_stubs::aidl::android::media::IAudioPolicyService::{
     BnAudioPolicyService, IAudioPolicyService,
 };
 use atl_audioflinger_stubs::aidl::android::media::IAudioPolicyServiceClient::IAudioPolicyServiceClient;
-use atl_services::counters;
+use atl_services_types::counters;
 use binder::{BinderFeatures, Interface, SpIBinder, Status, Strong};
 
 use crate::flinger::output_handle;
@@ -23,7 +23,7 @@ impl Interface for AudioPolicy {}
 #[allow(non_snake_case, reason = "AOSP's AIDL method names")]
 impl IAudioPolicyService for AudioPolicy {
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        counters::unimplemented(INTERFACE, method)
+        atl_services::unimplemented(INTERFACE, method)
     }
 
     /// AudioPolicyService::getOutput: the one output, for every stream (no routing policy yet).

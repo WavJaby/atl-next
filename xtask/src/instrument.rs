@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, ensure};
 
-use atl_services::packages::Library;
+use atl_services_types::packages::Library;
 
 use crate::atld_run::{Run, Runtime, Shell, counter_lines};
 use crate::manifest;
@@ -106,7 +106,7 @@ enum Expect {
 struct Case<'a> {
     label: &'a str,
     apk: PathBuf,
-    manifest: atl_services::packages::Manifest,
+    manifest: atl_services_types::packages::Manifest,
     runner: &'a str,
     class: &'a str,
     expect: Expect,

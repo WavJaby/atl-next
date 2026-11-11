@@ -140,6 +140,7 @@ dependencies = [
  "atl-platform-ui",
  "atl-service-view",
  "atl-services",
+ "atl-services-types",
  "rustix",
  "tracing",
 ]
@@ -203,6 +204,7 @@ version = "0.0.0"
 dependencies = [
  "atl-android-paths",
  "atl-binderd",
+ "atl-bwrap",
  "libc",
  "object",
  "rustix",
@@ -210,6 +212,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "atl-bwrap"
+version = "0.0.0"
 
 [[package]]
 name = "atl-codec-store"
@@ -240,6 +246,7 @@ dependencies = [
  "atl-scene-buffer",
  "atl-service-view",
  "atl-services",
+ "atl-services-types",
  "rustix",
  "tracing",
 ]
@@ -303,10 +310,18 @@ version = "0.0.0"
 name = "atl-fonts"
 version = "0.0.0"
 dependencies = [
+ "atl-fonts-table",
  "atl-platform-host",
  "icu_locale",
  "read-fonts",
  "roxmltree",
+ "thiserror",
+]
+
+[[package]]
+name = "atl-fonts-table"
+version = "0.0.0"
+dependencies = [
  "serde",
  "serde_json",
  "thiserror",
@@ -600,7 +615,7 @@ dependencies = [
  "anyhow",
  "atl-aidl",
  "atl-bridgegen",
- "atl-services",
+ "atl-services-types",
  "cxx",
  "cxx-build",
 ]
@@ -619,8 +634,18 @@ dependencies = [
  "atl-libgui-parcel",
  "atl-libinput",
  "atl-platform-host",
+ "atl-services-types",
  "clap",
  "rustix",
+ "serde_json",
+]
+
+[[package]]
+name = "atl-services-types"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atl-android-paths",
  "serde",
  "serde_json",
  "toml",
@@ -636,10 +661,12 @@ dependencies = [
  "atl-binderd",
  "atl-broker",
  "atl-fonts",
+ "atl-fonts-table",
  "atl-gralloc",
  "atl-platform-host",
  "atl-property-service",
  "atl-services",
+ "atl-services-types",
  "clap",
  "md-5",
  "pem-rfc7468",
@@ -2568,16 +2595,16 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "atl-android-paths",
- "atl-binderd",
  "atl-bridgegen",
  "atl-broker",
+ "atl-bwrap",
  "atl-cpu-pressure",
- "atl-fonts",
+ "atl-fonts-table",
  "atl-gralloc",
  "atl-layout",
  "atl-native-bridge",
  "atl-platform-host",
- "atl-services",
+ "atl-services-types",
  "clap",
  "object",
  "png",

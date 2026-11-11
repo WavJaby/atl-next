@@ -8,7 +8,7 @@
 //! * Source SOURCE_KEYBOARD, device KEYBOARD (input_devices), flags FLAG_FROM_SYSTEM (every reader-made key event carries it).
 
 use atl_platform_ui::{KeyEvent, Locks};
-use atl_services::input_devices::{KEYBOARD, SOURCE_KEYBOARD};
+use atl_services_types::input_devices::{KEYBOARD, SOURCE_KEYBOARD};
 
 /// KeyEvent actions (NDK input.h AKEY_EVENT_ACTION_*).
 pub const ACTION_DOWN: i32 = 0;

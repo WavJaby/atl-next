@@ -3,7 +3,7 @@
 //! DISPLAY_SERVICE / WINDOW_SERVICE / INPUT_METHOD_SERVICE name them) and the compositor registry (compositor_registry.rs: how an app's in-process SurfaceFlinger gets registered) and serves them on libbinder's thread pool, until killed. Runs as the system uid: servicemanager accepts addService from it. The packages come
 //! from a record file (atld's install step writes it), the shared libraries and the display from arguments (`--display`: display_model.rs; omitted, the model's default). Processes are started
 //! and killed through the control connection atld passes as stdin ([`atl_services::process_control`]).
-//! Prints `services: ready` once all are registered; unimplemented calls are counted on stderr (atl_services::counters).
+//! Prints `services: ready` once all are registered; unimplemented calls are counted on stderr (atl_services_types::counters).
 
 // the converter's rlib, on the crate search path build.rs sets (no cargo dependency names it)
 extern crate binder;
@@ -17,19 +17,19 @@ use anyhow::{Context, Result, bail};
 use atl_aidl::aidl::android::app::IActivityManager::BnActivityManager;
 use atl_aidl::aidl::android::content::pm::IPackageManager::BnPackageManager;
 use atl_services::activity::ActivityManager;
-use atl_services::compositor_registry;
-use atl_services::display_model::DisplayModel;
 use atl_services::package::PackageManager;
-use atl_services::packages::{Library, PackageRecord, Packages};
-use atl_services::permission::Permissions;
 use atl_services::process_control::ControlSocket;
 use atl_services::ui_agent::UiAgents;
+use atl_services_types::compositor_registry;
+use atl_services_types::display_model::DisplayModel;
+use atl_services_types::packages::{Library, PackageRecord, Packages};
+use atl_services_types::permission::Permissions;
 use binder::{BinderFeatures, ProcessState};
 use clap::Parser;
 
 #[derive(Parser)]
 struct Args {
-    /// The installed packages: a JSON array of `PackageRecord`s (atl_services::packages), paths as the app processes see them.
+    /// The installed packages: a JSON array of `PackageRecord`s (atl_services_types::packages), paths as the app processes see them.
     #[arg(long)]
     packages: PathBuf,
     /// A shared library an app may `<uses-library>`: `<name>=<jar path as the app processes see it>[,<dependency name>...]` (repeat). SystemConfig's `<library name file dependency>`.

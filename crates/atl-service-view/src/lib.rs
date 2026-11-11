@@ -28,7 +28,7 @@ use atl_aidl::aidl::android::os::IServiceManager::{BnServiceManager, IServiceMan
 use atl_aidl::aidl::android::os::Service::Service;
 use atl_aidl::aidl::android::os::ServiceDebugInfo::ServiceDebugInfo;
 use atl_aidl::aidl::android::os::ServiceWithMetadata::ServiceWithMetadata;
-use atl_services::counters;
+use atl_services_types::counters;
 use binder::unstable_api::{AsNative, new_spibinder};
 use binder::{BinderFeatures, ExceptionCode, FromIBinder, SpIBinder, Status, StatusCode, Strong};
 

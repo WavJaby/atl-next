@@ -7,7 +7,7 @@
 //! * Source SOURCE_TOUCHSCREEN, TOOL_TYPE_FINGER, pressure 1, cursor NaN (a touchscreen hit-tests at its pointer: MotionEvent.getXDispatchLocation reads the cursor only for SOURCE_MOUSE).
 
 use atl_platform_ui::{PhysPoint, TouchEvent, TouchPhase};
-use atl_services::input_devices::{SOURCE_TOUCHSCREEN, TOUCHSCREEN};
+use atl_services_types::input_devices::{SOURCE_TOUCHSCREEN, TOUCHSCREEN};
 
 use super::pointer::{
     ACTION_DOWN, ACTION_MOVE, ACTION_UP, AXIS_PRESSURE, Motion, MotionPointer, TOOL_TYPE_FINGER,

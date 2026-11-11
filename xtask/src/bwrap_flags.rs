@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Step `bwrap-flags` of `xtask check`: bwrap flag literals live only in atl-broker's bwrap.rs (the argv builder), so every sandbox argv is built through it and a flag's meaning has one home.
+//! Step `bwrap-flags` of `xtask check`: bwrap flag literals live only in crate atl-bwrap (the argv builder), so every sandbox argv is built through it and a flag's meaning has one home.
 //! Flags = the `--name` literals of bwrap.rs itself (derived, not listed here). A finding = a string literal elsewhere whose first whitespace-separated token is one of them (a flag inside another command's text, `mount --bind`, is not bwrap's), in any `.rs` file the next commit can contain (spdx.rs `candidate_files`); literals are read as android_paths.rs reads them.
 //! Exempt: this file and the functions in [`EXEMPT`], each with its reason -- chiefly the golden argv tests, expected values written from the sandbox spec that must not be built by the code under test. A row whose function holds no flag literal fails (stale).
 
@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::android_paths::literals;
 
-const BUILDER: &str = "crates/atl-broker/src/bwrap.rs";
+const BUILDER: &str = "crates/atl-bwrap/src/lib.rs";
 const SELF: &str = "xtask/src/bwrap_flags.rs";
 /// (file, function, reason) allowed to hold a flag literal.
 const EXEMPT: &[(&str, &str, &str)] = &[
@@ -110,7 +110,7 @@ fn judge(found: &[(String, usize, String, String)], exempt: &[(&str, &str, &str)
             Some(g) => {
                 used.insert(*g);
             }
-            None => fails.push(format!("{f}:{line}: bwrap flag literal {l:?} outside {BUILDER}: build the argv with atl_broker::bwrap::Args")),
+            None => fails.push(format!("{f}:{line}: bwrap flag literal {l:?} outside {BUILDER}: build the argv with atl_bwrap::Args")),
         }
     }
     for g in exempt {

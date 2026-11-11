@@ -21,7 +21,7 @@ const WANT: ABI = ABI::V6;
 /// Exit status when the sandbox cannot be set up (bad arguments, no Landlock, exec failed).
 const SETUP_FAILED: u8 = 2;
 
-/// What a path is granted, one flag each (atl-broker's `bwrap::Access`).
+/// What a path is granted, one flag each (atl-bwrap's `Access`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Grant {
     Ro,

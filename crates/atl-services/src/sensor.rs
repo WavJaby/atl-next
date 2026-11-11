@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 use atl_platform_host::{Accelerometer, SampleStream, Sensors};
 use rustix::net::{AddressFamily, SendFlags, SocketFlags, SocketType};
 
-use crate::counters;
 use crate::focus::FocusedProcess;
+use atl_services_types::counters;
 
 /// `ASensorEvent` as clang lays it out from the pinned android/sensor.h (build.rs).
 #[allow(clippy::all)]

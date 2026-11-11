@@ -20,8 +20,8 @@ use atl_android_paths::{DATA_APP, DATA_USER, DATA_USER_DE};
 use atl_broker::control::{self, Request, Response};
 use atl_broker::{Broker, Process};
 use atl_layout::Layout;
-use atl_services::native_libs::LIB_DIR_NAME;
-use atl_services::packages::{ActivityDecl, InstrumentationDecl, Manifest, PackageRecord};
+use atl_services_types::native_libs::LIB_DIR_NAME;
+use atl_services_types::packages::{ActivityDecl, InstrumentationDecl, Manifest, PackageRecord};
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 
 use crate::atld_run::without_stamp;
@@ -49,7 +49,7 @@ const CLIENT_LIMIT: Duration = Duration::from_secs(20);
 /// What `service call` prints for a reply of exactly status 0 and an int32 0 (false, or a null parcelable's flag): Parcel's text dump (libs/binder TextOutput), words then their
 /// characters, as measured 2026-11-03; the closing `'...')` pins the length to those two words.
 const REPLY_OK_ZERO: &str = "Result: Parcel(\t00000000 00000000   '........')";
-/// Counter lines the client runs must produce (atl_services::counters): getProcessLimit (app run) and getMoveStatus (system run, past the permission hook).
+/// Counter lines the client runs must produce (atl_services_types::counters): getProcessLimit (app run) and getMoveStatus (system run, past the permission hook).
 const MUST_COUNT: &[&str] = &[
     "services: unimplemented IActivityManager.getProcessLimit 1",
     "services: unimplemented IPackageManager.getMoveStatus 1",
@@ -171,7 +171,7 @@ pub fn stage(
                 task_affinity: None,
                 process: None,
                 meta_data: vec![],
-                screen_orientation: atl_services::packages::SCREEN_ORIENTATION_UNSPECIFIED,
+                screen_orientation: atl_services_types::packages::SCREEN_ORIENTATION_UNSPECIFIED,
                 resizeable: true,
                 min_aspect_ratio: None,
                 max_aspect_ratio: None,
@@ -197,7 +197,7 @@ pub fn stage(
         data_dir: format!("{DATA_USER}/0/{APP}"),
         device_protected_data_dir: format!("{DATA_USER_DE}/0/{APP}"),
         granted_permissions: vec![],
-        gl_driver: atl_services::gl_driver::GlDriver::Native,
+        gl_driver: atl_services_types::gl_driver::GlDriver::Native,
     };
     let packages_file = test_root.join("packages.json");
     std::fs::write(&packages_file, serde_json::to_vec_pretty(&[&record])?)?;

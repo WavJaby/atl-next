@@ -33,10 +33,11 @@ use binder::{
     BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, StatusCode, Strong, ThreadState,
 };
 
-use crate::permission::Permissions;
+use crate::activity;
 use crate::tasks::{Placement, TaskId, TaskSize, Tasks};
 use crate::ui_agent::{IUiAgent, UiAgents};
-use crate::{activity, counters};
+use atl_services_types::counters;
+use atl_services_types::permission::Permissions;
 
 /// The interface names counters use.
 const WINDOW_MANAGER: &str = "IWindowManager";
@@ -258,7 +259,7 @@ impl IWindowManager for WindowManager {
     }
 
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        counters::unimplemented(WINDOW_MANAGER, method)
+        crate::unimplemented(WINDOW_MANAGER, method)
     }
 
     /// WindowManagerService.hasNavigationBar:6669-6677, for the one display: false (see the module doc).
@@ -421,7 +422,7 @@ fn open_input_pair() -> Result<(OwnedFd, OwnedFd), StatusCode> {
 
 impl IWindowSession for Session {
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        counters::unimplemented(WINDOW_SESSION, method)
+        crate::unimplemented(WINDOW_SESSION, method)
     }
 
     /// WindowManagerService.addWindow for a window of the one display: the window is recorded by its client binder and its Task (the activity its `attrs.token` names); a window that takes
@@ -855,7 +856,7 @@ pub fn notify_resized(tasks: &Tasks<SpIBinder>, task: TaskId) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::display_model::DisplayModel;
+    use atl_services_types::display_model::DisplayModel;
 
     /// The missing-Task path: no size is refused (BAD_VALUE) and counted, never a panic; a created Task answers its size.
     #[test]

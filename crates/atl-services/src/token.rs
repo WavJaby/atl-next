@@ -4,7 +4,7 @@
 use binder::binder_impl::{Binder, BorrowedParcel, TransactionCode};
 use binder::{BinderFeatures, Interface, SpIBinder, StatusCode, declare_binder_interface};
 
-use crate::counters;
+use atl_services_types::counters;
 
 pub trait IToken: Interface {}
 

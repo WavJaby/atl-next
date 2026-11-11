@@ -6,7 +6,7 @@ use std::os::fd::OwnedFd;
 
 use atl_compositor::callbacks::LISTENER_DESCRIPTOR;
 use atl_libgui_parcel::parcel::WireParcel;
-use atl_services::counters;
+use atl_services_types::counters;
 use binder::binder_impl::{Binder, BorrowedParcel, FLAG_ONEWAY, IBinderInternal, TransactionCode};
 use binder::{Interface, SpIBinder, StatusCode, Strong, declare_binder_interface};
 

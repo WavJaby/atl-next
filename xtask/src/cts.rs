@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, ensure};
 use atl_layout::Layout;
-use atl_services::packages::{InstrumentationDecl, Manifest};
+use atl_services_types::packages::{InstrumentationDecl, Manifest};
 
 use crate::atld_run::{Run, Runtime, counters};
 use crate::cts_report::{self, Module, Report, State};

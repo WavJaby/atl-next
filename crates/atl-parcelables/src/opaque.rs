@@ -39,7 +39,7 @@ pub fn refused() -> Vec<(&'static str, u64)> {
     map.iter().map(|(k, v)| (*k, *v)).collect()
 }
 
-/// The wall clock as logcat stamps lines (`secs.mmm`), the same as atl_services::counters::wall_stamp: atl-parcelables sits below atl-services and cannot call it.
+/// The wall clock as logcat stamps lines (`secs.mmm`), the same as atl_services_types::counters::wall_stamp: atl-parcelables sits below atl-services and cannot call it.
 fn wall_stamp() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

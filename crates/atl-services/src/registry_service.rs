@@ -13,16 +13,16 @@ use binder::{
 };
 
 use crate::activity::ActivityManager;
-use crate::compositor_registry::{
-    DESCRIPTOR, GET_COMPOSER, REGISTER, SET_BOUNDS, SET_DISPLAY, TASK_INFO,
-};
-use crate::counters;
 use crate::desktop_bounds::ActivityInput;
 use crate::display::DisplayCallbacks;
-use crate::display_model::DisplayModel;
-use crate::permission::{SHELL_UID, SYSTEM_UID};
 use crate::tasks::{TaskId, TaskSize, Tasks, initial_size};
 use crate::ui_agent::UiAgents;
+use atl_services_types::compositor_registry::{
+    DESCRIPTOR, GET_COMPOSER, REGISTER, SET_BOUNDS, SET_DISPLAY, TASK_INFO,
+};
+use atl_services_types::counters;
+use atl_services_types::display_model::DisplayModel;
+use atl_services_types::permission::{SHELL_UID, SYSTEM_UID};
 
 /// The interface name counters use.
 const INTERFACE: &str = "ICompositorRegistry";

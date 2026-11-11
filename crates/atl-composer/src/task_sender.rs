@@ -8,8 +8,8 @@
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use atl_platform_ui::PhysSize;
-use atl_services::compositor_registry::{SERVICE, SET_BOUNDS, SET_DISPLAY};
-use atl_services::display_model::DisplayModel;
+use atl_services_types::compositor_registry::{SERVICE, SET_BOUNDS, SET_DISPLAY};
+use atl_services_types::display_model::DisplayModel;
 use binder::binder_impl::IBinderInternal;
 use binder::{SpIBinder, Strong};
 

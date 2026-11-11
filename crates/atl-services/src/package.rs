@@ -19,12 +19,12 @@ use atl_parcelables::java::util::Map;
 use atl_parcelables::parts::{ComponentInfo, PackageItemInfo, SharedLibraryInfo};
 use binder::{ExceptionCode, Interface, Status, ThreadState};
 
-use crate::packages::{
+use atl_services_types::manifest_flags;
+use atl_services_types::packages::{
     ActivityDecl, InstrumentationDecl, LibraryNode, MetaValue, PackageRecord, Packages,
     ProviderDecl,
 };
-use crate::permission::{self, Permissions};
-use crate::{counters, manifest_flags};
+use atl_services_types::permission::{self, Permissions};
 
 /// The interface name counters use.
 const INTERFACE: &str = "IPackageManager";
@@ -309,7 +309,7 @@ impl IPackageManager for PackageManager {
     }
 
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        counters::unimplemented(INTERFACE, method)
+        crate::unimplemented(INTERFACE, method)
     }
 
     /// ComputerEngine.getApplicationInfo:986: null for a package the caller may not see or that does not exist.
@@ -512,7 +512,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::packages::Manifest;
+    use atl_services_types::packages::Manifest;
 
     fn activity(name: &str, meta_data: Vec<(String, MetaValue)>) -> ActivityDecl {
         ActivityDecl {
@@ -525,7 +525,7 @@ mod tests {
             task_affinity: None,
             process: None,
             meta_data,
-            screen_orientation: crate::packages::SCREEN_ORIENTATION_UNSPECIFIED,
+            screen_orientation: atl_services_types::packages::SCREEN_ORIENTATION_UNSPECIFIED,
             resizeable: true,
             min_aspect_ratio: None,
             max_aspect_ratio: None,
@@ -574,7 +574,7 @@ mod tests {
             data_dir: String::new(),
             device_protected_data_dir: String::new(),
             granted_permissions: vec![],
-            gl_driver: crate::gl_driver::GlDriver::Native,
+            gl_driver: atl_services_types::gl_driver::GlDriver::Native,
         }
     }
 

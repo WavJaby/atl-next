@@ -29,6 +29,7 @@ atl-libinput = { path = "../atl-libinput" }
 atl-platform-ui = { path = "../atl-platform-ui" }
 atl-scene-buffer = { path = "../atl-scene-buffer" }
 atl-services = { path = "../atl-services" }
+atl-services-types = { path = "../atl-services-types" }
 atl-service-view = { path = "../atl-service-view" }
 rustix.workspace = true
 tracing.workspace = true

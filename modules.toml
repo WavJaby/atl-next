@@ -29,7 +29,7 @@ uses = ["bionic"]
 # atl-sandbox-stub: the in-child stage bwrap runs before the program (Landlock, then exec); atl-sandbox-probe: what an app process reaches (`xtask test sandbox`)
 crates = ["atl-broker", "atl-sandbox-stub", "atl-sandbox-probe"]
 exports = ["atl-broker"]
-uses = ["binder", "android-paths"]
+uses = ["binder", "android-paths", "bwrap"]
 
 # the Android filesystem layout inside the sandbox: the only home of Android path literals (xtask check step android-paths)
 [android-paths]
@@ -39,7 +39,7 @@ exports = ["atl-android-paths"]
 # M2 wiring: binderd, servicemanager, the services and the apps, each a process started through the broker; serves the services' process control; the install step reads the package records (services' plain types); the VINTF manifests declare the graphics HALs (gralloc's definitions); the system font files come from the desktop's fonts (fonts)
 [atld]
 crates = ["atld"]
-uses = ["binder", "broker", "gralloc", "platform-host", "property-service", "services", "android-paths", "fonts"]
+uses = ["binder", "broker", "gralloc", "platform-host", "property-service", "services", "services-types", "android-paths", "fonts", "fonts-table"]
 
 # the user's launch surface (plan gpu-selection S2.5): `run --gpu`, the per-app GPU preference, the `.desktop` writer; it execs the ATL command (or switcherooctl) and links no ATL crate
 [launch]
@@ -54,7 +54,7 @@ uses = ["generators", "bionic", "composer", "platform-ui", "service-view", "audi
 [service-view]
 crates = ["atl-service-view"]
 exports = ["atl-service-view"]
-uses = ["aidl", "generators", "services"]
+uses = ["aidl", "generators", "services-types"]
 
 # the extractor plugins of the app process (audio M1): AOSP's MediaExtractorFactory::LoadExtractors, the call only the media.extractor service makes; cxx forwarder in wrap/extractors.cpp
 [media-extractors]
@@ -84,7 +84,7 @@ uses = ["service-view", "generators"]
 [audioflinger]
 crates = ["atl-audioflinger"]
 exports = ["atl-audioflinger"]
-uses = ["service-view", "services", "generators", "audio-bridge", "platform-ui"]
+uses = ["service-view", "services", "services-types", "generators", "audio-bridge", "platform-ui"]
 
 # AOSP's server side of a track (ServerProxy over the mapped control block and buffer) and its mixer (AudioMixerBase), through cxx (wrap/mix.cpp): the boundary crate for atl-audioflinger's data plane (audio A2); libaudioclient and libaudioprocessing_base from the converter
 [audio-bridge]
@@ -96,7 +96,7 @@ uses = ["generators"]
 [composer]
 crates = ["atl-composer"]
 exports = ["atl-composer"]
-uses = ["aidl", "compositor", "libgui-parcel", "ime", "libinput", "platform-ui", "scene-buffer", "services", "generators", "android-paths", "service-view", "gralloc"]
+uses = ["aidl", "compositor", "libgui-parcel", "ime", "libinput", "platform-ui", "scene-buffer", "services", "services-types", "generators", "android-paths", "service-view", "gralloc"]
 
 # framework natives (libandroid_runtime) ATL implements itself instead of building their AOSP sources
 [android-runtime]
@@ -115,7 +115,7 @@ crates = ["atl-services"]
 # the package record types (plain Rust, no converter) are what atld installs and xtask writes
 exports = ["atl-services"]
 # libgui-parcel: finishDrawing frames the post-draw Transaction with libgui's reader to forward it (window.rs); platform-host: the sensor service reads the machine's accelerometers through it (sensor.rs); gralloc: atl-screencap reads the captured buffer's dma-buf (screencap.rs)
-uses = ["aidl", "generators", "broker", "libinput", "android-paths", "libgui-parcel", "platform-host", "gralloc"]
+uses = ["aidl", "generators", "broker", "libinput", "android-paths", "libgui-parcel", "platform-host", "gralloc", "services-types"]
 
 # AOSP libinput as the converter builds it, reached through cxx adapters (wrap/input.cpp): the input publisher and the virtual keyboard's KeyCharacterMap; C++ only as the adapters the project CLAUDE.md allows
 [libinput]
@@ -173,7 +173,7 @@ exports = ["atl-platform-types"]
 [fonts]
 crates = ["atl-fonts"]
 exports = ["atl-fonts"]
-uses = ["platform-host"]
+uses = ["platform-host", "fonts-table"]
 
 # the host half of the platform layer (plan S1 `atl-platform-host`): the desktop's monitors and fonts as atld and xtask read them (refresh rate so far); the GDK implementation is the second crate deny.toml lets depend on GTK
 [platform-host]
@@ -228,7 +228,25 @@ exports = ["atl-layout"]
 crates = ["atl-cpu-pressure"]
 exports = ["atl-cpu-pressure"]
 
+# definition crates below (no build script, no runtime crate): shared by the product and xtask, so the bootstrap tool builds without the product
+# bubblewrap's argv, spelled once (F1.1): the broker's sandbox profiles and xtask's build-tree namespace
+[bwrap]
+crates = ["atl-bwrap"]
+exports = ["atl-bwrap"]
+
+# the system services' plain types and policy: package records, manifest flags, GL driver owners, display model, registry names, uid identity and permission rules, the unimplemented-method counters
+[services-types]
+crates = ["atl-services-types"]
+exports = ["atl-services-types"]
+# android-paths: a test checks a record path against the guest layout (dev-dependency)
+uses = ["android-paths"]
+
+# the font tables: fonts.toml and AOSP's alias / fallback-order JSON, parsed and checked
+[fonts-table]
+crates = ["atl-fonts-table"]
+exports = ["atl-fonts-table"]
+
 [xtask]
 crates = ["xtask"]
-# binder: `xtask test binder` registers processes with atl-binderd as the broker will; broker: its control protocol, served by the same test; services: the package manifest records xtask writes for atld; gralloc: the VINTF declarations and mapper library name the gralloc gate and atld share; native-bridge: its library name, staged for atld runs, and its `isSupported` classifier the jni-fixture gate runs on the fixture; android-paths: the guest paths of the records it writes and the roots its android-paths check step scans for; fonts: the tables step checks fonts.toml, the font gate reads the pinned fonts' tables; cpu-pressure: the cadence window's starvation share (judge_window); generators: the aarch64 thunk-pool emitter (atl_bridgegen::aarch64) writes the QEMU spike fixture's pool, and the spike check reads it back
-uses = ["layout", "binder", "broker", "services", "gralloc", "platform-host", "native-bridge", "android-paths", "fonts", "cpu-pressure", "generators"]
+# broker: its control protocol, mounts and launcher, used by the runtime gates; bwrap: the build-tree namespace's argv (tree.rs); services-types: the package manifest records xtask writes for atld, and gl-drivers.toml's parser (step tables); gralloc: the VINTF declarations and mapper library name the gralloc gate and atld share; native-bridge: its library name, staged for atld runs, and its `isSupported` classifier the jni-fixture gate runs on the fixture; android-paths: the guest paths of the records it writes and the roots its android-paths check step scans for; fonts-table: the tables step checks fonts.toml; cpu-pressure: the cadence window's starvation share (judge_window); generators: the aarch64 thunk-pool emitter (atl_bridgegen::aarch64) writes the QEMU spike fixture's pool, and the spike check reads it back
+uses = ["layout", "broker", "bwrap", "services-types", "gralloc", "platform-host", "native-bridge", "android-paths", "fonts-table", "cpu-pressure", "generators"]

@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use atl_layout::Layout;
-use atl_services::display_model::DisplayModel;
+use atl_services_types::display_model::DisplayModel;
 
 use crate::atld_run::{Run, Runtime, Shell, counter_lines, run_display};
 use crate::manifest;
@@ -411,7 +411,7 @@ fn good_services() -> String {
 
 /// atl-composer start's line once both services are in the process's service view.
 fn served_line() -> String {
-    use atl_services::compositor_registry::{SURFACE_FLINGER, SURFACE_FLINGER_AIDL};
+    use atl_services_types::compositor_registry::{SURFACE_FLINGER, SURFACE_FLINGER_AIDL};
     format!("composer: serving {SURFACE_FLINGER}, {SURFACE_FLINGER_AIDL} in-process")
 }
 

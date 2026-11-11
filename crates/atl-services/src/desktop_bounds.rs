@@ -4,7 +4,7 @@
 //! Not modelled: caption height (`:85-87`; maximise runs with 0), user min-aspect and compat-change overrides (DesktopAppCompatAspectRatioPolicy.getMinAspectRatio), fullscreen and windowLayout overrides, ActivityOptions launch bounds, and per-app universal resizability (ActivityRecord.isUniversalResizeable, ActivityRecord.java:3113-3126).
 //! Position: the centred rect of AOSP's rule. xdg-shell gives a client no toplevel position, so the compositor places the window and this origin only records the Task's bounds.
 
-use crate::packages::{
+use atl_services_types::packages::{
     ActivityDecl, SCREEN_ORIENTATION_LANDSCAPE, SCREEN_ORIENTATION_PORTRAIT,
     SCREEN_ORIENTATION_REVERSE_LANDSCAPE, SCREEN_ORIENTATION_REVERSE_PORTRAIT,
     SCREEN_ORIENTATION_SENSOR_LANDSCAPE, SCREEN_ORIENTATION_SENSOR_PORTRAIT,

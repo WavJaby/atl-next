@@ -18,7 +18,7 @@ use atl_parcelables::parts::Part;
 use binder::binder_impl::{Binder, BorrowedParcel, IBinderInternal, TransactionCode};
 use binder::{Interface, ParcelFileDescriptor, SpIBinder, StatusCode, declare_binder_interface};
 
-use crate::counters;
+use atl_services_types::counters;
 
 /// The interface descriptor.
 pub const DESCRIPTOR: &str = "atl.IUiAgent";

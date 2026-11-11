@@ -29,11 +29,11 @@ use crate::activity::{
 use crate::activity_stack::{Command, Machine, ResultTo, Step};
 use crate::activity_start::{self, Call, Refusal, Source, Start, Target};
 use crate::config_diff::Config;
-use crate::counters;
-use crate::manifest_flags;
-use crate::packages::{ActivityDecl, Packages};
 use crate::tasks::{TaskId, Tasks};
 use crate::token;
+use atl_services_types::counters;
+use atl_services_types::manifest_flags;
+use atl_services_types::packages::{ActivityDecl, Packages};
 
 const ATM: &str = "IActivityTaskManager";
 
@@ -640,7 +640,7 @@ impl Interface for ActivityTaskService {}
 
 impl IActivityTaskManager for ActivityTaskService {
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        counters::unimplemented(ATM, method)
+        crate::unimplemented(ATM, method)
     }
 
     fn r#startActivity(

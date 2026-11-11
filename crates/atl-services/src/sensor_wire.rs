@@ -9,10 +9,10 @@ use std::sync::Arc;
 use binder::binder_impl::{Binder, BorrowedParcel, IBinderInternal, TransactionCode};
 use binder::{BinderFeatures, Interface, SpIBinder, StatusCode, Strong, declare_binder_interface};
 
-use crate::counters;
 use crate::sensor::{
     Channel, EVENT_SIZE, MODE_HAL_BYPASS_REPLAY_DATA_INJECTION, SensorHub, encode_event,
 };
+use atl_services_types::counters;
 
 /// ISensorServer.cpp:220 IMPLEMENT_META_INTERFACE(SensorServer, "android.gui.SensorServer").
 const SERVER_DESCRIPTOR: &str = "android.gui.SensorServer";

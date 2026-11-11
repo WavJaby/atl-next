@@ -4,10 +4,10 @@
 //! Undefined values are AOSP's: 0, except grammaticalGender (-1) and fontWeightAdjustment (Integer.MAX_VALUE).
 //! The window part compares by plain equality. Its CONFIG_WINDOW_CONFIGURATION bit never reaches a relaunch (getConfigurationChanges clears it), so only "changed at all" reads it.
 
-pub use crate::size_buckets::{
+pub use atl_services_types::size_buckets::{
     CONFIG_SCREEN_LAYOUT, CONFIG_SCREEN_SIZE, CONFIG_SMALLEST_SCREEN_SIZE,
 };
-use crate::size_buckets::{SizeBuckets, SizeFields, filter_diff};
+use atl_services_types::size_buckets::{SizeBuckets, SizeFields, filter_diff};
 
 /// ActivityInfo.CONFIG_* (ActivityInfo.java:966-1126) not defined in size_buckets.rs.
 pub const CONFIG_MCC: u32 = 0x0001;

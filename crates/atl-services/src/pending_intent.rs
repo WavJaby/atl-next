@@ -9,7 +9,6 @@ use std::sync::{Mutex, MutexGuard};
 use atl_aidl::aidl::android::content::IIntentSender::{BnIntentSender, IIntentSender};
 use binder::{BinderFeatures, Interface, SpIBinder, Status, Strong};
 
-use crate::counters;
 use crate::pending_intent_table::{Key, Lookup, PendingIntentTable};
 
 /// The interface name counters use.
@@ -73,7 +72,7 @@ impl Interface for Sender {}
 
 impl IIntentSender for Sender {
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        counters::unimplemented(INTERFACE, method)
+        crate::unimplemented(INTERFACE, method)
     }
 }
 

@@ -221,8 +221,9 @@ impl Step {
                     mirrors.len()
                 );
                 // fonts.toml: rows = AOSP's named families at the pin
-                let fonts =
-                    atl_fonts::Table::parse(&std::fs::read_to_string(root.join("fonts.toml"))?)?;
+                let fonts = atl_fonts_table::Table::parse(&std::fs::read_to_string(
+                    root.join("fonts.toml"),
+                )?)?;
                 let aosp_fonts = layout
                     .locate(Path::new("aosp/frameworks/base"))
                     .dir
@@ -236,7 +237,7 @@ impl Step {
                     fonts.rows.len()
                 );
                 // gl-drivers.toml: the owner list atld's install step and atl-services read, parsed by the same code
-                let gl = atl_services::gl_driver::owner_table(&std::fs::read_to_string(
+                let gl = atl_services_types::gl_driver::owner_table(&std::fs::read_to_string(
                     root.join("gl-drivers.toml"),
                 )?)
                 .map_err(anyhow::Error::msg)?;

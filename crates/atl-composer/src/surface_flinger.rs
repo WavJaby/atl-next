@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use atl_libgui_parcel::transaction::{SET_TRANSACTION_STATE, SURFACE_COMPOSER_DESCRIPTOR};
-use atl_services::counters;
+use atl_services_types::counters;
 use binder::binder_impl::{Binder, BorrowedParcel, TransactionCode};
 use binder::{BinderFeatures, Interface, SpIBinder, StatusCode, declare_binder_interface};
 

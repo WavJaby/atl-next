@@ -6,8 +6,6 @@
 use atl_aidl::aidl::android::os::IUserManager::{BnUserManager, IUserManager};
 use binder::{BinderFeatures, Interface, SpIBinder, Status};
 
-use crate::counters;
-
 /// The interface name counters use.
 const INTERFACE: &str = "IUserManager";
 /// UserHandle.USER_SYSTEM (UserHandle.java): the only user this runtime has.
@@ -19,7 +17,7 @@ impl Interface for UserService {}
 
 impl IUserManager for UserService {
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        counters::unimplemented(INTERFACE, method)
+        crate::unimplemented(INTERFACE, method)
     }
 
     /// UserManagerService.isUserRunning:8005: a user with a state (mUserStates) is running; the system user has one, no other id does.

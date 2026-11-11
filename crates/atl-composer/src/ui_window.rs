@@ -14,7 +14,7 @@ use atl_platform_ui::{
     UiInvoker, Window, WindowAttributes,
 };
 
-use atl_services::display_model::DisplayModel;
+use atl_services_types::display_model::DisplayModel;
 
 use crate::host::Composer;
 use crate::input::{InputSender, Message};

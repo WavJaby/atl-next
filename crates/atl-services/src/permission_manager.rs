@@ -10,9 +10,8 @@ use atl_aidl::aidl::android::permission::IPermissionManager::{
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, ThreadState};
 use std::sync::Arc;
 
-use crate::counters;
-use crate::packages::Packages;
-use crate::permission::Permissions;
+use atl_services_types::packages::Packages;
+use atl_services_types::permission::Permissions;
 
 /// The interface name counters use.
 const INTERFACE: &str = "IPermissionManager";
@@ -65,7 +64,7 @@ impl IPermissionManager for PermissionManagerService {
     }
 
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        counters::unimplemented(INTERFACE, method)
+        crate::unimplemented(INTERFACE, method)
     }
 
     fn r#checkPermission(

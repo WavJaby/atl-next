@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: MIT
 //! Starting the compositor of an app process: its two service objects are served under AOSP's names by the process's service view (atl-service-view; libgui looks them up there), and its UI agent (ui_agent.rs)
-//! goes to the registry in the system process (atl_services::compositor_registry has the protocol). Reads from the process's own property area what atld wrote there (`ro.atl.display`); a process without it
+//! goes to the registry in the system process (atl_services_types::compositor_registry has the protocol). Reads from the process's own property area what atld wrote there (`ro.atl.display`); a process without it
 //! is not an ATL app process and gets no compositor.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use atl_services::compositor_registry::{
+use atl_services_types::compositor_registry::{
     DESCRIPTOR, DISPLAY_PROPERTY, POINTER_PROPERTY, REGISTER, SERVICE, SURFACE_FLINGER,
     SURFACE_FLINGER_AIDL, TASK_INFO, TILT_PROPERTY, TiltConfig,
 };
-use atl_services::counters;
-use atl_services::display_model::DisplayModel;
+use atl_services_types::counters;
+use atl_services_types::display_model::DisplayModel;
 use binder::binder_impl::{Binder, BorrowedParcel, IBinderInternal, TransactionCode};
 use binder::{Interface, SpIBinder, StatusCode, Strong, declare_binder_interface};
 

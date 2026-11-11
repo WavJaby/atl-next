@@ -52,12 +52,10 @@ atl-gralloc-dmabuf = { path = "../atl-gralloc-dmabuf" }
 atl-libgui-parcel = { path = "../atl-libgui-parcel" }
 atl-libinput = { path = "../atl-libinput" }
 atl-platform-host = { path = "../atl-platform-host" }
+atl-services-types = { path = "../atl-services-types" }
 clap.workspace = true
 rustix.workspace = true
-serde.workspace = true
 serde_json.workspace = true
-toml.workspace = true
-zip.workspace = true
 
 [build-dependencies]
 anyhow.workspace = true

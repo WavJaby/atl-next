@@ -21,10 +21,10 @@ use std::sync::{Arc, Mutex};
 use atl_aidl::aidl::android::hardware::display::IDisplayManagerCallback::IDisplayManagerCallback;
 use binder::Strong;
 
-use crate::counters;
-use crate::display_model::{self, DisplayModel};
-use crate::permission::Permissions;
 use crate::tasks::Tasks;
+use atl_services_types::counters;
+use atl_services_types::display_model::{self, DisplayModel};
+use atl_services_types::permission::Permissions;
 
 /// The interface name counters use.
 const INTERFACE: &str = "IDisplayManager";
@@ -145,7 +145,7 @@ impl IDisplayManager for DisplayManager {
     }
 
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        counters::unimplemented(INTERFACE, method)
+        crate::unimplemented(INTERFACE, method)
     }
 
     /// DisplayManagerService.getDisplayInfo: the record of display 0 from the model; null for any other display (there is no other).

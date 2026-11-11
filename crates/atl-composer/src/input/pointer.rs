@@ -9,7 +9,7 @@
 //!   Android flings from the finger's own velocity (handleFling ignores the library's), so no fling is synthesized here.
 
 use atl_platform_ui::{InputEvent, PhysPoint, PointerButton, PointerPhase, ScrollKind};
-use atl_services::input_devices::{POINTER, SOURCE_MOUSE, TOUCHPAD};
+use atl_services_types::input_devices::{POINTER, SOURCE_MOUSE, TOUCHPAD};
 
 use super::key::{self, Key};
 

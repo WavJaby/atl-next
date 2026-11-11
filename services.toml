@@ -14,7 +14,7 @@ src = [
     "crates/atl-services/src/activity.rs",
     "crates/atl-services/src/activity_stack.rs",
     "crates/atl-services/src/config_diff.rs",
-    "crates/atl-services/src/size_buckets.rs",
+    "crates/atl-services-types/src/size_buckets.rs",
     "crates/atl-services/src/process_control.rs",
     "crates/atl-services/src/broadcast.rs",
     "crates/atl-services/src/broadcast_queue.rs",
@@ -88,9 +88,9 @@ mirrors = [
 [package]
 src = [
     "crates/atl-services/src/package.rs",
-    "crates/atl-services/src/packages.rs",
-    "crates/atl-services/src/manifest_flags.rs",
-    "crates/atl-services/src/native_libs.rs",
+    "crates/atl-services-types/src/packages.rs",
+    "crates/atl-services-types/src/manifest_flags.rs",
+    "crates/atl-services-types/src/native_libs.rs",
 ]
 mirrors = [
     "frameworks/base/core/java/com/android/internal/content/NativeLibraryHelper.java#copyNativeBinariesForSupportedAbi",
@@ -112,7 +112,7 @@ mirrors = [
 [display]
 src = [
     "crates/atl-services/src/display.rs",
-    "crates/atl-services/src/display_model.rs",
+    "crates/atl-services-types/src/display_model.rs",
 ]
 mirrors = [
     "frameworks/base/services/core/java/com/android/server/display/DisplayManagerService.java#getDisplayInfo",
@@ -303,7 +303,7 @@ mirrors = [
 ["atl.compositor_registry"]
 src = [
     "crates/atl-services/src/registry_service.rs",
-    "crates/atl-services/src/compositor_registry.rs",
+    "crates/atl-services-types/src/compositor_registry.rs",
 ]
 mirrors = []
 reason = "ATL's own interface (ICompositorRegistry): registers each app's in-process SurfaceFlinger and UI agent (plan C3); AOSP has no counterpart, its one SurfaceFlinger is a separate process"

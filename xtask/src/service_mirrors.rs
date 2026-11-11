@@ -16,8 +16,8 @@ use crate::sources::{Aosp, is_tree_path};
 pub const FILE: &str = "services.toml";
 /// The binary that registers every service with servicemanager: the source of the row set.
 pub const REGISTRAR: &str = "crates/atl-services/src/bin/system_services.rs";
-/// Where a `module::CONST` service name in REGISTRAR is defined: `<dir>/<module>.rs`.
-const SERVICES_SRC: &str = "crates/atl-services/src";
+/// Where a `module::CONST` service name in REGISTRAR is defined: `<dir>/<module>.rs` of the one dir holding that module (atl-services, or its plain types).
+const SERVICES_SRC: [&str; 2] = ["crates/atl-services/src", "crates/atl-services-types/src"];
 
 /// Row key = servicemanager name.
 pub type Table = BTreeMap<String, Row>;
@@ -97,8 +97,19 @@ pub fn registered(root: &Path) -> Result<BTreeSet<String>> {
         let arg = rest.split(',').next().unwrap_or("").trim();
         let name = match arg.rsplit_once("::") {
             Some((module, konst)) => {
-                let file = format!("{SERVICES_SRC}/{module}.rs");
-                let src = std::fs::read_to_string(root.join(&file))
+                let module = module.rsplit("::").next().unwrap_or(module);
+                let files: Vec<String> = SERVICES_SRC
+                    .iter()
+                    .map(|d| format!("{d}/{module}.rs"))
+                    .filter(|f| root.join(f).is_file())
+                    .collect();
+                let [file] = files.as_slice() else {
+                    bail!(
+                        "{arg}: {module}.rs is in {} of {SERVICES_SRC:?}, not exactly one",
+                        files.len()
+                    );
+                };
+                let src = std::fs::read_to_string(root.join(file))
                     .with_context(|| format!("reading {file} for {arg}"))?;
                 const_str(&src, konst).with_context(|| format!("{arg}: no &str const in {file}"))?
             }

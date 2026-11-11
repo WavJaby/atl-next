@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
-use atl_services::display_model::DisplayModel;
+use atl_services_types::display_model::DisplayModel;
 
 /// One headless output: its mode in physical pixels (wlroots divides by the scale for the logical size).
 #[derive(Clone, Copy, Debug)]
