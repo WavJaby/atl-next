@@ -68,7 +68,6 @@ extern "C" fn gl_tex_parameterf(target: u32, pname: u32, param: f32) {
 extern "C" fn gl_vertex_attrib4f(index: u32, x: f32, y: f32, z: f32, w: f32) {
     record(vec![uint(index), float(x), float(y), float(z), float(w)]);
 }
-#[expect(clippy::too_many_arguments, reason = "glTexImage2D's prototype")]
 extern "C" fn gl_tex_image_2d(
     target: u32,
     level: i32,
@@ -92,7 +91,6 @@ extern "C" fn gl_tex_image_2d(
         pixels as u64,
     ]);
 }
-#[expect(clippy::too_many_arguments, reason = "glTexSubImage2D's prototype")]
 extern "C" fn gl_tex_sub_image_2d(
     target: u32,
     level: i32,
@@ -116,10 +114,6 @@ extern "C" fn gl_tex_sub_image_2d(
         pixels as u64,
     ]);
 }
-#[expect(
-    clippy::too_many_arguments,
-    reason = "glCompressedTexImage2D's prototype"
-)]
 extern "C" fn gl_compressed_tex_image_2d(
     target: u32,
     level: i32,
