@@ -358,7 +358,7 @@ const PROXY_LIBS: &[(&str, &str)] = &[
     ("libandroid_runtime.so", "libandroid_runtime"),
     ("libjnigraphics.so", "libjnigraphics"),
 ];
-/// The guest libc's stub list (NBS), per guest ISA: x86_64 for the identity guest (patch 0003 adds sigaction / sigaction64); arm64 for the QEMU guest, which has no sigaction stub (its guest libc's own syscall reaches QEMU's signal emulation) but setjmp / longjmp ones.
+/// The guest libc's stub list (NBS), per guest ISA: x86_64 for the identity guest (patch 0003 adds sigaction / sigaction64); arm64 for the QEMU guest, which has no sigaction stub (its guest libc's own syscall reaches QEMU's signal emulation) and, with patch 0006, no setjmp-family stubs (bionic's setjmp.S saves and restores guest registers in the guest).
 fn libc_stubs(qemu: bool) -> &'static str {
     if qemu {
         "frameworks/libs/native_bridge_support/android_api/libc/stubs_arm64.cpp"

@@ -3,7 +3,7 @@
 //! The guest's threads are glibc threads (the stub libc's `pthread_create` is the host shim). Each attaches its own engine CPU on its first guest call, runs its routine, and at exit runs its guest key destructor through a crossing on that thread.
 //! Env (xtask qemu_thread.rs sets it; unset prints SKIP): ATL_ENGINE_SO (the engine `.so`), ATL_NB_BOOT (the engine boot executable, crates/atl-qemu-boot), ATL_NB_THREADEXE (fixture.c, PIE), ATL_NB_LINKER, ATL_NB_VDSO (the arm64 NB images; `<nb>/libnative_bridge_guest_libc` among the guest library directories).
 //! Expected values come from the property store and the fixture's C source, never from the engine: xtask seeds `atl.qt.p.<i>` and `atl.qt.expect` into the area (ATL_PROP_AREA), and the provider's foreach must count exactly `atl.qt.expect` of them; qt_join(x) = x + 1000 (fixture.c `QT_JOIN_OFFSET`); the destructor stores the value its thread's key held at exit.
-//! Checks: (s) started, (p) foreach counts the seeded properties, (j) pthread_create's routine got its argument and its result reached pthread_join, (d) the key destructor ran at thread exit with the thread's value, (g) a guest thread's `pthread_getattr_np(pthread_self())` contains its sp and reports the size its attr asked for (fixture.c `QT_SMALL_STACK`), or 1 MiB without an attr, with a guard of one host page (the engine's default, bionic `PTHREAD_GUARD_SIZE`), (i) two host threads in concurrent down calls each keep a 64 KiB stack pattern intact while the other's is live, with sp in their own reported range and the two ranges disjoint.
+//! Checks: (s) started, (p) foreach counts the seeded properties, (j) pthread_create's routine got its argument and its result reached pthread_join, (d) the key destructor ran at thread exit with the thread's value, (g) a guest thread's `pthread_getattr_np(pthread_self())` contains its sp and reports the size its attr asked for (fixture.c `QT_SMALL_STACK`), or 1 MiB without an attr, with a guard of one host page (the engine's default, bionic `PTHREAD_GUARD_SIZE`), (i) two host threads in concurrent down calls each keep a 64 KiB stack pattern intact while the other's is live, with sp in their own reported range and the two ranges disjoint, (k) guest setjmp / longjmp round trip from a deeper frame (fixture.c `QT_JMP_VALUE`, volatile local kept), (m) siglongjmp restores the mask sigsetjmp(b, 1) saved (SIGUSR1 unblocked again). Both run the guest libc's bionic setjmp.S: the NBS patch drops the arm64 setjmp stubs, so no host side exists.
 //! Output: `qemu-thread: (x) ok` per check, `(x) FAIL <why>` otherwise, and one `qemu-thread: call-cost` line (not a check: the round trip of a no-op guest call on this thread). Exit 0 when all pass.
 #![expect(
     clippy::disallowed_types,
@@ -24,7 +24,7 @@ use atl_native_bridge::engine::{Config, Guest, qemu};
 use object::{Object, ObjectSymbol, read::elf::ElfFile64};
 
 /// The fixture functions the host calls, in the order `Expected::values` holds them.
-const SYMBOLS: [&str; 14] = [
+const SYMBOLS: [&str; 16] = [
     "qt_props_count",
     "qt_props_expected",
     "qt_join",
@@ -39,6 +39,8 @@ const SYMBOLS: [&str; 14] = [
     "qt_stack_fill",
     "qt_fill_base_at",
     "qt_fill_size_at",
+    "qt_jmp",
+    "qt_sigjmp",
 ];
 /// bionic `PTHREAD_STACK_SIZE_DEFAULT` order (1 MiB; R-10 plan D2): the guest stack of a thread created without an attr.
 const DEFAULT_STACK: u64 = 1 << 20;
@@ -50,6 +52,8 @@ const JOIN_ARG: u64 = 41;
 const JOIN_OFFSET: u64 = 1000;
 /// The value `qt_key_run`'s thread sets its key to; the destructor must store it.
 const KEY_VALUE: u64 = 0x7e57;
+/// fixture.c `qt_jmp`: `QT_JMP_VALUE` (7) from the second setjmp return, plus 100 for its one first-return pass.
+const JMP_WANT: u64 = 7 + 100;
 /// Round trips timed for the call-cost line.
 const COST_CALLS: u32 = 1000;
 
@@ -183,6 +187,29 @@ fn started(r: Result<Guest, String>) -> u64 {
         } else {
             Err(format!(
                 "key_run returned {ran:#x}, destructor stored {last:#x}, expected {KEY_VALUE:#x}"
+            ))
+        },
+    );
+
+    // SAFETY: as above; guest bionic setjmp / longjmp inside the guest call.
+    let jmp = unsafe { guest.call(addr(14), 0, 0, 0) } as u64;
+    ok &= check(
+        'k',
+        if jmp == JMP_WANT {
+            Ok(())
+        } else {
+            Err(format!("qt_jmp returned {jmp:#x}, expected {JMP_WANT:#x}"))
+        },
+    );
+    // SAFETY: as above; sigsetjmp / siglongjmp and sigprocmask, guest code.
+    let mask = unsafe { guest.call(addr(15), 0, 0, 0) } as i64;
+    ok &= check(
+        'm',
+        if mask == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "qt_sigjmp returned {mask} (0 restored, 1 SIGUSR1 still blocked, <0 a mask call failed)"
             ))
         },
     );

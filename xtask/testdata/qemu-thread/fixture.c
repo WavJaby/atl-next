@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Guest side of the Q5-6 thread gate (xtask `test qemu-thread`, QEMU bridge plan Q5-6): a bionic PIE executable that the guest linker loads; the host calls its qt_* functions through the crossing (tests/qemu_thread.rs).
 // The properties are the gate's: xtask writes `atl.qt.p.<i>` and `atl.qt.expect` into the area the provider maps (ATL_PROP_AREA). The guest cannot set properties (the provider's set is ENOENT until the property service lands), so qt_props_count counts the store and qt_props_expected reads the seeded count.
-// qt_routine adds QT_JOIN_OFFSET. Only the stub libc's intercepted stubs are called (pthread_*, __system_property_*): no other libc symbol resolves in the guest.
+// qt_routine adds QT_JOIN_OFFSET. Libc calls: the stub libc's intercepted stubs (pthread_*, __system_property_*) and, for the Q7-7 checks, guest bionic code (the setjmp family; sigprocmask through the guest's rt_sigprocmask syscall).
 #include <pthread.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <stdint.h>
 #include <sys/system_properties.h>
 
@@ -224,6 +226,51 @@ long qt_fill_base_at(long slot) {
 
 long qt_fill_size_at(long slot) {
     return (long)qt_fill_size[slot & 1];
+}
+
+// Q7-7 setjmp gate (checks k, m): the guest libc's own bionic setjmp.S, never a host stub
+// the value longjmp hands back to setjmp
+#define QT_JMP_VALUE 7
+// the signal whose blocked state siglongjmp must restore
+#define QT_JMP_SIG SIGUSR1
+
+static __attribute__((noinline)) void qt_jump(jmp_buf b) {
+    longjmp(b, QT_JMP_VALUE);
+}
+
+// setjmp, then longjmp(QT_JMP_VALUE) from a deeper frame; returns setjmp's second answer + 100 * the times the first-return path ran (expected QT_JMP_VALUE + 100: the volatile local survived, the jump happened once).
+long qt_jmp(void) {
+    jmp_buf b;
+    volatile long firsts = 0;
+    int r = setjmp(b);
+    if (r == 0) {
+        firsts++;
+        qt_jump(b);
+        return -1;
+    }
+    return r + 100 * firsts;
+}
+
+// sigsetjmp(b, 1) with QT_JMP_SIG unblocked, block it, siglongjmp back: 0 when the mask was restored (unblocked), 1 when still blocked, negative when a mask call failed.
+long qt_sigjmp(void) {
+    sigjmp_buf b;
+    sigset_t s;
+    sigemptyset(&s);
+    sigaddset(&s, QT_JMP_SIG);
+    if (sigprocmask(SIG_UNBLOCK, &s, 0) != 0) {
+        return -2;
+    }
+    if (sigsetjmp(b, 1) == 0) {
+        if (sigprocmask(SIG_BLOCK, &s, 0) != 0) {
+            return -3;
+        }
+        siglongjmp(b, 1);
+    }
+    sigset_t now;
+    if (sigprocmask(SIG_SETMASK, 0, &now) != 0) {
+        return -4;
+    }
+    return sigismember(&now, QT_JMP_SIG);
 }
 
 int main(void) {

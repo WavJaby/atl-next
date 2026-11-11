@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Wed, 11 Nov 2026 12:58:32 +0800
+Subject: [PATCH] Keep bionic setjmp on arm64 guests
+
+Drop the setjmp family (setjmp, _setjmp, sigsetjmp, longjmp,
+_longjmp, siglongjmp) from the arm64 libc stub list, so the guest
+libc keeps bionic arch-arm64/bionic/setjmp.S: its entries are
+ENTRY_WEAK_FOR_NATIVE_BRIDGE and lose to these stubs only while the
+stubs exist. The jump buffer holds guest registers, which the guest
+saves and restores itself under an emulating engine (QEMU); the
+signal mask goes through the guest rt_sigprocmask syscall.
+
+Upstream-Status: Inappropriate [berberis restores guest registers host-side through proxy/setjmp_thunks.cc; an emulator without that host thunk needs the guest code]
+Patch-Reason: the stub list is compiled into the guest libc; no launcher, loader or environment setting can remove a strong stub definition that overrides bionic weak setjmp
+---
+SPDX-License-Identifier: Apache-2.0
+ android_api/libc/stubs_arm64.cpp | 12 ------------
+ 1 file changed, 12 deletions(-)
+
+diff --git a/android_api/libc/stubs_arm64.cpp b/android_api/libc/stubs_arm64.cpp
+index 177b8ae26a3f4a6d1fa462e47fd0da200ac16b1e..2a996ba4765b7f23db7633518369547ee29a89b4 100644
+--- a/android_api/libc/stubs_arm64.cpp
++++ b/android_api/libc/stubs_arm64.cpp
+@@ -37,8 +37,6 @@ DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_set_filename);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_update);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_wait);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_wait_any);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(_longjmp);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(_setjmp);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(android_crash_detail_register);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(android_crash_detail_replace_data);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(android_crash_detail_replace_name);
+@@ -56,7 +54,6 @@ DEFINE_INTERCEPTABLE_STUB_FUNCTION(gethostbyaddr);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(gethostbyname);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(getnameinfo);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(gettimeofday);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(longjmp);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(memcmp);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(memcpy);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(memset);
+@@ -112,9 +109,6 @@ DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_setschedparam);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_setschedprio);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_setspecific);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_sigqueue);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(setjmp);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(siglongjmp);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(sigsetjmp);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(time);
+ DEFINE_INTERCEPTABLE_STUB_VARIABLE(environ);
+ 
+@@ -139,8 +133,6 @@ static void __attribute__((constructor(0))) init_stub_library() {
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_update);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_wait);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_wait_any);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", _longjmp);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", _setjmp);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", android_crash_detail_register);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", android_crash_detail_replace_data);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", android_crash_detail_replace_name);
+@@ -158,7 +150,6 @@ static void __attribute__((constructor(0))) init_stub_library() {
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", gethostbyname);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", getnameinfo);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", gettimeofday);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", longjmp);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", memcmp);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", memcpy);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", memset);
+@@ -214,9 +205,6 @@ static void __attribute__((constructor(0))) init_stub_library() {
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_setschedprio);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_setspecific);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_sigqueue);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", setjmp);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", siglongjmp);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", sigsetjmp);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", time);
+   INIT_INTERCEPTABLE_STUB_VARIABLE("libc.so", environ);
+ }
