@@ -8,7 +8,7 @@ use core::ffi::{c_char, c_int, c_void};
 /// Major version: a host refuses an engine with another major.
 pub const ABI_MAJOR: u32 = 2;
 /// Minor version: additions only, appended to a struct.
-pub const ABI_MINOR: u32 = 2;
+pub const ABI_MINOR: u32 = 3;
 
 /// `ATL_PROT_READ`.
 pub const PROT_READ: u32 = 0x1;
@@ -122,6 +122,8 @@ pub type CallExFn = unsafe extern "C" fn(
 /// `atl_engine::fault` (2.2): `info` is the kernel's `siginfo_t *`, `ucontext` its `ucontext_t *`; true when the engine took the signal. Signal context; may not return (header).
 pub type FaultFn =
     unsafe extern "C" fn(sig: c_int, info: *mut c_void, ucontext: *mut c_void) -> bool;
+/// `atl_engine::end_call` (2.3): inside a CALL / BIND trap callback, makes the trap's return end the guest call it interrupted, with the trap's answer (header). 0, or `-EINVAL` outside a trap.
+pub type EndCallFn = unsafe extern "C" fn(engine: *mut AtlEngineHandle) -> c_int;
 
 /// `atl_engine`: the table the engine `.so` exports as `atl_engine`.
 #[repr(C)]
@@ -149,9 +151,11 @@ pub struct AtlEngine {
     pub attach_ex: Option<AttachExFn>,
     /// 2.2: the engine's part of a host SIGSEGV / SIGBUS handler (a sigchain special handler).
     pub fault: Option<FaultFn>,
+    /// 2.3: ends the guest call a trap interrupted when the trap returns (thread exit).
+    pub end_call: Option<EndCallFn>,
 }
 
-/// Admits an engine table this host can drive, or refuses it by name. Refuses another major, a size below this host's table size (minor versions only append), and a minor below 2 or a table without `attach_ex` or `fault`. The core loader and the gate both call it.
+/// Admits an engine table this host can drive, or refuses it by name. Refuses another major, a size below this host's table size (minor versions only append), and a minor below 3 or a table without `attach_ex`, `fault` or `end_call`. The core loader and the gate both call it.
 pub fn check_engine_table(table: &AtlEngine) -> Result<(), String> {
     if table.major != ABI_MAJOR {
         return Err(format!(
@@ -166,10 +170,14 @@ pub fn check_engine_table(table: &AtlEngine) -> Result<(), String> {
             table.major, table.minor, table.size
         ));
     }
-    // host and engine are built together, so no older-minor fallback: the host calls attach_ex (2.1) and fault (2.2) unconditionally
-    if table.minor < ABI_MINOR || table.attach_ex.is_none() || table.fault.is_none() {
+    // host and engine are built together, so no older-minor fallback: the host calls attach_ex (2.1), fault (2.2) and end_call (2.3) unconditionally
+    if table.minor < ABI_MINOR
+        || table.attach_ex.is_none()
+        || table.fault.is_none()
+        || table.end_call.is_none()
+    {
         return Err(format!(
-            "engine ABI {}.{} lacks attach_ex (2.1) or fault (2.2), host needs {ABI_MAJOR}.{ABI_MINOR}",
+            "engine ABI {}.{} lacks attach_ex (2.1), fault (2.2) or end_call (2.3), host needs {ABI_MAJOR}.{ABI_MINOR}",
             table.major, table.minor
         ));
     }
@@ -194,11 +202,12 @@ mod tests {
             call_ex: None,
             attach_ex: None,
             fault: None,
+            end_call: None,
         };
-        // "2.2" is the spec, typed here: ABI_MAJOR/ABI_MINOR are the code under test
+        // "2.3" is the spec, typed here: ABI_MAJOR/ABI_MINOR are the code under test
         assert_eq!(
             check_engine_table(&table),
-            Err("engine ABI 1.1 refused, host speaks 2.2".to_owned())
+            Err("engine ABI 1.1 refused, host speaks 2.3".to_owned())
         );
     }
 
@@ -223,10 +232,14 @@ mod tests {
             call_ex: None,
             attach_ex: Some(attach_ex),
             fault: None,
+            end_call: None,
         };
         assert_eq!(
             check_engine_table(&table),
-            Err("engine ABI 2.1 lacks attach_ex (2.1) or fault (2.2), host needs 2.2".to_owned())
+            Err(
+                "engine ABI 2.1 lacks attach_ex (2.1), fault (2.2) or end_call (2.3), host needs 2.3"
+                    .to_owned()
+            )
         );
     }
 }

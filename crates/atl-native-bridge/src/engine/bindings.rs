@@ -127,13 +127,15 @@ fn trapped((lib, name, why): (&str, &str, &str)) {
     ))
 }
 
-/// The hand-written host side of `Entry::Shim` stub `name`: the one match over build.rs `SHIMS` and `NDK_SHIMS` (test `every_shim_has_an_arm`).
+/// The hand-written host side of `Entry::Shim` stub `name`: the one match over build.rs `SHIMS`, `QEMU_SHIMS` and `NDK_SHIMS` (test `every_shim_has_an_arm`).
 fn shim(name: &str) -> Option<usize> {
     Some(match name {
         "pthread_create" => super::intercepts::pthread_create as *const () as usize,
         "pthread_key_create" => super::intercepts::pthread_key_create as *const () as usize,
         "pthread_key_delete" => super::intercepts::pthread_key_delete as *const () as usize,
         "pthread_getattr_np" => super::intercepts::pthread_getattr_np as *const () as usize,
+        // Q7-7: QEMU table only (build.rs `QEMU_SHIMS`)
+        "pthread_exit" => super::intercepts::pthread_exit as *const () as usize,
         "__system_property_foreach" => super::provider::foreach as *const () as usize,
         "__system_property_read_callback" => super::provider::read_callback as *const () as usize,
         "sigaction" | "sigaction64" => super::signal::sigaction as *const () as usize,

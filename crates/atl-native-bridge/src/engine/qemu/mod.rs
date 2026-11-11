@@ -60,6 +60,27 @@ thread_local! {
     static CPU: Cell<*mut AtlCpu> = const { Cell::new(std::ptr::null_mut()) };
     /// The guest stack `attach_ex` gave this thread's CPU (base, len, guard filled); zero before attach.
     static STACK: Cell<AtlStack> = const { Cell::new(AtlStack { size: 0, guard: 0, base: 0, len: 0 }) };
+    /// Guest calls running on this thread ([`call_on`], nested through traps).
+    static DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Guest calls running on this thread: 1 inside a trap means the trapping code runs in the thread's outermost guest call.
+pub(super) fn call_depth() -> u32 {
+    DEPTH.with(Cell::get)
+}
+
+/// From inside a trap callback: the trap's return ends the guest call it interrupted, its answer becoming that call's (`atl_engine.end_call`, 2.3).
+pub(super) fn end_call() -> Result<(), String> {
+    let e = engine();
+    let end = e
+        .table
+        .end_call
+        .unwrap_or_else(|| unsupported("engine table has no end_call"));
+    // SAFETY: the handle is the one create returned.
+    match unsafe { end(e.handle) } {
+        0 => Ok(()),
+        rc => Err(format!("end_call: {}", errno_text(rc))),
+    }
 }
 
 /// Boots the engine `library` (the engine `.so`) on the static aarch64 `boot_exe`, which must raise BOOT with its auxv in x0. `on_trap` gets every trap of the engine on the trapping thread, BOOT included. Returns once BOOT ran and the engine is up; the guest runs after [`attach_current`]. Once per process.
@@ -259,8 +280,10 @@ fn call_on(tp: &mut u64, f: u64, lanes: &mut AtlLanes) {
         .table
         .call_ex
         .unwrap_or_else(|| unsupported("engine table has no call_ex"));
+    DEPTH.with(|d| d.set(d.get() + 1));
     // SAFETY: handle and cpu are the engine's; cpu was attached on this thread (CPU is set only by attach_current); tp and lanes are writable and live for the call.
-    unsafe { ex(e.handle, cpu, tp, f, lanes) }
+    unsafe { ex(e.handle, cpu, tp, f, lanes) };
+    DEPTH.with(|d| d.set(d.get() - 1));
 }
 
 /// Runs guest `f` for a host->guest down call (Q6-4, dispatch.rs `down_body`): on the calling thread's record (`thread::attach_current`, which attaches the CPU and the guest TCB on demand), with the record's thread pointer in and out, and `lanes` in and out (`call_ex`).

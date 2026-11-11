@@ -98,6 +98,7 @@ mod abi_check {
     const _: () =
         assert!(offset_of!(AtlEngine, attach_ex) as u64 == l::ATL_OFFSET_ENGINE_ATTACH_EX);
     const _: () = assert!(offset_of!(AtlEngine, fault) as u64 == l::ATL_OFFSET_ENGINE_FAULT);
+    const _: () = assert!(offset_of!(AtlEngine, end_call) as u64 == l::ATL_OFFSET_ENGINE_END_CALL);
     const _: () = assert!(size_of::<AtlStack>() as u64 == l::ATL_SIZEOF_STACK);
     const _: () = assert!(offset_of!(AtlStack, size) as u64 == l::ATL_OFFSET_STACK_SIZE);
     const _: () = assert!(offset_of!(AtlStack, guard) as u64 == l::ATL_OFFSET_STACK_GUARD);
@@ -328,6 +329,15 @@ mod capi {
         crate::signal::special(sig, info.cast(), uc)
     }
 
+    /// 2.3: the innermost running trap of this thread ends its guest call on return ([`crate::trap::end_call`]).
+    unsafe extern "C" fn end_call(engine: *mut AtlEngineHandle) -> c_int {
+        if is_engine(engine) && crate::trap::end_call() {
+            0
+        } else {
+            -libc::EINVAL
+        }
+    }
+
     /// The table the engine `.so` exports (version script: `atl_engine` is the only global symbol of its kind).
     #[cfg(atl_qe_abi_major_next)]
     const BREAK_MAJOR: u32 = 1;
@@ -348,5 +358,6 @@ mod capi {
         call_ex: Some(call_ex),
         attach_ex: Some(attach_ex),
         fault: Some(fault),
+        end_call: Some(end_call),
     };
 }

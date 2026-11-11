@@ -273,6 +273,39 @@ long qt_sigjmp(void) {
     return sigismember(&now, QT_JMP_SIG);
 }
 
+// Q7-7 pthread_exit gate (check x): the value a routine hands pthread_exit one frame down reaches join, and its key destructor runs
+// pthread_exit's argument is the routine's argument plus this
+#define QT_EXIT_OFFSET 2000
+
+static __attribute__((noinline)) void qt_exit_deep(void *arg) {
+    pthread_exit((void *)((uintptr_t)arg + QT_EXIT_OFFSET));
+}
+
+static void *qt_exit_routine(void *arg) {
+    (void)pthread_setspecific(qt_key, arg);
+    qt_exit_deep(arg);
+    // reached only when pthread_exit returned: join then reports -1
+    return (void *)(uintptr_t)-1;
+}
+
+// One thread sets the key to x and calls pthread_exit(x + QT_EXIT_OFFSET) from a callee; returns what join reports (-1 when create fails or pthread_exit returned). qt_last_value then holds what the destructor stored.
+long qt_exit_run(long x) {
+    if (!qt_key_ready) {
+        if (pthread_key_create(&qt_key, qt_dtor) != 0) {
+            return -1;
+        }
+        qt_key_ready = 1;
+    }
+    qt_last = 0;
+    pthread_t t;
+    void *ret = 0;
+    if (pthread_create(&t, 0, qt_exit_routine, (void *)(uintptr_t)x) != 0) {
+        return -1;
+    }
+    (void)pthread_join(t, &ret);
+    return (long)(uintptr_t)ret;
+}
+
 int main(void) {
     return 0;
 }

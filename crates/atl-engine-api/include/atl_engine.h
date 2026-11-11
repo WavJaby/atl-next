@@ -13,7 +13,7 @@
 #include <stdint.h>
 
 #define ATL_ENGINE_ABI_MAJOR 2
-#define ATL_ENGINE_ABI_MINOR 2
+#define ATL_ENGINE_ABI_MINOR 3
 
 /* Page protection, QEMU's page flags (include/exec/page-protection.h). */
 #define ATL_PROT_READ 0x1u
@@ -74,6 +74,8 @@ typedef struct atl_engine {
     int (*attach_ex)(atl_engine_handle *engine, atl_stack *stack, atl_cpu **out);
     /* 2.2. The engine's part of a host SIGSEGV / SIGBUS handler, for a special handler in front of the process's user action (ART sigchain via NativeBridge getSignalHandler). info is the kernel's siginfo_t *, ucontext its ucontext_t *. True: the engine took the signal (a guest fault, delivered to the guest; or the translator's own fatal exit). False: not the engine's, pass it on. Signal context, on the thread that took the signal, with every signal blocked; may not return (it longjmps into the guest CPU loop), so the caller registers it as no-return (sigchain SIGCHAIN_ALLOW_NORETURN). False before create has booted. */
     bool (*fault)(int sig, void *info, void *ucontext);
+    /* 2.3. From inside a CALL or BIND trap callback, on the trapping thread: when the innermost trap of this thread returns, the guest call it interrupted (the innermost call_ex on this thread's CPU) ends at once with the trap's answer as its answer, instead of resuming the trapping guest code. For a thread-exit call that never returns to its guest caller (bionic pthread_exit). 0, or -EINVAL when no trap of this thread is running. */
+    int (*end_call)(atl_engine_handle *engine);
 } atl_engine;
 
 #endif /* ATL_ENGINE_H */

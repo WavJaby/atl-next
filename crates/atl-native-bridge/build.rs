@@ -175,6 +175,8 @@ const SHIMS: &[&str] = &[
 ];
 /// Shims of the x86_64 stub list only (`libc_stubs`): signal.rs registers the guest handler with sigchain behind ART's claims.
 const SIGNAL_SHIMS: &[&str] = &["sigaction", "sigaction64"];
+/// Shims of the arm64 (QEMU) stub list only: intercepts.rs `pthread_exit` ends the start routine's guest call through the engine's `end_call` (ABI 2.3), which the identity engine has no counterpart of.
+const QEMU_SHIMS: &[&str] = &["pthread_exit"];
 /// Q5-8: the QEMU table's libc rows that bind to counted shims under `crossing-count` (counters.rs `memcpy`, `memset`, `memcmp`), which record the size argument and then run glibc's.
 const COUNTED_SHIMS: &[&str] = &["memcpy", "memset", "memcmp"];
 /// NDK functions taking a `JNIEnv*` (C3, engine/ndk.rs): the generic crossing would hand the host library the guest's env, so each binds `Entry::Shim` in its library. Any NDK proxy library may list them; each must be in one (`bindings_table`).
@@ -440,7 +442,7 @@ fn stub_names(up: &Upstreams, rel: &str) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// The libc rows: per NBS libc stub, its entry -- [`SHIMS`] (+ [`SIGNAL_SHIMS`] for the x86_64 list), [`GLIBC`], the provider's [`PROVIDER_APIS`], else a named trap. A name in those lists that the stub list lacks fails the build (a stale row).
+/// The libc rows: per NBS libc stub, its entry -- [`SHIMS`] (+ [`SIGNAL_SHIMS`] for the x86_64 list, [`QEMU_SHIMS`] for the arm64 one), [`GLIBC`], the provider's [`PROVIDER_APIS`], else a named trap. A name in those lists that the stub list lacks fails the build (a stale row).
 fn libc_entries(
     names: &[String],
     qemu: bool,
@@ -450,14 +452,19 @@ fn libc_entries(
         .iter()
         .flat_map(|(_, f)| f.iter().copied())
         .collect();
-    let signal: &[&str] = if qemu { &[] } else { SIGNAL_SHIMS };
+    let per_isa: &[&str] = if qemu { QEMU_SHIMS } else { SIGNAL_SHIMS };
     // cargo sets CARGO_FEATURE_<NAME> for build scripts; identity and shipped builds keep the glibc rows
     let counted: &[&str] = if qemu && std::env::var_os("CARGO_FEATURE_CROSSING_COUNT").is_some() {
         COUNTED_SHIMS
     } else {
         &[]
     };
-    let shims: Vec<&str> = SHIMS.iter().chain(signal).chain(counted).copied().collect();
+    let shims: Vec<&str> = SHIMS
+        .iter()
+        .chain(per_isa)
+        .chain(counted)
+        .copied()
+        .collect();
     for n in shims
         .iter()
         .chain(GLIBC.iter().map(|(n, _)| n))
@@ -759,6 +766,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("qt_attr_size", "atl_nb_qt_attr_size"),
     // R10 S3 (build.rs `libc_entries`): pthread_getattr_np bound to glibc again, which reads the bionic record as a glibc thread (qemu-thread gate, `g`)
     ("qt_getattr_glibc", "atl_nb_qt_getattr_glibc"),
+    // Q7-7 (engine/intercepts.rs `pthread_exit`): the routine's guest call is not ended, so the guest resumes after its noreturn pthread_exit (qemu-thread gate, `x`)
+    ("qt_exit_resume", "atl_nb_qt_exit_resume"),
     // Q6-2 (engine/dispatch.rs `call_jni`): the host JNI function gets the guest's env instead of the host object (qemu-jni gate, `e`)
     ("jni_guest_env", "atl_nb_jni_guest_env"),
     // Q6-2 (engine/dispatch.rs `call_jni`): x3 and x4 exchanged, so CallStaticIntMethod(2, 3) reaches the host as (3, 2) (qemu-jni gate, `c`)

@@ -56,6 +56,10 @@ const FACTS: &[(&str, &str)] = &[
         "offsetof(atl_engine, attach_ex)",
     ),
     ("ATL_OFFSET_ENGINE_FAULT", "offsetof(atl_engine, fault)"),
+    (
+        "ATL_OFFSET_ENGINE_END_CALL",
+        "offsetof(atl_engine, end_call)",
+    ),
 ];
 
 /// The Rust module (`pub const ATL_...: u64`) of [`FACTS`] for the header at `header`, read by clang for `host`. The C unit goes into `out`.

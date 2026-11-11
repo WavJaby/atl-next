@@ -3,6 +3,7 @@
 //! Answer: 0 handled (resume at pc, already past the svc), 1 leave this `cpu_loop` (a guest call returned), <0 not ours (QEMU's syscall path).
 //! Immediates: Linux ignores the svc immediate and bionic uses `svc #0`, so nonzero values in the 0x7a1x range are ours, and so is any immediate with bit 15 ([`BIND`]: a binding thunk, id = the low 15 bits). The guest fixture (xtask/testdata/qemu-spike/fixture.c) repeats them.
 
+use std::cell::Cell;
 use std::ffi::{c_int, c_void};
 
 use crate::engine::{Guest, Trap, lib};
@@ -29,6 +30,39 @@ const HANDLED: c_int = 0;
 const LEAVE: c_int = 1;
 const NOT_OURS: c_int = -1;
 
+thread_local! {
+    /// CALL / BIND traps running on this thread (nested through guest calls from their callbacks).
+    static DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// [`end_call`] ran inside the innermost running trap: its return leaves the `cpu_loop` of the guest call it interrupted.
+    static END: Cell<bool> = const { Cell::new(false) };
+}
+
+/// ABI `end_call` (2.3): the innermost CALL / BIND trap running on this thread, when it returns, ends the guest call it interrupted with its answer (x0), instead of resuming the guest after the svc. False when no such trap runs.
+pub(crate) fn end_call() -> bool {
+    if DEPTH.with(Cell::get) == 0 {
+        return false;
+    }
+    END.with(|e| e.set(true));
+    true
+}
+
+/// A CALL / BIND trap: the callback's answer in x0, then resume past the svc, or leave this `cpu_loop` when the callback asked [`end_call`]. An outer trap's pending request is kept aside while this one runs.
+fn host_trap(g: Guest, t: Trap) -> c_int {
+    let outer = END.with(|e| e.replace(false));
+    DEPTH.with(|d| d.set(d.get() + 1));
+    let r = (lib().on_trap)(g, t);
+    DEPTH.with(|d| d.set(d.get() - 1));
+    // break `ret-reg` (gate a): the answer arrives corrupted
+    #[cfg(atl_qe_ret_reg)]
+    let r = r ^ 1;
+    g.set_x(0, r);
+    if END.with(|e| e.replace(outer)) {
+        LEAVE
+    } else {
+        HANDLED
+    }
+}
+
 /// # Safety
 /// Called by QEMU's `cpu_loop` only: `env` is the calling thread's live `CPUArchState`.
 #[unsafe(no_mangle)]
@@ -45,15 +79,7 @@ fn dispatch(g: Guest, imm: u32) -> c_int {
     match imm {
         RET => LEAVE,
         BOOT => crate::engine::boot(g),
-        CALL => {
-            let regs = std::array::from_fn(|i| g.x(i));
-            let r = on_trap(g, Trap::Call(regs));
-            // break `ret-reg` (gate a): the answer arrives corrupted
-            #[cfg(atl_qe_ret_reg)]
-            let r = r ^ 1;
-            g.set_x(0, r);
-            HANDLED
-        }
+        CALL => host_trap(g, Trap::Call(std::array::from_fn(|i| g.x(i)))),
         REPORT => {
             on_trap(g, Trap::Report(g.x(0)));
             HANDLED
@@ -62,18 +88,13 @@ fn dispatch(g: Guest, imm: u32) -> c_int {
             crate::signal::register_thread();
             HANDLED
         }
-        _ if imm & BIND_TEST != 0 => {
-            let regs = std::array::from_fn(|i| g.x(i));
-            let r = on_trap(
-                g,
-                Trap::Bind {
-                    id: imm & !BIND,
-                    args: regs,
-                },
-            );
-            g.set_x(0, r);
-            HANDLED
-        }
+        _ if imm & BIND_TEST != 0 => host_trap(
+            g,
+            Trap::Bind {
+                id: imm & !BIND,
+                args: std::array::from_fn(|i| g.x(i)),
+            },
+        ),
         _ => NOT_OURS,
     }
 }
