@@ -1222,7 +1222,8 @@ fn run(a: &Args) -> Result<ExitCode> {
                 spawn.args = vec!["--drm-node".into(), n.into()];
                 for (fourcc, mods) in modifiers {
                     let arg = node::modifier_arg(*fourcc, mods);
-                    log(format_args!("gpu: modifiers {arg} (probe)"));
+                    // own prefix: `gpu:` is the one node line the run-apk gate reads
+                    log(format_args!("gpu-modifiers: {arg} (probe)"));
                     spawn.args.push("--modifiers".into());
                     spawn.args.push(arg.into());
                 }
