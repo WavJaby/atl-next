@@ -3,10 +3,12 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 
+use crate::timing::{self, Timings};
 use crate::unit_use::{self, Echo, Units};
 use crate::verdict::{self, Failure, Verdict};
 use crate::{
@@ -313,25 +315,37 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     })?;
     let mut skipped = Vec::new();
     let mut failures = Vec::new();
+    let mut times = Timings::default();
     for step in &steps {
         eprintln!("== check: {}", step.name());
-        if let Some(why) = step.skip(&out) {
-            eprintln!("== check: {} skipped: {why}", step.name());
+        let started = Instant::now();
+        // every step ends with one `== check: <step> (<s>) <outcome>` line: the time sits on the line that names the outcome
+        let outcome = if let Some(why) = step.skip(&out) {
             skipped.push(step.name());
+            format!("skipped: {why}")
         } else {
             match step.run(root, &out) {
-                Ok(None) => {}
+                Ok(None) => "ok".to_owned(),
                 Ok(Some(why)) => {
-                    eprintln!("== check: {} skipped: {why}", step.name());
                     skipped.push(step.name());
+                    format!("skipped: {why}")
                 }
                 Err(e) => {
-                    eprintln!("== check: {} FAILED: {e:#}", step.name());
                     failures.push(Failure::step(step.name(), format!("{e:#}")));
+                    format!("FAILED: {e:#}")
                 }
             }
-        }
+        };
+        let took = started.elapsed();
+        times.push(step.name(), took);
+        eprintln!(
+            "== check: {} ({}) {outcome}",
+            step.name(),
+            timing::secs(took)
+        );
     }
+    // stderr like the step lines: stdout's last line stays the verdict line atl-out and land read
+    eprintln!("{}", times.table("check").trim_end());
     let verdict = Verdict {
         cmd: "check",
         total: Some((steps.len(), "steps")),

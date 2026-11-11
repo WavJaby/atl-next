@@ -103,6 +103,7 @@ mod spdx;
 mod system;
 mod test_apks;
 mod test_fonts;
+mod timing;
 mod tree;
 mod tree_gate;
 mod triage;

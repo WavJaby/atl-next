@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
 use atl_layout::{Layout, MAIN};
@@ -17,6 +18,7 @@ use crate::patch;
 use crate::slot::{self, SLOTS};
 use crate::slot_prune;
 use crate::sources::{self, Sources};
+use crate::timing::{self, Timings};
 use crate::unit_use::{self, Echo, Units};
 use crate::verdict::{self, Failure, Verdict};
 
@@ -95,8 +97,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         println!("{}", clean_up_child(root, &args.branch)?);
         return Ok(ExitCode::SUCCESS);
     }
+    let started = Instant::now();
     let plan = Plan::new(root, &args.branch, args.execute)?;
     let stages = plan.stages();
+    // preflight = origin fetch + read-only checks; not a stage, so outside the table
+    println!("land: preflight ({}) ok", timing::secs(started.elapsed()));
     if !args.execute {
         for line in plan.describe(&stages) {
             println!("{line}");
@@ -288,13 +293,24 @@ impl Plan {
     }
 
     /// Runs the stages in order and returns the verdict line. The first failure stops the run: before the push nothing reached origin, after it the message says what did.
+    /// Each stage's line carries its wall time; the time table closes the run, before the verdict line, on success or failure.
     fn execute(&self, stages: &[Stage], runner: &Runner) -> String {
         let total = stages.len();
+        let mut times = Timings::default();
         for stage in stages {
-            match self.run_stage(stage, runner) {
-                Ok(note) => println!("land: {} ok: {note}", stage.name()),
+            let started = Instant::now();
+            let result = self.run_stage(stage, runner);
+            let took = started.elapsed();
+            times.push(stage.name(), took);
+            match result {
+                Ok(note) => println!("land: {} ({}) ok: {note}", stage.name(), timing::secs(took)),
                 Err(e) => {
-                    println!("land: {} FAILED: {e:#}", stage.name());
+                    println!(
+                        "land: {} ({}) FAILED: {e:#}",
+                        stage.name(),
+                        timing::secs(took)
+                    );
+                    println!("{}", times.table("land").trim_end());
                     return Verdict {
                         cmd: "land",
                         total: Some((total, "steps")),
@@ -305,6 +321,7 @@ impl Plan {
                 }
             }
         }
+        println!("{}", times.table("land").trim_end());
         Verdict {
             cmd: "land",
             total: Some((total, "steps")),
