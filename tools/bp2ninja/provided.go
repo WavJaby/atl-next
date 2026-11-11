@@ -130,14 +130,15 @@ func (g *Graph) partialProvider(n *Node) *Node {
 }
 
 // checkPartial: every file a `srcs` row lists must be a source of its module at the pin, a typo or a file upstream moved would otherwise drop nothing, silently.
-// Where the goals build the module, the file must have been dropped from at least one of its nodes (sides and target blocks differ in sources); where they do not, it must at least exist in the module's directory.
+// Checked per variant (sides and target blocks differ in sources: libandroid_runtime's Zygote JNI is target.android only, so the host variant a cross host builds lacks it):
+// a file must be a source of some variant of the module; every built node whose variant lists it must have dropped it. A module the goals do not build: the file must at least exist.
 func (g *Graph) checkPartial() error {
 	var bad []string
 	for _, name := range sortedKeys(keysOf(g.partial)) {
-		built := false
-		for k := range g.nodes {
-			if k.name == name && !g.nodes[k].provided {
-				built = true
+		var built []*Node
+		for k, n := range g.nodes {
+			if k.name == name && !n.provided {
+				built = append(built, n)
 			}
 		}
 		mods := append(append([]*Module{}, g.mods[Device][name]...), g.mods[Host][name]...)
@@ -146,9 +147,23 @@ func (g *Graph) checkPartial() error {
 		}
 		for _, s := range g.partial[name].Srcs {
 			path := filepath.Join(mods[0].Dir, s)
-			if built && !g.droppedSrcs[name+"\x00"+path] {
+			listed := false
+			for _, n := range built {
+				if listsSrc(n.props, s) {
+					listed = true
+					if n.side.glibc() && !g.droppedSrcs[name+"\x00"+path] {
+						bad = append(bad, fmt.Sprintf("%s: %s is a source of its %s variant but was not dropped", name, s, n.side))
+					}
+				}
+			}
+			for _, side := range []Side{Device, Host} {
+				for _, m := range g.mods[side][name] {
+					listed = listed || listsSrc(g.flatten(m, side, Shared), s)
+				}
+			}
+			if len(built) > 0 && !listed {
 				bad = append(bad, fmt.Sprintf("%s: %s is not one of its sources", name, s))
-			} else if _, err := os.Stat(g.abs(path)); !built && err != nil {
+			} else if _, err := os.Stat(g.abs(path)); len(built) == 0 && err != nil {
 				bad = append(bad, fmt.Sprintf("%s: %s does not exist", name, path))
 			}
 		}
@@ -157,6 +172,16 @@ func (g *Graph) checkPartial() error {
 		return fmt.Errorf("providers.toml srcs: %s", strings.Join(bad, "; "))
 	}
 	return nil
+}
+
+// listsSrc: props' `srcs` names file s (relative to the module dir), literally or by a glob.
+func listsSrc(props *Obj, s string) bool {
+	for _, e := range props.strs("srcs") {
+		if ok, _ := filepath.Match(e, s); ok || e == s {
+			return true
+		}
+	}
+	return false
 }
 
 func keysOf[T any](m map[string]T) map[string]bool {

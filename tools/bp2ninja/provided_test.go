@@ -162,6 +162,22 @@ cc_library_shared { name: "libunbuilt", srcs: ["u.cc"] }
 	}
 }
 
+// A row file only the android variant lists: the host variant (a cross host's goal side) builds without it, and the row stays valid.
+func TestPartialPerVariant(t *testing.T) {
+	g := graphFor(t, map[string]string{"p/Android.bp": `
+cc_library_shared { name: "librt", host_supported: true, srcs: ["keep.cc"], target: { android: { srcs: ["dev.cc"] } } }
+`, "p/keep.cc": "", "p/dev.cc": ""})
+	g.partial = map[string]Partial{"librt": {Srcs: []string{"dev.cc"}}}
+	g.node("librt", Host, Shared, "goal")
+	if err := g.checkPartial(); err != nil {
+		t.Errorf("host variant: %v", err)
+	}
+	g.partial = map[string]Partial{"librt": {Srcs: []string{"typo.cc"}}}
+	if err := g.checkPartial(); err == nil || !strings.Contains(err.Error(), "librt: typo.cc is not one of its sources") {
+		t.Errorf("typo: %v", err)
+	}
+}
+
 // Soong's implicit system_shared_libs and atl-bionic standing in for libc (the providers.toml rows libc = crate:atl-bionic, libm / libdl = none).
 func TestSystemSharedLibsAndProvidedLibc(t *testing.T) {
 	g := graphFor(t, map[string]string{"p/Android.bp": `
