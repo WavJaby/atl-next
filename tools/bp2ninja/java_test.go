@@ -234,7 +234,7 @@ java_library { name: "dep", srcs: ["d/D.java"], sdk_version: "none", system_modu
 		t.Fatalf("no javac edge:\n%s", ninja)
 	}
 	// collectJavacFlags: -Xlint:-dep-ann, then --patch-module=<module>=.:<out>:<classpath> (classpath = the static lib's header)
-	depHeader := filepath.Join(g.out, "device", "dep", "javac-header", "dep.jar")
+	depHeader := filepath.Join(g.out, "device", "dep", "turbine-combined", "dep.jar")
 	if want := "-Xlint:-dep-ann --patch-module=java.base=.:" + g.out + ":" + depHeader; javac["flags"] != want {
 		t.Errorf("javac flags %q, want %q", javac["flags"], want)
 	}
@@ -313,7 +313,7 @@ java_library { name: "u", srcs: ["U.java"], sdk_version: "none", system_modules:
 	}
 	// java 8 does not use modules: the system modules' libs form -bootclasspath (transformJavaToClasses)
 	javac := ninjaEdgeVars(ninja, filepath.Join(g.out, "device", "u", "javac", "u.jar"))
-	lHeader := filepath.Join(g.out, "device", "l", "javac-header", "l.jar")
+	lHeader := filepath.Join(g.out, "device", "l", "turbine-combined", "l.jar")
 	if javac == nil || javac["bootcp"] != "-bootclasspath "+esc(lHeader) || javac["ver"] != "1.8" {
 		t.Errorf("javac %v", javac)
 	}

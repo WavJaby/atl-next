@@ -13,18 +13,17 @@ import (
 // Java modules, following build/soong/java (spec): java.go, base.go (compile, collectDeps, collectJavacFlags), builder.go (rules),
 // dex.go (d8 flags), sdk.go (decodeSdkDep), system_modules.go, java_resources.go. One jNode per (module, side) = Soong's
 // android_common (Device) or linux_glibc_common (Host) variant.
-//   - Turbine is not run: Soong's TURBINE_ENABLED=false path, which every host module takes anyway. A module's header jar is its
-//     implementation jar without META-INF/services (convertImplementationJarToHeaderJar); dependents compile against it.
-//   - Header jars are one combined jar per module, where Soong lists the module's and its static libraries' header jars: same
-//     classes, one file. A repackaged device module (jarjar.go) is the exception, as with Turbine on: it exports its unmodified header
-//     and the repackaged one (javaHeaders), and dependents put every header of a libs / static_libs dependency on the classpath.
+//   - Header jars (javaHeaders): device modules take turbine's (turbine.go), host modules and device modules with an API-generating plugin
+//     the implementation jar without META-INF/services, as Soong. One combined jar per module, where Soong lists the module's and its
+//     static libraries' header jars: same classes, one file. A repackaged device module (jarjar.go) also exports the repackaged header, and
+//     dependents put every header of a libs / static_libs dependency on the classpath.
 //   - d8 runs in debug mode unless dxflags ask for --release: D8's own default, and what Soong's eng builds pass explicitly.
 //   - Every installable / compile_dex device jar is stored uncompressed and aligned (Soong: boot jars, APEX jars and preopted jars are,
 //     which is what this build's runtime jars are); `uncompress_dex: false` opts out.
 //   - A genrule named in libs / static_libs whose command cannot run is dropped from the jars with a problem, not failed downstream
 //     (notices-for-stubs-jar: NOTICE files for API stubs jars, needs gen_notice).
 //   - Generated sources: javagen.go (.aidl, .logtags, .proto), kotlin.go (.kt), jarjar.go (jarjar_rules, inherited rename rules), aapt.go
-//     (an android_app's R sources); javac sharding needs Turbine, so javac runs once.
+//     (an android_app's R sources). javac_shard_size is ignored: shards compile the same classes, javac runs once per module.
 //   - Not supported, reported as problems: errorprone, jacoco, lint, hiddenapi, dexpreopt, R8 (optimize), services, kapt.
 
 // JavaTools are the host programs and directories the Java rules run, given by the caller (all absolute). Soong's equivalents:
@@ -59,8 +58,11 @@ type jNode struct {
 	sysDir  string
 	sysDeps []string
 	sysJars []string
-	// java_plugin
-	processor string
+	// java_plugin; generatesApi: generates_api (JavaPluginInfo.GeneratesApi)
+	processor    string
+	generatesApi bool
+	// exportedDisableTurbine: an exported plugin generates API, so dependents cannot take turbine headers
+	expDisableTurbine bool
 	// aidl.export_include_dirs (tree-relative): dependents' aidl -I (JavaInfo.AidlIncludeDirs)
 	aidlExport []string
 	// jarjar rename rules it hands dependents, original class -> new name ("" = renamed by a later jarjar_prefix); jarjar.go
@@ -458,10 +460,11 @@ type javaDeps struct {
 	sys                                  *jNode
 	staticImpl, staticRes                []string
 	// staticHeaders: the static libs' TransitiveStaticLibsHeaderJars (jNode.headers of each, in order), what compileJavaHeader merges into a
-	// device module's header; staticRepackaged: one of them exports a repackaged header beside the unmodified one
-	staticHeaders    []string
-	staticRepackaged bool
-	srcJars          []string
+	// device module's header
+	staticHeaders []string
+	// disableTurbine: a plugin (own, or exported by a libs / static_libs dependency) generates API, which turbine does not run
+	disableTurbine bool
+	srcJars        []string
 	// aidl: libs' and static_libs' exported include dirs (tree-relative), the SDK's preprocessed file (absolute; "" = none), and the
 	// generated one a module SDK would need instead (not built)
 	aidlIncludes            []string
@@ -532,6 +535,7 @@ func (g *Graph) collectJavaDeps(n *jNode, s sdkSpec) (javaDeps, []*jNode) {
 			d.dexClasspath = append(d.dexClasspath, l.headers()...)
 			d.aidlIncludes = append(d.aidlIncludes, l.aidlExport...)
 			addPlugins(l.expPluginJars, l.expProcessors)
+			d.disableTurbine = d.disableTurbine || l.expDisableTurbine
 		}
 	}
 	for _, r := range p.strs("static_libs") {
@@ -545,11 +549,11 @@ func (g *Graph) collectJavaDeps(n *jNode, s sdkSpec) (javaDeps, []*jNode) {
 			// staticLibTag: TransitiveStaticLibsHeaderJars joins the classpath whole (the unmodified and the repackaged header alike)
 			d.classpath = append(d.classpath, l.headers()...)
 			d.staticHeaders = append(d.staticHeaders, l.headers()...)
-			d.staticRepackaged = d.staticRepackaged || l.repackagedHeader != ""
 			d.staticImpl = append(d.staticImpl, l.impl...)
 			d.staticRes = append(d.staticRes, l.res...)
 			d.aidlIncludes = append(d.aidlIncludes, l.aidlExport...)
 			addPlugins(l.expPluginJars, l.expProcessors)
+			d.disableTurbine = d.disableTurbine || l.expDisableTurbine
 			statics = append(statics, l)
 		}
 	}
@@ -564,6 +568,7 @@ func (g *Graph) collectJavaDeps(n *jNode, s sdkSpec) (javaDeps, []*jNode) {
 				classes = []string{pl.processor}
 			}
 			addPlugins([]string{pl.implRes}, classes)
+			d.disableTurbine = d.disableTurbine || pl.generatesApi
 		}
 	}
 	d.classpath = dedupKeep(d.classpath)
@@ -718,7 +723,6 @@ func (g *Graph) javaLibWith(n *jNode, extra javaExtra) {
 		g.problem("%s: cannot depend directly on java_sdk_library %s", n.name, n.mod.Name)
 		return
 	}
-	// javac_shard_size shards javac only with Turbine (base.go enableSharding), which is off
 	for _, k := range []string{"services"} {
 		if p.get(k) != nil {
 			g.problem("%s: %s is unsupported", n.name, k)
@@ -745,6 +749,7 @@ func (g *Graph) javaLibWith(n *jNode, extra javaExtra) {
 	d.classpath = append(slices.Clone(extra.classpath), d.classpath...)
 	if n.typ == "java_plugin" {
 		n.processor = p.str("processor_class")
+		n.generatesApi = p.boolean("generates_api", false)
 	}
 	for _, dir := range p.obj("aidl").strs("export_include_dirs") {
 		n.aidlExport = append(n.aidlExport, filepath.Join(n.mod.Dir, dir))
@@ -755,6 +760,8 @@ func (g *Graph) javaLibWith(n *jNode, extra javaExtra) {
 			if pl.processor != "" {
 				n.expProcessors = append(n.expProcessors, pl.processor)
 			}
+			// exportedPluginTag assigns, so the last exported plugin decides (Soong's behaviour, kept)
+			n.expDisableTurbine = pl.generatesApi
 		}
 	}
 	src := g.javaSrcs(n, srcs)
@@ -793,16 +800,27 @@ func (g *Graph) javaLibWith(n *jNode, extra javaExtra) {
 			flags = append(flags, "--patch-module="+pm+"="+strings.Join(paths, ":"))
 		}
 	}
-	// localPlain: the compiled jars before repackaging, the local part of a device module's header (javaHeaders)
-	var localImpl, localPlain []string
+	// hdr: what turbine compiles (compileJavaHeader); its extra jars are the kotlin headers and extraCombinedJars
+	hdr := headerSrcs{java: java, srcjars: srcjars, waits: waits, flags: flags, ver: ver}
+	var localImpl []string
 	// compile: jarjar rename rules inherited from dependencies (jarjar.go), applied to each compiled jar (repackageFlagsIfNecessary)
 	repackage := g.repackageRules(n, srcs, s)
 	if p.boolean("headers_only", false) {
 		// base.go compile: headers_only compiles header classes with Turbine (Soong rejects it with Turbine off) and nothing else
-		g.turbineHeaders(n, java, src.kt, srcjars, waits, flags, ver, d, jar, repackage)
+		if len(src.kt) > 0 {
+			g.problem("%s: compiling headers_only with .kt not supported", n.name)
+			return
+		}
+		if d.disableTurbine {
+			g.problem("%s: headers_only is enabled but Turbine is disabled", n.name)
+			return
+		}
+		g.turbineHeaders(n, hdr, d, jar, repackage)
 		return
 	}
 	if len(src.kt) > 0 {
+		// turbine runs every annotation processor of a module with kotlin sources (base.go compile), so it stays on
+		d.disableTurbine = false
 		// kotlinc first over every .java and .kt source (it reads the java ones only to resolve types), then javac against its header jar
 		if len(d.processorPath) > 0 {
 			g.problem("%s: annotation processors on Kotlin sources need kapt, which is unsupported", n.name)
@@ -810,16 +828,16 @@ func (g *Graph) javaLibWith(n *jNode, extra javaExtra) {
 		kt, kh := filepath.Join(n.dir, "kotlin", jar), filepath.Join(n.dir, "kotlin_headers", jar)
 		g.kotlinc(n, kt, kh, java, src.kt, srcjars, waits, ver, d)
 		localImpl = append(localImpl, g.repackage(n, kt, repackage, "kotlinc", jar))
-		localPlain = append(localPlain, kt)
+		hdr.extra = append(hdr.extra, kh)
 		d.classpath = append([]string{kh}, d.classpath...)
 	}
 	if len(java)+len(srcjars) > 0 {
 		classes := out("javac")
 		g.javac(n, classes, java, srcjars, waits, flags, ver, d)
 		localImpl = append(localImpl, g.repackage(n, classes, repackage, "javac", jar))
-		localPlain = append(localPlain, classes)
 	}
 	localImpl = append(localImpl, extra.combined...)
+	hdr.extra = append(hdr.extra, extra.combined...)
 
 	// resources (java_resource_dirs, java_resources)
 	resArgs, resDeps, resWaits := g.javaResources(n)
@@ -918,7 +936,7 @@ func (g *Graph) javaLibWith(n *jNode, extra javaExtra) {
 	}
 	n.impl = implJars
 	if impl != "" {
-		g.javaHeaders(n, impl, localPlain, d, repackage, validations, jar)
+		g.javaHeaders(n, impl, hdr, d, repackage, validations, jar)
 	}
 
 	// implementation + resources
@@ -938,38 +956,29 @@ func (g *Graph) javaLibWith(n *jNode, extra javaExtra) {
 	}
 }
 
-// javaHeaders sets n.header (HeaderJars) and n.repackagedHeader (RepackagedHeaderJars) from the implementation jar and the classes
-// compiled before repackaging (base.go compile, compileJavaHeader).
-//   - Host (Soong: Turbine off) and device modules neither repackaged nor merging a repackaged static lib: the implementation jar without
-//     META-INF/services (convertImplementationJarToHeaderJar).
-//   - Device (Turbine on) otherwise: header = jarjar_rules(merge of the local classes and the static libs' headers), where a repackaged
-//     static lib contributes its unmodified and its repackaged header; repackaged header = the inherited rename rules over that header.
-//     Both are exported (localHeaderJars) and dependents compile against both, so sources naming a class the repackaging moved (ims-common
-//     naming com.android.internal.telephony.flags, which framework-minus-apex moves under hidden_from_bootclasspath) still resolve.
-//     Turbine is not run: the classes stand in for the header classes, so META-INF/services is stripped as the host path does.
-func (g *Graph) javaHeaders(n *jNode, impl string, local []string, d javaDeps, repackage string, validations []string, jar string) {
-	j := g.java
-	header := filepath.Join(n.dir, "javac-header", jar)
-	n.header = header
-	srcs := dedupKeep(append(append([]string{}, local...), d.staticHeaders...))
-	if n.side != Device || len(srcs) == 0 || repackage == "" && !d.staticRepackaged {
-		j.edgeV("header", []string{header}, []string{impl}, nil, nil, validations, nil)
+// javaHeaders sets n.header (HeaderJars) and n.repackagedHeader (RepackagedHeaderJars) (base.go compile).
+//   - Device, no plugin generating API: turbine's header classes (compileJavaHeader), through jarjar_rules ("turbine"); repackaged header =
+//     the inherited rename rules over it. Both are exported (localHeaderJars) and dependents compile against both, so sources naming a class
+//     the repackaging moved (ims-common naming com.android.internal.telephony.flags, which framework-minus-apex moves under
+//     hidden_from_bootclasspath) still resolve. A method-body edit leaves turbine's bytes alone, so dependents' javac does not rerun.
+//   - Host (Soong: Turbine is device-only) and device modules with an API-generating plugin: the implementation jar without
+//     META-INF/services (convertImplementationJarToHeaderJar); no repackaged header.
+func (g *Graph) javaHeaders(n *jNode, impl string, hdr headerSrcs, d javaDeps, repackage string, validations []string, jar string) {
+	if n.side == Device && !d.disableTurbine {
+		header := g.compileJavaHeader(n, hdr, d, jar, validations)
+		if rules := g.jarjarRulesFile(n); rules != "" {
+			jj := filepath.Join(n.dir, "jarjar", "turbine", jar)
+			g.jarjar(n, jj, header, rules, 1)
+			header = jj
+		}
+		n.header = header
+		if repackage != "" {
+			n.repackagedHeader = g.repackage(n, header, repackage, "turbine", jar)
+		}
 		return
 	}
-	merged := srcs[0]
-	if len(srcs) > 1 {
-		merged = filepath.Join(n.dir, "turbine-combined", jar)
-		j.combine(merged, srcs, "")
-	}
-	if rules := g.jarjarRulesFile(n); rules != "" {
-		jj := filepath.Join(n.dir, "jarjar", "turbine", jar)
-		g.jarjar(n, jj, merged, rules, 1)
-		merged = jj
-	}
-	j.edgeV("header", []string{header}, []string{merged}, nil, nil, validations, nil)
-	if repackage != "" {
-		n.repackagedHeader = g.repackage(n, header, repackage, "turbine", jar)
-	}
+	n.header = filepath.Join(n.dir, "javac-header", jar)
+	g.java.edgeV("header", []string{n.header}, []string{impl}, nil, nil, validations, nil)
 }
 
 // output is what building a Java goal means: its dex jar, else its jar with resources, else its stubs / system modules.
@@ -1379,8 +1388,8 @@ func (g *Graph) globDirs(dir string, pats []string) []string {
 // (java/builder.go javac, jar, combineJar, convertImplementationJarToHeaderJar, jarjar, packageCheck, zipalign; dex.go d8;
 // system_modules.go jarsTosystemModules). Soong's javac wrapper and incremental-state tools (soong_javac_wrapper, find_input_delta)
 // do not change outputs and are not used; srcjars are unpacked with unzip (zipsync's job).
-// javac and header commit their jar only when its bytes changed and restat (commitIfChanged): javac as Soong's javac rule does; header stands in
-// for Soong's device header jar, which is turbine's (cmp + restat). A dependent edit that leaves a jar's bytes alone stops the rebuild there.
+// javac, header and turbine commit their jar only when its bytes changed and restat (commitIfChanged), as Soong's javac and turbine rules do.
+// A dependent edit that leaves a jar's bytes alone stops the rebuild there.
 func (j *javaGraph) header(g *Graph) string {
 	c := j.cfg
 	tools := j.tools

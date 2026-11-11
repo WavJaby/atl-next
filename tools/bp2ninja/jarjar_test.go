@@ -85,16 +85,17 @@ func TestJarjarRepackaging(t *testing.T) {
 	}
 	// base.go compile (Turbine on, a device module): headerJarFile = jarjarIfNecessary(turbine-combined) then, repackaged,
 	// repackagedHeaderJarFile = repackageFlagsIfNecessary(headerJarFile); localHeaderJars = both, libs dependents compile against both
-	plain, repackaged := filepath.Join(dir, "javac-header", "fw.jar"), filepath.Join(dir, "repackaged-jarjar", "turbine", "fw.jar")
+	plain, repackaged := filepath.Join(dir, "jarjar", "turbine", "fw.jar"), filepath.Join(dir, "repackaged-jarjar", "turbine", "fw.jar")
 	if got := n.headers(); len(got) != 2 || got[0] != plain || got[1] != repackaged {
 		t.Errorf("headers %v", got)
 	}
-	if e := ninjaEdgeVars(ninja, plain); e == nil || !strings.Contains(e[""], filepath.Join(dir, "jarjar", "turbine", "fw.jar")) {
-		t.Errorf("plain header %v", e)
-	}
-	if e := ninjaEdgeVars(ninja, filepath.Join(dir, "jarjar", "turbine", "fw.jar")); e == nil || !strings.Contains(e[""], filepath.Join(dir, "javac", "fw.jar")) ||
-		e["rules"] != esc(g.abs("j/rules.txt")) || e["total"] != "1" {
+	comb := filepath.Join(dir, "turbine-combined", "fw.jar")
+	if e := ninjaEdgeVars(ninja, plain); e == nil || !strings.Contains(e[""], ": jarjar "+comb) || e["rules"] != esc(g.abs("j/rules.txt")) || e["total"] != "1" {
 		t.Errorf("header jarjar %v", e)
+	}
+	// turbine-combined holds turbine's classes, never javac's
+	if e := ninjaEdgeVars(ninja, comb); e == nil || !strings.Contains(e[""], filepath.Join(dir, "turbine", "fw.jar")) || strings.Contains(e[""], filepath.Join(dir, "javac", "fw.jar")) {
+		t.Errorf("turbine-combined %v", e)
 	}
 	if e := ninjaEdgeVars(ninja, repackaged); e == nil || e["rules"] != esc(rules) || !strings.Contains(e[""], plain) {
 		t.Errorf("repackaged header %v", e)
@@ -151,7 +152,7 @@ func TestRepackagedStaticLibHeaders(t *testing.T) {
 	if strings.Contains(hdr[""], filepath.Join(g.out, "device", "lib", "combined")) {
 		t.Errorf("wrap's header merges lib's implementation: %s", hdr[""])
 	}
-	if got := wrap.headers(); len(got) != 2 || got[0] != filepath.Join(wdir, "javac-header", "wrap.jar") || got[1] != filepath.Join(wdir, "repackaged-jarjar", "turbine", "wrap.jar") {
+	if got := wrap.headers(); len(got) != 2 || got[0] != filepath.Join(wdir, "turbine-combined", "wrap.jar") || got[1] != filepath.Join(wdir, "repackaged-jarjar", "turbine", "wrap.jar") {
 		t.Errorf("wrap headers %v", got)
 	}
 	// the implementation merge keeps lib's repackaged implementation only
