@@ -3,7 +3,7 @@
 //! CMake only: the one upstream built this way is BoringSSL (CLAUDE.md). `cmake` is shared with the LLVM runtimes for the bionic targets (`runtimes`), CMake's other allowed use. A second build system becomes a `Recipe` field when its first upstream arrives.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, ensure};
@@ -41,16 +41,54 @@ pub fn recipe(name: &str) -> Option<&'static Recipe> {
     RECIPES.iter().find(|r| r.name == name)
 }
 
+/// What the converter derives for its host modules (`bp2ninja -upstream-toolchain`), not restated here: the libc++ headers and, for a cross host, the target flags (`--target`, `--sysroot`, `-march`) from arches.toml.
+#[derive(serde::Deserialize)]
+pub struct Flags {
+    pub libcxx: PathBuf,
+    pub compile: Vec<String>,
+    pub link: Vec<String>,
+}
+
 /// The C/C++ toolchain of the converter's build; an upstream is compiled with the same one.
 pub struct Toolchain<'a> {
     pub cc: &'a str,
     pub cxx: &'a str,
-    /// The libc++ headers `cxx` is installed with, as the converter derives them (`bp2ninja -libcxx-headers`), not restated here.
-    pub libcxx: &'a Path,
+    pub flags: &'a Flags,
+    /// Cross host: its arch name, CMake's `CMAKE_SYSTEM_PROCESSOR` (with `CMAKE_SYSTEM_NAME` it puts CMake in cross mode: no try_run, no build-machine search paths).
+    pub cross_processor: Option<&'a str>,
 }
 
 /// The link flags of the default libc++ selection (bp2ninja stl.go `stlLinkFlags`).
 const STL_LINK_FLAGS: &str = "-nostdlib++ -lc++";
+
+/// The CMake cache entries of `tc`: compilers, target flags on every language (asm sources too) and on links, the libc++ selection.
+fn toolchain_cache(tc: &Toolchain) -> Vec<(&'static str, String)> {
+    let target = tc.flags.compile.join(" ");
+    let link = format!("{} {STL_LINK_FLAGS}", tc.flags.link.join(" "));
+    let mut cache = vec![
+        ("CMAKE_C_COMPILER", tc.cc.to_owned()),
+        ("CMAKE_CXX_COMPILER", tc.cxx.to_owned()),
+        ("CMAKE_C_FLAGS", target.clone()),
+        ("CMAKE_ASM_FLAGS", target.clone()),
+        // one C++ runtime per process, selected as the converter selects it for a module with the default stl (bp2ninja stl.go, after Soong's cc/stl.go non-Bionic branch)
+        (
+            "CMAKE_CXX_FLAGS",
+            format!(
+                "{target} -nostdinc++ -isystem {}",
+                tc.flags.libcxx.display()
+            )
+            .trim_start()
+            .to_owned(),
+        ),
+        ("CMAKE_SHARED_LINKER_FLAGS", link.clone()),
+        ("CMAKE_EXE_LINKER_FLAGS", link),
+    ];
+    if let Some(processor) = tc.cross_processor {
+        cache.push(("CMAKE_SYSTEM_NAME", "Linux".to_owned()));
+        cache.push(("CMAKE_SYSTEM_PROCESSOR", processor.to_owned()));
+    }
+    cache
+}
 
 /// Configures, builds and installs one upstream (incremental: cmake + ninja reuse `<out>/upstream/<name>/build`; install leaves unchanged files' mtimes alone, so dependents do not relink), then its provided modules.
 pub fn build(
@@ -68,21 +106,13 @@ pub fn build(
     let (build, prefix) = (dir.join("build"), dir.join("prefix"));
     std::fs::create_dir_all(&build)?;
     let log = dir.join("build.log");
-    let cache = [
-        ("CMAKE_BUILD_TYPE", "Release".to_owned()),
-        ("CMAKE_C_COMPILER", tc.cc.to_owned()),
-        ("CMAKE_CXX_COMPILER", tc.cxx.to_owned()),
-        // one C++ runtime per process, selected as the converter selects it for a module with the default stl (bp2ninja stl.go, after Soong's cc/stl.go non-Bionic branch)
-        (
-            "CMAKE_CXX_FLAGS",
-            format!("-nostdinc++ -isystem {}", tc.libcxx.display()),
-        ),
-        ("CMAKE_SHARED_LINKER_FLAGS", STL_LINK_FLAGS.to_owned()),
-        ("CMAKE_EXE_LINKER_FLAGS", STL_LINK_FLAGS.to_owned()),
+    let mut cache = vec![("CMAKE_BUILD_TYPE", "Release".to_owned())];
+    cache.extend(toolchain_cache(tc));
+    cache.extend([
         ("CMAKE_INSTALL_PREFIX", prefix.display().to_string()),
         // GNUInstallDirs may pick lib/<multiarch>; the artifact path below assumes lib
         ("CMAKE_INSTALL_LIBDIR", "lib".to_owned()),
-    ];
+    ]);
     let cache: Vec<(&str, &str)> = cache
         .iter()
         .map(|(k, v)| (*k, v.as_str()))

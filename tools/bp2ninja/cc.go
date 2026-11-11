@@ -197,8 +197,6 @@ type Graph struct {
 	dropped map[string]bool
 	// providers.toml rows built outside the tree (provided.go)
 	provided map[string]Provided
-	// cross host: the upstream providers.toml rows, named but never built here (plan A3a); crossProviderUse fails a goal closure that reaches one
-	crossProviders map[string]bool
 	// bionic sides' provided modules: the LLVM runtimes archives built for the guest (xtask runtimes) under Soong's module names (libc++_static_noexcept, libclang_rt.builtins, ...)
 	nbProvided map[string]Provided
 	// providers.toml rows replacing only some sources of a module, and the "module\x00file" ones dropped (provided.go)
@@ -297,23 +295,6 @@ func (g *Graph) ccGoalSide(goal string) Side {
 		return Host
 	}
 	return Device
-}
-
-// crossProviderUse: a cross host builds no upstream provider yet (plan A3a), so a goal closure reaching one fails here rather than linking the tree's copy built for the wrong arch.
-func (g *Graph) crossProviderUse() error {
-	if !g.cfg.HostCross.set() {
-		return nil
-	}
-	used := map[string]bool{}
-	for k := range g.nodes {
-		if g.crossProviders[k.name] {
-			used[k.name] = true
-		}
-	}
-	if len(used) == 0 {
-		return nil
-	}
-	return fmt.Errorf("cross host: upstream providers not supported until A3a: %s", strings.Join(sortedKeys(used), " "))
 }
 
 // lookup finds a module by Soong reference: `name`, `//dir:name`, `name#tag`; prebuilts, imports

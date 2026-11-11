@@ -70,29 +70,6 @@ cc_library { name: "optout", device_supported: false }`})
 	}
 }
 
-// A cross host builds no upstream provider (plan A3a): a goal whose closure reaches one fails, naming it; a closure without one passes.
-func TestCrossProviderUse(t *testing.T) {
-	g := graphFor(t, map[string]string{"p/Android.bp": `
-cc_library { name: "libgoal", host_supported: true, shared_libs: ["libprovided"] }
-cc_library { name: "libfree", host_supported: true }
-cc_library { name: "libprovided", host_supported: true }
-`})
-	g.cfg.HostCross = riscvCross
-	g.crossProviders = map[string]bool{"libprovided": true}
-	if g.node("libfree", Host, Shared, "goal") == nil {
-		t.Fatal("libfree: no host node")
-	}
-	if err := g.crossProviderUse(); err != nil {
-		t.Errorf("closure without a provider: %v", err)
-	}
-	if g.node("libgoal", Host, Shared, "goal") == nil {
-		t.Fatal("libgoal: no host node")
-	}
-	if err := g.crossProviderUse(); err == nil || !strings.Contains(err.Error(), "cross host: upstream providers not supported until A3a: libprovided") {
-		t.Errorf("closure reaching a provider: %v", err)
-	}
-}
-
 // A cross host's libc++ headers must lie under its sysroot: the distro's own include dir is the build machine's libc++. The sysroot prefix ends at a separator, so root-other is not under root.
 func TestLibcxxInSysroot(t *testing.T) {
 	for _, c := range []struct {

@@ -117,6 +117,27 @@ func (h HostCross) linkFlags() []string {
 	return []string{"--target=" + h.Target, "--sysroot=" + h.Sysroot}
 }
 
+// UpstreamToolchain: what a build outside the converter (xtask upstream.rs: CMake) needs to compile and link like a host module: one derivation, read through -upstream-toolchain.
+type UpstreamToolchain struct {
+	Libcxx  string   `json:"libcxx"`
+	Compile []string `json:"compile"`
+	Link    []string `json:"link"`
+}
+
+// upstreamToolchainOf: the converter's libc++ and host target flags. Link adds -fuse-ld=lld, which the converter's host links get from Soong's lldflags (readLldflags) and which a cross link needs: the distro's ld is the build machine's.
+func upstreamToolchainOf(cxx string, h HostCross) (UpstreamToolchain, error) {
+	dir, err := libcxxProvider(cxx, h)
+	if err != nil {
+		return UpstreamToolchain{}, err
+	}
+	return UpstreamToolchain{
+		Libcxx: dir,
+		// non-nil: the build machine's empty list must read as [] (json: nil -> null)
+		Compile: append([]string{}, h.compileFlags()...),
+		Link:    append(h.linkFlags(), "-fuse-ld=lld"),
+	}, nil
+}
+
 // common: the side's Global.CommonFlags for a module in dir.
 func (f *GlobalFlags) common(side Side, dir string) []string {
 	out := slices.Clone(f.Head[side])

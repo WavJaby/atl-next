@@ -336,7 +336,7 @@ used_by = ["xtask:cross", "host:riscv64"]
 # (linux-libc-dev from main, not backports). libgcc-14-dev lays out usr/lib/gcc-cross/riscv64-linux-gnu/14, the GCC install clang
 # finds under the sysroot: crtbeginS.o/crtendS.o, the libgcc_s.so linker script, and (through it) usr/riscv64-linux-gnu/lib's crt1.o.
 # libc++ is the native riscv64 pair of trixie's llvm-toolchain-19 (trixie ships no libc++ cross packages): the Depends closure of
-# libc++-19-dev, all 1:19.1.7-3+b1. Headers under usr/lib/llvm-19/include/c++/v1 (bp2ninja -libcxx-headers); the .so.1 runtimes
+# libc++-19-dev, all 1:19.1.7-3+b1. Headers under usr/lib/llvm-19/include/c++/v1 (bp2ninja -upstream-toolchain); the .so.1 runtimes
 # (libc++, libc++abi, libunwind) for the link and NEEDED. libatomic1 (gcc-14 14.2.0-19, the native riscv64 package libc++1-19 Depends on) is their runtime NEEDED: pinned for the runtime closure.
 # system:libelf (providers.toml `libelf`, plan A2): libelf-dev and its Depends closure (zlib1g-dev, libzstd-dev), plus the runtime libelf1t64 and its NEEDED zlib1g, libzstd1. Native riscv64 packages, as libc++1-19 above.
 # system:vulkan (providers.toml `libvulkan`): libvulkan-dev and its runtime libvulkan1; libvulkan-dev's Depends python3:any is a build-time tool, not pinned (nothing here runs it).

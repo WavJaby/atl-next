@@ -59,7 +59,6 @@ func main() {
 	providedFile := flag.String("provided", "", "JSON file: module -> {libs, include, defines} of modules built outside the tree (providers.toml `crate:`, `upstream:` and `system:`, provided.go)")
 	aidlCratesFile := flag.String("aidl-crates", "", "JSON file: interface name -> {include_dirs, types, parcelables}: unstable aidl_interfaces defined at the tree root over the import closure of types, whose -rust backends workspace packages link (Cargo.toml `[package.metadata.atl.aidl]`, aidlcrates.go)")
 	srcsFile := flag.String("srcs", "", "JSON file: module -> {srcs, provider} of modules built without some of their sources (providers.toml rows with `srcs`, provided.go Partial); a listed file that is not a source of the module fails")
-	crossProviders := flag.String("cross-providers", "", "cross host only: comma-separated providers.toml modules whose upstream: provider the cross host does not build yet (plan A3a); a goal closure reaching one fails. Crate and system providers are built for the cross host by xtask native and need no entry")
 	rustAndroid := flag.String("rust-android", "", "comma-separated device Rust modules compiled as Android userspace: android target blocks + --cfg "+rustAndroidCfg+" (providers.toml `rust_os = \"android\"`, rust.go rustOSSide)")
 	defines := flag.String("defines", "", "comma-separated module:MACRO (NAME or NAME=VALUE): macros the module's device C/C++ compiles get as -D, read by a patch to its source (providers.toml `defines`, provided.go parseDefines)")
 	standIn := flag.String("stand-in", "", "comma-separated module=tree-module pairs: the tree module is built wherever the module is named, and must install under its name (stem + suffix) (providers.toml `module:`)")
@@ -69,7 +68,7 @@ func main() {
 	release := flag.String("release", "", "build/release config (TARGET_RELEASE): build flags and aconfig values (aconfig flag libraries; Java goals)")
 	measure := flag.Bool("measure", false, "write <out>/measure.txt (module types and source kinds the goals reach, measure.go) instead of a build")
 	cxxProbe := flag.String("device-cxx-flags", "", "tree dir: instead of a build, write <out>/compat (the libc provider from -provided) and print as JSON {argv, android} the C++ command line a device module there gets with nothing of its own, and the -D__ANDROID__ define in it (xtask check step libcxx); takes no goals")
-	libcxxHeaders := flag.Bool("libcxx-headers", false, "print the libc++ headers directory (stl.go libcxxProvider) and exit, for builds outside the converter that must compile C++ against the same libc++ (xtask upstream.rs): the one -cxx searches, or a cross host's -host-libcxx (-cxx unused then); takes -cxx and the -host-* flags too")
+	upstreamToolchain := flag.Bool("upstream-toolchain", false, "print as JSON {libcxx, compile, link} and exit, for builds outside the converter that must compile and link like its host modules (xtask upstream.rs): the libc++ headers (stl.go libcxxProvider: the one -cxx searches, or a cross host's -host-libcxx) and the host target flags (soongflags.go HostCross); takes -cxx and the -host-* flags too")
 	hostTarget := flag.String("host-target", "", "cross host (the build machine is another arch): the clang triple of the host's code (arches.toml clang); with -host-sysroot, -host-isa and -host-libcxx, all four or none")
 	hostSysroot := flag.String("host-sysroot", "", "cross host: the target's sysroot directory (a fetched sysroot_debs row, deps.toml)")
 	hostISA := flag.String("host-isa", "", "cross host: -march of the host's code (arches.toml isa)")
@@ -81,13 +80,18 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -host-target, -host-sysroot, -host-isa and -host-libcxx go together")
 		os.Exit(2)
 	}
-	if *libcxxHeaders {
-		dir, err := libcxxProvider(*cxx, cross)
+	if *upstreamToolchain {
+		tc, err := upstreamToolchainOf(*cxx, cross)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "bp2ninja:", err)
 			os.Exit(1)
 		}
-		fmt.Println(dir)
+		b, err := json.Marshal(tc)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "bp2ninja:", err)
+			os.Exit(1)
+		}
+		fmt.Println(string(b))
 		return
 	}
 	if *tree == "" || *out == "" || *arch == "" || (*bits != 32 && *bits != 64) || (flag.NArg() == 0) == (*cxxProbe == "" && *nbExports == "") || (*nbExports != "" && *nbArch == "") {
@@ -104,7 +108,6 @@ func main() {
 		return out
 	}
 	omitted, android := set(*omit), set(*rustAndroid)
-	crossProvided := set(*crossProviders)
 	stand := map[string]string{}
 	for _, pair := range strings.Split(*standIn, ",") {
 		if pair == "" {
@@ -163,7 +166,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -provided / -srcs:", err)
 		os.Exit(1)
 	}
-	if err := run(*tree, *out, cfg, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion, *libclang, *llvm, *launcher, *rtInclude, *bionicStaticRust}, javaSetup{jt, *release, *measure}, omitted, crossProvided, provided, nbProvided, partial, android, moduleDefines, stand, aidlCrates, *nbExports, flag.Args()); err != nil {
+	if err := run(*tree, *out, cfg, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion, *libclang, *llvm, *launcher, *rtInclude, *bionicStaticRust}, javaSetup{jt, *release, *measure}, omitted, provided, nbProvided, partial, android, moduleDefines, stand, aidlCrates, *nbExports, flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja:", err)
 		os.Exit(1)
 	}
@@ -222,7 +225,7 @@ type javaSetup struct {
 	measure bool
 }
 
-func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit, crossProviders map[string]bool, provided, nbProvided map[string]Provided, partial map[string]Partial, rustAndroid map[string]bool, defines map[string][]string, stand map[string]string, aidlCrates map[string]AidlCrate, nbExports string, goals []string) error {
+func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[string]bool, provided, nbProvided map[string]Provided, partial map[string]Partial, rustAndroid map[string]bool, defines map[string][]string, stand map[string]string, aidlCrates map[string]AidlCrate, nbExports string, goals []string) error {
 	files, err := discover(tree)
 	if err != nil {
 		return err
@@ -233,7 +236,7 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit, crossPro
 	}
 	// not passed (toolchainLocation, keepFlag): reported on every run, so a change in what is dropped shows
 	fmt.Printf("bp2ninja: Soong global flags not passed (diagnostics, debug info, prebuilt toolchain location): %s\n", strings.Join(soong.Flags.Skipped, " "))
-	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, crossProviders: crossProviders, provided: provided, nbProvided: nbProvided, partial: partial, rustAndroid: rustAndroid, defines: defines, stand: stand, rtInclude: tools.RtInclude, bionicStaticRust: tools.BionicStaticRust, nodes: map[key]*Node{}}
+	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, provided: provided, nbProvided: nbProvided, partial: partial, rustAndroid: rustAndroid, defines: defines, stand: stand, rtInclude: tools.RtInclude, bionicStaticRust: tools.BionicStaticRust, nodes: map[key]*Node{}}
 	if g.libcxx, err = libcxxProvider(tools.CXX, cfg.HostCross); err != nil {
 		return err
 	}
@@ -292,7 +295,6 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit, crossPro
 	}
 	names = append(names, sortedKeys(rustAndroid)...)
 	names = append(names, sortedKeys(keysOf(defines))...)
-	names = append(names, sortedKeys(crossProviders)...)
 	// a `module:` row's key may be absent (libartpalette-system: system/libartpalette is not fetched); its stand-in must exist, and node checks it installs under the key
 	for _, alt := range stand {
 		names = append(names, alt)
@@ -377,9 +379,6 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit, crossPro
 		if n := g.node(goal, g.ccGoalSide(goal), Shared, "goal"); n != nil {
 			ccGoals = append(ccGoals, n)
 		}
-	}
-	if err := g.crossProviderUse(); err != nil {
-		return err
 	}
 	if err := g.checkPartial(); err != nil {
 		return err

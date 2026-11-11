@@ -239,32 +239,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         fetch::add_and_fetch(root, &[])?;
     }
     // modules provided outside the tree, before the converter: it links their artifacts; each provider is built or resolved once (crates by cargo-c, upstreams by their own build system, system libraries as installed), then each module gets one entry joining its row's providers in order
-    // plan A3b: a cross host builds its crate and system providers for its target (cross::cargo_target); upstream ones wait for plan A3a, so the converter fails a goal closure that reaches one (-cross-providers)
-    let is_upstream = |row: &providers::Provider| {
-        row.provider
-            .as_deref()
-            .is_some_and(|p| p.starts_with("upstream:"))
-    };
-    let cross_names: Vec<&str> = providers
-        .iter()
-        .filter(|(_, row)| is_upstream(row))
-        .map(|(m, _)| m.as_str())
-        .collect();
-    let cross_provider_args: Vec<String> = if cross.is_some() {
-        vec!["-cross-providers".to_owned(), cross_names.join(",")]
-    } else {
-        Vec::new()
-    };
-    let built_here: providers::Providers = if cross.is_some() {
-        providers
-            .iter()
-            .filter(|(_, row)| !is_upstream(row))
-            .map(|(m, row)| (m.clone(), row.clone()))
-            .collect()
-    } else {
-        providers.clone()
-    };
-    let to_build = &built_here;
+    // a cross host builds every provider for its target: crates with cross::cargo_target, system rows from its sysroot, upstreams with the converter's cross flags (bp2ninja -upstream-toolchain)
+    let to_build = &providers;
     let crates = build_crates(root, &out, to_build, cross_cargo.as_ref())?;
     // a cross host's system rows resolve in its sysroot: the build machine's pkg-config path and library dirs never apply
     let target_root = cross
@@ -295,23 +271,24 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         );
         systems.insert(row, p);
     }
-    let libcxx = PathBuf::from(
-        crate::host_art::output(
-            Command::new(&converter)
-                .args([
-                    "-libcxx-headers",
-                    "-cxx",
-                    &flag_or_row(&args.cxx, root, "clang-cxx")?,
-                ])
-                .args(&cross_flags),
-            "bp2ninja -libcxx-headers",
-        )?
-        .trim(),
-    );
+    // the converter's own libc++ and host target flags: an upstream compiles and links as its host modules do
+    let flags: upstream::Flags = serde_json::from_str(&crate::host_art::output(
+        Command::new(&converter)
+            .args([
+                "-upstream-toolchain",
+                "-cxx",
+                &flag_or_row(&args.cxx, root, "clang-cxx")?,
+            ])
+            .args(&cross_flags),
+        "bp2ninja -upstream-toolchain",
+    )?)
+    .context("parsing bp2ninja -upstream-toolchain")?;
     let toolchain = upstream::Toolchain {
         cc: &flag_or_row(&args.cc, root, "clang")?,
         cxx: &flag_or_row(&args.cxx, root, "clang-cxx")?,
-        libcxx: &libcxx,
+        flags: &flags,
+        // CMake's cross mode (CMAKE_CROSSCOMPILING): the arch name is the clang triple's arch part (arches.toml `clang`)
+        cross_processor: cross.as_ref().map(|_| args.host.as_str()),
     };
     let checkouts = sources.checkouts(None);
     // by module: a recipe installs one artifact per module it provides
@@ -410,7 +387,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .arg("-out")
             .arg(&out)
             .args(&cross_flags)
-            .args(&cross_provider_args)
             .args([
                 "-arch",
                 &args.host,
