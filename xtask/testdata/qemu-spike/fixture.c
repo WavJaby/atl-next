@@ -7,6 +7,7 @@
 #include <setjmp.h>
 #include <signal.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <ucontext.h>
@@ -431,6 +432,31 @@ __attribute__((noinline)) u64 fx_overflow(void) {
     return overflow(0);
 }
 
+// (w) guest SIGABRT after the engine gave the host's SIGABRT back: fx_abort_catch() installs a guest SIGABRT handler, raise(SIGABRT)s and returns W_CAUGHT once the handler ran (W_MISSED if it did not, W_FAILED if sigaction failed). fx_abort() calls abort() with no handler: the process must end by SIGABRT.
+#define W_CAUGHT 0x5a
+#define W_MISSED 1
+#define W_FAILED 2
+static volatile u64 w_seen;
+static void w_handler(int sig) {
+    w_seen = (u64)sig;
+}
+
+__attribute__((noinline)) u64 fx_abort_catch(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = w_handler;
+    if (sigaction(SIGABRT, &sa, 0) != 0) {
+        return W_FAILED;
+    }
+    w_seen = 0;
+    raise(SIGABRT);
+    return w_seen == SIGABRT ? W_CAUGHT : W_MISSED;
+}
+
+__attribute__((noinline)) u64 fx_abort(void) {
+    abort();
+}
+
 // The gate table, read by the host (crates/atl-qemu-engine/tests/spike.rs `t`): u64 words, in this order.
 static const u64 table[] = {
     // 0..3: entry points
@@ -470,6 +496,8 @@ static const u64 table[] = {
     (u64)fx_sig_recover, X_ADDR,
     // 48..53: (v) fx_overflow, its return after the longjmp, the alternate stack's size, SS_ONSTACK, -EPERM, -ENOMEM
     (u64)fx_overflow, V_LONGJMP, V_ALT_SIZE, SS_ONSTACK, (u64)-EPERM, (u64)-ENOMEM,
+    // 54..56: (w) fx_abort_catch, its answer when the guest handler ran, fx_abort
+    (u64)fx_abort_catch, W_CAUGHT, (u64)fx_abort,
 };
 
 int main(void) {

@@ -83,6 +83,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("no-restore", "atl_qe_no_restore"),
     // gate (y): the old route, guest faults through the current user action (QEMU's handler, not restored): a host sigaction after boot takes them
     ("user-route", "atl_qe_user_route"),
+    // gate (w): BOOT leaves QEMU's handler on SIGFPE/ILL/QUIT/TRAP, so a host trap (ud2, SIGILL) on a thread with no CPU dies inside it by SIGSEGV (NULL thread_cpu)
+    ("no-core-restore", "atl_qe_no_core_restore"),
     // gate (e): the harness registers the special without SIGCHAIN_ALLOW_NORETURN, so QEMU's longjmp leaves sigchain's per-thread handling flag set and later faults skip every special
     ("no-noreturn", "atl_qe_no_noreturn"),
     // gate (l): the bind decode tests bit 14, so a binding thunk (bit 15) reaches QEMU's syscall path

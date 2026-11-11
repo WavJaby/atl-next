@@ -2,6 +2,7 @@
 //! SIGSEGV and SIGBUS: guest faults through a special handler, everything else through the process's user action.
 //! [`special`] is a sigchain special handler (AOSP art/sigchainlib `SigchainAction`). In an ART process ART registers it: NativeBridge `getSignalHandler` (native_bridge.h, interface >= 2) answers the bridge's forwarder to this engine's `fault` entry, and `InitializeNativeBridge` (art/runtime/native_bridge_art_interface.cc) adds it with a full `sc_mask` and `SIGCHAIN_ALLOW_NORETURN`, behind ART's FaultManager (fault_handler.cc). The spike harness registers it the same way.
 //! Sigchain's `Handler` (sigchain.cc) runs the specials in order, then the user action. A guest fault: [`special`] runs QEMU's handler and claims it. Anything else: declined, so the user action runs.
+//! The other core-dump signals (FPE, ILL, QUIT, TRAP), which `signal_init` also takes: [`install`] gives them back to the pre-QEMU action ([`CORE_SIGNALS`] says why that is safe for guest delivery).
 //! The user action: QEMU's `signal_init` (linux-user/signal.c) overwrites it with `host_signal_handler` and never chains the old one, and that handler calls `die_from_signal` for a fault it does not own. So [`capture_previous`] before QEMU's `main` records the action the process had, and [`install`] at BOOT, after `signal_init`, takes QEMU's for [`special`] and puts the previous one back.
 //! Why a special, not the user action: a host `sigaction(SIGSEGV)` after boot (a game engine, a crash reporter; sigchain records it as the user action) replaces only the user action, so guest faults still reach QEMU, and host faults reach that newer handler as the kernel would deliver them.
 //! No-return: QEMU's handler leaves a guest fault by `siglongjmp` into its CPU loop (`cpu_loop_exit_sigsegv`). Without `SIGCHAIN_ALLOW_NORETURN` sigchain sets its per-thread "handling" flag around the special and the longjmp skips the restore, so that thread's later faults skip every special (sigchain.cc 440-470). The mask sigchain sets for the special (`sc_mask`) does not outlive the longjmp: QEMU restores the interrupted mask first (`host_sigsegv_handler`: `sigprocmask(SIG_SETMASK, host_signal_mask(uc))`).
@@ -26,18 +27,25 @@ const PF_WRITE: u64 = 0x2;
 /// `si_code` of a SIGSEGV protection violation (uapi asm-generic/siginfo.h); the libc crate does not export it.
 const SEGV_ACCERR: c_int = 2;
 
-/// Per signal (index as [`SIGNALS`]): a sigaction record.
-struct Actions([libc::sigaction; 2]);
+/// The other host signals `signal_init` takes: `core_dump_signal` minus SEGV/BUS, mapped 1:1. Not SIGABRT: QEMU remaps the guest's to a host realtime signal (`signal_table_init`) and installs on that, leaving host SIGABRT alone.
+/// QEMU needs none of them on a host thread, and its handler there loads `get_task_state(thread_cpu)` with `thread_cpu` NULL before anything else (`host_signal_handler`), so a host `ud2` / `__builtin_trap` died by SIGSEGV instead of SIGILL. [`install`] gives them back to the process.
+/// Guest delivery does not use these host actions: guest ILL/FPE/TRAP from translated code are CPU exceptions queued by the cpu loop (`force_sig`), host ones with `si_code > 0` were `die_from_signal` anyway, and a guest `sigaction` for any of them re-installs QEMU's handler for that host signal (`do_sigaction`).
+const CORE_SIGNALS: [c_int; 4] = [libc::SIGFPE, libc::SIGILL, libc::SIGQUIT, libc::SIGTRAP];
+
+/// Per signal (index as the signal list it was taken for): a sigaction record.
+struct Actions<const N: usize>([libc::sigaction; N]);
 
 // SAFETY: sigaction records hold handler addresses and masks only; written once before any reader.
-unsafe impl Sync for Actions {}
+unsafe impl<const N: usize> Sync for Actions<N> {}
 // SAFETY: as for Sync.
-unsafe impl Send for Actions {}
+unsafe impl<const N: usize> Send for Actions<N> {}
 
 /// The user action before QEMU's `main`; [`install`] restores it.
-static PREVIOUS: OnceLock<Actions> = OnceLock::new();
+static PREVIOUS: OnceLock<Actions<2>> = OnceLock::new();
+/// As [`PREVIOUS`], for [`CORE_SIGNALS`].
+static PREVIOUS_CORE: OnceLock<Actions<4>> = OnceLock::new();
 /// QEMU's handlers as `signal_init` installed them; [`special`] runs them for guest faults. Set at [`install`]: until then [`special`] declines everything.
-static QEMU: OnceLock<Actions> = OnceLock::new();
+static QEMU: OnceLock<Actions<2>> = OnceLock::new();
 /// `helper_retaddr` of the BOOT thread: the only slot the `boot-only` break reads.
 static BOOT_SLOT: AtomicUsize = AtomicUsize::new(0);
 
@@ -94,9 +102,10 @@ fn query(sig: c_int) -> libc::sigaction {
     current(sig).unwrap_or_else(|| panic!("sigaction({sig}) query failed"))
 }
 
-/// Records the process's current SIGSEGV/SIGBUS actions. Before QEMU's `main` ([`crate::run`]).
+/// Records the process's current actions for [`SIGNALS`] and [`CORE_SIGNALS`]. Before QEMU's `main` ([`crate::run`]).
 pub(crate) fn capture_previous() {
     let _ = PREVIOUS.set(Actions(SIGNALS.map(query)));
+    let _ = PREVIOUS_CORE.set(Actions(CORE_SIGNALS.map(query)));
 }
 
 /// Registers the calling thread as a guest thread. Its `helper_retaddr` is resolved on this thread, so it is this thread's instance. Returns the slot.
@@ -128,6 +137,18 @@ pub(crate) fn install() {
     }
     if QEMU.set(Actions(qemu)).is_err() {
         return;
+    }
+    // break `no-core-restore` (gate w): QEMU's handler keeps the core-dump signals, so a host trap (SIGILL) on a thread with no CPU dies inside it by SIGSEGV
+    if !cfg!(atl_qe_no_core_restore) {
+        let core = &PREVIOUS_CORE
+            .get()
+            .expect("capture_previous before install")
+            .0;
+        for (act, sig) in core.iter().zip(CORE_SIGNALS) {
+            // SAFETY: act is a complete record from the capture query.
+            let rc = unsafe { libc::sigaction(sig, act, std::ptr::null_mut()) };
+            assert_eq!(rc, 0, "sigaction({sig}) restore failed");
+        }
     }
     // break `no-restore` (gates e, x): QEMU's handler stays the user action, so host faults reach its die_from_signal; break `user-route` (gate y) keeps it too, as the guest route
     if cfg!(atl_qe_no_restore) || cfg!(atl_qe_user_route) {

@@ -35,9 +35,9 @@ const CPU_LOOP: &str = "linux-user/aarch64/cpu_loop.c";
 const UACCESS: &str = "linux-user/uaccess.c";
 const QEMU_H: &str = "linux-user/qemu.h";
 const PACKAGE: &str = "atl-qemu-engine";
-const GATES: [char; 22] = [
+const GATES: [char; 23] = [
     'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 's', 't', 'u',
-    'v', 'x', 'y',
+    'v', 'w', 'x', 'y',
 ];
 /// Thunk slots in the fixture's pool, as the NB pool is sized (atl-native-bridge build.rs: stub rows + fixed bindings + JNI slots, rounded to a power of two; 3860 + 6 + 256 > 4096). Gate (l) uses the last slot, 8191.
 const POOL_SLOTS: u32 = 8192;
@@ -355,6 +355,15 @@ const RUNS: &[RunSpec] = &[
         base: "0",
         engine_break: Some("user-route"),
         red: Some('y'),
+    },
+    // gate (w): the host thread's ud2 reaches QEMU's handler, which reads its NULL thread_cpu: the child dies by SIGSEGV, not SIGILL
+    RunSpec {
+        name: "no-core-restore",
+        swap: None,
+        pool_skew: false,
+        base: "0",
+        engine_break: Some("no-core-restore"),
+        red: Some('w'),
     },
     // gate (e): the special registered without SIGCHAIN_ALLOW_NORETURN: after gate (d)'s guest fault longjmps out, the boot thread's faults skip both specials; (e)'s child reaches the previous action with no special call ("ran before the special handler"), and gate (f)'s host write then ends the run in the previous handler
     RunSpec {

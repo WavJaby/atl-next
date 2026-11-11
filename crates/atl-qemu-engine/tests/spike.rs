@@ -2,7 +2,7 @@
 //! Spike gates (QEMU bridge plan Q2/Q3, Q5-2), harness-less: `start` boots QEMU on its helper thread, whose BOOT trap runs gates (a)-(l) there and parks; the host threads then run (n), (u), (m), (o), (p), (s), (t), (v) on their own guest CPUs, and the process exits 0 when every gate is ok.
 //! Env (xtask qemu_spike.rs sets it; without it the run prints SKIP): `ATL_QEMU_SPIKE_SO` = the spike library, `ATL_QEMU_SPIKE_FIXTURE` = the static guest program, `ATL_QEMU_SIGCHAIN_OBJ` = AOSP libsigchain's object (build.rs links it and sets cfg `atl_qe_sigchain`). Args: `--guest-base <n>` (QEMU's `-B`, default 0 = identity).
 //! Expected values come from the fixture's table (fixture.c), never from the engine. One line per gate: `spike: (x) ok` or `spike: (x) FAIL <why>`.
-//! Gates: (a) trap arguments, (b) nested host/guest calls, (c) host memory, (d) guest store fault, (e) host fault order behind sigchain, (h) implicit null check through sigchain, (f) write into translated code, (g) second guest thread, (i) fatal guest fault on one thread, (j) the same on a second thread (both end by SIGSEGV), (k) host fault with previous action SIG_IGN (ends by SIGSEGV), (l) binding thunks from the guest pool (bit 15 of the svc immediate, id = slot); (n) helper boot: `start` returned with the BOOT answer, the helper stays parked, the creator thread attaches and calls; (m) two host threads attach at once and call concurrently, each with its own thread pointer and syscalls; (o) a write(2) on host heap memory, accepted under identity mapping (access_ok patch 0002), (p) a write straddling a QEMU-mapped page into host memory QEMU does not map; (s) four attached threads fill their guest stacks across one barrier and find their own words intact; (t) a guest store into the guard page below an attached CPU's stack is a guest SIGSEGV at that address (forked child); (u) 50 host threads attach, call and detach while another attached thread's guest loop churns guest mmap/munmap, translation and host calls (deadline: a hang prints FAIL); (v) two attached threads, both alive, each overflow their guest stack into its guard: an SA_ONSTACK SIGSEGV handler runs on the thread's own alternate stack (32 KiB, disjoint from the other's), sees SS_ONSTACK and EPERM there, siglongjmps out (forked child: with no alternate stack QEMU kills it); (x) a guest SA_SIGINFO handler leaving by siglongjmp gets its si_addr through the engine's special handler, the host mask survives the no-return exit, and later host faults on that thread still reach the previous action and ART's special; (y) a host `sigaction(SIGSEGV)` after boot does not take guest faults.
+//! Gates: (a) trap arguments, (b) nested host/guest calls, (c) host memory, (d) guest store fault, (e) host fault order behind sigchain, (h) implicit null check through sigchain, (f) write into translated code, (g) second guest thread, (i) fatal guest fault on one thread, (j) the same on a second thread (both end by SIGSEGV), (k) host fault with previous action SIG_IGN (ends by SIGSEGV), (l) binding thunks from the guest pool (bit 15 of the svc immediate, id = slot); (n) helper boot: `start` returned with the BOOT answer, the helper stays parked, the creator thread attaches and calls; (m) two host threads attach at once and call concurrently, each with its own thread pointer and syscalls; (o) a write(2) on host heap memory, accepted under identity mapping (access_ok patch 0002), (p) a write straddling a QEMU-mapped page into host memory QEMU does not map; (s) four attached threads fill their guest stacks across one barrier and find their own words intact; (t) a guest store into the guard page below an attached CPU's stack is a guest SIGSEGV at that address (forked child); (u) 50 host threads attach, call and detach while another attached thread's guest loop churns guest mmap/munmap, translation and host calls (deadline: a hang prints FAIL); (v) two attached threads, both alive, each overflow their guest stack into its guard: an SA_ONSTACK SIGSEGV handler runs on the thread's own alternate stack (32 KiB, disjoint from the other's), sees SS_ONSTACK and EPERM there, siglongjmps out (forked child: with no alternate stack QEMU kills it); (x) a guest SA_SIGINFO handler leaving by siglongjmp gets its si_addr through the engine's special handler, the host mask survives the no-return exit, and later host faults on that thread still reach the previous action and ART's special; (y) a host `sigaction(SIGSEGV)` after boot does not take guest faults; (w) a host `ud2` / `abort()` on a thread with no CPU ends by SIGILL / SIGABRT, and the guest's own SIGABRT (handled and unhandled) still works.
 //! Signals: the harness registers on the linked sigchain what ART does -- an ART FaultManager stand-in, then the engine's special (`signal::special`) with a full mask and `SIGCHAIN_ALLOW_NORETURN` -- and sets the pre-QEMU user action.
 #![allow(clippy::print_stdout, reason = "test harness output is its verdict")]
 
@@ -72,7 +72,10 @@ mod spike {
         pub const V_ONSTACK: usize = 51;
         pub const V_EPERM: usize = 52;
         pub const V_ENOMEM: usize = 53;
-        pub const LEN: usize = 54;
+        pub const ABORT_CATCH: usize = 54;
+        pub const W_CAUGHT: usize = 55;
+        pub const ABORT: usize = 56;
+        pub const LEN: usize = 57;
     }
 
     /// What the host answers a CALL with during gate (a): any value the guest cannot produce itself.
@@ -406,6 +409,7 @@ mod spike {
             ('l', gate_l),
             ('x', gate_x),
             ('y', gate_y),
+            ('w', gate_w),
         ] {
             GATE.with(|c| c.set(gate));
             REPORTS.lock().expect("reports").clear();
@@ -787,6 +791,59 @@ mod spike {
             Y_MISSED => Err("the guest handler did not see its fault address".to_owned()),
             Y_SURVIVED => Err("the host store did not fault".to_owned()),
             code => Err(format!("child exit {code}, expected {Y_OK}")),
+        }
+    }
+
+    /// Gate (w) child: a host thread that never attached a CPU runs `f`; the child dies by whatever `f` raises.
+    fn host_thread_child(f: fn()) -> Result<c_int, String> {
+        let pid = fork_child()?;
+        if pid == 0 {
+            // the child's only thread is this one (fork); the new thread is a plain host thread
+            let _ = std::thread::spawn(f).join();
+            // SAFETY: not reached unless f returned.
+            unsafe { libc::_exit(0) };
+        }
+        wait_signal(pid)
+    }
+
+    /// Gate (w), host traps (Q7-3), in forked children on a host thread with no CPU: a `ud2` (Rust's abort intrinsic, C `__builtin_trap`) must end by SIGILL under the pre-QEMU action (here the default); QEMU's handler, if still installed, reads a NULL `thread_cpu` and dies by SIGSEGV. A host `abort()` must end by SIGABRT (QEMU never takes host SIGABRT: it remaps the guest's). Then the guest's own SIGABRT still works: a guest handler catches its raise(SIGABRT), and a guest abort() with no handler ends a forked child by SIGABRT.
+    fn gate_w(g: Guest) -> Result<(), String> {
+        let cases: [(&str, fn(), c_int); 2] = [
+            // SAFETY: the trap under test.
+            ("ud2", || unsafe { std::arch::asm!("ud2") }, libc::SIGILL),
+            // SAFETY: the abort under test.
+            ("abort()", || unsafe { libc::abort() }, libc::SIGABRT),
+        ];
+        for (what, f, want) in cases {
+            match host_thread_child(f) {
+                Ok(sig) if sig == want => {}
+                Ok(sig) => {
+                    return Err(format!(
+                        "host thread {what}: child died by signal {sig}, expected {want}"
+                    ));
+                }
+                Err(e) => return Err(format!("host thread {what}: {e}")),
+            }
+        }
+        let caught = g.call(w(t::ABORT_CATCH), &[]);
+        if caught != w(t::W_CAUGHT) {
+            return Err(format!(
+                "guest raise(SIGABRT): fx_abort_catch returned {caught:#x}, expected {:#x} (fixture: 1 = handler did not run, 2 = sigaction failed)",
+                w(t::W_CAUGHT)
+            ));
+        }
+        let pid = fork_child()?;
+        if pid == 0 {
+            g.call(w(t::ABORT), &[]);
+            // SAFETY: not reached unless the guest survived abort().
+            unsafe { libc::_exit(0) };
+        }
+        match wait_signal(pid) {
+            Ok(libc::SIGABRT) => Ok(()),
+            Ok(sig) => Err(format!(
+                "guest abort(): child died by signal {sig}, expected SIGABRT"
+            )),
+            Err(e) => Err(format!("guest abort(): {e}")),
         }
     }
 
