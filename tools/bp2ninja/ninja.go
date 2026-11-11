@@ -164,6 +164,11 @@ rule fail
 // Per whitespace-separated token, since clang packs several short paths on one line; a token starting with `/` or `\` (absolute, line continuation) stays. Paths with escaped spaces are not handled (none in the tree).
 const rootDeps = `sed -i -E "s#(^|[[:space:]])([^/[:space:]\\][^[:space:]]*)#\1$root/\2#g" $out.d`
 
+// commitIfChanged: a command that wrote $out.tmp keeps the old $out (and its mtime) when every byte is equal (cmp), else moves the new one in. In
+// a `restat = 1` rule ninja then skips the dependents of an unchanged output (Soong: java/builder.go javac and turbine, java/sdk.go
+// commitChangeForRestat). Exact: any differing byte replaces the file.
+const commitIfChanged = `(if cmp -s $out.tmp $out; then rm $out.tmp; else mv $out.tmp $out; fi)`
+
 // nodeOut: the file a node builds ("" for kinds without one: generated sources, objects). Fixed by the node's module, side, kind and
 // properties, so Java edges may name a host tool before emit (javagen.go jhost).
 func (g *Graph) nodeOut(n *Node) string {

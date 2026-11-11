@@ -59,10 +59,10 @@ func (g *Graph) turbineHeaders(n *jNode, java, kt, srcjars, waits, flags []strin
 	n.header, n.impl, n.implRes = header, []string{header}, header
 }
 
-// turbineRule: the rule of turbineHeaders (cwd the tree root, sources tree-relative as javac's).
+// turbineRule: the rule of turbineHeaders (cwd the tree root, sources tree-relative as javac's); cmp + restat as Soong's turbine rule.
 func (j *javaGraph) turbineRule() string {
 	c := j.cfg
 	return "rule turbine\n  command = cd $root && $jdk/bin/java " + strings.Join(c.JavaVmFlags, " ") + " -jar $turbine --output $out.tmp --sources @$out.rsp --javacopts " +
-		strings.Join(c.CommonJdkFlags, " ") + " $flags -source $ver -target $ver -- --source_jars $srcjars $bootcp --classpath $cp && mv $out.tmp $out\n" +
-		"  rspfile = $out.rsp\n  rspfile_content = $in_newline\n  description = turbine $out\n"
+		strings.Join(c.CommonJdkFlags, " ") + " $flags -source $ver -target $ver -- --source_jars $srcjars $bootcp --classpath $cp && " + commitIfChanged + "\n" +
+		"  rspfile = $out.rsp\n  rspfile_content = $in_newline\n  restat = 1\n  description = turbine $out\n"
 }

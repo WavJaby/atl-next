@@ -1379,6 +1379,8 @@ func (g *Graph) globDirs(dir string, pats []string) []string {
 // (java/builder.go javac, jar, combineJar, convertImplementationJarToHeaderJar, jarjar, packageCheck, zipalign; dex.go d8;
 // system_modules.go jarsTosystemModules). Soong's javac wrapper and incremental-state tools (soong_javac_wrapper, find_input_delta)
 // do not change outputs and are not used; srcjars are unpacked with unzip (zipsync's job).
+// javac and header commit their jar only when its bytes changed and restat (commitIfChanged): javac as Soong's javac rule does; header stands in
+// for Soong's device header jar, which is turbine's (cmp + restat). A dependent edit that leaves a jar's bytes alone stops the rebuild there.
 func (j *javaGraph) header(g *Graph) string {
 	c := j.cfg
 	tools := j.tools
@@ -1391,9 +1393,10 @@ func (j *javaGraph) header(g *Graph) string {
 	fmt.Fprintf(&b, "jdk = %s\nsoongzip = %s\nmergezips = %s\nzip2zip = %s\nzipalign = %s\n", esc(tools.JDK), bt("soong_zip"),
 		bt("merge_zips"), bt("zip2zip"), bt("zipalign"))
 	fmt.Fprintf(&b, `rule javac
-  command = rm -rf $outdir $annodir $srcjardir $out.tmp && mkdir -p $outdir $annodir $srcjardir && %s && (if [ -s $srcjardir/list ] || [ -s $out.rsp ]; then cd $root && $jdk/bin/javac %s %s $processorpath $processor $flags $bootcp $cp -source $ver -target $ver -d $outdir -s $annodir @$out.rsp @$srcjardir/list; fi) && $soongzip -jar -o $out -C $outdir -D $outdir && rm -rf $outdir $srcjardir
+  command = rm -rf $outdir $annodir $srcjardir $out.tmp && mkdir -p $outdir $annodir $srcjardir && %s && (if [ -s $srcjardir/list ] || [ -s $out.rsp ]; then cd $root && $jdk/bin/javac %s %s $processorpath $processor $flags $bootcp $cp -source $ver -target $ver -d $outdir -s $annodir @$out.rsp @$srcjardir/list; fi) && $soongzip -jar -o $out.tmp -C $outdir -D $outdir && %s && rm -rf $outdir $srcjardir
   rspfile = $out.rsp
   rspfile_content = $srcs
+  restat = 1
   description = javac $out
 rule jar
   command = cd $root && $soongzip -jar -o $out @$out.rsp
@@ -1404,7 +1407,8 @@ rule combine
   command = $mergezips --ignore-duplicates -j $args $out $in
   description = merge $out
 rule header
-  command = $zip2zip -i $in -o $out -x 'META-INF/services/**/*'
+  command = $zip2zip -i $in -o $out.tmp -x 'META-INF/services/**/*' && %s
+  restat = 1
   description = header $out
 rule d8
   command = rm -rf $outdir && mkdir -p $outdir && PATH=$jdk/bin:$$PATH $d8 %s $flags --output $outdir --no-dex-input-jar $in && $soongzip $zipflags -o $outdir/classes.dex.jar -C $outdir -f "$outdir/classes*.dex" && $mergezips -D -stripFile "**/*.class" $out $outdir/classes.dex.jar $in && rm -f $outdir/classes*.dex $outdir/classes.dex.jar
@@ -1424,7 +1428,7 @@ rule sysmodules
 rule installexec
   command = cp -f $in $out && chmod +x $out
   description = install $out
-`, unpack, javacVm, strings.Join(c.CommonJdkFlags, " "), strings.Join(c.D8Flags, " "), strings.Join(c.JavaVmFlags, " "), c.JlinkVersion)
+`, unpack, javacVm, strings.Join(c.CommonJdkFlags, " "), commitIfChanged, commitIfChanged, strings.Join(c.D8Flags, " "), strings.Join(c.JavaVmFlags, " "), c.JlinkVersion)
 	b.WriteString(appRules)
 	b.WriteString(j.stubsRules(g, unpack))
 	b.WriteString(aconfigJavaRule)

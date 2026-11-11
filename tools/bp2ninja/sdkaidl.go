@@ -45,10 +45,14 @@ func (g *Graph) sdkFrameworkAidl(name, from string) string {
 	return out
 }
 
+// sdkAidlRules commit only changed bytes and restat, as Soong does for the combined file (sdk.go commitChangeForRestat): every jaidl edge
+// reads it, so stubs whose Parcelables did not change stop the rebuild there.
 const sdkAidlRules = `rule sdkparcelables
-  command = rm -f $out && $tool $in $out --guarantee_stable
+  command = rm -f $out.tmp && $tool $in $out.tmp --guarantee_stable && ` + commitIfChanged + `
+  restat = 1
   description = sdkparcelables $out
 rule sortu
-  command = rm -f $out && cat $in | sort -u > $out
+  command = cat $in | sort -u > $out.tmp && ` + commitIfChanged + `
+  restat = 1
   description = sort -u $out
 `

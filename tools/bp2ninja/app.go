@@ -406,7 +406,7 @@ func (g *Graph) aaptBuild(n *jNode, o aaptOpts) *aaptOut {
 		dir := filepath.Join(n.mod.Dir, rd)
 		files := g.resourceGlob(dir)
 		var outs []string
-		for _, shard := range shards(files, aapt2ShardSize) {
+		for i, shard := range shards(files, aapt2ShardSize) {
 			var shardOuts []string
 			for _, f := range shard {
 				shardOuts = append(shardOuts, filepath.Join(n.dir, "aapt2", aapt2Path(f)))
@@ -414,6 +414,7 @@ func (g *Graph) aaptBuild(n *jNode, o aaptOpts) *aaptOut {
 			outs = append(outs, shardOuts...)
 			j.edge("aapt2compile", shardOuts, absAll(g, shard), slices.Concat(aapt2Deps, aconfigOrder), nil, [][2]string{
 				{"aapt2", esc(aapt2)}, {"outdir", esc(filepath.Join(n.dir, "aapt2", dir))}, {"cflags", ninjaRaw(slices.Concat(compile, compileFF))},
+				{"tmpdir", esc(filepath.Join(n.dir, "aapt2-tmp", dir, strconv.Itoa(i)))},
 			})
 		}
 		slices.Sort(outs)
@@ -881,8 +882,11 @@ func (g *Graph) appOutputs(name, tag string, side Side, from string) (files []sr
 // aapt2CompileZip, aapt2Link, mergeAssets, extractAssets; android_manifest.go manifestFixer, manifestMerger; aar.go resourceProcessorBusyBox,
 // unzipAAR; app_builder.go combineApk, TransformJniLibsToJar). mergeAssets and combineApk are stubs.go's `mergezips` (`merge_zips $out $in`).
 // aapt2link restats: its R srcjar is written only if changed (javagen.go srcjar says why that needs restat).
+// aapt2compile compiles into $tmpdir and moves each .flat over its output only when its bytes differ, then restats (Soong's aapt2Compile
+// does not; exact as commitIfChanged): a rebuilt aapt2 that compiles the same bytes stops at the .flat files instead of relinking every app.
 const appRules = `rule aapt2compile
-  command = $aapt2 compile -o $outdir $cflags $in
+  command = rm -rf $tmpdir && mkdir -p $tmpdir $outdir && $aapt2 compile -o $tmpdir $cflags $in && for o in $out; do t=$tmpdir/$${o##*/}; if cmp -s $$t $$o; then rm $$t; else mv $$t $$o || exit 1; fi; done && rm -rf $tmpdir
+  restat = 1
   description = aapt2 compile $outdir
 rule aapt2compilezip
   command = rm -rf $zipdir && mkdir -p $zipdir && (unzip -qo $in $pattern -d $zipdir || [ $$? -eq 11 ]) && mkdir -p $resdir && $aapt2 compile -o $out $cflags --dir $resdir
