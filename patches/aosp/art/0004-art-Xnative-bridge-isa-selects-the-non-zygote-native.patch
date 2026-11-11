@@ -1,0 +1,165 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Wed, 11 Nov 2026 13:59:14 +0800
+Subject: [PATCH] art: -Xnative-bridge-isa selects the non-zygote native bridge
+ ISA
+
+A non-zygote runtime pre-initializes and initializes the native bridge
+for kRuntimeISA unconditionally, so a bridge started with
+-XX:NativeBridge can never be told the app's instruction set. The new
+option -Xnative-bridge-isa:<isa> (default: kRuntimeISA) is passed to
+PreInitializeNativeBridge and InitNonZygoteOrPostFork; as in the
+zygote child, an ISA other than kRuntimeISA initializes the bridge.
+An unknown ISA string is refused at parse.
+
+Upstream-Status: Pending
+Patch-Reason: non-zygote starts hardcode kRuntimeISA and no option
+ carries an ISA; the zygote child path that does carry one unloads the
+ bridge for the runtime ISA, which a host-ISA bridge (-Xforce-nb-testing)
+ needs, so the launcher cannot reach a foreign-ISA bridge without ART.
+---
+SPDX-License-Identifier: Apache-2.0
+ runtime/native_bridge_art_interface.cc |  6 +++---
+ runtime/native_bridge_art_interface.h  |  2 +-
+ runtime/parsed_options.cc              | 12 ++++++++++++
+ runtime/runtime.cc                     | 12 +++++++++---
+ runtime/runtime.h                      |  3 +++
+ runtime/runtime_options.def            |  1 +
+ 6 files changed, 29 insertions(+), 7 deletions(-)
+
+diff --git a/runtime/native_bridge_art_interface.cc b/runtime/native_bridge_art_interface.cc
+index 404d1f1ad6369aa743430bac49096a1a60362a1a..f23137b4d62456777acb90ef019a5f80c9760a42 100644
+--- a/runtime/native_bridge_art_interface.cc
++++ b/runtime/native_bridge_art_interface.cc
+@@ -98,15 +98,15 @@ bool LoadNativeBridge(const std::string& native_bridge_library_filename) {
+                                    &native_bridge_art_callbacks_);
+ }
+ 
+-void PreInitializeNativeBridge(const std::string& dir) {
++void PreInitializeNativeBridge(const std::string& dir, const char* instruction_set) {
+   VLOG(startup) << "Runtime::Pre-initialize native bridge";
+ #ifndef __APPLE__  // Mac OS does not support CLONE_NEWNS.
+   if (unshare(CLONE_NEWNS) == -1) {
+     LOG(WARNING) << "Could not create mount namespace.";
+   }
+-  android::PreInitializeNativeBridge(dir.c_str(), GetInstructionSetString(kRuntimeISA));
++  android::PreInitializeNativeBridge(dir.c_str(), instruction_set);
+ #else
+-  UNUSED(dir);
++  UNUSED(dir, instruction_set);
+ #endif
+ }
+ 
+diff --git a/runtime/native_bridge_art_interface.h b/runtime/native_bridge_art_interface.h
+index 5aeaebf2ca35dbc145c56f2ea1ce483ad327d471..11f1f1e89f4db3df37c22da18720177332948c8c 100644
+--- a/runtime/native_bridge_art_interface.h
++++ b/runtime/native_bridge_art_interface.h
+@@ -31,7 +31,7 @@ namespace art HIDDEN {
+ bool LoadNativeBridge(const std::string& native_bridge_library_filename);
+ 
+ // This is mostly for testing purposes, as in a full system this is called by Zygote code.
+-void PreInitializeNativeBridge(const std::string& dir);
++void PreInitializeNativeBridge(const std::string& dir, const char* instruction_set);
+ 
+ void PreZygoteForkNativeBridge();
+ 
+diff --git a/runtime/parsed_options.cc b/runtime/parsed_options.cc
+index ab07ea0f020cb09d46cf822ff98984bb1e2ab6bc..54c5b7388334a21aab3cc9ed0e4f521a2b7796c8 100644
+--- a/runtime/parsed_options.cc
++++ b/runtime/parsed_options.cc
+@@ -398,6 +398,10 @@ std::unique_ptr<RuntimeParser> ParsedOptions::MakeParser(bool ignore_unrecognize
+           .IntoKey(M::Experimental)
+       .Define("-Xforce-nb-testing")
+           .IntoKey(M::ForceNativeBridge)
++      .Define("-Xnative-bridge-isa:_")
++          .WithType<std::string>()
++          .WithHelp("Instruction set the native bridge is initialized for in a non-zygote runtime.")
++          .IntoKey(M::NativeBridgeIsa)
+       .Define("-Xplugin:_")
+           .WithHelp("Load and initialize the specified art-plugin.")
+           .WithType<std::vector<Plugin>>().AppendValues()
+@@ -774,6 +778,14 @@ bool ParsedOptions::DoParse(const RuntimeOptions& options,
+     args.Set(M::AllowInMemoryCompilation, Unit());
+   }
+ 
++  if (args.Exists(M::NativeBridgeIsa)) {
++    const std::string& nb_isa = *args.Get(M::NativeBridgeIsa);
++    if (GetInstructionSetFromString(nb_isa.c_str()) == InstructionSet::kNone) {
++      Usage("-Xnative-bridge-isa:%s is not a valid instruction set.\n", nb_isa.c_str());
++      return false;
++    }
++  }
++
+   if (!args.Exists(M::CompilerCallbacksPtr) && !args.Exists(M::Image) &&
+       use_default_bootclasspath) {
+     const bool deny_art_apex_data_files = args.Exists(M::DenyArtApexDataFiles);
+diff --git a/runtime/runtime.cc b/runtime/runtime.cc
+index d6c11628feaf9422dbaceba4c82bd0e6224e6b90..00e2a8b5cb3c5176c4f64f390c35a4f15883ca9f 100644
+--- a/runtime/runtime.cc
++++ b/runtime/runtime.cc
+@@ -296,6 +296,7 @@ Runtime::Runtime()
+       implicit_suspend_checks_(false),
+       no_sig_chain_(false),
+       force_native_bridge_(false),
++      native_bridge_isa_(kRuntimeISA),
+       is_native_bridge_loaded_(false),
+       is_native_debuggable_(false),
+       async_exceptions_thrown_(false),
+@@ -1117,16 +1118,17 @@ bool Runtime::Start() {
+ 
+   if (!is_zygote_) {
+     if (is_native_bridge_loaded_) {
+-      PreInitializeNativeBridge(".");
++      PreInitializeNativeBridge(".", GetInstructionSetString(native_bridge_isa_));
+     }
+-    NativeBridgeAction action = force_native_bridge_
++    // As in the zygote child (ZygoteHooks nativePostForkChild): a foreign ISA needs the bridge.
++    NativeBridgeAction action = (force_native_bridge_ || native_bridge_isa_ != kRuntimeISA)
+         ? NativeBridgeAction::kInitialize
+         : NativeBridgeAction::kUnload;
+     InitNonZygoteOrPostFork(self->GetJniEnv(),
+                             /* is_system_server= */ false,
+                             /* is_child_zygote= */ false,
+                             action,
+-                            GetInstructionSetString(kRuntimeISA));
++                            GetInstructionSetString(native_bridge_isa_));
+   }
+ 
+   {
+@@ -1737,6 +1739,10 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
+   // and it passes the `NoSigChain` option to `Runtime` to indicate this.
+   no_sig_chain_ = runtime_options.Exists(Opt::NoSigChain);
+   force_native_bridge_ = runtime_options.Exists(Opt::ForceNativeBridge);
++  // Validated at parse; absent -> the runtime ISA, as before.
++  native_bridge_isa_ = runtime_options.Exists(Opt::NativeBridgeIsa)
++      ? GetInstructionSetFromString(runtime_options.GetOrDefault(Opt::NativeBridgeIsa).c_str())
++      : kRuntimeISA;
+ 
+   Split(runtime_options.GetOrDefault(Opt::CpuAbiList), ',', &cpu_abilist_);
+ 
+diff --git a/runtime/runtime.h b/runtime/runtime.h
+index 8f781cff3451d22a6dadf53587e2067d445c9682..194db4e51b074491db5676107100fa6a3729695f 100644
+--- a/runtime/runtime.h
++++ b/runtime/runtime.h
+@@ -1379,6 +1379,9 @@ class Runtime {
+   // Force the use of native bridge even if the app ISA matches the runtime ISA.
+   bool force_native_bridge_;
+ 
++  // Instruction set a non-zygote runtime initializes the native bridge for (-Xnative-bridge-isa).
++  InstructionSet native_bridge_isa_;
++
+   // Whether or not a native bridge has been loaded.
+   //
+   // The native bridge allows running native code compiled for a foreign ISA. The way it works is,
+diff --git a/runtime/runtime_options.def b/runtime/runtime_options.def
+index 010dc04c706d440292e4f9786211ef9aac8c4fb0..72e84bc2b3504db36c7372b10c700b741b79d4ea 100644
+--- a/runtime/runtime_options.def
++++ b/runtime/runtime_options.def
+@@ -119,6 +119,7 @@ RUNTIME_OPTIONS_KEY (Unit,                DisableExplicitGC)
+ RUNTIME_OPTIONS_KEY (Unit,                DisableEagerlyReleaseExplicitGC)
+ RUNTIME_OPTIONS_KEY (Unit,                NoSigChain)
+ RUNTIME_OPTIONS_KEY (Unit,                ForceNativeBridge)
++RUNTIME_OPTIONS_KEY (std::string,         NativeBridgeIsa)
+ RUNTIME_OPTIONS_KEY (LogVerbosity,        Verbose)
+ RUNTIME_OPTIONS_KEY (unsigned int,        LockProfThreshold)
+ RUNTIME_OPTIONS_KEY (unsigned int,        StackDumpLockProfThreshold)

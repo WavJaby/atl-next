@@ -39,6 +39,15 @@ fn fail(msg: String) {
     LAST_ERROR.with(|e| *e.borrow_mut() = c);
 }
 
+/// A refused `initialize`, said where it can be seen: libnativebridge only dlcloses the bridge (no getError call, no log), so the app silently runs without one.
+#[allow(
+    clippy::print_stderr,
+    reason = "the bridge has no logger; the launcher's stderr is the app process's log"
+)]
+fn refused(msg: &str) {
+    eprintln!("{msg}");
+}
+
 /// The ELF machine of the process engine's libraries, read once.
 fn engine_machine() -> Option<obj_elf::Machine> {
     static MACHINE: OnceLock<Option<obj_elf::Machine>> = OnceLock::new();
@@ -70,7 +79,9 @@ pub unsafe fn initialize(
     };
     // the app's ISA picks the process's one engine (QEMU bridge plan 2.3): host ISA -> identity, a foreign ISA -> the engine `.so`
     if let Err(e) = engine::select(isa) {
-        fail(format!("atl-native-bridge: initialize: {e}"));
+        let msg = format!("atl-native-bridge: initialize: {e}");
+        refused(&msg);
+        fail(msg);
         return false;
     }
     // ART calls this after FaultManager::Init: its claimed signals get the host-FS entry before any guest code runs

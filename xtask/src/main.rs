@@ -63,6 +63,7 @@ mod modules;
 mod native;
 mod native_load;
 mod nb_identity;
+mod nb_isa;
 mod ndk_surface;
 mod nested_wayland;
 mod none_gate;
@@ -238,6 +239,8 @@ enum Test {
     /// Duplicate libraries (libbase, liblog, libnativehelper, ICU, libc++) warn; --strict-copies fails on them, for an ART built by the converter.
     /// The fixture (Java declarations + JNI shim in Rust) is built into <out>/native-load on every run with the Java pipeline's JDK and d8 and the repo's rustc.
     NativeLoad(native_load::Args),
+    /// ART's `-Xnative-bridge-isa:<isa>` (patches/aosp/art 0004) under atl-app-launcher with the bridge loaded: `arm64` with no arm64 engine staged reaches the bridge's `initialize`, which refuses naming it; an unknown ISA is refused at parse. `--break delivery|parse` must each turn its check red. Logs: stdout.
+    NbIsa(nb_isa::Args),
     /// AOSP servicemanager + `service list` / `check` through atl-binderd on libbinder's driver seam; binderd's counters must show the expected driver paths firing.
     Binder(binder::Args),
     /// The app sandbox (plan Q5): a probe as an app process (uid 10123, the broker's App profile) reaches neither the real $HOME nor anything outside its data dir, and writes its own. Its deliberate break is by hand (sandbox.rs).
@@ -403,6 +406,9 @@ fn main() -> Result<ExitCode> {
             test: Test::NativeLoad(args),
         } => native_load::run(&root, &args),
         Command::Test {
+            test: Test::NbIsa(args),
+        } => nb_isa::run(&root, &args),
+        Command::Test {
             test: Test::Parcel(args),
         } => parcel::run(&root, &args),
         Command::Test {
@@ -520,6 +526,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
         Command::Remote { .. } => "remote",
         Command::Test { test } => match test {
             Test::NativeLoad(_) => "native-load",
+            Test::NbIsa(_) => "nb-isa",
             Test::Parcel(_) => "parcel",
             Test::Provider(_) => "provider",
             Test::Compositor(_) => "compositor",
