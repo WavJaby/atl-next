@@ -41,6 +41,8 @@ enum Step {
     Keepset,
     /// modules.toml equals the real cross-module crate graph
     Modules,
+    /// a fresh checkout builds xtask: its build closure is definition crates only, and it builds offline under bwrap with src, src-wt and out hidden while a control crate that reads the tree fails there (bootstrap_gate.rs)
+    Bootstrap,
     /// fetched upstream checkouts match their pins and patches/ (no unexported or uncommitted work)
     Drift,
     /// libbinder's driver I/O goes only through BinderDriver.h (patches/aosp/frameworks/native 0003), in the tree this checkout builds
@@ -71,13 +73,14 @@ enum Step {
     CrossBionic,
 }
 
-const ALL: [Step; 20] = [
+const ALL: [Step; 21] = [
     Step::Fmt,
     Step::Spdx,
     Step::Tables,
     Step::Deps,
     Step::Keepset,
     Step::Modules,
+    Step::Bootstrap,
     Step::Drift,
     Step::Seam,
     Step::AndroidPaths,
@@ -103,6 +106,7 @@ impl Step {
             Step::Deps => "deps",
             Step::Keepset => "keepset",
             Step::Modules => "modules",
+            Step::Bootstrap => "bootstrap",
             Step::Drift => "drift",
             Step::Seam => "seam",
             Step::AndroidPaths => "android-paths",
@@ -267,6 +271,7 @@ impl Step {
                 );
                 Ok(())
             }
+            Step::Bootstrap => crate::bootstrap_gate::check(root),
             Step::Drift => patch::check(root),
             Step::Seam => crate::seam_gate::check(root),
             Step::AndroidPaths => crate::android_paths::check(root),

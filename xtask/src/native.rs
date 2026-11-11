@@ -1148,7 +1148,8 @@ fn build_crates<'a>(
         let mut cargo = Command::new("cargo");
         cargo.args([
             "cinstall",
-            "--release",
+            "--profile",
+            crate::build_state::NATIVE_PROFILE,
             "--library-type",
             "cdylib",
             "-p",

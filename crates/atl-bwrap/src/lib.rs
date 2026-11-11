@@ -62,6 +62,11 @@ impl Args {
         self.word("--unshare-pid")
     }
 
+    /// `--unshare-net`: a new network namespace with only loopback.
+    pub fn unshare_net(&mut self) -> &mut Self {
+        self.word("--unshare-net")
+    }
+
     /// `--unshare-all`: user (try), ipc, pid, net, uts, cgroup (try) namespaces.
     pub fn unshare_all(&mut self) -> &mut Self {
         self.word("--unshare-all")

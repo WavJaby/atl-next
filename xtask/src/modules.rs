@@ -186,6 +186,7 @@ mod tests {
                 .iter()
                 .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
                 .collect(),
+            ..Workspace::default()
         }
     }
 

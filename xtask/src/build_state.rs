@@ -21,8 +21,8 @@ const RECORD: &str = "built-from";
 const GATE_SIDE: &[&str] = &["xtask", "xtask-harness", "test-apks.toml"];
 /// The root manifest: it enters the state as [`native_manifest`], not as the file.
 const MANIFEST: &str = "Cargo.toml";
-/// The cargo profile native builds crates with (`cargo cinstall --release`, native.rs build_crates); no other profile reaches its outputs. Change both together.
-const NATIVE_PROFILE: &str = "release";
+/// The cargo profile native builds crates with (`cargo cinstall --profile`, native.rs build_crates); no other profile reaches its outputs.
+pub const NATIVE_PROFILE: &str = "release";
 
 /// The part of the root manifest a native build reads: the parsed TOML (comments and layout drop out) with every profile but [`NATIVE_PROFILE`] removed and,
 /// in that one, the per-package overrides of gate-side packages (a [`GATE_SIDE`] directory holds the package of its name: `xtask`, `xtask-harness`).

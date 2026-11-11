@@ -73,6 +73,11 @@ impl Layout {
         }
     }
 
+    /// Every directory fetched upstream trees live in: the shared tree and the task copies' root.
+    pub fn fetched_roots(&self) -> [PathBuf; 2] {
+        [self.workspace.join(SHARED), self.workspace.join(TASKS)]
+    }
+
     /// The workspace root (`~/atl-next`): `out/`, `cache/` and the checkouts live under it.
     pub fn workspace(&self) -> &Path {
         &self.workspace

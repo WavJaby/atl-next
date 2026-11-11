@@ -13,6 +13,7 @@ pub mod android_paths;
 pub mod aosp;
 pub mod apk_sig;
 pub mod arches;
+pub mod bootstrap_gate;
 pub mod build_pool;
 pub mod build_state;
 pub mod bwrap_flags;
