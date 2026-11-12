@@ -1069,20 +1069,64 @@ fn harness(
             );
         }
         Some(g) => {
-            ensure!(!ok(g), "break left gate ({g}) ok, log {}", log.display());
-            ensure!(
-                !run.status.success(),
-                "break run exited 0, log {}",
-                log.display()
-            );
+            if let Err(why) = break_red(text, g, run.status.success()) {
+                bail!(
+                    "{why}{}, log {}",
+                    if hung { " (hung)" } else { "" },
+                    log.display()
+                );
+            }
         }
+    }
+    Ok(())
+}
+
+/// A break run counts as red only when its target gate printed its own `spike: (<g>) FAIL` line (spike.rs), printed no `ok`, and the run exited nonzero.
+/// Missing ok + nonzero exit alone is not enough: a crash or hang before the gate ran (boot, an earlier gate) looks the same and says nothing about gate `g`.
+fn break_red(stdout: &str, g: char, exit_ok: bool) -> Result<(), String> {
+    let ok = format!("spike: ({g}) ok");
+    let fail = format!("spike: ({g}) FAIL");
+    if stdout.lines().any(|l| l == ok) {
+        return Err(format!("break left gate ({g}) ok"));
+    }
+    if !stdout.lines().any(|l| l.starts_with(&fail)) {
+        return Err(format!(
+            "break printed no `{fail}` line: gate ({g}) never judged"
+        ));
+    }
+    if exit_ok {
+        return Err("break run exited 0".to_owned());
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::killed_at_limit;
+    use super::{break_red, killed_at_limit};
+
+    /// Red needs gate (e)'s own FAIL line: a boot crash printing nothing for (e) is not a red (e).
+    #[test]
+    fn break_is_red_only_with_its_gates_fail_line() {
+        let judged = "spike: (a) ok\nspike: (e) FAIL order: special ran second\n";
+        assert_eq!(break_red(judged, 'e', false), Ok(()));
+        // crashed before (e) ran: no ok, nonzero exit, but no FAIL line either
+        let crashed = "spike: (a) ok\nspike: FAIL boot: no answer\n";
+        assert!(
+            break_red(crashed, 'e', false)
+                .unwrap_err()
+                .contains("never judged")
+        );
+        // another gate's FAIL does not stand in for (e)
+        assert!(break_red("spike: (h) FAIL x\n", 'e', false).is_err());
+        // the (v) child's line is not the gate's own
+        assert!(break_red("spike: (v) child FAIL thread 0: x\n", 'v', false).is_err());
+        assert!(break_red("spike: (e) ok\nspike: (e) FAIL x\n", 'e', false).is_err());
+        assert!(
+            break_red(judged, 'e', true)
+                .unwrap_err()
+                .contains("exited 0")
+        );
+    }
 
     /// timeout(1): 124 at the limit, 137 for `-s KILL` (128 + SIGKILL 9); any other status is the command's own.
     #[test]
