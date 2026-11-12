@@ -11,8 +11,18 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 
 pub const FILE: &str = "launcher-closure.toml";
-/// The launcher's package and executable (packages.rs: built into the slot's converter target dir).
+/// The launcher's package and executable, the loader (packages.rs: built into the slot's converter target dir).
 const LAUNCHER: &str = "atl-app-launcher";
+/// The runtime cdylib the loader dlopens `RTLD_LOCAL` (atl-app-launcher main.rs), installed in `<out>/crates/<LAUNCHER>/lib` (packages.rs `install_cdylib`).
+const RUNTIME: &str = "libatl_app_runtime.so";
+
+/// One `RTLD_LOCAL` root's closure as glibc resolves it: the loader's (global scope) or the runtime's.
+struct Group<'a> {
+    scope: Scope,
+    /// the root object, named in `via` by its file name
+    root: &'a Path,
+    resolved: &'a [Resolved],
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -36,11 +46,29 @@ pub enum Class {
     System,
 }
 
+/// Which closure of the process a host library is in: the loader's (global scope) or the runtime cdylib's beyond it (the AOSP group, `RTLD_LOCAL`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Scope {
+    Global,
+    Runtime,
+}
+
+impl Scope {
+    fn name(self) -> &'static str {
+        match self {
+            Scope::Global => "global",
+            Scope::Runtime => "runtime",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClosureRow {
     pub soname: String,
     pub class: Class,
+    pub scope: Scope,
     pub via: String,
     #[serde(default)]
     pub provider: Option<String>,
@@ -164,7 +192,7 @@ fn parse(text: &str, providers: &toml::Table) -> Result<Table> {
 }
 
 /// One resolved object of the closure: what DT_NEEDED names, and the file the loader picked (None: not found).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Resolved {
     soname: String,
     path: Option<PathBuf>,
@@ -227,29 +255,31 @@ pub fn check_own(root: &Path) -> Result<Option<String>> {
             launcher.display()
         )));
     }
+    let runtime = out.join("crates").join(LAUNCHER).join("lib").join(RUNTIME);
+    ensure!(
+        runtime.is_file(),
+        "no {}: `cargo xtask native` builds and installs it with the launcher",
+        runtime.display()
+    );
     // reads built binaries: a slot from another source state would judge a stale launcher
     crate::build_state::ensure_current(root, &out)?;
-    let lines = check(&table, &launcher, &crate::host_art::runtime_libs(&out)?)?;
+    let lines = check(
+        &table,
+        &launcher,
+        &runtime,
+        &crate::host_art::runtime_libs(&out)?,
+    )?;
     eprintln!("launcher-closure: {lines}");
     Ok(None)
 }
 
-/// The launcher's closure against `table`'s closure rows: every host object (resolved outside `runtime_libs`' dirs) has a row, every row is in the closure, every row's `via` names it in DT_NEEDED. Returns the ok summary.
-fn check(table: &Table, launcher: &Path, runtime_libs: &[PathBuf]) -> Result<String> {
-    let dirs: BTreeSet<&Path> = runtime_libs.iter().filter_map(|l| l.parent()).collect();
-    let mut lib_path = std::ffi::OsString::new();
-    for (i, d) in dirs.iter().enumerate() {
-        if i > 0 {
-            lib_path.push(":");
-        }
-        lib_path.push(d);
-    }
-    let ld = interpreter(launcher)?;
-    let run = Command::new(&ld)
+/// `root`'s DT_NEEDED closure as `ld` resolves it over `lib_path` alone.
+fn list(ld: &Path, lib_path: &std::ffi::OsStr, root: &Path) -> Result<Vec<Resolved>> {
+    let run = Command::new(ld)
         .arg("--list")
         .arg("--library-path")
-        .arg(&lib_path)
-        .arg(launcher)
+        .arg(lib_path)
+        .arg(root)
         .env_remove("LD_LIBRARY_PATH")
         .env_remove("LD_PRELOAD")
         .output()
@@ -259,96 +289,149 @@ fn check(table: &Table, launcher: &Path, runtime_libs: &[PathBuf]) -> Result<Str
         run.status.success(),
         "{} --list {} failed: {}{}",
         ld.display(),
-        launcher.display(),
+        root.display(),
         text,
         String::from_utf8_lossy(&run.stderr)
     );
-    let resolved = parse_list(&text);
-    let failures = judge_closure(
-        table,
-        launcher,
-        &resolved,
-        &|p| dirs.iter().any(|d| p.parent() == Some(*d)),
-        &|p| crate::provided_gate::needed(p),
-    )?;
+    Ok(parse_list(&text))
+}
+
+/// The process's two closures against `table`'s closure rows: the loader's (global scope: what every object of the process can bind) and the runtime cdylib's beyond it (the AOSP group). Every host object (resolved outside `runtime_libs`' dirs)
+/// has a row of its scope, every row is in its scope's closure, every row's `via` names it in DT_NEEDED. Returns the ok summary.
+fn check(
+    table: &Table,
+    launcher: &Path,
+    runtime: &Path,
+    runtime_libs: &[PathBuf],
+) -> Result<String> {
+    let dirs: BTreeSet<&Path> = runtime_libs.iter().filter_map(|l| l.parent()).collect();
+    let mut lib_path = std::ffi::OsString::new();
+    for (i, d) in dirs.iter().enumerate() {
+        if i > 0 {
+            lib_path.push(":");
+        }
+        lib_path.push(d);
+    }
+    // the loader's interpreter resolves both: the runtime is dlopened into its process
+    let ld = interpreter(launcher)?;
+    let global = list(&ld, &lib_path, launcher)?;
+    let local = list(&ld, &lib_path, runtime)?;
+    let groups = [
+        Group {
+            scope: Scope::Global,
+            root: launcher,
+            resolved: &global,
+        },
+        Group {
+            scope: Scope::Runtime,
+            root: runtime,
+            resolved: &local,
+        },
+    ];
+    let inside = |p: &Path| dirs.iter().any(|d| p.parent() == Some(*d));
+    let failures = judge_closure(table, &groups, &inside, &|p| {
+        crate::provided_gate::needed(p)
+    })?;
     if !failures.is_empty() {
         bail!(
-            "{} closure problems ({}):\n  {}",
+            "{} closure problems ({}, {}):\n  {}",
             failures.len(),
             launcher.display(),
+            runtime.display(),
             failures.join("\n  ")
         );
     }
-    let host = table.closure.len();
+    let ours_global = global
+        .iter()
+        .filter(|r| r.path.as_deref().is_some_and(inside))
+        .count();
     Ok(format!(
-        "{FILE} ok ({} objects, {host} host rows, {} ours/AOSP)",
-        resolved.len(),
-        resolved.len() - host
+        "{FILE} ok (global: {} objects, {ours_global} ours/AOSP; runtime: {} objects; {} host rows)",
+        global.len(),
+        local.len(),
+        table.closure.len()
     ))
 }
 
-/// The problems of `resolved` (the launcher's closure) against the table's closure rows. `inside`: the path is on the runtime library path; `needed`: an object's DT_NEEDED.
+/// The problems of `groups` (global first, then the runtime's closure, whose objects already in global scope are global's) against the table's closure rows. `inside`: the path is on the runtime library path; `needed`: an object's DT_NEEDED.
 fn judge_closure(
     table: &Table,
-    launcher: &Path,
-    resolved: &[Resolved],
+    groups: &[Group],
     inside: &dyn Fn(&Path) -> bool,
     needed: &dyn Fn(&Path) -> Result<Vec<String>>,
 ) -> Result<Vec<String>> {
     let mut failures = Vec::new();
-    let mut host = BTreeMap::new();
-    for r in resolved {
-        match &r.path {
-            None => failures.push(format!(
-                "{}: not found on the runtime library path or the system's",
-                r.soname
-            )),
-            Some(p) if !inside(p) => {
-                host.insert(r.soname.as_str(), p.as_path());
-            }
-            Some(_) => {}
-        }
-    }
     let rows: BTreeMap<&str, &ClosureRow> = table
         .closure
         .iter()
         .map(|r| (r.soname.as_str(), r))
         .collect();
-    for (soname, path) in &host {
-        if !rows.contains_key(soname) {
-            failures.push(format!(
-                "host library {soname} ({}) is not a row of {FILE}",
-                path.display()
-            ));
+    let mut earlier: BTreeSet<&str> = BTreeSet::new();
+    for g in groups {
+        let mut host = BTreeMap::new();
+        for r in g.resolved {
+            if earlier.contains(r.soname.as_str()) {
+                continue;
+            }
+            match &r.path {
+                None => failures.push(format!(
+                    "{}: not found on the runtime library path or the system's",
+                    r.soname
+                )),
+                Some(p) if !inside(p) => {
+                    host.insert(r.soname.as_str(), p.as_path());
+                }
+                Some(_) => {}
+            }
         }
-    }
-    for row in rows.values() {
-        if !host.contains_key(row.soname.as_str()) {
-            failures.push(format!(
-                "row {} is no longer a host library of the closure: delete it",
-                row.soname
-            ));
-            continue;
+        for (soname, path) in &host {
+            match rows.get(soname) {
+                None => failures.push(format!(
+                    "host library {soname} ({}) is not a row of {FILE}",
+                    path.display()
+                )),
+                Some(row) if row.scope != g.scope => failures.push(format!(
+                    "host library {soname} is in the {} closure, its row says scope {}",
+                    g.scope.name(),
+                    row.scope.name()
+                )),
+                Some(_) => {}
+            }
         }
-        let via = if row.via == LAUNCHER {
-            Some(launcher)
-        } else {
-            resolved
-                .iter()
-                .find(|r| r.soname == row.via)
-                .and_then(|r| r.path.as_deref())
-        };
-        match via {
-            None => failures.push(format!(
-                "row {}: via {} is not in the closure",
-                row.soname, row.via
-            )),
-            Some(v) if !needed(v)?.contains(&row.soname) => failures.push(format!(
-                "row {}: via {} has no DT_NEEDED {}",
-                row.soname, row.via, row.soname
-            )),
-            Some(_) => {}
+        for row in rows.values().filter(|r| r.scope == g.scope) {
+            if !host.contains_key(row.soname.as_str()) {
+                if !g.resolved.iter().any(|r| r.soname == row.soname) {
+                    failures.push(format!(
+                        "row {} is no longer a host library of the {} closure: delete it",
+                        row.soname,
+                        g.scope.name()
+                    ));
+                }
+                continue;
+            }
+            let via = if g.root.file_name().is_some_and(|f| f == row.via.as_str()) {
+                Some(g.root)
+            } else {
+                g.resolved
+                    .iter()
+                    .find(|r| r.soname == row.via)
+                    .and_then(|r| r.path.as_deref())
+            };
+            match via {
+                None => failures.push(format!(
+                    "row {}: via {} is not in the {} closure",
+                    row.soname,
+                    row.via,
+                    g.scope.name()
+                )),
+                Some(v) if !needed(v)?.contains(&row.soname) => failures.push(format!(
+                    "row {}: via {} has no DT_NEEDED {}",
+                    row.soname, row.via, row.soname
+                )),
+                Some(_) => {}
+            }
         }
+        earlier.extend(g.resolved.iter().map(|r| r.soname.as_str()));
     }
     Ok(failures)
 }
@@ -519,8 +602,17 @@ mod tests {
 [[closure]]
 soname = "libc.so.6"
 class = "glibc"
+scope = "global"
 via = "atl-app-launcher"
 reason = "C library"
+
+[[closure]]
+soname = "libvulkan.so.1"
+class = "system"
+scope = "runtime"
+via = "libfc.so"
+provider = "libvulkan"
+reason = "Khronos loader under an AOSP library"
 
 [[binding]]
 from = "libhwui.so"
@@ -638,62 +730,93 @@ reason = "BoringSSL vs host OpenSSL"
         assert_eq!(r[2].soname, "ld-linux-x86-64.so.2");
     }
 
-    /// A host library without a row, a row gone from the closure, a row whose via does not need it: each named.
+    fn res(soname: &str, path: &str) -> Resolved {
+        Resolved {
+            soname: soname.into(),
+            path: Some(path.into()),
+        }
+    }
+
+    /// The two groups: the loader's (global) and the runtime's beyond it.
+    fn judge(
+        t: &Table,
+        global: &[Resolved],
+        runtime: &[Resolved],
+        needed: &dyn Fn(&Path) -> Result<Vec<String>>,
+    ) -> Vec<String> {
+        let groups = [
+            Group {
+                scope: Scope::Global,
+                root: Path::new("/o/atl-app-launcher"),
+                resolved: global,
+            },
+            Group {
+                scope: Scope::Runtime,
+                root: Path::new("/o/libatl_app_runtime.so"),
+                resolved: runtime,
+            },
+        ];
+        judge_closure(t, &groups, &|p| p.starts_with("/o"), needed).unwrap()
+    }
+
+    /// A host library without a row, a row gone from its closure, a row whose via does not need it, a host library in the other scope than its row's: each named; the runtime's view of global objects is global's.
     #[test]
     fn judges_closure() {
         let t = parse(TABLE, &providers()).unwrap();
-        let resolved = vec![
-            Resolved {
-                soname: "libsigchain.so".into(),
-                path: Some("/o/libsigchain.so".into()),
-            },
-            Resolved {
-                soname: "libgtk-4.so.1".into(),
-                path: Some("/usr/lib/libgtk-4.so.1".into()),
-            },
-        ];
-        let f = judge_closure(
-            &t,
-            Path::new("/o/atl-app-launcher"),
-            &resolved,
-            &|p| p.starts_with("/o"),
-            &|_| Ok(vec![]),
-        )
-        .unwrap()
-        .join("\n");
-        assert!(f.contains("host library libgtk-4.so.1"), "{f}");
-        assert!(f.contains("row libc.so.6 is no longer"), "{f}");
-        let ok = vec![Resolved {
-            soname: "libc.so.6".into(),
-            path: Some("/lib/libc.so.6".into()),
-        }];
+        let libc = res("libc.so.6", "/lib/libc.so.6");
+        let fc = res("libfc.so", "/o/libfc.so");
+        let vk = res("libvulkan.so.1", "/usr/lib/libvulkan.so.1");
         let needs = |p: &Path| {
             Ok(if p.ends_with(LAUNCHER) {
                 vec!["libc.so.6".to_owned()]
+            } else if p.ends_with("libfc.so") {
+                vec!["libvulkan.so.1".to_owned()]
             } else {
                 vec![]
             })
         };
+        // the runtime's closure holds libc too (global's object, by soname): no second row needed
+        let ok = judge(
+            &t,
+            std::slice::from_ref(&libc),
+            &[libc.clone(), fc.clone(), vk.clone()],
+            &needs,
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+        let gtk = res("libgtk-4.so.1", "/usr/lib/libgtk-4.so.1");
+        let f = judge(
+            &t,
+            &[res("libsigchain.so", "/o/libsigchain.so"), gtk],
+            &[],
+            &needs,
+        )
+        .join("\n");
+        assert!(f.contains("host library libgtk-4.so.1"), "{f}");
         assert!(
-            judge_closure(
-                &t,
-                Path::new("/o/atl-app-launcher"),
-                &ok,
-                &|p| p.starts_with("/o"),
-                &needs
-            )
-            .unwrap()
-            .is_empty()
+            f.contains("row libc.so.6 is no longer a host library of the global"),
+            "{f}"
+        );
+        assert!(
+            f.contains("row libvulkan.so.1 is no longer a host library of the runtime"),
+            "{f}"
+        );
+        // libvulkan.so.1 in the loader's closure: global scope, against its runtime row
+        let f = judge(&t, &[libc.clone(), fc.clone(), vk.clone()], &[], &needs).join("\n");
+        assert!(
+            f.contains(
+                "host library libvulkan.so.1 is in the global closure, its row says scope runtime"
+            ),
+            "{f}"
         );
         let none = |_: &Path| Ok(vec![]);
-        let f = judge_closure(
-            &t,
-            Path::new("/o/atl-app-launcher"),
-            &ok,
-            &|p| p.starts_with("/o"),
-            &none,
-        )
-        .unwrap();
-        assert!(f[0].contains("has no DT_NEEDED libc.so.6"), "{f:?}");
+        let f = judge(&t, std::slice::from_ref(&libc), &[fc, vk], &none).join("\n");
+        assert!(
+            f.contains("row libc.so.6: via atl-app-launcher has no DT_NEEDED libc.so.6"),
+            "{f}"
+        );
+        assert!(
+            f.contains("row libvulkan.so.1: via libfc.so has no DT_NEEDED"),
+            "{f}"
+        );
     }
 }

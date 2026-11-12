@@ -7,6 +7,7 @@ use std::borrow::Cow;
 use std::ffi::CString;
 use std::io::Write;
 use std::os::fd::RawFd;
+use std::os::unix::ffi::OsStringExt as _;
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -21,7 +22,6 @@ unsafe extern "C" {
     fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
     fn dlerror() -> *mut c_char;
-    fn _exit(status: c_int);
     fn syscall(number: c_long, ...) -> c_long;
     fn getpid() -> c_int;
     fn sigfillset(set: *mut signal::__sigset_t) -> c_int;
@@ -31,7 +31,6 @@ unsafe extern "C" {
 const _: dlfcn::dlopen = dlopen;
 const _: dlfcn::dlsym = dlsym;
 const _: dlfcn::dlerror = dlerror;
-const _: unistd::_exit = _exit;
 const _: unistd::syscall = syscall;
 const _: unistd::getpid = getpid;
 const _: signal::sigfillset = sigfillset;
@@ -80,10 +79,10 @@ unsafe fn sym<F: Copy>(handle: *mut c_void, name: &CStr) -> Result<F> {
 }
 
 impl Runtime {
-    /// Loads libnativehelper (`RTLD_GLOBAL`: the libraries ART loads later bind to the same liblog and libc provider) and resolves every function.
+    /// Loads libnativehelper (`RTLD_LOCAL`: libraries ART loads later still bind the same liblog and libc provider, glibc deduplicating by soname; global scope stays glibc + libsigchain, main.rs) and resolves every function.
     pub fn load() -> Result<Self> {
         // SAFETY: a NUL-terminated soname and the header's flag values
-        let h = unsafe { dlopen(NATIVEHELPER.as_ptr(), dlfcn::RTLD_NOW | dlfcn::RTLD_GLOBAL) };
+        let h = unsafe { dlopen(NATIVEHELPER.as_ptr(), dlfcn::RTLD_NOW | dlfcn::RTLD_LOCAL) };
         ensure!(!h.is_null(), "loading the runtime: {}", dl_error());
         // SAFETY: each F is the generated type of the function of that name (build.rs `IMPORTS`); h is live (never closed)
         unsafe {
@@ -174,13 +173,13 @@ pub struct AndroidRuntime {
 }
 
 impl AndroidRuntime {
-    /// Loads libandroid_runtime (`RTLD_GLOBAL`, as linked into app_process: libraries loaded later bind to the same libbinder) and resolves both functions.
+    /// Loads libandroid_runtime (`RTLD_LOCAL`: libraries loaded later reach the same libbinder by soname, as `Runtime::load`) and resolves both functions.
     pub fn load() -> Result<Self> {
         // SAFETY: a NUL-terminated soname and the header's flag values
         let h = unsafe {
             dlopen(
                 ANDROID_RUNTIME.as_ptr(),
-                dlfcn::RTLD_NOW | dlfcn::RTLD_GLOBAL,
+                dlfcn::RTLD_NOW | dlfcn::RTLD_LOCAL,
             )
         };
         ensure!(!h.is_null(), "loading libandroid_runtime: {}", dl_error());
@@ -234,10 +233,10 @@ pub struct LooperApi {
 const ANDROID: &CStr = c"libandroid.so";
 
 impl LooperApi {
-    /// Loads libandroid (`RTLD_NOW | RTLD_GLOBAL`) and resolves the three functions from its handle; the handle is never closed.
+    /// Loads libandroid (`RTLD_NOW | RTLD_LOCAL`, as `Runtime::load`) and resolves the three functions from its handle; the handle is never closed.
     pub fn load() -> Result<Self> {
         // SAFETY: a NUL-terminated soname and the header's flag values
-        let h = unsafe { dlopen(ANDROID.as_ptr(), dlfcn::RTLD_NOW | dlfcn::RTLD_GLOBAL) };
+        let h = unsafe { dlopen(ANDROID.as_ptr(), dlfcn::RTLD_NOW | dlfcn::RTLD_LOCAL) };
         ensure!(!h.is_null(), "loading libandroid: {}", dl_error());
         // SAFETY: each F is the generated type of the function of that name (build.rs `IMPORTS`); h is live
         unsafe {
@@ -748,11 +747,22 @@ extern "C" fn on_crash(sig: c_int, info: *mut signal::siginfo_t, _context: *mut 
     }
 }
 
-/// ART's FastExit: `_exit`, no static destructors while runtime daemons may still run.
-pub fn fast_exit(status: i32) -> ! {
+/// The runtime's one C entry, what the loader executable calls (main.rs): the process's argv -> its exit status, which the loader ends the process with (`_exit`, ART's FastExit).
+/// This library's std buffers its own stdout: flushed here, the loader's std cannot.
+///
+/// # Safety
+/// `argv` holds `argc` NUL-terminated strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn atl_app_main(argc: c_int, argv: *const *const c_char) -> c_int {
+    let args = (0..usize::try_from(argc).unwrap_or(0))
+        .map(|i| {
+            // SAFETY: the caller's contract: argc strings, each NUL-terminated
+            let a = unsafe { CStr::from_ptr(*argv.add(i)) };
+            std::ffi::OsString::from_vec(a.to_bytes().to_vec())
+        })
+        .collect();
+    let status = crate::main(args);
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
-    // SAFETY: ends the process; nothing after it runs
-    unsafe { _exit(status) };
-    unreachable!("_exit returned")
+    status
 }

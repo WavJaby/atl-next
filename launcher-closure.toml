@@ -1,77 +1,89 @@
 # SPDX-License-Identifier: MIT
-# What of the host the app launcher's process may reach (launcher-ui-module plan M4). Ours and AOSP objects are never listed: an object is ours/AOSP when it resolves on the runtime library path (xtask host_art.rs runtime_libs), host otherwise.
-# Judges: `cargo xtask check` step launcher-closure (the launcher's DT_NEEDED closure, resolved by its own PT_INTERP `ld.so --list`) and `cargo xtask test window --stage hwui` (one UI-mode run's LD_DEBUG=bindings records). Every row must occur: a row whose library or binding is gone fails until deleted.
+# What of the host the app launcher's process may reach (launcher-ui-module plan M4, launcher-scope-split plan X1). Ours and AOSP objects are never listed: an object is ours/AOSP when it resolves on the runtime library path (xtask host_art.rs runtime_libs), host otherwise.
+# The process has two closures: the loader executable's (`atl-app-launcher`: global scope, which every object binds) and the runtime cdylib's (`libatl_app_runtime.so`, dlopened RTLD_LOCAL: the AOSP group; its objects already global are global's).
+# Judges: `cargo xtask check` step launcher-closure (both closures, resolved by the loader's PT_INTERP `ld.so --list`) and `cargo xtask test window --stage hwui` (one UI-mode run's LD_DEBUG=bindings records). Every row must occur: a row whose library or binding is gone fails until deleted.
 #
-# [[closure]]  a host library in the launcher's DT_NEEDED closure; any host library without a row fails by name
+# [[closure]]  a host library in one of the two closures; any host library without a row fails by name
 #   soname     as DT_NEEDED names it (the interpreter: its file name)
 #   class      glibc | cxx-runtime | system. glibc and cxx-runtime may be bound by any object of the process; a system library's bindings need [[binding]] rows
-#   via        one object of the closure (`atl-app-launcher` or a soname) whose DT_NEEDED names it: checked
+#   scope      global (the loader's closure) | runtime (the runtime's closure beyond it): checked, a library in the other closure fails
+#   via        one object of that closure (its root `atl-app-launcher` / `libatl_app_runtime.so`, or a soname) whose DT_NEEDED names it: checked
 #   provider   class system only: its providers.toml row key, which must be a `system:` row
 #   reason     why it is in the process
 # [[binding]]  a declared binding from an ours/AOSP/app object to a system-class host library (glibc and cxx-runtime need none; the platform module's own bindings are its job)
 #   from, to   file names of the bound objects; symbols: exactly those that bind (each must occur); provider: as in [[closure]]
-# [[reverse]]  O4: an ours/AOSP soname that host objects (the platform module's GTK closure) bind through global scope; a new soname fails. Taking AOSP libraries out of global scope later = deleting rows
+# [[reverse]]  an ours/AOSP soname that host objects bind; a new soname fails. What is left in global scope is libsigchain's closure (scope-split X3 shrinks it)
 #   to         file name of the bound object; reason
-#   max_bindings  ceiling on unique (host object, symbol) bindings into it in one hwui run; a growth fails (measured 2026-11-12: identical on 5 runs, spread 0, total 1441)
+#   max_bindings  ceiling on unique (host object, symbol) bindings into it in one hwui run; a growth fails (measured 2026-11-13: one run after X1, total 218)
 # [[forbidden_reverse]]  a soname no host object may bind (fails even once)
 
 [[closure]]
 soname = "libc.so.6"
 class = "glibc"
+scope = "global"
 via = "atl-app-launcher"
 reason = "the system C library (bionic's place on a glibc desktop: providers.toml libc)"
 
 [[closure]]
 soname = "libm.so.6"
 class = "glibc"
-via = "atl-app-launcher"
+scope = "global"
+via = "libsigchain.so"
 reason = "glibc's libm (providers.toml libm)"
 
 [[closure]]
 soname = "ld-linux-x86-64.so.2"
 class = "glibc"
+scope = "global"
 via = "atl-app-launcher"
 reason = "glibc's dynamic loader, the launcher's PT_INTERP"
 
 [[closure]]
-soname = "libresolv.so.2"
-class = "glibc"
-via = "libnetd_client.so"
-reason = "glibc's resolver: libnetd_client's res_* calls on a glibc host"
-
-[[closure]]
 soname = "libgcc_s.so.1"
 class = "cxx-runtime"
-via = "libstdc++.so.6"
-reason = "GCC's unwinder under libstdc++, and of the converter's device libraries"
-
-[[closure]]
-soname = "libstdc++.so.6"
-class = "cxx-runtime"
+scope = "global"
 via = "atl-app-launcher"
-reason = "O2: the cxx crate's C++ runtime in the launcher; removal tracked by a report"
+reason = "GCC's unwinder under Rust std, libstdc++ and the converter's device libraries"
 
 [[closure]]
 soname = "libc++.so.1"
 class = "cxx-runtime"
-via = "atl-app-launcher"
-reason = "the distro libc++ every converter-built C++ library links (the converter's device C++ runtime, libcxx gate)"
+scope = "global"
+via = "libsigchain.so"
+reason = "the distro libc++ every converter-built C++ library links (libcxx gate); global through libsigchain's android variant until X3 (scope-split O2: stays global for now)"
 
 [[closure]]
 soname = "libc++abi.so.1"
 class = "cxx-runtime"
-via = "atl-app-launcher"
-reason = "libc++'s ABI library"
+scope = "global"
+via = "libsigchain.so"
+reason = "libc++'s ABI library, as libc++.so.1"
 
 [[closure]]
 soname = "libunwind.so.1"
 class = "cxx-runtime"
-via = "atl-app-launcher"
-reason = "LLVM's unwinder under libc++abi"
+scope = "global"
+via = "libsigchain.so"
+reason = "LLVM's unwinder under libc++abi, as libc++.so.1"
+
+[[closure]]
+soname = "libresolv.so.2"
+class = "glibc"
+scope = "runtime"
+via = "libnetd_client.so"
+reason = "glibc's resolver: libnetd_client's res_* calls on a glibc host"
+
+[[closure]]
+soname = "libstdc++.so.6"
+class = "cxx-runtime"
+scope = "runtime"
+via = "libatl_app_runtime.so"
+reason = "the cxx crate's C++ runtime in the runtime cdylib (launcher-ui-module O2), out of global scope since X1"
 
 [[closure]]
 soname = "libvulkan.so.1"
 class = "system"
+scope = "runtime"
 via = "libstagefright_framecapture_utils.so"
 provider = "libvulkan"
 reason = "the Khronos loader in place of AOSP's (providers.toml libvulkan); V0 removes it"
@@ -83,76 +95,25 @@ symbols = ["vkEnumerateInstanceVersion", "vkGetDeviceProcAddr", "vkGetInstancePr
 provider = "libvulkan"
 reason = "hwui's Vulkan pipeline probe through the Khronos loader (providers.toml libvulkan); V0 removes it"
 
-# O4 (owner 2026-11-12: accept for now, decide later on taking AOSP libraries out of global scope). Sources: the platform module's GTK / Mesa / glib closure, measured on window --stage hwui.
 [[reverse]]
-to = "libharfbuzz_ng.so"
-max_bindings = 381
-reason = "GTK / pango hb_* resolve to AOSP harfbuzz first in global scope"
-
-[[reverse]]
-to = "libharfbuzz_subset.so"
-max_bindings = 14
-reason = "GTK's hb_subset_* resolve to AOSP's harfbuzz subsetter"
-
-[[reverse]]
-to = "libft2.so"
-max_bindings = 205
-reason = "host cairo / pango / fontconfig FT_* resolve to AOSP freetype"
-
-[[reverse]]
-to = "libandroidfw.so"
-max_bindings = 226
-reason = "libandroidfw re-exports libpng symbols it links statically; host cairo / gdk-pixbuf png_* resolve there"
-
-[[reverse]]
-to = "libpng.so"
-max_bindings = 4
-reason = "host gdk-pixbuf png_* resolve to AOSP libpng"
-
-[[reverse]]
-to = "libjpeg.so"
-max_bindings = 147
-reason = "host gdk-pixbuf / tiff jpeg_* resolve to AOSP libjpeg"
+to = "libsigchain.so"
+max_bindings = 17
+reason = "intended: every host sigaction / signal goes through libsigchain, which leads the loader's DT_NEEDED for ART's fault handler"
 
 [[reverse]]
 to = "libz.so"
 max_bindings = 116
-reason = "host zlib users (png16, freetype, glib) resolve inflate / deflate to AOSP zlib"
+reason = "global through libsigchain's android variant (libunwindstack NEEDs it): host zlib users (png16, freetype, glib) resolve inflate / deflate to AOSP zlib; X3 removes it"
+
+[[reverse]]
+to = "libatl_bionic.so.0.0.0"
+max_bindings = 3
+reason = "global through libsigchain's android variant (it NEEDs libatl_bionic): host libbsd getprogname / setprogname resolve there; X3 removes it"
 
 [[reverse]]
 to = "libbpf_minimal.so"
-max_bindings = 132
-reason = "libbpf_minimal exports a bundled zstd; host LLVM / Mesa ZSTD_* resolve there"
-
-[[reverse]]
-to = "libexpat.so"
-max_bindings = 79
-reason = "host Mesa / fontconfig XML_* resolve to AOSP expat"
-
-[[reverse]]
-to = "libxml2.so"
-max_bindings = 65
-reason = "host libxml2 users resolve xml* to AOSP libxml2"
-
-[[reverse]]
-to = "libpcre2.so"
-max_bindings = 51
-reason = "host glib pcre2_* resolve to AOSP pcre2"
-
-[[reverse]]
-to = "libcutils.so"
-max_bindings = 2
-reason = "host libbsd strlcpy resolves to libcutils' copy"
-
-[[reverse]]
-to = "libsigchain.so"
-max_bindings = 17
-reason = "intended: every host sigaction / signal goes through libsigchain, which leads DT_NEEDED for ART's fault handler"
-
-[[reverse]]
-to = "atl-app-launcher"
-max_bindings = 2
-reason = "host libbsd getprogname resolves to the launcher's exported symbols"
+max_bindings = 82
+reason = "not global scope: host libelf / libzstd sit inside the AOSP group (libbpf_bcc NEEDs libelf), where libbpf_minimal's bundled zstd precedes libzstd.so.1 in the group's lookup order"
 
 # BoringSSL vs host OpenSSL: a host libssl / libcrypto user binding AOSP's same-named symbols is an ABI mismatch, not a duplicate
 [[forbidden_reverse]]

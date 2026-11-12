@@ -3,7 +3,7 @@
 //! the records and constants the launcher uses with clang's layout asserted, and per function it calls the header's fn-pointer type (`import_module`), so a header change fails the build, not a run.
 //! The functions are looked up at run time (`crate::ffi`): the ART libraries are the converter's build output, not inputs of a cargo build.
 //! Host headers (glibc's dlfcn.h, the JNI and liblog headers the converter compiles against) are parsed for the host triple; bionic's API in bionic's view, as atl-bionic's build.rs parses it.
-//! With feature `converter` (the executable; `xtask native` builds it so) it also links the converter's libsigchain (Cargo.toml `[package.metadata.atl] converter`, atl-bridgegen converter.rs): `-lsigchain` + RUNPATH, as the converter links dalvikvm's device variant (art/dalvikvm Android.bp `target.android.shared_libs`).
+//! With feature `converter` (`xtask native` builds it so) it also links the converter's modules (Cargo.toml `[package.metadata.atl] converter`, atl-bridgegen converter.rs) into both targets; `--as-needed` keeps in the loader executable only libsigchain (std's `sigaction` binds it), as the converter links dalvikvm's device variant (art/dalvikvm Android.bp `target.android.shared_libs`), and every other module in the runtime cdylib.
 //! `rustc-link-lib` of this package goes before std's `-lc` on the link line, so libsigchain precedes libc in DT_NEEDED and wins the global lookup of `sigaction` / `signal`; a `link-arg` would land after `-lc` and lose it.
 
 use std::path::PathBuf;
@@ -47,7 +47,7 @@ const IMPORTS: &[Import] = &[
         view: View::Host,
         functions: &["dlopen", "dlsym", "dlerror"],
         types: &[],
-        macros: &["RTLD_NOW", "RTLD_GLOBAL", "RTLD_LAZY", "RTLD_NOLOAD"],
+        macros: &["RTLD_NOW", "RTLD_LOCAL", "RTLD_LAZY", "RTLD_NOLOAD"],
         include_dirs: &[],
     },
     // the exit dalvikvm takes (ART's FastExit): no static destructors while runtime daemons may still run; the crash handler's resend (ffi `crash`)
@@ -307,19 +307,21 @@ fn main() -> Result<()> {
     for path in rerun {
         println!("cargo::rerun-if-changed={}", path.display());
     }
+    // The runtime's ABI is `atl_app_main` only, defined in this crate's own objects; every symbol from an archive (each dependency's rlib: atl-bionic's C names, cxx's `cxxbridge1$*`, std) stays local.
+    // Its NEEDed libraries resolve in its group with it first: an exported copy would interpose theirs (libinput.so's own cxx runtime; AOSP libraries' atl-bionic, which must be the one libatl_bionic.so ART's group binds too).
+    println!("cargo::rustc-link-arg-cdylib=-Wl,--exclude-libs,ALL");
     if std::env::var_os("CARGO_FEATURE_CONVERTER").is_some() {
         let lines = atl_bridgegen::converter::link_package(&manifest)?;
         for l in lines {
-            println!("{l}");
+            // RUNPATH only on the executable: the runtime cdylib is installed beside the converter's libraries and, like them, carries none (xtask runpath_gate); the stage's library path finds its needs
+            match l.strip_prefix("cargo::rustc-link-arg=") {
+                Some(arg) if arg.contains("-rpath,") => {
+                    println!("cargo::rustc-link-arg-bins={arg}");
+                }
+                _ => println!("{l}"),
+            }
         }
-        // why: exports.map
-        let map = manifest.join("exports.map");
-        println!("cargo::rerun-if-changed={}", map.display());
-        println!(
-            "cargo::rustc-link-arg-bins=-Wl,--version-script={}",
-            map.display()
-        );
-        // libmediaplayerservice and libstagefright_httplive NEED libcrypto.so (BoringSSL, providers.toml `libcrypto`), a provided library no converter link line carries (graph.json has no artifact for it): the executable links it from its install prefix (xtask upstream.rs), `-lcrypto` kept against --as-needed; RUNPATH for the modules' NEEDED at run time
+        // libmediaplayerservice and libstagefright_httplive NEED libcrypto.so (BoringSSL, providers.toml `libcrypto`), a provided library no converter link line carries (graph.json has no artifact for it): the runtime links it from its install prefix (xtask upstream.rs), `-lcrypto` kept against --as-needed
         let prefix = PathBuf::from(
             std::env::var_os(atl_bridgegen::converter::NATIVE_OUT).context("ATL_NATIVE_OUT")?,
         )
@@ -329,11 +331,7 @@ fn main() -> Result<()> {
             prefix.join("libcrypto.so").display()
         );
         println!("cargo::rustc-link-search=native={}", prefix.display());
-        println!("cargo::rustc-link-arg-bins=-Wl,--no-as-needed,-lcrypto,--as-needed");
-        println!(
-            "cargo::rustc-link-arg-bins=-Wl,--enable-new-dtags,-rpath,{}",
-            prefix.display()
-        );
+        println!("cargo::rustc-link-arg-cdylib=-Wl,--no-as-needed,-lcrypto,--as-needed");
     }
     Ok(())
 }

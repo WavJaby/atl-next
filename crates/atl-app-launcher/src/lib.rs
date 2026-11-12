@@ -18,8 +18,9 @@
 //!      give the display property has none and starts without, saying so;
 //! 5c. `ZygoteInit.zygoteInit(targetSdk, no disabled changes, [class, args...], boot class loader)` and the Runnable it returns (RuntimeInit.applicationInit -> `class.main(args)`), as zygote runs it; an app's class is android.app.ActivityThread with `seq=<startSeq>`.
 //!
-//! The library holds all of it; the executable (`src/main.rs`, feature `converter`) only calls [`main`]. It needs a link no plain cargo build can make: DT_NEEDED on the converter's libsigchain ahead of libc, as the converter links dalvikvm's device variant,
-//! so `sigaction` / `signal` of every library loaded later bind to libsigchain and a game engine's or crash reporter's own SIGSEGV handler is chained behind ART's fault handler instead of replacing it. `xtask native` builds it (build.rs says how).
+//! The library holds all of it, built as cdylib `libatl_app_runtime.so` with one C entry (`ffi::atl_app_main`); the executable (`src/main.rs`, feature `converter`) is its loader, `dlopen`ing it `RTLD_LOCAL`, so no AOSP object enters global scope and host objects loaded later
+//! (the UI module) resolve among themselves. The executable needs a link no plain cargo build can make: DT_NEEDED on the converter's libsigchain ahead of libc, as the converter links dalvikvm's device variant, so `sigaction` / `signal` of every library loaded later, in either group,
+//! bind to libsigchain and a game engine's or crash reporter's own SIGSEGV handler is chained behind ART's fault handler instead of replacing it. `xtask native` builds both (build.rs says how) and installs the library on the runtime library path (xtask packages.rs).
 //! Boundary crate (JNI, `dlopen`): `unsafe` only in `ffi`.
 #![deny(unsafe_code)]
 
@@ -204,8 +205,8 @@ fn native_bridge_options(property: Option<String>, isa: Option<&str>) -> Vec<std
     }
 }
 
-fn run() -> Result<i32> {
-    let launch = args::parse(std::env::args_os()).map_err(|e| anyhow!(e))?;
+fn run(argv: Vec<std::ffi::OsString>) -> Result<i32> {
+    let launch = args::parse(argv).map_err(|e| anyhow!(e))?;
     ffi::install_signal_stack()?;
     ffi::install_crash_handler()?;
     let rt = ffi::Runtime::load()?;
@@ -273,18 +274,17 @@ fn run() -> Result<i32> {
     Ok(rc)
 }
 
-/// The launcher's whole run, from the process's arguments to `_exit`.
-pub fn main() -> ! {
+/// The launcher's whole run, from the process's arguments to its exit status (`ffi::atl_app_main`, the C entry).
+fn main(argv: Vec<std::ffi::OsString>) -> i32 {
     trace::install();
-    let status = match run() {
+    match run(argv) {
         Ok(rc) => rc,
         Err(e) => {
             use std::io::Write;
             let _ = writeln!(std::io::stderr(), "atl-app-launcher: {e:#}");
             1
         }
-    };
-    ffi::fast_exit(status)
+    }
 }
 
 #[cfg(test)]

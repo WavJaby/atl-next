@@ -43,6 +43,10 @@ pub struct Package {
     pub aidl: Option<AidlSpec>,
     /// its executables (cargo bin targets)
     pub bins: Vec<String>,
+    /// `[package.metadata.atl] install_cdylib = true`: its cdylib target's name, installed into `<out>/crates/<package>/lib`, the runtime library path ([`build`]). Other cdylibs (test fixtures) stay in cargo's dir
+    pub cdylib: Option<String>,
+    /// `[package.metadata.atl] bin_needed`: the converter modules its executables' DT_NEEDED starts with, when not all of them (a loader whose library links the rest: atl-app-launcher); each must be in `modules`
+    pub bin_needed: Option<Vec<String>>,
 }
 
 /// `[package.metadata.atl.aidl]`.
@@ -162,6 +166,49 @@ fn parse_packages(json: &str) -> Result<Vec<Package>> {
             "{}: names converter modules but has no feature `{FEATURE}` to link them under",
             p.name
         );
+        let bin_needed: Option<Vec<String>> = match p
+            .metadata
+            .as_ref()
+            .and_then(|m| m["atl"].get("bin_needed"))
+        {
+            None => None,
+            Some(v) => {
+                let list: Vec<String> = serde_json::from_value(v.clone()).with_context(|| {
+                    format!(
+                        "{}: [package.metadata.atl] bin_needed is not a list of strings",
+                        p.name
+                    )
+                })?;
+                if let Some(m) = list.iter().find(|m| !modules.contains(m)) {
+                    anyhow::bail!(
+                        "{}: [package.metadata.atl] bin_needed names {m}, not in its converter list",
+                        p.name
+                    );
+                }
+                Some(list)
+            }
+        };
+        let install = p
+            .metadata
+            .as_ref()
+            .and_then(|m| m["atl"].get("install_cdylib"))
+            .is_some_and(|v| v.as_bool() == Some(true));
+        let cdylib = if install {
+            Some(
+                p.targets
+                    .iter()
+                    .find(|t| t.kind.iter().any(|k| k == "cdylib"))
+                    .map(|t| t.name.clone())
+                    .with_context(|| {
+                        format!(
+                            "{}: [package.metadata.atl] install_cdylib without a cdylib target",
+                            p.name
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
         let bins = p
             .targets
             .into_iter()
@@ -173,6 +220,8 @@ fn parse_packages(json: &str) -> Result<Vec<Package>> {
             modules,
             aidl,
             bins,
+            cdylib,
+            bin_needed,
         });
     }
     Ok(out)
@@ -394,10 +443,12 @@ fn select<'a>(
     (built, skipped)
 }
 
-/// The sonames DT_NEEDED of `package`'s executables must start with: its shared modules' file names, in the order named.
+/// The sonames DT_NEEDED of `package`'s executables must start with: its shared modules' file names (of `bin_needed` when given), in the order named.
 fn leading_needed(package: &Package, graph: &Graph) -> Result<Vec<String>> {
     package
-        .modules
+        .bin_needed
+        .as_ref()
+        .unwrap_or(&package.modules)
         .iter()
         .filter_map(|m| graph.artifacts.get(m).filter(|a| a.kind == "shared"))
         .map(|a| {
@@ -581,12 +632,27 @@ pub fn build(root: &Path, out: &Path) -> Result<Vec<Built>> {
             check_needed(&bin, &provided_gate::needed(&bin)?, &leading)?;
             bins.push(bin);
         }
+        if let Some(lib) = &p.cdylib {
+            install_cdylib(&sel.target.join("release"), sel.out, &p.name, lib)?;
+        }
         built.push(Built {
             package: p.name.clone(),
             bins,
         });
     }
     Ok(built)
+}
+
+/// Copies cdylib `lib<lib>.so` of `package` from cargo's `release` dir to `<out>/crates/<package>/lib`, the dir every runtime library path holds (host_art `stage_art`, stage_env `lib_env`): a loader `dlopen`s it by name as Android's linker finds a library.
+/// A copy, not a link: the runpath gate and the stage read it there, and cargo rewrites its own output in place.
+fn install_cdylib(release: &Path, out: &Path, package: &str, lib: &str) -> Result<PathBuf> {
+    let file = format!("lib{lib}.so");
+    let dir = out.join("crates").join(package).join("lib");
+    std::fs::create_dir_all(&dir).with_context(|| dir.display().to_string())?;
+    let to = dir.join(&file);
+    std::fs::copy(release.join(&file), &to)
+        .with_context(|| format!("installing {} to {}", file, to.display()))?;
+    Ok(to)
 }
 
 /// `xtask check` step converter-packages: clippy (as `build` lints them) then unit tests on the converter packages of `out`'s graph.json. Returns the packages it could not check, each with the
@@ -667,9 +733,31 @@ mod tests {
                 name: "launcher".into(),
                 modules: vec!["device/libsigchain".into()],
                 aidl: None,
-                bins: vec!["launcher".into()]
+                bins: vec!["launcher".into()],
+                cdylib: None,
+                bin_needed: None,
             }]
         );
+        // install_cdylib names the cdylib target (the loader's runtime); without it a cdylib is not installed; bin_needed must name converter modules
+        let loader = serde_json::json!({ "atl": { "converter": ["device/libsigchain", "device/libx"], "bin_needed": ["device/libsigchain"], "install_cdylib": true } });
+        let mut rt = pkg("launcher", loader, &["converter"], &["launcher"]);
+        rt["targets"][0] = serde_json::json!({ "name": "launcher_rt", "kind": ["cdylib"] });
+        let parsed = parse_packages(&meta(&[rt.clone()])).unwrap();
+        assert_eq!(parsed[0].cdylib.as_deref(), Some("launcher_rt"));
+        let mut fixture = rt.clone();
+        fixture["metadata"]["atl"]["install_cdylib"] = serde_json::json!(false);
+        assert_eq!(parse_packages(&meta(&[fixture])).unwrap()[0].cdylib, None);
+        let mut no_target = rt;
+        no_target["targets"][0] = serde_json::json!({ "name": "launcher", "kind": ["lib"] });
+        let err = parse_packages(&meta(&[no_target])).unwrap_err();
+        assert!(format!("{err:#}").contains("install_cdylib without a cdylib target"));
+        assert_eq!(
+            parsed[0].bin_needed.as_deref(),
+            Some(&["device/libsigchain".to_owned()][..])
+        );
+        let stray = serde_json::json!({ "atl": { "converter": ["device/libx"], "bin_needed": ["device/libsigchain"] } });
+        let err = parse_packages(&meta(&[pkg("l", stray, &["converter"], &[])])).unwrap_err();
+        assert!(format!("{err:#}").contains("not in its converter list"));
         // `aidl` adds the package's AIDL crate: a module to link and an -aidl-crates entry + goal; `parcelables` resolves to the rust_library package
         let with_aidl = serde_json::json!({ "atl": { "converter": ["device/libbinder_rs"], "aidl": { "include_dirs": ["i"], "types": ["a.IFoo"], "parcelables": "lib-p" } } });
         let mut lib_p = pkg(
@@ -801,6 +889,8 @@ mod tests {
             modules: modules.iter().map(|m| (*m).to_owned()).collect(),
             aidl: None,
             bins: Vec::new(),
+            cdylib: None,
+            bin_needed: None,
         };
         let packages = [
             p("a", &["device/libsigchain", "device/libbinder_rs"]),
@@ -823,6 +913,12 @@ mod tests {
             leading_needed(&packages[0], &g).unwrap(),
             ["libsigchain.so"]
         );
+        // bin_needed replaces the module list: a loader leading with none of them
+        let loader = Package {
+            bin_needed: Some(Vec::new()),
+            ..p("a", &["device/libsigchain", "device/libbinder_rs"])
+        };
+        assert!(leading_needed(&loader, &g).unwrap().is_empty());
     }
 
     /// The DT_NEEDED check fires when the shared module is not first (as when it is linked by `link-arg`, after std's -lc).
