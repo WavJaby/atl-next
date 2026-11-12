@@ -66,3 +66,16 @@ files = [
   { name = "config.xxhdpi", sha256 = "1556e749bcb7b2dc23a1007db4928bf2c705d86b397d0fc4b37b25464fbfdd87", size = 207150 },
   { name = "config.en", sha256 = "36395ef2dde71e80ef49e31e0af27e337db802572239d141a909d532b050383d", size = 45266 },
 ]
+
+# google-play row: Alto's Odyssey 1.0.42, the one probed Play game that ships an x86_64 split. Values read from an apkeep download with device google_kiwi_x86_64 (2026-11-13): Play serves that profile the base and config.x86_64 only.
+[altos-odyssey]
+package = "com.noodlecake.altosodyssey"
+version_name = "1.0.42"
+version_code = 107
+signer_sha256 = "08c7348bf7fa6175fdb0ec52136463582eb09150a7c5818410389d1ad8d99733"
+source = "google-play"
+device = "google_kiwi_x86_64"
+files = [
+  { name = "base", sha256 = "6984d85a8acd58ff12fbed4ee66b20f544b983a7ccab765cf1073211ab84da8b", size = 88306907 },
+  { name = "config.x86_64", sha256 = "0d040eee99bfce2651982d3badf822f9eae1fbac05713dcae3583953510b2578", size = 26325638 },
+]
