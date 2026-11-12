@@ -891,7 +891,7 @@ mod tests {
         let atm = fixture_atm();
         let (thread, scheduled) = app_thread();
         let source = attach_launcher(&atm, &thread);
-        let pairs = [("path", "/sdcard/video.mp4"), ("mute", "true")];
+        let pairs = [("path", "clip.mp4"), ("mute", "true")];
         let caller_intent = Intent {
             component: Some(ComponentName {
                 package: PACKAGE.to_owned(),
