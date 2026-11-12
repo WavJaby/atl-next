@@ -518,6 +518,13 @@ impl Window for GtkWindow {
         mirror::resync();
     }
 
+    /// `gtk_window_minimize`: GDK's Wayland backend sends `xdg_toplevel.set_minimized`.
+    fn minimize(&self) {
+        tracing::info!("atl-platform-ui: minimize");
+        self.window.minimize();
+        mirror::resync();
+    }
+
     fn size(&self) -> PhysSize {
         let (width, height) = (self.view.width(), self.view.height());
         if width <= 0 || height <= 0 {

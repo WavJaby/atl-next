@@ -10,7 +10,10 @@
 //! Sub-gates ([`checks`]): shown (the dialog drew), readback (the last settled readback is that picture), pong, controls (no dim / surface origin without the insets / popup below the anchor each give
 //! another picture, so each would fail the readback), touch (real wl_pointer drags on the off-origin dialog, before and after a resize with it open, reach it in its own coordinates: InputDispatcher's
 //! per-window transform, raw coordinates staying the Task's; `--break-input-frames` must fail it). The readback is the picture at the resized size.
-//! back-close (Main starts Sub after the first draw; Sub's Back pops to Main, which stays; after the resize, Main's Back finishes Main and the services remove its window; `--break-root-back` must fail it).
+//! Back is the app's first (owner 2026-11-12; ActivityClientController.onBackPressed:1720-1747 decides only what the app left unhandled):
+//! back (Main starts Sub after the first draw; Sub leaves its Back unhandled, so the services' requestFinish finishes it, Main resumes and the services remove Sub's window; `--break-back-finish` must fail it);
+//! consumed (after the resize, Main's first Back is consumed by its OnBackInvokedCallback: logged, no move to the back for it); minimize (Main's second Back is unhandled on the launcher root: the services
+//! move the Task back once, the window sends `xdg_toplevel.set_minimized`, Main is not destroyed and the app is still running at the watch's end; `--break-root-minimize` (policy close) must fail it).
 
 use std::path::Path;
 use std::time::Duration;
@@ -44,11 +47,14 @@ const POPUP_SIZE: (u32, u32) = (160, 80);
 const DIM_DIVISOR: u8 = 2;
 /// The fixture's line per touch on the dialog.
 const TOUCH: &str = "AtlWindow: dialog touch ";
-/// The back-close case's lines: Sub.java's onResume / onDestroy, Main.java's onDestroy (MARKER is Main's onResume).
+/// The back case's lines: Sub.java's onResume / onDestroy, Main.java's onDestroy and its callback's consumed Back (MARKER is Main's onResume).
 const SUB_RESUMED: &str = "AtlWindow: sub onResume reached";
 const SUB_DESTROYED: &str = "AtlWindow: sub onDestroy reached";
 const DESTROYED: &str = "AtlWindow: onDestroy reached";
-/// Each back-close wait polls this long for its line; a break leaves it unmet and the verdict names the line.
+const CONSUMED: &str = "AtlWindow: back consumed";
+/// The services' line per move to the back (activity.rs ActivityClientController::task_to_back).
+const TASK_TO_BACK: &str = "services: onBackPressed: moveTaskToBack uid=";
+/// Each back wait polls this long for its line or event; a break leaves it unmet and the verdict names what is missing.
 const BACK_WAIT: Duration = Duration::from_secs(5);
 /// A drag starts at the dialog's centre and ends this far from it: inside the dialog, so a window-relative event stays on it.
 const DRAG: (u32, u32) = (30, 20);
@@ -311,16 +317,20 @@ fn touch_check(app: &str) -> Result<String, String> {
     ))
 }
 
-/// The sub-gates. `services` is the services log: the back-close case reads the window removals there.
+/// The sub-gates. `services` is the services log: the back case reads the window removals and the moves to the back there. `ended`: the app or atld ended before the watch did.
 pub fn checks(
     app: &str,
     services: &str,
     liveness: &Result<Liveness, String>,
     pictures: &Mutex<capture::Seen>,
+    ended: bool,
 ) -> Vec<Sub> {
+    let minimized = liveness.as_ref().is_ok_and(|l| l.minimized);
     vec![
         // first: the probe's first step, and a break of it leaves Sub on top for everything after
-        ("back-close", back_close_check(app, services)),
+        ("back", back_check(app, services)),
+        ("consumed", consumed_check(app, services)),
+        ("minimize", minimize_check(app, services, minimized, ended)),
         (
             "shown",
             layout(app).map(|l| format!("window {}x{}, anchor {:?}", l.width, l.height, l.anchor)),
@@ -340,9 +350,16 @@ pub fn checks(
     ]
 }
 
-/// The back-close verdict: Sub's Back popped Sub (Main resumed before Sub's onDestroy, as AOSP resumes the activity below first), then Main's Back finished Main.
-/// The services removed both windows: Sub's (its Back) and Main's (the root close). A services break (`--no-root-back`: no requestFinish) misses the first line that needs it.
-fn back_close_check(app: &str, services: &str) -> Result<String, String> {
+/// The services removed the window of the activity whose class ends with `title`.
+fn removed(services: &str, title: &str) -> bool {
+    services
+        .lines()
+        .any(|l| l.contains("window ") && l.ends_with(&format!("{title} removed")))
+}
+
+/// The back verdict: Sub's unhandled Back finished Sub (Main resumed before Sub's onDestroy, as AOSP resumes the activity below first) and the services removed Sub's window.
+/// A services break (`--no-back-finish`: no requestFinish) misses the sub onDestroy.
+fn back_check(app: &str, services: &str) -> Result<String, String> {
     let started = app
         .find(SUB_RESUMED)
         .ok_or("Main never started Sub (no sub onResume)")?;
@@ -353,21 +370,60 @@ fn back_close_check(app: &str, services: &str) -> Result<String, String> {
     if !app[started..sub].contains(MARKER) {
         return Err("Main did not resume when Sub's Back popped it".to_owned());
     }
-    app[sub..]
-        .find(DESTROYED)
-        .ok_or("Main's Back never finished Main (no onDestroy)")?;
-    let removed = |title: &str| {
-        services
-            .lines()
-            .any(|l| l.contains("window ") && l.ends_with(&format!("{title} removed")))
-    };
-    if !removed(".Sub") {
+    if !removed(services, ".Sub") {
         return Err("the services removed no Sub window".to_owned());
     }
-    if !removed(".Main") {
-        return Err("the services removed no Main window".to_owned());
+    Ok(
+        "Sub's unhandled Back finished Sub, Main resumed, the services removed Sub's window"
+            .to_owned(),
+    )
+}
+
+/// The consumed verdict: Main's callback logged its Back, and that Back reached no system default: the services moved the Task back once at most (the second, unhandled Back's), and Main lives on.
+fn consumed_check(app: &str, services: &str) -> Result<String, String> {
+    app.find(CONSUMED)
+        .ok_or("Main's OnBackInvokedCallback never got its Back (no back consumed)")?;
+    let moves = services.matches(TASK_TO_BACK).count();
+    if moves > 1 {
+        return Err(format!(
+            "{moves} moves to the back: the consumed Back reached the services too"
+        ));
     }
-    Ok("Sub's Back popped Sub, Main resumed, Main's Back finished Main; the services removed both windows".to_owned())
+    if app.contains(DESTROYED) {
+        return Err("Main was destroyed: a Back finished it".to_owned());
+    }
+    Ok("the app's callback consumed Main's first Back; no system default ran for it".to_owned())
+}
+
+/// The minimize verdict: Main's unhandled Back on the launcher root moved the Task back once, the window asked to be minimized, Main was not destroyed or its window removed, and the app outlived
+/// the watch. The close policy (`--root-back close`) finishes Main instead: no move, no set_minimized, onDestroy, and the app ends with its last window.
+fn minimize_check(
+    app: &str,
+    services: &str,
+    minimized: bool,
+    ended: bool,
+) -> Result<String, String> {
+    let moves = services.matches(TASK_TO_BACK).count();
+    if moves != 1 {
+        return Err(format!(
+            "{moves} moves to the back for Main's unhandled Back, want 1"
+        ));
+    }
+    if !minimized {
+        return Err("the window sent no xdg_toplevel.set_minimized".to_owned());
+    }
+    if app.contains(DESTROYED) || removed(services, ".Main") {
+        return Err(
+            "Main was finished (onDestroy or its window removed), not moved back".to_owned(),
+        );
+    }
+    if ended {
+        return Err("the app ended before the watch did".to_owned());
+    }
+    Ok(
+        "Main's unhandled Back moved the Task back: window minimized, Main alive, app running"
+            .to_owned(),
+    )
 }
 
 /// A drag on the dialog of the log's last layout: pointer in at its centre, press, move DRAG in two steps, release.
@@ -419,9 +475,9 @@ fn back(proxy: &Proxy, x: f64, y: f64) -> Result<(), String> {
     )
 }
 
-/// The back-close case, first half: Main started Sub after the dialog's first draw; Sub's Back pops to Main, which resumes and stays.
+/// The back case, first step: Main started Sub after the dialog's first draw; Sub's unhandled Back pops to Main, which resumes and stays.
 /// The dialog is touch-modal, so no touch reaches the anchor (a click there lands in the dialog); the Back is a mouse button, which goes to the focused window.
-/// Waits only; [`back_close_check`] judges the lines, so a break fails there, not here.
+/// Waits only; [`back_check`] judges the lines, so a break fails there, not here.
 fn sub_back(proxy: &Proxy, app_log: &Path) -> Result<(), String> {
     wait_until(app_log, BACK_WAIT, |t| t.contains(SUB_RESUMED));
     let (x, y) = anchor_centre(app_log)?;
@@ -430,16 +486,18 @@ fn sub_back(proxy: &Proxy, app_log: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The back-close case, second half: Main's own Back. Its onDestroy and the window's removal are judged by [`back_close_check`].
-fn root_back(proxy: &Proxy, app_log: &Path) -> Result<(), String> {
+/// The back case, last steps: Main's first Back (its callback consumes it, [`consumed_check`]), then its second, unhandled one. Returns whether the window then sent `set_minimized`
+/// ([`minimize_check`] judges it with the lines).
+fn root_backs(proxy: &Proxy, app_log: &Path) -> Result<bool, String> {
     let (x, y) = anchor_centre(app_log)?;
     back(proxy, x, y)?;
-    wait_until(app_log, BACK_WAIT, |t| t.contains(DESTROYED));
-    Ok(())
+    wait_until(app_log, BACK_WAIT, |t| t.contains(CONSUMED));
+    back(proxy, x, y)?;
+    Ok(await_event(&proxy.events, BACK_WAIT, |e| *e == ProxyEvent::Minimized).is_some())
 }
 
 /// The probe: the window's configure is acked, the dialog drew, one ping, a drag on the dialog; the window is resized with it open, and a second drag.
-/// The back-close case's Sub Back comes first, before any other input (Sub covers the dialog until it pops); Main's Back comes last, since the window goes away with it.
+/// The back case's Sub Back comes first, before any other input (Sub covers the dialog until it pops); Main's Backs come last, since the window minimizes with the second.
 pub fn drive(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liveness, String> {
     await_event(&proxy.events, ACK_WAIT, |e| {
         matches!(e, ProxyEvent::Acked { .. })
@@ -468,12 +526,13 @@ pub fn drive(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liv
     std::thread::sleep(RESIZE_SETTLE);
     drag(&proxy, app_log)?;
     std::thread::sleep(RESIZE_SETTLE);
-    // the picture of the dialog as the last drag left it, before Main's Back closes Main
+    // the picture of the dialog as the last drag left it, before Main's Backs minimize the window
     probe.record_settled();
-    root_back(&proxy, app_log)?;
+    let minimized = root_backs(&proxy, app_log)?;
     std::thread::sleep(RESIZE_SETTLE);
     Ok(Liveness {
         answered,
+        minimized,
         ..Liveness::default()
     })
 }
@@ -507,55 +566,85 @@ mod tests {
         assert!(controls(LINE).is_ok());
     }
 
-    /// The fixture's lines in the back-close case: Main resumes when Sub's Back pops it, before Sub's onDestroy (AOSP resumes the activity below first); Main's onDestroy comes last.
-    const BACK_CLOSE: &str = "1.0 I AtlWindow: onResume reached\n1.1 I AtlWindow: sub onResume reached\n1.2 I AtlWindow: onResume reached\n1.3 I AtlWindow: sub onDestroy reached\n1.4 I AtlWindow: onDestroy reached\n";
-    /// The services' window lines: Sub's window (its Back), then Main's (the root close).
-    const REMOVED_LINE: &str = "services: window com.example.atldialog/com.example.atldialog.Sub removed\nservices: window com.example.atldialog/com.example.atldialog.Main removed\n";
+    /// The fixture's lines in the back case: Main resumes when Sub's Back pops it, before Sub's onDestroy (AOSP resumes the activity below first); Main's callback consumes its first Back.
+    const BACK: &str = "1.0 I AtlWindow: onResume reached\n1.1 I AtlWindow: sub onResume reached\n1.2 I AtlWindow: onResume reached\n1.3 I AtlWindow: sub onDestroy reached\n1.4 I AtlWindow: back consumed\n";
+    /// The services' lines: Sub's window removed (its Back), then one move to the back (Main's unhandled Back).
+    const SERVICES: &str = "services: window com.example.atldialog/com.example.atldialog.Sub removed\nservices: onBackPressed: moveTaskToBack uid=10001\n";
+    /// The close policy's services lines: no move, Main's window removed.
+    const CLOSED: &str = "services: window com.example.atldialog/com.example.atldialog.Sub removed\nservices: window com.example.atldialog/com.example.atldialog.Main removed\n";
 
     #[test]
-    fn back_close_wants_sub_popped_then_main_finished() {
-        assert!(back_close_check(BACK_CLOSE, REMOVED_LINE).is_ok());
+    fn back_case_passes_on_the_fixture_lines() {
+        assert!(back_check(BACK, SERVICES).is_ok());
+        assert!(consumed_check(BACK, SERVICES).is_ok());
+        assert!(minimize_check(BACK, SERVICES, true, false).is_ok());
     }
 
     #[test]
-    fn back_close_needs_main_finished_by_its_own_back() {
-        // --no-root-back: no requestFinish on either Back, so Sub never destroys and Main never does
-        let no_back = "1.0 I AtlWindow: onResume reached\n1.1 I AtlWindow: sub onResume reached\n";
+    fn back_needs_sub_finished_and_main_resumed() {
+        // --no-back-finish: no requestFinish, so Sub never destroys
+        let no_finish =
+            "1.0 I AtlWindow: onResume reached\n1.1 I AtlWindow: sub onResume reached\n";
         assert!(
-            back_close_check(no_back, REMOVED_LINE)
+            back_check(no_finish, SERVICES)
                 .unwrap_err()
                 .contains("no sub onDestroy")
         );
-        // Sub popped but Main's Back never finished it
-        let no_root = "1.0 I AtlWindow: onResume reached\n1.1 I AtlWindow: sub onResume reached\n1.2 I AtlWindow: onResume reached\n1.3 I AtlWindow: sub onDestroy reached\n";
+        // Sub's Back took Main down with it: no Main resume between Sub's onResume and onDestroy
+        let no_resume = "1.0 I AtlWindow: onResume reached\n1.1 I AtlWindow: sub onResume reached\n1.2 I AtlWindow: sub onDestroy reached\n";
         assert!(
-            back_close_check(no_root, REMOVED_LINE)
+            back_check(no_resume, SERVICES)
                 .unwrap_err()
-                .contains("no onDestroy")
+                .contains("did not resume")
         );
-        let sub_only = "services: window com.example.atldialog/com.example.atldialog.Sub removed\n";
+        let no_removal = "services: onBackPressed: moveTaskToBack uid=10001\n";
         assert!(
-            back_close_check(BACK_CLOSE, sub_only)
-                .unwrap_err()
-                .contains("no Main window")
-        );
-        let main_only =
-            "services: window com.example.atldialog/com.example.atldialog.Main removed\n";
-        assert!(
-            back_close_check(BACK_CLOSE, main_only)
+            back_check(BACK, no_removal)
                 .unwrap_err()
                 .contains("no Sub window")
         );
     }
 
     #[test]
-    fn back_close_needs_main_to_resume_when_sub_pops() {
-        // Sub's Back took Main down with it: no Main resume between Sub's onResume and onDestroy
-        let no_resume = "1.0 I AtlWindow: onResume reached\n1.1 I AtlWindow: sub onResume reached\n1.2 I AtlWindow: sub onDestroy reached\n1.3 I AtlWindow: onDestroy reached\n";
+    fn consumed_needs_the_callback_and_no_extra_default() {
+        let unconsumed = BACK.replace("back consumed", "something else");
         assert!(
-            back_close_check(no_resume, REMOVED_LINE)
+            consumed_check(&unconsumed, SERVICES)
                 .unwrap_err()
-                .contains("did not resume")
+                .contains("no back consumed")
+        );
+        // both of Main's Backs reached the services
+        let twice = format!("{SERVICES}services: onBackPressed: moveTaskToBack uid=10001\n");
+        assert!(
+            consumed_check(BACK, &twice)
+                .unwrap_err()
+                .contains("2 moves")
+        );
+    }
+
+    /// `--root-back close`: Main finishes on its unhandled Back, the window closes and the app ends with it; every condition of the minimize check fails on that run's lines.
+    #[test]
+    fn minimize_fails_under_the_close_policy() {
+        let destroyed = format!("{BACK}1.5 I AtlWindow: onDestroy reached\n");
+        assert!(
+            minimize_check(&destroyed, CLOSED, false, true)
+                .unwrap_err()
+                .contains("0 moves")
+        );
+        assert!(
+            minimize_check(BACK, SERVICES, false, false)
+                .unwrap_err()
+                .contains("set_minimized")
+        );
+        assert!(
+            minimize_check(&destroyed, SERVICES, true, false)
+                .unwrap_err()
+                .contains("finished")
+        );
+        assert!(
+            minimize_check(BACK, SERVICES, true, true)
+                .unwrap_err()
+                .contains("ended")
         );
     }
 }

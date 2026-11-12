@@ -55,6 +55,20 @@ pub fn set_pointer_icon(kind: i32) {
     }));
 }
 
+/// The services' moveTaskToBack of this app's Task (an unhandled Back on its root activity, UI-agent MINIMIZE): the window is minimized; from any thread. Headless mode has no window.
+pub fn minimize() {
+    let Some(invoker) = INVOKER.get() else {
+        return;
+    };
+    invoker.invoke(Box::new(|| {
+        SESSION.with_borrow(|session| {
+            if let Some(window) = session.as_ref().and_then(|s| s.window.as_ref()) {
+                window.minimize();
+            }
+        });
+    }));
+}
+
 /// Whether captures can be served: UI mode attached the toolkit (a headless compositor has no window to read back).
 pub fn available() -> bool {
     INVOKER.get().is_some()

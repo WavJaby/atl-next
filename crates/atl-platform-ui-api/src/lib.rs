@@ -204,6 +204,9 @@ pub trait Window: FrameClock + InputSource + Sized {
     /// Sets the cursor shown while the pointer is over the content.
     fn set_cursor(&self, shape: CursorShape);
 
+    /// Asks the desktop to minimize (iconify) the window; the app keeps running. A request: the shell may ignore it, and gives no answer (Wayland `xdg_toplevel.set_minimized`).
+    fn minimize(&self);
+
     /// The content size now: what the compositor granted once mapped, else what was asked for.
     fn size(&self) -> PhysSize;
 

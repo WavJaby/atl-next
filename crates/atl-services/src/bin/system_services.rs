@@ -16,7 +16,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use atl_aidl::aidl::android::app::IActivityManager::BnActivityManager;
 use atl_aidl::aidl::android::content::pm::IPackageManager::BnPackageManager;
-use atl_services::activity::ActivityManager;
+use atl_services::activity::{ActivityManager, RootBack};
 use atl_services::package::PackageManager;
 use atl_services::process_control::ControlSocket;
 use atl_services::ui_agent::UiAgents;
@@ -53,9 +53,12 @@ struct Args {
     /// Test only: a start owes its caller no result, so no onActivityResult arrives (none is delivered or cancelled), the deliberate break of the app gate's result sub-gate.
     #[arg(long)]
     no_activity_result: bool,
-    /// Test only: onBackPressed sends no requestFinish, the deliberate break of the dialog gate's back-close sub-gate (no activity finishes on Back).
+    /// Test only: onBackPressed sends no requestFinish, the deliberate break of the dialog gate's back sub-gate (no activity finishes on an unhandled Back).
     #[arg(long)]
-    no_root_back: bool,
+    no_back_finish: bool,
+    /// What an unhandled Back on a Task's launcher root does: `minimize` (Android 12+ moveTaskToBack; the app keeps running) or `close` (the root finishes; pre-Android-12).
+    #[arg(long, value_parser = parse_root_back, default_value = "minimize")]
+    root_back: RootBack,
     /// Test only: `sensorservice` is not registered, the deliberate break of the sensors gate's empty stage (SensorManager then waits for it, SensorManager.cpp `waitForSensorService`).
     #[arg(long)]
     no_sensor_service: bool,
@@ -106,6 +109,15 @@ const CONNECTIVITY: &str = "connectivity";
 /// The name PermissionManager's constructor looks IPermissionManager up by (PermissionManager.java getServiceOrThrow("permissionmgr")).
 const PERMISSION_MANAGER: &str = "permissionmgr";
 
+/// `--root-back`'s values.
+fn parse_root_back(s: &str) -> Result<RootBack, String> {
+    match s {
+        "minimize" => Ok(RootBack::Minimize),
+        "close" => Ok(RootBack::Close),
+        _ => Err(format!("{s}: expected minimize or close")),
+    }
+}
+
 fn main() -> Result<()> {
     let a = Args::parse();
     let display = a.display.unwrap_or_default();
@@ -130,7 +142,9 @@ fn main() -> Result<()> {
         Arc::clone(&permissions),
         control,
         Arc::clone(&tasks),
-        !a.no_root_back,
+        Arc::clone(&agents),
+        !a.no_back_finish,
+        a.root_back,
     );
     if let Some(package) = &a.launch
         && packages.by_name(package).is_none()

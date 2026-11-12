@@ -726,7 +726,7 @@ impl IWindowSession for Session {
             windows.retain(|w| w.client != *token);
             (inputs, layers, titles)
         };
-        // one line per window that left its Task: the back-close gate reads it (the window goes away when its activity finishes)
+        // one line per window that left its Task: the dialog gate's back case reads it (the window goes away when its activity finishes)
         for title in titles {
             activity::log(format_args!("window {title} removed"));
         }

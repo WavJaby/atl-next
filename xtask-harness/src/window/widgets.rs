@@ -1029,6 +1029,7 @@ pub fn drive(
         resumed_ms: None,
         configured: Vec::new(),
         idle: Some(Idle { from, to }),
+        minimized: false,
     })
 }
 

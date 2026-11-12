@@ -5,7 +5,7 @@
 //! * `wl_display.get_registry` and `wl_registry.bind` -> which object id is which interface (`xdg_wm_base`, `wl_shm`, ...);
 //! * `xdg_wm_base.pong(serial)` (request opcode 3) -> [`Event::Pong`], `wl_shm.create_pool` (opcode 0) -> [`Event::ShmPool`];
 //! * `xdg_wm_base.ping(serial)` from the compositor (event opcode 0) -> [`Event::Ping`] with `injected: false`;
-//! * `xdg_toplevel.set_app_id(app_id)` of the window's toplevel (request opcode 3) -> [`Event::AppId`];
+//! * `xdg_toplevel.set_app_id(app_id)` of the window's toplevel (request opcode 3) -> [`Event::AppId`], its `set_minimized` (opcode 13) -> [`Event::Minimized`];
 //! * the window's first `wl_surface.commit` (xdg-shell's initial one, no buffer) -> [`Event::FirstCommit`].
 //!
 //! Injections go to the connection that bound `xdg_wm_base` (the window's); an app's other connections forward only.
@@ -54,6 +54,8 @@ const XDG_SURFACE_SET_WINDOW_GEOMETRY: u16 = 3;
 const XDG_TOPLEVEL: &str = "xdg_toplevel";
 /// `xdg_toplevel.set_app_id(app_id: string)`, request 3 (xdg-shell.xml).
 const XDG_TOPLEVEL_SET_APP_ID: u16 = 3;
+/// `xdg_toplevel.set_minimized()`, request 13 (xdg-shell.xml: destroy 0 ... unset_fullscreen 12, set_minimized 13).
+const XDG_TOPLEVEL_SET_MINIMIZED: u16 = 13;
 /// `wl_surface.commit` request 6 (wayland.xml).
 const WL_SURFACE_COMMIT: u16 = 6;
 /// The `configure` events of xdg_toplevel and xdg_surface are both opcode 0 (their requests are other opcodes).
@@ -139,6 +141,8 @@ pub enum Event {
     },
     /// The client's `xdg_toplevel.set_app_id` on the window: the id the compositor sees the window by. Every one is sent, in order.
     AppId { app_id: String },
+    /// The client's `xdg_toplevel.set_minimized` on the window: it asked the desktop to minimize it.
+    Minimized,
     /// The window's first `wl_surface.commit`: the initial one, which carries no buffer; the desktop matches the window's rules on it, before any frame.
     FirstCommit,
     /// [`Proxy::inject_pointer`]'s action was written to the client (a dropped action reports nothing).
@@ -271,6 +275,9 @@ fn note_request(ids: &mut Ids, object: u32, opcode: u16, body: &[u8]) -> Option<
             Some(Event::AppId {
                 app_id: wl_string(body, 0)?,
             })
+        }
+        (Some(XDG_TOPLEVEL), XDG_TOPLEVEL_SET_MINIMIZED) if ids.toplevel == Some(object) => {
+            Some(Event::Minimized)
         }
         (Some(WM_BASE), XDG_WM_BASE_PONG) => Some(Event::Pong {
             serial: word(body, 0)?,
@@ -1023,6 +1030,23 @@ mod tests {
         );
         assert_eq!(
             note_request(&mut ids, 13, XDG_TOPLEVEL_SET_APP_ID, &body),
+            None
+        );
+    }
+
+    /// `xdg_toplevel.set_minimized` (request 13, no arguments) of the window's toplevel is [`Event::Minimized`]; another toplevel's is not.
+    #[test]
+    fn set_minimized_is_an_event() {
+        let mut ids = Ids::default();
+        ids.interfaces.insert(12, XDG_TOPLEVEL.to_owned());
+        ids.interfaces.insert(13, XDG_TOPLEVEL.to_owned());
+        ids.toplevel = Some(12);
+        assert_eq!(
+            note_request(&mut ids, 12, XDG_TOPLEVEL_SET_MINIMIZED, &[]),
+            Some(Event::Minimized)
+        );
+        assert_eq!(
+            note_request(&mut ids, 13, XDG_TOPLEVEL_SET_MINIMIZED, &[]),
             None
         );
     }

@@ -51,7 +51,7 @@ use binder::{
 };
 
 use crate::activity_start::{self, Refusal};
-use crate::activity_task::ActivityTasks;
+use crate::activity_task::{ActivityTasks, Back};
 use crate::broadcast::{self, BroadcastFilter, Broadcasts, IntentKey, StickyRefusal};
 use crate::broadcast_queue::{self, Job};
 use crate::config_diff::{self, Config, Delivery};
@@ -61,6 +61,7 @@ use crate::pending_intent_table::Key;
 use crate::process_control::ProcessControl;
 use crate::shared_memory::ApplicationSharedMemory;
 use crate::tasks::{TaskId, TaskSize, Tasks, initial_size};
+use crate::ui_agent::{IUiAgent, UiAgents};
 use crate::{package, settings};
 use atl_services_types::counters;
 use atl_services_types::display_model::DisplayModel;
@@ -542,15 +543,35 @@ fn back_pressed(known: bool, callback: Option<&dyn IRequestFinishCallback>) -> b
     true
 }
 
+/// What an unhandled Back on a Task's launcher root does: the system default behind ActivityClientController.shouldMoveTaskToBack. One value for every app now; a per-app setting chooses it later.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RootBack {
+    /// moveTaskToBack, Android 12+ (owner 2026-11-12): the window is minimized, the app keeps running.
+    #[default]
+    Minimize,
+    /// requestFinish, as before Android 12: the root finishes, its window closes and with the last window the process ends.
+    Close,
+}
+
+/// The policy applied to onBackPressed's choice: under [`RootBack::Close`] a move to the back finishes instead.
+fn under_policy(back: Back, root: RootBack) -> Back {
+    match (back, root) {
+        (Back::TaskToBack { .. }, RootBack::Close) => Back::Finish,
+        (back, _) => back,
+    }
+}
+
 impl ActivityManager {
-    /// `tasks` is the table the window service and the registry read: the launch binds each activity it starts to its Task there.
-    /// `root_back` false is the test-only break (`--no-root-back`): see [`ActivityClientController::root_back`].
+    /// `tasks` is the table the window service and the registry read: the launch binds each activity it starts to its Task there. `agents` are the apps' UI agents: a root Back minimizes through them.
+    /// `back_finish` false is the test-only break (`--no-back-finish`): see [`ActivityClientController::back_finish`]. `root_back`: see [`RootBack`].
     pub fn new(
         packages: Arc<Packages>,
         permissions: Arc<Permissions>,
         control: Arc<dyn ProcessControl>,
         tasks: Arc<Tasks<SpIBinder>>,
-        root_back: bool,
+        agents: Arc<UiAgents>,
+        back_finish: bool,
+        root_back: RootBack,
     ) -> Self {
         let buckets = Arc::new(ReportedBuckets::default());
         ActivityManager {
@@ -559,6 +580,8 @@ impl ActivityManager {
                     ActivityClientController {
                         buckets: Arc::clone(&buckets),
                         inner: inner.clone(),
+                        agents,
+                        back_finish,
                         root_back,
                     },
                     BinderFeatures::default(),
@@ -2176,8 +2199,32 @@ impl ReportedBuckets {
 struct ActivityClientController {
     buckets: Arc<ReportedBuckets>,
     inner: Weak<Inner>,
-    /// false: onBackPressed sends nothing (`--no-root-back`, the dialog gate's deliberate break); the Back then never finishes an activity.
-    root_back: bool,
+    /// the apps' UI agents, by uid: a move to the back minimizes the app's window through its agent
+    agents: Arc<UiAgents>,
+    /// false: onBackPressed sends no requestFinish (`--no-back-finish`, the dialog gate's back sub-gate's deliberate break); a Back then never finishes an activity.
+    back_finish: bool,
+    /// what an unhandled Back on a launcher root does
+    root_back: RootBack,
+}
+
+impl ActivityClientController {
+    /// moveActivityTaskToBack for the app of `uid`: its UI agent minimizes the window (the desktop's "back": the Task stays, behind the others). Logged as `onBackPressed: moveTaskToBack uid=<uid>`.
+    /// No agent (headless, or not registered yet): counted, nothing else; the activity stays.
+    fn task_to_back(&self, uid: u32) {
+        log(format_args!("onBackPressed: moveTaskToBack uid={uid}"));
+        let Some(agent) = self
+            .agents
+            .get(uid)
+            .and_then(|b| b.into_interface::<dyn IUiAgent>().ok())
+        else {
+            counters::answered(ACC, "onBackPressed: moveTaskToBack, no UI agent");
+            return;
+        };
+        counters::answered(ACC, "onBackPressed: moveTaskToBack");
+        if let Err(e) = agent.minimize() {
+            log(format_args!("onBackPressed: minimize: {e:?}"));
+        }
+    }
 }
 
 impl Interface for ActivityClientController {}
@@ -2261,22 +2308,28 @@ impl IActivityClientController for ActivityClientController {
         Ok(inner.atm.finish(token, code, data.cloned()))
     }
 
-    /// ActivityClientController.onBackPressed (oneway, AIDL): a record with the token gets requestFinish, and the app finishes it. The root closes with the window; never moveTaskToBack
-    /// (owner, 2026-11-07: the branch at ActivityClientController.java:1736-1739 is not modelled) and no task organizer (:1728-1735).
+    /// ActivityClientController.onBackPressed:1720-1747 (oneway, AIDL). The app calls it only for a Back it left unhandled (Activity.onBackInvoked after its own callbacks, OnBackPressedDispatcher
+    /// and dialogs declined it). The launcher root of its Task moves the Task back (shouldMoveTaskToBack, :1736-1739): its window is minimized and the app keeps running, unless the policy is
+    /// [`RootBack::Close`]. Any other record gets requestFinish (:1744), and the app finishes it. No task organizer (:1728-1735).
     fn r#onBackPressed(
         &self,
         token: Option<&SpIBinder>,
         callback: Option<&Strong<dyn IRequestFinishCallback>>,
     ) -> binder::Result<()> {
-        if !self.root_back {
-            counters::refused(ACC, "onBackPressed (--no-root-back)");
-            return Ok(());
-        }
-        let known = match (token, self.inner.upgrade()) {
-            (Some(token), Some(inner)) => inner.atm.has_record(token),
-            _ => false,
+        let inner = self.inner.upgrade();
+        let back = match (token, &inner) {
+            (Some(token), Some(inner)) => inner.atm.back(token),
+            _ => None,
         };
-        back_pressed(known, callback.map(|c| &**c));
+        match back.map(|b| under_policy(b, self.root_back)) {
+            Some(Back::TaskToBack { uid }) => self.task_to_back(uid),
+            Some(Back::Finish) if !self.back_finish => {
+                counters::refused(ACC, "onBackPressed (--no-back-finish)");
+            }
+            known => {
+                back_pressed(known.is_some(), callback.map(|c| &**c));
+            }
+        }
         Ok(())
     }
 
@@ -2391,5 +2444,15 @@ mod tests {
     #[test]
     fn no_callback_sends_nothing() {
         assert!(!back_pressed(true, None));
+    }
+
+    /// Minimize keeps the move to the back; Close turns it into the pre-Android-12 finish; a plain finish stays a finish under both.
+    #[test]
+    fn root_back_policy() {
+        let back = Back::TaskToBack { uid: 10_001 };
+        assert_eq!(under_policy(back, RootBack::Minimize), back);
+        assert_eq!(under_policy(back, RootBack::Close), Back::Finish);
+        assert_eq!(under_policy(Back::Finish, RootBack::Minimize), Back::Finish);
+        assert_eq!(under_policy(Back::Finish, RootBack::Close), Back::Finish);
     }
 }

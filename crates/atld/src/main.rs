@@ -157,9 +157,12 @@ struct Args {
     /// Test only: passed to the services (`--no-activity-result`), the deliberate break of the app gate's result sub-gate: starts owe no result.
     #[arg(long)]
     no_activity_result: bool,
-    /// Test only: passed to the services (`--no-root-back`), the deliberate break of the dialog gate's back-close sub-gate.
+    /// Test only: passed to the services (`--no-back-finish`), the deliberate break of the dialog gate's back sub-gate.
     #[arg(long)]
-    no_root_back: bool,
+    no_back_finish: bool,
+    /// What an unhandled Back on an app's root activity does, passed to the services: `minimize` (the window is minimized, the app keeps running; Android 12+) or `close` (the app's window closes).
+    #[arg(long, value_parser = ["minimize", "close"], default_value = "minimize")]
+    root_back: String,
     /// Test only: passed to the services (`--no-sensor-service`), the deliberate break of the sensors gate's empty stage.
     #[arg(long)]
     no_sensor_service: bool,
@@ -1387,9 +1390,11 @@ fn run(a: &Args) -> Result<ExitCode> {
     if a.no_activity_result {
         services_args.push("--no-activity-result".into());
     }
-    if a.no_root_back {
-        services_args.push("--no-root-back".into());
+    if a.no_back_finish {
+        services_args.push("--no-back-finish".into());
     }
+    services_args.push("--root-back".into());
+    services_args.push(a.root_back.clone().into());
     if a.no_sensor_service {
         services_args.push("--no-sensor-service".into());
     }

@@ -13,6 +13,8 @@ import android.view.ViewTreeObserver;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
 import android.widget.PopupWindow;
+import android.window.OnBackInvokedCallback;
+import android.window.OnBackInvokedDispatcher;
 
 /**
  * The dialog gate: `xtask test window --stage dialog` (xtask-harness/src/window/dialog.rs). A software window of colour WINDOW with an ANCHOR view near its bottom;
@@ -20,7 +22,8 @@ import android.widget.PopupWindow;
  * centred (gravity 0), FLAG_DIM_BEHIND at DIM, with manual surfaceInsets INSET on each side (a shadow's room; set by reflection, the field is hidden API).
  * Sizes are pixels; colours stay at or under 0x80 per channel, so the dimmed value is exact whether the compositor's alpha is 0.5 or 128/255.
  * After the dialog's first draw, and at each window layout after it, the fixture logs the window size and the anchor's rectangle; the dialog logs each touch in its own and in raw coordinates.
- * After the dialog's first draw Main starts Sub (Sub.java): the back-close sub-gate's first Back pops it, then Main's own Back finishes Main and logs its onDestroy.
+ * After the dialog's first draw Main starts Sub (Sub.java): the back sub-gate's first Back pops it (Sub leaves Back unhandled: the services' requestFinish, and Sub finishes).
+ * Main's first own Back is consumed by its OnBackInvokedCallback ("back consumed"), which then unregisters; its second is unhandled, so the services move the Task back: the window minimizes, Main stays.
  */
 public class Main extends Activity {
     static final String TAG = "AtlWindow";
@@ -40,6 +43,14 @@ public class Main extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        // the app's own handling wins (targetSdk 36: predictive back): one Back consumed, then the callback is gone and the next Back reaches the system default
+        getOnBackInvokedDispatcher().registerOnBackInvokedCallback(OnBackInvokedDispatcher.PRIORITY_DEFAULT, new OnBackInvokedCallback() {
+            @Override
+            public void onBackInvoked() {
+                Log.i(TAG, "back consumed");
+                getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(this);
+            }
+        });
         root = new FrameLayout(this);
         root.setBackgroundColor(WINDOW);
         anchor = new View(this);
@@ -99,7 +110,7 @@ public class Main extends Activity {
     private void showDialog() {
         final View content = new View(this);
         content.setBackgroundColor(DIALOG);
-        // NOT_FOCUSABLE: keys stay with the activity, so its Back (the back-close case) reaches Main, not this window
+        // NOT_FOCUSABLE: keys stay with the activity, so its Backs (the back case) reach Main, not this window
         WindowManager.LayoutParams lp = new WindowManager.LayoutParams(DIALOG_W, DIALOG_H, WindowManager.LayoutParams.TYPE_APPLICATION,
                 WindowManager.LayoutParams.FLAG_DIM_BEHIND | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT);
         lp.gravity = 0;

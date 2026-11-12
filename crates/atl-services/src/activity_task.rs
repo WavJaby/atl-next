@@ -53,6 +53,17 @@ pub(crate) struct Owner {
     pub declared: u32,
     /// a relaunch was sent and activityRelaunched has not come (ActivityRecord.mPendingRelaunchCount, at most 1 here: Delivery::Wait)
     pub relaunching: bool,
+    /// started by the launcher with its MAIN / LAUNCHER intent (ActivityRecord LAUNCH_SOURCE_TYPE_HOME + isMainIntent): an unhandled Back on it as the Task's root moves the Task back, see [`ActivityTasks::back`]
+    pub entry: bool,
+}
+
+/// What an unhandled Back on an activity does (ActivityClientController.onBackPressed:1720-1747).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Back {
+    /// requestFinish: the app finishes the activity (the default, :1744).
+    Finish,
+    /// moveActivityTaskToBack (:1736-1739): the Task of the app with this uid goes to the back, the activity stays.
+    TaskToBack { uid: u32 },
 }
 
 /// What a Launch step is built from: the activity's package and declaration, and the LaunchActivityItem's ident.
@@ -300,6 +311,7 @@ impl ActivityTasks {
                 .by_name(package)
                 .map_or(0, |p| manifest_flags::real_config_changes(p, decl)),
             relaunching: false,
+            entry: true,
         };
         let launch = Launch {
             package: package.to_owned(),
@@ -443,6 +455,7 @@ impl ActivityTasks {
             reported: self.launch_config(),
             declared: package.map_or(0, |p| manifest_flags::real_config_changes(p, decl)),
             relaunching: false,
+            entry: false,
         };
         let launch = Launch {
             package: calling_package.to_owned(),
@@ -455,9 +468,24 @@ impl ActivityTasks {
         Ok(activity_start::START_SUCCESS)
     }
 
-    /// ActivityClientController.onBackPressed (isInRootTaskLocked): true when a record has the token. A lookup only; nothing is sent or changed.
-    pub(crate) fn has_record(&self, token: &SpIBinder) -> bool {
-        self.machine().phase(token).is_some()
+    /// ActivityClientController.onBackPressed's choice for the record with `token`; None when no record has it (isInRootTaskLocked null: nothing happens). A lookup only.
+    /// shouldMoveTaskToBack (:1750-1767): the record is its Task's root (the bottom record), the root is the launcher's entry, and the record is the Task's top. isRelativeTaskRootActivity is
+    /// false here (no TaskFragments, so no record sits on a finishing root), and no task organizer intercepts (:1728-1735).
+    pub(crate) fn back(&self, token: &SpIBinder) -> Option<Back> {
+        let m = self.machine();
+        let task = m.task_of(token)?;
+        let records: Vec<_> = m.records(task).collect();
+        let (root, root_owner) = records.first()?;
+        let top = records.last().map(|(t, _)| *t);
+        Some(
+            if *root == token && root_owner.entry && top == Some(token) {
+                Back::TaskToBack {
+                    uid: root_owner.uid,
+                }
+            } else {
+                Back::Finish
+            },
+        )
     }
 
     /// ActivityClientController.activityResumed: the resume ack, logged as `activity resumed <class> at=<stamp>` before the settled change it may cause. False when no record has the token (nothing logged).

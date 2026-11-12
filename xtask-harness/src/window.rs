@@ -112,9 +112,12 @@ pub struct Args {
     /// Stage widgets only: the back press is BTN_LEFT, so no back key comes and the mouse-buttons sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     break_mouse_back: bool,
-    /// Stage dialog only: the services send no requestFinish on Back (atld `--no-root-back`), so the back-close sub-gate must fail (the gate's deliberate break).
+    /// Stage dialog only: the services send no requestFinish on an unhandled Back (atld `--no-back-finish`), so the back sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
-    break_root_back: bool,
+    break_back_finish: bool,
+    /// Stage dialog only: an unhandled root Back closes the root instead of minimizing (atld `--root-back close`), so the minimize sub-gate must fail (the gate's deliberate break).
+    #[arg(long)]
+    break_root_minimize: bool,
     /// Stage suspended only: the probe never sends the suspended configure, so the states check must fail (the gate's deliberate break).
     #[arg(long)]
     break_suspended: bool,
@@ -268,7 +271,7 @@ pub(crate) const WINDOW_MS: u64 = 2_000;
 const FRAMES_WINDOW_MS: u64 = 5_000;
 /// The gtk stage's watch after the marker: the first draw, the pointer script, the probe's block and the pong after it.
 const GTK_WINDOW_MS: u64 = 10_000;
-/// The dialog stage's watch after the marker: the probe's drags, the resize, and the back-close case (two Backs, each with its settle and waits), so longer than the gtk watch.
+/// The dialog stage's watch after the marker: the probe's drags, the resize, and the back case (three Backs, each with its settle and waits), so longer than the gtk watch. The app stays up after the last Back (minimized), so the watch always runs to its end.
 const DIALOG_WINDOW_MS: u64 = 30_000;
 /// The widgets stage's watch after the marker: the first draw and the readback, then three injections, each waiting up to LINE_WAIT for its fixture line.
 const WIDGETS_WINDOW_MS: u64 = 12_000;
@@ -923,6 +926,8 @@ struct Liveness {
     configured: Vec<bool>,
     /// Widgets stage: the idle window's log offsets (None in the other stages).
     idle: Option<widgets::Idle>,
+    /// Dialog stage: the window sent `xdg_toplevel.set_minimized` after the unhandled root Back (false in the other stages).
+    minimized: bool,
 }
 
 /// The gtk stage's probe, from the proxy's side: the window's configure is acked; a ping is answered; the pointer script goes in; then a click whose UP sleeps the UI thread (past BLOCK_MIN_X). A ping sent meanwhile gets no pong until the sleep ends.
@@ -977,6 +982,7 @@ fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
         resumed_ms,
         configured: Vec::new(),
         idle: None,
+        minimized: false,
     })
 }
 
@@ -1073,6 +1079,7 @@ fn drive_resize(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<
         resumed_ms: None,
         configured,
         idle: None,
+        minimized: false,
     })
 }
 
@@ -1835,8 +1842,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         rt
     };
-    let rt = if args.break_root_back {
-        rt.without_root_back()
+    let rt = if args.break_back_finish {
+        rt.without_back_finish()
+    } else {
+        rt
+    };
+    let rt = if args.break_root_minimize {
+        rt.with_root_back_close()
     } else {
         rt
     };
@@ -2049,7 +2061,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         ],
         (Stage::SurfaceView, Some(_)) => surface_view::checks(&app, &liveness, &captured),
         (Stage::UiBlock, Some(_)) => ui_block::checks(&app),
-        (Stage::Dialog, Some(_)) => dialog::checks(&app, &services, &liveness, &captured),
+        (Stage::Dialog, Some(_)) => {
+            dialog::checks(&app, &services, &liveness, &captured, ended.is_some())
+        }
         (Stage::Gles2, Some(_)) => gles2::checks(&app, display, &liveness, &captured),
         (Stage::Suspended, Some(_)) => suspended::checks(&after_marker(&app, marker), &liveness),
         (Stage::Ime, Some(_)) => {
@@ -2422,6 +2436,7 @@ mod tests {
             resumed_ms: None,
             configured,
             idle: None,
+            minimized: false,
         });
         let seen = Mutex::new(capture::Seen {
             pictures,

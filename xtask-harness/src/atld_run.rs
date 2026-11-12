@@ -221,8 +221,10 @@ pub struct Runtime {
     new_intent: bool,
     /// Starts owe their callers a result unless this is cleared (`--no-activity-result`, the app gate's deliberate break).
     activity_result: bool,
-    /// Back finishes an activity unless this is cleared (`--no-root-back`, the dialog gate's back-close sub-gate's deliberate break).
-    root_back: bool,
+    /// An unhandled Back finishes an activity unless this is cleared (`--no-back-finish`, the dialog gate's back sub-gate's deliberate break).
+    back_finish: bool,
+    /// An unhandled Back on the root closes it instead of minimizing (atld `--root-back close`, the dialog gate's minimize sub-gate's deliberate break).
+    root_back_close: bool,
     /// The services register `sensorservice` unless this is cleared (`--no-sensor-service`, the sensors gate's deliberate break).
     sensor_service: bool,
     /// Services left unregistered (`--omit-service`, the app gate's per-service breaks).
@@ -562,7 +564,8 @@ impl Runtime {
             ime_death_link: true,
             new_intent: true,
             activity_result: true,
-            root_back: true,
+            back_finish: true,
+            root_back_close: false,
             sensor_service: true,
             omitted_services: Vec::new(),
             tilt_keys: None,
@@ -790,9 +793,15 @@ impl Runtime {
         self
     }
 
-    /// Back finishes nothing (atld `--no-root-back`): the dialog gate's back-close sub-gate must then fail.
-    pub fn without_root_back(mut self) -> Self {
-        self.root_back = false;
+    /// An unhandled Back finishes nothing (atld `--no-back-finish`): the dialog gate's back sub-gate must then fail.
+    pub fn without_back_finish(mut self) -> Self {
+        self.back_finish = false;
+        self
+    }
+
+    /// An unhandled root Back closes the root (atld `--root-back close`): the dialog gate's minimize sub-gate must then fail.
+    pub fn with_root_back_close(mut self) -> Self {
+        self.root_back_close = true;
         self
     }
 
@@ -1251,8 +1260,11 @@ impl Runtime {
         if !self.activity_result {
             cmd.arg("--no-activity-result");
         }
-        if !self.root_back {
-            cmd.arg("--no-root-back");
+        if !self.back_finish {
+            cmd.arg("--no-back-finish");
+        }
+        if self.root_back_close {
+            cmd.args(["--root-back", "close"]);
         }
         for jar in &self.art.boot {
             cmd.arg("--boot-jar").arg(jar);

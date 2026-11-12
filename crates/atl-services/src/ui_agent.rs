@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! The app's UI agent (plan 8c, M3 slice 5): the binder an app process gives the compositor registry in REGISTER (compositor_registry.rs), and the call the window service makes on it.
-//! `IUiAgent` (descriptor `atl.IUiAgent`) has ten transactions. DIM_LAYER: a dimming window's layer id, dim amount (f32), dim width and height (i32) in, nothing out; the agent keeps a black colour layer
+//! `IUiAgent` (descriptor `atl.IUiAgent`) has eleven transactions. MINIMIZE (oneway, from onBackPressed's moveTaskToBack): nothing in; the agent minimizes its window. DIM_LAYER: a dimming window's layer id, dim amount (f32), dim width and height (i32) in, nothing out; the agent keeps a black colour layer
 //! just below that layer (WMS Dimmer), amount <= 0 drops it. POST_DRAW_TRANSACTION: a window's post-draw Transaction (finishDrawing), its bytes and objects, in; the composer applies it. INPUT_METHOD: nothing in, the app's in-app input method (an IInputMethod binder, atl-ime) out, or null; IMMS-lite binds it where AOSP binds an IME service (ime_bind.rs). POINTER_ICON (oneway, from the input service's setPointerIcon): the icon type (i32, PointerIconType) in; the agent sets its window's cursor. WINDOW_SURFACE: the layer's name (String16) in, the window's SurfaceControl (codecs/android/view/SurfaceControl.rs, Part form) out.
 //! WINDOW_POSITION: a window's layer id (i32) and its frame's origin in its Task (x, y: i32) in, nothing out; the agent sets the layer's position, as WMS does on the window's SurfaceControl (WindowState.updateSurfacePosition -> Transaction.setPosition).
 //! INPUT_SERVER: a window's input channel token (strong binder, the token both channel ends carry: AOSP keys a dispatcher connection by it) and server end (an fd, ParcelFileDescriptor) and the window's LayoutParams flags (i32) in, nothing out.
@@ -42,6 +42,8 @@ pub const POST_DRAW_TRANSACTION: TransactionCode = 8;
 pub const DIM_LAYER: TransactionCode = 9;
 /// A window's input channel token and its frame in its Task (left, top, right, bottom: i32) in; nothing out. The agent's dispatcher hit-tests and translates that window's pointer events with it.
 pub const INPUT_FRAME: TransactionCode = 10;
+/// Nothing in (oneway): the app's Task went to the back (moveTaskToBack), so the agent minimizes its window.
+pub const MINIMIZE: TransactionCode = 11;
 /// The interface name counters use.
 const INTERFACE: &str = "IUiAgent";
 
@@ -58,6 +60,8 @@ pub trait IUiAgent: Interface {
     fn task(&self, task: i32) -> Result<(), StatusCode>;
     /// The pointer icon the app's view hierarchy resolved (PointerIconType value): the app's window shows it as its cursor.
     fn pointer_icon(&self, kind: i32) -> Result<(), StatusCode>;
+    /// The app's Task went to the back (ActivityClientController.moveActivityTaskToBack): its window is minimized and the app keeps running.
+    fn minimize(&self) -> Result<(), StatusCode>;
     /// The window of layer `layer_id` has its frame at (`x`, `y`) in its Task: its layer is placed there.
     fn window_position(&self, layer_id: i32, x: i32, y: i32) -> Result<(), StatusCode>;
     /// The app's in-app input method (IInputMethod), None when it serves none.
@@ -116,6 +120,7 @@ fn on_transact(
             let kind: i32 = data.read()?;
             service.pointer_icon(kind)
         }
+        MINIMIZE => service.minimize(),
         WINDOW_POSITION => {
             let layer_id: i32 = data.read()?;
             let x: i32 = data.read()?;
@@ -195,6 +200,13 @@ impl IUiAgent for BpUiAgent {
         let mut data = binder.prepare_transact()?;
         data.write(&kind)?;
         binder.submit_transact(POINTER_ICON, data, binder::binder_impl::FLAG_ONEWAY)?;
+        Ok(())
+    }
+
+    fn minimize(&self) -> Result<(), StatusCode> {
+        let binder = self.as_binder();
+        let data = binder.prepare_transact()?;
+        binder.submit_transact(MINIMIZE, data, binder::binder_impl::FLAG_ONEWAY)?;
         Ok(())
     }
 
@@ -316,6 +328,10 @@ impl IUiAgent for Binder<BnUiAgent> {
 
     fn pointer_icon(&self, kind: i32) -> Result<(), StatusCode> {
         self.0.pointer_icon(kind)
+    }
+
+    fn minimize(&self) -> Result<(), StatusCode> {
+        self.0.minimize()
     }
 
     fn window_position(&self, layer_id: i32, x: i32, y: i32) -> Result<(), StatusCode> {

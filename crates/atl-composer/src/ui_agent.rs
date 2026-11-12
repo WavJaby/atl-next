@@ -114,6 +114,11 @@ impl IUiAgent for UiAgent {
         Ok(())
     }
 
+    fn minimize(&self) -> Result<(), StatusCode> {
+        crate::ui_window::minimize();
+        Ok(())
+    }
+
     /// WMS Dimmer: one colour layer per dimming window (Dimmer.java:169-173 makeDimLayer), a root at the Task origin like every window layer here, cropped to the Task
     /// (DimmerAnimationHelper.java:286-287), relative z -1 to the window (:257), black at alpha `amount` (:293 setAlpha). Dropping the handle destroys the layer.
     fn dim_layer(
