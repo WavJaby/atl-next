@@ -25,12 +25,14 @@ type isaTier struct {
 }
 
 // isaTierProbe: one tier source's compile argv, for xtask's probe (gate a): Base (the row's isa) must fail naming the extension, Tier must compile.
+// Objects: the source's object files of this graph (relative to the out dir), which the isa gate requires to claim the extension.
 type isaTierProbe struct {
-	Module string   `json:"module"`
-	Side   string   `json:"side"`
-	Src    string   `json:"src"` // absolute
-	Base   []string `json:"base"`
-	Tier   []string `json:"tier"`
+	Module  string   `json:"module"`
+	Side    string   `json:"side"`
+	Src     string   `json:"src"` // absolute
+	Base    []string `json:"base"`
+	Tier    []string `json:"tier"`
+	Objects []string `json:"objects"`
 }
 
 // checkISATiers: each row's module is in the tree, its src is one of the module's sources in some variant at the pin, and its gate file names the symbol.
@@ -87,7 +89,14 @@ func (g *Graph) isaTierArgv(n *Node, s string, argv []string) []string {
 		return argv
 	}
 	key := n.side.String() + "\x00" + n.mod.Name + "\x00" + s
-	g.isaProbes[key] = isaTierProbe{Module: n.mod.Name, Side: n.side.String(), Src: g.abs(s), Base: argv, Tier: tier}
+	p := g.isaProbes[key]
+	p.Module, p.Side, p.Src, p.Base, p.Tier = n.mod.Name, n.side.String(), g.abs(s), argv, tier
+	// the object ninja builds for this edge (emit: obj/<side>/<name>/<kind>/<src>.o)
+	obj := filepath.Join("obj", n.side.String(), n.name, n.kind.String(), s+".o")
+	if !slices.Contains(p.Objects, obj) {
+		p.Objects = append(p.Objects, obj)
+	}
+	g.isaProbes[key] = p
 	return tier
 }
 
@@ -114,7 +123,9 @@ func (g *Graph) writeISATierProbes(out string) error {
 	}
 	probes := make([]isaTierProbe, 0, len(g.isaProbes))
 	for _, k := range sortedKeys(keysOf(g.isaProbes)) {
-		probes = append(probes, g.isaProbes[k])
+		p := g.isaProbes[k]
+		slices.Sort(p.Objects)
+		probes = append(probes, p)
 	}
 	text, err := json.MarshalIndent(probes, "", "  ")
 	if err != nil {

@@ -44,7 +44,7 @@ struct ConverterRow<'a> {
     gate: &'a str,
 }
 
-/// One tier source's compile argv as the converter emits it (tools/bp2ninja isatier.go isaTierProbe).
+/// One tier source's compile argv as the converter emits it (tools/bp2ninja isatier.go isaTierProbe), and the objects this graph builds for it.
 #[derive(Debug, Deserialize)]
 pub struct Probe {
     pub module: String,
@@ -52,6 +52,18 @@ pub struct Probe {
     pub src: String,
     pub base: Vec<String>,
     pub tier: Vec<String>,
+    pub objects: Vec<String>,
+}
+
+/// The tier objects of this build's graph (relative to the out dir): each must claim its row's extension. Empty when the converter wrote no probe file (no cross host).
+pub fn current_objects(out: &Path) -> Result<BTreeSet<String>> {
+    let path = out.join(PROBE_FILE);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(BTreeSet::new());
+    };
+    let probes: Vec<Probe> =
+        serde_json::from_str(&text).with_context(|| format!("reading {}", path.display()))?;
+    Ok(probes.into_iter().flat_map(|p| p.objects).collect())
 }
 
 /// Reads the table and checks each row's own fields. The tree-dependent part (module, src, gate file) is the converter's, at the pin.
@@ -158,13 +170,14 @@ pub fn object_row<'a>(tiers: &'a Tiers, rel: &str) -> Option<(&'a str, &'a Tier)
     (src == row.src || src.ends_with(&format!("/{}", row.src))).then_some((module.as_str(), row))
 }
 
-/// The row whose product `rel` is: `device/<module>.so` or `host/<module>.so` (the converter's product sides; `build/` holds the build machine's and is not a product).
+/// The row whose product `rel` is: `device/<module>/<name>.so` or `host/<module>/<name>.so` (the converter links into `<side>/<module>/`; `build/` holds the build machine's and is not a product).
 pub fn product_row<'a>(tiers: &'a Tiers, rel: &str) -> Option<(&'a str, &'a Tier)> {
-    let (side, file) = rel.split_once('/')?;
-    if !(side == "device" || side == "host") || file.contains('/') {
+    let mut parts = rel.split('/');
+    let (side, module, file) = (parts.next()?, parts.next()?, parts.next()?);
+    if !(side == "device" || side == "host") || parts.next().is_some() || !file.ends_with(".so") {
         return None;
     }
-    let (module, row) = tiers.get_key_value(file.strip_suffix(".so")?)?;
+    let (module, row) = tiers.get_key_value(module)?;
     Some((module.as_str(), row))
 }
 
@@ -287,15 +300,17 @@ mod tests {
             .is_none()
         );
         assert_eq!(
-            product_row(&tiers, "device/libz.so").map(|(m, _)| m),
+            product_row(&tiers, "device/libz/libz.so").map(|(m, _)| m),
             Some("libz")
         );
         assert_eq!(
-            product_row(&tiers, "host/libz.so").map(|(m, _)| m),
+            product_row(&tiers, "host/libz/libz.so").map(|(m, _)| m),
             Some("libz")
         );
-        assert!(product_row(&tiers, "build/libz.so").is_none());
-        assert!(product_row(&tiers, "device/libz.a").is_none());
+        assert!(product_row(&tiers, "build/libz/libz.so").is_none());
+        assert!(product_row(&tiers, "device/libz/libz.a").is_none());
+        assert!(product_row(&tiers, "device/libz.so").is_none());
+        assert!(product_row(&tiers, "device/libzz/libz.so").is_none());
     }
 
     #[test]

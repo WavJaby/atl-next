@@ -1441,7 +1441,8 @@ fn isa_floor_gate(
     if host.isa.is_none() {
         return Ok(None);
     }
-    let report = crate::isa_gate::check(out, host, tiers)?;
+    let report =
+        crate::isa_gate::check(out, host, tiers, &crate::isa_tiers::current_objects(out)?)?;
     println!("native: isa gate: {}", crate::isa_gate::summary(&report));
     for v in report.violations.iter().take(5) {
         println!("native:   isa: {v}");

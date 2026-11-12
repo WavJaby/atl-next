@@ -173,6 +173,10 @@ func TestISATierProbeFile(t *testing.T) {
 	if marchOf(t, probes[0].Base) != "-march=rv64gc_zba_zbb" || marchOf(t, probes[0].Tier) != "-march=rv64gcv_zba_zbb" {
 		t.Errorf("probe argv: base %q, tier %q", probes[0].Base, probes[0].Tier)
 	}
+	want := []string{"obj/device/libz/shared/p/adler32_simd.c.o", "obj/device/libz/static/p/adler32_simd.c.o"}
+	if !slices.Equal(probes[0].Objects, want) {
+		t.Errorf("objects %q, want %q", probes[0].Objects, want)
+	}
 }
 
 // marchArgv replaces the one -march= word and refuses an argv without exactly one.

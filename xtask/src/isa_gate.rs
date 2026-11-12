@@ -64,7 +64,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         workspace.join("out").join("native")
     })?
     .join(&args.arch);
-    let report = check(&out, host, &isa_tiers::load(root)?)?;
+    let report = check(
+        &out,
+        host,
+        &isa_tiers::load(root)?,
+        &isa_tiers::current_objects(&out)?,
+    )?;
     println!("isa gate: {}", summary(&report));
     for v in report.violations.iter().take(5) {
         println!("isa gate:   {v}");
@@ -77,7 +82,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 }
 
 /// The gate over every riscv64 ELF64 under `out` (symlinks skipped) against `host`'s isa and glibc_floor, and `tiers` (isa-tiers.toml) for the files they let claim more.
-pub fn check(out: &Path, host: &arches::Host, tiers: &isa_tiers::Tiers) -> Result<Report> {
+/// `current`: this graph's tier objects (isa_tiers::current_objects), which must claim their row's extension; stale objects of earlier graphs in `out` are only held to the closure.
+pub fn check(
+    out: &Path,
+    host: &arches::Host,
+    tiers: &isa_tiers::Tiers,
+    current: &BTreeSet<String>,
+) -> Result<Report> {
     let (Some(isa), Some(floor)) = (&host.isa, &host.glibc_floor) else {
         bail!(
             "{}: the isa gate needs the row's isa and glibc_floor",
@@ -98,7 +109,8 @@ pub fn check(out: &Path, host: &arches::Host, tiers: &isa_tiers::Tiers) -> Resul
         };
         report.files += 1;
         let claim = isa_claim(&f, &data).with_context(|| name.clone())?;
-        let (violations, tier) = file_check(&name, claim.as_deref(), tiers, isa, &allowed)?;
+        let (violations, tier) =
+            file_check(&name, claim.as_deref(), tiers, isa, &allowed, current)?;
         report.violations.extend(violations);
         report.tiered.extend(tier);
         let needs = glibc_needs(&f, &data).with_context(|| name.clone())?;
@@ -150,13 +162,14 @@ pub fn summary(report: &Report) -> String {
 }
 
 /// One file's violations (prefixed with its name), and the tier row that let it claim its extension. The file is allowed the row's closure when a row names it: an object by its src, a product by its module.
-/// An object a row names must claim the row's extension: without it the row did not reach the source.
+/// An object of this graph (`current`) that a row names must claim the row's extension: without it the row did not reach the source.
 fn file_check(
     name: &str,
     claim: Option<&str>,
     tiers: &isa_tiers::Tiers,
     isa: &str,
     allowed: &BTreeSet<String>,
+    current: &BTreeSet<String>,
 ) -> Result<(Vec<String>, Option<String>)> {
     let row = isa_tiers::object_row(tiers, name)
         .map(|(module, row)| (module, row, true))
@@ -172,7 +185,7 @@ fn file_check(
         .into_iter()
         .map(|v| format!("{name}: {v}"))
         .collect();
-    if object && claim.is_some_and(|c| !claims(c, &row.ext)) {
+    if object && current.contains(name) && claim.is_some_and(|c| !claims(c, &row.ext)) {
         out.push(format!(
             "{name}: tier `{module}` {} does not claim `{}`: the row did not reach its source",
             row.src, row.ext
@@ -447,31 +460,50 @@ mod tests {
     /// The claim written for -march=rv64gcv_zba_zbb: V, then the names V implies (RVV 1.0 rules, Zvl128b, Zve64d, Zve64f, Zve64x, Zve32f, Zve32x, Zvl64b, Zvl32b), spelled as Tag_RISCV_arch spells them. Written from the rules, not read from clang; the riscv64 run's readelf -A confirms it.
     const V_CLAIM: &str = "rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0_v1p0_zvl128b1p0_zve32x1p0_zve64d1p0_zve64f1p0_zve64x1p0_zve32f1p0_zvl32b1p0_zvl64b1p0_zba1p0_zbb1p0";
 
+    fn set(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|n| (*n).to_owned()).collect()
+    }
+
     #[test]
     fn tier_source_may_claim_v_and_must() {
+        let host = "obj/host/libz/static/external/zlib/adler32_simd.c.o";
         let (violations, tier) = file_check(
             "obj/device/libz/shared/external/zlib/adler32_simd.c.o",
             Some(V_CLAIM),
             &tiers(),
             "rv64gc_zba_zbb",
             &allowed(),
+            &set(&[]),
         )
         .unwrap();
         assert!(violations.is_empty(), "{violations:?}");
         assert_eq!(tier.as_deref(), Some("libz adler32_simd.c (v)"));
-        // the row's source built without the extension: the row did not reach it
+        // this graph's tier object built without the extension: the row did not reach it
         let (violations, _) = file_check(
-            "obj/host/libz/static/external/zlib/adler32_simd.c.o",
+            host,
             Some(RV64GC_ZBA_ZBB),
             &tiers(),
             "rv64gc_zba_zbb",
             &allowed(),
+            &set(&[host]),
         )
         .unwrap();
         assert!(
             violations.iter().any(|v| v.contains("does not claim `v`")),
             "{violations:?}"
         );
+        // the same object left in the out dir by an earlier graph is not held to it
+        let (violations, tier) = file_check(
+            host,
+            Some(RV64GC_ZBA_ZBB),
+            &tiers(),
+            "rv64gc_zba_zbb",
+            &allowed(),
+            &set(&[]),
+        )
+        .unwrap();
+        assert!(violations.is_empty(), "{violations:?}");
+        assert_eq!(tier.as_deref(), Some("libz adler32_simd.c (v)"));
     }
 
     #[test]
@@ -482,6 +514,7 @@ mod tests {
             &tiers(),
             "rv64gc_zba_zbb",
             &allowed(),
+            &set(&[]),
         )
         .unwrap();
         assert!(tier.is_none());
@@ -496,21 +529,23 @@ mod tests {
     #[test]
     fn product_of_the_row_module_may_claim_v_others_may_not() {
         let (violations, tier) = file_check(
-            "device/libz.so",
+            "device/libz/libz.so",
             Some(V_CLAIM),
             &tiers(),
             "rv64gc_zba_zbb",
             &allowed(),
+            &set(&[]),
         )
         .unwrap();
         assert!(violations.is_empty(), "{violations:?}");
         assert_eq!(tier.as_deref(), Some("libz (v)"));
         let (violations, tier) = file_check(
-            "device/libzz.so",
+            "device/libzz/libz.so",
             Some(V_CLAIM),
             &tiers(),
             "rv64gc_zba_zbb",
             &allowed(),
+            &set(&[]),
         )
         .unwrap();
         assert!(tier.is_none());
