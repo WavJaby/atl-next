@@ -619,12 +619,13 @@ impl Runtime {
         Ok(self)
     }
 
-    /// Also places the guest `xtask native --native-bridge <host>` built (the identity engine's guest has the host's ISA) where the NativeBridge core starts it (atl-native-bridge `Config::installed`): linker64 + app_process64 under `native_bridge_bin`, the guest libraries under `native_bridge_lib`.
-    pub fn with_native_bridge_guest(mut self, host: &str) -> Result<Self> {
-        let bin = atl_android_paths::native_bridge_bin(host);
-        let lib = atl_android_paths::native_bridge_lib(host);
+    /// Also places the guest `xtask native --native-bridge <isa>` built where the NativeBridge core starts it (atl-native-bridge `Config::installed`): linker64 + app_process64 under `native_bridge_bin`, the guest libraries under `native_bridge_lib`.
+    /// The host ISA's guest serves identity; a foreign ISA's also needs its engine ([`Runtime::with_qemu_engine`]). Each call adds one ISA's guest.
+    pub fn with_native_bridge_guest(mut self, isa: &str) -> Result<Self> {
+        let bin = atl_android_paths::native_bridge_bin(isa);
+        let lib = atl_android_paths::native_bridge_lib(isa);
         let module =
-            |m: &str, file: &str| crate::native::nb_module_dir(&self.out, host, m).join(file);
+            |m: &str, file: &str| crate::native::nb_module_dir(&self.out, isa, m).join(file);
         let mut files = vec![
             (module(NB_LINKER, "linker64"), format!("{bin}/linker64")),
             (
@@ -632,7 +633,7 @@ impl Runtime {
                 format!("{bin}/app_process64"),
             ),
             (
-                crate::runtimes::shared_libcxx(&self.out, host),
+                crate::runtimes::shared_libcxx(&self.out, isa),
                 format!("{lib}/libc++.so"),
             ),
         ];
@@ -643,11 +644,11 @@ impl Runtime {
         for (f, _) in &files {
             ensure!(
                 f.is_file(),
-                "missing input {} (xtask native --native-bridge {host})",
+                "missing input {} (xtask native --native-bridge {isa})",
                 f.display()
             );
         }
-        // the NDK proxies' host sides, where the NativeBridge core loads them (bindings.rs `Host::System`), as the GL fronts are placed
+        // the NDK proxies' host sides, where the NativeBridge core loads them (bindings.rs `Host::System`), as the GL fronts are placed; one copy whichever guests are placed
         for m in NDK_PROXIED {
             let host = self.out.join("device").join(m).join(format!("{m}.so"));
             ensure!(
@@ -655,10 +656,29 @@ impl Runtime {
                 "missing input {} (build native goal `{m}`)",
                 host.display()
             );
-            self.platform_files
-                .push((host, format!("{}/{m}.so", atl_android_paths::SYSTEM_LIB)));
+            let at = format!("{}/{m}.so", atl_android_paths::SYSTEM_LIB);
+            if !self.platform_files.iter().any(|(_, a)| *a == at) {
+                self.platform_files.push((host, at));
+            }
         }
-        self.native_bridge_guest = files;
+        self.native_bridge_guest.extend(files);
+        Ok(self)
+    }
+
+    /// The device's ABIs, preferred first ([`device_abis`]).
+    pub fn abis(&self) -> &[SupportedAbi] {
+        &self.abis
+    }
+
+    /// Also places the QEMU engine of foreign guest ISA `isa` (test images only, [`qemu_engine_files`]): `xtask qemu --pic` of its arch (built when stale), the engine `.so` linked from it and the boot executable, kept under `<qemu dir>/app-engine`.
+    pub fn with_qemu_engine(mut self, root: &Path, isa: &str) -> Result<Self> {
+        let b = crate::qemu::plan(root, isa, None, true)?;
+        crate::qemu::execute(root, &b)?;
+        let dir = b.dir.join("app-engine");
+        let so = crate::qemu_spike::engine_so_file(root, &b, &dir)?;
+        let boot = crate::qemu::boot_exe(root, &b, &dir)?;
+        self.platform_files
+            .extend(qemu_engine_files(isa, &so, &boot));
         Ok(self)
     }
 

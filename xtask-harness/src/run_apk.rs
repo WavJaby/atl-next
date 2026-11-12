@@ -9,12 +9,13 @@
 //! `remote run-apk` ([`remote`]): the same run on a target's desktop. The bundle goes there and is checked, atld runs there for `--hold`, and the logs come back when the run ends; the verdict is read from them, against the target's end record.
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, ExitCode, ExitStatus};
+use std::process::{Child, Command, ExitCode, ExitStatus};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 
 use crate::atld_run::{MS_PER_S, Run, Runtime, last_resumed, parse_stamp, run_display, settled};
+use atl_services_types::native_libs::{SupportedAbi, find_supported_abi};
 use atl_services_types::packages::Manifest;
 
 use crate::nested_wayland::NestedCompositor;
@@ -155,7 +156,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
         None => None,
     };
-    let rt = runtime(root, args)?;
+    let (rt, foreign) = runtime(root, args, &apk_file)?;
     let work = rt.out.join("run-apk");
     std::fs::create_dir_all(&work)?;
     // without --hold nobody watches the window: it maps in the gate's own compositor, which outlives atld (declared before it)
@@ -246,7 +247,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         end_ms: window::now_ms(),
     };
     let scripted = args.pointer.is_some() || args.drive.is_some();
-    let outcome = judge_ending(&services, &app, &ending, watch_ms, scripted);
+    let outcome = check_delivery(foreign.as_deref(), &m.name, &app)
+        .and_then(|()| judge_ending(&services, &app, &ending, watch_ms, scripted));
     // the drive's failure first: it says what the script could not do, the verdict only what the app did
     let outcome = match (driven, args.drive.is_some()) {
         (Some(Err(e)), _) => Err(format!("drive: {e:#}")),
@@ -293,7 +295,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         tilt_keys: a.tilt_keys,
     };
     // no `--display`: atld reads the target's own monitor, as on the product's host (host_display); this host's monitor is not the target's
-    let rt = runtime(root, &args)?;
+    let (rt, foreign) = runtime(root, &args, &apk_file)?;
     let rt = match &a.display {
         Some(display) => rt.with_display(display.clone()),
         None => rt,
@@ -411,6 +413,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
             atld_exited: !stopped_at_limit(rc),
             end_ms,
         };
+        check_delivery(foreign.as_deref(), &m.name, &app)?;
         judge_ending(&services, &app, &ending, watch_ms, a.pointer.is_some())
     });
     let outcome = outcome.and_then(|ok| {
@@ -430,8 +433,27 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
     ))
 }
 
-/// The staged runtime of a run of `args`: the window gate's staging, with the GL driver, the native bridge guest and the GTK UI. Its display is set by the caller.
-fn runtime(root: &Path, args: &Args) -> Result<Runtime> {
+/// The app's ISA when foreign (not `host`): the device ABI the install picks for `apk` (atl-services-types `find_supported_abi`, the broker's own choice), whose guest and engine the test image then needs. Empty for a host-ISA or no-native-code app.
+fn foreign_isa(abis: &[SupportedAbi], host: &str, apk: &Path) -> Result<Option<String>> {
+    let list = Command::new("unzip")
+        .arg("-Z1")
+        .arg(apk)
+        .output()
+        .context("running unzip")?;
+    ensure!(
+        list.status.success(),
+        "unzip -Z1 {}: {}",
+        apk.display(),
+        list.status
+    );
+    let entries = String::from_utf8_lossy(&list.stdout);
+    Ok(find_supported_abi(entries.lines(), abis)
+        .map(|i| abis[i].isa.clone())
+        .filter(|isa| isa != host))
+}
+
+/// The staged runtime of a run of `args` for APK file `apk`: the window gate's staging, with the GL driver, the native bridge guest of the host and, for a foreign-ISA app ([`foreign_isa`]), that ISA's guest and QEMU engine, and the GTK UI. Its display is set by the caller.
+fn runtime(root: &Path, args: &Args, apk: &Path) -> Result<(Runtime, Option<String>)> {
     let rt = Runtime::new(
         root,
         "run-apk",
@@ -445,6 +467,13 @@ fn runtime(root: &Path, args: &Args) -> Result<Runtime> {
     .with_gl_driver(root)?
     .with_native_bridge_guest(&args.host)?
     .with_ui("gtk");
+    let foreign = foreign_isa(rt.abis(), &args.host, apk)?;
+    let rt = match &foreign {
+        Some(isa) => rt
+            .with_native_bridge_guest(isa)?
+            .with_qemu_engine(root, isa)?,
+        None => rt,
+    };
     let rt = if args.no_app_seccomp {
         rt.without_app_seccomp()
     } else {
@@ -464,7 +493,33 @@ fn runtime(root: &Path, args: &Args) -> Result<Runtime> {
     } else {
         rt
     };
-    Ok(rt)
+    Ok((rt, foreign))
+}
+
+/// The bridge's load line (atl-native-bridge loader.rs) for a library of `package`'s `lib/<isa>/`.
+fn delivery_line(package: &str, isa: &str) -> String {
+    format!("atl-native-bridge: loaded /data/app/{package}/lib/{isa}/")
+}
+
+/// The delivery check of a foreign-ISA app (`foreign`): the app log `app` has the bridge loading one of the package's `lib/<isa>/` libraries into the guest, so ART handed the bridge the app's ISA and the engine took the library.
+/// Checked before the window verdict: without delivery nothing the app's native code does is the guest's.
+fn check_delivery(foreign: Option<&str>, package: &str, app: &str) -> Result<(), String> {
+    let Some(isa) = foreign else {
+        return Ok(());
+    };
+    let line = delivery_line(package, isa);
+    match app.lines().find(|l| l.contains(&line)) {
+        Some(l) => {
+            println!("run-apk: guest delivery {isa}: ok ({})", l.trim());
+            Ok(())
+        }
+        None => {
+            println!("run-apk: guest delivery {isa}: FAIL (no `{line}` line in the app log)");
+            Err(format!(
+                "guest delivery {isa}: no library of lib/{isa} loaded into the guest"
+            ))
+        }
+    }
 }
 
 /// Copies the APK into the run's work dir and reads its manifest. A row's pin is checked against the manifest. Prints the package's line, and that it is unpinned when no row names it.
@@ -752,6 +807,18 @@ fn judge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The load line as loader.rs prints it for CTR's arm64 libctro (measured 2026-11-12); the break is identity's run, which loads nothing into a guest of the app's ISA.
+    #[test]
+    fn delivery_needs_the_guest_load_of_the_apps_isa() {
+        let pkg = "com.zeptolab.ctr.ads";
+        let app = "atl-native-bridge: loaded /data/app/com.zeptolab.ctr.ads/lib/arm64/libctro.so into the guest\n";
+        assert!(check_delivery(Some("arm64"), pkg, app).is_ok());
+        assert!(check_delivery(Some("arm64"), pkg, "").is_err());
+        assert!(check_delivery(Some("riscv64"), pkg, app).is_err());
+        // a host-ISA app has nothing to deliver
+        assert!(check_delivery(None, pkg, "").is_ok());
+    }
 
     /// Lines as atld prints them (atld main.rs `run`): a GPU desktop, its display tier, the trial tier, and WSLg's vgem-only devices.
     #[test]
