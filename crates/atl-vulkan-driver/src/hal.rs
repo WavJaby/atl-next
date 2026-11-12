@@ -3,11 +3,14 @@
 //! The device's three entries are the chosen ICD's own (`icd::choose`), so libvulkan calls the host driver with no frame of ours in between; the ICD is chosen once per process, at the first open.
 
 use std::cell::UnsafeCell;
-use std::ffi::{CStr, c_char, c_int};
+use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::OnceLock;
 
+use atl_gralloc::node;
+
 use crate::abi::hal::{
-    HWVULKAN_DEVICE_0, VkInstance_T, hw_device_t, hw_module_methods_t, hw_module_t,
+    HWVULKAN_DEVICE_0, VK_ERROR_INITIALIZATION_FAILED, VK_INCOMPLETE, VK_SUCCESS, VkInstance_T,
+    VkPhysicalDeviceGroupProperties, hw_device_t, hw_module_methods_t, hw_module_t,
     hwvulkan_device_t, hwvulkan_module_t,
 };
 use crate::icd::{self, Icd};
@@ -69,26 +72,195 @@ static DEVICE: OnceLock<Option<(Device, Icd)>> = OnceLock::new();
 
 fn device() -> Option<&'static Device> {
     DEVICE
-        .get_or_init(
-            || match icd::choose().and_then(|icd| Ok((make(&icd)?, icd))) {
-                Ok(pair) => {
-                    log(&format!(
-                        "icd {} interface {} device {} type {}",
-                        pair.1.manifest.display(),
-                        pair.1.interface,
-                        pair.1.device,
-                        pair.1.device_type
-                    ));
-                    Some(pair)
+        .get_or_init(|| {
+            let chosen = node::process_node(property)
+                .map_err(anyhow::Error::from)
+                .and_then(|n| Ok((icd::choose(&n)?, n)))
+                .and_then(|(icd, n)| Ok((make(&icd)?, icd, n)));
+            match chosen {
+                Ok((dev, icd, n)) => {
+                    let head =
+                        format!("icd {} interface {}", icd.manifest.display(), icd.interface);
+                    match &icd.chosen {
+                        Ok((c, tier)) => log(&format!(
+                            "{head} device {} type {} tier {} gralloc node {n}",
+                            c.name,
+                            c.kind,
+                            tier.name()
+                        )),
+                        // instances still create; enumeration reports 0 devices
+                        Err(why) => log(&format!("{head} {REFUSED}{why}")),
+                    }
+                    Some((dev, icd))
                 }
                 Err(err) => {
                     log(&format!("no device: {err:#}"));
                     None
                 }
-            },
-        )
+            }
+        })
         .as_ref()
         .map(|(d, _)| d)
+}
+
+/// The log's mark for an ICD that loads but has no device on gralloc's node.
+const REFUSED: &str = "exposes 0 devices: ";
+
+/// The process's ICD, once open succeeded.
+fn icd() -> Option<&'static Icd> {
+    DEVICE.get()?.as_ref().map(|(_, i)| i)
+}
+
+/// bionic `__system_property_get` as the process's global scope has it (atl-bionic in an app process; the probe exports its own): the value, None when unset or empty.
+fn property(name: &str) -> std::io::Result<Option<String>> {
+    type Get = unsafe extern "C" fn(*const c_char, *mut c_char) -> c_int;
+    // bionic's PROP_VALUE_MAX (sys/system_properties.h)
+    const PROP_VALUE_MAX: usize = 92;
+    let this = libloading::os::unix::Library::this();
+    // SAFETY: the symbol, where present, is bionic's `int __system_property_get(const char*, char*)`
+    let get = unsafe { this.get::<Get>(b"__system_property_get\0") }.map_err(|_| {
+        std::io::Error::other(
+            "__system_property_get not in the process: not an app process atld started",
+        )
+    })?;
+    let cname = std::ffi::CString::new(name)?;
+    let mut value = [0 as c_char; PROP_VALUE_MAX];
+    // SAFETY: a NUL-terminated name and a PROP_VALUE_MAX buffer, bionic's contract
+    let len = unsafe { get(cname.as_ptr(), value.as_mut_ptr()) };
+    if len <= 0 {
+        return Ok(None);
+    }
+    // SAFETY: bionic NUL-terminates the value within the buffer
+    let v = unsafe { CStr::from_ptr(value.as_ptr()) };
+    Ok(Some(v.to_string_lossy().into_owned()))
+}
+
+/// The HAL's `GetInstanceProcAddr`: the ICD's commands unchanged, except the enumerations, which expose only the chosen device.
+unsafe extern "C" fn get_instance_proc_addr(
+    instance: *mut VkInstance_T,
+    name: *const c_char,
+) -> Option<unsafe extern "C" fn()> {
+    let icd = icd()?;
+    // SAFETY: the caller passes a NUL-terminated command name
+    let wanted = unsafe { CStr::from_ptr(name) }.to_bytes();
+    match wanted {
+        b"vkGetInstanceProcAddr" => {
+            // SAFETY: the command of that name, returned as PFN_vkVoidFunction as the API does
+            Some(unsafe {
+                std::mem::transmute::<GipaField, unsafe extern "C" fn()>(get_instance_proc_addr)
+            })
+        }
+        b"vkEnumeratePhysicalDevices" => {
+            // SAFETY: as above
+            Some(unsafe {
+                std::mem::transmute::<EnumerateFn, unsafe extern "C" fn()>(
+                    enumerate_physical_devices,
+                )
+            })
+        }
+        b"vkEnumeratePhysicalDeviceGroups" | b"vkEnumeratePhysicalDeviceGroupsKHR" => {
+            // SAFETY: as above
+            Some(unsafe {
+                std::mem::transmute::<GroupsFn, unsafe extern "C" fn()>(
+                    enumerate_physical_device_groups,
+                )
+            })
+        }
+        // SAFETY: the ICD's own lookup, called as the interface defines
+        _ => unsafe { (icd.gipa)(instance.cast(), name) },
+    }
+}
+
+type H = *mut c_void;
+type EnumerateFn = unsafe extern "C" fn(H, *mut u32, *mut H) -> i32;
+type GroupsFn = unsafe extern "C" fn(H, *mut u32, *mut VkPhysicalDeviceGroupProperties) -> i32;
+
+/// The chosen device among `instance`'s, None when the ICD exposes none (refusal) or it is gone.
+fn chosen_handle(icd: &Icd, instance: H) -> Result<Option<H>, i32> {
+    let Ok((want, _)) = &icd.chosen else {
+        return Ok(None);
+    };
+    // SAFETY: a live instance of this ICD (the app's, created through it)
+    let all = unsafe { icd::physical_devices(icd.gipa, instance) }
+        .map_err(|_| VK_ERROR_INITIALIZATION_FAILED)?;
+    for p in all {
+        // SAFETY: a handle the instance just enumerated
+        let (key, _, _) = unsafe { icd::properties(icd.gipa, instance, p) }
+            .map_err(|_| VK_ERROR_INITIALIZATION_FAILED)?;
+        if key == want.key {
+            return Ok(Some(p));
+        }
+    }
+    Ok(None)
+}
+
+/// `vkEnumeratePhysicalDevices` over [`chosen_handle`]: 0 or 1 devices, the spec's count/INCOMPLETE protocol.
+unsafe extern "C" fn enumerate_physical_devices(instance: H, count: *mut u32, out: *mut H) -> i32 {
+    let Some(icd) = icd() else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    };
+    let mine = match chosen_handle(icd, instance) {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
+    let n = u32::from(mine.is_some());
+    // SAFETY: the caller's count pointer, valid per the spec
+    let count = unsafe { &mut *count };
+    if out.is_null() {
+        *count = n;
+        return VK_SUCCESS;
+    }
+    match mine {
+        Some(p) if *count >= 1 => {
+            // SAFETY: room for *count >= 1 handles
+            unsafe { *out = p };
+            *count = 1;
+            VK_SUCCESS
+        }
+        Some(_) => VK_INCOMPLETE,
+        None => {
+            *count = 0;
+            VK_SUCCESS
+        }
+    }
+}
+
+/// `vkEnumeratePhysicalDeviceGroups`: one group holding only the chosen device, or none.
+unsafe extern "C" fn enumerate_physical_device_groups(
+    instance: H,
+    count: *mut u32,
+    out: *mut VkPhysicalDeviceGroupProperties,
+) -> i32 {
+    let Some(icd) = icd() else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    };
+    let mine = match chosen_handle(icd, instance) {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
+    // SAFETY: the caller's count pointer, valid per the spec
+    let count = unsafe { &mut *count };
+    if out.is_null() {
+        *count = u32::from(mine.is_some());
+        return VK_SUCCESS;
+    }
+    match mine {
+        Some(p) if *count >= 1 => {
+            // SAFETY: room for *count >= 1 records; the caller set sType/pNext, which stay
+            let g = unsafe { &mut *out };
+            g.physicalDeviceCount = 1;
+            g.physicalDevices = [std::ptr::null_mut(); _];
+            g.physicalDevices[0] = p.cast();
+            g.subsetAllocation = 0;
+            *count = 1;
+            VK_SUCCESS
+        }
+        Some(_) => VK_INCOMPLETE,
+        None => {
+            *count = 0;
+            VK_SUCCESS
+        }
+    }
 }
 
 fn make(icd: &Icd) -> anyhow::Result<Device> {
@@ -108,10 +280,7 @@ fn make(icd: &Icd) -> anyhow::Result<Device> {
         }?),
         // SAFETY: as above
         CreateInstance: Some(unsafe { icd::proc(icd.gipa, null, c"vkCreateInstance") }?),
-        // SAFETY: same signature; the generated record names the instance handle by its own opaque type
-        GetInstanceProcAddr: Some(unsafe {
-            std::mem::transmute::<icd::GetInstanceProcAddr, GipaField>(icd.gipa)
-        }),
+        GetInstanceProcAddr: Some(get_instance_proc_addr),
     }))
 }
 

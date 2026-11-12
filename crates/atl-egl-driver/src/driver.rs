@@ -402,19 +402,11 @@ mod tests {
 /// The EGL device of the node atld named (atl_gralloc::node): on the display tier exactly that node's device, else an error naming it; on the trial tier that node's device, else the software device (a node that only allocates, vgem).
 /// Also the node's st_rdev: what every buffer this driver imports must carry, on every tier.
 fn choose_display(host: &Arc<Host>) -> Result<(Display, String, DeviceNumber)> {
-    let get = |name: &str| {
-        property(name)?.with_context(|| {
-            format!(
-                "{name} is unset: no gralloc node in this process (atld names it with --gralloc)"
-            )
-        })
-    };
-    let node = get(node::RENDER_NODE_PROPERTY)?;
-    let source = get(node::NODE_SOURCE_PROPERTY)?;
-    let source = NodeSource::parse(&source)
-        .with_context(|| format!("{}={source}: unknown", node::NODE_SOURCE_PROPERTY))?;
-    let rdev = node::device_number(std::path::Path::new(&node))
-        .with_context(|| format!("gralloc's node {node}"))?;
+    let node::ProcessNode {
+        path: node,
+        source,
+        device: rdev,
+    } = node::process_node(|name| property(name).map_err(std::io::Error::other))?;
     if let Some((display, name)) = host.display_on_node(&node)? {
         return Ok((display, name, rdev));
     }

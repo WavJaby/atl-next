@@ -50,6 +50,45 @@ pub fn device_number(path: &std::path::Path) -> std::io::Result<crate::handle::D
     })
 }
 
+/// The node an app process's GPU drivers must use, as atld names it: path, how it was chosen, its st_rdev.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessNode {
+    pub path: String,
+    pub source: NodeSource,
+    pub device: crate::handle::DeviceNumber,
+}
+
+impl std::fmt::Display for ProcessNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({}, {})", self.path, self.device, self.source.name())
+    }
+}
+
+/// The process's node from its two properties; `get` reads one (bionic `__system_property_get` in an app process, None when unset). Every driver reads the node through this, so they agree on one GPU.
+pub fn process_node(
+    get: impl Fn(&str) -> std::io::Result<Option<String>>,
+) -> std::io::Result<ProcessNode> {
+    let read = |name: &str| {
+        get(name)?.ok_or_else(|| {
+            std::io::Error::other(format!(
+                "{name} is unset: no gralloc node in this process (atld names it with --gralloc)"
+            ))
+        })
+    };
+    let path = read(RENDER_NODE_PROPERTY)?;
+    let source = read(NODE_SOURCE_PROPERTY)?;
+    let source = NodeSource::parse(&source).ok_or_else(|| {
+        std::io::Error::other(format!("{NODE_SOURCE_PROPERTY}={source}: unknown"))
+    })?;
+    let device = device_number(std::path::Path::new(&path))
+        .map_err(|e| std::io::Error::other(format!("gralloc's node {path}: {e}")))?;
+    Ok(ProcessNode {
+        path,
+        source,
+        device,
+    })
+}
+
 /// What `atl-egl-probe --display-node` prints and atld reads: `<prefix> node=<path>|none renderer=<GL_RENDERER>`.
 pub const DISPLAY_LINE: &str = "gpu-probe:";
 /// The `node=` value when the display's device has no render node.

@@ -15,6 +15,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 anyhow.workspace = true
+# gralloc's node (atl_gralloc::node): the one physical device exposed is on it
+atl-gralloc = { path = "../atl-gralloc" }
 # the probe's arguments only
 clap.workspace = true
 libloading.workspace = true

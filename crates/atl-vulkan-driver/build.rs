@@ -26,6 +26,9 @@ const IMPORTS: &[HeaderImport] = &[HeaderImport {
         "VkInstanceCreateInfo",
         "VkDeviceCreateInfo",
         "VkPhysicalDeviceProperties",
+        "VkPhysicalDeviceProperties2",
+        "VkPhysicalDeviceDrmPropertiesEXT",
+        "VkPhysicalDeviceGroupProperties",
         "VkQueueFamilyProperties",
         "VkExtensionProperties",
         "PFN_vkEnumeratePhysicalDevices",
@@ -46,5 +49,9 @@ const IMPORTS: &[HeaderImport] = &[HeaderImport {
 }];
 
 fn main() -> anyhow::Result<()> {
+    // the probe exports `__system_property_get`: the driver resolves it from the global scope (bionic's in an app process), which an executable's own symbols reach only when exported
+    println!(
+        "cargo::rustc-link-arg-bin=atl-vulkan-driver-probe=-Wl,--export-dynamic-symbol=__system_property_get"
+    );
     import_headers(IMPORTS)
 }

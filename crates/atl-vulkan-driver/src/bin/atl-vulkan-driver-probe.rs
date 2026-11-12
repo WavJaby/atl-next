@@ -3,9 +3,12 @@
 //! Judge: libvulkan's own acceptance test of a driver's handles (driver.h `SetDataInternal`): the first pointer of the VkInstance, each VkPhysicalDevice, the VkDevice and its VkQueue holds `HWVULKAN_DISPATCH_MAGIC` before libvulkan writes its table there. Prints `vk-driver: PASS ...` or `vk-driver: FAIL ...`, exit status to match.
 //! `--break magic`: the judge expects another value, so every slot must be reported red (the check discriminates).
 
-use std::ffi::{CStr, c_char, c_void};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::OnceLock;
+
+use atl_gralloc::node;
 
 use anyhow::{Context, Result, bail, ensure};
 use atl_vulkan_driver::abi::hal::{
@@ -37,7 +40,36 @@ struct Args {
     /// `magic`: the judge expects a wrong value (control).
     #[arg(long = "break")]
     brk: Option<String>,
+    /// gralloc's node, as atld names it in an app process (`ro.atl.gpu.render_node`).
+    #[arg(long)]
+    node: String,
+    /// How it was chosen (`ro.atl.gpu.node_source`): display or trial.
+    #[arg(long, default_value = "trial")]
+    node_source: String,
 }
+
+/// The two node properties, as atld writes them for an app process.
+static PROPERTIES: OnceLock<Vec<(CString, CString)>> = OnceLock::new();
+
+/// bionic's `__system_property_get`, exported from this executable (build.rs) so the driver finds it in the global scope as in an app process: copies the value and returns its length, 0 when unset.
+///
+/// # Safety
+/// The caller passes a NUL-terminated name and a buffer of PROP_VALUE_MAX (92) bytes, bionic's contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __system_property_get(name: *const c_char, value: *mut c_char) -> i32 {
+    // SAFETY: the caller's
+    let name = unsafe { CStr::from_ptr(name) };
+    let found = PROPERTIES
+        .get()
+        .and_then(|p| p.iter().find(|(k, _)| k.as_c_str() == name));
+    let bytes = found.map_or(&[0u8][..], |(_, v)| v.as_bytes_with_nul());
+    // SAFETY: the caller's buffer holds PROP_VALUE_MAX bytes; main refuses longer values
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr().cast(), value, bytes.len()) };
+    i32::try_from(bytes.len() - 1).unwrap_or(0)
+}
+
+/// bionic's PROP_VALUE_MAX, NUL included.
+const PROP_VALUE_MAX: usize = 92;
 
 #[allow(
     clippy::print_stdout,
@@ -67,6 +99,19 @@ fn run(args: &Args) -> Result<String> {
         Some("magic") => !(HWVULKAN_DISPATCH_MAGIC as usize),
         Some(other) => bail!("unknown break {other} (known: magic)"),
     };
+    let props = [
+        (node::RENDER_NODE_PROPERTY, &args.node),
+        (node::NODE_SOURCE_PROPERTY, &args.node_source),
+    ]
+    .into_iter()
+    .map(|(k, v)| {
+        ensure!(v.len() < PROP_VALUE_MAX, "{k}={v}: past PROP_VALUE_MAX");
+        Ok((CString::new(k)?, CString::new(v.as_str())?))
+    })
+    .collect::<Result<Vec<_>>>()?;
+    PROPERTIES
+        .set(props)
+        .map_err(|_| anyhow::anyhow!("properties set twice"))?;
     // SAFETY: loading the driver under test, as libvulkan does
     let lib = unsafe { Library::open(Some(&args.driver), RTLD_NOW | RTLD_LOCAL) }
         .context("dlopen driver")?;
@@ -156,6 +201,8 @@ fn run(args: &Args) -> Result<String> {
     let r = unsafe { enumerate(instance, &mut count, std::ptr::null_mut()) };
     ensure!(r == VK_SUCCESS, "vkEnumeratePhysicalDevices count: {r}");
     ensure!(count > 0, "0 physical devices");
+    // the driver exposes exactly the device on gralloc's node
+    ensure!(count == 1, "{count} physical devices exposed, expected 1");
     let mut phys = vec![std::ptr::null_mut(); count as usize];
     // SAFETY: room for count handles
     let r = unsafe { enumerate(instance, &mut count, phys.as_mut_ptr()) };
