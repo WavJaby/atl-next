@@ -33,7 +33,7 @@ enum Command {
     ///
     /// Dry run by default: prints the environment and the cargo command. `--execute` runs it. The sysroot must be fetched first (`deps --fetch`).
     Cross(cross::Args),
-    /// Static gate over a cross host's ELF outputs: each riscv64 ELF's Tag_RISCV_arch within the row's isa, its GLIBC needs within glibc_floor (isa_gate.rs).
+    /// Static gate over a cross host's ELF outputs: each riscv64 ELF's Tag_RISCV_arch within the row's isa and its GLIBC needs within glibc_floor; each product ELF RISC-V and each build ELF the build machine's; each product DT_NEEDED resolved (isa_gate.rs).
     IsaGate(isa_gate::Args),
     /// Upstream checkouts under <workspace>/src at the pins in sources.toml. `--test-apks` fetches the test APKs of test-apks.toml instead.
     ///

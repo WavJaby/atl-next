@@ -6,7 +6,7 @@
 //! `--target` goes right after the cargo subcommand, so harness arguments after a `--` in the cargo arguments stay theirs.
 //! Test binaries land in `target/<triple>/debug/deps/` of the checkout.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -90,7 +90,7 @@ pub fn cargo_target(root: &Path, arch: &str) -> Result<CargoTarget> {
         problems.join("; ")
     );
     let sysroot = deps::sysroot_root(root, sysroot)?;
-    let lib = sysroot.join("usr").join(clang).join("lib");
+    let [lib, _] = sysroot_lib_dirs(&sysroot, clang);
     ensure!(lib.is_dir(), "sysroot has no {}", lib.display());
     // RUSTFLAGS is split on whitespace: a path with a space would reach the linker as two arguments.
     ensure!(
@@ -123,6 +123,14 @@ fn env_key(triple: &str, suffix: &str) -> String {
         "CARGO_TARGET_{}_{suffix}",
         triple.to_ascii_uppercase().replace(['-', '.'], "_")
     )
+}
+
+/// A sysroot's library dirs for the clang triple `clang`: `usr/<clang>/lib` (glibc's runtime; cargo_target's -L) and `usr/lib/<clang>` (the multiarch dir). isa_gate resolves DT_NEEDED names in both.
+pub fn sysroot_lib_dirs(sysroot: &Path, clang: &str) -> [PathBuf; 2] {
+    [
+        sysroot.join("usr").join(clang).join("lib"),
+        sysroot.join("usr").join("lib").join(clang),
+    ]
 }
 
 /// The RUSTFLAGS of a cross link: the ISA features for rustc (arches::rustc_target_features), then the clang triple, lld and the sysroot for the linker.

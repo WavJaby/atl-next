@@ -33,30 +33,48 @@ struct Elf {
     defined: Vec<(String, bool)>,
 }
 
-/// None for a file that is not a 64-bit ELF (hosts are 64-bit, arches.toml).
-fn read_elf(path: &Path, executable: bool) -> Result<Option<Elf>> {
-    let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let Ok(file) = ElfFile64::<Endianness>::parse(&*data) else {
+/// What an ELF links against and is called.
+pub struct Linkage {
+    /// DT_NEEDED names, in order.
+    pub needed: Vec<String>,
+    pub soname: Option<String>,
+}
+
+/// The DT_NEEDED entries and DT_SONAME of the 64-bit ELF `data`; None for a file that is not one (hosts are 64-bit, arches.toml).
+pub fn linkage(data: &[u8]) -> Result<Option<Linkage>> {
+    let Ok(file) = ElfFile64::<Endianness>::parse(data) else {
         return Ok(None);
     };
-    let endian = file.endian();
     let table = file
         .elf_section_table()
-        .dynamic_table(endian, &*data)
-        .with_context(|| format!("{}: dynamic section", path.display()))?;
-    let mut needed = Vec::new();
-    let mut soname = None;
+        .dynamic_table(file.endian(), data)?;
+    let mut linkage = Linkage {
+        needed: Vec::new(),
+        soname: None,
+    };
     for d in &table {
         if d.tag != elf::DT_NEEDED && d.tag != elf::DT_SONAME {
             continue;
         }
         let name = String::from_utf8_lossy(table.string(d)?).into_owned();
         if d.tag == elf::DT_NEEDED {
-            needed.push(name);
+            linkage.needed.push(name);
         } else {
-            soname = Some(name);
+            linkage.soname = Some(name);
         }
     }
+    Ok(Some(linkage))
+}
+
+/// None for a file that is not a 64-bit ELF.
+fn read_elf(path: &Path, executable: bool) -> Result<Option<Elf>> {
+    let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let Some(Linkage { needed, soname }) =
+        linkage(&data).with_context(|| format!("{}: dynamic section", path.display()))?
+    else {
+        return Ok(None);
+    };
+    let file = ElfFile64::<Endianness>::parse(&*data)?;
     // an executable binds to its own definitions whether it exports them or not
     let symbols: Vec<_> = if executable {
         file.symbols().collect()
@@ -102,9 +120,9 @@ pub fn exported(lib: &Path) -> Result<Exported> {
     })
 }
 
-/// The device outputs of the current converter graph (graph.json `artifacts."device/<module>".out`): the only files the gate scans.
+/// The outputs of the current converter graph on the `sides` named (graph.json `artifacts."<side>/<module>".out`): the only files the gates scan.
 /// A module directory keeps the files of earlier builds (a renamed or dropped module's `libEGL*`), which are not what this build links.
-pub fn current_outputs(out: &Path) -> Result<BTreeSet<PathBuf>> {
+pub fn current_outputs(out: &Path, sides: &[&str]) -> Result<BTreeSet<PathBuf>> {
     let file = out.join("graph.json");
     let graph: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?,
@@ -115,7 +133,13 @@ pub fn current_outputs(out: &Path) -> Result<BTreeSet<PathBuf>> {
         .context("graph.json has no artifacts")?;
     Ok(artifacts
         .iter()
-        .filter(|(module, _)| module.starts_with("device/"))
+        .filter(|(module, _)| {
+            sides.iter().any(|side| {
+                module
+                    .strip_prefix(side)
+                    .is_some_and(|rest| rest.starts_with('/'))
+            })
+        })
         .filter_map(|(_, row)| row["out"].as_str())
         .map(PathBuf::from)
         .collect())
@@ -307,8 +331,13 @@ mod tests {
             ),
         )
         .expect("test graph");
-        let current = current_outputs(&root).expect("graph read");
+        let current = current_outputs(&root, &["device"]).expect("graph read");
         assert_eq!(current, BTreeSet::from([device.join("libnew/libnew.so")]));
+        let both = current_outputs(&root, &["device", "host"]).expect("graph read");
+        assert_eq!(
+            both,
+            BTreeSet::from([device.join("libnew/libnew.so"), device.join("host/x")])
+        );
         let scanned = artifacts(&device, &current).expect("scan");
         assert_eq!(scanned, [(device.join("libnew/libnew.so"), false)]);
         std::fs::remove_dir_all(&root).expect("test dir cleanup");

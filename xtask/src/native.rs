@@ -532,7 +532,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if let Some(first) = runpath_gate(&graph_out)? {
         failed.push(Failure::step("runpath gate", first));
     }
-    if let Some(first) = isa_floor_gate(&graph_out, host, &tiers)? {
+    if let Some(first) = isa_floor_gate(root, &graph_out, host, &tiers)? {
         failed.push(Failure::step("isa gate", first));
     }
     if let Some(first) = fronts_gate(&graph_out, &tree)? {
@@ -1409,7 +1409,7 @@ fn gate<'a>(out: &Path, libs: impl Iterator<Item = &'a Path>) -> Result<Option<S
     if exported.is_empty() {
         return Ok(None);
     }
-    let current = provided_gate::current_outputs(out)?;
+    let current = provided_gate::current_outputs(out, &["device"])?;
     let report = provided_gate::check(&out.join("device"), &exported, &current)?;
     println!(
         "native: provided gate: {} libraries, {} artifacts, {} weak fallbacks lose, {} violations",
@@ -1470,8 +1470,9 @@ fn fronts_gate(out: &Path, tree: &Path) -> Result<Option<String>> {
     Ok(first)
 }
 
-/// The ISA and glibc-floor gate (isa_gate.rs) over this cross host's outputs; its first violation, None when it passes. The build machine's row has no isa: not checked.
+/// The isa gate (isa_gate.rs: ISA, glibc floor, machine per dir, DT_NEEDED) over this cross host's outputs; its first violation, None when it passes. The build machine's row has no isa: not checked.
 fn isa_floor_gate(
+    root: &Path,
     out: &Path,
     host: &arches::Host,
     tiers: &crate::isa_tiers::Tiers,
@@ -1479,13 +1480,21 @@ fn isa_floor_gate(
     if host.isa.is_none() {
         return Ok(None);
     }
-    let report =
-        crate::isa_gate::check(out, host, tiers, &crate::isa_tiers::current_objects(out)?)?;
-    println!("native: isa gate: {}", crate::isa_gate::summary(&report));
-    for v in report.violations.iter().take(5) {
+    let sysroot = crate::isa_gate::sysroot_dirs(root, host)?;
+    let report = crate::isa_gate::check(
+        out,
+        host,
+        tiers,
+        &crate::isa_tiers::current_objects(out)?,
+        &sysroot,
+    )?;
+    for line in crate::isa_gate::summary(&report) {
+        println!("native: isa gate: {line}");
+    }
+    for (_, v) in report.violations.iter().take(5) {
         println!("native:   isa: {v}");
     }
-    Ok(report.violations.first().cloned())
+    Ok(crate::isa_gate::first_violation(&report).map(str::to_owned))
 }
 
 /// The converter's argument file in the out dir (tools/bp2ninja regen.go): build.ninja's regeneration edge reads it, so a changed flag or goal reruns the conversion.
