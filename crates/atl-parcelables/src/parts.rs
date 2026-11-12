@@ -5,6 +5,7 @@
 use binder::SpIBinder;
 
 use crate::codecs::android::content::Intent::Intent;
+use crate::codecs::android::content::IntentFilter::IntentFilter;
 use crate::codecs::android::content::pm::ActivityInfo::ActivityInfo;
 use crate::codecs::android::content::pm::ApplicationInfo::ApplicationInfo;
 use crate::codecs::android::content::res::Configuration::Configuration;
@@ -481,6 +482,97 @@ impl Part for ComponentInfo {
             enabled: r_bool(p)?,
             exported: r_bool(p)?,
             direct_boot_aware: r_bool(p)?,
+        })
+    }
+}
+
+/// android.os.PatternMatcher (os/PatternMatcher.java writeToParcel :191 / PatternMatcher(Parcel)): mPattern (String16), mType, mParsedPattern (an int array).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PatternMatcher {
+    pub pattern: Option<String>,
+    pub kind: i32,
+    pub parsed_pattern: Option<Vec<i32>>,
+}
+impl Part for PatternMatcher {
+    fn write(&self, p: &mut In<'_>) -> Result<()> {
+        w_str16(p, &self.pattern)?;
+        w_i32(p, self.kind)?;
+        w_i32_array(p, &self.parsed_pattern)
+    }
+    fn read(p: &In<'_>) -> Result<Self> {
+        Ok(PatternMatcher {
+            pattern: r_str16(p)?,
+            kind: r_i32(p)?,
+            parsed_pattern: r_i32_array(p)?,
+        })
+    }
+}
+
+/// android.content.pm.PathPermission (content/pm/PathPermission.java writeToParcel :47 / PathPermission(Parcel) :53): the PatternMatcher, then the read and write permissions (String16).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PathPermission {
+    pub pattern: PatternMatcher,
+    pub read_permission: Option<String>,
+    pub write_permission: Option<String>,
+}
+impl Part for PathPermission {
+    fn write(&self, p: &mut In<'_>) -> Result<()> {
+        self.pattern.write(p)?;
+        w_str16(p, &self.read_permission)?;
+        w_str16(p, &self.write_permission)
+    }
+    fn read(p: &In<'_>) -> Result<Self> {
+        Ok(PathPermission {
+            pattern: PatternMatcher::read(p)?,
+            read_permission: r_str16(p)?,
+            write_permission: r_str16(p)?,
+        })
+    }
+}
+
+/// com.android.internal.pm.pkg.component.ParsedIntentInfoImpl (writeToParcel :114 / ParsedIntentInfoImpl(Parcel)): a parsed `<intent-filter>` -- flag byte (writeByte = an int; 0x1 hasDefault, 0x4 label present),
+/// labelRes, the label (TextUtils.writeToParcel) when flagged, icon, the IntentFilter as writeTypedObject. ParsedComponentImpl.writeToParcel writes a component's list of them with writeTypedList.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ParsedIntentInfo {
+    pub has_default: bool,
+    pub label_res: i32,
+    pub non_localized_label: Option<String>,
+    pub icon: i32,
+    pub intent_filter: Option<IntentFilter>,
+}
+const INTENT_INFO_DEFAULT: i32 = 0x1;
+const INTENT_INFO_LABEL: i32 = 0x4;
+impl Part for ParsedIntentInfo {
+    fn write(&self, p: &mut In<'_>) -> Result<()> {
+        let label = self.non_localized_label.is_some();
+        let default = if self.has_default {
+            INTENT_INFO_DEFAULT
+        } else {
+            0
+        };
+        w_i32(p, default | if label { INTENT_INFO_LABEL } else { 0 })?;
+        w_i32(p, self.label_res)?;
+        if label {
+            w_char_sequence(p, &self.non_localized_label)?;
+        }
+        w_i32(p, self.icon)?;
+        w_typed(p, &self.intent_filter)
+    }
+    fn read(p: &In<'_>) -> Result<Self> {
+        // readByte: the int's low byte
+        let flags = r_i32(p)? & 0xff;
+        let label_res = r_i32(p)?;
+        let non_localized_label = if flags & INTENT_INFO_LABEL != 0 {
+            r_char_sequence(p)?
+        } else {
+            None
+        };
+        Ok(ParsedIntentInfo {
+            has_default: flags & INTENT_INFO_DEFAULT != 0,
+            label_res,
+            non_localized_label,
+            icon: r_i32(p)?,
+            intent_filter: r_typed(p)?,
         })
     }
 }

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! android.content.pm.ProviderInfo: content/pm/ProviderInfo.java writeToParcel / ProviderInfo(Parcel), after ComponentInfo. Not modelled, null only: uriPermissionPatterns, pathPermissions.
+//! android.content.pm.ProviderInfo: content/pm/ProviderInfo.java writeToParcel (:163) / ProviderInfo(Parcel) (:193), after ComponentInfo. uriPermissionPatterns and pathPermissions are writeTypedArrays
+//! (generate makes them non-null, PackageInfoCommonUtils.java:441-442).
 
 use crate::parcel::*;
 use crate::parts::*;
@@ -12,6 +13,8 @@ pub struct ProviderInfo {
     pub write_permission: Option<String>,
     pub grant_uri_permissions: bool,
     pub force_uri_permissions: bool,
+    pub uri_permission_patterns: Option<Vec<Option<PatternMatcher>>>,
+    pub path_permissions: Option<Vec<Option<PathPermission>>>,
     pub multiprocess: bool,
     pub init_order: i32,
     pub flags: i32,
@@ -26,8 +29,8 @@ impl Part for ProviderInfo {
         w_str8(p, &self.write_permission)?;
         w_bool(p, self.grant_uri_permissions)?;
         w_bool(p, self.force_uri_permissions)?;
-        w_null(p)?; // uriPermissionPatterns
-        w_null(p)?; // pathPermissions
+        w_typed_list(p, &self.uri_permission_patterns)?;
+        w_typed_list(p, &self.path_permissions)?;
         w_bool(p, self.multiprocess)?;
         w_i32(p, self.init_order)?;
         w_i32(p, self.flags)?;
@@ -35,21 +38,15 @@ impl Part for ProviderInfo {
     }
 
     fn read(p: &In<'_>) -> Result<Self> {
-        let component = ComponentInfo::read(p)?;
-        let authority = r_str8(p)?;
-        let read_permission = r_str8(p)?;
-        let write_permission = r_str8(p)?;
-        let grant_uri_permissions = r_bool(p)?;
-        let force_uri_permissions = r_bool(p)?;
-        r_null(p, "android.content.pm.ProviderInfo.uriPermissionPatterns")?;
-        r_null(p, "android.content.pm.ProviderInfo.pathPermissions")?;
         Ok(ProviderInfo {
-            component,
-            authority,
-            read_permission,
-            write_permission,
-            grant_uri_permissions,
-            force_uri_permissions,
+            component: ComponentInfo::read(p)?,
+            authority: r_str8(p)?,
+            read_permission: r_str8(p)?,
+            write_permission: r_str8(p)?,
+            grant_uri_permissions: r_bool(p)?,
+            force_uri_permissions: r_bool(p)?,
+            uri_permission_patterns: r_typed_list(p)?,
+            path_permissions: r_typed_list(p)?,
             multiprocess: r_bool(p)?,
             init_order: r_i32(p)?,
             flags: r_i32(p)?,

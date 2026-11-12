@@ -51,6 +51,8 @@ pub mod input;
 #[cfg(feature = "converter")]
 pub mod input_method;
 #[cfg(feature = "converter")]
+pub mod installed;
+#[cfg(feature = "converter")]
 pub mod notification;
 #[cfg(feature = "converter")]
 pub mod package;

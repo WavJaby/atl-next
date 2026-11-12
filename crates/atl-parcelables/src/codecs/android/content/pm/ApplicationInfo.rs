@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! android.content.pm.ApplicationInfo: content/pm/ApplicationInfo.java writeToParcel / ApplicationInfo(Parcel), behind Parcel.maybeWriteSquashed / readSquashed.
-//! Squashing: a parcel that allows it (PackageInfo, ProviderInfoList) writes a later identical ApplicationInfo as a back-reference offset; this codec writes 0 (no squash, which every reader accepts)
-//! and refuses to read a back-reference. Not modelled, null only: splitDependencies (SparseArray), optionalSharedLibraryInfos.
+//! Squashing: inside a value that allows it (PackageInfo, ProviderInfoList), a later copy is a back-reference offset (`crate::squash`). Not modelled, null only: splitDependencies (SparseArray), optionalSharedLibraryInfos.
 
 use crate::parcel::*;
 use crate::parts::*;
@@ -87,7 +86,17 @@ pub struct ApplicationInfo {
 
 impl Part for ApplicationInfo {
     fn write(&self, p: &mut In<'_>) -> Result<()> {
-        w_i32(p, 0)?; // maybeWriteSquashed: not squashed
+        crate::squash::write(p, |p| self.write_body(p))
+    }
+
+    fn read(p: &In<'_>) -> Result<Self> {
+        crate::squash::read(p, Self::read_body)
+    }
+}
+
+impl ApplicationInfo {
+    /// writeToParcel after maybeWriteSquashed.
+    fn write_body(&self, p: &mut In<'_>) -> Result<()> {
         self.item.write(p)?;
         w_str8(p, &self.task_affinity)?;
         w_str8(p, &self.permission)?;
@@ -175,12 +184,8 @@ impl Part for ApplicationInfo {
         w_string_set(p, &self.known_activity_embedding_certs)
     }
 
-    fn read(p: &In<'_>) -> Result<Self> {
-        if r_i32(p)? != 0 {
-            return Err(crate::refuse(
-                "android.content.pm.ApplicationInfo (squashed back-reference)",
-            ));
-        }
+    /// ApplicationInfo(Parcel), what readSquashed calls for a first copy.
+    fn read_body(p: &In<'_>) -> Result<Self> {
         let item = PackageItemInfo::read(p)?;
         let task_affinity = r_str8(p)?;
         let permission = r_str8(p)?;

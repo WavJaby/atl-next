@@ -13,7 +13,10 @@
 //! 5. `refuse-duplicate-permission`: an app linked here declaring one permission twice with different protection levels -> the full parse refuses it (ParsingPackageUtils.java:1051-1055, INSTALL_PARSE_FAILED_MANIFEST_MALFORMED -108); the lite parse alone accepts it.
 //! 6. `feature`: an app linked here requesting CAMERA only with `<required-feature android.hardware.camera>` -> on this device (no declared features, the installer gets no `--feature`) AOSP drops the request (ParsingPackageUtils.java:1464-1471): no uses-permission.
 //!
-//! Measured: the installer's VM start, lite parse, full parse and natives times (its `time-ms` line) and the process wall time of each run.
+//! The installer's output is frames of upstream parcels (atl-services-types installer_output); every check reads it decoded by atl-services (`installed::decode`, through atl-installer-dump).
+//! 7. `alto-corrupt-length`, `alto-truncated-parcel`: check 1's output with its first frame length past the end, and with the PackageInfo parcel cut by 8 bytes -> the decode refuses each by name, decoding nothing.
+//!
+//! Measured: the installer's VM start, lite parse, full parse and natives times (its stderr `time-ms` line) and the process wall time of each run.
 //! Breaks: `--break drop-split` (check 1's dir without its split: splits, primary ABI and libraries must turn red); `--break abi-arm64` (the device's ABI lists are arm64-v8a only: AOSP's no-match, `native error -113`, must turn check 1 red);
 //! `--break feature` (check 6's installer is told the device has android.hardware.camera: the forwarder's hasFeature answers true, uses-permission must turn red).
 //! Default: mutating (stages ART into `<out>/installer-art`, writes `<out>/installer`).
@@ -34,6 +37,9 @@ const CMD: &str = "installer";
 /// The package that builds both loaders, and the installer's executable.
 const PACKAGE: &str = "atl-app-launcher";
 const INSTALLER: &str = "atl-installer";
+/// The package and executable that decode the installer's output (atl-services installed.rs).
+const DUMP_PACKAGE: &str = "atl-services";
+const DUMP: &str = "atl-installer-dump";
 /// The google-play row with a split (test-apks.toml).
 const SPLIT_ROW: &str = "altos-odyssey";
 /// A one-APK url row (test-apks.toml).
@@ -113,7 +119,8 @@ fn badging(aapt2: &Path, apk: &Path) -> Result<Badging> {
     })
 }
 
-/// What the installer printed (installer.rs in atl-app-launcher: `package`, `version-code`, `split`*, `primary-abi`, `lib-dir`, `time-ms vm <n> lite <n> parse <n> natives <n>`; the full parse's other lines are installer_parse.rs's).
+/// What the installer returned, from its decoded output (atl-installer-dump: `package`, `version-code`, `split`*, `primary-abi`, `lib-dir`; the full parse's other lines are installer_parse.rs's) and its stderr
+/// (`time-ms vm <n> lite <n> parse <n> natives <n>`).
 #[derive(Debug, Default)]
 struct Parsed {
     package: String,
@@ -132,9 +139,10 @@ fn none_or(value: &str) -> Option<&str> {
     (value != "none").then_some(value)
 }
 
-fn parse_output(stdout: &str) -> Result<Parsed> {
+fn parse_output(decoded: &str, stderr: &str) -> Result<Parsed> {
     let mut p = Parsed::default();
-    for line in stdout.lines() {
+    let timing = stderr.lines().filter(|l| l.starts_with("time-ms "));
+    for line in decoded.lines().chain(timing) {
         let (key, value) = line.split_once(' ').unwrap_or((line, ""));
         match key {
             "package" => p.package = value.to_owned(),
@@ -160,7 +168,7 @@ fn parse_output(stdout: &str) -> Result<Parsed> {
             _ => {}
         }
     }
-    ensure!(!p.package.is_empty(), "no package line in {stdout:?}");
+    ensure!(!p.package.is_empty(), "no package line in {decoded:?}");
     Ok(p)
 }
 
@@ -466,6 +474,8 @@ struct Want {
 struct Gate<'a> {
     host: &'a HostArt,
     installer: PathBuf,
+    /// atl-installer-dump: the installer's frames decoded by atl-services (`installed::decode`) into lines
+    dump: PathBuf,
     /// The api-impl dex `xtask native` built (the ParseCallback forwarder): the installer VM's class path.
     api_impl: PathBuf,
     aapt2: PathBuf,
@@ -485,7 +495,7 @@ impl Gate<'_> {
         features: &[&str],
         dir: &Path,
         lib_root: &Path,
-    ) -> Result<(ArtRun, u128)> {
+    ) -> Result<(ArtRun, Vec<u8>, u128)> {
         let own: Vec<String> = features.iter().map(|f| format!("--feature={f}")).collect();
         let own: Vec<&str> = own.iter().map(String::as_str).collect();
         let mut cmd = self
@@ -496,13 +506,81 @@ impl Gate<'_> {
             .arg(lib_root);
         let mut cmd = in_view(&cmd, &self.view);
         let start = Instant::now();
-        let r = self.host.run(&mut cmd)?;
-        Ok((r, start.elapsed().as_millis()))
+        let (r, frames) = self.host.run_binary(&mut cmd)?;
+        Ok((r, frames, start.elapsed().as_millis()))
     }
 
     /// `run_with` on this device: no declared features (atld's PackageManager declares none).
-    fn run(&self, area: &(String, String), dir: &Path, lib_root: &Path) -> Result<(ArtRun, u128)> {
+    fn run(
+        &self,
+        area: &(String, String),
+        dir: &Path,
+        lib_root: &Path,
+    ) -> Result<(ArtRun, Vec<u8>, u128)> {
         self.run_with(area, &[], dir, lib_root)
+    }
+
+    /// The installer's `frames` decoded (atl-installer-dump): its lines, or its error line.
+    fn decode(&self, frames: &[u8]) -> Result<std::result::Result<String, String>> {
+        use std::io::Write as _;
+        // the converter's libbinder_ndk and liblog, from the staged runtime's library dir as every converter binary the harness runs
+        let mut child = Command::new(&self.dump)
+            .env("LD_LIBRARY_PATH", &self.host.lib_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .with_context(|| format!("running {}", self.dump.display()))?;
+        let mut stdin = child.stdin.take().context("dump stdin")?;
+        // written from a thread: the dump reads all of stdin before writing, but a large output must not wait on a full pipe either way
+        let input = frames.to_vec();
+        let writer = std::thread::spawn(move || stdin.write_all(&input));
+        let out = child.wait_with_output()?;
+        writer
+            .join()
+            .map_err(|_| anyhow::anyhow!("dump stdin writer panicked"))??;
+        let stdout = String::from_utf8(out.stdout).context("dump output")?;
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+        Ok(if out.status.success() {
+            Ok(stdout)
+        } else {
+            // a failed decode prints nothing on stdout (installer_dump.rs)
+            ensure!(
+                stdout.is_empty(),
+                "atl-installer-dump failed after printing lines: {stderr}"
+            );
+            Err(format!("{} ({})", stderr, out.status))
+        })
+    }
+
+    /// Breaks on `frames` (a good output): a corrupt frame length, then a truncated PackageInfo parcel, must each be refused by name with nothing decoded.
+    fn decode_breaks(&mut self, name: &str, frames: &[u8]) -> Result<()> {
+        ensure!(
+            frames.len() > 16,
+            "{name}: output of {} bytes",
+            frames.len()
+        );
+        let mut corrupt = frames.to_vec();
+        // the first frame's length (bytes 4..8, little-endian) past the end
+        corrupt[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        let first = u32::from_le_bytes(frames[4..8].try_into().expect("4 bytes")) as usize;
+        // the PackageInfo parcel without its last 8 bytes, its frame length to match, the rest of the output dropped
+        let mut truncated = frames[..8 + first - 8].to_vec();
+        truncated[4..8].copy_from_slice(&u32::try_from(first - 8)?.to_le_bytes());
+        for (case, input, marker) in [
+            ("corrupt-length", corrupt, "claims"),
+            ("truncated-parcel", truncated, "refused"),
+        ] {
+            match self.decode(&input)? {
+                Err(e) if e.contains(marker) => println!("{name}-{case}: PASS refused: {e}"),
+                Err(e) => self.fail(
+                    &format!("{name}-{case}"),
+                    format!("refused without `{marker}`: {e}"),
+                ),
+                Ok(_) => self.fail(&format!("{name}-{case}"), "decoded".to_owned()),
+            }
+        }
+        Ok(())
     }
 
     /// The full parse of `stdout` against the oracle of `base_apk` (failures into `bad`), and against manifest.rs (printed as findings of check `name`).
@@ -536,18 +614,28 @@ impl Gate<'_> {
         lib_root: &Path,
         want: &Want,
     ) -> Result<()> {
-        let (r, wall) = self.run(area, dir, lib_root)?;
+        let (r, frames, wall) = self.run(area, dir, lib_root)?;
         if !r.ok {
             self.fail(name, format!("installer {}: {}", r.status, r.failure()));
             return Ok(());
         }
-        let p = parse_output(&r.stdout)?;
+        let decoded = match self.decode(&frames)? {
+            Ok(d) => d,
+            Err(e) => {
+                self.fail(name, format!("decode: {e}"));
+                return Ok(());
+            }
+        };
+        if name == "alto" {
+            self.decode_breaks(name, &frames)?;
+        }
+        let p = parse_output(&decoded, &r.stderr)?;
         let mut got = p.splits.clone();
         got.sort();
         let mut splits = want.splits.clone();
         splits.sort();
         let mut bad = Vec::new();
-        let full = self.full_parse(name, &r.stdout, &want.base_apk, &mut bad)?;
+        let full = self.full_parse(name, &decoded, &want.base_apk, &mut bad)?;
         if p.package != want.base.package {
             bad.push(format!(
                 "package {} != aapt2 {}",
@@ -642,12 +730,19 @@ impl Gate<'_> {
         lib_root: &Path,
     ) -> Result<()> {
         let name = "feature";
-        let (r, _) = self.run_with(area, features, dir, lib_root)?;
+        let (r, frames, _) = self.run_with(area, features, dir, lib_root)?;
         if !r.ok {
             self.fail(name, format!("installer {}: {}", r.status, r.failure()));
             return Ok(());
         }
-        let full = Full::read(&r.stdout)?;
+        let decoded = match self.decode(&frames)? {
+            Ok(d) => d,
+            Err(e) => {
+                self.fail(name, format!("decode: {e}"));
+                return Ok(());
+            }
+        };
+        let full = Full::read(&decoded)?;
         if full.uses_permissions.is_empty() {
             println!(
                 "{name}: PASS uses-permission [] ({FEATURE_PERMISSION} needs {FEATURE}, which this device does not declare)"
@@ -674,7 +769,7 @@ impl Gate<'_> {
         code: i32,
         marker: &str,
     ) -> Result<()> {
-        let (r, _) = self.run(area, dir, lib_root)?;
+        let (r, _, _) = self.run(area, dir, lib_root)?;
         // the message after the code may lead with the file and position (ParseTypeImpl.error with the parser's description)
         let want = format!("parse error {code}: ... {marker}");
         let line = r
@@ -731,6 +826,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let mut gate = Gate {
         host: &host,
         installer: packages::bin(root, &out, PACKAGE, INSTALLER)?,
+        dump: packages::bin(root, &out, DUMP_PACKAGE, DUMP)?,
         api_impl,
         aapt2: tools.aapt2.clone(),
         sdk: device_sdk(&device_props)?,
@@ -895,7 +991,8 @@ mod tests {
     #[test]
     fn reads_the_installer_lines() {
         let p = parse_output(
-            "package a.b\nversion-code 7\nsplit x\nsplit y\nprimary-abi x86_64\nlib-dir /o/lib/x86_64\ntime-ms vm 10 lite 2 parse 3 natives 5\n",
+            "package a.b\nversion-code 7\nsplit x\nsplit y\nprimary-abi x86_64\nlib-dir /o/lib/x86_64\n",
+            "W/art: noise\ntime-ms vm 10 lite 2 parse 3 natives 5\n",
         )
         .unwrap();
         assert_eq!(
@@ -923,11 +1020,12 @@ mod tests {
             )
         );
         let none = parse_output(
-            "package a.b\nprimary-abi none\nlib-dir none\ntime-ms vm 1 lite 1 parse 1 natives 0\n",
+            "package a.b\nprimary-abi none\nlib-dir none\n",
+            "time-ms vm 1 lite 1 parse 1 natives 0\n",
         )
         .unwrap();
         assert_eq!((none.primary_abi, none.lib_dir), (None, None));
-        assert!(parse_output("version-code 7\n").is_err());
+        assert!(parse_output("version-code 7\n", "").is_err());
         assert_eq!(none_or("none"), None);
     }
 

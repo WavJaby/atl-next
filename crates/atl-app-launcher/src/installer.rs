@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: MIT
-//! The installer process (plan item 4b, slices M1-M3): AOSP's own package parsing and native-code choice in a VM of its own. Started as `atl-installer [--feature=<name>...] [VM options...] <package dir> <native library root>`;
+//! The installer process (plan item 4b, slices M1-M4a): AOSP's own package parsing and native-code choice in a VM of its own. Started as `atl-installer [--feature=<name>...] [VM options...] <package dir> <native library root>`;
 //! the dir holds the base APK and its splits (AOSP names them `base.apk`, `split_<name>.apk`), the root receives the chosen ABI's libraries under `<root>/<isa>`. The VM options name the api-impl dex (`-Djava.class.path=`), whose ParsingPackageUtils.Callback forwarder the full parse needs.
 //! `--feature=<name>`: a feature this device declares (PMS hasSystemFeature, the parse's `hasFeature`); the spawner passes the set atld's PackageManager answers with.
 //! Steps: the app process's start up to the VM (lib.rs steps 0-3), plus `-Xhidden-api-policy:just-warn` (installer VM only: it calls `@hide` framework code from JNI); libandroid_runtime around the VM (step 5a: the framework's natives, ApkAssets and NativeLibraryHelper among them);
 //! then `ApkLiteParseUtils.parseClusterPackageLite` over the dir (`ffi::Vm::parse_cluster`, M1), the full parse (`package::parse`, M3), then the install path's native code (`Cluster::install_natives`, M2).
-//! Output on stdout, one `key value` per line: the full parse's lines (`package`, `version-code`, `version-name`, `min-sdk`, `target-sdk`, `app-class`, `app-flags`, `extract-native-libs`, `app-process`, `app-theme`,
-//! `uses-permission`*, `permission`*, `activity`/`receiver`/`service`/`provider` <name> key=value...*, `filter <kind> <component> actions= categories= schemes= types=`*), one `split` per split name in AOSP's order,
-//! `primary-abi <abi>|none`, `lib-dir <path>|none`, then `time-ms vm <n> lite <n> parse <n> natives <n>`.
+//! Output on stdout: the frames of atl-services-types `installer_output` (the PackageInfo parcel with the ABI choice on its ApplicationInfo, the components' intent filters); on stderr after them
+//! `time-ms vm <n> lite <n> parse <n> natives <n>`.
 //! Errors: stderr `parse error <code>: <message>` (PackageManager INSTALL_PARSE_FAILED_* code) or `native error <code>: <name>` (INSTALL_FAILED_* code), exit 1.
 
 use std::ffi::{CString, OsString};
@@ -82,28 +81,21 @@ fn run(argv: Vec<OsString>) -> Result<()> {
     let natives_start = Instant::now();
     let natives = cluster.install_natives(&lib_root)?;
     let natives_ms = natives_start.elapsed().as_millis();
-    let mut out = std::io::stdout().lock();
-    for line in &parsed {
-        writeln!(out, "{line}")?;
-    }
-    for s in &cluster.splits {
-        writeln!(out, "split {s}")?;
-    }
-    writeln!(
-        out,
-        "primary-abi {}",
-        natives.primary_abi.as_deref().unwrap_or("none")
+    let frames = parsed.frames(
+        &vm,
+        &package::Abi {
+            primary: natives.primary_abi.as_deref(),
+            lib_dir: natives.lib_dir.as_deref(),
+        },
     )?;
-    match &natives.lib_dir {
-        Some(d) => writeln!(out, "lib-dir {}", d.display())?,
-        None => writeln!(out, "lib-dir none")?,
-    }
+    let mut out = std::io::stdout().lock();
+    out.write_all(&frames)?;
+    out.flush()?;
+    drop(out);
     writeln!(
-        out,
+        std::io::stderr(),
         "time-ms vm {vm_ms} lite {lite_ms} parse {parse_ms} natives {natives_ms}"
     )?;
-    drop(out);
-    drop(cluster);
     vm.shut_down()
 }
 

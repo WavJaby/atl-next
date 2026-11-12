@@ -228,6 +228,15 @@ impl HostArt {
         Ok(self.result(&format!("{cmd:?}"), out))
     }
 
+    /// `run` of a command whose stdout is binary: its bytes as they came, and the run with an empty `stdout`.
+    pub fn run_binary(&self, cmd: &mut Command) -> Result<(ArtRun, Vec<u8>)> {
+        let mut out = cmd
+            .output()
+            .with_context(|| format!("running {:?}", cmd.get_program()))?;
+        let bytes = std::mem::take(&mut out.stdout);
+        Ok((self.result(&format!("{cmd:?}"), out), bytes))
+    }
+
     /// `launch`'s command, for a caller that spawns it itself (through binderd's harness); its stdout and stderr piped for `finish`.
     pub fn command(
         &self,

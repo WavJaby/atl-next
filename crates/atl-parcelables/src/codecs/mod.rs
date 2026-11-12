@@ -23,8 +23,10 @@ pub mod android {
             pub mod InstrumentationInfo;
             pub mod PackageInfo;
             pub mod ParceledListSlice;
+            pub mod PermissionInfo;
             pub mod ProviderInfo;
             pub mod ProviderInfoList;
+            pub mod ServiceInfo;
         }
         pub mod res {
             pub mod CompatibilityInfo;

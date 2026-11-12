@@ -55,6 +55,8 @@ atl-media-extractors = { path = "../atl-media-extractors" }
 atl-platform-ui = { path = "../atl-platform-ui" }
 # the run's gralloc node (property) -> its device number, what the UI's presented buffers must carry (lib.rs start_ui)
 atl-gralloc = { path = "../atl-gralloc" }
+# the installer's output frames (installer.rs, package.rs)
+atl-services-types = { path = "../atl-services-types" }
 rustix.workspace = true
 tracing-subscriber.workspace = true
 

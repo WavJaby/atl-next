@@ -45,10 +45,10 @@ uses = ["binder", "broker", "gralloc", "platform-host", "property-service", "ser
 [launch]
 crates = ["atl-launch"]
 
-# the app process's entry: JNI invocation of the converter's ART, liblog's logger, bionic's property and target-SDK API, all resolved at run time by name in libatl_bionic.so (no link to atl-bionic: one copy of its state); the process's SurfaceFlinger (composer), started in app mode; UI mode's GTK session (platform-ui), attached before Java
+# the app process's entry: JNI invocation of the converter's ART, liblog's logger, bionic's property and target-SDK API, all resolved at run time by name in libatl_bionic.so (no link to atl-bionic: one copy of its state); the process's SurfaceFlinger (composer), started in app mode; UI mode's GTK session (platform-ui), attached before Java; the installer's output frames (services-types)
 [launcher]
 crates = ["atl-app-launcher"]
-uses = ["generators", "android-paths", "composer", "gralloc", "platform-ui", "service-view", "audioflinger", "codec-store", "resource-manager", "media-player", "media-extractors"]
+uses = ["generators", "android-paths", "composer", "gralloc", "platform-ui", "service-view", "audioflinger", "codec-store", "resource-manager", "media-player", "media-extractors", "services-types"]
 
 # the process's own view of servicemanager: names the app process serves itself (its SurfaceFlinger, the Codec2 store, the media resource manager, the media extractor service, media.player) answered in-process, the rest forwarded; libbinder reached through cxx adapters (wrap/view.cpp)
 [service-view]

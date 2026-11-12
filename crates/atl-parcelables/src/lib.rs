@@ -7,7 +7,7 @@
 //! - a hand-written codec where `src/codecs/<java path>/<Name>.rs` exists: the AOSP writeToParcel / createFromParcel order, field for field;
 //! - else `opaque!`: a type that refuses to encode or decode and counts the refusal (`refused`); null still passes (the NULL flag is the caller's).
 //!
-//! A codec models the values M2 sends; a non-null value of a part it does not model (a squashed ApplicationInfo back-reference, Spanned text, ...) is refused and counted the same way.
+//! A codec models the values M2 sends; a non-null value of a part it does not model (Spanned text, a typed array it has no codec for, ...) is refused and counted the same way.
 //! Ground truth: `xtask test parcel` round-trips each codec against Java's own Parcelable on host ART (Java bytes -> Rust decode + encode -> byte-equal; Rust bytes -> Java `equals`).
 //! Cargo builds nothing here (`cfg(soong)`, which only the converter passes): plain workspace builds need no converter output.
 #![cfg(soong)]
@@ -18,6 +18,7 @@ pub mod codecs;
 mod opaque;
 pub mod parcel;
 pub mod parts;
+pub mod squash;
 
 pub use opaque::{NICHE, Niche, refuse, refused};
 

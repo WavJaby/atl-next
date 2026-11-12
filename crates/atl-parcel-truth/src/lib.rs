@@ -27,7 +27,7 @@ use atl_parcelables::android::app::PendingIntent;
 use atl_parcelables::android::app::servertransaction::ClientTransaction;
 use atl_parcelables::android::content::pm::{
     ActivityInfo, ApplicationInfo, InstrumentationInfo, PackageInfo, ParceledListSlice,
-    ProviderInfo, ProviderInfoList,
+    PermissionInfo, ProviderInfo, ProviderInfoList, ServiceInfo,
 };
 use atl_parcelables::android::content::res::{CompatibilityInfo, Configuration};
 use atl_parcelables::android::content::{ComponentName, Intent, IntentFilter};
@@ -54,6 +54,7 @@ use atl_parcelables::com::android::internal::inputmethod::{
 use atl_parcelables::java::io::FileDescriptor;
 use atl_parcelables::java::lang::CharSequence;
 use atl_parcelables::java::util::Map;
+use atl_parcelables::parts::{ParsedIntentInfo, Part};
 use binder::binder_impl::{BorrowedParcel, Parcel, UnstructuredParcelable};
 use binder::unstable_api::{AParcel, AsNative};
 
@@ -114,6 +115,23 @@ fn decode_as<T: UnstructuredParcelable>(p: &Parcel, mode: i32) -> Result<Vec<u8>
     }
     let mut out = Parcel::new();
     v.write_to_parcel(&mut out.borrowed())
+        .map_err(|e| format!("encode refused: {e:?}"))?;
+    finish(&out, mode)
+}
+
+/// `round_trip_as` for a layout that is a `Part` but no AIDL parcelable.
+fn round_trip_part<T: Part>(input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
+    let p = unmarshal(input)?;
+    let v = T::read(p.borrowed_ref()).map_err(|e| format!("decode refused: {e:?}"))?;
+    if p.get_data_position() != p.get_data_size() {
+        return Err(format!(
+            "decode stopped at byte {} of {}",
+            p.get_data_position(),
+            p.get_data_size()
+        ));
+    }
+    let mut out = Parcel::new();
+    v.write(&mut out.borrowed())
         .map_err(|e| format!("encode refused: {e:?}"))?;
     finish(&out, mode)
 }
@@ -269,6 +287,12 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
         "android.content.pm.ProviderInfo" => round_trip_as::<ProviderInfo>(input, mode),
         "android.content.pm.ProviderInfoList" => round_trip_as::<ProviderInfoList>(input, mode),
         "android.content.pm.PackageInfo" => round_trip_as::<PackageInfo>(input, mode),
+        "android.content.pm.ServiceInfo" => round_trip_as::<ServiceInfo>(input, mode),
+        "android.content.pm.PermissionInfo" => round_trip_as::<PermissionInfo>(input, mode),
+        // not an AIDL parcelable: the installer's intents frames carry it (atl-parcelables parts.rs)
+        "com.android.internal.pm.pkg.component.ParsedIntentInfoImpl" => {
+            round_trip_part::<ParsedIntentInfo>(input, mode)
+        }
         "android.content.pm.ParceledListSlice" => round_trip_as::<ParceledListSlice>(input, mode),
         "android.content.pm.InstrumentationInfo" => {
             round_trip_as::<InstrumentationInfo>(input, mode)

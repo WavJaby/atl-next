@@ -3,10 +3,49 @@
 //! Wire: the actions as a String array (the ArraySet's iteration order, kept as read), then for categories, data schemes, static data types, data types and MIME groups an int presence flag and a String list
 //! (count, strings), the scheme-specific parts / authorities / paths as a count and entries, priority, the two partial-type flags, autoVerify, the instant-app visibility, order, an extras presence flag + PersistableBundle,
 //! and the UriRelativeFilterGroup count (always written, 0 unless aconfig flag `relative_reference_intent_filters` is on).
-//! Not modelled (refused and counted when present): scheme-specific parts, authorities, paths (PatternMatcher / AuthorityEntry), extras, relative filter groups.
+//! Scheme-specific parts and paths are PatternMatchers (os/PatternMatcher.java writeToParcel :191), authorities AuthorityEntries (IntentFilter.java AuthorityEntry.writeToParcel :1195); a count 0 reads as null,
+//! so an empty list is null here. Not modelled (refused and counted when present): extras, relative filter groups.
 
 use crate::parcel::*;
 use crate::parts::*;
+
+/// android.content.IntentFilter.AuthorityEntry: mOrigHost, mHost (String16), mWild, mPort.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AuthorityEntry {
+    pub orig_host: Option<String>,
+    pub host: Option<String>,
+    pub wild: bool,
+    /// -1 = any port
+    pub port: i32,
+}
+
+impl Part for AuthorityEntry {
+    fn write(&self, p: &mut In<'_>) -> Result<()> {
+        w_str16(p, &self.orig_host)?;
+        w_str16(p, &self.host)?;
+        w_bool(p, self.wild)?;
+        w_i32(p, self.port)
+    }
+
+    fn read(p: &In<'_>) -> Result<Self> {
+        Ok(AuthorityEntry {
+            orig_host: r_str16(p)?,
+            host: r_str16(p)?,
+            wild: r_bool(p)?,
+            port: r_i32(p)?,
+        })
+    }
+}
+
+/// A count and the entries, 0 for null (writeToParcel's loops); IntentFilter(Parcel) makes a list only for a count > 0.
+fn w_entries<T: Part>(p: &mut In<'_>, v: &[T]) -> Result<()> {
+    w_i32(p, len_i32(v.len())?)?;
+    v.iter().try_for_each(|e| e.write(p))
+}
+fn r_entries<T: Part>(p: &In<'_>) -> Result<Vec<T>> {
+    let n = r_i32(p)?;
+    (0..n.max(0)).map(|_| T::read(p)).collect()
+}
 
 /// android.content.IntentFilter. Optional lists are `None` where Java's field is null (a present empty list is `Some`).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -18,6 +57,9 @@ pub struct IntentFilter {
     pub static_data_types: Option<Vec<Option<String>>>,
     pub data_types: Option<Vec<Option<String>>>,
     pub mime_groups: Option<Vec<Option<String>>>,
+    pub data_scheme_specific_parts: Vec<PatternMatcher>,
+    pub data_authorities: Vec<AuthorityEntry>,
+    pub data_paths: Vec<PatternMatcher>,
     pub priority: i32,
     pub has_static_partial_types: bool,
     pub has_dynamic_partial_types: bool,
@@ -77,9 +119,9 @@ impl Part for IntentFilter {
         w_opt_list(p, &self.static_data_types)?;
         w_opt_list(p, &self.data_types)?;
         w_opt_list(p, &self.mime_groups)?;
-        w_i32(p, 0)?; // mDataSchemeSpecificParts
-        w_i32(p, 0)?; // mDataAuthorities
-        w_i32(p, 0)?; // mDataPaths
+        w_entries(p, &self.data_scheme_specific_parts)?;
+        w_entries(p, &self.data_authorities)?;
+        w_entries(p, &self.data_paths)?;
         w_i32(p, self.priority)?;
         w_bool(p, self.has_static_partial_types)?;
         w_bool(p, self.has_dynamic_partial_types)?;
@@ -97,9 +139,9 @@ impl Part for IntentFilter {
         let static_data_types = r_opt_list(p)?;
         let data_types = r_opt_list(p)?;
         let mime_groups = r_opt_list(p)?;
-        r_no_entries(p, "android.content.IntentFilter.mDataSchemeSpecificParts")?;
-        r_no_entries(p, "android.content.IntentFilter.mDataAuthorities")?;
-        r_no_entries(p, "android.content.IntentFilter.mDataPaths")?;
+        let data_scheme_specific_parts = r_entries(p)?;
+        let data_authorities = r_entries(p)?;
+        let data_paths = r_entries(p)?;
         let filter = IntentFilter {
             actions,
             categories,
@@ -107,6 +149,9 @@ impl Part for IntentFilter {
             static_data_types,
             data_types,
             mime_groups,
+            data_scheme_specific_parts,
+            data_authorities,
+            data_paths,
             priority: r_i32(p)?,
             // `readInt() > 0`
             has_static_partial_types: r_i32(p)? > 0,

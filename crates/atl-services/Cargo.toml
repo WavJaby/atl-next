@@ -24,6 +24,12 @@ name = "atl-system-services"
 path = "src/bin/system_services.rs"
 required-features = ["converter"]
 
+# Test-only: the installer's output decoded (installed.rs) and printed as lines for `xtask test installer`.
+[[bin]]
+name = "atl-installer-dump"
+path = "src/bin/installer_dump.rs"
+required-features = ["converter"]
+
 # Test-only client of `xtask test binder`: the M2 calls an app process makes, as an app or the system uid.
 [[bin]]
 name = "atl-services-client"

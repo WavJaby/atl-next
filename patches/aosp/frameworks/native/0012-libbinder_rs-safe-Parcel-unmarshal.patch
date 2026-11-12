@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Fri, 13 Nov 2026 06:05:41 +0800
+Subject: [PATCH] libbinder_rs: safe Parcel::unmarshal
+
+AParcel_unmarshal makes a parcel from bytes; libbinder_rs offers no
+safe call for it. The reverse of Parcel::marshal (0004).
+
+Upstream-Status: Inappropriate [ATL-only: callers forbid unsafe; no AOSP Rust caller needs it]
+Patch-Reason: the installer returns marshalled PackageInfo parcels to atld, whose services decode them with atl-parcelables; atl-services forbids unsafe, and a boundary crate for one call would add a converter rlib edge and a modules.toml edge.
+---
+SPDX-License-Identifier: Apache-2.0
+ libs/binder/rust/src/parcel.rs | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/libs/binder/rust/src/parcel.rs b/libs/binder/rust/src/parcel.rs
+index 981bae38d181c6a7e2ca8b911e0beb453465af6c..e1af6806ca9caa496cf2c139611928ee1718dae6 100644
+--- a/libs/binder/rust/src/parcel.rs
++++ b/libs/binder/rust/src/parcel.rs
+@@ -515,6 +515,20 @@ impl Parcel {
+         status_result(status)?;
+         Ok(buf)
+     }
++
++    /// A parcel holding `bytes` as its data, positioned at 0: the reverse of [`Parcel::marshal`]. Bytes carry no binder or file descriptor object, so the parcel holds none.
++    pub fn unmarshal(bytes: &[u8]) -> Result<Parcel> {
++        let mut parcel = Parcel::new();
++        if bytes.is_empty() {
++            return Ok(parcel);
++        }
++        // Safety: `parcel` is live and owned here; `bytes` is a readable slice of `bytes.len()` bytes, which AParcel_unmarshal copies.
++        let status =
++            unsafe { sys::AParcel_unmarshal(parcel.as_native_mut(), bytes.as_ptr(), bytes.len()) };
++        status_result(status)?;
++        parcel.set_data_position_checked(0)?;
++        Ok(parcel)
++    }
+ }
+ 
+ // Data deserialization methods

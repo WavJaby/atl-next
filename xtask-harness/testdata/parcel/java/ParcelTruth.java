@@ -32,8 +32,11 @@ import android.content.pm.ApplicationInfo;
 import android.content.pm.InstrumentationInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.ParceledListSlice;
+import android.content.pm.PathPermission;
+import android.content.pm.PermissionInfo;
 import android.content.pm.ProviderInfo;
 import android.content.pm.ProviderInfoList;
+import android.content.pm.ServiceInfo;
 import android.content.pm.SharedLibraryInfo;
 import android.content.res.CompatibilityInfo;
 import android.content.res.Configuration;
@@ -61,6 +64,7 @@ import com.android.internal.infra.AndroidFuture;
 import com.android.internal.inputmethod.InputBindResult;
 import com.android.internal.inputmethod.InputConnectionCommandHeader;
 import com.android.internal.inputmethod.InputMethodInfoSafeList;
+import com.android.internal.pm.pkg.component.ParsedIntentInfoImpl;
 import android.view.SurfaceControl;
 import android.view.WindowInsets;
 import android.view.WindowManager;
@@ -75,6 +79,7 @@ import android.os.LocaleList;
 import android.os.Parcel;
 import android.os.ParcelFileDescriptor;
 import android.os.Parcelable;
+import android.os.PatternMatcher;
 import android.os.UserHandle;
 import android.os.storage.StorageVolume;
 import android.window.ActivityWindowInfo;
@@ -183,6 +188,27 @@ public class ParcelTruth {
         holder.noReleaseNeeded = true;
         check("ContentProviderHolder", holder, ContentProviderHolder.CREATOR);
         check("PackageInfo", packageInfo(ai), PackageInfo.CREATOR);
+        check("ServiceInfo", serviceInfo(ai), ServiceInfo.CREATOR);
+        check("PermissionInfo", permissionInfo(), PermissionInfo.CREATOR);
+        // the installer's PackageInfo (PackageInfoCommonUtils.generate, every component flag): each component holds the package's own ApplicationInfo, so every later copy is a squashed back-reference
+        check("PackageInfo:components", packageInfoComponents(ai), PackageInfo.CREATOR);
+        // a manifest <data> filter: scheme, authorities (one wild, one with a port), a path and a scheme-specific part
+        IntentFilter dataFilter = new IntentFilter(Intent.ACTION_VIEW);
+        dataFilter.addCategory(Intent.CATEGORY_DEFAULT);
+        dataFilter.addCategory(Intent.CATEGORY_BROWSABLE);
+        dataFilter.addDataScheme("https");
+        dataFilter.addDataAuthority("example.com", "443");
+        dataFilter.addDataAuthority("*.example.org", null);
+        dataFilter.addDataPath("/notes", PatternMatcher.PATTERN_PREFIX);
+        dataFilter.addDataSchemeSpecificPart("//example.net/x", PatternMatcher.PATTERN_LITERAL);
+        check("IntentFilter:data", dataFilter, IntentFilter.CREATOR);
+        // one element of the installer's intents frames (ParsedComponentImpl's intents list)
+        ParsedIntentInfoImpl intentInfo = new ParsedIntentInfoImpl();
+        intentInfo.setHasDefault(true).setLabelRes(0x7f0f0001).setNonLocalizedLabel("Open").setIcon(0x7f080003);
+        intentInfo.getIntentFilter().addAction(Intent.ACTION_SEND);
+        intentInfo.getIntentFilter().addCategory(Intent.CATEGORY_DEFAULT);
+        check("ParsedIntentInfo", intentInfo, ParsedIntentInfoImpl.CREATOR);
+        check("ParsedIntentInfo:plain", new ParsedIntentInfoImpl(), ParsedIntentInfoImpl.CREATOR);
         check("ComponentName", new ComponentName("com.example.app", "com.example.app.Runner"), ComponentName.CREATOR);
         check("InstrumentationInfo", instrumentationInfo(ai), InstrumentationInfo.CREATOR);
         // IPackageManager.queryInstrumentationAsUser's reply: the inline list, its element class written once
@@ -963,6 +989,54 @@ public class ParcelTruth {
         p.requestedPermissions = new String[] {"android.permission.INTERNET"};
         p.requestedPermissionsFlags = new int[] {PackageInfo.REQUESTED_PERMISSION_GRANTED};
         p.compileSdkVersion = 35;
+        return p;
+    }
+
+    static ServiceInfo serviceInfo(ApplicationInfo ai) {
+        ServiceInfo s = new ServiceInfo();
+        s.name = "com.example.app.Sync";
+        s.packageName = ai.packageName;
+        s.applicationInfo = ai;
+        s.processName = "com.example.app:sync";
+        s.exported = true;
+        s.permission = "android.permission.BIND_JOB_SERVICE";
+        s.flags = ServiceInfo.FLAG_STOP_WITH_TASK;
+        return s;
+    }
+
+    static PermissionInfo permissionInfo() {
+        PermissionInfo p = new PermissionInfo();
+        p.name = "com.example.app.permission.C2D";
+        p.packageName = "com.example.app";
+        p.protectionLevel = PermissionInfo.PROTECTION_SIGNATURE;
+        p.group = "com.example.app.group";
+        p.descriptionRes = 0x7f0f0002;
+        p.nonLocalizedDescription = "Receive messages";
+        return p;
+    }
+
+    /// generate's shape: two activities (one with a meta-data Bundle), a disabled receiver, a service, a provider, a permission, every component holding `ai` itself.
+    static PackageInfo packageInfoComponents(ApplicationInfo ai) {
+        PackageInfo p = packageInfo(ai);
+        ActivityInfo main = activityInfo(ai);
+        main.metaData = new Bundle();
+        main.metaData.putString("unityplayer.UnityActivity", "true");
+        main.metaData.putInt("io.example.resource", 0x7f030001);
+        ActivityInfo alias = activityInfo(ai);
+        alias.name = "com.example.app.Main.Green";
+        alias.targetActivity = "com.example.app.Main";
+        ActivityInfo receiver = activityInfo(ai);
+        receiver.name = "com.example.app.Boot";
+        receiver.enabled = false;
+        p.activities = new ActivityInfo[] {main, alias};
+        p.receivers = new ActivityInfo[] {receiver};
+        p.services = new ServiceInfo[] {serviceInfo(ai)};
+        // a provider with <grant-uri-permission> and <path-permission>; generate makes both arrays non-null
+        ProviderInfo files = providerInfo(ai);
+        files.uriPermissionPatterns = new PatternMatcher[] {new PatternMatcher("/shared/", PatternMatcher.PATTERN_PREFIX)};
+        files.pathPermissions = new PathPermission[] {new PathPermission("/private", PatternMatcher.PATTERN_PREFIX, "com.example.READ", null)};
+        p.providers = new ProviderInfo[] {files};
+        p.permissions = new PermissionInfo[] {permissionInfo()};
         return p;
     }
 

@@ -419,13 +419,11 @@ impl VmHandle {
 
 const EXIT_FAILURE: i32 = 1;
 
-/// A package dir as AOSP's PackageLite describes it (`Vm::parse_cluster`): its split names, and the PackageLite object `install_natives` reads.
+/// A package dir as AOSP's PackageLite describes it (`Vm::parse_cluster`): the PackageLite object `install_natives` reads (the split names reach the output in the PackageInfo).
 /// `lite` is a local reference of the main thread: valid until the VM is shut down, so the caller drops this first.
 pub struct Cluster<'vm> {
     vm: &'vm Vm,
     lite: JObject,
-    /// The split names in PackageLite's order (sorted by ApkLiteParseUtils).
-    pub splits: Vec<String>,
 }
 
 /// AOSP's install-path decision for a package's native code (`Cluster::install_natives`).
@@ -1002,15 +1000,6 @@ impl Vm {
         Ok(value)
     }
 
-    /// `obj.method()`: an instance method with no arguments, returning a long.
-    pub(crate) fn call_long(&self, obj: JObject, method: JMethod, what: &str) -> Result<i64> {
-        let none = core::ptr::null::<jni::jvalue>();
-        // SAFETY: as `call_bool`
-        let value = unsafe { jni_call!(self.env, CallLongMethodA, obj, method, none) };
-        self.check(what)?;
-        Ok(value)
-    }
-
     /// The instance field `name` (type `sig`) of `class`.
     pub(crate) fn field(&self, class: JClass, name: &CStr, sig: &CStr) -> Result<JField> {
         // SAFETY: the main thread's env, a live class reference, NUL-terminated name and signature
@@ -1030,22 +1019,60 @@ impl Vm {
         Ok(value)
     }
 
-    /// The int value of `field` in `obj`.
-    pub(crate) fn int_field(&self, obj: JObject, field: JField) -> Result<i32> {
-        ensure!(!obj.is_null(), "field read on null");
-        // SAFETY: as `object_field`, an int field
-        let value = unsafe { jni_call!(self.env, GetIntField, obj, field) };
-        self.check("int field")?;
-        Ok(value)
+    /// Sets the object `field` of `obj` to `value`.
+    pub(crate) fn set_object_field(
+        &self,
+        obj: JObject,
+        field: JField,
+        value: JObject,
+    ) -> Result<()> {
+        ensure!(!obj.is_null(), "field write on null");
+        // SAFETY: as `object_field`; `value` is null or a live reference of the field's type (the caller resolved `field` with that type)
+        unsafe { jni_call!(self.env, SetObjectField, obj, field, value) };
+        self.check("set object field")
     }
 
-    /// The boolean value of `field` in `obj`.
-    pub(crate) fn bool_field(&self, obj: JObject, field: JField) -> Result<bool> {
-        ensure!(!obj.is_null(), "field read on null");
-        // SAFETY: as `object_field`, a boolean field
-        let value = unsafe { jni_call!(self.env, GetBooleanField, obj, field) };
-        self.check("boolean field")?;
-        Ok(value != 0)
+    /// A Java `String` of `text`.
+    pub(crate) fn new_string(&self, text: &str) -> Result<JObject> {
+        let text = CString::new(text).context("string with a NUL")?;
+        // SAFETY: the main thread's env, a NUL-terminated string
+        let s = unsafe { jni_call!(self.env, NewStringUTF, text.as_ptr()) };
+        self.check("NewStringUTF")?;
+        ensure!(!s.is_null(), "NewStringUTF: null");
+        Ok(s)
+    }
+
+    /// `obj.method(args)`: an instance method returning void.
+    pub(crate) fn call_void_with(
+        &self,
+        obj: JObject,
+        method: JMethod,
+        args: &[jni::jvalue],
+        what: &str,
+    ) -> Result<()> {
+        // SAFETY: as `call_object`
+        unsafe { jni_call!(self.env, CallVoidMethodA, obj, method, args.as_ptr()) };
+        self.check(what)
+    }
+
+    /// The bytes of a Java `byte[]`.
+    pub(crate) fn bytes(&self, array: JObject) -> Result<Vec<u8>> {
+        ensure!(!array.is_null(), "null byte[]");
+        let len = usize::try_from(self.array_len(array)?).context("byte[] length")?;
+        let mut buf = vec![0u8; len];
+        // SAFETY: the main thread's env, a live byte[] of `len` elements; the region [0, len) is the array's and `buf` holds `len` bytes
+        unsafe {
+            jni_call!(
+                self.env,
+                GetByteArrayRegion,
+                array,
+                0,
+                len as i32,
+                buf.as_mut_ptr().cast()
+            )
+        };
+        self.check("GetByteArrayRegion")?;
+        Ok(buf)
     }
 
     /// `new class(args)` through the constructor `init`.
@@ -1198,26 +1225,7 @@ impl Vm {
             "ApkLiteParseUtils.parseClusterPackageLite",
         )?;
         let lite = self.parse_result(result, "ApkLiteParseUtils.parseClusterPackageLite")?;
-        let lite_class = self.find_class(c"android/content/pm/parsing/PackageLite")?;
-        let split_names = self.method(
-            lite_class,
-            c"getSplitNames",
-            c"()[Ljava/lang/String;",
-            false,
-        )?;
-        let names = self.call_object(lite, split_names, &[], "PackageLite.getSplitNames")?;
-        let mut splits = Vec::new();
-        if !names.is_null() {
-            for i in 0..self.array_len(names)? {
-                let s = self.array_get(names, i)?;
-                splits.push(self.string(s)?.context("null split name")?);
-            }
-        }
-        Ok(Cluster {
-            vm: self,
-            lite,
-            splits,
-        })
+        Ok(Cluster { vm: self, lite })
     }
 
     /// The VM, for threads other than this one.

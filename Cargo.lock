@@ -115,6 +115,7 @@ dependencies = [
  "atl-platform-ui",
  "atl-resource-manager",
  "atl-service-view",
+ "atl-services-types",
  "rustix",
  "tracing-subscriber",
 ]
