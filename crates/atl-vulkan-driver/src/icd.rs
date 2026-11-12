@@ -145,9 +145,8 @@ fn load(manifest: &Path) -> Result<Icd> {
         .with_context(|| format!("dlopen {}", path.display()))?;
     let mut interface = LOADER_INTERFACE;
     // SAFETY: the symbol's type is the loader-driver interface's
-    if let Ok(negotiate) =
-        unsafe { lib.get::<Negotiate>(b"vk_icdNegotiateLoaderICDInterfaceVersion\0") }
-    {
+    let negotiate = unsafe { lib.get::<Negotiate>(b"vk_icdNegotiateLoaderICDInterfaceVersion\0") };
+    if let Ok(negotiate) = negotiate {
         // SAFETY: a valid out-pointer, per the interface
         let r = unsafe { negotiate(&mut interface) };
         ensure!(r == VK_SUCCESS, "interface negotiation: VkResult {r}");
@@ -170,7 +169,14 @@ fn load(manifest: &Path) -> Result<Icd> {
 }
 
 /// A command of `instance` (null: a global one), by its Vulkan name.
-pub fn proc<F: Copy>(gipa: GetInstanceProcAddr, instance: *mut c_void, name: &CStr) -> Result<F> {
+///
+/// # Safety
+/// `instance` is null or a live instance of the ICD `gipa` belongs to; `F` is the command's function-pointer type.
+pub unsafe fn proc<F: Copy>(
+    gipa: GetInstanceProcAddr,
+    instance: *mut c_void,
+    name: &CStr,
+) -> Result<F> {
     ensure!(
         size_of::<F>() == size_of::<unsafe extern "C" fn()>(),
         "not a function pointer type"
@@ -184,7 +190,8 @@ pub fn proc<F: Copy>(gipa: GetInstanceProcAddr, instance: *mut c_void, name: &CS
 
 /// A probe instance on the ICD: its first physical device's name and type, or why there is none.
 fn probe(gipa: GetInstanceProcAddr) -> Result<(String, &'static str)> {
-    let create: CreateInstance = proc(gipa, std::ptr::null_mut(), c"vkCreateInstance")?;
+    // SAFETY: a global command, typed per the spec
+    let create: CreateInstance = unsafe { proc(gipa, std::ptr::null_mut(), c"vkCreateInstance") }?;
     let name = CString::new("atl-vulkan-driver probe")?;
     let app = VkApplicationInfo {
         sType: VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -204,10 +211,12 @@ fn probe(gipa: GetInstanceProcAddr) -> Result<(String, &'static str)> {
     let r = unsafe { create(&info, std::ptr::null(), &mut instance) };
     ensure!(r == VK_SUCCESS, "vkCreateInstance: VkResult {r}");
     let result = (|| {
+        // SAFETY: the live instance created above; commands typed per the spec
         let enumerate: EnumeratePhysicalDevices =
-            proc(gipa, instance, c"vkEnumeratePhysicalDevices")?;
+            unsafe { proc(gipa, instance, c"vkEnumeratePhysicalDevices") }?;
+        // SAFETY: as above
         let props: GetPhysicalDeviceProperties =
-            proc(gipa, instance, c"vkGetPhysicalDeviceProperties")?;
+            unsafe { proc(gipa, instance, c"vkGetPhysicalDeviceProperties") }?;
         let mut count = 1u32;
         let mut first = std::ptr::null_mut();
         // SAFETY: room for one handle; VK_INCOMPLETE when there are more
@@ -227,7 +236,8 @@ fn probe(gipa: GetInstanceProcAddr) -> Result<(String, &'static str)> {
             .into_owned();
         Ok((device, device_type(p.deviceType)))
     })();
-    let destroy: DestroyInstance = proc(gipa, instance, c"vkDestroyInstance")?;
+    // SAFETY: the live instance created above
+    let destroy: DestroyInstance = unsafe { proc(gipa, instance, c"vkDestroyInstance") }?;
     // SAFETY: the instance created above, no child objects left
     unsafe { destroy(instance, std::ptr::null()) };
     result

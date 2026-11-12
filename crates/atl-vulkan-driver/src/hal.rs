@@ -7,8 +7,8 @@ use std::ffi::{CStr, c_char, c_int};
 use std::sync::OnceLock;
 
 use crate::abi::hal::{
-    HWVULKAN_DEVICE_0, hw_device_t, hw_module_methods_t, hw_module_t, hwvulkan_device_t,
-    hwvulkan_module_t,
+    HWVULKAN_DEVICE_0, VkInstance_T, hw_device_t, hw_module_methods_t, hw_module_t,
+    hwvulkan_device_t, hwvulkan_module_t,
 };
 use crate::icd::{self, Icd};
 
@@ -58,26 +58,6 @@ pub static HMI: Module = Module(UnsafeCell::new(hwvulkan_module_t {
 /// hwvulkan.h `HWVULKAN_HARDWARE_MODULE_ID`, as the C string the record points at (the test ties it to the generated constant).
 const MODULE_ID: &CStr = c"vulkan";
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::abi::hal::HWVULKAN_HARDWARE_MODULE_ID;
-
-    #[test]
-    fn module_id_is_the_headers() {
-        assert_eq!(MODULE_ID.to_bytes(), HWVULKAN_HARDWARE_MODULE_ID.as_bytes());
-    }
-
-    /// hardware.h's macros, evaluated by hand: 'H'=0x48 'W'=0x57 'M'=0x4d 'T'=0x54 'D'=0x44.
-    #[test]
-    fn tags_and_versions() {
-        assert_eq!(tag(b"HWMT"), 0x4857_4d54);
-        assert_eq!(tag(b"HWDT"), 0x4857_4454);
-        assert_eq!(api_version(1, 0), 0x0100);
-        assert_eq!(api_version_2(0, 1, 0), 0x0001_0000);
-    }
-}
-
 /// The opened device: one per process, alive until exit (close is a no-op: the ICD stays loaded).
 struct Device(hwvulkan_device_t);
 // SAFETY: immutable after construction; its pointers are the static module and the ICD's functions
@@ -122,18 +102,22 @@ fn make(icd: &Icd) -> anyhow::Result<Device> {
             reserved: [0; 12],
             close: Some(close),
         },
-        EnumerateInstanceExtensionProperties: Some(icd::proc(
-            icd.gipa,
-            null,
-            c"vkEnumerateInstanceExtensionProperties",
-        )?),
-        CreateInstance: Some(icd::proc(icd.gipa, null, c"vkCreateInstance")?),
+        // SAFETY: global commands (null instance), typed as the record's fields are (the header's PFN types)
+        EnumerateInstanceExtensionProperties: Some(unsafe {
+            icd::proc(icd.gipa, null, c"vkEnumerateInstanceExtensionProperties")
+        }?),
+        // SAFETY: as above
+        CreateInstance: Some(unsafe { icd::proc(icd.gipa, null, c"vkCreateInstance") }?),
         // SAFETY: same signature; the generated record names the instance handle by its own opaque type
         GetInstanceProcAddr: Some(unsafe {
-            std::mem::transmute::<icd::GetInstanceProcAddr, _>(icd.gipa)
+            std::mem::transmute::<icd::GetInstanceProcAddr, GipaField>(icd.gipa)
         }),
     }))
 }
+
+/// `hwvulkan_device_t::GetInstanceProcAddr` as generated.
+type GipaField =
+    unsafe extern "C" fn(*mut VkInstance_T, *const c_char) -> Option<unsafe extern "C" fn()>;
 
 /// One line on stderr, which is the app process's log (atl-broker).
 fn log(line: &str) {
@@ -169,4 +153,24 @@ unsafe extern "C" fn open(
 /// `hw_device_t::close`: nothing to free, the device and ICD live for the process.
 unsafe extern "C" fn close(_dev: *mut hw_device_t) -> c_int {
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::abi::hal::HWVULKAN_HARDWARE_MODULE_ID;
+
+    #[test]
+    fn module_id_is_the_headers() {
+        assert_eq!(MODULE_ID.to_bytes(), HWVULKAN_HARDWARE_MODULE_ID.as_bytes());
+    }
+
+    /// hardware.h's macros, evaluated by hand: 'H'=0x48 'W'=0x57 'M'=0x4d 'T'=0x54 'D'=0x44.
+    #[test]
+    fn tags_and_versions() {
+        assert_eq!(tag(b"HWMT"), 0x4857_4d54);
+        assert_eq!(tag(b"HWDT"), 0x4857_4454);
+        assert_eq!(api_version(1, 0), 0x0100);
+        assert_eq!(api_version_2(0, 1, 0), 0x0001_0000);
+    }
 }

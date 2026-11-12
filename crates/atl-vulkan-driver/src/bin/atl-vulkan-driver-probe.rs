@@ -12,8 +12,8 @@ use atl_vulkan_driver::abi::hal::{
     HWVULKAN_DEVICE_0, HWVULKAN_DISPATCH_MAGIC, HWVULKAN_HARDWARE_MODULE_ID, VK_API_VERSION_1_1,
     VK_INCOMPLETE, VK_STRUCTURE_TYPE_APPLICATION_INFO, VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
     VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, VK_SUCCESS,
-    VkApplicationInfo, VkDeviceCreateInfo, VkDeviceQueueCreateInfo, VkInstanceCreateInfo,
-    VkPhysicalDeviceProperties, hw_device_t, hw_module_t, hwvulkan_device_t,
+    VkApplicationInfo, VkDeviceCreateInfo, VkDeviceQueueCreateInfo, VkInstance_T,
+    VkInstanceCreateInfo, VkPhysicalDeviceProperties, hw_device_t, hw_module_t, hwvulkan_device_t,
 };
 use atl_vulkan_driver::icd::{GetInstanceProcAddr, proc};
 use clap::Parser;
@@ -94,8 +94,15 @@ fn run(args: &Args) -> Result<String> {
         .context("no EnumerateInstanceExtensionProperties")?;
     let create = dev.CreateInstance.context("no CreateInstance")?;
     // SAFETY: same signature, the instance handle typed opaque here
-    let gipa: GetInstanceProcAddr =
-        unsafe { std::mem::transmute(dev.GetInstanceProcAddr.context("no GetInstanceProcAddr")?) };
+    let gipa = unsafe {
+        std::mem::transmute::<
+            unsafe extern "C" fn(
+                *mut VkInstance_T,
+                *const c_char,
+            ) -> Option<unsafe extern "C" fn()>,
+            GetInstanceProcAddr,
+        >(dev.GetInstanceProcAddr.context("no GetInstanceProcAddr")?)
+    };
 
     let mut n_ext = 0u32;
     // SAFETY: count query
@@ -138,9 +145,12 @@ fn run(args: &Args) -> Result<String> {
     };
     slot("VkInstance", instance);
 
-    let enumerate: EnumeratePhysicalDevices = proc(gipa, instance, c"vkEnumeratePhysicalDevices")?;
+    // SAFETY: the live instance; commands typed per the spec
+    let enumerate: EnumeratePhysicalDevices =
+        unsafe { proc(gipa, instance, c"vkEnumeratePhysicalDevices") }?;
+    // SAFETY: as above
     let props: GetPhysicalDeviceProperties =
-        proc(gipa, instance, c"vkGetPhysicalDeviceProperties")?;
+        unsafe { proc(gipa, instance, c"vkGetPhysicalDeviceProperties") }?;
     let mut count = 0u32;
     // SAFETY: count query
     let r = unsafe { enumerate(instance, &mut count, std::ptr::null_mut()) };
@@ -170,8 +180,10 @@ fn run(args: &Args) -> Result<String> {
         }
     }
 
-    let create_device: CreateDevice = proc(gipa, instance, c"vkCreateDevice")?;
-    let gdpa: GetDeviceProcAddr = proc(gipa, instance, c"vkGetDeviceProcAddr")?;
+    // SAFETY: as above
+    let create_device: CreateDevice = unsafe { proc(gipa, instance, c"vkCreateDevice") }?;
+    // SAFETY: as above
+    let gdpa: GetDeviceProcAddr = unsafe { proc(gipa, instance, c"vkGetDeviceProcAddr") }?;
     let priority = 1.0f32;
     // SAFETY: zeroed create infos are valid; completed below
     let mut queue_info: VkDeviceQueueCreateInfo = unsafe { std::mem::zeroed() };
@@ -194,16 +206,21 @@ fn run(args: &Args) -> Result<String> {
         unsafe { gdpa(device, n.as_ptr()) }.with_context(|| format!("{n:?} not provided"))
     };
     // SAFETY: the looked-up commands have these types (Vulkan spec)
-    let get_queue: GetDeviceQueue = unsafe { std::mem::transmute(dproc(c"vkGetDeviceQueue")?) };
+    let get_queue = unsafe {
+        std::mem::transmute::<unsafe extern "C" fn(), GetDeviceQueue>(dproc(c"vkGetDeviceQueue")?)
+    };
     // SAFETY: as above
-    let destroy_device: DestroyDevice = unsafe { std::mem::transmute(dproc(c"vkDestroyDevice")?) };
+    let destroy_device = unsafe {
+        std::mem::transmute::<unsafe extern "C" fn(), DestroyDevice>(dproc(c"vkDestroyDevice")?)
+    };
     let mut queue: H = std::ptr::null_mut();
     // SAFETY: family 0 index 0 was created
     unsafe { get_queue(device, 0, 0, &mut queue) };
     slot("VkQueue", queue);
     // SAFETY: no child objects left
     unsafe { destroy_device(device, std::ptr::null()) };
-    let destroy: DestroyInstance = proc(gipa, instance, c"vkDestroyInstance")?;
+    // SAFETY: the live instance
+    let destroy: DestroyInstance = unsafe { proc(gipa, instance, c"vkDestroyInstance") }?;
     // SAFETY: as above
     unsafe { destroy(instance, std::ptr::null()) };
     drop(lib);
