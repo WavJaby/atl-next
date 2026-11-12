@@ -805,6 +805,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("dns_glibc_order", "atl_nb_dns_glibc_order"),
     // Q6-2 (engine/dispatch.rs `call_jni`): x3 and x4 exchanged, so CallStaticIntMethod(2, 3) reaches the host as (3, 2) (qemu-jni gate, `c`)
     ("jni_swap", "atl_nb_jni_swap"),
+    // Q6-7 (engine/va_list.rs `fp`): a guest va_list's fp arguments are read from its integer save area (qemu-jni gate, `V`)
+    ("va_fp_gp", "atl_nb_va_fp_gp"),
     // Q6-3 (engine/dispatch.rs `call_host`): the fp lanes reach the host as zeros (qemu-jni gate, `d` and `f`)
     ("v_drop", "atl_nb_v_drop"),
     // Q6-3 (engine/dispatch.rs `call_host`): the stack words reach the host one word early (qemu-jni gate, `d`)

@@ -62,12 +62,26 @@ unsafe fn str_arg<'a>(p: *const c_char) -> Option<&'a CStr> {
 }
 
 /// # Safety
-/// `instruction_set` is null or a NUL-terminated string (native_bridge.h).
+/// `runtime_cbs` is null or the runtime's callbacks, live for the process; `instruction_set` is null or a NUL-terminated string (native_bridge.h).
 pub unsafe fn initialize(
-    _runtime_cbs: *const NativeBridgeRuntimeCallbacks,
+    runtime_cbs: *const NativeBridgeRuntimeCallbacks,
     _private_dir: *const c_char,
     instruction_set: *const c_char,
 ) -> bool {
+    // the runtime's shorty lookup: a guest JNI `...V` call reads its va_list by it (engine/jni.rs `set_method_shorty`)
+    // SAFETY: caller contract.
+    if let Some(f) = unsafe { runtime_cbs.as_ref() }.and_then(|c| c.getMethodShorty) {
+        // SAFETY: the same C function, its JNIEnv* and jmethodID taken as words.
+        engine::jni::set_method_shorty(unsafe {
+            std::mem::transmute::<
+                unsafe extern "C" fn(
+                    *mut *const crate::generated::JNINativeInterface,
+                    *mut crate::generated::_jmethodID,
+                ) -> *const c_char,
+                engine::jni::MethodShorty,
+            >(f)
+        });
+    }
     // SAFETY: the header's contract for `instruction_set`.
     let isa = unsafe { str_arg(instruction_set) };
     let isa = match isa.map(CStr::to_str).transpose() {

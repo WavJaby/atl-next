@@ -19,6 +19,7 @@ mod provider;
 pub mod qemu;
 pub mod signal;
 pub mod thread;
+mod va_list;
 pub mod vdso;
 
 use std::path::PathBuf;

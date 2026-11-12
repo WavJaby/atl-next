@@ -22,7 +22,7 @@ static long long qj_seen[6];
 #define REFUSE_VALIST 2
 #define REFUSE_FORGED 3
 
-// the first variadic argument of CallStaticIntMethodV is a va_list: the call is refused before it is read
+// REFUSE_VALIST: the gate gave the engine no shorty source in this case, so the V call is refused before its va_list is read
 static void call_valist(JNIEnv *env, ...) {
     va_list ap;
     va_start(ap, env);
@@ -30,9 +30,47 @@ static void call_valist(JNIEnv *env, ...) {
     va_end(ap);
 }
 
+// Q6-7, the `...V` calls (check V): each helper takes the method's arguments variadically and passes its va_list on, as an app's JNI wrapper does.
+// V_ARGS matches the fake's shorty for V_MID, "IDJFLIDJFIDJFIDJFLD" (tests/qemu_jni.rs V_SHORTY): 10 integer-class arguments, past the five or four x registers each helper has left, and 9 fp ones (floats promoted to double), past v0..v7, so the va_list's __stack is read for both.
+// The fake's `...A` slots compare each jvalue with tests/qemu_jni.rs V_* and answer that slot's V_RET_*.
+#define V_MID 0x7a11
+#define V_ARGS 11, 1.25, 0x100000002LL, 0.5f, (jobject)(intptr_t)0xb01, -12, 2.5, -3LL, 1.75f, 13, 3.75, 0x700000004LL, 2.25f, 14, 4.5, 5LL, 3.125f, (jobject)(intptr_t)0xb02, 5.875
+
+static jdouble v_static(JNIEnv *env, jclass cls, jmethodID mid, ...) {
+    va_list ap;
+    va_start(ap, mid);
+    jdouble r = (*env)->CallStaticDoubleMethodV(env, cls, mid, ap);
+    va_end(ap);
+    return r;
+}
+
+static jlong v_virtual(JNIEnv *env, jobject obj, jmethodID mid, ...) {
+    va_list ap;
+    va_start(ap, mid);
+    jlong r = (*env)->CallLongMethodV(env, obj, mid, ap);
+    va_end(ap);
+    return r;
+}
+
+static jint v_nonvirtual(JNIEnv *env, jobject obj, jclass cls, jmethodID mid, ...) {
+    va_list ap;
+    va_start(ap, mid);
+    jint r = (*env)->CallNonvirtualIntMethodV(env, obj, cls, mid, ap);
+    va_end(ap);
+    return r;
+}
+
+static jobject v_new(JNIEnv *env, jclass cls, jmethodID mid, ...) {
+    va_list ap;
+    va_start(ap, mid);
+    jobject r = (*env)->NewObjectV(env, cls, mid, ap);
+    va_end(ap);
+    return r;
+}
+
 // out[8] (in) the pool address of the snprintf binding, out[9] (in) its buffer, out[11] (in) the buffer size, out[10] (out) snprintf's result: the `p` row.
 // out[0] GetVersion, out[1] CallStaticIntMethod(ADD_A, ADD_B),out[2] GetJavaVM's result, out[3] the vm it gave, out[4] 1 when NewStringUTF("abc") reads back "abc",
-// out[5] the bits of CallStaticDoubleMethod's result, out[6] the bits of CallStaticFloatMethod's result, out[7] (refuse == REFUSE_FORGED) the address of a JNI stub past the table
+// out[5] the bits of CallStaticDoubleMethod's result, out[6] the bits of CallStaticFloatMethod's result, out[7] (refuse == REFUSE_FORGED) the address of a JNI stub past the table; out[21..24] the V calls (below)
 void qj_run(JNIEnv *env, long long *out, long long refuse) {
     if (refuse == REFUSE_RESERVED) {
         // jni.h reserved3: a `void *` field, so the call goes through a cast
@@ -85,6 +123,18 @@ void qj_run(JNIEnv *env, long long *out, long long refuse) {
     for (int k = 0; k < 6; k++) {
         out[15 + k] = qj_seen[k];
     }
+    // Q6-7: out[21] the bits of CallStaticDoubleMethodV's result, out[22] CallLongMethodV's, out[23] CallNonvirtualIntMethodV's, out[24] NewObjectV's object
+    jmethodID vmid = (jmethodID)(intptr_t)V_MID;
+    jobject vobj = (jobject)(intptr_t)OBJ;
+    union {
+        jdouble d;
+        long long i;
+    } vu;
+    vu.d = v_static(env, cls, vmid, V_ARGS);
+    out[21] = vu.i;
+    out[22] = v_virtual(env, vobj, vmid, V_ARGS);
+    out[23] = v_nonvirtual(env, vobj, cls, vmid, V_ARGS);
+    out[24] = (long long)(intptr_t)v_new(env, cls, vmid, V_ARGS);
 }
 
 // JNI_OnLoad(vm, reserved): ART calls it with no shorty, the host through a down shell (Vm kind); records both, returns JNI_VERSION_1_6 (jni.h)

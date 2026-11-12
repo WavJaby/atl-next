@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! The guest's `JNIEnv` / `JavaVM` (bridge1-step4-plan section 3, identity ABI): an object whose word 0 is a guest function table and word 1 the host object it stands for (`GuestObj`).
-//! Table slots come from jni.h (build.rs `jni_tables`); each is a JNI stub (arch `jni_stub`) that crosses to the host object's own slot with only the object argument rewritten, so variadic and `va_list` entries need no per-signature code.
+//! Table slots come from jni.h (build.rs `jni_tables`); each is a JNI stub (arch `jni_stub`) that crosses to the host object's own slot with only the object argument rewritten, so variadic entries need no per-signature code. Under QEMU a `va_list` entry crosses to its `...A` sibling instead, its arguments read by the method's shorty (dispatch.rs `call_jni`, va_list.rs).
 //! Specials, whose results hand an env/vm back to the guest, are host functions instead (the set Berberis `jni/jni_trampolines.cc` special-cases, minus `RegisterNatives`: ART asks `isNativeBridgeFunctionPointer`): `GetJavaVM`, `GetEnv`, `AttachCurrentThread`, `AttachCurrentThreadAsDaemon`.
 //! Down calls rewrite the other way (arch `Down`): host env -> this thread's guest env, host vm -> the guest vm.
 
@@ -179,11 +179,40 @@ pub(super) enum Refused {
     },
     /// A jni.h `reserved*` field: no function behind it.
     Reserved { id: usize },
-    /// A `...V` variant: its `va_list` is a pointer the host would have to read, not converted (Q6-3).
-    VaList { name: &'static str },
+    /// A `...V` variant with no shorty source: ART gives `getMethodShorty` at `initialize` (exports.rs); a caller of the engine that skipped it has none.
+    NoShorty { name: &'static str },
+    /// A `...V` variant whose method's shorty holds a character outside jni's `ZBSCIJFDL`.
+    Shorty { name: &'static str, c: u8 },
 }
 
-/// The lane descriptor of guest JNI call `id` made on guest object `guest`. The table is the vm's for the process's one guest vm (`guest_vm`), else the env's. Refused: an id past the table, a reserved slot, a parameter of class `VaList`.
+/// ART's `NativeBridgeRuntimeCallbacks::getMethodShorty(env, mid)` (native_bridge.h): a method's shorty, result first.
+pub type MethodShorty = unsafe extern "C" fn(usize, usize) -> *const std::ffi::c_char;
+static METHOD_SHORTY: OnceLock<MethodShorty> = OnceLock::new();
+
+/// Keeps the runtime's shorty callback (exports.rs `initialize`): a guest `...V` call reads its `va_list` by the method's shorty (dispatch.rs `call_jni`). The first one set stays.
+pub fn set_method_shorty(f: MethodShorty) {
+    let _ = METHOD_SHORTY.set(f);
+}
+
+/// The parameter characters of method `mid`'s shorty (its result character dropped), asked of the runtime on host env `host`; `None` when no callback was set or it answered null.
+///
+/// # Safety
+/// `host` is a host JNIEnv and `mid` a jmethodID of it; the shorty the runtime returns lives as long as the method.
+pub(super) unsafe fn method_params(host: usize, mid: usize) -> Option<&'static [u8]> {
+    let f = METHOD_SHORTY.get()?;
+    // SAFETY: caller contract; native_bridge.h's getMethodShorty.
+    let p = unsafe { f(host, mid) };
+    // SAFETY: a non-null shorty is NUL-terminated and outlives the method (caller contract).
+    let s = (!p.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(p) })?;
+    s.to_bytes().get(1..)
+}
+
+/// The `...A` sibling of `...V` slot `id`: jni.h declares each `XV` directly before `XA` (unit test `a_slot_follows_each_v_slot`).
+pub(super) const fn a_slot(id: usize) -> usize {
+    id + 1
+}
+
+/// The lane descriptor of guest JNI call `id` made on guest object `guest`. The table is the vm's for the process's one guest vm (`guest_vm`), else the env's. Refused: an id past the table, a reserved slot.
 pub(super) fn lane_of(guest: usize, id: usize) -> Result<&'static lanes::Lane, Refused> {
     let (table, name): (&'static [Option<lanes::Lane>], &'static str) = if VM.get() == Some(&guest)
     {
@@ -198,9 +227,6 @@ pub(super) fn lane_of(guest: usize, id: usize) -> Result<&'static lanes::Lane, R
             len: table.len(),
         }),
         Some(None) => Err(Refused::Reserved { id }),
-        Some(Some(lane)) if lane.params.contains(&Class::VaList) => {
-            Err(Refused::VaList { name: lane.name })
-        }
         Some(Some(lane)) => Ok(lane),
     }
 }
@@ -286,4 +312,29 @@ extern "C" fn attach_current_thread_as_daemon(
 ) -> i32 {
     // SAFETY: as above.
     unsafe { attach(vm, out, args, vm::AttachCurrentThreadAsDaemon) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `va_list` slot `XV` has `XA` at `a_slot`, with the same parameters up to the `va_list` (a `jvalue*` there) and the same result. jni.h has 31 V slots (10 types x Call, CallNonvirtual, CallStatic, plus NewObject).
+    #[test]
+    fn a_slot_follows_each_v_slot() {
+        let mut n = 0;
+        for (id, lane) in lanes::env::LANES.iter().enumerate() {
+            let Some(v) = lane else { continue };
+            let Some(k) = v.params.iter().position(|c| *c == Class::VaList) else {
+                continue;
+            };
+            n += 1;
+            let a = lanes::env::LANES[a_slot(id)].expect("an A slot");
+            let stem = v.name.strip_suffix('V').expect("a V name");
+            assert_eq!(a.name.strip_suffix('A'), Some(stem), "{}", v.name);
+            assert_eq!(a.params.len(), k + 1, "{}", v.name);
+            assert_eq!(a.params[..k], v.params[..k], "{}", v.name);
+            assert_eq!(a.ret, v.ret, "{}", v.name);
+        }
+        assert_eq!(n, 31);
+    }
 }

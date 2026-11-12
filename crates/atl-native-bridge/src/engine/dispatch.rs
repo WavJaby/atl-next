@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use atl_engine_api::AtlLanes;
 
 use super::jni::{self, Class, Refused};
-use super::unsupported;
+use super::{unsupported, va_list};
 use crate::engine::bindings::JNI_STUBS;
 use crate::engine::bindings::qemu::THUNKS;
 use crate::engine::identity::Down;
@@ -86,11 +86,28 @@ fn call_jni(id: u32, lanes: &AtlLanes) -> Answer {
     let lane = jni::lane_of(guest, id as usize).unwrap_or_else(|r| refuse(r));
     // SAFETY: `guest` is a guest env or vm: `lane_of` found its table, which only `guest_env` / `guest_vm` objects carry.
     let host = unsafe { jni::host_of(guest) };
-    // SAFETY: `id` is below the length of the table `lane_of` read, which jni.rs builds from the host object's table, so it is a slot of `host`'s own table.
-    let target = unsafe { jni::host_slot(host, id as usize) };
+    let mut lanes = *lanes;
+    // a `...V` call (Q6-7): its va_list read per the method's shorty into a jvalue array, which the `...A` sibling takes in the va_list's lane
+    let args: Vec<u64>;
+    let slot = match lane.params.iter().position(|c| *c == Class::VaList) {
+        None => id as usize,
+        Some(k) => {
+            let name = lane.name;
+            // SAFETY: `host` is the host env behind the guest env; lane k - 1 is the call's jmethodID (jni.h: every V slot's va_list follows its methodID).
+            let params = unsafe { jni::method_params(host, lanes.x[k - 1] as usize) }
+                .unwrap_or_else(|| refuse(Refused::NoShorty { name }));
+            // SAFETY: lane k is the guest's va_list pointer, and the guest made the call with the method's arguments (JNI contract).
+            args = unsafe { va_list::jvalues(lanes.x[k] as usize, params) }
+                .unwrap_or_else(|c| refuse(Refused::Shorty { name, c }));
+            lanes.x[k] = args.as_ptr() as u64;
+            jni::a_slot(id as usize)
+        }
+    };
+    // SAFETY: `slot` is `id` or its A sibling, below the length of the table `lane_of` read, which jni.rs builds from the host object's table, so it is a slot of `host`'s own table.
+    let target = unsafe { jni::host_slot(host, slot) };
+    // counted as the guest's slot `id`, with the host function that ran
     #[cfg(all(feature = "crossing-count", not(atl_nb_qe_jni_count)))]
     count_jni(id as usize, target);
-    let mut lanes = *lanes;
     #[cfg(atl_nb_jni_swap)]
     if id as usize == jni::CALL_STATIC_INT_METHOD {
         lanes.x.swap(3, 4);
@@ -241,10 +258,10 @@ fn fp_result(_ret: Class) -> Class {
     Class::Int
 }
 
-/// Refusals by kind, in [`refuse`]'s order: a forged id, a reserved slot, a `va_list`. A refusal aborts, so each count reaches the abort message only.
-static REFUSED: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
+/// Refusals by kind, in [`refuse`]'s order: a forged id, a reserved slot, a `va_list` without a shorty source, a shorty character outside jni's. A refusal aborts, so each count reaches the abort message only.
+static REFUSED: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
 
-/// The named abort of a refused guest JNI call (owner decision D-4): the message says which call and why, with the count of that kind.
+/// The named abort of a refused guest JNI call: the message says which call and why, with the count of that kind.
 fn refuse(r: Refused) -> ! {
     let (kind, why) = match r {
         Refused::Forged { id, table, len } => (
@@ -255,7 +272,17 @@ fn refuse(r: Refused) -> ! {
             1,
             format!("JNI slot {id} is reserved (jni.h reserved*), no function"),
         ),
-        Refused::VaList { name } => (2, format!("JNI {name} takes a va_list (a V variant, D-4)")),
+        Refused::NoShorty { name } => (
+            2,
+            format!("JNI {name} takes a va_list and the runtime gave no getMethodShorty"),
+        ),
+        Refused::Shorty { name, c } => (
+            3,
+            format!(
+                "JNI {name}: shorty character {:?} is not a JNI type",
+                char::from(c)
+            ),
+        ),
     };
     let n = REFUSED[kind].fetch_add(1, Ordering::Relaxed) + 1;
     unsupported(&format!(

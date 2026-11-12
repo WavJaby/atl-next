@@ -3,7 +3,7 @@
 //! The fake records what each call got and answers with spec values: GetVersion gives JNI_VERSION_1_6 (jni.h), CallStaticIntMethod(a, b) gives a * 10 + b, so a swapped pair shows as 32, not 23. CallStaticDoubleMethod and CallStaticFloatMethod check the lanes they were given (the stack spill, the fp arguments) and answer from them.
 //! Driver: run without `ATL_QJ_CASE`, it first runs each refusal case in a child process (QEMU starts once per process), then the plain case in this process. A refusal case must abort by name: SIGABRT and its message on stderr.
 //! Env (xtask qemu_jni.rs sets it; unset prints SKIP): ATL_ENGINE_SO (the engine `.so`), ATL_NB_BOOT (the engine boot executable, crates/atl-qemu-boot), ATL_NB_JNIEXE (fixture.c, PIE), ATL_NB_LINKER, ATL_NB_VDSO (the arm64 NB images; `<nb>/libnative_bridge_guest_libc` among the guest library directories).
-//! Checks: (s) started; (v) GetVersion returned JNI_VERSION_1_6; (e) all 11 calls reached the fake, each with the host env it was given; (c) FindClass and GetStaticMethodID got the names and the handles they issued, CallStaticIntMethod got (cls, mid, 2, 3), and the fixture got 23; (j) GetJavaVM, a special with its own host thunk, returned the guest vm of the fake vm; (t) NewStringUTF and GetStringUTFChars round-tripped "abc"; (d) SetDoubleField got 2.5, CallStaticDoubleMethod got its lanes and returned DOUBLE_EXPECT; (f) CallStaticFloatMethod returned FLOAT_EXPECT; (a) glibc atof, bound with result class Fp, returned ATOF_EXPECT in v0; (p) glibc snprintf, bound through `qemu::bind` and called from the guest with a double vararg, wrote SNPRINTF_EXPECT (the `%al` row); (r) a reserved slot, (l) a va_list entry, (g) a forged id past the table: each refused by name. Q6-4 down calls, each through `qemu::down` with the host env or vm: (o) JNI_OnLoad returned JNI_VERSION_1_6 and got the guest vm and the reserved pointer; (m) nativeMix (14 arguments, a double result) got the guest env and class and returned MIX_EXPECT; (x) nativeScale (a float result) got the guest env and class and returned SCALE_EXPECT; (R) a down call of 15 integers is refused by name in its child.
+//! Checks: (s) started; (v) GetVersion returned JNI_VERSION_1_6; (e) all 11 calls reached the fake, each with the host env it was given; (c) FindClass and GetStaticMethodID got the names and the handles they issued, CallStaticIntMethod got (cls, mid, 2, 3), and the fixture got 23; (j) GetJavaVM, a special with its own host thunk, returned the guest vm of the fake vm; (t) NewStringUTF and GetStringUTFChars round-tripped "abc"; (d) SetDoubleField got 2.5, CallStaticDoubleMethod got its lanes and returned DOUBLE_EXPECT; (f) CallStaticFloatMethod returned FLOAT_EXPECT; (a) glibc atof, bound with result class Fp, returned ATOF_EXPECT in v0; (p) glibc snprintf, bound through `qemu::bind` and called from the guest with a double vararg, wrote SNPRINTF_EXPECT (the `%al` row); (V) CallStaticDoubleMethodV, CallLongMethodV, CallNonvirtualIntMethodV and NewObjectV with 19 mixed arguments through a guest va_list reached the `...A` slots with each jvalue right, and their results came back; (r) a reserved slot, (l) a va_list entry with no shorty source, (g) a forged id past the table: each refused by name. Q6-4 down calls, each through `qemu::down` with the host env or vm: (o) JNI_OnLoad returned JNI_VERSION_1_6 and got the guest vm and the reserved pointer; (m) nativeMix (14 arguments, a double result) got the guest env and class and returned MIX_EXPECT; (x) nativeScale (a float result) got the guest env and class and returned SCALE_EXPECT; (R) a down call of 15 integers is refused by name in its child.
 //! Output: `qemu-jni: (x) ok` per check, `(x) FAIL <why>` otherwise, exit 0 when all pass.
 #![expect(
     clippy::disallowed_types,
@@ -23,7 +23,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 use atl_native_bridge::engine::identity::Down;
-use atl_native_bridge::engine::jni::{Class, guest_env, guest_vm};
+use atl_native_bridge::engine::jni::{Class, guest_env, guest_vm, set_method_shorty};
 use atl_native_bridge::engine::{Config, Guest, qemu};
 use object::{Object, ObjectSymbol, read::elf::ElfFile64};
 
@@ -67,7 +67,51 @@ const FORGED_SLOT: usize = 240;
 const CALLS: usize = 11;
 /// The words of `out`: fixture.c's results at 0..7; the snprintf row (`p`) takes the pool address of its binding at 8, the buffer's address at 9, its size at 11 and returns snprintf's result at 10; the atof row (`a`) takes its binding at 12 and its argument at 13 and returns the result's bits at 14.
 /// Q6-4: the down calls' records (fixture.c `qj_seen`, copied by qj_run): JNI_OnLoad's vm at 15 and reserved at 16, nativeMix's env at 17 and class at 18, nativeScale's env at 19 and class at 20.
-const OUT_WORDS: usize = 21;
+/// Q6-7: the V calls' results at 21..24 (fixture.c `qj_run`).
+const OUT_WORDS: usize = 25;
+/// Q6-7, the `...V` calls (check V): fixture.c passes V_ARGS through a va_list with method V_MID; the engine reads them by V_MID's shorty and calls these `...A` slots (jni.h order), which check each jvalue and answer their V_RET_*.
+const NEW_OBJECT_A: usize = 30;
+const CALL_LONG_METHOD_A: usize = 54;
+const CALL_NONVIRTUAL_INT_METHOD_A: usize = 81;
+const CALL_STATIC_DOUBLE_METHOD_A: usize = 140;
+/// fixture.c `V_MID`.
+const V_MID: usize = 0x7a11;
+/// One argument of fixture.c `V_ARGS`, by its JNI type.
+#[derive(Clone, Copy)]
+enum V {
+    I(i32),
+    J(i64),
+    F(f32),
+    D(f64),
+    L(usize),
+}
+/// fixture.c `V_ARGS`, in order: 10 integer-class (I, J, L) and 9 fp (F, D) arguments, so both of the va_list's register save areas run out and `__stack` holds the rest. Each value fits its type exactly (the floats are binary fractions); the longs need their upper half.
+const V_ARGS: [V; 19] = [
+    V::I(11),
+    V::D(1.25),
+    V::J(0x1_0000_0002),
+    V::F(0.5),
+    V::L(0xb01),
+    V::I(-12),
+    V::D(2.5),
+    V::J(-3),
+    V::F(1.75),
+    V::I(13),
+    V::D(3.75),
+    V::J(0x7_0000_0004),
+    V::F(2.25),
+    V::I(14),
+    V::D(4.5),
+    V::J(5),
+    V::F(3.125),
+    V::L(0xb02),
+    V::D(5.875),
+];
+/// The answers of the four `...A` slots: arbitrary values of their result types, distinct from any argument.
+const V_RET_D: f64 = 0.375;
+const V_RET_J: i64 = 0x1234_5678_9abc_def0;
+const V_RET_I: i32 = -77;
+const V_RET_OBJ: usize = 0x0b0b;
 /// The snprintf row (`p`): glibc's `snprintf("%d %.2f", 7, 2.5)` (C99 7.21.6.1: `%d` writes 7, `%.2f` writes 2.50), so the text and its length. The buffer has room for it and its NUL.
 const SNPRINTF_EXPECT: &str = "7 2.50";
 const SNP_CAP: usize = 16;
@@ -124,7 +168,7 @@ const R1_INTS: usize = 15;
 /// The refusal cases: name (`ATL_QJ_CASE`), the check letter, the value `qj_run` takes for it, and the words its named abort must carry.
 const CASES: &[(&str, char, i64, &str)] = &[
     ("reserved", 'r', REFUSE_RESERVED, "is reserved"),
-    ("valist", 'l', REFUSE_VALIST, "takes a va_list"),
+    ("valist", 'l', REFUSE_VALIST, "gave no getMethodShorty"),
     ("forged", 'g', REFUSE_FORGED, "past the env table"),
     (
         "downstack",
@@ -151,6 +195,9 @@ static FIELD_BAD: AtomicUsize = AtomicUsize::new(0);
 static SET_BITS: AtomicU64 = AtomicU64::new(0);
 static DOUBLE_BAD: AtomicUsize = AtomicUsize::new(0);
 static FLOAT_BAD: AtomicUsize = AtomicUsize::new(0);
+/// Q6-7: `...A` calls the fake got, and those with a wrong env, object, class, method or jvalue.
+static V_SEEN: AtomicUsize = AtomicUsize::new(0);
+static V_BAD: AtomicUsize = AtomicUsize::new(0);
 
 /// The fake host objects: a JNIEnv and a JavaVM, each the address of a word holding its function table (jni.h's object layout). Leaked: the process's life.
 struct Fake {
@@ -372,6 +419,80 @@ extern "C" fn release_string_utf_chars(env: usize, s: usize, chars: *const c_cha
     wrong(&STR_BAD, s != STRING || chars != STR_CHARS.as_ptr().cast());
 }
 
+/// The fake runtime's `getMethodShorty` (native_bridge.h): V_MID's shorty, result first (`D`, any type: the engine reads only the parameters), then V_ARGS's types; null for any other method.
+extern "C" fn method_shorty(env: usize, mid: usize) -> *const c_char {
+    static SHORTY: OnceLock<Vec<u8>> = OnceLock::new();
+    wrong(&V_BAD, env != fake().env);
+    if mid != V_MID {
+        return std::ptr::null();
+    }
+    SHORTY
+        .get_or_init(|| {
+            let mut s = vec![b'D'];
+            s.extend(V_ARGS.iter().map(|a| match a {
+                V::I(_) => b'I',
+                V::J(_) => b'J',
+                V::F(_) => b'F',
+                V::D(_) => b'D',
+                V::L(_) => b'L',
+            }));
+            s.push(0);
+            s
+        })
+        .as_ptr()
+        .cast()
+}
+
+/// One `...A` call: counts it, and counts it in V_BAD unless its env, object or class (0 = not passed), method and every jvalue are fixture.c's. A jvalue is 8 bytes, its member at offset 0 (jni.h union).
+fn v_call(env: usize, obj: usize, cls: usize, mid: usize, args: *const u64) {
+    V_SEEN.fetch_add(1, Ordering::Relaxed);
+    let objs = (obj == 0 || obj == OBJ) && (cls == 0 || cls == CLASS);
+    let mut bad = env != fake().env || !objs || mid != V_MID;
+    for (i, want) in V_ARGS.iter().enumerate() {
+        // SAFETY: the engine's jvalue array has one word per shorty parameter, V_ARGS.len() of them.
+        let w = unsafe { *args.add(i) };
+        bad |= match *want {
+            V::I(v) => w as u32 as i32 != v,
+            V::J(v) => w as i64 != v,
+            V::F(v) => w as u32 != v.to_bits(),
+            V::D(v) => w != v.to_bits(),
+            V::L(v) => w as usize != v,
+        };
+    }
+    wrong(&V_BAD, bad);
+}
+
+extern "C" fn call_static_double_method_a(
+    env: usize,
+    cls: usize,
+    mid: usize,
+    args: *const u64,
+) -> f64 {
+    v_call(env, 0, cls, mid, args);
+    V_RET_D
+}
+
+extern "C" fn call_long_method_a(env: usize, obj: usize, mid: usize, args: *const u64) -> i64 {
+    v_call(env, obj, 0, mid, args);
+    V_RET_J
+}
+
+extern "C" fn call_nonvirtual_int_method_a(
+    env: usize,
+    obj: usize,
+    cls: usize,
+    mid: usize,
+    args: *const u64,
+) -> i32 {
+    v_call(env, obj, cls, mid, args);
+    V_RET_I
+}
+
+extern "C" fn new_object_a(env: usize, cls: usize, mid: usize, args: *const u64) -> usize {
+    v_call(env, 0, cls, mid, args);
+    V_RET_OBJ
+}
+
 /// A table entry the fixture does not call: the route reached one the gate does not model, so the run ends here.
 extern "C" fn unimplemented() -> usize {
     println!("qemu-jni: FAIL a JNI entry the fake does not implement was called");
@@ -412,6 +533,16 @@ fn fake() -> &'static Fake {
                 CALL_STATIC_FLOAT_METHOD,
                 call_static_float_method as *const () as usize,
             ),
+            (
+                CALL_STATIC_DOUBLE_METHOD_A,
+                call_static_double_method_a as *const () as usize,
+            ),
+            (CALL_LONG_METHOD_A, call_long_method_a as *const () as usize),
+            (
+                CALL_NONVIRTUAL_INT_METHOD_A,
+                call_nonvirtual_int_method_a as *const () as usize,
+            ),
+            (NEW_OBJECT_A, new_object_a as *const () as usize),
         ] {
             env_table[slot] = f;
         }
@@ -446,6 +577,10 @@ fn started(r: Result<Guest, String>) -> u64 {
     // the guest env standing for the fake host env, made on this thread after BOOT (jni.rs `guest_env`)
     let env = guest_env(fake.env);
     let refuse = CASE.load(Ordering::Relaxed);
+    // the runtime's shorty source, as ART gives it to `initialize`; the va_list refusal case runs without one
+    if refuse != REFUSE_VALIST {
+        set_method_shorty(method_shorty);
+    }
     if refuse == REFUSE_DOWN_STACK {
         // R-1 (Q6-4): 15 integers take six host registers and nine stack words, one more than the lane image holds: the shell refuses the call by name before the guest runs it
         let mut shorty = vec![b'I'; R1_INTS + 1];
@@ -629,6 +764,25 @@ fn started(r: Result<Guest, String>) -> u64 {
                 "snprintf returned {}, wrote {printed:?}; expected {}, {SNPRINTF_EXPECT:?}",
                 out[10],
                 SNPRINTF_EXPECT.len()
+            ))
+        },
+    );
+    let v_seen = V_SEEN.load(Ordering::Relaxed);
+    let v_bad = V_BAD.load(Ordering::Relaxed);
+    let v_want = [
+        V_RET_D.to_bits() as i64,
+        V_RET_J,
+        i64::from(V_RET_I),
+        V_RET_OBJ as i64,
+    ];
+    ok &= check(
+        'V',
+        if v_seen == 4 && v_bad == 0 && out[21..25] == v_want {
+            Ok(())
+        } else {
+            Err(format!(
+                "{v_seen} A calls (expected 4), {v_bad} with a wrong env, handle or jvalue; results {:x?} (expected {v_want:x?})",
+                &out[21..25]
             ))
         },
     );
