@@ -38,6 +38,8 @@ atl-media-player = { path = "../atl-media-player" }
 atl-media-extractors = { path = "../atl-media-extractors" }
 # UI mode (lib.rs start_ui): GTK on the main thread, its GLib context mirrored into the Looper by atl-platform-ui-linux (looper.rs is the Looper seam)
 atl-platform-ui = { path = "../atl-platform-ui" }
+# the run's gralloc node (property) -> its device number, what the UI's presented buffers must carry (lib.rs start_ui)
+atl-gralloc = { path = "../atl-gralloc" }
 rustix.workspace = true
 tracing-subscriber.workspace = true
 

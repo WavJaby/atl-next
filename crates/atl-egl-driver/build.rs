@@ -35,6 +35,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("no_window_connect", "atl_egl_no_window_connect"),
     // the Blit orientation tier's copy (surface.rs `flip_into_buffer`) keeps GL's bottom-up rows: egl-driver's orientation check on that tier
     ("no_blit_flip", "atl_egl_no_blit_flip"),
+    // the wrong-device refusal (surface.rs `import`): a buffer naming another DRM device is imported anyway: egl-driver's forged-device import must then be accepted (red)
+    ("no_device_check", "atl_egl_no_device_check"),
 ];
 
 /// `ATL_EGL_TIER=<name>` selects a [`TIERS`] row: the orientation probe (driver.rs `Orientation::probe`) then reads its capability as absent, so a gate runs the baseline tier on a host that has the fast one. Not a break: green either way.

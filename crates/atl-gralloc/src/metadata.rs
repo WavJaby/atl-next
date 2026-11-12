@@ -417,6 +417,8 @@ mod tests {
             usage: 0x33,
             modifier: 0,
             id: 0x0000_04d2_0000_0007,
+            // metadata never reads the device
+            device: crate::handle::DeviceNumber(0),
         }
     }
 

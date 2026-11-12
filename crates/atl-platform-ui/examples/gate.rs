@@ -169,6 +169,7 @@ fn pattern_buffer(width: u32, height: u32, frame: u32) -> Result<([OwnedFd; 2], 
         size: d.size,
         usage: 0,
         modifier: d.modifier,
+        device: backend()?.device(),
         id: u64::from(frame),
     };
     let buffer = SceneBuffer {
@@ -475,7 +476,8 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&args.out)?;
     let deadline = Instant::now() + Duration::from_secs(args.timeout_secs);
     let looper = TestLooper::default();
-    let ui = PlatformUi::attach(Box::new(looper.clone()))?;
+    // the window imports what this gate's own GBM backend allocates
+    let ui = PlatformUi::attach(Box::new(looper.clone()), Some(backend()?.device()))?;
     let window = Rc::new(PlatformWindow::create(
         &ui,
         &WindowAttributes {

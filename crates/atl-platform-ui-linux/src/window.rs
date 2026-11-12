@@ -155,6 +155,8 @@ pub struct GtkWindow {
     text_input: GtkTextInput,
     /// The output-transform listener (outputs.rs): removed with the window, so a closed window leaves no callback behind.
     _output_follow: outputs::Follow,
+    /// The DRM device every presented buffer must come from (GtkUi's).
+    buffer_device: Option<atl_platform_ui_api::DeviceNumber>,
 }
 
 impl GtkWindow {
@@ -480,6 +482,7 @@ impl Window for GtkWindow {
         let text_input = GtkTextInput::new(&view);
         let this = GtkWindow {
             _output_follow: output_follow,
+            buffer_device: ui.buffer_device,
             window,
             view,
             requested: Cell::new(attributes.size),
@@ -551,7 +554,8 @@ impl Window for GtkWindow {
     }
 
     fn present(&self, scene: &Scene) -> Result<(), PresentError> {
-        let (node, shown) = scene::build(&WidgetExt::display(&self.window), scene)?;
+        let (node, shown) =
+            scene::build(&WidgetExt::display(&self.window), scene, self.buffer_device)?;
         self.view.show_node(node);
         // a buffer still in the new scene stays shown; the rest is retired until the paint that stops drawing it
         let old = std::mem::replace(&mut *self.shared.shown.borrow_mut(), shown);

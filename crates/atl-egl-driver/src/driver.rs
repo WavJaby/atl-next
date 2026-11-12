@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use anyhow::{Context as _, Result, anyhow, bail};
 use atl_egl_host::{Device, Display, Host};
 use atl_gralloc::format::{self, RGBA_8888, RGBX_8888};
+use atl_gralloc::handle::DeviceNumber;
 use atl_gralloc::node::{self, NodeSource};
 
 use crate::abi::egl as e;
@@ -174,6 +175,8 @@ pub struct Driver {
     pub seen_contexts: Mutex<HashSet<usize>>,
     /// The device rendered on: its render node / DRM file, or `software`.
     device: String,
+    /// The st_rdev every imported buffer must carry: gralloc's node, whose EGL device this is (on the software fallback of the trial tier: the allocation-only node, vgem, the software device maps its buffers).
+    pub buffer_device: DeviceNumber,
     renderer_logged: AtomicBool,
 }
 
@@ -204,7 +207,7 @@ pub fn get() -> Option<&'static Driver> {
 impl Driver {
     fn load() -> Result<Self> {
         let host = Host::load()?;
-        let (display, device) = choose_display(&host)?;
+        let (display, device, buffer_device) = choose_display(&host)?;
         let (orientation, tier) = {
             // GL extensions need a current context: a throwaway one, released before any app context exists (the driver loads on the first eglGetDisplay)
             let ctx = display.create_context()?;
@@ -238,6 +241,7 @@ impl Driver {
             surfaces: Mutex::new(HashMap::new()),
             seen_contexts: Mutex::new(HashSet::new()),
             device,
+            buffer_device,
             renderer_logged: AtomicBool::new(false),
         })
     }
@@ -396,7 +400,8 @@ mod tests {
 }
 
 /// The EGL device of the node atld named (atl_gralloc::node): on the display tier exactly that node's device, else an error naming it; on the trial tier that node's device, else the software device (a node that only allocates, vgem).
-fn choose_display(host: &Arc<Host>) -> Result<(Display, String)> {
+/// Also the node's st_rdev: what every buffer this driver imports must carry, on every tier.
+fn choose_display(host: &Arc<Host>) -> Result<(Display, String, DeviceNumber)> {
     let get = |name: &str| {
         property(name)?.with_context(|| {
             format!(
@@ -408,8 +413,10 @@ fn choose_display(host: &Arc<Host>) -> Result<(Display, String)> {
     let source = get(node::NODE_SOURCE_PROPERTY)?;
     let source = NodeSource::parse(&source)
         .with_context(|| format!("{}={source}: unknown", node::NODE_SOURCE_PROPERTY))?;
-    if let Some(on_node) = host.display_on_node(&node)? {
-        return Ok(on_node);
+    let rdev = node::device_number(std::path::Path::new(&node))
+        .with_context(|| format!("gralloc's node {node}"))?;
+    if let Some((display, name)) = host.display_on_node(&node)? {
+        return Ok((display, name, rdev));
     }
     match source {
         NodeSource::Display => {
@@ -424,7 +431,7 @@ fn choose_display(host: &Arc<Host>) -> Result<(Display, String)> {
                 .with_context(|| {
                     format!("no EGL device on gralloc's node {node} and no software device")
                 })?;
-            Ok((software.display()?, "software".to_owned()))
+            Ok((software.display()?, "software".to_owned(), rdev))
         }
     }
 }

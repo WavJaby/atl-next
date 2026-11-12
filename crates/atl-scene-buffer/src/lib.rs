@@ -9,7 +9,7 @@ use std::os::fd::BorrowedFd;
 
 use atl_compositor::scene::{SceneBuffer, SceneFd};
 use atl_gralloc::format::{self, COMPONENT_A, DRM_FORMAT_MOD_LINEAR, RGBA_8888, RGBX_8888};
-use atl_gralloc::handle::FD_DMABUF;
+use atl_gralloc::handle::{DeviceNumber, FD_DMABUF, Params, wrong_device_refusals};
 use atl_gralloc::layout::Layout;
 use atl_gralloc_dmabuf::{Mapping, SYNC_READ, begin_cpu_access, end_cpu_access};
 use rustix::event::{PollFd, PollFlags, poll};
@@ -61,10 +61,14 @@ pub struct DmabufView<'a> {
 }
 
 impl<'a> DmabufView<'a> {
-    /// The view of `buffer`, whose handle came from another process: its ints are validated as the mapper's import does, and each plane fd must exist.
-    pub fn of(buffer: &'a SceneBuffer) -> Result<Self, String> {
-        let layout = atl_gralloc::layout::from_handle(buffer.fds.len(), &buffer.ints)
+    /// The view of `buffer`, whose handle came from another process, for an import onto the DRM device `importer` (the run's gralloc node): its ints are validated as the mapper's import does, a buffer of another device is refused by name (counted, Params::check_device), and each plane fd must exist.
+    pub fn of(buffer: &'a SceneBuffer, importer: DeviceNumber) -> Result<Self, String> {
+        let params = Params::from_handle(buffer.fds.len(), &buffer.ints)
             .map_err(|e| format!("not a gralloc handle: {e:?}"))?;
+        params
+            .check_device(importer)
+            .map_err(|e| format!("{e} (refusals {})", wrong_device_refusals()))?;
+        let layout = params.layout();
         let fds = layout
             .planes
             .iter()
@@ -207,11 +211,15 @@ mod tests {
             usage: 0,
             modifier: DRM_FORMAT_MOD_LINEAR,
             id: 7,
+            device: D128,
         };
         let mut b = buffer(&dmabuf, 16, 2, 16);
         b.fds.push(SceneFd::new(page.as_raw_fd()));
         b.ints = params.to_ints().to_vec();
-        let v = DmabufView::of(&b).expect("view");
+        // the presenter on another DRM device: refused by name, both numbers in the reason
+        let e = DmabufView::of(&b, D129).expect_err("wrong device");
+        assert!(e.contains("226:128") && e.contains("226:129"), "{e}");
+        let v = DmabufView::of(&b, D128).expect("view");
         assert_eq!(v.fds.len(), 1);
         assert_eq!(v.fds[0].as_raw_fd(), dmabuf.as_raw_fd());
         assert_eq!(v.layout.planes[0].stride_bytes, 80);
@@ -221,8 +229,12 @@ mod tests {
             (DRM_FORMAT_ABGR8888, DRM_FORMAT_MOD_LINEAR)
         );
         b.ints[0] = 0;
-        assert!(DmabufView::of(&b).is_err(), "foreign magic");
+        assert!(DmabufView::of(&b, D128).is_err(), "foreign magic");
     }
+
+    // glibc makedev(226, 128) / (226, 129): (major << 8) | minor below 4096:256
+    const D128: DeviceNumber = DeviceNumber(0xe280);
+    const D129: DeviceNumber = DeviceNumber(0xe281);
 
     /// A gralloc handle naming a tiled modifier is refused by name; the same handle with LINEAR reads.
     #[test]
@@ -242,6 +254,7 @@ mod tests {
             // NVIDIA block-linear (gralloc-modifiers S1)
             modifier: 0x0300_0000_00e0_8014,
             id: 7,
+            device: D128,
         };
         let mut b = buffer(&dmabuf, 2, 2, 2);
         b.fds.push(SceneFd::new(page.as_raw_fd()));

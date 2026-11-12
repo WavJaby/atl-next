@@ -15,7 +15,7 @@ pub const NUM_FDS: usize = 2;
 /// 'ATLG'.
 const MAGIC: i32 = i32::from_le_bytes(*b"ATLG");
 /// Bumped when the int layout changes; an importer of another version refuses the handle.
-const VERSION: i32 = 1;
+const VERSION: i32 = 2;
 
 // int indices
 const I_MAGIC: usize = 0;
@@ -29,8 +29,78 @@ const I_SIZE: usize = 7; // lo, hi
 const I_USAGE: usize = 9; // lo, hi
 const I_MODIFIER: usize = 11; // lo, hi
 const I_ID: usize = 13; // lo, hi
+const I_DEVICE: usize = 15;
 /// `native_handle_t::numInts`.
-pub const NUM_INTS: usize = 15;
+pub const NUM_INTS: usize = 16;
+// build-time layout check: indices dense, in order, the last field ends at NUM_INTS
+const _: () = assert!(
+    I_VERSION == I_MAGIC + 1
+        && I_WIDTH == I_VERSION + 1
+        && I_HEIGHT == I_WIDTH + 1
+        && I_PIXEL_FORMAT == I_HEIGHT + 1
+        && I_FOURCC == I_PIXEL_FORMAT + 1
+        && I_PITCH == I_FOURCC + 1
+        && I_SIZE == I_PITCH + 1
+        && I_USAGE == I_SIZE + 2
+        && I_MODIFIER == I_USAGE + 2
+        && I_ID == I_MODIFIER + 2
+        && I_DEVICE == I_ID + 2
+        && NUM_INTS == I_DEVICE + 1
+);
+
+/// A DRM node's device number as `stat` reports it (`st_rdev`, glibc/bionic encoding). One handle int: the kernel's dev_t is 32 bits (12-bit major, 20-bit minor), and the libc encoding of such a number stays below 2^32.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DeviceNumber(pub u32);
+
+impl DeviceNumber {
+    /// From `st_rdev`; None past 32 bits (no kernel device number encodes there).
+    pub fn from_rdev(rdev: u64) -> Option<Self> {
+        u32::try_from(rdev).ok().map(Self)
+    }
+
+    /// glibc `gnu_dev_major` restricted to 32 bits.
+    pub fn major(self) -> u32 {
+        (self.0 >> 8) & 0xfff
+    }
+
+    /// glibc `gnu_dev_minor` restricted to 32 bits.
+    pub fn minor(self) -> u32 {
+        (self.0 & 0xff) | ((self.0 >> 12) & 0xf_ff00)
+    }
+}
+
+impl std::fmt::Display for DeviceNumber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.major(), self.minor())
+    }
+}
+
+/// A buffer allocated on another DRM device than the one importing it: refused before any EGL/GL call ([`Params::check_device`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WrongDevice {
+    pub buffer: DeviceNumber,
+    pub importer: DeviceNumber,
+}
+
+impl std::fmt::Display for WrongDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "buffer allocated on DRM device {}, importer's device is {}: cross-device import refused",
+            self.buffer, self.importer
+        )
+    }
+}
+
+impl std::error::Error for WrongDevice {}
+
+/// Wrong-device refusals of this process ([`Params::check_device`]).
+static WRONG_DEVICE_REFUSALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many imports this process refused for a device mismatch.
+pub fn wrong_device_refusals() -> u64 {
+    WRONG_DEVICE_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// What the allocator decided about one buffer, as the handle's ints carry it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +119,8 @@ pub struct Params {
     pub modifier: u64,
     /// Unique among live buffers of the system: allocator pid << 32 | its counter.
     pub id: u64,
+    /// The DRM node the allocator allocated on (allocation-only tier, WSL vgem: vgem's card node; the importer compares with the run's node, which is that same node).
+    pub device: DeviceNumber,
 }
 
 /// Why a handle is not one of ours.
@@ -112,7 +184,20 @@ impl Params {
         v[I_USAGE..I_USAGE + 2].copy_from_slice(&split(self.usage));
         v[I_MODIFIER..I_MODIFIER + 2].copy_from_slice(&split(self.modifier));
         v[I_ID..I_ID + 2].copy_from_slice(&split(self.id));
+        v[I_DEVICE] = self.device.0 as i32;
         v
+    }
+
+    /// Every import onto a device goes through here first: the buffer must come from `importer`, the node whose device imports it. A mismatch is refused by name and counted ([`wrong_device_refusals`]) instead of failing later inside EGL/GL.
+    pub fn check_device(&self, importer: DeviceNumber) -> Result<(), WrongDevice> {
+        if self.device == importer {
+            return Ok(());
+        }
+        WRONG_DEVICE_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Err(WrongDevice {
+            buffer: self.device,
+            importer,
+        })
     }
 
     /// Parses and validates the ints of a handle with `num_fds` fds. A handle crosses processes, so the importer trusts none of it: layout and consistency are checked here once.
@@ -136,6 +221,7 @@ impl Params {
             usage: join(ints[I_USAGE], ints[I_USAGE + 1]),
             modifier: join(ints[I_MODIFIER], ints[I_MODIFIER + 1]),
             id: join(ints[I_ID], ints[I_ID + 1]),
+            device: DeviceNumber(ints[I_DEVICE] as u32),
         };
         let f = format::lookup(p.pixel_format).ok_or(HandleError::Inconsistent("pixel format"))?;
         if p.fourcc != f.fourcc {
@@ -170,8 +256,14 @@ mod tests {
             usage: 0x1_0000_0033,
             modifier: 0,
             id: (1234u64 << 32) | 7,
+            device: RENDER_D128,
         }
     }
+
+    // glibc makedev(226, 128) = (226 << 8) | 128 = 0xe280 (major < 4096, minor < 256: no high bits)
+    const RENDER_D128: DeviceNumber = DeviceNumber(0xe280);
+    // makedev(226, 129)
+    const RENDER_D129: DeviceNumber = DeviceNumber(0xe281);
 
     #[test]
     fn round_trip_including_64_bit_halves() {
@@ -181,6 +273,36 @@ mod tests {
         // usage 0x1_0000_0033: lo 0x33, hi 1; id lo 7, hi 1234
         assert_eq!((ints[I_USAGE], ints[I_USAGE + 1]), (0x33, 1));
         assert_eq!((ints[I_ID], ints[I_ID + 1]), (7, 1234));
+        assert_eq!(ints[I_DEVICE], 0xe280);
+    }
+
+    #[test]
+    fn device_number_splits_like_glibc() {
+        assert_eq!((RENDER_D128.major(), RENDER_D128.minor()), (226, 128));
+        assert_eq!(RENDER_D129.to_string(), "226:129");
+        // makedev(4095, 0xfffff): major bits 8..19, minor low byte 0..7 + its bits 8..19 at 20..31 = 0xffffffff
+        let max = DeviceNumber(0xffff_ffff);
+        assert_eq!((max.major(), max.minor()), (0xfff, 0xf_ffff));
+        assert_eq!(DeviceNumber::from_rdev(1 << 32), None);
+        assert_eq!(DeviceNumber::from_rdev(0xe280), Some(RENDER_D128));
+    }
+
+    #[test]
+    fn wrong_device_is_refused_by_name_and_counted() {
+        let p = sample();
+        assert_eq!(p.check_device(RENDER_D128), Ok(()));
+        let before = wrong_device_refusals();
+        let err = p.check_device(RENDER_D129).unwrap_err();
+        assert_eq!(
+            err,
+            WrongDevice {
+                buffer: RENDER_D128,
+                importer: RENDER_D129
+            }
+        );
+        assert!(err.to_string().contains("226:128") && err.to_string().contains("226:129"));
+        // other tests may run in parallel: at least ours
+        assert!(wrong_device_refusals() > before);
     }
 
     #[test]
@@ -212,7 +334,7 @@ mod tests {
         v[I_MAGIC] = 0;
         assert_eq!(Params::from_handle(NUM_FDS, &v), Err(HandleError::Foreign));
         let mut v = good;
-        v[I_VERSION] = 2;
+        v[I_VERSION] = VERSION + 1;
         assert_eq!(Params::from_handle(NUM_FDS, &v), Err(HandleError::Foreign));
         for (idx, val, why) in [
             (I_PIXEL_FORMAT, 4, "pixel format"),

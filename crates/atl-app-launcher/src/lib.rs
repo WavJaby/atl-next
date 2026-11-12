@@ -83,7 +83,7 @@ mod generated {
 
 use std::path::Path;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use atl_platform_ui::Ui;
 
 /// The compositor's threads: attached to the VM, as a binder thread is.
@@ -173,9 +173,16 @@ fn load_media_extractors() {}
 
 /// Step 5b''. UI mode (`ro.atl.ui=gtk`, atld `--ui gtk`): the main thread's Looper is made before Java (its MessageQueue adopts it), then GTK starts on this thread with its GLib main context mirrored
 /// into the Looper (atl-platform-ui-linux `mirror`, over the `looper` seam), so GTK runs while the app's main thread idles in its Looper and a blocked one answers no ping.
-fn start_ui() -> Result<atl_platform_ui::PlatformUi> {
+/// `gralloc_node`: the run's node (`ro.atl.gpu.render_node`), whose device number every presented buffer must carry; unset: no gralloc, the window refuses every buffer.
+fn start_ui(gralloc_node: Option<String>) -> Result<atl_platform_ui::PlatformUi> {
+    let device = gralloc_node
+        .map(|n| {
+            atl_gralloc::node::device_number(std::path::Path::new(&n))
+                .with_context(|| format!("gralloc node {n}"))
+        })
+        .transpose()?;
     let thread_looper = ffi::LooperApi::load()?.prepare_looper()?;
-    atl_platform_ui::PlatformUi::attach(Box::new(looper::AndroidLooper::new(thread_looper)))
+    atl_platform_ui::PlatformUi::attach(Box::new(looper::AndroidLooper::new(thread_looper)), device)
         .map_err(|e| anyhow!("{e}"))
 }
 
@@ -246,7 +253,9 @@ fn run() -> Result<i32> {
         android.attach(&vm)?;
         android.start_thread_pool();
         let ui = if rt.property(c"ro.atl.ui").as_deref() == Some("gtk") {
-            start_ui()
+            std::ffi::CString::new(atl_gralloc::node::RENDER_NODE_PROPERTY)
+                .map_err(anyhow::Error::from)
+                .and_then(|name| start_ui(rt.property(&name)))
                 .inspect_err(|e| {
                     use std::io::Write;
                     let _ = writeln!(std::io::stderr(), "atl-app-launcher: no UI mode: {e:#}");

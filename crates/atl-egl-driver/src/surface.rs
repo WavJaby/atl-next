@@ -405,7 +405,18 @@ fn wait(fence: &OwnedFd) -> Result<(), EglError> {
 }
 
 /// Imports one gralloc buffer (the handle's dma-buf, single plane) as a host EGLImage.
+/// A buffer from another DRM device than gralloc's node is refused here, before EGL sees it: EGL_BAD_MATCH, logged with both device numbers, counted (atl_gralloc::handle::wrong_device_refusals).
 pub fn import(d: &'static Driver, p: &Params, fd: i32) -> Result<Image<'static>, EglError> {
+    // the `no_device_check` break (build.rs `BREAKS`): every buffer is imported whatever device it names, as before the check
+    if !cfg!(atl_egl_no_device_check)
+        && let Err(err) = p.check_device(d.buffer_device)
+    {
+        log(&format!(
+            "import: {err} (refusals {}), EGL_BAD_MATCH",
+            atl_gralloc::handle::wrong_device_refusals()
+        ));
+        return Err(e::EGL_BAD_MATCH);
+    }
     // SAFETY: `fd` is the handle's dma-buf, open while the buffer lives, which outlasts this call (the caller holds the buffer).
     let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
     d.display

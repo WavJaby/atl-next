@@ -373,6 +373,7 @@ fn window(alloc: Option<&Path>) -> Result<Box<TestWindow>> {
             usage: checked.usage,
             modifier: buf.modifier,
             id: (u64::from(std::process::id()) << 32) | (i as u64 + 1),
+            device: backend.device(),
         };
         // native_handle_t: version = sizeof(native_handle_t) (3 ints), numFds, numInts, then data
         let mut h = vec![
@@ -680,8 +681,69 @@ fn run(args: &Args) -> Result<()> {
             egl_fail("eglMakeCurrent(none)")
         );
         ensure!(destroy(dpy, surface) != 0, egl_fail("eglDestroySurface"));
+        wrong_device(&drv, dpy, &win)?;
     }
     judge(&win)
+}
+
+/// eglCreateImageKHR(EGL_NATIVE_BUFFER_ANDROID) of slot 0 as allocated must give an image; the same buffer with its handle's device int changed (another DRM device) must give none, error EGL_BAD_MATCH (surface.rs `import`).
+/// # Safety
+/// `dpy` is the driver's initialised display.
+unsafe fn wrong_device(drv: &Loaded, dpy: e::EGLDisplay, win: &TestWindow) -> Result<()> {
+    let from_drv = |name: &CStr| drv.entry(name);
+    let create = entry!(from_drv, c"eglCreateImageKHR", e::eglCreateImageKHR);
+    let destroy = entry!(from_drv, c"eglDestroyImageKHR", e::eglDestroyImageKHR);
+    let egl_error = entry!(from_drv, c"eglGetError", e::eglGetError);
+    let slot = &win.slots[0];
+    let try_import = |buffer: &w::ANativeWindowBuffer| {
+        // SAFETY: `buffer` and its handle stay alive across each call; the driver takes no reference past eglDestroyImageKHR.
+        unsafe {
+            let image = create(
+                dpy,
+                std::ptr::null_mut(),
+                e::EGL_NATIVE_BUFFER_ANDROID as u32,
+                std::ptr::from_ref(buffer).cast_mut().cast(),
+                std::ptr::null(),
+            );
+            let err = egl_error();
+            if !image.is_null() {
+                destroy(dpy, image);
+            }
+            (!image.is_null(), err)
+        }
+    };
+    let (ok, err) = try_import(&slot.buffer);
+    ensure!(ok, "own-device import refused: EGL error {err:#x}");
+    // the handle as the window holds it: header (3 ints), fds, then the ints
+    // SAFETY: `handle` points at the slot's boxed native_handle_t of 3 + NUM_FDS + NUM_INTS ints.
+    let own = unsafe {
+        std::slice::from_raw_parts(slot.buffer.handle.cast::<i32>(), 3 + NUM_FDS + NUM_INTS)
+    };
+    let mut p = Params::from_handle(NUM_FDS, &own[3 + NUM_FDS..])
+        .map_err(|e| anyhow!("own handle: {e}"))?;
+    // a device number no node of this host has: one past the allocating node's minor
+    p.device = atl_gralloc::handle::DeviceNumber(p.device.0 + 1);
+    let mut forged = own[..3 + NUM_FDS].to_vec();
+    forged.extend(p.to_ints());
+    let forged_buffer = w::ANativeWindowBuffer {
+        handle: forged.as_ptr().cast(),
+        ..*slot.buffer
+    };
+    let (ok, err) = try_import(&forged_buffer);
+    ensure!(
+        !ok,
+        "wrong-device import accepted: handle names device {}, the driver's node is another",
+        p.device
+    );
+    ensure!(
+        err == e::EGL_BAD_MATCH,
+        "wrong-device import refused with EGL error {err:#x}, want EGL_BAD_MATCH"
+    );
+    out(&format!(
+        "wrong-device import refused (device {})",
+        p.device
+    ));
+    Ok(())
 }
 
 // ---- the verdict ----

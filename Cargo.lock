@@ -109,6 +109,7 @@ dependencies = [
  "atl-bridgegen",
  "atl-codec-store",
  "atl-composer",
+ "atl-gralloc",
  "atl-media-extractors",
  "atl-media-player",
  "atl-platform-ui",
@@ -527,6 +528,7 @@ name = "atl-platform-ui-api"
 version = "0.0.0"
 dependencies = [
  "atl-compositor",
+ "atl-gralloc",
  "atl-platform-types",
  "thiserror",
 ]

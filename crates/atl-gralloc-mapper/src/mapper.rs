@@ -135,7 +135,7 @@ impl Mapper {
         let mut h = vec![0i32; HANDLE_HEADER_INTS + handle::NUM_FDS + handle::NUM_INTS];
         h[0] = i32::try_from(HANDLE_HEADER_INTS * 4).expect("12");
         h[1] = i32::try_from(handle::NUM_FDS).expect("2");
-        h[2] = i32::try_from(handle::NUM_INTS).expect("15");
+        h[2] = i32::try_from(handle::NUM_INTS).expect("a few ints");
         h[HANDLE_HEADER_INTS + handle::FD_DMABUF] = dmabuf.as_raw_fd();
         h[HANDLE_HEADER_INTS + handle::FD_PAGE] = page_fd.as_raw_fd();
         h[HANDLE_HEADER_INTS + handle::NUM_FDS..].copy_from_slice(ints);
@@ -353,6 +353,8 @@ mod tests {
             usage: 0x33, // CPU_READ_OFTEN | CPU_WRITE_OFTEN as the nibbles: read 3, write 3 << 4
             modifier: 0,
             id: 42,
+            // the mapper maps on the CPU, imports onto no device: it never compares the device
+            device: atl_gralloc::handle::DeviceNumber(0),
         }
     }
 
@@ -429,7 +431,8 @@ mod tests {
         assert!(m.is_empty());
 
         let key = m.import(&[b.as_fd(), pg.as_fd()], &ints).expect("import");
-        assert_eq!(m.transport_size(key), Ok((2, 15)));
+        // handle layout v2: 2 fds, 16 ints (15 of v1 + the device number)
+        assert_eq!(m.transport_size(key), Ok((2, 16)));
         assert_eq!(m.free(key), Ok(()));
         assert_eq!(m.free(key), Err(Error::BadBuffer));
         assert_eq!(m.transport_size(key), Err(Error::BadBuffer));
@@ -442,7 +445,7 @@ mod tests {
         let p = params();
         let key = import(&m, &p);
         let b = m.find(key).expect("find");
-        assert_eq!(&b.handle[..3], &[12, 2, 15]);
+        assert_eq!(&b.handle[..3], &[12, 2, 16]);
         assert_eq!(b.handle[3], b.dmabuf.as_raw_fd());
         assert_eq!(&b.handle[5..], &p.to_ints());
         assert_ne!(b.handle[3], b.handle[4]);

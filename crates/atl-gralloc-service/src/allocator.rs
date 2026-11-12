@@ -185,6 +185,7 @@ impl Allocator {
                 usage: d.usage,
                 modifier: dmabuf.modifier,
                 id,
+                device: self.backend.device(),
             },
         })
     }
@@ -244,5 +245,10 @@ mod tests {
             Ok(x.params)
         );
         assert_eq!(x.params.pixel_stride(), x.params.pitch / 4);
+        // the handle names the node it came from (st_rdev, independent of the backend's own record)
+        let rdev = std::os::unix::fs::MetadataExt::rdev(
+            &std::fs::metadata(a.backend.node()).expect("node"),
+        );
+        assert_eq!(u64::from(x.params.device.0), rdev);
     }
 }

@@ -18,6 +18,7 @@ use atl_gralloc::descriptor::{Checked, Descriptor};
 use atl_gralloc::format::{
     BLOB, BLOB_ROW_BYTES, DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR, RGBA_8888,
 };
+use atl_gralloc::handle::DeviceNumber;
 use atl_gralloc::usage;
 use gbm::{BufferObjectFlags, Device, Format, Modifier};
 use rustix::fs::{SeekFrom, seek};
@@ -127,6 +128,8 @@ pub struct Backend {
     tx: Option<Sender<Request>>,
     thread: Option<JoinHandle<()>>,
     node: PathBuf,
+    /// `node`'s st_rdev: every handle carries it.
+    device: DeviceNumber,
     counters: Arc<Counters>,
 }
 
@@ -279,12 +282,17 @@ impl Backend {
             })
             .map_err(|e| BackendError::Alloc(format!("starting the GBM thread: {e}")))?;
         match ready_rx.recv() {
-            Ok(Ok(node)) => Ok(Self {
-                tx: Some(tx),
-                thread: Some(thread),
-                node,
-                counters,
-            }),
+            Ok(Ok(node)) => {
+                let device = atl_gralloc::node::device_number(&node)
+                    .map_err(|e| BackendError::NoNode(vec![e.to_string()]))?;
+                Ok(Self {
+                    tx: Some(tx),
+                    thread: Some(thread),
+                    node,
+                    device,
+                    counters,
+                })
+            }
             Ok(Err(e)) => {
                 let _ = thread.join();
                 Err(e)
@@ -296,6 +304,11 @@ impl Backend {
     /// The node the backend allocates from.
     pub fn node(&self) -> &Path {
         &self.node
+    }
+
+    /// The node's device number (st_rdev), as every handle of this backend carries it.
+    pub fn device(&self) -> DeviceNumber {
+        self.device
     }
 
     /// The backend's fallback counters.

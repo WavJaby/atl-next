@@ -13,6 +13,8 @@ use std::os::fd::{OwnedFd, RawFd};
 
 pub mod audio;
 pub use atl_compositor::scene::Scene;
+/// The DRM device a buffer was allocated on (gralloc handle): what [`Ui::attach`] is told the presented buffers must carry.
+pub use atl_gralloc::handle::DeviceNumber;
 /// The value types the host side shares (a window's monitor is the same type atld reads).
 pub use atl_platform_types::{Monitor, PhysSize, Rotation, Scale};
 
@@ -79,7 +81,11 @@ pub trait Ui: Sized {
     type Invoker: UiInvoker;
 
     /// Starts the toolkit on the calling thread, which becomes the UI thread, and registers the fds its main loop waits on with `looper`. Called once, when the thread's Looper is prepared and before Java adopts it; never per window.
-    fn attach(looper: Box<dyn Looper>) -> Result<Self, UiError>;
+    /// `buffer_device`: the run's gralloc node (st_rdev); every presented buffer must have been allocated there, others are refused by name. None (no gralloc in this process): every buffer is refused.
+    fn attach(
+        looper: Box<dyn Looper>,
+        buffer_device: Option<DeviceNumber>,
+    ) -> Result<Self, UiError>;
 
     /// A handle that runs closures on this UI thread, from any thread.
     fn invoker(&self) -> Self::Invoker;

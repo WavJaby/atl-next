@@ -31,6 +31,25 @@ impl NodeSource {
     }
 }
 
+/// The device number of DRM node `path` (`st_rdev`): what the allocator writes into every handle and what an importer compares it with (handle::Params::check_device). Not a character device, or a number past 32 bits: an error naming the path.
+pub fn device_number(path: &std::path::Path) -> std::io::Result<crate::handle::DeviceNumber> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let meta = std::fs::metadata(path)?;
+    if !meta.file_type().is_char_device() {
+        return Err(std::io::Error::other(format!(
+            "{}: not a character device",
+            path.display()
+        )));
+    }
+    crate::handle::DeviceNumber::from_rdev(meta.rdev()).ok_or_else(|| {
+        std::io::Error::other(format!(
+            "{}: device number {:#x} past 32 bits",
+            path.display(),
+            meta.rdev()
+        ))
+    })
+}
+
 /// What `atl-egl-probe --display-node` prints and atld reads: `<prefix> node=<path>|none renderer=<GL_RENDERER>`.
 pub const DISPLAY_LINE: &str = "gpu-probe:";
 /// The `node=` value when the display's device has no render node.

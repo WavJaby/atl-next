@@ -2,7 +2,7 @@
 //! `xtask test egl-driver`: the GLES driver over the host's system EGL (crate atl-egl-driver, `libGLES_atl.so`) rendering into an ANativeWindow, every pixel checked, orientation included (atl-egl-driver-probe's module doc has the scenario and the judge).
 //! Runs on this host's own EGL: llvmpipe on WSL, the GPU of gralloc's node on a desktop. No native build and no slot: the driver and the probe are plain cargo outputs (in --out).
 //! Two runs, one per orientation tier (driver.rs `Orientation`): the driver as built for this host (its probe picks the tier, logged), then built with `ATL_EGL_TIER=blit` (the baseline, forced through the probe's input). Both must pass.
-//! Breaks, each must fail: `fbo0` on both (framebuffer entries from the host, not the driver: framebuffer 0 is not the window); on a FlipY run `flip-y` (the surface FBO's flip-y undone: the frame stored upside down); on a Blit run the driver break `no_blit_flip` (the swap's copy not inverted).
+//! Breaks, each must fail: `fbo0` on both (framebuffer entries from the host, not the driver: framebuffer 0 is not the window); on a FlipY run `flip-y` (the surface FBO's flip-y undone: the frame stored upside down); on a Blit run the driver break `no_blit_flip` (the swap's copy not inverted); once, the driver break `no_device_check` (a buffer whose handle names another DRM device is imported).
 //! On another host: copy `<out>/<host|blit>/egl/libGLES_atl.so` and the probe (`<out>/cargo/release/atl-egl-driver-probe`) and run `atl-egl-driver-probe --driver libGLES_atl.so [--break flip-y|fbo0]`; the probe links no workspace library dynamically.
 
 use std::path::{Path, PathBuf};
@@ -105,7 +105,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
         control("fbo0", go(&driver, Some("fbo0"))?, "FAIL")?;
     }
-    println!("egl-driver: ok (both tiers; controls: flip-y or no_blit_flip, fbo0 red)");
+    // the wrong-device refusal is tier-independent: one break run on the host build
+    let broken = stage("host-no-device-check", None, Some("no_device_check"))?;
+    control("no_device_check", go(&broken, None)?, WRONG_DEVICE_RED)?;
+    println!(
+        "egl-driver: ok (both tiers; controls: flip-y or no_blit_flip, fbo0, no_device_check red)"
+    );
     Ok(ExitCode::SUCCESS)
 }
 
@@ -115,6 +120,8 @@ const BREAK_ENV: &str = "ATL_EGL_BREAK";
 /// The driver's one stderr line naming the tier that ran (driver.rs `Driver::load`).
 const TIER_LINE: &str = "libGLES_atl: window tier ";
 const ORIENTATION_RED: &str = "orientation red";
+/// The probe's failure when the driver imports a buffer naming another DRM device (atl-egl-driver-probe `wrong_device`).
+const WRONG_DEVICE_RED: &str = "wrong-device import accepted";
 
 /// The value of `ro.hardware.egl` that selects the driver: Loader.cpp opens `libGLES_<value>.so` in the driver dir.
 const HARDWARE: &str = "atl";

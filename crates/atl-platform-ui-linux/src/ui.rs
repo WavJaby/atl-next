@@ -7,7 +7,7 @@
 use std::marker::PhantomData;
 use std::thread::{self, ThreadId};
 
-use atl_platform_ui_api::{Looper, Ui, UiError, UiInvoker};
+use atl_platform_ui_api::{DeviceNumber, Looper, Ui, UiError, UiInvoker};
 use gtk4::glib;
 
 use crate::mirror;
@@ -15,6 +15,8 @@ use crate::mirror;
 /// The session: GTK initialised on this thread, whose GLib main context the thread's Looper polls. Not `Send`: it must stay on the UI thread.
 pub struct GtkUi {
     thread: ThreadId,
+    /// The DRM device presented buffers must come from ([`Ui::attach`]).
+    pub(crate) buffer_device: Option<DeviceNumber>,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -45,7 +47,10 @@ impl Ui for GtkUi {
         GtkInvoker(glib::MainContext::default())
     }
 
-    fn attach(looper: Box<dyn Looper>) -> Result<Self, UiError> {
+    fn attach(
+        looper: Box<dyn Looper>,
+        buffer_device: Option<DeviceNumber>,
+    ) -> Result<Self, UiError> {
         gtk4::init().map_err(|e| UiError::Unavailable(e.to_string()))?;
         // GTK may have been started by another thread earlier in this process: that thread owns it, this one cannot
         if !gtk4::is_initialized_main_thread() {
@@ -54,6 +59,7 @@ impl Ui for GtkUi {
         mirror::install(looper)?;
         Ok(GtkUi {
             thread: thread::current().id(),
+            buffer_device,
             _not_send: PhantomData,
         })
     }

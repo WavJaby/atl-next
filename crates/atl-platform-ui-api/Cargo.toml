@@ -13,6 +13,7 @@ publish.workspace = true
 
 [dependencies]
 atl-compositor = { path = "../atl-compositor" }
+atl-gralloc = { path = "../atl-gralloc" }
 atl-platform-types = { path = "../atl-platform-types" }
 thiserror.workspace = true
 

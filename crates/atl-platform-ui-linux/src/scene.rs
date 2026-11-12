@@ -8,7 +8,7 @@ use std::os::fd::OwnedFd;
 
 use atl_compositor::scene::{Content, Quad, Scene};
 use atl_libgui_parcel::state::FloatRect;
-use atl_platform_ui_api::PresentError;
+use atl_platform_ui_api::{DeviceNumber, PresentError};
 use atl_scene_buffer::DmabufView;
 use gtk4::prelude::*;
 use gtk4::{gdk, graphene, gsk};
@@ -53,6 +53,7 @@ const CLOCKWISE_QUARTER_TURN_DEGREES: f32 = 90.0;
 /// The node of one quad, `None` when nothing of it shows (empty rectangles, scissored away); a buffer quad's buffer is added to `shown`.
 fn quad_node(
     display: &gdk::Display,
+    device: Option<DeviceNumber>,
     quad: &Quad,
     shown: &mut Vec<Shown>,
 ) -> Result<Option<gsk::RenderNode>, PresentError> {
@@ -79,7 +80,10 @@ fn quad_node(
     let Some(visible_rect) = visible(&quad.dst, quad.clip.as_ref()) else {
         return Ok(None);
     };
-    let view = DmabufView::of(&b.buffer).map_err(fail)?;
+    let device = device.ok_or_else(|| {
+        fail("no gralloc node in this process: no DRM device to import onto".to_owned())
+    })?;
+    let view = DmabufView::of(&b.buffer, device).map_err(fail)?;
     let texture = dmabuf::texture(display, &view, b.opaque).map_err(fail)?;
     let first = view
         .fds
@@ -107,14 +111,16 @@ fn quad_node(
 }
 
 /// The render node of `scene` in physical pixels of `display`, with the buffers it samples. Fails without side effects on the first buffer that cannot be imported.
+/// `device`: the DRM device every buffer must come from (GtkUi's `buffer_device`).
 pub fn build(
     display: &gdk::Display,
     scene: &Scene,
+    device: Option<DeviceNumber>,
 ) -> Result<(gsk::RenderNode, Vec<Shown>), PresentError> {
     let mut shown = Vec::new();
     let mut children = Vec::new();
     for quad in &scene.quads {
-        children.extend(quad_node(display, quad, &mut shown)?);
+        children.extend(quad_node(display, device, quad, &mut shown)?);
     }
     Ok((gsk::ContainerNode::new(&children).upcast(), shown))
 }
