@@ -14,10 +14,11 @@ use crate::{arches, packages, slot, tree};
 /// The boot classpath: the dex jars the Java pipeline's goal `platform-bootclasspath` built, one per line in BOOTCLASSPATH order (bp2ninja bootclasspath.go derives it as Soong's product config and derive_classpath do).
 const BOOTCLASSPATH: &str = "bootclasspath.txt";
 /// The class jars a test compiles against (javac's bootclasspath, d8's --lib): ART's core and framework, the API the tests use.
+/// framework's is its header jar as dependents see it: turbine output after the module's jarjar rules (bp2ninja java.go javaHeaders, Soong compileJavaHeader).
 const JAVAC_BOOT: [&str; 3] = [
     "device/core-oj/javac/core-oj.jar",
     "device/core-libart/javac/core-libart.jar",
-    "device/framework-minus-apex/javac-header/framework.jar",
+    "device/framework-minus-apex/jarjar/turbine/framework.jar",
 ];
 /// The property service binary, built by cargo into <out>/cargo (the launcher: packages.rs).
 const PROPERTY_SERVICE: &str = "atl-property-service";
