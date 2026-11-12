@@ -33,7 +33,7 @@ enum Step {
     Fmt,
     /// SPDX header on every tracked or new, non-ignored file
     Spdx,
-    /// repo tables (arches, sources, deps, providers, licenses, prune, cts, test-apks) parse with their schema and invariants
+    /// repo tables (arches, sources, deps, providers, licenses, prune, cts, test-apks, isa-tiers) parse with their schema and invariants
     Tables,
     /// deps.toml rows against this host: installed at the required version (`deps --check`)
     Deps,
@@ -187,6 +187,7 @@ impl Step {
                 arches::check_cross(root, &arches)?;
                 arches::check_qemu_target(&layout, &arches)?;
                 arches::check_guest_rust(root, &arches)?;
+                crate::isa_tiers::check(root, &arches)?;
                 eprintln!("tables: {} ok ({} arches)", arches::FILE, arches.len());
                 let sources = sources::load(root)?;
                 eprintln!(

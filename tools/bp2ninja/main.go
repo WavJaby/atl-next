@@ -60,6 +60,7 @@ func main() {
 	llvm := flag.String("llvm", "", "install prefix of -cc's LLVM tools (bin/llvm-addr2line): ART_CLANG_PATH of the host ART flags (artplugin.go)")
 	omit := flag.String("omit", "", "comma-separated modules whose dependencies are dropped (providers.toml `none`)")
 	providedFile := flag.String("provided", "", "JSON file: module -> {libs, include, defines} of modules built outside the tree (providers.toml `crate:`, `upstream:` and `system:`, provided.go)")
+	isaTiersFile := flag.String("isa-tiers", "", "JSON file: module -> {src, march, gate} of isa-tiers.toml rows (isatier.go): one source of the module compiled with -march, on a cross host's product sides; needs the -host-* flags; the tier files' compiles go to isa-tier-probes.json in -out")
 	aidlCratesFile := flag.String("aidl-crates", "", "JSON file: interface name -> {include_dirs, types, parcelables}: unstable aidl_interfaces defined at the tree root over the import closure of types, whose -rust backends workspace packages link (Cargo.toml `[package.metadata.atl.aidl]`, aidlcrates.go)")
 	srcsFile := flag.String("srcs", "", "JSON file: module -> {srcs, provider} of modules built without some of their sources (providers.toml rows with `srcs`, provided.go Partial); a listed file that is not a source of the module fails")
 	rustAndroid := flag.String("rust-android", "", "comma-separated device Rust modules compiled as Android userspace: android target blocks + --cfg "+rustAndroidCfg+" (providers.toml `rust_os = \"android\"`, rust.go rustOSSide)")
@@ -204,6 +205,15 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -srcs:", err)
 		os.Exit(1)
 	}
+	isaTiers, err := readJSON[isaTier](*isaTiersFile)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "bp2ninja: -isa-tiers:", err)
+		os.Exit(1)
+	}
+	if isaTiers != nil && !cross.set() {
+		fmt.Fprintln(os.Stderr, "bp2ninja: -isa-tiers needs the -host-* flags (a cross host)")
+		os.Exit(2)
+	}
 	aidlCrates, err := readJSON[AidlCrate](*aidlCratesFile)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -aidl-crates:", err)
@@ -231,7 +241,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -build-provided:", err)
 		os.Exit(1)
 	}
-	if err := run(*tree, *out, cfg, Tools{*cc, *cxx, *ar, *bison, *flex, *m4, *yasm, *rustc, *rustVersion, *libclang, *llvm, *launcher, *rtInclude, *bionicStaticRust, *licenceGate}, javaSetup{jt, *release, *measure}, omitted, provided, buildProvided, nbProvided, partial, android, moduleDefines, stand, aidlCrates, *nbExports, regen, flag.Args()); err != nil {
+	if err := run(*tree, *out, cfg, Tools{*cc, *cxx, *ar, *bison, *flex, *m4, *yasm, *rustc, *rustVersion, *libclang, *llvm, *launcher, *rtInclude, *bionicStaticRust, *licenceGate}, javaSetup{jt, *release, *measure}, omitted, provided, buildProvided, nbProvided, partial, isaTiers, android, moduleDefines, stand, aidlCrates, *nbExports, regen, flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja:", err)
 		os.Exit(1)
 	}
@@ -290,7 +300,7 @@ type javaSetup struct {
 	measure bool
 }
 
-func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[string]bool, provided, buildProvided, nbProvided map[string]Provided, partial map[string]Partial, rustAndroid map[string]bool, defines map[string][]string, stand map[string]string, aidlCrates map[string]AidlCrate, nbExports string, regen *regenSetup, goals []string) error {
+func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[string]bool, provided, buildProvided, nbProvided map[string]Provided, partial map[string]Partial, isaTiers map[string]isaTier, rustAndroid map[string]bool, defines map[string][]string, stand map[string]string, aidlCrates map[string]AidlCrate, nbExports string, regen *regenSetup, goals []string) error {
 	files, err := discover(tree)
 	if err != nil {
 		return err
@@ -301,7 +311,7 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	}
 	// not passed (toolchainLocation, keepFlag): reported on every run, so a change in what is dropped shows
 	fmt.Printf("bp2ninja: Soong global flags not passed (diagnostics, debug info, prebuilt toolchain location): %s\n", strings.Join(soong.Flags.Skipped, " "))
-	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, provided: provided, buildProvided: buildProvided, nbProvided: nbProvided, partial: partial, rustAndroid: rustAndroid, defines: defines, stand: stand, rtInclude: tools.RtInclude, bionicStaticRust: tools.BionicStaticRust, nodes: map[key]*Node{}}
+	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, provided: provided, buildProvided: buildProvided, nbProvided: nbProvided, partial: partial, rustAndroid: rustAndroid, defines: defines, stand: stand, rtInclude: tools.RtInclude, bionicStaticRust: tools.BionicStaticRust, nodes: map[key]*Node{}, tiers: isaTiers, isaProbes: map[string]isaTierProbe{}}
 	if g.libcxx, err = libcxxProvider(tools.CXX, cfg.HostCross); err != nil {
 		return err
 	}
@@ -454,8 +464,8 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	if err := g.checkPartial(); err != nil {
 		return err
 	}
-	if len(g.osArchSkipped) > 0 {
-		fmt.Printf("bp2ninja: target blocks not applied (Android %s ABI %s not covered by host isa %s): %s\n", cfg.Arch, soong.Flags.ArchISA[Device], cfg.HostCross.ISA, strings.Join(sortedKeys(g.osArchSkipped), ", "))
+	if err := g.checkISATiers(); err != nil {
+		return err
 	}
 	// build.ninja is written part by part as each is made (it is ~0.8 GB: one concatenated string plus its copies set the peak RSS), into a temporary file renamed at the end, so a failed run leaves the previous one
 	if err := os.MkdirAll(out, 0o755); err != nil {
@@ -467,6 +477,9 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	}
 	defer ninja.discard()
 	ninja.WriteString(g.emit(tools))
+	if err := g.writeISATierProbes(out); err != nil {
+		return err
+	}
 	if g.java != nil {
 		ninja.WriteString(g.java.ninja(g))
 	}

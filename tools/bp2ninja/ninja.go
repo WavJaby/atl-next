@@ -328,6 +328,7 @@ func (g *Graph) emit(tools Tools) string {
 				}
 				continue
 			}
+			lang = g.isaTierArgv(n, s, lang)
 			fmt.Fprintf(&b, "build %s: cc %s || %s\n  cc = %s\n  flags = %s\n", esc(obj), esc(src), join(waits), esc(cc), shellQuote(lang))
 			if debugInfo(lang) {
 				b.WriteString("  launcher =\n")

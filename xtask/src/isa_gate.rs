@@ -2,6 +2,7 @@
 //! Static gate over a cross host's ELF outputs: `xtask native --host <arch>` runs it after the build, `xtask isa-gate --arch <arch>` alone.
 //! Every riscv64 ELF64 file under the arch's out dir must claim only the ISA its arches.toml row allows (`Tag_RISCV_arch`, implied extensions included: arches::isa_closure), and every GLIBC_x.y version its undefined dynamic symbols need must be at or below the row's `glibc_floor`.
 //! It reads what the object declares, not what its code executes: `Tag_RISCV_arch` is the assembler's -march, so a TU built with a wider -march fails even if it never runs the extension.
+//! Run-time tiers (isa-tiers.toml, isa_tiers.rs): an object named by a row may claim the row's extension and must claim it; a product of the row's module may claim it; nothing else may.
 //! Not checked: static archives (object is built without its `archive` feature), GLIBCXX_/CXXABI_/GCC_ needs, GTK (no riscv64 output links it yet). GLIBC_PRIVATE is the loader's own interface, not a number: skipped.
 
 use std::collections::BTreeSet;
@@ -13,7 +14,7 @@ use object::read::SymbolIndex;
 use object::read::elf::{ElfFile64, FileHeader, SectionHeader, Sym};
 use object::{Endianness, elf};
 
-use crate::{arches, slot};
+use crate::{arches, isa_tiers, slot};
 
 /// psABI build attribute `Tag_RISCV_arch`: an odd tag, so its value is a NUL-terminated string.
 const TAG_RISCV_ARCH: u64 = 5;
@@ -49,6 +50,8 @@ pub struct Report {
     pub max_glibc: Option<(Vec<u32>, String)>,
     /// One line per violation, prefixed with its file.
     pub violations: Vec<String>,
+    /// Files a tier row let claim its extension: `<module> <src> (<ext>)` for an object, `<module> (<ext>)` for a product.
+    pub tiered: Vec<String>,
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
@@ -61,7 +64,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         workspace.join("out").join("native")
     })?
     .join(&args.arch);
-    let report = check(&out, host)?;
+    let report = check(&out, host, &isa_tiers::load(root)?)?;
     println!("isa gate: {}", summary(&report));
     for v in report.violations.iter().take(5) {
         println!("isa gate:   {v}");
@@ -73,8 +76,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     })
 }
 
-/// The gate over every riscv64 ELF64 under `out` (symlinks skipped) against `host`'s isa and glibc_floor.
-pub fn check(out: &Path, host: &arches::Host) -> Result<Report> {
+/// The gate over every riscv64 ELF64 under `out` (symlinks skipped) against `host`'s isa and glibc_floor, and `tiers` (isa-tiers.toml) for the files they let claim more.
+pub fn check(out: &Path, host: &arches::Host, tiers: &isa_tiers::Tiers) -> Result<Report> {
     let (Some(isa), Some(floor)) = (&host.isa, &host.glibc_floor) else {
         bail!(
             "{}: the isa gate needs the row's isa and glibc_floor",
@@ -95,11 +98,9 @@ pub fn check(out: &Path, host: &arches::Host) -> Result<Report> {
         };
         report.files += 1;
         let claim = isa_claim(&f, &data).with_context(|| name.clone())?;
-        report.violations.extend(
-            isa_violations(claim.as_deref(), &allowed, isa)
-                .into_iter()
-                .map(|v| format!("{name}: {v}")),
-        );
+        let (violations, tier) = file_check(&name, claim.as_deref(), tiers, isa, &allowed)?;
+        report.violations.extend(violations);
+        report.tiered.extend(tier);
         let needs = glibc_needs(&f, &data).with_context(|| name.clone())?;
         for need in &needs {
             let Some(version) = glibc_version(&need.version)? else {
@@ -140,11 +141,54 @@ pub fn summary(report: &Report) -> String {
         |(version, at)| format!("GLIBC_{} ({at})", dotted(version)),
     );
     format!(
-        "{} riscv64 ELF64 files, ISA [{}], max {max}, {} violations",
+        "{} riscv64 ELF64 files, ISA [{}], max {max}, {} violations, tiers [{}]",
         report.files,
         isas.join(" | "),
-        report.violations.len()
+        report.violations.len(),
+        report.tiered.join(" | ")
     )
+}
+
+/// One file's violations (prefixed with its name), and the tier row that let it claim its extension. The file is allowed the row's closure when a row names it: an object by its src, a product by its module.
+/// An object a row names must claim the row's extension: without it the row did not reach the source.
+fn file_check(
+    name: &str,
+    claim: Option<&str>,
+    tiers: &isa_tiers::Tiers,
+    isa: &str,
+    allowed: &BTreeSet<String>,
+) -> Result<(Vec<String>, Option<String>)> {
+    let row = isa_tiers::object_row(tiers, name)
+        .map(|(module, row)| (module, row, true))
+        .or_else(|| isa_tiers::product_row(tiers, name).map(|(module, row)| (module, row, false)));
+    let Some((module, row, object)) = row else {
+        let out = isa_violations(claim, allowed, isa)
+            .into_iter()
+            .map(|v| format!("{name}: {v}"));
+        return Ok((out.collect(), None));
+    };
+    let set = isa_tiers::closure(isa, &row.ext)?;
+    let mut out: Vec<String> = isa_violations(claim, &set, isa)
+        .into_iter()
+        .map(|v| format!("{name}: {v}"))
+        .collect();
+    if object && claim.is_some_and(|c| !claims(c, &row.ext)) {
+        out.push(format!(
+            "{name}: tier `{module}` {} does not claim `{}`: the row did not reach its source",
+            row.src, row.ext
+        ));
+    }
+    let label = if object {
+        format!("{module} {} ({})", row.src, row.ext)
+    } else {
+        format!("{module} ({})", row.ext)
+    };
+    Ok((out, Some(label)))
+}
+
+/// Whether a Tag_RISCV_arch string names the extension (`v1p0` -> `v`).
+fn claims(claim: &str, ext: &str) -> bool {
+    claim.split('_').any(|part| ext_name(part) == ext)
 }
 
 /// Every regular file under `dir`, recursively; symlinks are not followed.
@@ -390,5 +434,98 @@ mod tests {
     #[test]
     fn non_elf_is_not_read() {
         assert!(riscv64_elf(b"#!/bin/sh\n").unwrap().is_none());
+    }
+
+    /// The libz row as isa-tiers.toml gives it.
+    fn tiers() -> isa_tiers::Tiers {
+        toml::from_str(
+            "[libz]\nsrc = \"adler32_simd.c\"\next = \"v\"\ngate = \"adler32.c:riscv_cpu_enable_rvv\"\nreason = \"r\"\n",
+        )
+        .unwrap()
+    }
+
+    /// The claim written for -march=rv64gcv_zba_zbb: V, then the names V implies (RVV 1.0 rules, Zvl128b, Zve64d, Zve64f, Zve64x, Zve32f, Zve32x, Zvl64b, Zvl32b), spelled as Tag_RISCV_arch spells them. Written from the rules, not read from clang; the riscv64 run's readelf -A confirms it.
+    const V_CLAIM: &str = "rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0_v1p0_zvl128b1p0_zve32x1p0_zve64d1p0_zve64f1p0_zve64x1p0_zve32f1p0_zvl32b1p0_zvl64b1p0_zba1p0_zbb1p0";
+
+    #[test]
+    fn tier_source_may_claim_v_and_must() {
+        let (violations, tier) = file_check(
+            "obj/device/libz/shared/external/zlib/adler32_simd.c.o",
+            Some(V_CLAIM),
+            &tiers(),
+            "rv64gc_zba_zbb",
+            &allowed(),
+        )
+        .unwrap();
+        assert!(violations.is_empty(), "{violations:?}");
+        assert_eq!(tier.as_deref(), Some("libz adler32_simd.c (v)"));
+        // the row's source built without the extension: the row did not reach it
+        let (violations, _) = file_check(
+            "obj/host/libz/static/external/zlib/adler32_simd.c.o",
+            Some(RV64GC_ZBA_ZBB),
+            &tiers(),
+            "rv64gc_zba_zbb",
+            &allowed(),
+        )
+        .unwrap();
+        assert!(
+            violations.iter().any(|v| v.contains("does not claim `v`")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn other_source_of_the_module_may_not_claim_v() {
+        let (violations, tier) = file_check(
+            "obj/device/libz/shared/external/zlib/adler32.c.o",
+            Some(V_CLAIM),
+            &tiers(),
+            "rv64gc_zba_zbb",
+            &allowed(),
+        )
+        .unwrap();
+        assert!(tier.is_none());
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("extension `v` is outside isa `rv64gc_zba_zbb`")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn product_of_the_row_module_may_claim_v_others_may_not() {
+        let (violations, tier) = file_check(
+            "device/libz.so",
+            Some(V_CLAIM),
+            &tiers(),
+            "rv64gc_zba_zbb",
+            &allowed(),
+        )
+        .unwrap();
+        assert!(violations.is_empty(), "{violations:?}");
+        assert_eq!(tier.as_deref(), Some("libz (v)"));
+        let (violations, tier) = file_check(
+            "device/libzz.so",
+            Some(V_CLAIM),
+            &tiers(),
+            "rv64gc_zba_zbb",
+            &allowed(),
+        )
+        .unwrap();
+        assert!(tier.is_none());
+        assert!(!violations.is_empty());
+    }
+
+    #[test]
+    fn tier_closure_covers_the_claim_v_makes_and_no_more() {
+        let closure = isa_tiers::closure("rv64gc_zba_zbb", "v").unwrap();
+        assert!(isa_violations(Some(V_CLAIM), &closure, "rv64gc_zba_zbb").is_empty());
+        let zbs = "rv64i2p1_zbs1p0";
+        assert_eq!(
+            isa_violations(Some(zbs), &closure, "rv64gc_zba_zbb").len(),
+            1
+        );
+        assert!(claims(V_CLAIM, "v") && !claims(RV64GC_ZBA_ZBB, "v"));
     }
 }

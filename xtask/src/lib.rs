@@ -32,6 +32,7 @@ pub mod harness;
 pub mod host_art;
 pub mod host_disk;
 pub mod isa_gate;
+pub mod isa_tiers;
 pub mod keepset;
 pub mod land;
 pub mod launcher_closure;

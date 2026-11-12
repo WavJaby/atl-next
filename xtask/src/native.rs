@@ -339,6 +339,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .flat_map(CompilerCache::env)
         .chain(java_env(&jdk))
         .collect();
+    // run-time ISA tiers (isa-tiers.toml): the table is read once per run; a cross host's converter input goes in its out dir
+    let tiers = crate::isa_tiers::load(root)?;
+    let isa_tiers_file = match &cross {
+        Some(c) => Some(crate::isa_tiers::write_converter_file(
+            &tiers, &c.isa, &out,
+        )?),
+        None => None,
+    };
     let mut round = 0;
     loop {
         round += 1;
@@ -358,6 +366,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         ];
         argv.extend(cross_flags.iter().cloned());
         argv.extend(build_provided_args.iter().cloned());
+        if let Some(file) = &isa_tiers_file {
+            argv.extend(["-isa-tiers".to_owned(), path(file)]);
+        }
         argv.extend(
             [
                 "-arch",
@@ -460,6 +471,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if let Some(c) = &cache {
         c.start()?;
     }
+    // gate a (isa-tiers.toml): each tier source compiles at its tier's isa and fails at its row's, before ninja builds the rest
+    if cross.is_some() {
+        let probed = crate::isa_tiers::probe(&out, &cc)?;
+        println!("native: isa tiers: {probed} source(s) probed");
+    }
     let log = out.join("ninja.log");
     // only ninja queues for a machine-wide token (build_pool.rs); the gates below run after it is released
     let tokens = build_pool::tokens(ws)?;
@@ -502,7 +518,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if let Some(first) = runpath_gate(&out)? {
         failed.push(Failure::step("runpath gate", first));
     }
-    if let Some(first) = isa_floor_gate(&out, host)? {
+    if let Some(first) = isa_floor_gate(&out, host, &tiers)? {
         failed.push(Failure::step("isa gate", first));
     }
     if let Some(first) = fronts_gate(&out, &tree)? {
@@ -1417,11 +1433,15 @@ fn fronts_gate(out: &Path, tree: &Path) -> Result<Option<String>> {
 }
 
 /// The ISA and glibc-floor gate (isa_gate.rs) over this cross host's outputs; its first violation, None when it passes. The build machine's row has no isa: not checked.
-fn isa_floor_gate(out: &Path, host: &arches::Host) -> Result<Option<String>> {
+fn isa_floor_gate(
+    out: &Path,
+    host: &arches::Host,
+    tiers: &crate::isa_tiers::Tiers,
+) -> Result<Option<String>> {
     if host.isa.is_none() {
         return Ok(None);
     }
-    let report = crate::isa_gate::check(out, host)?;
+    let report = crate::isa_gate::check(out, host, tiers)?;
     println!("native: isa gate: {}", crate::isa_gate::summary(&report));
     for v in report.violations.iter().take(5) {
         println!("native:   isa: {v}");

@@ -35,8 +35,6 @@ type GlobalFlags struct {
 	RustTriple map[Side]string
 	// per Side: the side's machine target on its links (HostCross.linkFlags on a cross host's product sides); empty where the side links for the build machine or a bionic triple
 	Link map[Side][]string
-	// per cross product side: the toolchain's dropped -march value, the arch ABI baseline its OS+arch props were written for (Android riscv64: rv64gcv_zba_zbb_zbs); absent = none dropped (flatten osArchApplies)
-	ArchISA map[Side]string
 }
 
 // hod: the side's Host-or-Device prefix of Soong's global flag variables (<Hod>GlobalCflags).
@@ -80,7 +78,7 @@ func toolchainLocation(f string) int {
 }
 
 // HostCross: the target of a host whose arch is not the build machine's (xtask native: the host row's clang, sysroot and isa). Zero = the build machine's own, no flags.
-// The distro clang compiles and links for any target it knows given --target and --sysroot (the sysroot's libraries, crt objects and GCC runtime dir are found under it). -march pins the ISA baseline: no V or Zbs reaches an object (readelf -A Tag_RISCV_arch).
+// The distro clang compiles and links for any target it knows given --target and --sysroot (the sysroot's libraries, crt objects and GCC runtime dir are found under it). -march pins the ISA baseline: no V or Zbs reaches an object, except an isa-tiers.toml row's file (isatier.go; readelf -A Tag_RISCV_arch).
 // No -fuse-ld here: Soong's lldflags give every host link -fuse-ld=lld already (readLldflags).
 type HostCross struct {
 	Target  string // clang --target
@@ -280,12 +278,6 @@ func readGlobalFlags(cfg Config, dev DeviceArch) (GlobalFlags, error) {
 					drop := strings.HasPrefix(f, "-march=") || strings.HasPrefix(f, "-mcpu=")
 					if drop {
 						skipped[f] = true
-					}
-					if isa, ok := strings.CutPrefix(f, "-march="); ok {
-						if g.ArchISA == nil {
-							g.ArchISA = map[Side]string{}
-						}
-						g.ArchISA[side] = isa
 					}
 					return drop
 				}), err

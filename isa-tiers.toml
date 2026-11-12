@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: MIT
+# Run-time ISA tiers of a cross host (route B; study plan/atl-next/riscv-vector-tiers.md). A source of a module is compiled with the host row's `isa` (arches.toml) plus one extension, because upstream runs it only behind a run-time CPU check. Every other source of the module keeps the row's isa; isa_gate checks each object and product against this table (isa_gate.rs).
+# One binary serves every riscv64 host: no second build, no AOSP source patch, no per-function target pragma.
+#
+# Row key: Android.bp module name (the converter fails on a key that names no module of the tree at the pin).
+#   src     the module's source the extension goes on, relative to its directory, as Android.bp lists it (the converter fails unless it is one of the module's sources at the pin)
+#   ext     the extension. Only `v` has its implication rules (isa_tiers.rs). The source compiles as `-march=<row isa + ext>`: rv64gc_zba_zbb -> rv64gcv_zba_zbb
+#   gate    `<file>:<symbol>`: the upstream run-time check the source runs behind. `<file>` in the module's directory must name `<symbol>` (the converter fails otherwise)
+#   reason  why the source needs `ext`, and why the module's other sources do not
+# A row is effective only while its source needs `ext`: `xtask native --host <cross host>` probes each row before ninja (the row's isa must fail naming the extension, the tier argv must compile). Each row is also checked by `cargo xtask check` step tables (fields, and the row's march for every cross host's isa).
+
+["libz"]
+src = "adler32_simd.c"
+ext = "v"
+gate = "adler32.c:riscv_cpu_enable_rvv"
+reason = "RVV intrinsics (riscv_vector.h) need V. adler32.c calls them only when riscv_cpu_enable_rvv is set (cpu_features.c: AT_HWCAP V bit), so a host without V never reaches them. The rest of libz has no V code and is built at the row's isa."
