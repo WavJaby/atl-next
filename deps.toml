@@ -339,7 +339,6 @@ used_by = ["xtask:cross", "host:riscv64"]
 # libc++-19-dev, all 1:19.1.7-3+b1. Headers under usr/lib/llvm-19/include/c++/v1 (bp2ninja -upstream-toolchain); the .so.1 runtimes
 # (libc++, libc++abi, libunwind) for the link and NEEDED. libatomic1 (gcc-14 14.2.0-19, the native riscv64 package libc++1-19 Depends on) is their runtime NEEDED: pinned for the runtime closure.
 # system:libelf (providers.toml `libelf`, plan A2): libelf-dev and its Depends closure (zlib1g-dev, libzstd-dev), plus the runtime libelf1t64 and its NEEDED zlib1g, libzstd1. Native riscv64 packages, as libc++1-19 above.
-# system:vulkan (providers.toml `libvulkan`): libvulkan-dev and its runtime libvulkan1; libvulkan-dev's Depends python3:any is a build-time tool, not pinned (nothing here runs it).
 [riscv64-sysroot]
 sysroot_debs = [
     "libc6-riscv64-cross=2.41-11cross1",
@@ -360,8 +359,6 @@ sysroot_debs = [
     "zlib1g=1:1.3.dfsg+really1.3.1-1+b1",
     "libzstd-dev=1.5.7+dfsg-1",
     "libzstd1=1.5.7+dfsg-1",
-    "libvulkan-dev=1.4.309.0-1",
-    "libvulkan1=1.4.309.0-1",
 ]
 scope = ["build"]
 used_by = ["xtask:cross", "host:riscv64"]
@@ -425,13 +422,6 @@ min = "2.41.5"
 min_reason = "observed 2026-11-07; older is untested"
 scope = ["runtime", "test"]
 used_by = ["xtask:run-apk"]
-
-[vulkan]
-debian = "libvulkan-dev"
-arch = "vulkan-icd-loader"
-pkgconfig = "vulkan"
-scope = ["build", "runtime"]
-used_by = ["upstream:aosp"]
 
 # Soong's .asm rule is yasm (cc/builder.go, a prebuilt there); its -f/-m flags are yasm syntax. libjpeg-turbo's x86 SIMD sources.
 [yasm]
