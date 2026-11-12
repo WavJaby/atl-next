@@ -1,0 +1,141 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Fri, 13 Nov 2026 06:47:46 +0800
+Subject: [PATCH] libmediaplayerservice: deliver in-process client
+ notifications from a queue
+
+An app served in-process receives the service's notifications as a plain
+virtual call on the NuPlayer looper. MediaPlayer::notify then takes the
+app's mLock, which MediaPlayer::reset holds while it waits for that same
+looper: a deadlock. AOSP's remote client is FLAG_ONEWAY, so the looper
+never waits there.
+
+Client ctor wraps a local IMediaPlayerClient in QueuedMediaPlayerClient.
+Its notify copies the event and queues it on a per-client thread, FIFO,
+so the looper returns at once. The thread is not joined; stop() on
+disconnect drops pending events so none reach the app afterwards.
+
+Upstream-Status: Pending
+Patch-Reason: in-process serving of media.player makes AOSP's oneway IMediaPlayerClient::notify synchronous
+---
+SPDX-License-Identifier: Apache-2.0
+ .../MediaPlayerService.cpp                    | 85 +++++++++++++++++++
+ 1 file changed, 85 insertions(+)
+
+diff --git a/media/libmediaplayerservice/MediaPlayerService.cpp b/media/libmediaplayerservice/MediaPlayerService.cpp
+index f843ada82eb0bb3749a140826ecb4573744b4d6f..2ef00a7faa6bc971b00a6774ce70be6274c702c1 100644
+--- a/media/libmediaplayerservice/MediaPlayerService.cpp
++++ b/media/libmediaplayerservice/MediaPlayerService.cpp
+@@ -22,6 +22,8 @@
+ #include <utils/Log.h>
+ 
+ #include <chrono>
++#include <deque>
++#include <memory>
+ #include <sys/types.h>
+ #include <sys/stat.h>
+ #include <sys/time.h>
+@@ -45,6 +47,7 @@
+ #include <utils/Errors.h>  // for status_t
+ #include <utils/String8.h>
+ #include <utils/SystemClock.h>
++#include <utils/Thread.h>
+ #include <utils/Timers.h>
+ #include <utils/Vector.h>
+ 
+@@ -769,6 +772,80 @@ bool MediaPlayerService::hasClient(wp<Client> client)
+     return mClients.indexOf(client) != NAME_NOT_FOUND;
+ }
+ 
++namespace {
++
++// In-process app only (Client ctor). AOSP's client is remote and IMediaPlayerClient::notify is FLAG_ONEWAY, so the service never waits for the app. A local client is a plain call: Client::notify would block the NuPlayer looper on MediaPlayer::mLock while the app thread waits in reset() for that same looper. Here the looper only copies the event and returns; this thread delivers it, FIFO. stop() drops pending events when the client goes, so none reach the app after disconnect. Not joined: a join would make the disconnecting thread wait on an app callback.
++class ClientNotifyQueue : public Thread {
++public:
++    explicit ClientNotifyQueue(const wp<IMediaPlayerClient>& target) : mTarget(target) {}
++
++    void post(int msg, int ext1, int ext2, std::unique_ptr<Parcel> obj) {
++        Mutex::Autolock l(mLock);
++        if (mStopped) return;
++        mQueue.push_back({msg, ext1, ext2, std::move(obj)});
++        mCond.signal();
++    }
++
++    void stop() {
++        Mutex::Autolock l(mLock);
++        mStopped = true;
++        mQueue.clear();
++        mCond.signal();
++    }
++
++private:
++    struct Event {
++        int msg, ext1, ext2;
++        std::unique_ptr<Parcel> obj;
++    };
++
++    bool threadLoop() override {
++        for (;;) {
++            Event e;
++            {
++                Mutex::Autolock l(mLock);
++                while (!mStopped && mQueue.empty()) mCond.wait(mLock);
++                if (mStopped) return false;
++                e = std::move(mQueue.front());
++                mQueue.pop_front();
++            }
++            if (sp<IMediaPlayerClient> target = mTarget.promote()) {
++                target->notify(e.msg, e.ext1, e.ext2, e.obj.get());
++            }
++        }
++    }
++
++    const wp<IMediaPlayerClient> mTarget;
++    Mutex mLock;
++    Condition mCond;
++    bool mStopped = false;
++    std::deque<Event> mQueue;
++};
++
++// The client the service holds for an in-process app: copies each event and queues it.
++class QueuedMediaPlayerClient : public BnMediaPlayerClient {
++public:
++    explicit QueuedMediaPlayerClient(const sp<ClientNotifyQueue>& queue) : mQueue(queue) {}
++    ~QueuedMediaPlayerClient() override { mQueue->stop(); }
++
++    void notify(int msg, int ext1, int ext2, const Parcel *obj) override {
++        std::unique_ptr<Parcel> copy;
++        if (obj != nullptr) {
++            copy = std::make_unique<Parcel>();
++            if (copy->appendFrom(obj, 0, obj->dataSize()) != NO_ERROR) {
++                ALOGE("notify(%d): parcel copy failed, event dropped", msg);
++                return;
++            }
++        }
++        mQueue->post(msg, ext1, ext2, std::move(copy));
++    }
++
++private:
++    const sp<ClientNotifyQueue> mQueue;
++};
++
++}  // namespace
++
+ MediaPlayerService::Client::Client(
+         const sp<MediaPlayerService>& service, const AttributionSourceState& attributionSource,
+         int32_t connId, const sp<IMediaPlayerClient>& client,
+@@ -779,6 +856,14 @@ MediaPlayerService::Client::Client(
+     mConnId = connId;
+     mService = service;
+     mClient = client;
++    if (client != nullptr && IInterface::asBinder(client)->localBinder() != nullptr) {
++        sp<ClientNotifyQueue> queue = new ClientNotifyQueue(client);
++        if (queue->run("MPSClientNotify") == NO_ERROR) {
++            mClient = new QueuedMediaPlayerClient(queue);
++        } else {
++            ALOGE("[%d] no notify thread: in-process client notified inline", connId);
++        }
++    }
+     mLoop = false;
+     mStatus = NO_INIT;
+     mAudioSessionId = audioSessionId;
