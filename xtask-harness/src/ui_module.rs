@@ -32,8 +32,10 @@ const MODULE_PACKAGE: &str = "atl-platform-ui-linux";
 const MODULE_FILE: &str = "libatl_platform_ui_linux.so";
 /// NDK API level of the stand-ins: the level the plan's probe measured with (NDK r30, API 33).
 const API: u32 = 33;
-/// The record the module logs once attached (atl-platform-ui-linux module.rs `entry`).
+/// The record the module logs once attached (atl-platform-ui-linux module.rs `ui_attach`).
 const ATTACHED: &str = "module attached";
+/// The target the facade gives every forwarded module record (atl-platform-ui module.rs `forward`), as the fixture's subscriber prints it.
+const MODULE_TARGET: &str = "atl_platform_ui_linux:";
 /// glibc's objects: app objects may bind to them (`__cxa_finalize`), they are in every scope.
 const GLIBC: &[&str] = &["/libc.so.6", "/ld-linux-x86-64.so.2"];
 
@@ -86,8 +88,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         std::fs::remove_dir_all(&work)?;
     }
     std::fs::create_dir_all(&work)?;
-    let module_dir =
-        crate::cdylib::stage(root, &out, MODULE_PACKAGE, "ui-module-lib", MODULE_FILE)?;
+    let module_dir = stage_module(root, &out)?;
     let app = build_app(root, args, &work.join("app"))?;
     let app_dir = app.parent().context("app dir")?.to_path_buf();
     let nested = NestedCompositor::start(&work)?;
@@ -102,7 +103,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         ensure!(k == "LD_LIBRARY_PATH", "unexpected stage variable {k}");
         lib_path.push(v);
     }
-    let go = |name: &str, extra: &[&str]| -> Result<Run> {
+    let go_with = |name: &str, extra: &[&str], module_dir: Option<&Path>| -> Result<Run> {
+        let mut lib_path = lib_path.clone();
+        match module_dir {
+            Some(d) => lib_path[1] = d.display().to_string(),
+            None => {
+                lib_path.remove(1);
+            }
+        }
         let ld = work.join(format!("ld-{name}"));
         let mut cmd = Command::new(&fixture);
         cmd.arg("--app")
@@ -136,16 +144,24 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             })
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .collect();
-        let module_lines = text.lines().filter(|l| l.contains("MODULE ")).count();
+        let module_lines = text.lines().filter(|l| l.contains(MODULE_TARGET)).count();
         Ok(Run {
             text,
             results,
             module_lines,
         })
     };
+    let go = |name: &str, extra: &[&str]| go_with(name, extra, Some(&module_dir));
     let normal = go("local", &[])?;
     let global = go("global", &["--global"])?;
-    let silent = go("no-log-sink", &["--no-log-sink"])?;
+    let silent = go("no-module-records", &["--drop-module-records"])?;
+    let missing = go_with("no-module", &[], None)?;
+    let foreign_dir = foreign_build(
+        &module_dir.join(MODULE_FILE),
+        &normal,
+        &work.join("abi-bad"),
+    )?;
+    let foreign = go_with("abi-bad", &[], Some(&foreign_dir))?;
 
     let mut failures: Vec<String> = Vec::new();
     let mut check = |ok: bool, what: String| {
@@ -169,9 +185,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         normal
             .text
             .lines()
-            .any(|l| l.contains("MODULE ") && l.contains(ATTACHED)),
+            .any(|l| l.contains(MODULE_TARGET) && l.contains(ATTACHED)),
         format!(
-            "module record `{ATTACHED}` reached the process subscriber ({} MODULE lines)",
+            "module record `{ATTACHED}` reached the process subscriber ({} module lines)",
             normal.module_lines
         ),
     );
@@ -231,19 +247,41 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     check(
         silent.module_lines == 0 && silent.int("painted").is_some_and(|p| p >= 1),
         format!(
-            "control no log sink: {} MODULE lines, painted {:?}",
+            "control module records filtered: {} module lines, painted {:?}",
             silent.module_lines,
             silent.get("painted")
         ),
     );
+    let refused = |r: &Run, want: &[&str]| {
+        r.get("attach_error")
+            .is_some_and(|e| want.iter().all(|w| e.contains(w)))
+            && r.get("painted").is_none()
+            && r.int("app_vkCreateInstance") == Some(AOSP_VALUE)
+    };
+    check(
+        refused(&missing, &[&format!("platform module {MODULE_FILE}:")]),
+        format!(
+            "control module absent: named refusal, app still loads (attach_error {:?})",
+            missing.get("attach_error")
+        ),
+    );
+    check(
+        refused(&foreign, &["abi ", ", launcher "]),
+        format!(
+            "control module of another build (abi id patched): named refusal (attach_error {:?})",
+            foreign.get("attach_error")
+        ),
+    );
     match failures.first() {
         None => {
-            println!("ui-module: ok (controls: RTLD_GLOBAL leaks, no sink drops the records)");
+            println!(
+                "ui-module: ok (controls: RTLD_GLOBAL leaks, filtered records vanish, absent module and foreign abi refused by name)"
+            );
             Ok(ExitCode::SUCCESS)
         }
         Some(first) => {
             println!(
-                "ui-module: FAILED {} of 9; first error: {first:?}",
+                "ui-module: FAILED {} of 11; first error: {first:?}",
                 failures.len()
             );
             Ok(ExitCode::FAILURE)
@@ -280,6 +318,35 @@ fn build_app(root: &Path, args: &Args, dir: &Path) -> Result<PathBuf> {
         "NDK clang app",
     )?;
     Ok(app)
+}
+
+/// Builds the platform module and installs it as `<out>/ui-module-lib/libatl_platform_ui_linux.so`; returns the dir, for the library path of every process that uses the atl-platform-ui facade (the launcher in a runtime run, this gate's fixture).
+pub fn stage_module(root: &Path, out: &Path) -> Result<PathBuf> {
+    crate::cdylib::stage(root, out, MODULE_PACKAGE, "ui-module-lib", MODULE_FILE)
+}
+
+/// A copy of `module` in `dir` whose build identity differs: every little-endian occurrence of the fixture's reported `abi_id` (the vtable's first field, atl-platform-ui-api `abi::ABI_ID`) with each byte inverted. Stands for a module of another build without a second build.
+fn foreign_build(module: &Path, run: &Run, dir: &Path) -> Result<PathBuf> {
+    let id = run.get("abi_id").context("fixture reported no abi_id")?;
+    let id = u64::from_str_radix(id, 16).with_context(|| format!("abi_id {id}"))?;
+    let (from, to) = (id.to_le_bytes(), (!id).to_le_bytes());
+    let mut bytes =
+        std::fs::read(module).with_context(|| format!("reading {}", module.display()))?;
+    let mut n = 0;
+    let mut i = 0;
+    while i + from.len() <= bytes.len() {
+        if bytes[i..i + from.len()] == from {
+            bytes[i..i + from.len()].copy_from_slice(&to);
+            n += 1;
+            i += from.len();
+        } else {
+            i += 1;
+        }
+    }
+    ensure!(n >= 1, "abi id {id:016x} not found in {}", module.display());
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join(MODULE_FILE), &bytes)?;
+    Ok(dir.to_path_buf())
 }
 
 /// The `LD_DEBUG=bindings` records of one run (files `<prefix>.<pid>`) as (line, from object, to object).

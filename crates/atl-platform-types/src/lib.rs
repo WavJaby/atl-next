@@ -5,6 +5,8 @@
 #![deny(missing_docs)]
 
 /// A length in physical (device) pixels: a window's content area, a buffer's extent, a monitor's mode.
+/// `repr(C)` here and on [`Rotation`]: they cross the platform module's C ABI (atl-platform-ui-api `abi`) as they are.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PhysSize {
     /// Width in physical pixels.
@@ -44,6 +46,7 @@ impl Scale {
 
 /// How the desktop turns the drawn image on the panel, from the panel's natural orientation, clockwise: Android's `Surface.ROTATION_*` sense ("the rotation of the drawn graphics on the screen,
 /// the opposite direction of the physical rotation of the device", Display.getRotation docs). A mirroring transform reports its rotation part (Android has no mirrored display).
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Rotation {
     /// The natural orientation.

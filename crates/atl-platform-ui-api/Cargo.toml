@@ -9,11 +9,13 @@ publish.workspace = true
 
 # The platform layer's app-process side as traits (plan S1 `atl-platform-ui`, M3 slice 6): toolkit session and main loop (`Ui`), window with the compositor's `Scene` presented into it (`Window`), the display's frame clock (`FrameClock`) and pointer input (`InputSource`); and the PCM audio output (`audio`, plan A0).
 # Shaped by the one implementation, GTK4 on Linux (atl-platform-ui-linux): sizes are physical pixels plus a scale (GTK speaks logical units), the whole session is thread-affine (GLib and the Android Looper share the UI thread, plan Q6), callbacks run inside the Looper's poll (`Looper` seam).
-# No OS or toolkit dependency, no unsafe; core crates use the `atl-platform-ui` facade, not this crate or the implementation directly.
+# No OS or toolkit dependency; core crates use the `atl-platform-ui` facade, not this crate or the implementation directly.
+# `abi` (launcher-ui-module plan S2): the traits as the C ABI of the platform module, compiled into both the facade (loader) and the module; its only `unsafe` turns that boundary's raw pointers into safe types. build.rs computes its build identity (`ABI_ID`).
 
 [dependencies]
 atl-compositor = { path = "../atl-compositor" }
 atl-gralloc = { path = "../atl-gralloc" }
+atl-libgui-parcel = { path = "../atl-libgui-parcel" }
 atl-platform-types = { path = "../atl-platform-types" }
 thiserror.workspace = true
 

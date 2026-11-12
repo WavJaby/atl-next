@@ -7,14 +7,16 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# The facade core crates depend on (plan S1, review B8): the `-api` traits plus the one implementation the target OS selects at compile time, under neutral names. Static dispatch, no `dyn`.
+# The facade core crates depend on (plan S1, review B8): the `-api` traits plus the one implementation the target OS selects, under neutral names. Static dispatch to proxies, no `dyn`.
+# Linux: the implementation is the cdylib atl-platform-ui-linux, never linked: `module.rs` dlopens it RTLD_LOCAL by file name (launcher-ui-module plan S3) and `proxy.rs` calls its `abi` vtable. Whoever runs a process using this crate puts `libatl_platform_ui_linux.so` on its library path (xtask's runtime and gates stage it); `unsafe` only in those two modules (dlopen, the C ABI).
 # `examples/gate.rs` is the client of `xtask test platform-ui`.
 
 [dependencies]
 atl-platform-ui-api = { path = "../atl-platform-ui-api" }
+tracing.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-atl-platform-ui-linux = { path = "../atl-platform-ui-linux" }
+libc.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true

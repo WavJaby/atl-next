@@ -6,11 +6,14 @@
 //!
 //! Sizes cross this boundary in physical pixels with an explicit [`Scale`]; no logical-pixel type exists here, because the compositor's layer stack and the app's buffers are physical and a toolkit's logical unit is an implementation detail of the `-<os>` crate.
 //! The traits are shaped by the first implementation (GTK4, atl-platform-ui-linux) and by what slices 5 and 7 need of it; they are reshaped when a second implementation is built (CLAUDE.md "One implementation per concept"). Window callbacks are generic parameters (static dispatch) and `'static`: the implementation keeps them for the window's life and calls them on the UI thread from inside the Looper's poll. The [`Looper`] seam takes boxed callbacks: one erasure, because the launcher's callback is a C function pointer.
-#![forbid(unsafe_code)]
+//! [`abi`] is the same traits as a C ABI, for the platform module a process loads `RTLD_LOCAL` (launcher-ui-module plan S2); the value types its views do not wrap are `#[repr(C)]` here, at their definition.
+#![deny(unsafe_code)]
 #![deny(missing_docs)]
 
 use std::os::fd::{OwnedFd, RawFd};
 
+// the C ABI's callbacks and views: raw pointers across the module boundary, each turned into safe types at once
+#[allow(unsafe_code)]
 pub mod abi;
 pub mod audio;
 pub use atl_compositor::scene::Scene;
@@ -20,6 +23,7 @@ pub use atl_gralloc::handle::DeviceNumber;
 pub use atl_platform_types::{Monitor, PhysSize, Rotation, Scale};
 
 /// A position in physical pixels from the window content's top-left corner; fractional because pointers report sub-pixel positions.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PhysPoint {
     /// Horizontal distance, in physical pixels.
@@ -99,6 +103,7 @@ pub trait UiInvoker: Send + Sync + 'static {
 }
 
 /// A pointer cursor, by the CSS cursor names desktop toolkits share (the set Android's pointer icon types name).
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CursorShape {
     /// The arrow.
@@ -248,6 +253,7 @@ pub struct Capture {
 }
 
 /// One frame callback of the display's clock.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameTick {
     /// Start of the frame on the monotonic clock (`CLOCK_MONOTONIC`), in nanoseconds: the vsync timestamp the app's `Choreographer` and the compositor's event thread are fed.
@@ -255,6 +261,7 @@ pub struct FrameTick {
 }
 
 /// One frame the display showed, as the compositor's presentation feedback reports it: the sample the compositor's vsync grid is put on (UI mode).
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PresentTiming {
     /// When the frame reached the display, on the monotonic clock (`CLOCK_MONOTONIC`), in nanoseconds.
@@ -289,6 +296,7 @@ pub trait FrameClock {
 }
 
 /// A pointer button.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PointerButton {
     /// Left, or the touch contact: `BUTTON_PRIMARY`.
@@ -302,6 +310,7 @@ pub enum PointerButton {
 }
 
 /// What a pointer did.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PointerPhase {
     /// A button went down.
@@ -317,6 +326,7 @@ pub enum PointerPhase {
 }
 
 /// One pointer event.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PointerEvent {
     /// What happened.
@@ -328,6 +338,7 @@ pub struct PointerEvent {
 }
 
 /// What a scroll did. Deltas follow the toolkit's convention: positive scrolls toward the end of the content (down, right); the compositor has already applied the desktop's natural-scrolling setting.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ScrollKind {
     /// A wheel turned, in notches (fractional for high-resolution wheels).
@@ -349,6 +360,7 @@ pub enum ScrollKind {
 }
 
 /// One scroll event, at the pointer.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScrollEvent {
     /// What happened.
@@ -360,6 +372,7 @@ pub struct ScrollEvent {
 }
 
 /// What a touch contact did.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TouchPhase {
     /// The contact touched down.
@@ -373,6 +386,7 @@ pub enum TouchPhase {
 }
 
 /// One touch contact event.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TouchEvent {
     /// What happened.
@@ -386,6 +400,7 @@ pub struct TouchEvent {
 }
 
 /// One physical key press or release of the window's keyboard. No keysym or text: characters come from the Android key map, composed text from `TextInput`.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct KeyEvent {
     /// Pressed (`true`) or released. A press of a key already down is the desktop's key repeat.
@@ -399,6 +414,7 @@ pub struct KeyEvent {
 }
 
 /// Lock states of a keyboard.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Locks {
     /// Caps Lock on.
@@ -410,6 +426,7 @@ pub struct Locks {
 }
 
 /// An input event of a window.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum InputEvent {
     /// Mouse or touchpad pointer. Stylus and gamepads are added by the slice that first consumes them.
@@ -431,6 +448,7 @@ pub trait InputSource {
 }
 
 /// A rectangle in physical pixels of the window content, origin top-left.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PhysRect {
     /// Left edge.
@@ -444,6 +462,7 @@ pub struct PhysRect {
 }
 
 /// What a text field holds, for the input method's choice of layout and behaviour (GTK `GtkInputPurpose`, text-input v3 `content_purpose`).
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ContentPurpose {
     /// Any text.
@@ -472,6 +491,7 @@ pub enum ContentPurpose {
 }
 
 /// How the input method should treat the text, as independent bits (GTK `GtkInputHints`); combine with `|`.
+#[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ContentHints(u32);
 

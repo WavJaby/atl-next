@@ -6,6 +6,7 @@
 use std::path::Path;
 
 /// Frames per second and interleaved channels of a PCM stream. Samples are F32 in the server's native byte order.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PcmSpec {
     /// Frames per second: the server's graph rate after negotiation.

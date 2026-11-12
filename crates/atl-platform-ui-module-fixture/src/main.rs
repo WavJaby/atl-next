@@ -1,35 +1,42 @@
 // SPDX-License-Identifier: MIT
-//! The process of `xtask test ui-module` (launcher-ui-module plan slice M1): loads the platform module as the launcher will, then an app library, and reports on stdout what each part saw. The harness judges; this program only reports.
-//! 1. `dlopen(<module>, RTLD_NOW | RTLD_LOCAL)` (`--global`: RTLD_GLOBAL, the gate's break), the entry with this program's [`Host`]: its Looper (a `poll(2)` loop on this thread) and its log sink (`--no-log-sink`: none, the other break).
-//! 2. One colour window; the Looper runs until the module reports a paint or `--timeout-ms` passes. `--audio <socket>`: the module's PipeWire connect (loads SPA plugins from inside the local group).
+//! The process of `xtask test ui-module` (launcher-ui-module plan slices M1, M3): loads the platform module through the `atl-platform-ui` facade, as the launcher does, then an app library, and reports on stdout what each part saw. The harness judges; this program only reports.
+//! 1. `PlatformUi::attach` with this program's Looper (a `poll(2)` loop on this thread, state in an `Rc`, not a thread-local): the facade dlopens the module `RTLD_NOW | RTLD_LOCAL` by file name, checks its build identity and routes its log records into this program's subscriber (target `atl_platform_ui_linux`). A refusal is reported (`attach_error`) and the run goes on without UI, as the launcher's "no UI mode". `--global`: the module is dlopened `RTLD_GLOBAL` first (the gate's break: the facade's later local load gets the same, global, object). `--drop-module-records`: this subscriber filters the module's records out (the other break).
+//! 2. One `PlatformWindow` presenting a colour scene at each tick until the first paint or `--timeout-ms`. `--audio <socket>`: `PlatformAudioHost::connect` (loads SPA plugins inside the local group).
 //! 3. `dlopen(<app>, RTLD_NOW)` as nativeloader would, and the app's `app_probe` (the stand-in's `vkCreateInstance`). Then `dlsym(RTLD_DEFAULT)` of host-library symbols: any found means the module's closure leaked into global scope.
+//! 4. Drops the window and the session, then returns from `main`: the normal exit runs every thread-local destructor, which must not reach a dropped object (state note ui-module-m1, trap 1).
 //!
-//! Lines: module records as `MODULE <target>: <message>`; results as `RESULT <key>=<value>`.
+//! Lines: module records under target `atl_platform_ui_linux`; results as `RESULT <key>=<value>`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::ffi::{CStr, CString, c_int, c_void};
+use std::os::fd::RawFd;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
-use atl_platform_ui_api::abi::{self, Entry, FdSink, Host};
+use atl_compositor::scene::{Content, Quad};
+use atl_libgui_parcel::state::FloatRect;
+use atl_platform_ui::audio::AudioHost;
+use atl_platform_ui::{
+    FdEvents, FrameClock, Looper, PhysSize, PlatformAudioHost, PlatformUi, PlatformWindow, Scene,
+    Ui, UiError, Window, WindowAttributes, abi,
+};
 use clap::Parser;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 struct Args {
-    /// The platform module; a bare file name is found by the dynamic loader's search path.
-    #[arg(long, default_value = abi::MODULE_FILE)]
-    module: PathBuf,
     /// The app library: exports `int app_probe(void)`, which returns its `vkCreateInstance(0, 0, 0)`.
     #[arg(long)]
     app: PathBuf,
-    /// Load the module RTLD_GLOBAL (deliberate break: its closure joins global scope).
+    /// dlopen the module RTLD_GLOBAL before the facade loads it (deliberate break: its closure joins global scope).
     #[arg(long)]
     global: bool,
-    /// Give the module no log sink (deliberate break: its records go nowhere).
+    /// Filter the module's records out of this program's subscriber (deliberate break: they reach the process only through it).
     #[arg(long)]
-    no_log_sink: bool,
+    drop_module_records: bool,
     /// Connect the module's audio host to this PipeWire socket.
     #[arg(long)]
     audio: Option<PathBuf>,
@@ -65,114 +72,77 @@ fn result(key: &str, value: impl std::fmt::Display) {
     tracing::info!("RESULT {key}={value}");
 }
 
-/// The Looper: registered fds polled on this thread, readiness handed to the module's sink.
+type Sink = Box<dyn FnMut(RawFd, FdEvents)>;
+
+/// The Looper's registrations and the module's sink.
 #[derive(Default)]
-struct LooperState {
-    sink: Option<FdSink>,
-    fds: BTreeMap<c_int, u32>,
+struct LoopState {
+    sink: Option<Sink>,
+    fds: BTreeMap<RawFd, FdEvents>,
 }
 
-thread_local! {
-    static LOOPER: RefCell<LooperState> = RefCell::new(LooperState::default());
-}
+/// This thread's Looper: registered fds polled by [`PollLooper::poll_once`], readiness handed to the sink.
+#[derive(Clone, Default)]
+struct PollLooper(Rc<RefCell<LoopState>>);
 
-unsafe extern "C" fn host_log(
-    _data: *mut c_void,
-    level: abi::Level,
-    target: *const c_char,
-    target_len: usize,
-    message: *const c_char,
-    message_len: usize,
-) {
-    // SAFETY: the ABI contract: both are UTF-8 byte ranges valid for this call.
-    let (target, message) = unsafe {
-        (
-            std::slice::from_raw_parts(target.cast::<u8>(), target_len),
-            std::slice::from_raw_parts(message.cast::<u8>(), message_len),
-        )
-    };
-    let (target, message) = (
-        String::from_utf8_lossy(target),
-        String::from_utf8_lossy(message),
-    );
-    tracing::info!("MODULE level={level} {target}: {message}");
-}
+impl Looper for PollLooper {
+    fn set_sink(&self, sink: Sink) {
+        self.0.borrow_mut().sink = Some(sink);
+    }
 
-unsafe extern "C" fn host_set_sink(_data: *mut c_void, sink: FdSink) {
-    let old = LOOPER.with_borrow_mut(|l| l.sink.replace(sink));
-    if let Some(old) = old {
-        // SAFETY: the sink's contract: dropped once, after its last call.
-        unsafe { (old.drop)(old.data) };
+    fn add_fd(&self, fd: RawFd, events: FdEvents) -> Result<(), UiError> {
+        self.0.borrow_mut().fds.insert(fd, events);
+        Ok(())
+    }
+
+    fn remove_fd(&self, fd: RawFd) -> Result<(), UiError> {
+        self.0.borrow_mut().fds.remove(&fd);
+        Ok(())
     }
 }
 
-unsafe extern "C" fn host_add_fd(_data: *mut c_void, fd: c_int, events: u32) -> c_int {
-    LOOPER.with_borrow_mut(|l| l.fds.insert(fd, events));
-    0
-}
-
-unsafe extern "C" fn host_remove_fd(_data: *mut c_void, fd: c_int) -> c_int {
-    LOOPER.with_borrow_mut(|l| l.fds.remove(&fd));
-    0
-}
-
-/// One `poll(2)` pass of at most `timeout`, then the sink for each ready fd.
-fn poll_once(timeout: Duration) -> Result<()> {
-    let mut pfds: Vec<libc::pollfd> = LOOPER.with_borrow(|l| {
-        l.fds
+impl PollLooper {
+    /// One `poll(2)` pass of at most `timeout`, then the sink for each ready fd.
+    fn poll_once(&self, timeout: Duration) -> Result<()> {
+        let mut pfds: Vec<libc::pollfd> = self
+            .0
+            .borrow()
+            .fds
             .iter()
-            .map(|(&fd, &ev)| libc::pollfd {
+            .map(|(&fd, ev)| libc::pollfd {
                 fd,
-                events: (if ev & abi::FD_INPUT != 0 {
-                    libc::POLLIN
-                } else {
-                    0
-                }) | (if ev & abi::FD_OUTPUT != 0 {
-                    libc::POLLOUT
-                } else {
-                    0
-                }),
+                events: (if ev.input { libc::POLLIN } else { 0 })
+                    | (if ev.output { libc::POLLOUT } else { 0 }),
                 revents: 0,
             })
-            .collect()
-    });
-    let ms = c_int::try_from(timeout.as_millis()).unwrap_or(c_int::MAX);
-    // SAFETY: `pfds` is a valid array of its length for the call.
-    let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, ms) };
-    if n < 0 {
-        let e = std::io::Error::last_os_error();
-        if e.kind() == std::io::ErrorKind::Interrupted {
-            return Ok(());
+            .collect();
+        let ms = c_int::try_from(timeout.as_millis()).unwrap_or(c_int::MAX);
+        // SAFETY: `pfds` is a valid array of its length for the call.
+        let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, ms) };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                return Ok(());
+            }
+            bail!("poll: {e}");
         }
-        bail!("poll: {e}");
-    }
-    for p in pfds.iter().filter(|p| p.revents != 0) {
-        let r = p.revents;
-        let bits = (if r & libc::POLLIN != 0 {
-            abi::FD_INPUT
-        } else {
-            0
-        }) | (if r & libc::POLLOUT != 0 {
-            abi::FD_OUTPUT
-        } else {
-            0
-        }) | (if r & libc::POLLERR != 0 {
-            abi::FD_ERROR
-        } else {
-            0
-        }) | (if r & libc::POLLHUP != 0 {
-            abi::FD_HANGUP
-        } else {
-            0
-        });
-        // the sink may add or remove fds: call it without the borrow held
-        let sink = LOOPER.with_borrow(|l| l.sink.as_ref().map(|s| (s.call, s.data)));
-        if let Some((call, data)) = sink {
-            // SAFETY: the sink's contract: called on this (the UI) thread while it is set.
-            unsafe { call(data, p.fd, bits) };
+        for p in pfds.iter().filter(|p| p.revents != 0) {
+            let r = p.revents;
+            let events = FdEvents {
+                input: r & libc::POLLIN != 0,
+                output: r & libc::POLLOUT != 0,
+                error: r & libc::POLLERR != 0,
+                hangup: r & libc::POLLHUP != 0,
+            };
+            // the sink adds and removes fds: run it with the state unborrowed, then put it back
+            let sink = self.0.borrow_mut().sink.take();
+            if let Some(mut sink) = sink {
+                sink(p.fd, events);
+                self.0.borrow_mut().sink.get_or_insert(sink);
+            }
         }
+        Ok(())
     }
-    Ok(())
 }
 
 fn dlerror() -> String {
@@ -222,14 +192,88 @@ fn provider(name: &str) -> String {
         .into_owned()
 }
 
+/// One opaque colour quad covering `width` x `height`.
+fn color_scene(width: u32, height: u32, rgb: [f32; 3]) -> Scene {
+    let dst = FloatRect {
+        left: 0.0,
+        top: 0.0,
+        right: width as f32,
+        bottom: height as f32,
+    };
+    Scene {
+        frame: 1,
+        layer_stack: 0,
+        quads: vec![Quad {
+            layer_id: 0,
+            name: "color".into(),
+            content: Content::Color(rgb),
+            dst,
+            clip: Some(dst),
+            alpha: 1.0,
+        }],
+    }
+}
+
+/// Opens the colour window and runs the Looper until its first paint or the deadline; returns the window and the paint count.
+fn paint_window(
+    ui: &PlatformUi,
+    looper: &PollLooper,
+    timeout: Duration,
+) -> Result<(Rc<PlatformWindow>, u64)> {
+    let (width, height) = (320, 240);
+    let window = Rc::new(
+        PlatformWindow::create(
+            ui,
+            &WindowAttributes {
+                title: "atl ui-module fixture".into(),
+                app_id: None,
+                size: PhysSize { width, height },
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("window: {e}"))?,
+    );
+    let painted = Rc::new(Cell::new(0u64));
+    // the colour the harness may look for in a capture; any opaque colour shows a paint
+    let scene = color_scene(width, height, [0.2, 0.6, 0.9]);
+    let weak = Rc::downgrade(&window);
+    let count = Rc::clone(&painted);
+    window.on_tick(move |_| {
+        let Some(w) = weak.upgrade() else { return };
+        if let Err(e) = w.present(&scene) {
+            tracing::error!("present: {e}");
+        }
+        if count.get() == 0 {
+            w.request_frame();
+        }
+    });
+    let count = Rc::clone(&painted);
+    window.on_painted(move |_| count.set(count.get() + 1));
+    window.request_frame();
+    let deadline = Instant::now() + timeout;
+    while painted.get() == 0 && Instant::now() < deadline {
+        looper.poll_once(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(100)),
+        )?;
+    }
+    let n = painted.get();
+    Ok((window, n))
+}
+
 fn main() -> Result<()> {
+    let args = Args::parse();
+    let filter = if args.drop_module_records {
+        "info,atl_platform_ui_linux=off"
+    } else {
+        "info"
+    };
     tracing_subscriber::fmt()
         .with_writer(std::io::stdout)
         .with_ansi(false)
         .without_time()
-        .with_target(false)
+        .with_env_filter(EnvFilter::new(filter))
         .init();
-    let args = Args::parse();
     // the launcher's crash handler queries and sets actions through sigchain (libsigchain leads DT_NEEDED); the same call here is the reference that keeps libsigchain linked, and where it resolves is reported
     let mut old = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
     // SAFETY: a query (null new action) into a zeroed out-parameter of the right type.
@@ -240,59 +284,35 @@ fn main() -> Result<()> {
         std::io::Error::last_os_error()
     );
     result("sigaction_from", provider("sigaction"));
+    result("abi_id", abi::ABI_ID);
     // what global lookup finds before the module: the process's own closure (libsigchain's pulls AOSP libz.so) is not the module's leak
     let before: Vec<String> = HOST_SYMBOLS.iter().map(|s| provider(s)).collect();
-    let flags = libc::RTLD_NOW
-        | if args.global {
-            libc::RTLD_GLOBAL
-        } else {
-            libc::RTLD_LOCAL
-        };
     result("module_flags", if args.global { "global" } else { "local" });
-    let module = dlopen(&args.module, flags)?;
-    let entry = dlsym(module, abi::ENTRY_SYMBOL)
-        .with_context(|| format!("{}: {}", abi::ENTRY_SYMBOL, dlerror()))?;
-    // SAFETY: the symbol is the module's `abi::Entry` (one definition compiled into both sides).
-    let entry: Entry = unsafe { std::mem::transmute::<*mut c_void, Entry>(entry) };
-    let host: &'static Host = Box::leak(Box::new(Host {
-        data: std::ptr::null_mut(),
-        log: if args.no_log_sink {
-            None
-        } else {
-            Some(host_log)
-        },
-        set_sink: host_set_sink,
-        add_fd: host_add_fd,
-        remove_fd: host_remove_fd,
-    }));
-    // SAFETY: `host` is leaked, so it outlives the process; this thread is the UI thread from here on.
-    let m = unsafe { entry(host) };
-    // SAFETY: null or the module's static `Module`.
-    let m =
-        unsafe { m.as_ref() }.context("module entry failed (its reason is in the MODULE lines)")?;
-    let title = CString::new("atl ui-module fixture")?;
-    // the colour the harness may look for in a capture; any opaque colour shows a paint
-    let rgb = [0.2f32, 0.6, 0.9];
-    // SAFETY: the ABI contract: NUL-terminated title, three floats, UI thread.
-    let rc = unsafe { (m.open_color_window)(title.as_ptr(), 320, 240, &rgb) };
-    ensure!(rc == 0, "open_color_window: {rc}");
-    let deadline = Instant::now() + Duration::from_millis(args.timeout_ms);
-    let painted = || {
-        // SAFETY: UI thread.
-        unsafe { (m.painted)() }
-    };
-    while painted() == 0 && Instant::now() < deadline {
-        poll_once(
-            deadline
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_millis(100)),
+    if args.global {
+        dlopen(
+            std::path::Path::new(abi::MODULE_FILE),
+            libc::RTLD_NOW | libc::RTLD_GLOBAL,
         )?;
     }
-    result("painted", painted());
+    let looper = PollLooper::default();
+    let mut session = None;
+    match PlatformUi::attach(Box::new(looper.clone()), None) {
+        Ok(ui) => {
+            let (window, painted) =
+                paint_window(&ui, &looper, Duration::from_millis(args.timeout_ms))?;
+            result("painted", painted);
+            session = Some((ui, window));
+        }
+        Err(e) => result("attach_error", e),
+    }
     if let Some(socket) = &args.audio {
-        let c = CString::new(socket.as_os_str().as_encoded_bytes())?;
-        // SAFETY: NUL-terminated, UI thread.
-        result("audio_connect", unsafe { (m.audio_connect)(c.as_ptr()) });
+        match PlatformAudioHost::connect(socket) {
+            Ok(_) => result("audio_connect", 1),
+            Err(e) => {
+                result("audio_connect", 0);
+                result("audio_error", e);
+            }
+        }
     }
     let app = dlopen(&args.app, libc::RTLD_NOW)?;
     let probe = dlsym(app, "app_probe").context("app_probe")?;
@@ -320,11 +340,14 @@ fn main() -> Result<()> {
     result("global_before_module", preexisting.join(","));
     // a few more passes after the app load: the module keeps running in the same loop
     for _ in 0..5 {
-        poll_once(Duration::from_millis(20))?;
+        looper.poll_once(Duration::from_millis(20))?;
+    }
+    // window first, then the session: the order the trait objects' owners use
+    if let Some((ui, window)) = session.take() {
+        drop(window);
+        drop(ui);
     }
     result("done", 1);
-    // the launcher's exit (ART's FastExit): no thread-local destructors. Running them would drop the module's window, whose fd removal calls this program's Looper after its thread-local is gone (measured: "cannot access a Thread Local Storage value during or after destruction", abort).
-    std::io::Write::flush(&mut std::io::stdout())?;
-    // SAFETY: _exit has no preconditions; stdout is flushed above.
-    unsafe { libc::_exit(0) }
+    // a normal exit: the thread-local destructors run (M1 used _exit to skip a module thread-local that called a destroyed Looper; M3 keeps no state there)
+    Ok(())
 }

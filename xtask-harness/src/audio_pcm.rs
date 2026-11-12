@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 
-use crate::unit_use::{self, Echo, Units};
+use crate::platform_ui::Built as Client;
 use crate::verdict::{Failure, Verdict};
 
 /// The tone's frequency in Hz, the client's `--freq` default.
@@ -102,7 +102,7 @@ impl Report {
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let client = build_client(root)?;
+    let client = crate::platform_ui::build_client(root, "audio_pcm")?;
     let dir = match &args.keep {
         Some(dir) => dir.clone(),
         None => std::env::temp_dir().join(format!("{SINK_PREFIX}-{}", std::process::id())),
@@ -134,7 +134,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 }
 
 /// Records the default sink's monitor while the client plays into the null sink the gate made the default.
-fn normal(client: &Path, args: &Args, dir: &Path, report: &mut Report) -> Result<()> {
+fn normal(client: &Client, args: &Args, dir: &Path, report: &mut Report) -> Result<()> {
     let name = format!("{SINK_PREFIX}-{}", std::process::id());
     let wav = dir.join("recording.wav");
     let routing = Routing::setup(&name)?;
@@ -175,7 +175,7 @@ fn normal(client: &Path, args: &Args, dir: &Path, report: &mut Report) -> Result
 }
 
 /// Runs the client against a private server with no session manager: nothing links its stream, so the output must refuse its start.
-fn no_target(client: &Path, args: &Args, dir: &Path, report: &mut Report) -> Result<()> {
+fn no_target(client: &Client, args: &Args, dir: &Path, report: &mut Report) -> Result<()> {
     let runtime = dir.join("runtime");
     fs::create_dir_all(&runtime).with_context(|| format!("creating {}", runtime.display()))?;
     let env = [("PIPEWIRE_RUNTIME_DIR", runtime.as_path())];
@@ -274,38 +274,16 @@ fn check_recording(
     Ok(())
 }
 
-/// Builds the client example and returns its path.
-fn build_client(root: &Path) -> Result<PathBuf> {
-    let mut cmd = crate::cargo_command();
-    cmd.current_dir(root).args([
-        "build",
-        "--locked",
-        "-p",
-        "atl-platform-ui",
-        "--example",
-        "audio_pcm",
-    ]);
-    let run = unit_use::run(&mut cmd, Units::Recorded, Echo::Both)?;
-    ensure!(
-        run.status.success(),
-        "cargo build of the audio_pcm client failed"
-    );
-    run.messages
-        .iter()
-        .filter(|m| m["reason"] == "compiler-artifact" && m["target"]["name"] == "audio_pcm")
-        .find_map(|m| m["executable"].as_str().map(PathBuf::from))
-        .context("cargo reported no audio_pcm executable")
-}
-
-/// Runs the client with the tone parameters of `args` (and a break, if any), connected to the server socket `remote`; returns what it printed.
+/// Runs the client with the tone parameters of `args` (and a break, if any), connected to the server socket `remote`; returns what it printed. The client finds the platform module through LD_LIBRARY_PATH.
 fn run_client(
-    client: &Path,
+    client: &Client,
     args: &Args,
     env: &[(&str, &Path)],
     remote: &Path,
 ) -> Result<ClientRun> {
-    let mut command = Command::new(client);
+    let mut command = Command::new(&client.exe);
     command
+        .env("LD_LIBRARY_PATH", &client.module_dir)
         .arg("--rate")
         .arg(args.rate.to_string())
         .arg("--channels")

@@ -385,8 +385,16 @@ impl Probe {
     }
 }
 
-/// Build `gate` and return its path.
-fn build_client(root: &Path) -> Result<PathBuf> {
+/// A facade example and the platform module it loads, built together (one build: the module's abi id matches).
+pub struct Built {
+    /// The example executable.
+    pub exe: PathBuf,
+    /// The dir holding `libatl_platform_ui_linux.so`: the client's LD_LIBRARY_PATH (the facade dlopens the module by file name).
+    pub module_dir: PathBuf,
+}
+
+/// Builds atl-platform-ui's `example` with the platform module (atl-platform-ui-linux's cdylib).
+pub fn build_client(root: &Path, example: &str) -> Result<Built> {
     let mut cmd = crate::cargo_command();
     cmd.current_dir(root).args([
         "build",
@@ -394,18 +402,34 @@ fn build_client(root: &Path) -> Result<PathBuf> {
         "-p",
         "atl-platform-ui",
         "--example",
-        "gate",
+        example,
+        "-p",
+        "atl-platform-ui-linux",
+        "--lib",
     ]);
     let run = unit_use::run(&mut cmd, Units::Recorded, Echo::Both)?;
     ensure!(
         run.status.success(),
-        "cargo build of the gate client failed"
+        "cargo build of the {example} client failed"
     );
-    run.messages
-        .iter()
-        .filter(|m| m["reason"] == "compiler-artifact" && m["target"]["name"] == "gate")
+    let artifacts = || {
+        run.messages
+            .iter()
+            .filter(|m| m["reason"] == "compiler-artifact")
+    };
+    let exe = artifacts()
+        .filter(|m| m["target"]["name"] == example)
         .find_map(|m| m["executable"].as_str().map(PathBuf::from))
-        .context("cargo reported no gate executable")
+        .with_context(|| format!("cargo reported no {example} executable"))?;
+    let module = artifacts()
+        .filter(|m| m["target"]["name"] == "atl_platform_ui_linux")
+        .flat_map(|m| m["filenames"].as_array().cloned().unwrap_or_default())
+        .find_map(|f| f.as_str().filter(|f| f.ends_with(".so")).map(PathBuf::from))
+        .context("cargo reported no platform module")?;
+    Ok(Built {
+        exe,
+        module_dir: module.parent().context("module dir")?.to_path_buf(),
+    })
 }
 
 /// The desktop's compositor socket, from WAYLAND_DISPLAY (absolute, or under XDG_RUNTIME_DIR).
@@ -450,7 +474,7 @@ fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let exe = build_client(root)?;
+    let built = build_client(root, "gate")?;
     let out_dir = match &args.keep {
         Some(dir) => {
             std::fs::create_dir_all(dir)?;
@@ -508,7 +532,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         Vec::new()
     };
-    let mut child = Command::new(&exe)
+    let mut child = Command::new(&built.exe)
+        .env("LD_LIBRARY_PATH", &built.module_dir)
         .args(["--out"])
         .arg(&out_dir)
         .args(["--frames", &args.frames.to_string()])
@@ -529,7 +554,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         // always a file: the dmabuf gate reads GTK's debug lines from it (--verbose prints it at the end)
         .stderr(Stdio::from(std::fs::File::create(&stderr_file)?))
         .spawn()
-        .with_context(|| format!("starting {}", exe.display()))?;
+        .with_context(|| format!("starting {}", built.exe.display()))?;
     let stdout = child.stdout.take().context("client stdout")?;
     let stdin = child.stdin.take().context("client stdin")?;
     let (tx, lines) = channel();

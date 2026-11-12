@@ -270,8 +270,9 @@ thread_local! {
 
 /// Syncs the Looper's registrations to GLib now, when called on the UI thread outside a pass; a no-op inside a pass (the pass syncs when it ends) and on any other thread (GLib wakes the owner itself).
 /// Needed after any GLib change the UI thread makes outside a pass (Java calling in from the Looper, e.g. the app's vsync request): a source attached by the context's owner writes no wakeup (GLib `g_source_attach_unlocked` wakes only another owner thread), so its fd or timeout would otherwise never reach the Looper and never fire.
+/// During thread-local teardown (a window the process drops from its own thread-local destructor at exit) the slot may already be gone: then nothing syncs, the loop is ending (`with` would abort there).
 pub fn resync() {
-    let mirror = MIRROR.with_borrow(Weak::upgrade);
+    let mirror = MIRROR.try_with(|m| m.borrow().upgrade()).ok().flatten();
     if let Some(mirror) = mirror
         && let Ok(mut m) = mirror.try_borrow_mut()
     {

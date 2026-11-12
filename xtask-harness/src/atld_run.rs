@@ -185,6 +185,8 @@ pub struct Runtime {
     platform_files: Vec<(PathBuf, String)>,
     /// The directory of the NativeBridge core (atl-native-bridge `LIBRARY`), which ART of every app process opens by name (`ro.dalvik.vm.native.bridge`).
     native_bridge: PathBuf,
+    /// The directory of the platform module (`libatl_platform_ui_linux.so`, ui_module.rs `stage_module`), which the launcher's atl-platform-ui facade opens by name: on every app's library path, UI or not (the audio output is in it too).
+    platform_module: PathBuf,
     /// The device's ABIs, preferred first (`ro.product.cpu.abilist`'s role), for the install's native-library extraction and each app's instruction set ([`device_abis`]).
     abis: Vec<SupportedAbi>,
     /// The headless pointer script (atld `--headless-pointer`), when [`Runtime::with_headless_pointer`] set it.
@@ -518,6 +520,7 @@ impl Runtime {
             "native-bridge/lib",
             atl_native_bridge::LIBRARY,
         )?;
+        let platform_module = crate::ui_module::stage_module(root, &out)?;
         let arches = crate::arches::load(root)?;
         let abis = device_abis(&arches, host)?;
         let licenses = crate::licenses::load(root, &crate::sources::load(root)?.upstream_names())?;
@@ -527,6 +530,7 @@ impl Runtime {
             tree: tree::shared_tree(&layout),
             test_only,
             native_bridge,
+            platform_module,
             abis,
             art,
             out,
@@ -1056,6 +1060,9 @@ impl Runtime {
             .files
             .extend(self.platform_files.iter().map(|(f, _)| f.clone()));
         inputs.files.extend(remote::lib_files(&self.native_bridge)?);
+        inputs
+            .files
+            .extend(remote::lib_files(&self.platform_module)?);
         Ok(inputs)
     }
 
@@ -1125,18 +1132,24 @@ impl Runtime {
             .iter()
             .map(|(file, _)| self.keychars.join(file))
             .collect();
-        let mut staged: Vec<&Path> =
-            vec![&self.art.lib_path, &self.native_bridge, &self.framework_res];
+        let mut staged: Vec<&Path> = vec![
+            &self.art.lib_path,
+            &self.native_bridge,
+            &self.platform_module,
+            &self.framework_res,
+        ];
         staged.extend(self.fonts.files.iter().map(PathBuf::as_path));
         staged.extend(keychars.iter().map(PathBuf::as_path));
         staged.extend(self.gralloc.iter().map(|(_, dir)| dir.as_path()));
         staged.extend(self.gl_driver.iter().map(|(f, _)| f.as_path()));
         staged.extend(self.native_bridge_guest.iter().map(|(f, _)| f.as_path()));
         crate::licenses::refuse_test_only(&staged, &self.test_only)?;
-        // the staged ART's library dir, the NativeBridge core's, then mapper.atl.so's (a PathBuf would take the absolute second as a replacement)
+        // the staged ART's library dir, the NativeBridge core's, the platform module's, then mapper.atl.so's (a PathBuf would take the absolute second as a replacement)
         let mut lib_path = std::ffi::OsString::from(self.art.lib_path.as_os_str());
         lib_path.push(":");
         lib_path.push(&self.native_bridge);
+        lib_path.push(":");
+        lib_path.push(&self.platform_module);
         if let Some((_, dir)) = &self.gralloc {
             lib_path.push(":");
             lib_path.push(dir);

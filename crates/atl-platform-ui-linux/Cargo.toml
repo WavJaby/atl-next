@@ -11,10 +11,10 @@ publish.workspace = true
 # One thread: GLib's default main context is mirrored into the Android Looper of the thread that attached (`mirror.rs`; the Looper polls it), so a blocked UI thread answers no `xdg_wm_base.ping`.
 # `unsafe` only in `mirror` (raw g_main_context calls), `dmabuf` (GDK borrows the dmabuf texture's fds: gtk4-rs marks the builder unsafe) and `audio` (PipeWire: the thread-loop constructor pipewire-rs marks unsafe, `sched_getscheduler`); the read-fence ioctl is atl-gralloc-dmabuf's.
 # PipeWire (plan A0, `audio`): the PCM output's safe bindings, the only crate allowed to depend on them (deny.toml `wrappers`).
-# Also a cdylib, `libatl_platform_ui_linux.so` (launcher-ui-module plan, slice M1, `module`): loaded with dlopen(RTLD_LOCAL) it keeps GTK, GLib, PipeWire and their closure out of the process's global symbol scope. tracing-subscriber forwards the module's own `tracing` copy to the process's log sink.
+# Only a cdylib, `libatl_platform_ui_linux.so` (launcher-ui-module plan S2/M3, `module`): the atl-platform-ui facade loads it with dlopen(RTLD_NOW | RTLD_LOCAL) and calls it through atl-platform-ui-api's `abi` vtable, so GTK, GLib, PipeWire and their closure stay out of the process's global symbol scope. No rlib: no crate links it, so there is no second (static) route to GTK. tracing-subscriber forwards the module's own `tracing` copy to the process's log sink.
 
 [lib]
-crate-type = ["rlib", "cdylib"]
+crate-type = ["cdylib"]
 
 [dependencies]
 atl-compositor = { path = "../atl-compositor" }

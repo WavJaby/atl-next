@@ -518,9 +518,10 @@ dependencies = [
  "atl-gralloc-service",
  "atl-libgui-parcel",
  "atl-platform-ui-api",
- "atl-platform-ui-linux",
  "clap",
+ "libc",
  "rustix",
+ "tracing",
 ]
 
 [[package]]
@@ -529,6 +530,7 @@ version = "0.0.0"
 dependencies = [
  "atl-compositor",
  "atl-gralloc",
+ "atl-libgui-parcel",
  "atl-platform-types",
  "thiserror",
 ]
@@ -559,7 +561,9 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "atl-bridgegen",
- "atl-platform-ui-api",
+ "atl-compositor",
+ "atl-libgui-parcel",
+ "atl-platform-ui",
  "clap",
  "libc",
  "tracing",
