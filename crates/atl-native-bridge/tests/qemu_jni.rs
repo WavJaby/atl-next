@@ -170,7 +170,12 @@ const R1_INTS: usize = 15;
 const CASES: &[(&str, char, i64, &str)] = &[
     ("reserved", 'r', REFUSE_RESERVED, "is reserved"),
     ("valist", 'l', REFUSE_VALIST, "gave no getMethodShorty"),
-    ("forged", 'g', REFUSE_FORGED, "past the JNINativeInterface table"),
+    (
+        "forged",
+        'g',
+        REFUSE_FORGED,
+        "past the JNINativeInterface table",
+    ),
     (
         "downstack",
         'R',
