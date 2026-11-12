@@ -324,11 +324,8 @@ func (g *Graph) noDeviceVariant(m *Module) bool {
 }
 
 // ccGoalSide: a C/C++/Rust goal builds its device variant; a host-only one (aapt2's cc_binary_host) its host one -- a device variant would be a build tool linked as if shipped, its closure (libprotobuf-cpp-full) under the licence gate.
-// A cross host builds its host variant for every goal: the device variant needs the guest's bionic and device ISA flags. HostCross is set exactly when the host arch is not the build machine's, so this is a host-vs-build relation, not an arch test.
+// The variant never depends on the machine: a cross host builds the same one, for its own target (soongflags.go product-side flags).
 func (g *Graph) ccGoalSide(goal string) Side {
-	if g.cfg.HostCross.set() {
-		return Host
-	}
 	if m := g.lookup(goal, Device); m != nil && g.noDeviceVariant(m) {
 		return Host
 	}

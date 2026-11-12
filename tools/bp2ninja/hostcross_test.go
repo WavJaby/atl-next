@@ -51,15 +51,43 @@ func TestHostCrossHostSide(t *testing.T) {
 			t.Errorf("x86 flag %q on the cross host", f)
 		}
 	}
-	if !slices.Equal(cross.HostLink, riscvCross.linkFlags()) || plain.HostLink != nil {
-		t.Errorf("host link %q, plain %q", cross.HostLink, plain.HostLink)
+	for _, s := range []Side{Device, Host} {
+		if !slices.Equal(cross.Link[s], riscvCross.linkFlags()) || plain.Link[s] != nil {
+			t.Errorf("%v link %q, plain %q", s, cross.Link[s], plain.Link[s])
+		}
 	}
-	if !slices.Equal(cross.Head[Device], plain.Head[Device]) || !slices.Equal(cross.Tail[Device], plain.Tail[Device]) {
-		t.Error("the device side changed with the host's cross target")
+	if cross.Link[Build] != nil {
+		t.Errorf("build link %q", cross.Link[Build])
 	}
 }
 
-// A cross host builds every cc goal's host variant: the device variant needs the guest's bionic (plan B1). The build machine's own host keeps the device side.
+// The device source set on a cross host: Soong's device toolchain flags for the host arch, led by the host row's target, with the toolchain's -march dropped into Skipped -- the row's isa is the one ISA authority (riscv64_device.go's rv64gcv_zba_zbb_zbs would put V in every object).
+// Break: a device side without the cross target, or keeping the toolchain's -march, fails here.
+func TestHostCrossDeviceSide(t *testing.T) {
+	plain := mustFlags(t, Config{Arch: "riscv64", PointerBits: 64}, DeviceArch{})
+	cross := mustFlags(t, riscvOnX86, DeviceArch{})
+	var dropped []string
+	rest := slices.DeleteFunc(slices.Clone(plain.Head[Device]), func(f string) bool {
+		d := strings.HasPrefix(f, "-march=") || strings.HasPrefix(f, "-mcpu=")
+		if d {
+			dropped = append(dropped, f)
+		}
+		return d
+	})
+	if len(dropped) == 0 {
+		t.Fatalf("riscv64 device toolchain gives no -march: %q", plain.Head[Device])
+	}
+	if want := slices.Concat(riscvCross.compileFlags(), rest); !slices.Equal(cross.Head[Device], want) {
+		t.Errorf("device head %q, want %q", cross.Head[Device], want)
+	}
+	for _, f := range dropped {
+		if !slices.Contains(cross.Skipped, f) {
+			t.Errorf("%q not in Skipped %q", f, cross.Skipped)
+		}
+	}
+}
+
+// A cross host builds the variant the build machine's own host builds: the variant is per goal, never per machine.
 func TestCrossGoalSide(t *testing.T) {
 	g := graphFor(t, map[string]string{"p/Android.bp": `cc_binary_host { name: "tool" }
 cc_library { name: "lib" }
@@ -68,7 +96,7 @@ cc_library { name: "optout", device_supported: false }`})
 		t.Fatalf("build machine's host: side %v, want device", got)
 	}
 	g.cfg.HostCross = riscvCross
-	for goal, want := range map[string]Side{"tool": Host, "lib": Host, "optout": Host} {
+	for goal, want := range map[string]Side{"tool": Host, "lib": Device, "optout": Host} {
 		if got := g.ccGoalSide(goal); got != want {
 			t.Errorf("%s: side %v, want %v", goal, got, want)
 		}

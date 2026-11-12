@@ -540,9 +540,7 @@ func (g *Graph) outName(n *Node) string {
 // Not taken: linkerFlags' device-side --pack-dyn-relocs=android+relr. The loader is glibc's ld.so, not bionic's linker (measured, glibc 2.41 + lld 19): `android` packing moves relocations to DT_ANDROID_RELA, which glibc ignores -> pointers left unrelocated, segfault; `relr` -> "DT_RELR without GLIBC_ABI_DT_RELR dependency", a version need lld adds only for -z pack-relative-relocs. Unpacked relocations are what Soong's own pack_relocations: false gives (--pack-dyn-relocs=none): bigger, same behaviour.
 func (g *Graph) linkFlags(n *Node) []string {
 	var out []string
-	if n.side == Host {
-		out = append(out, g.soong.Flags.HostLink...)
-	}
+	out = append(out, g.soong.Flags.Link[n.side]...)
 	if n.kind == Shared {
 		out = append(out, "-shared", "-Wl,-soname,"+g.outName(n)+".so")
 	}

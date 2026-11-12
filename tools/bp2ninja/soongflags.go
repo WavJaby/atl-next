@@ -33,8 +33,8 @@ type GlobalFlags struct {
 	Triple map[Side]string
 	// per bionic Side: rust/config's RustTriple, rustc's --target there (rust/compiler.go); its std is rustup's for that target (rust-toolchain.toml toolchain). Glibc sides compile for rustc's default host triple
 	RustTriple map[Side]string
-	// the cross host's link flags (HostCross.linkFlags) on every host link; nil when the host is the build machine
-	HostLink []string
+	// per Side: the side's machine target on its links (HostCross.linkFlags on a cross host's product sides); empty where the side links for the build machine or a bionic triple
+	Link map[Side][]string
 }
 
 // hod: the side's Host-or-Device prefix of Soong's global flag variables (<Hod>GlobalCflags).
@@ -150,7 +150,7 @@ func thirdParty(dir string) bool { return android.IsThirdPartyPath(dir + "/") }
 
 func newGlobalFlags() GlobalFlags {
 	return GlobalFlags{Head: map[Side][]string{}, Tail: map[Side][]string{}, Conly: map[Side][]string{}, Cpp: map[Side][]string{}, As: map[Side][]string{},
-		Yasm: map[Side][]string{}, NoToolchain: map[Side]string{}, Triple: map[Side]string{}, RustTriple: map[Side]string{}}
+		Yasm: map[Side][]string{}, NoToolchain: map[Side]string{}, Triple: map[Side]string{}, RustTriple: map[Side]string{}, Link: map[Side][]string{}}
 }
 
 // soongCcConfig, soongRustConfig: the Soong toolchain packages read as data. The converter compiles the pinned build/soong (xtask converter.rs go.work), so their package vars, inits, VariableFuncs and toolchain factories run as in Soong.
@@ -269,6 +269,20 @@ func readGlobalFlags(cfg Config, dev DeviceArch) (GlobalFlags, error) {
 	// each side's toolchain around the global lists (compiler.go: instruction set first, tc.Cflags before CommonGlobalCflags, tc.ToolchainCflags last; tc.Cppflags after the global C++ lists, tc.Asflags before CommonGlobalAsflags)
 	for _, side := range cfg.sides() {
 		os, arch := soongOS(side), arches[side]
+		get, all := get, get
+		// a cross host's product side: the host row's isa (HostCross.ISA) is its only ISA authority; the toolchain's -march/-mcpu (riscv64_device.go rv64gcv_zba_zbb_zbs) is dropped into Skipped, never overridden by order
+		if cfg.machine(side) == "host" {
+			get = func(expr string) ([]string, error) {
+				l, err := all(expr)
+				return slices.DeleteFunc(l, func(f string) bool {
+					drop := strings.HasPrefix(f, "-march=") || strings.HasPrefix(f, "-mcpu=")
+					if drop {
+						skipped[f] = true
+					}
+					return drop
+				}), err
+			}
+		}
 		tc, err := soongCall(func() ccconfig.Toolchain { return ccconfig.FindToolchain(os, arch) })
 		if err != nil {
 			// a host's arch variant is always "", so its only failure is an unregistered (os, arch)
@@ -321,10 +335,12 @@ func readGlobalFlags(cfg Config, dev DeviceArch) (GlobalFlags, error) {
 		}
 		g.Yasm[side] = strings.Fields(yasm)
 	}
-	// the cross host's target flags lead its compiles, ahead of the toolchain's (if it has one); its link flags go on every host link (HostLink)
-	if cfg.HostCross.set() {
-		g.Head[Host] = slices.Concat(cfg.HostCross.compileFlags(), g.Head[Host])
-		g.HostLink = cfg.HostCross.linkFlags()
+	// the cross host's target flags lead every product side's compiles (device and host source sets: both run on the ATL host), ahead of the toolchain's (if it has one); its link flags go on their links (Link)
+	for _, side := range cfg.sides() {
+		if cfg.machine(side) == "host" {
+			g.Head[side] = slices.Concat(cfg.HostCross.compileFlags(), g.Head[side])
+			g.Link[side] = cfg.HostCross.linkFlags()
+		}
 	}
 	if err := readRustTriples(cfg, arches, g.RustTriple); err != nil {
 		return g, err
