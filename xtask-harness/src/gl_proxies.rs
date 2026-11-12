@@ -178,7 +178,9 @@ pub fn check(root: &Path, out: &Path, arch: &str) -> Result<Option<String>> {
             let (mut bound, mut pending, mut unbound) = (0usize, 0usize, 0usize);
             for (_, _, b) in bindings::rows().filter(|(l, ..)| *l == soname) {
                 match b {
-                    Binding::Generic { .. } | Binding::Shim => bound += 1,
+                    Binding::Generic { .. } | Binding::Shim | Binding::Variable { .. } => {
+                        bound += 1
+                    }
                     Binding::Trap(why) if why.starts_with("pending") => pending += 1,
                     Binding::Trap(_) => unbound += 1,
                 }

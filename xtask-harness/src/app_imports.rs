@@ -88,7 +88,9 @@ pub fn classify(
         if let Some((&(lib, _), b)) = rows.iter().find(|((l, n), _)| l == so && *n == name) {
             return match b {
                 Binding::Trap(why) => Class::Trapped(lib, why),
-                Binding::Generic { .. } | Binding::Shim => Class::Bound(lib),
+                Binding::Generic { .. } | Binding::Shim | Binding::Variable { .. } => {
+                    Class::Bound(lib)
+                }
             };
         }
         if let Some((&lib, _)) = surfaces.iter().find(|(l, s)| *l == so && s.contains(name)) {
