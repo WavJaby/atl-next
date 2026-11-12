@@ -272,7 +272,7 @@ fn refuse(r: Refused) -> ! {
         ),
         Refused::Reserved { id, table } => (
             1,
-            format!("{table} slot {id} has no function (jni.h reserved*)"),
+            format!("{table} slot {id} is reserved (jni.h reserved*), no function"),
         ),
         Refused::NotProxy { id, guest } => (
             4,
