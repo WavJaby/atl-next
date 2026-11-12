@@ -87,11 +87,6 @@ const BUILD_UNKNOWN: &str = "unknown";
 /// There is no SystemUI here, so every app takes AOSP's own disabled-change path (owner 2026-11-05, kept 2026-11-06): Toast.makeText builds the view (Toast.java:523, ToastPresenter.getTextToastView); Toast.show's else branch (:199-215) sends enqueueToast with the app's TN;
 /// notification.rs answers TN.show(windowToken), and TN.handleShow (:758-792) adds the TYPE_TOAST window through ToastPresenter.show in the app. App-visible difference: Toast.getView() is non-null for text toasts. Delete this when a system UI renders enqueueTextToast.
 const DISABLED_COMPAT_CHANGES: [i64; 1] = [147_798_919];
-/// Intent.ACTION_MAIN / CATEGORY_LAUNCHER: how the launcher starts an app.
-const ACTION_MAIN: &str = "android.intent.action.MAIN";
-const CATEGORY_LAUNCHER: &str = "android.intent.category.LAUNCHER";
-/// Intent.FLAG_ACTIVITY_NEW_TASK, set on a launcher start.
-const FLAG_ACTIVITY_NEW_TASK: i32 = 0x1000_0000;
 /// Intent.FLAG_RECEIVER_BOOT_UPGRADE (Intent.java:7647): refused in a broadcast from an app.
 const FLAG_RECEIVER_BOOT_UPGRADE: i32 = 0x0200_0000;
 /// ActivityManager.BROADCAST_SUCCESS (ActivityManager.java:639).
@@ -281,8 +276,8 @@ pub(crate) fn resume_item(token: SpIBinder) -> ResumeActivityItem {
     }
 }
 
-/// The LaunchActivityItem of `p`'s `activity` (ActivityTaskSupervisor.realStartActivityLocked's launch): the MAIN / LAUNCHER intent, the global configuration, the controller
-/// every activity names. Built by activity_task when the machine's Launch step is sent.
+/// The LaunchActivityItem of `p`'s `activity` (ActivityTaskSupervisor.realStartActivityLocked's launch): `intent` as the start sent it, the global configuration, the controller every activity names. Built by activity_task when the machine's Launch step is sent.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn launch_item(
     packages: &Packages,
     display: &DisplayModel,
@@ -291,18 +286,9 @@ pub(crate) fn launch_item(
     activity: &ActivityDecl,
     token: SpIBinder,
     ident: i32,
+    intent: Intent,
 ) -> LaunchActivityItem {
     let ai = package::application_info(p, packages, package::STOCK_PM_FLAGS);
-    let intent = Intent {
-        action: Some(ACTION_MAIN.into()),
-        categories: vec![Some(CATEGORY_LAUNCHER.into())],
-        flags: FLAG_ACTIVITY_NEW_TASK,
-        component: Some(ComponentName {
-            package: p.name.clone(),
-            class: activity.name.clone(),
-        }),
-        ..Default::default()
-    };
     let info = package::activity_info(p, activity, ai, package::STOCK_PM_FLAGS);
     LaunchActivityItem {
         activity_token: Some(token),

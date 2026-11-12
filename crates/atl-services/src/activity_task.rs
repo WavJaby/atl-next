@@ -14,7 +14,7 @@ use atl_aidl::aidl::android::app::IActivityTaskManager::{
 use atl_aidl::aidl::android::app::IApplicationThread::IApplicationThread;
 use atl_parcelables::android::app::ProfilerInfo;
 use atl_parcelables::android::app::servertransaction::ClientTransaction;
-use atl_parcelables::android::content::Intent;
+use atl_parcelables::android::content::{ComponentName, Intent};
 use atl_parcelables::android::os::Bundle;
 use atl_parcelables::codecs::android::app::servertransaction::ClientTransaction::ClientTransactionItem;
 use atl_parcelables::parts::{
@@ -66,12 +66,20 @@ pub(crate) enum Back {
     TaskToBack { uid: u32 },
 }
 
-/// What a Launch step is built from: the activity's package and declaration, and the LaunchActivityItem's ident.
+/// Intent.ACTION_MAIN / CATEGORY_LAUNCHER: how the launcher starts an app.
+const ACTION_MAIN: &str = "android.intent.action.MAIN";
+const CATEGORY_LAUNCHER: &str = "android.intent.category.LAUNCHER";
+/// Intent.FLAG_ACTIVITY_NEW_TASK, set on a launcher start.
+const FLAG_ACTIVITY_NEW_TASK: i32 = 0x1000_0000;
+
+/// What a Launch step is built from: the activity's package and declaration, the LaunchActivityItem's ident, and the intent it delivers.
 #[derive(Clone)]
 pub(crate) struct Launch {
     pub package: String,
     pub decl: ActivityDecl,
     pub ident: i32,
+    /// the start's intent as sent (ActivityRecord.intent, ActivityTaskSupervisor.java:1021); a launcher start's MAIN / LAUNCHER intent
+    pub intent: Intent,
 }
 
 /// The intent a reused record gets in onNewIntent (ActivityRecord.deliverNewIntentLocked: the start's intent, referrer = the calling package, no caller token here).
@@ -213,6 +221,7 @@ impl ActivityTasks {
                     &launch.decl,
                     token.clone(),
                     launch.ident,
+                    launch.intent,
                 )))
             }
             Step::Result(results) => ClientTransactionItem::ActivityResult(ActivityResultItem {
@@ -317,6 +326,16 @@ impl ActivityTasks {
             package: package.to_owned(),
             decl: decl.clone(),
             ident: self.next_ident(),
+            intent: Intent {
+                action: Some(ACTION_MAIN.into()),
+                categories: vec![Some(CATEGORY_LAUNCHER.into())],
+                flags: FLAG_ACTIVITY_NEW_TASK,
+                component: Some(ComponentName {
+                    package: package.to_owned(),
+                    class: decl.name.clone(),
+                }),
+                ..Default::default()
+            },
         };
         let mut m = self.machine();
         let commands = m.push(task, token.clone(), owner, launch);
@@ -461,6 +480,7 @@ impl ActivityTasks {
             package: calling_package.to_owned(),
             decl: decl.clone(),
             ident: self.next_ident(),
+            intent: intent.clone(),
         };
         commands.extend(m.push_owed(task, token, owner, launch, owed));
         self.note_settle(&m);
@@ -715,5 +735,232 @@ impl IActivityTaskManager for ActivityTaskService {
     ) -> binder::Result<Option<Strong<dyn IActivityClientController>>> {
         let controller = <dyn IActivityClientController>::try_from(self.atm.controller())?;
         Ok(Some(controller))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use atl_aidl::aidl::android::app::IApplicationThread::BnApplicationThread;
+    use atl_parcelables::codecs::android::os::Bundle::Value;
+    use atl_services_types::display_model::DisplayModel;
+    use atl_services_types::packages::{Manifest, PackageRecord, SCREEN_ORIENTATION_UNSPECIFIED};
+    use binder::StatusCode;
+
+    use super::*;
+    use crate::tasks::TaskSize;
+
+    const PACKAGE: &str = "com.example.player";
+    const LAUNCHER: &str = "com.example.player.Main";
+    const VIDEO: &str = "com.example.player.Video";
+    const UID: u32 = 10_123;
+    /// the request code of a startActivityForResult
+    const REQUEST_CODE: i32 = 1131;
+
+    /// Keeps every transaction scheduled on it, in order.
+    struct Thread {
+        scheduled: Arc<Mutex<Vec<ClientTransaction>>>,
+    }
+
+    impl Interface for Thread {}
+
+    impl IApplicationThread for Thread {
+        fn r#unimplemented(&self, _method: &'static str) -> Status {
+            StatusCode::UNKNOWN_TRANSACTION.into()
+        }
+
+        fn r#scheduleTransaction(
+            &self,
+            transaction: Option<&ClientTransaction>,
+        ) -> binder::Result<()> {
+            let transaction = transaction.cloned().unwrap_or_default();
+            self.scheduled
+                .lock()
+                .expect("transactions lock")
+                .push(transaction);
+            Ok(())
+        }
+    }
+
+    /// The app thread binder, and the list the services' transactions for it are kept in.
+    fn app_thread() -> (
+        Strong<dyn IApplicationThread>,
+        Arc<Mutex<Vec<ClientTransaction>>>,
+    ) {
+        let scheduled = Arc::new(Mutex::new(Vec::new()));
+        let thread = BnApplicationThread::new_binder(
+            Thread {
+                scheduled: Arc::clone(&scheduled),
+            },
+            BinderFeatures::default(),
+        );
+        (thread, scheduled)
+    }
+
+    /// `name` as the manifest declares it: standard launch mode (LAUNCH_MULTIPLE = 0), no attribute beyond its name.
+    fn decl(name: &str) -> ActivityDecl {
+        ActivityDecl {
+            name: name.to_owned(),
+            launcher: name == LAUNCHER,
+            theme: 0,
+            config_changes: 0,
+            booleans: BTreeMap::new(),
+            launch_mode: 0,
+            task_affinity: None,
+            process: None,
+            meta_data: vec![],
+            screen_orientation: SCREEN_ORIENTATION_UNSPECIFIED,
+            resizeable: true,
+            min_aspect_ratio: None,
+            max_aspect_ratio: None,
+        }
+    }
+
+    /// One installed package: its launcher and one video activity.
+    fn fixture_atm() -> ActivityTasks {
+        let manifest = Manifest {
+            name: PACKAGE.to_owned(),
+            version_code: 1,
+            version_name: None,
+            min_sdk: 21,
+            target_sdk: 34,
+            process_name: None,
+            application_theme: 0,
+            application_class: None,
+            app_component_factory: None,
+            application_meta_data: vec![],
+            application_booleans: BTreeMap::new(),
+            activities: vec![decl(LAUNCHER), decl(VIDEO)],
+            receivers: vec![],
+            providers: vec![],
+            requested_permissions: vec![],
+            permissions: vec![],
+            libraries: vec![],
+            instrumentation: vec![],
+        };
+        let record = PackageRecord {
+            manifest,
+            uid: UID,
+            source_dir: String::new(),
+            primary_cpu_abi: None,
+            native_library_dir: String::new(),
+            data_dir: String::new(),
+            device_protected_data_dir: String::new(),
+            granted_permissions: vec![],
+            gl_driver: Default::default(),
+        };
+        ActivityTasks::new(
+            Arc::new(Packages::new(vec![record], BTreeMap::new())),
+            Arc::new(Tasks::new(DisplayModel::default())),
+            token::new(),
+        )
+    }
+
+    /// The launcher record, pushed and launched as finishAttachApplication does it; returns its token.
+    fn attach_launcher(atm: &ActivityTasks, thread: &Strong<dyn IApplicationThread>) -> SpIBinder {
+        let task = atm.tasks.new_task(
+            UID,
+            PACKAGE,
+            TaskSize {
+                width: 480,
+                height: 800,
+            },
+        );
+        atm.launch_launcher(thread.clone(), UID, PACKAGE, &decl(LAUNCHER), task)
+    }
+
+    /// The intent of the LaunchActivityItem scheduled for `class`, as the app thread received it.
+    fn intent_of(scheduled: &Mutex<Vec<ClientTransaction>>, class: &str) -> Intent {
+        scheduled
+            .lock()
+            .expect("transactions lock")
+            .iter()
+            .flat_map(|t| t.items.iter().flatten())
+            .filter_map(|item| match item {
+                ClientTransactionItem::LaunchActivity(launch) => launch.intent.clone(),
+                _ => None,
+            })
+            .find(|i| i.component.as_ref().is_some_and(|c| c.class == class))
+            .expect("a LaunchActivityItem for the class")
+    }
+
+    /// The start an app's startActivity carries (ZVideoPlayer: setClass + putExtra, no action, no flags) is the intent the fresh launch of its activity delivers: the caller's fields, extras included.
+    #[test]
+    fn fresh_start_delivers_the_caller_intent() {
+        let atm = fixture_atm();
+        let (thread, scheduled) = app_thread();
+        let source = attach_launcher(&atm, &thread);
+        let pairs = [("path", "/sdcard/video.mp4"), ("mute", "true")];
+        let caller_intent = Intent {
+            component: Some(ComponentName {
+                package: PACKAGE.to_owned(),
+                class: VIDEO.to_owned(),
+            }),
+            extras: Some(Bundle::from_strings(&pairs)),
+            ..Default::default()
+        };
+        let status = atm
+            .start(
+                &thread,
+                UID,
+                PACKAGE,
+                StartArgs {
+                    intent: Some(&caller_intent),
+                    reuse: true,
+                    results: true,
+                    request_code: REQUEST_CODE,
+                    result_to: Some(&source),
+                    result_who: None,
+                },
+            )
+            .expect("start");
+        assert_eq!(status, activity_start::START_SUCCESS);
+
+        let launched = intent_of(&scheduled, VIDEO);
+        // expected: the caller's own fields, read from the input (AOSP ActivityRecord keeps r.intent as the start's intent)
+        assert_eq!(launched.action, caller_intent.action);
+        assert_eq!(launched.categories, caller_intent.categories);
+        assert_eq!(launched.flags, caller_intent.flags);
+        assert_eq!(launched.component, caller_intent.component);
+        // a Bundle is a map: the entries compare by key, not in the order the codec returns them
+        let expected: BTreeMap<String, Value> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), Value::String(Some((*v).to_owned()))))
+            .collect();
+        let extras: BTreeMap<String, Value> = launched
+            .extras
+            .as_ref()
+            .map_or_else(Vec::new, |b| b.entries().expect("extras"))
+            .into_iter()
+            .collect();
+        assert_eq!(extras, expected);
+    }
+
+    /// The launcher start carries AOSP's launcher intent: ACTION_MAIN, CATEGORY_LAUNCHER, FLAG_ACTIVITY_NEW_TASK (0x10000000), the launcher's component, no extras.
+    #[test]
+    fn launcher_start_is_main_launcher_in_a_new_task() {
+        let atm = fixture_atm();
+        let (thread, scheduled) = app_thread();
+        attach_launcher(&atm, &thread);
+
+        let launched = intent_of(&scheduled, LAUNCHER);
+        assert_eq!(
+            launched.action.as_deref(),
+            Some("android.intent.action.MAIN")
+        );
+        assert_eq!(
+            launched.categories,
+            vec![Some("android.intent.category.LAUNCHER".to_owned())]
+        );
+        assert_eq!(launched.flags, 0x1000_0000);
+        assert_eq!(
+            launched.component,
+            Some(ComponentName {
+                package: PACKAGE.to_owned(),
+                class: LAUNCHER.to_owned(),
+            })
+        );
+        assert!(launched.extras.is_none());
     }
 }
