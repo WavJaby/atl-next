@@ -8,10 +8,15 @@
 // - triangle (-1,-1) (1,-1) (-1,1), solid uniform colour (1, 0, 0, 1)
 // - quad [0,1]^2 (triangle strip), fragment = texture2D(tex, ndc position), 2x2 RGBA8 texture, GL_NEAREST, clamp to edge; rows bottom first:
 //   row 0 (t = 0): green (0,255,0,255), blue (0,0,255,255); row 1: white (255,255,255,255), yellow (255,255,0,255)
+//
+// Worker (the window gate's balance sub-gate): nativeInit starts a pthread that attaches to the VM, makes one JNI call, detaches and exits, and joins it -> the bridge logs one thread exit before init returns, as a game's loader/audio thread does.
+// Deliberate break (built with -DATL_GLES2_BREAK_NO_EXIT, window `--break-no-detach`): the worker parks forever after its call and is not joined -> no exit line -> balance must fail.
 
 #include <GLES2/gl2.h>
 #include <android/log.h>
 #include <jni.h>
+#include <pthread.h>
+#include <unistd.h>
 
 #define TAG "AtlGles2"
 #define VIEWPORT 64
@@ -71,7 +76,46 @@ static GLuint program(const char *fs) {
     return p;
 }
 
+static JavaVM *vm;
+
+JNIEXPORT jint JNI_OnLoad(JavaVM *v, void *reserved) {
+    vm = v;
+    return JNI_VERSION_1_6;
+}
+
+static void *worker(void *arg) {
+    JNIEnv *env = NULL;
+    if ((*vm)->AttachCurrentThread(vm, &env, NULL) != JNI_OK) {
+        __android_log_print(ANDROID_LOG_ERROR, TAG, "worker: AttachCurrentThread failed");
+        return NULL;
+    }
+    __android_log_print(ANDROID_LOG_INFO, TAG, "worker JNI version 0x%x", (*env)->GetVersion(env));
+#ifdef ATL_GLES2_BREAK_NO_EXIT
+    for (;;) {
+        pause();
+    }
+#endif
+    (*vm)->DetachCurrentThread(vm);
+    return NULL;
+}
+
+/// Starts the worker and (unless broken) joins it: its exit, and so the bridge's detach line, comes before init returns.
+static int run_worker(void) {
+    pthread_t t;
+    if (pthread_create(&t, NULL, worker, NULL) != 0) {
+        __android_log_print(ANDROID_LOG_ERROR, TAG, "worker: pthread_create failed");
+        return 0;
+    }
+#ifndef ATL_GLES2_BREAK_NO_EXIT
+    pthread_join(t, NULL);
+#endif
+    return 1;
+}
+
 JNIEXPORT jboolean JNICALL Java_com_example_atlgles2_Main_nativeInit(JNIEnv *env, jclass cls) {
+    if (!run_worker()) {
+        return JNI_FALSE;
+    }
     solid = program(FS_SOLID);
     textured = program(FS_TEX);
     if (!solid || !textured) {

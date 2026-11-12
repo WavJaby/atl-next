@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Stage `gles2` of `xtask test window` (GS2.5): the GLES2 fixture (xtask-harness/testdata/gles2, Main.java) in UI mode on the gate's compositor, its `.so` a guest library through the native bridge, so every GL call crosses it and the frame reaches the window's picture ([`capture::Probe`]).
-//! Sub-gates ([`checks`]): `probe` (the window acked, the fixture read back, the picture settled), `readback` (the app's glReadPixels at each probe is the expectation), `composed` (the picture at each probe is the expectation), `present` (no failed present), `balance` (the bridge's exit accounting).
+//! Sub-gates ([`checks`]): `probe` (the window acked, the fixture read back, the picture settled), `readback` (the app's glReadPixels at each probe is the expectation), `composed` (the picture at each probe is the expectation), `present` (no failed present), `balance` (the fixture worker's exit, and the bridge's exit accounting; break `--break-no-detach`).
 //! The expectation is [`gles2_fixture::PROBES`], worked out from the scene in Main.java. GL's window origin is bottom-left, the picture's top-left: probe (x, y) is in the picture at row `height - 1 - y`, `height` the window's opening height (the picture's size, checked).
 
 use std::path::Path;
@@ -23,6 +23,8 @@ const READBACK_FAIL: &str = "AtlGles2: readback FAIL";
 const PRESENT_WARN: &str = "atl-composer: ui present:";
 /// The bridge's exit line (atl-native-bridge engine/thread.rs `detach`): `attached A, detached D`.
 const DETACH_LINE: &str = "atl-native-bridge: thread detached (attached ";
+/// The fixture worker's line after its JNI call (atl_gles2.c `worker`).
+const WORKER_LINE: &str = "AtlGles2: worker JNI version ";
 /// Per-channel slack of Main.java's `matches` (`SLACK`): the clear colour goes float -> unorm8.
 const SLACK: u32 = 1;
 
@@ -148,8 +150,13 @@ fn exit_counts(line: &str) -> Option<(u32, u32)> {
     Some((a.parse().ok()?, d.parse().ok()?))
 }
 
-/// Thread balance: every thread exit leaves the main thread attached, so attached > detached on each exit line. The window's GL thread lives to the end of the run, so a run with no exit has nothing to balance: it passes, and says so.
+/// Thread balance: the fixture's worker (atl_gles2.c `worker`, joined in nativeInit) made its JNI call and exited, so at least one exit line; every exit leaves the main thread attached, so attached > detached on each.
 fn balance_check(app: &str) -> Result<String, String> {
+    if !app.contains(WORKER_LINE) {
+        return Err(format!(
+            "`{WORKER_LINE}` never logged: the worker made no JNI call"
+        ));
+    }
     let exits: Vec<(u32, u32)> = app.lines().filter_map(exit_counts).collect();
     if let Some(&(a, d)) = exits.iter().find(|&&(a, d)| a <= d) {
         return Err(format!(
@@ -158,7 +165,7 @@ fn balance_check(app: &str) -> Result<String, String> {
     }
     match exits.last() {
         Some(&(a, d)) => Ok(format!("the last exit leaves attached {a}, detached {d}")),
-        None => Ok("no thread exited in the run (the GL thread lives on)".to_owned()),
+        None => Err("no thread exited: the worker never detached".to_owned()),
     }
 }
 
@@ -253,12 +260,14 @@ mod tests {
     }
 
     #[test]
-    fn balance_judges_the_exits_it_sees() {
-        let none = balance_check("1.0 I AtlGles2: surface 960x600\n").expect("no exit");
-        assert!(none.contains("no thread exited"), "{none}");
+    fn balance_needs_the_worker_exit_and_judges_it() {
+        let worker = "1.0 I AtlGles2: worker JNI version 0x10006\n";
+        let none = balance_check(worker).expect_err("no exit");
+        assert!(none.contains("never detached"), "{none}");
         let one = "atl-native-bridge: thread detached (attached 3, detached 1)\n";
-        assert!(balance_check(one).is_ok());
+        assert!(balance_check(&format!("{worker}{one}")).is_ok());
+        assert!(balance_check(one).is_err(), "no worker line");
         let broken = "atl-native-bridge: thread detached (attached 2, detached 2)\n";
-        assert!(balance_check(broken).is_err());
+        assert!(balance_check(&format!("{worker}{broken}")).is_err());
     }
 }

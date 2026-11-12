@@ -124,6 +124,9 @@ pub struct Args {
     /// Stage capture only: the refusal sub-gate expects the fixture served, so it must fail on the registry's SECURITY (the gate's deliberate break, harness-side).
     #[arg(long)]
     break_capture_caller: bool,
+    /// Stage gles2 only: the fixture's worker thread parks forever instead of exiting, so the bridge never detaches it and the balance sub-gate must fail (the gate's deliberate break, fixture-side).
+    #[arg(long)]
+    break_no_detach: bool,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -1878,6 +1881,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             &crate::ndk::default_ndk(root)?,
             &args.host,
             &work.join("gles2-lib"),
+            args.break_no_detach,
         )?),
         _ => None,
     };

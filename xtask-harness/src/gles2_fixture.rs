@@ -94,8 +94,11 @@ pub(crate) const PROBES: [(u32, u32, u32); 6] = [
     (56, 56, 0xffff00ff),
 ];
 
-/// Builds the library into `dir`; its path.
-fn build_lib(root: &Path, t: &NdkTarget, dir: &Path) -> Result<PathBuf> {
+/// atl_gles2.c's deliberate break: its worker never exits, so never detaches (window `--break-no-detach`).
+const BREAK_NO_EXIT: &str = "-DATL_GLES2_BREAK_NO_EXIT";
+
+/// Builds the library into `dir` (`broken`: with [`BREAK_NO_EXIT`]); its path.
+fn build_lib(root: &Path, t: &NdkTarget, dir: &Path, broken: bool) -> Result<PathBuf> {
     if dir.exists() {
         std::fs::remove_dir_all(dir)?;
     }
@@ -106,6 +109,7 @@ fn build_lib(root: &Path, t: &NdkTarget, dir: &Path) -> Result<PathBuf> {
             .arg("-shared")
             .args(CFLAGS)
             .arg("-std=c11")
+            .args(broken.then_some(BREAK_NO_EXIT))
             .arg(root.join(FIXTURE).join(SOURCE))
             .args(["-lGLESv2", "-llog"])
             .arg(format!("-Wl,-soname,{LIB}"))
@@ -116,10 +120,16 @@ fn build_lib(root: &Path, t: &NdkTarget, dir: &Path) -> Result<PathBuf> {
     Ok(lib)
 }
 
-/// The library for `arch` (an arches.toml row with `[guest]`), built with NDK `ndk` into `out`: the `lib/<abi>/` entry of the APK.
-pub(crate) fn apk_libs(root: &Path, ndk: &Path, arch: &str, out: &Path) -> Result<NativeLibs> {
+/// The library for `arch` (an arches.toml row with `[guest]`), built with NDK `ndk` into `out` (`broken`: the no-exit worker break): the `lib/<abi>/` entry of the APK.
+pub(crate) fn apk_libs(
+    root: &Path,
+    ndk: &Path,
+    arch: &str,
+    out: &Path,
+    broken: bool,
+) -> Result<NativeLibs> {
     let t = NdkTarget::new(root, ndk, arch, MIN_SDK)?;
-    let lib = build_lib(root, &t, out)?;
+    let lib = build_lib(root, &t, out, broken)?;
     Ok(NativeLibs {
         abi: t.abi.clone(),
         libs: vec![lib],
@@ -280,7 +290,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let java_out = slot::out_dir(root, args.java_out.as_deref(), "--java-out", |w| {
         w.join("out/java/build")
     })?;
-    let native = apk_libs(root, &ndk, &args.arch, &work.join("lib"))?;
+    let native = apk_libs(root, &ndk, &args.arch, &work.join("lib"), false)?;
     let shape = jni_fixture::shape(&work.join("lib").join(LIB))?;
     let mut fails = needed_failures(&shape.needed);
     let imports = import_failures(&shape.imports);
