@@ -2671,6 +2671,7 @@ dependencies = [
  "atl-layout",
  "atl-native-bridge",
  "atl-platform-host",
+ "atl-property-service",
  "atl-services-types",
  "clap",
  "object",

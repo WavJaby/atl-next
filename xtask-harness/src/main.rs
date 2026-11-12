@@ -128,7 +128,7 @@ enum Test {
     NativeLoad(native_load::Args),
     /// ART's `-Xnative-bridge-isa:<isa>` (patches/aosp/art 0004) under atl-app-launcher with the bridge loaded: `arm64` with no arm64 engine staged reaches the bridge's `initialize`, which refuses naming it; an unknown ISA is refused at parse. `--break delivery|parse` must each turn its check red. Logs: stdout.
     NbIsa(nb_isa::Args),
-    /// The installer process (atl-installer, plan item 4b M1): AOSP's ApkLiteParseUtils over a package dir on host ART; package, versionCode and split names equal `aapt2 dump badging` (altos-odyssey's base + split, fossify-notes); a split with another versionCode or package is refused by AOSP. Prints the VM start and parse times. `--break drop-split` must turn the split check red.
+    /// The installer process (atl-installer, plan item 4b M1): AOSP's ApkLiteParseUtils over a package dir on host ART; package, versionCode and split names equal `aapt2 dump badging` (altos-odyssey's base + split, fossify-notes); a split with another versionCode or package is refused by AOSP. Slice M2: AOSP's native-code choice (NativeLibraryHelper through PackageAbiHelperImpl's install path): the primary ABI and the libraries under `<root>/<isa>` equal the zip's `lib/x86_64/` entries (names, sha256 of `unzip -p`). Prints the VM start, parse and natives times. `--break drop-split` and `--break abi-arm64` (device ABI lists arm64-v8a only: AOSP's no-match) must each turn the alto check red.
     Installer(installer::Args),
     /// AOSP servicemanager + `service list` / `check` through atl-binderd on libbinder's driver seam; binderd's counters must show the expected driver paths firing.
     Binder(binder::Args),

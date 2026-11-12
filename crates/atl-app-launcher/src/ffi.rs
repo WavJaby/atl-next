@@ -8,9 +8,10 @@ use std::ffi::CString;
 use std::io::Write;
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStringExt as _;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 
 use crate::generated::{
     binder_process, dlfcn, invoked_vm, jni, jni_invocation, lib_names, libdl_android,
@@ -343,6 +344,8 @@ type Env = *mut *const jni::JNINativeInterface;
 type JClass = *mut c_void;
 type JString = *mut c_void;
 type JMethod = *mut jni::_jmethodID;
+type JField = *mut jni::_jfieldID;
+type JObject = *mut c_void;
 
 /// Calls the JNIEnv function `$f` of `$env` with the rest as arguments; inside an unsafe block, under that function's JNI contract.
 macro_rules! jni_call {
@@ -415,13 +418,200 @@ impl VmHandle {
 
 const EXIT_FAILURE: i32 = 1;
 
-/// What AOSP's PackageLite says of a package dir (`Vm::parse_cluster`).
-pub struct ClusterLite {
+/// A package dir as AOSP's PackageLite describes it (`Vm::parse_cluster`): the values the installer prints, and the PackageLite object `install_natives` reads.
+/// `lite` is a local reference of the main thread: valid until the VM is shut down, so the caller drops this first.
+pub struct Cluster<'vm> {
+    vm: &'vm Vm,
+    lite: JObject,
+    /// PackageLite.getPackageName.
     pub package: String,
     /// `getLongVersionCode`: versionCodeMajor << 32 | versionCode.
     pub version_code: i64,
     /// The split names in PackageLite's order (sorted by ApkLiteParseUtils).
     pub splits: Vec<String>,
+}
+
+/// AOSP's install-path decision for a package's native code (`Cluster::install_natives`).
+pub struct Natives {
+    /// `primaryCpuAbi`; None without native code.
+    pub primary_abi: Option<String>,
+    /// The dir the primary ABI's libraries were copied to; None when nothing was copied: no native code, or `extractNativeLibs` false (the libraries load from the APK).
+    pub lib_dir: Option<PathBuf>,
+}
+
+/// PackageManager install codes of the native path (core/java/android/content/pm/PackageManager.java: 2122, 2258, 2485, 2518, 2528).
+const INSTALL_FAILED_INVALID_APK: i32 = -2;
+const INSTALL_FAILED_CPU_ABI_INCOMPATIBLE: i32 = -16;
+const INSTALL_FAILED_INTERNAL_ERROR: i32 = -110;
+const INSTALL_FAILED_NO_MATCHING_ABIS: i32 = -113;
+const NO_NATIVE_LIBRARIES: i32 = -114;
+
+/// The installer's error for an install code of the native path.
+fn native_error(code: i32) -> anyhow::Error {
+    let name = match code {
+        INSTALL_FAILED_INVALID_APK => "INSTALL_FAILED_INVALID_APK",
+        INSTALL_FAILED_CPU_ABI_INCOMPATIBLE => "INSTALL_FAILED_CPU_ABI_INCOMPATIBLE",
+        INSTALL_FAILED_INTERNAL_ERROR => "INSTALL_FAILED_INTERNAL_ERROR",
+        INSTALL_FAILED_NO_MATCHING_ABIS => "INSTALL_FAILED_NO_MATCHING_ABIS",
+        _ => "unnamed",
+    };
+    anyhow!("native error {code}: {name}")
+}
+
+impl Cluster<'_> {
+    /// Installer slice M2: the native code of this package dir on AOSP's install path, `PackageAbiHelperImpl.derivePackageAbi` (called at InstallPackageHelper.java:1952) for a non-multi-arch cluster install.
+    /// `Handle.create(lite)`; the device's `Build.SUPPORTED_ABIS` (RenderScript bitcode on a 64-bit device: the 32-bit list, derivePackageAbi:481-494); with `extractNativeLibs` `copyNativeBinariesForSupportedAbi` into `lib_root/<isa>` (it finds the ABI and returns its index), else `findSupportedAbi` alone.
+    /// `lib_root` stands for AOSP's cluster `<codePath>/lib` (deriveNativeLibraryPaths:209); its parent must exist (createNativeLibrarySubdir makes one level). Multi-arch packages are refused: their 32/64-bit branch depends on the aconfig flag forceMultiArchNativeLibsMatch.
+    /// A no-match is `native error -113: INSTALL_FAILED_NO_MATCHING_ABIS`; a Java exception is described on stderr.
+    pub fn install_natives(&self, lib_root: &Path) -> Result<Natives> {
+        let vm = self.vm;
+        let lite = vm.find_class(c"android/content/pm/parsing/PackageLite")?;
+        let is_multi_arch = vm.method(lite, c"isMultiArch", c"()Z", false)?;
+        ensure!(
+            !vm.call_bool(self.lite, is_multi_arch, "PackageLite.isMultiArch")?,
+            "multi-arch package: not in installer slice M2 (derivePackageAbi:387)"
+        );
+        let is_extract = vm.method(lite, c"isExtractNativeLibs", c"()Z", false)?;
+        let extract = vm.call_bool(self.lite, is_extract, "PackageLite.isExtractNativeLibs")?;
+
+        let handle_class =
+            vm.find_class(c"com/android/internal/content/NativeLibraryHelper$Handle")?;
+        let create = vm.method(
+            handle_class,
+            c"create",
+            c"(Landroid/content/pm/parsing/PackageLite;)Lcom/android/internal/content/NativeLibraryHelper$Handle;",
+            true,
+        )?;
+        let close = vm.method(handle_class, c"close", c"()V", false)?;
+        let handle = NativeHandle {
+            vm,
+            obj: vm.call_static_object(
+                handle_class,
+                create,
+                &[jni::jvalue { l: self.lite }],
+                "NativeLibraryHelper.Handle.create",
+            )?,
+            close,
+        };
+
+        let helper = vm.find_class(c"com/android/internal/content/NativeLibraryHelper")?;
+        let build = vm.find_class(c"android/os/Build")?;
+        let string_array = c"[Ljava/lang/String;";
+        let abis = vm.static_object_field(build, c"SUPPORTED_ABIS", string_array)?;
+        let abis32 = vm.static_object_field(build, c"SUPPORTED_32_BIT_ABIS", string_array)?;
+        let abis64 = vm.static_object_field(build, c"SUPPORTED_64_BIT_ABIS", string_array)?;
+        let has_rs = vm.method(
+            helper,
+            c"hasRenderscriptBitcode",
+            c"(Lcom/android/internal/content/NativeLibraryHelper$Handle;)Z",
+            true,
+        )?;
+        // derivePackageAbi:481-494: RenderScript bitcode on a 64-bit device runs as 32-bit
+        let (list, rs_override) = if vm.array_len(abis64)? > 0
+            && vm.call_static_bool(
+                helper,
+                has_rs,
+                &[jni::jvalue { l: handle.obj }],
+                "hasRenderscriptBitcode",
+            )? {
+            if vm.array_len(abis32)? == 0 {
+                return Err(native_error(INSTALL_FAILED_CPU_ABI_INCOMPATIBLE));
+            }
+            (abis32, true)
+        } else {
+            (abis, false)
+        };
+
+        let copy = if extract {
+            let copy = vm.method(
+                helper,
+                c"copyNativeBinariesForSupportedAbi",
+                c"(Lcom/android/internal/content/NativeLibraryHelper$Handle;Ljava/io/File;[Ljava/lang/String;ZZ)I",
+                true,
+            )?;
+            let root = vm.file(lib_root)?;
+            vm.call_static_int(
+                helper,
+                copy,
+                &[
+                    jni::jvalue { l: handle.obj },
+                    jni::jvalue { l: root },
+                    jni::jvalue { l: list },
+                    jni::jvalue { z: 1 },
+                    jni::jvalue { z: 0 },
+                ],
+                "copyNativeBinariesForSupportedAbi",
+            )?
+        } else {
+            let find = vm.method(
+                helper,
+                c"findSupportedAbi",
+                c"(Lcom/android/internal/content/NativeLibraryHelper$Handle;[Ljava/lang/String;)I",
+                true,
+            )?;
+            vm.call_static_int(
+                helper,
+                find,
+                &[jni::jvalue { l: handle.obj }, jni::jvalue { l: list }],
+                "findSupportedAbi",
+            )?
+        };
+        if copy < 0 && copy != NO_NATIVE_LIBRARIES {
+            return Err(native_error(copy));
+        }
+        if copy >= 0 {
+            let abi = vm.array_get(list, copy)?;
+            let primary_abi = vm.string(abi)?.context("null ABI name")?;
+            let lib_dir = if extract {
+                let runtime = vm.find_class(c"dalvik/system/VMRuntime")?;
+                let isa_of = vm.method(
+                    runtime,
+                    c"getInstructionSet",
+                    c"(Ljava/lang/String;)Ljava/lang/String;",
+                    true,
+                )?;
+                let isa = vm.call_static_object(
+                    runtime,
+                    isa_of,
+                    &[jni::jvalue { l: abi }],
+                    "VMRuntime.getInstructionSet",
+                )?;
+                Some(lib_root.join(vm.string(isa)?.context("null instruction set")?))
+            } else {
+                None
+            };
+            return Ok(Natives {
+                primary_abi: Some(primary_abi),
+                lib_dir,
+            });
+        }
+        if rs_override {
+            // no native code, RenderScript: abiList[0] (derivePackageAbi:522-523)
+            let first = vm.array_get(list, 0)?;
+            return Ok(Natives {
+                primary_abi: Some(vm.string(first)?.context("null ABI name")?),
+                lib_dir: None,
+            });
+        }
+        Ok(Natives {
+            primary_abi: None,
+            lib_dir: None,
+        })
+    }
+}
+
+/// A `NativeLibraryHelper.Handle`, closed when it goes out of scope (AOSP's callers close it with `IoUtils.closeQuietly`).
+struct NativeHandle<'vm> {
+    vm: &'vm Vm,
+    obj: JObject,
+    close: JMethod,
+}
+
+impl Drop for NativeHandle<'_> {
+    fn drop(&mut self) {
+        // a close that fails leaves an exception `check` clears; a destructor has nowhere to report it
+        let _ = self.vm.call_void(self.obj, self.close, "Handle.close");
+    }
 }
 
 impl Vm {
@@ -679,13 +869,147 @@ impl Vm {
         }
     }
 
+    /// The static object field `name` (type `sig`) of `class`.
+    fn static_object_field(&self, class: JClass, name: &CStr, sig: &CStr) -> Result<JObject> {
+        let what = format!("field {}", name.to_string_lossy());
+        // SAFETY: the main thread's env, a live class reference, NUL-terminated name and signature
+        let field: JField = unsafe {
+            jni_call!(
+                self.env,
+                GetStaticFieldID,
+                class,
+                name.as_ptr(),
+                sig.as_ptr()
+            )
+        };
+        self.check(&what)?;
+        ensure!(!field.is_null(), "no field {}", name.to_string_lossy());
+        // SAFETY: `field` is the static field of `class` just resolved, read on the same env
+        let value = unsafe { jni_call!(self.env, GetStaticObjectField, class, field) };
+        self.check(&what)?;
+        Ok(value)
+    }
+
+    /// `class.method(args)`: a static method returning an int.
+    fn call_static_int(
+        &self,
+        class: JClass,
+        method: JMethod,
+        args: &[jni::jvalue],
+        what: &str,
+    ) -> Result<i32> {
+        // SAFETY: the main thread's env; `method` is a static method of `class` whose signature `args` match
+        let value =
+            unsafe { jni_call!(self.env, CallStaticIntMethodA, class, method, args.as_ptr()) };
+        self.check(what)?;
+        Ok(value)
+    }
+
+    /// As `call_static_int`, returning a boolean.
+    fn call_static_bool(
+        &self,
+        class: JClass,
+        method: JMethod,
+        args: &[jni::jvalue],
+        what: &str,
+    ) -> Result<bool> {
+        // SAFETY: as `call_static_int`
+        let value = unsafe {
+            jni_call!(
+                self.env,
+                CallStaticBooleanMethodA,
+                class,
+                method,
+                args.as_ptr()
+            )
+        };
+        self.check(what)?;
+        Ok(value != 0)
+    }
+
+    /// As `call_static_int`, returning an object.
+    fn call_static_object(
+        &self,
+        class: JClass,
+        method: JMethod,
+        args: &[jni::jvalue],
+        what: &str,
+    ) -> Result<JObject> {
+        // SAFETY: as `call_static_int`
+        let value = unsafe {
+            jni_call!(
+                self.env,
+                CallStaticObjectMethodA,
+                class,
+                method,
+                args.as_ptr()
+            )
+        };
+        self.check(what)?;
+        Ok(value)
+    }
+
+    /// `obj.method()`: an instance method with no arguments, returning a boolean.
+    fn call_bool(&self, obj: JObject, method: JMethod, what: &str) -> Result<bool> {
+        let none = core::ptr::null::<jni::jvalue>();
+        // SAFETY: the main thread's env, a live object of the method's class, no arguments
+        let value = unsafe { jni_call!(self.env, CallBooleanMethodA, obj, method, none) };
+        self.check(what)?;
+        Ok(value != 0)
+    }
+
+    /// `obj.method()`: an instance method with no arguments, returning void.
+    fn call_void(&self, obj: JObject, method: JMethod, what: &str) -> Result<()> {
+        let none = core::ptr::null::<jni::jvalue>();
+        // SAFETY: as `call_bool`
+        unsafe { jni_call!(self.env, CallVoidMethodA, obj, method, none) };
+        self.check(what)
+    }
+
+    /// The length of a Java array.
+    fn array_len(&self, array: JObject) -> Result<i32> {
+        // SAFETY: the main thread's env and a live array reference
+        Ok(unsafe { jni_call!(self.env, GetArrayLength, array) })
+    }
+
+    /// Element `index` of an object array.
+    fn array_get(&self, array: JObject, index: i32) -> Result<JObject> {
+        ensure!(
+            (0..self.array_len(array)?).contains(&index),
+            "array index {index} out of range"
+        );
+        // SAFETY: the main thread's env, a live object array, an index below its length
+        let element = unsafe { jni_call!(self.env, GetObjectArrayElement, array, index) };
+        self.check("array element")?;
+        Ok(element)
+    }
+
+    /// `new File(path)`.
+    fn file(&self, path: &Path) -> Result<JObject> {
+        let text = CString::new(path.as_os_str().as_encoded_bytes()).context("path with a NUL")?;
+        let class = self.find_class(c"java/io/File")?;
+        let init = self.method(class, c"<init>", c"(Ljava/lang/String;)V", false)?;
+        // SAFETY: the main thread's env, a NUL-terminated path, File's String constructor
+        unsafe {
+            let jpath = jni_call!(self.env, NewStringUTF, text.as_ptr());
+            self.check("NewStringUTF")?;
+            let file = jni_call!(
+                self.env,
+                NewObjectA,
+                class,
+                init,
+                [jni::jvalue { l: jpath }].as_ptr()
+            );
+            self.check("new File")?;
+            Ok(file)
+        }
+    }
+
     /// Installer slice M1: `ApkLiteParseUtils.parseClusterPackageLite(ParseTypeImpl.forParsingWithoutPlatformCompat().reset(), new File(dir), 0)`, which reads every APK in `dir` through ApkAssets and refuses a split whose package or versionCode differs.
     /// `forParsingWithoutPlatformCompat`: no IPlatformCompat service in this process; a deferred error's change counts as enabled by targetSdk alone (ParseTypeImpl). Flags 0: no certificates collected.
     /// A ParseResult error -> `parse error <code>: <message>` (PackageManager INSTALL_PARSE_FAILED_*).
-    pub fn parse_cluster(&self, dir: &std::path::Path) -> Result<ClusterLite> {
-        let path = CString::new(dir.as_os_str().as_encoded_bytes()).context("dir with a NUL")?;
-        let file_class = self.find_class(c"java/io/File")?;
-        let file_init = self.method(file_class, c"<init>", c"(Ljava/lang/String;)V", false)?;
+    pub fn parse_cluster(&self, dir: &Path) -> Result<Cluster<'_>> {
+        let file = self.file(dir)?;
         let parse_type = self.find_class(c"android/content/pm/parsing/result/ParseTypeImpl")?;
         let for_parsing = self.method(
             parse_type,
@@ -733,16 +1057,6 @@ impl Vm {
         let none = core::ptr::null::<jni::jvalue>();
         // SAFETY: JNI calls on the main thread's env with the classes and method IDs resolved above, each with the argument list its signature names; every result is checked (`check`, null) before use
         unsafe {
-            let jpath = jni_call!(self.env, NewStringUTF, path.as_ptr());
-            self.check("NewStringUTF")?;
-            let file = jni_call!(
-                self.env,
-                NewObjectA,
-                file_class,
-                file_init,
-                [jni::jvalue { l: jpath }].as_ptr()
-            );
-            self.check("new File")?;
             let input = jni_call!(
                 self.env,
                 CallStaticObjectMethodA,
@@ -798,7 +1112,9 @@ impl Vm {
                     jni_call!(self.env, DeleteLocalRef, s);
                 }
             }
-            Ok(ClusterLite {
+            Ok(Cluster {
+                vm: self,
+                lite,
                 package,
                 version_code,
                 splits,

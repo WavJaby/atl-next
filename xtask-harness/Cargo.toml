@@ -18,6 +18,7 @@ atl-gralloc = { path = "../crates/atl-gralloc" }
 atl-layout = { path = "../crates/atl-layout" }
 atl-native-bridge = { path = "../crates/atl-native-bridge" }
 atl-platform-host = { path = "../crates/atl-platform-host" }
+atl-property-service = { path = "../crates/atl-property-service" }
 atl-services-types = { path = "../crates/atl-services-types" }
 clap.workspace = true
 object.workspace = true
