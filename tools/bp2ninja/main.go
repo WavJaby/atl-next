@@ -454,6 +454,9 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	if err := g.checkPartial(); err != nil {
 		return err
 	}
+	if len(g.osArchSkipped) > 0 {
+		fmt.Printf("bp2ninja: target blocks not applied (Android %s ABI %s not covered by host isa %s): %s\n", cfg.Arch, soong.Flags.ArchISA[Device], cfg.HostCross.ISA, strings.Join(sortedKeys(g.osArchSkipped), ", "))
+	}
 	// build.ninja is written part by part as each is made (it is ~0.8 GB: one concatenated string plus its copies set the peak RSS), into a temporary file renamed at the end, so a failed run leaves the previous one
 	if err := os.MkdirAll(out, 0o755); err != nil {
 		return err

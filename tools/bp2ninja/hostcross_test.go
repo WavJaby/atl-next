@@ -87,6 +87,35 @@ func TestHostCrossDeviceSide(t *testing.T) {
 	}
 }
 
+// The ISA baseline rule: on a cross host's device side, target.android_<arch> applies only when the host row's isa covers the Android toolchain's -march (props written for that ABI, e.g. zlib's RVV defines); linux_/bionic_<arch> and arch.<arch> always apply. The dropped block is listed.
+// Break: applying android_riscv64 regardless (zlib's -DRISCV_RVV on a non-V host) or not listing it fails here; so does dropping it when the isa covers the ABI.
+func TestCrossOSArchISA(t *testing.T) {
+	g := graphFor(t, map[string]string{"p/Android.bp": `cc_library { name: "z", cflags: ["-DBASE"],
+  arch: { riscv64: { cflags: ["-DARCH"] } },
+  target: { linux_riscv64: { cflags: ["-DLINUX"] }, bionic_riscv64: { cflags: ["-DBIONIC"] }, android_riscv64: { cflags: ["-DRVV"] } } }`})
+	g.cfg = riscvOnX86
+	g.soong.Flags.ArchISA = map[Side]string{Device: "rv64gcv_zba_zbb_zbs"}
+	if got, want := g.flatten(g.lookup("z", Device), Device, Static).strs("cflags"), []string{"-DBASE", "-DARCH", "-DLINUX", "-DBIONIC"}; !slices.Equal(got, want) {
+		t.Errorf("non-V host: cflags %q, want %q", got, want)
+	}
+	if want := []string{"z target.android_riscv64"}; !slices.Equal(sortedKeys(g.osArchSkipped), want) {
+		t.Errorf("listed %q, want %q", sortedKeys(g.osArchSkipped), want)
+	}
+	g.osArchSkipped = nil
+	g.cfg.HostCross.ISA = "rv64gcv_zba_zbb_zbs_zicond"
+	if got := g.flatten(g.lookup("z", Device), Device, Static).strs("cflags"); !slices.Contains(got, "-DRVV") || len(g.osArchSkipped) != 0 {
+		t.Errorf("V host: cflags %q, listed %q", got, sortedKeys(g.osArchSkipped))
+	}
+	for _, c := range []struct {
+		have, want string
+		ok         bool
+	}{{"rv64gc_zba_zbb", "rv64gcv_zba_zbb_zbs", false}, {"rv64gcv_zba_zbb_zbs", "rv64gcv_zba_zbb_zbs", true}, {"rv64imafdc_zicsr_zifencei", "rv64gc", true}, {"rv32gc", "rv64gc", false}, {"armv8-a", "armv8.2-a", false}} {
+		if got := isaCovers(c.have, c.want); got != c.ok {
+			t.Errorf("isaCovers(%s, %s) = %v", c.have, c.want, got)
+		}
+	}
+}
+
 // A cross host builds the variant the build machine's own host builds: the variant is per goal, never per machine.
 func TestCrossGoalSide(t *testing.T) {
 	g := graphFor(t, map[string]string{"p/Android.bp": `cc_binary_host { name: "tool" }

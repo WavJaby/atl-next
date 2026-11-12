@@ -132,6 +132,70 @@ func osArchBlocks(s Side, arch string) []string {
 	return []string{"linux_" + arch, "linux_glibc_" + arch, "glibc_" + arch}
 }
 
+// osArchApplies: whether flatten applies OS+arch block b of module m on side. Not applied: `target.android_<arch>` on a cross host's product side whose host row ISA (HostCross.ISA) does not cover the Android toolchain's -march (GlobalFlags.ArchISA).
+// Those props are written for the Android <arch> ABI baseline (zlib's android_riscv64 RVV defines need V); Soong's own host build of that arch never applies them (os linux_glibc). linux_/bionic_<arch> stay: the libc and kernel are still bionic + Linux.
+// flatten lists a dropped block a module has in osArchSkipped. A run-time ISA tier adds those props back for its own objects; the baseline is this.
+func (g *Graph) osArchApplies(side Side, b string) bool {
+	if g.cfg.machine(side) != "host" || !side.android() {
+		return true
+	}
+	arch, _ := g.cfg.archOf(side)
+	abi, ok := g.soong.Flags.ArchISA[side]
+	return b != "android_"+arch || !ok || isaCovers(g.cfg.HostCross.ISA, abi)
+}
+
+// isaCovers: every extension of -march value want is in have. RISC-V ISA strings only (rv<xlen><single letters>[_<multi-letter>]*, g = imafd + zicsr + zifencei); any other value covers only itself, so an unparsed arch fails closed (props dropped and listed).
+func isaCovers(have, want string) bool {
+	if have == want {
+		return true
+	}
+	h, ok1 := riscvExts(have)
+	w, ok2 := riscvExts(want)
+	if !ok1 || !ok2 {
+		return false
+	}
+	for e := range w {
+		if !h[e] {
+			return false
+		}
+	}
+	return true
+}
+
+// riscvExts: the extension set of a RISC-V -march value, with its xlen under the key "xlen"+digits; ok = false when s is not one.
+func riscvExts(s string) (map[string]bool, bool) {
+	var xlen string
+	switch {
+	case strings.HasPrefix(s, "rv64"):
+		xlen = "64"
+	case strings.HasPrefix(s, "rv32"):
+		xlen = "32"
+	default:
+		return nil, false
+	}
+	parts := strings.Split(s[4:], "_")
+	out := map[string]bool{"xlen" + xlen: true}
+	for _, c := range parts[0] {
+		if c < 'a' || c > 'z' {
+			return nil, false
+		}
+		if c == 'g' {
+			for _, e := range []string{"i", "m", "a", "f", "d", "zicsr", "zifencei"} {
+				out[e] = true
+			}
+			continue
+		}
+		out[string(c)] = true
+	}
+	for _, p := range parts[1:] {
+		if p == "" {
+			return nil, false
+		}
+		out[p] = true
+	}
+	return out, true
+}
+
 // Kind is the artifact a node produces.
 type Kind int
 
@@ -256,6 +320,8 @@ type Graph struct {
 	nodes            map[key]*Node
 	order            []*Node
 	problems         []string
+	// OS+arch target blocks not applied (osArchApplies): "<module> target.<block>", reported on every run
+	osArchSkipped map[string]bool
 	// references no module of the tree answers to (see notFound)
 	missing map[string]bool
 	// tree-relative directories modules name by path (include_dirs) that do not exist
@@ -450,7 +516,18 @@ func (g *Graph) flatten(m *Module, side Side, kind Kind) *Obj {
 			base = merge(base, o)
 		}
 	}
-	target(osArchBlocks(osSide, arch))
+	target(slices.DeleteFunc(osArchBlocks(osSide, arch), func(b string) bool {
+		if g.osArchApplies(side, b) {
+			return false
+		}
+		if t := p.obj("target"); t != nil && t.obj(b) != nil {
+			if g.osArchSkipped == nil {
+				g.osArchSkipped = map[string]bool{}
+			}
+			g.osArchSkipped[m.Name+" target."+b] = true
+		}
+		return true
+	}))
 	var part *Obj
 	if kind == Static || kind == Shared {
 		part = base.obj(kind.String())

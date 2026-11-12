@@ -35,6 +35,8 @@ type GlobalFlags struct {
 	RustTriple map[Side]string
 	// per Side: the side's machine target on its links (HostCross.linkFlags on a cross host's product sides); empty where the side links for the build machine or a bionic triple
 	Link map[Side][]string
+	// per cross product side: the toolchain's dropped -march value, the arch ABI baseline its OS+arch props were written for (Android riscv64: rv64gcv_zba_zbb_zbs); absent = none dropped (flatten osArchApplies)
+	ArchISA map[Side]string
 }
 
 // hod: the side's Host-or-Device prefix of Soong's global flag variables (<Hod>GlobalCflags).
@@ -278,6 +280,12 @@ func readGlobalFlags(cfg Config, dev DeviceArch) (GlobalFlags, error) {
 					drop := strings.HasPrefix(f, "-march=") || strings.HasPrefix(f, "-mcpu=")
 					if drop {
 						skipped[f] = true
+					}
+					if isa, ok := strings.CutPrefix(f, "-march="); ok {
+						if g.ArchISA == nil {
+							g.ArchISA = map[Side]string{}
+						}
+						g.ArchISA[side] = isa
 					}
 					return drop
 				}), err
