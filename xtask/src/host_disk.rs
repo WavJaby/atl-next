@@ -2,7 +2,7 @@
 //! Free space of the Windows drive that holds this WSL distro's virtual disk (ext4.vhdx), checked before `native`.
 //!
 //! WSL cannot see the vhdx's own headroom: the ext4 inside reports the vhdx's virtual size, while the file grows on the host drive and a full host drive fails writes in
-//! the distro mid-build. The drive is the one the distro's `Lxss` registry row names (`BasePath`, read through `reg.exe` interop), seen at `/mnt/<letter>`.
+//! the distro mid-build. The drive is the one the distro's `Lxss` registry row names (`BasePath`, read through `reg.exe` interop, retried on transient interop failure), seen at `/mnt/<letter>`.
 //! Off WSL (`WSL_DISTRO_NAME` unset, e.g. the Arch laptop) there is no host drive and the check is skipped.
 
 use std::path::PathBuf;
@@ -25,17 +25,80 @@ fn host_free() -> Result<Option<(PathBuf, u64)>> {
     let Ok(distro) = std::env::var("WSL_DISTRO_NAME") else {
         return Ok(None);
     };
-    let out = Command::new("reg.exe")
-        .args(["query", LXSS_KEY, "/s"])
-        .output()
-        .context("running reg.exe (WSL interop) for the distro's BasePath")?;
-    let text = String::from_utf8_lossy(&out.stdout);
+    let text = query_lxss(run_reg, REG_ATTEMPTS, REG_RETRY_DELAY)?;
     let base = base_path(&text, &distro)
-        .with_context(|| format!("no Lxss BasePath for distro {distro}"))?;
+        .with_context(|| format!("no Lxss BasePath for distro {distro} (reg.exe succeeded)"))?;
     let mount =
         mount_of(&base).with_context(|| format!("BasePath {base} names no drive letter"))?;
     let st = rustix::fs::statvfs(&mount).with_context(|| format!("statvfs {}", mount.display()))?;
     Ok(Some((mount, st.f_bavail * st.f_frsize)))
+}
+
+/// Interop under heavy build load fails transiently (same moments as `Wsl/Service/0x8007274c`) and a rerun seconds later works: 3 tries 2 s apart span ~4 s of
+/// outage. Not cached: the distro can be moved (`wsl --manage --move`) and nothing inside the guest names the vhdx's drive (`/proc/mounts` shows only `/dev/sdX`).
+const REG_ATTEMPTS: u32 = 3;
+const REG_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// One `reg.exe` run: exit code (`None` = killed by signal / spawn failed), stdout, stderr.
+struct RegRun {
+    ok: bool,
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+fn run_reg() -> RegRun {
+    match Command::new("reg.exe")
+        .args(["query", LXSS_KEY, "/s"])
+        .output()
+    {
+        Ok(o) => RegRun {
+            ok: o.status.success(),
+            code: o.status.code(),
+            stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+        },
+        Err(e) => RegRun {
+            ok: false,
+            code: None,
+            stdout: String::new(),
+            stderr: format!("spawn: {e}"),
+        },
+    }
+}
+
+/// `reg query` stdout, retried while interop fails (non-zero exit or empty stdout); the error names the last exit code and stderr, never "no BasePath".
+fn query_lxss(
+    mut run: impl FnMut() -> RegRun,
+    attempts: u32,
+    delay: std::time::Duration,
+) -> Result<String> {
+    let mut last = None;
+    for i in 1..=attempts {
+        let r = run();
+        if r.ok && !r.stdout.trim().is_empty() {
+            if i > 1 {
+                println!("native: reg.exe (WSL interop) succeeded on attempt {i}/{attempts}");
+            }
+            return Ok(r.stdout);
+        }
+        println!(
+            "native: reg.exe (WSL interop) failed, attempt {i}/{attempts}: exit {:?}, stderr {:?}",
+            r.code,
+            r.stderr.trim()
+        );
+        last = Some(r);
+        if i < attempts {
+            std::thread::sleep(delay);
+        }
+    }
+    let r = last.expect("attempts >= 1");
+    bail!(
+        "WSL interop failed: reg.exe query {LXSS_KEY} gave exit {:?}, stdout {} bytes, stderr {:?} after {attempts} attempts; host disk floor unchecked, refusing `native`",
+        r.code,
+        r.stdout.len(),
+        r.stderr.trim()
+    )
 }
 
 /// The `BasePath` of the registry block whose `DistributionName` is `distro` (`reg query /s` output: one block per distro, `name  REG_SZ  value` lines).
@@ -115,6 +178,65 @@ mod tests {
                 .is_some_and(|n| n.contains("compact"))
         );
         assert!(judge("/mnt/c", 30 * GIB, LIMITS).unwrap().is_none());
+    }
+
+    fn fake(ok: bool, stdout: &str) -> RegRun {
+        RegRun {
+            ok,
+            code: Some(if ok { 0 } else { 1 }),
+            stdout: stdout.into(),
+            stderr: if ok {
+                String::new()
+            } else {
+                "Wsl/Service/0x8007274c".into()
+            },
+        }
+    }
+
+    /// Transient failures (bad exit, empty stdout) are retried; success on the last attempt returns its stdout.
+    #[test]
+    fn retries_transient_interop() {
+        let mut seq = vec![
+            fake(false, ""),
+            fake(true, "  \r\n"),
+            fake(true, "BasePath"),
+        ]
+        .into_iter();
+        let mut calls = 0;
+        let out = query_lxss(
+            || {
+                calls += 1;
+                seq.next().unwrap()
+            },
+            3,
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!((out.as_str(), calls), ("BasePath", 3));
+    }
+
+    /// Break test: interop never works -> bounded tries, error names the interop failure + stderr, not "no BasePath".
+    #[test]
+    fn persistent_interop_failure_refuses() {
+        let mut calls = 0;
+        let e = query_lxss(
+            || {
+                calls += 1;
+                fake(false, "")
+            },
+            3,
+            std::time::Duration::ZERO,
+        )
+        .expect_err("must refuse");
+        let msg = format!("{e}");
+        assert_eq!(calls, 3);
+        assert!(
+            msg.contains("WSL interop failed")
+                && msg.contains("0x8007274c")
+                && msg.contains("exit Some(1)"),
+            "{msg}"
+        );
+        assert!(!msg.contains("BasePath for distro"), "{msg}");
     }
 
     /// The block of the named distro, not the first; the `\\?\` prefix and the drive letter.
