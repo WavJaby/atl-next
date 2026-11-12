@@ -192,9 +192,12 @@ struct Gate<'a> {
 
 impl Gate<'_> {
     fn run(&self, dir: &Path) -> Result<(ArtRun, u128)> {
-        let mut cmd =
-            self.host
-                .art_command(&self.installer, &self.data, (&self.area.0, &self.area.1));
+        let mut cmd = self.host.art_command(
+            &self.installer,
+            &[],
+            &self.data,
+            (&self.area.0, &self.area.1),
+        );
         cmd.arg(dir);
         let start = Instant::now();
         let r = self.host.run(&mut cmd)?;

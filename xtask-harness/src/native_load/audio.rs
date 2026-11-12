@@ -268,6 +268,13 @@ fn check(
     if got.get("store").map(String::as_str) != Some("local") {
         bad.push(format!("store is {:?}, expected local", got.get("store")));
     }
+    // a lookup from this process of media.extractor, as MediaPlayerService's setDataSource makes it: the served service, not servicemanager's (none = absent)
+    if got.get("extractor").map(String::as_str) != Some("local") {
+        bad.push(format!(
+            "extractor is {:?}, expected local",
+            got.get("extractor")
+        ));
+    }
     if let Some(wav) = &exp.wav_data
         && wav.as_slice() != pcm
     {

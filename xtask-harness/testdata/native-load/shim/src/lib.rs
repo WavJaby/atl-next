@@ -210,6 +210,7 @@ pub extern "C" fn Java_NativeLoad_createDecoder(
 const BINDER_NDK: &[u8] = b"libbinder_ndk.so\0";
 const IFACE: &[u8] = b"android.hardware.media.c2.IComponentStore\0";
 const STORE: &[u8] = b"android.hardware.media.c2.IComponentStore/default\0";
+const EXTRACTOR: &[u8] = b"media.extractor\0";
 /// JNINativeInterface slot of NewStringUTF (jni.h order), beside GetStringUTFChars (169).
 const NEW_STRING_UTF: usize = 167;
 /// AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM.
@@ -361,6 +362,31 @@ fn store_probe(out: &mut Vec<String>) {
         if names.is_empty() { "-".to_owned() } else { names.join(",") }
     ));
     out.push(format!("store={store}"));
+}
+
+/// The lookup of media.extractor from this process, as MediaPlayerService's setDataSource makes it: `local` = the in-process service, `remote` = servicemanager's, `none` = absent.
+/// checkService does not wait, so an absent name answers at once.
+fn extractor_probe(out: &mut Vec<String>) {
+    let (Some(check), Some(is_remote), Some(dec)) = (
+        lib_sym::<CheckService>(BINDER_NDK, b"AServiceManager_checkService\0"),
+        lib_sym::<IsRemote>(BINDER_NDK, b"AIBinder_isRemote\0"),
+        lib_sym::<DecStrong>(BINDER_NDK, b"AIBinder_decStrong\0"),
+    ) else {
+        out.push("extractor=unavailable".to_owned());
+        return;
+    };
+    // SAFETY: EXTRACTOR is NUL-terminated; a non-null result holds one strong reference, released below.
+    let binder = unsafe { check(EXTRACTOR.as_ptr().cast()) };
+    let found = if binder.is_null() {
+        "none"
+    } else {
+        // SAFETY: binder is non-null, so live.
+        let remote = unsafe { is_remote(binder) };
+        // SAFETY: releases the reference checkService returned.
+        unsafe { dec(binder) };
+        if remote { "remote" } else { "local" }
+    };
+    out.push(format!("extractor={found}"));
 }
 
 /// `AServiceManager_forEachDeclaredInstance`'s callback: appends the instance to the Vec behind `context`.
@@ -548,6 +574,7 @@ pub extern "C" fn Java_NativeLoad_decodeFile(
     let (input, output) = (java_string(env, input), java_string(env, output));
     let mut out = Vec::new();
     store_probe(&mut out);
+    extractor_probe(&mut out);
     if let Err(e) = ashmem_probe(&mut out).and_then(|()| decode(&input, &output, &mut out)) {
         out.push(e);
     }

@@ -114,8 +114,10 @@ const GUEST_FAULT_REPORT: &str =
 const MEDIA_PLAYER_SERVICE: &str = "AtlTest: media.player: ";
 /// The probe's line when its lookup was answered and setDataSource(fd) returned (MEDIA_PLAYER_SERVICE).
 const MEDIA_PLAYER_ANSWERED: &str = "returned";
-/// The served service's own line, logged inside its setDataSource: it asks the real servicemanager for media.extractor, which this host does not serve (MediaPlayerService.cpp:892-894). Its presence shows the served object ran the call; it goes once media.extractor is served.
-const MEDIA_PLAYER_RAN: &str = "MediaPlayerService: extractor service not available";
+/// The served service's own line: GenericSource's, for the extractor it could not make from the probe's fd at the probe's prepare (GenericSource.cpp:181, Main.java mediaPlayerService). It prints only
+/// after setDataSource_pre got media.extractor from the process's view (MediaPlayerService.cpp:892); before the extractor service was served that lookup returned null and printed
+/// "extractor service not available" instead. Its presence shows the served object went past that lookup.
+const MEDIA_PLAYER_RAN: &str = "initFromDataSource, cannot create extractor!";
 /// The startActivityForResult round trip (Main.java, ResultChild.java): after the marker Main starts ResultChild for request 7; its RESULT_OK (-1) and extra come back in
 /// onActivityResult, then Main's singleTop self-start cancels request 9 (RESULT_CANCELED, 0) before its new intent. Lines are `AtlTest: result request=<r> code=<c> extra=<e>`.
 const RESULT: &str = "AtlTest: result ";

@@ -283,8 +283,22 @@ impl HostArt {
         class: &str,
         args: &[String],
     ) -> Command {
+        self.command_with(&[], fixture, area, vm, class, args)
+    }
+
+    /// `command` with the launcher's own options (`--...`, atl-app-launcher args.rs), which it reads before its VM options.
+    pub fn command_with(
+        &self,
+        launcher: &[&str],
+        fixture: &JavaFixture,
+        area: &str,
+        vm: &[&str],
+        class: &str,
+        args: &[String],
+    ) -> Command {
         let mut cmd = self.art_command(
             &self.launcher,
+            launcher,
             &fixture.work.join("data"),
             (&fixture.area.0, area),
         );
@@ -296,11 +310,18 @@ impl HostArt {
         cmd
     }
 
-    /// `exe` (a loader of the launcher package: atl-app-launcher, atl-installer) on this ART: the boot classpath options first (the caller appends the rest), the runtime's environment, `area` = (variable, path) of the property area, `data` = ANDROID_DATA.
-    pub fn art_command(&self, exe: &Path, data: &Path, area: (&str, &str)) -> Command {
+    /// `exe` (a loader of the launcher package: atl-app-launcher, atl-installer) on this ART: `own` (the exe's own `--...` options, read before its VM options), then the boot classpath options (the caller appends the rest), the runtime's environment, `area` = (variable, path) of the property area, `data` = ANDROID_DATA.
+    pub fn art_command(
+        &self,
+        exe: &Path,
+        own: &[&str],
+        data: &Path,
+        area: (&str, &str),
+    ) -> Command {
         let boot = join_paths(&self.boot);
         let mut cmd = Command::new(exe);
-        cmd.arg(format!("-Xbootclasspath:{boot}"))
+        cmd.args(own)
+            .arg(format!("-Xbootclasspath:{boot}"))
             .arg(format!("-Xbootclasspath-locations:{boot}"))
             .arg("-Xnoimage-dex2oat")
             .env("ANDROID_ROOT", &self.art)

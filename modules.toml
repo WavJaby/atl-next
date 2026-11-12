@@ -50,17 +50,17 @@ crates = ["atl-launch"]
 crates = ["atl-app-launcher"]
 uses = ["generators", "bionic", "composer", "gralloc", "platform-ui", "service-view", "audioflinger", "codec-store", "resource-manager", "media-player", "media-extractors"]
 
-# the process's own view of servicemanager: names the app process serves itself (its SurfaceFlinger, the Codec2 store, the media resource manager, media.player) answered in-process, the rest forwarded; libbinder reached through cxx adapters (wrap/view.cpp)
+# the process's own view of servicemanager: names the app process serves itself (its SurfaceFlinger, the Codec2 store, the media resource manager, the media extractor service, media.player) answered in-process, the rest forwarded; libbinder reached through cxx adapters (wrap/view.cpp)
 [service-view]
 crates = ["atl-service-view"]
 exports = ["atl-service-view"]
 uses = ["aidl", "generators", "services-types"]
 
-# the extractor plugins of the app process (audio M1): AOSP's MediaExtractorFactory::LoadExtractors, the call only the media.extractor service makes; cxx forwarder in wrap/extractors.cpp
+# the media extractor service the app process serves through the view (audio M1): AOSP's MediaExtractorService constructed as instantiate() does minus addService, as media.extractor (its constructor loads the extractor plugins); cxx adapter in wrap/extractors.cpp
 [media-extractors]
 crates = ["atl-media-extractors"]
 exports = ["atl-media-extractors"]
-uses = ["generators"]
+uses = ["service-view", "generators"]
 
 # the Codec2 store the app process serves through the view (audio M1): AOSP's aidl ComponentStore over the platform store, as IComponentStore/default; cxx adapter in wrap/store.cpp
 [codec-store]

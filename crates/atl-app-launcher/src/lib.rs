@@ -125,12 +125,13 @@ fn install_service_view() -> Result<()> {
     Ok(())
 }
 
-/// Step 1c. The media services this process serves through the view, right after it is installed, found by name in-process: AudioFlinger and AudioPolicyService (atl-audioflinger, `media.audio_flinger` / `media.audio_policy`), the Codec2 store (atl-codec-store, `IComponentStore/default`, which AOSP's Codec2 client walks to) and the resource manager (atl-resource-manager, `media.resource_manager`, which MediaCodec waits for), and the media player service (atl-media-player, `media.player`, which MediaPlayer's native calls wait for; skipped under `--no-media-player-service`, the media player gate's break).
+/// Step 1c. The media services this process serves through the view, right after it is installed, found by name in-process: AudioFlinger and AudioPolicyService (atl-audioflinger, `media.audio_flinger` / `media.audio_policy`), the Codec2 store (atl-codec-store, `IComponentStore/default`, which AOSP's Codec2 client walks to) and the resource manager (atl-resource-manager, `media.resource_manager`, which MediaCodec waits for), the extractor service (atl-media-extractors, `media.extractor`, which MediaPlayer's setDataSource waits for; made here at launch, since its constructor loads the plugins that the in-process MediaExtractorFactory reads; skipped under `--no-media-extractor-service`, the extractor gate's break), and the media player service (atl-media-player, `media.player`, which MediaPlayer's native calls wait for; skipped under `--no-media-player-service`, the media player gate's break).
 /// The PCM output opens on its first use (atl-audioflinger), so the audio server is named here only: an unreachable server does not fail the launch. `pipewire` is atld's grant (`--pipewire-socket`).
 #[cfg(feature = "converter")]
 fn serve_media_services(
     no_audio_service: bool,
     break_cblk: bool,
+    no_media_extractor_service: bool,
     no_media_player_service: bool,
     break_mix: bool,
     pipewire: Option<&Path>,
@@ -147,6 +148,9 @@ fn serve_media_services(
     }
     atl_codec_store::serve().map_err(|e| anyhow!(e))?;
     atl_resource_manager::serve().map_err(|e| anyhow!(e))?;
+    if !no_media_extractor_service {
+        atl_media_extractors::serve().map_err(|e| anyhow!(e))?;
+    }
     if !no_media_player_service {
         atl_media_player::serve().map_err(|e| anyhow!(e))?;
     }
@@ -157,21 +161,13 @@ fn serve_media_services(
 fn serve_media_services(
     _no_audio_service: bool,
     _break_cblk: bool,
+    _no_media_extractor_service: bool,
     _no_media_player_service: bool,
     _break_mix: bool,
     _pipewire: Option<&Path>,
 ) -> Result<()> {
     Ok(())
 }
-
-/// Step 1d. The extractor plugins of this process (atl-media-extractors): AOSP's media.extractor service registers them at its start, and this process runs with extractremote=false, so it never runs that service.
-#[cfg(feature = "converter")]
-fn load_media_extractors() {
-    atl_media_extractors::load();
-}
-
-#[cfg(not(feature = "converter"))]
-fn load_media_extractors() {}
 
 /// Step 5b''. UI mode (`ro.atl.ui=gtk`, atld `--ui gtk`): the main thread's Looper is made before Java (its MessageQueue adopts it), then GTK starts on this thread with its GLib main context mirrored
 /// into the Looper (atl-platform-ui-linux `mirror`, over the `looper` seam), so GTK runs while the app's main thread idles in its Looper and a blocked one answers no ping.
@@ -227,11 +223,11 @@ fn run(argv: Vec<std::ffi::OsString>) -> Result<i32> {
     serve_media_services(
         launch.no_audio_service,
         launch.break_cblk,
+        launch.no_media_extractor_service,
         launch.no_media_player_service,
         launch.break_mix,
         launch.pipewire_socket.as_deref(),
     )?;
-    load_media_extractors();
     let mut vm_options = launch.vm_options.clone();
     if launch.app {
         vm_options.extend(native_bridge_options(

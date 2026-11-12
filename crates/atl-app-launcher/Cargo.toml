@@ -11,7 +11,7 @@ publish.workspace = true
 # Only `xtask native` has built the converter modules: it builds this package after the converter with feature `converter` (build.rs, atl-bridgegen converter.rs); plain workspace builds and tests skip the executable. With it, in app mode, the process's SurfaceFlinger (atl-composer)
 # runs in the runtime: its converter modules are linked here too (a package's link arguments reach only its own links). The audio bridge (atl-audio-bridge, game audio A2) runs there too, so its archive (AudioMixerBase's libaudioprocessing_base) and libaudioclient / libaudioutils link here.
 [package.metadata.atl]
-converter = ["device/libsigchain", "device/libbinder_ndk", "device/libbinder", "device/libbinder_rs", "device/libatl_parcelables", "device/atl-aidl-stubs-rust", "device/libgui_aidl_types_rs", "device/librustutils", "device/libcodec2_aidl_noisurface", "device/libcodec2_vndk", "device/libstagefright", "device/libresourcemanagerservice", "device/libmediaplayerservice", "device/libaudioclient", "device/libaudioprocessing_base", "device/libaudioutils"]
+converter = ["device/libsigchain", "device/libbinder_ndk", "device/libbinder", "device/libbinder_rs", "device/libatl_parcelables", "device/atl-aidl-stubs-rust", "device/libgui_aidl_types_rs", "device/librustutils", "device/libcodec2_aidl_noisurface", "device/libcodec2_vndk", "device/libstagefright", "device/libresourcemanagerservice", "device/libdatasource", "device/libmediaextractorservice", "device/libmediaplayerservice", "device/libaudioclient", "device/libaudioprocessing_base", "device/libaudioutils"]
 # the loader's DT_NEEDED leads with libsigchain only (global scope = glibc + libsigchain); the runtime cdylib links the rest
 bin_needed = ["device/libsigchain"]
 # the runtime cdylib goes onto the runtime library path, where the loader dlopens it by name
@@ -48,7 +48,7 @@ atl-codec-store = { path = "../atl-codec-store" }
 atl-resource-manager = { path = "../atl-resource-manager" }
 # the media player service the process serves through the view (lib.rs step 1c)
 atl-media-player = { path = "../atl-media-player" }
-# the extractor plugins of the process, registered after the store (lib.rs step 1d)
+# the media extractor service the process serves through the view, made at launch (lib.rs step 1c)
 atl-media-extractors = { path = "../atl-media-extractors" }
 # UI mode (lib.rs start_ui): GTK on the main thread, its GLib context mirrored into the Looper by atl-platform-ui-linux (looper.rs is the Looper seam)
 atl-platform-ui = { path = "../atl-platform-ui" }

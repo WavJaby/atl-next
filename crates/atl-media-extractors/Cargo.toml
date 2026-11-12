@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
-# The extractor plugins of an app process (audio M1): AOSP's MediaExtractorFactory::LoadExtractors, which only the media.extractor service calls at its start. The app runs with media.stagefright.extractremote=false, so without this call no extractor is ever registered.
-# C++ is a cxx forwarder (wrap/extractors.{h,cpp}): one call, no logic (project CLAUDE.md, C++ exception).
+# The media extractor service an app process serves in-process (audio M1): AOSP's MediaExtractorService constructed as instantiate() does minus addService, as `media.extractor`. Its constructor loads the
+# extractor plugins (MediaExtractorFactory::LoadExtractors), which the app process needs: its MediaExtractorFactory runs in-process (media.stagefright.extractremote=false), and the service's name is looked up before every setDataSource.
+# C++ is cxx glue (src/bridge.rs) plus wrap/extractors.{h,cpp}: the construction and the AIBinder conversion, nothing else. No logic (project CLAUDE.md, C++ exception).
 [package]
 name = "atl-media-extractors"
 version = "0.0.0"
@@ -10,12 +11,13 @@ license.workspace = true
 publish.workspace = true
 
 [package.metadata.atl]
-converter = ["device/libstagefright"]
+converter = ["device/libdatasource", "device/libmediaextractorservice", "device/libstagefright", "device/libbinder_ndk", "device/libbinder", "device/libbinder_rs", "device/libatl_parcelables", "device/atl-aidl-stubs-rust", "device/libgui_aidl_types_rs", "device/librustutils"]
 
 [features]
-converter = []
+converter = ["atl-service-view/converter"]
 
 [dependencies]
+atl-service-view = { path = "../atl-service-view" }
 cxx.workspace = true
 
 [build-dependencies]

@@ -20,7 +20,7 @@
 //! 8. media: NDK `AMediaCodec_createDecoderByType` for [`MEDIA_MIMES`], the run an app-uid binder process of its own binderd + AOSP servicemanager. A warning, not a failure, until the in-app Codec2 store exists (audio slice M1);
 //!    the detail is the first fatal line, else the last Codec2 line. Measured 2026-11-06: without `media.c2.hal.selection=aidl` (atl-property-service CONSTANTS) Codec2Client::CacheServiceNames takes the HIDL path and aborts
 //!    (`Check failed: serviceManager Hardware service manager is not running.`); with it the process exits 0, both codecs null (`No Codec2 services declared in the manifest.`), after MediaCodecList's 5 s wait for `media.player`.
-//! 9. decode: the clips of `audio.rs` (Ogg Vorbis, WAV PCM, from the game APKs) decoded one by one through the NDK extractor and codec, as stage 8 runs them. Frames, channels, rate and PCM bytes equal each container's; raw output equals the WAV data chunk; the process's Codec2 store is in-process (`store=local`, declared, instance `default`).
+//! 9. decode: the clips of `audio.rs` (Ogg Vorbis, WAV PCM, from the game APKs) decoded one by one through the NDK extractor and codec, as stage 8 runs them. Frames, channels, rate and PCM bytes equal each container's; raw output equals the WAV data chunk; the process's Codec2 store is in-process (`store=local`, declared, instance `default`), and media.extractor is served in-process (`extractor=local`, the lookup MediaPlayerService's setDataSource makes).
 //! 10. player: after startReg, as stage 8 runs: MediaPlayer's class init must succeed (loads libmedia_jni, whose JNI_OnLoad registers every media class, then native_init). Then Happy Jump's sequence (GameShared.loadMusic): `new MediaPlayer`, `setLooping`, `setVolume`, `release`, no exception and no `media.player` lookup; `start()` in Idle throws IllegalStateException, as AOSP's MediaPlayer.cpp answers it.
 //!     The sequence is a warning here: construction resolves an AttributionSource, which needs ActivityThread or the package service (see `player_result`).
 //!
@@ -69,6 +69,9 @@ pub struct Args {
     /// Stage 9 decodes cheer.ogg truncated to half its bytes against the full file's expectation: the stage must fail.
     #[arg(long)]
     break_media: bool,
+    /// The extractor break: every stage's launcher starts with `--no-media-extractor-service`, so the name media.extractor is not served and stage 9's `extractor=local` check must go red.
+    #[arg(long)]
+    break_extractor: bool,
     /// The property area names the DMABUF-heap tier whatever the probe found (atl-property-service `--linear-tier dmabuf-heap`): on a host without /dev/dma_heap/system stage 9 must fail (NO_MEMORY), which shows the probe's gralloc-BLOB tier is what keeps it working.
     #[arg(long)]
     break_linear_tier: bool,
@@ -439,6 +442,8 @@ struct Env {
     root: PathBuf,
     out: PathBuf,
     work: PathBuf,
+    /// The launcher's leading options (atl-app-launcher args.rs): the extractor break's `--no-media-extractor-service`.
+    launcher_opts: Vec<&'static str>,
 }
 
 struct Fixture {
@@ -477,6 +482,11 @@ impl Env {
             work: out.join("native-load"),
             root: root.to_owned(),
             out,
+            launcher_opts: if args.break_extractor {
+                vec!["--no-media-extractor-service"]
+            } else {
+                Vec::new()
+            },
         })
     }
 
@@ -532,7 +542,8 @@ impl Env {
             &test_root.join("allocator.log"),
             None,
         )?;
-        let mut cmd = self.host.command(
+        let mut cmd = self.host.command_with(
+            &self.launcher_opts,
             &fixture.java,
             &fixture.java.area.1,
             &[],

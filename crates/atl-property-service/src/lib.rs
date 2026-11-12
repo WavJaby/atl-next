@@ -45,7 +45,7 @@ const CONSTANTS: &[(&str, &str)] = &[
     // the device's choice of Codec2 HAL, a vendor property on Android: AIDL (`IComponentStore` through servicemanager, frameworks/av codec2 HalSelection.cpp IsCodec2AidlHalSelected; the aidl_hal flag is on in our release).
     // Unset it reads "hidl", and Codec2Client::CacheServiceNames CHECK-aborts without hwservicemanager, which ATL has none of (measured 2026-11-06, native-load stage 8)
     ("media.c2.hal.selection", "aidl"),
-    // MediaExtractorFactory.cpp:47 defaults to true: extractors then run in a media.extractor process, which ATL does not serve. false loads them in-process, where the sandbox's plugin dirs are the only dependency (see native-load stage 9)
+    // MediaExtractorFactory.cpp:47 defaults to true: extractors then run in a media.extractor process, which ATL does not start (atl-media-extractors serves the name in-process). false loads them in-process, where the sandbox's plugin dirs are the only dependency (see native-load stage 9)
     ("media.stagefright.extractremote", "false"),
     // libcutils ashmem-dev.cpp __has_memfd_support: memfd only when both are true, else it opens /dev/ashmem, which Linux lacks (Codec2's FMQ and input buffers then fail NO_MEMORY, measured 2026-11-07, native-load stage 9). Every Treble device (Android 8+) sets ro.treble.enabled=true
     ("ro.treble.enabled", "true"),

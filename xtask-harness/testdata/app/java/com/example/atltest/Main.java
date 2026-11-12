@@ -363,6 +363,12 @@ public class Main extends Activity {
                     MediaPlayer mp = new MediaPlayer();
                     mp.setDataSource(afd.getFileDescriptor(), afd.getStartOffset(), afd.getLength());
                     r = "returned";
+                    // VideoView's next step (prepareAsync in the game): the prepare creates the extractor, and its failure logs MEDIA_PLAYER_RAN from the served service (app.rs)
+                    try {
+                        mp.prepare();
+                    } catch (Exception e) {
+                        // the bytes are no media, so the prepare fails; the line above already answered the probe
+                    }
                 } catch (Throwable t) {
                     r = thrown(t);
                 }
