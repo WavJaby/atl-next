@@ -32,6 +32,7 @@ mod gl_scene;
 mod gles2_fixture;
 mod gralloc;
 mod installer;
+mod installer_parse;
 mod instrument;
 mod jni_fixture;
 mod manifest;

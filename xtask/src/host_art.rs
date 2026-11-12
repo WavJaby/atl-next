@@ -162,7 +162,7 @@ impl HostArt {
             property_service: build_property_service(root, &out.join("cargo"))?,
             build_prop: out.join(BUILD_PROP),
             boot: boot_jars(&java_out)?,
-            javac_boot: JAVAC_BOOT.iter().map(|j| java_out.join(j)).collect(),
+            javac_boot: javac_boot(&java_out),
             d8,
             jdk,
             cargo: out.join("cargo"),
@@ -181,56 +181,10 @@ impl HostArt {
 
     /// Compiles every .java below `java` into `work` (rebuilt every run: a few seconds, no staleness logic to get wrong) and writes the default property area there.
     pub fn compile(&self, java: &Path, work: &Path) -> Result<JavaFixture> {
-        if work.exists() {
-            std::fs::remove_dir_all(work)?;
-        }
-        let classes = work.join("classes");
-        std::fs::create_dir_all(&classes)?;
+        let dex = compile_dex(&self.jdk, &self.d8, &self.javac_boot, java, work)?;
         std::fs::create_dir_all(work.join("data"))?;
-        let mut sources = Vec::new();
-        collect(java, "java", &mut sources)?;
-        let jdk_bin = self.jdk.join("bin");
-        let bootcp = join_paths(&self.javac_boot);
-        exec(
-            Command::new(jdk_bin.join("javac"))
-                .args([
-                    "-source",
-                    "8",
-                    "-target",
-                    "8",
-                    "-Xlint:-options",
-                    "-bootclasspath",
-                ])
-                .arg(&bootcp)
-                .arg("-d")
-                .arg(&classes)
-                .args(&sources),
-            "javac",
-        )?;
-        let jar = work.join("classes.jar");
-        exec(
-            Command::new(jdk_bin.join("jar"))
-                .arg("cf")
-                .arg(&jar)
-                .arg("-C")
-                .arg(&classes)
-                .arg("."),
-            "jar",
-        )?;
-        let dex = work.join("dex");
-        std::fs::create_dir_all(&dex)?;
-        let path = std::env::join_paths(std::iter::once(jdk_bin.clone()).chain(
-            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
-        ))?;
-        // installed executable by the Java pipeline (a bash script running r8.jar with the JDK on PATH)
-        let mut d8 = Command::new(&self.d8);
-        d8.env("PATH", path);
-        for lib in &self.javac_boot {
-            d8.arg("--lib").arg(lib);
-        }
-        exec(d8.arg("--output").arg(&dex).arg(&jar), "d8")?;
         Ok(JavaFixture {
-            dex: dex.join("classes.dex"),
+            dex,
             area: self.property_area(&work.join("properties"))?,
             work: work.to_path_buf(),
         })
@@ -363,6 +317,95 @@ impl HostArt {
         }
         run
     }
+}
+
+/// The javac / d8 class jars below the Java pipeline's build dir `java_out` ([`JAVAC_BOOT`]).
+fn javac_boot(java_out: &Path) -> Vec<PathBuf> {
+    JAVAC_BOOT.iter().map(|j| java_out.join(j)).collect()
+}
+
+/// Every .java below `java` compiled against `boot` with the JDK `jdk` and the Java pipeline's `d8`, into `work` (removed first: no staleness logic); the dex file.
+fn compile_dex(
+    jdk: &Path,
+    d8: &Path,
+    boot: &[PathBuf],
+    java: &Path,
+    work: &Path,
+) -> Result<PathBuf> {
+    if work.exists() {
+        std::fs::remove_dir_all(work)?;
+    }
+    let classes = work.join("classes");
+    std::fs::create_dir_all(&classes)?;
+    let mut sources = Vec::new();
+    collect(java, "java", &mut sources)?;
+    let jdk_bin = jdk.join("bin");
+    exec(
+        Command::new(jdk_bin.join("javac"))
+            .args([
+                "-source",
+                "8",
+                "-target",
+                "8",
+                "-Xlint:-options",
+                "-bootclasspath",
+            ])
+            .arg(join_paths(boot))
+            .arg("-d")
+            .arg(&classes)
+            .args(&sources),
+        "javac",
+    )?;
+    let jar = work.join("classes.jar");
+    exec(
+        Command::new(jdk_bin.join("jar"))
+            .arg("cf")
+            .arg(&jar)
+            .arg("-C")
+            .arg(&classes)
+            .arg("."),
+        "jar",
+    )?;
+    let dex = work.join("dex");
+    std::fs::create_dir_all(&dex)?;
+    let path = std::env::join_paths(std::iter::once(jdk_bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))?;
+    // installed executable by the Java pipeline (a bash script running r8.jar with the JDK on PATH)
+    let mut cmd = Command::new(d8);
+    cmd.env("PATH", path);
+    for lib in boot {
+        cmd.arg("--lib").arg(lib);
+    }
+    exec(cmd.arg("--output").arg(&dex).arg(&jar), "d8")?;
+    Ok(dex.join("classes.dex"))
+}
+
+/// The api-impl sources in the repo (AGENTS Languages: the Java ART requires of us, and forwarders): the installer's ParsingPackageUtils.Callback.
+const API_IMPL_SRC: &str = "java/api-impl";
+/// Where `xtask native` puts the api-impl dex below a build dir; the installer VM's class path (`-Djava.class.path`).
+const API_IMPL: &str = "api-impl";
+
+/// The api-impl dex of build dir `out` ([`build_api_impl`]).
+pub fn api_impl_dex(out: &Path) -> PathBuf {
+    out.join(API_IMPL).join("dex/classes.dex")
+}
+
+/// `xtask native`'s api-impl step: [`API_IMPL_SRC`] compiled against the Java pipeline's framework of `out` into [`api_impl_dex`]. None when `out` holds no framework header jar (the goals built no Java), so there is nothing to compile against.
+pub fn build_api_impl(root: &Path, host: &str, out: &Path) -> Result<Option<PathBuf>> {
+    let boot = javac_boot(out);
+    if !boot.iter().all(|j| j.is_file()) {
+        return Ok(None);
+    }
+    let (d8, jdk) = java_tools(root, host, out)?;
+    compile_dex(
+        &jdk,
+        &d8,
+        &boot,
+        &root.join(API_IMPL_SRC),
+        &out.join(API_IMPL),
+    )
+    .map(Some)
 }
 
 /// The shared libraries every runtime run's library path holds, as [`stage_art`] links them into its lib dir: each `<out>/device/<module>/*.so` the converter linked, plus the provided libraries built outside the tree ([`provided_lib_dirs`]).

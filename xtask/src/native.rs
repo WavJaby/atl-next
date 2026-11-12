@@ -544,6 +544,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 println!("native: package {} -> {}", built.package, bin.display());
             }
         }
+        // the JDK of the host row runs on the build machine only when they are one arch, as for the packages above
+        if cross.is_none() {
+            match crate::host_art::build_api_impl(root, &args.host, &out)? {
+                Some(dex) => println!("native: api-impl -> {}", dex.display()),
+                None => {
+                    println!("native: api-impl not built: the goals built no framework header jar")
+                }
+            }
+        }
         // the runtime gates read the converter packages and crates from here (build_state::gate_out); a failed ninja leaves the old packages, so no record
         build_state::record(&out, &state, &built_goals)?;
         if let Some(first) = table_check(&table) {

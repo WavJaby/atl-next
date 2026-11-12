@@ -1,14 +1,21 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test installer`: the installer process (atl-installer, plan item 4b slices M1-M2) runs AOSP's `ApkLiteParseUtils.parseClusterPackageLite` and then AOSP's native-code choice (`NativeLibraryHelper`, `PackageAbiHelperImpl.derivePackageAbi`) on host ART over a package dir laid out as PackageManager stages one (`base.apk`, `split_<name>.apk`).
-//! Oracles, read here independently of the installer: `aapt2 dump badging` of each file (package, versionCode, `split`); the zip itself through `unzip` (the `lib/<abi>/` entries, their names and sha256); the device's ABI list from the property set the installer maps (`ro.product.cpu.abilist`).
+//! `xtask test installer`: the installer process (atl-installer, plan item 4b slices M1-M3) runs AOSP's `ApkLiteParseUtils.parseClusterPackageLite`, the full `ParsingPackageUtils.parsePackage` (through the api-impl ParseCallback forwarder) and then AOSP's
+//! native-code choice (`NativeLibraryHelper`, `PackageAbiHelperImpl.derivePackageAbi`) on host ART over a package dir laid out as PackageManager stages one (`base.apk`, `split_<name>.apk`).
+//! Oracles, read here independently of the installer: `aapt2 dump badging` of each file (package, versionCode, `split`); the full parse's oracle (installer_parse.rs: badging + the manifest's xmltree, and manifest.rs whose differences are printed as findings);
+//! the zip itself through `unzip` (the `lib/<abi>/` entries, their names and sha256); the device's ABI list and SDK from the property set the installer maps (`ro.product.cpu.abilist`, `ro.build.version.sdk`).
 //!
 //! Checks:
-//! 1. `alto`: the altos-odyssey row (google-play: base + config.x86_64, both already in the test-APK cache and verified here by sha256) -> package, versionCode and split names equal aapt2's; primary ABI = the first device ABI the row's zip carries (x86_64); the lib dir `<root>/<isa>` holds exactly the zip's `lib/x86_64/` files, same sha256.
-//! 2. `single`: the fossify-notes row (one APK, downloaded on first use) -> package, versionCode equal aapt2's, no split; its manifest says extractNativeLibs=false, so the primary ABI is the first device ABI its zip carries (x86_64) and nothing is copied (lib-dir none, the libraries stay in the APK).
-//! 3. `refuse-version`, `refuse-package`: fossify-notes' base + a split linked here by aapt2 whose versionCode (base + 1) or package (base + `.other`) differs -> AOSP's own check refuses (`Inconsistent version` / `Inconsistent package`, PackageManager INSTALL_PARSE_FAILED_BAD_MANIFEST -101), the installer exits non-zero.
+//! 1. `alto`: the altos-odyssey row (google-play: base + config.x86_64, both already in the test-APK cache and verified here by sha256) -> package, versionCode and split names equal aapt2's; the full parse equals its oracle; primary ABI = the first device ABI the row's zip carries (x86_64);
+//!    the lib dir `<root>/<isa>` holds exactly the zip's `lib/x86_64/` files, same sha256.
+//! 2. `single`: the fossify-notes row (one APK, downloaded on first use) -> as check 1, no split; its manifest says extractNativeLibs=false, so the primary ABI is the first device ABI its zip carries (x86_64) and nothing is copied (lib-dir none, the libraries stay in the APK).
+//! 3. `rich`: the material-catalog row (services, receivers, providers, permissions) -> as check 2.
+//! 4. `refuse-version`, `refuse-package`: fossify-notes' base + a split linked here by aapt2 whose versionCode (base + 1) or package (base + `.other`) differs -> AOSP's own check refuses (`Inconsistent version` / `Inconsistent package`, PackageManager INSTALL_PARSE_FAILED_BAD_MANIFEST -101), the installer exits non-zero.
+//! 5. `refuse-duplicate-permission`: an app linked here declaring one permission twice with different protection levels -> the full parse refuses it (ParsingPackageUtils.java:1051-1055, INSTALL_PARSE_FAILED_MANIFEST_MALFORMED -108); the lite parse alone accepts it.
+//! 6. `feature`: an app linked here requesting CAMERA only with `<required-feature android.hardware.camera>` -> on this device (no declared features, the installer gets no `--feature`) AOSP drops the request (ParsingPackageUtils.java:1464-1471): no uses-permission.
 //!
-//! Measured: the installer's VM start, parse and natives times (its `time-ms` line) and the process wall time of check 1.
-//! Breaks: `--break drop-split` (check 1's dir without its split: splits, primary ABI and libraries must turn red); `--break abi-arm64` (the device's ABI lists are arm64-v8a only: AOSP's no-match, `native error -113`, must turn check 1 red).
+//! Measured: the installer's VM start, lite parse, full parse and natives times (its `time-ms` line) and the process wall time of each run.
+//! Breaks: `--break drop-split` (check 1's dir without its split: splits, primary ABI and libraries must turn red); `--break abi-arm64` (the device's ABI lists are arm64-v8a only: AOSP's no-match, `native error -113`, must turn check 1 red);
+//! `--break feature` (check 6's installer is told the device has android.hardware.camera: the forwarder's hasFeature answers true, uses-permission must turn red).
 //! Default: mutating (stages ART into `<out>/installer-art`, writes `<out>/installer`).
 
 use std::path::{Path, PathBuf};
@@ -20,7 +27,8 @@ use atl_property_service::{LinearTier, Property};
 
 use crate::atld_run::ApkTools;
 use crate::host_art::{ArtRun, HostArt};
-use crate::{packages, slot, test_apks, verdict};
+use crate::installer_parse::{Full, compare, manifest_findings, oracle};
+use crate::{manifest, packages, slot, test_apks, verdict};
 
 const CMD: &str = "installer";
 /// The package that builds both loaders, and the installer's executable.
@@ -30,6 +38,17 @@ const INSTALLER: &str = "atl-installer";
 const SPLIT_ROW: &str = "altos-odyssey";
 /// A one-APK url row (test-apks.toml).
 const SINGLE_ROW: &str = "fossify-notes";
+/// A one-APK url row whose manifest declares services, receivers, providers and permissions (test-apks.toml).
+const RICH_ROW: &str = "material-catalog";
+/// PackageManager.INSTALL_PARSE_FAILED_MANIFEST_MALFORMED: ParsingPackageUtils' code for a malformed duplicate permission (:1051-1055).
+const MANIFEST_MALFORMED: i32 = -108;
+/// The device's SDK and its codename: Build.VERSION.SDK_INT / CODENAME read these; RESOURCES_SDK_INT adds one while the codename is not `REL` (Build.java).
+const SDK: &str = "ro.build.version.sdk";
+const CODENAME: &str = "ro.build.version.codename";
+/// Check 6's feature and the permission that requires it.
+const FEATURE: &str = "android.hardware.camera";
+const FEATURE_PERMISSION: &str = "android.permission.CAMERA";
+const BREAK_FEATURE: &str = "feature";
 /// Where test_apks keeps verified files, under the workspace: `cache/test-apks/<sha256>.apk` (xtask test_apks.rs `CACHE_DIR`, `cached_path`).
 const CACHE: &str = "cache/test-apks";
 /// PackageManager.INSTALL_PARSE_FAILED_BAD_MANIFEST (frameworks/base core/java/android/content/pm/PackageManager.java): the code ApkLiteParseUtils.parseClusterPackageLite gives both inconsistencies.
@@ -53,8 +72,8 @@ pub struct Args {
     /// Native build directory (default: this checkout's slot; else <workspace>/out/native/<host>).
     #[arg(long)]
     out: Option<PathBuf>,
-    /// Deliberate break that must turn check 1 red: `drop-split` (no config split in the dir), `abi-arm64` (the device's ABI lists are arm64-v8a only).
-    #[arg(long, value_parser = ["drop-split", "abi-arm64"])]
+    /// Deliberate break that must turn a check red: `drop-split`, `abi-arm64` (check 1: no config split in the dir; the device's ABI lists are arm64-v8a only), `feature` (check 6: the installer is told the device has android.hardware.camera).
+    #[arg(long, value_parser = ["drop-split", "abi-arm64", "feature"])]
     r#break: Option<String>,
     /// Print each installer command and its output.
     #[arg(long)]
@@ -94,7 +113,7 @@ fn badging(aapt2: &Path, apk: &Path) -> Result<Badging> {
     })
 }
 
-/// What the installer printed (installer.rs in atl-app-launcher: `package`, `version-code`, `split`*, `primary-abi`, `lib-dir`, `time-ms vm <n> parse <n> natives <n>`).
+/// What the installer printed (installer.rs in atl-app-launcher: `package`, `version-code`, `split`*, `primary-abi`, `lib-dir`, `time-ms vm <n> lite <n> parse <n> natives <n>`; the full parse's other lines are installer_parse.rs's).
 #[derive(Debug, Default)]
 struct Parsed {
     package: String,
@@ -103,6 +122,7 @@ struct Parsed {
     primary_abi: Option<String>,
     lib_dir: Option<PathBuf>,
     vm_ms: u64,
+    lite_ms: u64,
     parse_ms: u64,
     natives_ms: u64,
 }
@@ -125,12 +145,17 @@ fn parse_output(stdout: &str) -> Result<Parsed> {
             "time-ms" => {
                 let f: Vec<&str> = value.split(' ').collect();
                 ensure!(
-                    f.len() == 6 && f[0] == "vm" && f[2] == "parse" && f[4] == "natives",
+                    f.len() == 8
+                        && f[0] == "vm"
+                        && f[2] == "lite"
+                        && f[4] == "parse"
+                        && f[6] == "natives",
                     "time-ms line {line:?}"
                 );
                 p.vm_ms = f[1].parse()?;
-                p.parse_ms = f[3].parse()?;
-                p.natives_ms = f[5].parse()?;
+                p.lite_ms = f[3].parse()?;
+                p.parse_ms = f[5].parse()?;
+                p.natives_ms = f[7].parse()?;
             }
             _ => {}
         }
@@ -177,16 +202,32 @@ fn link_split(
     version_code: i64,
     split: &str,
 ) -> Result<PathBuf> {
-    let dir = work.join(format!("split-{package}-{version_code}"));
-    std::fs::create_dir_all(&dir)?;
-    let manifest = dir.join("AndroidManifest.xml");
-    std::fs::write(
-        &manifest,
-        format!(
+    link(
+        tools,
+        &work.join(format!("split-{package}-{version_code}")),
+        &format!(
             "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\" package=\"{package}\" android:versionCode=\"{version_code}\" split=\"{split}\">\n  <application android:hasCode=\"false\"/>\n</manifest>\n"
         ),
-    )?;
-    let apk = dir.join("split.apk");
+    )
+}
+
+/// A code-less app `org.atl.fixture.<name>` whose manifest holds `body` (elements under `<manifest>`), linked by aapt2 into `<work>/<name>`: the input of the full parse's own checks.
+fn link_app(tools: &ApkTools, work: &Path, name: &str, body: &str) -> Result<PathBuf> {
+    link(
+        tools,
+        &work.join(format!("fixture-{name}")),
+        &format!(
+            "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\" package=\"org.atl.fixture.{name}\" android:versionCode=\"1\">\n  <uses-sdk android:minSdkVersion=\"24\" android:targetSdkVersion=\"34\"/>\n{body}  <application android:hasCode=\"false\"/>\n</manifest>\n"
+        ),
+    )
+}
+
+/// `manifest` linked by aapt2 against the SDK's android.jar into `<dir>/app.apk`.
+fn link(tools: &ApkTools, dir: &Path, manifest_text: &str) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let manifest = dir.join("AndroidManifest.xml");
+    std::fs::write(&manifest, manifest_text)?;
+    let apk = dir.join("app.apk");
     crate::host_art::exec(
         Command::new(&tools.aapt2)
             .arg("link")
@@ -243,6 +284,66 @@ fn device_list(props: &[Property]) -> Vec<String> {
                 .map(str::to_owned)
                 .collect()
         })
+}
+
+/// The converter's framework-res below the native build dir: what Android installs at AssetManager.FRAMEWORK_APK_PATH.
+const FRAMEWORK_RES: &str = "device/framework-res/framework-res.apk";
+
+/// bwrap options for the installer's filesystem view: the host's `/` entry by entry (directories bound with their devices, symlinks re-made) on bwrap's own root, plus framework-res.apk at
+/// `/system/framework/framework-res.apk`, the fixed path the full parse's system AssetManager opens (AssetManager.createSystemAssetsInZygoteLocked, via DefaultSplitAssetLoader.getBaseAssetManager).
+/// Environment-side setup in place of the broker's installer sandbox (slice M5), which will bind it as app sandboxes do; the host has no `/system`, and its `/` is not writable, so it is rebuilt here.
+fn system_view(framework_res: &Path) -> Result<Vec<std::ffi::OsString>> {
+    let mut a = atl_bwrap::Args::new();
+    a.die_with_parent();
+    for e in std::fs::read_dir("/").context("reading /")? {
+        let p = e?.path();
+        let kind = std::fs::symlink_metadata(&p)?.file_type();
+        if kind.is_symlink() {
+            a.symlink(std::fs::read_link(&p)?, &p);
+        } else if kind.is_dir() {
+            a.dev_bind(&p, &p);
+        }
+    }
+    a.ro_bind(
+        framework_res,
+        Path::new(atl_android_paths::SYSTEM_FRAMEWORK).join("framework-res.apk"),
+    );
+    Ok(a.end())
+}
+
+/// `cmd` run inside `view` (`system_view`): bwrap, then the program with its arguments and environment.
+fn in_view(cmd: &Command, view: &[std::ffi::OsString]) -> Command {
+    let mut wrapped = Command::new(atl_bwrap::PROGRAM);
+    wrapped
+        .args(view)
+        .arg(cmd.get_program())
+        .args(cmd.get_args());
+    for (k, v) in cmd.get_envs() {
+        match v {
+            Some(v) => wrapped.env(k, v),
+            None => wrapped.env_remove(k),
+        };
+    }
+    wrapped
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    wrapped
+}
+
+/// The device's Build.VERSION.RESOURCES_SDK_INT: `ro.build.version.sdk`, plus one while `ro.build.version.codename` is not `REL` (Build.java: ACTIVE_CODENAMES is empty only for REL).
+fn device_sdk(props: &[Property]) -> Result<i32> {
+    let get = |key: &str| {
+        props
+            .iter()
+            .find(|(n, _)| n == key)
+            .map(|(_, v)| v.as_str())
+    };
+    let sdk: i32 = get(SDK)
+        .with_context(|| format!("the property set has no {SDK}"))?
+        .parse()
+        .with_context(|| SDK.to_owned())?;
+    Ok(sdk + i32::from(get(CODENAME).is_some_and(|c| c != "REL")))
 }
 
 /// AOSP's `extractNativeLibs` of the base APK's manifest (ApkLiteParseUtils:509-510, default true), read from `aapt2 dump xmltree`: `=false` when the `<application>` attribute says so.
@@ -354,6 +455,8 @@ fn dir_files(dir: &Path) -> Result<Vec<(String, String)>> {
 /// What the oracle says a package dir must give: identity and splits (aapt2), the primary ABI and its libraries (the zip).
 struct Want {
     base: Badging,
+    /// The base APK, the full parse's oracle input.
+    base_apk: PathBuf,
     splits: Vec<String>,
     primary: Option<String>,
     /// (name, sha256), sorted; None: nothing is copied (extractNativeLibs=false, the libraries stay in the APK).
@@ -363,20 +466,60 @@ struct Want {
 struct Gate<'a> {
     host: &'a HostArt,
     installer: PathBuf,
+    /// The api-impl dex `xtask native` built (the ParseCallback forwarder): the installer VM's class path.
+    api_impl: PathBuf,
+    aapt2: PathBuf,
+    /// The device's resource SDK (`device_sdk`).
+    sdk: i32,
+    /// bwrap options of the installer's filesystem view (`system_view`).
+    view: Vec<std::ffi::OsString>,
     data: PathBuf,
     fails: Vec<String>,
 }
 
 impl Gate<'_> {
-    /// The installer over `dir` with the device `area`, libraries into `lib_root`.
-    fn run(&self, area: &(String, String), dir: &Path, lib_root: &Path) -> Result<(ArtRun, u128)> {
+    /// The installer over `dir` with the device `area` and declared `features`, libraries into `lib_root`.
+    fn run_with(
+        &self,
+        area: &(String, String),
+        features: &[&str],
+        dir: &Path,
+        lib_root: &Path,
+    ) -> Result<(ArtRun, u128)> {
+        let own: Vec<String> = features.iter().map(|f| format!("--feature={f}")).collect();
+        let own: Vec<&str> = own.iter().map(String::as_str).collect();
         let mut cmd = self
             .host
-            .art_command(&self.installer, &[], &self.data, (&area.0, &area.1));
-        cmd.arg(dir).arg(lib_root);
+            .art_command(&self.installer, &own, &self.data, (&area.0, &area.1));
+        cmd.arg(format!("-Djava.class.path={}", self.api_impl.display()))
+            .arg(dir)
+            .arg(lib_root);
+        let mut cmd = in_view(&cmd, &self.view);
         let start = Instant::now();
         let r = self.host.run(&mut cmd)?;
         Ok((r, start.elapsed().as_millis()))
+    }
+
+    /// `run_with` on this device: no declared features (atld's PackageManager declares none).
+    fn run(&self, area: &(String, String), dir: &Path, lib_root: &Path) -> Result<(ArtRun, u128)> {
+        self.run_with(area, &[], dir, lib_root)
+    }
+
+    /// The full parse of `stdout` against the oracle of `base_apk` (failures into `bad`), and against manifest.rs (printed as findings of check `name`).
+    fn full_parse(
+        &self,
+        name: &str,
+        stdout: &str,
+        base_apk: &Path,
+        bad: &mut Vec<String>,
+    ) -> Result<Full> {
+        let full = Full::read(stdout)?;
+        bad.extend(compare(&full, &oracle(&self.aapt2, base_apk, self.sdk)?));
+        let m = manifest::read(&self.aapt2, base_apk)?;
+        for (field, ours, theirs) in manifest_findings(&full, &m) {
+            println!("{name}: finding {field}: installer {ours} != manifest.rs {theirs}");
+        }
+        Ok(full)
     }
 
     fn fail(&mut self, check: &str, msg: String) {
@@ -404,6 +547,7 @@ impl Gate<'_> {
         let mut splits = want.splits.clone();
         splits.sort();
         let mut bad = Vec::new();
+        let full = self.full_parse(name, &r.stdout, &want.base_apk, &mut bad)?;
         if p.package != want.base.package {
             bad.push(format!(
                 "package {} != aapt2 {}",
@@ -464,34 +608,79 @@ impl Gate<'_> {
                 || "left in the APK (extractNativeLibs=false)".to_owned(),
                 |l| format!("{} copied, sha256 equal to unzip -p", l.len()),
             );
+            let count = |k: &str| full.components.iter().filter(|c| c.kind == k).count();
             println!(
-                "{name}: PASS package {} versionCode {} splits {got:?} primary-abi {} libraries {libs}",
+                "{name}: PASS package {} versionCode {} splits {got:?} target-sdk {} launcher {} activities {} receivers {} services {} providers {} uses-permission {} permission {} primary-abi {} libraries {libs}",
                 p.package,
                 p.version_code,
+                full.value("target-sdk"),
+                full.launchers().first().map_or("none", String::as_str),
+                count("activity"),
+                count("receiver"),
+                count("service"),
+                count("provider"),
+                full.uses_permissions.len(),
+                full.permissions.len(),
                 want.primary.as_deref().unwrap_or("none"),
             );
         } else {
             self.fail(name, bad.join("; "));
         }
         println!(
-            "{name}: measured installer vm start {} ms, parse {} ms, natives {} ms, process wall {wall} ms",
-            p.vm_ms, p.parse_ms, p.natives_ms
+            "{name}: measured installer vm start {} ms, lite parse {} ms, full parse {} ms, natives {} ms, process wall {wall} ms",
+            p.vm_ms, p.lite_ms, p.parse_ms, p.natives_ms
         );
         Ok(())
     }
 
-    /// Check `name`: the installer over `dir` exits non-zero with AOSP's refusal `parse error -101: <marker>...`.
+    /// Check `feature`: the fixture's only request needs a feature; with the device's features (`features`, none unless broken) AOSP drops it, so the installer requests nothing.
+    fn feature(
+        &mut self,
+        area: &(String, String),
+        features: &[&str],
+        dir: &Path,
+        lib_root: &Path,
+    ) -> Result<()> {
+        let name = "feature";
+        let (r, _) = self.run_with(area, features, dir, lib_root)?;
+        if !r.ok {
+            self.fail(name, format!("installer {}: {}", r.status, r.failure()));
+            return Ok(());
+        }
+        let full = Full::read(&r.stdout)?;
+        if full.uses_permissions.is_empty() {
+            println!(
+                "{name}: PASS uses-permission [] ({FEATURE_PERMISSION} needs {FEATURE}, which this device does not declare)"
+            );
+        } else {
+            self.fail(
+                name,
+                format!(
+                    "uses-permission {:?} != oracle [] ({FEATURE_PERMISSION} needs {FEATURE}, which this device does not declare)",
+                    full.uses_permissions
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    /// Check `name`: the installer over `dir` exits non-zero with AOSP's refusal `parse error <code>: <marker>...`.
     fn refuse(
         &mut self,
         name: &str,
         area: &(String, String),
         dir: &Path,
         lib_root: &Path,
+        code: i32,
         marker: &str,
     ) -> Result<()> {
         let (r, _) = self.run(area, dir, lib_root)?;
-        let want = format!("parse error {BAD_MANIFEST}: {marker}");
-        let line = r.stderr.lines().find(|l| l.contains(&want));
+        // the message after the code may lead with the file and position (ParseTypeImpl.error with the parser's description)
+        let want = format!("parse error {code}: ... {marker}");
+        let line = r
+            .stderr
+            .lines()
+            .find(|l| l.contains(&format!("parse error {code}: ")) && l.contains(marker));
         match (line, r.ok) {
             (Some(l), false) => println!("{name}: PASS {}", l.trim()),
             _ => self.fail(
@@ -533,9 +722,19 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         area.clone()
     };
+    let api_impl = xtask::host_art::api_impl_dex(&java_out);
+    ensure!(
+        api_impl.is_file(),
+        "no api-impl dex {}: `cargo xtask native` builds it with the Java goals",
+        api_impl.display()
+    );
     let mut gate = Gate {
         host: &host,
         installer: packages::bin(root, &out, PACKAGE, INSTALLER)?,
+        api_impl,
+        aapt2: tools.aapt2.clone(),
+        sdk: device_sdk(&device_props)?,
+        view: system_view(&out.join(FRAMEWORK_RES))?,
         data: work.join("data"),
         fails: Vec::new(),
     };
@@ -569,6 +768,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let (primary, libs) = natives(&device, &row_files, extract)?;
     let want = Want {
         base: alto,
+        base_apk: alto_base.clone(),
         splits: splits.iter().map(|(s, _)| s.clone()).collect(),
         primary,
         libs,
@@ -587,13 +787,30 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let (primary, libs) = natives(&device, std::slice::from_ref(&single_apk), extract)?;
     let want = Want {
         base: single.clone(),
+        base_apk: single_apk.clone(),
         splits: Vec::new(),
         primary,
         libs,
     };
     gate.expect("single", &area, &dir, &work.join("single-lib"), &want)?;
 
-    // 3. refusals: AOSP's consistency check between base and split
+    // 3. rich: a manifest with every component kind
+    let (_, rich_apk) = test_apks::ensure(root, RICH_ROW)?;
+    let rich = badging(&tools.aapt2, &rich_apk)?;
+    let dir = work.join("rich");
+    stage_dir(&dir, &[(None, &rich_apk)])?;
+    let extract = extract_native_libs(&tools.aapt2, &rich_apk)?;
+    let (primary, libs) = natives(&device, std::slice::from_ref(&rich_apk), extract)?;
+    let want = Want {
+        base: rich,
+        base_apk: rich_apk.clone(),
+        splits: Vec::new(),
+        primary,
+        libs,
+    };
+    gate.expect("rich", &area, &dir, &work.join("rich-lib"), &want)?;
+
+    // 4. refusals: AOSP's consistency check between base and split
     let cases = [
         (
             "refuse-version",
@@ -615,8 +832,52 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             &dir,
             &[(None, &single_apk), (Some("config.x86_64"), &split)],
         )?;
-        gate.refuse(name, &area, &dir, &work.join(format!("{name}-lib")), marker)?;
+        gate.refuse(
+            name,
+            &area,
+            &dir,
+            &work.join(format!("{name}-lib")),
+            BAD_MANIFEST,
+            marker,
+        )?;
     }
+
+    // 5. a manifest only the full parse refuses: one permission declared twice, the second with another protection level
+    let name = "refuse-duplicate-permission";
+    let apk = link_app(
+        &tools,
+        &work,
+        "duplicate",
+        "  <permission android:name=\"org.atl.fixture.P\" android:protectionLevel=\"normal\"/>\n  <permission android:name=\"org.atl.fixture.P\" android:protectionLevel=\"signature\"/>\n",
+    )?;
+    let dir = work.join(name);
+    stage_dir(&dir, &[(None, &apk)])?;
+    gate.refuse(
+        name,
+        &area,
+        &dir,
+        &work.join(format!("{name}-lib")),
+        MANIFEST_MALFORMED,
+        "Found duplicate permission",
+    )?;
+
+    // 6. feature: a request gated on a feature the device does not declare
+    let apk = link_app(
+        &tools,
+        &work,
+        "feature",
+        &format!(
+            "  <uses-permission android:name=\"{FEATURE_PERMISSION}\">\n    <required-feature android:name=\"{FEATURE}\"/>\n  </uses-permission>\n"
+        ),
+    )?;
+    let dir = work.join("feature");
+    stage_dir(&dir, &[(None, &apk)])?;
+    let features: &[&str] = if args.r#break.as_deref() == Some(BREAK_FEATURE) {
+        &[FEATURE]
+    } else {
+        &[]
+    };
+    gate.feature(&area, features, &dir, &work.join("feature-lib"))?;
 
     println!("{}", verdict::gate(CMD, &gate.fails));
     Ok(if gate.fails.is_empty() {
@@ -634,7 +895,7 @@ mod tests {
     #[test]
     fn reads_the_installer_lines() {
         let p = parse_output(
-            "package a.b\nversion-code 7\nsplit x\nsplit y\nprimary-abi x86_64\nlib-dir /o/lib/x86_64\ntime-ms vm 10 parse 3 natives 5\n",
+            "package a.b\nversion-code 7\nsplit x\nsplit y\nprimary-abi x86_64\nlib-dir /o/lib/x86_64\ntime-ms vm 10 lite 2 parse 3 natives 5\n",
         )
         .unwrap();
         assert_eq!(
@@ -645,6 +906,7 @@ mod tests {
                 p.primary_abi.as_deref(),
                 p.lib_dir.as_deref(),
                 p.vm_ms,
+                p.lite_ms,
                 p.parse_ms,
                 p.natives_ms
             ),
@@ -655,12 +917,13 @@ mod tests {
                 Some("x86_64"),
                 Some(std::path::Path::new("/o/lib/x86_64")),
                 10,
+                2,
                 3,
                 5
             )
         );
         let none = parse_output(
-            "package a.b\nprimary-abi none\nlib-dir none\ntime-ms vm 1 parse 1 natives 0\n",
+            "package a.b\nprimary-abi none\nlib-dir none\ntime-ms vm 1 lite 1 parse 1 natives 0\n",
         )
         .unwrap();
         assert_eq!((none.primary_abi, none.lib_dir), (None, None));

@@ -341,11 +341,12 @@ extern "C" fn logger(message: *const liblog::__android_log_message) {
 
 type Env = *mut *const jni::JNINativeInterface;
 /// jni.h's reference and method-ID types as the generated table spells them (references are `void *` there).
-type JClass = *mut c_void;
-type JString = *mut c_void;
-type JMethod = *mut jni::_jmethodID;
-type JField = *mut jni::_jfieldID;
-type JObject = *mut c_void;
+pub(crate) type JClass = *mut c_void;
+pub(crate) type JString = *mut c_void;
+pub(crate) type JMethod = *mut jni::_jmethodID;
+pub(crate) type JField = *mut jni::_jfieldID;
+pub(crate) type JObject = *mut c_void;
+pub(crate) use jni::jvalue as JValue;
 
 /// Calls the JNIEnv function `$f` of `$env` with the rest as arguments; inside an unsafe block, under that function's JNI contract.
 macro_rules! jni_call {
@@ -418,15 +419,11 @@ impl VmHandle {
 
 const EXIT_FAILURE: i32 = 1;
 
-/// A package dir as AOSP's PackageLite describes it (`Vm::parse_cluster`): the values the installer prints, and the PackageLite object `install_natives` reads.
+/// A package dir as AOSP's PackageLite describes it (`Vm::parse_cluster`): its split names, and the PackageLite object `install_natives` reads.
 /// `lite` is a local reference of the main thread: valid until the VM is shut down, so the caller drops this first.
 pub struct Cluster<'vm> {
     vm: &'vm Vm,
     lite: JObject,
-    /// PackageLite.getPackageName.
-    pub package: String,
-    /// `getLongVersionCode`: versionCodeMajor << 32 | versionCode.
-    pub version_code: i64,
     /// The split names in PackageLite's order (sorted by ApkLiteParseUtils).
     pub splits: Vec<String>,
 }
@@ -821,7 +818,7 @@ impl Vm {
         Ok(())
     }
 
-    fn find_class(&self, name: &CStr) -> Result<JClass> {
+    pub(crate) fn find_class(&self, name: &CStr) -> Result<JClass> {
         // SAFETY: the main thread's env, a NUL-terminated class name
         let c = unsafe { jni_call!(self.env, FindClass, name.as_ptr()) };
         self.check(&format!("FindClass {}", name.to_string_lossy()))?;
@@ -830,7 +827,13 @@ impl Vm {
     }
 
     /// The method `name` + `sig` of `class`: static when `is_static`.
-    fn method(&self, class: JClass, name: &CStr, sig: &CStr, is_static: bool) -> Result<JMethod> {
+    pub(crate) fn method(
+        &self,
+        class: JClass,
+        name: &CStr,
+        sig: &CStr,
+        is_static: bool,
+    ) -> Result<JMethod> {
         // SAFETY: the main thread's env, a live class reference, NUL-terminated name and signature
         let m = unsafe {
             if is_static {
@@ -855,7 +858,7 @@ impl Vm {
     }
 
     /// A Java `String` as UTF-8; null -> None.
-    fn string(&self, s: JString) -> Result<Option<String>> {
+    pub(crate) fn string(&self, s: JString) -> Result<Option<String>> {
         if s.is_null() {
             return Ok(None);
         }
@@ -870,7 +873,12 @@ impl Vm {
     }
 
     /// The static object field `name` (type `sig`) of `class`.
-    fn static_object_field(&self, class: JClass, name: &CStr, sig: &CStr) -> Result<JObject> {
+    pub(crate) fn static_object_field(
+        &self,
+        class: JClass,
+        name: &CStr,
+        sig: &CStr,
+    ) -> Result<JObject> {
         let what = format!("field {}", name.to_string_lossy());
         // SAFETY: the main thread's env, a live class reference, NUL-terminated name and signature
         let field: JField = unsafe {
@@ -928,7 +936,7 @@ impl Vm {
     }
 
     /// As `call_static_int`, returning an object.
-    fn call_static_object(
+    pub(crate) fn call_static_object(
         &self,
         class: JClass,
         method: JMethod,
@@ -950,7 +958,7 @@ impl Vm {
     }
 
     /// `obj.method()`: an instance method with no arguments, returning a boolean.
-    fn call_bool(&self, obj: JObject, method: JMethod, what: &str) -> Result<bool> {
+    pub(crate) fn call_bool(&self, obj: JObject, method: JMethod, what: &str) -> Result<bool> {
         let none = core::ptr::null::<jni::jvalue>();
         // SAFETY: the main thread's env, a live object of the method's class, no arguments
         let value = unsafe { jni_call!(self.env, CallBooleanMethodA, obj, method, none) };
@@ -959,21 +967,134 @@ impl Vm {
     }
 
     /// `obj.method()`: an instance method with no arguments, returning void.
-    fn call_void(&self, obj: JObject, method: JMethod, what: &str) -> Result<()> {
+    pub(crate) fn call_void(&self, obj: JObject, method: JMethod, what: &str) -> Result<()> {
         let none = core::ptr::null::<jni::jvalue>();
         // SAFETY: as `call_bool`
         unsafe { jni_call!(self.env, CallVoidMethodA, obj, method, none) };
         self.check(what)
     }
 
+    /// `obj.method(args)`: an instance method returning an object.
+    pub(crate) fn call_object(
+        &self,
+        obj: JObject,
+        method: JMethod,
+        args: &[jni::jvalue],
+        what: &str,
+    ) -> Result<JObject> {
+        // SAFETY: the main thread's env, a live object of the method's class, `args` matching its signature
+        let value = unsafe { jni_call!(self.env, CallObjectMethodA, obj, method, args.as_ptr()) };
+        self.check(what)?;
+        Ok(value)
+    }
+
+    /// `obj.method(args)`: an instance method returning an int.
+    pub(crate) fn call_int(
+        &self,
+        obj: JObject,
+        method: JMethod,
+        args: &[jni::jvalue],
+        what: &str,
+    ) -> Result<i32> {
+        // SAFETY: as `call_object`
+        let value = unsafe { jni_call!(self.env, CallIntMethodA, obj, method, args.as_ptr()) };
+        self.check(what)?;
+        Ok(value)
+    }
+
+    /// `obj.method()`: an instance method with no arguments, returning a long.
+    pub(crate) fn call_long(&self, obj: JObject, method: JMethod, what: &str) -> Result<i64> {
+        let none = core::ptr::null::<jni::jvalue>();
+        // SAFETY: as `call_bool`
+        let value = unsafe { jni_call!(self.env, CallLongMethodA, obj, method, none) };
+        self.check(what)?;
+        Ok(value)
+    }
+
+    /// The instance field `name` (type `sig`) of `class`.
+    pub(crate) fn field(&self, class: JClass, name: &CStr, sig: &CStr) -> Result<JField> {
+        // SAFETY: the main thread's env, a live class reference, NUL-terminated name and signature
+        let field: JField =
+            unsafe { jni_call!(self.env, GetFieldID, class, name.as_ptr(), sig.as_ptr()) };
+        self.check(&format!("field {}", name.to_string_lossy()))?;
+        ensure!(!field.is_null(), "no field {}", name.to_string_lossy());
+        Ok(field)
+    }
+
+    /// The object value of `field` in `obj`.
+    pub(crate) fn object_field(&self, obj: JObject, field: JField) -> Result<JObject> {
+        ensure!(!obj.is_null(), "field read on null");
+        // SAFETY: a live object whose class declares `field` (resolved by `field` on that class), read on the same env
+        let value = unsafe { jni_call!(self.env, GetObjectField, obj, field) };
+        self.check("object field")?;
+        Ok(value)
+    }
+
+    /// The int value of `field` in `obj`.
+    pub(crate) fn int_field(&self, obj: JObject, field: JField) -> Result<i32> {
+        ensure!(!obj.is_null(), "field read on null");
+        // SAFETY: as `object_field`, an int field
+        let value = unsafe { jni_call!(self.env, GetIntField, obj, field) };
+        self.check("int field")?;
+        Ok(value)
+    }
+
+    /// The boolean value of `field` in `obj`.
+    pub(crate) fn bool_field(&self, obj: JObject, field: JField) -> Result<bool> {
+        ensure!(!obj.is_null(), "field read on null");
+        // SAFETY: as `object_field`, a boolean field
+        let value = unsafe { jni_call!(self.env, GetBooleanField, obj, field) };
+        self.check("boolean field")?;
+        Ok(value != 0)
+    }
+
+    /// `new class(args)` through the constructor `init`.
+    pub(crate) fn new_object(
+        &self,
+        class: JClass,
+        init: JMethod,
+        args: &[jni::jvalue],
+        what: &str,
+    ) -> Result<JObject> {
+        // SAFETY: the main thread's env, a constructor of `class`, `args` matching its signature
+        let value = unsafe { jni_call!(self.env, NewObjectA, class, init, args.as_ptr()) };
+        self.check(what)?;
+        ensure!(!value.is_null(), "{what}: null");
+        Ok(value)
+    }
+
+    /// A `String[]` of `items`.
+    pub(crate) fn strings(&self, items: &[String]) -> Result<JObject> {
+        let items = items
+            .iter()
+            .map(|s| CString::new(s.as_str()))
+            .collect::<Result<Vec<_>, _>>()
+            .context("string with a NUL")?;
+        self.string_array(items.iter().map(CString::as_c_str))
+            .map_err(|e| anyhow!(e))
+    }
+
+    /// `f` inside a JNI local frame (`PushLocalFrame` / `PopLocalFrame`): the local references it makes are freed when it returns, so a walk over many objects stays within the local table.
+    pub(crate) fn frame<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        /// Locals one frame is sized for; ART grows the table past it when needed.
+        const LOCALS: i32 = 32;
+        // SAFETY: the main thread's env; the frame pushed here is popped below on every path
+        let pushed = unsafe { jni_call!(self.env, PushLocalFrame, LOCALS) };
+        ensure!(pushed == 0, "PushLocalFrame failed");
+        let result = f();
+        // SAFETY: pops the frame pushed above; no reference made inside it is used after (`f`'s values are Rust values)
+        unsafe { jni_call!(self.env, PopLocalFrame, core::ptr::null_mut()) };
+        result
+    }
+
     /// The length of a Java array.
-    fn array_len(&self, array: JObject) -> Result<i32> {
+    pub(crate) fn array_len(&self, array: JObject) -> Result<i32> {
         // SAFETY: the main thread's env and a live array reference
         Ok(unsafe { jni_call!(self.env, GetArrayLength, array) })
     }
 
     /// Element `index` of an object array.
-    fn array_get(&self, array: JObject, index: i32) -> Result<JObject> {
+    pub(crate) fn array_get(&self, array: JObject, index: i32) -> Result<JObject> {
         ensure!(
             (0..self.array_len(array)?).contains(&index),
             "array index {index} out of range"
@@ -985,7 +1106,7 @@ impl Vm {
     }
 
     /// `new File(path)`.
-    fn file(&self, path: &Path) -> Result<JObject> {
+    pub(crate) fn file(&self, path: &Path) -> Result<JObject> {
         let text = CString::new(path.as_os_str().as_encoded_bytes()).context("path with a NUL")?;
         let class = self.find_class(c"java/io/File")?;
         let init = self.method(class, c"<init>", c"(Ljava/lang/String;)V", false)?;
@@ -1005,11 +1126,9 @@ impl Vm {
         }
     }
 
-    /// Installer slice M1: `ApkLiteParseUtils.parseClusterPackageLite(ParseTypeImpl.forParsingWithoutPlatformCompat().reset(), new File(dir), 0)`, which reads every APK in `dir` through ApkAssets and refuses a split whose package or versionCode differs.
-    /// `forParsingWithoutPlatformCompat`: no IPlatformCompat service in this process; a deferred error's change counts as enabled by targetSdk alone (ParseTypeImpl). Flags 0: no certificates collected.
-    /// A ParseResult error -> `parse error <code>: <message>` (PackageManager INSTALL_PARSE_FAILED_*).
-    pub fn parse_cluster(&self, dir: &Path) -> Result<Cluster<'_>> {
-        let file = self.file(dir)?;
+    /// `ParseTypeImpl.forParsingWithoutPlatformCompat().reset()`, the ParseInput of every installer parse: no IPlatformCompat service in this process; a deferred error's change counts as enabled by targetSdk alone,
+    /// which is PlatformCompat's default answer for a targetSdk-gated change without an override (ParseTypeImpl.java:71-79).
+    pub(crate) fn parse_input(&self) -> Result<JObject> {
         let parse_type = self.find_class(c"android/content/pm/parsing/result/ParseTypeImpl")?;
         let for_parsing = self.method(
             parse_type,
@@ -1023,6 +1142,42 @@ impl Vm {
             c"()Landroid/content/pm/parsing/result/ParseInput;",
             false,
         )?;
+        let input = self.call_static_object(
+            parse_type,
+            for_parsing,
+            &[],
+            "ParseTypeImpl.forParsingWithoutPlatformCompat",
+        )?;
+        self.call_object(input, reset, &[], "ParseTypeImpl.reset")
+    }
+
+    /// A ParseResult's value; an error result -> `parse error <code>: <message>` (PackageManager INSTALL_PARSE_FAILED_* code). `what` names the call that returned it.
+    pub(crate) fn parse_result(&self, result: JObject, what: &str) -> Result<JObject> {
+        ensure!(!result.is_null(), "{what} returned null");
+        let class = self.find_class(c"android/content/pm/parsing/result/ParseResult")?;
+        let is_error = self.method(class, c"isError", c"()Z", false)?;
+        if self.call_bool(result, is_error, "ParseResult.isError")? {
+            let error_code = self.method(class, c"getErrorCode", c"()I", false)?;
+            let error_message =
+                self.method(class, c"getErrorMessage", c"()Ljava/lang/String;", false)?;
+            let code = self.call_int(result, error_code, &[], "ParseResult.getErrorCode")?;
+            let message =
+                self.call_object(result, error_message, &[], "ParseResult.getErrorMessage")?;
+            bail!(
+                "parse error {code}: {}",
+                self.string(message)?.unwrap_or_default()
+            );
+        }
+        let get_result = self.method(class, c"getResult", c"()Ljava/lang/Object;", false)?;
+        let value = self.call_object(result, get_result, &[], "ParseResult.getResult")?;
+        ensure!(!value.is_null(), "{what}: ParseResult holds no value");
+        Ok(value)
+    }
+
+    /// Installer slice M1: `ApkLiteParseUtils.parseClusterPackageLite(parse_input(), new File(dir), 0)`, which reads every APK in `dir` through ApkAssets and refuses a split whose package or versionCode differs.
+    /// Flags 0: no certificates collected. An error result as `parse_result`'s.
+    pub fn parse_cluster(&self, dir: &Path) -> Result<Cluster<'_>> {
+        let file = self.file(dir)?;
         let utils = self.find_class(c"android/content/pm/parsing/ApkLiteParseUtils")?;
         let parse = self.method(
             utils,
@@ -1030,96 +1185,39 @@ impl Vm {
             c"(Landroid/content/pm/parsing/result/ParseInput;Ljava/io/File;I)Landroid/content/pm/parsing/result/ParseResult;",
             true,
         )?;
-        let result_class = self.find_class(c"android/content/pm/parsing/result/ParseResult")?;
-        let is_error = self.method(result_class, c"isError", c"()Z", false)?;
-        let error_code = self.method(result_class, c"getErrorCode", c"()I", false)?;
-        let error_message = self.method(
-            result_class,
-            c"getErrorMessage",
-            c"()Ljava/lang/String;",
-            false,
+        let input = self.parse_input()?;
+        let args = [
+            jni::jvalue { l: input },
+            jni::jvalue { l: file },
+            jni::jvalue { i: 0 },
+        ];
+        let result = self.call_static_object(
+            utils,
+            parse,
+            &args,
+            "ApkLiteParseUtils.parseClusterPackageLite",
         )?;
-        let get_result = self.method(result_class, c"getResult", c"()Ljava/lang/Object;", false)?;
+        let lite = self.parse_result(result, "ApkLiteParseUtils.parseClusterPackageLite")?;
         let lite_class = self.find_class(c"android/content/pm/parsing/PackageLite")?;
-        let package_name = self.method(
-            lite_class,
-            c"getPackageName",
-            c"()Ljava/lang/String;",
-            false,
-        )?;
-        let version_code = self.method(lite_class, c"getLongVersionCode", c"()J", false)?;
         let split_names = self.method(
             lite_class,
             c"getSplitNames",
             c"()[Ljava/lang/String;",
             false,
         )?;
-        let none = core::ptr::null::<jni::jvalue>();
-        // SAFETY: JNI calls on the main thread's env with the classes and method IDs resolved above, each with the argument list its signature names; every result is checked (`check`, null) before use
-        unsafe {
-            let input = jni_call!(
-                self.env,
-                CallStaticObjectMethodA,
-                parse_type,
-                for_parsing,
-                none
-            );
-            self.check("ParseTypeImpl.forParsingWithoutPlatformCompat")?;
-            let input = jni_call!(self.env, CallObjectMethodA, input, reset, none);
-            self.check("ParseTypeImpl.reset")?;
-            let args = [
-                jni::jvalue { l: input },
-                jni::jvalue { l: file },
-                jni::jvalue { i: 0 },
-            ];
-            let result = jni_call!(
-                self.env,
-                CallStaticObjectMethodA,
-                utils,
-                parse,
-                args.as_ptr()
-            );
-            self.check("ApkLiteParseUtils.parseClusterPackageLite")?;
-            ensure!(!result.is_null(), "parseClusterPackageLite returned null");
-            if jni_call!(self.env, CallBooleanMethodA, result, is_error, none) != 0 {
-                let code = jni_call!(self.env, CallIntMethodA, result, error_code, none);
-                let message = jni_call!(self.env, CallObjectMethodA, result, error_message, none);
-                self.check("ParseResult error")?;
-                bail!(
-                    "parse error {code}: {}",
-                    self.string(message)?.unwrap_or_default()
-                );
+        let names = self.call_object(lite, split_names, &[], "PackageLite.getSplitNames")?;
+        let mut splits = Vec::new();
+        if !names.is_null() {
+            for i in 0..self.array_len(names)? {
+                let s = self.array_get(names, i)?;
+                splits.push(self.string(s)?.context("null split name")?);
             }
-            let lite = jni_call!(self.env, CallObjectMethodA, result, get_result, none);
-            self.check("ParseResult.getResult")?;
-            ensure!(!lite.is_null(), "ParseResult holds no PackageLite");
-            let name = jni_call!(self.env, CallObjectMethodA, lite, package_name, none);
-            self.check("PackageLite.getPackageName")?;
-            let package = self
-                .string(name)?
-                .context("PackageLite has no package name")?;
-            let version_code = jni_call!(self.env, CallLongMethodA, lite, version_code, none);
-            self.check("PackageLite.getLongVersionCode")?;
-            let names = jni_call!(self.env, CallObjectMethodA, lite, split_names, none);
-            self.check("PackageLite.getSplitNames")?;
-            let mut splits = Vec::new();
-            if !names.is_null() {
-                let len = jni_call!(self.env, GetArrayLength, names);
-                for i in 0..len {
-                    let s = jni_call!(self.env, GetObjectArrayElement, names, i);
-                    self.check("splitNames element")?;
-                    splits.push(self.string(s)?.context("null split name")?);
-                    jni_call!(self.env, DeleteLocalRef, s);
-                }
-            }
-            Ok(Cluster {
-                vm: self,
-                lite,
-                package,
-                version_code,
-                splits,
-            })
         }
+        Ok(Cluster {
+            vm: self,
+            lite,
+            splits,
+        })
     }
 
     /// The VM, for threads other than this one.
