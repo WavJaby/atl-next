@@ -150,7 +150,7 @@ pub struct AtlEngine {
     pub end_call: Option<EndCallFn>,
 }
 
-/// Admits an engine table this host can drive, or refuses it by name. Refuses another major, a size below this host's table size (minor versions only append), a minor below this host's, and a table missing any entry. The core loader and the gate both call it.
+/// Admits an engine table this host can drive, or refuses it by name. Refuses another major, a size below this host's table size (minor versions only append, so this also refuses an older minor), and a table missing any entry. The core loader and the gate both call it.
 pub fn check_engine_table(table: &AtlEngine) -> Result<(), String> {
     if table.major != ABI_MAJOR {
         return Err(format!(
@@ -179,7 +179,8 @@ pub fn check_engine_table(table: &AtlEngine) -> Result<(), String> {
     .into_iter()
     .filter_map(|(name, none)| none.then_some(name))
     .collect();
-    if table.minor < ABI_MINOR || !missing.is_empty() {
+    // no minor comparison: minors only append entries, so an older minor's table is refused by the size check above
+    if !missing.is_empty() {
         return Err(format!(
             "engine ABI {}.{} lacks [{}], host needs {ABI_MAJOR}.{ABI_MINOR}",
             table.major,
