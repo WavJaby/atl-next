@@ -469,13 +469,13 @@ impl Drop for Recorder {
     }
 }
 
-/// A PipeWire server of the gate's own, with no session manager, in `runtime`.
-struct PrivateServer {
+/// A PipeWire server of the gate's own, with no session manager, in `runtime` (also ui_module.rs's).
+pub(crate) struct PrivateServer {
     child: Child,
 }
 
 impl PrivateServer {
-    fn start(runtime: &Path, dir: &Path) -> Result<Self> {
+    pub(crate) fn start(runtime: &Path, dir: &Path) -> Result<Self> {
         let log = fs::File::create(dir.join("server.log")).context("creating the server log")?;
         let child = Command::new("pipewire")
             .env("PIPEWIRE_RUNTIME_DIR", runtime)

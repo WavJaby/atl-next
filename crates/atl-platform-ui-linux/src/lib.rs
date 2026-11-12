@@ -13,6 +13,8 @@ mod geometry;
 mod input;
 #[allow(unsafe_code)]
 pub(crate) mod mirror;
+#[allow(unsafe_code)]
+mod module;
 mod outputs;
 mod scene;
 mod text_input;

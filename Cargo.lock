@@ -549,7 +549,21 @@ dependencies = [
  "pipewire",
  "rustix",
  "tracing",
+ "tracing-subscriber",
  "wayland-client",
+]
+
+[[package]]
+name = "atl-platform-ui-module-fixture"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atl-bridgegen",
+ "atl-platform-ui-api",
+ "clap",
+ "libc",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

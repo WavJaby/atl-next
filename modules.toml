@@ -151,9 +151,9 @@ reason = "the probes allocate through the same GBM backend as the allocator serv
 
 # the app-process half of the platform layer (M3 slice 6, plan S1 `atl-platform-ui`): the -api traits (window, frame clock, input, main loop), the GTK4 implementation (the one crate deny.toml lets depend on GTK) and the facade core crates use; presents the compositor's Scene, importing each quad's dma-buf as a GTK dmabuf texture (layout through scene-buffer, the read fence through gralloc-dmabuf)
 [platform-ui]
-crates = ["atl-platform-ui-api", "atl-platform-ui-linux", "atl-platform-ui"]
+crates = ["atl-platform-ui-api", "atl-platform-ui-linux", "atl-platform-ui", "atl-platform-ui-module-fixture"]
 exports = ["atl-platform-ui"]
-uses = ["compositor", "libgui-parcel", "gralloc", "scene-buffer", "platform-types"]
+uses = ["compositor", "libgui-parcel", "gralloc", "scene-buffer", "platform-types", "generators"]
 
 [platform-ui.direct_link.gralloc]
 reason = "the facade's gate example (xtask test platform-ui) allocates real dma-bufs through gralloc's GBM backend (atl-gralloc-service), as the allocator service does: a dmabuf texture needs a real dma-buf, a memfd is refused"

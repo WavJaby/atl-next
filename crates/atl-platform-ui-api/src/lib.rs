@@ -11,6 +11,7 @@
 
 use std::os::fd::{OwnedFd, RawFd};
 
+pub mod abi;
 pub mod audio;
 pub use atl_compositor::scene::Scene;
 /// The DRM device a buffer was allocated on (gralloc handle): what [`Ui::attach`] is told the presented buffers must carry.

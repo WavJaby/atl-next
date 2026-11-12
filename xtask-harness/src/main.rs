@@ -57,6 +57,7 @@ mod sensors;
 mod services;
 mod test_fonts;
 mod tree_gate;
+mod ui_module;
 mod wayland_proxy;
 mod window;
 
@@ -177,6 +178,10 @@ enum Test {
     /// Runs crates/atl-platform-ui/examples/gate.rs in the gate's headless weston (`--hold-blocked`: on $WAYLAND_DISPLAY) through a Wayland proxy that injects the pings; the module doc of xtask-harness/src/platform_ui.rs lists the gates and the evidence tier of each.
     /// The compositor's own "not responding" reaction is not observable on WSLg: `--hold-blocked <s>` keeps the UI thread blocked for the Arch-laptop run to watch.
     PlatformUi(platform_ui::Args),
+    /// The platform module loaded RTLD_LOCAL (launcher-ui-module plan M1): atl-platform-ui-module-fixture (the launcher's link shape) paints a window through it, then an app library's `libvulkan.so` import must bind the AOSP stand-in, with no host symbol in global scope; the module's log reaches the process subscriber.
+    ///
+    /// Controls run every time: the module loaded RTLD_GLOBAL must leak, no log sink must drop the records. Needs `xtask native`, labwc, pipewire and the NDK.
+    UiModule(ui_module::Args),
     /// The PCM output of atl-platform-ui-linux (plan A0) on PipeWire: a 1 kHz tone played to a null sink the run makes the default, recorded from its monitor, checked for frequency, level and duration. `--break zeros` and `--break no-target` must turn it red.
     ///
     /// The client is crates/atl-platform-ui/examples/audio_pcm.rs; the module doc of xtask-harness/src/audio_pcm.rs lists the gates and the environment it changes (restored on every exit). Needs pipewire, pw-cli, pw-metadata and pw-record on PATH.
@@ -299,6 +304,9 @@ fn main() -> Result<ExitCode> {
             test: Test::PlatformUi(args),
         } => platform_ui::run(&root, &args),
         Command::Test {
+            test: Test::UiModule(args),
+        } => ui_module::run(&root, &args),
+        Command::Test {
             test: Test::AudioPcm(args),
         } => audio_pcm::run(&root, &args),
         Command::Test {
@@ -397,6 +405,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::Drive(_) => "drive",
             Test::Sensors(_) => "sensors",
             Test::PlatformUi(_) => "platform-ui",
+            Test::UiModule(_) => "ui-module",
             Test::AudioPcm(_) => "audio-pcm",
             Test::JniFixture(_) => "jni-fixture",
             Test::Gles2Fixture(_) => "gles2-fixture",
