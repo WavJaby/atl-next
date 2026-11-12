@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, ensure};
 use atl_layout::Layout;
 
-use crate::atld_run::{Run, Runtime, Shell};
+use crate::atld_run::{Package, Run, Runtime, Shell};
 use crate::gl_scene;
 use crate::{manifest, remote, tree};
 
@@ -279,11 +279,12 @@ fn run_probe(
     verbose: bool,
     tag: &str,
 ) -> Result<String> {
+    let m = manifest::read(&rt.apk.aapt2, apk)?;
     let run = Run {
         root: dir.join("root"),
         scratch: dir.join("scratch"),
         launch: None,
-        packages: vec![(apk.to_path_buf(), manifest::read(&rt.apk.aapt2, apk)?)],
+        packages: vec![Package::base(apk.to_path_buf(), m)],
         first_uid: APP_UID,
         libraries: vec![],
         shell: Some(Shell {

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use atl_layout::Layout;
 
-use crate::atld_run::{Run, Runtime, children_outside_broker, counter_lines, counters};
+use crate::atld_run::{Package, Run, Runtime, children_outside_broker, counter_lines, counters};
 use crate::gl_scene::{Judged, Scene};
 use crate::native_load::PLAYER_STEPS;
 use crate::test_fonts;
@@ -597,7 +597,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         root: work.join("root"),
         scratch: work.join("scratch"),
         launch: Some(m.name.clone()),
-        packages: vec![(apk, m.clone())],
+        packages: vec![Package::base(apk, m.clone())],
         first_uid: APP_UID,
         libraries: vec![],
         shell: None,

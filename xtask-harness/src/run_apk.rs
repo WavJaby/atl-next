@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 
-use crate::atld_run::{MS_PER_S, Run, Runtime, last_resumed, parse_stamp, run_display, settled};
+use crate::atld_run::{
+    MS_PER_S, Package, Run, Runtime, last_resumed, parse_stamp, run_display, settled,
+};
 use atl_services_types::native_libs::{SupportedAbi, find_supported_abi};
 use atl_services_types::packages::Manifest;
 
@@ -575,7 +577,7 @@ fn run_of(work: &Path, apk: PathBuf, m: &Manifest, log_tags: &str) -> Run {
         root: work.join("root"),
         scratch: work.join("scratch"),
         launch: Some(m.name.clone()),
-        packages: vec![(apk, m.clone())],
+        packages: vec![Package::base(apk, m.clone())],
         first_uid: window::APP_UID,
         libraries: vec![],
         shell: None,

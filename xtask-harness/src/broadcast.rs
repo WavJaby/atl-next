@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use atl_layout::Layout;
 
-use crate::atld_run::{Run, Runtime, counter_lines};
+use crate::atld_run::{Package, Run, Runtime, counter_lines};
 use crate::manifest;
 
 #[derive(clap::Args)]
@@ -89,9 +89,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             m.name,
             m.receivers.len()
         );
-        packages.push((apk, m));
+        packages.push(Package::base(apk, m));
     }
-    let (sender, receiver) = (packages[0].1.name.clone(), packages[1].1.name.clone());
+    let sender = packages[0].manifest.name.clone();
+    let receiver = packages[1].manifest.name.clone();
     let run = Run {
         root: work.join("root"),
         scratch: work.join("scratch"),

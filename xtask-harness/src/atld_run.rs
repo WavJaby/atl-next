@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use atl_layout::Layout;
 use atl_services_types::display_model::DisplayModel;
 use atl_services_types::native_libs::SupportedAbi;
@@ -256,14 +256,36 @@ pub struct Shell {
     pub boot_jars: Vec<PathBuf>,
 }
 
+/// One package: its files, base first, and the base's manifest.
+pub struct Package {
+    pub files: Vec<PackageFile>,
+    pub manifest: Manifest,
+}
+
+/// One APK of a package: the base (`split` None), or a split APK with its split name.
+pub struct PackageFile {
+    pub split: Option<String>,
+    pub path: PathBuf,
+}
+
+impl Package {
+    /// A package of one base APK and no splits.
+    pub fn base(path: PathBuf, manifest: Manifest) -> Self {
+        Self {
+            files: vec![PackageFile { split: None, path }],
+            manifest,
+        }
+    }
+}
+
 /// One atld run.
 pub struct Run {
     /// atld's runtime root (atld makes it again); its logs are `<root>/log/<process>.log`.
     pub root: PathBuf,
     /// Where the package files and atld's own log go (outside the root, which atld removes).
     pub scratch: PathBuf,
-    /// Each package's APK and manifest, in uid order.
-    pub packages: Vec<(PathBuf, Manifest)>,
+    /// Each package's files and manifest, in uid order.
+    pub packages: Vec<Package>,
     pub first_uid: u32,
     pub launch: Option<String>,
     /// Shared libraries by name; `file` is the host jar.
@@ -1078,9 +1100,8 @@ impl Runtime {
     /// Records what `run` reads for `xtask remote push` (remote.rs `write_record`): the runtime's inputs, the run's packages and boot jars. Written before atld starts, so a run that fails still leaves its record.
     pub fn record_inputs(&self, run: &Run) -> Result<()> {
         let mut inputs = self.runtime_inputs()?;
-        inputs
-            .files
-            .extend(run.packages.iter().map(|(apk, _)| apk.clone()));
+        let files = run.packages.iter().flat_map(|p| &p.files);
+        inputs.files.extend(files.map(|f| f.path.clone()));
         if let Some(shell) = &run.shell {
             inputs.files.extend(shell.boot_jars.iter().cloned());
         }
@@ -1314,13 +1335,17 @@ impl Runtime {
         for jar in &self.art.boot {
             cmd.arg("--boot-jar").arg(jar);
         }
-        for (i, (apk, manifest)) in run.packages.iter().enumerate() {
+        for (i, package) in run.packages.iter().enumerate() {
+            // atld reads one base APK per package until its install takes the file list
+            let [base @ PackageFile { split: None, .. }] = package.files.as_slice() else {
+                bail!("package {i}: {} files, not one base", package.files.len());
+            };
             let file = run.scratch.join(format!("package-{i}.json"));
             std::fs::write(
                 &file,
                 serde_json::to_vec_pretty(&PackageSource {
-                    apk,
-                    manifest,
+                    apk: &base.path,
+                    manifest: &package.manifest,
                     abis: &self.abis,
                 })?,
             )?;

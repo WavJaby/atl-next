@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use rustix::fs::{FileType, Mode, OFlags};
 
-use crate::atld_run::{Run, Runtime, counter_lines, counters};
+use crate::atld_run::{Package, Run, Runtime, counter_lines, counters};
 use crate::window::{self, WINDOW_MS};
 use crate::{manifest, verdict};
 
@@ -661,7 +661,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         root: work.join("root"),
         scratch: work.join("scratch"),
         launch: Some(m.name.clone()),
-        packages: vec![(apk, m.clone())],
+        packages: vec![Package::base(apk, m.clone())],
         first_uid: APP_UID,
         libraries: vec![],
         shell: None,

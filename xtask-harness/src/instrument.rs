@@ -21,7 +21,7 @@ use anyhow::{Result, ensure};
 
 use atl_services_types::packages::Library;
 
-use crate::atld_run::{Run, Runtime, Shell, counter_lines};
+use crate::atld_run::{Package, Run, Runtime, Shell, counter_lines};
 use crate::manifest;
 use crate::verdict::{Failure, Verdict};
 
@@ -551,7 +551,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let run = Run {
             root: work.join(format!("root-{label}")),
             scratch: work.join(format!("scratch-{label}")),
-            packages: vec![(apk.clone(), m.clone())],
+            packages: vec![Package::base(apk.clone(), m.clone())],
             first_uid: APP_UID,
             launch: None,
             libraries: libraries.clone(),

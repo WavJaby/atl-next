@@ -15,7 +15,7 @@ use anyhow::{Context, Result, ensure};
 use atl_layout::Layout;
 use atl_services_types::packages::{InstrumentationDecl, Manifest};
 
-use crate::atld_run::{Run, Runtime, counters};
+use crate::atld_run::{Package, Run, Runtime, counters};
 use crate::cts_report::{self, Module, Report, State};
 use crate::cts_table::{self, Row};
 use crate::instrument::{self, APP_UID};
@@ -166,14 +166,14 @@ fn build_row(
     Ok(Some(why.join("; ")))
 }
 
-/// A module's APK and manifest; Err = why it has none.
-fn built(rt: &Runtime, module: &str) -> Result<(PathBuf, Manifest), String> {
+/// A module's package (its APK and manifest); Err = why it has none.
+fn built(rt: &Runtime, module: &str) -> Result<Package, String> {
     let apk = apk_path(&rt.java_out, module);
     if !apk.is_file() {
         return Err(format!("{} does not exist", apk.display()));
     }
     let manifest = manifest::read(&rt.apk.aapt2, &apk).map_err(|e| format!("{module}: {e:#}"))?;
-    Ok((apk, manifest))
+    Ok(Package::base(apk, manifest))
 }
 
 /// The `am instrument` arguments of a row: wait, raw text, the filters, the component.
@@ -259,13 +259,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 continue;
             }
         };
-        let test = packages[0].1.clone();
+        let test = packages[0].manifest.clone();
         let instrumentation =
             pick_instrumentation(&test).map_err(|e| anyhow::anyhow!("{module}: {e}"))?;
         ensure!(
             packages
                 .iter()
-                .any(|(_, m)| m.name == instrumentation.target_package),
+                .any(|p| p.manifest.name == instrumentation.target_package),
             "{module}: instrumentation {} targets package {}, which no staged package is: add the module that builds it to `apps` in {}",
             instrumentation.name,
             instrumentation.target_package,

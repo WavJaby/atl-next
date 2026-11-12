@@ -15,7 +15,7 @@ use std::os::unix::net::UnixListener;
 
 use anyhow::{Context, Result};
 
-use crate::atld_run::{Run, Runtime, counter_lines};
+use crate::atld_run::{Package, Run, Runtime, counter_lines};
 use crate::audio_pcm::{
     FULL_SCALE, Recorder, Recording, Routing, frequency_hz, out_of_range, read_wav, rms,
 };
@@ -345,7 +345,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         root: work.join("root"),
         scratch: work.join("scratch"),
         launch: Some(m.name.clone()),
-        packages: vec![(apk, m.clone())],
+        packages: vec![Package::base(apk, m.clone())],
         first_uid: APP_UID,
         libraries: vec![],
         shell: None,

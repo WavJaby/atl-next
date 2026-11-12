@@ -20,7 +20,7 @@ use anyhow::Result;
 use atl_layout::Layout;
 use atl_services_types::display_model::DisplayModel;
 
-use crate::atld_run::{Run, Runtime, Shell, counter_lines, run_display};
+use crate::atld_run::{Package, Run, Runtime, Shell, counter_lines, run_display};
 use crate::manifest;
 use crate::verdict::{Failure, Verdict};
 
@@ -693,7 +693,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         root: work.join("root"),
         scratch: work.join("scratch"),
         launch: None,
-        packages: vec![(apk.clone(), m)],
+        packages: vec![Package::base(apk.clone(), m)],
         first_uid: APP_UID,
         libraries: vec![],
         shell: Some(Shell {
