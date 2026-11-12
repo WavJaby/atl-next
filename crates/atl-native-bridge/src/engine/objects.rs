@@ -11,7 +11,10 @@ mod slots {
     include!(concat!(env!("OUT_DIR"), "/object_tables.rs"));
 }
 pub use slots::{SL_IIDS, TABLES};
-pub(super) use slots::{env, vm};
+pub(super) use slots::{
+    env, sl_android_configuration, sl_android_simple_buffer_queue, sl_buffer_queue, sl_engine,
+    sl_object, sl_output_mix, sl_play, sl_prefetch_status, sl_seek, sl_volume, vm,
+};
 
 /// Per slot, the lane descriptor (build.rs `object_lanes_rs`): [`lane_of`] reads it.
 mod lanes {

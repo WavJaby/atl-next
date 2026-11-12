@@ -25,12 +25,16 @@ pub const INT3: u8 = 0xCC;
 pub const JUMP_LEN: usize = 13;
 /// Offset of the imm64 in a [`jump`]; a stub's `movabs` immediate sits at the same offset.
 pub const IMM_AT: usize = 2;
-/// Length of [`down_stub`]: `movabs $target, %r10; movabs $entry, %r11; jmp *%r11; int3`.
-pub const DOWN_LEN: usize = 24;
+/// `push $imm32` (sign-extended to 64): opcode `68 id`.
+pub const PUSH_IMM32: u8 = 0x68;
+/// Length of [`down_stub`]: `push $kind; movabs $target, %r10; movabs $entry, %r11; jmp *%r11`, int3 up to 32.
+pub const DOWN_LEN: usize = 32;
+/// Offset of the kind imm32 in a [`down_stub`].
+pub const DOWN_KIND_AT: usize = 1;
 /// Offset of the target imm64 in a [`down_stub`].
-pub const DOWN_TARGET_AT: usize = 2;
+pub const DOWN_TARGET_AT: usize = 7;
 /// Offset of the entry imm64 in a [`down_stub`].
-pub const DOWN_ENTRY_AT: usize = 12;
+pub const DOWN_ENTRY_AT: usize = 17;
 
 /// `movabs $target, %r11; jmp *%r11`: the stub jump a linker hook or NBS stub is rewritten to.
 pub fn jump(target: u64) -> [u8; JUMP_LEN] {
@@ -41,10 +45,12 @@ pub fn jump(target: u64) -> [u8; JUMP_LEN] {
     b
 }
 
-/// Host-to-guest down stub: `target` in %r10, `entry` (the crossing kind's) in %r11, then `jmp *%r11`.
-pub fn down_stub(target: u64, entry: u64) -> [u8; DOWN_LEN] {
+/// Host-to-guest down stub: `kind` (what the first argument is) pushed for the crossing to read, `target` in %r10, `entry` (the crossing) in %r11, then `jmp *%r11`.
+pub fn down_stub(kind: u32, target: u64, entry: u64) -> [u8; DOWN_LEN] {
     let mut b = [INT3; DOWN_LEN];
-    b[..DOWN_TARGET_AT].copy_from_slice(&MOVABS_R10);
+    b[0] = PUSH_IMM32;
+    b[DOWN_KIND_AT..DOWN_KIND_AT + 4].copy_from_slice(&kind.to_le_bytes());
+    b[DOWN_TARGET_AT - MOVABS_R10.len()..DOWN_TARGET_AT].copy_from_slice(&MOVABS_R10);
     b[DOWN_TARGET_AT..DOWN_TARGET_AT + 8].copy_from_slice(&target.to_le_bytes());
     b[DOWN_ENTRY_AT - MOVABS_R11.len()..DOWN_ENTRY_AT].copy_from_slice(&MOVABS_R11);
     b[DOWN_ENTRY_AT..DOWN_ENTRY_AT + 8].copy_from_slice(&entry.to_le_bytes());
@@ -67,15 +73,16 @@ pub fn constants_rust() -> String {
          pub const JUMP: [u8; {JUMP_LEN}] = {};\n\
          pub const JUMP_LEN: usize = {JUMP_LEN};\n\
          pub const IMM_AT: usize = {IMM_AT};\n\
-         /// Down stub with zero immediates (length {DOWN_LEN}); the engine writes the target at `DOWN_TARGET_AT` and the entry at `DOWN_ENTRY_AT`.\n\
+         /// Down stub with zero immediates (length {DOWN_LEN}); the engine writes the kind (u32) at `DOWN_KIND_AT`, the target at `DOWN_TARGET_AT` and the entry at `DOWN_ENTRY_AT`.\n\
          pub const DOWN: [u8; {DOWN_LEN}] = {};\n\
          pub const DOWN_LEN: usize = {DOWN_LEN};\n\
+         pub const DOWN_KIND_AT: usize = {DOWN_KIND_AT};\n\
          pub const DOWN_TARGET_AT: usize = {DOWN_TARGET_AT};\n\
          pub const DOWN_ENTRY_AT: usize = {DOWN_ENTRY_AT};\n",
         bytes_lit(&MOVABS_R11),
         bytes_lit(&UD2),
         bytes_lit(&jump(0)),
-        bytes_lit(&down_stub(0, 0)),
+        bytes_lit(&down_stub(0, 0, 0)),
     )
 }
 

@@ -328,12 +328,12 @@ fn down_body(slot: usize, host: &mut AtlLanes) {
     let Some(mut guest) = place(&d.params, host) else {
         refuse_down(d.target)
     };
-    // the first argument of a JNI method, or of JNI_OnLoad, is the host's env or vm: the guest's own object stands for it (jni.rs), and it is the first integer, in x0
+    // the first argument of a JNI method, of JNI_OnLoad or of an SL callback is a host env, vm or interface: the guest's own object stands for it (jni.rs, sles.rs), and it is the first integer, in x0; an slObjectCallback's 6th is the 6th integer, in x5
     #[cfg(not(atl_nb_down_noenv))]
-    match d.kind {
-        Down::Env => guest.x[0] = jni::guest_env(guest.x[0] as usize) as u64,
-        Down::Vm => guest.x[0] = jni::guest_vm(guest.x[0] as usize) as u64,
-        Down::Plain => {}
+    {
+        let (mut first, mut sixth) = (guest.x[0] as usize, guest.x[5] as usize);
+        d.kind.guest_args(&mut first, &mut sixth);
+        (guest.x[0], guest.x[5]) = (first as u64, sixth as u64);
     }
     // break `down_noenv` (qemu-jni gate, checks o, m and x): the kind is not read, so the guest gets the host's env or vm
     #[cfg(atl_nb_down_noenv)]
@@ -352,6 +352,8 @@ pub(in crate::engine) fn down_params(
         (Down::Vm, None) => return Ok(vec![Class::Int, Class::Int]),
         (Down::Env, Some(s)) => (&[Class::Int, Class::Int], s),
         (Down::Plain, Some(s)) => (&[], s),
+        // an SL callback: the interface first, then the shorty's (sles.rs gives one per callback type)
+        (Down::Itf(_), Some(s)) => (&[Class::Int], s),
         (kind, shorty) => {
             return Err(format!("down call of kind {kind:?} with shorty {shorty:?}"));
         }

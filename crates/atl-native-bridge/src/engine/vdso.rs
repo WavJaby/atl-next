@@ -24,7 +24,17 @@ extern "C" fn intercept_symbol(addr: *mut c_void, library: *const c_char, symbol
     let addr = addr as usize;
     let engine = active();
     if !engine.is_stub(addr) {
-        // the exported entry (`jmp name_stub`) or a variable: reaches the host through the stub
+        // the exported entry (`jmp name_stub`) reaches the host through the stub; a stub variable (NBS `DEFINE_INTERCEPTABLE_STUB_VARIABLE`, `uintptr_t name;`) takes the host variable's value (break `sles_var_skip`: left 0)
+        if let Some(value) = super::bindings::variable(&lib, &name) {
+            #[cfg(not(atl_nb_sles_var_skip))]
+            // SAFETY: NBS INIT_INTERCEPTABLE_STUB_VARIABLE passes `&name`, the guest's own writable `uintptr_t`.
+            unsafe {
+                *(addr as *mut usize) = value;
+            }
+            #[cfg(atl_nb_sles_var_skip)]
+            let _ = value;
+            BOUND.fetch_add(1, Ordering::Relaxed);
+        }
         return;
     }
     // every stub resolves by (library, name) in the one binding table (bindings.rs), never by the global scope

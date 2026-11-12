@@ -98,7 +98,7 @@ pub const NDK_FRONTS: [&str; 1] = ["libOpenSLES"];
 pub const NB_LINKER: &str = "native_bridge_guest_linker";
 pub const NB_EXE: &str = "native_bridge_guest_app_process";
 /// The guest libraries `app_process64`'s closure needs (its and their `DT_NEEDED`), by module: NBS's guest libc and linker helpers, AOSP's guest libcutils / libutils / liblog (NBS `NATIVE_BRIDGE_ORIG_GUEST_LIBS`), the GL / window proxies (`libnative_bridge_guest_*`, installed under their stems) that route GL calls to the host fronts (GS2), AOSP's guest zlib and libstdc++ (C12: DT_NEEDED of the legacy fixture, not of app_process), and the NDK proxies libandroid, libandroid_runtime and libjnigraphics (C3: DT_NEEDED of the fixtures' asset and bitmap calls), and the vdso. libc++.so comes from the runtimes build (runtimes.rs `shared_libcxx`). Installed file names: atld_run `nb_lib_file`.
-pub const NB_GUEST_LIBS: [&str; 21] = [
+pub const NB_GUEST_LIBS: [&str; 22] = [
     "libnative_bridge_guest_libc",
     "libm",
     "libdl",
@@ -119,6 +119,7 @@ pub const NB_GUEST_LIBS: [&str; 21] = [
     "libnative_bridge_guest_libandroid",
     "libnative_bridge_guest_libandroid_runtime",
     "libnative_bridge_guest_libjnigraphics",
+    "libnative_bridge_guest_libOpenSLES",
     "libnative_bridge_vdso",
 ];
 

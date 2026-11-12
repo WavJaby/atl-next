@@ -15,14 +15,15 @@ fn jump_is_movabs_r11_then_jmp_r11() {
 }
 
 #[test]
-fn down_stub_is_two_movabs_then_jmp_r11_then_int3() {
-    // movabs $target, %r10 = 49 ba + imm64; movabs $entry, %r11 = 49 bb + imm64; jmp *%r11 = 41 ff e3; int3 = cc
+fn down_stub_is_push_two_movabs_then_jmp_r11_then_int3() {
+    // push $kind = 68 + imm32; movabs $target, %r10 = 49 ba + imm64; movabs $entry, %r11 = 49 bb + imm64; jmp *%r11 = 41 ff e3; int3 = cc to 32 bytes
     assert_eq!(
-        down_stub(0x1122_3344_5566_7788, 0x8877_6655_4433_2211),
+        down_stub(0x0403_0201, 0x1122_3344_5566_7788, 0x8877_6655_4433_2211),
         [
+            0x68, 0x01, 0x02, 0x03, 0x04, //
             0x49, 0xBA, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, //
             0x49, 0xBB, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, //
-            0x41, 0xFF, 0xE3, 0xCC,
+            0x41, 0xFF, 0xE3, 0xCC, 0xCC, 0xCC, 0xCC,
         ]
     );
 }

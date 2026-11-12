@@ -19,6 +19,7 @@ pub mod objects;
 mod provider;
 pub mod qemu;
 pub mod signal;
+pub mod sles;
 pub mod thread;
 mod va_list;
 pub mod vdso;
@@ -39,6 +40,13 @@ pub enum Active {
 }
 
 static ACTIVE: OnceLock<Active> = OnceLock::new();
+
+/// A down shell's identity: guest target, kind, shorty.
+type DownKey = (usize, identity::Down, Option<Vec<u8>>);
+/// Every down shell made ([`Active::down`]), by what it runs.
+static DOWN_SHELLS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<DownKey, usize>>,
+> = std::sync::LazyLock::new(Default::default);
 
 /// A sigchain special handler (`art::SigchainAction::sc_sigaction`; NativeBridge `getSignalHandler`'s answer): true when it took the signal.
 pub type SignalHandler =
@@ -234,17 +242,35 @@ impl Active {
         }
     }
 
-    /// A host-callable address that runs guest `target` (loader.rs trampolines): a down call of `kind` whose arguments follow `shorty` (ART's JNI signature; None for JNI_OnLoad / JNI_OnUnload). QEMU places the arguments by it (place.rs `down`); identity's stub passes the caller's registers through.
+    /// A host-callable address that runs guest `target` (loader.rs trampolines, sles.rs callbacks): a down call of `kind` whose arguments follow `shorty` (ART's JNI signature; None for JNI_OnLoad / JNI_OnUnload). QEMU places the arguments by it (place.rs `down`); identity's stub passes the caller's registers through.
+    /// Shells are never freed, so one `(target, kind, shorty)` gets one shell for the process (opensl-es plan 2.2 item 5: an app registering one callback per player would otherwise use a shell per player). Break `sles_no_dedup`: every request takes a new shell.
     pub fn down(
         self,
         target: usize,
         kind: identity::Down,
         shorty: Option<&[u8]>,
     ) -> Result<usize, String> {
-        match self {
-            Active::Identity => identity::down(target, kind),
-            Active::Qemu => qemu::down(target, kind, shorty),
+        let key = (target, kind, shorty.map(<[u8]>::to_vec));
+        let mut shells = DOWN_SHELLS
+            .lock()
+            .map_err(|_| "down shells: poisoned".to_owned())?;
+        #[cfg(not(atl_nb_sles_no_dedup))]
+        if let Some(&at) = shells.get(&key) {
+            return Ok(at);
         }
+        let at = match self {
+            Active::Identity => identity::down(target, kind)?,
+            Active::Qemu => qemu::down(target, kind, shorty)?,
+        };
+        #[cfg(atl_nb_sles_no_dedup)]
+        let key = (key.0, key.1, Some(at.to_ne_bytes().to_vec()));
+        shells.insert(key, at);
+        Ok(at)
+    }
+
+    /// Down shells made so far ([`Active::down`]), for the gates: a deduplicated request makes none.
+    pub fn down_shells(self) -> usize {
+        DOWN_SHELLS.lock().map_or(0, |s| s.len())
     }
 
     /// [`Engine::call`] on this engine.

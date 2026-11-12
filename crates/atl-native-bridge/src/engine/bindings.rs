@@ -71,6 +71,8 @@ pub enum Entry {
     Shim,
     /// `table::TRAPS[i]`
     Trap(usize),
+    /// an NBS stub variable (`uintptr_t name;`): it takes the value of this variable of that host library (opensl-es plan 2.2 item 6: `SL_IID_*`, a pointer to the host's IID; LP64 on both sides)
+    Variable(Host, &'static str),
 }
 
 /// A guest library: its soname (what the guest's init passes to the intercept) and its stubs, in NBS list order.
@@ -95,6 +97,11 @@ pub enum Binding {
     Shim,
     /// why the stub traps: `unbound: …` (no host side), `pending: …` (a binding class still to build) or `refused: R-1 …` (QEMU: a prototype the lane image cannot carry, build.rs)
     Trap(&'static str),
+    /// a stub variable taking the value of `symbol` in `host`
+    Variable {
+        host: Host,
+        symbol: &'static str,
+    },
 }
 
 /// Every (library, stub name, binding) of the process engine's table, in table order.
@@ -114,6 +121,7 @@ fn rows_of(t: Table) -> impl Iterator<Item = (&'static str, &'static str, Bindin
                 Entry::Generic(host, symbol, ret) => Binding::Generic { host, symbol, ret },
                 Entry::Shim => Binding::Shim,
                 Entry::Trap(i) => Binding::Trap(t.trap_names[i].2),
+                Entry::Variable(host, symbol) => Binding::Variable { host, symbol },
             };
             (l.soname, name, b)
         })
@@ -146,6 +154,7 @@ fn shim(name: &str) -> Option<usize> {
         "AndroidBitmap_getInfo" => super::ndk::bitmap_get_info as *const () as usize,
         "AndroidBitmap_lockPixels" => super::ndk::bitmap_lock_pixels as *const () as usize,
         "AndroidBitmap_unlockPixels" => super::ndk::bitmap_unlock_pixels as *const () as usize,
+        "slCreateEngine" => super::sles::create_engine as *const () as usize,
         // Q5-8: the QEMU table's counted libc rows (build.rs `COUNTED_SHIMS`); identity never binds them
         #[cfg(feature = "crossing-count")]
         "memcpy" => crate::counters::memcpy as *const () as usize,
@@ -175,6 +184,20 @@ impl Target {
             Target::Absent => None,
         }
     }
+}
+
+/// The value stub variable `soname:name` takes (an `Entry::Variable` row: the host variable's word), counted in the library's report; None when the row is no variable or the host lacks the symbol.
+pub fn variable(soname: &str, name: &str) -> Option<usize> {
+    let lib = table().libs.iter().find(|l| l.soname == soname)?;
+    let Some(&(_, Entry::Variable(host, sym))) = lib.stubs.iter().find(|(n, _)| *n == name) else {
+        return None;
+    };
+    let value = symbol(host, lib.soname, sym).map(|at| {
+        // SAFETY: a host data symbol of pointer size (`uintptr_t` on the guest side, LP64 both sides), in a library that stays loaded.
+        unsafe { *(at as *const usize) }
+    });
+    report(lib, if value.is_some() { 0 } else { 3 });
+    value
 }
 
 /// Per library, stubs by outcome: [bound to the host, unbound trap, pending trap, absent], printed once the library's list is complete.
@@ -255,6 +278,8 @@ pub fn target(soname: &str, name: &str) -> Option<Target> {
     let (t, outcome) = match entry {
         Some(Entry::Generic(host, sym, ret)) => found(symbol(host, lib.soname, sym), ret),
         Some(Entry::Shim) => found(shim(name), Class::Int),
+        // a variable is never a stub: [`variable`] resolves it
+        Some(Entry::Variable(..)) => (Target::Absent, 3),
         Some(Entry::Trap(i)) => {
             let why = table.trap_names[i].2;
             let outcome = if why.starts_with("unbound") { 1 } else { 2 };

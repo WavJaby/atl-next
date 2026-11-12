@@ -221,7 +221,7 @@ std::arch::global_asm!(
     concat!(
         // atl_nb_call_guest(ht, f, a, b, c, d) -> f(a, b, c, d) on the guest thread pointer
         // hidden: rip-relative references must not be preemptible in the cdylib
-        ".hidden atl_nb_host_targets, atl_nb_host_thunks, atl_nb_call_guest, atl_nb_cross_to_host, atl_nb_object_up, atl_nb_object_stubs, atl_nb_up, atl_nb_cross_to_guest, atl_nb_cross_to_guest_env, atl_nb_cross_to_guest_vm, atl_nb_attach_fn, atl_nb_signal_entry, atl_nb_signal_handlers, atl_nb_bootstrap, atl_nb_bootstrap_tid\n",
+        ".hidden atl_nb_host_targets, atl_nb_host_thunks, atl_nb_call_guest, atl_nb_cross_to_host, atl_nb_object_up, atl_nb_object_stubs, atl_nb_up, atl_nb_cross_to_guest, atl_nb_attach_fn, atl_nb_signal_entry, atl_nb_signal_handlers, atl_nb_bootstrap, atl_nb_bootstrap_tid\n",
         ".text\n",
         ".globl atl_nb_call_guest\n",
         ".type atl_nb_call_guest,@function\n",
@@ -293,22 +293,13 @@ std::arch::global_asm!(
         "    call {up_failed}\n",
         "    ud2\n",
         ".size atl_nb_up, .-atl_nb_up\n",
-        // host->guest (down call): entered by `jmp` from a down stub with %r10 = guest target; [rsp] = host return, then the caller's stack args.
+        // host->guest (down call): entered by `jmp` from a down stub with %r10 = guest target; [rsp] = the kind the stub pushed (`Down::code`), then the host return, then the caller's stack args.
         // Frame (4 words, as up): host return, guest target, host FS, the caller's %rbx; %rbx = the record while the guest runs (callee-saved by it).
-        // Argument registers, %al and stack args reach the guest untouched; only %r10/%r11 (and %rcx after the call, not a return register) are scratch.
-        // Three entries, by what the first argument is (`Down`): none to rewrite, a host JNIEnv, a host JavaVM; the kind rides in a pushed slot until attach has read it, which then carries the caller's %rbx.
+        // Argument registers, %al and stack args reach the guest untouched (but for the ones attach rewrites by kind); only %r10/%r11 (and %rcx after the call, not a return register) are scratch.
+        // The kind slot carries the caller's %rbx once attach has read it.
         ".globl atl_nb_cross_to_guest\n",
         ".type atl_nb_cross_to_guest,@function\n",
         "atl_nb_cross_to_guest:\n",
-        "    push $0\n",
-        "    jmp 2f\n",
-        ".globl atl_nb_cross_to_guest_env, atl_nb_cross_to_guest_vm\n",
-        "atl_nb_cross_to_guest_env:\n",
-        "    push $1\n",
-        "    jmp 2f\n",
-        "atl_nb_cross_to_guest_vm:\n",
-        "    push $2\n",
-        "2:\n",
         // the record always comes from host TLS (attach; FS is the host's here, nested or not): an incoming GS base is not trusted (a nonzero one that was no record trapped, app run 2026-11-06)
         // every argument register saved around the attach call; with the kind slot, 9 pushes + 128 keep the call 16-aligned
         "    push %r10\n",
@@ -328,7 +319,7 @@ std::arch::global_asm!(
         "    movdqu %xmm5, 80(%rsp)\n",
         "    movdqu %xmm6, 96(%rsp)\n",
         "    movdqu %xmm7, 112(%rsp)\n",
-        // attach(&saved %rdi, kind): the record; rewrites the saved first argument to the guest object for kinds 1 and 2
+        // attach(&saved %rdi, kind): the record; rewrites saved argument registers by kind (the 6th, %r9, is 5 words below %rdi: `attach_entry`)
         "    lea 176(%rsp), %rdi\n",
         "    mov 192(%rsp), %rsi\n",
         "    call *atl_nb_attach_fn(%rip)\n",
@@ -807,50 +798,77 @@ pub fn bind(target: usize) -> Option<usize> {
     Some(base + i * encodings::SLOT)
 }
 
-/// What a down call's first argument is, so the crossing hands the guest its own object for it (jni.rs).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// What a down call's host arguments are, so the crossing hands the guest its own objects for them (jni.rs, sles.rs). Both engines: identity carries it in the stub ([`Down::code`]), QEMU in the down slot.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Down {
     /// passed through: plain C, `@CriticalNative`
-    Plain = 0,
+    Plain,
     /// a host `JNIEnv*` -> this thread's guest env (Regular / FastNative JNI methods)
-    Env = 1,
+    Env,
     /// a host `JavaVM*` -> the guest vm (`JNI_OnLoad`)
-    Vm = 2,
+    Vm,
+    /// an OpenSL ES callback: its first argument a host interface of proxy table `t` -> its guest proxy (sles.rs `down_args`, which also rewrites `slObjectCallback`'s 6th)
+    Itf(super::objects::TableId),
 }
 
-/// What `atl_nb_cross_to_guest` calls on every down call: the thread's record, attached on demand (thread.rs `attach_current`), after rewriting the saved first argument for its kind.
+impl Down {
+    /// The kind word a down stub pushes for [`attach_entry`]: 0 plain, 1 env, 2 vm, 3 + table for an interface.
+    pub const fn code(self) -> u32 {
+        match self {
+            Down::Plain => 0,
+            Down::Env => 1,
+            Down::Vm => 2,
+            Down::Itf(t) => 3 + t as u32,
+        }
+    }
+
+    /// The kind [`Down::code`] made `code`.
+    fn from_code(code: usize) -> Down {
+        match code {
+            0 => Down::Plain,
+            1 => Down::Env,
+            2 => Down::Vm,
+            c => Down::Itf(c - 3),
+        }
+    }
+
+    /// Rewrites the host argument words `first` and `sixth` of a down call of this kind to the guest's objects for them. Both engines' crossings call it before the guest runs.
+    pub(in crate::engine) fn guest_args(self, first: &mut usize, sixth: &mut usize) {
+        match self {
+            Down::Plain => {}
+            Down::Env => *first = super::jni::guest_env(*first),
+            Down::Vm => *first = super::jni::guest_vm(*first),
+            Down::Itf(t) => super::sles::down_args(t, first, sixth),
+        }
+    }
+}
+
+/// What `atl_nb_cross_to_guest` calls on every down call: the thread's record, attached on demand (thread.rs `attach_current`), after rewriting the saved argument registers for its kind.
 #[unsafe(no_mangle)]
 static atl_nb_attach_fn: extern "C" fn(*mut usize, usize) -> *mut HostThread = attach_entry;
 
+/// Words from the saved %rdi down to the saved %r9 in the crossing's frame: it pushes rdi, rsi, rdx, rcx, r8, r9 in that order (SysV argument order), so the 6th argument sits 5 words lower.
+const SIXTH_BELOW_FIRST: usize = 5;
+
 extern "C" fn attach_entry(first: *mut usize, kind: usize) -> *mut HostThread {
     let ht = super::thread::attach_current();
-    if kind != Down::Plain as usize {
-        // SAFETY: `first` is the crossing's saved %rdi slot on its own stack frame.
-        unsafe {
-            *first = if kind == Down::Env as usize {
-                super::jni::guest_env(*first)
-            } else {
-                super::jni::guest_vm(*first)
-            };
-        }
+    // SAFETY: `first` is the crossing's saved %rdi slot on its own stack frame; the saved %r9 is SIXTH_BELOW_FIRST words below it in the same frame.
+    unsafe {
+        Down::from_code(kind).guest_args(&mut *first, &mut *first.sub(SIXTH_BELOW_FIRST));
     }
     ht
 }
 
 unsafe extern "C" {
     fn atl_nb_cross_to_guest();
-    fn atl_nb_cross_to_guest_env();
-    fn atl_nb_cross_to_guest_vm();
 }
 
-/// Bytes of a down stub calling guest `target` from host code on any thread: the generated template (`encodings::DOWN`, `movabs $target, %r10; movabs $entry, %r11; jmp *%r11; int3`) with its two immediates filled.
+/// Bytes of a down stub calling guest `target` from host code on any thread: the generated template (`encodings::DOWN`, `push $kind; movabs $target, %r10; movabs $entry, %r11; jmp *%r11`) with its immediates filled.
 fn down_stub(target: usize, kind: Down) -> [u8; encodings::DOWN_LEN] {
-    let entry = match kind {
-        Down::Plain => atl_nb_cross_to_guest as *const () as usize,
-        Down::Env => atl_nb_cross_to_guest_env as *const () as usize,
-        Down::Vm => atl_nb_cross_to_guest_vm as *const () as usize,
-    };
+    let entry = atl_nb_cross_to_guest as *const () as usize;
     let mut s = encodings::DOWN;
+    s[encodings::DOWN_KIND_AT..encodings::DOWN_KIND_AT + 4]
+        .copy_from_slice(&kind.code().to_le_bytes());
     s[encodings::DOWN_TARGET_AT..encodings::DOWN_TARGET_AT + 8]
         .copy_from_slice(&target.to_le_bytes());
     s[encodings::DOWN_ENTRY_AT..encodings::DOWN_ENTRY_AT + 8].copy_from_slice(&entry.to_le_bytes());
@@ -1025,7 +1043,7 @@ mod tests {
         }
     }
 
-    /// The templates are the ISA's forms: `movabs $imm64, %r10` = 49 ba, `%r11` = 49 bb, `jmp *%r11` = 41 ff e3, `int3` = cc (Intel SDM Vol. 2).
+    /// The templates are the ISA's forms: `push $imm32` = 68, `movabs $imm64, %r10` = 49 ba, `%r11` = 49 bb, `jmp *%r11` = 41 ff e3, `int3` = cc (Intel SDM Vol. 2).
     #[test]
     fn patch_templates_are_isa_bytes() {
         assert_eq!(
@@ -1035,8 +1053,8 @@ mod tests {
         assert_eq!(
             encodings::DOWN,
             [
-                0x49, 0xba, 0, 0, 0, 0, 0, 0, 0, 0, 0x49, 0xbb, 0, 0, 0, 0, 0, 0, 0, 0, 0x41, 0xff,
-                0xe3, 0xcc
+                0x68, 0, 0, 0, 0, 0x49, 0xba, 0, 0, 0, 0, 0, 0, 0, 0, 0x49, 0xbb, 0, 0, 0, 0, 0, 0,
+                0, 0, 0x41, 0xff, 0xe3, 0xcc, 0xcc, 0xcc, 0xcc
             ]
         );
         assert_eq!(encodings::STUB_PREFIX, [0x49, 0xbb]);
@@ -1062,16 +1080,26 @@ mod tests {
         );
     }
 
-    /// `down_stub`: `movabs $target, %r10; movabs $entry, %r11; jmp *%r11; int3`, the entry being the plain crossing.
+    /// `down_stub`: `push $kind; movabs $target, %r10; movabs $entry, %r11; jmp *%r11`, int3 fill; one crossing entry for every kind, the kind word 3 + table for an interface.
     #[test]
-    fn down_stub_is_two_movabs_then_jmp_r11() {
+    fn down_stub_is_push_two_movabs_then_jmp_r11() {
         let target = 0x1122_3344_5566_7788;
         let entry = atl_nb_cross_to_guest as *const () as usize;
-        let s = down_stub(target, Down::Plain);
-        assert_eq!(s[..2], [0x49, 0xba]);
-        assert_eq!(s[2..10], target.to_le_bytes());
-        assert_eq!(s[10..12], [0x49, 0xbb]);
-        assert_eq!(s[12..20], entry.to_le_bytes());
-        assert_eq!(s[20..], [0x41, 0xff, 0xe3, 0xcc]);
+        for (kind, word) in [
+            (Down::Plain, 0u32),
+            (Down::Env, 1),
+            (Down::Vm, 2),
+            (Down::Itf(7), 10),
+        ] {
+            let s = down_stub(target, kind);
+            assert_eq!(s[0], 0x68);
+            assert_eq!(s[1..5], word.to_le_bytes());
+            assert_eq!(s[5..7], [0x49, 0xba]);
+            assert_eq!(s[7..15], target.to_le_bytes());
+            assert_eq!(s[15..17], [0x49, 0xbb]);
+            assert_eq!(s[17..25], entry.to_le_bytes());
+            assert_eq!(s[25..], [0x41, 0xff, 0xe3, 0xcc, 0xcc, 0xcc, 0xcc]);
+            assert_eq!(Down::from_code(word as usize), kind);
+        }
     }
 }
