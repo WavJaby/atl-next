@@ -269,6 +269,9 @@ fn extract_native_libs(aapt2: &Path, base: &Path) -> Result<bool> {
     }
 }
 
+/// A row's copied libraries as (name, sha256), sorted.
+type LibSums = Vec<(String, String)>;
+
 /// A library the zip carries as `lib/<abi>/<name>` (one level, the entries AOSP's copy takes): its ABI, name, and sha256 of its bytes (`unzip -p`).
 struct NativeEntry {
     abi: String,
@@ -310,7 +313,7 @@ fn natives(
     device: &[String],
     files: &[PathBuf],
     extract: bool,
-) -> Result<(Option<String>, Option<Vec<(String, String)>>)> {
+) -> Result<(Option<String>, Option<LibSums>)> {
     let mut all = Vec::new();
     for f in files {
         all.extend(native_entries(f)?);
@@ -354,7 +357,7 @@ struct Want {
     splits: Vec<String>,
     primary: Option<String>,
     /// (name, sha256), sorted; None: nothing is copied (extractNativeLibs=false, the libraries stay in the APK).
-    libs: Option<Vec<(String, String)>>,
+    libs: Option<LibSums>,
 }
 
 struct Gate<'a> {
