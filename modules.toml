@@ -149,6 +149,11 @@ uses = ["gralloc", "generators"]
 [egl-host.direct_link.gralloc]
 reason = "the probes allocate through the same GBM backend as the allocator service (atl-gralloc-service Backend::start), so the buffer is the one an app would get; the driver itself takes gralloc's node from atld (atl_gralloc::node), not from a second trial"
 
+# the Vulkan driver (vulkan plan V0): the hwvulkan HAL module vulkan.atl.so AOSP's libvulkan opens, driving one host ICD directly (no Khronos loader in the app process); its probe loads it as libvulkan does
+[vulkan]
+crates = ["atl-vulkan-driver"]
+uses = ["generators"]
+
 # the app-process half of the platform layer (M3 slice 6, plan S1 `atl-platform-ui`): the -api traits (window, frame clock, input, main loop), the GTK4 implementation (the one crate deny.toml lets depend on GTK) and the facade core crates use; presents the compositor's Scene, importing each quad's dma-buf as a GTK dmabuf texture (layout through scene-buffer, the read fence through gralloc-dmabuf)
 [platform-ui]
 crates = ["atl-platform-ui-api", "atl-platform-ui-linux", "atl-platform-ui", "atl-platform-ui-module-fixture"]

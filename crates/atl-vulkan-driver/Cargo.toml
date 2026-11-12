@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-vulkan-driver"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# `vulkan.atl.so`: the hwvulkan HAL module AOSP's libvulkan opens by `ro.hardware.vulkan` (driver.cpp `LoadDriver`: `vulkan.<name>.so`, symbol `HMI`, id `vulkan`, device `vk0`).
+# One host ICD, chosen at open, drives it directly: libvulkan gets the ICD's own entry points (vulkan plan S2 ideal 1, owner D1 direct ICD).
+# Boundary crate: the HAL's C ABI, dlopen of the host ICD. The rlib is for the probe (bin atl-vulkan-driver-probe), which loads the cdylib as libvulkan does.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow.workspace = true
+# the probe's arguments only
+clap.workspace = true
+libloading.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[build-dependencies]
+anyhow.workspace = true
+atl-bridgegen = { path = "../atl-bridgegen" }
+
+[lints]
+workspace = true

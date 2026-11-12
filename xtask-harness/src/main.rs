@@ -59,6 +59,7 @@ mod sles_bridge;
 mod test_fonts;
 mod tree_gate;
 mod ui_module;
+mod vk_driver;
 mod wayland_proxy;
 mod window;
 
@@ -207,6 +208,10 @@ enum Test {
     ///
     /// Controls every run: a window dropping the buffer transform and framebuffer entries taken from the host must fail. Needs no native build.
     EglDriver(egl_driver::Args),
+    /// The Vulkan HAL module (vulkan.atl.so) loaded as AOSP's libvulkan loads it, driving this host's ICD: instance, physical devices, device, queue; every dispatch slot judged as libvulkan judges it.
+    ///
+    /// Controls every run: a judge expecting another slot value, and an environment with no ICD manifest, must fail. Needs no native build.
+    VkDriver(vk_driver::Args),
     /// GLES on the real driver in an app process: a pbuffer cleared and read back, and an extension outside entries.in through eglGetProcAddress (patch 0010); then a deliberate break that both checks must catch.
     ///
     /// Needs the fronts, gralloc and the services in --out (`xtask native`).
@@ -330,6 +335,9 @@ fn main() -> Result<ExitCode> {
             test: Test::EglDriver(args),
         } => egl_driver::run(&root, &args),
         Command::Test {
+            test: Test::VkDriver(args),
+        } => vk_driver::run(&root, &args),
+        Command::Test {
             test: Test::Gl(args),
         } => gl_probe::run(&root, &args),
         Command::Test {
@@ -420,6 +428,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::TaskBind(_) => "task-bind",
             Test::GlDispatch(_) => "gl-dispatch",
             Test::EglDriver(_) => "egl-driver",
+            Test::VkDriver(_) => "vk-driver",
             Test::Gl(_) => "gl",
             Test::Qemu(_) => "qemu-gate",
             Test::QemuSpike(_) => "qemu-spike",
