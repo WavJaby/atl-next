@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Thu, 12 Nov 2026 20:04:17 +0800
+Subject: [PATCH] Build libOpenSLES for x86_64 guests
+
+The identity engine runs x86_64 guests on an x86_64 host, so the
+NativeBridge guest needs an x86_64 build of the libOpenSLES proxy
+(OpenSL ES apps link it). Its stub list is LP64 and arch-neutral
+(stubs_arm64.cc equals stubs_riscv64.cc), so the x86_64 build takes
+the arm64 list, as 0004 and 0005 do.
+
+Upstream-Status: Pending
+Patch-Reason: the x86_64 arch block lives inside this Android.bp module, which no launcher, loader or environment setting can add; the stub list is shared by every LP64 arch here
+---
+SPDX-License-Identifier: Apache-2.0
+ android_api/libOpenSLES/Android.bp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/android_api/libOpenSLES/Android.bp b/android_api/libOpenSLES/Android.bp
+index c332f2f0bb9da4dec86ac63ea6cebbe089e6ea00..1fff64878a5747b5895c275632c351fb8f778983 100644
+--- a/android_api/libOpenSLES/Android.bp
++++ b/android_api/libOpenSLES/Android.bp
+@@ -30,6 +30,9 @@ cc_library {
+         arm64: {
+             srcs: ["stubs_arm64.cc"],
+         },
++        x86_64: {
++            srcs: ["stubs_arm64.cc"],
++        },
+         riscv64: {
+             srcs: ["stubs_riscv64.cc"],
+         },

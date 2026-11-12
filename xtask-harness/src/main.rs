@@ -55,6 +55,7 @@ mod sandbox;
 mod screencopy;
 mod sensors;
 mod services;
+mod sles_bridge;
 mod test_fonts;
 mod tree_gate;
 mod ui_module;
@@ -240,6 +241,10 @@ enum Test {
     ///
     /// Needs the x86_64 NB build and `xtask test app` (it stages `app/root` and `app/jni-fixture`). Logs in `<out>/nb-identity/`.
     NbIdentity(nb_identity::Args),
+    /// OpenSL ES through the identity engine (opensl-es plan O1): an NDK fixture against a host recorder `libOpenSLES.so` staged at a bwrap `/system/lib64`; checks a-g, then each break must turn its named check red.
+    ///
+    /// Needs what `nb-identity` needs (the x86_64 NB build incl. the guest `libOpenSLES` proxy, `xtask test app`). Logs in `<out>/sles-bridge/`.
+    SlesBridge(sles_bridge::Args),
 }
 
 fn main() -> Result<ExitCode> {
@@ -357,6 +362,9 @@ fn main() -> Result<ExitCode> {
         Command::Test {
             test: Test::NbIdentity(args),
         } => nb_identity::run(&root, &args),
+        Command::Test {
+            test: Test::SlesBridge(args),
+        } => sles_bridge::run(&root, &args),
         Command::CheckStep { step, out } => check_step(&root, step, &out),
     };
     // a run that ends in an error (`?`, bail!) still ends with its verdict line; main prints the error after it
@@ -423,6 +431,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::AppImports(_) => "app-imports",
             Test::Crossing(_) => "crossing",
             Test::NbIdentity(_) => "nb-identity",
+            Test::SlesBridge(_) => "sles-bridge",
         },
         Command::CheckStep { .. } => return None,
     })

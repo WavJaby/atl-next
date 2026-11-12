@@ -113,6 +113,22 @@ pub fn start(env: &Nb) -> Result<Guest, String> {
     Guest::start(&cfg)
 }
 
+/// The guest linker's last error text.
+pub fn dlerror(g: &mut Guest) -> String {
+    let Ok(f) = need(&g.linker, "__dl___loader_dlerror") else {
+        return "(no __loader_dlerror)".into();
+    };
+    // SAFETY: char* __loader_dlerror(void); NULL or a NUL-terminated text in the guest's TLS buffer.
+    let p = unsafe { g.call(f, 0, 0, 0) };
+    if p == 0 {
+        return "(no error)".into();
+    }
+    // SAFETY: as above.
+    unsafe { std::ffi::CStr::from_ptr(p as *const std::ffi::c_char) }
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// The host FS is this thread's again (`host` read before the crossing) and the probe passes; puts it back on failure so the next stage runs.
 pub fn host_intact(
     g: &Guest,

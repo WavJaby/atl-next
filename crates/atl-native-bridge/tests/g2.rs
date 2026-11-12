@@ -16,7 +16,7 @@ use std::ffi::CStr;
 use std::process::ExitCode;
 
 use atl_native_bridge::engine::{Guest, identity};
-use common::{RTLD_NOW, host_intact, need};
+use common::{RTLD_NOW, dlerror, host_intact, need};
 
 const LIB: &CStr = c"libatl-jni-test.so";
 const PREFIX: &str = "Java_atl_bridge1_testlib_AtlJniTest_";
@@ -40,22 +40,6 @@ fn sym(g: &mut Guest, dlsym: usize, h: usize, name: &str) -> Result<usize, Strin
         return Err(format!("guest dlsym({name}) = NULL"));
     }
     Ok(f)
-}
-
-/// The guest linker's last error text.
-fn dlerror(g: &mut Guest) -> String {
-    let Ok(f) = need(&g.linker, "__dl___loader_dlerror") else {
-        return "(no __loader_dlerror)".into();
-    };
-    // SAFETY: char* __loader_dlerror(void); NULL or a NUL-terminated text in the guest's TLS buffer.
-    let p = unsafe { g.call(f, 0, 0, 0) };
-    if p == 0 {
-        return "(no error)".into();
-    }
-    // SAFETY: as above.
-    unsafe { CStr::from_ptr(p as *const std::ffi::c_char) }
-        .to_string_lossy()
-        .into_owned()
 }
 
 fn run(env: &common::Nb) -> Result<(), String> {

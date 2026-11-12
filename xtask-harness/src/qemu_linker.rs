@@ -304,6 +304,13 @@ fn staged(
         std::fs::copy(&src, &at)
             .with_context(|| format!("copying {} to {}", src.display(), at.display()))?;
     }
+    let wrap = system_wrap(&stage)?;
+    let env: [(&str, &Path); 1] = [("ATL_NB_STAGED", Path::new("1"))];
+    harness_in(root, dir, &STAGED, &env, dir, brk, name, &wrap)
+}
+
+/// bwrap and its arguments (no closing `--`) for a command that must see `<stage>/system` as `/system` and the host's other top-level entries as they are.
+pub(crate) fn system_wrap(stage: &Path) -> Result<Vec<OsString>> {
     let system = atl_android_paths::SYSTEM;
     // bwrap's root is a tmpfs, so /system can be made on it; every host top-level entry is bound as it is (devices included: cargo, sccache), except one named /system
     let mut a = bwrap::Args::new();
@@ -326,8 +333,7 @@ fn staged(
         wrap.pop().as_deref() == Some(OsStr::new("--")),
         "bwrap::Args::end did not close with --"
     );
-    let env: [(&str, &Path); 1] = [("ATL_NB_STAGED", Path::new("1"))];
-    harness_in(root, dir, &STAGED, &env, dir, brk, name, &wrap)
+    Ok(wrap)
 }
 
 /// One harness run: plain (every check ok, exit 0) or a break (not every check ok, and a nonzero exit). `dllibs` is the guest library directory of `qemu_dlopen` (ATL_NB_DLLIBS).

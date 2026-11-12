@@ -21,7 +21,7 @@ const PACKAGE: &str = "atl-native-bridge";
 /// The identity gates: harness-less test targets of [`PACKAGE`], no feature.
 const GATES: [&str; 5] = ["g1", "g2", "g3", "g4", "g5"];
 /// The arches.toml row whose NB build and guest libraries this runs (the identity guest is the host arch).
-const ARCH: &str = "x86_64";
+pub(crate) const ARCH: &str = "x86_64";
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -34,7 +34,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let out = slot::out_dir(root, args.out.as_deref(), "--out", |ws| {
         ws.join("out/native").join(ARCH)
     })?;
-    let env = identity_env(root, &out)?;
+    let env = identity_env(root, &out, out.join("app/jni-fixture/android-21"))?;
     let dir = out.join("nb-identity");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let mut fails = Vec::new();
@@ -57,11 +57,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     })
 }
 
-/// The env the gates read, from `out`. Each named dir must exist: a missing one names the step that stages it.
-fn identity_env(root: &Path, out: &Path) -> Result<Vec<(&'static str, OsString)>> {
+/// The env the gates read, from `out`, with `fixture` as the test library dir. Each named dir must exist: a missing one names the step that stages it.
+pub(crate) fn identity_env(
+    root: &Path,
+    out: &Path,
+    fixture: PathBuf,
+) -> Result<Vec<(&'static str, OsString)>> {
     let nb = out.join(format!("nb/{ARCH}"));
     let libcxx = out.join(format!("app/root/system/lib64/{ARCH}"));
-    let fixture = out.join("app/jni-fixture/android-21");
     for dir in [&nb, &libcxx, &fixture] {
         ensure!(
             dir.is_dir(),
