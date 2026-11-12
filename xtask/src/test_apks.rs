@@ -817,6 +817,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "altos-odyssey",
                 "battle-cats-tw",
                 "fossify-math",
                 "fossify-notes",
