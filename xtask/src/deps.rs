@@ -1151,7 +1151,7 @@ mod tests {
 
     #[test]
     fn sysroot_arch_comes_from_arches() {
-        let root = crate::checkout_root().unwrap();
+        let root = crate::test_root();
         let apt = PrivateApt::of_sysroot(&root, "riscv64-sysroot").unwrap();
         assert_eq!(apt.arch, "riscv64");
         assert!(apt.dir.ends_with("cache/apt/riscv64"));

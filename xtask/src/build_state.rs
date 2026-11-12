@@ -138,7 +138,7 @@ pub fn gate_out(root: &Path, explicit: Option<&Path>, host: &str, gate: &str) ->
         )
     })?;
     let built = read(&out).map(|r| r.goals).unwrap_or_default();
-    crate::gate_goals::ensure_built(gate, host, &built)?;
+    crate::gate_goals::ensure_built(root, gate, host, &built)?;
     Ok(out)
 }
 

@@ -1164,7 +1164,7 @@ fn add_entries(
 impl Bundle {
     /// The bundle of gate `gate` from its record in `out`, with `brk` applied. The name is checked against gate_goals.rs first.
     fn of(gate: &str, out: &Path, brk: Option<Break>) -> Result<Bundle> {
-        gate_goals::of(gate)?;
+        gate_goals::declared(gate)?;
         let record = read_record(out, gate)?;
         let mut map = BTreeMap::new();
         for file in &record.files {

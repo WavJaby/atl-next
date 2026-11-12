@@ -4,6 +4,7 @@
 //! naming the missing goals and the `--for` command, so no gate discovers a missing input mid-run. The native-bridge guest is part of the same record (`nb:` goals), so stale `<out>/nb` is refused the same way.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use anyhow::{Result, bail};
 
@@ -71,8 +72,11 @@ impl Goals {
 }
 
 /// Every gate's goals (`native --for all-gates`), as the converter's argument file names them: the set a slot's graph must cover for keepset to read it (keepset.rs).
-pub fn all_converter() -> Result<BTreeSet<String>> {
-    Ok(union(&[ALL.to_owned()])?.converter().into_iter().collect())
+pub fn all_converter(root: &Path) -> Result<BTreeSet<String>> {
+    Ok(union(root, &[ALL.to_owned()])?
+        .converter()
+        .into_iter()
+        .collect())
 }
 
 /// The record's name of nb goal `module` built with `--native-bridge <arch>`.
@@ -288,13 +292,13 @@ pub const GATES: &[(&str, GoalsOf)] = &[
     ("window", window),
 ];
 
-/// The goals of gate `name`, expanded ([`resolve`]).
-pub fn of(name: &str) -> Result<Goals> {
-    resolve(declared(name)?)
+/// The goals of gate `name`, expanded from the checkout at `root` ([`resolve`]).
+pub fn of(root: &Path, name: &str) -> Result<Goals> {
+    resolve(root, declared(name)?)
 }
 
-/// The goals gate `name` declares, not yet expanded.
-fn declared(name: &str) -> Result<Goals> {
+/// The goals gate `name` declares, not yet expanded; an unknown name is an error (the name check that reads nothing from disk).
+pub fn declared(name: &str) -> Result<Goals> {
     match GATES.iter().find(|(n, _)| *n == name) {
         Some((_, f)) => Ok(f()),
         None => bail!(
@@ -305,7 +309,7 @@ fn declared(name: &str) -> Result<Goals> {
 }
 
 /// The union of `names`' goals (`all-gates` = every gate).
-pub fn union(names: &[String]) -> Result<Goals> {
+pub fn union(root: &Path, names: &[String]) -> Result<Goals> {
     let mut g = Goals::default();
     for name in names {
         if name == ALL {
@@ -316,14 +320,13 @@ pub fn union(names: &[String]) -> Result<Goals> {
             g = g.with(declared(name)?);
         }
     }
-    resolve(g)
+    resolve(root, g)
 }
 
-/// `g` with its symbolic groups expanded: the store's libraries, from the store source of this checkout (tree::build_file).
-fn resolve(mut g: Goals) -> Result<Goals> {
+/// `g` with its symbolic groups expanded: the store's libraries, from the store source of the checkout at `root` (tree::build_file).
+fn resolve(root: &Path, mut g: Goals) -> Result<Goals> {
     if std::mem::take(&mut g.store) {
-        g.host
-            .extend(crate::codec2_store::libraries(&crate::checkout_root()?)?);
+        g.host.extend(crate::codec2_store::libraries(root)?);
     }
     Ok(g)
 }
@@ -338,8 +341,13 @@ fn names() -> String {
 }
 
 /// Refuses unless `built` (the record's goals) holds all of gate `name`'s, naming the missing ones and the command that builds them.
-pub fn ensure_built(name: &str, host_arch: &str, built: &BTreeSet<String>) -> Result<()> {
-    let missing: Vec<String> = of(name)?
+pub fn ensure_built(
+    root: &Path,
+    name: &str,
+    host_arch: &str,
+    built: &BTreeSet<String>,
+) -> Result<()> {
+    let missing: Vec<String> = of(root, name)?
         .recorded(host_arch)
         .into_iter()
         .filter(|g| !built.contains(g))
@@ -364,40 +372,42 @@ mod tests {
             assert!(seen.insert(*n), "{n} twice");
             f();
         }
+        let root = crate::test_root();
         assert!(
-            union(&[ALL.to_owned()])
+            union(&root, &[ALL.to_owned()])
                 .unwrap()
                 .host
                 .contains("servicemanager")
         );
-        assert!(of("nope").is_err());
+        assert!(of(&root, "nope").is_err());
     }
 
     #[test]
     fn missing_goal_is_named() {
+        let root = crate::test_root();
         let built: BTreeSet<String> = ["servicemanager".to_owned()].into();
-        let e = ensure_built("binder", "x86_64", &built)
+        let e = ensure_built(&root, "binder", "x86_64", &built)
             .unwrap_err()
             .to_string();
         // binder needs `service` too (binder.rs goals)
         assert!(e.contains(" service") && e.contains("--for binder"), "{e}");
-        let app = of("app").unwrap();
+        let app = of(&root, "app").unwrap();
         let nb = app.nb.iter().next().expect("app needs the nb guest");
-        let e = ensure_built("app", "x86_64", &app.host)
+        let e = ensure_built(&root, "app", "x86_64", &app.host)
             .unwrap_err()
             .to_string();
         assert!(e.contains(&nb_key("x86_64", nb)), "{e}");
-        assert!(ensure_built("app", "x86_64", &app.recorded("x86_64")).is_ok());
+        assert!(ensure_built(&root, "app", "x86_64", &app.recorded("x86_64")).is_ok());
     }
 
     #[test]
     fn store_libraries_reach_every_runtime_gate() {
         // the store's own list (C2Store.cpp) is the expectation; no literal names
-        let root = crate::checkout_root().expect("checkout root");
+        let root = crate::test_root();
         let libs = crate::codec2_store::libraries(&root).expect("store list");
         assert!(!libs.is_empty());
         for gate in ["app", "native-load", "run-apk"] {
-            let g = of(gate).expect(gate);
+            let g = of(&root, gate).expect(gate);
             assert!(!g.store, "{gate}: store not expanded");
             assert!(libs.iter().all(|m| g.host.contains(m)), "{gate}");
         }

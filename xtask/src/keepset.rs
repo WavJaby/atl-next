@@ -227,7 +227,7 @@ pub fn check_own(root: &Path) -> Result<Option<String>> {
 /// `(label, out dir)` of the checkout's own slot graph; `Ok(Err(why))` when there is none to read yet.
 fn own_graph(root: &Path, layout: &Layout) -> Result<Result<(String, PathBuf), String>> {
     let slot = crate::slot::record_slot(root)?;
-    let required = crate::gate_goals::all_converter()?;
+    let required = crate::gate_goals::all_converter(root)?;
     select_graph(layout.workspace(), slot, &required)
 }
 
@@ -340,7 +340,7 @@ fn derive(
         }
     }
     for (gate, _) in crate::gate_goals::GATES {
-        let g = crate::gate_goals::of(gate)?;
+        let g = crate::gate_goals::of(root, gate)?;
         gates
             .goals
             .insert((*gate).to_owned(), g.host.into_iter().chain(g.nb).collect());

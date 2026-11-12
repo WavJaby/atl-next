@@ -78,9 +78,9 @@ pub struct Args {
 
 impl Args {
     /// The explicit goals plus those of the `--for` gates; their nb goals set --native-bridge to the host (the identity engine's guest, atld_run.rs).
-    fn resolved(&self) -> Result<Args> {
+    fn resolved(&self, root: &Path) -> Result<Args> {
         let mut a = self.clone();
-        let wanted = crate::gate_goals::union(&self.for_gates)?;
+        let wanted = crate::gate_goals::union(root, &self.for_gates)?;
         if !wanted.nb.is_empty() {
             match &a.native_bridge {
                 None => a.native_bridge = Some(a.host.clone()),
@@ -140,7 +140,7 @@ fn cross_args(root: &Path, cross: Option<&arches::CrossTarget>) -> Result<Vec<St
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let args = &args.resolved()?;
+    let args = &args.resolved(root)?;
     crate::host_disk::check(crate::host_disk::Limits {
         stop_gib: args.host_free_stop_gib,
         compact_gib: args.host_free_compact_gib,

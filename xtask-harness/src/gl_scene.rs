@@ -689,9 +689,8 @@ mod tests {
     use super::*;
 
     fn scene() -> Scene {
-        let path = crate::checkout_root()
-            .expect("checkout root")
-            .join("xtask-harness/testdata/gl-probe/es1-scene.toml");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/gl-probe/es1-scene.toml");
         Scene::load(&path).expect("the ES1 scene parses")
     }
 

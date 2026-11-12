@@ -100,6 +100,15 @@ fn toplevel_in(dir: &Path) -> Result<PathBuf> {
         })
 }
 
+/// Tests: the checkout that compiled them (this crate's parent), so they pass from any cwd; product code keeps [`checkout_root`].
+#[cfg(test)]
+pub(crate) fn test_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("xtask sits in the checkout root")
+        .to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
