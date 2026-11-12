@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use atl_native_bridge::engine::bindings::{Binding, Host, rows};
-use atl_native_bridge::engine::jni::Class;
+use atl_native_bridge::engine::objects::Class;
 use atl_native_bridge::engine::{self, qemu};
 
 /// The guest library of the GLES2 proxies.

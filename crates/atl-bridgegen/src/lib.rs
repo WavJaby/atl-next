@@ -21,6 +21,7 @@ pub mod jni;
 pub mod report;
 pub mod rust;
 pub mod shape;
+pub mod sles;
 pub mod x86;
 
 use anyhow::Result;

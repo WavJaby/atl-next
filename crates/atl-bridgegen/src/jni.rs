@@ -50,7 +50,7 @@ pub fn lanes(view: &ArchView, record: &str) -> Result<Vec<Option<Lane>>> {
 /// `jni_lanes.rs`: the lane types, then one module per `(name, lanes)` with `LANES` indexed by slot. Each module's array length is the table length, so a table that disagrees with its slot list fails to compile.
 pub fn rust(tables: &[(&str, Vec<Option<Lane>>)]) -> String {
     let mut out = String::from(
-        "/// Lane class of a JNI parameter or result (`atl_bridgegen::jni::Class`).\n\
+        "/// Lane class of a JNI parameter or result (`atl_bridgegen::objects::Class`).\n\
          #[allow(dead_code)]\n\
          #[derive(Clone, Copy, Debug, PartialEq, Eq)]\n\
          pub enum Class {\n    Int,\n    Fp,\n    Void,\n    VaList,\n}\n\n\

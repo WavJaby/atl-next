@@ -181,15 +181,15 @@ fn run() -> bool {
     else {
         return report('s', Err("no free thunk".into()));
     };
-    // a host JNIEnv object: word 0 is its function table, which `atl_nb_jni_up` reads per call; the guest env: word 1 is the object, which the shell reads
-    let mut table = vec![0usize; identity::JNI_STUBS];
+    // a host JNIEnv object: word 0 is its function table, which `atl_nb_object_up` reads per call; the guest env: word 1 is the object, which the shell reads
+    let mut table = vec![0usize; identity::OBJECT_STUBS];
     table[JNI_E] = addr(host_e);
     table[JNI_F] = addr(host_f);
     let table: &'static [usize] = Box::leak(table.into_boxed_slice());
     let object: &'static [usize; 1] = Box::leak(Box::new([table.as_ptr() as usize]));
     let env: &'static [usize; 2] = Box::leak(Box::new([0, object.as_ptr() as usize]));
     let env = env.as_ptr() as usize;
-    let (je, jf) = (identity::jni_stub(JNI_E), identity::jni_stub(JNI_F));
+    let (je, jf) = (identity::object_stub(JNI_E), identity::object_stub(JNI_F));
     let mut ok = report('s', Ok(()));
 
     // (t) thunks: each target's counter delta and its own record

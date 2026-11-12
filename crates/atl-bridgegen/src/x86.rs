@@ -86,8 +86,8 @@ fn bytes_lit(b: &[u8]) -> String {
 }
 
 /// Assembly for the identity engine's entry shells and call pools, `.text`, for its `global_asm!`.
-/// `atl_nb_cross_to_host` (host-function slots) and `atl_nb_jni_up` (JNI slots) pop the return address, turn it into the slot's index (`ret - (pool + CALL_LEN)`), index their table and jump to the up crossing `atl_nb_up`. `atl_nb_jni_up` first rewrites %rdi to the host object (word 1 of the guest JNIEnv/JavaVM) and reads the target from that object's own table per call (ART swaps an env's table for CheckJNI); every other argument, %al and stack word reaches the host function untouched (variadic Call*Method).
-/// `atl_nb_host_thunks` holds `thunks` slots and `atl_nb_jni_stubs` `jni_stubs`; each slot is `call` + alignment, written as opcode plus `.long target - . - 4` so the generator owns the displacement expression.
+/// `atl_nb_cross_to_host` (host-function slots) and `atl_nb_object_up` (JNI slots) pop the return address, turn it into the slot's index (`ret - (pool + CALL_LEN)`), index their table and jump to the up crossing `atl_nb_up`. `atl_nb_object_up` first rewrites %rdi to the host object (word 1 of the guest JNIEnv/JavaVM) and reads the target from that object's own table per call (ART swaps an env's table for CheckJNI); every other argument, %al and stack word reaches the host function untouched (variadic Call*Method).
+/// `atl_nb_host_thunks` holds `thunks` slots and `atl_nb_object_stubs` `jni_stubs`; each slot is `call` + alignment, written as opcode plus `.long target - . - 4` so the generator owns the displacement expression.
 /// `disp_bias` is 0 in every shipped build. The break (build.rs `BREAKS`) sets it to 1: the displacement comes out one short, so each pool call lands one byte past its shell.
 /// `counted` (feature `crossing-count`, build.rs): each shell calls its counter (counters.rs `atl_nb_count_host` / `atl_nb_count_jni`) with (slot, target) before the up crossing. False: the plain shells.
 pub fn entries_asm(thunks: usize, jni_stubs: usize, disp_bias: usize, counted: bool) -> String {
@@ -117,8 +117,8 @@ pub fn entries_asm(thunks: usize, jni_stubs: usize, disp_bias: usize, counted: b
     );
     shell(
         &mut s,
-        "atl_nb_jni_up",
-        "atl_nb_jni_stubs",
+        "atl_nb_object_up",
+        "atl_nb_object_stubs",
         &[
             "mov 8(%rdi), %rdi",
             "mov (%rdi), %r10",
@@ -133,7 +133,13 @@ pub fn entries_asm(thunks: usize, jni_stubs: usize, disp_bias: usize, counted: b
         thunks,
         end,
     );
-    pool(&mut s, "atl_nb_jni_stubs", "atl_nb_jni_up", jni_stubs, end);
+    pool(
+        &mut s,
+        "atl_nb_object_stubs",
+        "atl_nb_object_up",
+        jni_stubs,
+        end,
+    );
     s
 }
 

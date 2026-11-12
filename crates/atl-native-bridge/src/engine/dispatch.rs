@@ -6,9 +6,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use atl_engine_api::AtlLanes;
 
-use super::jni::{self, Class, Refused};
+use super::jni;
+use super::objects::{self, Class, Refused};
 use super::{unsupported, va_list};
-use crate::engine::bindings::JNI_STUBS;
+use crate::engine::bindings::OBJECT_STUBS;
 use crate::engine::bindings::qemu::THUNKS;
 use crate::engine::identity::Down;
 
@@ -19,7 +20,7 @@ pub enum Trap {
     Boot(u64),
     /// `svc #CALL`: the guest's lanes.
     Call(AtlLanes),
-    /// A pool thunk: its id (a JNI slot below `JNI_STUBS`, else a bound host function), and its lanes.
+    /// A pool thunk: its id (a JNI slot below `OBJECT_STUBS`, else a bound host function), and its lanes.
     Bind { id: u32, lanes: AtlLanes },
     /// A value reported for a gate: x0.
     Report(u64),
@@ -40,10 +41,10 @@ pub type OnTrap = fn(Trap) -> Answer;
 /// The host function and result class of each pool slot, read by the binding trap ([`call_binding`]). The QEMU placement sets a slot once (`place::bind_result`), so a slot is bound before any trap reads it.
 pub(super) static TARGETS: [OnceLock<(usize, Class)>; THUNKS] = [const { OnceLock::new() }; THUNKS];
 
-/// The default trap callback: a JNI trap calls the host object's table (`call_jni`), a binding trap its host target (`call_binding`), and each answers with x0 and v0 from the host result. Other kinds abort until a route is built; BOOT is the start, answered by `qemu::run` or by the gate's own callback.
+/// The default trap callback: a JNI trap calls the host object's table (`call_object`), a binding trap its host target (`call_binding`), and each answers with x0 and v0 from the host result. Other kinds abort until a route is built; BOOT is the start, answered by `qemu::run` or by the gate's own callback.
 pub fn on_trap(trap: Trap) -> Answer {
     match trap {
-        Trap::Bind { id, lanes } if (id as usize) < JNI_STUBS => call_jni(id, &lanes),
+        Trap::Bind { id, lanes } if (id as usize) < OBJECT_STUBS => call_object(id, &lanes),
         Trap::Bind { id, lanes } => call_binding(id, &lanes),
         other => unsupported(&format!("qemu crossing: {other:?} is not routed yet")),
     }
@@ -72,20 +73,21 @@ pub(super) fn call_binding(id: u32, lanes: &AtlLanes) -> Answer {
     call_host(target, lanes, ret)
 }
 
-/// The JNI crossing counter's one entry (QEMU bridge plan section 5, `dispatch::jni(slot)`): a guest->host JNI call of slot `slot` to host `target`. Both engines call it -- QEMU's [`call_jni`] directly, the identity JNI shell (`atl-bridgegen` `x86::entries_asm`, counted) by this symbol on guest FS, so it touches no TLS and no libc. Break `qe_jni_count`: [`call_jni`] skips it, so only identity counts.
+/// The JNI crossing counter's one entry (QEMU bridge plan section 5, `dispatch::jni(slot)`): a guest->host JNI call of slot `slot` to host `target`. Both engines call it -- QEMU's [`call_object`] directly, the identity JNI shell (`atl-bridgegen` `x86::entries_asm`, counted) by this symbol on guest FS, so it touches no TLS and no libc. Break `qe_jni_count`: [`call_object`] skips it, so only identity counts.
 #[cfg(feature = "crossing-count")]
 #[unsafe(export_name = "atl_nb_count_jni")]
 pub extern "C" fn count_jni(slot: usize, target: usize) {
     crate::counters::count_jni(slot, target);
 }
 
-/// A guest JNI call (pool id `id` < `JNI_STUBS`, Q6-2): x0 is the guest's JNIEnv or JavaVM, and the call runs on the host object it stands for. That object's own table slot `id` runs with x0 replaced by the host object and the other lanes forwarded; its result is the answer. The descriptor (`jni::lane_of`, from the guest object's table) gives the result class; a refused call aborts by name ([`refuse`]).
+/// A guest JNI call (pool id `id` < `OBJECT_STUBS`, Q6-2): x0 is the guest's JNIEnv or JavaVM, and the call runs on the host object it stands for. That object's own table slot `id` runs with x0 replaced by the host object and the other lanes forwarded; its result is the answer. The descriptor (`jni::lane_of`, from the guest object's table) gives the result class; a refused call aborts by name ([`refuse`]).
 /// Deliberate breaks: `jni_swap` exchanges x3 and x4 of CallStaticIntMethod only; `jni_guest_env` passes the guest's env through unmapped.
-fn call_jni(id: u32, lanes: &AtlLanes) -> Answer {
+fn call_object(id: u32, lanes: &AtlLanes) -> Answer {
     let guest = lanes.x[0] as usize;
-    let lane = jni::lane_of(guest, id as usize).unwrap_or_else(|r| refuse(r));
+    // SAFETY: x0 is the object pointer the guest called through.
+    let (_, lane) = unsafe { objects::lane_of(guest, id as usize) }.unwrap_or_else(|r| refuse(r));
     // SAFETY: `guest` is a guest env or vm: `lane_of` found its table, which only `guest_env` / `guest_vm` objects carry.
-    let host = unsafe { jni::host_of(guest) };
+    let host = unsafe { objects::host_of(guest) };
     let mut lanes = *lanes;
     // a `...V` call (Q6-7): its va_list read per the method's shorty into a jvalue array, which the `...A` sibling takes in the va_list's lane
     let args: Vec<u64>;
@@ -104,7 +106,7 @@ fn call_jni(id: u32, lanes: &AtlLanes) -> Answer {
         }
     };
     // SAFETY: `slot` is `id` or its A sibling, below the length of the table `lane_of` read, which jni.rs builds from the host object's table, so it is a slot of `host`'s own table.
-    let target = unsafe { jni::host_slot(host, slot) };
+    let target = unsafe { objects::host_slot(host, slot) };
     // counted as the guest's slot `id`, with the host function that ran
     #[cfg(all(feature = "crossing-count", not(atl_nb_qe_jni_count)))]
     count_jni(id as usize, target);
@@ -258,19 +260,23 @@ fn fp_result(_ret: Class) -> Class {
     Class::Int
 }
 
-/// Refusals by kind, in [`refuse`]'s order: a forged id, a reserved slot, a `va_list` without a shorty source, a shorty character outside jni's. A refusal aborts, so each count reaches the abort message only.
-static REFUSED: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+/// Refusals by kind, in [`refuse`]'s order: a forged id, a slot with no function, a `va_list` without a shorty source, a shorty character outside jni's, an x0 that is no proxy object. A refusal aborts, so each count reaches the abort message only.
+static REFUSED: [AtomicUsize; 5] = [const { AtomicUsize::new(0) }; 5];
 
-/// The named abort of a refused guest JNI call: the message says which call and why, with the count of that kind.
+/// The named abort of a refused guest object call: the message says which call and why, with the count of that kind.
 fn refuse(r: Refused) -> ! {
     let (kind, why) = match r {
         Refused::Forged { id, table, len } => (
             0,
-            format!("JNI id {id} past the {table} table ({len} entries)"),
+            format!("object id {id} past the {table} table ({len} entries)"),
         ),
-        Refused::Reserved { id } => (
+        Refused::Reserved { id, table } => (
             1,
-            format!("JNI slot {id} is reserved (jni.h reserved*), no function"),
+            format!("{table} slot {id} has no function (jni.h reserved*)"),
+        ),
+        Refused::NotProxy { id, guest } => (
+            4,
+            format!("object call {id} on {guest:#x}, which no proxy table backs"),
         ),
         Refused::NoShorty { name } => (
             2,

@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_void};
 use std::sync::Mutex;
 
-use super::jni::Class;
+use super::objects::Class;
 use super::{Active, active, unsupported};
 
 /// The identity engine's table: the host arch's NBS libc stub list, every shim bound.
@@ -79,9 +79,9 @@ pub struct Lib {
     pub stubs: &'static [(&'static str, Entry)],
 }
 
-/// JNI stubs per engine: one per slot of the largest JNI table (build.rs `JNI_STUBS`).
-pub const JNI_STUBS: usize = identity::JNI_STUBS;
-const _: () = assert!(identity::JNI_STUBS == qemu::JNI_STUBS);
+/// JNI stubs per engine: one per slot of the largest JNI table (build.rs `OBJECT_STUBS`).
+pub const OBJECT_STUBS: usize = identity::OBJECT_STUBS;
+const _: () = assert!(identity::OBJECT_STUBS == qemu::OBJECT_STUBS);
 
 /// One row of the table, for gates outside the engine (xtask `gl-proxies`, tests/qemu_gl.rs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

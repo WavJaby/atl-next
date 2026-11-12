@@ -221,7 +221,7 @@ std::arch::global_asm!(
     concat!(
         // atl_nb_call_guest(ht, f, a, b, c, d) -> f(a, b, c, d) on the guest thread pointer
         // hidden: rip-relative references must not be preemptible in the cdylib
-        ".hidden atl_nb_host_targets, atl_nb_host_thunks, atl_nb_call_guest, atl_nb_cross_to_host, atl_nb_jni_up, atl_nb_jni_stubs, atl_nb_up, atl_nb_cross_to_guest, atl_nb_cross_to_guest_env, atl_nb_cross_to_guest_vm, atl_nb_attach_fn, atl_nb_signal_entry, atl_nb_signal_handlers, atl_nb_bootstrap, atl_nb_bootstrap_tid\n",
+        ".hidden atl_nb_host_targets, atl_nb_host_thunks, atl_nb_call_guest, atl_nb_cross_to_host, atl_nb_object_up, atl_nb_object_stubs, atl_nb_up, atl_nb_cross_to_guest, atl_nb_cross_to_guest_env, atl_nb_cross_to_guest_vm, atl_nb_attach_fn, atl_nb_signal_entry, atl_nb_signal_handlers, atl_nb_bootstrap, atl_nb_bootstrap_tid\n",
         ".text\n",
         ".globl atl_nb_call_guest\n",
         ".type atl_nb_call_guest,@function\n",
@@ -445,7 +445,7 @@ std::arch::global_asm!(
     options(att_syntax)
 );
 
-// Q5-7: entry shells and call pools, generated (bridgegen x86.rs `entries_asm`); the pools are the guest-callable stubs `bind` and `jni_stub` hand out
+// Q5-7: entry shells and call pools, generated (bridgegen x86.rs `entries_asm`); the pools are the guest-callable stubs `bind` and `object_stub` hand out
 std::arch::global_asm!(
     include_str!(concat!(env!("OUT_DIR"), "/x86_entries.s")),
     options(att_syntax)
@@ -690,13 +690,13 @@ extern "C" fn up_failed(
 // frames are 32 bytes in the hand-written asm; the generated shells index their pools by `encodings::SLOT`
 const _: () = assert!(FRAME_WORDS * 8 == 32);
 
-/// JNI stubs (bindings.rs `JNI_STUBS`, from build.rs; the generated pool takes it).
-pub const JNI_STUBS: usize = super::bindings::JNI_STUBS;
+/// JNI stubs (bindings.rs `OBJECT_STUBS`, from build.rs; the generated pool takes it).
+pub const OBJECT_STUBS: usize = super::bindings::OBJECT_STUBS;
 
 /// The guest-callable address of JNI table slot `slot` (jni.rs): crosses to the host object's own slot with the object rewritten.
-pub fn jni_stub(slot: usize) -> usize {
-    assert!(slot < JNI_STUBS, "JNI slot {slot} past the stub array");
-    (&raw const atl_nb_jni_stubs) as usize + slot * encodings::SLOT
+pub fn object_stub(slot: usize) -> usize {
+    assert!(slot < OBJECT_STUBS, "JNI slot {slot} past the stub array");
+    (&raw const atl_nb_object_stubs) as usize + slot * encodings::SLOT
 }
 
 unsafe extern "C" {
@@ -709,7 +709,7 @@ unsafe extern "C" {
         d: usize,
     ) -> usize;
     static atl_nb_host_thunks: u8;
-    static atl_nb_jni_stubs: u8;
+    static atl_nb_object_stubs: u8;
     fn atl_nb_signal_entry(sig: i32, info: *mut libc::siginfo_t, uc: *mut libc::c_void);
 }
 
@@ -962,7 +962,7 @@ pub fn patch_entry(vdso: &Image, value_at: usize, host: usize) -> Result<(), &'s
 #[cfg(test)]
 mod tests {
     use super::{
-        Down, atl_nb_cross_to_guest, atl_nb_host_targets, atl_nb_host_thunks, atl_nb_jni_stubs,
+        Down, atl_nb_cross_to_guest, atl_nb_host_targets, atl_nb_host_thunks, atl_nb_object_stubs,
         down_stub, encodings, maps_line_covers, patch_hook,
     };
     use std::sync::atomic::Ordering;
@@ -990,7 +990,7 @@ mod tests {
 
     unsafe extern "C" {
         fn atl_nb_cross_to_host();
-        fn atl_nb_jni_up();
+        fn atl_nb_object_up();
     }
 
     /// Target of the `call rel32` at `at`: opcode E8, next ip = at + 5, target = next ip + rel32 (Intel SDM Vol. 2, CALL).
@@ -1014,9 +1014,9 @@ mod tests {
                 "thunk slot {k}"
             );
         }
-        let jni = (&raw const atl_nb_jni_stubs) as usize;
-        let shell = atl_nb_jni_up as *const () as usize;
-        for k in 0..super::JNI_STUBS {
+        let jni = (&raw const atl_nb_object_stubs) as usize;
+        let shell = atl_nb_object_up as *const () as usize;
+        for k in 0..super::OBJECT_STUBS {
             assert_eq!(
                 call_target(jni + k * encodings::SLOT),
                 shell,

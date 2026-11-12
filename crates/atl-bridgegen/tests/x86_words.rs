@@ -67,17 +67,17 @@ fn entries_text_layout() {
         "    mov (%r10,%r11), %r11\n",
         "    jmp atl_nb_up\n",
         ".size atl_nb_cross_to_host, .-atl_nb_cross_to_host\n",
-        ".globl atl_nb_jni_up\n",
-        ".type atl_nb_jni_up,@function\n",
-        "atl_nb_jni_up:\n",
+        ".globl atl_nb_object_up\n",
+        ".type atl_nb_object_up,@function\n",
+        "atl_nb_object_up:\n",
         "    pop %r11\n",
-        "    lea atl_nb_jni_stubs+5(%rip), %r10\n",
+        "    lea atl_nb_object_stubs+5(%rip), %r10\n",
         "    sub %r10, %r11\n",
         "    mov 8(%rdi), %rdi\n",
         "    mov (%rdi), %r10\n",
         "    mov (%r10,%r11), %r11\n",
         "    jmp atl_nb_up\n",
-        ".size atl_nb_jni_up, .-atl_nb_jni_up\n",
+        ".size atl_nb_object_up, .-atl_nb_object_up\n",
         ".p2align 3\n",
         ".globl atl_nb_host_thunks\n",
         "atl_nb_host_thunks:\n",
@@ -88,10 +88,10 @@ fn entries_text_layout() {
         "    .long atl_nb_cross_to_host - . - 4\n",
         "    .p2align 3\n",
         ".p2align 3\n",
-        ".globl atl_nb_jni_stubs\n",
-        "atl_nb_jni_stubs:\n",
+        ".globl atl_nb_object_stubs\n",
+        "atl_nb_object_stubs:\n",
         "    .byte 0xe8\n",
-        "    .long atl_nb_jni_up - . - 4\n",
+        "    .long atl_nb_object_up - . - 4\n",
         "    .p2align 3\n",
     );
     assert_eq!(entries_asm(2, 1, 0, false), want);
@@ -105,7 +105,10 @@ fn displacement_break_is_one_byte_short() {
         text.contains("    .long atl_nb_cross_to_host - . - 3\n"),
         "{text}"
     );
-    assert!(text.contains("    .long atl_nb_jni_up - . - 3\n"), "{text}");
+    assert!(
+        text.contains("    .long atl_nb_object_up - . - 3\n"),
+        "{text}"
+    );
     assert!(!text.contains("- 4\n"), "{text}");
 }
 

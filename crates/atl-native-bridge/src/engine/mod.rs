@@ -15,6 +15,7 @@ mod intercepts;
 pub mod jni;
 mod ndk;
 mod netdb;
+pub mod objects;
 mod provider;
 pub mod qemu;
 pub mod signal;
@@ -177,11 +178,11 @@ impl Active {
 
     /// A guest-callable address that crosses to host function `target` with an integer result; None when the engine's thunks are used up.
     pub fn bind(self, target: usize) -> Option<usize> {
-        self.bind_result(target, jni::Class::Int)
+        self.bind_result(target, objects::Class::Int)
     }
 
     /// [`Active::bind`] for a host function whose result is of class `ret`: the QEMU engine answers the binding trap in x0 or v0 by it. Identity's native call returns in its own registers, so it ignores `ret`.
-    pub fn bind_result(self, target: usize, ret: jni::Class) -> Option<usize> {
+    pub fn bind_result(self, target: usize, ret: objects::Class) -> Option<usize> {
         match self {
             Active::Identity => identity::bind(target),
             Active::Qemu => qemu::bind_result(target, ret),
@@ -226,10 +227,10 @@ impl Active {
     }
 
     /// The guest-callable address of JNI table slot `slot`.
-    pub fn jni_stub(self, slot: usize) -> usize {
+    pub fn object_stub(self, slot: usize) -> usize {
         match self {
-            Active::Identity => identity::jni_stub(slot),
-            Active::Qemu => qemu::jni_stub(slot),
+            Active::Identity => identity::object_stub(slot),
+            Active::Qemu => qemu::object_stub(slot),
         }
     }
 

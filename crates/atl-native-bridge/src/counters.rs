@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Crossing counter (QEMU bridge plan section 5, Q5-8 / Q5-8b; feature `crossing-count`, absent from shipped builds).
 //!
-//! Per pool slot: the host target that ran and the crossings it took. Three pools, each its own slot space: QEMU's binding slots (`count_binding`, called by `dispatch::call_binding`), the identity engine's host thunks (`atl_nb_count_host`, called by the counted shells of `atl-bridgegen` `x86::entries_asm`), and the JNI slots of both engines (`count_jni`, called only by `dispatch::jni`: QEMU's `call_jni` and the identity JNI shell share that one entry). A JNI slot is one index into both the JNIEnv and the JavaVM table (one stub pool serves both), so the dump names it by both tables' entries. Per [`Mem`] kind: a histogram of the sizes the counted `memcpy`/`memset`/`memcmp` shims were given. Bin = bit length of the size: bin 0 = size 0, bin k = 2^(k-1) <= size < 2^k.
+//! Per pool slot: the host target that ran and the crossings it took. Three pools, each its own slot space: QEMU's binding slots (`count_binding`, called by `dispatch::call_binding`), the identity engine's host thunks (`atl_nb_count_host`, called by the counted shells of `atl-bridgegen` `x86::entries_asm`), and the JNI slots of both engines (`count_jni`, called only by `dispatch::jni`: QEMU's `call_object` and the identity JNI shell share that one entry). A JNI slot is one index into both the JNIEnv and the JavaVM table (one stub pool serves both), so the dump names it by both tables' entries. Per [`Mem`] kind: a histogram of the sizes the counted `memcpy`/`memset`/`memcmp` shims were given. Bin = bit length of the size: bin 0 = size 0, bin k = 2^(k-1) <= size < 2^k.
 //!
 //! Every 2^16 crossings the 16-bit tick wraps and [`dump`] writes the slots and histogram bins that are non-zero to fd 2. The dump allocates nothing, calls no libc function and touches no TLS: its line buffer is on the stack and it writes with a raw `syscall`, because the identity side counts on guest FS, where glibc's wrapper would read the host thread pointer (errno, cancellation).
 //! Counts are relaxed atomics: exact, lock-free, and a crossing costs a few stores.
@@ -10,7 +10,7 @@ use std::ffi::{c_int, c_void};
 use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
 
 use crate::engine::bindings::qemu::THUNKS;
-use crate::engine::identity::{JNI_STUBS, THUNKS as HOST_THUNKS};
+use crate::engine::identity::{OBJECT_STUBS, THUNKS as HOST_THUNKS};
 
 /// Histogram bins: the bit lengths 0..=64 of a `usize` size.
 pub const BINS: usize = usize::BITS as usize + 1;
@@ -46,7 +46,7 @@ impl Slot {
 static SLOTS: [Slot; THUNKS] = [const { Slot::new() }; THUNKS];
 /// Identity: the host thunk pool (`bind`). Both engines: the JNI slots.
 static HOST: [Slot; HOST_THUNKS] = [const { Slot::new() }; HOST_THUNKS];
-static JNI: [Slot; JNI_STUBS] = [const { Slot::new() }; JNI_STUBS];
+static JNI: [Slot; OBJECT_STUBS] = [const { Slot::new() }; OBJECT_STUBS];
 static HIST: [[AtomicU64; BINS]; 3] = [const { [const { AtomicU64::new(0) }; BINS] }; 3];
 /// Crossings modulo 2^16: wraps (dumps) every 65536.
 static TICK: AtomicU16 = AtomicU16::new(0);

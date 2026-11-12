@@ -11,7 +11,7 @@ use crate::engine::bindings::qemu::THUNKS;
 use crate::engine::dispatch::{TARGETS, down_params};
 use crate::engine::identity::Down;
 use crate::engine::image::{Image, write_sealed};
-use crate::engine::jni::Class;
+use crate::engine::objects::Class;
 
 use super::CROSSING;
 
@@ -27,14 +27,14 @@ pub(super) mod pool {
 
 /// Bytes per thunk: two instruction words.
 pub(super) const THUNK_BYTES: usize = 8;
-/// Next free pool slot: past the JNI ids `0..JNI_STUBS` (`jni_stub`), so `bind` never hands out a JNI id.
-static NEXT: AtomicUsize = AtomicUsize::new(JNI_STUBS);
+/// Next free pool slot: past the JNI ids `0..OBJECT_STUBS` (`object_stub`), so `bind` never hands out a JNI id.
+static NEXT: AtomicUsize = AtomicUsize::new(OBJECT_STUBS);
 
 // one generated slot per binding: the pool and the table are sized by the same build-time count
 const _: () = assert!(std::mem::size_of::<pool::Pool>() == THUNKS * THUNK_BYTES);
 
-/// JNI pool ids: id `k` < `JNI_STUBS` is JNI table entry `k`, for env and vm alike (`jni_stub`). Ids from here up are bound host functions.
-pub const JNI_STUBS: usize = crate::engine::bindings::JNI_STUBS;
+/// JNI pool ids: id `k` < `OBJECT_STUBS` is JNI table entry `k`, for env and vm alike (`object_stub`). Ids from here up are bound host functions.
+pub const OBJECT_STUBS: usize = crate::engine::bindings::OBJECT_STUBS;
 
 /// A guest-callable address that crosses to host function `target` with an integer result ([`bind_result`]). None when the pool is used up.
 pub fn bind(target: usize) -> Option<usize> {
@@ -53,9 +53,9 @@ pub fn bind_result(target: usize, ret: Class) -> Option<usize> {
     Some((&raw const pool::POOL) as usize + slot * THUNK_BYTES)
 }
 
-/// The guest-callable address of JNI table slot `slot`: pool slot `slot` itself. Its trap is routed by id to the host object's own table (`dispatch::call_jni`), not through `TARGETS`.
-pub fn jni_stub(slot: usize) -> usize {
-    assert!(slot < JNI_STUBS, "JNI slot {slot} past the stub array");
+/// The guest-callable address of JNI table slot `slot`: pool slot `slot` itself. Its trap is routed by id to the host object's own table (`dispatch::call_object`), not through `TARGETS`.
+pub fn object_stub(slot: usize) -> usize {
+    assert!(slot < OBJECT_STUBS, "JNI slot {slot} past the stub array");
     (&raw const pool::POOL) as usize + slot * THUNK_BYTES
 }
 

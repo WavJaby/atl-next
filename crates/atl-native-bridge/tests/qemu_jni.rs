@@ -23,7 +23,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 use atl_native_bridge::engine::identity::Down;
-use atl_native_bridge::engine::jni::{Class, guest_env, guest_vm, set_method_shorty};
+use atl_native_bridge::engine::jni::{guest_env, guest_vm, set_method_shorty};
+use atl_native_bridge::engine::objects::Class;
 use atl_native_bridge::engine::{Config, Guest, qemu};
 use object::{Object, ObjectSymbol, read::elf::ElfFile64};
 
@@ -595,7 +596,7 @@ fn started(r: Result<Guest, String>) -> u64 {
     let mut out = [0i64; OUT_WORDS];
     // the forged-id case calls the stub of a JNI id past the env table
     out[7] = if refuse == REFUSE_FORGED {
-        qemu::jni_stub(FORGED_SLOT) as i64
+        qemu::object_stub(FORGED_SLOT) as i64
     } else {
         0
     };
