@@ -40,37 +40,114 @@ fn has_mode(tags: &[&str]) -> bool {
     tags.iter().any(|t| MODE_TAGS.contains(t))
 }
 
-/// The NDK stub surface of one map file for `arch`.
-pub fn surface(map: &str, arch: &str) -> Result<Surface> {
-    let mut out = Surface::new();
-    let mut node: Option<(String, bool)> = None;
+/// One global symbol line of a map file, with its node's tags and its own.
+struct Entry<'a> {
+    node: &'a str,
+    node_tags: Vec<&'a str>,
+    sym: &'a str,
+    tags: Vec<&'a str>,
+}
+
+/// Every symbol a map file lists, in order (the `local: *;` catch-all aside).
+fn entries(map: &str) -> Result<Vec<Entry<'_>>> {
+    let mut out = Vec::new();
+    let mut node: Option<(&str, Vec<&str>)> = None;
     for (n, raw) in map.lines().enumerate() {
         let code = raw.split('#').next().unwrap_or("").trim();
         if code.is_empty() {
             continue;
         }
         if let Some(name) = code.strip_suffix('{').map(str::trim) {
-            let t = tags(raw);
-            let keep = !(name.ends_with("_PRIVATE") || name.ends_with("_PLATFORM"))
-                && !t.contains(&"platform-only")
-                && !has_mode(&t)
-                && in_arch(&t, arch);
-            node = Some((name.to_string(), keep));
+            node = Some((name, tags(raw)));
         } else if code.starts_with('}') {
             node = None;
         } else if code == "global:" || code == "local:" || code == "*;" {
         } else {
-            let (name, keep) = node
+            let (name, node_tags) = node
                 .as_ref()
                 .with_context(|| format!("line {}: symbol outside a version node", n + 1))?;
-            let sym = code.trim_end_matches(';').trim();
-            let t = tags(raw);
-            if *keep && !has_mode(&t) && in_arch(&t, arch) {
-                out.insert((name.clone(), sym.to_string()));
-            }
+            out.push(Entry {
+                node: name,
+                node_tags: node_tags.clone(),
+                sym: code.trim_end_matches(';').trim(),
+                tags: tags(raw),
+            });
         }
     }
     Ok(out)
+}
+
+/// The NDK stub surface of one map file for `arch`.
+pub fn surface(map: &str, arch: &str) -> Result<Surface> {
+    Ok(entries(map)?
+        .into_iter()
+        .filter(|e| {
+            let t = &e.node_tags;
+            !(e.node.ends_with("_PRIVATE") || e.node.ends_with("_PLATFORM"))
+                && !t.contains(&"platform-only")
+                && !has_mode(t)
+                && in_arch(t, arch)
+                && !has_mode(&e.tags)
+                && in_arch(&e.tags, arch)
+        })
+        .map(|e| (e.node.to_string(), e.sym.to_string()))
+        .collect())
+}
+
+/// What a link with `map` as `-Wl,--version-script` exports: every listed symbol under its node. The tags are `#` comments to the linker, so none filters (Soong passes `version_script` to the link unchanged, cc/linker.go).
+pub fn script(map: &str) -> Result<Surface> {
+    Ok(entries(map)?
+        .into_iter()
+        .map(|e| (e.node.to_string(), e.sym.to_string()))
+        .collect())
+}
+
+/// NDK libraries built from AOSP source as-is (gate_goals.rs `NDK_FRONTS`) and the version script their Android.bp names, relative to the AOSP tree; the fronts gate compares each built library's exports with it.
+pub const FRONT_SCRIPTS: &[(&str, &str)] =
+    &[("libOpenSLES", "frameworks/wilhelm/src/libOpenSLES.map.txt")];
+
+/// The (version node, symbol) pairs `lib` defines and exports dynamically; an unversioned one has node "". The version definitions' own symbols are not exports.
+pub fn exports(lib: &Path) -> Result<Surface> {
+    let data = std::fs::read(lib).with_context(|| format!("reading {}", lib.display()))?;
+    let elf = ElfFile64::<Endianness>::parse(&*data)?;
+    let endian = elf.endian();
+    let versions = elf.elf_section_table().versions(endian, &*data)?;
+    let mut out = Surface::new();
+    for s in elf
+        .dynamic_symbols()
+        .filter(|s| !s.is_undefined() && s.is_global())
+    {
+        let name = s.name()?;
+        let node = match &versions {
+            Some(v) => v
+                .version(v.version_index(endian, s.index()).index())?
+                .map(|v| String::from_utf8_lossy(v.name()).into_owned())
+                .unwrap_or_default(),
+            None => String::new(),
+        };
+        if name.is_empty() || name == node {
+            continue;
+        }
+        out.insert((node, name.to_string()));
+    }
+    Ok(out)
+}
+
+/// The differences between `lib`'s exports and the version script at `map`, one line each; empty when equal.
+pub fn front_mismatch(lib: &Path, map: &Path) -> Result<Vec<String>> {
+    let text =
+        std::fs::read_to_string(map).with_context(|| format!("reading {}", map.display()))?;
+    let want = script(&text).with_context(|| format!("in {}", map.display()))?;
+    let have = exports(lib)?;
+    Ok(diff(&have, &want))
+}
+
+fn diff(have: &Surface, want: &Surface) -> Vec<String> {
+    let missing = want
+        .difference(have)
+        .map(|(n, s)| format!("missing {s}@{n}"));
+    let extra = have.difference(want).map(|(n, s)| format!("extra {s}@{n}"));
+    missing.chain(extra).collect()
 }
 
 /// One version-needed binding of a dynamic undefined symbol: (needed file, version node, symbol).
@@ -163,6 +240,34 @@ mod tests {
     fn tagged_symbols_fire() {
         assert_eq!(run("LIBC", "__apex_only").len(), 1);
         assert_eq!(run("LIBC", "__arm_only").len(), 1);
+    }
+
+    /// A version script exports every listed symbol, tags or not; `local: *;` is no symbol.
+    #[test]
+    fn script_keeps_tagged_symbols() {
+        let s = script(MAP).unwrap();
+        // MAP lists 7 symbols: malloc, __apex_only, __arm_only, pthread_getname_np, __libc_init_private, __plat, __old
+        assert_eq!(s.len(), 7);
+        assert!(s.contains(&("LIBC".into(), "__arm_only".into())));
+        assert!(s.contains(&("LIBC_DEPRECATED".into(), "__old".into())));
+    }
+
+    #[test]
+    fn diff_names_both_sides() {
+        let pair = |n: &str, s: &str| (n.to_string(), s.to_string());
+        let want: Surface = [pair("L", "a"), pair("L", "b")].into();
+        let have: Surface = [pair("L", "a"), pair("L", "c")].into();
+        assert_eq!(diff(&have, &want), ["missing b@L", "extra c@L"]);
+        assert!(diff(&want, &want).is_empty());
+    }
+
+    /// Every NDK front the build stages has its version script row.
+    #[test]
+    fn every_front_has_a_script() {
+        for f in crate::gate_goals::NDK_FRONTS {
+            assert!(FRONT_SCRIPTS.iter().any(|(m, _)| *m == f), "{f}");
+        }
+        assert_eq!(FRONT_SCRIPTS.len(), crate::gate_goals::NDK_FRONTS.len());
     }
 
     #[test]

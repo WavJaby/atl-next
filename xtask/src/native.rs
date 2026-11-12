@@ -535,6 +535,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if let Some(first) = isa_floor_gate(&out, host)? {
         failed.push(Failure::step("isa gate", first));
     }
+    if let Some(first) = fronts_gate(&out, &tree)? {
+        failed.push(Failure::step("fronts gate", first));
+    }
     if let Some(first) = licence_gate(&out, status.success(), args.verbose)? {
         failed.push(Failure::step("licence gate", first));
     }
@@ -1299,6 +1302,36 @@ fn runpath_gate(out: &Path) -> Result<Option<String>> {
         println!("native:   runpath: {v}");
     }
     Ok(violations.first().cloned())
+}
+
+/// The NDK fronts gate: each built `device/<m>/<m>.so` of ndk_surface.rs `FRONT_SCRIPTS` exports exactly its version script's symbols under their nodes, the surface an NDK app links against; its first mismatch, None when it passes. A front this graph did not build is not checked; the count says how many were.
+fn fronts_gate(out: &Path, tree: &Path) -> Result<Option<String>> {
+    let mut checked = 0;
+    let mut first = None;
+    for (module, map) in ndk_surface::FRONT_SCRIPTS {
+        let lib = out.join("device").join(module).join(format!("{module}.so"));
+        if !lib.is_file() {
+            continue;
+        }
+        checked += 1;
+        let bad = ndk_surface::front_mismatch(&lib, &tree.join(map))?;
+        for b in bad.iter().take(5) {
+            println!("native:   fronts: {module}: {b}");
+        }
+        if first.is_none()
+            && let Some(b) = bad.first()
+        {
+            first = Some(format!(
+                "{module}: {b} ({} differences from {map})",
+                bad.len()
+            ));
+        }
+    }
+    println!(
+        "native: fronts gate: {checked} of {} NDK fronts checked against their version scripts",
+        ndk_surface::FRONT_SCRIPTS.len()
+    );
+    Ok(first)
 }
 
 /// The ISA and glibc-floor gate (isa_gate.rs) over this cross host's outputs; its first violation, None when it passes. The build machine's row has no isa: not checked.

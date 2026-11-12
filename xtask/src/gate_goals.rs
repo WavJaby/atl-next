@@ -92,6 +92,8 @@ pub const ANGLE_FRONTS: [&str; 3] = ["libEGL_angle", "libGLESv1_CM_angle", "libG
 pub const EXTRACTOR_PLUGINS: [&str; 2] = ["liboggextractor", "libwavextractor"];
 /// Framework JNI libraries an app loads by name (`System.loadLibrary`): libsoundpool (SoundPool.java:119) and libmedia_jni (MediaPlayer.java:623), built as AOSP's source as-is. Their closures build with them; stage_art links every built `device/<module>/*.so` into the ART lib dir, which atld's LD_LIBRARY_PATH names, so no placement row is needed.
 pub const FRAMEWORK_JNI: [&str; 2] = ["libsoundpool", "libmedia_jni"];
+/// NDK libraries implemented by AOSP's own source as-is on the host: libOpenSLES (frameworks/wilhelm, over libaudioclient). Staged like [`FRAMEWORK_JNI`]: stage_art links every built `device/<module>/*.so` into the ART lib dir, so an app's `DT_NEEDED libOpenSLES.so` resolves there.
+pub const NDK_FRONTS: [&str; 1] = ["libOpenSLES"];
 /// The native-bridge guest's linker and main executable (NBS modules; `app_process64` = argv[1] of the guest linker, atl-native-bridge engine/mod.rs).
 pub const NB_LINKER: &str = "native_bridge_guest_linker";
 pub const NB_EXE: &str = "native_bridge_guest_app_process";
@@ -148,6 +150,7 @@ pub fn runtime() -> Goals {
     ])
     .with(Goals::host(&EXTRACTOR_PLUGINS))
     .with(Goals::host(&FRAMEWORK_JNI))
+    .with(Goals::host(&NDK_FRONTS))
     .with(Goals::codec_store())
 }
 
