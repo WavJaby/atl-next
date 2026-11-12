@@ -622,18 +622,7 @@ fn fixture(root: &Path, b: &Build, dir: &Path, name: &str, skew: u32) -> Result<
         "NDK clang failed on {}",
         pool_src.display()
     );
-    let bin = dir.join(name);
-    let src = root.join(FIXTURE_SRC);
-    let status = target
-        .cmd("clang")
-        .args(["-static", "-O1", "-Wall", "-Werror", "-o"])
-        .arg(&bin)
-        .arg(&src)
-        .arg(&pool_obj)
-        .status()
-        .context("running the NDK clang")?;
-    ensure!(status.success(), "NDK clang failed on {}", src.display());
-    Ok(bin)
+    target.static_exe(&[&root.join(FIXTURE_SRC), &pool_obj], &dir.join(name))
 }
 
 /// The built fixture's pool, read back from its own symbol table: `atl_bind_pool` is page aligned and `POOL_BYTES` long, and slot k holds `aarch64::place_words(k)` (`svc #(BIND | k); ret`).

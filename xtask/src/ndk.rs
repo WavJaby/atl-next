@@ -62,6 +62,19 @@ impl NdkTarget {
         c
     }
 
+    /// `srcs` (C sources and objects) linked into the static guest executable `bin` (`-static -O1 -Wall -Werror`): the QEMU gates' fixture form, as `qemu-linker`'s boot executable.
+    pub fn static_exe(&self, srcs: &[&Path], bin: &Path) -> Result<PathBuf> {
+        let status = self
+            .cmd("clang")
+            .args(["-static", "-O1", "-Wall", "-Werror", "-o"])
+            .arg(bin)
+            .args(srcs)
+            .status()
+            .context("running the NDK clang")?;
+        anyhow::ensure!(status.success(), "NDK clang failed on {srcs:?}");
+        Ok(bin.to_path_buf())
+    }
+
     /// The per-API clang wrapper (`<triple><api>-clang`): a compiler that needs no `--target` argument, for tools that take a bare compiler path.
     pub fn wrapper(&self) -> &Path {
         &self.wrapper

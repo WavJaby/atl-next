@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 
 use crate::ndk::NdkTarget;
 use crate::qemu::{self, GUEST_API};
@@ -48,7 +48,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let so = qemu_spike::engine_so_file(root, &b, &engine)?;
     let ndk = crate::ndk::default_ndk(root)?;
     let target = NdkTarget::new(root, &ndk, &b.arch, GUEST_API)?;
-    let fixture = fixture_build(root, &target, &dir.join("fixture"))?;
+    let fixture = target.static_exe(
+        &[&root.join(TESTDATA).join("fixture.c")],
+        &dir.join("fixture"),
+    )?;
     // (run name, native-bridge break, engine break)
     let mut runs: Vec<(&str, Option<&str>, Option<&str>)> = vec![("plain", None, None)];
     if !args.no_breaks {
@@ -89,18 +92,4 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         ExitCode::FAILURE
     })
-}
-
-/// `fixture.c` for the guest: a static executable, the form of `qemu-linker`'s boot executable.
-fn fixture_build(root: &Path, target: &NdkTarget, bin: &Path) -> Result<PathBuf> {
-    let src = root.join(TESTDATA).join("fixture.c");
-    let status = target
-        .cmd("clang")
-        .args(["-static", "-O1", "-Wall", "-Werror", "-o"])
-        .arg(bin)
-        .arg(&src)
-        .status()
-        .context("running the NDK clang")?;
-    ensure!(status.success(), "NDK clang failed on {}", src.display());
-    Ok(bin.to_path_buf())
 }
