@@ -339,6 +339,10 @@ extern "C" fn logger(message: *const liblog::__android_log_message) {
 }
 
 type Env = *mut *const jni::JNINativeInterface;
+/// jni.h's reference and method-ID types as the generated table spells them (references are `void *` there).
+type JClass = *mut c_void;
+type JString = *mut c_void;
+type JMethod = *mut jni::_jmethodID;
 
 /// Calls the JNIEnv function `$f` of `$env` with the rest as arguments; inside an unsafe block, under that function's JNI contract.
 macro_rules! jni_call {
@@ -410,6 +414,15 @@ impl VmHandle {
 }
 
 const EXIT_FAILURE: i32 = 1;
+
+/// What AOSP's PackageLite says of a package dir (`Vm::parse_cluster`).
+pub struct ClusterLite {
+    pub package: String,
+    /// `getLongVersionCode`: versionCodeMajor << 32 | versionCode.
+    pub version_code: i64,
+    /// The split names in PackageLite's order (sorted by ApkLiteParseUtils).
+    pub splits: Vec<String>,
+}
 
 impl Vm {
     /// dalvikvm `InvokeMain`: `class.main(args)` if public, static, `([Ljava/lang/String;)V`; the exit status (0, or 1 on any failure or an uncaught exception).
@@ -605,6 +618,194 @@ impl Vm {
         0
     }
 
+    /// A pending Java exception, described on stderr (`ExceptionDescribe`) and cleared, as an error naming `what`.
+    fn check(&self, what: &str) -> Result<()> {
+        // SAFETY: the main thread's env; checking, describing and clearing are allowed with an exception pending
+        unsafe {
+            if jni_call!(self.env, ExceptionCheck) != 0 {
+                jni_call!(self.env, ExceptionDescribe);
+                jni_call!(self.env, ExceptionClear);
+                bail!("{what}: Java exception (described on stderr)");
+            }
+        }
+        Ok(())
+    }
+
+    fn find_class(&self, name: &CStr) -> Result<JClass> {
+        // SAFETY: the main thread's env, a NUL-terminated class name
+        let c = unsafe { jni_call!(self.env, FindClass, name.as_ptr()) };
+        self.check(&format!("FindClass {}", name.to_string_lossy()))?;
+        ensure!(!c.is_null(), "no class {}", name.to_string_lossy());
+        Ok(c)
+    }
+
+    /// The method `name` + `sig` of `class`: static when `is_static`.
+    fn method(&self, class: JClass, name: &CStr, sig: &CStr, is_static: bool) -> Result<JMethod> {
+        // SAFETY: the main thread's env, a live class reference, NUL-terminated name and signature
+        let m = unsafe {
+            if is_static {
+                jni_call!(
+                    self.env,
+                    GetStaticMethodID,
+                    class,
+                    name.as_ptr(),
+                    sig.as_ptr()
+                )
+            } else {
+                jni_call!(self.env, GetMethodID, class, name.as_ptr(), sig.as_ptr())
+            }
+        };
+        self.check(&format!(
+            "method {}{}",
+            name.to_string_lossy(),
+            sig.to_string_lossy()
+        ))?;
+        ensure!(!m.is_null(), "no method {}", name.to_string_lossy());
+        Ok(m)
+    }
+
+    /// A Java `String` as UTF-8; null -> None.
+    fn string(&self, s: JString) -> Result<Option<String>> {
+        if s.is_null() {
+            return Ok(None);
+        }
+        // SAFETY: a live String reference; the chars are released below, after the copy
+        unsafe {
+            let chars = jni_call!(self.env, GetStringUTFChars, s, core::ptr::null_mut());
+            ensure!(!chars.is_null(), "GetStringUTFChars failed");
+            let text = CStr::from_ptr(chars).to_string_lossy().into_owned();
+            jni_call!(self.env, ReleaseStringUTFChars, s, chars);
+            Ok(Some(text))
+        }
+    }
+
+    /// Installer slice M1: `ApkLiteParseUtils.parseClusterPackageLite(ParseTypeImpl.forParsingWithoutPlatformCompat().reset(), new File(dir), 0)`, which reads every APK in `dir` through ApkAssets and refuses a split whose package or versionCode differs.
+    /// `forParsingWithoutPlatformCompat`: no IPlatformCompat service in this process; a deferred error's change counts as enabled by targetSdk alone (ParseTypeImpl). Flags 0: no certificates collected.
+    /// A ParseResult error -> `parse error <code>: <message>` (PackageManager INSTALL_PARSE_FAILED_*).
+    pub fn parse_cluster(&self, dir: &std::path::Path) -> Result<ClusterLite> {
+        let path = CString::new(dir.as_os_str().as_encoded_bytes()).context("dir with a NUL")?;
+        let file_class = self.find_class(c"java/io/File")?;
+        let file_init = self.method(file_class, c"<init>", c"(Ljava/lang/String;)V", false)?;
+        let parse_type = self.find_class(c"android/content/pm/parsing/result/ParseTypeImpl")?;
+        let for_parsing = self.method(
+            parse_type,
+            c"forParsingWithoutPlatformCompat",
+            c"()Landroid/content/pm/parsing/result/ParseTypeImpl;",
+            true,
+        )?;
+        let reset = self.method(
+            parse_type,
+            c"reset",
+            c"()Landroid/content/pm/parsing/result/ParseInput;",
+            false,
+        )?;
+        let utils = self.find_class(c"android/content/pm/parsing/ApkLiteParseUtils")?;
+        let parse = self.method(
+            utils,
+            c"parseClusterPackageLite",
+            c"(Landroid/content/pm/parsing/result/ParseInput;Ljava/io/File;I)Landroid/content/pm/parsing/result/ParseResult;",
+            true,
+        )?;
+        let result_class = self.find_class(c"android/content/pm/parsing/result/ParseResult")?;
+        let is_error = self.method(result_class, c"isError", c"()Z", false)?;
+        let error_code = self.method(result_class, c"getErrorCode", c"()I", false)?;
+        let error_message = self.method(
+            result_class,
+            c"getErrorMessage",
+            c"()Ljava/lang/String;",
+            false,
+        )?;
+        let get_result = self.method(result_class, c"getResult", c"()Ljava/lang/Object;", false)?;
+        let lite_class = self.find_class(c"android/content/pm/parsing/PackageLite")?;
+        let package_name = self.method(
+            lite_class,
+            c"getPackageName",
+            c"()Ljava/lang/String;",
+            false,
+        )?;
+        let version_code = self.method(lite_class, c"getLongVersionCode", c"()J", false)?;
+        let split_names = self.method(
+            lite_class,
+            c"getSplitNames",
+            c"()[Ljava/lang/String;",
+            false,
+        )?;
+        let none = core::ptr::null::<jni::jvalue>();
+        // SAFETY: JNI calls on the main thread's env with the classes and method IDs resolved above, each with the argument list its signature names; every result is checked (`check`, null) before use
+        unsafe {
+            let jpath = jni_call!(self.env, NewStringUTF, path.as_ptr());
+            self.check("NewStringUTF")?;
+            let file = jni_call!(
+                self.env,
+                NewObjectA,
+                file_class,
+                file_init,
+                [jni::jvalue { l: jpath }].as_ptr()
+            );
+            self.check("new File")?;
+            let input = jni_call!(
+                self.env,
+                CallStaticObjectMethodA,
+                parse_type,
+                for_parsing,
+                none
+            );
+            self.check("ParseTypeImpl.forParsingWithoutPlatformCompat")?;
+            let input = jni_call!(self.env, CallObjectMethodA, input, reset, none);
+            self.check("ParseTypeImpl.reset")?;
+            let args = [
+                jni::jvalue { l: input },
+                jni::jvalue { l: file },
+                jni::jvalue { i: 0 },
+            ];
+            let result = jni_call!(
+                self.env,
+                CallStaticObjectMethodA,
+                utils,
+                parse,
+                args.as_ptr()
+            );
+            self.check("ApkLiteParseUtils.parseClusterPackageLite")?;
+            ensure!(!result.is_null(), "parseClusterPackageLite returned null");
+            if jni_call!(self.env, CallBooleanMethodA, result, is_error, none) != 0 {
+                let code = jni_call!(self.env, CallIntMethodA, result, error_code, none);
+                let message = jni_call!(self.env, CallObjectMethodA, result, error_message, none);
+                self.check("ParseResult error")?;
+                bail!(
+                    "parse error {code}: {}",
+                    self.string(message)?.unwrap_or_default()
+                );
+            }
+            let lite = jni_call!(self.env, CallObjectMethodA, result, get_result, none);
+            self.check("ParseResult.getResult")?;
+            ensure!(!lite.is_null(), "ParseResult holds no PackageLite");
+            let name = jni_call!(self.env, CallObjectMethodA, lite, package_name, none);
+            self.check("PackageLite.getPackageName")?;
+            let package = self
+                .string(name)?
+                .context("PackageLite has no package name")?;
+            let version_code = jni_call!(self.env, CallLongMethodA, lite, version_code, none);
+            self.check("PackageLite.getLongVersionCode")?;
+            let names = jni_call!(self.env, CallObjectMethodA, lite, split_names, none);
+            self.check("PackageLite.getSplitNames")?;
+            let mut splits = Vec::new();
+            if !names.is_null() {
+                let len = jni_call!(self.env, GetArrayLength, names);
+                for i in 0..len {
+                    let s = jni_call!(self.env, GetObjectArrayElement, names, i);
+                    self.check("splitNames element")?;
+                    splits.push(self.string(s)?.context("null split name")?);
+                    jni_call!(self.env, DeleteLocalRef, s);
+                }
+            }
+            Ok(ClusterLite {
+                package,
+                version_code,
+                splits,
+            })
+        }
+    }
+
     /// The VM, for threads other than this one.
     #[cfg(feature = "converter")]
     pub fn handle(&self) -> VmHandle {
@@ -754,15 +955,36 @@ extern "C" fn on_crash(sig: c_int, info: *mut signal::siginfo_t, _context: *mut 
 /// `argv` holds `argc` NUL-terminated strings.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn atl_app_main(argc: c_int, argv: *const *const c_char) -> c_int {
-    let args = (0..usize::try_from(argc).unwrap_or(0))
+    // SAFETY: the caller's contract, passed on
+    let status = crate::main(unsafe { c_args(argc, argv) });
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    status
+}
+
+/// The installer's C entry (bin/atl-installer.rs loads it as atl-app-launcher loads `atl_app_main`), with the same contract.
+///
+/// # Safety
+/// `argv` holds `argc` NUL-terminated strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn atl_installer_main(argc: c_int, argv: *const *const c_char) -> c_int {
+    // SAFETY: the caller's contract, passed on
+    let status = crate::installer::main(unsafe { c_args(argc, argv) });
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    status
+}
+
+/// A C entry's argv as `OsString`s.
+///
+/// # Safety
+/// `argv` holds `argc` NUL-terminated strings.
+unsafe fn c_args(argc: c_int, argv: *const *const c_char) -> Vec<std::ffi::OsString> {
+    (0..usize::try_from(argc).unwrap_or(0))
         .map(|i| {
             // SAFETY: the caller's contract: argc strings, each NUL-terminated
             let a = unsafe { CStr::from_ptr(*argv.add(i)) };
             std::ffi::OsString::from_vec(a.to_bytes().to_vec())
         })
-        .collect();
-    let status = crate::main(args);
-    let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().flush();
-    status
+        .collect()
 }

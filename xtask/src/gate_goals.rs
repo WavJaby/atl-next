@@ -280,6 +280,8 @@ pub const GATES: &[(&str, GoalsOf)] = &[
             "android.hardware.graphics.allocator-V2-rust",
         ])
     }),
+    // ApkAssets and the parse classes: libandroid_runtime and framework.jar, both in HOST_ART
+    ("installer", || Goals::host(&HOST_ART)),
     ("instrument", instrument),
     ("native-load", native_load),
     ("nb-isa", || Goals::host(&HOST_ART)),

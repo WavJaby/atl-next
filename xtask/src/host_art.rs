@@ -229,26 +229,29 @@ impl HostArt {
             d8.arg("--lib").arg(lib);
         }
         exec(d8.arg("--output").arg(&dex).arg(&jar), "d8")?;
-        // the broker's step: the default property area, its variable printed as NAME=path
+        Ok(JavaFixture {
+            dex: dex.join("classes.dex"),
+            area: self.property_area(&work.join("properties"))?,
+            work: work.to_path_buf(),
+        })
+    }
+
+    /// The broker's step: the default property area written into `dir`, as (variable, path) the way atl-property-service prints it (NAME=path).
+    pub fn property_area(&self, dir: &Path) -> Result<(String, String)> {
         let printed = output(
             Command::new(&self.property_service)
                 .arg("--build-prop")
                 .arg(&self.build_prop)
                 .arg("--out")
-                .arg(work.join("properties"))
+                .arg(dir)
                 .args(self.linear_tier.iter().flat_map(|t| ["--linear-tier", t])),
             "atl-property-service",
         )?;
-        let area = printed
+        printed
             .trim()
             .split_once('=')
             .map(|(n, v)| (n.to_owned(), v.to_owned()))
-            .with_context(|| format!("atl-property-service printed {printed:?}, not NAME=path"))?;
-        Ok(JavaFixture {
-            dex: dex.join("classes.dex"),
-            area,
-            work: work.to_path_buf(),
-        })
+            .with_context(|| format!("atl-property-service printed {printed:?}, not NAME=path"))
     }
 
     /// `class args` from `fixture`'s dex, started by the launcher with the property-area variable set to `area` and the extra VM options `vm`.
@@ -260,10 +263,14 @@ impl HostArt {
         class: &str,
         args: &[String],
     ) -> Result<ArtRun> {
-        let mut cmd = self.command(fixture, area, vm, class, args);
+        self.run(&mut self.command(fixture, area, vm, class, args))
+    }
+
+    /// Runs `cmd` (an `art_command`) to its end.
+    pub fn run(&self, cmd: &mut Command) -> Result<ArtRun> {
         let out = cmd
             .output()
-            .with_context(|| format!("running {}", self.launcher.display()))?;
+            .with_context(|| format!("running {:?}", cmd.get_program()))?;
         Ok(self.result(&format!("{cmd:?}"), out))
     }
 
@@ -276,24 +283,34 @@ impl HostArt {
         class: &str,
         args: &[String],
     ) -> Command {
-        let boot = join_paths(&self.boot);
-        let mut cmd = Command::new(&self.launcher);
-        cmd.arg(format!("-Xbootclasspath:{boot}"))
-            .arg(format!("-Xbootclasspath-locations:{boot}"))
-            .arg("-Xnoimage-dex2oat")
-            .args(vm)
+        let mut cmd = self.art_command(
+            &self.launcher,
+            &fixture.work.join("data"),
+            (&fixture.area.0, area),
+        );
+        cmd.args(vm)
             .arg("-cp")
             .arg(&fixture.dex)
             .arg(class)
-            .args(args)
+            .args(args);
+        cmd
+    }
+
+    /// `exe` (a loader of the launcher package: atl-app-launcher, atl-installer) on this ART: the boot classpath options first (the caller appends the rest), the runtime's environment, `area` = (variable, path) of the property area, `data` = ANDROID_DATA.
+    pub fn art_command(&self, exe: &Path, data: &Path, area: (&str, &str)) -> Command {
+        let boot = join_paths(&self.boot);
+        let mut cmd = Command::new(exe);
+        cmd.arg(format!("-Xbootclasspath:{boot}"))
+            .arg(format!("-Xbootclasspath-locations:{boot}"))
+            .arg("-Xnoimage-dex2oat")
             .env("ANDROID_ROOT", &self.art)
             .env("ANDROID_ART_ROOT", self.art.join("com.android.art"))
             .env("ANDROID_I18N_ROOT", self.art.join("com.android.i18n"))
             .env("ANDROID_TZDATA_ROOT", self.art.join("com.android.tzdata"))
-            .env("ANDROID_DATA", fixture.work.join("data"))
+            .env("ANDROID_DATA", data)
             .env("LD_BIND_NOW", "1")
             .env("LD_LIBRARY_PATH", &self.lib_path)
-            .env(&fixture.area.0, area)
+            .env(area.0, area.1)
             // liblog's minimum priority INFO: libbase InitLogging (ART's runtime start) reads it into __android_log_set_minimum_priority, so liblog itself refuses VERBOSE
             .env("ANDROID_LOG_TAGS", "*:i")
             .stdin(std::process::Stdio::null())

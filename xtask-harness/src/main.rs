@@ -31,6 +31,7 @@ mod gl_proxies;
 mod gl_scene;
 mod gles2_fixture;
 mod gralloc;
+mod installer;
 mod instrument;
 mod jni_fixture;
 mod manifest;
@@ -127,6 +128,8 @@ enum Test {
     NativeLoad(native_load::Args),
     /// ART's `-Xnative-bridge-isa:<isa>` (patches/aosp/art 0004) under atl-app-launcher with the bridge loaded: `arm64` with no arm64 engine staged reaches the bridge's `initialize`, which refuses naming it; an unknown ISA is refused at parse. `--break delivery|parse` must each turn its check red. Logs: stdout.
     NbIsa(nb_isa::Args),
+    /// The installer process (atl-installer, plan item 4b M1): AOSP's ApkLiteParseUtils over a package dir on host ART; package, versionCode and split names equal `aapt2 dump badging` (altos-odyssey's base + split, fossify-notes); a split with another versionCode or package is refused by AOSP. Prints the VM start and parse times. `--break drop-split` must turn the split check red.
+    Installer(installer::Args),
     /// AOSP servicemanager + `service list` / `check` through atl-binderd on libbinder's driver seam; binderd's counters must show the expected driver paths firing.
     Binder(binder::Args),
     /// The app sandbox (plan Q5): a probe as an app process (uid 10123, the broker's App profile) reaches neither the real $HOME nor anything outside its data dir, and writes its own. Its deliberate break is by hand (sandbox.rs).
@@ -265,6 +268,9 @@ fn main() -> Result<ExitCode> {
         Command::Test {
             test: Test::NbIsa(args),
         } => nb_isa::run(&root, &args),
+        Command::Test {
+            test: Test::Installer(args),
+        } => installer::run(&root, &args),
         Command::Test {
             test: Test::Parcel(args),
         } => parcel::run(&root, &args),
@@ -405,6 +411,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
         Command::Test { test } => match test {
             Test::NativeLoad(_) => "native-load",
             Test::NbIsa(_) => "nb-isa",
+            Test::Installer(_) => "installer",
             Test::Parcel(_) => "parcel",
             Test::Provider(_) => "provider",
             Test::Compositor(_) => "compositor",

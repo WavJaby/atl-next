@@ -27,6 +27,7 @@
 mod args;
 #[allow(unsafe_code)]
 mod ffi;
+mod installer;
 mod log;
 mod logdw;
 #[allow(unsafe_code)]
@@ -205,8 +206,8 @@ fn native_bridge_options(property: Option<String>, isa: Option<&str>) -> Vec<std
     }
 }
 
-fn run(argv: Vec<std::ffi::OsString>) -> Result<i32> {
-    let launch = args::parse(argv).map_err(|e| anyhow!(e))?;
+/// Steps 0 and 1: the signal setup bionic makes, ART's functions, and the refusal to start without a property area. Every process this library runs (app, installer) starts so.
+fn load_runtime() -> Result<ffi::Runtime> {
     ffi::install_signal_stack()?;
     ffi::install_crash_handler()?;
     let rt = ffi::Runtime::load()?;
@@ -216,6 +217,12 @@ fn run(argv: Vec<std::ffi::OsString>) -> Result<i32> {
             atl_bionic::AREA_ENV
         );
     }
+    Ok(rt)
+}
+
+fn run(argv: Vec<std::ffi::OsString>) -> Result<i32> {
+    let launch = args::parse(argv).map_err(|e| anyhow!(e))?;
+    let rt = load_runtime()?;
     install_service_view()?;
     serve_media_services(
         launch.no_audio_service,

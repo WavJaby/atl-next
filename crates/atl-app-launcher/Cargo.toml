@@ -25,6 +25,12 @@ crate-type = ["cdylib"]
 name = "atl-app-launcher"
 required-features = ["converter"]
 
+# the installer (plan item 4b): the same loader with the runtime's installer entry, AOSP's package parsing in a VM of its own
+[[bin]]
+name = "atl-installer"
+path = "src/bin/atl-installer.rs"
+required-features = ["converter"]
+
 [features]
 converter = ["atl-audioflinger/converter", "atl-codec-store/converter", "atl-composer/converter","atl-media-extractors/converter", "atl-resource-manager/converter", "atl-media-player/converter", "atl-service-view/converter"]
 

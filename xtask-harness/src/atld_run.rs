@@ -465,7 +465,7 @@ fn sdk_level(build_prop: &Path) -> Result<String> {
 /// What building an APK needs, and nothing of the runtime: aapt2 and d8 of the Java pipeline, the prebuilt JDK, the SDK's android.jar of the platform's API level. The static fixture gates use it without a staged ART.
 pub struct ApkTools {
     pub aapt2: PathBuf,
-    android_jar: PathBuf,
+    pub android_jar: PathBuf,
     pub jdk: PathBuf,
     d8: PathBuf,
 }
