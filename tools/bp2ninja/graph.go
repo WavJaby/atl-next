@@ -4,6 +4,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -128,6 +129,64 @@ func (n *Node) stepDeps() []*Node {
 	return deps
 }
 
+// checkMachines: every edge of the graph ends on the machine Soong's variation rule gives it (Config.machine). An edge whose consumer executes or loads the output during the build (generator and genrule tools, rustc proc macros, Graph.tools) ends on the build machine (BuildOSTarget);
+// every other edge (linked, embedded, header, runtime, generated-source and source-provider dependencies) stays on its consumer's machine. A miss fails here instead of as an Exec format error or a wrong-ELF link at ninja time.
+func (g *Graph) checkMachines() error {
+	var bad []string
+	check := func(from string, d *Node, want, edge string) {
+		if d == nil {
+			return
+		}
+		if got := g.cfg.machine(d.side); got != want {
+			bad = append(bad, fmt.Sprintf("%s -> %s (%s): on the %s machine, want %s", from, d.dir(), edge, got, want))
+		}
+	}
+	build := g.cfg.machine(Build)
+	for _, n := range g.order {
+		own := g.cfg.machine(n.side)
+		for _, d := range slices.Concat(n.deps.whole, n.deps.static, n.deps.shared, n.deps.headers, n.deps.runtime, n.reexport, n.objSrcs, n.objDeps, n.crtBegin, n.crtEnd) {
+			check(n.dir(), d, own, "link")
+		}
+		for _, d := range n.deps.crates {
+			if d.kind == ProcMacro {
+				check(n.dir(), d, build, "proc macro")
+			} else {
+				check(n.dir(), d, own, "crate")
+			}
+		}
+		if n.rust != nil {
+			for _, d := range n.rust.providers {
+				check(n.dir(), d, own, "source provider")
+			}
+		}
+		for gn := range n.usedGens {
+			check(n.dir(), gn, own, "generated sources")
+		}
+		for _, e := range n.edges {
+			for _, t := range e.tools {
+				check(n.dir(), t.node, build, "tool "+t.v)
+			}
+		}
+		if n.rule != nil {
+			for _, t := range n.rule.tools {
+				check(n.dir(), t, build, "genrule tool")
+			}
+			for _, o := range n.rule.objs {
+				check(n.dir(), o, own, "genrule object")
+			}
+		}
+	}
+	for _, name := range sortedKeys(g.tools) {
+		check("tool "+name, g.tools[name], build, "executed")
+	}
+	if len(bad) == 0 {
+		return nil
+	}
+	slices.Sort(bad)
+	bad = slices.Compact(bad)
+	return fmt.Errorf("%d edges cross machines:\n  %s", len(bad), strings.Join(bad, "\n  "))
+}
+
 // noneExports: the tree directories (sorted, never nil) an omitted module's headers would be exported from, header libraries it re-exports followed.
 // It is not built: what its lookups miss is no problem of the build, so problems and missing references are restored.
 func (g *Graph) noneExports(name string, side Side) []string {
@@ -205,8 +264,10 @@ func (g *Graph) graphJSON(goals []*Node, linkDriver, cc string) ([]byte, error) 
 		dir, name, _ := strings.Cut(e, " ")
 		f.Dropped[dir] = append(f.Dropped[dir], name)
 		side := Device
-		if strings.HasPrefix(dir, Host.String()+"/") {
-			side = Host
+		for _, s := range []Side{Host, Build} {
+			if strings.HasPrefix(dir, s.String()+"/") {
+				side = s
+			}
 		}
 		if k := side.String() + "/" + name; f.NoneExports[k] == nil {
 			f.NoneExports[k] = g.noneExports(name, side)

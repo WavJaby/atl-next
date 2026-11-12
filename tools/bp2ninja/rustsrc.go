@@ -108,7 +108,7 @@ func (rustProtobuf) gen(g *Graph, n *Node, fail func(string, ...any)) rustSource
 			}
 		}
 	}
-	tools := []edgeTool{{"aprotoc", g.hostTool("aprotoc", n)}, {"plugin", g.hostTool(rustProtobufPlugin, n)}}
+	tools := []edgeTool{{"aprotoc", g.buildTool("aprotoc", n)}, {"plugin", g.buildTool(rustProtobufPlugin, n)}}
 	src := rustSource{outs: []string{filepath.Join(dir, "mod_"+stem+".rs")}}
 	var names []string
 	for _, s := range p.strs("protos") {
@@ -224,7 +224,7 @@ func (rustBindgen) gen(g *Graph, n *Node, fail func(string, ...any)) rustSource 
 	var waits []string
 	genClosure(n, map[*Node]bool{}, &waits)
 	out := filepath.Join(g.genDir(n, ""), stem+".rs")
-	n.edges = append(n.edges, genEdge{rule: "bindgen", outs: []string{out}, in: g.abs(filepath.Join(m.Dir, wrapper)), tools: []edgeTool{{"bindgen", g.hostTool(rustBindgenTool, n)}},
+	n.edges = append(n.edges, genEdge{rule: "bindgen", outs: []string{out}, in: g.abs(filepath.Join(m.Dir, wrapper)), tools: []edgeTool{{"bindgen", g.buildTool(rustBindgenTool, n)}},
 		implicit: flagFiles, order: waits, vars: [][2]string{
 			{"flags", shellQuote(moduleFlags(p, "bindgen_flags"))}, {"flagfiles", shellQuote(flagFiles)}, {"cflags", shellQuote(cflags)},
 		}})
@@ -248,7 +248,7 @@ func (rustAidl) deps(n *Node) ([]string, []string) {
 func (rustAidl) gen(g *Graph, n *Node, fail func(string, ...any)) rustSource {
 	s := n.mod.aidl
 	dir := g.genDir(n, "")
-	tools := []edgeTool{{"aidl", g.hostTool("aidl", n)}}
+	tools := []edgeTool{{"aidl", g.buildTool("aidl", n)}}
 	src := rustSource{outs: []string{filepath.Join(dir, n.props.str("source_stem")+".rs")}}
 	root := &aidlRustMod{nested: map[string]*aidlRustMod{}}
 	for _, f := range s.srcs {

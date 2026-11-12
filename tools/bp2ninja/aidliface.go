@@ -286,7 +286,7 @@ func (g *Graph) synthAidl(ref string, side Side) *Module {
 		g.problem("%s: backend.%s.enabled is false in %s", ref, lang, name)
 		return nil
 	}
-	if side == Host && !p.boolean("host_supported", false) {
+	if !side.android() && !p.boolean("host_supported", false) {
 		g.problem("%s: aidl_interface %s has no host variant (host_supported unset)", ref, name)
 		return nil
 	}
@@ -585,7 +585,7 @@ func (g *Graph) aidlPreprocessed(i *aidlIface, ver string) string {
 		flags = append(flags, "-I"+g.abs(d))
 	}
 	tool := filepath.Join(g.out, "missing-tool", "aidl")
-	if t := g.hostTool("aidl", &Node{mod: i.mod}); t != nil {
+	if t := g.buildTool("aidl", &Node{mod: i.mod}); t != nil {
 		tool = g.nodeOut(t)
 	}
 	var ins []string

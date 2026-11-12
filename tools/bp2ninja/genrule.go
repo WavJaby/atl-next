@@ -170,8 +170,13 @@ func (g *Graph) buildGenRule(n *Node) *genRule {
 	}
 	if g.baseType(m.Type) == "cc_genrule" {
 		// cc/genrule.go genruleCmdModifier: shell variables, not exported ones
-		osName := map[Side]string{Device: "android", Host: "linux_glibc"}[n.side]
-		r.cmd = fmt.Sprintf("CC_ARCH=%s CC_NATIVE_BRIDGE= CC_MULTILIB=%s CC_OS=%s && %s", g.cfg.Arch, g.cfg.Multilib(), osName, r.cmd)
+		// the variant's arch and OS (ctx.Arch(), ctx.Os()): a build-side genrule is the build machine's
+		osName := map[Side]string{Device: "android", Host: "linux_glibc", Build: "linux_glibc"}[n.side]
+		arch, bits := g.cfg.Arch, g.cfg.PointerBits
+		if n.side == Build {
+			arch, bits = g.cfg.archOf(Build)
+		}
+		r.cmd = fmt.Sprintf("CC_ARCH=%s CC_NATIVE_BRIDGE= CC_MULTILIB=lib%d CC_OS=%s && %s", arch, bits, osName, r.cmd)
 	}
 	for _, unsupported := range []string{"device_first_srcs", "device_common_srcs", "common_os_srcs", "dir_srcs"} {
 		if len(p.strs(unsupported)) > 0 {
@@ -265,7 +270,7 @@ func (g *Graph) buildGenRule(n *Node) *genRule {
 	return r
 }
 
-// genTool resolves one `tools` entry (a host module) into a location label.
+// genTool resolves one `tools` entry (a host module, built for the build machine: toolSide) into a location label.
 func (g *Graph) genTool(n *Node, r *genRule, ref string, fail func(string, ...any)) genLabel {
 	l := genLabel{name: ref}
 	bad := func(format string, args ...any) genLabel {
@@ -273,7 +278,7 @@ func (g *Graph) genTool(n *Node, r *genRule, ref string, fail func(string, ...an
 		fail("%s", l.err)
 		return l
 	}
-	tm := g.lookup(ref, Host)
+	tm := g.lookup(ref, g.cfg.toolSide())
 	if tm == nil {
 		g.notFound(ref)
 		return bad("host tool %s not found", ref)
@@ -313,7 +318,7 @@ func (g *Graph) genTool(n *Node, r *genRule, ref string, fail func(string, ...an
 	if k, ok := kindOf(bt, Binary); !ok || k != Binary {
 		return bad("tool %s is a %s (unsupported)", ref, tm.Type)
 	}
-	tn := g.node(ref, Host, Binary, n.name)
+	tn := g.node(ref, g.cfg.toolSide(), Binary, n.name)
 	if tn == nil {
 		return bad("tool %s unavailable", ref)
 	}
@@ -333,12 +338,12 @@ type toolFile struct{ src, rel string }
 // or not at all, so they are skipped. `data` is no packaging spec of a cc_binary_host (installed with tests only).
 func (g *Graph) genToolData(r *genRule, tm *Module, fail func(string, ...any)) {
 	skipNone := func(string) bool { return false }
-	for _, req := range g.flatten(tm, Host, Binary).strs("required") {
-		rm := g.lookupWith(req, Host, skipNone)
+	for _, req := range g.flatten(tm, g.cfg.toolSide(), Binary).strs("required") {
+		rm := g.lookupWith(req, g.cfg.toolSide(), skipNone)
 		if rm == nil || g.baseType(rm.Type) != "prebuilt_etc_host" {
 			continue
 		}
-		p := g.flatten(rm, Host, Gen)
+		p := g.flatten(rm, g.cfg.toolSide(), Gen)
 		srcs := p.strs("srcs")
 		if s := p.str("src"); s != "" {
 			srcs = append(srcs, s)
@@ -349,7 +354,7 @@ func (g *Graph) genToolData(r *genRule, tm *Module, fail func(string, ...any)) {
 			continue
 		}
 		for _, s := range srcs {
-			files, ok := g.resolveSrc(rm.Dir, Host, s, rm.Name)
+			files, ok := g.resolveSrc(rm.Dir, g.cfg.toolSide(), s, rm.Name)
 			if !ok {
 				fail("%s: src %s unresolved", rm.Name, s)
 			}
@@ -391,7 +396,7 @@ func sandboxPrelude(sb string, data []toolFile) string {
 // binary.go getPyMainFile: main defaults to <name>.py). Soong packages the others with their library tree, which is not rebuilt here. why
 // says what disqualifies the module.
 func pythonTool(g *Graph, m *Module) (files []string, why string) {
-	p := g.flatten(m, Host, Gen)
+	p := g.flatten(m, g.cfg.toolSide(), Gen)
 	if len(p.strs("data")) > 0 || p.str("pkg_path") != "" {
 		return nil, "with data or pkg_path"
 	}
@@ -404,11 +409,11 @@ func pythonTool(g *Graph, m *Module) (files []string, why string) {
 				continue
 			}
 			seen[l] = true
-			lm := g.lookup(l, Host)
+			lm := g.lookup(l, g.cfg.toolSide())
 			if lm == nil || g.baseType(lm.Type) != "python_library_host" {
 				return "with lib " + l + " that is no python_library_host"
 			}
-			lp := g.flatten(lm, Host, Gen)
+			lp := g.flatten(lm, g.cfg.toolSide(), Gen)
 			if lp.str("pkg_path") != "" || len(lp.strs("data")) > 0 {
 				return "with lib " + l + " that has data or pkg_path"
 			}

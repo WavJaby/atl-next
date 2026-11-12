@@ -120,8 +120,13 @@ fn flag_or_row(flag: &Option<String>, root: &Path, row: &str) -> Result<String> 
     }
 }
 
-/// The converter's flags for a cross host (`cross`: arches::cross_target): the target's clang triple, its fetched sysroot, its isa and the libc++ headers in that sysroot (atl_layout::libcxx_dir, the one derivation). Empty for the build machine, whose compiler already targets it.
-fn cross_args(root: &Path, cross: Option<&arches::CrossTarget>) -> Result<Vec<String>> {
+/// The converter's flags for a cross host (`cross`: arches::cross_target): the target's clang triple, its fetched sysroot, its isa and the libc++ headers in that sysroot (atl_layout::libcxx_dir, the one derivation),
+/// and the build machine's row and pointer width (`build`: arches::build_machine), which the converter's build side (tools a build rule executes or loads) is compiled for. Empty for the build machine, whose compiler already targets it.
+fn cross_args(
+    root: &Path,
+    cross: Option<&arches::CrossTarget>,
+    (build_name, build): (&str, &arches::Arch),
+) -> Result<Vec<String>> {
     let Some(c) = cross else {
         return Ok(Vec::new());
     };
@@ -136,6 +141,10 @@ fn cross_args(root: &Path, cross: Option<&arches::CrossTarget>) -> Result<Vec<St
         c.isa.clone(),
         "-host-libcxx".to_owned(),
         libcxx.display().to_string(),
+        "-build-arch".to_owned(),
+        build_name.to_owned(),
+        "-build-pointer-bits".to_owned(),
+        build.pointer_bits.to_string(),
     ])
 }
 
@@ -163,7 +172,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let (build_name, build) = arches::build_machine(root, &arches)?;
     let prebuilt_os = prebuilt_os(build_name, build)?;
     let cross = arches::cross_target(&args.host, host, build_name)?;
-    let cross_flags = cross_args(root, cross.as_ref())?;
+    let cross_flags = cross_args(root, cross.as_ref(), (build_name, build))?;
     // a cross host's cargo target (rust std, sysroot, linker): checked before any build starts
     let cross_cargo = cross
         .as_ref()

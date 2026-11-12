@@ -160,7 +160,7 @@ func graphForCfg(t *testing.T, cfg Config, files map[string]string) *Graph {
 	if err != nil {
 		t.Fatal(err)
 	}
-	g := &Graph{tree: tree, out: out, cfg: cfg, libcxx: standInLibcxx, nodes: map[key]*Node{}, baseTypes: map[string]string{}, mods: map[Side]map[string][]*Module{}}
+	g := &Graph{tree: tree, out: out, cfg: cfg, libcxx: standInLibcxx, buildLibcxx: standInLibcxx, nodes: map[key]*Node{}, baseTypes: map[string]string{}, mods: map[Side]map[string][]*Module{}}
 	for _, side := range cfg.sides() {
 		ecfg := cfg
 		ecfg.Arch, ecfg.PointerBits = cfg.archOf(side)

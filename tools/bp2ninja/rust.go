@@ -286,9 +286,9 @@ func (g *Graph) rustNode(n *Node) {
 	for _, ref := range slices.Concat(p.strs("rustlibs"), p.strs("rlibs"), spCrates) {
 		crate(ref, n.side, Rlib)
 	}
-	// proc macros run in the compiler: host crates whatever the side
+	// proc macros run in the compiler (rustc dlopens them): build-machine crates whatever the side
 	for _, ref := range slices.Concat(p.strs("proc_macros"), spMacros) {
-		crate(ref, Host, ProcMacro)
+		crate(ref, g.cfg.toolSide(), ProcMacro)
 	}
 	n.deps.crates = uniqueNodes(n.deps.crates)
 	if sp != nil {

@@ -23,12 +23,23 @@ func TestHostCrossFlags(t *testing.T) {
 	}
 }
 
+// riscvOnX86: the riscv64 host built on an x86_64 build machine (xtask native: arches::build_machine's row and pointer_bits).
+var riscvOnX86 = Config{Arch: "riscv64", PointerBits: 64, HostCross: riscvCross, BuildArch: "x86_64", BuildBits: 64}
+
 // arm64 has no (linux_glibc, arm64) toolchain in Soong, as a riscv64 host has none (TestToolchainYasm): its host side takes the cross flags ahead of the common ones and no x86 toolchain flag.
-// Break: a host side that takes the x86 toolchain (-m64, -march=x86-64, --gcc-toolchain) or loses HostLink fails here.
+// The build side is the build machine's linux_glibc toolchain without cross flags: what the x86_64 host side of a plain x86_64 build gets.
+// Break: a host side that takes the x86 toolchain (-m64, -march=x86-64, --gcc-toolchain) or loses HostLink, or a build side with the cross target, fails here.
 func TestHostCrossHostSide(t *testing.T) {
 	arm64 := DeviceArch{Variant: "armv8-a"}
 	plain := mustFlags(t, Config{Arch: "arm64", PointerBits: 64, ArchVariant: arm64.Variant}, arm64)
-	cross := mustFlags(t, Config{Arch: "arm64", PointerBits: 64, ArchVariant: arm64.Variant, HostCross: riscvCross}, arm64)
+	cross := mustFlags(t, Config{Arch: "arm64", PointerBits: 64, ArchVariant: arm64.Variant, HostCross: riscvCross, BuildArch: "x86_64", BuildBits: 64}, arm64)
+	x86 := mustFlags(t, Config{Arch: "x86_64", PointerBits: 64}, DeviceArch{})
+	if cross.NoToolchain[Build] != "" || !slices.Equal(cross.Head[Build], x86.Head[Host]) || !slices.Equal(cross.Tail[Build], x86.Tail[Host]) || !slices.Equal(cross.Cpp[Build], x86.Cpp[Host]) {
+		t.Errorf("build head %q tail %q, want the x86_64 host side's %q %q", cross.Head[Build], cross.Tail[Build], x86.Head[Host], x86.Tail[Host])
+	}
+	if _, ok := plain.Head[Build]; ok {
+		t.Error("a plain build has a build side")
+	}
 	if plain.NoToolchain[Host] == "" || cross.NoToolchain[Host] == "" {
 		t.Fatalf("arm64 host has a Soong toolchain: %q", plain.NoToolchain[Host])
 	}
@@ -60,6 +71,55 @@ cc_library { name: "optout", device_supported: false }`})
 	for goal, want := range map[string]Side{"tool": Host, "lib": Host, "optout": Host} {
 		if got := g.ccGoalSide(goal); got != want {
 			t.Errorf("%s: side %v, want %v", goal, got, want)
+		}
+	}
+}
+
+// The tool rule (Soong's BuildOSTarget for a tools dependency): a genrule's tool, its link closure and a generator tool are build-side nodes on a cross host, the consumer and its own libraries stay host-side; on the build machine's own host they are one host node.
+// Break: a tool edge left on Host puts an ATL-host binary where the build executes it (Exec format error); checkMachines then fails, which the hand-made crossing edge at the end shows.
+func TestCrossToolEdges(t *testing.T) {
+	files := map[string]string{"p/Android.bp": `
+cc_binary_host { name: "tool", srcs: ["tool.cc"], static_libs: ["libt"] }
+cc_library_host_static { name: "libt", srcs: ["t.cc"] }
+genrule { name: "gen", tools: ["tool"], cmd: "$(location tool) > $(out)", out: ["g.h"] }
+cc_library { name: "lib", srcs: ["a.cc"], generated_headers: ["gen"], static_libs: ["libu"], host_supported: true }
+cc_library_static { name: "libu", srcs: ["u.cc"], host_supported: true }
+`, "p/tool.cc": "", "p/t.cc": "", "p/a.cc": "", "p/u.cc": ""}
+	for _, c := range []struct {
+		name       string
+		cfg        Config
+		tool, prod Side
+	}{
+		{"x86_64 on x86_64", Config{Arch: "x86_64", PointerBits: 64}, Host, Host},
+		{"riscv64 on x86_64", riscvOnX86, Build, Host},
+	} {
+		g := graphForCfg(t, c.cfg, files)
+		lib := g.node("lib", Host, Shared, "test")
+		if lib == nil {
+			t.Fatalf("%s: lib not built: %v", c.name, g.problems)
+		}
+		gen := g.nodes[key{"gen", c.prod, Gen}]
+		if gen == nil || len(gen.rule.tools) != 1 {
+			t.Fatalf("%s: genrule gen on %v with tools %v", c.name, c.prod, gen)
+		}
+		tool := gen.rule.tools[0]
+		if tool.side != c.tool || len(tool.deps.static) != 1 || tool.deps.static[0].side != c.tool {
+			t.Errorf("%s: tool on %v (static %v), want %v", c.name, tool.side, tool.deps.static, c.tool)
+		}
+		if lib.deps.static[0].side != c.prod {
+			t.Errorf("%s: libu on %v, want %v", c.name, lib.deps.static[0].side, c.prod)
+		}
+		if gt := g.buildTool("tool", lib); gt != tool {
+			t.Errorf("%s: generator tool %v is not the genrule's %v", c.name, gt, tool)
+		}
+		if err := g.checkMachines(); err != nil {
+			t.Errorf("%s: %v", c.name, err)
+		}
+		if c.tool == Build {
+			tool.deps.static = append(tool.deps.static, lib.deps.static[0])
+			if err := g.checkMachines(); err == nil || !strings.Contains(err.Error(), "build/tool -> host/libu (link): on the host machine, want build") {
+				t.Errorf("%s: a build tool linking a host library: %v", c.name, err)
+			}
 		}
 	}
 }

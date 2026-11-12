@@ -85,7 +85,7 @@ func (g *Graph) synthSysprop(ref string, side Side) *Module {
 		g.problem("%s: sysprop_library %s must specify srcs", ref, name)
 		return nil
 	}
-	if side == Host && !p.boolean("host_supported", false) {
+	if !side.android() && !p.boolean("host_supported", false) {
 		g.problem("%s: sysprop_library %s has no host variant (host_supported unset)", ref, name)
 		return nil
 	}

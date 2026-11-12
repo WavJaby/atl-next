@@ -120,7 +120,7 @@ func (g *Graph) genSources(n *Node, files []srcFile) {
 			continue
 		}
 		if sg.tool != "" {
-			r.edge.tools = []edgeTool{{sg.tool, g.hostTool(sg.tool, n)}}
+			r.edge.tools = []edgeTool{{sg.tool, g.buildTool(sg.tool, n)}}
 		}
 		g.addGen(n, r, sg.export != nil && sg.export(n))
 		libs = append(libs, r.libs...)
@@ -163,12 +163,12 @@ func appendMissing(list, add []string) []string {
 	return list
 }
 
-// hostTool: the host cc binary a generator runs, built once per graph (nil when the module is missing: the problem is recorded then).
-func (g *Graph) hostTool(name string, n *Node) *Node {
+// buildTool: the host cc binary a generator runs, built for the build machine (toolSide) once per graph (nil when the module is missing: the problem is recorded then).
+func (g *Graph) buildTool(name string, n *Node) *Node {
 	if t, ok := g.tools[name]; ok {
 		return t
 	}
-	t := g.node(name, Host, Binary, n.mod.Name+" (sources for "+name+")")
+	t := g.node(name, g.cfg.toolSide(), Binary, n.mod.Name+" (sources for "+name+")")
 	if g.tools == nil {
 		g.tools = map[string]*Node{}
 	}

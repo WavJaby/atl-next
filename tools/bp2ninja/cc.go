@@ -14,7 +14,8 @@ import (
 	"strings"
 )
 
-// Side is which source set a module is built from, and for which C library. device = the module's android properties built as a Linux glibc binary (runtime libraries of an app process); host = its host properties (build tools such as aidl that run on the build machine); native bridge = android properties + target.native_bridge, built against bionic for a guest arch.
+// Side is which source set a module is built from, for which machine and C library. device = the module's android properties built as a Linux glibc binary for the ATL host (runtime libraries of an app process); host = its host properties built for the ATL host;
+// build = its host properties built for the build machine (Soong's BuildOSTarget variation: tools a build rule executes or loads), a side of its own only on a cross host (toolSide); native bridge = android properties + target.native_bridge, built against bionic for a guest arch.
 // Comparable: per-side state is a map keyed by Side, iterated in Graph.sides order (never map order: emit must be deterministic).
 type Side struct {
 	kind sideKind
@@ -27,11 +28,13 @@ const (
 	deviceSide sideKind = iota
 	hostSide
 	nativeBridgeSide
+	buildSide
 )
 
 var (
 	Device = Side{kind: deviceSide}
 	Host   = Side{kind: hostSide}
+	Build  = Side{kind: buildSide}
 )
 
 // NativeBridge: the native bridge side for guest arch.
@@ -43,15 +46,36 @@ func (s Side) String() string {
 		return "device"
 	case hostSide:
 		return "host"
+	case buildSide:
+		return "build"
 	}
 	return "nb/" + s.arch
 }
 
-// android: the side evaluates the module's android properties (device and native bridge).
-func (s Side) android() bool { return s.kind != hostSide }
+// android: the side evaluates the module's android properties (device and native bridge); host and build evaluate its host ones.
+func (s Side) android() bool { return s.kind == deviceSide || s.kind == nativeBridgeSide }
 
-// glibc: the side links against the build machine's glibc (device and host); the native bridge side links bionic.
+// glibc: the side links against glibc (device, host: the ATL host's; build: the build machine's); the native bridge side links bionic.
 func (s Side) glibc() bool { return s.kind != nativeBridgeSide }
+
+// toolSide: the side of a node whose output a build rule executes or loads (genrule tools, generator tools, rustc proc macros): Soong's BuildOSTarget. Host when the ATL host is the build machine, so one node serves both and the graph is the plain one.
+func (c Config) toolSide() Side {
+	if c.HostCross.set() {
+		return Build
+	}
+	return Host
+}
+
+// machine: the machine a side's code runs on: "build", "host" (the ATL host, a cross host only) or the native bridge guest. The graph check (checkMachines) compares it across edges.
+func (c Config) machine(s Side) string {
+	switch {
+	case s.kind == nativeBridgeSide:
+		return s.String()
+	case s.kind == buildSide || !c.HostCross.set():
+		return "build"
+	}
+	return "host"
+}
 
 // evalOS: the Soong OS the side's modules are evaluated for (select(os(), …), target blocks).
 func (s Side) evalOS() string {
@@ -64,19 +88,25 @@ func (s Side) evalOS() string {
 // nbGoalPrefix: a goal naming a module's native bridge variant.
 const nbGoalPrefix = "nb:"
 
-// sides: the sides a run evaluates, in emit order: device, host, then the native bridge guest if -native-bridge names one.
+// sides: the sides a run evaluates, in emit order: device, host, build on a cross host, then the native bridge guest if -native-bridge names one.
 func (c Config) sides() []Side {
 	s := []Side{Device, Host}
+	if c.HostCross.set() {
+		s = append(s, Build)
+	}
 	if c.NativeBridge != "" {
 		s = append(s, NativeBridge(c.NativeBridge))
 	}
 	return s
 }
 
-// archOf: the Soong arch and pointer width a side's modules are built for: the host arch, or the native bridge guest's.
+// archOf: the Soong arch and pointer width a side's modules are built for: the host arch, the build machine's, or the native bridge guest's.
 func (c Config) archOf(s Side) (string, int) {
-	if s.kind == nativeBridgeSide {
+	switch s.kind {
+	case nativeBridgeSide:
 		return s.arch, c.NativeBridgeBits
+	case buildSide:
+		return c.BuildArch, c.BuildBits
 	}
 	return c.Arch, c.PointerBits
 }
@@ -192,8 +222,8 @@ type Graph struct {
 	soong     SoongConfig
 	// link outputs under <out>/device, in emit order: the inputs of the licence gate edge (licence.go)
 	deviceLinks []string
-	// the libc++ headers of the stl provider: -isystem of every libc++ C++ compile (stl.go libcxxProvider)
-	libcxx string
+	// the libc++ headers of the stl provider: -isystem of every libc++ C++ compile (stl.go libcxxProvider); buildLibcxx the build side's (the build machine's own, = libcxx unless cross)
+	libcxx, buildLibcxx string
 	// bionic sides: compiler-rt's public headers (sanitizer/, xray/), which prebuilts/clang's resource dir carries and the distro clang's lacks (-clang-rt-include)
 	rtInclude string
 	// crate root linked into the Rust staticlib of every static bionic executable (-bionic-static-rust, rust.go rustStaticlib); empty = none
@@ -230,7 +260,7 @@ type Graph struct {
 	missingPaths map[string]bool
 	// files emit generates (genrule scripts, Rust staticlib roots) by path, written by writeGenFiles after emit
 	genFiles map[string]string
-	// host binaries source generators run (gensrc.go hostTool), nil entry = module missing
+	// host binaries source generators run (gensrc.go buildTool), nil entry = module missing
 	tools map[string]*Node
 	// aidl_interface / hidl_interface modules by name/side (nil = none or unusable), for the modules synth makes from them
 	aidlIfaces map[string]*aidlIface
@@ -292,7 +322,7 @@ func (g *Graph) noDeviceVariant(m *Module) bool {
 }
 
 // ccGoalSide: a C/C++/Rust goal builds its device variant; a host-only one (aapt2's cc_binary_host) its host one -- a device variant would be a build tool linked as if shipped, its closure (libprotobuf-cpp-full) under the licence gate.
-// A cross host builds its host variant for every goal: the device variant needs the guest's bionic and device ISA flags (plan B1). HostCross is set exactly when the host arch is not the build machine's, so this is a host-vs-build relation, not an arch test.
+// A cross host builds its host variant for every goal: the device variant needs the guest's bionic and device ISA flags. HostCross is set exactly when the host arch is not the build machine's, so this is a host-vs-build relation, not an arch test.
 func (g *Graph) ccGoalSide(goal string) Side {
 	if g.cfg.HostCross.set() {
 		return Host

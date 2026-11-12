@@ -75,6 +75,8 @@ func main() {
 	hostSysroot := flag.String("host-sysroot", "", "cross host: the target's sysroot directory (a fetched sysroot_debs row, deps.toml)")
 	hostISA := flag.String("host-isa", "", "cross host: -march of the host's code (arches.toml isa)")
 	hostLibcxx := flag.String("host-libcxx", "", "cross host: the sysroot's libc++ headers directory, derived by xtask (cross::libcxx_dir: the one c++/v1 holding __config); under -host-sysroot")
+	buildArch := flag.String("build-arch", "", "cross host: Soong arch name of the build machine (its arches.toml row, xtask arches::build_machine): the build side, which compiles every node a build rule executes or loads; given exactly with the -host-* flags")
+	buildBits := flag.Int("build-pointer-bits", 0, "cross host: pointer width of -build-arch (its arches.toml pointer_bits)")
 	nbExports := flag.String("nb-exports", "", "module: instead of a build, print as JSON the include flags its -native-bridge variant hands dependents (exportsOf), for builds outside the converter that compile against bionic's headers (xtask runtimes: libc_headers); takes no goals")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "usage: bp2ninja [flags] goal...\n       bp2ninja %s|%s <file>   (the flags and goals, one per line; build.ninja regenerates itself: regen.go)\n", argsFlag, bootstrapFlag)
@@ -123,6 +125,10 @@ func main() {
 	cross := HostCross{Target: *hostTarget, Sysroot: *hostSysroot, ISA: *hostISA, Libcxx: *hostLibcxx}
 	if cross.set() && (cross.Target == "" || cross.Sysroot == "" || cross.ISA == "" || cross.Libcxx == "") {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -host-target, -host-sysroot, -host-isa and -host-libcxx go together")
+		os.Exit(2)
+	}
+	if cross.set() != (*buildArch != "") || (*buildArch != "") != (*buildBits != 0) {
+		fmt.Fprintln(os.Stderr, "bp2ninja: -build-arch and -build-pointer-bits go together, given exactly when the -host-* flags are")
 		os.Exit(2)
 	}
 	if *upstreamToolchain {
@@ -183,7 +189,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -native-bridge-arch-variant needs -native-bridge")
 		os.Exit(1)
 	}
-	cfg := Config{Arch: *arch, PointerBits: *bits, ArchVariant: *variant, ABI: *abi, NativeBridge: *nbArch, NativeBridgeBits: *nbBits, NativeBridgeArchVariant: *nbArchVariant, HostCross: cross}
+	cfg := Config{Arch: *arch, PointerBits: *bits, ArchVariant: *variant, ABI: *abi, NativeBridge: *nbArch, NativeBridgeBits: *nbBits, NativeBridgeArchVariant: *nbArchVariant, HostCross: cross, BuildArch: *buildArch, BuildBits: *buildBits}
 	// the probe compiles, links nothing: its libc provider may be headers only, so checkLibs does not apply
 	if *cxxProbe != "" {
 		if err := deviceCxxFlags(*tree, *out, cfg, provided, *cxx, *cxxProbe); err != nil {
@@ -284,6 +290,12 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, provided: provided, nbProvided: nbProvided, partial: partial, rustAndroid: rustAndroid, defines: defines, stand: stand, rtInclude: tools.RtInclude, bionicStaticRust: tools.BionicStaticRust, nodes: map[key]*Node{}}
 	if g.libcxx, err = libcxxProvider(tools.CXX, cfg.HostCross); err != nil {
 		return err
+	}
+	g.buildLibcxx = g.libcxx
+	if cfg.HostCross.set() {
+		if g.buildLibcxx, err = libcxxProvider(tools.CXX, HostCross{}); err != nil {
+			return err
+		}
 	}
 	// the release first: select(release_flag(…)) and the soong config variables it sets are evaluated with it
 	if js.release != "" {
@@ -461,6 +473,10 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 			return err
 		}
 		ninja.WriteString(m)
+	}
+	// before the commit: a graph that crosses machines keeps the previous build.ninja
+	if err := g.checkMachines(); err != nil {
+		return err
 	}
 	if err := ninja.commit(); err != nil {
 		return err

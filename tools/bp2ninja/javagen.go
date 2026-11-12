@@ -37,12 +37,12 @@ func javaGen(ext string) func(g *Graph, n *jNode, files []srcFile, d javaDeps) (
 // genOrder: the order genSources appends generated outputs, after the module's own .srcjar sources: protos, then aidl.
 var genOrder = []string{".logtags", ".proto", ".aidl"}
 
-// jhost: the path of host binary name (cc or Rust), built once per graph (nodeOut); a missing tool is a problem and the path is one nothing builds,
+// jhost: the path of host binary name (cc or Rust), built for the build machine (toolSide) once per graph (nodeOut); a missing tool is a problem and the path is one nothing builds,
 // so its users fail.
 func (g *Graph) jhost(name, from string) string {
 	t, ok := g.tools[name]
 	if !ok {
-		t = g.node(name, Host, Binary, from+" (tool "+name+")")
+		t = g.node(name, g.cfg.toolSide(), Binary, from+" (tool "+name+")")
 		if g.tools == nil {
 			g.tools = map[string]*Node{}
 		}
@@ -185,7 +185,7 @@ func (g *Graph) javaMinSdk(n *jNode) string {
 
 // javaLogtags: gen.go genLogtags, `java-event-log-tags -o out in` (a python_binary_host).
 func (g *Graph) javaLogtags(n *jNode, files []srcFile, _ javaDeps) (java, srcjars []string) {
-	tm := g.lookup("java-event-log-tags", Host)
+	tm := g.lookup("java-event-log-tags", g.cfg.toolSide())
 	var script []string
 	why := "not found"
 	if tm != nil {

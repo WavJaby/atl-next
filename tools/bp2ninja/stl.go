@@ -57,24 +57,27 @@ func (g *Graph) stlOf(n *Node) string {
 	return sel
 }
 
-// stlCompileFlags: the C++ compile flags of selection sel (cc/stl.go flags, non-Bionic). The provider's headers are an -isystem
+// stlCompileFlags: the C++ compile flags of selection sel (cc/stl.go flags, non-Bionic) with libc++ headers dir. The provider's headers are an -isystem
 // of their own: they follow the module's -I dirs, as Soong's dependency exports do.
-func (g *Graph) stlCompileFlags(sel string) []string {
+func (g *Graph) stlCompileFlags(sel, dir string) []string {
 	if sel == "" {
 		return []string{"-nostdinc++"}
 	}
-	if g.libcxx == "" {
+	if dir == "" {
 		g.problem("C++ standard library %s: no libc++ headers derived (libcxxProvider)", sel)
 		return []string{"-nostdinc++"}
 	}
-	return []string{"-nostdinc++", "-isystem", g.libcxx}
+	return []string{"-nostdinc++", "-isystem", dir}
 }
 
-// sideStlCompileFlags: stlCompileFlags of the node's selection on glibc sides. A bionic side takes its libc++ headers from the STL module's exports (bionic.go bionicStlDeps), as Soong's Bionic branch does;
+// sideStlCompileFlags: stlCompileFlags of the node's selection on glibc sides, with its machine's libc++ (the build side's is the build machine's own). A bionic side takes its libc++ headers from the STL module's exports (bionic.go bionicStlDeps), as Soong's Bionic branch does;
 // -nostdinc++ keeps the distro compiler's own libc++ out of every bionic compile.
 func (g *Graph) sideStlCompileFlags(n *Node) []string {
-	if n.side.glibc() {
-		return g.stlCompileFlags(g.stlOf(n))
+	switch {
+	case n.side == Build:
+		return g.stlCompileFlags(g.stlOf(n), g.buildLibcxx)
+	case n.side.glibc():
+		return g.stlCompileFlags(g.stlOf(n), g.libcxx)
 	}
 	return []string{"-nostdinc++"}
 }
