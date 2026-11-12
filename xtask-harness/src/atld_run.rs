@@ -199,6 +199,8 @@ pub struct Runtime {
     ui_break: Option<&'static str>,
     /// Variables the desktop would set for this launch, in atld's environment ([`Runtime::with_desktop_env`]).
     desktop_env: Vec<(String, String)>,
+    /// `KEY=VALUE`s for every app process (atld `--app-env`, [`Runtime::with_app_env`]).
+    app_env: Vec<String>,
     /// Apps serve AudioFlinger and AudioPolicyService unless this is cleared (`--no-audio-service`, the audio gate's break).
     audio_service: bool,
     /// Apps' AudioFlinger gives tracks a control block one buffer short when this is set (`--break-cblk`, the audio gate's second break).
@@ -557,6 +559,7 @@ impl Runtime {
             ui: None,
             ui_break: None,
             desktop_env: Vec::new(),
+            app_env: Vec::new(),
             audio_service: true,
             audio_break_cblk: false,
             media_player_service: true,
@@ -733,6 +736,12 @@ impl Runtime {
     /// `vars` in atld's environment, as a desktop launcher sets them (GPU offload: `__NV_PRIME_RENDER_OFFLOAD`, `DRI_PRIME`); atld's processes inherit them. Test-environment setup: the product reads none of them.
     pub fn with_desktop_env(mut self, vars: &[(String, String)]) -> Self {
         self.desktop_env = vars.to_vec();
+        self
+    }
+
+    /// `vars` (`KEY=VALUE`) in every app process's environment, atld `--app-env`: test-environment setup (e.g. `LD_DEBUG=bindings`); the product reads none of them.
+    pub fn with_app_env(mut self, vars: &[String]) -> Self {
+        self.app_env = vars.to_vec();
         self
     }
 
@@ -1258,6 +1267,9 @@ impl Runtime {
         }
         if let Some(rule) = self.ui_break {
             cmd.arg("--app-env").arg(format!("ATL_UI_BREAK={rule}"));
+        }
+        for var in &self.app_env {
+            cmd.arg("--app-env").arg(var);
         }
         cmd.envs(self.desktop_env.iter().map(|(k, v)| (k, v)));
         if !self.audio_service {

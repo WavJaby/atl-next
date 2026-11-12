@@ -74,6 +74,9 @@ pub struct Args {
     /// atld `--tilt-keys`: held left / right (or a / d) tilt the device for accelerometer games, at atld's default angle, ramp and rate.
     #[arg(long)]
     tilt_keys: bool,
+    /// A variable in every app process's environment (repeat), atld `--app-env`: test-environment setup such as `LD_DEBUG=bindings` (the launcher-closure measurement; glibc's lines land in the app log). The product reads none of these.
+    #[arg(long = "app-env", value_name = "KEY=VALUE")]
+    app_env: Vec<String>,
 }
 
 /// `xtask remote run-apk` (remote.rs `Remote::RunApk`): the same run on a target's desktop. `--hold` is required: the window is the target's, on its Wayland session, not a headless one.
@@ -141,6 +144,7 @@ impl Args {
             drive: Some(script),
             break_blank_capture,
             tilt_keys: false,
+            app_env: Vec::new(),
         }
     }
 }
@@ -293,6 +297,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         drive: None,
         break_blank_capture: false,
         tilt_keys: a.tilt_keys,
+        app_env: Vec::new(),
     };
     // no `--display`: atld reads the target's own monitor, as on the product's host (host_display); this host's monitor is not the target's
     let (rt, foreign) = runtime(root, &args, &apk_file)?;
@@ -493,7 +498,7 @@ fn runtime(root: &Path, args: &Args, apk: &Path) -> Result<(Runtime, Option<Stri
     } else {
         rt
     };
-    Ok((rt, foreign))
+    Ok((rt.with_app_env(&args.app_env), foreign))
 }
 
 /// The bridge's load line (atl-native-bridge loader.rs) for a library of `package`'s `lib/<isa>/`.
