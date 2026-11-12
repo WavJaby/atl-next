@@ -246,9 +246,8 @@ pub fn check_own(root: &Path) -> Result<Option<String>> {
         return Ok(Some("this checkout holds no slot: run `cargo xtask slot assign <n> --execute`, then `cargo xtask native`".into()));
     };
     let out = crate::slot::slot_dir(atl_layout::Layout::of(root)?.workspace(), n);
-    let launcher = crate::packages::target_dir(&out)
-        .join("release")
-        .join(LAUNCHER);
+    let bin_dir = crate::packages::target_dir(&out).join("release");
+    let launcher = bin_dir.join(LAUNCHER);
     if !launcher.is_file() {
         return Ok(Some(format!(
             "no {}: run `cargo xtask native` first",
@@ -261,16 +260,101 @@ pub fn check_own(root: &Path) -> Result<Option<String>> {
         "no {}: `cargo xtask native` builds and installs it with the launcher",
         runtime.display()
     );
+    let installer = bin_dir.join(INSTALLER);
+    ensure!(
+        installer.is_file(),
+        "no {}: `cargo xtask native` builds it with the launcher",
+        installer.display()
+    );
     // reads built binaries: a slot from another source state would judge a stale launcher
     crate::build_state::ensure_current(root, &out)?;
-    let lines = check(
-        &table,
-        &launcher,
-        &runtime,
-        &crate::host_art::runtime_libs(&out)?,
+    let libs = crate::host_art::runtime_libs(&out)?;
+    let lines = check(&table, &launcher, &runtime, &libs)?;
+    let bionic = libs
+        .iter()
+        .find(|p| p.file_name().and_then(|n| n.to_str()) == Some(BIONIC))
+        .with_context(|| format!("no {BIONIC} on the runtime library path"))?;
+    let copies = one_copy(
+        &[launcher.as_path(), installer.as_path(), runtime.as_path()],
+        bionic,
     )?;
-    eprintln!("launcher-closure: {lines}");
+    eprintln!("launcher-closure: {lines}; {copies}");
     Ok(None)
+}
+
+/// The one copy of bionic state a launcher process holds: the soname file of the runtime library path's `libatl_bionic`.
+const BIONIC: &str = "libatl_bionic.so.0.0.0";
+/// The installer executable (packages.rs), the loader's second entry: it links the same loader and runtime objects.
+const INSTALLER: &str = "atl-installer";
+
+/// The names `path` defines: its symbol table (`.symtab`, every definition the object carries, hidden copies included) or, with `dynamic`, its exports (`.dynsym`).
+fn defined_names(path: &Path, dynamic: bool) -> Result<BTreeSet<String>> {
+    use object::Endianness;
+    use object::Object;
+    use object::read::elf::ElfFile64;
+    let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let elf = ElfFile64::<Endianness>::parse(&*data)
+        .with_context(|| format!("{}: not a 64-bit ELF", path.display()))?;
+    Ok(if dynamic {
+        definitions(elf.dynamic_symbols())
+    } else {
+        definitions(elf.symbols())
+    })
+}
+
+/// The names of `symbols` that define something (sections and files excluded).
+fn definitions<'data>(
+    symbols: impl Iterator<Item = impl object::ObjectSymbol<'data>>,
+) -> BTreeSet<String> {
+    use object::SymbolKind;
+    symbols
+        .filter(|s| {
+            s.is_definition() && !matches!(s.kind(), SymbolKind::Section | SymbolKind::File)
+        })
+        .filter_map(|s| s.name().ok().filter(|n| !n.is_empty()).map(str::to_owned))
+        .collect()
+}
+
+/// The names `defined` shares with `bionic`'s exports: in that object, a second copy of the state the shared object holds.
+fn copies(defined: &BTreeSet<String>, bionic: &BTreeSet<String>) -> Vec<String> {
+    defined.intersection(bionic).cloned().collect()
+}
+
+/// The one-copy rule (step `launcher-closure`): no object of the launcher's process defines a name `bionic` exports, hidden copies included, so a statically linked caller binds the shared object's copy. Returns the ok summary.
+fn one_copy(objects: &[&Path], bionic: &Path) -> Result<String> {
+    let exports = defined_names(bionic, true)?;
+    ensure!(
+        !exports.is_empty(),
+        "{}: exports no names",
+        bionic.display()
+    );
+    let mut failures = Vec::new();
+    for object in objects {
+        let defined = defined_names(object, false)?;
+        ensure!(
+            !defined.is_empty(),
+            "{}: no symbol table (stripped?): the one-copy rule cannot read it",
+            object.display()
+        );
+        let shared = copies(&defined, &exports);
+        if !shared.is_empty() {
+            failures.push(format!(
+                "{}: defines {} of {BIONIC}'s names: {}",
+                object.display(),
+                shared.len(),
+                shared.join(" ")
+            ));
+        }
+    }
+    ensure!(
+        failures.is_empty(),
+        "a second copy of bionic state in the launcher's process:\n  {}",
+        failures.join("\n  ")
+    );
+    Ok(format!(
+        "one copy: no object defines any of {BIONIC}'s {} names",
+        exports.len()
+    ))
 }
 
 /// `root`'s DT_NEEDED closure as `ld` resolves it over `lib_path` alone.
@@ -637,6 +721,29 @@ reason = "BoringSSL vs host OpenSSL"
             to: to.into(),
             symbol: symbol.into(),
         }
+    }
+
+    /// The rule names a bionic export an object defines itself, and passes one that only binds it.
+    #[test]
+    fn one_copy_names_a_defined_bionic_export() {
+        let exports: BTreeSet<String> = ["__system_property_find", "android_fdsan_close_with_tag"]
+            .map(String::from)
+            .into();
+        let bound: BTreeSet<String> = ["main", "__system_property_find_x"]
+            .map(String::from)
+            .into();
+        assert!(copies(&bound, &exports).is_empty());
+        let copied: BTreeSet<String> = ["main", "android_fdsan_close_with_tag"]
+            .map(String::from)
+            .into();
+        assert_eq!(copies(&copied, &exports), ["android_fdsan_close_with_tag"]);
+    }
+
+    /// The reader sees the definitions of a built object: this test binary defines `main` (the harness's).
+    #[test]
+    fn reads_a_symbol_table() {
+        let exe = std::env::current_exe().unwrap();
+        assert!(defined_names(&exe, false).unwrap().contains("main"));
     }
 
     /// A glibc record line parses to its objects and symbol.

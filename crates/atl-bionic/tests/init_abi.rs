@@ -31,7 +31,7 @@ fn init_fails_without_an_area_then_maps_once_it_exists() {
     let file = dir.join("properties");
     let _ = std::fs::remove_file(&file);
     // SAFETY: the only test in this binary; nothing else reads the environment concurrently
-    unsafe { std::env::set_var("ATL_PROP_AREA", &file) };
+    unsafe { std::env::set_var(atl_android_paths::PROPERTY_AREA_ENV, &file) };
 
     // no file: -1, errno untouched; readers see every property unset
     errno::set_errno(errno::Errno(1234));

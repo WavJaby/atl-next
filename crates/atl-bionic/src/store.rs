@@ -11,14 +11,11 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::{Acquire, Release};
 use std::sync::{Mutex, OnceLock};
 
+use atl_android_paths::PROPERTY_AREA_ENV;
 use rustix::io::Errno;
 
 use crate::generated::system_properties::PROP_DIRNAME;
 use crate::props::{Area, PropInfo, VALUE_MAX, value_len};
-
-/// Environment variable naming the area file; unset = bionic's `PROP_DIRNAME`. Set by whoever starts
-/// the process until the broker puts the file at `PROP_DIRNAME` inside the sandbox.
-pub const AREA_ENV: &str = "ATL_PROP_AREA";
 
 static AREA: OnceLock<Area<'static>> = OnceLock::new();
 /// A first use already tried and failed.
@@ -32,8 +29,8 @@ fn map() -> Option<Area<'static>> {
     if let Some(a) = AREA.get() {
         return Some(*a);
     }
-    let path =
-        std::env::var_os(AREA_ENV).map_or_else(|| PathBuf::from(PROP_DIRNAME), PathBuf::from);
+    let path = std::env::var_os(PROPERTY_AREA_ENV)
+        .map_or_else(|| PathBuf::from(PROP_DIRNAME), PathBuf::from);
     let area = Area::new(crate::map::map_shared(&path).ok()?).ok()?;
     Some(*AREA.get_or_init(|| area))
 }

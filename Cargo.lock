@@ -104,8 +104,8 @@ name = "atl-app-launcher"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "atl-android-paths",
  "atl-audioflinger",
- "atl-bionic",
  "atl-bridgegen",
  "atl-codec-store",
  "atl-composer",
@@ -180,6 +180,7 @@ name = "atl-bionic"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "atl-android-paths",
  "atl-bridgegen",
  "errno",
  "rustix",
@@ -576,6 +577,7 @@ name = "atl-property-service"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "atl-android-paths",
  "atl-bionic",
  "clap",
  "toml",

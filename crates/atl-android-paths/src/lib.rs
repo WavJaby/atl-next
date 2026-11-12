@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The Android filesystem layout as an app process sees it inside its sandbox: the one place an Android path literal lives (plan S18 sandbox layout table, first cut).
+//! The Android filesystem layout as an app process sees it inside its sandbox: the one place an Android path literal lives (plan S18 sandbox layout table, first cut), and the variable that names the property area on the host until the sandbox mounts it (`PROPERTY_AREA_ENV`).
 //! `xtask check` step `android-paths` fails on such a literal anywhere else in the workspace, unless android-paths.toml allows it with a reason; its roots are `ROOTS`.
 #![forbid(unsafe_code)]
 
@@ -62,6 +62,8 @@ pub const DATA_USER: &str = "/data/user";
 pub const DATA_USER_DE: &str = "/data/user_de";
 /// bionic's default property area path (`__system_properties_init` without `$ATL_PROP_AREA`): the sandbox's `/dev` is the broker's own, so the area is mounted there and no variable is needed.
 pub const PROPERTY_AREA: &str = "/dev/__properties__";
+/// The variable naming the property area file a process maps instead of `PROPERTY_AREA` (`ATL_PROP_AREA`): whoever starts the process sets it until the sandbox mounts the area there. The one definition: atl-bionic reads it, the launcher names it, atl-property-service prints it.
+pub const PROPERTY_AREA_ENV: &str = "ATL_PROP_AREA";
 /// The shared storage root (Environment's external storage, the path the mount service reports for the emulated primary): app_spawn mounts each package's Android/data and Android/obb under it.
 pub const SHARED_STORAGE: &str = "/storage/emulated/0";
 /// The legacy external storage link, pointing at `SHARED_STORAGE`.

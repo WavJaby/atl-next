@@ -8,6 +8,8 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# the property area's variable name (one definition, no state; launcher-scope-split X2)
+atl-android-paths = { path = "../atl-android-paths" }
 errno.workspace = true
 rustix.workspace = true
 

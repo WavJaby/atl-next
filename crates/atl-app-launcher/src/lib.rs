@@ -2,7 +2,7 @@
 //! atl-app-launcher: starts an app process's runtime -- the one launch path (the broker will run it inside the sandbox; xtask and test harnesses run it now).
 //! dalvikvm's start (art/dalvikvm/dalvikvm.cc) through the standard seams only: the JNI invocation API, liblog's logger API, bionic's API. Steps:
 //! 0. what bionic sets up on Android before any code runs: the main thread's alternate signal stack (`ffi::install_signal_stack`), and debuggerd_init's crash-signal disposition, so a crash ends the process with its own signal (`ffi::install_crash_handler`; no tombstone).
-//! 1. refuse to start without a property area: bionic's `__system_properties_init` maps `$ATL_PROP_AREA` (atl-bionic `AREA_ENV`), else `/dev/__properties__`; without it every property reads unset and the runtime runs on defaults no Android process sees.
+//! 1. refuse to start without a property area: bionic's `__system_properties_init` maps `$ATL_PROP_AREA` (atl-android-paths `PROPERTY_AREA_ENV`), else `/dev/__properties__`; without it every property reads unset and the runtime runs on defaults no Android process sees.
 //!    Then (step 1b) the process's view of servicemanager (atl-service-view, feature `converter`): libbinder's default service manager, answering the names this process serves itself (its SurfaceFlinger) and forwarding the rest; it must precede any `defaultServiceManager()`.
 //! 2. `JNI_CreateJavaVM` through libnativehelper's JniInvocation, the VM options as dalvikvm takes them (`args`).
 //! 3. our logger via `__android_log_set_logger`, after the VM exists: ART's InitLogging (ART_TARGET_LINUX) installs libbase's StderrLogger through the same call (system/libbase/logging.cpp SetLogger), replacing any earlier one. The logger turns each message into a C6 record (`log`); liblog filters before calling it.
@@ -211,7 +211,7 @@ fn load_runtime() -> Result<ffi::Runtime> {
     if !rt.has_property_area() {
         bail!(
             "no system property area: neither ${} nor /dev/__properties__ is a bionic property area (the broker or the harness writes one; atl-property-service)",
-            atl_bionic::AREA_ENV
+            atl_android_paths::PROPERTY_AREA_ENV
         );
     }
     Ok(rt)

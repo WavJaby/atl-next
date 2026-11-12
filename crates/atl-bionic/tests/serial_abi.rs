@@ -26,7 +26,12 @@ struct EmptyPi([u8; 96]);
 #[test]
 fn serial_of_a_callers_prop_info() {
     // SAFETY: no other test in this binary reads the environment
-    unsafe { std::env::set_var("ATL_PROP_AREA", "/nonexistent/atl-bionic-serial-test") };
+    unsafe {
+        std::env::set_var(
+            atl_android_paths::PROPERTY_AREA_ENV,
+            "/nonexistent/atl-bionic-serial-test",
+        )
+    };
     let empty = EmptyPi([0; 96]);
     // SAFETY: bionic's contracts: a NUL-terminated name; a prop_info-sized, aligned record
     unsafe {

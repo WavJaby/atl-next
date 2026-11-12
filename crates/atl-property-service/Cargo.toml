@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+atl-android-paths = { path = "../atl-android-paths" }
 atl-bionic = { path = "../atl-bionic" }
 clap.workspace = true
 

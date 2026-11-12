@@ -73,7 +73,7 @@ fn c_callers_see_the_area() {
     let file = dir.join("properties");
     std::fs::write(&file, image.into_bytes()).unwrap();
     // SAFETY: the only test in this binary; nothing else reads the environment concurrently
-    unsafe { std::env::set_var("ATL_PROP_AREA", &file) };
+    unsafe { std::env::set_var(atl_android_paths::PROPERTY_AREA_ENV, &file) };
 
     // SAFETY: every call follows bionic's contracts: C strings, PROP_VALUE_MAX / PROP_NAME_MAX buffers
     unsafe {

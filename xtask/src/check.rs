@@ -39,7 +39,7 @@ enum Step {
     Deps,
     /// every [aosp.sparse] row covers the reads of this checkout's slot graph, converted for every gate's goals (keepset.rs); skipped without a slot or graph
     Keepset,
-    /// launcher-closure.toml's rules, then every host library of the launcher's DT_NEEDED closure (its PT_INTERP's `ld.so --list` over the runtime library path) is a row and every row is in it (launcher_closure.rs); the closure part skipped without a slot or a built launcher
+    /// launcher-closure.toml's rules, then every host library of the launcher's DT_NEEDED closure (its PT_INTERP's `ld.so --list` over the runtime library path) is a row and every row is in it, then the loader, installer and runtime define no name libatl_bionic.so exports (launcher_closure.rs); skipped without a slot or a built launcher
     LauncherClosure,
     /// modules.toml equals the real cross-module crate graph
     Modules,

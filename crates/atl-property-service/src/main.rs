@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Writes the default property area (crate docs: the set and its sources) to --out, then prints `ATL_PROP_AREA=<--out>` on stdout: the variable an app process maps its area from (atl-bionic `AREA_ENV`), for the caller to put in that process's environment.
+//! Writes the default property area (crate docs: the set and its sources) to --out, then prints `ATL_PROP_AREA=<--out>` on stdout: the variable an app process maps its area from (atl-android-paths `PROPERTY_AREA_ENV`), for the caller to put in that process's environment.
 //! The file is written beside --out and renamed over it, so a process mapping --out never sees a partial area.
 #![forbid(unsafe_code)]
 
@@ -51,7 +51,7 @@ fn main() -> Result<()> {
     writeln!(
         std::io::stdout(),
         "{}={}",
-        atl_property_service::AREA_ENV,
+        atl_android_paths::PROPERTY_AREA_ENV,
         out.display()
     )?;
     Ok(())

@@ -307,8 +307,8 @@ fn main() -> Result<()> {
     for path in rerun {
         println!("cargo::rerun-if-changed={}", path.display());
     }
-    // The runtime's ABI is `atl_app_main` only, defined in this crate's own objects; every symbol from an archive (each dependency's rlib: atl-bionic's C names, cxx's `cxxbridge1$*`, std) stays local.
-    // Its NEEDed libraries resolve in its group with it first: an exported copy would interpose theirs (libinput.so's own cxx runtime; AOSP libraries' atl-bionic, which must be the one libatl_bionic.so ART's group binds too).
+    // The runtime's ABI is `atl_app_main` only, defined in this crate's own objects; every symbol from an archive (each dependency's rlib: cxx's `cxxbridge1$*`, std) stays local.
+    // Its NEEDed libraries resolve in its group with it first: an exported copy would interpose theirs (libinput.so's own cxx runtime; AOSP libraries' libatl_bionic.so, the process's one bionic).
     println!("cargo::rustc-link-arg-cdylib=-Wl,--exclude-libs,ALL");
     if std::env::var_os("CARGO_FEATURE_CONVERTER").is_some() {
         let lines = atl_bridgegen::converter::link_package(&manifest)?;

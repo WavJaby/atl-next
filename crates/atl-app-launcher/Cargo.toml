@@ -36,7 +36,8 @@ converter = ["atl-audioflinger/converter", "atl-codec-store/converter", "atl-com
 
 [dependencies]
 anyhow.workspace = true
-atl-bionic = { path = "../atl-bionic" }
+# the property area's variable name, named in the refusal (lib.rs load_runtime); no bionic link: the process's bionic is libatl_bionic.so, resolved by name (launcher-scope-split X2)
+atl-android-paths = { path = "../atl-android-paths" }
 atl-composer = { path = "../atl-composer" }
 # the process's view of servicemanager, installed before the VM (lib.rs step 1b)
 atl-service-view = { path = "../atl-service-view" }

@@ -91,7 +91,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         ("ATL_NB_THREADEXE", &fixture),
         ("ATL_NB_LINKER", &linker),
         ("ATL_NB_VDSO", &vdso),
-        ("ATL_PROP_AREA", &area),
+        (atl_android_paths::PROPERTY_AREA_ENV, &area),
     ];
     let mut runs: Vec<Option<&str>> = vec![None];
     if !args.no_breaks {

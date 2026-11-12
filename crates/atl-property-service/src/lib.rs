@@ -13,8 +13,6 @@ use std::fmt;
 
 use atl_bionic::image::{AddError, Image};
 
-pub use atl_bionic::AREA_ENV;
-
 mod abis {
     include!(concat!(env!("OUT_DIR"), "/abis.rs"));
 }
