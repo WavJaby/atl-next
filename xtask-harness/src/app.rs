@@ -45,6 +45,10 @@ pub struct Args {
     /// The bridge-1 JNI fixture variant packaged, by API level = the APK's minSdk: 21 = emulated TLS, 29 = ELF TLS (jni_fixture.rs).
     #[arg(long, default_value_t = jni_fixture::EMULATED_TLS_API)]
     fixture_api: u32,
+    /// The fixture's ISA (an arches.toml row with `[guest]`), default the host's (identity). A foreign one ships only that ABI's libraries, so the app runs under that ISA's QEMU engine (staged with its guest), and the calls the engine does not carry yet are skipped and listed (`QEMU_DEFERRED`).
+    /// Needs the ISA's NB guest built (`xtask native --native-bridge <isa>`).
+    #[arg(long)]
+    fixture_arch: Option<String>,
     /// The C12 break: leaves this native-bridge guest library (an NB_LIBS file, e.g. libstdc++.so or libz.so) out of the guest, so the legacy fixture's load fails naming it; the gate must then go red.
     #[arg(long)]
     drop_nb_lib: Option<String>,
@@ -199,17 +203,55 @@ const ASSET_LEN: usize = 70_000;
 fn asset_bytes() -> Vec<u8> {
     (0..ASSET_LEN).map(|i| ((i * 31 + 7) % 251) as u8).collect()
 }
-/// Writes the two assets into `dir`, which `Apk::build` packs as the APK's assets.
-fn write_assets(dir: &Path) -> Result<()> {
+/// Writes the two assets into `dir`, which `Apk::build` packs as the APK's assets, and [`SKIP_ASSET`] naming the `deferred` calls when there are any (removed otherwise: `dir` outlives runs).
+fn write_assets(dir: &Path, deferred: &[&str]) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     let bytes = asset_bytes();
     std::fs::write(dir.join("stored.bin"), &bytes)?;
     std::fs::write(dir.join("deflated.txt"), &bytes)?;
+    let skip = dir.join(SKIP_ASSET);
+    if deferred.is_empty() {
+        if skip.exists() {
+            std::fs::remove_file(&skip)?;
+        }
+    } else {
+        std::fs::write(&skip, deferred.join("\n") + "\n")?;
+    }
     Ok(())
 }
 
-/// Every bridge-1 call whose line is missing or wrong, then the thread balance.
-fn bridge1_call_failures(app: &str) -> Vec<String> {
+/// Main's line value for a skipped call (Main.java `bridge1Call`).
+const SKIPPED: &str = "skipped";
+/// The asset naming the calls Main skips, one label a line (Main.java SKIP_ASSET); written only for a run with [`deferred`] calls.
+const SKIP_ASSET: &str = "bridge1-skip.txt";
+/// The [`BRIDGE1_CALLS`] labels (and [`FIRST_CONFIG`], `guestLog`) the QEMU engine does not carry yet (QEMU Q6 plan Q6-6 subset; the rest is Q7): C++ exceptions through the guest unwinder, guest signals,
+/// the JIT up-call and guest liblog / property callbacks (not in the subset), GL through the proxies, and the C12 legacy fixture. Each is skipped by Main and must log `skipped`.
+const QEMU_DEFERRED: &[&str] = &[
+    "cppThrowCatch",
+    "sigsegvRecover",
+    "nullFieldRead",
+    "jitUpCall",
+    "guestLog",
+    "propCallbacks",
+    FIRST_CONFIG,
+    "glesPbuffer",
+    "driverMapped",
+    "es1Begin",
+    "es1Version",
+    "es1Driver",
+    "es1Pixels",
+    "es1End",
+    "legacyStdio",
+    "legacyNew",
+    "zRoundTrip",
+];
+/// The calls a run of fixture ISA `isa` on host `host` skips: none for the host's (identity), [`QEMU_DEFERRED`] for a foreign one.
+fn deferred(isa: &str, host: &str) -> &'static [&'static str] {
+    if isa == host { &[] } else { QEMU_DEFERRED }
+}
+
+/// Every bridge-1 call whose line is missing or wrong (a `deferred` label's line must be `skipped`), then the thread balance.
+fn bridge1_call_failures(app: &str, deferred: &[&str]) -> Vec<String> {
     let got = |name: &str| {
         app.lines().find_map(|l| {
             let (_, r) = l.split_once(BRIDGE1_CALL)?;
@@ -219,18 +261,35 @@ fn bridge1_call_failures(app: &str) -> Vec<String> {
     };
     let mut whys: Vec<String> = BRIDGE1_CALLS
         .iter()
-        .filter_map(|&(name, want)| match got(name) {
+        .map(|&(name, want)| {
+            (
+                name,
+                if deferred.contains(&name) {
+                    SKIPPED
+                } else {
+                    want
+                },
+            )
+        })
+        .filter_map(|(name, want)| match got(name) {
             Some(v) if v == want => None,
             other => Some(format!("bridge1 call {name}: want {want}, got {other:?}")),
         })
         .collect();
-    if let Some(why) = first_config_why(got(FIRST_CONFIG).as_deref()) {
+    if deferred.contains(&FIRST_CONFIG) {
+        if got(FIRST_CONFIG).as_deref() != Some(SKIPPED) {
+            whys.push(format!(
+                "bridge1 call {FIRST_CONFIG}: want {SKIPPED}, got {:?}",
+                got(FIRST_CONFIG)
+            ));
+        }
+    } else if let Some(why) = first_config_why(got(FIRST_CONFIG).as_deref()) {
         whys.push(format!("bridge1 call {FIRST_CONFIG}: {why}"));
     }
     if app.contains("called unimplemented OpenGL ES API") {
         whys.push("GL: the front reports an unimplemented OpenGL ES API call".to_owned());
     }
-    if !app.lines().any(|l| l.ends_with(GUEST_LOG)) {
+    if !deferred.contains(&"guestLog") && !app.lines().any(|l| l.ends_with(GUEST_LOG)) {
         whys.push(format!("guest liblog: no line ending {GUEST_LOG:?}"));
     }
     let last = app.lines().rev().find_map(|l| l.split_once(BRIDGE1_DETACH));
@@ -450,6 +509,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     .with_gralloc(root)?
     .with_gl_driver(root)?
     .with_native_bridge_guest(&args.host)?;
+    let isa = args.fixture_arch.as_deref().unwrap_or(&args.host);
+    let deferred = deferred(isa, &args.host);
+    let rt = if isa == args.host {
+        rt
+    } else {
+        rt.with_native_bridge_guest(isa)?
+            .with_qemu_engine(root, isa)?
+    };
     let rt = match &args.drop_nb_lib {
         Some(file) => rt.without_nb_lib(file)?,
         None => rt,
@@ -492,13 +559,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // the bridge-1 JNI fixture rides along in lib/<abi>/ (jni_fixture.rs); the NativeBridge core loads it into the guest
     let native = jni_fixture::apk_libs(
         root,
-        &args.host,
+        isa,
         args.fixture_api,
         &work.join("jni-fixture"),
         args.legacy_no_libc,
     )?;
     let assets = work.join("assets");
-    write_assets(&assets)?;
+    write_assets(&assets, deferred)?;
     let apk = rt.apk.build(
         &root.join(FIXTURE),
         &work.join("apk"),
@@ -699,17 +766,27 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     let mut es1_compared = None;
     if passed && bridge1_ok {
-        whys.extend(bridge1_call_failures(&app));
+        whys.extend(bridge1_call_failures(&app, deferred));
         // sigsegvRecover's fault reaches the fixture's own handler through the bridge (signal.rs guest_handler), which reports it first: the report's only gate in a real app process
-        if !app.lines().any(|l| l.contains(GUEST_FAULT_REPORT)) {
+        if !deferred.contains(&"sigsegvRecover")
+            && !app.lines().any(|l| l.contains(GUEST_FAULT_REPORT))
+        {
             whys.push(format!(
                 "bridge1: sigsegvRecover left no {GUEST_FAULT_REPORT:?} line"
             ));
         }
-        match es1_pixels(&app, &scene) {
-            Ok(n) => es1_compared = Some(n),
-            Err(why) => whys.push(format!("es1 pixels: {why}")),
+        if !deferred.contains(&"es1Pixels") {
+            match es1_pixels(&app, &scene) {
+                Ok(n) => es1_compared = Some(n),
+                Err(why) => whys.push(format!("es1 pixels: {why}")),
+            }
         }
+    }
+    if !deferred.is_empty() {
+        println!(
+            "app: {isa} under QEMU: not claimed (Q7): {}",
+            deferred.join(", ")
+        );
     }
     if !whys.is_empty() {
         for why in &whys {

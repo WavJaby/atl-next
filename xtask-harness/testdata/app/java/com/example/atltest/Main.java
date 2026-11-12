@@ -47,6 +47,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "connectivity: " + connectivity());
         Log.i("AtlTest", "permission: " + permission());
         mediaPlayerService();
+        readSkipped();
         Class<?> jni;
         try {
             jni = Class.forName("atl.bridge1.testlib.AtlJniTest");
@@ -130,8 +131,30 @@ public class Main extends Activity {
         return p.measureText(FONT_TEXT);
     }
 
-    /** One native call's result line (app.rs BRIDGE1_CALLS): "bridge1 call <label> = <value>", or what it threw. Reflection: the fixture class is compiled apart from Main. */
+    /** The asset naming the bridge-1 calls this run does not make, one label a line (app.rs SKIP_ASSET): the gate writes it for an engine that does not carry them yet. */
+    private static final String SKIP_ASSET = "bridge1-skip.txt";
+    /** The labels of SKIP_ASSET; empty when the APK has none. */
+    private static final java.util.Set<String> SKIPPED = new java.util.HashSet<>();
+
+    /** Reads SKIP_ASSET into SKIPPED; a missing asset skips nothing. */
+    private void readSkipped() {
+        try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.InputStreamReader(getAssets().open(SKIP_ASSET)))) {
+            for (String l = r.readLine(); l != null; l = r.readLine()) {
+                if (!l.isEmpty()) {
+                    SKIPPED.add(l);
+                }
+            }
+        } catch (java.io.IOException e) {
+            // no asset: every call runs
+        }
+    }
+
+    /** One native call's result line (app.rs BRIDGE1_CALLS): "bridge1 call <label> = <value>", "skipped" for a SKIPPED label, or what it threw. Reflection: the fixture class is compiled apart from Main. */
     private static void bridge1Call(Class<?> jni, String label, String method, Object... args) {
+        if (SKIPPED.contains(label)) {
+            Log.i("AtlTest", "bridge1 call " + label + " = skipped");
+            return;
+        }
         String v;
         try {
             Class<?>[] types = new Class<?>[args.length];
@@ -208,18 +231,26 @@ public class Main extends Activity {
 
     /** C12 legacy rows (AtlLegacyTest.java), loaded apart from the bridge-1 fixture. A failed load logs every row as threw, with ART's reason (the library's name). */
     private static void bridge1Legacy() {
+        String[] rows = {"legacyStdio", "legacyNew", "zRoundTrip"};
+        // every row skipped: the library is not loaded either
+        if (SKIPPED.containsAll(java.util.Arrays.asList(rows))) {
+            for (String row : rows) {
+                Log.i("AtlTest", "bridge1 call " + row + " = skipped");
+            }
+            return;
+        }
         Class<?> legacy;
         try {
             legacy = Class.forName("atl.bridge1.testlib.AtlLegacyTest");
         } catch (Throwable t) {
-            for (String row : new String[] {"legacyStdio", "legacyNew", "zRoundTrip"}) {
+            for (String row : rows) {
                 Log.i("AtlTest", "bridge1 call " + row + " = threw " + t);
             }
             return;
         }
-        bridge1Call(legacy, "legacyStdio", "legacyStdio");
-        bridge1Call(legacy, "legacyNew", "legacyNew");
-        bridge1Call(legacy, "zRoundTrip", "zRoundTrip");
+        for (String row : rows) {
+            bridge1Call(legacy, row, row);
+        }
     }
 
     /** The default TrustManagerFactory's issuers (Conscrypt: AndroidCAStore -> TrustedCertificateStore): "trusted <ROOT> of <n>", or why not. */
