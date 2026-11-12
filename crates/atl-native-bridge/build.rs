@@ -403,8 +403,6 @@ fn libc_stubs(qemu: bool) -> &'static str {
     }
 }
 
-/// Why the NDK shims (`JNIEnv*` takers) trap in the QEMU guest: their env is the QEMU JNI table, which lands with the JNI slice (plan Q6, D-C).
-const QEMU_NDK_PENDING: &str = "pending: NDK shim under QEMU, Q6";
 /// The QEMU guest's arches.toml row (engine/qemu/mod.rs `GUEST_ISA`).
 const QEMU_GUEST_ARCH: &str = "arm64";
 /// The prototypes of the proxy libraries: EGL and the GLES 1.x / 2.x / 3.x headers with their extensions (AOSP's Khronos headers), parsed once per view.
@@ -664,12 +662,9 @@ fn bindings_table(
                 format!("Entry::Trap({})", traps.len() - 1)
             };
             let entry = match (guest_view.functions.get(name), host_ir.functions.get(name)) {
+                // both engines: the shim maps the guest env to the host's (engine/ndk.rs); its other arguments are integer lanes in one address space
                 (Some(_), Some(_)) if NDK_SHIMS.contains(&name.as_str()) => {
-                    if qemu {
-                        trap(QEMU_NDK_PENDING)
-                    } else {
-                        "Entry::Shim".to_owned()
-                    }
+                    "Entry::Shim".to_owned()
                 }
                 (Some(_), Some(_)) if ANNOTATED.contains(&name.as_str()) => {
                     trap("pending: annotated, GS2.2")

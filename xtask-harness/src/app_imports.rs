@@ -98,10 +98,9 @@ pub fn classify(
     Class::Unknown { weak }
 }
 
-/// The slice that owns a remaining import, from the trap reason the table generates (build.rs): the NDK shims wait for Q6-6, GS2.2 classes are deferred (D-Q7-5), R-1 refusals stay refused, the rest has no slice yet.
+/// The slice that owns a remaining import, from the trap reason the table generates (build.rs): GS2.2 classes are deferred (D-Q7-5), R-1 refusals stay refused, the rest has no slice yet.
 pub fn owner(c: &Class) -> &'static str {
     match c {
-        Class::Trapped(_, why) if why.contains("Q6") => "Q6-6 (NDK shims under QEMU)",
         Class::Trapped(_, why) if why.contains("GS2.2") => "GS2.2 (deferred, D-Q7-5)",
         Class::Trapped(_, why) if why.starts_with("refused") => "R-1 (refused by design)",
         Class::Trapped(..) => "none: needs a binding row",
@@ -372,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn ndk_shim_traps_pending_q6() {
+    fn ndk_shim_bound_under_qemu() {
         let rows = qemu_rows();
         let c = classify(
             "AndroidBitmap_lockPixels",
@@ -382,7 +381,6 @@ mod tests {
             &rows,
             &BTreeMap::new(),
         );
-        assert!(matches!(c, Class::Trapped("libjnigraphics.so", _)), "{c:?}");
-        assert_eq!(owner(&c), "Q6-6 (NDK shims under QEMU)");
+        assert!(matches!(c, Class::Bound("libjnigraphics.so")), "{c:?}");
     }
 }

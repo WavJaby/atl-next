@@ -15,7 +15,7 @@ pub(super) mod identity {
     include!(concat!(env!("OUT_DIR"), "/bindings_table_identity.rs"));
 }
 
-/// The QEMU engine's table: the arm64 NBS libc stub list; the NDK shims trap until Q6 (build.rs `QEMU_NDK_PENDING`).
+/// The QEMU engine's table: the arm64 NBS libc stub list; the NDK shims bind as in identity's.
 pub(crate) mod qemu {
     include!(concat!(env!("OUT_DIR"), "/bindings_table_qemu.rs"));
 }
