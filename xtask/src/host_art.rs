@@ -327,6 +327,34 @@ impl HostArt {
     }
 }
 
+/// The shared libraries every runtime run's library path holds, as [`stage_art`] links them into its lib dir: each `<out>/device/<module>/*.so` the converter linked, plus the provided libraries built outside the tree ([`provided_lib_dirs`]).
+pub fn runtime_libs(out: &Path) -> Result<Vec<PathBuf>> {
+    let mut libs = Vec::new();
+    for module in std::fs::read_dir(out.join("device"))? {
+        let module = module?.path();
+        if !module.is_dir() {
+            continue;
+        }
+        for f in std::fs::read_dir(&module)? {
+            let f = f?.path();
+            if f.extension().is_some_and(|e| e == "so") && f.is_file() {
+                libs.push(f);
+            }
+        }
+    }
+    for provider in provided_lib_dirs(out)? {
+        for f in std::fs::read_dir(&provider)? {
+            let f = f?.path();
+            let name = f.file_name().context("a file name")?;
+            // the soname file (libatl_bionic.so.0.0.0) is what DT_NEEDED names
+            if name.to_string_lossy().contains(".so") && f.is_file() {
+                libs.push(f);
+            }
+        }
+    }
+    Ok(libs)
+}
+
 /// The lib dirs of the providers `xtask native` built outside the tree: `<out>/crates/<crate>/lib`, `<out>/upstream/<name>/prefix/lib`.
 fn provided_lib_dirs(out: &Path) -> Result<Vec<PathBuf>> {
     let mut dirs = Vec::new();
@@ -382,28 +410,9 @@ fn stage_art(out: &Path, art: &Path, tree: &Path, pointer_bits: u32) -> Result<P
         Path::new(atl_android_paths::SYSTEM_CACERTS),
         &art.join("etc/security/cacerts"),
     )?;
-    for module in std::fs::read_dir(&device)? {
-        let module = module?.path();
-        if !module.is_dir() {
-            continue;
-        }
-        for f in std::fs::read_dir(&module)? {
-            let f = f?.path();
-            if f.extension().is_some_and(|e| e == "so") && f.is_file() {
-                let name = f.file_name().context("a file name")?;
-                link(&f, &lib.join(name))?;
-            }
-        }
-    }
-    for provider in provided_lib_dirs(out)? {
-        for f in std::fs::read_dir(&provider)? {
-            let f = f?.path();
-            let name = f.file_name().context("a file name")?;
-            // the soname file (libatl_bionic.so.0.0.0) is what DT_NEEDED names
-            if name.to_string_lossy().contains(".so") && f.is_file() {
-                link(&f, &lib.join(name))?;
-            }
-        }
+    for f in runtime_libs(out)? {
+        let name = f.file_name().context("a file name")?;
+        link(&f, &lib.join(name))?;
     }
     let mut data = 0;
     for f in std::fs::read_dir(tree.join(ICU_DATA))? {

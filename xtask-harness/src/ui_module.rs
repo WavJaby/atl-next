@@ -29,7 +29,7 @@ const SOURCES: &str = "xtask-harness/testdata/ui-module";
 const FIXTURE: &str = "atl-platform-ui-module-fixture";
 /// The module's package and its file (atl-platform-ui-api `abi::MODULE_FILE`; the harness does not link the api crate).
 const MODULE_PACKAGE: &str = "atl-platform-ui-linux";
-const MODULE_FILE: &str = "libatl_platform_ui_linux.so";
+pub(crate) const MODULE_FILE: &str = "libatl_platform_ui_linux.so";
 /// NDK API level of the stand-ins: the level the plan's probe measured with (NDK r30, API 33).
 const API: u32 = 33;
 /// The record the module logs once attached (atl-platform-ui-linux module.rs `ui_attach`).

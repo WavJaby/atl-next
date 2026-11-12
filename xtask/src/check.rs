@@ -39,6 +39,8 @@ enum Step {
     Deps,
     /// every [aosp.sparse] row covers the reads of this checkout's slot graph, converted for every gate's goals (keepset.rs); skipped without a slot or graph
     Keepset,
+    /// launcher-closure.toml's rules, then every host library of the launcher's DT_NEEDED closure (its PT_INTERP's `ld.so --list` over the runtime library path) is a row and every row is in it (launcher_closure.rs); the closure part skipped without a slot or a built launcher
+    LauncherClosure,
     /// modules.toml equals the real cross-module crate graph
     Modules,
     /// a fresh checkout builds xtask: its build closure is definition crates only, and it builds offline under bwrap with src, src-wt and out hidden while a control crate that reads the tree fails there (bootstrap_gate.rs)
@@ -73,12 +75,13 @@ enum Step {
     CrossBionic,
 }
 
-const ALL: [Step; 21] = [
+const ALL: [Step; 22] = [
     Step::Fmt,
     Step::Spdx,
     Step::Tables,
     Step::Deps,
     Step::Keepset,
+    Step::LauncherClosure,
     Step::Modules,
     Step::Bootstrap,
     Step::Drift,
@@ -105,6 +108,7 @@ impl Step {
             Step::Tables => "tables",
             Step::Deps => "deps",
             Step::Keepset => "keepset",
+            Step::LauncherClosure => "launcher-closure",
             Step::Modules => "modules",
             Step::Bootstrap => "bootstrap",
             Step::Drift => "drift",
@@ -143,6 +147,9 @@ impl Step {
         if self == Step::Keepset {
             // reads the checkout's slot record (keepset.rs own_graph), not an explicit --out
             return crate::keepset::check_own(root);
+        }
+        if self == Step::LauncherClosure {
+            return crate::launcher_closure::check_own(root);
         }
         if self == Step::ConverterPackages {
             // the packages link the slot's converter rlibs: a slot built before a rebase fails late (E0432 on main's new parcelables), so refuse it by name, as the runtime gates do
@@ -301,6 +308,7 @@ impl Step {
             Step::Libcxx => libcxx_gate::check(root),
             Step::Runtimes => crate::runtimes::check(root),
             Step::Keepset => unreachable!("run handles keepset"),
+            Step::LauncherClosure => unreachable!("run handles launcher-closure"),
             Step::ConverterPackages => unreachable!("run handles converter-packages"),
             Step::GlProxies => unreachable!("run handles gl-proxies"),
             Step::CrossBionic => unreachable!("run handles cross-bionic"),

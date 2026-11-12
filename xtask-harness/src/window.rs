@@ -127,6 +127,12 @@ pub struct Args {
     /// Stage gles2 only: the fixture's worker thread parks forever instead of exiting, so the bridge never detaches it and the balance sub-gate must fail (the gate's deliberate break, fixture-side).
     #[arg(long)]
     break_no_detach: bool,
+    /// Stage hwui only: the app processes preload the platform module (`LD_PRELOAD`), putting GTK's closure in global scope as an `RTLD_GLOBAL` load would, so the bindings sub-gate must fail on undeclared app/AOSP -> host bindings (the gate's deliberate break).
+    #[arg(long)]
+    break_global_module: bool,
+    /// Stage hwui only: this `[[reverse]]` row of launcher-closure.toml is dropped before judging, so its soname is a new reverse binding and the bindings sub-gate must fail naming it (the gate's deliberate break).
+    #[arg(long, value_name = "SONAME")]
+    break_forget_reverse: Option<String>,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -1827,6 +1833,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
         Stage::Resume | Stage::Frames => rt,
     };
+    // the bindings sub-gate reads glibc's records from the app log (test-environment setup: the product reads neither variable)
+    let rt = if matches!(args.stage, Stage::Hwui) {
+        let mut env = vec!["LD_DEBUG=bindings".to_owned()];
+        if args.break_global_module {
+            env.push(format!("LD_PRELOAD={}", crate::ui_module::MODULE_FILE));
+        }
+        rt.with_app_env(&env)
+    } else {
+        rt
+    };
     // the refresh rate atld answers with and the cadence checks judge against: the gate's own compositor's; headless stages (no window) take the same gate output's; only a hold asks the desktop
     let display = match &nested {
         Some(n) => n.display(),
@@ -2139,6 +2155,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             ("mapped", gtk_window_check(&app)),
             ("hardware", hardware_check(&app)),
             (
+                "bindings",
+                bindings_check(root, &app, args.break_forget_reverse.as_deref()),
+            ),
+            (
                 "readback",
                 capture::judged(&captured, 0, opening_size(display), args.break_swap_rb),
             ),
@@ -2226,6 +2246,40 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     };
     println!("{}", verdict.line());
     Ok(ExitCode::FAILURE)
+}
+
+/// Stage hwui: the run's `LD_DEBUG=bindings` records against launcher-closure.toml (xtask launcher_closure.rs `judge_bindings`): app/AOSP/ours objects bind host only to glibc, the C++ runtime and the declared system bindings; host objects bind only listed AOSP sonames, never a forbidden one.
+/// The O4 count per soname is judged against its row's ceiling (5 runs measured identical, spread 0) and printed in full.
+fn bindings_check(root: &Path, app: &str, forget: Option<&str>) -> Result<String, String> {
+    use xtask::launcher_closure::{judge_bindings, load, parse_bindings};
+    let mut table = load(root).map_err(|e| format!("{e:#}"))?;
+    if let Some(s) = forget {
+        table.reverse.retain(|r| r.to != s);
+    }
+    let records = parse_bindings(app);
+    // an unresponsive probe (LD_DEBUG not reaching the app) would otherwise pass with nothing judged
+    if records.is_empty() {
+        return Err("no LD_DEBUG=bindings records in the app log".into());
+    }
+    let j = judge_bindings(&table, &records, crate::ui_module::MODULE_FILE);
+    println!(
+        "window: info reverse bindings (O4) {} records, {} unique, by soname {:?}",
+        j.reverse_records, j.reverse_unique, j.reverse_by_to
+    );
+    if j.failures.is_empty() {
+        Ok(format!(
+            "{} records; {} declared host bindings; {} reverse sonames, all listed",
+            records.len(),
+            j.declared,
+            j.reverse_by_to.len()
+        ))
+    } else {
+        Err(format!(
+            "{} problems: {}",
+            j.failures.len(),
+            j.failures.join("; ")
+        ))
+    }
 }
 
 /// A new Task's window size: 3/4 of each display side, truncated -- AOSP desktop mode's default bounds (Shell DesktopModeUtils.kt:43-56, `persist.wm.debug.desktop_mode_initial_bounds_scale` default 75), stated here from AOSP, not read from the services.
