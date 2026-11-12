@@ -73,10 +73,12 @@ func main() {
 	measure := flag.Bool("measure", false, "write <out>/measure.txt (module types and source kinds the goals reach, measure.go) instead of a build")
 	cxxProbe := flag.String("device-cxx-flags", "", "tree dir: instead of a build, write <out>/compat (the libc provider from -provided) and print as JSON {argv, android} the C++ command line a device module there gets with nothing of its own, and the -D__ANDROID__ define in it (xtask check step libcxx); takes no goals")
 	upstreamToolchain := flag.Bool("upstream-toolchain", false, "print as JSON {libcxx, compile, link} and exit, for builds outside the converter that must compile and link like its host modules (xtask upstream.rs): the libc++ headers (stl.go libcxxProvider: the one -cxx searches, or a cross host's -host-libcxx) and the host target flags (soongflags.go HostCross); takes -cxx and the -host-* flags too")
-	hostTarget := flag.String("host-target", "", "cross host (the build machine is another arch): the clang triple of the host's code (arches.toml clang); with -host-sysroot, -host-isa and -host-libcxx, all four or none")
+	hostTarget := flag.String("host-target", "", "cross host (the build machine is another arch): the clang triple of the host's code (arches.toml clang); with -host-sysroot, -host-isa, -host-libcxx and -host-rust-target, all five or none")
 	hostSysroot := flag.String("host-sysroot", "", "cross host: the target's sysroot directory (a fetched sysroot_debs row, deps.toml)")
 	hostISA := flag.String("host-isa", "", "cross host: -march of the host's code (arches.toml isa)")
 	hostLibcxx := flag.String("host-libcxx", "", "cross host: the sysroot's libc++ headers directory, derived by xtask (cross::libcxx_dir: the one c++/v1 holding __config); under -host-sysroot")
+	hostRustTarget := flag.String("host-rust-target", "", "cross host: rustc --target of the host's product crates (arches.toml rust; its std is a rustup_target row)")
+	hostRustFeatures := flag.String("host-rust-features", "", "cross host: rustc -C target-feature of the host's isa past the base (xtask arches::rustc_target_features, e.g. +zba,+zbb); may be empty")
 	buildArch := flag.String("build-arch", "", "cross host: Soong arch name of the build machine (its arches.toml row, xtask arches::build_machine): the build side, which compiles every node a build rule executes or loads; given exactly with the -host-* flags")
 	buildBits := flag.Int("build-pointer-bits", 0, "cross host: pointer width of -build-arch (its arches.toml pointer_bits)")
 	nbExports := flag.String("nb-exports", "", "module: instead of a build, print as JSON the include flags its -native-bridge variant hands dependents (exportsOf), for builds outside the converter that compile against bionic's headers (xtask runtimes: libc_headers); takes no goals")
@@ -124,9 +126,9 @@ func main() {
 		}
 		return
 	}
-	cross := HostCross{Target: *hostTarget, Sysroot: *hostSysroot, ISA: *hostISA, Libcxx: *hostLibcxx}
-	if cross.set() && (cross.Target == "" || cross.Sysroot == "" || cross.ISA == "" || cross.Libcxx == "") {
-		fmt.Fprintln(os.Stderr, "bp2ninja: -host-target, -host-sysroot, -host-isa and -host-libcxx go together")
+	cross := HostCross{Target: *hostTarget, Sysroot: *hostSysroot, ISA: *hostISA, Libcxx: *hostLibcxx, RustTarget: *hostRustTarget, RustFeatures: *hostRustFeatures}
+	if cross.set() && (cross.Target == "" || cross.Sysroot == "" || cross.ISA == "" || cross.Libcxx == "" || cross.RustTarget == "") {
+		fmt.Fprintln(os.Stderr, "bp2ninja: -host-target, -host-sysroot, -host-isa, -host-libcxx and -host-rust-target go together")
 		os.Exit(2)
 	}
 	if cross.set() != (*buildArch != "") || (*buildArch != "") != (*buildBits != 0) {

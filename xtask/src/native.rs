@@ -120,7 +120,7 @@ fn flag_or_row(flag: &Option<String>, root: &Path, row: &str) -> Result<String> 
     }
 }
 
-/// The converter's flags for a cross host (`cross`: arches::cross_target): the target's clang triple, its fetched sysroot, its isa and the libc++ headers in that sysroot (atl_layout::libcxx_dir, the one derivation),
+/// The converter's flags for a cross host (`cross`: arches::cross_target): the target's clang triple, its fetched sysroot, its isa, its rust target and rustc features (arches::rustc_target_features) and the libc++ headers in that sysroot (atl_layout::libcxx_dir, the one derivation),
 /// and the build machine's row and pointer width (`build`: arches::build_machine), which the converter's build side (tools a build rule executes or loads) is compiled for. Empty for the build machine, whose compiler already targets it.
 fn cross_args(
     root: &Path,
@@ -141,6 +141,10 @@ fn cross_args(
         c.isa.clone(),
         "-host-libcxx".to_owned(),
         libcxx.display().to_string(),
+        "-host-rust-target".to_owned(),
+        c.rust.clone(),
+        "-host-rust-features".to_owned(),
+        arches::rustc_target_features(&c.isa)?,
         "-build-arch".to_owned(),
         build_name.to_owned(),
         "-build-pointer-bits".to_owned(),

@@ -98,11 +98,7 @@ pub fn cargo_target(root: &Path, arch: &str) -> Result<CargoTarget> {
         "sysroot path {} has whitespace",
         sysroot.display()
     );
-    let features: Vec<String> = arches::isa_extensions(isa)?
-        .iter()
-        .map(|e| format!("+{e}"))
-        .collect();
-    let rustflags = rustflags(&features, clang, &sysroot, &lib);
+    let rustflags = rustflags(&arches::rustc_target_features(isa)?, clang, &sysroot, &lib);
     let driver = deps::binary(root, "clang")?;
     Ok(CargoTarget {
         triple: host.rust.clone(),
@@ -129,11 +125,10 @@ fn env_key(triple: &str, suffix: &str) -> String {
     )
 }
 
-/// The RUSTFLAGS of a cross link: the ISA features for rustc, then the clang triple, lld and the sysroot for the linker.
-fn rustflags(features: &[String], clang: &str, sysroot: &Path, lib: &Path) -> String {
+/// The RUSTFLAGS of a cross link: the ISA features for rustc (arches::rustc_target_features), then the clang triple, lld and the sysroot for the linker.
+fn rustflags(features: &str, clang: &str, sysroot: &Path, lib: &Path) -> String {
     format!(
-        "-C target-feature={} -C link-arg=--target={clang} -C link-arg=-fuse-ld=lld -C link-arg=--sysroot={} -C link-arg=-L{}",
-        features.join(","),
+        "-C target-feature={features} -C link-arg=--target={clang} -C link-arg=-fuse-ld=lld -C link-arg=--sysroot={} -C link-arg=-L{}",
         sysroot.display(),
         lib.display()
     )
@@ -170,7 +165,7 @@ mod tests {
     #[test]
     fn rustflags_carry_isa_and_link_driver() {
         let flags = rustflags(
-            &["+zba".to_owned(), "+zbb".to_owned()],
+            "+zba,+zbb",
             "riscv64-linux-gnu",
             Path::new("/s"),
             Path::new("/s/usr/riscv64-linux-gnu/lib"),

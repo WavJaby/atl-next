@@ -9,7 +9,7 @@
 #   kernel_arch       Linux kernel arch: the uapi `asm-<kernel_arch>` directory (bionic `libc_uapi_headers` arch block, checked against the fetched tree)
 #   uapi_records      records `asm-<kernel_arch>/asm/ptrace.h` declares that AOSP's <sys/ptrace.h> consumers read by layout: the arch's branch of libmemunreachable ThreadCapture.cpp (pt_regs on arm/x86, user_pt_regs on arm64, user_regs_struct on riscv64). atl-bionic emits them; checked against that header (xtask check tables)
 # `[<arch>.host]` present = we build and run on it (one 64-bit process per app):
-#   rust              Rust target triple of the host build
+#   rust              Rust target triple of the host build; a cross host's product crates take it as rustc --target, with its isa's extensions as target features (native.rs cross_args)
 #   meson_cpu_family  meson `cpu_family` (QEMU cross files)
 #   debian            Debian architecture name; for a sysroot row, the arch of its private apt index (cache/apt/<debian>)
 #   archlinux         Arch Linux architecture; absent where Arch has no official port

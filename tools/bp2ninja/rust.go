@@ -21,7 +21,7 @@ import (
 //     The rlibs' own cc dependencies (libcxx's whole_static_libs libcxxbridge05) link into that final link like any static closure member; Soong bundles them into the rlib instead, same objects.
 //   - Toolchain: the repo's rust-toolchain.toml rustc (stable), with the host's own sysroot, so std, core, alloc and proc_macro come from it; Soong's `--sysroot=/dev/null` + prebuilt std modules are not mirrored.
 //     Soong's -Z flags (stack-protector, remap-cwd-prefix, dylib-lto, link-native-libraries, tls-model, debug-info-for-profiling) need nightly; they harden or tune code, never change what compiles, so they are dropped.
-//   - Device crates build for the host triple (rustc's default target), as cc device modules do: target_os is linux, not android. cc device compiles define __ANDROID__ (androidDefine); rustc's target_os is no define, so it stays linux.
+//   - Device crates build for the ATL host's triple (rustc's default target on the build machine; a cross host's row target, HostCross.rustFlags), as cc device modules do: target_os is linux, not android. cc device compiles define __ANDROID__ (androidDefine); rustc's target_os is no define, so it stays linux.
 //     So a device crate takes the linux_glibc `target: {…}` blocks (rustOSSide), keeping device codegen flags (rustDeviceFlags) -- unlike cc, which keeps android blocks.
 //     cc device code is written against the Android userspace API, which this build provides, so android blocks stay right for it.
 //   - Native bridge crates link bionic: rustc --target <rust/config RustTriple> (rustSideFlags) with rustup's std for that target (`rustup target add`), so target_os is android and they keep their own android blocks.
@@ -31,6 +31,8 @@ import (
 //     and gets `--cfg atl_android_userspace` (rustAndroidCfg), which a patch to its source adds to exactly the `target_os = "android"` gates it needs; its host variant is untouched.
 //   - Lints: `--cap-lints allow` for every crate, as cc's -w: a newer rustc warns differently, errors are what this build measures (Soong caps only external/ and prebuilts/).
 //   - Source providers (rust_protobuf, rust_bindgen, aidl_interface rust backends): rlibs whose crate root a build step generates, rustsrc.go; named in another crate's srcs, their source variant (Kind Gen) generates only.
+//   - Cross host (arches.toml row with isa and rust): its product crates (Device, Host) take the row's target and isa features (HostCross.rustFlags), and its Rust binaries link with its cc link flags; the build machine's crates (tools, proc macros) keep rustc's default target.
+//     The converter reads no Soong Rust codegen flags (rustGlobalFlags is the whole list), so Soong's riscv64 `-C target-feature=+V,+Zba,+Zbb,+Zbs` (rust/config/riscv64_device.go) never reaches rustc.
 //   - Not supported, reported as problems: dylib / cdylib / staticlib crate variants (rust_ffi in shared_libs), provider types without a rustSourceProviders row (rust_aconfig_library).
 
 // rustOSSide: the side whose OS blocks a Rust module takes on side (flatten): rustc compiles for linux_glibc, so Host, but Device for a device variant of a rust_os = "android" row.
@@ -83,7 +85,7 @@ var rustGlobalFlags = []string{"-C", "opt-level=3", "-C", "relocation-model=pic"
 // rustDeviceFlags: rust/config/global.go deviceGlobalRustFlags that a stable rustc takes.
 var rustDeviceFlags = []string{"-C", "panic=abort"}
 
-// rustSideFlags: the codegen flags of every crate on side: global, device ones on android sides (Soong's native bridge variant is a device variant), a bionic side's --target.
+// rustSideFlags: the codegen flags of every crate on side: global, device ones on android sides (Soong's native bridge variant is a device variant), a bionic side's --target, a cross host's product target (HostCross.rustFlags).
 func (g *Graph) rustSideFlags(s Side) []string {
 	flags := append([]string{}, rustGlobalFlags...)
 	if s.android() {
@@ -91,6 +93,9 @@ func (g *Graph) rustSideFlags(s Side) []string {
 	}
 	if !s.glibc() {
 		flags = append(flags, "--target", g.soong.Flags.RustTriple[s])
+	}
+	if g.cfg.machine(s) == "host" {
+		flags = append(flags, g.cfg.HostCross.rustFlags()...)
 	}
 	return flags
 }
@@ -598,8 +603,14 @@ func (g *Graph) emitRust(b *strings.Builder, n *Node, tools Tools) {
 }
 
 // rustLinkArgs: a Rust binary's link: the cc link driver (Soong's rustc_linker runs clang++), the cc libraries its crates need (rustCcLibs) as link args, and their dirs as -L (rustLinkDirs).
+// A cross host's product binary links for its target as its cc links do: the side's Link (--target, --sysroot) and the lld flags (Soong's rust link takes the toolchain's link flags, lld among them).
 func (g *Graph) rustLinkArgs(n *Node, linker string) (flags, inputs []string) {
 	flags = []string{"-C", "linker=" + linker}
+	if g.cfg.machine(n.side) == "host" {
+		for _, f := range slices.Concat(g.soong.Flags.Link[n.side], g.soong.Lldflags) {
+			flags = append(flags, "-C", "link-arg="+f)
+		}
+	}
 	libs, inputs := g.rustCcLibs(n)
 	for _, l := range libs {
 		flags = append(flags, "-C", "link-arg="+l)

@@ -83,12 +83,13 @@ fn host_row<'a>(arches: &'a Arches, triple: &str) -> Result<(&'a str, &'a Arch)>
         .with_context(|| format!("no {FILE} [host] row has rust = {triple:?}"))
 }
 
-/// What a host of another arch than the build machine is compiled and linked for: its `[host]` row's clang, sysroot and isa.
+/// What a host of another arch than the build machine is compiled and linked for: its `[host]` row's clang, sysroot, isa and rust target.
 #[derive(Debug, PartialEq)]
 pub struct CrossTarget {
     pub clang: String,
     pub sysroot: String,
     pub isa: String,
+    pub rust: String,
 }
 
 /// The cross target of host `name` when the build machine is `build` (build_machine's name): None for the build machine itself; another arch needs all three columns of its row.
@@ -101,6 +102,7 @@ pub fn cross_target(name: &str, host: &Host, build: &str) -> Result<Option<Cross
             clang: clang.clone(),
             sysroot: sysroot.clone(),
             isa: isa.clone(),
+            rust: host.rust.clone(),
         })),
         _ => bail!(
             "{FILE}: {name} is not the build machine ({build}): a cross host needs clang, sysroot and isa in its [host] row"
@@ -242,6 +244,15 @@ pub fn isa_extensions(isa: &str) -> Result<Vec<String>> {
         );
     }
     Ok(extensions)
+}
+
+/// `rv64gc_zba_zbb` -> `+zba,+zbb`: the rustc `-C target-feature` list of `isa` (empty for the base alone). One derivation for cross::cargo_target and the converter's `-host-rust-features`.
+pub fn rustc_target_features(isa: &str) -> Result<String> {
+    Ok(isa_extensions(isa)?
+        .iter()
+        .map(|e| format!("+{e}"))
+        .collect::<Vec<_>>()
+        .join(","))
 }
 
 /// The extensions an `isa` row allows, implied ones included: `rv64gc_zba_zbb` -> a c d f i m zaamo zalrsc zba zbb zca zcd zicsr zifencei zmmul.
@@ -500,6 +511,11 @@ mod tests {
         assert!(super::isa_extensions("rv64gcv_zba_zbb").is_err());
         assert!(super::isa_extensions("rv64gc_v").is_err());
         assert!(super::isa_extensions("rv64gc_Zba").is_err());
+        assert_eq!(
+            super::rustc_target_features("rv64gc_zba_zbb").unwrap(),
+            "+zba,+zbb"
+        );
+        assert_eq!(super::rustc_target_features("rv64gc").unwrap(), "");
     }
 
     #[test]
@@ -553,6 +569,7 @@ mod tests {
                 clang: "riscv64-linux-gnu".into(),
                 sysroot: "riscv64-sysroot".into(),
                 isa: "rv64gc_zba_zbb".into(),
+                rust: "t".into(),
             })
         );
         // another arch with no or a partial row: an error, never the build machine's flags

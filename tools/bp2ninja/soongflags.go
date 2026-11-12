@@ -77,18 +77,33 @@ func toolchainLocation(f string) int {
 	return 0
 }
 
-// HostCross: the target of a host whose arch is not the build machine's (xtask native: the host row's clang, sysroot and isa). Zero = the build machine's own, no flags.
+// HostCross: the target of a host whose arch is not the build machine's (xtask native: the host row's clang, sysroot, isa and rust). Zero = the build machine's own, no flags.
 // The distro clang compiles and links for any target it knows given --target and --sysroot (the sysroot's libraries, crt objects and GCC runtime dir are found under it). -march pins the ISA baseline: no V or Zbs reaches an object, except an isa-tiers.toml row's file (isatier.go; readelf -A Tag_RISCV_arch).
+// Rust follows the same row: rustc --target and the isa's extensions as target features (rustFlags), so no product crate takes the build machine's default target or Soong's riscv64 Rust features.
 // No -fuse-ld here: Soong's lldflags give every host link -fuse-ld=lld already (readLldflags).
 type HostCross struct {
-	Target  string // clang --target
-	Sysroot string // the sysroot directory (a fetched sysroot_debs row)
-	ISA     string // -march
-	Libcxx  string // the sysroot's libc++ headers (xtask cross::libcxx_dir): the one c++/v1 holding __config
+	Target       string // clang --target
+	Sysroot      string // the sysroot directory (a fetched sysroot_debs row)
+	ISA          string // -march
+	Libcxx       string // the sysroot's libc++ headers (xtask cross::libcxx_dir): the one c++/v1 holding __config
+	RustTarget   string // rustc --target of the host's product crates (arches.toml rust); its std is a rustup_target row
+	RustFeatures string // rustc -C target-feature: the isa's extensions past the base (arches::rustc_target_features); empty for the base alone
 }
 
-// set: the host is cross. main.go requires its four fields together.
+// set: the host is cross. main.go requires Target, Sysroot, ISA, Libcxx and RustTarget together; RustFeatures may be empty.
 func (h HostCross) set() bool { return h != (HostCross{}) }
+
+// rustFlags: the rustc flags of a cross host's product crates, in place of rustc's default target (Soong's RustTriple: --target, then the target's features).
+func (h HostCross) rustFlags() []string {
+	if !h.set() {
+		return nil
+	}
+	flags := []string{"--target", h.RustTarget}
+	if h.RustFeatures != "" {
+		flags = append(flags, "-C", "target-feature="+h.RustFeatures)
+	}
+	return flags
+}
 
 // compileFlags: the target flags of every host compile, ahead of the Soong toolchain's (instruction set first, compiler.go).
 func (h HostCross) compileFlags() []string {

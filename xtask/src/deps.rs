@@ -1025,6 +1025,31 @@ mod tests {
         );
     }
 
+    /// A cross host's rust std row against the installed std targets: the named `rustup target add` problem that cross::cargo_target stops on before any build, and none once installed.
+    #[test]
+    fn missing_rust_std_is_named_before_any_build() {
+        let text = "[rust-std-riscv64]\nrustup_target = \"riscv64gc-unknown-linux-gnu\"\nscope = [\"build\"]\nused_by = [\"xtask:cross\", \"host:riscv64\"]\n";
+        let deps = parse(text, &consumers()).unwrap();
+        let dep = &deps["rust-std-riscv64"];
+        let none = BTreeSet::new();
+        assert_eq!(
+            check_row(dep, Distro::Debian, &BTreeMap::new(), &none, Path::new("/")).unwrap(),
+            Some("missing: rustup target add riscv64gc-unknown-linux-gnu".to_owned())
+        );
+        let installed = BTreeSet::from(["riscv64gc-unknown-linux-gnu".to_owned()]);
+        assert_eq!(
+            check_row(
+                dep,
+                Distro::Debian,
+                &BTreeMap::new(),
+                &installed,
+                Path::new("/")
+            )
+            .unwrap(),
+            None
+        );
+    }
+
     #[test]
     fn cross_only_means_every_consumer_is_a_cross_build() {
         let row = |used: &str| -> Dep {
