@@ -80,21 +80,6 @@ scope = "runtime"
 via = "libatl_app_runtime.so"
 reason = "the cxx crate's C++ runtime in the runtime cdylib (launcher-ui-module O2), out of global scope since X1"
 
-[[closure]]
-soname = "libvulkan.so.1"
-class = "system"
-scope = "runtime"
-via = "libstagefright_framecapture_utils.so"
-provider = "libvulkan"
-reason = "the Khronos loader in place of AOSP's (providers.toml libvulkan); V0 removes it"
-
-[[binding]]
-from = "libhwui.so"
-to = "libvulkan.so.1"
-symbols = ["vkEnumerateInstanceVersion", "vkGetDeviceProcAddr", "vkGetInstanceProcAddr"]
-provider = "libvulkan"
-reason = "hwui's Vulkan pipeline probe through the Khronos loader (providers.toml libvulkan); V0 removes it"
-
 [[reverse]]
 to = "libsigchain.so"
 max_bindings = 17
