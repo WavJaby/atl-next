@@ -121,21 +121,32 @@ fn bias_past_the_displacement_is_refused() {
 
 #[test]
 fn counted_shells_save_restore_and_call_the_counter() {
-    // literal layout, not the emitter's constants: 200 B save area (rdi, rsi, rdx, rcx, r8, r9, rax at 0..56, %r11 at 56, the index at 64, xmm0-7 at 72..200); rsp is 8 mod 16 after the pop, so 200 B keeps it 16-aligned at the call
+    // literal layout, not the emitter's constants: 216 B save area (rdi, rsi, rdx, rcx, r8, r9, rax at 0..56, %r11 at 56, the index at 64, xmm0-7 at 72..200, the entry %rdi at 200, 8 B pad); rsp is 8 mod 16 after the pop, so 216 B keeps it 16-aligned at the call
     let text = entries_asm(2, 1, 0, true);
     assert!(
-        text.contains(".hidden atl_nb_count_host, atl_nb_count_jni\n"),
+        text.contains(".hidden atl_nb_count_host, atl_nb_count_object\n"),
         "{text}"
     );
-    assert_eq!(text.matches("    sub $200, %rsp\n").count(), 2, "{text}");
-    assert_eq!(text.matches("    add $200, %rsp\n").count(), 2, "{text}");
+    assert_eq!(text.matches("    sub $216, %rsp\n").count(), 2, "{text}");
+    assert_eq!(text.matches("    add $216, %rsp\n").count(), 2, "{text}");
+    // the entry %rdi saved before the body, passed as the counter's third argument
+    assert_eq!(
+        text.matches("    mov %rdi, 200(%rsp)\n").count(),
+        2,
+        "{text}"
+    );
+    assert_eq!(
+        text.matches("    mov 200(%rsp), %rdx\n").count(),
+        2,
+        "{text}"
+    );
     assert_eq!(
         text.matches("    call atl_nb_count_host\n").count(),
         1,
         "{text}"
     );
     assert_eq!(
-        text.matches("    call atl_nb_count_jni\n").count(),
+        text.matches("    call atl_nb_count_object\n").count(),
         1,
         "{text}"
     );

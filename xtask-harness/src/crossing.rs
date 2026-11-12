@@ -35,11 +35,11 @@ const BREAKS: [(&str, char); 2] = [("qe_id", 'c'), ("qe_jni_count", 'j')];
 const IDENTITY_BREAK: (&str, char) = ("id_count", 'j');
 /// Bound on one cargo run, as qemu_linker's harness runs (its `RUN_TIMEOUT_SECS`).
 const RUN_TIMEOUT_SECS: u32 = 240;
-/// Symbol prefixes of the counters in `nm -C` output: the counter module's demangled Rust path, the counter entries' exported names (`atl_nb_count_host`, the shared JNI entry `atl_nb_count_jni`), and the JNI slot names the dump reads.
+/// Symbol prefixes of the counters in `nm -C` output: the counter module's demangled Rust path, the counter entries' exported names (`atl_nb_count_host`, the shared object entry `atl_nb_count_object`), and dispatch's object counter functions.
 const COUNTER_SYMBOLS: [&str; 3] = [
     "atl_native_bridge::counters",
     "atl_nb_count_",
-    "atl_native_bridge::engine::jni::slot_names",
+    "atl_native_bridge::engine::dispatch::count_object",
 ];
 
 #[derive(clap::Args)]

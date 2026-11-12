@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Q5-8b gate (QEMU bridge plan section 5), harness-less: the crossing counter on the identity side (feature `crossing-count`; the counted shells of `atl-bridgegen` `x86::entries_asm`). A stand-in guest loop, run as g4 runs its own (stand-in guest TCB, no TLS), calls the host thunk pool and the JNI stub pool; each call crosses to a host function.
 //! Expected values are the loop counts this file passes, never the counter's: each host function also counts its own calls, so the counter is checked against a record it does not write.
-//! Checks: (s) started (FSGSBASE); (t) thunk crossings per host target exact, two slots bound to one target counted together; (j) JNI stub crossings per target and per JNI slot exact (slots 5 and 9, no other slot; the slot count is the shared `dispatch::count_jni` entry QEMU's route also takes); (w) 2^16 further crossings dump exactly once; (f) FS on the host after the calls.
+//! Checks: (s) started (FSGSBASE); (t) thunk crossings per host target exact, two slots bound to one target counted together; (j) JNI stub crossings per target and per JNI slot exact (slots 5 and 9, no other slot; the slot count is the shared `dispatch::count_object` entry, per (table, slot) QEMU's route also takes); (w) 2^16 further crossings dump exactly once; (f) FS on the host after the calls.
 //! Output: `crossing: (x) ok` or `crossing: (x) FAIL <why>` per check; exit 0 when all pass. Break `ATL_NB_BREAK=id_count`: the shells are generated plain, so the counter sees nothing and (t), (j) and (w) must fail.
 #![allow(
     clippy::print_stdout,
@@ -12,7 +12,8 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use atl_native_bridge::counters::{self, Snapshot};
-use atl_native_bridge::engine::{Engine, HostThread, Tp, identity};
+use atl_native_bridge::engine::objects::{ENV, TableId};
+use atl_native_bridge::engine::{Engine, HostThread, Tp, identity, jni};
 
 /// Thunk calls per host target: `A` and `B` one slot each, `D` bound to two slots (its count sums by target).
 const CALLS_A: u64 = 40_000;
@@ -109,21 +110,32 @@ fn check_counts(d: &[(usize, u64)], want: &[(usize, u64)]) -> Result<(), String>
     Ok(())
 }
 
-/// Each JNI slot in `want` gained exactly its count between the snapshots, and no other JNI slot gained any.
-fn check_slots(before: &Snapshot, after: &Snapshot, want: &[(usize, u64)]) -> Result<(), String> {
-    let of = |s: &Snapshot, k: usize| s.jni.iter().find(|&&(x, _)| x == k).map_or(0, |&(_, c)| c);
-    for &(k, _) in &after.jni {
+/// Each (table, slot) in `want` gained exactly its count between the snapshots, and no other object slot gained any.
+fn check_slots(
+    before: &Snapshot,
+    after: &Snapshot,
+    want: &[((TableId, usize), u64)],
+) -> Result<(), String> {
+    let of = |s: &Snapshot, k: (TableId, usize)| {
+        s.objects
+            .iter()
+            .find(|&&(x, _)| x == k)
+            .map_or(0, |&(_, c)| c)
+    };
+    for &(k, _) in &after.objects {
         let got = of(after, k) - of(before, k);
         let n = want.iter().find(|&&(w, _)| w == k).map_or(0, |&(_, n)| n);
         if got != n {
             return Err(format!(
-                "JNI slot {k} counted {got} calls, the loop makes {n}"
+                "object slot {k:?} counted {got} calls, the loop makes {n}"
             ));
         }
     }
     for &(k, n) in want {
-        if n != 0 && !after.jni.iter().any(|&(x, _)| x == k) {
-            return Err(format!("JNI slot {k} counted 0 calls, the loop makes {n}"));
+        if n != 0 && !after.objects.iter().any(|&(x, _)| x == k) {
+            return Err(format!(
+                "object slot {k:?} counted 0 calls, the loop makes {n}"
+            ));
         }
     }
     Ok(())
@@ -181,14 +193,13 @@ fn run() -> bool {
     else {
         return report('s', Err("no free thunk".into()));
     };
-    // a host JNIEnv object: word 0 is its function table, which `atl_nb_object_up` reads per call; the guest env: word 1 is the object, which the shell reads
+    // a host JNIEnv object: word 0 is its function table, which `atl_nb_object_up` reads per call; the guest env (`jni::guest_env`): word 0 the registered env table, which the counter names, word 1 the object, which the shell reads
     let mut table = vec![0usize; identity::OBJECT_STUBS];
     table[JNI_E] = addr(host_e);
     table[JNI_F] = addr(host_f);
     let table: &'static [usize] = Box::leak(table.into_boxed_slice());
     let object: &'static [usize; 1] = Box::leak(Box::new([table.as_ptr() as usize]));
-    let env: &'static [usize; 2] = Box::leak(Box::new([0, object.as_ptr() as usize]));
-    let env = env.as_ptr() as usize;
+    let env = jni::guest_env(object.as_ptr() as usize);
     let (je, jf) = (identity::object_stub(JNI_E), identity::object_stub(JNI_F));
     let mut ok = report('s', Ok(()));
 
@@ -234,7 +245,13 @@ fn run() -> bool {
     ok &= report(
         'j',
         check_counts(&j, &[(addr(host_e), CALLS_E), (addr(host_f), CALLS_F)])
-            .and_then(|()| check_slots(&before, &after, &[(JNI_E, CALLS_E), (JNI_F, CALLS_F)]))
+            .and_then(|()| {
+                check_slots(
+                    &before,
+                    &after,
+                    &[((ENV, JNI_E), CALLS_E), ((ENV, JNI_F), CALLS_F)],
+                )
+            })
             .and_then(|()| check_own(&[("host_e", &OWN_E, CALLS_E), ("host_f", &OWN_F, CALLS_F)])),
     );
 

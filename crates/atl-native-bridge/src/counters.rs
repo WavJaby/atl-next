@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Crossing counter (QEMU bridge plan section 5, Q5-8 / Q5-8b; feature `crossing-count`, absent from shipped builds).
 //!
-//! Per pool slot: the host target that ran and the crossings it took. Three pools, each its own slot space: QEMU's binding slots (`count_binding`, called by `dispatch::call_binding`), the identity engine's host thunks (`atl_nb_count_host`, called by the counted shells of `atl-bridgegen` `x86::entries_asm`), and the JNI slots of both engines (`count_jni`, called only by `dispatch::jni`: QEMU's `call_object` and the identity JNI shell share that one entry). A JNI slot is one index into both the JNIEnv and the JavaVM table (one stub pool serves both), so the dump names it by both tables' entries. Per [`Mem`] kind: a histogram of the sizes the counted `memcpy`/`memset`/`memcmp` shims were given. Bin = bit length of the size: bin 0 = size 0, bin k = 2^(k-1) <= size < 2^k.
+//! Per pool slot: the host target that ran and the crossings it took. Three pools, each its own slot space: QEMU's binding slots (`count_binding`, called by `dispatch::call_binding`), the identity engine's host thunks (`atl_nb_count_host`, called by the counted shells of `atl-bridgegen` `x86::entries_asm`), and the proxy object slots of both engines per (table, slot) (`count_object`, called only by `dispatch::count_object`: QEMU's `call_object` and the identity object shell share that one entry). One stub pool serves every table (objects.rs), so the table comes from the guest object, not the stub; the dump names a slot by its table's record and entry. Per [`Mem`] kind: a histogram of the sizes the counted `memcpy`/`memset`/`memcmp` shims were given. Bin = bit length of the size: bin 0 = size 0, bin k = 2^(k-1) <= size < 2^k.
 //!
 //! Every 2^16 crossings the 16-bit tick wraps and [`dump`] writes the slots and histogram bins that are non-zero to fd 2. The dump allocates nothing, calls no libc function and touches no TLS: its line buffer is on the stack and it writes with a raw `syscall`, because the identity side counts on guest FS, where glibc's wrapper would read the host thread pointer (errno, cancellation).
 //! Counts are relaxed atomics: exact, lock-free, and a crossing costs a few stores.
@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
 
 use crate::engine::bindings::qemu::THUNKS;
 use crate::engine::identity::{OBJECT_STUBS, THUNKS as HOST_THUNKS};
+use crate::engine::objects::{TABLES, TableId};
 
 /// Histogram bins: the bit lengths 0..=64 of a `usize` size.
 pub const BINS: usize = usize::BITS as usize + 1;
@@ -44,9 +45,15 @@ impl Slot {
 }
 
 static SLOTS: [Slot; THUNKS] = [const { Slot::new() }; THUNKS];
-/// Identity: the host thunk pool (`bind`). Both engines: the JNI slots.
+/// Identity: the host thunk pool (`bind`).
 static HOST: [Slot; HOST_THUNKS] = [const { Slot::new() }; HOST_THUNKS];
-static JNI: [Slot; OBJECT_STUBS] = [const { Slot::new() }; OBJECT_STUBS];
+/// Rows: each registered table ([`TABLES`] order), then [`UNREGISTERED`].
+const OBJECT_ROWS: usize = TABLES.len() + 1;
+/// The row of a call whose object no registered table backs: identity's shell does not validate word 0 (QEMU refuses such a call before counting).
+pub const UNREGISTERED: TableId = TABLES.len();
+/// Both engines: the proxy object slots, per table.
+static OBJECTS: [[Slot; OBJECT_STUBS]; OBJECT_ROWS] =
+    [const { [const { Slot::new() }; OBJECT_STUBS] }; OBJECT_ROWS];
 static HIST: [[AtomicU64; BINS]; 3] = [const { [const { AtomicU64::new(0) }; BINS] }; 3];
 /// Crossings modulo 2^16: wraps (dumps) every 65536.
 static TICK: AtomicU16 = AtomicU16::new(0);
@@ -63,9 +70,9 @@ pub extern "C" fn atl_nb_count_host(slot: usize, target: usize) {
     count(&HOST, slot, target);
 }
 
-/// Counts one guest->host JNI call of slot `slot` to host `target`. Only `dispatch::jni` calls it, so both engines count JNI through one entry. No TLS, no libc (the identity side runs it on guest FS).
-pub(crate) fn count_jni(slot: usize, target: usize) {
-    count(&JNI, slot, target);
+/// Counts one guest->host call of slot `slot` of proxy table `table` ([`UNREGISTERED`]: none) to host `target`. Only `dispatch::count_object` calls it, so both engines count object calls through one entry. No TLS, no libc (the identity side runs it on guest FS).
+pub(crate) fn count_object(table: TableId, slot: usize, target: usize) {
+    count(&OBJECTS[table.min(UNREGISTERED)], slot, target);
 }
 
 /// Counts one crossing of `pool`'s slot `slot` to host `target`; dumps when the tick wraps.
@@ -78,9 +85,23 @@ fn count(pool: &[Slot], slot: usize, target: usize) {
     }
 }
 
-/// Every counted pool with its name in the dump: QEMU's `slot`, identity's `host`, both engines' `jni`.
-fn pools() -> [(&'static str, &'static [Slot]); 3] {
-    [("slot", &SLOTS), ("host", &HOST), ("jni", &JNI)]
+/// Every counted pool with its name in the dump: QEMU's `slot`, identity's `host`, then both engines' object rows, each `object` with its table.
+fn pools() -> impl Iterator<Item = (&'static str, Option<TableId>, &'static [Slot])> {
+    [("slot", None, &SLOTS[..]), ("host", None, &HOST[..])]
+        .into_iter()
+        .chain(
+            OBJECTS
+                .iter()
+                .enumerate()
+                .map(|(t, r)| ("object", Some(t), &r[..])),
+        )
+}
+
+/// A table's record name for the dump (`?` for [`UNREGISTERED`]) and the entry at `slot` ("" past its end).
+fn object_names(table: TableId, slot: usize) -> (&'static str, &'static str) {
+    TABLES.get(table).map_or(("?", ""), |&(record, slots)| {
+        (record, slots.get(slot).copied().unwrap_or(""))
+    })
 }
 
 /// Records a size given to a counted shim: its bin is the size's bit length.
@@ -123,8 +144,8 @@ pub unsafe extern "C" fn memcmp(a: *const c_void, b: *const c_void, n: usize) ->
 pub struct Snapshot {
     /// (host target, crossings), in slot order of first use.
     pub targets: Vec<(usize, u64)>,
-    /// (JNI slot, crossings) of every JNI slot that ran, in slot order: the per-slot view `targets` folds away.
-    pub jni: Vec<(usize, u64)>,
+    /// ((table, slot), crossings) of every proxy object slot that ran, in table then slot order: the per-slot view `targets` folds away. Table = [`TABLES`] index or [`UNREGISTERED`].
+    pub objects: Vec<((TableId, usize), u64)>,
     /// Bin counts per [`Mem`] kind (index = `kind as usize`).
     pub sizes: [[u64; BINS]; 3],
     /// Dumps written so far: one per 2^16 crossings.
@@ -134,7 +155,7 @@ pub struct Snapshot {
 /// The counters now. Allocates (the result is a `Vec`): for gates on the host thread, never from a crossing.
 pub fn snapshot() -> Snapshot {
     let mut targets: Vec<(usize, u64)> = Vec::new();
-    for s in pools().iter().flat_map(|&(_, pool)| pool.iter()) {
+    for s in pools().flat_map(|(_, _, pool)| pool.iter()) {
         let calls = s.calls.load(Ordering::Relaxed);
         if calls == 0 {
             continue;
@@ -147,43 +168,48 @@ pub fn snapshot() -> Snapshot {
     }
     let sizes =
         std::array::from_fn(|k| std::array::from_fn(|b| HIST[k][b].load(Ordering::Relaxed)));
-    let jni = JNI
+    let objects = OBJECTS
         .iter()
         .enumerate()
-        .map(|(k, s)| (k, s.calls.load(Ordering::Relaxed)))
+        .flat_map(|(t, row)| {
+            row.iter()
+                .enumerate()
+                .map(move |(k, s)| ((t, k), s.calls.load(Ordering::Relaxed)))
+        })
         .filter(|&(_, c)| c != 0)
         .collect();
     Snapshot {
         targets,
-        jni,
+        objects,
         sizes,
         dumps: DUMPS.load(Ordering::Relaxed),
     }
 }
 
-/// Writes the dump number, the non-empty slots (`<pool> <k> <target> <calls>`; a JNI slot `jni <k> <env entry>|<vm entry> <target> <calls>`, the vm part only where the vm table reaches `k`) and the non-empty histogram bins (`<kind> bin <b> <count>`) to fd 2. No allocation, no libc, no TLS.
+/// Writes the dump number, the non-empty slots (`<pool> <k> <target> <calls>`; an object slot `object <record> <k> <entry> <target> <calls>`) and the non-empty histogram bins (`<kind> bin <b> <count>`) to fd 2. No allocation, no libc, no TLS.
 fn dump() {
     let n = DUMPS.fetch_add(1, Ordering::Relaxed) + 1;
     let mut out = Out::new();
     out.text("crossing-count: dump ");
     out.dec(n);
     out.text(" (every 65536 crossings)\n");
-    for (name, pool) in pools() {
+    for (name, table, pool) in pools() {
         for (slot, s) in pool.iter().enumerate() {
             let calls = s.calls.load(Ordering::Relaxed);
             if calls != 0 {
                 out.text("  ");
                 out.text(name);
                 out.text(" ");
+                let entry = table.map(|t| {
+                    let (record, entry) = object_names(t, slot);
+                    out.text(record);
+                    out.text(" ");
+                    entry
+                });
                 out.dec(slot as u64);
                 out.text(" ");
-                if std::ptr::eq(pool, JNI.as_slice()) {
-                    let [env, vm] = crate::engine::jni::slot_names(slot);
-                    out.text(env);
-                    if !vm.is_empty() {
-                        out.text("|");
-                        out.text(vm);
-                    }
+                if let Some(entry) = entry {
+                    out.text(entry);
                     out.text(" ");
                 }
                 out.hex(s.target.load(Ordering::Relaxed));

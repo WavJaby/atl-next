@@ -73,11 +73,22 @@ pub(super) fn call_binding(id: u32, lanes: &AtlLanes) -> Answer {
     call_host(target, lanes, ret)
 }
 
-/// The JNI crossing counter's one entry (QEMU bridge plan section 5, `dispatch::jni(slot)`): a guest->host JNI call of slot `slot` to host `target`. Both engines call it -- QEMU's [`call_object`] directly, the identity JNI shell (`atl-bridgegen` `x86::entries_asm`, counted) by this symbol on guest FS, so it touches no TLS and no libc. Break `qe_jni_count`: [`call_object`] skips it, so only identity counts.
+/// The object crossing counter's one entry (QEMU bridge plan section 5, per proxy table + slot): a guest->host call of slot `slot` of table `table` to host `target`. QEMU's [`call_object`] calls it with the table `lane_of` found; the identity object shell reaches it through [`count_object_shell`]. Break `qe_jni_count`: [`call_object`] skips it, so only identity counts.
 #[cfg(feature = "crossing-count")]
-#[unsafe(export_name = "atl_nb_count_jni")]
-pub extern "C" fn count_jni(slot: usize, target: usize) {
-    crate::counters::count_jni(slot, target);
+fn count_object(table: objects::TableId, slot: usize, target: usize) {
+    crate::counters::count_object(table, slot, target);
+}
+
+/// The identity object shell's counter (`atl-bridgegen` `x86::entries_asm`, counted): slot `slot` ran `target` for guest object `guest` (the shell's %rdi before its body rewrote it), whose table is read from its word 0. Runs on guest FS: `table_of` reads atomics only, no TLS, no libc.
+///
+/// # Safety
+/// `guest` is the object the guest called through: readable for one word (the shell has already read its word 1).
+#[cfg(feature = "crossing-count")]
+#[unsafe(export_name = "atl_nb_count_object")]
+pub unsafe extern "C" fn count_object_shell(slot: usize, target: usize, guest: usize) {
+    // SAFETY: caller contract.
+    let table = unsafe { objects::table_of(guest) }.unwrap_or(crate::counters::UNREGISTERED);
+    count_object(table, slot, target);
 }
 
 /// A guest JNI call (pool id `id` < `OBJECT_STUBS`, Q6-2): x0 is the guest's JNIEnv or JavaVM, and the call runs on the host object it stands for. That object's own table slot `id` runs with x0 replaced by the host object and the other lanes forwarded; its result is the answer. The descriptor (`jni::lane_of`, from the guest object's table) gives the result class; a refused call aborts by name ([`refuse`]).
@@ -85,7 +96,8 @@ pub extern "C" fn count_jni(slot: usize, target: usize) {
 fn call_object(id: u32, lanes: &AtlLanes) -> Answer {
     let guest = lanes.x[0] as usize;
     // SAFETY: x0 is the object pointer the guest called through.
-    let (_, lane) = unsafe { objects::lane_of(guest, id as usize) }.unwrap_or_else(|r| refuse(r));
+    let (table, lane) =
+        unsafe { objects::lane_of(guest, id as usize) }.unwrap_or_else(|r| refuse(r));
     // SAFETY: `guest` is a guest env or vm: `lane_of` found its table, which only `guest_env` / `guest_vm` objects carry.
     let host = unsafe { objects::host_of(guest) };
     let mut lanes = *lanes;
@@ -109,7 +121,9 @@ fn call_object(id: u32, lanes: &AtlLanes) -> Answer {
     let target = unsafe { objects::host_slot(host, slot) };
     // counted as the guest's slot `id`, with the host function that ran
     #[cfg(all(feature = "crossing-count", not(atl_nb_qe_jni_count)))]
-    count_jni(id as usize, target);
+    count_object(table, id as usize, target);
+    #[cfg(not(all(feature = "crossing-count", not(atl_nb_qe_jni_count))))]
+    let _ = table;
     #[cfg(atl_nb_jni_swap)]
     if id as usize == jni::CALL_STATIC_INT_METHOD {
         lanes.x.swap(3, 4);

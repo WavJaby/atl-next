@@ -89,7 +89,7 @@ fn bytes_lit(b: &[u8]) -> String {
 /// `atl_nb_cross_to_host` (host-function slots) and `atl_nb_object_up` (JNI slots) pop the return address, turn it into the slot's index (`ret - (pool + CALL_LEN)`), index their table and jump to the up crossing `atl_nb_up`. `atl_nb_object_up` first rewrites %rdi to the host object (word 1 of the guest JNIEnv/JavaVM) and reads the target from that object's own table per call (ART swaps an env's table for CheckJNI); every other argument, %al and stack word reaches the host function untouched (variadic Call*Method).
 /// `atl_nb_host_thunks` holds `thunks` slots and `atl_nb_object_stubs` `jni_stubs`; each slot is `call` + alignment, written as opcode plus `.long target - . - 4` so the generator owns the displacement expression.
 /// `disp_bias` is 0 in every shipped build. The break (build.rs `BREAKS`) sets it to 1: the displacement comes out one short, so each pool call lands one byte past its shell.
-/// `counted` (feature `crossing-count`, build.rs): each shell calls its counter (counters.rs `atl_nb_count_host` / `atl_nb_count_jni`) with (slot, target) before the up crossing. False: the plain shells.
+/// `counted` (feature `crossing-count`, build.rs): each shell calls its counter (counters.rs `atl_nb_count_host` / dispatch.rs `atl_nb_count_object`) with (slot, target, the guest's %rdi as it entered) before the up crossing; the host counter ignores the third. False: the plain shells.
 pub fn entries_asm(thunks: usize, jni_stubs: usize, disp_bias: usize, counted: bool) -> String {
     assert!(
         disp_bias < CALL_LEN - 1,
@@ -100,8 +100,8 @@ pub fn entries_asm(thunks: usize, jni_stubs: usize, disp_bias: usize, counted: b
     let mut s = String::from(".text\n");
     // hidden: the counter calls bind direct, not through the PLT (the shells run on guest FS)
     let counters = if counted {
-        s.push_str(".hidden atl_nb_count_host, atl_nb_count_jni\n");
-        Some(("atl_nb_count_host", "atl_nb_count_jni"))
+        s.push_str(".hidden atl_nb_count_host, atl_nb_count_object\n");
+        Some(("atl_nb_count_host", "atl_nb_count_object"))
     } else {
         None
     };
@@ -143,9 +143,9 @@ pub fn entries_asm(thunks: usize, jni_stubs: usize, disp_bias: usize, counted: b
     s
 }
 
-/// Counted shells: bytes of the save area. After the pop rsp is 8 mod 16 (the pool slot's call put its return on top of the guest's), so 192 B of registers (rdi..rax, %r11, xmm0-7) + the 8 B index keeps rsp 16-aligned at the counter call.
-pub const SAVE_BYTES: usize = 200;
-/// Save area offsets: the GPR arguments, %r11 (the target, after the body), the pool index (before the body), xmm0-7 at 16 B each.
+/// Counted shells: bytes of the save area. After the pop rsp is 8 mod 16 (the pool slot's call put its return on top of the guest's), so 192 B of registers (rdi..rax, %r11, xmm0-7) + the 8 B index + the 8 B entry %rdi + 8 B pad keeps rsp 16-aligned at the counter call.
+pub const SAVE_BYTES: usize = 216;
+/// Save area offsets: the GPR arguments, %r11 (the target, after the body), the pool index and the entry %rdi (both before the body), xmm0-7 at 16 B each.
 const SAVE_GPRS: [(&str, usize); 7] = [
     ("%rdi", 0),
     ("%rsi", 8),
@@ -158,6 +158,7 @@ const SAVE_GPRS: [(&str, usize); 7] = [
 const SAVE_TARGET: usize = 56;
 const SAVE_INDEX: usize = 64;
 const SAVE_XMM: usize = 72;
+const SAVE_ENTRY_RDI: usize = 200;
 
 /// One index shell: `pop` the return, subtract the pool base + [`CALL_LEN`] (the return of a pool call), then `body` (loads the target into %r11, may first rewrite %rdi), then the up crossing.
 /// Counted (`counter` = the counter's symbol): the index is saved before `body`, the registers after it (a JNI body rewrites %rdi), and [`count_call`] runs before the up crossing.
@@ -170,7 +171,7 @@ fn shell(s: &mut String, name: &str, pool: &str, body: &[&str], counter: Option<
     if counter.is_some() {
         write!(
             s,
-            "    sub ${SAVE_BYTES}, %rsp\n    mov %r11, {SAVE_INDEX}(%rsp)\n"
+            "    sub ${SAVE_BYTES}, %rsp\n    mov %r11, {SAVE_INDEX}(%rsp)\n    mov %rdi, {SAVE_ENTRY_RDI}(%rsp)\n"
         )
         .expect("writing to a String");
     }
@@ -183,7 +184,7 @@ fn shell(s: &mut String, name: &str, pool: &str, body: &[&str], counter: Option<
     write!(s, "    jmp atl_nb_up\n.size {name}, .-{name}\n").expect("writing to a String");
 }
 
-/// The counted shell's tail: saves the registers as the body left them, calls `counter(slot, target)` on the guest stack (%rdi = pool index >> log2 [`SLOT`], %rsi = %r11), then restores them and pops the save area.
+/// The counted shell's tail: saves the registers as the body left them, calls `counter(slot, target, entry rdi)` on the guest stack (%rdi = pool index >> log2 [`SLOT`], %rsi = %r11, %rdx = %rdi before the body), then restores them and pops the save area.
 fn count_call(s: &mut String, counter: &str) {
     for (reg, at) in SAVE_GPRS {
         writeln!(s, "    mov {reg}, {at}(%rsp)").expect("writing to a String");
@@ -195,7 +196,7 @@ fn count_call(s: &mut String, counter: &str) {
     }
     writeln!(
         s,
-        "    mov {SAVE_INDEX}(%rsp), %rdi\n    shr ${}, %rdi\n    mov %r11, %rsi\n    call {counter}",
+        "    mov {SAVE_INDEX}(%rsp), %rdi\n    shr ${}, %rdi\n    mov %r11, %rsi\n    mov {SAVE_ENTRY_RDI}(%rsp), %rdx\n    call {counter}",
         SLOT.trailing_zeros()
     )
     .expect("writing to a String");

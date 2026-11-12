@@ -13,12 +13,6 @@ use objects::host_slot;
 /// jni.h `JNI_OK`.
 const JNI_OK: i32 = 0;
 
-/// The jni.h entries at JNI slot `slot` for the crossing counter's dump: [env entry, vm entry], "" where a table is shorter. One stub pool serves both tables, so a counted slot is either.
-#[cfg(feature = "crossing-count")]
-pub(crate) fn slot_names(slot: usize) -> [&'static str; 2] {
-    [env::SLOTS.get(slot), vm::SLOTS.get(slot)].map(|n| n.copied().unwrap_or(""))
-}
-
 /// Deliberate break `jni_swap` (dispatch.rs `call_object`): the one entry whose variadic lanes it exchanges. Other entries keep their order: GetStaticMethodID's x3 is its signature.
 #[cfg(atl_nb_jni_swap)]
 pub(super) const CALL_STATIC_INT_METHOD: usize = env::CallStaticIntMethod;
