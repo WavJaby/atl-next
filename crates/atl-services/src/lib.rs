@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! ATL's M2 system services in Rust (owner decision 2026-11-03: AOSP's Java system_server on ART would add resident memory, startup time and a large build closure; not measured; more services and methods later, per service).
 //! Each implements a converter-built AIDL stub (atl-aidl) and only the methods M2 needs; the rest keep the stub's default body (aidl `--rust_unimplemented_hook`), which lands in
-//! [`unimplemented`]: counted per (interface, method) and answered UNKNOWN_TRANSACTION, what Java's Binder.onTransact gives an unknown code.
+//! [`atl_services_wire::unimplemented`]: counted per (interface, method) and answered UNKNOWN_TRANSACTION, what Java's Binder.onTransact gives an unknown code.
 //! `@EnforcePermission` methods ask [`atl_services_types::permission::Permissions::holds`] first (fail-closed). Policy modules are plain Rust; the binder modules need feature `converter`.
 #![forbid(unsafe_code)]
 
@@ -71,16 +71,8 @@ pub mod storage;
 #[cfg(feature = "converter")]
 mod token;
 #[cfg(feature = "converter")]
-pub mod ui_agent;
+pub mod ui_agents;
 #[cfg(feature = "converter")]
 pub mod user;
 #[cfg(feature = "converter")]
 pub mod window;
-
-/// The stubs' `unimplemented` hook: counted ([`atl_services_types::counters`]), then UNKNOWN_TRANSACTION (frameworks/base core/java/android/os/Binder.java onTransact returns false for a code it does not know,
-/// which the caller sees as UNKNOWN_TRANSACTION; a Java proxy then reads an empty reply: no exception, a null / zero result).
-#[cfg(feature = "converter")]
-pub fn unimplemented(interface: &'static str, method: &str) -> binder::Status {
-    atl_services_types::counters::count_unimplemented(interface, method);
-    binder::StatusCode::UNKNOWN_TRANSACTION.into()
-}

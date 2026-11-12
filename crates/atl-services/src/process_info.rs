@@ -30,7 +30,7 @@ fn fill(pids: Option<&[i32]>, out: &mut Option<Vec<i32>>, value: i32) -> binder:
 
 impl IProcessInfoService for ProcessInfoService {
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        crate::unimplemented(INTERFACE, method)
+        atl_services_wire::unimplemented(INTERFACE, method)
     }
 
     /// ProcessInfoService.getProcessStatesFromPids -> AMS getProcessStatesAndOomScoresForPIDs(pids, states, null).

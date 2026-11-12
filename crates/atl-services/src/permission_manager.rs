@@ -64,7 +64,7 @@ impl IPermissionManager for PermissionManagerService {
     }
 
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        crate::unimplemented(INTERFACE, method)
+        atl_services_wire::unimplemented(INTERFACE, method)
     }
 
     fn r#checkPermission(

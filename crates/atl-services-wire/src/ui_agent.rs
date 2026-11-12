@@ -5,12 +5,11 @@
 //! WINDOW_POSITION: a window's layer id (i32) and its frame's origin in its Task (x, y: i32) in, nothing out; the agent sets the layer's position, as WMS does on the window's SurfaceControl (WindowState.updateSurfacePosition -> Transaction.setPosition).
 //! INPUT_SERVER: a window's input channel token (strong binder, the token both channel ends carry: AOSP keys a dispatcher connection by it) and server end (an fd, ParcelFileDescriptor) and the window's LayoutParams flags (i32) in, nothing out.
 //! REMOVE_INPUT: a removed window's input channel token in, nothing out: the agent drops that channel (WindowState.disposeInputChannel -> InputDispatcher::removeInputChannel). TASK: the window's Task number (i32, tasks.rs) in, nothing out; the agent names it in its SET_BOUNDS.
-//! The app serves it (atl-composer `ui_agent`: the layer in its in-process compositor, the input server end to its input thread). This module holds the protocol on both sides and the table the registry fills per uid.
-//! The window service calls it through the proxy; the server object is only ever a remote one here, so `Binder<BnUiAgent>` delegates to the native object like any AIDL interface.
+//! The app serves it (atl-composer `ui_agent`: the layer in its in-process compositor, the input server end to its input thread). This module holds the protocol on both sides; the table the registry fills per uid is atl-services `ui_agents`.
+//! The window service calls it through the proxy; `Binder<BnUiAgent>` delegates to the native object like any AIDL interface.
 
-use std::collections::HashMap;
 use std::os::fd::OwnedFd;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
 use atl_parcelables::android::view::{SurfaceControl, SurfaceControl_Transaction};
 use atl_parcelables::codecs::android::view::SurfaceControl_Transaction::TransactionObject;
@@ -354,27 +353,5 @@ impl IUiAgent for Binder<BnUiAgent> {
         height: i32,
     ) -> Result<(), StatusCode> {
         self.0.dim_layer(layer_id, amount, width, height)
-    }
-}
-
-/// The UI agents the registry holds, by uid. One app per uid: a process that registers again replaces its uid's entry (a restarted app).
-#[derive(Default)]
-pub struct UiAgents {
-    agents: Mutex<HashMap<u32, SpIBinder>>,
-}
-
-impl UiAgents {
-    pub fn insert(&self, uid: u32, agent: SpIBinder) {
-        self.lock().insert(uid, agent);
-    }
-
-    /// The agent registered for `uid`.
-    pub fn get(&self, uid: u32) -> Option<SpIBinder> {
-        self.lock().get(&uid).cloned()
-    }
-
-    fn lock(&self) -> MutexGuard<'_, HashMap<u32, SpIBinder>> {
-        // a poisoned table still holds the agents
-        self.agents.lock().unwrap_or_else(|e| e.into_inner())
     }
 }

@@ -19,7 +19,7 @@ use atl_aidl::aidl::android::content::pm::IPackageManager::BnPackageManager;
 use atl_services::activity::{ActivityManager, RootBack};
 use atl_services::package::PackageManager;
 use atl_services::process_control::ControlSocket;
-use atl_services::ui_agent::UiAgents;
+use atl_services::ui_agents::UiAgents;
 use atl_services_types::compositor_registry;
 use atl_services_types::display_model::DisplayModel;
 use atl_services_types::packages::{Library, PackageRecord, Packages};

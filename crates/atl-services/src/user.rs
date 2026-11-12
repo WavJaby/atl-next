@@ -17,7 +17,7 @@ impl Interface for UserService {}
 
 impl IUserManager for UserService {
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        crate::unimplemented(INTERFACE, method)
+        atl_services_wire::unimplemented(INTERFACE, method)
     }
 
     /// UserManagerService.isUserRunning:8005: a user with a state (mUserStates) is running; the system user has one, no other id does.

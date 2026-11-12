@@ -98,7 +98,7 @@ impl Interface for AudioFlinger {}
 #[allow(non_snake_case, reason = "AOSP's AIDL method names")]
 impl IAudioFlingerService for AudioFlinger {
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        atl_services::unimplemented(INTERFACE, method)
+        atl_services_wire::unimplemented(INTERFACE, method)
     }
 
     /// AudioSystem::getSamplingRate: AOSP answers 0 for a handle it does not have (AudioFlinger.cpp:1283-1292), and 0 here when the output cannot open.

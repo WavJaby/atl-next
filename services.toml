@@ -281,7 +281,7 @@ mirrors = [
 ]
 
 [sensorservice]
-src = ["crates/atl-services/src/sensor.rs", "crates/atl-services/src/sensor_wire.rs"]
+src = ["crates/atl-services/src/sensor.rs", "crates/atl-services/src/sensor_wire.rs", "crates/atl-services-wire/src/sensor.rs", "crates/atl-services-wire/src/sensor_wire.rs"]
 mirrors = [
     "frameworks/native/services/sensorservice/SensorService.cpp#getSensorList",
     "frameworks/native/services/sensorservice/SensorService.cpp#getDynamicSensorList",

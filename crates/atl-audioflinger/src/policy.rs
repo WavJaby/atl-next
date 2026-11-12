@@ -23,7 +23,7 @@ impl Interface for AudioPolicy {}
 #[allow(non_snake_case, reason = "AOSP's AIDL method names")]
 impl IAudioPolicyService for AudioPolicy {
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        atl_services::unimplemented(INTERFACE, method)
+        atl_services_wire::unimplemented(INTERFACE, method)
     }
 
     /// AudioPolicyService::getOutput: the one output, for every stream (no routing policy yet).

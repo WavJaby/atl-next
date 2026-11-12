@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The app's UI agent (atl_services::ui_agent, M3 slice 5): a window's layer in this process's compositor, answered as the SurfaceControl the window service returns from relayout.
+//! The app's UI agent (atl_services_wire::ui_agent, M3 slice 5): a window's layer in this process's compositor, answered as the SurfaceControl the window service returns from relayout.
 //! The layer is made as createSurface makes one (`Composer::create_layer`, a root layer named after the window): the client is the one createConnection gives, the handle is the layer's.
 //! The SurfaceControl is libgui's parcel form (codecs/android/view/SurfaceControl.rs); the display's size, RGBA_8888, no transform hint.
 
@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use atl_compositor::model::ColorLayer;
 use atl_parcelables::android::view::{SurfaceControl, SurfaceControl_Transaction};
 use atl_parcelables::codecs::android::view::SurfaceControl::NativeSurfaceControl;
-use atl_services::ui_agent::{BnUiAgent, IUiAgent};
+use atl_services_wire::ui_agent::{BnUiAgent, IUiAgent};
 use binder::{BinderFeatures, Interface, SpIBinder, StatusCode};
 
 use crate::host::Composer;

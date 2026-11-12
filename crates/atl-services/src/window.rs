@@ -35,9 +35,10 @@ use binder::{
 
 use crate::activity;
 use crate::tasks::{Placement, TaskId, TaskSize, Tasks};
-use crate::ui_agent::{IUiAgent, UiAgents};
+use crate::ui_agents::UiAgents;
 use atl_services_types::counters;
 use atl_services_types::permission::Permissions;
+use atl_services_wire::ui_agent::IUiAgent;
 
 /// The interface names counters use.
 const WINDOW_MANAGER: &str = "IWindowManager";
@@ -259,7 +260,7 @@ impl IWindowManager for WindowManager {
     }
 
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        crate::unimplemented(WINDOW_MANAGER, method)
+        atl_services_wire::unimplemented(WINDOW_MANAGER, method)
     }
 
     /// WindowManagerService.hasNavigationBar:6669-6677, for the one display: false (see the module doc).
@@ -422,7 +423,7 @@ fn open_input_pair() -> Result<(OwnedFd, OwnedFd), StatusCode> {
 
 impl IWindowSession for Session {
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        crate::unimplemented(WINDOW_SESSION, method)
+        atl_services_wire::unimplemented(WINDOW_SESSION, method)
     }
 
     /// WindowManagerService.addWindow for a window of the one display: the window is recorded by its client binder and its Task (the activity its `attrs.token` names); a window that takes

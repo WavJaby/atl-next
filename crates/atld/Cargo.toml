@@ -19,6 +19,7 @@ atl-platform-host = { path = "../atl-platform-host" }
 atl-property-service = { path = "../atl-property-service" }
 atl-services = { path = "../atl-services" }
 atl-services-types = { path = "../atl-services-types" }
+atl-services-wire = { path = "../atl-services-wire" }
 clap.workspace = true
 md-5 = "0.11"
 pem-rfc7468 = { version = "1", features = ["alloc"] }

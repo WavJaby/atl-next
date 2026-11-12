@@ -97,7 +97,7 @@ impl IContentService for ContentService {
     }
 
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        crate::unimplemented(INTERFACE, method)
+        atl_services_wire::unimplemented(INTERFACE, method)
     }
 
     /// ContentService.registerContentObserver (:365-400). A null URI or observer is an IllegalArgumentException. The death link is set before the registration is kept, so a dead

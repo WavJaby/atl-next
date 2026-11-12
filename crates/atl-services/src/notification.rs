@@ -181,7 +181,7 @@ impl INotificationManager for NotificationManager {
     }
 
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        crate::unimplemented(INTERFACE, method)
+        atl_services_wire::unimplemented(INTERFACE, method)
     }
 
     /// enqueueToast (:3969): queued per (pkg, token); a known one only takes the new duration (record.update). Refused (false, as AOSP): no package or TN, MAX_PACKAGE_TOASTS

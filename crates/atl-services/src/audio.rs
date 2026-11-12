@@ -69,7 +69,7 @@ impl IAudioService for AudioService {
     }
 
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        crate::unimplemented(INTERFACE, method)
+        atl_services_wire::unimplemented(INTERFACE, method)
     }
 
     /// Repeat sounds for navigation (fast scroll) stay off: there is no sound effect player.

@@ -140,8 +140,8 @@ dependencies = [
  "atl-bridgegen",
  "atl-platform-ui",
  "atl-service-view",
- "atl-services",
  "atl-services-types",
+ "atl-services-wire",
  "rustix",
  "tracing",
 ]
@@ -246,8 +246,8 @@ dependencies = [
  "atl-platform-ui",
  "atl-scene-buffer",
  "atl-service-view",
- "atl-services",
  "atl-services-types",
+ "atl-services-wire",
  "rustix",
  "tracing",
 ]
@@ -637,6 +637,7 @@ dependencies = [
  "atl-libinput",
  "atl-platform-host",
  "atl-services-types",
+ "atl-services-wire",
  "clap",
  "rustix",
  "serde_json",
@@ -655,6 +656,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "atl-services-wire"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atl-bridgegen",
+ "atl-services-types",
+ "rustix",
+]
+
+[[package]]
 name = "atld"
 version = "0.0.0"
 dependencies = [
@@ -669,6 +680,7 @@ dependencies = [
  "atl-property-service",
  "atl-services",
  "atl-services-types",
+ "atl-services-wire",
  "clap",
  "md-5",
  "pem-rfc7468",

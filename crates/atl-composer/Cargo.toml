@@ -15,7 +15,7 @@ publish.workspace = true
 converter = ["device/libbinder_rs", "device/libatl_parcelables", "device/atl-aidl-stubs-rust", "device/libgui_aidl_types_rs", "device/librustutils"]
 
 [features]
-converter = ["atl-aidl/converter", "atl-ime/converter", "atl-libinput/converter", "atl-services/converter", "atl-service-view/converter"]
+converter = ["atl-aidl/converter", "atl-ime/converter", "atl-libinput/converter", "atl-services-wire/converter", "atl-service-view/converter"]
 
 [dependencies]
 atl-aidl = { path = "../atl-aidl" }
@@ -28,7 +28,7 @@ atl-ime = { path = "../atl-ime" }
 atl-libinput = { path = "../atl-libinput" }
 atl-platform-ui = { path = "../atl-platform-ui" }
 atl-scene-buffer = { path = "../atl-scene-buffer" }
-atl-services = { path = "../atl-services" }
+atl-services-wire = { path = "../atl-services-wire" }
 atl-services-types = { path = "../atl-services-types" }
 atl-service-view = { path = "../atl-service-view" }
 rustix.workspace = true

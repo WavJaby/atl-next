@@ -145,7 +145,7 @@ impl IDisplayManager for DisplayManager {
     }
 
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        crate::unimplemented(INTERFACE, method)
+        atl_services_wire::unimplemented(INTERFACE, method)
     }
 
     /// DisplayManagerService.getDisplayInfo: the record of display 0 from the model; null for any other display (there is no other).

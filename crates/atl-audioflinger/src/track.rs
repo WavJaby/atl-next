@@ -153,7 +153,7 @@ impl Interface for Track {}
 #[allow(non_snake_case, reason = "AOSP's AIDL method names")]
 impl IAudioTrack for Track {
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        atl_services::unimplemented(INTERFACE, method)
+        atl_services_wire::unimplemented(INTERFACE, method)
     }
 
     /// IAudioTrack.getCblk: a new fd of the region, as AOSP's TrackHandle returns a dup per call; the client maps it read-write.

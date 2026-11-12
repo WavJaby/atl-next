@@ -61,13 +61,14 @@ use crate::pending_intent_table::Key;
 use crate::process_control::ProcessControl;
 use crate::shared_memory::ApplicationSharedMemory;
 use crate::tasks::{TaskId, TaskSize, Tasks, initial_size};
-use crate::ui_agent::{IUiAgent, UiAgents};
+use crate::ui_agents::UiAgents;
 use crate::{package, settings};
 use atl_services_types::counters;
 use atl_services_types::display_model::DisplayModel;
 use atl_services_types::packages::{ActivityDecl, PackageRecord, Packages};
 use atl_services_types::permission::{self, Permissions, ROOT_UID, SHELL_UID, SYSTEM_UID};
 use atl_services_types::size_buckets::SizeBuckets;
+use atl_services_wire::ui_agent::IUiAgent;
 
 const AM: &str = "IActivityManager";
 const ACC: &str = "IActivityClientController";
@@ -1239,7 +1240,7 @@ impl IActivityManager for ActivityManager {
     }
 
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        crate::unimplemented(AM, method)
+        atl_services_wire::unimplemented(AM, method)
     }
 
     /// ActivityManagerService.checkPermissionForDevice (:6193-6200) -> checkComponentPermission: the install-time grants of `uid`'s packages (permission::check, rule A); one device.
@@ -1584,13 +1585,13 @@ impl IActivityManager for ActivityManager {
         }
         let no_restart = flags & INSTR_FLAG_NO_RESTART != 0;
         if flags & INSTR_FLAG_NO_RESTART != 0 {
-            return Err(crate::unimplemented(
+            return Err(atl_services_wire::unimplemented(
                 AM,
                 "startInstrumentation (INSTR_FLAG_NO_RESTART)",
             ));
         }
         if flags >> 5 != 0 {
-            return Err(crate::unimplemented(
+            return Err(atl_services_wire::unimplemented(
                 AM,
                 "startInstrumentation (INSTR_FLAG_INSTRUMENT_SDK_SANDBOX)",
             ));
@@ -1809,7 +1810,7 @@ impl IActivityManager for ActivityManager {
             )));
         }
         if kind == pending_intent::INTENT_SENDER_ACTIVITY_RESULT {
-            return Err(crate::unimplemented(
+            return Err(atl_services_wire::unimplemented(
                 AM,
                 "getIntentSenderWithFeature (activity result)",
             ));
@@ -2231,7 +2232,7 @@ impl Interface for ActivityClientController {}
 
 impl IActivityClientController for ActivityClientController {
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        crate::unimplemented(ACC, method)
+        atl_services_wire::unimplemented(ACC, method)
     }
 
     /// ActivityClientController.activityResumed:200-206 -> ActivityRecord.activityResumedLocked:6173, which finds the record by token, then clears its saved state, sets its splash-exit

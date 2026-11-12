@@ -1404,7 +1404,7 @@ fn run(a: &Args) -> Result<ExitCode> {
     if a.tilt_keys {
         services_args.extend([
             "--sensor-injection".into(),
-            atl_services::sensor::TILT_INJECTOR_PACKAGE.into(),
+            atl_services_wire::sensor::TILT_INJECTOR_PACKAGE.into(),
         ]);
     }
     if a.no_sensor_focus_check {

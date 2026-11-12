@@ -121,12 +121,12 @@ impl Tilt {
     }
 }
 
-/// The injector thread: connects as [`atl_services::sensor::TILT_INJECTOR_PACKAGE`], then every period steps the tilt and injects. Ends (logged) when the service is not in injection mode or the connection fails.
+/// The injector thread: connects as [`atl_services_wire::sensor::TILT_INJECTOR_PACKAGE`], then every period steps the tilt and injects. Ends (logged) when the service is not in injection mode or the connection fails.
 #[cfg(feature = "converter")]
 pub fn spawn(tilt: std::sync::Arc<std::sync::Mutex<Tilt>>, rotation: i32) -> Result<(), String> {
-    use atl_services::sensor_wire::Injector;
+    use atl_services_wire::sensor_wire::Injector;
     let run = move || {
-        let injector = match Injector::connect(atl_services::sensor::TILT_INJECTOR_PACKAGE) {
+        let injector = match Injector::connect(atl_services_wire::sensor::TILT_INJECTOR_PACKAGE) {
             Ok(Some(i)) => i,
             Ok(None) => {
                 tracing::info!("tilt: sensorservice not in injection mode, no tilt");

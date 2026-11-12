@@ -16,7 +16,7 @@ publish.workspace = true
 converter = ["device/libbinder_rs", "device/libatl_parcelables", "device/atl-aidl-stubs-rust", "device/libgui_aidl_types_rs"]
 
 [features]
-converter = ["atl-aidl/converter", "atl-libinput/converter"]
+converter = ["atl-aidl/converter", "atl-libinput/converter", "atl-services-wire/converter"]
 
 # Registers the services with servicemanager (as atld will) and serves them; `xtask test binder` runs it as uid 1000.
 [[bin]]
@@ -53,6 +53,7 @@ atl-libgui-parcel = { path = "../atl-libgui-parcel" }
 atl-libinput = { path = "../atl-libinput" }
 atl-platform-host = { path = "../atl-platform-host" }
 atl-services-types = { path = "../atl-services-types" }
+atl-services-wire = { path = "../atl-services-wire" }
 clap.workspace = true
 rustix.workspace = true
 serde_json.workspace = true

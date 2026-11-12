@@ -44,7 +44,7 @@ impl Interface for ConnectivityService {}
 
 impl IConnectivityManager for ConnectivityService {
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        crate::unimplemented(INTERFACE, method)
+        atl_services_wire::unimplemented(INTERFACE, method)
     }
 
     /// ConnectivityService.getActiveNetworkInfo: no agent for the uid -> null.

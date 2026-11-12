@@ -53,13 +53,13 @@ types = [
 ]
 
 [features]
-converter = ["atl-service-view/converter", "atl-audio-bridge/converter"]
+converter = ["atl-service-view/converter", "atl-audio-bridge/converter", "atl-services-wire/converter"]
 
 [dependencies]
 atl-audio-bridge = { path = "../atl-audio-bridge" }
 atl-platform-ui = { path = "../atl-platform-ui" }
 atl-service-view = { path = "../atl-service-view" }
-atl-services = { path = "../atl-services" }
+atl-services-wire = { path = "../atl-services-wire" }
 atl-services-types = { path = "../atl-services-types" }
 rustix.workspace = true
 tracing.workspace = true

@@ -16,7 +16,7 @@ use crate::activity::ActivityManager;
 use crate::desktop_bounds::ActivityInput;
 use crate::display::DisplayCallbacks;
 use crate::tasks::{TaskId, TaskSize, Tasks, initial_size};
-use crate::ui_agent::UiAgents;
+use crate::ui_agents::UiAgents;
 use atl_services_types::compositor_registry::{
     DESCRIPTOR, GET_COMPOSER, REGISTER, SET_BOUNDS, SET_DISPLAY, TASK_INFO,
 };

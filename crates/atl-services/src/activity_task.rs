@@ -668,7 +668,7 @@ impl Interface for ActivityTaskService {}
 
 impl IActivityTaskManager for ActivityTaskService {
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        crate::unimplemented(ATM, method)
+        atl_services_wire::unimplemented(ATM, method)
     }
 
     fn r#startActivity(

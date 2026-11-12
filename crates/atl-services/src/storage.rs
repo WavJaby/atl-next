@@ -55,7 +55,7 @@ impl IStorageManager for StorageService {
     }
 
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        crate::unimplemented(INTERFACE, method)
+        atl_services_wire::unimplemented(INTERFACE, method)
     }
 
     /// StorageManager.getVolumeList (StorageManager.java:330): the volumes of `user_id`; the calling package and the flags are not modelled.

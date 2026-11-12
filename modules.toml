@@ -39,7 +39,7 @@ exports = ["atl-android-paths"]
 # M2 wiring: binderd, servicemanager, the services and the apps, each a process started through the broker; serves the services' process control; the install step reads the package records (services' plain types); the VINTF manifests declare the graphics HALs (gralloc's definitions); the system font files come from the desktop's fonts (fonts)
 [atld]
 crates = ["atld"]
-uses = ["binder", "broker", "gralloc", "platform-host", "property-service", "services", "services-types", "android-paths", "fonts", "fonts-table"]
+uses = ["binder", "broker", "gralloc", "platform-host", "property-service", "services", "services-types", "services-wire", "android-paths", "fonts", "fonts-table"]
 
 # the user's launch surface (plan gpu-selection S2.5): `run --gpu`, the per-app GPU preference, the `.desktop` writer; it execs the ATL command (or switcherooctl) and links no ATL crate
 [launch]
@@ -84,7 +84,7 @@ uses = ["service-view", "generators"]
 [audioflinger]
 crates = ["atl-audioflinger"]
 exports = ["atl-audioflinger"]
-uses = ["service-view", "services", "services-types", "generators", "audio-bridge", "platform-ui"]
+uses = ["service-view", "services-wire", "services-types", "generators", "audio-bridge", "platform-ui"]
 
 # AOSP's server side of a track (ServerProxy over the mapped control block and buffer) and its mixer (AudioMixerBase), through cxx (wrap/mix.cpp): the boundary crate for atl-audioflinger's data plane (audio A2); libaudioclient and libaudioprocessing_base from the converter
 [audio-bridge]
@@ -96,7 +96,7 @@ uses = ["generators"]
 [composer]
 crates = ["atl-composer"]
 exports = ["atl-composer"]
-uses = ["aidl", "compositor", "libgui-parcel", "ime", "libinput", "platform-ui", "scene-buffer", "services", "services-types", "generators", "android-paths", "service-view", "gralloc"]
+uses = ["aidl", "compositor", "libgui-parcel", "ime", "libinput", "platform-ui", "scene-buffer", "services-wire", "services-types", "generators", "android-paths", "service-view", "gralloc"]
 
 # framework natives (libandroid_runtime) ATL implements itself instead of building their AOSP sources
 [android-runtime]
@@ -115,7 +115,7 @@ crates = ["atl-services"]
 # the package record types (plain Rust, no converter) are what atld installs and xtask writes
 exports = ["atl-services"]
 # libgui-parcel: finishDrawing frames the post-draw Transaction with libgui's reader to forward it (window.rs); platform-host: the sensor service reads the machine's accelerometers through it (sensor.rs); gralloc: atl-screencap reads the captured buffer's dma-buf (screencap.rs)
-uses = ["aidl", "generators", "broker", "libinput", "android-paths", "libgui-parcel", "platform-host", "gralloc", "services-types"]
+uses = ["aidl", "generators", "broker", "libinput", "android-paths", "libgui-parcel", "platform-host", "gralloc", "services-types", "services-wire"]
 
 # AOSP libinput as the converter builds it, reached through cxx adapters (wrap/input.cpp): the input publisher and the virtual keyboard's KeyCharacterMap; C++ only as the adapters the project CLAUDE.md allows
 [libinput]
@@ -240,6 +240,12 @@ crates = ["atl-services-types"]
 exports = ["atl-services-types"]
 # android-paths: a test checks a record path against the guest layout (dev-dependency)
 uses = ["android-paths"]
+
+# the wire of the hand-written binder interfaces services and their in-ATL clients share (IUiAgent, libsensor's sensorservice + the injector, the stubs' unimplemented hook): an app process depends on it instead of on services, so it links no platform-host
+[services-wire]
+crates = ["atl-services-wire"]
+exports = ["atl-services-wire"]
+uses = ["generators", "services-types"]
 
 # the font tables: fonts.toml and AOSP's alias / fallback-order JSON, parsed and checked
 [fonts-table]

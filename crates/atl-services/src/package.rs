@@ -309,7 +309,7 @@ impl IPackageManager for PackageManager {
     }
 
     fn r#unimplemented(&self, method: &'static str) -> Status {
-        crate::unimplemented(INTERFACE, method)
+        atl_services_wire::unimplemented(INTERFACE, method)
     }
 
     /// ComputerEngine.getApplicationInfo:986: null for a package the caller may not see or that does not exist.
