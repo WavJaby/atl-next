@@ -267,7 +267,7 @@ fn device_area(
     Ok((
         props,
         (
-            atl_property_service::AREA_ENV.to_owned(),
+            atl_android_paths::PROPERTY_AREA_ENV.to_owned(),
             path.display().to_string(),
         ),
     ))
