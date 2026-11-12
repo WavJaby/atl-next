@@ -142,6 +142,36 @@ pub fn gate_out(root: &Path, explicit: Option<&Path>, host: &str, gate: &str) ->
     Ok(out)
 }
 
+/// Run-time gate `gate`'s foreign native-bridge graph for guest `isa` (native.rs `graph_dir` under the host's out dir `out`): refused unless built from the checkout now with every nb goal the gate declares (gate_goals.rs `nb`), else naming the `native --native-bridge` command that builds them.
+pub fn foreign_out(root: &Path, out: &Path, host: &str, isa: &str, gate: &str) -> Result<PathBuf> {
+    let dir = crate::native::graph_dir(out, host, isa);
+    let modules: Vec<String> = crate::gate_goals::of(root, gate)?.nb.into_iter().collect();
+    let goals: Vec<String> = modules
+        .iter()
+        .map(|m| format!("{}{m}", crate::native::NB_GOAL))
+        .collect();
+    let fix = format!(
+        "cargo xtask native --host {host} --native-bridge {isa} {}",
+        goals.join(" ")
+    );
+    ensure_current(root, &dir).with_context(|| {
+        format!("gate `{gate}`: the {isa} native-bridge graph is not current: run `{fix}`")
+    })?;
+    let built = read(&dir).map(|r| r.goals).unwrap_or_default();
+    let missing: Vec<&str> = modules
+        .iter()
+        .filter(|m| !built.contains(&crate::gate_goals::nb_key(isa, m)))
+        .map(String::as_str)
+        .collect();
+    ensure!(
+        missing.is_empty(),
+        "gate `{gate}`: the {isa} native-bridge graph lacks {} goal(s): {}: run `{fix}`",
+        missing.len(),
+        missing.join(" ")
+    );
+    Ok(dir)
+}
+
 /// What a native build reads: the checkout's state, then each AOSP task copy bound over `src/aosp` (tree::overlays) as ` <project>=<its state>`, so a plain and a task build of one checkout differ.
 pub fn of_build(root: &Path) -> Result<String> {
     with_overlays(root, &crate::tree::overlays_of(root)?)

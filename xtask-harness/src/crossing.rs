@@ -6,7 +6,7 @@
 //! QEMU side (Q5-8): `tests/qemu_crossing.rs` on the real arm64 NB images: the fixture's N calls per binding count N, sizes fall in their literal bins, the fixture's N' JNI calls per env/vm slot count N' each, 2^16 crossings dump exactly once. Then the `qe_id` break (every binding calls its neighbour) must turn `c` red, and `qe_jni_count` (QEMU's JNI route skips the shared counter, so only identity counts JNI) must turn `j` red. Last, the library built without the feature has no counter symbol (`nm -C`), and the same probe finds one with the feature on (positive control).
 //!
 //! Library: the engine `.so` (`qemu_spike::engine_so_file`), as `qemu-thread` uses it. Fixture: `xtask-harness/testdata/crossing/fixture.c` (PIE, NDK clang, `-fno-builtin`). Boot: the engine boot executable (`qemu::boot_exe`, crates/atl-qemu-boot).
-//! Images: `--nb <dir>` is the arm64 NB out dir (`<out>/nb/arm64`), built as for `test qemu-thread`; the identity side needs none.
+//! Images: `--nb <dir>` is the arm64 NB out dir (`<out>/nb-graph-arm64/nb/arm64`), built as for `test qemu-thread`; the identity side needs none.
 //! Cargo runs go through `unit_use` with the feature selected here. Output: `<out>/qemu/<target>-linux-user-pic/crossing/`, one log per run; `cargo-probe` holds the feature-off and feature-on cdylib builds of the probe.
 
 use std::path::{Path, PathBuf};
@@ -50,7 +50,7 @@ pub struct Args {
     /// Out dir (default: as for `xtask qemu`).
     #[arg(long)]
     pub out: Option<PathBuf>,
-    /// The arm64 NB out dir (`<out>/nb/arm64`), as for `test qemu-thread`.
+    /// The arm64 NB out dir (`<out>/nb-graph-arm64/nb/arm64`), as for `test qemu-thread`.
     #[arg(long)]
     pub nb: PathBuf,
 }

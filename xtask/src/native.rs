@@ -34,8 +34,7 @@ pub struct Args {
     /// The host arch (an arches.toml row with `[host]`); also Soong's arch name. An arch other than the build machine's is cross-built with its row's clang, sysroot and isa.
     #[arg(long)]
     host: String,
-    /// Guest arch of the native bridge side (an arches.toml row with `[guest]`): first builds its LLVM runtimes (runtimes.rs) against bionic's `libc_headers`, then converts
-    /// `nb:` goals against bionic into `<out>/nb/<arch>`.
+    /// Guest arch of the native bridge side (an arches.toml row with `[guest]`): first builds its LLVM runtimes (runtimes.rs) against bionic's `libc_headers`, then converts `nb:` goals against bionic into `<out>/nb/<arch>`, or for a guest other than the host's into its own graph dir (`graph_dir`).
     #[arg(long)]
     native_bridge: Option<String>,
     /// C compiler (default: deps.toml row `clang`'s binary).
@@ -204,10 +203,17 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         out
     };
+    // the converter graph and what it builds: the host's out dir, or a foreign guest's own dir (graph_dir), so a foreign run writes neither the host build.ninja nor its args file
+    let graph_out = match &args.native_bridge {
+        Some(arch) => graph_dir(&out, &args.host, arch),
+        None => out.clone(),
+    };
+    let foreign = graph_out != out;
     // the state the crates will be built from, taken first; the record goes until they are
     let state = build_state::of_build(root)?;
     std::fs::create_dir_all(&out)?;
-    let mut built_goals = build_state::forget(&out, &state)?;
+    std::fs::create_dir_all(&graph_out)?;
+    let mut built_goals = build_state::forget(&graph_out, &state)?;
     built_goals.extend(args.recorded_goals());
     let tool_dir = out.join("bp2ninja");
     std::fs::create_dir_all(&out)?;
@@ -321,6 +327,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         packages::workspace_aidl_crates(root)?
     };
+    // a foreign graph builds no workspace packages (below), so it converts none of their AIDL goals
+    let aidl_goals = if foreign { Vec::new() } else { aidl_goals };
     let aidl_crates_file = out.join("aidl-crates.json");
     write_if_changed(
         &aidl_crates_file,
@@ -329,7 +337,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let rust = rust_toolchain(root)?;
     let libclang = libclang_dir(&flag_or_row(&args.cc, root, "clang")?)?;
     let llvm = llvm_prefix(&flag_or_row(&args.cc, root, "clang")?)?;
-    let nb = native_bridge_flags(root, &arches, args, &converter, &tree, &out, &llvm)?;
+    let nb = native_bridge_flags(root, &arches, args, &converter, &tree, &graph_out, &llvm)?;
     // the pinned tag's release config: build flags, and the values aconfig flag libraries are generated with (the converter builds aconfig from the tree)
     let release = aosp::target_release(&tree)?;
     // the table check: providers.toml rows the converter finds wrong against the tree, then the none gate
@@ -347,7 +355,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let tiers = crate::isa_tiers::load(root)?;
     let isa_tiers_file = match &cross {
         Some(c) => Some(crate::isa_tiers::write_converter_file(
-            &tiers, &c.isa, &out,
+            &tiers, &c.isa, &graph_out,
         )?),
         None => None,
     };
@@ -366,7 +374,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             "-build-tools".into(),
             path(&build_tools),
             "-out".into(),
-            path(&out),
+            path(&graph_out),
         ];
         argv.extend(cross_flags.iter().cloned());
         argv.extend(build_provided_args.iter().cloned());
@@ -414,7 +422,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 "-release",
                 &release,
                 "-licence-gate",
-                &licence_gate_command(root, &out)?,
+                &licence_gate_command(root, &graph_out)?,
             ]
             .map(str::to_owned),
         );
@@ -427,11 +435,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         argv.extend(nb.flags.iter().cloned());
         argv.extend(args.goals.iter().cloned());
         argv.extend(aidl_goals.iter().cloned());
-        convert(&converter, &out, &argv, &env)?;
-        let problems = std::fs::read_to_string(out.join("problems.txt")).unwrap_or_default();
+        convert(&converter, &graph_out, &argv, &env)?;
+        let problems = std::fs::read_to_string(graph_out.join("problems.txt")).unwrap_or_default();
         if args.fetch_missing {
-            let missing = std::fs::read_to_string(out.join("missing.txt")).unwrap_or_default();
-            let paths = std::fs::read_to_string(out.join("missing-paths.txt")).unwrap_or_default();
+            let missing =
+                std::fs::read_to_string(graph_out.join("missing.txt")).unwrap_or_default();
+            let paths =
+                std::fs::read_to_string(graph_out.join("missing-paths.txt")).unwrap_or_default();
             let sources = sources::load(root)?;
             let index = Index::load(root, &sources.aosp)?;
             let manifest = aosp::load(root, &sources.aosp)?
@@ -477,10 +487,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     // gate a (isa-tiers.toml): each tier source compiles at its tier's isa and fails at its row's, before ninja builds the rest
     if cross.is_some() {
-        let probed = crate::isa_tiers::probe(&out, &cc)?;
+        let probed = crate::isa_tiers::probe(&graph_out, &cc)?;
         println!("native: isa tiers: {probed} source(s) probed");
     }
-    let log = out.join("ninja.log");
+    let log = graph_out.join("ninja.log");
     // only ninja queues for a machine-wide token (build_pool.rs); the gates below run after it is released
     let tokens = build_pool::tokens(ws)?;
     let token = build_pool::acquire(
@@ -491,21 +501,21 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         |line| println!("native: {line}"),
     )?;
     println!("native: build token {} of {tokens}", token.index);
-    let graph_file = out.join("graph.json");
+    let graph_file = graph_out.join("graph.json");
     let graph: triage::Graph = serde_json::from_str(
         &std::fs::read_to_string(&graph_file)
             .with_context(|| format!("reading {}", graph_file.display()))?,
     )
     .with_context(|| format!("parsing {}", graph_file.display()))?;
     if let Some(p) = &nb.pass2 {
-        runtimes_pass2(root, args, &out, &tree, &graph, p, &env)?;
+        runtimes_pass2(root, args, &graph_out, &tree, &graph, p, &env)?;
     }
     let status = Command::new("ninja")
         .args(["-k", "0", "-C"])
-        .arg(&out)
+        .arg(&graph_out)
         .envs(env.iter().cloned())
         .stdout(std::fs::File::create(&log)?)
-        .stderr(std::fs::File::create(out.join("ninja.err"))?)
+        .stderr(std::fs::File::create(graph_out.join("ninja.err"))?)
         .status()
         .context("running ninja")?;
     drop(token);
@@ -516,25 +526,25 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .collect();
     // every check that fails the run, with its first error line: the last line names and quotes them (`verdict`)
     let mut failed: Vec<Failure> = Vec::new();
-    if let Some(first) = gate(&out, provided_libs.into_iter())? {
+    if let Some(first) = gate(&graph_out, provided_libs.into_iter())? {
         failed.push(Failure::step("provided gate", first));
     }
-    if let Some(first) = runpath_gate(&out)? {
+    if let Some(first) = runpath_gate(&graph_out)? {
         failed.push(Failure::step("runpath gate", first));
     }
-    if let Some(first) = isa_floor_gate(&out, host, &tiers)? {
+    if let Some(first) = isa_floor_gate(&graph_out, host, &tiers)? {
         failed.push(Failure::step("isa gate", first));
     }
-    if let Some(first) = fronts_gate(&out, &tree)? {
+    if let Some(first) = fronts_gate(&graph_out, &tree)? {
         failed.push(Failure::step("fronts gate", first));
     }
-    if let Some(first) = licence_gate(&out, status.success(), args.verbose)? {
+    if let Some(first) = licence_gate(&graph_out, status.success(), args.verbose)? {
         failed.push(Failure::step("licence gate", first));
     }
     if status.success() {
-        println!("native: built -> {}", out.display());
-        let packages_built = if cross.is_some() {
-            println!("native: cross host: workspace packages not built (plan A3)");
+        println!("native: built -> {}", graph_out.display());
+        let packages_built = if cross.is_some() || foreign {
+            println!("native: cross host or foreign guest: workspace packages not built (plan A3)");
             Vec::new()
         } else {
             packages::build(root, &out)?
@@ -554,7 +564,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             }
         }
         // the runtime gates read the converter packages and crates from here (build_state::gate_out); a failed ninja leaves the old packages, so no record
-        build_state::record(&out, &state, &built_goals)?;
+        build_state::record(&graph_out, &state, &built_goals)?;
         if let Some(first) = table_check(&table) {
             failed.push(Failure::step("table check", first));
         }
@@ -562,13 +572,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     let text = std::fs::read_to_string(&log)?;
     let prefixes = [
-        format!("{}/", out.display()),
+        format!("{}/", graph_out.display()),
         format!("{}/", tree.display()),
     ];
     let failures = triage::failures(&text, &prefixes.each_ref().map(String::as_str));
     if failures.is_empty() {
         // ninja failed without a failed step: it could not load the graph (duplicate rule, missing input)
-        let err = std::fs::read_to_string(out.join("ninja.err")).unwrap_or_default();
+        let err = std::fs::read_to_string(graph_out.join("ninja.err")).unwrap_or_default();
         bail!(
             "ninja failed before building a step: {}",
             err.lines().next().unwrap_or("(no ninja.err)")
@@ -872,9 +882,24 @@ fn java_env(jdk: &Path) -> [(&'static str, OsString); 2] {
     [("JAVA_HOME", jdk.into()), ("PATH", path)]
 }
 
-/// Where `--native-bridge <arch>` put module `m`'s outputs.
-pub fn nb_module_dir(out: &Path, arch: &str, m: &str) -> PathBuf {
-    out.join(format!("{NB_DIR}{arch}/{m}"))
+/// Where `--native-bridge <arch>` put module `m`'s outputs, under the graph dir `graph` (`graph_dir`).
+pub fn nb_module_dir(graph: &Path, arch: &str, m: &str) -> PathBuf {
+    graph.join(format!("{NB_DIR}{arch}/{m}"))
+}
+
+/// Name of a foreign guest's graph dir under the out dir (`graph_dir`).
+const NB_GRAPH_DIR: &str = "nb-graph-";
+
+/// The dir of the native-bridge graph of guest `arch` under out dir `out` of host `host`: `out` for the host's own arch (the identity guest is part of the host graph, `nb/<host>`), else `out/nb-graph-<arch>`.
+/// Accepted constraint: one graph per foreign nb arch, not one multi-arch graph, since one converter run takes one `--native-bridge`. Its cost: each foreign graph has its own host closure of its nb goals and its own guest runtimes (compiles hit sccache, CompilerCache); one dir per arch per slot.
+/// What it buys: a foreign build writes only its own dir, so the host graph and `bp2ninja.args` are never rewritten, and keepset and check keep reading the host graph.
+/// Retired when bp2ninja converts several nb arches into one graph (per-arch nb variants) and `Goals::nb` is keyed by ISA: then this dir, `build_state::foreign_out` and the `graph_out` split go.
+pub fn graph_dir(out: &Path, host: &str, arch: &str) -> PathBuf {
+    if arch == host {
+        out.to_owned()
+    } else {
+        out.join(format!("{NB_GRAPH_DIR}{arch}"))
+    }
 }
 
 /// The compiler cache of the converter's C/C++ compiles: sccache, prefixed to the cc rule by the converter's `-launcher` (tools/bp2ninja ninja.go says why Rust and yasm steps go uncached).
@@ -1686,6 +1711,19 @@ mod tests {
             BTreeSet::from(["libbase".to_owned(), "nb:libc".to_owned()])
         );
         assert!(goals_of_args("-tree\n/t\n").is_empty());
+    }
+
+    /// The host's own guest stays in the host graph dir; a foreign guest gets `nb-graph-<arch>` under it, and its modules sit under that dir's `nb/<arch>`.
+    #[test]
+    fn foreign_guest_has_its_own_graph_dir() {
+        let out = Path::new("/w/out/slot-3");
+        assert_eq!(graph_dir(out, "x86_64", "x86_64"), out);
+        let foreign = graph_dir(out, "x86_64", "arm64");
+        assert_eq!(foreign, out.join("nb-graph-arm64"));
+        assert_eq!(
+            nb_module_dir(&foreign, "arm64", "libc"),
+            foreign.join("nb/arm64/libc")
+        );
     }
 
     /// Soong's ninja environment (config.go NewConfig): JAVA_HOME is the JDK, whose bin precedes the inherited PATH, so `java` resolves to the JDK's.

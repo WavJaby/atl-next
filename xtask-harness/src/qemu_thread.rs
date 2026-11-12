@@ -2,7 +2,7 @@
 //! `xtask test qemu-thread`: guest threads under the QEMU crossing on the real arm64 NB images (QEMU bridge plan Q5-6). A guest `pthread_create` attaches its own engine CPU, the provider's foreach reaches a guest callback, a guest key destructor runs at thread exit through a crossing. Then each break must turn its run red.
 //!
 //! Library: the engine `.so` (`qemu_spike::engine_so_file`), as `qemu-linker` uses it. Fixture: `xtask-harness/testdata/qemu-thread/fixture.c` (PIE, NDK clang, DT_NEEDED libc.so). Boot: the engine boot executable (`qemu::boot_exe`, crates/atl-qemu-boot).
-//! Images: `--nb <dir>` is the arm64 NB out dir (`<out>/nb/arm64`), built as for `test qemu-linker`.
+//! Images: `--nb <dir>` is the arm64 NB dir (`<out>/nb-graph-arm64/nb/arm64`), built as for `test qemu-linker`.
 //! A guest thread's `pthread_getattr_np` reports the guest stack its attr sized (R-10 S3, check g), and concurrent down calls from two host threads keep disjoint stacks (check i).
 //! Harness: `tests/qemu_thread.rs` (harness-less; checks s, p, j, d, k, m, x, r, g, i) run through `qemu_linker::harness`. Breaks (`ATL_NB_BREAK`): `qt_exit_resume`, `dns_glibc_order`, `qt_skip_dtor`, `qt_routine_arg`, `qt_attr_size`, `qt_getattr_glibc`. Checks k and m (guest setjmp family) have no flag break: their break is a guest libc built without NBS patch 0006, whose setjmp stubs then have no host row (`--nb` on such a build: k red).
 //! Property area (check p): the guest cannot set properties (the provider's set is ENOENT), so the gate writes `SEEDED` `atl.qt.p.<i>` properties and `atl.qt.expect` into a copy of the native out dir's build.prop, and the area writer (atl-property-service, the broker's own) lays out the area the provider maps through `ATL_PROP_AREA`.
@@ -18,6 +18,7 @@ use crate::ndk::NdkTarget;
 use crate::qemu::{self, GUEST_API};
 use crate::qemu_linker::{self, Harness};
 use crate::qemu_spike;
+use crate::slot;
 use crate::verdict::{Failure, Verdict};
 
 const TESTDATA: &str = "xtask-harness/testdata/qemu-thread";
@@ -49,7 +50,7 @@ pub struct Args {
     /// Out dir (default: as for `xtask qemu`).
     #[arg(long)]
     pub out: Option<PathBuf>,
-    /// The arm64 NB out dir (`<out>/nb/arm64`), as for `test qemu-linker`.
+    /// The arm64 NB dir (`<out>/nb/arm64`, or `<out>/nb-graph-arm64/nb/arm64` for a foreign guest), as for `test qemu-linker`.
     #[arg(long)]
     pub nb: PathBuf,
     /// Only the plain run, no breaks.
@@ -79,12 +80,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let target = NdkTarget::new(root, &ndk, &b.arch, GUEST_API)?;
     let fixture = fixture_build(root, &target, &dir.join("fixture"))?;
     let boot = qemu::boot_exe(root, &b, &dir)?;
-    let out = args
-        .nb
-        .ancestors()
-        .nth(2)
-        .context("the NB directory is not <out>/nb/<arch>")?;
-    let area = seed_area(root, out, &dir)?;
+    // the host's out dir, whichever graph `--nb` names: build.prop and the property-service cargo target are the host's
+    let out = slot::out_dir(root, args.out.as_deref(), "--out", |ws| ws.join("out"))?;
+    let area = seed_area(root, &out, &dir)?;
     let env: [(&str, &Path); 6] = [
         ("ATL_ENGINE_SO", &so),
         ("ATL_NB_BOOT", &boot),

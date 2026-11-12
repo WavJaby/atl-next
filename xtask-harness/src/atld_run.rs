@@ -155,6 +155,8 @@ pub struct Runtime {
     pub art: HostArt,
     /// The native build directory: the gates keep their work below it.
     pub out: PathBuf,
+    /// The host arch: a foreign guest's native-bridge graph is read from its own dir (native::graph_dir).
+    host: String,
     pub java_out: PathBuf,
     pub apk: ApkTools,
     servicemanager: PathBuf,
@@ -558,6 +560,7 @@ impl Runtime {
             abis,
             art,
             out,
+            host: host.to_owned(),
             java_out,
             apk,
             servicemanager,
@@ -650,11 +653,12 @@ impl Runtime {
 
     /// Also places the guest `xtask native --native-bridge <isa>` built where the NativeBridge core starts it (atl-native-bridge `Config::installed`): linker64 + app_process64 under `native_bridge_bin`, the guest libraries under `native_bridge_lib`.
     /// The host ISA's guest serves identity; a foreign ISA's also needs its engine ([`Runtime::with_qemu_engine`]). Each call adds one ISA's guest.
+    /// A foreign ISA's files are read from its own graph dir (native::graph_dir); run-apk checks that graph first (build_state::foreign_out).
     pub fn with_native_bridge_guest(mut self, isa: &str) -> Result<Self> {
         let bin = atl_android_paths::native_bridge_bin(isa);
         let lib = atl_android_paths::native_bridge_lib(isa);
-        let module =
-            |m: &str, file: &str| crate::native::nb_module_dir(&self.out, isa, m).join(file);
+        let graph = crate::native::graph_dir(&self.out, &self.host, isa);
+        let module = |m: &str, file: &str| crate::native::nb_module_dir(&graph, isa, m).join(file);
         let mut files = vec![
             (module(NB_LINKER, "linker64"), format!("{bin}/linker64")),
             (
@@ -662,7 +666,7 @@ impl Runtime {
                 format!("{bin}/app_process64"),
             ),
             (
-                crate::runtimes::shared_libcxx(&self.out, isa),
+                crate::runtimes::shared_libcxx(&graph, isa),
                 format!("{lib}/libc++.so"),
             ),
         ];

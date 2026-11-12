@@ -230,13 +230,13 @@ enum Test {
     QemuSpike(qemu_spike::Args),
     /// The QEMU crossing on the real arm64 NB images (QEMU bridge plan Q4-3..Q4-5): the six entries placed in place, the guest linker's init, a guest dlopen with DT_NEEDED; then each break must turn its run red.
     ///
-    /// Builds first (as `xtask qemu --pic --execute`); needs the arm64 NB build (`xtask native --host x86_64 --native-bridge arm64 nb:libc nb:native_bridge_guest_linker nb:libnative_bridge_vdso nb:libnative_bridge_guest_libc nb:libdl nb:libm nb:ld-android`) and `--nb` pointing at its `<out>/nb/arm64`. Logs in `<out>/qemu/<target>-linux-user-pic/qemu-linker/`.
+    /// Builds first (as `xtask qemu --pic --execute`); needs the arm64 NB build (`xtask native --host x86_64 --native-bridge arm64 nb:libc nb:native_bridge_guest_linker nb:libnative_bridge_vdso nb:libnative_bridge_guest_libc nb:libdl nb:libm nb:ld-android`) and `--nb` pointing at its `<out>/nb-graph-arm64/nb/arm64`. Logs in `<out>/qemu/<target>-linux-user-pic/qemu-linker/`.
     QemuLinker(qemu_linker::Args),
     /// The QEMU crossing's guest threads on the real arm64 NB images (QEMU bridge plan Q5-6): a guest `pthread_create` attaches its own engine CPU, the provider's foreach reaches a guest callback, a key destructor runs at thread exit; then each break must turn its run red.
     ///
-    /// Builds first (as `xtask qemu --pic --execute`); needs the arm64 NB build (as `test qemu-linker`) and `--nb` pointing at its `<out>/nb/arm64`. Logs in `<out>/qemu/<target>-linux-user-pic/qemu-thread/`.
+    /// Builds first (as `xtask qemu --pic --execute`); needs the arm64 NB build (as `test qemu-linker`) and `--nb` pointing at its `<out>/nb-graph-arm64/nb/arm64`. Logs in `<out>/qemu/<target>-linux-user-pic/qemu-thread/`.
     QemuThread(qemu_thread::Args),
-    /// Guest JNI calls under the QEMU crossing, integer lanes (QEMU bridge plan Q6-2): a fixture's JNI calls reach a fake host JNIEnv, GetJavaVM routes to its own thunk; the `jni_guest_env` and `jni_swap` breaks must turn it red. Builds first (as `xtask qemu --pic --execute`); needs the arm64 NB build (as `test qemu-linker`) and `--nb` pointing at its `<out>/nb/arm64`. Logs in `<out>/qemu/<target>-linux-user-pic/qemu-jni/`.
+    /// Guest JNI calls under the QEMU crossing, integer lanes (QEMU bridge plan Q6-2): a fixture's JNI calls reach a fake host JNIEnv, GetJavaVM routes to its own thunk; the `jni_guest_env` and `jni_swap` breaks must turn it red. Builds first (as `xtask qemu --pic --execute`); needs the arm64 NB build (as `test qemu-linker`) and `--nb` pointing at its `<out>/nb-graph-arm64/nb/arm64`. Logs in `<out>/qemu/<target>-linux-user-pic/qemu-jni/`.
     QemuJni(qemu_jni::Args),
     /// The engine ABI (QEMU bridge plan Q6-1), both directions: a guest host call's integer lanes, FP lanes and stack words reach the host, and the host's FP answer returns in the guest's v0; `call_ex` puts the host's lanes in the guest's registers and stack, and returns the callee's FP result. The `qa_stack_off`, `qa_v_lane`, `call-stack` and `call-v` breaks must each turn it red. Builds first (as `xtask qemu --pic --execute`); needs no NB images. Logs in `<out>/qemu/<target>-linux-user-pic/qemu-abi/`.
     QemuAbi(qemu_abi::Args),
@@ -244,7 +244,7 @@ enum Test {
     QemuGl(qemu_gl::Args),
     /// Static audit of an APK's arm64 imports against the QEMU binding table (QEMU Q7 plan Q7-5): every dynamic undefined symbol of each `lib/arm64-v8a/*.so` is bound (same APK, a Generic/Shim row, guest bionic), trapped (with its reason) or unknown; red when a gated APK (default Cut the Rope 3.63.0) has a trapped or strong unknown import, each printed with its owning slice. `--info` APKs (default the Battle Cats TW arm64 split) are reported only. Executes nothing.
     AppImports(app_imports::Args),
-    /// The crossing counter of both engines (QEMU bridge plan Q5-8, feature `crossing-count`): identity host-thunk and JNI shells, then QEMU; the fixture's N calls per binding count N, sizes fall in their literal bins, 2^16 crossings dump once; the `id_count` and `qe_id` breaks must turn it red; the library without the feature has no counter symbol. Builds first (as `xtask qemu --pic --execute`); needs the arm64 NB build (as `test qemu-thread`) and `--nb` pointing at its `<out>/nb/arm64`. Logs in `<out>/qemu/<target>-linux-user-pic/crossing/`.
+    /// The crossing counter of both engines (QEMU bridge plan Q5-8, feature `crossing-count`): identity host-thunk and JNI shells, then QEMU; the fixture's N calls per binding count N, sizes fall in their literal bins, 2^16 crossings dump once; the `id_count` and `qe_id` breaks must turn it red; the library without the feature has no counter symbol. Builds first (as `xtask qemu --pic --execute`); needs the arm64 NB build (as `test qemu-thread`) and `--nb` pointing at its `<out>/nb-graph-arm64/nb/arm64`. Logs in `<out>/qemu/<target>-linux-user-pic/crossing/`.
     Crossing(crossing::Args),
     /// The identity native-bridge gates g1-g5 (x86_64 engine, no QEMU) with their `ATL_NB*` env taken from this checkout's out dir (`nb/x86_64`, the staged `app/`), not set by hand.
     ///

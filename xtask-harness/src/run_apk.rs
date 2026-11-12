@@ -476,9 +476,11 @@ fn runtime(root: &Path, args: &Args, apk: &Path) -> Result<(Runtime, Option<Stri
     .with_ui("gtk");
     let foreign = foreign_isa(rt.abis(), &args.host, apk)?;
     let rt = match &foreign {
-        Some(isa) => rt
-            .with_native_bridge_guest(isa)?
-            .with_qemu_engine(root, isa)?,
+        Some(isa) => {
+            crate::build_state::foreign_out(root, &rt.out, &args.host, isa, "run-apk")?;
+            rt.with_native_bridge_guest(isa)?
+                .with_qemu_engine(root, isa)?
+        }
         None => rt,
     };
     let rt = if args.no_app_seccomp {

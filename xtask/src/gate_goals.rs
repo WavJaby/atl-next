@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The native goals each runtime gate reads, declared once here by gate name in [`GATES`] (the gates themselves live in xtask-harness; `native --for` must not link them).
 //! `xtask native --for <gate>[,<gate>]` builds their union; a gate's [`crate::build_state::gate_out`] refuses a slot whose record lacks one (built-from state + goals, build_state.rs),
-//! naming the missing goals and the `--for` command, so no gate discovers a missing input mid-run. The native-bridge guest is part of the same record (`nb:` goals), so stale `<out>/nb` is refused the same way.
+//! naming the missing goals and the `--for` command, so no gate discovers a missing input mid-run. The native-bridge guest is part of the same record (`nb:` goals), so stale `<out>/nb` is refused the same way; a foreign guest's `nb:` goals are checked in its own graph dir (`build_state::foreign_out`).
 
 use std::collections::BTreeSet;
 use std::path::Path;

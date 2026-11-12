@@ -2,7 +2,7 @@
 //! `xtask test qemu-linker`: the QEMU crossing on the real arm64 NB images, three harnesses, each plain then with each of its breaks (QEMU bridge plan Q4-3, Q4-4, Q4-5).
 //!
 //! Library: the engine `.so` (`qemu_spike::engine_so_file`, QEMU bridge plan Q5-1b), which the core dlopens through its C ABI; the rlib route is retired. Fixtures in `xtask-harness/testdata/qemu-linker/`, built by the NDK clang: `fixture.c` (static, Q4-3), `exe.c` (PIE without libc, the main executable the guest linker loads), `dl_exe.c` (PIE with DT_NEEDED on libc.so and libdl.so, the Q4-5 dlopen executable), `libdep.c` and `libfix.c` (the Q4-5 dlopen'd pair: libfix.so's DT_NEEDED is libdep.so). Boot: the engine boot executable (`qemu::boot_exe`, crates/atl-qemu-boot).
-//! Images: `--nb <dir>` is the arm64 NB out dir (`<out>/nb/arm64`, from `xtask native --host x86_64 --native-bridge arm64 nb:libc nb:native_bridge_guest_linker nb:libnative_bridge_vdso nb:libnative_bridge_guest_libc nb:libdl nb:libm nb:ld-android`): `native_bridge_guest_linker/linker64`, `libnative_bridge_vdso/libnative_bridge_vdso.so`, and the guest library directories `libnative_bridge_guest_libc`, `libdl`, `libm`, `ld-android` that the Q4-5 harness puts on the guest's library path.
+//! Images: `--nb <dir>` is the arm64 NB out dir (`<out>/nb-graph-arm64/nb/arm64`, from `xtask native --host x86_64 --native-bridge arm64 nb:libc nb:native_bridge_guest_linker nb:libnative_bridge_vdso nb:libnative_bridge_guest_libc nb:libdl nb:libm nb:ld-android`): `native_bridge_guest_linker/linker64`, `libnative_bridge_vdso/libnative_bridge_vdso.so`, and the guest library directories `libnative_bridge_guest_libc`, `libdl`, `libm`, `ld-android` that the Q4-5 harness puts on the guest's library path.
 //! Harnesses: `cargo test -p atl-native-bridge --test <name>` (each selects the QEMU engine itself), harness-less; each header lists its env and checks.
 //! - `qemu_linker` (Q4-3 placement): checks p, r, t, a, s. Breaks (`ATL_NB_BREAK`): `qe_site` (the vdso's placeholder search fails closed on call_guest), `qe_nomap` (no page registered: a fetch from a placed site faults), `qe_id` (a binding trap calls its neighbour's host function).
 //! - `qemu_start` (Q4-4 linker init): checks s (started), e (entry), t (static TLS), h (get_host_pthread), g (GS base). Breaks: `qe_no_tls` (the static-TLS hook unpatched: the linker's `bl` branches to 0). `qe_guest_base` is retired (Q5-1b): the engine's command line is `-B 0` and the C ABI has no base argument, so there is no nonzero-base run to refuse. The AT_RANDOM break (plan Q4-4 (b)) was never wired: it did not abort (Q4-5 log).
@@ -70,7 +70,7 @@ pub struct Args {
     /// Out dir (default: as for `xtask qemu`).
     #[arg(long)]
     pub out: Option<PathBuf>,
-    /// The arm64 NB out dir (`<out>/nb/arm64`): holds `native_bridge_guest_linker/linker64`, `libnative_bridge_vdso/libnative_bridge_vdso.so`, and the guest libraries `libnative_bridge_guest_libc`, `libdl`, `libm`, `ld-android`.
+    /// The arm64 NB out dir (`<out>/nb-graph-arm64/nb/arm64`): holds `native_bridge_guest_linker/linker64`, `libnative_bridge_vdso/libnative_bridge_vdso.so`, and the guest libraries `libnative_bridge_guest_libc`, `libdl`, `libm`, `ld-android`.
     #[arg(long)]
     pub nb: PathBuf,
     /// Only the plain runs, no breaks.
