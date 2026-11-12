@@ -87,7 +87,7 @@ pub enum Slot {
     List,
     /// Give this checkout a slot and link its `target/` to the slot's (dry run unless --execute).
     ///
-    /// Without N: the lowest slot no live checkout holds. A slot held by a live other checkout is refused unless --force, which takes it over; that checkout then builds into the old default and its `target/` link is removed (a build it runs there fails).
+    /// Without N: the lowest slot no live checkout holds. A slot held by a live other checkout is refused unless --force, which takes it over; that checkout then builds into the old default and its `target/` link is removed (a build it runs there fails); executables in the slot's `deps/` that embed its paths (test binaries' `CARGO_BIN_EXE_*`) are removed, the rest stays as cache.
     /// An own real `target/` is moved into the slot when the slot has no target yet, else removed.
     Assign {
         /// Slot number, 1..=build.slots.
@@ -386,12 +386,14 @@ pub enum Step {
     Adopt { from: PathBuf, to: PathBuf },
     /// Remove a checkout's own real `target/`: its slot's target exists already.
     Remove(PathBuf),
+    /// Remove an executable a live displaced holder built: it embeds `checkout`'s absolute paths (`CARGO_BIN_EXE_*`, `CARGO_MANIFEST_DIR`), and cargo may reuse it as fresh for the new holder, which then runs the other checkout's binaries.
+    Drop { file: PathBuf, checkout: PathBuf },
     /// Make `at` a link to `to`, creating `to`; replaces a link at `at`.
     Link { at: PathBuf, to: PathBuf },
 }
 
 /// The steps that give checkout `root` slot `slot`. `current` is its slot now, `release` the holders displaced from `slot`.
-/// Displaced links go; a slot whose displaced holders are all stale is wiped (a live holder keeps its files); the slot the checkout leaves is wiped; then `root/target` is linked.
+/// Displaced links go; a slot whose displaced holders are all stale is wiped; a live holder's files stay as cache, minus the executables embedding its paths ([`embedding`]); the slot the checkout leaves is wiped; then `root/target` is linked.
 pub fn target_steps(
     root: &Path,
     ws: &Path,
@@ -410,6 +412,15 @@ pub fn target_steps(
     let stale = !release.is_empty() && release.iter().all(|h| !h.live);
     if stale && want.exists() {
         steps.push(Step::Wipe(want.clone()));
+    } else {
+        for h in release.iter().filter(|h| h.live && h.checkout != root) {
+            for file in embedding(&want, &h.checkout)? {
+                steps.push(Step::Drop {
+                    file,
+                    checkout: h.checkout.clone(),
+                });
+            }
+        }
     }
     if let Some(old) = current.filter(|&n| n != slot) {
         let dir = slot_target(ws, old);
@@ -419,6 +430,60 @@ pub fn target_steps(
     }
     steps.extend(link_steps(&root.join(TARGET), &want)?);
     Ok(steps)
+}
+
+/// Executables in cargo target `target`'s `deps/` dirs (`<profile>/deps`, `<triple>/<profile>/deps`) whose bytes hold `<checkout>/`. Executable = regular file with an x bit and no extension (test and bin outputs; `.so`/`.rlib` are not run with baked paths).
+/// Matching bytes, not names: debug info and `env!` paths both carry the builder's checkout, and a binary built by the new holder never holds the other's path.
+fn embedding(target: &Path, checkout: &Path) -> Result<Vec<PathBuf>> {
+    use std::os::unix::fs::PermissionsExt;
+    let needle = format!("{}/", checkout.display()).into_bytes();
+    let mut levels = vec![target.to_owned()];
+    levels.extend(subdirs(target)?);
+    let mut deps = Vec::new();
+    for level in levels {
+        for profile in subdirs(&level)? {
+            let d = profile.join("deps");
+            if d.is_dir() {
+                deps.push(d);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    for d in deps {
+        for e in std::fs::read_dir(&d).with_context(|| format!("reading {}", d.display()))? {
+            let path = e?.path();
+            let meta = std::fs::symlink_metadata(&path)?;
+            if !meta.is_file()
+                || meta.permissions().mode() & 0o111 == 0
+                || path.extension().is_some()
+            {
+                continue;
+            }
+            let bytes =
+                std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+            if bytes.windows(needle.len()).any(|w| w == needle.as_slice()) {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found.dedup();
+    Ok(found)
+}
+
+/// Directories directly under `dir` (none when it is missing).
+fn subdirs(dir: &Path) -> Result<Vec<PathBuf>> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for e in rd {
+        let e = e?;
+        if e.file_type()?.is_dir() {
+            out.push(e.path());
+        }
+    }
+    Ok(out)
 }
 
 /// Steps that make `link` (`<checkout>/target`) a link to `want`: none when it is one already (a missing `want` is created), else a link, after a real dir is moved into an empty `want` or removed.
@@ -461,6 +526,10 @@ pub fn apply_steps(steps: &[Step]) -> Result<()> {
             Step::Mkdir(p) => {
                 std::fs::create_dir_all(p).with_context(|| format!("creating {}", p.display()))?;
             }
+            Step::Drop { file, .. } => {
+                std::fs::remove_file(file)
+                    .with_context(|| format!("removing {}", file.display()))?;
+            }
             Step::Adopt { from, to } => {
                 let parent = to.parent().unwrap_or(to);
                 std::fs::create_dir_all(parent)
@@ -497,6 +566,11 @@ pub fn describe_step(step: &Step) -> String {
             )
         }
         Step::Remove(p) => format!("remove {} (its slot's target exists)", p.display()),
+        Step::Drop { file, checkout } => format!(
+            "remove {} (embeds {}'s paths; cargo could reuse it as fresh)",
+            file.display(),
+            checkout.display()
+        ),
         Step::Link { at, to } => format!("link {} -> {}", at.display(), to.display()),
     }
 }
@@ -995,6 +1069,57 @@ mod tests {
         apply_steps(&steps).expect("apply");
         assert_eq!(entry(&other.join(TARGET)).expect("entry"), Entry::Absent);
         assert!(slot_target(&ws, 1).join("building.txt").is_file());
+        std::fs::remove_dir_all(ws.parent().expect("scratch")).expect("cleanup");
+    }
+
+    /// An executable file at `path` holding `bytes`.
+    fn exe(path: &Path, bytes: &[u8]) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+        std::fs::write(path, bytes).expect("file");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    #[test]
+    fn a_live_displaced_holders_path_embedding_executables_are_dropped() {
+        let (ws, root) = fixture("link-embed");
+        let other = ws.join("wt/other");
+        std::fs::create_dir_all(&other).expect("other checkout");
+        link(&slot_target(&ws, 1), &other.join(TARGET));
+        let baked = format!("CARGO_BIN_EXE={}/target/debug/atl-launch", other.display());
+        let deps = slot_target(&ws, 1).join("debug/deps");
+        let cross = slot_target(&ws, 1).join("riscv64gc-unknown-linux-gnu/debug/deps");
+        // stale: integration-test binaries naming the other checkout, on both deps levels
+        exe(&deps.join("launch-0123456789abcdef"), baked.as_bytes());
+        exe(&cross.join("launch-0123456789abcdef"), baked.as_bytes());
+        // kept: a library with the path (not run), a binary of a sibling path sharing the prefix, a non-executable
+        exe(&deps.join("libx-0123456789abcdef.rlib"), baked.as_bytes());
+        let sibling = format!("{}-2/target", other.display());
+        exe(&deps.join("sib-0123456789abcdef"), sibling.as_bytes());
+        put(&deps.join("plain-0123456789abcdef"));
+        std::fs::write(deps.join("plain-0123456789abcdef"), &baked).expect("plain");
+        let held = [holder_of(1, other.clone(), true)];
+        let steps = target_steps(&root, &ws, 1, None, &held).expect("steps");
+        let drop = |file: PathBuf| Step::Drop {
+            file,
+            checkout: other.clone(),
+        };
+        assert_eq!(
+            steps,
+            vec![
+                Step::Unlink(other.join(TARGET)),
+                drop(deps.join("launch-0123456789abcdef")),
+                drop(cross.join("launch-0123456789abcdef")),
+                Step::Link {
+                    at: root.join(TARGET),
+                    to: slot_target(&ws, 1),
+                },
+            ]
+        );
+        apply_steps(&steps).expect("apply");
+        assert!(!deps.join("launch-0123456789abcdef").exists());
+        assert!(deps.join("libx-0123456789abcdef.rlib").is_file());
+        assert!(deps.join("sib-0123456789abcdef").is_file());
         std::fs::remove_dir_all(ws.parent().expect("scratch")).expect("cleanup");
     }
 
