@@ -37,7 +37,7 @@ thread_local! {
     static END: Cell<bool> = const { Cell::new(false) };
 }
 
-/// ABI `end_call` (2.3): the innermost CALL / BIND trap running on this thread, when it returns, ends the guest call it interrupted with its answer (x0), instead of resuming the guest after the svc. False when no such trap runs.
+/// ABI `end_call`: the innermost CALL / BIND trap running on this thread, when it returns, ends the guest call it interrupted with its answer (x0), instead of resuming the guest after the svc. False when no such trap runs.
 pub(crate) fn end_call() -> bool {
     if DEPTH.with(Cell::get) == 0 {
         return false;

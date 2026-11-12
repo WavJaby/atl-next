@@ -6,9 +6,9 @@
 use core::ffi::{c_char, c_int, c_void};
 
 /// Major version: a host refuses an engine with another major.
-pub const ABI_MAJOR: u32 = 2;
+pub const ABI_MAJOR: u32 = 3;
 /// Minor version: additions only, appended to a struct.
-pub const ABI_MINOR: u32 = 3;
+pub const ABI_MINOR: u32 = 0;
 
 /// `ATL_PROT_READ`.
 pub const PROT_READ: u32 = 0x1;
@@ -100,10 +100,7 @@ pub type DestroyFn = unsafe extern "C" fn(engine: *mut AtlEngineHandle);
 /// `atl_engine::map`.
 pub type MapFn =
     unsafe extern "C" fn(engine: *mut AtlEngineHandle, start: u64, len: u64, prot: u32) -> c_int;
-/// `atl_engine::attach`.
-pub type AttachFn =
-    unsafe extern "C" fn(engine: *mut AtlEngineHandle, out: *mut *mut AtlCpu) -> c_int;
-/// `atl_engine::attach_ex` (2.1): `stack` in and out.
+/// `atl_engine::attach_ex`: `stack` in and out.
 pub type AttachExFn = unsafe extern "C" fn(
     engine: *mut AtlEngineHandle,
     stack: *mut AtlStack,
@@ -119,10 +116,10 @@ pub type CallExFn = unsafe extern "C" fn(
     f: u64,
     lanes: *mut AtlLanes,
 );
-/// `atl_engine::fault` (2.2): `info` is the kernel's `siginfo_t *`, `ucontext` its `ucontext_t *`; true when the engine took the signal. Signal context; may not return (header).
+/// `atl_engine::fault`: `info` is the kernel's `siginfo_t *`, `ucontext` its `ucontext_t *`; true when the engine took the signal. Signal context; may not return (header).
 pub type FaultFn =
     unsafe extern "C" fn(sig: c_int, info: *mut c_void, ucontext: *mut c_void) -> bool;
-/// `atl_engine::end_call` (2.3): inside a CALL / BIND trap callback, makes the trap's return end the guest call it interrupted, with the trap's answer (header). 0, or `-EINVAL` outside a trap.
+/// `atl_engine::end_call`: inside a CALL / BIND trap callback, makes the trap's return end the guest call it interrupted, with the trap's answer (header). 0, or `-EINVAL` outside a trap.
 pub type EndCallFn = unsafe extern "C" fn(engine: *mut AtlEngineHandle) -> c_int;
 
 /// `atl_engine`: the table the engine `.so` exports as `atl_engine`.
@@ -141,21 +138,19 @@ pub struct AtlEngine {
     pub destroy: Option<DestroyFn>,
     /// Marks a guest range as mapped.
     pub map: Option<MapFn>,
-    /// Gives the calling thread a guest CPU.
-    pub attach: Option<AttachFn>,
-    /// Releases a CPU from [`AtlEngine::attach`].
+    /// Gives the calling thread a guest CPU on a sized guest stack.
+    pub attach_ex: Option<AttachExFn>,
+    /// Releases a CPU from [`AtlEngine::attach_ex`].
     pub detach: Option<DetachFn>,
     /// Runs guest code with lanes on a CPU.
     pub call_ex: Option<CallExFn>,
-    /// 2.1: gives the calling thread a guest CPU on a sized guest stack.
-    pub attach_ex: Option<AttachExFn>,
-    /// 2.2: the engine's part of a host SIGSEGV / SIGBUS handler (a sigchain special handler).
+    /// The engine's part of a host SIGSEGV / SIGBUS handler (a sigchain special handler).
     pub fault: Option<FaultFn>,
-    /// 2.3: ends the guest call a trap interrupted when the trap returns (thread exit).
+    /// Ends the guest call a trap interrupted when the trap returns (thread exit).
     pub end_call: Option<EndCallFn>,
 }
 
-/// Admits an engine table this host can drive, or refuses it by name. Refuses another major, a size below this host's table size (minor versions only append), and a minor below 3 or a table without `attach_ex`, `fault` or `end_call`. The core loader and the gate both call it.
+/// Admits an engine table this host can drive, or refuses it by name. Refuses another major, a size below this host's table size (minor versions only append), a minor below this host's, and a table missing any entry. The core loader and the gate both call it.
 pub fn check_engine_table(table: &AtlEngine) -> Result<(), String> {
     if table.major != ABI_MAJOR {
         return Err(format!(
@@ -170,15 +165,26 @@ pub fn check_engine_table(table: &AtlEngine) -> Result<(), String> {
             table.major, table.minor, table.size
         ));
     }
-    // host and engine are built together, so no older-minor fallback: the host calls attach_ex (2.1), fault (2.2) and end_call (2.3) unconditionally
-    if table.minor < ABI_MINOR
-        || table.attach_ex.is_none()
-        || table.fault.is_none()
-        || table.end_call.is_none()
-    {
+    // host and engine are built together, so no older-minor fallback: the host calls every entry unconditionally
+    let missing: Vec<&str> = [
+        ("create", table.create.is_none()),
+        ("destroy", table.destroy.is_none()),
+        ("map", table.map.is_none()),
+        ("attach_ex", table.attach_ex.is_none()),
+        ("detach", table.detach.is_none()),
+        ("call_ex", table.call_ex.is_none()),
+        ("fault", table.fault.is_none()),
+        ("end_call", table.end_call.is_none()),
+    ]
+    .into_iter()
+    .filter_map(|(name, none)| none.then_some(name))
+    .collect();
+    if table.minor < ABI_MINOR || !missing.is_empty() {
         return Err(format!(
-            "engine ABI {}.{} lacks attach_ex (2.1), fault (2.2) or end_call (2.3), host needs {ABI_MAJOR}.{ABI_MINOR}",
-            table.major, table.minor
+            "engine ABI {}.{} lacks [{}], host needs {ABI_MAJOR}.{ABI_MINOR}",
+            table.major,
+            table.minor,
+            missing.join(", ")
         ));
     }
     Ok(())
@@ -188,58 +194,82 @@ pub fn check_engine_table(table: &AtlEngine) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn refuses_a_major_1_engine_by_name() {
-        let table = AtlEngine {
-            major: 1,
-            minor: 1,
+    extern "C" fn create(
+        _: *const AtlHost,
+        _: *const c_char,
+        _: *mut *mut AtlEngineHandle,
+    ) -> c_int {
+        0
+    }
+    extern "C" fn destroy(_: *mut AtlEngineHandle) {}
+    extern "C" fn map(_: *mut AtlEngineHandle, _: u64, _: u64, _: u32) -> c_int {
+        0
+    }
+    extern "C" fn attach_ex(
+        _: *mut AtlEngineHandle,
+        _: *mut AtlStack,
+        _: *mut *mut AtlCpu,
+    ) -> c_int {
+        0
+    }
+    extern "C" fn detach(_: *mut AtlEngineHandle, _: *mut AtlCpu) {}
+    extern "C" fn call_ex(
+        _: *mut AtlEngineHandle,
+        _: *mut AtlCpu,
+        _: *mut u64,
+        _: u64,
+        _: *mut AtlLanes,
+    ) {
+    }
+    extern "C" fn fault(_: c_int, _: *mut c_void, _: *mut c_void) -> bool {
+        false
+    }
+    extern "C" fn end_call(_: *mut AtlEngineHandle) -> c_int {
+        0
+    }
+
+    /// Every entry set, at `major.minor`.
+    fn full(major: u32, minor: u32) -> AtlEngine {
+        AtlEngine {
+            major,
+            minor,
             size: core::mem::size_of::<AtlEngine>() as u32,
-            create: None,
-            destroy: None,
-            map: None,
-            attach: None,
-            detach: None,
-            call_ex: None,
-            attach_ex: None,
-            fault: None,
-            end_call: None,
-        };
-        // "2.3" is the spec, typed here: ABI_MAJOR/ABI_MINOR are the code under test
+            create: Some(create),
+            destroy: Some(destroy),
+            map: Some(map),
+            attach_ex: Some(attach_ex),
+            detach: Some(detach),
+            call_ex: Some(call_ex),
+            fault: Some(fault),
+            end_call: Some(end_call),
+        }
+    }
+
+    // "3.0" in the expected texts is the spec, typed here: ABI_MAJOR/ABI_MINOR are the code under test
+
+    #[test]
+    fn admits_a_full_3_0_engine() {
+        assert_eq!(check_engine_table(&full(3, 0)), Ok(()));
+    }
+
+    #[test]
+    fn refuses_a_2_3_engine_naming_the_major() {
+        // a complete 2.3 table (the last 2.x minor) is still another major: 3.0 dropped `attach`
         assert_eq!(
-            check_engine_table(&table),
-            Err("engine ABI 1.1 refused, host speaks 2.3".to_owned())
+            check_engine_table(&full(2, 3)),
+            Err("engine ABI 2.3 refused, host speaks 3.0".to_owned())
         );
     }
 
     #[test]
-    fn refuses_a_2_1_engine_without_fault_by_name() {
-        extern "C" fn attach_ex(
-            _: *mut AtlEngineHandle,
-            _: *mut AtlStack,
-            _: *mut *mut AtlCpu,
-        ) -> c_int {
-            0
-        }
+    fn refuses_a_3_0_engine_without_fault_by_name() {
         let table = AtlEngine {
-            major: 2,
-            minor: 1,
-            size: core::mem::size_of::<AtlEngine>() as u32,
-            create: None,
-            destroy: None,
-            map: None,
-            attach: None,
-            detach: None,
-            call_ex: None,
-            attach_ex: Some(attach_ex),
             fault: None,
-            end_call: None,
+            ..full(3, 0)
         };
         assert_eq!(
             check_engine_table(&table),
-            Err(
-                "engine ABI 2.1 lacks attach_ex (2.1), fault (2.2) or end_call (2.3), host needs 2.3"
-                    .to_owned()
-            )
+            Err("engine ABI 3.0 lacks [fault], host needs 3.0".to_owned())
         );
     }
 }

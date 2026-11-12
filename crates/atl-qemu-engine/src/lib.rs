@@ -92,7 +92,6 @@ mod abi_check {
     const _: () = assert!(offset_of!(AtlEngine, create) as u64 == l::ATL_OFFSET_ENGINE_CREATE);
     const _: () = assert!(offset_of!(AtlEngine, destroy) as u64 == l::ATL_OFFSET_ENGINE_DESTROY);
     const _: () = assert!(offset_of!(AtlEngine, map) as u64 == l::ATL_OFFSET_ENGINE_MAP);
-    const _: () = assert!(offset_of!(AtlEngine, attach) as u64 == l::ATL_OFFSET_ENGINE_ATTACH);
     const _: () = assert!(offset_of!(AtlEngine, detach) as u64 == l::ATL_OFFSET_ENGINE_DETACH);
     const _: () = assert!(offset_of!(AtlEngine, call_ex) as u64 == l::ATL_OFFSET_ENGINE_CALL_EX);
     const _: () =
@@ -258,12 +257,6 @@ mod capi {
         }
     }
 
-    unsafe extern "C" fn attach(engine: *mut AtlEngineHandle, out: *mut *mut AtlCpu) -> c_int {
-        let mut stack = AtlStack::default();
-        // SAFETY: stack is a live local; out is passed through (the ABI).
-        unsafe { attach_ex(engine, &mut stack, out) }
-    }
-
     unsafe extern "C" fn attach_ex(
         engine: *mut AtlEngineHandle,
         stack: *mut AtlStack,
@@ -353,10 +346,9 @@ mod capi {
         create: Some(create),
         destroy: Some(destroy),
         map: Some(map),
-        attach: Some(attach),
+        attach_ex: Some(attach_ex),
         detach: Some(detach),
         call_ex: Some(call_ex),
-        attach_ex: Some(attach_ex),
         fault: Some(fault),
         end_call: Some(end_call),
     };

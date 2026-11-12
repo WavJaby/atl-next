@@ -1587,8 +1587,8 @@ mod engine_so {
     use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
     use atl_engine_api::{
-        ABI_MAJOR, ABI_MINOR, AtlCpu, AtlEngine, AtlEngineHandle, AtlHost, AtlLanes, PROT_READ,
-        TrapKind, check_engine_table,
+        ABI_MAJOR, ABI_MINOR, AtlCpu, AtlEngine, AtlEngineHandle, AtlHost, AtlLanes, AtlStack,
+        PROT_READ, TrapKind, check_engine_table,
     };
 
     /// The auxv pointer BOOT delivered (x0), written by the host trap on the boot helper.
@@ -1633,7 +1633,7 @@ mod engine_so {
             return Err("create wrote no handle before BOOT".to_owned());
         }
         let map = p.table.map.ok_or("engine table has no map")?;
-        let attach = p.table.attach.ok_or("engine table has no attach")?;
+        let attach_ex = p.table.attach_ex.ok_or("engine table has no attach_ex")?;
         // SAFETY: engine is the handle create wrote; PAGE is a live host page of this process (the ABI's map).
         let rc = unsafe {
             map(
@@ -1651,8 +1651,9 @@ mod engine_so {
         std::thread::spawn(move || {
             let engine = engine as *mut AtlEngineHandle;
             let mut cpu: *mut AtlCpu = std::ptr::null_mut();
-            // SAFETY: engine is live; cpu is an out parameter.
-            let rc = unsafe { attach(engine, &mut cpu) };
+            let mut stack = AtlStack::default();
+            // SAFETY: engine is live; stack (default size) and cpu are a live local and an out parameter.
+            let rc = unsafe { attach_ex(engine, &mut stack, &mut cpu) };
             let _ = tx.send(rc);
             if rc == 0 {
                 loop {
@@ -1752,17 +1753,18 @@ mod engine_so {
         Ok((table, probe.engine.load(Ordering::SeqCst)))
     }
 
-    /// Gate (r): `attach` then `detach` on a thread of its own, the thread that attached (the ABI's rule), with no guest call between. The copied CPU has not run its queued work, so detach must enter it in `plugin.cpu_ht` itself: without that, plugins/core.c:293 aborts.
+    /// Gate (r): `attach_ex` then `detach` on a thread of its own, the thread that attached (the ABI's rule), with no guest call between. The copied CPU has not run its queued work, so detach must enter it in `plugin.cpu_ht` itself: without that, plugins/core.c:293 aborts.
     fn detach_probe(table: &AtlEngine, engine: *mut AtlEngineHandle) -> Result<(), String> {
-        let attach = table.attach.ok_or("engine table has no attach")?;
+        let attach_ex = table.attach_ex.ok_or("engine table has no attach_ex")?;
         let detach = table.detach.ok_or("engine table has no detach")?;
         let engine = engine as usize;
         let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
         std::thread::spawn(move || {
             let engine = engine as *mut AtlEngineHandle;
             let mut cpu: *mut AtlCpu = std::ptr::null_mut();
-            // SAFETY: engine is live; cpu is an out parameter.
-            let rc = unsafe { attach(engine, &mut cpu) };
+            let mut stack = AtlStack::default();
+            // SAFETY: engine is live; stack (default size) and cpu are a live local and an out parameter.
+            let rc = unsafe { attach_ex(engine, &mut stack, &mut cpu) };
             if rc != 0 {
                 let _ = tx.send(Err(format!("attach for detach: {rc}")));
                 return;

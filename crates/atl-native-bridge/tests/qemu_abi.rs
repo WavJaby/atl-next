@@ -148,7 +148,7 @@ fn check_edge(edge: u64) -> Result<(), String> {
     )
 }
 
-/// Check z, `attach_ex` (ABI 2.1): the main thread's default stack is [`DEFAULT_STACK`]; a second thread asks for [`SIZED_STACK`], gets exactly that, and `qa_run` on it stores its stack words (`K_EXPECT`) inside `[base, base + len)`, so the guest's sp lives in the reported range.
+/// Check z, `attach_ex`: the main thread's default stack is [`DEFAULT_STACK`]; a second thread asks for [`SIZED_STACK`], gets exactly that, and `qa_run` on it stores its stack words (`K_EXPECT`) inside `[base, base + len)`, so the guest's sp lives in the reported range.
 fn check_stack(default: AtlStack, run: u64) -> Result<(), String> {
     same("default stack len", default.len, DEFAULT_STACK)?;
     std::thread::spawn(move || -> Result<(), String> {

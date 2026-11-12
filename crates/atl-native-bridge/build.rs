@@ -201,7 +201,7 @@ const SHIMS: &[&str] = &[
 ];
 /// Shims of the x86_64 stub list only (`libc_stubs`): signal.rs registers the guest handler with sigchain behind ART's claims.
 const SIGNAL_SHIMS: &[&str] = &["sigaction", "sigaction64"];
-/// Shims of the arm64 (QEMU) stub list only: intercepts.rs `pthread_exit` ends the start routine's guest call through the engine's `end_call` (ABI 2.3), which the identity engine has no counterpart of.
+/// Shims of the arm64 (QEMU) stub list only: intercepts.rs `pthread_exit` ends the start routine's guest call through the engine's `end_call`, which the identity engine has no counterpart of.
 const QEMU_SHIMS: &[&str] = &[
     "pthread_exit",
     // engine/netdb.rs: struct addrinfo and the AI_ / NI_ / EAI_ values differ between bionic and glibc, so these convert (layouts generated from bionic's netdb.h)

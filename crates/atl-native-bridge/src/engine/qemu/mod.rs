@@ -69,7 +69,7 @@ pub(super) fn call_depth() -> u32 {
     DEPTH.with(Cell::get)
 }
 
-/// From inside a trap callback: the trap's return ends the guest call it interrupted, its answer becoming that call's (`atl_engine.end_call`, 2.3).
+/// From inside a trap callback: the trap's return ends the guest call it interrupted, its answer becoming that call's (`atl_engine.end_call`).
 pub(super) fn end_call() -> Result<(), String> {
     let e = engine();
     let end = e
@@ -227,7 +227,7 @@ fn engine() -> &'static Engine {
         .unwrap_or_else(|| unsupported("qemu crossing: no engine (boot has not run)"))
 }
 
-/// Gives the calling thread a guest CPU (`atl_engine.attach`: a copy of the boot CPU) and makes it this thread's CPU for [`call_guest`], [`call`] and [`register`]. Once per thread, after [`boot`]: a second call keeps the first CPU. [`detach_current`] takes it back at thread exit.
+/// Gives the calling thread a guest CPU (`atl_engine.attach_ex`: a copy of the boot CPU) and makes it this thread's CPU for [`call_guest`], [`call`] and [`register`]. Once per thread, after [`boot`]: a second call keeps the first CPU. [`detach_current`] takes it back at thread exit.
 pub fn attach_current() -> Result<(), String> {
     attach_current_ex(AtlStack::default()).map(|_| ())
 }

@@ -48,7 +48,6 @@ const FACTS: &[(&str, &str)] = &[
     ("ATL_OFFSET_ENGINE_CREATE", "offsetof(atl_engine, create)"),
     ("ATL_OFFSET_ENGINE_DESTROY", "offsetof(atl_engine, destroy)"),
     ("ATL_OFFSET_ENGINE_MAP", "offsetof(atl_engine, map)"),
-    ("ATL_OFFSET_ENGINE_ATTACH", "offsetof(atl_engine, attach)"),
     ("ATL_OFFSET_ENGINE_DETACH", "offsetof(atl_engine, detach)"),
     ("ATL_OFFSET_ENGINE_CALL_EX", "offsetof(atl_engine, call_ex)"),
     (
