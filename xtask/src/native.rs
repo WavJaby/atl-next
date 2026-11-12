@@ -231,10 +231,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if args.fetch_missing {
         fetch::add_and_fetch(root, &[])?;
     }
-    // modules provided outside the tree, before the converter: it links their artifacts; each provider is built or resolved once (crates by cargo-c, upstreams by their own build system, system libraries as installed), then each module gets one entry joining its row's providers in order
+    // modules provided outside the tree, before the converter: it links their artifacts
     // a cross host builds every provider for its target: crates with cross::cargo_target, system rows from its sysroot, upstreams with the converter's cross flags (bp2ninja -upstream-toolchain)
     let to_build = &providers;
-    let crates = build_crates(root, &out, to_build, cross_cargo.as_ref())?;
+    let checkouts = sources.checkouts(None);
     // a cross host's system rows resolve in its sysroot: the build machine's pkg-config path and library dirs never apply
     let target_root = cross
         .as_ref()
@@ -248,86 +248,55 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }),
         _ => None,
     };
-    let mut systems = BTreeMap::new();
-    for (_, row) in providers::systems(to_build) {
-        if systems.contains_key(row) {
-            continue;
-        }
-        let pkg = deps[row]
-            .pkgconfig
-            .as_deref()
-            .context("providers.toml checked the pkgconfig")?;
-        let p = system::resolve(row, pkg, target)?;
-        println!(
-            "native: system {row} (pkg-config {pkg}) -> {}",
-            p.lib.display()
-        );
-        systems.insert(row, p);
-    }
-    // the converter's own libc++ and host target flags: an upstream compiles and links as its host modules do
-    let flags: upstream::Flags = serde_json::from_str(&crate::host_art::output(
-        Command::new(&converter)
-            .args([
-                "-upstream-toolchain",
-                "-cxx",
-                &flag_or_row(&args.cxx, root, "clang-cxx")?,
-            ])
-            .args(&cross_flags),
-        "bp2ninja -upstream-toolchain",
-    )?)
-    .context("parsing bp2ninja -upstream-toolchain")?;
-    let toolchain = upstream::Toolchain {
-        cc: &flag_or_row(&args.cc, root, "clang")?,
-        cxx: &flag_or_row(&args.cxx, root, "clang-cxx")?,
-        flags: &flags,
-        // CMake's cross mode (CMAKE_CROSSCOMPILING): the arch name is the clang triple's arch part (arches.toml `clang`)
-        cross_processor: cross.as_ref().map(|_| args.host.as_str()),
+    let cc = flag_or_row(&args.cc, root, "clang")?;
+    let cxx = flag_or_row(&args.cxx, root, "clang-cxx")?;
+    let ctx = ProvideCtx {
+        root,
+        providers: to_build,
+        deps: &deps,
+        layout: &layout,
+        checkouts: &checkouts,
+        converter: &converter,
+        cc: &cc,
+        cxx: &cxx,
     };
-    let checkouts = sources.checkouts(None);
-    // by module: a recipe installs one artifact per module it provides
-    let mut upstreams = BTreeMap::new();
-    for name in providers::upstreams(to_build) {
-        let recipe = upstream::recipe(name).context("providers.toml checked the recipe")?;
-        let c = checkouts
-            .iter()
-            .find(|c| matches!(&c.pin, Pin::Git(n) if n == name))
-            .with_context(|| format!("providers.toml upstream {name} has no sources.toml row"))?;
-        let src = layout.locate(&c.dir).dir;
-        println!("native: building upstream {name} from {}", src.display());
-        upstreams.extend(upstream::build(&src, &out, recipe, &toolchain)?);
-    }
-    let mut provided = BTreeMap::new();
-    // rust_os rows have no provider and module: rows a tree one: the tree builds them (-stand-in)
-    let stood: BTreeSet<&str> = providers::stand_ins(&providers)
-        .into_iter()
-        .map(|(m, _)| m)
-        .collect();
-    for (module, row) in to_build
-        .iter()
-        .filter(|(m, row)| !row.is_none() && !stood.contains(m.as_str()))
-    {
-        let Some(provider) = &row.provider else {
-            continue;
-        };
-        let p = match provider.split_once(':') {
-            Some(("crate", name)) => crates.get(name),
-            Some(("system", name)) => systems.get(name),
-            Some(("upstream", _)) => upstreams.get(module),
-            _ => None,
+    let mut provided = provide(
+        &ctx,
+        &Machine {
+            label: "",
+            out: out.clone(),
+            cargo: cross_cargo.as_ref(),
+            target,
+            flags: &cross_flags,
+            cross_processor: cross.as_ref().map(|_| args.host.as_str()),
+        },
+    )?;
+    // a cross host's build side (tools a build rule executes or loads: bp2ninja Build) links the same providers built for the build machine, as Soong resolves a BuildOSTarget module's deps in the build OS variant;
+    // in their own dir, apart from the converter's device/, host/ and build/<module> nodes and the gates over them
+    let build_provided_file = out.join("build-provided.json");
+    let build_provided_args = match &cross {
+        None => Vec::new(),
+        Some(_) => {
+            let build_machine = Machine {
+                label: "build ",
+                out: out.join("build-provided"),
+                cargo: None,
+                target: None,
+                flags: &[],
+                cross_processor: None,
+            };
+            let mut bp = provide(&ctx, &build_machine)?;
+            // a srcs row's provider stands in for sources of a product module; no build-side module has one
+            for (module, _) in providers::partial(to_build) {
+                bp.remove(module);
+            }
+            write_if_changed(&build_provided_file, &serde_json::to_string_pretty(&bp)?)?;
+            vec![
+                "-build-provided".to_owned(),
+                build_provided_file.display().to_string(),
+            ]
         }
-        .cloned()
-        .with_context(|| format!("{module}: provider {provider} was not built"))?;
-        let part = if row.srcs.is_empty() {
-            ""
-        } else {
-            " (its srcs row)"
-        };
-        println!(
-            "native: provided {module}{part} = {provider} -> {}",
-            p.lib.display()
-        );
-        provided.insert(module.as_str(), p);
-    }
+    };
     // a srcs row's provider stands in for some sources of its module, not for the module
     let partial: BTreeMap<&str, Partial> = providers::partial(to_build)
         .into_iter()
@@ -388,6 +357,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             path(&out),
         ];
         argv.extend(cross_flags.iter().cloned());
+        argv.extend(build_provided_args.iter().cloned());
         argv.extend(
             [
                 "-arch",
@@ -1177,6 +1147,118 @@ fn remove_path(path: &Path) -> Result<()> {
 /// A crate installing no header (its callers include upstream headers) gets no include dir.
 /// cargo-c installs into a DESTDIR staging tree that is replaced each run; `sync_tree` copies only what changed into the installed paths, so an unchanged header or library keeps its mtime and its dependants stay clean.
 /// A cross host's crates are built for its target: cargo's `--target` and environment come from `cross` (cross::cargo_target).
+/// What every machine's provided set is resolved from: the providers.toml rows, deps.toml, the checkouts, and the converter (its -upstream-toolchain flags).
+struct ProvideCtx<'a> {
+    root: &'a Path,
+    providers: &'a providers::Providers,
+    deps: &'a deps::Deps,
+    layout: &'a Layout,
+    checkouts: &'a [sources::Checkout],
+    converter: &'a Path,
+    cc: &'a str,
+    cxx: &'a str,
+}
+
+/// The machine a provided set is built for: its output dir, cargo target, sysroot and converter cross flags; all empty for the build machine.
+struct Machine<'a> {
+    /// log prefix: "" for the ATL host, "build " for a cross host's build machine
+    label: &'static str,
+    out: PathBuf,
+    cargo: Option<&'a crate::cross::CargoTarget>,
+    target: Option<system::Sysroot<'a>>,
+    flags: &'a [String],
+    cross_processor: Option<&'a str>,
+}
+
+/// The provided set for machine `m`: each provider built or resolved once (crates by cargo-c, upstreams by their own build system, system libraries as installed), then each module one entry joining its row's providers in order; `srcs` rows included (the caller splits them off).
+fn provide<'a>(ctx: &ProvideCtx<'a>, m: &Machine) -> Result<BTreeMap<&'a str, Provided>> {
+    let crates = build_crates(ctx.root, &m.out, ctx.providers, m.cargo)?;
+    let mut systems = BTreeMap::new();
+    for (_, row) in providers::systems(ctx.providers) {
+        if systems.contains_key(row) {
+            continue;
+        }
+        let pkg = ctx.deps[row]
+            .pkgconfig
+            .as_deref()
+            .context("providers.toml checked the pkgconfig")?;
+        let p = system::resolve(row, pkg, m.target)?;
+        println!(
+            "native: {}system {row} (pkg-config {pkg}) -> {}",
+            m.label,
+            p.lib.display()
+        );
+        systems.insert(row, p);
+    }
+    // the converter's own libc++ and target flags: an upstream compiles and links as the machine's tree modules do
+    let flags: upstream::Flags = serde_json::from_str(&crate::host_art::output(
+        Command::new(ctx.converter)
+            .args(["-upstream-toolchain", "-cxx", ctx.cxx])
+            .args(m.flags),
+        "bp2ninja -upstream-toolchain",
+    )?)
+    .context("parsing bp2ninja -upstream-toolchain")?;
+    let toolchain = upstream::Toolchain {
+        cc: ctx.cc,
+        cxx: ctx.cxx,
+        flags: &flags,
+        // CMake's cross mode (CMAKE_CROSSCOMPILING): the arch name is the clang triple's arch part (arches.toml `clang`)
+        cross_processor: m.cross_processor,
+    };
+    // by module: a recipe installs one artifact per module it provides
+    let mut upstreams = BTreeMap::new();
+    for name in providers::upstreams(ctx.providers) {
+        let recipe = upstream::recipe(name).context("providers.toml checked the recipe")?;
+        let c = ctx
+            .checkouts
+            .iter()
+            .find(|c| matches!(&c.pin, Pin::Git(n) if n == name))
+            .with_context(|| format!("providers.toml upstream {name} has no sources.toml row"))?;
+        let src = ctx.layout.locate(&c.dir).dir;
+        println!(
+            "native: {}building upstream {name} from {}",
+            m.label,
+            src.display()
+        );
+        upstreams.extend(upstream::build(&src, &m.out, recipe, &toolchain)?);
+    }
+    let mut provided = BTreeMap::new();
+    // rust_os rows have no provider and module: rows a tree one: the tree builds them (-stand-in)
+    let stood: BTreeSet<&str> = providers::stand_ins(ctx.providers)
+        .into_iter()
+        .map(|(m, _)| m)
+        .collect();
+    for (module, row) in ctx
+        .providers
+        .iter()
+        .filter(|(m, row)| !row.is_none() && !stood.contains(m.as_str()))
+    {
+        let Some(provider) = &row.provider else {
+            continue;
+        };
+        let p = match provider.split_once(':') {
+            Some(("crate", name)) => crates.get(name),
+            Some(("system", name)) => systems.get(name),
+            Some(("upstream", _)) => upstreams.get(module),
+            _ => None,
+        }
+        .cloned()
+        .with_context(|| format!("{module}: provider {provider} was not built"))?;
+        let part = if row.srcs.is_empty() {
+            ""
+        } else {
+            " (its srcs row)"
+        };
+        println!(
+            "native: {}provided {module}{part} = {provider} -> {}",
+            m.label,
+            p.lib.display()
+        );
+        provided.insert(module.as_str(), p);
+    }
+    Ok(provided)
+}
+
 fn build_crates<'a>(
     root: &Path,
     out: &Path,

@@ -233,6 +233,8 @@ type Graph struct {
 	dropped map[string]bool
 	// providers.toml rows built outside the tree (provided.go)
 	provided map[string]Provided
+	// the same rows built for the build machine, read by the Build side (a cross host only; providedOn)
+	buildProvided map[string]Provided
 	// bionic sides' provided modules: the LLVM runtimes archives built for the guest (xtask runtimes) under Soong's module names (libc++_static_noexcept, libclang_rt.builtins, ...)
 	nbProvided map[string]Provided
 	// providers.toml rows replacing only some sources of a module, and the "module\x00file" ones dropped (provided.go)
@@ -684,6 +686,14 @@ func compatPath(set []compatHeader, name string) string {
 // stlModules: Soong's STL libraries (cc/stl.go). Every link takes -lc++ with its module's stl selection (stl.go linkStlFlags), so a module naming one directly (libcxx's shared_libs) needs nothing more.
 var stlModules = map[string]bool{"libc++": true, "libc++_static": true}
 
+// providedOn: the provided set of a glibc side's machine. The Build side links the build machine's (Soong: a BuildOSTarget module's deps take the build OS variant); it exists only on a cross host, where -build-provided is required.
+func (g *Graph) providedOn(side Side) map[string]Provided {
+	if side == Build {
+		return g.buildProvided
+	}
+	return g.provided
+}
+
 // node builds (once) the node for a reference, depth first.
 func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 	name := strings.TrimPrefix(ref, ":")
@@ -704,7 +714,7 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 	if stlModules[name] {
 		return nil
 	}
-	if p, ok := g.provided[name]; ok {
+	if p, ok := g.providedOn(side)[name]; ok {
 		return g.providedNode(name, side, p)
 	}
 	// providers.toml `module:`: the tree module that installs under this name stands in for it; anything else under the name would be a different library

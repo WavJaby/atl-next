@@ -41,6 +41,7 @@ func main() {
 	nbArch := flag.String("native-bridge", "", "guest arch of the native bridge side (arches.toml row with [guest]): android properties + target.native_bridge built against bionic into <out>/nb/<arch>; goals `nb:<module>` build there; empty = no native bridge side")
 	nbBits := flag.Int("native-bridge-bits", 0, "pointer width of -native-bridge (its arches.toml pointer_bits)")
 	nbArchVariant := flag.String("native-bridge-arch-variant", "", "Soong arch variant of the native bridge side (its arches.toml soong_arch_variant; empty = Soong's baseline, which arm and arm64 lack); needs -native-bridge")
+	buildProvidedFile := flag.String("build-provided", "", "cross host: JSON file like -provided: the same rows built for the build machine, which the build side links; given exactly with the -host-* flags")
 	nbProvidedFile := flag.String("nb-provided", "", "JSON file like -provided: the native bridge side's provided modules (the LLVM runtimes built for the guest: libc++_static_noexcept, libc++demangle_noexcept, libunwind, libclang_rt.builtins)")
 	rtInclude := flag.String("clang-rt-include", "", "compiler-rt's include dir (sanitizer/, xray/ headers) for the -native-bridge side's compiles: prebuilts/clang's resource dir carries it, the distro clang's lacks it (bionic's heap_tagging.cpp includes sanitizer/hwasan_interface.h)")
 	bionicStaticRust := flag.String("bionic-static-rust", "", "crate root (crates/atl-guest-dlsym/src/lib.rs) compiled into the Rust staticlib of every static bionic executable: the dlsym rustup's std panic_abort references, which a static bionic executable has no libdl for")
@@ -217,7 +218,20 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -provided / -srcs:", err)
 		os.Exit(1)
 	}
-	if err := run(*tree, *out, cfg, Tools{*cc, *cxx, *ar, *bison, *flex, *m4, *yasm, *rustc, *rustVersion, *libclang, *llvm, *launcher, *rtInclude, *bionicStaticRust, *licenceGate}, javaSetup{jt, *release, *measure}, omitted, provided, nbProvided, partial, android, moduleDefines, stand, aidlCrates, *nbExports, regen, flag.Args()); err != nil {
+	// the build side exists only on a cross host, and links nothing of the host's provided set
+	if cross.set() != (*buildProvidedFile != "") {
+		fmt.Fprintln(os.Stderr, "bp2ninja: -build-provided is given exactly with the -host-* flags")
+		os.Exit(1)
+	}
+	buildProvided, err := readJSON[Provided](*buildProvidedFile)
+	if err == nil {
+		err = checkLibs(buildProvided, nil)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "bp2ninja: -build-provided:", err)
+		os.Exit(1)
+	}
+	if err := run(*tree, *out, cfg, Tools{*cc, *cxx, *ar, *bison, *flex, *m4, *yasm, *rustc, *rustVersion, *libclang, *llvm, *launcher, *rtInclude, *bionicStaticRust, *licenceGate}, javaSetup{jt, *release, *measure}, omitted, provided, buildProvided, nbProvided, partial, android, moduleDefines, stand, aidlCrates, *nbExports, regen, flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja:", err)
 		os.Exit(1)
 	}
@@ -276,7 +290,7 @@ type javaSetup struct {
 	measure bool
 }
 
-func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[string]bool, provided, nbProvided map[string]Provided, partial map[string]Partial, rustAndroid map[string]bool, defines map[string][]string, stand map[string]string, aidlCrates map[string]AidlCrate, nbExports string, regen *regenSetup, goals []string) error {
+func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[string]bool, provided, buildProvided, nbProvided map[string]Provided, partial map[string]Partial, rustAndroid map[string]bool, defines map[string][]string, stand map[string]string, aidlCrates map[string]AidlCrate, nbExports string, regen *regenSetup, goals []string) error {
 	files, err := discover(tree)
 	if err != nil {
 		return err
@@ -287,7 +301,7 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	}
 	// not passed (toolchainLocation, keepFlag): reported on every run, so a change in what is dropped shows
 	fmt.Printf("bp2ninja: Soong global flags not passed (diagnostics, debug info, prebuilt toolchain location): %s\n", strings.Join(soong.Flags.Skipped, " "))
-	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, provided: provided, nbProvided: nbProvided, partial: partial, rustAndroid: rustAndroid, defines: defines, stand: stand, rtInclude: tools.RtInclude, bionicStaticRust: tools.BionicStaticRust, nodes: map[key]*Node{}}
+	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, provided: provided, buildProvided: buildProvided, nbProvided: nbProvided, partial: partial, rustAndroid: rustAndroid, defines: defines, stand: stand, rtInclude: tools.RtInclude, bionicStaticRust: tools.BionicStaticRust, nodes: map[key]*Node{}}
 	if g.libcxx, err = libcxxProvider(tools.CXX, cfg.HostCross); err != nil {
 		return err
 	}

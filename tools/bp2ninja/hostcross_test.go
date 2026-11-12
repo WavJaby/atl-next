@@ -124,6 +124,45 @@ cc_library_static { name: "libu", srcs: ["u.cc"], host_supported: true }
 	}
 }
 
+// A provided module resolves per machine: a cross host's build tool links the build machine's copy (-build-provided), its products the host's (-provided); on the build machine both are the one -provided set.
+func TestProvidedPerMachine(t *testing.T) {
+	files := map[string]string{"p/Android.bp": `
+cc_binary_host { name: "tool", srcs: ["tool.cc"], shared_libs: ["libprov"] }
+genrule { name: "gen", tools: ["tool"], cmd: "$(location tool) > $(out)", out: ["g.h"] }
+cc_library { name: "lib", srcs: ["a.cc"], generated_headers: ["gen"], shared_libs: ["libprov"], host_supported: true }
+`, "p/tool.cc": "", "p/a.cc": ""}
+	const hostLib, buildLib = "/host/libprov.so", "/build/libprov.so"
+	for _, c := range []struct {
+		name             string
+		cfg              Config
+		build            map[string]Provided
+		toolLib, prodLib string
+	}{
+		{"x86_64 on x86_64", Config{Arch: "x86_64", PointerBits: 64}, nil, hostLib, hostLib},
+		{"riscv64 on x86_64", riscvOnX86, map[string]Provided{"libprov": {Lib: buildLib}}, buildLib, hostLib},
+	} {
+		g := graphForCfg(t, c.cfg, files)
+		g.provided = map[string]Provided{"libprov": {Lib: hostLib}}
+		g.buildProvided = c.build
+		lib := g.node("lib", Host, Shared, "test")
+		if lib == nil {
+			t.Fatalf("%s: lib not built: %v", c.name, g.problems)
+		}
+		tool := g.nodes[key{"gen", lib.side, Gen}].rule.tools[0]
+		for _, n := range []struct {
+			n    *Node
+			want string
+		}{{tool, c.toolLib}, {lib, c.prodLib}} {
+			if len(n.n.deps.shared) != 1 || n.n.deps.shared[0].out != n.want || n.n.deps.shared[0].side != n.n.side {
+				t.Errorf("%s: %s links %v, want %s on its own side", c.name, n.n.dir(), n.n.deps.shared, n.want)
+			}
+		}
+		if err := g.checkMachines(); err != nil {
+			t.Errorf("%s: %v", c.name, err)
+		}
+	}
+}
+
 // A cross host's libc++ headers must lie under its sysroot: the distro's own include dir is the build machine's libc++. The sysroot prefix ends at a separator, so root-other is not under root.
 func TestLibcxxInSysroot(t *testing.T) {
 	for _, c := range []struct {
