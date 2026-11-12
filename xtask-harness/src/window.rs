@@ -130,6 +130,10 @@ pub struct Args {
     /// Stage hwui only: the app processes preload the platform module (`LD_PRELOAD`), putting GTK's closure in global scope as an `RTLD_GLOBAL` load would, so the bindings sub-gate must fail on undeclared app/AOSP -> host bindings (the gate's deliberate break).
     #[arg(long)]
     break_global_module: bool,
+    /// Stage hwui only: the app processes preload the runtime cdylib (`LD_PRELOAD` of xtask launcher_closure `RUNTIME`), putting the AOSP group in global scope as loading it `RTLD_GLOBAL` would, so host objects (GTK, the Khronos loader) bind AOSP libraries again
+    /// and the bindings sub-gate must fail on new reverse sonames (the scope split's deliberate break).
+    #[arg(long)]
+    break_global_runtime: bool,
     /// Stage hwui only: this `[[reverse]]` row of launcher-closure.toml is dropped before judging, so its soname is a new reverse binding and the bindings sub-gate must fail naming it (the gate's deliberate break).
     #[arg(long, value_name = "SONAME")]
     break_forget_reverse: Option<String>,
@@ -870,7 +874,7 @@ fn new_intent_check(app: &str, services: &str) -> Result<String, String> {
     }
 }
 
-/// The app processes atld started (the launcher's processes under it).
+/// The app processes atld started (the launcher's processes under it, and the sandbox running each).
 pub(crate) fn app_pids(atld: u32) -> Vec<u32> {
     std::fs::read_dir("/proc")
         .into_iter()
@@ -878,13 +882,20 @@ pub(crate) fn app_pids(atld: u32) -> Vec<u32> {
         .flatten()
         .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
         .filter(|&pid| {
-            std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| {
-                c.windows(APP_LAUNCHER.len())
-                    .any(|w| w == APP_LAUNCHER.as_bytes())
-            })
+            std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| runs_launcher(&c))
         })
         .filter(|&pid| descends_from(pid, atld))
         .collect()
+}
+
+/// Whether a NUL-separated cmdline runs the launcher: an argument whose file name is it (the program, or bwrap's command). Not a substring: a sandbox of atld's services bind-mounts the runtime library dirs, `<out>/crates/atl-app-launcher/lib` among them.
+fn runs_launcher(cmdline: &[u8]) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    cmdline.split(|&b| b == 0).any(|arg| {
+        Path::new(std::ffi::OsStr::from_bytes(arg))
+            .file_name()
+            .is_some_and(|f| f == APP_LAUNCHER)
+    })
 }
 
 /// Whether `pid` is a descendant of `ancestor`, by the parent links in /proc.
@@ -1839,6 +1850,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         if args.break_global_module {
             env.push(format!("LD_PRELOAD={}", crate::ui_module::MODULE_FILE));
         }
+        if args.break_global_runtime {
+            env.push(format!("LD_PRELOAD={}", xtask::launcher_closure::RUNTIME));
+        }
         rt.with_app_env(&env)
     } else {
         rt
@@ -2295,6 +2309,20 @@ fn opening_size_i32(display: DisplayModel) -> (i32, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The app's sandbox and launcher match by an argument's file name; the services' sandbox, binding the runtime's lib dir under `crates/atl-app-launcher`, does not.
+    #[test]
+    fn launcher_by_argument_file_name() {
+        assert!(runs_launcher(
+            b"/o/cargo-converter/release/atl-app-launcher\0--app\0"
+        ));
+        assert!(runs_launcher(
+            b"bwrap\0--ro-bind\0/a\0/a\0/o/release/atl-app-launcher\0-cp\0"
+        ));
+        assert!(!runs_launcher(
+            b"bwrap\0--ro-bind\0/o/crates/atl-app-launcher/lib\0/l\0/o/atl-system-services\0"
+        ));
+    }
 
     /// Every self-test case holds: a crash or a death inside the window fails, one just past it passes, a missing marker and an atld exit are as stated.
     #[test]

@@ -14,7 +14,7 @@ pub const FILE: &str = "launcher-closure.toml";
 /// The launcher's package and executable, the loader (packages.rs: built into the slot's converter target dir).
 const LAUNCHER: &str = "atl-app-launcher";
 /// The runtime cdylib the loader dlopens `RTLD_LOCAL` (atl-app-launcher main.rs), installed in `<out>/crates/<LAUNCHER>/lib` (packages.rs `install_cdylib`).
-const RUNTIME: &str = "libatl_app_runtime.so";
+pub const RUNTIME: &str = "libatl_app_runtime.so";
 
 /// One `RTLD_LOCAL` root's closure as glibc resolves it: the loader's (global scope) or the runtime's.
 struct Group<'a> {
