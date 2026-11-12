@@ -235,11 +235,13 @@ pub fn check(
                 index.products.extend(library_names(rel, &linkage));
                 owners.push((name.clone(), linkage));
             }
-        } else if is64 && side == Some(Side::Build) && name.contains(".so") {
-            if let Some(linkage) = provided_gate::linkage(&data).with_context(|| name.clone())? {
-                for n in library_names(rel, &linkage) {
-                    index.build.entry(n).or_insert_with(|| name.clone());
-                }
+        } else if is64
+            && side == Some(Side::Build)
+            && name.contains(".so")
+            && let Some(linkage) = provided_gate::linkage(&data).with_context(|| name.clone())?
+        {
+            for n in library_names(rel, &linkage) {
+                index.build.entry(n).or_insert_with(|| name.clone());
             }
         }
     }
@@ -1245,7 +1247,7 @@ mod tests {
         }
 
         fn align8(file: &mut Vec<u8>) {
-            while file.len() % 8 != 0 {
+            while !file.len().is_multiple_of(8) {
                 file.push(0);
             }
         }
