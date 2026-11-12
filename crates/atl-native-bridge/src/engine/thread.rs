@@ -230,16 +230,12 @@ extern "C" fn detach(value: *mut libc::c_void) {
     CURRENT.with(|c| c.set(std::ptr::null_mut()));
     active().detach();
     let d = DETACHED.fetch_add(1, Ordering::Relaxed) + 1;
-    #[allow(
-        clippy::print_stderr,
-        reason = "the process's log (atl-broker): the thread gate reads it"
-    )]
-    {
-        eprintln!(
-            "atl-native-bridge: thread detached (attached {}, detached {d})",
-            ATTACHED.load(Ordering::Relaxed)
-        );
-    }
+    // the process's log (atl-broker), which the thread gates parse: one write(2) per line -- eprintln! writes each format piece separately, and another thread's log write landed between them (torn line, gate red)
+    let line = format!(
+        "atl-native-bridge: thread detached (attached {}, detached {d})\n",
+        ATTACHED.load(Ordering::Relaxed)
+    );
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
 }
 
 fn release_record() {
