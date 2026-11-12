@@ -135,7 +135,7 @@ fn trapped((lib, name, why): (&str, &str, &str)) {
     ))
 }
 
-/// The hand-written host side of `Entry::Shim` stub `name`: the one match over build.rs `SHIMS`, `QEMU_SHIMS` and `NDK_SHIMS` (test `every_shim_has_an_arm`).
+/// The hand-written host side of `Entry::Shim` stub `name`: the one match over build.rs `SHIMS`, `QEMU_SHIMS` and `PROXY_SHIMS` (test `every_shim_has_an_arm`).
 fn shim(name: &str) -> Option<usize> {
     Some(match name {
         "pthread_create" => super::intercepts::pthread_create as *const () as usize,

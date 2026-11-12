@@ -154,6 +154,11 @@ pub(super) fn down_args(t: TableId, first: &mut usize, sixth: &mut usize) {
     }
 }
 
+/// Live proxies owned by no object (first met as a callback's caller): never freed, so this is the leak, for the gates.
+pub fn ownerless() -> usize {
+    map().proxies.values().filter(|p| p.owner.is_none()).count()
+}
+
 /// Refusals so far, by name (`sles.<method>.<name>`), for the gates.
 static REFUSED: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
 

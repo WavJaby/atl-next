@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Host sides of the NDK functions that take a `JNIEnv*` (build.rs `NDK_SHIMS`). The guest passes its own env (jni.rs `GuestObj`), so the generic crossing would hand the host library a guest env: each shim maps it to the host env (jni.rs `host_env`) and calls the same function of the host library of its soname (bindings.rs `system_symbol`).
+//! Host sides of the NDK functions that take a `JNIEnv*` (their rows of build.rs `PROXY_SHIMS`). The guest passes its own env (jni.rs `GuestObj`), so the generic crossing would hand the host library a guest env: each shim maps it to the host env (jni.rs `host_env`) and calls the same function of the host library of its soname (bindings.rs `system_symbol`).
 //! The other arguments and the results are host values already: object references are the host's, and an AAssetManager or a pixel pointer names host memory the guest reads in the same address space.
 
 use std::ffi::c_void;

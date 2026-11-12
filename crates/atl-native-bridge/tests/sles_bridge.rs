@@ -5,7 +5,7 @@
 //! a: `slCreateEngine` + Realize = SL_RESULT_SUCCESS, the recorder's first engine Realize saw its own engine object as arg 0, and no recorder call in the whole run had a foreign arg 0;
 //! b: `GetInterface(SL_IID_ENGINE)`'s out-param is no recorder interface (a guest proxy);
 //! c: `CreateAudioPlayer`'s sink `outputMix` reached the recorder as its own output mix;
-//! d: the recorder's pthread fired `sles_callbacks` callbacks; the guest saw its queue proxy as `caller` and its context each time, and re-entered `Enqueue` from each (recorder: `sles_callbacks` re-entered, no underrun);
+//! d: the recorder's pthread fired `sles_callbacks` callbacks; the guest saw its queue proxy as `caller` and its context each time, and re-entered `Enqueue` from each (recorder: `sles_callbacks` re-entered, no underrun); no ownerless proxy was made (engine/sles.rs `ownerless`: the caller is the queue the fixture got from GetInterface);
 //! e: `sles_players` players registering one Play callback add exactly 1 down shell;
 //! f: the guest's `SL_IID_PLAY` is the recorder's `SL_IID_PLAY` value;
 //! g: `GetInterface` of the fixture's unknown IID = SL_RESULT_FEATURE_UNSUPPORTED (0x0C) and the refusal counter `sles.GetInterface.<its 16 bytes in hex>` is 1.
@@ -285,7 +285,12 @@ fn run(env: &common::Nb) -> Result<(), String> {
                     "guest (callbacks, bad caller, bad context, bad enqueue) = {seen:?}, want ({n}, 0, 0, 0); recorder (fired, re-entered, underruns) = {host:?}, want ({n}, {n}, 0)"
                 ));
             }
-            Ok(format!("{n} callbacks on the recorder thread, caller + context intact, {n} Enqueue re-entries"))
+            // the caller is the queue the fixture got from GetInterface, so its proxy is owned: none ownerless
+            let ownerless = sles::ownerless();
+            if ownerless != 0 {
+                return Err(format!("{ownerless} ownerless proxies after the callbacks, want 0"));
+            }
+            Ok(format!("{n} callbacks on the recorder thread, caller + context intact, {n} Enqueue re-entries, 0 ownerless proxies"))
         });
         check!('d', d);
 
