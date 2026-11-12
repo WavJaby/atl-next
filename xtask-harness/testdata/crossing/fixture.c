@@ -3,8 +3,10 @@
  * Q5-8 crossing counter fixture (crates/atl-native-bridge/tests/qemu_crossing.rs). A PIE on libc.so, built with -fno-builtin so each call stays a call.
  * cx_run makes CX_CALLS calls of each of four bindings: memcpy, memset, memcmp (counted shims under the feature) and time (glibc through the stub libc). Call i of each sized binding takes cx_sizes[i % CX_NSIZES].
  * The harness reads N from cx_calls and the sizes from cx_size_at, so these literals are its only source of expectations.
+ * cx_jni makes CX_JNI_CALLS calls of each of three JNI slots through the env and vm it is given: GetVersion and ExceptionCheck (JNIEnv), DetachCurrentThread (JavaVM, a stub slot, not a special). The harness reads N from cx_jni_calls.
  * Exports return size_t: the harness reads x0 whole.
  */
+#include <jni.h>
 #include <stddef.h>
 #include <string.h>
 #include <time.h>
@@ -28,6 +30,28 @@ static time_t (*volatile cx_time)(time_t *) = time;
 int main(void) { return 0; }
 
 size_t cx_calls(void) { return CX_CALLS; }
+
+/* JNI calls per counted slot. Not CX_CALLS, so a JNI count read from the binding loop shows. */
+#define CX_JNI_CALLS 48
+
+size_t cx_jni_calls(void) { return CX_JNI_CALLS; }
+
+/* Returns the number of wrong answers: the harness's fake answers JNI_VERSION_1_6, JNI_FALSE and JNI_OK. */
+size_t cx_jni(JNIEnv *env, JavaVM *vm) {
+    size_t bad = 0;
+    for (size_t i = 0; i < (size_t)CX_JNI_CALLS; i++) {
+        if ((*env)->GetVersion(env) != JNI_VERSION_1_6) {
+            bad++;
+        }
+        if ((*env)->ExceptionCheck(env) != JNI_FALSE) {
+            bad++;
+        }
+        if ((*vm)->DetachCurrentThread(vm) != JNI_OK) {
+            bad++;
+        }
+    }
+    return bad;
+}
 size_t cx_size_count(void) { return CX_NSIZES; }
 size_t cx_size_at(size_t i) { return cx_sizes[i]; }
 

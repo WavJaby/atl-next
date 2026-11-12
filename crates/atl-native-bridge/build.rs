@@ -786,6 +786,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("qe_nomap", "atl_nb_qe_nomap"),
     // Q4-3 (engine/dispatch.rs `call_binding`, `ID_SKEW`): a binding trap calls its neighbour's host function, so each placed site answers the wrong sentinel
     ("qe_id", "atl_nb_qe_id"),
+    // L3 JNI count (engine/dispatch.rs `call_jni`): QEMU's JNI route skips the shared counter entry, so only identity counts JNI (crossing gate, QEMU check j)
+    ("qe_jni_count", "atl_nb_qe_jni_count"),
     // Q4-4 (engine/vdso.rs `bind_linker`): the static-TLS hook keeps its placeholder, so the linker's `bl` branches to 0 and the start gate goes red
     ("qe_no_tls", "atl_nb_qe_no_tls"),
     // Q5-5 (engine/mod.rs `decide`): the host ISA routed to the QEMU engine (unit test `engine::tests::selection`)

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! `xtask test crossing`: the crossing counter (QEMU bridge plan Q5-8 / Q5-8b; counters.rs, feature `crossing-count`).
 //!
-//! Identity side (Q5-8b, `tests/identity_crossing.rs`): in-process on the host, no image. Thunk and JNI shell crossings counted exactly per host target, 2^16 crossings dump once. The `id_count` break (the shells count nothing) must turn it red.
+//! Identity side (Q5-8b, `tests/identity_crossing.rs`): in-process on the host, no image. Thunk and JNI shell crossings counted exactly per host target, JNI also per slot, 2^16 crossings dump once. The `id_count` break (the shells count nothing, so only QEMU counts JNI) must turn its JNI check `j` red.
 //!
-//! QEMU side (Q5-8): `tests/qemu_crossing.rs` on the real arm64 NB images: the fixture's N calls per binding count N, sizes fall in their literal bins, 2^16 crossings dump exactly once. Then the `qe_id` break (every binding calls its neighbour) must turn it red. Last, the library built without the feature has no counter symbol (`nm -C`), and the same probe finds one with the feature on (positive control).
+//! QEMU side (Q5-8): `tests/qemu_crossing.rs` on the real arm64 NB images: the fixture's N calls per binding count N, sizes fall in their literal bins, the fixture's N' JNI calls per env/vm slot count N' each, 2^16 crossings dump exactly once. Then the `qe_id` break (every binding calls its neighbour) must turn `c` red, and `qe_jni_count` (QEMU's JNI route skips the shared counter, so only identity counts JNI) must turn `j` red. Last, the library built without the feature has no counter symbol (`nm -C`), and the same probe finds one with the feature on (positive control).
 //!
 //! Library: the engine `.so` (`qemu_spike::engine_so_file`), as `qemu-thread` uses it. Fixture: `xtask-harness/testdata/crossing/fixture.c` (PIE, NDK clang, `-fno-builtin`). Boot: the engine boot executable (`qemu::boot_exe`, crates/atl-qemu-boot).
 //! Images: `--nb <dir>` is the arm64 NB out dir (`<out>/nb/arm64`), built as for `test qemu-thread`; the identity side needs none.
@@ -25,18 +25,22 @@ const PACKAGE: &str = "atl-native-bridge";
 const TEST: &str = "qemu_crossing";
 const IDENTITY_TEST: &str = "identity_crossing";
 const FEATURE: &str = "crossing-count";
-/// The QEMU harness's checks, `crossing: (x) ok` each: s started, r fixture results, c calls per binding, h size bins, w 2^16 window.
-const CHECKS: [char; 5] = ['s', 'r', 'c', 'h', 'w'];
+/// The QEMU harness's checks, `crossing: (x) ok` each: s started, r fixture results, c calls per binding, h size bins, j calls per JNI slot, w 2^16 window.
+const CHECKS: [char; 6] = ['s', 'r', 'c', 'h', 'j', 'w'];
 /// The identity harness's checks: s started, t thunk crossings per target, j JNI crossings per target, w 2^16 window, f FS back on the host.
 const IDENTITY_CHECKS: [char; 5] = ['s', 't', 'j', 'w', 'f'];
-/// build.rs `BREAKS`: each binding trap calls its neighbour's host function (QEMU).
-const BREAK: &str = "qe_id";
-/// build.rs `BREAKS`: the identity shells are generated plain, so the counter is never called.
-const IDENTITY_BREAK: &str = "id_count";
+/// build.rs `BREAKS` of the QEMU run, each with the check it must turn red: each binding trap calls its neighbour's host function; QEMU's JNI route skips the shared JNI counter (only identity counts).
+const BREAKS: [(&str, char); 2] = [("qe_id", 'c'), ("qe_jni_count", 'j')];
+/// build.rs `BREAKS` of the identity run: the identity shells are generated plain, so only QEMU's route counts JNI and `j` must be red.
+const IDENTITY_BREAK: (&str, char) = ("id_count", 'j');
 /// Bound on one cargo run, as qemu_linker's harness runs (its `RUN_TIMEOUT_SECS`).
 const RUN_TIMEOUT_SECS: u32 = 240;
-/// Symbol prefixes of the counters in `nm -C` output: the QEMU module's demangled Rust path, and the identity counters' `no_mangle` names.
-const COUNTER_SYMBOLS: [&str; 2] = ["atl_native_bridge::counters", "atl_nb_count_"];
+/// Symbol prefixes of the counters in `nm -C` output: the counter module's demangled Rust path, the counter entries' exported names (`atl_nb_count_host`, the shared JNI entry `atl_nb_count_jni`), and the JNI slot names the dump reads.
+const COUNTER_SYMBOLS: [&str; 3] = [
+    "atl_native_bridge::counters",
+    "atl_nb_count_",
+    "atl_native_bridge::engine::jni::slot_names",
+];
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -58,7 +62,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let mut fails = Vec::new();
 
     for brk in [None, Some(IDENTITY_BREAK)] {
-        let name = format!("crossing-identity-{}", brk.unwrap_or("plain"));
+        let name = format!("crossing-identity-{}", brk.map_or("plain", |(b, _)| b));
         if let Err(e) = harness(root, &dir, &[], brk, &name, IDENTITY_TEST, &IDENTITY_CHECKS) {
             fails.push(Failure::step(&name, format!("{e:#}")));
         }
@@ -90,8 +94,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         ("ATL_NB_VDSO", &vdso),
     ];
 
-    for brk in [None, Some(BREAK)] {
-        let name = format!("crossing-{}", brk.unwrap_or("plain"));
+    for brk in std::iter::once(None).chain(BREAKS.map(Some)) {
+        let name = format!("crossing-{}", brk.map_or("plain", |(b, _)| b));
         if let Err(e) = harness(root, &dir, &env, brk, &name, TEST, &CHECKS) {
             fails.push(Failure::step(&name, format!("{e:#}")));
         }
@@ -101,7 +105,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     let verdict = Verdict {
         cmd: "crossing",
-        total: Some((5, "runs")),
+        total: Some((2 + 1 + BREAKS.len() + 1, "runs")),
         skipped: Vec::new(),
         failures: fails,
     };
@@ -113,12 +117,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     })
 }
 
-/// One harness run: `cargo test --features crossing-count --test <test>` with `env`, log in `dir/<name>.log`. The plain run needs every check in `checks` ok and exit 0; the break run must not pass.
+/// One harness run: `cargo test --features crossing-count --test <test>` with `env`, log in `dir/<name>.log`. The plain run needs every check in `checks` ok and exit 0; a break run `(break, check)` must exit non-zero with `check` not ok.
 fn harness(
     root: &Path,
     dir: &Path,
     env: &[(&str, &Path)],
-    brk: Option<&str>,
+    brk: Option<(&str, char)>,
     name: &str,
     test: &str,
     checks: &[char],
@@ -144,7 +148,7 @@ fn harness(
     .envs(env.iter().copied())
     .current_dir(root);
     match brk {
-        Some(b) => cmd.env("ATL_NB_BREAK", b),
+        Some((b, _)) => cmd.env("ATL_NB_BREAK", b),
         None => cmd.env_remove("ATL_NB_BREAK"),
     };
     let run =
@@ -166,12 +170,8 @@ fn harness(
                 log.display()
             );
         }
-        Some(_) => {
-            ensure!(
-                !checks.iter().copied().all(ok),
-                "break left every check ok, log {}",
-                log.display()
-            );
+        Some((_, red)) => {
+            ensure!(!ok(red), "break left check {red} ok, log {}", log.display());
             ensure!(
                 !run.status.success(),
                 "break run exited 0, log {}",

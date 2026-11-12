@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Q5-8b gate (QEMU bridge plan section 5), harness-less: the crossing counter on the identity side (feature `crossing-count`; the counted shells of `atl-bridgegen` `x86::entries_asm`). A stand-in guest loop, run as g4 runs its own (stand-in guest TCB, no TLS), calls the host thunk pool and the JNI stub pool; each call crosses to a host function.
 //! Expected values are the loop counts this file passes, never the counter's: each host function also counts its own calls, so the counter is checked against a record it does not write.
-//! Checks: (s) started (FSGSBASE); (t) thunk crossings per host target exact, two slots bound to one target counted together; (j) JNI stub crossings per target exact (JNI slots 5 and 9); (w) 2^16 further crossings dump exactly once; (f) FS on the host after the calls.
+//! Checks: (s) started (FSGSBASE); (t) thunk crossings per host target exact, two slots bound to one target counted together; (j) JNI stub crossings per target and per JNI slot exact (slots 5 and 9, no other slot; the slot count is the shared `dispatch::count_jni` entry QEMU's route also takes); (w) 2^16 further crossings dump exactly once; (f) FS on the host after the calls.
 //! Output: `crossing: (x) ok` or `crossing: (x) FAIL <why>` per check; exit 0 when all pass. Break `ATL_NB_BREAK=id_count`: the shells are generated plain, so the counter sees nothing and (t), (j) and (w) must fail.
 #![allow(
     clippy::print_stdout,
@@ -109,6 +109,26 @@ fn check_counts(d: &[(usize, u64)], want: &[(usize, u64)]) -> Result<(), String>
     Ok(())
 }
 
+/// Each JNI slot in `want` gained exactly its count between the snapshots, and no other JNI slot gained any.
+fn check_slots(before: &Snapshot, after: &Snapshot, want: &[(usize, u64)]) -> Result<(), String> {
+    let of = |s: &Snapshot, k: usize| s.jni.iter().find(|&&(x, _)| x == k).map_or(0, |&(_, c)| c);
+    for &(k, _) in &after.jni {
+        let got = of(after, k) - of(before, k);
+        let n = want.iter().find(|&&(w, _)| w == k).map_or(0, |&(_, n)| n);
+        if got != n {
+            return Err(format!(
+                "JNI slot {k} counted {got} calls, the loop makes {n}"
+            ));
+        }
+    }
+    for &(k, n) in want {
+        if n != 0 && !after.jni.iter().any(|&(x, _)| x == k) {
+            return Err(format!("JNI slot {k} counted 0 calls, the loop makes {n}"));
+        }
+    }
+    Ok(())
+}
+
 /// The host's own records: each function ran exactly its count.
 fn check_own(own: &[(&str, &AtomicU64, u64)]) -> Result<(), String> {
     for &(name, calls, n) in own {
@@ -209,10 +229,12 @@ fn run() -> bool {
         guest_calls(ht, tcb, CALLS_E, je, env);
         guest_calls(ht, tcb, CALLS_F, jf, env);
     }
-    let j = delta(&before, &counters::snapshot());
+    let after = counters::snapshot();
+    let j = delta(&before, &after);
     ok &= report(
         'j',
         check_counts(&j, &[(addr(host_e), CALLS_E), (addr(host_f), CALLS_F)])
+            .and_then(|()| check_slots(&before, &after, &[(JNI_E, CALLS_E), (JNI_F, CALLS_F)]))
             .and_then(|()| check_own(&[("host_e", &OWN_E, CALLS_E), ("host_f", &OWN_F, CALLS_F)])),
     );
 

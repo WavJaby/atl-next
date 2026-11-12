@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! Q5-8 gate (QEMU bridge plan Q5-8), harness-less: the crossing counter under QEMU (feature `crossing-count`, counters.rs). The real arm64 guest linker starts the fixture (`xtask-harness/testdata/crossing/fixture.c`, PIE on libc.so); the host calls its `cx_*` functions through the crossing.
 //! Expected values come from the fixture, never from the counter: N = `cx_calls()`, the sizes = `cx_size_at(i)` for `i < cx_size_count()`. A bin is a size's bit length (`ilog2 + 1`, 0 for size 0): the definition in counters.rs, re-derived here from the sizes alone.
-//! Checks: (s) started; (r) the fixture's own results (copies, fills, compares and `time` all right, so the shims did the work); (c) during `cx_run` each bound host function ran exactly N crossings and no other did; (h) each counted kind's histogram gained exactly the bins of the sizes it was given; (w) 2^16 further crossings (256 runs of 4N) dumped exactly once.
+//! Checks: (s) started; (r) the fixture's own results (copies, fills, compares and `time` all right, so the shims did the work); (c) during `cx_run` each bound host function ran exactly N crossings and no other did; (h) each counted kind's histogram gained exactly the bins of the sizes it was given; (j) `cx_jni` through the guest env and vm of fake host objects: each of its three JNI slots counted exactly N' = `cx_jni_calls()` (the shared `dispatch::count_jni` entry), no other slot, each fake ran N' times; (w) 2^16 further crossings (256 runs of 4N) dumped exactly once.
 //! Env (xtask crossing.rs sets it; unset prints SKIP): ATL_ENGINE_SO (the engine `.so`), ATL_NB_BOOT (the engine boot executable, crates/atl-qemu-boot), ATL_NB_EXE (the fixture), ATL_NB_LINKER, ATL_NB_VDSO (the arm64 NB images; `<nb>/libnative_bridge_guest_libc` among the library directories).
-//! Output: `crossing: (x) ok` or `crossing: (x) FAIL <why>` per check; exit 0 when all pass. The `qe_id` break (`ATL_NB_BREAK`) skews every binding to its neighbour's host function, so (c) and (r) must fail.
+//! Output: `crossing: (x) ok` or `crossing: (x) FAIL <why>` per check; exit 0 when all pass. The `qe_id` break (`ATL_NB_BREAK`) skews every binding to its neighbour's host function, so (c) and (r) must fail; `qe_jni_count` drops QEMU's JNI count, so (j) must fail.
 #![allow(clippy::print_stdout, reason = "test harness output is its verdict")]
 #![allow(
     unsafe_code,
@@ -13,13 +13,30 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use atl_native_bridge::counters::{self, BINS, Snapshot};
+use atl_native_bridge::engine::jni::{guest_env, guest_vm};
 use atl_native_bridge::engine::{Config, Guest, qemu};
 use object::{Object, ObjectSymbol, read::elf::ElfFile64};
 
 /// The fixture functions the host calls, in the order `Expected::values` holds them.
-const SYMBOLS: [&str; 4] = ["cx_run", "cx_calls", "cx_size_count", "cx_size_at"];
+const SYMBOLS: [&str; 6] = [
+    "cx_run",
+    "cx_calls",
+    "cx_size_count",
+    "cx_size_at",
+    "cx_jni",
+    "cx_jni_calls",
+];
+/// jni.h slots `cx_jni` calls: `JNINativeInterface` GetVersion (after reserved0..3) and ExceptionCheck (233 entries, the last five NewDirectByteBuffer..GetObjectRefType follow it), `JNIInvokeInterface` DetachCurrentThread (reserved0..2, DestroyJavaVM, AttachCurrentThread, then it). Table sizes: 233 env entries, 8 vm entries.
+const GET_VERSION: usize = 4;
+const EXCEPTION_CHECK: usize = 228;
+const DETACH_CURRENT_THREAD: usize = 5;
+const ENV_SLOTS: usize = 233;
+const VM_SLOTS: usize = 8;
+/// The fake's GetVersion answer, as `cx_jni` checks it: jni.h `JNI_VERSION_1_6`.
+const JNI_VERSION_1_6: i32 = 0x0001_0006;
 /// Crossings in one 2^16 window: the 16-bit tick wraps exactly once in any window of this length.
 const WINDOW: u64 = 1 << 16;
 /// Bindings `cx_run` calls per iteration: memcpy, memset, memcmp, time (fixture.c).
@@ -133,6 +150,66 @@ fn check_calls(d: &[(usize, u64)], want: &[(usize, &str)], n: u64) -> Result<(),
     Ok(())
 }
 
+/// The fake host JNI functions `cx_jni` reaches: each counts its own calls, the record the per-slot counter is checked against.
+static OWN_JNI: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+extern "C" fn get_version(_env: usize) -> i32 {
+    OWN_JNI[0].fetch_add(1, Ordering::Relaxed);
+    JNI_VERSION_1_6
+}
+extern "C" fn exception_check(_env: usize) -> u8 {
+    OWN_JNI[1].fetch_add(1, Ordering::Relaxed);
+    0
+}
+extern "C" fn detach_current_thread(_vm: usize) -> i32 {
+    OWN_JNI[2].fetch_add(1, Ordering::Relaxed);
+    0
+}
+/// Any other entry: the route reached a slot the fixture does not call.
+extern "C" fn unimplemented() -> usize {
+    println!("crossing: FAIL a JNI entry the fake does not implement was called");
+    std::process::exit(2);
+}
+
+/// A fake host JNI object of `slots` entries (word 0 = its table), `set` filled in, the rest `unimplemented`. Leaked.
+fn fake_object(slots: usize, set: &[(usize, usize)]) -> usize {
+    let mut table = vec![unimplemented as *const () as usize; slots];
+    for &(k, f) in set {
+        table[k] = f;
+    }
+    let table: &'static [usize] = Box::leak(table.into_boxed_slice());
+    Box::leak(Box::new(table.as_ptr() as usize)) as *const usize as usize
+}
+
+/// Each JNI slot in `want` gained exactly `n` between the snapshots, no other JNI slot gained any, and each fake function ran `n` times.
+fn check_jni(before: &Snapshot, after: &Snapshot, want: &[usize], n: u64) -> Result<(), String> {
+    let of = |s: &Snapshot, k: usize| s.jni.iter().find(|&&(x, _)| x == k).map_or(0, |&(_, c)| c);
+    for &k in want {
+        let got = of(after, k) - of(before, k);
+        if got != n {
+            return Err(format!(
+                "JNI slot {k} counted {got} calls, the fixture makes {n}"
+            ));
+        }
+    }
+    for &(k, _) in &after.jni {
+        let got = of(after, k) - of(before, k);
+        if got != 0 && !want.contains(&k) {
+            return Err(format!(
+                "JNI slot {k} counted {got} calls the fixture does not make"
+            ));
+        }
+    }
+    for (i, own) in OWN_JNI.iter().enumerate() {
+        let got = own.load(Ordering::Relaxed);
+        if got != n {
+            return Err(format!(
+                "fake JNI function {i} ran {got} times, the fixture makes {n}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Bin counts that `n` calls of one kind give, call i with `sizes[i % sizes.len()]`.
 fn expected_bins(sizes: &[u64], n: u64) -> [u64; BINS] {
     let mut bins = [0u64; BINS];
@@ -213,6 +290,41 @@ fn started(r: Result<Guest, String>) -> u64 {
     );
     ok &= check('c', check_calls(&d, &want, n));
     ok &= check('h', check_sizes(&before, &after, &sizes, n));
+
+    let (jni_run, jni_calls) = (addr(4), addr(5));
+    let env = guest_env(fake_object(
+        ENV_SLOTS,
+        &[
+            (GET_VERSION, get_version as *const () as usize),
+            (EXCEPTION_CHECK, exception_check as *const () as usize),
+        ],
+    ));
+    let vm = guest_vm(fake_object(
+        VM_SLOTS,
+        &[(
+            DETACH_CURRENT_THREAD,
+            detach_current_thread as *const () as usize,
+        )],
+    ));
+    // SAFETY: as above.
+    let jn = unsafe { guest.call(jni_calls, 0, 0, 0) } as u64;
+    let before = counters::snapshot();
+    // SAFETY: as above; cx_jni(env, vm) calls three JNI slots jn times each through the guest objects of the fakes and returns the number of wrong answers.
+    let bad = unsafe { guest.call(jni_run, env, vm, 0) };
+    let after = counters::snapshot();
+    ok &= check(
+        'j',
+        if bad != 0 {
+            Err(format!("{bad} wrong answers from the fixture's JNI calls"))
+        } else {
+            check_jni(
+                &before,
+                &after,
+                &[GET_VERSION, EXCEPTION_CHECK, DETACH_CURRENT_THREAD],
+                jn,
+            )
+        },
+    );
 
     let per_run = BINDINGS_PER_RUN * n;
     let w = if per_run == 0 || WINDOW % per_run != 0 {
