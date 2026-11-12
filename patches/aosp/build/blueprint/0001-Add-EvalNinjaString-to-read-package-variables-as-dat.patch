@@ -10,18 +10,22 @@ registers (StaticVariable, VariableFunc) without a Context: evaluation
 is otherwise reachable only through Variable.value, which is
 unexported.
 
+A literal span is unescaped as ninja would: "$$" -> "$", and the "$ "
+that parseNinjaString puts before a leading space of a string with no
+variable reference loses its "$" (riscv64's ToolchainCflags is " ").
+
 Upstream-Status: Inappropriate [ATL-specific: only ATL's Blueprint-to-ninja converter reads Soong's variables outside soong_build]
 Patch-Reason: the converter imports Soong's cc/config and rust/config packages to take its toolchain flags from Soong's own code instead of a reimplementation; their values are ninja variables, and blueprint exports no way to evaluate one outside a Context. Neither the launcher, loader nor environment can supply a Go API.
 ---
 SPDX-License-Identifier: Apache-2.0
- package_ctx.go | 69 ++++++++++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 69 insertions(+)
+ package_ctx.go | 75 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 75 insertions(+)
 
 diff --git a/package_ctx.go b/package_ctx.go
-index db43bec7d0386f2836b0d7bf5b39b7ac289ecc08..a812cd7f6495c4e8a3aae4f2e363dabf8d854d5c 100644
+index db43bec7d0386f2836b0d7bf5b39b7ac289ecc08..92503f9fc42bd1c19889165eaac1988fb96d6469 100644
 --- a/package_ctx.go
 +++ b/package_ctx.go
-@@ -915,3 +915,72 @@ func NewBuiltinRule(name string) Rule {
+@@ -915,3 +915,78 @@ func NewBuiltinRule(name string) Rule {
  func (p *packageContext) AddNinjaFileDeps(deps ...string) {
  	p.ninjaFileDeps = append(p.ninjaFileDeps, deps...)
  }
@@ -54,9 +58,15 @@ index db43bec7d0386f2836b0d7bf5b39b7ac289ecc08..a812cd7f6495c4e8a3aae4f2e363dabf
 +}
 +
 +func evalNinjaString(n *ninjaString, config interface{}, visiting map[Variable]bool) (string, error) {
-+	// "$$" is the only escape a parsed literal span can hold
++	// parseNinjaString emits two escapes: "$$" and, for a string with no "$",
++	// a leading "$ " guarding a leading space; with a "$" that space is a
++	// nil-variable reference instead. It rejects "$ ", "$:" and "$\n"
++	// anywhere else (only the input/output escapers of build paths emit them).
 +	unescape := strings.NewReplacer("$$", "$")
 +	if n.variables == nil {
++		if strings.HasPrefix(n.str, "$ ") {
++			return n.str[1:], nil
++		}
 +		return unescape.Replace(n.str), nil
 +	}
 +	w := &strings.Builder{}
