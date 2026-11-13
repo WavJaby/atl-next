@@ -9,6 +9,7 @@
 //! Kill mode, `test binder`: run 1 died at 444 (landlock_create_ruleset); 445/446 added with it (the next two calls of the same sequence, landlock-0.4.7 compat.rs) and prctl (its PR_SET_NO_NEW_PRIVS before restrict_self, errors.rs); run 2 passed with no record. openat/close of the stub's PathFds were already listed.
 //! Not measured, so killed: every path the gates do not reach, e.g. a panic's abort (rt_sigprocmask, tgkill) -- the panic message is written first, the abort ends as SIGSYS instead of SIGABRT.
 //! Re-measure after binderd or its Rust/glibc start code changes (a new call ends every gate with "binderd ended"); the procedure needs nothing but the filter and dmesg.
+//! Message sizes (2026-11-13, kill mode, same kernel; `xtask test binder` stage `sweep`): a message past two 32 KiB fragments (65536 payload bytes) takes a buffer glibc maps (128 KiB and up), and freeing it is munmap (11). With the list as it was, the sweep's put of 65536 bytes ended at munmap; with munmap, every sweep row passed, both directions and oneway, up to the region limit. mremap (25) and madvise (28) were not hit by that sweep, so they are not listed; a new call ends the sweep with dmesg naming it.
 
 use seccompiler::TargetArch;
 
@@ -35,6 +36,8 @@ pub const BINDERD_SYSCALLS: &[i64] = &[
     libc::SYS_mmap,
     libc::SYS_mprotect,
     libc::SYS_brk,
+    // free of a buffer glibc mapped (a message past 65536 bytes; header, 2026-11-13 sweep)
+    libc::SYS_munmap,
     // start-up: the loader opening its closure, glibc and std init
     libc::SYS_execve,
     libc::SYS_openat,
