@@ -21,6 +21,35 @@ const DRIVER_NODES: &[(&str, &[&str])] = &[(
     ],
 )];
 
+/// A render path a kernel module adds beside the DRM device classes: a GPU reached through a non-DRM node, so no [`device_class`] names it.
+/// Candidate only: atld probes it (renderer differs from the baseline's and a context initialises) before apps get its nodes and variables; the baseline (no row) works everywhere and is the reference.
+pub struct RenderPath {
+    /// The kernel module (`/sys/module/<module>`) whose presence makes the row a candidate; also the tier's name in atld's log.
+    pub module: &'static str,
+    /// Device nodes the renderer opens; every one must exist.
+    pub nodes: &'static [&'static str],
+    /// Variables the host GL driver reads to render through it: Mesa picks llvmpipe by default and has no API to pick a gallium driver (eglinfo on WSL: every platform llvmpipe without it).
+    pub env: &'static [(&'static str, &'static str)],
+}
+
+/// dxgkrnl (GPU paravirtualisation, e.g. WSL2): Mesa's d3d12 gallium driver renders through `/dev/dxg` (bwrap without it: d3d12 cannot initialise). Not gralloc's: GBM under d3d12 fails (`gbm_bo_create` ENOENT).
+pub const RENDER_PATHS: &[RenderPath] = &[RenderPath {
+    module: "dxgkrnl",
+    nodes: &["/dev/dxg"],
+    env: &[("GALLIUM_DRIVER", "d3d12")],
+}];
+
+/// The [`RENDER_PATHS`] rows this kernel offers: module loaded, every node present.
+pub fn render_paths() -> Vec<&'static RenderPath> {
+    paths_in(Path::new("/sys/module"), RENDER_PATHS)
+}
+
+fn paths_in(sys_module: &Path, rows: &'static [RenderPath]) -> Vec<&'static RenderPath> {
+    rows.iter()
+        .filter(|r| sys_module.join(r.module).is_dir() && r.nodes.iter().all(|n| Path::new(n).exists()))
+        .collect()
+}
+
 /// The device class of the GPU behind DRM node `node` (`/dev/dri/renderD128`, or a `card*` node): every DRM node of the same device (its `drm/` dir in sysfs), and its kernel driver's control nodes ([`DRIVER_NODES`], [`nvidia_minor`]). Sorted, deduplicated.
 pub fn device_class(node: &Path) -> io::Result<Vec<PathBuf>> {
     class_in(
@@ -176,6 +205,22 @@ mod tests {
         let (sys, dev, nv) = fixture(&root, None);
         let e = class_in(&sys, &dev, &nv, &dev.join("renderD129")).unwrap_err();
         assert!(e.to_string().contains("information"), "{e}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A row is a candidate only with its module loaded and every node present (`/` exists everywhere; the second row's node never does).
+    #[test]
+    fn render_path_needs_module_and_nodes() {
+        static ROWS: &[RenderPath] = &[
+            RenderPath { module: "m1", nodes: &["/"], env: &[] },
+            RenderPath { module: "m2", nodes: &["/atl-no-such-node"], env: &[] },
+            RenderPath { module: "m3", nodes: &["/"], env: &[] },
+        ];
+        let root = tmp("modules");
+        std::fs::create_dir_all(root.join("m1")).unwrap();
+        std::fs::create_dir_all(root.join("m2")).unwrap();
+        let found: Vec<_> = paths_in(&root, ROWS).iter().map(|r| r.module).collect();
+        assert_eq!(found, ["m1"]);
         let _ = std::fs::remove_dir_all(&root);
     }
 

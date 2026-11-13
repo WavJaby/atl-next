@@ -64,6 +64,9 @@ struct Args {
     /// Print the render node of the desktop's Wayland EGL display's device and its renderer (atl_gralloc::node::display_line), under this process's environment; atld runs this once per run to pick the GPU.
     #[arg(long)]
     display_node: bool,
+    /// Print GL_VERSION and GL_RENDERER of a GLES context on the `--render` device (atl_gralloc::node::renderer_line), under this process's environment; atld runs it per render-path candidate (atl-broker gpu::RENDER_PATHS) and once for the baseline.
+    #[arg(long, requires = "render")]
+    renderer: bool,
 }
 
 fn main() -> ExitCode {
@@ -92,6 +95,19 @@ fn main() -> ExitCode {
             }
         };
     }
+    if args.renderer {
+        let render = args.render.as_deref().unwrap_or_default();
+        return match renderer(render) {
+            Ok((version, renderer)) => {
+                out(&node::renderer_line(&version, &renderer));
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                out(&format!("{} FAIL {e:#}", node::RENDERER_LINE));
+                ExitCode::FAILURE
+            }
+        };
+    }
     let result = if args.matrix {
         matrix()
     } else {
@@ -107,6 +123,27 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// (GL_VERSION, GL_RENDERER) of a GLES context on `render`'s EGL device (a render node, or `software`).
+fn renderer(render: &str) -> Result<(String, String)> {
+    let host = Host::load()?;
+    let display = if render == "software" {
+        host.devices()?
+            .into_iter()
+            .find(Device::is_software)
+            .context("no software EGL device")?
+            .display()?
+    } else {
+        host.display_on_node(render)?
+            .with_context(|| format!("no EGL device on {render}"))?
+            .0
+    };
+    let ctx = display.create_context()?;
+    let gl = ctx.make_current()?;
+    let pair = (gl.string(GL_VERSION), gl.string(GL_RENDERER));
+    gl.check("glGetString")?;
+    Ok(pair)
 }
 
 /// One [`node::MODIFIERS_LINE`] per gralloc fourcc: renderable on `render_node`'s EGL device display ∩ imported by the Wayland display, 1-plane layouts (atl_gralloc::node::modifier_set).

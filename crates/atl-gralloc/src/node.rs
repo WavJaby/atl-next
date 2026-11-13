@@ -114,6 +114,27 @@ pub fn parse_display_line(text: &str) -> Option<(Option<String>, String)> {
     Some((node, renderer.to_owned()))
 }
 
+/// The probe's `--renderer` line: what a GLES context on one EGL device reports, under the probe's environment (atld's render-path choice, atl-broker gpu::RENDER_PATHS).
+pub const RENDERER_LINE: &str = "gpu-renderer:";
+
+/// `<prefix> version=<GL_VERSION> renderer=<GL_RENDERER>` (version first: neither string is quoted, the renderer runs to the end).
+pub fn renderer_line(version: &str, renderer: &str) -> String {
+    format!("{RENDERER_LINE} version={version} renderer={renderer}")
+}
+
+/// (GL_VERSION, GL_RENDERER) from the last well-formed [`RENDERER_LINE`] in `text`.
+pub fn parse_renderer_line(text: &str) -> Option<(String, String)> {
+    let line = text
+        .lines()
+        .rev()
+        .find_map(|l| l.strip_prefix(RENDERER_LINE))?;
+    let (version, renderer) = line
+        .trim_start()
+        .strip_prefix("version=")?
+        .split_once(" renderer=")?;
+    Some((version.to_owned(), renderer.to_owned()))
+}
+
 /// The probe's per-fourcc modifier line after [`DISPLAY_LINE`]: `<prefix> <FOURCC>=<hex>,<hex>...` (nothing after `=`: no modifier qualifies). Its own prefix, so [`parse_display_line`] never reads it.
 pub const MODIFIERS_LINE: &str = "gpu-modifiers:";
 
@@ -179,6 +200,21 @@ pub fn parse_modifiers_lines(text: &str) -> Vec<(u32, Vec<u64>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Strings as WSL's d3d12 reports them (gpu-readback slice 1): spaces and parentheses in both survive the round trip.
+    #[test]
+    fn renderer_line_round_trips() {
+        let (v, r) = (
+            "OpenGL ES 3.1 Mesa 25.0.7-2",
+            "D3D12 (NVIDIA GeForce GTX 1080 Ti)",
+        );
+        let text = format!("noise\n{}\n", renderer_line(v, r));
+        assert_eq!(
+            parse_renderer_line(&text),
+            Some((v.to_owned(), r.to_owned()))
+        );
+        assert_eq!(parse_renderer_line("gpu-renderer: FAIL x"), None);
+    }
 
     /// AB24 lists from the laptop (gralloc-modifiers S1): NVIDIA renderD129 lists LINEAR external-only + block-linear renderable; GTK offload env imports `0` and the 12 block-linear ones.
     const NV_BL: u64 = 0x0300_0000_00e0_8014;

@@ -588,8 +588,6 @@ pub struct Broker {
     app_seccomp: bool,
     /// The sandbox stub every app process runs under (bwrap execs it, it restricts itself and execs the program).
     stub: PathBuf,
-    /// Variables every spawn gets on top of its own ([`Broker::with_env`]): the launcher's explicit additions, e.g. a harness's debug or break variables.
-    app_env: Vec<(OsString, OsString)>,
 }
 
 fn other(what: impl std::fmt::Display) -> io::Error {
@@ -693,14 +691,7 @@ impl Broker {
             spawning: Mutex::new(()),
             app_seccomp: true,
             stub: stub.to_path_buf(),
-            app_env: Vec::new(),
         }
-    }
-
-    /// Every spawn also gets `vars`, after its own entries (atld `--app-env`): the explicit route for what is not the desktop's to give (app_env::APP_ENV).
-    pub fn with_env(mut self, vars: Vec<(OsString, OsString)>) -> Self {
-        self.app_env = vars;
-        self
     }
 
     /// Apps start without the seccomp filter: the deliberate-failure check that shows what the filter answers (atld `--no-app-seccomp`, test only).
@@ -743,10 +734,9 @@ impl Broker {
             args.splice(0..0, [OsString::from("--nice"), tiers.describe().into()]);
         }
         args.extend(spawn.args.iter().cloned());
-        // the desktop's variables the sandbox reads (app_env::APP_ENV), then the spawn's own and the launcher's additions, later winning on a clash; nothing else of atld's environment
+        // the desktop's variables the sandbox reads (app_env::APP_ENV), then the spawn's own (later winning on a clash); nothing else of atld's environment
         let mut env = app_env::forwarded(|k| std::env::var_os(k));
         env.extend(spawn.env);
-        env.extend(self.app_env.iter().cloned());
         env.push((CONTROL_ENV.into(), theirs.as_raw_fd().to_string().into()));
         let mut inherit: Vec<OwnedFd> = vec![theirs, info_w.into()];
         inherit.extend(seccomp);

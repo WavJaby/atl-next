@@ -222,6 +222,8 @@ pub struct Runtime {
     wayland: Option<PathBuf>,
     /// Apps run under atld's app seccomp filter (atl-broker seccomp.rs) unless this is cleared (`--no-app-seccomp`, the deliberate-failure check).
     app_seccomp: bool,
+    /// atld probes each render-path candidate without its nodes (`--break-render-path`): the render-path choice's deliberate break.
+    break_render_path: bool,
     /// The build's `[test_only]` artifacts (licenses.toml): never bound into the runtime root.
     test_only: std::collections::BTreeSet<PathBuf>,
     /// Input method clients get a death link unless this is cleared (`--no-ime-death-link`, the ime gate's deliberate break).
@@ -690,6 +692,7 @@ impl Runtime {
             pipewire_remote: None,
             wayland: None,
             app_seccomp: true,
+            break_render_path: false,
             ime_death_link: true,
             new_intent: true,
             activity_result: true,
@@ -929,6 +932,12 @@ impl Runtime {
     /// Apps start without the app seccomp filter (atld `--no-app-seccomp`): the deliberate-failure check of the thread-priority rule (seccomp.rs).
     pub fn without_app_seccomp(mut self) -> Self {
         self.app_seccomp = false;
+        self
+    }
+
+    /// atld `--break-render-path`: each render-path candidate is probed without its nodes, so the run must fall back to the baseline.
+    pub fn with_broken_render_path(mut self) -> Self {
+        self.break_render_path = true;
         self
     }
 
@@ -1469,6 +1478,9 @@ impl Runtime {
         }
         if let Some(socket) = &self.wayland {
             cmd.env("WAYLAND_DISPLAY", socket);
+        }
+        if self.break_render_path {
+            cmd.arg("--break-render-path");
         }
         if !self.app_seccomp {
             cmd.arg("--no-app-seccomp");

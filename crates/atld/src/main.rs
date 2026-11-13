@@ -159,9 +159,12 @@ struct Args {
     /// Test only: apps start without the app seccomp filter (atl-broker seccomp.rs), the deliberate-failure check of its thread-priority rule: without the filter queued-work-looper dies with SecurityException.
     #[arg(long)]
     no_app_seccomp: bool,
-    /// A variable every sandboxed process gets (repeat): `KEY=VALUE`. The only way besides the desktop's forwarded names (atl-broker app_env::APP_ENV) a value reaches an app; e.g. a run's RUST_LOG or GDK_DEBUG.
+    /// A variable every app process gets (repeat): `KEY=VALUE`. The only way besides the desktop's forwarded names (atl-broker app_env::APP_ENV) a value reaches an app; e.g. a run's RUST_LOG or GDK_DEBUG. Not the allocator, the probes or the services.
     #[arg(long = "app-env", value_parser = app_env_var)]
     app_env: Vec<(OsString, OsString)>,
+    /// Test only: each render-path candidate (atl-broker gpu::RENDER_PATHS) is probed without its device nodes, the deliberate break of the render-path choice: the run must fall back to the baseline, naming the probe failure.
+    #[arg(long)]
+    break_render_path: bool,
     /// Test only: passed to the services (`--no-ime-death-link`), the deliberate break of the ime gate's death sub-gate.
     #[arg(long)]
     no_ime_death_link: bool,
@@ -782,6 +785,8 @@ struct Host {
     pipewire: Option<PathBuf>,
     /// The device nodes each app process may open: the run's GPU's class and the heap tier's heap (`run`).
     app_devices: Vec<PathBuf>,
+    /// Variables only app processes get, after the runtime's own: the chosen render path's ([`choose_render_path`]), then `--app-env` (later wins). Never the allocator's or the services'.
+    app_env: Vec<(OsString, OsString)>,
     /// The run's GPU: gralloc's DRM node and how it was chosen, pushed to each app process (atl_gralloc::node). None: no gralloc in this run.
     gpu: Option<(String, NodeSource)>,
     /// installd's role: the sessions' files, the installer, what is staged and installed (an app process mounts its package's own directories, package_mounts).
@@ -949,7 +954,11 @@ impl Host {
             rights: vec![],
             program: self.launcher.clone(),
             args: launcher_args,
-            env: self.art_env(),
+            env: self
+                .art_env()
+                .into_iter()
+                .chain(self.app_env.iter().cloned())
+                .collect(),
             cwd: None,
             stdin: None,
             stdout,
@@ -1348,7 +1357,6 @@ fn run(a: &Args) -> Result<ExitCode> {
         &a.sandbox_stub,
         std::fs::File::create(r.log("binderd"))?,
     )?;
-    let broker = broker.with_env(a.app_env.clone());
     let broker = if a.no_app_seccomp {
         broker.without_app_seccomp()
     } else {
@@ -1530,8 +1538,72 @@ fn run(a: &Args) -> Result<ExitCode> {
     if tier == LinearTier::DmaBufHeap {
         app_devices.push(PathBuf::from(atl_property_service::DMA_HEAP_SYSTEM));
     }
+    // the render path: baseline (Mesa's default on the run's GPU) unless a kernel-offered candidate initialises and renders on something else (gpu::RENDER_PATHS); one `gpu-render: path` line records which ran
+    let mut app_env = Vec::new();
+    if let (Some((n, _)), Some(probe)) = (&gpu, &a.gpu_probe) {
+        let probe_renderer = |name: &str, devices: Vec<PathBuf>, env: Vec<(OsString, OsString)>| -> Result<std::result::Result<(String, String), String>> {
+            let mut spawn = system_spawn(
+                name,
+                probe,
+                vec!["--renderer".into(), "--render".into(), n.into()],
+                false,
+                None,
+            )?;
+            spawn.devices = devices;
+            spawn.env.extend(env);
+            spawn.mounts.extend(desktop_mounts()?);
+            let mut p = broker
+                .spawn(spawn)
+                .with_context(|| format!("starting {}", probe.display()))?;
+            let status = p.child.wait()?;
+            let text = std::fs::read_to_string(r.log(name))?;
+            Ok(atl_gralloc::node::parse_renderer_line(&text)
+                .filter(|_| status.success())
+                .ok_or_else(|| format!("probe exited {status}: {}", text.trim())))
+        };
+        let candidates = gpu::render_paths();
+        let chosen = if candidates.is_empty() {
+            Err("no kernel render path offered".to_owned())
+        } else {
+            let baseline = probe_renderer("gpu-render-baseline", app_devices.clone(), vec![])?;
+            let mut chosen = Err(format!("baseline {baseline:?}"));
+            for path in candidates {
+                let mut devices = app_devices.clone();
+                if !a.break_render_path {
+                    devices.extend(path.nodes.iter().map(PathBuf::from));
+                }
+                let env: Vec<(OsString, OsString)> =
+                    path.env.iter().map(|(k, v)| ((*k).into(), (*v).into())).collect();
+                let name = format!("gpu-render-{}", path.module);
+                match (probe_renderer(&name, devices, env.clone())?, &baseline) {
+                    (Ok((v, rend)), Ok((_, base))) if rend != *base => {
+                        chosen = Ok((path, v, rend, env));
+                        break;
+                    }
+                    (Ok((_, rend)), _) => {
+                        chosen = Err(format!("{}: renders on the baseline's {rend}", path.module))
+                    }
+                    (Err(e), _) => chosen = Err(format!("{}: {e}", path.module)),
+                }
+            }
+            chosen
+        };
+        match chosen {
+            Ok((path, version, renderer, env)) => {
+                log(format_args!(
+                    "gpu-render: path {} (renderer {renderer}, {version})",
+                    path.module
+                ));
+                app_devices.extend(path.nodes.iter().map(PathBuf::from));
+                app_env = env;
+            }
+            Err(why) => log(format_args!("gpu-render: path baseline ({why})")),
+        }
+    }
+    app_env.extend(a.app_env.iter().cloned());
     log(format_args!("apps' devices {app_devices:?}"));
     let host = Arc::new(Host {
+        app_env,
         app_devices,
         gpu,
         broker,

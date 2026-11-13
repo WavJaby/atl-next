@@ -43,6 +43,27 @@ impl Verdict {
     pub fn ok(&self) -> bool {
         self.imported > 0 && self.downloaded == 0 && self.failed == 0
     }
+
+    /// [`Verdict::ok`], or the readback tier's presenter path (M58, plan gpu-readback S5 Q1): downloads allowed only when the same log has the driver's `buffer tier readback` line and a readback counter line > 0; still no failed import.
+    pub fn ok_in(&self, log: &str) -> bool {
+        self.ok() || (self.failed == 0 && self.downloaded > 0 && readback_frames(log) > 0)
+    }
+}
+
+/// atl-egl-driver surface.rs: its tier line and its counter line (`READBACK_FRAMES_LINE`, logged at powers of two).
+const READBACK_TIER: &str = "libGLES_atl: buffer tier readback";
+const READBACK_FRAMES: &str = "libGLES_atl: readback_frames=";
+
+/// The largest readback count the driver logged, 0 without its tier line.
+pub fn readback_frames(log: &str) -> u64 {
+    if !log.lines().any(|l| l.contains(READBACK_TIER)) {
+        return 0;
+    }
+    log.lines()
+        .filter_map(|l| l.split_once(READBACK_FRAMES))
+        .filter_map(|(_, n)| n.trim().parse().ok())
+        .max()
+        .unwrap_or(0)
 }
 
 impl std::fmt::Display for Verdict {
@@ -81,5 +102,20 @@ mod tests {
         );
         assert_eq!((bad.downloaded, bad.failed), (1, 1));
         assert!(!bad.ok());
+    }
+
+    /// mmap downloads pass only beside the driver's readback tier line and a counter > 0 (the rule's break: the same downloads without them are red).
+    #[test]
+    fn mmap_needs_counted_readback() {
+        let mmap = "Gdk-DEBUG: Used mmap for downloading 562x900 dmabuf (format AB24:0)\n";
+        let tier = "libGLES_atl: buffer tier readback (this device cannot import gralloc's buffer, EGL error 0x3003)\n";
+        let counted = format!("{tier}libGLES_atl: readback_frames=1\nlibGLES_atl: readback_frames=64\n{mmap}");
+        assert_eq!(readback_frames(&counted), 64);
+        assert!(Verdict::of(&counted).ok_in(&counted));
+        assert!(!Verdict::of(mmap).ok_in(mmap));
+        let uncounted = format!("{tier}{mmap}");
+        assert!(!Verdict::of(&uncounted).ok_in(&uncounted));
+        let untiered = format!("libGLES_atl: readback_frames=8\n{mmap}");
+        assert!(!Verdict::of(&untiered).ok_in(&untiered));
     }
 }

@@ -327,7 +327,11 @@ impl WindowSurface {
             ));
             e::EGL_BAD_ALLOC
         })?;
-        d.readback_frames.fetch_add(1, Ordering::Relaxed);
+        // the counter's line at 1, 2, 4, ...: log2(frames) lines per process; the window gate lets GDK's mmap download through only next to it (gdk_dmabuf.rs)
+        let n = d.readback_frames.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            log(&format!("{READBACK_FRAMES_LINE}{n}"));
+        }
         Ok(())
     }
 
@@ -471,6 +475,9 @@ fn connect(_: &Window) -> Result<bool, EglError> {
     clippy::print_stderr,
     reason = "one line per window connect or teardown, which path ran"
 )]
+/// The readback counter's log text after `libGLES_atl: ` (count follows).
+pub const READBACK_FRAMES_LINE: &str = "readback_frames=";
+
 fn log(line: &str) {
     eprintln!("libGLES_atl: {line}");
 }

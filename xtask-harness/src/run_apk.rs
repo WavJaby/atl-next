@@ -62,6 +62,9 @@ pub struct Args {
     /// Deliberate-failure check: every device ABI maps to the host ISA (atld_run `with_broken_instruction_set`), so a foreign-ABI app gets the host ISA from the broker and its bridge runs identity.
     #[arg(long)]
     break_isa: bool,
+    /// Deliberate-failure check of the render-path choice: atld `--break-render-path` probes each candidate without its nodes, so a host that offers one must fail `render path` (offered, not taken).
+    #[arg(long)]
+    break_render_path: bool,
     /// A pointer script the app injects into its window from its first present (atl-composer `input::parse_script`): `down:X,Y up:X,Y` in the content's physical pixels, `wait:MS` between steps,
     /// e.g. `wait:6000 down:792,28 up:792,28` taps (792, 28) 6 s after the first frame. The verdict is still about the last resumed activity, so wait for each tap's answer to settle.
     #[arg(long, value_name = "SCRIPT", conflicts_with = "drive")]
@@ -148,6 +151,7 @@ impl Args {
             verbose: false,
             no_app_seccomp: false,
             break_isa: false,
+            break_render_path: false,
             pointer: None,
             drive: Some(script),
             break_blank_capture,
@@ -261,7 +265,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     };
     let scripted = args.pointer.is_some() || args.drive.is_some();
     let outcome = check_delivery(foreign.as_deref(), &m.name, &app)
-        .and_then(|()| judge_ending(&services, &app, &ending, watch_ms, scripted));
+        .and_then(|()| judge_ending(&services, &app, &ending, watch_ms, scripted))
+        .and_then(|ok| {
+            render_path_check(&read(&run.atld_log()), &app).map(|p| format!("{ok}; {p}"))
+        });
     // the drive's failure first: it says what the script could not do, the verdict only what the app did
     let outcome = match (driven, args.drive.is_some()) {
         (Some(Err(e)), _) => Err(format!("drive: {e:#}")),
@@ -302,6 +309,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         verbose: false,
         no_app_seccomp: false,
         break_isa: false,
+        break_render_path: false,
         pointer: a.pointer.clone(),
         drive: None,
         break_blank_capture: false,
@@ -528,6 +536,11 @@ fn runtime(root: &Path, args: &Args, files: &[PackageFile]) -> Result<(Runtime, 
     } else {
         rt
     };
+    let rt = if args.break_render_path {
+        rt.with_broken_render_path()
+    } else {
+        rt
+    };
     let rt = match &args.pointer {
         Some(script) => rt.with_headless_pointer(script),
         None => rt,
@@ -735,6 +748,30 @@ fn display_node_check(atld_log: &str) -> Result<String, String> {
     Ok(format!("gpu: {gpu}"))
 }
 
+/// atld's render-path line (`gpu-render: path <module|baseline> (...)`, atld main.rs): a kernel-offered candidate (atl-broker gpu::RENDER_PATHS) must be taken; baseline is red only when one was offered and its probe failed or rendered on the baseline's renderer.
+/// Ok: the path, plus the driver's `buffer tier` line from the app log. No line (headless run, no gralloc): Ok, nothing to judge.
+fn render_path_check(atld_log: &str, app: &str) -> Result<String, String> {
+    let Some(path) = atld_log
+        .lines()
+        .rev()
+        .find_map(|l| l.strip_prefix("atld: gpu-render: path "))
+    else {
+        return Ok("render path: none probed".to_owned());
+    };
+    let tier = app
+        .lines()
+        .rev()
+        .find_map(|l| l.split_once("libGLES_atl: buffer tier ").map(|(_, t)| t))
+        .unwrap_or("not logged");
+    let offered_not_taken = path.starts_with("baseline (")
+        && !path.starts_with("baseline (no kernel render path offered");
+    if offered_not_taken {
+        Err(format!("render path offered but not taken: {path}"))
+    } else {
+        Ok(format!("render path {path}; buffer tier {tier}"))
+    }
+}
+
 fn finish(
     outcome: Result<String, String>,
     app: &str,
@@ -906,6 +943,19 @@ mod tests {
     }
 
     /// Lines as atld prints them (atld main.rs `run`): a GPU desktop, its display tier, the trial tier, and WSLg's vgem-only devices.
+    #[test]
+    fn render_path_check_reds_an_offer_not_taken() {
+        let app = "libGLES_atl: buffer tier readback (x)\n";
+        let taken = "atld: gpu-render: path dxgkrnl (renderer D3D12 (GPU), OpenGL ES 3.1 Mesa)\n";
+        assert!(render_path_check(taken, app).unwrap().contains("buffer tier readback"));
+        let none = "atld: gpu-render: path baseline (no kernel render path offered)\n";
+        assert!(render_path_check(none, app).is_ok());
+        assert!(render_path_check("", app).is_ok());
+        // what --break-render-path leaves: the candidate's probe failed
+        let broken = "atld: gpu-render: path baseline (dxgkrnl: probe exited exit status: 1: gpu-renderer: FAIL eglInitialize)\n";
+        assert!(render_path_check(broken, app).is_err());
+    }
+
     #[test]
     fn display_node_check_reds_a_lost_node() {
         let probe = "atld: gpu-probe: devices [\"/dev/dri/card0\", \"/dev/dri/renderD128\"]\n";
