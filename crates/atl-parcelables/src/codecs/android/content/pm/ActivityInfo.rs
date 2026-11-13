@@ -1,8 +1,47 @@
 // SPDX-License-Identifier: MIT
-//! android.content.pm.ActivityInfo: content/pm/ActivityInfo.java writeToParcel / ActivityInfo(Parcel), after ComponentInfo. Not modelled: windowLayout (present = refused).
+//! android.content.pm.ActivityInfo: content/pm/ActivityInfo.java writeToParcel / ActivityInfo(Parcel), after ComponentInfo. windowLayout (`<layout>`) is ActivityInfo.WindowLayout's writeToParcel behind a presence int.
 
 use crate::parcel::*;
 use crate::parts::*;
+
+/// ActivityInfo.WindowLayout (writeToParcel / WindowLayout(Parcel)): the manifest's `<layout>` element.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WindowLayout {
+    pub width: i32,
+    pub width_fraction: f32,
+    pub height: i32,
+    pub height_fraction: f32,
+    pub gravity: i32,
+    pub min_width: i32,
+    pub min_height: i32,
+    pub window_layout_affinity: Option<String>,
+}
+
+impl Part for WindowLayout {
+    fn write(&self, p: &mut In<'_>) -> Result<()> {
+        w_i32(p, self.width)?;
+        w_f32(p, self.width_fraction)?;
+        w_i32(p, self.height)?;
+        w_f32(p, self.height_fraction)?;
+        w_i32(p, self.gravity)?;
+        w_i32(p, self.min_width)?;
+        w_i32(p, self.min_height)?;
+        w_str8(p, &self.window_layout_affinity)
+    }
+
+    fn read(p: &In<'_>) -> Result<Self> {
+        Ok(WindowLayout {
+            width: r_i32(p)?,
+            width_fraction: r_f32(p)?,
+            height: r_i32(p)?,
+            height_fraction: r_f32(p)?,
+            gravity: r_i32(p)?,
+            min_width: r_i32(p)?,
+            min_height: r_i32(p)?,
+            window_layout_affinity: r_str8(p)?,
+        })
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct ActivityInfo {
@@ -24,6 +63,7 @@ pub struct ActivityInfo {
     pub persistable_mode: i32,
     pub max_recents: i32,
     pub lock_task_launch_mode: i32,
+    pub window_layout: Option<WindowLayout>,
     pub resize_mode: i32,
     pub requested_vr_component: Option<String>,
     pub rotation_animation: i32,
@@ -57,7 +97,13 @@ impl Part for ActivityInfo {
         w_i32(p, self.persistable_mode)?;
         w_i32(p, self.max_recents)?;
         w_i32(p, self.lock_task_launch_mode)?;
-        w_i32(p, 0)?; // windowLayout
+        match &self.window_layout {
+            Some(l) => {
+                w_i32(p, 1)?;
+                l.write(p)?;
+            }
+            None => w_i32(p, 0)?,
+        }
         w_i32(p, self.resize_mode)?;
         w_str8(p, &self.requested_vr_component)?;
         w_i32(p, self.rotation_animation)?;
@@ -90,12 +136,13 @@ impl Part for ActivityInfo {
         let max_recents = r_i32(p)?;
         let lock_task_launch_mode = r_i32(p)?;
         // ActivityInfo(Parcel) reads a WindowLayout only for exactly 1
-        if r_i32(p)? == 1 {
-            return Err(crate::refuse(
-                "android.content.pm.ActivityInfo.windowLayout",
-            ));
-        }
+        let window_layout = if r_i32(p)? == 1 {
+            Some(WindowLayout::read(p)?)
+        } else {
+            None
+        };
         Ok(ActivityInfo {
+            window_layout,
             component,
             theme,
             launch_mode,

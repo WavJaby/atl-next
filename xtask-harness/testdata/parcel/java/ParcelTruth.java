@@ -154,6 +154,10 @@ public class ParcelTruth {
         withMeta.metaData.putFloat("io.example.ratio", 1.5f);
         check("ApplicationInfo:meta-data", withMeta, ApplicationInfo.CREATOR);
         check("ActivityInfo", activity, ActivityInfo.CREATOR);
+        // <layout> as ParsedActivityUtils.parseActivityWindowLayout makes it (Angry Birds 2's launcher activity carries one); affinity set, every number off its default
+        ActivityInfo withLayout = new ActivityInfo(activity);
+        withLayout.windowLayout = new ActivityInfo.WindowLayout(640, 0.5f, -1, 0.75f, 0x11, 320, 240, "com.example.layout");
+        check("ActivityInfo:window-layout", withLayout, ActivityInfo.CREATOR);
         // the values an activity sends with setTaskDescription (Activity.onApplyThemeResource, every themed launch)
         check("ActivityManager.TaskDescription", taskDescription(), ActivityManager.TaskDescription.CREATOR);
         // the crash report an app's process sends as it dies (RuntimeInit's uncaught-exception handler): nine strings and one int, nulls where unset
