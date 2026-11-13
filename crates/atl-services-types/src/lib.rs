@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The system services' plain types and policy: platform permission definitions and shared libraries, per-app GL driver, display model, the compositor registry names, input devices, the installer's output frames, uid identity and permission rules. No binder, no build script, no workspace runtime crate: shared by atl-services, atld and xtask.
+//! The system services' plain types and policy: platform permission definitions and shared libraries, per-app GL driver, display model, the compositor registry names, input devices, the installer's output frames, SystemConfig's system features, uid identity and permission rules. No binder, no build script, no workspace runtime crate: shared by atl-services, atld and xtask.
 #![forbid(unsafe_code)]
 
 pub mod compositor_registry;
@@ -11,3 +11,4 @@ pub mod native_libs;
 pub mod packages;
 pub mod permission;
 pub mod size_buckets;
+pub mod system_config;

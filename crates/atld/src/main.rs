@@ -460,6 +460,31 @@ fn vintf_layout(a: &Args, r: &Root) -> Result<()> {
     Ok(())
 }
 
+/// The vendor permission file atld writes with the features it derives from this host and the desktop settings (atl_services_types::system_config format); the services read it with the
+/// partitions' other permission files (`--partitions`). The vendor partition, as a device's hardware features come from its vendor build.
+const HOST_FEATURES_FILE: &str = "etc/permissions/atl_host_hardware.xml";
+/// AOSP's frameworks/native/data/etc/android.hardware.touchscreen.xml: a touchscreen, which also offers faketouch.
+const FEATURES_TOUCHSCREEN: [(&str, i32); 2] = [
+    ("android.hardware.touchscreen", 0),
+    ("android.hardware.faketouch", 0),
+];
+/// PackageManager.FEATURE_OPENGLES_EXTENSION_PACK (frameworks/native/data/etc/android.hardware.opengles.aep.xml).
+const FEATURE_OPENGLES_AEP: (&str, i32) = ("android.hardware.opengles.aep", 0);
+
+/// Writes [`HOST_FEATURES_FILE`] (also when empty: the file says which run found nothing) and logs `features: host <names>`.
+fn host_features_layout(r: &Root, features: &[(&str, i32)]) -> Result<()> {
+    let path = r.vendor().join(HOST_FEATURES_FILE);
+    ensure!(!path.exists(), "two files at {}", path.display());
+    std::fs::create_dir_all(path.parent().context("a file below etc")?)?;
+    std::fs::write(
+        &path,
+        atl_services_types::system_config::permissions_xml(features)?,
+    )?;
+    let names: Vec<&str> = features.iter().map(|(n, _)| *n).collect();
+    log(format_args!("features: host [{}]", names.join(" ")));
+    Ok(())
+}
+
 /// Partitions `--file` may place files in: the root's `system` and `vendor` (Root::system, Root::vendor).
 const FILE_PARTITIONS: &[&str] = &["system", "vendor"];
 
@@ -1555,30 +1580,37 @@ fn run(a: &Args) -> Result<ExitCode> {
     }
     // the render path: baseline (Mesa's default on the run's GPU) unless a kernel-offered candidate initialises and renders on something else (gpu::RENDER_PATHS); one `gpu-render: path` line records which ran
     let mut app_env = Vec::new();
+    // the system features this host gives the apps (HOST_FEATURES_FILE): what the probes find and the desktop adaptations make true
+    let mut host_features: Vec<(&str, i32)> = Vec::new();
+    if a.ui.is_some() && a.mouse_touch {
+        // the left button is one finger on SOURCE_TOUCHSCREEN: a single-touch screen, as AOSP's android.hardware.touchscreen.xml declares it (no multitouch: one pointer)
+        host_features.extend(FEATURES_TOUCHSCREEN);
+    }
     if let (Some((n, _)), Some(probe)) = (&gpu, &a.gpu_probe) {
-        let probe_renderer = |name: &str,
-                              devices: Vec<PathBuf>,
-                              env: Vec<(OsString, OsString)>|
-         -> Result<std::result::Result<(String, String), String>> {
-            let mut spawn = system_spawn(
-                name,
-                probe,
-                vec!["--renderer".into(), "--render".into(), n.into()],
-                false,
-                None,
-            )?;
-            spawn.devices = devices;
-            spawn.env.extend(env);
-            spawn.mounts.extend(desktop_mounts()?);
-            let mut p = broker
-                .spawn(spawn)
-                .with_context(|| format!("starting {}", probe.display()))?;
-            let status = p.child.wait()?;
-            let text = std::fs::read_to_string(r.log(name))?;
-            Ok(atl_gralloc::node::parse_renderer_line(&text)
-                .filter(|_| status.success())
-                .ok_or_else(|| format!("probe exited {status}: {}", text.trim())))
-        };
+        let probe_renderer =
+            |name: &str,
+             devices: Vec<PathBuf>,
+             env: Vec<(OsString, OsString)>|
+             -> Result<std::result::Result<atl_gralloc::node::Renderer, String>> {
+                let mut spawn = system_spawn(
+                    name,
+                    probe,
+                    vec!["--renderer".into(), "--render".into(), n.into()],
+                    false,
+                    None,
+                )?;
+                spawn.devices = devices;
+                spawn.env.extend(env);
+                spawn.mounts.extend(desktop_mounts()?);
+                let mut p = broker
+                    .spawn(spawn)
+                    .with_context(|| format!("starting {}", probe.display()))?;
+                let status = p.child.wait()?;
+                let text = std::fs::read_to_string(r.log(name))?;
+                Ok(atl_gralloc::node::parse_renderer_line(&text)
+                    .filter(|_| status.success())
+                    .ok_or_else(|| format!("probe exited {status}: {}", text.trim())))
+            };
         let candidates = gpu::render_paths();
         // probed even without candidates: its GL_VERSION is what the apps get on the baseline (ro.opengles.version)
         let baseline = probe_renderer("gpu-render-baseline", app_devices.clone(), vec![])?;
@@ -1598,38 +1630,48 @@ fn run(a: &Args) -> Result<ExitCode> {
                     .collect();
                 let name = format!("gpu-render-{}", path.module);
                 match (probe_renderer(&name, devices, env.clone())?, &baseline) {
-                    (Ok((v, rend)), Ok((_, base))) if rend != *base => {
-                        chosen = Ok((path, v, rend, env));
+                    (Ok(rend), Ok(base)) if rend.renderer != base.renderer => {
+                        chosen = Ok((path, rend, env));
                         break;
                     }
-                    (Ok((_, rend)), _) => {
-                        chosen = Err(format!("{}: renders on the baseline's {rend}", path.module))
+                    (Ok(rend), _) => {
+                        chosen = Err(format!(
+                            "{}: renders on the baseline's {}",
+                            path.module, rend.renderer
+                        ))
                     }
                     (Err(e), _) => chosen = Err(format!("{}: {e}", path.module)),
                 }
             }
             chosen
         };
-        let version = match chosen {
-            Ok((path, version, renderer, env)) => {
+        // what the GL of the path that runs reports; None when no probe answered
+        let ran = match chosen {
+            Ok((path, rend, env)) => {
                 log(format_args!(
-                    "gpu-render: path {} (renderer {renderer}, {version})",
-                    path.module
+                    "gpu-render: path {} (renderer {}, {})",
+                    path.module, rend.renderer, rend.version
                 ));
                 app_devices.extend(path.nodes.iter().map(PathBuf::from));
                 app_env = env;
-                Some(version)
+                Some(rend)
             }
             Err(why) => {
                 log(format_args!("gpu-render: path baseline ({why})"));
-                baseline.ok().map(|(v, _)| v)
+                baseline.ok()
             }
         };
+        // the Android extension pack: a device with it declares the feature (CDD 7.1.4.1), as its vendor permission file does
+        if ran.as_ref().is_some_and(|r| r.aep) {
+            host_features.push(FEATURE_OPENGLES_AEP);
+        }
         // the GLES version of the path that runs, as the device's vendor build.prop states it on Android; unset when no probe answered or the string is not GLES's
-        match version
-            .as_deref()
-            .map(|v| (v, atl_property_service::gles_version(v)))
-        {
+        match ran.as_ref().map(|r| {
+            (
+                r.version.as_str(),
+                atl_property_service::gles_version(&r.version),
+            )
+        }) {
             Some((v, Some(prop))) => {
                 log(format_args!("gles: {}={} ({v})", prop.0, prop.1));
                 defaults.push(prop);
@@ -1638,6 +1680,7 @@ fn run(a: &Args) -> Result<ExitCode> {
             None => log(format_args!("gles: unset (no renderer probed)")),
         }
     }
+    host_features_layout(&r, &host_features)?;
     // the services' area: the defaults with what the probes above added (ActivityTaskManagerService reads ro.opengles.version); the processes started before the probes keep the first area
     let system_area = r.root.join("properties.d").join("system");
     std::fs::write(&system_area, atl_property_service::area(&defaults)?)?;
@@ -1792,6 +1835,8 @@ fn run(a: &Args) -> Result<ExitCode> {
         "--keychars".into(),
         r.system().join("usr/keychars").into_os_string(),
     ]);
+    // SystemConfig's permission files lie in the root's partitions: system (mounted for every process) and vendor (HOST_FEATURES_FILE and `--file` placements), by host path
+    services_args.extend(["--partitions".into(), r.root.clone().into_os_string()]);
     let mut services_spawn = system_spawn(
         "services",
         &a.services,
@@ -1802,6 +1847,7 @@ fn run(a: &Args) -> Result<ExitCode> {
     services_spawn.property_area = Some(system_area);
     // what the install reads by host path: the sessions' manifests and the installer's frames, the platform's permission definitions
     services_spawn.mounts.push(ro_at_own_path(&install_dir));
+    services_spawn.mounts.push(ro_at_own_path(&r.vendor()));
     if let Some(p) = &a.platform_permissions {
         services_spawn.mounts.push(ro_at_own_path(p));
     }

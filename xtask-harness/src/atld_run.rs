@@ -94,7 +94,19 @@ fn nb_lib_file(module: &str) -> String {
     format!("{stem}.so")
 }
 
+/// AOSP's per-feature permission files (PRODUCT_COPY_FILES sources on a device).
+const FEATURE_FILES_DIR: &str = "frameworks/native/data/etc";
+/// The system features every ATL run has, whatever the host: AOSP's own files as-is, placed in /system/etc/permissions where SystemConfig reads them (atl_services_types::system_config).
+/// Host-dependent features (touchscreen per the mouse-touch setting, opengles.aep per the GL probe) are atld's vendor file, not rows here. A row is added only for what ATL provides:
+/// a desktop window takes either orientation (AOSP's pc_core_hardware.xml declares both); audio output is the audio service over PipeWire.
+const FEATURE_FILES: [&str; 3] = [
+    "android.hardware.screen.landscape.xml",
+    "android.hardware.screen.portrait.xml",
+    "android.hardware.audio.output.xml",
+];
+
 /// The /system files of the media stack an app process reads: the extractor plugins (MediaExtractorFactory loads `lib64/extractors`) and AOSP's codec lists (`media_codecs.xml` is the software list; the Codec2 list is `media_codecs_c2.xml`, read from the parser's default search dirs, which include /system/etc).
+/// And the system features' permission files ([`FEATURE_FILES`]).
 /// One list for every /system placement: atld `--file` rows (every [`Runtime`]) and native-load's test layout (binder.rs `link_rows`). Hard error when a host file is missing: xtask native builds them.
 pub(crate) fn platform_rows(out: &Path, aosp: &Path) -> Result<Vec<(PathBuf, String)>> {
     let data = aosp.join("frameworks/av/media/libstagefright/data");
@@ -114,10 +126,17 @@ pub(crate) fn platform_rows(out: &Path, aosp: &Path) -> Result<Vec<(PathBuf, Str
         data.join("media_codecs_google_c2.xml"),
         format!("{system}/etc/media_codecs_c2.xml"),
     ));
+    let features = aosp.join(FEATURE_FILES_DIR);
+    for file in FEATURE_FILES {
+        rows.push((
+            features.join(file),
+            format!("{system}/etc/permissions/{file}"),
+        ));
+    }
     for (host, _) in &rows {
         ensure!(
             host.is_file(),
-            "missing input {} (the media stack's /system files: xtask native builds the plugins)",
+            "missing input {} (the media stack's /system files: xtask native builds the plugins; the permission files: the pinned AOSP tree)",
             host.display()
         );
     }
@@ -938,6 +957,15 @@ impl Runtime {
     /// atld `--break-render-path`: each render-path candidate is probed without its nodes, so the run must fall back to the baseline.
     pub fn with_broken_render_path(mut self) -> Self {
         self.break_render_path = true;
+        self
+    }
+
+    /// The run places none of [`FEATURE_FILES`]: SystemConfig then holds only atld's host features, so the app gate's features row (always-present feature) must fail.
+    pub fn without_feature_files(mut self) -> Self {
+        self.platform_files.retain(|(host, _)| {
+            host.file_name()
+                .is_none_or(|n| !FEATURE_FILES.iter().any(|f| n == *f))
+        });
         self
     }
 

@@ -28,6 +28,7 @@ use atl_services_types::compositor_registry;
 use atl_services_types::display_model::DisplayModel;
 use atl_services_types::native_libs::SupportedAbi;
 use atl_services_types::packages::{Library, PermissionDecl};
+use atl_services_types::system_config::Features;
 use binder::{BinderFeatures, ProcessState};
 use clap::Parser;
 
@@ -57,6 +58,10 @@ struct Args {
     /// The display the services answer with (`WxH@hz,dpi`, display_model.rs). Omitted: the model's default.
     #[arg(long, value_parser = DisplayModel::parse_arg)]
     display: Option<DisplayModel>,
+    /// The directory holding the partitions (`system/`, `vendor/`, ...) as this process sees them: SystemConfig's system features are read from their `etc/{sysconfig,permissions}/*.xml`
+    /// (atl_services_types::system_config). Omitted: no feature, hasSystemFeature false for every name.
+    #[arg(long)]
+    partitions: Option<PathBuf>,
     /// AOSP's keychars directory (/system/usr/keychars): Virtual.kcm (the virtual keyboard's map, also carried by the pointer devices) and Generic.kcm (the physical keyboard's), loaded through libinput at start.
     #[arg(long)]
     keychars: PathBuf,
@@ -201,6 +206,8 @@ fn main() -> Result<()> {
     {
         bail!("--launch {package}: not an installed package");
     }
+    // ro.opengles.version, read by ActivityTaskManagerService and PackageManagerService alike
+    let gl_es = gl_es_version()?;
     let am = BnActivityManager::new_binder(activity.clone(), BinderFeatures::default());
     binder::add_service(ACTIVITY, am.as_binder()).context("addService activity")?;
     binder::add_service(
@@ -209,12 +216,30 @@ fn main() -> Result<()> {
             activity.clone(),
             !a.no_new_intent,
             !a.no_activity_result,
-            gl_es_version()?,
+            gl_es,
         ),
     )
     .context("addService activity_task")?;
+    let features = match &a.partitions {
+        Some(root) => Features::read(root)?,
+        None => Features::default(),
+    };
+    writeln!(
+        std::io::stderr(),
+        "services: system features {}: {}",
+        features.len(),
+        features
+            .iter()
+            .map(|(n, v)| if v == 0 {
+                n.to_owned()
+            } else {
+                format!("{n}={v}")
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    )?;
     let pm = BnPackageManager::new_binder(
-        PackageManager::new(packages.clone(), Arc::clone(&permissions)),
+        PackageManager::new(packages.clone(), Arc::clone(&permissions), features, gl_es),
         BinderFeatures::default(),
     );
     binder::add_service(PACKAGE, pm.as_binder()).context("addService package")?;

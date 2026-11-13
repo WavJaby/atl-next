@@ -24,6 +24,7 @@ pub mod android {
             pub mod ActivityInfo;
             pub mod ApplicationInfo;
             pub mod ConfigurationInfo;
+            pub mod FeatureInfo;
             pub mod InstrumentationInfo;
             pub mod PackageInfo;
             pub mod ParceledListSlice;

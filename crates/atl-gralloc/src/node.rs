@@ -117,22 +117,51 @@ pub fn parse_display_line(text: &str) -> Option<(Option<String>, String)> {
 /// The probe's `--renderer` line: what a GLES context on one EGL device reports, under the probe's environment (atld's render-path choice, atl-broker gpu::RENDER_PATHS).
 pub const RENDERER_LINE: &str = "gpu-renderer:";
 
-/// `<prefix> version=<GL_VERSION> renderer=<GL_RENDERER>` (version first: neither string is quoted, the renderer runs to the end).
-pub fn renderer_line(version: &str, renderer: &str) -> String {
-    format!("{RENDERER_LINE} version={version} renderer={renderer}")
+/// The GL extension whose presence makes a device declare `android.hardware.opengles.aep` (CDD 7.1.4.1; PackageManager.FEATURE_OPENGLES_EXTENSION_PACK).
+pub const AEP_EXTENSION: &str = "GL_ANDROID_extension_pack_es31a";
+
+/// What [`RENDERER_LINE`] reports of one GLES context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Renderer {
+    /// GL_VERSION
+    pub version: String,
+    /// GL_EXTENSIONS lists [`AEP_EXTENSION`]
+    pub aep: bool,
+    /// GL_RENDERER
+    pub renderer: String,
 }
 
-/// (GL_VERSION, GL_RENDERER) from the last well-formed [`RENDERER_LINE`] in `text`.
-pub fn parse_renderer_line(text: &str) -> Option<(String, String)> {
+/// `<prefix> version=<GL_VERSION> aep=<0|1> renderer=<GL_RENDERER>` (version first: neither string is quoted, the renderer runs to the end).
+pub fn renderer_line(r: &Renderer) -> String {
+    format!(
+        "{RENDERER_LINE} version={} aep={} renderer={}",
+        r.version,
+        u8::from(r.aep),
+        r.renderer
+    )
+}
+
+/// The [`Renderer`] of the last well-formed [`RENDERER_LINE`] in `text`.
+pub fn parse_renderer_line(text: &str) -> Option<Renderer> {
     let line = text
         .lines()
         .rev()
         .find_map(|l| l.strip_prefix(RENDERER_LINE))?;
-    let (version, renderer) = line
+    let (version, rest) = line
         .trim_start()
         .strip_prefix("version=")?
-        .split_once(" renderer=")?;
-    Some((version.to_owned(), renderer.to_owned()))
+        .split_once(" aep=")?;
+    let (aep, renderer) = rest.split_once(" renderer=")?;
+    let aep = match aep {
+        "0" => false,
+        "1" => true,
+        _ => return None,
+    };
+    Some(Renderer {
+        version: version.to_owned(),
+        aep,
+        renderer: renderer.to_owned(),
+    })
 }
 
 /// The probe's per-fourcc modifier line after [`DISPLAY_LINE`]: `<prefix> <FOURCC>=<hex>,<hex>...` (nothing after `=`: no modifier qualifies). Its own prefix, so [`parse_display_line`] never reads it.
@@ -204,16 +233,25 @@ mod tests {
     /// Strings as WSL's d3d12 reports them (gpu-readback slice 1): spaces and parentheses in both survive the round trip.
     #[test]
     fn renderer_line_round_trips() {
-        let (v, r) = (
-            "OpenGL ES 3.1 Mesa 25.0.7-2",
-            "D3D12 (NVIDIA GeForce GTX 1080 Ti)",
-        );
-        let text = format!("noise\n{}\n", renderer_line(v, r));
-        assert_eq!(
-            parse_renderer_line(&text),
-            Some((v.to_owned(), r.to_owned()))
-        );
+        for aep in [false, true] {
+            let r = Renderer {
+                version: "OpenGL ES 3.1 Mesa 25.0.7-2".to_owned(),
+                aep,
+                renderer: "D3D12 (NVIDIA GeForce GTX 1080 Ti)".to_owned(),
+            };
+            let text = format!("noise\n{}\n", renderer_line(&r));
+            assert_eq!(parse_renderer_line(&text), Some(r));
+        }
         assert_eq!(parse_renderer_line("gpu-renderer: FAIL x"), None);
+        // an aep value other than 0 / 1, or a line without the field, is not well-formed
+        assert_eq!(
+            parse_renderer_line("gpu-renderer: version=v aep=yes renderer=r"),
+            None
+        );
+        assert_eq!(
+            parse_renderer_line("gpu-renderer: version=v renderer=r"),
+            None
+        );
     }
 
     /// AB24 lists from the laptop (gralloc-modifiers S1): NVIDIA renderD129 lists LINEAR external-only + block-linear renderable; GTK offload env imports `0` and the 12 block-linear ones.

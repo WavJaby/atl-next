@@ -682,6 +682,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "atl-android-paths",
+ "roxmltree",
  "serde",
  "serde_json",
  "toml",

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Derived from the Android Open Source Project: frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java, frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java, frameworks/base/services/core/java/com/android/server/pm/IPackageManagerBase.java, frameworks/base/services/core/java/com/android/server/pm/parsing/PackageInfoUtils.java
-//! IPackageManager, subset: getApplicationInfo, getPackageInfo, getActivityInfo, getServiceInfo, getProviderInfo, resolveContentProvider, hasSystemFeature, getPackagesForUid, notifyDexLoad,
+//! IPackageManager, subset: getApplicationInfo, getPackageInfo, getActivityInfo, getServiceInfo, getProviderInfo, resolveContentProvider, hasSystemFeature, getSystemAvailableFeatures, getPackagesForUid, notifyDexLoad,
 //! getInstrumentationInfoAsUser, queryInstrumentationAsUser, checkSignatures. Every other method is counted unimplemented (counters).
 //! Every answer is a clone of the installer's PackageInfo (crate::packages) cut to the caller's flags: GET_META_DATA, MATCH_DISABLED_COMPONENTS, and getPackageInfo's GET_<component> / GET_PERMISSIONS.
 //! One user (0): a userId other than 0 is a user that does not exist. `sharedLibraryFiles` is always filled (ActivityManagerService's STOCK_PM_FLAGS asks for it on every app path).
@@ -11,11 +11,12 @@ use std::sync::Arc;
 use atl_aidl::aidl::android::content::pm::IPackageManager::{EnforcePermission, IPackageManager};
 use atl_parcelables::android::content::ComponentName;
 use atl_parcelables::android::content::pm::{
-    ActivityInfo, ApplicationInfo, InstrumentationInfo, PackageInfo, ParceledListSlice,
-    ProviderInfo, ServiceInfo,
+    ActivityInfo, ApplicationInfo, FeatureInfo, InstrumentationInfo, PackageInfo,
+    ParceledListSlice, ProviderInfo, ServiceInfo,
 };
 use atl_parcelables::codecs::android::content::pm::PackageInfo::{Signature, SigningDetails};
 use atl_parcelables::parts::{ComponentInfo, SharedLibraryInfo};
+use atl_services_types::system_config::Features;
 use binder::{ExceptionCode, Interface, Status, ThreadState};
 
 use crate::packages::{GET_META_DATA, PackageRecord, Packages, Permissions, answer};
@@ -167,14 +168,41 @@ fn listed<T: Clone>(
 pub struct PackageManager {
     packages: Arc<Packages>,
     permissions: Arc<Permissions>,
+    /// PackageManagerService.mAvailableFeatures: SystemConfig's features (atl_services_types::system_config), read once at start
+    features: Features,
+    /// `ro.opengles.version` at start (major << 16 | minor; 0 unset): getSystemAvailableFeatures' last entry
+    gl_es_version: i32,
 }
 
 impl PackageManager {
-    pub fn new(packages: Arc<Packages>, permissions: Arc<Permissions>) -> Self {
+    pub fn new(
+        packages: Arc<Packages>,
+        permissions: Arc<Permissions>,
+        features: Features,
+        gl_es_version: i32,
+    ) -> Self {
         PackageManager {
             packages,
             permissions,
+            features,
+            gl_es_version,
         }
+    }
+
+    /// PackageManagerService.getSystemAvailableFeatures:5398: every feature, then one entry with only reqGlEsVersion (`ro.opengles.version`, GL_ES_VERSION_UNDEFINED 0 when unset).
+    fn system_available_features(&self) -> Vec<FeatureInfo> {
+        self.features
+            .iter()
+            .map(|(name, version)| FeatureInfo {
+                name: Some(name.to_owned()),
+                version,
+                ..FeatureInfo::default()
+            })
+            .chain(std::iter::once(FeatureInfo {
+                req_gl_es_version: self.gl_es_version,
+                ..FeatureInfo::default()
+            }))
+            .collect()
     }
 
     /// The record `caller` may see under `name` in `user` (ComputerEngine.getApplicationInfoInternal:997 `!mUserManager.exists(userId) return null`; visibility per Packages::visible).
@@ -394,10 +422,16 @@ impl IPackageManager for PackageManager {
             .map(|p| self.package_info(p, flags)))
     }
 
-    /// PackageManagerService.hasSystemFeature:2954: true when mAvailableFeatures holds `name` at >= `version`. M2: the set is empty, so false for every feature;
-    /// features.toml (plan: feature groups by table, each row's hasSystemFeature flags) becomes the source when the first feature group is needed.
-    fn r#hasSystemFeature(&self, _name: Option<&str>, _version: i32) -> binder::Result<bool> {
-        Ok(false)
+    /// PackageManagerService.hasSystemFeature:2954: true when mAvailableFeatures holds `name` at >= `version`; a null name is in no map.
+    fn r#hasSystemFeature(&self, name: Option<&str>, version: i32) -> binder::Result<bool> {
+        Ok(name.is_some_and(|n| self.features.has(n, version)))
+    }
+
+    /// PackageManagerService.getSystemAvailableFeatures:5398 (any caller, instant apps included).
+    fn r#getSystemAvailableFeatures(&self) -> binder::Result<Option<ParceledListSlice>> {
+        Ok(Some(ParceledListSlice::new(
+            self.system_available_features(),
+        )))
     }
 
     /// ComputerEngine.getPackagesForUid:1987: the packages of the uid's app id; null when none, or when the caller may not see them (an app sees its own uid only).
@@ -632,6 +666,8 @@ mod tests {
         let pm = PackageManager::new(
             Arc::clone(&packages),
             Arc::new(Permissions::new(&packages, &[])),
+            Features::default(),
+            0,
         );
         let p = packages.by_name("a").expect("a");
         assert!(pm.package_info(p, 0).activities.is_none());
@@ -668,7 +704,12 @@ mod tests {
                 protection_level: level,
             });
         let permissions = Arc::new(Permissions::new(&packages, &platform));
-        let pm = PackageManager::new(Arc::clone(&packages), Arc::clone(&permissions));
+        let pm = PackageManager::new(
+            Arc::clone(&packages),
+            Arc::clone(&permissions),
+            Features::default(),
+            0,
+        );
         let p = packages.by_name("g").expect("g");
         assert_eq!(pm.package_info(p, 0).requested_permissions_flags, None);
         assert_eq!(
@@ -735,5 +776,40 @@ mod tests {
             SIGNATURE_SECOND_NOT_SIGNED
         );
         assert_eq!(check_signatures(None, None), SIGNATURE_NEITHER_SIGNED);
+    }
+
+    /// hasSystemFeature compares versions; getSystemAvailableFeatures lists the features, then the GL ES entry with no name (PackageManagerService :2954, :5398).
+    #[test]
+    fn features_answer_as_package_manager_service() {
+        let packages = Arc::new(packages());
+        let features = Features::from_texts([
+            r#"<permissions><feature name="android.hardware.touchscreen" /><feature name="v.level" version="1" /></permissions>"#,
+        ])
+        .expect("features");
+        let pm = PackageManager::new(
+            Arc::clone(&packages),
+            Arc::new(Permissions::new(&packages, &[])),
+            features,
+            0x30002,
+        );
+        assert!(
+            pm.hasSystemFeature(Some("android.hardware.touchscreen"), 0)
+                .unwrap()
+        );
+        assert!(pm.hasSystemFeature(Some("v.level"), 1).unwrap());
+        assert!(!pm.hasSystemFeature(Some("v.level"), 2).unwrap());
+        assert!(
+            !pm.hasSystemFeature(Some("android.hardware.wifi"), 0)
+                .unwrap()
+        );
+        assert!(!pm.hasSystemFeature(None, 0).unwrap());
+        let all = pm.system_available_features();
+        let names: Vec<_> = all.iter().map(|f| f.name.as_deref()).collect();
+        assert_eq!(
+            names,
+            [Some("android.hardware.touchscreen"), Some("v.level"), None]
+        );
+        assert_eq!(all[1].version, 1);
+        assert_eq!(all[2].req_gl_es_version, 0x30002);
     }
 }

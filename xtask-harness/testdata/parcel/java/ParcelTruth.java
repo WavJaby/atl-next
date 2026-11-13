@@ -33,6 +33,7 @@ import android.content.IntentFilter;
 import android.content.pm.ActivityInfo;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.ConfigurationInfo;
+import android.content.pm.FeatureInfo;
 import android.content.pm.InstrumentationInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.ParceledListSlice;
@@ -234,6 +235,8 @@ public class ParcelTruth {
         check("InstrumentationInfo", instrumentationInfo(ai), InstrumentationInfo.CREATOR);
         // IPackageManager.queryInstrumentationAsUser's reply: the inline list, its element class written once
         check("ParceledListSlice", new ParceledListSlice<>(Arrays.asList(instrumentationInfo(ai), instrumentationInfo(ai))), ParceledListSlice.CREATOR);
+        // IPackageManager.getSystemAvailableFeatures' reply: named features, then the GL ES entry (name null, PackageManagerService :5398)
+        check("ParceledListSlice:features", new ParceledListSlice<>(Arrays.asList(featureInfo("android.hardware.touchscreen", 0), featureInfo("android.hardware.vulkan.level", 1), glEsFeature())), ParceledListSlice.CREATOR);
         check("NotificationChannel", notificationChannel("atl"), NotificationChannel.CREATOR);
         check("NotificationChannel:pattern", patternChannel(), NotificationChannel.CREATOR);
         // INotificationManager.createNotificationChannels' argument / getNotificationChannels' reply: the element class picks the codec
@@ -1279,6 +1282,22 @@ public class ParcelTruth {
         c.reqInputFeatures = ConfigurationInfo.INPUT_FEATURE_HARD_KEYBOARD;
         c.reqGlEsVersion = 0x30001;
         return c;
+    }
+
+    /// One SystemConfig feature as PackageManagerService lists it; flags distinct from 0 so a dropped field shows.
+    static FeatureInfo featureInfo(String name, int version) {
+        FeatureInfo f = new FeatureInfo();
+        f.name = name;
+        f.version = version;
+        f.flags = FeatureInfo.FLAG_REQUIRED;
+        return f;
+    }
+
+    /// getSystemAvailableFeatures' last entry: only reqGlEsVersion (ES 3.2).
+    static FeatureInfo glEsFeature() {
+        FeatureInfo f = new FeatureInfo();
+        f.reqGlEsVersion = 0x30002;
+        return f;
     }
 
     static void check(String name, Parcelable p, Parcelable.Creator<?> creator) {

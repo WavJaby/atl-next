@@ -77,6 +77,9 @@ pub struct Args {
     /// RLIMIT_NICE below 40, Process.setThreadPriority throws SecurityException and the priority line must go red.
     #[arg(long)]
     priority_break: bool,
+    /// The system-features break: the run places none of AOSP's static permission files (atld_run.rs FEATURE_FILES), so the always-present feature reads false and the features line must go red.
+    #[arg(long)]
+    features_break: bool,
 }
 
 /// The fixture's dir.
@@ -127,6 +130,8 @@ const PENDING_INTENT: (&str, &str) = (
     "AtlTest: pendingintent: ",
     "package=com.example.atltest self=true immutable=true broadcast=true mutable=true",
 );
+/// Main.features' line (platform-fidelity row 4): `landscape=<b> touchscreen=<b> aep=<b> gl-aep=<b> listed=<b> gles=<hex> config=<hex>` ([`features_why`]).
+const FEATURES: &str = "AtlTest: features: ";
 /// Main.priority's line: `start=<n> background=<r>/<nice> restore=<r>/<nice> foreground=<r>/<nice>`, r = `ok` or the throwable's simple name ([`priority_why`]).
 const PRIORITY: &str = "AtlTest: priority: ";
 /// Main.signatures' line: the fixture's signer as GET_SIGNATURES and GET_SIGNING_CERTIFICATES return it and checkSignatures against itself ([`signatures_want`]).
@@ -224,6 +229,41 @@ const PRIORITY_ASKS: [(&str, Option<i32>); 3] = [
     ("restore", None),
     ("foreground", Some(-2)),
 ];
+
+/// Why the features line is wrong, else None. This headless run has:
+/// - landscape: an always-present feature (atld_run.rs FEATURE_FILES, AOSP's own file in /system/etc/permissions) -> true;
+/// - touchscreen: none, as no window takes input (atld declares it only with `--ui` and mouse-touch) -> false;
+/// - aep: atld's probed feature, compared with what the app's own ES 3 context lists (`gl-aep`, GL_EXTENSIONS has GL_ANDROID_extension_pack_es31a): equal whatever the host GPU;
+/// - listed: getSystemAvailableFeatures holds landscape; `gles` (its GL ES entry) = `config` (ActivityManager.getDeviceConfigurationInfo().reqGlEsVersion), both ro.opengles.version, non-zero (the run probes GL).
+fn features_why(line: Option<&str>) -> Option<String> {
+    let Some(line) = line else {
+        return Some("no line".to_owned());
+    };
+    let fields: BTreeMap<&str, &str> = line
+        .split_whitespace()
+        .filter_map(|f| f.split_once('='))
+        .collect();
+    let get = |k: &str| fields.get(k).copied();
+    for (key, want) in [
+        ("landscape", "true"),
+        ("touchscreen", "false"),
+        ("listed", "true"),
+    ] {
+        if get(key) != Some(want) {
+            return Some(format!("{key}: want {want}, got {:?}", get(key)));
+        }
+    }
+    match (get("aep"), get("gl-aep")) {
+        (Some(a), Some(g)) if a == g && (a == "true" || a == "false") => {}
+        (a, g) => return Some(format!("aep {a:?} != the app's GL {g:?}")),
+    }
+    match (get("gles"), get("config")) {
+        (Some(g), Some(c)) if g == c && g != "0x0" => None,
+        (g, c) => Some(format!(
+            "GL ES entry {g:?} != configuration {c:?}, or unset"
+        )),
+    }
+}
 
 /// Why the priority line is wrong for a host whose app tiers apply nice >= `floor` (atl-broker NiceTiers), else None.
 /// Every request must succeed, as on Android; Process.getThreadPriority then reads the kernel's value: the request when it is at or above the floor, the previous nice when it was answered without effect.
@@ -881,6 +921,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         rt
     };
+    let rt = if args.features_break {
+        rt.without_feature_files()
+    } else {
+        rt
+    };
     let work = rt.out.join("app");
     // the bridge-1 JNI fixture rides along in lib/<abi>/ (jni_fixture.rs); the NativeBridge core loads it into the guest
     let native = jni_fixture::apk_libs(
@@ -1065,6 +1110,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             "processes: want {PROCESSES_WANT:?}, got {processes:?}"
         ));
     }
+    let features = app
+        .lines()
+        .find_map(|l| l.split_once(FEATURES).map(|(_, r)| r.trim_end().to_owned()));
+    if passed && let Some(why) = features_why(features.as_deref()) {
+        whys.push(format!("features: {why} (line {features:?})"));
+    }
     let priority = app
         .lines()
         .find_map(|l| l.split_once(PRIORITY).map(|(_, r)| r.trim_end().to_owned()));
@@ -1193,6 +1244,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             tiers.describe()
         );
         println!(
+            "app: pass features {}",
+            features.as_deref().unwrap_or_default()
+        );
+        println!(
             "app: pass media.player {} (answered through the view; setDataSource returned)",
             probe.unwrap_or_default()
         );
@@ -1255,6 +1310,26 @@ fn fault(app_log: &str, atld_exited: bool) -> Option<String> {
 mod tests {
     use super::*;
     use crate::window::stamp_text;
+
+    /// The features line: a host with AEP and one without both pass when the app's GL agrees; the break run (no static files) and a probe that disagrees with the app's GL fail.
+    #[test]
+    fn features_line_judges_presence_probe_and_gles() {
+        let ok = "landscape=true touchscreen=false aep=true gl-aep=true listed=true gles=0x30002 config=0x30002";
+        assert_eq!(features_why(Some(ok)), None);
+        let no_aep = "landscape=true touchscreen=false aep=false gl-aep=false listed=true gles=0x30001 config=0x30001";
+        assert_eq!(features_why(Some(no_aep)), None);
+        for bad in [
+            // --features-break: no static permission files
+            "landscape=false touchscreen=false aep=true gl-aep=true listed=false gles=0x30002 config=0x30002",
+            "landscape=true touchscreen=true aep=true gl-aep=true listed=true gles=0x30002 config=0x30002",
+            "landscape=true touchscreen=false aep=false gl-aep=true listed=true gles=0x30002 config=0x30002",
+            "landscape=true touchscreen=false aep=true gl-aep=true listed=true gles=0x0 config=0x0",
+            "landscape=true touchscreen=false aep=true gl-aep=true listed=true gles=0x30002 config=0x30001",
+        ] {
+            assert!(features_why(Some(bad)).is_some(), "{bad}");
+        }
+        assert!(features_why(None).is_some());
+    }
 
     #[test]
     fn cpu_lists_count_as_the_kernel_documents() {

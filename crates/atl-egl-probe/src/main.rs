@@ -64,7 +64,7 @@ struct Args {
     /// Print the render node of the desktop's Wayland EGL display's device and its renderer (atl_gralloc::node::display_line), under this process's environment; atld runs this once per run to pick the GPU.
     #[arg(long)]
     display_node: bool,
-    /// Print GL_VERSION and GL_RENDERER of a GLES context on the `--render` device (atl_gralloc::node::renderer_line), under this process's environment; atld runs it per render-path candidate (atl-broker gpu::RENDER_PATHS) and once for the baseline.
+    /// Print GL_VERSION, whether GL_EXTENSIONS has the Android extension pack, and GL_RENDERER of a GLES context on the `--render` device (atl_gralloc::node::renderer_line), under this process's environment; atld runs it per render-path candidate (atl-broker gpu::RENDER_PATHS) and once for the baseline.
     #[arg(long, requires = "render")]
     renderer: bool,
 }
@@ -98,8 +98,8 @@ fn main() -> ExitCode {
     if args.renderer {
         let render = args.render.as_deref().unwrap_or_default();
         return match renderer(render) {
-            Ok((version, renderer)) => {
-                out(&node::renderer_line(&version, &renderer));
+            Ok(r) => {
+                out(&node::renderer_line(&r));
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -125,8 +125,8 @@ fn main() -> ExitCode {
     }
 }
 
-/// (GL_VERSION, GL_RENDERER) of a GLES context on `render`'s EGL device (a render node, or `software`).
-fn renderer(render: &str) -> Result<(String, String)> {
+/// GL_VERSION, AEP (GL_EXTENSIONS lists node::AEP_EXTENSION) and GL_RENDERER of a GLES context on `render`'s EGL device (a render node, or `software`).
+fn renderer(render: &str) -> Result<node::Renderer> {
     let host = Host::load()?;
     let display = if render == "software" {
         host.devices()?
@@ -141,9 +141,16 @@ fn renderer(render: &str) -> Result<(String, String)> {
     };
     let ctx = display.create_context()?;
     let gl = ctx.make_current()?;
-    let pair = (gl.string(GL_VERSION), gl.string(GL_RENDERER));
+    let r = node::Renderer {
+        version: gl.string(GL_VERSION),
+        aep: gl
+            .string(GL_EXTENSIONS)
+            .split_ascii_whitespace()
+            .any(|e| e == node::AEP_EXTENSION),
+        renderer: gl.string(GL_RENDERER),
+    };
     gl.check("glGetString")?;
-    Ok(pair)
+    Ok(r)
 }
 
 /// One [`node::MODIFIERS_LINE`] per gralloc fourcc: renderable on `render_node`'s EGL device display ∩ imported by the Wayland display, 1-plane layouts (atl_gralloc::node::modifier_set).

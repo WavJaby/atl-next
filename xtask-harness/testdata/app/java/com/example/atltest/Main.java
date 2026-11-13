@@ -36,6 +36,7 @@ import javax.net.ssl.X509TrustManager;
  * SoundPool line (app.rs SOUNDPOOL): `new SoundPool` (the legacy 3-arg path HJ takes) loads libsoundpool.so and constructs, or logs what it threw.
  * MediaPlayer lines (app.rs MEDIAPLAYER): Happy Jump's GameShared.loadMusic sequence, one line per step.
  * Service lines (app.rs SERVICE_LINES): connectivity = the host's default network as the `connectivity` service reports it, queried and through registerDefaultNetworkCallback; permission = PackageManager.checkPermission through `permissionmgr`; else `absent` / what it threw.
+ * Features line (app.rs FEATURES): system features through PackageManager against this process's own GL.
  * media.player line (app.rs MEDIA_PLAYER_SERVICE): setDataSource(fd) reaches the served service and returns.
  * WAV lines (app.rs MEDIA_WAV): a valid WAV is prepared, started, sought and reset per round, by fd and by path; the served extractor must sniff it.
  * Reset lines (app.rs MEDIA_RESET): reset with a seek pending, each within a bound; a reset that never returns is named.
@@ -93,6 +94,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "power: " + power());
         Log.i("AtlTest", "pendingintent: " + pendingIntent());
         Log.i("AtlTest", "processes: " + processes());
+        Log.i("AtlTest", "features: " + features());
         Log.i("AtlTest", "signatures: " + signatures());
         Log.i("AtlTest", "priority: " + priority());
         mediaPlayerService();
@@ -303,6 +305,76 @@ public class Main extends Activity {
                     + " immutable=" + fixed.isImmutable() + " broadcast=" + fixed.isBroadcast() + " mutable=" + !open.isImmutable();
         } catch (Throwable t) {
             return "threw " + t;
+        }
+    }
+
+    /**
+     * The features line (app.rs FEATURES): "landscape=<bool> touchscreen=<bool> aep=<bool> gl-aep=<bool|threw ...> listed=<bool> gles=<hex> config=<hex>": hasSystemFeature for an always-present,
+     * an absent and a probed feature; what this process's own ES 3 context lists (gl-aep); whether getSystemAvailableFeatures holds the always-present one, its GL ES entry (the one without a name)
+     * and the configuration's reqGlEsVersion; else what it threw.
+     */
+    private String features() {
+        try {
+            android.content.pm.PackageManager pm = getPackageManager();
+            String landscape = android.content.pm.PackageManager.FEATURE_SCREEN_LANDSCAPE;
+            boolean listed = false;
+            int gles = -1;
+            for (android.content.pm.FeatureInfo f : pm.getSystemAvailableFeatures()) {
+                if (f.name == null) {
+                    gles = f.reqGlEsVersion;
+                } else if (f.name.equals(landscape)) {
+                    listed = true;
+                }
+            }
+            android.app.ActivityManager am = (android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE);
+            String glAep;
+            try {
+                glAep = String.valueOf(glHasAep());
+            } catch (Throwable t) {
+                glAep = "threw " + t;
+            }
+            return "landscape=" + pm.hasSystemFeature(landscape)
+                    + " touchscreen=" + pm.hasSystemFeature(android.content.pm.PackageManager.FEATURE_TOUCHSCREEN)
+                    + " aep=" + pm.hasSystemFeature(android.content.pm.PackageManager.FEATURE_OPENGLES_EXTENSION_PACK)
+                    + " gl-aep=" + glAep + " listed=" + listed + " gles=0x" + Integer.toHexString(gles)
+                    + " config=0x" + Integer.toHexString(am.getDeviceConfigurationInfo().reqGlEsVersion);
+        } catch (Throwable t) {
+            return "threw " + t;
+        }
+    }
+
+    /** The extension whose presence a device declares as FEATURE_OPENGLES_EXTENSION_PACK (CDD 7.1.4.1). */
+    private static final String AEP_EXTENSION = "GL_ANDROID_extension_pack_es31a";
+
+    /** Whether an ES 3 context made here (1x1 pbuffer, as a game makes its first context) lists AEP_EXTENSION in GL_EXTENSIONS. */
+    private static boolean glHasAep() {
+        android.opengl.EGLDisplay d = android.opengl.EGL14.eglGetDisplay(android.opengl.EGL14.EGL_DEFAULT_DISPLAY);
+        int[] version = new int[2];
+        if (!android.opengl.EGL14.eglInitialize(d, version, 0, version, 1)) {
+            throw new IllegalStateException("eglInitialize " + android.opengl.EGL14.eglGetError());
+        }
+        int[] attribs = {android.opengl.EGL14.EGL_RENDERABLE_TYPE, android.opengl.EGLExt.EGL_OPENGL_ES3_BIT_KHR,
+                android.opengl.EGL14.EGL_SURFACE_TYPE, android.opengl.EGL14.EGL_PBUFFER_BIT, android.opengl.EGL14.EGL_NONE};
+        android.opengl.EGLConfig[] config = new android.opengl.EGLConfig[1];
+        int[] n = new int[1];
+        if (!android.opengl.EGL14.eglChooseConfig(d, attribs, 0, config, 0, 1, n, 0) || n[0] == 0) {
+            throw new IllegalStateException("no ES 3 pbuffer config");
+        }
+        android.opengl.EGLContext ctx = android.opengl.EGL14.eglCreateContext(d, config[0], android.opengl.EGL14.EGL_NO_CONTEXT,
+                new int[] {android.opengl.EGL14.EGL_CONTEXT_CLIENT_VERSION, 3, android.opengl.EGL14.EGL_NONE}, 0);
+        android.opengl.EGLSurface s = android.opengl.EGL14.eglCreatePbufferSurface(d, config[0],
+                new int[] {android.opengl.EGL14.EGL_WIDTH, 1, android.opengl.EGL14.EGL_HEIGHT, 1, android.opengl.EGL14.EGL_NONE}, 0);
+        if (ctx == android.opengl.EGL14.EGL_NO_CONTEXT || s == android.opengl.EGL14.EGL_NO_SURFACE
+                || !android.opengl.EGL14.eglMakeCurrent(d, s, s, ctx)) {
+            throw new IllegalStateException("ES 3 context " + android.opengl.EGL14.eglGetError());
+        }
+        try {
+            String ext = android.opengl.GLES20.glGetString(android.opengl.GLES20.GL_EXTENSIONS);
+            return ext != null && java.util.Arrays.asList(ext.split(" ")).contains(AEP_EXTENSION);
+        } finally {
+            android.opengl.EGL14.eglMakeCurrent(d, android.opengl.EGL14.EGL_NO_SURFACE, android.opengl.EGL14.EGL_NO_SURFACE, android.opengl.EGL14.EGL_NO_CONTEXT);
+            android.opengl.EGL14.eglDestroySurface(d, s);
+            android.opengl.EGL14.eglDestroyContext(d, ctx);
         }
     }
 

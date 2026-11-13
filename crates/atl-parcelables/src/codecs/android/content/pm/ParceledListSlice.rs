@@ -7,6 +7,7 @@
 
 use std::io::Write;
 
+use super::FeatureInfo::FeatureInfo;
 use super::InstrumentationInfo::InstrumentationInfo;
 use crate::codecs::android::app::NotificationChannel::NotificationChannel;
 use crate::parcel::*;
@@ -70,6 +71,8 @@ macro_rules! elements {
 elements! {
     // IPackageManager.queryInstrumentationAsUser's reply
     InstrumentationInfo => "android.content.pm.InstrumentationInfo",
+    // IPackageManager.getSystemAvailableFeatures' reply
+    FeatureInfo => "android.content.pm.FeatureInfo",
     // INotificationManager.createNotificationChannels / getNotificationChannels
     NotificationChannel => "android.app.NotificationChannel",
 }
