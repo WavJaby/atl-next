@@ -199,7 +199,11 @@ fn pcm_verdicts(rec: &Recording) -> bool {
     );
     for (i, (name, hz, want)) in [
         ("static", STATIC_TONE_HZ, TONE_FRAMES * rate / TONE_RATE_HZ),
-        ("stream", STREAM_TONE_HZ, STREAM_FRAMES * rate / STREAM_RATE_HZ),
+        (
+            "stream",
+            STREAM_TONE_HZ,
+            STREAM_FRAMES * rate / STREAM_RATE_HZ,
+        ),
     ]
     .into_iter()
     .enumerate()
