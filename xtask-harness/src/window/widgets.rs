@@ -5,6 +5,7 @@
 //! header (the press reached the client, no touch reached Android), click, focus, window (the second activity the focus starts and finishes leaves input on Main), hover, wheel, swipe (fake finger + fling), list (the drag), readback (the last picture is the fixture's final frame and differs from the first),
 //! presents (more than 2 scenes), cadence (the frame callbacks while the list redraws, as the frames stage),
 //! idle (no fixture frame callback over IDLE_WINDOW after the settle), resume (the tap after the idle window draws a frame callback).
+//! Stage `mouse-touch` (window.rs `Stage::MouseTouch`) runs this fixture with `with_mouse_touch()` and one mouse drag on the list: [`drive_mouse_touch`], judged by [`mouse_touch_checks`].
 //! What `idle` proves: the app requests no frame while nothing is injected. It does not observe the composer's clock: the composer logs nothing while it is parked, so whether the clock parks is not directly observed here.
 
 use std::path::Path;
@@ -1042,6 +1043,126 @@ pub fn drive(
     })
 }
 
+/// The mouse-touch stage's probe (window.rs `Stage::MouseTouch`): after the first present, one mouse drag on the list (press, DRAG_PX up in SCROLL_STEPS motions, release).
+/// With the desktop adaptation on, the press is a finger ([`mouse_touch_check`] judges the touches); the drive only waits for the list's scroll and for that check, so a miss is the check's to report.
+pub fn drive_mouse_touch(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
+    await_event(&proxy.events, ACK_WAIT, |e| {
+        matches!(e, ProxyEvent::Acked { .. })
+    })
+    .ok_or("the window never acked a configure")?;
+    wait_for_line(app_log, SOFTWARE_LINE, ACK_WAIT)
+        .then_some(())
+        .ok_or("the fixture never logged its software frame")?;
+    wait_for_line(app_log, CONTENT_ORIGIN_LINE, ACK_WAIT)
+        .then_some(())
+        .ok_or("the window never presented")?;
+    let text = std::fs::read_to_string(app_log).map_err(|e| e.to_string())?;
+    let (ox, oy) = content_origin(&text)?;
+    let r = widget(&text, "list")?;
+    let (x, y) = (
+        (r.left + r.width / 2) as f64 + f64::from(ox),
+        (r.top + r.height / 2) as f64 + f64::from(oy),
+    );
+    let drag_from = text.len();
+    let mut drag = vec![PointerAction::Enter { x, y }, press(true)];
+    for step in 1..=SCROLL_STEPS {
+        drag.push(PointerAction::Motion {
+            x,
+            y: y - DRAG_PX * f64::from(step) / f64::from(SCROLL_STEPS),
+        });
+    }
+    drag.push(press(false));
+    inject(&proxy, drag)?;
+    wait_until(app_log, LINE_WAIT, |t| {
+        t.get(drag_from..)
+            .is_some_and(|after| after.contains("AtlWindow: list first="))
+    });
+    wait_until(app_log, LINE_WAIT, |t| mouse_touch_check(t).is_ok());
+    Ok(Liveness {
+        answered: false,
+        silent: false,
+        resumed_ms: None,
+        configured: Vec::new(),
+        idle: None,
+        minimized: false,
+    })
+}
+
+/// The mouse drag on the list with the adaptation on: one finger from the touchscreen, AOSP InputDevice.SOURCE_TOUCHSCREEN (source 4098 = 0x1002) on TOUCHSCREEN_DEVICE, as DOWN(0) 1 pointer, MOVE(2)s, UP(1) 1 pointer.
+/// No mouse press reaches the app (source 8194 = AOSP SOURCE_MOUSE 0x2002), no hover enters with the finger (as [`touch_check`]), and the list scrolls after the DOWN.
+fn mouse_touch_check(app: &str) -> Result<String, String> {
+    let lines: Vec<&str> = app.lines().collect();
+    let from_screen = |l: &str| touch_field(l, "source") == Some(SOURCE_TOUCHSCREEN);
+    let first = lines
+        .iter()
+        .position(|l| from_screen(l))
+        .ok_or("no touchscreen event: the drag reached the app as a mouse")?;
+    let last = lines.iter().rposition(|l| from_screen(l)).unwrap_or(first);
+    if let Some(l) = lines
+        .iter()
+        .find(|l| touch(l).is_some() && touch_field(l, "source") == Some(SOURCE_MOUSE))
+    {
+        return Err(format!("a mouse press reached the app: {l}"));
+    }
+    // the crossing reaches the app before the finger's DOWN: look from the line before it
+    if let Some(l) = lines[first.saturating_sub(1)..=last]
+        .iter()
+        .find(|l| generic(l) == Some(ACTION_HOVER_ENTER))
+    {
+        return Err(format!("a mouse hover entered with the finger: {l}"));
+    }
+    let mut seq: Vec<(i64, i64)> = Vec::new();
+    for l in lines[first..].iter().filter(|l| from_screen(l)) {
+        if touch_field(l, "device") != Some(TOUCHSCREEN_DEVICE) {
+            return Err(format!("a touchscreen event from another device: {l}"));
+        }
+        let (action, _) = touch(l).ok_or("unparsed touch line")?;
+        let step = (i64::from(action), touch_field(l, "pointers").unwrap_or(0));
+        // repeated MOVEs are one step
+        if seq.last() != Some(&step) {
+            seq.push(step);
+        }
+    }
+    let want = [
+        (i64::from(ACTION_DOWN), 1),
+        (i64::from(ACTION_MOVE), 1),
+        (i64::from(ACTION_UP), 1),
+    ];
+    if seq != want {
+        return Err(format!(
+            "touchscreen (action, pointers) {seq:?}, want {want:?}"
+        ));
+    }
+    let before = position_before(&lines, first);
+    let after = lines[first..]
+        .iter()
+        .filter_map(|l| list_position(l))
+        .max()
+        .unwrap_or(before);
+    if after <= before {
+        return Err(format!(
+            "the drag did not scroll the list: position {before} -> {after}"
+        ));
+    }
+    Ok(format!(
+        "the drag reached the touchscreen as one finger (source {SOURCE_TOUCHSCREEN}, device {TOUCHSCREEN_DEVICE}) {seq:?}; list position {before} -> {after}"
+    ))
+}
+
+/// The mouse-touch stage's sub-gates: the probe's drive (every injection got its answer) and the drag's touches.
+pub fn mouse_touch_checks(app: &str, probe: &Result<Liveness, String>) -> Vec<Sub> {
+    vec![
+        (
+            "probe",
+            probe
+                .as_ref()
+                .map(|_| "every injection got its answer".to_owned())
+                .map_err(Clone::clone),
+        ),
+        ("mouse-touch", mouse_touch_check(app)),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1191,5 +1312,94 @@ mod tests {
         assert!(readback_check(&pictures(aa, bb), &app(bb)).is_ok());
         assert!(readback_check(&pictures(aa, cc), &app(bb)).is_err());
         assert!(readback_check(&pictures(bb, bb), &app(bb)).is_err());
+    }
+
+    /// A fixture `touch` line (Main.java's format), class 0, `pointers` down, from `source` on `device`.
+    fn touch_at(action: u32, source: i64, pointers: u32, device: i64) -> String {
+        format!(
+            "AtlWindow: touch action={action} x=1.0 y=2.0 class=0 source={source} pointers={pointers} device={device}\n"
+        )
+    }
+
+    /// One finger from the touchscreen, DOWN, MOVEs, UP, the list moving after the DOWN; the mouse's own drag and a hover are refused.
+    #[test]
+    fn mouse_touch_check_wants_one_finger_from_the_touchscreen() {
+        // AOSP InputDevice: SOURCE_CLASS_POINTER 0x2 | the touchscreen bit 0x1000 = 4098; | the mouse bit 0x2000 = 8194
+        assert_eq!(SOURCE_TOUCHSCREEN, 4098);
+        assert_eq!(SOURCE_MOUSE, 8194);
+        let pos = |first: u32, top: i32| format!("AtlWindow: list first={first} top={top}\n");
+        let finger = |action: u32| touch_at(action, 4098, 1, TOUCHSCREEN_DEVICE);
+        let drag = [
+            pos(0, 0),
+            finger(0),
+            finger(2),
+            finger(2),
+            finger(1),
+            pos(2, -10),
+        ]
+        .concat();
+        assert!(mouse_touch_check(&drag).is_ok());
+        // a mouse press left in the log: the button was not made a finger
+        assert!(mouse_touch_check(&[drag.clone(), touch_at(0, 8194, 1, 1)].concat()).is_err());
+        // the adaptation off: the same gesture is the mouse's, and no touchscreen event exists
+        let mouse_drag = [
+            pos(0, 0),
+            touch_at(0, 8194, 1, 1),
+            touch_at(2, 8194, 1, 1),
+            pos(2, -10),
+            touch_at(1, 8194, 1, 1),
+        ]
+        .concat();
+        assert!(mouse_touch_check(&mouse_drag).is_err());
+        // a second pointer, a touch from another device, a hover entering with the finger, a list that stays put
+        let two = [
+            pos(0, 0),
+            finger(0),
+            touch_at(5, 4098, 2, TOUCHSCREEN_DEVICE),
+            finger(2),
+            finger(1),
+            pos(2, -10),
+        ]
+        .concat();
+        assert!(mouse_touch_check(&two).is_err());
+        let other = [
+            pos(0, 0),
+            finger(0),
+            touch_at(2, 4098, 1, 1),
+            finger(1),
+            pos(2, -10),
+        ]
+        .concat();
+        assert!(mouse_touch_check(&other).is_err());
+        let hover = "AtlWindow: generic action=9 vscroll=0.0 x=1.0 y=2.0\n".to_owned();
+        let hovered = [
+            pos(0, 0),
+            hover,
+            finger(0),
+            finger(2),
+            finger(1),
+            pos(2, -10),
+        ]
+        .concat();
+        assert!(mouse_touch_check(&hovered).is_err());
+        assert!(mouse_touch_check(&[pos(0, 0), finger(0), finger(2), finger(1)].concat()).is_err());
+    }
+
+    /// The existing list row keeps the mouse's drag: source 8194; a touchscreen drag (source 4098) is not that row's drag.
+    #[test]
+    fn list_check_wants_the_mouse_drag() {
+        let pos = |first: u32, top: i32| format!("AtlWindow: list first={first} top={top}\n");
+        let drag = |source: i64| {
+            [
+                pos(0, 0),
+                touch_at(0, source, 1, 1),
+                touch_at(2, source, 1, 1),
+                pos(2, -10),
+                touch_at(1, source, 1, 1),
+            ]
+            .concat()
+        };
+        assert!(list_check(&drag(8194)).is_ok());
+        assert!(list_check(&drag(4098)).is_err());
     }
 }

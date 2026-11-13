@@ -112,6 +112,9 @@ pub struct Args {
     /// Stage widgets only: the back press is BTN_LEFT, so no back key comes and the mouse-buttons sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     break_mouse_back: bool,
+    /// Stage mouse-touch only: the desktop adaptation is off (no `with_mouse_touch()`, so atld `--mouse-touch false`), the drag stays the mouse's (source 8194) and the mouse-touch sub-gate must fail (the gate's deliberate break).
+    #[arg(long)]
+    break_mouse_touch: bool,
     /// Stage dialog only: the services send no requestFinish on an unhandled Back (atld `--no-back-finish`), so the back sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     break_back_finish: bool,
@@ -151,6 +154,8 @@ enum Stage {
     Gtk,
     /// The widget fixture in UI mode: layout, the text in the readback, a tap on the button, focus, a list drag, presents and cadence (xtask-harness/src/window/widgets.rs).
     Widgets,
+    /// The widget fixture with the desktop's mouse-as-one-finger adaptation on (`with_mouse_touch()`, atld `--mouse-touch true`): one mouse drag on the list reaches the app as a touchscreen drag (source 4098), not the mouse's 8194 (xtask-harness/src/window/widgets.rs `drive_mouse_touch`).
+    MouseTouch,
     /// The widget fixture in UI mode with a fake desktop input method: the EditText's focus binds the in-app input method, and the IME's preedit, commit and delete reach the EditText (xtask-harness/src/window/ime.rs).
     Ime,
     /// Resume in UI mode, then the probe configures the window larger, then smaller ([`drive_resize`]); the sub-gates follow each size ([`resize_checks`]).
@@ -191,6 +196,7 @@ impl Stage {
             Stage::Input => "input",
             Stage::Gtk => "gtk",
             Stage::Widgets => "widgets",
+            Stage::MouseTouch => "mouse-touch",
             Stage::Ime => "ime",
             Stage::Resize => "resize",
             Stage::Relaunch => "relaunch",
@@ -223,7 +229,7 @@ impl Stage {
             | Stage::AppId => GTK_WINDOW_MS,
             Stage::Dialog => DIALOG_WINDOW_MS,
             Stage::Capture => capture::CAPTURE_WINDOW_MS,
-            Stage::Widgets | Stage::Ime => WIDGETS_WINDOW_MS,
+            Stage::Widgets | Stage::Ime | Stage::MouseTouch => WIDGETS_WINDOW_MS,
             Stage::Resize
             | Stage::Relaunch
             | Stage::Declared
@@ -376,7 +382,8 @@ fn marker(stage: Stage) -> &'static str {
         | Stage::StartFinish
         | Stage::Move
         | Stage::UiBlock
-        | Stage::Suspended => "AtlWindow: onResume reached",
+        | Stage::Suspended
+        | Stage::MouseTouch => "AtlWindow: onResume reached",
         Stage::SurfaceView => surface_view::MARKER,
         Stage::Dialog => dialog::MARKER,
         Stage::Gles2 => gles2::MARKER,
@@ -1799,7 +1806,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         | Stage::UiBlock
         | Stage::Dialog
         | Stage::Gles2
-        | Stage::Suspended => {
+        | Stage::Suspended
+        | Stage::MouseTouch => {
             // a hold has no proxy: the compositor sees the window alone, so its border and size are the owner's drags
             if args.hold.is_some() {
                 rt.with_ui("gtk")
@@ -1810,7 +1818,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                     ..GATE_OUTPUT
                 });
                 let outputs: &[Output] = match args.stage {
-                    Stage::Widgets | Stage::Ime => &[widgets::OUTPUT],
+                    Stage::Widgets | Stage::Ime | Stage::MouseTouch => &[widgets::OUTPUT],
                     Stage::SurfaceView => &[surface_view::OUTPUT],
                     Stage::Move => &move_output::OUTPUTS,
                     _ => std::slice::from_ref(&gate),
@@ -1885,6 +1893,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         rt
     };
+    // the desktop's mouse-as-one-finger adaptation (atld `--mouse-touch`): this stage's drag is a touchscreen's; its break is the adaptation off, the AOSP mouse
+    let rt = if matches!(args.stage, Stage::MouseTouch) && !args.break_mouse_touch {
+        rt.with_mouse_touch()
+    } else {
+        rt
+    };
     let outputs = nested.as_ref().map(NestedCompositor::control);
     // the move stage's second output, as Android's display
     let moved = nested
@@ -1892,7 +1906,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .filter(|_| matches!(args.stage, Stage::Move))
         .map(|n| n.output_display(1));
     let fixture = match args.stage {
-        Stage::Widgets | Stage::Ime => widgets::FIXTURE,
+        Stage::Widgets | Stage::Ime | Stage::MouseTouch => widgets::FIXTURE,
         Stage::Relaunch => SIZED_FIXTURE,
         Stage::Declared => DECLARED_FIXTURE,
         Stage::StartFinish => START_FIXTURE,
@@ -2003,6 +2017,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 None => Err("no capture probe".to_owned()),
             },
             (Stage::UiBlock, _, _) => ui_block::drive(p, &log),
+            (Stage::MouseTouch, _, _) => widgets::drive_mouse_touch(p, &log),
             (Stage::Dialog, _, _) => match &capture_probe {
                 Some(capture_probe) => dialog::drive(p, &log, capture_probe),
                 None => Err("no capture probe".to_owned()),
@@ -2095,6 +2110,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         ],
         (Stage::SurfaceView, Some(_)) => surface_view::checks(&app, &liveness, &captured),
         (Stage::UiBlock, Some(_)) => ui_block::checks(&app),
+        (Stage::MouseTouch, Some(_)) => widgets::mouse_touch_checks(&app, &liveness),
         (Stage::Dialog, Some(_)) => {
             dialog::checks(&app, &services, &liveness, &captured, ended.is_some())
         }
