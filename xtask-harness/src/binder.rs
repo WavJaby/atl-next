@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::installer::{new_records, seccomp_records};
 use crate::stage_env::lib_env;
 use anyhow::{Context, Result, ensure};
 use atl_broker::{Broker, Mount, Process, Spawn, to_log};
@@ -28,6 +29,10 @@ pub struct Args {
 /// Android uids (system/core/libcutils/include/private/android_filesystem_config.h): AID_SYSTEM, AID_SHELL.
 const AID_SYSTEM: u32 = 1000;
 const AID_SHELL: u32 = 2000;
+/// AID_APP_START (android_filesystem_config.h): the first application uid; the sweep client runs as one.
+const AID_APP: u32 = 10000;
+/// Longest the sweep client may take: each direction's grid, a bisection of about 20 probes of up to 1 MiB each, and the rows around each limit.
+const SWEEP_LIMIT: Duration = Duration::from_secs(300);
 /// The name servicemanager registers itself under (cmds/servicemanager/main.cpp `addService("manager", ...)`).
 const MANAGER: &str = "manager";
 /// A name nothing registers, shaped as an AIDL HAL instance (`<package>.<Interface>/<instance>`) so servicemanager's miss path consults the VINTF manifests (ServiceManager.cpp `isVintfDeclared` via `NativeName::fill` / AIDL instance names): without them it logs `NULL VINTF MANIFEST`.
@@ -303,6 +308,53 @@ pub(crate) fn fresh_layout_with(root: &Path, vendor_hals: &str) -> Result<()> {
     layout(root, vendor_hals)
 }
 
+/// Stage `sweep`: transactions of every size up to libbinder's limit, in both directions and oneway, through binderd (`atl-binder-sweep`, crate atl-services). The server is uid 1000 (it registers `atl.sweep`); the client an app uid.
+/// Fails when the client fails, binderd ended, or dmesg gained a seccomp record naming atl-binderd: kill mode, so the record names the call the list lacks.
+fn sweep_stage(
+    b: &Broker,
+    out: &Path,
+    env: &[(String, String)],
+    test_root: &Path,
+    binderd: &mut Process,
+) -> Result<Vec<String>> {
+    let bin = out.join("cargo-converter/release/atl-binder-sweep");
+    let mut server = Command::new(&bin);
+    server.envs(env.iter().cloned()).arg("server");
+    let mut client = Command::new(&bin);
+    client.envs(env.iter().cloned()).arg("client");
+    let before = seccomp_records();
+    let mut srv = spawn_logged(b, &server, AID_SYSTEM, &test_root.join("sweep-server.log"))?;
+    let log = test_root.join("sweep-client.log");
+    let mut cli = spawn_logged(b, &client, AID_APP, &log)?;
+    let status = wait_limited(&mut cli.child, SWEEP_LIMIT)?;
+    let _ = srv.child.kill();
+    let _ = srv.child.wait();
+    let text = std::fs::read_to_string(&log)?;
+    print!("{text}");
+    let mut fails = Vec::new();
+    match status {
+        Some(s) if s.success() => {}
+        Some(s) => fails.push(format!(
+            "sweep client exited {s}: {}",
+            text.lines().last().unwrap_or_default()
+        )),
+        None => fails.push(format!(
+            "sweep client did not finish within {SWEEP_LIMIT:?}"
+        )),
+    }
+    if let Some(s) = binderd.child.try_wait()? {
+        fails.push(format!("atl-binderd ended during the sweep: {s}"));
+    }
+    for r in new_records(before, seccomp_records())
+        .iter()
+        .filter(|r| r.contains("comm=\"atl-binderd\""))
+    {
+        println!("sweep: {r}");
+        fails.push(format!("seccomp killed atl-binderd: {r}"));
+    }
+    Ok(fails)
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let out = crate::build_state::gate_out(root, args.out.as_deref(), &args.host, "binder")?;
     let device = out.join("device");
@@ -333,6 +385,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let absent = self::service(&b, &service, &env, &["check", ABSENT], &log("absent"))?;
     let services_fails =
         crate::services::stage(root, &out, &args.host, &b, &env, &service, &test_root)?;
+    let sweep_fails = sweep_stage(&b, &out, &env, &test_root, &mut binderd)?;
 
     let _ = sm.child.kill();
     sm.child.wait()?;
@@ -346,6 +399,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     let mut fails = verdict(&list, &found, &absent, &counters);
     fails.extend(services_fails);
+    fails.extend(sweep_fails);
     match bstatus {
         Some(s) if s.success() => {}
         Some(s) => fails.push(format!("atl-binderd exited {s}")),

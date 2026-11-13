@@ -48,6 +48,12 @@ name = "atl-screencap"
 path = "src/bin/screencap.rs"
 required-features = ["converter"]
 
+# Test-only server and client of `xtask test binder` (stage `sweep`): transactions of every size up to libbinder's limit, both directions and oneway, through binderd.
+[[bin]]
+name = "atl-binder-sweep"
+path = "src/bin/binder_sweep.rs"
+required-features = ["converter"]
+
 [dependencies]
 anyhow.workspace = true
 atl-aidl = { path = "../atl-aidl" }

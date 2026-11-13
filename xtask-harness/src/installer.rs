@@ -972,7 +972,7 @@ impl Gate<'_> {
 }
 
 /// The seccomp audit records dmesg holds now (`type=1326`, one per call the filter denies: kill mode ends the process too). None when dmesg cannot be read: the count is then not judged.
-fn seccomp_records() -> Option<Vec<String>> {
+pub(crate) fn seccomp_records() -> Option<Vec<String>> {
     let out = Command::new("dmesg").output().ok()?;
     out.status.success().then(|| {
         String::from_utf8_lossy(&out.stdout)
@@ -984,7 +984,7 @@ fn seccomp_records() -> Option<Vec<String>> {
 }
 
 /// The records dmesg gained between two `seccomp_records` reads (dmesg only appends; a read that lost its start yields none).
-fn new_records(before: Option<Vec<String>>, after: Option<Vec<String>>) -> Vec<String> {
+pub(crate) fn new_records(before: Option<Vec<String>>, after: Option<Vec<String>>) -> Vec<String> {
     match (before, after) {
         (Some(b), Some(a)) => a.get(b.len()..).unwrap_or_default().to_vec(),
         _ => Vec::new(),
