@@ -8,13 +8,13 @@ use atl_parcelables::android::content::pm::{
     ServiceInfo,
 };
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::Mutex;
 
 use atl_parcelables::parts::{ComponentInfo, ParsedIntentInfo};
 use atl_services_types::gl_driver::GlDriver;
 use atl_services_types::installer_output::Kind;
-use atl_services_types::packages::{Library, LibraryNode, used_libraries};
-use atl_services_types::permission;
+use atl_services_types::packages::{Library, LibraryNode, PermissionDecl, used_libraries};
+use atl_services_types::permission::{self, PermissionState};
 
 use crate::activity_start::Declared;
 use crate::desktop_bounds::{ActivityInput, ActivityOrientation};
@@ -36,8 +36,6 @@ pub struct PackageRecord {
     pub uid: u32,
     /// The instruction set the process runs (arches.toml row key): primaryCpuAbi's, else the device's first (InstructionSets.getPrimaryInstructionSet); zygote's `--instruction-set`.
     pub instruction_set: String,
-    /// The install-time grants (permission::install_grants): what checkPermission answers GRANTED for this uid.
-    pub granted_permissions: Vec<String>,
     pub gl_driver: GlDriver,
 }
 
@@ -209,20 +207,152 @@ impl Packages {
     }
 }
 
-/// The permission state every service consults: the install-time grants of the installed packages, by uid (a shared uid's packages pool their grants, as PMS's shared user does).
+/// Why grantRuntimePermission refuses (PermissionManagerServiceImpl.grantRuntimePermissionInternal): `UnknownPermission` is its IllegalArgumentException, the other two its SecurityExceptions.
+/// The messages are AOSP's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantError {
+    UnknownPermission(String),
+    NotChangeable { permission: String, package: String },
+    NotRequested { permission: String, package: String },
+}
+
+impl std::fmt::Display for GrantError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GrantError::UnknownPermission(p) => write!(f, "Unknown permission: {p}"),
+            GrantError::NotChangeable {
+                permission,
+                package,
+            } => write!(
+                f,
+                "Permission {permission} requested by {package} is not a changeable permission type"
+            ),
+            GrantError::NotRequested {
+                permission,
+                package,
+            } => write!(
+                f,
+                "Package {package} has not requested permission {permission}"
+            ),
+        }
+    }
+}
+
+/// The permission state every service consults (PermissionManagerServiceImpl's registry + UidPermissionState): the registry of definitions, and each app id's permission states, first
+/// `permission::initial_states` of its packages (a shared uid's packages pool theirs, as PMS's shared user does), then changed by runtime grants. One user (0); not persisted (plan S6).
 pub struct Permissions {
-    packages: Arc<Packages>,
+    registry: permission::Registry,
+    /// app id -> its permission states, by name
+    states: Mutex<BTreeMap<u32, BTreeMap<String, PermissionState>>>,
 }
 
 impl Permissions {
-    pub fn new(packages: Arc<Packages>) -> Self {
-        Permissions { packages }
+    /// `platform` = framework-res's `<permission>` definitions, registered before every package's.
+    pub fn new(packages: &Packages, platform: &[PermissionDecl]) -> Self {
+        let registry = permission::registry(
+            platform
+                .iter()
+                .map(|d| {
+                    (
+                        permission::PLATFORM_PACKAGE,
+                        d.name.as_str(),
+                        d.protection_level,
+                    )
+                })
+                .chain(packages.all().iter().flat_map(|o| {
+                    o.permission_decls().filter_map(move |d| {
+                        Some((o.name(), d.item.name.as_deref()?, d.protection_level as u32))
+                    })
+                })),
+        );
+        let mut states: BTreeMap<u32, BTreeMap<String, PermissionState>> = BTreeMap::new();
+        for p in packages.all() {
+            let uid_states = states.entry(permission::app_id(p.uid)).or_default();
+            for s in permission::initial_states(
+                p.name(),
+                p.app().target_sdk_version,
+                p.requested_permissions(),
+                &registry,
+            ) {
+                uid_states.entry(s.name.clone()).or_insert(s);
+            }
+        }
+        Permissions {
+            registry,
+            states: Mutex::new(states),
+        }
     }
 
-    fn granted(&self, uid: u32, p: &str) -> bool {
-        self.packages
-            .by_app_id(permission::app_id(uid))
-            .any(|r| r.granted_permissions.iter().any(|g| g == p))
+    fn states(
+        &self,
+    ) -> std::sync::MutexGuard<'_, BTreeMap<u32, BTreeMap<String, PermissionState>>> {
+        self.states.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn state(&self, uid: u32, p: &str) -> Option<PermissionState> {
+        self.states()
+            .get(&permission::app_id(uid))
+            .and_then(|s| s.get(p))
+            .cloned()
+    }
+
+    /// UidPermissionState.isPermissionGranted for `uid`'s app id.
+    pub fn granted(&self, uid: u32, p: &str) -> bool {
+        self.state(uid, p).is_some_and(|s| s.granted)
+    }
+
+    /// The names `uid` holds now (the broker's sandbox rights read them at process start).
+    pub fn granted_names(&self, uid: u32) -> Vec<String> {
+        self.states()
+            .get(&permission::app_id(uid))
+            .map(|s| {
+                s.values()
+                    .filter(|s| s.granted)
+                    .map(|s| s.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// UidPermissionState.getPermissionFlags: 0 for a permission without state.
+    pub fn flags(&self, uid: u32, p: &str) -> u32 {
+        self.state(uid, p).map_or(0, |s| s.flags)
+    }
+
+    /// grantRuntimePermissionInternal after the caller and package checks: the permission must be defined and runtime (role and development permissions are not modelled) and requested by
+    /// `package` (or already in its uid's state); a legacy app's runtime permission is left as it is (granted, with its review flag), as AOSP returns early for targetSdk < M.
+    pub fn grant_runtime(&self, package: &PackageRecord, p: &str) -> Result<(), GrantError> {
+        let definition = self
+            .registry
+            .get(p)
+            .ok_or_else(|| GrantError::UnknownPermission(p.to_owned()))?;
+        if !definition.is_runtime() {
+            return Err(GrantError::NotChangeable {
+                permission: p.to_owned(),
+                package: package.name().to_owned(),
+            });
+        }
+        let mut states = self.states();
+        let uid_states = states.entry(permission::app_id(package.uid)).or_default();
+        if !uid_states.contains_key(p) && !package.requested_permissions().any(|r| r == p) {
+            return Err(GrantError::NotRequested {
+                permission: p.to_owned(),
+                package: package.name().to_owned(),
+            });
+        }
+        if package.app().target_sdk_version < permission::TARGET_SDK_RUNTIME_PERMISSIONS {
+            return Ok(());
+        }
+        uid_states
+            .entry(p.to_owned())
+            .or_insert_with(|| PermissionState {
+                name: p.to_owned(),
+                runtime: true,
+                granted: false,
+                flags: 0,
+            })
+            .granted = true;
+        Ok(())
     }
 
     /// `permission::holds` against `uid`'s grants.
@@ -461,7 +591,6 @@ pub mod fixture {
             libraries: Vec::new(),
             uid: 10_001,
             instruction_set: "x86_64".to_owned(),
-            granted_permissions: Vec::new(),
             gl_driver: GlDriver::Native,
         }
     }
@@ -472,6 +601,67 @@ mod tests {
     use super::fixture::*;
     use super::*;
     use atl_parcelables::android::os::Bundle;
+    use std::sync::Arc;
+
+    const INTERNET: &str = "android.permission.INTERNET";
+    const POST_NOTIFICATIONS: &str = "android.permission.POST_NOTIFICATIONS";
+    const CAMERA: &str = "android.permission.CAMERA";
+
+    /// One package `org.x` with `target_sdk` requesting INTERNET and POST_NOTIFICATIONS (AB2's two platform ones of each kind), against framework-res's levels as aapt2 prints them (INTERNET normal 0x0,
+    /// POST_NOTIFICATIONS and CAMERA dangerous 0x1).
+    fn permissions(target_sdk: i32) -> (Permissions, PackageRecord) {
+        let mut r = record("org.x");
+        r.info.requested_permissions =
+            Some(vec![Some(INTERNET.into()), Some(POST_NOTIFICATIONS.into())]);
+        if let Some(a) = r.info.application_info.as_mut() {
+            a.target_sdk_version = target_sdk;
+        }
+        let platform =
+            [(INTERNET, 0x0), (POST_NOTIFICATIONS, 0x1), (CAMERA, 0x1)].map(|(name, level)| {
+                PermissionDecl {
+                    name: name.into(),
+                    protection_level: level,
+                }
+            });
+        let packages = Arc::new(Packages::new(vec![r.clone()], BTreeMap::new()));
+        (Permissions::new(&packages, &platform), r)
+    }
+
+    /// targetSdk >= M: the runtime permission starts denied and grantRuntimePermission grants it; the install permission is granted and not changeable; grantRuntimePermissionInternal's refusals
+    /// (unknown permission, not requested) keep the state as it was.
+    #[test]
+    fn runtime_permission_is_denied_until_granted() {
+        let (p, r) = permissions(36);
+        assert!(p.granted(r.uid, INTERNET));
+        assert!(!p.granted(r.uid, POST_NOTIFICATIONS));
+        assert_eq!(p.flags(r.uid, POST_NOTIFICATIONS), 0);
+        assert!(matches!(
+            p.grant_runtime(&r, INTERNET),
+            Err(GrantError::NotChangeable { .. })
+        ));
+        assert!(matches!(
+            p.grant_runtime(&r, "org.z.UNDEFINED"),
+            Err(GrantError::UnknownPermission(_))
+        ));
+        assert!(matches!(
+            p.grant_runtime(&r, CAMERA),
+            Err(GrantError::NotRequested { .. })
+        ));
+        assert!(!p.granted(r.uid, CAMERA));
+        assert_eq!(p.grant_runtime(&r, POST_NOTIFICATIONS), Ok(()));
+        assert!(p.granted(r.uid, POST_NOTIFICATIONS));
+        assert_eq!(p.granted_names(r.uid), [INTERNET, POST_NOTIFICATIONS]);
+    }
+
+    /// targetSdk < M: the platform runtime permission is granted at install with REVIEW_REQUIRED | REVOKED_COMPAT (0x40 | 0x8), and a grant leaves it so.
+    #[test]
+    fn legacy_runtime_permission_is_granted_for_review() {
+        let (p, r) = permissions(22);
+        assert!(p.granted(r.uid, POST_NOTIFICATIONS));
+        assert_eq!(p.flags(r.uid, POST_NOTIFICATIONS), 0x48);
+        assert_eq!(p.grant_runtime(&r, POST_NOTIFICATIONS), Ok(()));
+        assert_eq!(p.flags(r.uid, POST_NOTIFICATIONS), 0x48);
+    }
 
     const MAIN: &[&str] = &[ACTION_MAIN];
     const LAUNCHER: &[&str] = &[CATEGORY_LAUNCHER];

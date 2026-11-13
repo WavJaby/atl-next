@@ -852,7 +852,7 @@ impl Inner {
             entry_point: ACTIVITY_THREAD.to_owned(),
             args: vec![format!("{PROC_START_SEQ_IDENT}{start_seq}")],
             instruction_set: p.instruction_set.clone(),
-            rights: atl_broker::rights_of(p.granted_permissions.as_slice()),
+            rights: atl_broker::rights_of(self.permissions.granted_names(p.uid).as_slice()),
         })?;
         // the launch's Task exists before the process attaches: the composer asks for its bounds and package at its window's install (registry TASK_INFO)
         let task = p.launcher().filter(|_| launch_activity).map(|a| {
@@ -1052,7 +1052,7 @@ impl Inner {
         }
     }
 
-    /// checkPermission(permission, pid, uid) against the uid's install-time grants.
+    /// checkPermission(permission, pid, uid) against the uid's granted permission states.
     fn holds(&self, uid: u32, perm: &str) -> bool {
         self.permissions.check(uid, Some(perm))
     }
@@ -1213,7 +1213,7 @@ impl IActivityManager for ActivityManager {
         atl_services_wire::unimplemented(AM, method)
     }
 
-    /// ActivityManagerService.checkPermissionForDevice (:6193-6200) -> checkComponentPermission: the install-time grants of `uid`'s packages (permission::check, rule A); one device.
+    /// ActivityManagerService.checkPermissionForDevice (:6193-6200) -> checkComponentPermission: the granted permission states of `uid` (Permissions::check); one device.
     /// Was unimplemented, whose empty reply reads 0 = PERMISSION_GRANTED: every check passed.
     fn r#checkPermissionForDevice(
         &self,

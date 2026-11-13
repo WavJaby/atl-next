@@ -25,7 +25,7 @@ use atl_services::ui_agents::UiAgents;
 use atl_services_types::compositor_registry;
 use atl_services_types::display_model::DisplayModel;
 use atl_services_types::native_libs::SupportedAbi;
-use atl_services_types::packages::Library;
+use atl_services_types::packages::{Library, PermissionDecl};
 use binder::{BinderFeatures, ProcessState};
 use clap::Parser;
 
@@ -153,17 +153,17 @@ fn main() -> Result<()> {
     let config = install::Config {
         first_uid: a.first_uid,
         abis: a.abis.clone(),
-        platform_permissions: match &a.platform_permissions {
-            Some(p) => read_json(p)?,
-            None => Vec::new(),
-        },
         no_gl_selection: a.no_gl_selection,
     };
     let list: Vec<PackageRecord> = install::install(&control, &a.sessions, &config)?;
     let libraries: BTreeMap<String, Library> = a.shared_libraries.into_iter().collect();
     let packages = Arc::new(Packages::new(list, libraries));
-    // the install-time grants every service checks callers against (permission.rs, rule A)
-    let permissions = Arc::new(Permissions::new(Arc::clone(&packages)));
+    // the permission states every service checks callers against: framework-res's definitions first, then the packages' (permission::initial_states, then runtime grants)
+    let platform_permissions: Vec<PermissionDecl> = match &a.platform_permissions {
+        Some(p) => read_json(p)?,
+        None => Vec::new(),
+    };
+    let permissions = Arc::new(Permissions::new(&packages, &platform_permissions));
     ProcessState::start_thread_pool();
     // the UI agents the registry takes in REGISTER, read by the window service at each window's first relayout
     let agents = Arc::new(UiAgents::default());

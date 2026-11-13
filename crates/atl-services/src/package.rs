@@ -46,6 +46,8 @@ const GET_SERVICES: i64 = 0x4;
 const GET_PROVIDERS: i64 = 0x8;
 const GET_INSTRUMENTATION: i64 = 0x10;
 const GET_PERMISSIONS: i64 = 0x1000;
+/// PackageInfo.REQUESTED_PERMISSION_GRANTED (1 << 1).
+const REQUESTED_PERMISSION_GRANTED: i32 = 1 << 1;
 /// ActivityManagerService.STOCK_PM_FLAGS: GET_SHARED_LIBRARY_FILES, the flags AMS reads an app's ApplicationInfo with (bindApplication's, the launch's).
 pub const STOCK_PM_FLAGS: i64 = 0x400;
 
@@ -185,6 +187,34 @@ impl PackageManager {
         self.packages.visible(ThreadState::get_calling_uid(), name?)
     }
 
+    /// PackageInfoUtils.generate (services, :203-207): the parse's requestedPermissionsFlags (REQUIRED, NEVER_FOR_LOCATION, IMPLICIT) plus REQUESTED_PERMISSION_GRANTED for each one the uid
+    /// holds now; the installer's PackageInfoCommonUtils.generate has no permission state to set it from.
+    fn requested_flags(&self, p: &PackageRecord) -> Option<Vec<i32>> {
+        let names = p.info.requested_permissions.as_deref()?;
+        let parsed = p
+            .info
+            .requested_permissions_flags
+            .as_deref()
+            .unwrap_or_default();
+        Some(
+            names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    let held = name
+                        .as_deref()
+                        .is_some_and(|n| self.permissions.granted(p.uid, n));
+                    parsed.get(i).copied().unwrap_or(0)
+                        | if held {
+                            REQUESTED_PERMISSION_GRANTED
+                        } else {
+                            0
+                        }
+                })
+                .collect(),
+        )
+    }
+
     /// getPackageInfo after the visibility check (PackageInfoCommonUtils.generate over the stored info, cut to `flags`).
     fn package_info(&self, p: &PackageRecord, flags: i64) -> PackageInfo {
         let packages = &self.packages;
@@ -216,7 +246,7 @@ impl PackageManager {
                 None
             },
             requested_permissions_flags: if flags & GET_PERMISSIONS != 0 {
-                info.requested_permissions_flags.clone()
+                self.requested_flags(p)
             } else {
                 None
             },
@@ -549,6 +579,7 @@ mod tests {
     use crate::packages::MATCH_DISABLED_COMPONENTS;
     use crate::packages::fixture::*;
     use atl_parcelables::android::os::Bundle;
+    use atl_services_types::packages::PermissionDecl;
 
     /// One package: `<application>` meta-data `app.key`, activity `a.Native` with NativeActivity's `android.app.lib_name`, activity `a.Bare` with none, disabled activity `a.Off`.
     fn packages() -> Packages {
@@ -601,7 +632,7 @@ mod tests {
         let packages = Arc::new(packages());
         let pm = PackageManager::new(
             Arc::clone(&packages),
-            Arc::new(Permissions::new(Arc::clone(&packages))),
+            Arc::new(Permissions::new(&packages, &[])),
         );
         let p = packages.by_name("a").expect("a");
         assert!(pm.package_info(p, 0).activities.is_none());
@@ -618,6 +649,41 @@ mod tests {
         assert_eq!(
             names(GET_ACTIVITIES | MATCH_DISABLED_COMPONENTS),
             ["a.Native", "a.Bare", "a.Off"]
+        );
+    }
+
+    /// PackageInfoUtils.generate: the parse's REQUIRED (1, every uses-permission) plus GRANTED (2) for what the uid holds: INTERNET (normal 0x0) from install, POST_NOTIFICATIONS (dangerous 0x1)
+    /// only after grantRuntimePermission. Without GET_PERMISSIONS no flags at all.
+    #[test]
+    fn requested_flags_carry_the_live_grants() {
+        const INTERNET: &str = "android.permission.INTERNET";
+        const POST_NOTIFICATIONS: &str = "android.permission.POST_NOTIFICATIONS";
+        let mut r = record("g");
+        r.info.requested_permissions =
+            Some(vec![Some(INTERNET.into()), Some(POST_NOTIFICATIONS.into())]);
+        r.info.requested_permissions_flags = Some(vec![1, 1]);
+        let packages = Arc::new(Packages::new(vec![r], BTreeMap::new()));
+        let platform =
+            [(INTERNET, 0x0), (POST_NOTIFICATIONS, 0x1)].map(|(name, level)| PermissionDecl {
+                name: name.into(),
+                protection_level: level,
+            });
+        let permissions = Arc::new(Permissions::new(&packages, &platform));
+        let pm = PackageManager::new(Arc::clone(&packages), Arc::clone(&permissions));
+        let p = packages.by_name("g").expect("g");
+        assert_eq!(pm.package_info(p, 0).requested_permissions_flags, None);
+        assert_eq!(
+            pm.package_info(p, GET_PERMISSIONS)
+                .requested_permissions_flags,
+            Some(vec![3, 1])
+        );
+        permissions
+            .grant_runtime(p, POST_NOTIFICATIONS)
+            .expect("grant");
+        assert_eq!(
+            pm.package_info(p, GET_PERMISSIONS)
+                .requested_permissions_flags,
+            Some(vec![3, 3])
         );
     }
 

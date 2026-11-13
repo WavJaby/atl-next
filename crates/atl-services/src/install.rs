@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The services' install (owner option I, 2026-11-13): PackageManagerService's half. The host does the file work (atld: staging, the installer run, the rename, the data dirs; installd's role) over the
 //! control socket; here the installer's frames are decoded ([`crate::installed`]) into the package's record: PMS's per-install fields (uid, code and data paths) set on its PackageInfo, its instruction
-//! set from `primaryCpuAbi`, the GL driver from the owner table and the host's ES1 fact, and the install-time grants over every definition (PermissionManagerService).
+//! set from `primaryCpuAbi`, the GL driver from the owner table and the host's ES1 fact. Permission states are the PermissionManager's (`packages::Permissions`), made from these records.
 //! All or nothing: any session that fails (installer exit, decode, commit) fails the install, and no package is registered.
 
 use std::path::Path;
@@ -12,7 +12,6 @@ use atl_broker::control::StagedName;
 use atl_parcelables::android::content::pm::ApplicationInfo;
 use atl_services_types::gl_driver;
 use atl_services_types::native_libs::{SupportedAbi, instruction_set};
-use atl_services_types::packages::PermissionDecl;
 
 use crate::activity::log;
 use crate::packages::{InstallFields, PackageRecord};
@@ -24,8 +23,6 @@ pub struct Config {
     pub first_uid: u32,
     /// The device's ABIs, preferred first: primaryCpuAbi -> instruction set.
     pub abis: Vec<SupportedAbi>,
-    /// framework-res's `<permission>` definitions: the grant rule's platform half.
-    pub platform_permissions: Vec<PermissionDecl>,
     /// Test only: every package gets the native GL driver (the GL selection gate's break).
     pub no_gl_selection: bool,
 }
@@ -93,32 +90,8 @@ pub fn install(
             libraries: installed.libraries,
             uid,
             instruction_set: isa,
-            granted_permissions: Vec::new(),
             gl_driver,
         });
-    }
-    // install-time grants over every definition: the platform's first, then the packages' (permission::install_grants)
-    let grants: Vec<Vec<String>> = records
-        .iter()
-        .map(|p| {
-            let platform = c
-                .platform_permissions
-                .iter()
-                .map(|d| ("android", d.name.as_str(), d.protection_level));
-            let packages = records.iter().flat_map(|o| {
-                o.permission_decls().filter_map(move |d| {
-                    Some((o.name(), d.item.name.as_deref()?, d.protection_level as u32))
-                })
-            });
-            atl_services_types::permission::install_grants(
-                p.name(),
-                p.requested_permissions(),
-                platform.chain(packages),
-            )
-        })
-        .collect();
-    for (record, granted) in records.iter_mut().zip(grants) {
-        record.granted_permissions = granted;
     }
     Ok(records)
 }
