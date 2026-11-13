@@ -137,8 +137,8 @@ pub fn library_path_mounts(path: &OsStr) -> io::Result<Vec<Mount>> {
     Ok(mounts)
 }
 
-/// Whether `path` starts with the ELF magic.
-fn is_elf(path: &Path) -> bool {
+/// Whether `path` starts with the ELF magic. A `.so` under an app's `lib/` without it is data the app reads itself (Unity's `libil2cpp.usym.so`), not a library anything links.
+pub fn is_elf(path: &Path) -> bool {
     use std::io::Read;
     let mut magic = [0u8; 4];
     std::fs::File::open(path)
@@ -385,24 +385,34 @@ pub fn elf_closure(program: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// `path`'s PT_INTERP and DT_NEEDED names.
+/// `path`'s PT_INTERP and DT_NEEDED names; 32- and 64-bit ELF (an arm32 game's libraries are ELFCLASS32).
 pub fn elf_deps(path: &Path) -> io::Result<(Option<PathBuf>, Vec<String>)> {
-    use object::read::elf::{Dyn, ElfFile64, ProgramHeader};
     let data = std::fs::read(path)?;
-    let elf = ElfFile64::<object::Endianness>::parse(&*data)
-        .map_err(|e| other(format!("{}: {e}", path.display())))?;
+    // e_ident[EI_CLASS] (EI_CLASS = 4) is ELFCLASS32 = 1 or ELFCLASS64 = 2 (ELF spec, e_ident layout)
+    match data.get(4) {
+        Some(1) => elf_deps_of::<object::elf::FileHeader32<object::Endianness>>(path, &data),
+        _ => elf_deps_of::<object::elf::FileHeader64<object::Endianness>>(path, &data),
+    }
+}
+
+fn elf_deps_of<Elf: object::read::elf::FileHeader<Endian = object::Endianness>>(
+    path: &Path,
+    data: &[u8],
+) -> io::Result<(Option<PathBuf>, Vec<String>)> {
+    use object::read::elf::{Dyn, ElfFile, ProgramHeader};
+    let elf = ElfFile::<Elf>::parse(data).map_err(|e| other(format!("{}: {e}", path.display())))?;
     let endian = elf.endian();
     let bad = |e: object::Error| other(format!("{}: {e}", path.display()));
     let mut interp = None;
     for ph in elf.elf_program_headers() {
-        if let Some(bytes) = ph.interpreter(endian, &*data).map_err(bad)? {
+        if let Some(bytes) = ph.interpreter(endian, data).map_err(bad)? {
             interp = Some(PathBuf::from(OsStr::from_bytes(bytes)));
         }
     }
     let mut needed = Vec::new();
     let sections = elf.elf_section_table();
-    if let Some((dynamic, link)) = sections.dynamic(endian, &*data).map_err(bad)? {
-        let strings = sections.strings(endian, &*data, link).map_err(bad)?;
+    if let Some((dynamic, link)) = sections.dynamic(endian, data).map_err(bad)? {
+        let strings = sections.strings(endian, data, link).map_err(bad)?;
         for d in dynamic {
             if d.tag(endian) == object::elf::DT_NEEDED {
                 let name = d.string(endian, strings).map_err(bad)?;

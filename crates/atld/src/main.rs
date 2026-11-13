@@ -494,7 +494,7 @@ fn needs_es1(lib: &Path) -> Result<bool> {
     for isa in std::fs::read_dir(lib)? {
         for entry in std::fs::read_dir(isa?.path())? {
             let so = entry?.path();
-            if so.extension().is_some_and(|e| e == "so") {
+            if so.extension().is_some_and(|e| e == "so") && atl_broker::is_elf(&so) {
                 let (_, needed) = atl_broker::elf_deps(&so)
                     .with_context(|| format!("reading {}", so.display()))?;
                 if needed.iter().any(|n| n == gl_driver::ES1_LIB) {
@@ -1805,6 +1805,21 @@ mod tests {
             staged: staged.into(),
             name: name.into(),
         }
+    }
+
+    /// A `.so` under `lib/<isa>/` that is not ELF (Unity's symbol data `libil2cpp.usym.so`, Angry Birds 2) is data, not a library: the ES1 rule skips it instead of failing the commit.
+    #[test]
+    fn es1_rule_skips_non_elf_so_files() {
+        let dir = staged("es1", &[]);
+        let isa = dir.join(LIB_DIR_NAME).join("arm64");
+        std::fs::create_dir_all(&isa).expect("isa dir");
+        std::fs::write(isa.join("libil2cpp.usym.so"), b"USYM symbol data").expect("usym");
+        assert!(!needs_es1(&dir.join(LIB_DIR_NAME)).expect("no error"));
+        // a truncated ELF is still read as one, and its error still fails the commit
+        // the ELF magic (ELF spec e_ident[EI_MAG0..3]) and nothing after it
+        std::fs::write(isa.join("libbroken.so"), b"\x7fELF").expect("broken");
+        assert!(needs_es1(&dir.join(LIB_DIR_NAME)).is_err());
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     /// Files staged under source names, one of which already carries another file's target name: each ends under its parsed name with its own bytes.
