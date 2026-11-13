@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! ProcessControl (owner D1, 2026-11-03): how the system services start and kill app processes. The seam stands where AOSP's ProcessList meets the zygote (`Process.start`) and `Process.killProcess`;
 //! the one implementation is a control socket to atld, which spawns through the broker's sandbox and kills the sandbox ([`atl_broker::control`] is the protocol). The trait is shaped by that implementation:
-//! a start names the process and returns the pid binderd will report for it (what `attachApplication` sees as the calling pid), a kill takes that pid.
+//! a start names the process and returns the pid binderd will report for it (what `attachApplication` sees as the calling pid), a kill takes that pid, and so does the lookup of the pid the process has
+//! inside its own sandbox (getRunningAppProcesses answers an app's own pid in its numbering).
 
 use std::io;
 use std::os::fd::OwnedFd;
@@ -14,6 +15,8 @@ pub trait ProcessControl: Send + Sync {
     fn start(&self, request: &StartRequest) -> io::Result<i32>;
     /// Kills a process this control started, with everything in its sandbox.
     fn kill(&self, pid: i32) -> io::Result<()>;
+    /// The pid a process this control started has in its own sandbox: what it reads as Process.myPid().
+    fn program_pid(&self, pid: i32) -> io::Result<i32>;
 }
 
 /// The control socket's install half (installd's role): staging + the installer run, then the commit (the services' boot-time install, system_services.rs).
@@ -89,6 +92,14 @@ impl ProcessControl for ControlSocket {
             other => Err(io::Error::other(format!("kill answered {other:?}"))),
         }
     }
+
+    fn program_pid(&self, pid: i32) -> io::Result<i32> {
+        match self.call(&Request::ProgramPid { pid })? {
+            Response::ProgramPid { pid } => Ok(pid),
+            Response::Error { message } => Err(io::Error::other(message)),
+            other => Err(io::Error::other(format!("program pid answered {other:?}"))),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -109,7 +120,7 @@ mod tests {
         }
     }
 
-    /// The trait over the socket against a server that starts one process (pid 77) and refuses any other kill.
+    /// The trait over the socket against a server that starts one process (pid 77, pid 2 in its sandbox) and refuses any other kill.
     #[test]
     fn start_and_kill_over_the_socket() {
         let (ours, theirs) = socketpair(
@@ -129,6 +140,7 @@ mod tests {
                 Request::Kill { pid } => Response::Error {
                     message: format!("not started: {pid}"),
                 },
+                Request::ProgramPid { pid: 77 } => Response::ProgramPid { pid: 2 },
                 other => Response::Error {
                     message: format!("unexpected {other:?}"),
                 },
@@ -137,6 +149,7 @@ mod tests {
         });
         let pc = ControlSocket::new(ours);
         assert_eq!(pc.start(&request()).expect("start"), 77);
+        assert_eq!(pc.program_pid(77).expect("program pid"), 2);
         pc.kill(77).expect("kill");
         let err = pc.kill(5).expect_err("a pid nobody started");
         assert!(err.to_string().contains("not started: 5"), "{err}");

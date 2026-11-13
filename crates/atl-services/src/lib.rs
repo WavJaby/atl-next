@@ -28,6 +28,7 @@ pub mod observer_rules;
 pub mod pending_intent_table;
 pub mod players;
 pub mod process_control;
+pub mod running_processes;
 pub mod sensor;
 pub mod shared_memory;
 pub mod tasks;

@@ -168,6 +168,10 @@ public class ParcelTruth {
         // getInfoForIntentSender's answer for a record (package, uid, immutable, INTENT_SENDER_BROADCAST) and for a foreign sender (null, INVALID_UID, mutable, INTENT_SENDER_UNKNOWN)
         check("ActivityManager.PendingIntentInfo", new ActivityManager.PendingIntentInfo("com.example.atltest", 10123, true, ActivityManager.INTENT_SENDER_BROADCAST), ActivityManager.PendingIntentInfo.CREATOR);
         check("ActivityManager.PendingIntentInfo:unknown", new ActivityManager.PendingIntentInfo(null, -1, false, ActivityManager.INTENT_SENDER_UNKNOWN), ActivityManager.PendingIntentInfo.CREATOR);
+        // getRunningAppProcesses' element: every field off its default, a reason component, pkgDeps null (the services' answer) and set
+        check("ActivityManager.RunningAppProcessInfo", runningAppProcess(), ActivityManager.RunningAppProcessInfo.CREATOR);
+        ActivityManager.RunningAppProcessInfo bare = new ActivityManager.RunningAppProcessInfo("com.example.atltest", 2, new String[] {"com.example.atltest"});
+        check("ActivityManager.RunningAppProcessInfo:bare", bare, ActivityManager.RunningAppProcessInfo.CREATOR);
         // the crash report an app's process sends as it dies (RuntimeInit's uncaught-exception handler): nine strings and one int, nulls where unset
         check("ApplicationErrorReport.ParcelableCrashInfo", crashInfo(), ApplicationErrorReport.ParcelableCrashInfo.CREATOR);
         // IDisplayManager.getDisplayInfo's record (DisplayInfo.writeToParcel): every field set off its default, its Mode arrays in use
@@ -954,6 +958,25 @@ public class ParcelTruth {
         td.setMinHeight(480);
         td.setIconFilename("icon.png");
         return td;
+    }
+
+    /// ActivityManager.RunningAppProcessInfo with every field off its default.
+    static ActivityManager.RunningAppProcessInfo runningAppProcess() {
+        ActivityManager.RunningAppProcessInfo r = new ActivityManager.RunningAppProcessInfo("com.example.atltest:remote", 4321, new String[] {"com.example.atltest", "com.example.shared"});
+        r.uid = 10123;
+        r.pkgDeps = new String[] {"com.example.dep"};
+        r.flags = ActivityManager.RunningAppProcessInfo.FLAG_HAS_ACTIVITIES;
+        r.lastTrimLevel = 20;
+        r.importance = ActivityManager.RunningAppProcessInfo.IMPORTANCE_CACHED;
+        r.lru = 905;
+        r.importanceReasonCode = ActivityManager.RunningAppProcessInfo.REASON_SERVICE_IN_USE;
+        r.importanceReasonPid = 1234;
+        r.importanceReasonComponent = new ComponentName("com.example.atltest", "com.example.atltest.Svc");
+        r.importanceReasonImportance = 125;
+        r.processState = 6;
+        r.isFocused = true;
+        r.lastActivityTime = 123456789012L;
+        return r;
     }
 
     static Configuration configuration() {

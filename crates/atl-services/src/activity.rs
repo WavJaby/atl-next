@@ -27,8 +27,9 @@ use atl_aidl::aidl::android::content::IIntentSender::IIntentSender;
 use atl_broker::control::StartRequest;
 use atl_parcelables::android::app::servertransaction::ClientTransaction;
 use atl_parcelables::android::app::{
-    ActivityManager_PendingIntentInfo, ActivityManager_TaskDescription,
-    ApplicationErrorReport_ParcelableCrashInfo, ContentProviderHolder,
+    ActivityManager_PendingIntentInfo, ActivityManager_RunningAppProcessInfo,
+    ActivityManager_TaskDescription, ApplicationErrorReport_ParcelableCrashInfo,
+    ContentProviderHolder,
 };
 use atl_parcelables::android::content::pm::{
     ActivityInfo, ApplicationInfo, ProviderInfo, ProviderInfoList,
@@ -59,6 +60,7 @@ use crate::packages::{PackageRecord, Packages, Permissions};
 use crate::pending_intent::{self, PendingIntents};
 use crate::pending_intent_table::Key;
 use crate::process_control::ProcessControl;
+use crate::running_processes;
 use crate::shared_memory::ApplicationSharedMemory;
 use crate::tasks::{TaskId, TaskSize, Tasks, initial_size};
 use crate::ui_agents::UiAgents;
@@ -347,6 +349,8 @@ struct ProcessRecord {
 /// The thread of an attached process and the death link on its binder (AppDeathRecipient, ActivityManagerService.java:4600); the recipient is only held so the link outlives the attach call.
 struct Attached {
     thread: Strong<dyn IApplicationThread>,
+    /// the process's pid in its own sandbox ([`ProcessControl::program_pid`], read at attach); None when the lookup failed (logged)
+    program_pid: Option<i32>,
     _death: DeathRecipient,
 }
 
@@ -1267,6 +1271,46 @@ impl IActivityManager for ActivityManager {
         Ok(())
     }
 
+    /// ActivityManagerService.getRunningAppProcesses: the attached processes the caller may see (running_processes). Not enforced: enforceNotIsolatedCaller (no isolated uids).
+    fn r#getRunningAppProcesses(
+        &self,
+    ) -> binder::Result<Option<Vec<Option<ActivityManager_RunningAppProcessInfo>>>> {
+        let uid = ThreadState::get_calling_uid();
+        let caller = running_processes::Caller {
+            uid,
+            all_users: self
+                .inner
+                .holds(uid, "android.permission.INTERACT_ACROSS_USERS_FULL"),
+            all_uids: self.inner.holds(uid, "android.permission.REAL_GET_TASKS"),
+        };
+        let calling_pid = ThreadState::get_calling_pid();
+        let st = self.inner.state();
+        let procs = st.processes.iter().filter_map(|r| {
+            let a = r.attached.as_ref()?;
+            Some(running_processes::RunningProcess {
+                process_name: &r.process_name,
+                package: &r.package,
+                uid: r.uid,
+                pid: running_processes::pid_seen_by(r.pid, a.program_pid, calling_pid),
+            })
+        });
+        Ok(running_processes::visible(procs, &caller).map(|list| {
+            list.into_iter()
+                .map(|p| {
+                    Some(ActivityManager_RunningAppProcessInfo {
+                        process_name: Some(p.process_name.to_owned()),
+                        pid: p.pid,
+                        uid: p.uid as i32,
+                        pkg_list: Some(vec![Some(p.package.to_owned())]),
+                        importance: running_processes::IMPORTANCE_FOREGROUND,
+                        process_state: running_processes::PROCESS_STATE_TOP,
+                        ..Default::default()
+                    })
+                })
+                .collect()
+        }))
+    }
+
     /// ActivityManagerService.attachApplication:4852 -> attachApplicationLocked:4517: a null thread is a SecurityException; the app is the process this service started (:4540-4563: found by
     /// pid, whose uid and startSeq must match, else the pending start of that startSeq and uid); with none the process is dropped (:4566-4580: killed). Then bindApplication (:4754) of its package,
     /// with the instrumentation, if one is to run in it (:4682-4761).
@@ -1281,6 +1325,12 @@ impl IActivityManager for ActivityManager {
         let inner = &self.inner;
         let pid = ThreadState::get_calling_pid();
         let uid = ThreadState::get_calling_uid();
+        // asked before the state lock (a round trip to atld, as kills are); a pid that is no started process fails here and is dropped below
+        let program_pid = inner
+            .control
+            .program_pid(pid)
+            .inspect_err(|e| log(format_args!("program pid of {pid}: {e}")))
+            .ok();
         let mut st = inner.state();
         let Some(i) = st.processes.iter().position(|r| {
             r.attached.is_none()
@@ -1413,6 +1463,7 @@ impl IActivityManager for ActivityManager {
         )?;
         st.processes[i].attached = Some(Attached {
             thread: thread.clone(),
+            program_pid,
             _death: death,
         });
         Ok(())

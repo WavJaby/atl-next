@@ -579,6 +579,28 @@ pub fn kill_sandbox(host_pid: i32) -> io::Result<()> {
     kill_process(pid, Signal::KILL).map_err(io::Error::from)
 }
 
+/// The pid the program of the sandbox whose first process is `host_pid` has in its own pid namespace (its getpid(), Process.myPid()): bwrap's init is that first process (pid 1; no `--as-pid-1`)
+/// and forks the program as its one child, which the stub execs into. Read from the kernel: the init's children (`/proc/<pid>/task/<pid>/children`), then that child's `NSpid` (innermost last).
+pub fn program_pid(host_pid: i32) -> io::Result<i32> {
+    let children = fs::read_to_string(format!("/proc/{host_pid}/task/{host_pid}/children"))?;
+    let child = match children.split_whitespace().collect::<Vec<_>>()[..] {
+        [one] => one,
+        ref all => {
+            return Err(other(format!(
+                "sandbox {host_pid}: init has children {all:?}, want one"
+            )));
+        }
+    };
+    let status = fs::read_to_string(format!("/proc/{child}/status"))?;
+    innermost_pid(&status).ok_or_else(|| other(format!("sandbox {host_pid}: no NSpid for {child}")))
+}
+
+/// The last pid of a `/proc/<pid>/status` `NSpid:` line: the pid in the process's own namespace (proc(5)).
+fn innermost_pid(status: &str) -> Option<i32> {
+    let line = status.lines().find_map(|l| l.strip_prefix("NSpid:"))?;
+    line.split_whitespace().last()?.parse().ok()
+}
+
 /// The broker's side of binderd: its admin connection. Dropping it closes the connection, which ends binderd.
 pub struct Broker {
     admin: OwnedFd,
@@ -1225,6 +1247,44 @@ mod tests {
         assert!(files.contains(&libc), "{files:?}");
         // a library missing from that directory fails instead of yielding a sandbox binderd cannot start in
         assert!(elf_closure(Path::new("/nonexistent")).is_err());
+    }
+
+    #[test]
+    fn nspid() {
+        // proc(5): host pid first, the process's own namespace last
+        assert_eq!(
+            innermost_pid("Name:\tapp_process\nPid:\t1113415\nNSpid:\t1113415\t2\nNSpgid:\t1\n"),
+            Some(2)
+        );
+        assert_eq!(innermost_pid("NSpid:\t77\n"), Some(77));
+        assert_eq!(innermost_pid("Pid:\t77\n"), None);
+    }
+
+    /// A shell standing in for bwrap's init, its one child for the program: with no pid namespace of their own, the child's NSpid is the pid the shell printed (`$!`, after the fork).
+    #[test]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "a test: an unsandboxed process tree stands in for a sandbox's"
+    )]
+    fn program_pid_of_a_live_tree() {
+        let mut init = std::process::Command::new("sh")
+            .args(["-c", "sleep 5 & echo $!; wait"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("sh");
+        let mut line = String::new();
+        io::BufRead::read_line(
+            &mut io::BufReader::new(init.stdout.take().expect("stdout")),
+            &mut line,
+        )
+        .expect("read");
+        let got = program_pid(i32::try_from(init.id()).expect("pid"));
+        let _ = init.kill();
+        let _ = init.wait();
+        assert_eq!(
+            got.expect("program_pid"),
+            line.trim().parse::<i32>().expect("$!")
+        );
     }
 
     #[test]

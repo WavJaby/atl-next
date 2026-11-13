@@ -131,6 +131,10 @@ const PENDING_INTENT: (&str, &str) = (
 const PRIORITY: &str = "AtlTest: priority: ";
 /// Main.signatures' line: the fixture's signer as GET_SIGNATURES and GET_SIGNING_CERTIFICATES return it and checkSignatures against itself ([`signatures_want`]).
 const SIGNATURES: &str = "AtlTest: signatures: ";
+/// Main.processes' line: getRunningAppProcesses shows the fixture its one process (AOSP: a caller sees its own uid's processes only), with the fixture's Process.myPid / myUid, its processName and
+/// package, and IMPORTANCE_FOREGROUND (100: ATL answers every app process as PROCESS_STATE_TOP). `null` = the list AOSP gives a caller with no attached process.
+const PROCESSES: &str = "AtlTest: processes: ";
+const PROCESSES_WANT: &str = "count=1 own=1 uid=true name=true pkg=true importance=100";
 
 /// A [`SERVICE_LINES`] expectation: the fixed value, or for connectivity (None) [`connectivity_want`].
 fn service_want(fixed: Option<&str>) -> String {
@@ -1052,6 +1056,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if passed && pending.as_deref() != Some(want) {
         whys.push(format!("pendingintent: want {want:?}, got {pending:?}"));
     }
+    let processes = app.lines().find_map(|l| {
+        l.split_once(PROCESSES)
+            .map(|(_, r)| r.trim_end().to_owned())
+    });
+    if passed && processes.as_deref() != Some(PROCESSES_WANT) {
+        whys.push(format!(
+            "processes: want {PROCESSES_WANT:?}, got {processes:?}"
+        ));
+    }
     let priority = app
         .lines()
         .find_map(|l| l.split_once(PRIORITY).map(|(_, r)| r.trim_end().to_owned()));
@@ -1173,6 +1186,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         for (service, _, want) in SERVICE_LINES {
             println!("app: pass {service} {}", service_want(want));
         }
+        println!("app: pass processes {PROCESSES_WANT}");
         println!(
             "app: pass priority {} ({})",
             priority.as_deref().unwrap_or_default(),

@@ -22,6 +22,7 @@ mod capture;
 mod compositor;
 
 use atl_parcelables::android::app::ActivityManager_PendingIntentInfo;
+use atl_parcelables::android::app::ActivityManager_RunningAppProcessInfo;
 use atl_parcelables::android::app::ActivityManager_TaskDescription;
 use atl_parcelables::android::app::ApplicationErrorReport_ParcelableCrashInfo;
 use atl_parcelables::android::app::ContentProviderHolder;
@@ -315,6 +316,9 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
         "android.app.PendingIntent" => round_trip_as::<PendingIntent>(input, mode),
         "android.app.ActivityManager$PendingIntentInfo" => {
             round_trip_as::<ActivityManager_PendingIntentInfo>(input, mode)
+        }
+        "android.app.ActivityManager$RunningAppProcessInfo" => {
+            round_trip_as::<ActivityManager_RunningAppProcessInfo>(input, mode)
         }
         "android.app.ActivityManager$TaskDescription" => {
             round_trip_as::<ActivityManager_TaskDescription>(input, mode)

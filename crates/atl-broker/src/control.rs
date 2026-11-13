@@ -41,6 +41,11 @@ pub enum Request {
     Kill {
         pid: i32,
     },
+    /// The pid a started process (`pid`, its tag) has in its own sandbox, as it numbers itself ([`crate::program_pid`]): the services answer an app's own pid in the app's numbering. Answered
+    /// [`Response::ProgramPid`].
+    ProgramPid {
+        pid: i32,
+    },
     /// Stage session `session`'s files under their session names (the source file names, as `pm install-multiple` writes them: PackageManagerShellCommand.doWriteSplits) in `/data/app/vmdl<session>.tmp`
     /// and run the installer over it (parse + native-library copy). `uid` (the package's future uid) must be above the installer's own ([`crate::INSTALLER_UID`]). Answered [`Response::Staged`]; a failed
     /// installer run removes the staging dir and answers its stderr.
@@ -74,6 +79,10 @@ pub enum Response {
     },
     /// The sandbox was killed.
     Killed,
+    /// The process's pid in its own sandbox.
+    ProgramPid {
+        pid: i32,
+    },
     /// The installer ran: its frames (atl-services-types installer_output) at `frames`, a host path the services read.
     Staged {
         frames: String,

@@ -18,8 +18,12 @@ src = [
     "crates/atl-services/src/process_control.rs",
     "crates/atl-services/src/broadcast.rs",
     "crates/atl-services/src/broadcast_queue.rs",
+    "crates/atl-services/src/running_processes.rs",
 ]
 mirrors = [
+    "frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java#getRunningAppProcesses",
+    "frameworks/base/services/core/java/com/android/server/am/ProcessList.java#getRunningAppProcessesLOSP",
+    "frameworks/base/services/core/java/com/android/server/am/ProcessList.java#fillInProcMemInfoLOSP",
     "frameworks/base/services/core/java/com/android/server/am/BroadcastController.java#registerReceiverWithFeatureTraced",
     "frameworks/base/services/core/java/com/android/server/am/BroadcastController.java#unregisterReceiverTraced",
     "frameworks/base/services/core/java/com/android/server/am/BroadcastController.java#broadcastIntentLocked",

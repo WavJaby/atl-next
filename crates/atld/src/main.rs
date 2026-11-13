@@ -1102,6 +1102,18 @@ impl Host {
             .remove(&pid);
         Ok(())
     }
+
+    /// The services' program-pid request: only for a process they started.
+    fn program_pid(&self, pid: i32) -> Result<i32> {
+        ensure!(
+            self.controlled
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&pid),
+            "pid {pid} is not a process the services started"
+        );
+        Ok(atl_broker::program_pid(pid)?)
+    }
 }
 
 impl Host {
@@ -1238,6 +1250,9 @@ fn serve_control(host: Arc<Host>, fd: std::os::fd::OwnedFd) {
         let outcome = match request {
             Request::Start(req) => host.start_app(&req).map(|pid| Response::Started { pid }),
             Request::Kill { pid } => host.kill(pid).map(|()| Response::Killed),
+            Request::ProgramPid { pid } => host
+                .program_pid(pid)
+                .map(|pid| Response::ProgramPid { pid }),
             Request::Install { session, uid } => host
                 .install(session, uid)
                 .map(|frames| Response::Staged { frames }),

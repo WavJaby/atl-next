@@ -92,6 +92,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "notification: " + channels());
         Log.i("AtlTest", "power: " + power());
         Log.i("AtlTest", "pendingintent: " + pendingIntent());
+        Log.i("AtlTest", "processes: " + processes());
         Log.i("AtlTest", "signatures: " + signatures());
         Log.i("AtlTest", "priority: " + priority());
         mediaPlayerService();
@@ -245,6 +246,35 @@ public class Main extends Activity {
      * "interactive=<bool> powersave=<bool> partial=<bool> held=<bool> released=<bool>": PowerManager (vungle's AndroidPlatform.<init> path) answers isInteractive / isPowerSaveMode /
      * isWakeLockLevelSupported(PARTIAL), and a PARTIAL wake lock's isHeld after acquire and after release; "absent" when getSystemService returns null; else what it threw.
      */
+    /**
+     * "count=<n> own=<n> uid=<bool> name=<bool> pkg=<bool> importance=<n>": ActivityManager.getRunningAppProcesses as SDK "am I the main process" checks read it: how many records, how many carry
+     * Process.myPid(), whether every one has Process.myUid(), and the own record's processName (= ApplicationInfo.processName), pkgList (= the package) and importance; "null" for a null list.
+     */
+    private String processes() {
+        try {
+            java.util.List<android.app.ActivityManager.RunningAppProcessInfo> list =
+                    ((android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE)).getRunningAppProcesses();
+            if (list == null) {
+                return "null";
+            }
+            int own = 0;
+            boolean uid = true;
+            android.app.ActivityManager.RunningAppProcessInfo mine = null;
+            for (android.app.ActivityManager.RunningAppProcessInfo i : list) {
+                if (i.pid == android.os.Process.myPid()) {
+                    own++;
+                    mine = i;
+                }
+                uid &= i.uid == android.os.Process.myUid();
+            }
+            String rest = mine == null ? "" : " name=" + mine.processName.equals(getApplicationInfo().processName)
+                    + " pkg=" + java.util.Arrays.equals(mine.pkgList, new String[] {getPackageName()}) + " importance=" + mine.importance;
+            return "count=" + list.size() + " own=" + own + " uid=" + uid + rest;
+        } catch (Throwable t) {
+            return "threw " + t;
+        }
+    }
+
     private String power() {
         try {
             android.os.PowerManager pm = (android.os.PowerManager) getSystemService(POWER_SERVICE);
