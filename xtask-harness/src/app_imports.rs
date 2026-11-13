@@ -90,7 +90,7 @@ pub fn classify(
                 Binding::Trap(why) => Class::Trapped(lib, why),
                 Binding::Generic { .. }
                 | Binding::Shim
-                | Binding::Env { .. }
+                | Binding::Mapped { .. }
                 | Binding::Variable { .. } => Class::Bound(lib),
             };
         }
@@ -105,6 +105,9 @@ pub fn classify(
 pub fn owner(c: &Class) -> &'static str {
     match c {
         Class::Trapped(_, why) if why.contains("GS2.2") => "GS2.2 (deferred, D-Q7-5)",
+        Class::Trapped(_, why) if why.contains("callback-param") => {
+            "GS2.2 G2 (review the callback type for build.rs CALLBACKS)"
+        }
         Class::Trapped(_, why) if why.starts_with("refused") => "R-1 (refused by design)",
         Class::Trapped(..) => "none: needs a binding row",
         _ => "none: not in any table",

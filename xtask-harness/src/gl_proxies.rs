@@ -181,7 +181,7 @@ pub fn check(root: &Path, out: &Path, arch: &str) -> Result<Option<String>> {
                 match b {
                     Binding::Generic { .. }
                     | Binding::Shim
-                    | Binding::Env { .. }
+                    | Binding::Mapped { .. }
                     | Binding::Variable { .. } => bound += 1,
                     Binding::Trap(why) if why.starts_with("pending") => pending += 1,
                     Binding::Trap(_) => unbound += 1,

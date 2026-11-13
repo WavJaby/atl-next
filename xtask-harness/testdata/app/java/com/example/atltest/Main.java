@@ -73,6 +73,7 @@ public class Main extends Activity {
         }
         if (jni != null) {
             bridge1Calls(jni);
+            bridge1 = jni;
         }
         bridge1Legacy();
         Log.i("AtlTest", "onCreate reached");
@@ -103,6 +104,10 @@ public class Main extends Activity {
         String extra = data == null ? null : data.getStringExtra(ResultChild.EXTRA);
         Log.i("AtlTest", "result request=" + requestCode + " code=" + resultCode + " extra=" + (extra == null ? "none" : extra));
         if (requestCode == REQUEST_CHILD) {
+            // tr-first blocker 5 (b): by the child's result the main Looper has run, so looperArm's callback has had its later call
+            if (bridge1 != null) {
+                bridge1Call(bridge1, "looperLater", "looperLater");
+            }
             startActivityForResult(new Intent(this, Main.class), REQUEST_SELF);
         }
     }
@@ -163,6 +168,9 @@ public class Main extends Activity {
             // no asset: every call runs
         }
     }
+
+    /** The bridge-1 fixture class once loaded (onActivityResult makes the looperLater call with it); null without it. */
+    private Class<?> bridge1;
 
     /** One native call's result line (app.rs BRIDGE1_CALLS): "bridge1 call <label> = <value>", "skipped" for a SKIPPED label, or what it threw. Reflection: the fixture class is compiled apart from Main. */
     private static void bridge1Call(Class<?> jni, String label, String method, Object... args) {
@@ -229,6 +237,20 @@ public class Main extends Activity {
         bridge1Call(jni, "bitmapRgb565", "bitmapProbe", bitmap3x2(Bitmap.Config.RGB_565, RGB565_PIXELS));
         bridge1Call(jni, "windowProbe", "windowProbe", probeSurface());
         bridge1Call(jni, "mediandkLinked", "mediandkLinked");
+        // tr-first blocker 5: (a) on this thread inside the call; then a fresh thread arms the main looper for (b), read in onActivityResult
+        bridge1Call(jni, "looperNow", "looperNow");
+        Thread arm = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                bridge1Call(jni, "looperArm", "looperArm");
+            }
+        });
+        arm.start();
+        try {
+            arm.join();
+        } catch (InterruptedException e) {
+            Log.i("AtlTest", "bridge1 call looperArm = threw " + e);
+        }
     }
 
     /** windowProbe's Surface: a SurfaceTexture's producer with default buffer size WINDOW_W x WINDOW_H (app.rs BRIDGE1_CALLS windowProbe). */

@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, ensure};
 use atl_bridgegen::buildscript::{self, Upstreams};
 use atl_bridgegen::ir::Ty;
+use atl_bridgegen::jni::{LaneMap, Route};
 use atl_bridgegen::rust::{Table, api_module_with_table};
 use atl_bridgegen::{Lang, Source, Target};
 
@@ -226,7 +227,20 @@ const QEMU_SHIMS: &[&str] = &[
 const COUNTED_SHIMS: &[&str] = &["memcpy", "memset", "memcmp"];
 /// Proxy-library functions whose host side is hand-written, each bound `Entry::Shim` in its library; each must be in one proxy library's list (`bindings_table`). `slCreateEngine` (engine/sles.rs: its out object is wrapped in a guest proxy); `eglGetProcAddress` (engine/proc.rs: its answer is a row's guest address, never a raw host pointer; the fn-return arm below traps every other one).
 const PROXY_SHIMS: &[&str] = &["slCreateEngine", "eglGetProcAddress"];
-/// NDK functions with JNI types in their prototype, bound by the env class (`Entry::Env`, engine/ndk.rs `call_env`: the guest's `JNIEnv*` mapped to the host's, the rest passed as int lanes; references are the host's already). A generic row would hand the host library the guest's env (tr-first blocker 3: `ANativeWindow_fromSurface` -> SEGV in `android_view_Surface_getSurface`), so a JNI-typed prototype missing here fails the build naming it (`atl_bridgegen::jni::env_binding`), and a name here without one is stale.
+/// Callback typedefs whose guest function pointer a lane-mapped row hands the host as a down shell (`Entry::Mapped`, engine/ndk.rs `call_mapped`; GS2.2 callback-param, tr-first blocker 5). Reviewed: every argument the host passes the callback is a value or the guest's own user data, nothing the guest would dereference in host-only memory (QEMU maps no host heap). A function-pointer parameter of another type traps `pending` (`atl_bridgegen::jni::route`); a name here no row uses is stale.
+/// Not here, with why: `AMediaDataSourceReadAt` (its buffer is host memory the guest writes: needs the G2 copy arena), `GLDEBUGPROC*` (its message is host memory: G2 staging), `AChoreographer_vsyncCallback` (`AChoreographerFrameCallbackData*`, a host record the guest reads).
+const CALLBACKS: &[&str] = &[
+    // looper.h `int (*)(int fd, int events, void* data)`
+    "ALooper_callbackFunc",
+    // choreographer.h `void (*)(long frameTimeNanos, void* data)`, `void (*)(int64_t frameTimeNanos, void* data)`, `void (*)(int64_t vsyncPeriodNanos, void* data)`
+    "AChoreographer_frameCallback",
+    "AChoreographer_frameCallback64",
+    "AChoreographer_refreshRateCallback",
+    // NdkMediaDataSource.h `ssize_t (*)(void* userdata)`, `void (*)(void* userdata)`
+    "AMediaDataSourceGetSize",
+    "AMediaDataSourceClose",
+];
+/// NDK functions with JNI types in their prototype, bound lane-mapped (`Entry::Mapped`, engine/ndk.rs `call_mapped`: the guest's `JNIEnv*` mapped to the host's, the rest passed as int lanes; references are the host's already). A generic row would hand the host library the guest's env (tr-first blocker 3: `ANativeWindow_fromSurface` -> SEGV in `android_view_Surface_getSurface`), so a JNI-typed prototype missing here fails the build naming it (`atl_bridgegen::jni::route`), and a name here without one is stale.
 const ENV_SHIMS: &[&str] = &[
     "AAssetManager_fromJava",
     "AHardwareBuffer_fromHardwareBuffer",
@@ -759,6 +773,8 @@ fn missing_prototype(soname: &str) -> &'static str {
 const FIXED_BINDINGS: usize = 6;
 /// JNI stubs: one per slot of the largest JNI table (`JNINativeInterface`: 233 in jni.h today, `JNIInvokeInterface` fewer; engine/jni.rs asserts the fit), rounded up to 256. The x86 engine's stub array has this length; the QEMU engine reserves as many pool slots.
 const OBJECT_STUBS: usize = 256;
+/// An `Entry::Mapped` row as generated: library, name, the (parameter, map) pairs.
+type MappedRow = (String, String, Vec<(usize, LaneMap)>);
 /// `bindings_table.rs` (module `bindings`): every guest library whose stubs the engine binds -- the GL / window / NDK proxies and libc -- with its NBS stub names in list order, each with the entry it binds. The one table `native_bridge_intercept_symbol` resolves (library, name) in.
 /// `Entry::Generic(host, symbol, class)` binds `symbol` looked up on that host library's own handle (a GL front, the bionic provider, glibc's libc.so.6) through the generic crossing, `class` the lane class of its result (`atl_bridgegen::jni::result_class`); `Entry::Shim` a hand-written host side; `Entry::Trap(i)` `TRAPS[i]`, a named trap (`TRAP_NAMES[i]`).
 /// The proxy prototypes come from one unit parsed for two views: `guest` (bionic, as NDK apps compile) and `host` (glibc). A stub whose prototype differs between the views fails the build, naming it.
@@ -896,30 +912,35 @@ fn bindings_table(
 
     let mut traps: Vec<(String, String, &'static str)> = Vec::new();
     let mut rows: Vec<(&str, Vec<(String, String)>)> = Vec::new();
-    // `Entry::Env(i)` rows: library, name, the `JNIEnv*` parameter's index; and every JNI-typed prototype refused a row, named together in one build error
-    let mut env_rows: Vec<(String, String, usize)> = Vec::new();
+    // `Entry::Mapped(i)` rows: library, name, the (parameter, map) pairs; and every prototype refused a row, named together in one build error
+    let mut mapped_rows: Vec<MappedRow> = Vec::new();
     let mut refused: Vec<String> = Vec::new();
     for (soname, names) in &lists {
         let mut entries = Vec::new();
         for name in names {
-            let env = match (guest_view.functions.get(name), host_ir.functions.get(name)) {
-                (Some(sig), Some(_)) => {
-                    atl_bridgegen::jni::env_binding(name, sig, ENV_SHIMS.contains(&name.as_str()))
-                        .unwrap_or_else(|e| {
-                            refused.push(format!("{e:#}"));
-                            None
-                        })
-                }
-                _ => None,
+            let route = match (guest_view.functions.get(name), host_ir.functions.get(name)) {
+                (Some(sig), Some(_)) => atl_bridgegen::jni::route(
+                    name,
+                    sig,
+                    ENV_SHIMS.contains(&name.as_str()),
+                    CALLBACKS,
+                )
+                .unwrap_or_else(|e| {
+                    refused.push(format!("{e:#}"));
+                    Route::Plain
+                }),
+                _ => Route::Plain,
             };
             let mut trap = |why: &'static str| {
                 traps.push(((*soname).to_owned(), name.clone(), why));
                 format!("Entry::Trap({})", traps.len() - 1)
             };
-            // both engines: the guest env mapped to the host's, the other arguments int lanes in one address space (engine/ndk.rs `call_env`)
-            let entry = if let Some(index) = env {
-                env_rows.push(((*soname).to_owned(), name.clone(), index));
-                format!("Entry::Env({})", env_rows.len() - 1)
+            // both engines: the guest env mapped to the host's, a guest callback to a down shell, the other arguments int lanes in one address space (engine/ndk.rs `call_mapped`)
+            let entry = if let Route::Mapped(maps) = route {
+                mapped_rows.push(((*soname).to_owned(), name.clone(), maps));
+                format!("Entry::Mapped({})", mapped_rows.len() - 1)
+            } else if let Route::Pending(why) = route {
+                trap(why)
             } else {
                 match (guest_view.functions.get(name), host_ir.functions.get(name)) {
                     (Some(_), Some(_)) if PROXY_SHIMS.contains(&name.as_str()) => {
@@ -931,9 +952,6 @@ fn bindings_table(
                     // fn-return rows that are not shims (PROXY_SHIMS, eglGetProcAddress): a host function pointer must never reach the guest as a result
                     (Some(sig), Some(_)) if is_fn_ptr(&sig.ret) => {
                         trap("pending: fn-return, GS2.2")
-                    }
-                    (Some(sig), Some(_)) if sig.params.iter().any(is_fn_ptr) => {
-                        trap("pending: callback-param, GS2.2")
                     }
                     (Some(sig), Some(_)) => {
                         // a record by value (NDK imagedecoder.h `ARect AImageDecoderFrameInfo_getFrameRect`) has no lane class: trapped by name, both engines (the identity table's Generic rows carry a class too)
@@ -975,14 +993,24 @@ fn bindings_table(
     }
     ensure!(
         refused.is_empty(),
-        "{} proxy prototype(s) with JNI types refused a binding (build.rs ENV_SHIMS): {}",
+        "{} proxy prototype(s) refused a lane-mapped binding (build.rs ENV_SHIMS, CALLBACKS): {}",
         refused.len(),
         refused.join(" | ")
     );
     for n in ENV_SHIMS {
         ensure!(
-            env_rows.iter().any(|(_, r, _)| r == n),
+            mapped_rows
+                .iter()
+                .any(|(_, r, m)| r == n && m.iter().any(|(_, x)| *x == LaneMap::Env)),
             "{n}: in ENV_SHIMS but no proxy library lists it with a prototype in the set"
+        );
+    }
+    for t in CALLBACKS {
+        ensure!(
+            mapped_rows.iter().any(|(_, _, m)| m
+                .iter()
+                .any(|(_, x)| matches!(x, LaneMap::Down { ty, .. } if ty == t))),
+            "{t}: in CALLBACKS but no proxy row with a prototype in the set takes it"
         );
     }
     let libc = libc_entries(&libc_names, qemu, &mut |name, why| {
@@ -992,7 +1020,7 @@ fn bindings_table(
     rows.push(("libc.so", libc_names.into_iter().zip(libc).collect()));
 
     let mut code = String::from(
-        "// generated by build.rs (atl-native-bridge) from the NBS stub lists, the binding lists and the EGL/GLES prototypes of the guest and host views, do not edit\nuse super::{Class, Entry, Host, Lib};\n\npub const LIBS: &[Lib] = &[\n",
+        "// generated by build.rs (atl-native-bridge) from the NBS stub lists, the binding lists and the EGL/GLES prototypes of the guest and host views, do not edit\nuse super::{Class, Entry, Host, LaneMap, Lib, MappedRow};\n\npub const LIBS: &[Lib] = &[\n",
     );
     let mut total = 0usize;
     for (soname, entries) in &rows {
@@ -1051,21 +1079,31 @@ fn bindings_table(
         code.push_str(&format!("    trap::<{i}>,\n"));
     }
     code.push_str("];\n\n");
-    // the env class's host sides: one six-lane forwarder per row (atl_bridgegen::jni::ENV_LANES)
+    // the lane-mapped class's host sides: one six-lane forwarder per row (atl_bridgegen::jni::MAPPED_LANES)
     ensure!(
-        atl_bridgegen::jni::ENV_LANES == 6,
-        "the env forwarder below takes 6 lanes, atl_bridgegen::jni::ENV_LANES is {}",
-        atl_bridgegen::jni::ENV_LANES
+        atl_bridgegen::jni::MAPPED_LANES == 6,
+        "the mapped forwarder below takes 6 lanes, atl_bridgegen::jni::MAPPED_LANES is {}",
+        atl_bridgegen::jni::MAPPED_LANES
     );
-    code.push_str("/// Per `Entry::Env(i)`: library, symbol, the index of its `JNIEnv*` parameter.\npub const ENV_ROWS: &[(&str, &str, usize)] = &[\n");
-    for (lib, name, index) in &env_rows {
-        code.push_str(&format!("    ({lib:?}, {name:?}, {index}),\n"));
+    code.push_str("/// Per `Entry::Mapped(i)`: library, symbol, the (parameter, map) pairs.\npub const MAPPED_ROWS: &[MappedRow] = &[\n");
+    for (lib, name, maps) in &mapped_rows {
+        let maps: Vec<String> = maps
+            .iter()
+            .map(|(i, m)| match m {
+                LaneMap::Env => format!("({i}, LaneMap::Env)"),
+                LaneMap::Down { shorty, .. } => format!("({i}, LaneMap::Down(b{shorty:?}))"),
+            })
+            .collect();
+        code.push_str(&format!(
+            "    ({lib:?}, {name:?}, &[{}]),\n",
+            maps.join(", ")
+        ));
     }
     code.push_str(
-        "];\n\n/// The host side of `Entry::Env(I)`: its six int lanes to ndk.rs `call_env`.\nextern \"C\" fn env<const I: usize>(a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> usize {\n    super::super::ndk::call_env(ENV_ROWS[I], [a0, a1, a2, a3, a4, a5])\n}\n\n/// `env::<i>` per `Entry::Env(i)`.\npub const ENV_FNS: &[extern \"C\" fn(usize, usize, usize, usize, usize, usize) -> usize] = &[\n",
+        "];\n\n/// The host side of `Entry::Mapped(I)`: its six int lanes to ndk.rs `call_mapped`.\nextern \"C\" fn mapped<const I: usize>(a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> usize {\n    super::super::ndk::call_mapped(MAPPED_ROWS[I], [a0, a1, a2, a3, a4, a5])\n}\n\n/// `mapped::<i>` per `Entry::Mapped(i)`.\npub const MAPPED_FNS: &[extern \"C\" fn(usize, usize, usize, usize, usize, usize) -> usize] = &[\n",
     );
-    for i in 0..env_rows.len() {
-        code.push_str(&format!("    env::<{i}>,\n"));
+    for i in 0..mapped_rows.len() {
+        code.push_str(&format!("    mapped::<{i}>,\n"));
     }
     code.push_str("];\n");
     // one copy: sles.rs asserts against the identity table's (the layout is the host view's, the same for both tables)
@@ -1131,6 +1169,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("jni_direct", "atl_nb_jni_direct"),
     // C3 (engine/ndk.rs, jni.rs `host_env`): the NDK shims hand the host library the guest env unmapped
     ("ndk_env", "atl_nb_ndk_env"),
+    // tr-first blocker 5 (engine/ndk.rs `call_mapped`): a guest callback reaches the host unmapped, no down shell (app gate, QEMU arm64: rows looperNow, looperLater)
+    ("cb_down_skip", "atl_nb_cb_down_skip"),
     // gate 4.4 (exports.rs): isNativeBridgeFunctionPointer answers false
     ("nbfp_false", "atl_nb_nbfp_false"),
     // spike gates g1/g2 (engine::identity): the host->guest crossing without its FS restore

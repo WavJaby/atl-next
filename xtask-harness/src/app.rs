@@ -196,6 +196,10 @@ const BRIDGE1_CALLS: &[(&str, &str)] = &[
     ("windowProbe", "window 48 32 1"),
     // G6b: the fixture library (DT_NEEDED libmediandk.so) loaded, so the guest found the libmediandk proxy; 1 = C's `f != NULL` for AMediaFormat_new (atl_jni_test.c mediandkLinked)
     ("mediandkLinked", "1"),
+    // tr-first blocker 5 (atl_jni_test.c looperNow / looperArm / looperLater; engine/ndk.rs `call_mapped` hands the host a down shell for the guest callback): (a) one call, on the calling thread, pollOnce = ALOOPER_POLL_CALLBACK (-2, looper.h), no wrong user data; (b) the main Looper's later call of the callback a fresh thread registered: one call, on the main thread, which is not the arming one, no wrong user data
+    ("looperNow", "now 1 1 -2 0"),
+    ("looperArm", "armed"),
+    ("looperLater", "later 1 1 1 0"),
 ];
 /// Main.bridge1Calls' firstConfig row: `r=<r> g=<g> b=<b> a=<a> visual=<v>`, the first config eglChooseConfig lists for RGB 8 minimum on pbuffer surfaces (atl_jni_test.c firstConfig).
 /// The driver orders the list as the host does, so the row is judged ([`first_config_why`]), not compared with a fixed line.

@@ -5,6 +5,7 @@
 #include <android/asset_manager_jni.h>
 #include <android/bitmap.h>
 #include <android/log.h>
+#include <android/looper.h>
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
 #include <media/NdkMediaFormat.h>
@@ -572,6 +573,71 @@ JNI_FN(jstring, windowProbe)(JNIEnv *env, jclass cls, jobject surface)
     ANativeWindow_release(w);
     char line[64];
     snprintf(line, sizeof line, "window %d %d %d", width, height, format);
+    return (*env)->NewStringUTF(env, line);
+}
+
+// tr-first blocker 5 (GS2.2 G2, callback-param): ALooper_addFd's callback is a guest function the host libandroid calls; the bridge hands it a down shell (engine/ndk.rs `call_mapped`). One record per case; the user data is the record's address, so a lost or swapped pointer counts in g_cb_bad instead.
+struct cb_rec {
+    int calls;
+    pid_t tid;
+    int wfd;
+};
+static struct cb_rec g_cb_now = {0, 0, -1}, g_cb_later = {0, 0, -1};
+static int g_cb_bad;
+static ALooper *g_main_looper;
+static pid_t g_main_tid, g_arm_tid;
+
+static int looper_cb(int fd, int events, void *data)
+{
+    struct cb_rec *r = data == &g_cb_now ? &g_cb_now : data == &g_cb_later ? &g_cb_later : NULL;
+    char b;
+    read(fd, &b, 1);
+    if (r == NULL || events != ALOOPER_EVENT_INPUT) {
+        g_cb_bad++;
+    } else {
+        r->calls++;
+        r->tid = gettid();
+        close(r->wfd);
+    }
+    close(fd);
+    return 0; // unregister
+}
+
+// AtlJniTest.looperNow, on the main thread: (a) the host calls the callback during the call, on the calling thread, inside ALooper_pollOnce. "now <calls> <same thread> <pollOnce result> <bad>"; also keeps the main looper for looperArm.
+JNI_FN(jstring, looperNow)(JNIEnv *env, jclass cls)
+{
+    g_main_looper = ALooper_forThread();
+    g_main_tid = gettid();
+    int p[2];
+    if (g_main_looper == NULL || pipe(p) != 0)
+        return (*env)->NewStringUTF(env, "no looper or pipe");
+    g_cb_now.wfd = p[1];
+    ALooper_addFd(g_main_looper, p[0], ALOOPER_POLL_CALLBACK, ALOOPER_EVENT_INPUT, looper_cb, &g_cb_now);
+    write(p[1], "x", 1);
+    int r = ALooper_pollOnce(1000, NULL, NULL, NULL);
+    char line[64];
+    snprintf(line, sizeof line, "now %d %d %d %d", g_cb_now.calls, g_cb_now.tid == g_main_tid, r, g_cb_bad);
+    return (*env)->NewStringUTF(env, line);
+}
+
+// AtlJniTest.looperArm, on a fresh Java thread: registers on the main looper and makes the fd ready, then returns; the main thread's Java Looper calls the callback later, outside this call (looperLater reads it).
+JNI_FN(jstring, looperArm)(JNIEnv *env, jclass cls)
+{
+    g_arm_tid = gettid();
+    int p[2];
+    if (g_main_looper == NULL || pipe(p) != 0)
+        return (*env)->NewStringUTF(env, "no looper or pipe");
+    g_cb_later.wfd = p[1];
+    ALooper_addFd(g_main_looper, p[0], ALOOPER_POLL_CALLBACK, ALOOPER_EVENT_INPUT, looper_cb, &g_cb_later);
+    write(p[1], "x", 1);
+    return (*env)->NewStringUTF(env, "armed");
+}
+
+// AtlJniTest.looperLater, on the main thread after its Looper ran: (b) "later <calls> <ran on main> <main is not the arming thread> <bad>".
+JNI_FN(jstring, looperLater)(JNIEnv *env, jclass cls)
+{
+    char line[64];
+    snprintf(line, sizeof line, "later %d %d %d %d", g_cb_later.calls, g_cb_later.tid == g_main_tid, g_arm_tid != g_main_tid, g_cb_bad);
     return (*env)->NewStringUTF(env, line);
 }
 

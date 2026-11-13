@@ -153,8 +153,91 @@ const JNI_REFS: &[&str] = &[
     "jweak",
 ];
 
-/// The integer lanes the env class forwards: SysV's six integer registers. Its host side (atl-native-bridge ndk.rs `call_env`) is one `extern "C" fn` of six words that calls the host function with them; a seventh would sit on the stack, which that function's frame does not forward.
-pub const ENV_LANES: usize = 6;
+/// The integer lanes the lane-mapped class forwards: SysV's six integer registers. Its host side (atl-native-bridge ndk.rs `call_mapped`) is one `extern "C" fn` of six words that calls the host function with them; a seventh would sit on the stack, which that function's frame does not forward.
+pub const MAPPED_LANES: usize = 6;
+
+/// What a lane-mapped row's host side does to one argument before it forwards the call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaneMap {
+    /// the guest's `JNIEnv*` -> the host's (a generic row would hand the host library the guest env: tr-first blocker 3)
+    Env,
+    /// a guest function pointer of callback typedef `ty` -> a host-callable down shell entering the guest; `shorty`: its lanes in JNI shorty letters (result first; `J` int lane, `D` fp lane, `V` void), what the down shell places the arguments by
+    Down { ty: String, shorty: String },
+}
+
+/// How a proxy function binds, from its prototype ([`route`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Route {
+    /// no lane needs mapping: the generic route
+    Plain,
+    /// the lane-mapped class: these (parameter index, map) pairs, then the host function with the six int lanes
+    Mapped(Vec<(usize, LaneMap)>),
+    /// a callback parameter whose typedef is not reviewed: trapped by this reason
+    Pending(&'static str),
+}
+
+/// Trap reason of a callback parameter whose type `route`'s caller has not reviewed.
+pub const UNREVIEWED_CALLBACK: &str =
+    "pending: callback-param, callback type not reviewed (build.rs CALLBACKS)";
+
+/// How proxy function `name` with prototype `sig` binds.
+/// JNI types (`JNIEnv*`, `JavaVM*`, a jni.h reference typedef): a generic row would hand the host library the guest's env, which the host cannot use (tr-first blocker 3: `ANativeWindow_fromSurface` -> SEGV in `android_view_Surface_getSurface`), so such a prototype binds only with its `JNIEnv*` mapped, and only when `env_listed` (the caller's reviewed list) names it.
+/// A function-pointer parameter (GS2.2 callback-param): the host would call a guest address. Mapped to a down shell when its typedef is in `callbacks` (the caller's reviewed list: every argument the host passes the callback is a value or guest data, nothing the guest would dereference in host-only memory), else [`Route::Pending`].
+/// Mapped rows forward every parameter as an int lane, at most [`MAPPED_LANES`], the result an int lane or void. Err: why not, naming `name`.
+pub fn route(name: &str, sig: &Signature, env_listed: bool, callbacks: &[&str]) -> Result<Route> {
+    let mut maps = Vec::new();
+    if let Some(i) = env_param(name, sig, env_listed)? {
+        maps.push((i, LaneMap::Env));
+    }
+    for (i, p) in sig.params.iter().enumerate() {
+        let Some(cb) = function(p) else { continue };
+        match typedef_name(p).filter(|t| callbacks.contains(t)) {
+            Some(ty) => maps.push((
+                i,
+                LaneMap::Down {
+                    ty: ty.to_owned(),
+                    shorty: shorty(cb).with_context(|| format!("{name}: callback {ty}"))?,
+                },
+            )),
+            None => return Ok(Route::Pending(UNREVIEWED_CALLBACK)),
+        }
+    }
+    if maps.is_empty() {
+        return Ok(Route::Plain);
+    }
+    ensure!(
+        function(&sig.ret).is_none(),
+        "{name}: a lane-mapped row answering a function pointer would hand the guest a host address"
+    );
+    let params = param_classes(sig).with_context(|| format!("{name}: parameter classes"))?;
+    ensure!(
+        params.len() <= MAPPED_LANES && params.iter().all(|&c| c == Class::Int),
+        "{name}: the lane-mapped class forwards at most {MAPPED_LANES} int lanes, the prototype has {params:?}"
+    );
+    let ret = result_class(&sig.ret).with_context(|| format!("{name}: result class"))?;
+    ensure!(
+        matches!(ret, Class::Int | Class::Void),
+        "{name}: the lane-mapped class answers in an int lane, the result is {ret:?}"
+    );
+    maps.sort_by_key(|&(i, _)| i);
+    Ok(Route::Mapped(maps))
+}
+
+/// A callback signature's lanes as a shorty: the result's letter, then one per parameter. Only the bank matters to the down shell (atl-native-bridge dispatch.rs `down_params`), so every int lane is `J` and every fp lane `D`.
+fn shorty(sig: &Signature) -> Result<String> {
+    ensure!(!sig.variadic, "a variadic callback has no fixed lanes");
+    let letter = |c: Class| match c {
+        Class::Int => Ok('J'),
+        Class::Fp => Ok('D'),
+        Class::Void => Ok('V'),
+        Class::VaList => bail!("a va_list callback argument has no lane"),
+    };
+    let mut s = String::from(letter(result_class(&sig.ret)?)?);
+    for c in param_classes(sig)? {
+        s.push(letter(c)?);
+    }
+    Ok(s)
+}
 
 /// The typedef name a type is spelled with, through `const` and nothing else.
 fn typedef_name(ty: &Ty) -> Option<&str> {
@@ -169,9 +252,8 @@ fn points_to(ty: &Ty, name: &str) -> bool {
     matches!(ty.resolved(), Ty::Pointer { pointee, .. } if typedef_name(pointee) == Some(name))
 }
 
-/// How proxy function `name` with prototype `sig` binds when the prototype has JNI types (`JNIEnv*`, `JavaVM*`, a jni.h reference typedef). A generic row would hand the host library the guest's env, which the host cannot use (tr-first blocker 3: `ANativeWindow_fromSurface` -> SEGV in `android_view_Surface_getSurface`), so such a prototype binds only through the env class, and only when `listed` (the caller's reviewed list) names it.
-/// Ok(None): no JNI type, the generic route applies. Ok(Some(i)): the env class, parameter `i` is the `JNIEnv*` its host side maps; every parameter an int lane, at most [`ENV_LANES`], the result an int lane or void. Err: why not, naming `name`.
-pub fn env_binding(name: &str, sig: &Signature, listed: bool) -> Result<Option<usize>> {
+/// The `JNIEnv*` parameter [`route`] maps. Ok(None): no JNI type. Err: a JNI-typed prototype not `listed`, a `JavaVM*`, or not exactly one `JNIEnv*`; a listed prototype without a JNI type is stale.
+fn env_param(name: &str, sig: &Signature, listed: bool) -> Result<Option<usize>> {
     let env: Vec<usize> = (0..sig.params.len())
         .filter(|&i| points_to(&sig.params[i], "JNIEnv"))
         .collect();
@@ -199,16 +281,6 @@ pub fn env_binding(name: &str, sig: &Signature, listed: bool) -> Result<Option<u
             env.len()
         );
     };
-    let params = param_classes(sig).with_context(|| format!("{name}: parameter classes"))?;
-    ensure!(
-        params.len() <= ENV_LANES && params.iter().all(|&c| c == Class::Int),
-        "{name}: the env class forwards at most {ENV_LANES} int lanes, the prototype has {params:?}"
-    );
-    let ret = result_class(&sig.ret).with_context(|| format!("{name}: result class"))?;
-    ensure!(
-        matches!(ret, Class::Int | Class::Void),
-        "{name}: the env class answers in an int lane, the result is {ret:?}"
-    );
     Ok(Some(index))
 }
 
@@ -354,15 +426,16 @@ mod tests {
         }
     }
 
-    /// tr-first blocker 3, the build-time refusal: NDK-shaped prototypes in a fixture header. Expected outcomes are written from the C shapes and `env_binding`'s rule, not from running it: a JNI-typed prototype not listed fails naming itself; listed, the env class maps the `JNIEnv*` at its position; JavaVM*, two envs, an fp lane, seven lanes and a reference without an env each fail by their own reason; a plain prototype stays generic, and listing it is stale.
+    /// tr-first blocker 3, the build-time refusal: NDK-shaped prototypes in a fixture header. Expected outcomes are written from the C shapes and `route`'s rule, not from running it: a JNI-typed prototype not listed fails naming itself; listed, its `JNIEnv*` is mapped at its position; JavaVM*, two envs, an fp lane, seven lanes and a reference without an env each fail by their own reason; a plain prototype stays generic, and listing it is stale.
     #[test]
-    fn env_binding_refuses_unlisted_jni_prototypes() {
+    fn route_refuses_unlisted_jni_prototypes() {
         let iface = parse(
             "env",
             "typedef void *jobject;\ntypedef jobject jclass;\ntypedef const struct JNINativeInterface *JNIEnv;\ntypedef const struct JNIInvokeInterface *JavaVM;\nstruct ANativeWindow;\nstruct ANativeWindow *ANativeWindow_fromSurface(JNIEnv *env, jobject surface);\nint lock_at_two(void *a, void *b, JNIEnv *env, jobject o);\njobject to_java(JNIEnv *env, struct ANativeWindow *w);\nint from_vm(JavaVM *vm);\nint two_envs(JNIEnv *a, JNIEnv *b);\nint fp_lane(JNIEnv *env, float f);\nint seven(JNIEnv *e, int a, int b, int c, int d, int f, int g);\nint ref_only(jclass c);\nint plain(struct ANativeWindow *w);\n",
         );
         let view = &iface.arches["x86_64"];
-        let bind = |name: &str, listed: bool| env_binding(name, &view.functions[name], listed);
+        let bind = |name: &str, listed: bool| route(name, &view.functions[name], listed, &[]);
+        let env_at = |i| Route::Mapped(vec![(i, LaneMap::Env)]);
         let err = format!(
             "{:#}",
             bind("ANativeWindow_fromSurface", false).unwrap_err()
@@ -372,9 +445,9 @@ mod tests {
                 && err.contains("list it for the env class"),
             "{err}"
         );
-        assert_eq!(bind("ANativeWindow_fromSurface", true).unwrap(), Some(0));
-        assert_eq!(bind("lock_at_two", true).unwrap(), Some(2));
-        assert_eq!(bind("to_java", true).unwrap(), Some(0));
+        assert_eq!(bind("ANativeWindow_fromSurface", true).unwrap(), env_at(0));
+        assert_eq!(bind("lock_at_two", true).unwrap(), env_at(2));
+        assert_eq!(bind("to_java", true).unwrap(), env_at(0));
         for (name, why) in [
             ("from_vm", "JavaVM*"),
             ("two_envs", "exactly one JNIEnv*"),
@@ -385,9 +458,53 @@ mod tests {
             let e = format!("{:#}", bind(name, true).unwrap_err());
             assert!(e.starts_with(name) && e.contains(why), "{name}: {e}");
         }
-        assert_eq!(bind("plain", false).unwrap(), None);
+        assert_eq!(bind("plain", false).unwrap(), Route::Plain);
         let stale = format!("{:#}", bind("plain", true).unwrap_err());
         assert!(stale.contains("no JNI type"), "{stale}");
+    }
+
+    /// GS2.2 callback-param (tr-first blocker 5), NDK-shaped prototypes. Expected outcomes from the C shapes: looper.h's `ALooper_addFd` maps lane 4 to a down shell of `int(int, int, void*)` = `JJJJ`; choreographer.h's frame callback `void(long, void*)` = `VJJ`; a double argument takes `D`; an unreviewed typedef and an unnamed function-pointer type stay pending; a seven-lane prototype fails by the lane rule.
+    #[test]
+    fn route_maps_reviewed_callbacks_to_down_shells() {
+        let iface = parse(
+            "cb",
+            "typedef struct ALooper ALooper;\ntypedef int (*ALooper_callbackFunc)(int fd, int events, void *data);\ntypedef void (*AChoreographer_frameCallback)(long t, void *data);\ntypedef void (*fp_cb)(double v, void *data);\ntypedef void (*other_cb)(void *data);\nint ALooper_addFd(ALooper *l, int fd, int ident, int events, ALooper_callbackFunc cb, void *data);\nvoid post(void *c, AChoreographer_frameCallback cb, void *data);\nvoid with_fp(fp_cb cb, void *data);\nvoid unreviewed(other_cb cb);\nvoid unnamed(void (*cb)(void *));\nint seven(ALooper_callbackFunc cb, int a, int b, int c, int d, int e, int f);\n",
+        );
+        let view = &iface.arches["x86_64"];
+        let reviewed = [
+            "ALooper_callbackFunc",
+            "AChoreographer_frameCallback",
+            "fp_cb",
+        ];
+        let bind = |name: &str| route(name, &view.functions[name], false, &reviewed);
+        let down = |i, ty: &str, shorty: &str| {
+            Route::Mapped(vec![(
+                i,
+                LaneMap::Down {
+                    ty: ty.to_owned(),
+                    shorty: shorty.to_owned(),
+                },
+            )])
+        };
+        assert_eq!(
+            bind("ALooper_addFd").unwrap(),
+            down(4, "ALooper_callbackFunc", "JJJJ")
+        );
+        assert_eq!(
+            bind("post").unwrap(),
+            down(1, "AChoreographer_frameCallback", "VJJ")
+        );
+        assert_eq!(bind("with_fp").unwrap(), down(0, "fp_cb", "VDJ"));
+        assert_eq!(
+            bind("unreviewed").unwrap(),
+            Route::Pending(UNREVIEWED_CALLBACK)
+        );
+        assert_eq!(
+            bind("unnamed").unwrap(),
+            Route::Pending(UNREVIEWED_CALLBACK)
+        );
+        let e = format!("{:#}", bind("seven").unwrap_err());
+        assert!(e.starts_with("seven") && e.contains("at most 6"), "{e}");
     }
 
     /// The emitted text type-checks under rustc, with one 8-slot table.

@@ -149,6 +149,15 @@ public final class AtlJniTest {
     /** G6b: 1 when the library's DT_NEEDED libmediandk.so proxy loaded and AMediaFormat_new resolved (atl_jni_test.c mediandkLinked). */
     public static native int mediandkLinked();
 
+    /** tr-first blocker 5: a guest ALooper callback called by the host during ALooper_pollOnce on this thread (atl_jni_test.c looperNow). Main thread. */
+    public static native String looperNow();
+
+    /** tr-first blocker 5: registers a guest callback on the main looper from this thread and readies its fd (atl_jni_test.c looperArm). */
+    public static native String looperArm();
+
+    /** tr-first blocker 5: what the main Looper's later call of looperArm's callback recorded (atl_jni_test.c looperLater). Main thread. */
+    public static native String looperLater();
+
     /** Bound by RegisterNatives in JNI_OnLoad. */
     public static native int registeredAnswer();
 
