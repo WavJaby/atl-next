@@ -262,8 +262,26 @@ fn report(plans: &[TreePlan], total: &mut Sweep, roots: &mut BTreeMap<String, Sw
     }
 }
 
+/// What a prune removes: units and sessions (`slot prune`), or sessions only (the end of a build, `prune_sessions`).
+#[derive(Clone, Copy, Debug)]
+enum Scope {
+    /// units last used `cutoff` seconds or more ago, and the stale sessions
+    Everything { cutoff: u64 },
+    /// stale sessions only: units keep their `--older-than` rule
+    SessionsOnly,
+}
+
 /// Plans slot `n`'s prune and, with `execute`, removes what it names. Holds the slot's lock for the whole call.
 pub fn prune_slot(ws: &Path, n: u32, cutoff: u64, now: u64, execute: bool) -> Result<Outcome> {
+    prune_slot_in(ws, n, Scope::Everything { cutoff }, now, execute)
+}
+
+/// The end of a build in slot `n` (`slot::after_build`): removes the slot's stale incremental sessions, never units. Busy while any process holds the slot, so the caller drops its own shared hold first.
+pub fn prune_sessions(ws: &Path, n: u32, now: u64) -> Result<Outcome> {
+    prune_slot_in(ws, n, Scope::SessionsOnly, now, true)
+}
+
+fn prune_slot_in(ws: &Path, n: u32, scope: Scope, now: u64, execute: bool) -> Result<Outcome> {
     let dir = slot::slot_dir(ws, n);
     match fs::symlink_metadata(&dir) {
         Ok(meta) => ensure!(
@@ -279,15 +297,36 @@ pub fn prune_slot(ws: &Path, n: u32, cutoff: u64, now: u64, execute: bool) -> Re
         return Ok(Outcome::Busy);
     };
     let found = trees_under(&slot_roots(&dir)?)?;
-    Ok(Outcome::Done(prune_trees(
-        ws, &found, cutoff, now, execute,
-    )?))
+    Ok(Outcome::Done(prune_trees(ws, &found, scope, now, execute)?))
 }
 
 /// The trees no slot owns (`--all`): `repo/target` and the EGL driver probes. Each is busy-checked by its own `.cargo-lock`.
 pub fn prune_unslotted(ws: &Path, cutoff: u64, now: u64, execute: bool) -> Result<Vec<TreePlan>> {
     let found = trees_under(&unslotted_roots(ws)?)?;
-    prune_trees(ws, &found, cutoff, now, execute)
+    prune_trees(ws, &found, Scope::Everything { cutoff }, now, execute)
+}
+
+/// The sessions of an unslotted target dir (the main checkout's `repo/target`), without units. Each tree is busy-checked by its own `.cargo-lock`.
+pub fn prune_target_sessions(ws: &Path, target: &Path, now: u64) -> Result<Vec<TreePlan>> {
+    let found = trees_under(&[target.to_owned()])?;
+    prune_trees(ws, &found, Scope::SessionsOnly, now, true)
+}
+
+/// The one line the end of a build prints for `what` (a slot or a target dir): sessions removed and kept, their bytes, busy trees.
+pub fn sessions_line(what: &str, plans: &[TreePlan]) -> String {
+    let removed: usize = plans.iter().map(|p| p.sessions.len()).sum();
+    let bytes: u64 = plans.iter().map(TreePlan::session_bytes).sum();
+    let kept: usize = plans.iter().map(|p| p.kept_sessions).sum();
+    let busy = plans.iter().filter(|p| p.busy).count();
+    let busy = if busy == 0 {
+        String::new()
+    } else {
+        format!(", {busy} tree(s) busy, skipped")
+    };
+    format!(
+        "session prune: {what}: removed {removed} stale session entries ({}), kept {kept}{busy}",
+        human(bytes)
+    )
 }
 
 /// The slot number `n` when `dir` is exactly `<ws>/out/slot-<n>`, `n` >= 1 in canonical spelling. Whether `n` is within `build.slots` is the callers' check (`slot::pool`, `run`), so this reads no config.
@@ -367,7 +406,7 @@ fn is_tree(dir: &Path) -> Result<bool> {
 fn prune_trees(
     ws: &Path,
     found: &[Found],
-    cutoff: u64,
+    scope: Scope,
     now: u64,
     execute: bool,
 ) -> Result<Vec<TreePlan>> {
@@ -397,7 +436,7 @@ fn prune_trees(
                 ..TreePlan::default()
             });
         } else {
-            plans.push(plan_tree(&f.dir, root, tree, now, cutoff)?);
+            plans.push(plan_tree(&f.dir, root, tree, now, scope)?);
         }
     }
     if execute {
@@ -445,15 +484,26 @@ fn hold_tree(tree: &Path) -> Result<Option<File>> {
     }
 }
 
-/// The plan for one tree (its `.cargo-lock` held by the caller). Units are the fingerprint dirs; `build/`, `deps/`, `examples/` files are attributed by hash, uplifted links by inode. A unit's last use is its record entry; without one, its fingerprint dir's mtime. Stale when that is older than the cutoff.
-fn plan_tree(tree: &Path, root: String, label: String, now: u64, cutoff: u64) -> Result<TreePlan> {
-    let record = unit_use::load(tree)?;
+/// The plan for one tree (its `.cargo-lock` held by the caller): its stale sessions in both scopes, its units under `Everything` only.
+fn plan_tree(tree: &Path, root: String, label: String, now: u64, scope: Scope) -> Result<TreePlan> {
     let mut plan = TreePlan {
         root,
         tree: label,
         dir: tree.to_owned(),
         ..TreePlan::default()
     };
+    if let Scope::Everything { cutoff } = scope {
+        plan_units(tree, now, cutoff, &mut plan)?;
+    }
+    let (sessions, kept) = stale_sessions(tree, now)?;
+    plan.sessions = sessions;
+    plan.kept_sessions = kept;
+    Ok(plan)
+}
+
+/// Plans the units of `tree` into `plan`. Units are the fingerprint dirs; `build/`, `deps/`, `examples/` files are attributed by hash, uplifted links by inode. A unit's last use is its record entry; without one, its fingerprint dir's mtime. Stale when that is older than the cutoff.
+fn plan_units(tree: &Path, now: u64, cutoff: u64, plan: &mut TreePlan) -> Result<()> {
+    let record = unit_use::load(tree)?;
     let mut units: Vec<(PathBuf, String)> = Vec::new();
     for dir in children(&tree.join(FINGERPRINT))? {
         plan.units += 1;
@@ -524,10 +574,7 @@ fn plan_tree(tree: &Path, root: String, label: String, now: u64, cutoff: u64) ->
             plan.orphan_bytes += unique_bytes(std::slice::from_ref(path))?;
         }
     }
-    let (sessions, kept) = stale_sessions(tree, now)?;
-    plan.sessions = sessions;
-    plan.kept_sessions = kept;
-    Ok(plan)
+    Ok(())
 }
 
 /// Stale when the last use is more than `cutoff` seconds before `now`. A use in the future, or a sum that overflows, is kept.
@@ -1491,5 +1538,127 @@ mod tests {
             !is_stale(1, u64::MAX, u64::MAX),
             "an overflowing sum is kept"
         );
+    }
+
+    /// The session dirs of crate dir `x`, sorted; lock files left out.
+    fn session_dirs(x: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(x)
+            .expect("crate dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(SESSION) && !name.ends_with(LOCK_EXT))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// `prune_sessions` again once the lock is free; a `Busy` while the previous hold drains is retried, as in `prune_once_free`.
+    fn sessions_once_free(ws: &Path, n: u32, now: u64) -> Vec<TreePlan> {
+        for _ in 0..FREE_TRIES {
+            match prune_sessions(ws, n, now).expect("prune") {
+                Outcome::Busy => std::thread::sleep(FREE_POLL),
+                done => return only_plan(done),
+            }
+        }
+        panic!("slot {n} stayed busy after {FREE_TRIES} tries");
+    }
+
+    #[test]
+    fn session_prune_takes_stale_sessions_and_no_unit() {
+        let ws = scratch("sessions-only");
+        let release = tree_fixture(&ws);
+        write_record(&release, &recent_uses());
+        let debug = ws.join("out/slot-1/cargo/debug");
+        fs::create_dir_all(debug.join(FINGERPRINT)).expect("fingerprint");
+        let x = incremental_fixture(&debug);
+        let _held = hold_incremental_locks(&x);
+        let plans = only_plan(prune_sessions(&ws, 1, NOW).expect("prune"));
+        assert!(plans.iter().all(|p| p.stale.is_empty()), "a unit was planned");
+        for gone in ["s-1-a-svh1", "s-1-a.lock", "s-4-d-working", "s-4-d.lock", "s-7-g.lock"] {
+            assert!(!x.join(gone).exists(), "{gone} survived");
+        }
+        for kept in ["s-2-b-svh2", "s-5-e-working", "s-9-z-svh9", "s-x", "s-8-h.lock"] {
+            assert!(x.join(kept).exists(), "{kept} was removed");
+        }
+        for unit in [STALE, OLD, NEVER] {
+            assert!(
+                release.join(FINGERPRINT).join(unit).exists(),
+                "unit {unit} was removed"
+            );
+        }
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// The caller's own shared hold blocks the prune (why `finish_build` drops it first); once free, the prune runs.
+    #[test]
+    fn session_prune_skips_a_slot_a_build_holds() {
+        let ws = scratch("sessions-busy");
+        let debug = ws.join("out/slot-1/cargo/debug");
+        fs::create_dir_all(debug.join(FINGERPRINT)).expect("fingerprint");
+        let x = incremental_fixture(&debug);
+        let build = build_pool::hold_slot(&ws, 1, || {}).expect("build holds slot 1");
+        assert!(matches!(
+            prune_sessions(&ws, 1, NOW).expect("prune"),
+            Outcome::Busy
+        ));
+        assert!(x.join("s-1-a-svh1").exists(), "a busy slot was pruned");
+        drop(build);
+        sessions_once_free(&ws, 1, NOW);
+        assert!(
+            !x.join("s-1-a-svh1").exists(),
+            "stale session survived once the slot was free"
+        );
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    #[test]
+    fn session_prune_leaves_the_other_slots_alone() {
+        let ws = scratch("sessions-other-slot");
+        let one = ws.join("out/slot-1/cargo/debug");
+        let two = ws.join("out/slot-2/cargo/debug");
+        fs::create_dir_all(one.join(FINGERPRINT)).expect("fingerprint");
+        fs::create_dir_all(two.join(FINGERPRINT)).expect("fingerprint");
+        let x1 = incremental_fixture(&one);
+        let x2 = incremental_fixture(&two);
+        sessions_once_free(&ws, 1, NOW);
+        assert!(!x1.join("s-1-a-svh1").exists(), "slot 1's stale session survived");
+        assert!(x2.join("s-1-a-svh1").exists(), "slot 2's session was pruned");
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// Two finalized sessions in one crate dir, as a crate's last two builds leave them: the call takes the older one and keeps the newest.
+    #[test]
+    fn after_a_build_only_the_newest_session_is_left() {
+        let ws = scratch("sessions-steady");
+        let debug = ws.join("out/slot-1/cargo/debug");
+        fs::create_dir_all(debug.join(FINGERPRINT)).expect("fingerprint");
+        let x = debug.join("incremental/atl_x-0123456789abcdef");
+        sized(&x.join("s-1-a-svh1/query-cache.bin"), 100);
+        sized(&x.join("s-2-b-svh2/query-cache.bin"), 200);
+        fs::write(x.join("s-1-a.lock"), "").expect("lock");
+        fs::write(x.join("s-2-b.lock"), "").expect("lock");
+        let plans = sessions_once_free(&ws, 1, NOW);
+        assert_eq!(session_dirs(&x), ["s-2-b-svh2"]);
+        assert_eq!(plans.iter().map(TreePlan::session_bytes).sum::<u64>(), 100);
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    #[test]
+    fn sessions_line_names_what_was_removed() {
+        let plans = [TreePlan {
+            sessions: vec![Session {
+                dir: None,
+                lock: None,
+                bytes: 2048,
+                _held: None,
+            }],
+            kept_sessions: 3,
+            ..TreePlan::default()
+        }];
+        let line = sessions_line("slot 2", &plans);
+        assert!(
+            line.starts_with("session prune: slot 2: removed 1 stale session entries ("),
+            "{line}"
+        );
+        assert!(line.ends_with("), kept 3"), "{line}");
     }
 }

@@ -5,11 +5,12 @@
 //! Resolution per flag: explicit flag > the checkout's slot > the old default. The old default prints a note naming `cargo xtask slot assign`, so it is never taken silently.
 //! A record that cannot be read as a slot in the pool is an error, never a silent fallback.
 //! A slot held by a live other checkout is refused unless `--force`; a record whose checkout directory is gone is stale and may be reassigned.
-//! A process that resolves a slot holds its slot lock (`build_pool::hold_slot`) until it exits; `slot prune` skips a slot whose lock it cannot take.
+//! A process that resolves a slot holds its slot lock (`build_pool::hold_slot`) until it exits, or until `after_build` releases it to prune the slot's stale sessions; `slot prune` skips a slot whose lock it cannot take.
 //! A slotted checkout's `target/` is a symlink to `out/slot-<n>/target`, so every cargo build there (xtask, `cargo test`, clippy) builds into its slot: one target dir per slot. A symlink because it is the only per-checkout switch cargo reads with no tracked file or env var; `.gitignore`'s `/target` matches it (`/target/` does not match a symlink).
 //! `cargo clean` unlinks the link and keeps the slot's files: the checkout then builds into a real `target/` until `slot assign --execute` relinks it (`slot show` reports which).
 //! A slot's target leaves with its holder: land removes it (`leave`); an assign wipes it when its holder is stale or its checkout moves to another slot.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Mutex;
@@ -19,7 +20,8 @@ use atl_layout::Layout;
 
 use crate::build_pool::{self, SlotLock};
 use crate::git::git;
-use crate::slot_prune;
+use crate::slot_prune::{self, Outcome};
+use crate::unit_use;
 use crate::ws_config::{self, WsConfig};
 
 /// The pool size (`build.slots`, `ws_config::DEFAULT_SLOTS` explains the default), refused while any record holds a slot above it: lowering the limit would strand that checkout's out dir and record.
@@ -192,6 +194,67 @@ fn hold_if_slot(ws: &Path, dir: &Path) -> Result<()> {
         let lock = build_pool::hold_slot(ws, n, || eprintln!("slot {n}: being pruned, waiting"))?;
         held.push((n, lock));
     }
+    Ok(())
+}
+
+/// The end of a checkout's build (`native`, `check`, `cross`, the harness commands): the stale incremental sessions of the trees it wrote go, one line per slot. `result` passes through unless the prune fails.
+pub fn after_build(root: &Path, result: Result<ExitCode>) -> Result<ExitCode> {
+    match (result, finish_build(root)) {
+        (result, Ok(())) => result,
+        (Ok(_), Err(e)) => Err(e),
+        (Err(e), Err(prune)) => {
+            eprintln!("session prune: {prune:#}");
+            Err(e)
+        }
+    }
+}
+
+/// Prunes the sessions of this process's slots and of the checkout's record slot; with no slot, of the checkout's own target dir.
+fn finish_build(root: &Path) -> Result<()> {
+    let ws = Layout::of(root)?.workspace().to_owned();
+    let now = unit_use::now()?;
+    // a shared hold blocks the prune, so the slots this process resolved are released first
+    let mut slots = release_holds()?;
+    slots.extend(read_record(&record_of(root)?)?);
+    if slots.is_empty() {
+        return finish_target(&ws, &root.join(TARGET), now);
+    }
+    for n in slots {
+        let line = match slot_prune::prune_sessions(&ws, n, now)? {
+            Outcome::NotBuilt => format!("session prune: slot {n}: not built"),
+            Outcome::Busy => format!("session prune: slot {n}: busy, skipped: another process holds it"),
+            Outcome::Done(plans) => slot_prune::sessions_line(&format!("slot {n}"), &plans),
+        };
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// Drops this process's slot locks (`hold_if_slot`) and returns their slot numbers.
+fn release_holds() -> Result<BTreeSet<u32>> {
+    let mut held = HELD
+        .lock()
+        .map_err(|_| anyhow::anyhow!("slot lock table poisoned"))?;
+    Ok(held.drain(..).map(|(n, _lock)| n).collect())
+}
+
+/// No slot: the checkout's own target dir (the main checkout's `repo/target`). A link is refused: no record names the dir it points at.
+fn finish_target(ws: &Path, target: &Path, now: u64) -> Result<()> {
+    let label = target.strip_prefix(ws).unwrap_or(target).display().to_string();
+    match std::fs::symlink_metadata(target) {
+        Ok(meta) if meta.file_type().is_symlink() => bail!(
+            "refused: {} is a link and this checkout has no slot record",
+            target.display()
+        ),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("session prune: {label}: no target dir");
+            return Ok(());
+        }
+        Err(e) => return Err(e).with_context(|| format!("reading {}", target.display())),
+    }
+    let plans = slot_prune::prune_target_sessions(ws, target, now)?;
+    println!("{}", slot_prune::sessions_line(&label, &plans));
     Ok(())
 }
 

@@ -145,6 +145,16 @@ pub fn main() -> Result<ExitCode> {
             return Ok(code);
         }
     }
+    // commands whose cargo builds write the checkout's target dir: their stale incremental sessions go when they end (slot::after_build)
+    let builds_trees = matches!(
+        cli.command,
+        Command::Native(_)
+            | Command::Check(_)
+            | Command::Cross(_)
+            | Command::Test(_)
+            | Command::RunApk(_)
+            | Command::Remote(_)
+    );
     let result = match cli.command {
         Command::Check(args) => check::run(&root, &args),
         Command::Deps(args) => deps::run(&root, &args),
@@ -172,6 +182,11 @@ pub fn main() -> Result<ExitCode> {
         Command::RunApk(p) => harness::pass_through(&root, "run-apk", &p.args),
         Command::Remote(p) => harness::pass_through(&root, "remote", &p.args),
         Command::Test(p) => harness::pass_through(&root, "test", &p.args),
+    };
+    let result = if builds_trees {
+        slot::after_build(&root, result)
+    } else {
+        result
     };
     // a run that ends in an error (`?`, bail!) still ends with its verdict line; main prints the error after it
     if let (Err(e), Some(name)) = (&result, name) {
