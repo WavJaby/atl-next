@@ -306,6 +306,7 @@ fn link(tools: &ApkTools, dir: &Path, manifest_text: &str) -> Result<PathBuf> {
             .arg(&apk),
         "aapt2 link",
     )?;
+    tools.signer.sign(&apk)?;
     Ok(apk)
 }
 

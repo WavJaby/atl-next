@@ -113,6 +113,14 @@ const SERVICE_LINES: [(&str, &str, &str); 2] = [
 ];
 /// Main.priority's line: `start=<n> background=<r>/<nice> restore=<r>/<nice> foreground=<r>/<nice>`, r = `ok` or the throwable's simple name ([`priority_why`]).
 const PRIORITY: &str = "AtlTest: priority: ";
+/// Main.signatures' line: the fixture's signer as GET_SIGNATURES and GET_SIGNING_CERTIFICATES return it and checkSignatures against itself ([`signatures_want`]).
+const SIGNATURES: &str = "AtlTest: signatures: ";
+
+/// The signatures line for an APK whose one signer's certificate SHA-256 is `cert` (from `apksigner verify --print-certs`, not our code): one signature and one current signer with that digest,
+/// no rotation history (apksigner signs with one key, no lineage), and checkSignatures of a package with itself SIGNATURE_MATCH (0, PackageManager.java:1480).
+fn signatures_want(cert: &str) -> String {
+    format!("signatures=1 sig0={cert} signers=1 signer0={cert} history=false check=0")
+}
 /// Main.priority's requests in order (android.os.Process THREAD_PRIORITY_BACKGROUND 10, the start value, THREAD_PRIORITY_FOREGROUND -2); None = the start value.
 const PRIORITY_ASKS: [(&str, Option<i32>); 3] = [
     ("background", Some(10)),
@@ -780,6 +788,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Some(&native),
         Some(&assets),
     )?;
+    let cert = rt.apk.signer.cert_sha256(&apk)?;
     let m = manifest::read(&rt.apk.aapt2, &apk)?;
     let activity = m
         .launch_activity()
@@ -919,6 +928,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         if passed && got.as_deref() != Some(want) {
             whys.push(format!("{service}: want {want:?}, got {got:?}"));
         }
+    }
+    let signatures = app.lines().find_map(|l| {
+        l.split_once(SIGNATURES)
+            .map(|(_, r)| r.trim_end().to_owned())
+    });
+    let want = signatures_want(&cert);
+    if passed && signatures.as_deref() != Some(want.as_str()) {
+        whys.push(format!("signatures: want {want:?}, got {signatures:?}"));
     }
     let priority = app
         .lines()

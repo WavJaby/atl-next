@@ -89,6 +89,7 @@ public class Main extends Activity {
         mediaPlayer();
         Log.i("AtlTest", "connectivity: " + connectivity());
         Log.i("AtlTest", "permission: " + permission());
+        Log.i("AtlTest", "signatures: " + signatures());
         Log.i("AtlTest", "priority: " + priority());
         mediaPlayerService();
         mediaExtractorWav();
@@ -168,6 +169,43 @@ public class Main extends Activity {
         } catch (Throwable t) {
             return "threw " + t;
         }
+    }
+
+    /**
+     * "signatures=<n> sig0=<sha256> signers=<n> signer0=<sha256> history=<bool> check=<int>": this package's GET_SIGNATURES array and GET_SIGNING_CERTIFICATES SigningInfo (the Facebook SDK's
+     * getKeyHash path), each certificate's SHA-256 in lower hex, and checkSignatures against itself; `null` for a missing array or info; else what it threw.
+     */
+    private String signatures() {
+        try {
+            android.content.pm.PackageManager pm = getPackageManager();
+            android.content.pm.PackageInfo old = pm.getPackageInfo(getPackageName(), android.content.pm.PackageManager.GET_SIGNATURES);
+            android.content.pm.PackageInfo now = pm.getPackageInfo(getPackageName(), android.content.pm.PackageManager.GET_SIGNING_CERTIFICATES);
+            StringBuilder out = new StringBuilder();
+            if (old.signatures == null) {
+                out.append("signatures=null");
+            } else {
+                out.append("signatures=").append(old.signatures.length).append(" sig0=").append(sha256(old.signatures[0].toByteArray()));
+            }
+            if (now.signingInfo == null) {
+                out.append(" signers=null");
+            } else {
+                android.content.pm.Signature[] s = now.signingInfo.getApkContentsSigners();
+                out.append(" signers=").append(s.length).append(" signer0=").append(sha256(s[0].toByteArray()))
+                        .append(" history=").append(now.signingInfo.hasPastSigningCertificates());
+            }
+            out.append(" check=").append(pm.checkSignatures(getPackageName(), getPackageName()));
+            return out.toString();
+        } catch (Throwable t) {
+            return "threw " + t;
+        }
+    }
+
+    private static String sha256(byte[] bytes) throws java.security.NoSuchAlgorithmException {
+        StringBuilder hex = new StringBuilder();
+        for (byte b : java.security.MessageDigest.getInstance("SHA-256").digest(bytes)) {
+            hex.append(String.format("%02x", b & 0xff));
+        }
+        return hex.toString();
     }
 
     /** The font gate's text (app.rs FONT_TEXT). */

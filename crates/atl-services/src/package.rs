@@ -14,6 +14,7 @@ use atl_parcelables::android::content::pm::{
     ActivityInfo, ApplicationInfo, InstrumentationInfo, PackageInfo, ParceledListSlice,
     ProviderInfo, ServiceInfo,
 };
+use atl_parcelables::codecs::android::content::pm::PackageInfo::{Signature, SigningDetails};
 use atl_parcelables::parts::{ComponentInfo, SharedLibraryInfo};
 use binder::{ExceptionCode, Interface, Status, ThreadState};
 
@@ -28,9 +29,16 @@ const USER_SYSTEM: i32 = 0;
 /// SharedLibraryInfo.TYPE_BUILTIN and VERSION_UNDEFINED (SharedLibraryInfo.java:60, :92).
 const SHARED_LIBRARY_TYPE_BUILTIN: i32 = 0;
 const SHARED_LIBRARY_VERSION_UNDEFINED: i64 = -1;
-/// PackageManager.SIGNATURE_MATCH / SIGNATURE_UNKNOWN_PACKAGE (PackageManager.java:1480, :1510).
+/// PackageManager.SIGNATURE_MATCH, NEITHER_SIGNED, FIRST_NOT_SIGNED, SECOND_NOT_SIGNED, NO_MATCH, UNKNOWN_PACKAGE (PackageManager.java:1480-1510).
 const SIGNATURE_MATCH: i32 = 0;
+const SIGNATURE_NEITHER_SIGNED: i32 = 1;
+const SIGNATURE_FIRST_NOT_SIGNED: i32 = -1;
+const SIGNATURE_SECOND_NOT_SIGNED: i32 = -2;
+const SIGNATURE_NO_MATCH: i32 = -3;
 const SIGNATURE_UNKNOWN_PACKAGE: i32 = -4;
+/// PackageManager.GET_SIGNATURES, GET_SIGNING_CERTIFICATES (PackageManager.java:1084, :1309).
+const GET_SIGNATURES: i64 = 0x40;
+const GET_SIGNING_CERTIFICATES: i64 = 0x0800_0000;
 /// PackageManager.GET_ACTIVITIES, GET_RECEIVERS, GET_SERVICES, GET_PROVIDERS, GET_INSTRUMENTATION, GET_PERMISSIONS (PackageManager.java): what PackageInfoCommonUtils.generate copies.
 const GET_ACTIVITIES: i64 = 0x1;
 const GET_RECEIVERS: i64 = 0x2;
@@ -209,6 +217,17 @@ impl PackageManager {
             },
             requested_permissions_flags: if flags & GET_PERMISSIONS != 0 {
                 info.requested_permissions_flags.clone()
+            } else {
+                None
+            },
+            // the installer's generate asked for both signer forms (PackageInfoCommonUtils.generate:196-219 decides their content); each is kept only under its own flag
+            signatures: if flags & GET_SIGNATURES != 0 {
+                info.signatures.clone()
+            } else {
+                None
+            },
+            signing_info: if flags & GET_SIGNING_CERTIFICATES != 0 {
+                info.signing_info.clone()
             } else {
                 None
             },
@@ -437,20 +456,86 @@ impl IPackageManager for PackageManager {
         Ok(Some(ParceledListSlice::new(instrumentation)))
     }
 
-    /// ComputerEngine.checkSignatures:4199-4217: SIGNATURE_UNKNOWN_PACKAGE when either package is not installed or the caller may not see it; otherwise checkSignaturesInternal compares the signing
-    /// details. Nothing here reads or verifies APK signatures (no package has any), so two known packages always compare as SIGNATURE_MATCH.
+    /// ComputerEngine.checkSignatures:4199-4217: SIGNATURE_UNKNOWN_PACKAGE when either package is not installed or the caller may not see it; otherwise checkSignaturesInternal compares the
+    /// signing details the installer verified.
     fn r#checkSignatures(
         &self,
         pkg1: Option<&str>,
         pkg2: Option<&str>,
         user: i32,
     ) -> binder::Result<i32> {
-        let known = |n| self.visible(n, user).is_some();
-        Ok(if known(pkg1) && known(pkg2) {
-            SIGNATURE_MATCH
-        } else {
-            SIGNATURE_UNKNOWN_PACKAGE
-        })
+        let (Some(p1), Some(p2)) = (self.visible(pkg1, user), self.visible(pkg2, user)) else {
+            return Ok(SIGNATURE_UNKNOWN_PACKAGE);
+        };
+        Ok(check_signatures(
+            p1.info.signing_info.as_ref(),
+            p2.info.signing_info.as_ref(),
+        ))
+    }
+}
+
+/// The signers of `d`: none for UNKNOWN (SigningDetails.UNKNOWN has null signatures).
+fn signers(d: &SigningDetails) -> Option<Vec<&Signature>> {
+    match d {
+        SigningDetails::Unknown => None,
+        SigningDetails::Known { signatures, .. } => {
+            signatures.as_ref().map(|s| s.iter().flatten().collect())
+        }
+    }
+}
+
+/// The oldest signer of a lineage, if `d` has one (SigningDetails.hasPastSigningCertificates: non-null and non-empty).
+fn oldest_signer(d: &SigningDetails) -> Option<&Signature> {
+    match d {
+        SigningDetails::Known {
+            past_signing_certificates: Some(past),
+            ..
+        } => past.first()?.as_ref(),
+        _ => None,
+    }
+}
+
+/// ComputerEngine.checkSignaturesInternal:4276-4303: a null details is not signed; compareSignatures on the current signers, and when that does not match and either has a lineage, the oldest
+/// signer of each lineage instead (pre-rotation clients).
+fn check_signatures(d1: Option<&SigningDetails>, d2: Option<&SigningDetails>) -> i32 {
+    let (Some(d1), Some(d2)) = (d1, d2) else {
+        return match (d1, d2) {
+            (None, None) => SIGNATURE_NEITHER_SIGNED,
+            (None, Some(_)) => SIGNATURE_FIRST_NOT_SIGNED,
+            _ => SIGNATURE_SECOND_NOT_SIGNED,
+        };
+    };
+    let result = compare_signature_arrays(signers(d1), signers(d2));
+    if result == SIGNATURE_MATCH {
+        return result;
+    }
+    let (o1, o2) = (oldest_signer(d1), oldest_signer(d2));
+    if o1.is_none() && o2.is_none() {
+        return result;
+    }
+    let pick = |o: Option<&Signature>, d| o.map(|s| vec![s]).or_else(|| signers(d));
+    compare_signature_arrays(pick(o1, d1), pick(o2, d2))
+}
+
+/// PackageManagerServiceUtils.compareSignatureArrays:394-430: null sides are unsigned; otherwise equal as sets (Signature.equals compares the bytes).
+fn compare_signature_arrays(s1: Option<Vec<&Signature>>, s2: Option<Vec<&Signature>>) -> i32 {
+    match (s1, s2) {
+        (None, None) => SIGNATURE_NEITHER_SIGNED,
+        (None, Some(_)) => SIGNATURE_FIRST_NOT_SIGNED,
+        (Some(_), None) => SIGNATURE_SECOND_NOT_SIGNED,
+        (Some(a), Some(b)) => {
+            if a.len() != b.len() {
+                return SIGNATURE_NO_MATCH;
+            }
+            let set = |v: Vec<&Signature>| -> std::collections::BTreeSet<Option<Vec<u8>>> {
+                v.into_iter().map(|s| s.bytes.clone()).collect()
+            };
+            if set(a) == set(b) {
+                SIGNATURE_MATCH
+            } else {
+                SIGNATURE_NO_MATCH
+            }
+        }
     }
 }
 

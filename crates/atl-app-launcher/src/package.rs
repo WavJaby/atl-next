@@ -13,9 +13,11 @@ use crate::ffi::{JObject, JValue, Vm};
 /// PackageParser2's install flags (InstallPackageHelper.java:1502-1505): PARSE_CHATTY (1 << 31) | PARSE_ENFORCE_CODE (1 << 6) (ParsingPackageUtils.java:243, :252); not on external storage.
 /// PARSE_ENFORCE_CODE is read by ScanPackageUtils.assertCodePolicy (InstallPackageHelper.java:4626), services.jar, not by the parser.
 const PARSE_FLAGS: i32 = i32::MIN | 1 << 6;
-/// PackageManager GET_ACTIVITIES | GET_RECEIVERS | GET_SERVICES | GET_PROVIDERS | GET_INSTRUMENTATION | GET_META_DATA | GET_PERMISSIONS | MATCH_DIRECT_BOOT_UNAWARE | MATCH_DIRECT_BOOT_AWARE (PackageManager.java):
-/// every component (generate keeps one only if a direct-boot flag matches it, PackageInfoCommonUtils.isMatch:630-644), the instrumentation, their meta-data and the permission arrays.
-const INFO_FLAGS: i64 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x80 | 0x1000 | 0x0004_0000 | 0x0008_0000;
+/// PackageManager GET_ACTIVITIES | GET_RECEIVERS | GET_SERVICES | GET_PROVIDERS | GET_INSTRUMENTATION | GET_SIGNATURES | GET_META_DATA | GET_PERMISSIONS | MATCH_DIRECT_BOOT_UNAWARE |
+/// MATCH_DIRECT_BOOT_AWARE | GET_SIGNING_CERTIFICATES (PackageManager.java): every component (generate keeps one only if a direct-boot flag matches it, PackageInfoCommonUtils.isMatch:630-644),
+/// the instrumentation, their meta-data, the permission arrays and both signer forms (signatures, signingInfo: PackageInfoCommonUtils.generate:196-219).
+const INFO_FLAGS: i64 =
+    0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x40 | 0x80 | 0x1000 | 0x0004_0000 | 0x0008_0000 | 0x0800_0000;
 /// The user generate fills per-user fields for: the only one (UserHandle.USER_SYSTEM).
 const USER: i32 = 0;
 
@@ -117,8 +119,36 @@ pub fn parse(vm: &Vm, dir: &Path, device: &Device) -> Result<Parsed> {
         false,
     )?;
     let parsed = vm.call_object(parsing, hide, &[], "ParsingPackage.hideAsParsed")?;
-    // hideAsFinal (InstallPackageHelper:426, before any PackageInfo) computes the base ApplicationInfo flags (PackageImpl.assignDerivedFields2): generate before it answers flags 0, no FLAG_HAS_CODE -> empty class path
+    // the install path's certificate collection (InstallPackageHelper.java:1590-1600, no signing details in the request): ApkSignatureVerifier.verify over the base APK and every split, the
+    // minimum scheme for the target SDK, splits refused when their signers differ; a verification failure fails the install as there
     let parsed_class = vm.find_class(c"com/android/internal/pm/parsing/pkg/ParsedPackage")?;
+    let signing = vm.method(
+        utils_class,
+        c"getSigningDetails",
+        c"(Landroid/content/pm/parsing/result/ParseInput;Lcom/android/internal/pm/parsing/pkg/ParsedPackage;Z)Landroid/content/pm/parsing/result/ParseResult;",
+        true,
+    )?;
+    let input = vm.parse_input()?;
+    let result = vm.call_static_object(
+        utils_class,
+        signing,
+        &[JValue { l: input }, JValue { l: parsed }, JValue { z: 0 }],
+        "ParsingPackageUtils.getSigningDetails",
+    )?;
+    let details = vm.parse_result(result, "ParsingPackageUtils.getSigningDetails")?;
+    let set_signing = vm.method(
+        parsed_class,
+        c"setSigningDetails",
+        c"(Landroid/content/pm/SigningDetails;)Lcom/android/internal/pm/parsing/pkg/ParsedPackage;",
+        false,
+    )?;
+    vm.call_object(
+        parsed,
+        set_signing,
+        &[JValue { l: details }],
+        "ParsedPackage.setSigningDetails",
+    )?;
+    // hideAsFinal (InstallPackageHelper:426, before any PackageInfo) computes the base ApplicationInfo flags (PackageImpl.assignDerivedFields2): generate before it answers flags 0, no FLAG_HAS_CODE -> empty class path
     let finalize = vm.method(
         parsed_class,
         c"hideAsFinal",

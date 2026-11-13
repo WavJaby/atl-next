@@ -1524,7 +1524,7 @@ impl IActivityManager for ActivityManager {
     /// Not modelled, each counted when asked for: no-restart (:14639 instrumentWithoutRestart), the SDK sandbox flags (:14566), a target process list other than the default process
     /// (:14589-14596; the first listed process is started, the instrumentation does not follow into the others). Not enforced: enforceNotIsolatedCaller (:14456, no isolated uids),
     /// the DISABLE_HIDDEN_API_CHECKS permission (:14551-14563: the flags change nothing, ART's hidden API enforcement is off), the app op for DISABLE_ISOLATED_STORAGE (:14633).
-    /// Signatures: nothing here verifies APK signatures, so checkSignatures (:14509) is SIGNATURE_MATCH for every pair of known packages and the signature-denial branch (:14511-14535) cannot fire.
+    /// Not modelled: the signature check between the instrumentation and its target (:14503-14523: checkSignatures, then a SecurityException unless root on a debuggable build).
     fn r#startInstrumentation(
         &self,
         class_name: Option<&ComponentName>,

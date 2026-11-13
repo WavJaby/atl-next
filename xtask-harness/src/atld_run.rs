@@ -471,6 +471,7 @@ pub struct ApkTools {
     pub android_jar: PathBuf,
     pub jdk: PathBuf,
     d8: PathBuf,
+    pub signer: Signer,
 }
 
 impl ApkTools {
@@ -484,6 +485,7 @@ impl ApkTools {
                 .join("prebuilts/sdk")
                 .join(sdk_level(&out.join(host_art::BUILD_PROP))?)
                 .join("public/android.jar"),
+            signer: Signer::new(&layout, &jdk, &java_out.join("host/apksigner"))?,
             jdk,
             d8,
         };
@@ -492,6 +494,129 @@ impl ApkTools {
         }
         ensure!(t.jdk.is_dir(), "missing input {}", t.jdk.display());
         Ok(t)
+    }
+}
+
+/// AOSP's apksigner (tools/apksig, Android.bp modules `apksig` + `apksigner`: the library minus the KMS providers, then the tool) and a debug key, as an app build signs its debug APK: the device's
+/// install path verifies every APK (ParsingPackageUtils.getSigningDetails -> ApkSignatureVerifier.verify) and refuses an unsigned one, so every fixture is signed (v1 + v2 + v3, apksigner's defaults).
+pub struct Signer {
+    jar: PathBuf,
+    keystore: PathBuf,
+    java: PathBuf,
+}
+
+/// The Android SDK's debug keystore conventions (the Android Gradle plugin's `debug.keystore`): store and key password `android`, alias `androiddebugkey`, `CN=Android Debug,O=Android,C=US`.
+const DEBUG_PASSWORD: &str = "android";
+const DEBUG_ALIAS: &str = "androiddebugkey";
+const DEBUG_DNAME: &str = "CN=Android Debug,O=Android,C=US";
+/// The plugin's validity: 30 years in days.
+const DEBUG_VALIDITY_DAYS: &str = "10950";
+
+impl Signer {
+    /// The jar and the keystore in `dir`, each made once and kept (a gate run reuses them, so its fixtures share one signer across runs); written to a temporary name, then renamed, so concurrent
+    /// gates never see half a file.
+    fn new(layout: &Layout, jdk: &Path, dir: &Path) -> Result<Signer> {
+        let bin = jdk.join("bin");
+        let jar = dir.join("apksigner.jar");
+        let keystore = dir.join("debug.keystore");
+        std::fs::create_dir_all(dir)?;
+        let tmp = |p: &Path| p.with_extension(format!("tmp{}", std::process::id()));
+        if !jar.is_file() {
+            let apksig = layout.locate(Path::new("aosp/tools/apksig")).dir;
+            let mut sources = Vec::new();
+            host_art::collect(&apksig.join("src/main/java"), "java", &mut sources)?;
+            let kms = [
+                apksig.join("src/main/java/com/android/apksig/kms/aws"),
+                apksig.join("src/main/java/com/android/apksig/kms/gcp"),
+            ];
+            sources.retain(|s| !kms.iter().any(|k| s.starts_with(k)));
+            let tool = apksig.join("src/apksigner/java");
+            host_art::collect(&tool, "java", &mut sources)?;
+            let classes = tmp(&dir.join("classes"));
+            if classes.exists() {
+                std::fs::remove_dir_all(&classes)?;
+            }
+            std::fs::create_dir_all(&classes)?;
+            host_art::exec(
+                Command::new(bin.join("javac"))
+                    .args(["-nowarn", "-encoding", "UTF-8", "-d"])
+                    .arg(&classes)
+                    .args(&sources),
+                "javac apksig",
+            )?;
+            // the tool's java_resources: its help texts, next to its classes
+            let help = Path::new("com/android/apksigner");
+            for e in std::fs::read_dir(tool.join(help))? {
+                let p = e?.path();
+                if p.extension().is_some_and(|x| x == "txt") {
+                    std::fs::copy(&p, classes.join(help).join(p.file_name().context("name")?))?;
+                }
+            }
+            let out = tmp(&jar);
+            host_art::exec(
+                Command::new(bin.join("jar"))
+                    .arg("--create")
+                    .arg("--file")
+                    .arg(&out)
+                    .args(["--main-class", "com.android.apksigner.ApkSignerTool", "-C"])
+                    .arg(&classes)
+                    .arg("."),
+                "jar apksigner",
+            )?;
+            std::fs::remove_dir_all(&classes)?;
+            std::fs::rename(&out, &jar)?;
+        }
+        if !keystore.is_file() {
+            let out = tmp(&keystore);
+            host_art::exec(
+                Command::new(bin.join("keytool"))
+                    .args(["-genkeypair", "-keystore"])
+                    .arg(&out)
+                    .args(["-storepass", DEBUG_PASSWORD, "-keypass", DEBUG_PASSWORD])
+                    .args(["-alias", DEBUG_ALIAS, "-dname", DEBUG_DNAME])
+                    .args(["-keyalg", "RSA", "-keysize", "2048"])
+                    .args(["-validity", DEBUG_VALIDITY_DAYS]),
+                "keytool -genkeypair",
+            )?;
+            std::fs::rename(&out, &keystore)?;
+        }
+        Ok(Signer {
+            jar,
+            keystore,
+            java: bin.join("java"),
+        })
+    }
+
+    /// Signs `apk` in place (`apksigner sign`, after zipalign as apksigner requires).
+    pub fn sign(&self, apk: &Path) -> Result<()> {
+        let pass = format!("pass:{DEBUG_PASSWORD}");
+        host_art::exec(
+            Command::new(&self.java)
+                .arg("-jar")
+                .arg(&self.jar)
+                .args(["sign", "--ks"])
+                .arg(&self.keystore)
+                .args(["--ks-pass", &pass, "--key-pass", &pass])
+                .args(["--ks-key-alias", DEBUG_ALIAS])
+                .arg(apk),
+            "apksigner sign",
+        )
+    }
+
+    /// The SHA-256 of `apk`'s signing certificate as `apksigner verify --print-certs` prints it (`Signer #1 certificate SHA-256 digest: <hex>`): a value from AOSP's tool, not from our code.
+    pub fn cert_sha256(&self, apk: &Path) -> Result<String> {
+        let out = host_art::output(
+            Command::new(&self.java)
+                .arg("-jar")
+                .arg(&self.jar)
+                .args(["verify", "--print-certs"])
+                .arg(apk),
+            "apksigner verify",
+        )?;
+        out.lines()
+            .find_map(|l| l.strip_prefix("Signer #1 certificate SHA-256 digest: "))
+            .map(|h| h.trim().to_owned())
+            .context("apksigner verify printed no Signer #1 SHA-256 digest")
     }
 }
 
@@ -1009,6 +1134,7 @@ impl ApkTools {
             )?;
         }
         zipalign(&apk)?;
+        self.signer.sign(&apk)?;
         Ok(apk)
     }
 

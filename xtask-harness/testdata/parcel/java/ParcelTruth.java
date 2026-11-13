@@ -192,6 +192,10 @@ public class ParcelTruth {
         holder.noReleaseNeeded = true;
         check("ContentProviderHolder", holder, ContentProviderHolder.CREATOR);
         check("PackageInfo", packageInfo(ai), PackageInfo.CREATOR);
+        // getPackageInfo with GET_SIGNATURES | GET_SIGNING_CERTIFICATES (PackageInfoCommonUtils.generate:196-219): the signer array and the SigningInfo, whose public keys go as Serializable values
+        check("PackageInfo:signatures", signedPackageInfo(ai, false), PackageInfo.CREATOR);
+        // a signer with a rotation history (v3 lineage): signingInfo also carries the past certificates
+        check("PackageInfo:signing-lineage", signedPackageInfo(ai, true), PackageInfo.CREATOR);
         check("ServiceInfo", serviceInfo(ai), ServiceInfo.CREATOR);
         check("PermissionInfo", permissionInfo(), PermissionInfo.CREATOR);
         // the installer's PackageInfo (PackageInfoCommonUtils.generate, every component flag): each component holds the package's own ApplicationInfo, so every later copy is a squashed back-reference
@@ -979,6 +983,27 @@ public class ParcelTruth {
         i.addCategory(Intent.CATEGORY_DEFAULT);
         i.setSourceBounds(new Rect(1, 2, 3, 4));
         return i;
+    }
+
+    /** A self-signed EC P-256 certificate (openssl req -x509, CN=ATL parcel test), DER in base64: SigningDetails derives its public key from it. */
+    static final String TEST_CERT = "MIIBizCCATGgAwIBAgIUdj2Uu9nVgn3NHO2Gan5/6HfRrUUwCgYIKoZIzj0EAwIwGjEYMBYGA1UEAwwPQVRMIHBhcmNlbCB0ZXN0MCAXDTI2MTExMzEwMzY1NFoYDzIxMjYxMDIwMTAzNjU0WjAaMRgwFgYDVQQDDA9BVEwgcGFyY2VsIHRlc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQ1BMU8rhSECrEBnZFASQOMWyAwHPtbiV6eo8PsKUChIWYklG5ByG6L/iP1WIAIjHDLfs0L5vgt0FwXgRJyKWm9o1MwUTAdBgNVHQ4EFgQUoSSaxGrkfLRBx9tHenh3868ZUYkwHwYDVR0jBBgwFoAUoSSaxGrkfLRBx9tHenh3868ZUYkwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiB7QxKBFLCdj+Fqy4D48J9draPSRqS4BwKMoln3rGyePQIhAO7qWqKnu2BzIq8GI9gZiClIeEPWzFaIkidVqiHgwNMW";
+
+    /** packageInfo with TEST_CERT as its one signer: v2, or v3 with itself as the rotation history. */
+    static PackageInfo signedPackageInfo(ApplicationInfo ai, boolean lineage) {
+        android.content.pm.Signature sig = new android.content.pm.Signature(android.util.Base64.decode(TEST_CERT, android.util.Base64.DEFAULT));
+        android.content.pm.Signature[] sigs = {sig};
+        android.content.pm.SigningDetails details;
+        try {
+            details = lineage
+                    ? new android.content.pm.SigningDetails(sigs, android.content.pm.SigningDetails.SignatureSchemeVersion.SIGNING_BLOCK_V3, sigs)
+                    : new android.content.pm.SigningDetails(sigs, android.content.pm.SigningDetails.SignatureSchemeVersion.SIGNING_BLOCK_V2);
+        } catch (java.security.cert.CertificateException e) {
+            throw new IllegalStateException(e);
+        }
+        PackageInfo p = packageInfo(ai);
+        p.signatures = sigs;
+        p.signingInfo = new android.content.pm.SigningInfo(details);
+        return p;
     }
 
     static PackageInfo packageInfo(ApplicationInfo ai) {
