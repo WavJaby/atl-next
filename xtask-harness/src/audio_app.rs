@@ -3,7 +3,7 @@
 //! Expected values are AOSP's formulas worked here over the served output, not the code under test: AudioSystem::calculateMinFrameCount (AudioSystem.cpp:486) with sourceFramesNeededWithTimestretch (AudioResamplerPublic.h:84-110) at speed 1.0, and AudioFlinger's streaming-track roundup to a power of two (Tracks.cpp:162).
 //! The served profile is the PCM output's granted rate and quantum (game audio A2), which on this host are PipeWire's defaults: [`SPEC_RATE_HZ`] and the others copy them, so a different graph must change these too (a mismatch is a red gate).
 //! PCM (A2): the fixture plays a static track, then a streaming track, each a tone (Main.java `pcm`). The output's sink is a null sink the gate makes the default for the run, and its monitor is recorded with `pw-record` (audio_pcm.rs). The recording must hold two runs of tone with the frequency, length and level the fixture's input gives, and no sample beyond full scale. Expected values come from the constants below, never from the server.
-//! Checks: session ids nonzero and distinct; getMinBufferSize equals the expected bytes (stereo, 16-bit); a track reaches STATE_INITIALIZED with a nonzero piid (AudioTrack calls baseRegisterPlayer only after native_setup succeeds, AudioTrack.java:912) and the expected frame count; the low-latency track initialises although the server refuses FAST (counted); AudioFlinger's and AudioPolicyService's calls were answered in-process.
+//! Checks: session ids nonzero and distinct; getMinBufferSize equals the expected bytes (stereo, 16-bit); AudioManager's output rate and frames-per-buffer properties are the served profile's; a track reaches STATE_INITIALIZED with a nonzero piid (AudioTrack calls baseRegisterPlayer only after native_setup succeeds, AudioTrack.java:912) and the expected frame count; the low-latency track initialises although the server refuses FAST (counted); AudioFlinger's and AudioPolicyService's calls were answered in-process.
 //! `--break-serve` starts the app with `--no-audio-service` (atld, then the launcher): it serves neither name, so the session line must go red. `--break-cblk` starts it with `--break-cblk`: each streaming track's region is one buffer short, createTrack refuses it, and both streaming tracks fail to initialise (a static track has no buffer of its own to be short of). `--break-mix` starts it with `--break-mix`: the mixer plays silence, so the PCM checks find no tone and must go red. `--unreachable` makes the desktop's server a stale socket file (`PIPEWIRE_REMOTE` for atld): the app must still reach `done` (the launch is not fatal), its track must fail with STATE_UNINITIALIZED and a counted refusal, and no tone may reach the sink.
 
 use std::fs;
@@ -95,9 +95,11 @@ const STATE_NO_STATIC_DATA: i64 = 2;
 /// AudioPlaybackConfiguration.PLAYER_PIID_INVALID: a player that has no piid.
 const PIID_INVALID: i64 = -1;
 
-/// The PCM tones (game audio A2). Main.java plays them in this order: a static track of STATIC_TONE_HZ, then a streaming track of STREAM_TONE_HZ, each TONE_FRAMES frames at TONE_RATE_HZ and TONE_DBFS peak, with a gap of about 0.5 s between. The fixture's samples come from the same values.
+/// The PCM tones (game audio A2). Main.java plays them in this order: a static track of STATIC_TONE_HZ (TONE_FRAMES frames at TONE_RATE_HZ), then a streaming track of STREAM_TONE_HZ in FMOD's Java output shape (STREAM_FRAMES at STREAM_RATE_HZ: Temple Run's FMOD asks 24000 Hz, stream-type constructor, byte writes), both TONE_DBFS peak, with a gap of about 0.5 s between. The fixture's samples come from the same values.
 const TONE_RATE_HZ: u64 = 44_100;
 const TONE_FRAMES: u64 = 22_050;
+const STREAM_RATE_HZ: u64 = 24_000;
+const STREAM_FRAMES: u64 = 12_000;
 const STATIC_TONE_HZ: f64 = 1_000.0;
 const STREAM_TONE_HZ: f64 = 500.0;
 const TONE_DBFS: f64 = -12.0;
@@ -186,7 +188,6 @@ fn pcm_verdicts(rec: &Recording) -> bool {
     let expected_rms = amplitude / std::f64::consts::SQRT_2;
     let threshold = presence();
     let gap = (GAP_SECONDS * f64::from(rec.rate)) as usize;
-    let want = TONE_FRAMES * rate / TONE_RATE_HZ;
     let runs = segments(&rec.channel(0), threshold, gap);
     let mut ok = verdict(
         "pcm tones",
@@ -196,9 +197,12 @@ fn pcm_verdicts(rec: &Recording) -> bool {
             runs.len()
         ),
     );
-    for (i, (name, hz)) in [("static", STATIC_TONE_HZ), ("stream", STREAM_TONE_HZ)]
-        .into_iter()
-        .enumerate()
+    for (i, (name, hz, want)) in [
+        ("static", STATIC_TONE_HZ, TONE_FRAMES * rate / TONE_RATE_HZ),
+        ("stream", STREAM_TONE_HZ, STREAM_FRAMES * rate / STREAM_RATE_HZ),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let Some(&(first, last)) = runs.get(i) else {
             ok &= verdict(&format!("pcm {name} tone"), false, "not in the recording");
@@ -413,6 +417,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             "got {got:?}, expected {want} bytes ({} frames)",
             want / frame_bytes
         ),
+    );
+
+    // AudioManager.getProperty: Integer.toString of the primary output's rate and HAL frame count, null when AudioFlinger answers 0 (AudioManager.java getProperty)
+    let props = line_value(&app, "props: ");
+    let want_props = format!("rate={SPEC_RATE_HZ} frames={SPEC_FRAMES}");
+    ok &= verdict(
+        "output properties",
+        props == Some(want_props.as_str()),
+        &format!("got {props:?}, expected {want_props} (the served profile)"),
     );
 
     let track = line_value(&app, "track: ");

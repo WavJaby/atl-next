@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! IAudioFlingerService (AOSP AudioFlinger.cpp; AIDL in libaudioclient `aidl/`): the calls AudioSystem makes for an id, the output's rate, frame count and latency (the served profile, output.rs), the client registration, and createTrack (A1b, A2).
+//! IAudioFlingerService (AOSP AudioFlinger.cpp; AIDL in libaudioclient `aidl/`): the calls AudioSystem makes for an id, the output's rate, frame count and latency (the served profile, output.rs) and the primary output's (AudioManager's output properties), the client registration, and createTrack (A1b, A2).
 //! Other methods keep the stub's default (UNKNOWN_TRANSACTION, counted). openOutput and the rest come with later slices.
 
 use std::sync::Arc;
@@ -123,6 +123,22 @@ impl IAudioFlingerService for AudioFlinger {
         Ok(self
             .output_for(output, "latency")
             .map_or(0, |o| o.profile.latency_ms()))
+    }
+
+    /// AudioManager's `PROPERTY_OUTPUT_SAMPLE_RATE` (AudioSystem.getPrimaryOutputSamplingRate): the primary playback thread's rate, 0 with none (AudioFlinger.cpp getPrimaryOutputSamplingRate). The one output is the primary; it opens here on first use.
+    fn r#getPrimaryOutputSamplingRate(&self) -> binder::Result<i32> {
+        counters::answered(INTERFACE, "getPrimaryOutputSamplingRate");
+        Ok(self
+            .output_for(output_handle(), "getPrimaryOutputSamplingRate")
+            .map_or(0, |o| o.profile.rate_hz as i32))
+    }
+
+    /// AudioManager's `PROPERTY_OUTPUT_FRAMES_PER_BUFFER`: the primary thread's HAL frame count (frameCountHAL), 0 with none; here the output's quantum.
+    fn r#getPrimaryOutputFrameCount(&self) -> binder::Result<i64> {
+        counters::answered(INTERFACE, "getPrimaryOutputFrameCount");
+        Ok(self
+            .output_for(output_handle(), "getPrimaryOutputFrameCount")
+            .map_or(0, |o| i64::from(o.profile.quantum)))
     }
 
     /// AOSP keeps the client for ioConfigChanged; this service never changes an output, so it never calls back.

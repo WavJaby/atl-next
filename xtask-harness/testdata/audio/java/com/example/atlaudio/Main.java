@@ -16,7 +16,8 @@ import android.util.Log;
  * `track: state=<n> piid=<n> frames=<n>`: a track's constructor (createTrack, IAudioTrack, then PlayerBase's trackPlayer): its state, its player id, its frame count.
  * `fast: state=<n>`: a low-latency track; the server refuses FAST and the track must still initialise on the normal path.
  * `static: state=<n> frames=<n>`: a shared-buffer track (MODE_STATIC): the frames are the requested ones, not rounded.
- * `pcm: ...`: the PCM tones (audio_app.rs TONE_*): a static track of STATIC_TONE_HZ, then a streaming track of STREAM_TONE_HZ, one after the other; the gate checks the recording of the sink.
+ * `props: rate=<s> frames=<s>`: AudioManager's PROPERTY_OUTPUT_SAMPLE_RATE and PROPERTY_OUTPUT_FRAMES_PER_BUFFER (the primary output's rate and HAL frame count).
+ * `pcm: ...`: the PCM tones (audio_app.rs TONE_*, STREAM_*): a static track of STATIC_TONE_HZ, then a streaming track of STREAM_TONE_HZ in FMOD's shape, one after the other; the gate checks the recording of the sink.
  * `done`: the end of the run.
  */
 public class Main extends Activity {
@@ -33,12 +34,16 @@ public class Main extends Activity {
     private static final double TONE_DBFS = -12.0;
     private static final int TONE_GAP_MS = 500;
 
-    /** Stereo 16-bit samples of a sine of `hz`: TONE_FRAMES frames at TONE_DBFS peak. */
-    private static short[] tone(int hz) {
-        short[] s = new short[TONE_FRAMES * 2];
+    /** The streaming tone in FMOD's shape (audio_app.rs STREAM_*): FMOD's rate seen in Temple Run (getMinFrameCount for 24000 Hz), half a second of it. */
+    private static final int STREAM_RATE_HZ = 24000;
+    private static final int STREAM_FRAMES = 12000;
+
+    /** Stereo 16-bit samples of a sine of `hz`: `frames` frames at `rate`, TONE_DBFS peak. */
+    private static short[] tone(int hz, int rate, int frames) {
+        short[] s = new short[frames * 2];
         double amp = Math.pow(10.0, TONE_DBFS / 20.0) * 32767.0;
-        for (int i = 0; i < TONE_FRAMES; i++) {
-            short v = (short) Math.round(amp * Math.sin(2.0 * Math.PI * hz * i / TONE_RATE_HZ));
+        for (int i = 0; i < frames; i++) {
+            short v = (short) Math.round(amp * Math.sin(2.0 * Math.PI * hz * i / rate));
             s[2 * i] = v;
             s[2 * i + 1] = v;
         }
@@ -55,6 +60,9 @@ public class Main extends Activity {
         int min = AudioTrack.getMinBufferSize(
                 RATE_HZ, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT);
         Log.i(TAG, "minbuf: " + min);
+        // the output properties FMOD and OpenSL users size their buffers by (AudioSystem.getPrimaryOutput*; null when the server answers 0)
+        Log.i(TAG, "props: rate=" + audio.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)
+                + " frames=" + audio.getProperty(AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER));
         AudioAttributes attributes = new AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_GAME).build();
         AudioFormat format = new AudioFormat.Builder()
@@ -110,7 +118,7 @@ public class Main extends Activity {
         int toneMs = TONE_FRAMES * 1000 / TONE_RATE_HZ;
         try {
             // a static track (SoundPool's shape): the samples are written before play, then the track plays them once
-            short[] samples = tone(STATIC_TONE_HZ);
+            short[] samples = tone(STATIC_TONE_HZ, TONE_RATE_HZ, TONE_FRAMES);
             AudioTrack st = new AudioTrack(attributes, toneFormat, samples.length * 2,
                     AudioTrack.MODE_STATIC, 0);
             int wrote = st.write(samples, 0, samples.length);
@@ -122,10 +130,20 @@ public class Main extends Activity {
             Log.i(TAG, "pcm: static " + e);
         }
         try {
-            // a streaming track: play, then write; the blocking write returns once the buffer has taken every sample
-            AudioTrack ts = new AudioTrack(attributes, toneFormat, min, AudioTrack.MODE_STREAM, 0);
+            // a streaming track in FMOD's Java output shape (Unity games, org.fmod.FMODAudioDevice): stream-type constructor, STREAM_MUSIC, STREAM_RATE_HZ, its own minimum buffer, byte writes. Play, then write; the blocking write returns once the buffer has taken every byte
+            int streamMin = AudioTrack.getMinBufferSize(
+                    STREAM_RATE_HZ, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT);
+            AudioTrack ts = new AudioTrack(AudioManager.STREAM_MUSIC, STREAM_RATE_HZ,
+                    AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT, streamMin,
+                    AudioTrack.MODE_STREAM);
             ts.play();
-            int wrote = ts.write(tone(STREAM_TONE_HZ), 0, TONE_FRAMES * 2);
+            short[] s = tone(STREAM_TONE_HZ, STREAM_RATE_HZ, STREAM_FRAMES);
+            byte[] bytes = new byte[s.length * 2];
+            for (int i = 0; i < s.length; i++) {
+                bytes[2 * i] = (byte) s[i];
+                bytes[2 * i + 1] = (byte) (s[i] >> 8);
+            }
+            int wrote = ts.write(bytes, 0, bytes.length);
             Log.i(TAG, "pcm: stream wrote=" + wrote);
             Thread.sleep(TONE_GAP_MS);
             ts.release();
