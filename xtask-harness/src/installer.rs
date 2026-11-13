@@ -32,7 +32,7 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
-use atl_android_paths::{PROPERTY_AREA, PROPERTY_AREA_ENV, SYSTEM_FRAMEWORK};
+use atl_android_paths::{DATA, PROPERTY_AREA, PROPERTY_AREA_ENV, SYSTEM_FRAMEWORK};
 use atl_broker::{Broker, INSTALLER_UID, Mount, to_log, tree_mounts};
 use atl_property_service::{LinearTier, Property};
 
@@ -68,8 +68,8 @@ const BREAK_READ_OUTSIDE: &str = "read-outside";
 const BREAK_WRITE_OUTSIDE: &str = "write-outside";
 const BREAK_NO_FRAMEWORK: &str = "no-framework-res";
 const BREAK_NET: &str = "net";
-/// The package the net break's probe names as its own data dir (atl-sandbox-probe's OWN_FILE; the profile shows nothing of it).
-const PROBE_OWN_FILE: &str = "/data/user/0/atl.sandbox.probe/probe.txt";
+/// The package whose data dir the net break's probe names (atl-sandbox-probe's OWN_FILE: `DATA/user/0/<package>`, which the profile does not show).
+const PROBE_DATA_PACKAGE: &str = "atl.sandbox.probe";
 /// SIGSYS (31 on x86_64 and aarch64 Linux): the signal a seccomp KILL_PROCESS ends the process with.
 const SIGSYS: i32 = 31;
 /// How long one installer run may take: alto's measured process wall is under 2 s; a hang fails the gate, it does not stop it.
@@ -713,7 +713,7 @@ impl Gate<'_> {
         cmd.arg(file("net-home-file"))
             .arg(file("net-home-new"))
             .arg("/usr/atl-sandbox-probe")
-            .arg(PROBE_OWN_FILE)
+            .arg(format!("{DATA}/user/0/{PROBE_DATA_PACKAGE}/probe.txt"))
             .arg("9")
             .arg(file("net-socket"))
             .arg(file("net-other-socket"))

@@ -26,6 +26,11 @@ const EXEMPT: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/atl-broker/src/lib.rs",
+        "installer_shape",
+        "golden argv of the installer profile",
+    ),
+    (
+        "crates/atl-broker/src/lib.rs",
         "links_follow_the_mounts",
         "golden argv tail",
     ),
