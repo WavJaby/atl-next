@@ -16,7 +16,7 @@ mod seccomp;
 pub use seccomp::{NiceTiers, granted_nice};
 
 use std::ffi::{OsStr, OsString};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Read, Seek, Write};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
@@ -856,6 +856,12 @@ fn complete_mounts(spawn: &mut Spawn) -> io::Result<()> {
             spawn.mounts.extend(library_path_mounts(v)?);
         }
     }
+    // INTERNET: the host's resolver configuration, where /etc links it out of the shown root (resolver_view)
+    if spawn.rights.contains(&Right::Net) {
+        let (mounts, links) = resolver_view(Path::new(RESOLV_CONF))?;
+        spawn.mounts.extend(mounts);
+        spawn.links.extend(links);
+    }
     let mut seen = std::collections::BTreeSet::new();
     spawn.mounts.retain(|m| {
         let in_root = m.host == m.at
@@ -865,6 +871,57 @@ fn complete_mounts(spawn: &mut Spawn) -> io::Result<()> {
         !in_root && seen.insert((m.host.clone(), m.at.clone(), m.writable))
     });
     Ok(())
+}
+
+/// The resolver configuration glibc's stub resolver reads (resolv.h `_PATH_RESCONF`), which the guest's and ART's getaddrinfo reach through the host libc.
+pub const RESOLV_CONF: &str = "/etc/resolv.conf";
+
+/// What makes `path` resolve inside the sandbox as on the host when it is a symlink chain leaving the shown root (systemd-resolved: `-> /run/systemd/resolve/stub-resolv.conf`; WSL: `-> /mnt/wsl/resolv.conf`):
+/// every hop outside [`APP_ROOT_DIRS`] that is a link becomes the same link, the final file a read-only mount at its own path. Each hop's parent is canonicalised, so a linked directory (`/var/run -> /run`) is followed too.
+/// Nothing for a path the root already shows whole, and nothing when the chain dangles on the host or loops (more than 40 hops, the kernel's MAXSYMLINKS): the host has no resolver file then, and neither does the app.
+fn resolver_view(path: &Path) -> io::Result<(Vec<Mount>, Vec<Link>)> {
+    let shown = |p: &Path| {
+        APP_ROOT_DIRS
+            .iter()
+            .any(|d| p.starts_with(Path::new("/").join(d)))
+    };
+    let mut mounts = Vec::new();
+    let mut links = Vec::new();
+    let mut hop = path.to_path_buf();
+    for _ in 0..40 {
+        let (Some(parent), Some(name)) = (hop.parent(), hop.file_name()) else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        let here = match fs::canonicalize(parent) {
+            Ok(dir) => dir.join(name),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
+            Err(e) => return Err(e),
+        };
+        let meta = match fs::symlink_metadata(&here) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
+            Err(e) => return Err(e),
+        };
+        if !meta.file_type().is_symlink() {
+            if !shown(&here) {
+                mounts.push(Mount {
+                    host: here.clone(),
+                    at: here,
+                    writable: false,
+                });
+            }
+            return Ok((mounts, links));
+        }
+        let target = fs::read_link(&here)?;
+        if !shown(&here) {
+            links.push(Link {
+                target: target.clone(),
+                at: here.clone(),
+            });
+        }
+        hop = here.parent().unwrap_or(Path::new("/")).join(target);
+    }
+    Ok((Vec::new(), Vec::new()))
 }
 
 /// A failed registration of `host_pid`: a closed admin connection (EPIPE / ECONNRESET on the SEQPACKET socket) means binderd has ended -- killed by its seccomp filter, crashed, or exited -- and its log says which.
@@ -1047,6 +1104,50 @@ mod tests {
 
     /// Golden argv of Profile::Installer, written from its spec: the installer's uid, every namespace and a network namespace of its own (loopback only), its own session, the seccomp program;
     /// then the root, the caller's mounts, the stub and the program as the other profiles give them. No devices, no property area here: the spawn gives none.
+    /// A chain leaving the root: each link outside it recreated as written, the file mounted read-only at its own path; a dangling chain and a file the root shows give nothing.
+    #[test]
+    fn resolver_view_follows_the_chain() {
+        let dir = std::env::temp_dir().join(format!("atl-broker-resolv-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("sub")).expect("test dir");
+        let dir = fs::canonicalize(&dir).expect("canonical test dir");
+        fs::write(dir.join("sub/c"), "nameserver 192.0.2.1\n").expect("file");
+        std::os::unix::fs::symlink("b", dir.join("a")).expect("link a");
+        std::os::unix::fs::symlink("sub/c", dir.join("b")).expect("link b");
+        std::os::unix::fs::symlink("gone", dir.join("dangling")).expect("link");
+        let (mounts, links) = resolver_view(&dir.join("a")).expect("view");
+        assert_eq!(
+            links,
+            [
+                Link {
+                    target: "b".into(),
+                    at: dir.join("a")
+                },
+                Link {
+                    target: "sub/c".into(),
+                    at: dir.join("b")
+                }
+            ]
+        );
+        assert_eq!(
+            mounts,
+            [Mount {
+                host: dir.join("sub/c"),
+                at: dir.join("sub/c"),
+                writable: false
+            }]
+        );
+        assert_eq!(
+            resolver_view(&dir.join("dangling")).expect("view"),
+            (vec![], vec![])
+        );
+        assert_eq!(
+            resolver_view(Path::new("/etc/passwd")).expect("view"),
+            (vec![], vec![])
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn installer_shape() {
         let mut sp = spawn();

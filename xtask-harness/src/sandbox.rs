@@ -5,6 +5,7 @@
 //! The UI baseline grants (each a grant class every UI app gets, not a manifest right), each with one shown and one refused path: the compositor socket (atl_platform_host::app_access::socket_of; a second socket beside it refused), the fontconfig file (config_file_of; a file beside it refused),
 //! the DRM node's sysfs (atl_broker::drm_sysfs over /dev/dri: the device dir's `uevent` read, `/sys/kernel/uevent_seqnum` refused; the CPU topology dir every sandbox shows is judged by `test app`'s cpuProbe row). Font dirs are not probed: the face dirs fontconfig lists are bound the same way as the file.
 //! The TCP judgement needs Landlock ABI >= 4 (the network rights): below it the gate prints the net check as not judged and counts nothing for it. WSL is ABI 3, so the net branch is asserted on the Arch laptop only.
+//! The resolver (judge_resolv): with INTERNET the probe reads the host's /etc/resolv.conf through whatever link chain the host has (WSL `/mnt/wsl/resolv.conf`, systemd-resolved `/run/...`); a dangling link reads ENOENT and fails it.
 //! The environment (judge_env): only atl-broker app_env::APP_ENV names, the spawn's own and the sandbox's fixed ones; the broker's HOME must not arrive.
 //! Deliberate breaks, by hand: restore the writable host root in atl-broker `host_root` (every host dir bound rw); `home-read` must then fail. Drop `env_clear` in atl-broker `launch`; the `env:` checks must then fail. The gate removes the two $HOME names it makes.
 
@@ -19,7 +20,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, ensure};
 use atl_android_paths::DATA;
 use atl_broker::app_env::APP_ENV;
-use atl_broker::{Broker, CONTROL_ENV, Mount, drm_sysfs, rights_of, to_log};
+use atl_broker::{Broker, CONTROL_ENV, Mount, RESOLV_CONF, drm_sysfs, rights_of, to_log};
 use atl_platform_host::app_access;
 
 use crate::binder;
@@ -229,7 +230,8 @@ fn probe_once(
         .arg(&ui.fontconf)
         .arg(&ui.sibling)
         .arg(&ui.sysfs)
-        .arg(SYS_OTHER);
+        .arg(SYS_OTHER)
+        .arg(RESOLV_CONF);
     let mut spawn = binder::spawn_of(&cmd, APP_UID)?;
     spawn.env.push((EXPLICIT_ENV.into(), "1".into()));
     spawn.mounts.push(Mount {
@@ -271,6 +273,9 @@ fn probe_once(
         None => fails.push(format!("probe still running after {LIMIT:?}, killed")),
     }
     fails.extend(judge(&line, internet, abi));
+    if internet {
+        fails.extend(judge_resolv(&line, &host_resolv()));
+    }
     fails.extend(judge_env(&line, |k| std::env::var_os(k).is_some()));
     Ok(Probed { line, abi, fails })
 }
@@ -318,6 +323,33 @@ fn judge_env(line: &str, host_has: impl Fn(&str) -> bool) -> Vec<String> {
         ));
     }
     fails
+}
+
+/// What the probe's `resolv` check must read with INTERNET: what this process reads at atl_broker::RESOLV_CONF on the host, as `ok:<first nameserver>` (`ok:none` without one), else `err:<errno>` (no resolver file on the host: none in the app either).
+/// The first nameserver is resolv.conf's first `nameserver <address>` line (glibc res_init's keyword), parsed here, not by the probe's code.
+fn host_resolv() -> String {
+    match fs::read_to_string(RESOLV_CONF) {
+        Ok(text) => {
+            let ns = text
+                .lines()
+                .map(str::split_whitespace)
+                .find_map(|mut w| (w.next() == Some("nameserver")).then(|| w.next()).flatten());
+            format!("ok:{}", ns.unwrap_or("none"))
+        }
+        Err(e) => format!("err:{}", e.raw_os_error().unwrap_or(0)),
+    }
+}
+
+/// The INTERNET run's resolver view against the host's ([`host_resolv`]): an app holding INTERNET resolves through the host's resolver, so it must read the same file, wherever /etc links it (systemd-resolved, WSL).
+/// Not judged without INTERNET: a resolv.conf that is a plain file in /etc is shown with the rest of /etc, and the separate network namespace that would hide it (plan Q5 stage v2) is not built.
+fn judge_resolv(line: &str, want: &str) -> Option<String> {
+    let got = line
+        .split(' ')
+        .find_map(|kv| kv.strip_prefix("resolv="))
+        .unwrap_or("missing");
+    (got != want).then(|| {
+        format!("resolv={got}: the app's resolver file differs from the host's (want {want})")
+    })
 }
 
 /// The verdict on one probe line: the file checks in every run; the TCP connect by the run's rights, judged only where Landlock enforces the network rights (ABI >= NET_ABI).

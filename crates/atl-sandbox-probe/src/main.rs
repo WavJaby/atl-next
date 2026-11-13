@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
 //! atl-sandbox-probe: what an app process can reach, as `probe: <check>=<outcome>` on stdout, for `xtask test sandbox` to judge.
-//! Usage: `atl-sandbox-probe HOME_FILE HOME_NEW OUTSIDE OWN_FILE PORT SOCKET OTHER_SOCKET FONTCONF FONTCONF_SIBLING SYSFS SYS_OTHER`:
+//! Usage: `atl-sandbox-probe HOME_FILE HOME_NEW OUTSIDE OWN_FILE PORT SOCKET OTHER_SOCKET FONTCONF FONTCONF_SIBLING SYSFS SYS_OTHER RESOLV`:
 //! HOME_FILE an existing file in the real $HOME, HOME_NEW a name in it that does not exist, OUTSIDE a file the app's grants do not cover for writing, OWN_FILE a path in the app's own data dir, PORT a loopback TCP port the gate listens on;
-//! SOCKET the granted compositor socket and OTHER_SOCKET a host socket beside it, FONTCONF the granted fontconfig file and FONTCONF_SIBLING a file beside it, SYSFS a file in the granted DRM device's sysfs and SYS_OTHER a sysfs file outside it.
-//! Checks: `home-read`, `home-create`, `outside-write`, `own-write` + `own-read`, `net-connect`, then `socket` / `socket-other` (unix connect), `fontconf` / `fontconf-sibling`, `drm-sysfs` / `sys-other` (reads). An outcome is `ok` or `err:<errno>`. Last, `env=<names>`: the names of its whole environment, sorted, comma-joined, no values. Exits 0 once every check ran; the gate judges the outcomes.
+//! SOCKET the granted compositor socket and OTHER_SOCKET a host socket beside it, FONTCONF the granted fontconfig file and FONTCONF_SIBLING a file beside it, SYSFS a file in the granted DRM device's sysfs and SYS_OTHER a sysfs file outside it, RESOLV the resolver configuration (/etc/resolv.conf).
+//! Checks: `home-read`, `home-create`, `outside-write`, `own-write` + `own-read`, `net-connect`, then `socket` / `socket-other` (unix connect), `fontconf` / `fontconf-sibling`, `drm-sysfs` / `sys-other` (reads),
+//! `resolv` (`ok:<first nameserver, or none>` when RESOLV reads). An outcome is `ok` or `err:<errno>`. Last, `env=<names>`: the names of its whole environment, sorted, comma-joined, no values. Exits 0 once every check ran; the gate judges the outcomes.
 //! Built on std, stays inside the app seccomp filter (allow-all but setpriority) and the stub's Landlock domain: no probe of its own beyond the file calls.
 #![forbid(unsafe_code)]
 
@@ -46,6 +47,22 @@ fn net(port: &str) -> String {
     }
 }
 
+/// The resolver file as the sandbox shows it: `ok:<first nameserver>` (`ok:none` without one), or the read's errno (ENOENT: a link that dangles in the sandbox).
+fn nameserver(p: &Path) -> String {
+    match fs::read_to_string(p) {
+        Ok(text) => format!("ok:{}", first_nameserver(&text).unwrap_or("none")),
+        Err(e) => outcome(Err(e)),
+    }
+}
+
+/// resolv.conf's first `nameserver` value (resolv_conf.c: keyword, whitespace, address).
+fn first_nameserver(text: &str) -> Option<&str> {
+    text.lines().find_map(|l| {
+        let mut w = l.split_whitespace();
+        (w.next() == Some("nameserver")).then(|| w.next()).flatten()
+    })
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [
@@ -60,11 +77,12 @@ fn main() -> ExitCode {
         fontconf_sibling,
         sysfs,
         sys_other,
+        resolv,
     ] = args.as_slice()
     else {
         let _ = writeln!(
             io::stderr(),
-            "probe: usage: HOME_FILE HOME_NEW OUTSIDE OWN_FILE PORT SOCKET OTHER_SOCKET FONTCONF FONTCONF_SIBLING SYSFS SYS_OTHER"
+            "probe: usage: HOME_FILE HOME_NEW OUTSIDE OWN_FILE PORT SOCKET OTHER_SOCKET FONTCONF FONTCONF_SIBLING SYSFS SYS_OTHER RESOLV"
         );
         return ExitCode::from(2);
     };
@@ -82,6 +100,7 @@ fn main() -> ExitCode {
         ("fontconf-sibling", read(p(fontconf_sibling))),
         ("drm-sysfs", read(p(sysfs))),
         ("sys-other", read(p(sys_other))),
+        ("resolv", nameserver(p(resolv))),
     ];
     let mut line: Vec<String> = checks.iter().map(|(k, v)| format!("{k}={v}")).collect();
     let mut names: Vec<String> = std::env::vars_os()
