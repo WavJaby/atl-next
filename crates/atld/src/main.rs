@@ -186,6 +186,10 @@ struct Args {
     /// Desktop tilt for accelerometer games: while an app window has focus, held Left / Right (or A / D) tilt the device, injected as accelerometer data (sensorservice HAL bypass injection); the keys still reach the app. Off: no emulation. No effect on a machine with a real accelerometer (the services probe it).
     #[arg(long)]
     tilt_keys: bool,
+    /// Desktop adaptation: the left mouse button is one finger, its press / drag / release reach the app as touchscreen events (hover and the other buttons stay the mouse's). AOSP has no such conversion and touch-only games ignore the mouse.
+    /// On by default, so touch-only apps are usable with a mouse; `--mouse-touch false` is exact AOSP input.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    mouse_touch: bool,
     /// With `--tilt-keys`: the angle a held key reaches, degrees (default: atl-services `TiltConfig::default`).
     #[arg(long, requires = "tilt_keys")]
     tilt_max_deg: Option<f32>,
@@ -752,8 +756,8 @@ struct Host {
     headless_pointer: Option<String>,
     /// the UI mode; pushed to each app process as `ro.atl.ui`
     ui: Option<String>,
-    /// the key tilt (`--tilt-keys`); pushed to each app process as `ro.atl.tilt`
-    tilt: Option<compositor_registry::TiltConfig>,
+    /// the desktop input adaptations (`--mouse-touch`, `--tilt-keys`); pushed to each app process as `ro.atl.desktop-input`
+    desktop_input: compositor_registry::DesktopInput,
     /// test only: each app's launcher gets `--no-audio-service` (the audio gate's break)
     no_audio_service: bool,
     /// test only: each app's launcher gets `--break-cblk` (the audio gate's second break)
@@ -845,9 +849,10 @@ impl Host {
         if let Some(mode) = &self.ui {
             props.push((compositor_registry::UI_PROPERTY.to_owned(), mode.clone()));
         }
-        if let Some(tilt) = &self.tilt {
-            props.push((compositor_registry::TILT_PROPERTY.to_owned(), tilt.to_arg()));
-        }
+        props.push((
+            compositor_registry::DESKTOP_INPUT_PROPERTY.to_owned(),
+            self.desktop_input.to_arg(),
+        ));
         if let Some((node, source)) = &self.gpu {
             props.push((node::RENDER_NODE_PROPERTY.to_owned(), node.clone()));
             props.push((
@@ -1540,15 +1545,18 @@ fn run(a: &Args) -> Result<ExitCode> {
         display,
         headless_pointer: a.headless_pointer.clone(),
         ui: a.ui.clone(),
-        tilt: a.tilt_keys.then(|| {
-            let d = compositor_registry::TiltConfig::default();
-            compositor_registry::TiltConfig {
-                max_deg: a.tilt_max_deg.unwrap_or(d.max_deg),
-                ramp_ms: a.tilt_ramp_ms.unwrap_or(d.ramp_ms),
-                period_ms: a.tilt_period_ms.unwrap_or(d.period_ms),
-                probe_unfocused: a.tilt_probe_unfocused,
-            }
-        }),
+        desktop_input: compositor_registry::DesktopInput {
+            mouse_touch: a.mouse_touch,
+            tilt: a.tilt_keys.then(|| {
+                let d = compositor_registry::TiltConfig::default();
+                compositor_registry::TiltConfig {
+                    max_deg: a.tilt_max_deg.unwrap_or(d.max_deg),
+                    ramp_ms: a.tilt_ramp_ms.unwrap_or(d.ramp_ms),
+                    period_ms: a.tilt_period_ms.unwrap_or(d.period_ms),
+                    probe_unfocused: a.tilt_probe_unfocused,
+                }
+            }),
+        },
         no_audio_service: a.no_audio_service,
         break_cblk: a.break_cblk,
         no_media_player_service: a.no_media_player_service,

@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use atl_services_types::compositor_registry::{
-    DESCRIPTOR, DISPLAY_PROPERTY, POINTER_PROPERTY, REGISTER, SERVICE, SURFACE_FLINGER,
-    SURFACE_FLINGER_AIDL, TASK_INFO, TILT_PROPERTY, TiltConfig,
+    DESCRIPTOR, DESKTOP_INPUT_PROPERTY, DISPLAY_PROPERTY, DesktopInput, POINTER_PROPERTY, REGISTER,
+    SERVICE, SURFACE_FLINGER, SURFACE_FLINGER_AIDL, TASK_INFO,
 };
 use atl_services_types::counters;
 use atl_services_types::display_model::DisplayModel;
@@ -138,17 +138,19 @@ pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Com
         None => Vec::new(),
     };
     let wake_enabled = std::env::var(BREAK_ENV).as_deref() != Ok(BREAK_INPUT_NO_WAKE);
-    let tilt = match optional_property(TILT_PROPERTY)? {
-        Some(arg) => {
-            let t = Arc::new(std::sync::Mutex::new(crate::tilt::Tilt::new(
-                TiltConfig::parse_arg(&arg)?,
-            )));
+    let desktop_input = match optional_property(DESKTOP_INPUT_PROPERTY)? {
+        Some(arg) => DesktopInput::parse_arg(&arg)?,
+        None => DesktopInput::default(),
+    };
+    let tilt = match desktop_input.tilt {
+        Some(config) => {
+            let t = Arc::new(std::sync::Mutex::new(crate::tilt::Tilt::new(config)));
             crate::tilt::spawn(Arc::clone(&t), display.rotation)?;
             Some(t)
         }
         None => None,
     };
-    let input_tx = input::spawn(script, wake_enabled, tilt)?;
+    let input_tx = input::spawn(script, wake_enabled, tilt, desktop_input.mouse_touch)?;
     let composer = Composer::new(ComposerConfig {
         display,
         compositor: CompositorConfig {

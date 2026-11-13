@@ -76,6 +76,9 @@ pub struct Args {
     /// atld `--tilt-keys`: held left / right (or a / d) tilt the device for accelerometer games, at atld's default angle, ramp and rate.
     #[arg(long)]
     tilt_keys: bool,
+    /// atld `--mouse-touch`: the left mouse button (a drive's `tap` / `swipe`) reaches the app as one finger. atld's default, on; `false` is exact AOSP input.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    mouse_touch: bool,
     /// A variable in every app process's environment (repeat), atld `--app-env`: test-environment setup such as `LD_DEBUG=bindings` (the launcher-closure measurement; glibc's lines land in the app log). The product reads none of these.
     #[arg(long = "app-env", value_name = "KEY=VALUE")]
     app_env: Vec<String>,
@@ -99,6 +102,9 @@ pub struct RemoteArgs {
     /// atld `--tilt-keys`, as for `run-apk`.
     #[arg(long)]
     tilt_keys: bool,
+    /// atld `--mouse-touch`, as for `run-apk`.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    mouse_touch: bool,
     /// A pointer script atld injects from the app's first present (`run-apk --pointer`).
     #[arg(long, value_name = "SCRIPT")]
     pointer: Option<String>,
@@ -146,6 +152,7 @@ impl Args {
             drive: Some(script),
             break_blank_capture,
             tilt_keys: false,
+            mouse_touch: false,
             app_env: Vec::new(),
         }
     }
@@ -299,6 +306,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         drive: None,
         break_blank_capture: false,
         tilt_keys: a.tilt_keys,
+        mouse_touch: a.mouse_touch,
         app_env: Vec::new(),
     };
     // no `--display`: atld reads the target's own monitor, as on the product's host (host_display); this host's monitor is not the target's
@@ -526,6 +534,11 @@ fn runtime(root: &Path, args: &Args, files: &[PackageFile]) -> Result<(Runtime, 
     };
     let rt = if args.tilt_keys {
         rt.with_tilt_keys(&[])
+    } else {
+        rt
+    };
+    let rt = if args.mouse_touch {
+        rt.with_mouse_touch()
     } else {
         rt
     };

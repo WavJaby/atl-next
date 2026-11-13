@@ -6,7 +6,9 @@
 //!   a lift with others down -> POINTER_UP | index (the list still has it), the last -> UP; a cancel voids the whole gesture -> CANCEL with FLAG_CANCELED (InputDispatcher synthesizes it so: every pointer, once).
 //! * Source SOURCE_TOUCHSCREEN, TOOL_TYPE_FINGER, pressure 1, cursor NaN (a touchscreen hit-tests at its pointer: MotionEvent.getXDispatchLocation reads the cursor only for SOURCE_MOUSE).
 
-use atl_platform_ui::{PhysPoint, TouchEvent, TouchPhase};
+use atl_platform_ui::{
+    InputEvent, PhysPoint, PointerButton, PointerEvent, PointerPhase, TouchEvent, TouchPhase,
+};
 use atl_services_types::input_devices::{SOURCE_TOUCHSCREEN, TOUCHSCREEN};
 
 use super::pointer::{
@@ -104,9 +106,109 @@ impl Touch {
     }
 }
 
+/// The contact id the mouse finger takes: the platform's first contact id, free since the finger starts only with no contact down.
+const MOUSE_FINGER_ID: u32 = 0;
+
+/// Desktop adaptation (atld `--mouse-touch`, DesktopInput::mouse_touch): the left button is one finger. AOSP has none (CursorInputMapper.cpp sync sends buttons as SOURCE_MOUSE), so off is exact AOSP input.
+/// A primary press with no contact down becomes a leave (the mouse's hover ends, as for a finger on a phone) then a contact down; moves while it is held move the contact; its release lifts it. Hover, wheel and other buttons stay the mouse's.
+#[derive(Debug, Default)]
+pub struct MouseFinger {
+    held: bool,
+}
+
+impl MouseFinger {
+    /// The events `e` stands for: itself, or the finger's. `touch_down`: a real contact is down, so a press stays the mouse's (one gesture per touchscreen).
+    pub fn adapt(&mut self, e: InputEvent, touch_down: bool) -> Vec<InputEvent> {
+        let InputEvent::Pointer(p) = e else {
+            return vec![e];
+        };
+        let contact = |phase| {
+            InputEvent::Touch(TouchEvent {
+                phase,
+                id: MOUSE_FINGER_ID,
+                position: p.position,
+                time_ms: p.time_ms,
+            })
+        };
+        match p.phase {
+            PointerPhase::Down(PointerButton::Primary) if !self.held && !touch_down => {
+                self.held = true;
+                let leave = PointerEvent {
+                    phase: PointerPhase::Leave,
+                    ..p
+                };
+                vec![InputEvent::Pointer(leave), contact(TouchPhase::Down)]
+            }
+            PointerPhase::Move | PointerPhase::Enter if self.held => {
+                vec![contact(TouchPhase::Move)]
+            }
+            PointerPhase::Up(PointerButton::Primary) if self.held => {
+                self.held = false;
+                vec![contact(TouchPhase::Up)]
+            }
+            _ => vec![InputEvent::Pointer(p)],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mouse(phase: PointerPhase, t: u32) -> InputEvent {
+        InputEvent::Pointer(PointerEvent {
+            phase,
+            position: PhysPoint { x: 7.0, y: 9.0 },
+            time_ms: t,
+        })
+    }
+
+    /// The left button through MouseFinger then Touch: a hover move stays the mouse's; press -> pointer Leave + DOWN(0) from the touchscreen (source 0x1002, device 3, TOOL_TYPE_FINGER 1, input.h / InputDevice);
+    /// a drag -> MOVE(2); release -> UP(1); a right press stays the mouse's. Pressed while a real contact is down, the left button stays the mouse's.
+    #[test]
+    fn left_button_is_one_finger() {
+        let mut f = MouseFinger::default();
+        let mut t = Touch::default();
+        assert!(matches!(
+            f.adapt(mouse(PointerPhase::Move, 1), false)[..],
+            [InputEvent::Pointer(_)]
+        ));
+        let press = f.adapt(mouse(PointerPhase::Down(PointerButton::Primary), 2), false);
+        assert!(matches!(&press[0], InputEvent::Pointer(p) if p.phase == PointerPhase::Leave));
+        let InputEvent::Touch(down) = press[1] else {
+            panic!("no contact: {press:?}")
+        };
+        let d = t.translate(down);
+        assert_eq!(
+            (
+                d[0].action,
+                d[0].source,
+                d[0].device_id,
+                d[0].pointers[0].tool_type
+            ),
+            (0, 0x1002, 3, 1)
+        );
+        for (e, action) in [
+            (mouse(PointerPhase::Move, 3), 2),
+            (mouse(PointerPhase::Up(PointerButton::Primary), 4), 1),
+        ] {
+            let [InputEvent::Touch(c)] = f.adapt(e, t.in_gesture())[..] else {
+                panic!("not a contact")
+            };
+            assert_eq!(t.translate(c)[0].action, action);
+        }
+        assert!(matches!(
+            f.adapt(
+                mouse(PointerPhase::Down(PointerButton::Secondary), 5),
+                false
+            )[..],
+            [InputEvent::Pointer(_)]
+        ));
+        assert!(matches!(
+            f.adapt(mouse(PointerPhase::Down(PointerButton::Primary), 6), true)[..],
+            [InputEvent::Pointer(_)]
+        ));
+    }
 
     fn ev(phase: TouchPhase, id: u32, x: f64, t: u32) -> TouchEvent {
         TouchEvent {

@@ -419,6 +419,8 @@ mod publish {
         seq: Cell<u32>,
         /// The key tilt (`ro.atl.tilt`), shared with its injector thread; None: off.
         tilt: Option<Arc<Mutex<Tilt>>>,
+        /// The mouse finger (`ro.atl.desktop-input` mouse-touch); None: off, the mouse is only a mouse.
+        mouse_finger: Option<RefCell<touch::MouseFinger>>,
     }
 
     /// Runs `f` on the tilt, when on.
@@ -491,6 +493,20 @@ mod publish {
             publish_keys(state, k.as_slice());
             return;
         }
+        let events = match &state.mouse_finger {
+            Some(f) => {
+                let touch_down = state.touch.borrow().in_gesture();
+                f.borrow_mut().adapt(event, touch_down)
+            }
+            None => vec![event],
+        };
+        for event in events {
+            publish_motion_event(state, event);
+        }
+    }
+
+    /// Publishes one pointer or touch event's MotionEvents (and a mouse button's keys).
+    fn publish_motion_event(state: &State, event: InputEvent) {
         let meta_state = state.keys.borrow().meta_state();
         let (in_gesture, motions) = {
             let mut pointer_state = state.pointer.borrow_mut();
@@ -592,6 +608,7 @@ mod publish {
         tx: InputSender<Message>,
         mut script: Vec<Step>,
         tilt: Option<Arc<Mutex<Tilt>>>,
+        mouse_touch: bool,
     ) {
         let layout = KeyLayoutMap::load(KEY_LAYOUT)
             .inspect_err(|err| {
@@ -601,6 +618,7 @@ mod publish {
         let state = Rc::new(State {
             layout,
             tilt,
+            mouse_finger: mouse_touch.then(RefCell::default),
             ..State::default()
         });
         let source = HeadlessInput::default();
@@ -701,18 +719,19 @@ mod publish {
 
     /// Starts the input thread with `script` (empty: nothing injected, channels still taken). The sender takes each window's channel and the first frame.
     /// `wake_enabled` false is the deliberate-failure break (start.rs BREAK_INPUT_NO_WAKE): sends queue but never wake the loop.
-    /// `tilt`: the key tilt the keys and focus drive (its injector runs on its own thread).
+    /// `tilt`: the key tilt the keys and focus drive (its injector runs on its own thread). `mouse_touch`: the left button is one finger ([`touch::MouseFinger`]).
     pub fn spawn(
         script: Vec<Step>,
         wake_enabled: bool,
         tilt: Option<Arc<Mutex<Tilt>>>,
+        mouse_touch: bool,
     ) -> Result<InputSender<Message>, String> {
         let (tx, rx) = wake::channel(wake_enabled).map_err(|e| format!("input wake pair: {e}"))?;
         // the thread's own sender (for the script's events) keeps its loop open for the process's life; it ends with the process, as before
         let own = tx.clone();
         thread::Builder::new()
             .name("atl-input".to_owned())
-            .spawn(move || dispatch(rx, own, script, tilt))
+            .spawn(move || dispatch(rx, own, script, tilt, mouse_touch))
             .map_err(|e| format!("input thread: {e}"))?;
         Ok(tx)
     }

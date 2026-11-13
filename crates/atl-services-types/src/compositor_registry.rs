@@ -25,8 +25,57 @@ pub const DISPLAY_PROPERTY: &str = "ro.atl.display";
 pub const POINTER_PROPERTY: &str = "ro.atl.headless.pointer";
 /// The system property selecting an app process's UI mode (atld `--ui`): `gtk` presents the compositor's scenes into a GTK window of the process, on its main thread (atl-app-launcher lib.rs `start_ui`, atl-composer). Unset: headless.
 pub const UI_PROPERTY: &str = "ro.atl.ui";
-/// The system property holding the key tilt settings (atld `--tilt-keys`, [`TiltConfig::to_arg`]), read by atl-composer's tilt. Unset: no tilt.
-pub const TILT_PROPERTY: &str = "ro.atl.tilt";
+/// The system property holding the desktop input adaptations ([`DesktopInput::to_arg`]), read by atl-composer's input. Unset: none, exact AOSP input.
+pub const DESKTOP_INPUT_PROPERTY: &str = "ro.atl.desktop-input";
+
+/// Desktop input adaptations: what a desktop lacks that a phone has, emulated with what it has. Each is a switch; off is exact AOSP behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct DesktopInput {
+    /// The left mouse button is one finger: its down / move / up reach the app as a touchscreen's (atl-composer `input::touch::MouseFinger`). AOSP has none (CursorInputMapper sends SOURCE_MOUSE), and touch-only games ignore the mouse.
+    pub mouse_touch: bool,
+    /// The key tilt; None: off.
+    pub tilt: Option<TiltConfig>,
+}
+
+impl DesktopInput {
+    /// `;`-separated: `mouse-touch`, `tilt=` + [`TiltConfig::to_arg`]; `none` when every adaptation is off.
+    pub fn to_arg(&self) -> String {
+        let mut parts = Vec::new();
+        if self.mouse_touch {
+            parts.push("mouse-touch".to_owned());
+        }
+        if let Some(t) = &self.tilt {
+            parts.push(format!("tilt={}", t.to_arg()));
+        }
+        if parts.is_empty() {
+            "none".to_owned()
+        } else {
+            parts.join(";")
+        }
+    }
+
+    /// [`DesktopInput::to_arg`]'s form; each adaptation at most once.
+    pub fn parse_arg(s: &str) -> Result<DesktopInput, String> {
+        let mut d = DesktopInput::default();
+        if s == "none" {
+            return Ok(d);
+        }
+        for part in s.split(';') {
+            match part.split_once('=') {
+                None if part == "mouse-touch" && !d.mouse_touch => d.mouse_touch = true,
+                Some(("tilt", arg)) if d.tilt.is_none() => {
+                    d.tilt = Some(TiltConfig::parse_arg(arg)?)
+                }
+                _ => {
+                    return Err(format!(
+                        "{s}: `{part}` is not mouse-touch or tilt=<arg>, once each, or none"
+                    ));
+                }
+            }
+        }
+        Ok(d)
+    }
+}
 
 /// The key tilt: the arrow / A-D keys tilt the device for accelerometer games (sensor data injection, atl-composer `tilt`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -92,3 +141,21 @@ impl TiltConfig {
 /// AOSP's service names, libgui's lookups (SurfaceComposerClient.cpp ComposerService / ComposerServiceAIDL), served in-process.
 pub const SURFACE_FLINGER: &str = "SurfaceFlinger";
 pub const SURFACE_FLINGER_AIDL: &str = "SurfaceFlingerAIDL";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every combination survives the property round trip; a repeated or unknown part is refused.
+    #[test]
+    fn desktop_input_round_trips() {
+        let tilt = Some(TiltConfig::default());
+        for (mouse_touch, tilt) in [(false, None), (true, None), (false, tilt), (true, tilt)] {
+            let d = DesktopInput { mouse_touch, tilt };
+            assert_eq!(DesktopInput::parse_arg(&d.to_arg()), Ok(d));
+        }
+        assert_eq!(DesktopInput::default().to_arg(), "none");
+        assert!(DesktopInput::parse_arg("mouse-touch;mouse-touch").is_err());
+        assert!(DesktopInput::parse_arg("hover").is_err());
+    }
+}
