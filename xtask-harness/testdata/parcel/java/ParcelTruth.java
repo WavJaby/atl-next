@@ -165,6 +165,9 @@ public class ParcelTruth {
         check("ActivityInfo:window-layout", withLayout, ActivityInfo.CREATOR);
         // the values an activity sends with setTaskDescription (Activity.onApplyThemeResource, every themed launch)
         check("ActivityManager.TaskDescription", taskDescription(), ActivityManager.TaskDescription.CREATOR);
+        // getInfoForIntentSender's answer for a record (package, uid, immutable, INTENT_SENDER_BROADCAST) and for a foreign sender (null, INVALID_UID, mutable, INTENT_SENDER_UNKNOWN)
+        check("ActivityManager.PendingIntentInfo", new ActivityManager.PendingIntentInfo("com.example.atltest", 10123, true, ActivityManager.INTENT_SENDER_BROADCAST), ActivityManager.PendingIntentInfo.CREATOR);
+        check("ActivityManager.PendingIntentInfo:unknown", new ActivityManager.PendingIntentInfo(null, -1, false, ActivityManager.INTENT_SENDER_UNKNOWN), ActivityManager.PendingIntentInfo.CREATOR);
         // the crash report an app's process sends as it dies (RuntimeInit's uncaught-exception handler): nine strings and one int, nulls where unset
         check("ApplicationErrorReport.ParcelableCrashInfo", crashInfo(), ApplicationErrorReport.ParcelableCrashInfo.CREATOR);
         // IDisplayManager.getDisplayInfo's record (DisplayInfo.writeToParcel): every field set off its default, its Mode arrays in use

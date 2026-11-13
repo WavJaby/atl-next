@@ -121,6 +121,12 @@ const SERVICE_LINES: [(&str, &str, Option<&str>); 4] = [
         Some("interactive=true powersave=false partial=true held=true released=true"),
     ),
 ];
+/// Main.pendingIntent's line: PendingIntent's creator getters for this package's own immutable broadcast, then isImmutable of a FLAG_MUTABLE one (ActivityManagerService.getInfoForIntentSender reports the record's
+/// key package, its creator uid, FLAG_IMMUTABLE and INTENT_SENDER_BROADCAST). A service without the method gives the app a null PendingIntentInfo, and the line reads `threw ...NullPointerException...`.
+const PENDING_INTENT: (&str, &str) = (
+    "AtlTest: pendingintent: ",
+    "package=com.example.atltest self=true immutable=true broadcast=true mutable=true",
+);
 /// Main.priority's line: `start=<n> background=<r>/<nice> restore=<r>/<nice> foreground=<r>/<nice>`, r = `ok` or the throwable's simple name ([`priority_why`]).
 const PRIORITY: &str = "AtlTest: priority: ";
 /// Main.signatures' line: the fixture's signer as GET_SIGNATURES and GET_SIGNING_CERTIFICATES return it and checkSignatures against itself ([`signatures_want`]).
@@ -1038,6 +1044,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let want = signatures_want(&cert);
     if passed && signatures.as_deref() != Some(want.as_str()) {
         whys.push(format!("signatures: want {want:?}, got {signatures:?}"));
+    }
+    let (prefix, want) = PENDING_INTENT;
+    let pending = app
+        .lines()
+        .find_map(|l| l.split_once(prefix).map(|(_, r)| r.trim_end().to_owned()));
+    if passed && pending.as_deref() != Some(want) {
+        whys.push(format!("pendingintent: want {want:?}, got {pending:?}"));
     }
     let priority = app
         .lines()

@@ -27,8 +27,8 @@ use atl_aidl::aidl::android::content::IIntentSender::IIntentSender;
 use atl_broker::control::StartRequest;
 use atl_parcelables::android::app::servertransaction::ClientTransaction;
 use atl_parcelables::android::app::{
-    ActivityManager_TaskDescription, ApplicationErrorReport_ParcelableCrashInfo,
-    ContentProviderHolder,
+    ActivityManager_PendingIntentInfo, ActivityManager_TaskDescription,
+    ApplicationErrorReport_ParcelableCrashInfo, ContentProviderHolder,
 };
 use atl_parcelables::android::content::pm::{
     ActivityInfo, ApplicationInfo, ProviderInfo, ProviderInfoList,
@@ -1803,6 +1803,39 @@ impl IActivityManager for ActivityManager {
         Ok(sender)
     }
 
+    /// getInfoForIntentSender (ActivityManagerService.java:5685-5701): a record this service holds reports its key's package and FLAG_IMMUTABLE, its creator uid and its type; any other sender
+    /// (null, or not a record here) null / INVALID_UID / false / INTENT_SENDER_UNKNOWN. Not modelled: package visibility (filterAppAccess), so the package and uid are never filtered.
+    fn r#getInfoForIntentSender(
+        &self,
+        sender: Option<&Strong<dyn IIntentSender>>,
+    ) -> binder::Result<Option<ActivityManager_PendingIntentInfo>> {
+        let record = sender.and_then(|s| self.inner.pending.info(&s.as_binder()));
+        let info = match record {
+            Some(r) => {
+                counters::answered(AM, "getInfoForIntentSender");
+                ActivityManager_PendingIntentInfo {
+                    creator_package: Some(r.package),
+                    creator_uid: r.uid as i32,
+                    immutable: r.flags & pending_intent::FLAG_IMMUTABLE != 0,
+                    intent_sender_type: r.r#type,
+                }
+            }
+            None => {
+                counters::answered(
+                    AM,
+                    "getInfoForIntentSender (no PendingIntent of this service)",
+                );
+                ActivityManager_PendingIntentInfo {
+                    creator_package: None,
+                    creator_uid: permission::INVALID_UID,
+                    immutable: false,
+                    intent_sender_type: pending_intent::INTENT_SENDER_UNKNOWN,
+                }
+            }
+        };
+        Ok(Some(info))
+    }
+
     /// cancelIntentSender (:5668 -> PendingIntentController.java:262-283): a record this service holds, cancelled by its creator's app id (AOSP compares the package's uid, :269-271). Any other sender: nothing (:263-264).
     fn r#cancelIntentSender(
         &self,
@@ -1812,7 +1845,7 @@ impl IActivityManager for ActivityManager {
             return Ok(());
         };
         let binder = sender.as_binder();
-        let Some(owner) = self.inner.pending.creator_uid(&binder) else {
+        let Some(owner) = self.inner.pending.info(&binder).map(|r| r.uid) else {
             counters::answered(AM, "cancelIntentSender (no PendingIntent of this service)");
             return Ok(());
         };

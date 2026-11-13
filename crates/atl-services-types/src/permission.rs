@@ -28,6 +28,8 @@ pub fn is_system_or_root(uid: u32) -> bool {
 pub const FIRST_APPLICATION_UID: u32 = 10_000;
 /// AID_SHELL: the uid `adb shell` (and `am`) runs as.
 pub const SHELL_UID: u32 = 2000;
+/// Process.INVALID_UID: the wire's "no uid" (signed, as the AIDL int fields carry it).
+pub const INVALID_UID: i32 = -1;
 
 /// A uid that is not an application's (root, system, shell, ...): AppsFilterImpl.shouldFilterApplication filters nothing for `callingAppId < Process.FIRST_APPLICATION_UID`.
 pub fn sees_all_packages(uid: u32) -> bool {

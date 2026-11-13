@@ -21,6 +21,18 @@ const LOOKUP_FLAGS: i32 = FLAG_NO_CREATE | FLAG_CANCEL_CURRENT | FLAG_UPDATE_CUR
 /// ActivityManager.INTENT_SENDER_BROADCAST and INTENT_SENDER_ACTIVITY_RESULT (ActivityManager.java:666, 681).
 pub const INTENT_SENDER_BROADCAST: i32 = 1;
 pub const INTENT_SENDER_ACTIVITY_RESULT: i32 = 3;
+/// ActivityManager.INTENT_SENDER_UNKNOWN (ActivityManager.java:659): the type getInfoForIntentSender reports for a sender that is not a record of this service.
+pub const INTENT_SENDER_UNKNOWN: i32 = 0;
+/// PendingIntent.FLAG_IMMUTABLE (PendingIntent.java:266): not a lookup flag, so it stays in the key, where getInfoForIntentSender reads it.
+pub const FLAG_IMMUTABLE: i32 = 1 << 26;
+
+/// A record as [`PendingIntents::info`] reports it.
+pub struct RecordInfo {
+    pub package: String,
+    pub uid: u32,
+    pub flags: i32,
+    pub r#type: i32,
+}
 
 /// The records, under one lock.
 #[derive(Default)]
@@ -51,9 +63,14 @@ impl PendingIntents {
             .transpose()?)
     }
 
-    /// The creator uid of the record whose binder is `binder`; None when this service holds no such record.
-    pub fn creator_uid(&self, binder: &SpIBinder) -> Option<u32> {
-        self.lock().find(binder).map(|r| r.uid)
+    /// The record whose binder is `binder` (its key's package, flags and type, and its creator uid); None when this service holds no such record.
+    pub fn info(&self, binder: &SpIBinder) -> Option<RecordInfo> {
+        self.lock().find(binder).map(|r| RecordInfo {
+            package: r.key.package.clone(),
+            uid: r.uid,
+            flags: r.key.flags,
+            r#type: r.key.r#type,
+        })
     }
 
     /// Cancels the record whose binder is `binder`; no such record, nothing.

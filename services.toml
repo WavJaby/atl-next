@@ -43,6 +43,7 @@ mirrors = [
     "frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java#addInstrumentationResults",
     "frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java#finishInstrumentation",
     "frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java#broadcastIntentWithFeature",
+    "frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java#getInfoForIntentSender",
     "frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java#registerReceiverWithFeature",
     "frameworks/base/services/core/java/com/android/server/am/ProcessList.java#startProcessLocked",
     "frameworks/base/services/core/java/com/android/server/wm/ActivityClientController.java#activityResumed",

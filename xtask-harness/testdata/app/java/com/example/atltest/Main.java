@@ -91,6 +91,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "permission: " + permission());
         Log.i("AtlTest", "notification: " + channels());
         Log.i("AtlTest", "power: " + power());
+        Log.i("AtlTest", "pendingintent: " + pendingIntent());
         Log.i("AtlTest", "signatures: " + signatures());
         Log.i("AtlTest", "priority: " + priority());
         mediaPlayerService();
@@ -257,6 +258,19 @@ public class Main extends Activity {
             return "interactive=" + pm.isInteractive() + " powersave=" + pm.isPowerSaveMode()
                     + " partial=" + pm.isWakeLockLevelSupported(android.os.PowerManager.PARTIAL_WAKE_LOCK)
                     + " held=" + held + " released=" + !wl.isHeld();
+        } catch (Throwable t) {
+            return "threw " + t;
+        }
+    }
+
+    /** What PendingIntent reads back through IActivityManager.getInfoForIntentSender (the Facebook ads SDK's getCreatorPackage path): an immutable and a mutable broadcast of this package. */
+    private String pendingIntent() {
+        try {
+            Intent target = new Intent("atl.test.PI").setPackage(getPackageName());
+            android.app.PendingIntent fixed = android.app.PendingIntent.getBroadcast(this, 1, target, android.app.PendingIntent.FLAG_IMMUTABLE);
+            android.app.PendingIntent open = android.app.PendingIntent.getBroadcast(this, 2, target, android.app.PendingIntent.FLAG_MUTABLE);
+            return "package=" + fixed.getCreatorPackage() + " self=" + (fixed.getCreatorUid() == android.os.Process.myUid())
+                    + " immutable=" + fixed.isImmutable() + " broadcast=" + fixed.isBroadcast() + " mutable=" + !open.isImmutable();
         } catch (Throwable t) {
             return "threw " + t;
         }

@@ -5,6 +5,7 @@
 
 pub mod android {
     pub mod app {
+        pub mod ActivityManager_PendingIntentInfo;
         pub mod ActivityManager_TaskDescription;
         pub mod ApplicationErrorReport_ParcelableCrashInfo;
         pub mod ContentProviderHolder;

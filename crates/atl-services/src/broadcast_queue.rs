@@ -19,12 +19,12 @@ use binder::Strong;
 
 use crate::activity::log;
 use atl_services_types::counters;
+/// sentFromUid without shareIdentity.
+use atl_services_types::permission::INVALID_UID;
 
 const BQ: &str = "BroadcastQueue";
 /// ActivityManager.PROCESS_STATE_UNKNOWN: the reported process state, not tracked.
 const PROCESS_STATE_UNKNOWN: i32 = -1;
-/// Process.INVALID_UID: sentFromUid without shareIdentity.
-const INVALID_UID: i32 = -1;
 
 /// What one receiver gets (BroadcastRecord + its receiver at `index`, reduced to the wire arguments).
 pub(crate) enum Job {

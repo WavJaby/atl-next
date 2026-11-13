@@ -132,12 +132,14 @@ const RUNTIME: &str = "device/libandroid_runtime/libandroid_runtime.so";
 /// The driver's binder uid: AID_APP_START (system/core/libcutils/include/private/android_filesystem_config.h), the first app uid, as an app process has.
 const AID_APP_START: u32 = 10000;
 /// Every line ParcelTruth.java prints, by case, in its order: a missing one fails the stage (a driver that stops early passes nothing). `summary` is its last line.
-const CASES: [&str; 90] = [
+const CASES: [&str; 92] = [
     "ApplicationInfo",
     "ApplicationInfo:meta-data",
     "ActivityInfo",
     "ActivityInfo:window-layout",
     "ActivityManager.TaskDescription",
+    "ActivityManager.PendingIntentInfo",
+    "ActivityManager.PendingIntentInfo:unknown",
     "ApplicationErrorReport.ParcelableCrashInfo",
     "DisplayInfo",
     "Configuration",
