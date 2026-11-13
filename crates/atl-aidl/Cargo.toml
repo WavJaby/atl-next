@@ -72,8 +72,9 @@ types = [
     "android.app.IAlarmManager",
     # the activity service's PendingIntent records (pending_intent.rs): BnIntentSender
     "android.content.IIntentSender",
-    # the connectivity service (connectivity.rs)
+    # the connectivity service (connectivity.rs) and the client Messenger its network callbacks go to
     "android.net.IConnectivityManager",
+    "android.os.IMessenger",
     # the permissionmgr service (permission_manager.rs)
     "android.permission.IPermissionManager",
     "android.app.IApplicationThread",

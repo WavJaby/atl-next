@@ -35,7 +35,7 @@ import javax.net.ssl.X509TrustManager;
  * Bridge-1 line (app.rs BRIDGE1): the fixture is loaded (AtlJniTest's static initialiser) through the NativeBridge core into its guest; a failed load logs ART's UnsatisfiedLinkError, which carries the core's reason.
  * SoundPool line (app.rs SOUNDPOOL): `new SoundPool` (the legacy 3-arg path HJ takes) loads libsoundpool.so and constructs, or logs what it threw.
  * MediaPlayer lines (app.rs MEDIAPLAYER): Happy Jump's GameShared.loadMusic sequence, one line per step.
- * Service lines (app.rs SERVICE_LINES): connectivity = the offline answers of the `connectivity` service; permission = PackageManager.checkPermission through `permissionmgr`; else `absent` / what it threw.
+ * Service lines (app.rs SERVICE_LINES): connectivity = the host's default network as the `connectivity` service reports it, queried and through registerDefaultNetworkCallback; permission = PackageManager.checkPermission through `permissionmgr`; else `absent` / what it threw.
  * media.player line (app.rs MEDIA_PLAYER_SERVICE): setDataSource(fd) reaches the served service and returns.
  * WAV lines (app.rs MEDIA_WAV): a valid WAV is prepared, started, sought and reset per round, by fd and by path; the served extractor must sniff it.
  * Reset lines (app.rs MEDIA_RESET): reset with a seek pending, each within a bound; a reset that never returns is named.
@@ -146,15 +146,54 @@ public class Main extends Activity {
         }
     }
 
-    /** "active=<NetworkInfo> metered=<bool>" from ConnectivityManager; "absent" when getSystemService returns null (Cut the Rope's NPE); else what it threw. */
+    /** How long the default-network callback may take: online it arrives at registration; offline none comes, and this is the wait that shows it. */
+    private static final long CALLBACK_WAIT_MS = 5000;
+
+    /**
+     * "active=<type>/<state> metered=<bool> internet=<bool> validated=<bool> iface=<name> callback=<cb>" from ConnectivityManager: the active NetworkInfo's type name and state ("null" without one), isActiveNetworkMetered,
+     * the active network's INTERNET / VALIDATED capabilities and link interface; cb = what registerDefaultNetworkCallback delivered within CALLBACK_WAIT_MS: "same validated=<bool> iface=<name>" when its network equals
+     * getActiveNetwork ("other ..." when not), "none" when nothing came. "absent" when getSystemService returns null (Cut the Rope's NPE); else what it threw.
+     */
     private String connectivity() {
         try {
-            android.net.ConnectivityManager cm =
+            final android.net.ConnectivityManager cm =
                     (android.net.ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
             if (cm == null) {
                 return "absent";
             }
-            return "active=" + cm.getActiveNetworkInfo() + " metered=" + cm.isActiveNetworkMetered();
+            android.net.NetworkInfo info = cm.getActiveNetworkInfo();
+            android.net.Network active = cm.getActiveNetwork();
+            android.net.NetworkCapabilities nc = active == null ? null : cm.getNetworkCapabilities(active);
+            android.net.LinkProperties lp = active == null ? null : cm.getLinkProperties(active);
+            String line = "active=" + (info == null ? "null" : info.getTypeName() + "/" + info.getState())
+                    + " metered=" + cm.isActiveNetworkMetered()
+                    + " internet=" + (nc != null && nc.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET))
+                    + " validated=" + (nc != null && nc.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED))
+                    + " iface=" + (lp == null ? "null" : lp.getInterfaceName());
+            final java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(1);
+            final AtomicReference<String> got = new AtomicReference<>("none");
+            final android.net.Network expect = active;
+            // onAvailable(network, caps, lp, ...) calls onAvailable, onCapabilitiesChanged, onLinkPropertiesChanged in that order (ConnectivityManager.NetworkCallback)
+            android.net.ConnectivityManager.NetworkCallback cb = new android.net.ConnectivityManager.NetworkCallback() {
+                private android.net.NetworkCapabilities caps;
+
+                @Override
+                public void onCapabilitiesChanged(android.net.Network n, android.net.NetworkCapabilities c) {
+                    caps = c;
+                }
+
+                @Override
+                public void onLinkPropertiesChanged(android.net.Network n, android.net.LinkProperties l) {
+                    got.set((n.equals(expect) ? "same" : "other")
+                            + " validated=" + (caps != null && caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED))
+                            + " iface=" + l.getInterfaceName());
+                    done.countDown();
+                }
+            };
+            cm.registerDefaultNetworkCallback(cb);
+            done.await(CALLBACK_WAIT_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
+            cm.unregisterNetworkCallback(cb);
+            return line + " callback=" + got.get();
         } catch (Throwable t) {
             return "threw " + t;
         }

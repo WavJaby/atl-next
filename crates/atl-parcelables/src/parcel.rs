@@ -202,3 +202,25 @@ pub fn r_absent_array(p: &In<'_>, what: &'static str) -> Result<i32> {
 pub fn len_i32(n: usize) -> Result<i32> {
     i32::try_from(n).map_err(|_| StatusCode::BAD_VALUE)
 }
+
+/// Java writeByteArray (Parcel.cpp writeByteVector's layout): int32 length or -1 for null, the bytes, zero-padded to 4. libbinder_rs writes `Option<Vec<u8>>` the same way.
+pub fn w_bytes(p: &mut In<'_>, v: Option<&[u8]>) -> Result<()> {
+    p.write(&v.map(<[u8]>::to_vec))
+}
+/// Java createByteArray.
+pub fn r_bytes(p: &In<'_>) -> Result<Option<Vec<u8>>> {
+    p.read()
+}
+
+/// Java writeParcelable's creator part (writeParcelableCreator): the class name as String16; null writes only a null name.
+pub fn w_class(p: &mut In<'_>, class: Option<&str>) -> Result<()> {
+    w_str16(p, &class.map(str::to_owned))
+}
+/// Java readParcelable's class name: `Some(())` when it is `class`, `None` for null; another class is refused as `what`.
+pub fn r_class(p: &In<'_>, class: &str, what: &'static str) -> Result<Option<()>> {
+    match r_str16(p)? {
+        None => Ok(None),
+        Some(c) if c == class => Ok(Some(())),
+        Some(_) => Err(crate::refuse(what)),
+    }
+}

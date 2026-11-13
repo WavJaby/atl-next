@@ -3,6 +3,7 @@
 //! Shaped by the one implementation, GDK on Linux (atl-platform-host-linux): the connection is thread-affine, and a monitor that reports no refresh rate answers `None`.
 //! The machine's motion sensors ([`Sensors`]): shaped by the one implementation, Linux IIO. A stream per open, served by the kernel buffer where the environment enabled it and by sysfs reads otherwise ([`Tier`]); the caller paces its reads.
 //! The desktop's fonts ([`FontSource`]): which faces, in what order, for which language; read when atld starts.
+//! The host's network ([`NetworkSource`]): the link its default route leaves through, its resolver, and the system's own verdict on reaching the Internet; read when the services start.
 //! No OS or toolkit dependency, no unsafe; core crates use the `atl-platform-host` facade, not this crate or the implementation directly.
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -82,6 +83,63 @@ pub struct Face {
     pub family: String,
     /// The desktop's width value of the face.
     pub width: i32,
+}
+
+/// The host's network could not be read (a kernel table or resolver file answered something unparsable).
+#[derive(Debug, thiserror::Error)]
+#[error("network state unavailable: {0}")]
+pub struct NetworkError(
+    /// The source's reason.
+    pub String,
+);
+
+/// The kind of link the default route leaves through, as the host's driver reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkKind {
+    /// A wireless LAN interface.
+    Wifi,
+    /// Any other interface (wired, virtual): a desktop's default.
+    Ethernet,
+}
+
+/// The system's verdict on reaching the Internet over the default route, as the desktop's network monitor reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Connectivity {
+    /// A route exists but the Internet is known not to be reachable.
+    Limited,
+    /// A captive portal intercepts traffic.
+    Portal,
+    /// The Internet is reachable (or the monitor has no check and a default route exists).
+    Full,
+}
+
+/// The host's default network: the link its default route leaves through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultNetwork {
+    /// The interface name (`eth0`, `wlp2s0`).
+    pub interface: String,
+    /// Its kind.
+    pub kind: LinkKind,
+    /// Its hardware address as the kernel prints it (`aa:bb:..`); `None` where it has none.
+    pub hw_address: Option<String>,
+    /// Its MTU; `None` where unreadable.
+    pub mtu: Option<u32>,
+    /// The default routes' gateways through it, IPv4 first; an on-link default route has none.
+    pub gateways: Vec<std::net::IpAddr>,
+    /// The resolver's servers, in the host resolver's order.
+    pub dns: Vec<std::net::IpAddr>,
+    /// The resolver's search domains, space-separated; `None` without any.
+    pub search: Option<String>,
+    /// Whether the Internet is reachable over it.
+    pub connectivity: Connectivity,
+    /// Whether the system considers it metered.
+    pub metered: bool,
+}
+
+/// The host's network state, as a native desktop program sees it. Shaped by its one implementation: the kernel's route tables, the resolver file, GIO's network monitor.
+pub trait NetworkSource: Send + Sync {
+    /// The default network now; `None` when the host has no default route (offline).
+    fn default_network(&self) -> Result<Option<DefaultNetwork>, NetworkError>;
 }
 
 /// The desktop's font configuration (plan C7: Android's font list follows the desktop). Shaped by its one implementation, fontconfig: a sorted preference list per query and a plain listing; named instances of a variable font are not separate faces.

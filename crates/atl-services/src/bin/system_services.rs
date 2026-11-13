@@ -254,9 +254,30 @@ fn main() -> Result<()> {
     )
     .context("addService clipboard")?;
     if !a.omit_service.iter().any(|s| s == CONNECTIVITY) {
+        // the host's default network through the platform layer, read once at start; unreadable = none, said so
+        use atl_platform_host::NetworkSource;
+        let network = match atl_platform_host::PlatformNetwork.default_network() {
+            Ok(n) => n,
+            Err(e) => {
+                writeln!(std::io::stderr(), "connectivity: {e}; no default network")?;
+                None
+            }
+        };
+        match &network {
+            Some(n) => writeln!(
+                std::io::stderr(),
+                "connectivity: default network {} {:?} {:?} metered={} dns={}",
+                n.interface,
+                n.kind,
+                n.connectivity,
+                n.metered,
+                n.dns.len()
+            )?,
+            None => writeln!(std::io::stderr(), "connectivity: no default network")?,
+        }
         binder::add_service(
             CONNECTIVITY,
-            atl_services::connectivity::new_binder(Arc::clone(&permissions)),
+            atl_services::connectivity::new_binder(Arc::clone(&permissions), network.as_ref()),
         )
         .context("addService connectivity")?;
     }

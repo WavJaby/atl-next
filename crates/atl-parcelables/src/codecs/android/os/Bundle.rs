@@ -93,7 +93,7 @@ pub fn r_bundle(p: &In<'_>) -> Result<Option<Bundle>> {
     Bundle::read_after_length(p, length).map(Some)
 }
 
-/// A Bundle value of the kinds a service makes or merges (Parcel.writeValue's VAL_STRING, VAL_INTEGER, VAL_LONG, VAL_FLOAT, VAL_BOOLEAN, VAL_NULL); Float = manifest `<meta-data>` (Property.toBundle putFloat).
+/// A Bundle value of the kinds a service makes or merges (Parcel.writeValue's VAL_STRING, VAL_INTEGER, VAL_LONG, VAL_FLOAT, VAL_BOOLEAN, VAL_NULL, VAL_PARCELABLE); Float = manifest `<meta-data>` (Property.toBundle putFloat).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     String(Option<String>),
@@ -102,12 +102,39 @@ pub enum Value {
     Float(f32),
     Bool(bool),
     Null,
+    /// writeParcelable's class name and the object's writeToParcel bytes, which must hold no binder or file descriptor (the body is bytes, see `entries`). Parcel.writeValue length-prefixes it (isLengthPrefixed, Parcel.java:5107-5120).
+    Parcelable {
+        class: String,
+        body: Vec<u8>,
+    },
+}
+
+impl Value {
+    /// `v` as a Parcelable value of `class`: its writeToParcel bytes. Refused (counted) when it writes a binder or file descriptor.
+    pub fn parcelable<T: Part>(class: &str, v: &T) -> Result<Value> {
+        let mut parcel = Parcel::new();
+        v.write(&mut parcel.borrowed())?;
+        let body = parcel.marshal().map_err(|e| {
+            if e == StatusCode::INVALID_OPERATION {
+                crate::refuse(
+                    "android.os.Bundle (a Parcelable value with binder or file descriptor objects)",
+                )
+            } else {
+                e
+            }
+        })?;
+        Ok(Value::Parcelable {
+            class: class.to_owned(),
+            body,
+        })
+    }
 }
 
 /// Parcel.java VAL_* type codes (Parcel.java:317-327).
 const VAL_NULL: i32 = -1;
 const VAL_STRING: i32 = 0;
 const VAL_INTEGER: i32 = 1;
+const VAL_PARCELABLE: i32 = 4;
 const VAL_LONG: i32 = 6;
 const VAL_FLOAT: i32 = 7;
 const VAL_BOOLEAN: i32 = 9;
@@ -260,6 +287,22 @@ impl Bundle {
                     // writeFloat: the IEEE bits in one word
                     VAL_FLOAT => Value::Float(f32::from_bits(w.i32()? as u32)),
                     VAL_BOOLEAN => Value::Bool(w.i32()? != 0),
+                    VAL_PARCELABLE => {
+                        let length = usize::try_from(w.i32()?)
+                            .map_err(|_| crate::refuse("android.os.Bundle (parcelable length)"))?;
+                        let (Some(object), rest) = (w.0.get(..length), w.0.get(length..)) else {
+                            return Err(StatusCode::NOT_ENOUGH_DATA);
+                        };
+                        w.0 = rest.unwrap_or_default();
+                        let mut o = Words(object);
+                        let class = o.string()?.ok_or_else(|| {
+                            crate::refuse("android.os.Bundle (null parcelable class)")
+                        })?;
+                        Value::Parcelable {
+                            class,
+                            body: o.0.to_vec(),
+                        }
+                    }
                     _ => return Err(crate::refuse("android.os.Bundle (value type)")),
                 };
                 Ok((key, value))
@@ -306,6 +349,21 @@ impl Bundle {
                 Value::Bool(b) => {
                     body.extend_from_slice(&tag(VAL_BOOLEAN));
                     body.extend_from_slice(&i32::from(*b).to_ne_bytes());
+                }
+                Value::Parcelable {
+                    class,
+                    body: object,
+                } => {
+                    body.extend_from_slice(&tag(VAL_PARCELABLE));
+                    let mut prefixed = Vec::new();
+                    put_string(&mut prefixed, &Some(class.clone()));
+                    prefixed.extend_from_slice(object);
+                    body.extend_from_slice(
+                        &i32::try_from(prefixed.len())
+                            .unwrap_or(i32::MAX)
+                            .to_ne_bytes(),
+                    );
+                    body.extend_from_slice(&prefixed);
                 }
             }
         }

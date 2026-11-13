@@ -44,10 +44,17 @@ pub mod android {
         pub mod PlayerBase_PlayerIdCard;
     }
     pub mod net {
+        pub mod LinkProperties;
+        pub mod Network;
+        pub mod NetworkCapabilities;
+        pub mod NetworkInfo;
+        pub mod NetworkRequest;
         pub mod Uri;
     }
     pub mod os {
         pub mod Bundle;
+        pub mod Message;
+        pub mod Messenger;
         pub mod storage {
             pub mod StorageVolume;
         }

@@ -10,6 +10,8 @@ pub use atl_platform_host_linux::FcFonts as PlatformFonts;
 #[cfg(target_os = "linux")]
 pub use atl_platform_host_linux::GdkDesktop as PlatformDesktop;
 #[cfg(target_os = "linux")]
+pub use atl_platform_host_linux::HostNetwork as PlatformNetwork;
+#[cfg(target_os = "linux")]
 pub use atl_platform_host_linux::IioSensors as PlatformSensors;
 /// What an app process's UI side reads from the desktop, as host paths the broker shows read-only at their own place: `wayland_socket()` (the compositor's) and `fontconfig_paths()` (config file + font dirs).
 #[cfg(target_os = "linux")]
@@ -28,6 +30,8 @@ fn implements_the_api() {
     sensors::<PlatformSensors>();
     fn fonts<T: FontSource>() {}
     fonts::<PlatformFonts>();
+    fn network<T: NetworkSource + Default>() {}
+    network::<PlatformNetwork>();
 }
 
 /// The first monitor, from a connection let go at once; `None` where the desktop lists none. `Err`: no desktop answers.

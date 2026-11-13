@@ -96,25 +96,98 @@ const SOUNDPOOL_CALLS: [&str; 2] = ["trackPlayer", "releasePlayer"];
 const MEDIAPLAYER: &str = "AtlTest: mediaplayer: ";
 /// AOSP's ALOGE in MediaPlayer::start for a player in Idle (mediaplayer.cpp:364, tag MediaPlayerNative, state 1 = MEDIA_PLAYER_IDLE): start() reached the native player and was refused there. Java's _start throws nothing for that (android_media_MediaPlayer.cpp), so this line is the only evidence the native path ran.
 const MEDIAPLAYER_START: &str = "MediaPlayerNative: start called in state 1";
-/// Main.onCreate's lines for services an app reaches through a manager that is null without them: (servicemanager name, line prefix, expected value). A missing service logs `absent`.
-/// connectivity: a device with no network agent (ConnectivityService.getActiveNetworkInfo -> null, isActiveNetworkMetered -> true).
+/// Main.onCreate's lines for services an app reaches through a manager that is null without them: (servicemanager name, line prefix, expected value; None = derived from the host, [`service_want`]). A missing service logs `absent`.
+/// connectivity: [`connectivity_want`].
 /// permissionmgr: PackageManager.checkPermission for the fixture itself: ACCESS_NETWORK_STATE is requested + NORMAL -> granted (0, permission.rs rule A); CAMERA is not requested -> denied (-1).
-const SERVICE_LINES: [(&str, &str, &str); 2] = [
-    (
-        "connectivity",
-        "AtlTest: connectivity: ",
-        "active=null metered=true",
-    ),
+const SERVICE_LINES: [(&str, &str, Option<&str>); 2] = [
+    ("connectivity", "AtlTest: connectivity: ", None),
     (
         "permissionmgr",
         "AtlTest: permission: ",
-        "network_state=0 camera=-1",
+        Some("network_state=0 camera=-1"),
     ),
 ];
 /// Main.priority's line: `start=<n> background=<r>/<nice> restore=<r>/<nice> foreground=<r>/<nice>`, r = `ok` or the throwable's simple name ([`priority_why`]).
 const PRIORITY: &str = "AtlTest: priority: ";
 /// Main.signatures' line: the fixture's signer as GET_SIGNATURES and GET_SIGNING_CERTIFICATES return it and checkSignatures against itself ([`signatures_want`]).
 const SIGNATURES: &str = "AtlTest: signatures: ";
+
+/// A [`SERVICE_LINES`] expectation: the fixed value, or for connectivity (None) [`connectivity_want`].
+fn service_want(fixed: Option<&str>) -> String {
+    fixed.map_or_else(connectivity_want, str::to_owned)
+}
+
+/// The connectivity line (Main.connectivity) for this host, read with the host's own tools, not the platform layer's code: the default route's interface from iproute2 (`ip route show default`, IPv4 then IPv6, lowest metric);
+/// its kind from sysfs (`wireless` dir -> Wi-Fi agent "WIFI", else Ethernet agent "Ethernet"); the Internet verdict and metered flag as GIO's network monitor takes them from NetworkManager (`nmcli`: connectivity none -> offline,
+/// full / unknown -> VALIDATED, limited / portal -> not; device GENERAL.METERED yes) and, without NetworkManager, as its netlink base does (a default route = full, not metered).
+/// Online: the active network's NetworkInfo is CONNECTED (NetworkAgent.markConnected), INTERNET is held, and the default-network callback delivers the same network with the same values.
+/// Offline: ConnectivityService with no agent (getActiveNetworkInfo null, isActiveNetworkMetered true) and no callback.
+fn connectivity_want() -> String {
+    const OFFLINE: &str =
+        "active=null metered=true internet=false validated=false iface=null callback=none";
+    let run = |args: &[&str]| -> Option<String> {
+        let out = std::process::Command::new(args[0])
+            .args(&args[1..])
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let best = |text: String| -> Option<String> {
+        text.lines()
+            .filter_map(|l| {
+                let w: Vec<&str> = l.split_whitespace().collect();
+                let field = |k: &str| w.iter().position(|x| *x == k).and_then(|i| w.get(i + 1));
+                Some((
+                    field("metric")
+                        .and_then(|m| m.parse::<u32>().ok())
+                        .unwrap_or(0),
+                    field("dev")?.to_string(),
+                ))
+            })
+            .min()
+            .map(|(_, dev)| dev)
+    };
+    let Some(iface) = run(&["ip", "-4", "route", "show", "default"])
+        .and_then(best)
+        .or_else(|| run(&["ip", "-6", "route", "show", "default"]).and_then(best))
+    else {
+        return OFFLINE.to_owned();
+    };
+    let (validated, metered) = match run(&["nmcli", "-t", "networking", "connectivity"]) {
+        None => (true, false),
+        Some(c) => {
+            let metered = run(&[
+                "nmcli",
+                "-t",
+                "-g",
+                "GENERAL.METERED",
+                "device",
+                "show",
+                &iface,
+            ])
+            .is_some_and(|m| m.trim_start().starts_with("yes"));
+            match c.trim() {
+                "none" => return OFFLINE.to_owned(),
+                "limited" | "portal" => (false, metered),
+                _ => (true, metered),
+            }
+        }
+    };
+    let kind = if Path::new("/sys/class/net")
+        .join(&iface)
+        .join("wireless")
+        .exists()
+    {
+        "WIFI"
+    } else {
+        "Ethernet"
+    };
+    format!(
+        "active={kind}/CONNECTED metered={metered} internet=true validated={validated} iface={iface} callback=same validated={validated} iface={iface}"
+    )
+}
 
 /// The signatures line for an APK whose one signer's certificate SHA-256 is `cert` (from `apksigner verify --print-certs`, not our code): one signature and one current signer with that digest,
 /// no rotation history (apksigner signs with one key, no lineage), and checkSignatures of a package with itself SIGNATURE_MATCH (0, PackageManager.java:1480).
@@ -922,10 +995,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         whys.push(format!("soundpool: want constructed, got {soundpool:?}"));
     }
     for (service, prefix, want) in SERVICE_LINES {
+        let want = service_want(want);
         let got = app
             .lines()
             .find_map(|l| l.split_once(prefix).map(|(_, r)| r.to_owned()));
-        if passed && got.as_deref() != Some(want) {
+        if passed && got.as_deref() != Some(want.as_str()) {
             whys.push(format!("{service}: want {want:?}, got {got:?}"));
         }
     }
@@ -1056,7 +1130,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             mediaplayer_steps(&app)
         );
         for (service, _, want) in SERVICE_LINES {
-            println!("app: pass {service} {want}");
+            println!("app: pass {service} {}", service_want(want));
         }
         println!(
             "app: pass priority {} ({})",
