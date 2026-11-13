@@ -222,7 +222,9 @@ fn finish_build(root: &Path) -> Result<()> {
     for n in slots {
         let line = match slot_prune::prune_sessions(&ws, n, now)? {
             Outcome::NotBuilt => format!("session prune: slot {n}: not built"),
-            Outcome::Busy => format!("session prune: slot {n}: busy, skipped: another process holds it"),
+            Outcome::Busy => {
+                format!("session prune: slot {n}: busy, skipped: another process holds it")
+            }
             Outcome::Done(plans) => slot_prune::sessions_line(&format!("slot {n}"), &plans),
         };
         println!("{line}");
@@ -240,7 +242,11 @@ fn release_holds() -> Result<BTreeSet<u32>> {
 
 /// No slot: the checkout's own target dir (the main checkout's `repo/target`). A link is refused: no record names the dir it points at.
 fn finish_target(ws: &Path, target: &Path, now: u64) -> Result<()> {
-    let label = target.strip_prefix(ws).unwrap_or(target).display().to_string();
+    let label = target
+        .strip_prefix(ws)
+        .unwrap_or(target)
+        .display()
+        .to_string();
     match std::fs::symlink_metadata(target) {
         Ok(meta) if meta.file_type().is_symlink() => bail!(
             "refused: {} is a link and this checkout has no slot record",

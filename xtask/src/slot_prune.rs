@@ -1572,11 +1572,26 @@ mod tests {
         let x = incremental_fixture(&debug);
         let _held = hold_incremental_locks(&x);
         let plans = only_plan(prune_sessions(&ws, 1, NOW).expect("prune"));
-        assert!(plans.iter().all(|p| p.stale.is_empty()), "a unit was planned");
-        for gone in ["s-1-a-svh1", "s-1-a.lock", "s-4-d-working", "s-4-d.lock", "s-7-g.lock"] {
+        assert!(
+            plans.iter().all(|p| p.stale.is_empty()),
+            "a unit was planned"
+        );
+        for gone in [
+            "s-1-a-svh1",
+            "s-1-a.lock",
+            "s-4-d-working",
+            "s-4-d.lock",
+            "s-7-g.lock",
+        ] {
             assert!(!x.join(gone).exists(), "{gone} survived");
         }
-        for kept in ["s-2-b-svh2", "s-5-e-working", "s-9-z-svh9", "s-x", "s-8-h.lock"] {
+        for kept in [
+            "s-2-b-svh2",
+            "s-5-e-working",
+            "s-9-z-svh9",
+            "s-x",
+            "s-8-h.lock",
+        ] {
             assert!(x.join(kept).exists(), "{kept} was removed");
         }
         for unit in [STALE, OLD, NEVER] {
@@ -1620,8 +1635,14 @@ mod tests {
         let x1 = incremental_fixture(&one);
         let x2 = incremental_fixture(&two);
         sessions_once_free(&ws, 1, NOW);
-        assert!(!x1.join("s-1-a-svh1").exists(), "slot 1's stale session survived");
-        assert!(x2.join("s-1-a-svh1").exists(), "slot 2's session was pruned");
+        assert!(
+            !x1.join("s-1-a-svh1").exists(),
+            "slot 1's stale session survived"
+        );
+        assert!(
+            x2.join("s-1-a-svh1").exists(),
+            "slot 2's session was pruned"
+        );
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 
