@@ -47,7 +47,7 @@ fn exports(path: &Path) -> Result<BTreeSet<String>> {
         .collect())
 }
 
-/// The NDK names of a `map.txt`: the `global:` entries, minus `# llndk` (vendor-only) and `# systemapi` (system-only) ones, which AOSP's stub generator omits from the NDK surface (build/soong/cc/symbolfile `_should_omit_tags`). A tag besides `introduced*` / `llndk` / `systemapi` fails: a new annotation must be classified, not guessed.
+/// The NDK names of a `map.txt`: the `global:` entries, minus `# llndk` (vendor-only) and `# systemapi` (system-only) ones, which AOSP's stub generator omits from the NDK surface (build/soong/cc/symbolfile `_should_omit_tags`). `# var` marks a data symbol (libmediandk's `AMEDIA*_KEY_*`): still NDK surface, the stub generator emits it as a variable. A tag besides `introduced*` / `llndk` / `systemapi` / `var` fails: a new annotation must be classified, not guessed.
 fn ndk_names(map: &str) -> Result<Vec<(usize, String)>> {
     let mut out = Vec::new();
     for (i, line) in map.lines().enumerate() {
@@ -63,7 +63,7 @@ fn ndk_names(map: &str) -> Result<Vec<(usize, String)>> {
         let tags: Vec<&str> = tags.split_whitespace().collect();
         if let Some(t) = tags
             .iter()
-            .find(|t| !t.starts_with("introduced") && !matches!(**t, "llndk" | "systemapi"))
+            .find(|t| !t.starts_with("introduced") && !matches!(**t, "llndk" | "systemapi" | "var"))
         {
             bail!("map line {}: unclassified tag {t} on {name}", i + 1);
         }
@@ -205,13 +205,13 @@ mod tests {
 
     #[test]
     fn map_names_skip_llndk_and_systemapi_and_refuse_unknown_tags() {
-        let map = "LIBEGL {\n  global:\n    eglA;\n    eglB; # introduced=29\n    eglC; # llndk\n    eglD; # systemapi introduced=31\n  local:\n    *;\n};\n";
+        let map = "LIBEGL {\n  global:\n    eglA;\n    eglB; # introduced=29\n    eglC; # llndk\n    eglD; # systemapi introduced=31\n    eglV; # var introduced=31\n  local:\n    *;\n};\n";
         let names: Vec<String> = ndk_names(map)
             .unwrap()
             .into_iter()
             .map(|(_, n)| n)
             .collect();
-        assert_eq!(names, ["eglA", "eglB"]);
+        assert_eq!(names, ["eglA", "eglB", "eglV"]);
         assert!(ndk_names("    eglE; # bogus\n").is_err());
     }
 }
