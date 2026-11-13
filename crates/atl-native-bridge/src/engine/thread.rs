@@ -107,19 +107,109 @@ pub fn set_guest_dtor(key: libc::pthread_key_t, dtor: usize) {
     }
 }
 
-/// Every attached thread's guest stack, by both handles the guest may hold for it: its bionic record (guest `pthread_self`) and its glibc `pthread_t` (guest `pthread_create`'s out-handle). The guest's `pthread_getattr_np` reads it ([`stack_of`]); detach removes the thread's entries.
-static STACKS: Mutex<Vec<(usize, Stack)>> = Mutex::new(Vec::new());
-
-/// The guest stack of the thread `handle` names (its record or its glibc `pthread_t`); None for a handle of no attached thread.
-pub fn stack_of(handle: usize) -> Option<Stack> {
-    let v = STACKS.lock().ok()?;
-    v.iter().find(|&&(h, _)| h == handle).map(|&(_, s)| s)
+/// One guest thread, by its one guest handle: the bionic record, which guest `pthread_self` reads from the TCB and guest `pthread_create` hands out (intercepts.rs), so `pthread_equal` (guest bionic) holds between the two.
+/// Every `pthread_t` row maps the handle to glibc's here ([`glibc_of`]); a guest thread a guest `pthread_create` made and a host thread that attached later (its first down call) are entered alike, the former before glibc starts it ([`prepare`]), the latter at attach.
+struct Thread {
+    record: usize,
+    /// glibc's `pthread_t`; 0 between [`prepare`] and glibc's answer
+    glibc: usize,
+    stack: Option<Stack>,
+    /// Made by a guest `pthread_create`, joinable: its record outlives the thread until join or detach, as bionic's does.
+    joinable: bool,
+    /// The thread ran its exit (`detach`) while still joinable.
+    exited: bool,
 }
 
-/// This thread's two handles ([`STACKS`]).
-fn handles() -> [usize; 2] {
+/// Every guest thread ([`Thread`]).
+static THREADS: Mutex<Vec<Thread>> = Mutex::new(Vec::new());
+
+fn with_thread<R>(handle: usize, f: impl FnOnce(&mut Thread) -> R) -> Option<R> {
+    let mut v = THREADS.lock().ok()?;
+    v.iter_mut().find(|t| t.record == handle).map(f)
+}
+
+/// The guest stack of the thread `handle` names; None for a handle of no attached thread.
+pub fn stack_of(handle: usize) -> Option<Stack> {
+    with_thread(handle, |t| t.stack).flatten()
+}
+
+/// glibc's `pthread_t` of the guest thread `handle`; None for a handle of no guest thread (the row answers ESRCH, as bionic does for an unknown handle).
+pub fn glibc_of(handle: usize) -> Option<libc::pthread_t> {
+    with_thread(handle, |t| t.glibc as libc::pthread_t).filter(|&g| g != 0)
+}
+
+/// The kernel tid of the guest thread `handle` (its record's `tid`, written by the thread itself at start, [`adopt_record`]); None for an unknown handle.
+pub fn tid_of(handle: usize) -> Option<i32> {
+    with_thread(handle, |_| ())?;
+    let a = abi();
+    // SAFETY: a live record of the generated layout (entries are removed before their record is freed); `tid` is `pid_t`, written once by its thread.
+    Some(unsafe { std::ptr::read_volatile((handle as *const u8).add(a.tid).cast::<i32>()) })
+}
+
+/// A guest `pthread_create`'s record, entered before glibc starts the thread so that its handle is valid from `pthread_create`'s return: the new thread adopts it ([`adopt_record`]). `joinable` from the attr.
+pub fn prepare(joinable: bool) -> usize {
+    let record = build();
+    // the creator's tid until the thread writes its own ([`adopt_record`]); 0 = not started
+    // SAFETY: `tid` is the fresh record's `pid_t` field.
+    unsafe { std::ptr::write_volatile((record as *mut u8).add(abi().tid).cast::<i32>(), 0) };
+    if let Ok(mut v) = THREADS.lock() {
+        v.push(Thread {
+            record,
+            glibc: 0,
+            stack: None,
+            joinable,
+            exited: false,
+        });
+    }
+    record
+}
+
+/// glibc's answer for [`prepare`]'s record (`thread` 0: glibc refused, the entry and record go).
+pub fn started(record: usize, thread: libc::pthread_t) {
+    if thread == 0 {
+        forget(record);
+        // SAFETY: the record [`prepare`] made; no thread adopted it.
+        unsafe { free_record(record) };
+        return;
+    }
+    with_thread(record, |t| t.glibc = thread as usize);
+}
+
+/// On the new thread, first: [`prepare`]'s record becomes this thread's, with its tid. Waits for nothing; the creator's [`tid_of`] reads the tid once the thread has run this.
+pub fn adopt_record(record: usize) {
     // SAFETY: no arguments.
-    [current(), unsafe { libc::pthread_self() } as usize]
+    let tid = unsafe { libc::gettid() };
+    // SAFETY: [`prepare`]'s record, not yet adopted; `tid` is its `pid_t` field.
+    unsafe { std::ptr::write_volatile((record as *mut u8).add(abi().tid).cast::<i32>(), tid) };
+    RECORD.with(|r| r.set(record));
+}
+
+/// Join's end (intercepts.rs `pthread_join` after glibc's): the thread has exited, its record goes.
+pub fn joined(handle: usize) {
+    if forget(handle) {
+        // SAFETY: the entry is gone and its thread has exited (glibc joined it), so nothing reads the record.
+        unsafe { free_record(handle) };
+    }
+}
+
+/// Detach (intercepts.rs `pthread_detach` after glibc's): an exited thread's record goes now, a running one's at its exit.
+pub fn detached(handle: usize) {
+    let gone = with_thread(handle, |t| {
+        t.joinable = false;
+        t.exited
+    });
+    if gone == Some(true) {
+        joined(handle);
+    }
+}
+
+/// Removes `handle`'s entry; whether it was there.
+fn forget(handle: usize) -> bool {
+    THREADS.lock().is_ok_and(|mut v| {
+        let n = v.len();
+        v.retain(|t| t.record != handle);
+        v.len() != n
+    })
 }
 
 /// Makes `ht` the calling thread's record (the thread that started the guest: its TCB came from `Guest::start`, its CPU from `Engine::start`).
@@ -133,8 +223,24 @@ pub fn adopt(ht: *mut HostThread) {
 fn adopt_on(ht: *mut HostThread, stack: Stack) {
     // SAFETY: `ht` is this thread's record, leaked until its detach; no other borrow is live.
     unsafe { (*ht).set_stack(stack) };
-    if let Ok(mut v) = STACKS.lock() {
-        v.extend(handles().map(|h| (h, stack)));
+    let record = current();
+    // SAFETY: no arguments.
+    let glibc = unsafe { libc::pthread_self() } as usize;
+    if let Ok(mut v) = THREADS.lock() {
+        match v.iter_mut().find(|t| t.record == record) {
+            // a guest pthread_create's thread: its creator may not have stored glibc's answer yet
+            Some(t) => {
+                t.glibc = glibc;
+                t.stack = Some(stack);
+            }
+            None => v.push(Thread {
+                record,
+                glibc,
+                stack: Some(stack),
+                joinable: false,
+                exited: false,
+            }),
+        }
     }
     CURRENT.with(|c| c.set(ht));
     ATTACHED.fetch_add(1, Ordering::Relaxed);
@@ -222,11 +328,19 @@ extern "C" fn detach(value: *mut libc::c_void) {
         }
         drop(Box::from_raw(ht));
     }
-    let gone = handles();
-    if let Ok(mut v) = STACKS.lock() {
-        v.retain(|(h, _)| !gone.contains(h));
+    // a joinable guest thread keeps its record and entry for join / detach (its handle stays valid); any other thread's go now
+    let record = RECORD.with(|r| r.replace(0));
+    let keep = record != 0
+        && with_thread(record, |t| {
+            t.stack = None;
+            t.exited = true;
+            t.joinable
+        }) == Some(true);
+    if record != 0 && !keep {
+        forget(record);
+        // SAFETY: this thread's record, which runs no more guest code; its entry is gone.
+        unsafe { free_record(record) };
     }
-    release_record();
     CURRENT.with(|c| c.set(std::ptr::null_mut()));
     active().detach();
     let d = DETACHED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -238,11 +352,9 @@ extern "C" fn detach(value: *mut libc::c_void) {
     let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
 }
 
-fn release_record() {
-    let rec = RECORD.with(|r| r.replace(0));
-    if rec == 0 {
-        return;
-    }
+/// # Safety
+/// `rec` came from [`build`] and nothing reads it after.
+unsafe fn free_record(rec: usize) {
     let a = abi();
     // SAFETY: `rec` and its `bionic_tls` were allocated by `build` with these layouts (the engine is chosen once per process).
     unsafe {
@@ -260,7 +372,7 @@ unsafe fn free(p: usize, size: usize, align: usize) {
     unsafe { std::alloc::dealloc(p as *mut u8, layout) };
 }
 
-/// The calling host thread's record, built on first use; leaked: the guest TCB keeps pointing at it for the thread's life.
+/// The calling host thread's record, built on first use (a guest `pthread_create`'s thread adopted [`prepare`]'s first); freed at the thread's exit, or for a joinable guest thread at join / detach.
 pub fn current() -> usize {
     RECORD.with(|r| {
         if r.get() == 0 {

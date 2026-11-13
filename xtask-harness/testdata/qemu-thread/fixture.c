@@ -10,6 +10,7 @@
 #include <signal.h>
 #include <stdint.h>
 #include <sys/system_properties.h>
+#include <unistd.h>
 
 // qt_routine returns its argument plus this
 #define QT_JOIN_OFFSET 1000
@@ -369,6 +370,86 @@ long qt_resolve(void) {
     struct hostent *he = gethostbyname("127.0.0.1");
     if (!he || he->h_addrtype != AF_INET || he->h_length != 4 || !he->h_addr_list || !he->h_addr_list[0] || !qt_is_loopback(he->h_addr_list[0])) {
         bad |= 1L << 8;
+    }
+    return bad;
+}
+
+// tr-first blocker 4 gate (check q): one guest thread handle for every pthread_t row. The target's routine and the signal handler record pthread_self() and gettid(); the creator compares them with its pthread_create handle (pthread_equal, guest bionic), pthread_gettid_np and what join hands back.
+// the signal pthread_kill sends: a real-time-free user signal no other check uses
+#define QT_KILL_SIG SIGUSR2
+static pthread_t qt_kill_seen;
+static volatile int qt_kill_hits;
+static volatile int qt_kill_ready;
+static volatile int qt_kill_go;
+static pid_t qt_kill_tid;
+static pthread_t qt_kill_self;
+
+static void qt_on_kill(int sig) {
+    (void)sig;
+    qt_kill_seen = pthread_self();
+    __atomic_add_fetch(&qt_kill_hits, 1, __ATOMIC_SEQ_CST);
+}
+
+static void *qt_kill_routine(void *arg) {
+    (void)arg;
+    qt_kill_self = pthread_self();
+    qt_kill_tid = gettid();
+    __atomic_store_n(&qt_kill_ready, 1, __ATOMIC_SEQ_CST);
+    // alive until the creator has read pthread_gettid_np (bionic clears the record's tid at exit)
+    long spins = 0;
+    while (!__atomic_load_n(&qt_kill_go, __ATOMIC_SEQ_CST) && ++spins < QT_SPIN_LIMIT) {
+    }
+    return (void *)pthread_self();
+}
+
+// Returns 0 when every step held, else a bit per failed step: 1 sigaction, 2 create, 3 the routine never started, 4 pthread_kill's rc, 5 the handler never ran, 6 it ran on another thread than the target (its pthread_self != the create handle), 7 the routine's pthread_self != the handle (pthread_equal), 8 pthread_gettid_np(handle) != the routine's gettid, 9 join's rc, 10 join's value (the routine's pthread_self) != the handle, 11 pthread_equal(pthread_self(), handle) on the creator.
+long qt_kill(void) {
+    long bad = 0;
+    struct sigaction sa = {0};
+    sa.sa_handler = qt_on_kill;
+    if (sigaction(QT_KILL_SIG, &sa, 0) != 0) {
+        return 1L << 1;
+    }
+    qt_kill_hits = 0;
+    qt_kill_ready = 0;
+    qt_kill_go = 0;
+    pthread_t t;
+    if (pthread_create(&t, 0, qt_kill_routine, 0) != 0) {
+        return 1L << 2;
+    }
+    long spins = 0;
+    while (!__atomic_load_n(&qt_kill_ready, __ATOMIC_SEQ_CST) && ++spins < QT_SPIN_LIMIT) {
+    }
+    if (!qt_kill_ready) {
+        bad |= 1L << 3;
+    }
+    if (pthread_kill(t, QT_KILL_SIG) != 0) {
+        bad |= 1L << 4;
+    }
+    spins = 0;
+    while (__atomic_load_n(&qt_kill_hits, __ATOMIC_SEQ_CST) == 0 && ++spins < QT_SPIN_LIMIT) {
+    }
+    if (pthread_gettid_np(t) != qt_kill_tid) {
+        bad |= 1L << 8;
+    }
+    __atomic_store_n(&qt_kill_go, 1, __ATOMIC_SEQ_CST);
+    void *ret = 0;
+    if (pthread_join(t, &ret) != 0) {
+        bad |= 1L << 9;
+    }
+    if (qt_kill_hits == 0) {
+        bad |= 1L << 5;
+    } else if (!pthread_equal(qt_kill_seen, t)) {
+        bad |= 1L << 6;
+    }
+    if (!pthread_equal(qt_kill_self, t)) {
+        bad |= 1L << 7;
+    }
+    if ((pthread_t)ret != t) {
+        bad |= 1L << 10;
+    }
+    if (pthread_equal(pthread_self(), t)) {
+        bad |= 1L << 11;
     }
     return bad;
 }

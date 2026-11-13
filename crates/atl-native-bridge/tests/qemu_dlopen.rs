@@ -82,9 +82,9 @@ fn dl_error(guest: &mut Guest, dlerror: usize) -> String {
 fn load_provider(nb: &Path) -> Result<(), String> {
     let lib = nb
         .ancestors()
-        .nth(2)
-        .ok_or("the NB directory is not <out>/nb/<arch>")?
-        .join("crates/atl-bionic/lib/libatl_bionic.so.0.0.0");
+        .map(|a| a.join("crates/atl-bionic/lib/libatl_bionic.so.0.0.0"))
+        .find(|p| p.is_file())
+        .ok_or("no crates/atl-bionic/lib/libatl_bionic.so.0.0.0 above the NB directory (<out>/nb/<arch>, <out>/nb-graph-<arch>/nb/<arch>)")?;
     let path =
         std::ffi::CString::new(lib.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
     // SAFETY: dlopen of a NUL-terminated path; the provider's constructors are its own.

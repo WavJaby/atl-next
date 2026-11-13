@@ -195,6 +195,19 @@ const SHIMS: &[&str] = &[
     "pthread_key_delete",
     // intercepts.rs: reports the guest stack of the thread, not glibc's view of a bionic record
     "pthread_getattr_np",
+    // tr-first blocker 4, intercepts.rs: a guest pthread_t is the thread's bionic record (thread.rs `THREADS`), mapped to glibc's handle; join and detach also end the record's life, gettid_np reads it (glibc has none)
+    "pthread_join",
+    "pthread_detach",
+    "pthread_gettid_np",
+    // intercepts.rs `BY_HANDLE`: the handle mapped, then glibc's function
+    "pthread_getcpuclockid",
+    "pthread_getname_np",
+    "pthread_getschedparam",
+    "pthread_kill",
+    "pthread_setname_np",
+    "pthread_setschedparam",
+    "pthread_setschedprio",
+    "pthread_sigqueue",
     // provider.rs: the provider calls a host trampoline that crosses to the guest callback
     "__system_property_foreach",
     "__system_property_read_callback",
@@ -239,7 +252,7 @@ const ENV_SHIMS: &[&str] = &[
 ];
 
 /// Guest libc stubs glibc's `libc.so.6` serves with the same ABI, by (stub name, glibc symbol). NBS names the allocator entries `native_bridge_<fn>` (one heap: the guest libc's malloc calls them).
-/// The pthread rows rest on intercepts.rs's size gates (`pthread_t` long, `pthread_key_t` int, `pthread_attr_t` only ever filled and read by glibc since every `pthread_attr_*` is here); the rest are the C contract (memory, allocation, time), identical in bionic and glibc on LP64.
+/// The pthread rows rest on intercepts.rs's size gates (`pthread_key_t` int, `pthread_attr_t` only ever filled and read by glibc since every `pthread_attr_*` is here); none takes a `pthread_t`, which is the guest's own handle ([`SHIMS`]); the rest are the C contract (memory, allocation, time), identical in bionic and glibc on LP64.
 const GLIBC: &[(&str, &str)] = &[
     ("memcpy", "memcpy"),
     ("memset", "memset"),
@@ -280,16 +293,6 @@ const GLIBC: &[(&str, &str)] = &[
     ("pthread_attr_setscope", "pthread_attr_setscope"),
     ("pthread_attr_setstack", "pthread_attr_setstack"),
     ("pthread_attr_setstacksize", "pthread_attr_setstacksize"),
-    ("pthread_detach", "pthread_detach"),
-    ("pthread_getcpuclockid", "pthread_getcpuclockid"),
-    ("pthread_getname_np", "pthread_getname_np"),
-    ("pthread_getschedparam", "pthread_getschedparam"),
-    ("pthread_join", "pthread_join"),
-    ("pthread_kill", "pthread_kill"),
-    ("pthread_setname_np", "pthread_setname_np"),
-    ("pthread_setschedparam", "pthread_setschedparam"),
-    ("pthread_setschedprio", "pthread_setschedprio"),
-    ("pthread_sigqueue", "pthread_sigqueue"),
     ("pthread_getspecific", "pthread_getspecific"),
     ("pthread_setspecific", "pthread_setspecific"),
     // struct hostent is the same in bionic and glibc (engine/netdb.rs layout gate); the answer is glibc's static storage, as bionic's is its own. h_errno stays glibc's: the guest's h_errno is not set
@@ -1158,6 +1161,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("qt_routine_arg", "atl_nb_qt_routine_arg"),
     // R10 S3 (engine/intercepts.rs `pthread_create`): the guest attr's stack size is not passed to attach, every guest stack is the default (qemu-thread gate, `g`)
     ("qt_attr_size", "atl_nb_qt_attr_size"),
+    // tr-first blocker 4 (engine/intercepts.rs `pthread_create`): the guest gets glibc's handle, not its thread's record, so the record-keyed rows miss it (qemu-thread gate, `q`)
+    ("qt_handle_glibc", "atl_nb_qt_handle_glibc"),
     // R10 S3 (build.rs `libc_entries`): pthread_getattr_np bound to glibc again, which reads the bionic record as a glibc thread (qemu-thread gate, `g`)
     ("qt_getattr_glibc", "atl_nb_qt_getattr_glibc"),
     // Q7-7 (engine/intercepts.rs `pthread_exit`): the routine's guest call is not ended, so the guest resumes after its noreturn pthread_exit (qemu-thread gate, `x`)

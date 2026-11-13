@@ -170,6 +170,11 @@ fn shim(name: &str) -> Option<usize> {
         "pthread_key_create" => super::intercepts::pthread_key_create as *const () as usize,
         "pthread_key_delete" => super::intercepts::pthread_key_delete as *const () as usize,
         "pthread_getattr_np" => super::intercepts::pthread_getattr_np as *const () as usize,
+        "pthread_join" => super::intercepts::pthread_join as *const () as usize,
+        "pthread_detach" => super::intercepts::pthread_detach as *const () as usize,
+        "pthread_gettid_np" => super::intercepts::pthread_gettid_np as *const () as usize,
+        // tr-first blocker 4: the handle-mapped glibc rows (build.rs `SHIMS`, intercepts.rs `BY_HANDLE`)
+        n if super::intercepts::by_handle_fn(n).is_some() => super::intercepts::by_handle_fn(n)?,
         // Q7-7: QEMU table only (build.rs `QEMU_SHIMS`)
         "pthread_exit" => super::intercepts::pthread_exit as *const () as usize,
         "getaddrinfo" => super::netdb::getaddrinfo as *const () as usize,
@@ -280,6 +285,11 @@ fn symbol(host: Host, soname: &str, name: &str) -> Option<usize> {
     // SAFETY: dlsym on a live handle with a NUL-terminated name.
     let p = unsafe { libc::dlsym(h as *mut c_void, c.as_ptr()) };
     (!p.is_null()).then_some(p as usize)
+}
+
+/// glibc's own `name` (intercepts.rs `by_handle` calls through it).
+pub fn glibc_symbol(name: &str) -> Option<usize> {
+    symbol(Host::Glibc, "", name)
 }
 
 /// The provider's own `name` (provider.rs shims call through it); None without the provider.
