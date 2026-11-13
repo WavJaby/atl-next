@@ -446,7 +446,10 @@ fn round_failures(app: &str, prefix: &str, rounds: usize, bound_ms: Option<u64>)
     let name = prefix.trim_end().trim_end_matches(':');
     let mut whys = Vec::new();
     let mut done = 0;
-    for line in app.lines().filter_map(|l| l.split_once(prefix).map(|(_, r)| r.trim_end())) {
+    for line in app
+        .lines()
+        .filter_map(|l| l.split_once(prefix).map(|(_, r)| r.trim_end()))
+    {
         let ok = line
             .strip_prefix("round ")
             .and_then(|r| r.split_once(" ok "))
@@ -794,7 +797,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // media.extractor end to end (l1-sniff): a valid WAV is prepared, started, sought and reset through the served service, by fd and by path; the reset with a seek
     // pending returns within its bound (the in-process notify path, patch 0004)
     if passed {
-        whys.extend(round_failures(&app, MEDIA_WAV, MEDIA_WAV_ROUNDS, Some(MEDIA_ROUND_BOUND_MS)));
+        whys.extend(round_failures(
+            &app,
+            MEDIA_WAV,
+            MEDIA_WAV_ROUNDS,
+            Some(MEDIA_ROUND_BOUND_MS),
+        ));
         whys.extend(round_failures(
             &app,
             MEDIA_RESET,
@@ -1022,7 +1030,12 @@ mod tests {
             .map(|i| format!("AtlTest: mediaplayer-reset: round {i} ok 40 ms\n"))
             .collect();
         assert_eq!(
-            round_failures(&ok, MEDIA_RESET, MEDIA_RESET_ROUNDS, Some(MEDIA_ROUND_BOUND_MS)),
+            round_failures(
+                &ok,
+                MEDIA_RESET,
+                MEDIA_RESET_ROUNDS,
+                Some(MEDIA_ROUND_BOUND_MS)
+            ),
             Vec::<String>::new()
         );
         // a reset that never returns: its round is missing and the probe's own line names it
@@ -1041,14 +1054,31 @@ mod tests {
             MEDIA_ROUND_BOUND_MS + 1
         );
         assert!(!round_failures(&slow, MEDIA_RESET, 1, Some(MEDIA_ROUND_BOUND_MS)).is_empty());
-        let threw = "AtlTest: mediaplayer-wav: round 0 prepare java.io.IOException: Prepare failed.\n";
-        let why = round_failures(threw, MEDIA_WAV, MEDIA_WAV_ROUNDS, Some(MEDIA_ROUND_BOUND_MS));
-        assert!(why.iter().any(|w| w.contains("prepare java.io.IOException")));
+        let threw =
+            "AtlTest: mediaplayer-wav: round 0 prepare java.io.IOException: Prepare failed.\n";
+        let why = round_failures(
+            threw,
+            MEDIA_WAV,
+            MEDIA_WAV_ROUNDS,
+            Some(MEDIA_ROUND_BOUND_MS),
+        );
+        assert!(
+            why.iter()
+                .any(|w| w.contains("prepare java.io.IOException"))
+        );
         assert!(why.iter().any(|w| w.ends_with("0 of 4 rounds ok")));
         // the WAV probe's worker outlives its bound: the probe names the step the round was in
         let hung = "AtlTest: mediaplayer-wav: round 0 ok 1 ms\nAtlTest: mediaplayer-wav: no answer within 40000 ms at reset\n";
-        let why = round_failures(hung, MEDIA_WAV, MEDIA_WAV_ROUNDS, Some(MEDIA_ROUND_BOUND_MS));
-        assert!(why.iter().any(|w| w.contains("no answer within 40000 ms at reset: round 1 never returned")));
+        let why = round_failures(
+            hung,
+            MEDIA_WAV,
+            MEDIA_WAV_ROUNDS,
+            Some(MEDIA_ROUND_BOUND_MS),
+        );
+        assert!(
+            why.iter()
+                .any(|w| w.contains("no answer within 40000 ms at reset: round 1 never returned"))
+        );
     }
 
     #[test]
