@@ -120,7 +120,7 @@ crates = ["atl-services"]
 # the package record types (plain Rust, no converter) are what atld installs and xtask writes
 exports = ["atl-services"]
 # libgui-parcel: finishDrawing frames the post-draw Transaction with libgui's reader to forward it (window.rs); platform-host: the sensor service reads the machine's accelerometers through it (sensor.rs); gralloc: atl-screencap reads the captured buffer's dma-buf (screencap.rs); property-service: ActivityTaskManager reads ro.opengles.version by its name there (system_services.rs)
-uses = ["aidl", "generators", "broker", "libinput", "android-paths", "libgui-parcel", "platform-host", "gralloc", "services-types", "services-wire", "property-service"]
+uses = ["aidl", "generators", "broker", "libinput", "android-paths", "libgui-parcel", "platform-host", "gralloc", "services-types", "services-wire", "property-service", "diag"]
 
 # AOSP libinput as the converter builds it, reached through cxx adapters (wrap/input.cpp): the input publisher and the virtual keyboard's KeyCharacterMap; C++ only as the adapters the project CLAUDE.md allows
 [libinput]
@@ -273,4 +273,4 @@ uses = ["layout", "bwrap", "services-types", "android-paths", "fonts-table"]
 [xtask-harness]
 crates = ["xtask-harness"]
 # xtask: its library; broker: its control protocol, mounts and launcher, used by the runtime gates; bwrap: the task-bind gate's namespace argv; services-types: the package manifest records the gates write for atld; gralloc: the VINTF declarations and mapper library name the gralloc gate and atld share; native-bridge: its library name, staged for atld runs, its binding table (step gl-proxies) and its `isSupported` classifier the jni-fixture gate runs on the fixture; android-paths: the guest paths of the records it writes; platform-host: the app sandbox's access and the PipeWire socket; cpu-pressure: the cadence window's starvation share (judge_window); generators: the aarch64 thunk-pool emitter (atl_bridgegen::aarch64) writes the QEMU spike fixture's pool, and the spike check reads it back; property-service: the default property set the installer gate maps, with the device ABI list replaced for its break abi-arm64
-uses = ["xtask", "layout", "broker", "bwrap", "services-types", "gralloc", "platform-host", "native-bridge", "android-paths", "cpu-pressure", "generators", "property-service"]
+uses = ["xtask", "layout", "broker", "bwrap", "services-types", "gralloc", "platform-host", "native-bridge", "android-paths", "cpu-pressure", "generators", "property-service", "diag"]
