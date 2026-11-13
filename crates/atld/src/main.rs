@@ -3,7 +3,8 @@
 //! 1. the runtime root `--root` (made fresh): `properties` (the default property area, atl-property-service; `properties.d/` one area per app process: the defaults plus the properties only that process has, [`Host::process_properties`]), `system/` (build.prop, `framework/` = the boot jars and shared libraries),
 //!    `data/` (`app/<package>/{base.apk,split_<name>.apk,lib/<isa>/}`, `user/0/<package>/`, `dalvik-cache/`), `install/` (the installer's frames of each session, read by the services), `log/<process>.log` (each process's stdout + stderr).
 //! 2. the install sessions: each `--package` (its APK files) is a session the services install at their start (owner option I, 2026-11-13): they own the package list; atld does installd's
-//!    file work on their request (control `Install`: stage under AOSP names + run atl-installer in the broker's installer profile; `Commit`: rename to `/data/app/<package>`, create the data dirs).
+//!    file work on their request (control `Install`: stage under session names (hard links where possible) + run atl-installer in the broker's installer profile; `Commit`: rename each file by its
+//!    parsed split (`base.apk`, `split_<name>.apk`), then the dir to `/data/app/<package>`, create the data dirs).
 //! 3. atl-binderd, its admin connection on stdin; the broker holds the other end.
 //! 4. AOSP servicemanager as uid 1000 (AID_SYSTEM), the one process that may become context manager.
 //! 5. atl-system-services as uid 1000 with the packages and, as its stdin, the process-control connection (atl_broker::control): it starts app processes (ActivityManager's ProcessList) and kills them, here, through
@@ -30,7 +31,7 @@ use atl_android_paths::{
     DATA, DATA_APP, DATA_USER, DATA_USER_DE, PROPERTY_AREA, PROPERTY_AREA_ENV, SDCARD,
     SHARED_STORAGE, SYSTEM, SYSTEM_FONTS, SYSTEM_FRAMEWORK, VENDOR,
 };
-use atl_broker::control::{self, Request, Response, StartRequest};
+use atl_broker::control::{self, Request, Response, StagedName, StartRequest};
 use atl_broker::{
     Broker, INSTALLER_UID, Link, Mount, Process, Spawn, gpu, kill_sandbox, to_log, tree_mounts,
 };
@@ -278,21 +279,43 @@ struct PackageSource {
     files: Vec<PackageFile>,
 }
 
-/// One APK of a session: the base (`split` None) or a split with its name.
+/// One APK of a session. Which file is the base and what each split is called comes from the installer's parse, not from here.
 #[derive(Deserialize, Clone)]
 struct PackageFile {
-    split: Option<String>,
     path: PathBuf,
 }
 
 impl PackageFile {
-    /// Its name in the code dir, as PackageInstallerSession stages it (`base.apk`, `split_<name>.apk`).
-    fn staged_name(&self) -> String {
-        match &self.split {
-            None => "base.apk".to_owned(),
-            Some(n) => format!("split_{n}.apk"),
-        }
+    /// Its session name: the source's file name, as `pm install-multiple` writes each file (PackageManagerShellCommand.doWriteSplits). It must end in `.apk`: the cluster parse sees only those
+    /// (ApkLiteParseUtils.isApkFile), so another name would be dropped without a word.
+    fn session_name(&self) -> Result<String> {
+        let name = self
+            .path
+            .file_name()
+            .with_context(|| format!("{}: no file name", self.path.display()))?
+            .to_string_lossy()
+            .into_owned();
+        ensure!(
+            name.ends_with(".apk"),
+            "{name}: a session file must end in .apk"
+        );
+        Ok(name)
     }
+}
+
+/// Puts `from` at `to` without a second copy where the filesystem allows: a hard link, else a copy (another filesystem). The staged dir is mounted read-only into the installer, so nothing
+/// it runs (AOSP's hole punching in the APK among it) can change the linked source.
+fn stage_file(from: &Path, to: &Path) -> Result<()> {
+    if std::fs::hard_link(from, to).is_ok() {
+        return Ok(());
+    }
+    std::fs::copy(from, to).with_context(|| format!("staging {}", from.display()))?;
+    Ok(())
+}
+
+/// `FileUtils.isValidExtFilename` as PackageInstallerSession applies it to a target name: non-empty, not `.`/`..`, no NUL or `/`.
+fn valid_ext_filename(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['\0', '/'])
 }
 
 /// The runtime root's layout.
@@ -499,6 +522,50 @@ struct Installd {
     committed: Mutex<BTreeMap<String, u32>>,
 }
 
+/// PackageInstallerSession's uniform naming in `dir`: each staged `.apk` file renamed to its `names` entry. Every staged APK is named exactly once and every target is `base.apk` or
+/// `split_<name>.apk` with a valid name; otherwise nothing is renamed. Session names end in `.apk` and target names are distinct, but a session file may already carry a target's name: the renames go
+/// through a temporary name each, so no rename lands on a file still to be moved.
+fn rename_staged(dir: &Path, names: &[StagedName]) -> Result<()> {
+    let mut staged = BTreeSet::new();
+    for e in std::fs::read_dir(dir)? {
+        let e = e?;
+        let name = e.file_name().to_string_lossy().into_owned();
+        if e.file_type()?.is_file() && name.ends_with(".apk") {
+            staged.insert(name);
+        }
+    }
+    let named: BTreeSet<&str> = names.iter().map(|n| n.staged.as_str()).collect();
+    ensure!(
+        named.len() == names.len() && named == staged.iter().map(String::as_str).collect(),
+        "commit names {named:?}, staged {staged:?}: not every staged APK once"
+    );
+    let targets: BTreeSet<&str> = names.iter().map(|n| n.name.as_str()).collect();
+    ensure!(
+        targets.len() == names.len(),
+        "two staged APKs under one name"
+    );
+    for n in names {
+        let split = n
+            .name
+            .strip_prefix("split_")
+            .and_then(|s| s.strip_suffix(".apk"));
+        ensure!(
+            n.name == "base.apk"
+                || (split.is_some_and(valid_ext_filename) && valid_ext_filename(&n.name)),
+            "{:?}: not base.apk or split_<name>.apk",
+            n.name
+        );
+    }
+    let tmp = |i: usize| dir.join(format!(".rename-{i}"));
+    for (i, n) in names.iter().enumerate() {
+        std::fs::rename(dir.join(&n.staged), tmp(i))?;
+    }
+    for (i, n) in names.iter().enumerate() {
+        std::fs::rename(tmp(i), dir.join(&n.name))?;
+    }
+    Ok(())
+}
+
 /// A staging dir's name below /data/app (PackageInstallerService.buildTmpSessionDir: `vmdl<sessionId>.tmp`).
 fn staging_name(session: u32) -> String {
     format!("vmdl{session}.tmp")
@@ -529,8 +596,7 @@ impl Host {
         std::fs::create_dir_all(&host_dir)?;
         let staged = (|| -> Result<String> {
             for f in files {
-                std::fs::copy(&f.path, host_dir.join(f.staged_name()))
-                    .with_context(|| format!("staging {}", f.path.display()))?;
+                stage_file(&f.path, &host_dir.join(f.session_name()?))?;
             }
             let lib = LIB_DIR_NAME;
             std::fs::create_dir_all(host_dir.join(lib))?;
@@ -609,7 +675,7 @@ impl Host {
     }
 
     /// Request `Commit`: session `session` (staged for `uid`) becomes `/data/app/<package>` (PackageInstallerSession's rename), with its data dirs (installd createAppData) and external dirs; whether a library needs ES1.
-    fn commit(&self, session: u32, package: &str, uid: u32) -> Result<bool> {
+    fn commit(&self, session: u32, package: &str, uid: u32, names: &[StagedName]) -> Result<bool> {
         ensure!(
             !package.is_empty()
                 && package
@@ -631,7 +697,9 @@ impl Host {
         );
         let app = self.root.data().join("app");
         let code = app.join(package);
-        std::fs::rename(app.join(staging_name(session)), &code)
+        let staged_dir = app.join(staging_name(session));
+        rename_staged(&staged_dir, names)?;
+        std::fs::rename(&staged_dir, &code)
             .with_context(|| format!("moving session {session} to {}", code.display()))?;
         for d in [format!("user/0/{package}"), format!("user_de/0/{package}")] {
             std::fs::create_dir_all(self.root.data().join(d))?;
@@ -1163,8 +1231,9 @@ fn serve_control(host: Arc<Host>, fd: std::os::fd::OwnedFd) {
                 session,
                 package,
                 uid,
+                names,
             } => host
-                .commit(session, &package, uid)
+                .commit(session, &package, uid, &names)
                 .map(|needs_es1| Response::Committed { needs_es1 }),
         };
         outcome.unwrap_or_else(|e| {
@@ -1256,10 +1325,14 @@ fn run(a: &Args) -> Result<ExitCode> {
             std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
         let source: PackageSource =
             serde_json::from_str(&text).with_context(|| format!("parsing {}", file.display()))?;
+        let names = source
+            .files
+            .iter()
+            .map(PackageFile::session_name)
+            .collect::<Result<BTreeSet<_>>>()?;
         ensure!(
-            source.files.first().is_some_and(|f| f.split.is_none())
-                && source.files[1..].iter().all(|f| f.split.is_some()),
-            "{}: not a base APK followed by splits",
+            !source.files.is_empty() && names.len() == source.files.len(),
+            "{}: no files, or two with one file name (a session holds each name once)",
             file.display()
         );
         session_args.extend(["--session".into(), i.to_string().into()]);
@@ -1715,6 +1788,68 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh dir holding `files` (each content = its name) and a `lib/` dir, under the system temp dir.
+    fn staged(test: &str, files: &[&str]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("atld-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(LIB_DIR_NAME)).expect("dir");
+        for f in files {
+            std::fs::write(dir.join(f), f).expect("file");
+        }
+        dir
+    }
+
+    fn name(staged: &str, name: &str) -> StagedName {
+        StagedName {
+            staged: staged.into(),
+            name: name.into(),
+        }
+    }
+
+    /// Files staged under source names, one of which already carries another file's target name: each ends under its parsed name with its own bytes.
+    #[test]
+    fn staged_files_take_their_parsed_names() {
+        let dir = staged("rename", &["a.apk", "split_x.apk"]);
+        let names = [
+            name("a.apk", "split_x.apk"),
+            name("split_x.apk", "base.apk"),
+        ];
+        rename_staged(&dir, &names).expect("renamed");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("split_x.apk")).expect("split"),
+            "a.apk"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("base.apk")).expect("base"),
+            "split_x.apk"
+        );
+        assert!(!dir.join("a.apk").exists());
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// Break: a staged APK the names leave out, or a target outside AOSP's two forms, is refused before any rename.
+    #[test]
+    fn incomplete_or_foreign_names_rename_nothing() {
+        let dir = staged("refuse", &["a.apk", "b.apk"]);
+        assert!(rename_staged(&dir, &[name("a.apk", "base.apk")]).is_err());
+        assert!(
+            rename_staged(
+                &dir,
+                &[name("a.apk", "base.apk"), name("b.apk", "other.apk")]
+            )
+            .is_err()
+        );
+        assert!(
+            rename_staged(
+                &dir,
+                &[name("a.apk", "base.apk"), name("b.apk", "split_.apk")]
+            )
+            .is_err()
+        );
+        assert!(dir.join("a.apk").exists() && dir.join("b.apk").exists());
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
 
     #[test]
     fn gralloc_node_is_the_ready_lines_parenthesis() {

@@ -7,7 +7,7 @@ use std::io;
 use std::os::fd::OwnedFd;
 use std::sync::Mutex;
 
-use atl_broker::control::{self, Request, Response, StartRequest};
+use atl_broker::control::{self, Request, Response, StagedName, StartRequest};
 
 pub trait ProcessControl: Send + Sync {
     /// Starts the process; its pid (the binderd tag).
@@ -27,12 +27,19 @@ impl ControlSocket {
         }
     }
 
-    /// Moves session `session` to `/data/app/<package>` and creates its data dirs: whether a library needs ES1.
-    pub fn commit(&self, session: u32, package: &str, uid: u32) -> io::Result<bool> {
+    /// Renames session `session`'s files to `names`, moves it to `/data/app/<package>` and creates its data dirs: whether a library needs ES1.
+    pub fn commit(
+        &self,
+        session: u32,
+        package: &str,
+        uid: u32,
+        names: Vec<StagedName>,
+    ) -> io::Result<bool> {
         match self.call(&Request::Commit {
             session,
             package: package.to_owned(),
             uid,
+            names,
         })? {
             Response::Committed { needs_es1 } => Ok(needs_es1),
             Response::Error { message } => Err(io::Error::other(message)),

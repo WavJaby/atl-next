@@ -266,10 +266,9 @@ pub struct Package {
     pub files: Vec<PackageFile>,
 }
 
-/// One APK of a package: the base (`split` None), or a split APK with its split name.
+/// One APK of a package. Which is the base and what each split is called is the installer's parse; atld stages each under its file name (`.apk`, unique in the package).
 #[derive(Serialize)]
 pub struct PackageFile {
-    pub split: Option<String>,
     pub path: PathBuf,
 }
 
@@ -277,7 +276,7 @@ impl Package {
     /// A package of one base APK and no splits.
     pub fn base(path: PathBuf) -> Self {
         Self {
-            files: vec![PackageFile { split: None, path }],
+            files: vec![PackageFile { path }],
         }
     }
 }

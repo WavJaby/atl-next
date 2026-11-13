@@ -741,7 +741,7 @@ fn source(root: &Path, target: &str) -> Result<(Option<test_apks::Row>, Vec<Pack
         let (row, files) = test_apks::ensure(root, target)?;
         let files = files
             .into_iter()
-            .map(|(split, path)| PackageFile { split, path })
+            .map(|(_, path)| PackageFile { path })
             .collect();
         return Ok((Some(row), files));
     }
@@ -750,7 +750,7 @@ fn source(root: &Path, target: &str) -> Result<(Option<test_apks::Row>, Vec<Pack
         path.is_file(),
         "{target}: not a file (an argument holding `.`, `/` or `\\` is a path)"
     );
-    Ok((None, vec![PackageFile { split: None, path }]))
+    Ok((None, vec![PackageFile { path }]))
 }
 
 /// The script's `wait:MS` items summed: how long it runs after the first present (a bad item is the app's to refuse, counted 0 here).

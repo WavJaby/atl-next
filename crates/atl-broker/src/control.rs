@@ -41,18 +41,28 @@ pub enum Request {
     Kill {
         pid: i32,
     },
-    /// Stage session `session`'s files under AOSP names (`base.apk`, `split_<name>.apk`) in `/data/app/vmdl<session>.tmp` and run the installer over it (parse + native-library copy).
-    /// `uid` (the package's future uid) must be above the installer's own ([`crate::INSTALLER_UID`]). Answered [`Response::Staged`]; a failed installer run removes the staging dir and answers its stderr.
+    /// Stage session `session`'s files under their session names (the source file names, as `pm install-multiple` writes them: PackageManagerShellCommand.doWriteSplits) in `/data/app/vmdl<session>.tmp`
+    /// and run the installer over it (parse + native-library copy). `uid` (the package's future uid) must be above the installer's own ([`crate::INSTALLER_UID`]). Answered [`Response::Staged`]; a failed
+    /// installer run removes the staging dir and answers its stderr.
     Install {
         session: u32,
         uid: u32,
     },
-    /// Rename the staged dir to `/data/app/<package>` and create the package's data dirs (installd createAppData): the services decoded the frames and accepted them.
+    /// Rename each staged file to the name its parsed split gives (`names`: PackageInstallerSession's uniform naming, ApkLiteParseUtils.splitNameToFileName), then the staged dir to
+    /// `/data/app/<package>`, and create the package's data dirs (installd createAppData): the services decoded the frames and accepted them. `names` covers every staged file once.
     Commit {
         session: u32,
         package: String,
         uid: u32,
+        names: Vec<StagedName>,
     },
+}
+
+/// One staged file's rename at commit: `staged` (its session name) -> `name` (`base.apk` or `split_<split name>.apk`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedName {
+    pub staged: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
