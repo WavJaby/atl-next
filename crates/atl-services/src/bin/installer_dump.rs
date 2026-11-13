@@ -2,7 +2,7 @@
 //! atl-installer-dump: the installer's output (frames of upstream parcels on stdin) decoded by `atl_services::installed::decode`, printed as `key value` lines for `xtask test installer`, which compares them
 //! with its oracles. Test-only. A decode error goes to stderr with its name, exit 1, and nothing on stdout.
 //! Lines: `package`, `version-code` (getLongVersionCode), `version-name`, `min-sdk`, `target-sdk`, `app-class`, `app-flags`, `extract-native-libs`, `app-process`, `app-theme`, `uses-permission`*,
-//! `permission <name> protection-level=`*, `activity`/`receiver`/`service`/`provider <name> key=value...`*, `filter <kind> <component> actions= categories= schemes= types=`*, `split`*, `primary-abi`, `lib-dir`.
+//! `permission <name> protection-level=`*, `activity`/`receiver`/`service`/`provider <name> key=value...`*, `filter <kind> <component> actions= categories= schemes= types=`*, `uses-library <name> required=`*, `instrumentation <name> target=`*, `split`*, `primary-abi`, `lib-dir`.
 
 extern crate atl_parcelables;
 extern crate binder;
@@ -114,7 +114,7 @@ fn lines(installed: &Installed) -> Result<Vec<String>> {
             Kind::ReceiverIntents => "receiver",
             Kind::ServiceIntents => "service",
             Kind::ProviderIntents => "provider",
-            Kind::Package => continue,
+            Kind::Package | Kind::UsesLibraries => continue,
         };
         for i in &c.intents {
             let f = i
@@ -130,6 +130,16 @@ fn lines(installed: &Installed) -> Result<Vec<String>> {
                 join(f.data_types.as_ref())
             ));
         }
+    }
+    for l in &installed.libraries {
+        out.push(format!("uses-library {} required={}", l.name, l.required));
+    }
+    for i in pkg.instrumentation.iter().flatten().flatten() {
+        out.push(format!(
+            "instrumentation {} target={}",
+            or_none(&i.item.name),
+            or_none(&i.target_package)
+        ));
     }
     for s in pkg.split_names.iter().flatten().flatten() {
         out.push(format!("split {s}"));

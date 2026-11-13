@@ -4,6 +4,8 @@
 //!   PackageInfoUtils sets them from the package setting.
 //! - [`Kind::ActivityIntents`] .. [`Kind::ProviderIntents`], one per component with intent filters (PackageInfo carries none): the first and the intents fields of ParsedComponentImpl.writeToParcel
 //!   (frameworks/base core/java/com/android/internal/pm/pkg/component/ParsedComponentImpl.java:159-169): the class name as writeString, then writeTypedList of its ParsedIntentInfoImpl.
+//! - [`Kind::UsesLibraries`], once: the `<uses-library>` lists PackageInfo does not carry, as PackageImpl.writeToParcel writes them (:3202-3203): writeStringList of getUsesLibraries (required), then of getUsesOptionalLibraries.
+//!   No static or SDK library lists: no test row or fixture declares one.
 //!
 //! The frame layer only splits; atl-services decodes the parcels (`installed`).
 
@@ -18,15 +20,17 @@ pub enum Kind {
     ReceiverIntents = 3,
     ServiceIntents = 4,
     ProviderIntents = 5,
+    UsesLibraries = 6,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 5] = [
+    pub const ALL: [Kind; 6] = [
         Kind::Package,
         Kind::ActivityIntents,
         Kind::ReceiverIntents,
         Kind::ServiceIntents,
         Kind::ProviderIntents,
+        Kind::UsesLibraries,
     ];
 
     fn from_u32(v: u32) -> Option<Kind> {
@@ -186,10 +190,10 @@ mod tests {
     #[test]
     fn unknown_kind_is_refused_by_name() {
         let mut data = two_frames();
-        data[0..4].copy_from_slice(&9u32.to_le_bytes());
+        data[0..4].copy_from_slice(&7u32.to_le_bytes());
         assert_eq!(
             frames(&data),
-            Err(FrameError::UnknownKind { at: 0, kind: 9 })
+            Err(FrameError::UnknownKind { at: 0, kind: 7 })
         );
     }
 }

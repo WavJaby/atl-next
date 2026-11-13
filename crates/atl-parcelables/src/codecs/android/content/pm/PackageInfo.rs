@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MIT
 //! android.content.pm.PackageInfo: content/pm/PackageInfo.java writeToParcel (:581) / PackageInfo(Parcel) (:659), squashing allowed around the whole value: every component's ApplicationInfo
 //! after the first copy is a back-reference (`crate::squash`).
-//! Component and permission arrays: writeTypedArray (-1 = null, else the count and each element as writeTypedObject). Not modelled, null only: instrumentation, signatures, configPreferences,
+//! Component and permission arrays: writeTypedArray (-1 = null, else the count and each element as writeTypedObject). Not modelled, null only: signatures, configPreferences,
 //! reqFeatures, featureGroups, attributions (typed arrays), signingInfo.
 
 use super::ActivityInfo::ActivityInfo;
 use super::ApplicationInfo::ApplicationInfo;
+use super::InstrumentationInfo::InstrumentationInfo;
 use super::PermissionInfo::PermissionInfo;
 use super::ProviderInfo::ProviderInfo;
 use super::ServiceInfo::ServiceInfo;
@@ -34,6 +35,7 @@ pub struct PackageInfo {
     pub receivers: TypedArray<ActivityInfo>,
     pub services: TypedArray<ServiceInfo>,
     pub providers: TypedArray<ProviderInfo>,
+    pub instrumentation: TypedArray<InstrumentationInfo>,
     pub permissions: TypedArray<PermissionInfo>,
     pub requested_permissions: Option<Vec<Option<String>>>,
     pub requested_permissions_flags: Option<Vec<i32>>,
@@ -94,7 +96,7 @@ impl PackageInfo {
         w_typed_list(p, &self.receivers)?;
         w_typed_list(p, &self.services)?;
         w_typed_list(p, &self.providers)?;
-        w_null(p)?; // instrumentation
+        w_typed_list(p, &self.instrumentation)?;
         w_typed_list(p, &self.permissions)?;
         w_str8_array(p, &self.requested_permissions)?;
         w_i32_array(p, &self.requested_permissions_flags)?;
@@ -142,7 +144,7 @@ impl PackageInfo {
         let receivers = r_typed_list(p)?;
         let services = r_typed_list(p)?;
         let providers = r_typed_list(p)?;
-        r_null(p, "android.content.pm.PackageInfo.instrumentation")?;
+        let instrumentation = r_typed_list(p)?;
         let permissions = r_typed_list(p)?;
         let requested_permissions = r_str8_array(p)?;
         let requested_permissions_flags = r_i32_array(p)?;
@@ -186,6 +188,7 @@ impl PackageInfo {
             receivers,
             services,
             providers,
+            instrumentation,
             permissions,
             requested_permissions,
             requested_permissions_flags,

@@ -12,13 +12,16 @@
 //! 4. `refuse-version`, `refuse-package`: fossify-notes' base + a split linked here by aapt2 whose versionCode (base + 1) or package (base + `.other`) differs -> AOSP's own check refuses (`Inconsistent version` / `Inconsistent package`, PackageManager INSTALL_PARSE_FAILED_BAD_MANIFEST -101), the installer exits non-zero.
 //! 5. `refuse-duplicate-permission`: an app linked here declaring one permission twice with different protection levels -> the full parse refuses it (ParsingPackageUtils.java:1051-1055, INSTALL_PARSE_FAILED_MANIFEST_MALFORMED -108); the lite parse alone accepts it.
 //! 6. `feature`: an app linked here requesting CAMERA only with `<required-feature android.hardware.camera>` -> on this device (no declared features, the installer gets no `--feature`) AOSP drops the request (ParsingPackageUtils.java:1464-1471): no uses-permission.
+//! 8. `libraries`: an app linked here declaring an `<instrumentation>` and `<uses-library>` required, optional, optional-then-required and both ways -> PackageInfo's instrumentation and the uses-library frame equal the xmltree oracle
+//!    (AOSP's merge rule, ParsingPackageUtils.parseUsesLibrary). Checks 1-3 compare both against their rows' xmltree too.
 //!
 //! The installer's output is frames of upstream parcels (atl-services-types installer_output); every check reads it decoded by atl-services (`installed::decode`, through atl-installer-dump).
 //! 7. `alto-corrupt-length`, `alto-truncated-parcel`: check 1's output with its first frame length past the end, and with the PackageInfo parcel cut by 8 bytes -> the decode refuses each by name, decoding nothing.
 //!
 //! Measured: the installer's VM start, lite parse, full parse and natives times (its stderr `time-ms` line) and the process wall time of each run.
 //! Breaks: `--break drop-split` (check 1's dir without its split: splits, primary ABI and libraries must turn red); `--break abi-arm64` (the device's ABI lists are arm64-v8a only: AOSP's no-match, `native error -113`, must turn check 1 red);
-//! `--break feature` (check 6's installer is told the device has android.hardware.camera: the forwarder's hasFeature answers true, uses-permission must turn red).
+//! `--break feature` (check 6's installer is told the device has android.hardware.camera: the forwarder's hasFeature answers true, uses-permission must turn red);
+//! `--break libraries` (check 8's installer parses a variant with the optional library required and no instrumentation, against the original's oracle: uses-library and instrumentation must both turn red).
 //! Every installer run is spawned through the broker's installer profile (atl-broker `spawn_installer`, plan 4b M5): the runtime, framework-res, the api-impl dex and the package dir read-only at their own paths, one output dir read-write,
 //! no network namespace, no binder, the measured installer seccomp filter, the installer's own uid. The verdict counts the seccomp denials dmesg recorded during the run (kill mode: a denial also ends the process with SIGSYS).
 //! Breaks, each must turn the gate red and name the refusal: `read-outside` (alto's package dir is not in the view: ENOENT), `write-outside` (alto's output dir is inside the read-only package dir: EROFS),
@@ -63,6 +66,7 @@ const CODENAME: &str = "ro.build.version.codename";
 const FEATURE: &str = "android.hardware.camera";
 const FEATURE_PERMISSION: &str = "android.permission.CAMERA";
 const BREAK_FEATURE: &str = "feature";
+const BREAK_LIBRARIES: &str = "libraries";
 /// The M5 breaks (module doc): each must turn the gate red with the refusal named.
 const BREAK_READ_OUTSIDE: &str = "read-outside";
 const BREAK_WRITE_OUTSIDE: &str = "write-outside";
@@ -103,7 +107,8 @@ pub struct Args {
     out: Option<PathBuf>,
     /// Deliberate break that must turn the gate red with the refusal named (module doc): `drop-split`, `abi-arm64` (check 1: no config split in the dir; the device's ABI lists are arm64-v8a only), `feature` (check 6: the installer is told the device has android.hardware.camera),
     /// `read-outside`, `write-outside`, `no-framework-res` (check 1's view lacks its package dir / its output dir is read-only / framework-res), `net` (the probe in the profile reaches for TCP).
-    #[arg(long, value_parser = ["drop-split", "abi-arm64", "feature", BREAK_READ_OUTSIDE, BREAK_WRITE_OUTSIDE, BREAK_NO_FRAMEWORK, BREAK_NET])]
+    /// `libraries` (check 8's installer parses an APK whose optional library is required and which has no instrumentation; the oracle stays the original's).
+    #[arg(long, value_parser = ["drop-split", "abi-arm64", "feature", BREAK_LIBRARIES, BREAK_READ_OUTSIDE, BREAK_WRITE_OUTSIDE, BREAK_NO_FRAMEWORK, BREAK_NET])]
     r#break: Option<String>,
     /// Print each installer command and its output.
     #[arg(long)]
@@ -259,6 +264,27 @@ fn link_app(tools: &ApkTools, work: &Path, name: &str, body: &str) -> Result<Pat
         &work.join(format!("fixture-{name}")),
         &format!(
             "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\" package=\"org.atl.fixture.{name}\" android:versionCode=\"1\">\n  <uses-sdk android:minSdkVersion=\"24\" android:targetSdkVersion=\"34\"/>\n{body}  <application android:hasCode=\"false\"/>\n</manifest>\n"
+        ),
+    )
+}
+
+/// Check 8's app `org.atl.fixture.libraries` in `<work>/fixture-libraries[-broken]`: an instrumentation and `<uses-library>` declared required, optional, optional-then-required and twice (AOSP's merge rule decides each);
+/// `broken` (break `libraries`): the optional library required and no instrumentation.
+fn link_libraries(tools: &ApkTools, work: &Path, broken: bool) -> Result<PathBuf> {
+    let (dir, optional, instrumentation) = if broken {
+        ("fixture-libraries-broken", "true", "")
+    } else {
+        (
+            "fixture-libraries",
+            "false",
+            "  <instrumentation android:name=\".Probe\" android:targetPackage=\"org.atl.fixture.libraries\"/>\n",
+        )
+    };
+    link(
+        tools,
+        &work.join(dir),
+        &format!(
+            "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\" package=\"org.atl.fixture.libraries\" android:versionCode=\"1\" android:versionName=\"1\">\n  <uses-sdk android:minSdkVersion=\"24\" android:targetSdkVersion=\"34\"/>\n{instrumentation}  <application android:hasCode=\"false\">\n    <uses-library android:name=\"org.apache.http.legacy\"/>\n    <uses-library android:name=\"androidx.window.extensions\" android:required=\"{optional}\"/>\n    <uses-library android:name=\"android.test.runner\" android:required=\"false\"/>\n    <uses-library android:name=\"android.test.runner\"/>\n    <uses-library android:name=\"org.apache.http.legacy\" android:required=\"false\"/>\n  </application>\n</manifest>\n"
         ),
     )
 }
@@ -943,6 +969,41 @@ impl Gate<'_> {
         Ok(())
     }
 
+    /// Check `libraries`: the installer over `dir` against the xmltree oracle of `oracle_apk` (the same APK unless broken): uses-library and instrumentation must equal it.
+    fn libraries(
+        &mut self,
+        area: &Path,
+        dir: &Path,
+        lib_root: &Path,
+        oracle_apk: &Path,
+    ) -> Result<()> {
+        let name = "libraries";
+        let (r, frames, _) = self.run(area, dir, lib_root, Show::ALL)?;
+        if !r.ok {
+            self.fail(name, format!("installer {}: {}", r.status, r.failure()));
+            return Ok(());
+        }
+        let decoded = match self.decode(&frames)? {
+            Ok(d) => d,
+            Err(e) => {
+                self.fail(name, format!("decode: {e}"));
+                return Ok(());
+            }
+        };
+        let full = Full::read(&decoded)?;
+        let o = oracle(&self.aapt2, oracle_apk, self.sdk)?;
+        let bad = compare(&full, &o);
+        if bad.is_empty() {
+            println!(
+                "{name}: PASS uses-library {:?} instrumentation {:?} (xmltree, parseUsesLibrary's merge)",
+                full.uses_libraries, full.instrumentation
+            );
+        } else {
+            self.fail(name, bad.join("; "));
+        }
+        Ok(())
+    }
+
     /// Check `name`: the installer over `dir` exits non-zero with AOSP's refusal `parse error <code>: <marker>...`.
     fn refuse(
         &mut self,
@@ -1226,6 +1287,17 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         &[]
     };
     gate.feature(&area, features, &dir, &work.join("feature-lib"))?;
+
+    // 8. libraries: <uses-library> and <instrumentation>, PackageInfo's instrumentation and the uses-library frame
+    let good = link_libraries(&tools, &work, false)?;
+    let input = if args.r#break.as_deref() == Some(BREAK_LIBRARIES) {
+        link_libraries(&tools, &work, true)?
+    } else {
+        good.clone()
+    };
+    let dir = work.join("libraries");
+    stage_dir(&dir, &[(None, &input)])?;
+    gate.libraries(&area, &dir, &work.join("libraries-lib"), &good)?;
 
     if let Some(probe) = &probe {
         gate.net_break(probe)?;

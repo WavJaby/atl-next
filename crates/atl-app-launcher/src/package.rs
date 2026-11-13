@@ -13,9 +13,9 @@ use crate::ffi::{JObject, JValue, Vm};
 /// PackageParser2's install flags (InstallPackageHelper.java:1502-1505): PARSE_CHATTY (1 << 31) | PARSE_ENFORCE_CODE (1 << 6) (ParsingPackageUtils.java:243, :252); not on external storage.
 /// PARSE_ENFORCE_CODE is read by ScanPackageUtils.assertCodePolicy (InstallPackageHelper.java:4626), services.jar, not by the parser.
 const PARSE_FLAGS: i32 = i32::MIN | 1 << 6;
-/// PackageManager GET_ACTIVITIES | GET_RECEIVERS | GET_SERVICES | GET_PROVIDERS | GET_META_DATA | GET_PERMISSIONS | MATCH_DIRECT_BOOT_UNAWARE | MATCH_DIRECT_BOOT_AWARE (PackageManager.java):
-/// every component (generate keeps one only if a direct-boot flag matches it, PackageInfoCommonUtils.isMatch:630-644), their meta-data and the permission arrays.
-const INFO_FLAGS: i64 = 0x1 | 0x2 | 0x4 | 0x8 | 0x80 | 0x1000 | 0x0004_0000 | 0x0008_0000;
+/// PackageManager GET_ACTIVITIES | GET_RECEIVERS | GET_SERVICES | GET_PROVIDERS | GET_INSTRUMENTATION | GET_META_DATA | GET_PERMISSIONS | MATCH_DIRECT_BOOT_UNAWARE | MATCH_DIRECT_BOOT_AWARE (PackageManager.java):
+/// every component (generate keeps one only if a direct-boot flag matches it, PackageInfoCommonUtils.isMatch:630-644), the instrumentation, their meta-data and the permission arrays.
+const INFO_FLAGS: i64 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x80 | 0x1000 | 0x0004_0000 | 0x0008_0000;
 /// The user generate fills per-user fields for: the only one (UserHandle.USER_SYSTEM).
 const USER: i32 = 0;
 
@@ -199,7 +199,37 @@ impl Parsed {
         ] {
             vm.frame(|| self.intents(vm, kind, getter, &mut out))?;
         }
+        vm.frame(|| self.libraries(vm, &mut out))?;
         Ok(out)
+    }
+
+    /// The `<uses-library>` frame: writeStringList of getUsesLibraries, then of getUsesOptionalLibraries, as PackageImpl.writeToParcel writes the two (:3202-3203).
+    fn libraries(&self, vm: &Vm, out: &mut Vec<u8>) -> Result<()> {
+        let android_package = vm.find_class(c"com/android/server/pm/pkg/AndroidPackage")?;
+        let parcel_class = vm.find_class(c"android/os/Parcel")?;
+        let write = vm.method(
+            parcel_class,
+            c"writeStringList",
+            c"(Ljava/util/List;)V",
+            false,
+        )?;
+        let mut lists = Vec::new();
+        for getter in [c"getUsesLibraries", c"getUsesOptionalLibraries"] {
+            let get = vm.method(android_package, getter, c"()Ljava/util/List;", false)?;
+            lists.push(vm.call_object(self.pkg, get, &[], "AndroidPackage uses-library list")?);
+        }
+        let bytes = marshal(vm, |parcel| {
+            for list in &lists {
+                vm.call_void_with(
+                    parcel,
+                    write,
+                    &[JValue { l: *list }],
+                    "Parcel.writeStringList",
+                )?;
+            }
+            Ok(())
+        })?;
+        write_frame(out, Kind::UsesLibraries, &bytes).context("frame")
     }
 
     /// One frame per component of `getter`'s list that has intent filters: `writeString(name)`, `writeTypedList(intents)`, as ParsedComponentImpl.writeToParcel writes those two fields.

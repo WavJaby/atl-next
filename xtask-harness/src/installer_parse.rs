@@ -2,7 +2,7 @@
 //! `xtask test installer`, slice M3: the installer's full parse (ParsingPackageUtils + PackageInfoCommonUtils.generate) against oracles read here, independently of it.
 //! - `aapt2 dump badging`: package, versionCode, versionName, minSdkVersion, targetSdkVersion, launchable-activity (the first enabled `<activity>`; badging ignores aliases, so an alias launcher is checked by name only), `uses-permission` / `uses-permission-sdk-23` (with AOSP's request filter: a permission whose
 //!   `maxSdkVersion` is below the device's resource SDK, or the sdk-23 form below 23, is dropped, ParsingPackageUtils.parseUsesPermission:1459-1462).
-//! - `aapt2 dump xmltree` of the manifest, scanned here: the class names of `<application>`, `<activity>` + `<activity-alias>` (AOSP lists aliases among activities), `<receiver>`, `<service>`, `<provider>`, and `<permission>` names.
+//! - `aapt2 dump xmltree` of the manifest, scanned here: the class names of `<application>`, `<activity>` + `<activity-alias>` (AOSP lists aliases among activities), `<receiver>`, `<service>`, `<provider>`, `<permission>` names, `<uses-library>` (name, required, with AOSP's merge rule) and `<instrumentation>` (class, targetPackage).
 //! - `manifest.rs` (the aapt2 reader the services use today): every field it shares with the installer. A difference there is a finding, printed, not a failure: AOSP is the reference unless shown otherwise.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,7 +16,7 @@ use atl_services_types::packages::Manifest;
 const SDK_23: i32 = 23;
 const ACTION_MAIN: &str = "android.intent.action.MAIN";
 const CATEGORY_LAUNCHER: &str = "android.intent.category.LAUNCHER";
-const ANDROID_NAME: &str = ":name(0x01010003)=";
+const ANDROID_NS: &str = "http://schemas.android.com/apk/res/android:";
 
 /// One component line of the installer: kind, name, and its `key=value` fields.
 #[derive(Debug, Default, Clone)]
@@ -44,6 +44,10 @@ pub struct Full {
     pub permissions: Vec<(String, u32)>,
     pub components: Vec<Component>,
     pub filters: Vec<Filter>,
+    /// (name, required) in output order
+    pub uses_libraries: Vec<(String, bool)>,
+    /// the `instrumentation` lines' text
+    pub instrumentation: BTreeSet<String>,
 }
 
 fn kv(rest: &str) -> BTreeMap<String, String> {
@@ -73,6 +77,14 @@ impl Full {
             let (key, rest) = line.split_once(' ').unwrap_or((line, ""));
             match key {
                 "uses-permission" => f.uses_permissions.push(rest.to_owned()),
+                "uses-library" => {
+                    let (name, fields) = rest.split_once(' ').unwrap_or((rest, ""));
+                    let required = kv(fields).get("required").is_some_and(|r| r == "true");
+                    f.uses_libraries.push((name.to_owned(), required));
+                }
+                "instrumentation" => {
+                    f.instrumentation.insert(rest.to_owned());
+                }
                 "permission" => {
                     let (name, fields) = rest.split_once(' ').unwrap_or((rest, ""));
                     let level = kv(fields)
@@ -158,6 +170,10 @@ pub struct Oracle {
     /// The `<activity-alias>` names: badging's launchable-activity considers `<activity>` elements only.
     pub aliases: BTreeSet<String>,
     pub permissions: BTreeSet<String>,
+    /// (name, required), as the parse keeps them (`uses_libraries`)
+    pub uses_libraries: Vec<(String, bool)>,
+    /// `<class> target=<targetPackage>`
+    pub instrumentation: BTreeSet<String>,
 }
 
 /// `key='value'` of a badging line.
@@ -178,46 +194,86 @@ fn class_name(package: &str, name: &str) -> String {
     }
 }
 
-/// The xmltree's `android:name` of each element as (tag, parent tag, raw name), in order: an element's attributes are the `A:` lines indented one step below its `E:` line.
-fn xml_names(tree: &str) -> Vec<(String, String, String)> {
-    let mut stack: Vec<(usize, String)> = Vec::new();
-    let mut out = Vec::new();
+/// One xmltree element: its tag path from the root (`["manifest", "application", ...]`) and its `android:` attributes by name (value without aapt2's `(Raw: ..)` and quotes).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Element {
+    path: Vec<String>,
+    attrs: BTreeMap<String, String>,
+}
+
+impl Element {
+    fn at(&self, path: &[&str]) -> bool {
+        self.path
+            .iter()
+            .map(String::as_str)
+            .eq(path.iter().copied())
+    }
+}
+
+/// The xmltree's elements in order: an element's attributes are the `A:` lines indented one step below its `E:` line.
+fn xml_elements(tree: &str) -> Vec<Element> {
+    let mut stack: Vec<usize> = Vec::new();
+    let mut out: Vec<Element> = Vec::new();
+    let mut path: Vec<String> = Vec::new();
+    // the index in `out` of the element the next `A:` lines belong to
+    let mut current = None;
     for line in tree.lines() {
         let indent = line.len() - line.trim_start().len();
         let t = line.trim_start();
         if let Some(rest) = t.strip_prefix("E: ") {
-            while stack.last().is_some_and(|(i, _)| *i >= indent) {
+            while stack.last().is_some_and(|i| *i >= indent) {
                 stack.pop();
+                path.pop();
             }
-            stack.push((
-                indent,
-                rest.split(' ').next().unwrap_or_default().to_owned(),
-            ));
+            stack.push(indent);
+            path.push(rest.split(' ').next().unwrap_or_default().to_owned());
+            out.push(Element {
+                path: path.clone(),
+                attrs: BTreeMap::new(),
+            });
+            current = Some(out.len() - 1);
         } else if let Some(rest) = t.strip_prefix("A: ") {
-            let Some(at) = rest.find(ANDROID_NAME) else {
+            let (Some(at), Some(i)) = (rest.find(ANDROID_NS), current) else {
                 continue;
             };
-            let Some((elem_indent, tag)) = stack.last() else {
-                continue;
-            };
-            if indent <= *elem_indent {
+            if stack.last().is_none_or(|e| indent <= *e) {
                 continue;
             }
-            let value = &rest[at + ANDROID_NAME.len()..];
+            let attr = &rest[at + ANDROID_NS.len()..];
+            let Some((name, value)) = attr
+                .split_once('(')
+                .and_then(|(n, v)| Some((n, v.split_once(")=")?.1)))
+            else {
+                continue;
+            };
             let value = value
                 .split(" (Raw")
                 .next()
                 .unwrap_or(value)
                 .trim()
                 .trim_matches('"');
-            let parent = stack
-                .len()
-                .checked_sub(2)
-                .map_or(String::new(), |i| stack[i].1.clone());
-            out.push((tag.clone(), parent, value.to_owned()));
+            out[i].attrs.insert(name.to_owned(), value.to_owned());
         }
     }
     out
+}
+
+/// AOSP's `<uses-library>` rule (ParsingPackageUtils.parseUsesLibrary, PackageImpl.addUsesLibrary): `required` defaults to true; a required name leaves the optional list; an optional name already required is ignored; no duplicates. (name, required), required first.
+fn uses_libraries(declared: &[(String, bool)]) -> Vec<(String, bool)> {
+    let mut required: Vec<String> = Vec::new();
+    let mut optional: Vec<String> = Vec::new();
+    for (name, req) in declared {
+        if *req {
+            if !required.contains(name) {
+                required.push(name.clone());
+            }
+            optional.retain(|o| o != name);
+        } else if !required.contains(name) && !optional.contains(name) {
+            optional.push(name.clone());
+        }
+    }
+    let r = required.into_iter().map(|n| (n, true));
+    r.chain(optional.into_iter().map(|n| (n, false))).collect()
 }
 
 /// The oracle of one base APK; `sdk` = the device's resource SDK (Build.VERSION.RESOURCES_SDK_INT).
@@ -268,9 +324,35 @@ pub fn oracle(aapt2: &Path, apk: &Path, sdk: i32) -> Result<Oracle> {
             .arg(apk),
         "aapt2 dump xmltree",
     )?;
-    for (tag, parent, name) in xml_names(&tree) {
-        let class = class_name(&o.package, &name);
-        match (tag.as_str(), parent.as_str()) {
+    let mut declared = Vec::new();
+    for e in xml_elements(&tree) {
+        // AOSP parses `<uses-library>` and `<instrumentation>` only at these places (parseBaseApplication's child tags, parseBaseApkTags)
+        if e.at(&["manifest", "application", "uses-library"]) {
+            let name = e.attrs.get("name").context("uses-library without a name")?;
+            declared.push((
+                name.clone(),
+                e.attrs.get("required").is_none_or(|r| r != "false"),
+            ));
+        } else if e.at(&["manifest", "instrumentation"]) {
+            let name = e
+                .attrs
+                .get("name")
+                .context("instrumentation without a name")?;
+            let target = e.attrs.get("targetPackage").map_or("none", String::as_str);
+            o.instrumentation
+                .insert(format!("{} target={target}", class_name(&o.package, name)));
+        }
+        let (Some(tag), Some(name)) = (e.path.last(), e.attrs.get("name")) else {
+            continue;
+        };
+        let parent = e
+            .path
+            .len()
+            .checked_sub(2)
+            .map_or("", |i| e.path[i].as_str());
+        let class = class_name(&o.package, name);
+        let name = name.clone();
+        match (tag.as_str(), parent) {
             ("application", "manifest") => o.app_class = Some(class),
             ("activity", "application") => {
                 o.components
@@ -294,6 +376,7 @@ pub fn oracle(aapt2: &Path, apk: &Path, sdk: i32) -> Result<Oracle> {
             _ => {}
         }
     }
+    o.uses_libraries = uses_libraries(&declared);
     Ok(o)
 }
 
@@ -360,6 +443,18 @@ pub fn compare(full: &Full, o: &Oracle) -> Vec<String> {
         bad.push(format!(
             "permission {perms:?} != xmltree {:?}",
             o.permissions
+        ));
+    }
+    if full.uses_libraries != o.uses_libraries {
+        bad.push(format!(
+            "uses-library {:?} != xmltree {:?}",
+            full.uses_libraries, o.uses_libraries
+        ));
+    }
+    if full.instrumentation != o.instrumentation {
+        bad.push(format!(
+            "instrumentation {:?} != xmltree {:?}",
+            full.instrumentation, o.instrumentation
         ));
     }
     bad
@@ -545,7 +640,7 @@ pub fn manifest_findings(full: &Full, m: &Manifest) -> Vec<Finding> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Full, class_name, xml_names};
+    use super::{Element, Full, class_name, uses_libraries, xml_elements};
 
     #[test]
     fn reads_full_lines_and_launchers() {
@@ -567,20 +662,41 @@ mod tests {
     }
 
     #[test]
-    fn xml_names_take_the_own_attribute_and_parent() {
-        let tree = "N: android=http://schemas.android.com/apk/res/android\n  E: manifest (line=2)\n    A: http://schemas.android.com/apk/res/android:versionCode(0x0101021b)=1\n    E: permission (line=3)\n      A: http://schemas.android.com/apk/res/android:name(0x01010003)=\"a.P\" (Raw: \"a.P\")\n    E: application (line=4)\n      A: http://schemas.android.com/apk/res/android:name(0x01010003)=\"a.App\" (Raw: \"a.App\")\n      E: activity (line=5)\n        A: http://schemas.android.com/apk/res/android:name(0x01010003)=\".M\" (Raw: \".M\")\n        E: intent-filter (line=6)\n          E: action (line=7)\n            A: http://schemas.android.com/apk/res/android:name(0x01010003)=\"android.intent.action.MAIN\" (Raw: \"android.intent.action.MAIN\")\n";
+    fn xml_elements_take_their_own_attributes_and_path() {
+        let tree = "N: android=http://schemas.android.com/apk/res/android\n  E: manifest (line=2)\n    A: http://schemas.android.com/apk/res/android:versionCode(0x0101021b)=1\n    E: permission (line=3)\n      A: http://schemas.android.com/apk/res/android:name(0x01010003)=\"a.P\" (Raw: \"a.P\")\n    E: application (line=4)\n      A: http://schemas.android.com/apk/res/android:name(0x01010003)=\"a.App\" (Raw: \"a.App\")\n      E: uses-library (line=5)\n        A: http://schemas.android.com/apk/res/android:name(0x01010003)=\"org.apache.http.legacy\" (Raw: \"org.apache.http.legacy\")\n        A: http://schemas.android.com/apk/res/android:required(0x0101028e)=false\n      E: activity (line=6)\n        A: http://schemas.android.com/apk/res/android:name(0x01010003)=\".M\" (Raw: \".M\")\n";
+        let e = xml_elements(tree);
+        let path = |e: &Element| e.path.join("/");
         assert_eq!(
-            xml_names(tree),
+            e.iter().map(path).collect::<Vec<_>>(),
             [
-                ("permission".into(), "manifest".into(), "a.P".into()),
-                ("application".into(), "manifest".into(), "a.App".into()),
-                ("activity".into(), "application".into(), ".M".into()),
-                (
-                    "action".into(),
-                    "intent-filter".into(),
-                    "android.intent.action.MAIN".into()
-                ),
+                "manifest",
+                "manifest/permission",
+                "manifest/application",
+                "manifest/application/uses-library",
+                "manifest/application/activity"
             ]
+        );
+        assert_eq!(e[0].attrs["versionCode"], "1");
+        assert_eq!(e[1].attrs["name"], "a.P");
+        assert_eq!(e[3].attrs["name"], "org.apache.http.legacy");
+        assert_eq!(e[3].attrs["required"], "false");
+        assert_eq!(e[4].attrs["name"], ".M");
+    }
+
+    #[test]
+    fn uses_libraries_follow_parse_uses_library() {
+        let d = |n: &str, r| (n.to_owned(), r);
+        // a: optional then required -> required only; b: required then optional -> required; c: optional twice -> once
+        assert_eq!(
+            uses_libraries(&[
+                d("a", false),
+                d("c", false),
+                d("a", true),
+                d("b", true),
+                d("b", false),
+                d("c", false)
+            ]),
+            [d("a", true), d("b", true), d("c", false)]
         );
     }
 }
