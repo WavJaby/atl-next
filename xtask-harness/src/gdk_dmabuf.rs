@@ -109,7 +109,9 @@ mod tests {
     fn mmap_needs_counted_readback() {
         let mmap = "Gdk-DEBUG: Used mmap for downloading 562x900 dmabuf (format AB24:0)\n";
         let tier = "libGLES_atl: buffer tier readback (this device cannot import gralloc's buffer, EGL error 0x3003)\n";
-        let counted = format!("{tier}libGLES_atl: readback_frames=1\nlibGLES_atl: readback_frames=64\n{mmap}");
+        let counted = format!(
+            "{tier}libGLES_atl: readback_frames=1\nlibGLES_atl: readback_frames=64\n{mmap}"
+        );
         assert_eq!(readback_frames(&counted), 64);
         assert!(Verdict::of(&counted).ok_in(&counted));
         assert!(!Verdict::of(mmap).ok_in(mmap));

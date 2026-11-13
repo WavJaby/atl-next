@@ -1541,7 +1541,10 @@ fn run(a: &Args) -> Result<ExitCode> {
     // the render path: baseline (Mesa's default on the run's GPU) unless a kernel-offered candidate initialises and renders on something else (gpu::RENDER_PATHS); one `gpu-render: path` line records which ran
     let mut app_env = Vec::new();
     if let (Some((n, _)), Some(probe)) = (&gpu, &a.gpu_probe) {
-        let probe_renderer = |name: &str, devices: Vec<PathBuf>, env: Vec<(OsString, OsString)>| -> Result<std::result::Result<(String, String), String>> {
+        let probe_renderer = |name: &str,
+                              devices: Vec<PathBuf>,
+                              env: Vec<(OsString, OsString)>|
+         -> Result<std::result::Result<(String, String), String>> {
             let mut spawn = system_spawn(
                 name,
                 probe,
@@ -1572,8 +1575,11 @@ fn run(a: &Args) -> Result<ExitCode> {
                 if !a.break_render_path {
                     devices.extend(path.nodes.iter().map(PathBuf::from));
                 }
-                let env: Vec<(OsString, OsString)> =
-                    path.env.iter().map(|(k, v)| ((*k).into(), (*v).into())).collect();
+                let env: Vec<(OsString, OsString)> = path
+                    .env
+                    .iter()
+                    .map(|(k, v)| ((*k).into(), (*v).into()))
+                    .collect();
                 let name = format!("gpu-render-{}", path.module);
                 match (probe_renderer(&name, devices, env.clone())?, &baseline) {
                     (Ok((v, rend)), Ok((_, base))) if rend != *base => {

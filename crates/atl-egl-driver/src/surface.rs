@@ -470,14 +470,14 @@ fn connect(_: &Window) -> Result<bool, EglError> {
     Ok(false)
 }
 
-/// One stderr line per window event (the app's log), so a run shows which path ran.
-#[allow(
-    clippy::print_stderr,
-    reason = "one line per window connect or teardown, which path ran"
-)]
 /// The readback counter's log text after `libGLES_atl: ` (count follows).
 pub const READBACK_FRAMES_LINE: &str = "readback_frames=";
 
+/// One stderr line per window event (the app's log), so a run shows which path ran; plus the readback counter at powers of two.
+#[allow(
+    clippy::print_stderr,
+    reason = "one line per window connect or teardown, which path ran; the readback counter log2(frames) times"
+)]
 fn log(line: &str) {
     eprintln!("libGLES_atl: {line}");
 }

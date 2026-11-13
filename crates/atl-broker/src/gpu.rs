@@ -46,7 +46,9 @@ pub fn render_paths() -> Vec<&'static RenderPath> {
 
 fn paths_in(sys_module: &Path, rows: &'static [RenderPath]) -> Vec<&'static RenderPath> {
     rows.iter()
-        .filter(|r| sys_module.join(r.module).is_dir() && r.nodes.iter().all(|n| Path::new(n).exists()))
+        .filter(|r| {
+            sys_module.join(r.module).is_dir() && r.nodes.iter().all(|n| Path::new(n).exists())
+        })
         .collect()
 }
 
@@ -212,9 +214,21 @@ mod tests {
     #[test]
     fn render_path_needs_module_and_nodes() {
         static ROWS: &[RenderPath] = &[
-            RenderPath { module: "m1", nodes: &["/"], env: &[] },
-            RenderPath { module: "m2", nodes: &["/atl-no-such-node"], env: &[] },
-            RenderPath { module: "m3", nodes: &["/"], env: &[] },
+            RenderPath {
+                module: "m1",
+                nodes: &["/"],
+                env: &[],
+            },
+            RenderPath {
+                module: "m2",
+                nodes: &["/atl-no-such-node"],
+                env: &[],
+            },
+            RenderPath {
+                module: "m3",
+                nodes: &["/"],
+                env: &[],
+            },
         ];
         let root = tmp("modules");
         std::fs::create_dir_all(root.join("m1")).unwrap();

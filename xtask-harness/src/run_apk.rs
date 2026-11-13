@@ -947,7 +947,11 @@ mod tests {
     fn render_path_check_reds_an_offer_not_taken() {
         let app = "libGLES_atl: buffer tier readback (x)\n";
         let taken = "atld: gpu-render: path dxgkrnl (renderer D3D12 (GPU), OpenGL ES 3.1 Mesa)\n";
-        assert!(render_path_check(taken, app).unwrap().contains("buffer tier readback"));
+        assert!(
+            render_path_check(taken, app)
+                .unwrap()
+                .contains("buffer tier readback")
+        );
         let none = "atld: gpu-render: path baseline (no kernel render path offered)\n";
         assert!(render_path_check(none, app).is_ok());
         assert!(render_path_check("", app).is_ok());
