@@ -79,3 +79,44 @@ files = [
   { name = "base", sha256 = "6984d85a8acd58ff12fbed4ee66b20f544b983a7ccab765cf1073211ab84da8b", size = 88306907 },
   { name = "config.x86_64", sha256 = "0d040eee99bfce2651982d3badf822f9eae1fbac05713dcae3583953510b2578", size = 26325638 },
 ]
+
+# google-play row: Bad Piggies 2.4.3471, arm64 with a Unity asset-pack split. Values read from an apkeep download with device px_9a (2026-11-13).
+[bad-piggies]
+package = "com.rovio.BadPiggies"
+version_name = "2.4.3471"
+version_code = 3471
+signer_sha256 = "3bf281705398004c6f8e4ba8426c3ba2490385c3aeaf6b05b6440396c6a1a50d"
+source = "google-play"
+device = "px_9a"
+files = [
+  { name = "base", sha256 = "7e8e8fc00337f0e155dcd28cdcae0a841d3a33d2994080723dc3f89087c3b7fc", size = 70956996 },
+  { name = "config.arm64_v8a", sha256 = "75b82f087c2a113ac868f086823a849cc71517a12e889db1d20abb4ac63bd133", size = 20820702 },
+  { name = "UnityDataAssetPack", sha256 = "23191e42e448834fa3ce279c942072cad0fe661320f216374ed74ffc91e07f19", size = 104263910 },
+]
+
+# google-play row: Angry Birds 2 26.7.2, arm64 with a 579 MB Unity asset-pack split. Values read from an apkeep download with device px_9a (2026-11-13).
+[angry-birds-2]
+package = "com.rovio.baba"
+version_name = "26.7.2"
+version_code = 50303381
+signer_sha256 = "3bf281705398004c6f8e4ba8426c3ba2490385c3aeaf6b05b6440396c6a1a50d"
+source = "google-play"
+device = "px_9a"
+files = [
+  { name = "base", sha256 = "93778e259e7dee41182117544ad0baa94c8b4d90ecd323be2210150f7144929c", size = 77072852 },
+  { name = "config.arm64_v8a", sha256 = "d79f6e0b9017a06c9eab178fc9fdbaf5f2fd64e2786f7be29e38518799334e1e", size = 85628487 },
+  { name = "UnityDataAssetPack", sha256 = "49ff1d0b40a35dd607146be09486114229b1c6ea42a936e28bacb5ee20d200a0", size = 579101458 },
+]
+
+# google-play row: Temple Run 1.43.0, arm64. Values read from the local copy in ~/atl-next/apk/temple-run/play-split (2026-11-13); device px_9a inferred as for battle-cats-tw (Play served config.arm64_v8a only).
+[temple-run]
+package = "com.imangi.templerun"
+version_name = "1.43.0"
+version_code = 29864577
+signer_sha256 = "8c45dc885dae0e8dbfc8ea9f74017156d82e612923e81a060406cac5c71ac069"
+source = "google-play"
+device = "px_9a"
+files = [
+  { name = "base", sha256 = "422c91d53ebf6d4bf2359fb4eb15ac847d8079df94fb9a17e5dbeefec690f1c3", size = 157199574 },
+  { name = "config.arm64_v8a", sha256 = "99371e4e034761872eb0c33ae96b60230dc29d572f2b68dd00b5dc5cf6ea0fe7", size = 23779658 },
+]

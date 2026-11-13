@@ -271,15 +271,14 @@ pub fn names_row(arg: &str) -> bool {
     !arg.contains(['.', '/', '\\'])
 }
 
-/// At least two dotted segments, each starting with a letter.
+/// At least two dotted segments, each an ASCII letter then letters, digits or `_`: AOSP's package name rule (FrameworkParsingPackageUtils.validateName with requireSeparator), which allows
+/// upper case (com.rovio.BadPiggies).
 fn is_package(s: &str) -> bool {
     let segments: Vec<&str> = s.split('.').collect();
     segments.len() >= 2
         && segments.iter().all(|seg| {
-            seg.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
-                && seg
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            seg.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+                && seg.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
         })
 }
 
@@ -823,10 +822,13 @@ mod tests {
             names,
             [
                 "altos-odyssey",
+                "angry-birds-2",
+                "bad-piggies",
                 "battle-cats-tw",
                 "fossify-math",
                 "fossify-notes",
-                "material-catalog"
+                "material-catalog",
+                "temple-run"
             ]
         );
     }
@@ -846,7 +848,7 @@ mod tests {
             err(&VALID.replace("version_code = 13", "version_code = 14")).contains("url must be")
         );
         assert!(
-            err(&VALID.replace("org.fossify.notes\"", "Org.Fossify\""))
+            err(&VALID.replace("org.fossify.notes\"", "org.9fossify\""))
                 .contains("not a Java package name")
         );
         let github = "[material-catalog]\n\
