@@ -191,6 +191,7 @@ fn window() -> Goals {
     runtime_gralloc().with(nb_guest())
 }
 
+/// The services stage installs its fixture through the real installer first (installer.rs `install_fixture`), so binder also reads what the installer gate does: host ART.
 fn binder() -> Goals {
     Goals::host(&[
         "servicemanager",
@@ -199,6 +200,7 @@ fn binder() -> Goals {
         "libbinder_rs",
         "libatl_parcelables",
     ])
+    .with(Goals::host(&HOST_ART))
 }
 
 /// Host ART with the boot classpath and its JNI libraries: what nb-isa runs, and native-load's base.

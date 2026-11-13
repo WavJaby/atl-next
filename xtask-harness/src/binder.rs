@@ -24,6 +24,9 @@ pub struct Args {
     /// Native build directory holding servicemanager and service (default: this checkout's slot, see `xtask slot`; else <workspace>/out/native/<host>).
     #[arg(long)]
     out: Option<PathBuf>,
+    /// Break: the harness answers the services' control `Install` with atld's installer-exit error (atl-installer exited non-zero); the services stage passes only if they exit before `ready` with no package installed. The sweep stage is skipped.
+    #[arg(long)]
+    break_install: bool,
 }
 
 /// Android uids (system/core/libcutils/include/private/android_filesystem_config.h): AID_SYSTEM, AID_SHELL.
@@ -383,9 +386,21 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let (mut sm, found) = start_servicemanager(&b, &test_root, &servicemanager, &service, &env)?;
     let list = self::service(&b, &service, &env, &["list"], &log("list"))?;
     let absent = self::service(&b, &service, &env, &["check", ABSENT], &log("absent"))?;
-    let services_fails =
-        crate::services::stage(root, &out, &args.host, &b, &env, &service, &test_root)?;
-    let sweep_fails = sweep_stage(&b, &out, &env, &test_root, &mut binderd)?;
+    let services_fails = crate::services::stage(
+        root,
+        &out,
+        &args.host,
+        &b,
+        &env,
+        &service,
+        &test_root,
+        args.break_install,
+    )?;
+    let sweep_fails = if args.break_install {
+        Vec::new()
+    } else {
+        sweep_stage(&b, &out, &env, &test_root, &mut binderd)?
+    };
 
     let _ = sm.child.kill();
     sm.child.wait()?;

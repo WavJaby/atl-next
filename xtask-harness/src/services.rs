@@ -125,6 +125,8 @@ fn verdict(app: &Run, system: &Run, feature: &Run, info: &Run, services_log: &st
 }
 
 /// Runs the stage; the passes are printed, the failures returned. `host_arch`: the arches.toml `[host]` row the services run on; the device ABIs the services get are its rows (atld_run::device_abis).
+/// `break_install`: `Install` is answered with atld's installer-exit error; the stage then passes only if the services exit unsuccessfully before `ready` and log no installed package.
+#[allow(clippy::too_many_arguments)]
 pub fn stage(
     root: &Path,
     out: &Path,
@@ -133,6 +135,7 @@ pub fn stage(
     env: &[(String, String)],
     service: &Path,
     test_root: &Path,
+    break_install: bool,
 ) -> Result<Vec<String>> {
     let arches = crate::arches::load(root)?;
     ensure!(
@@ -233,6 +236,13 @@ pub fn stage(
                 message: format!("the services stage starts no process it kills (pid {pid})"),
             },
             // session 0 was installed before the services started: its frames; no file moves (the client reads no package file)
+            // atld's answer when atl-installer exits non-zero (atld main.rs, control Install)
+            Request::Install { session: 0, uid } if uid == APP_UID && break_install => {
+                Response::Error {
+                    message: "session 0: atl-installer exited exit status: 1: (break-install)"
+                        .to_owned(),
+                }
+            }
             Request::Install { session: 0, uid } if uid == APP_UID => Response::Staged {
                 frames: frames.display().to_string(),
             },
@@ -259,6 +269,21 @@ pub fn stage(
         let start = Instant::now();
         while !std::fs::read_to_string(&services_log)?.contains("services: ready") {
             if let Some(s) = services.try_wait()? {
+                let text = std::fs::read_to_string(&services_log)?;
+                if break_install {
+                    // nothing registered: no install line (install.rs logs one per record) and the exit is a failure
+                    if !s.success() && !text.contains("services: install ") {
+                        println!(
+                            "services: break-install: PASS exited {s} before ready, no package installed: {}",
+                            text.lines().last().unwrap_or("").trim()
+                        );
+                        return Ok(Vec::new());
+                    }
+                    return Ok(vec![format!(
+                        "break-install: exited {s} with an install logged: {}",
+                        text.trim()
+                    )]);
+                }
                 return Ok(vec![format!(
                     "atl-system-services exited {s}: {}",
                     std::fs::read_to_string(&services_log)?.trim()
@@ -272,6 +297,13 @@ pub fn stage(
                 )]);
             }
             std::thread::sleep(Duration::from_millis(50));
+        }
+        if break_install {
+            let _ = services.kill();
+            let _ = services.wait();
+            return Ok(vec![
+                "break-install: the services became ready after a failed install".to_owned(),
+            ]);
         }
 
         let codes = Command::new(&client)
