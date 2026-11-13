@@ -101,7 +101,9 @@ const MEDIAPLAYER_START: &str = "MediaPlayerNative: start called in state 1";
 /// permissionmgr: PackageManager.checkPermission for the fixture itself: ACCESS_NETWORK_STATE is requested + NORMAL -> granted (0, permission.rs rule A); CAMERA is not requested -> denied (-1).
 /// notification: Main.channels creates channel `atl.test` at IMPORTANCE_LOW (2) and reads it back: PreferencesHelper.createNotificationChannel gives a new app channel the package's visibility
 /// (VISIBILITY_NO_OVERRIDE, -1000); the channel list holds it alone; an unknown id reads null; re-creating it at IMPORTANCE_HIGH keeps 2 (an app may only lower an existing channel's importance).
-const SERVICE_LINES: [(&str, &str, Option<&str>); 3] = [
+/// power: Main.power: a desktop session is interactive with battery saver off; PARTIAL is a supported level; a PARTIAL wake lock is held after acquire and not after release
+/// (WAKE_LOCK is requested + NORMAL -> granted; a refused acquire or release throws SecurityException and the line reads `threw ...`).
+const SERVICE_LINES: [(&str, &str, Option<&str>); 4] = [
     ("connectivity", "AtlTest: connectivity: ", None),
     (
         "permissionmgr",
@@ -112,6 +114,11 @@ const SERVICE_LINES: [(&str, &str, Option<&str>); 3] = [
         "notification",
         "AtlTest: notification: ",
         Some("importance=2 name=ATL test visibility=-1000 count=1 absent=null raised=2"),
+    ),
+    (
+        "power",
+        "AtlTest: power: ",
+        Some("interactive=true powersave=false partial=true held=true released=true"),
     ),
 ];
 /// Main.priority's line: `start=<n> background=<r>/<nice> restore=<r>/<nice> foreground=<r>/<nice>`, r = `ok` or the throwable's simple name ([`priority_why`]).

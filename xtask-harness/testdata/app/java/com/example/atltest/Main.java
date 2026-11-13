@@ -90,6 +90,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "connectivity: " + connectivity());
         Log.i("AtlTest", "permission: " + permission());
         Log.i("AtlTest", "notification: " + channels());
+        Log.i("AtlTest", "power: " + power());
         Log.i("AtlTest", "signatures: " + signatures());
         Log.i("AtlTest", "priority: " + priority());
         mediaPlayerService();
@@ -234,6 +235,28 @@ public class Main extends Activity {
                     "atl.test", "ATL test", android.app.NotificationManager.IMPORTANCE_HIGH));
             android.app.NotificationChannel again = nm.getNotificationChannel("atl.test");
             return read + " count=" + count + " absent=" + absent + " raised=" + (again == null ? "none" : again.getImportance());
+        } catch (Throwable t) {
+            return "threw " + t;
+        }
+    }
+
+    /**
+     * "interactive=<bool> powersave=<bool> partial=<bool> held=<bool> released=<bool>": PowerManager (vungle's AndroidPlatform.<init> path) answers isInteractive / isPowerSaveMode /
+     * isWakeLockLevelSupported(PARTIAL), and a PARTIAL wake lock's isHeld after acquire and after release; "absent" when getSystemService returns null; else what it threw.
+     */
+    private String power() {
+        try {
+            android.os.PowerManager pm = (android.os.PowerManager) getSystemService(POWER_SERVICE);
+            if (pm == null) {
+                return "absent";
+            }
+            android.os.PowerManager.WakeLock wl = pm.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "atl:test");
+            wl.acquire();
+            boolean held = wl.isHeld();
+            wl.release();
+            return "interactive=" + pm.isInteractive() + " powersave=" + pm.isPowerSaveMode()
+                    + " partial=" + pm.isWakeLockLevelSupported(android.os.PowerManager.PARTIAL_WAKE_LOCK)
+                    + " held=" + held + " released=" + !wl.isHeld();
         } catch (Throwable t) {
             return "threw " + t;
         }

@@ -75,6 +75,9 @@ types = [
     # the connectivity service (connectivity.rs) and the client Messenger its network callbacks go to
     "android.net.IConnectivityManager",
     "android.os.IMessenger",
+    # the power service and the thermalservice PowerManager needs beside it (power.rs)
+    "android.os.IPowerManager",
+    "android.os.IThermalService",
     # the permissionmgr service (permission_manager.rs)
     "android.permission.IPermissionManager",
     "android.app.IApplicationThread",

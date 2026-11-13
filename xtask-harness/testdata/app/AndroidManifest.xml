@@ -12,6 +12,8 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- the permission-request line (app.rs PERMISSION_REQUEST): a runtime (dangerous) permission Main asks for -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- the power line (app.rs SERVICE_LINES): BinderService.acquireWakeLock / releaseWakeLock enforce it -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application android:label="ATL test">
         <activity android:name=".Main" android:exported="true" android:launchMode="singleTop">

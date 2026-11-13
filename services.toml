@@ -255,6 +255,23 @@ src = ["crates/atl-services/src/clipboard.rs"]
 mirrors = []
 reason = "registered only so ClipboardManager's constructor finds the service; every method keeps the stub's UNKNOWN_TRANSACTION default (clipboard.rs), so no ClipboardService behaviour is reproduced yet"
 
+[power]
+src = ["crates/atl-services/src/power.rs"]
+mirrors = [
+    "frameworks/base/services/core/java/com/android/server/power/PowerManagerService.java#acquireWakeLock",
+    "frameworks/base/services/core/java/com/android/server/power/PowerManagerService.java#acquireWakeLockInternal",
+    "frameworks/base/services/core/java/com/android/server/power/PowerManagerService.java#releaseWakeLock",
+    "frameworks/base/services/core/java/com/android/server/power/PowerManagerService.java#isWakeLockLevelSupportedInternal",
+    "frameworks/base/services/core/java/com/android/server/power/PowerManagerService.java#isInteractive",
+    "frameworks/base/services/core/java/com/android/server/power/PowerManagerService.java#isPowerSaveMode",
+    "frameworks/base/core/java/android/os/PowerManager.java#validateWakeLockParameters",
+]
+
+[thermalservice]
+src = ["crates/atl-services/src/power.rs"]
+mirrors = []
+reason = "registered only so SystemServiceRegistry can build PowerManager (it looks up power and thermalservice together); every method keeps the stub's UNKNOWN_TRANSACTION default (power.rs)"
+
 [connectivity]
 src = ["crates/atl-services/src/connectivity.rs"]
 mirrors = [
