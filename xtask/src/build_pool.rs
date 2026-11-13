@@ -55,6 +55,54 @@ pub fn acquire(
     }
 }
 
+/// A build's tokens: the pool token, plus a slow-class token when it builds in a slow slot.
+#[derive(Debug)]
+pub struct BuildTokens {
+    pub class: Option<Token>,
+    pub token: Token,
+}
+
+/// The slow class's token dir under pool dir `dir`; its tokens are counted apart from the pool's.
+pub fn slow_dir(dir: &Path) -> PathBuf {
+    dir.join("slow")
+}
+
+/// A native build's tokens for checkout `root` in workspace `ws`: a slot listed in `build.slow_slots` first takes one of `build.slow_builds` class tokens, then a pool token, so at most that many pool tokens ever go to slow slots and fast slots never wait behind more. Prints each wait as `<tag>: <line>`.
+pub fn acquire_build(ws: &Path, root: &Path, tag: &str) -> Result<BuildTokens> {
+    let cfg = crate::ws_config::load(ws)?;
+    let slot = crate::slot::record_slot(root)?;
+    let slow = slot
+        .filter(|n| cfg.slow_slots.value.contains(n))
+        .map(|_| cfg.slow_builds.value);
+    acquire_classed(
+        &dir(ws),
+        cfg.parallel_builds.value,
+        slow,
+        &this_holder(root),
+        POLL,
+        |line| println!("{tag}: {line}"),
+    )
+}
+
+/// `slow` = the class size when the build is in a slow slot. The class token is taken before the pool token: a slow build never holds a pool token while it queues for its class. `on_wait` gets one line per stage that waits.
+pub fn acquire_classed(
+    dir: &Path,
+    tokens: u32,
+    slow: Option<u32>,
+    who: &str,
+    poll: Duration,
+    mut on_wait: impl FnMut(&str),
+) -> Result<BuildTokens> {
+    let class = match slow {
+        Some(n) => Some(acquire(&slow_dir(dir), n, who, poll, |line| {
+            on_wait(&format!("slow class: {line}"))
+        })?),
+        None => None,
+    };
+    let token = acquire(dir, tokens, who, poll, |line| on_wait(line))?;
+    Ok(BuildTokens { class, token })
+}
+
 /// Every one of `tokens` tokens without waiting (a quiet window: no ninja build runs while they are held): Ok(all), or Err(the holders line) when any is held -- the ones taken are released again.
 pub fn try_take_all(
     dir: &Path,
@@ -279,6 +327,44 @@ mod tests {
         assert_eq!(rx.recv_timeout(STILL_WAITING * 4).unwrap(), freed);
         waiter.join().unwrap();
         drop(b);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Class 1 of pool 2: a second slow build waits for the class (one wait line, holding no pool token), while a fast build still gets the free pool token.
+    #[test]
+    fn slow_class_caps_slow_builds_and_spares_fast_ones() {
+        let dir = scratch("slow");
+        let s1 = acquire_classed(&dir, 2, Some(1), "s1", FAST, |_| panic!("s1 waited")).unwrap();
+        assert!(s1.class.is_some());
+        let (tx, rx) = mpsc::channel();
+        let (wtx, wrx) = mpsc::channel();
+        let d = dir.clone();
+        let s2 = std::thread::spawn(move || {
+            let t = acquire_classed(&d, 2, Some(1), "s2", FAST, |l| {
+                wtx.send(l.to_owned()).unwrap()
+            })
+            .unwrap();
+            tx.send(()).unwrap();
+            drop(t);
+        });
+        let line = wrx.recv_timeout(STILL_WAITING).expect("no class wait line");
+        assert!(
+            line.starts_with("slow class: ") && line.contains("s1"),
+            "{line}"
+        );
+        assert!(
+            rx.recv_timeout(STILL_WAITING).is_err(),
+            "second slow build ran"
+        );
+        // the waiting slow build holds no pool token: a fast build takes the second one at once
+        let fast =
+            acquire_classed(&dir, 2, None, "fast", FAST, |l| panic!("fast waited: {l}")).unwrap();
+        assert!(fast.class.is_none());
+        drop(fast);
+        drop(s1);
+        rx.recv_timeout(STILL_WAITING * 4)
+            .expect("second slow build never ran");
+        s2.join().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

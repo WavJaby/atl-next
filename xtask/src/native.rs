@@ -493,14 +493,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let log = graph_out.join("ninja.log");
     // only ninja queues for a machine-wide token (build_pool.rs); the gates below run after it is released
     let tokens = build_pool::tokens(ws)?;
-    let token = build_pool::acquire(
-        &build_pool::dir(ws),
-        tokens,
-        &build_pool::this_holder(root),
-        build_pool::POLL,
-        |line| println!("native: {line}"),
-    )?;
-    println!("native: build token {} of {tokens}", token.index);
+    let token = build_pool::acquire_build(ws, root, "native")?;
+    match &token.class {
+        Some(c) => println!(
+            "native: build token {} of {tokens}, slow-class token {}",
+            token.token.index, c.index
+        ),
+        None => println!("native: build token {} of {tokens}", token.token.index),
+    }
     let graph_file = graph_out.join("graph.json");
     let graph: triage::Graph = serde_json::from_str(
         &std::fs::read_to_string(&graph_file)

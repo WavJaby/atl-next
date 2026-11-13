@@ -265,13 +265,7 @@ fn check_version(b: &Build) -> Result<()> {
 /// Configures and builds under one build token, then checks the version. Returns the executable.
 pub fn execute(root: &Path, b: &Build) -> Result<PathBuf> {
     let ws = Layout::of(root)?.workspace().to_owned();
-    let _token = build_pool::acquire(
-        &build_pool::dir(&ws),
-        build_pool::tokens(&ws)?,
-        &build_pool::this_holder(root),
-        build_pool::POLL,
-        |line| println!("qemu: {line}"),
-    )?;
+    let _token = build_pool::acquire_build(&ws, root, "qemu")?;
     configure(b)?;
     ninja(b)?;
     check_version(b)?;

@@ -6,6 +6,8 @@
 //! [build]
 //! slots = 3            # out/slot-<n> count
 //! parallel_builds = 2  # machine-wide full native builds
+//! slow_slots = [5, 6]  # slots on slow (HDD) disks
+//! slow_builds = 1      # of parallel_builds, at most this many go to slow slots at once
 //! [cache]
 //! sccache_size = "5G"  # shared C/C++ compiler cache
 //! [fetch]
@@ -82,16 +84,26 @@ pub struct WsConfig {
     pub sccache_size: Setting<String>,
     /// `fetch.for`: gates (`gate_goals` names or `all-gates`) whose `needed_by` projects fetch checks out; empty = core only.
     pub fetch_for: Setting<Vec<String>>,
+    /// `build.slow_slots`: slots on slow disks (HDD-backed); a native build in one also needs a slow-class token (`build_pool`). Declared, not probed: inside WSL every virtual disk reports `queue/rotational` 1, SSD-backed ones too (2026-11-14).
+    pub slow_slots: Setting<Vec<u32>>,
+    /// `build.slow_builds`: how many of the `parallel_builds` tokens slow-slot builds may hold at once, [`DEFAULT_SLOW_BUILDS`].
+    pub slow_builds: Setting<u32>,
 }
+
+/// Slow-slot builds at once. 1 of the default 2 tokens: the other always stays free for a fast slot, so an SSD lane never waits behind an HDD build (owner rule 2026-11-13).
+pub const DEFAULT_SLOW_BUILDS: u32 = 1;
 
 impl WsConfig {
     /// The one line `slot list` prints.
     pub fn summary(&self) -> String {
+        let slow: Vec<String> = self.slow_slots.value.iter().map(u32::to_string).collect();
         format!(
-            "{}: slots {}, parallel_builds {}, sccache_size {}, fetch.for {}",
+            "{}: slots {}, parallel_builds {}, slow_slots [{}], slow_builds {}, sccache_size {}, fetch.for {}",
             self.path.display(),
             self.slots,
             self.parallel_builds,
+            slow.join(", "),
+            self.slow_builds,
             self.sccache_size,
             self.fetch_for_shown()
         )
@@ -166,6 +178,8 @@ fn defaults(path: PathBuf) -> WsConfig {
         parallel_builds: Setting::default(DEFAULT_PARALLEL_BUILDS),
         sccache_size: Setting::default(DEFAULT_SCCACHE_SIZE.to_owned()),
         fetch_for: Setting::default(Vec::new()),
+        slow_slots: Setting::default(Vec::new()),
+        slow_builds: Setting::default(DEFAULT_SLOW_BUILDS),
     }
 }
 
@@ -187,15 +201,38 @@ pub fn parse(text: &str, path: &Path) -> Result<WsConfig> {
                 ("build", "parallel_builds") => {
                     cfg.parallel_builds = Setting::file(count(value, &at)?);
                 }
+                ("build", "slow_slots") => cfg.slow_slots = Setting::file(slot_list(value, &at)?),
+                ("build", "slow_builds") => cfg.slow_builds = Setting::file(count(value, &at)?),
                 ("cache", "sccache_size") => cfg.sccache_size = Setting::file(size(value, &at)?),
                 ("fetch", "for") => cfg.fetch_for = Setting::file(gates(value, &at)?),
                 _ => bail!(
-                    "{at} is not a known key (known: build.slots, build.parallel_builds, cache.sccache_size, fetch.for)"
+                    "{at} is not a known key (known: build.slots, build.parallel_builds, build.slow_slots, build.slow_builds, cache.sccache_size, fetch.for)"
                 ),
             }
         }
     }
+    // a slow class as large as the pool lets slow builds take every token, the case the class exists to prevent
+    ensure!(
+        cfg.slow_slots.value.is_empty() || cfg.slow_builds.value < cfg.parallel_builds.value,
+        "{shown}: `build.slow_builds` ({}) must be below `build.parallel_builds` ({}) so a fast slot always has a token",
+        cfg.slow_builds.value,
+        cfg.parallel_builds.value
+    );
     Ok(cfg)
+}
+
+/// A list of distinct slot numbers.
+fn slot_list(value: &toml::Value, at: &str) -> Result<Vec<u32>> {
+    let toml::Value::Array(items) = value else {
+        bail!("{at} must be a list of slot numbers, not {value}");
+    };
+    let mut out = Vec::new();
+    for item in items {
+        let n = count(item, at)?;
+        ensure!(!out.contains(&n), "{at} lists slot {n} twice");
+        out.push(n);
+    }
+    Ok(out)
 }
 
 /// A positive integer.
@@ -342,7 +379,21 @@ mod tests {
         let cfg = parse("[build]\nslots = 2\n", path()).expect("valid");
         assert_eq!(
             cfg.summary(),
-            "/ws/workspace.toml: slots 2 (file), parallel_builds 2 (default), sccache_size 5G (default), fetch.for [] = core only (default)"
+            "/ws/workspace.toml: slots 2 (file), parallel_builds 2 (default), slow_slots [], slow_builds 1 (default), sccache_size 5G (default), fetch.for [] = core only (default)"
+        );
+    }
+
+    #[test]
+    fn slow_class_is_parsed_and_bounded() {
+        let cfg = parse("[build]\nslow_slots = [5, 6]\n", path()).expect("valid");
+        assert_eq!(cfg.slow_slots, Setting::file(vec![5, 6]));
+        assert_eq!(cfg.slow_builds, Setting::default(1));
+        assert!(err("[build]\nslow_slots = [5, 5]\n").contains("twice"));
+        assert!(err("[build]\nslow_slots = [0]\n").contains("positive integer"));
+        // the class must leave at least one pool token to fast slots
+        assert!(
+            err("[build]\nparallel_builds = 2\nslow_builds = 2\nslow_slots = [5]\n")
+                .contains("must be below")
         );
     }
 
