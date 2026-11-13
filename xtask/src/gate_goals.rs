@@ -88,8 +88,9 @@ pub fn nb_key(arch: &str, module: &str) -> String {
 pub const GL_FRONTS: [&str; 4] = ["libEGL", "libGLESv1_CM", "libGLESv2", "libGLESv3"];
 /// ANGLE's three libraries: AOSP's Loader dlopens them by name in the default namespace when an app's GL selection is ANGLE (Loader.cpp `load_angle`), so they are placed beside the fronts.
 pub const ANGLE_FRONTS: [&str; 3] = ["libEGL_angle", "libGLESv1_CM_angle", "libGLESv2_angle"];
-/// The extractor plugins atld_run's `platform_rows` places: every atld run reads them, so [`runtime`] builds them.
-pub const EXTRACTOR_PLUGINS: [&str; 2] = ["liboggextractor", "libwavextractor"];
+/// The extractor plugins atld_run's `platform_rows` places: every atld run reads them, so [`runtime`] builds them. libmp4extractor is the MP4/M4A container
+/// (AOSP media/module/extractors/mp4); the decoders its tracks need are separate goals.
+pub const EXTRACTOR_PLUGINS: [&str; 3] = ["liboggextractor", "libwavextractor", "libmp4extractor"];
 /// Framework JNI libraries an app loads by name (`System.loadLibrary`): libsoundpool (SoundPool.java:119) and libmedia_jni (MediaPlayer.java:623), built as AOSP's source as-is. Their closures build with them; stage_art links every built `device/<module>/*.so` into the ART lib dir, which atld's LD_LIBRARY_PATH names, so no placement row is needed.
 pub const FRAMEWORK_JNI: [&str; 2] = ["libsoundpool", "libmedia_jni"];
 /// NDK libraries implemented by AOSP's own source as-is on the host: libOpenSLES (frameworks/wilhelm, over libaudioclient). Staged like [`FRAMEWORK_JNI`]: stage_art links every built `device/<module>/*.so` into the ART lib dir, so an app's `DT_NEEDED libOpenSLES.so` resolves there.
@@ -211,13 +212,12 @@ const HOST_ART: [&str; 8] = [
 
 fn native_load() -> Goals {
     Goals::host(&HOST_ART)
+        .with(Goals::host(&EXTRACTOR_PLUGINS))
         .with(Goals::host(&[
             "servicemanager",
             "service",
             "libcodec2_aidl_noisurface",
             "libresourcemanagerservice",
-            "liboggextractor",
-            "libwavextractor",
             "libmedia_jni",
         ]))
         .with(Goals::codec_store())
