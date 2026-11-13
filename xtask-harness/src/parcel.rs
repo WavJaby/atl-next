@@ -81,6 +81,8 @@ const CASES: [&str; 84] = [
     "ProviderInfoList",
     "ContentProviderHolder",
     "PackageInfo",
+    "PackageInfo:signatures",
+    "PackageInfo:signing-lineage",
     "ServiceInfo",
     "PermissionInfo",
     "PackageInfo:components",

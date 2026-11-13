@@ -125,6 +125,10 @@ pub const NB_GUEST_LIBS: [&str; 23] = [
     "libnative_bridge_vdso",
 ];
 
+/// AOSP's apksigner (tools/apksig, with conscrypt-unbundled): xtask-harness `ApkTools` signs every fixture APK it builds, since the installer verifies signatures as AOSP's install path does
+/// (ParsingPackageUtils.getSigningDetails) and refuses an unsigned APK. Every gate that builds an APK through ApkTools (atld runs, binder's and the installer's fixtures, gles2-fixture) reads it.
+pub const APK_SIGNER: &str = "apksigner";
+
 /// What every atld run (atld_run `Runtime`) reads: ART and its boot jars' JNI libraries, servicemanager, framework-res, the converter crates the service packages link (packages.rs), and the Codec2 store's libraries (codec2_store.rs: its constructor dlopens each one in every app process that decodes).
 pub fn runtime() -> Goals {
     Goals::host(&[
@@ -150,6 +154,7 @@ pub fn runtime() -> Goals {
         "atl-aidl-stubs-rust",
         "libgui_aidl_types_rs",
         "librustutils",
+        APK_SIGNER,
     ])
     .with(Goals::host(&EXTRACTOR_PLUGINS))
     .with(Goals::host(&FRAMEWORK_JNI))
@@ -199,6 +204,7 @@ fn binder() -> Goals {
         "atl-aidl-stubs-rust",
         "libbinder_rs",
         "libatl_parcelables",
+        APK_SIGNER,
     ])
     .with(Goals::host(&HOST_ART))
 }
@@ -275,7 +281,7 @@ pub const GATES: &[(&str, GoalsOf)] = &[
     ("gl", runtime_gralloc),
     ("gl-dispatch", || Goals::host(&["libEGL", "libGLESv2"])),
     ("gl-proxies", gl_proxies),
-    ("gles2-fixture", Goals::default),
+    ("gles2-fixture", || Goals::host(&[APK_SIGNER])),
     ("gralloc", || {
         Goals::host(&[
             "servicemanager",
@@ -286,7 +292,9 @@ pub const GATES: &[(&str, GoalsOf)] = &[
         ])
     }),
     // ApkAssets and the parse classes: libandroid_runtime and framework.jar, both in HOST_ART
-    ("installer", || Goals::host(&HOST_ART)),
+    ("installer", || {
+        Goals::host(&HOST_ART).with(Goals::host(&[APK_SIGNER]))
+    }),
     ("instrument", instrument),
     ("native-load", native_load),
     ("nb-isa", || Goals::host(&HOST_ART)),
