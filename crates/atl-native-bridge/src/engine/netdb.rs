@@ -137,12 +137,19 @@ fn guest_error(host: c_int) -> c_int {
         .map_or(g::EAI_FAIL, |&(_, guest)| guest)
 }
 
-/// A failed lookup's guest code. bionic answers EAI_NODATA for a host it does not find (getaddrinfo.c:835, NS_NOTFOUND; a NULL host at :728); glibc answers EAI_NONAME for both. bionic's EAI_NONAME is for the numeric-only flags (AI_NUMERICHOST :730, AI_NUMERICSERV :1190), which keep glibc's meaning.
-fn lookup_error(host: c_int, guest_flags: i32) -> c_int {
-    if host == libc::EAI_NONAME && guest_flags & (g::AI_NUMERICHOST | g::AI_NUMERICSERV) == 0 {
-        return g::EAI_NODATA;
+/// A failed lookup's guest code, as Android answers it. A name lookup that fails on the DNS side is EAI_NODATA: EAI_NONAME (unknown host), EAI_AGAIN (no connectivity, no answer), EAI_FAIL. On a device netd makes the lookup, and every failure of its reply (DnsProxyListener.cpp GetAddrInfoHandler::run, rv) reaches bionic's proxy client, which reads the code, discards it and answers EAI_NODATA (getaddrinfo.c:455-459, :557). EAI_NONAME stays for the numeric-only flags (AI_NUMERICHOST :730, AI_NUMERICSERV :1190-1191) and for a NULL host and service (:616); other codes are [`guest_error`]'s.
+fn lookup_error(host: c_int, guest_flags: i32, nameless: bool) -> c_int {
+    let numeric_only = guest_flags & (g::AI_NUMERICHOST | g::AI_NUMERICSERV) != 0;
+    let dns_failure = match host {
+        libc::EAI_NONAME => !(nameless || numeric_only),
+        libc::EAI_AGAIN | libc::EAI_FAIL => true,
+        _ => false,
+    };
+    if dns_failure {
+        g::EAI_NODATA
+    } else {
+        guest_error(host)
     }
-    guest_error(host)
 }
 
 /// `const char* gai_strerror(int)`: bionic's text for its own code; out of range answers EAI_MAX's text (bionic clamps the same way). No host call.
@@ -278,7 +285,7 @@ pub(super) extern "C" fn getaddrinfo(
         )
     };
     if rc != 0 {
-        return lookup_error(rc, guest_flags);
+        return lookup_error(rc, guest_flags, node.is_null() && service.is_null());
     }
     let mut head: *mut u8 = std::ptr::null_mut();
     let mut tail: *mut u8 = std::ptr::null_mut();
@@ -380,11 +387,42 @@ mod tests {
 
     #[test]
     fn lookup_failures_answer_bionic_codes() {
-        // bionic netdb.h values (spec literals): EAI_AGAIN 2, EAI_NODATA 7, EAI_NONAME 8, EAI_SERVICE 9; guest AI_NUMERICHOST 4, AI_NUMERICSERV 8
-        assert_eq!(lookup_error(libc::EAI_NONAME, 0), 7, "host not found");
-        assert_eq!(lookup_error(libc::EAI_NONAME, 4), 8, "AI_NUMERICHOST");
-        assert_eq!(lookup_error(libc::EAI_NONAME, 8), 8, "AI_NUMERICSERV");
-        assert_eq!(lookup_error(libc::EAI_AGAIN, 0), 2, "temporary failure");
+        // bionic netdb.h values (spec literals, getaddrinfo.c:455-459 and :557 for the proxy's EAI_NODATA): EAI_FAIL 4, EAI_NODATA 7, EAI_NONAME 8, EAI_SERVICE 9; guest AI_NUMERICHOST 4, AI_NUMERICSERV 8
+        assert_eq!(
+            lookup_error(libc::EAI_NONAME, 0, false),
+            7,
+            "host not found"
+        );
+        assert_eq!(
+            lookup_error(libc::EAI_NONAME, 4, false),
+            8,
+            "AI_NUMERICHOST"
+        );
+        assert_eq!(
+            lookup_error(libc::EAI_NONAME, 8, false),
+            8,
+            "AI_NUMERICSERV"
+        );
+        assert_eq!(
+            lookup_error(libc::EAI_NONAME, 0, true),
+            8,
+            "NULL host and service (:616)"
+        );
+        assert_eq!(
+            lookup_error(libc::EAI_AGAIN, 0, false),
+            7,
+            "no connectivity: the device's EAI_NODATA"
+        );
+        assert_eq!(
+            lookup_error(libc::EAI_FAIL, 0, false),
+            7,
+            "DNS failure: the device's EAI_NODATA"
+        );
+        assert_eq!(
+            lookup_error(libc::EAI_AGAIN, 4, false),
+            7,
+            "numeric flags do not keep a DNS failure"
+        );
         assert_eq!(guest_error(libc::EAI_SERVICE), 9, "EAI_SERVICE");
     }
 
