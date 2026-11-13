@@ -8,11 +8,19 @@ import android.graphics.Bitmap;
 import android.graphics.Paint;
 import android.graphics.Typeface;
 import android.media.AudioManager;
+import android.media.MediaExtractor;
+import android.media.MediaMetadataRetriever;
 import android.media.MediaPlayer;
 import android.media.SoundPool;
 import android.os.Bundle;
 import android.util.Log;
 
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.security.KeyStore;
 import java.security.cert.X509Certificate;
 import javax.net.ssl.TrustManager;
@@ -28,6 +36,8 @@ import javax.net.ssl.X509TrustManager;
  * MediaPlayer lines (app.rs MEDIAPLAYER): Happy Jump's GameShared.loadMusic sequence, one line per step.
  * Service lines (app.rs SERVICE_LINES): connectivity = the offline answers of the `connectivity` service; permission = PackageManager.checkPermission through `permissionmgr`; else `absent` / what it threw.
  * media.player line (app.rs MEDIA_PLAYER_SERVICE): setDataSource(fd) reaches the served service and returns.
+ * WAV lines (app.rs MEDIA_WAV): a valid WAV is prepared, started, sought and reset per round, by fd and by path; the served extractor must sniff it.
+ * Reset lines (app.rs MEDIA_RESET): reset with a seek pending, each within a bound; a reset that never returns is named.
  * result lines (app.rs RESULT): after the marker, Main starts ResultChild for request 7; its result comes back in onActivityResult, and the singleTop self-start from it cancels request 9 before its new intent.
  */
 public class Main extends Activity {
@@ -47,6 +57,10 @@ public class Main extends Activity {
         Log.i("AtlTest", "connectivity: " + connectivity());
         Log.i("AtlTest", "permission: " + permission());
         mediaPlayerService();
+        mediaExtractorWav();
+        mediaRetrieverWav();
+        mediaPlayerWav();
+        mediaPlayerReset();
         readSkipped();
         Class<?> jni;
         try {
@@ -384,5 +398,200 @@ public class Main extends Activity {
         if (probe.isAlive()) {
             Log.i("AtlTest", "media.player: no answer within " + PROBE_MS + " ms");
         }
+    }
+
+    /**
+     * WAV rounds of the media.player WAV probe (app.rs MEDIA_WAV): even rounds pass the fd, odd rounds the path. MediaPlayer.java:1237-1238 opens a path and
+     * passes its fd, so both reach GenericSource through the same fd route.
+     */
+    private static final int WAV_ROUNDS = 4;
+    /** Length of the probe's WAV, and the position each round seeks to (app.rs MEDIA_WAV). */
+    private static final int WAV_SECONDS = 2;
+    private static final int WAV_SEEK_MS = 1000;
+    /** Reset probe rounds and the bound each reset gets (app.rs MEDIA_RESET). */
+    private static final int RESET_ROUNDS = 4;
+    private static final long RESET_BOUND_MS = 10000L;
+
+    /**
+     * Diagnosis, not gated: MediaMetadataRetriever reads the WAV's mime from the fd through a PlayerServiceFileSource and the same
+     * MediaExtractorFactory::Create that GenericSource runs (StagefrightMetadataRetriever.cpp:96,105). A mime here means the sniff works on that source, so
+     * a failing MediaPlayer line sits in GenericSource's own flow.
+     */
+    private void mediaRetrieverWav() {
+        File wav;
+        try {
+            wav = writeWav("retriever.wav");
+        } catch (IOException e) {
+            Log.i("AtlTest", "mediaretriever: no file " + thrown(e));
+            return;
+        }
+        MediaMetadataRetriever r = new MediaMetadataRetriever();
+        FileInputStream in = null;
+        try {
+            in = new FileInputStream(wav);
+            r.setDataSource(in.getFD());
+            Log.i("AtlTest", "mediaretriever: fd mime " + r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_MIMETYPE));
+        } catch (Throwable t) {
+            Log.i("AtlTest", "mediaretriever: fd " + thrown(t));
+        } finally {
+            try {
+                r.release();
+            } catch (IOException e) {
+                Log.i("AtlTest", "mediaretriever: release " + thrown(e));
+            }
+            if (in != null) {
+                try {
+                    in.close();
+                } catch (IOException e) {
+                    Log.i("AtlTest", "mediaretriever: close " + thrown(e));
+                }
+            }
+        }
+    }
+
+    /**
+     * Diagnosis, not gated: android.media.MediaExtractor (the NDK extractor path, FileSource) reads the track count of the same WAV by path and by fd, so a
+     * failing MediaPlayer line can be set against an extractor that works in the same process.
+     */
+    private void mediaExtractorWav() {
+        File wav;
+        try {
+            wav = writeWav("extractor.wav");
+        } catch (IOException e) {
+            Log.i("AtlTest", "mediaextractor: no file " + thrown(e));
+            return;
+        }
+        String[] how = {"path", "fd"};
+        for (int i = 0; i < how.length; i++) {
+            MediaExtractor ex = new MediaExtractor();
+            try {
+                if (i == 0) {
+                    ex.setDataSource(wav.getPath());
+                } else {
+                    FileInputStream in = new FileInputStream(wav);
+                    try {
+                        ex.setDataSource(in.getFD());
+                    } finally {
+                        in.close();
+                    }
+                }
+                Log.i("AtlTest", "mediaextractor: " + how[i] + " tracks " + ex.getTrackCount());
+            } catch (Throwable t) {
+                Log.i("AtlTest", "mediaextractor: " + how[i] + " " + thrown(t));
+            } finally {
+                ex.release();
+            }
+        }
+    }
+
+    /**
+     * media.extractor end to end (app.rs MEDIA_WAV): a WAV is set, prepared, started, sought and reset, per round. A failing step logs its throwable.
+     */
+    private void mediaPlayerWav() {
+        File wav;
+        try {
+            wav = writeWav("probe.wav");
+        } catch (IOException e) {
+            Log.i("AtlTest", "mediaplayer-wav: no file " + thrown(e));
+            return;
+        }
+        for (int i = 0; i < WAV_ROUNDS; i++) {
+            String step = "setDataSource";
+            MediaPlayer mp = new MediaPlayer();
+            try {
+                if (i % 2 == 0) {
+                    FileInputStream in = new FileInputStream(wav);
+                    try {
+                        mp.setDataSource(in.getFD());
+                    } finally {
+                        in.close();
+                    }
+                } else {
+                    mp.setDataSource(wav.getPath());
+                }
+                step = "prepare";
+                mp.prepare();
+                step = "start";
+                mp.start();
+                step = "seekTo";
+                mp.seekTo(WAV_SEEK_MS);
+                step = "reset";
+                long t0 = System.nanoTime();
+                mp.reset();
+                long ms = (System.nanoTime() - t0) / 1000000L;
+                Log.i("AtlTest", "mediaplayer-wav: round " + i + " ok " + ms + " ms");
+            } catch (Throwable t) {
+                Log.i("AtlTest", "mediaplayer-wav: round " + i + " " + step + " " + thrown(t));
+            } finally {
+                mp.release();
+            }
+        }
+    }
+
+    /**
+     * l1-restart regression (app.rs MEDIA_RESET): a seek is issued and reset runs at once, so the seek-complete notify can still be pending in the
+     * service while reset waits for the service. On a worker thread: each reset gets RESET_BOUND_MS, the whole probe RESET_ROUNDS times that; a reset
+     * that never returns leaves its round line out and the probe's line says "no answer".
+     */
+    private void mediaPlayerReset() {
+        Thread worker = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                String step = "setDataSource";
+                int i = 0;
+                try {
+                    File wav = writeWav("reset.wav");
+                    for (i = 0; i < RESET_ROUNDS; i++) {
+                        MediaPlayer mp = new MediaPlayer();
+                        try {
+                            mp.setDataSource(wav.getPath());
+                            step = "prepare";
+                            mp.prepare();
+                            step = "start";
+                            mp.start();
+                            step = "seekTo";
+                            mp.seekTo(WAV_SEEK_MS);
+                            step = "reset";
+                            long t0 = System.nanoTime();
+                            mp.reset();
+                            long ms = (System.nanoTime() - t0) / 1000000L;
+                            Log.i("AtlTest", "mediaplayer-reset: round " + i + " ok " + ms + " ms");
+                        } finally {
+                            mp.release();
+                        }
+                    }
+                } catch (Throwable t) {
+                    Log.i("AtlTest", "mediaplayer-reset: round " + i + " " + step + " " + thrown(t));
+                }
+            }
+        });
+        worker.start();
+        try {
+            worker.join(RESET_ROUNDS * RESET_BOUND_MS);
+        } catch (InterruptedException e) {
+            Log.i("AtlTest", "mediaplayer-reset: interrupted " + e);
+        }
+        if (worker.isAlive()) {
+            Log.i("AtlTest", "mediaplayer-reset: no answer within " + RESET_ROUNDS * RESET_BOUND_MS + " ms");
+        }
+    }
+
+    /** A PCM WAV of silence, WAV_SECONDS long at 8 kHz, 16-bit mono, in the app's files dir: no asset to ship. */
+    private File writeWav(String name) throws IOException {
+        int rate = 8000;
+        int dataLen = rate * 2 * WAV_SECONDS;
+        ByteBuffer b = ByteBuffer.allocate(44 + dataLen).order(ByteOrder.LITTLE_ENDIAN);
+        b.put("RIFF".getBytes()).putInt(36 + dataLen).put("WAVE".getBytes());
+        b.put("fmt ".getBytes()).putInt(16).putShort((short) 1).putShort((short) 1);
+        b.putInt(rate).putInt(rate * 2).putShort((short) 2).putShort((short) 16);
+        b.put("data".getBytes()).putInt(dataLen);
+        File f = new File(getFilesDir(), name);
+        FileOutputStream out = new FileOutputStream(f);
+        try {
+            out.write(b.array());
+        } finally {
+            out.close();
+        }
+        return f;
     }
 }
