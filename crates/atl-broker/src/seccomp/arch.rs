@@ -63,3 +63,88 @@ pub const BINDERD_SYSCALLS: &[i64] = &[
 compile_error!(
     "binderd's seccomp allow-list is measured on x86_64 only: measure this arch (arch.rs, BINDERD_SYSCALLS derivation) before building the broker here"
 );
+
+/// The installer's syscalls (x86_64, 2026-11-13, WSL2 kernel 6.6.87.2), derived by measurement:
+/// 1. gdb `catch syscall` census of the installer's gate paths: the union of 57 numbers. alto's run was cut at 900 s (8.4 M stops) before its native copy; `feature` ran to its end (56 numbers); the others ended early.
+/// 2. Kill-mode gate runs: alto's native copy makes calls no census reached: unlink (87), chmod (90), fsync (74), utimensat (280), fallocate (285), rename (82). Each run ended at the first unlisted call (SIGSYS, the call named by dmesg `type=1326`).
+/// 3. The sandbox's own start-up (bwrap's pid 1 and atl-sandbox-stub run under this filter too): execve (59), wait4 (61), the Landlock calls (444-446), from binderd's measured list.
+/// The list gives 67 numbers. socket(2) is absent from it: seccomp.rs allows it for AF_UNIX only. setpriority(2) is measured (ART's thread priorities); no EACCES from it reached the gate's stderr.
+/// Final evidence: the installer gate green in kill mode with 0 denials in dmesg on three runs. Re-measure after installer, ART or glibc start-up code changes: a new call ends the run with SIGSYS, and dmesg names it.
+#[cfg(target_arch = "x86_64")]
+pub const INSTALLER_SYSCALLS: &[i64] = &[
+    // file and socket I/O (socket itself: AF_UNIX only, binderd-style rule in seccomp.rs)
+    libc::SYS_read,
+    libc::SYS_write,
+    libc::SYS_writev,
+    libc::SYS_open,
+    libc::SYS_openat,
+    libc::SYS_close,
+    libc::SYS_fstat,
+    libc::SYS_newfstatat,
+    libc::SYS_lseek,
+    libc::SYS_pread64,
+    libc::SYS_access,
+    libc::SYS_readlink,
+    libc::SYS_unlink,
+    libc::SYS_chmod,
+    libc::SYS_fallocate,
+    libc::SYS_fsync,
+    libc::SYS_utimensat,
+    libc::SYS_rename,
+    libc::SYS_getdents64,
+    libc::SYS_mkdir,
+    libc::SYS_ftruncate,
+    libc::SYS_getcwd,
+    libc::SYS_statfs,
+    libc::SYS_fstatfs,
+    libc::SYS_poll,
+    libc::SYS_fcntl,
+    libc::SYS_ioctl,
+    libc::SYS_connect,
+    // memory
+    libc::SYS_mmap,
+    libc::SYS_mprotect,
+    libc::SYS_munmap,
+    libc::SYS_mincore,
+    libc::SYS_brk,
+    libc::SYS_madvise,
+    libc::SYS_memfd_create,
+    libc::SYS_userfaultfd,
+    // threads, signals, ids, priority
+    libc::SYS_clone3,
+    libc::SYS_futex,
+    libc::SYS_sched_yield,
+    libc::SYS_sched_getaffinity,
+    libc::SYS_setpriority,
+    libc::SYS_set_tid_address,
+    libc::SYS_set_robust_list,
+    libc::SYS_rseq,
+    libc::SYS_membarrier,
+    libc::SYS_rt_sigaction,
+    libc::SYS_rt_sigprocmask,
+    libc::SYS_rt_sigtimedwait,
+    libc::SYS_sigaltstack,
+    libc::SYS_tgkill,
+    libc::SYS_restart_syscall,
+    libc::SYS_gettid,
+    libc::SYS_getpid,
+    libc::SYS_getuid,
+    libc::SYS_uname,
+    libc::SYS_prlimit64,
+    libc::SYS_getrandom,
+    libc::SYS_clock_gettime,
+    libc::SYS_arch_prctl,
+    libc::SYS_prctl,
+    libc::SYS_exit,
+    libc::SYS_exit_group,
+    // the sandbox's own start-up (bwrap's pid 1 and atl-sandbox-stub run under this filter too): exec of the stub, wait, its Landlock domain
+    libc::SYS_execve,
+    libc::SYS_wait4,
+    libc::SYS_landlock_create_ruleset,
+    libc::SYS_landlock_add_rule,
+    libc::SYS_landlock_restrict_self,
+];
+#[cfg(not(target_arch = "x86_64"))]
+compile_error!(
+    "the installer's seccomp allow-list is measured on x86_64 only: measure this arch (arch.rs, INSTALLER_SYSCALLS derivation) before building the broker here"
+);

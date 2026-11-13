@@ -19,19 +19,27 @@
 //! Measured: the installer's VM start, lite parse, full parse and natives times (its stderr `time-ms` line) and the process wall time of each run.
 //! Breaks: `--break drop-split` (check 1's dir without its split: splits, primary ABI and libraries must turn red); `--break abi-arm64` (the device's ABI lists are arm64-v8a only: AOSP's no-match, `native error -113`, must turn check 1 red);
 //! `--break feature` (check 6's installer is told the device has android.hardware.camera: the forwarder's hasFeature answers true, uses-permission must turn red).
+//! Every installer run is spawned through the broker's installer profile (atl-broker `spawn_installer`, plan 4b M5): the runtime, framework-res, the api-impl dex and the package dir read-only at their own paths, one output dir read-write,
+//! no network namespace, no binder, the measured installer seccomp filter, the installer's own uid. The verdict counts the seccomp denials dmesg recorded during the run (kill mode: a denial also ends the process with SIGSYS).
+//! Breaks, each must turn the gate red and name the refusal: `read-outside` (alto's package dir is not in the view: ENOENT), `write-outside` (alto's output dir is inside the read-only package dir: EROFS),
+//! `no-framework-res` (framework-res not in the view: AOSP's `Failed to create system AssetManager`), `net` (atl-sandbox-probe, not the installer, reaches for TCP in the profile: killed by SIGSYS at socket(AF_INET)).
 //! Default: mutating (stages ART into `<out>/installer-art`, writes `<out>/installer`).
 
+use std::fs::File;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
-use std::time::Instant;
+use std::process::{Command, ExitCode, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
+use atl_android_paths::{PROPERTY_AREA, PROPERTY_AREA_ENV, SYSTEM_FRAMEWORK};
+use atl_broker::{Broker, INSTALLER_UID, Mount, to_log, tree_mounts};
 use atl_property_service::{LinearTier, Property};
 
 use crate::atld_run::ApkTools;
 use crate::host_art::{ArtRun, HostArt};
 use crate::installer_parse::{Full, compare, manifest_findings, oracle};
-use crate::{manifest, packages, slot, test_apks, verdict};
+use crate::{binder, manifest, packages, slot, test_apks, verdict};
 
 const CMD: &str = "installer";
 /// The package that builds both loaders, and the installer's executable.
@@ -55,6 +63,21 @@ const CODENAME: &str = "ro.build.version.codename";
 const FEATURE: &str = "android.hardware.camera";
 const FEATURE_PERMISSION: &str = "android.permission.CAMERA";
 const BREAK_FEATURE: &str = "feature";
+/// The M5 breaks (module doc): each must turn the gate red with the refusal named.
+const BREAK_READ_OUTSIDE: &str = "read-outside";
+const BREAK_WRITE_OUTSIDE: &str = "write-outside";
+const BREAK_NO_FRAMEWORK: &str = "no-framework-res";
+const BREAK_NET: &str = "net";
+/// The package the net break's probe names as its own data dir (atl-sandbox-probe's OWN_FILE; the profile shows nothing of it).
+const PROBE_OWN_FILE: &str = "/data/user/0/atl.sandbox.probe/probe.txt";
+/// SIGSYS (31 on x86_64 and aarch64 Linux): the signal a seccomp KILL_PROCESS ends the process with.
+const SIGSYS: i32 = 31;
+/// How long one installer run may take: alto's measured process wall is under 2 s; a hang fails the gate, it does not stop it.
+const RUN_LIMIT: Duration = Duration::from_secs(120);
+/// The property area as the installer sees it: the broker maps the caller's file at bionic's default path, so the variable names that path.
+const IN_VIEW_AREA: (&str, &str) = (PROPERTY_AREA_ENV, PROPERTY_AREA);
+/// atl-sandbox-probe, built by cargo into `<out>/cargo` for the net break.
+const PROBE_PACKAGE: &str = "atl-sandbox-probe";
 /// Where test_apks keeps verified files, under the workspace: `cache/test-apks/<sha256>.apk` (xtask test_apks.rs `CACHE_DIR`, `cached_path`).
 const CACHE: &str = "cache/test-apks";
 /// PackageManager.INSTALL_PARSE_FAILED_BAD_MANIFEST (frameworks/base core/java/android/content/pm/PackageManager.java): the code ApkLiteParseUtils.parseClusterPackageLite gives both inconsistencies.
@@ -78,8 +101,9 @@ pub struct Args {
     /// Native build directory (default: this checkout's slot; else <workspace>/out/native/<host>).
     #[arg(long)]
     out: Option<PathBuf>,
-    /// Deliberate break that must turn a check red: `drop-split`, `abi-arm64` (check 1: no config split in the dir; the device's ABI lists are arm64-v8a only), `feature` (check 6: the installer is told the device has android.hardware.camera).
-    #[arg(long, value_parser = ["drop-split", "abi-arm64", "feature"])]
+    /// Deliberate break that must turn the gate red with the refusal named (module doc): `drop-split`, `abi-arm64` (check 1: no config split in the dir; the device's ABI lists are arm64-v8a only), `feature` (check 6: the installer is told the device has android.hardware.camera),
+    /// `read-outside`, `write-outside`, `no-framework-res` (check 1's view lacks its package dir / its output dir is read-only / framework-res), `net` (the probe in the profile reaches for TCP).
+    #[arg(long, value_parser = ["drop-split", "abi-arm64", "feature", BREAK_READ_OUTSIDE, BREAK_WRITE_OUTSIDE, BREAK_NO_FRAMEWORK, BREAK_NET])]
     r#break: Option<String>,
     /// Print each installer command and its output.
     #[arg(long)]
@@ -250,13 +274,9 @@ fn link(tools: &ApkTools, dir: &Path, manifest_text: &str) -> Result<PathBuf> {
     Ok(apk)
 }
 
-/// The property area the installer maps (`ATL_PROP_AREA`): atl-property-service's default set over the host's build.prop, its ABI lists replaced by `abi` when given, laid out by its area writer into `dir`.
-/// Returns the set (the oracle reads the device's ABI list from it) and (variable, path) for the process environment.
-fn device_area(
-    host: &HostArt,
-    dir: &Path,
-    abi: Option<&str>,
-) -> Result<(Vec<Property>, (String, String))> {
+/// The device's property area file: atl-property-service's default set over the host's build.prop, its ABI lists replaced by `abi` when given, laid out by its area writer into `dir`.
+/// Returns the set (the oracle reads the device's ABI list from it) and the file (the broker maps it at PROPERTY_AREA).
+fn device_area(host: &HostArt, dir: &Path, abi: Option<&str>) -> Result<(Vec<Property>, PathBuf)> {
     let text = std::fs::read_to_string(&host.build_prop)
         .with_context(|| format!("reading {}", host.build_prop.display()))?;
     let mut props = atl_property_service::defaults(&text, LinearTier::probe())?;
@@ -272,13 +292,7 @@ fn device_area(
     std::fs::create_dir_all(dir)?;
     let path = dir.join("properties");
     std::fs::write(&path, atl_property_service::area(&props)?)?;
-    Ok((
-        props,
-        (
-            atl_android_paths::PROPERTY_AREA_ENV.to_owned(),
-            path.display().to_string(),
-        ),
-    ))
+    Ok((props, path))
 }
 
 /// The device's ABIs, preferred first: `ro.product.cpu.abilist` of the property set.
@@ -297,46 +311,69 @@ fn device_list(props: &[Property]) -> Vec<String> {
 /// The converter's framework-res below the native build dir: what Android installs at AssetManager.FRAMEWORK_APK_PATH.
 const FRAMEWORK_RES: &str = "device/framework-res/framework-res.apk";
 
-/// bwrap options for the installer's filesystem view: the host's `/` entry by entry (directories bound with their devices, symlinks re-made) on bwrap's own root, plus framework-res.apk at
-/// `/system/framework/framework-res.apk`, the fixed path the full parse's system AssetManager opens (AssetManager.createSystemAssetsInZygoteLocked, via DefaultSplitAssetLoader.getBaseAssetManager).
-/// Environment-side setup in place of the broker's installer sandbox (slice M5), which will bind it as app sandboxes do; the host has no `/system`, and its `/` is not writable, so it is rebuilt here.
-fn system_view(framework_res: &Path) -> Result<Vec<std::ffi::OsString>> {
-    let mut a = atl_bwrap::Args::new();
-    a.die_with_parent();
-    for e in std::fs::read_dir("/").context("reading /")? {
-        let p = e?.path();
-        let kind = std::fs::symlink_metadata(&p)?.file_type();
-        if kind.is_symlink() {
-            a.symlink(std::fs::read_link(&p)?, &p);
-        } else if kind.is_dir() {
-            a.dev_bind(&p, &p);
-        }
-    }
-    a.ro_bind(
-        framework_res,
-        Path::new(atl_android_paths::SYSTEM_FRAMEWORK).join("framework-res.apk"),
-    );
-    Ok(a.end())
+/// What an installer run's view shows of the caller's files (on top of the runtime, which always is shown). A break turns one off, for its check only.
+#[derive(Clone, Copy)]
+struct Show {
+    /// the package dir: read-only, with the files its links name
+    input: bool,
+    /// framework-res.apk at `/system/framework/framework-res.apk`, the fixed path the full parse's system AssetManager opens (AssetManager.createSystemAssetsInZygoteLocked, via DefaultSplitAssetLoader.getBaseAssetManager)
+    framework: bool,
+    /// the output dir: read-write
+    output: bool,
 }
 
-/// `cmd` run inside `view` (`system_view`): bwrap, then the program with its arguments and environment.
-fn in_view(cmd: &Command, view: &[std::ffi::OsString]) -> Command {
-    let mut wrapped = Command::new(atl_bwrap::PROGRAM);
-    wrapped
-        .args(view)
-        .arg(cmd.get_program())
-        .args(cmd.get_args());
-    for (k, v) in cmd.get_envs() {
-        match v {
-            Some(v) => wrapped.env(k, v),
-            None => wrapped.env_remove(k),
-        };
+impl Show {
+    const ALL: Show = Show {
+        input: true,
+        framework: true,
+        output: true,
+    };
+
+    /// The refusal a break takes away, as the verdict names it (None: nothing is taken away).
+    fn refusal(self) -> Option<&'static str> {
+        if !self.input {
+            Some("refused: the package dir is outside the installer's view (ENOENT)")
+        } else if !self.framework {
+            Some("refused: framework-res is outside the installer's view")
+        } else if !self.output {
+            Some("refused: the output dir is read-only in the view (EROFS)")
+        } else {
+            None
+        }
     }
-    wrapped
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    wrapped
+}
+
+/// The signal that ended a sandboxed process: bwrap exits with 128 + the signal when its child is killed (the child's own signal is not its status).
+fn killed_by(status: std::process::ExitStatus) -> Option<i32> {
+    status.signal().or_else(|| {
+        status
+            .code()
+            .filter(|c| (129..=192).contains(c))
+            .map(|c| c - 128)
+    })
+}
+
+/// The line of an installer's stderr that says what refused it, most specific first: AOSP's own failure text, an errno text, a described Java exception, then the installer's own error line
+/// (its `atl-installer: ...` at the start of a line; ART's `I atl-installer:` info lines are not errors). liblog's trace-file noise and the flag storage the view does not have are not refusals.
+fn refusal_line(stderr: &str) -> Option<&str> {
+    const NOISE: [&str; 3] = ["cutils-trace", "FeatureFlags", "AconfigStorage"];
+    let lines = || {
+        stderr
+            .lines()
+            .map(str::trim)
+            .filter(|l| !NOISE.iter().any(|n| l.contains(n)))
+    };
+    [
+        "Failed to create system AssetManager",
+        "Failed to",
+        "Read-only file system",
+        "Permission denied",
+        "No such file or directory",
+        "Exception",
+    ]
+    .iter()
+    .find_map(|m| lines().find(|l| l.contains(m)))
+    .or_else(|| lines().find(|l| l.starts_with("atl-installer:")))
 }
 
 /// The device's Build.VERSION.RESOURCES_SDK_INT: `ro.build.version.sdk`, plus one while `ro.build.version.codename` is not `REL` (Build.java: ACTIVE_CODENAMES is empty only for REL).
@@ -481,43 +518,110 @@ struct Gate<'a> {
     aapt2: PathBuf,
     /// The device's resource SDK (`device_sdk`).
     sdk: i32,
-    /// bwrap options of the installer's filesystem view (`system_view`).
-    view: Vec<std::ffi::OsString>,
+    /// The broker the installer runs through: its installer profile (`spawn_installer`).
+    broker: &'a Broker,
+    /// framework-res.apk of the converter's build, shown at its Android path when `Show::framework`.
+    framework_res: PathBuf,
+    /// The run's files: each installer run's frames and stderr.
+    work: PathBuf,
     data: PathBuf,
     fails: Vec<String>,
 }
 
 impl Gate<'_> {
-    /// The installer over `dir` with the device `area` and declared `features`, libraries into `lib_root`.
+    /// What the installer's view shows of the caller's files, on the broker's root: the runtime read-only at its own paths (the ART root with the links it holds, the boot classpath, the api-impl dex), framework-res at its Android path,
+    /// per `show` the package dir (read-only, its links' targets too) and the output dir (read-write, created here).
+    fn view(&self, dir: &Path, lib_root: &Path, show: Show) -> Result<Vec<Mount>> {
+        let ro = |p: &Path| Mount {
+            host: p.to_path_buf(),
+            at: p.to_path_buf(),
+            writable: false,
+        };
+        let mut mounts = tree_mounts(&self.host.art)?;
+        mounts.extend(self.host.boot.iter().map(|j| ro(j)));
+        mounts.push(ro(&self.api_impl));
+        if show.framework {
+            mounts.push(Mount {
+                host: self.framework_res.clone(),
+                at: Path::new(SYSTEM_FRAMEWORK).join("framework-res.apk"),
+                writable: false,
+            });
+        }
+        if show.input {
+            mounts.extend(tree_mounts(dir)?);
+        }
+        if show.output {
+            std::fs::create_dir_all(lib_root)?;
+            mounts.push(Mount {
+                host: lib_root.to_path_buf(),
+                at: lib_root.to_path_buf(),
+                writable: true,
+            });
+        }
+        Ok(mounts)
+    }
+
+    /// The installer over `dir` with the device property file `area` and declared `features`, libraries into `lib_root`, run in the broker's installer profile: its frames, the run, and its wall time.
     fn run_with(
         &self,
-        area: &(String, String),
+        area: &Path,
         features: &[&str],
         dir: &Path,
         lib_root: &Path,
+        show: Show,
     ) -> Result<(ArtRun, Vec<u8>, u128)> {
         let own: Vec<String> = features.iter().map(|f| format!("--feature={f}")).collect();
         let own: Vec<&str> = own.iter().map(String::as_str).collect();
         let mut cmd = self
             .host
-            .art_command(&self.installer, &own, &self.data, (&area.0, &area.1));
+            .art_command(&self.installer, &own, &self.data, IN_VIEW_AREA);
         cmd.arg(format!("-Djava.class.path={}", self.api_impl.display()))
             .arg(dir)
             .arg(lib_root);
-        let mut cmd = in_view(&cmd, &self.view);
+        let mut spawn = binder::spawn_of(&cmd, INSTALLER_UID)?;
+        spawn.mounts.extend(self.view(dir, lib_root, show)?);
+        spawn.property_area = Some(area.to_path_buf());
+        let stem = lib_root
+            .file_name()
+            .context("a lib root without a name")?
+            .to_string_lossy()
+            .into_owned();
+        let frames_path = self.work.join(format!("{stem}.frames"));
+        let stderr_path = self.work.join(format!("{stem}.stderr"));
+        spawn.stdout = Stdio::from(File::create(&frames_path)?);
+        spawn.stderr = Stdio::from(File::create(&stderr_path)?);
         let start = Instant::now();
-        let (r, frames) = self.host.run_binary(&mut cmd)?;
-        Ok((r, frames, start.elapsed().as_millis()))
+        let mut p = self
+            .broker
+            .spawn_installer(spawn)
+            .context("starting the installer in its profile")?;
+        // the broker's share of the wall time: mounts, the ELF closure of the runtime, bwrap's set-up, before the installer runs
+        println!("{stem}: profile spawn {} ms", start.elapsed().as_millis());
+        let status = binder::wait_limited(&mut p.child, RUN_LIMIT)?;
+        let wall = start.elapsed().as_millis();
+        let run = ArtRun {
+            ok: status.is_some_and(|s| s.success()),
+            code: status.and_then(|s| s.code()),
+            signal: status.and_then(killed_by),
+            status: status.map_or_else(
+                || format!("still running after {RUN_LIMIT:?}, killed"),
+                |s| s.to_string(),
+            ),
+            stdout: String::new(),
+            stderr: std::fs::read_to_string(&stderr_path).unwrap_or_default(),
+        };
+        Ok((run, std::fs::read(&frames_path)?, wall))
     }
 
     /// `run_with` on this device: no declared features (atld's PackageManager declares none).
     fn run(
         &self,
-        area: &(String, String),
+        area: &Path,
         dir: &Path,
         lib_root: &Path,
+        show: Show,
     ) -> Result<(ArtRun, Vec<u8>, u128)> {
-        self.run_with(area, &[], dir, lib_root)
+        self.run_with(area, &[], dir, lib_root, show)
     }
 
     /// The installer's `frames` decoded (atl-installer-dump): its lines, or its error line.
@@ -600,6 +704,67 @@ impl Gate<'_> {
         Ok(full)
     }
 
+    /// Break `net`: atl-sandbox-probe, run in the installer's profile, reaches for TCP. The profile's filter kills it at its socket(AF_INET), and the verdict names the audit record dmesg holds for that call.
+    fn net_break(&mut self, probe: &Path) -> Result<()> {
+        let name = BREAK_NET;
+        let file = |n: &str| self.work.join(n);
+        std::fs::write(file("net-home-file"), b"a file outside the view")?;
+        let mut cmd = Command::new(probe);
+        cmd.arg(file("net-home-file"))
+            .arg(file("net-home-new"))
+            .arg("/usr/atl-sandbox-probe")
+            .arg(PROBE_OWN_FILE)
+            .arg("9")
+            .arg(file("net-socket"))
+            .arg(file("net-other-socket"))
+            .arg(file("net-fonts.conf"))
+            .arg(file("net-fonts-sibling.conf"))
+            .arg("/sys/devices/system/cpu/online")
+            .arg("/sys/devices/system/cpu/online");
+        let mut spawn = binder::spawn_of(&cmd, INSTALLER_UID)?;
+        let log = self.work.join("net-probe.log");
+        (spawn.stdout, spawn.stderr) = to_log(File::create(&log)?)?;
+        let before = seccomp_records();
+        let mut p = self
+            .broker
+            .spawn_installer(spawn)
+            .context("starting the probe in the installer profile")?;
+        let status = binder::wait_limited(&mut p.child, RUN_LIMIT)?;
+        let refused = new_records(before, seccomp_records());
+        match status {
+            Some(s) if killed_by(s) == Some(SIGSYS) => {
+                // the first audit record of this run names the call (x86_64: 41 = socket)
+                let call = refused
+                    .first()
+                    .and_then(|l| l.split("syscall=").nth(1))
+                    .and_then(|n| n.split_whitespace().next())
+                    .unwrap_or("?");
+                self.fail(
+                    name,
+                    format!(
+                        "refused: the probe was killed by SIGSYS in the installer profile at syscall {call} (41 = socket: its TCP socket)"
+                    ),
+                );
+            }
+            Some(s) if s.success() => self.fail(
+                name,
+                "probe completed: a TCP socket went through the installer profile".to_owned(),
+            ),
+            Some(s) => self.fail(
+                name,
+                format!(
+                    "probe exited {s}: {}",
+                    std::fs::read_to_string(&log).unwrap_or_default().trim()
+                ),
+            ),
+            None => self.fail(
+                name,
+                format!("probe still running after {RUN_LIMIT:?}, killed"),
+            ),
+        }
+        Ok(())
+    }
+
     fn fail(&mut self, check: &str, msg: String) {
         println!("{check}: FAIL {msg}");
         self.fails.push(format!("{check}: {msg}"));
@@ -609,14 +774,24 @@ impl Gate<'_> {
     fn expect(
         &mut self,
         name: &str,
-        area: &(String, String),
+        area: &Path,
         dir: &Path,
         lib_root: &Path,
         want: &Want,
+        show: Show,
     ) -> Result<()> {
-        let (r, frames, wall) = self.run(area, dir, lib_root)?;
+        let (r, frames, wall) = self.run(area, dir, lib_root, show)?;
         if !r.ok {
-            self.fail(name, format!("installer {}: {}", r.status, r.failure()));
+            let refused = show.refusal().map(|w| format!("{w}; ")).unwrap_or_default();
+            let how = match r.signal {
+                Some(SIGSYS) => "killed by SIGSYS (a seccomp denial)".to_owned(),
+                Some(n) => format!("killed by signal {n}"),
+                None => r.status.clone(),
+            };
+            let said = refusal_line(&r.stderr)
+                .map(|l| format!(": {l}"))
+                .unwrap_or_default();
+            self.fail(name, format!("{refused}installer {how}{said}"));
             return Ok(());
         }
         let decoded = match self.decode(&frames)? {
@@ -724,13 +899,13 @@ impl Gate<'_> {
     /// Check `feature`: the fixture's only request needs a feature; with the device's features (`features`, none unless broken) AOSP drops it, so the installer requests nothing.
     fn feature(
         &mut self,
-        area: &(String, String),
+        area: &Path,
         features: &[&str],
         dir: &Path,
         lib_root: &Path,
     ) -> Result<()> {
         let name = "feature";
-        let (r, frames, _) = self.run_with(area, features, dir, lib_root)?;
+        let (r, frames, _) = self.run_with(area, features, dir, lib_root, Show::ALL)?;
         if !r.ok {
             self.fail(name, format!("installer {}: {}", r.status, r.failure()));
             return Ok(());
@@ -763,13 +938,13 @@ impl Gate<'_> {
     fn refuse(
         &mut self,
         name: &str,
-        area: &(String, String),
+        area: &Path,
         dir: &Path,
         lib_root: &Path,
         code: i32,
         marker: &str,
     ) -> Result<()> {
-        let (r, _, _) = self.run(area, dir, lib_root)?;
+        let (r, _, _) = self.run(area, dir, lib_root, Show::ALL)?;
         // the message after the code may lead with the file and position (ParseTypeImpl.error with the parser's description)
         let want = format!("parse error {code}: ... {marker}");
         let line = r
@@ -785,6 +960,38 @@ impl Gate<'_> {
         }
         Ok(())
     }
+}
+
+/// The seccomp audit records dmesg holds now (`type=1326`, one per call the filter denies: kill mode ends the process too). None when dmesg cannot be read: the count is then not judged.
+fn seccomp_records() -> Option<Vec<String>> {
+    let out = Command::new("dmesg").output().ok()?;
+    out.status.success().then(|| {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.contains("type=1326"))
+            .map(str::to_owned)
+            .collect()
+    })
+}
+
+/// The records dmesg gained between two `seccomp_records` reads (dmesg only appends; a read that lost its start yields none).
+fn new_records(before: Option<Vec<String>>, after: Option<Vec<String>>) -> Vec<String> {
+    match (before, after) {
+        (Some(b), Some(a)) => a.get(b.len()..).unwrap_or_default().to_vec(),
+        _ => Vec::new(),
+    }
+}
+
+/// atl-sandbox-probe built into `<out>/cargo`, as `xtask test sandbox` builds it: its path.
+fn build_probe(root: &Path, out: &Path) -> Result<PathBuf> {
+    let status = crate::unit_use::status(
+        crate::cargo_command()
+            .args(["build", "--release", "-p", PROBE_PACKAGE, "--target-dir"])
+            .arg(out.join("cargo"))
+            .current_dir(root),
+    )?;
+    ensure!(status.success(), "building {PROBE_PACKAGE} failed");
+    Ok(out.join("cargo/release").join(PROBE_PACKAGE))
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
@@ -823,6 +1030,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         "no api-impl dex {}: `cargo xtask native` builds it with the Java goals",
         api_impl.display()
     );
+    // the installer runs through the broker, as atld's processes do: binderd starts as atld starts it
+    let (broker, mut binderd) = binder::start_binderd(root, &out, &work.join("binderd.log"))?;
+    let seccomp_before = seccomp_records();
+    let probe = if args.r#break.as_deref() == Some(BREAK_NET) {
+        Some(build_probe(root, &out)?)
+    } else {
+        None
+    };
     let mut gate = Gate {
         host: &host,
         installer: packages::bin(root, &out, PACKAGE, INSTALLER)?,
@@ -830,7 +1045,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         api_impl,
         aapt2: tools.aapt2.clone(),
         sdk: device_sdk(&device_props)?,
-        view: system_view(&out.join(FRAMEWORK_RES))?,
+        broker: &broker,
+        framework_res: out.join(FRAMEWORK_RES),
+        work: work.clone(),
         data: work.join("data"),
         fails: Vec::new(),
     };
@@ -869,7 +1086,19 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         primary,
         libs,
     };
-    gate.expect("alto", &alto_area, &dir, &work.join("alto-lib"), &want)?;
+    // a break takes one part of alto's view away, or moves its output into the read-only package dir: the verdict names what refused it
+    let brk = args.r#break.as_deref();
+    let show = Show {
+        input: brk != Some(BREAK_READ_OUTSIDE),
+        framework: brk != Some(BREAK_NO_FRAMEWORK),
+        output: brk != Some(BREAK_WRITE_OUTSIDE),
+    };
+    let alto_lib = if brk == Some(BREAK_WRITE_OUTSIDE) {
+        dir.join("elsewhere")
+    } else {
+        work.join("alto-lib")
+    };
+    gate.expect("alto", &alto_area, &dir, &alto_lib, &want, show)?;
 
     // 2. single
     let (_, single_apk) = test_apks::ensure(root, SINGLE_ROW)?;
@@ -888,7 +1117,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         primary,
         libs,
     };
-    gate.expect("single", &area, &dir, &work.join("single-lib"), &want)?;
+    gate.expect(
+        "single",
+        &area,
+        &dir,
+        &work.join("single-lib"),
+        &want,
+        Show::ALL,
+    )?;
 
     // 3. rich: a manifest with every component kind
     let (_, rich_apk) = test_apks::ensure(root, RICH_ROW)?;
@@ -904,7 +1140,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         primary,
         libs,
     };
-    gate.expect("rich", &area, &dir, &work.join("rich-lib"), &want)?;
+    gate.expect(
+        "rich",
+        &area,
+        &dir,
+        &work.join("rich-lib"),
+        &want,
+        Show::ALL,
+    )?;
 
     // 4. refusals: AOSP's consistency check between base and split
     let cases = [
@@ -975,8 +1218,33 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     };
     gate.feature(&area, features, &dir, &work.join("feature-lib"))?;
 
+    if let Some(probe) = &probe {
+        gate.net_break(probe)?;
+    }
+    // every seccomp denial the run recorded: a denial in kill mode also ends its process, so it is a failure either way
+    match (seccomp_before.is_some(), seccomp_records()) {
+        (true, Some(after)) => {
+            let new = new_records(seccomp_before, Some(after));
+            println!(
+                "installer: seccomp denials during the run: {} (kill mode; dmesg type=1326 records)",
+                new.len()
+            );
+            for line in new.iter().take(3) {
+                println!("{line}");
+            }
+            if !new.is_empty() {
+                gate.fails
+                    .push(format!("seccomp: {} denied call(s) in dmesg", new.len()));
+            }
+        }
+        _ => println!("installer: seccomp denials: not judged (dmesg unreadable)"),
+    }
     println!("{}", verdict::gate(CMD, &gate.fails));
-    Ok(if gate.fails.is_empty() {
+    let ok = gate.fails.is_empty();
+    drop(gate);
+    drop(broker);
+    binder::wait_limited(&mut binderd.child, RUN_LIMIT)?;
+    Ok(if ok {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE

@@ -153,10 +153,16 @@ pub enum Profile {
     App,
     /// binderd itself ([`Broker::start`]): every namespace, no capabilities, a root holding only its executable's ELF closure, the [`seccomp::binderd_filter`] allow-list.
     BinderDaemon,
+    /// The package installer ([`Broker::spawn_installer`], plan 4b): AOSP's package parse and native-code choice over the caller's package dir and one output dir.
+    /// Its own uid ([`INSTALLER_UID`]), no network namespace, not registered with binderd (no binder), the caller's environment alone, the installer allow-list ([`seccomp`]).
+    Installer,
 }
 
 /// The uid and gid binderd runs as inside its user namespace: the overflow id (nobody), which owns nothing binderd could reach.
 const BINDERD_ID: u32 = 65534;
+
+/// The installer's appId (plan S10: a dedicated uid, since the package it installs has no uid yet). The first application uid, held back for the installer: package uids start above it.
+pub const INSTALLER_UID: u32 = 10_000;
 
 /// A started sandbox.
 #[derive(Debug)]
@@ -211,11 +217,12 @@ fn key(e: &RootEntry) -> &str {
     }
 }
 
-/// The app sandbox's bwrap arguments for `spawn` over `root` (up to and including `--`), info on fd `info_fd`, the seccomp program on `seccomp_fd` when given, and the stub `stub` and the program bound read-only to be exec'd.
+/// The sandbox's bwrap arguments for `spawn` in `profile` over `root` (up to and including `--`), info on fd `info_fd`, the seccomp program on `seccomp_fd` when given, and the stub `stub` and the program bound read-only to be exec'd.
 /// Returns the grants with them: every bind and fresh mount, which `stub_args` turns into the stub's Landlock rules, so no path is visible without one.
 /// A root entry a mount covers (its first path component) is left out, as are `/dev` and `/proc`, which the sandbox gets fresh.
 pub fn bwrap_args(
     spawn: &Spawn,
+    profile: Profile,
     root: &[RootEntry],
     stub: &Path,
     info_fd: i32,
@@ -233,9 +240,15 @@ pub fn bwrap_args(
         // init's /dev/socket (first_stage_init.cpp `mkdir("/dev/socket", 0755)`): the process's own liblog sink binds `logdw` there (atl-app-launcher logdw.rs)
         .dir(SOCKET_DIR)
         .proc("/proc")
-        .grant(Access::Ro, "/proc")
-        .tmpfs("/tmp")
-        .grant(Access::Rw, "/tmp");
+        .grant(Access::Ro, "/proc");
+    if profile != Profile::Installer {
+        // the app's private /tmp; the installer writes nowhere but its output dir
+        a.tmpfs("/tmp").grant(Access::Rw, "/tmp");
+    }
+    if profile == Profile::Installer {
+        // no network: a namespace with loopback only; no controlling terminal
+        a.unshare_net().new_session();
+    }
     if let Some(fd) = seccomp_fd {
         a.seccomp(fd);
     }
@@ -688,27 +701,7 @@ impl Broker {
     pub fn spawn(&self, mut spawn: Spawn) -> io::Result<Process> {
         // a panic elsewhere leaves nothing half-done here: the guard only orders spawns
         let _one_at_a_time = self.spawning.lock().unwrap_or_else(|e| e.into_inner());
-        // the libraries its loader finds through RUNPATH are part of the program's view (runpath_mounts)
-        spawn.mounts.extend(runpath_mounts(&spawn.program)?);
-        // the sysfs of its DRM nodes only (drm_sysfs)
-        let (sys_mounts, sys_links) = drm_sysfs(&spawn.devices)?;
-        spawn.mounts.extend(sys_mounts);
-        spawn.links.extend(sys_links);
-        // the trees of the LD_LIBRARY_PATH the process starts with: a library the loader finds there loads its own RUNPATH dirs too (library_path_mounts)
-        for (k, v) in &spawn.env {
-            if k == "LD_LIBRARY_PATH" {
-                spawn.mounts.extend(library_path_mounts(v)?);
-            }
-        }
-        // a path the root already shows read-only at the same place is not mounted again, and none is mounted twice
-        let mut seen = std::collections::BTreeSet::new();
-        spawn.mounts.retain(|m| {
-            let in_root = m.host == m.at
-                && APP_ROOT_DIRS
-                    .iter()
-                    .any(|d| m.at.starts_with(Path::new("/").join(d)));
-            !in_root && seen.insert((m.host.clone(), m.at.clone(), m.writable))
-        });
+        complete_mounts(&mut spawn)?;
         let (ours, theirs) = socketpair(
             AddressFamily::UNIX,
             SocketType::SEQPACKET,
@@ -724,6 +717,7 @@ impl Broker {
             .transpose()?;
         let (bwrap_args, grants) = bwrap_args(
             &spawn,
+            Profile::App,
             &host_root()?,
             &self.stub,
             info_w.as_raw_fd(),
@@ -762,6 +756,88 @@ impl Broker {
         .map_err(|e| registration_error(host_pid, e))?;
         Ok(Process { child, host_pid })
     }
+}
+
+impl Broker {
+    /// Starts the installer (plan 4b) in [`Profile::Installer`]: `spawn` runs as [`INSTALLER_UID`] and asks for nothing the profile does not give ([`installer_refusal`]).
+    /// Its environment is `spawn.env` alone (no desktop variables, no app env), and it is not registered with binderd: an installer has no binder.
+    pub fn spawn_installer(&self, mut spawn: Spawn) -> io::Result<Process> {
+        if let Some(why) = installer_refusal(&spawn) {
+            return Err(other(format!("installer spawn refused: {why}")));
+        }
+        let _one_at_a_time = self.spawning.lock().unwrap_or_else(|e| e.into_inner());
+        complete_mounts(&mut spawn)?;
+        let (info_r, info_w) = io::pipe()?;
+        let seccomp = seccomp_memfd(Profile::Installer)?;
+        let (bwrap_args, grants) = bwrap_args(
+            &spawn,
+            Profile::Installer,
+            &host_root()?,
+            &self.stub,
+            info_w.as_raw_fd(),
+            Some(seccomp.as_raw_fd()),
+        );
+        // no rights: TCP is left handled (refused) by the stub, and the namespace has no network anyway
+        let mut args = stub_args(&grants, false, &spawn.program);
+        args.extend(spawn.args.iter().cloned());
+        let Process { child, host_pid } = launch(
+            Launch {
+                bwrap_args,
+                program: Path::new(SANDBOX_STUB_AT),
+                args: &args,
+                env: spawn.env,
+                stdin: spawn.stdin.map_or_else(Stdio::null, Stdio::from),
+                stdout: spawn.stdout,
+                stderr: spawn.stderr,
+            },
+            info_r,
+            vec![info_w.into(), seccomp],
+        )?;
+        Ok(Process { child, host_pid })
+    }
+}
+
+/// Why [`Broker::spawn_installer`] refuses `spawn`: what the installer profile does not give (its uid, devices, rights, links, the context-manager role), else None.
+fn installer_refusal(spawn: &Spawn) -> Option<&'static str> {
+    if spawn.uid != INSTALLER_UID {
+        Some("uid is not INSTALLER_UID")
+    } else if !spawn.devices.is_empty() {
+        Some("devices: the installer has no device nodes")
+    } else if !spawn.rights.is_empty() {
+        Some("rights: the installer has no manifest right, network included")
+    } else if !spawn.links.is_empty() {
+        Some("links: the installer's view is mounts only")
+    } else if spawn.context_manager {
+        Some("context manager: the installer has no binder")
+    } else {
+        None
+    }
+}
+
+/// What every sandbox shows beyond its caller's mounts: the libraries its loader finds through RUNPATH, the sysfs of its DRM nodes, the trees of its LD_LIBRARY_PATH.
+/// A path the root already shows read-only at the same place, or one already mounted, is dropped.
+fn complete_mounts(spawn: &mut Spawn) -> io::Result<()> {
+    // the libraries its loader finds through RUNPATH are part of the program's view (runpath_mounts)
+    spawn.mounts.extend(runpath_mounts(&spawn.program)?);
+    // the sysfs of its DRM nodes only (drm_sysfs)
+    let (sys_mounts, sys_links) = drm_sysfs(&spawn.devices)?;
+    spawn.mounts.extend(sys_mounts);
+    spawn.links.extend(sys_links);
+    // the trees of the LD_LIBRARY_PATH the process starts with: a library the loader finds there loads its own RUNPATH dirs too (library_path_mounts)
+    for (k, v) in &spawn.env {
+        if k == "LD_LIBRARY_PATH" {
+            spawn.mounts.extend(library_path_mounts(v)?);
+        }
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    spawn.mounts.retain(|m| {
+        let in_root = m.host == m.at
+            && APP_ROOT_DIRS
+                .iter()
+                .any(|d| m.at.starts_with(Path::new("/").join(d)));
+        !in_root && seen.insert((m.host.clone(), m.at.clone(), m.writable))
+    });
+    Ok(())
 }
 
 /// A failed registration of `host_pid`: a closed admin connection (EPIPE / ECONNRESET on the SEQPACKET socket) means binderd has ended -- killed by its seccomp filter, crashed, or exited -- and its log says which.
@@ -815,7 +891,8 @@ mod tests {
             target: SHARED_STORAGE.into(),
             at: SDCARD.into(),
         });
-        let joined = s(&bwrap_args(&sp, &[], Path::new("/b/stub"), 9, None).0).join(" ");
+        let joined =
+            s(&bwrap_args(&sp, Profile::App, &[], Path::new("/b/stub"), 9, None).0).join(" ");
         assert!(joined.ends_with(
             "--ro-bind /r/system /system --bind /r/data /data --symlink /storage/emulated/0 /sdcard --dev-bind /dev/dri /dev/dri --ro-bind /r/properties /dev/__properties__ --ro-bind /b/stub /.atl-sandbox-stub --ro-bind /bin/true /bin/true --chdir / --"
         ));
@@ -872,15 +949,15 @@ mod tests {
         let tail = "--ro-bind /etc /etc --symlink usr/lib /lib --ro-bind /usr /usr --ro-bind /r/system /system --bind /r/data /data --dev-bind /dev/dri /dev/dri --ro-bind /r/properties /dev/__properties__ --ro-bind /b/stub /.atl-sandbox-stub --ro-bind /bin/true /bin/true --chdir / --";
         let stub = Path::new("/b/stub");
         assert_eq!(
-            s(&bwrap_args(&spawn(), &root, stub, 9, None).0).join(" "),
+            s(&bwrap_args(&spawn(), Profile::App, &root, stub, 9, None).0).join(" "),
             format!("{head} {tail}")
         );
         assert_eq!(
-            s(&bwrap_args(&spawn(), &root, stub, 9, Some(8)).0).join(" "),
+            s(&bwrap_args(&spawn(), Profile::App, &root, stub, 9, Some(8)).0).join(" "),
             format!("{head} --seccomp 8 {tail}")
         );
         // the grants, in call order: the fresh /dev, /proc, /tmp; each bind at its sandbox path, the device and the area
-        let (_, grants) = bwrap_args(&spawn(), &root, stub, 9, None);
+        let (_, grants) = bwrap_args(&spawn(), Profile::App, &root, stub, 9, None);
         let want: Vec<(Access, &str)> = vec![
             (Access::Rw, "/dev"),
             (Access::Ro, "/proc"),
@@ -914,6 +991,7 @@ mod tests {
         });
         let (argv, _) = bwrap_args(
             &sp,
+            Profile::App,
             &[RootEntry::Dir("usr".into())],
             Path::new("/b/stub"),
             9,
@@ -938,6 +1016,58 @@ mod tests {
             s(&binderd_args(&files, 9, 8)).join(" "),
             "--unshare-all --unshare-user --uid 65534 --gid 65534 --die-with-parent --new-session --cap-drop ALL --info-fd 9 --seccomp 8 --tmpfs / --ro-bind /b/atl-binderd /b/atl-binderd --ro-bind /lib64/ld.so /lib64/ld.so --"
         );
+    }
+
+    /// Golden argv of Profile::Installer, written from its spec: the installer's uid, every namespace and a network namespace of its own (loopback only), its own session, the seccomp program;
+    /// then the root, the caller's mounts, the stub and the program as the other profiles give them. No devices, no property area here: the spawn gives none.
+    #[test]
+    fn installer_shape() {
+        let mut sp = spawn();
+        sp.uid = INSTALLER_UID;
+        sp.devices.clear();
+        sp.property_area = None;
+        let root = [RootEntry::Dir("usr".into())];
+        assert_eq!(
+            s(&bwrap_args(
+                &sp,
+                Profile::Installer,
+                &root,
+                Path::new("/b/stub"),
+                9,
+                Some(8)
+            )
+            .0)
+            .join(" "),
+            "--unshare-user --uid 10000 --gid 10000 --unshare-pid --die-with-parent --info-fd 9 --tmpfs / --dev /dev --dir /dev/socket --proc /proc --unshare-net --new-session --seccomp 8 --ro-bind /usr /usr --ro-bind /r/system /system --bind /r/data /data --ro-bind /b/stub /.atl-sandbox-stub --ro-bind /bin/true /bin/true --chdir / --"
+        );
+    }
+
+    /// The installer profile refuses what it does not give: another uid, a device, a manifest right, a link, the context-manager role. The spawn it accepts has none of them.
+    #[test]
+    fn installer_refuses_what_it_does_not_give() {
+        let mut sp = spawn();
+        assert!(
+            installer_refusal(&sp).is_some(),
+            "uid 10123 is not the installer's"
+        );
+        sp.uid = INSTALLER_UID;
+        sp.devices.clear();
+        sp.property_area = None;
+        assert_eq!(installer_refusal(&sp), None);
+        sp.devices.push("/dev/dri".into());
+        assert!(installer_refusal(&sp).is_some());
+        sp.devices.clear();
+        sp.rights.push(Right::Net);
+        assert!(installer_refusal(&sp).is_some());
+        sp.rights.clear();
+        sp.links.push(Link {
+            target: "/x".into(),
+            at: "/y".into(),
+        });
+        assert!(installer_refusal(&sp).is_some());
+        sp.links.clear();
+        sp.context_manager = true;
+        assert!(installer_refusal(&sp).is_some());
     }
 
     /// The stub's argv: each grant as its flag and path, then `--` and the program (atl-sandbox-stub's usage line).

@@ -2,6 +2,7 @@
 //! The sandboxes' seccomp filters, one per [`Profile`]. bwrap installs it (`--seccomp FD`) before the sandboxed program runs, so every thread inherits it.
 //! BinderDaemon: a measured allow-list, everything else kills ([`binderd_program`]; derivation in arch.rs).
 //! App: the first rule of the planned per-app filter (seccompiler 0.5); every other syscall is allowed, so this is not yet the allow-list.
+//! Installer: a measured allow-list like BinderDaemon's ([`arch::INSTALLER_SYSCALLS`]), socket only for AF_UNIX; anything else kills the process.
 //! App rule: `setpriority` with a negative priority returns 0 and changes nothing; a non-negative priority reaches the kernel unchanged.
 //! Condition defended: an unprivileged user cannot lower nice (RLIMIT_NICE hard limit 0 here; real Android's init sets 40/40, init.rc:42-43). ART starts HandlerThreads at THREAD_PRIORITY_FOREGROUND (-2),
 //! so Process.setThreadPriority throws SecurityException (android_util_Process.cpp:115) and the app's queued-work looper dies with the app.
@@ -30,30 +31,40 @@ pub fn program(profile: Profile) -> io::Result<BpfProgram> {
     match profile {
         Profile::App => app_program(),
         Profile::BinderDaemon => binderd_program(),
+        Profile::Installer => installer_program(),
     }
 }
 
-/// socketpair(domain, type, protocol, sv): the domain is the first argument.
+/// socket(domain, type, protocol) and socketpair(domain, type, protocol, sv): the domain is the first argument.
 const DOMAIN_ARG: u8 = 0;
 
 /// binderd's filter: an allow-list ([`arch::BINDERD_SYSCALLS`], measured), socketpair only for AF_UNIX, anything else kills the process (SECCOMP_RET_KILL_PROCESS: the run then fails on "binderd ended", never on a half-working daemon).
 /// Covers bwrap's pid 1 in the sandbox too (it waits for binderd), since bwrap installs the filter before it forks it.
 fn binderd_program() -> io::Result<BpfProgram> {
-    let unix = SeccompCondition::new(
-        DOMAIN_ARG,
-        SeccompCmpArgLen::Dword,
-        SeccompCmpOp::Eq,
-        u64::from(libc::AF_UNIX.unsigned_abs()),
-    )
-    .map_err(io::Error::other)?;
-    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = arch::BINDERD_SYSCALLS
-        .iter()
-        .map(|&n| (n, vec![]))
-        .collect();
-    rules.insert(
-        libc::SYS_socketpair,
-        vec![SeccompRule::new(vec![unix]).map_err(io::Error::other)?],
-    );
+    allow_list(arch::BINDERD_SYSCALLS, &[libc::SYS_socketpair])
+}
+
+/// The installer's filter: an allow-list ([`arch::INSTALLER_SYSCALLS`], measured the same way), socket only for AF_UNIX (its namespace has no network to reach anyway), anything else kills the process.
+fn installer_program() -> io::Result<BpfProgram> {
+    allow_list(arch::INSTALLER_SYSCALLS, &[libc::SYS_socket])
+}
+
+/// An allow-list program: `calls` are allowed with any arguments, each of `unix_only` only when its domain is AF_UNIX, every other call kills the process.
+fn allow_list(calls: &[i64], unix_only: &[i64]) -> io::Result<BpfProgram> {
+    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = calls.iter().map(|&n| (n, vec![])).collect();
+    for &call in unix_only {
+        let unix = SeccompCondition::new(
+            DOMAIN_ARG,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            u64::from(libc::AF_UNIX.unsigned_abs()),
+        )
+        .map_err(io::Error::other)?;
+        rules.insert(
+            call,
+            vec![SeccompRule::new(vec![unix]).map_err(io::Error::other)?],
+        );
+    }
     let filter = SeccompFilter::new(
         rules,
         SeccompAction::KillProcess,
