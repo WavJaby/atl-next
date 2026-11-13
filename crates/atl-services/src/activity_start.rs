@@ -5,11 +5,10 @@
 //! A start for a result (startActivityForResult) is accepted too: the result it owes its caller is answered by the services (see [`Call::result_requested`]).
 //! And a start with no caller app (shell / home) of a package's launcher whose process is not running ([`check_shell`]).
 //! Every other call is refused: a SecurityException when the caller does not own the activity it names (fail-closed), otherwise the START code AOSP returns for the case
-//! (ActivityManager.java:162 FIRST_START_FATAL = -100), counted by `counters::refused` under its reason. Refusals are never silent: the app sees the code, the log sees the count.
+//! (ActivityManager.java:162 FIRST_START_FATAL = -100), counted by `atl_diag::refused` under its reason. Refusals are never silent: the app sees the code, the log sees the count.
 //! Refused, not modelled: implicit intents (intent filters), other packages, singleInstance, other processes, intent flags except NEW_TASK, task affinity
 //! across tasks (NEW_TASK into another affinity), more than one task per package, bringing a running app's task to front.
 
-use atl_services_types::counters;
 use atl_services_types::permission::{SHELL_UID, SYSTEM_UID};
 
 /// What a start's check reads of the activity it starts (the installed ActivityInfo's, crate::packages::declared): its class, launch mode, process and task affinity.
@@ -103,7 +102,7 @@ pub struct Target<'a> {
 }
 
 fn refused(code: i32, reason: &'static str) -> Refusal {
-    counters::refused(INTERFACE, &format!("startActivity ({reason})"));
+    atl_diag::refused(INTERFACE, &format!("startActivity ({reason})"));
     Refusal::Code { code, reason }
 }
 
@@ -113,7 +112,7 @@ pub fn check<'a>(call: &Call<'_>, target: Target<'a>) -> Result<(&'a Declared, S
         return Err(refused(START_CANCELED, "resultTo names no activity"));
     };
     if source.uid != call.calling_uid || source.package != call.calling_package {
-        counters::refused(
+        atl_diag::refused(
             INTERFACE,
             "startActivity (resultTo is not the caller's activity)",
         );
@@ -201,7 +200,7 @@ pub fn check_shell(
     running: bool,
 ) -> Result<(), Refusal> {
     if calling_uid != SYSTEM_UID && calling_uid != SHELL_UID {
-        counters::refused(
+        atl_diag::refused(
             INTERFACE,
             "startActivity (no caller app, uid without START_ANY_ACTIVITY)",
         );

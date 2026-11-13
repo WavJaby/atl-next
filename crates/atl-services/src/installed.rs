@@ -45,7 +45,7 @@ pub enum DecodeError {
         frame: usize,
         kind: Kind,
         status: StatusCode,
-        refused: Vec<&'static str>,
+        refused: Vec<String>,
     },
     /// the value ended before its frame did
     Trailing {
@@ -143,7 +143,7 @@ pub fn decode(data: &[u8]) -> Result<Installed, DecodeError> {
     for (frame, f) in frames.iter().enumerate() {
         let parcel = |status| parcel_error(frame, f.kind, status, Vec::new());
         let p = Parcel::unmarshal(f.parcel).map_err(parcel)?;
-        let before = atl_parcelables::refused();
+        let before = parcel_refusals();
         let decoded = read(&p, f.kind);
         let decoded =
             decoded.map_err(|status| parcel_error(frame, f.kind, status, new_refusals(&before)))?;
@@ -235,12 +235,7 @@ fn read(p: &Parcel, kind: Kind) -> Result<Value, StatusCode> {
     })
 }
 
-fn parcel_error(
-    frame: usize,
-    kind: Kind,
-    status: StatusCode,
-    refused: Vec<&'static str>,
-) -> DecodeError {
+fn parcel_error(frame: usize, kind: Kind, status: StatusCode, refused: Vec<String>) -> DecodeError {
     DecodeError::Parcel {
         frame,
         kind,
@@ -249,9 +244,18 @@ fn parcel_error(
     }
 }
 
+/// This process's parcelable refusals so far (atl-parcelables `refuse` counts them as `refused-parcel <what>`): (what, count).
+fn parcel_refusals() -> Vec<(String, u64)> {
+    atl_diag::counts()
+        .into_iter()
+        .filter(|(outcome, _, _)| outcome == atl_diag::REFUSED_PARCEL)
+        .map(|(_, what, n)| (what, n))
+        .collect()
+}
+
 /// The refusal names whose count grew since `before`.
-fn new_refusals(before: &[(&'static str, u64)]) -> Vec<&'static str> {
-    atl_parcelables::refused()
+fn new_refusals(before: &[(String, u64)]) -> Vec<String> {
+    parcel_refusals()
         .into_iter()
         .filter(|(name, n)| {
             before
@@ -443,9 +447,8 @@ mod tests {
         bytes[at..at + 4].copy_from_slice(&(offset + 4).to_ne_bytes());
         match decode(&output(&bytes)) {
             Err(DecodeError::Parcel { refused, .. }) => assert!(
-                refused.contains(
-                    &"android.content.pm.ApplicationInfo (back-reference to no earlier copy)"
-                ),
+                refused.iter().any(|r| r
+                    == "android.content.pm.ApplicationInfo (back-reference to no earlier copy)"),
                 "{refused:?}"
             ),
             other => panic!("expected a refused back-reference, got {other:?}"),

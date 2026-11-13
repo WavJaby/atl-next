@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! The PendingIntent records of the activity service: the table (pending_intent_table.rs) under a lock, and the IIntentSender binder each record is handed out as.
-//! send is not modelled: the stub default, counted UNKNOWN (counters.rs), so a PendingIntent that would fire shows in the log. Not modelled: the send-time data (intent extras, options), cancel listeners, and the activity-result kind, which AOSP gives ActivityTaskManager (activity.rs refuses it).
+//! send is not modelled: the stub default, counted unimplemented by the reply hook (atl-diag), so a PendingIntent that would fire shows in the log. Not modelled: the send-time data (intent extras, options), cancel listeners, and the activity-result kind, which AOSP gives ActivityTaskManager (activity.rs refuses it).
 //! Records last until cancelled. AOSP lets a record go with its last remote reference (WeakReference, PendingIntentController.java:163-164); here it is held, so a FLAG_NO_CREATE lookup can find a record AOSP would have dropped.
 //! userId is part of the key only: one user.
 

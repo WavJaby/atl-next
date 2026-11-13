@@ -2,7 +2,7 @@
 //! The `mount` service (`ServiceManager.getService("mount")`, StorageManager.java:326): ATL's one storage volume, the emulated primary, at [`atl_android_paths::SHARED_STORAGE`].
 //! StorageManager.getVolumeList (its PropertyInvalidatedCache query, StorageManager.java:322-331) asks for a user's volumes. ATL has one user, the system user (user.rs): it gets the primary, other users none.
 //! The flags (FLAG_FOR_WRITE, FLAG_REAL_STATE, ...) are not modelled: the primary is always mounted and writable. Environment.getExternalDirs builds every external path from these volumes (Environment.java:186-194).
-//! Every other method keeps the stub's default body: counted (counters.rs) and answered UNKNOWN_TRANSACTION. Not modelled: the shared storage root, the permission-derived mounts and MediaStore; the broker mounts only each app's own Android/data and Android/obb (atld app_spawn).
+//! Every other method keeps the stub's default body: counted by the reply hook (atl-diag) and answered UNKNOWN_TRANSACTION. Not modelled: the shared storage root, the permission-derived mounts and MediaStore; the broker mounts only each app's own Android/data and Android/obb (atld app_spawn).
 
 use atl_aidl::aidl::android::os::storage::IStorageManager::{
     BnStorageManager, EnforcePermission, IStorageManager,

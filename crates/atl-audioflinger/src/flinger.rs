@@ -20,7 +20,6 @@ use atl_audioflinger_stubs::mangled::{
     _7_android_5_media_18_CreateTrackRequest as CreateTrackRequest,
     _7_android_5_media_19_CreateTrackResponse as CreateTrackResponse,
 };
-use atl_services_types::counters;
 use binder::{BinderFeatures, Interface, SpIBinder, StatusCode, Strong};
 
 use crate::output::{self, Opened, Opener};
@@ -85,7 +84,7 @@ impl AudioFlinger {
         match self.output.get() {
             Ok(opened) => Some(opened),
             Err(_) => {
-                counters::refused(INTERFACE, method);
+                atl_diag::refused(INTERFACE, method);
                 None
             }
         }
@@ -99,7 +98,7 @@ impl Interface for AudioFlinger {}
 impl IAudioFlingerService for AudioFlinger {
     /// AudioSystem::getSamplingRate: AOSP answers 0 for a handle it does not have (AudioFlinger.cpp:1283-1292), and 0 here when the output cannot open.
     fn r#sampleRate(&self, io_handle: i32) -> binder::Result<i32> {
-        counters::answered(INTERFACE, "sampleRate");
+        atl_diag::answered(INTERFACE, "sampleRate");
         Ok(self
             .output_for(io_handle, "sampleRate")
             .map_or(0, |o| o.profile.rate_hz as i32))
@@ -107,7 +106,7 @@ impl IAudioFlingerService for AudioFlinger {
 
     /// AudioSystem::getFrameCount: 0 for an unknown handle, as AOSP (AudioFlinger.cpp:1305-1315).
     fn r#frameCount(&self, io_handle: i32) -> binder::Result<i64> {
-        counters::answered(INTERFACE, "frameCount");
+        atl_diag::answered(INTERFACE, "frameCount");
         Ok(self
             .output_for(io_handle, "frameCount")
             .map_or(0, |o| i64::from(o.profile.quantum)))
@@ -115,7 +114,7 @@ impl IAudioFlingerService for AudioFlinger {
 
     /// AudioSystem::getLatency, ms (AudioFlinger.cpp:1329-1337: 0 for no playback thread).
     fn r#latency(&self, output: i32) -> binder::Result<i32> {
-        counters::answered(INTERFACE, "latency");
+        atl_diag::answered(INTERFACE, "latency");
         Ok(self
             .output_for(output, "latency")
             .map_or(0, |o| o.profile.latency_ms()))
@@ -123,7 +122,7 @@ impl IAudioFlingerService for AudioFlinger {
 
     /// AudioManager's `PROPERTY_OUTPUT_SAMPLE_RATE` (AudioSystem.getPrimaryOutputSamplingRate): the primary playback thread's rate, 0 with none (AudioFlinger.cpp getPrimaryOutputSamplingRate). The one output is the primary; it opens here on first use.
     fn r#getPrimaryOutputSamplingRate(&self) -> binder::Result<i32> {
-        counters::answered(INTERFACE, "getPrimaryOutputSamplingRate");
+        atl_diag::answered(INTERFACE, "getPrimaryOutputSamplingRate");
         Ok(self
             .output_for(output_handle(), "getPrimaryOutputSamplingRate")
             .map_or(0, |o| o.profile.rate_hz as i32))
@@ -131,7 +130,7 @@ impl IAudioFlingerService for AudioFlinger {
 
     /// AudioManager's `PROPERTY_OUTPUT_FRAMES_PER_BUFFER`: the primary thread's HAL frame count (frameCountHAL), 0 with none; here the output's quantum.
     fn r#getPrimaryOutputFrameCount(&self) -> binder::Result<i64> {
-        counters::answered(INTERFACE, "getPrimaryOutputFrameCount");
+        atl_diag::answered(INTERFACE, "getPrimaryOutputFrameCount");
         Ok(self
             .output_for(output_handle(), "getPrimaryOutputFrameCount")
             .map_or(0, |o| i64::from(o.profile.quantum)))
@@ -142,7 +141,7 @@ impl IAudioFlingerService for AudioFlinger {
         &self,
         _client: Option<&Strong<dyn IAudioFlingerClient>>,
     ) -> binder::Result<()> {
-        counters::answered(INTERFACE, "registerClient");
+        atl_diag::answered(INTERFACE, "registerClient");
         Ok(())
     }
 
@@ -153,11 +152,11 @@ impl IAudioFlingerService for AudioFlinger {
     ) -> binder::Result<i32> {
         match u32::try_from(use_.0).ok().and_then(ids::next) {
             Some(id) => {
-                counters::answered(INTERFACE, "newAudioUniqueId");
+                atl_diag::answered(INTERFACE, "newAudioUniqueId");
                 Ok(id)
             }
             None => {
-                counters::refused(INTERFACE, "newAudioUniqueId");
+                atl_diag::refused(INTERFACE, "newAudioUniqueId");
                 Ok(0)
             }
         }
@@ -165,12 +164,12 @@ impl IAudioFlingerService for AudioFlinger {
 
     /// AudioFlinger keeps per-client session refs for effects; no effect exists here, so the call is a no-op.
     fn r#acquireAudioSessionId(&self, _session: i32, _pid: i32, _uid: i32) -> binder::Result<()> {
-        counters::answered(INTERFACE, "acquireAudioSessionId");
+        atl_diag::answered(INTERFACE, "acquireAudioSessionId");
         Ok(())
     }
 
     fn r#releaseAudioSessionId(&self, _session: i32, _pid: i32) -> binder::Result<()> {
-        counters::answered(INTERFACE, "releaseAudioSessionId");
+        atl_diag::answered(INTERFACE, "releaseAudioSessionId");
         Ok(())
     }
 
@@ -181,7 +180,7 @@ impl IAudioFlingerService for AudioFlinger {
         request: Option<&CreateTrackRequest>,
     ) -> binder::Result<Option<CreateTrackResponse>> {
         let refused = || -> binder::Result<Option<CreateTrackResponse>> {
-            counters::refused(INTERFACE, "createTrack");
+            atl_diag::refused(INTERFACE, "createTrack");
             Err(StatusCode::BAD_VALUE.into())
         };
         let Some(request) = request else {
@@ -210,7 +209,7 @@ impl IAudioFlingerService for AudioFlinger {
             Ok(out) => out,
             Err(reason) => {
                 tracing::warn!(%reason, "createTrack: no PCM output");
-                counters::refused(INTERFACE, "createTrack.output");
+                atl_diag::refused(INTERFACE, "createTrack.output");
                 return refused();
             }
         };
@@ -228,7 +227,7 @@ impl IAudioFlingerService for AudioFlinger {
                 let region = match track::allocate(0, self.opts.break_cblk) {
                     Ok(region) => region,
                     Err(status) => {
-                        counters::refused(INTERFACE, "createTrack.region");
+                        atl_diag::refused(INTERFACE, "createTrack.region");
                         return Err(status.into());
                     }
                 };
@@ -242,7 +241,7 @@ impl IAudioFlingerService for AudioFlinger {
                 ) {
                     Ok(server) => (frames, region, server),
                     Err(status) => {
-                        counters::refused(INTERFACE, "createTrack.region");
+                        atl_diag::refused(INTERFACE, "createTrack.region");
                         return Err(status.into());
                     }
                 }
@@ -257,27 +256,27 @@ impl IAudioFlingerService for AudioFlinger {
                 let region = match track::allocate(bytes, self.opts.break_cblk) {
                     Ok(region) => region,
                     Err(status) => {
-                        counters::refused(INTERFACE, "createTrack.region");
+                        atl_diag::refused(INTERFACE, "createTrack.region");
                         return Err(status.into());
                     }
                 };
                 match track::server_streaming(&region, frames, frame_bytes, track_rate) {
                     Ok(server) => (frames, region, server),
                     Err(status) => {
-                        counters::refused(INTERFACE, "createTrack.region");
+                        atl_diag::refused(INTERFACE, "createTrack.region");
                         return Err(status.into());
                     }
                 }
             }
         };
         if request.flags & AUDIO_OUTPUT_FLAG_FAST != 0 {
-            counters::refused(INTERFACE, "createTrack.FAST");
+            atl_diag::refused(INTERFACE, "createTrack.FAST");
         }
         let Some(name) = output::add_track(&out.mixer, server, session, channel_mask) else {
-            counters::refused(INTERFACE, "createTrack.mixer");
+            atl_diag::refused(INTERFACE, "createTrack.mixer");
             return refused();
         };
-        counters::answered(INTERFACE, "createTrack");
+        atl_diag::answered(INTERFACE, "createTrack");
         Ok(Some(CreateTrackResponse {
             r#flags: request.flags & !AUDIO_OUTPUT_FLAG_FAST,
             r#frameCount: frames as i64,

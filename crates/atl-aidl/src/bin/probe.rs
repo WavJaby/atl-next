@@ -6,9 +6,10 @@
 //! binder's on_transact must return the hook's SECURITY Status without running the method when it denies, and the method's result when it allows; the hook must see exactly
 //! `("getSerialPorts", Single("SERIAL_PORT"))`. Writing the interface token reaches libbinder's IPCThreadState, so this mode needs a driver: `xtask test parcel` runs it under binderd.
 
-//! `--outcomes <n0>,..,<n5>`: the aidl patch's reply hook (atl_diag::binder_reply): drives each outcome of [`OUTCOMES`] n_i times through local binders' on_transact; `xtask test parcel` counts the hook's stderr lines against the same numbers.
+//! `--outcomes <n0>,..,<n5>`: the aidl patch's reply hook (atl_diag::binder_reply): drives each outcome of [`OUTCOMES`] n_i times through local binders' on_transact, then writes the exact totals (atl_diag::flush_totals); `xtask test parcel` checks them against the same numbers.
 
 // the converter's rlibs, on the crate search path build.rs sets (no cargo dependency names them)
+extern crate atl_diag;
 extern crate atl_parcelables;
 extern crate binder;
 
@@ -170,6 +171,7 @@ fn outcomes(n: [u32; OUTCOMES]) -> Result<()> {
     for _ in 0..n[5] {
         send(&future, future_tx::r#complete, FLAG_ONEWAY, null)?;
     }
+    atl_diag::flush_totals();
     Ok(())
 }
 

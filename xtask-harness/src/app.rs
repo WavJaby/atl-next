@@ -1066,7 +1066,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             let want = format!("IAudioService.{method}");
             if !served
                 .iter()
-                .any(|c| c.kind == "answered" && c.name == want && c.count > 0)
+                .any(|c| c.outcome == "answered" && c.api == want && c.count > 0)
             {
                 whys.push(format!(
                     "soundpool: the audio service did not answer {method}"

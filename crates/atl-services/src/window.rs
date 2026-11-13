@@ -9,7 +9,7 @@
 //! its input channel's server end stays with the app: no close signal yet, a known gap). The frames come from one place, [`client_frames`] (relayout and `resized` alike): display and parent frame are the Task's bounds
 //! (freeform: WindowLayout.computeFrames sets the display frame from the window bounds), no insets (the desktop shows no system bars).
 //! finishDrawing: the post-draw SurfaceControl.Transaction goes unchanged to the app's composer (Session::finishDrawing; what is not modelled is listed there).
-//! Every other method keeps the stub's default body: counted (counters.rs) and answered UNKNOWN_TRANSACTION.
+//! Every other method keeps the stub's default body: counted by the reply hook (atl-diag) and answered UNKNOWN_TRANSACTION.
 
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex};
@@ -37,7 +37,6 @@ use crate::activity;
 use crate::packages::Permissions;
 use crate::tasks::{Placement, TaskId, TaskSize, Tasks};
 use crate::ui_agents::UiAgents;
-use atl_services_types::counters;
 use atl_services_wire::ui_agent::IUiAgent;
 
 /// The interface names counters use.
@@ -73,7 +72,7 @@ impl RegisteredAgent {
     /// The app's UI agent; None, counted under `call`, when the app registered no agent or it is not an IUiAgent.
     fn agent(&self, call: &str) -> Option<Strong<dyn IUiAgent>> {
         let Some(binder) = self.agents.get(self.uid) else {
-            counters::answered(
+            atl_diag::answered(
                 WINDOW_SESSION,
                 &format!("{call}: no UI agent registered for the app's uid"),
             );
@@ -82,7 +81,7 @@ impl RegisteredAgent {
         match binder.into_interface() {
             Ok(agent) => Some(agent),
             Err(e) => {
-                counters::answered(
+                atl_diag::answered(
                     WINDOW_SESSION,
                     &format!("{call}: registered UI agent is not an IUiAgent: {e:?}"),
                 );
@@ -97,7 +96,7 @@ impl RegisteredAgent {
         match agent.window_surface(title) {
             Ok(surface) => Some(surface),
             Err(e) => {
-                counters::answered(
+                atl_diag::answered(
                     WINDOW_SESSION,
                     &format!("relayout: UI agent refused the window surface: {e:?}"),
                 );
@@ -114,7 +113,7 @@ impl RegisteredAgent {
         match agent.window_position(layer_id, x, y) {
             Ok(()) => true,
             Err(e) => {
-                counters::answered(
+                atl_diag::answered(
                     WINDOW_SESSION,
                     &format!("relayout: UI agent refused the window position: {e:?}"),
                 );
@@ -136,7 +135,7 @@ impl RegisteredAgent {
             bounds.right - bounds.left,
             bounds.bottom - bounds.top,
         ) {
-            counters::answered(
+            atl_diag::answered(
                 WINDOW_SESSION,
                 &format!("relayout: UI agent refused the dim layer: {e:?}"),
             );
@@ -149,7 +148,7 @@ impl RegisteredAgent {
             return;
         };
         if let Err(e) = agent.task(task.raw()) {
-            counters::answered(
+            atl_diag::answered(
                 WINDOW_SESSION,
                 &format!("addToDisplayAsUser: UI agent refused the task: {e:?}"),
             );
@@ -164,7 +163,7 @@ impl RegisteredAgent {
         match agent.input_server(token, fd, flags) {
             Ok(()) => true,
             Err(e) => {
-                counters::answered(
+                atl_diag::answered(
                     WINDOW_SESSION,
                     &format!("addToDisplayAsUser: UI agent refused the input server end: {e:?}"),
                 );
@@ -179,7 +178,7 @@ impl RegisteredAgent {
             return;
         };
         if let Err(e) = agent.remove_input(token) {
-            counters::answered(
+            atl_diag::answered(
                 WINDOW_SESSION,
                 &format!("remove: UI agent refused the input removal: {e:?}"),
             );
@@ -194,7 +193,7 @@ impl RegisteredAgent {
         match agent.input_frame(token, [frame.left, frame.top, frame.right, frame.bottom]) {
             Ok(()) => true,
             Err(e) => {
-                counters::answered(
+                atl_diag::answered(
                     WINDOW_SESSION,
                     &format!("relayout: UI agent refused the input frame: {e:?}"),
                 );
@@ -268,7 +267,7 @@ impl IWindowManager for WindowManager {
     /// (ViewRootImpl.ensureTouchMode:7233-7242), and an error there is a RuntimeException in the app. No other app window shares this display process's input: accept.
     fn r#setInTouchMode(&self, _in_touch: bool, _display_id: i32) -> binder::Result<()> {
         // counted: the window gate's input stage requires this line (xtask window.rs touch_mode_check)
-        counters::answered(WINDOW_MANAGER, "setInTouchMode (answered)");
+        atl_diag::answered(WINDOW_MANAGER, "setInTouchMode (answered)");
         Ok(())
     }
 
@@ -328,7 +327,7 @@ fn size_of<C: Clone + PartialEq>(
     call: &str,
 ) -> binder::Result<TaskSize> {
     tasks.size(task).ok_or_else(|| {
-        counters::refused(
+        atl_diag::refused(
             WINDOW_SESSION,
             &format!("{call}: the window's Task has no size"),
         );
@@ -436,7 +435,7 @@ impl IWindowSession for Session {
         size_compat_scale: &mut Option<Vec<f32>>,
     ) -> binder::Result<i32> {
         let (Some(window), Some(attrs)) = (window, attrs) else {
-            counters::refused(
+            atl_diag::refused(
                 WINDOW_SESSION,
                 "addToDisplayAsUser: no window or LayoutParams",
             );
@@ -457,13 +456,13 @@ impl IWindowSession for Session {
         };
         let Some(task) = task else {
             if sub_window {
-                counters::refused(
+                atl_diag::refused(
                     WINDOW_SESSION,
                     "addToDisplayAsUser: the sub-window's token names no window of the session",
                 );
                 return Ok(ADD_BAD_SUBWINDOW_TOKEN);
             }
-            counters::refused(
+            atl_diag::refused(
                 WINDOW_SESSION,
                 "addToDisplayAsUser: the window's token names no activity's Task",
             );
@@ -524,7 +523,7 @@ impl IWindowSession for Session {
         ));
         // WMS dispatches the app's visibility to its windows (WindowState's app visibility): ViewRootImpl draws only while its app is visible, and it starts out not.
         if let Err(e) = window.r#dispatchAppVisibility(true) {
-            counters::answered(
+            atl_diag::answered(
                 WINDOW_SESSION,
                 &format!("addToDisplayAsUser: dispatchAppVisibility refused: {e:?}"),
             );
@@ -547,14 +546,14 @@ impl IWindowSession for Session {
         out_relayout_result: &mut Option<WindowRelayoutResult>,
     ) -> binder::Result<i32> {
         let Some(window) = window else {
-            counters::refused(WINDOW_SESSION, "relayout: no window");
+            atl_diag::refused(WINDOW_SESSION, "relayout: no window");
             return Err(StatusCode::BAD_VALUE.into());
         };
         let client = window.as_binder();
         let (first, pending, task, title) = {
             let mut windows = self.lock();
             let Some(record) = windows.iter_mut().find(|w| w.client == client) else {
-                counters::refused(WINDOW_SESSION, "relayout: window not added by this session");
+                atl_diag::refused(WINDOW_SESSION, "relayout: window not added by this session");
                 return Err(StatusCode::BAD_VALUE.into());
             };
             let first = !record.laid_out;
@@ -686,7 +685,7 @@ impl IWindowSession for Session {
         last_sync_seq_id: i32,
     ) -> binder::Result<()> {
         // one counter line per call: the resize and dialog gates count the served calls (`relayout_async_check`)
-        counters::answered(WINDOW_SESSION, "relayoutAsync");
+        atl_diag::answered(WINDOW_SESSION, "relayoutAsync");
         self.r#relayout(
             window,
             attrs,
@@ -705,7 +704,7 @@ impl IWindowSession for Session {
     /// without the windows lock. A window the session does not hold is nothing to remove (AOSP does nothing for an unknown window either).
     fn r#remove(&self, client_token: Option<&SpIBinder>) -> binder::Result<()> {
         let Some(token) = client_token else {
-            counters::refused(WINDOW_SESSION, "remove: no client token");
+            atl_diag::refused(WINDOW_SESSION, "remove: no client token");
             return Err(StatusCode::BAD_VALUE.into());
         };
         let (removed, layers, titles): (Vec<SpIBinder>, Vec<i32>, Vec<String>) = {
@@ -752,7 +751,7 @@ impl IWindowSession for Session {
             self.lock().iter().any(|x| x.client == client)
         });
         if !known {
-            counters::answered(WINDOW_SESSION, "finishDrawing: not this session's window");
+            atl_diag::answered(WINDOW_SESSION, "finishDrawing: not this session's window");
             return Ok(());
         }
         let Some(t) = post_draw.filter(|t| t.present) else {
@@ -762,7 +761,7 @@ impl IWindowSession for Session {
             return Ok(());
         };
         if let Err(e) = agent.post_draw_transaction(t) {
-            counters::answered(
+            atl_diag::answered(
                 WINDOW_SESSION,
                 &format!("finishDrawing: UI agent refused the post-draw transaction: {e:?}"),
             );
@@ -814,7 +813,7 @@ pub fn notify_resized(tasks: &Tasks<SpIBinder>, task: TaskId) -> usize {
         {
             Ok(window) => window,
             Err(e) => {
-                counters::answered(
+                atl_diag::answered(
                     WINDOW_SESSION,
                     &format!("resized: client is not an IWindow: {e:?}"),
                 );
@@ -840,7 +839,7 @@ pub fn notify_resized(tasks: &Tasks<SpIBinder>, task: TaskId) -> usize {
             false,
             None,
         ) {
-            counters::answered(WINDOW_SESSION, &format!("resized: IWindow refused: {e:?}"));
+            atl_diag::answered(WINDOW_SESSION, &format!("resized: IWindow refused: {e:?}"));
         }
     }
     clients.len()
@@ -856,10 +855,10 @@ mod tests {
     fn size_of_refuses_a_task_without_a_size() {
         let tasks = Tasks::<u32>::new(DisplayModel::default());
         let refused = |label: &str| {
-            counters::counts()
+            atl_diag::counts()
                 .into_iter()
-                .find(|c| c.0 == counters::Kind::Refused && c.2 == label)
-                .map(|c| c.3)
+                .find(|c| c.0 == atl_diag::REFUSED && c.1.ends_with(&format!(".{label}")))
+                .map(|c| c.2)
         };
         let label = "size-of-test: the window's Task has no size";
         assert_eq!(refused(label), None);

@@ -430,7 +430,7 @@ fn check_buffer(services: &str) -> Vec<String> {
     let all = counters(services);
     let tiers: Vec<&str> = all
         .iter()
-        .map(|c| c.name.as_str())
+        .map(|c| c.api.as_str())
         .filter(|n| n.contains(TIER_COUNTER))
         .collect();
     let mut whys = Vec::new();
@@ -439,7 +439,7 @@ fn check_buffer(services: &str) -> Vec<String> {
             "tier counters {tiers:?}, want only `{BUFFERED_COUNTER}`"
         ));
     }
-    if all.iter().any(|c| c.name.contains(TS_FALLBACK_COUNTER)) {
+    if all.iter().any(|c| c.api.contains(TS_FALLBACK_COUNTER)) {
         whys.push(format!(
             "`{TS_FALLBACK_COUNTER}` counted: a stamp left the clock's window"
         ));
@@ -855,19 +855,19 @@ mod tests {
 
     #[test]
     fn buffer_counters_say_buffered_and_no_fallback() {
-        let ok = "services: answered ISensorServer.accelerometer tier: buffered 2 at=100.006\n";
+        let ok = "diag: count answered ISensorServer.accelerometer tier: buffered 2 at=100.006\n";
         assert!(check_buffer(ok).is_empty());
-        let polled = "services: answered ISensorServer.accelerometer tier: buffered 1 at=100.006\n\
-                      services: answered ISensorServer.accelerometer tier: polled (no-data) 1 at=100.900\n";
+        let polled = "diag: first answered ISensorServer.accelerometer tier: buffered 1 at=100.006\n\
+                      diag: first answered ISensorServer.accelerometer tier: polled (no-data) 1 at=100.900\n";
         assert!(!check_buffer(polled).is_empty());
         let clock =
-            "services: answered ISensorServer.accelerometer tier: polled (clock) 1 at=100.900\n";
+            "diag: first answered ISensorServer.accelerometer tier: polled (clock) 1 at=100.900\n";
         assert!(
             !check_buffer(clock).is_empty(),
             "a stamp ahead fails at open"
         );
         let fallback = format!(
-            "{ok}services: answered ISensorServer.accelerometer ts-fallback 1 at=101.000\n"
+            "{ok}diag: first answered ISensorServer.accelerometer ts-fallback 1 at=101.000\n"
         );
         assert!(!check_buffer(&fallback).is_empty());
         assert!(!check_buffer("").is_empty(), "no tier counter at all");

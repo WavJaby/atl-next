@@ -8,6 +8,7 @@
 #![allow(non_snake_case)]
 
 // the converter's rlibs, on the crate search path build.rs sets (no cargo dependency names them)
+extern crate atl_diag;
 extern crate atl_parcelables;
 extern crate binder;
 
@@ -670,15 +671,16 @@ pub unsafe extern "C" fn Java_ParcelTruth_lastError(env: JniEnv, _class: JObject
     unsafe { java_string(env, &e) }
 }
 
-/// `static native String refused()`: atl-parcelables' refusal counters, `name=count` per line.
+/// `static native String refused()`: atl-parcelables' refusal counts (atl-diag `refused-parcel`), `name=count` per line.
 ///
 /// # Safety
 /// Called by ART as that native method.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_ParcelTruth_refused(env: JniEnv, _class: JObject) -> JObject {
-    let s: String = atl_parcelables::refused()
+    let s: String = atl_diag::counts()
         .iter()
-        .map(|(k, v)| format!("{k}={v}\n"))
+        .filter(|(outcome, _, _)| outcome == atl_diag::REFUSED_PARCEL)
+        .map(|(_, k, v)| format!("{k}={v}\n"))
         .collect();
     // SAFETY: ART's JNIEnv
     unsafe { java_string(env, &s) }

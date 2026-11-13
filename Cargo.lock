@@ -141,7 +141,6 @@ dependencies = [
  "atl-bridgegen",
  "atl-platform-ui",
  "atl-service-view",
- "atl-services-types",
  "atl-services-wire",
  "rustix",
  "tracing",
@@ -271,6 +270,9 @@ dependencies = [
 [[package]]
 name = "atl-diag"
 version = "0.0.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "atl-egl-driver"
@@ -659,6 +661,7 @@ dependencies = [
  "atl-android-paths",
  "atl-bridgegen",
  "atl-broker",
+ "atl-diag",
  "atl-gralloc",
  "atl-gralloc-dmabuf",
  "atl-libgui-parcel",
@@ -690,7 +693,6 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "atl-bridgegen",
- "atl-services-types",
  "rustix",
 ]
 
@@ -2677,6 +2679,7 @@ dependencies = [
  "atl-broker",
  "atl-bwrap",
  "atl-cpu-pressure",
+ "atl-diag",
  "atl-gralloc",
  "atl-layout",
  "atl-native-bridge",

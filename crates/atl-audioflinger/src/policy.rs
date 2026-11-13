@@ -6,7 +6,6 @@ use atl_audioflinger_stubs::aidl::android::media::IAudioPolicyService::{
     BnAudioPolicyService, IAudioPolicyService,
 };
 use atl_audioflinger_stubs::aidl::android::media::IAudioPolicyServiceClient::IAudioPolicyServiceClient;
-use atl_services_types::counters;
 use binder::{BinderFeatures, Interface, SpIBinder, Strong};
 
 use crate::flinger::output_handle;
@@ -24,7 +23,7 @@ impl Interface for AudioPolicy {}
 impl IAudioPolicyService for AudioPolicy {
     /// AudioPolicyService::getOutput: the one output, for every stream (no routing policy yet).
     fn r#getOutput(&self, _stream: AudioStreamType) -> binder::Result<i32> {
-        counters::answered(INTERFACE, "getOutput");
+        atl_diag::answered(INTERFACE, "getOutput");
         Ok(output_handle())
     }
 
@@ -33,7 +32,7 @@ impl IAudioPolicyService for AudioPolicy {
         &self,
         _client: Option<&Strong<dyn IAudioPolicyServiceClient>>,
     ) -> binder::Result<()> {
-        counters::answered(INTERFACE, "registerClient");
+        atl_diag::answered(INTERFACE, "registerClient");
         Ok(())
     }
 }

@@ -2,7 +2,7 @@
 //! `xtask test window`: the window path, one stage at a time. Stage `resume` (M3 plan step 1): the window fixture (xtask-harness/testdata/window: a software activity painting four solid colours)
 //! is started the Android way by atld, as `xtask test app` starts its fixture; the services send ResumeActivityItem after LaunchActivityItem (activity.rs), so ActivityThread runs onResume.
 //! Pass: the stage's marker is logged, and the app neither logs FATAL EXCEPTION, nor dies, nor waits on a service nothing serves ([`UNSERVED_WAIT`]: a hang shows only as that line) within [`WINDOW_MS`] after it. The app's log lines and the services' counter lines carry the same
-//! wall clock (logcat's first field; `at=` on a counter line, atl_services_types::counters), so every counted call is printed as before or after the marker, with its offset.
+//! wall clock (logcat's first field; `at=` on a counter line, atl-diag), so every counted call is printed as before or after the marker, with its offset.
 //! Always printed: the counters before the marker, the calls after it, the services' crash reports and the app's log after it; on failure also the atld, app and services log tails.
 //! `--self-test` checks the verdict on synthetic logs: a crash or a death inside the window fails, one just past it does not, a missing marker and an atld exit fail.
 //! Stage `frames` (M3 slice 5) runs the same verdict over its longer window, then two sub-gates on the fixture's frames: (a) the first frame reaches the compositor and its pixels are the
@@ -25,7 +25,7 @@ use atl_layout::Layout;
 use atl_services_types::display_model::DisplayModel;
 
 use crate::atld_run::{
-    Counter, Event, MS_PER_S, Package, Run, Runtime, events, parse_stamp, run_display, totals,
+    Counter, Event, MS_PER_S, Package, Run, Runtime, events, parse_stamp, run_display, show, totals,
 };
 use crate::composer::{fnv1a64, word};
 use crate::gles2_fixture;
@@ -620,11 +620,7 @@ fn before(all: &[Event], at_ms: u64) -> Vec<Counter> {
     totals(all.iter().filter(|e| e.at_ms < at_ms))
 }
 
-fn show(c: &Counter) -> String {
-    format!("{} {} x{}", c.kind, c.name, c.count)
-}
-
-/// The counters before the marker (their totals), then each counted call from the marker on, with its offset from it.
+/// The counters before the marker (their totals), then each counted line from the marker on, with its offset from it.
 fn print_calls(all: &[Event], marked: u64) {
     for c in before(all, marked) {
         println!("window: before onResume: {}", show(&c));
@@ -633,8 +629,8 @@ fn print_calls(all: &[Event], marked: u64) {
         println!(
             "window: +{} ms after onResume: {} {} (total {})",
             e.at_ms - marked,
-            e.counter.kind,
-            e.counter.name,
+            e.counter.outcome,
+            e.counter.api,
             e.counter.count
         );
     }
@@ -854,7 +850,7 @@ fn run_survives_check(
     }
 }
 
-/// The fixture's onNewIntent line (window Main.java) for Start's second start, the services' delivery line (activity_task.rs send) and their refusal count (counters.rs).
+/// The fixture's onNewIntent line (window Main.java) for Start's second start, the services' delivery line (activity_task.rs send) and their refusal count (atl-diag).
 const NEW_INTENT_APP: &str = "AtlWindow: onNewIntent reached again=true";
 const NEW_INTENT_SERVICES: &str = "services: activity new intent to com.example.atlwindow.Main ";
 const START_REFUSED: &str = "refused IActivityTaskManager.startActivity";
@@ -2365,7 +2361,7 @@ mod tests {
     fn relayout_async_fails_on_an_unserved_call() {
         assert!(relayout_async_check(RESIZE_SERVICES).is_ok());
         let unserved = format!(
-            "{RESIZE_SERVICES}services: unimplemented IWindowSession.relayoutAsync 1 at=1794093338.966\n"
+            "{RESIZE_SERVICES}diag: first unimplemented IWindowSession.relayoutAsync 1 at=1794093338.966\n"
         );
         assert!(relayout_async_check(&unserved).is_err());
     }
@@ -2432,23 +2428,19 @@ mod tests {
     /// The counters before the marker are totals; the calls from it on keep their offsets.
     #[test]
     fn calls_split_at_the_marker() {
+        let counter = |count| Counter {
+            outcome: "unimplemented".into(),
+            api: "IA.m".into(),
+            count,
+            exact: false,
+        };
         let ev = |at_ms, count| Event {
             at_ms,
-            counter: Counter {
-                kind: "unimplemented".into(),
-                name: "IA.m".into(),
-                count,
-            },
+            counter: counter(count),
+            cause: None,
         };
-        let all = [ev(900, 1), ev(1_000, 2), ev(1_004, 3)];
-        assert_eq!(
-            before(&all, 1_000),
-            [Counter {
-                kind: "unimplemented".into(),
-                name: "IA.m".into(),
-                count: 1,
-            }]
-        );
+        let all = [ev(900, 1), ev(1_000, 2), ev(1_004, 4)];
+        assert_eq!(before(&all, 1_000), [counter(1)]);
         let offsets: Vec<u64> = all
             .iter()
             .filter(|e| e.at_ms >= 1_000)
@@ -2622,7 +2614,7 @@ mod tests {
     #[test]
     fn lifecycle_check_tells_the_three_lives_apart() {
         let steps: Result<Steps, String> = Ok(((6, 4), (3, 1)));
-        let count = |name: &str, n: u32| format!("services: answered I.{name} {n} at=1\n");
+        let count = |name: &str, n: u32| format!("diag: count answered I.{name} {n} at=1.000\n");
         let create = format!("{CREATE_LINE}\n");
         let grown = format!("{LAYOUT_LINE}6x4 x\n");
         let told = |dp: i32| format!("{CHANGED_LINE} screenWidthDp={dp}\n");
@@ -2634,7 +2626,7 @@ mod tests {
         assert!(check(&twice, &sent, Lifecycle::Kept).is_err());
 
         let relaunched = format!(
-            "{}services: answered {RELAUNCHED_COUNTER}1 at=1\n",
+            "{}diag: first answered {RELAUNCHED_COUNTER}1 at=1.000\n",
             count(RELAUNCH_COUNTER, 1)
         );
         assert!(check(&twice, &relaunched, Lifecycle::Relaunches).is_ok());

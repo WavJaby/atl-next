@@ -8,7 +8,6 @@ use binder::binder_impl::{BorrowedParcel, TransactionCode};
 use binder::{BinderFeatures, Interface, SpIBinder, StatusCode};
 
 use crate::sensor::{Channel, SensorHub};
-use atl_services_types::counters;
 use atl_services_wire::sensor::MODE_HAL_BYPASS_REPLAY_DATA_INJECTION;
 use atl_services_wire::sensor_wire::{
     BnSensorEventConnection, BnSensorServer, CREATE_SENSOR_EVENT_CONNECTION, DESTROY,
@@ -82,7 +81,7 @@ impl IHandWritten for SensorServer {
                         } else {
                             "createSensorEventConnection: invalid mode"
                         };
-                        counters::refused(SERVER, what);
+                        atl_diag::refused(SERVER, what);
                         return reply.write(&None::<SpIBinder>);
                     }
                 };
@@ -111,7 +110,7 @@ impl IHandWritten for SensorServer {
                 reply.write(&i32::from(self.hub.hal_bypass_injection()))
             }
             _ => {
-                counters::count_unimplemented(SERVER, &format!("code {code}"));
+                atl_diag::unimplemented(SERVER, &format!("code {code}"));
                 Err(StatusCode::UNKNOWN_TRANSACTION)
             }
         }
@@ -175,7 +174,7 @@ impl IConnection for EventConnection {
             }
             _ => {
                 // FLUSH_SENSOR (flush-complete meta events), CONFIGURE_CHANNEL (direct channels only: INVALID_OPERATION in AOSP too)
-                counters::count_unimplemented(CONNECTION, &format!("code {code}"));
+                atl_diag::unimplemented(CONNECTION, &format!("code {code}"));
                 Err(StatusCode::UNKNOWN_TRANSACTION)
             }
         }

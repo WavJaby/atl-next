@@ -35,7 +35,6 @@ use crate::tasks::{TaskId, Tasks};
 use crate::token;
 use atl_parcelables::android::content::pm::{ActivityInfo, ConfigurationInfo};
 use atl_parcelables::android::content::res::Configuration;
-use atl_services_types::counters;
 
 const ATM: &str = "IActivityTaskManager";
 
@@ -240,7 +239,7 @@ impl ActivityTasks {
             let state = if now { "settled" } else { "unsettled" };
             log(format_args!(
                 "activity {state} at={}",
-                counters::wall_stamp()
+                atl_diag::wall_stamp()
             ));
         }
     }
@@ -255,7 +254,7 @@ impl ActivityTasks {
         Some(match step {
             Step::Launch(launch) => {
                 let Some(p) = self.packages.by_name(&launch.package) else {
-                    counters::answered(ATM, "launch of a package not installed");
+                    atl_diag::answered(ATM, "launch of a package not installed");
                     return None;
                 };
                 ClientTransactionItem::LaunchActivity(Box::new(launch_item(
@@ -311,7 +310,7 @@ impl ActivityTasks {
                 "activity send {} {} at={}",
                 step_names(&command.steps),
                 command.owner.component,
-                counters::wall_stamp()
+                atl_diag::wall_stamp()
             ));
             if command
                 .steps
@@ -322,7 +321,7 @@ impl ActivityTasks {
                 log(format_args!(
                     "activity new intent to {} at={}",
                     command.owner.component,
-                    counters::wall_stamp()
+                    atl_diag::wall_stamp()
                 ));
             }
             let items = command
@@ -455,14 +454,14 @@ impl ActivityTasks {
                 permission_request::dismissed_result(request, calling_package, target_sdk, |p| {
                     self.permissions.check(calling_uid, Some(p))
                 });
-            counters::answered(
+            atl_diag::answered(
                 ATM,
                 "startActivity REQUEST_PERMISSIONS (no permission controller: dismissed, P1)",
             );
             log(format_args!(
                 "activity permission request from {calling_package} answered as dismissed (no permission controller) owed={} at={}",
                 owed.is_some(),
-                counters::wall_stamp()
+                atl_diag::wall_stamp()
             ));
             let commands = answer_owed(
                 &mut m,
@@ -514,7 +513,7 @@ impl ActivityTasks {
             return Ok(activity_start::START_CANCELED);
         };
         if let (Start::Reuse { .. }, false) = (start, reuse) {
-            counters::refused(ATM, "startActivity (reuse refused: --no-new-intent)");
+            atl_diag::refused(ATM, "startActivity (reuse refused: --no-new-intent)");
             commands.extend(cancel_owed(&mut m, owed.take().as_ref()));
             self.note_settle(&m);
             self.send(commands);
@@ -594,7 +593,7 @@ impl ActivityTasks {
         };
         log(format_args!(
             "activity resumed {component} at={}",
-            counters::wall_stamp()
+            atl_diag::wall_stamp()
         ));
         let commands = m.resumed(token);
         self.note_settle(&m);
@@ -614,7 +613,7 @@ impl ActivityTasks {
             .unwrap_or_default();
         log(format_args!(
             "activity paused {component} at={}",
-            counters::wall_stamp()
+            atl_diag::wall_stamp()
         ));
         let commands = m.paused(token);
         self.note_settle(&m);
@@ -634,7 +633,7 @@ impl ActivityTasks {
             .unwrap_or_default();
         log(format_args!(
             "activity stopped {component} at={}",
-            counters::wall_stamp()
+            atl_diag::wall_stamp()
         ));
         let commands = m.stopped(token);
         self.note_settle(&m);
@@ -650,7 +649,7 @@ impl ActivityTasks {
         log(format_args!(
             "activity task {} visible={visible} at={}",
             task.raw(),
-            counters::wall_stamp()
+            atl_diag::wall_stamp()
         ));
         let commands = m.set_visible(task, visible);
         self.note_settle(&m);
@@ -674,7 +673,7 @@ impl ActivityTasks {
             .unwrap_or_default();
         log(format_args!(
             "activity finish {component} code={code} at={}",
-            counters::wall_stamp()
+            atl_diag::wall_stamp()
         ));
         match m.finish(token, result) {
             Some(commands) => {

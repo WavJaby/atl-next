@@ -13,6 +13,8 @@
 
 // the converter's rlibs, on the crate search path build.rs sets (no cargo dependency names them)
 #[cfg(feature = "converter")]
+extern crate atl_diag;
+#[cfg(feature = "converter")]
 extern crate atl_parcelables;
 #[cfg(feature = "converter")]
 extern crate binder;

@@ -754,10 +754,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if let Some(l) = last_counters(&app) {
         println!("{l}");
     }
-    for l in app
-        .lines()
-        .filter(|l| l.contains("services: unimplemented"))
-    {
+    for l in app.lines().filter(|l| l.contains("diag: ")) {
         println!("composer: counted {l}");
     }
     for l in counter_lines(&services) {

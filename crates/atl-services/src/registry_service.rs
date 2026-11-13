@@ -20,7 +20,6 @@ use crate::ui_agents::UiAgents;
 use atl_services_types::compositor_registry::{
     DESCRIPTOR, GET_COMPOSER, REGISTER, SET_BOUNDS, SET_DISPLAY, TASK_INFO,
 };
-use atl_services_types::counters;
 use atl_services_types::display_model::DisplayModel;
 use atl_services_types::permission::{SHELL_UID, SYSTEM_UID};
 
@@ -103,7 +102,7 @@ fn on_transact(
         return reply.write(&info.package);
     }
     if code != REGISTER {
-        counters::count_unimplemented(INTERFACE, &format!("code {code}"));
+        atl_diag::unimplemented(INTERFACE, &format!("code {code}"));
         return Err(StatusCode::UNKNOWN_TRANSACTION);
     }
     let ui_agent: SpIBinder = data.read()?;

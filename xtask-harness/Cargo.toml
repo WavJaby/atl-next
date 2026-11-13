@@ -19,6 +19,7 @@ atl-layout = { path = "../crates/atl-layout" }
 atl-native-bridge = { path = "../crates/atl-native-bridge" }
 atl-platform-host = { path = "../crates/atl-platform-host" }
 atl-property-service = { path = "../crates/atl-property-service" }
+atl-diag = { path = "../crates/atl-diag", features = ["serde"] }
 atl-services-types = { path = "../crates/atl-services-types" }
 clap.workspace = true
 object.workspace = true

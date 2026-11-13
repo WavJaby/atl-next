@@ -20,7 +20,7 @@ pub mod parcel;
 pub mod parts;
 pub mod squash;
 
-pub use opaque::{NICHE, Niche, refuse, refused};
+pub use opaque::{NICHE, Niche, refuse};
 
 /// The generated items: Java package and class names as Rust paths (nested classes `Outer_Inner`), hence the naming allowances.
 #[allow(non_camel_case_types, non_snake_case)]

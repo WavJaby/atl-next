@@ -10,7 +10,6 @@ use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, Thread
 
 use crate::packages::Permissions;
 use crate::ui_agents::UiAgents;
-use atl_services_types::counters;
 use atl_services_types::input_devices::{
     KEYBOARD, POINTER, SOURCE_KEYBOARD, SOURCE_MOUSE, SOURCE_TOUCHPAD, SOURCE_TOUCHSCREEN,
     TOUCHPAD, TOUCHSCREEN, VIRTUAL_KEYBOARD,
@@ -135,7 +134,7 @@ impl IInputManager for InputManager {
             >,
         >,
     ) -> binder::Result<()> {
-        counters::answered(INTERFACE, "registerInputDevicesChangedListener (not kept)");
+        atl_diag::answered(INTERFACE, "registerInputDevicesChangedListener (not kept)");
         Ok(())
     }
 
@@ -154,7 +153,7 @@ impl IInputManager for InputManager {
             .get(ThreadState::get_calling_uid())
             .and_then(|b| b.into_interface::<dyn IUiAgent>().ok());
         let (Some(icon), Some(agent)) = (icon, agent) else {
-            counters::answered(INTERFACE, "setPointerIcon (no icon or no UI agent)");
+            atl_diag::answered(INTERFACE, "setPointerIcon (no icon or no UI agent)");
             return Ok(false);
         };
         Ok(agent.pointer_icon(icon.kind).is_ok())

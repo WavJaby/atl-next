@@ -15,7 +15,7 @@ use atl_layout::Layout;
 use atl_services_types::display_model::DisplayModel;
 use atl_services_types::native_libs::SupportedAbi;
 use atl_services_types::packages::Library;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::gate_goals::{
     ANGLE_FRONTS, EXTRACTOR_PLUGINS, GL_FRONTS, NB_EXE, NB_GUEST_LIBS, NB_LINKER, NDK_PROXIED,
@@ -1549,106 +1549,14 @@ impl Runtime {
     }
 }
 
-/// One service counter: its kind (`unimplemented`, `answered`, `refused`, `sent`), its name and its total.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Counter {
-    pub kind: String,
-    pub name: String,
-    pub count: u64,
-}
+// The `diag:` counter lines' one parser (the services, the app processes and atld read the same lines).
+pub use atl_diag::summary::{
+    Counter, Event, MS_PER_S, counter_lines, counters, events, parse_stamp, show, totals,
+};
 
-/// One counter line of the services' log: the counter's running count after that call, and the wall-clock time (ms since the epoch) the call was counted at.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Event {
-    pub at_ms: u64,
-    pub counter: Counter,
-}
-
-/// Milliseconds per second: the unit of a stamp's `secs.mmm`, logcat's and the services' wall clock.
-pub const MS_PER_S: u64 = 1_000;
-/// Digits after the point of a stamp: milliseconds, as logcat prints them.
-const STAMP_DIGITS: usize = 3;
-
-/// A wall-clock stamp `secs.mmm` (logcat's first field, a counter line's `at=`) as milliseconds since the epoch.
-pub fn parse_stamp(text: &str) -> Option<u64> {
-    let (secs, frac) = text.split_once('.')?;
-    if frac.len() != STAMP_DIGITS || !frac.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    Some(secs.parse::<u64>().ok()? * MS_PER_S + frac.parse::<u64>().ok()?)
-}
-
-/// A counter line without its ` at=<stamp>`: the text the exact-match checks compare.
+/// A counter line without its ` at=<stamp>` (and any cause after it): the text the exact-match checks compare.
 pub fn without_stamp(line: &str) -> &str {
     line.rsplit_once(" at=").map_or(line, |(head, _)| head)
-}
-
-/// Every counter line of the services' log, in log order: `services: unimplemented|answered|refused|sent <interface>.<method> <n> at=<stamp>`
-/// (atl_services_types::counters), and `parcelables: refused <what> <n> at=<stamp>` (atl_parcelables `refuse`). A line without a parsable stamp is not one.
-pub fn events(services_log: &str) -> Vec<Event> {
-    const KINDS: [(&str, &str); 5] = [
-        ("services: unimplemented ", "unimplemented"),
-        ("services: answered ", "answered"),
-        ("services: refused ", "refused"),
-        ("services: sent ", "sent"),
-        ("parcelables: refused ", "refused"),
-    ];
-    let mut out = Vec::new();
-    for line in services_log.lines() {
-        for (prefix, kind) in KINDS {
-            let Some((body, stamp)) = line
-                .strip_prefix(prefix)
-                .and_then(|rest| rest.rsplit_once(" at="))
-            else {
-                continue;
-            };
-            let Some(at_ms) = parse_stamp(stamp) else {
-                continue;
-            };
-            let Some((name, n)) = body.rsplit_once(' ') else {
-                continue;
-            };
-            let Ok(count) = n.parse::<u64>() else {
-                continue;
-            };
-            out.push(Event {
-                at_ms,
-                counter: Counter {
-                    kind: kind.to_owned(),
-                    name: name.to_owned(),
-                    count,
-                },
-            });
-        }
-    }
-    out
-}
-
-/// The last count of each (kind, name) among `events`: the totals. The services are killed at the end of a run and print no summary, so the last line per name is the total.
-pub fn totals<'a>(events: impl IntoIterator<Item = &'a Event>) -> Vec<Counter> {
-    let mut last = std::collections::BTreeMap::new();
-    for e in events {
-        last.insert(
-            (e.counter.kind.clone(), e.counter.name.clone()),
-            e.counter.count,
-        );
-    }
-    last.into_iter()
-        .map(|((kind, name), count)| Counter { kind, name, count })
-        .collect()
-}
-
-/// The services' counters, from their log: the [`totals`] of [`events`].
-pub fn counters(services_log: &str) -> Vec<Counter> {
-    totals(&events(services_log))
-}
-
-/// [`counters`] as `<kind> <name> x<total>` lines.
-pub fn counter_lines(services_log: &str) -> Vec<String> {
-    counters(services_log)
-        .into_iter()
-        .map(|c| format!("{} {} x{}", c.kind, c.name, c.count))
-        .collect()
 }
 
 /// The line activity_task.rs writes when an app reports its resume (`activityResumed`, sent after onResume returns): `services: activity resumed <class> at=<stamp>`.
@@ -1744,29 +1652,15 @@ mod tests {
         }
     }
 
-    /// Every counter kind, the last count per name wins, a name with spaces keeps them, other lines are ignored, and a counter line without a stamp is not one.
+    /// The re-exported parser reads the writer's lines (atl-diag's own tests cover the policy); other lines are ignored.
     #[test]
-    fn counter_lines_take_the_last_count_of_each_kind() {
+    fn counter_lines_read_diag_lines() {
         let log = "services: ready\n\
-                   services: unimplemented IActivityManager.getProcessLimit 1 at=100.000\n\
-                   parcelables: refused android.content.Intent.extras 1 at=100.001\n\
-                   services: unimplemented IActivityManager.getProcessLimit 2 at=100.002\n\
-                   parcelables: refused android.os.Bundle (value type) 1 at=100.003\n\
-                   parcelables: refused android.content.Intent.extras 2 at=100.004\n\
-                   services: Failure reporting\n\
-                   services: sent IInputMethodManager.IInputMethod.bindInput 1 at=100.005\n\
-                   services: answered IInputMethodManager.addClient 1 at=100.006\n\
-                   services: answered IInputMethodManager.addClient 2 at=100.007\n\
-                   services: unimplemented IPackageManager.getMoveStatus 9\n";
+                   diag: first unimplemented IActivityManager.getProcessLimit 1 at=100.000\n\
+                   diag: count unimplemented IActivityManager.getProcessLimit 2 at=100.002\n";
         assert_eq!(
             counter_lines(log),
-            [
-                "answered IInputMethodManager.addClient x2",
-                "refused android.content.Intent.extras x2",
-                "refused android.os.Bundle (value type) x1",
-                "sent IInputMethodManager.IInputMethod.bindInput x1",
-                "unimplemented IActivityManager.getProcessLimit x2",
-            ]
+            ["unimplemented IActivityManager.getProcessLimit x>=2"]
         );
         assert!(counter_lines("nothing\n").is_empty());
     }

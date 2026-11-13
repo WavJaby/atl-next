@@ -69,52 +69,58 @@ const OUTCOMES: [(&str, &str, u32); 6] = [
     ("exception:ILLEGAL_STATE", "IAndroidFuture.complete", 6),
 ];
 /// The cause on each BAD_VALUE line: the refusal atl-parcelables' AndroidFuture codec makes of a failed future.
-const DECODE_CAUSE: &str = " cause=com.android.internal.infra.AndroidFuture (failed)";
+const DECODE_CAUSE: &str = "com.android.internal.infra.AndroidFuture (failed)";
 
 /// `--outcomes` argument: the call counts of [`OUTCOMES`].
 fn outcome_arg() -> String {
     OUTCOMES.map(|(_, _, n)| n.to_string()).join(",")
 }
 
-/// Failures of the reply-hook run: a key whose line count differs from its calls, a BAD_VALUE line without its cause, a hook line of no expected key. Hook lines: `services: <outcome> <api> <n> at=<stamp>[ cause=..]` with outcome `unimplemented`, `exception:*`, `status:*`.
+/// Whether an outcome is one the reply hook writes (atl-diag `outcome`), not a hand-written count.
+fn hook_outcome(outcome: &str) -> bool {
+    outcome == atl_diag::UNIMPLEMENTED
+        || outcome.starts_with("exception:")
+        || outcome.starts_with("status:")
+}
+
+/// Failures of the reply-hook run, read from the probe's `diag:` lines (it flushes exact totals on exit): a key whose exact total differs from its calls (or has none), a BAD_VALUE line without
+/// its cause, a hook key that is not expected.
 fn outcome_verdict(stderr: &str) -> Vec<String> {
-    let hook: Vec<&str> = stderr
-        .lines()
-        .filter_map(|l| l.strip_prefix("services: "))
-        .filter(|l| {
-            l.starts_with("unimplemented ")
-                || l.starts_with("exception:")
-                || l.starts_with("status:")
-        })
+    let events: Vec<_> = crate::atld_run::events(stderr)
+        .into_iter()
+        .filter(|e| hook_outcome(&e.counter.outcome))
         .collect();
+    let totals = crate::atld_run::totals(&events);
     let mut fails = Vec::new();
-    let mut matched = 0;
     for (outcome, api, want) in OUTCOMES {
-        let prefix = format!("{outcome} {api} ");
-        let lines: Vec<&&str> = hook.iter().filter(|l| l.starts_with(&prefix)).collect();
-        matched += lines.len();
-        if lines.len() != want as usize {
+        let got = totals.iter().find(|c| c.outcome == outcome && c.api == api);
+        if !got.is_some_and(|c| c.exact && c.count == u64::from(want)) {
             fails.push(format!(
-                "reply hook: {outcome} {api}: {} lines, {want} calls",
-                lines.len()
+                "reply hook: {outcome} {api}: {got:?}, want exactly {want} calls"
             ));
         }
-        if outcome == "status:BAD_VALUE" && lines.iter().any(|l| !l.ends_with(DECODE_CAUSE)) {
+        let lacks_cause = events.iter().any(|e| {
+            e.counter.outcome == outcome
+                && e.counter.api == api
+                && !e.counter.exact
+                && e.cause.as_deref() != Some(DECODE_CAUSE)
+        });
+        if outcome == "status:BAD_VALUE" && lacks_cause {
             fails.push(format!(
-                "reply hook: {outcome} {api}: a line lacks `{DECODE_CAUSE}`"
+                "reply hook: {outcome} {api}: a line lacks cause `{DECODE_CAUSE}`"
             ));
         }
     }
-    if matched != hook.len() {
-        fails.push(format!(
-            "reply hook: {} lines of no expected key: {:?}",
-            hook.len() - matched,
-            hook.iter()
-                .filter(|l| !OUTCOMES
-                    .iter()
-                    .any(|(o, a, _)| l.starts_with(&format!("{o} {a} "))))
-                .collect::<Vec<_>>()
-        ));
+    let stray: Vec<_> = totals
+        .iter()
+        .filter(|c| {
+            !OUTCOMES
+                .iter()
+                .any(|(o, a, _)| c.outcome == *o && c.api == *a)
+        })
+        .collect();
+    if !stray.is_empty() {
+        fails.push(format!("reply hook: keys not expected: {stray:?}"));
     }
     fails
 }
@@ -298,8 +304,8 @@ pub fn truth_verdict(
     (passes, fails)
 }
 
-/// The line `atl_parcelables::refuse` writes to stderr for the Intent ClipData refusal that ParcelTruth's `self-test:refusal` provokes (once): `parcelables: refused <what> <n>`.
-const REFUSAL_LINE: &str = "parcelables: refused android.content.Intent.clipData 1";
+/// The line `atl_parcelables::refuse` writes to stderr (atl-diag first hit) for the Intent ClipData refusal that ParcelTruth's `self-test:refusal` provokes (once).
+const REFUSAL_LINE: &str = "diag: first refused-parcel android.content.Intent.clipData 1";
 
 /// A failure message when the refusal of the self-test is missing from the driver's stderr: refusals that show up only in a counter nobody prints are the failure this guards.
 fn refusal_logged(stderr: &str) -> Option<String> {
@@ -420,7 +426,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         ));
     } else if hook_fails.is_empty() {
         println!(
-            "parcel: pass reply hook ({} outcomes, each counted once per call)",
+            "parcel: pass reply hook ({} outcomes, each exit total equal to its calls)",
             OUTCOMES.len()
         );
     }
@@ -474,37 +480,44 @@ mod tests {
         assert_eq!(verdict(&ok, &(false, "other".into())).len(), 1);
     }
 
-    /// The reply-hook verdict: exact lines pass; one line short, one doubled into another key, a missing cause, and a stray hook line each fail.
+    /// The reply-hook verdict: the policy's lines (powers of two, then the exit totals) pass; a missing total, a wrong total, a missing cause, and a stray key each fail.
     #[test]
     fn outcome_verdicts() {
         let mut exact = String::from("noise\n");
         for (o, a, n) in OUTCOMES {
-            for i in 1..=n {
+            for i in (1..=n).filter(|i| i.is_power_of_two()) {
+                let kind = if i == 1 { "first" } else { "count" };
                 let cause = if o == "status:BAD_VALUE" {
-                    DECODE_CAUSE
+                    format!(" cause={DECODE_CAUSE}")
                 } else {
-                    ""
+                    String::new()
                 };
-                exact += &format!("services: {o} {a} {i} at=1.000{cause}\n");
+                exact += &format!("diag: {kind} {o} {a} {i} at=1.000{cause}\n");
             }
+        }
+        for (o, a, n) in OUTCOMES {
+            exact += &format!("diag: total {o} {a} {n} first=1.000\n");
         }
         assert!(
             outcome_verdict(&exact).is_empty(),
             "{:?}",
             outcome_verdict(&exact)
         );
-        let short = exact.replacen(
-            "services: exception:SECURITY ISerialManager.getSerialPorts 1 at=1.000\n",
+        let no_total = exact.replacen(
+            "diag: total exception:SECURITY ISerialManager.getSerialPorts 1 first=1.000\n",
             "",
             1,
         );
-        assert_eq!(outcome_verdict(&short).len(), 1);
-        let doubled =
-            exact.clone() + "services: unimplemented ISerialManager.openSerialPort 3 at=1.000\n";
-        assert_eq!(outcome_verdict(&doubled).len(), 1);
-        let no_cause = exact.replacen(DECODE_CAUSE, "", 1);
+        assert_eq!(outcome_verdict(&no_total).len(), 1);
+        let wrong = exact.replacen(
+            "diag: total unimplemented ISerialManager.openSerialPort 2 ",
+            "diag: total unimplemented ISerialManager.openSerialPort 3 ",
+            1,
+        );
+        assert_eq!(outcome_verdict(&wrong).len(), 1);
+        let no_cause = exact.replacen(&format!(" cause={DECODE_CAUSE}"), "", 1);
         assert_eq!(outcome_verdict(&no_cause).len(), 1);
-        let stray = exact + "services: status:DEAD_OBJECT IFoo.bar 1 at=1.000\n";
+        let stray = exact + "diag: first status:DEAD_OBJECT IFoo.bar 1 at=1.000\n";
         assert_eq!(outcome_verdict(&stray).len(), 1);
         assert_eq!(outcome_arg(), "1,2,3,4,5,6");
     }
@@ -519,7 +532,8 @@ mod tests {
         assert!(refusal_logged("").is_some());
         assert_eq!(refusal_logged(&format!("{REFUSAL_LINE} at=1.000\n")), None);
         assert!(
-            refusal_logged("parcelables: refused android.content.Intent.clipData 2\n").is_some()
+            refusal_logged("diag: count refused-parcel android.content.Intent.clipData 2\n")
+                .is_some()
         );
     }
 

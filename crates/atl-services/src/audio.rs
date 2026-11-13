@@ -15,7 +15,6 @@ use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, Thread
 
 use crate::packages::Permissions;
 use crate::players::{Access, PIID_INVALID, Players};
-use atl_services_types::counters;
 
 /// The interface name counters use.
 const INTERFACE: &str = "IAudioService";
@@ -37,8 +36,8 @@ impl AudioService {
 /// Counts a player call by what it found: refused for a player another uid tracks, else answered (an unknown id is AOSP's no-op).
 fn count_player_call(method: &str, access: Access) {
     match access {
-        Access::Denied => counters::refused(INTERFACE, method),
-        Access::Owned | Access::Unknown => counters::answered(INTERFACE, method),
+        Access::Denied => atl_diag::refused(INTERFACE, method),
+        Access::Owned | Access::Unknown => atl_diag::answered(INTERFACE, method),
     };
 }
 
@@ -75,7 +74,7 @@ impl IAudioService for AudioService {
 
     /// The click sound: nothing plays yet. Counted, so a run shows the call.
     fn r#playSoundEffect(&self, _effect_type: i32, _user_id: i32) -> binder::Result<()> {
-        counters::answered(INTERFACE, "playSoundEffect");
+        atl_diag::answered(INTERFACE, "playSoundEffect");
         Ok(())
     }
 
@@ -89,9 +88,9 @@ impl IAudioService for AudioService {
         }
         let piid = self.players().track(ThreadState::get_calling_uid());
         if piid == PIID_INVALID {
-            counters::refused(INTERFACE, "trackPlayer");
+            atl_diag::refused(INTERFACE, "trackPlayer");
         } else {
-            counters::answered(INTERFACE, "trackPlayer");
+            atl_diag::answered(INTERFACE, "trackPlayer");
         }
         Ok(piid)
     }

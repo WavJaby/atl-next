@@ -10,7 +10,6 @@ use atl_services_types::compositor_registry::{
     DESCRIPTOR, DESKTOP_INPUT_PROPERTY, DISPLAY_PROPERTY, DesktopInput, POINTER_PROPERTY, REGISTER,
     SERVICE, SURFACE_FLINGER, SURFACE_FLINGER_AIDL, TASK_INFO,
 };
-use atl_services_types::counters;
 use atl_services_types::display_model::DisplayModel;
 use binder::binder_impl::{Binder, BorrowedParcel, IBinderInternal, TransactionCode};
 use binder::{Interface, SpIBinder, StatusCode, Strong, declare_binder_interface};
@@ -61,7 +60,7 @@ fn on_transact(
     _: &BorrowedParcel<'_>,
     _: &mut BorrowedParcel<'_>,
 ) -> Result<(), StatusCode> {
-    counters::count_unimplemented("IRegistry", &format!("code {code}"));
+    atl_diag::unimplemented("IRegistry", &format!("code {code}"));
     Err(StatusCode::UNKNOWN_TRANSACTION)
 }
 

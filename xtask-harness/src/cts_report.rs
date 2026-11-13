@@ -97,7 +97,8 @@ pub struct Report {
     pub counters: Vec<Counter>,
 }
 
-pub const SCHEMA: u32 = 1;
+/// 2: counters keyed (outcome, api) with `exact` (atl-diag), was (kind, name)
+pub const SCHEMA: u32 = 2;
 
 /// What the status blocks say of the tests: the outcomes by `<class>#<test>`, how many end blocks came (each counted by its kind) and the largest `numtests`.
 struct Tally {
@@ -239,22 +240,31 @@ pub fn classify(module: &str, s: &Session, timed_out: bool, limit_secs: u64) -> 
     }
 }
 
-/// `counters` of every module summed by (kind, name), most hits first, then by name.
+/// `counters` of every module summed by (outcome, api), most hits first, then by key; exact only where every module's count was.
 pub fn sum_counters(per_module: &[Vec<Counter>]) -> Vec<Counter> {
-    let mut sum: BTreeMap<(String, String), u64> = BTreeMap::new();
+    let mut sum: BTreeMap<(String, String), (u64, bool)> = BTreeMap::new();
     for c in per_module.iter().flatten() {
-        *sum.entry((c.kind.clone(), c.name.clone())).or_default() += c.count;
+        let e = sum
+            .entry((c.outcome.clone(), c.api.clone()))
+            .or_insert((0, true));
+        e.0 += c.count;
+        e.1 &= c.exact;
     }
     let mut out: Vec<Counter> = sum
         .into_iter()
-        .map(|((kind, name), count)| Counter { kind, name, count })
+        .map(|((outcome, api), (count, exact))| Counter {
+            outcome,
+            api,
+            count,
+            exact,
+        })
         .collect();
     out.sort_by_key(|c| std::cmp::Reverse(c.count));
     out
 }
 
-/// Counter kinds the ranked list shows: calls the services could not serve (unimplemented) and parcelables they refused (codec gaps). The other kinds (answered, sent) are served calls, summed per kind only.
-const ACTIONABLE: [&str; 2] = ["unimplemented", "refused"];
+/// Outcomes not ranked: calls served on purpose (atl-diag `answered`, `sent`), summed per outcome only; every other outcome is work to do.
+const SERVED: [&str; 2] = [atl_diag::ANSWERED, atl_diag::SENT];
 
 /// The one-screen summary: a table row per module, the totals, then the `top` counters.
 pub fn summary(report: &Report, top: usize) -> Vec<String> {
@@ -296,20 +306,24 @@ pub fn summary(report: &Report, top: usize) -> Vec<String> {
         sum(|m| m.total)
     ));
     // what the services could not serve or refused is work to do; served calls are totals, not ranked
-    let actionable = |c: &&Counter| ACTIONABLE.contains(&c.kind.as_str());
+    let actionable = |c: &&Counter| !SERVED.contains(&c.outcome.as_str());
     let ranked: Vec<&Counter> = report.counters.iter().filter(actionable).collect();
     if !ranked.is_empty() {
         lines.push(format!(
-            "top counters (unimplemented and refused; of {}, summed over the modules):",
+            "top counters (not served; of {}, summed over the modules):",
             ranked.len()
         ));
         for c in ranked.iter().take(top) {
-            lines.push(format!("  {:>6}  {} {}", c.count, c.kind, c.name));
+            let bound = if c.exact { "" } else { ">=" };
+            lines.push(format!(
+                "  {bound:>2}{:>6}  {} {}",
+                c.count, c.outcome, c.api
+            ));
         }
     }
     let mut served: BTreeMap<&str, (u64, usize)> = BTreeMap::new();
     for c in report.counters.iter().filter(|c| !actionable(c)) {
-        let e = served.entry(c.kind.as_str()).or_default();
+        let e = served.entry(c.outcome.as_str()).or_default();
         e.0 += c.count;
         e.1 += 1;
     }
@@ -554,13 +568,18 @@ mod tests {
 
     #[test]
     fn counters_sum_across_modules_and_rank() {
-        let c = |name: &str, count| Counter {
-            kind: "unimplemented".into(),
-            name: name.into(),
+        let c = |api: &str, count, exact| Counter {
+            outcome: "unimplemented".into(),
+            api: api.into(),
             count,
+            exact,
         };
-        let sum = sum_counters(&[vec![c("a", 2), c("b", 5)], vec![c("a", 4)]]);
-        assert_eq!(sum, [c("a", 6), c("b", 5)]);
+        // a: 2 + 4 = 6, a lower bound because one module's count was; b: 5 exact
+        let sum = sum_counters(&[
+            vec![c("a", 2, true), c("b", 5, true)],
+            vec![c("a", 4, false)],
+        ]);
+        assert_eq!(sum, [c("a", 6, false), c("b", 5, true)]);
     }
 
     #[test]
@@ -576,14 +595,16 @@ mod tests {
         ]);
         r.counters = vec![
             Counter {
-                kind: "refused".into(),
-                name: "x".into(),
+                outcome: "refused".into(),
+                api: "x".into(),
                 count: 9,
+                exact: true,
             },
             Counter {
-                kind: "unimplemented".into(),
-                name: "y".into(),
+                outcome: "unimplemented".into(),
+                api: "y".into(),
                 count: 1,
+                exact: true,
             },
         ];
         let lines = summary(&r, 1);
@@ -603,10 +624,11 @@ mod tests {
     #[test]
     fn served_counters_are_totals_not_ranked() {
         let mut r = report(vec![module("Alpha", State::Ran, &[])]);
-        let c = |kind: &str, name: &str, count| Counter {
-            kind: kind.into(),
-            name: name.into(),
+        let c = |outcome: &str, api: &str, count| Counter {
+            outcome: outcome.into(),
+            api: api.into(),
             count,
+            exact: true,
         };
         r.counters = vec![
             c("answered", "a", 90),

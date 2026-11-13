@@ -4,8 +4,6 @@
 use binder::binder_impl::{Binder, BorrowedParcel, TransactionCode};
 use binder::{BinderFeatures, Interface, SpIBinder, StatusCode, declare_binder_interface};
 
-use atl_services_types::counters;
-
 pub trait IToken: Interface {}
 
 declare_binder_interface! {
@@ -21,7 +19,7 @@ fn on_transact(
     _: &BorrowedParcel<'_>,
     _: &mut BorrowedParcel<'_>,
 ) -> Result<(), StatusCode> {
-    counters::count_unimplemented("IToken", &format!("code {code}"));
+    atl_diag::unimplemented("IToken", &format!("code {code}"));
     Err(StatusCode::UNKNOWN_TRANSACTION)
 }
 

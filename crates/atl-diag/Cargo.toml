@@ -7,9 +7,16 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# Binder reply outcomes: the aidl patch's --rust_reply_hook (atl-aidl `aidl.reply_hook`). A leaf crate: the converter builds it as rust_library `libatl_diag` for every AIDL crate and atl-parcelables; cargo builds and tests it as a plain library.
+# The one counter family (API outcomes) and its log parser; the aidl patch's --rust_reply_hook (atl-aidl `aidl.reply_hook`). A leaf crate: the converter builds it as rust_library `libatl_diag`
+# (no features) for every AIDL crate, atl-parcelables and the services; cargo builds and tests it, and xtask's report enables `serde`.
 [package.metadata.atl.rust_library]
 rustlibs = []
+
+[dependencies]
+serde = { workspace = true, optional = true }
+
+[features]
+serde = ["dep:serde"]
 
 [lints]
 workspace = true

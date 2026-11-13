@@ -63,7 +63,6 @@ use crate::shared_memory::ApplicationSharedMemory;
 use crate::tasks::{TaskId, TaskSize, Tasks, initial_size};
 use crate::ui_agents::UiAgents;
 use crate::{package, settings};
-use atl_services_types::counters;
 use atl_services_types::display_model::DisplayModel;
 use atl_services_types::permission::{self, ROOT_UID, SHELL_UID, SYSTEM_UID};
 use atl_services_types::size_buckets::SizeBuckets;
@@ -519,7 +518,7 @@ fn illegal_argument(msg: &str) -> Status {
 /// A failed send is logged, not returned: the call is oneway, so no caller hears of it. Returns whether requestFinish was sent.
 fn back_pressed(known: bool, callback: Option<&dyn IRequestFinishCallback>) -> bool {
     let (true, Some(callback)) = (known, callback) else {
-        counters::answered(ACC, "onBackPressed: no such activity");
+        atl_diag::answered(ACC, "onBackPressed: no such activity");
         return false;
     };
     if let Err(e) = callback.requestFinish() {
@@ -746,11 +745,11 @@ impl Inner {
                 ) {
                     Delivery::Nothing => continue,
                     Delivery::Wait => {
-                        counters::answered(AM, "configuration change waits for the relaunch");
+                        atl_diag::answered(AM, "configuration change waits for the relaunch");
                         continue;
                     }
                     Delivery::Send => {
-                        counters::answered(
+                        atl_diag::answered(
                             AM,
                             "configuration change sent (ActivityConfigurationChangeItem)",
                         );
@@ -766,7 +765,7 @@ impl Inner {
                         changes,
                         preserve_window,
                     } => {
-                        counters::answered(
+                        atl_diag::answered(
                             AM,
                             "configuration change relaunch (ActivityRelaunchItem)",
                         );
@@ -1049,7 +1048,7 @@ impl Inner {
     /// BroadcastQueueImpl.onApplicationCleanupLocked + the ReceiverList cleanup of a dead process: its registrations and waiting deliveries go; dropped deliveries are counted.
     fn broadcasts_died(st: &mut State, pid: i32) {
         for _ in 0..st.broadcasts.process_died(pid) {
-            counters::answered(AM, "broadcast dropped: its process died before attaching");
+            atl_diag::answered(AM, "broadcast dropped: its process died before attaching");
         }
     }
 
@@ -1089,14 +1088,14 @@ impl Inner {
         user: i32,
     ) {
         let Some(p) = self.packages.by_name(package) else {
-            counters::answered(
+            atl_diag::answered(
                 AM,
                 "broadcast to a component of an unknown package: no receiver",
             );
             return;
         };
         let Some(decl) = p.receiver(class).filter(|r| r.component.enabled) else {
-            counters::answered(
+            atl_diag::answered(
                 AM,
                 "broadcast to a component that is no enabled <receiver>: no receiver",
             );
@@ -1116,7 +1115,7 @@ impl Inner {
             |perm| self.holds(sender_uid, perm),
             |perm| self.holds(p.uid, perm),
         ) {
-            counters::answered(
+            atl_diag::answered(
                 AM,
                 "broadcast skipped: Permission Denial (manifest receiver)",
             );
@@ -1155,13 +1154,13 @@ impl Inner {
             None => {
                 if let Err(e) = self.start_process_locked(st, p, &process_name, false, None) {
                     // BroadcastQueueImpl:1037-1050: the start failed, the delivery fails
-                    counters::answered(AM, "broadcast dropped: receiver process start failed");
+                    atl_diag::answered(AM, "broadcast dropped: receiver process start failed");
                     log(format_args!(
                         "Unable to launch app {process_name} for broadcast {component}: {e}"
                     ));
                     return;
                 }
-                counters::answered(AM, "broadcast cold start (scheduleReceiverColdLocked)");
+                atl_diag::answered(AM, "broadcast cold start (scheduleReceiverColdLocked)");
                 st.processes.last().map(|r| r.pid).unwrap_or_default()
             }
         };
@@ -1510,7 +1509,7 @@ impl IActivityManager for ActivityManager {
                 "Unable to find app for caller when publishing content providers",
             ));
         }
-        counters::answered(
+        atl_diag::answered(
             AM,
             "publishContentProviders (not kept: no cross-process lookup)",
         );
@@ -1554,16 +1553,13 @@ impl IActivityManager for ActivityManager {
         }
         let no_restart = flags & INSTR_FLAG_NO_RESTART != 0;
         if flags & INSTR_FLAG_NO_RESTART != 0 {
-            return Err(atl_services_wire::unimplemented(
-                AM,
-                "startInstrumentation (INSTR_FLAG_NO_RESTART)",
-            ));
+            // unimplemented sub-cases: the reply hook counts startInstrumentation `unimplemented` with the cause
+            atl_diag::set_cause("INSTR_FLAG_NO_RESTART");
+            return Err(binder::StatusCode::UNKNOWN_TRANSACTION.into());
         }
         if flags >> 5 != 0 {
-            return Err(atl_services_wire::unimplemented(
-                AM,
-                "startInstrumentation (INSTR_FLAG_INSTRUMENT_SDK_SANDBOX)",
-            ));
+            atl_diag::set_cause("INSTR_FLAG_INSTRUMENT_SDK_SANDBOX");
+            return Err(binder::StatusCode::UNKNOWN_TRANSACTION.into());
         }
         for (flag, what) in [
             (
@@ -1584,7 +1580,7 @@ impl IActivityManager for ActivityManager {
             ),
         ] {
             if flags & flag != 0 {
-                counters::answered(AM, &format!("startInstrumentation ({what} ignored)"));
+                atl_diag::answered(AM, &format!("startInstrumentation ({what} ignored)"));
             }
         }
 
@@ -1637,14 +1633,14 @@ impl IActivityManager for ActivityManager {
         let default_process = match decl.target_processes.as_deref() {
             None => target.process_name().to_owned(),
             Some("*") => {
-                counters::answered(AM, "startInstrumentation (targetProcesses=*)");
+                atl_diag::answered(AM, "startInstrumentation (targetProcesses=*)");
                 target.process_name().to_owned()
             }
             Some(list) => {
                 let mut names = list.split(',');
                 let first = names.next().unwrap_or_default().to_owned();
                 if names.next().is_some() {
-                    counters::answered(AM, "startInstrumentation (more than one target process)");
+                    atl_diag::answered(AM, "startInstrumentation (more than one target process)");
                 }
                 first
             }
@@ -1777,10 +1773,8 @@ impl IActivityManager for ActivityManager {
             )));
         }
         if kind == pending_intent::INTENT_SENDER_ACTIVITY_RESULT {
-            return Err(atl_services_wire::unimplemented(
-                AM,
-                "getIntentSenderWithFeature (activity result)",
-            ));
+            atl_diag::set_cause("activity result");
+            return Err(binder::StatusCode::UNKNOWN_TRANSACTION.into());
         }
         let request = intents.and_then(|v| v.last()).and_then(Option::as_ref);
         let resolved = resolved_types
@@ -1799,7 +1793,7 @@ impl IActivityManager for ActivityManager {
             user_id,
         };
         let sender = self.inner.pending.get_or_create(key, uid, flags)?;
-        counters::answered(AM, "getIntentSenderWithFeature");
+        atl_diag::answered(AM, "getIntentSenderWithFeature");
         Ok(sender)
     }
 
@@ -1812,7 +1806,7 @@ impl IActivityManager for ActivityManager {
         let record = sender.and_then(|s| self.inner.pending.info(&s.as_binder()));
         let info = match record {
             Some(r) => {
-                counters::answered(AM, "getInfoForIntentSender");
+                atl_diag::answered(AM, "getInfoForIntentSender");
                 ActivityManager_PendingIntentInfo {
                     creator_package: Some(r.package),
                     creator_uid: r.uid as i32,
@@ -1821,7 +1815,7 @@ impl IActivityManager for ActivityManager {
                 }
             }
             None => {
-                counters::answered(
+                atl_diag::answered(
                     AM,
                     "getInfoForIntentSender (no PendingIntent of this service)",
                 );
@@ -1846,7 +1840,7 @@ impl IActivityManager for ActivityManager {
         };
         let binder = sender.as_binder();
         let Some(owner) = self.inner.pending.info(&binder).map(|r| r.uid) else {
-            counters::answered(AM, "cancelIntentSender (no PendingIntent of this service)");
+            atl_diag::answered(AM, "cancelIntentSender (no PendingIntent of this service)");
             return Ok(());
         };
         let uid = ThreadState::get_calling_uid();
@@ -1856,7 +1850,7 @@ impl IActivityManager for ActivityManager {
             )));
         }
         self.inner.pending.cancel(&binder);
-        counters::answered(AM, "cancelIntentSender");
+        atl_diag::answered(AM, "cancelIntentSender");
         Ok(())
     }
 
@@ -1900,7 +1894,7 @@ impl IActivityManager for ActivityManager {
             ));
         }
         if serialized || result_to.is_some() {
-            counters::answered(
+            atl_diag::answered(
                 AM,
                 "broadcastIntentWithFeature ordered / resultTo (P2: sent unordered, no result)",
             );
@@ -1962,7 +1956,7 @@ impl IActivityManager for ActivityManager {
             ),
             Some(_) => {}
             None if !registered_only => {
-                counters::answered(
+                atl_diag::answered(
                     AM,
                     "implicit broadcast: manifest receivers not resolved (P2)",
                 );
@@ -1979,7 +1973,7 @@ impl IActivityManager for ActivityManager {
                     |p| inner.holds(uid, p),
                     |p| inner.holds(ruid, p),
                 ) {
-                    counters::answered(AM, why.split(':').next().unwrap_or("skipped"));
+                    atl_diag::answered(AM, why.split(':').next().unwrap_or("skipped"));
                     log(format_args!("{why}"));
                     continue;
                 }
@@ -2041,7 +2035,7 @@ impl IActivityManager for ActivityManager {
                 .broadcasts
                 .unregister(&ReceiverHandle(r.clone()));
             if !removed {
-                counters::answered(AM, "unregisterReceiver: not registered");
+                atl_diag::answered(AM, "unregisterReceiver: not registered");
             }
         }
         Ok(())
@@ -2058,7 +2052,7 @@ impl IActivityManager for ActivityManager {
         _abort_broadcast: bool,
         _flags: i32,
     ) -> binder::Result<()> {
-        counters::answered(AM, "finishReceiver (non-ordered: nothing waits)");
+        atl_diag::answered(AM, "finishReceiver (non-ordered: nothing waits)");
         Ok(())
     }
 
@@ -2113,7 +2107,7 @@ impl IActivityManager for ActivityManager {
         let export = broadcast::register_export(flags, receiver.is_some(), target_sdk)
             .map_err(|m| illegal_argument(&m))?;
         if export.flag_missing_unchecked {
-            counters::answered(
+            atl_diag::answered(
                 AM,
                 "registerReceiver without RECEIVER_EXPORTED / NOT_EXPORTED at targetSdk >= 34 (protected-broadcast list not loaded: taken as exported)",
             );
@@ -2136,7 +2130,7 @@ impl IActivityManager for ActivityManager {
             .register(handle, pid, uid, user, bf)
             .map_err(|m| illegal_argument(&m))?
         {
-            counters::answered(AM, "registerReceiver: filter already registered");
+            atl_diag::answered(AM, "registerReceiver: filter already registered");
         }
         let mut first = None;
         for s in stickies {
@@ -2221,10 +2215,10 @@ impl ActivityClientController {
             .get(uid)
             .and_then(|b| b.into_interface::<dyn IUiAgent>().ok())
         else {
-            counters::answered(ACC, "onBackPressed: moveTaskToBack, no UI agent");
+            atl_diag::answered(ACC, "onBackPressed: moveTaskToBack, no UI agent");
             return;
         };
-        counters::answered(ACC, "onBackPressed: moveTaskToBack");
+        atl_diag::answered(ACC, "onBackPressed: moveTaskToBack");
         if let Err(e) = agent.minimize() {
             log(format_args!("onBackPressed: minimize: {e:?}"));
         }
@@ -2247,7 +2241,7 @@ impl IActivityClientController for ActivityClientController {
                 .upgrade()
                 .is_some_and(|inner| inner.atm.resumed(token));
             if !known {
-                counters::answered(ACC, "activityResumed: no such activity");
+                atl_diag::answered(ACC, "activityResumed: no such activity");
             }
         }
         Ok(())
@@ -2260,7 +2254,7 @@ impl IActivityClientController for ActivityClientController {
             _ => false,
         };
         if !known {
-            counters::answered(ACC, "activityPaused: no such activity");
+            atl_diag::answered(ACC, "activityPaused: no such activity");
         }
         Ok(())
     }
@@ -2278,14 +2272,14 @@ impl IActivityClientController for ActivityClientController {
             _ => false,
         };
         if !known {
-            counters::answered(ACC, "activityStopped: no such activity");
+            atl_diag::answered(ACC, "activityStopped: no such activity");
         }
         Ok(())
     }
 
     /// ActivityClientController.activityDestroyed (oneway): nothing to do, the record left the stack when its Destroy was sent. Counted.
     fn r#activityDestroyed(&self, _token: Option<&SpIBinder>) -> binder::Result<()> {
-        counters::answered(ACC, "activityDestroyed (the record left at its Destroy)");
+        atl_diag::answered(ACC, "activityDestroyed (the record left at its Destroy)");
         Ok(())
     }
 
@@ -2298,11 +2292,11 @@ impl IActivityClientController for ActivityClientController {
         finish_task: i32,
     ) -> binder::Result<bool> {
         let (Some(token), Some(inner)) = (token, self.inner.upgrade()) else {
-            counters::answered(ACC, "finishActivity: no token");
+            atl_diag::answered(ACC, "finishActivity: no token");
             return Ok(false);
         };
         if finish_task != 0 {
-            counters::answered(ACC, "finishActivity (finishTask not modelled: refused)");
+            atl_diag::answered(ACC, "finishActivity (finishTask not modelled: refused)");
             return Ok(false);
         }
         Ok(inner.atm.finish(token, code, data.cloned()))
@@ -2324,7 +2318,7 @@ impl IActivityClientController for ActivityClientController {
         match back.map(|b| under_policy(b, self.root_back)) {
             Some(Back::TaskToBack { uid }) => self.task_to_back(uid),
             Some(Back::Finish) if !self.back_finish => {
-                counters::refused(ACC, "onBackPressed (--no-back-finish)");
+                atl_diag::refused(ACC, "onBackPressed (--no-back-finish)");
             }
             known => {
                 back_pressed(known.is_some(), callback.map(|c| &**c));
@@ -2341,10 +2335,10 @@ impl IActivityClientController for ActivityClientController {
     /// ActivityClientController.activityRelaunched (ActivityThread.reportRelaunch): the relaunch ended. Oneway, so a token-less call is only counted.
     fn r#activityRelaunched(&self, token: Option<&SpIBinder>) -> binder::Result<()> {
         let (Some(token), Some(inner)) = (token, self.inner.upgrade()) else {
-            counters::answered(ACC, "activityRelaunched: no token");
+            atl_diag::answered(ACC, "activityRelaunched: no token");
             return Ok(());
         };
-        counters::answered(ACC, "activityRelaunched");
+        atl_diag::answered(ACC, "activityRelaunched");
         inner.relaunch_finished(token);
         Ok(())
     }
@@ -2356,10 +2350,10 @@ impl IActivityClientController for ActivityClientController {
         sizes: Option<&SizeConfigurationBuckets>,
     ) -> binder::Result<()> {
         let Some(token) = token else {
-            counters::answered(ACC, "reportSizeConfigurations: no token");
+            atl_diag::answered(ACC, "reportSizeConfigurations: no token");
             return Ok(());
         };
-        counters::answered(ACC, "reportSizeConfigurations (kept per activity)");
+        atl_diag::answered(ACC, "reportSizeConfigurations (kept per activity)");
         self.buckets.set(token, sizes.map(buckets_of));
         Ok(())
     }
@@ -2371,7 +2365,7 @@ impl IActivityClientController for ActivityClientController {
         _token: Option<&SpIBinder>,
         _values: Option<&ActivityManager_TaskDescription>,
     ) -> binder::Result<()> {
-        counters::answered(ACC, "setTaskDescription (not kept: no recents)");
+        atl_diag::answered(ACC, "setTaskDescription (not kept: no recents)");
         Ok(())
     }
 }

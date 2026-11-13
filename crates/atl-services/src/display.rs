@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The `display` service (Context.DISPLAY_SERVICE): the converter's IDisplayManager stub answering for display 0 from the display the Tasks own (tasks.rs `Tasks::display`: atld's `--display` at start, then the window's monitor via registry SET_DISPLAY); registered callbacks hear each change ([`DisplayCallbacks`]).
 //! getDisplayInfo is display 0's record (DisplayManagerService.getDisplayInfo: null for any other id) and getDisplayIds lists display 0; getOverlaySupport is AOSP's no-HWC default.
-//! Every other method keeps the stub's default body, so each call is counted (counters.rs) and answered UNKNOWN_TRANSACTION.
+//! Every other method keeps the stub's default body, so each call is counted by the reply hook (atl-diag) and answered UNKNOWN_TRANSACTION.
 
 use atl_aidl::aidl::android::hardware::display::IDisplayManager::{
     BnDisplayManager, EnforcePermission, IDisplayManager,
@@ -23,7 +23,6 @@ use binder::Strong;
 
 use crate::packages::Permissions;
 use crate::tasks::Tasks;
-use atl_services_types::counters;
 use atl_services_types::display_model::{self, DisplayModel};
 
 /// The interface name counters use.
@@ -103,7 +102,7 @@ impl DisplayCallbacks {
             match callback.r#onDisplayEvent(DEFAULT_DISPLAY, EVENT_DISPLAY_BASIC_CHANGED) {
                 Ok(()) => told += 1,
                 Err(e) => {
-                    counters::answered(INTERFACE, &format!("onDisplayEvent failed: {e}"));
+                    atl_diag::answered(INTERFACE, &format!("onDisplayEvent failed: {e}"));
                 }
             }
         }

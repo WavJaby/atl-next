@@ -7,17 +7,16 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# The hand-written binder interfaces the system services and their in-ATL clients share (both sides of the wire, no server state): the app's UI agent (IUiAgent), libsensor's ISensorServer / ISensorEventConnection with the data-injection client, the AIDL stubs' `unimplemented` hook.
+# The hand-written binder interfaces the system services and their in-ATL clients share (both sides of the wire, no server state): the app's UI agent (IUiAgent), libsensor's ISensorServer / ISensorEventConnection with the data-injection client.
 # An app process links this, not atl-services, so it does not pull the services' platform-host closure (fontconfig, a second gtk4).
 # The `ASensorEvent` encoder is plain Rust (build.rs probe); the binder parts need feature `converter` (libbinder_rs and the codecs come from the converter, not cargo).
 [package.metadata.atl]
-converter = ["device/libbinder_rs", "device/libatl_parcelables"]
+converter = ["device/libbinder_rs", "device/libatl_diag", "device/libatl_parcelables"]
 
 [features]
 converter = []
 
 [dependencies]
-atl-services-types = { path = "../atl-services-types" }
 rustix.workspace = true
 
 [build-dependencies]

@@ -30,8 +30,6 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::packages::Permissions;
 
-/// The interface name counters use.
-const INTERFACE: &str = "IConnectivityManager";
 /// ConnectivityService.enforceAccessPermission: every query below needs it.
 const ACCESS_NETWORK_STATE: &str = "android.permission.ACCESS_NETWORK_STATE";
 /// NetIdManager.MIN_NET_ID: the first netId ConnectivityService gives an agent.
@@ -314,10 +312,9 @@ impl IConnectivityManager for ConnectivityService {
         _declared_methods: i32,
     ) -> binder::Result<Option<NetworkRequest>> {
         if req_type != TRACK_DEFAULT {
-            return Err(atl_services_wire::unimplemented(
-                INTERFACE,
-                "requestNetwork(type other than TRACK_DEFAULT)",
-            ));
+            // an unimplemented sub-case: the reply hook counts requestNetwork `unimplemented` with this cause
+            atl_diag::set_cause("type other than TRACK_DEFAULT");
+            return Err(binder::StatusCode::UNKNOWN_TRANSACTION.into());
         }
         self.enforce_access("requestNetwork")?;
         let Some(messenger) = messenger else {

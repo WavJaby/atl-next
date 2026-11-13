@@ -21,7 +21,6 @@ use binder::{
 
 use crate::observer_rules::{Watch, segments};
 use crate::packages::Permissions;
-use atl_services_types::counters;
 use atl_services_types::permission;
 
 /// The interface name counters use.
@@ -108,7 +107,7 @@ impl IContentService for ContentService {
         _target_sdk_version: i32,
     ) -> binder::Result<()> {
         let (Some(uri), Some(observer)) = (uri, observer) else {
-            counters::refused(INTERFACE, "registerContentObserver (null uri or observer)");
+            atl_diag::refused(INTERFACE, "registerContentObserver (null uri or observer)");
             return Err(Status::new_exception_str(
                 ExceptionCode::ILLEGAL_ARGUMENT,
                 Some("You must pass a valid uri and observer".to_owned()),
@@ -140,7 +139,7 @@ impl IContentService for ContentService {
         observer: Option<&Strong<dyn IContentObserver>>,
     ) -> binder::Result<()> {
         let Some(observer) = observer else {
-            counters::refused(INTERFACE, "unregisterContentObserver (null observer)");
+            atl_diag::refused(INTERFACE, "unregisterContentObserver (null observer)");
             return Err(Status::new_exception_str(
                 ExceptionCode::ILLEGAL_ARGUMENT,
                 Some("You must pass a valid observer".to_owned()),
@@ -165,7 +164,7 @@ impl IContentService for ContentService {
     ) -> binder::Result<()> {
         let target = resolve_user(user_handle, ThreadState::get_calling_uid())?;
         if (flags & NOTIFY_SYNC_TO_NETWORK) != 0 {
-            counters::answered(
+            atl_diag::answered(
                 INTERFACE,
                 "notifyChange sync to network (not kept: no SyncManager)",
             );
@@ -178,7 +177,7 @@ impl IContentService for ContentService {
             list.retain(alive);
             for uri in uris.unwrap_or_default() {
                 let Some(uri) = uri else {
-                    counters::refused(INTERFACE, "notifyChange (null uri)");
+                    atl_diag::refused(INTERFACE, "notifyChange (null uri)");
                     continue;
                 };
                 let notified = segments(&uri.0);
@@ -204,7 +203,7 @@ impl IContentService for ContentService {
         }
         for (observer, self_change, got) in heard {
             let Ok(proxy) = <dyn IContentObserver as FromIBinder>::try_from(observer) else {
-                counters::refused(INTERFACE, "notifyChange (not an IContentObserver)");
+                atl_diag::refused(INTERFACE, "notifyChange (not an IContentObserver)");
                 continue;
             };
             let got: Vec<Option<Uri>> = got.into_iter().map(Some).collect();

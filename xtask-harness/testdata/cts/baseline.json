@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "host": "x86_64",
   "modules": [
     {
@@ -407,49 +407,58 @@
   ],
   "counters": [
     {
-      "kind": "unimplemented",
-      "name": "IActivityManager.checkPermissionForDevice",
-      "count": 6
+      "outcome": "unimplemented",
+      "api": "IActivityManager.checkPermissionForDevice",
+      "count": 6,
+      "exact": true
     },
     {
-      "kind": "refused",
-      "name": "java.util.Map value (only String and null modelled)",
-      "count": 5
+      "outcome": "refused-parcel",
+      "api": "java.util.Map value (only String and null modelled)",
+      "count": 5,
+      "exact": true
     },
     {
-      "kind": "unimplemented",
-      "name": "IActivityManager.broadcastIntentWithFeature (no receivers: dropped)",
-      "count": 2
+      "outcome": "unimplemented",
+      "api": "IActivityManager.broadcastIntentWithFeature (no receivers: dropped)",
+      "count": 2,
+      "exact": true
     },
     {
-      "kind": "unimplemented",
-      "name": "IActivityManager.registerReceiverWithFeature (registration not kept: no broadcast is delivered)",
-      "count": 2
+      "outcome": "unimplemented",
+      "api": "IActivityManager.registerReceiverWithFeature (registration not kept: no broadcast is delivered)",
+      "count": 2,
+      "exact": true
     },
     {
-      "kind": "unimplemented",
-      "name": "IActivityManager.startInstrumentation (INSTR_FLAG_DISABLE_TEST_API_CHECKS ignored)",
-      "count": 2
+      "outcome": "unimplemented",
+      "api": "IActivityManager.startInstrumentation (INSTR_FLAG_DISABLE_TEST_API_CHECKS ignored)",
+      "count": 2,
+      "exact": true
     },
     {
-      "kind": "unimplemented",
-      "name": "IDisplayManager.getOverlaySupport",
-      "count": 2
+      "outcome": "unimplemented",
+      "api": "IDisplayManager.getOverlaySupport",
+      "count": 2,
+      "exact": true
     },
     {
-      "kind": "unimplemented",
-      "name": "IDisplayManager.getPreferredWideGamutColorSpaceId",
-      "count": 2
+      "outcome": "unimplemented",
+      "api": "IDisplayManager.getPreferredWideGamutColorSpaceId",
+      "count": 2,
+      "exact": true
     },
     {
-      "kind": "unimplemented",
-      "name": "IActivityManager.frozenBinderTransactionDetected",
-      "count": 1
+      "outcome": "unimplemented",
+      "api": "IActivityManager.frozenBinderTransactionDetected",
+      "count": 1,
+      "exact": true
     },
     {
-      "kind": "unimplemented",
-      "name": "IActivityManager.handleApplicationWtf",
-      "count": 1
+      "outcome": "unimplemented",
+      "api": "IActivityManager.handleApplicationWtf",
+      "count": 1,
+      "exact": true
     }
   ]
 }

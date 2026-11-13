@@ -3,7 +3,7 @@
 //! DISPLAY_SERVICE / WINDOW_SERVICE / INPUT_METHOD_SERVICE name them) and the compositor registry (compositor_registry.rs: how an app's in-process SurfaceFlinger gets registered) and serves them on libbinder's thread pool, until killed. Runs as the system uid: servicemanager accepts addService from it. The packages are
 //! installed at start from the sessions atld holds files for (`--session`), the shared libraries and the display come from arguments (`--display`: display_model.rs; omitted, the model's default). Processes are started
 //! and killed through the control connection atld passes as stdin ([`atl_services::process_control`]).
-//! Prints `services: ready` once all are registered; unimplemented calls are counted on stderr (atl_services_types::counters).
+//! Prints `services: ready` once all are registered; non-OK replies are counted on stderr (atl-diag).
 
 // the converter's rlib, on the crate search path build.rs sets (no cargo dependency names it)
 extern crate binder;

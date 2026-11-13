@@ -6,9 +6,15 @@
 
 // the converter's rlibs, on the crate search path build.rs sets (no cargo dependency names them)
 #[cfg(feature = "converter")]
+extern crate atl_diag;
+#[cfg(feature = "converter")]
 extern crate atl_parcelables;
 #[cfg(feature = "converter")]
 extern crate binder;
+// One atl_diag per process: the converter's, which the AIDL crates' reply hook and atl_parcelables link (a cargo copy beside it would split the counts and the cause).
+// Plain builds (policy modules and their tests, no binder) take cargo's under another dependency name, so it never shadows the converter's in a converter build.
+#[cfg(not(feature = "converter"))]
+extern crate atl_diag_plain as atl_diag;
 
 pub mod activity_stack;
 pub mod activity_start;

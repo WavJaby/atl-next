@@ -6,7 +6,6 @@
 use std::sync::Arc;
 
 use atl_libgui_parcel::transaction::{SET_TRANSACTION_STATE, SURFACE_COMPOSER_DESCRIPTOR};
-use atl_services_types::counters;
 use binder::binder_impl::{Binder, BorrowedParcel, TransactionCode};
 use binder::{BinderFeatures, Interface, SpIBinder, StatusCode, declare_binder_interface};
 
@@ -36,7 +35,7 @@ fn on_transact(
     if code == SET_TRANSACTION_STATE {
         return service.set_transaction_state(data);
     }
-    counters::count_unimplemented(INTERFACE, &format!("code {code}"));
+    atl_diag::unimplemented(INTERFACE, &format!("code {code}"));
     Err(StatusCode::UNKNOWN_TRANSACTION)
 }
 

@@ -8,7 +8,6 @@ use std::sync::{Mutex, MutexGuard};
 
 use atl_audio_bridge::{Mapping, Track as Server};
 use atl_audioflinger_stubs::aidl::android::media::IAudioTrack::{BnAudioTrack, IAudioTrack};
-use atl_services_types::counters;
 use binder::{BinderFeatures, Interface, StatusCode, Strong};
 use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
 use shared_file_region_aidl::mangled::_7_android_5_media_16_SharedFileRegion as SharedFileRegion;
@@ -154,7 +153,7 @@ impl Interface for Track {}
 impl IAudioTrack for Track {
     /// IAudioTrack.getCblk: a new fd of the region, as AOSP's TrackHandle returns a dup per call; the client maps it read-write.
     fn r#getCblk(&self) -> binder::Result<Option<SharedFileRegion>> {
-        counters::answered(INTERFACE, "getCblk");
+        atl_diag::answered(INTERFACE, "getCblk");
         let fd = self
             .region
             .fd
@@ -170,7 +169,7 @@ impl IAudioTrack for Track {
 
     /// Idle, stopped or paused -> active: enabled in the mixer. Starting an active track is a no-op (the client's own guard decides before it calls).
     fn r#start(&self) -> binder::Result<i32> {
-        counters::answered(INTERFACE, "start");
+        atl_diag::answered(INTERFACE, "start");
         let mut state = self.state();
         if *state != State::Active {
             *state = State::Active;
@@ -180,7 +179,7 @@ impl IAudioTrack for Track {
     }
 
     fn r#stop(&self) -> binder::Result<()> {
-        counters::answered(INTERFACE, "stop");
+        atl_diag::answered(INTERFACE, "stop");
         let mut state = self.state();
         if matches!(*state, State::Active | State::Paused) {
             *state = State::Stopped;
@@ -190,7 +189,7 @@ impl IAudioTrack for Track {
     }
 
     fn r#pause(&self) -> binder::Result<()> {
-        counters::answered(INTERFACE, "pause");
+        atl_diag::answered(INTERFACE, "pause");
         let mut state = self.state();
         if *state == State::Active {
             *state = State::Paused;
@@ -201,17 +200,17 @@ impl IAudioTrack for Track {
 
     /// Discards the frames of a stopped or paused track (AOSP: no effect on a playing one). Not served yet: the mixer keeps what it has not taken.
     fn r#flush(&self) -> binder::Result<()> {
-        counters::answered(INTERFACE, "flush");
+        atl_diag::answered(INTERFACE, "flush");
         Ok(())
     }
 
     /// AudioTrack's construction attaches effect 0 (none): NO_ERROR. A real effect would need an effect chain this server does not have.
     fn r#attachAuxEffect(&self, effect_id: i32) -> binder::Result<i32> {
         if effect_id == 0 {
-            counters::answered(INTERFACE, "attachAuxEffect");
+            atl_diag::answered(INTERFACE, "attachAuxEffect");
             Ok(NO_ERROR)
         } else {
-            counters::refused(INTERFACE, "attachAuxEffect");
+            atl_diag::refused(INTERFACE, "attachAuxEffect");
             Ok(BAD_VALUE)
         }
     }

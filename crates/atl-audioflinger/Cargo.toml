@@ -11,7 +11,7 @@ publish.workspace = true
 # [package.metadata.atl.aidl] makes device/atl-audioflinger-stubs-rust (crate atl_audioflinger_stubs): the five types of the C0 probe (Run C), their import closure, no parcelables.
 # The stubs keep types of other AIDL crates crate-private, so this crate names AudioUniqueIdUse, AudioStreamType, SharedFileRegion and AttributionSourceState from their own converter crates (listed below, extern crate in lib.rs).
 [package.metadata.atl]
-converter = ["device/libbinder_rs", "device/atl-audioflinger-stubs-rust", "device/audioclient-types-aidl-rust", "device/android.media.audio.common.types-V4-rust", "device/shared-file-region-aidl-rust", "device/framework-permission-aidl-rust"]
+converter = ["device/libbinder_rs", "device/libatl_diag", "device/atl-audioflinger-stubs-rust", "device/audioclient-types-aidl-rust", "device/android.media.audio.common.types-V4-rust", "device/shared-file-region-aidl-rust", "device/framework-permission-aidl-rust"]
 
 [package.metadata.atl.aidl]
 include_dirs = [
@@ -62,7 +62,6 @@ atl-audio-bridge = { path = "../atl-audio-bridge" }
 atl-platform-ui = { path = "../atl-platform-ui" }
 atl-service-view = { path = "../atl-service-view" }
 atl-services-wire = { path = "../atl-services-wire" }
-atl-services-types = { path = "../atl-services-types" }
 rustix.workspace = true
 tracing.workspace = true
 

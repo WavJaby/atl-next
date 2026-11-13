@@ -24,7 +24,6 @@ use atl_platform_host::{Accelerometer, SampleStream, Sensors};
 use rustix::net::{AddressFamily, SendFlags, SocketFlags, SocketType};
 
 use crate::focus::FocusedProcess;
-use atl_services_types::counters;
 use atl_services_wire::sensor::{EVENT_SIZE, TYPE_ACCELEROMETER, encode_event, layout};
 
 /// The interface name counters use.
@@ -291,7 +290,7 @@ impl Channel {
     fn append(cache: &mut VecDeque<[u8; EVENT_SIZE]>, event: &[u8; EVENT_SIZE]) {
         if cache.len() >= MAX_CACHE_EVENTS {
             cache.pop_front();
-            counters::answered(INTERFACE, "event dropped: cache full");
+            atl_diag::answered(INTERFACE, "event dropped: cache full");
         }
         cache.push_back(*event);
     }
@@ -378,7 +377,7 @@ impl SensorHub {
     ) -> Arc<SensorHub> {
         let listed = source.accelerometers();
         for a in &listed {
-            counters::answered(INTERFACE, &format!("accelerometer tier: {}", a.tier));
+            atl_diag::answered(INTERFACE, &format!("accelerometer tier: {}", a.tier));
         }
         let mut sensors: Vec<SensorInfo> = listed
             .iter()
@@ -391,7 +390,7 @@ impl SensorHub {
                     "injection off: {} real accelerometer(s)",
                     sensors.len()
                 ));
-                counters::refused(INTERFACE, "data injection: real accelerometer present");
+                atl_diag::refused(INTERFACE, "data injection: real accelerometer present");
                 None
             }
             Some(package) => {
@@ -399,7 +398,7 @@ impl SensorHub {
                 log(&format!(
                     "injection on: hal_bypass_replay_data_injection for {package:?}"
                 ));
-                counters::answered(INTERFACE, "data injection: hal bypass mode");
+                atl_diag::answered(INTERFACE, "data injection: hal bypass mode");
                 Some(package.to_owned())
             }
             None => None,
@@ -432,11 +431,11 @@ impl SensorHub {
     /// Dropped (counted) outside the mode, for a package not allow-listed, from a `pid` (the connection's creator) not owning the focused window, or for an unknown handle (AOSP: getSensorInterfaceFromHandle null).
     pub fn inject(&self, package: &str, pid: i32, record: &[u8; EVENT_SIZE]) {
         if !self.is_allow_listed(package) {
-            counters::refused(INTERFACE, "injected event: not allowed");
+            atl_diag::refused(INTERFACE, "injected event: not allowed");
             return;
         }
         if self.focus.as_ref().is_some_and(|f| !f.is(pid)) {
-            counters::refused(INTERFACE, "injected event: caller has no focused window");
+            atl_diag::refused(INTERFACE, "injected event: caller has no focused window");
             return;
         }
         let word = |off: u64| {
@@ -445,7 +444,7 @@ impl SensorHub {
         };
         let handle = word(layout::ASENSOR_EVENT_SENSOR);
         let Some(s) = self.sensor(handle) else {
-            counters::refused(INTERFACE, "injected event: unknown handle");
+            atl_diag::refused(INTERFACE, "injected event: unknown handle");
             return;
         };
         let mut event = *record;
@@ -634,7 +633,7 @@ impl SensorHub {
             if stream.is_none() {
                 match self.source.open(&id) {
                     Ok(st) => {
-                        counters::answered(
+                        atl_diag::answered(
                             INTERFACE,
                             &format!("accelerometer tier: {}", st.tier()),
                         );
@@ -642,14 +641,14 @@ impl SensorHub {
                         ts_seen = 0;
                     }
                     Err(e) => {
-                        counters::answered(INTERFACE, &format!("source open failed: {e}"));
+                        atl_diag::answered(INTERFACE, &format!("source open failed: {e}"));
                     }
                 }
             }
             let outcome = stream.as_mut().map(|st| st.next(wait));
             if let Some(st) = stream.as_ref() {
                 for _ in ts_seen..st.ts_fallbacks() {
-                    counters::answered(INTERFACE, "accelerometer ts-fallback");
+                    atl_diag::answered(INTERFACE, "accelerometer ts-fallback");
                 }
                 ts_seen = st.ts_fallbacks();
             }
@@ -660,7 +659,7 @@ impl SensorHub {
                 }
                 Some(Ok(None)) => last.map(|v| (boottime_ns(), v)),
                 Some(Err(e)) => {
-                    counters::answered(INTERFACE, &format!("source read failed: {e}"));
+                    atl_diag::answered(INTERFACE, &format!("source read failed: {e}"));
                     stream = None;
                     None
                 }

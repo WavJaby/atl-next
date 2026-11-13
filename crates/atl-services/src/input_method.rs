@@ -41,7 +41,6 @@ use crate::focus::FocusedProcess;
 use crate::ime_bind::{self, Bind, ClientBind, Peer};
 use crate::packages::Permissions;
 use crate::ui_agents::UiAgents;
-use atl_services_types::counters;
 use atl_services_wire::ui_agent::IUiAgent;
 use std::sync::Arc;
 
@@ -90,7 +89,7 @@ impl State {
         clients.remove(&uid);
         let left = clients.len();
         drop(clients);
-        counters::answered(INTERFACE, "client died");
+        atl_diag::answered(INTERFACE, "client died");
         let _ = writeln!(
             std::io::stderr(),
             "services: input_method client uid={uid} pid={pid} died; entry removed, {left} clients left"
@@ -115,9 +114,9 @@ struct Remote<'a> {
 }
 
 fn sent(call: &str, r: binder::Result<()>) {
-    counters::sent(INTERFACE, call);
+    atl_diag::sent(INTERFACE, call);
     if let Err(e) = r {
-        counters::refused(INTERFACE, &format!("{call}: {e:?}"));
+        atl_diag::refused(INTERFACE, &format!("{call}: {e:?}"));
     }
 }
 
@@ -144,7 +143,7 @@ impl Peer for Remote<'_> {
             .and_then(|agent| agent.input_method().ok().flatten())
             .and_then(|b| b.into_interface::<dyn IInputMethod>().ok());
         let Some(method) = method else {
-            counters::answered(INTERFACE, "bind: the app serves no input method");
+            atl_diag::answered(INTERFACE, "bind: the app serves no input method");
             return false;
         };
         sent(
@@ -245,7 +244,7 @@ fn with_client(
 ) {
     let mut clients = state.clients();
     let Some(c) = clients.get_mut(&uid) else {
-        counters::answered(INTERFACE, "call for a client never added");
+        atl_diag::answered(INTERFACE, "call for a client never added");
         return;
     };
     let Client {
@@ -277,7 +276,7 @@ impl Interface for SessionCallback {}
 impl IInputMethodSessionCallback for SessionCallback {
     fn r#sessionCreated(&self, session: Option<&Session>) -> binder::Result<()> {
         let Some(session) = session.cloned() else {
-            counters::answered(INTERFACE, "sessionCreated with no session");
+            atl_diag::answered(INTERFACE, "sessionCreated with no session");
             return Ok(());
         };
         with_client(&self.state, self.uid, |bind, remote| {
@@ -327,7 +326,7 @@ impl IInputMethodManager for InputMethodManager {
         _input_connection: Option<&Strong<dyn IRemoteInputConnection>>,
         _untrusted_display_id: i32,
     ) -> binder::Result<()> {
-        counters::answered(INTERFACE, "addClient");
+        atl_diag::answered(INTERFACE, "addClient");
         let Some(client) = client.cloned() else {
             return Ok(());
         };
@@ -388,7 +387,7 @@ impl IInputMethodManager for InputMethodManager {
         // a window of the caller has focus, editor or not, client or not
         self.state.focus.gained(ThreadState::get_calling_pid());
         let Some(client) = client else {
-            counters::answered(
+            atl_diag::answered(
                 INTERFACE,
                 "startInputOrWindowGainedFocusAsync with no client",
             );
@@ -429,7 +428,7 @@ impl IInputMethodManager for InputMethodManager {
         _reason: i32,
         _async: bool,
     ) -> binder::Result<bool> {
-        counters::answered(INTERFACE, "showSoftInput (false: no IME)");
+        atl_diag::answered(INTERFACE, "showSoftInput (false: no IME)");
         Ok(false)
     }
 
@@ -445,7 +444,7 @@ impl IInputMethodManager for InputMethodManager {
         _reason: i32,
         _async: bool,
     ) -> binder::Result<bool> {
-        counters::answered(INTERFACE, "hideSoftInput (false: no IME)");
+        atl_diag::answered(INTERFACE, "hideSoftInput (false: no IME)");
         Ok(false)
     }
 
@@ -460,7 +459,7 @@ impl IInputMethodManager for InputMethodManager {
             >,
         >,
     > {
-        counters::answered(INTERFACE, "getImeTrackerService (null: no IME tracker)");
+        atl_diag::answered(INTERFACE, "getImeTrackerService (null: no IME tracker)");
         Ok(None)
     }
 

@@ -12,7 +12,7 @@ publish.workspace = true
 # Also the JNI library of `xtask test compositor` (compositor.rs): atl-compositor's codecs vs libgui's C++ on host ART. It reads a Java Parcel's data and object table through libbinder's C++ accessors, so libbinder is linked directly.
 # Also the golden of ScreenCaptureResults (src/capture.rs, unit tests under the converter): libgui's own writeToParcel / readFromParcel through wrap/capture.{h,cpp} (adapters, no logic) on a parcel libbinder_rs owns.
 [package.metadata.atl]
-converter = ["device/libbinder_rs", "device/libatl_parcelables", "device/libbinder", "device/libbinder_ndk", "device/libgui", "device/libgui_aidl_types_rs", "device/libui", "device/libutils"]
+converter = ["device/libbinder_rs", "device/libatl_diag", "device/libatl_parcelables", "device/libbinder", "device/libbinder_ndk", "device/libgui", "device/libgui_aidl_types_rs", "device/libui", "device/libutils"]
 
 [lib]
 crate-type = ["cdylib"]

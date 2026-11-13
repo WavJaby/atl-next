@@ -19,7 +19,6 @@ use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, Strong
 use crate::alarm_table::{Alarm, AlarmTable};
 use crate::packages::Packages;
 use crate::packages::Permissions;
-use atl_services_types::counters;
 use atl_services_types::permission;
 
 /// The interface name counters use.
@@ -52,7 +51,7 @@ impl Interface for AlarmService {}
 /// A call that names no package is malformed: AlarmManager always passes its op package. Refused and counted.
 fn named<'a>(package: Option<&'a str>, method: &str) -> binder::Result<&'a str> {
     package.ok_or_else(|| {
-        counters::refused(INTERFACE, &format!("{method} (no package)"));
+        atl_diag::refused(INTERFACE, &format!("{method} (no package)"));
         Status::new_exception_str(
             ExceptionCode::ILLEGAL_ARGUMENT,
             Some(format!("{method}: no package")),
@@ -132,7 +131,7 @@ impl IAlarmManager for AlarmService {
             operation: operation.map(|p| p.target.clone()),
             listener: listener.map(|l| l.as_binder()),
         });
-        counters::answered(INTERFACE, "set (stored, never fires)");
+        atl_diag::answered(INTERFACE, "set (stored, never fires)");
         Ok(())
     }
 
@@ -145,7 +144,7 @@ impl IAlarmManager for AlarmService {
         let operation = operation.map(|p| p.target.clone());
         let listener = listener.map(|l| l.as_binder());
         self.0.lock().remove(operation.as_ref(), listener.as_ref());
-        counters::answered(INTERFACE, "remove");
+        atl_diag::answered(INTERFACE, "remove");
         Ok(())
     }
 
@@ -160,13 +159,13 @@ impl IAlarmManager for AlarmService {
             return Err(not_owner(package, uid));
         }
         self.0.lock().remove_all(uid, package);
-        counters::answered(INTERFACE, "removeAll");
+        atl_diag::answered(INTERFACE, "removeAll");
         Ok(())
     }
 
     /// getNextAlarmClock (:2936): null. No alarm clock is ever held (module doc), and AOSP answers null for a user with none (getNextAlarmClockImpl :3703).
     fn r#getNextAlarmClock(&self, _user_id: i32) -> binder::Result<Option<AlarmClockInfo>> {
-        counters::answered(INTERFACE, "getNextAlarmClock (null)");
+        atl_diag::answered(INTERFACE, "getNextAlarmClock (null)");
         Ok(None)
     }
 }

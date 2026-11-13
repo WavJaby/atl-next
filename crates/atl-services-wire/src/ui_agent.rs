@@ -17,8 +17,6 @@ use atl_parcelables::parts::Part;
 use binder::binder_impl::{Binder, BorrowedParcel, IBinderInternal, TransactionCode};
 use binder::{Interface, ParcelFileDescriptor, SpIBinder, StatusCode, declare_binder_interface};
 
-use atl_services_types::counters;
-
 /// The interface descriptor.
 pub const DESCRIPTOR: &str = "atl.IUiAgent";
 /// A window's SurfaceControl: the layer name in, the SurfaceControl out.
@@ -142,7 +140,7 @@ fn on_transact(
             service.dim_layer(layer_id, amount, width, height)
         }
         _ => {
-            counters::count_unimplemented(INTERFACE, &format!("code {code}"));
+            atl_diag::unimplemented(INTERFACE, &format!("code {code}"));
             Err(StatusCode::UNKNOWN_TRANSACTION)
         }
     }

@@ -8,6 +8,7 @@
 // the converter's rlibs, on the crate search path build.rs sets (no cargo dependency names them)
 extern crate android_media_audio_common_types;
 extern crate atl_audioflinger_stubs;
+extern crate atl_diag;
 extern crate audioclient_types_aidl;
 extern crate binder;
 extern crate framework_permission_aidl;

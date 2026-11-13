@@ -6,7 +6,6 @@ use std::os::fd::OwnedFd;
 
 use atl_compositor::callbacks::LISTENER_DESCRIPTOR;
 use atl_libgui_parcel::parcel::WireParcel;
-use atl_services_types::counters;
 use binder::binder_impl::{Binder, BorrowedParcel, FLAG_ONEWAY, IBinderInternal, TransactionCode};
 use binder::{Interface, SpIBinder, StatusCode, Strong, declare_binder_interface};
 
@@ -28,7 +27,7 @@ fn on_transact(
     _: &BorrowedParcel<'_>,
     _: &mut BorrowedParcel<'_>,
 ) -> Result<(), StatusCode> {
-    counters::count_unimplemented("ITransactionCompletedListener", &format!("code {code}"));
+    atl_diag::unimplemented("ITransactionCompletedListener", &format!("code {code}"));
     Err(StatusCode::UNKNOWN_TRANSACTION)
 }
 

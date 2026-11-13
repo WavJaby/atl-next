@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The `clipboard` service (Context.CLIPBOARD_SERVICE): published so ClipboardManager's constructor (`ServiceManager.getServiceOrThrow("clipboard")`) succeeds; without it
 //! SystemServiceRegistry returns null and Compose's AndroidClipboardManager.<init> fails its cast. Plan rule (decision 8c): authority + state here, the Wayland selection reached later
-//! through the focused app's IUiAgent. Not built yet: the clip state, the focused-app read rule and the Wayland sync. Every method keeps the stub's default: counted (counters.rs),
+//! through the focused app's IUiAgent. Not built yet: the clip state, the focused-app read rule and the Wayland sync. Every method keeps the stub's default: counted by the reply hook (atl-diag),
 //! answered UNKNOWN_TRANSACTION. Do not add get/has methods before the focused-app read rule exists: without it one app reads another's clip.
 
 use atl_aidl::aidl::android::content::IClipboard::{BnClipboard, EnforcePermission, IClipboard};

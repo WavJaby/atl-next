@@ -43,10 +43,10 @@ const CLIENT_LIMIT: Duration = Duration::from_secs(20);
 /// What `service call` prints for a reply of exactly status 0 and an int32 0 (false, or a null parcelable's flag): Parcel's text dump (libs/binder TextOutput), words then their
 /// characters, as measured 2026-11-03; the closing `'...')` pins the length to those two words.
 const REPLY_OK_ZERO: &str = "Result: Parcel(\t00000000 00000000   '........')";
-/// Counter lines the client runs must produce (atl_services_types::counters): getProcessLimit (app run) and getMoveStatus (system run, past the permission hook).
+/// Counter lines the client runs must produce (atl-diag reply hook, first hit): getProcessLimit (app run) and getMoveStatus (system run, past the permission hook).
 const MUST_COUNT: &[&str] = &[
-    "services: unimplemented IActivityManager.getProcessLimit 1",
-    "services: unimplemented IPackageManager.getMoveStatus 1",
+    "diag: first unimplemented IActivityManager.getProcessLimit 1",
+    "diag: first unimplemented IPackageManager.getMoveStatus 1",
 ];
 
 /// One process's (exit success, output).

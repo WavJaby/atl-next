@@ -6,8 +6,6 @@
 use binder::binder_impl::{Binder, BorrowedParcel, FIRST_CALL_TRANSACTION, TransactionCode};
 use binder::{BinderFeatures, Interface, SpIBinder, StatusCode, declare_binder_interface};
 
-use atl_services_types::counters;
-
 /// IContentProvider.descriptor ("android.content.IContentProvider", IContentProvider.java).
 pub const DESCRIPTOR: &str = "android.content.IContentProvider";
 /// IContentProvider.CALL_TRANSACTION = IBinder.FIRST_CALL_TRANSACTION + 20 (IContentProvider.java:217).
@@ -40,7 +38,7 @@ fn on_transact(
         reply.write(&NO_EXCEPTION)?;
         return reply.write(&NULL_BUNDLE);
     }
-    counters::count_unimplemented(INTERFACE, &format!("code {code}"));
+    atl_diag::unimplemented(INTERFACE, &format!("code {code}"));
     Err(StatusCode::UNKNOWN_TRANSACTION)
 }
 

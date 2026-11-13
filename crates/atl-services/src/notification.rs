@@ -23,7 +23,6 @@ use crate::notification_channels::{ChannelError, Channels};
 use crate::packages::Packages;
 use crate::packages::Permissions;
 use crate::tasks::Tasks;
-use atl_services_types::counters;
 use atl_services_types::permission;
 
 /// The interface name counters use.
@@ -132,7 +131,7 @@ impl Inner {
                 return;
             };
             if let Err(e) = callback.r#show(Some(&window_token)) {
-                counters::answered(INTERFACE, &format!("toast show refused: {e:?}"));
+                atl_diag::answered(INTERFACE, &format!("toast show refused: {e:?}"));
                 self.remove(id);
                 continue;
             }
@@ -150,7 +149,7 @@ impl Inner {
                     inner.cancel(id);
                 });
             if spawned.is_err() {
-                counters::answered(INTERFACE, "toast timer: no thread");
+                atl_diag::answered(INTERFACE, "toast timer: no thread");
             }
             return;
         }
@@ -178,7 +177,7 @@ impl Inner {
             (t, i == 0)
         };
         if let Err(e) = toast.callback.r#hide() {
-            counters::answered(INTERFACE, &format!("toast hide refused: {e:?}"));
+            atl_diag::answered(INTERFACE, &format!("toast hide refused: {e:?}"));
         }
         let inner = Arc::clone(self);
         let window_token = toast.window_token.clone();
@@ -189,7 +188,7 @@ impl Inner {
                 inner.finish(|w| *w == window_token);
             });
         if spawned.is_err() {
-            counters::answered(INTERFACE, "toast token timer: no thread");
+            atl_diag::answered(INTERFACE, "toast token timer: no thread");
         }
         if was_head {
             self.show_next();
@@ -250,7 +249,7 @@ impl INotificationManager for NotificationManager {
         _display_id: i32,
     ) -> binder::Result<bool> {
         let (Some(pkg), Some(token), Some(callback)) = (pkg, token, callback) else {
-            counters::refused(INTERFACE, "enqueueToast: no package, token or callback");
+            atl_diag::refused(INTERFACE, "enqueueToast: no package, token or callback");
             return Ok(false);
         };
         let inner = &self.0;
@@ -266,11 +265,11 @@ impl INotificationManager for NotificationManager {
                 return Ok(true);
             }
             if st.queue.iter().filter(|t| t.pkg == pkg).count() >= MAX_PACKAGE_TOASTS {
-                counters::refused(INTERFACE, "enqueueToast: MAX_PACKAGE_TOASTS queued");
+                atl_diag::refused(INTERFACE, "enqueueToast: MAX_PACKAGE_TOASTS queued");
                 return Ok(false);
             }
             let Some(task) = inner.tasks.newest_task_of(uid) else {
-                counters::refused(INTERFACE, "enqueueToast: the caller has no Task");
+                atl_diag::refused(INTERFACE, "enqueueToast: the caller has no Task");
                 return Ok(false);
             };
             let window_token = crate::token::new();
@@ -285,7 +284,7 @@ impl INotificationManager for NotificationManager {
             });
             st.queue.len() == 1
         };
-        counters::answered(INTERFACE, "enqueueToast (queued)");
+        atl_diag::answered(INTERFACE, "enqueueToast (queued)");
         if head {
             inner.show_next();
         }
@@ -305,7 +304,7 @@ impl INotificationManager for NotificationManager {
             &Strong<dyn atl_aidl::mangled::_7_android_3_app_30_ITransientNotificationCallback>,
         >,
     ) -> binder::Result<bool> {
-        counters::refused(
+        atl_diag::refused(
             INTERFACE,
             "enqueueTextToast: no system UI renders text toasts",
         );
@@ -361,7 +360,7 @@ impl INotificationManager for NotificationManager {
                 .create(uid, pkg, channel.clone())
                 .map_err(ChannelError::status)?;
         }
-        counters::answered(INTERFACE, "createNotificationChannels");
+        atl_diag::answered(INTERFACE, "createNotificationChannels");
         Ok(())
     }
 
@@ -374,7 +373,7 @@ impl INotificationManager for NotificationManager {
         channel_id: Option<&str>,
     ) -> binder::Result<Option<NotificationChannel>> {
         let (uid, pkg) = self.0.can_notify_as(calling_pkg, user_id, target_pkg)?;
-        counters::answered(INTERFACE, "getNotificationChannel");
+        atl_diag::answered(INTERFACE, "getNotificationChannel");
         Ok(self.0.lock().channels.get(uid, pkg, channel_id))
     }
 
@@ -386,7 +385,7 @@ impl INotificationManager for NotificationManager {
         user_id: i32,
     ) -> binder::Result<Option<ParceledListSlice>> {
         let (uid, pkg) = self.0.can_notify_as(calling_pkg, user_id, target_pkg)?;
-        counters::answered(INTERFACE, "getNotificationChannels");
+        atl_diag::answered(INTERFACE, "getNotificationChannels");
         Ok(Some(ParceledListSlice::new(
             self.0.lock().channels.list(uid, pkg),
         )))

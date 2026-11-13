@@ -12,7 +12,7 @@ publish.workspace = true
 # plain workspace builds take the modules without binder types (wire, objects, vsync, clock) and their tests. The launcher (atl-app-launcher) starts the compositor in an app process.
 # librustutils: the process's system properties (the display atld wrote into its property area).
 [package.metadata.atl]
-converter = ["device/libbinder_rs", "device/libatl_parcelables", "device/atl-aidl-stubs-rust", "device/libgui_aidl_types_rs", "device/librustutils"]
+converter = ["device/libbinder_rs", "device/libatl_diag", "device/libatl_parcelables", "device/atl-aidl-stubs-rust", "device/libgui_aidl_types_rs", "device/librustutils"]
 
 [features]
 converter = ["atl-aidl/converter", "atl-ime/converter", "atl-libinput/converter", "atl-services-wire/converter", "atl-service-view/converter"]
