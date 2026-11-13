@@ -434,7 +434,8 @@ pub struct Natives {
     pub lib_dir: Option<PathBuf>,
 }
 
-/// PackageManager install codes of the native path (core/java/android/content/pm/PackageManager.java: 2122, 2258, 2485, 2518, 2528).
+/// PackageManager install codes of the native path (core/java/android/content/pm/PackageManager.java: 2104, 2122, 2258, 2485, 2518, 2528).
+const INSTALL_SUCCEEDED: i32 = 1;
 const INSTALL_FAILED_INVALID_APK: i32 = -2;
 const INSTALL_FAILED_CPU_ABI_INCOMPATIBLE: i32 = -16;
 const INSTALL_FAILED_INTERNAL_ERROR: i32 = -110;
@@ -490,6 +491,32 @@ impl Cluster<'_> {
         };
 
         let helper = vm.find_class(c"com/android/internal/content/NativeLibraryHelper")?;
+        // The session's step first (PackageInstallerSession.extractNativeLibraries:4512): copyNativeBinariesWithOverride(handle, <stage>/lib, no override, not incremental). With extractNativeLibs=false it
+        // copies nothing and refuses compressed or non-page-aligned libraries (NativeLibraryHelper.cpp copyFileIfChanged) -> INSTALL_FAILED_INVALID_APK. Its hole punching in the APK fails on the
+        // read-only staged mount and only warns there (as AOSP's does where punching fails), so a staged hard link never changes its source. The derive step below finds the copies unchanged.
+        let with_override = vm.method(
+            helper,
+            c"copyNativeBinariesWithOverride",
+            c"(Lcom/android/internal/content/NativeLibraryHelper$Handle;Ljava/io/File;Ljava/lang/String;Z)I",
+            true,
+        )?;
+        let session_root = vm.file(lib_root)?;
+        let session = vm.call_static_int(
+            helper,
+            with_override,
+            &[
+                jni::jvalue { l: handle.obj },
+                jni::jvalue { l: session_root },
+                jni::jvalue {
+                    l: core::ptr::null_mut(),
+                },
+                jni::jvalue { z: 0 },
+            ],
+            "copyNativeBinariesWithOverride",
+        )?;
+        if session != INSTALL_SUCCEEDED {
+            return Err(native_error(session));
+        }
         let build = vm.find_class(c"android/os/Build")?;
         let string_array = c"[Ljava/lang/String;";
         let abis = vm.static_object_field(build, c"SUPPORTED_ABIS", string_array)?;
