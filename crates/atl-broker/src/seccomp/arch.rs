@@ -68,7 +68,9 @@ compile_error!(
 /// 1. gdb `catch syscall` census of the installer's gate paths: the union of 57 numbers. alto's run was cut at 900 s (8.4 M stops) before its native copy; `feature` ran to its end (56 numbers); the others ended early.
 /// 2. Kill-mode gate runs: alto's native copy makes calls no census reached: unlink (87), chmod (90), fsync (74), utimensat (280), fallocate (285), rename (82). Each run ended at the first unlisted call (SIGSYS, the call named by dmesg `type=1326`).
 /// 3. The sandbox's own start-up (bwrap's pid 1 and atl-sandbox-stub run under this filter too): execve (59), wait4 (61), the Landlock calls (444-446), from binderd's measured list.
+///
 /// The list gives 67 numbers. socket(2) is absent from it: seccomp.rs allows it for AF_UNIX only. setpriority(2) is measured (ART's thread priorities); no EACCES from it reached the gate's stderr.
+///
 /// Final evidence: the installer gate green in kill mode with 0 denials in dmesg on three runs. Re-measure after installer, ART or glibc start-up code changes: a new call ends the run with SIGSYS, and dmesg names it.
 #[cfg(target_arch = "x86_64")]
 pub const INSTALLER_SYSCALLS: &[i64] = &[
