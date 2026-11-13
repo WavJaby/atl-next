@@ -110,23 +110,20 @@ const SERVICE_LINES: [(&str, &str, &str); 2] = [
 /// The native bridge's report of a fault handed to a guest handler (identity/mod.rs fault_report via signal.rs guest_handler); bridge1's sigsegvRecover must produce one (SIGSEGV = 11).
 const GUEST_FAULT_REPORT: &str =
     "atl-native-bridge: fatal-signal report: fault handed to the guest's handler: sig 11 ";
-/// Main.mediaPlayerService's line: "returned" when the view answered the lookup and setDataSource(fd) returned, "no answer" when nothing did. A return means an answer (getMediaPlayerService waits for media.player, IMediaDeathNotifier.cpp:41); a native setDataSource error is logged and dropped by MediaPlayer.java:1305, so MEDIA_PLAYER_RAN carries the served service's own evidence.
+/// Main.mediaPlayerService's line: "returned" when the view answered the lookup and setDataSource(fd) returned, "no answer" when nothing did. A return means an answer (getMediaPlayerService waits for media.player, IMediaDeathNotifier.cpp:41); a native setDataSource error is logged and dropped by MediaPlayer.java:1305, so a return does not prove setDataSource ran: MEDIA_WAV is that check.
 const MEDIA_PLAYER_SERVICE: &str = "AtlTest: media.player: ";
 /// The probe's line when its lookup was answered and setDataSource(fd) returned (MEDIA_PLAYER_SERVICE).
 const MEDIA_PLAYER_ANSWERED: &str = "returned";
-/// The served service's own line: GenericSource's, for the extractor it could not make from the probe's fd at the probe's prepare (GenericSource.cpp:181, Main.java mediaPlayerService). It prints only
-/// after setDataSource_pre got media.extractor from the process's view (MediaPlayerService.cpp:892); before the extractor service was served that lookup returned null and printed
-/// "extractor service not available" instead. Its presence shows the served object went past that lookup. It also prints when no extractor sniffs a valid file, so it is not proof of
-/// extraction: MEDIA_WAV is that check.
-const MEDIA_PLAYER_RAN: &str = "initFromDataSource, cannot create extractor!";
-/// Main.mediaPlayerWav's lines: `round <i> ok <ms> ms` per round, or `round <i> <step> <throwable>` when a step threw. Rounds alternate fd and path (Main.WAV_ROUNDS).
+/// Main.mediaPlayerWav's lines: `round <i> ok <ms> ms` per round, `round <i> <step> <throwable>` when a step threw, `no answer within <ms> ms at <step>` when a round never
+/// returned. Rounds alternate fd and path (Main.WAV_ROUNDS). A pass means the served service sniffed and extracted a valid WAV (prepare throws without an extractor).
+/// This replaces the failure-text marker "initFromDataSource, cannot create extractor!": GenericSource prints it on every stored.bin probe, pass or fail (GenericSource.cpp:181).
 const MEDIA_WAV: &str = "AtlTest: mediaplayer-wav: ";
 const MEDIA_WAV_ROUNDS: usize = 4;
-/// Main.mediaPlayerReset's lines: `round <i> ok <ms> ms` per reset, `round <i> <step> <throwable>`, or `no answer within <ms> ms` when a reset never returned.
+/// Main.mediaPlayerReset's lines: `round <i> ok <ms> ms` per reset, `round <i> <step> <throwable>`, or `no answer within <ms> ms at <step>` when a round never returned.
 const MEDIA_RESET: &str = "AtlTest: mediaplayer-reset: ";
 const MEDIA_RESET_ROUNDS: usize = 4;
-/// Main.RESET_BOUND_MS: the most one reset may take.
-const MEDIA_RESET_BOUND_MS: u64 = 10_000;
+/// Main.ROUND_BOUND_MS: the most one round of the WAV and reset probes may take; a probe whose worker outlives rounds x this is named by the probe.
+const MEDIA_ROUND_BOUND_MS: u64 = 10_000;
 /// The startActivityForResult round trip (Main.java, ResultChild.java): after the marker Main starts ResultChild for request 7; its RESULT_OK (-1) and extra come back in
 /// onActivityResult, then Main's singleTop self-start cancels request 9 (RESULT_CANCELED, 0) before its new intent. Lines are `AtlTest: result request=<r> code=<c> extra=<e>`.
 const RESULT: &str = "AtlTest: result ";
@@ -794,20 +791,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             "media.player: want {MEDIA_PLAYER_ANSWERED:?}, got {probe:?}"
         ));
     }
-    if passed && !app.contains(MEDIA_PLAYER_RAN) {
-        whys.push(format!(
-            "media.player: the served service did not run setDataSource (no {MEDIA_PLAYER_RAN:?} line)"
-        ));
-    }
     // media.extractor end to end (l1-sniff): a valid WAV is prepared, started, sought and reset through the served service, by fd and by path; the reset with a seek
     // pending returns within its bound (the in-process notify path, patch 0004)
     if passed {
-        whys.extend(round_failures(&app, MEDIA_WAV, MEDIA_WAV_ROUNDS, None));
+        whys.extend(round_failures(&app, MEDIA_WAV, MEDIA_WAV_ROUNDS, Some(MEDIA_ROUND_BOUND_MS)));
         whys.extend(round_failures(
             &app,
             MEDIA_RESET,
             MEDIA_RESET_ROUNDS,
-            Some(MEDIA_RESET_BOUND_MS),
+            Some(MEDIA_ROUND_BOUND_MS),
         ));
     }
     // startActivityForResult round trip (Main.java, ResultChild.java): the result, its order against Main's resume, and the singleTop self-start's cancel
@@ -873,14 +865,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             println!("app: pass {service} {want}");
         }
         println!(
-            "app: pass media.player {} (answered through the view; the served service ran setDataSource)",
+            "app: pass media.player {} (answered through the view; setDataSource returned)",
             probe.unwrap_or_default()
         );
         println!(
-            "app: pass mediaplayer-wav {MEDIA_WAV_ROUNDS} rounds (prepare, start, seekTo, reset; fd and path)"
+            "app: pass mediaplayer-wav {MEDIA_WAV_ROUNDS} rounds (prepare, start, seekTo, reset; fd and path), each within {MEDIA_ROUND_BOUND_MS} ms"
         );
         println!(
-            "app: pass mediaplayer-reset {MEDIA_RESET_ROUNDS} resets with a seek pending, each within {MEDIA_RESET_BOUND_MS} ms"
+            "app: pass mediaplayer-reset {MEDIA_RESET_ROUNDS} resets with a seek pending, each within {MEDIA_ROUND_BOUND_MS} ms"
         );
         println!("app: pass result {RESULT_CHILD}; {RESULT_CANCELED} before main new intent");
         if let Some(n) = es1_compared {
@@ -1030,29 +1022,33 @@ mod tests {
             .map(|i| format!("AtlTest: mediaplayer-reset: round {i} ok 40 ms\n"))
             .collect();
         assert_eq!(
-            round_failures(&ok, MEDIA_RESET, MEDIA_RESET_ROUNDS, Some(MEDIA_RESET_BOUND_MS)),
+            round_failures(&ok, MEDIA_RESET, MEDIA_RESET_ROUNDS, Some(MEDIA_ROUND_BOUND_MS)),
             Vec::<String>::new()
         );
         // a reset that never returns: its round is missing and the probe's own line names it
-        let frozen = "AtlTest: mediaplayer-reset: round 0 ok 40 ms\nAtlTest: mediaplayer-reset: no answer within 40000 ms\n";
+        let frozen = "AtlTest: mediaplayer-reset: round 0 ok 40 ms\nAtlTest: mediaplayer-reset: no answer within 40000 ms at reset\n";
         let why = round_failures(
             frozen,
             MEDIA_RESET,
             MEDIA_RESET_ROUNDS,
-            Some(MEDIA_RESET_BOUND_MS),
+            Some(MEDIA_ROUND_BOUND_MS),
         );
         assert!(why.iter().any(|w| w.contains("never returned")));
         assert!(why.iter().any(|w| w.contains("1 of 4 rounds ok")));
         // a round over the bound, or one that threw, is named where it stands
         let slow = format!(
             "AtlTest: mediaplayer-reset: round 0 ok {} ms\n",
-            MEDIA_RESET_BOUND_MS + 1
+            MEDIA_ROUND_BOUND_MS + 1
         );
-        assert!(!round_failures(&slow, MEDIA_RESET, 1, Some(MEDIA_RESET_BOUND_MS)).is_empty());
+        assert!(!round_failures(&slow, MEDIA_RESET, 1, Some(MEDIA_ROUND_BOUND_MS)).is_empty());
         let threw = "AtlTest: mediaplayer-wav: round 0 prepare java.io.IOException: Prepare failed.\n";
-        let why = round_failures(threw, MEDIA_WAV, MEDIA_WAV_ROUNDS, None);
+        let why = round_failures(threw, MEDIA_WAV, MEDIA_WAV_ROUNDS, Some(MEDIA_ROUND_BOUND_MS));
         assert!(why.iter().any(|w| w.contains("prepare java.io.IOException")));
         assert!(why.iter().any(|w| w.ends_with("0 of 4 rounds ok")));
+        // the WAV probe's worker outlives its bound: the probe names the step the round was in
+        let hung = "AtlTest: mediaplayer-wav: round 0 ok 1 ms\nAtlTest: mediaplayer-wav: no answer within 40000 ms at reset\n";
+        let why = round_failures(hung, MEDIA_WAV, MEDIA_WAV_ROUNDS, Some(MEDIA_ROUND_BOUND_MS));
+        assert!(why.iter().any(|w| w.contains("no answer within 40000 ms at reset: round 1 never returned")));
     }
 
     #[test]

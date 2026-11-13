@@ -23,6 +23,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.security.KeyStore;
 import java.security.cert.X509Certificate;
+import java.util.concurrent.atomic.AtomicReference;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.TrustManagerFactory;
 import javax.net.ssl.X509TrustManager;
@@ -377,7 +378,7 @@ public class Main extends Activity {
                     MediaPlayer mp = new MediaPlayer();
                     mp.setDataSource(afd.getFileDescriptor(), afd.getStartOffset(), afd.getLength());
                     r = "returned";
-                    // VideoView's next step (prepareAsync in the game): the prepare creates the extractor, and its failure logs MEDIA_PLAYER_RAN from the served service (app.rs)
+                    // VideoView's next step (prepareAsync in the game): the prepare creates the extractor; the WAV rounds (app.rs MEDIA_WAV) are the check that it works
                     try {
                         mp.prepare();
                     } catch (Exception e) {
@@ -408,9 +409,9 @@ public class Main extends Activity {
     /** Length of the probe's WAV, and the position each round seeks to (app.rs MEDIA_WAV). */
     private static final int WAV_SECONDS = 2;
     private static final int WAV_SEEK_MS = 1000;
-    /** Reset probe rounds and the bound each reset gets (app.rs MEDIA_RESET). */
+    /** Rounds of the reset probe; the bound each round of the WAV and reset probes gets (app.rs MEDIA_ROUND_BOUND_MS). */
     private static final int RESET_ROUNDS = 4;
-    private static final long RESET_BOUND_MS = 10000L;
+    private static final long ROUND_BOUND_MS = 10000L;
 
     /**
      * Diagnosis, not gated: MediaMetadataRetriever reads the WAV's mime from the fd through a PlayerServiceFileSource and the same
@@ -485,73 +486,83 @@ public class Main extends Activity {
     }
 
     /**
-     * media.extractor end to end (app.rs MEDIA_WAV): a WAV is set, prepared, started, sought and reset, per round. A failing step logs its throwable.
+     * media.extractor end to end (app.rs MEDIA_WAV): a WAV is set, prepared, started, sought and reset, per round, on a worker (joinProbe) so a round that
+     * never returns is named. A failing step logs its throwable.
      */
     private void mediaPlayerWav() {
-        File wav;
+        final File wav;
         try {
             wav = writeWav("probe.wav");
         } catch (IOException e) {
             Log.i("AtlTest", "mediaplayer-wav: no file " + thrown(e));
             return;
         }
-        for (int i = 0; i < WAV_ROUNDS; i++) {
-            String step = "setDataSource";
-            MediaPlayer mp = new MediaPlayer();
-            try {
-                if (i % 2 == 0) {
-                    FileInputStream in = new FileInputStream(wav);
+        final AtomicReference<String> at = new AtomicReference<String>("setDataSource");
+        Thread worker = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                for (int i = 0; i < WAV_ROUNDS; i++) {
+                    at.set("setDataSource");
+                    MediaPlayer mp = new MediaPlayer();
                     try {
-                        mp.setDataSource(in.getFD());
+                        if (i % 2 == 0) {
+                            FileInputStream in = new FileInputStream(wav);
+                            try {
+                                mp.setDataSource(in.getFD());
+                            } finally {
+                                in.close();
+                            }
+                        } else {
+                            mp.setDataSource(wav.getPath());
+                        }
+                        at.set("prepare");
+                        mp.prepare();
+                        at.set("start");
+                        mp.start();
+                        at.set("seekTo");
+                        mp.seekTo(WAV_SEEK_MS);
+                        at.set("reset");
+                        long t0 = System.nanoTime();
+                        mp.reset();
+                        long ms = (System.nanoTime() - t0) / 1000000L;
+                        Log.i("AtlTest", "mediaplayer-wav: round " + i + " ok " + ms + " ms");
+                    } catch (Throwable t) {
+                        Log.i("AtlTest", "mediaplayer-wav: round " + i + " " + at.get() + " " + thrown(t));
                     } finally {
-                        in.close();
+                        mp.release();
                     }
-                } else {
-                    mp.setDataSource(wav.getPath());
                 }
-                step = "prepare";
-                mp.prepare();
-                step = "start";
-                mp.start();
-                step = "seekTo";
-                mp.seekTo(WAV_SEEK_MS);
-                step = "reset";
-                long t0 = System.nanoTime();
-                mp.reset();
-                long ms = (System.nanoTime() - t0) / 1000000L;
-                Log.i("AtlTest", "mediaplayer-wav: round " + i + " ok " + ms + " ms");
-            } catch (Throwable t) {
-                Log.i("AtlTest", "mediaplayer-wav: round " + i + " " + step + " " + thrown(t));
-            } finally {
-                mp.release();
             }
-        }
+        });
+        worker.start();
+        joinProbe(worker, "mediaplayer-wav", WAV_ROUNDS, at);
     }
 
     /**
      * l1-restart regression (app.rs MEDIA_RESET): a seek is issued and reset runs at once, so the seek-complete notify can still be pending in the
-     * service while reset waits for the service. On a worker thread: each reset gets RESET_BOUND_MS, the whole probe RESET_ROUNDS times that; a reset
-     * that never returns leaves its round line out and the probe's line says "no answer".
+     * service while reset waits for the service. On a worker thread (joinProbe): each round gets ROUND_BOUND_MS; a reset that never returns leaves its round
+     * line out and the probe's line says "no answer within ... at reset".
      */
     private void mediaPlayerReset() {
+        final AtomicReference<String> at = new AtomicReference<String>("setDataSource");
         Thread worker = new Thread(new Runnable() {
             @Override
             public void run() {
-                String step = "setDataSource";
                 int i = 0;
                 try {
                     File wav = writeWav("reset.wav");
                     for (i = 0; i < RESET_ROUNDS; i++) {
                         MediaPlayer mp = new MediaPlayer();
                         try {
+                            at.set("setDataSource");
                             mp.setDataSource(wav.getPath());
-                            step = "prepare";
+                            at.set("prepare");
                             mp.prepare();
-                            step = "start";
+                            at.set("start");
                             mp.start();
-                            step = "seekTo";
+                            at.set("seekTo");
                             mp.seekTo(WAV_SEEK_MS);
-                            step = "reset";
+                            at.set("reset");
                             long t0 = System.nanoTime();
                             mp.reset();
                             long ms = (System.nanoTime() - t0) / 1000000L;
@@ -561,18 +572,26 @@ public class Main extends Activity {
                         }
                     }
                 } catch (Throwable t) {
-                    Log.i("AtlTest", "mediaplayer-reset: round " + i + " " + step + " " + thrown(t));
+                    Log.i("AtlTest", "mediaplayer-reset: round " + i + " " + at.get() + " " + thrown(t));
                 }
             }
         });
         worker.start();
+        joinProbe(worker, "mediaplayer-reset", RESET_ROUNDS, at);
+    }
+
+    /**
+     * Waits for a probe's worker: rounds * ROUND_BOUND_MS in all. A worker still running after that is named with the step it was in, so a round that
+     * never returns reads "no answer within <ms> ms at <step>" (app.rs round_failures).
+     */
+    private void joinProbe(Thread worker, String name, int rounds, AtomicReference<String> at) {
         try {
-            worker.join(RESET_ROUNDS * RESET_BOUND_MS);
+            worker.join(rounds * ROUND_BOUND_MS);
         } catch (InterruptedException e) {
-            Log.i("AtlTest", "mediaplayer-reset: interrupted " + e);
+            Log.i("AtlTest", name + ": interrupted " + e);
         }
         if (worker.isAlive()) {
-            Log.i("AtlTest", "mediaplayer-reset: no answer within " + RESET_ROUNDS * RESET_BOUND_MS + " ms");
+            Log.i("AtlTest", name + ": no answer within " + rounds * ROUND_BOUND_MS + " ms at " + at.get());
         }
     }
 
