@@ -237,6 +237,7 @@ public class Main extends Activity {
         bridge1Call(jni, "bitmapRgb565", "bitmapProbe", bitmap3x2(Bitmap.Config.RGB_565, RGB565_PIXELS));
         bridge1Call(jni, "windowProbe", "windowProbe", probeSurface());
         bridge1Call(jni, "mediandkLinked", "mediandkLinked");
+        bridge1Call(jni, "resolverProbe", "resolverProbe");
         // tr-first blocker 5: (a) on this thread inside the call; then a fresh thread arms the main looper for (b), read in onActivityResult
         bridge1Call(jni, "looperNow", "looperNow");
         Thread arm = new Thread(new Runnable() {

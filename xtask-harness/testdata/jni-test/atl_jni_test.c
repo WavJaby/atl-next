@@ -11,9 +11,13 @@
 #include <media/NdkMediaFormat.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
+#include <arpa/inet.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <jni.h>
 #include <pthread.h>
 #include <setjmp.h>
@@ -646,4 +650,116 @@ JNI_FN(jint, mediandkLinked)(JNIEnv *env, jclass cls)
 {
     AMediaFormat *(*volatile f)(void) = AMediaFormat_new;
     return f != NULL;
+}
+
+// AtlJniTest.resolverProbe (net-bp, engine/netdb.rs): the libc resolver family through the bridge, every answer read in bionic's layout and values. Fields: numeric 1 (AF_INET 127.0.0.1:80, one node, no canonical name); passive 1 (AI_PASSIVE null host, 0.0.0.0:8080); service = EAI_SERVICE (9); numerichost = EAI_NONAME (8, AI_NUMERICHOST on a name); text 1 (gai_strerror of EAI_NODATA and EAI_NONAME is bionic's); loop 1000 (1000 numeric lookups, each read back and freed); list ok (AF_UNSPEC passive list walked and freed, its length host-dependent, not printed). The unresolvable name is logged, not gated: its answer depends on the sandbox network.
+static int rp_numeric(void)
+{
+    struct addrinfo hints = {0}, *res = NULL;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo("127.0.0.1", "80", &hints, &res) != 0 || res == NULL)
+        return 0;
+    const struct sockaddr_in *sin = (const struct sockaddr_in *)res->ai_addr;
+    int ok = res->ai_family == AF_INET && res->ai_socktype == SOCK_STREAM && res->ai_addrlen == sizeof(struct sockaddr_in) && sin != NULL && sin->sin_family == AF_INET && sin->sin_port == htons(80) && sin->sin_addr.s_addr == htonl(INADDR_LOOPBACK) && res->ai_next == NULL && res->ai_canonname == NULL;
+    freeaddrinfo(res);
+    return ok;
+}
+
+static int rp_passive(void)
+{
+    struct addrinfo hints = {0}, *res = NULL;
+    hints.ai_flags = AI_PASSIVE;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(NULL, "8080", &hints, &res) != 0 || res == NULL)
+        return 0;
+    const struct sockaddr_in *sin = (const struct sockaddr_in *)res->ai_addr;
+    int ok = sin->sin_addr.s_addr == htonl(INADDR_ANY) && sin->sin_port == htons(8080);
+    freeaddrinfo(res);
+    return ok;
+}
+
+static int rp_service(void)
+{
+    struct addrinfo hints = {0}, *res = NULL;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    int rc = getaddrinfo("127.0.0.1", "nosuchservice", &hints, &res);
+    if (rc == 0)
+        freeaddrinfo(res);
+    return rc;
+}
+
+static int rp_numerichost(void)
+{
+    struct addrinfo hints = {0}, *res = NULL;
+    hints.ai_flags = AI_NUMERICHOST;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    int rc = getaddrinfo("nonexistent.invalid", "80", &hints, &res);
+    if (rc == 0)
+        freeaddrinfo(res);
+    return rc;
+}
+
+static int rp_text(void)
+{
+    return strcmp(gai_strerror(EAI_NODATA), "No address associated with hostname") == 0 && strcmp(gai_strerror(EAI_NONAME), "hostname nor servname provided, or not known") == 0;
+}
+
+static int rp_loop(void)
+{
+    for (int i = 0; i < 1000; i++) {
+        struct addrinfo hints = {0}, *res = NULL;
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        if (getaddrinfo("127.0.0.1", "80", &hints, &res) != 0 || res == NULL)
+            return 0;
+        int ok = ((const struct sockaddr_in *)res->ai_addr)->sin_port == htons(80);
+        freeaddrinfo(res);
+        if (!ok)
+            return 0;
+    }
+    return 1000;
+}
+
+static int rp_list(void)
+{
+    struct addrinfo hints = {0}, *res = NULL;
+    hints.ai_flags = AI_PASSIVE;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(NULL, "80", &hints, &res) != 0 || res == NULL)
+        return 0;
+    int ok = 1, n = 0;
+    for (struct addrinfo *a = res; a != NULL; a = a->ai_next) {
+        n++;
+        if (a->ai_addr == NULL || (a->ai_family != AF_INET && a->ai_family != AF_INET6))
+            ok = 0;
+        else if (a->ai_family == AF_INET && ((const struct sockaddr_in *)a->ai_addr)->sin_port != htons(80))
+            ok = 0;
+    }
+    freeaddrinfo(res);
+    return ok && n > 0;
+}
+
+static void rp_unresolved(void)
+{
+    struct addrinfo hints = {0}, *res = NULL;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    int rc = getaddrinfo("nonexistent.invalid", "80", &hints, &res);
+    __android_log_print(ANDROID_LOG_INFO, "atl-resolver", "unresolved rc=%d text=%s", rc, rc != 0 ? gai_strerror(rc) : "(success)");
+    if (rc == 0)
+        freeaddrinfo(res);
+}
+
+JNI_FN(jstring, resolverProbe)(JNIEnv *env, jclass cls)
+{
+    char line[256];
+    rp_unresolved();
+    snprintf(line, sizeof line, "numeric %d passive %d service %d numerichost %d text %d loop %d list %s",
+             rp_numeric(), rp_passive(), rp_service(), rp_numerichost(), rp_text(), rp_loop(), rp_list() ? "ok" : "fail");
+    return (*env)->NewStringUTF(env, line);
 }

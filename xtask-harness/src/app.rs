@@ -196,6 +196,8 @@ const BRIDGE1_CALLS: &[(&str, &str)] = &[
     ("windowProbe", "window 48 32 1"),
     // G6b: the fixture library (DT_NEEDED libmediandk.so) loaded, so the guest found the libmediandk proxy; 1 = C's `f != NULL` for AMediaFormat_new (atl_jni_test.c mediandkLinked)
     ("mediandkLinked", "1"),
+    // net-bp (engine/netdb.rs; atl_jni_test.c resolverProbe): getaddrinfo / freeaddrinfo / getnameinfo / gai_strerror through the bridge on both engines; the failures carry bionic's EAI_* codes (service 9, numerichost 8), the loop is 1000 lookups with every node freed
+    ("resolverProbe", "numeric 1 passive 1 service 9 numerichost 8 text 1 loop 1000 list ok"),
     // tr-first blocker 5 (atl_jni_test.c looperNow / looperArm / looperLater; engine/ndk.rs `call_mapped` hands the host a down shell for the guest callback): (a) one call, on the calling thread, pollOnce = ALOOPER_POLL_CALLBACK (-2, looper.h), no wrong user data; (b) the main Looper's later call of the callback a fresh thread registered: one call, on the main thread, which is not the arming one, no wrong user data
     ("looperNow", "now 1 1 -2 0"),
     ("looperArm", "armed"),

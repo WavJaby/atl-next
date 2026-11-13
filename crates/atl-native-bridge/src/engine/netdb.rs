@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! Host sides of the guest resolver stubs (QEMU table, build.rs `QEMU_SHIMS`): bionic's `struct addrinfo` swaps `ai_canonname` and `ai_addr` against glibc's, and every AI_ / NI_ / EAI_ value differs (bionic netdb.h vs glibc netdb.h), so each call converts. The bionic side is generated from bionic's netdb.h (thread.rs `layout::qemu`), the glibc side is the libc crate; both gated below.
+//! Host sides of the guest resolver stubs, both engines (build.rs `SHIMS`): bionic's `struct addrinfo` swaps `ai_canonname` and `ai_addr` against glibc's, and every AI_ / NI_ / EAI_ value differs (bionic netdb.h vs glibc netdb.h), so each call converts. The bionic side is generated from bionic's netdb.h (thread.rs `layout::qemu`; `layout::identity` asserted equal below), the glibc side is the libc crate; both gated below.
+//! `gai_strerror` answers bionic's own text (build.rs `gai_errlist_rs`), no host call.
 //! `struct hostent` is the same in both: `gethostbyname` and `gethostbyaddr` are plain glibc rows (build.rs `GLIBC`), gated here.
 //! `sockaddr` passes through: the kernel's layout, the same for both libcs.
 
@@ -8,7 +9,47 @@ use std::ffi::{c_char, c_int};
 use std::mem::{offset_of, size_of};
 use std::sync::Mutex;
 
-use super::thread::layout::qemu as g;
+use super::thread::layout::{identity, qemu as g};
+
+// bionic_thread_{identity,qemu}: the identity guest is the host arch's bionic, the QEMU guest arm64's. Both LP64 and one netdb.h, so one implementation serves both engines; equal here, not assumed.
+const _: () = {
+    assert!(identity::addrinfo::SIZE == g::addrinfo::SIZE);
+    assert!(identity::addrinfo::ai_flags == g::addrinfo::ai_flags);
+    assert!(identity::addrinfo::ai_family == g::addrinfo::ai_family);
+    assert!(identity::addrinfo::ai_socktype == g::addrinfo::ai_socktype);
+    assert!(identity::addrinfo::ai_protocol == g::addrinfo::ai_protocol);
+    assert!(identity::addrinfo::ai_addrlen == g::addrinfo::ai_addrlen);
+    assert!(identity::addrinfo::ai_addr == g::addrinfo::ai_addr);
+    assert!(identity::addrinfo::ai_canonname == g::addrinfo::ai_canonname);
+    assert!(identity::addrinfo::ai_next == g::addrinfo::ai_next);
+    assert!(identity::AI_MASK == g::AI_MASK);
+    assert!(identity::AI_PASSIVE == g::AI_PASSIVE);
+    assert!(identity::AI_CANONNAME == g::AI_CANONNAME);
+    assert!(identity::AI_NUMERICHOST == g::AI_NUMERICHOST);
+    assert!(identity::AI_NUMERICSERV == g::AI_NUMERICSERV);
+    assert!(identity::AI_ADDRCONFIG == g::AI_ADDRCONFIG);
+    assert!(identity::NI_NOFQDN == g::NI_NOFQDN);
+    assert!(identity::NI_NUMERICHOST == g::NI_NUMERICHOST);
+    assert!(identity::NI_NAMEREQD == g::NI_NAMEREQD);
+    assert!(identity::NI_NUMERICSERV == g::NI_NUMERICSERV);
+    assert!(identity::NI_DGRAM == g::NI_DGRAM);
+    assert!(identity::EAI_ADDRFAMILY == g::EAI_ADDRFAMILY);
+    assert!(identity::EAI_AGAIN == g::EAI_AGAIN);
+    assert!(identity::EAI_BADFLAGS == g::EAI_BADFLAGS);
+    assert!(identity::EAI_FAIL == g::EAI_FAIL);
+    assert!(identity::EAI_FAMILY == g::EAI_FAMILY);
+    assert!(identity::EAI_MEMORY == g::EAI_MEMORY);
+    assert!(identity::EAI_NODATA == g::EAI_NODATA);
+    assert!(identity::EAI_NONAME == g::EAI_NONAME);
+    assert!(identity::EAI_SERVICE == g::EAI_SERVICE);
+    assert!(identity::EAI_SOCKTYPE == g::EAI_SOCKTYPE);
+    assert!(identity::EAI_SYSTEM == g::EAI_SYSTEM);
+    assert!(identity::EAI_OVERFLOW == g::EAI_OVERFLOW);
+};
+
+// bionic's text table, indexed by its EAI_* values: one entry per value 0..=EAI_MAX (netdb.h: EAI_MAX = EAI_OVERFLOW + 1)
+include!(concat!(env!("OUT_DIR"), "/gai_errlist.rs"));
+const _: () = assert!(GAI_ERRLIST.len() == g::EAI_OVERFLOW as usize + 2);
 
 // hostent: same layout, so the glibc row hands the guest glibc's own answer
 const _: () = {
@@ -55,6 +96,7 @@ const NI: [(i32, c_int); 5] = [
 const GLIBC_EAI_ADDRFAMILY: c_int = -9;
 
 /// Host error -> guest error. A host code not here (glibc's asynchronous ones) is EAI_FAIL.
+/// (Break `dns_eai_raw` returns the host's code unmapped.)
 const EAI: [(c_int, i32); 12] = [
     (GLIBC_EAI_ADDRFAMILY, g::EAI_ADDRFAMILY),
     (libc::EAI_AGAIN, g::EAI_AGAIN),
@@ -87,9 +129,27 @@ fn guest_error(host: c_int) -> c_int {
     if host == 0 {
         return 0;
     }
+    if cfg!(atl_nb_dns_eai_raw) {
+        return host;
+    }
     EAI.iter()
         .find(|&&(h, _)| h == host)
         .map_or(g::EAI_FAIL, |&(_, guest)| guest)
+}
+
+/// A failed lookup's guest code. bionic answers EAI_NODATA for a host it does not find (getaddrinfo.c:835, NS_NOTFOUND; a NULL host at :728); glibc answers EAI_NONAME for both. bionic's EAI_NONAME is for the numeric-only flags (AI_NUMERICHOST :730, AI_NUMERICSERV :1190), which keep glibc's meaning.
+fn lookup_error(host: c_int, guest_flags: i32) -> c_int {
+    if host == libc::EAI_NONAME && guest_flags & (g::AI_NUMERICHOST | g::AI_NUMERICSERV) == 0 {
+        return g::EAI_NODATA;
+    }
+    guest_error(host)
+}
+
+/// `const char* gai_strerror(int)`: bionic's text for its own code; out of range answers EAI_MAX's text (bionic clamps the same way). No host call.
+pub(super) extern "C" fn gai_strerror(ecode: c_int) -> *const c_char {
+    let last = GAI_ERRLIST.len() - 1;
+    let i = usize::try_from(ecode).map_or(last, |e| e.min(last));
+    GAI_ERRLIST[i].as_ptr()
 }
 
 /// Guest lists [`getaddrinfo`] made and [`freeaddrinfo`] has not freed: their heads.
@@ -183,6 +243,7 @@ pub(super) extern "C" fn getaddrinfo(
     }
     // SAFETY: zeroed is a valid empty addrinfo (bionic and glibc both read null hints fields as unset).
     let mut host_hints: libc::addrinfo = unsafe { std::mem::zeroed() };
+    let mut guest_flags = 0;
     if !hints.is_null() {
         // SAFETY: the guest's hints, bionic layout (generated offsets); bionic reads only these four fields of hints.
         let (flags, family, socktype, protocol) = unsafe {
@@ -196,6 +257,7 @@ pub(super) extern "C" fn getaddrinfo(
         let Some(f) = map_flags(flags, &AI) else {
             return g::EAI_BADFLAGS;
         };
+        guest_flags = flags;
         host_hints.ai_flags = f;
         host_hints.ai_family = family;
         host_hints.ai_socktype = socktype;
@@ -216,7 +278,7 @@ pub(super) extern "C" fn getaddrinfo(
         )
     };
     if rc != 0 {
-        return guest_error(rc);
+        return lookup_error(rc, guest_flags);
     }
     let mut head: *mut u8 = std::ptr::null_mut();
     let mut tail: *mut u8 = std::ptr::null_mut();
@@ -314,5 +376,32 @@ mod tests {
         // bionic AI_V4MAPPED (0x800) is outside AI_MASK: bionic answers EAI_BADFLAGS
         assert_eq!(map_flags(0x800, &AI), None);
         assert_eq!(map_flags(1 | 8, &AI), Some(1 | 0x400));
+    }
+
+    #[test]
+    fn lookup_failures_answer_bionic_codes() {
+        // bionic netdb.h values (spec literals): EAI_AGAIN 2, EAI_NODATA 7, EAI_NONAME 8, EAI_SERVICE 9; guest AI_NUMERICHOST 4, AI_NUMERICSERV 8
+        assert_eq!(lookup_error(libc::EAI_NONAME, 0), 7, "host not found");
+        assert_eq!(lookup_error(libc::EAI_NONAME, 4), 8, "AI_NUMERICHOST");
+        assert_eq!(lookup_error(libc::EAI_NONAME, 8), 8, "AI_NUMERICSERV");
+        assert_eq!(lookup_error(libc::EAI_AGAIN, 0), 2, "temporary failure");
+        assert_eq!(guest_error(libc::EAI_SERVICE), 9, "EAI_SERVICE");
+    }
+
+    #[test]
+    fn gai_strerror_is_bionic_text() {
+        // bionic getaddrinfo.c ai_errlist, spec literals; out of range answers EAI_MAX's text
+        let text = |c: c_int| {
+            // SAFETY: gai_strerror answers a NUL-terminated entry of GAI_ERRLIST, which lives for the program
+            unsafe { std::ffi::CStr::from_ptr(gai_strerror(c)) }
+                .to_str()
+                .expect("ASCII text")
+        };
+        assert_eq!(text(0), "Success");
+        assert_eq!(text(7), "No address associated with hostname");
+        assert_eq!(text(8), "hostname nor servname provided, or not known");
+        assert_eq!(text(15), "Unknown error");
+        assert_eq!(text(-1), "Unknown error");
+        assert_eq!(text(99), "Unknown error");
     }
 }

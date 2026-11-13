@@ -189,9 +189,11 @@ fn shim(name: &str) -> Option<usize> {
         n if super::intercepts::by_handle_fn(n).is_some() => super::intercepts::by_handle_fn(n)?,
         // Q7-7: QEMU table only (build.rs `QEMU_SHIMS`)
         "pthread_exit" => super::intercepts::pthread_exit as *const () as usize,
+        // net-bp: both engines (build.rs `SHIMS`)
         "getaddrinfo" => super::netdb::getaddrinfo as *const () as usize,
         "freeaddrinfo" => super::netdb::freeaddrinfo as *const () as usize,
         "getnameinfo" => super::netdb::getnameinfo as *const () as usize,
+        "gai_strerror" => super::netdb::gai_strerror as *const () as usize,
         "__system_property_foreach" => super::provider::foreach as *const () as usize,
         "__system_property_read_callback" => super::provider::read_callback as *const () as usize,
         "sigaction" | "sigaction64" => super::signal::sigaction as *const () as usize,

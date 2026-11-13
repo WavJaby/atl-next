@@ -149,6 +149,9 @@ public final class AtlJniTest {
     /** G6b: 1 when the library's DT_NEEDED libmediandk.so proxy loaded and AMediaFormat_new resolved (atl_jni_test.c mediandkLinked). */
     public static native int mediandkLinked();
 
+    /** net-bp: the libc resolver family through the bridge, one line of checks (atl_jni_test.c resolverProbe). */
+    public static native String resolverProbe();
+
     /** tr-first blocker 5: a guest ALooper callback called by the host during ALooper_pollOnce on this thread (atl_jni_test.c looperNow). Main thread. */
     public static native String looperNow();
 
