@@ -10,24 +10,25 @@ it serves, and makes on_transact call PATH(descriptor, method, code,
 exception, status) once per non-OK outcome it sends back: an
 exception reply (enforce failure, a method's Err), a oneway method's
 dropped Err, and any Err(StatusCode) leaving on_transact (argument
-decode failure, UNKNOWN_TRANSACTION, unknown code). A transaction
-error Status written to the reply leaves on_transact as that Err, so
-the per-method site skips it and the outer one counts it.
+decode failure, UNKNOWN_TRANSACTION, unknown code). The per-method
+site runs after the reply is written; writing a transaction-error
+Status returns its code as Err (libbinder Status::writeToParcel), so
+such an outcome reaches only the outer site.
 
 Upstream-Status: Inappropriate [ATL host tool: Rust services implement a subset of framework AIDL and count what they refuse]
 Patch-Reason: every IFoo method is a required trait method (generate_rust.cpp GenerateRustInterface); IActivityManager alone has ~260, and no build config, environment or wrapper crate can give a trait default bodies; on_transact is generated code, so the one place every reply passes is inside the generator
 ---
 SPDX-License-Identifier: Apache-2.0
- generate_rust.cpp | 67 ++++++++++++++++++++++++++++++++++++++++++-----
+ generate_rust.cpp | 61 +++++++++++++++++++++++++++++++++++++++++------
  options.cpp       |  6 +++++
  options.h         |  5 ++++
- 3 files changed, 71 insertions(+), 7 deletions(-)
+ 3 files changed, 65 insertions(+), 7 deletions(-)
 
 diff --git a/generate_rust.cpp b/generate_rust.cpp
-index d5ebf973bcac01592080eed7e28da9ca434b6217..a40ff8f0cc7e8233d294023fcf2e05f58bbfd790 100644
+index d5ebf973bcac01592080eed7e28da9ca434b6217..06089c6de9a8d4a4242c90427297b3e84a235add 100644
 --- a/generate_rust.cpp
 +++ b/generate_rust.cpp
-@@ -454,6 +454,14 @@ void GenerateClientMethod(CodeWriter& out, const AidlInterface& iface, const Aid
+@@ -454,6 +454,13 @@ void GenerateClientMethod(CodeWriter& out, const AidlInterface& iface, const Aid
  const char* kEnforceHook =
      "fn r#enforce_permission(&self, method: &str, permission: EnforcePermission<'_>) -> "
      "binder::Result<()>";
@@ -35,29 +36,26 @@ index d5ebf973bcac01592080eed7e28da9ca434b6217..a40ff8f0cc7e8233d294023fcf2e05f5
 +// Java's Binder.onTransact answers a code it does not know), and on_transact calls
 +// PATH(descriptor, method, code, exception, status) once per non-OK outcome it sends back: an
 +// exception reply (enforce failure, a method's Err), a oneway method's dropped Err, and any
-+// Err(StatusCode) leaving on_transact (argument decode, UNKNOWN_TRANSACTION, unknown code). A
-+// transaction-error Status written to the reply leaves as that Err, so it is counted there only.
++// Err(StatusCode) leaving on_transact (argument decode, UNKNOWN_TRANSACTION, unknown code).
 +const char* kUnknownTransactionBody =
 +    " { Err(binder::StatusCode::UNKNOWN_TRANSACTION.into()) }\n";
  bool HasEnforce(const AidlInterface& iface) {
    for (const auto& m : iface.GetMethods())
      if (m->GetType().EnforceExpression()) return true;
-@@ -469,7 +477,13 @@ struct RustPermission {
+@@ -469,7 +476,11 @@ struct RustPermission {
  };
  
  void GenerateServerTransaction(CodeWriter& out, const AidlInterface& interface,
 -                               const AidlMethod& method, const AidlTypenames& typenames) {
 +                               const AidlMethod& method, const AidlTypenames& typenames,
 +                               bool reply_hook) {
-+  // after the reply is written, so a failing write is counted once, as the Err it returns
-+  const string reported =
-+      reply_hook ? string("_aidl_reported(_aidl_code, &_aidl_status, ") +
-+                       (method.IsOneway() ? "true" : "false") + ");\n"
-+                 : "";
++  // after the reply is written: writing a transaction-error Status returns its code as Err (libbinder
++  // Status::writeToParcel), which `?` sends to the outer site, so each outcome passes one site
++  const string reported = reply_hook ? "_aidl_reported(_aidl_code, &_aidl_status);\n" : "";
    out << "transactions::r#" << method.GetName() << " => {\n";
    out.Indent();
    if (method.IsUserDefined() && method.IsNew() &&
-@@ -486,7 +500,7 @@ void GenerateServerTransaction(CodeWriter& out, const AidlInterface& interface,
+@@ -486,7 +497,7 @@ void GenerateServerTransaction(CodeWriter& out, const AidlInterface& interface,
    if (expr) {
      out << "if let Err(_aidl_status) = _aidl_service.r#enforce_permission(\"" << method.GetName()
          << "\", EnforcePermission::" << std::visit(RustPermission(), *expr) << ") {\n"
@@ -66,7 +64,7 @@ index d5ebf973bcac01592080eed7e28da9ca434b6217..a40ff8f0cc7e8233d294023fcf2e05f5
          << "  return Ok(());\n}\n";
    }
  
-@@ -551,9 +565,15 @@ void GenerateServerTransaction(CodeWriter& out, const AidlInterface& interface,
+@@ -551,9 +562,15 @@ void GenerateServerTransaction(CodeWriter& out, const AidlInterface& interface,
      }
      out.Dedent();
      out << "}\n";
@@ -83,7 +81,7 @@ index d5ebf973bcac01592080eed7e28da9ca434b6217..a40ff8f0cc7e8233d294023fcf2e05f5
    }
    out << "Ok(())\n";
    if (method.IsUserDefined() && method.IsNew() &&
-@@ -566,7 +586,7 @@ void GenerateServerTransaction(CodeWriter& out, const AidlInterface& interface,
+@@ -566,7 +583,7 @@ void GenerateServerTransaction(CodeWriter& out, const AidlInterface& interface,
  }
  
  void GenerateServerItems(CodeWriter& out, const AidlInterface* iface,
@@ -92,7 +90,7 @@ index d5ebf973bcac01592080eed7e28da9ca434b6217..a40ff8f0cc7e8233d294023fcf2e05f5
    auto trait_name = ClassName(*iface, cpp::ClassNames::INTERFACE);
    auto server_name = ClassName(*iface, cpp::ClassNames::SERVER);
  
-@@ -590,6 +610,23 @@ void GenerateServerItems(CodeWriter& out, const AidlInterface* iface,
+@@ -590,6 +607,20 @@ void GenerateServerItems(CodeWriter& out, const AidlInterface* iface,
    out.Dedent();
    out << "}\n";
  
@@ -104,19 +102,16 @@ index d5ebf973bcac01592080eed7e28da9ca434b6217..a40ff8f0cc7e8233d294023fcf2e05f5
 +      out << "    transactions::r#" << method->GetName() << " => Some(\"" << method->GetName()
 +          << "\"),\n";
 +    out << "    _ => None,\n  }\n}\n";
-+    // an exception reply leaves on_transact as Ok; a transaction error leaves as Err, counted there
 +    out << "fn _aidl_reported(_aidl_code: binder::binder_impl::TransactionCode, _aidl_status: "
-+           "&binder::Status, _aidl_oneway: bool) {\n"
-+        << "  if _aidl_oneway || _aidl_status.exception_code() != "
-+           "binder::ExceptionCode::TRANSACTION_FAILED {\n"
-+        << "    " << reply_hook << "(\"" << iface->GetDescriptor()
++           "&binder::Status) {\n"
++        << "  " << reply_hook << "(\"" << iface->GetDescriptor()
 +        << "\", _aidl_method_name(_aidl_code), _aidl_code, _aidl_status.exception_code() as i32, "
-+           "_aidl_status.transaction_error() as i32);\n  }\n}\n";
++           "_aidl_status.transaction_error() as i32);\n}\n";
 +  }
    out << "fn on_transact("
           "_aidl_service: &dyn "
        << trait_name
-@@ -600,14 +637,23 @@ void GenerateServerItems(CodeWriter& out, const AidlInterface* iface,
+@@ -600,14 +631,23 @@ void GenerateServerItems(CodeWriter& out, const AidlInterface* iface,
           "binder::StatusCode> "
           "{\n";
    out.Indent();
@@ -141,7 +136,7 @@ index d5ebf973bcac01592080eed7e28da9ca434b6217..a40ff8f0cc7e8233d294023fcf2e05f5
    out.Dedent();
    out << "}\n";
  }
-@@ -708,6 +754,8 @@ void GenerateRustInterface(CodeWriter* code_writer, const AidlInterface* iface,
+@@ -708,6 +748,8 @@ void GenerateRustInterface(CodeWriter* code_writer, const AidlInterface* iface,
    *code_writer << "pub trait " << trait_name << ": binder::Interface + Send {\n";
    code_writer->Indent();
    if (enforce) *code_writer << kEnforceHook << ";\n";
@@ -150,7 +145,7 @@ index d5ebf973bcac01592080eed7e28da9ca434b6217..a40ff8f0cc7e8233d294023fcf2e05f5
    *code_writer << "fn get_descriptor() -> &'static str where Self: Sized { \""
                 << iface->GetDescriptor() << "\" }\n";
  
-@@ -715,7 +763,12 @@ void GenerateRustInterface(CodeWriter* code_writer, const AidlInterface* iface,
+@@ -715,7 +757,12 @@ void GenerateRustInterface(CodeWriter* code_writer, const AidlInterface* iface,
      // Generate the method
      GenerateDeprecated(*code_writer, *method);
      if (method->IsUserDefined()) {
@@ -164,7 +159,7 @@ index d5ebf973bcac01592080eed7e28da9ca434b6217..a40ff8f0cc7e8233d294023fcf2e05f5
      } else {
        // Generate default implementations for meta methods
        *code_writer << BuildMethod(*method, typenames, iface->IsVintfStability()) << " {\n";
-@@ -1035,7 +1088,7 @@ void GenerateRustInterface(CodeWriter* code_writer, const AidlInterface* iface,
+@@ -1035,7 +1082,7 @@ void GenerateRustInterface(CodeWriter* code_writer, const AidlInterface* iface,
    *code_writer << "}\n";
  
    // Generate the server-side methods
