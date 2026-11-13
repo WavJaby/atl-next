@@ -16,8 +16,8 @@ pub mod sensor_wire;
 #[cfg(feature = "converter")]
 pub mod ui_agent;
 
-/// The stubs' `unimplemented` hook: counted ([`atl_services_types::counters`]), then UNKNOWN_TRANSACTION (frameworks/base core/java/android/os/Binder.java onTransact returns false for a code it does not know,
-/// which the caller sees as UNKNOWN_TRANSACTION; a Java proxy then reads an empty reply: no exception, a null / zero result).
+/// A sub-case of an implemented method that is not: counted under its own name (`method (reason)`, [`atl_services_types::counters`]), then UNKNOWN_TRANSACTION (Binder.java onTransact's answer to a code it does not know: a Java proxy reads
+/// an empty reply, a null / zero result). The reply hook also counts the method itself; the reason moves to the hook's cause later (plan diagnostics-f4 D2).
 #[cfg(feature = "converter")]
 pub fn unimplemented(interface: &'static str, method: &str) -> binder::Status {
     atl_services_types::counters::count_unimplemented(interface, method);

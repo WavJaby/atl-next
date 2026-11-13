@@ -12,7 +12,7 @@ publish.workspace = true
 # Plain workspace builds and tests take the empty library and skip the probe.
 # `android.hardware.graphics.allocator-V2-rust` is AOSP's own Rust backend of the stable HAL interface (stability vintf, frozen at V2 = its current sources): an unstable crate cannot compile @VintfStability types (aidl.cpp), so it is not one of the crate's `types`.
 [package.metadata.atl]
-converter = ["device/libbinder_rs", "device/android.hardware.graphics.allocator-V2-rust"]
+converter = ["device/libbinder_rs", "device/libatl_parcelables", "device/android.hardware.graphics.allocator-V2-rust"]
 
 # types: IServiceManager (libbinder's own AIDL), the M2 framework interfaces, and the M3 window path (IWindowManager, IWindowSession, IWindow, IDisplayManager; libgui's `android.gui` ISurfaceComposer and its client / display-event interfaces), IInputMethodManager (the input method service, input_method.rs), IInputMethod / IInputMethodSession / IInputMethodSessionCallback (the in-app input method atl-ime serves and IMMS-lite binds, ime_bind.rs), IAndroidFuture (the getSurroundingText result atl-ime receives), IInputManager (the input service, input.rs), IStorageManager (the mount service, storage.rs; its IVoldTaskListener import is in system/vold/binder), IClipboard (the clipboard service, clipboard.rs), compiled with their import closure.
 # A type another aidl_interface owns is imported at its latest frozen version, not compiled (bp2ninja aidlcrates.go): android.hardware.graphics.common (DisplayDecorationSupport, ...) is `android.hardware.graphics.common-V6-rust`. The interfaces owning a requested type are stood in for: `android.gui` brings its rust backend's `libgui_aidl_types_rs` (BitTube, LayerMetadata, VsyncEventData, ... as `todo!()` stubs).
@@ -97,6 +97,8 @@ types = [
     "android.hardware.ISerialManager",
 ]
 parcelables = "atl-parcelables"
+# every non-OK reply a served interface sends is counted once (aidl patch --rust_reply_hook); methods a service does not implement answer UNKNOWN_TRANSACTION
+reply_hook = { package = "atl-diag", path = "atl_diag::binder_reply" }
 
 [features]
 converter = []

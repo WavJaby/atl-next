@@ -29,16 +29,11 @@ use atl_parcelables::codecs::com::android::internal::infra::AndroidFuture::{
 };
 use atl_parcelables::com::android::internal::infra::AndroidFuture;
 use atl_platform_ui::UiInvoker;
-use binder::{BinderFeatures, Interface, SpIBinder, Status, StatusCode, Strong};
+use binder::{BinderFeatures, Interface, SpIBinder, Strong};
 
 use crate::field::{self, Field};
 
 type Invoker = Arc<dyn UiInvoker>;
-
-fn unserved(method: &'static str) -> Status {
-    tracing::warn!("atl-ime: {method} not served");
-    StatusCode::UNKNOWN_TRANSACTION.into()
-}
 
 /// Queues a field start on the UI thread.
 fn start_field(
@@ -72,10 +67,6 @@ struct SurroundingFuture {
 impl Interface for SurroundingFuture {}
 
 impl IAndroidFuture for SurroundingFuture {
-    fn r#unimplemented(&self, method: &'static str) -> Status {
-        unserved(method)
-    }
-
     fn r#complete(&self, result: Option<&AndroidFuture>) -> binder::Result<()> {
         match result.map(|f| &f.state) {
             Some(FutureState::Done(FutureValue::SurroundingText(text))) => {
@@ -111,10 +102,6 @@ struct InputMethod {
 impl Interface for InputMethod {}
 
 impl IInputMethod for InputMethod {
-    fn r#unimplemented(&self, method: &'static str) -> Status {
-        unserved(method)
-    }
-
     /// IInputMethodWrapper.initializeInternal: the IME's window token and privileged operations; this IME has no window, so nothing is kept.
     fn r#initializeInternal(&self, _params: Option<&InitParams>) -> binder::Result<()> {
         tracing::info!("atl-ime: initializeInternal");
@@ -201,10 +188,6 @@ struct Session {
 impl Interface for Session {}
 
 impl IInputMethodSession for Session {
-    fn r#unimplemented(&self, method: &'static str) -> Status {
-        unserved(method)
-    }
-
     /// The editor's selection moved: the desktop input method's surrounding text is refreshed from the editor (field.rs).
     fn r#updateSelection(
         &self,

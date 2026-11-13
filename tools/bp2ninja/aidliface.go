@@ -248,8 +248,10 @@ type aidlSpec struct {
 	prevReported bool
 	// rust: --rust_java_type values (an aidl crate with parcelables, aidlcrates.go)
 	javaTypes []string
-	// rust, every aidl crate (framework AIDL our Rust services serve, each a subset, to Java callers): --rust_unimplemented_hook and --rust_java_nullability
+	// rust, every aidl crate (framework AIDL our Rust services serve, each a subset, to Java callers): --rust_java_nullability
 	rustServed bool
+	// rust, an aidl crate with reply_hook (aidlcrates.go): --rust_reply_hook=<path>
+	replyHook string
 }
 
 func strVals(list []string) []Val {
@@ -359,6 +361,7 @@ func (g *Graph) synthAidl(ref string, side Side) *Module {
 		}
 		spec.javaTypes = c.javaTypes
 		spec.rustServed = true
+		spec.replyHook = c.replyHook
 	}
 	for _, h := range p.strs("headers") {
 		spec.includes = appendMissing(spec.includes, g.aidlLibraryDirs(h, side, ref, map[string]bool{}))
@@ -525,8 +528,11 @@ func (s *aidlSpec) flags(g *Graph, f srcFile, path func(string) string) (flags, 
 	for _, j := range s.javaTypes {
 		flags = append(flags, "--rust_java_type="+j)
 	}
+	if s.replyHook != "" {
+		flags = append(flags, "--rust_reply_hook="+s.replyHook)
+	}
 	if s.rustServed {
-		flags = append(flags, "--rust_unimplemented_hook", "--rust_java_nullability")
+		flags = append(flags, "--rust_java_nullability")
 	}
 	for _, r := range s.includes {
 		flags = append(flags, "-I"+path(r))

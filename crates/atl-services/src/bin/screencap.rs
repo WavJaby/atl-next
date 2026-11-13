@@ -47,10 +47,6 @@ struct Listener {
 impl binder::Interface for Listener {}
 
 impl IScreenCaptureListener for Listener {
-    fn r#unimplemented(&self, _method: &'static str) -> binder::Status {
-        binder::StatusCode::UNKNOWN_TRANSACTION.into()
-    }
-
     fn r#onScreenCaptureCompleted(
         &self,
         results: Option<&ScreenCaptureResults>,

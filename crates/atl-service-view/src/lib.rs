@@ -28,9 +28,8 @@ use atl_aidl::aidl::android::os::IServiceManager::{BnServiceManager, IServiceMan
 use atl_aidl::aidl::android::os::Service::Service;
 use atl_aidl::aidl::android::os::ServiceDebugInfo::ServiceDebugInfo;
 use atl_aidl::aidl::android::os::ServiceWithMetadata::ServiceWithMetadata;
-use atl_services_types::counters;
 use binder::unstable_api::{AsNative, new_spibinder};
-use binder::{BinderFeatures, ExceptionCode, FromIBinder, SpIBinder, Status, StatusCode, Strong};
+use binder::{BinderFeatures, ExceptionCode, FromIBinder, SpIBinder, Status, Strong};
 
 /// The installed view; set once by [`install`].
 static VIEW: OnceLock<Strong<dyn IServiceManager>> = OnceLock::new();
@@ -141,11 +140,6 @@ struct View;
 impl binder::Interface for View {}
 
 impl IServiceManager for View {
-    fn r#unimplemented(&self, method: &'static str) -> Status {
-        counters::count_unimplemented("IServiceManager", method);
-        Status::from(StatusCode::UNKNOWN_TRANSACTION)
-    }
-
     fn r#getService(&self, name: Option<&str>) -> binder::Result<Option<SpIBinder>> {
         match local(name) {
             Some(b) => Ok(Some(b)),

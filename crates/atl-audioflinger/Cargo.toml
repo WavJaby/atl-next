@@ -51,6 +51,8 @@ types = [
     "android.media.IAudioPolicyServiceClient",
     "android.media.AudioPolicyForcedConfig",
 ]
+# unserved methods answer UNKNOWN_TRANSACTION; every non-OK reply is counted (aidl patch --rust_reply_hook)
+reply_hook = { package = "atl-diag", path = "atl_diag::binder_reply" }
 
 [features]
 converter = ["atl-service-view/converter", "atl-audio-bridge/converter", "atl-services-wire/converter"]

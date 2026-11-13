@@ -10,9 +10,6 @@ use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, Thread
 use crate::packages::Permissions;
 use std::sync::Arc;
 
-/// The interface name counters use.
-const INTERFACE: &str = "IClipboard";
-
 struct ClipboardService {
     permissions: Arc<Permissions>,
 }
@@ -41,10 +38,6 @@ impl IClipboard for ClipboardService {
             ExceptionCode::SECURITY,
             Some(format!("{method}: caller lacks {permission:?}")),
         ))
-    }
-
-    fn r#unimplemented(&self, method: &'static str) -> Status {
-        atl_services_wire::unimplemented(INTERFACE, method)
     }
 }
 

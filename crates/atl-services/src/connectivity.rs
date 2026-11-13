@@ -204,10 +204,6 @@ impl ConnectivityService {
 impl Interface for ConnectivityService {}
 
 impl IConnectivityManager for ConnectivityService {
-    fn r#unimplemented(&self, method: &'static str) -> Status {
-        atl_services_wire::unimplemented(INTERFACE, method)
-    }
-
     /// getActiveNetworkInfo -> getFilteredNetworkInfo of the default network: its NetworkInfo (nothing blocks it), null without one.
     fn r#getActiveNetworkInfo(&self) -> binder::Result<Option<NetworkInfo>> {
         self.enforce_access("getActiveNetworkInfo")?;
@@ -318,7 +314,10 @@ impl IConnectivityManager for ConnectivityService {
         _declared_methods: i32,
     ) -> binder::Result<Option<NetworkRequest>> {
         if req_type != TRACK_DEFAULT {
-            return Err(self.unimplemented("requestNetwork(type other than TRACK_DEFAULT)"));
+            return Err(atl_services_wire::unimplemented(
+                INTERFACE,
+                "requestNetwork(type other than TRACK_DEFAULT)",
+            ));
         }
         self.enforce_access("requestNetwork")?;
         let Some(messenger) = messenger else {

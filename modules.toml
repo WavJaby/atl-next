@@ -102,6 +102,11 @@ uses = ["aidl", "compositor", "libgui-parcel", "ime", "libinput", "platform-ui",
 [android-runtime]
 crates = ["atl-android-runtime"]
 
+# binder reply outcomes counted per process: the aidl patch's reply hook (a leaf; converter-built AIDL crates and atl-parcelables link it as rust_library libatl_diag)
+[diag]
+crates = ["atl-diag"]
+exports = ["atl-diag"]
+
 # Rust stubs of AIDL interfaces against AOSP's libbinder_rs, both from the converter (built by `xtask native` after it), and the Rust types of the Java-only parcelables they pass (a converter rust_library)
 [aidl]
 crates = ["atl-aidl", "atl-parcelables", "atl-parcel-truth"]

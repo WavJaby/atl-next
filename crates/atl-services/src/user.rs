@@ -4,10 +4,8 @@
 //! ATL has one user, the system user (UserHandle.USER_SYSTEM = 0), always running and unlocked. The three state queries answer for it and nothing else; every other method stays counted.
 
 use atl_aidl::aidl::android::os::IUserManager::{BnUserManager, IUserManager};
-use binder::{BinderFeatures, Interface, SpIBinder, Status};
+use binder::{BinderFeatures, Interface, SpIBinder};
 
-/// The interface name counters use.
-const INTERFACE: &str = "IUserManager";
 /// UserHandle.USER_SYSTEM (UserHandle.java): the only user this runtime has.
 const USER_SYSTEM: i32 = 0;
 
@@ -16,10 +14,6 @@ struct UserService;
 impl Interface for UserService {}
 
 impl IUserManager for UserService {
-    fn r#unimplemented(&self, method: &'static str) -> Status {
-        atl_services_wire::unimplemented(INTERFACE, method)
-    }
-
     /// UserManagerService.isUserRunning:8005: a user with a state (mUserStates) is running; the system user has one, no other id does.
     fn r#isUserRunning(&self, user_id: i32) -> binder::Result<bool> {
         Ok(user_id == USER_SYSTEM)

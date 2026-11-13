@@ -238,10 +238,6 @@ impl INotificationManager for NotificationManager {
         ))
     }
 
-    fn r#unimplemented(&self, method: &'static str) -> Status {
-        atl_services_wire::unimplemented(INTERFACE, method)
-    }
-
     /// enqueueToast (:3969): queued per (pkg, token); a known one only takes the new duration (record.update). Refused (false, as AOSP): no package or TN, MAX_PACKAGE_TOASTS
     /// already queued, or a caller with no Task to show it in. A package not installed under the caller's uid -> SecurityException (checkCallerIsSameApp).
     fn r#enqueueToast(

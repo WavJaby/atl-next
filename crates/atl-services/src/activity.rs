@@ -1210,10 +1210,6 @@ impl IActivityManager for ActivityManager {
         Err(security(&format!("{method}: caller lacks {permission:?}")))
     }
 
-    fn r#unimplemented(&self, method: &'static str) -> Status {
-        atl_services_wire::unimplemented(AM, method)
-    }
-
     /// ActivityManagerService.checkPermissionForDevice (:6193-6200) -> checkComponentPermission: the granted permission states of `uid` (Permissions::check); one device.
     /// Was unimplemented, whose empty reply reads 0 = PERMISSION_GRANTED: every check passed.
     fn r#checkPermissionForDevice(
@@ -2205,10 +2201,6 @@ impl ActivityClientController {
 impl Interface for ActivityClientController {}
 
 impl IActivityClientController for ActivityClientController {
-    fn r#unimplemented(&self, method: &'static str) -> Status {
-        atl_services_wire::unimplemented(ACC, method)
-    }
-
     /// ActivityClientController.activityResumed:200-206 -> ActivityRecord.activityResumedLocked:6173, which finds the record by token, then clears its saved state, sets its splash-exit
     /// animation and handles size compat. None of that state exists here yet: the resume is logged by activity_task (`services: activity resumed <class> at=<stamp>`), which run-apk reads as onResume of the last one.
     fn r#activityResumed(
@@ -2381,10 +2373,6 @@ mod tests {
     impl Interface for Callback {}
 
     impl IRequestFinishCallback for Callback {
-        fn r#unimplemented(&self, _method: &'static str) -> Status {
-            StatusCode::UNKNOWN_TRANSACTION.into()
-        }
-
         fn r#requestFinish(&self) -> binder::Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.fail {

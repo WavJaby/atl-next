@@ -190,7 +190,8 @@ func TestAidlCrates(t *testing.T) {
 	}
 	parcelables := &AidlParcelables{Module: "libp", Crate: "p", Dir: dir, Edition: "2024", Rustlibs: []string{"libbinder_rs"},
 		Aconfig: []string{"flags-aconfig"}, Lints: []string{"-D", "warnings"}}
-	if err := g.addAidlCrates(map[string]AidlCrate{"pkg": {IncludeDirs: []string{"inc"}, Types: []string{"a.IFoo"}, Parcelables: parcelables}}); err != nil {
+	hook := &AidlReplyHook{Path: "h::reply", Module: "libh", Crate: "h", Dir: dir, Edition: "2024", Lints: []string{"-D", "warnings"}}
+	if err := g.addAidlCrates(map[string]AidlCrate{"pkg": {IncludeDirs: []string{"inc"}, Types: []string{"a.IFoo"}, Parcelables: parcelables, ReplyHook: hook}}); err != nil {
 		t.Fatal(err)
 	}
 	m := g.synth("pkg-rust", Device)
@@ -211,7 +212,10 @@ func TestAidlCrates(t *testing.T) {
 		t.Errorf("rustlibs %v lack libx, the crate of IFoo's `R rust_type \"x::R\"`", m.Props.strs("rustlibs"))
 	}
 	if !slices.Contains(m.Props.strs("rustlibs"), "libp") || !slices.Contains(m.aidl.javaTypes, "Map=p::java::util::Map") || len(m.aidl.preprocessed) != 1 || !m.aidl.rustServed {
-		t.Errorf("rustlibs %v, java types %v, preprocessed %v, unimplemented hook %v", m.Props.strs("rustlibs"), m.aidl.javaTypes, m.aidl.preprocessed, m.aidl.rustServed)
+		t.Errorf("rustlibs %v, java types %v, preprocessed %v, served %v", m.Props.strs("rustlibs"), m.aidl.javaTypes, m.aidl.preprocessed, m.aidl.rustServed)
+	}
+	if !slices.Contains(m.Props.strs("rustlibs"), "libh") || m.aidl.replyHook != "h::reply" || len(g.mods[Device]["libh"]) != 1 {
+		t.Errorf("reply hook: rustlibs %v, path %q, module %v", m.Props.strs("rustlibs"), m.aidl.replyHook, g.mods[Device]["libh"])
 	}
 	pre := g.genFiles[m.aidl.preprocessed[0]]
 	for _, want := range []string{"parcelable a.P rust_type \"p::a::P\";", "parcelable b.L<T> rust_type \"p::b::L\";", "parcelable c.type.Q rust_type \"p::c::r#type::Q\";", "parcelable a.Outer.Inner rust_type \"p::a::Outer_Inner\";", "parcelable a.Option rust_type \"p::a::Option_\";"} {

@@ -22,7 +22,7 @@ import (
 //     A compiled file referencing an unstructured parcelable with its own rust_type (`android.view.Surface`: "nativewindow::Surface") takes the tree's rust_library of that crate name as a rustlib; none in the tree is an error.
 //   - parcelables (optional): the crate giving Rust types to every unstructured `parcelable X;` declared under include_dirs without its own rust_type (all of them, not the closure's: one
 //     scan, no second walk to keep in step), through a generated preprocessed file `parcelable X rust_type "<crate>::<x path>";` (-p; aidl skips imports it defines), and to the Java-only
-//     builtins (aidlJavaOnly) through the host aidl patch's --rust_java_type (every aidl crate also gets its --rust_unimplemented_hook: our services implement a subset). The crate is a rust_library the converter builds from the package's cargo dir (Soong's additional_rustlibs):
+//     builtins (aidlJavaOnly) through the host aidl patch's --rust_java_type. The crate is a rust_library the converter builds from the package's cargo dir (Soong's additional_rustlibs):
 //     root <dir>/src/lib.rs, its rustlibs, plus a generated `parcelables.rs` in OUT_DIR (rust_aidl_parcelables, rustsrc.go) declaring each type: `pub use crate::codecs::<path>::<Name>::<Name>;`
 //     where <dir>/src/codecs/<java path>/<Name>.rs exists (a hand-written codec), else `crate::opaque!(<Name>[<T>], "<qualified>");`, in modules mirroring the Java packages; a nested class
 //     `Outer.Inner` is the type `Outer_Inner` (aidlDecl.rustName).
@@ -36,6 +36,18 @@ type AidlCrate struct {
 	IncludeDirs []string         `json:"include_dirs"`
 	Types       []string         `json:"types"`
 	Parcelables *AidlParcelables `json:"parcelables,omitempty"`
+	// reply_hook (optional): the host aidl patch's --rust_reply_hook (methods default to UNKNOWN_TRANSACTION, every non-OK reply calls Path); its crate joins the rustlibs
+	ReplyHook *AidlReplyHook `json:"reply_hook,omitempty"`
+}
+
+// AidlReplyHook: a function path and the dependency-free rust_library defining it (Cargo.toml `[package.metadata.atl] rust_library` of the package `aidl.reply_hook` names), shared by every crate naming it.
+type AidlReplyHook struct {
+	Path    string   `json:"path"`
+	Module  string   `json:"module"`
+	Crate   string   `json:"crate"`
+	Dir     string   `json:"dir"`
+	Edition string   `json:"edition"`
+	Lints   []string `json:"lints"`
 }
 
 // AidlParcelables is the rust_library giving unstructured parcelables their Rust types (Cargo.toml `[package.metadata.atl] rust_library` of the package `aidl.parcelables` names).
@@ -61,7 +73,8 @@ type aidlCrateSpec struct {
 	includes     []string
 	preprocessed string   // absolute, "" without parcelables
 	javaTypes    []string // --rust_java_type values
-	rustlibs     []string // additional_rustlibs: the parcelables crate
+	rustlibs     []string // additional_rustlibs: the parcelables crate, the reply hook's
+	replyHook    string   // --rust_reply_hook value, "" = none
 }
 
 // aidlParcelablesType: the source provider generating a parcelables crate's parcelables.rs (rustsrc.go row); its module carries the text (Module.genText).
@@ -422,6 +435,11 @@ func (g *Graph) addAidlCrates(crates map[string]AidlCrate) error {
 				return fmt.Errorf("aidl crate %s: %w", name, err)
 			}
 		}
+		if h := c.ReplyHook; h != nil {
+			if err := g.addReplyHook(h, spec); err != nil {
+				return fmt.Errorf("aidl crate %s: %w", name, err)
+			}
+		}
 		// the interfaces it stands in for contribute their rust backend's additional_rustlibs, as their own `-rust` library would take them (aidl_interface.go addRustLibrary)
 		for _, i := range standIn {
 			spec.rustlibs = appendMissing(spec.rustlibs, i.props.obj("backend").obj("rust").strs("additional_rustlibs"))
@@ -446,6 +464,34 @@ func (g *Graph) addAidlCrates(crates map[string]AidlCrate) error {
 		props.set("imports", strVals(imports))
 		g.mods[Device][name] = append(g.mods[Device][name], &Module{Type: "aidl_interface", Name: name, Props: props, aidlCrate: spec})
 	}
+	return nil
+}
+
+// addReplyHook: the hook's rust_library (registered once, the same for every crate naming it; a different module of that name is an error) as a rustlib, and its path as the flag value.
+func (g *Graph) addReplyHook(h *AidlReplyHook, spec *aidlCrateSpec) error {
+	if h.Path == "" || h.Module == "" || h.Crate == "" || h.Dir == "" {
+		return fmt.Errorf("reply_hook: path, module, crate and dir are required")
+	}
+	if !slices.Contains(h.Lints, "warnings") {
+		return fmt.Errorf("reply_hook %s: lints %v lack -D warnings", h.Module, h.Lints)
+	}
+	root := filepath.Join(h.Dir, "src", "lib.rs")
+	if _, err := statPath(root); err != nil {
+		return fmt.Errorf("reply_hook %s: %w", h.Module, err)
+	}
+	props := newObj()
+	props.set("crate_name", h.Crate)
+	props.set("edition", h.Edition)
+	props.set("srcs", strVals([]string{root}))
+	if ms := g.mods[Device][h.Module]; len(ms) > 0 {
+		if ms[0].Type != "rust_library" || ms[0].Props.str("crate_name") != h.Crate || !slices.Equal(ms[0].Props.strs("srcs"), []string{root}) {
+			return fmt.Errorf("reply_hook %s: the tree already has another module of that name", h.Module)
+		}
+	} else {
+		g.mods[Device][h.Module] = []*Module{{Type: "rust_library", Name: h.Module, Props: props, lints: h.Lints}}
+	}
+	spec.rustlibs = appendMissing(spec.rustlibs, []string{h.Module})
+	spec.replyHook = h.Path
 	return nil
 }
 

@@ -29,8 +29,8 @@ use atl_parcelables::java::util::Map;
 use atl_services::settings;
 use binder::binder_impl::{Parcel, UnstructuredParcelable};
 use binder::{
-    BinderFeatures, ExceptionCode, Interface, ParcelFileDescriptor, ProcessState, Status,
-    StatusCode, Strong,
+    BinderFeatures, ExceptionCode, Interface, ParcelFileDescriptor, ProcessState, StatusCode,
+    Strong,
 };
 use clap::{Parser, Subcommand};
 
@@ -86,9 +86,6 @@ struct Thread(Mutex<Sender<Event>>);
 impl Interface for Thread {}
 
 impl IApplicationThread for Thread {
-    fn r#unimplemented(&self, _method: &'static str) -> Status {
-        StatusCode::UNKNOWN_TRANSACTION.into()
-    }
     #[allow(clippy::too_many_arguments)]
     fn r#bindApplication(
         &self,

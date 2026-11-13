@@ -22,8 +22,6 @@ use crate::packages::{GET_META_DATA, PackageRecord, Packages, Permissions, answe
 use atl_services_types::packages::LibraryNode;
 use atl_services_types::permission;
 
-/// The interface name counters use.
-const INTERFACE: &str = "IPackageManager";
 /// The only user (UserHandle.USER_SYSTEM).
 const USER_SYSTEM: i32 = 0;
 /// SharedLibraryInfo.TYPE_BUILTIN and VERSION_UNDEFINED (SharedLibraryInfo.java:60, :92).
@@ -289,10 +287,6 @@ impl IPackageManager for PackageManager {
             ExceptionCode::SECURITY,
             Some(format!("{method}: caller lacks {permission:?}")),
         ))
-    }
-
-    fn r#unimplemented(&self, method: &'static str) -> Status {
-        atl_services_wire::unimplemented(INTERFACE, method)
     }
 
     /// PMS.getPermissionControllerPackageName: the package Packages::permission_controller resolves; null while none is installed (the condition of runtime-permissions P1).

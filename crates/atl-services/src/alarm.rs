@@ -94,10 +94,6 @@ impl IAlarmManager for AlarmService {
         ))
     }
 
-    fn r#unimplemented(&self, method: &'static str) -> Status {
-        atl_services_wire::unimplemented(INTERFACE, method)
-    }
-
     /// set (:2684): the caller must be the package's uid, and a repeating alarm takes no listener (:2701). Stored under its key, replacing the alarm that key held (setImplLocked:2271).
     #[allow(clippy::too_many_arguments)]
     fn r#set(

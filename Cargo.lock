@@ -269,6 +269,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "atl-diag"
+version = "0.0.0"
+
+[[package]]
 name = "atl-egl-driver"
 version = "0.0.0"
 dependencies = [

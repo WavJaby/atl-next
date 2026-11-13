@@ -259,10 +259,6 @@ impl IWindowManager for WindowManager {
         ))
     }
 
-    fn r#unimplemented(&self, method: &'static str) -> Status {
-        atl_services_wire::unimplemented(WINDOW_MANAGER, method)
-    }
-
     /// WindowManagerService.hasNavigationBar:6669-6677, for the one display: false (see the module doc).
     fn r#hasNavigationBar(&self, _display_id: i32) -> binder::Result<bool> {
         Ok(false)
@@ -422,10 +418,6 @@ fn open_input_pair() -> Result<(OwnedFd, OwnedFd), StatusCode> {
 }
 
 impl IWindowSession for Session {
-    fn r#unimplemented(&self, method: &'static str) -> Status {
-        atl_services_wire::unimplemented(WINDOW_SESSION, method)
-    }
-
     /// WindowManagerService.addWindow for a window of the one display: the window is recorded by its client binder and its Task (the activity its `attrs.token` names); a window that takes
     /// input gets an input channel (the client end returned, the server end handed to the app's UI agent). Refused: a call without the window or its attributes (counted, BAD_VALUE); a token
     /// no activity was bound to (counted, ADD_BAD_APP_TOKEN).

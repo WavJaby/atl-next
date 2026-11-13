@@ -275,10 +275,6 @@ struct SessionCallback {
 impl Interface for SessionCallback {}
 
 impl IInputMethodSessionCallback for SessionCallback {
-    fn r#unimplemented(&self, method: &'static str) -> Status {
-        atl_services_wire::unimplemented("IInputMethodSessionCallback", method)
-    }
-
     fn r#sessionCreated(&self, session: Option<&Session>) -> binder::Result<()> {
         let Some(session) = session.cloned() else {
             counters::answered(INTERFACE, "sessionCreated with no session");
@@ -320,10 +316,6 @@ impl IInputMethodManager for InputMethodManager {
             ExceptionCode::SECURITY,
             Some(format!("{method}: caller lacks {permission:?}")),
         ))
-    }
-
-    fn r#unimplemented(&self, method: &'static str) -> Status {
-        atl_services_wire::unimplemented(INTERFACE, method)
     }
 
     /// InputMethodManagerService.addClient (:1791-1805), as createRealInstance calls it (InputMethodManager.java:1652): the client is kept for its uid with a fresh bind state (a restarted app's

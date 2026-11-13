@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 use atl_audio_bridge::{Mapping, Track as Server};
 use atl_audioflinger_stubs::aidl::android::media::IAudioTrack::{BnAudioTrack, IAudioTrack};
 use atl_services_types::counters;
-use binder::{BinderFeatures, Interface, Status, StatusCode, Strong};
+use binder::{BinderFeatures, Interface, StatusCode, Strong};
 use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
 use shared_file_region_aidl::mangled::_7_android_5_media_16_SharedFileRegion as SharedFileRegion;
 
@@ -152,10 +152,6 @@ impl Interface for Track {}
 /// AOSP's AIDL method names; the generated trait declares them raw.
 #[allow(non_snake_case, reason = "AOSP's AIDL method names")]
 impl IAudioTrack for Track {
-    fn r#unimplemented(&self, method: &'static str) -> Status {
-        atl_services_wire::unimplemented(INTERFACE, method)
-    }
-
     /// IAudioTrack.getCblk: a new fd of the region, as AOSP's TrackHandle returns a dup per call; the client maps it read-write.
     fn r#getCblk(&self) -> binder::Result<Option<SharedFileRegion>> {
         counters::answered(INTERFACE, "getCblk");

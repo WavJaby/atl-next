@@ -6,7 +6,10 @@
 //! binder's on_transact must return the hook's SECURITY Status without running the method when it denies, and the method's result when it allows; the hook must see exactly
 //! `("getSerialPorts", Single("SERIAL_PORT"))`. Writing the interface token reaches libbinder's IPCThreadState, so this mode needs a driver: `xtask test parcel` runs it under binderd.
 
-// the converter's rlib, on the crate search path build.rs sets (no cargo dependency names it)
+//! `--outcomes <n0>,..,<n5>`: the aidl patch's reply hook (atl_diag::binder_reply): drives each outcome of [`OUTCOMES`] n_i times through local binders' on_transact; `xtask test parcel` counts the hook's stderr lines against the same numbers.
+
+// the converter's rlibs, on the crate search path build.rs sets (no cargo dependency names them)
+extern crate atl_parcelables;
 extern crate binder;
 
 use std::sync::Arc;
@@ -17,8 +20,12 @@ use atl_aidl::aidl::android::hardware::ISerialManager::{
     BnSerialManager, EnforcePermission, ISerialManager, transactions,
 };
 use atl_aidl::aidl::android::os::ServiceDebugInfo::ServiceDebugInfo;
-use binder::binder_impl::{IBinderInternal, Parcel};
-use binder::{BinderFeatures, ExceptionCode, Interface, Status};
+use atl_aidl::aidl::com::android::internal::infra::IAndroidFuture::{
+    BnAndroidFuture, IAndroidFuture, transactions as future_tx,
+};
+use atl_parcelables::com::android::internal::infra::AndroidFuture;
+use binder::binder_impl::{FLAG_ONEWAY, IBinderInternal, Parcel, TransactionCode};
+use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status};
 
 /// The service name written: 14 UTF-16 code units.
 const NAME: &str = "servicemanager";
@@ -31,7 +38,15 @@ enum Mode {
     /// the round trip, expecting this many bytes
     RoundTrip(i32),
     Enforce,
+    /// how often to drive each of [`OUTCOMES`]
+    Outcomes([u32; OUTCOMES]),
 }
+
+/// The reply hook's outcomes the probe drives, in `--outcomes` order: enforce denial (getSerialPorts: SECURITY), default body (openSerialPort: UNKNOWN_TRANSACTION), a method's exception (openSerialPort: ILLEGAL_ARGUMENT),
+/// an unknown code ([`UNKNOWN_CODE`]), an argument that fails to decode (IAndroidFuture.complete with a failed future: BAD_VALUE, refused by atl-parcelables), a oneway method's dropped Err (complete(null): ILLEGAL_STATE).
+const OUTCOMES: usize = 6;
+/// A code ISerialManager has no method for: its two methods are FIRST_CALL_TRANSACTION (1) and 2; meta codes start at 0x00fffffx.
+const UNKNOWN_CODE: TransactionCode = 1000;
 
 fn mode() -> Result<Mode> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -41,7 +56,19 @@ fn mode() -> Result<Mode> {
             n.parse().context("--want-bytes: an integer")?,
         )),
         [flag] if flag == "--enforce" => Ok(Mode::Enforce),
-        _ => bail!("usage: atl-aidl-probe [--want-bytes <n> | --enforce]"),
+        [flag, list] if flag == "--outcomes" => {
+            let n: Vec<u32> = list
+                .split(',')
+                .map(str::parse)
+                .collect::<Result<_, _>>()
+                .context("--outcomes: comma-separated counts")?;
+            Ok(Mode::Outcomes(n.try_into().map_err(|n: Vec<u32>| {
+                anyhow::anyhow!("--outcomes: {} counts, want {OUTCOMES}", n.len())
+            })?))
+        }
+        _ => {
+            bail!("usage: atl-aidl-probe [--want-bytes <n> | --enforce | --outcomes <n0>,..,<n5>]")
+        }
     }
 }
 
@@ -49,7 +76,101 @@ fn main() -> Result<()> {
     match mode()? {
         Mode::RoundTrip(want) => round_trip(want),
         Mode::Enforce => enforce(),
+        Mode::Outcomes(n) => outcomes(n),
     }
+}
+
+/// An ISerialManager that implements nothing but the permission hook: openSerialPort keeps its default body (UNKNOWN_TRANSACTION).
+struct Port {
+    deny: bool,
+}
+
+impl Interface for Port {}
+
+impl ISerialManager for Port {
+    fn r#enforce_permission(&self, _: &str, _: EnforcePermission<'_>) -> binder::Result<()> {
+        if self.deny {
+            Err(Status::new_exception(ExceptionCode::SECURITY, None))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// An ISerialManager whose openSerialPort throws.
+struct Throwing;
+
+impl Interface for Throwing {}
+
+impl ISerialManager for Throwing {
+    fn r#enforce_permission(&self, _: &str, _: EnforcePermission<'_>) -> binder::Result<()> {
+        Ok(())
+    }
+    fn r#openSerialPort(
+        &self,
+        _: Option<&str>,
+    ) -> binder::Result<Option<binder::ParcelFileDescriptor>> {
+        Err(Status::new_exception(ExceptionCode::ILLEGAL_ARGUMENT, None))
+    }
+}
+
+/// A oneway IAndroidFuture whose complete fails (the caller never sees it).
+struct Future;
+
+impl Interface for Future {}
+
+impl IAndroidFuture for Future {
+    fn r#complete(&self, _: Option<&AndroidFuture>) -> binder::Result<()> {
+        Err(Status::new_exception(ExceptionCode::ILLEGAL_STATE, None))
+    }
+}
+
+/// One transaction of `code` on `b` with the data `fill` writes after the interface token. Its result is not the measure: the hook's line is.
+fn send(
+    b: &SpIBinder,
+    code: TransactionCode,
+    flags: u32,
+    fill: impl Fn(&mut Parcel) -> Result<(), binder::StatusCode>,
+) -> Result<()> {
+    let mut data = b.prepare_transact()?;
+    fill(&mut data)?;
+    let _ = b.submit_transact(code, data, flags);
+    Ok(())
+}
+
+fn outcomes(n: [u32; OUTCOMES]) -> Result<()> {
+    let f = BinderFeatures::default;
+    let denied = BnSerialManager::new_binder(Port { deny: true }, f()).as_binder();
+    let port = BnSerialManager::new_binder(Port { deny: false }, f()).as_binder();
+    let throwing = BnSerialManager::new_binder(Throwing, f()).as_binder();
+    let future = BnAndroidFuture::new_binder(Future, f()).as_binder();
+    let name = |p: &mut Parcel| p.write(PORT);
+    // AndroidFuture as Parcel holds it: non-null marker, done, failed (the codec refuses a failed future)
+    let failed = |p: &mut Parcel| {
+        p.write(&1i32)?;
+        p.write(&true)?;
+        p.write(&true)
+    };
+    let null = |p: &mut Parcel| p.write(&0i32);
+    for _ in 0..n[0] {
+        send(&denied, transactions::r#getSerialPorts, 0, |_| Ok(()))?;
+    }
+    for _ in 0..n[1] {
+        send(&port, transactions::r#openSerialPort, 0, name)?;
+    }
+    for _ in 0..n[2] {
+        send(&throwing, transactions::r#openSerialPort, 0, name)?;
+    }
+    for _ in 0..n[3] {
+        send(&port, UNKNOWN_CODE, 0, |_| Ok(()))?;
+    }
+    for _ in 0..n[4] {
+        send(&future, future_tx::r#complete, FLAG_ONEWAY, failed)?;
+    }
+    for _ in 0..n[5] {
+        send(&future, future_tx::r#complete, FLAG_ONEWAY, null)?;
+    }
+    Ok(())
 }
 
 /// The port the allowing service answers.
@@ -77,10 +198,6 @@ impl ISerialManager for Serial {
         } else {
             Err(Status::new_exception(ExceptionCode::SECURITY, None))
         }
-    }
-    // openSerialPort keeps its default body (aidl --rust_unimplemented_hook), which answers through here
-    fn r#unimplemented(&self, _method: &'static str) -> Status {
-        binder::StatusCode::UNKNOWN_TRANSACTION.into()
     }
     fn r#getSerialPorts(&self) -> binder::Result<Option<Vec<Option<String>>>> {
         self.ran.store(true, Ordering::SeqCst);

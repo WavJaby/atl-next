@@ -13,8 +13,6 @@ use std::sync::Arc;
 use crate::activity::log;
 use crate::packages::{GrantError, Packages, Permissions};
 
-/// The interface name counters use.
-const INTERFACE: &str = "IPermissionManager";
 /// PackageManager.PERMISSION_GRANTED / PERMISSION_DENIED.
 const GRANTED: i32 = 0;
 const DENIED: i32 = -1;
@@ -72,10 +70,6 @@ impl IPermissionManager for PermissionManagerService {
             EnforcePermission::AnyOf(p) => (p, true),
         };
         self.enforce(method, perms, any)
-    }
-
-    fn r#unimplemented(&self, method: &'static str) -> Status {
-        atl_services_wire::unimplemented(INTERFACE, method)
     }
 
     fn r#checkPermission(

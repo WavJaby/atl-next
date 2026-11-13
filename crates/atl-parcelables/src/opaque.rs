@@ -19,6 +19,8 @@ static REFUSED: Mutex<BTreeMap<&'static str, u64>> = Mutex::new(BTreeMap::new())
 /// Every hit is also written to stderr as `parcelables: refused <what> <n> at=<stamp>` ([`wall_stamp`]): a refusal reaches the caller only as BAD_VALUE (Java: IllegalArgumentException), so the line is the one place that names what was refused.
 /// `xtask test` reads these lines out of the services log (atld_run.rs `events`); a process killed at the end of a run prints no summary, so the last line per name is the total.
 pub fn refuse(what: &'static str) -> StatusCode {
+    // the BAD_VALUE this returns usually leaves on_transact next; the reply hook prints the cause on its line
+    atl_diag::set_cause(what);
     // a poisoned counter still counts: the map holds plain numbers
     let mut map = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
     let n = map.entry(what).or_insert(0);

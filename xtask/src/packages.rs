@@ -58,6 +58,29 @@ pub struct AidlSpec {
     /// the workspace package (with `rust_library`) giving parcelables their Rust types
     #[serde(default)]
     pub parcelables: Option<String>,
+    /// the aidl patch's `--rust_reply_hook`: a function path and the workspace package (with `rust_library`, no rustlibs) defining it
+    #[serde(default)]
+    pub reply_hook: Option<ReplyHookSpec>,
+}
+
+/// `[package.metadata.atl.aidl] reply_hook`.
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplyHookSpec {
+    pub package: String,
+    pub path: String,
+}
+
+/// A reply hook as bp2ninja `-aidl-crates` takes it (aidlcrates.go AidlReplyHook).
+#[derive(Debug, PartialEq, serde::Serialize)]
+pub struct ReplyHook {
+    pub path: String,
+    pub module: String,
+    #[serde(rename = "crate")]
+    pub crate_name: String,
+    pub dir: PathBuf,
+    pub edition: String,
+    pub lints: Vec<String>,
 }
 
 /// A package with `[package.metadata.atl] rust_library`, as bp2ninja `-aidl-crates` takes it (aidlcrates.go AidlParcelables).
@@ -93,6 +116,8 @@ pub struct AidlCrate {
     pub types: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parcelables: Option<RustLibrary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_hook: Option<ReplyHook>,
 }
 
 /// What `cargo metadata --no-deps` says of a package (the fields read here).
@@ -266,7 +291,7 @@ fn lint_flags(workspace_toml: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// The packages with `[package.metadata.atl.rust_library]` (non-empty rustlibs), each compiled with `lints`; one without a lib target is refused.
+/// The packages with `[package.metadata.atl.rust_library]` (rustlibs may be empty: a reply hook crate), each compiled with `lints`; one without a lib target is refused.
 fn parse_rust_libraries(json: &str, lints: &[String]) -> Result<Vec<RustLibrary>> {
     let meta: Metadata = serde_json::from_str(json).context("parsing cargo metadata")?;
     let mut out = Vec::new();
@@ -285,11 +310,6 @@ fn parse_rust_libraries(json: &str, lints: &[String]) -> Result<Vec<RustLibrary>
                 p.name
             )
         })?;
-        ensure!(
-            !spec.rustlibs.is_empty(),
-            "{}: [package.metadata.atl.rust_library] rustlibs is empty",
-            p.name
-        );
         let lib = p
             .targets
             .iter()
@@ -346,12 +366,41 @@ pub fn aidl_crates(
                     .clone(),
             ),
         };
+        let reply_hook = match &a.reply_hook {
+            None => None,
+            Some(h) => {
+                let l = libraries
+                    .iter()
+                    .find(|l| l.package == h.package)
+                    .with_context(|| {
+                        format!(
+                            "{}: aidl.reply_hook {} is no package with [package.metadata.atl] rust_library",
+                            p.name, h.package
+                        )
+                    })?;
+                ensure!(
+                    l.rustlibs.is_empty() && l.aconfig.is_empty(),
+                    "{}: aidl.reply_hook {} has rustlibs or aconfig; the hook crate is a leaf every aidl crate links",
+                    p.name,
+                    h.package
+                );
+                Some(ReplyHook {
+                    path: h.path.clone(),
+                    module: l.module.clone(),
+                    crate_name: l.crate_name.clone(),
+                    dir: l.dir.clone(),
+                    edition: l.edition.clone(),
+                    lints: l.lints.clone(),
+                })
+            }
+        };
         crates.insert(
             aidl_interface(&p.name),
             AidlCrate {
                 include_dirs: a.include_dirs.clone(),
                 types: a.types.clone(),
                 parcelables,
+                reply_hook,
             },
         );
     }
@@ -797,6 +846,38 @@ mod tests {
         // parcelables naming a package without rust_library
         let e = aidl_crates(&parsed, &[]).unwrap_err();
         assert!(format!("{e:#}").contains("no package with [package.metadata.atl] rust_library"));
+        // reply_hook resolves to a leaf rust_library package; one with rustlibs is refused
+        let hooked = |lib: &str| serde_json::json!({ "atl": { "converter": ["device/libbinder_rs"], "aidl": { "include_dirs": ["i"], "types": ["a.IFoo"], "reply_hook": { "package": lib, "path": "d::reply" } } } });
+        let mut lib_d = pkg(
+            "lib-d",
+            serde_json::json!({ "atl": { "rust_library": { "rustlibs": [] } } }),
+            &[],
+            &[],
+        );
+        lib_d["targets"][0]["name"] = "lib_d".into();
+        lib_d["manifest_path"] = "/w/crates/lib-d/Cargo.toml".into();
+        let json = meta(&[pkg("q", hooked("lib-d"), &["converter"], &[]), lib_d]);
+        let libs = parse_rust_libraries(&json, &lints).unwrap();
+        let (crates, _) = aidl_crates(&parse_packages(&json).unwrap(), &libs).unwrap();
+        let h = crates["q-stubs"].reply_hook.as_ref().unwrap();
+        assert_eq!(
+            (h.path.as_str(), h.module.as_str()),
+            ("d::reply", "liblib_d")
+        );
+        let mut lib_p = pkg(
+            "lib-p",
+            serde_json::json!({ "atl": { "rust_library": { "rustlibs": ["libbinder_rs"] } } }),
+            &[],
+            &[],
+        );
+        lib_p["manifest_path"] = "/w/crates/lib-p/Cargo.toml".into();
+        let json = meta(&[pkg("q", hooked("lib-p"), &["converter"], &[]), lib_p]);
+        let e = aidl_crates(
+            &parse_packages(&json).unwrap(),
+            &parse_rust_libraries(&json, &lints).unwrap(),
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("the hook crate is a leaf"));
         let rl = |v: serde_json::Value| {
             format!(
                 "{:#}",
@@ -812,7 +893,6 @@ mod tests {
                 .unwrap_err()
             )
         };
-        assert!(rl(serde_json::json!({ "rustlibs": [] })).contains("rustlibs is empty"));
         assert!(rl(serde_json::json!(["libbinder_rs"])).contains("is not { rustlibs"));
         assert!(
             rl(serde_json::json!({ "rustlibs": ["a"], "typo": 1 })).contains("is not { rustlibs")

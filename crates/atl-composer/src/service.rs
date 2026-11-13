@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! `android.gui.ISurfaceComposer` ("SurfaceFlingerAIDL"), `ISurfaceComposerClient` and `IDisplayEventConnection` on the converter's stubs: the calls BLASTBufferQueue, Choreographer's DisplayEventReceiver,
 //! SurfaceControl and ViewRootImpl make through libgui. Answers follow SurfaceFlinger's (SurfaceFlinger.cpp `getStaticDisplayInfo` / `getDynamicDisplayInfoFromId` / `getDisplayState`) for the one display
-//! the display model describes; every other method keeps the stub's default body, counted (atl_services_types::counters) and answered UNKNOWN_TRANSACTION.
+//! the display model describes; every other method keeps the stub's default body: UNKNOWN_TRANSACTION, counted by the reply hook (atl-diag).
 
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex};
@@ -30,7 +30,7 @@ use atl_aidl::aidl::android::gui::Size::Size;
 use atl_aidl::aidl::android::gui::StaticDisplayInfo::StaticDisplayInfo;
 use atl_compositor::event::ConnectionId;
 use atl_libgui_parcel::parcel::WireParcel;
-use atl_services_types::{counters, display_model};
+use atl_services_types::display_model;
 use binder::{BinderFeatures, SpIBinder, Status, StatusCode, Strong};
 use gui_aidl_types_rs::{BitTube, LayerMetadata, VsyncEventData};
 
@@ -39,10 +39,6 @@ use crate::capture_reply;
 use crate::clock;
 use crate::host::{Composer, DISPLAY_ID};
 
-/// The interface names counters use.
-const COMPOSER: &str = "ISurfaceComposer";
-const CLIENT: &str = "ISurfaceComposerClient";
-const EVENT_CONNECTION: &str = "IDisplayEventConnection";
 /// `ui::ColorMode::NATIVE`: the one color mode the display reports.
 const COLOR_MODE_NATIVE: i32 = 0;
 /// DynamicDisplayInfo.preferredBootDisplayMode: none (SurfaceFlinger reports -1 without boot display mode support).
@@ -51,11 +47,6 @@ const NO_PREFERRED_BOOT_MODE: i32 = -1;
 const MODE_ID: i32 = 0;
 /// Density's reference dpi (DisplayMetrics.DENSITY_DEFAULT): `StaticDisplayInfo.density` is the scale factor against it.
 const DENSITY_DEFAULT_DPI: f32 = 160.0;
-
-fn unimplemented(interface: &'static str, method: &str) -> Status {
-    counters::count_unimplemented(interface, method);
-    StatusCode::UNKNOWN_TRANSACTION.into()
-}
 
 fn size(c: &Composer) -> Size {
     let d = c.display();
@@ -95,10 +86,6 @@ struct SurfaceComposer {
 impl binder::Interface for SurfaceComposer {}
 
 impl ISurfaceComposer for SurfaceComposer {
-    fn r#unimplemented(&self, method: &'static str) -> Status {
-        unimplemented(COMPOSER, method)
-    }
-
     fn r#createConnection(&self) -> binder::Result<Option<Strong<dyn ISurfaceComposerClient>>> {
         Ok(Some(new_client(Arc::clone(&self.composer))))
     }
@@ -291,10 +278,6 @@ struct Client {
 impl binder::Interface for Client {}
 
 impl ISurfaceComposerClient for Client {
-    fn r#unimplemented(&self, method: &'static str) -> Status {
-        unimplemented(CLIENT, method)
-    }
-
     /// SurfaceFlinger::createLayer: a layer named `name` with a new handle. Of `flags`, the layer type decides whether it fills with colour (an effect layer without `eNoColorFill`; createLayer adds that flag to every other type);
     /// hidden, opaque ... arrive again as layer state in the transactions, and `metadata` has no reader yet.
     fn r#createSurface(
@@ -336,10 +319,6 @@ impl Drop for EventConnection {
 }
 
 impl IDisplayEventConnection for EventConnection {
-    fn r#unimplemented(&self, method: &'static str) -> Status {
-        unimplemented(EVENT_CONNECTION, method)
-    }
-
     /// The channel's client end, once (EventThreadConnection::stealReceiveChannel moves it out).
     fn r#stealReceiveChannel(&self, out: &mut Option<BitTube>) -> binder::Result<()> {
         let fd = self

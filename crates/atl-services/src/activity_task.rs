@@ -735,10 +735,6 @@ impl ActivityTaskService {
 impl Interface for ActivityTaskService {}
 
 impl IActivityTaskManager for ActivityTaskService {
-    fn r#unimplemented(&self, method: &'static str) -> Status {
-        atl_services_wire::unimplemented(ATM, method)
-    }
-
     fn r#startActivity(
         &self,
         caller: Option<&Strong<dyn IApplicationThread>>,
@@ -813,10 +809,6 @@ mod tests {
     impl Interface for Thread {}
 
     impl IApplicationThread for Thread {
-        fn r#unimplemented(&self, _method: &'static str) -> Status {
-            StatusCode::UNKNOWN_TRANSACTION.into()
-        }
-
         fn r#scheduleTransaction(
             &self,
             transaction: Option<&ClientTransaction>,

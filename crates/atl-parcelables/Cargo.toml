@@ -13,7 +13,7 @@ publish.workspace = true
 # aconfig: the framework flags the codecs' formats depend on (Intent: android.security.prevent_intent_redirect; LayoutParams: android.view.flags toolkit_set_frame_rate_read_only; EditorInfo: android.view.inputmethod.flags),
 # as aconfig evaluates them for the release (src/aconfig.rs).
 [package.metadata.atl.rust_library]
-rustlibs = ["libbinder_rs"]
+rustlibs = ["libbinder_rs", "libatl_diag"]
 aconfig = ["android.security.flags-aconfig", "android.view.flags-aconfig", "android.view.inputmethod.flags-aconfig"]
 
 [lints]

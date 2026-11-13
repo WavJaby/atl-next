@@ -71,13 +71,13 @@ index 471a498808767498c1b81e819f33c03e2292aa22..413e289a134b3aa93d96fcac7619e0f8
    } else if (!(isPrimitive || isEnum) || arg.GetType().IsFixedSizeArray()) {
      return StorageMode::IN_ARGUMENT;
 diff --git a/options.cpp b/options.cpp
-index d1a958ed6a4b652269e8213fe6c09162451d1c3a..2b58e79b5ed4e37838d579e3f57875a19babc9da 100644
+index dfa942bdb2b5beefdf05efec86f7617d76293235..03800a8d32d2d97694e0dd0ec244d4c4d7573805 100644
 --- a/options.cpp
 +++ b/options.cpp
 @@ -148,6 +148,8 @@ string Options::GetUsage() const {
         << "          Rust: accept Java-only builtin NAME, spelled RUST_TYPE." << endl
-        << "  --rust_unimplemented_hook" << endl
-        << "          Rust: methods default to a required unimplemented(method) hook." << endl
+        << "  --rust_reply_hook=PATH" << endl
+        << "          Rust: methods default to UNKNOWN_TRANSACTION; PATH sees each non-OK reply." << endl
 +       << "  --rust_java_nullability" << endl
 +       << "          Rust: every object type is nullable, as in Java." << endl
         << "  --log" << endl
@@ -98,14 +98,14 @@ index d1a958ed6a4b652269e8213fe6c09162451d1c3a..2b58e79b5ed4e37838d579e3f57875a1
 @@ -335,6 +342,7 @@ Options::Options(int argc, const char* const raw_argv[], Options::Language defau
          {"preprocessed", required_argument, 0, 'p'},
          {"rust_java_type", required_argument, 0, 'R'},
-         {"rust_unimplemented_hook", no_argument, 0, 'U'},
+         {"rust_reply_hook", required_argument, 0, 'U'},
 +        {"rust_java_nullability", no_argument, 0, 'J'},
          {"dep", required_argument, 0, 'd'},
          {"out", required_argument, 0, 'o'},
          {"header_out", required_argument, 0, 'h'},
 @@ -486,6 +494,9 @@ Options::Options(int argc, const char* const raw_argv[], Options::Language defau
        case 'U':
-         rust_unimplemented_hook_ = true;
+         rust_reply_hook_ = Trim(optarg);
          break;
 +      case 'J':
 +        RustJavaNullability() = true;
@@ -114,7 +114,7 @@ index d1a958ed6a4b652269e8213fe6c09162451d1c3a..2b58e79b5ed4e37838d579e3f57875a1
          gen_traces_ = true;
          break;
 diff --git a/options.h b/options.h
-index 3a6aa6998b659c9963845c46ea88af01c9dd4dd8..db3fcca6ca7939261d3e0d5bf715c7970f75135c 100644
+index b2e720ed47cca3d5b5a33abdc24ada9dd61cc875..3def689cc7eeec51ad8f6affd38cd0f52b598d33 100644
 --- a/options.h
 +++ b/options.h
 @@ -175,6 +175,9 @@ class Options final {

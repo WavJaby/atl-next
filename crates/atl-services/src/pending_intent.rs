@@ -7,12 +7,9 @@
 use std::sync::{Mutex, MutexGuard};
 
 use atl_aidl::aidl::android::content::IIntentSender::{BnIntentSender, IIntentSender};
-use binder::{BinderFeatures, Interface, SpIBinder, Status, Strong};
+use binder::{BinderFeatures, Interface, SpIBinder, Strong};
 
 use crate::pending_intent_table::{Key, Lookup, PendingIntentTable};
-
-/// The interface name counters use.
-const INTERFACE: &str = "IIntentSender";
 
 /// PendingIntent.FLAG_NO_CREATE, FLAG_CANCEL_CURRENT, FLAG_UPDATE_CURRENT (PendingIntent.java:225, 237, 253).
 const FLAG_NO_CREATE: i32 = 1 << 29;
@@ -70,11 +67,7 @@ struct Sender;
 
 impl Interface for Sender {}
 
-impl IIntentSender for Sender {
-    fn r#unimplemented(&self, method: &'static str) -> Status {
-        atl_services_wire::unimplemented(INTERFACE, method)
-    }
-}
+impl IIntentSender for Sender {}
 
 /// A new record's binder.
 fn new_binder() -> SpIBinder {

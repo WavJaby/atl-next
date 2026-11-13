@@ -8,6 +8,8 @@
 //!    `hasFileDescriptors` agrees with Java's. Every case in [`CASES`] must report pass, including the self-tests that make a corrupted encoding, a wrong codec and an unmodelled value fail; the refusal of the last also has to be a stderr line.
 //!    Needs the converter's ART in --out: `xtask native ... libart libnativehelper libjavacore libopenjdk libicu_jni libandroid_runtime libandroid libsigchain`.
 //! 3. permission hook: `atl-aidl-probe --enforce` (the aidl patch's @EnforcePermission hook): a denying hook returns SECURITY and the method body never runs; an allowing one runs it.
+//! 4. reply hook: `atl-aidl-probe --outcomes` (the aidl patch's --rust_reply_hook, atl_diag::binder_reply): each outcome of [`OUTCOMES`] driven a distinct number of times must read exactly that many hook lines, and no other hook line;
+//!    the decode refusal's lines carry the refused parcelable as cause.
 //!
 //! Stages 2 and 3 run as binder processes of a binderd this stage starts (binder.rs start_binderd): libbinder opens the driver as soon as a parcel carries a binder or an interface token.
 
@@ -50,6 +52,73 @@ const SIZE_FAILURE: &str = "Parcel's encoding gives";
 const WRONG_BYTES: &str = "52";
 /// The probe's permission-hook mode (atl-aidl src/bin/probe.rs).
 const ENFORCE: &str = "--enforce";
+/// The probe's reply-hook mode (atl-aidl src/bin/probe.rs `--outcomes`).
+const OUTCOMES_FLAG: &str = "--outcomes";
+/// What probe.rs OUTCOMES drives, in its order, as the hook's line names them (atl-diag `outcome`, `api`): outcome label, `<Interface>.<method>`, calls made. The counts are distinct, so a line counted under the wrong key shows.
+/// 1000 is probe.rs UNKNOWN_CODE.
+const OUTCOMES: [(&str, &str, u32); 6] = [
+    ("exception:SECURITY", "ISerialManager.getSerialPorts", 1),
+    ("unimplemented", "ISerialManager.openSerialPort", 2),
+    (
+        "exception:ILLEGAL_ARGUMENT",
+        "ISerialManager.openSerialPort",
+        3,
+    ),
+    ("unimplemented", "ISerialManager.code=1000", 4),
+    ("status:BAD_VALUE", "IAndroidFuture.complete", 5),
+    ("exception:ILLEGAL_STATE", "IAndroidFuture.complete", 6),
+];
+/// The cause on each BAD_VALUE line: the refusal atl-parcelables' AndroidFuture codec makes of a failed future.
+const DECODE_CAUSE: &str = " cause=com.android.internal.infra.AndroidFuture (failed)";
+
+/// `--outcomes` argument: the call counts of [`OUTCOMES`].
+fn outcome_arg() -> String {
+    OUTCOMES.map(|(_, _, n)| n.to_string()).join(",")
+}
+
+/// Failures of the reply-hook run: a key whose line count differs from its calls, a BAD_VALUE line without its cause, a hook line of no expected key. Hook lines: `services: <outcome> <api> <n> at=<stamp>[ cause=..]` with outcome `unimplemented`, `exception:*`, `status:*`.
+fn outcome_verdict(stderr: &str) -> Vec<String> {
+    let hook: Vec<&str> = stderr
+        .lines()
+        .filter_map(|l| l.strip_prefix("services: "))
+        .filter(|l| {
+            l.starts_with("unimplemented ")
+                || l.starts_with("exception:")
+                || l.starts_with("status:")
+        })
+        .collect();
+    let mut fails = Vec::new();
+    let mut matched = 0;
+    for (outcome, api, want) in OUTCOMES {
+        let prefix = format!("{outcome} {api} ");
+        let lines: Vec<&&str> = hook.iter().filter(|l| l.starts_with(&prefix)).collect();
+        matched += lines.len();
+        if lines.len() != want as usize {
+            fails.push(format!(
+                "reply hook: {outcome} {api}: {} lines, {want} calls",
+                lines.len()
+            ));
+        }
+        if outcome == "status:BAD_VALUE" && lines.iter().any(|l| !l.ends_with(DECODE_CAUSE)) {
+            fails.push(format!(
+                "reply hook: {outcome} {api}: a line lacks `{DECODE_CAUSE}`"
+            ));
+        }
+    }
+    if matched != hook.len() {
+        fails.push(format!(
+            "reply hook: {} lines of no expected key: {:?}",
+            hook.len() - matched,
+            hook.iter()
+                .filter(|l| !OUTCOMES
+                    .iter()
+                    .any(|(o, a, _)| l.starts_with(&format!("{o} {a} "))))
+                .collect::<Vec<_>>()
+        ));
+    }
+    fails
+}
+
 /// The driver's argument for the PlayerIdCard break (ParcelTruth.java BREAK_PLAYER_CARD).
 const BREAK_PLAYER_CARD: &str = "--break-player-card";
 
@@ -327,10 +396,32 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     enforce_cmd.arg(ENFORCE).envs(stage.iter().cloned());
     let enforce = binder::spawn_piped(&broker, &enforce_cmd, AID_APP_START)
         .and_then(|p| Ok(p.child.wait_with_output()?));
+    // the reply hook (atl-aidl-probe --outcomes), a binder process too: interface tokens reach IPCThreadState
+    let mut outcomes_cmd = Command::new(&probe);
+    outcomes_cmd
+        .args([OUTCOMES_FLAG, &outcome_arg()])
+        .envs(stage.iter().cloned());
+    let outcomes = binder::spawn_piped(&broker, &outcomes_cmd, AID_APP_START)
+        .and_then(|p| Ok(p.child.wait_with_output()?));
     drop(broker);
     binderd.child.wait()?;
     let run = run?;
     let enforce = enforce?;
+    let outcomes = outcomes?;
+    let hook_fails = outcome_verdict(&String::from_utf8_lossy(&outcomes.stderr));
+    if !outcomes.status.success() {
+        fails.push(format!(
+            "reply hook probe ({}): {}",
+            outcomes.status,
+            String::from_utf8_lossy(&outcomes.stderr).trim()
+        ));
+    } else if hook_fails.is_empty() {
+        println!(
+            "parcel: pass reply hook ({} outcomes, each counted once per call)",
+            OUTCOMES.len()
+        );
+    }
+    fails.extend(hook_fails);
     if enforce.status.success() {
         println!(
             "parcel: pass permission hook (deny -> SECURITY, body not run; allow -> body runs)"
@@ -378,6 +469,41 @@ mod tests {
         assert_eq!(verdict(&(false, "boom".into()), &fired).len(), 1);
         assert_eq!(verdict(&ok, &ok).len(), 1);
         assert_eq!(verdict(&ok, &(false, "other".into())).len(), 1);
+    }
+
+    /// The reply-hook verdict: exact lines pass; one line short, one doubled into another key, a missing cause, and a stray hook line each fail.
+    #[test]
+    fn outcome_verdicts() {
+        let mut exact = String::from("noise\n");
+        for (o, a, n) in OUTCOMES {
+            for i in 1..=n {
+                let cause = if o == "status:BAD_VALUE" {
+                    DECODE_CAUSE
+                } else {
+                    ""
+                };
+                exact += &format!("services: {o} {a} {i} at=1.000{cause}\n");
+            }
+        }
+        assert!(
+            outcome_verdict(&exact).is_empty(),
+            "{:?}",
+            outcome_verdict(&exact)
+        );
+        let short = exact.replacen(
+            "services: exception:SECURITY ISerialManager.getSerialPorts 1 at=1.000\n",
+            "",
+            1,
+        );
+        assert_eq!(outcome_verdict(&short).len(), 1);
+        let doubled =
+            exact.clone() + "services: unimplemented ISerialManager.openSerialPort 3 at=1.000\n";
+        assert_eq!(outcome_verdict(&doubled).len(), 1);
+        let no_cause = exact.replacen(DECODE_CAUSE, "", 1);
+        assert_eq!(outcome_verdict(&no_cause).len(), 1);
+        let stray = exact + "services: status:DEAD_OBJECT IFoo.bar 1 at=1.000\n";
+        assert_eq!(outcome_verdict(&stray).len(), 1);
+        assert_eq!(outcome_arg(), "1,2,3,4,5,6");
     }
 
     /// The refusal line must be on its own line of stderr; any other text does not count.

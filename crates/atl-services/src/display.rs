@@ -144,10 +144,6 @@ impl IDisplayManager for DisplayManager {
         ))
     }
 
-    fn r#unimplemented(&self, method: &'static str) -> Status {
-        atl_services_wire::unimplemented(INTERFACE, method)
-    }
-
     /// DisplayManagerService.getDisplayInfo: the record of display 0 from the model; null for any other display (there is no other).
     fn r#getDisplayInfo(&self, display_id: i32) -> binder::Result<Option<DisplayInfo>> {
         Ok((display_id == DEFAULT_DISPLAY).then(|| display_info(&self.tasks.display())))

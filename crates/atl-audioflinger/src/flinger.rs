@@ -21,7 +21,7 @@ use atl_audioflinger_stubs::mangled::{
     _7_android_5_media_19_CreateTrackResponse as CreateTrackResponse,
 };
 use atl_services_types::counters;
-use binder::{BinderFeatures, Interface, SpIBinder, Status, StatusCode, Strong};
+use binder::{BinderFeatures, Interface, SpIBinder, StatusCode, Strong};
 
 use crate::output::{self, Opened, Opener};
 use crate::{OUTPUT_CHANNEL_MASK, Options, ids, track};
@@ -97,10 +97,6 @@ impl Interface for AudioFlinger {}
 /// AOSP's AIDL method names; the generated trait declares them raw.
 #[allow(non_snake_case, reason = "AOSP's AIDL method names")]
 impl IAudioFlingerService for AudioFlinger {
-    fn r#unimplemented(&self, method: &'static str) -> Status {
-        atl_services_wire::unimplemented(INTERFACE, method)
-    }
-
     /// AudioSystem::getSamplingRate: AOSP answers 0 for a handle it does not have (AudioFlinger.cpp:1283-1292), and 0 here when the output cannot open.
     fn r#sampleRate(&self, io_handle: i32) -> binder::Result<i32> {
         counters::answered(INTERFACE, "sampleRate");

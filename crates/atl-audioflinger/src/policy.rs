@@ -7,7 +7,7 @@ use atl_audioflinger_stubs::aidl::android::media::IAudioPolicyService::{
 };
 use atl_audioflinger_stubs::aidl::android::media::IAudioPolicyServiceClient::IAudioPolicyServiceClient;
 use atl_services_types::counters;
-use binder::{BinderFeatures, Interface, SpIBinder, Status, Strong};
+use binder::{BinderFeatures, Interface, SpIBinder, Strong};
 
 use crate::flinger::output_handle;
 
@@ -22,10 +22,6 @@ impl Interface for AudioPolicy {}
 /// AOSP's AIDL method names; the generated trait declares them raw.
 #[allow(non_snake_case, reason = "AOSP's AIDL method names")]
 impl IAudioPolicyService for AudioPolicy {
-    fn r#unimplemented(&self, method: &'static str) -> Status {
-        atl_services_wire::unimplemented(INTERFACE, method)
-    }
-
     /// AudioPolicyService::getOutput: the one output, for every stream (no routing policy yet).
     fn r#getOutput(&self, _stream: AudioStreamType) -> binder::Result<i32> {
         counters::answered(INTERFACE, "getOutput");

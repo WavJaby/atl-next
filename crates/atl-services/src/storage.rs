@@ -13,8 +13,6 @@ use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, Thread
 use crate::packages::Permissions;
 use std::sync::Arc;
 
-/// The interface name counters use.
-const INTERFACE: &str = "IStorageManager";
 /// VolumeInfo.ID_EMULATED_INTERNAL: the id of the emulated primary.
 const PRIMARY_ID: &str = "emulated";
 /// R.string.storage_internal (frameworks/base/core/res/res/values/strings.xml:4540).
@@ -52,10 +50,6 @@ impl IStorageManager for StorageService {
             ExceptionCode::SECURITY,
             Some(format!("{method}: caller lacks {permission:?}")),
         ))
-    }
-
-    fn r#unimplemented(&self, method: &'static str) -> Status {
-        atl_services_wire::unimplemented(INTERFACE, method)
     }
 
     /// StorageManager.getVolumeList (StorageManager.java:330): the volumes of `user_id`; the calling package and the flags are not modelled.

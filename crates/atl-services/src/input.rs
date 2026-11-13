@@ -111,10 +111,6 @@ impl IInputManager for InputManager {
         ))
     }
 
-    fn r#unimplemented(&self, method: &'static str) -> Status {
-        atl_services_wire::unimplemented(INTERFACE, method)
-    }
-
     /// Null selects the default VelocityTracker strategy; InputManagerGlobal.java:159 keeps null as is.
     fn r#getVelocityTrackerStrategy(&self) -> binder::Result<Option<String>> {
         Ok(None)

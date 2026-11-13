@@ -68,10 +68,6 @@ impl IAudioService for AudioService {
         ))
     }
 
-    fn r#unimplemented(&self, method: &'static str) -> Status {
-        atl_services_wire::unimplemented(INTERFACE, method)
-    }
-
     /// Repeat sounds for navigation (fast scroll) stay off: there is no sound effect player.
     fn r#areNavigationRepeatSoundEffectsEnabled(&self) -> binder::Result<bool> {
         Ok(false)

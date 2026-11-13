@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-diag"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Binder reply outcomes: the aidl patch's --rust_reply_hook (atl-aidl `aidl.reply_hook`). A leaf crate: the converter builds it as rust_library `libatl_diag` for every AIDL crate and atl-parcelables; cargo builds and tests it as a plain library.
+[package.metadata.atl.rust_library]
+rustlibs = []
+
+[lints]
+workspace = true
