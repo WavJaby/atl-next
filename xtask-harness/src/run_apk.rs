@@ -18,7 +18,7 @@ use crate::atld_run::{
     MS_PER_S, Package, PackageFile, Run, Runtime, last_resumed, parse_stamp, run_display, settled,
 };
 use crate::manifest::Manifest;
-use atl_services_types::native_libs::{SupportedAbi, find_supported_abi};
+use atl_services_types::native_libs::{LIB_DIR_NAME, SupportedAbi};
 
 use crate::nested_wayland::NestedCompositor;
 use crate::{arches, drive, manifest, observe, remote, test_apks, verdict, window};
@@ -442,7 +442,28 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
     ))
 }
 
-/// The app's ISA when foreign (not `host`): the device ABI the install picks over every file of the package (atl-services-types `find_supported_abi`; a config split carries the libraries), whose guest and
+/// Index into `supported` of the ABI AOSP's `NativeLibraryHelper.findSupportedAbi` picks: the lowest index any `lib/<abi>/<file>.so` entry matches. The harness's own reading of the zip, needed before the
+/// run to stage a guest; the install itself runs AOSP's.
+fn find_supported_abi<'a>(
+    entries: impl IntoIterator<Item = &'a str>,
+    supported: &[SupportedAbi],
+) -> Option<usize> {
+    entries
+        .into_iter()
+        .filter_map(|e| library_entry(e).map(|(abi, _)| abi))
+        .filter_map(|abi| supported.iter().position(|s| s.abi == abi))
+        .min()
+}
+
+/// `(abi, file)` of an APK entry `lib/<abi>/<file>.so` with one path component in `file`.
+fn library_entry(entry: &str) -> Option<(&str, &str)> {
+    let rest = entry.strip_prefix(LIB_DIR_NAME)?.strip_prefix('/')?;
+    let (abi, file) = rest.split_once('/')?;
+    (!abi.is_empty() && !file.contains('/') && file.ends_with(".so") && file != ".so")
+        .then_some((abi, file))
+}
+
+/// The app's ISA when foreign (not `host`): the device ABI the install picks over every file of the package ([`find_supported_abi`]; a config split carries the libraries), whose guest and
 /// engine the test image then needs. Empty for a host-ISA or no-native-code app.
 fn foreign_isa(abis: &[SupportedAbi], host: &str, files: &[PackageFile]) -> Result<Option<String>> {
     let mut entries = String::new();
@@ -823,6 +844,41 @@ fn judge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn abis(list: &[(&str, &str)]) -> Vec<SupportedAbi> {
+        list.iter()
+            .map(|(abi, isa)| SupportedAbi {
+                abi: (*abi).into(),
+                isa: (*isa).into(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_most_preferred_device_abi_wins_whatever_the_entry_order() {
+        let s = abis(&[("x86_64", "x86_64"), ("x86", "x86"), ("arm64-v8a", "arm64")]);
+        let entries = [
+            "classes.dex",
+            "lib/arm64-v8a/libg.so",
+            "lib/x86/libg.so",
+            "lib/mips/libg.so",
+        ];
+        assert_eq!(find_supported_abi(entries, &s), Some(1));
+    }
+
+    #[test]
+    fn only_direct_so_entries_count() {
+        let s = abis(&[("x86_64", "x86_64")]);
+        for e in [
+            "lib/x86_64/sub/libg.so",
+            "lib/x86_64/readme.txt",
+            "lib/x86_64/",
+            "assets/lib/x86_64/libg.so",
+            "lib//libg.so",
+        ] {
+            assert_eq!(find_supported_abi([e], &s), None, "{e}");
+        }
+    }
 
     /// The load line as loader.rs prints it for CTR's arm64 libctro (measured 2026-11-12); the break is identity's run, which loads nothing into a guest of the app's ISA.
     #[test]
