@@ -1106,6 +1106,8 @@ public class ParcelTruth {
     /// A channel whose vibration pattern is set but whose VibrationEffect is null: setVibrationPattern would also build the effect (the effect API flag), so the field is set directly.
     static NotificationChannel patternChannel() {
         NotificationChannel c = new NotificationChannel("pattern", "Pattern", NotificationManager.IMPORTANCE_DEFAULT);
+        // the default sound is a HierarchicalUri (Settings.System.DEFAULT_NOTIFICATION_URI), which NotificationChannel(Parcel) re-parses into a StringUri (:378): a channel read back writes type 1, so start from one
+        c.setSound(Uri.parse(c.getSound().toString()), c.getAudioAttributes());
         try {
             Field f = NotificationChannel.class.getDeclaredField("mVibrationPattern");
             f.setAccessible(true);

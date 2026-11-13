@@ -16,7 +16,7 @@ use crate::parts::*;
 const MAX_IPC_SIZE: i32 = 64 * 1024;
 
 /// An element class a list can carry: its Java class name (what writeParcelableCreator writes) and its place in [`Element`].
-pub trait ListElement: Part + Clone {
+pub trait ListElement: Part + Clone + 'static {
     const CLASS: &'static str;
     fn wrap(self) -> Element;
     fn unwrap(e: &Element) -> Option<&Self>;
