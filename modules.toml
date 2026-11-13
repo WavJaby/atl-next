@@ -251,7 +251,7 @@ exports = ["atl-services-types"]
 # android-paths: a test checks a record path against the guest layout (dev-dependency)
 uses = ["android-paths"]
 
-# the wire of the hand-written binder interfaces services and their in-ATL clients share (IUiAgent, libsensor's sensorservice + the injector,): an app process depends on it instead of on services, so it links no platform-host
+# the wire of the hand-written binder interfaces services and their in-ATL clients share (IUiAgent, libsensor's sensorservice + the injector): an app process depends on it instead of on services, so it links no platform-host
 [services-wire]
 crates = ["atl-services-wire"]
 exports = ["atl-services-wire"]
