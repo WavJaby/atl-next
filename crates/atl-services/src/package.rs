@@ -513,7 +513,9 @@ fn check_signatures(d1: Option<&SigningDetails>, d2: Option<&SigningDetails>) ->
     if o1.is_none() && o2.is_none() {
         return result;
     }
-    let pick = |o: Option<&Signature>, d| o.map(|s| vec![s]).or_else(|| signers(d));
+    fn pick<'a>(o: Option<&'a Signature>, d: &'a SigningDetails) -> Option<Vec<&'a Signature>> {
+        o.map(|s| vec![s]).or_else(|| signers(d))
+    }
     compare_signature_arrays(pick(o1, d1), pick(o2, d2))
 }
 
@@ -617,5 +619,56 @@ mod tests {
             names(GET_ACTIVITIES | MATCH_DISABLED_COMPONENTS),
             ["a.Native", "a.Bare", "a.Off"]
         );
+    }
+
+    fn sig(b: u8) -> Option<Signature> {
+        Some(Signature {
+            bytes: Some(vec![b]),
+        })
+    }
+
+    fn signed(current: &[u8], past: &[u8]) -> SigningDetails {
+        SigningDetails::Known {
+            signatures: Some(current.iter().map(|b| sig(*b)).collect()),
+            scheme_version: 3,
+            public_keys: None,
+            past_signing_certificates: (!past.is_empty())
+                .then(|| past.iter().map(|b| sig(*b)).collect()),
+        }
+    }
+
+    /// Expected values: PackageManagerServiceUtils.compareSignatureArrays (set equality) and ComputerEngine.checkSignaturesInternal (the oldest lineage signer on a mismatch).
+    #[test]
+    fn check_signatures_follows_aosp() {
+        let a = signed(&[1], &[]);
+        assert_eq!(check_signatures(Some(&a), Some(&a)), SIGNATURE_MATCH);
+        assert_eq!(
+            check_signatures(Some(&a), Some(&signed(&[2], &[]))),
+            SIGNATURE_NO_MATCH
+        );
+        // order does not matter; size does
+        assert_eq!(
+            check_signatures(Some(&signed(&[1, 2], &[])), Some(&signed(&[2, 1], &[]))),
+            SIGNATURE_MATCH
+        );
+        assert_eq!(
+            check_signatures(Some(&signed(&[1, 2], &[])), Some(&a)),
+            SIGNATURE_NO_MATCH
+        );
+        // rotated 1 -> 2: the oldest signer (1) matches a package still signed by 1
+        assert_eq!(
+            check_signatures(Some(&signed(&[2], &[1, 2])), Some(&a)),
+            SIGNATURE_MATCH
+        );
+        let unknown = SigningDetails::Unknown;
+        assert_eq!(
+            check_signatures(Some(&unknown), Some(&a)),
+            SIGNATURE_FIRST_NOT_SIGNED
+        );
+        assert_eq!(
+            check_signatures(Some(&a), Some(&unknown)),
+            SIGNATURE_SECOND_NOT_SIGNED
+        );
+        assert_eq!(check_signatures(None, None), SIGNATURE_NEITHER_SIGNED);
     }
 }
