@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Fri, 13 Nov 2026 09:47:25 +0800
+Subject: [PATCH] libmedia: give a local IMediaPlayer the view a transaction
+ gives
+
+A player in this process is called directly. MediaPlayer::invoke and
+setMetadataFilter hand it the caller's parcel as written: read position
+at its end, interface token unread. NuPlayerDriver::invoke then fails
+to read the method id (NOT_ENOUGH_DATA, -61), and MediaPlayer.prepare()
+throws "failure code: -61" from scanInternalSubtitleTracks().
+
+- local player: copy the request, rewind, consume the interface token
+  (the CHECK_INTERFACE a transaction runs in BnMediaPlayer::onTransact)
+- remote player (BpMediaPlayer): request passed as is
+
+Upstream-Status: Inappropriate (AOSP never calls IMediaPlayer in-process)
+Patch-Reason: media.player runs in the app process (atl-service-view, M35),
+ so IMediaPlayer calls are direct C++ calls that skip transaction
+ marshalling. Restoring the transaction view at the client call site is
+ two functions; the ideal is the binder layer delivering local calls as
+ transactions (owner decision).
+---
+SPDX-License-Identifier: Apache-2.0
+ media/libmedia/mediaplayer.cpp | 27 +++++++++++++++++++++++++--
+ 1 file changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/media/libmedia/mediaplayer.cpp b/media/libmedia/mediaplayer.cpp
+index 9d3fce70b2d6d13cb9be9e7e9a8216a14c222ab3..bf9e8d3f8181ce4ccf36ca34b22b408f84675482 100644
+--- a/media/libmedia/mediaplayer.cpp
++++ b/media/libmedia/mediaplayer.cpp
+@@ -218,6 +218,19 @@ status_t MediaPlayer::setDataSource(const String8& rtpParams)
+     return err;
+ }
+ 
++// A player in this process is called directly, not through a transaction. A transaction hands the
++// server a parcel whose interface token BnMediaPlayer::onTransact (CHECK_INTERFACE) has consumed;
++// a direct call passes the caller's parcel as written, read position at its end, token unread.
++// A local player gets the transaction's view: a copy, rewound, token consumed. Remote players
++// (BpMediaPlayer) take the request as is.
++static status_t payloadForLocalPlayer(const sp<IMediaPlayer> &player, const Parcel &request,
++        Parcel *payload)
++{
++    payload->appendFrom(&request, 0, request.dataSize());
++    payload->setDataPosition(0);
++    return payload->checkInterface(IInterface::asBinder(player).get()) ? OK : PERMISSION_DENIED;
++}
++
+ status_t MediaPlayer::invoke(const Parcel& request, Parcel *reply)
+ {
+     Mutex::Autolock _l(mLock);
+@@ -226,7 +239,12 @@ status_t MediaPlayer::invoke(const Parcel& request, Parcel *reply)
+             ((mCurrentState & MEDIA_PLAYER_IDLE) != MEDIA_PLAYER_IDLE);
+     if ((mPlayer != NULL) && hasBeenInitialized) {
+         ALOGV("invoke %zu", request.dataSize());
+-        return  mPlayer->invoke(request, reply);
++        if (IInterface::asBinder(mPlayer)->localBinder() == nullptr) {
++            return mPlayer->invoke(request, reply);
++        }
++        Parcel payload;
++        status_t err = payloadForLocalPlayer(mPlayer, request, &payload);
++        return err != OK ? err : mPlayer->invoke(payload, reply);
+     }
+     ALOGE("invoke failed: wrong state %X, mPlayer(%p)", mCurrentState, mPlayer.get());
+     return INVALID_OPERATION;
+@@ -239,7 +257,12 @@ status_t MediaPlayer::setMetadataFilter(const Parcel& filter)
+     if (mPlayer == NULL) {
+         return NO_INIT;
+     }
+-    return mPlayer->setMetadataFilter(filter);
++    if (IInterface::asBinder(mPlayer)->localBinder() == nullptr) {
++        return mPlayer->setMetadataFilter(filter);
++    }
++    Parcel payload;
++    status_t err = payloadForLocalPlayer(mPlayer, filter, &payload);
++    return err != OK ? err : mPlayer->setMetadataFilter(payload);
+ }
+ 
+ status_t MediaPlayer::getMetadata(bool update_only, bool apply_filter, Parcel *metadata)
