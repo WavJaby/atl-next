@@ -33,10 +33,40 @@ use crate::packages::{Packages, Permissions, real_config_changes};
 use crate::permission_request;
 use crate::tasks::{TaskId, Tasks};
 use crate::token;
-use atl_parcelables::android::content::pm::ActivityInfo;
+use atl_parcelables::android::content::pm::{ActivityInfo, ConfigurationInfo};
+use atl_parcelables::android::content::res::Configuration;
 use atl_services_types::counters;
 
 const ATM: &str = "IActivityTaskManager";
+
+/// Configuration.KEYBOARD_UNDEFINED / KEYBOARD_NOKEYS, NAVIGATION_DPAD / NAVIGATION_TRACKBALL (Configuration.java) and ConfigurationInfo.INPUT_FEATURE_HARD_KEYBOARD / FIVE_WAY_NAV (ConfigurationInfo.java).
+const KEYBOARD_UNDEFINED: i32 = 0;
+const KEYBOARD_NOKEYS: i32 = 1;
+const NAVIGATION_DPAD: i32 = 2;
+const NAVIGATION_TRACKBALL: i32 = 3;
+const INPUT_FEATURE_HARD_KEYBOARD: i32 = 1;
+const INPUT_FEATURE_FIVE_WAY_NAV: i32 = 2;
+
+/// ActivityTaskManagerService.getDeviceConfigurationInfo (:1155): the input fields of the caller's global configuration, the input features they imply, and the GL ES version read at service start.
+pub(crate) fn device_configuration_info(
+    global: &Configuration,
+    gl_es_version: i32,
+) -> ConfigurationInfo {
+    let mut features = 0;
+    if global.navigation == NAVIGATION_DPAD || global.navigation == NAVIGATION_TRACKBALL {
+        features |= INPUT_FEATURE_FIVE_WAY_NAV;
+    }
+    if global.keyboard != KEYBOARD_UNDEFINED && global.keyboard != KEYBOARD_NOKEYS {
+        features |= INPUT_FEATURE_HARD_KEYBOARD;
+    }
+    ConfigurationInfo {
+        req_touch_screen: global.touchscreen,
+        req_keyboard_type: global.keyboard,
+        req_navigation: global.navigation,
+        req_input_features: features,
+        req_gl_es_version: gl_es_version,
+    }
+}
 
 /// What the machine keeps per activity (ActivityRecord, reduced): its app thread, the identity its starts are checked against, and the configuration state a change is delivered by.
 #[derive(Clone)]
@@ -670,7 +700,12 @@ impl ActivityTasks {
 
     /// The configuration a launch carries (launch_item: the global configuration, no override): what the record's `reported` starts from.
     fn launch_config(&self) -> Config {
-        Config::from(&global_configuration(&self.tasks.display()))
+        Config::from(&self.global_configuration())
+    }
+
+    /// ActivityTaskManagerService.getGlobalConfigurationForCallingPid: one display, so every caller's is the global one.
+    fn global_configuration(&self) -> Configuration {
+        global_configuration(&self.tasks.display())
     }
 
     /// The records of `task` with their owners, bottom -> top, that a configuration change of the Task is delivered to: not finishing (ActivityRecord.java:8441-8445 ensureActivityConfiguration
@@ -701,7 +736,7 @@ impl ActivityTasks {
     }
 }
 
-/// IActivityTaskManager: startActivity and getActivityClientController. Every other method keeps the stub's unimplemented answer (counted).
+/// IActivityTaskManager: startActivity, getActivityClientController and getDeviceConfigurationInfo. Every other method keeps the stub's unimplemented answer (counted).
 pub struct ActivityTaskService {
     atm: Arc<ActivityTasks>,
     /// the processes: a start with no caller app starts one (ActivityManager::start_without_caller)
@@ -710,22 +745,30 @@ pub struct ActivityTaskService {
     reuse: bool,
     /// StartArgs::results
     results: bool,
+    /// ActivityTaskManagerService.GL_ES_VERSION: `ro.opengles.version` at service start, 0 (GL_ES_VERSION_UNDEFINED) when unset
+    gl_es_version: i32,
 }
 
 impl ActivityTaskService {
-    pub fn new(am: ActivityManager, reuse: bool, results: bool) -> Self {
+    pub fn new(am: ActivityManager, reuse: bool, results: bool, gl_es_version: i32) -> Self {
         ActivityTaskService {
             atm: am.activity_tasks(),
             am,
             reuse,
             results,
+            gl_es_version,
         }
     }
 
     /// `reuse` false: the test-only `--no-new-intent` (StartArgs::reuse); `results` false: the test-only `--no-activity-result` (StartArgs::results).
-    pub fn new_binder(am: ActivityManager, reuse: bool, results: bool) -> SpIBinder {
+    pub fn new_binder(
+        am: ActivityManager,
+        reuse: bool,
+        results: bool,
+        gl_es_version: i32,
+    ) -> SpIBinder {
         BnActivityTaskManager::new_binder(
-            ActivityTaskService::new(am, reuse, results),
+            ActivityTaskService::new(am, reuse, results, gl_es_version),
             BinderFeatures::default(),
         )
         .as_binder()
@@ -779,6 +822,13 @@ impl IActivityTaskManager for ActivityTaskService {
     ) -> binder::Result<Option<Strong<dyn IActivityClientController>>> {
         let controller = <dyn IActivityClientController>::try_from(self.atm.controller())?;
         Ok(Some(controller))
+    }
+
+    fn r#getDeviceConfigurationInfo(&self) -> binder::Result<Option<ConfigurationInfo>> {
+        Ok(Some(device_configuration_info(
+            &self.atm.global_configuration(),
+            self.gl_es_version,
+        )))
     }
 }
 
@@ -1085,5 +1135,43 @@ mod tests {
             matches!(results.as_slice(), [(REQUEST_CODE, 0, None)]),
             "{results:?}"
         );
+    }
+
+    /// getDeviceConfigurationInfo over the global configuration: input fields undefined (0) until the platform layer supplies input -> no features; the GL ES version passes through
+    /// (0x30001 = ES 3.1). Then AOSP's derivation on a configuration with a QWERTY keyboard (2) and a d-pad (2): both features; NOKEYS (1) and NONAV (1) give none (the break).
+    #[test]
+    fn device_configuration_info_follows_the_global_configuration() {
+        let atm = fixture_atm();
+        let info = device_configuration_info(&atm.global_configuration(), 0x30001);
+        assert_eq!(
+            info,
+            ConfigurationInfo {
+                req_gl_es_version: 0x30001,
+                ..ConfigurationInfo::default()
+            }
+        );
+        let keys = Configuration {
+            touchscreen: 3,
+            keyboard: 2,
+            navigation: NAVIGATION_DPAD,
+            ..Configuration::default()
+        };
+        let info = device_configuration_info(&keys, 0x20000);
+        assert_eq!(
+            (
+                info.req_touch_screen,
+                info.req_keyboard_type,
+                info.req_navigation
+            ),
+            (3, 2, NAVIGATION_DPAD)
+        );
+        assert_eq!(info.req_input_features, 0b11);
+        assert_eq!(info.req_gl_es_version, 0x20000);
+        let none = Configuration {
+            keyboard: KEYBOARD_NOKEYS,
+            navigation: 1,
+            ..Configuration::default()
+        };
+        assert_eq!(device_configuration_info(&none, 0).req_input_features, 0);
     }
 }

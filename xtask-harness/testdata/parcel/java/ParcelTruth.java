@@ -32,6 +32,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.ActivityInfo;
 import android.content.pm.ApplicationInfo;
+import android.content.pm.ConfigurationInfo;
 import android.content.pm.InstrumentationInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.ParceledListSlice;
@@ -222,6 +223,7 @@ public class ParcelTruth {
         check("ParsedIntentInfo", intentInfo, ParsedIntentInfoImpl.CREATOR);
         check("ParsedIntentInfo:plain", new ParsedIntentInfoImpl(), ParsedIntentInfoImpl.CREATOR);
         check("ComponentName", new ComponentName("com.example.app", "com.example.app.Runner"), ComponentName.CREATOR);
+        check("ConfigurationInfo", configurationInfo(), ConfigurationInfo.CREATOR);
         check("InstrumentationInfo", instrumentationInfo(ai), InstrumentationInfo.CREATOR);
         // IPackageManager.queryInstrumentationAsUser's reply: the inline list, its element class written once
         check("ParceledListSlice", new ParceledListSlice<>(Arrays.asList(instrumentationInfo(ai), instrumentationInfo(ai))), ParceledListSlice.CREATOR);
@@ -1240,6 +1242,17 @@ public class ParcelTruth {
     static void result(boolean ok, String name, String detail) {
         System.out.println("pt " + (ok ? "pass " : "fail ") + name + " " + detail);
         if (!ok) failures++;
+    }
+
+    /// IActivityTaskManager.getDeviceConfigurationInfo's reply, each field distinct so a swapped pair shows: finger touch, qwerty, no navigation, hard keyboard, ES 3.1.
+    static ConfigurationInfo configurationInfo() {
+        ConfigurationInfo c = new ConfigurationInfo();
+        c.reqTouchScreen = 3;
+        c.reqKeyboardType = 2;
+        c.reqNavigation = 1;
+        c.reqInputFeatures = ConfigurationInfo.INPUT_FEATURE_HARD_KEYBOARD;
+        c.reqGlEsVersion = 0x30001;
+        return c;
     }
 
     static void check(String name, Parcelable p, Parcelable.Creator<?> creator) {

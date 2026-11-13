@@ -13,7 +13,7 @@ publish.workspace = true
 # plain workspace builds take the policy modules (permission, counters, packages) and their tests.
 # The stubs' module is named too: a package's link arguments reach only its own links (atl-bridgegen converter.rs), and the stubs' cc libraries (libnativewindow, libcutils, ...) come from their rlib closure.
 [package.metadata.atl]
-converter = ["device/libbinder_rs", "device/libatl_parcelables", "device/atl-aidl-stubs-rust", "device/libgui_aidl_types_rs"]
+converter = ["device/libbinder_rs", "device/libatl_parcelables", "device/atl-aidl-stubs-rust", "device/libgui_aidl_types_rs", "device/librustutils"]
 
 [features]
 converter = ["atl-aidl/converter", "atl-libinput/converter", "atl-services-wire/converter"]
@@ -64,6 +64,7 @@ atl-gralloc-dmabuf = { path = "../atl-gralloc-dmabuf" }
 atl-libgui-parcel = { path = "../atl-libgui-parcel" }
 atl-libinput = { path = "../atl-libinput" }
 atl-platform-host = { path = "../atl-platform-host" }
+atl-property-service = { path = "../atl-property-service" }
 atl-services-types = { path = "../atl-services-types" }
 atl-services-wire = { path = "../atl-services-wire" }
 clap.workspace = true

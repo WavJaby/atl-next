@@ -7,6 +7,7 @@
 //! - `CONSTANTS`: what neither the tree nor the host decides, each with its reason.
 //! - arches.toml as the board config, AOSP's board_config.mk rules (build.rs): `ro.product.cpu.abilist`, `abilist32`, `abilist64`.
 //! - derived as init derives it when unset: `ro.build.fingerprint` (`fingerprint`).
+//! - probed from the run's GPU (atld, after its render-path choice): `ro.opengles.version` (`gles_version`).
 #![forbid(unsafe_code)]
 
 use std::fmt;
@@ -131,6 +132,21 @@ impl LinearTier {
     }
 }
 
+/// The device's GLES version: ActivityTaskManagerService reads it into ConfigurationInfo.reqGlEsVersion (`SystemProperties.getInt`, decimal), and apps compare it against `major << 16 | minor`.
+pub const GLES_VERSION: &str = "ro.opengles.version";
+
+/// [`GLES_VERSION`] from a GLES context's GL_VERSION string, which the GLES spec fixes as `OpenGL ES <major>.<minor><space><vendor info>`: the version the driver actually exposes, never a claimed one.
+/// None for any other shape (a desktop GL string, garbage): the property then stays unset, as on a device without it (GL_ES_VERSION_UNDEFINED).
+pub fn gles_version(gl_version: &str) -> Option<Property> {
+    let rest = gl_version.strip_prefix("OpenGL ES ")?;
+    let number = rest.split(' ').next()?;
+    let (major, minor) = number.split_once('.')?;
+    let major: u16 = major.parse().ok()?;
+    let minor: u16 = minor.parse().ok()?;
+    let encoded = (u32::from(major) << 16) | u32::from(minor);
+    Some((GLES_VERSION.to_owned(), encoded.to_string()))
+}
+
 /// The default set: `build_prop`'s properties, `CONSTANTS`, the linear allocator tier's properties, the ABI lists, then the fingerprint derived from them.
 pub fn defaults(build_prop: &str, tier: LinearTier) -> Result<Vec<Property>, Error> {
     let mut props = parse_build_prop(build_prop)?;
@@ -213,6 +229,37 @@ mod tests {
         let mut out = [0u8; VALUE_MAX];
         let len = value_len(area.read(pi, &mut out));
         Some(String::from_utf8_lossy(&out[..len]).into_owned())
+    }
+
+    /// Mesa's GL_VERSION on the d3d12 and llvmpipe paths (gpu-readback.md S2) -> 3 << 16 | 1 = 196609 and 3 << 16 | 2 = 196610, read back from an area as SystemProperties would.
+    /// Break: desktop GL and malformed strings set nothing; a missing area entry reads None.
+    #[test]
+    fn gles_version_from_gl_version() {
+        let d3d12 = gles_version("OpenGL ES 3.1 Mesa 25.0.7-2").unwrap();
+        let llvmpipe = gles_version("OpenGL ES 3.2 Mesa 25.0.7-2").unwrap();
+        assert_eq!(d3d12, (GLES_VERSION.to_owned(), "196609".to_owned()));
+        assert_eq!(llvmpipe.1, "196610");
+        assert_eq!(gles_version("OpenGL ES 2.0").unwrap().1, "131072");
+        for bad in [
+            "4.6 (Compatibility Profile) Mesa 25.0.7",
+            "OpenGL ES-CM 1.1 Mesa",
+            "OpenGL ES 3",
+            "OpenGL ES x.1",
+            "",
+        ] {
+            assert_eq!(gles_version(bad), None, "{bad:?}");
+        }
+        let mut props = defaults(BUILD_PROP, LinearTier::DmaBufHeap).unwrap();
+        let bytes = area(&props).unwrap();
+        let w = words(&bytes);
+        assert_eq!(read(&Area::new(&w).unwrap(), GLES_VERSION), None);
+        props.push(d3d12);
+        let bytes = area(&props).unwrap();
+        let w = words(&bytes);
+        assert_eq!(
+            read(&Area::new(&w).unwrap(), GLES_VERSION).as_deref(),
+            Some("196609")
+        );
     }
 
     #[test]

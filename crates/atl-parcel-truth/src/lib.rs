@@ -27,8 +27,8 @@ use atl_parcelables::android::app::NotificationChannel;
 use atl_parcelables::android::app::PendingIntent;
 use atl_parcelables::android::app::servertransaction::ClientTransaction;
 use atl_parcelables::android::content::pm::{
-    ActivityInfo, ApplicationInfo, InstrumentationInfo, PackageInfo, ParceledListSlice,
-    PermissionInfo, ProviderInfo, ProviderInfoList, ServiceInfo,
+    ActivityInfo, ApplicationInfo, ConfigurationInfo, InstrumentationInfo, PackageInfo,
+    ParceledListSlice, PermissionInfo, ProviderInfo, ProviderInfoList, ServiceInfo,
 };
 use atl_parcelables::android::content::res::{CompatibilityInfo, Configuration};
 use atl_parcelables::android::content::{ComponentName, Intent, IntentFilter};
@@ -304,6 +304,7 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
         "android.content.Intent" => round_trip_as::<Intent>(input, mode),
         "android.content.IntentFilter" => round_trip_as::<IntentFilter>(input, mode),
         "android.content.ComponentName" => round_trip_as::<ComponentName>(input, mode),
+        "android.content.pm.ConfigurationInfo" => round_trip_as::<ConfigurationInfo>(input, mode),
         "android.os.Bundle" => round_trip_as::<Bundle>(input, mode),
         "android.app.servertransaction.ClientTransaction" => {
             round_trip_as::<ClientTransaction>(input, mode)

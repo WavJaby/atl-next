@@ -119,8 +119,8 @@ uses = ["generators", "compositor", "libgui-parcel"]
 crates = ["atl-services"]
 # the package record types (plain Rust, no converter) are what atld installs and xtask writes
 exports = ["atl-services"]
-# libgui-parcel: finishDrawing frames the post-draw Transaction with libgui's reader to forward it (window.rs); platform-host: the sensor service reads the machine's accelerometers through it (sensor.rs); gralloc: atl-screencap reads the captured buffer's dma-buf (screencap.rs)
-uses = ["aidl", "generators", "broker", "libinput", "android-paths", "libgui-parcel", "platform-host", "gralloc", "services-types", "services-wire"]
+# libgui-parcel: finishDrawing frames the post-draw Transaction with libgui's reader to forward it (window.rs); platform-host: the sensor service reads the machine's accelerometers through it (sensor.rs); gralloc: atl-screencap reads the captured buffer's dma-buf (screencap.rs); property-service: ActivityTaskManager reads ro.opengles.version by its name there (system_services.rs)
+uses = ["aidl", "generators", "broker", "libinput", "android-paths", "libgui-parcel", "platform-host", "gralloc", "services-types", "services-wire", "property-service"]
 
 # AOSP libinput as the converter builds it, reached through cxx adapters (wrap/input.cpp): the input publisher and the virtual keyboard's KeyCharacterMap; C++ only as the adapters the project CLAUDE.md allows
 [libinput]

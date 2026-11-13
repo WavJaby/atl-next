@@ -664,6 +664,7 @@ dependencies = [
  "atl-libgui-parcel",
  "atl-libinput",
  "atl-platform-host",
+ "atl-property-service",
  "atl-services-types",
  "atl-services-wire",
  "clap",

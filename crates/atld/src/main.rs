@@ -1309,7 +1309,7 @@ fn run(a: &Args) -> Result<ExitCode> {
     std::fs::create_dir_all(r.root.join("log"))?;
     let tier = LinearTier::probe();
     log(format_args!("linear allocator tier {}", tier.name()));
-    let defaults = property_area(a, &r, tier)?;
+    let mut defaults = property_area(a, &r, tier)?;
     let boot = system_layout(a, &r)?;
     let fonts = font_layout(a, &r)?;
     vintf_layout(a, &r)?;
@@ -1565,10 +1565,11 @@ fn run(a: &Args) -> Result<ExitCode> {
                 .ok_or_else(|| format!("probe exited {status}: {}", text.trim())))
         };
         let candidates = gpu::render_paths();
+        // probed even without candidates: its GL_VERSION is what the apps get on the baseline (ro.opengles.version)
+        let baseline = probe_renderer("gpu-render-baseline", app_devices.clone(), vec![])?;
         let chosen = if candidates.is_empty() {
             Err("no kernel render path offered".to_owned())
         } else {
-            let baseline = probe_renderer("gpu-render-baseline", app_devices.clone(), vec![])?;
             let mut chosen = Err(format!("baseline {baseline:?}"));
             for path in candidates {
                 let mut devices = app_devices.clone();
@@ -1594,7 +1595,7 @@ fn run(a: &Args) -> Result<ExitCode> {
             }
             chosen
         };
-        match chosen {
+        let version = match chosen {
             Ok((path, version, renderer, env)) => {
                 log(format_args!(
                     "gpu-render: path {} (renderer {renderer}, {version})",
@@ -1602,10 +1603,29 @@ fn run(a: &Args) -> Result<ExitCode> {
                 ));
                 app_devices.extend(path.nodes.iter().map(PathBuf::from));
                 app_env = env;
+                Some(version)
             }
-            Err(why) => log(format_args!("gpu-render: path baseline ({why})")),
+            Err(why) => {
+                log(format_args!("gpu-render: path baseline ({why})"));
+                baseline.ok().map(|(v, _)| v)
+            }
+        };
+        // the GLES version of the path that runs, as the device's vendor build.prop states it on Android; unset when no probe answered or the string is not GLES's
+        match version
+            .as_deref()
+            .map(|v| (v, atl_property_service::gles_version(v)))
+        {
+            Some((v, Some(prop))) => {
+                log(format_args!("gles: {}={} ({v})", prop.0, prop.1));
+                defaults.push(prop);
+            }
+            Some((v, None)) => log(format_args!("gles: unset (GL_VERSION {v:?} not GLES)")),
+            None => log(format_args!("gles: unset (no renderer probed)")),
         }
     }
+    // the services' area: the defaults with what the probes above added (ActivityTaskManagerService reads ro.opengles.version); the processes started before the probes keep the first area
+    let system_area = r.root.join("properties.d").join("system");
+    std::fs::write(&system_area, atl_property_service::area(&defaults)?)?;
     app_env.extend(a.app_env.iter().cloned());
     log(format_args!("apps' devices {app_devices:?}"));
     let host = Arc::new(Host {
@@ -1764,6 +1784,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         false,
         Some(control_theirs),
     )?;
+    services_spawn.property_area = Some(system_area);
     // what the install reads by host path: the sessions' manifests and the installer's frames, the platform's permission definitions
     services_spawn.mounts.push(ro_at_own_path(&install_dir));
     if let Some(p) = &a.platform_permissions {

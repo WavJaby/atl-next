@@ -7,6 +7,8 @@
 
 // the converter's rlib, on the crate search path build.rs sets (no cargo dependency names it)
 extern crate binder;
+// librustutils: the process's system properties (ro.opengles.version, which atld writes into the services' property area)
+extern crate rustutils;
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -148,6 +150,17 @@ fn parse_root_back(s: &str) -> Result<RootBack, String> {
     }
 }
 
+/// ActivityTaskManagerService's GL_ES_VERSION: `SystemProperties.getInt("ro.opengles.version", GL_ES_VERSION_UNDEFINED)` (:867); unset -> 0. A value that is not an int is atld's bug: fail the start.
+fn gl_es_version() -> Result<i32> {
+    let name = atl_property_service::GLES_VERSION;
+    match rustutils::system_properties::read(name).with_context(|| format!("reading {name}"))? {
+        Some(v) if !v.is_empty() => v
+            .parse()
+            .with_context(|| format!("{name}={v:?}: not an int")),
+        _ => Ok(0),
+    }
+}
+
 fn main() -> Result<()> {
     let a = Args::parse();
     let display = a.display.unwrap_or_default();
@@ -196,6 +209,7 @@ fn main() -> Result<()> {
             activity.clone(),
             !a.no_new_intent,
             !a.no_activity_result,
+            gl_es_version()?,
         ),
     )
     .context("addService activity_task")?;
