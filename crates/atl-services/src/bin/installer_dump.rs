@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! atl-installer-dump: the installer's output (frames of upstream parcels on stdin) decoded by `atl_services::installed::decode`, printed as `key value` lines for `xtask test installer`, which compares them
 //! with its oracles. Test-only. A decode error goes to stderr with its name, exit 1, and nothing on stdout.
-//! Lines: `package`, `version-code` (getLongVersionCode), `version-name`, `min-sdk`, `target-sdk`, `app-class`, `app-flags`, `extract-native-libs`, `app-process`, `app-theme`, `uses-permission`*,
+//! Lines: `package`, `version-code` (getLongVersionCode), `version-name`, `min-sdk`, `target-sdk`, `app-class`, `app-flags`, `extract-native-libs`, `has-code`, `app-process`, `app-theme`, `uses-permission`*,
 //! `permission <name> protection-level=`*, `activity`/`receiver`/`service`/`provider <name> key=value...`*, `filter <kind> <component> actions= categories= schemes= types=`*, `uses-library <name> required=`*, `instrumentation <name> target=`*, `split`*, `primary-abi`, `lib-dir`.
 
 extern crate atl_parcelables;
@@ -18,6 +18,8 @@ use atl_services_types::installer_output::Kind;
 
 /// ApplicationInfo.FLAG_EXTRACT_NATIVE_LIBS (ApplicationInfo.java).
 const FLAG_EXTRACT_NATIVE_LIBS: i32 = 1 << 28;
+/// ApplicationInfo.FLAG_HAS_CODE (ApplicationInfo.java).
+const FLAG_HAS_CODE: i32 = 1 << 2;
 
 fn or_none(v: &Option<String>) -> &str {
     v.as_deref().unwrap_or("none")
@@ -58,6 +60,7 @@ fn lines(installed: &Installed) -> Result<Vec<String>> {
             "extract-native-libs {}",
             app.flags & FLAG_EXTRACT_NATIVE_LIBS != 0
         ),
+        format!("has-code {}", app.flags & FLAG_HAS_CODE != 0),
         format!("app-process {}", or_none(&app.process_name)),
         format!("app-theme {:#x}", app.theme),
     ];

@@ -428,6 +428,11 @@ fn device_sdk(props: &[Property]) -> Result<i32> {
 
 /// AOSP's `extractNativeLibs` of the base APK's manifest (ApkLiteParseUtils:509-510, default true), read from `aapt2 dump xmltree`: `=false` when the `<application>` attribute says so.
 fn extract_native_libs(aapt2: &Path, base: &Path) -> Result<bool> {
+    application_bool(aapt2, base, "extractNativeLibs")
+}
+
+/// A default-true `<application>` boolean of the base APK's manifest (`extractNativeLibs`, `hasCode`: ParsingPackageUtils:2401), from `aapt2 dump xmltree`.
+fn application_bool(aapt2: &Path, base: &Path, attr: &str) -> Result<bool> {
     let tree = crate::host_art::output(
         Command::new(aapt2)
             .arg("dump")
@@ -437,16 +442,13 @@ fn extract_native_libs(aapt2: &Path, base: &Path) -> Result<bool> {
             .arg(base),
         "aapt2 dump xmltree",
     )?;
-    let Some(line) = tree.lines().find(|l| l.contains("extractNativeLibs(")) else {
+    let Some(line) = tree.lines().find(|l| l.contains(&format!(":{attr}("))) else {
         return Ok(true);
     };
     match line.rsplit_once('=').map(|(_, v)| v.trim()) {
         Some("true") => Ok(true),
         Some("false") => Ok(false),
-        _ => bail!(
-            "extractNativeLibs of {}: unrecognised form {line:?}",
-            base.display()
-        ),
+        _ => bail!("{attr} of {}: unrecognised form {line:?}", base.display()),
     }
 }
 
@@ -726,6 +728,17 @@ impl Gate<'_> {
     fn full_parse(&self, stdout: &str, base_apk: &Path, bad: &mut Vec<String>) -> Result<Full> {
         let full = Full::read(stdout)?;
         bad.extend(compare(&full, &oracle(&self.aapt2, base_apk, self.sdk)?));
+        // the ApplicationInfo flags AOSP derives at hideAsFinal: generate before it answered 0 (no FLAG_HAS_CODE -> an empty class path in every app)
+        let flags = [
+            ("has-code", "hasCode"),
+            ("extract-native-libs", "extractNativeLibs"),
+        ];
+        for (key, attr) in flags {
+            let want = application_bool(&self.aapt2, base_apk, attr)?.to_string();
+            if full.value(key) != want {
+                bad.push(format!("{key} {} != xmltree {want}", full.value(key)));
+            }
+        }
         Ok(full)
     }
 
