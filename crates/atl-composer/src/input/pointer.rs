@@ -3,6 +3,7 @@
 //! Pure: [`Pointer::translate`] turns one platform event into the [`Motion`]s Android would deliver, in order; the publisher stamps seq and ids and writes them.
 //! * Buttons: DOWN then BUTTON_PRESS per button, BUTTON_RELEASE then UP (CursorInputMapper.cpp sync). DOWN and UP follow primary, secondary and tertiary only (isPointerDown); back and forward only press. A button with no Android bit is ignored. Back and forward also send a key ([`button_keys`]).
 //! * Hover: no button held -> HOVER_MOVE, with HOVER_ENTER first and HOVER_EXIT on leave or before a press (InputDispatcher synthesizes enter/exit per window; we are the dispatcher).
+//!   A crossing alone (platform Enter) only places the cursor: Android's enter is synthesized in front of a hover move, never from a crossing. GTK also crosses for a finger (touch pointer focus), which must not look like a hovering mouse to the app.
 //! * Wheel -> ACTION_SCROLL, AXIS_VSCROLL = -dy (positive = toward the user's "up", MotionEvent.AXIS_VSCROLL javadoc), AXIS_HSCROLL = dx.
 //! * Touchpad swipe -> one fake finger (GestureConverter.cpp handleScroll): DOWN at the cursor, MOVE per delta, UP at the end; TWO_FINGER_SWIPE, IS_GENERATED_GESTURE, pressure 1, source SOURCE_MOUSE (GestureConverter.h SOURCE; mouse|touchpad is only the device's sources, and SOURCE_CLASS_POSITION on an event makes MotionEvent skip the view offset: shouldDisregardTransformation),
 //!   finger and cursor offset to the cursor position (PointerChoreographer.cpp processTouchpadEventLocked). The finger moves with the content (= -scroll delta) and GESTURE_SCROLL_*_DISTANCE = the scroll delta.
@@ -250,7 +251,8 @@ impl Pointer {
                         self.at = Some(e.position);
                         out.push(self.mouse(ACTION_MOVE, 0, e.position, Vec::new(), t));
                     }
-                    PointerPhase::Enter | PointerPhase::Move => {
+                    PointerPhase::Enter => self.at = Some(e.position),
+                    PointerPhase::Move => {
                         self.at = Some(e.position);
                         if self.swipe.is_none() {
                             if !std::mem::replace(&mut self.hovering, true) {
@@ -262,15 +264,7 @@ impl Pointer {
                                     t,
                                 ));
                             }
-                            if e.phase == PointerPhase::Move {
-                                out.push(self.mouse(
-                                    ACTION_HOVER_MOVE,
-                                    0,
-                                    e.position,
-                                    Vec::new(),
-                                    t,
-                                ));
-                            }
+                            out.push(self.mouse(ACTION_HOVER_MOVE, 0, e.position, Vec::new(), t));
                         }
                     }
                     PointerPhase::Leave => {
@@ -389,12 +383,12 @@ mod tests {
         p.translate(e).iter().map(|m| m.action).collect()
     }
 
-    /// Hover then a click: ENTER(9) MOVE(7), EXIT(10) before DOWN(0) + BUTTON_PRESS(11), BUTTON_RELEASE(12) + UP(1), then the next move enters again. Codes from input.h.
+    /// Hover then a click: a crossing alone sends nothing; the first move ENTER(9) MOVE(7), EXIT(10) before DOWN(0) + BUTTON_PRESS(11), BUTTON_RELEASE(12) + UP(1), then the next move enters again. Codes from input.h.
     #[test]
     fn hover_wraps_a_click() {
         let mut p = Pointer::default();
-        assert_eq!(actions(&mut p, pointer(PointerPhase::Enter, 1)), [9]);
-        assert_eq!(actions(&mut p, pointer(PointerPhase::Move, 2)), [7]);
+        assert!(actions(&mut p, pointer(PointerPhase::Enter, 1)).is_empty());
+        assert_eq!(actions(&mut p, pointer(PointerPhase::Move, 2)), [9, 7]);
         let down = p.translate(pointer(PointerPhase::Down(PointerButton::Primary), 3));
         assert_eq!(
             down.iter().map(|m| m.action).collect::<Vec<_>>(),
@@ -565,18 +559,15 @@ mod tests {
         assert_eq!(m[0].cursor, P);
     }
 
-    /// A swipe: hover exits, the fake finger goes down at the cursor and moves against the scroll (dy +10 -> finger y 190), GESTURE_SCROLL_Y_DISTANCE = +10, then UP at the moved finger with pressure 0.
+    /// A swipe: the fake finger goes down at the cursor (a crossing alone left no hover to exit) and moves against the scroll (dy +10 -> finger y 190), GESTURE_SCROLL_Y_DISTANCE = +10, then UP at the moved finger with pressure 0.
     /// Source 0x2002 (GestureConverter.h), TOOL_TYPE_FINGER 1, TWO_FINGER_SWIPE 3, IS_GENERATED_GESTURE 0x8 (input.h, MotionEventFlag.aidl).
     #[test]
     fn swipe_is_a_fake_finger() {
         let mut p = Pointer::default();
         p.translate(pointer(PointerPhase::Enter, 1));
         let first = p.translate(scroll(ScrollKind::Swipe { dx: 0.0, dy: 10.0 }, 2));
-        assert_eq!(
-            first.iter().map(|m| m.action).collect::<Vec<_>>(),
-            [10, 0, 2]
-        );
-        let (down, moved) = (&first[1], &first[2]);
+        assert_eq!(first.iter().map(|m| m.action).collect::<Vec<_>>(), [0, 2]);
+        let (down, moved) = (&first[0], &first[1]);
         assert_eq!(
             (
                 down.source,

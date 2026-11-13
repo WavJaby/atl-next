@@ -405,8 +405,13 @@ pub struct Proxy {
     pub events: Receiver<(Instant, Event)>,
     injections: Arc<Mutex<Vec<Injection>>>,
     wakes: Arc<Mutex<Vec<OwnedFd>>>,
-    /// Origin of the event timestamps the injected pointer events carry.
-    epoch: Instant,
+}
+
+/// An injected input event's timestamp: CLOCK_MONOTONIC in ms, truncated to u32 -- the base wlroots and weston stamp input with. The protocol leaves the base undefined, but clients that turn it into Android event times read it as uptimeMillis (CLOCK_MONOTONIC), so a private epoch dates every event hours in the past.
+fn input_time_ms() -> u32 {
+    let t = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    let ms = t.tv_sec as u64 * 1000 + t.tv_nsec as u64 / 1_000_000;
+    ms as u32
 }
 
 impl Proxy {
@@ -436,7 +441,6 @@ impl Proxy {
             events,
             injections,
             wakes,
-            epoch: Instant::now(),
         })
     }
 
@@ -447,23 +451,26 @@ impl Proxy {
 
     /// Queues a pointer action on the connection's `wl_pointer`, at its window surface; the client gets it as compositor input. Nothing is written until the client has both (`xdg_surface` and `get_pointer`), so inject after [`Event::Acked`].
     pub fn inject_pointer(&self, action: PointerAction) -> Result<()> {
-        let time_ms = u32::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u32::MAX);
-        self.queue(Injection::Pointer { action, time_ms })
+        self.queue(Injection::Pointer {
+            action,
+            time_ms: input_time_ms(),
+        })
     }
 
     /// Queues a touch action on the client's `wl_touch`, at its window surface. The compositor's seat need have no touch: the proxy adds the capability, answers `get_touch` itself and is the only source of its events (module doc). Nothing is written before the client has the touch and its window.
     pub fn inject_touch(&self, action: TouchAction) -> Result<()> {
-        let time_ms = u32::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u32::MAX);
-        self.queue(Injection::Touch { action, time_ms })
+        self.queue(Injection::Touch {
+            action,
+            time_ms: input_time_ms(),
+        })
     }
 
     /// Queues `wl_keyboard.key` of linux input `code` (KEY_A = 30) on the client's keyboard, which must hold focus (the window active: the compositor sent `enter`). Only the key: no `modifiers` event, so the client's xkb state does not see it as a modifier (the Android side derives meta from key transitions). The client's own repeat (`repeat_info`) runs while a key is held.
     pub fn inject_key(&self, code: u32, pressed: bool) -> Result<()> {
-        let time_ms = u32::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u32::MAX);
         self.queue(Injection::Key {
             code,
             pressed,
-            time_ms,
+            time_ms: input_time_ms(),
         })
     }
 

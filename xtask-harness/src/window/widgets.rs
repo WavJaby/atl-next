@@ -326,7 +326,7 @@ fn buttons_check(app: &str) -> Result<String, String> {
     ))
 }
 
-/// The hover the probe makes over the list: HOVER_ENTER (9), HOVER_MOVE (7), HOVER_EXIT (10) in that order with no touch in between (input.h codes). A tap's enter is exited by its press, with no move: only the hover makes a 7.
+/// The hover the probe makes over the list: HOVER_ENTER (9), HOVER_MOVE (7), HOVER_EXIT (10) in that order with no touch in between (input.h codes). A tap (enter, press) makes no hover at all: the enter comes with the first move.
 fn hover_check(app: &str) -> Result<String, String> {
     let lines: Vec<&str> = app.lines().collect();
     for (i, l) in lines.iter().enumerate() {
@@ -644,6 +644,7 @@ fn list_check(app: &str) -> Result<String, String> {
 }
 
 /// The two-finger touch on the list: from the touchscreen (source, device), as DOWN(0) 1 pointer, POINTER_DOWN(5) 2, MOVE(2) 2, POINTER_UP(6) 2, UP(1) 1 (input.h codes; TouchInputMapper's sequence), and the list scrolled after its DOWN.
+/// No mouse HOVER_ENTER (9) during the touch: GTK moves its pointer focus for a finger, and that crossing is no mouse (Android sends a finger no hover).
 fn touch_check(app: &str) -> Result<String, String> {
     let lines: Vec<&str> = app.lines().collect();
     let from_screen = |l: &str| touch_field(l, "source") == Some(SOURCE_TOUCHSCREEN);
@@ -651,6 +652,14 @@ fn touch_check(app: &str) -> Result<String, String> {
         .iter()
         .position(|l| from_screen(l))
         .ok_or("no touchscreen event at all")?;
+    let last = lines.iter().rposition(|l| from_screen(l)).unwrap_or(first);
+    // the crossing reaches the app before the finger's DOWN: look from the line before it
+    if let Some(l) = lines[first.saturating_sub(1)..=last]
+        .iter()
+        .find(|l| generic(l) == Some(ACTION_HOVER_ENTER))
+    {
+        return Err(format!("a mouse hover entered with the finger: {l}"));
+    }
     let mut seq: Vec<(i64, i64)> = Vec::new();
     for l in lines[first..].iter().filter(|l| from_screen(l)) {
         if touch_field(l, "device") != Some(TOUCHSCREEN_DEVICE) {

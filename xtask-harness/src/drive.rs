@@ -2,8 +2,8 @@
 //! `xtask run-apk --drive <script>`: an agent's hands and eyes on a real APK, headless. A script runs against the app's window once run-apk's own wait is over (resumed, settled, a frame presented, the watch done).
 //! Input goes through the window proxy (wayland_proxy.rs), shots through the compositor (screencopy.rs). The compositor holds the window at output (0, 0) ([`NestedCompositor::start_placed`]), so content pixels map to the output by the window geometry the client declared.
 //! Script, one step a line; blank lines and `#` comments are skipped. Coordinates are window content pixels (the output has scale 1).
-//!   wait <ms> | wait-frames <n> | tap <x> <y> | touch <x> <y> <ms> | swipe <x1> <y1> <x2> <y2> <ms> | key <name> | key-down <name> | key-up <name> | resize <w> <h> | shot <file.png>
-//! `tap` and `swipe` are the mouse (SOURCE_MOUSE events); `touch` is one finger on the touchscreen (wl_touch -> SOURCE_TOUCHSCREEN), down for `ms` then up, what a phone game's touch input reads (Unity's Input.touches ignores the mouse).
+//!   wait <ms> | wait-frames <n> | tap <x> <y> | touch <x> <y> <ms> | touch-swipe <x1> <y1> <x2> <y2> <ms> | swipe <x1> <y1> <x2> <y2> <ms> | leave | key <name> | key-down <name> | key-up <name> | resize <w> <h> | shot <file.png>
+//! `tap` and `swipe` are the mouse (SOURCE_MOUSE events); `touch` / `touch-swipe` are one finger on the touchscreen (wl_touch -> SOURCE_TOUCHSCREEN), what a phone game's touch input reads (Unity's Input.touches ignores the mouse). `leave` takes the mouse off the window (HOVER_EXIT).
 //! `wait-frames` counts the app's presents from that step on and fails if they do not come: an idle app presents nothing, so use it only after something that redraws. A present is logged before the compositor shows it: a shot straight after may be one frame old.
 //! `shot` paths are relative to the current directory; the image is the window's content (a dialog reaching past it is cut), and a one-colour image is an error, never a pass.
 
@@ -53,6 +53,14 @@ pub enum Step {
     Tap(f64, f64),
     /// One finger at (x, y), held for the ms.
     Touch(f64, f64, u64),
+    /// One finger down at `from`, moved to `to` over the ms, then up.
+    TouchSwipe {
+        from: (f64, f64),
+        to: (f64, f64),
+        ms: u64,
+    },
+    /// The mouse leaves the window (`wl_pointer.leave` -> HOVER_EXIT): no pointer hovers the content.
+    Leave,
     Swipe {
         from: (f64, f64),
         to: (f64, f64),
@@ -107,6 +115,12 @@ fn parse_step(line: &str) -> Result<Step> {
         ["wait-frames", n] => Step::WaitFrames(num(n)?),
         ["tap", x, y] => Step::Tap(num(x)?, num(y)?),
         ["touch", x, y, ms] => Step::Touch(num(x)?, num(y)?, num(ms)?),
+        ["touch-swipe", x1, y1, x2, y2, ms] => Step::TouchSwipe {
+            from: (num(x1)?, num(y1)?),
+            to: (num(x2)?, num(y2)?),
+            ms: num(ms)?,
+        },
+        ["leave"] => Step::Leave,
         ["swipe", x1, y1, x2, y2, ms] => Step::Swipe {
             from: (num(x1)?, num(y1)?),
             to: (num(x2)?, num(y2)?),
@@ -276,6 +290,8 @@ impl Driver<'_> {
                 std::thread::sleep(Duration::from_millis(*ms));
                 self.t.proxy.inject_touch(TouchAction::Up { id: 0 })?;
             }
+            Step::TouchSwipe { from, to, ms } => self.touch_swipe(*from, *to, *ms)?,
+            Step::Leave => self.t.proxy.inject_pointer(PointerAction::Leave)?,
             Step::Swipe { from, to, ms } => self.swipe(*from, *to, *ms)?,
             Step::Key(code) => {
                 self.t.proxy.inject_key(*code, true)?;
@@ -305,6 +321,28 @@ impl Driver<'_> {
             })?;
         }
         self.press(false)
+    }
+
+    /// [`Driver::swipe`] with one finger: down, a move each [`SWIPE_STEP`], up at `to`.
+    fn touch_swipe(&mut self, from: (f64, f64), to: (f64, f64), ms: u64) -> Result<()> {
+        let (x1, y1) = self.surface_point(from)?;
+        let (x2, y2) = self.surface_point(to)?;
+        let steps = (ms / SWIPE_STEP.as_millis() as u64).max(1);
+        self.t.proxy.inject_touch(TouchAction::Down {
+            id: 0,
+            x: x1,
+            y: y1,
+        })?;
+        for i in 1..=steps {
+            let f = i as f64 / steps as f64;
+            std::thread::sleep(SWIPE_STEP);
+            self.t.proxy.inject_touch(TouchAction::Motion {
+                id: 0,
+                x: x1 + (x2 - x1) * f,
+                y: y1 + (y2 - y1) * f,
+            })?;
+        }
+        self.t.proxy.inject_touch(TouchAction::Up { id: 0 })
     }
 
     /// Configures the window so its content is `w` x `h`, then waits for the ack and the geometry of that size.
@@ -349,7 +387,7 @@ mod tests {
 
     #[test]
     fn every_step_parses() {
-        let script = "# comment\n\nwait 10\nwait-frames 2\ntap 1 2.5\ntouch 3 4 80\nswipe 1 2 3 4 100\nkey a\nkey 0\nkey enter\nresize 640 400\nshot out/a.png\n";
+        let script = "# comment\n\nwait 10\nwait-frames 2\ntap 1 2.5\ntouch 3 4 80\ntouch-swipe 1 2 3 4 100\nleave\nswipe 1 2 3 4 100\nkey a\nkey 0\nkey enter\nresize 640 400\nshot out/a.png\n";
         // KEY_A = 30, KEY_0 = 11, KEY_ENTER = 28 (linux/input-event-codes.h)
         assert_eq!(
             parse(script).unwrap(),
@@ -358,6 +396,12 @@ mod tests {
                 Step::WaitFrames(2),
                 Step::Tap(1.0, 2.5),
                 Step::Touch(3.0, 4.0, 80),
+                Step::TouchSwipe {
+                    from: (1.0, 2.0),
+                    to: (3.0, 4.0),
+                    ms: 100
+                },
+                Step::Leave,
                 Step::Swipe {
                     from: (1.0, 2.0),
                     to: (3.0, 4.0),
