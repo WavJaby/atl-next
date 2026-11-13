@@ -133,6 +133,24 @@ pub fn r_i32_array(p: &In<'_>) -> Result<Option<Vec<i32>>> {
         .map(Some)
 }
 
+/// Java writeLongArray: -1 for null, else the count and each long.
+pub fn w_i64_array(p: &mut In<'_>, v: &Option<Vec<i64>>) -> Result<()> {
+    let Some(v) = v else { return w_i32(p, -1) };
+    w_i32(p, len_i32(v.len())?)?;
+    v.iter().try_for_each(|x| w_i64(p, *x))
+}
+/// Java createLongArray.
+pub fn r_i64_array(p: &In<'_>) -> Result<Option<Vec<i64>>> {
+    let n = r_i32(p)?;
+    if n < 0 {
+        return Ok(None);
+    }
+    (0..n)
+        .map(|_| r_i64(p))
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
 /// Java writeFloatArray: -1 for null, else the count and each float.
 pub fn w_f32_array(p: &mut In<'_>, v: &Option<Vec<f32>>) -> Result<()> {
     let Some(v) = v else { return w_i32(p, -1) };

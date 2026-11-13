@@ -89,6 +89,7 @@ public class Main extends Activity {
         mediaPlayer();
         Log.i("AtlTest", "connectivity: " + connectivity());
         Log.i("AtlTest", "permission: " + permission());
+        Log.i("AtlTest", "notification: " + channels());
         Log.i("AtlTest", "signatures: " + signatures());
         Log.i("AtlTest", "priority: " + priority());
         mediaPlayerService();
@@ -194,6 +195,33 @@ public class Main extends Activity {
             done.await(CALLBACK_WAIT_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
             cm.unregisterNetworkCallback(cb);
             return line + " callback=" + got.get();
+        } catch (Throwable t) {
+            return "threw " + t;
+        }
+    }
+
+    /**
+     * "importance=<int> name=<name> visibility=<int> count=<n> absent=<channel> raised=<int>": a channel created at IMPORTANCE_LOW and read back, the channel count, an unknown id, and the importance
+     * after re-creating it at IMPORTANCE_HIGH (Unity's registerNotificationChannel path); "absent" when getSystemService returns null; else what it threw.
+     */
+    private String channels() {
+        try {
+            android.app.NotificationManager nm =
+                    (android.app.NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            if (nm == null) {
+                return "absent";
+            }
+            nm.createNotificationChannel(new android.app.NotificationChannel(
+                    "atl.test", "ATL test", android.app.NotificationManager.IMPORTANCE_LOW));
+            android.app.NotificationChannel c = nm.getNotificationChannel("atl.test");
+            String read = c == null ? "importance=none"
+                    : "importance=" + c.getImportance() + " name=" + c.getName() + " visibility=" + c.getLockscreenVisibility();
+            int count = nm.getNotificationChannels().size();
+            android.app.NotificationChannel absent = nm.getNotificationChannel("atl.none");
+            nm.createNotificationChannel(new android.app.NotificationChannel(
+                    "atl.test", "ATL test", android.app.NotificationManager.IMPORTANCE_HIGH));
+            android.app.NotificationChannel again = nm.getNotificationChannel("atl.test");
+            return read + " count=" + count + " absent=" + absent + " raised=" + (again == null ? "none" : again.getImportance());
         } catch (Throwable t) {
             return "threw " + t;
         }

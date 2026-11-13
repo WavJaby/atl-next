@@ -4,7 +4,8 @@
 //! (LONG_DELAY 3.5 s / SHORT_DELAY 2 s, :461-462), and its window token is removed when the app calls finishToken, else after FINISH_TOKEN_TIMEOUT (11 s, :465).
 //! The app draws the toast: text toasts take the pre-R TN path (activity.rs DISABLED_COMPAT_CHANGES), so ITransientNotification.show(windowToken) makes the app's ToastPresenter add a
 //! TYPE_TOAST window with that token; the token is bound to the caller's newest Task here (WindowManagerInternal.addWindowToken), which is where window.rs places the window.
-//! Not modelled: rate limiting, per-user visibility, suspended/blocked packages, accessibility timeouts, enqueueTextToast (no system UI: answered false), channels and posting (counted UNKNOWN).
+//! Channels: apps create and read back their own (notification_channels.rs), as a device answers (behaviour decision 1); nothing is displayed for them.
+//! Not modelled: rate limiting, per-user visibility, suspended/blocked packages, accessibility timeouts, enqueueTextToast (no system UI: answered false), channel groups and posting (counted UNKNOWN).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -14,8 +15,11 @@ use atl_aidl::aidl::android::app::INotificationManager::{
     BnNotificationManager, EnforcePermission, INotificationManager,
 };
 use atl_aidl::mangled::_7_android_3_app_22_ITransientNotification as ITransientNotification;
+use atl_parcelables::android::app::NotificationChannel;
+use atl_parcelables::android::content::pm::ParceledListSlice;
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, Strong, ThreadState};
 
+use crate::notification_channels::{ChannelError, Channels};
 use crate::packages::Packages;
 use crate::packages::Permissions;
 use crate::tasks::Tasks;
@@ -24,6 +28,8 @@ use atl_services_types::permission;
 
 /// The interface name counters use.
 const INTERFACE: &str = "INotificationManager";
+/// Manifest.permission.INTERACT_ACROSS_USERS: canNotifyAsPackage's check for another user's channels.
+const INTERACT_ACROSS_USERS: &str = "android.permission.INTERACT_ACROSS_USERS";
 /// NotificationManagerService.MAX_PACKAGE_TOASTS (:444).
 const MAX_PACKAGE_TOASTS: usize = 5;
 /// Toast.LENGTH_LONG; LONG_DELAY / SHORT_DELAY / FINISH_TOKEN_TIMEOUT (:461-465).
@@ -47,6 +53,7 @@ struct State {
     queue: Vec<Toast>,
     /// hidden toasts whose window token waits for finishToken (or the timeout): (pkg, token, window token)
     finishing: Vec<(String, SpIBinder, SpIBinder)>,
+    channels: Channels,
 }
 
 struct Inner {
@@ -60,6 +67,56 @@ struct Inner {
 impl Inner {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// checkCallerIsSystemOrSameApp: `pkg` must be installed under the caller's app id (root / system pass); else SecurityException. Returns the calling uid.
+    fn check_same_app(&self, method: &str, pkg: &str) -> binder::Result<u32> {
+        let uid = ThreadState::get_calling_uid();
+        if permission::is_system_or_root(uid)
+            || self
+                .packages
+                .by_app_id(permission::app_id(uid))
+                .any(|p| p.name() == pkg)
+        {
+            return Ok(uid);
+        }
+        Err(Status::new_exception_str(
+            ExceptionCode::SECURITY,
+            Some(format!("{method}: package {pkg} is not uid {uid}'s")),
+        ))
+    }
+
+    /// canNotifyAsPackage (NotificationManagerService): the calling package is the caller's, another user needs INTERACT_ACROSS_USERS, and the target is the calling package itself (no delegates
+    /// exist); else SecurityException as AOSP's channel getters throw. Returns the (uid, package) whose channels are read.
+    fn can_notify_as<'a>(
+        &self,
+        calling_pkg: Option<&str>,
+        user_id: i32,
+        target_pkg: Option<&'a str>,
+    ) -> binder::Result<(u32, &'a str)> {
+        let calling_pkg =
+            calling_pkg.ok_or_else(|| Status::new_exception(ExceptionCode::NULL_POINTER, None))?;
+        let uid = self.check_same_app("canNotifyAsPackage", calling_pkg)?;
+        if i64::from(permission::user_id(uid)) != i64::from(user_id)
+            && !self.permissions.holds(uid, &[INTERACT_ACROSS_USERS], false)
+        {
+            return Err(Status::new_exception_str(
+                ExceptionCode::SECURITY,
+                Some(format!(
+                    "canNotifyAsPackage for user {user_id}: caller lacks {INTERACT_ACROSS_USERS}"
+                )),
+            ));
+        }
+        match target_pkg {
+            Some(t) if t == calling_pkg => Ok((uid, t)),
+            t => Err(Status::new_exception_str(
+                ExceptionCode::SECURITY,
+                Some(format!(
+                    "Pkg {calling_pkg} cannot read channels for {} in {user_id}",
+                    t.unwrap_or("null")
+                )),
+            )),
+        }
     }
 
     /// showNextToastLocked: the head is shown and its hide scheduled; a TN that refuses (its process died) is dropped and the next one tried.
@@ -201,19 +258,7 @@ impl INotificationManager for NotificationManager {
             return Ok(false);
         };
         let inner = &self.0;
-        let uid = ThreadState::get_calling_uid();
-        // checkCallerIsSameApp (enqueueToast -> checkCallerIsSystemOrSameApp unless system): the package must be installed under the caller's app id; AOSP throws SecurityException
-        if !permission::is_system_or_root(uid)
-            && !inner
-                .packages
-                .by_app_id(permission::app_id(uid))
-                .any(|p| p.name() == pkg)
-        {
-            return Err(Status::new_exception_str(
-                ExceptionCode::SECURITY,
-                Some(format!("enqueueToast: package {pkg} is not uid {uid}'s")),
-            ));
-        }
+        let uid = inner.check_same_app("enqueueToast", pkg)?;
         let head = {
             let mut st = inner.lock();
             if let Some(t) = st
@@ -303,6 +348,52 @@ impl INotificationManager for NotificationManager {
     /// areNotificationsEnabled: AOSP's default for an app nobody blocked (NotificationManagerService areNotificationsEnabledForPackage -> PreferencesHelper, importance unspecified -> true).
     fn r#areNotificationsEnabled(&self, _pkg: Option<&str>) -> binder::Result<bool> {
         Ok(true)
+    }
+
+    /// createNotificationChannels (:4850 -> createNotificationChannelsImpl): each channel in turn into the caller's store; the first refused one throws, the ones before it stay (as AOSP's loop).
+    fn r#createNotificationChannels(
+        &self,
+        pkg: Option<&str>,
+        list: Option<&ParceledListSlice>,
+    ) -> binder::Result<()> {
+        let pkg = pkg.ok_or_else(|| Status::new_exception(ExceptionCode::NULL_POINTER, None))?;
+        let uid = self.0.check_same_app("createNotificationChannels", pkg)?;
+        let list = list.ok_or_else(|| Status::new_exception(ExceptionCode::NULL_POINTER, None))?;
+        let mut st = self.0.lock();
+        for channel in list.of::<NotificationChannel>() {
+            st.channels
+                .create(uid, pkg, channel.clone())
+                .map_err(ChannelError::status)?;
+        }
+        counters::answered(INTERFACE, "createNotificationChannels");
+        Ok(())
+    }
+
+    /// getNotificationChannel (:4889 -> getConversationNotificationChannel, no conversation): the target's channel `channel_id`, or null.
+    fn r#getNotificationChannel(
+        &self,
+        calling_pkg: Option<&str>,
+        user_id: i32,
+        target_pkg: Option<&str>,
+        channel_id: Option<&str>,
+    ) -> binder::Result<Option<NotificationChannel>> {
+        let (uid, pkg) = self.0.can_notify_as(calling_pkg, user_id, target_pkg)?;
+        counters::answered(INTERFACE, "getNotificationChannel");
+        Ok(self.0.lock().channels.get(uid, pkg, channel_id))
+    }
+
+    /// getNotificationChannels (:5124): the target's channels, deleted ones left out.
+    fn r#getNotificationChannels(
+        &self,
+        calling_pkg: Option<&str>,
+        target_pkg: Option<&str>,
+        user_id: i32,
+    ) -> binder::Result<Option<ParceledListSlice>> {
+        let (uid, pkg) = self.0.can_notify_as(calling_pkg, user_id, target_pkg)?;
+        counters::answered(INTERFACE, "getNotificationChannels");
+        Ok(Some(ParceledListSlice::new(
+            self.0.lock().channels.list(uid, pkg),
+        )))
     }
 }
 

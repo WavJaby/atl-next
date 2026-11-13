@@ -23,6 +23,7 @@ mod compositor;
 use atl_parcelables::android::app::ActivityManager_TaskDescription;
 use atl_parcelables::android::app::ApplicationErrorReport_ParcelableCrashInfo;
 use atl_parcelables::android::app::ContentProviderHolder;
+use atl_parcelables::android::app::NotificationChannel;
 use atl_parcelables::android::app::PendingIntent;
 use atl_parcelables::android::app::servertransaction::ClientTransaction;
 use atl_parcelables::android::content::pm::{
@@ -294,6 +295,7 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
             round_trip_part::<ParsedIntentInfo>(input, mode)
         }
         "android.content.pm.ParceledListSlice" => round_trip_as::<ParceledListSlice>(input, mode),
+        "android.app.NotificationChannel" => round_trip_as::<NotificationChannel>(input, mode),
         "android.content.pm.InstrumentationInfo" => {
             round_trip_as::<InstrumentationInfo>(input, mode)
         }

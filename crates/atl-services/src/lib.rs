@@ -57,6 +57,8 @@ pub mod installed;
 #[cfg(feature = "converter")]
 pub mod notification;
 #[cfg(feature = "converter")]
+pub mod notification_channels;
+#[cfg(feature = "converter")]
 pub mod package;
 #[cfg(feature = "converter")]
 pub mod packages;

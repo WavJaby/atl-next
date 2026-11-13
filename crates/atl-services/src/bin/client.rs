@@ -20,7 +20,7 @@ use atl_aidl::aidl::android::app::IActivityManager::IActivityManager;
 use atl_aidl::aidl::android::app::IApplicationThread::{BnApplicationThread, IApplicationThread};
 use atl_aidl::aidl::android::content::pm::IPackageManager::{IPackageManager, transactions};
 use atl_parcelables::android::app::servertransaction::ClientTransaction;
-use atl_parcelables::android::content::pm::ApplicationInfo;
+use atl_parcelables::android::content::pm::{ApplicationInfo, InstrumentationInfo};
 use atl_parcelables::android::content::{ComponentName, Intent};
 use atl_parcelables::android::os::Bundle;
 use atl_parcelables::codecs::android::app::servertransaction::ClientTransaction::ClientTransactionItem;
@@ -300,18 +300,15 @@ fn app(package: &str, uid: i32, activity: &str, start_seq: i64) -> Result<usize>
     let q = pm.queryInstrumentationAsUser(Some(package), 0, 0);
     r.check(
         "queryInstrumentationAsUser",
-        matches!(&q, Ok(Some(l)) if l.instrumentation.len() == 1
-            && l.instrumentation[0].item.name.as_deref() == Some(INSTRUMENTATION)),
-        format!("{:?}", q.map(|l| l.map(|l| l.instrumentation.len()))),
+        matches!(&q, Ok(Some(l)) if l.len() == 1
+            && l.of::<InstrumentationInfo>().next().and_then(|i| i.item.name.as_deref()) == Some(INSTRUMENTATION)),
+        format!("{:?}", q.map(|l| l.map(|l| l.len()))),
     );
     let q = pm.queryInstrumentationAsUser(Some(ABSENT), 0, 0);
     r.check(
         "queryInstrumentationAsUser:empty",
-        matches!(&q, Ok(Some(l)) if l.instrumentation.is_empty()),
-        format!(
-            "{ABSENT}: {:?}",
-            q.map(|l| l.map(|l| l.instrumentation.len()))
-        ),
+        matches!(&q, Ok(Some(l)) if l.is_empty()),
+        format!("{ABSENT}: {:?}", q.map(|l| l.map(|l| l.len()))),
     );
     // PackageManager.SIGNATURE_MATCH 0, SIGNATURE_UNKNOWN_PACKAGE -4
     let same = pm.checkSignatures(Some(package), Some(package), 0);

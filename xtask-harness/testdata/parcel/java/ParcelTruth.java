@@ -8,6 +8,9 @@
 import android.app.ActivityManager;
 import android.app.ApplicationErrorReport;
 import android.app.ContentProviderHolder;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.ResultInfo;
 import android.content.IIntentSender;
@@ -92,6 +95,7 @@ import android.media.VolumeShaperConfiguration;
 import android.media.VolumeShaperOperation;
 import java.io.File;
 import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Arrays;
@@ -221,6 +225,10 @@ public class ParcelTruth {
         check("InstrumentationInfo", instrumentationInfo(ai), InstrumentationInfo.CREATOR);
         // IPackageManager.queryInstrumentationAsUser's reply: the inline list, its element class written once
         check("ParceledListSlice", new ParceledListSlice<>(Arrays.asList(instrumentationInfo(ai), instrumentationInfo(ai))), ParceledListSlice.CREATOR);
+        check("NotificationChannel", notificationChannel("atl"), NotificationChannel.CREATOR);
+        check("NotificationChannel:pattern", patternChannel(), NotificationChannel.CREATOR);
+        // INotificationManager.createNotificationChannels' argument / getNotificationChannels' reply: the element class picks the codec
+        check("ParceledListSlice:channels", new ParceledListSlice<>(Arrays.asList(notificationChannel("a"), patternChannel())), ParceledListSlice.CREATOR);
         ClientTransaction transaction = new ClientTransaction();
         transaction.addTransactionItem(new LaunchActivityItem(null, intent, 3, activity, config, new Configuration(), 0,
                 "com.example.referrer", null, 2, null, null, null, null, null, true, null, null, null, null, false, null, null,
@@ -1067,6 +1075,45 @@ public class ParcelTruth {
         p.providers = new ProviderInfo[] {files};
         p.permissions = new PermissionInfo[] {permissionInfo()};
         return p;
+    }
+
+    /// A NotificationChannel with every parcelled field off its default except the VibrationEffect (no codec; enableVibration leaves it null): sound + tagged attributes, a conversation, the hidden flags.
+    static NotificationChannel notificationChannel(String id) {
+        NotificationChannel c = new NotificationChannel(id, "Channel " + id, NotificationManager.IMPORTANCE_HIGH);
+        c.setDescription("about " + id);
+        c.setBypassDnd(true);
+        c.setLockscreenVisibility(Notification.VISIBILITY_PRIVATE);
+        c.setSound(Uri.parse("content://settings/system/notification_sound"), taggedAttributes());
+        c.enableLights(true);
+        c.setLightColor(0xff00ff00);
+        c.enableVibration(true);
+        c.setShowBadge(false);
+        c.setGroup("group");
+        c.setBlockable(true);
+        c.setAllowBubbles(true);
+        c.setConversationId("parent", "conversation");
+        c.setDemoted(true);
+        c.setImportantConversation(true);
+        c.setDeleted(true);
+        c.setDeletedTimeMs(1234567890123L);
+        c.setImportanceLockedByCriticalDeviceFunction(true);
+        c.setUserVisibleTaskShown(true);
+        c.setOriginalImportance(NotificationManager.IMPORTANCE_LOW);
+        c.lockFields(NotificationChannel.USER_LOCKED_SOUND);
+        return c;
+    }
+
+    /// A channel whose vibration pattern is set but whose VibrationEffect is null: setVibrationPattern would also build the effect (the effect API flag), so the field is set directly.
+    static NotificationChannel patternChannel() {
+        NotificationChannel c = new NotificationChannel("pattern", "Pattern", NotificationManager.IMPORTANCE_DEFAULT);
+        try {
+            Field f = NotificationChannel.class.getDeclaredField("mVibrationPattern");
+            f.setAccessible(true);
+            f.set(c, new long[] {0, 100, 50, 200});
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException(e);
+        }
+        return c;
     }
 
     /// The test package's InstrumentationInfo (AMS's instrumentation record), each field distinct from its default.

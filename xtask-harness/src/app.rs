@@ -99,12 +99,19 @@ const MEDIAPLAYER_START: &str = "MediaPlayerNative: start called in state 1";
 /// Main.onCreate's lines for services an app reaches through a manager that is null without them: (servicemanager name, line prefix, expected value; None = derived from the host, [`service_want`]). A missing service logs `absent`.
 /// connectivity: [`connectivity_want`].
 /// permissionmgr: PackageManager.checkPermission for the fixture itself: ACCESS_NETWORK_STATE is requested + NORMAL -> granted (0, permission.rs rule A); CAMERA is not requested -> denied (-1).
-const SERVICE_LINES: [(&str, &str, Option<&str>); 2] = [
+/// notification: Main.channels creates channel `atl.test` at IMPORTANCE_LOW (2) and reads it back: PreferencesHelper.createNotificationChannel gives a new app channel the package's visibility
+/// (VISIBILITY_NO_OVERRIDE, -1000); the channel list holds it alone; an unknown id reads null; re-creating it at IMPORTANCE_HIGH keeps 2 (an app may only lower an existing channel's importance).
+const SERVICE_LINES: [(&str, &str, Option<&str>); 3] = [
     ("connectivity", "AtlTest: connectivity: ", None),
     (
         "permissionmgr",
         "AtlTest: permission: ",
         Some("network_state=0 camera=-1"),
+    ),
+    (
+        "notification",
+        "AtlTest: notification: ",
+        Some("importance=2 name=ATL test visibility=-1000 count=1 absent=null raised=2"),
     ),
 ];
 /// Main.priority's line: `start=<n> background=<r>/<nice> restore=<r>/<nice> foreground=<r>/<nice>`, r = `ok` or the throwable's simple name ([`priority_why`]).
