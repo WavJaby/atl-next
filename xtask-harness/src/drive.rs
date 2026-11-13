@@ -2,7 +2,8 @@
 //! `xtask run-apk --drive <script>`: an agent's hands and eyes on a real APK, headless. A script runs against the app's window once run-apk's own wait is over (resumed, settled, a frame presented, the watch done).
 //! Input goes through the window proxy (wayland_proxy.rs), shots through the compositor (screencopy.rs). The compositor holds the window at output (0, 0) ([`NestedCompositor::start_placed`]), so content pixels map to the output by the window geometry the client declared.
 //! Script, one step a line; blank lines and `#` comments are skipped. Coordinates are window content pixels (the output has scale 1).
-//!   wait <ms> | wait-frames <n> | tap <x> <y> | swipe <x1> <y1> <x2> <y2> <ms> | key <name> | key-down <name> | key-up <name> | resize <w> <h> | shot <file.png>
+//!   wait <ms> | wait-frames <n> | tap <x> <y> | touch <x> <y> <ms> | swipe <x1> <y1> <x2> <y2> <ms> | key <name> | key-down <name> | key-up <name> | resize <w> <h> | shot <file.png>
+//! `tap` and `swipe` are the mouse (SOURCE_MOUSE events); `touch` is one finger on the touchscreen (wl_touch -> SOURCE_TOUCHSCREEN), down for `ms` then up, what a phone game's touch input reads (Unity's Input.touches ignores the mouse).
 //! `wait-frames` counts the app's presents from that step on and fails if they do not come: an idle app presents nothing, so use it only after something that redraws. A present is logged before the compositor shows it: a shot straight after may be one frame old.
 //! `shot` paths are relative to the current directory; the image is the window's content (a dialog reaching past it is cut), and a one-colour image is an error, never a pass.
 
@@ -13,7 +14,7 @@ use anyhow::{Context, Result, bail, ensure};
 
 use crate::nested_wayland::NestedCompositor;
 use crate::screencopy;
-use crate::wayland_proxy::{Event, PointerAction, Proxy};
+use crate::wayland_proxy::{Event, PointerAction, Proxy, TouchAction};
 use crate::window;
 
 const BTN_LEFT: u32 = 0x110;
@@ -50,6 +51,8 @@ pub enum Step {
     Wait(u64),
     WaitFrames(usize),
     Tap(f64, f64),
+    /// One finger at (x, y), held for the ms.
+    Touch(f64, f64, u64),
     Swipe {
         from: (f64, f64),
         to: (f64, f64),
@@ -103,6 +106,7 @@ fn parse_step(line: &str) -> Result<Step> {
         ["wait", ms] => Step::Wait(num(ms)?),
         ["wait-frames", n] => Step::WaitFrames(num(n)?),
         ["tap", x, y] => Step::Tap(num(x)?, num(y)?),
+        ["touch", x, y, ms] => Step::Touch(num(x)?, num(y)?, num(ms)?),
         ["swipe", x1, y1, x2, y2, ms] => Step::Swipe {
             from: (num(x1)?, num(y1)?),
             to: (num(x2)?, num(y2)?),
@@ -264,6 +268,14 @@ impl Driver<'_> {
                 self.press(true)?;
                 self.press(false)?;
             }
+            Step::Touch(x, y, ms) => {
+                let (x, y) = self.surface_point((*x, *y))?;
+                self.t
+                    .proxy
+                    .inject_touch(TouchAction::Down { id: 0, x, y })?;
+                std::thread::sleep(Duration::from_millis(*ms));
+                self.t.proxy.inject_touch(TouchAction::Up { id: 0 })?;
+            }
             Step::Swipe { from, to, ms } => self.swipe(*from, *to, *ms)?,
             Step::Key(code) => {
                 self.t.proxy.inject_key(*code, true)?;
@@ -337,7 +349,7 @@ mod tests {
 
     #[test]
     fn every_step_parses() {
-        let script = "# comment\n\nwait 10\nwait-frames 2\ntap 1 2.5\nswipe 1 2 3 4 100\nkey a\nkey 0\nkey enter\nresize 640 400\nshot out/a.png\n";
+        let script = "# comment\n\nwait 10\nwait-frames 2\ntap 1 2.5\ntouch 3 4 80\nswipe 1 2 3 4 100\nkey a\nkey 0\nkey enter\nresize 640 400\nshot out/a.png\n";
         // KEY_A = 30, KEY_0 = 11, KEY_ENTER = 28 (linux/input-event-codes.h)
         assert_eq!(
             parse(script).unwrap(),
@@ -345,6 +357,7 @@ mod tests {
                 Step::Wait(10),
                 Step::WaitFrames(2),
                 Step::Tap(1.0, 2.5),
+                Step::Touch(3.0, 4.0, 80),
                 Step::Swipe {
                     from: (1.0, 2.0),
                     to: (3.0, 4.0),
@@ -371,7 +384,14 @@ mod tests {
 
     #[test]
     fn bad_lines_are_named() {
-        for bad in ["tap 1", "wait x", "fly 1", "key nosuch", "resize 0 1"] {
+        for bad in [
+            "tap 1",
+            "touch 1 2",
+            "wait x",
+            "fly 1",
+            "key nosuch",
+            "resize 0 1",
+        ] {
             let err = format!("{:#}", parse(&format!("wait 1\n{bad}\n")).unwrap_err());
             assert!(err.contains("script line 2"), "{err}");
         }
