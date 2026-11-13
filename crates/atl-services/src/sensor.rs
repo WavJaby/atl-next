@@ -5,7 +5,7 @@
 //! - list order = handle order, handles from 1 (0 is SENSOR_TYPE_META_DATA's sensor field in a flush event)
 //! - enable: unknown handle -> BAD_VALUE; period clamped to [minDelay, maxDelay] (SensorService.cpp `enable` :2124-2131, `setEventRate` :2244-2247)
 //! - one source read per sensor, at the shortest period any connection asked for, every event to every connection with the sensor enabled (SensorService::threadLoop fans one HAL stream out)
-//! - events are `ASensorEvent` records sent whole on the connection's SOCK_SEQPACKET channel without blocking; a full channel drops the event (AOSP caches it in mEventCache: not done, counted)
+//! - events are `ASensorEvent` records sent whole on the connection's SOCK_SEQPACKET channel without blocking; a full channel caches them per connection (SensorEventConnection mEventCache: later events queue behind the cache, the oldest dropped past its cap, counted) and the cache is written back once the channel is writable, several events per packet ([`Channel`])
 //! - timestamps on CLOCK_BOOTTIME, the base of SystemClock.elapsedRealtimeNanos (SensorEvent.timestamp docs)
 //!
 //! Data injection: only HAL_BYPASS_REPLAY_DATA_INJECTION (SensorService.h Mode 4), the one mode that needs no HAL: injected events go to every app with the sensor enabled (SensorDevice::injectSensorData queues them, poll() plays them back, SensorDevice.cpp :370, :799).
@@ -14,7 +14,7 @@
 //! - the "HAL" here lists no sensor without a device, so the mode lists one accelerometer of its own ([`INJECTED_NAME`]) for injected events to land on; it has no source thread
 //! - not AOSP: an event is accepted only from the process owning the focused window ([`FocusedProcess`]), checked per event; the name check alone lets any process that claims the allow-listed name (the op package is the caller's own string) steer every app's accelerometer
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -45,6 +45,20 @@ const SENSOR_VERSION: i32 = 1;
 const SOCKET_BUFFER_SIZE: usize = 4 * 1024;
 /// BitTube.cpp DEFAULT_SOCKET_BUFFER_SIZE: the unused return direction (acks of wake-up sensors only).
 const RETURN_BUFFER_SIZE: usize = 4 * 1024;
+/// SensorService.h MAX_SOCKET_BUFFER_SIZE_BATCHED: computeMaxCacheSizeLocked's cache size in non-batch mode is this over sizeof(sensors_event_t).
+const MAX_SOCKET_BUFFER_SIZE_BATCHED: usize = 100 * 1024;
+/// The per-connection cache's cap in events (984).
+const MAX_CACHE_EVENTS: usize = MAX_SOCKET_BUFFER_SIZE_BATCHED / EVENT_SIZE;
+/// SensorEventQueue.h MAX_RECEIVE_BUFFER_EVENT_COUNT: the client reads at most this many events per packet.
+const MAX_RECEIVE_BUFFER_EVENT_COUNT: usize = 256;
+/// writeToSocketFromCache: events per packet from the cache, min(receive buffer / 2, socket buffer / (2 events)) = 19.
+const CACHE_WRITE_EVENTS: usize = {
+    let a = MAX_RECEIVE_BUFFER_EVENT_COUNT / 2;
+    let b = SOCKET_BUFFER_SIZE / (EVENT_SIZE * 2);
+    if a < b { a } else { b }
+};
+/// How long the cache writer waits for the channel to turn writable before checking whether the channel still exists.
+const CACHE_POLL: Duration = Duration::from_millis(100);
 
 /// The accelerometer the injection mode lists.
 pub const INJECTED_NAME: &str = "ATL injected accelerometer";
@@ -174,6 +188,8 @@ pub struct Channel {
     send: OwnedFd,
     receive: Mutex<Option<OwnedFd>>,
     dead: AtomicBool,
+    /// Events the channel had no room for, oldest first (mEventCache); while non-empty a writer thread waits for the channel to turn writable.
+    cache: Mutex<VecDeque<[u8; EVENT_SIZE]>>,
 }
 
 impl Channel {
@@ -192,6 +208,7 @@ impl Channel {
             send,
             receive: Mutex::new(Some(receive)),
             dead: AtomicBool::new(false),
+            cache: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -230,17 +247,99 @@ impl Channel {
         }
     }
 
-    /// BitTube::sendObjects: one packet, never blocking. false once the client end is gone.
-    fn send(&self, event: &[u8]) -> bool {
-        match rustix::net::send(&self.send, event, SendFlags::DONTWAIT | SendFlags::NOSIGNAL) {
-            Ok(_) => true,
-            Err(rustix::io::Errno::AGAIN) => {
-                counters::answered(INTERFACE, "event dropped: channel full");
+    /// SensorEventConnection::sendEvents for one event: behind a non-empty cache it is appended; else one packet (BitTube::sendObjects), never blocking, and a full channel caches it and starts the cache writer. false once the client end is gone.
+    fn send(self: &Arc<Self>, event: &[u8; EVENT_SIZE]) -> bool {
+        let mut cache = self.lock_cache();
+        if !cache.is_empty() {
+            Self::append(&mut cache, event);
+            return true;
+        }
+        match self.write(event) {
+            Ok(true) => true,
+            Ok(false) => {
+                Self::append(&mut cache, event);
+                let weak = Arc::downgrade(self);
+                std::thread::spawn(move || Self::write_cache_when_writable(&weak));
                 true
             }
+            Err(()) => false,
+        }
+    }
+
+    fn lock_cache(&self) -> std::sync::MutexGuard<'_, VecDeque<[u8; EVENT_SIZE]>> {
+        // a poisoned lock still holds whole records
+        self.cache.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// One packet: Ok(true) sent, Ok(false) no room (EAGAIN), Err the client end is gone (marks the channel dead).
+    fn write(&self, packet: &[u8]) -> Result<bool, ()> {
+        match rustix::net::send(
+            &self.send,
+            packet,
+            SendFlags::DONTWAIT | SendFlags::NOSIGNAL,
+        ) {
+            Ok(_) => Ok(true),
+            Err(rustix::io::Errno::AGAIN) => Ok(false),
             Err(_) => {
                 self.dead.store(true, Ordering::Relaxed);
-                false
+                Err(())
+            }
+        }
+    }
+
+    /// appendEventsToCacheLocked for one event: at the cap the oldest cached event is dropped (counted) to make room.
+    fn append(cache: &mut VecDeque<[u8; EVENT_SIZE]>, event: &[u8; EVENT_SIZE]) {
+        if cache.len() >= MAX_CACHE_EVENTS {
+            cache.pop_front();
+            counters::answered(INTERFACE, "event dropped: cache full");
+        }
+        cache.push_back(*event);
+    }
+
+    /// writeToSocketFromCache: the cache in packets of [`CACHE_WRITE_EVENTS`] events until it is empty (true) or the channel is full again (false). A dead channel's cache is discarded (true).
+    fn write_cache(&self) -> bool {
+        let mut cache = self.lock_cache();
+        while !cache.is_empty() {
+            let n = cache.len().min(CACHE_WRITE_EVENTS);
+            let packet: Vec<u8> = cache.iter().take(n).flatten().copied().collect();
+            match self.write(&packet) {
+                Ok(true) => {
+                    cache.drain(..n);
+                }
+                Ok(false) => return false,
+                Err(()) => {
+                    cache.clear();
+                    return true;
+                }
+            }
+        }
+        true
+    }
+
+    /// The cache writer (AOSP: the service looper's ALOOPER_EVENT_OUTPUT callback, handleEvent -> sendEventsFromCache): waits for the channel to turn writable and writes the cache, until it is empty, the channel is dead or dropped.
+    fn write_cache_when_writable(weak: &Weak<Channel>) {
+        use rustix::event::{PollFd, PollFlags};
+        let timeout = rustix::event::Timespec::try_from(CACHE_POLL).ok();
+        loop {
+            let Some(ch) = weak.upgrade() else { return };
+            if ch.dead.load(Ordering::Relaxed) {
+                ch.lock_cache().clear();
+                return;
+            }
+            let mut fds = [PollFd::new(&ch.send, PollFlags::OUT)];
+            match rustix::event::poll(&mut fds, timeout.as_ref()) {
+                Ok(_) | Err(rustix::io::Errno::INTR) => {}
+                // no way to wait any more: a cache nobody writes would hold every later event
+                Err(_) => {
+                    ch.dead.store(true, Ordering::Relaxed);
+                    continue;
+                }
+            }
+            let revents = fds[0].revents();
+            if revents.intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL) {
+                ch.dead.store(true, Ordering::Relaxed);
+            } else if revents.contains(PollFlags::OUT) && ch.write_cache() {
+                return;
             }
         }
     }
@@ -868,6 +967,67 @@ mod tests {
             "stamps not strictly increasing: {stamps:?}"
         );
         hub.drop_connection(1);
+    }
+
+    /// Every event from the client end, the stamps only, until `want` arrived or nothing came for 1 s; packets may carry several (the cache writes up to [`CACHE_WRITE_EVENTS`]).
+    fn drain_stamps(fd: &OwnedFd, want: usize) -> Vec<i64> {
+        let mut buf = vec![0u8; MAX_RECEIVE_BUFFER_EVENT_COUNT * EVENT_SIZE];
+        let mut stamps = Vec::new();
+        let mut idle = Instant::now();
+        while stamps.len() < want && idle.elapsed() < Duration::from_secs(1) {
+            match rustix::net::recv(fd, &mut buf, rustix::net::RecvFlags::DONTWAIT) {
+                Ok((n, _)) => {
+                    assert_eq!(n % EVENT_SIZE, 0, "whole records only");
+                    stamps.extend(
+                        buf[..n]
+                            .chunks(EVENT_SIZE)
+                            .map(|e| i64::from_ne_bytes(e[16..24].try_into().unwrap())),
+                    );
+                    idle = Instant::now();
+                }
+                Err(rustix::io::Errno::AGAIN) => std::thread::sleep(Duration::from_millis(2)),
+                Err(e) => panic!("recv: {e}"),
+            }
+        }
+        stamps
+    }
+
+    /// A client that stops reading (the app's frame stalls): what the 4 KB channel cannot hold is cached and arrives, in order, once it reads again (mEventCache), instead of being dropped.
+    #[test]
+    fn full_channel_caches_and_delivers_in_order_once_read() {
+        let ch = Arc::new(Channel::open().unwrap());
+        let rx = ch.take_receive().unwrap();
+        // far more than a 4 KB SOCK_SEQPACKET buffer holds as one-event packets (a few), below the cache cap
+        let n = 60;
+        for ts in 0..n {
+            assert!(ch.send(&encode_event(1, TYPE_ACCELEROMETER, ts, &[0.0; 3])));
+        }
+        let got = drain_stamps(&rx, n as usize);
+        assert_eq!(got, (0..n).collect::<Vec<_>>());
+    }
+
+    /// Past the cap the oldest cached events go (appendEventsToCacheLocked): the reader gets what the socket held, then the newest MAX_CACHE_EVENTS, still in order.
+    #[test]
+    fn cache_past_its_cap_drops_the_oldest() {
+        let ch = Arc::new(Channel::open().unwrap());
+        let rx = ch.take_receive().unwrap();
+        let n = (MAX_CACHE_EVENTS + 100) as i64;
+        for ts in 0..n {
+            ch.send(&encode_event(1, TYPE_ACCELEROMETER, ts, &[0.0; 3]));
+        }
+        let got = drain_stamps(&rx, n as usize);
+        assert!(got.windows(2).all(|w| w[1] > w[0]), "in order");
+        let tail: Vec<i64> = (n - MAX_CACHE_EVENTS as i64..n).collect();
+        assert!(got.ends_with(&tail), "the newest cap-full arrive");
+        let in_socket = got.len() - MAX_CACHE_EVENTS;
+        assert!(
+            in_socket > 0 && in_socket < 100,
+            "the socket held a few: {in_socket}"
+        );
+        assert_eq!(
+            &got[..in_socket],
+            &(0..in_socket as i64).collect::<Vec<_>>()[..]
+        );
     }
 
     #[test]
