@@ -16,6 +16,31 @@ pub trait ProcessControl: Send + Sync {
     fn kill(&self, pid: i32) -> io::Result<()>;
 }
 
+/// The control socket's install half (installd's role): staging + the installer run, then the commit (the services' boot-time install, system_services.rs).
+impl ControlSocket {
+    /// Stages session `session` for `uid` and runs the installer: the frames file's host path.
+    pub fn install(&self, session: u32, uid: u32) -> io::Result<String> {
+        match self.call(&Request::Install { session, uid })? {
+            Response::Staged { frames } => Ok(frames),
+            Response::Error { message } => Err(io::Error::other(message)),
+            other => Err(io::Error::other(format!("install answered {other:?}"))),
+        }
+    }
+
+    /// Moves session `session` to `/data/app/<package>` and creates its data dirs: whether a library needs ES1.
+    pub fn commit(&self, session: u32, package: &str, uid: u32) -> io::Result<bool> {
+        match self.call(&Request::Commit {
+            session,
+            package: package.to_owned(),
+            uid,
+        })? {
+            Response::Committed { needs_es1 } => Ok(needs_es1),
+            Response::Error { message } => Err(io::Error::other(message)),
+            other => Err(io::Error::other(format!("commit answered {other:?}"))),
+        }
+    }
+}
+
 /// The control socket to atld. One request is in flight at a time: the protocol is request then reply on one connection.
 pub struct ControlSocket {
     fd: Mutex<OwnedFd>,
@@ -72,6 +97,8 @@ mod tests {
             target_sdk: 36,
             entry_point: "android.app.ActivityThread".into(),
             args: vec!["seq=3".into()],
+            instruction_set: "x86_64".into(),
+            rights: vec![],
         }
     }
 
@@ -94,6 +121,9 @@ mod tests {
                 Request::Kill { pid: 77 } => Response::Killed,
                 Request::Kill { pid } => Response::Error {
                     message: format!("not started: {pid}"),
+                },
+                other => Response::Error {
+                    message: format!("unexpected {other:?}"),
                 },
             })
             .expect("serve");

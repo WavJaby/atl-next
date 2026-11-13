@@ -211,6 +211,15 @@ fn stage_dir(dir: &Path, files: &[(Option<&str>, &Path)]) -> Result<()> {
 }
 
 /// The verified cached file of `pin`: present (a google-play row is fetched by `xtask test-apks fetch`, never here) and of the pinned sha256.
+/// Row `name`'s one file: the single-APK cases' rows are url rows.
+fn one_file(root: &Path, name: &str) -> Result<PathBuf> {
+    let (_, files) = test_apks::ensure(root, name)?;
+    match <[_; 1]>::try_from(files) {
+        Ok([(None, path)]) => Ok(path),
+        _ => bail!("{name}: not a one-file row"),
+    }
+}
+
 fn cached(root: &Path, pin: &test_apks::Pin) -> Result<PathBuf> {
     let path = atl_layout::Layout::of(root)?
         .workspace()
@@ -1101,7 +1110,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     gate.expect("alto", &alto_area, &dir, &alto_lib, &want, show)?;
 
     // 2. single
-    let (_, single_apk) = test_apks::ensure(root, SINGLE_ROW)?;
+    let single_apk = one_file(root, SINGLE_ROW)?;
     let single = badging(&tools.aapt2, &single_apk)?;
     if single.split.is_some() {
         bail!("{SINGLE_ROW}: aapt2 reads a split, not a base");
@@ -1127,7 +1136,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     )?;
 
     // 3. rich: a manifest with every component kind
-    let (_, rich_apk) = test_apks::ensure(root, RICH_ROW)?;
+    let rich_apk = one_file(root, RICH_ROW)?;
     let rich = badging(&tools.aapt2, &rich_apk)?;
     let dir = work.join("rich");
     stage_dir(&dir, &[(None, &rich_apk)])?;

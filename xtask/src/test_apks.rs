@@ -50,6 +50,8 @@ pub enum Source {
 /// One file of a row, pinned by size and sha256. `file` is the name it goes by: a url row's last URL segment, a Play row's apkeep file name.
 #[derive(Debug, Clone)]
 pub struct Pin {
+    /// The split name (`split=` of its manifest); None: the base, and a url row's one file.
+    pub split: Option<String>,
     pub file: String,
     pub sha256: String,
     pub size: u64,
@@ -193,7 +195,12 @@ fn url_source(kind: RawSource, raw: &RawRow) -> Result<Source> {
     let file = url.rsplit('/').next().unwrap_or(&url).to_owned();
     Ok(Source::Url {
         url,
-        pin: Pin { file, sha256, size },
+        pin: Pin {
+            split: None,
+            file,
+            sha256,
+            size,
+        },
     })
 }
 
@@ -236,6 +243,7 @@ fn google_play_source(raw: &RawRow) -> Result<Source> {
         );
         ensure!(f.size > 0, "{}: size must be positive", f.name);
         files.push(Pin {
+            split: (f.name != "base").then(|| f.name.clone()),
             file: apkeep_file_name(&raw.package, &f.name),
             sha256: f.sha256.clone(),
             size: f.size,
@@ -323,9 +331,12 @@ fn cached_path(dir: &Path, pin: &Pin) -> PathBuf {
     dir.join(format!("{}.apk", pin.sha256))
 }
 
-/// The row's verified file, which `run-apk` runs. A url row's file is downloaded if missing or damaged. A google-play row's files must already be cached and verified, and
-/// `run-apk` runs one APK, so a row of more files is refused once its files all verify.
-pub fn ensure(root: &Path, name: &str) -> Result<(Row, PathBuf)> {
+/// One verified file of a row: its split name (None: the base) and its cached path.
+pub type RowFile = (Option<String>, PathBuf);
+
+/// The row's verified files, base first then the splits in table order, each with its split name: what `run-apk` installs. A url row's file is downloaded if missing or damaged.
+/// A google-play row's files must already be cached and verified.
+pub fn ensure(root: &Path, name: &str) -> Result<(Row, Vec<RowFile>)> {
     let table = load(root)?;
     let row = table.get(name).with_context(|| {
         format!(
@@ -338,22 +349,16 @@ pub fn ensure(root: &Path, name: &str) -> Result<(Row, PathBuf)> {
         )
     })?;
     let dir = cache_dir(root)?;
-    let path = match &row.source {
-        Source::Url { url, pin } => cached_or_download(&dir, name, row, url, pin)?,
-        Source::GooglePlay { files, .. } => {
-            let mut paths = Vec::new();
-            for pin in files {
-                paths.push(verified_play_file(&dir, name, row, pin)?);
-            }
-            ensure!(
-                paths.len() == 1,
-                "{name}: run-apk runs one APK, and this row has {} files (base and splits), all verified",
-                paths.len()
-            );
-            paths.pop().context("a google-play row has no files")?
-        }
+    let mut files = match &row.source {
+        Source::Url { url, pin } => vec![(None, cached_or_download(&dir, name, row, url, pin)?)],
+        Source::GooglePlay { files, .. } => files
+            .iter()
+            .map(|pin| Ok((pin.split.clone(), verified_play_file(&dir, name, row, pin)?)))
+            .collect::<Result<Vec<_>>>()?,
     };
-    Ok((row.clone(), path))
+    // the base first, as an install session lists it (stable: the splits keep table order)
+    files.sort_by_key(|(split, _)| split.is_some());
+    Ok((row.clone(), files))
 }
 
 /// A google-play file's cached copy, verified. Missing or damaged: refused by name and kept, never deleted.
@@ -1006,6 +1011,7 @@ mod tests {
     fn verify_names_the_failing_file_and_field() {
         let row = row();
         let pin = Pin {
+            split: Some("config.en".to_owned()),
             file: "jp.co.ponos.battlecatstw.config.en.apk".to_owned(),
             sha256: ZEROS.to_owned(),
             size: 3,

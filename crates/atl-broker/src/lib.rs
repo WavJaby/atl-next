@@ -349,7 +349,8 @@ pub fn rights_of<S: AsRef<str>>(permissions: &[S]) -> Vec<Right> {
 }
 
 /// A right a manifest permission gives an app process beyond its mounts (see [`Spawn::rights`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Right {
     /// TCP bind and connect on any port: the Landlock network rights are left unhandled.
     Net,

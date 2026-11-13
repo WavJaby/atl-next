@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use atl_layout::Layout;
 use atl_services_types::display_model::DisplayModel;
 use atl_services_types::native_libs::SupportedAbi;
@@ -168,6 +168,9 @@ pub struct Runtime {
     binderd: PathBuf,
     sandbox_stub: PathBuf,
     atld: PathBuf,
+    /// atl-installer and the api-impl dex: atld's `--installer`, `--installer-class-path`
+    installer: PathBuf,
+    api_impl: PathBuf,
     framework_res: PathBuf,
     /// The pinned test fonts atld reads as the desktop's (test_fonts.rs): its FONTCONFIG_FILE and `--font-data`.
     fonts: crate::test_fonts::TestFonts,
@@ -265,6 +268,7 @@ pub struct Package {
 }
 
 /// One APK of a package: the base (`split` None), or a split APK with its split name.
+#[derive(Serialize)]
 pub struct PackageFile {
     pub split: Option<String>,
     pub path: PathBuf,
@@ -299,9 +303,8 @@ pub struct Run {
 /// atld's `--package` file.
 #[derive(Serialize)]
 struct PackageSource<'a> {
-    apk: &'a Path,
+    files: &'a [PackageFile],
     manifest: &'a Manifest,
-    abis: &'a [SupportedAbi],
 }
 
 impl Run {
@@ -524,6 +527,13 @@ impl Runtime {
         let binderd = cargo_bin(root, &out, "atl-binderd")?;
         let sandbox_stub = cargo_bin(root, &out, "atl-sandbox-stub")?;
         let atld = cargo_bin(root, &out, "atld")?;
+        let installer = packages::bin(root, &out, "atl-app-launcher", "atl-installer")?;
+        let api_impl = host_art::api_impl_dex(&java_out);
+        ensure!(
+            api_impl.is_file(),
+            "no api-impl dex {}: `cargo xtask native` builds it with the Java goals",
+            api_impl.display()
+        );
         let apk = ApkTools::new(root, host, &out, &java_out)?;
         let framework_res = java_out.join(FRAMEWORK_RES);
         ensure!(
@@ -570,6 +580,8 @@ impl Runtime {
             binderd,
             sandbox_stub,
             atld,
+            installer,
+            api_impl,
             framework_res,
             fonts,
             keychars,
@@ -991,6 +1003,7 @@ impl ApkTools {
                 "jar --update lib",
             )?;
         }
+        zipalign(&apk)?;
         Ok(apk)
     }
 
@@ -1053,6 +1066,44 @@ impl ApkTools {
         )?;
         Ok(())
     }
+}
+
+/// Stored entries' data aligned as `zipalign -p 4` leaves them: 4 bytes, a native library to the page (4096). `jar --update` drops aapt2's alignment, and the installer's parse refuses a
+/// targetSdk >= 30 APK whose resources.arsc is not stored 4-aligned (ParsingPackageUtils, error -124). Entries keep their compression method.
+fn zipalign(apk: &Path) -> Result<()> {
+    use std::io::{Read, Write};
+    use zip::CompressionMethod;
+    use zip::write::SimpleFileOptions;
+    /// zipalign's default alignment, and `-p`'s for `.so` entries
+    const ALIGN: u16 = 4;
+    const PAGE: u16 = 4096;
+    let mut input = zip::ZipArchive::new(std::fs::File::open(apk)?)
+        .with_context(|| format!("reading {}", apk.display()))?;
+    let tmp = apk.with_extension("aligned");
+    let mut out = zip::ZipWriter::new(std::fs::File::create(&tmp)?);
+    for i in 0..input.len() {
+        let mut entry = input.by_index(i)?;
+        let name = entry.name()?.into_owned();
+        let stored = entry.compression() == CompressionMethod::Stored;
+        let options = if stored {
+            SimpleFileOptions::default()
+                .compression_method(CompressionMethod::Stored)
+                .with_alignment(if name.ends_with(".so") { PAGE } else { ALIGN })
+        } else {
+            SimpleFileOptions::default().compression_method(CompressionMethod::Deflated)
+        };
+        if entry.is_dir() {
+            out.add_directory(name, options)?;
+        } else {
+            let mut data = Vec::with_capacity(usize::try_from(entry.size())?);
+            entry.read_to_end(&mut data)?;
+            out.start_file(name, options)?;
+            out.write_all(&data)?;
+        }
+    }
+    out.finish()?;
+    std::fs::rename(&tmp, apk)?;
+    Ok(())
 }
 
 impl Runtime {
@@ -1252,6 +1303,10 @@ impl Runtime {
             .arg(&self.screencap)
             .arg("--launcher")
             .arg(&self.art.launcher)
+            .arg("--installer")
+            .arg(&self.installer)
+            .arg("--installer-class-path")
+            .arg(&self.api_impl)
             .arg("--lib-path")
             .arg(&lib_path)
             .arg("--art-root")
@@ -1339,18 +1394,16 @@ impl Runtime {
         for jar in &self.art.boot {
             cmd.arg("--boot-jar").arg(jar);
         }
+        for a in &self.abis {
+            cmd.arg("--abi").arg(format!("{}={}", a.abi, a.isa));
+        }
         for (i, package) in run.packages.iter().enumerate() {
-            // atld reads one base APK per package until its install takes the file list
-            let [base @ PackageFile { split: None, .. }] = package.files.as_slice() else {
-                bail!("package {i}: {} files, not one base", package.files.len());
-            };
             let file = run.scratch.join(format!("package-{i}.json"));
             std::fs::write(
                 &file,
                 serde_json::to_vec_pretty(&PackageSource {
-                    apk: &base.path,
+                    files: &package.files,
                     manifest: &package.manifest,
-                    abis: &self.abis,
                 })?,
             )?;
             written.push(file.clone());

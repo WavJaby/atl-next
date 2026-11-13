@@ -845,6 +845,7 @@ mod tests {
             source_dir: String::new(),
             primary_cpu_abi: None,
             native_library_dir: String::new(),
+            instruction_set: String::new(),
             data_dir: String::new(),
             device_protected_data_dir: String::new(),
             granted_permissions: vec![],

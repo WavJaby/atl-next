@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! atld, M2 wiring: starts the system the Android way, each process through the broker, then serves the services' process control until the run ends (step 7).
 //! 1. the runtime root `--root` (made fresh): `properties` (the default property area, atl-property-service; `properties.d/` one area per app process: the defaults plus the properties only that process has, [`Host::process_properties`]), `system/` (build.prop, `framework/` = the boot jars and shared libraries),
-//!    `data/` (`app/<package>/base.apk`, `user/0/<package>/`, `dalvik-cache/`), `packages.json` (the installed packages), `log/<process>.log` (each process's stdout + stderr; a System.out line is a liblog record there).
-//! 2. the install: each `--package` (an APK and the manifest xtask read from it) gets the next app uid, its data directories and `/data/app/<package>/base.apk`; the records go to `packages.json`.
+//!    `data/` (`app/<package>/{base.apk,split_<name>.apk,lib/<isa>/}`, `user/0/<package>/`, `dalvik-cache/`), `install/` (each session's manifest and the installer's frames, read by the services), `log/<process>.log` (each process's stdout + stderr).
+//! 2. the install sessions: each `--package` (its APK files and the manifest xtask read) is a session the services install at their start (owner option I, 2026-11-13): they own the package list; atld does installd's
+//!    file work on their request (control `Install`: stage under AOSP names + run atl-installer in the broker's installer profile; `Commit`: rename to `/data/app/<package>`, create the data dirs).
 //! 3. atl-binderd, its admin connection on stdin; the broker holds the other end.
 //! 4. AOSP servicemanager as uid 1000 (AID_SYSTEM), the one process that may become context manager.
 //! 5. atl-system-services as uid 1000 with the packages and, as its stdin, the process-control connection (atl_broker::control): it starts app processes (ActivityManager's ProcessList) and kills them, here, through
@@ -13,7 +14,7 @@
 //! Exit status: the command's (bwrap passes it on); 0 after `stop`; failure when the services exited. Plan: binderd, servicemanager and the services move into this process later; here each is a process, as `xtask test binder` runs them.
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
@@ -26,18 +27,21 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use atl_android_paths::{
-    DATA, SDCARD, SHARED_STORAGE, SYSTEM, SYSTEM_FONTS, SYSTEM_FRAMEWORK, VENDOR,
+    DATA, DATA_APP, DATA_USER, DATA_USER_DE, PROPERTY_AREA, PROPERTY_AREA_ENV, SDCARD,
+    SHARED_STORAGE, SYSTEM, SYSTEM_FONTS, SYSTEM_FRAMEWORK, VENDOR,
 };
 use atl_broker::control::{self, Request, Response, StartRequest};
-use atl_broker::{Broker, Link, Mount, Process, Spawn, gpu, kill_sandbox, to_log};
+use atl_broker::{
+    Broker, INSTALLER_UID, Link, Mount, Process, Spawn, gpu, kill_sandbox, to_log, tree_mounts,
+};
 use atl_gralloc::node::{self, NodeSource};
 use atl_gralloc::vintf;
 use atl_property_service::{LinearTier, Property};
 use atl_services_types::compositor_registry;
 use atl_services_types::display_model::DisplayModel;
 use atl_services_types::gl_driver;
-use atl_services_types::native_libs::{self, SupportedAbi};
-use atl_services_types::packages::{Library, Manifest, PackageRecord, PermissionDecl};
+use atl_services_types::native_libs::LIB_DIR_NAME;
+use atl_services_types::packages::{Library, Manifest};
 use clap::Parser;
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 
@@ -98,14 +102,23 @@ struct Args {
     /// (SystemConfig's `<library name file dependency>`).
     #[arg(long = "shared-library", value_parser = Library::parse_arg)]
     shared_libraries: Vec<(String, Library)>,
-    /// A package to install (repeat): a JSON file `{"apk": <host path>, "manifest": {...}}` (atl_services_types::packages::Manifest, which xtask reads from the APK with aapt2).
+    /// A package to install (repeat; session i, in uid order): a JSON file `{"files": [{"split": null|<name>, "path": <host path>}], "manifest": {...}}`, base first (atl_services_types::packages::Manifest, xtask's aapt2 read).
     #[arg(long = "package", required = true)]
     packages: Vec<PathBuf>,
-    /// The platform's permission definitions (framework-res's `<permission>` elements): a JSON array of atl_services_types::packages::PermissionDecl, the install-time grant rule's platform half.
+    /// atl-installer executable: AOSP's package parse and native-code install in a VM of its own, run in the broker's installer profile on each session's staged dir.
+    #[arg(long)]
+    installer: PathBuf,
+    /// The api-impl dex (its ParsingPackageUtils.Callback forwarder): the installer VM's `-Djava.class.path`.
+    #[arg(long)]
+    installer_class_path: PathBuf,
+    /// A device ABI with its instruction set (repeat, preferred first): `<abi>=<isa>` (arches.toml row key); forwarded to the services, which map primaryCpuAbi to the instruction set.
+    #[arg(long = "abi", required = true)]
+    abis: Vec<String>,
+    /// The platform's permission definitions (framework-res's `<permission>` elements): a JSON array of atl_services_types::packages::PermissionDecl, the install-time grant rule's platform half, forwarded to the services.
     /// Omitted: only the packages' own definitions count, so no platform permission is granted.
     #[arg(long)]
     platform_permissions: Option<PathBuf>,
-    /// The first app uid (AID_APP_START 10000 and above); the i-th package gets uid + i.
+    /// The first app uid, above the installer's (atl_broker::INSTALLER_UID); the i-th package gets uid + i (the services assign it).
     #[arg(long)]
     first_uid: u32,
     /// liblog's ANDROID_LOG_TAGS for every app process.
@@ -204,10 +217,9 @@ struct Args {
     break_mix: bool,
 }
 
-/// Android uids (system/core/libcutils/include/private/android_filesystem_config.h): AID_SYSTEM, AID_APP_START.
+/// Android uids (system/core/libcutils/include/private/android_filesystem_config.h): AID_SYSTEM, AID_SHELL.
 const AID_SYSTEM: u32 = 1000;
 const AID_SHELL: u32 = 2000;
-const AID_APP_START: u32 = 10_000;
 /// The run's control socket, below the root (serve_run_control).
 const CONTROL_SOCKET: &str = "control.sock";
 /// How often the run checks that the services still run while it waits for its end: a dead services process is noticed within this.
@@ -215,6 +227,9 @@ const SERVICES_POLL: Duration = Duration::from_millis(200);
 /// How long the services may take to register: servicemanager's start, then two addService round trips (well under a second measured by `xtask test binder`; libbinder waits 1 s
 /// per retry while the context manager is missing); 20 s for a loaded machine.
 const READY: Duration = Duration::from_secs(20);
+/// What each install session adds to the services' start (they install before registering): the installer measured 0.8-5.1 s cold (inst-m3/m5) plus staging copies of up to ~600 MB (an asset-pack split)
+/// at a slow disk's ~10 MB/s; a loaded machine's margin.
+const INSTALL_READY: Duration = Duration::from_secs(120);
 /// What atl-system-services prints once registered.
 const READY_LINE: &str = "services: ready";
 /// What atl-gralloc-allocator prints once registered: `gralloc: ready (<DRM node>)`.
@@ -256,13 +271,29 @@ fn host_display() -> DisplayModel {
     }
 }
 
-/// A package to install, as xtask writes it.
+/// A package to install, as xtask writes it: one install session.
 #[derive(Deserialize)]
 struct PackageSource {
-    apk: PathBuf,
+    /// base first
+    files: Vec<PackageFile>,
     manifest: Manifest,
-    /// The device's ABIs, preferred first, for the native-library extraction.
-    abis: Vec<SupportedAbi>,
+}
+
+/// One APK of a session: the base (`split` None) or a split with its name.
+#[derive(Deserialize, Clone)]
+struct PackageFile {
+    split: Option<String>,
+    path: PathBuf,
+}
+
+impl PackageFile {
+    /// Its name in the code dir, as PackageInstallerSession stages it (`base.apk`, `split_<name>.apk`).
+    fn staged_name(&self) -> String {
+        match &self.split {
+            None => "base.apk".to_owned(),
+            Some(n) => format!("split_{n}.apk"),
+        }
+    }
 }
 
 /// The runtime root's layout.
@@ -453,102 +484,169 @@ fn needs_es1(lib: &Path) -> Result<bool> {
     Ok(false)
 }
 
-/// The install step, until the package manager installs from a real APK (the installer process: AOSP ParsingPackageUtils on ART, plan 4b): for each package its uid, `/data/app/<package>/base.apk` (the APK copied), its
-/// native libraries (`lib/<isa>/`, [`native_libs::extract`]), credential- and device-protected data directories, and ART's dalvik-cache; the records the services read, and each package's instruction set
-/// ([`native_libs::instruction_set`] of its `primaryCpuAbi`), decided here once as PackageManager does.
-fn install(a: &Args, r: &Root) -> Result<(Vec<PackageRecord>, InstructionSets)> {
-    ensure!(
-        a.first_uid >= AID_APP_START,
-        "--first-uid {}: not an app uid",
-        a.first_uid
-    );
-    std::fs::create_dir_all(r.data().join("dalvik-cache"))?;
-    let owner = gl_driver::owner_table(gl_driver::OWNER_TABLE).map_err(anyhow::Error::msg)?;
-    let mut records = Vec::new();
-    let mut isas = InstructionSets::new();
-    for (i, file) in a.packages.iter().enumerate() {
-        let text =
-            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
-        let source: PackageSource =
-            serde_json::from_str(&text).with_context(|| format!("parsing {}", file.display()))?;
-        let name = &source.manifest.name;
-        ensure!(
-            !records.iter().any(|p: &PackageRecord| &p.name == name),
-            "two packages named {name}"
-        );
-        let (app, user, user_de) = (
-            format!("app/{name}"),
-            format!("user/0/{name}"),
-            format!("user_de/0/{name}"),
-        );
-        for d in [&app, &user, &user_de] {
-            std::fs::create_dir_all(r.data().join(d))?;
-        }
-        for d in ["data", "obb"] {
-            std::fs::create_dir_all(r.external(name).join(d))?;
-        }
-        std::fs::copy(&source.apk, r.data().join(&app).join("base.apk"))
-            .with_context(|| format!("copying {}", source.apk.display()))?;
-        let libs = native_libs::extract(
-            &source.apk,
-            &r.data().join(&app),
-            &format!("{DATA}/{app}"),
-            &source.abis,
-        )?;
-        let gl = if a.no_gl_selection {
-            gl_driver::GlDriver::Native
-        } else {
-            let needs = needs_es1(&r.data().join(&app).join(native_libs::LIB_DIR_NAME))?;
-            gl_driver::select(&owner, name, needs)
-        };
-        isas.insert(
-            name.clone(),
-            native_libs::instruction_set(libs.primary_cpu_abi.as_deref(), &source.abis).to_owned(),
-        );
-        records.push(PackageRecord {
-            gl_driver: gl,
-            uid: a.first_uid + u32::try_from(i)?,
-            source_dir: format!("{DATA}/{app}/base.apk"),
-            primary_cpu_abi: libs.primary_cpu_abi,
-            native_library_dir: libs.native_library_dir,
-            data_dir: format!("{DATA}/{user}"),
-            device_protected_data_dir: format!("{DATA}/{user_de}"),
-            manifest: source.manifest,
-            granted_permissions: vec![],
-        });
-    }
-    // install-time grants over every definition: the platform's first, then the packages' (permission::install_grants)
-    let platform: Vec<PermissionDecl> = match &a.platform_permissions {
-        Some(file) => serde_json::from_str(
-            &std::fs::read_to_string(file)
-                .with_context(|| format!("reading {}", file.display()))?,
-        )
-        .with_context(|| format!("parsing {}", file.display()))?,
-        None => Vec::new(),
-    };
-    let grants: Vec<Vec<String>> = records
-        .iter()
-        .map(|p| {
-            let defs = platform.iter().map(|d| ("android", d)).chain(
-                records
-                    .iter()
-                    .flat_map(|o| o.permissions.iter().map(move |d| (o.name.as_str(), d))),
-            );
-            atl_services_types::permission::install_grants(&p.name, &p.requested_permissions, defs)
-        })
-        .collect();
-    for (record, granted) in records.iter_mut().zip(grants) {
-        record.granted_permissions = granted;
-    }
-    std::fs::write(
-        r.root.join("packages.json"),
-        serde_json::to_vec_pretty(&records)?,
-    )?;
-    Ok((records, isas))
+/// installd's file work for the services' install (owner option I): the sessions' files, the installer's view, and what was staged and committed.
+struct Installd {
+    /// session i's files, base first (`--package` i)
+    sessions: Vec<Vec<PackageFile>>,
+    installer: PathBuf,
+    /// VM options + `-Djava.class.path` (the api-impl dex)
+    vm: Vec<OsString>,
+    env: Vec<(OsString, OsString)>,
+    /// read-only: the ART root, boot jars, api-impl dex at their own paths; framework-res at its Android path
+    mounts: Vec<Mount>,
+    /// staged sessions -> the uid they were staged for
+    staged: Mutex<BTreeMap<u32, u32>>,
+    /// committed packages -> uid: what a start request may name
+    committed: Mutex<BTreeMap<String, u32>>,
 }
 
-/// Package name -> its instruction set (arches.toml row key), what the broker passes the launcher as `--instruction-set`.
-type InstructionSets = std::collections::HashMap<String, String>;
+/// A staging dir's name below /data/app (PackageInstallerService.buildTmpSessionDir: `vmdl<sessionId>.tmp`).
+fn staging_name(session: u32) -> String {
+    format!("vmdl{session}.tmp")
+}
+
+impl Host {
+    /// Request `Install`: stages session `session` for `uid` (copies, AOSP names) and runs the installer over it in its profile; the frames file. A failed run removes the staging dir; its error carries the installer's stderr.
+    fn install(&self, session: u32, uid: u32) -> Result<String> {
+        ensure!(
+            uid > INSTALLER_UID,
+            "uid {uid}: at or below the installer's ({INSTALLER_UID}); package uids start above it"
+        );
+        let i = &self.installd;
+        let files = i
+            .sessions
+            .get(usize::try_from(session)?)
+            .with_context(|| format!("session {session}: no such session"))?;
+        ensure!(
+            !i.staged
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&session),
+            "session {session}: already staged"
+        );
+        let name = staging_name(session);
+        let host_dir = self.root.data().join("app").join(&name);
+        let at = Path::new(DATA_APP).join(&name);
+        std::fs::create_dir_all(&host_dir)?;
+        let staged = (|| -> Result<String> {
+            for f in files {
+                std::fs::copy(&f.path, host_dir.join(f.staged_name()))
+                    .with_context(|| format!("staging {}", f.path.display()))?;
+            }
+            let lib = LIB_DIR_NAME;
+            std::fs::create_dir_all(host_dir.join(lib))?;
+            let install_dir = self.root.root.join("install");
+            let frames = install_dir.join(format!("{session}.frames"));
+            let log_path = self.root.log(&format!("installer-{session}"));
+            let spawn = Spawn {
+                uid: INSTALLER_UID,
+                context_manager: false,
+                mounts: i
+                    .mounts
+                    .iter()
+                    .cloned()
+                    .chain([
+                        Mount {
+                            host: host_dir.clone(),
+                            at: at.clone(),
+                            writable: false,
+                        },
+                        // the native-library root, the one writable path (NativeLibraryHelper copies into it)
+                        Mount {
+                            host: host_dir.join(lib),
+                            at: at.join(lib),
+                            writable: true,
+                        },
+                    ])
+                    .collect(),
+                links: vec![],
+                devices: vec![],
+                property_area: Some(self.root.properties()),
+                rights: vec![],
+                program: i.installer.clone(),
+                args: i
+                    .vm
+                    .iter()
+                    .cloned()
+                    .chain([at.clone().into_os_string(), at.join(lib).into_os_string()])
+                    .collect(),
+                env: i.env.clone(),
+                cwd: None,
+                stdin: None,
+                stdout: std::fs::File::create(&frames)?.into(),
+                stderr: std::fs::File::create(&log_path)?.into(),
+            };
+            let start = Instant::now();
+            let mut p = self
+                .broker
+                .spawn_installer(spawn)
+                .with_context(|| format!("starting {}", i.installer.display()))?;
+            let status = p.child.wait()?;
+            let stderr = std::fs::read_to_string(&log_path).unwrap_or_default();
+            ensure!(
+                status.success(),
+                "session {session}: atl-installer exited {status}: {}",
+                stderr.trim()
+            );
+            log(format_args!(
+                "install session {session}: installer {} ms",
+                start.elapsed().as_millis()
+            ));
+            Ok(frames.to_string_lossy().into_owned())
+        })();
+        match staged {
+            Ok(frames) => {
+                i.staged
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(session, uid);
+                Ok(frames)
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&host_dir);
+                Err(e)
+            }
+        }
+    }
+
+    /// Request `Commit`: session `session` (staged for `uid`) becomes `/data/app/<package>` (PackageInstallerSession's rename), with its data dirs (installd createAppData) and external dirs; whether a library needs ES1.
+    fn commit(&self, session: u32, package: &str, uid: u32) -> Result<bool> {
+        ensure!(
+            !package.is_empty()
+                && package
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+                && !package.starts_with('.'),
+            "{package:?}: not a package name"
+        );
+        let i = &self.installd;
+        let mut staged = i.staged.lock().unwrap_or_else(|e| e.into_inner());
+        ensure!(
+            staged.get(&session) == Some(&uid),
+            "session {session}: not staged for uid {uid}"
+        );
+        let mut committed = i.committed.lock().unwrap_or_else(|e| e.into_inner());
+        ensure!(
+            !committed.contains_key(package),
+            "{package}: already installed"
+        );
+        let app = self.root.data().join("app");
+        let code = app.join(package);
+        std::fs::rename(app.join(staging_name(session)), &code)
+            .with_context(|| format!("moving session {session} to {}", code.display()))?;
+        for d in [format!("user/0/{package}"), format!("user_de/0/{package}")] {
+            std::fs::create_dir_all(self.root.data().join(d))?;
+        }
+        for d in ["data", "obb"] {
+            std::fs::create_dir_all(self.root.external(package).join(d))?;
+        }
+        let es1 = needs_es1(&code.join(LIB_DIR_NAME))?;
+        staged.remove(&session);
+        committed.insert(package.to_owned(), uid);
+        log(format_args!("installed {package}: uid {uid}"));
+        Ok(es1)
+    }
+}
 
 /// Writes the default property area (system processes map it) and returns the properties it holds, to which each app process's area adds its own.
 /// Sources as init's property service loads them: /system/build.prop, then /vendor/build.prop when `--file` places one (the device's: `ro.hardware.egl`).
@@ -615,10 +713,8 @@ struct Host {
     app_devices: Vec<PathBuf>,
     /// The run's GPU: gralloc's DRM node and how it was chosen, pushed to each app process (atl_gralloc::node). None: no gralloc in this run.
     gpu: Option<(String, NodeSource)>,
-    /// The installed packages: an app process mounts its own directories (package_mounts).
-    packages: Vec<PackageRecord>,
-    /// Each installed package's instruction set (install).
-    instruction_sets: InstructionSets,
+    /// installd's role: the sessions' files, the installer, what is staged and installed (an app process mounts its package's own directories, package_mounts).
+    installd: Installd,
 }
 
 /// A host path read-only at the same path in the sandbox: the runtime's shared host paths name themselves in both trees.
@@ -640,25 +736,29 @@ enum End {
     Services(ExitStatus),
 }
 
+/// ANDROID_ROOT & co. and the library path: the environment of an ART process (the converter's staged ART root `art`); app processes and the installer.
+fn art_env(
+    art: &Path,
+    lib: &(OsString, OsString),
+    log_tags: &OsString,
+) -> Vec<(OsString, OsString)> {
+    [
+        ("ANDROID_ROOT", art.to_path_buf()),
+        ("ANDROID_ART_ROOT", art.join("com.android.art")),
+        ("ANDROID_I18N_ROOT", art.join("com.android.i18n")),
+        ("ANDROID_TZDATA_ROOT", art.join("com.android.tzdata")),
+        ("ANDROID_DATA", PathBuf::from(DATA)),
+        ("LD_BIND_NOW", PathBuf::from("1")),
+    ]
+    .into_iter()
+    .map(|(k, v)| (OsString::from(k), v.into_os_string()))
+    .chain([lib.clone(), ("ANDROID_LOG_TAGS".into(), log_tags.clone())])
+    .collect()
+}
+
 impl Host {
-    /// ANDROID_ROOT & co. and the library path: the environment of an ART process (the converter's staged ART root).
     fn art_env(&self) -> Vec<(OsString, OsString)> {
-        let art = &self.art_root;
-        [
-            ("ANDROID_ROOT", art.clone()),
-            ("ANDROID_ART_ROOT", art.join("com.android.art")),
-            ("ANDROID_I18N_ROOT", art.join("com.android.i18n")),
-            ("ANDROID_TZDATA_ROOT", art.join("com.android.tzdata")),
-            ("ANDROID_DATA", PathBuf::from(DATA)),
-            ("LD_BIND_NOW", PathBuf::from("1")),
-        ]
-        .into_iter()
-        .map(|(k, v)| (OsString::from(k), v.into_os_string()))
-        .chain([
-            self.lib.clone(),
-            ("ANDROID_LOG_TAGS".into(), self.log_tags.clone()),
-        ])
-        .collect()
+        art_env(&self.art_root, &self.lib, &self.log_tags)
     }
 
     /// The property area of the app process `name` of `uid`: the defaults plus what only this process has. `ro.atl.display` is the display the process's compositor answers with
@@ -785,24 +885,21 @@ impl Host {
         })
     }
 
-    /// A package's own directories (the install's records name them): its APK and native libraries read-only at /data/app/<package>, its data and device-protected data read-write. Never the whole /data.
-    fn package_mounts(&self, p: &PackageRecord) -> Result<Vec<Mount>> {
-        let app = Path::new(&p.source_dir)
-            .parent()
-            .with_context(|| format!("{}: no app directory", p.source_dir))?;
+    /// A package's own directories (as commit made them): its APKs and native libraries read-only at /data/app/<package>, its data and device-protected data read-write. Never the whole /data.
+    fn package_mounts(&self, package: &str) -> Result<Vec<Mount>> {
         [
-            (app, false),
-            (Path::new(&p.data_dir), true),
-            (Path::new(&p.device_protected_data_dir), true),
+            (format!("{DATA_APP}/{package}"), false),
+            (format!("{DATA_USER}/0/{package}"), true),
+            (format!("{DATA_USER_DE}/0/{package}"), true),
         ]
         .into_iter()
         .map(|(at, writable)| {
-            let rel = at
+            let rel = Path::new(&at)
                 .strip_prefix(DATA)
-                .with_context(|| format!("{}: not below {DATA}", at.display()))?;
+                .with_context(|| format!("{at}: not below {DATA}"))?;
             Ok(Mount {
                 host: self.root.data().join(rel),
-                at: at.to_path_buf(),
+                at: PathBuf::from(&at),
                 writable,
             })
         })
@@ -872,28 +969,32 @@ impl Host {
 
     /// The services' start request: ProcessList.startProcessLocked's Process.start, as an app process in the sandbox.
     fn start_app(self: &Arc<Self>, req: &StartRequest) -> Result<i32> {
-        ensure!(req.uid >= AID_APP_START, "{}: not an app uid", req.uid);
-        let record = self
-            .packages
-            .iter()
-            .find(|p| p.name == req.package)
-            .with_context(|| format!("{}: not an installed package", req.package))?;
-        let isa = self
-            .instruction_sets
+        let uid = self
+            .installd
+            .committed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&req.package)
-            .with_context(|| format!("{}: no instruction set recorded", req.package))?;
+            .copied()
+            .with_context(|| format!("{}: not an installed package", req.package))?;
+        ensure!(
+            uid == req.uid,
+            "{}: installed as uid {uid}, asked for {}",
+            req.package,
+            req.uid
+        );
         let mut spawn = self.app_spawn(
             req.uid,
             &req.process_name,
             req.target_sdk,
-            Some(isa),
+            Some(&req.instruction_set),
             &self.boot,
             &req.entry_point,
             &req.args,
         )?;
         self.external_storage(&mut spawn, &req.package);
-        spawn.mounts.extend(self.package_mounts(record)?);
-        spawn.rights = atl_broker::rights_of(record.granted_permissions.as_slice());
+        spawn.mounts.extend(self.package_mounts(&req.package)?);
+        spawn.rights = req.rights.clone();
         let pid = self.start(spawn, false, true)?;
         log(format_args!(
             "started {} (package {}): uid {}, host pid {pid}",
@@ -1056,6 +1157,16 @@ fn serve_control(host: Arc<Host>, fd: std::os::fd::OwnedFd) {
         let outcome = match request {
             Request::Start(req) => host.start_app(&req).map(|pid| Response::Started { pid }),
             Request::Kill { pid } => host.kill(pid).map(|()| Response::Killed),
+            Request::Install { session, uid } => host
+                .install(session, uid)
+                .map(|frames| Response::Staged { frames }),
+            Request::Commit {
+                session,
+                package,
+                uid,
+            } => host
+                .commit(session, &package, uid)
+                .map(|needs_es1| Response::Committed { needs_es1 }),
         };
         outcome.unwrap_or_else(|e| {
             log(format_args!("control request failed: {e:#}"));
@@ -1078,8 +1189,14 @@ fn gralloc_node(log: &str) -> Option<String> {
     Some(node.to_owned())
 }
 
-/// Waits until `child`'s `log` holds `line`; fails when it exits first (naming its log, which says why) or after [`READY`].
-fn wait_ready(child: &mut Child, log: &Path, line: &str, what: &str) -> Result<()> {
+/// Waits until `child`'s `log` holds `line`; fails when it exits first (naming its log, which says why) or after `limit`.
+fn wait_ready(
+    child: &mut Child,
+    log: &Path,
+    line: &str,
+    what: &str,
+    limit: Duration,
+) -> Result<()> {
     let start = Instant::now();
     loop {
         let text = std::fs::read_to_string(log).unwrap_or_default();
@@ -1093,8 +1210,8 @@ fn wait_ready(child: &mut Child, log: &Path, line: &str, what: &str) -> Result<(
                 log.display()
             );
         }
-        if start.elapsed() > READY {
-            bail!("{what} not ready after {READY:?} (log {})", log.display());
+        if start.elapsed() > limit {
+            bail!("{what} not ready after {limit:?} (log {})", log.display());
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -1124,11 +1241,35 @@ fn run(a: &Args) -> Result<ExitCode> {
         .iter()
         .map(|jar| link_into_framework(&r, jar))
         .collect::<Result<Vec<_>>>()?;
-    let (records, instruction_sets) = install(a, &r)?;
-    if let Some(p) = &a.launch
-        && !records.iter().any(|rec| &rec.name == p)
-    {
-        bail!("--launch {p}: not an installed package");
+    ensure!(
+        a.first_uid > INSTALLER_UID,
+        "--first-uid {}: at or below the installer's uid {INSTALLER_UID}",
+        a.first_uid
+    );
+    std::fs::create_dir_all(r.data().join("dalvik-cache"))?;
+    // the install sessions: their files stay where xtask put them until staged; each manifest goes to install/<i>.manifest.json for the services
+    let install_dir = r.root.join("install");
+    std::fs::create_dir_all(&install_dir)?;
+    let mut sessions = Vec::new();
+    let mut session_args: Vec<OsString> = Vec::new();
+    for (i, file) in a.packages.iter().enumerate() {
+        let text =
+            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+        let source: PackageSource =
+            serde_json::from_str(&text).with_context(|| format!("parsing {}", file.display()))?;
+        ensure!(
+            source.files.first().is_some_and(|f| f.split.is_none())
+                && source.files[1..].iter().all(|f| f.split.is_some()),
+            "{}: not a base APK followed by splits",
+            file.display()
+        );
+        let manifest = install_dir.join(format!("{i}.manifest.json"));
+        std::fs::write(&manifest, serde_json::to_vec_pretty(&source.manifest)?)?;
+        session_args.extend([
+            "--session".into(),
+            format!("{i}={}", manifest.display()).into(),
+        ]);
+        sessions.push(source.files);
     }
     let (broker, mut binderd) = Broker::start(
         &a.binderd,
@@ -1146,11 +1287,9 @@ fn run(a: &Args) -> Result<ExitCode> {
     // /system and /vendor link to (boot jars, framework-res, shared libraries, --file sources)
     let mut shared_ro: Vec<Mount> = atl_broker::library_path_mounts(&a.lib_path)?;
     shared_ro.extend(atl_broker::tree_mounts(&a.art_root)?);
-    // by host path, read-only: the package records (--packages) and the system dir's keyboard maps (--keychars, under it)
-    let packages_json = r.root.join("packages.json");
+    // by host path, read-only: the system dir's keyboard maps (--keychars, under it)
     let system_dir = r.system();
     let linked: Vec<&Path> = std::iter::once(a.framework_res.as_path())
-        .chain(std::iter::once(packages_json.as_path()))
         .chain(std::iter::once(system_dir.as_path()))
         .chain(a.boot_jars.iter().map(PathBuf::as_path))
         .chain(a.run_boot_jars.iter().map(PathBuf::as_path))
@@ -1275,6 +1414,7 @@ fn run(a: &Args) -> Result<ExitCode> {
             &r.log("gralloc"),
             GRALLOC_READY_LINE,
             "atl-gralloc-allocator",
+            READY,
         )?;
         let allocated = gralloc_node(&std::fs::read_to_string(r.log("gralloc"))?)
             .context("gralloc's ready line names no node")?;
@@ -1357,8 +1497,49 @@ fn run(a: &Args) -> Result<ExitCode> {
             vec![]
         },
         pipewire: atl_platform_host::app_access::pipewire_socket(),
-        packages: records,
-        instruction_sets,
+        installd: Installd {
+            sessions,
+            installer: a.installer.clone(),
+            vm: {
+                let boot = a
+                    .boot_jars
+                    .iter()
+                    .map(|j| j.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(":");
+                [
+                    format!("-Xbootclasspath:{boot}"),
+                    format!("-Xbootclasspath-locations:{boot}"),
+                    "-Xnoimage-dex2oat".to_owned(),
+                    format!("-Djava.class.path={}", a.installer_class_path.display()),
+                ]
+                .into_iter()
+                .map(OsString::from)
+                .collect()
+            },
+            // ART's environment with the property area at bionic's default path, where the profile mounts it (as the app profile does)
+            env: art_env(&a.art_root, &lib, &a.log_tags)
+                .into_iter()
+                .chain([(PROPERTY_AREA_ENV.into(), PROPERTY_AREA.into())])
+                .collect(),
+            mounts: {
+                let mut m = tree_mounts(&a.art_root)?;
+                m.extend(
+                    a.boot_jars
+                        .iter()
+                        .chain([&a.installer_class_path])
+                        .map(|p| ro_at_own_path(p)),
+                );
+                m.push(Mount {
+                    host: a.framework_res.clone(),
+                    at: Path::new(SYSTEM_FRAMEWORK).join(FRAMEWORK_RES),
+                    writable: false,
+                });
+                m
+            },
+            staged: Mutex::new(BTreeMap::new()),
+            committed: Mutex::new(BTreeMap::new()),
+        },
         root: Root {
             root: r.root.clone(),
         },
@@ -1370,10 +1551,18 @@ fn run(a: &Args) -> Result<ExitCode> {
             .name("process-control".into())
             .spawn(move || serve_control(host, control_ours))?;
     }
-    let mut services_args: Vec<OsString> = vec![
-        "--packages".into(),
-        r.root.join("packages.json").into_os_string(),
-    ];
+    // the services install the sessions at their start (atl_services::install): the files through the control socket, the rest by argument
+    let mut services_args: Vec<OsString> = session_args;
+    services_args.extend(["--first-uid".into(), a.first_uid.to_string().into()]);
+    for abi in &a.abis {
+        services_args.extend(["--abi".into(), abi.into()]);
+    }
+    if let Some(p) = &a.platform_permissions {
+        services_args.extend(["--platform-permissions".into(), p.into()]);
+    }
+    if a.no_gl_selection {
+        services_args.push("--no-gl-selection".into());
+    }
     for library in &libraries {
         services_args.extend(["--shared-library".into(), library.into()]);
     }
@@ -1422,6 +1611,11 @@ fn run(a: &Args) -> Result<ExitCode> {
         false,
         Some(control_theirs),
     )?;
+    // what the install reads by host path: the sessions' manifests and the installer's frames, the platform's permission definitions
+    services_spawn.mounts.push(ro_at_own_path(&install_dir));
+    if let Some(p) = &a.platform_permissions {
+        services_spawn.mounts.push(ro_at_own_path(p));
+    }
     // sensorservice's source reads the machine's accelerometers (PlatformSensors), which the minimal root does not show: their sysfs and udev entries read-only, their char devices bound (the buffered tier)
     let sensors = atl_platform_host::PlatformSensors::default();
     let sensor_paths = sensors.read_paths();
@@ -1441,6 +1635,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         &r.log("services"),
         READY_LINE,
         "atl-system-services",
+        READY + INSTALL_READY * u32::try_from(a.packages.len())?,
     )?;
     log(format_args!("services ready"));
 

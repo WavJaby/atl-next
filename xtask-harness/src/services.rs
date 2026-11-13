@@ -194,6 +194,7 @@ pub fn stage(
         source_dir: format!("{DATA_APP}/{APP}/base.apk"),
         primary_cpu_abi: None,
         native_library_dir: format!("{DATA_APP}/{APP}/{LIB_DIR_NAME}/{host_arch}"),
+        instruction_set: host_arch.to_string(),
         data_dir: format!("{DATA_USER}/0/{APP}"),
         device_protected_data_dir: format!("{DATA_USER_DE}/0/{APP}"),
         granted_permissions: vec![],
@@ -270,6 +271,9 @@ pub fn stage(
             }
             Request::Kill { pid } => Response::Error {
                 message: format!("the services stage starts no process it kills (pid {pid})"),
+            },
+            other => Response::Error {
+                message: format!("the services stage installs nothing ({other:?})"),
             },
         });
         // the services ending their end of the socket is how the loop stops; any other error is theirs to report

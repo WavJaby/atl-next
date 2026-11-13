@@ -27,13 +27,32 @@ pub struct StartRequest {
     pub entry_point: String,
     /// Its arguments (`seq=<startSeq>`).
     pub args: Vec<String>,
+    /// The package's instruction set (arches.toml row key), from ApplicationInfo.primaryCpuAbi: zygote's `--instruction-set`, as ProcessList passes it.
+    pub instruction_set: String,
+    /// What the package's install-time grants give the sandbox ([`crate::rights_of`]): ProcessList's gids, which PackageManager derives from the grants.
+    pub rights: Vec<crate::Right>,
 }
 
+/// `Install` / `Commit` are the installd half of an install (PackageInstallerSession staging + installd): the services own the package list and ask the host for file work only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
     Start(StartRequest),
-    Kill { pid: i32 },
+    Kill {
+        pid: i32,
+    },
+    /// Stage session `session`'s files under AOSP names (`base.apk`, `split_<name>.apk`) in `/data/app/vmdl<session>.tmp` and run the installer over it (parse + native-library copy).
+    /// `uid` (the package's future uid) must be above the installer's own ([`crate::INSTALLER_UID`]). Answered [`Response::Staged`]; a failed installer run removes the staging dir and answers its stderr.
+    Install {
+        session: u32,
+        uid: u32,
+    },
+    /// Rename the staged dir to `/data/app/<package>` and create the package's data dirs (installd createAppData): the services decoded the frames and accepted them.
+    Commit {
+        session: u32,
+        package: String,
+        uid: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +64,14 @@ pub enum Response {
     },
     /// The sandbox was killed.
     Killed,
+    /// The installer ran: its frames (atl-services-types installer_output) at `frames`, a host path the services read.
+    Staged {
+        frames: String,
+    },
+    /// The package is in place; `needs_es1`: a native library of it DT_NEEDs libGLESv1_CM (the ES1 rule's file fact; the services choose the driver).
+    Committed {
+        needs_es1: bool,
+    },
     Error {
         message: String,
     },
@@ -125,6 +152,8 @@ mod tests {
             target_sdk: 36,
             entry_point: "android.app.ActivityThread".into(),
             args: vec!["seq=1".into()],
+            instruction_set: "x86_64".into(),
+            rights: vec![crate::Right::Net],
         }
     }
 
@@ -141,6 +170,9 @@ mod tests {
                     Request::Kill { pid: 4242 } => Response::Killed,
                     Request::Kill { pid } => Response::Error {
                         message: format!("unknown pid {pid}"),
+                    },
+                    other => Response::Error {
+                        message: format!("unexpected {other:?}"),
                     },
                 }
             })

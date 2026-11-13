@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, ensure};
 
 use crate::atld_run::{
-    MS_PER_S, Package, Run, Runtime, last_resumed, parse_stamp, run_display, settled,
+    MS_PER_S, Package, PackageFile, Run, Runtime, last_resumed, parse_stamp, run_display, settled,
 };
 use atl_services_types::native_libs::{SupportedAbi, find_supported_abi};
 use atl_services_types::packages::Manifest;
@@ -152,7 +152,7 @@ impl Args {
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let (pin, apk_file) = source(root, &args.target)?;
+    let (pin, files) = source(root, &args.target)?;
     // a bad script fails before anything starts
     let steps = match &args.drive {
         Some(file) => {
@@ -162,7 +162,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
         None => None,
     };
-    let (rt, foreign) = runtime(root, args, &apk_file)?;
+    let (rt, foreign) = runtime(root, args, &files)?;
     let work = rt.out.join("run-apk");
     std::fs::create_dir_all(&work)?;
     // without --hold nobody watches the window: it maps in the gate's own compositor, which outlives atld (declared before it)
@@ -186,8 +186,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .with_display(n.display().to_arg()),
         (None, _) => rt.with_display(run_display().to_arg()),
     };
-    let (apk, m) = package(&rt, &apk_file, pin.as_ref(), &args.target, &work)?;
-    let run = run_of(&work, apk, &m, &args.log_tags);
+    let m = package(&rt, &files, pin.as_ref(), &args.target)?;
+    let run = run_of(&work, files, &m, &args.log_tags);
     let app_log = run.log(&m.name);
     let services_log = run.log("services");
     let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
@@ -282,7 +282,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         a.shot
     );
     let observe_on = a.observe || !shots.is_empty();
-    let (pin, apk_file) = source(root, &a.target)?;
+    let (pin, files) = source(root, &a.target)?;
     let arches = arches::load(root)?;
     let (arch, _) = arches::build_machine(root, &arches)?;
     let args = Args {
@@ -302,7 +302,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         app_env: Vec::new(),
     };
     // no `--display`: atld reads the target's own monitor, as on the product's host (host_display); this host's monitor is not the target's
-    let (rt, foreign) = runtime(root, &args, &apk_file)?;
+    let (rt, foreign) = runtime(root, &args, &files)?;
     let rt = match &a.display {
         Some(display) => rt.with_display(display.clone()),
         None => rt,
@@ -310,19 +310,21 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
     .with_desktop_env(&a.env);
     let work = rt.out.join("run-apk");
     std::fs::create_dir_all(&work)?;
-    let (apk, m) = package(&rt, &apk_file, pin.as_ref(), &a.target, &work)?;
-    let run = run_of(&work, apk, &m, &args.log_tags);
+    let m = package(&rt, &files, pin.as_ref(), &a.target)?;
+    let stem = files[0]
+        .path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("apk")
+        .to_owned();
+    let run = run_of(&work, files, &m, &args.log_tags);
     // the record first: the bundle is what the run reads (remote.rs `Target::of`)
     rt.record_inputs(&run)?;
     let target = remote::Target::of(&rt.out, "run-apk", &a.host, a.brk)?;
     let stem = if test_apks::names_row(&a.target) {
         a.target.clone()
     } else {
-        apk_file
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("apk")
-            .to_owned()
+        stem
     };
     let logs = rt
         .out
@@ -440,27 +442,31 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
     ))
 }
 
-/// The app's ISA when foreign (not `host`): the device ABI the install picks for `apk` (atl-services-types `find_supported_abi`, the broker's own choice), whose guest and engine the test image then needs. Empty for a host-ISA or no-native-code app.
-fn foreign_isa(abis: &[SupportedAbi], host: &str, apk: &Path) -> Result<Option<String>> {
-    let list = Command::new("unzip")
-        .arg("-Z1")
-        .arg(apk)
-        .output()
-        .context("running unzip")?;
-    ensure!(
-        list.status.success(),
-        "unzip -Z1 {}: {}",
-        apk.display(),
-        list.status
-    );
-    let entries = String::from_utf8_lossy(&list.stdout);
+/// The app's ISA when foreign (not `host`): the device ABI the install picks over every file of the package (atl-services-types `find_supported_abi`; a config split carries the libraries), whose guest and
+/// engine the test image then needs. Empty for a host-ISA or no-native-code app.
+fn foreign_isa(abis: &[SupportedAbi], host: &str, files: &[PackageFile]) -> Result<Option<String>> {
+    let mut entries = String::new();
+    for f in files {
+        let list = Command::new("unzip")
+            .arg("-Z1")
+            .arg(&f.path)
+            .output()
+            .context("running unzip")?;
+        ensure!(
+            list.status.success(),
+            "unzip -Z1 {}: {}",
+            f.path.display(),
+            list.status
+        );
+        entries.push_str(&String::from_utf8_lossy(&list.stdout));
+    }
     Ok(find_supported_abi(entries.lines(), abis)
         .map(|i| abis[i].isa.clone())
         .filter(|isa| isa != host))
 }
 
-/// The staged runtime of a run of `args` for APK file `apk`: the window gate's staging, with the GL driver, the native bridge guest of the host and, for a foreign-ISA app ([`foreign_isa`]), that ISA's guest and QEMU engine, and the GTK UI. Its display is set by the caller.
-fn runtime(root: &Path, args: &Args, apk: &Path) -> Result<(Runtime, Option<String>)> {
+/// The staged runtime of a run of `args` for the package `files`: the window gate's staging, with the GL driver, the native bridge guest of the host and, for a foreign-ISA app ([`foreign_isa`]), that ISA's guest and QEMU engine, and the GTK UI. Its display is set by the caller.
+fn runtime(root: &Path, args: &Args, files: &[PackageFile]) -> Result<(Runtime, Option<String>)> {
     let rt = Runtime::new(
         root,
         "run-apk",
@@ -474,7 +480,7 @@ fn runtime(root: &Path, args: &Args, apk: &Path) -> Result<(Runtime, Option<Stri
     .with_gl_driver(root)?
     .with_native_bridge_guest(&args.host)?
     .with_ui("gtk");
-    let foreign = foreign_isa(rt.abis(), &args.host, apk)?;
+    let foreign = foreign_isa(rt.abis(), &args.host, files)?;
     let rt = match &foreign {
         Some(isa) => {
             crate::build_state::foreign_out(root, &rt.out, &args.host, isa, "run-apk")?;
@@ -531,17 +537,15 @@ fn check_delivery(foreign: Option<&str>, package: &str, app: &str) -> Result<(),
     }
 }
 
-/// Copies the APK into the run's work dir and reads its manifest. A row's pin is checked against the manifest. Prints the package's line, and that it is unpinned when no row names it.
+/// Reads the base APK's manifest (`files`, base first; atld stages the files themselves). A row's pin is checked against the manifest. Prints the package's line, and that it is unpinned when no row names it.
 fn package(
     rt: &Runtime,
-    apk_file: &Path,
+    files: &[PackageFile],
     pin: Option<&test_apks::Row>,
     target: &str,
-    work: &Path,
-) -> Result<(PathBuf, Manifest)> {
-    let apk = work.join("base.apk");
-    std::fs::copy(apk_file, &apk).with_context(|| format!("copying {}", apk_file.display()))?;
-    let m = manifest::read(&rt.apk.aapt2, &apk)?;
+) -> Result<Manifest> {
+    let apk_file = &files.first().context("a package without files")?.path;
+    let m = manifest::read(&rt.apk.aapt2, apk_file)?;
     if let Some(row) = pin {
         test_apks::check_identity(
             target,
@@ -556,12 +560,13 @@ fn package(
         .map(|a| a.name.clone())
         .context("the APK has no launcher activity")?;
     println!(
-        "run-apk: {} ({} versionCode {}, sdk {}..{}, launcher activity {activity})",
+        "run-apk: {} ({} versionCode {}, sdk {}..{}, launcher activity {activity}, {} file(s))",
         apk_file.display(),
         m.name,
         m.version_code,
         m.min_sdk,
-        m.target_sdk
+        m.target_sdk,
+        files.len()
     );
     if pin.is_none() {
         println!(
@@ -570,16 +575,19 @@ fn package(
             test_apks::FILE
         );
     }
-    Ok((apk, m))
+    Ok(m)
 }
 
 /// The run's dirs and its one package, started at its launcher activity.
-fn run_of(work: &Path, apk: PathBuf, m: &Manifest, log_tags: &str) -> Run {
+fn run_of(work: &Path, files: Vec<PackageFile>, m: &Manifest, log_tags: &str) -> Run {
     Run {
         root: work.join("root"),
         scratch: work.join("scratch"),
         launch: Some(m.name.clone()),
-        packages: vec![Package::base(apk, m.clone())],
+        packages: vec![Package {
+            files,
+            manifest: m.clone(),
+        }],
         first_uid: window::APP_UID,
         libraries: vec![],
         shell: None,
@@ -732,18 +740,22 @@ fn finish(
     }
 }
 
-/// The APK to run: a row's pinned file (verified by `test_apks::ensure`), or the file a path names, which no row pins.
-fn source(root: &Path, target: &str) -> Result<(Option<test_apks::Row>, PathBuf)> {
+/// The package to run, base first: a row's pinned files (verified by `test_apks::ensure`), or the one base APK a path names, which no row pins.
+fn source(root: &Path, target: &str) -> Result<(Option<test_apks::Row>, Vec<PackageFile>)> {
     if test_apks::names_row(target) {
-        let (row, file) = test_apks::ensure(root, target)?;
-        return Ok((Some(row), file));
+        let (row, files) = test_apks::ensure(root, target)?;
+        let files = files
+            .into_iter()
+            .map(|(split, path)| PackageFile { split, path })
+            .collect();
+        return Ok((Some(row), files));
     }
-    let file = PathBuf::from(target);
+    let path = PathBuf::from(target);
     ensure!(
-        file.is_file(),
+        path.is_file(),
         "{target}: not a file (an argument holding `.`, `/` or `\\` is a path)"
     );
-    Ok((None, file))
+    Ok((None, vec![PackageFile { split: None, path }]))
 }
 
 /// The script's `wait:MS` items summed: how long it runs after the first present (a bad item is the app's to refuse, counted 0 here).

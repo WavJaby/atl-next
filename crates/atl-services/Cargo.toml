@@ -62,6 +62,7 @@ atl-services-types = { path = "../atl-services-types" }
 atl-services-wire = { path = "../atl-services-wire" }
 clap.workspace = true
 rustix.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 
 [build-dependencies]

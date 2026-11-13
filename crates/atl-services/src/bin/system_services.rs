@@ -17,11 +17,13 @@ use anyhow::{Context, Result, bail};
 use atl_aidl::aidl::android::app::IActivityManager::BnActivityManager;
 use atl_aidl::aidl::android::content::pm::IPackageManager::BnPackageManager;
 use atl_services::activity::{ActivityManager, RootBack};
+use atl_services::install::{self, Session};
 use atl_services::package::PackageManager;
 use atl_services::process_control::ControlSocket;
 use atl_services::ui_agents::UiAgents;
 use atl_services_types::compositor_registry;
 use atl_services_types::display_model::DisplayModel;
+use atl_services_types::native_libs::SupportedAbi;
 use atl_services_types::packages::{Library, PackageRecord, Packages};
 use atl_services_types::permission::Permissions;
 use binder::{BinderFeatures, ProcessState};
@@ -29,9 +31,25 @@ use clap::Parser;
 
 #[derive(Parser)]
 struct Args {
-    /// The installed packages: a JSON array of `PackageRecord`s (atl_services_types::packages), paths as the app processes see them.
+    /// Records of packages already in place, a JSON array of `PackageRecord`s: the `xtask test binder` services stage, which has no APK. Excludes `--session`.
+    #[arg(long, conflicts_with = "sessions")]
+    packages: Option<PathBuf>,
+    /// An install session the host holds files for (repeat, in uid order): `<id>=<manifest JSON path>` (atl_services_types::packages::Manifest, xtask's aapt2 read of the base APK).
+    /// Installed at start through the control socket (atl_services::install).
+    #[arg(long = "session", value_parser = parse_session)]
+    sessions: Vec<(u32, PathBuf)>,
+    /// The first session's uid; the i-th gets uid + i. Default: the first uid above the installer's (atl_broker::INSTALLER_UID).
+    #[arg(long, default_value_t = atl_broker::INSTALLER_UID + 1)]
+    first_uid: u32,
+    /// A device ABI with its instruction set (repeat, preferred first): `<abi>=<isa>` (ro.product.cpu.abilist with arches.toml row keys).
+    #[arg(long = "abi", value_parser = parse_abi)]
+    abis: Vec<SupportedAbi>,
+    /// framework-res's permission definitions: a JSON array of `PermissionDecl` (the grant rule's platform half). Omitted: no platform permission is granted.
     #[arg(long)]
-    packages: PathBuf,
+    platform_permissions: Option<PathBuf>,
+    /// Test only: every package gets the native GL driver (the GL selection gate's break).
+    #[arg(long)]
+    no_gl_selection: bool,
     /// A shared library an app may `<uses-library>`: `<name>=<jar path as the app processes see it>[,<dependency name>...]` (repeat). SystemConfig's `<library name file dependency>`.
     #[arg(long = "shared-library", value_parser = Library::parse_arg)]
     shared_libraries: Vec<(String, Library)>,
@@ -109,6 +127,24 @@ const CONNECTIVITY: &str = "connectivity";
 /// The name PermissionManager's constructor looks IPermissionManager up by (PermissionManager.java getServiceOrThrow("permissionmgr")).
 const PERMISSION_MANAGER: &str = "permissionmgr";
 
+fn parse_session(s: &str) -> Result<(u32, PathBuf), String> {
+    let (id, path) = s.split_once('=').ok_or("expected <id>=<manifest path>")?;
+    Ok((id.parse().map_err(|e| format!("{id}: {e}"))?, path.into()))
+}
+
+fn parse_abi(s: &str) -> Result<SupportedAbi, String> {
+    let (abi, isa) = s.split_once('=').ok_or("expected <abi>=<isa>")?;
+    Ok(SupportedAbi {
+        abi: abi.into(),
+        isa: isa.into(),
+    })
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(p: &std::path::Path) -> Result<T> {
+    let text = std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("parsing {}", p.display()))
+}
+
 /// `--root-back`'s values.
 fn parse_root_back(s: &str) -> Result<RootBack, String> {
     match s {
@@ -121,15 +157,37 @@ fn parse_root_back(s: &str) -> Result<RootBack, String> {
 fn main() -> Result<()> {
     let a = Args::parse();
     let display = a.display.unwrap_or_default();
-    let text = std::fs::read_to_string(&a.packages)
-        .with_context(|| format!("reading {}", a.packages.display()))?;
-    let list: Vec<PackageRecord> =
-        serde_json::from_str(&text).with_context(|| format!("parsing {}", a.packages.display()))?;
+    let control = Arc::new(ControlSocket::from_stdin().context("the process control on stdin")?);
+    // the package list: installed now through the host's file work (atl_services::install), before any service answers
+    let list: Vec<PackageRecord> = match &a.packages {
+        Some(file) => read_json(file)?,
+        None => {
+            let sessions = a
+                .sessions
+                .iter()
+                .map(|(id, m)| {
+                    Ok(Session {
+                        id: *id,
+                        manifest: read_json(m)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let config = install::Config {
+                first_uid: a.first_uid,
+                abis: a.abis.clone(),
+                platform_permissions: match &a.platform_permissions {
+                    Some(p) => read_json(p)?,
+                    None => Vec::new(),
+                },
+                no_gl_selection: a.no_gl_selection,
+            };
+            install::install(&control, sessions, &config)?
+        }
+    };
     let libraries: BTreeMap<String, Library> = a.shared_libraries.into_iter().collect();
     let packages = Arc::new(Packages::new(list, libraries));
     // the install-time grants every service checks callers against (permission.rs, rule A)
     let permissions = Arc::new(Permissions::new(Arc::clone(&packages)));
-    let control = Arc::new(ControlSocket::from_stdin().context("the process control on stdin")?);
     ProcessState::start_thread_pool();
     // the UI agents the registry takes in REGISTER, read by the window service at each window's first relayout
     let agents = Arc::new(UiAgents::default());

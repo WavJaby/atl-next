@@ -662,6 +662,7 @@ dependencies = [
  "atl-services-wire",
  "clap",
  "rustix",
+ "serde",
  "serde_json",
 ]
 
@@ -2687,6 +2688,7 @@ dependencies = [
  "sha2",
  "toml",
  "xtask",
+ "zip",
 ]
 
 [[package]]

@@ -218,6 +218,9 @@ pub struct PackageRecord {
     pub primary_cpu_abi: Option<String>,
     /// `/data/app/<package>/lib/<isa>` (ApplicationInfo.nativeLibraryDir; its parent is nativeLibraryRootDir), set with or without native code
     pub native_library_dir: String,
+    /// The instruction set the process runs (arches.toml row key): primaryCpuAbi's, else the device's first (InstructionSets.getPrimaryInstructionSet); zygote's `--instruction-set`.
+    #[serde(default)]
+    pub instruction_set: String,
     /// credential-protected storage (ApplicationInfo.dataDir, credentialProtectedDataDir: /data/user/<user>/<package>)
     pub data_dir: String,
     /// device-protected storage (ApplicationInfo.deviceProtectedDataDir: /data/user_de/<user>/<package>): the code cache dir, which graphics setup opens first
@@ -417,6 +420,7 @@ mod tests {
             source_dir: String::new(),
             primary_cpu_abi: None,
             native_library_dir: String::new(),
+            instruction_set: String::new(),
             data_dir: String::new(),
             device_protected_data_dir: String::new(),
             granted_permissions: vec![],
