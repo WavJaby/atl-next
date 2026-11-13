@@ -652,7 +652,7 @@ JNI_FN(jint, mediandkLinked)(JNIEnv *env, jclass cls)
     return f != NULL;
 }
 
-// AtlJniTest.resolverProbe (net-bp, engine/netdb.rs): the libc resolver family through the bridge, every answer read in bionic's layout and values. Fields: numeric 1 (AF_INET 127.0.0.1:80, one node, no canonical name); passive 1 (AI_PASSIVE null host, 0.0.0.0:8080); service = EAI_SERVICE (9); numerichost = EAI_NONAME (8, AI_NUMERICHOST on a name); text 1 (gai_strerror of EAI_NODATA and EAI_NONAME is bionic's); loop 1000 (1000 numeric lookups, each read back and freed); list ok (AF_UNSPEC passive list walked and freed, its length host-dependent, not printed). The unresolvable name is logged, not gated: its answer depends on the sandbox network.
+// AtlJniTest.resolverProbe (net-bp, engine/netdb.rs): the libc resolver family through the bridge, every answer read in bionic's layout and values. Fields: numeric 1 (AF_INET 127.0.0.1:80, one node, no canonical name); passive 1 (AI_PASSIVE null host, 0.0.0.0:8080); service = EAI_SERVICE (9); numerichost = EAI_NONAME (8, AI_NUMERICHOST on a name); text 1 (gai_strerror of EAI_NODATA and EAI_NONAME is bionic's); loop 1000 (1000 numeric lookups, each read back and freed); list ok (AF_UNSPEC passive list walked and freed, its length host-dependent, not printed); herr 1 (h_errno set to 77, then a failed gethostbyname of the unresolvable name leaves HOST_NOT_FOUND or TRY_AGAIN in it; a name that resolves here reads 0, so a DNS that answers every name fails this field). The getaddrinfo answer for the unresolvable name is logged, not gated: its code depends on the sandbox network.
 static int rp_numeric(void)
 {
     struct addrinfo hints = {0}, *res = NULL;
@@ -744,6 +744,15 @@ static int rp_list(void)
     return ok && n > 0;
 }
 
+// net-bp (build.rs `GLIBC` `__get_h_errno`): the guest's h_errno is the slot the host's gethostbyname sets. 77 is a sentinel no lookup writes, so 1 or 2 is the failed lookup's own value.
+static int rp_herrno(void)
+{
+    h_errno = 77;
+    struct hostent *he = gethostbyname("nonexistent.invalid");
+    __android_log_print(ANDROID_LOG_INFO, "atl-resolver", "gethostbyname %s h_errno=%d", he == NULL ? "failed" : "answered", h_errno);
+    return he == NULL && (h_errno == HOST_NOT_FOUND || h_errno == TRY_AGAIN);
+}
+
 static void rp_unresolved(void)
 {
     struct addrinfo hints = {0}, *res = NULL;
@@ -759,7 +768,7 @@ JNI_FN(jstring, resolverProbe)(JNIEnv *env, jclass cls)
 {
     char line[256];
     rp_unresolved();
-    snprintf(line, sizeof line, "numeric %d passive %d service %d numerichost %d text %d loop %d list %s",
-             rp_numeric(), rp_passive(), rp_service(), rp_numerichost(), rp_text(), rp_loop(), rp_list() ? "ok" : "fail");
+    snprintf(line, sizeof line, "numeric %d passive %d service %d numerichost %d text %d loop %d list %s herr %d",
+             rp_numeric(), rp_passive(), rp_service(), rp_numerichost(), rp_text(), rp_loop(), rp_list() ? "ok" : "fail", rp_herrno());
     return (*env)->NewStringUTF(env, line);
 }

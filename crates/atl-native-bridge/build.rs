@@ -309,10 +309,12 @@ const GLIBC: &[(&str, &str)] = &[
     ("pthread_attr_setstacksize", "pthread_attr_setstacksize"),
     ("pthread_getspecific", "pthread_getspecific"),
     ("pthread_setspecific", "pthread_setspecific"),
-    // struct hostent is the same in bionic and glibc (engine/netdb.rs layout gate); the answer is glibc's static storage, as bionic's is its own. h_errno stays glibc's: the guest's h_errno is not set
+    // struct hostent is the same in bionic and glibc (engine/netdb.rs layout gate); the answer is glibc's static storage, as bionic's is its own. Its h_errno is the guest's too: the `__get_h_errno` row below
     ("gethostbyname", "gethostbyname"),
     // same class: same prototype in both libcs (address bytes, length, type; AF_INET = 2 in both), same hostent storage; h_errno as above
     ("gethostbyaddr", "gethostbyaddr"),
+    // NBS patch 0009 stubs it on both lists. bionic's h_errno is *__get_h_errno(), the guest's own resolver slot, which the rows above never set; glibc's location is the one slot both sides use (the guest dereferences it, as it does the netdb lists)
+    ("__get_h_errno", "__h_errno_location"),
 ];
 
 /// The provider's soname, as cargo-c names a cdylib (`lib<crate>.so.<v>`): `<v>` is the version's semver-compatible prefix -- the major from 1.0, `0.<minor>` below it, the whole `0.0.<patch>` below that (measured: `libatl_bionic.so.0.0.0`, readelf SONAME). Read from atl-bionic's own manifest so a version bump moves it.
@@ -789,11 +791,14 @@ fn libc_entries(
     }
     let getattr_glibc = selected_breaks()?.contains(&"atl_nb_qt_getattr_glibc");
     let dns_unbound = selected_breaks()?.contains(&"atl_nb_dns_unbound");
+    let herr_trap = selected_breaks()?.contains(&"atl_nb_dns_herr_trap");
     Ok(names
         .iter()
         .map(|name| {
             if dns_unbound && name == "getaddrinfo" {
                 trap(name, "unbound: no host side (break dns_unbound)")
+            } else if herr_trap && name == "__get_h_errno" {
+                trap(name, "unbound: no host side (break dns_herr_trap)")
             } else if getattr_glibc && name == "pthread_getattr_np" {
                 format!("Entry::Generic(Host::Glibc, {name:?}, Class::Int)")
             } else if shims.contains(&name.as_str()) {
@@ -1266,6 +1271,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("dns_unbound", "atl_nb_dns_unbound"),
     // net-bp (engine/netdb.rs `guest_error`): host EAI_* codes reach the guest unmapped (resolver probe: service code)
     ("dns_eai_raw", "atl_nb_dns_eai_raw"),
+    // net-bp (build.rs `libc_entries`): `__get_h_errno` trapped: the resolver probe's h_errno read aborts the app
+    ("dns_herr_trap", "atl_nb_dns_herr_trap"),
     // Q6-2 (engine/dispatch.rs `call_object`): x3 and x4 exchanged, so CallStaticIntMethod(2, 3) reaches the host as (3, 2) (qemu-jni gate, `c`)
     ("jni_swap", "atl_nb_jni_swap"),
     // Q6-7 (engine/va_list.rs `fp`): a guest va_list's fp arguments are read from its integer save area (qemu-jni gate, `V`)

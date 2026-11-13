@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Fri, 13 Nov 2026 15:55:45 +0800
+Subject: [PATCH] Stub __get_h_errno for guest libc
+
+bionic's h_errno is *__get_h_errno(), a slot of the calling thread's
+resolver state. The bridge answers gethostbyname and gethostbyaddr
+with glibc's own calls, which set glibc's h_errno, so the guest read
+its own stale slot after a failed lookup. The stub is bound to glibc's
+__h_errno_location (build.rs GLIBC row): one slot, written by the host
+call, read by the guest.
+
+Upstream-Status: Pending
+Patch-Reason: h_errno is a macro over a bionic accessor; the NativeBridge libc stub list is the only place that redirects it.
+---
+SPDX-License-Identifier: Apache-2.0
+ android_api/libc/stubs_arm64.cpp  | 2 ++
+ android_api/libc/stubs_x86_64.cpp | 2 ++
+ 2 files changed, 4 insertions(+)
+
+diff --git a/android_api/libc/stubs_arm64.cpp b/android_api/libc/stubs_arm64.cpp
+index 2a996ba4765b7f23db7633518369547ee29a89b4..eb37764efef6681a6847da54096c2ad6e9390106 100644
+--- a/android_api/libc/stubs_arm64.cpp
++++ b/android_api/libc/stubs_arm64.cpp
+@@ -18,6 +18,7 @@
+ #include "native_bridge_support/vdso/interceptable_functions.h"
+ 
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(__clone_for_fork);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(__get_h_errno);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(__get_thread_stack_top);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(__pthread_cleanup_pop);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(__pthread_cleanup_push);
+@@ -114,6 +115,7 @@ DEFINE_INTERCEPTABLE_STUB_VARIABLE(environ);
+ 
+ static void __attribute__((constructor(0))) init_stub_library() {
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __clone_for_fork);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __get_h_errno);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __get_thread_stack_top);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __pthread_cleanup_pop);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __pthread_cleanup_push);
+diff --git a/android_api/libc/stubs_x86_64.cpp b/android_api/libc/stubs_x86_64.cpp
+index 3a01322a792d5ca89e85b01d0e08659aec221e3d..85e1f9c9e8ff6d1ad4af9556b94f047f8bbf8dcd 100644
+--- a/android_api/libc/stubs_x86_64.cpp
++++ b/android_api/libc/stubs_x86_64.cpp
+@@ -22,6 +22,7 @@
+ #include "native_bridge_support/vdso/interceptable_functions.h"
+ 
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(__clone_for_fork);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(__get_h_errno);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(__get_thread_stack_top);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(__pthread_cleanup_pop);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(__pthread_cleanup_push);
+@@ -120,6 +121,7 @@ DEFINE_INTERCEPTABLE_STUB_VARIABLE(environ);
+ 
+ static void __attribute__((constructor(0))) init_stub_library() {
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __clone_for_fork);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __get_h_errno);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __get_thread_stack_top);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __pthread_cleanup_pop);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __pthread_cleanup_push);
