@@ -354,7 +354,7 @@ pub(crate) fn harness(
     clippy::too_many_arguments,
     reason = "harness's arguments plus the wrapper"
 )]
-fn harness_in(
+pub(crate) fn harness_in(
     root: &Path,
     dir: &Path,
     h: &Harness,

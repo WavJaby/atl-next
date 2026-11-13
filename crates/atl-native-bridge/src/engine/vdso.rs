@@ -34,11 +34,15 @@ extern "C" fn intercept_symbol(addr: *mut c_void, library: *const c_char, symbol
             #[cfg(atl_nb_sles_var_skip)]
             let _ = value;
             BOUND.fetch_add(1, Ordering::Relaxed);
+        } else {
+            // a function's exported entry, reported before its stub: the address the guest imports the row by (proc.rs `row_address`)
+            super::proc::note_exported(&lib, &name, addr);
         }
         return;
     }
     // every stub resolves by (library, name) in the one binding table (bindings.rs), never by the global scope
     let host = super::bindings::target(&lib, &name).and_then(|t| t.callee());
+    let host_addr = host.map(|(h, _)| h);
     // deliberate break of the app gate's glesPbuffer (`ATL_NB_BREAK=gl_direct`): glClear's stub jumps to the host front itself, skipping the crossing -> host code runs on the guest thread pointer
     #[cfg(atl_nb_gl_direct)]
     let bound = if name == "glClear" {
@@ -51,6 +55,9 @@ extern "C" fn intercept_symbol(addr: *mut c_void, library: *const c_char, symbol
     match bound {
         Some(thunk) if engine.patch_site(addr, thunk) => {
             BOUND.fetch_add(1, Ordering::Relaxed);
+            if let Some(h) = host_addr {
+                super::proc::note_bound(&lib, &name, h);
+            }
         }
         _ => {
             UNBOUND.fetch_add(1, Ordering::Relaxed);

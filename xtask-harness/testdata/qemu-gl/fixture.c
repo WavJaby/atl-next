@@ -70,11 +70,62 @@ uint64_t qg_path_length(PFNGLGETPATHLENGTHNVPROC f) {
     return bits;
 }
 
-// The entries BOOT carries (x0 = this table), in tests/qemu_gl.rs `CALLS` order.
-static void *const qg_table[9] = {
+// GS2.2 G1, eglGetProcAddress: `gpa` is the QEMU binding of eglGetProcAddress. Each entry asks it for a name and returns the answer; with `call` set it also calls the answer (tests/qemu_gl.rs `egl_row`: the answer is compared first, so a host address is refused before any guest call).
+typedef void *(*qg_gpa_fn)(const char *name);
+
+uint64_t qg_egl_vertex_attrib4f(qg_gpa_fn gpa, uint64_t call) {
+    PFNGLVERTEXATTRIB4FPROC f = (PFNGLVERTEXATTRIB4FPROC)gpa("glVertexAttrib4f");
+    if (call && f) f(5, 2.0f, -3.0f, 4.5f, -5.25f);
+    return (uint64_t)(uintptr_t)f;
+}
+
+// 9 integer-class arguments through the answer, as qg_tex_image_2d
+uint64_t qg_egl_tex_image_2d(qg_gpa_fn gpa, uint64_t call) {
+    PFNGLTEXIMAGE2DPROC f = (PFNGLTEXIMAGE2DPROC)gpa("glTexImage2D");
+    if (call && f) f(GL_TEXTURE_2D, 2, GL_RGBA, 64, 32, 0, GL_RGBA, GL_UNSIGNED_BYTE, TEX_PIXELS);
+    return (uint64_t)(uintptr_t)f;
+}
+
+// a row the fixture never imports: its only argument is the mark the recorder checks
+uint64_t qg_egl_finish(qg_gpa_fn gpa, uint64_t call) {
+    PFNGLFINISHPROC f = (PFNGLFINISHPROC)gpa("glFinish");
+    if (call && f) f();
+    return (uint64_t)(uintptr_t)f;
+}
+
+// a name no row and no host answer has: NULL
+uint64_t qg_egl_unknown(qg_gpa_fn gpa) {
+    return (uint64_t)(uintptr_t)gpa("glNoSuchFunctionAtl");
+}
+
+// GS2.2 G1 fallback: a name with no row and a host answer. Both answers of glGetPathLengthNV are one address; the answer's fp result comes back bit for bit (`qg_path_length`).
+uint64_t qg_egl_dedup(qg_gpa_fn gpa) {
+    void *a = gpa("glGetPathLengthNV");
+    void *b = gpa("glGetPathLengthNV");
+    return a != 0 && a == b;
+}
+
+uint64_t qg_egl_path(qg_gpa_fn gpa) {
+    void *f = gpa("glGetPathLengthNV");
+    if (!f) return 0;
+    return qg_path_length((PFNGLGETPATHLENGTHNVPROC)f);
+}
+
+// GS2.2 G1 named trap, its own run: a name no prototype describes; its answer aborts when called
+uint64_t qg_egl_trap(qg_gpa_fn gpa) {
+    void (*f)(void) = (void (*)(void))gpa("glAtlNoDescriptor");
+    if (f) f();
+    return 0;
+}
+
+// The entries BOOT carries (x0 = this table), in tests/qemu_gl.rs `calls` order (0 to 8), then the eglGetProcAddress entries (9 to 15, `egl_checks`, `egl_fallback_checks`, `egl_trap_run`).
+static void *const qg_table[16] = {
     (void *)qg_clear_color,  (void *)qg_uniform4f,        (void *)qg_depth_rangef,
     (void *)qg_tex_parameterf, (void *)qg_vertex_attrib4f, (void *)qg_tex_image_2d,
     (void *)qg_tex_sub_image_2d, (void *)qg_compressed_tex_image_2d, (void *)qg_path_length,
+    (void *)qg_egl_vertex_attrib4f, (void *)qg_egl_tex_image_2d, (void *)qg_egl_finish,
+    (void *)qg_egl_unknown, (void *)qg_egl_dedup, (void *)qg_egl_path,
+    (void *)qg_egl_trap,
 };
 
 // BOOT: x0 = the table, x1 = the return stub. The host's answer is this process's exit status; the boot thread never resumes after BOOT.

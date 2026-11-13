@@ -211,13 +211,14 @@ const QEMU_SHIMS: &[&str] = &[
 ];
 /// Q5-8: the QEMU table's libc rows that bind to counted shims under `crossing-count` (counters.rs `memcpy`, `memset`, `memcmp`), which record the size argument and then run glibc's.
 const COUNTED_SHIMS: &[&str] = &["memcpy", "memset", "memcmp"];
-/// Proxy-library functions whose host side is hand-written, each bound `Entry::Shim` in its library; each must be in one proxy library's list (`bindings_table`). NDK functions taking a `JNIEnv*` (C3, engine/ndk.rs: the generic crossing would hand the host library the guest's env); `slCreateEngine` (engine/sles.rs: its out object is wrapped in a guest proxy).
+/// Proxy-library functions whose host side is hand-written, each bound `Entry::Shim` in its library; each must be in one proxy library's list (`bindings_table`). NDK functions taking a `JNIEnv*` (C3, engine/ndk.rs: the generic crossing would hand the host library the guest's env); `slCreateEngine` (engine/sles.rs: its out object is wrapped in a guest proxy); `eglGetProcAddress` (engine/proc.rs: its answer is a row's guest address, never a raw host pointer; the fn-return arm below traps every other one).
 const PROXY_SHIMS: &[&str] = &[
     "AAssetManager_fromJava",
     "AndroidBitmap_getInfo",
     "AndroidBitmap_lockPixels",
     "AndroidBitmap_unlockPixels",
     "slCreateEngine",
+    "eglGetProcAddress",
 ];
 
 /// Guest libc stubs glibc's `libc.so.6` serves with the same ABI, by (stub name, glibc symbol). NBS names the allocator entries `native_bridge_<fn>` (one heap: the guest libc's malloc calls them).
@@ -784,6 +785,7 @@ fn bindings_table(
                 (Some(_), Some(_)) if ANNOTATED.contains(&name.as_str()) => {
                     trap("pending: annotated, GS2.2")
                 }
+                // fn-return rows that are not shims (PROXY_SHIMS, eglGetProcAddress): a host function pointer must never reach the guest as a result
                 (Some(sig), Some(_)) if is_fn_ptr(&sig.ret) => trap("pending: fn-return, GS2.2"),
                 (Some(sig), Some(_)) if sig.params.iter().any(is_fn_ptr) => {
                     trap("pending: callback-param, GS2.2")
@@ -837,6 +839,19 @@ fn bindings_table(
             code.push_str(&format!("            ({name:?}, {entry}),\n"));
         }
         code.push_str("        ],\n    },\n");
+    }
+    code.push_str("];\n\n");
+    // descriptors for a name with no row (engine/proc.rs): the return class and, for QEMU, the lane refusal of the parameters; a prototype whose classes do not resolve has none, so such a name traps by name
+    code.push_str("/// Prototype descriptors by name: return class, and the QEMU lane refusal of the parameters (None: carried). Engine/proc.rs binds a host answer for a name with no row by its descriptor.\npub const PROTOTYPES: &[(&str, Class, Option<&str>)] = &[\n");
+    for (name, sig) in &host_ir.functions {
+        let (Ok(ret), Ok(params)) = (
+            atl_bridgegen::jni::result_class(&sig.ret),
+            atl_bridgegen::jni::param_classes(sig),
+        ) else {
+            continue;
+        };
+        let why = atl_bridgegen::jni::lane_refusal(&params).filter(|_| qemu);
+        code.push_str(&format!("    ({name:?}, Class::{ret:?}, {why:?}),\n"));
     }
     code.push_str("];\n\n");
     // one pool slot per binding plus the JNI slots (QEMU's JNI stubs are binding ids too), rounded to a power of two; the QEMU pool (engine/qemu/place.rs) is generated at the QEMU table's size (aarch64_pool.rs)
@@ -1006,6 +1021,10 @@ const BREAKS: &[(&str, &str)] = &[
     ("sles_no_dedup", "atl_nb_sles_no_dedup"),
     // O1 (engine/vdso.rs variable rows): a guest variable binding is not written, so SL_IID_* stay 0 (sles-bridge gate, check f)
     ("sles_var_skip", "atl_nb_sles_var_skip"),
+    // GS2.2 G1 (engine/proc.rs `row_address`): eglGetProcAddress answers a row's host address, not its exported entry (qemu-gl gate, checks e and f)
+    ("egl_raw", "atl_nb_egl_raw"),
+    // GS2.2 G1 (engine/proc.rs `bind_host`): every host answer takes a new binding, so one name answers two addresses (unit test `fallback_dedup`)
+    ("egl_nodedup", "atl_nb_egl_nodedup"),
 ];
 /// The cfg of the `x86_disp` break, read here: it selects the generator's displacement bias, no crate code.
 const X86_DISP_CFG: &str = "atl_nb_x86_disp";

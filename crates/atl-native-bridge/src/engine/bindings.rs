@@ -26,6 +26,7 @@ struct Table {
     trap_names: &'static [(&'static str, &'static str, &'static str)],
     traps: &'static [extern "C" fn()],
     provider_soname: &'static str,
+    prototypes: &'static [(&'static str, Class, Option<&'static str>)],
 }
 
 /// The table of the process's engine.
@@ -36,6 +37,7 @@ fn table() -> Table {
             trap_names: identity::TRAP_NAMES,
             traps: identity::TRAPS,
             provider_soname: identity::PROVIDER_SONAME,
+            prototypes: identity::PROTOTYPES,
         },
         Active::Qemu => qemu_table(),
     }
@@ -48,7 +50,13 @@ fn qemu_table() -> Table {
         trap_names: qemu::TRAP_NAMES,
         traps: qemu::TRAPS,
         provider_soname: qemu::PROVIDER_SONAME,
+        prototypes: qemu::PROTOTYPES,
     }
+}
+
+/// The process engine's prototype descriptors (build.rs `PROTOTYPES`): name, return class, the QEMU lane refusal of its parameters (None: carried). Engine/proc.rs binds a host answer for a name with no row by one.
+pub fn prototypes() -> &'static [(&'static str, Class, Option<&'static str>)] {
+    table().prototypes
 }
 
 /// The host library a `Generic` entry's symbol is looked up in.
@@ -155,6 +163,8 @@ fn shim(name: &str) -> Option<usize> {
         "AndroidBitmap_lockPixels" => super::ndk::bitmap_lock_pixels as *const () as usize,
         "AndroidBitmap_unlockPixels" => super::ndk::bitmap_unlock_pixels as *const () as usize,
         "slCreateEngine" => super::sles::create_engine as *const () as usize,
+        // GS2.2 G1: the answer is a row's guest address or a bound host answer (proc.rs); build.rs `PROXY_SHIMS`
+        "eglGetProcAddress" => super::proc::get_proc_address as *const () as usize,
         // Q5-8: the QEMU table's counted libc rows (build.rs `COUNTED_SHIMS`); identity never binds them
         #[cfg(feature = "crossing-count")]
         "memcpy" => crate::counters::memcpy as *const () as usize,

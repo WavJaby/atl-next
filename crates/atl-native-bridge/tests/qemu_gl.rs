@@ -4,6 +4,7 @@
 //! Env (xtask qemu_gl.rs sets it; unset prints SKIP): ATL_ENGINE_SO (the engine `.so`), ATL_QEMU_GL_FIXTURE (fixture.c, built static).
 //! Expected values are the fixture's literals, written out here again (never read from the engine); GL enum values from gl2.h / gl2ext.h.
 //! Checks: (s) started; (b) every GL name below is a Generic row of libGLESv2.so whose result class is its prototype's (void, glGetPathLengthNV GLfloat); (c) glClearColor; (u) glUniform4f; (d) glDepthRangef; (t) glTexParameterf; (a) glVertexAttrib4f; (i) glTexImage2D, 9 arguments, pixels the guest's first stack word; (j) glTexSubImage2D, likewise; (k) glCompressedTexImage2D, 8 arguments; (n) glGetPathLengthNV's arguments, and the guest got [`PATH_LENGTH`]'s bits back.
+//! GS2.2 G1 (eglGetProcAddress, `egl_checks`): the fixture asks the binding of eglGetProcAddress for a name and calls the answer. (e) glVertexAttrib4f, a row the fixture imports (fp arguments): the answer is the row's guest address, and the call reaches the recorder. (f) glTexImage2D, likewise (9 arguments, the ninth on the stack). (g) glFinish, a row the fixture never imports (its arguments: one mark word). (h) a name no row or host answer has: NULL. (p) fallback, a name with no row that the SYSTEM_LIB recorder (`examples/egl_recorder.rs`) answers: two answers are one address, and the answer's call returns its fp result bit for bit (`egl_fallback_checks`). (o) the named trap for a name no prototype describes, in its own run (`ATL_QEMU_GL_CASE=trap`, `egl_trap_run`): the process aborts naming it.
 //! Output: `qemu-gl: (x) ok` per check, `(x) FAIL <why>` otherwise, exit 0 when all pass.
 #![allow(clippy::print_stdout, reason = "test harness output is its verdict")]
 
@@ -12,9 +13,9 @@ use std::process::ExitCode;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use atl_native_bridge::engine::bindings::{Binding, Host, rows};
+use atl_native_bridge::engine::bindings::{Binding, Host, rows, target};
 use atl_native_bridge::engine::objects::Class;
-use atl_native_bridge::engine::{self, qemu};
+use atl_native_bridge::engine::{self, proc, qemu};
 
 /// The guest library of the GLES2 proxies.
 const SONAME: &str = "libGLESv2.so";
@@ -34,6 +35,8 @@ const SUB_PIXELS: u64 = 0x0000_5ab5_0000_9ab0;
 const ETC_DATA: u64 = 0x0000_ec10_00c0_ffe0;
 /// The recorder's glGetPathLengthNV answer: exact in a float, no input value, so only the fp result lane can carry it.
 const PATH_LENGTH: f32 = 12.375;
+/// The SYSTEM_LIB recorder's glGetPathLengthNV answer (`examples/egl_recorder.rs` PATH_LENGTH), read by the fallback check p.
+const EGL_PATH_LENGTH: f32 = 12.5;
 
 /// One argument word as the recorder saw it: an integer sign- or zero-extended by its C type, a float's 32 bits.
 fn uint(v: u32) -> u64 {
@@ -138,6 +141,11 @@ extern "C" fn gl_compressed_tex_image_2d(
 extern "C" fn gl_get_path_length_nv(path: u32, start: i32, num: i32) -> f32 {
     record(vec![uint(path), int(start), int(num)]);
     PATH_LENGTH
+}
+/// glFinish takes no argument: the recorder writes this mark word, so a call that never reaches it is told apart from one that does.
+const FINISH_MARK: u64 = 0x0f1;
+extern "C" fn gl_finish() {
+    record(vec![FINISH_MARK]);
 }
 
 /// One GL call of the fixture: check letter, GL name, the result class its prototype gives, the recorder, and the arguments fixture.c passes. In fixture.c `qg_table` order.
@@ -377,6 +385,108 @@ fn checks(table: u64) -> bool {
     ok
 }
 
+/// Table entry `i` of the fixture (`qg_table`).
+fn entry(table: u64, i: usize) -> u64 {
+    // SAFETY: the table is the fixture's static array of entry pointers, mapped in this process (identity, as `checks` reads it).
+    unsafe { (table as *const u64).add(i).read() }
+}
+
+/// One name the fixture asks eglGetProcAddress for: the row's guest address is the answer, and the call through it reaches the recorder with `c.args`. The answer is compared before the call, so a host address (break `egl_raw`) fails here without a guest call to it.
+fn egl_row(table: u64, index: usize, gpa: u64, c: &Call) -> Result<(), String> {
+    row_class(c.name)?;
+    let row = qemu::bind_result(c.recorder, c.ret).ok_or("pool used up")?;
+    // what init reports for the row: its exported entry (the address a guest import resolves to) and its host function
+    proc::note_exported(SONAME, c.name, row);
+    proc::note_bound(SONAME, c.name, c.recorder);
+    let answered = qemu::call(entry(table, index), &[gpa, 0]);
+    if answered != row as u64 {
+        return Err(format!(
+            "eglGetProcAddress({}) answered {answered:#x}, the row's guest address is {row:#x}",
+            c.name
+        ));
+    }
+    record(Vec::new());
+    qemu::call(entry(table, index), &[gpa, 1]);
+    let seen = std::mem::take(&mut *SEEN.lock().expect("seen"));
+    if seen != c.args {
+        Err(format!("{} got {seen:x?}, want {:x?}", c.name, c.args))
+    } else {
+        Ok(())
+    }
+}
+
+/// The QEMU binding of libEGL's eglGetProcAddress (its table row's shim): the `gpa` every eglGetProcAddress fixture entry takes.
+fn egl_gpa() -> Result<u64, String> {
+    let (addr, ret) = target("libEGL.so", "eglGetProcAddress")
+        .and_then(|t| t.callee())
+        .ok_or("eglGetProcAddress has no binding in the QEMU table")?;
+    qemu::bind_result(addr, ret)
+        .map(|a| a as u64)
+        .ok_or_else(|| "pool used up".to_owned())
+}
+
+/// GS2.2 G1 (eglGetProcAddress): checks e to h. Fixture entries 9 to 12 take `gpa`.
+fn egl_checks(table: u64, gpa: u64) -> bool {
+    let calls = calls();
+    let by_letter = |letter: char| {
+        calls
+            .iter()
+            .find(|c| c.letter == letter)
+            .expect("a call of this letter")
+    };
+    let finish = Call {
+        letter: 'g',
+        name: "glFinish",
+        ret: Class::Void,
+        recorder: gl_finish as *const () as usize,
+        args: vec![FINISH_MARK],
+    };
+    let cases: [(char, usize, &Call); 2] = [('e', 9, by_letter('a')), ('f', 10, by_letter('i'))];
+    let mut ok = true;
+    for (letter, index, c) in cases {
+        ok &= check(letter, egl_row(table, index, gpa, c));
+    }
+    ok &= check('g', egl_row(table, 11, gpa, &finish));
+    let answer = qemu::call(entry(table, 12), &[gpa]);
+    ok &= check(
+        'h',
+        if answer == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "eglGetProcAddress(glNoSuchFunctionAtl) answered {answer:#x}, want NULL"
+            ))
+        },
+    );
+    ok
+}
+
+/// GS2.2 G1 fallback (a name with no row, answered by the host libEGL at SYSTEM_LIB): check p. Entry 13: two answers for glGetPathLengthNV are one address; entry 14: the answer's call returns the host's fp result bit for bit.
+fn egl_fallback_checks(table: u64, gpa: u64) -> bool {
+    let same = qemu::call(entry(table, 13), &[gpa]);
+    let bits = qemu::call(entry(table, 14), &[gpa]);
+    let want = u64::from(EGL_PATH_LENGTH.to_bits());
+    let verdict = if same == 1 && bits == want {
+        Ok(())
+    } else if same == 0 && bits == 0 {
+        Err("eglGetProcAddress(glGetPathLengthNV) answered NULL: no host libEGL at SYSTEM_LIB (the gate's stage)".to_owned())
+    } else if same == 0 {
+        Err("two answers for glGetPathLengthNV differ (one binding per host address)".to_owned())
+    } else {
+        Err(format!(
+            "glGetPathLengthNV through the answer returned {bits:#x}, want {want:#x}"
+        ))
+    };
+    check('p', verdict)
+}
+
+/// GS2.2 G1 named trap, its own process (`ATL_QEMU_GL_CASE=trap`, check o): entry 15 asks for a name no prototype describes and calls the answer. The trap aborts the process, naming the function; a return is a failure.
+fn egl_trap_run(table: u64, gpa: u64) -> ExitCode {
+    let _ = qemu::call(entry(table, 15), &[gpa]);
+    println!("qemu-gl: (o) FAIL the named trap for glAtlNoDescriptor returned: it did not abort");
+    ExitCode::FAILURE
+}
+
 fn main() -> ExitCode {
     let (Some(so), Some(fixture)) = (
         std::env::var_os("ATL_ENGINE_SO"),
@@ -410,7 +520,27 @@ fn main() -> ExitCode {
     ) {
         return ExitCode::FAILURE;
     }
-    if checks(table) {
+    if std::env::var("ATL_QEMU_GL_CASE").is_ok_and(|c| c == "trap") {
+        return match egl_gpa() {
+            Ok(gpa) => egl_trap_run(table, gpa),
+            Err(e) => {
+                println!("qemu-gl: (o) FAIL {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    let mut ok = checks(table);
+    match egl_gpa() {
+        Ok(gpa) => {
+            ok &= egl_checks(table, gpa);
+            ok &= egl_fallback_checks(table, gpa);
+        }
+        Err(e) => {
+            println!("qemu-gl: (e) FAIL {e}");
+            ok = false;
+        }
+    }
+    if ok {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE

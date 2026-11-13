@@ -23,6 +23,7 @@ mod cts;
 mod cts_report;
 mod drive;
 mod drive_gate;
+mod egl_bridge;
 mod egl_driver;
 mod gdk_dmabuf;
 mod gl_dispatch;
@@ -240,7 +241,7 @@ enum Test {
     QemuJni(qemu_jni::Args),
     /// The engine ABI (QEMU bridge plan Q6-1), both directions: a guest host call's integer lanes, FP lanes and stack words reach the host, and the host's FP answer returns in the guest's v0; `call_ex` puts the host's lanes in the guest's registers and stack, and returns the callee's FP result. The `qa_stack_off`, `qa_v_lane`, `call-stack` and `call-v` breaks must each turn it red. Builds first (as `xtask qemu --pic --execute`); needs no NB images. Logs in `<out>/qemu/<target>-linux-user-pic/qemu-abi/`.
     QemuAbi(qemu_abi::Args),
-    /// GLES2 proxy calls under QEMU (QEMU bridge plan Q7-4): fp arguments, 9-argument calls with the ninth on the guest stack and the fp result reach a host recorder bit for bit, each bound by its QEMU binding-table row. The `v_drop`, `drop_stack` and `ret_int` breaks must each turn it red. Builds first (as `xtask qemu --pic --execute`); needs no NB images. Logs in `<out>/qemu/<target>-linux-user-pic/qemu-gl/`.
+    /// GLES2 proxy calls under QEMU (QEMU bridge plan Q7-4): fp arguments, 9-argument calls with the ninth on the guest stack and the fp result reach a host recorder bit for bit, each bound by its QEMU binding-table row. eglGetProcAddress (GS2.2 G1) answers a row's guest address for its names and NULL for an unknown one. The `v_drop`, `drop_stack`, `ret_int` and `egl_raw` breaks must each turn it red. Builds first (as `xtask qemu --pic --execute`); needs no NB images. Logs in `<out>/qemu/<target>-linux-user-pic/qemu-gl/`.
     QemuGl(qemu_gl::Args),
     /// Static audit of an APK's arm64 imports against the QEMU binding table (QEMU Q7 plan Q7-5): every dynamic undefined symbol of each `lib/arm64-v8a/*.so` is bound (same APK, a Generic/Shim row, guest bionic), trapped (with its reason) or unknown; red when a gated APK (default Cut the Rope 3.63.0) has a trapped or strong unknown import, each printed with its owning slice. `--info` APKs (default the Battle Cats TW arm64 split) are reported only. Executes nothing.
     AppImports(app_imports::Args),
@@ -254,6 +255,8 @@ enum Test {
     ///
     /// Needs what `nb-identity` needs (the x86_64 NB build incl. the guest `libOpenSLES` proxy, `xtask test app`). Logs in `<out>/sles-bridge/`.
     SlesBridge(sles_bridge::Args),
+    /// eglGetProcAddress through the identity engine (GS2.2 G1): an imported GL name equals the answer and the answer's call reaches a host recorder; a table-only name is callable; an unknown name is NULL; two answers for a described name are one address; a name no prototype describes traps by name (its own run). Needs what `nb-identity` needs (the x86_64 NB build incl. the guest `libEGL` and `libGLESv2` proxies, `xtask test app`). Logs in `<out>/egl-bridge/`.
+    EglBridge(egl_bridge::Args),
 }
 
 fn main() -> Result<ExitCode> {
@@ -380,6 +383,9 @@ fn main() -> Result<ExitCode> {
         Command::Test {
             test: Test::SlesBridge(args),
         } => sles_bridge::run(&root, &args),
+        Command::Test {
+            test: Test::EglBridge(args),
+        } => egl_bridge::run(&root, &args),
         Command::CheckStep { step, out } => check_step(&root, step, &out),
     };
     // a run that ends in an error (`?`, bail!) still ends with its verdict line; main prints the error after it
@@ -449,6 +455,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::Crossing(_) => "crossing",
             Test::NbIdentity(_) => "nb-identity",
             Test::SlesBridge(_) => "sles-bridge",
+            Test::EglBridge(_) => "egl-bridge",
         },
         Command::CheckStep { .. } => return None,
     })

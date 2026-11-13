@@ -16,6 +16,8 @@ pub mod jni;
 mod ndk;
 mod netdb;
 pub mod objects;
+/// `eglGetProcAddress` (GS2.2 G1): a row's guest address, or a host answer bound by its descriptor.
+pub mod proc;
 mod provider;
 pub mod qemu;
 pub mod signal;

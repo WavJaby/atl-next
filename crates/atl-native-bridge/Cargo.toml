@@ -106,6 +106,16 @@ harness = false
 name = "sles_recorder"
 crate-type = ["cdylib"]
 
+# GS2.2 G1 gate `egl-bridge`: eglGetProcAddress through the identity engine; checks a, f, b, d, e and the trap run c; run under bwrap by `xtask test egl-bridge`
+[[test]]
+name = "egl_bridge"
+harness = false
+
+# the host recorder `libEGL.so` / `libGLESv2.so` of `egl_bridge` and the `qemu-gl` fallback checks (test library, never staged by `xtask native`)
+[[example]]
+name = "egl_recorder"
+crate-type = ["cdylib"]
+
 [dependencies]
 atl-android-paths = { path = "../atl-android-paths" }
 atl-engine-api = { path = "../atl-engine-api" }
