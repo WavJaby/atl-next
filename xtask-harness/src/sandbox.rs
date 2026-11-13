@@ -3,7 +3,7 @@
 //! Its world: a file in the real $HOME it must not read, a name in $HOME it must not create, its own data dir (/data/user/0/<PACKAGE>) as its only writable mount, and a TCP connect to a loopback listener the gate holds (the sandbox shares the host's loopback).
 //! Pass, both runs: the $HOME file and the new $HOME name refused (ENOENT or EACCES), a write to /usr refused, the own data dir written and read back. The TCP connect is refused without INTERNET and succeeds with it.
 //! The UI baseline grants (each a grant class every UI app gets, not a manifest right), each with one shown and one refused path: the compositor socket (atl_platform_host::app_access::socket_of; a second socket beside it refused), the fontconfig file (config_file_of; a file beside it refused),
-//! the DRM node's sysfs (atl_broker::drm_sysfs over /dev/dri: the device dir's `uevent` read, `/sys/devices/system/cpu/online` refused). Font dirs are not probed: the face dirs fontconfig lists are bound the same way as the file.
+//! the DRM node's sysfs (atl_broker::drm_sysfs over /dev/dri: the device dir's `uevent` read, `/sys/kernel/uevent_seqnum` refused; the CPU topology dir every sandbox shows is judged by `test app`'s cpuProbe row). Font dirs are not probed: the face dirs fontconfig lists are bound the same way as the file.
 //! The TCP judgement needs Landlock ABI >= 4 (the network rights): below it the gate prints the net check as not judged and counts nothing for it. WSL is ABI 3, so the net branch is asserted on the Arch laptop only.
 //! The environment (judge_env): only atl-broker app_env::APP_ENV names, the spawn's own and the sandbox's fixed ones; the broker's HOME must not arrive.
 //! Deliberate breaks, by hand: restore the writable host root in atl-broker `host_root` (every host dir bound rw); `home-read` must then fail. Drop `env_clear` in atl-broker `launch`; the `env:` checks must then fail. The gate removes the two $HOME names it makes.
@@ -47,8 +47,8 @@ const LIMIT: Duration = Duration::from_secs(60);
 const INTERNET: &str = "android.permission.INTERNET";
 /// The DRM nodes the probe gets, as atld's app processes do (atld DRM_DIR).
 const DRM_DIR: &str = "/dev/dri";
-/// A host sysfs file outside every DRM device's dir: the probe must not read it.
-const SYS_OTHER: &str = "/sys/devices/system/cpu/online";
+/// A host sysfs file outside every DRM device's dir and outside atl_broker::CPU_SYSFS: the probe must not read it.
+const SYS_OTHER: &str = "/sys/kernel/uevent_seqnum";
 /// The Landlock ABI that enforces the network rights; below it TCP is not restricted, so the net check is not judged.
 const NET_ABI: u32 = 4;
 /// errno values (asm-generic/errno-base.h) a refusal may carry.

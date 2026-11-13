@@ -315,7 +315,7 @@ fn deferred(isa: &str, host: &str) -> &'static [&'static str] {
 }
 
 /// Every bridge-1 call whose line is missing or wrong (a `deferred` label's line must be `skipped`), then the thread balance.
-fn bridge1_call_failures(app: &str, deferred: &[&str]) -> Vec<String> {
+fn bridge1_call_failures(app: &str, deferred: &[&str], foreign: bool) -> Vec<String> {
     let got = |name: &str| {
         app.lines().find_map(|l| {
             let (_, r) = l.split_once(BRIDGE1_CALL)?;
@@ -350,6 +350,9 @@ fn bridge1_call_failures(app: &str, deferred: &[&str]) -> Vec<String> {
     } else if let Some(why) = first_config_why(got(FIRST_CONFIG).as_deref()) {
         whys.push(format!("bridge1 call {FIRST_CONFIG}: {why}"));
     }
+    if let Some(why) = cpu_probe_why(got(CPU_PROBE).as_deref(), foreign) {
+        whys.push(format!("bridge1 call {CPU_PROBE}: {why}"));
+    }
     if app.contains("called unimplemented OpenGL ES API") {
         whys.push("GL: the front reports an unimplemented OpenGL ES API call".to_owned());
     }
@@ -372,6 +375,101 @@ fn bridge1_call_failures(app: &str, deferred: &[&str]) -> Vec<String> {
     }
     whys
 }
+/// Main.bridge1Calls' cpuProbe row (atl_jni_test.c cpuProbe): `conf C onln O affinity A java J cpuinfo P features F`, judged by [`cpu_probe_why`] against this host's own answers.
+const CPU_PROBE: &str = "cpuProbe";
+/// The host CPU lists an app's counts must equal: Android lets every domain read the whole dir (sepolicy domain.te `r_dir_file(domain, sysfs_devices_system_cpu)`).
+const CPU_POSSIBLE: &str = "/sys/devices/system/cpu/possible";
+const CPU_ONLINE: &str = "/sys/devices/system/cpu/online";
+
+/// The number of CPUs a kernel cpu list names (Documentation/admin-guide/cputopology.rst: `0-3,8,10-11`); None when it does not parse.
+fn cpu_list_count(list: &str) -> Option<usize> {
+    list.trim().split(',').try_fold(0, |n, part| {
+        let (a, b) = part.split_once('-').unwrap_or((part, part));
+        let (a, b): (usize, usize) = (a.parse().ok()?, b.parse().ok()?);
+        (b >= a).then(|| n + b - a + 1)
+    })
+}
+
+/// The features word of a /proc/cpuinfo text, by the fixture's rule: "asimd" from a `Features` line, "sse2" from a `flags` line, else "none".
+fn cpuinfo_features(text: &str) -> &'static str {
+    let mut word = "none";
+    for line in text.lines() {
+        let words = || {
+            line.split_once(':')
+                .map(|(_, w)| w.split_whitespace())
+                .into_iter()
+                .flatten()
+        };
+        if line.starts_with("Features") && words().any(|w| w == "asimd") {
+            word = "asimd";
+        } else if line.starts_with("flags") && words().any(|w| w == "sse2") {
+            word = "sse2";
+        }
+    }
+    word
+}
+
+/// The cpuProbe row's judge. Each count must equal the host's answer to the same question: conf the possible list, onln, java and the cpuinfo `processor` lines the online list, affinity this process's affinity mask (the app inherits atld's, which inherits the gate's).
+/// features: an identity guest sees the host's own cpuinfo (the host's word); a foreign guest (`foreign`, QEMU) must see its own ISA's, so a word that is neither the host's nor "none". `None`: the row passes.
+fn cpu_probe_why(value: Option<&str>, foreign: bool) -> Option<String> {
+    let Some(value) = value else {
+        return Some("no line".to_owned());
+    };
+    let read_count = |p: &str| {
+        std::fs::read_to_string(p)
+            .ok()
+            .as_deref()
+            .and_then(cpu_list_count)
+    };
+    let (Some(possible), Some(online)) = (read_count(CPU_POSSIBLE), read_count(CPU_ONLINE)) else {
+        return Some(format!(
+            "the host's {CPU_POSSIBLE} or {CPU_ONLINE} does not parse"
+        ));
+    };
+    let affinity = match rustix::thread::sched_getaffinity(None) {
+        Ok(set) => (0..rustix::thread::CpuSet::MAX_CPU)
+            .filter(|&i| set.is_set(i))
+            .count(),
+        Err(e) => return Some(format!("the gate's own sched_getaffinity: {e}")),
+    };
+    let host_word = cpuinfo_features(&std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default());
+    let fields: BTreeMap<&str, &str> = value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .chunks(2)
+        .filter_map(|c| Some((*c.first()?, *c.get(1)?)))
+        .collect();
+    let want = [
+        ("conf", possible),
+        ("onln", online),
+        ("java", online),
+        ("cpuinfo", online),
+        ("affinity", affinity),
+    ];
+    let mut wrong: Vec<String> = want
+        .iter()
+        .filter(|&&(k, n)| fields.get(k).and_then(|v| v.parse::<usize>().ok()) != Some(n))
+        .map(|&(k, n)| format!("{k} want {n}"))
+        .collect();
+    let features = fields.get("features").copied().unwrap_or("missing");
+    let features_ok = if foreign {
+        features != host_word && features != "none" && features != "missing"
+    } else {
+        features == host_word
+    };
+    if !features_ok {
+        wrong.push(format!(
+            "features {features:?}: want {} (host's is {host_word:?})",
+            if foreign {
+                "the guest ISA's own word"
+            } else {
+                "the host's"
+            }
+        ));
+    }
+    (!wrong.is_empty()).then(|| format!("{value:?}: {}", wrong.join(", ")))
+}
+
 /// The firstConfig row's judge: its visual (EGL_NATIVE_VISUAL_ID) must be one of [`FIXED_FORMATS`]. The sizes sit in the reason, so a failure shows which config came first. `None`: the row passes.
 fn first_config_why(value: Option<&str>) -> Option<String> {
     let Some(value) = value else {
@@ -890,7 +988,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     let mut es1_compared = None;
     if passed && bridge1_ok {
-        whys.extend(bridge1_call_failures(&app, deferred));
+        whys.extend(bridge1_call_failures(&app, deferred, isa != args.host));
         // sigsegvRecover's fault reaches the fixture's own handler through the bridge (signal.rs guest_handler), which reports it first: the report's only gate in a real app process
         if !deferred.contains(&"sigsegvRecover")
             && !app.lines().any(|l| l.contains(GUEST_FAULT_REPORT))
@@ -1006,6 +1104,32 @@ fn fault(app_log: &str, atld_exited: bool) -> Option<String> {
 mod tests {
     use super::*;
     use crate::window::stamp_text;
+
+    #[test]
+    fn cpu_lists_count_as_the_kernel_documents() {
+        // cputopology.rst's forms: one range, a single cpu, ranges and singles mixed (0-3 = 4, 8 = 1, 10-11 = 2)
+        assert_eq!(cpu_list_count("0-15\n"), Some(16));
+        assert_eq!(cpu_list_count("0"), Some(1));
+        assert_eq!(cpu_list_count("0-3,8,10-11"), Some(7));
+        assert_eq!(cpu_list_count("3-1"), None);
+        assert_eq!(cpu_list_count(""), None);
+    }
+
+    #[test]
+    fn cpuinfo_features_names_the_isa_line() {
+        assert_eq!(
+            cpuinfo_features("processor\t: 0\nFeatures\t: fp asimd evtstrm\n"),
+            "asimd"
+        );
+        assert_eq!(
+            cpuinfo_features("processor\t: 0\nflags\t\t: fpu sse sse2 avx\n"),
+            "sse2"
+        );
+        assert_eq!(
+            cpuinfo_features("processor\t: 0\nflags\t\t: fpu sse\n"),
+            "none"
+        );
+    }
 
     const T: u64 = 1_000_000;
 

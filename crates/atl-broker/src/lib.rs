@@ -831,11 +831,21 @@ fn installer_refusal(spawn: &Spawn) -> Option<&'static str> {
     }
 }
 
-/// What every sandbox shows beyond its caller's mounts: the libraries its loader finds through RUNPATH, the sysfs of its DRM nodes, the trees of its LD_LIBRARY_PATH.
+/// The CPU topology dir, shown read-only to every sandbox: Android lets every domain read it (sepolicy domain.te `r_dir_file(domain, sysfs_devices_system_cpu)`, isolated apps included).
+/// bionic's sysconf(_SC_NPROCESSORS_CONF/ONLN) reads its `possible` / `online` and answers 1 without them (sysinfo.cpp), so an engine sizing its worker pool by them ran one worker.
+pub const CPU_SYSFS: &str = "/sys/devices/system/cpu";
+
+/// What every sandbox shows beyond its caller's mounts: the libraries its loader finds through RUNPATH, the CPU topology ([`CPU_SYSFS`]), the sysfs of its DRM nodes, the trees of its LD_LIBRARY_PATH.
 /// A path the root already shows read-only at the same place, or one already mounted, is dropped.
 fn complete_mounts(spawn: &mut Spawn) -> io::Result<()> {
     // the libraries its loader finds through RUNPATH are part of the program's view (runpath_mounts)
     spawn.mounts.extend(runpath_mounts(&spawn.program)?);
+    // the CPU topology every Android domain reads (CPU_SYSFS)
+    spawn.mounts.push(Mount {
+        host: PathBuf::from(CPU_SYSFS),
+        at: PathBuf::from(CPU_SYSFS),
+        writable: false,
+    });
     // the sysfs of its DRM nodes only (drm_sysfs)
     let (sys_mounts, sys_links) = drm_sysfs(&spawn.devices)?;
     spawn.mounts.extend(sys_mounts);

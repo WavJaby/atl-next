@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 // bridge-1 fixture, C side. Uses the bionic-only surface on purpose (errno through __errno, bionic pthread/dlopen, __thread) so a glibc host cannot satisfy it.
 // Java side: xtask-harness/testdata/app/java/atl/bridge1/testlib/AtlJniTest.java. C++ side: atl_jni_cxx.cpp. Built by xtask-harness/src/jni_fixture.rs.
+// bionic declares cpu_set_t / sched_getaffinity under _GNU_SOURCE (sched.h __USE_GNU)
+#define _GNU_SOURCE
 #include <android/asset_manager.h>
 #include <android/asset_manager_jni.h>
 #include <android/bitmap.h>
@@ -20,6 +22,7 @@
 #include <sys/socket.h>
 #include <jni.h>
 #include <pthread.h>
+#include <sched.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stdint.h>
@@ -650,6 +653,42 @@ JNI_FN(jint, mediandkLinked)(JNIEnv *env, jclass cls)
 {
     AMediaFormat *(*volatile f)(void) = AMediaFormat_new;
     return f != NULL;
+}
+
+// AtlJniTest.cpuProbe (ab2-load): every route app code counts CPUs by, as bionic answers it in this process. sysconf CONF/ONLN = get_nprocs_conf/get_nprocs (bionic sysconf.cpp; those two are API 23, above the fixture's level), which read /sys/devices/system/cpu/{possible,online} (bionic sysinfo.cpp: 1 when the file is missing); affinity = CPU_COUNT of sched_getaffinity; cpuinfo = the `processor` lines of /proc/cpuinfo;
+// features = "asimd" when a `Features` line lists asimd (an arm64 kernel's, or QEMU's synthesised one), "sse2" when a `flags` line lists sse2 (x86), else "none". `java` is the caller's Runtime.availableProcessors.
+static int cpu_word_in(const char *line, const char *word)
+{
+    size_t n = strlen(word);
+    for (const char *p = strstr(line, word); p != NULL; p = strstr(p + 1, word)) {
+        if ((p == line || p[-1] == ' ' || p[-1] == '\t' || p[-1] == ':') && (p[n] == ' ' || p[n] == '\n' || p[n] == '\0'))
+            return 1;
+    }
+    return 0;
+}
+
+JNI_FN(jstring, cpuProbe)(JNIEnv *env, jclass cls, jint java)
+{
+    cpu_set_t set;
+    int affinity = sched_getaffinity(0, sizeof set, &set) == 0 ? CPU_COUNT(&set) : -1;
+    int processors = 0;
+    const char *features = "none";
+    FILE *f = fopen("/proc/cpuinfo", "re");
+    if (f != NULL) {
+        char line[4096];
+        while (fgets(line, sizeof line, f) != NULL) {
+            if (strncmp(line, "processor", 9) == 0)
+                processors++;
+            else if (strncmp(line, "Features", 8) == 0 && cpu_word_in(line, "asimd"))
+                features = "asimd";
+            else if (strncmp(line, "flags", 5) == 0 && cpu_word_in(line, "sse2"))
+                features = "sse2";
+        }
+        fclose(f);
+    }
+    char out[160];
+    snprintf(out, sizeof out, "conf %ld onln %ld affinity %d java %d cpuinfo %d features %s", sysconf(_SC_NPROCESSORS_CONF), sysconf(_SC_NPROCESSORS_ONLN), affinity, (int)java, processors, features);
+    return (*env)->NewStringUTF(env, out);
 }
 
 // AtlJniTest.resolverProbe (net-bp, engine/netdb.rs): the libc resolver family through the bridge, every answer read in bionic's layout and values. Fields: numeric 1 (AF_INET 127.0.0.1:80, one node, no canonical name); passive 1 (AI_PASSIVE null host, 0.0.0.0:8080); service = EAI_SERVICE (9); numerichost = EAI_NONAME (8, AI_NUMERICHOST on a name); text 1 (gai_strerror of EAI_NODATA and EAI_NONAME is bionic's); loop 1000 (1000 numeric lookups, each read back and freed); list ok (AF_UNSPEC passive list walked and freed, its length host-dependent, not printed); herr 1 (h_errno set to 77, then a failed gethostbyname of the unresolvable name leaves HOST_NOT_FOUND or TRY_AGAIN in it; a name that resolves here reads 0, so a DNS that answers every name fails this field). The getaddrinfo answer for the unresolvable name is logged, not gated: its code depends on the sandbox network.

@@ -149,6 +149,9 @@ public final class AtlJniTest {
     /** G6b: 1 when the library's DT_NEEDED libmediandk.so proxy loaded and AMediaFormat_new resolved (atl_jni_test.c mediandkLinked). */
     public static native int mediandkLinked();
 
+    /** ab2-load: the CPU count by every native route plus the caller's Runtime.availableProcessors, and the /proc/cpuinfo features word (atl_jni_test.c cpuProbe). */
+    public static native String cpuProbe(int java);
+
     /** net-bp: the libc resolver family through the bridge, one line of checks (atl_jni_test.c resolverProbe). */
     public static native String resolverProbe();
 
