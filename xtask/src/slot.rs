@@ -453,6 +453,8 @@ pub enum Step {
     Mkdir(PathBuf),
     /// Move a checkout's own real `target/` into an empty slot target, keeping its build.
     Adopt { from: PathBuf, to: PathBuf },
+    /// Remove a checkout's own real `target/` that is on another filesystem than its slot: rename cannot cross (EXDEV), and copying a 10-30 GB build onto a slot disk costs more than cargo's rebuild.
+    Discard(PathBuf),
     /// Remove a checkout's own real `target/`: its slot's target exists already.
     Remove(PathBuf),
     /// Remove an executable a live displaced holder built: it embeds `checkout`'s absolute paths (`CARGO_BIN_EXE_*`, `CARGO_MANIFEST_DIR`), and cargo may reuse it as fresh for the new holder, which then runs the other checkout's binaries.
@@ -571,6 +573,7 @@ fn link_steps(link: &Path, want: &Path) -> Result<Vec<Step>> {
         }
         Entry::Absent | Entry::Link(_) => vec![relink],
         Entry::Dir if want.exists() => vec![Step::Remove(link.to_owned()), relink],
+        Entry::Dir if !same_filesystem(link, want)? => vec![Step::Discard(link.to_owned()), relink],
         Entry::Dir => vec![
             Step::Adopt {
                 from: link.to_owned(),
@@ -582,6 +585,21 @@ fn link_steps(link: &Path, want: &Path) -> Result<Vec<Step>> {
     })
 }
 
+/// Whether `dir` and `want` (missing: its nearest existing ancestor, where it will be created) are on one filesystem, i.e. a rename between them works.
+fn same_filesystem(dir: &Path, want: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let dev = |p: &Path| {
+        std::fs::metadata(p)
+            .map(|m| m.dev())
+            .with_context(|| format!("reading {}", p.display()))
+    };
+    let existing = want
+        .ancestors()
+        .find(|p| p.exists())
+        .unwrap_or(Path::new("/"));
+    Ok(dev(dir)? == dev(existing)?)
+}
+
 /// Runs `steps` in order. Callers plan them with `target_steps` first; this is the only place they change anything.
 pub fn apply_steps(steps: &[Step]) -> Result<()> {
     for step in steps {
@@ -589,7 +607,7 @@ pub fn apply_steps(steps: &[Step]) -> Result<()> {
             Step::Unlink(p) => {
                 std::fs::remove_file(p).with_context(|| format!("unlinking {}", p.display()))?;
             }
-            Step::Wipe(p) | Step::Remove(p) => {
+            Step::Wipe(p) | Step::Remove(p) | Step::Discard(p) => {
                 std::fs::remove_dir_all(p).with_context(|| format!("removing {}", p.display()))?;
             }
             Step::Mkdir(p) => {
@@ -635,6 +653,10 @@ pub fn describe_step(step: &Step) -> String {
             )
         }
         Step::Remove(p) => format!("remove {} (its slot's target exists)", p.display()),
+        Step::Discard(p) => format!(
+            "remove {} (on another filesystem than the slot: cannot be moved; cargo rebuilds it)",
+            p.display()
+        ),
         Step::Drop { file, checkout } => format!(
             "remove {} (embeds {}'s paths; cargo could reuse it as fresh)",
             file.display(),
@@ -1067,6 +1089,41 @@ mod tests {
             entry(&root.join(TARGET)).expect("entry"),
             Entry::Link(slot_target(&ws, 1))
         );
+        std::fs::remove_dir_all(ws.parent().expect("scratch")).expect("cleanup");
+    }
+
+    /// The slot on another filesystem (a slot disk, here /dev/shm's tmpfs under a link, like `out/slot-5` on its own mount): the own target is removed, not renamed (EXDEV, os error 18).
+    #[test]
+    fn an_own_real_target_on_another_filesystem_is_discarded() {
+        let (ws, root) = fixture("link-xdev");
+        let disk =
+            PathBuf::from("/dev/shm").join(format!("xtask-slot-xdev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&disk);
+        std::fs::create_dir_all(&disk).expect("slot disk");
+        std::os::unix::fs::symlink(&disk, slot_dir(&ws, 1)).expect("slot link");
+        put(&root.join(TARGET).join("own.txt"));
+        assert!(
+            !same_filesystem(&root.join(TARGET), &slot_target(&ws, 1)).expect("dev"),
+            "fixture: /dev/shm shares the scratch filesystem, the case is not exercised"
+        );
+        let steps = target_steps(&root, &ws, 1, None, &[]).expect("steps");
+        assert_eq!(
+            steps,
+            vec![
+                Step::Discard(root.join(TARGET)),
+                Step::Link {
+                    at: root.join(TARGET),
+                    to: slot_target(&ws, 1),
+                },
+            ]
+        );
+        apply_steps(&steps).expect("apply");
+        assert!(disk.join(TARGET).is_dir());
+        assert_eq!(
+            entry(&root.join(TARGET)).expect("entry"),
+            Entry::Link(slot_target(&ws, 1))
+        );
+        std::fs::remove_dir_all(&disk).expect("cleanup disk");
         std::fs::remove_dir_all(ws.parent().expect("scratch")).expect("cleanup");
     }
 
