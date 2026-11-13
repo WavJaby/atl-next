@@ -311,6 +311,8 @@ const GLIBC: &[(&str, &str)] = &[
     ("pthread_setspecific", "pthread_setspecific"),
     // struct hostent is the same in bionic and glibc (engine/netdb.rs layout gate); the answer is glibc's static storage, as bionic's is its own. h_errno stays glibc's: the guest's h_errno is not set
     ("gethostbyname", "gethostbyname"),
+    // same class: same prototype in both libcs (address bytes, length, type; AF_INET = 2 in both), same hostent storage; h_errno as above
+    ("gethostbyaddr", "gethostbyaddr"),
 ];
 
 /// The provider's soname, as cargo-c names a cdylib (`lib<crate>.so.<v>`): `<v>` is the version's semver-compatible prefix -- the major from 1.0, `0.<minor>` below it, the whole `0.0.<patch>` below that (measured: `libatl_bionic.so.0.0.0`, readelf SONAME). Read from atl-bionic's own manifest so a version bump moves it.

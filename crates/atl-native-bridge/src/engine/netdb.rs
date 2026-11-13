@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Host sides of the guest resolver stubs (QEMU table, build.rs `QEMU_SHIMS`): bionic's `struct addrinfo` swaps `ai_canonname` and `ai_addr` against glibc's, and every AI_ / NI_ / EAI_ value differs (bionic netdb.h vs glibc netdb.h), so each call converts. The bionic side is generated from bionic's netdb.h (thread.rs `layout::qemu`), the glibc side is the libc crate; both gated below.
-//! `struct hostent` is the same in both: `gethostbyname` is a plain glibc row (build.rs `GLIBC`), gated here.
+//! `struct hostent` is the same in both: `gethostbyname` and `gethostbyaddr` are plain glibc rows (build.rs `GLIBC`), gated here.
 //! `sockaddr` passes through: the kernel's layout, the same for both libcs.
 
 use std::collections::HashSet;

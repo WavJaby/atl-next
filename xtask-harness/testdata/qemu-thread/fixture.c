@@ -333,7 +333,7 @@ static int qt_is_loopback(const void *p) {
     return b[0] == qt_loopback[0] && b[1] == qt_loopback[1] && b[2] == qt_loopback[2] && b[3] == qt_loopback[3];
 }
 
-// Returns 0 when every field matched, else a bit per failed step: 1 getaddrinfo rc, 2 family / socktype / protocol, 3 addrlen, 4 sockaddr (port, address), 5 canonname, 6 getnameinfo rc, 7 its host / service text, 8 gethostbyname fields.
+// Returns 0 when every field matched, else a bit per failed step: 1 getaddrinfo rc, 2 family / socktype / protocol, 3 addrlen, 4 sockaddr (port, address), 5 canonname, 6 getnameinfo rc, 7 its host / service text, 8 gethostbyname fields, 9 gethostbyaddr(127.0.0.1) fields.
 long qt_resolve(void) {
     long bad = 0;
     struct addrinfo hints = {0};
@@ -370,6 +370,11 @@ long qt_resolve(void) {
     struct hostent *he = gethostbyname("127.0.0.1");
     if (!he || he->h_addrtype != AF_INET || he->h_length != 4 || !he->h_addr_list || !he->h_addr_list[0] || !qt_is_loopback(he->h_addr_list[0])) {
         bad |= 1L << 8;
+    }
+    // reverse lookup of the loopback address: /etc/hosts names it (glibc's files source), in bionic's hostent layout
+    he = gethostbyaddr(qt_loopback, sizeof qt_loopback, AF_INET);
+    if (!he || he->h_addrtype != AF_INET || he->h_length != 4 || !he->h_name || !he->h_name[0] || !he->h_addr_list || !he->h_addr_list[0] || !qt_is_loopback(he->h_addr_list[0])) {
+        bad |= 1L << 9;
     }
     return bad;
 }
