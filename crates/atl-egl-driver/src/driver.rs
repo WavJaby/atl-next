@@ -6,7 +6,7 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_void};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -94,6 +94,9 @@ host_table!(
         glIsEnabled,
         glEnable,
         glDisable,
+        glReadPixels,
+        glPixelStorei,
+        glBindBuffer,
     }
 );
 
@@ -128,6 +131,16 @@ impl Orientation {
         let f = unsafe { std::mem::transmute::<*const c_void, g::glFramebufferParameteriMESA>(p) };
         (Self::FlipY(f), "flip_y (GL_MESA_framebuffer_flip_y)")
     }
+}
+
+/// How a finished frame reaches the window buffer; orthogonal to [`Orientation`], which says how framebuffer 0 holds it top-down.
+/// One concept, two capability tiers, chosen once per process by `surface.rs` `probe_destination` on the first window buffer (can this device render into gralloc's buffer?), never by device or driver name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Destination {
+    /// Baseline, the reference: the buffer's dma-buf is imported as an EGLImage and rendered (FlipY) or blitted (Blit) into on the device.
+    Import,
+    /// The device cannot render into the allocator's buffers (no dma-buf import, or no complete FBO on it): framebuffer 0 is private GPU storage and swap reads the frame back into the buffer's own CPU mapping (`glReadPixels`, synchronous, so no fence follows).
+    Readback,
 }
 
 /// Host display extensions passed on: what holds unchanged for the driver's own objects too (images, syncs, contexts, surfaceless).
@@ -168,6 +181,10 @@ pub struct Driver {
     pub native_fence: bool,
     /// The orientation tier window surfaces run, probed once at load.
     pub orientation: Orientation,
+    /// The destination tier, set by the first window buffer's probe (`surface.rs` `probe_destination`).
+    pub destination: OnceLock<Destination>,
+    /// Frames queued through the `Readback` tier: the counter of that tier.
+    pub readback_frames: AtomicU64,
     extensions: CString,
     /// Window surfaces by handle (the boxed surface's address).
     pub surfaces: Mutex<HashMap<usize, Arc<Mutex<WindowSurface>>>>,
@@ -237,6 +254,8 @@ impl Driver {
             gl,
             native_fence,
             orientation,
+            destination: OnceLock::new(),
+            readback_frames: AtomicU64::new(0),
             extensions: CString::new(ext.join(" "))?,
             surfaces: Mutex::new(HashMap::new()),
             seen_contexts: Mutex::new(HashSet::new()),

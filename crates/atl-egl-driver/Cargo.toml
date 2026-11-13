@@ -17,6 +17,7 @@ crate-type = ["cdylib", "rlib"]
 anyhow.workspace = true
 atl-egl-host = { path = "../atl-egl-host" }
 atl-gralloc = { path = "../atl-gralloc" }
+atl-gralloc-dmabuf = { path = "../atl-gralloc-dmabuf" }
 libloading.workspace = true
 rustix.workspace = true
 

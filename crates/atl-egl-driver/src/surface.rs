@@ -7,19 +7,25 @@
 //! - `Blit` tier: framebuffer 0 is a per-context back FBO (colour + depth/stencil, rendering bottom-up as GL does); swap blits it into the buffer's colour-only FBO with y inverted. Cost: one full-surface copy per frame + one colour renderbuffer per context.
 //!
 //! Damage rects the fronts convert assuming top-down buffers are then right as they are.
+//! Destination (driver.rs `Destination`), probed once per process on the first buffer: `Import` renders/blits into the imported buffer as above; `Readback` keeps framebuffer 0 as the private back FBO on either orientation and swap copies the frame into the buffer's CPU mapping with `glReadPixels`.
+//! - Readback + FlipY: the back FBO renders top-down (flip-y); a second FBO on the same colour renderbuffer without flip-y is read, so the rows come out top-down.
+//! - Readback + Blit: the back FBO renders bottom-up; swap blits it y-inverted into a staging renderbuffer, which is read.
 
 use std::collections::HashMap;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::sync::atomic::Ordering;
 
 use atl_egl_host::{DmabufPlane, Image};
+use atl_gralloc::format::{DRM_FORMAT_ABGR8888, DRM_FORMAT_XBGR8888};
 use atl_gralloc::handle::{FD_DMABUF, Params};
 use atl_gralloc::usage;
+use atl_gralloc_dmabuf::{Mapping, SYNC_WRITE, begin_cpu_access, end_cpu_access};
 use rustix::event::{PollFd, PollFlags, poll};
 
 use crate::abi::egl as e;
 use crate::abi::gles as g;
 use crate::abi::window as w;
-use crate::driver::{Driver, Orientation};
+use crate::driver::{Destination, Driver, Orientation};
 use crate::window::{Buffer, Window};
 
 /// A host image the surface owns.
@@ -34,12 +40,25 @@ struct Target {
     texture: u32,
 }
 
-/// `Blit` tier: a context's framebuffer 0 at one size.
+/// `Blit` or `Readback` tier: a context's framebuffer 0 at one size.
 struct Back {
     fbo: u32,
     color: u32,
+    /// `Readback`: the FBO `glReadPixels` reads, holding the frame top-down (0 on `Import`).
+    read: u32,
+    /// `Readback` + `Blit`: the colour renderbuffer of `read`, the y-inverted copy's destination (0 otherwise; on FlipY `read` shares `color`).
+    staging: u32,
     width: i32,
     height: i32,
+}
+
+/// `Readback` tier: one buffer's CPU mapping.
+struct Mapped {
+    map: Mapping,
+    /// The buffer's dma-buf (a dup), for DMA_BUF_IOCTL_SYNC around each write.
+    fd: OwnedFd,
+    /// Row pitch in bytes.
+    pitch: u32,
 }
 
 pub struct WindowSurface {
@@ -51,6 +70,7 @@ pub struct WindowSurface {
     pub width: i32,
     pub height: i32,
     images: HashMap<u64, OwnedImage>,
+    maps: HashMap<u64, Mapped>,
     targets: HashMap<(usize, u64), Target>,
     depth: HashMap<usize, (u32, i32, i32)>,
     backs: HashMap<usize, Back>,
@@ -77,6 +97,7 @@ impl WindowSurface {
             width: 0,
             height: 0,
             images: HashMap::new(),
+            maps: HashMap::new(),
             targets: HashMap::new(),
             depth: HashMap::new(),
             backs: HashMap::new(),
@@ -124,8 +145,30 @@ impl WindowSurface {
         }
         let h = buf.handle().ok_or(e::EGL_BAD_NATIVE_WINDOW)?;
         let p = Params::from_handle(h.fds.len(), h.ints).map_err(|_| e::EGL_BAD_NATIVE_WINDOW)?;
-        if let std::collections::hash_map::Entry::Vacant(slot) = self.images.entry(p.id) {
-            slot.insert(OwnedImage(import(d, &p, h.fds[FD_DMABUF])?));
+        let fd = h.fds[FD_DMABUF];
+        let destination = match d.destination.get() {
+            Some(&dest) => dest,
+            None => {
+                let (dest, image) = probe_destination(d, &p, fd);
+                // another thread's surface may have probed first: its result stands, and an image this probe imported is still valid for this buffer
+                let dest = *d.destination.get_or_init(|| dest);
+                if let (Destination::Import, Some(image)) = (dest, image) {
+                    self.images.insert(p.id, OwnedImage(image));
+                }
+                dest
+            }
+        };
+        match destination {
+            Destination::Import => {
+                if let std::collections::hash_map::Entry::Vacant(slot) = self.images.entry(p.id) {
+                    slot.insert(OwnedImage(import(d, &p, fd)?));
+                }
+            }
+            Destination::Readback => {
+                if let std::collections::hash_map::Entry::Vacant(slot) = self.maps.entry(p.id) {
+                    slot.insert(map_buffer(&p, fd)?);
+                }
+            }
         }
         (self.width, self.height) = (buf.width(), buf.height());
         self.current = Some((buf, p.id));
@@ -135,9 +178,11 @@ impl WindowSurface {
     /// Makes the held buffer (dequeued now if needed) the draw target of the current context `ctx`; returns the FBO now standing for framebuffer 0.
     pub fn bind(&mut self, d: &'static Driver, ctx: usize) -> Result<u32, EglError> {
         let id = self.ensure_buffer(d)?;
-        let fbo = match d.orientation {
-            Orientation::FlipY(_) => self.buffer_fbo(d, ctx, id)?,
-            Orientation::Blit => self.back(d, ctx)?,
+        let fbo = match (destination(d), d.orientation) {
+            (Destination::Import, Orientation::FlipY(_)) => self.buffer_fbo(d, ctx, id)?,
+            (Destination::Import, Orientation::Blit) | (Destination::Readback, _) => {
+                self.back(d, ctx)?
+            }
         };
         // SAFETY: `fbo` is a framebuffer of the context current on this thread.
         unsafe { (d.gl.glBindFramebuffer)(g::GL_FRAMEBUFFER as u32, fbo) };
@@ -165,7 +210,7 @@ impl WindowSurface {
         Ok(fbo)
     }
 
-    /// `Blit` tier: the context's back FBO at the current size (remade on a resize), with the depth/stencil renderbuffer when the config has one.
+    /// `Blit` / `Readback` tier: the context's back FBO at the current size (remade on a resize), with the depth/stencil renderbuffer when the config has one; on `Readback` also the FBO swap reads (module doc).
     fn back(&mut self, d: &'static Driver, ctx: usize) -> Result<u32, EglError> {
         let (w, h) = (self.width, self.height);
         if let Some(b) = self.backs.get(&ctx) {
@@ -197,11 +242,20 @@ impl WindowSurface {
             attach_depth(d, depth);
             (gl.glCheckFramebufferStatus)(g::GL_FRAMEBUFFER as u32)
         };
-        let b = Back {
+        let mut b = Back {
             fbo,
             color,
+            read: 0,
+            staging: 0,
             width: w,
             height: h,
+        };
+        let status = if status == g::GL_FRAMEBUFFER_COMPLETE as u32
+            && destination(d) == Destination::Readback
+        {
+            readback_fbos(d, &mut b)
+        } else {
+            status
         };
         if status != g::GL_FRAMEBUFFER_COMPLETE as u32 {
             log(&format!(
@@ -214,43 +268,75 @@ impl WindowSurface {
         Ok(fbo)
     }
 
+    /// `Readback` tier, at swap: the frame into the held buffer's CPU mapping, top-down, through `glReadPixels` (returns once the GPU finished, so the buffer needs no fence). The app's pack state and pixel-pack buffer are restored; framebuffer bindings are left to the caller's rebind.
+    fn read_back(&mut self, d: &'static Driver, ctx: usize) -> Result<(), EglError> {
+        let id = self.ensure_buffer(d)?;
+        self.back(d, ctx)?;
+        let (w, h) = (self.width, self.height);
+        let b = &self.backs[&ctx];
+        if let Orientation::Blit = d.orientation {
+            blit_flipped(d, b.fbo, b.read, w, h);
+        }
+        let m = &self.maps[&id];
+        let gl = &d.gl;
+        let pack = [
+            g::GL_PACK_ROW_LENGTH,
+            g::GL_PACK_SKIP_ROWS,
+            g::GL_PACK_SKIP_PIXELS,
+            g::GL_PACK_ALIGNMENT,
+        ];
+        // RGBA_8888 / RGBX_8888 rows: 4 bytes per pixel (map_buffer admits no other format)
+        let ours = [(m.pitch / 4) as i32, 0, 0, 4];
+        let mut saved = [0; 4];
+        let mut pbo = 0;
+        begin_cpu_access(m.fd.as_fd(), SYNC_WRITE).map_err(|err| {
+            log(&format!(
+                "readback: dma-buf sync start failed ({err}), EGL_BAD_ALLOC"
+            ));
+            e::EGL_BAD_ALLOC
+        })?;
+        // SAFETY: the current context; `read` is its complete FBO of size w x h; the mapping holds pitch x h bytes (map_buffer) and a row of w pixels fits in pitch (gralloc's layout), so the write stays inside it; every pack parameter and the pack buffer binding are restored.
+        unsafe {
+            (gl.glGetIntegerv)(g::GL_PIXEL_PACK_BUFFER_BINDING as u32, &mut pbo);
+            (gl.glBindBuffer)(g::GL_PIXEL_PACK_BUFFER as u32, 0);
+            for ((&p, v), s) in pack.iter().zip(ours).zip(saved.iter_mut()) {
+                (gl.glGetIntegerv)(p as u32, s);
+                (gl.glPixelStorei)(p as u32, v);
+            }
+            (gl.glBindFramebuffer)(g::GL_READ_FRAMEBUFFER as u32, b.read);
+            // the `no_readback` break (build.rs `BREAKS`): the buffer keeps what it held before this frame
+            if !cfg!(atl_egl_no_readback) {
+                (gl.glReadPixels)(
+                    0,
+                    0,
+                    w,
+                    h,
+                    g::GL_RGBA as u32,
+                    g::GL_UNSIGNED_BYTE as u32,
+                    m.map.as_ptr().cast(),
+                );
+            }
+            for (&p, s) in pack.iter().zip(saved) {
+                (gl.glPixelStorei)(p as u32, s);
+            }
+            (gl.glBindBuffer)(g::GL_PIXEL_PACK_BUFFER as u32, pbo as u32);
+        }
+        end_cpu_access(m.fd.as_fd(), SYNC_WRITE).map_err(|err| {
+            log(&format!(
+                "readback: dma-buf sync end failed ({err}), EGL_BAD_ALLOC"
+            ));
+            e::EGL_BAD_ALLOC
+        })?;
+        d.readback_frames.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// `Blit` tier, at swap: the back FBO into the held buffer, y inverted, so the buffer's row 0 is GL's top row. Leaves both framebuffer bindings to the caller's rebind.
     fn flip_into_buffer(&mut self, d: &'static Driver, ctx: usize) -> Result<(), EglError> {
         let id = self.ensure_buffer(d)?;
         let src = self.back(d, ctx)?;
         let dst = self.buffer_fbo(d, ctx, id)?;
-        let (w, h) = (self.width, self.height);
-        // the `no_blit_flip` break (build.rs `BREAKS`): the copy keeps GL's bottom-up rows
-        let (y0, y1) = if cfg!(atl_egl_no_blit_flip) {
-            (0, h)
-        } else {
-            (h, 0)
-        };
-        let gl = &d.gl;
-        // SAFETY: the current context; both FBOs are its own and complete; the app's scissor test (the one fragment state a blit obeys) is restored.
-        unsafe {
-            let scissor = (gl.glIsEnabled)(g::GL_SCISSOR_TEST as u32) != 0;
-            if scissor {
-                (gl.glDisable)(g::GL_SCISSOR_TEST as u32);
-            }
-            (gl.glBindFramebuffer)(g::GL_READ_FRAMEBUFFER as u32, src);
-            (gl.glBindFramebuffer)(g::GL_DRAW_FRAMEBUFFER as u32, dst);
-            (gl.glBlitFramebuffer)(
-                0,
-                0,
-                w,
-                h,
-                0,
-                y0,
-                w,
-                y1,
-                g::GL_COLOR_BUFFER_BIT as u32,
-                g::GL_NEAREST as u32,
-            );
-            if scissor {
-                (gl.glEnable)(g::GL_SCISSOR_TEST as u32);
-            }
-        }
+        blit_flipped(d, src, dst, self.width, self.height);
         Ok(())
     }
 
@@ -303,10 +389,16 @@ impl WindowSurface {
             // a swap with nothing drawn still presents a buffer (EGL: contents undefined)
             self.ensure_buffer(d)?;
         }
-        if let Orientation::Blit = d.orientation {
+        let readback = destination(d) == Destination::Readback;
+        if readback {
+            self.read_back(d, ctx)?;
+        } else if let Orientation::Blit = d.orientation {
             self.flip_into_buffer(d, ctx)?;
         }
-        let fence = if d.native_fence {
+        let fence = if readback {
+            // glReadPixels returned with the frame in memory: nothing left for the consumer to wait on
+            None
+        } else if d.native_fence {
             Some(d.display.export_fence().map_err(|err| {
                 log(&format!(
                     "swap: native fence export failed ({err}), EGL_BAD_ALLOC"
@@ -515,11 +607,173 @@ fn target(
 }
 
 fn delete_back(d: &'static Driver, b: &Back) {
-    // SAFETY: names of the current context, deleted once.
+    // SAFETY: names of the current context, deleted once; 0 names are ignored by GL.
     unsafe {
         (d.gl.glDeleteFramebuffers)(1, &b.fbo);
         (d.gl.glDeleteRenderbuffers)(1, &b.color);
+        (d.gl.glDeleteFramebuffers)(1, &b.read);
+        (d.gl.glDeleteRenderbuffers)(1, &b.staging);
     }
+}
+
+/// The destination tier; set before any surface binds (`ensure_buffer` probes first).
+fn destination(d: &Driver) -> Destination {
+    *d.destination
+        .get()
+        .expect("ensure_buffer probes the destination before any bind or swap")
+}
+
+/// `src` into `dst` (both complete FBOs of the current context, w x h), y inverted, colour only. Leaves both framebuffer bindings to the caller's rebind.
+fn blit_flipped(d: &'static Driver, src: u32, dst: u32, w: i32, h: i32) {
+    // the `no_blit_flip` break (build.rs `BREAKS`): the copy keeps GL's bottom-up rows
+    let (y0, y1) = if cfg!(atl_egl_no_blit_flip) {
+        (0, h)
+    } else {
+        (h, 0)
+    };
+    let gl = &d.gl;
+    // SAFETY: the current context; both FBOs are its own and complete; the app's scissor test (the one fragment state a blit obeys) is restored.
+    unsafe {
+        let scissor = (gl.glIsEnabled)(g::GL_SCISSOR_TEST as u32) != 0;
+        if scissor {
+            (gl.glDisable)(g::GL_SCISSOR_TEST as u32);
+        }
+        (gl.glBindFramebuffer)(g::GL_READ_FRAMEBUFFER as u32, src);
+        (gl.glBindFramebuffer)(g::GL_DRAW_FRAMEBUFFER as u32, dst);
+        (gl.glBlitFramebuffer)(
+            0,
+            0,
+            w,
+            h,
+            0,
+            y0,
+            w,
+            y1,
+            g::GL_COLOR_BUFFER_BIT as u32,
+            g::GL_NEAREST as u32,
+        );
+        if scissor {
+            (gl.glEnable)(g::GL_SCISSOR_TEST as u32);
+        }
+    }
+}
+
+/// `Readback` tier: completes `b` (its FBO bound, colour attached and complete) with the FBO swap reads. FlipY: `b` renders top-down and `read` is a second FBO on the same colour renderbuffer without flip-y, whose row 0 is the frame's top row. Blit: `read` gets its own colour renderbuffer, the y-inverted copy's destination.
+/// Returns the status of the last FBO checked; on failure the names made so far are in `b`, for delete_back. Leaves `b.fbo` bound, the renderbuffer binding restored.
+fn readback_fbos(d: &'static Driver, b: &mut Back) -> u32 {
+    let gl = &d.gl;
+    let mut prev = 0;
+    // SAFETY: the current context with `b.fbo` bound; name slots; the renderbuffer binding restored (the app's state).
+    unsafe {
+        let color = match d.orientation {
+            Orientation::FlipY(set) => {
+                set(
+                    g::GL_FRAMEBUFFER as u32,
+                    g::GL_FRAMEBUFFER_FLIP_Y_MESA as u32,
+                    1,
+                );
+                b.color
+            }
+            Orientation::Blit => {
+                (gl.glGetIntegerv)(g::GL_RENDERBUFFER_BINDING as u32, &mut prev);
+                (gl.glGenRenderbuffers)(1, &mut b.staging);
+                (gl.glBindRenderbuffer)(g::GL_RENDERBUFFER as u32, b.staging);
+                (gl.glRenderbufferStorage)(
+                    g::GL_RENDERBUFFER as u32,
+                    g::GL_RGBA8 as u32,
+                    b.width,
+                    b.height,
+                );
+                (gl.glBindRenderbuffer)(g::GL_RENDERBUFFER as u32, prev as u32);
+                b.staging
+            }
+        };
+        (gl.glGenFramebuffers)(1, &mut b.read);
+        (gl.glBindFramebuffer)(g::GL_FRAMEBUFFER as u32, b.read);
+        (gl.glFramebufferRenderbuffer)(
+            g::GL_FRAMEBUFFER as u32,
+            g::GL_COLOR_ATTACHMENT0 as u32,
+            g::GL_RENDERBUFFER as u32,
+            color,
+        );
+        let status = (gl.glCheckFramebufferStatus)(g::GL_FRAMEBUFFER as u32);
+        (gl.glBindFramebuffer)(g::GL_FRAMEBUFFER as u32, b.fbo);
+        status
+    }
+}
+
+/// The destination tier of this process, probed on its first window buffer `p` (dma-buf `fd`): the buffer imports as an EGLImage and is a complete FBO colour attachment on this device -> `Import` (the image returned for reuse); else `Readback`. One log line names the tier and why.
+/// The `force_import` break (build.rs `BREAKS`): `Import` without probing, so a device that cannot import fails at the first import instead.
+fn probe_destination(
+    d: &'static Driver,
+    p: &Params,
+    fd: i32,
+) -> (Destination, Option<Image<'static>>) {
+    let (dest, why, image) = if cfg!(atl_egl_force_import) {
+        (
+            Destination::Import,
+            "forced, break force_import".to_owned(),
+            None,
+        )
+    } else {
+        match import(d, p, fd) {
+            Err(err) => (
+                Destination::Readback,
+                format!("this device cannot import gralloc's buffer, EGL error {err:#x}"),
+                None,
+            ),
+            Ok(image) => match target(d, image.raw(), 0, None) {
+                Ok(t) => {
+                    delete_target(d, &t);
+                    (
+                        Destination::Import,
+                        "gralloc's buffer imports and renders on this device".to_owned(),
+                        Some(image),
+                    )
+                }
+                Err(err) => (
+                    Destination::Readback,
+                    format!(
+                        "gralloc's buffer imports but is no complete framebuffer, EGL error {err:#x}"
+                    ),
+                    None,
+                ),
+            },
+        }
+    };
+    let name = match dest {
+        Destination::Import => "import",
+        Destination::Readback => "readback",
+    };
+    log(&format!("buffer tier {name} ({why})"));
+    (dest, image)
+}
+
+/// `Readback` tier: a CPU mapping of buffer `p` (dma-buf `fd`) to write frames into. Only what `glReadPixels(GL_RGBA, GL_UNSIGNED_BYTE)` writes byte-exact is admitted: RGBA_8888 / RGBX_8888 memory (DRM ABGR8888 / XBGR8888) in LINEAR layout; anything else is refused named, EGL_BAD_MATCH.
+fn map_buffer(p: &Params, fd: i32) -> Result<Mapped, EglError> {
+    if !matches!(p.fourcc, DRM_FORMAT_ABGR8888 | DRM_FORMAT_XBGR8888) || p.modifier != 0 {
+        log(&format!(
+            "readback: buffer fourcc {:#x} modifier {:#x} is not RGBA8 LINEAR, EGL_BAD_MATCH",
+            p.fourcc, p.modifier
+        ));
+        return Err(e::EGL_BAD_MATCH);
+    }
+    // SAFETY: `fd` is the handle's dma-buf, open while the buffer lives (the caller holds it); dup'ed at once.
+    let fd = unsafe { BorrowedFd::borrow_raw(fd) }
+        .try_clone_to_owned()
+        .map_err(|_| e::EGL_BAD_ALLOC)?;
+    let len = p.pitch as usize * p.height as usize;
+    let map = Mapping::new(fd.as_fd(), len).map_err(|err| {
+        log(&format!(
+            "readback: mapping {len} bytes failed ({err}), EGL_BAD_ALLOC"
+        ));
+        e::EGL_BAD_ALLOC
+    })?;
+    Ok(Mapped {
+        map,
+        fd,
+        pitch: p.pitch,
+    })
 }
 
 fn delete_target(d: &'static Driver, t: &Target) {

@@ -82,6 +82,8 @@ const GL_FUNCTIONS: &[&str] = &[
     "glFramebufferParameteriMESA",
     "glBlitFramebuffer",
     "glIsEnabled",
+    "glPixelStorei",
+    "glBindBuffer",
 ];
 
 const IMPORTS: &[HeaderImport] = &[
@@ -212,6 +214,12 @@ const IMPORTS: &[HeaderImport] = &[
             "GL_SCISSOR_TEST",
             "GL_COLOR_BUFFER_BIT",
             "GL_FRAMEBUFFER_FLIP_Y_MESA",
+            "GL_PACK_ROW_LENGTH",
+            "GL_PACK_SKIP_ROWS",
+            "GL_PACK_SKIP_PIXELS",
+            "GL_PACK_ALIGNMENT",
+            "GL_PIXEL_PACK_BUFFER",
+            "GL_PIXEL_PACK_BUFFER_BINDING",
         ],
     },
 ];

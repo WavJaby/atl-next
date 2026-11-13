@@ -33,10 +33,14 @@ const BREAKS: &[(&str, &str)] = &[
     ("no_config_filter", "atl_egl_no_config_filter"),
     // the window connect (surface.rs `connect`): no window is connected to EGL, so every dequeue has no connected producer (the Happy Jump failure)
     ("no_window_connect", "atl_egl_no_window_connect"),
-    // the Blit orientation tier's copy (surface.rs `flip_into_buffer`) keeps GL's bottom-up rows: egl-driver's orientation check on that tier
+    // the Blit orientation tier's copy (surface.rs `blit_flipped`) keeps GL's bottom-up rows: egl-driver's orientation check on that tier
     ("no_blit_flip", "atl_egl_no_blit_flip"),
     // the wrong-device refusal (surface.rs `import`): a buffer naming another DRM device is imported anyway: egl-driver's forged-device import must then be accepted (red)
     ("no_device_check", "atl_egl_no_device_check"),
+    // the Readback destination tier's copy (surface.rs `read_back`) is skipped: the buffer keeps its previous bytes (egl-driver's readback run sees POISON)
+    ("no_readback", "atl_egl_no_readback"),
+    // the destination probe (surface.rs `probe_destination`) answers Import unprobed: a device that cannot import fails at its first import, named
+    ("force_import", "atl_egl_force_import"),
 ];
 
 /// `ATL_EGL_TIER=<name>` selects a [`TIERS`] row: the orientation probe (driver.rs `Orientation::probe`) then reads its capability as absent, so a gate runs the baseline tier on a host that has the fast one. Not a break: green either way.

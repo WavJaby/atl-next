@@ -276,6 +276,7 @@ dependencies = [
  "atl-bridgegen",
  "atl-egl-host",
  "atl-gralloc",
+ "atl-gralloc-dmabuf",
  "libloading",
  "rustix",
 ]

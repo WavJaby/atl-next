@@ -71,6 +71,12 @@ struct Args {
     /// Break one thing the verdict depends on; the run must then fail.
     #[arg(long = "break", value_enum)]
     broken: Option<Break>,
+    /// KEY=VALUE set in this process after its buffers are allocated and before the driver loads (repeat): the render-side environment an app process gets and the allocator does not (atld `--app-env`), e.g. the host EGL's own driver choice.
+    #[arg(long = "render-env", value_name = "KEY=VALUE")]
+    render_env: Vec<String>,
+    /// The renderer cannot import gralloc's buffers (the driver's readback destination tier): the own-device EGLImage import must then be refused EGL_BAD_ALLOC instead of accepted; the wrong-device refusal is checked as always.
+    #[arg(long)]
+    cross_device: bool,
 }
 
 fn out(line: &str) {
@@ -514,6 +520,14 @@ macro_rules! entry {
 fn run(args: &Args) -> Result<()> {
     // the window first: its gralloc node is the property the driver reads when it loads (as atld writes an app's properties before the app starts)
     let win = window(args.alloc.as_deref())?;
+    for kv in &args.render_env {
+        let (k, v) = kv
+            .split_once('=')
+            .with_context(|| format!("--render-env {kv}: want KEY=VALUE"))?;
+        // SAFETY: no other thread exists yet (the driver, which reads the environment, is not loaded).
+        unsafe { std::env::set_var(k, v) };
+        out(&format!("render env {k}={v}"));
+    }
     let drv = Loaded::load(&args.driver)?;
     for name in [c"glBindFramebuffer", c"glGetIntegerv", c"glClear"] {
         // Loader.cpp dlsyms gl* first: an exported gl* name would bind before eglGetProcAddress and bypass the FBO-0 wrappers
@@ -681,15 +695,20 @@ fn run(args: &Args) -> Result<()> {
             egl_fail("eglMakeCurrent(none)")
         );
         ensure!(destroy(dpy, surface) != 0, egl_fail("eglDestroySurface"));
-        wrong_device(&drv, dpy, &win)?;
+        wrong_device(&drv, dpy, &win, args.cross_device)?;
     }
     judge(&win)
 }
 
-/// eglCreateImageKHR(EGL_NATIVE_BUFFER_ANDROID) of slot 0 as allocated must give an image; the same buffer with its handle's device int changed (another DRM device) must give none, error EGL_BAD_MATCH (surface.rs `import`).
+/// eglCreateImageKHR(EGL_NATIVE_BUFFER_ANDROID) of slot 0 as allocated must give an image (with `cross_device`: none, EGL_BAD_ALLOC, the renderer cannot import); the same buffer with its handle's device int changed (another DRM device) must give none, error EGL_BAD_MATCH (surface.rs `import`).
 /// # Safety
 /// `dpy` is the driver's initialised display.
-unsafe fn wrong_device(drv: &Loaded, dpy: e::EGLDisplay, win: &TestWindow) -> Result<()> {
+unsafe fn wrong_device(
+    drv: &Loaded,
+    dpy: e::EGLDisplay,
+    win: &TestWindow,
+    cross_device: bool,
+) -> Result<()> {
     let from_drv = |name: &CStr| drv.entry(name);
     let create = entry!(from_drv, c"eglCreateImageKHR", e::eglCreateImageKHR);
     let destroy = entry!(from_drv, c"eglDestroyImageKHR", e::eglDestroyImageKHR);
@@ -713,7 +732,15 @@ unsafe fn wrong_device(drv: &Loaded, dpy: e::EGLDisplay, win: &TestWindow) -> Re
         }
     };
     let (ok, err) = try_import(&slot.buffer);
-    ensure!(ok, "own-device import refused: EGL error {err:#x}");
+    if cross_device {
+        ensure!(
+            !ok && err == e::EGL_BAD_ALLOC,
+            "own-device import on a renderer that cannot import: accepted {ok}, EGL error {err:#x}, want refused EGL_BAD_ALLOC"
+        );
+        out("own-device import refused (renderer cannot import, EGL_BAD_ALLOC)");
+    } else {
+        ensure!(ok, "own-device import refused: EGL error {err:#x}");
+    }
     // the handle as the window holds it: header (3 ints), fds, then the ints
     // SAFETY: `handle` points at the slot's boxed native_handle_t of 3 + NUM_FDS + NUM_INTS ints.
     let own = unsafe {
