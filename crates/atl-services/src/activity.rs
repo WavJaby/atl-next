@@ -128,6 +128,10 @@ const ORIENTATION_PORTRAIT: i32 = 1;
 const ORIENTATION_LANDSCAPE: i32 = 2;
 const DENSITY_DEFAULT: f32 = 160.0;
 
+/// The global configuration's uiMode, the one source the `uimode` service answers from (uimode.rs): UI_MODE_TYPE_NORMAL (1) | UI_MODE_NIGHT_NO (0x10), what UiModeManagerService.updateConfigurationLocked
+/// writes for a normal device with the default night mode (config_defaultNightMode = MODE_NIGHT_NO). Following the desktop's dark appearance is a later setting.
+pub(crate) const GLOBAL_UI_MODE: i32 = 0x11;
+
 /// The global configuration a started app gets (ActivityTaskManagerService's `getGlobalConfiguration`), from the display model: font scale 1 (the `font_scale` setting's default), the locale,
 /// and the display's density and size. The size is DisplayContent.computeScreenAppConfiguration:2462-2468 for the one display: dp = px / (dpi / 160), rounded; portrait when width <= height.
 /// The input fields stay undefined (0) until the platform layer supplies input. Shared with window.rs (the MergedConfiguration of a relayout).
@@ -147,6 +151,7 @@ pub(crate) fn global_configuration(display: &DisplayModel) -> Configuration {
         } else {
             ORIENTATION_LANDSCAPE
         },
+        ui_mode: GLOBAL_UI_MODE,
         // DisplayContent.computeScreenConfiguration:2460/2475: the display's rotation as both
         window_configuration: atl_parcelables::parts::WindowConfiguration {
             rotation: display.rotation,

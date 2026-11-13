@@ -106,7 +106,8 @@ const MEDIAPLAYER_START: &str = "MediaPlayerNative: start called in state 1";
 /// (VISIBILITY_NO_OVERRIDE, -1000); the channel list holds it alone; an unknown id reads null; re-creating it at IMPORTANCE_HIGH keeps 2 (an app may only lower an existing channel's importance).
 /// power: Main.power: a desktop session is interactive with battery saver off; PARTIAL is a supported level; a PARTIAL wake lock is held after acquire and not after release
 /// (WAKE_LOCK is requested + NORMAL -> granted; a refused acquire or release throws SecurityException and the line reads `threw ...`).
-const SERVICE_LINES: [(&str, &str, Option<&str>); 4] = [
+/// uimode: Main.uiMode: UI_MODE_TYPE_NORMAL (1), MODE_NIGHT_NO (1), and the Configuration's uiMode TYPE_NORMAL | NIGHT_NO = 0x11 = 17 (UiModeManagerService's default for a normal device).
+const SERVICE_LINES: [(&str, &str, Option<&str>); 5] = [
     ("connectivity", "AtlTest: connectivity: ", None),
     (
         "permissionmgr",
@@ -122,6 +123,11 @@ const SERVICE_LINES: [(&str, &str, Option<&str>); 4] = [
         "power",
         "AtlTest: power: ",
         Some("interactive=true powersave=false partial=true held=true released=true"),
+    ),
+    (
+        "uimode",
+        "AtlTest: uimode: ",
+        Some("type=1 night=1 config=17"),
     ),
 ];
 /// Main.pendingIntent's line: PendingIntent's creator getters for this package's own immutable broadcast, then isImmutable of a FLAG_MUTABLE one (ActivityManagerService.getInfoForIntentSender reports the record's

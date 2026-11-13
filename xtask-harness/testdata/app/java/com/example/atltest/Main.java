@@ -92,6 +92,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "permission: " + permission());
         Log.i("AtlTest", "notification: " + channels());
         Log.i("AtlTest", "power: " + power());
+        Log.i("AtlTest", "uimode: " + uiMode());
         Log.i("AtlTest", "pendingintent: " + pendingIntent());
         Log.i("AtlTest", "processes: " + processes());
         Log.i("AtlTest", "features: " + features());
@@ -290,6 +291,19 @@ public class Main extends Activity {
             return "interactive=" + pm.isInteractive() + " powersave=" + pm.isPowerSaveMode()
                     + " partial=" + pm.isWakeLockLevelSupported(android.os.PowerManager.PARTIAL_WAKE_LOCK)
                     + " held=" + held + " released=" + !wl.isHeld();
+        } catch (Throwable t) {
+            return "threw " + t;
+        }
+    }
+
+    /** UiModeManager's mode type and night mode, and the uiMode of the app's Configuration they must agree with; "absent" when getSystemService returns null; else what it threw. */
+    private String uiMode() {
+        try {
+            android.app.UiModeManager um = (android.app.UiModeManager) getSystemService(UI_MODE_SERVICE);
+            if (um == null) {
+                return "absent";
+            }
+            return "type=" + um.getCurrentModeType() + " night=" + um.getNightMode() + " config=" + getResources().getConfiguration().uiMode;
         } catch (Throwable t) {
             return "threw " + t;
         }

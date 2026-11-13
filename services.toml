@@ -277,6 +277,17 @@ src = ["crates/atl-services/src/power.rs"]
 mirrors = []
 reason = "registered only so SystemServiceRegistry can build PowerManager (it looks up power and thermalservice together); every method keeps the stub's UNKNOWN_TRANSACTION default (power.rs)"
 
+[uimode]
+src = ["crates/atl-services/src/uimode.rs"]
+mirrors = [
+    "frameworks/base/services/core/java/com/android/server/UiModeManagerService.java#getCurrentModeType",
+    "frameworks/base/services/core/java/com/android/server/UiModeManagerService.java#getNightMode",
+    "frameworks/base/services/core/java/com/android/server/UiModeManagerService.java#isUiModeLocked",
+    "frameworks/base/services/core/java/com/android/server/UiModeManagerService.java#isNightModeLocked",
+    "frameworks/base/services/core/java/com/android/server/UiModeManagerService.java#getContrast",
+    "frameworks/base/services/core/java/com/android/server/UiModeManagerService.java#getForceInvertState",
+]
+
 [connectivity]
 src = ["crates/atl-services/src/connectivity.rs"]
 mirrors = [
