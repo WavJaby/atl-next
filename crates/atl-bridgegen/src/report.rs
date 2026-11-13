@@ -313,6 +313,35 @@ fn ty_difference(
                 return ty_difference(pa, pb, va, vb, &path(at, "pointee"), out);
             }
         }
+        // a C++ reference is passed as a pointer of its width (ir.rs `Ty::Reference`): the same rule as a pointer (NDK surface_control.h `const ARect&`)
+        (
+            Ty::Reference {
+                bits: ba,
+                pointee: pa,
+                ..
+            },
+            Ty::Reference {
+                bits: bb,
+                pointee: pb,
+                ..
+            },
+        ) => {
+            if ba != bb {
+                Some(format!("reference {ba} vs {bb} bits"))
+            } else if is_opaque(pa) || is_opaque(pb) {
+                None
+            } else {
+                return ty_difference(pa, pb, va, vb, &path(at, "referent"), out);
+            }
+        }
+        // an array (a parameter's `const uint8_t uuid[16]`, NDK NdkMediaCrypto.h, decays to a pointer; a field's is inline): the same length of the same element
+        (Ty::Array { elem: ea, len: la }, Ty::Array { elem: eb, len: lb }) => {
+            if la != lb {
+                Some(format!("array of {la} vs {lb}"))
+            } else {
+                return ty_difference(ea, eb, va, vb, &path(at, "element"), out);
+            }
+        }
         // data pointer vs integer: its own kind (TyDiff::PointerVsInteger); a function pointer is code, never an integer
         (
             Ty::Pointer {

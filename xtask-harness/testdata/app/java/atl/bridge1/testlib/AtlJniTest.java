@@ -143,6 +143,12 @@ public final class AtlJniTest {
     /** C3 bitmap probe over libjnigraphics' AndroidBitmap: info and the locked pixel bytes, one line (atl_jni_test.c bitmapProbe). */
     public static native String bitmapProbe(Bitmap bitmap);
 
+    /** tr-first blockers 2-3: ANativeWindow_fromSurface / getWidth / getHeight / getFormat of `surface`, one line (atl_jni_test.c windowProbe). */
+    public static native String windowProbe(android.view.Surface surface);
+
+    /** G6b: 1 when the library's DT_NEEDED libmediandk.so proxy loaded and AMediaFormat_new resolved (atl_jni_test.c mediandkLinked). */
+    public static native int mediandkLinked();
+
     /** Bound by RegisterNatives in JNI_OnLoad. */
     public static native int registeredAnswer();
 

@@ -88,9 +88,10 @@ pub fn classify(
         if let Some((&(lib, _), b)) = rows.iter().find(|((l, n), _)| l == so && *n == name) {
             return match b {
                 Binding::Trap(why) => Class::Trapped(lib, why),
-                Binding::Generic { .. } | Binding::Shim | Binding::Variable { .. } => {
-                    Class::Bound(lib)
-                }
+                Binding::Generic { .. }
+                | Binding::Shim
+                | Binding::Env { .. }
+                | Binding::Variable { .. } => Class::Bound(lib),
             };
         }
         if let Some((&lib, _)) = surfaces.iter().find(|(l, s)| *l == so && s.contains(name)) {
@@ -161,6 +162,11 @@ fn apk_libs(apk: &Path) -> Result<BTreeMap<String, Elf>> {
             .output()
             .context("running unzip")?;
         ensure!(data.status.success(), "unzip -p {} {entry}", apk.display());
+        // not code the linker loads: Unity ships its il2cpp symbol table as `libil2cpp.usym.so` (no ELF magic, measured in Angry Birds 2); every other `.so` must parse
+        if !data.stdout.starts_with(b"\x7fELF") {
+            eprintln!("app-imports: {entry}: no ELF magic, not a library, skipped");
+            continue;
+        }
         out.insert(
             lib.to_owned(),
             read_elf(&data.stdout).with_context(|| format!("{}: {entry}", apk.display()))?,

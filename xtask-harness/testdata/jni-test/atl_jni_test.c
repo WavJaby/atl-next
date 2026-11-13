@@ -5,6 +5,9 @@
 #include <android/asset_manager_jni.h>
 #include <android/bitmap.h>
 #include <android/log.h>
+#include <android/native_window.h>
+#include <android/native_window_jni.h>
+#include <media/NdkMediaFormat.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 #include <dlfcn.h>
@@ -555,4 +558,26 @@ JNI_FN(jstring, bitmapProbe)(JNIEnv *env, jclass cls, jobject bitmap)
     char line[256];
     snprintf(line, sizeof line, "info %u %u %u %d %u bytes %s", info.width, info.height, info.stride, info.format, info.flags, hex);
     return (*env)->NewStringUTF(env, line);
+}
+
+// AtlJniTest.windowProbe (tr-first blockers 2, 3): ANativeWindow_fromSurface (an env-class row: its JNIEnv* mapped to the host's), then rows of native_window.h bound generically, as "window <width> <height> <format>".
+JNI_FN(jstring, windowProbe)(JNIEnv *env, jclass cls, jobject surface)
+{
+    ANativeWindow *w = ANativeWindow_fromSurface(env, surface);
+    if (w == NULL)
+        return (*env)->NewStringUTF(env, "fromSurface null");
+    int32_t width = ANativeWindow_getWidth(w);
+    int32_t height = ANativeWindow_getHeight(w);
+    int32_t format = ANativeWindow_getFormat(w);
+    ANativeWindow_release(w);
+    char line[64];
+    snprintf(line, sizeof line, "window %d %d %d", width, height, format);
+    return (*env)->NewStringUTF(env, line);
+}
+
+// AtlJniTest.mediandkLinked (G6b): this library has DT_NEEDED libmediandk.so, as every Unity libunity.so does, so it loads only when the guest finds that proxy; 1 when its AMediaFormat_new resolved.
+JNI_FN(jint, mediandkLinked)(JNIEnv *env, jclass cls)
+{
+    AMediaFormat *(*volatile f)(void) = AMediaFormat_new;
+    return f != NULL;
 }

@@ -1,71 +1,23 @@
 // SPDX-License-Identifier: MIT
-//! Host sides of the NDK functions that take a `JNIEnv*` (their rows of build.rs `PROXY_SHIMS`). The guest passes its own env (jni.rs `GuestObj`), so the generic crossing would hand the host library a guest env: each shim maps it to the host env (jni.rs `host_env`) and calls the same function of the host library of its soname (bindings.rs `system_symbol`).
-//! The other arguments and the results are host values already: object references are the host's, and an AAssetManager or a pixel pointer names host memory the guest reads in the same address space.
-
-use std::ffi::c_void;
+//! The env class: host sides of the NDK functions with JNI types in their prototype (build.rs `ENV_SHIMS`, `Entry::Env`). The guest passes its own env (jni.rs `GuestObj`), so a generic row would hand the host library a guest env: each row maps it to the host env (jni.rs `host_env`) and calls the same function of the host library of its soname (bindings.rs `system_symbol`).
+//! The other arguments and the results are host values already: object references are the host's, and an AAssetManager, ANativeWindow or pixel pointer names host memory the guest reads in the same address space. Every row's lanes are ints, at most six (atl_bridgegen `jni::env_binding` refuses the rest at build time), so one six-word forwarder serves all.
 
 use super::{bindings, jni, unsupported};
 
-/// The NDK functions' host libraries: the system libraries of their sonames (SYSTEM_LIB).
-const LIBANDROID: &str = "libandroid.so";
-const LIBJNIGRAPHICS: &str = "libjnigraphics.so";
+/// The forwarded host function: six int lanes (SysV's integer registers; a shorter prototype ignores the rest), one int result (a void one's is never read).
+type HostFn = unsafe extern "C" fn(usize, usize, usize, usize, usize, usize) -> usize;
 
-/// `name` of the host library `soname`, as the NDK header declares it (the caller types it); aborts when the host library lacks it.
-fn host_fn(soname: &str, name: &str) -> usize {
-    bindings::system_symbol(soname, name)
-        .unwrap_or_else(|| unsupported(&format!("{name}: NDK shim with no {soname} in SYSTEM_LIB")))
-}
-
-/// The host `JNIEnv*` standing behind the guest's `env`.
-fn to_host_env(env: *mut c_void) -> *mut c_void {
-    // SAFETY: `env` is the guest's own `JNIEnv*` (made by jni.rs `guest_env`), as an NDK function receives it.
-    unsafe { jni::host_env(env as usize) as *mut c_void }
-}
-
-/// `AAssetManager* AAssetManager_fromJava(JNIEnv* env, jobject assetManager)`.
-pub(super) extern "C" fn asset_manager_from_java(
-    env: *mut c_void,
-    asset_manager: *mut c_void,
-) -> *mut c_void {
-    type F = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
-    // SAFETY: the host libandroid's export of this name; its prototype is asset_manager_jni.h's.
-    let f: F = unsafe { std::mem::transmute(host_fn(LIBANDROID, "AAssetManager_fromJava")) };
-    // SAFETY: the host env and the guest's jobject, which is the host's reference.
-    unsafe { f(to_host_env(env), asset_manager) }
-}
-
-/// `int AndroidBitmap_getInfo(JNIEnv* env, jobject jbitmap, AndroidBitmapInfo* info)`.
-pub(super) extern "C" fn bitmap_get_info(
-    env: *mut c_void,
-    bitmap: *mut c_void,
-    info: *mut c_void,
-) -> i32 {
-    type F = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32;
-    // SAFETY: the host libjnigraphics' export of this name; its prototype is bitmap.h's.
-    let f: F = unsafe { std::mem::transmute(host_fn(LIBJNIGRAPHICS, "AndroidBitmap_getInfo")) };
-    // SAFETY: the host env, the guest's jobject and the guest's info struct, all in the one address space.
-    unsafe { f(to_host_env(env), bitmap, info) }
-}
-
-/// `int AndroidBitmap_lockPixels(JNIEnv* env, jobject jbitmap, void** addrPtr)`.
-pub(super) extern "C" fn bitmap_lock_pixels(
-    env: *mut c_void,
-    bitmap: *mut c_void,
-    addr: *mut c_void,
-) -> i32 {
-    type F = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32;
-    // SAFETY: the host libjnigraphics' export of this name; its prototype is bitmap.h's.
-    let f: F = unsafe { std::mem::transmute(host_fn(LIBJNIGRAPHICS, "AndroidBitmap_lockPixels")) };
-    // SAFETY: the host env, the guest's jobject and out-parameter.
-    unsafe { f(to_host_env(env), bitmap, addr) }
-}
-
-/// `int AndroidBitmap_unlockPixels(JNIEnv* env, jobject jbitmap)`.
-pub(super) extern "C" fn bitmap_unlock_pixels(env: *mut c_void, bitmap: *mut c_void) -> i32 {
-    type F = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32;
-    // SAFETY: the host libjnigraphics' export of this name; its prototype is bitmap.h's.
-    let f: F =
-        unsafe { std::mem::transmute(host_fn(LIBJNIGRAPHICS, "AndroidBitmap_unlockPixels")) };
-    // SAFETY: the host env and the guest's jobject.
-    unsafe { f(to_host_env(env), bitmap) }
+/// `Entry::Env` row `(soname, symbol, env)`'s call: `lanes[env]` (the guest's `JNIEnv*`) replaced by the host env, then `symbol` of the host library `soname` with the six lanes. Aborts when the host library lacks the symbol (bindings.rs `target` binds the row only when it has it).
+pub(super) fn call_env((soname, symbol, env): (&str, &str, usize), mut lanes: [usize; 6]) -> usize {
+    let f = bindings::system_symbol(soname, symbol).unwrap_or_else(|| {
+        unsupported(&format!(
+            "{symbol}: env-class row with no {soname} in SYSTEM_LIB"
+        ))
+    });
+    // SAFETY: lane `env` is the guest's own `JNIEnv*` (made by jni.rs `guest_env`), as the NDK function receives it (build.rs proved the position from its prototype).
+    lanes[env] = unsafe { jni::host_env(lanes[env]) };
+    // SAFETY: the host library's export of this name, whose prototype (the NDK header's) takes at most six int lanes and answers an int lane or void (env_binding); extra lanes sit in registers it never reads.
+    let f: HostFn = unsafe { std::mem::transmute(f) };
+    // SAFETY: as above; every other lane is a host value in this address space.
+    unsafe { f(lanes[0], lanes[1], lanes[2], lanes[3], lanes[4], lanes[5]) }
 }

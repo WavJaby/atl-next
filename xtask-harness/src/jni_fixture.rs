@@ -84,9 +84,15 @@ fn selected_break() -> Result<Option<&'static str>> {
     }
 }
 
-/// The C3 probes' libraries (atl_jni_test.c `assetProbe` / `bitmapProbe`): DT_NEEDED names the NDK libraries, and each import is one the probes call.
-const NDK_NEEDED: [&str; 2] = ["libandroid.so", "libjnigraphics.so"];
-const NDK_IMPORTS: [&str; 11] = [
+/// The NDK probes' libraries (atl_jni_test.c `assetProbe` / `bitmapProbe` (C3), `windowProbe` (tr-first 2-3), `mediandkLinked` (G6b)): DT_NEEDED names the NDK libraries, and each import is one the probes use.
+const NDK_NEEDED: [&str; 3] = ["libandroid.so", "libjnigraphics.so", "libmediandk.so"];
+const NDK_IMPORTS: [&str; 17] = [
+    "AMediaFormat_new",
+    "ANativeWindow_fromSurface",
+    "ANativeWindow_getWidth",
+    "ANativeWindow_getHeight",
+    "ANativeWindow_getFormat",
+    "ANativeWindow_release",
     "AAssetManager_fromJava",
     "AAssetManager_open",
     "AAsset_read",
@@ -200,6 +206,7 @@ pub fn build(
             .arg("-lGLESv1_CM")
             .arg("-landroid")
             .arg("-ljnigraphics")
+            .arg("-lmediandk")
             .arg("-o")
             .arg(&lib),
         "NDK clang++ link",

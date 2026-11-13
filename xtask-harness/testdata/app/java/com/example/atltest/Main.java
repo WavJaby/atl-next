@@ -227,6 +227,18 @@ public class Main extends Activity {
         bridge1Call(jni, "assetProbe", "assetProbe", getAssets());
         bridge1Call(jni, "bitmapArgb8888", "bitmapProbe", bitmap3x2(Bitmap.Config.ARGB_8888, ARGB_PIXELS));
         bridge1Call(jni, "bitmapRgb565", "bitmapProbe", bitmap3x2(Bitmap.Config.RGB_565, RGB565_PIXELS));
+        bridge1Call(jni, "windowProbe", "windowProbe", probeSurface());
+        bridge1Call(jni, "mediandkLinked", "mediandkLinked");
+    }
+
+    /** windowProbe's Surface: a SurfaceTexture's producer with default buffer size WINDOW_W x WINDOW_H (app.rs BRIDGE1_CALLS windowProbe). */
+    private static final int WINDOW_W = 48;
+    private static final int WINDOW_H = 32;
+
+    private static android.view.Surface probeSurface() {
+        android.graphics.SurfaceTexture st = new android.graphics.SurfaceTexture(0);
+        st.setDefaultBufferSize(WINDOW_W, WINDOW_H);
+        return new android.view.Surface(st);
     }
 
     /** The C3 bitmap rows' pixels, row-major, opaque, exact in both configs (app.rs BRIDGE1_CALLS): red, green, blue / white, black, gray 0x80 (ARGB_8888); yellow for the last one in RGB_565, whose 565 values are exact for primaries and 0 / 255 channels. */

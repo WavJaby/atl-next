@@ -93,6 +93,7 @@ fn map_dir(lib: &str) -> &'static str {
     match lib {
         "libandroid" => "aosp/frameworks/base/native/android",
         "libjnigraphics" => "aosp/frameworks/base/native/graphics/jni",
+        "libmediandk" => "aosp/frameworks/av/media/ndk",
         _ => MAPS,
     }
 }
@@ -178,9 +179,10 @@ pub fn check(root: &Path, out: &Path, arch: &str) -> Result<Option<String>> {
             let (mut bound, mut pending, mut unbound) = (0usize, 0usize, 0usize);
             for (_, _, b) in bindings::rows().filter(|(l, ..)| *l == soname) {
                 match b {
-                    Binding::Generic { .. } | Binding::Shim | Binding::Variable { .. } => {
-                        bound += 1
-                    }
+                    Binding::Generic { .. }
+                    | Binding::Shim
+                    | Binding::Env { .. }
+                    | Binding::Variable { .. } => bound += 1,
                     Binding::Trap(why) if why.starts_with("pending") => pending += 1,
                     Binding::Trap(_) => unbound += 1,
                 }

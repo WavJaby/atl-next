@@ -36,6 +36,21 @@ pub const DECLARATIONS: Kept<'static> = Kept {
     records: &[],
 };
 
+/// bionic's `android/api-level.h` as an API row: the level names and the two functions, printed include-free. One row for its two consumers: atl-bionic implements and installs it (the converter forces it into every host compile of AOSP code), and atl-native-bridge's host prototype view includes it, so NDK headers parse as the host libraries were compiled.
+pub const API_LEVEL: Api = Api {
+    name: "api_level",
+    source: "bionic/libc/include/android/api-level.h",
+    lang: Lang::C,
+    header: Some("android/api-level.h"),
+    functions: &[
+        "android_get_device_api_level",
+        "android_get_application_target_sdk_version",
+    ],
+    macros: &["__ANDROID_API_*__"],
+    include_dirs: &[],
+    kept: DECLARATIONS,
+};
+
 /// Generated files of `api` parsed for `target` (plus the API's include dirs), paths relative to
 /// OUT_DIR: `<name>.rs` (its constants, opaque types and records, and the check that each function of
 /// `implementation`, a Rust path, has the header's signature), `<name>.ir.json`, and with a header

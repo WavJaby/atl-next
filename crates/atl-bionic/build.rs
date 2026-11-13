@@ -60,19 +60,7 @@ const APIS: &[Api] = &[
         kept: DECLARATIONS,
     },
     // bionic's sys/cdefs.h brings it into every unit; ours has no include, so it can be forced
-    Api {
-        name: "api_level",
-        source: "bionic/libc/include/android/api-level.h",
-        lang: Lang::C,
-        header: Some("android/api-level.h"),
-        functions: &[
-            "android_get_device_api_level",
-            "android_get_application_target_sdk_version",
-        ],
-        macros: &["__ANDROID_API_*__"],
-        include_dirs: &[],
-        kept: DECLARATIONS,
-    },
+    buildscript::API_LEVEL,
     // libdl's platform-only API, declared by its callers: the target SDK setter (ART; the launcher calls
     // it, owner Q5), the exported-namespace lookup (libvulkan, libgraphicsenv, libstagefright,
     // libvndksupport), namespace creation / linking (libgraphicsenv), the linker warnings (libandroid_runtime

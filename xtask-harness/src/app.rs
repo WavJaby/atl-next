@@ -192,6 +192,10 @@ const BRIDGE1_CALLS: &[(&str, &str)] = &[
         "bitmapRgb565",
         "info 3 2 6 4 1 bytes 00f8e0071f00ffff0000e0ff",
     ),
+    // tr-first blockers 2-3 (atl_jni_test.c windowProbe, Main.probeSurface): a SurfaceTexture producer with setDefaultBufferSize(48, 32); width and height are BufferQueueProducer::query's mDefaultWidth/Height (Surface::query forwards NATIVE_WINDOW_WIDTH/HEIGHT), format 1 = BufferQueueCore's default PIXEL_FORMAT_RGBA_8888 (Surface.cpp: no mReqFormat yet)
+    ("windowProbe", "window 48 32 1"),
+    // G6b: the fixture library (DT_NEEDED libmediandk.so) loaded, so the guest found the libmediandk proxy; 1 = C's `f != NULL` for AMediaFormat_new (atl_jni_test.c mediandkLinked)
+    ("mediandkLinked", "1"),
 ];
 /// Main.bridge1Calls' firstConfig row: `r=<r> g=<g> b=<b> a=<a> visual=<v>`, the first config eglChooseConfig lists for RGB 8 minimum on pbuffer surfaces (atl_jni_test.c firstConfig).
 /// The driver orders the list as the host does, so the row is judged ([`first_config_why`]), not compared with a fixed line.

@@ -2,7 +2,7 @@
 //! Lane descriptors of a JNI function table (Q6-3). Per slot: the lane class of each fixed parameter and of the result, and the variadic flag. A class is the bank that AAPCS64 (guest) and SysV (host) both assign the argument to: integers and pointers take an int lane, floats and doubles an fp lane, each bank counted in declaration order. The descriptors come from the IR that `jni_tables` reads (build.rs `jni_interface`), so a slot's lanes and its table position share one description.
 //! A `va_list` parameter (the `...V` variants) has its own class: its argument is a pointer to a platform struct, not a lane value, so a route can refuse it by name.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 
 use crate::ir::{ArchView, Signature, Ty};
 
@@ -134,10 +134,90 @@ pub fn lane_refusal(params: &[Class]) -> Option<&'static str> {
     }
 }
 
+/// jni.h's reference typedefs: a value of one is a reference in some `JNIEnv`'s tables, meaningful only next to that env.
+const JNI_REFS: &[&str] = &[
+    "jobject",
+    "jclass",
+    "jstring",
+    "jarray",
+    "jobjectArray",
+    "jbooleanArray",
+    "jbyteArray",
+    "jcharArray",
+    "jshortArray",
+    "jintArray",
+    "jlongArray",
+    "jfloatArray",
+    "jdoubleArray",
+    "jthrowable",
+    "jweak",
+];
+
+/// The integer lanes the env class forwards: SysV's six integer registers. Its host side (atl-native-bridge ndk.rs `call_env`) is one `extern "C" fn` of six words that calls the host function with them; a seventh would sit on the stack, which that function's frame does not forward.
+pub const ENV_LANES: usize = 6;
+
+/// The typedef name a type is spelled with, through `const` and nothing else.
+fn typedef_name(ty: &Ty) -> Option<&str> {
+    match ty {
+        Ty::Typedef { name, .. } => Some(name),
+        _ => None,
+    }
+}
+
+/// `JNIEnv*` / `JavaVM*`: a pointer to that typedef.
+fn points_to(ty: &Ty, name: &str) -> bool {
+    matches!(ty.resolved(), Ty::Pointer { pointee, .. } if typedef_name(pointee) == Some(name))
+}
+
+/// How proxy function `name` with prototype `sig` binds when the prototype has JNI types (`JNIEnv*`, `JavaVM*`, a jni.h reference typedef). A generic row would hand the host library the guest's env, which the host cannot use (tr-first blocker 3: `ANativeWindow_fromSurface` -> SEGV in `android_view_Surface_getSurface`), so such a prototype binds only through the env class, and only when `listed` (the caller's reviewed list) names it.
+/// Ok(None): no JNI type, the generic route applies. Ok(Some(i)): the env class, parameter `i` is the `JNIEnv*` its host side maps; every parameter an int lane, at most [`ENV_LANES`], the result an int lane or void. Err: why not, naming `name`.
+pub fn env_binding(name: &str, sig: &Signature, listed: bool) -> Result<Option<usize>> {
+    let env: Vec<usize> = (0..sig.params.len())
+        .filter(|&i| points_to(&sig.params[i], "JNIEnv"))
+        .collect();
+    let vm = sig.params.iter().any(|p| points_to(p, "JavaVM"));
+    let refs = sig
+        .params
+        .iter()
+        .chain(std::iter::once(&sig.ret))
+        .any(|p| typedef_name(p).is_some_and(|n| JNI_REFS.contains(&n)));
+    if env.is_empty() && !vm && !refs {
+        ensure!(
+            !listed,
+            "{name}: listed for the env class, but its prototype has no JNI type"
+        );
+        return Ok(None);
+    }
+    ensure!(
+        listed,
+        "{name}: a JNI-typed prototype (JNIEnv*, JavaVM* or a jni.h reference) bound generically would hand the host the guest's env; list it for the env class"
+    );
+    ensure!(!vm, "{name}: a JavaVM* parameter has no shim class");
+    let [index] = env[..] else {
+        bail!(
+            "{name}: the env class maps exactly one JNIEnv* parameter, the prototype has {}",
+            env.len()
+        );
+    };
+    let params = param_classes(sig).with_context(|| format!("{name}: parameter classes"))?;
+    ensure!(
+        params.len() <= ENV_LANES && params.iter().all(|&c| c == Class::Int),
+        "{name}: the env class forwards at most {ENV_LANES} int lanes, the prototype has {params:?}"
+    );
+    let ret = result_class(&sig.ret).with_context(|| format!("{name}: result class"))?;
+    ensure!(
+        matches!(ret, Class::Int | Class::Void),
+        "{name}: the env class answers in an int lane, the result is {ret:?}"
+    );
+    Ok(Some(index))
+}
+
 /// A parameter's class. `va_list` is matched by name first: the IR keeps the typedef name, and its type differs by platform (an array on x86-64, a struct on AArch64).
 fn param(ty: &Ty) -> Result<Class> {
     match ty {
         Ty::Typedef { name, .. } if name == "va_list" => Ok(Class::VaList),
+        // C: a parameter of array type is a pointer (NDK NdkMediaCrypto.h `const uint8_t uuid[16]`)
+        _ if matches!(ty.resolved(), Ty::Array { .. }) => Ok(Class::Int),
         _ => scalar(ty),
     }
 }
@@ -272,6 +352,42 @@ mod tests {
                 "{name}: {r:?}"
             );
         }
+    }
+
+    /// tr-first blocker 3, the build-time refusal: NDK-shaped prototypes in a fixture header. Expected outcomes are written from the C shapes and `env_binding`'s rule, not from running it: a JNI-typed prototype not listed fails naming itself; listed, the env class maps the `JNIEnv*` at its position; JavaVM*, two envs, an fp lane, seven lanes and a reference without an env each fail by their own reason; a plain prototype stays generic, and listing it is stale.
+    #[test]
+    fn env_binding_refuses_unlisted_jni_prototypes() {
+        let iface = parse(
+            "env",
+            "typedef void *jobject;\ntypedef jobject jclass;\ntypedef const struct JNINativeInterface *JNIEnv;\ntypedef const struct JNIInvokeInterface *JavaVM;\nstruct ANativeWindow;\nstruct ANativeWindow *ANativeWindow_fromSurface(JNIEnv *env, jobject surface);\nint lock_at_two(void *a, void *b, JNIEnv *env, jobject o);\njobject to_java(JNIEnv *env, struct ANativeWindow *w);\nint from_vm(JavaVM *vm);\nint two_envs(JNIEnv *a, JNIEnv *b);\nint fp_lane(JNIEnv *env, float f);\nint seven(JNIEnv *e, int a, int b, int c, int d, int f, int g);\nint ref_only(jclass c);\nint plain(struct ANativeWindow *w);\n",
+        );
+        let view = &iface.arches["x86_64"];
+        let bind = |name: &str, listed: bool| env_binding(name, &view.functions[name], listed);
+        let err = format!(
+            "{:#}",
+            bind("ANativeWindow_fromSurface", false).unwrap_err()
+        );
+        assert!(
+            err.starts_with("ANativeWindow_fromSurface: a JNI-typed prototype")
+                && err.contains("list it for the env class"),
+            "{err}"
+        );
+        assert_eq!(bind("ANativeWindow_fromSurface", true).unwrap(), Some(0));
+        assert_eq!(bind("lock_at_two", true).unwrap(), Some(2));
+        assert_eq!(bind("to_java", true).unwrap(), Some(0));
+        for (name, why) in [
+            ("from_vm", "JavaVM*"),
+            ("two_envs", "exactly one JNIEnv*"),
+            ("fp_lane", "int lanes"),
+            ("seven", "at most 6"),
+            ("ref_only", "exactly one JNIEnv*"),
+        ] {
+            let e = format!("{:#}", bind(name, true).unwrap_err());
+            assert!(e.starts_with(name) && e.contains(why), "{name}: {e}");
+        }
+        assert_eq!(bind("plain", false).unwrap(), None);
+        let stale = format!("{:#}", bind("plain", true).unwrap_err());
+        assert!(stale.contains("no JNI type"), "{stale}");
     }
 
     /// The emitted text type-checks under rustc, with one 8-slot table.

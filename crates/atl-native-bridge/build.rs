@@ -211,14 +211,31 @@ const QEMU_SHIMS: &[&str] = &[
 ];
 /// Q5-8: the QEMU table's libc rows that bind to counted shims under `crossing-count` (counters.rs `memcpy`, `memset`, `memcmp`), which record the size argument and then run glibc's.
 const COUNTED_SHIMS: &[&str] = &["memcpy", "memset", "memcmp"];
-/// Proxy-library functions whose host side is hand-written, each bound `Entry::Shim` in its library; each must be in one proxy library's list (`bindings_table`). NDK functions taking a `JNIEnv*` (C3, engine/ndk.rs: the generic crossing would hand the host library the guest's env); `slCreateEngine` (engine/sles.rs: its out object is wrapped in a guest proxy); `eglGetProcAddress` (engine/proc.rs: its answer is a row's guest address, never a raw host pointer; the fn-return arm below traps every other one).
-const PROXY_SHIMS: &[&str] = &[
+/// Proxy-library functions whose host side is hand-written, each bound `Entry::Shim` in its library; each must be in one proxy library's list (`bindings_table`). `slCreateEngine` (engine/sles.rs: its out object is wrapped in a guest proxy); `eglGetProcAddress` (engine/proc.rs: its answer is a row's guest address, never a raw host pointer; the fn-return arm below traps every other one).
+const PROXY_SHIMS: &[&str] = &["slCreateEngine", "eglGetProcAddress"];
+/// NDK functions with JNI types in their prototype, bound by the env class (`Entry::Env`, engine/ndk.rs `call_env`: the guest's `JNIEnv*` mapped to the host's, the rest passed as int lanes; references are the host's already). A generic row would hand the host library the guest's env (tr-first blocker 3: `ANativeWindow_fromSurface` -> SEGV in `android_view_Surface_getSurface`), so a JNI-typed prototype missing here fails the build naming it (`atl_bridgegen::jni::env_binding`), and a name here without one is stale.
+const ENV_SHIMS: &[&str] = &[
     "AAssetManager_fromJava",
+    "AHardwareBuffer_fromHardwareBuffer",
+    "AHardwareBuffer_toHardwareBuffer",
+    "AInputEvent_toJava",
+    "AInputQueue_fromJava",
+    "AInputTransferToken_fromJava",
+    "AInputTransferToken_toJava",
+    "AKeyEvent_fromJava",
+    "AMotionEvent_fromJava",
+    "ANativeWindow_fromSurface",
+    "ANativeWindow_toSurface",
+    "APerformanceHint_borrowSessionFromJava",
+    "ASharedMemory_dupFromJava",
+    "ASurfaceControl_fromJava",
+    "ASurfaceTexture_fromSurfaceTexture",
+    "ASurfaceTransaction_fromJava",
+    "AndroidBitmap_getDataSpace",
+    "AndroidBitmap_getHardwareBuffer",
     "AndroidBitmap_getInfo",
     "AndroidBitmap_lockPixels",
     "AndroidBitmap_unlockPixels",
-    "slCreateEngine",
-    "eglGetProcAddress",
 ];
 
 /// Guest libc stubs glibc's `libc.so.6` serves with the same ABI, by (stub name, glibc symbol). NBS names the allocator entries `native_bridge_<fn>` (one heap: the guest libc's malloc calls them).
@@ -456,7 +473,7 @@ fn object_lanes_rs(tables: &[(String, String, atl_bridgegen::ir::ArchView)]) -> 
 }
 
 /// The guest proxy libraries (NBS `libnative_bridge_guest_*`): soname, and the NBS directory whose `stubs_arm64.cc` (arch-neutral, LP64) is the library's symbol set.
-/// The last three are the NDK libraries of C3: a stub gets a binding only when its prototype is in [`PROTOTYPE_HEADERS`]; the rest trap (`missing_prototype`).
+/// The NDK libraries (libnativewindow, libandroid, libandroid_runtime, libjnigraphics: C3; libmediandk: G6b): a stub gets a binding only when its prototype is in [`PROTOTYPE_HEADERS`]; the rest trap (`missing_prototype`).
 const PROXY_LIBS: &[(&str, &str)] = &[
     ("libEGL.so", "libEGL"),
     ("libGLESv1_CM.so", "libGLESv1_CM"),
@@ -468,6 +485,8 @@ const PROXY_LIBS: &[(&str, &str)] = &[
     ("libjnigraphics.so", "libjnigraphics"),
     // opensl-es O1: three functions (slCreateEngine a shim) and the SL_IID_* variables (`Entry::Variable`)
     ("libOpenSLES.so", "libOpenSLES"),
+    // G6b: every Unity libunity.so NEEDs it; the host side is AOSP's libmediandk (gate_goals `NDK_PROXIED`)
+    ("libmediandk.so", "libmediandk"),
 ];
 /// The guest libc's stub list (NBS), per guest ISA: x86_64 for the identity guest (patch 0003 adds sigaction / sigaction64); arm64 for the QEMU guest, which has no sigaction stub (its guest libc's own syscall reaches QEMU's signal emulation) and, with patch 0006, no setjmp-family stubs (bionic's setjmp.S saves and restores guest registers in the guest).
 fn libc_stubs(qemu: bool) -> &'static str {
@@ -491,16 +510,113 @@ const PROTOTYPE_HEADERS: &[&str] = &[
     "GLES3/gl3.h",
     "GLES3/gl31.h",
     "GLES3/gl32.h",
-    // C3: the NDK headers of libandroid / libjnigraphics; their declarations count through `also` (bindings_table)
-    "android/asset_manager.h",
-    "android/asset_manager_jni.h",
-    "android/bitmap.h",
     // opensl-es O1: the libOpenSLES functions and the layouts sles.rs reads by pointer ([`SL_RECORDS`])
     "SLES/OpenSLES.h",
     "SLES/OpenSLES_Android.h",
 ];
-/// The NDK headers' declarations count from `frameworks/native/include/android` (bindings_table `also`).
-const NDK_HEADERS: &[&str] = &["asset_manager.h", "asset_manager_jni.h", "bitmap.h"];
+/// The NDK headers of the NDK proxies (libandroid, libnativewindow, libjnigraphics: C3; libmediandk: G6b), by include directory relative to the AOSP tree: each directory is an include path of both views, each header is included by the prototype unit and its declarations count (bindings_table `also`).
+/// Every public header of those libraries' NDK surface, so a stub gets a row whenever its prototype exists, not only the ones an app was seen importing (tr-first blocker 2). Left out: `hardware_buffer_aidl.h` and `native_window_aidl.h` (C++ inline helpers over libbinder's Parcel, no function of the proxies' stub lists).
+const NDK_HEADERS: &[(&str, &[&str])] = &[
+    (
+        "frameworks/native/include",
+        &[
+            "android/asset_manager.h",
+            "android/asset_manager_jni.h",
+            "android/bitmap.h",
+            "android/choreographer.h",
+            "android/configuration.h",
+            "android/display_luts.h",
+            "android/font.h",
+            "android/font_matcher.h",
+            "android/hardware_buffer_jni.h",
+            "android/imagedecoder.h",
+            "android/input.h",
+            "android/input_transfer_token_jni.h",
+            "android/keycodes.h",
+            "android/looper.h",
+            "android/multinetwork.h",
+            "android/native_activity.h",
+            "android/native_window_jni.h",
+            "android/obb.h",
+            "android/performance_hint.h",
+            "android/permission_manager.h",
+            "android/sensor.h",
+            "android/sharedmem.h",
+            "android/sharedmem_jni.h",
+            "android/storage_manager.h",
+            "android/surface_control.h",
+            "android/surface_control_input_receiver.h",
+            "android/surface_control_jni.h",
+            "android/surface_texture.h",
+            "android/surface_texture_jni.h",
+            "android/system_fonts.h",
+            "android/system_health.h",
+            "android/thermal.h",
+            "android/trace.h",
+            "android/window.h",
+        ],
+    ),
+    (
+        "frameworks/native/libs/nativewindow/include",
+        &[
+            "android/data_space.h",
+            "android/hardware_buffer.h",
+            "android/hdr_metadata.h",
+            "android/native_window.h",
+        ],
+    ),
+    ("frameworks/native/libs/arect/include", &["android/rect.h"]),
+    (
+        "frameworks/av/media/ndk/include",
+        &[
+            "media/NdkImage.h",
+            "media/NdkImageReader.h",
+            "media/NdkMediaCodec.h",
+            "media/NdkMediaCodecInfo.h",
+            "media/NdkMediaCodecStore.h",
+            "media/NdkMediaCrypto.h",
+            "media/NdkMediaDataSource.h",
+            "media/NdkMediaDrm.h",
+            "media/NdkMediaError.h",
+            "media/NdkMediaExtractor.h",
+            "media/NdkMediaFormat.h",
+            "media/NdkMediaMuxer.h",
+        ],
+    ),
+];
+/// bionic's availability header, copied into the host view's compat dir ([`host_compat`]).
+const VERSIONING_H: &str = "bionic/libc/include/android/versioning.h";
+
+/// The host view's compat dir, as the converter gives every host compile of AOSP code (bp2ninja cc.go `deviceCompat`, `libcCompat`, `deviceForced`): bionic's `android/versioning.h` and atl-bionic's include-free `android/api-level.h` (`buildscript::API_LEVEL`, generated in bionic's view). Returns the include args: the dir, both forced in the converter's order, and Soong's weak-availability define (every declaration visible, `__INTRODUCED_IN` an availability attribute clang ignores on linux-gnu). NDK media headers include `<android/api-level.h>` and use `__INTRODUCED_IN` without a fallback.
+fn host_compat(
+    up: &Upstreams,
+    host: &buildscript::ArchRow,
+    out: &std::path::Path,
+) -> Result<Vec<String>> {
+    let dir = out.join("host-compat");
+    let android = dir.join("android");
+    std::fs::create_dir_all(&android)?;
+    let target =
+        buildscript::bionic_platform_target(up, host, buildscript::future_level(up, host)?, None);
+    let header = std::path::Path::new("capi/include/android/api-level.h");
+    let (_, text) = buildscript::api_files(up, &buildscript::API_LEVEL, target, "crate")?
+        .into_iter()
+        .find(|(p, _)| p == header)
+        .context("API_LEVEL printed no android/api-level.h")?;
+    std::fs::write(android.join("api-level.h"), text)?;
+    std::fs::copy(up.aosp(VERSIONING_H), android.join("versioning.h"))?;
+    for p in up.rerun_paths(&format!("aosp/{VERSIONING_H}")) {
+        println!("cargo::rerun-if-changed={}", p.display());
+    }
+    Ok(vec![
+        format!("-I{}", dir.display()),
+        "-D__ANDROID_UNAVAILABLE_SYMBOLS_ARE_WEAK__".to_owned(),
+        "-include".to_owned(),
+        "android/versioning.h".to_owned(),
+        "-include".to_owned(),
+        "android/api-level.h".to_owned(),
+    ])
+}
 /// The SL headers' declarations count from [`SLES_DIR`] (bindings_table `also`).
 const SL_HEADERS: &[&str] = &[
     "OpenSLES.h",
@@ -521,9 +637,9 @@ const SL_RECORDS: &[&str] = &[
     "SLAndroidDataFormat_PCM_EX_",
     "SLEngineOption_",
 ];
+/// Include paths of both views besides the [`NDK_HEADERS`] directories.
 const PROTOTYPE_INCLUDES: &[&str] = &[
     "frameworks/native/opengl/include",
-    "frameworks/native/include",
     "libnativehelper/include_jni",
     "frameworks/wilhelm/include",
 ];
@@ -625,11 +741,12 @@ fn libc_entries(
         .collect())
 }
 
-/// Why a stub with no prototype in the set traps. libandroid and libjnigraphics: the NDK prototypes outside [`PROTOTYPE_HEADERS`] are pending; libandroid_runtime is C++ internals no app calls.
+/// Why a stub with no prototype in the set traps. The NDK proxies: every public NDK header of theirs is in [`NDK_HEADERS`], so a stub without a prototype is platform API no NDK header declares (measured 2026-11-13: `*ForTesting`, `*ForClient`, the LL-NDK `ANativeWindow_dequeueBuffer` family, `AActivityManager_*`); libandroid_runtime is C++ internals no app calls.
 fn missing_prototype(soname: &str) -> &'static str {
     match soname {
-        "libnativewindow.so" => "pending: nativewindow prototypes not in the EGL/GLES set",
-        "libandroid.so" | "libjnigraphics.so" => "pending: NDK prototypes not in the set",
+        "libnativewindow.so" | "libandroid.so" | "libjnigraphics.so" | "libmediandk.so" => {
+            "unbound: platform API, no NDK header declares it"
+        }
         "libandroid_runtime.so" => "unbound: C++ internals",
         _ => "unbound: no prototype in the EGL/GLES headers",
     }
@@ -672,12 +789,14 @@ fn bindings_table(
 
     let unit = out.join("proxy_prototypes.cc");
     let mut text = String::from("#define EGL_EGLEXT_PROTOTYPES\n#define GL_GLEXT_PROTOTYPES\n");
-    for h in PROTOTYPE_HEADERS {
+    let ndk_headers = NDK_HEADERS.iter().flat_map(|(_, hs)| hs.iter());
+    for h in PROTOTYPE_HEADERS.iter().chain(ndk_headers) {
         text.push_str(&format!("#include <{h}>\n"));
     }
     std::fs::write(&unit, text)?;
     let includes: Vec<String> = PROTOTYPE_INCLUDES
         .iter()
+        .chain(NDK_HEADERS.iter().map(|(d, _)| d))
         .map(|d| format!("-I{}", up.aosp(d).display()))
         .collect();
     let mut guest = buildscript::bionic_platform_target(
@@ -694,10 +813,12 @@ fn bindings_table(
         println!("cargo::rerun-if-changed={h}");
         guest.args.extend(["-include".to_owned(), h]);
     }
+    let mut host_args = host_compat(up, host, out)?;
+    host_args.extend(includes);
     let host_view = Target {
         arch: "host".to_owned(),
         triple: buildscript::clang_triple_from_cargo()?,
-        args: includes,
+        args: host_args,
     };
     // declarations count only from the files named here (`Source::also`): every header of the tree
     let root = up.aosp("frameworks/native/opengl/include");
@@ -706,9 +827,11 @@ fn bindings_table(
         headers_under(&root.join(dir), &mut also)?;
     }
     println!("cargo::rerun-if-changed={}", root.display());
-    let ndk = up.aosp("frameworks/native/include/android");
-    also.extend(NDK_HEADERS.iter().map(|h| ndk.join(h)));
-    println!("cargo::rerun-if-changed={}", ndk.display());
+    for (dir, headers) in NDK_HEADERS {
+        let dir = up.aosp(dir);
+        also.extend(headers.iter().map(|h| dir.join(h)));
+        println!("cargo::rerun-if-changed={}", dir.display());
+    }
     let sles = up.aosp(SLES_DIR);
     also.extend(SL_HEADERS.iter().map(|h| sles.join(h)));
     println!("cargo::rerun-if-changed={}", sles.display());
@@ -770,38 +893,65 @@ fn bindings_table(
 
     let mut traps: Vec<(String, String, &'static str)> = Vec::new();
     let mut rows: Vec<(&str, Vec<(String, String)>)> = Vec::new();
+    // `Entry::Env(i)` rows: library, name, the `JNIEnv*` parameter's index; and every JNI-typed prototype refused a row, named together in one build error
+    let mut env_rows: Vec<(String, String, usize)> = Vec::new();
+    let mut refused: Vec<String> = Vec::new();
     for (soname, names) in &lists {
         let mut entries = Vec::new();
         for name in names {
+            let env = match (guest_view.functions.get(name), host_ir.functions.get(name)) {
+                (Some(sig), Some(_)) => {
+                    atl_bridgegen::jni::env_binding(name, sig, ENV_SHIMS.contains(&name.as_str()))
+                        .unwrap_or_else(|e| {
+                            refused.push(format!("{e:#}"));
+                            None
+                        })
+                }
+                _ => None,
+            };
             let mut trap = |why: &'static str| {
                 traps.push(((*soname).to_owned(), name.clone(), why));
                 format!("Entry::Trap({})", traps.len() - 1)
             };
-            let entry = match (guest_view.functions.get(name), host_ir.functions.get(name)) {
-                // both engines: the shim maps the guest env to the host's (engine/ndk.rs); its other arguments are integer lanes in one address space
-                (Some(_), Some(_)) if PROXY_SHIMS.contains(&name.as_str()) => {
-                    "Entry::Shim".to_owned()
-                }
-                (Some(_), Some(_)) if ANNOTATED.contains(&name.as_str()) => {
-                    trap("pending: annotated, GS2.2")
-                }
-                // fn-return rows that are not shims (PROXY_SHIMS, eglGetProcAddress): a host function pointer must never reach the guest as a result
-                (Some(sig), Some(_)) if is_fn_ptr(&sig.ret) => trap("pending: fn-return, GS2.2"),
-                (Some(sig), Some(_)) if sig.params.iter().any(is_fn_ptr) => {
-                    trap("pending: callback-param, GS2.2")
-                }
-                (Some(sig), Some(_)) => {
-                    let ret = atl_bridgegen::jni::result_class(&sig.ret)
-                        .with_context(|| format!("{name}: result class"))?;
-                    // QEMU crosses by the lane image (dispatch.rs `call_host`): a prototype it cannot carry traps by name here, at bind time (R-1, Q7-4); identity passes the call through natively
-                    let params = atl_bridgegen::jni::param_classes(sig)
-                        .with_context(|| format!("{name}: parameter classes"))?;
-                    match atl_bridgegen::jni::lane_refusal(&params).filter(|_| qemu) {
-                        Some(why) => trap(why),
-                        None => format!("Entry::Generic(Host::System, {name:?}, Class::{ret:?})"),
+            // both engines: the guest env mapped to the host's, the other arguments int lanes in one address space (engine/ndk.rs `call_env`)
+            let entry = if let Some(index) = env {
+                env_rows.push(((*soname).to_owned(), name.clone(), index));
+                format!("Entry::Env({})", env_rows.len() - 1)
+            } else {
+                match (guest_view.functions.get(name), host_ir.functions.get(name)) {
+                    (Some(_), Some(_)) if PROXY_SHIMS.contains(&name.as_str()) => {
+                        "Entry::Shim".to_owned()
                     }
+                    (Some(_), Some(_)) if ANNOTATED.contains(&name.as_str()) => {
+                        trap("pending: annotated, GS2.2")
+                    }
+                    // fn-return rows that are not shims (PROXY_SHIMS, eglGetProcAddress): a host function pointer must never reach the guest as a result
+                    (Some(sig), Some(_)) if is_fn_ptr(&sig.ret) => {
+                        trap("pending: fn-return, GS2.2")
+                    }
+                    (Some(sig), Some(_)) if sig.params.iter().any(is_fn_ptr) => {
+                        trap("pending: callback-param, GS2.2")
+                    }
+                    (Some(sig), Some(_)) => {
+                        // a record by value (NDK imagedecoder.h `ARect AImageDecoderFrameInfo_getFrameRect`) has no lane class: trapped by name, both engines (the identity table's Generic rows carry a class too)
+                        match (
+                            atl_bridgegen::jni::result_class(&sig.ret),
+                            atl_bridgegen::jni::param_classes(sig),
+                        ) {
+                            (Ok(ret), Ok(params)) => {
+                                // QEMU crosses by the lane image (dispatch.rs `call_host`): a prototype it cannot carry traps by name here, at bind time (R-1, Q7-4); identity passes the call through natively
+                                match atl_bridgegen::jni::lane_refusal(&params).filter(|_| qemu) {
+                                    Some(why) => trap(why),
+                                    None => format!(
+                                        "Entry::Generic(Host::System, {name:?}, Class::{ret:?})"
+                                    ),
+                                }
+                            }
+                            _ => trap("pending: a record by value has no lane class"),
+                        }
+                    }
+                    _ => trap(missing_prototype(soname)),
                 }
-                _ => trap(missing_prototype(soname)),
             };
             let prototyped =
                 guest_view.functions.contains_key(name) && host_ir.functions.contains_key(name);
@@ -819,6 +969,18 @@ fn bindings_table(
             ));
         }
         rows.push((soname, entries));
+    }
+    ensure!(
+        refused.is_empty(),
+        "{} proxy prototype(s) with JNI types refused a binding (build.rs ENV_SHIMS): {}",
+        refused.len(),
+        refused.join(" | ")
+    );
+    for n in ENV_SHIMS {
+        ensure!(
+            env_rows.iter().any(|(_, r, _)| r == n),
+            "{n}: in ENV_SHIMS but no proxy library lists it with a prototype in the set"
+        );
     }
     let libc = libc_entries(&libc_names, qemu, &mut |name, why| {
         traps.push(("libc.so".to_owned(), name.to_owned(), why));
@@ -884,6 +1046,23 @@ fn bindings_table(
     );
     for i in 0..traps.len() {
         code.push_str(&format!("    trap::<{i}>,\n"));
+    }
+    code.push_str("];\n\n");
+    // the env class's host sides: one six-lane forwarder per row (atl_bridgegen::jni::ENV_LANES)
+    ensure!(
+        atl_bridgegen::jni::ENV_LANES == 6,
+        "the env forwarder below takes 6 lanes, atl_bridgegen::jni::ENV_LANES is {}",
+        atl_bridgegen::jni::ENV_LANES
+    );
+    code.push_str("/// Per `Entry::Env(i)`: library, symbol, the index of its `JNIEnv*` parameter.\npub const ENV_ROWS: &[(&str, &str, usize)] = &[\n");
+    for (lib, name, index) in &env_rows {
+        code.push_str(&format!("    ({lib:?}, {name:?}, {index}),\n"));
+    }
+    code.push_str(
+        "];\n\n/// The host side of `Entry::Env(I)`: its six int lanes to ndk.rs `call_env`.\nextern \"C\" fn env<const I: usize>(a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> usize {\n    super::super::ndk::call_env(ENV_ROWS[I], [a0, a1, a2, a3, a4, a5])\n}\n\n/// `env::<i>` per `Entry::Env(i)`.\npub const ENV_FNS: &[extern \"C\" fn(usize, usize, usize, usize, usize, usize) -> usize] = &[\n",
+    );
+    for i in 0..env_rows.len() {
+        code.push_str(&format!("    env::<{i}>,\n"));
     }
     code.push_str("];\n");
     // one copy: sles.rs asserts against the identity table's (the layout is the host view's, the same for both tables)

@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Fri, 13 Nov 2026 11:45:21 +0800
+Subject: [PATCH] Build libmediandk for x86_64 guests
+
+The identity engine runs x86_64 guests on an x86_64 host, so the
+NativeBridge guest needs an x86_64 build of the libmediandk proxy
+(Unity links it). Its stub list is LP64 and arch-neutral
+(stubs_arm64.cc equals stubs_riscv64.cc), so the x86_64 build takes
+the arm64 list, as 0004, 0005 and 0007 do.
+
+Upstream-Status: Pending
+Patch-Reason: the x86_64 arch block lives inside this Android.bp module, which no launcher, loader or environment setting can add; the stub list is shared by every LP64 arch here
+---
+SPDX-License-Identifier: Apache-2.0
+ android_api/libmediandk/Android.bp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/android_api/libmediandk/Android.bp b/android_api/libmediandk/Android.bp
+index 0f8145f38db77f2127a2f0386dff9d11b53ddcbd..11c749f945ecb2c10d6f8b5928f16b02764ceb84 100644
+--- a/android_api/libmediandk/Android.bp
++++ b/android_api/libmediandk/Android.bp
+@@ -30,6 +30,9 @@ cc_library {
+         arm64: {
+             srcs: ["stubs_arm64.cc"],
+         },
++        x86_64: {
++            srcs: ["stubs_arm64.cc"],
++        },
+         riscv64: {
+             srcs: ["stubs_riscv64.cc"],
+         },
