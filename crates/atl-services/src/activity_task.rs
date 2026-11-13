@@ -29,7 +29,8 @@ use crate::activity::{
 use crate::activity_stack::{Command, Machine, ResultTo, Step};
 use crate::activity_start::{self, Call, Refusal, Source, Start, Target};
 use crate::config_diff::Config;
-use crate::packages::{Packages, real_config_changes};
+use crate::packages::{Packages, Permissions, real_config_changes};
+use crate::permission_request;
 use crate::tasks::{TaskId, Tasks};
 use crate::token;
 use atl_parcelables::android::content::pm::ActivityInfo;
@@ -111,14 +112,24 @@ pub(crate) fn affinity_of(decl: &ActivityInfo, package: &str) -> String {
 
 /// Answers the result `owed` as cancelled (RESULT_CANCELED, no data), as every cancelled start does (ActivityStarter.java:1222, 2470, 2846); nothing when none is owed.
 fn cancel_owed(m: &mut Lifecycle, owed: Option<&ResultTo<SpIBinder>>) -> Vec<Cmd> {
+    answer_owed(m, owed, RESULT_CANCELED, None)
+}
+
+/// Answers the result `owed` with (`code`, `data`) through the one deliver path (Machine::deliver: at once to a resumed caller, else with its next resume); nothing when none is owed.
+fn answer_owed(
+    m: &mut Lifecycle,
+    owed: Option<&ResultTo<SpIBinder>>,
+    code: i32,
+    data: Option<Intent>,
+) -> Vec<Cmd> {
     owed.map_or_else(Vec::new, |to| {
         m.deliver(
             to,
             ResultInfo {
                 result_who: to.who.clone(),
                 request_code: to.request_code,
-                result_code: RESULT_CANCELED,
-                data: None,
+                result_code: code,
+                data,
                 caller_token: None,
             },
         )
@@ -148,6 +159,8 @@ fn step_names<L, I, R>(steps: &[Step<L, I, R>]) -> String {
 
 pub struct ActivityTasks {
     packages: Arc<Packages>,
+    /// the callers' grants: a dismissed permission request returns their current state (permission_request)
+    permissions: Arc<Permissions>,
     tasks: Arc<Tasks<SpIBinder>>,
     /// the ActivityClientController every LaunchActivityItem names: ActivityClient routes its calls through it
     controller: SpIBinder,
@@ -161,11 +174,13 @@ pub struct ActivityTasks {
 impl ActivityTasks {
     pub(crate) fn new(
         packages: Arc<Packages>,
+        permissions: Arc<Permissions>,
         tasks: Arc<Tasks<SpIBinder>>,
         controller: SpIBinder,
     ) -> Self {
         ActivityTasks {
             packages,
+            permissions,
             tasks,
             controller,
             machine: Mutex::new(Machine::new()),
@@ -398,6 +413,37 @@ impl ActivityTasks {
             }),
             _ => None,
         };
+        // runtime-permissions P1 (owner 2026-11-14): no permission controller installed -> the request is answered as dismissed; deleted when PermissionController is the controller (S4)
+        if let Some(request) = intent.filter(|_| {
+            permission_request::answered_as_dismissed(intent, self.packages.permission_controller())
+        }) {
+            let target_sdk = self
+                .packages
+                .by_name(calling_package)
+                .map_or(0, |p| p.app().target_sdk_version);
+            let data =
+                permission_request::dismissed_result(request, calling_package, target_sdk, |p| {
+                    self.permissions.check(calling_uid, Some(p))
+                });
+            counters::answered(
+                ATM,
+                "startActivity REQUEST_PERMISSIONS (no permission controller: dismissed, P1)",
+            );
+            log(format_args!(
+                "activity permission request from {calling_package} answered as dismissed (no permission controller) owed={} at={}",
+                owed.is_some(),
+                counters::wall_stamp()
+            ));
+            let commands = answer_owed(
+                &mut m,
+                owed.as_ref(),
+                permission_request::RESULT_OK,
+                Some(data),
+            );
+            self.note_settle(&m);
+            self.send(commands);
+            return Ok(activity_start::START_SUCCESS);
+        }
         let source_task = source.as_ref().and_then(|(t, _)| m.task_of(t));
         let class = component.map(|(_, class)| class);
         let instance = source_task
@@ -809,8 +855,10 @@ mod tests {
         let mut record = crate::packages::fixture::record(PACKAGE);
         record.uid = UID;
         record.info.activities = Some(vec![Some(decl(LAUNCHER)), Some(decl(VIDEO))]);
+        let packages = Arc::new(Packages::new(vec![record], BTreeMap::new()));
         ActivityTasks::new(
-            Arc::new(Packages::new(vec![record], BTreeMap::new())),
+            Arc::clone(&packages),
+            Arc::new(Permissions::new(&packages, &[])),
             Arc::new(Tasks::new(DisplayModel::default())),
             token::new(),
         )
@@ -921,5 +969,129 @@ mod tests {
             })
         );
         assert!(launched.extras.is_none());
+    }
+
+    /// Activity.requestPermissions' who (Activity.java:807 REQUEST_PERMISSIONS_WHO_PREFIX) and PackageManager.buildRequestPermissionsIntent's start for POST_NOTIFICATIONS.
+    const PERMISSIONS_WHO: &str = "@android:requestPermissions:";
+    const POST_NOTIFICATIONS: &str = "android.permission.POST_NOTIFICATIONS";
+
+    /// The REQUEST_PERMISSIONS start from the resumed launcher; the results the app thread got for it (request code, result code, data).
+    fn request_permissions(atm: &ActivityTasks) -> (i32, Vec<(i32, i32, Option<Intent>)>) {
+        let (thread, scheduled) = app_thread();
+        let source = attach_launcher(atm, &thread);
+        atm.resumed(&source);
+        let request = Intent {
+            action: Some(permission_request::ACTION_REQUEST_PERMISSIONS.into()),
+            extras: Some(Bundle::from_entries([(
+                permission_request::EXTRA_NAMES.to_owned(),
+                Value::StringArray(Some(vec![Some(POST_NOTIFICATIONS.into())])),
+            )])),
+            ..Default::default()
+        };
+        let status = atm
+            .start(
+                &thread,
+                UID,
+                PACKAGE,
+                StartArgs {
+                    intent: Some(&request),
+                    reuse: true,
+                    results: true,
+                    request_code: REQUEST_CODE,
+                    result_to: Some(&source),
+                    result_who: Some(PERMISSIONS_WHO),
+                },
+            )
+            .expect("start");
+        let results = scheduled
+            .lock()
+            .expect("transactions lock")
+            .iter()
+            .flat_map(|t| t.items.iter().flatten())
+            .filter_map(|item| match item {
+                ClientTransactionItem::ActivityResult(r) => Some(r.result_infos.clone()),
+                _ => None,
+            })
+            .flatten()
+            .flatten()
+            .flatten()
+            .inspect(|r| assert_eq!(r.result_who.as_deref(), Some(PERMISSIONS_WHO)))
+            .map(|r| (r.request_code, r.result_code, r.data))
+            .collect();
+        (status, results)
+    }
+
+    /// P1 fires with no permission controller installed: the start succeeds (the dialog would have started) and the owed result is GrantPermissionsActivity's dismissal: RESULT_OK (-1) with
+    /// the requested name and its current state, PERMISSION_DENIED (-1) for a runtime permission never granted.
+    #[test]
+    fn permission_request_without_a_controller_is_answered_as_dismissed() {
+        let atm = fixture_atm();
+        let (status, results) = request_permissions(&atm);
+        assert_eq!(status, activity_start::START_SUCCESS);
+        let [(code, result, Some(data))] = results.as_slice() else {
+            panic!("one result with data, got {results:?}");
+        };
+        assert_eq!((*code, *result), (REQUEST_CODE, -1));
+        let extras: BTreeMap<String, Value> = data
+            .extras
+            .as_ref()
+            .expect("extras")
+            .entries()
+            .expect("entries")
+            .into_iter()
+            .collect();
+        assert_eq!(
+            extras.get(permission_request::EXTRA_NAMES),
+            Some(&Value::StringArray(Some(vec![Some(
+                POST_NOTIFICATIONS.into()
+            )])))
+        );
+        assert_eq!(
+            extras.get(permission_request::EXTRA_RESULTS),
+            Some(&Value::IntArray(Some(vec![-1])))
+        );
+    }
+
+    /// With a resolvable controller (a privileged system package resolving MANAGE_PERMISSIONS) P1 stays out of the way: the start takes the normal path, which refuses the implicit intent
+    /// (START_INTENT_NOT_RESOLVED, -91) and cancels the owed result (RESULT_CANCELED 0, no data) until runtime-permissions S5 resolves it.
+    #[test]
+    fn permission_request_with_a_controller_takes_the_normal_start() {
+        let controller = "com.android.permissioncontroller";
+        let class = "com.android.permissioncontroller.permission.ui.ManagePermissionsActivity";
+        let mut c = crate::packages::fixture::record(controller);
+        c.uid = 10_200;
+        c.info.activities = Some(vec![Some(crate::packages::fixture::activity(
+            controller, class,
+        ))]);
+        c.intents.push(crate::installed::ComponentIntents {
+            kind: atl_services_types::installer_output::Kind::ActivityIntents,
+            name: class.to_owned(),
+            intents: vec![crate::packages::fixture::filter(
+                &["android.intent.action.MANAGE_PERMISSIONS"],
+                &["android.intent.category.DEFAULT"],
+            )],
+        });
+        if let Some(a) = c.info.application_info.as_mut() {
+            // FLAG_SYSTEM, PRIVATE_FLAG_PRIVILEGED (ApplicationInfo.java:189, :535)
+            a.flags = 1;
+            a.private_flags = 1 << 3;
+        }
+        let mut app = crate::packages::fixture::record(PACKAGE);
+        app.uid = UID;
+        app.info.activities = Some(vec![Some(decl(LAUNCHER))]);
+        let packages = Arc::new(Packages::new(vec![app, c], BTreeMap::new()));
+        assert_eq!(packages.permission_controller(), Some(controller));
+        let atm = ActivityTasks::new(
+            Arc::clone(&packages),
+            Arc::new(Permissions::new(&packages, &[])),
+            Arc::new(Tasks::new(DisplayModel::default())),
+            token::new(),
+        );
+        let (status, results) = request_permissions(&atm);
+        assert_eq!(status, activity_start::START_INTENT_NOT_RESOLVED);
+        assert!(
+            matches!(results.as_slice(), [(REQUEST_CODE, 0, None)]),
+            "{results:?}"
+        );
     }
 }

@@ -107,6 +107,10 @@ pub enum Value {
         class: String,
         body: Vec<u8>,
     },
+    /// String[] (VAL_STRINGARRAY, writeStringArray: int32 count, -1 = null, then writeString each); not length-prefixed.
+    StringArray(Option<Vec<Option<String>>>),
+    /// int[] (VAL_INTARRAY, writeIntArray: int32 count, -1 = null, then the ints); not length-prefixed.
+    IntArray(Option<Vec<i32>>),
 }
 
 impl Value {
@@ -138,6 +142,8 @@ const VAL_PARCELABLE: i32 = 4;
 const VAL_LONG: i32 = 6;
 const VAL_FLOAT: i32 = 7;
 const VAL_BOOLEAN: i32 = 9;
+const VAL_STRINGARRAY: i32 = 14;
+const VAL_INTARRAY: i32 = 18;
 
 /// String.hashCode: the order of an ArrayMap's entries, which Parcel.readArrayMap appends in the order written (Parcel.java:5688-5689, `sorted`).
 fn java_hash(s: &str) -> i32 {
@@ -191,6 +197,21 @@ impl Words<'_> {
             .map(Some)
             .map_err(|_| crate::refuse("android.os.Bundle (string encoding)"))
     }
+
+    /// An array's int32 count: -1 = null, another negative is refused.
+    fn count(&mut self) -> Result<Option<usize>> {
+        match self.i32()? {
+            -1 => Ok(None),
+            n => usize::try_from(n)
+                .map(Some)
+                .map_err(|_| crate::refuse("android.os.Bundle (array length)")),
+        }
+    }
+}
+
+fn put_count(out: &mut Vec<u8>, n: Option<usize>) {
+    let n = n.map_or(-1, |n| i32::try_from(n).unwrap_or(i32::MAX));
+    out.extend_from_slice(&n.to_ne_bytes());
 }
 
 fn put_string(out: &mut Vec<u8>, s: &Option<String>) {
@@ -303,6 +324,14 @@ impl Bundle {
                             body: o.0.to_vec(),
                         }
                     }
+                    VAL_STRINGARRAY => Value::StringArray(match w.count()? {
+                        None => None,
+                        Some(n) => Some((0..n).map(|_| w.string()).collect::<Result<_>>()?),
+                    }),
+                    VAL_INTARRAY => Value::IntArray(match w.count()? {
+                        None => None,
+                        Some(n) => Some((0..n).map(|_| w.i32()).collect::<Result<_>>()?),
+                    }),
                     _ => return Err(crate::refuse("android.os.Bundle (value type)")),
                 };
                 Ok((key, value))
@@ -364,6 +393,20 @@ impl Bundle {
                             .to_ne_bytes(),
                     );
                     body.extend_from_slice(&prefixed);
+                }
+                Value::StringArray(a) => {
+                    body.extend_from_slice(&tag(VAL_STRINGARRAY));
+                    put_count(&mut body, a.as_ref().map(Vec::len));
+                    for s in a.iter().flatten() {
+                        put_string(&mut body, s);
+                    }
+                }
+                Value::IntArray(a) => {
+                    body.extend_from_slice(&tag(VAL_INTARRAY));
+                    put_count(&mut body, a.as_ref().map(Vec::len));
+                    for i in a.iter().flatten() {
+                        body.extend_from_slice(&i.to_ne_bytes());
+                    }
                 }
             }
         }

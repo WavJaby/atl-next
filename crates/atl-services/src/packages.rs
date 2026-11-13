@@ -25,6 +25,11 @@ pub const GET_META_DATA: i64 = 0x80;
 pub const MATCH_DISABLED_COMPONENTS: i64 = 0x200;
 const ACTION_MAIN: &str = "android.intent.action.MAIN";
 const CATEGORY_LAUNCHER: &str = "android.intent.category.LAUNCHER";
+const ACTION_MANAGE_PERMISSIONS: &str = "android.intent.action.MANAGE_PERMISSIONS";
+const CATEGORY_DEFAULT: &str = "android.intent.category.DEFAULT";
+/// ApplicationInfo.FLAG_SYSTEM (1<<0) and PRIVATE_FLAG_PRIVILEGED (1<<3), ApplicationInfo.java:189, :535.
+const FLAG_SYSTEM: i32 = 1;
+const PRIVATE_FLAG_PRIVILEGED: i32 = 1 << 3;
 
 /// One installed package.
 #[derive(Debug, Clone)]
@@ -147,6 +152,31 @@ pub struct Packages {
 impl Packages {
     pub fn new(list: Vec<PackageRecord>, libraries: BTreeMap<String, Library>) -> Self {
         Packages { list, libraries }
+    }
+
+    /// getPermissionControllerPackageName: PMS.getRequiredPermissionControllerLPr (PackageManagerService.java:2700-2716) resolves ACTION_MANAGE_PERMISSIONS + CATEGORY_DEFAULT among system
+    /// packages (MATCH_SYSTEM_ONLY: ApplicationInfo FLAG_SYSTEM) and wants exactly one match, a privileged app. AOSP throws at boot otherwise; here None = no controller installed (no package
+    /// is a system package until runtime-permissions S4 installs PermissionController).
+    pub fn permission_controller(&self) -> Option<&str> {
+        let mut matches = self
+            .list
+            .iter()
+            .filter(|p| p.app().flags & FLAG_SYSTEM != 0)
+            .flat_map(|p| {
+                p.activities()
+                    .filter(|a| a.component.enabled)
+                    .filter(move |a| {
+                        let name = a.component.item.name.as_deref().unwrap_or_default();
+                        p.intents(Kind::ActivityIntents, name)
+                            .iter()
+                            .any(|i| has(i, ACTION_MANAGE_PERMISSIONS, CATEGORY_DEFAULT))
+                    })
+                    .map(move |_| p)
+            });
+        let (Some(only), None) = (matches.next(), matches.next()) else {
+            return None;
+        };
+        (only.app().private_flags & PRIVATE_FLAG_PRIVILEGED != 0).then(|| only.name())
     }
 
     pub fn by_name(&self, name: &str) -> Option<&PackageRecord> {
@@ -415,13 +445,18 @@ fn named(c: &ComponentInfo, class: &str) -> bool {
 
 /// An intent filter with action MAIN and category LAUNCHER.
 fn launches(i: &ParsedIntentInfo) -> bool {
+    has(i, ACTION_MAIN, CATEGORY_LAUNCHER)
+}
+
+/// The filter lists `action` and `category`.
+fn has(i: &ParsedIntentInfo, action: &str, category: &str) -> bool {
     i.intent_filter.as_ref().is_some_and(|f| {
-        f.actions.iter().flatten().any(|a| a == ACTION_MAIN)
+        f.actions.iter().flatten().any(|a| a == action)
             && f.categories
                 .iter()
                 .flatten()
                 .flatten()
-                .any(|c| c == CATEGORY_LAUNCHER)
+                .any(|c| c == category)
     })
 }
 
@@ -698,6 +733,59 @@ mod tests {
         // break: without the filters nothing launches
         r.intents.clear();
         assert!(r.launcher().is_none());
+    }
+
+    /// getRequiredPermissionControllerLPr: exactly one system package with an enabled MANAGE_PERMISSIONS + DEFAULT activity, privileged. PermissionController's manifest declares that filter
+    /// on ManagePermissionsActivity (packages/modules/Permission/PermissionController AndroidManifest.xml).
+    #[test]
+    fn permission_controller_is_the_one_privileged_system_manage_permissions_package() {
+        let pkg = "com.android.permissioncontroller";
+        let class = "com.android.permissioncontroller.permission.ui.ManagePermissionsActivity";
+        let controller = |flags: i32, private_flags: i32| {
+            let mut r = record(pkg);
+            r.info.activities = Some(vec![Some(activity(pkg, class))]);
+            r.intents.push(ComponentIntents {
+                kind: Kind::ActivityIntents,
+                name: class.to_owned(),
+                intents: vec![filter(&[ACTION_MANAGE_PERMISSIONS], &[CATEGORY_DEFAULT])],
+            });
+            if let Some(a) = r.info.application_info.as_mut() {
+                a.flags = flags;
+                a.private_flags = private_flags;
+            }
+            r
+        };
+        let of = |list: Vec<PackageRecord>| {
+            Packages::new(list, BTreeMap::new())
+                .permission_controller()
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            of(vec![
+                record("org.x"),
+                controller(FLAG_SYSTEM, PRIVATE_FLAG_PRIVILEGED)
+            ])
+            .as_deref(),
+            Some(pkg)
+        );
+        // what every install has today: no system package -> none
+        assert_eq!(
+            of(vec![
+                record("org.x"),
+                controller(0, PRIVATE_FLAG_PRIVILEGED)
+            ]),
+            None
+        );
+        assert_eq!(of(vec![controller(FLAG_SYSTEM, 0)]), None);
+        let mut second = controller(FLAG_SYSTEM, PRIVATE_FLAG_PRIVILEGED);
+        second.info.package_name = Some("org.other".into());
+        assert_eq!(
+            of(vec![
+                controller(FLAG_SYSTEM, PRIVATE_FLAG_PRIVILEGED),
+                second
+            ]),
+            None
+        );
     }
 
     /// Temple Run's base (aapt2 xmltree, row `temple-run`): `com.google.firebase.components.ComponentDiscoveryService` exported=false directBootAware=true, whose meta-data lists the Firebase

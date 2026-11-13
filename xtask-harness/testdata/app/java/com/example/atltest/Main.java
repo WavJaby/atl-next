@@ -127,6 +127,18 @@ public class Main extends Activity {
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         Log.i("AtlTest", "main new intent");
+        requestPermissions(new String[] {POST_NOTIFICATIONS}, REQUEST_PERMISSION);
+    }
+
+    /** The permission request after the result round trip (app.rs PERMISSION_REQUEST). */
+    private static final int REQUEST_PERMISSION = 11;
+    private static final String POST_NOTIFICATIONS = "android.permission.POST_NOTIFICATIONS";
+
+    /** "permission-request request=<r> names=<[..]> results=<[..]> self=<int>": the callback's arguments and checkSelfPermission after it (app.rs PERMISSION_REQUEST). */
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        Log.i("AtlTest", "permission-request request=" + requestCode + " names=" + java.util.Arrays.toString(permissions)
+                + " results=" + java.util.Arrays.toString(grantResults) + " self=" + checkSelfPermission(POST_NOTIFICATIONS));
     }
 
     /**

@@ -575,6 +575,7 @@ impl ActivityManager {
                 Inner {
                     atm: Arc::new(ActivityTasks::new(
                         Arc::clone(&packages),
+                        Arc::clone(&permissions),
                         Arc::clone(&tasks),
                         controller.clone(),
                     )),

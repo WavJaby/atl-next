@@ -263,7 +263,13 @@ const RESULT_CANCELED: &str = "request=9 code=0 extra=none";
 const CHILD_FINISHING: &str = "AtlTest: result child finishing";
 const MAIN_RESUMED: &str = "AtlTest: main resumed";
 const MAIN_NEW_INTENT: &str = "AtlTest: main new intent";
-/// How long the watch after the marker waits for the round trip's last line ([`MAIN_NEW_INTENT`]) once WINDOW_MS has passed. The gate reads the log without it after this, so a slow host
+/// Main.onNewIntent's requestPermissions(POST_NOTIFICATIONS, 11) (Main.java onRequestPermissionsResult), the round trip's last line. With no permission controller installed (runtime-permissions P1) the
+/// services answer it as GrantPermissionsActivity's dismissal: setResultIfNeeded returns the requested names and checkPermission of each for a targetSdk >= M app (36 here); the never-granted
+/// runtime permission is PERMISSION_DENIED (-1), and checkSelfPermission stays -1 (a dismissal grants nothing). Activity.dispatchRequestPermissionsResult hands both arrays to the callback.
+const PERMISSION_REQUEST: &str = "AtlTest: permission-request ";
+const PERMISSION_DISMISSED: &str =
+    "request=11 names=[android.permission.POST_NOTIFICATIONS] results=[-1] self=-1";
+/// How long the watch after the marker waits for the round trip's last line ([`PERMISSION_REQUEST`]) once WINDOW_MS has passed. The gate reads the log without it after this, so a slow host
 /// gets this long and a broken round trip fails after it.
 const RESULT_WAIT: Duration = Duration::from_secs(30);
 const FONT_TEXT: &str = "Handgloves";
@@ -774,6 +780,14 @@ fn result_failures(app: &str) -> Vec<String> {
         (_, None) => whys.push(format!("main new intent: no {MAIN_NEW_INTENT:?} line")),
         _ => {}
     }
+    let permission = app
+        .lines()
+        .find_map(|l| l.split_once(PERMISSION_REQUEST).map(|(_, r)| r.trim_end()));
+    if permission != Some(PERMISSION_DISMISSED) {
+        whys.push(format!(
+            "permission request: want {PERMISSION_DISMISSED:?}, got {permission:?}"
+        ));
+    }
     whys
 }
 
@@ -933,7 +947,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let watch = Instant::now();
         while ended.is_none()
             && (watch.elapsed() < Duration::from_millis(WINDOW_MS)
-                || (watch.elapsed() < RESULT_WAIT && !read(&app_log).contains(MAIN_NEW_INTENT)))
+                || (watch.elapsed() < RESULT_WAIT && !read(&app_log).contains(PERMISSION_REQUEST)))
         {
             ended = atld_child.try_wait()?;
             if ended.is_none() && run.app_ended() {
@@ -1154,7 +1168,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         println!(
             "app: pass mediaplayer-reset {MEDIA_RESET_ROUNDS} resets with a seek pending, each within {MEDIA_ROUND_BOUND_MS} ms"
         );
-        println!("app: pass result {RESULT_CHILD}; {RESULT_CANCELED} before main new intent");
+        println!(
+            "app: pass result {RESULT_CHILD}; {RESULT_CANCELED} before main new intent; permission-request {PERMISSION_DISMISSED}"
+        );
         if let Some(n) = es1_compared {
             println!(
                 "app: pass es1 {n} pixels match the scene model (libGLESv1_CM.so through the proxies)"
@@ -1457,6 +1473,7 @@ mod tests {
         "AtlTest: main resumed\n",
         "AtlTest: result request=9 code=0 extra=none\n",
         "AtlTest: main new intent\n",
+        "AtlTest: permission-request request=11 names=[android.permission.POST_NOTIFICATIONS] results=[-1] self=-1\n",
     );
 
     #[test]
@@ -1488,8 +1505,24 @@ mod tests {
                 .iter()
                 .any(|w| w.starts_with("result 9: want"))
         );
-        // nothing logged after the marker: all three required lines are reported
-        assert_eq!(result_failures("AtlTest: onCreate reached\n").len(), 3);
+        // a request answered as RESULT_CANCELED with no data (empty arrays) or granted is not AOSP's dismissal
+        for got in [
+            "names=[] results=[] self=-1",
+            "names=[android.permission.POST_NOTIFICATIONS] results=[0] self=0",
+        ] {
+            let other = ROUND_TRIP.replace(
+                "names=[android.permission.POST_NOTIFICATIONS] results=[-1] self=-1",
+                got,
+            );
+            assert!(
+                result_failures(&other)
+                    .iter()
+                    .any(|w| w.starts_with("permission request: want")),
+                "{got}"
+            );
+        }
+        // nothing logged after the marker: all four required lines are reported
+        assert_eq!(result_failures("AtlTest: onCreate reached\n").len(), 4);
     }
 
     #[test]

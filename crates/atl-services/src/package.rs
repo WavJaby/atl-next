@@ -295,6 +295,11 @@ impl IPackageManager for PackageManager {
         atl_services_wire::unimplemented(INTERFACE, method)
     }
 
+    /// PMS.getPermissionControllerPackageName: the package Packages::permission_controller resolves; null while none is installed (the condition of runtime-permissions P1).
+    fn r#getPermissionControllerPackageName(&self) -> binder::Result<Option<String>> {
+        Ok(self.packages.permission_controller().map(str::to_owned))
+    }
+
     /// ComputerEngine.getApplicationInfo:986: null for a package the caller may not see or that does not exist.
     fn r#getApplicationInfo(
         &self,

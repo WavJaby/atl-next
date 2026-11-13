@@ -67,6 +67,8 @@ pub mod pending_intent;
 #[cfg(feature = "converter")]
 pub mod permission_manager;
 #[cfg(feature = "converter")]
+pub mod permission_request;
+#[cfg(feature = "converter")]
 pub mod process_info;
 #[cfg(feature = "converter")]
 pub mod registry_service;
