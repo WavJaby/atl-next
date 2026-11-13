@@ -88,8 +88,9 @@ mirrors = [
 [package]
 src = [
     "crates/atl-services/src/package.rs",
+    "crates/atl-services/src/packages.rs",
+    "crates/atl-services/src/install.rs",
     "crates/atl-services-types/src/packages.rs",
-    "crates/atl-services-types/src/manifest_flags.rs",
     "crates/atl-services-types/src/native_libs.rs",
 ]
 mirrors = [
@@ -100,6 +101,7 @@ mirrors = [
     "frameworks/base/services/core/java/com/android/server/pm/PackageAbiHelperImpl.java#deriveNativeLibraryPaths",
     "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#getApplicationInfo",
     "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#getPackageInfo",
+    "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#getServiceInfo",
     "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#getPackagesForUid",
     "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#checkSignatures",
     "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#getInstrumentationInfoAsUser",

@@ -17,9 +17,10 @@ use atl_parcelables::android::os::WorkSource;
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, Strong, ThreadState};
 
 use crate::alarm_table::{Alarm, AlarmTable};
+use crate::packages::Packages;
+use crate::packages::Permissions;
 use atl_services_types::counters;
-use atl_services_types::packages::Packages;
-use atl_services_types::permission::{self, Permissions};
+use atl_services_types::permission;
 
 /// The interface name counters use.
 const INTERFACE: &str = "IAlarmManager";

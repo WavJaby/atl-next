@@ -39,9 +39,9 @@ use binder::{
 
 use crate::focus::FocusedProcess;
 use crate::ime_bind::{self, Bind, ClientBind, Peer};
+use crate::packages::Permissions;
 use crate::ui_agents::UiAgents;
 use atl_services_types::counters;
-use atl_services_types::permission::Permissions;
 use atl_services_wire::ui_agent::IUiAgent;
 use std::sync::Arc;
 

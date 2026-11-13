@@ -55,7 +55,7 @@ use crate::activity_task::{ActivityTasks, Back};
 use crate::broadcast::{self, BroadcastFilter, Broadcasts, IntentKey, StickyRefusal};
 use crate::broadcast_queue::{self, Job};
 use crate::config_diff::{self, Config, Delivery};
-use crate::desktop_bounds::ActivityInput;
+use crate::packages::{PackageRecord, Packages, Permissions};
 use crate::pending_intent::{self, PendingIntents};
 use crate::pending_intent_table::Key;
 use crate::process_control::ProcessControl;
@@ -65,8 +65,7 @@ use crate::ui_agents::UiAgents;
 use crate::{package, settings};
 use atl_services_types::counters;
 use atl_services_types::display_model::DisplayModel;
-use atl_services_types::packages::{ActivityDecl, PackageRecord, Packages};
-use atl_services_types::permission::{self, Permissions, ROOT_UID, SHELL_UID, SYSTEM_UID};
+use atl_services_types::permission::{self, ROOT_UID, SHELL_UID, SYSTEM_UID};
 use atl_services_types::size_buckets::SizeBuckets;
 use atl_services_wire::ui_agent::IUiAgent;
 
@@ -283,13 +282,12 @@ pub(crate) fn launch_item(
     display: &DisplayModel,
     controller: &SpIBinder,
     p: &PackageRecord,
-    activity: &ActivityDecl,
+    activity: &ActivityInfo,
     token: SpIBinder,
     ident: i32,
     intent: Intent,
 ) -> LaunchActivityItem {
-    let ai = package::application_info(p, packages, package::STOCK_PM_FLAGS);
-    let info = package::activity_info(p, activity, ai, package::STOCK_PM_FLAGS);
+    let info = package::activity_info(p, packages, activity, package::STOCK_PM_FLAGS);
     LaunchActivityItem {
         activity_token: Some(token),
         ident,
@@ -603,7 +601,7 @@ impl ActivityManager {
             .packages
             .by_name(package)
             .ok_or_else(|| format!("no package {package}"))?;
-        if p.launch_activity().is_none() {
+        if p.launcher().is_none() {
             return Err(format!("{package} has no launcher activity"));
         }
         let mut st = self.inner.state();
@@ -621,9 +619,11 @@ impl ActivityManager {
         component: Option<(&str, &str)>,
     ) -> Result<i32, Status> {
         let p = component.and_then(|(package, _)| self.inner.packages.by_name(package));
-        let launcher = p.and_then(|p| p.launch_activity()).map(|d| d.name.as_str());
+        let launcher = p
+            .and_then(|p| p.launcher())
+            .and_then(|a| a.component.item.name.as_deref());
         let mut st = self.inner.state();
-        let running = p.is_some_and(|p| st.processes.iter().any(|r| r.package == p.name));
+        let running = p.is_some_and(|p| st.processes.iter().any(|r| r.package == p.name()));
         match activity_start::check_shell(calling_uid, flags, component, launcher, running) {
             Ok(()) => {}
             Err(Refusal::Code { code, .. }) => return Ok(code),
@@ -637,12 +637,12 @@ impl ActivityManager {
             .map_err(|e| {
                 Status::new_exception_str(
                     ExceptionCode::ILLEGAL_STATE,
-                    Some(format!("starting {}: {e}", p.name)),
+                    Some(format!("starting {}: {e}", p.name())),
                 )
             })?;
         log(format_args!(
             "activity start of {} from uid {calling_uid} (no caller app): process started",
-            p.name
+            p.name()
         ));
         Ok(activity_start::START_SUCCESS)
     }
@@ -847,20 +847,20 @@ impl Inner {
         let pid = self.control.start(&StartRequest {
             uid: p.uid,
             process_name: process_name.to_owned(),
-            package: p.name.clone(),
-            target_sdk: p.target_sdk,
+            package: p.name().to_owned(),
+            target_sdk: p.app().target_sdk_version,
             entry_point: ACTIVITY_THREAD.to_owned(),
             args: vec![format!("{PROC_START_SEQ_IDENT}{start_seq}")],
             instruction_set: p.instruction_set.clone(),
             rights: atl_broker::rights_of(p.granted_permissions.as_slice()),
         })?;
         // the launch's Task exists before the process attaches: the composer asks for its bounds and package at its window's install (registry TASK_INFO)
-        let task = p.launch_activity().filter(|_| launch_activity).map(|decl| {
-            let size = initial_size(&self.tasks.display(), &ActivityInput::from_decl(decl));
-            self.tasks.new_task(p.uid, &p.name, size)
+        let task = p.launcher().filter(|_| launch_activity).map(|a| {
+            let size = initial_size(&self.tasks.display(), &crate::packages::bounds_input(a));
+            self.tasks.new_task(p.uid, p.name(), size)
         });
         st.processes.push(ProcessRecord {
-            package: p.name.clone(),
+            package: p.name().to_owned(),
             process_name: process_name.to_owned(),
             uid: p.uid,
             start_seq,
@@ -1094,7 +1094,7 @@ impl Inner {
             );
             return;
         };
-        let Some(decl) = p.receivers.iter().find(|r| r.name == class && r.enabled) else {
+        let Some(decl) = p.receiver(class).filter(|r| r.component.enabled) else {
             counters::answered(
                 AM,
                 "broadcast to a component that is no enabled <receiver>: no receiver",
@@ -1105,7 +1105,7 @@ impl Inner {
         let target = broadcast::ManifestReceiver {
             component: &component,
             permission: decl.permission.as_deref(),
-            exported: decl.exported,
+            exported: decl.component.exported,
             uid: p.uid,
         };
         if let Some(why) = broadcast::skip_manifest(
@@ -1123,36 +1123,18 @@ impl Inner {
             return;
         }
         let process_name = decl
-            .process
+            .component
+            .process_name
             .as_deref()
             .unwrap_or(p.process_name())
             .to_owned();
-        let mut info = ActivityInfo {
-            component: ComponentInfo {
-                item: PackageItemInfo {
-                    name: Some(decl.name.clone()),
-                    package_name: Some(p.name.clone()),
-                    ..Default::default()
-                },
-                application_info: package::application_info(
-                    p,
-                    &self.packages,
-                    package::STOCK_PM_FLAGS,
-                ),
-                process_name: Some(process_name.clone()),
-                enabled: true,
-                exported: decl.exported,
-                ..Default::default()
-            },
-            permission: decl.permission.clone(),
-            ..Default::default()
-        };
-        info.component.application_info.uid = p.uid as i32;
+        // the stored receiver for STOCK_PM_FLAGS (ComputerEngine.queryIntentReceivers' ResolveInfo.activityInfo)
+        let info = package::activity_info(p, &self.packages, decl, package::STOCK_PM_FLAGS);
         // the receiver's Intent carries its component (BroadcastRecord.getReceiverIntent: setComponent for a ResolveInfo)
         let mut receiver_intent = intent.clone();
         receiver_intent.component = Some(ComponentName {
-            package: p.name.clone(),
-            class: decl.name.clone(),
+            package: p.name().to_owned(),
+            class: class.to_owned(),
         });
         let job = Job::Manifest {
             intent: receiver_intent,
@@ -1366,7 +1348,9 @@ impl IActivityManager for ActivityManager {
             .as_binder()
             .link_to_death(&mut death)
             .map_err(|e| illegal_state(&format!("linkToDeath: {e:?}")))?;
-        let core_settings = match atl_services_types::gl_driver::selection(inner.packages.all()) {
+        let core_settings = match atl_services_types::gl_driver::selection(
+            inner.packages.all().iter().map(|p| (p.name(), p.gl_driver)),
+        ) {
             Some((pkgs, values)) => Bundle::from_strings(&[
                 (atl_services_types::gl_driver::SELECTION_PKGS, pkgs.as_str()),
                 (
@@ -1463,7 +1447,7 @@ impl IActivityManager for ActivityManager {
         if launch
             && let Some(task) = task
             && let Some(p) = inner.packages.by_name(&package)
-            && let Some(activity) = p.launch_activity()
+            && let Some(activity) = p.launcher()
         {
             // the launch is the lifecycle's: the process's Task (made at its start), the record pushed, its Launch + Resume sent (activity_task.rs). The app starts with the global configuration and no override.
             inner
@@ -1623,14 +1607,12 @@ impl IActivityManager for ActivityManager {
             );
             return Ok(false);
         };
-        let Some(target) = inner.packages.by_name(&decl.target_package) else {
+        let target_package = decl.target_package.as_deref().unwrap_or_default();
+        let Some(target) = inner.packages.by_name(target_package) else {
             inner.report_start_failure(
                 watcher,
                 class_name,
-                &format!(
-                    "Unable to find instrumentation target package: {}",
-                    decl.target_package
-                ),
+                &format!("Unable to find instrumentation target package: {target_package}"),
             );
             return Ok(false);
         };
@@ -1649,7 +1631,7 @@ impl IActivityManager for ActivityManager {
                     .packages
                     .by_app_id(permission::app_id(calling_uid))
                     .next()
-                    .map_or("null", |p| p.name.as_str())
+                    .map_or("null", |p| p.name())
             );
             inner.report_start_failure(watcher, class_name, &msg);
             return Err(security(&msg));
@@ -1672,7 +1654,7 @@ impl IActivityManager for ActivityManager {
         };
         let instr = ActiveInstrumentation {
             class: class_name.clone(),
-            target_package: target.name.clone(),
+            target_package: target.name().to_owned(),
             arguments: arguments.cloned(),
             watcher: watcher.cloned(),
             ui_connection: connection.cloned(),
@@ -1680,12 +1662,12 @@ impl IActivityManager for ActivityManager {
             no_restart,
         };
         // :14613-14622 forceStopPackageLocked of the target, addAppLocked -> startProcessLocked
-        let kill = inner.force_stop_package_locked(&mut st, &target.name);
+        let kill = inner.force_stop_package_locked(&mut st, target.name());
         let started =
             inner.start_process_locked(&mut st, target, &default_process, false, Some(instr));
         drop(st);
         inner.kill(&kill);
-        started.map_err(|e| illegal_state(&format!("starting {}: {e}", target.name)))?;
+        started.map_err(|e| illegal_state(&format!("starting {}: {e}", target.name())))?;
         Ok(true)
     }
 
@@ -2094,7 +2076,10 @@ impl IActivityManager for ActivityManager {
                 Some("registerReceiver: null IntentFilter"),
             ));
         };
-        let target_sdk = inner.packages.by_name(&package).map_or(0, |p| p.target_sdk);
+        let target_sdk = inner
+            .packages
+            .by_name(&package)
+            .map_or(0, |p| p.app().target_sdk_version);
         let export = broadcast::register_export(flags, receiver.is_some(), target_sdk)
             .map_err(|m| illegal_argument(&m))?;
         if export.flag_missing_unchecked {

@@ -8,13 +8,13 @@ use atl_parcelables::android::view::{InputDevice, PointerIcon};
 use atl_parcelables::codecs::android::view::InputDevice::set_key_character_map;
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, ThreadState};
 
+use crate::packages::Permissions;
 use crate::ui_agents::UiAgents;
 use atl_services_types::counters;
 use atl_services_types::input_devices::{
     KEYBOARD, POINTER, SOURCE_KEYBOARD, SOURCE_MOUSE, SOURCE_TOUCHPAD, SOURCE_TOUCHSCREEN,
     TOUCHPAD, TOUCHSCREEN, VIRTUAL_KEYBOARD,
 };
-use atl_services_types::permission::Permissions;
 use atl_services_wire::ui_agent::IUiAgent;
 use std::sync::Arc;
 

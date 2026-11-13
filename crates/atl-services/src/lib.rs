@@ -59,6 +59,8 @@ pub mod notification;
 #[cfg(feature = "converter")]
 pub mod package;
 #[cfg(feature = "converter")]
+pub mod packages;
+#[cfg(feature = "converter")]
 pub mod pending_intent;
 #[cfg(feature = "converter")]
 pub mod permission_manager;

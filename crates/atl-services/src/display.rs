@@ -21,10 +21,10 @@ use std::sync::{Arc, Mutex};
 use atl_aidl::aidl::android::hardware::display::IDisplayManagerCallback::IDisplayManagerCallback;
 use binder::Strong;
 
+use crate::packages::Permissions;
 use crate::tasks::Tasks;
 use atl_services_types::counters;
 use atl_services_types::display_model::{self, DisplayModel};
-use atl_services_types::permission::Permissions;
 
 /// The interface name counters use.
 const INTERFACE: &str = "IDisplayManager";

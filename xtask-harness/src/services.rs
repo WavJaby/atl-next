@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! `xtask test binder` stage `services`: the M2 Rust services (crate atl-services) registered with AOSP servicemanager and called through binderd, inside binder.rs's harness.
 //! 1. atl-system-services as uid 1000 (AID_SYSTEM) registers `activity` and `package` (addService) for one test package, whose launcher the services start (`--launch`). The harness stands in for atld:
-//!    it serves the services' process control (atl_broker::control, their stdin) and starts the process they ask for, the client below, as the package's uid with the startSeq they chose.
+//!    the package is a code-less fixture APK the real installer parsed (installer::install_fixture) before the services start, answered to their control `Install` / `Commit`; it serves the services'
+//!    process control (atl_broker::control, their stdin) and starts the process they ask for, the client below, as the package's uid with the startSeq they chose.
 //! 2. atl-services-client `app` as that process: getService of each, attach -> bindApplication, finishAttach -> LaunchActivityItem, getDisplayId, the PackageManager subset,
 //!    the settings provider and its `call`, null returns, an unimplemented method, a denied @EnforcePermission method (crates/atl-services/src/bin/client.rs).
 //! 3. atl-services-client `system` as uid 1000: the same @EnforcePermission method passes the hook and reaches the unimplemented default.
@@ -9,19 +10,15 @@
 //!    server takes it as None (before aidl --rust_java_nullability it failed the transaction with UNEXPECTED_NULL) and getApplicationInfo answers null (parcelable flag 0).
 //! 5. The services' counter lines: the unimplemented calls of 2 and 3 were counted.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Sender, channel};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
-use atl_android_paths::{DATA_APP, DATA_USER, DATA_USER_DE};
 use atl_broker::control::{self, Request, Response};
 use atl_broker::{Broker, Process};
 use atl_layout::Layout;
-use atl_services_types::native_libs::LIB_DIR_NAME;
-use atl_services_types::packages::{ActivityDecl, InstrumentationDecl, Manifest, PackageRecord};
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 
 use crate::atld_run::without_stamp;
@@ -34,9 +31,6 @@ const APP_UID: u32 = 10_123;
 const ACTIVITY: &str = "com.example.atltest.Main";
 /// The instrumentation it declares (client.rs checks the PackageManager's answers for it).
 const INSTRUMENTATION: &str = "com.example.atltest.Runner";
-/// Its manifest values: versionCode 1, min and target SDK 34 (any; the client checks only what it is told here).
-const VERSION_CODE: i64 = 1;
-const SDK: i32 = 34;
 /// The prefix of the startSeq argument the services pass (ActivityThread.PROC_START_SEQ_IDENT).
 const SEQ_ARG: &str = "seq=";
 /// Android uids (android_filesystem_config.h): AID_SYSTEM, AID_SHELL.
@@ -57,6 +51,14 @@ const MUST_COUNT: &[&str] = &[
 
 /// One process's (exit success, output).
 type Run = (bool, String);
+
+/// The test package's manifest: launcher `.Main` (MAIN + LAUNCHER), one functional-test instrumentation targeting the package itself (client.rs checks both), versionCode 1, SDK 34 (any; the client
+/// checks only what it is told here). Code-less: the started process is atl-services-client, not the app.
+fn fixture_manifest() -> String {
+    format!(
+        "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\" package=\"{APP}\" android:versionCode=\"1\">\n  <uses-sdk android:minSdkVersion=\"34\" android:targetSdkVersion=\"34\"/>\n  <instrumentation android:name=\"{INSTRUMENTATION}\" android:targetPackage=\"{APP}\" android:functionalTest=\"true\"/>\n  <application android:hasCode=\"false\">\n    <activity android:name=\"{ACTIVITY}\" android:exported=\"true\">\n      <intent-filter>\n        <action android:name=\"android.intent.action.MAIN\"/>\n        <category android:name=\"android.intent.category.LAUNCHER\"/>\n      </intent-filter>\n    </activity>\n  </application>\n</manifest>\n"
+    )
+}
 
 fn wait(child: &mut Child, limit: Duration) -> Result<Option<std::process::ExitStatus>> {
     let start = Instant::now();
@@ -122,7 +124,7 @@ fn verdict(app: &Run, system: &Run, feature: &Run, info: &Run, services_log: &st
     fails
 }
 
-/// Runs the stage; the passes are printed, the failures returned. `host_arch`: the arches.toml `[host]` row the services run on; the record's native library dir is the one the installer gives a package without native code there (native_libs.rs: the first supported ISA, the host's).
+/// Runs the stage; the passes are printed, the failures returned. `host_arch`: the arches.toml `[host]` row the services run on; the device ABIs the services get are its rows (atld_run::device_abis).
 pub fn stage(
     root: &Path,
     out: &Path,
@@ -147,61 +149,17 @@ pub fn stage(
     }
     let client = packages::bin(root, out, PACKAGE, "atl-services-client")?;
     let services_log = test_root.join("services.log");
-    // the installed package, as atld's install step would write it
-    let record = PackageRecord {
-        manifest: Manifest {
-            name: APP.to_owned(),
-            version_code: VERSION_CODE,
-            version_name: None,
-            min_sdk: SDK,
-            target_sdk: SDK,
-            process_name: None,
-            application_theme: 0,
-            application_class: None,
-            app_component_factory: None,
-            application_meta_data: vec![],
-            application_booleans: BTreeMap::new(),
-            activities: vec![ActivityDecl {
-                name: ACTIVITY.to_owned(),
-                launcher: true,
-                theme: 0,
-                config_changes: 0,
-                booleans: BTreeMap::new(),
-                launch_mode: 0,
-                task_affinity: None,
-                process: None,
-                meta_data: vec![],
-                screen_orientation: atl_services_types::packages::SCREEN_ORIENTATION_UNSPECIFIED,
-                resizeable: true,
-                min_aspect_ratio: None,
-                max_aspect_ratio: None,
-            }],
-            receivers: vec![],
-            providers: vec![],
-            requested_permissions: vec![],
-            permissions: Vec::new(),
-            libraries: vec![],
-            // one instrumentation, targeting the package itself (client.rs INSTRUMENTATION)
-            instrumentation: vec![InstrumentationDecl {
-                name: INSTRUMENTATION.to_owned(),
-                target_package: APP.to_owned(),
-                target_processes: None,
-                handle_profiling: false,
-                functional_test: true,
-            }],
-        },
-        uid: APP_UID,
-        source_dir: format!("{DATA_APP}/{APP}/base.apk"),
-        primary_cpu_abi: None,
-        native_library_dir: format!("{DATA_APP}/{APP}/{LIB_DIR_NAME}/{host_arch}"),
-        instruction_set: host_arch.to_string(),
-        data_dir: format!("{DATA_USER}/0/{APP}"),
-        device_protected_data_dir: format!("{DATA_USER_DE}/0/{APP}"),
-        granted_permissions: vec![],
-        gl_driver: atl_services_types::gl_driver::GlDriver::Native,
-    };
-    let packages_file = test_root.join("packages.json");
-    std::fs::write(&packages_file, serde_json::to_vec_pretty(&[&record])?)?;
+    // the test package, installed for real: its manifest linked into a code-less APK, the installer run over it in its profile (the harness does atld's installd work here); the services
+    // decode the frames at their start (control Install), as under atld
+    let frames = crate::installer::install_fixture(
+        root,
+        host_arch,
+        out,
+        b,
+        &test_root.join("install"),
+        &fixture_manifest(),
+    )
+    .context("installing the test package")?;
     let (control_ours, control_theirs) = socketpair(
         AddressFamily::UNIX,
         SocketType::SEQPACKET,
@@ -209,20 +167,22 @@ pub fn stage(
         None,
     )?;
     let mut cmd = Command::new(&host);
-    cmd.arg("--packages")
-        .arg(&packages_file)
-        .arg("--keychars")
+    cmd.args(["--session", "0", "--first-uid", &APP_UID.to_string()]);
+    for a in crate::atld_run::device_abis(&arches, host_arch)? {
+        cmd.arg("--abi").arg(format!("{}={}", a.abi, a.isa));
+    }
+    cmd.arg("--keychars")
         .arg(&keychars)
         .args(["--launch", APP])
         .envs(env.iter().cloned());
     let mut services_spawn = binder::spawn_of(&cmd, AID_SYSTEM)?;
-    // what the services read by path, read-only at their own paths: the packages record and the keyboard maps (--keychars)
+    // what the services read by path, read-only at their own paths: the installer's frames and the keyboard maps (--keychars)
     services_spawn
         .mounts
         .extend(atl_broker::tree_mounts(Path::new(&keychars))?);
     services_spawn.mounts.push(atl_broker::Mount {
-        host: packages_file.clone(),
-        at: packages_file.clone(),
+        host: frames.clone(),
+        at: frames.clone(),
         writable: false,
     });
     services_spawn.stdin = Some(control_theirs);
@@ -272,8 +232,17 @@ pub fn stage(
             Request::Kill { pid } => Response::Error {
                 message: format!("the services stage starts no process it kills (pid {pid})"),
             },
+            // session 0 was installed before the services started: its frames; no file moves (the client reads no package file)
+            Request::Install { session: 0, uid } if uid == APP_UID => Response::Staged {
+                frames: frames.display().to_string(),
+            },
+            Request::Commit {
+                session: 0, uid, ..
+            } if uid == APP_UID => Response::Committed { needs_es1: false },
             other => Response::Error {
-                message: format!("the services stage installs nothing ({other:?})"),
+                message: format!(
+                    "the services stage holds session 0 for uid {APP_UID} only ({other:?})"
+                ),
             },
         });
         // the services ending their end of the socket is how the loop stops; any other error is theirs to report

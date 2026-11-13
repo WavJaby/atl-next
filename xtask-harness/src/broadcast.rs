@@ -78,6 +78,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     )?;
     let work = rt.out.join("broadcast");
     let mut packages = Vec::new();
+    let mut names = Vec::new();
     for (fixture, dir) in [(SENDER, "sender"), (RECEIVER, "receiver")] {
         let apk = rt
             .apk
@@ -89,10 +90,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             m.name,
             m.receivers.len()
         );
-        packages.push(Package::base(apk, m));
+        packages.push(Package::base(apk));
+        names.push(m.name);
     }
-    let sender = packages[0].manifest.name.clone();
-    let receiver = packages[1].manifest.name.clone();
+    let (sender, receiver) = (names[0].clone(), names[1].clone());
     let run = Run {
         root: work.join("root"),
         scratch: work.join("scratch"),

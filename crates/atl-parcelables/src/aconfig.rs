@@ -80,16 +80,3 @@ pub const TOOLKIT_SET_FRAME_RATE_READ_ONLY: bool = read_only_flag(
     VIEW_FLAGS,
     "android.view.flags.toolkit_set_frame_rate_read_only",
 );
-
-/// android.window.flags (core/java/android/window/flags/*.aconfig, module `com.android.window.flags.window-aconfig`, AconfigFlags.bp).
-const WINDOW_FLAGS: &str = include_str!(concat!(
-    env!("OUT_DIR"),
-    "/com.android.window.flags.window-aconfig.aconfig.txt"
-));
-
-/// `com.android.window.flags.Flags.predictiveBackDefaultEnableSdk36()` (ParsingPackageUtils:2436): an app with targetSdk > 35 that does not write
-/// enableOnBackInvokedCallback gets predictive back only while it is on (manifest_flags::application_private_flags_ext). Release bp2a sets it ENABLED (build/release/aconfig/bp2a/com.android.window.flags).
-pub const PREDICTIVE_BACK_DEFAULT_ENABLE_SDK_36: bool = read_only_flag(
-    WINDOW_FLAGS,
-    "com.android.window.flags.predictive_back_default_enable_sdk_36",
-);

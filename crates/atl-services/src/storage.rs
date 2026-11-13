@@ -10,7 +10,7 @@ use atl_aidl::aidl::android::os::storage::IStorageManager::{
 use atl_parcelables::android::os::storage::StorageVolume;
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, ThreadState};
 
-use atl_services_types::permission::Permissions;
+use crate::packages::Permissions;
 use std::sync::Arc;
 
 /// The interface name counters use.

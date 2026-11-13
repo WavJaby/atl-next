@@ -29,11 +29,11 @@ use crate::activity::{
 use crate::activity_stack::{Command, Machine, ResultTo, Step};
 use crate::activity_start::{self, Call, Refusal, Source, Start, Target};
 use crate::config_diff::Config;
+use crate::packages::{Packages, real_config_changes};
 use crate::tasks::{TaskId, Tasks};
 use crate::token;
+use atl_parcelables::android::content::pm::ActivityInfo;
 use atl_services_types::counters;
-use atl_services_types::manifest_flags;
-use atl_services_types::packages::{ActivityDecl, Packages};
 
 const ATM: &str = "IActivityTaskManager";
 
@@ -45,7 +45,7 @@ pub(crate) struct Owner {
     pub package: String,
     /// the affinity of the activity's task: its taskAffinity, else the package name (see [`affinity_of`])
     pub affinity: String,
-    /// the activity's class name (ActivityDecl.name); the services' log names the activity by it
+    /// the activity's class name (ActivityInfo.name); the services' log names the activity by it
     pub component: String,
     /// the merged configuration the app last got (ActivityRecord.mLastReportedConfiguration); a configuration change is diffed against it (activity.rs task_resized)
     pub reported: Config,
@@ -76,7 +76,7 @@ const FLAG_ACTIVITY_NEW_TASK: i32 = 0x1000_0000;
 #[derive(Clone)]
 pub(crate) struct Launch {
     pub package: String,
-    pub decl: ActivityDecl,
+    pub decl: ActivityInfo,
     pub ident: i32,
     /// the start's intent as sent (ActivityRecord.intent, ActivityTaskSupervisor.java:1021); a launcher start's MAIN / LAUNCHER intent
     pub intent: Intent,
@@ -103,7 +103,7 @@ pub(crate) struct StartArgs<'a> {
 }
 
 /// ActivityRecord's task affinity: the manifest's taskAffinity, else the package name.
-pub(crate) fn affinity_of(decl: &ActivityDecl, package: &str) -> String {
+pub(crate) fn affinity_of(decl: &ActivityInfo, package: &str) -> String {
     decl.task_affinity
         .clone()
         .unwrap_or_else(|| package.to_owned())
@@ -303,7 +303,7 @@ impl ActivityTasks {
         thread: Strong<dyn IApplicationThread>,
         uid: u32,
         package: &str,
-        decl: &ActivityDecl,
+        decl: &ActivityInfo,
         task: TaskId,
     ) -> SpIBinder {
         let token = token::new();
@@ -313,12 +313,12 @@ impl ActivityTasks {
             uid,
             package: package.to_owned(),
             affinity: affinity_of(decl, package),
-            component: decl.name.clone(),
+            component: decl.component.item.name.clone().unwrap_or_default(),
             reported: self.launch_config(),
             declared: self
                 .packages
                 .by_name(package)
-                .map_or(0, |p| manifest_flags::real_config_changes(p, decl)),
+                .map_or(0, |_| real_config_changes(decl)),
             relaunching: false,
             entry: true,
         };
@@ -332,7 +332,7 @@ impl ActivityTasks {
                 flags: FLAG_ACTIVITY_NEW_TASK,
                 component: Some(ComponentName {
                     package: package.to_owned(),
-                    class: decl.name.clone(),
+                    class: decl.component.item.name.clone().unwrap_or_default(),
                 }),
                 ..Default::default()
             },
@@ -379,9 +379,8 @@ impl ActivityTasks {
             finishing: m.is_finishing(t) == Some(true),
         });
         let package = component.and_then(|(p, _)| self.packages.by_name(p));
-        let decl = component.and_then(|(_, class)| {
-            package.and_then(|p| p.manifest.activities.iter().find(|a| a.name == class))
-        });
+        let info = component.and_then(|(_, class)| package.and_then(|p| p.activity(class)));
+        let declared = info.map(crate::packages::declared);
         let call = Call {
             calling_uid,
             calling_package,
@@ -409,12 +408,15 @@ impl ActivityTasks {
             .is_some_and(|(task, class)| m.top(task).is_some_and(|(_, o)| o.component == class));
         let target = Target {
             process: package.map_or("", |p| p.process_name()),
-            decl,
+            decl: declared.as_ref(),
             in_task: instance.is_some(),
             top_is_class,
         };
         let (decl, start) = match activity_start::check(&call, target) {
-            Ok(accepted) => accepted,
+            Ok((_, start)) => (
+                info.expect("check accepts only a class the package declares"),
+                start,
+            ),
             Err(Refusal::Code { code, .. }) => {
                 // a refused start answers the result it owes as cancelled (ActivityStarter.java:1220-1222)
                 let cancelled = cancel_owed(&mut m, owed.as_ref());
@@ -470,9 +472,9 @@ impl ActivityTasks {
             uid: calling_uid,
             package: calling_package.to_owned(),
             affinity: affinity_of(decl, calling_package),
-            component: decl.name.clone(),
+            component: decl.component.item.name.clone().unwrap_or_default(),
             reported: self.launch_config(),
-            declared: package.map_or(0, |p| manifest_flags::real_config_changes(p, decl)),
+            declared: package.map_or(0, |_| real_config_changes(decl)),
             relaunching: false,
             entry: false,
         };
@@ -745,7 +747,6 @@ mod tests {
     use atl_aidl::aidl::android::app::IApplicationThread::BnApplicationThread;
     use atl_parcelables::codecs::android::os::Bundle::Value;
     use atl_services_types::display_model::DisplayModel;
-    use atl_services_types::packages::{Manifest, PackageRecord, SCREEN_ORIENTATION_UNSPECIFIED};
     use binder::StatusCode;
 
     use super::*;
@@ -799,58 +800,15 @@ mod tests {
     }
 
     /// `name` as the manifest declares it: standard launch mode (LAUNCH_MULTIPLE = 0), no attribute beyond its name.
-    fn decl(name: &str) -> ActivityDecl {
-        ActivityDecl {
-            name: name.to_owned(),
-            launcher: name == LAUNCHER,
-            theme: 0,
-            config_changes: 0,
-            booleans: BTreeMap::new(),
-            launch_mode: 0,
-            task_affinity: None,
-            process: None,
-            meta_data: vec![],
-            screen_orientation: SCREEN_ORIENTATION_UNSPECIFIED,
-            resizeable: true,
-            min_aspect_ratio: None,
-            max_aspect_ratio: None,
-        }
+    fn decl(name: &str) -> ActivityInfo {
+        crate::packages::fixture::activity(PACKAGE, name)
     }
 
     /// One installed package: its launcher and one video activity.
     fn fixture_atm() -> ActivityTasks {
-        let manifest = Manifest {
-            name: PACKAGE.to_owned(),
-            version_code: 1,
-            version_name: None,
-            min_sdk: 21,
-            target_sdk: 34,
-            process_name: None,
-            application_theme: 0,
-            application_class: None,
-            app_component_factory: None,
-            application_meta_data: vec![],
-            application_booleans: BTreeMap::new(),
-            activities: vec![decl(LAUNCHER), decl(VIDEO)],
-            receivers: vec![],
-            providers: vec![],
-            requested_permissions: vec![],
-            permissions: vec![],
-            libraries: vec![],
-            instrumentation: vec![],
-        };
-        let record = PackageRecord {
-            manifest,
-            uid: UID,
-            source_dir: String::new(),
-            primary_cpu_abi: None,
-            native_library_dir: String::new(),
-            instruction_set: String::new(),
-            data_dir: String::new(),
-            device_protected_data_dir: String::new(),
-            granted_permissions: vec![],
-            gl_driver: Default::default(),
-        };
+        let mut record = crate::packages::fixture::record(PACKAGE);
+        record.uid = UID;
+        record.info.activities = Some(vec![Some(decl(LAUNCHER)), Some(decl(VIDEO))]);
         ActivityTasks::new(
             Arc::new(Packages::new(vec![record], BTreeMap::new())),
             Arc::new(Tasks::new(DisplayModel::default())),

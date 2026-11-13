@@ -50,33 +50,6 @@ pub fn holds(uid: u32, permissions: &[&str], any: bool, granted: impl Fn(&str) -
     }
 }
 
-/// The permission state every service consults: the install-time grants of the installed packages, by uid (a shared uid's packages pool their grants, as PMS's shared user does).
-pub struct Permissions {
-    packages: std::sync::Arc<crate::packages::Packages>,
-}
-
-impl Permissions {
-    pub fn new(packages: std::sync::Arc<crate::packages::Packages>) -> Self {
-        Permissions { packages }
-    }
-
-    fn granted(&self, uid: u32, permission: &str) -> bool {
-        self.packages
-            .by_app_id(app_id(uid))
-            .any(|p| p.granted_permissions.iter().any(|g| g == permission))
-    }
-
-    /// `holds` against `uid`'s grants.
-    pub fn holds(&self, uid: u32, permissions: &[&str], any: bool) -> bool {
-        holds(uid, permissions, any, |p| self.granted(uid, p))
-    }
-
-    /// `check` against `uid`'s grants.
-    pub fn check(&self, uid: u32, permission: Option<&str>) -> bool {
-        permission.is_some_and(|p| holds(uid, &[p], false, |p| self.granted(uid, p)))
-    }
-}
-
 /// PermissionInfo.PROTECTION_MASK_BASE and the two base types the install-time rule grants (PermissionInfo.java).
 const PROTECTION_MASK_BASE: u32 = 0xf;
 const PROTECTION_NORMAL: u32 = 0;
@@ -84,26 +57,26 @@ const PROTECTION_SIGNATURE: u32 = 2;
 
 /// The install-time grants of `package` (owner decision 2026-11-05, interim rule A; PermissionManagerServiceImpl.restorePermissionState): a requested permission is granted when its definition
 /// is NORMAL, or SIGNATURE and defined by `package` itself (same package -> same certificate). Every other requested permission (dangerous: runtime grant via PermissionController, not built;
-/// signature of another signer; undefined) is not. `definitions` = the platform's (framework-res) then each installed package's, as (defining package, declaration); the first definition wins (PMS keeps the first).
+/// signature of another signer; undefined) is not. `definitions` = the platform's (framework-res) then each installed package's, as (defining package, name, protectionLevel); the first definition wins (PMS keeps the first).
 pub fn install_grants<'a>(
     package: &str,
-    requested: &[String],
-    definitions: impl IntoIterator<Item = (&'a str, &'a crate::packages::PermissionDecl)>,
+    requested: impl IntoIterator<Item = &'a str>,
+    definitions: impl IntoIterator<Item = (&'a str, &'a str, u32)>,
 ) -> Vec<String> {
     let mut defined: std::collections::BTreeMap<&str, (&str, u32)> = Default::default();
-    for (owner, d) in definitions {
+    for (owner, name, level) in definitions {
         defined
-            .entry(d.name.as_str())
-            .or_insert((owner, d.protection_level & PROTECTION_MASK_BASE));
+            .entry(name)
+            .or_insert((owner, level & PROTECTION_MASK_BASE));
     }
     requested
-        .iter()
-        .filter(|p| match defined.get(p.as_str()) {
+        .into_iter()
+        .filter(|p| match defined.get(p) {
             Some((_, PROTECTION_NORMAL)) => true,
             Some((owner, PROTECTION_SIGNATURE)) => *owner == package,
             _ => false,
         })
-        .cloned()
+        .map(str::to_owned)
         .collect()
 }
 
@@ -132,23 +105,26 @@ mod tests {
         ];
         let own = [decl("org.x.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION", 0x2)];
         let other = [decl("org.y.SECRET", 0x2)];
-        let requested: Vec<String> = [
+        let requested = [
             "android.permission.INTERNET",
             "android.permission.READ_CONTACTS",
             "android.permission.WRITE_SECURE_SETTINGS",
             "org.x.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION",
             "org.y.SECRET",
             "org.z.UNDEFINED",
+        ];
+        let defs = [
+            ("android", &platform[..]),
+            ("org.x", &own),
+            ("org.y", &other),
         ]
-        .map(String::from)
-        .into();
-        let defs = platform
-            .iter()
-            .map(|d| ("android", d))
-            .chain(own.iter().map(|d| ("org.x", d)))
-            .chain(other.iter().map(|d| ("org.y", d)));
+        .into_iter()
+        .flat_map(|(owner, list)| {
+            list.iter()
+                .map(move |d| (owner, d.name.as_str(), d.protection_level))
+        });
         assert_eq!(
-            install_grants("org.x", &requested, defs),
+            install_grants("org.x", requested, defs),
             [
                 "android.permission.INTERNET",
                 "org.x.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"

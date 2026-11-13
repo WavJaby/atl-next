@@ -16,10 +16,11 @@ use atl_aidl::aidl::android::app::INotificationManager::{
 use atl_aidl::mangled::_7_android_3_app_22_ITransientNotification as ITransientNotification;
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, Strong, ThreadState};
 
+use crate::packages::Packages;
+use crate::packages::Permissions;
 use crate::tasks::Tasks;
 use atl_services_types::counters;
-use atl_services_types::packages::Packages;
-use atl_services_types::permission::{self, Permissions};
+use atl_services_types::permission;
 
 /// The interface name counters use.
 const INTERFACE: &str = "INotificationManager";
@@ -206,7 +207,7 @@ impl INotificationManager for NotificationManager {
             && !inner
                 .packages
                 .by_app_id(permission::app_id(uid))
-                .any(|p| p.manifest.name == pkg)
+                .any(|p| p.name() == pkg)
         {
             return Err(Status::new_exception_str(
                 ExceptionCode::SECURITY,

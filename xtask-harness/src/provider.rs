@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use crate::manifest::MetaValue;
 use anyhow::{Result, ensure};
 use atl_layout::Layout;
-use atl_services_types::packages::MetaValue;
 
 use crate::atld_run::{Package, Run, Runtime};
 use crate::manifest;
@@ -105,7 +105,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         root: work.join("root"),
         scratch: work.join("scratch"),
         launch: Some(package.clone()),
-        packages: vec![Package::base(apk, m)],
+        packages: vec![Package::base(apk)],
         first_uid: UID,
         libraries: vec![],
         shell: None,

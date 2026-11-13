@@ -17,8 +17,8 @@ use anyhow::{Context, Result, ensure};
 use crate::atld_run::{
     MS_PER_S, Package, PackageFile, Run, Runtime, last_resumed, parse_stamp, run_display, settled,
 };
+use crate::manifest::Manifest;
 use atl_services_types::native_libs::{SupportedAbi, find_supported_abi};
-use atl_services_types::packages::Manifest;
 
 use crate::nested_wayland::NestedCompositor;
 use crate::{arches, drive, manifest, observe, remote, test_apks, verdict, window};
@@ -555,12 +555,10 @@ fn package(
             m.version_name.as_deref(),
         )?;
     }
-    let activity = m
-        .launch_activity()
-        .map(|a| a.name.clone())
-        .context("the APK has no launcher activity")?;
+    // the launcher is the services' (the installer's parse, aliases included): aapt2's first launcher activity is only shown
+    let activity = m.launch_activity().map_or("none", |a| a.name.as_str());
     println!(
-        "run-apk: {} ({} versionCode {}, sdk {}..{}, launcher activity {activity}, {} file(s))",
+        "run-apk: {} ({} versionCode {}, sdk {}..{}, aapt2 launcher activity {activity}, {} file(s))",
         apk_file.display(),
         m.name,
         m.version_code,
@@ -584,10 +582,7 @@ fn run_of(work: &Path, files: Vec<PackageFile>, m: &Manifest, log_tags: &str) ->
         root: work.join("root"),
         scratch: work.join("scratch"),
         launch: Some(m.name.clone()),
-        packages: vec![Package {
-            files,
-            manifest: m.clone(),
-        }],
+        packages: vec![Package { files }],
         first_uid: window::APP_UID,
         libraries: vec![],
         shell: None,

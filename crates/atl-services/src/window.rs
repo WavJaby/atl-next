@@ -34,10 +34,10 @@ use binder::{
 };
 
 use crate::activity;
+use crate::packages::Permissions;
 use crate::tasks::{Placement, TaskId, TaskSize, Tasks};
 use crate::ui_agents::UiAgents;
 use atl_services_types::counters;
-use atl_services_types::permission::Permissions;
 use atl_services_wire::ui_agent::IUiAgent;
 
 /// The interface names counters use.

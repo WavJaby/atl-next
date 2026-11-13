@@ -693,7 +693,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         root: work.join("root"),
         scratch: work.join("scratch"),
         launch: None,
-        packages: vec![Package::base(apk.clone(), m)],
+        packages: vec![Package::base(apk.clone())],
         first_uid: APP_UID,
         libraries: vec![],
         shell: Some(Shell {

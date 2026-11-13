@@ -11,9 +11,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{Duration, SystemTime};
 
+use crate::manifest::{InstrumentationDecl, Manifest};
 use anyhow::{Context, Result, ensure};
 use atl_layout::Layout;
-use atl_services_types::packages::{InstrumentationDecl, Manifest};
 
 use crate::atld_run::{Package, Run, Runtime, counters};
 use crate::cts_report::{self, Module, Report, State};
@@ -166,14 +166,14 @@ fn build_row(
     Ok(Some(why.join("; ")))
 }
 
-/// A module's package (its APK and manifest); Err = why it has none.
-fn built(rt: &Runtime, module: &str) -> Result<Package, String> {
+/// A module's package and its manifest (aapt2: which instrumentation to run); Err = why it has none.
+fn built(rt: &Runtime, module: &str) -> Result<(Package, Manifest), String> {
     let apk = apk_path(&rt.java_out, module);
     if !apk.is_file() {
         return Err(format!("{} does not exist", apk.display()));
     }
     let manifest = manifest::read(&rt.apk.aapt2, &apk).map_err(|e| format!("{module}: {e:#}"))?;
-    Ok(Package::base(apk, manifest))
+    Ok((Package::base(apk), manifest))
 }
 
 /// The `am instrument` arguments of a row: wait, raw text, the filters, the component.
@@ -250,8 +250,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 .collect::<Result<Vec<_>, _>>(),
         };
         // the test APK first, then the apps, in uid order
-        let packages = match staged {
-            Ok(p) => p,
+        let (packages, manifests): (Vec<Package>, Vec<Manifest>) = match staged {
+            Ok(p) => p.into_iter().unzip(),
             Err(why) => {
                 let why = cts_report::relative_to_workspace(&why, &ws);
                 println!("cts: {module}: BUILD_FAIL {why}");
@@ -259,13 +259,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 continue;
             }
         };
-        let test = packages[0].manifest.clone();
+        let test = manifests[0].clone();
         let instrumentation =
             pick_instrumentation(&test).map_err(|e| anyhow::anyhow!("{module}: {e}"))?;
         ensure!(
-            packages
+            manifests
                 .iter()
-                .any(|p| p.manifest.name == instrumentation.target_package),
+                .any(|m| m.name == instrumentation.target_package),
             "{module}: instrumentation {} targets package {}, which no staged package is: add the module that builds it to `apps` in {}",
             instrumentation.name,
             instrumentation.target_package,

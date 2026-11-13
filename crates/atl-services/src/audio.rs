@@ -13,9 +13,9 @@ use atl_aidl::aidl::android::media::IAudioService::{
 use atl_parcelables::android::media::{AudioAttributes, PlayerBase_PlayerIdCard};
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, ThreadState};
 
+use crate::packages::Permissions;
 use crate::players::{Access, PIID_INVALID, Players};
 use atl_services_types::counters;
-use atl_services_types::permission::Permissions;
 
 /// The interface name counters use.
 const INTERFACE: &str = "IAudioService";

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! atld, M2 wiring: starts the system the Android way, each process through the broker, then serves the services' process control until the run ends (step 7).
 //! 1. the runtime root `--root` (made fresh): `properties` (the default property area, atl-property-service; `properties.d/` one area per app process: the defaults plus the properties only that process has, [`Host::process_properties`]), `system/` (build.prop, `framework/` = the boot jars and shared libraries),
-//!    `data/` (`app/<package>/{base.apk,split_<name>.apk,lib/<isa>/}`, `user/0/<package>/`, `dalvik-cache/`), `install/` (each session's manifest and the installer's frames, read by the services), `log/<process>.log` (each process's stdout + stderr).
-//! 2. the install sessions: each `--package` (its APK files and the manifest xtask read) is a session the services install at their start (owner option I, 2026-11-13): they own the package list; atld does installd's
+//!    `data/` (`app/<package>/{base.apk,split_<name>.apk,lib/<isa>/}`, `user/0/<package>/`, `dalvik-cache/`), `install/` (the installer's frames of each session, read by the services), `log/<process>.log` (each process's stdout + stderr).
+//! 2. the install sessions: each `--package` (its APK files) is a session the services install at their start (owner option I, 2026-11-13): they own the package list; atld does installd's
 //!    file work on their request (control `Install`: stage under AOSP names + run atl-installer in the broker's installer profile; `Commit`: rename to `/data/app/<package>`, create the data dirs).
 //! 3. atl-binderd, its admin connection on stdin; the broker holds the other end.
 //! 4. AOSP servicemanager as uid 1000 (AID_SYSTEM), the one process that may become context manager.
@@ -41,7 +41,7 @@ use atl_services_types::compositor_registry;
 use atl_services_types::display_model::DisplayModel;
 use atl_services_types::gl_driver;
 use atl_services_types::native_libs::LIB_DIR_NAME;
-use atl_services_types::packages::{Library, Manifest};
+use atl_services_types::packages::Library;
 use clap::Parser;
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 
@@ -102,7 +102,7 @@ struct Args {
     /// (SystemConfig's `<library name file dependency>`).
     #[arg(long = "shared-library", value_parser = Library::parse_arg)]
     shared_libraries: Vec<(String, Library)>,
-    /// A package to install (repeat; session i, in uid order): a JSON file `{"files": [{"split": null|<name>, "path": <host path>}], "manifest": {...}}`, base first (atl_services_types::packages::Manifest, xtask's aapt2 read).
+    /// A package to install (repeat; session i, in uid order): a JSON file `{"files": [{"split": null|<name>, "path": <host path>}]}`, base first.
     #[arg(long = "package", required = true)]
     packages: Vec<PathBuf>,
     /// atl-installer executable: AOSP's package parse and native-code install in a VM of its own, run in the broker's installer profile on each session's staged dir.
@@ -276,7 +276,6 @@ fn host_display() -> DisplayModel {
 struct PackageSource {
     /// base first
     files: Vec<PackageFile>,
-    manifest: Manifest,
 }
 
 /// One APK of a session: the base (`split` None) or a split with its name.
@@ -1247,7 +1246,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         a.first_uid
     );
     std::fs::create_dir_all(r.data().join("dalvik-cache"))?;
-    // the install sessions: their files stay where xtask put them until staged; each manifest goes to install/<i>.manifest.json for the services
+    // the install sessions: their files stay where xtask put them until staged; the installer's frames go to install/ for the services
     let install_dir = r.root.join("install");
     std::fs::create_dir_all(&install_dir)?;
     let mut sessions = Vec::new();
@@ -1263,12 +1262,7 @@ fn run(a: &Args) -> Result<ExitCode> {
             "{}: not a base APK followed by splits",
             file.display()
         );
-        let manifest = install_dir.join(format!("{i}.manifest.json"));
-        std::fs::write(&manifest, serde_json::to_vec_pretty(&source.manifest)?)?;
-        session_args.extend([
-            "--session".into(),
-            format!("{i}={}", manifest.display()).into(),
-        ]);
+        session_args.extend(["--session".into(), i.to_string().into()]);
         sessions.push(source.files);
     }
     let (broker, mut binderd) = Broker::start(

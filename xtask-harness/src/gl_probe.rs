@@ -24,7 +24,7 @@ use atl_layout::Layout;
 
 use crate::atld_run::{Package, Run, Runtime, Shell};
 use crate::gl_scene;
-use crate::{manifest, remote, tree};
+use crate::{remote, tree};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -279,12 +279,11 @@ fn run_probe(
     verbose: bool,
     tag: &str,
 ) -> Result<String> {
-    let m = manifest::read(&rt.apk.aapt2, apk)?;
     let run = Run {
         root: dir.join("root"),
         scratch: dir.join("scratch"),
         launch: None,
-        packages: vec![Package::base(apk.to_path_buf(), m)],
+        packages: vec![Package::base(apk.to_path_buf())],
         first_uid: APP_UID,
         libraries: vec![],
         shell: Some(Shell {

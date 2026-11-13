@@ -11,7 +11,6 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use atl_services_types::packages::IntentFilterDecl;
 use atl_services_types::permission;
 
 /// Context.RECEIVER_EXPORTED / RECEIVER_NOT_EXPORTED (Context.java:781, :795).
@@ -26,8 +25,15 @@ pub const BROADCAST_STICKY_CANT_HAVE_PERMISSION: i32 = -1;
 /// BroadcastController.DYNAMIC_RECEIVER_EXPLICIT_EXPORT_REQUIRED (:145-146): @EnabledSince(targetSdkVersion = UPSIDE_DOWN_CAKE), API 34.
 const EXPLICIT_EXPORT_REQUIRED_SDK: i32 = 34;
 
-/// An intent filter: the manifest's form is the one the services hold (packages.rs), a registered IntentFilter is converted into it.
-pub type Filter = IntentFilterDecl;
+/// An intent filter reduced to what broadcast matching reads (a registered IntentFilter is converted into it): actions, categories, `<data android:scheme>` and `<data android:mimeType>`.
+/// None = the filter names none (IntentFilter's null lists), which matchData treats differently from an empty list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Filter {
+    pub actions: Vec<String>,
+    pub categories: Option<Vec<String>>,
+    pub schemes: Option<Vec<String>>,
+    pub types: Option<Vec<String>>,
+}
 
 /// What matching and Intent.filterEquals read of an Intent. `resolved_type` is the caller's resolvedType (matching); filterEquals reads `r#type` (mType).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

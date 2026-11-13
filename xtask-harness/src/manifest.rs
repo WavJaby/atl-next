@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
-//! A package's manifest as the services need it, read from the APK with AOSP's own `aapt2 dump xmltree --file AndroidManifest.xml` (owner D3, 2026-11-03: aapt2 is a build and test time tool; real installs
-//! at run time read the manifest with libandroidfw's ResXMLTree through a boundary crate, and produce the same `Manifest`). No second binary-XML decoder is written here: this reads aapt2's text.
+//! A package's manifest as the gates' oracle reads it, from the APK with AOSP's own `aapt2 dump xmltree --file AndroidManifest.xml` (owner D3, 2026-11-03: aapt2 is a build and test time tool). The
+//! product never sees it: the services answer from the installer's parse (atl-services `packages`); gates use it for what to expect and whom to start. No second binary-XML decoder is written
+//! here: this reads aapt2's text.
 //! aapt2's format (tools/aapt2/Debug.cpp `Debug::DumpXml`): `N:` namespace lines, `E: <element> (line=n)`, `A: [<namespace uri>:]<name>[(0x<resource id>)]=<value>`; an element's attributes are indented two
 //! columns deeper than it, its child elements four. A value is `"string" (Raw: "string")`, a decimal or `0x` integer, `true` / `false`, or `@0x<id>` / `(type 0x..)0x..` for the rest.
 
@@ -9,12 +10,128 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-use atl_services_types::packages::{
-    ActivityDecl, InstrumentationDecl, IntentFilterDecl, Manifest, MetaValue, PermissionDecl,
-    ProviderDecl, ReceiverDecl, SCREEN_ORIENTATION_UNSPECIFIED, UsesLibrary,
-};
+use atl_services_types::packages::{PermissionDecl, SCREEN_ORIENTATION_UNSPECIFIED};
 
 use crate::host_art;
+
+/// `<uses-library android:name android:required>` (`required` defaults to true).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsesLibrary {
+    pub name: String,
+    pub required: bool,
+}
+
+/// `<instrumentation>` (ParsedInstrumentation): `name` resolved against the package; `target_processes` None = the target's default process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstrumentationDecl {
+    pub name: String,
+    pub target_package: String,
+    pub target_processes: Option<String>,
+    pub handle_profiling: bool,
+    pub functional_test: bool,
+}
+
+/// `<activity>` as aapt2 prints it: class resolved, whether it handles MAIN + LAUNCHER, the attributes the gates expect values from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActivityDecl {
+    pub name: String,
+    pub launcher: bool,
+    /// `android:theme` as a resource id; 0 = none written
+    pub theme: i32,
+    /// `android:configChanges` with the recreateOnConfigChanges rule (ParsedActivityUtils.getActivityConfigChanges)
+    pub config_changes: i32,
+    /// boolean attributes by name, only those written
+    pub booleans: BTreeMap<String, bool>,
+    pub launch_mode: i32,
+    pub task_affinity: Option<String>,
+    /// `android:process` resolved (`:name` -> `<package>:name`); None = the package's process
+    pub process: Option<String>,
+    pub meta_data: Vec<(String, MetaValue)>,
+    pub screen_orientation: i32,
+    /// `android:resizeableActivity` on the activity, else `<application>`, else resizable (PackageParser.setActivityResizeMode)
+    pub resizeable: bool,
+    pub min_aspect_ratio: Option<f32>,
+    pub max_aspect_ratio: Option<f32>,
+}
+
+/// `<intent-filter>` reduced: actions, categories, `<data android:scheme>`, `<data android:mimeType>`; None = the filter names none.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IntentFilterDecl {
+    pub actions: Vec<String>,
+    pub categories: Option<Vec<String>>,
+    pub schemes: Option<Vec<String>>,
+    pub types: Option<Vec<String>>,
+}
+
+/// `<receiver>` (ParsedActivityUtils.parseReceiver, reduced).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiverDecl {
+    pub name: String,
+    /// unwritten = whether it has an intent filter
+    pub exported: bool,
+    pub enabled: bool,
+    pub permission: Option<String>,
+    pub process: Option<String>,
+    pub filters: Vec<IntentFilterDecl>,
+}
+
+/// `<provider>` (ParsedProviderUtils.parseProvider, reduced).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderDecl {
+    pub name: String,
+    pub authority: Option<String>,
+    pub exported: bool,
+    pub enabled: bool,
+    pub process: Option<String>,
+    pub read_permission: Option<String>,
+    pub write_permission: Option<String>,
+    pub grant_uri_permissions: bool,
+    pub force_uri_permissions: bool,
+    pub multiprocess: bool,
+    pub init_order: i32,
+    pub syncable: bool,
+    pub direct_boot_aware: bool,
+    pub meta_data: Vec<(String, MetaValue)>,
+}
+
+/// What aapt2 shows of an APK's AndroidManifest.xml that the gates read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Manifest {
+    pub name: String,
+    pub version_code: i64,
+    pub version_name: Option<String>,
+    pub min_sdk: i32,
+    pub target_sdk: i32,
+    pub process_name: Option<String>,
+    pub application_theme: i32,
+    pub application_class: Option<String>,
+    pub app_component_factory: Option<String>,
+    pub application_meta_data: Vec<(String, MetaValue)>,
+    pub application_booleans: BTreeMap<String, bool>,
+    pub activities: Vec<ActivityDecl>,
+    pub receivers: Vec<ReceiverDecl>,
+    pub providers: Vec<ProviderDecl>,
+    pub requested_permissions: Vec<String>,
+    pub permissions: Vec<PermissionDecl>,
+    pub libraries: Vec<UsesLibrary>,
+    pub instrumentation: Vec<InstrumentationDecl>,
+}
+
+impl Manifest {
+    /// The first `<activity>` that handles MAIN + LAUNCHER (aliases not modelled: the installer's parse is the product's answer).
+    pub fn launch_activity(&self) -> Option<&ActivityDecl> {
+        self.activities.iter().find(|a| a.launcher)
+    }
+}
+
+/// A `<meta-data>` value as ParsingPackageUtils.parseMetaData types it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetaValue {
+    String(String),
+    Int(i32),
+    Bool(bool),
+    Float(f32),
+}
 
 /// ACTION_MAIN / CATEGORY_LAUNCHER (Intent.java): the pair that makes an activity the package's launcher activity.
 const ACTION_MAIN: &str = "android.intent.action.MAIN";
@@ -1149,11 +1266,9 @@ mod tests {
                     A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.intent.category.LAUNCHER" (Raw: "android.intent.category.LAUNCHER")
 "#;
 
-    /// The window fixture's record: the launcher activity's `hardwareAccelerated=false` is its ActivityInfo bit clear (0), the application's defaults are ApplicationInfo.flags 0x3000_8044
-    /// (manifest_flags' default test), and the activity's other boolean (`exported`) is kept as written but sets no flag.
+    /// The window fixture's manifest: the launcher activity's booleans as written (`exported`, `hardwareAccelerated=false`), none on the application.
     #[test]
     fn the_window_fixture_record() {
-        use atl_services_types::manifest_flags::{activity_flags, application_flags};
         let m = parse(WINDOW).expect("parse");
         assert_eq!(m.name, "com.example.atlwindow");
         assert_eq!((m.min_sdk, m.target_sdk), (21, 36));
@@ -1167,7 +1282,5 @@ mod tests {
                 ("hardwareAccelerated".to_owned(), false)
             ])
         );
-        assert_eq!(application_flags(&m), 0x3000_8044);
-        assert_eq!(activity_flags(&m, launch), 0);
     }
 }

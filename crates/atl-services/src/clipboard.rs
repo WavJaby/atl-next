@@ -7,7 +7,7 @@
 use atl_aidl::aidl::android::content::IClipboard::{BnClipboard, EnforcePermission, IClipboard};
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, ThreadState};
 
-use atl_services_types::permission::Permissions;
+use crate::packages::Permissions;
 use std::sync::Arc;
 
 /// The interface name counters use.

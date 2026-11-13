@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! `xtask test installer`: the installer process (atl-installer, plan item 4b slices M1-M3) runs AOSP's `ApkLiteParseUtils.parseClusterPackageLite`, the full `ParsingPackageUtils.parsePackage` (through the api-impl ParseCallback forwarder) and then AOSP's
 //! native-code choice (`NativeLibraryHelper`, `PackageAbiHelperImpl.derivePackageAbi`) on host ART over a package dir laid out as PackageManager stages one (`base.apk`, `split_<name>.apk`).
-//! Oracles, read here independently of the installer: `aapt2 dump badging` of each file (package, versionCode, `split`); the full parse's oracle (installer_parse.rs: badging + the manifest's xmltree, and manifest.rs whose differences are printed as findings);
+//! Oracles, read here independently of the installer: `aapt2 dump badging` of each file (package, versionCode, `split`); the full parse's oracle (installer_parse.rs: badging + the manifest's xmltree);
 //! the zip itself through `unzip` (the `lib/<abi>/` entries, their names and sha256); the device's ABI list and SDK from the property set the installer maps (`ro.product.cpu.abilist`, `ro.build.version.sdk`).
 //!
 //! Checks:
@@ -41,8 +41,8 @@ use atl_property_service::{LinearTier, Property};
 
 use crate::atld_run::ApkTools;
 use crate::host_art::{ArtRun, HostArt};
-use crate::installer_parse::{Full, compare, manifest_findings, oracle};
-use crate::{binder, manifest, packages, slot, test_apks, verdict};
+use crate::installer_parse::{Full, compare, oracle};
+use crate::{binder, packages, slot, test_apks, verdict};
 
 const CMD: &str = "installer";
 /// The package that builds both loaders, and the installer's executable.
@@ -722,20 +722,10 @@ impl Gate<'_> {
         Ok(())
     }
 
-    /// The full parse of `stdout` against the oracle of `base_apk` (failures into `bad`), and against manifest.rs (printed as findings of check `name`).
-    fn full_parse(
-        &self,
-        name: &str,
-        stdout: &str,
-        base_apk: &Path,
-        bad: &mut Vec<String>,
-    ) -> Result<Full> {
+    /// The full parse of `stdout` against the oracle of `base_apk` (failures into `bad`).
+    fn full_parse(&self, stdout: &str, base_apk: &Path, bad: &mut Vec<String>) -> Result<Full> {
         let full = Full::read(stdout)?;
         bad.extend(compare(&full, &oracle(&self.aapt2, base_apk, self.sdk)?));
-        let m = manifest::read(&self.aapt2, base_apk)?;
-        for (field, ours, theirs) in manifest_findings(&full, &m) {
-            println!("{name}: finding {field}: installer {ours} != manifest.rs {theirs}");
-        }
         Ok(full)
     }
 
@@ -845,7 +835,7 @@ impl Gate<'_> {
         let mut splits = want.splits.clone();
         splits.sort();
         let mut bad = Vec::new();
-        let full = self.full_parse(name, &decoded, &want.base_apk, &mut bad)?;
+        let full = self.full_parse(&decoded, &want.base_apk, &mut bad)?;
         if p.package != want.base.package {
             bad.push(format!(
                 "package {} != aapt2 {}",
@@ -1050,6 +1040,56 @@ pub(crate) fn new_records(before: Option<Vec<String>>, after: Option<Vec<String>
         (Some(b), Some(a)) => a.get(b.len()..).unwrap_or_default().to_vec(),
         _ => Vec::new(),
     }
+}
+
+/// The real install of a code-less fixture app for a gate that stands in for atld (`xtask test binder`'s services stage): `manifest_text` linked by aapt2 into `<work>/app/app.apk`, staged as
+/// `<work>/pkg/base.apk`, and the installer run over it in the broker's installer profile as atld runs it (no feature, the device's property set). The frames file the services decode; Err when the
+/// installer refuses the package (its refusal line).
+pub fn install_fixture(
+    root: &Path,
+    host_arch: &str,
+    out: &Path,
+    broker: &Broker,
+    work: &Path,
+    manifest_text: &str,
+) -> Result<PathBuf> {
+    let java_out = slot::out_dir(root, None, "--java-out", |w| w.join("out/java/build"))?;
+    let host = HostArt::new(
+        root,
+        host_arch,
+        Some(&java_out),
+        out,
+        "installer-art",
+        false,
+    )?;
+    let tools = ApkTools::new(root, host_arch, out, &java_out)?;
+    let apk = link(&tools, &work.join("app"), manifest_text)?;
+    let dir = work.join("pkg");
+    stage_dir(&dir, &[(None, &apk)])?;
+    let (props, area) = device_area(&host, &work.join("device"), None)?;
+    std::fs::create_dir_all(work.join("data"))?;
+    let gate = Gate {
+        host: &host,
+        installer: packages::bin(root, out, PACKAGE, INSTALLER)?,
+        dump: packages::bin(root, out, DUMP_PACKAGE, DUMP)?,
+        api_impl: xtask::host_art::api_impl_dex(&java_out),
+        aapt2: tools.aapt2.clone(),
+        sdk: device_sdk(&props)?,
+        broker,
+        framework_res: out.join(FRAMEWORK_RES),
+        work: work.to_path_buf(),
+        data: work.join("data"),
+        fails: Vec::new(),
+    };
+    let lib_root = work.join("lib");
+    let (run, _, _) = gate.run(&area, &dir, &lib_root, Show::ALL)?;
+    ensure!(
+        run.ok,
+        "the installer refused the fixture ({}): {}",
+        run.status,
+        refusal_line(&run.stderr).unwrap_or(run.stderr.trim())
+    );
+    Ok(work.join("lib.frames"))
 }
 
 /// atl-sandbox-probe built into `<out>/cargo`, as `xtask test sandbox` builds it: its path.

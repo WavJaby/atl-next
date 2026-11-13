@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! atl-system-services: registers the M2 services and the window service with servicemanager (`activity`, `package`, `display`, `window`, as Context.ACTIVITY_SERVICE / PACKAGE_SERVICE /
-//! DISPLAY_SERVICE / WINDOW_SERVICE / INPUT_METHOD_SERVICE name them) and the compositor registry (compositor_registry.rs: how an app's in-process SurfaceFlinger gets registered) and serves them on libbinder's thread pool, until killed. Runs as the system uid: servicemanager accepts addService from it. The packages come
-//! from a record file (atld's install step writes it), the shared libraries and the display from arguments (`--display`: display_model.rs; omitted, the model's default). Processes are started
+//! DISPLAY_SERVICE / WINDOW_SERVICE / INPUT_METHOD_SERVICE name them) and the compositor registry (compositor_registry.rs: how an app's in-process SurfaceFlinger gets registered) and serves them on libbinder's thread pool, until killed. Runs as the system uid: servicemanager accepts addService from it. The packages are
+//! installed at start from the sessions atld holds files for (`--session`), the shared libraries and the display come from arguments (`--display`: display_model.rs; omitted, the model's default). Processes are started
 //! and killed through the control connection atld passes as stdin ([`atl_services::process_control`]).
 //! Prints `services: ready` once all are registered; unimplemented calls are counted on stderr (atl_services_types::counters).
 
@@ -17,27 +17,23 @@ use anyhow::{Context, Result, bail};
 use atl_aidl::aidl::android::app::IActivityManager::BnActivityManager;
 use atl_aidl::aidl::android::content::pm::IPackageManager::BnPackageManager;
 use atl_services::activity::{ActivityManager, RootBack};
-use atl_services::install::{self, Session};
+use atl_services::install;
 use atl_services::package::PackageManager;
+use atl_services::packages::{PackageRecord, Packages, Permissions};
 use atl_services::process_control::ControlSocket;
 use atl_services::ui_agents::UiAgents;
 use atl_services_types::compositor_registry;
 use atl_services_types::display_model::DisplayModel;
 use atl_services_types::native_libs::SupportedAbi;
-use atl_services_types::packages::{Library, PackageRecord, Packages};
-use atl_services_types::permission::Permissions;
+use atl_services_types::packages::Library;
 use binder::{BinderFeatures, ProcessState};
 use clap::Parser;
 
 #[derive(Parser)]
 struct Args {
-    /// Records of packages already in place, a JSON array of `PackageRecord`s: the `xtask test binder` services stage, which has no APK. Excludes `--session`.
-    #[arg(long, conflicts_with = "sessions")]
-    packages: Option<PathBuf>,
-    /// An install session the host holds files for (repeat, in uid order): `<id>=<manifest JSON path>` (atl_services_types::packages::Manifest, xtask's aapt2 read of the base APK).
-    /// Installed at start through the control socket (atl_services::install).
-    #[arg(long = "session", value_parser = parse_session)]
-    sessions: Vec<(u32, PathBuf)>,
+    /// An install session the host holds files for (repeat, in uid order), by its id. Installed at start through the control socket (atl_services::install): the installer's parse is the package.
+    #[arg(long = "session")]
+    sessions: Vec<u32>,
     /// The first session's uid; the i-th gets uid + i. Default: the first uid above the installer's (atl_broker::INSTALLER_UID).
     #[arg(long, default_value_t = atl_broker::INSTALLER_UID + 1)]
     first_uid: u32,
@@ -127,11 +123,6 @@ const CONNECTIVITY: &str = "connectivity";
 /// The name PermissionManager's constructor looks IPermissionManager up by (PermissionManager.java getServiceOrThrow("permissionmgr")).
 const PERMISSION_MANAGER: &str = "permissionmgr";
 
-fn parse_session(s: &str) -> Result<(u32, PathBuf), String> {
-    let (id, path) = s.split_once('=').ok_or("expected <id>=<manifest path>")?;
-    Ok((id.parse().map_err(|e| format!("{id}: {e}"))?, path.into()))
-}
-
 fn parse_abi(s: &str) -> Result<SupportedAbi, String> {
     let (abi, isa) = s.split_once('=').ok_or("expected <abi>=<isa>")?;
     Ok(SupportedAbi {
@@ -159,31 +150,16 @@ fn main() -> Result<()> {
     let display = a.display.unwrap_or_default();
     let control = Arc::new(ControlSocket::from_stdin().context("the process control on stdin")?);
     // the package list: installed now through the host's file work (atl_services::install), before any service answers
-    let list: Vec<PackageRecord> = match &a.packages {
-        Some(file) => read_json(file)?,
-        None => {
-            let sessions = a
-                .sessions
-                .iter()
-                .map(|(id, m)| {
-                    Ok(Session {
-                        id: *id,
-                        manifest: read_json(m)?,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let config = install::Config {
-                first_uid: a.first_uid,
-                abis: a.abis.clone(),
-                platform_permissions: match &a.platform_permissions {
-                    Some(p) => read_json(p)?,
-                    None => Vec::new(),
-                },
-                no_gl_selection: a.no_gl_selection,
-            };
-            install::install(&control, sessions, &config)?
-        }
+    let config = install::Config {
+        first_uid: a.first_uid,
+        abis: a.abis.clone(),
+        platform_permissions: match &a.platform_permissions {
+            Some(p) => read_json(p)?,
+            None => Vec::new(),
+        },
+        no_gl_selection: a.no_gl_selection,
     };
+    let list: Vec<PackageRecord> = install::install(&control, &a.sessions, &config)?;
     let libraries: BTreeMap<String, Library> = a.shared_libraries.into_iter().collect();
     let packages = Arc::new(Packages::new(list, libraries));
     // the install-time grants every service checks callers against (permission.rs, rule A)

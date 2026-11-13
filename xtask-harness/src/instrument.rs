@@ -106,7 +106,7 @@ enum Expect {
 struct Case<'a> {
     label: &'a str,
     apk: PathBuf,
-    manifest: atl_services_types::packages::Manifest,
+    manifest: crate::manifest::Manifest,
     runner: &'a str,
     class: &'a str,
     expect: Expect,
@@ -551,7 +551,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let run = Run {
             root: work.join(format!("root-{label}")),
             scratch: work.join(format!("scratch-{label}")),
-            packages: vec![Package::base(apk.clone(), m.clone())],
+            packages: vec![Package::base(apk.clone())],
             first_uid: APP_UID,
             launch: None,
             libraries: libraries.clone(),

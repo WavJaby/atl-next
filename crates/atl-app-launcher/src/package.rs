@@ -116,7 +116,16 @@ pub fn parse(vm: &Vm, dir: &Path, device: &Device) -> Result<Parsed> {
         c"()Lcom/android/internal/pm/parsing/pkg/ParsedPackage;",
         false,
     )?;
-    let pkg = vm.call_object(parsing, hide, &[], "ParsingPackage.hideAsParsed")?;
+    let parsed = vm.call_object(parsing, hide, &[], "ParsingPackage.hideAsParsed")?;
+    // hideAsFinal (InstallPackageHelper:426, before any PackageInfo) computes the base ApplicationInfo flags (PackageImpl.assignDerivedFields2): generate before it answers flags 0, no FLAG_HAS_CODE -> empty class path
+    let parsed_class = vm.find_class(c"com/android/internal/pm/parsing/pkg/ParsedPackage")?;
+    let finalize = vm.method(
+        parsed_class,
+        c"hideAsFinal",
+        c"()Lcom/android/internal/pm/parsing/pkg/AndroidPackageInternal;",
+        false,
+    )?;
+    let pkg = vm.call_object(parsed, finalize, &[], "ParsedPackage.hideAsFinal")?;
     let common = vm.find_class(c"com/android/internal/pm/parsing/PackageInfoCommonUtils")?;
     let generate = vm.method(
         common,

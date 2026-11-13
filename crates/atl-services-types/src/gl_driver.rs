@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: MIT
 //! The GL driver each app process gets: AOSP's per-package switch (GraphicsEnvironment.queryAngleChoice reads `angle_gl_driver_selection_pkgs` / `_values`), decided by the owner list (gl-drivers.toml) and the install-time ES1 rule, then handed to app processes as coreSettings at bindApplication (CoreSettingsObserver's job in AOSP).
-//! The install step stores the decision in `PackageRecord::gl_driver`; the bundle lists only the `angle` packages, so an unlisted package gets AOSP's default (native).
+//! The install step stores the decision per package (atl-services `PackageRecord::gl_driver`); the bundle lists only the `angle` packages, so an unlisted package gets AOSP's default (native).
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-
-use crate::packages::PackageRecord;
 
 /// The owner list, compiled in. The install step and `xtask check` read this same text.
 pub const OWNER_TABLE: &str = include_str!("../../../gl-drivers.toml");
@@ -84,11 +82,13 @@ pub fn select(owner: &BTreeMap<String, GlDriver>, name: &str, needs_es1: bool) -
 }
 
 /// The values of [`SELECTION_PKGS`] and [`SELECTION_VALUES`] for bindApplication: the `angle` packages, index-matched (GraphicsEnvironment splits both on ','). None when no package is ANGLE, so no key is set.
-pub fn selection(packages: &[PackageRecord]) -> Option<(String, String)> {
+pub fn selection<'a>(
+    packages: impl IntoIterator<Item = (&'a str, GlDriver)>,
+) -> Option<(String, String)> {
     let names: Vec<&str> = packages
-        .iter()
-        .filter(|p| p.gl_driver == GlDriver::Angle)
-        .map(|p| p.name.as_str())
+        .into_iter()
+        .filter(|(_, d)| *d == GlDriver::Angle)
+        .map(|(n, _)| n)
         .collect();
     if names.is_empty() {
         return None;

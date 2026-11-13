@@ -10,8 +10,19 @@
 //! across tasks (NEW_TASK into another affinity), more than one task per package, bringing a running app's task to front.
 
 use atl_services_types::counters;
-use atl_services_types::packages::ActivityDecl;
 use atl_services_types::permission::{SHELL_UID, SYSTEM_UID};
+
+/// What a start's check reads of the activity it starts (the installed ActivityInfo's, crate::packages::declared): its class, launch mode, process and task affinity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Declared {
+    pub name: String,
+    /// ActivityInfo.launchMode
+    pub launch_mode: i32,
+    /// ComponentInfo.processName (the parse fills it: the component's, else the package's)
+    pub process: Option<String>,
+    /// ActivityInfo.taskAffinity; None = the package name
+    pub task_affinity: Option<String>,
+}
 
 /// ActivityManager.START_SUCCESS: the activity is started (the record is pushed and its launch sent).
 pub const START_SUCCESS: i32 = 0;
@@ -84,7 +95,7 @@ impl Call<'_> {
 #[derive(Debug, Clone, Copy)]
 pub struct Target<'a> {
     pub process: &'a str,
-    pub decl: Option<&'a ActivityDecl>,
+    pub decl: Option<&'a Declared>,
     /// An activity of the component's class, not finishing, is in the source's task: what a singleTask start reuses.
     pub in_task: bool,
     /// The source task's top non-finishing activity is of the component's class: what a singleTop start reuses.
@@ -97,10 +108,7 @@ fn refused(code: i32, reason: &'static str) -> Refusal {
 }
 
 /// Validates one start. Ok: the declaration of the activity to start; the caller starts it in the source's task.
-pub fn check<'a>(
-    call: &Call<'_>,
-    target: Target<'a>,
-) -> Result<(&'a ActivityDecl, Start), Refusal> {
+pub fn check<'a>(call: &Call<'_>, target: Target<'a>) -> Result<(&'a Declared, Start), Refusal> {
     let Some(source) = call.source else {
         return Err(refused(START_CANCELED, "resultTo names no activity"));
     };
@@ -242,21 +250,13 @@ mod tests {
     const SPLASH: &str = "org.example.app.SplashActivity";
     const OTHER_PACKAGE: &str = "org.example.other";
 
-    fn decl(name: &str) -> ActivityDecl {
-        ActivityDecl {
+    /// A standard activity in the package's process, no affinity written (the parse fills both with the package's).
+    fn decl(name: &str) -> Declared {
+        Declared {
             name: name.to_owned(),
-            launcher: false,
-            theme: 0,
-            config_changes: 0,
-            booleans: Default::default(),
             launch_mode: LAUNCH_MODE_STANDARD,
+            process: Some(PACKAGE.to_owned()),
             task_affinity: None,
-            process: None,
-            meta_data: vec![],
-            screen_orientation: atl_services_types::packages::SCREEN_ORIENTATION_UNSPECIFIED,
-            resizeable: true,
-            min_aspect_ratio: None,
-            max_aspect_ratio: None,
         }
     }
 
@@ -277,7 +277,7 @@ mod tests {
         }
     }
 
-    fn target(main: &ActivityDecl) -> Target<'_> {
+    fn target(main: &Declared) -> Target<'_> {
         Target {
             process: PACKAGE,
             decl: Some(main),
@@ -286,7 +286,7 @@ mod tests {
         }
     }
 
-    fn code_of(r: Result<(&ActivityDecl, Start), Refusal>) -> Refusal {
+    fn code_of(r: Result<(&Declared, Start), Refusal>) -> Refusal {
         match r {
             Err(refusal) => refusal,
             Ok((d, _)) => panic!("accepted {}, refusal expected", d.name),
@@ -599,7 +599,7 @@ mod tests {
         );
     }
 
-    fn start_of(r: Result<(&ActivityDecl, Start), Refusal>) -> Start {
+    fn start_of(r: Result<(&Declared, Start), Refusal>) -> Start {
         r.expect("accepted").1
     }
 
@@ -607,13 +607,13 @@ mod tests {
     #[test]
     fn single_top_and_task_reuse_their_instance_else_start_new() {
         let mut main = decl(MAIN);
-        fn in_task(m: &ActivityDecl) -> Target<'_> {
+        fn in_task(m: &Declared) -> Target<'_> {
             Target {
                 in_task: true,
                 ..target(m)
             }
         }
-        fn on_top(m: &ActivityDecl) -> Target<'_> {
+        fn on_top(m: &Declared) -> Target<'_> {
             Target {
                 in_task: true,
                 top_is_class: true,

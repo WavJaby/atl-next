@@ -10,8 +10,8 @@ use atl_aidl::aidl::android::permission::IPermissionManager::{
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, ThreadState};
 use std::sync::Arc;
 
-use atl_services_types::packages::Packages;
-use atl_services_types::permission::Permissions;
+use crate::packages::Packages;
+use crate::packages::Permissions;
 
 /// The interface name counters use.
 const INTERFACE: &str = "IPermissionManager";

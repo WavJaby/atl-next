@@ -14,7 +14,7 @@ use anyhow::{Context, Result, ensure};
 use atl_layout::Layout;
 use atl_services_types::display_model::DisplayModel;
 use atl_services_types::native_libs::SupportedAbi;
-use atl_services_types::packages::{Library, Manifest};
+use atl_services_types::packages::Library;
 use serde::{Deserialize, Serialize};
 
 use crate::gate_goals::{
@@ -261,10 +261,9 @@ pub struct Shell {
     pub boot_jars: Vec<PathBuf>,
 }
 
-/// One package: its files, base first, and the base's manifest.
+/// One package: its files, base first. The services install it (the installer's parse is the package); no manifest reaches atld.
 pub struct Package {
     pub files: Vec<PackageFile>,
-    pub manifest: Manifest,
 }
 
 /// One APK of a package: the base (`split` None), or a split APK with its split name.
@@ -276,10 +275,9 @@ pub struct PackageFile {
 
 impl Package {
     /// A package of one base APK and no splits.
-    pub fn base(path: PathBuf, manifest: Manifest) -> Self {
+    pub fn base(path: PathBuf) -> Self {
         Self {
             files: vec![PackageFile { split: None, path }],
-            manifest,
         }
     }
 }
@@ -290,7 +288,7 @@ pub struct Run {
     pub root: PathBuf,
     /// Where the package files and atld's own log go (outside the root, which atld removes).
     pub scratch: PathBuf,
-    /// Each package's files and manifest, in uid order.
+    /// Each package's files, in uid order.
     pub packages: Vec<Package>,
     pub first_uid: u32,
     pub launch: Option<String>,
@@ -304,7 +302,6 @@ pub struct Run {
 #[derive(Serialize)]
 struct PackageSource<'a> {
     files: &'a [PackageFile],
-    manifest: &'a Manifest,
 }
 
 impl Run {
@@ -1403,7 +1400,6 @@ impl Runtime {
                 &file,
                 serde_json::to_vec_pretty(&PackageSource {
                     files: &package.files,
-                    manifest: &package.manifest,
                 })?,
             )?;
             written.push(file.clone());

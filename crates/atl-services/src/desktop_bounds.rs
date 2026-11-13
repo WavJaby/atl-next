@@ -5,7 +5,7 @@
 //! Position: the centred rect of AOSP's rule. xdg-shell gives a client no toplevel position, so the compositor places the window and this origin only records the Task's bounds.
 
 use atl_services_types::packages::{
-    ActivityDecl, SCREEN_ORIENTATION_LANDSCAPE, SCREEN_ORIENTATION_PORTRAIT,
+    SCREEN_ORIENTATION_LANDSCAPE, SCREEN_ORIENTATION_PORTRAIT,
     SCREEN_ORIENTATION_REVERSE_LANDSCAPE, SCREEN_ORIENTATION_REVERSE_PORTRAIT,
     SCREEN_ORIENTATION_SENSOR_LANDSCAPE, SCREEN_ORIENTATION_SENSOR_PORTRAIT,
     SCREEN_ORIENTATION_USER_LANDSCAPE, SCREEN_ORIENTATION_USER_PORTRAIT,
@@ -80,16 +80,6 @@ pub struct ActivityInput {
 }
 
 impl ActivityInput {
-    /// The activity a manifest declares: its screen orientation, resize mode and aspect limits.
-    pub fn from_decl(decl: &ActivityDecl) -> Self {
-        Self {
-            orientation: ActivityOrientation::from_screen_orientation(decl.screen_orientation),
-            resizeable: decl.resizeable,
-            min_aspect: decl.min_aspect_ratio,
-            max_aspect: decl.max_aspect_ratio,
-        }
-    }
-
     /// A process with no launch activity: AOSP's default activity (unspecified orientation, resizeable, no aspect limits).
     pub fn no_activity() -> Self {
         Self {

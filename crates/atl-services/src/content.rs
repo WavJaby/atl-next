@@ -20,8 +20,9 @@ use binder::{
 };
 
 use crate::observer_rules::{Watch, segments};
+use crate::packages::Permissions;
 use atl_services_types::counters;
-use atl_services_types::permission::{self, Permissions};
+use atl_services_types::permission;
 
 /// The interface name counters use.
 const INTERFACE: &str = "IContentService";
