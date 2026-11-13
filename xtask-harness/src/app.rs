@@ -192,6 +192,9 @@ const BRIDGE1_CALLS: &[(&str, &str)] = &[
     ("threadSum", "5050"),
     ("tlsCounter#3", "3"),
     ("tlsCounterFreshThread", "1"),
+    // atl_jni_test.c keyDtorDetach: destructor ran once; DetachCurrentThread and AttachCurrentThread both JNI_OK (0); return and pthread_exit endings
+    ("keyDtorDetachReturn", "ran 1 rc 0 attach 0"),
+    ("keyDtorDetachExit", "ran 1 rc 0 attach 0"),
     ("errnoRoundTrip", "2"),
     ("cppThrowCatch", "1"),
     ("dlopenSibling", "42"),

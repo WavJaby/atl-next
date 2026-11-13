@@ -2,7 +2,7 @@
 //! Host sides of the guest libc's pthread stubs (NBS `stubs_x86_64.cpp`): guest threads are glibc threads, as NBS makes them host threads.
 //! Pass-through to glibc where the ABI is the same (build.rs `GLIBC` rows of the binding table): `pthread_key_t` (int), `pthread_attr_t` (56 bytes, only ever filled and read by glibc, since every `pthread_attr_*` is a glibc row too) -- sizes gated below against the generated bionic layout.
 //! A `pthread_t` is the guest's own handle, the thread's bionic record (thread.rs `THREADS`): every row taking one maps it to glibc's (`pthread_join`, `pthread_detach`, `pthread_gettid_np`, `pthread_getattr_np`, [`BY_HANDLE`]); `pthread_self` and `pthread_equal` are guest bionic and agree with `pthread_create`'s answer.
-//! Own host sides (`Shim` rows) where the guest hands host code a guest function: `pthread_create` (start routine on the new thread's guest thread pointer, after attach on a guest stack of the attr's size) and `pthread_key_create` (destructor run by thread.rs `detach`); and `pthread_getattr_np`, whose answer is the guest stack (thread.rs `stack_of`), not glibc's view of the host thread. QEMU only: `pthread_exit`, which ends the start routine's guest call.
+//! Own host sides (`Shim` rows) where the guest hands host code a guest function: `pthread_create` (start routine on the new thread's guest thread pointer, after attach on a guest stack of the attr's size) and `pthread_key_create` (destructor run by thread.rs `detach`); and `pthread_getattr_np`, whose answer is the guest stack (thread.rs `stack_of`), not glibc's view of the host thread. And `pthread_exit`, which ends the start routine's guest call (`Engine::end_call`).
 
 use std::cell::Cell;
 use std::ffi::c_void;
@@ -128,23 +128,22 @@ thread_local! {
     static ROUTINE: Cell<bool> = const { Cell::new(false) };
 }
 
-/// `void pthread_exit(void*)` (QEMU table only, build.rs `QEMU_SHIMS`): ends the start routine's guest call at once with `value` as its result (answered in x0, hence the return), so [`run`] returns it to glibc, whose join reports it; the host thread then exits as after a plain return.
+/// `void pthread_exit(void*)`: ends the start routine's guest call at once with `value` as its result (`Engine::end_call`; QEMU answers it in x0, hence the return), so [`run`] returns it to glibc, whose join reports it; the host thread then exits as after a plain return.
 /// bionic's order (pthread_exit.cpp): `__cxa_thread_finalize`, cleanup handlers, `pthread_key_clean_all`, then the stack goes. The first two are guest-libc NBS stubs with no host side here (an app that registers either traps first); key destructors and the guest stack are thread.rs `detach`'s, run by the host key at this thread's exit.
-/// Only from the routine's own guest call (call depth 1 on a [`run`] thread): a deeper exit would skip host frames between the calls, and a host thread that merely attached has no routine to end. Both abort, named.
+/// Only from the routine's own guest call on a [`run`] thread (the engine refuses a nested one: it would skip host frames between the calls); a host thread that merely attached has no routine to end. Both abort, named.
 pub(super) extern "C" fn pthread_exit(value: usize) -> usize {
-    let (routine, depth) = (ROUTINE.with(Cell::get), super::qemu::call_depth());
-    if !routine || depth != 1 {
-        super::unsupported(&format!(
-            "guest pthread_exit outside a guest thread's start routine (routine thread {routine}, guest call depth {depth})"
-        ));
+    if !ROUTINE.with(Cell::get) {
+        super::unsupported("guest pthread_exit outside a guest thread's start routine");
     }
     // deliberate break (`ATL_NB_BREAK=qt_exit_resume`): the call is not ended, so the guest resumes after its noreturn pthread_exit (qemu-thread gate `x`)
-    if !cfg!(atl_nb_qt_exit_resume)
-        && let Err(e) = super::qemu::end_call()
-    {
-        super::unsupported(&format!("guest pthread_exit: {e}"));
+    if cfg!(atl_nb_qt_exit_resume) {
+        return value;
     }
-    value
+    // SAFETY: this thread's record (a run thread attached before its routine), called from the guest's pthread_exit crossing; nothing here needs a drop.
+    match unsafe { super::active().end_call(&mut *thread::attach_current(), value) } {
+        Ok(v) => v,
+        Err(e) => super::unsupported(&format!("guest pthread_exit: {e}")),
+    }
 }
 
 /// `int pthread_key_create(pthread_key_t*, void (*)(void*))`: glibc's key without a destructor; the guest's is stored here and runs at thread exit (thread.rs `detach`). The store is the same under QEMU; the destructor crosses on the exiting thread (thread.rs `detach`).

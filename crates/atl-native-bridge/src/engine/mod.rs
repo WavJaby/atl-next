@@ -288,6 +288,24 @@ impl Active {
             }
         }
     }
+
+    /// [`Engine::end_call`] on this engine.
+    ///
+    /// # Safety
+    /// As [`Engine::end_call`].
+    pub(crate) unsafe fn end_call(
+        self,
+        cpu: &mut HostThread,
+        value: usize,
+    ) -> Result<usize, String> {
+        // SAFETY: caller contract.
+        unsafe {
+            match self {
+                Active::Identity => identity::CROSSING.end_call(cpu, value),
+                Active::Qemu => qemu::CROSSING.end_call(cpu, value),
+            }
+        }
+    }
 }
 
 /// Host `sigaction(sig)`, then `signal::rewrap_all`: `handler(sig, info, ucontext)` runs on the host thread pointer even when the signal hit guest code (spike gate g3) -- the path every host handler takes, ART's sigchain included.
@@ -395,6 +413,11 @@ pub trait Engine {
     /// # Safety
     /// `f` must be guest code taking up to four integer arguments, pointer arguments valid for it; `cpu` is the calling thread's own.
     unsafe fn call(&self, cpu: &mut Self::Cpu, tp: Tp, f: usize, args: &[usize; 4]) -> usize;
+    /// From a host function the guest called in the thread's outermost guest call (intercepts.rs `pthread_exit`): ends that guest call at once, `value` becoming its answer; host frames between are skipped, so the caller holds nothing that needs a drop. Refused (Err) when another guest call is nested inside the outermost one. QEMU: arms `atl_engine.end_call`, answers `value`, and the host function's return ends the call. Identity: never returns on success (the stack goes back to the outermost `atl_nb_call_guest`).
+    ///
+    /// # Safety
+    /// `cpu` is the calling thread's own record, called from inside a host function the guest called.
+    unsafe fn end_call(&self, cpu: &mut Self::Cpu, value: usize) -> Result<usize, String>;
 }
 
 /// The core's guest call on `cpu`, with the thread pointer its record holds.

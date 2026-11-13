@@ -272,6 +272,8 @@ public class Main extends Activity {
         bridge1Call(jni, "mediandkLinked", "mediandkLinked");
         bridge1Call(jni, "resolverProbe", "resolverProbe");
         bridge1Call(jni, "cpuProbe", "cpuProbe", Runtime.getRuntime().availableProcessors());
+        bridge1Call(jni, "keyDtorDetachReturn", "keyDtorDetach", 0);
+        bridge1Call(jni, "keyDtorDetachExit", "keyDtorDetach", 1);
         // tr-first blocker 5: (a) on this thread inside the call; then a fresh thread arms the main looper for (b), read in onActivityResult
         bridge1Call(jni, "looperNow", "looperNow");
         Thread arm = new Thread(new Runnable() {

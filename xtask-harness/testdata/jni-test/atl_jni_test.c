@@ -691,6 +691,43 @@ JNI_FN(jstring, cpuProbe)(JNIEnv *env, jclass cls, jint java)
     return (*env)->NewStringUTF(env, out);
 }
 
+// AtlJniTest.keyDtorDetach (bridge-keydtor): Android's documented JNI thread pattern (developer.android.com JNI tips "Threads"): a native thread attaches, stores its JNIEnv under a pthread key whose destructor calls DetachCurrentThread, then ends without detaching -- by returning (exit 0) or by pthread_exit (exit 1). ART's ThreadExitCallback re-arms once for exactly this (thread.cc) and aborts only if the thread is still attached on its second call.
+// Answer "ran R rc C attach A": R = destructor runs (1), C = its DetachCurrentThread result (JNI_OK 0), A = the thread's AttachCurrentThread result (0). A process abort instead of an answer is the failure this row guards.
+static JavaVM *kd_vm;
+static pthread_key_t kd_key;
+static volatile int kd_ran, kd_rc = -100, kd_attach = -100;
+
+static void kd_dtor(void *value)
+{
+    kd_ran++;
+    kd_rc = (*kd_vm)->DetachCurrentThread(kd_vm);
+}
+
+static void *kd_thread(void *arg)
+{
+    JNIEnv *env = NULL;
+    kd_attach = (*kd_vm)->AttachCurrentThread(kd_vm, &env, NULL);
+    pthread_setspecific(kd_key, env);
+    if ((intptr_t)arg)
+        pthread_exit(NULL);
+    return NULL;
+}
+
+JNI_FN(jstring, keyDtorDetach)(JNIEnv *env, jclass cls, jint via_exit)
+{
+    char out[64];
+    pthread_t t;
+    (*env)->GetJavaVM(env, &kd_vm);
+    kd_ran = 0;
+    kd_rc = kd_attach = -100;
+    if (pthread_key_create(&kd_key, kd_dtor) != 0 || pthread_create(&t, NULL, kd_thread, (void *)(intptr_t)via_exit) != 0)
+        return (*env)->NewStringUTF(env, "setup failed");
+    pthread_join(t, NULL);
+    pthread_key_delete(kd_key);
+    snprintf(out, sizeof out, "ran %d rc %d attach %d", kd_ran, kd_rc, kd_attach);
+    return (*env)->NewStringUTF(env, out);
+}
+
 // AtlJniTest.resolverProbe (net-bp, engine/netdb.rs): the libc resolver family through the bridge, every answer read in bionic's layout and values. Fields: numeric 1 (AF_INET 127.0.0.1:80, one node, no canonical name); passive 1 (AI_PASSIVE null host, 0.0.0.0:8080); service = EAI_SERVICE (9); numerichost = EAI_NONAME (8, AI_NUMERICHOST on a name); text 1 (gai_strerror of EAI_NODATA and EAI_NONAME is bionic's); loop 1000 (1000 numeric lookups, each read back and freed); list ok (AF_UNSPEC passive list walked and freed, its length host-dependent, not printed); herr 1 (h_errno set to 77, then a failed gethostbyname of the unresolvable name leaves HOST_NOT_FOUND or TRY_AGAIN in it; a name that resolves here reads 0, so a DNS that answers every name fails this field). The getaddrinfo answer for the unresolvable name is logged, not gated: its code depends on the sandbox network.
 static int rp_numeric(void)
 {

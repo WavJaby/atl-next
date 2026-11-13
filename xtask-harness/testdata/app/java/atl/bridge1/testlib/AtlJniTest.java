@@ -152,6 +152,9 @@ public final class AtlJniTest {
     /** ab2-load: the CPU count by every native route plus the caller's Runtime.availableProcessors, and the /proc/cpuinfo features word (atl_jni_test.c cpuProbe). */
     public static native String cpuProbe(int java);
 
+    /** bridge-keydtor: a native thread that attaches and detaches only from a pthread key destructor, ending by return (0) or pthread_exit (1) (atl_jni_test.c keyDtorDetach). */
+    public static native String keyDtorDetach(int viaExit);
+
     /** net-bp: the libc resolver family through the bridge, one line of checks (atl_jni_test.c resolverProbe). */
     public static native String resolverProbe();
 

@@ -36,6 +36,8 @@ pub struct HostThread {
     host_fs: usize,
     guest_fs: usize,
     shadow_end: *mut usize,
+    /// The innermost running `atl_nb_call_guest`'s saved-register frame (its sp after the saves), where `atl_nb_end_call` resumes; the outer call's is kept in that frame. 0 outside any call.
+    exit_sp: usize,
     shadow: [usize; SHADOW_FRAMES * FRAME_WORDS],
     /// The stack this thread's guest code runs on (`Engine::attach`'s answer); the guest's `pthread_getattr_np` reports it.
     stack: super::Stack,
@@ -46,6 +48,7 @@ const _: () = {
     assert!(std::mem::offset_of!(HostThread, host_fs) == 8);
     assert!(std::mem::offset_of!(HostThread, guest_fs) == 16);
     assert!(std::mem::offset_of!(HostThread, shadow_end) == 24);
+    assert!(std::mem::offset_of!(HostThread, exit_sp) == 32);
 };
 
 /// Bootstrap record: the starting thread's, while its `Tp::Bootstrap` call runs (`Identity::call`: `Guest::start`'s `__linker_init`).
@@ -65,6 +68,7 @@ impl HostThread {
             host_fs: 0,
             guest_fs: 0,
             shadow_end: std::ptr::null_mut(),
+            exit_sp: 0,
             shadow: [0; SHADOW_FRAMES * FRAME_WORDS],
             stack: super::Stack::default(),
         }));
@@ -220,14 +224,24 @@ macro_rules! up_call {
 std::arch::global_asm!(
     concat!(
         // atl_nb_call_guest(ht, f, a, b, c, d) -> f(a, b, c, d) on the guest thread pointer
+        // saves every callee-saved register, the outer call's exit_sp and the shadow sp, then records its sp in exit_sp (32): atl_nb_end_call resumes at `atl_nb_call_guest_end` from there; 9 words keep the call aligned
         // hidden: rip-relative references must not be preemptible in the cdylib
-        ".hidden atl_nb_host_targets, atl_nb_host_thunks, atl_nb_call_guest, atl_nb_cross_to_host, atl_nb_object_up, atl_nb_object_stubs, atl_nb_up, atl_nb_cross_to_guest, atl_nb_attach_fn, atl_nb_signal_entry, atl_nb_signal_handlers, atl_nb_bootstrap, atl_nb_bootstrap_tid\n",
+        ".hidden atl_nb_host_targets, atl_nb_host_thunks, atl_nb_call_guest, atl_nb_end_call,atl_nb_cross_to_host, atl_nb_object_up, atl_nb_object_stubs, atl_nb_up, atl_nb_cross_to_guest, atl_nb_attach_fn, atl_nb_signal_entry, atl_nb_signal_handlers, atl_nb_bootstrap, atl_nb_bootstrap_tid\n",
         ".text\n",
         ".globl atl_nb_call_guest\n",
         ".type atl_nb_call_guest,@function\n",
         "atl_nb_call_guest:\n",
         "    push %rbx\n",
+        "    push %rbp\n",
+        "    push %r12\n",
+        "    push %r13\n",
+        "    push %r14\n",
+        "    push %r15\n",
         "    mov %rdi, %rbx\n",
+        "    push 32(%rbx)\n",
+        "    push 0(%rbx)\n",
+        "    sub $8, %rsp\n",
+        "    mov %rsp, 32(%rbx)\n",
         "    rdfsbase %rax\n",
         "    mov %rax, 8(%rbx)\n",
         "    mov 16(%rbx), %rax\n",
@@ -241,12 +255,31 @@ std::arch::global_asm!(
         "    mov %r8, %rdx\n",
         "    mov %r9, %rcx\n",
         "    call *%rax\n",
+        "atl_nb_call_guest_end:\n",
         "    rdfsbase %rcx\n",
         "    mov %rcx, 16(%rbx)\n",
         restore_host_fs!(),
+        "    add $8, %rsp\n",
+        "    pop 0(%rbx)\n",
+        "    pop 32(%rbx)\n",
+        "    pop %r15\n",
+        "    pop %r14\n",
+        "    pop %r13\n",
+        "    pop %r12\n",
+        "    pop %rbp\n",
         "    pop %rbx\n",
         "    ret\n",
         ".size atl_nb_call_guest, .-atl_nb_call_guest\n",
+        // atl_nb_end_call(ht, value) -> !: from a host function the guest called, ends ht's innermost atl_nb_call_guest with `value` as its answer: the guest thread pointer back (the epilogue stores it), the stack back to that call's frame; the shadow sp it restores drops the open up frames
+        ".type atl_nb_end_call,@function\n",
+        "atl_nb_end_call:\n",
+        "    mov %rdi, %rbx\n",
+        "    mov %rsi, %rax\n",
+        "    mov 16(%rbx), %rcx\n",
+        "    wrfsbase %rcx\n",
+        "    mov 32(%rbx), %rsp\n",
+        "    jmp atl_nb_call_guest_end\n",
+        ".size atl_nb_end_call, .-atl_nb_end_call\n",
         // the up crossing proper: %r11 = host target, [rsp] = guest return, FS = guest
         // record: the bootstrap one while it is set (only the starting thread runs guest code then), else the guest TCB's slot
         // frame: guest return, guest FS, host target, guest %rbx; %rbx = the record while the host target runs (callee-saved by it)
@@ -699,6 +732,7 @@ unsafe extern "C" {
         c: usize,
         d: usize,
     ) -> usize;
+    fn atl_nb_end_call(ht: *mut HostThread, value: usize) -> !;
     static atl_nb_host_thunks: u8;
     static atl_nb_object_stubs: u8;
     fn atl_nb_signal_entry(sig: i32, info: *mut libc::siginfo_t, uc: *mut libc::c_void);
@@ -751,6 +785,19 @@ impl super::Engine for Identity {
     }
 
     fn detach(&self) {}
+
+    /// `atl_nb_end_call`: back to the innermost `atl_nb_call_guest`'s frame. Outermost only: exactly one shadow frame open, the up crossing that reached this host function (a down crossing or a nested guest call opens another).
+    unsafe fn end_call(&self, cpu: &mut HostThread, value: usize) -> Result<usize, String> {
+        let frames = (cpu.shadow_sp as usize - cpu.shadow.as_ptr() as usize)
+            / (FRAME_WORDS * size_of::<usize>());
+        if frames != 1 || cpu.exit_sp == 0 {
+            return Err(format!(
+                "end_call with {frames} crossing frames open, not only the outermost call's up crossing"
+            ));
+        }
+        // SAFETY: caller contract: `cpu` is this thread's record inside its one up crossing, whose host frames hold nothing to drop; exit_sp is that call's saved frame.
+        unsafe { atl_nb_end_call(cpu, value) }
+    }
 
     unsafe fn call(
         &self,

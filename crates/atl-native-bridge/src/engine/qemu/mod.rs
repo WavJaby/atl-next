@@ -64,13 +64,14 @@ thread_local! {
     static DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
-/// Guest calls running on this thread: 1 inside a trap means the trapping code runs in the thread's outermost guest call.
-pub(super) fn call_depth() -> u32 {
-    DEPTH.with(Cell::get)
-}
-
-/// From inside a trap callback: the trap's return ends the guest call it interrupted, its answer becoming that call's (`atl_engine.end_call`).
-pub(super) fn end_call() -> Result<(), String> {
+/// From inside a trap callback in the thread's outermost guest call (DEPTH 1; a deeper end would skip host frames between the calls): the trap's return ends the guest call it interrupted, its answer becoming that call's (`atl_engine.end_call`).
+fn end_call() -> Result<(), String> {
+    let depth = DEPTH.with(Cell::get);
+    if depth != 1 {
+        return Err(format!(
+            "end_call at guest call depth {depth}, not the outermost call"
+        ));
+    }
     let e = engine();
     let end = e
         .table
@@ -456,6 +457,11 @@ impl super::Engine for Qemu {
     /// Takes the calling thread's CPU back ([`detach_current`]) at thread exit, after its guest destructors.
     fn detach(&self) {
         detach_current();
+    }
+
+    /// Arms [`end_call`] and answers `value`, which the trap's return puts in x0.
+    unsafe fn end_call(&self, _cpu: &mut HostThread, value: usize) -> Result<usize, String> {
+        end_call().map(|()| value)
     }
 
     /// Calls guest `f(a, b, c, d)` on this thread's guest CPU with TPIDR_EL0 = the record's guest thread pointer, and stores back the one the guest returned with (the linker installs its own during `__linker_init`).

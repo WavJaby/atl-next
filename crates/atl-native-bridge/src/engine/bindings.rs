@@ -175,7 +175,7 @@ fn trapped((lib, name, why): (&str, &str, &str)) {
     ))
 }
 
-/// The hand-written host side of `Entry::Shim` stub `name`: the one match over build.rs `SHIMS`, `QEMU_SHIMS` and `PROXY_SHIMS` (test `every_shim_has_an_arm`).
+/// The hand-written host side of `Entry::Shim` stub `name`: the one match over build.rs `SHIMS`, `SIGNAL_SHIMS` and `PROXY_SHIMS` (test `every_shim_has_an_arm`).
 fn shim(name: &str) -> Option<usize> {
     Some(match name {
         "pthread_create" => super::intercepts::pthread_create as *const () as usize,
@@ -187,7 +187,7 @@ fn shim(name: &str) -> Option<usize> {
         "pthread_gettid_np" => super::intercepts::pthread_gettid_np as *const () as usize,
         // tr-first blocker 4: the handle-mapped glibc rows (build.rs `SHIMS`, intercepts.rs `BY_HANDLE`)
         n if super::intercepts::by_handle_fn(n).is_some() => super::intercepts::by_handle_fn(n)?,
-        // Q7-7: QEMU table only (build.rs `QEMU_SHIMS`)
+        // Q7-7 / bridge-keydtor: both engines (`Engine::end_call`)
         "pthread_exit" => super::intercepts::pthread_exit as *const () as usize,
         // net-bp: both engines (build.rs `SHIMS`)
         "getaddrinfo" => super::netdb::getaddrinfo as *const () as usize,

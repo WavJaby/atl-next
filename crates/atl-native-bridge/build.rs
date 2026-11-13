@@ -200,6 +200,8 @@ const SHIMS: &[&str] = &[
     "pthread_join",
     "pthread_detach",
     "pthread_gettid_np",
+    // intercepts.rs: ends the start routine's guest call (`Engine::end_call`)
+    "pthread_exit",
     // intercepts.rs `BY_HANDLE`: the handle mapped, then glibc's function
     "pthread_getcpuclockid",
     "pthread_getname_np",
@@ -221,8 +223,6 @@ const SHIMS: &[&str] = &[
 ];
 /// Shims of the x86_64 stub list only (`libc_stubs`): signal.rs registers the guest handler with sigchain behind ART's claims.
 const SIGNAL_SHIMS: &[&str] = &["sigaction", "sigaction64"];
-/// Shims of the arm64 (QEMU) stub list only: intercepts.rs `pthread_exit` ends the start routine's guest call through the engine's `end_call`, which the identity engine has no counterpart of.
-const QEMU_SHIMS: &[&str] = &["pthread_exit"];
 /// Q5-8: the QEMU table's libc rows that bind to counted shims under `crossing-count` (counters.rs `memcpy`, `memset`, `memcmp`), which record the size argument and then run glibc's.
 const COUNTED_SHIMS: &[&str] = &["memcpy", "memset", "memcmp"];
 /// Proxy-library functions whose host side is hand-written, each bound `Entry::Shim` in its library; each must be in one proxy library's list (`bindings_table`). `slCreateEngine` (engine/sles.rs: its out object is wrapped in a guest proxy); `eglGetProcAddress` (engine/proc.rs: its answer is a row's guest address, never a raw host pointer; the fn-return arm below traps every other one).
@@ -756,7 +756,7 @@ fn stub_names(up: &Upstreams, rel: &str) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// The libc rows: per NBS libc stub, its entry -- [`SHIMS`] (+ [`SIGNAL_SHIMS`] for the x86_64 list, [`QEMU_SHIMS`] for the arm64 one), [`GLIBC`], the provider's [`PROVIDER_APIS`], else a named trap. A name in those lists that the stub list lacks fails the build (a stale row).
+/// The libc rows: per NBS libc stub, its entry -- [`SHIMS`] (+ [`SIGNAL_SHIMS`] for the x86_64 list), [`GLIBC`], the provider's [`PROVIDER_APIS`], else a named trap. A name in those lists that the stub list lacks fails the build (a stale row).
 fn libc_entries(
     names: &[String],
     qemu: bool,
@@ -766,7 +766,7 @@ fn libc_entries(
         .iter()
         .flat_map(|(_, f)| f.iter().copied())
         .collect();
-    let per_isa: &[&str] = if qemu { QEMU_SHIMS } else { SIGNAL_SHIMS };
+    let per_isa: &[&str] = if qemu { &[] } else { SIGNAL_SHIMS };
     // cargo sets CARGO_FEATURE_<NAME> for build scripts; identity and shipped builds keep the glibc rows
     let counted: &[&str] = if qemu && std::env::var_os("CARGO_FEATURE_CROSSING_COUNT").is_some() {
         COUNTED_SHIMS
