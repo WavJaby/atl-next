@@ -13,6 +13,7 @@ pub mod app_env;
 pub mod control;
 pub mod gpu;
 mod seccomp;
+pub use seccomp::{NiceTiers, granted_nice};
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -726,6 +727,11 @@ impl Broker {
         );
         // the stub applies the grants, then execs the program with the spawn's arguments
         let mut args = stub_args(&grants, spawn.rights.contains(&Right::Net), &spawn.program);
+        // the app's thread-priority tiers (seccomp.rs NiceTiers): the stub raises the soft RLIMIT_NICE to the hard one and logs the tier line once per process
+        if self.app_seccomp {
+            let tiers = seccomp::NiceTiers::for_limit(seccomp::granted_nice());
+            args.splice(0..0, [OsString::from("--nice"), tiers.describe().into()]);
+        }
         args.extend(spawn.args.iter().cloned());
         // the desktop's variables the sandbox reads (app_env::APP_ENV), then the spawn's own and the launcher's additions, later winning on a clash; nothing else of atld's environment
         let mut env = app_env::forwarded(|k| std::env::var_os(k));

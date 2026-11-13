@@ -3,11 +3,12 @@
 //! BinderDaemon: a measured allow-list, everything else kills ([`binderd_program`]; derivation in arch.rs).
 //! App: the first rule of the planned per-app filter (seccompiler 0.5); every other syscall is allowed, so this is not yet the allow-list.
 //! Installer: a measured allow-list like BinderDaemon's ([`arch::INSTALLER_SYSCALLS`]), socket only for AF_UNIX; anything else kills the process.
-//! App rule: `setpriority` with a negative priority returns 0 and changes nothing; a non-negative priority reaches the kernel unchanged.
-//! Condition defended: an unprivileged user cannot lower nice (RLIMIT_NICE hard limit 0 here; real Android's init sets 40/40, init.rc:42-43). ART starts HandlerThreads at THREAD_PRIORITY_FOREGROUND (-2),
-//! so Process.setThreadPriority throws SecurityException (android_util_Process.cpp:115) and the app's queued-work looper dies with the app.
-//! Delete the rule when thread priority goes through the desktop (rtkit or the realtime portal): the ideal, not now.
-//! The rule grants nothing: a refused priority stays as it is, only the reported result changes. seccomp cannot count, so its evidence is the test below and `xtask run-apk` with and without `--no-app-seccomp`.
+//! App rule (thread priority, two capability tiers chosen by the host's RLIMIT_NICE hard limit H, [`granted_nice`]): the stub raises the soft limit to H ([`NiceTiers`]), so a nice the kernel then accepts from any
+//! current value (n >= 20 - H, kernel `can_nice`) reaches it and takes effect ("host-nice"); a lower one is answered 0 and changes nothing ("baseline"). getpriority keeps reporting the kernel's real value.
+//! Condition defended: Android grants every app RLIMIT_NICE 40/40 (init.rc `setrlimit nice 40 40`), so its apps never see setpriority fail on their own threads; Process.setThreadPriority turns EACCES into
+//! SecurityException (android_util_Process.cpp), which kills e.g. Firebase's executor threads and ART's queued-work looper. Hosts grant less (WSL 0, a GameMode host 30). Retires when H >= 40 (the rule then matches nothing).
+//! One static floor, not the kernel's "raising is always allowed": seccomp cannot see the current nice, and a floor keeps lower/restore pairs consistent (both applied, or both ignored).
+//! seccomp cannot count: the per-process evidence is the stub's `sandbox-stub: nice` line, the test below, and `xtask test app`'s priority row with and without `--no-app-seccomp`.
 
 mod arch;
 
@@ -26,10 +27,77 @@ const PRIORITY_ARG: u8 = 2;
 /// Bit 31 set: the 32-bit int is negative. A Dword comparison reads the argument's low 32 bits, the int the kernel reads, whatever the upper half holds.
 const NEGATIVE: u64 = 0x8000_0000;
 
+/// The kernel's nice range ends (include/linux/sched/prio.h MIN_NICE / MAX_NICE).
+const MIN_NICE: i32 = -20;
+const MAX_NICE: i32 = 19;
+/// The RLIMIT_NICE that allows every nice: 20 - MIN_NICE (kernel `nice_to_rlimit`), what Android's init grants.
+const FULL_NICE_LIMIT: u64 = 40;
+
+/// RLIMIT_NICE's hard limit this process (and so every app it starts) is granted, capped at [`FULL_NICE_LIMIT`] (unlimited counts as full).
+pub fn granted_nice() -> u64 {
+    rustix::process::getrlimit(rustix::process::Resource::Nice)
+        .maximum
+        .map_or(FULL_NICE_LIMIT, |h| h.min(FULL_NICE_LIMIT))
+}
+
+/// The app's thread-priority tiers for a hard limit: nice values from `floor` up reach the kernel (allowed from any current nice once soft = hard), lower ones are answered without effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NiceTiers {
+    pub granted: u64,
+    pub floor: i32,
+}
+
+impl NiceTiers {
+    /// Kernel `can_nice`: nice n needs RLIMIT_NICE >= 20 - n, so the lowest always-allowed nice is 20 - H.
+    pub fn for_limit(granted: u64) -> Self {
+        let granted = granted.min(FULL_NICE_LIMIT);
+        let floor = MAX_NICE + 1 - i32::try_from(granted).expect("capped at 40");
+        NiceTiers { granted, floor }
+    }
+
+    /// The rules matching a priority argument whose clamped nice is below the floor (each rule ANDs its conditions, the rules OR); None = no rule (nothing ignored, H = 40).
+    /// The argument is compared as the unsigned low 32 bits: negatives are >= 0x8000_0000, and a value above MAX_NICE clamps to MAX_NICE.
+    fn ignored(self) -> io::Result<Option<Vec<SeccompRule>>> {
+        let cond = |op, v: u64| {
+            SeccompCondition::new(PRIORITY_ARG, SeccompCmpArgLen::Dword, op, v)
+                .map_err(io::Error::other)
+        };
+        let rule = |c: Vec<SeccompCondition>| SeccompRule::new(c).map_err(io::Error::other);
+        let negative = || cond(SeccompCmpOp::Ge, NEGATIVE);
+        Ok(match self.floor {
+            f if f > MAX_NICE => Some(vec![]),
+            f if f > 0 => Some(vec![
+                rule(vec![negative()?])?,
+                rule(vec![cond(SeccompCmpOp::Lt, u64::from(f.unsigned_abs()))?])?,
+            ]),
+            0 => Some(vec![rule(vec![negative()?])?]),
+            f if f > MIN_NICE => Some(vec![rule(vec![
+                negative()?,
+                // two's complement of f as a u32
+                cond(SeccompCmpOp::Lt, u64::from(f.cast_unsigned()))?,
+            ])?]),
+            _ => None,
+        })
+    }
+
+    /// The stub's log line for this process ([`stub_args`](crate::stub_args) `--nice`).
+    pub fn describe(self) -> String {
+        let tier = match self.floor {
+            f if f > MAX_NICE => "baseline",
+            f if f <= MIN_NICE => "host-nice",
+            _ => "host-nice+baseline",
+        };
+        format!(
+            "tier={tier} granted={} kernel-applies-nice>={} lower-answered-without-effect",
+            self.granted, self.floor
+        )
+    }
+}
+
 /// `profile`'s program.
 pub fn program(profile: Profile) -> io::Result<BpfProgram> {
     match profile {
-        Profile::App => app_program(),
+        Profile::App => app_program(NiceTiers::for_limit(granted_nice())),
         Profile::BinderDaemon => binderd_program(),
         Profile::Installer => installer_program(),
     }
@@ -75,17 +143,13 @@ fn allow_list(calls: &[i64], unix_only: &[i64]) -> io::Result<BpfProgram> {
     filter.try_into().map_err(io::Error::other)
 }
 
-/// The app filter as seccompiler's program: setpriority with a negative priority returns 0 (`SECCOMP_RET_ERRNO` with errno 0, the kernel's return value -0), every other call is allowed.
-fn app_program() -> io::Result<BpfProgram> {
-    let negative = SeccompCondition::new(
-        PRIORITY_ARG,
-        SeccompCmpArgLen::Dword,
-        SeccompCmpOp::Ge,
-        NEGATIVE,
-    )
-    .map_err(io::Error::other)?;
-    let rule = SeccompRule::new(vec![negative]).map_err(io::Error::other)?;
-    let rules = BTreeMap::from([(libc::SYS_setpriority, vec![rule])]);
+/// The app filter as seccompiler's program: setpriority below `tiers`' floor returns 0 (`SECCOMP_RET_ERRNO` with errno 0, the kernel's return value -0), every other call is allowed.
+fn app_program(tiers: NiceTiers) -> io::Result<BpfProgram> {
+    let rules: BTreeMap<i64, Vec<SeccompRule>> = tiers
+        .ignored()?
+        .map(|r| (libc::SYS_setpriority, r))
+        .into_iter()
+        .collect();
     let filter = SeccompFilter::new(
         rules,
         SeccompAction::Allow,
@@ -118,29 +182,36 @@ pub fn filter(profile: Profile) -> io::Result<Vec<u8>> {
 )]
 mod tests {
     use super::*;
-    use rustix::process::{Resource, getpriority_process, getrlimit, setpriority_process};
+    use rustix::process::{
+        Resource, Rlimit, getpriority_process, getrlimit, setpriority_process, setrlimit,
+    };
     use std::collections::HashMap;
     use std::io::Write;
     use std::process::Command;
 
     /// The probe runs in a child process: the filter binds the thread that applies it, and the test harness must not be filtered.
     const MODE_ENV: &str = "ATL_SECCOMP_PROBE";
-    /// The kernel's MAX_NICE (kernel/sched/core.c, `nice_to_rlimit`): an unprivileged nice `n` needs RLIMIT_NICE >= MAX_NICE - n + 1.
-    const KERNEL_MAX_NICE: i32 = 19;
-    /// The priority Process.setThreadPriority(THREAD_PRIORITY_FOREGROUND) asks for (ART's HandlerThread default in QueuedWork).
+    /// The probe's requests, the app row's sequence (Firebase's executor, ART's HandlerThread): THREAD_PRIORITY_BACKGROUND (10), back to the start value, THREAD_PRIORITY_FOREGROUND (-2).
+    const BACKGROUND: i32 = 10;
     const FOREGROUND: i32 = -2;
 
-    fn rlimit_for(nice: i32) -> u64 {
-        u64::try_from(KERNEL_MAX_NICE - nice + 1).expect("a nice value the kernel accepts")
-    }
-
-    /// Prints one line: whether each call succeeded (`ok` or `err:<errno>`) and the nice value after it. Run as a child with MODE_ENV set; a no-op otherwise.
+    /// Prints one line: the start nice, then per request whether it succeeded (`ok` or `err:<errno>`) and the nice after it. Run as a child with MODE_ENV set; a no-op otherwise.
+    /// `filtered` first raises the soft limit to the hard one, as the stub does for an app.
     #[test]
     fn probe() {
         let Some(mode) = std::env::var_os(MODE_ENV) else {
             return;
         };
         if mode.to_str() == Some("filtered") {
+            let hard = getrlimit(Resource::Nice).maximum;
+            setrlimit(
+                Resource::Nice,
+                Rlimit {
+                    current: hard,
+                    maximum: hard,
+                },
+            )
+            .expect("soft = hard");
             seccompiler::apply_filter(&program(Profile::App).expect("program"))
                 .expect("apply_filter");
         }
@@ -149,16 +220,18 @@ mod tests {
             Err(e) => format!("err:{}", e.raw_os_error()),
         };
         let before = getpriority_process(None).expect("getpriority");
-        let negative = outcome(setpriority_process(None, FOREGROUND));
-        let after_negative = getpriority_process(None).expect("getpriority");
-        let plain = outcome(setpriority_process(None, 5));
-        let after_plain = getpriority_process(None).expect("getpriority");
+        let mut line = format!("probe: mode={} before={before}", mode.to_string_lossy());
+        for (name, nice) in [
+            ("background", BACKGROUND),
+            ("restore", before),
+            ("foreground", FOREGROUND),
+        ] {
+            let r = outcome(setpriority_process(None, nice));
+            let after = getpriority_process(None).expect("getpriority");
+            line += &format!(" {name}={r} after_{name}={after}");
+        }
         // stdout, not print!: the workspace denies print_stdout (logging goes through tracing)
-        let _ = writeln!(
-            std::io::stdout(),
-            "probe: mode={} before={before} negative={negative} nice_after_negative={after_negative} plain={plain} nice_after_plain={after_plain}",
-            mode.to_string_lossy()
-        );
+        let _ = writeln!(std::io::stdout(), "{line}");
     }
 
     fn run_probe(mode: &str) -> HashMap<String, String> {
@@ -185,27 +258,60 @@ mod tests {
             .collect()
     }
 
-    /// The filter answers a negative priority with success and leaves the nice value alone, and a non-negative priority still reaches the kernel (nice 0 -> 5).
-    /// Without the filter the kernel decides: a negative nice succeeds only when RLIMIT_NICE allows it, else EACCES (`err:13`), the SecurityException's cause.
+    /// Filtered: every request succeeds; a nice at or above the tiers' floor takes effect, a lower one leaves the nice as it was (getpriority reads the kernel's value).
+    /// Unfiltered (the break): restoring the start value after BACKGROUND lowers nice, which the kernel refuses with EACCES (`err:13`, the SecurityException's cause) unless the soft limit allows it.
     #[test]
-    fn negative_priority_is_answered_by_the_filter_and_refused_by_the_kernel_without_it() {
+    fn requests_below_the_granted_limit_succeed_without_effect_and_fail_without_the_filter() {
+        let tiers = NiceTiers::for_limit(granted_nice());
         let filtered = run_probe("filtered");
-        assert_eq!(filtered["negative"], "ok");
-        assert_eq!(filtered["nice_after_negative"], filtered["before"]);
-        assert_eq!(filtered["plain"], "ok");
-        assert_eq!(filtered["nice_after_plain"], "5");
+        let mut nice: i32 = filtered["before"].parse().expect("a nice");
+        let start = nice;
+        for (name, want) in [
+            ("background", BACKGROUND),
+            ("restore", start),
+            ("foreground", FOREGROUND),
+        ] {
+            assert_eq!(filtered[name], "ok", "{name}: {filtered:?}");
+            if want >= tiers.floor {
+                nice = want;
+            }
+            assert_eq!(
+                filtered[&format!("after_{name}")],
+                nice.to_string(),
+                "{name}"
+            );
+        }
 
         let plain = run_probe("plain");
-        let limit = getrlimit(Resource::Nice).current;
-        if limit.is_none_or(|l| l >= rlimit_for(FOREGROUND)) {
-            assert_eq!(plain["negative"], "ok");
-            assert_eq!(plain["nice_after_negative"], FOREGROUND.to_string());
+        let soft = getrlimit(Resource::Nice).current.unwrap_or(FULL_NICE_LIMIT);
+        let allowed = |n: i32| u64::try_from(MAX_NICE + 1 - n).is_ok_and(|need| soft >= need);
+        let start: i32 = plain["before"].parse().expect("a nice");
+        assert_eq!(plain["background"], "ok");
+        if allowed(start) {
+            assert_eq!(plain["restore"], "ok");
         } else {
-            assert_eq!(plain["negative"], format!("err:{}", libc::EACCES));
-            assert_eq!(plain["nice_after_negative"], plain["before"]);
+            assert_eq!(plain["restore"], format!("err:{}", libc::EACCES));
+            assert_eq!(plain["after_restore"], BACKGROUND.to_string());
         }
-        assert_eq!(plain["plain"], "ok");
-        assert_eq!(plain["nice_after_plain"], "5");
+    }
+
+    /// The floor is kernel `can_nice`'s 20 - H: WSL's 0 ignores every nice, a GameMode host's 30 applies -10..19, Android's 40 (and unlimited, capped) applies all and needs no rule.
+    #[test]
+    fn tiers_follow_the_kernel_limit_formula() {
+        assert_eq!(NiceTiers::for_limit(0).floor, 20);
+        assert_eq!(NiceTiers::for_limit(30).floor, -10);
+        assert_eq!(NiceTiers::for_limit(40).floor, -20);
+        assert_eq!(NiceTiers::for_limit(u64::MAX), NiceTiers::for_limit(40));
+        assert!(NiceTiers::for_limit(40).ignored().expect("rules").is_none());
+        assert!(
+            NiceTiers::for_limit(0)
+                .ignored()
+                .expect("rules")
+                .is_some_and(|r| r.is_empty())
+        );
+        for h in [0, 1, 19, 20, 21, 30, 39, 40] {
+            app_program(NiceTiers::for_limit(h)).expect("a program per limit");
+        }
     }
 
     /// bwrap reads whole `sock_filter` instructions: the bytes are the program's instruction count times the struct's size.

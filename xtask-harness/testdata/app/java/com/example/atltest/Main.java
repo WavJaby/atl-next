@@ -48,6 +48,38 @@ public class Main extends Activity {
     private static final int REQUEST_CHILD = 7;
     private static final int REQUEST_SELF = 9;
 
+    /**
+     * The priority line (app.rs PRIORITY): on a fresh thread, as Firebase's executor and ART's HandlerThread do, Process.setThreadPriority to BACKGROUND, back to the start value, then FOREGROUND;
+     * `start=<n> background=<ok|throwable>/<nice after> restore=... foreground=...`, each nice read back with Process.getThreadPriority.
+     */
+    private static String priority() {
+        final StringBuilder out = new StringBuilder();
+        Thread t = new Thread(new Runnable() { @Override public void run() {
+            int tid = android.os.Process.myTid();
+            int start = android.os.Process.getThreadPriority(tid);
+            out.append("start=").append(start);
+            int[] asks = {android.os.Process.THREAD_PRIORITY_BACKGROUND, start, android.os.Process.THREAD_PRIORITY_FOREGROUND};
+            String[] names = {"background", "restore", "foreground"};
+            for (int i = 0; i < asks.length; i++) {
+                String r;
+                try {
+                    android.os.Process.setThreadPriority(asks[i]);
+                    r = "ok";
+                } catch (Throwable e) {
+                    r = e.getClass().getSimpleName();
+                }
+                out.append(' ').append(names[i]).append('=').append(r).append('/').append(android.os.Process.getThreadPriority(tid));
+            }
+        } });
+        t.start();
+        try {
+            t.join();
+        } catch (InterruptedException e) {
+            return "interrupted";
+        }
+        return out.toString();
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -57,6 +89,7 @@ public class Main extends Activity {
         mediaPlayer();
         Log.i("AtlTest", "connectivity: " + connectivity());
         Log.i("AtlTest", "permission: " + permission());
+        Log.i("AtlTest", "priority: " + priority());
         mediaPlayerService();
         mediaExtractorWav();
         mediaRetrieverWav();

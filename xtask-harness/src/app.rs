@@ -73,6 +73,10 @@ pub struct Args {
     /// The routing break: the legacy fixture is linked without DT_NEEDED `libc.so`, so the NativeBridge core refuses it, glibc's dlerror surfaces and the legacy rows must go red.
     #[arg(long)]
     legacy_no_libc: bool,
+    /// The thread-priority break: apps start without the app seccomp filter (atld `--no-app-seccomp`), so restoring a thread's priority after BACKGROUND meets the kernel's EACCES on a host that grants
+    /// RLIMIT_NICE below 40, Process.setThreadPriority throws SecurityException and the priority line must go red.
+    #[arg(long)]
+    priority_break: bool,
 }
 
 /// The fixture's dir.
@@ -107,6 +111,45 @@ const SERVICE_LINES: [(&str, &str, &str); 2] = [
         "network_state=0 camera=-1",
     ),
 ];
+/// Main.priority's line: `start=<n> background=<r>/<nice> restore=<r>/<nice> foreground=<r>/<nice>`, r = `ok` or the throwable's simple name ([`priority_why`]).
+const PRIORITY: &str = "AtlTest: priority: ";
+/// Main.priority's requests in order (android.os.Process THREAD_PRIORITY_BACKGROUND 10, the start value, THREAD_PRIORITY_FOREGROUND -2); None = the start value.
+const PRIORITY_ASKS: [(&str, Option<i32>); 3] = [
+    ("background", Some(10)),
+    ("restore", None),
+    ("foreground", Some(-2)),
+];
+
+/// Why the priority line is wrong for a host whose app tiers apply nice >= `floor` (atl-broker NiceTiers), else None.
+/// Every request must succeed, as on Android; Process.getThreadPriority then reads the kernel's value: the request when it is at or above the floor, the previous nice when it was answered without effect.
+fn priority_why(line: Option<&str>, floor: i32) -> Option<String> {
+    let Some(line) = line else {
+        return Some("no priority line".into());
+    };
+    let fields: BTreeMap<&str, &str> = line
+        .split_whitespace()
+        .filter_map(|kv| kv.split_once('='))
+        .collect();
+    let Some(start) = fields.get("start").and_then(|s| s.parse::<i32>().ok()) else {
+        return Some(format!("no start in {line:?}"));
+    };
+    let mut nice = start;
+    for (name, ask) in PRIORITY_ASKS {
+        let ask = ask.unwrap_or(start);
+        if ask >= floor {
+            nice = ask;
+        }
+        let want = format!("ok/{nice}");
+        if fields.get(name) != Some(&want.as_str()) {
+            return Some(format!(
+                "{name}: want {want}, got {:?} in {line:?}",
+                fields.get(name)
+            ));
+        }
+    }
+    None
+}
+
 /// The native bridge's report of a fault handed to a guest handler (identity/mod.rs fault_report via signal.rs guest_handler); bridge1's sigsegvRecover must produce one (SIGSEGV = 11).
 const GUEST_FAULT_REPORT: &str =
     "atl-native-bridge: fatal-signal report: fault handed to the guest's handler: sig 11 ";
@@ -608,6 +651,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         rt
     };
+    let rt = if args.priority_break {
+        rt.without_app_seccomp()
+    } else {
+        rt
+    };
     let rt = if args.font_break {
         rt.with_sans_serif(&layout, test_fonts::MONO.2)?
     } else {
@@ -771,6 +819,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             whys.push(format!("{service}: want {want:?}, got {got:?}"));
         }
     }
+    let priority = app
+        .lines()
+        .find_map(|l| l.split_once(PRIORITY).map(|(_, r)| r.trim_end().to_owned()));
+    let tiers = atl_broker::NiceTiers::for_limit(atl_broker::granted_nice());
+    if passed && let Some(why) = priority_why(priority.as_deref(), tiers.floor) {
+        whys.push(format!("priority ({}): {why}", tiers.describe()));
+    }
     // the row's release: releasePlayer is oneway, so the app sees no error; the audio service's own count shows that the track and the release reached it and were served
     if passed {
         let served = counters(&services_log);
@@ -886,6 +941,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             println!("app: pass {service} {want}");
         }
         println!(
+            "app: pass priority {} ({})",
+            priority.as_deref().unwrap_or_default(),
+            tiers.describe()
+        );
+        println!(
             "app: pass media.player {} (answered through the view; setDataSource returned)",
             probe.unwrap_or_default()
         );
@@ -971,6 +1031,20 @@ mod tests {
         assert!(first_config_why(Some("r=8 g=8 b=8 a=8 visual=x")).is_some());
         assert!(first_config_why(Some("no display")).is_some());
         assert!(first_config_why(None).is_some());
+    }
+
+    /// Floors: 20 = WSL's limit 0 (every request ignored, nice stays 0), -10 = a GameMode host's 30 (background and restore applied, foreground -2 applied), and the break's SecurityException.
+    #[test]
+    fn priority_judged_against_the_floor() {
+        let ignored = "start=0 background=ok/0 restore=ok/0 foreground=ok/0";
+        assert_eq!(priority_why(Some(ignored), 20), None);
+        let applied = "start=0 background=ok/10 restore=ok/0 foreground=ok/-2";
+        assert_eq!(priority_why(Some(applied), -10), None);
+        assert!(priority_why(Some(applied), 20).is_some());
+        let broken =
+            "start=0 background=ok/10 restore=SecurityException/10 foreground=SecurityException/10";
+        assert!(priority_why(Some(broken), 20).is_some());
+        assert!(priority_why(None, 20).is_some());
     }
 
     #[test]
