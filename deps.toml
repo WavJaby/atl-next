@@ -379,6 +379,7 @@ used_by = ["xtask:cross", "host:riscv64"]
 # libc++-19-dev, all 1:19.1.7-3+b1. Headers under usr/lib/llvm-19/include/c++/v1 (bp2ninja -upstream-toolchain); the .so.1 runtimes
 # (libc++, libc++abi, libunwind) for the link and NEEDED. libatomic1 (gcc-14 14.2.0-19, the native riscv64 package libc++1-19 Depends on) is their runtime NEEDED: pinned for the runtime closure.
 # system:libelf (providers.toml `libelf`, plan A2): libelf-dev and its Depends closure (zlib1g-dev, libzstd-dev), plus the runtime libelf1t64 and its NEEDED zlib1g, libzstd1. Native riscv64 packages, as libc++1-19 above.
+# <sys/capability.h> (libcore android_system_OsConstants.cpp; on x86 the build machine's libcap-dev, on AOSP the glibc host sysroot): libcap-dev and its Depends libcap2, same version as trixie amd64.
 [riscv64-sysroot]
 sysroot_debs = [
     "libc6-riscv64-cross=2.41-11cross1",
@@ -399,6 +400,8 @@ sysroot_debs = [
     "zlib1g=1:1.3.dfsg+really1.3.1-1+b1",
     "libzstd-dev=1.5.7+dfsg-1",
     "libzstd1=1.5.7+dfsg-1",
+    "libcap-dev=1:2.75-10+deb13u1+b3",
+    "libcap2=1:2.75-10+deb13u1+b3",
 ]
 scope = ["build"]
 used_by = ["xtask:cross", "host:riscv64"]
