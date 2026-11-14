@@ -203,6 +203,10 @@ mod tests {
         let Some(mode) = std::env::var_os(MODE_ENV) else {
             return;
         };
+        if mode.to_str() == Some("installer") {
+            installer_probe();
+            return;
+        }
         if mode.to_str() == Some("filtered") {
             let hard = getrlimit(Resource::Nice).maximum;
             setrlimit(
@@ -235,9 +239,39 @@ mod tests {
         let _ = writeln!(std::io::stdout(), "{line}");
     }
 
+    /// Under the installer filter, std file calls whose glibc syscall differs per arch (x86_64 mkdir / rename / unlink, riscv64 mkdirat / renameat2 / unlinkat) in DIR_ENV; prints `probe: mode=installer done=1` only if the kernel let all of them through.
+    fn installer_probe() {
+        let dir = std::path::PathBuf::from(std::env::var_os(DIR_ENV).expect("the probe dir"));
+        seccompiler::apply_filter(&program(Profile::Installer).expect("program"))
+            .expect("apply_filter");
+        std::fs::create_dir(dir.join("d")).expect("mkdir");
+        std::fs::File::create(dir.join("a")).expect("openat");
+        std::fs::rename(dir.join("a"), dir.join("b")).expect("rename");
+        std::fs::remove_file(dir.join("b")).expect("unlink");
+        let _ = writeln!(std::io::stdout(), "probe: mode=installer done=1");
+    }
+
+    const DIR_ENV: &str = "ATL_SECCOMP_PROBE_DIR";
+
+    /// The allow-list holds this arch's numbers for the calls glibc makes here: a number from another arch's table (or a missing swap in arch.rs) leaves the call unlisted, and the kernel kills the child before its line.
+    /// Break-checked on x86_64 2026-11-15: x86 rows with SYS_renameat2 in place of SYS_rename -> no probe line (SIGSYS).
+    #[test]
+    fn installer_list_matches_this_arch_glibc_calls() {
+        let dir = std::env::temp_dir().join(format!("atl-seccomp-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("probe dir");
+        let line = run_probe_in("installer", &[(DIR_ENV, dir.as_os_str())]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(line["done"], "1");
+    }
+
     fn run_probe(mode: &str) -> HashMap<String, String> {
+        run_probe_in(mode, &[])
+    }
+
+    fn run_probe_in(mode: &str, env: &[(&str, &std::ffi::OsStr)]) -> HashMap<String, String> {
         let exe = std::env::current_exe().expect("the test binary");
         let out = Command::new(exe)
+            .envs(env.iter().copied())
             .args([
                 "--exact",
                 "seccomp::tests::probe",

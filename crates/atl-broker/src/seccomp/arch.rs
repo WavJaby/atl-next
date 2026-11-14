@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The seccomp target arch of the host this crate is built for and its per-arch rows: seccompiler's arch (its audit value) and binderd's measured allow-list.
-//! seccompiler 0.5 knows x86_64 and aarch64 only; riscv64 (a Tier 1 host later) needs seccompiler support or another backend before its build compiles.
+//! Numbers are the target's own (libc::SYS_*, per target arch), never another arch's; seccompiler 0.5 checks HOST's audit arch (AUDIT_ARCH_X86_64 / AUDIT_ARCH_RISCV64) first, so a filter built for one arch kills every call on another.
+//! riscv64 rows (asm-generic syscall table: no open, access, poll, readlink, unlink, chmod, rename, mkdir, arch_prctl): the x86_64 measurement with each x86-only call swapped for the *at / p* call glibc issues instead (sysdeps/unix/sysv/linux: access -> faccessat, rename -> renameat2, poll -> ppoll, ...). Not measured on riscv64 yet: kill mode on a riscv64 host (plan B3b) confirms or extends them; each swap is a cfg pair in the list.
 //!
 //! BINDERD_SYSCALLS derivation (x86_64, measured 2026-11-06, WSL2 kernel 6.6.87.2; strace is not installed, and RET_LOG lost records to kauditd's printk ratelimit: 1470 suppressed in one run):
 //! kill-mode iteration -- binderd's filter = allow the known set, default KILL_PROCESS; each run dies at the first call outside it and the kernel's one audit record (`type=1326 ... syscall=N`, in dmesg) names it; add, rerun, until the workload passes.
@@ -15,13 +16,14 @@ use seccompiler::TargetArch;
 
 #[cfg(target_arch = "x86_64")]
 pub const HOST: TargetArch = TargetArch::x86_64;
-#[cfg(target_arch = "aarch64")]
-pub const HOST: TargetArch = TargetArch::aarch64;
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-compile_error!("atl-broker's seccomp filters have no seccompiler target arch for this host");
+#[cfg(target_arch = "riscv64")]
+pub const HOST: TargetArch = TargetArch::riscv64;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+compile_error!(
+    "atl-broker's seccomp allow-lists exist for x86_64 (measured) and riscv64 (derived) only: measure this arch (BINDERD_SYSCALLS derivation) before building the broker here"
+);
 
 /// binderd's syscalls besides socketpair, by role: socket I/O (its whole job), memory, start-up (ld.so + glibc + Rust std; execve is the call that starts it, the filter being installed before), std's signal set-up, exit; and bwrap's pid 1 (wait4).
-#[cfg(target_arch = "x86_64")]
 pub const BINDERD_SYSCALLS: &[i64] = &[
     // socket I/O and fds
     libc::SYS_read,
@@ -29,6 +31,7 @@ pub const BINDERD_SYSCALLS: &[i64] = &[
     libc::SYS_close,
     libc::SYS_sendmsg,
     libc::SYS_recvmsg,
+    #[cfg(target_arch = "x86_64")]
     libc::SYS_poll,
     libc::SYS_ppoll,
     libc::SYS_fcntl,
@@ -41,10 +44,14 @@ pub const BINDERD_SYSCALLS: &[i64] = &[
     // start-up: the loader opening its closure, glibc and std init
     libc::SYS_execve,
     libc::SYS_openat,
+    #[cfg(target_arch = "x86_64")]
     libc::SYS_access,
+    #[cfg(target_arch = "riscv64")]
+    libc::SYS_faccessat,
     libc::SYS_fstat,
     libc::SYS_newfstatat,
     libc::SYS_pread64,
+    #[cfg(target_arch = "x86_64")]
     libc::SYS_arch_prctl,
     libc::SYS_set_tid_address,
     libc::SYS_set_robust_list,
@@ -62,10 +69,6 @@ pub const BINDERD_SYSCALLS: &[i64] = &[
     libc::SYS_exit_group,
     libc::SYS_wait4,
 ];
-#[cfg(not(target_arch = "x86_64"))]
-compile_error!(
-    "binderd's seccomp allow-list is measured on x86_64 only: measure this arch (arch.rs, BINDERD_SYSCALLS derivation) before building the broker here"
-);
 
 /// The installer's syscalls (x86_64, 2026-11-13, WSL2 kernel 6.6.87.2), derived by measurement:
 /// 1. gdb `catch syscall` census of the installer's gate paths: the union of 57 numbers. alto's run was cut at 900 s (8.4 M stops) before its native copy; `feature` ran to its end (56 numbers); the others ended early.
@@ -76,12 +79,12 @@ compile_error!(
 /// The list gives 68 numbers. socket(2) is absent from it: seccomp.rs allows it for AF_UNIX only. setpriority(2) is measured (ART's thread priorities); no EACCES from it reached the gate's stderr.
 ///
 /// Final evidence: the installer gate green in kill mode with 0 denials in dmesg on three runs. Re-measure after installer, ART or glibc start-up code changes: a new call ends the run with SIGSYS, and dmesg names it.
-#[cfg(target_arch = "x86_64")]
 pub const INSTALLER_SYSCALLS: &[i64] = &[
-    // file and socket I/O (socket itself: AF_UNIX only, binderd-style rule in seccomp.rs)
+    // file and socket I/O (socket itself: AF_UNIX only, binderd-style rule in seccomp.rs); riscv64: open -> the openat already listed
     libc::SYS_read,
     libc::SYS_write,
     libc::SYS_writev,
+    #[cfg(target_arch = "x86_64")]
     libc::SYS_open,
     libc::SYS_openat,
     libc::SYS_close,
@@ -89,21 +92,42 @@ pub const INSTALLER_SYSCALLS: &[i64] = &[
     libc::SYS_newfstatat,
     libc::SYS_lseek,
     libc::SYS_pread64,
+    #[cfg(target_arch = "x86_64")]
     libc::SYS_access,
+    #[cfg(target_arch = "riscv64")]
+    libc::SYS_faccessat,
+    #[cfg(target_arch = "x86_64")]
     libc::SYS_readlink,
+    #[cfg(target_arch = "riscv64")]
+    libc::SYS_readlinkat,
+    #[cfg(target_arch = "x86_64")]
     libc::SYS_unlink,
+    #[cfg(target_arch = "riscv64")]
+    libc::SYS_unlinkat,
+    #[cfg(target_arch = "x86_64")]
     libc::SYS_chmod,
+    #[cfg(target_arch = "riscv64")]
+    libc::SYS_fchmodat,
     libc::SYS_fallocate,
     libc::SYS_fsync,
     libc::SYS_utimensat,
+    #[cfg(target_arch = "x86_64")]
     libc::SYS_rename,
+    #[cfg(target_arch = "riscv64")]
+    libc::SYS_renameat2,
     libc::SYS_getdents64,
+    #[cfg(target_arch = "x86_64")]
     libc::SYS_mkdir,
+    #[cfg(target_arch = "riscv64")]
+    libc::SYS_mkdirat,
     libc::SYS_ftruncate,
     libc::SYS_getcwd,
     libc::SYS_statfs,
     libc::SYS_fstatfs,
+    #[cfg(target_arch = "x86_64")]
     libc::SYS_poll,
+    #[cfg(target_arch = "riscv64")]
+    libc::SYS_ppoll,
     libc::SYS_fcntl,
     libc::SYS_ioctl,
     libc::SYS_connect,
@@ -140,6 +164,7 @@ pub const INSTALLER_SYSCALLS: &[i64] = &[
     libc::SYS_prlimit64,
     libc::SYS_getrandom,
     libc::SYS_clock_gettime,
+    #[cfg(target_arch = "x86_64")]
     libc::SYS_arch_prctl,
     libc::SYS_prctl,
     libc::SYS_exit,
@@ -151,7 +176,3 @@ pub const INSTALLER_SYSCALLS: &[i64] = &[
     libc::SYS_landlock_add_rule,
     libc::SYS_landlock_restrict_self,
 ];
-#[cfg(not(target_arch = "x86_64"))]
-compile_error!(
-    "the installer's seccomp allow-list is measured on x86_64 only: measure this arch (arch.rs, INSTALLER_SYSCALLS derivation) before building the broker here"
-);
