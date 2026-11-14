@@ -31,11 +31,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use atl_android_paths::{
-    DATA, DATA_APP, DATA_USER, DATA_USER_DE, PROC_CPUINFO, PROPERTY_AREA, PROPERTY_AREA_ENV,
-    PRODUCT, SDCARD, SHARED_STORAGE, SYSTEM, SYSTEM_EXT, SYSTEM_FONTS, SYSTEM_FRAMEWORK, VENDOR,
+    DATA, DATA_APP, DATA_USER, DATA_USER_DE, PROC_CPUINFO, PRODUCT, PROPERTY_AREA,
+    PROPERTY_AREA_ENV, SDCARD, SHARED_STORAGE, SYSTEM, SYSTEM_EXT, SYSTEM_FONTS, SYSTEM_FRAMEWORK,
+    VENDOR,
 };
 use atl_broker::control::{self, Request, Response, StagedName, StartRequest};
-use atl_services_types::system_packages;
 use atl_broker::{
     Broker, INSTALLER_UID, Link, Mount, Process, Spawn, gpu, kill_sandbox, terminate_sandbox,
     to_log, tree_mounts,
@@ -48,6 +48,7 @@ use atl_services_types::display_model::DisplayModel;
 use atl_services_types::gl_driver;
 use atl_services_types::native_libs::LIB_DIR_NAME;
 use atl_services_types::packages::Library;
+use atl_services_types::system_packages;
 use clap::Parser;
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 use signal_hook::consts::{SIGINT, SIGTERM};
@@ -816,7 +817,10 @@ impl Host {
 
     /// Request `Commit`: session `session` (staged for `uid`) becomes `/data/app/<package>` (PackageInstallerSession's rename), with its data dirs (installd createAppData) and external dirs; whether a library needs ES1.
     fn commit(&self, session: u32, package: &str, uid: u32, names: &[StagedName]) -> Result<bool> {
-        ensure!(valid_package_name(package), "{package:?}: not a package name");
+        ensure!(
+            valid_package_name(package),
+            "{package:?}: not a package name"
+        );
         let i = &self.installd;
         let mut staged = i.staged.lock().unwrap_or_else(|e| e.into_inner());
         ensure!(
@@ -903,7 +907,10 @@ impl Host {
             uid > INSTALLER_UID,
             "uid {uid}: at or below the installer's ({INSTALLER_UID}); package uids start above it"
         );
-        ensure!(valid_package_name(package), "{package:?}: not a package name");
+        ensure!(
+            valid_package_name(package),
+            "{package:?}: not a package name"
+        );
         let i = &self.installd;
         ensure!(
             i.scanned
@@ -1249,17 +1256,17 @@ impl Host {
                 (app_data_dir(package), true),
                 (format!("{DATA_USER_DE}/0/{package}"), true),
             ])
-        .map(|(at, writable)| {
-            let rel = Path::new(&at)
-                .strip_prefix(DATA)
-                .with_context(|| format!("{at}: not below {DATA}"))?;
-            Ok(Mount {
-                host: self.root.data().join(rel),
-                at: PathBuf::from(&at),
-                writable,
+            .map(|(at, writable)| {
+                let rel = Path::new(&at)
+                    .strip_prefix(DATA)
+                    .with_context(|| format!("{at}: not below {DATA}"))?;
+                Ok(Mount {
+                    host: self.root.data().join(rel),
+                    at: PathBuf::from(&at),
+                    writable,
+                })
             })
-        })
-        .collect()
+            .collect()
     }
 
     /// A package's own external dirs, bound at Android/{data,obb}/<package> under the shared storage root, with /sdcard linked to that root: no permission needed, never the root itself (plan Storage/SAF).
@@ -1350,7 +1357,9 @@ impl Host {
             &req.args,
         )?;
         self.external_storage(&mut spawn, &req.package);
-        spawn.mounts.extend(self.package_mounts(&req.package, system)?);
+        spawn
+            .mounts
+            .extend(self.package_mounts(&req.package, system)?);
         spawn.rights = req.rights.clone();
         let pid = self.start(spawn, false, true)?;
         let _ = self.first_app_ms.set(wall_ms());

@@ -926,7 +926,10 @@ mod tests {
             // FLAG_SYSTEM = 1<<0, PRIVATE_FLAG_PRIVILEGED = 1<<3 (ApplicationInfo.java:189, :535)
             assert_eq!(a.flags & 1, 1);
             assert_eq!(a.private_flags & (1 << 3), 1 << 3);
-            assert_eq!(a.native_library_dir.as_deref(), Some("/part/app/A/lib/x86_64"));
+            assert_eq!(
+                a.native_library_dir.as_deref(),
+                Some("/part/app/A/lib/x86_64")
+            );
         }
         // the parse's own flag (1<<2) is kept beside the added one
         assert_eq!(r.app().flags, (1 << 2) | 1);

@@ -77,10 +77,14 @@ pub fn scan(
 ) -> Result<Vec<PackageRecord>> {
     ensure!(!c.abis.is_empty(), "no device ABI");
     let owner = gl_driver::owner_table(gl_driver::OWNER_TABLE).map_err(anyhow::Error::msg)?;
-    let found = system_packages::scan(root).with_context(|| format!("scanning {}", root.display()))?;
+    let found =
+        system_packages::scan(root).with_context(|| format!("scanning {}", root.display()))?;
     let mut skipped = found.skipped.len();
     for s in &found.skipped {
-        log(format_args!("scan {}: skipped: not a package dir", s.display()));
+        log(format_args!(
+            "scan {}: skipped: not a package dir",
+            s.display()
+        ));
     }
     let mut records: Vec<PackageRecord> = Vec::new();
     for d in &found.dirs {
@@ -90,10 +94,9 @@ pub fn scan(
             .map_err(anyhow::Error::from)
             .and_then(|frames| Parsed::read(&frames));
         let parsed = match parsed {
-            Ok(p) if records.iter().any(|r| r.name() == p.name) => Err(anyhow::anyhow!(
-                "package {} already scanned",
-                p.name
-            )),
+            Ok(p) if records.iter().any(|r| r.name() == p.name) => {
+                Err(anyhow::anyhow!("package {} already scanned", p.name))
+            }
             other => other,
         };
         let parsed = match parsed {

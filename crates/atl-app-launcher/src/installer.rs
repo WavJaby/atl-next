@@ -140,7 +140,10 @@ mod tests {
         assert_eq!(a.dir, std::path::Path::new("/p"));
         assert_eq!(a.lib_root.as_deref(), Some(std::path::Path::new("/lib")));
         let scan = parse(["x", "-Xa", "/p"].map(Into::into).to_vec()).unwrap();
-        assert_eq!((scan.dir.as_path(), scan.lib_root), (std::path::Path::new("/p"), None));
+        assert_eq!(
+            (scan.dir.as_path(), scan.lib_root),
+            (std::path::Path::new("/p"), None)
+        );
         assert!(parse(["x", "-Xa"].map(Into::into).to_vec()).is_err());
         assert!(parse(["x", "/p", "/q", "/r"].map(Into::into).to_vec()).is_err());
     }
