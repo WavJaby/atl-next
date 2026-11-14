@@ -630,7 +630,6 @@ fn run_of(work: &Path, files: Vec<PackageFile>, m: &Manifest, log_tags: &str) ->
         scratch: work.join("scratch"),
         launch: Some(m.name.clone()),
         packages: vec![Package { files }],
-        first_uid: window::APP_UID,
         libraries: vec![],
         shell: None,
         log_tags: log_tags.to_owned(),

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! `xtask test composer`: the in-app SurfaceFlinger (crate atl-composer) against AOSP's libgui in a real app process (M3 slice 4).
-//! atld starts the services and the composer fixture's class (xtask-harness/testdata/composer: `Client`) as an app process (`--run-class`, uid 10123): its launcher starts the process's compositor, served as
+//! atld starts the services and the composer fixture's class (xtask-harness/testdata/composer: `Client`) as an app process (`--run-class`, the package's uid): its launcher starts the process's compositor, served as
 //! `SurfaceFlinger` / `SurfaceFlingerAIDL` by the process's own service view (atl-service-view), where libgui's unpatched lookup finds it; its UI agent is registered through the system process. The client then does what a window does with the framework's public API:
 //! two layers (`createConnection`, `createSurface`), 30 transactions (`setTransactionState`), a transaction-committed callback (the compositor's call into libgui's TransactionCompletedListener) and Choreographer's vsync (`createDisplayEventConnection`, the BitTube).
 //! Pass (all checked from the logs, [`evaluate`]): both services registered; every client step logged; the compositor's own counters (its last `composer: counters` line) show every transaction applied, both layers created and gone, every vsync event sent and
@@ -53,8 +53,8 @@ pub struct Args {
 const FIXTURE: &str = "xtask-harness/testdata/composer";
 const CLIENT_CLASS: &str = "com.example.atlcomposer.Client";
 const CLIENT_NAME: &str = "composer-client";
-/// The client's uid: AID_APP_START + 123, any app id (as `xtask test app`).
-const APP_UID: u32 = 10_123;
+/// The client's uid: the run's only package's, as the allocator hands it out.
+const APP_UID: u32 = crate::atld_run::FIRST_APP_UID;
 /// How long the cold start and the client may take (as `xtask test app`).
 const LIMIT: Duration = Duration::from_secs(180);
 const POLL: Duration = Duration::from_millis(50);
@@ -694,7 +694,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         scratch: work.join("scratch"),
         launch: None,
         packages: vec![Package::base(apk.clone())],
-        first_uid: APP_UID,
         libraries: vec![],
         shell: Some(Shell {
             class: CLIENT_CLASS.to_owned(),

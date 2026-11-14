@@ -14,30 +14,30 @@ use atl_services_types::gl_driver;
 use atl_services_types::native_libs::{SupportedAbi, instruction_set};
 
 use crate::activity::log;
+use crate::app_id::AppIds;
 use crate::packages::{InstallFields, PackageRecord};
 use crate::process_control::ControlSocket;
 
 /// What the install takes besides the session ids.
 pub struct Config {
-    /// The first package's uid; the i-th session gets `first_uid + i`. The host refuses any at or below the installer's (atl_broker::INSTALLER_UID).
-    pub first_uid: u32,
     /// The device's ABIs, preferred first: primaryCpuAbi -> instruction set.
     pub abis: Vec<SupportedAbi>,
     /// Test only: every package gets the native GL driver (the GL selection gate's break).
     pub no_gl_selection: bool,
 }
 
-/// Installs every session the host holds files for, in order (PMS's boot scan of installed packages): the records the services answer from.
+/// Installs every session the host holds files for, in order (PMS's boot scan of installed packages): the records the services answer from. Each package's uid comes from `ids` (AppIdSettingMap).
 pub fn install(
     control: &ControlSocket,
     sessions: &[u32],
+    ids: &mut AppIds,
     c: &Config,
 ) -> Result<Vec<PackageRecord>> {
     ensure!(!c.abis.is_empty(), "no device ABI");
     let owner = gl_driver::owner_table(gl_driver::OWNER_TABLE).map_err(anyhow::Error::msg)?;
     let mut records: Vec<PackageRecord> = Vec::new();
-    for (i, &session) in sessions.iter().enumerate() {
-        let uid = c.first_uid + u32::try_from(i)?;
+    for &session in sessions {
+        let uid = ids.acquire().context("no application id left")?;
         let frames = control
             .install(session, uid)
             .with_context(|| format!("installing session {session}"))?;

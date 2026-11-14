@@ -36,7 +36,7 @@ pub struct Args {
     out: Option<PathBuf>,
 }
 
-/// The app uid the probe runs as: AID_APP_START + 123, as app.rs's APP_UID.
+/// The app uid the probe runs as: AID_APP_START + 123, any app id (no atld run, no allocator).
 const APP_UID: u32 = 10_123;
 /// The probe's package: its data dir /data/user/0/<PACKAGE> is the only writable mount it gets.
 const PACKAGE: &str = "atl.sandbox.probe";

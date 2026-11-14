@@ -129,9 +129,6 @@ struct Args {
     /// Omitted: only the packages' own definitions count, so no platform permission is granted.
     #[arg(long)]
     platform_permissions: Option<PathBuf>,
-    /// The first app uid, above the installer's (atl_broker::INSTALLER_UID); the i-th package gets uid + i (the services assign it).
-    #[arg(long)]
-    first_uid: u32,
     /// liblog's ANDROID_LOG_TAGS for every app process.
     #[arg(long, default_value = "*:i")]
     log_tags: OsString,
@@ -1492,11 +1489,6 @@ fn run(a: &Args) -> Result<ExitCode> {
         .iter()
         .map(|jar| link_into_framework(&r, jar))
         .collect::<Result<Vec<_>>>()?;
-    ensure!(
-        a.first_uid > INSTALLER_UID,
-        "--first-uid {}: at or below the installer's uid {INSTALLER_UID}",
-        a.first_uid
-    );
     std::fs::create_dir_all(r.data().join("dalvik-cache"))?;
     // the install sessions: their files stay where xtask put them until staged; the installer's frames go to install/ for the services
     let install_dir = r.root.join("install");
@@ -1950,7 +1942,6 @@ fn run(a: &Args) -> Result<ExitCode> {
     }
     // the services install the sessions at their start (atl_services::install): the files through the control socket, the rest by argument
     let mut services_args: Vec<OsString> = session_args;
-    services_args.extend(["--first-uid".into(), a.first_uid.to_string().into()]);
     for abi in &a.abis {
         services_args.extend(["--abi".into(), abi.into()]);
     }

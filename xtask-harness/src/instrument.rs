@@ -49,8 +49,6 @@ pub struct Args {
 const FIXTURE: &str = "xtask-harness/testdata/instrument";
 /// The shell's uid (AID_SHELL, system/core/libcutils/include/private/android_filesystem_config.h): `am` runs as it, as `adb shell am` does.
 const SHELL_UID: u32 = 2000;
-/// The test package's uid: AID_APP_START + 123, any app id.
-pub const APP_UID: u32 = 10_123;
 /// AOSP's `am` main class (frameworks/base/cmds/am/Android.bp `am`; am.sh runs it through app_process).
 const AM_CLASS: &str = "com.android.commands.am.Am";
 /// Where the Java pipeline puts the dex jars (bp2ninja java.go): `device/<module>/aligned/<stem>.jar`.
@@ -552,7 +550,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             root: work.join(format!("root-{label}")),
             scratch: work.join(format!("scratch-{label}")),
             packages: vec![Package::base(apk.clone())],
-            first_uid: APP_UID,
             launch: None,
             libraries: libraries.clone(),
             shell: Some(am_shell(

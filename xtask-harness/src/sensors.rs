@@ -89,7 +89,6 @@ const FIXTURE: &str = "xtask-harness/testdata/sensors";
 const TAG: &str = "AtlSensors: ";
 /// What onCreate logs last.
 const DONE: &str = "AtlSensors: done";
-const APP_UID: u32 = 10_124;
 /// A cold start (app.rs LIMIT).
 const LIMIT: Duration = Duration::from_secs(180);
 /// The lookup with the service present takes one binder round trip per call; without it SensorManager waits 60 x getService (>= 60 s). 10 s separates the two on a loaded machine.
@@ -662,7 +661,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         scratch: work.join("scratch"),
         launch: Some(m.name.clone()),
         packages: vec![Package::base(apk)],
-        first_uid: APP_UID,
         libraries: vec![],
         shell: None,
         log_tags: "*:i".to_owned(),

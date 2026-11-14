@@ -38,8 +38,6 @@ pub struct Args {
 
 const SENDER: &str = "xtask-harness/testdata/broadcast/sender";
 const RECEIVER: &str = "xtask-harness/testdata/broadcast/receiver";
-/// The sender's uid (AID_APP_START + 123, any app id); the receiver gets the next.
-const FIRST_UID: u32 = 10_123;
 /// A cold start of each app (ART without a boot image interprets framework.jar's class init), as `xtask test app`'s limit.
 const LIMIT: Duration = Duration::from_secs(180);
 /// How long the negative check waits after the receiver sent its PING: one oneway delivery between two attached processes takes milliseconds; 3 s on a loaded machine.
@@ -99,7 +97,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         scratch: work.join("scratch"),
         launch: Some(sender.clone()),
         packages,
-        first_uid: FIRST_UID,
         libraries: vec![],
         shell: None,
         log_tags: "*:i".into(),

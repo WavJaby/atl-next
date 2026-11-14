@@ -26,6 +26,8 @@ pub fn is_system_or_root(uid: u32) -> bool {
 
 /// Process.FIRST_APPLICATION_UID (AID_APP_START).
 pub const FIRST_APPLICATION_UID: u32 = 10_000;
+/// Process.LAST_APPLICATION_UID (AID_APP_END).
+pub const LAST_APPLICATION_UID: u32 = 19_999;
 /// AID_SHELL: the uid `adb shell` (and `am`) runs as.
 pub const SHELL_UID: u32 = 2000;
 /// Process.INVALID_UID: the wire's "no uid" (signed, as the AIDL int fields carry it).

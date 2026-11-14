@@ -57,8 +57,6 @@ const FIXTURE: &str = "xtask-harness/testdata/audio";
 /// Main.onCreate's log tag and the line that ends the run.
 const TAG: &str = "AtlAudio: ";
 const DONE: &str = "AtlAudio: done";
-/// The app's uid under atld (as the app gate's).
-const APP_UID: u32 = 10_123;
 /// The run's time limit: the APK's start, the two binder lookups' waits (5 s each when a service is missing) and the two tracks.
 const LIMIT: Duration = Duration::from_secs(180);
 
@@ -354,7 +352,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         scratch: work.join("scratch"),
         launch: Some(m.name.clone()),
         packages: vec![Package::base(apk)],
-        first_uid: APP_UID,
         libraries: vec![],
         shell: None,
         log_tags: args.log_tags.clone(),

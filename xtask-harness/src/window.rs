@@ -279,8 +279,8 @@ const PORTRAIT_FIXTURE: &str = "xtask-harness/testdata/window-portrait";
 const HARDWARE_DRAW_LINE: &str = "onDraw reached hardware=true";
 /// Scenes the compositor must present into the window before its readback (the fixture's first frame and a repaint).
 const GTK_PRESENTED: u32 = 2;
-/// The test app's uid: AID_APP_START + 123, any app id (as `xtask test app`).
-pub(crate) const APP_UID: u32 = 10_123;
+/// The test app's uid: the run's only package's, as the allocator hands it out.
+pub(crate) const APP_UID: u32 = crate::atld_run::FIRST_APP_UID;
 /// How long a cold start may take to reach the marker (as `xtask test app`).
 pub(crate) const LIMIT: Duration = Duration::from_secs(180);
 /// How long the app must survive after the marker. The resume path (WindowManagerGlobal.addView, the window of the activity) runs right after onResume and fails within
@@ -1953,7 +1953,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         scratch: work.join("scratch"),
         launch: Some(m.name.clone()),
         packages: vec![Package::base(apk)],
-        first_uid: APP_UID,
         libraries: vec![],
         shell: None,
         log_tags: args.log_tags.clone(),

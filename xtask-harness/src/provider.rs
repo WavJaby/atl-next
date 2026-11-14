@@ -40,8 +40,6 @@ pub struct Args {
 }
 
 const FIXTURE: &str = "xtask-harness/testdata/provider";
-/// AID_APP_START + 123, any app id.
-const UID: u32 = 10_123;
 /// A cold start (ART without a boot image interprets framework.jar's class init), as `xtask test app`'s limit.
 const LIMIT: Duration = Duration::from_secs(180);
 const TAIL: usize = 30;
@@ -106,7 +104,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         scratch: work.join("scratch"),
         launch: Some(package.clone()),
         packages: vec![Package::base(apk)],
-        first_uid: UID,
         libraries: vec![],
         shell: None,
         log_tags: "*:i".into(),

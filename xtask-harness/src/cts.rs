@@ -18,7 +18,7 @@ use atl_layout::Layout;
 use crate::atld_run::{Package, Run, Runtime, counters};
 use crate::cts_report::{self, Module, Report, State};
 use crate::cts_table::{self, Row};
-use crate::instrument::{self, APP_UID};
+use crate::instrument;
 use crate::{manifest, triage};
 
 #[derive(clap::Args)]
@@ -276,7 +276,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             root: work.join(format!("root-{module}")),
             scratch: work.join(format!("scratch-{module}")),
             packages,
-            first_uid: APP_UID,
             launch: None,
             libraries: libraries.clone(),
             shell: Some(instrument::am_shell(&rt, am_args(row, &component))),

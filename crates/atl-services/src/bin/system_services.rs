@@ -21,6 +21,7 @@ use anyhow::{Context, Result, bail};
 use atl_aidl::aidl::android::app::IActivityManager::BnActivityManager;
 use atl_aidl::aidl::android::content::pm::IPackageManager::BnPackageManager;
 use atl_services::activity::{ActivityManager, RootBack};
+use atl_services::app_id::AppIds;
 use atl_services::install;
 use atl_services::package::PackageManager;
 use atl_services::packages::{PackageRecord, Packages, Permissions};
@@ -38,12 +39,10 @@ use signal_hook::iterator::Signals;
 
 #[derive(Parser)]
 struct Args {
-    /// An install session the host holds files for (repeat, in uid order), by its id. Installed at start through the control socket (atl_services::install): the installer's parse is the package.
+    /// An install session the host holds files for (repeat, in install order), by its id. Installed at start through the control socket (atl_services::install): the installer's parse is the
+    /// package, its uid the appId allocator's (atl_services::app_id).
     #[arg(long = "session")]
     sessions: Vec<u32>,
-    /// The first session's uid; the i-th gets uid + i. Default: the first uid above the installer's (atl_broker::INSTALLER_UID).
-    #[arg(long, default_value_t = atl_broker::INSTALLER_UID + 1)]
-    first_uid: u32,
     /// A device ABI with its instruction set (repeat, preferred first): `<abi>=<isa>` (ro.product.cpu.abilist with arches.toml row keys).
     #[arg(long = "abi", value_parser = parse_abi)]
     abis: Vec<SupportedAbi>,
@@ -193,11 +192,11 @@ fn main() -> Result<()> {
     let control = Arc::new(ControlSocket::from_stdin().context("the process control on stdin")?);
     // the package list: installed now through the host's file work (atl_services::install), before any service answers
     let config = install::Config {
-        first_uid: a.first_uid,
         abis: a.abis.clone(),
         no_gl_selection: a.no_gl_selection,
     };
-    let list: Vec<PackageRecord> = install::install(&control, &a.sessions, &config)?;
+    let mut ids = AppIds::new();
+    let list: Vec<PackageRecord> = install::install(&control, &a.sessions, &mut ids, &config)?;
     let libraries: BTreeMap<String, Library> = a.shared_libraries.into_iter().collect();
     let packages = Arc::new(Packages::new(list, libraries));
     // the permission states every service checks callers against: framework-res's definitions first, then the packages' (permission::initial_states, then runtime grants)

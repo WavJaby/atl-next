@@ -309,15 +309,18 @@ impl Package {
     }
 }
 
+/// The first package's uid on a fresh run, derived from AOSP's rule (AppIdSettingMap.acquireAndRegisterNewAppId, the services' atl_services::app_id): the lowest free id >= FIRST_APPLICATION_UID
+/// (10000), and 10000 is the installer's (atl_broker::INSTALLER_UID) -> 10001. A row that sees another uid has caught the allocator handing out a taken or wrong id.
+pub const FIRST_APP_UID: u32 = 10_001;
+
 /// One atld run.
 pub struct Run {
     /// atld's runtime root (atld makes it again); its logs are `<root>/log/<process>.log`.
     pub root: PathBuf,
     /// Where the package files and atld's own log go (outside the root, which atld removes).
     pub scratch: PathBuf,
-    /// Each package's files, in uid order.
+    /// Each package's files, in install order: on a fresh run the i-th gets uid [`FIRST_APP_UID`] + i.
     pub packages: Vec<Package>,
-    pub first_uid: u32,
     pub launch: Option<String>,
     /// Shared libraries by name; `file` is the host jar.
     pub libraries: Vec<(String, Library)>,
@@ -1500,7 +1503,6 @@ impl Runtime {
                     ),
                 ]
             }))
-            .args(["--first-uid", &run.first_uid.to_string()])
             .args(["--log-tags", &run.log_tags]);
         if let Some(script) = &self.headless_pointer {
             cmd.args(["--headless-pointer", script]);

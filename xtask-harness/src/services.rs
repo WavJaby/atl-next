@@ -25,9 +25,9 @@ use crate::atld_run::without_stamp;
 use crate::{binder, packages, tree};
 
 const PACKAGE: &str = "atl-services";
-/// The test package: an app uid (AID_APP_START 10000 + 123, any app id), its paths, launcher activity and start.
+/// The test package: its uid (the services' allocator's first id; the stub control refuses any other, so a wrong allocation fails this stage), paths, launcher activity and start.
 const APP: &str = "com.example.atltest";
-const APP_UID: u32 = 10_123;
+const APP_UID: u32 = crate::atld_run::FIRST_APP_UID;
 const ACTIVITY: &str = "com.example.atltest.Main";
 /// The instrumentation it declares (client.rs checks the PackageManager's answers for it).
 const INSTRUMENTATION: &str = "com.example.atltest.Runner";
@@ -170,7 +170,7 @@ pub fn stage(
         None,
     )?;
     let mut cmd = Command::new(&host);
-    cmd.args(["--session", "0", "--first-uid", &APP_UID.to_string()]);
+    cmd.args(["--session", "0"]);
     for a in crate::atld_run::device_abis(&arches, host_arch)? {
         cmd.arg("--abi").arg(format!("{}={}", a.abi, a.isa));
     }

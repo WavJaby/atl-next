@@ -715,9 +715,6 @@ fn es1_pixels(app: &str, scene: &Scene) -> Result<usize, String> {
         Err(e) => Err(format!("{e:#}")),
     }
 }
-
-/// The test app's uid: AID_APP_START + 123, any app id.
-const APP_UID: u32 = 10_123;
 /// How long a cold start may take: ART without a boot image interprets framework.jar's class initialisation (the parcel stage's runs take seconds); 180 s for a loaded machine.
 const LIMIT: Duration = Duration::from_secs(180);
 /// App log lines shown on failure.
@@ -1139,7 +1136,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         scratch: work.join("scratch"),
         launch: Some(m.name.clone()),
         packages: vec![Package::base(apk)],
-        first_uid: APP_UID,
         libraries: vec![],
         shell: None,
         log_tags: args.log_tags.clone(),

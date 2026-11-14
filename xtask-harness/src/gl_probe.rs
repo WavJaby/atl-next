@@ -48,8 +48,8 @@ pub struct Args {
 const FIXTURE: &str = "xtask-harness/testdata/gl-probe";
 const PROBE_CLASS: &str = "com.example.atlgl.Probe";
 const PROBE_NAME: &str = "gl-probe";
-/// An app uid (AID_APP_START + 124): the probe runs as an app.
-const APP_UID: u32 = 10_124;
+/// The probe runs as an app: the run's only package's uid, as the allocator hands it out.
+const APP_UID: u32 = crate::atld_run::FIRST_APP_UID;
 /// The JNI library; the sandbox sees it in atl_android_paths::SYSTEM_LIB (atld `--file`).
 const LIB: &str = "libatl_gl_probe.so";
 /// The pbuffer's size and clear colour (bytes): odd sizes so no row or tile alignment hides a stray pixel; each channel a k / 255 value away from 0 and 255.
@@ -284,7 +284,6 @@ fn run_probe(
         scratch: dir.join("scratch"),
         launch: None,
         packages: vec![Package::base(apk.to_path_buf())],
-        first_uid: APP_UID,
         libraries: vec![],
         shell: Some(Shell {
             class: PROBE_CLASS.to_owned(),
