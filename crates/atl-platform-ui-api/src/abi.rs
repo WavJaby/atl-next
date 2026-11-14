@@ -1025,7 +1025,121 @@ pub const WEBVIEW_ENTRY_SYMBOL: &str = "atl_webview_entry";
 /// The WebView module's entry: its static vtable; starts nothing. The caller checks [`WebViewVtable::abi`] first.
 pub type WebViewEntry = unsafe extern "C" fn() -> *const WebViewVtable;
 
-/// The WebView module's functions (the [`crate::webview`] traits as a C ABI).
+/// A `WebView` (page view), opaque; UI thread.
+#[repr(C)]
+pub struct WebViewHandle {
+    _opaque: [u8; 0],
+}
+
+/// [`PromptReply`](crate::webview::PromptReply) across the boundary: made by the module, finished or dropped once by the process, from any thread.
+#[repr(C)]
+pub struct PromptReplyAbi {
+    data: *mut c_void,
+    finish: unsafe extern "C" fn(*mut c_void, Str, bool),
+    drop: unsafe extern "C" fn(*mut c_void),
+}
+
+// SAFETY: `new` takes only Send closures.
+unsafe impl Send for PromptReplyAbi {}
+
+unsafe extern "C" fn finish_box<F: FnOnce(Option<String>)>(
+    data: *mut c_void,
+    text: Str,
+    has: bool,
+) {
+    // SAFETY: `data` is the Box<F> `PromptReplyAbi::new` leaked; `finish` consumes it once (the owner's Drop does not run after it); `text` is alive for this call.
+    let f = unsafe { Box::from_raw(data.cast::<F>()) };
+    // SAFETY: as above.
+    f(has.then(|| unsafe { text.get() }.into_owned()))
+}
+
+impl PromptReplyAbi {
+    /// Carries `f` (the module side); dropping unfinished runs `f(None)` too, so the page never stays blocked.
+    pub fn new<F: FnOnce(Option<String>) + Send + 'static>(f: F) -> Self {
+        Self {
+            data: Box::into_raw(Box::new(f)).cast(),
+            finish: finish_box::<F>,
+            drop: drop_unfinished::<F>,
+        }
+    }
+}
+
+unsafe extern "C" fn drop_unfinished<F: FnOnce(Option<String>)>(data: *mut c_void) {
+    // SAFETY: as finish_box; reached only for a reply never finished.
+    (unsafe { Box::from_raw(data.cast::<F>()) })(None)
+}
+
+impl crate::webview::PromptReply for PromptReplyAbi {
+    fn finish(self: Box<Self>, text: Option<String>) {
+        let me = ManuallyDrop::new(*self);
+        let s = text.as_deref().unwrap_or("");
+        // SAFETY: paired by `new`; `finish` frees `data` and ManuallyDrop keeps Drop from running.
+        unsafe { (me.finish)(me.data, Str::of(s), text.is_some()) }
+    }
+}
+
+impl Drop for PromptReplyAbi {
+    fn drop(&mut self) {
+        // SAFETY: paired by `new`; reached only for a reply never finished.
+        unsafe { (self.drop)(self.data) }
+    }
+}
+
+/// [`WebEvent`](crate::webview::WebEvent) kinds.
+pub mod web_event {
+    /// `LoadStarted(uri)`.
+    pub const LOAD_STARTED: u32 = 1;
+    /// `LoadCommitted(uri)`.
+    pub const LOAD_COMMITTED: u32 = 2;
+    /// `LoadFinished(uri)`.
+    pub const LOAD_FINISHED: u32 = 3;
+    /// `LoadFailed { uri, message, kind = error }`.
+    pub const LOAD_FAILED: u32 = 4;
+    /// `Title(text)`.
+    pub const TITLE: u32 = 5;
+    /// `Progress(progress)`.
+    pub const PROGRESS: u32 = 6;
+    /// `Prompt { message, default = text, reply }`.
+    pub const PROMPT: u32 = 7;
+}
+
+/// One [`WebEvent`](crate::webview::WebEvent) for one call; a `PROMPT` event's `reply` passes to the receiver, which `take`s it once.
+#[repr(C)]
+pub struct WebEventView {
+    /// A [`web_event`] constant.
+    pub kind: u32,
+    /// The URL (load events) or the title / prompt message.
+    pub text: Str,
+    /// The failure message, or the prompt's default.
+    pub detail: Str,
+    /// [`LoadError`](crate::webview::LoadError) as u32 (`LOAD_FAILED`).
+    pub error: u32,
+    /// `PROGRESS`.
+    pub progress: i32,
+    /// `PROMPT`: the reply, owned by the receiver.
+    pub reply: ManuallyDrop<PromptReplyAbi>,
+}
+
+/// An `evaluate_javascript` result for one call.
+#[repr(C)]
+pub struct EvalResultView {
+    /// JSON on true, the exception's text on false.
+    pub ok: bool,
+    /// The text.
+    pub text: Str,
+}
+
+/// The boolean view settings [`WebViewVtable::view_set_bool`] knows.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoolSetting {
+    /// JavaScript enabled.
+    JavaScript = 1,
+    /// DOM storage enabled.
+    DomStorage = 2,
+}
+
+/// The WebView module's functions (the [`crate::webview`] traits as a C ABI). `view_*` on the UI thread.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct WebViewVtable {
@@ -1033,4 +1147,47 @@ pub struct WebViewVtable {
     pub abi: AbiId,
     /// `WebEngine::default_user_agent`: the engine's own default UA string into `out` and true; false with the reason in `out` when the engine cannot run (no display). Any thread.
     pub default_user_agent: unsafe extern "C" fn(out: *mut BytesOut) -> bool,
+    /// `WebEngine::create_view`.
+    pub view_create: unsafe extern "C" fn(
+        events: Callback<WebEventView>,
+        out: *mut *mut WebViewHandle,
+        err: *mut BytesOut,
+    ) -> Status,
+    /// Destroys a view.
+    pub view_drop: unsafe extern "C" fn(view: *mut WebViewHandle),
+    /// `WebView::load_uri`.
+    pub view_load_uri: unsafe extern "C" fn(view: *mut WebViewHandle, uri: Str),
+    /// `WebView::load_bytes`.
+    pub view_load_bytes: unsafe extern "C" fn(
+        view: *mut WebViewHandle,
+        content: *const u8,
+        len: usize,
+        mime_type: Str,
+        encoding: Str,
+        base_uri: Str,
+    ),
+    /// `WebView::stop_loading`.
+    pub view_stop: unsafe extern "C" fn(view: *mut WebViewHandle),
+    /// `WebView::reload`.
+    pub view_reload: unsafe extern "C" fn(view: *mut WebViewHandle),
+    /// `WebView::evaluate_javascript`; `done` is called once.
+    pub view_evaluate:
+        unsafe extern "C" fn(view: *mut WebViewHandle, script: Str, done: Callback<EvalResultView>),
+    /// `WebView::set_user_scripts`.
+    pub view_set_user_scripts:
+        unsafe extern "C" fn(view: *mut WebViewHandle, sources: *const Str, len: usize),
+    /// `WebView::uri` into `out`; false = none.
+    pub view_uri: unsafe extern "C" fn(view: *mut WebViewHandle, out: *mut BytesOut) -> bool,
+    /// `WebView::title` into `out`; false = none.
+    pub view_title: unsafe extern "C" fn(view: *mut WebViewHandle, out: *mut BytesOut) -> bool,
+    /// `WebView::progress`.
+    pub view_progress: unsafe extern "C" fn(view: *mut WebViewHandle) -> i32,
+    /// A boolean setting's setter.
+    pub view_set_bool: unsafe extern "C" fn(view: *mut WebViewHandle, which: BoolSetting, on: bool),
+    /// A boolean setting's value.
+    pub view_get_bool: unsafe extern "C" fn(view: *mut WebViewHandle, which: BoolSetting) -> bool,
+    /// `WebView::set_user_agent`.
+    pub view_set_user_agent: unsafe extern "C" fn(view: *mut WebViewHandle, ua: Str),
+    /// `WebView::user_agent` into `out`.
+    pub view_user_agent: unsafe extern "C" fn(view: *mut WebViewHandle, out: *mut BytesOut),
 }

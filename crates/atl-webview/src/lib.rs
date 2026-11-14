@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: MIT
-//! `libatl_webview.so`, the WebView provider's natives (webview plan S4.1, W1): `WebViewChromiumFactoryProviderForT` and its `WebViewChromiumStatics` forward every method here.
-//! W1 scope: `getStatics` (one instance per process, as Chromium's provider keeps one) and `Statics.getDefaultUserAgent` ([`ua`], the engine's tokens through `PlatformWebEngine`). Every other method throws UnsupportedOperationException("<Interface>.<method>") and counts `unimplemented` (plan S4.1 refusals): `createWebView` until W2.
+//! `libatl_webview.so`, the WebView provider's natives (webview plan S4.1): the Java forwarders in package com.android.webview.chromium call here.
+//! Built: `getStatics` (one instance per process, as Chromium's provider keeps one), `Statics.getDefaultUserAgent` ([`ua`], the engine's tokens through `PlatformWebEngine`); W2 `createWebView` and the
+//! core of `WebViewProviderImpl` / `WebSettingsImpl` (load, `evaluateJavascript`, [`bridge`], client callbacks). Every other method throws UnsupportedOperationException("<Interface>.<method>"),
+//! counted (plan S4.1 refusals) through the Java `Unimplemented.refuse`.
 #![deny(unsafe_code)]
 
+pub mod bridge;
 #[allow(unsafe_code)]
 mod jni;
 pub mod ua;

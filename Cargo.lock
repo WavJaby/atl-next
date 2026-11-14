@@ -752,6 +752,7 @@ dependencies = [
  "atl-bridgegen",
  "atl-diag",
  "atl-platform-ui",
+ "serde_json",
  "thiserror",
  "tracing",
  "tracing-subscriber",

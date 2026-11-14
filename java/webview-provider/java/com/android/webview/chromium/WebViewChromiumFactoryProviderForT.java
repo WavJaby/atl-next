@@ -18,7 +18,7 @@ import android.webkit.WebViewProvider;
 /**
  * The provider WebViewFactory instantiates (WebViewFactoryProvider.getWebViewFactoryClassName without use_b_entry_point; static create(WebViewDelegate), WebViewFactory.java:355-360).
  * A forwarder (AGENTS Languages): WebViewFactory needs an object implementing WebViewFactoryProvider, which JNI cannot create. Every method forwards to libatl_webview.so (the manifest's
- * WebViewLibrary); the native side throws UnsupportedOperationException("WebViewFactoryProvider.<method>") for what is not built yet and counts it (unimplemented_api).
+ * WebViewLibrary); what is not built yet throws Unimplemented.refuse("WebViewFactoryProvider.<method>"), counted natively. createWebView refuses the same way when the engine cannot start.
  * getPacProcessor / createPacProcessor keep the interface's defaults (UnsupportedOperationException), as AOSP's own provider contract states.
  */
 public final class WebViewChromiumFactoryProviderForT implements WebViewFactoryProvider {
@@ -44,30 +44,13 @@ public final class WebViewChromiumFactoryProviderForT implements WebViewFactoryP
     @Override
     public native WebViewProvider createWebView(WebView webView, WebView.PrivateAccess privateAccess);
 
-    @Override
-    public native GeolocationPermissions getGeolocationPermissions();
-
-    @Override
-    public native CookieManager getCookieManager();
-
-    @Override
-    public native TokenBindingService getTokenBindingService();
-
-    @Override
-    public native TracingController getTracingController();
-
-    @Override
-    public native ServiceWorkerController getServiceWorkerController();
-
-    @Override
-    public native WebIconDatabase getWebIconDatabase();
-
-    @Override
-    public native WebStorage getWebStorage();
-
-    @Override
-    public native WebViewDatabase getWebViewDatabase(Context context);
-
-    @Override
-    public native ClassLoader getWebViewClassLoader();
+    @Override public GeolocationPermissions getGeolocationPermissions() { throw Unimplemented.refuse("WebViewFactoryProvider.getGeolocationPermissions"); }
+    @Override public CookieManager getCookieManager() { throw Unimplemented.refuse("WebViewFactoryProvider.getCookieManager"); }
+    @Override public TokenBindingService getTokenBindingService() { throw Unimplemented.refuse("WebViewFactoryProvider.getTokenBindingService"); }
+    @Override public TracingController getTracingController() { throw Unimplemented.refuse("WebViewFactoryProvider.getTracingController"); }
+    @Override public ServiceWorkerController getServiceWorkerController() { throw Unimplemented.refuse("WebViewFactoryProvider.getServiceWorkerController"); }
+    @Override public WebIconDatabase getWebIconDatabase() { throw Unimplemented.refuse("WebViewFactoryProvider.getWebIconDatabase"); }
+    @Override public WebStorage getWebStorage() { throw Unimplemented.refuse("WebViewFactoryProvider.getWebStorage"); }
+    @Override public WebViewDatabase getWebViewDatabase(Context context) { throw Unimplemented.refuse("WebViewFactoryProvider.getWebViewDatabase"); }
+    @Override public ClassLoader getWebViewClassLoader() { throw Unimplemented.refuse("WebViewFactoryProvider.getWebViewClassLoader"); }
 }

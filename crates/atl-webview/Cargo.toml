@@ -19,6 +19,7 @@ crate-type = ["cdylib"]
 [dependencies]
 atl-diag = { path = "../atl-diag" }
 atl-platform-ui = { path = "../atl-platform-ui" }
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
