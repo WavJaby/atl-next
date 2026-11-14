@@ -19,6 +19,11 @@ literal = "/data/app/lib/x86_64/libatl-jni-test.so"
 reason = "test input of the native bridge's path classifier: a library path as libnativeloader passes one, never opened"
 
 [[allow]]
+file = "xtask-harness/src/adb.rs"
+literal = "/product/bin:/apex/com.android.runtime/bin:/apex/com.android.art/bin:/system_ext/bin:/system/bin:/system/xbin:/odm/bin:/vendor/bin:/vendor/xbin"
+reason = "init's PATH quoted from init.environ.rc.in: the shell's search order, a device value no layout constant composes"
+
+[[allow]]
 file = "xtask/src/host_disk.rs"
 literal = "/mnt"
 reason = "WSL's host-drive mount root (automount.root default), a Linux host path, not an Android one"

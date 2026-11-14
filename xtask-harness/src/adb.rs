@@ -11,6 +11,7 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
+use atl_android_paths::{DATA, SDCARD, SYSTEM, SYSTEM_BIN};
 use atl_broker::{Link, Mount, Spawn, adb, to_log};
 
 use crate::binder::{spawn_of, wait_limited};
@@ -43,20 +44,15 @@ const PORT: u16 = 5555;
 const LISTEN_PROP: &str = "service.adb.listen_addrs";
 /// The property the gate reads through `adb shell getprop`.
 const SDK_PROP: &str = "ro.build.version.sdk";
-/// init's environment, which adbd's shell inherits on a device (system/core/rootdir/init.environ.rc.in), less the BOOTCLASSPATH family (no ART in this shell yet).
+/// init's environment as adbd's shell inherits it on a device (system/core/rootdir/init.environ.rc.in), the part this shell reads; the APEX roots and BOOTCLASSPATH family join with ART in the shell (S4).
 const INIT_ENV: &[(&str, &str)] = &[
     (
         "PATH",
         "/product/bin:/apex/com.android.runtime/bin:/apex/com.android.art/bin:/system_ext/bin:/system/bin:/system/xbin:/odm/bin:/vendor/bin:/vendor/xbin",
     ),
-    ("ANDROID_ROOT", "/system"),
-    ("ANDROID_DATA", "/data"),
-    ("ANDROID_STORAGE", "/storage"),
-    ("ANDROID_ART_ROOT", "/apex/com.android.art"),
-    ("ANDROID_I18N_ROOT", "/apex/com.android.i18n"),
-    ("ANDROID_TZDATA_ROOT", "/apex/com.android.tzdata"),
-    ("EXTERNAL_STORAGE", "/sdcard"),
-    ("ASEC_MOUNTPOINT", "/mnt/asec"),
+    ("ANDROID_ROOT", SYSTEM),
+    ("ANDROID_DATA", DATA),
+    ("EXTERNAL_STORAGE", SDCARD),
 ];
 /// How long adbd may take to listen, and one client command to answer (a loaded machine: a cold adbd listens well under a second).
 const START_LIMIT: Duration = Duration::from_secs(10);
@@ -227,7 +223,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .extend(atl_broker::tree_mounts(&view.join(d))?.into_iter().skip(1));
     }
     s.links.push(Link {
-        target: "/system/bin".into(),
+        target: SYSTEM_BIN.into(),
         at: "/bin".into(),
     });
     s.property_area = Some(area);

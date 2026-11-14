@@ -911,11 +911,9 @@ impl Broker {
             info_w.as_raw_fd(),
             Some(seccomp.as_raw_fd()),
         );
-        let block = [
-            OsString::from("--userns-block-fd"),
-            block_r.as_raw_fd().to_string().into(),
-        ];
-        bwrap_args.splice(0..0, block);
+        let mut block = bwrap::Args::new();
+        block.userns_block_fd(block_r.as_raw_fd());
+        bwrap_args.splice(0..0, block.options());
         let mut args = stub_args(&grants, true, &spawn.program);
         args.extend(spawn.args.iter().cloned());
         let process = launch(

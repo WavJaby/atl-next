@@ -177,6 +177,11 @@ impl Args {
         self.word("--chdir").word(dir.as_ref())
     }
 
+    /// The options alone, without `--`: spliced before another argv's options (the adb profile's block fd, known only to its spawn).
+    pub fn options(self) -> Vec<OsString> {
+        self.argv
+    }
+
     /// The options and the closing `--`; the program and its arguments follow.
     pub fn end(mut self) -> Vec<OsString> {
         self.argv.push("--".into());
