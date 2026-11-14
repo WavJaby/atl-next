@@ -40,6 +40,9 @@ pub struct Args {
     /// Internal: the preflight's child in the branch's worktree (`facts_child`); prints what the branch's tables say, read-only.
     #[arg(long, hide = true, conflicts_with_all = ["execute", "cleanup"])]
     facts: bool,
+    /// Internal: the inputs child (`inputs_child`) in the worktree or the main checkout; prints what that checkout's check reads (`check_inputs`), read-only.
+    #[arg(long, hide = true, conflicts_with_all = ["execute", "cleanup", "facts"])]
+    inputs: bool,
 }
 
 /// What the branch's own tables say, as the branch's xtask reads them (`branch_facts`).
@@ -49,7 +52,15 @@ struct BranchFacts {
     edits: Vec<String>,
     /// Upstreams whose task copy exists already.
     copies: Vec<String>,
+    /// The build machine's arches.toml host: what verify-main builds the main checkout's slot for.
+    host: String,
 }
+
+/// What a checkout's `check` reads from the source side, as `check_inputs` hashes it: `.` = the checkout's tracked files, then each upstream dir as the checkout's layout resolves it (task copy or `src/`) -> its tree, or [`ABSENT`].
+type Inputs = std::collections::BTreeMap<String, String>;
+
+/// An upstream not fetched where the layout resolves it.
+const ABSENT: &str = "absent";
 
 /// `(worktree, branch)` -> the branch's facts; `facts_child` in production.
 type FactsFn<'a> = dyn Fn(&Path, &str) -> Result<BranchFacts> + 'a;
@@ -64,6 +75,10 @@ struct Runner<'a> {
     fetch: &'a dyn Fn(&Path) -> Result<()>,
     /// The cleanup child for the main checkout and the branch; its note line (`cleanup_execute`).
     cleanup: &'a dyn Fn(&Path, &str) -> Result<String>,
+    /// `(checkout, branch)` -> what that checkout's check reads, by its own xtask (`inputs_child`).
+    inputs: &'a dyn Fn(&Path, &str) -> Result<Inputs>,
+    /// `(main checkout, host)` -> `xtask native --for all-gates` there, by its own xtask (`native_execute`): verify-main's slot rebuild.
+    native: &'a dyn Fn(&Path, &str) -> Result<String>,
 }
 
 /// One step of a landing, in run order.
@@ -76,7 +91,7 @@ enum Stage {
     Push,
     /// Main fast-forwards to origin/main, then `fetch --execute` moves `src/` there.
     Sync,
-    /// `cargo xtask check` in the main checkout.
+    /// The main checkout's verdict: Verify's, when main's check inputs equal the ones Verify checked (`Plan::verify_main`); else `xtask native` + `cargo xtask check` there.
     VerifyMain,
     /// Task copies, the state note (kept in out/), the worktree and the branch, in a child (`cleanup_execute`): this process's binary predates the sync.
     Cleanup,
@@ -108,6 +123,8 @@ struct Plan {
     edits: Vec<String>,
     /// Upstreams whose task copy exists already.
     copies: Vec<String>,
+    /// The build machine's host arch, from the branch's arches.toml (`BranchFacts::host`).
+    host: String,
 }
 
 /// `xtask land <branch>`: prints the steps unless `--execute`.
@@ -123,6 +140,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
         for c in &f.copies {
             println!("{FACT_COPY}{c}");
+        }
+        println!("{FACT_HOST}{}", f.host);
+        return Ok(ExitCode::SUCCESS);
+    }
+    if args.inputs {
+        for (name, tree) in check_inputs(root)? {
+            println!("{INPUT}{name} {tree}");
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -146,6 +170,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         check: &check_verdict,
         fetch: &fetch_execute,
         cleanup: &cleanup_execute,
+        inputs: &inputs_child,
+        native: &native_execute,
     };
     let line = plan.execute(&stages, &runner);
     println!("{line}");
@@ -224,7 +250,11 @@ impl Plan {
             first(&dirty)
         );
         patch::check(repo).context("src/ is not origin/main's pin + patches: `cargo xtask fetch --execute` in the main checkout, then land again")?;
-        let BranchFacts { edits, copies } = facts(&wt, branch)?;
+        let BranchFacts {
+            edits,
+            copies,
+            host,
+        } = facts(&wt, branch)?;
         Ok(Plan {
             repo: repo.to_path_buf(),
             branch: branch.to_owned(),
@@ -233,6 +263,7 @@ impl Plan {
             head,
             edits,
             copies,
+            host,
         })
     }
 
@@ -275,9 +306,11 @@ impl Plan {
                 "sync in {repo}: merge --ff-only origin/main, then `cargo xtask fetch --execute` (src/ moves to {})",
                 short(&self.head)
             ),
-            Stage::VerifyMain => {
-                format!("verify in {repo}: `cargo xtask check` must print `check: ok`")
-            }
+            Stage::VerifyMain => format!(
+                "verify in {repo}: verify's verdict if its check inputs equal the worktree's, else `cargo xtask native --host {} --for {}` then `cargo xtask check` must print `check: ok`",
+                self.host,
+                crate::gate_goals::ALL
+            ),
             Stage::Cleanup => {
                 let gone: Vec<&str> = self
                     .copies
@@ -302,9 +335,11 @@ impl Plan {
     fn execute(&self, stages: &[Stage], runner: &Runner) -> String {
         let total = stages.len();
         let mut times = Timings::default();
+        // what Verify's check read; None until it passed and was read
+        let mut verified: Option<Inputs> = None;
         for stage in stages {
             let started = Instant::now();
-            let result = self.run_stage(stage, runner);
+            let result = self.run_stage(stage, runner, &mut verified);
             let took = started.elapsed();
             times.push(stage.name(), took);
             match result {
@@ -336,11 +371,30 @@ impl Plan {
         .line()
     }
 
-    fn run_stage(&self, stage: &Stage, runner: &Runner) -> Result<String> {
+    fn run_stage(
+        &self,
+        stage: &Stage,
+        runner: &Runner,
+        verified: &mut Option<Inputs>,
+    ) -> Result<String> {
         match stage {
             Stage::Edit(up) => (runner.edit)(&self.wt, up),
-            Stage::Verify => (runner.check)(self.wt.as_path())
-                .with_context(|| format!("nothing pushed: check in {} failed", self.wt.display())),
+            Stage::Verify => {
+                let line = (runner.check)(self.wt.as_path()).with_context(|| {
+                    format!("nothing pushed: check in {} failed", self.wt.display())
+                })?;
+                // read after the check: nothing in land writes the worktree or its task copies between the two
+                Ok(match (runner.inputs)(&self.wt, &self.branch) {
+                    Ok(inputs) => {
+                        let note = format!("{line}; {} check inputs read", inputs.len());
+                        *verified = Some(inputs);
+                        note
+                    }
+                    Err(e) => format!(
+                        "{line}; check inputs not read, verify-main will check main in full: {e:#}"
+                    ),
+                })
+            }
             Stage::Push => {
                 let refspec = format!("refs/heads/{}:refs/heads/main", self.branch);
                 git(Some(&self.repo), &["push", "-q", "origin", &refspec])
@@ -348,13 +402,7 @@ impl Plan {
                 Ok(format!("origin/main is {}", short(&self.head)))
             }
             Stage::Sync => self.sync(runner),
-            Stage::VerifyMain => (runner.check)(self.repo.as_path()).with_context(|| {
-                format!(
-                    "pushed: origin/main is {}, and the check in {} failed",
-                    short(&self.head),
-                    self.repo.display()
-                )
-            }),
+            Stage::VerifyMain => self.verify_main(runner, verified.as_ref()),
             Stage::Cleanup => (runner.cleanup)(&self.repo, &self.branch)
                 .context("pushed and checked, but cleanup failed: finish it by hand"),
         }
@@ -377,11 +425,84 @@ impl Plan {
         })?;
         Ok(format!("main and src/ at {}", short(&self.head)))
     }
+
+    /// The main checkout's verdict.
+    /// Invariant for the skip: `check` is a function of the checkout's tracked files (its own code included), the upstream trees its layout resolves, the slot's build and the workspace's shared config/caches.
+    /// The slot's build is in turn derived from the first two by `native`; the shared part is the same files for both checkouts. So when main's tracked files and resolved upstream trees (`check_inputs`)
+    /// equal what Verify's check read in the worktree (task copies included), main's check would reach Verify's verdict: it is recorded, and neither main's slot rebuild nor its check runs.
+    /// Main's slot stays as it was; its gates refuse it by name until the next `native` there (build_state::ensure_current). Not covered: untracked or ignored files a check reads (both checkouts are clean, the state note aside).
+    /// Inputs that differ (fetch built `src/<up>` other than the task copy, an unexported edit, Verify's inputs unread) -> native for every gate's goals (a stale slot failed "built from another source state" otherwise), then check.
+    fn verify_main(&self, runner: &Runner, verified: Option<&Inputs>) -> Result<String> {
+        let pushed = || {
+            format!(
+                "pushed: origin/main is {}, and the check in {} failed",
+                short(&self.head),
+                self.repo.display()
+            )
+        };
+        let why = match verified.map(|v| (v, (runner.inputs)(&self.repo, &self.branch))) {
+            None => "the worktree's check inputs were not read".to_owned(),
+            Some((v, Ok(now))) if now == *v => {
+                return Ok(format!(
+                    "verify's verdict: main's {} check inputs equal the worktree's (slot not rebuilt, check not run)",
+                    now.len()
+                ));
+            }
+            Some((v, Ok(now))) => format!("check inputs differ: {}", differing(v, &now)),
+            Some((_, Err(e))) => format!("main's check inputs not read: {e:#}"),
+        };
+        println!("land: verify-main: {why}: rebuilding main's slot, then checking");
+        (runner.native)(&self.repo, &self.host).with_context(pushed)?;
+        let line = (runner.check)(self.repo.as_path()).with_context(pushed)?;
+        Ok(format!("{line} ({why})"))
+    }
+}
+
+/// The first few names whose trees differ between `a` and `b`, either side's absence included.
+fn differing(a: &Inputs, b: &Inputs) -> String {
+    let names: Vec<&str> = a
+        .keys()
+        .chain(b.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter(|k| a.get(*k) != b.get(*k))
+        .map(String::as_str)
+        .collect();
+    format!("{} ({} in all)", first(&names), names.len())
+}
+
+/// What `check` in the checkout at `root` reads from the source side (`Inputs`), each tree as its tracked files are on disk (build_state::tracked_tree).
+/// Every upstream sources.toml lists (the AOSP manifest included), located as this checkout's layout locates it: a branch worktree sees its task copies, main sees `src/`.
+fn check_inputs(root: &Path) -> Result<Inputs> {
+    let layout = Layout::of(root)?;
+    let sources = sources::load(root)?;
+    let mut ups = sources.checkouts(None);
+    ups.push(sources.manifest_checkout());
+    let dirs: Vec<(String, PathBuf)> = ups
+        .iter()
+        .map(|c| (c.dir.display().to_string(), layout.locate(&c.dir).dir))
+        .collect();
+    let workers = std::thread::available_parallelism().map_or(1, usize::from);
+    let trees = crate::par::map(&dirs, workers, |(name, dir)| -> Result<String> {
+        if !dir.exists() {
+            return Ok(ABSENT.to_owned());
+        }
+        crate::build_state::tracked_tree(dir).with_context(|| format!("reading upstream {name}"))
+    });
+    let mut out = Inputs::new();
+    out.insert(".".to_owned(), crate::build_state::tracked_tree(root)?);
+    for ((name, _), tree) in dirs.into_iter().zip(trees) {
+        out.insert(name, tree?);
+    }
+    Ok(out)
 }
 
 /// `--facts` output line prefixes.
 const FACT_EDIT: &str = "land-facts: edit ";
 const FACT_COPY: &str = "land-facts: copy ";
+const FACT_HOST: &str = "land-facts: host ";
+/// `--inputs` output line prefix: `<name> <tree>` follows.
+const INPUT: &str = "land-inputs: ";
 
 /// The branch's facts from its own tables, read by whichever xtask runs this: the `--facts` child in the worktree `wt`, i.e. the branch's xtask, so a table schema the branch changes is read by the code that changed it.
 /// origin/main's tables (`fetch::Main`) are read through the refs the worktree shares with the main checkout.
@@ -411,9 +532,11 @@ fn branch_facts(wt: &Path) -> Result<BranchFacts> {
             edits.push(c.dir.display().to_string());
         }
     }
+    let arches = crate::arches::load(wt)?;
     Ok(BranchFacts {
         edits,
         copies: copies_of(&layout, &sources),
+        host: crate::arches::build_machine(wt, &arches)?.0.to_owned(),
     })
 }
 
@@ -443,9 +566,62 @@ fn parse_facts(stdout: &str) -> BranchFacts {
             f.edits.push(e.to_owned());
         } else if let Some(c) = line.strip_prefix(FACT_COPY) {
             f.copies.push(c.to_owned());
+        } else if let Some(h) = line.strip_prefix(FACT_HOST) {
+            f.host = h.to_owned();
         }
     }
     f
+}
+
+/// `cargo xtask land <branch> --inputs` in `dir` (the worktree or the main checkout), run by that checkout's own xtask: both sides hash with the code being landed.
+fn inputs_child(dir: &Path, branch: &str) -> Result<Inputs> {
+    let mut cmd = crate::cargo_command();
+    cmd.args(["xtask", "land", branch, "--inputs"])
+        .current_dir(dir);
+    let run = unit_use::run(&mut cmd, Units::Plain, Echo::Nothing)
+        .with_context(|| format!("running cargo xtask land --inputs in {}", dir.display()))?;
+    ensure!(
+        run.status.success(),
+        "{}: {}",
+        run.status,
+        run.stderr
+            .rfind("Error:")
+            .map_or(run.stderr.trim_end(), |at| run.stderr[at..].trim_end())
+    );
+    let inputs = parse_inputs(&run.stdout);
+    ensure!(!inputs.is_empty(), "the inputs child printed no input");
+    Ok(inputs)
+}
+
+fn parse_inputs(stdout: &str) -> Inputs {
+    stdout
+        .lines()
+        .filter_map(|l| l.strip_prefix(INPUT)?.rsplit_once(' '))
+        .map(|(name, tree)| (name.to_owned(), tree.to_owned()))
+        .collect()
+}
+
+/// `cargo xtask native --host <host> --for all-gates` in the main checkout, run by its own xtask: the slot verify-main's check reads, built from main as it is now.
+fn native_execute(repo: &Path, host: &str) -> Result<String> {
+    let mut cmd = crate::cargo_command();
+    cmd.args([
+        "xtask",
+        "native",
+        "--host",
+        host,
+        "--for",
+        crate::gate_goals::ALL,
+    ])
+    .current_dir(repo);
+    let run = unit_use::run(&mut cmd, Units::Plain, Echo::Both)
+        .with_context(|| format!("running cargo xtask native in {}", repo.display()))?;
+    ensure!(
+        run.status.success(),
+        "cargo xtask native --host {host} --for {} exited with {}",
+        crate::gate_goals::ALL,
+        run.status
+    );
+    Ok(format!("native {host} for {}", crate::gate_goals::ALL))
 }
 
 /// `cargo xtask patch --edit <up>` in the worktree, run by the branch's xtask: the task copy is built from the branch's tables.
@@ -674,6 +850,7 @@ mod tests {
             Ok(BranchFacts {
                 edits: Vec::new(),
                 copies: vec!["up".to_owned()],
+                host: "h".to_owned(),
             })
         };
         let plan = Plan::new(&env.repo, "land", true, &facts)
@@ -690,16 +867,123 @@ mod tests {
                 check: &check_fn,
                 fetch: &fetch_fn,
                 cleanup: &cleanup_fn,
+                inputs: &same_inputs,
+                native: &no_native,
             },
         );
         assert_eq!(line, "land: ok (5 steps)");
         // the child's output is what the parent plans from
         assert_eq!(
-            parse_facts("noise\nland-facts: edit aosp/x\nland-facts: copy up\n"),
+            parse_facts(
+                "noise\nland-facts: edit aosp/x\nland-facts: copy up\nland-facts: host x86_64\n"
+            ),
             BranchFacts {
                 edits: vec!["aosp/x".into()],
-                copies: vec!["up".into()]
+                copies: vec!["up".into()],
+                host: "x86_64".into(),
             }
+        );
+    }
+
+    /// Every checkout reads the same inputs.
+    fn same_inputs(_: &Path, _: &str) -> Result<Inputs> {
+        Ok(Inputs::from([(".".to_owned(), "t".to_owned())]))
+    }
+
+    fn no_native(_: &Path, host: &str) -> Result<String> {
+        panic!("verify-main rebuilt main's slot for {host}")
+    }
+
+    /// Main's inputs equal the worktree's: verify-main records Verify's verdict, no rebuild, no second check. Inputs read by this code in-process, as both children would.
+    #[test]
+    fn equal_inputs_skip_the_main_check() {
+        let env = Env::new("skip");
+        let plan = Plan::new(&env.repo, "land", true, &in_process).unwrap();
+        let checked = std::cell::RefCell::new(Vec::new());
+        let check_fn = |d: &Path| -> Result<String> {
+            checked.borrow_mut().push(d.to_path_buf());
+            Ok("check: ok (12 steps)".to_owned())
+        };
+        let fetch_fn = |_: &Path| -> Result<()> { Ok(()) };
+        let cleanup_fn = |_: &Path, _: &str| -> Result<String> { Ok("cleaned".to_owned()) };
+        let inputs_fn = |d: &Path, _: &str| check_inputs(d);
+        let line = plan.execute(
+            &plan.stages(),
+            &Runner {
+                edit: &no_edit,
+                check: &check_fn,
+                fetch: &fetch_fn,
+                cleanup: &cleanup_fn,
+                inputs: &inputs_fn,
+                native: &no_native,
+            },
+        );
+        assert_eq!(line, "land: ok (5 steps)");
+        assert_eq!(
+            *checked.borrow(),
+            std::slice::from_ref(&env.wt),
+            "main was checked"
+        );
+    }
+
+    /// Main's inputs differ (an upstream fetch built otherwise than the task copy): verify-main rebuilds main's slot for the branch's host, then checks main; the note names what differed.
+    #[test]
+    fn differing_inputs_rebuild_and_check_main() {
+        let env = Env::new("differ");
+        let plan = Plan::new(&env.repo, "land", true, &in_process).unwrap();
+        let calls = std::cell::RefCell::new(Vec::new());
+        let check_fn = |d: &Path| -> Result<String> {
+            calls.borrow_mut().push(format!("check {}", d.display()));
+            Ok("check: ok (12 steps)".to_owned())
+        };
+        let native_fn = |d: &Path, host: &str| -> Result<String> {
+            calls
+                .borrow_mut()
+                .push(format!("native {host} {}", d.display()));
+            Ok("built".to_owned())
+        };
+        let inputs_fn = |d: &Path, _: &str| -> Result<Inputs> {
+            let tree = if d == env.wt { "copy" } else { "fetched" };
+            Ok(Inputs::from([
+                (".".to_owned(), "t".to_owned()),
+                ("aosp/art".to_owned(), tree.to_owned()),
+            ]))
+        };
+        let fetch_fn = |_: &Path| -> Result<()> { Ok(()) };
+        let cleanup_fn = |_: &Path, _: &str| -> Result<String> { Ok("cleaned".to_owned()) };
+        let line = plan.execute(
+            &plan.stages(),
+            &Runner {
+                edit: &no_edit,
+                check: &check_fn,
+                fetch: &fetch_fn,
+                cleanup: &cleanup_fn,
+                inputs: &inputs_fn,
+                native: &native_fn,
+            },
+        );
+        assert_eq!(line, "land: ok (5 steps)");
+        assert_eq!(
+            *calls.borrow(),
+            [
+                format!("check {}", env.wt.display()),
+                format!("native {} {}", plan.host, env.repo.display()),
+                format!("check {}", env.repo.display()),
+            ]
+        );
+        assert_eq!(
+            differing(
+                &inputs_fn(&env.wt, "land").unwrap(),
+                &Inputs::from([(".".to_owned(), "t".to_owned())])
+            ),
+            "aosp/art (1 in all)"
+        );
+        assert_eq!(
+            parse_inputs("noise\nland-inputs: . abc\nland-inputs: aosp/a b c0\n"),
+            Inputs::from([
+                (".".to_owned(), "abc".to_owned()),
+                ("aosp/a b".to_owned(), "c0".to_owned())
+            ])
         );
     }
 
@@ -738,6 +1022,12 @@ mod tests {
             );
             write(&repo, "deny.toml", "[licenses]\nallow = [\"MIT\"]\n");
             write(&repo, "aosp-prune.toml", "");
+            // the facts read the build machine's host row: the repo's own table, which lists every machine xtask runs on
+            let arches = std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../arches.toml"),
+            )
+            .unwrap();
+            write(&repo, "arches.toml", &arches);
             commit(&repo, "base");
             let origin_arg = origin.display().to_string();
             git(Some(&repo), &["remote", "add", "origin", &origin_arg]).unwrap();
@@ -848,6 +1138,9 @@ mod tests {
         let cleanup_fn = |_: &Path, _: &str| -> Result<String> {
             panic!("the cleanup child ran after a failed check")
         };
+        let inputs_fn = |d: &Path, _: &str| -> Result<Inputs> {
+            panic!("inputs of {} read after a failed check", d.display())
+        };
         let line = plan.execute(
             &stages,
             &Runner {
@@ -855,6 +1148,8 @@ mod tests {
                 check: &check_fn,
                 fetch: &fetch_fn,
                 cleanup: &cleanup_fn,
+                inputs: &inputs_fn,
+                native: &no_native,
             },
         );
         assert!(
@@ -890,6 +1185,8 @@ mod tests {
                 check: &check_fn,
                 fetch: &fetch_fn,
                 cleanup: &cleanup_fn,
+                inputs: &same_inputs,
+                native: &no_native,
             },
         );
         assert_eq!(line, "land: ok (5 steps)");

@@ -44,10 +44,10 @@ fn native_manifest(text: &str) -> Result<String> {
     toml::to_string(&doc).context("writing the root Cargo.toml's native part")
 }
 
-/// The checkout's source state: the hash of its top-level tree entries, [`GATE_SIDE`] left out, the root manifest as [`native_manifest`].
-pub fn of_checkout(root: &Path) -> Result<String> {
+/// The tree of the git checkout at `root` as its tracked files are on disk (uncommitted edits included, untracked files not): `git add -u` into a scratch copy of the index, `git write-tree`.
+pub fn tracked_tree(root: &Path) -> Result<String> {
     let git_dir = PathBuf::from(git(root, &["rev-parse", "--absolute-git-dir"], None)?);
-    // one scratch index per call: concurrent calls in one process (parallel tests) would share git's `<index>.lock`
+    // one scratch index per call: concurrent calls in one process (parallel tests, land's per-upstream scan) would share git's `<index>.lock`
     static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let scratch =
@@ -56,33 +56,36 @@ pub fn of_checkout(root: &Path) -> Result<String> {
     if index.exists() {
         std::fs::copy(&index, &scratch).context("copying the git index")?;
     }
-    let result = (|| {
-        git(root, &["add", "-u"], Some(&scratch))?;
-        let tree = git(root, &["write-tree"], Some(&scratch))?;
-        let listing = git(root, &["ls-tree", &tree], None)?;
-        let mut kept = Vec::new();
-        for line in listing.lines() {
-            match line.split_once('\t') {
-                Some((_, name)) if GATE_SIDE.contains(&name) => {}
-                Some((mode, MANIFEST)) if mode.contains(" blob ") => {
-                    let text = std::fs::read_to_string(root.join(MANIFEST))
-                        .context("reading the root Cargo.toml")?;
-                    let native = native_manifest(&text)?;
-                    // only hashed, not stored: mktree --missing takes the id as is
-                    let id = git_stdin(root, &["hash-object", "--stdin"], &native)?;
-                    kept.push(format!("100644 blob {id}\t{MANIFEST}"));
-                }
-                _ => kept.push(line.to_owned()),
-            }
-        }
-        git_stdin(
-            root,
-            &["mktree", "--missing"],
-            &format!("{}\n", kept.join("\n")),
-        )
-    })();
+    let result = git(root, &["add", "-u"], Some(&scratch))
+        .and_then(|_| git(root, &["write-tree"], Some(&scratch)));
     let _ = std::fs::remove_file(&scratch);
     result
+}
+
+/// The checkout's source state: the hash of its top-level tree entries ([`tracked_tree`]), [`GATE_SIDE`] left out, the root manifest as [`native_manifest`].
+pub fn of_checkout(root: &Path) -> Result<String> {
+    let tree = tracked_tree(root)?;
+    let listing = git(root, &["ls-tree", &tree], None)?;
+    let mut kept = Vec::new();
+    for line in listing.lines() {
+        match line.split_once('\t') {
+            Some((_, name)) if GATE_SIDE.contains(&name) => {}
+            Some((mode, MANIFEST)) if mode.contains(" blob ") => {
+                let text = std::fs::read_to_string(root.join(MANIFEST))
+                    .context("reading the root Cargo.toml")?;
+                let native = native_manifest(&text)?;
+                // only hashed, not stored: mktree --missing takes the id as is
+                let id = git_stdin(root, &["hash-object", "--stdin"], &native)?;
+                kept.push(format!("100644 blob {id}\t{MANIFEST}"));
+            }
+            _ => kept.push(line.to_owned()),
+        }
+    }
+    git_stdin(
+        root,
+        &["mktree", "--missing"],
+        &format!("{}\n", kept.join("\n")),
+    )
 }
 
 /// A parsed record: the state, and the goals built from it.
