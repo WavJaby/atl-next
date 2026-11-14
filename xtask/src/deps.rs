@@ -1249,6 +1249,9 @@ mod tests {
         assert_eq!(upstream_version("4.18.6+ds-2"), "4.18.6");
         assert_eq!(upstream_version("2.47.1-1"), "2.47.1");
         assert_eq!(upstream_version("1.12.1"), "1.12.1");
+        // glibc row: Debian libc6-dev; Arch glibc carries a git snapshot suffix
+        assert_eq!(upstream_version("2.41-12+deb13u4"), "2.41");
+        assert_eq!(upstream_version("2.41+r48+g5cb575ca9a3d-1"), "2.41");
     }
 
     #[test]

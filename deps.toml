@@ -157,6 +157,15 @@ min_reason = "QEMU meson.build:1058 glib_req_ver >=2.66.0"
 scope = ["build"]
 used_by = ["upstream:qemu"]
 
+# the host C library's headers, which AOSP host code compiles against: IAudioFlinger.cpp:919 uses SCHED_NORMAL, which glibc's <sched.h> (sysdeps/unix/sysv/linux/bits/sched.h) first defines in 2.41 (absent at tag glibc-2.40; 2.39 hosts fail mid-build)
+[glibc]
+debian = "libc6-dev"
+arch = "glibc"
+min = "2.41"
+min_reason = "SCHED_NORMAL first in glibc-2.41 bits/sched.h, used by AOSP IAudioFlinger.cpp:919"
+scope = ["build"]
+used_by = ["upstream:aosp"]
+
 [git]
 debian = "git"
 arch = "git"
