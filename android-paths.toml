@@ -20,8 +20,13 @@ reason = "test input of the native bridge's path classifier: a library path as l
 
 [[allow]]
 file = "xtask/src/host_disk.rs"
-literal = "/mnt/{}"
-reason = "WSL's host-drive mount (/mnt/<letter>), a Linux host path, not an Android one"
+literal = "/mnt"
+reason = "WSL's host-drive mount root (automount.root default), a Linux host path, not an Android one"
+
+[[allow]]
+file = "xtask/src/host_disk.rs"
+literal = "/mnt/c/WSL/Debian/ext4.vhdx"
+reason = "WSL vhdx path under the host-drive mount as the test's expected value"
 
 [[allow]]
 file = "xtask/src/host_disk.rs"

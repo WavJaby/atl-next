@@ -172,10 +172,13 @@ fn cross_args(
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let args = &args.resolved(root)?;
-    crate::host_disk::check(crate::host_disk::Limits {
-        stop_gib: args.host_free_stop_gib,
-        compact_gib: args.host_free_compact_gib,
-    })?;
+    crate::host_disk::check(
+        atl_layout::Layout::of(root)?.workspace(),
+        crate::host_disk::Limits {
+            stop_gib: args.host_free_stop_gib,
+            compact_gib: args.host_free_compact_gib,
+        },
+    )?;
     let arches = arches::load(root)?;
     let (pointer_bits, arch_variant, abi, host) = match arches.get(&args.host) {
         Some(a @ arches::Arch { host: Some(h), .. }) => (
