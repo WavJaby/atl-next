@@ -325,6 +325,18 @@ mod tests {
         assert_eq!(abis::ABILIST32, "armeabi-v7a,armeabi,x86");
     }
 
+    /// Same rules on a riscv64 host: CPU ABI riscv64, bridged 64-bit arm64-v8a then x86_64 (row order arm64 < x86_64), bridged 32-bit unchanged.
+    #[cfg(target_arch = "riscv64")]
+    #[test]
+    fn abi_lists_on_riscv64() {
+        assert_eq!(
+            abis::ABILIST,
+            "riscv64,arm64-v8a,x86_64,armeabi-v7a,armeabi,x86"
+        );
+        assert_eq!(abis::ABILIST64, "riscv64,arm64-v8a,x86_64");
+        assert_eq!(abis::ABILIST32, "armeabi-v7a,armeabi,x86");
+    }
+
     #[test]
     fn fingerprint_unknown_parts() {
         let props = vec![("ro.product.brand".to_owned(), "b".to_owned())];
