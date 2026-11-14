@@ -1668,6 +1668,58 @@ mod tests {
         assert!(e.contains("xtask patch --export up"), "{e}");
     }
 
+    /// A land rewrote a patch under the same file name (2026-11-14 fid-nbridge, ART 0004): the old text is the repo history's, so src/'s branch holding it is
+    /// no lost work and fetch rebuilds the branch from patches/ instead of refusing it.
+    #[test]
+    fn fetch_replaces_patches_rewritten_on_main() {
+        let f = Fixture::new("fetch-rewrite");
+        let c = f.checkout("v1");
+        let u = f.fetched(&c, "ws");
+        let ws = f.layout("ws", None);
+        let names = || -> Vec<std::ffi::OsString> {
+            let mut n: Vec<_> = std::fs::read_dir(f.root.join("patches/up"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            n.sort();
+            n
+        };
+        patch_commit(&u, TRAILED);
+        export_ok(&u);
+        let before = names();
+        f.commit_repo("patches", "add the patch");
+        // the same subject, another body: export writes the same file name, so the history records a rewrite (M), not a delete
+        let dev = f.fetched(&c, "dev");
+        patch_commit(&dev, TRAILED);
+        std::fs::write(
+            dev.checkout().join("a.c"),
+            "// SPDX-License-Identifier: GPL-2.0-or-later\nint a;\nint other;\n",
+        )
+        .unwrap();
+        git(
+            Some(dev.checkout()),
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-a",
+                "--amend",
+                "--no-edit",
+            ],
+        )
+        .unwrap();
+        export_ok(&dev);
+        assert_eq!(names(), before, "the rewrite must keep the file name");
+        f.commit_repo("patches", "rewrite the patch");
+        let row = sync(&ctx(&f, &ws, true), &c).unwrap();
+        assert_eq!(row.patches.as_deref(), Some("applied 1 patches"));
+        assert_eq!(tree(&u), tree(&dev));
+        assert_eq!(drift_of(&u), Vec::<String>::new());
+    }
+
     #[test]
     fn pin_bump_reapplies_or_restores() {
         let f = Fixture::new("fetch-bump");

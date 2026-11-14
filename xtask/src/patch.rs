@@ -121,16 +121,17 @@ impl<'a> Up<'a> {
         has_branch(&self.checkout, &self.branch)
     }
 
-    /// Patch texts the repo checkout's history deleted from patches/<upstream>/: retired on purpose and
-    /// kept by that history, so a patch branch commit holding one loses no work when fetch drops it --
-    /// how a patch deleted on origin/main leaves src/.
+    /// Patch texts the repo checkout's history held under patches/<upstream>/ and later deleted or rewrote: kept by that history, so a patch branch commit
+    /// holding one loses no work when fetch drops it -- how a patch deleted or rewritten on origin/main (a land replacing `0004-x.patch`) leaves src/.
+    /// Rewrites count (`M`, pre-image), renames as delete + add (`--no-renames`): only the pre-image text matters, whatever the file is called now.
     fn retired(&self) -> Result<BTreeSet<String>> {
         let rel = Path::new("patches").join(&self.c.dir).display().to_string();
         let log = git_raw(
             &self.root,
             &[
                 "log",
-                "--diff-filter=D",
+                "--diff-filter=DM",
+                "--no-renames",
                 "--name-only",
                 "--format=%x00%H",
                 "HEAD",
