@@ -508,8 +508,12 @@ impl ApkTools {
     pub fn new(root: &Path, host: &str, out: &Path, java_out: &Path) -> Result<ApkTools> {
         let layout = Layout::of(root)?;
         let (d8, jdk) = host_art::java_tools(root, host, java_out)?;
+        let arches = crate::arches::load(root)?;
+        let (build, _) = crate::arches::build_machine(root, &arches)?;
         let t = ApkTools {
-            aapt2: java_out.join("host/aapt2/aapt2"),
+            aapt2: java_out
+                .join(crate::arches::tool_side(host, build))
+                .join("aapt2/aapt2"),
             android_jar: tree::shared_tree(&layout)
                 .join("prebuilts/sdk")
                 .join(sdk_level(&out.join(host_art::BUILD_PROP))?)

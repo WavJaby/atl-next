@@ -110,6 +110,12 @@ pub fn cross_target(name: &str, host: &Host, build: &str) -> Result<Option<Cross
     }
 }
 
+/// The out-dir side holding the native tools a build of host `name` executes (aapt2, aidl), with `build` the build machine's name: bp2ninja `Config.toolSide` (Soong's BuildOSTarget) -- `build/` on a cross host, `host/` on the build machine, where one node serves both.
+/// Java tools (d8, apksigner) are jars bp2ninja installs under `host/` on every host (`javaBinary`), so they do not go through this.
+pub fn tool_side(name: &str, build: &str) -> &'static str {
+    if name == build { "host" } else { "build" }
+}
+
 fn parse(text: &str) -> Result<Arches> {
     let arches: Arches = toml::from_str(text)?;
     validate(&arches)?;
@@ -537,6 +543,13 @@ mod tests {
         assert_eq!(super::dotted_version("2.39").unwrap(), [2, 39]);
         assert!(super::dotted_version("2.41").unwrap() > super::dotted_version("2.39").unwrap());
         assert!(super::dotted_version("2.").is_err());
+    }
+
+    #[test]
+    fn tool_side_is_build_only_off_the_build_machine() {
+        // bp2ninja Config.toolSide: Build when HostCross is set (host != build machine), else Host
+        assert_eq!(super::tool_side("x86_64", "x86_64"), "host");
+        assert_eq!(super::tool_side("riscv64", "x86_64"), "build");
     }
 
     #[test]
