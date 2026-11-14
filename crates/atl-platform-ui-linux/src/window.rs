@@ -82,20 +82,26 @@ struct Shared {
 }
 
 impl Shared {
-    /// Learns the toolkit clock from an event of toolkit time `t` received now; then maps `samples` (that event's own time included) onto CLOCK_MONOTONIC, oldest first.
-    fn monotonic(&self, t: u32, samples: impl IntoIterator<Item = u32>) -> Vec<u32> {
-        let now = monotonic_ms();
+    /// Learns the toolkit clock from a `kind` event of toolkit time `t` received now; then maps `samples` (that event's own time included) onto CLOCK_MONOTONIC ns, oldest first.
+    fn monotonic(&self, kind: &str, t: u32, samples: impl IntoIterator<Item = u32>) -> Vec<i64> {
+        let now = monotonic_ns();
         let mut clock = self.clock.borrow_mut();
-        if let Some(offset) = clock.learn(t, now) {
+        if t == input::UNTIMED {
+            tracing::debug!(
+                "atl-platform-ui: input clock: untimed {kind} event, stamped at receipt"
+            );
+        } else if let Some(offset) = clock.learn(t, now) {
             // once per clock base: headless shares the kernel's clock (offset ~0), WSLg's Weston does not
-            tracing::info!("atl-platform-ui: input clock: monotonic = toolkit {offset:+} ms");
+            tracing::info!(
+                "atl-platform-ui: input clock: monotonic = toolkit {offset:+} ms (learned from {kind})"
+            );
         }
         samples.into_iter().map(|s| clock.map(s, now)).collect()
     }
 
-    /// `t` (toolkit ms) of a single event on CLOCK_MONOTONIC.
-    fn stamp(&self, t: u32) -> u32 {
-        self.monotonic(t, [t])[0]
+    /// `t` (toolkit ms) of a single `kind` event on CLOCK_MONOTONIC ns.
+    fn stamp(&self, kind: &str, t: u32) -> i64 {
+        self.monotonic(kind, t, [t])[0]
     }
 
     /// After-paint of a frame that followed a present: the buffers that frame no longer shows go back, each with the reservation fences of its dma-buf as release fence (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE` for a write: every pending GPU read of it, by this paint or an earlier one; design §3.4).
@@ -224,19 +230,22 @@ impl GtkWindow {
             y: f64,
         ) {
             let t = controller.current_event_time();
-            emit_at(shared, controller, phase, (t, x, y), shared.stamp(t));
+            let at = shared.stamp(&format!("pointer {phase:?}"), t);
+            emit_at(shared, controller, phase, (t, x, y), at);
         }
-        /// `sample` in toolkit time (kept for `motion_samples`), published at `monotonic_ms`.
+        /// `sample` in toolkit time (kept for `motion_samples`), published at `monotonic_ns`.
         fn emit_at(
             shared: &Shared,
             controller: &impl IsA<gtk4::EventController>,
             phase: PointerPhase,
             (time_ms, x, y): input::Sample,
-            monotonic_ms: u32,
+            monotonic_ns: i64,
         ) {
             shared.pointer_at.set((x, y));
-            shared.pointer_time.set(Some(time_ms));
-            let event = input::pointer(phase, x, y, scale_of(controller), monotonic_ms);
+            if time_ms != input::UNTIMED {
+                shared.pointer_time.set(Some(time_ms));
+            }
+            let event = input::pointer(phase, x, y, scale_of(controller), monotonic_ns);
             shared.on_event.call(|f| f(event));
         }
         // raw wl_pointer buttons, not GestureClick: a click gesture interprets presses (gtk-dnd-drag-threshold -> "stopped", n_press counting), and a drag past it lost its release -> the mouse finger never lifted
@@ -270,7 +279,7 @@ impl GtkWindow {
                 Some((t.time(), at.0, at.1))
             });
             let samples = input::motion_samples(earlier, current, s.pointer_time.get());
-            let stamps = s.monotonic(current.0, samples.iter().map(|m| m.0));
+            let stamps = s.monotonic("pointer motion", current.0, samples.iter().map(|m| m.0));
             for (sample, at) in samples.into_iter().zip(stamps) {
                 emit_at(&s, c, PointerPhase::Move, sample, at);
             }
@@ -302,7 +311,7 @@ impl GtkWindow {
                 dy,
                 s.pointer_at.get(),
                 scale_of(c),
-                s.stamp(c.current_event_time()),
+                s.stamp("scroll", c.current_event_time()),
             );
             s.on_event.call(|f| f(event));
             gtk4::glib::Propagation::Stop
@@ -310,7 +319,7 @@ impl GtkWindow {
         let s = Rc::clone(shared);
         scroll.connect_scroll_end(move |c| {
             if s.swiping.replace(false) {
-                let at = s.stamp(c.current_event_time());
+                let at = s.stamp("scroll end", c.current_event_time());
                 let event = input::swipe_end(s.pointer_at.get(), scale_of(c), at);
                 s.on_event.call(|f| f(event));
             }
@@ -334,7 +343,7 @@ impl GtkWindow {
             let sequence: *mut gdk::ffi::GdkEventSequence = event.event_sequence().to_glib_none().0;
             let id = s.touch_ids.borrow_mut().id(sequence as usize, phase);
             if let (Some(id), Some((x, y))) = (id, view_point(c, event)) {
-                let at = s.stamp(c.current_event_time());
+                let at = s.stamp("touch", c.current_event_time());
                 let event = input::touch(phase, id, x, y, scale_of(c), at);
                 s.on_event.call(|f| f(event));
             }
@@ -355,7 +364,9 @@ impl GtkWindow {
                     scroll: d.is_scroll_locked(),
                 })
                 .unwrap_or_default();
-            if let Some(event) = input::key(down, keycode, locks, s.stamp(c.current_event_time())) {
+            if let Some(event) =
+                input::key(down, keycode, locks, s.stamp("key", c.current_event_time()))
+            {
                 s.on_event.call(|f| f(event));
             }
         };
@@ -417,10 +428,10 @@ fn surface_to_view(view: &gtk4::Widget, (x, y): (f64, f64)) -> Option<(f64, f64)
     Some((f64::from(at.x()), f64::from(at.y())))
 }
 
-/// CLOCK_MONOTONIC now, ms: the base of published input times (`input::ClockMap`).
-fn monotonic_ms() -> i64 {
+/// CLOCK_MONOTONIC now, ns: the base of published input times (`input::ClockMap`).
+fn monotonic_ns() -> i64 {
     let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
-    now.tv_sec * 1000 + now.tv_nsec / 1_000_000
+    now.tv_sec * 1_000_000_000 + now.tv_nsec
 }
 
 /// The scale of the controller's `SceneView` (1 before it is attached).

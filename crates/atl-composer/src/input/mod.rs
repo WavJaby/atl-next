@@ -334,8 +334,6 @@ mod publish {
 
     /// The default display.
     const DISPLAY_ID: i32 = 0;
-    /// Event times are AOSP's ns, the platform's are ms.
-    const NANOS_PER_MS: i64 = 1_000_000;
     /// The channel's name in AOSP's logs.
     const CHANNEL: &str = "atl-headless-pointer";
 
@@ -356,8 +354,8 @@ mod publish {
             scan_code: k.scan_code,
             meta_state: k.meta_state,
             repeat_count: k.repeat_count,
-            down_time: i64::from(k.down_ms) * NANOS_PER_MS,
-            event_time: i64::from(k.time_ms) * NANOS_PER_MS,
+            down_time: k.down_ns,
+            event_time: k.time_ns,
         }
     }
 
@@ -383,8 +381,8 @@ mod publish {
             // a mouse hit-tests at the cursor (MotionEvent.getXDispatchLocation); its NaN check is `!=`, always true, so NaN hits no child
             x_cursor: m.cursor.x as f32,
             y_cursor: m.cursor.y as f32,
-            down_time: i64::from(m.down_ms) * NANOS_PER_MS,
-            event_time: i64::from(m.time_ms) * NANOS_PER_MS,
+            down_time: m.down_ns,
+            event_time: m.time_ns,
             pointers: m
                 .pointers
                 .iter()
@@ -706,12 +704,10 @@ mod publish {
                         let tx = tx.clone();
                         let run = move || {
                             for step in steps {
-                                // input times are CLOCK_MONOTONIC ms (PointerEvent::time_ms)
+                                // input times are CLOCK_MONOTONIC ns (PointerEvent::time_ns)
                                 let now =
                                     rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
-                                let time_ms =
-                                    u32::try_from(now.tv_sec * 1000 + now.tv_nsec / 1_000_000)
-                                        .unwrap_or(u32::MAX);
+                                let time_ns = now.tv_sec * 1_000_000_000 + now.tv_nsec;
                                 let event = match step {
                                     Step::Wait(d) => {
                                         thread::sleep(d);
@@ -721,7 +717,7 @@ mod publish {
                                         InputEvent::Pointer(PointerEvent {
                                             phase,
                                             position,
-                                            time_ms,
+                                            time_ns,
                                         })
                                     }
                                     Step::Focus(active) => InputEvent::Focus(active),
@@ -730,7 +726,7 @@ mod publish {
                                             down,
                                             scan_code,
                                             locks: Default::default(),
-                                            time_ms,
+                                            time_ns,
                                         })
                                     }
                                 };
@@ -801,8 +797,8 @@ mod publish {
                     axes: vec![(2, 0.0)],
                 }],
                 cursor: PhysPoint { x: 250.0, y: 300.0 },
-                down_ms: 5,
-                time_ms: 7,
+                down_ns: 5,
+                time_ns: 7,
             };
             // AMETA_SHIFT_ON | AMETA_SHIFT_LEFT_ON (android/input.h): the keyboard's meta state rides on the motion
             let m = motion(&m, 3, 0x41, (600, 390));
@@ -991,7 +987,7 @@ mod tests {
         let event = InputEvent::Pointer(PointerEvent {
             phase: PointerPhase::Move,
             position: PhysPoint { x: 1.0, y: 2.0 },
-            time_ms: 0,
+            time_ns: 0,
         });
         let source = HeadlessInput::default();
         source.inject(event);

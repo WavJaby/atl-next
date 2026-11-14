@@ -34,8 +34,8 @@ pub struct Key {
     pub scan_code: i32,
     pub meta_state: i32,
     pub repeat_count: i32,
-    pub down_ms: u32,
-    pub time_ms: u32,
+    pub down_ns: i64,
+    pub time_ns: i64,
     /// The device (input_devices).
     pub device_id: i32,
     pub source: i32,
@@ -46,7 +46,7 @@ pub struct Key {
 struct Held {
     scan_code: u32,
     key_code: i32,
-    down_ms: u32,
+    down_ns: i64,
     repeats: i32,
 }
 
@@ -56,7 +56,7 @@ pub struct Keys {
     meta: i32,
     held: Vec<Held>,
     /// The last key's time.
-    last_ms: u32,
+    last_ns: i64,
 }
 
 impl Keys {
@@ -72,20 +72,20 @@ impl Keys {
         map: impl Fn(u32) -> Option<i32>,
         update: impl Fn(i32, bool, i32) -> i32,
     ) -> Option<Key> {
-        self.last_ms = e.time_ms;
+        self.last_ns = e.time_ns;
         let held = self.held.iter().position(|h| h.scan_code == e.scan_code);
-        let (key_code, down_ms, repeat_count) = match (e.down, held) {
+        let (key_code, down_ns, repeat_count) = match (e.down, held) {
             (true, Some(i)) => {
                 let h = &mut self.held[i];
                 h.repeats += 1;
-                (h.key_code, h.down_ms, h.repeats)
+                (h.key_code, h.down_ns, h.repeats)
             }
             (true, None) => {
                 let key_code = map(e.scan_code).unwrap_or(KEYCODE_UNKNOWN);
                 self.held.push(Held {
                     scan_code: e.scan_code,
                     key_code,
-                    down_ms: e.time_ms,
+                    down_ns: e.time_ns,
                     repeats: 0,
                 });
                 self.meta = update(
@@ -93,7 +93,7 @@ impl Keys {
                     true,
                     (self.meta & !META_LOCKS) | lock_bits(e.locks),
                 );
-                (key_code, e.time_ms, 0)
+                (key_code, e.time_ns, 0)
             }
             (false, Some(i)) => {
                 let h = self.held.remove(i);
@@ -102,7 +102,7 @@ impl Keys {
                     false,
                     (self.meta & !META_LOCKS) | lock_bits(e.locks),
                 );
-                (h.key_code, h.down_ms, 0)
+                (h.key_code, h.down_ns, 0)
             }
             // a release whose press this window never saw (pressed before focus): nothing to end
             (false, None) => return None,
@@ -119,8 +119,8 @@ impl Keys {
             scan_code: i32::try_from(e.scan_code).unwrap_or(i32::MAX),
             meta_state: self.meta,
             repeat_count,
-            down_ms,
-            time_ms: e.time_ms,
+            down_ns,
+            time_ns: e.time_ns,
             device_id: KEYBOARD,
             source: SOURCE_KEYBOARD,
         })
@@ -128,7 +128,7 @@ impl Keys {
 
     /// The window lost focus: an ACTION_UP with FLAG_CANCELED for each held key, in press order, at the last key's time (the focus event carries none); nothing stays held.
     pub fn cancel(&mut self, update: impl Fn(i32, bool, i32) -> i32) -> Vec<Key> {
-        let time_ms = self.last_ms;
+        let time_ns = self.last_ns;
         let held = std::mem::take(&mut self.held);
         held.into_iter()
             .map(|h| {
@@ -140,8 +140,8 @@ impl Keys {
                     scan_code: i32::try_from(h.scan_code).unwrap_or(i32::MAX),
                     meta_state: self.meta,
                     repeat_count: 0,
-                    down_ms: h.down_ms,
-                    time_ms,
+                    down_ns: h.down_ns,
+                    time_ns,
                     device_id: KEYBOARD,
                     source: SOURCE_KEYBOARD,
                 }
@@ -177,12 +177,12 @@ mod tests {
         if down { old | 0x41 } else { old & !0x41 }
     }
 
-    fn ev(down: bool, scan_code: u32, time_ms: u32) -> KeyEvent {
+    fn ev(down: bool, scan_code: u32, time_ns: i64) -> KeyEvent {
         KeyEvent {
             down,
             scan_code,
             locks: Locks::default(),
-            time_ms,
+            time_ns,
         }
     }
 
@@ -202,7 +202,7 @@ mod tests {
         );
         k.translate(ev(false, 42, 3), map, update).unwrap();
         let up = k.translate(ev(false, 30, 4), map, update).unwrap();
-        assert_eq!((up.action, up.meta_state, up.down_ms), (ACTION_UP, 0, 2));
+        assert_eq!((up.action, up.meta_state, up.down_ns), (ACTION_UP, 0, 2));
     }
 
     #[test]
@@ -212,7 +212,7 @@ mod tests {
         let r1 = k.translate(ev(true, 30, 610), map, update).unwrap();
         let r2 = k.translate(ev(true, 30, 650), map, update).unwrap();
         assert_eq!(
-            (r1.repeat_count, r1.flags, r1.down_ms),
+            (r1.repeat_count, r1.flags, r1.down_ns),
             (1, FLAG_FROM_SYSTEM | FLAG_LONG_PRESS, 10)
         );
         assert_eq!((r2.repeat_count, r2.flags), (2, FLAG_FROM_SYSTEM));
@@ -250,7 +250,7 @@ mod tests {
         assert_eq!(c.iter().map(|c| c.key_code).collect::<Vec<_>>(), [59, 29]);
         assert!(
             c.iter()
-                .all(|c| c.action == ACTION_UP && c.flags & FLAG_CANCELED != 0 && c.time_ms == 2)
+                .all(|c| c.action == ACTION_UP && c.flags & FLAG_CANCELED != 0 && c.time_ns == 2)
         );
         assert_eq!(c[1].meta_state, 0);
         assert!(k.cancel(update).is_empty());

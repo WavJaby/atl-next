@@ -32,7 +32,7 @@ const NO_CURSOR: PhysPoint = PhysPoint {
 #[derive(Debug, Default)]
 pub struct Touch {
     contacts: Vec<(u32, PhysPoint)>,
-    down_ms: u32,
+    down_ns: i64,
 }
 
 impl Touch {
@@ -41,7 +41,7 @@ impl Touch {
         !self.contacts.is_empty()
     }
 
-    fn motion(&self, action: i32, flags: i32, time_ms: u32) -> Motion {
+    fn motion(&self, action: i32, flags: i32, time_ns: i64) -> Motion {
         Motion {
             device_id: TOUCHSCREEN,
             action,
@@ -61,14 +61,14 @@ impl Touch {
                 })
                 .collect(),
             cursor: NO_CURSOR,
-            down_ms: self.down_ms,
-            time_ms,
+            down_ns: self.down_ns,
+            time_ns,
         }
     }
 
     /// The MotionEvents of `e` (none for a contact this gesture does not hold, or a second Down of a held one).
     pub fn translate(&mut self, e: TouchEvent) -> Vec<Motion> {
-        let t = e.time_ms;
+        let t = e.time_ns;
         let index = self.contacts.iter().position(|c| c.0 == e.id);
         let shifted = |i: usize| (i as i32) << ACTION_POINTER_INDEX_SHIFT;
         match (e.phase, index) {
@@ -76,7 +76,7 @@ impl Touch {
                 let i = self.contacts.partition_point(|c| c.0 < e.id);
                 self.contacts.insert(i, (e.id, e.position));
                 if self.contacts.len() == 1 {
-                    self.down_ms = t;
+                    self.down_ns = t;
                     vec![self.motion(ACTION_DOWN, 0, t)]
                 } else {
                     vec![self.motion(ACTION_POINTER_DOWN | shifted(i), 0, t)]
@@ -127,7 +127,7 @@ impl MouseFinger {
                 phase,
                 id: MOUSE_FINGER_ID,
                 position: p.position,
-                time_ms: p.time_ms,
+                time_ns: p.time_ns,
             })
         };
         match p.phase {
@@ -155,11 +155,11 @@ impl MouseFinger {
 mod tests {
     use super::*;
 
-    fn mouse(phase: PointerPhase, t: u32) -> InputEvent {
+    fn mouse(phase: PointerPhase, t: i64) -> InputEvent {
         InputEvent::Pointer(PointerEvent {
             phase,
             position: PhysPoint { x: 7.0, y: 9.0 },
-            time_ms: t,
+            time_ns: t,
         })
     }
 
@@ -210,12 +210,12 @@ mod tests {
         ));
     }
 
-    fn ev(phase: TouchPhase, id: u32, x: f64, t: u32) -> TouchEvent {
+    fn ev(phase: TouchPhase, id: u32, x: f64, t: i64) -> TouchEvent {
         TouchEvent {
             phase,
             id,
             position: PhysPoint { x, y: 50.0 },
-            time_ms: t,
+            time_ns: t,
         }
     }
 
@@ -236,7 +236,7 @@ mod tests {
         assert!(d[0].cursor.x.is_nan());
         let pd = t.translate(ev(TouchPhase::Down, 1, 20.0, 2));
         assert_eq!(
-            (pd[0].action, ids(&pd[0]), pd[0].down_ms),
+            (pd[0].action, ids(&pd[0]), pd[0].down_ns),
             (261, vec![0, 1], 1)
         );
         let mv = t.translate(ev(TouchPhase::Move, 1, 25.0, 3));

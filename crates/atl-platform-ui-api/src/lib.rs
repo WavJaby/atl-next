@@ -333,8 +333,8 @@ pub struct PointerEvent {
     pub phase: PointerPhase,
     /// Where, in physical pixels of the window content.
     pub position: PhysPoint,
-    /// Event time in milliseconds of CLOCK_MONOTONIC, the base Android stamps input with (SystemClock.uptimeMillis); a backend translates its toolkit's clock (a compositor's own base) onto it.
-    pub time_ms: u32,
+    /// Event time in nanoseconds of CLOCK_MONOTONIC, the base and unit of AOSP's MotionEvent/KeyEvent times (InputMessage eventTime, SystemClock.uptimeNanos); a backend translates its toolkit's clock (a compositor's own base) onto it.
+    pub time_ns: i64,
 }
 
 /// What a scroll did. Deltas follow the toolkit's convention: positive scrolls toward the end of the content (down, right); the compositor has already applied the desktop's natural-scrolling setting.
@@ -367,8 +367,8 @@ pub struct ScrollEvent {
     pub kind: ScrollKind,
     /// The pointer position, in physical pixels of the window content.
     pub position: PhysPoint,
-    /// Event time in milliseconds of CLOCK_MONOTONIC (as [`PointerEvent::time_ms`]).
-    pub time_ms: u32,
+    /// Event time in nanoseconds of CLOCK_MONOTONIC (as [`PointerEvent::time_ns`]).
+    pub time_ns: i64,
 }
 
 /// What a touch contact did.
@@ -395,8 +395,8 @@ pub struct TouchEvent {
     pub id: u32,
     /// Where, in physical pixels of the window content.
     pub position: PhysPoint,
-    /// Event time in milliseconds of CLOCK_MONOTONIC (as [`PointerEvent::time_ms`]).
-    pub time_ms: u32,
+    /// Event time in nanoseconds of CLOCK_MONOTONIC (as [`PointerEvent::time_ns`]).
+    pub time_ns: i64,
 }
 
 /// One physical key press or release of the window's keyboard. No keysym or text: characters come from the Android key map, composed text from `TextInput`.
@@ -409,8 +409,8 @@ pub struct KeyEvent {
     pub scan_code: u32,
     /// The keyboard's lock states at this event.
     pub locks: Locks,
-    /// Event time in milliseconds of CLOCK_MONOTONIC (as [`PointerEvent::time_ms`]).
-    pub time_ms: u32,
+    /// Event time in nanoseconds of CLOCK_MONOTONIC (as [`PointerEvent::time_ns`]).
+    pub time_ns: i64,
 }
 
 /// Lock states of a keyboard.

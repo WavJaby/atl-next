@@ -91,8 +91,8 @@ pub fn button_keys(motions: &[Motion], meta_state: i32) -> (Vec<Key>, Vec<Key>) 
             scan_code: 0,
             meta_state,
             repeat_count: 0,
-            down_ms: m.time_ms,
-            time_ms: m.time_ms,
+            down_ns: m.time_ns,
+            time_ns: m.time_ns,
             device_id: m.device_id,
             source: m.source,
         });
@@ -110,7 +110,7 @@ pub struct MotionPointer {
     pub axes: Vec<(i32, f32)>,
 }
 
-/// One MotionEvent, before the publisher numbers it. Positions are physical pixels of the window content; times are the platform's ms.
+/// One MotionEvent, before the publisher numbers it. Positions are physical pixels of the window content; times are CLOCK_MONOTONIC ns (InputMessage eventTime).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Motion {
     /// The device (atl-services input_devices).
@@ -125,8 +125,8 @@ pub struct Motion {
     pub pointers: Vec<MotionPointer>,
     /// The cursor position, where a mouse-source event hit-tests (MotionEvent.getXDispatchLocation); NaN (AMOTION_EVENT_INVALID_CURSOR_POSITION) for a touchscreen, which hit-tests at its pointer.
     pub cursor: PhysPoint,
-    pub down_ms: u32,
-    pub time_ms: u32,
+    pub down_ns: i64,
+    pub time_ns: i64,
 }
 
 impl Motion {
@@ -139,7 +139,7 @@ impl Motion {
 /// The fake finger of an open touchpad swipe.
 #[derive(Clone, Copy, Debug)]
 struct Swipe {
-    down_ms: u32,
+    down_ns: i64,
     finger: PhysPoint,
 }
 
@@ -148,7 +148,7 @@ struct Swipe {
 pub struct Pointer {
     buttons: i32,
     hovering: bool,
-    down_ms: u32,
+    down_ns: i64,
     at: Option<PhysPoint>,
     swipe: Option<Swipe>,
 }
@@ -165,7 +165,7 @@ impl Pointer {
         action_button: i32,
         at: PhysPoint,
         axes: Vec<(i32, f32)>,
-        time_ms: u32,
+        time_ns: i64,
     ) -> Motion {
         let in_gesture = self.buttons & PRESS_BUTTONS != 0 || action == ACTION_UP;
         Motion {
@@ -183,8 +183,8 @@ impl Pointer {
                 axes,
             }],
             cursor: at,
-            down_ms: if in_gesture { self.down_ms } else { time_ms },
-            time_ms,
+            down_ns: if in_gesture { self.down_ns } else { time_ns },
+            time_ns,
         }
     }
 
@@ -194,7 +194,7 @@ impl Pointer {
         swipe: Swipe,
         cursor: PhysPoint,
         axes: Vec<(i32, f32)>,
-        time_ms: u32,
+        time_ns: i64,
     ) -> Motion {
         Motion {
             // the touchpad's own gesture: GestureConverter reports its device's id
@@ -212,20 +212,20 @@ impl Pointer {
                 axes,
             }],
             cursor,
-            down_ms: swipe.down_ms,
-            time_ms,
+            down_ns: swipe.down_ns,
+            time_ns,
         }
     }
 
     /// Ends the hover (HOVER_EXIT) when one is going.
-    fn exit_hover(&mut self, out: &mut Vec<Motion>, at: PhysPoint, time_ms: u32) {
+    fn exit_hover(&mut self, out: &mut Vec<Motion>, at: PhysPoint, time_ns: i64) {
         if std::mem::take(&mut self.hovering) {
-            out.push(self.mouse(ACTION_HOVER_EXIT, 0, at, Vec::new(), time_ms));
+            out.push(self.mouse(ACTION_HOVER_EXIT, 0, at, Vec::new(), time_ns));
         }
     }
 
     /// Lifts the swipe's fake finger (UP, pressure 0) when one is down.
-    fn end_swipe(&mut self, out: &mut Vec<Motion>, time_ms: u32) {
+    fn end_swipe(&mut self, out: &mut Vec<Motion>, time_ns: i64) {
         if let Some(swipe) = self.swipe.take() {
             let cursor = self.at.unwrap_or(swipe.finger);
             out.push(self.finger(
@@ -233,7 +233,7 @@ impl Pointer {
                 swipe,
                 cursor,
                 vec![(AXIS_PRESSURE, 0.0)],
-                time_ms,
+                time_ns,
             ));
         }
     }
@@ -243,7 +243,7 @@ impl Pointer {
         let mut out = Vec::new();
         match event {
             InputEvent::Pointer(e) => {
-                let t = e.time_ms;
+                let t = e.time_ns;
                 match e.phase {
                     PointerPhase::Enter | PointerPhase::Move
                         if self.buttons & PRESS_BUTTONS != 0 =>
@@ -283,7 +283,7 @@ impl Pointer {
                         let starts = bit & PRESS_BUTTONS != 0 && self.buttons & PRESS_BUTTONS == 0;
                         self.buttons |= bit;
                         if starts {
-                            self.down_ms = t;
+                            self.down_ns = t;
                             out.push(self.mouse(ACTION_DOWN, 0, e.position, Vec::new(), t));
                         }
                         out.push(self.mouse(ACTION_BUTTON_PRESS, bit, e.position, Vec::new(), t));
@@ -303,7 +303,7 @@ impl Pointer {
                 }
             }
             InputEvent::Scroll(e) => {
-                let t = e.time_ms;
+                let t = e.time_ns;
                 match e.kind {
                     ScrollKind::Wheel { dx, dy } => {
                         self.at = Some(e.position);
@@ -320,7 +320,7 @@ impl Pointer {
                             None => {
                                 self.exit_hover(&mut out, cursor, t);
                                 let swipe = Swipe {
-                                    down_ms: t,
+                                    down_ns: t,
                                     finger: cursor,
                                 };
                                 out.push(self.finger(
@@ -363,19 +363,19 @@ mod tests {
 
     const P: PhysPoint = PhysPoint { x: 100.0, y: 200.0 };
 
-    fn pointer(phase: PointerPhase, t: u32) -> InputEvent {
+    fn pointer(phase: PointerPhase, t: i64) -> InputEvent {
         InputEvent::Pointer(PointerEvent {
             phase,
             position: P,
-            time_ms: t,
+            time_ns: t,
         })
     }
 
-    fn scroll(kind: ScrollKind, t: u32) -> InputEvent {
+    fn scroll(kind: ScrollKind, t: i64) -> InputEvent {
         InputEvent::Scroll(ScrollEvent {
             kind,
             position: P,
-            time_ms: t,
+            time_ns: t,
         })
     }
 
@@ -407,7 +407,7 @@ mod tests {
         let up = p.translate(pointer(PointerPhase::Up(PointerButton::Primary), 5));
         assert_eq!(up.iter().map(|m| m.action).collect::<Vec<_>>(), [12, 1]);
         assert_eq!(
-            (up[0].action_button, up[1].button_state, up[1].down_ms),
+            (up[0].action_button, up[1].button_state, up[1].down_ns),
             (1, 0, 3)
         );
         assert_eq!(actions(&mut p, pointer(PointerPhase::Move, 6)), [9, 7]);
@@ -587,7 +587,7 @@ mod tests {
         // a pointer move during the swipe is no hover
         assert!(p.translate(pointer(PointerPhase::Move, 3)).is_empty());
         let up = p.translate(scroll(ScrollKind::SwipeEnd, 4));
-        assert_eq!((up.len(), up[0].action, up[0].down_ms), (1, 1, 2));
+        assert_eq!((up.len(), up[0].action, up[0].down_ns), (1, 1, 2));
         assert_eq!(up[0].first().at, PhysPoint { x: 100.0, y: 190.0 });
         assert_eq!(up[0].first().axes, vec![(2, 0.0)]);
         assert!(!p.in_gesture());

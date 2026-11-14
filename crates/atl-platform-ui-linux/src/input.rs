@@ -17,14 +17,14 @@ pub fn button(number: u32) -> PointerButton {
 }
 
 /// The event for a pointer at (`x`, `y`) logical pixels of the content widget.
-pub fn pointer(phase: PointerPhase, x: f64, y: f64, scale: Scale, time_ms: u32) -> InputEvent {
+pub fn pointer(phase: PointerPhase, x: f64, y: f64, scale: Scale, time_ns: i64) -> InputEvent {
     InputEvent::Pointer(PointerEvent {
         phase,
         position: PhysPoint {
             x: scale.to_physical(x),
             y: scale.to_physical(y),
         },
-        time_ms,
+        time_ns,
     })
 }
 
@@ -56,22 +56,32 @@ pub fn motion_samples(
 /// 1 s: far above a frame-clock-coalesced delay (one frame, ~16 ms) or a busy main loop, far below the minutes-to-hours gap of a foreign clock base.
 const MAX_DELIVERY_MS: i64 = 1000;
 
-/// Toolkit event time -> CLOCK_MONOTONIC ms, the base AOSP stamps MotionEvent/KeyEvent with (evdev timestamps, SystemClock.uptimeMillis); InputConsumer resampling and app-side deltas compare against it.
+/// The toolkit time of an event that carries none: `GDK_CURRENT_TIME` (0), which GDK gives events whose Wayland message has no time (wl_pointer.enter/leave, keyboard focus) and events it synthesizes.
+/// Read as a real time it means "happened at toolkit 0" -> bound = now, a jump of the whole compositor base -> relearn, and the next timed event shrinks back (owner WSLg run: the INFO line fired 67 times, one base rising with guest uptime ~+41.3e6 ms, i.e. t = 0).
+pub const UNTIMED: u32 = 0;
+
+const NANOS_PER_MS: i64 = 1_000_000;
+
+/// Toolkit event time -> CLOCK_MONOTONIC ns, the base and unit AOSP stamps MotionEvent/KeyEvent with (evdev timestamps, SystemClock.uptimeNanos); InputConsumer resampling and app-side deltas compare against it.
 /// Wayland event times are the compositor's own ms clock with an unspecified base: WSLg's Weston ran 3,603,968 s (~41.7 days) ahead of the guest's monotonic clock (owner run tr-play-m4), a nested compositor on the same kernel matches it.
 /// The offset (monotonic - toolkit) is learned per seat from receipt times: every event arrives after it happened, so the tightest bound is the smallest `now - t` seen; it only shrinks, which keeps the compositor's spacing between samples.
-/// Output never lies after `now` and never goes backwards; a jump of the toolkit clock (bound exceeded by [`MAX_DELIVERY_MS`]) relearns.
+/// Output never lies after `now` and never goes backwards; a jump of the toolkit clock (bound exceeded by [`MAX_DELIVERY_MS`]) relearns. An [`UNTIMED`] event teaches nothing and is stamped at receipt.
+/// Output is i64 ns: AOSP's unit, no wrap (u32 ms wrapped after 49.7 days of uptime).
 #[derive(Debug, Default)]
 pub struct ClockMap {
-    /// monotonic - toolkit ms; None before the first event.
+    /// monotonic - toolkit ms; None before the first timed event.
     offset: Option<i64>,
-    /// Last time handed out (monotonic ms).
+    /// Last time handed out (monotonic ns).
     last: i64,
 }
 
 impl ClockMap {
-    /// Learns from an event of toolkit time `t` received at monotonic `now` (ms); returns the offset when it was (re)learned, for a log line.
+    /// Learns from an event of toolkit time `t` (ms) received at monotonic `now` (ns); returns the offset (ms) when it was (re)learned, for a log line.
     pub fn learn(&mut self, t: u32, now: i64) -> Option<i64> {
-        let bound = now - i64::from(t);
+        if t == UNTIMED {
+            return None;
+        }
+        let bound = now.div_euclid(NANOS_PER_MS) - i64::from(t);
         match self.offset {
             Some(o) if bound <= o => {
                 self.offset = Some(bound);
@@ -85,15 +95,16 @@ impl ClockMap {
         }
     }
 
-    /// `t` on CLOCK_MONOTONIC, clamped to (last handed out ..= `now`); `now` itself before anything was learned.
-    pub fn map(&mut self, t: u32, now: i64) -> u32 {
+    /// `t` (toolkit ms) on CLOCK_MONOTONIC ns, clamped to (last handed out ..= `now`); `now` itself for an untimed event or before anything was learned.
+    pub fn map(&mut self, t: u32, now: i64) -> i64 {
         let at = self
             .offset
-            .map_or(now, |o| i64::from(t) + o)
+            .filter(|_| t != UNTIMED)
+            .map_or(now, |o| (i64::from(t) + o) * NANOS_PER_MS)
             .min(now)
             .max(self.last);
         self.last = at;
-        u32::try_from(at).unwrap_or(u32::MAX)
+        at
     }
 }
 
@@ -113,7 +124,7 @@ pub fn scroll(
     dy: f64,
     at: (f64, f64),
     scale: Scale,
-    time_ms: u32,
+    time_ns: i64,
 ) -> InputEvent {
     let kind = match unit {
         ScrollUnit::Wheel => ScrollKind::Wheel { dx, dy },
@@ -125,16 +136,16 @@ pub fn scroll(
     InputEvent::Scroll(ScrollEvent {
         kind,
         position: physical(at, scale),
-        time_ms,
+        time_ns,
     })
 }
 
 /// The end of a swipe (the fingers lifted) with the pointer at `at`.
-pub fn swipe_end(at: (f64, f64), scale: Scale, time_ms: u32) -> InputEvent {
+pub fn swipe_end(at: (f64, f64), scale: Scale, time_ns: i64) -> InputEvent {
     InputEvent::Scroll(ScrollEvent {
         kind: ScrollKind::SwipeEnd,
         position: physical(at, scale),
-        time_ms,
+        time_ns,
     })
 }
 
@@ -171,12 +182,12 @@ impl TouchIds {
 }
 
 /// The event for touch contact `id` at (`x`, `y`) logical pixels of the content widget.
-pub fn touch(phase: TouchPhase, id: u32, x: f64, y: f64, scale: Scale, time_ms: u32) -> InputEvent {
+pub fn touch(phase: TouchPhase, id: u32, x: f64, y: f64, scale: Scale, time_ns: i64) -> InputEvent {
     InputEvent::Touch(TouchEvent {
         phase,
         id,
         position: physical((x, y), scale),
-        time_ms,
+        time_ns,
     })
 }
 
@@ -184,13 +195,13 @@ pub fn touch(phase: TouchPhase, id: u32, x: f64, y: f64, scale: Scale, time_ms: 
 const XKB_EVDEV_OFFSET: u32 = 8;
 
 /// The key event of GDK hardware keycode `keycode` (xkb numbering); None for a code below the evdev offset (no linux key).
-pub fn key(down: bool, keycode: u32, locks: Locks, time_ms: u32) -> Option<InputEvent> {
+pub fn key(down: bool, keycode: u32, locks: Locks, time_ns: i64) -> Option<InputEvent> {
     let scan_code = keycode.checked_sub(XKB_EVDEV_OFFSET)?;
     Some(InputEvent::Key(KeyEvent {
         down,
         scan_code,
         locks,
-        time_ms,
+        time_ns,
     }))
 }
 
@@ -246,7 +257,7 @@ mod tests {
                 down: true,
                 scan_code: 30,
                 locks,
-                time_ms: 5
+                time_ns: 5
             }))
         );
         assert_eq!(key(false, 7, locks, 5), None);
@@ -262,7 +273,7 @@ mod tests {
             InputEvent::Pointer(PointerEvent {
                 phase: PointerPhase::Move,
                 position: PhysPoint { x: 15.0, y: 30.0 },
-                time_ms: 42,
+                time_ns: 42,
             })
         );
     }
@@ -276,7 +287,7 @@ mod tests {
             InputEvent::Scroll(ScrollEvent {
                 kind,
                 position: at,
-                time_ms: 9,
+                time_ns: 9,
             })
         };
         assert_eq!(
@@ -311,7 +322,7 @@ mod tests {
                 phase: TouchPhase::Move,
                 id: 1,
                 position: PhysPoint { x: 8.0, y: 10.0 },
-                time_ms: 3,
+                time_ns: 3,
             })
         );
     }
@@ -382,38 +393,75 @@ mod tests {
     fn toolkit_time_maps_onto_monotonic() {
         // receipt of the logged event, monotonic ms: 39442483 + (1794644852296 - 1794644772739)
         let now = 39_442_483 + (1_794_644_852_296 - 1_794_644_772_739);
+        let ns = |ms: i64| ms * NANOS_PER_MS;
         let t: u32 = 3_643_489_863;
         let mut clock = ClockMap::default();
-        assert_eq!(clock.learn(t, now), Some(now - i64::from(t)));
+        assert_eq!(clock.learn(t, ns(now)), Some(now - i64::from(t)));
         // history 30 and 15 ms before, then the event itself: spacing kept, the event lands on receipt
-        let mapped: Vec<u32> = [t - 30, t - 15, t]
+        let mapped: Vec<i64> = [t - 30, t - 15, t]
             .iter()
-            .map(|&s| clock.map(s, now))
+            .map(|&s| clock.map(s, ns(now)))
             .collect();
-        let n = u32::try_from(now).expect("fits");
-        assert_eq!(mapped, vec![n - 30, n - 15, n]);
+        assert_eq!(mapped, vec![ns(now - 30), ns(now - 15), ns(now)]);
         // the toolkit base the old code passed through: 3643489863 - 39522040 = 3603967823 ms ahead
         assert_eq!(i64::from(t) - now, 3_603_967_823);
-        // next frame: 16 ms of toolkit time, received 20 ms later (4 ms delay) -> the 0-delay bound stays; event at n + 16
-        assert_eq!(clock.learn(t + 16, now + 20), None);
-        assert_eq!(clock.map(t + 16, now + 20), n + 16);
+        // next frame: 16 ms of toolkit time, received 20 ms later (4 ms delay) -> the 0-delay bound stays; event at now + 16
+        assert_eq!(clock.learn(t + 16, ns(now + 20)), None);
+        assert_eq!(clock.map(t + 16, ns(now + 20)), ns(now + 16));
         // received 10 ms after a 16 ms step would be in the future of an over-estimated offset: clamped to now, and the offset tightens
         let mut late_first = ClockMap::default();
-        late_first.learn(t, now + 8);
-        assert_eq!(late_first.map(t, now + 8), n + 8);
-        assert_eq!(late_first.learn(t + 16, now + 16), None);
-        assert_eq!(late_first.map(t + 16, now + 16), n + 16);
+        late_first.learn(t, ns(now + 8));
+        assert_eq!(late_first.map(t, ns(now + 8)), ns(now + 8));
+        assert_eq!(late_first.learn(t + 16, ns(now + 16)), None);
+        assert_eq!(late_first.map(t + 16, ns(now + 16)), ns(now + 16));
         // a sample older than one already handed out does not go backwards
-        assert_eq!(late_first.map(t, now + 16), n + 16);
+        assert_eq!(late_first.map(t, ns(now + 16)), ns(now + 16));
         // toolkit clock jumps back 1 h (compositor restart): bound grows by 3.6e6 > MAX_DELIVERY_MS -> relearned
         let jumped = t - 3_600_000;
         assert_eq!(
-            clock.learn(jumped, now + 40),
+            clock.learn(jumped, ns(now + 40)),
             Some(now + 40 - i64::from(jumped))
         );
-        assert_eq!(clock.map(jumped, now + 40), n + 40);
+        assert_eq!(clock.map(jumped, ns(now + 40)), ns(now + 40));
         // nothing learned -> receipt time
         assert_eq!(ClockMap::default().map(5, 1234), 1234);
+    }
+
+    /// The owner's WSLg run interleaved Weston-timed events (base ~-3603967703 ms) with untimed ones (GDK_CURRENT_TIME 0, logged as base +now, ~+41.3e6 ms rising).
+    /// Untimed events relearn nothing (no INFO storm), land at receipt, and the timed ones keep the Weston base and their 15 ms spacing; nothing goes backwards.
+    #[test]
+    fn untimed_events_do_not_relearn() {
+        let ns = |ms: i64| ms * NANOS_PER_MS;
+        // receipt of the first event, guest monotonic ms (~41.3e6, the untimed base of the owner run); the Weston base -3603967703 ms
+        let now: i64 = 41_300_000;
+        let weston = |at: i64| u32::try_from(at + 3_603_967_703).expect("u32 ms");
+        let mut clock = ClockMap::default();
+        let mut learned = Vec::new();
+        let mut out = Vec::new();
+        // 20 frames 15 ms apart, each received 2 ms late; after every frame an untimed event (enter/leave) 1 ms later
+        for i in 0..20 {
+            let at = now + 15 * i;
+            let t = weston(at);
+            learned.extend(clock.learn(t, ns(at + 2)));
+            out.push(clock.map(t, ns(at + 2)));
+            learned.extend(clock.learn(UNTIMED, ns(at + 3)));
+            let untimed = clock.map(UNTIMED, ns(at + 3));
+            assert_eq!(untimed, ns(at + 3));
+            out.push(untimed);
+        }
+        // one base learned: the first event's 2 ms-late bound
+        assert_eq!(learned, vec![-3_603_967_703 + 2]);
+        assert!(out.windows(2).all(|w| w[0] <= w[1]), "monotonic: {out:?}");
+        // a later timed frame keeps its toolkit spacing: 15 ms after the last timed one (offset learned 2 ms late -> each lands at receipt)
+        assert_eq!(out[38], ns(now + 15 * 19 + 2));
+        // untimed before anything was learned -> receipt, and teaches nothing
+        let mut fresh = ClockMap::default();
+        assert_eq!(fresh.learn(UNTIMED, ns(now)), None);
+        assert_eq!(fresh.map(UNTIMED, ns(now)), ns(now));
+        assert_eq!(
+            fresh.learn(weston(now), ns(now + 1)),
+            Some(-3_603_967_703 + 1)
+        );
     }
 
     #[test]
