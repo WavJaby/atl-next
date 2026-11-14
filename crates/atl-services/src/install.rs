@@ -195,6 +195,7 @@ impl Parsed {
             info,
             intents: installed.intents,
             libraries: installed.libraries,
+            force_queryable: installed.force_queryable,
             uid,
             instruction_set: isa,
             gl_driver,

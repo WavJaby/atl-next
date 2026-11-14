@@ -36,6 +36,8 @@ pub struct PackageRecord {
     pub info: PackageInfo,
     pub intents: Vec<ComponentIntents>,
     pub libraries: Vec<UsesLibrary>,
+    /// manifest `forceQueryable` (AndroidPackage.isForceQueryable); honoured for system packages only (`Packages::visible`)
+    pub force_queryable: bool,
     pub uid: u32,
     /// The instruction set the process runs (arches.toml row key): primaryCpuAbi's, else the device's first (InstructionSets.getPrimaryInstructionSet); zygote's `--instruction-set`.
     pub instruction_set: String,
@@ -227,11 +229,13 @@ impl Packages {
     }
 
     /// What `caller` may see of `package` (ComputerEngine shouldFilterApplication): a uid below the first application uid everything (AppsFilterImpl.shouldFilterApplication does not filter
-    /// them), an app its own package only (no <queries> yet).
+    /// them), an app its own package and every force-queryable one (no <queries> yet). Force-queryable = a system package whose manifest sets `forceQueryable` (AppsFilterImpl.addPackageInternal
+    /// :602-610; config_forceSystemPackagesQueryable and the device list are AOSP's defaults: false, empty).
     pub fn visible(&self, caller: u32, package: &str) -> Option<&PackageRecord> {
         let p = self.by_name(package)?;
         let own = permission::app_id(p.uid) == permission::app_id(caller);
-        (permission::sees_all_packages(caller) || own).then_some(p)
+        let force_queryable = p.force_queryable && p.app().flags & FLAG_SYSTEM != 0;
+        (permission::sees_all_packages(caller) || own || force_queryable).then_some(p)
     }
 }
 
@@ -634,6 +638,7 @@ pub mod fixture {
             },
             intents: Vec::new(),
             libraries: Vec::new(),
+            force_queryable: false,
             uid: 10_001,
             instruction_set: "x86_64".to_owned(),
             gl_driver: GlDriver::Native,
@@ -647,6 +652,29 @@ mod tests {
     use super::*;
     use atl_parcelables::android::os::Bundle;
     use std::sync::Arc;
+
+    /// An app sees another package only when it is system and force-queryable (AppsFilterImpl:607-608): both conditions, each alone is not enough.
+    #[test]
+    fn force_queryable_system_package_is_visible_to_apps() {
+        let app_uid = 10_002;
+        for (system, force, seen) in [
+            (true, true, true),
+            (true, false, false),
+            (false, true, false),
+        ] {
+            let mut r = record("org.provider");
+            r.force_queryable = force;
+            if let Some(a) = r.info.application_info.as_mut() {
+                a.flags = if system { FLAG_SYSTEM } else { 0 };
+            }
+            let packages = Packages::new(vec![r], BTreeMap::new());
+            assert_eq!(
+                packages.visible(app_uid, "org.provider").is_some(),
+                seen,
+                "system {system} force {force}"
+            );
+        }
+    }
 
     const INTERNET: &str = "android.permission.INTERNET";
     const POST_NOTIFICATIONS: &str = "android.permission.POST_NOTIFICATIONS";

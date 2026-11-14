@@ -81,16 +81,23 @@ public class Main extends Activity {
         return out.toString();
     }
 
-    /** The WebView line (app.rs WEBVIEW): WebSettings.getDefaultUserAgent, AdMob's first WebView call; `ua=<string>`, or `threw=` the throwable's class and each cause's, outermost first, joined by `<`. */
+    /**
+     * The WebView line (app.rs WEBVIEW): WebSettings.getDefaultUserAgent, AdMob's first WebView call; `ua=<string>`, or `threw=` the throwable's class and each cause's, outermost first, joined by `<`,
+     * then ` at=` the innermost one's top frame (class.method): for an unimplemented native it names the provider method reached.
+     */
     private String webView() {
         try {
             return "ua=" + android.webkit.WebSettings.getDefaultUserAgent(this);
         } catch (Throwable e) {
             StringBuilder out = new StringBuilder("threw=");
+            Throwable last = e;
             for (Throwable t = e; t != null; t = t.getCause()) {
                 if (t != e) out.append('<');
                 out.append(t.getClass().getName());
+                last = t;
             }
+            StackTraceElement[] frames = last.getStackTrace();
+            if (frames.length > 0) out.append(" at=").append(frames[0].getClassName()).append('.').append(frames[0].getMethodName());
             return out.toString();
         }
     }

@@ -160,11 +160,12 @@ const PROCESSES_WANT: &str = "count=1 own=1 uid=true name=true pkg=true importan
 /// Without the provider placed, AOSP: `webviewupdate`'s waitForAndGetProvider answers LIBLOAD_FAILED_LISTING_WEBVIEW_PACKAGES -> WebViewFactory.getWebViewContextAndSetProvider throws
 /// MissingWebViewPackageException, getProviderClass wraps it in AndroidRuntimeException, getProvider's catch (Exception) wraps that once more. Without the feature: UnsupportedOperationException
 /// alone (getProvider :345); without the service: asInterface(null)'s NullPointerException, wrapped once by getProvider (measured).
-/// With the provider placed the same chain stays until PackageManager shows the provider to apps (forceQueryable, webview plan W1b-2): getPackageInfo's NameNotFoundException is wrapped as
-/// MissingWebViewPackageException (WebViewFactory.java:520-521).
+/// With the provider placed and shown to apps (system + forceQueryable, Packages::visible): getProvider loads the provider APK's class loader (createApplicationContext), takes
+/// WebViewChromiumFactoryProviderForT (use_b_entry_point off) and its `create` returns the instance; getDefaultUserAgent then calls its `getStatics`, a native with no implementation until
+/// libatl_webview.so exists (webview plan W1c) -> UnsatisfiedLinkError, not wrapped (outside getProvider's catch). The frame proves `create` ran and names the entry class.
 const WEBVIEW: (&str, &str) = (
     "AtlTest: webview: ",
-    "threw=android.util.AndroidRuntimeException<android.util.AndroidRuntimeException<android.webkit.WebViewFactory$MissingWebViewPackageException",
+    "threw=java.lang.UnsatisfiedLinkError at=com.android.webview.chromium.WebViewChromiumFactoryProviderForT.getStatics",
 );
 /// Main.webViewPackage's line: WebView.getCurrentWebViewPackage (webviewupdate's getCurrentWebViewPackage, WebView.java:3128-3140) with the provider placed: the scanned
 /// `com.android.webview` with FLAG_SYSTEM (WebViewUpdateServiceImpl2.providerHasValidSignature accepts a system app). `null` = no valid provider.

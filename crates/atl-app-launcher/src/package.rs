@@ -242,7 +242,7 @@ impl Parsed {
         Ok(out)
     }
 
-    /// The `<uses-library>` frame: writeStringList of getUsesLibraries, then of getUsesOptionalLibraries, as PackageImpl.writeToParcel writes the two (:3202-3203).
+    /// The package-fields frame (installer_output documents it): the two `<uses-library>` lists, then isForceQueryable.
     fn libraries(&self, vm: &Vm, out: &mut Vec<u8>) -> Result<()> {
         let android_package = vm.find_class(c"com/android/server/pm/pkg/AndroidPackage")?;
         let parcel_class = vm.find_class(c"android/os/Parcel")?;
@@ -252,11 +252,15 @@ impl Parsed {
             c"(Ljava/util/List;)V",
             false,
         )?;
+        let write_bool = vm.method(parcel_class, c"writeBoolean", c"(Z)V", false)?;
         let mut lists = Vec::new();
         for getter in [c"getUsesLibraries", c"getUsesOptionalLibraries"] {
             let get = vm.method(android_package, getter, c"()Ljava/util/List;", false)?;
             lists.push(vm.call_object(self.pkg, get, &[], "AndroidPackage uses-library list")?);
         }
+        let force_queryable = vm.method(android_package, c"isForceQueryable", c"()Z", false)?;
+        let force_queryable =
+            vm.call_bool(self.pkg, force_queryable, "AndroidPackage.isForceQueryable")?;
         let bytes = marshal(vm, |parcel| {
             for list in &lists {
                 vm.call_void_with(
@@ -266,9 +270,16 @@ impl Parsed {
                     "Parcel.writeStringList",
                 )?;
             }
-            Ok(())
+            vm.call_void_with(
+                parcel,
+                write_bool,
+                &[JValue {
+                    z: force_queryable as u8,
+                }],
+                "Parcel.writeBoolean",
+            )
         })?;
-        write_frame(out, Kind::UsesLibraries, &bytes).context("frame")
+        write_frame(out, Kind::PackageFields, &bytes).context("frame")
     }
 
     /// One frame per component of `getter`'s list that has intent filters: `writeString(name)`, `writeTypedList(intents)`, as ParsedComponentImpl.writeToParcel writes those two fields.

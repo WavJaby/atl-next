@@ -34,6 +34,8 @@ pub struct Installed {
     pub intents: Vec<ComponentIntents>,
     /// required ones first, each list in manifest order
     pub libraries: Vec<UsesLibrary>,
+    /// manifest `forceQueryable` (AndroidPackage.isForceQueryable)
+    pub force_queryable: bool,
 }
 
 /// Why an output does not decode; `frame` is the frame's index.
@@ -58,8 +60,8 @@ pub enum DecodeError {
     SecondPackage {
         frame: usize,
     },
-    NoLibraries,
-    SecondLibraries {
+    NoPackageFields,
+    SecondPackageFields {
         frame: usize,
     },
     /// a uses-library list that is null or holds a null name
@@ -107,8 +109,8 @@ impl fmt::Display for DecodeError {
             DecodeError::SecondPackage { frame } => {
                 write!(f, "installer output: a second PackageInfo at frame {frame}")
             }
-            DecodeError::NoLibraries => write!(f, "installer output: no uses-library frame"),
-            DecodeError::SecondLibraries { frame } => {
+            DecodeError::NoPackageFields => write!(f, "installer output: no uses-library frame"),
+            DecodeError::SecondPackageFields { frame } => {
                 write!(
                     f,
                     "installer output: a second uses-library frame at frame {frame}"
@@ -138,7 +140,7 @@ impl std::error::Error for DecodeError {}
 pub fn decode(data: &[u8]) -> Result<Installed, DecodeError> {
     let frames = frames(data).map_err(DecodeError::Frame)?;
     let mut package = None;
-    let mut libraries = None;
+    let mut fields = None;
     let mut intents = Vec::new();
     for (frame, f) in frames.iter().enumerate() {
         let parcel = |status| parcel_error(frame, f.kind, status, Vec::new());
@@ -161,7 +163,7 @@ pub fn decode(data: &[u8]) -> Result<Installed, DecodeError> {
                     return Err(DecodeError::SecondPackage { frame });
                 }
             }
-            Value::Libraries(required, optional) => {
+            Value::Fields(required, optional, force_queryable) => {
                 let mut list = Vec::new();
                 for (names, required) in [(required, true), (optional, false)] {
                     for name in names.ok_or(DecodeError::NullInLibraries { frame })? {
@@ -169,8 +171,8 @@ pub fn decode(data: &[u8]) -> Result<Installed, DecodeError> {
                         list.push(UsesLibrary { name, required });
                     }
                 }
-                if libraries.replace(list).is_some() {
-                    return Err(DecodeError::SecondLibraries { frame });
+                if fields.replace((list, force_queryable)).is_some() {
+                    return Err(DecodeError::SecondPackageFields { frame });
                 }
             }
             Value::Intents(name, list) => {
@@ -191,7 +193,7 @@ pub fn decode(data: &[u8]) -> Result<Installed, DecodeError> {
         }
     }
     let package = package.ok_or(DecodeError::NoPackage)?;
-    let libraries = libraries.ok_or(DecodeError::NoLibraries)?;
+    let (libraries, force_queryable) = fields.ok_or(DecodeError::NoPackageFields)?;
     let intents = intents
         .into_iter()
         .map(|(frame, c)| {
@@ -210,6 +212,7 @@ pub fn decode(data: &[u8]) -> Result<Installed, DecodeError> {
         package,
         intents,
         libraries,
+        force_queryable,
     })
 }
 
@@ -218,7 +221,7 @@ type StringList = Option<Vec<Option<String>>>;
 enum Value {
     Package(Box<PackageInfo>),
     Intents(Option<String>, Vec<Option<ParsedIntentInfo>>),
-    Libraries(StringList, StringList),
+    Fields(StringList, StringList, bool),
 }
 
 fn read(p: &Parcel, kind: Kind) -> Result<Value, StatusCode> {
@@ -226,7 +229,7 @@ fn read(p: &Parcel, kind: Kind) -> Result<Value, StatusCode> {
     Ok(match kind {
         Kind::Package => Value::Package(Box::new(PackageInfo::from_parcel(b)?)),
         // Parcel.writeStringList: the count (-1 for null), then writeString per element -- the binder crate's Option<Vec<Option<String>>> layout
-        Kind::UsesLibraries => Value::Libraries(b.read()?, b.read()?),
+        Kind::PackageFields => Value::Fields(b.read()?, b.read()?, b.read()?),
         _ => {
             let name: Option<String> = b.read()?;
             let list = r_typed_list(b)?.ok_or(StatusCode::UNEXPECTED_NULL)?;
@@ -285,7 +288,7 @@ pub fn component_names(package: &PackageInfo, kind: Kind) -> Box<dyn Iterator<It
         Kind::ReceiverIntents => names(&package.receivers, |c| &c.component.item.name),
         Kind::ServiceIntents => names(&package.services, |c| &c.component.item.name),
         Kind::ProviderIntents => names(&package.providers, |c| &c.component.item.name),
-        Kind::Package | Kind::UsesLibraries => Box::new(std::iter::empty()),
+        Kind::Package | Kind::PackageFields => Box::new(std::iter::empty()),
     }
 }
 
@@ -319,19 +322,35 @@ mod tests {
         p.marshal().expect("marshal")
     }
 
-    /// A uses-library frame as the installer writes it: two string lists.
-    fn libraries_bytes(required: &[&str], optional: &[&str]) -> Vec<u8> {
+    /// A package-fields frame as the installer writes it: two string lists, then forceQueryable.
+    fn fields_bytes(required: &[&str], optional: &[&str], force_queryable: bool) -> Vec<u8> {
         let list = |v: &[&str]| Some(v.iter().map(|s| Some((*s).to_owned())).collect::<Vec<_>>());
         let mut p = Parcel::new();
         p.write(&list(required)).expect("required");
         p.write(&list(optional)).expect("optional");
+        p.write(&force_queryable).expect("forceQueryable");
         p.marshal().expect("marshal")
+    }
+
+    fn libraries_bytes(required: &[&str], optional: &[&str]) -> Vec<u8> {
+        fields_bytes(required, optional, false)
+    }
+
+    #[test]
+    fn decodes_force_queryable() {
+        for want in [false, true] {
+            let mut out = Vec::new();
+            write_frame(&mut out, Kind::Package, &package_bytes()).expect("frame");
+            write_frame(&mut out, Kind::PackageFields, &fields_bytes(&[], &[], want))
+                .expect("frame");
+            assert_eq!(decode(&out).expect("decode").force_queryable, want);
+        }
     }
 
     fn output(package: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         write_frame(&mut out, Kind::Package, package).expect("frame");
-        write_frame(&mut out, Kind::UsesLibraries, &libraries_bytes(&[], &[])).expect("frame");
+        write_frame(&mut out, Kind::PackageFields, &libraries_bytes(&[], &[])).expect("frame");
         out
     }
 
@@ -341,7 +360,7 @@ mod tests {
         write_frame(&mut out, Kind::Package, &package_bytes()).expect("frame");
         write_frame(
             &mut out,
-            Kind::UsesLibraries,
+            Kind::PackageFields,
             &libraries_bytes(&["a.req"], &["b.opt", "c.opt"]),
         )
         .expect("frame");
@@ -360,12 +379,12 @@ mod tests {
     fn missing_or_second_uses_libraries_is_refused() {
         let mut out = Vec::new();
         write_frame(&mut out, Kind::Package, &package_bytes()).expect("frame");
-        assert!(matches!(decode(&out), Err(DecodeError::NoLibraries)));
+        assert!(matches!(decode(&out), Err(DecodeError::NoPackageFields)));
         let mut out = output(&package_bytes());
-        write_frame(&mut out, Kind::UsesLibraries, &libraries_bytes(&[], &[])).expect("frame");
+        write_frame(&mut out, Kind::PackageFields, &libraries_bytes(&[], &[])).expect("frame");
         assert!(matches!(
             decode(&out),
-            Err(DecodeError::SecondLibraries { frame: 2 })
+            Err(DecodeError::SecondPackageFields { frame: 2 })
         ));
     }
 

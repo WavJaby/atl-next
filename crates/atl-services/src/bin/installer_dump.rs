@@ -117,7 +117,7 @@ fn lines(installed: &Installed) -> Result<Vec<String>> {
             Kind::ReceiverIntents => "receiver",
             Kind::ServiceIntents => "service",
             Kind::ProviderIntents => "provider",
-            Kind::Package | Kind::UsesLibraries => continue,
+            Kind::Package | Kind::PackageFields => continue,
         };
         for i in &c.intents {
             let f = i

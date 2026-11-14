@@ -4,7 +4,8 @@
 //!   PackageInfoUtils sets them from the package setting.
 //! - [`Kind::ActivityIntents`] .. [`Kind::ProviderIntents`], one per component with intent filters (PackageInfo carries none): the first and the intents fields of ParsedComponentImpl.writeToParcel
 //!   (frameworks/base core/java/com/android/internal/pm/pkg/component/ParsedComponentImpl.java:159-169): the class name as writeString, then writeTypedList of its ParsedIntentInfoImpl.
-//! - [`Kind::UsesLibraries`], once: the `<uses-library>` lists PackageInfo does not carry, as PackageImpl.writeToParcel writes them (:3202-3203): writeStringList of getUsesLibraries (required), then of getUsesOptionalLibraries.
+//! - [`Kind::PackageFields`], once: the AndroidPackage fields PackageInfo does not carry. The `<uses-library>` lists as PackageImpl.writeToParcel writes them (:3202-3203): writeStringList of
+//!   getUsesLibraries (required), then of getUsesOptionalLibraries; then writeBoolean of isForceQueryable (manifest `forceQueryable`, read by AppsFilterImpl for system packages).
 //!   No static or SDK library lists: no test row or fixture declares one.
 //!
 //! The frame layer only splits; atl-services decodes the parcels (`installed`).
@@ -20,7 +21,7 @@ pub enum Kind {
     ReceiverIntents = 3,
     ServiceIntents = 4,
     ProviderIntents = 5,
-    UsesLibraries = 6,
+    PackageFields = 6,
 }
 
 impl Kind {
@@ -30,7 +31,7 @@ impl Kind {
         Kind::ReceiverIntents,
         Kind::ServiceIntents,
         Kind::ProviderIntents,
-        Kind::UsesLibraries,
+        Kind::PackageFields,
     ];
 
     fn from_u32(v: u32) -> Option<Kind> {
