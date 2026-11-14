@@ -122,6 +122,16 @@ fn flag_or_row(flag: &Option<String>, root: &Path, row: &str) -> Result<String> 
     }
 }
 
+/// The converter's `-cc` / `-cxx`, for every converter run: the converter probes `-cxx` for libc++ (libcxxProvider) even in `-nb-exports` mode, and its default is the `clang++` on PATH, which need not be the deps.toml row (Debian: PATH clang++ = 19).
+fn compiler_args(args: &Args, root: &Path) -> Result<[String; 4]> {
+    Ok([
+        "-cc".to_owned(),
+        flag_or_row(&args.cc, root, "clang")?,
+        "-cxx".to_owned(),
+        flag_or_row(&args.cxx, root, "clang-cxx")?,
+    ])
+}
+
 /// The converter's flags for a cross host (`cross`: arches::cross_target): the target's clang triple, its fetched sysroot, its isa, its rust target and rustc features (arches::rustc_target_features) and the libc++ headers in that sysroot (atl_layout::libcxx_dir, the one derivation),
 /// and the build machine's row and pointer width (`build`: arches::build_machine), which the converter's build side (tools a build rule executes or loads) is compiled for. Empty for the build machine, whose compiler already targets it.
 fn cross_args(
@@ -392,6 +402,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         if let Some(file) = &isa_tiers_file {
             argv.extend(["-isa-tiers".to_owned(), path(file)]);
         }
+        argv.extend(compiler_args(args, root)?);
         argv.extend(
             [
                 "-arch",
@@ -402,10 +413,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 &arch_variant,
                 "-abi",
                 &abi,
-                "-cc",
-                &flag_or_row(&args.cc, root, "clang")?,
-                "-cxx",
-                &flag_or_row(&args.cxx, root, "clang-cxx")?,
                 "-ar",
                 &flag_or_row(&args.ar, root, "llvm")?,
                 "-omit",
@@ -694,6 +701,7 @@ fn native_bridge_flags(
             .arg("-llvm")
             .arg(llvm)
             .args(&side)
+            .args(compiler_args(args, root)?)
             .args(["-nb-exports", "libc_headers"]),
         "bp2ninja -nb-exports libc_headers",
     )?;
@@ -1918,6 +1926,32 @@ nope
         );
         // nothing missing -> nothing to do
         assert_eq!(run("\n", "\n", problems, &pinned), Default::default());
+    }
+
+    /// Every converter run (main graph and `-nb-exports`) takes `-cxx` from the clang-cxx row, never the converter's PATH `clang++` default; a flag overrides it.
+    #[test]
+    fn compiler_args_name_the_rows() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            native: Args,
+        }
+        let parse = |extra: &[&str]| {
+            let argv = [&["native", "--host", "x86_64"], extra, &["libfoo"]].concat();
+            <Cli as clap::Parser>::try_parse_from(argv).unwrap().native
+        };
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("repo root");
+        // expected = deps.toml rows clang / clang-cxx `binary`, read by hand from the table
+        assert_eq!(
+            compiler_args(&parse(&[]), root).expect("rows"),
+            ["-cc", "clang-19", "-cxx", "clang++-19"]
+        );
+        assert_eq!(
+            compiler_args(&parse(&["--cc", "c", "--cxx", "cxx"]), root).expect("flags"),
+            ["-cc", "c", "-cxx", "cxx"]
+        );
     }
 
     /// The converter gets `-launcher` only while the cache is on; `--no-compiler-cache` drops it and the clients' environment with it (the converter's ninja test shows the cc rule then runs the compiler directly).
