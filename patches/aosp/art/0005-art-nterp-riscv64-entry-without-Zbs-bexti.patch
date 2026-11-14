@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Sun, 15 Nov 2026 03:48:48 +0800
+Subject: [PATCH] art: nterp riscv64 entry without Zbs bexti
+
+The zero-arg fast path tested the static flag with bexti (Zbs); srli +
+andi 1 gives the same rd = (rs >> imm) & 1 in the base ISA.
+
+Licence of the patched file: Apache-2.0 (its AOSP header).
+
+Upstream-Status: Inappropriate [AOSP targets rv64gcv_zba_zbb_zbs]
+Patch-Reason: the riscv64 host target ISA has no Zbs (arches.toml [riscv64.host]; the test host lacks it), so the assembler rejects bexti and libart cannot link; the march is the target, not a build setting to widen, and nothing outside the source can replace the instruction
+---
+SPDX-License-Identifier: Apache-2.0
+ runtime/interpreter/mterp/riscv64/main.S | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/interpreter/mterp/riscv64/main.S b/runtime/interpreter/mterp/riscv64/main.S
+index 11428646adce5c0bf10a1d64cc715ee890cc0897..c3fec2f9e56f1ea8ce873c6af0b09dd433ec1ce0 100644
+--- a/runtime/interpreter/mterp/riscv64/main.S
++++ b/runtime/interpreter/mterp/riscv64/main.S
+@@ -486,8 +486,8 @@ OAT_ENTRY ExecuteNterpImpl
+ 
+    // Fast path: instance with zero args.
+ .Lentry_a1:
+-   bexti s10, s10, ART_METHOD_IS_STATIC_FLAG_BIT
+-                            // s10 := 1 if static, 0 if instance
++   srli s10, s10, ART_METHOD_IS_STATIC_FLAG_BIT
++   andi s10, s10, 1         // s10 := 1 if static, 0 if instance
+    bnez s10, .Lentry_shorty
+    sw a1, (t0)
+    sw a1, (t1)

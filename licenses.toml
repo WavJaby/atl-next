@@ -132,6 +132,10 @@ reason = "every file's header: \"Distributed under MIT license. See file LICENSE
 licence = "BSD-3-Clause OR GPL-2.0-only"
 reason = "the project's License file: \"SPDX-License-Identifier: BSD-3-Clause OR GPL-2.0-only\" for every file not stating otherwise; the libcap/ sources minijail links carry no notice, and Android.bp's license names three kinds"
 
+[upstream.aosp.paths."art/runtime/interpreter/mterp/riscv64/main.S"]
+licence = "Apache-2.0"
+reason = "the file's AOSP Apache-2.0 header sits inside the mterp template's `%def header():` block, which the notice scan does not read; art/runtime's Android.bp names two kinds, so the default cannot pick"
+
 [upstream.aosp.paths."external/mksh/src/"]
 licence = "MirOS"
 reason = "mirabilos' notice in each file (\"Provided that these terms and disclaimer and all copyright notices are retained ... permission is granted to deal in this work without restriction\"): the MirOS Licence (SPDX MirOS), which the phrase rules do not read"
