@@ -52,6 +52,51 @@ pub fn motion_samples(
     samples
 }
 
+/// Longest plausible delivery delay of an input event (ms): an event seeming later than this means the toolkit clock jumped (compositor restart, u32 wrap after 49.7 days) -> the offset is learned anew.
+/// 1 s: far above a frame-clock-coalesced delay (one frame, ~16 ms) or a busy main loop, far below the minutes-to-hours gap of a foreign clock base.
+const MAX_DELIVERY_MS: i64 = 1000;
+
+/// Toolkit event time -> CLOCK_MONOTONIC ms, the base AOSP stamps MotionEvent/KeyEvent with (evdev timestamps, SystemClock.uptimeMillis); InputConsumer resampling and app-side deltas compare against it.
+/// Wayland event times are the compositor's own ms clock with an unspecified base: WSLg's Weston ran 3,603,968 s (~41.7 days) ahead of the guest's monotonic clock (owner run tr-play-m4), a nested compositor on the same kernel matches it.
+/// The offset (monotonic - toolkit) is learned per seat from receipt times: every event arrives after it happened, so the tightest bound is the smallest `now - t` seen; it only shrinks, which keeps the compositor's spacing between samples.
+/// Output never lies after `now` and never goes backwards; a jump of the toolkit clock (bound exceeded by [`MAX_DELIVERY_MS`]) relearns.
+#[derive(Debug, Default)]
+pub struct ClockMap {
+    /// monotonic - toolkit ms; None before the first event.
+    offset: Option<i64>,
+    /// Last time handed out (monotonic ms).
+    last: i64,
+}
+
+impl ClockMap {
+    /// Learns from an event of toolkit time `t` received at monotonic `now` (ms); returns the offset when it was (re)learned, for a log line.
+    pub fn learn(&mut self, t: u32, now: i64) -> Option<i64> {
+        let bound = now - i64::from(t);
+        match self.offset {
+            Some(o) if bound <= o => {
+                self.offset = Some(bound);
+                None
+            }
+            Some(o) if bound - o <= MAX_DELIVERY_MS => None,
+            _ => {
+                self.offset = Some(bound);
+                Some(bound)
+            }
+        }
+    }
+
+    /// `t` on CLOCK_MONOTONIC, clamped to (last handed out ..= `now`); `now` itself before anything was learned.
+    pub fn map(&mut self, t: u32, now: i64) -> u32 {
+        let at = self
+            .offset
+            .map_or(now, |o| i64::from(t) + o)
+            .min(now)
+            .max(self.last);
+        self.last = at;
+        u32::try_from(at).unwrap_or(u32::MAX)
+    }
+}
+
 /// How a scroll's deltas count: GTK's `GdkScrollUnit`, the toolkit type kept out of this pure mapper.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScrollUnit {
@@ -329,6 +374,46 @@ mod tests {
             motion_samples([(30, 1.0, 1.0)], (40, 2.0, 2.0), Some(30)),
             vec![(40, 2.0, 2.0)]
         );
+    }
+
+    /// Owner run tr-play-m4: Weston stamped a touch at 3643489863 ms while the guest's CLOCK_MONOTONIC read ~39522 s (app log 39442.483 s at wall 1794644772.739, the event logged 79.557 s later) -> toolkit time 3,603,968 s (~41.7 days) ahead of monotonic.
+    /// A drag's samples 15 ms apart keep their spacing on the monotonic clock and end at or before receipt; a later event received sooner tightens the offset; a toolkit-clock jump relearns; nothing goes backwards.
+    #[test]
+    fn toolkit_time_maps_onto_monotonic() {
+        // receipt of the logged event, monotonic ms: 39442483 + (1794644852296 - 1794644772739)
+        let now = 39_442_483 + (1_794_644_852_296 - 1_794_644_772_739);
+        let t: u32 = 3_643_489_863;
+        let mut clock = ClockMap::default();
+        assert_eq!(clock.learn(t, now), Some(now - i64::from(t)));
+        // history 30 and 15 ms before, then the event itself: spacing kept, the event lands on receipt
+        let mapped: Vec<u32> = [t - 30, t - 15, t]
+            .iter()
+            .map(|&s| clock.map(s, now))
+            .collect();
+        let n = u32::try_from(now).expect("fits");
+        assert_eq!(mapped, vec![n - 30, n - 15, n]);
+        // the toolkit base the old code passed through: 3643489863 - 39522040 = 3603967823 ms ahead
+        assert_eq!(i64::from(t) - now, 3_603_967_823);
+        // next frame: 16 ms of toolkit time, received 20 ms later (4 ms delay) -> the 0-delay bound stays; event at n + 16
+        assert_eq!(clock.learn(t + 16, now + 20), None);
+        assert_eq!(clock.map(t + 16, now + 20), n + 16);
+        // received 10 ms after a 16 ms step would be in the future of an over-estimated offset: clamped to now, and the offset tightens
+        let mut late_first = ClockMap::default();
+        late_first.learn(t, now + 8);
+        assert_eq!(late_first.map(t, now + 8), n + 8);
+        assert_eq!(late_first.learn(t + 16, now + 16), None);
+        assert_eq!(late_first.map(t + 16, now + 16), n + 16);
+        // a sample older than one already handed out does not go backwards
+        assert_eq!(late_first.map(t, now + 16), n + 16);
+        // toolkit clock jumps back 1 h (compositor restart): bound grows by 3.6e6 > MAX_DELIVERY_MS -> relearned
+        let jumped = t - 3_600_000;
+        assert_eq!(
+            clock.learn(jumped, now + 40),
+            Some(now + 40 - i64::from(jumped))
+        );
+        assert_eq!(clock.map(jumped, now + 40), n + 40);
+        // nothing learned -> receipt time
+        assert_eq!(ClockMap::default().map(5, 1234), 1234);
     }
 
     #[test]

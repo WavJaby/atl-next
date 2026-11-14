@@ -320,7 +320,6 @@ mod publish {
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
     use std::thread;
-    use std::time::Instant;
 
     use crate::tilt::Tilt;
     use atl_libinput::{KeyEvent, KeyLayoutMap, MotionEvent, Pointer, Publisher};
@@ -650,7 +649,6 @@ mod publish {
         let source = HeadlessInput::default();
         let publish_state = Rc::clone(&state);
         source.on_events(move |event| publish(&publish_state, event));
-        let started = Instant::now();
         loop {
             let round = {
                 let windows = state.windows.borrow();
@@ -708,8 +706,12 @@ mod publish {
                         let tx = tx.clone();
                         let run = move || {
                             for step in steps {
-                                let time_ms = u32::try_from(started.elapsed().as_millis())
-                                    .unwrap_or(u32::MAX);
+                                // input times are CLOCK_MONOTONIC ms (PointerEvent::time_ms)
+                                let now =
+                                    rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+                                let time_ms =
+                                    u32::try_from(now.tv_sec * 1000 + now.tv_nsec / 1_000_000)
+                                        .unwrap_or(u32::MAX);
                                 let event = match step {
                                     Step::Wait(d) => {
                                         thread::sleep(d);

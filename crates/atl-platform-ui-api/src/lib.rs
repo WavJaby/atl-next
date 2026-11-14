@@ -333,7 +333,7 @@ pub struct PointerEvent {
     pub phase: PointerPhase,
     /// Where, in physical pixels of the window content.
     pub position: PhysPoint,
-    /// Event time in milliseconds on the toolkit's clock (the compositor's event timestamp).
+    /// Event time in milliseconds of CLOCK_MONOTONIC, the base Android stamps input with (SystemClock.uptimeMillis); a backend translates its toolkit's clock (a compositor's own base) onto it.
     pub time_ms: u32,
 }
 
@@ -367,7 +367,7 @@ pub struct ScrollEvent {
     pub kind: ScrollKind,
     /// The pointer position, in physical pixels of the window content.
     pub position: PhysPoint,
-    /// Event time in milliseconds on the toolkit's clock.
+    /// Event time in milliseconds of CLOCK_MONOTONIC (as [`PointerEvent::time_ms`]).
     pub time_ms: u32,
 }
 
@@ -395,7 +395,7 @@ pub struct TouchEvent {
     pub id: u32,
     /// Where, in physical pixels of the window content.
     pub position: PhysPoint,
-    /// Event time in milliseconds on the toolkit's clock.
+    /// Event time in milliseconds of CLOCK_MONOTONIC (as [`PointerEvent::time_ms`]).
     pub time_ms: u32,
 }
 
@@ -409,7 +409,7 @@ pub struct KeyEvent {
     pub scan_code: u32,
     /// The keyboard's lock states at this event.
     pub locks: Locks,
-    /// Event time in milliseconds on the toolkit's clock.
+    /// Event time in milliseconds of CLOCK_MONOTONIC (as [`PointerEvent::time_ms`]).
     pub time_ms: u32,
 }
 

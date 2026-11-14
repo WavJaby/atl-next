@@ -63,6 +63,8 @@ struct Shared {
     pointer_at: Cell<(f64, f64)>,
     /// Time (ms) of the last pointer event published: moves must come strictly after it (`input::motion_samples`).
     pointer_time: Cell<Option<u32>>,
+    /// Toolkit event times -> CLOCK_MONOTONIC: one compositor clock per seat, and a window sees one seat.
+    clock: RefCell<input::ClockMap>,
     /// A touchpad swipe is open: its end (GTK `scroll-end`) is reported; a wheel's is not.
     swiping: Cell<bool>,
     /// Contact ids of the touch sequences down.
@@ -80,6 +82,22 @@ struct Shared {
 }
 
 impl Shared {
+    /// Learns the toolkit clock from an event of toolkit time `t` received now; then maps `samples` (that event's own time included) onto CLOCK_MONOTONIC, oldest first.
+    fn monotonic(&self, t: u32, samples: impl IntoIterator<Item = u32>) -> Vec<u32> {
+        let now = monotonic_ms();
+        let mut clock = self.clock.borrow_mut();
+        if let Some(offset) = clock.learn(t, now) {
+            // once per clock base: headless shares the kernel's clock (offset ~0), WSLg's Weston does not
+            tracing::info!("atl-platform-ui: input clock: monotonic = toolkit {offset:+} ms");
+        }
+        samples.into_iter().map(|s| clock.map(s, now)).collect()
+    }
+
+    /// `t` (toolkit ms) of a single event on CLOCK_MONOTONIC.
+    fn stamp(&self, t: u32) -> u32 {
+        self.monotonic(t, [t])[0]
+    }
+
     /// After-paint of a frame that followed a present: the buffers that frame no longer shows go back, each with the reservation fences of its dma-buf as release fence (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE` for a write: every pending GPU read of it, by this paint or an earlier one; design §3.4).
     /// A driver that attaches no implicit fences (WSL: GSK on llvmpipe, which finishes rendering before the swap) yields an already-signalled fence.
     fn painted(&self) {
@@ -205,22 +223,20 @@ impl GtkWindow {
             x: f64,
             y: f64,
         ) {
-            emit_at(
-                shared,
-                controller,
-                phase,
-                (controller.current_event_time(), x, y),
-            );
+            let t = controller.current_event_time();
+            emit_at(shared, controller, phase, (t, x, y), shared.stamp(t));
         }
+        /// `sample` in toolkit time (kept for `motion_samples`), published at `monotonic_ms`.
         fn emit_at(
             shared: &Shared,
             controller: &impl IsA<gtk4::EventController>,
             phase: PointerPhase,
             (time_ms, x, y): input::Sample,
+            monotonic_ms: u32,
         ) {
             shared.pointer_at.set((x, y));
             shared.pointer_time.set(Some(time_ms));
-            let event = input::pointer(phase, x, y, scale_of(controller), time_ms);
+            let event = input::pointer(phase, x, y, scale_of(controller), monotonic_ms);
             shared.on_event.call(|f| f(event));
         }
         // raw wl_pointer buttons, not GestureClick: a click gesture interprets presses (gtk-dnd-drag-threshold -> "stopped", n_press counting), and a drag past it lost its release -> the mouse finger never lifted
@@ -253,8 +269,10 @@ impl GtkWindow {
                 let at = surface_to_view(view.as_ref()?, (axes[AXIS_X], axes[AXIS_Y]))?;
                 Some((t.time(), at.0, at.1))
             });
-            for sample in input::motion_samples(earlier, current, s.pointer_time.get()) {
-                emit_at(&s, c, PointerPhase::Move, sample);
+            let samples = input::motion_samples(earlier, current, s.pointer_time.get());
+            let stamps = s.monotonic(current.0, samples.iter().map(|m| m.0));
+            for (sample, at) in samples.into_iter().zip(stamps) {
+                emit_at(&s, c, PointerPhase::Move, sample, at);
             }
         });
         let s = Rc::clone(shared);
@@ -284,7 +302,7 @@ impl GtkWindow {
                 dy,
                 s.pointer_at.get(),
                 scale_of(c),
-                c.current_event_time(),
+                s.stamp(c.current_event_time()),
             );
             s.on_event.call(|f| f(event));
             gtk4::glib::Propagation::Stop
@@ -292,8 +310,8 @@ impl GtkWindow {
         let s = Rc::clone(shared);
         scroll.connect_scroll_end(move |c| {
             if s.swiping.replace(false) {
-                let event =
-                    input::swipe_end(s.pointer_at.get(), scale_of(c), c.current_event_time());
+                let at = s.stamp(c.current_event_time());
+                let event = input::swipe_end(s.pointer_at.get(), scale_of(c), at);
                 s.on_event.call(|f| f(event));
             }
         });
@@ -316,7 +334,8 @@ impl GtkWindow {
             let sequence: *mut gdk::ffi::GdkEventSequence = event.event_sequence().to_glib_none().0;
             let id = s.touch_ids.borrow_mut().id(sequence as usize, phase);
             if let (Some(id), Some((x, y))) = (id, view_point(c, event)) {
-                let event = input::touch(phase, id, x, y, scale_of(c), c.current_event_time());
+                let at = s.stamp(c.current_event_time());
+                let event = input::touch(phase, id, x, y, scale_of(c), at);
                 s.on_event.call(|f| f(event));
             }
             glib::Propagation::Stop
@@ -336,7 +355,7 @@ impl GtkWindow {
                     scroll: d.is_scroll_locked(),
                 })
                 .unwrap_or_default();
-            if let Some(event) = input::key(down, keycode, locks, c.current_event_time()) {
+            if let Some(event) = input::key(down, keycode, locks, s.stamp(c.current_event_time())) {
                 s.on_event.call(|f| f(event));
             }
         };
@@ -398,6 +417,12 @@ fn surface_to_view(view: &gtk4::Widget, (x, y): (f64, f64)) -> Option<(f64, f64)
     Some((f64::from(at.x()), f64::from(at.y())))
 }
 
+/// CLOCK_MONOTONIC now, ms: the base of published input times (`input::ClockMap`).
+fn monotonic_ms() -> i64 {
+    let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    now.tv_sec * 1000 + now.tv_nsec / 1_000_000
+}
+
 /// The scale of the controller's `SceneView` (1 before it is attached).
 fn scale_of(controller: &impl IsA<gtk4::EventController>) -> Scale {
     controller
@@ -427,6 +452,7 @@ impl Window for GtkWindow {
             on_resize: Slot::new(),
             pointer_at: Cell::new((0.0, 0.0)),
             pointer_time: Cell::new(None),
+            clock: RefCell::default(),
             swiping: Cell::new(false),
             touch_ids: RefCell::default(),
             on_monitor: Slot::new(),
