@@ -342,6 +342,69 @@ fn valid_ext_filename(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains(['\0', '/'])
 }
 
+/// The kernel log of a daemon whose libbase logs there (servicemanager: main.cpp `InitLogging(argv, KernelLogger)`, so every ALOG and LOG of it goes to the kernel log, among them the lookup
+/// of a name nobody serves, ServiceManager.cpp `tryStartService`, which atl-diag counts as `missing-service`). init's `file /dev/kmsg w` hands the daemon an fd in
+/// `ANDROID_FILE__dev_kmsg` (libbase logging.cpp `OpenKmsg`, any O_WRONLY fd); here that fd is the process's stderr, a pipe atld reads into `log` as logcat lines ([`kernel_line`]), stamped when
+/// read. Environment only, as init's is on Android: no servicemanager change.
+fn kernel_log_to_log(spawn: &mut Spawn, log: &Path) -> Result<()> {
+    let (reader, writer) = std::io::pipe().context("kernel log pipe")?;
+    let out = std::fs::OpenOptions::new().append(true).open(log)?;
+    spawn.stdout = writer.try_clone()?.into();
+    spawn.stderr = writer.into();
+    spawn
+        .env
+        .push(("ANDROID_FILE__dev_kmsg".into(), STDERR_FD.into()));
+    std::thread::Builder::new()
+        .name("kmsg".into())
+        .spawn(move || {
+            let mut out = out;
+            for line in BufReader::new(reader).lines() {
+                let Ok(line) = line else { break };
+                let _ = out.write_all(kernel_line(&line).as_bytes());
+            }
+        })
+        .context("kernel log thread")?;
+    Ok(())
+}
+
+/// stderr's fd number, the `ANDROID_FILE__dev_kmsg` value of [`kernel_log_to_log`].
+const STDERR_FD: &str = "2";
+
+/// One line of a [`kernel_log_to_log`] pipe: KernelLogLine's `<level>tag: message` (libbase logging.cpp) as a logcat line (atl-services-types `logcat::format`, source `kmsg`, pid 0: the pipe
+/// carries no sender), stamped now; any other line (the sandbox stub's, a crash's) kept as written.
+fn kernel_line(line: &str) -> String {
+    use atl_services_types::logcat::{self, Level, Record};
+    let parsed = line.strip_prefix('<').and_then(|rest| {
+        let (level, rest) = rest.split_once('>')?;
+        let (tag, message) = rest.split_once(": ")?;
+        Some((level.parse::<u8>().ok()?, tag, message))
+    });
+    let Some((level, tag, message)) = parsed else {
+        return format!("{line}\n");
+    };
+    // the inverse of KernelLogLine's kLogSeverityToKernelLogLevel: VERBOSE and DEBUG -> 7, INFO 6, WARNING 4, ERROR 3, FATAL 2
+    let level = match level {
+        7 => Level::Debug,
+        6 | 5 => Level::Info,
+        4 => Level::Warn,
+        3 => Level::Error,
+        _ => Level::Fatal,
+    };
+    logcat::format(&Record {
+        monotonic: logcat::monotonic_now(),
+        realtime: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default(),
+        pid: 0,
+        tid: 0,
+        source: "kmsg",
+        tag,
+        level,
+        location: None,
+        message,
+    })
+}
+
 /// The runtime root's layout.
 struct Root {
     root: PathBuf,
@@ -1527,15 +1590,9 @@ fn run(a: &Args) -> Result<ExitCode> {
             stderr,
         })
     };
-    let mut sm = broker
-        .spawn(system_spawn(
-            "servicemanager",
-            &a.servicemanager,
-            vec![],
-            true,
-            None,
-        )?)
-        .context("starting servicemanager")?;
+    let mut sm_spawn = system_spawn("servicemanager", &a.servicemanager, vec![], true, None)?;
+    kernel_log_to_log(&mut sm_spawn, &r.log("servicemanager"))?;
+    let mut sm = broker.spawn(sm_spawn).context("starting servicemanager")?;
     log(format_args!("servicemanager: host pid {}", sm.host_pid));
     // the guest cpuinfo before any app can start: the probe under the installed engine, with /system as apps see it
     let mut cpuinfo = BTreeMap::new();
@@ -2152,6 +2209,23 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// KernelLogLine's shape (`<6>` = INFO, libbase logging.cpp) becomes a stamped logcat line atl-diag reads; other lines pass unchanged.
+    #[test]
+    fn kernel_lines_become_logcat_lines() {
+        let l = kernel_line("<6>servicemanager: Caller(pid=9) Since 'x' could not be found");
+        assert!(
+            l.ends_with(" I kmsg/servicemanager: Caller(pid=9) Since 'x' could not be found\n"),
+            "{l}"
+        );
+        let stamp = l.split(' ').next().unwrap();
+        assert!(atl_diag::summary::parse_stamp(stamp).is_some(), "{l}");
+        assert!(kernel_line("<4>t: w").contains(" W kmsg/t: w"));
+        assert_eq!(
+            kernel_line("sandbox-stub: landlock abi=3"),
+            "sandbox-stub: landlock abi=3\n"
+        );
+    }
 
     /// A fresh dir holding `files` (each content = its name) and a `lib/` dir, under the system temp dir.
     fn staged(test: &str, files: &[&str]) -> PathBuf {

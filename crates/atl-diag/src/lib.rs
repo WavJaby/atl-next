@@ -5,7 +5,7 @@
 //! Log policy (owner 2026-11-14, M60 R2): a line at the first hit and at each power-of-two count, so a SIGKILLed process still leaves first-seen and a lower bound within 2x without flooding
 //! (50,708 hits of one key -> 16 lines); [`flush_totals`] writes the exact total per key on an orderly exit. Line shapes ([`summary`] parses them; outcome before api: an api may hold spaces, an
 //! outcome never does): `diag: first <outcome> <api> 1 at=<stamp>[ cause=<what>]`, `diag: count <outcome> <api> <n> at=<stamp>[ cause=<what>]`, `diag: total <outcome> <api> <n> first=<stamp>`.
-//! Outcomes: `unimplemented` (UNKNOWN_TRANSACTION), `exception:<NAME>`, `status:<NAME>`, `refused`, `refused-parcel`, `answered`, `sent`.
+//! Outcomes: `unimplemented` (UNKNOWN_TRANSACTION), `exception:<NAME>`, `status:<NAME>`, `refused`, `refused-parcel`, `answered`, `sent`; the parser adds `missing-service` from upstream lines.
 //! No dependencies (feature `serde` only for xtask's report): every converter-built AIDL crate, atl-parcelables and the services link the converter's one `libatl_diag` (bp2ninja aidlcrates.go
 //! `reply_hook`), so a process holds one map and one cause; a second copy linked by cargo would split them.
 
@@ -33,6 +33,8 @@ pub const REFUSED: &str = "refused";
 pub const REFUSED_PARCEL: &str = "refused-parcel";
 /// Outcome of an outgoing call the services made, so `unimplemented` keeps meaning unimplemented.
 pub const SENT: &str = "sent";
+/// Outcome of a service lookup nobody serves; the api field is the name. Read from upstream's own log lines ([`summary::MISSING_SERVICE_LINES`]), not counted in process.
+pub const MISSING_SERVICE: &str = "missing-service";
 
 /// Exception names by `binder_exception_t` value (binder_status.h).
 const EXCEPTIONS: &[(i32, &str)] = &[

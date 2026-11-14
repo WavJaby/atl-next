@@ -835,6 +835,69 @@ fn round_failures(app: &str, prefix: &str, rounds: usize, bound_ms: Option<u64>)
     whys
 }
 
+/// A name the fixture looks up that nobody serves: Main.permission()'s PackageManager.checkPermission fetches PermissionManager, whose fetcher asks `getServiceOrThrow("legacy_permission")`
+/// (SystemServiceRegistry). The day the services serve it, this row goes red by design (the plan's break): move it to another unserved name.
+const MISSING_JAVA: &str = "legacy_permission";
+
+/// The missing-service row (plan diagnostics-f4 D5): the app log counts `missing-service legacy_permission` (SystemServiceRegistry's "No service published for:" line, atl-diag
+/// MISSING_SERVICE_LINES). At least once: a fetcher that found nothing may ask again. A native miss (libbinder's 5 s give-up) has no bounded trigger an app can make by name (libbinder's
+/// getService is not NDK API; Java's waitForService never returns for an unserved name, window.rs UNSERVED_WAIT): atl-diag's unit test and the pin test cover its line.
+fn missing_service_failures(app: &str) -> Vec<String> {
+    let count = counters(app)
+        .iter()
+        .find(|c| c.outcome == atl_diag::MISSING_SERVICE && c.api == MISSING_JAVA)
+        .map_or(0, |c| c.count);
+    if count == 0 {
+        vec![format!(
+            "missing-services: the app log holds no `missing-service {MISSING_JAVA}`"
+        )]
+    } else {
+        vec![]
+    }
+}
+
+/// Each line atl-diag reads a missing service from is in the pinned source that writes it, in MISSING_SERVICE_LINES order, as (file, literal with the name's place).
+#[cfg(test)]
+const MISSING_SERVICE_SOURCES: [(&str, &str); 3] = [
+    (
+        "aosp/frameworks/base/core/java/android/os/ServiceManager.java",
+        "\"No service published for: \" + name",
+    ),
+    (
+        "aosp/frameworks/native/libs/binder/IServiceManager.cpp",
+        "\"Service %s didn't start. Returning NULL\"",
+    ),
+    (
+        "aosp/frameworks/native/cmds/servicemanager/ServiceManager.cpp",
+        // C string concatenation splits the format at the source line break: checked up to it
+        "Since '%s' could not be found trying to start it as a lazy AIDL service. (if it's ",
+    ),
+];
+
+/// Needs the fetched tree; without it the run cannot build either.
+#[cfg(test)]
+fn missing_service_lines_exist_at_the_pin(layout: &Layout) -> Result<()> {
+    for ((before, after), (file, literal)) in atl_diag::summary::MISSING_SERVICE_LINES
+        .iter()
+        .zip(MISSING_SERVICE_SOURCES)
+    {
+        let path = layout.locate(Path::new(file)).dir;
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        anyhow::ensure!(
+            text.contains(literal),
+            "{} lacks {literal:?}",
+            path.display()
+        );
+        // the parser's halves are the literal's text around the name
+        anyhow::ensure!(
+            literal.contains(before.trim_start()) && literal.contains(after.trim_end()),
+            "atl-diag MISSING_SERVICE_LINES ({before:?}, {after:?}) is not {literal:?}"
+        );
+    }
+    Ok(())
+}
+
 /// Main.java resultToSecurity's line, and what it must read: the services' SecurityException reached the app.
 const RESULT_TO_SECURITY: &str = "AtlTest: result-to-security ";
 const RESULT_TO_SECURITY_WANT: &str = "threw SecurityException";
@@ -1165,6 +1228,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         &atld_log,
         &read(&run.log("binderd")),
     ));
+    whys.extend(missing_service_failures(&app));
     match &outside {
         Some(o) => {
             println!("app: counter children_outside_broker {}", o.len());
@@ -1914,6 +1978,25 @@ mod tests {
                        diag: first status:BAD_VALUE IPackageManager.notifyDexLoad 1 at=1.001\n";
         assert_eq!(dex_load_failures(refused).len(), 1);
         assert_eq!(dex_load_failures("").len(), 1);
+    }
+
+    /// SystemServiceRegistry's line in the app log's shape counts; another name's does not.
+    #[test]
+    fn missing_service_needs_the_key() {
+        let line = |n: &str| {
+            format!(
+                "1700000000.100 5.000 2 2 W liblog/SystemServiceRegistry: No service published for: {n}\n"
+            )
+        };
+        assert!(missing_service_failures(&line(MISSING_JAVA)).is_empty());
+        assert_eq!(missing_service_failures(&line("netstats")).len(), 1);
+        assert_eq!(missing_service_failures("").len(), 1);
+    }
+
+    #[test]
+    fn missing_service_lines_match_the_pinned_sources() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        missing_service_lines_exist_at_the_pin(&Layout::of(root).unwrap()).unwrap();
     }
 
     #[test]

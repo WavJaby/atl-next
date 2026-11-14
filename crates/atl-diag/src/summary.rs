@@ -63,9 +63,57 @@ pub fn parse(line: &str) -> Option<Event> {
     })
 }
 
-/// Every `diag:` line of `log`, in log order.
+/// The upstream log lines of a lookup nobody serves, as (text before the name, text after it; empty = the name ends the line). Each miss writes exactly one of them, by the path that gives up:
+/// - Java `ServiceManager.getServiceOrThrow` (SystemServiceRegistry's manager fetchers): `ServiceNotFoundException` "No service published for: <name>" (ServiceManager.java), logged by `SystemServiceRegistry.onServiceNotFound` in the app's log. Java's `getService` itself returns null silently: its proxy's `getService2` is `checkService2` (ServiceManagerNative.java).
+/// - native `getService` (libbinder `CppBackendShim::getService`, IServiceManager.cpp) after its 5 s `checkService` poll: "Service <name> didn't start. Returning NULL", in the caller's log.
+/// - servicemanager's own `getService` with start-if-not-found (ServiceManager.cpp `tryStartService`), which only native `waitForService` reaches (its first `realGetService`); in servicemanager.log (its kernel log, through atld `kernel_log_to_log`). Such a wait never returns: window.rs `UNSERVED_WAIT` reports the hang.
+///
+/// xtask-harness `missing_service_lines_exist_at_the_pin` checks each against the pinned sources.
+pub const MISSING_SERVICE_LINES: [(&str, &str); 3] = [
+    (" No service published for: ", ""),
+    (" Service ", " didn't start. Returning NULL"),
+    (
+        " Since '",
+        "' could not be found trying to start it as a lazy AIDL service.",
+    ),
+];
+
+/// The service name of a logcat line (atl-services-types `logcat::format`: wall stamp first) that is one of [`MISSING_SERVICE_LINES`], with the line's stamp.
+fn missing_service(line: &str) -> Option<(u64, &str)> {
+    let at_ms = parse_stamp(line.split(' ').next()?)?;
+    MISSING_SERVICE_LINES.iter().find_map(|(before, after)| {
+        let (_, rest) = line.split_once(before)?;
+        let name = if after.is_empty() {
+            rest.trim_end()
+        } else {
+            rest.split_once(after)?.0
+        };
+        (!name.is_empty()).then_some((at_ms, name))
+    })
+}
+
+/// Every `diag:` line of `log`, in log order, and each [`MISSING_SERVICE_LINES`] line as a `missing-service <name>` event whose count is the lines so far: every miss writes one, so it is exact.
 pub fn events(log: &str) -> Vec<Event> {
-    log.lines().filter_map(parse).collect()
+    let mut misses = std::collections::BTreeMap::<&str, u64>::new();
+    log.lines()
+        .filter_map(|line| {
+            parse(line).or_else(|| {
+                let (at_ms, name) = missing_service(line)?;
+                let n = misses.entry(name).or_default();
+                *n += 1;
+                Some(Event {
+                    at_ms,
+                    counter: Counter {
+                        outcome: crate::MISSING_SERVICE.to_owned(),
+                        api: name.to_owned(),
+                        count: *n,
+                        exact: true,
+                    },
+                    cause: None,
+                })
+            })
+        })
+        .collect()
 }
 
 /// Each (outcome, api) key's count among `events`: its total line's if one was written, else the highest count seen. Key order.
@@ -234,5 +282,37 @@ mod tests {
         );
         assert_eq!(e.cause.as_deref(), Some("android.os.Message"));
         assert!(parse("diag: total sent I.x 3 first=1.000").is_some_and(|e| e.counter.exact));
+    }
+
+    /// Each upstream line (Java's ServiceNotFoundException message, servicemanager's with its calling-context prefix, libbinder's after the wait) becomes an exact `missing-service` count, one
+    /// per line; libbinder's wait-start line and the found case are not misses.
+    #[test]
+    fn missing_service_lines_count_exactly() {
+        let log = "\
+1700000000.100 5.000   7   7 I kmsg/servicemanager: Caller(pid=9,uid=10000,sid=) Since 'atl.none' could not be found trying to start it as a lazy AIDL service. (if it's not configured\n\
+1700000000.200 5.100   7   7 I kmsg/servicemanager: Caller(pid=9,uid=10000,sid=) Since 'atl.none' could not be found trying to start it as a lazy AIDL service. (if it's not configured\n\
+1700000001.000 6.000   9   9 I liblog/ServiceManagerCppClient: Waiting for service 'atl.n' on '/dev/binder'...\n\
+1700000006.000 11.00   9   9 W liblog/ServiceManagerCppClient: Service atl.n didn't start. Returning NULL\n\
+1700000007.000 12.00   9   9 I liblog/ServiceManagerCppClient: Waiting for service 'x' on '/dev/binder' successful after waiting 3ms\n\
+1700000008.000 13.00   9   9 W liblog/SystemServiceRegistry: No service published for: legacy_permission\n";
+        let mut c = counters(log);
+        c.sort_by(|a, b| a.api.cmp(&b.api));
+        let shown: Vec<String> = c.iter().map(show).collect();
+        assert_eq!(
+            shown,
+            [
+                "missing-service atl.n x1",
+                "missing-service atl.none x2",
+                "missing-service legacy_permission x1"
+            ]
+        );
+        assert_eq!(
+            summary(&[log], 1_700_000_000_000),
+            [
+                "missing-service atl.none x2 +0.100s",
+                "missing-service atl.n x1 +6.000s",
+                "missing-service legacy_permission x1 +8.000s"
+            ]
+        );
     }
 }

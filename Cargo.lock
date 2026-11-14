@@ -696,6 +696,7 @@ dependencies = [
  "anyhow",
  "atl-android-paths",
  "roxmltree",
+ "rustix",
  "serde",
  "serde_json",
  "toml",
