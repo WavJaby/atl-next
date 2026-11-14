@@ -543,7 +543,9 @@ mod publish {
         for m in motions {
             let seq = next_seq(state.seq.get());
             state.seq.set(seq);
-            if let Err(err) = publisher.publish_motion(&motion(m, seq, meta_state, origin)) {
+            let event = motion(m, seq, meta_state, origin);
+            log_motion(&event);
+            if let Err(err) = publisher.publish_motion(&event) {
                 tracing::warn!("input: publishing event {seq}: {err:?}");
                 if matches!(
                     err,
@@ -558,6 +560,30 @@ mod publish {
                 return;
             }
         }
+    }
+
+    /// One DEBUG line per published MotionEvent: what the app's InputConsumer receives. No history field: an InputMessage carries one sample; the consumer's batching (consumeBatch -> MotionEvent.addSample) builds the history the app sees from consecutive MOVEs.
+    fn log_motion(e: &MotionEvent) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        let pointers: Vec<String> = e
+            .pointers
+            .iter()
+            .map(|p| format!("{}:tool{}@({:.1},{:.1})", p.id, p.tool_type, p.x, p.y))
+            .collect();
+        tracing::debug!(
+            "input: motion seq {} action {:#x} button {:#x} buttons {:#x} source {:#x} pointers {} [{}] event {}ns down {}ns",
+            e.seq,
+            e.action,
+            e.action_button,
+            e.button_state,
+            e.source,
+            e.pointers.len(),
+            pointers.join(" "),
+            e.event_time,
+            e.down_time,
+        );
     }
 
     /// Reads the finished signals a channel holds (receiveConsumerResponse until none). False when a read fails: the loop then removes the channel, since a channel left readable with every read failing spins the loop.

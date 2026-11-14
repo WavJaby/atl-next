@@ -203,14 +203,21 @@ impl GtkWindow {
             x: f64,
             y: f64,
         ) {
-            shared.pointer_at.set((x, y));
-            let event = input::pointer(
+            emit_at(
+                shared,
+                controller,
                 phase,
-                x,
-                y,
-                scale_of(controller),
-                controller.current_event_time(),
+                (controller.current_event_time(), x, y),
             );
+        }
+        fn emit_at(
+            shared: &Shared,
+            controller: &impl IsA<gtk4::EventController>,
+            phase: PointerPhase,
+            (time_ms, x, y): input::Sample,
+        ) {
+            shared.pointer_at.set((x, y));
+            let event = input::pointer(phase, x, y, scale_of(controller), time_ms);
             shared.on_event.call(|f| f(event));
         }
         // raw wl_pointer buttons, not GestureClick: a click gesture interprets presses (gtk-dnd-drag-threshold -> "stopped", n_press counting), and a drag past it lost its release -> the mouse finger never lifted
@@ -234,7 +241,19 @@ impl GtkWindow {
         view.add_controller(buttons);
         let motion = gtk4::EventControllerMotion::new();
         let s = Rc::clone(shared);
-        motion.connect_motion(move |c, x, y| emit(&s, c, PointerPhase::Move, x, y));
+        motion.connect_motion(move |c, x, y| {
+            let current = (c.current_event_time(), x, y);
+            let history = c.current_event().map(|e| e.history()).unwrap_or_default();
+            let view = c.widget();
+            let earlier = history.iter().filter_map(|t| {
+                let axes = t.axes();
+                let at = surface_to_view(view.as_ref()?, (axes[AXIS_X], axes[AXIS_Y]))?;
+                Some((t.time(), at.0, at.1))
+            });
+            for sample in input::motion_samples(earlier, current) {
+                emit_at(&s, c, PointerPhase::Move, sample);
+            }
+        });
         let s = Rc::clone(shared);
         motion.connect_enter(move |c, x, y| emit(&s, c, PointerPhase::Enter, x, y));
         let s = Rc::clone(shared);
@@ -358,12 +377,19 @@ fn fit_window(window: &gtk4::Window, view: &SceneView) {
 
 /// A raw event's position in the view: the event's is the surface's, the content's is past the shadow and the header bar.
 fn view_point(c: &gtk4::EventControllerLegacy, event: &gdk::Event) -> Option<(f64, f64)> {
-    let view = c.widget()?;
-    let (x, y) = event.position()?;
+    surface_to_view(&c.widget()?, event.position()?)
+}
+
+/// `GdkTimeCoord.axes` indices of the position: the array is indexed by `GdkAxisUse` (`GDK_AXIS_X` 1, `GDK_AXIS_Y` 2).
+const AXIS_X: usize = 1;
+const AXIS_Y: usize = 2;
+
+/// A surface position (an event's, a history sample's) in `view`: past the shadow and the header bar.
+fn surface_to_view(view: &gtk4::Widget, (x, y): (f64, f64)) -> Option<(f64, f64)> {
     let native = view.native()?;
     let (shadow_x, shadow_y) = native.surface_transform();
     let at = native.compute_point(
-        &view,
+        view,
         &graphene::Point::new((x - shadow_x) as f32, (y - shadow_y) as f32),
     )?;
     Some((f64::from(at.x()), f64::from(at.y())))

@@ -28,6 +28,18 @@ pub fn pointer(phase: PointerPhase, x: f64, y: f64, scale: Scale, time_ms: u32) 
     })
 }
 
+/// One pointer position sample: (time ms, x, y), logical pixels of the content widget.
+pub type Sample = (u32, f64, f64);
+
+/// The moves of one compressed GTK motion event, oldest first: GDK coalesces motion per frame clock and keeps the dropped samples in `gdk_event_get_history`, which excludes the event's own position.
+/// Each sample becomes its own MOVE, as an evdev device's are: AOSP's InputConsumer (consumeBatch) then folds them into one ACTION_MOVE with history samples per frame, so the app's VelocityTracker sees every sample.
+/// A history sample timed after `current` is dropped: MotionEvent.addBatch refuses a sample older than the last.
+pub fn motion_samples(history: impl IntoIterator<Item = Sample>, current: Sample) -> Vec<Sample> {
+    let mut samples: Vec<Sample> = history.into_iter().filter(|s| s.0 <= current.0).collect();
+    samples.push(current);
+    samples
+}
+
 /// How a scroll's deltas count: GTK's `GdkScrollUnit`, the toolkit type kept out of this pure mapper.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScrollUnit {
@@ -245,6 +257,18 @@ mod tests {
                 time_ms: 3,
             })
         );
+    }
+
+    /// A frame that coalesced 3 motions: the 2 history samples come first with their own times, then the event's position; no history -> just the event; a stray later sample is dropped.
+    #[test]
+    fn compressed_motion_becomes_every_sample() {
+        let current = (40, 9.0, 9.0);
+        assert_eq!(
+            motion_samples([(8, 1.0, 2.0), (24, 5.0, 6.0)], current),
+            vec![(8, 1.0, 2.0), (24, 5.0, 6.0), current]
+        );
+        assert_eq!(motion_samples([], current), vec![current]);
+        assert_eq!(motion_samples([(41, 0.0, 0.0)], current), vec![current]);
     }
 
     #[test]
