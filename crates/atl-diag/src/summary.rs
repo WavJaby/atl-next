@@ -159,12 +159,17 @@ pub fn counter_lines(log: &str) -> Vec<String> {
 
 /// The ranked list (plan diagnostics-f4) of a run, `logs` one per process: every key but the served-by-design ones (`answered`, `sent`), most hits first, then first seen; each with its first-seen
 /// offset from `since_ms` (an app's spawn) and the last cause it carried. A key several processes count sums their [`totals`] (each process has its own map), exact only when every one is.
-pub fn summary(logs: &[impl AsRef<str>], since_ms: u64) -> Vec<String> {
+/// `family`: the keys of one [`crate::FAMILIES`] member (its own block), or None for the API block, which holds no family's key -- so a family's lower bounds (`prop:` keys of SIGKILLed apps)
+/// never push an API row off screen or take its first row.
+pub fn summary(logs: &[impl AsRef<str>], since_ms: u64, family: Option<&str>) -> Vec<String> {
     let mut rows: Vec<(Counter, u64, Option<String>)> = Vec::new();
     for log in logs {
         let all = events(log.as_ref());
         for c in totals(&all) {
-            if c.outcome == crate::ANSWERED || c.outcome == crate::SENT {
+            if c.outcome == crate::ANSWERED
+                || c.outcome == crate::SENT
+                || crate::family(&c.outcome) != family
+            {
                 continue;
             }
             let same = |e: &&Event| e.counter.outcome == c.outcome && e.counter.api == c.api;
@@ -234,11 +239,37 @@ mod tests {
                    diag: first unimplemented I.d 1 at=101.000\n\
                    diag: count unimplemented I.d 2 at=101.000\n";
         assert_eq!(
-            summary(&[log], 100_000),
+            summary(&[log], 100_000, None),
             [
                 "unimplemented I.d x>=2 +1.000s",
                 "status:BAD_VALUE I.a x>=1 +0.250s cause: android.os.Message",
                 "exception:SECURITY I.b x>=1 +0.500s",
+            ]
+        );
+    }
+
+    /// The family split: `prop:` keys (miss and overflow) only in the prop block, never in the API block, whose first row stays the exact API key even though the prop lower bound is larger;
+    /// `status:` and `diag:reentrant` are no family and stay in the API block. Break check: summary ignoring `family` -> the API block's first row is `prop:miss d.x x>=64`.
+    #[test]
+    fn families_get_their_own_block() {
+        let app = "diag: count prop:miss d.x 64 at=100.100\n\
+                   diag: first prop:overflow keys 1 at=100.200\n\
+                   diag: first status:BAD_VALUE I.b 1 at=100.300\n";
+        let services = "diag: total unimplemented I.a 3 first=100.000\n\
+                        diag: total diag:reentrant dropped 1 first=100.400\n";
+        assert_eq!(
+            summary(&[app, services], 100_000, None),
+            [
+                "unimplemented I.a x3 +0.000s",
+                "status:BAD_VALUE I.b x>=1 +0.300s",
+                "diag:reentrant dropped x1 +0.400s"
+            ]
+        );
+        assert_eq!(
+            summary(&[app, services], 100_000, Some(crate::PROP_FAMILY)),
+            [
+                "prop:miss d.x x>=64 +0.100s",
+                "prop:overflow keys x>=1 +0.200s"
             ]
         );
     }
@@ -253,11 +284,11 @@ mod tests {
                    diag: count unimplemented I.a 2 at=100.300\n\
                    diag: first refused-parcel P 1 at=100.400\n";
         assert_eq!(
-            summary(&[services, other_exact], 100_000),
+            summary(&[services, other_exact], 100_000, None),
             ["unimplemented I.a x5 +0.100s"]
         );
         assert_eq!(
-            summary(&[services, app], 100_000),
+            summary(&[services, app], 100_000, None),
             [
                 "unimplemented I.a x>=5 +0.100s",
                 "refused-parcel P x>=1 +0.400s"
@@ -307,7 +338,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            summary(&[log], 1_700_000_000_000),
+            summary(&[log], 1_700_000_000_000, None),
             [
                 "missing-service atl.none x2 +0.100s",
                 "missing-service atl.n x1 +6.000s",

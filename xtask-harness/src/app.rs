@@ -1242,6 +1242,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     for l in summary_rows(&atld_log).iter().take(SUMMARY_SHOWN) {
         println!("app: summary {l}");
     }
+    for l in block_rows(&atld_log, PROP_SUMMARY_PREFIX)
+        .iter()
+        .take(SUMMARY_SHOWN)
+    {
+        println!("app: prop-summary {l}");
+    }
+    if passed {
+        whys.extend(prop_block_failures(&atld_log));
+    }
     whys.extend(exit_failures(
         passed,
         &services_log,
@@ -1544,13 +1553,43 @@ const BINDERD_EXIT: &str = "binderd: exit";
 /// Summary rows the gate prints.
 const SUMMARY_SHOWN: usize = 5;
 
+/// atld's prop family block (atld main.rs print_summary, atl_diag::FAMILIES): `atld: prop-summary <n> keys`, then its rows.
+const PROP_SUMMARY_PREFIX: &str = "atld: prop-summary ";
+/// A property every app run reads unset: libEGL's layer loader reads it at EGL init (frameworks/native/opengl/libs/EGL/egl_layers.cpp `LayerLoader::InitLayers`: `GetProperty("debug.gles.layers", "")`),
+/// and ATL's area does not set it (a debug knob, unset on devices too). Its count is a lower bound above the API keys' (x>=64 on the run that found the regression), the case the split exists for.
+const PROP_FIXTURE: &str = "debug.gles.layers";
+
 /// The rows of atld's summary block, without its `<n> keys` header.
 fn summary_rows(atld_log: &str) -> Vec<&str> {
+    block_rows(atld_log, SUMMARY_PREFIX)
+}
+
+/// The rows of the atld block whose lines start with `prefix`, without its `<n> keys` header.
+fn block_rows<'a>(atld_log: &'a str, prefix: &str) -> Vec<&'a str> {
     atld_log
         .lines()
-        .filter_map(|l| l.strip_prefix(SUMMARY_PREFIX))
+        .filter_map(|l| l.strip_prefix(prefix))
         .filter(|r| !r.ends_with(" keys"))
         .collect()
+}
+
+/// Plan diagnostics-misses S17: the prop block lists `prop:miss` [`PROP_FIXTURE`], and the API block holds no `prop:` row (a family's lower bounds never rank there).
+fn prop_block_failures(atld: &str) -> Vec<String> {
+    let mut whys = Vec::new();
+    let want = format!("{} {PROP_FIXTURE} ", atl_diag::PROP_MISS);
+    if !block_rows(atld, PROP_SUMMARY_PREFIX)
+        .iter()
+        .any(|r| r.starts_with(&want))
+    {
+        whys.push(format!(
+            "`{PROP_SUMMARY_PREFIX}` block lists no `{want}x..` row"
+        ));
+    }
+    let family = format!("{}:", atl_diag::PROP_FAMILY);
+    if let Some(r) = summary_rows(atld).iter().find(|r| r.starts_with(&family)) {
+        whys.push(format!("the API summary block holds a prop row: {r}"));
+    }
+    whys
 }
 
 /// A summary row's count (`... x<n> +...`) and whether it is exact (`x>=<n>`: a lower bound).
@@ -1647,6 +1686,20 @@ mod tests {
         let unranked =
             "atld: stopped services\natld: summary I.a x1 +0.1s\natld: summary I.b x2 +0.2s\n";
         assert_eq!(exit_failures(true, services, unranked, binderd).len(), 1);
+    }
+
+    /// S17: the fixture's row in the prop block passes; a missing prop block row and a `prop:` row in the API block (the regression's shape) each fail once.
+    #[test]
+    fn prop_block_holds_the_fixture_and_the_api_block_none() {
+        let good = "atld: summary 1 keys\n\
+                    atld: summary unimplemented I.a x5 +0.100s\n\
+                    atld: prop-summary 1 keys\n\
+                    atld: prop-summary prop:miss debug.gles.layers x>=64 +0.200s\n";
+        assert!(prop_block_failures(good).is_empty());
+        let mixed = "atld: summary 2 keys\n\
+                     atld: summary prop:miss debug.gles.layers x>=64 +0.200s\n\
+                     atld: summary unimplemented I.a x5 +0.100s\n";
+        assert_eq!(prop_block_failures(mixed).len(), 2);
     }
 
     #[test]

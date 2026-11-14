@@ -100,9 +100,25 @@ pub fn delivered(area: Area, pi: PropInfo, empty: bool) {
 /// `PROP_NAME_MAX`, the name buffer bionic's readers fill.
 const NAME_MAX: usize = PROP_NAME_MAX as usize;
 
-/// Counts `prop:miss <name>`; the count. Key = the name only (plan M59).
+/// Counts `prop:miss <name>`, at most [`max_keys`] distinct names; the count. Key = the name only (plan M59).
 fn miss(name: &[u8]) -> u64 {
-    atl_diag::count(atl_diag::PROP_MISS, &key(name), None)
+    atl_diag::count_capped(atl_diag::PROP_MISS, &key(name), None, max_keys())
+}
+
+/// C4 `prop_diag.max_keys` as atld wrote it into the area (atl_diag::PROP_MAX_KEYS_PROPERTY), read once; the shared default without an area or a parsable value.
+/// Read with the area's own lookup, not [`find`]: an absent value must not count itself as a miss.
+fn max_keys() -> usize {
+    static MAX_KEYS: OnceLock<usize> = OnceLock::new();
+    *MAX_KEYS.get_or_init(|| {
+        area()
+            .and_then(|a| {
+                let pi = a.find(atl_diag::PROP_MAX_KEYS_PROPERTY.as_bytes())?;
+                let mut out = [0u8; VALUE_MAX];
+                let len = value_len(a.read(pi, &mut out));
+                std::str::from_utf8(&out[..len]).ok()?.parse().ok()
+            })
+            .unwrap_or(atl_diag::PROP_MAX_KEYS_DEFAULT)
+    })
 }
 
 /// The name as a line field: borrowed when every byte is printable ASCII other than space and `\` (every bionic-valid name), else those bytes as `\xHH`, so the line parser stays unambiguous.

@@ -238,7 +238,17 @@ struct Args {
     /// SIGKILL: what it takes to write its exit totals (`diag: total`) and end. App processes are SIGKILLed, as AOSP kills them. The C4 config's CLI layer: no TOML layer exists yet.
     #[arg(long, default_value_t = STOP_GRACE_MS)]
     stop_grace_ms: u64,
+    /// C4 `prop_diag.max_keys`: distinct `prop:` keys each process counts before further unknown names count `prop:overflow keys` (atl_diag::count_capped); every process reads it as
+    /// `ro.atl.diag.prop-max-keys` (atl_diag::PROP_MAX_KEYS_PROPERTY).
+    #[arg(long, default_value_t = atl_diag::PROP_MAX_KEYS_DEFAULT)]
+    prop_diag_max_keys: usize,
+    /// C4 `prop_diag.summary_rows`: rows of the `atld: prop-summary` block (the full list stays in each process's log).
+    #[arg(long, default_value_t = PROP_SUMMARY_ROWS)]
+    prop_diag_summary_rows: usize,
 }
+
+/// `prop_diag.summary_rows` default [est]: one terminal screen beside the API block; the device diff (plan S18) reads the logs, not this block.
+const PROP_SUMMARY_ROWS: usize = 20;
 
 /// Android uids (system/core/libcutils/include/private/android_filesystem_config.h): AID_SYSTEM, AID_SHELL.
 const AID_SYSTEM: u32 = 1000;
@@ -963,7 +973,11 @@ fn property_area(a: &Args, r: &Root, tier: LinearTier) -> Result<Vec<Property>> 
         text += &std::fs::read_to_string(host)
             .with_context(|| format!("reading {}", host.display()))?;
     }
-    let props = atl_property_service::defaults(&text, tier)?;
+    let mut props = atl_property_service::defaults(&text, tier)?;
+    props.push((
+        atl_diag::PROP_MAX_KEYS_PROPERTY.to_owned(),
+        a.prop_diag_max_keys.to_string(),
+    ));
     std::fs::write(r.properties(), atl_property_service::area(&props)?)?;
     std::fs::create_dir(r.root.join("properties.d"))?;
     Ok(props)
@@ -2288,7 +2302,12 @@ fn run(a: &Args) -> Result<ExitCode> {
     }
     let since = host.first_app_ms.get().copied().unwrap_or(started_ms);
     drop(host);
-    print_summary(&r.root.join("log"), since);
+    // the C4 row cap of each family block (atl_diag::FAMILIES)
+    let prop_rows = a.prop_diag_summary_rows;
+    print_summary(&r.root.join("log"), since, |fam| match fam {
+        atl_diag::PROP_FAMILY => prop_rows,
+        _ => usize::MAX,
+    });
     Ok(match (end, code) {
         // a signal's conventional status (128 + its number), as a shell reports a process it ended
         (End::Signal(sig), _) => {
@@ -2320,8 +2339,9 @@ fn stop_system(name: &str, p: &mut Process, grace: Duration) {
 }
 
 /// The run's ranked API outcomes (atl_diag::summary over every process's log, first-seen as offset from `since_ms`): `atld: summary <n> keys`, then one `atld: summary <row>` line per key, most hits first.
+/// Then one block per atl_diag::FAMILIES member, `atld: <family>-summary <n> keys` and its first `rows_of(family)` rows: a family's keys never enter the API block.
 /// Read after every system process stopped, so their counts are exact; app processes were SIGKILLed, so theirs read `x>=n`.
-fn print_summary(log_dir: &Path, since_ms: u64) {
+fn print_summary(log_dir: &Path, since_ms: u64, rows_of: impl Fn(&str) -> usize) {
     let mut paths: Vec<PathBuf> = std::fs::read_dir(log_dir)
         .map(|d| d.filter_map(|e| e.ok().map(|e| e.path())).collect())
         .unwrap_or_default();
@@ -2331,10 +2351,17 @@ fn print_summary(log_dir: &Path, since_ms: u64) {
         .iter()
         .filter_map(|p| std::fs::read_to_string(p).ok())
         .collect();
-    let rows = atl_diag::summary::summary(&logs, since_ms);
+    let rows = atl_diag::summary::summary(&logs, since_ms, None);
     log(format_args!("summary {} keys", rows.len()));
     for row in rows {
         log(format_args!("summary {row}"));
+    }
+    for fam in atl_diag::FAMILIES {
+        let rows = atl_diag::summary::summary(&logs, since_ms, Some(fam));
+        log(format_args!("{fam}-summary {} keys", rows.len()));
+        for row in rows.iter().take(rows_of(fam)) {
+            log(format_args!("{fam}-summary {row}"));
+        }
     }
 }
 

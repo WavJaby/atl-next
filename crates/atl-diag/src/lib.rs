@@ -110,6 +110,25 @@ static COUNTS: Mutex<BTreeMap<String, BTreeMap<String, Record>>> = Mutex::new(BT
 
 /// Outcome of a property read that finds nothing, or finds an empty value (AOSP readers treat "" as unset); the api field is the property name, nothing else (plan M59: no thread, library, package or caller).
 pub const PROP_MISS: &str = "prop:miss";
+/// The family of [`PROP_MISS`]: its own summary block (atld `print_summary`) and its own key cap.
+pub const PROP_FAMILY: &str = "prop";
+/// The families whose keys leave the ranked API block for a block of their own ([`summary::summary`]); an outcome `<family>:<what>` belongs to one. Other outcomes with a colon
+/// (`exception:<NAME>`, `status:<NAME>`, `diag:reentrant`) stay in the API block. S8's `fs` family joins here.
+pub const FAMILIES: [&str; 1] = [PROP_FAMILY];
+/// The listed family of `outcome`, if any.
+pub fn family(outcome: &str) -> Option<&'static str> {
+    let (fam, _) = outcome.split_once(':')?;
+    FAMILIES.iter().copied().find(|f| *f == fam)
+}
+/// Api field of a family's overflow key `<family>:overflow keys` ([`count_capped`]).
+pub const OVERFLOW_API: &str = "keys";
+/// Outcome suffix of a family's overflow key.
+const OVERFLOW: &str = "overflow";
+/// The property that carries C4 `prop_diag.max_keys` to every app process (atld writes it into the area, libatl_bionic reads it once).
+pub const PROP_MAX_KEYS_PROPERTY: &str = "ro.atl.diag.prop-max-keys";
+/// C4 `prop_diag.max_keys` default [est, plan S15]: dynamic names such as liblog's `log.tag.<TAG>` per tag are the main source of distinct keys; ~100 B per first-hit line -> <= ~100 KB per app log.
+pub const PROP_MAX_KEYS_DEFAULT: usize = 1024;
+
 /// Outcome under which [`flush_totals`] reports [`count`] calls dropped because the thread was already inside one (a signal handler reading a property while its thread held the map).
 pub const REENTRANT: &str = "diag:reentrant";
 /// [`REENTRANT`]'s api field.
@@ -167,12 +186,27 @@ fn logs(n: u64) -> bool {
 /// A call nested in another on the same thread (a signal handler) is dropped into [`REENTRANT`] and returns 0: taking the map lock again would deadlock a crashing app.
 /// A hit of a known key allocates only when it writes a line.
 pub fn count(outcome: &str, api: &str, cause: Option<&str>) -> u64 {
+    count_capped(outcome, api, cause, usize::MAX)
+}
+
+/// [`count`] with at most `max_keys` distinct keys in `outcome`'s [`family`] (all its outcomes together; an outcome of no family is capped on its own): a new key past the cap is not created,
+/// its hit counts `<family>:overflow keys` instead (dropped hits of unknown keys: counting distinct dropped keys would need the memory the cap bounds); known keys keep counting.
+pub fn count_capped(outcome: &str, api: &str, cause: Option<&str>, max_keys: usize) -> u64 {
     let Some(_inside) = Inside::enter() else {
         drop_nested();
         return 0;
     };
     // a poisoned map still counts: it holds plain numbers
     let mut map = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+    let known = map.get(outcome).is_some_and(|m| m.contains_key(api));
+    let overflow;
+    let (outcome, api) = if !known && keys_in_family(&map, outcome) >= max_keys {
+        let fam = family(outcome).unwrap_or(outcome);
+        overflow = format!("{fam}:{OVERFLOW}");
+        (overflow.as_str(), OVERFLOW_API)
+    } else {
+        (outcome, api)
+    };
     let (n, stamp) = match map.get_mut(outcome).and_then(|m| m.get_mut(api)) {
         Some(r) => {
             r.n += 1;
@@ -200,6 +234,20 @@ pub fn count(outcome: &str, api: &str, cause: Option<&str>) -> u64 {
         );
     }
     n
+}
+
+/// Distinct keys of `outcome`'s family in `map`, its overflow key not counted (run only for a new key).
+fn keys_in_family(map: &BTreeMap<String, BTreeMap<String, Record>>, outcome: &str) -> usize {
+    match family(outcome) {
+        Some(fam) => map
+            .iter()
+            .filter(|(o, _)| {
+                family(o) == Some(fam) && o.split_once(':').map(|x| x.1) != Some(OVERFLOW)
+            })
+            .map(|(_, apis)| apis.len())
+            .sum(),
+        None => map.get(outcome).map_or(0, BTreeMap::len),
+    }
 }
 
 /// The reply hook (aidl `--rust_reply_hook`): counts one non-OK outcome of `descriptor`'s `method` (None: unknown `code`), returns the new count.
@@ -394,6 +442,34 @@ mod tests {
         assert!(!counts().iter().any(|(_, a, _)| a == "t.nested"));
         // the guard was released: the next call counts
         assert_eq!(count(PROP_MISS, "t.nested", None), 1);
+    }
+
+    /// Cap 2 (plan S7's example) on an outcome of no family, 3 new keys one hit each: 2 keys, the third hit counts `t-cap:overflow keys 1`; a known key still counts past the cap. A family's
+    /// cap counts its keys across outcomes: with the cap at the family's current size, a new key of a second outcome overflows. Break check: drop the cap test in `count_capped` -> `c` is created.
+    #[test]
+    fn cap_creates_max_keys_then_counts_overflow() {
+        let solo = "t-cap";
+        assert_eq!(count_capped(solo, "a", None, 2), 1);
+        assert_eq!(count_capped(solo, "b", None, 2), 1);
+        assert_eq!(count_capped(solo, "c", None, 2), 1);
+        assert_eq!(count_capped(solo, "a", None, 2), 2);
+        let c = counts();
+        assert!(!c.iter().any(|(o, a, _)| o == solo && a == "c"), "{c:?}");
+        assert!(c.contains(&("t-cap:overflow".to_owned(), OVERFLOW_API.to_owned(), 1)));
+        // the prop family is shared with other tests, whose keys only grow: a cap at its current size (>= 1 after this key) refuses any new key of any prop outcome
+        count(PROP_MISS, "t.cap-known", None);
+        let size = keys_in_family(&COUNTS.lock().unwrap_or_else(|e| e.into_inner()), PROP_MISS);
+        count_capped("prop:t-cap-other", "t.new", None, size);
+        let c = counts();
+        assert!(!c.iter().any(|(_, a, _)| a == "t.new"), "{c:?}");
+        assert!(
+            c.iter()
+                .any(|(o, a, _)| o == "prop:overflow" && a == OVERFLOW_API)
+        );
+        assert_eq!(count_capped(PROP_MISS, "t.cap-known", None, size), 2);
+        assert_eq!(family("prop:miss"), Some(PROP_FAMILY));
+        assert_eq!(family("status:BAD_VALUE"), None);
+        assert_eq!(family("diag:reentrant"), None);
     }
 
     /// 1794661778402 ms = the S4 example stamp `1794661778.402`; a value under 100 ms keeps its leading zeros.
