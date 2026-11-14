@@ -330,7 +330,8 @@ func (g *Graph) emit(tools Tools) string {
 				}
 				continue
 			}
-			lang = g.isaTierArgv(n, s, lang)
+			// Concat, not append: lang is the node's shared argv
+			lang = slices.Concat(g.isaTierArgv(n, s, lang), g.crossModuleFlags(n))
 			fmt.Fprintf(&b, "build %s: cc %s || %s\n  cc = %s\n  flags = %s\n", esc(obj), esc(src), join(waits), esc(cc), shellQuote(lang))
 			if debugInfo(lang) {
 				b.WriteString("  launcher =\n")
@@ -568,7 +569,7 @@ func (g *Graph) linkFlags(n *Node) []string {
 	if n.versionScript != "" {
 		out = append(out, "-Wl,--version-script,"+n.versionScript)
 	}
-	return out
+	return append(out, g.crossModuleFlags(n)...)
 }
 
 // linkDep: what a link naming shared library d depends on: its table of contents where it has one (cc.go depsToPaths: depFile = TableOfContents),

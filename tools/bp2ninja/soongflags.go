@@ -83,17 +83,55 @@ func toolchainLocation(f string) int {
 // No -fuse-ld here: Soong's lldflags give every host link -fuse-ld=lld already (readLldflags).
 // The host has its own compiler (arches.toml cc / cxx): it compiles and links every node of the host's machine (Config.machine "host": device and host sides); the build side keeps -cc / -cxx (ccTools).
 type HostCross struct {
-	Target       string   // clang --target
-	Sysroot      string   // the sysroot directory (a fetched sysroot_debs row)
-	ISA          string   // -march
-	Libcxx       string   // the sysroot's libc++ headers (xtask cross::libcxx_dir): the one c++/v1 holding __config
-	RustTarget   string   // rustc --target of the host's product crates (arches.toml rust); its std is a rustup_target row
-	RustFeatures string   // rustc -C target-feature: the isa's extensions past the base (arches::rustc_target_features); empty for the base alone
-	CC, CXX      string   // the host's C and C++ drivers (arches.toml cc / cxx rows)
-	Flags        []string // extra target flags of every compile and link (arches.toml cflags: -mno-relax); may be empty
+	Target       string              // clang --target
+	Sysroot      string              // the sysroot directory (a fetched sysroot_debs row)
+	ISA          string              // -march
+	Libcxx       string              // the sysroot's libc++ headers (xtask cross::libcxx_dir): the one c++/v1 holding __config
+	RustTarget   string              // rustc --target of the host's product crates (arches.toml rust); its std is a rustup_target row
+	RustFeatures string              // rustc -C target-feature: the isa's extensions past the base (arches::rustc_target_features); empty for the base alone
+	CC, CXX      string              // the host's C and C++ drivers (arches.toml cc / cxx rows)
+	ModuleFlags  map[string][]string // per module: extra flags of its compiles and link on the host's product sides, after Soong's (arches.toml module_flags; libhwui: -mno-relax, which clang turns into lld's --no-relax); may be empty
 }
 
-// set: the host is cross. main.go requires Target, Sysroot, ISA, Libcxx, RustTarget, CC and CXX together; RustFeatures and Flags may be empty.
+// parseModuleFlags: -host-module-flags' `module=flag` pairs, comma-separated; "" = none.
+func parseModuleFlags(arg string) (map[string][]string, error) {
+	if arg == "" {
+		return nil, nil
+	}
+	out := map[string][]string{}
+	for _, pair := range strings.Split(arg, ",") {
+		mod, f, ok := strings.Cut(pair, "=")
+		if !ok || mod == "" || f == "" {
+			return nil, fmt.Errorf("%q is not module=flag", pair)
+		}
+		out[mod] = append(out[mod], f)
+	}
+	return out, nil
+}
+
+// crossModuleFlags: n's module_flags row on a cross host's product side (machine "host"); nil elsewhere, so the build side and a native host keep Soong's flags.
+func (g *Graph) crossModuleFlags(n *Node) []string {
+	if g.cfg.machine(n.side) != "host" {
+		return nil
+	}
+	return g.cfg.HostCross.ModuleFlags[n.mod.Name]
+}
+
+// checkModuleFlags: every module_flags row names a module of the tree.
+func (g *Graph) checkModuleFlags() error {
+	var bad []string
+	for _, name := range sortedKeys(keysOf(g.cfg.HostCross.ModuleFlags)) {
+		if len(g.mods[Device][name])+len(g.mods[Host][name]) == 0 {
+			bad = append(bad, name)
+		}
+	}
+	if len(bad) > 0 {
+		return fmt.Errorf("arches.toml module_flags: no module of the tree is named %s", strings.Join(bad, ", "))
+	}
+	return nil
+}
+
+// set: the host is cross. main.go requires Target, Sysroot, ISA, Libcxx, RustTarget, CC and CXX together; RustFeatures and ModuleFlags may be empty.
 func (h HostCross) set() bool { return h.Target != "" }
 
 // rustFlags: the rustc flags of a cross host's product crates, in place of rustc's default target (Soong's RustTriple: --target, then the target's features).
@@ -113,15 +151,15 @@ func (h HostCross) compileFlags() []string {
 	if !h.set() {
 		return nil
 	}
-	return append([]string{"--target=" + h.Target, "--sysroot=" + h.Sysroot, "-march=" + h.ISA}, h.Flags...)
+	return []string{"--target=" + h.Target, "--sysroot=" + h.Sysroot, "-march=" + h.ISA}
 }
 
-// linkFlags: the target and sysroot of every host link, and the extra flags (clang turns -mno-relax into lld's --no-relax). clang adds the sysroot's library and GCC runtime dirs itself (checked on riscv64: a link with no -L).
+// linkFlags: the target and sysroot of every host link. clang adds the sysroot's library and GCC runtime dirs itself (checked on riscv64: a link with no -L).
 func (h HostCross) linkFlags() []string {
 	if !h.set() {
 		return nil
 	}
-	return append([]string{"--target=" + h.Target, "--sysroot=" + h.Sysroot}, h.Flags...)
+	return []string{"--target=" + h.Target, "--sysroot=" + h.Sysroot}
 }
 
 // ccTools: tools with the C and C++ drivers of the machine side s runs on: the cross host's own for its device and host sides, else -cc / -cxx unchanged (the build side, the native bridge guest, a plain host).

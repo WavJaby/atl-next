@@ -23,7 +23,8 @@
 #   cc, cxx, lld      deps.toml rows of the cross compiler (C driver, C++ driver) and of the ld.lld it links with; required with isa, absent on the build machine (deps.toml `clang` / `clang-cxx`).
 #                     It compiles and links everything of this host (converter host and device sides, upstream CMake builds, cargo's link driver); the build side keeps the build machine's.
 #                     Checked: cxx sits in cc's install, and `cc -fuse-ld=lld` runs lld's binary.
-#   cflags            extra target flags of every cross compile and link (converter, upstream CMake, cargo link); absent = none. Checked: cc takes each for the clang triple under -Werror.
+#   module_flags      `[[<arch>.host.module_flags]]` rows, cross hosts only: `module` (Android.bp name), `flags`, `reason` (the measurement). The module's compiles and link on this host's product sides take `flags` after Soong's; every other module keeps AOSP's flags. Absent = none.
+#                     Checked: fields non-empty, cc takes the flags for the clang triple under -Werror, the converter fails on a module the tree lacks.
 # `[<arch>.guest]` present = app native code of this arch runs (natively on a matching host, else via
 # the QEMU bridge):
 #   android_abis      APK `lib/<abi>/` names, preferred first
@@ -81,12 +82,15 @@ isa = "rv64gc_zba_zbb"
 glibc_floor = "2.39"
 clang = "riscv64-linux-gnu"
 sysroot = "riscv64-sysroot"
-# memory M63 (measured 2026-11-13): libhwui's .gcc_except_table relocations keep dead code alive at link under clang-19 with or without relaxation, and under clang-21 with it; clang-21 + -mno-relax links.
-# AOSP passes no relax flag (riscv64_device.go) and clang defaults to -mrelax on every riscv triple (Driver/ToolChains/Arch/RISCV.cpp), so -mno-relax departs from AOSP on measurement.
 cc = "clang-21"
 cxx = "clang-21-cxx"
 lld = "lld-21"
-cflags = ["-mno-relax"]
+
+# AOSP passes no relax flag (riscv64_device.go) and clang relaxes by default on every riscv triple (Driver/ToolChains/Arch/RISCV.cpp): relaxation is the default here too. nterp depends on it: its handlers fit 128 bytes only with relaxed calls (row-wide -mno-relax made 7 handlers 130-134 bytes, nterp.cc size check fatal).
+[[riscv64.host.module_flags]]
+module = "libskia"
+flags = ["-mno-relax"]
+reason = "measured 2026-11-13 / 2026-11-15: with relaxation (clang-21), .gcc_except_table relocations keep libskia's dead SkFontMgr_android_ndk.cpp code alive in libhwui's --gc-sections link (12 undefined AFont_* from libskia.a); clang-21 + -mno-relax on libskia's objects links"
 
 [riscv64.guest]
 android_abis = ["riscv64"]

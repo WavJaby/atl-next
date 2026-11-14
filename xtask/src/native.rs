@@ -132,7 +132,7 @@ fn compiler_args(args: &Args, root: &Path) -> Result<[String; 4]> {
     ])
 }
 
-/// The converter's flags for a cross host (`cross`: arches::cross_target): the target's clang triple, its fetched sysroot, its isa, its rust target and rustc features (arches::rustc_target_features), the libc++ headers in that sysroot (atl_layout::libcxx_dir, the one derivation), its compiler (cc / cxx rows) and extra target flags (cflags),
+/// The converter's flags for a cross host (`cross`: arches::cross_target): the target's clang triple, its fetched sysroot, its isa, its rust target and rustc features (arches::rustc_target_features), the libc++ headers in that sysroot (atl_layout::libcxx_dir, the one derivation), its compiler (cc / cxx rows) and per-module flags (module_flags),
 /// and the build machine's row and pointer width (`build`: arches::build_machine), which the converter's build side (tools a build rule executes or loads) is compiled for. Empty for the build machine, whose compiler already targets it.
 fn cross_args(
     root: &Path,
@@ -161,8 +161,8 @@ fn cross_args(
         deps::binary(root, &c.cc)?,
         "-host-cxx".to_owned(),
         deps::binary(root, &c.cxx)?,
-        "-host-cflags".to_owned(),
-        c.cflags.join(","),
+        "-host-module-flags".to_owned(),
+        arches::module_flags_arg(&c.module_flags),
         "-build-arch".to_owned(),
         build_name.to_owned(),
         "-build-pointer-bits".to_owned(),

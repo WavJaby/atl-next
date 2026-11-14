@@ -44,9 +44,27 @@ pub struct Host {
     pub cc: Option<String>,
     pub cxx: Option<String>,
     pub lld: Option<String>,
-    /// Extra target flags of every cross compile and link (`-mno-relax`); empty = none.
+    /// Per-module departures from AOSP's flags on this cross host's product sides, each backed by a measurement; empty = none.
     #[serde(default)]
-    pub cflags: Vec<String>,
+    pub module_flags: Vec<ModuleFlags>,
+}
+
+/// One `[[<arch>.host.module_flags]]` row: extra target flags of one Android.bp module's compiles and link (the converter fails on a module the tree lacks).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleFlags {
+    pub module: String,
+    pub flags: Vec<String>,
+    /// The measurement that makes the departure necessary.
+    pub reason: String,
+}
+
+/// `module_flags` as the converter's `-host-module-flags` value: `module=flag` pairs, comma-separated, one per flag.
+pub fn module_flags_arg(rows: &[ModuleFlags]) -> String {
+    rows.iter()
+        .flat_map(|r| r.flags.iter().map(move |f| format!("{}={f}", r.module)))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,7 +117,7 @@ pub struct CrossTarget {
     pub rust: String,
     pub cc: String,
     pub cxx: String,
-    pub cflags: Vec<String>,
+    pub module_flags: Vec<ModuleFlags>,
 }
 
 /// The cross target of host `name` when the build machine is `build` (build_machine's name): None for the build machine itself; another arch needs clang, sysroot, isa, cc and cxx in its row.
@@ -115,7 +133,7 @@ pub fn cross_target(name: &str, host: &Host, build: &str) -> Result<Option<Cross
             rust: host.rust.clone(),
             cc: cc.clone(),
             cxx: cxx.clone(),
-            cflags: host.cflags.clone(),
+            module_flags: host.module_flags.clone(),
         })),
         _ => bail!(
             "{FILE}: {name} is not the build machine ({build}): a cross host needs clang, sysroot, isa, cc and cxx in its [host] row"
@@ -160,10 +178,17 @@ fn validate(arches: &Arches) -> Result<()> {
                 if host.isa.is_some() {
                     toolchain.iter().all(|c| c.is_some())
                 } else {
-                    toolchain.iter().all(|c| c.is_none()) && host.cflags.is_empty()
+                    toolchain.iter().all(|c| c.is_none()) && host.module_flags.is_empty()
                 },
-                "{name}: cc, cxx and lld go with isa (a cross host), cflags only with them"
+                "{name}: cc, cxx and lld go with isa (a cross host), module_flags only with them"
             );
+            for r in &host.module_flags {
+                ensure!(
+                    !r.module.is_empty() && !r.flags.is_empty() && !r.reason.trim().is_empty(),
+                    "{name}: module_flags row {:?}: module, flags and reason must be non-empty",
+                    r.module
+                );
+            }
             if let Some(floor) = &host.glibc_floor {
                 dotted_version(floor).with_context(|| format!("{name}: glibc_floor"))?;
             }
@@ -348,18 +373,19 @@ pub fn check_cross(root: &Path, arches: &Arches) -> Result<()> {
                 out.status.success() && triple.split('-').next() == Some(name.as_str()),
                 "{FILE}: {name}: {cc} does not accept {triple} as a target with arch {name}"
             );
-            // cflags: the compiler takes each for the triple as a used flag (an unused or unknown one fails under -Werror)
-            if !host.cflags.is_empty() {
+            // module_flags: the compiler takes each row's flags for the triple as used flags (an unused or unknown one fails under -Werror)
+            for r in &host.module_flags {
                 let out = Command::new(&cc)
                     .arg(format!("--target={triple}"))
-                    .args(&host.cflags)
+                    .args(&r.flags)
                     .args(["-Werror", "-x", "c", "-c", "/dev/null", "-o", "/dev/null"])
                     .output()
-                    .with_context(|| format!("running {cc} with cflags"))?;
+                    .with_context(|| format!("running {cc} with module_flags"))?;
                 ensure!(
                     out.status.success(),
-                    "{FILE}: {name}: {cc} --target={triple} rejects cflags {:?}: {}",
-                    host.cflags,
+                    "{FILE}: {name}: {cc} --target={triple} rejects module_flags {} {:?}: {}",
+                    r.module,
+                    r.flags,
                     String::from_utf8_lossy(&out.stderr).trim()
                 );
             }
@@ -635,6 +661,14 @@ mod tests {
         assert_eq!(super::tool_side("riscv64", "x86_64"), "build");
     }
 
+    fn hwui_row() -> super::ModuleFlags {
+        super::ModuleFlags {
+            module: "libhwui".into(),
+            flags: vec!["-mno-relax".into()],
+            reason: "r".into(),
+        }
+    }
+
     #[test]
     fn cross_target_needs_its_columns_off_the_build_machine() {
         let row = |clang: Option<&str>, sysroot: Option<&str>, isa: Option<&str>| super::Host {
@@ -650,7 +684,7 @@ mod tests {
             cc: isa.map(|_| "cc-row".into()),
             cxx: isa.map(|_| "cxx-row".into()),
             lld: isa.map(|_| "lld-row".into()),
-            cflags: isa.map(|_| vec!["-mno-relax".into()]).unwrap_or_default(),
+            module_flags: isa.map(|_| vec![hwui_row()]).unwrap_or_default(),
         };
         // the build machine's own row is native, whatever it lists
         assert_eq!(
@@ -672,8 +706,12 @@ mod tests {
                 rust: "t".into(),
                 cc: "cc-row".into(),
                 cxx: "cxx-row".into(),
-                cflags: vec!["-mno-relax".into()],
+                module_flags: vec![hwui_row()],
             })
+        );
+        assert_eq!(
+            super::module_flags_arg(&[hwui_row(), hwui_row()]),
+            "libhwui=-mno-relax,libhwui=-mno-relax"
         );
         // a cross row without its compiler: an error, never the build machine's compiler
         let mut no_cc = row(Some("c"), Some("s"), Some("rv64gc"));
@@ -763,11 +801,17 @@ mod tests {
         let host = "[a]\npointer_bits = 64\nkernel_arch = \"k\"\nuapi_records = [\"r\"]\n[a.host]\nrust = \"t\"\nmeson_cpu_family = \"m\"\ndebian = \"d\"\n";
         let cross = "isa = \"rv64gc\"\nglibc_floor = \"2.39\"\n";
         let tc = "cc = \"c\"\ncxx = \"x\"\nlld = \"l\"\n";
-        parse(&format!("{host}{cross}{tc}cflags = [\"-mno-relax\"]\n")).unwrap();
+        let row = |reason: &str| {
+            format!(
+                "[[a.host.module_flags]]\nmodule = \"m\"\nflags = [\"-mno-relax\"]\nreason = \"{reason}\"\n"
+            )
+        };
+        parse(&format!("{host}{cross}{tc}{}", row("measured"))).unwrap();
+        assert!(err(&format!("{host}{cross}{tc}{}", row(" "))).contains("must be non-empty"));
         // a cross host without its compiler rows
         assert!(err(&format!("{host}{cross}")).contains("cc, cxx and lld go with isa"));
-        // the build machine (no isa) takes deps.toml clang: no toolchain columns, no cflags
+        // the build machine (no isa) takes deps.toml clang: no toolchain columns, no module_flags
         assert!(err(&format!("{host}{tc}")).contains("go with isa"));
-        assert!(err(&format!("{host}cflags = [\"-x\"]\n")).contains("go with isa"));
+        assert!(err(&format!("{host}{}", row("m"))).contains("go with isa"));
     }
 }

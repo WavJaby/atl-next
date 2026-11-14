@@ -230,13 +230,9 @@ genrule { name: "gen", tools: ["tool"], cmd: "$(location tool) > $(out)", out: [
 cc_library { name: "lib", srcs: ["a.c", "b.cc"], generated_headers: ["gen"], host_supported: true }
 `, "p/tool.cc": "", "p/a.c": "", "p/b.cc": ""}
 	cross := riscvCross
-	cross.CC, cross.CXX, cross.Flags = "clang-21", "clang++-21", []string{"-mno-relax"}
-	if got := cross.compileFlags(); got[len(got)-1] != "-mno-relax" {
-		t.Errorf("compile flags %q end without the cflags", got)
-	}
-	if got := cross.linkFlags(); got[len(got)-1] != "-mno-relax" {
-		t.Errorf("link flags %q end without the cflags", got)
-	}
+	cross.CC, cross.CXX = "clang-21", "clang++-21"
+	// module_flags rows for lib (a product module) and tool (built only on the build side): only lib's product edges take the flag
+	cross.ModuleFlags = map[string][]string{"lib": {"-mno-relax"}, "tool": {"-mno-relax"}}
 	tools := Tools{CC: "clang-19", CXX: "clang++-19", AR: "ar"}
 	cfg := riscvOnX86
 	cfg.HostCross = cross
@@ -273,6 +269,24 @@ cc_library { name: "lib", srcs: ["a.c", "b.cc"], generated_headers: ["gen"], hos
 	}
 	if e := edge(ninja, g.out+"/build/tool"); strings.Contains(e, "cxx =") {
 		t.Errorf("build link names a driver: %q", e)
+	}
+	for prefix, want := range map[string]bool{hostObj + "a.c.o": true, hostObj + "b.cc.o": true, g.out + "/host/lib": true, buildObj + "tool.cc.o": false, g.out + "/build/tool": false} {
+		if got := strings.Contains(edge(ninja, prefix), "-mno-relax"); got != want {
+			t.Errorf("%s: module flag present %v, want %v", prefix, got, want)
+		}
+	}
+	if err := g.checkModuleFlags(); err != nil {
+		t.Errorf("rows naming tree modules: %v", err)
+	}
+	g.cfg.HostCross.ModuleFlags = map[string][]string{"absent": {"-mno-relax"}}
+	if err := g.checkModuleFlags(); err == nil || !strings.Contains(err.Error(), "absent") {
+		t.Errorf("a row naming no module: %v", err)
+	}
+	if got, err := parseModuleFlags("a=-x,a=-y,b=-z"); err != nil || !slices.Equal(got["a"], []string{"-x", "-y"}) || !slices.Equal(got["b"], []string{"-z"}) {
+		t.Errorf("parseModuleFlags: %v %v", got, err)
+	}
+	if _, err := parseModuleFlags("a"); err == nil {
+		t.Error("a pair without = accepted")
 	}
 	plain := graphForCfg(t, Config{Arch: "x86_64", PointerBits: 64}, files)
 	plain.node("lib", Host, Shared, "test")

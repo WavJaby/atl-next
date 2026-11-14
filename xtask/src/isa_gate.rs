@@ -968,7 +968,7 @@ mod tests {
             cc: Some("clang-21".to_owned()),
             cxx: Some("clang-21-cxx".to_owned()),
             lld: Some("lld-21".to_owned()),
-            cflags: vec!["-mno-relax".to_owned()],
+            module_flags: Vec::new(),
         };
         let report = check(
             &out,

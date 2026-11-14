@@ -83,7 +83,7 @@ func main() {
 	hostRustFeatures := flag.String("host-rust-features", "", "cross host: rustc -C target-feature of the host's isa past the base (xtask arches::rustc_target_features, e.g. +zba,+zbb); may be empty")
 	hostCC := flag.String("host-cc", "", "cross host: the C driver of the host's device and host sides (arches.toml cc row); -cc stays the build side's")
 	hostCXX := flag.String("host-cxx", "", "cross host: the C++ and link driver of the host's device and host sides (arches.toml cxx row); -cxx stays the build side's")
-	hostCflags := flag.String("host-cflags", "", "cross host: comma-separated extra target flags of every host compile and link (arches.toml cflags, e.g. -mno-relax); may be empty")
+	hostModuleFlags := flag.String("host-module-flags", "", "cross host: comma-separated module=flag pairs, one per flag (arches.toml module_flags, e.g. libhwui=-mno-relax): the module's compiles and link on the host's product sides take them after Soong's; may be empty")
 	buildArch := flag.String("build-arch", "", "cross host: Soong arch name of the build machine (its arches.toml row, xtask arches::build_machine): the build side, which compiles every node a build rule executes or loads; given exactly with the -host-* flags")
 	buildBits := flag.Int("build-pointer-bits", 0, "cross host: pointer width of -build-arch (its arches.toml pointer_bits)")
 	nbExports := flag.String("nb-exports", "", "module: instead of a build, print as JSON the include flags its -native-bridge variant hands dependents (exportsOf), for builds outside the converter that compile against bionic's headers (xtask runtimes: libc_headers); takes no goals")
@@ -132,11 +132,12 @@ func main() {
 		return
 	}
 	cross := HostCross{Target: *hostTarget, Sysroot: *hostSysroot, ISA: *hostISA, Libcxx: *hostLibcxx, RustTarget: *hostRustTarget, RustFeatures: *hostRustFeatures, CC: *hostCC, CXX: *hostCXX}
-	if *hostCflags != "" {
-		cross.Flags = strings.Split(*hostCflags, ",")
+	if cross.ModuleFlags, err = parseModuleFlags(*hostModuleFlags); err != nil {
+		fmt.Fprintln(os.Stderr, "bp2ninja: -host-module-flags:", err)
+		os.Exit(2)
 	}
 	required := []string{cross.Target, cross.Sysroot, cross.ISA, cross.Libcxx, cross.RustTarget, cross.CC, cross.CXX}
-	if given := slices.IndexFunc(required, func(s string) bool { return s != "" }) >= 0 || cross.RustFeatures != "" || cross.Flags != nil; given && slices.Contains(required, "") {
+	if given := slices.IndexFunc(required, func(s string) bool { return s != "" }) >= 0 || cross.RustFeatures != "" || cross.ModuleFlags != nil; given && slices.Contains(required, "") {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -host-target, -host-sysroot, -host-isa, -host-libcxx, -host-rust-target, -host-cc and -host-cxx go together")
 		os.Exit(2)
 	}
@@ -476,6 +477,9 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 		return err
 	}
 	if err := g.checkISATiers(); err != nil {
+		return err
+	}
+	if err := g.checkModuleFlags(); err != nil {
 		return err
 	}
 	// build.ninja is written part by part as each is made (it is ~0.8 GB: one concatenated string plus its copies set the peak RSS), into a temporary file renamed at the end, so a failed run leaves the previous one
