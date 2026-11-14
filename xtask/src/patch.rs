@@ -13,6 +13,7 @@ use atl_layout::{Layout, MAIN};
 use crate::aosp::Manifest;
 use crate::git::{Ident, git, git_isolated, git_raw};
 use crate::licenses::{self, Licenses};
+use crate::par;
 use crate::prune::{self, Prune};
 use crate::sources::{self, Checkout, Pin, Sources};
 use crate::{aosp, fetch, notice};
@@ -381,10 +382,15 @@ fn in_step(ups: &[Up], licenses: &Licenses) -> Result<()> {
 }
 
 /// Checkouts present, and what keeps each from matching its pin and patches/.
+/// Checkouts are read concurrently (each is several local `git` processes, ~0.3 s apiece serially over ~230 AOSP checkouts = most of a no-op `native`), one worker per CPU since the work is local stat/read; results keep input order, so verdict and text equal a serial run.
 fn problems(ups: &[Up], licenses: &Licenses) -> (usize, Vec<String>) {
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
     let (mut present, mut problems) = (0, Vec::new());
-    for u in ups {
-        match drift(u, licenses) {
+    for (u, r) in ups
+        .iter()
+        .zip(par::map(ups, workers, |u| drift(u, licenses)))
+    {
+        match r {
             Ok(None) => {}
             Ok(Some(p)) => {
                 present += 1;
