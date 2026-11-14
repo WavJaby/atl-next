@@ -23,6 +23,7 @@
 //! - `<bionic/reserved_signals.h>`: bionic's reserved signal numbers, constants only.
 //! - malloc introspection (`malloc_iterate`, `malloc_disable`, `malloc_enable`, `malloc_backtrace`): glibc's heap cannot be walked: `malloc_iterate` fails (`ENOTSUP`), the rest answer as a bionic allocator without the support does (no frames).
 //! - `android_getaddrinfofornet`: single network, the host's `getaddrinfo`.
+//! - `sys_signame` / `sys_siglist`: bionic's BSD signal-name tables, as data (`ffi`).
 //!
 //! Built as one shared library per process (cargo-c), so one store, one target SDK, one abort message.
 //! Boundary crate: `unsafe` only in `ffi` (the C ABI shells), `map` (the shared mapping), `linker`
@@ -88,6 +89,10 @@ mod generated {
     /// `struct timespec`'s layout, the same in bionic and the host libc.
     pub mod timespec {
         include!(concat!(env!("OUT_DIR"), "/timespec.rs"));
+    }
+    /// bionic's `sys_signame` / `sys_siglist` entries (build.rs `SIGDEFS`).
+    pub mod signal_names {
+        include!(concat!(env!("OUT_DIR"), "/signal_names.rs"));
     }
 }
 

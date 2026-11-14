@@ -13,6 +13,7 @@ use std::ffi::CString;
 use crate::generated::dlext::android_dlextinfo;
 use crate::generated::libdl_android::android_namespace_t;
 use crate::generated::resolv_netid::addrinfo;
+use crate::generated::signal_names;
 use crate::generated::system_properties::{PROP_NAME_MAX, prop_info, timespec};
 use crate::generated::timespec as ts;
 use crate::props::{Area, PropInfo, VALUE_MAX, Value};
@@ -665,4 +666,57 @@ pub unsafe extern "C" fn async_safe_fatal_no_abort(format: *const c_char, mut ar
 #[unsafe(no_mangle)]
 pub extern "C" fn __get_tls() -> *mut *mut c_void {
     crate::tls::slot_zero()
+}
+
+/// A C `const char* const [_NSIG]`: null or a static NUL-terminated string per signal number.
+#[repr(transparent)]
+pub struct SignalTable([*const c_char; signal_names::NSIG]);
+
+// SAFETY: immutable, and every pointer is null or a `'static` C string literal
+unsafe impl Sync for SignalTable {}
+
+/// bionic's strsignal.cpp tables: entry `pick` of each `signal_names::ENTRIES` row at its number, null elsewhere.
+const fn signal_table(pick: usize) -> SignalTable {
+    let mut table = [core::ptr::null(); signal_names::NSIG];
+    let mut i = 0;
+    while i < signal_names::ENTRIES.len() {
+        let (number, name, description) = signal_names::ENTRIES[i];
+        table[number] = if pick == 0 { name } else { description }.as_ptr();
+        i += 1;
+    }
+    SignalTable(table)
+}
+
+/// bionic's `sys_signame` (`<signal.h>`, build.rs `SIGDEFS`): "HUP" for SIGHUP.
+#[unsafe(no_mangle)]
+#[allow(non_upper_case_globals)]
+pub static sys_signame: SignalTable = signal_table(0);
+
+/// bionic's `sys_siglist` (`<signal.h>`, build.rs `SIGDEFS`): "Hangup" for SIGHUP. glibc's own is a non-default compat version, so links bind this one.
+#[unsafe(no_mangle)]
+#[allow(non_upper_case_globals)]
+pub static sys_siglist: SignalTable = signal_table(1);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(table: &SignalTable, number: usize) -> Option<&'static str> {
+        let p = table.0[number];
+        // SAFETY: null or a 'static C string literal (SignalTable)
+        (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_str().unwrap())
+    }
+
+    // Numbers: Linux generic signal ABI (asm-generic/signal.h: SIGHUP 1, SIGKILL 9, SIGSYS 31; _NSIG 64 -> bionic NSIG 65). Strings: bionic_sigdefs.h at the pin.
+    #[test]
+    fn tables_match_bionic() {
+        assert_eq!(signal_names::NSIG, 65);
+        assert_eq!(entry(&sys_signame, 1), Some("HUP"));
+        assert_eq!(entry(&sys_siglist, 1), Some("Hangup"));
+        assert_eq!(entry(&sys_signame, 9), Some("KILL"));
+        assert_eq!(entry(&sys_siglist, 31), Some("Bad system call"));
+        // signal 0 and the real-time range stay null (strsignal.cpp: "that's the ABI")
+        assert_eq!(entry(&sys_signame, 0), None);
+        assert_eq!(entry(&sys_siglist, 34), None);
+    }
 }

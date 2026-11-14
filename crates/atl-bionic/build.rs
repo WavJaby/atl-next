@@ -301,6 +301,7 @@ fn renamed(function: &str) -> String {
 /// ScopedPipe.h calls `pipe2(fd, O_CLOEXEC)` after `<sys/socket.h>` alone. glibc's home for those flags is
 /// `<fcntl.h>`; uapi `<asm/fcntl.h>` itself would redefine glibc's `struct flock`.
 /// `linux/magic.h`: bionic's `<sys/vfs.h>` (and `<sys/statfs.h>` through it) includes it, a kernel uapi include the shape walk does not derive; libandroid_runtime NativeLibraryHelper.cpp compares `statfs.f_type` with `EXT4_SUPER_MAGIC` after `<sys/statfs.h>` alone. Macros only, so glibc's header followed by it compiles.
+/// `linux/xattr.h`: bionic's `<sys/xattr.h>` includes it, glibc's does not; adbd file_sync_service.cpp reads `XATTR_NAME_CAPS` after `<sys/xattr.h>` alone. uapi `libc-compat.h` sees glibc's `_SYS_XATTR_H` and drops its own `XATTR_CREATE` / `XATTR_REPLACE` enum, so the pair compiles.
 /// glibc feature macros that `_GNU_SOURCE` turns on and bionic has no counterpart of, turned off after
 /// the host's `<features.h>` by a generated front of it, so device compiles see bionic's view.
 /// `__USE_DYNAMIC_STACK_SIZE` (glibc >= 2.34): `SIGSTKSZ` / `PTHREAD_STACK_MIN` become `sysconf` calls and
@@ -325,7 +326,17 @@ const EXTRA_INCLUDES: &[(&str, &str)] = &[
     ("unistd.h", "asm/unistd.h"),
     ("sys/socket.h", "fcntl.h"),
     ("sys/vfs.h", "linux/magic.h"),
+    ("sys/xattr.h", "linux/xattr.h"),
 ];
+
+/// bionic's BSD signal tables (`<signal.h>` `sys_siglist` / `sys_signame`, strsignal.cpp), exported as data: mksh
+/// builds with `HAVE_SYS_SIGNAME` / `HAVE_SYS_SIGLIST` (its Android.bp) and indexes both. glibc has no
+/// `sys_signame` and, since 2.32, `sys_siglist` only as a non-default compat symbol, declared nowhere, so
+/// links bind ours. Entries from bionic's own X-macro list; numbers and `_NSIG` from bionic's `<signal.h>`,
+/// checked equal to the host's (the declaration callers see sizes the array with the host's `_NSIG`).
+const SIGDEFS: &str = "bionic/libc/private/bionic_sigdefs.h";
+/// Generated, under `capi/include`; the shape wrapper of `<signal.h>` includes it.
+const SIGNAL_NAMES_HEADER: &str = "atl-bionic/signal_names.h";
 
 /// Records of a kernel uapi header, declared alone (bridgegen's C printer, layout asserted against
 /// bionic's view) in a generated header the shape wrapper of a host header includes (`shape::Inputs::extra`).
@@ -477,6 +488,7 @@ fn main() -> Result<()> {
         .map(|a| a.source)
         .chain(PROP_AREA_SOURCES.iter().copied())
         .chain(PROP_AREA_HEADERS.iter().copied())
+        .chain([SIGDEFS])
     {
         up.file(&format!("aosp/{rel}"))?;
     }
@@ -661,6 +673,10 @@ fn generate(
         ))
     });
     files.extend(refusals.take(timespec));
+    if let Some(names) = refusals.take(signal_names(up, host, level, out)) {
+        files.extend(names);
+        extra.push(("signal.h", SIGNAL_NAMES_HEADER));
+    }
     let shape = shape(up, host, level, &extra, refusals)?;
     for (name, text) in &shape.wrappers {
         let path = Path::new("capi/include").join(name);
@@ -972,6 +988,86 @@ fn prop_area(up: &Upstreams, mut target: Target, out: &Path) -> Result<Interface
         &src,
         &[target],
     )
+}
+
+/// `SIGDEFS`' entries as (macro name, description), in file order.
+fn sigdefs(text: &str) -> Result<Vec<(&str, &str)>> {
+    let mut defs = Vec::new();
+    for line in text.lines() {
+        let Some(args) = line.trim().strip_prefix("__BIONIC_SIGDEF(") else {
+            continue;
+        };
+        let parsed = args.split_once(',').and_then(|(name, rest)| {
+            let desc = rest.trim().strip_suffix(')')?.trim();
+            let desc = desc.strip_prefix('"')?.strip_suffix('"')?;
+            // printed into a Rust c"" literal as is
+            (!desc.contains(['"', '\\'])).then_some((name.trim(), desc))
+        });
+        defs.push(parsed.with_context(|| format!("{SIGDEFS}: unparsed entry `{line}`"))?);
+    }
+    ensure!(!defs.is_empty(), "{SIGDEFS}: no __BIONIC_SIGDEF entries");
+    Ok(defs)
+}
+
+/// The signal tables (`SIGDEFS`): `signal_names.rs` (`NSIG`, `ENTRIES`) and the declarations header.
+fn signal_names(up: &Upstreams, host: &ArchRow, level: u64, out: &Path) -> Result<Outputs> {
+    let path = up.aosp(SIGDEFS);
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let defs = sigdefs(&text)?;
+    let mut probe = String::from("#include <signal.h>\n#define ATL_SIG__NSIG _NSIG\n");
+    for (name, _) in &defs {
+        probe.push_str(&format!("#define ATL_SIG_{name} {name}\n"));
+    }
+    let unit = out.join("signal_numbers.c");
+    std::fs::write(&unit, probe)?;
+    let src = Source::c(&unit, &["ATL_SIG_*"]);
+    let mut views = Vec::new();
+    for target in [bionic_target(up, host, level, None), host_target(host)?] {
+        let iface =
+            atl_bridgegen::interface("signal_names", "<signal.h> signal numbers", &src, &[target])?;
+        let view: BTreeMap<String, u64> = iface.arches[&host.arch]
+            .constants
+            .iter()
+            .map(|(n, c)| (n.clone(), c.bits))
+            .collect();
+        views.push(view);
+    }
+    ensure!(
+        views[0] == views[1],
+        "signal numbers differ between bionic and the host libc: bionic {:?}, host {:?}",
+        views[0],
+        views[1]
+    );
+    let number = |name: &str| {
+        views[0]
+            .get(&format!("ATL_SIG_{name}"))
+            .copied()
+            .with_context(|| format!("<signal.h> {name}: not evaluated"))
+    };
+    let nsig = number("_NSIG")?;
+    let mut rs = format!(
+        "// generated by atl-bionic build.rs from {SIGDEFS} and bionic's <signal.h>, do not edit\n\n/// bionic's `_NSIG`: both tables' length.\npub const NSIG: usize = {nsig};\n/// (signal number, `sys_signame` entry, `sys_siglist` entry); every other slot is null, as bionic's.\npub const ENTRIES: &[(usize, &core::ffi::CStr, &core::ffi::CStr)] = &[\n"
+    );
+    for (name, desc) in &defs {
+        let n = number(name)?;
+        ensure!(n < nsig, "{name} = {n}: outside _NSIG {nsig}");
+        // strsignal.cpp: `&(#signal_number)[3]`
+        let short = name
+            .strip_prefix("SIG")
+            .with_context(|| format!("{SIGDEFS}: {name} lacks the SIG prefix"))?;
+        rs.push_str(&format!("    ({n}, c\"{short}\", c\"{desc}\"),\n"));
+    }
+    rs.push_str("];\n");
+    // bionic signal.h:57-58 without the nullability qualifiers; `_NSIG` is the host's, checked equal above
+    let header = "/* Generated by atl-bionic build.rs (SIGDEFS): bionic's <signal.h> tables. */\n#pragma once\n#include <sys/cdefs.h>\n__BEGIN_DECLS\nextern const char* const sys_siglist[_NSIG];\nextern const char* const sys_signame[_NSIG];\n__END_DECLS\n";
+    Ok(vec![
+        (PathBuf::from("signal_names.rs"), rs),
+        (
+            Path::new("capi/include").join(SIGNAL_NAMES_HEADER),
+            header.to_owned(),
+        ),
+    ])
 }
 
 /// `struct timespec`'s layout, the field `__system_property_wait`'s timeout is read through: evaluated in
