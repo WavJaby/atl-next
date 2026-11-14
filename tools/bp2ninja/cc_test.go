@@ -156,3 +156,27 @@ cc_library { name: "optout", device_supported: false }`,
 		}
 	}
 }
+
+// cc/linker.go linkerDeps (pinned build/soong 533c3c2, line 332): use_version_lib true appends libbuildversion to WholeStaticLibs; unset or false adds nothing.
+func TestUseVersionLib(t *testing.T) {
+	for _, c := range []struct {
+		prop string
+		want []string
+	}{{"", nil}, {"use_version_lib: false,", nil}, {"use_version_lib: true,", []string{"libbuildversion"}}} {
+		g := graphFor(t, map[string]string{"p/Android.bp": `
+cc_binary { name: "adbd", srcs: ["a.c"], system_shared_libs: [], stl: "none", ` + c.prop + ` }
+cc_library_static { name: "libbuildversion", srcs: ["a.c"], system_shared_libs: [], stl: "none" }
+`})
+		n := g.node("adbd", Device, Binary, "t")
+		if n == nil {
+			t.Fatalf("%q: no node, problems %q", c.prop, g.problems)
+		}
+		var got []string
+		for _, d := range n.deps.whole {
+			got = append(got, d.name)
+		}
+		if !slices.Equal(got, c.want) {
+			t.Errorf("%q: whole %q, want %q", c.prop, got, c.want)
+		}
+	}
+}

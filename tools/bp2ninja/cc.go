@@ -799,6 +799,10 @@ func (g *Graph) treeNode(ref string, side Side, want Kind, from string) *Node {
 	}
 	// cc_object modules named in srcs (srcFiles) are linked whole, as Soong links their object
 	n.deps.whole = append(dep(n.props.strs("whole_static_libs"), Static), n.objSrcs...)
+	// cc/linker.go linkerDeps: use_version_lib whole-links libbuildversion (its <build/version.h> and soong_build_number)
+	if n.props.boolean("use_version_lib", false) {
+		n.deps.whole = append(n.deps.whole, dep([]string{"libbuildversion"}, Static)...)
+	}
 	n.deps.static = dep(n.props.strs("static_libs"), Static)
 	n.deps.shared = dep(n.props.strs("shared_libs"), Shared)
 	// Soong's implicit system_shared_libs (cc/linker.go): the toolchain's default when unset, `[]` declines it; android sides only, host tools link the host's C library
