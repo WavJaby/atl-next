@@ -209,6 +209,17 @@ mirrors = [
     "frameworks/base/apex/jobscheduler/service/java/com/android/server/alarm/Alarm.java#matches",
 ]
 
+[jobscheduler]
+src = ["crates/atl-services/src/job_scheduler.rs"]
+mirrors = [
+    "frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobSchedulerService.java#scheduleAsPackage",
+    "frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobSchedulerService.java#getPendingJobs",
+    "frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobSchedulerService.java#cancelJob",
+    "frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobSchedulerService.java#cancelJobsForUid",
+    "frameworks/base/apex/jobscheduler/framework/java/android/app/job/JobInfo.java#writeToParcel",
+    "frameworks/base/apex/jobscheduler/framework/java/android/app/job/JobWorkItem.java#writeToParcel",
+]
+
 [content]
 src = [
     "crates/atl-services/src/content.rs",

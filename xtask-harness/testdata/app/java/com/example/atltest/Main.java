@@ -140,6 +140,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "notification: " + channels());
         Log.i("AtlTest", "power: " + power());
         Log.i("AtlTest", "uimode: " + uiMode());
+        Log.i("AtlTest", "jobscheduler: " + jobs());
         Log.i("AtlTest", "pendingintent: " + pendingIntent());
         Log.i("AtlTest", "processes: " + processes());
         Log.i("AtlTest", "features: " + features());
@@ -387,6 +388,33 @@ public class Main extends Activity {
             return "interactive=" + pm.isInteractive() + " powersave=" + pm.isPowerSaveMode()
                     + " partial=" + pm.isWakeLockLevelSupported(android.os.PowerManager.PARTIAL_WAKE_LOCK)
                     + " held=" + held + " released=" + !wl.isHeld();
+        } catch (Throwable t) {
+            return "threw " + t;
+        }
+    }
+
+    /** JobIntentService's path: enqueue the same job twice (its work joins one job), read it back, cancel it; a job naming an activity as its service is refused. "absent" when getSystemService returns null. */
+    private String jobs() {
+        try {
+            android.app.job.JobScheduler js = (android.app.job.JobScheduler) getSystemService(JOB_SCHEDULER_SERVICE);
+            if (js == null) {
+                return "absent";
+            }
+            android.app.job.JobInfo job = new android.app.job.JobInfo.Builder(7, new android.content.ComponentName(this, AtlJob.class)).setOverrideDeadline(0).build();
+            int first = js.enqueue(job, new android.app.job.JobWorkItem(new Intent("atl.test.JOB")));
+            int again = js.enqueue(job, new android.app.job.JobWorkItem(new Intent("atl.test.JOB")));
+            boolean pending = js.getPendingJob(7) != null;
+            int count = js.getAllPendingJobs().size();
+            js.cancel(7);
+            boolean cancelled = js.getPendingJob(7) == null;
+            String rejected;
+            try {
+                js.schedule(new android.app.job.JobInfo.Builder(8, new android.content.ComponentName(this, Main.class)).setOverrideDeadline(0).build());
+                rejected = "none";
+            } catch (Throwable t) {
+                rejected = t.getClass().getSimpleName();
+            }
+            return "enqueue=" + first + " again=" + again + " pending=" + pending + " count=" + count + " cancelled=" + cancelled + " rejected=" + rejected;
         } catch (Throwable t) {
             return "threw " + t;
         }

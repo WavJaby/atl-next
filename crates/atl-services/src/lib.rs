@@ -62,6 +62,8 @@ pub mod install;
 #[cfg(feature = "converter")]
 pub mod installed;
 #[cfg(feature = "converter")]
+pub mod job_scheduler;
+#[cfg(feature = "converter")]
 pub mod notification;
 #[cfg(feature = "converter")]
 pub mod notification_channels;

@@ -117,7 +117,16 @@ const MEDIAPLAYER_START: &str = "MediaPlayerNative: start called in state 1";
 /// power: Main.power: a desktop session is interactive with battery saver off; PARTIAL is a supported level; a PARTIAL wake lock is held after acquire and not after release
 /// (WAKE_LOCK is requested + NORMAL -> granted; a refused acquire or release throws SecurityException and the line reads `threw ...`).
 /// uimode: Main.uiMode: UI_MODE_TYPE_NORMAL (1), MODE_NIGHT_NO (1), and the Configuration's uiMode TYPE_NORMAL | NIGHT_NO = 0x11 = 17 (UiModeManagerService's default for a normal device).
-const SERVICE_LINES: [(&str, &str, Option<&str>); 5] = [
+/// jobscheduler: Main.jobs: each enqueue answers RESULT_SUCCESS (1); the second, of an equal JobInfo, joins the first job (JobSchedulerService.scheduleAsPackage), so one job is pending; cancel removes it;
+/// a job whose service is an activity fails enforceValidJobRequest ("non-existent component") -> IllegalArgumentException.
+const SERVICE_LINES: [(&str, &str, Option<&str>); 6] = [
+    (
+        "jobscheduler",
+        "AtlTest: jobscheduler: ",
+        Some(
+            "enqueue=1 again=1 pending=true count=1 cancelled=true rejected=IllegalArgumentException",
+        ),
+    ),
     ("connectivity", "AtlTest: connectivity: ", None),
     (
         "permissionmgr",

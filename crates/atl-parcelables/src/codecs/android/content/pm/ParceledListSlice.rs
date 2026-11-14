@@ -10,6 +10,7 @@ use std::io::Write;
 use super::FeatureInfo::FeatureInfo;
 use super::InstrumentationInfo::InstrumentationInfo;
 use crate::codecs::android::app::NotificationChannel::NotificationChannel;
+use crate::codecs::android::app::job::JobInfo::JobInfo;
 use crate::parcel::*;
 use crate::parts::*;
 
@@ -75,6 +76,8 @@ elements! {
     FeatureInfo => "android.content.pm.FeatureInfo",
     // INotificationManager.createNotificationChannels / getNotificationChannels
     NotificationChannel => "android.app.NotificationChannel",
+    // IJobScheduler.getAllPendingJobs / getAllPendingJobsInNamespace
+    JobInfo => "android.app.job.JobInfo",
 }
 
 /// AIDL names it raw (`ParceledListSlice`) and typed (`ParceledListSlice<ApplicationStartInfo>`) alike, so the type parameter is only a marker (default `()`, as `opaque!` does for the generic ones): the

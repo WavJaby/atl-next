@@ -12,6 +12,10 @@ pub mod android {
         pub mod ContentProviderHolder;
         pub mod NotificationChannel;
         pub mod PendingIntent;
+        pub mod job {
+            pub mod JobInfo;
+            pub mod JobWorkItem;
+        }
         pub mod servertransaction {
             pub mod ClientTransaction;
         }

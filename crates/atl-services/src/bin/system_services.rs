@@ -87,7 +87,7 @@ struct Args {
     /// Test only: `sensorservice` is not registered, the deliberate break of the sensors gate's empty stage (SensorManager then waits for it, SensorManager.cpp `waitForSensorService`).
     #[arg(long)]
     no_sensor_service: bool,
-    /// Test only: this service (`connectivity`, `permissionmgr`, `power`, `uimode`, `webviewupdate`) is not registered (repeat), the deliberate break of the app gate's line for it (its manager is then null).
+    /// Test only: this service (`connectivity`, `jobscheduler`, `permissionmgr`, `power`, `uimode`, `webviewupdate`) is not registered (repeat), the deliberate break of the app gate's line for it (its manager is then null).
     #[arg(long)]
     omit_service: Vec<String>,
     /// Start `sensorservice` in HAL bypass data injection mode with this package allow-listed (AOSP `dumpsys sensorservice hal_bypass_replay_data_injection <package>`); refused while the machine has a real accelerometer. atld `--tilt-keys` sets it.
@@ -127,6 +127,8 @@ const CLIPBOARD: &str = "clipboard";
 const NOTIFICATION: &str = "notification";
 /// Context.ALARM_SERVICE (Context.java:4750).
 const ALARM: &str = "alarm";
+/// Context.JOB_SCHEDULER_SERVICE (JobSchedulerFrameworkInitializer registers its static service over this name).
+const JOB_SCHEDULER: &str = "jobscheduler";
 /// The name libsensor's SensorManager waits for (SensorManager.cpp `waitForSensorService`).
 const SENSOR: &str = "sensorservice";
 /// Context.CONNECTIVITY_SERVICE (ConnectivityFrameworkInitializer.registerServiceWrappers looks it up by this name).
@@ -402,6 +404,16 @@ fn main() -> Result<()> {
         atl_services::alarm::new_binder(Arc::clone(&packages), Arc::clone(&permissions)),
     )
     .context("addService alarm")?;
+    if !a.omit_service.iter().any(|s| s == JOB_SCHEDULER) {
+        binder::add_service(
+            JOB_SCHEDULER,
+            atl_services::job_scheduler::new_binder(
+                Arc::clone(&packages),
+                Arc::clone(&permissions),
+            ),
+        )
+        .context("addService jobscheduler")?;
+    }
     if !a.no_sensor_service {
         // the machine's sensors through the platform layer, listed once at start
         let source: Arc<dyn atl_platform_host::Sensors> =
