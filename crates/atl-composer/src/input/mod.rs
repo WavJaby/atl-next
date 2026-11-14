@@ -828,7 +828,8 @@ mod publish {
             // a window at (600, 390): getX is the point less the origin, getRawX the point
             assert_eq!(m.transform, [1.0, 0.0, 0.0, 1.0, -600.0, -390.0]);
             assert_eq!(m.raw_transform, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
-            assert_eq!((m.down_time, m.event_time), (5_000_000, 7_000_000));
+            // platform times are already AOSP's ns: passed through unchanged
+            assert_eq!((m.down_time, m.event_time), (5, 7));
         }
     }
 }
