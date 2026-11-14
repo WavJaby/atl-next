@@ -389,6 +389,7 @@ used_by = ["xtask:cross", "host:riscv64"]
 # libc++-19-dev, all 1:19.1.7-3+b1. Headers under usr/lib/llvm-19/include/c++/v1 (bp2ninja -upstream-toolchain); the .so.1 runtimes
 # (libc++, libc++abi, libunwind) for the link and NEEDED. libatomic1 (gcc-14 14.2.0-19, the native riscv64 package libc++1-19 Depends on) is their runtime NEEDED: pinned for the runtime closure.
 # system:libelf (providers.toml `libelf`, plan A2): libelf-dev and its Depends closure (zlib1g-dev, libzstd-dev), plus the runtime libelf1t64 and its NEEDED zlib1g, libzstd1. Native riscv64 packages, as libc++1-19 above.
+# glib-2.0 (QEMU's one required library, `xtask qemu --host riscv64`): libgio-2.0-dev (trixie's home of the glib headers, glib-2.0.pc and the .so link; libglib2.0-dev only depends on it) + runtime libglib2.0-0t64, and libpcre2-dev + libpcre2-8-0 + libsysprof-capture-4-dev for the .pc's Requires.private (pkg-config resolves them even for a dynamic link). Dynamic, as on x86: QEMU pins GLIB_VERSION_MAX_ALLOWED to its minimum, so trixie's 2.84 headers produce no reference the test host's glib 2.80 lacks.
 # <sys/capability.h> (libcore android_system_OsConstants.cpp; on x86 the build machine's libcap-dev, on AOSP the glibc host sysroot): libcap-dev and its Depends libcap2, same version as trixie amd64.
 [riscv64-sysroot]
 sysroot_debs = [
@@ -412,9 +413,14 @@ sysroot_debs = [
     "libzstd1=1.5.7+dfsg-1",
     "libcap-dev=1:2.75-10+deb13u1+b3",
     "libcap2=1:2.75-10+deb13u1+b3",
+    "libgio-2.0-dev=2.84.4-3~deb13u5",
+    "libglib2.0-0t64=2.84.4-3~deb13u5",
+    "libpcre2-dev=10.46-1~deb13u2",
+    "libpcre2-8-0=10.46-1~deb13u2",
+    "libsysprof-capture-4-dev=48.0-2",
 ]
 scope = ["build"]
-used_by = ["xtask:cross", "host:riscv64"]
+used_by = ["xtask:cross", "xtask:qemu", "host:riscv64"]
 
 # the x86_64 host's header view for atl-bridgegen probes (atl-bridgegen buildscript::host_sysroot_args, as for every host): glibc + kernel headers and libc++ of trixie main, so generation reads pinned headers, never the build machine's /usr/include or its optional -dev packages.
 # Headers only: probes link nothing, and product binaries still compile and link against the build machine. libc++-19-dev's header Depends closure (libc++abi-19-dev, libunwind-19-dev), as the riscv64 row.

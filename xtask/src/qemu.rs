@@ -19,6 +19,7 @@ use crate::arches;
 use crate::build_pool;
 use crate::deps;
 use crate::git::git;
+use crate::isa_gate;
 use crate::ndk::{self, NdkTarget};
 use crate::patch;
 use crate::slot;
@@ -41,6 +42,9 @@ pub struct Args {
     /// arches.toml guest row whose `qemu_target` is built.
     #[arg(long, default_value = DEFAULT_ARCH)]
     pub arch: String,
+    /// arches.toml host row the executable runs on (default: the build machine). Another arch is a cross build (`<target>-linux-user-<host>`) gated by the host's isa, glibc_floor and sysroot instead of a `--version` run.
+    #[arg(long)]
+    pub host: Option<String>,
     /// Out dir (default: this checkout's slot, see `xtask slot`; else <workspace>/out).
     #[arg(long)]
     pub out: Option<PathBuf>,
@@ -72,6 +76,48 @@ pub struct Build {
     pub cc: String,
     /// The ninja binary (deps row `ninja`).
     pub ninja: String,
+    /// The host of another arch than the build machine, None for a native build.
+    pub cross: Option<Cross>,
+}
+
+/// A cross host for QEMU's own configure: `--cross-prefix` makes it write a meson cross file (`[host_machine]` from `--cpu`, which QEMU maps to meson's cpu_family); compiler, binutils and pkg-config come from the arches.toml host row and deps rows, never from `<prefix>gcc` tools the build machine lacks.
+pub struct Cross {
+    /// The arches.toml host row (`riscv64`).
+    pub host: String,
+    /// Its meson_cpu_family, QEMU's `--cpu`.
+    pub cpu: String,
+    /// Its clang triple: `--target` and the `--cross-prefix` QEMU derives tool names from.
+    pub clang: String,
+    /// The unpacked sysroot (deps `sysroot_debs` row).
+    pub sysroot: PathBuf,
+    /// Its isa, passed as `-march` (clang takes the arches.toml spelling as is).
+    pub isa: String,
+    /// The cross compiler binary (row `cc`).
+    pub cc: String,
+    /// `AR`, `NM`, ... for configure: the llvm row's tools, which read every target's objects.
+    pub tools: Vec<(String, String)>,
+}
+
+impl Cross {
+    /// configure's environment: the binutils and pkg-config restricted to the sysroot (no build-machine .pc file can leak in).
+    fn env(&self) -> Vec<(String, String)> {
+        let pc = |dir: &str| self.sysroot.join(dir).display().to_string();
+        let mut env = self.tools.clone();
+        env.push(("PKG_CONFIG".to_owned(), "pkg-config".to_owned()));
+        env.push((
+            "PKG_CONFIG_SYSROOT_DIR".to_owned(),
+            self.sysroot.display().to_string(),
+        ));
+        env.push((
+            "PKG_CONFIG_LIBDIR".to_owned(),
+            format!(
+                "{}:{}",
+                pc(&format!("usr/lib/{}/pkgconfig", self.clang)),
+                pc("usr/share/pkgconfig")
+            ),
+        ));
+        env
+    }
 }
 
 impl Build {
@@ -104,10 +150,26 @@ impl Build {
             "--enable-linux-user".to_owned(),
             "--disable-docs".to_owned(),
             "-Dtools=disabled".to_owned(),
-            format!("--cc={}", self.cc),
             format!("--cross-cc-{}={}", self.target, self.guest_cc.display()),
             format!("--cross-cc-cflags-{}=-static", self.target),
         ];
+        match &self.cross {
+            None => args.push(format!("--cc={}", self.cc)),
+            Some(c) => {
+                // configure splits --cc on spaces into the cross file's `c = [...]`; the build machine's compiler builds QEMU's own build-time tools
+                args.push(format!("--cross-prefix={}-", c.clang));
+                args.push(format!("--cpu={}", c.cpu));
+                args.push(format!(
+                    "--cc={} --target={} --sysroot={} -march={}",
+                    c.cc,
+                    c.clang,
+                    c.sysroot.display(),
+                    c.isa
+                ));
+                args.push(format!("--host-cc={}", self.cc));
+                args.push("--extra-ldflags=-fuse-ld=lld".to_owned());
+            }
+        }
         if self.pic {
             // meson's b_pie=true appends -fPIE after --extra-cflags, and -fPIE wins for clang (TPOFF32 on current_cpu in a shared object).
             // --disable-pie drops -fPIE (meson.build: -fno-pie instead); the explicit -fPIC then sets the codegen.
@@ -120,7 +182,22 @@ impl Build {
 
 /// The build of `arch` into `out` (default: this checkout's slot). Reads only: the pin, the NDK and the deps rows, then the out dir (which takes the slot lock, as every build does).
 pub fn plan(root: &Path, arch: &str, out: Option<&Path>, pic: bool) -> Result<Build> {
+    plan_on(root, arch, None, out, pic)
+}
+
+/// [`plan`] for the executable running on arches.toml host `host` (None or the build machine: native).
+pub fn plan_on(
+    root: &Path,
+    arch: &str,
+    host: Option<&str>,
+    out: Option<&Path>,
+    pic: bool,
+) -> Result<Build> {
     let arches = arches::load(root)?;
+    let cross = match host {
+        None => None,
+        Some(host) => cross_host(root, &arches, host)?,
+    };
     let target = arches::qemu_target(&arches, arch)?.to_owned();
     let (src, version) = pinned(root)?;
     let ndk = ndk::default_ndk(root)?;
@@ -134,10 +211,15 @@ pub fn plan(root: &Path, arch: &str, out: Option<&Path>, pic: bool) -> Result<Bu
         ndk.display()
     );
     let out = slot::out_dir(root, out, "--out", |ws| ws.join("out"))?;
-    let suffix = if pic { "-pic" } else { "" };
+    let pic_suffix = if pic { "-pic" } else { "" };
+    let host_suffix = cross
+        .as_ref()
+        .map_or_else(String::new, |c| format!("-{}", c.host));
     Ok(Build {
         arch: arch.to_owned(),
-        dir: out.join(DIR).join(format!("{target}-linux-user{suffix}")),
+        dir: out
+            .join(DIR)
+            .join(format!("{target}-linux-user{pic_suffix}{host_suffix}")),
         target,
         pic,
         src,
@@ -145,7 +227,48 @@ pub fn plan(root: &Path, arch: &str, out: Option<&Path>, pic: bool) -> Result<Bu
         guest_cc,
         cc: deps::binary(root, "clang")?,
         ninja: deps::binary(root, "ninja")?,
+        cross,
     })
+}
+
+/// The cross host `host` (arches::cross_target), None when it is the build machine. Its rows must be satisfied (deps::host_rows_problems names the fetch command).
+fn cross_host(root: &Path, arches: &arches::Arches, host: &str) -> Result<Option<Cross>> {
+    let (build, _) = arches::build_machine(root, arches)?;
+    let row = arches
+        .get(host)
+        .and_then(|a| a.host.as_ref())
+        .with_context(|| format!("{}: no [{host}.host] row", arches::FILE))?;
+    let Some(t) = arches::cross_target(host, row, build)? else {
+        return Ok(None);
+    };
+    let problems = deps::host_rows_problems(root, host)?;
+    ensure!(
+        problems.is_empty(),
+        "cross host {host}: {}",
+        problems.join("; ")
+    );
+    // the llvm row names llvm-ar-<major>; its siblings share the suffix
+    let ar = deps::binary(root, "llvm")?;
+    let tool = |name: &str| ar.replacen("llvm-ar", &format!("llvm-{name}"), 1);
+    let tools = [
+        ("AR", "ar"),
+        ("NM", "nm"),
+        ("RANLIB", "ranlib"),
+        ("STRIP", "strip"),
+        ("OBJCOPY", "objcopy"),
+    ]
+    .into_iter()
+    .map(|(var, name)| (var.to_owned(), tool(name)))
+    .collect();
+    Ok(Some(Cross {
+        host: host.to_owned(),
+        cpu: row.meson_cpu_family.clone(),
+        sysroot: deps::sysroot_root(root, &t.sysroot)?,
+        clang: t.clang,
+        isa: t.isa,
+        cc: deps::binary(root, &t.cc)?,
+        tools,
+    }))
 }
 
 /// The checkout as `patch::preflight` allows it (pin + patches/qemu, clean), and the pin's version.
@@ -193,6 +316,7 @@ fn configure(b: &Build) -> Result<()> {
     let log = b.dir.join("configure.log");
     let status = Command::new(b.src.join("configure"))
         .args(&args)
+        .envs(b.cross.iter().flat_map(Cross::env))
         .current_dir(&build)
         .stdout(File::create(&log)?)
         .stderr(File::options().append(true).open(&log)?)
@@ -268,8 +392,30 @@ pub fn execute(root: &Path, b: &Build) -> Result<PathBuf> {
     let _token = build_pool::acquire_build(&ws, root, "qemu")?;
     configure(b)?;
     ninja(b)?;
-    check_version(b)?;
+    match &b.cross {
+        None => check_version(b)?,
+        Some(c) => check_cross(root, b, c)?,
+    }
     Ok(b.exe())
+}
+
+/// A cross executable cannot run here: the host's isa gate holds it to the row's isa closure, glibc_floor and sysroot libraries.
+fn check_cross(root: &Path, b: &Build, c: &Cross) -> Result<()> {
+    let arches = arches::load(root)?;
+    let host = arches
+        .get(&c.host)
+        .and_then(|a| a.host.as_ref())
+        .with_context(|| format!("{}: no [{}.host] row", arches::FILE, c.host))?;
+    let report = isa_gate::check_executable(&b.exe(), host, &isa_gate::sysroot_dirs(root, host)?)?;
+    for line in isa_gate::summary(&report) {
+        println!("qemu: isa gate: {line}");
+    }
+    ensure!(
+        report.violations.is_empty(),
+        "qemu: isa gate: {}",
+        isa_gate::first_violation(&report).unwrap_or_default()
+    );
+    Ok(())
 }
 
 /// The engine's guest executables' crate root (atl-qemu-boot): `no_std`, each entry in `global_asm!`, chosen by cfg.
@@ -331,7 +477,13 @@ fn guest_exe(root: &Path, b: &Build, out: &Path, name: &str, cfg: Option<&str>) 
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let b = plan(root, &args.arch, args.out.as_deref(), args.pic)?;
+    let b = plan_on(
+        root,
+        &args.arch,
+        args.host.as_deref(),
+        args.out.as_deref(),
+        args.pic,
+    )?;
     if !args.execute {
         println!(
             "qemu: plan for {} (dry run; `--execute` configures and builds)",
@@ -391,6 +543,7 @@ mod tests {
             guest_cc: PathBuf::from("/ndk/aarch64-linux-android29-clang"),
             cc: "clang-19".to_owned(),
             ninja: "ninja".to_owned(),
+            cross: None,
         }
     }
 
@@ -427,5 +580,37 @@ mod tests {
         let args = b.configure_args();
         assert!(args.contains(&"--disable-pie".to_owned()));
         assert!(args.contains(&"--extra-cflags=-fPIC".to_owned()));
+    }
+
+    /// A cross host: configure only writes a meson cross file with --cross-prefix; the cross clang is one --cc word list, the build machine's clang builds the build-time tools, and pkg-config sees only the sysroot.
+    #[test]
+    fn cross_host_configures_a_meson_cross_build() {
+        let mut b = build("aarch64");
+        b.cross = Some(Cross {
+            host: "riscv64".to_owned(),
+            cpu: "riscv64".to_owned(),
+            clang: "riscv64-linux-gnu".to_owned(),
+            sysroot: PathBuf::from("/s"),
+            isa: "rv64gc".to_owned(),
+            cc: "clang-21".to_owned(),
+            tools: vec![("AR".to_owned(), "llvm-ar-19".to_owned())],
+        });
+        let args = b.configure_args();
+        for want in [
+            "--cross-prefix=riscv64-linux-gnu-",
+            "--cpu=riscv64",
+            "--cc=clang-21 --target=riscv64-linux-gnu --sysroot=/s -march=rv64gc",
+            "--host-cc=clang-19",
+            "--extra-ldflags=-fuse-ld=lld",
+        ] {
+            assert!(args.contains(&want.to_owned()), "{want}: {args:?}");
+        }
+        assert!(!args.contains(&"--cc=clang-19".to_owned()));
+        let env = b.cross.as_ref().unwrap().env();
+        assert!(env.contains(&("AR".to_owned(), "llvm-ar-19".to_owned())));
+        assert!(env.contains(&(
+            "PKG_CONFIG_LIBDIR".to_owned(),
+            "/s/usr/lib/riscv64-linux-gnu/pkgconfig:/s/usr/share/pkgconfig".to_owned()
+        )));
     }
 }

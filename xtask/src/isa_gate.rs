@@ -257,6 +257,20 @@ pub fn check(
             .with_context(|| format!("provided {}: not a 64-bit ELF", lib.display()))?;
         index.provided.extend(library_names(&lib, &linkage));
     }
+    index.sysroot = sysroot_names(sysroot)?;
+    for (owner, linkage) in &owners {
+        report.needed_products += 1;
+        report.needed_entries += linkage.needed.len();
+        for line in needed_violations(owner, &linkage.needed, &index) {
+            report.fail(Check::Needed, line);
+        }
+    }
+    Ok(report)
+}
+
+/// The library names the shared objects in `sysroot` (sysroot_dirs) answer to.
+fn sysroot_names(sysroot: &[PathBuf]) -> Result<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
     for dir in sysroot {
         for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
             let path = entry?.path();
@@ -269,14 +283,62 @@ pub fn check(
             let data =
                 std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
             if let Some(linkage) = provided_gate::linkage(&data)? {
-                index.sysroot.extend(library_names(&path, &linkage));
+                names.extend(library_names(&path, &linkage));
             }
         }
     }
-    for (owner, linkage) in &owners {
-        report.needed_products += 1;
-        report.needed_entries += linkage.needed.len();
-        for line in needed_violations(owner, &linkage.needed, &index) {
+    Ok(names)
+}
+
+/// The gate for one executable built outside the converter's out dir (`xtask qemu --host`): it must be a riscv64 ELF64 whose ISA claim is inside `host`'s isa closure (no tier applies), whose GLIBC needs stay at or below glibc_floor, and whose DT_NEEDED names a `sysroot` library answers to.
+pub fn check_executable(path: &Path, host: &arches::Host, sysroot: &[PathBuf]) -> Result<Report> {
+    let (Some(isa), Some(floor)) = (&host.isa, &host.glibc_floor) else {
+        bail!(
+            "{}: the isa gate needs the row's isa and glibc_floor",
+            arches::FILE
+        );
+    };
+    let allowed = arches::isa_closure(isa)?;
+    let floor = arches::dotted_version(floor)?;
+    let name = path.display().to_string();
+    let data = std::fs::read(path).with_context(|| format!("reading {name}"))?;
+    let mut report = Report {
+        build_machine: build_machine()?,
+        product_elfs: 1,
+        ..Report::default()
+    };
+    let Some(f) = riscv64_elf(&data).with_context(|| name.clone())? else {
+        report.fail(Check::Machine, format!("{name}: not a riscv64 ELF64"));
+        return Ok(report);
+    };
+    report.files = 1;
+    let claim = isa_claim(&f, &data).with_context(|| name.clone())?;
+    for v in isa_violations(claim.as_deref(), &allowed, isa) {
+        report.fail(Check::Isa, format!("{name}: {v}"));
+    }
+    let needs = glibc_needs(&f, &data).with_context(|| name.clone())?;
+    for need in &needs {
+        if let Some(version) = glibc_version(&need.version)?
+            && report
+                .max_glibc
+                .as_ref()
+                .is_none_or(|(max, _)| version > *max)
+        {
+            report.max_glibc = Some((version, format!("{name}: {}@{}", need.symbol, need.version)));
+        }
+    }
+    for line in glibc_violations(&needs, &floor)? {
+        report.fail(Check::Glibc, format!("{name}: {line}"));
+    }
+    report.isas.extend(claim);
+    if let Some(linkage) = provided_gate::linkage(&data).with_context(|| name.clone())? {
+        let index = Index {
+            sysroot: sysroot_names(sysroot)?,
+            ..Index::default()
+        };
+        report.needed_products = 1;
+        report.needed_entries = linkage.needed.len();
+        for line in needed_violations(&name, &linkage.needed, &index) {
             report.fail(Check::Needed, line);
         }
     }
