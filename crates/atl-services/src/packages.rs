@@ -27,9 +27,7 @@ const ACTION_MAIN: &str = "android.intent.action.MAIN";
 const CATEGORY_LAUNCHER: &str = "android.intent.category.LAUNCHER";
 const ACTION_MANAGE_PERMISSIONS: &str = "android.intent.action.MANAGE_PERMISSIONS";
 const CATEGORY_DEFAULT: &str = "android.intent.category.DEFAULT";
-/// ApplicationInfo.FLAG_SYSTEM (1<<0) and PRIVATE_FLAG_PRIVILEGED (1<<3), ApplicationInfo.java:189, :535.
-pub(crate) const FLAG_SYSTEM: i32 = 1;
-const PRIVATE_FLAG_PRIVILEGED: i32 = 1 << 3;
+pub(crate) use atl_services_types::system_packages::{FLAG_SYSTEM, PRIVATE_FLAG_PRIVILEGED};
 
 /// One installed package.
 #[derive(Debug, Clone)]
@@ -485,6 +483,11 @@ pub struct InstallFields<'a> {
     pub data_dir: &'a str,
     /// `/data/user_de/0/<package>`
     pub device_protected_data_dir: &'a str,
+    /// The APK paths: PackageInstallerSession's uniform names below `code_dir` (an install), or the parse's own (a system scan: the partition's files keep their names).
+    pub uniform_names: bool,
+    /// ApplicationInfo.flags / privateFlags to add (the system scan's, by location: atl-services-types `system_packages`); 0 for an install.
+    pub flags: i32,
+    pub private_flags: i32,
 }
 
 impl InstallFields<'_> {
@@ -544,10 +547,17 @@ impl InstallFields<'_> {
                 .collect::<Vec<_>>()
         });
         a.uid = i32::try_from(self.uid).unwrap_or(i32::MAX);
-        a.source_dir = Some(base.clone());
-        a.public_source_dir = Some(base);
-        a.split_source_dirs = splits.clone();
-        a.split_public_source_dirs = splits;
+        if self.uniform_names {
+            a.source_dir = Some(base.clone());
+            a.public_source_dir = Some(base);
+            a.split_source_dirs = splits.clone();
+            a.split_public_source_dirs = splits;
+        } else {
+            a.public_source_dir = a.source_dir.clone();
+            a.split_public_source_dirs = a.split_source_dirs.clone();
+        }
+        a.flags |= self.flags;
+        a.private_flags |= self.private_flags;
         // PackageAbiHelperImpl.deriveNativeLibraryPaths for a non-system app: root `<code>/lib`, dir `<root>/<isa>`, set with or without native code (LoadedApk.makePaths needs a non-null dir)
         let root = format!(
             "{}/{}",
@@ -859,6 +869,9 @@ mod tests {
             isa: "x86_64",
             data_dir: "/ce/a",
             device_protected_data_dir: "/de/a",
+            uniform_names: true,
+            flags: 0,
+            private_flags: 0,
         }
         .apply(&mut r.info);
         for a in [
@@ -878,5 +891,44 @@ mod tests {
             assert_eq!(a.native_library_root_dir.as_deref(), Some("/code/a/lib"));
             assert_eq!(a.device_protected_data_dir.as_deref(), Some("/de/a"));
         }
+    }
+
+    /// A system scan's fields: the parse's APK path kept (no uniform rename), the location's flags added to the parse's own on the app and a component's copy.
+    #[test]
+    fn scan_fields_keep_the_parsed_path_and_add_flags() {
+        let mut r = record("a");
+        let parsed = Some("/part/app/A/A.apk".to_owned());
+        r.info.application_info.as_mut().expect("app").source_dir = parsed.clone();
+        r.info.application_info.as_mut().expect("app").flags = 1 << 2;
+        let mut act = activity("a", "a.Main");
+        act.component.application_info.source_dir = parsed.clone();
+        r.info.activities = Some(vec![Some(act)]);
+        InstallFields {
+            uid: 10_001,
+            code_dir: "/part/app/A",
+            isa: "x86_64",
+            data_dir: "/ce/a",
+            device_protected_data_dir: "/de/a",
+            uniform_names: false,
+            flags: FLAG_SYSTEM,
+            private_flags: PRIVATE_FLAG_PRIVILEGED,
+        }
+        .apply(&mut r.info);
+        for a in [
+            r.app(),
+            &r.activity("a.Main")
+                .expect("activity")
+                .component
+                .application_info,
+        ] {
+            assert_eq!(a.source_dir, parsed);
+            assert_eq!(a.public_source_dir, parsed);
+            // FLAG_SYSTEM = 1<<0, PRIVATE_FLAG_PRIVILEGED = 1<<3 (ApplicationInfo.java:189, :535)
+            assert_eq!(a.flags & 1, 1);
+            assert_eq!(a.private_flags & (1 << 3), 1 << 3);
+            assert_eq!(a.native_library_dir.as_deref(), Some("/part/app/A/lib/x86_64"));
+        }
+        // the parse's own flag (1<<2) is kept beside the added one
+        assert_eq!(r.app().flags, (1 << 2) | 1);
     }
 }

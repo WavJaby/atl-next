@@ -7,6 +7,10 @@
 pub const SYSTEM: &str = "/system";
 /// The vendor partition (`Environment.getVendorDirectory()`), bound read-only: the GL driver (libEGL's Loader.cpp `/vendor/lib64/egl`), /vendor/build.prop.
 pub const VENDOR: &str = "/vendor";
+/// The product partition (`Environment.getProductDirectory()`), bound read-only: preinstalled apps under `app/`, `priv-app/` (PackageManager's system scan).
+pub const PRODUCT: &str = "/product";
+/// The system_ext partition (`Environment.getSystemExtDirectory()`), bound read-only, laid out as [`PRODUCT`].
+pub const SYSTEM_EXT: &str = "/system_ext";
 /// The platform's native libraries for the process's pointer width (bionic linker's `/system/lib64` in LP64, `/system/lib` in ILP32): libEGL's Loader.cpp `SYSTEM_LIB_PATH`.
 pub const SYSTEM_LIB: &str = if cfg!(target_pointer_width = "64") {
     "/system/lib64"

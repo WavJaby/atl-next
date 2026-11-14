@@ -278,6 +278,7 @@ pub const GATES: &[(&str, GoalsOf)] = &[
     ("binder", binder),
     ("broadcast", runtime),
     ("provider", runtime),
+    ("system-scan", runtime),
     ("composer", runtime_gralloc),
     ("compositor", || {
         Goals::host(&["servicemanager", "service", "libgui"]).with(native_load())

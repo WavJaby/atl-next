@@ -49,6 +49,30 @@ impl ControlSocket {
             other => Err(io::Error::other(format!("commit answered {other:?}"))),
         }
     }
+
+    /// Runs the installer over the preinstalled package dir `dir` (an Android path): the frames file's host path.
+    pub fn scan(&self, dir: &str) -> io::Result<String> {
+        match self.call(&Request::Scan {
+            dir: dir.to_owned(),
+        })? {
+            Response::Staged { frames } => Ok(frames),
+            Response::Error { message } => Err(io::Error::other(message)),
+            other => Err(io::Error::other(format!("scan answered {other:?}"))),
+        }
+    }
+
+    /// Accepts scan `dir` as `package` of `uid`: its data dirs are created; whether a library needs ES1.
+    pub fn scan_commit(&self, dir: &str, package: &str, uid: u32) -> io::Result<bool> {
+        match self.call(&Request::ScanCommit {
+            dir: dir.to_owned(),
+            package: package.to_owned(),
+            uid,
+        })? {
+            Response::Committed { needs_es1 } => Ok(needs_es1),
+            Response::Error { message } => Err(io::Error::other(message)),
+            other => Err(io::Error::other(format!("scan commit answered {other:?}"))),
+        }
+    }
 }
 
 /// The control socket to atld. One request is in flight at a time: the protocol is request then reply on one connection.

@@ -32,9 +32,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail, ensure};
 use atl_android_paths::{
     DATA, DATA_APP, DATA_USER, DATA_USER_DE, PROC_CPUINFO, PROPERTY_AREA, PROPERTY_AREA_ENV,
-    SDCARD, SHARED_STORAGE, SYSTEM, SYSTEM_FONTS, SYSTEM_FRAMEWORK, VENDOR,
+    PRODUCT, SDCARD, SHARED_STORAGE, SYSTEM, SYSTEM_EXT, SYSTEM_FONTS, SYSTEM_FRAMEWORK, VENDOR,
 };
 use atl_broker::control::{self, Request, Response, StagedName, StartRequest};
+use atl_services_types::system_packages;
 use atl_broker::{
     Broker, INSTALLER_UID, Link, Mount, Process, Spawn, gpu, kill_sandbox, terminate_sandbox,
     to_log, tree_mounts,
@@ -106,15 +107,17 @@ struct Args {
     /// AOSP's font data dir (frameworks/base/data/fonts): its alias.json and fallback_order.json, read as-is; the fonts themselves are the desktop's.
     #[arg(long)]
     font_data: PathBuf,
-    /// A file of /system or /vendor besides the framework's (repeat): `<host path>=<absolute Android path>`, linked there (the GL driver: /vendor/lib64/egl/<name>).
+    /// A file of /system, /vendor, /product or /system_ext besides the framework's (repeat): `<host path>=<absolute Android path>`, linked there (the GL driver: /vendor/lib64/egl/<name>; a
+    /// preinstalled package: /product/app/<Name>/<Name>.apk, scanned at start).
     #[arg(long = "file", value_parser = partition_file)]
     files: Vec<(PathBuf, PathBuf)>,
     /// A shared library packages may `<uses-library>` (repeat): `<name>=<host jar>[,<dependency name>...]`, linked as /system/framework/<file name> and registered with the package manager
     /// (SystemConfig's `<library name file dependency>`).
     #[arg(long = "shared-library", value_parser = Library::parse_arg)]
     shared_libraries: Vec<(String, Library)>,
-    /// A package to install (repeat; session i, in uid order): a JSON file `{"files": [{"split": null|<name>, "path": <host path>}]}`, base first.
-    #[arg(long = "package", required = true)]
+    /// A package to install (repeat; session i, in uid order, after the preinstalled packages): a JSON file `{"files": [{"split": null|<name>, "path": <host path>}]}`, base first. None: only the
+    /// preinstalled packages.
+    #[arg(long = "package")]
     packages: Vec<PathBuf>,
     /// atl-installer executable: AOSP's package parse and native-code install in a VM of its own, run in the broker's installer profile on each session's staged dir.
     #[arg(long)]
@@ -414,6 +417,13 @@ impl Root {
     fn vendor(&self) -> PathBuf {
         self.root.join("vendor")
     }
+    /// The partitions holding preinstalled packages beside /system (atl-services-types `system_packages`), each at `/<name>`: host dir and Android path.
+    fn package_partitions(&self) -> [(PathBuf, &'static str); 2] {
+        [
+            (self.root.join("product"), PRODUCT),
+            (self.root.join("system_ext"), SYSTEM_EXT),
+        ]
+    }
     fn data(&self) -> PathBuf {
         self.root.join("data")
     }
@@ -495,6 +505,10 @@ fn desktop_mounts() -> Result<Vec<Mount>> {
 fn system_layout(a: &Args, r: &Root) -> Result<Vec<String>> {
     let framework = r.system().join("framework");
     std::fs::create_dir_all(&framework)?;
+    // every partition exists, empty or not: each is bound into the sandboxes
+    for (host, _) in r.package_partitions() {
+        std::fs::create_dir_all(host)?;
+    }
     std::fs::copy(&a.build_prop, r.system().join("build.prop"))?;
     std::os::unix::fs::symlink(
         std::path::absolute(&a.framework_res)?,
@@ -562,8 +576,8 @@ fn host_features_layout(r: &Root, features: &[(&str, i32)]) -> Result<()> {
     Ok(())
 }
 
-/// Partitions `--file` may place files in: the root's `system` and `vendor` (Root::system, Root::vendor).
-const FILE_PARTITIONS: &[&str] = &["system", "vendor"];
+/// Partitions `--file` may place files in: the root's `system`, `vendor`, `product`, `system_ext` (Root::system, Root::vendor, Root::package_partitions).
+const FILE_PARTITIONS: &[&str] = &["system", "vendor", "product", "system_ext"];
 
 /// `--app-env`'s `KEY=VALUE`; the key non-empty.
 fn app_env_var(s: &str) -> Result<(OsString, OsString), String> {
@@ -577,7 +591,7 @@ fn app_env_var(s: &str) -> Result<(OsString, OsString), String> {
 fn partition_file(s: &str) -> Result<(PathBuf, PathBuf), String> {
     let (host, at) = s
         .split_once('=')
-        .ok_or_else(|| format!("{s}: not <host path>=</system or /vendor path>"))?;
+        .ok_or_else(|| format!("{s}: not <host path>=<partition path>"))?;
     let rel = Path::new(at)
         .strip_prefix("/")
         .map_err(|_| format!("{at}: not an absolute path"))?;
@@ -590,7 +604,10 @@ fn partition_file(s: &str) -> Result<(PathBuf, PathBuf), String> {
             .next()
             .is_some_and(|p| FILE_PARTITIONS.iter().any(|f| p.as_os_str() == *f));
     if !below {
-        return Err(format!("{at}: not a file path below /system or /vendor"));
+        return Err(format!(
+            "{at}: not a file path below a partition ({})",
+            FILE_PARTITIONS.join(", ")
+        ));
     }
     Ok((PathBuf::from(host), rel.to_path_buf()))
 }
@@ -623,12 +640,25 @@ struct Installd {
     /// VM options + `-Djava.class.path` (the api-impl dex)
     vm: Vec<OsString>,
     env: Vec<(OsString, OsString)>,
-    /// read-only: the ART root, boot jars, api-impl dex at their own paths; framework-res at its Android path
+    /// read-only, every installer run: the ART root, boot jars, api-impl dex at their own paths
     mounts: Vec<Mount>,
+    /// a session's installer view besides `mounts`: framework-res alone at its Android path
+    session_mounts: Vec<Mount>,
+    /// a system scan's installer view besides `mounts`: /system, /product, /system_ext read-only at their Android paths and the host files their links name at their own
+    scan_mounts: Vec<Mount>,
     /// staged sessions -> the uid they were staged for
     staged: Mutex<BTreeMap<u32, u32>>,
-    /// committed packages -> uid: what a start request may name
-    committed: Mutex<BTreeMap<String, u32>>,
+    /// scanned package dirs (Android paths) the installer parsed, not yet committed
+    scanned: Mutex<BTreeSet<String>>,
+    /// committed packages: what a start request may name
+    committed: Mutex<BTreeMap<String, Committed>>,
+}
+
+/// One committed package: its uid, and whether its code lies in a partition (a system scan) rather than /data/app.
+#[derive(Clone, Copy)]
+struct Committed {
+    uid: u32,
+    system: bool,
 }
 
 /// PackageInstallerSession's uniform naming in `dir`: each staged `.apk` file renamed to its `names` entry. Every staged APK is named exactly once and every target is `base.apk` or
@@ -718,6 +748,7 @@ impl Host {
                 mounts: i
                     .mounts
                     .iter()
+                    .chain(&i.session_mounts)
                     .cloned()
                     .chain([
                         Mount {
@@ -785,14 +816,7 @@ impl Host {
 
     /// Request `Commit`: session `session` (staged for `uid`) becomes `/data/app/<package>` (PackageInstallerSession's rename), with its data dirs (installd createAppData) and external dirs; whether a library needs ES1.
     fn commit(&self, session: u32, package: &str, uid: u32, names: &[StagedName]) -> Result<bool> {
-        ensure!(
-            !package.is_empty()
-                && package
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
-                && !package.starts_with('.'),
-            "{package:?}: not a package name"
-        );
+        ensure!(valid_package_name(package), "{package:?}: not a package name");
         let i = &self.installd;
         let mut staged = i.staged.lock().unwrap_or_else(|e| e.into_inner());
         ensure!(
@@ -810,18 +834,114 @@ impl Host {
         rename_staged(&staged_dir, names)?;
         std::fs::rename(&staged_dir, &code)
             .with_context(|| format!("moving session {session} to {}", code.display()))?;
+        self.create_app_data(package)?;
+        let es1 = needs_es1(&code.join(LIB_DIR_NAME))?;
+        staged.remove(&session);
+        committed.insert(package.to_owned(), Committed { uid, system: false });
+        log(format_args!("installed {package}: uid {uid}"));
+        Ok(es1)
+    }
+
+    /// Request `Scan`: runs the installer over the preinstalled package dir `dir` (an Android path), which must be one atl-services-types `system_packages::scan` finds in the root: parse only, in
+    /// place (no staging, no native-library root). The frames file; a failed run's error carries the installer's stderr.
+    fn scan(&self, dir: &str) -> Result<String> {
+        let found = system_packages::scan(&self.root.root)?;
+        let index = found
+            .dirs
+            .iter()
+            .position(|d| d.android_path() == dir)
+            .with_context(|| format!("{dir}: not a preinstalled package dir"))?;
+        let i = &self.installd;
+        let frames = self
+            .root
+            .root
+            .join("install")
+            .join(format!("scan-{index}.frames"));
+        let log_path = self.root.log(&format!("installer-scan-{index}"));
+        let spawn = Spawn {
+            uid: INSTALLER_UID,
+            context_manager: false,
+            mounts: i.mounts.iter().chain(&i.scan_mounts).cloned().collect(),
+            links: vec![],
+            devices: vec![],
+            property_area: Some(self.root.properties()),
+            rights: vec![],
+            program: i.installer.clone(),
+            args: i.vm.iter().cloned().chain([OsString::from(dir)]).collect(),
+            env: i.env.clone(),
+            cwd: None,
+            stdin: None,
+            stdout: std::fs::File::create(&frames)?.into(),
+            stderr: std::fs::File::create(&log_path)?.into(),
+        };
+        let start = Instant::now();
+        let mut p = self
+            .broker
+            .spawn_installer(spawn)
+            .with_context(|| format!("starting {}", i.installer.display()))?;
+        let status = p.child.wait()?;
+        let stderr = std::fs::read_to_string(&log_path).unwrap_or_default();
+        ensure!(
+            status.success(),
+            "scan {dir}: atl-installer exited {status}: {}",
+            stderr.trim()
+        );
+        log(format_args!(
+            "scan {dir}: installer {} ms",
+            start.elapsed().as_millis()
+        ));
+        i.scanned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(dir.to_owned());
+        Ok(frames.to_string_lossy().into_owned())
+    }
+
+    /// Request `ScanCommit`: scanned `dir` is package `package` of `uid`: its data dirs and external dirs (installd createAppData, as for any package); no ES1 fact (no native-library root).
+    fn scan_commit(&self, dir: &str, package: &str, uid: u32) -> Result<bool> {
+        ensure!(
+            uid > INSTALLER_UID,
+            "uid {uid}: at or below the installer's ({INSTALLER_UID}); package uids start above it"
+        );
+        ensure!(valid_package_name(package), "{package:?}: not a package name");
+        let i = &self.installd;
+        ensure!(
+            i.scanned
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(dir),
+            "{dir}: not scanned"
+        );
+        let mut committed = i.committed.lock().unwrap_or_else(|e| e.into_inner());
+        ensure!(
+            !committed.contains_key(package),
+            "{package}: already installed"
+        );
+        self.create_app_data(package)?;
+        committed.insert(package.to_owned(), Committed { uid, system: true });
+        log(format_args!("scanned {package}: uid {uid}, code {dir}"));
+        Ok(false)
+    }
+
+    /// installd createAppData: the package's data dirs and its external dirs.
+    fn create_app_data(&self, package: &str) -> Result<()> {
         for d in [format!("user/0/{package}"), format!("user_de/0/{package}")] {
             std::fs::create_dir_all(self.root.data().join(d))?;
         }
         for d in ["data", "obb"] {
             std::fs::create_dir_all(self.root.external(package).join(d))?;
         }
-        let es1 = needs_es1(&code.join(LIB_DIR_NAME))?;
-        staged.remove(&session);
-        committed.insert(package.to_owned(), uid);
-        log(format_args!("installed {package}: uid {uid}"));
-        Ok(es1)
+        Ok(())
     }
+}
+
+/// A package name as commit accepts it: ASCII letters, digits, `.` and `_`, not starting with `.`.
+fn valid_package_name(package: &str) -> bool {
+    !package.is_empty()
+        && package
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+        && !package.starts_with('.')
 }
 
 /// Writes the default property area (system processes map it) and returns the properties it holds, to which each app process's area adds its own.
@@ -1089,6 +1209,12 @@ impl Host {
                     writable: false,
                 },
             ])
+            // the preinstalled packages' partitions: a system app's code is readable by every app (WebView's CONTEXT_INCLUDE_CODE loads the provider's dex), as on a device
+            .chain(self.root.package_partitions().map(|(host, at)| Mount {
+                host,
+                at: at.into(),
+                writable: false,
+            }))
             // the runtime's shared host paths; the package's own directories come with start_app (package_mounts)
             .chain(self.shared_ro.iter().cloned())
             .chain(self.desktop_ro.iter().cloned())
@@ -1114,14 +1240,15 @@ impl Host {
         })
     }
 
-    /// A package's own directories (as commit made them): its APKs and native libraries read-only at /data/app/<package>, its data and device-protected data read-write. Never the whole /data.
-    fn package_mounts(&self, package: &str) -> Result<Vec<Mount>> {
-        [
-            (format!("{DATA_APP}/{package}"), false),
-            (app_data_dir(package), true),
-            (format!("{DATA_USER_DE}/0/{package}"), true),
-        ]
-        .into_iter()
+    /// A package's own directories (as commit made them): its APKs and native libraries read-only at /data/app/<package> (a `system` package's code is in its partition, bound for every app),
+    /// its data and device-protected data read-write. Never the whole /data.
+    fn package_mounts(&self, package: &str, system: bool) -> Result<Vec<Mount>> {
+        let code = (!system).then(|| (format!("{DATA_APP}/{package}"), false));
+        code.into_iter()
+            .chain([
+                (app_data_dir(package), true),
+                (format!("{DATA_USER_DE}/0/{package}"), true),
+            ])
         .map(|(at, writable)| {
             let rel = Path::new(&at)
                 .strip_prefix(DATA)
@@ -1198,7 +1325,7 @@ impl Host {
 
     /// The services' start request: ProcessList.startProcessLocked's Process.start, as an app process in the sandbox.
     fn start_app(self: &Arc<Self>, req: &StartRequest) -> Result<i32> {
-        let uid = self
+        let Committed { uid, system } = self
             .installd
             .committed
             .lock()
@@ -1223,7 +1350,7 @@ impl Host {
             &req.args,
         )?;
         self.external_storage(&mut spawn, &req.package);
-        spawn.mounts.extend(self.package_mounts(&req.package)?);
+        spawn.mounts.extend(self.package_mounts(&req.package, system)?);
         spawn.rights = req.rights.clone();
         let pid = self.start(spawn, false, true)?;
         let _ = self.first_app_ms.set(wall_ms());
@@ -1413,6 +1540,10 @@ fn serve_control(host: Arc<Host>, fd: std::os::fd::OwnedFd) {
                 names,
             } => host
                 .commit(session, &package, uid, &names)
+                .map(|needs_es1| Response::Committed { needs_es1 }),
+            Request::Scan { dir } => host.scan(&dir).map(|frames| Response::Staged { frames }),
+            Request::ScanCommit { dir, package, uid } => host
+                .scan_commit(&dir, &package, uid)
                 .map(|needs_es1| Response::Committed { needs_es1 }),
         };
         outcome.unwrap_or_else(|e| {
@@ -1919,14 +2050,26 @@ fn run(a: &Args) -> Result<ExitCode> {
                         .chain([&a.installer_class_path])
                         .map(|p| ro_at_own_path(p)),
                 );
-                m.push(Mount {
-                    host: a.framework_res.clone(),
-                    at: Path::new(SYSTEM_FRAMEWORK).join(FRAMEWORK_RES),
-                    writable: false,
-                });
                 m
             },
+            session_mounts: vec![Mount {
+                host: a.framework_res.clone(),
+                at: Path::new(SYSTEM_FRAMEWORK).join(FRAMEWORK_RES),
+                writable: false,
+            }],
+            // /system whole (its framework-res link resolves to the host file, bound at its own path), the package partitions, the `--file` sources their links name
+            scan_mounts: std::iter::once((r.system(), SYSTEM))
+                .chain(r.package_partitions())
+                .map(|(host, at)| Mount {
+                    host,
+                    at: at.into(),
+                    writable: false,
+                })
+                .chain(std::iter::once(ro_at_own_path(&a.framework_res)))
+                .chain(a.files.iter().map(|(host, _)| ro_at_own_path(host)))
+                .collect(),
             staged: Mutex::new(BTreeMap::new()),
+            scanned: Mutex::new(BTreeSet::new()),
             committed: Mutex::new(BTreeMap::new()),
         },
         root: Root {
@@ -2005,6 +2148,10 @@ fn run(a: &Args) -> Result<ExitCode> {
     // what the install reads by host path: the sessions' manifests and the installer's frames, the platform's permission definitions
     services_spawn.mounts.push(ro_at_own_path(&install_dir));
     services_spawn.mounts.push(ro_at_own_path(&r.vendor()));
+    // the system scan lists the package partitions' priv-app/ and app/ dirs (atl-services-types system_packages) where they lie in the root
+    for (host, _) in r.package_partitions() {
+        services_spawn.mounts.push(ro_at_own_path(&host));
+    }
     if let Some(p) = &a.platform_permissions {
         services_spawn.mounts.push(ro_at_own_path(p));
     }
@@ -2027,7 +2174,10 @@ fn run(a: &Args) -> Result<ExitCode> {
         &r.log("services"),
         READY_LINE,
         "atl-system-services",
-        READY + INSTALL_READY * u32::try_from(a.packages.len())?,
+        // one installer run per session and per preinstalled package dir
+        READY
+            + INSTALL_READY
+                * u32::try_from(a.packages.len() + system_packages::scan(&r.root)?.dirs.len())?,
     )?;
     log(format_args!("services ready"));
 

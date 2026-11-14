@@ -62,7 +62,8 @@ struct Args {
     #[arg(long, value_parser = DisplayModel::parse_arg)]
     display: Option<DisplayModel>,
     /// The directory holding the partitions (`system/`, `vendor/`, ...) as this process sees them: SystemConfig's system features are read from their `etc/{sysconfig,permissions}/*.xml`
-    /// (atl_services_types::system_config). Omitted: no feature, hasSystemFeature false for every name.
+    /// (atl_services_types::system_config), and the preinstalled packages scanned from their `priv-app/`, `app/` (atl_services_types::system_packages). Omitted: no feature, hasSystemFeature false for
+    /// every name, no system package.
     #[arg(long)]
     partitions: Option<PathBuf>,
     /// AOSP's keychars directory (/system/usr/keychars): Virtual.kcm (the virtual keyboard's map, also carried by the pointer devices) and Generic.kcm (the physical keyboard's), loaded through libinput at start.
@@ -195,8 +196,14 @@ fn main() -> Result<()> {
         abis: a.abis.clone(),
         no_gl_selection: a.no_gl_selection,
     };
+    // one appId pool across the system scan and the sessions, system packages first (PMS's boot order)
     let mut ids = AppIds::new();
-    let list: Vec<PackageRecord> = install::install(&control, &a.sessions, &mut ids, &config)?;
+    let system: Vec<PackageRecord> = match &a.partitions {
+        Some(root) => install::scan(&control, root, &mut ids, &config)?,
+        None => Vec::new(),
+    };
+    let list: Vec<PackageRecord> =
+        install::install(&control, &a.sessions, &mut ids, &config, system)?;
     let libraries: BTreeMap<String, Library> = a.shared_libraries.into_iter().collect();
     let packages = Arc::new(Packages::new(list, libraries));
     // the permission states every service checks callers against: framework-res's definitions first, then the packages' (permission::initial_states, then runtime grants)

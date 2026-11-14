@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- `xtask test system-scan`: placed by atld's file option in the product partition's app/AtlSystemScan/, scanned at start as a system package; reports what PackageManager says of itself and what its sandbox lets it do with its own APK. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.atlsystemscan"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
+
+    <application android:label="ATL system scan">
+        <!-- no window, no hardware rendering: this gate stages no EGL driver -->
+        <activity android:name=".Main" android:exported="true"
+            android:hardwareAccelerated="false"
+            android:theme="@android:style/Theme.NoDisplay">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

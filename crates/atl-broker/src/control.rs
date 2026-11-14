@@ -61,6 +61,18 @@ pub enum Request {
         uid: u32,
         names: Vec<StagedName>,
     },
+    /// PMS's system scan of one preinstalled package dir (`dir`: its Android path, one of atl-services-types `system_packages::scan`'s dirs, e.g. `/product/app/Fixture`): the installer parses it
+    /// where it lies (read-only partition, no staging, no native-library copy). No uid yet: PMS assigns the appId only to a package the scan accepts. Answered [`Response::Staged`]; a failed run
+    /// answers its stderr.
+    Scan {
+        dir: String,
+    },
+    /// The services accepted scan `dir` as `package`: create its data dirs (installd createAppData, as for any package) and let start requests name it. Answered [`Response::Committed`].
+    ScanCommit {
+        dir: String,
+        package: String,
+        uid: u32,
+    },
 }
 
 /// One staged file's rename at commit: `staged` (its session name) -> `name` (`base.apk` or `split_<split name>.apk`).

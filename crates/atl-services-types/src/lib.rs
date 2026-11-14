@@ -13,3 +13,4 @@ pub mod packages;
 pub mod permission;
 pub mod size_buckets;
 pub mod system_config;
+pub mod system_packages;

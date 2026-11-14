@@ -60,6 +60,7 @@ mod sensors;
 mod services;
 mod signing;
 mod sles_bridge;
+mod system_scan;
 mod test_fonts;
 mod tree_gate;
 mod ui_module;
@@ -160,6 +161,8 @@ enum Test {
     Broadcast(broadcast::Args),
     /// An app's ContentProviders (xtask-harness/testdata/provider) under atld: initOrder before Application.onCreate, disabled and other-process ones skipped, PackageManager lookups, a call to its own provider.
     Provider(provider::Args),
+    /// A preinstalled package (xtask-harness/testdata/system-scan) placed in /product under atld: scanned at start, FLAG_SYSTEM and its /product sourceDir via PackageManager, readable from its sandbox, a write there EROFS.
+    SystemScan(system_scan::Args),
     /// The CTS instrumentation path: AOSP's `am instrument` runs a JUnit3 test APK (xtask-harness/testdata/instrument) through the services; its INSTRUMENTATION_* text is parsed and checked.
     ///
     /// Run 1: a passing, a failing and an erroring test: status codes 1/0, 1/-2, 1/-1, the final code -1, and the instrumented process killed once the run finished.
@@ -312,6 +315,9 @@ fn main() -> Result<ExitCode> {
             test: Test::Provider(args),
         } => provider::run(&root, &args),
         Command::Test {
+            test: Test::SystemScan(args),
+        } => system_scan::run(&root, &args),
+        Command::Test {
             test: Test::Instrument(args),
         } => instrument::run(&root, &args),
         Command::Test {
@@ -431,6 +437,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::Signing(_) => "signing",
             Test::Parcel(_) => "parcel",
             Test::Provider(_) => "provider",
+            Test::SystemScan(_) => "system-scan",
             Test::Compositor(_) => "compositor",
             Test::Gralloc(_) => "gralloc",
             Test::Binder(_) => "binder",
