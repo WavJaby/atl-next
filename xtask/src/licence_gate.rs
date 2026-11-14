@@ -1174,7 +1174,7 @@ mod tests {
             .map(PathBuf::from)
             .to_vec(),
         };
-        let (roots, out) = (&places, Path::new("/out/n"));
+        let out = Path::new("/out/n");
         let up = |root: usize, rel: &str| Place::Upstream {
             root: &places.roots[root],
             rel: rel.to_owned(),
@@ -1182,7 +1182,7 @@ mod tests {
         assert_eq!(
             place(
                 Path::new("/src/aosp/external/dng_sdk/source/a.cpp"),
-                &roots,
+                &places,
                 out
             ),
             up(0, "external/dng_sdk/source/a.cpp")
@@ -1190,34 +1190,34 @@ mod tests {
         assert_eq!(
             place(
                 Path::new("/src-wt/t/aosp/external/skia/src/x.cpp"),
-                &roots,
+                &places,
                 out
             ),
             up(1, "external/skia/src/x.cpp")
         );
         assert_eq!(
-            place(Path::new("/src/boringssl/crypto/a.cc"), &roots, out),
+            place(Path::new("/src/boringssl/crypto/a.cc"), &places, out),
             up(2, "crypto/a.cc")
         );
         assert_eq!(
-            place(Path::new("/out/n/gen/x.h"), &roots, out),
+            place(Path::new("/out/n/gen/x.h"), &places, out),
             Place::Generated
         );
         assert_eq!(
-            place(Path::new("/usr/include/stdio.h"), &roots, out),
+            place(Path::new("/usr/include/stdio.h"), &places, out),
             Place::System
         );
         // `/usr` is a component, not a string prefix
-        assert_eq!(place(Path::new("/usrx/a.h"), &roots, out), Place::Unknown);
+        assert_eq!(place(Path::new("/usrx/a.h"), &places, out), Place::Unknown);
         assert_eq!(
-            place(Path::new("/home/me/a.h"), &roots, out),
+            place(Path::new("/home/me/a.h"), &places, out),
             Place::Unknown
         );
         // the sysroot's crt objects and libgcc: the platform's; a sibling dir is not
         let crt = "/cache/sysroot/riscv64-sysroot/root/usr/lib/gcc-cross/riscv64-linux-gnu/14/crtbeginS.o";
-        assert_eq!(place(Path::new(crt), &roots, out), Place::System);
+        assert_eq!(place(Path::new(crt), &places, out), Place::System);
         assert_eq!(
-            place(Path::new("/cache/sysroot/other/a.o"), &roots, out),
+            place(Path::new("/cache/sysroot/other/a.o"), &places, out),
             Place::Unknown
         );
     }
