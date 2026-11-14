@@ -109,24 +109,37 @@ pub fn counter_lines(log: &str) -> Vec<String> {
     counters(log).iter().map(show).collect()
 }
 
-/// The ranked list (plan diagnostics-f4): every key of `log` but the served-by-design ones (`answered`, `sent`), most hits first, then first seen; each with its first-seen offset from
-/// `since_ms` (an app's spawn) and the last cause it carried.
-pub fn summary(log: &str, since_ms: u64) -> Vec<String> {
-    let all = events(log);
-    let mut rows: Vec<(Counter, u64, Option<&str>)> = totals(&all)
-        .into_iter()
-        .filter(|c| c.outcome != crate::ANSWERED && c.outcome != crate::SENT)
-        .map(|c| {
+/// The ranked list (plan diagnostics-f4) of a run, `logs` one per process: every key but the served-by-design ones (`answered`, `sent`), most hits first, then first seen; each with its first-seen
+/// offset from `since_ms` (an app's spawn) and the last cause it carried. A key several processes count sums their [`totals`] (each process has its own map), exact only when every one is.
+pub fn summary(logs: &[impl AsRef<str>], since_ms: u64) -> Vec<String> {
+    let mut rows: Vec<(Counter, u64, Option<String>)> = Vec::new();
+    for log in logs {
+        let all = events(log.as_ref());
+        for c in totals(&all) {
+            if c.outcome == crate::ANSWERED || c.outcome == crate::SENT {
+                continue;
+            }
             let same = |e: &&Event| e.counter.outcome == c.outcome && e.counter.api == c.api;
             let first = all.iter().filter(same).map(|e| e.at_ms).min().unwrap_or(0);
             let cause = all
                 .iter()
                 .filter(same)
-                .filter_map(|e| e.cause.as_deref())
+                .filter_map(|e| e.cause.clone())
                 .next_back();
-            (c, first, cause)
-        })
-        .collect();
+            match rows
+                .iter_mut()
+                .find(|r| r.0.outcome == c.outcome && r.0.api == c.api)
+            {
+                Some(r) => {
+                    r.0.count += c.count;
+                    r.0.exact &= c.exact;
+                    r.1 = r.1.min(first);
+                    r.2 = cause.or(r.2.take());
+                }
+                None => rows.push((c, first, cause)),
+            }
+        }
+    }
     rows.sort_by(|a, b| b.0.count.cmp(&a.0.count).then(a.1.cmp(&b.1)));
     rows.into_iter()
         .map(|(c, first, cause)| {
@@ -173,11 +186,33 @@ mod tests {
                    diag: first unimplemented I.d 1 at=101.000\n\
                    diag: count unimplemented I.d 2 at=101.000\n";
         assert_eq!(
-            summary(log, 100_000),
+            summary(&[log], 100_000),
             [
                 "unimplemented I.d x>=2 +1.000s",
                 "status:BAD_VALUE I.a x>=1 +0.250s cause: android.os.Message",
                 "exception:SECURITY I.b x>=1 +0.500s",
+            ]
+        );
+    }
+
+    /// One key in two processes' logs: the counts add (3 exact + 2 exact = 5 exact; 3 exact + a lower bound 2 = >=5), first seen is the earlier one; another process's key ranks on its own.
+    #[test]
+    fn summary_sums_a_key_across_processes() {
+        let services = "diag: first unimplemented I.a 1 at=100.200\n\
+                        diag: total unimplemented I.a 3 first=100.200\n";
+        let other_exact = "diag: total unimplemented I.a 2 first=100.100\n";
+        let app = "diag: first unimplemented I.a 1 at=100.100\n\
+                   diag: count unimplemented I.a 2 at=100.300\n\
+                   diag: first refused-parcel P 1 at=100.400\n";
+        assert_eq!(
+            summary(&[services, other_exact], 100_000),
+            ["unimplemented I.a x5 +0.100s"]
+        );
+        assert_eq!(
+            summary(&[services, app], 100_000),
+            [
+                "unimplemented I.a x>=5 +0.100s",
+                "refused-parcel P x>=1 +0.400s"
             ]
         );
     }

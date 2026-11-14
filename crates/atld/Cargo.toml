@@ -12,6 +12,7 @@ anyhow.workspace = true
 atl-binderd = { path = "../atl-binderd" }
 atl-android-paths = { path = "../atl-android-paths" }
 atl-broker = { path = "../atl-broker" }
+atl-diag = { path = "../atl-diag" }
 atl-fonts = { path = "../atl-fonts" }
 atl-fonts-table = { path = "../atl-fonts-table" }
 atl-gralloc = { path = "../atl-gralloc" }
@@ -26,6 +27,7 @@ pem-rfc7468 = { version = "1", features = ["alloc"] }
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+signal-hook.workspace = true
 
 [lints]
 workspace = true

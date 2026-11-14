@@ -12,7 +12,10 @@
 //! 6. `--run-class`: a command as uid `--run-uid` (the shell), `am instrument` for example; its exit ends the run.
 //! 7. the control socket `<root>/control.sock` (serve_run_control): `stop` ends the run, `start <package>/<class>` is `am start`. An app process ending does not end the run: the services see its death.
 //!
-//! Exit status: the command's (bwrap passes it on); 0 after `stop`; failure when the services exited. Plan: binderd, servicemanager and the services move into this process later; here each is a process, as `xtask test binder` runs them.
+//! 8. the end (`stop`, the command's exit, SIGINT/SIGTERM): app processes SIGKILLed; the services, gralloc, servicemanager SIGTERMed (then SIGKILLed after `--stop-grace-ms`); binderd by its admin
+//!    connection; then the ranked summary of every process's `diag:` lines on stderr (`atld: summary ...`, print_summary).
+//!
+//! Exit status: the command's (bwrap passes it on); 0 after `stop`; 128 + n after signal n; failure when the services exited. Plan: binderd, servicemanager and the services move into this process later; here each is a process, as `xtask test binder` runs them.
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,7 +26,7 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitCode, ExitStatus};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -33,7 +36,8 @@ use atl_android_paths::{
 };
 use atl_broker::control::{self, Request, Response, StagedName, StartRequest};
 use atl_broker::{
-    Broker, INSTALLER_UID, Link, Mount, Process, Spawn, gpu, kill_sandbox, to_log, tree_mounts,
+    Broker, INSTALLER_UID, Link, Mount, Process, Spawn, gpu, kill_sandbox, terminate_sandbox,
+    to_log, tree_mounts,
 };
 use atl_gralloc::node::{self, NodeSource};
 use atl_gralloc::vintf;
@@ -45,6 +49,8 @@ use atl_services_types::native_libs::LIB_DIR_NAME;
 use atl_services_types::packages::Library;
 use clap::Parser;
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
+use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
 
 mod cacerts;
 use serde::Deserialize;
@@ -223,6 +229,10 @@ struct Args {
     /// Test only: apps start with `--break-mix` (their AudioFlinger's mixer plays silence), the audio gate's third break.
     #[arg(long)]
     break_mix: bool,
+    /// How long, ms, each system process (the services, gralloc, servicemanager, binderd) gets at the run's end between its stop request (SIGTERM; binderd: its admin connection closed) and
+    /// SIGKILL: what it takes to write its exit totals (`diag: total`) and end. App processes are SIGKILLed, as AOSP kills them. The C4 config's CLI layer: no TOML layer exists yet.
+    #[arg(long, default_value_t = STOP_GRACE_MS)]
+    stop_grace_ms: u64,
 }
 
 /// Android uids (system/core/libcutils/include/private/android_filesystem_config.h): AID_SYSTEM, AID_SHELL.
@@ -238,6 +248,9 @@ const READY: Duration = Duration::from_secs(20);
 /// What each install session adds to the services' start (they install before registering): the installer measured 0.8-5.1 s cold (inst-m3/m5) plus staging copies of up to ~600 MB (an asset-pack split)
 /// at a slow disk's ~10 MB/s; a loaded machine's margin.
 const INSTALL_READY: Duration = Duration::from_secs(120);
+/// [`Args::stop_grace_ms`]'s default. A stop writes one line per counter key (tens) and exits: milliseconds; 2 s is a loaded machine's margin. The system processes stop in parallel, then binderd,
+/// so a stop takes at most 2 graces: 4 s, inside `xtask remote run-apk`'s KILL_GRACE (10 s after the limit's TERM) and the harness's STOP_WAIT (10 s after `stop`).
+const STOP_GRACE_MS: u64 = 2_000;
 /// What atl-system-services prints once registered.
 const READY_LINE: &str = "services: ready";
 /// What atl-gralloc-allocator prints once registered: `gralloc: ready (<DRM node>)`.
@@ -816,6 +829,8 @@ struct Host {
     gpu: Option<(String, NodeSource)>,
     /// installd's role: the sessions' files, the installer, what is staged and installed (an app process mounts its package's own directories, package_mounts).
     installd: Installd,
+    /// When the services' first app process started (wall-clock ms): the summary's first-seen offsets count from it.
+    first_app_ms: OnceLock<u64>,
 }
 
 /// A host path read-only at the same path in the sandbox: the runtime's shared host paths name themselves in both trees.
@@ -835,6 +850,8 @@ enum End {
     Stop,
     /// the services exited: nothing can run any more
     Services(ExitStatus),
+    /// atld got SIGINT or SIGTERM (its number): the run stops as after `stop`
+    Signal(i32),
 }
 
 /// ANDROID_ROOT & co. and the library path: the environment of an ART process (the converter's staged ART root `art`); app processes and the installer.
@@ -1102,6 +1119,7 @@ impl Host {
         spawn.mounts.extend(self.package_mounts(&req.package)?);
         spawn.rights = req.rights.clone();
         let pid = self.start(spawn, false, true)?;
+        let _ = self.first_app_ms.set(wall_ms());
         log(format_args!(
             "started {} (package {}): uid {}, host pid {pid}",
             req.process_name, req.package, req.uid
@@ -1340,6 +1358,7 @@ fn wait_ready(
 }
 
 fn run(a: &Args) -> Result<ExitCode> {
+    let started_ms = wall_ms();
     if a.root.exists() {
         std::fs::remove_dir_all(&a.root)?;
     }
@@ -1565,6 +1584,18 @@ fn run(a: &Args) -> Result<ExitCode> {
         None,
     )?;
     let (done_tx, done_rx): (Sender<End>, Receiver<End>) = channel();
+    // SIGINT (a terminal's Ctrl-C) and SIGTERM (a supervisor, `timeout`) end the run as `stop` does, so the system processes still stop in order and write their totals
+    {
+        let mut signals = Signals::new([SIGINT, SIGTERM]).context("SIGINT/SIGTERM handler")?;
+        let done = done_tx.clone();
+        std::thread::Builder::new()
+            .name("run-signals".into())
+            .spawn(move || {
+                if let Some(sig) = signals.forever().next() {
+                    let _ = done.send(End::Signal(sig));
+                }
+            })?;
+    }
     // the services and every app process answer with this one display
     let display = a.display.unwrap_or_else(host_display);
     // the run's GPU's device class (gpu::device_class), as AOSP grants an app gpu_device per device (system/sepolicy private/app.te:393): the host EGL driver renders into, and imports, the gralloc dmabufs through them;
@@ -1728,6 +1759,7 @@ fn run(a: &Args) -> Result<ExitCode> {
             vec![]
         },
         pipewire: atl_platform_host::app_access::pipewire_socket(),
+        first_app_ms: OnceLock::new(),
         installd: Installd {
             sessions,
             installer: a.installer.clone(),
@@ -1912,9 +1944,14 @@ fn run(a: &Args) -> Result<ExitCode> {
             log(format_args!("services ended: {status}"));
             None
         }
+        End::Signal(sig) => {
+            log(format_args!("signal {sig}: stopping"));
+            None
+        }
     };
-    // what the services started dies with the run; then the services and servicemanager (their sandboxes' first processes, so everything in them). Every thread holding the host ends with its process,
-    // and the broker's admin connection then closes; binderd is killed anyway, as nothing needs it any more.
+    // what the services started dies with the run, SIGKILLed as AOSP kills an app process; then the system processes stop the Linux way (SIGTERM, the grace, SIGKILL; owner decision 3), each
+    // writing its exit totals, and binderd last, by its admin connection, printing its own counters
+    let grace = Duration::from_millis(a.stop_grace_ms);
     let left: Vec<i32> = host
         .controlled
         .lock()
@@ -1926,20 +1963,93 @@ fn run(a: &Args) -> Result<ExitCode> {
         log(format_args!("left at the end: {pid}"));
         let _ = kill_sandbox(pid);
     }
-    for p in [Some(&mut services), gralloc.as_mut(), Some(&mut sm)]
-        .into_iter()
-        .flatten()
-    {
-        let _ = kill_sandbox(p.host_pid);
-        let _ = p.child.wait();
+    std::thread::scope(|s| {
+        for (name, p) in [
+            ("services", Some(&mut services)),
+            ("gralloc", gralloc.as_mut()),
+            ("servicemanager", Some(&mut sm)),
+        ] {
+            if let Some(p) = p {
+                s.spawn(move || stop_system(name, p, grace));
+            }
+        }
+    });
+    if let Err(e) = host.broker.close_admin() {
+        log(format_args!("binderd: closing its admin connection: {e}"));
     }
+    let deadline = Instant::now() + grace;
+    loop {
+        if binderd.child.try_wait()?.is_some() {
+            log(format_args!("stopped binderd"));
+            break;
+        }
+        if Instant::now() >= deadline {
+            log(format_args!(
+                "binderd: no exit {grace:?} after its admin connection closed: killed"
+            ));
+            let _ = kill_sandbox(binderd.host_pid);
+            let _ = binderd.child.wait();
+            break;
+        }
+        std::thread::sleep(STOP_POLL);
+    }
+    let since = host.first_app_ms.get().copied().unwrap_or(started_ms);
     drop(host);
-    let _ = kill_sandbox(binderd.host_pid);
-    let _ = binderd.child.wait();
-    Ok(match code {
-        Some(0) => ExitCode::SUCCESS,
+    print_summary(&r.root.join("log"), since);
+    Ok(match (end, code) {
+        // a signal's conventional status (128 + its number), as a shell reports a process it ended
+        (End::Signal(sig), _) => {
+            u8::try_from(SIGNAL_STATUS_BASE + sig).map_or(ExitCode::FAILURE, ExitCode::from)
+        }
+        (_, Some(0)) => ExitCode::SUCCESS,
         _ => ExitCode::FAILURE,
     })
+}
+
+/// A shell's exit status for a process a signal ended: this plus the signal's number.
+const SIGNAL_STATUS_BASE: i32 = 128;
+/// Poll step while binderd ends: short against the grace.
+const STOP_POLL: Duration = Duration::from_millis(10);
+
+/// Stops one system process at the run's end ([`terminate_sandbox`]: SIGTERM, `grace`, SIGKILL) and reaps its bwrap; one line says which ended it.
+fn stop_system(name: &str, p: &mut Process, grace: Duration) {
+    match terminate_sandbox(p.host_pid, grace) {
+        Ok(true) => log(format_args!("stopped {name}")),
+        Ok(false) => log(format_args!(
+            "{name}: no exit {grace:?} after SIGTERM: killed"
+        )),
+        Err(e) => {
+            log(format_args!("{name}: SIGTERM: {e}: killed"));
+            let _ = kill_sandbox(p.host_pid);
+        }
+    }
+    let _ = p.child.wait();
+}
+
+/// The run's ranked API outcomes (atl_diag::summary over every process's log, first-seen as offset from `since_ms`): `atld: summary <n> keys`, then one `atld: summary <row>` line per key, most hits first.
+/// Read after every system process stopped, so their counts are exact; app processes were SIGKILLed, so theirs read `x>=n`.
+fn print_summary(log_dir: &Path, since_ms: u64) {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(log_dir)
+        .map(|d| d.filter_map(|e| e.ok().map(|e| e.path())).collect())
+        .unwrap_or_default();
+    paths.retain(|p| p.extension().is_some_and(|x| x == "log"));
+    paths.sort();
+    let logs: Vec<String> = paths
+        .iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .collect();
+    let rows = atl_diag::summary::summary(&logs, since_ms);
+    log(format_args!("summary {} keys", rows.len()));
+    for row in rows {
+        log(format_args!("summary {row}"));
+    }
+}
+
+/// Wall-clock ms since the epoch, the clock of the `diag:` lines' stamps (atl_diag::wall_stamp).
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 fn main() -> ExitCode {

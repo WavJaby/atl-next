@@ -9,6 +9,8 @@
 extern crate binder;
 // librustutils: the process's system properties (ro.opengles.version, which atld writes into the services' property area)
 extern crate rustutils;
+// the converter's one libatl_diag, which the AIDL crates' reply hook counts into (atl-services lib.rs)
+extern crate atl_diag;
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -31,6 +33,8 @@ use atl_services_types::packages::{Library, PermissionDecl};
 use atl_services_types::system_config::Features;
 use binder::{BinderFeatures, ProcessState};
 use clap::Parser;
+use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
 
 #[derive(Parser)]
 struct Args {
@@ -165,6 +169,20 @@ fn gl_es_version() -> Result<i32> {
             .with_context(|| format!("{name}={v:?}: not an int")),
         _ => Ok(0),
     }
+}
+
+/// SIGTERM (atld's stop) or SIGINT: write the exact total of every counter key ([`atl_diag::flush_totals`]), then exit 0, an orderly end. Before the ready line, so a stop after it always flushes.
+fn exit_totals_on_terminate() -> Result<()> {
+    let mut signals = Signals::new([SIGTERM, SIGINT]).context("SIGTERM/SIGINT handler")?;
+    std::thread::Builder::new()
+        .name("exit-totals".into())
+        .spawn(move || {
+            if signals.forever().next().is_some() {
+                atl_diag::flush_totals();
+                std::process::exit(0);
+            }
+        })?;
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -408,6 +426,7 @@ fn main() -> Result<()> {
         ),
     )
     .context("addService compositor registry")?;
+    exit_totals_on_terminate()?;
     writeln!(std::io::stderr(), "services: ready")?;
     if let Some(package) = &a.launch {
         activity

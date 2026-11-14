@@ -1083,6 +1083,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if passed && !cacerts.starts_with("trusted ") {
         whys.push(format!("CA store: {cacerts}"));
     }
+    let atld_log = read(&run.atld_log());
+    for l in summary_rows(&atld_log).iter().take(SUMMARY_SHOWN) {
+        println!("app: summary {l}");
+    }
+    whys.extend(exit_failures(
+        passed,
+        &services_log,
+        &atld_log,
+        &read(&run.log("binderd")),
+    ));
     match &outside {
         Some(o) => {
             println!("app: counter children_outside_broker {}", o.len());
@@ -1344,6 +1354,73 @@ fn fault(app_log: &str, atld_exited: bool) -> Option<String> {
     window::fault_after(app_log, 0, marker_ms + WINDOW_MS, marker_ms, atld_exited)
 }
 
+/// The key whose exact exit total the fixture forces: `Main.channels()` (run once from onCreate) calls `getNotificationChannel` 3 times, each counted `answered` by the services (notification.rs).
+/// 3 is not a power of two, so only the exit total reads 3: a SIGKILLed services process leaves its last power-of-two line, 2.
+const FORCED_TOTAL: &str =
+    "diag: total answered INotificationManager.getNotificationChannel 3 first=";
+/// atld's summary lines (atld main.rs print_summary): `atld: summary <n> keys`, then one row per key.
+const SUMMARY_PREFIX: &str = "atld: summary ";
+/// atld's line for a system process that ended within its grace after SIGTERM (atld main.rs stop_system).
+const SERVICES_STOPPED: &str = "atld: stopped services";
+/// binderd's orderly-exit line (atl-binderd main.rs EXIT_LINE), written after its counters.
+const BINDERD_EXIT: &str = "binderd: exit";
+/// Summary rows the gate prints.
+const SUMMARY_SHOWN: usize = 5;
+
+/// The rows of atld's summary block, without its `<n> keys` header.
+fn summary_rows(atld_log: &str) -> Vec<&str> {
+    atld_log
+        .lines()
+        .filter_map(|l| l.strip_prefix(SUMMARY_PREFIX))
+        .filter(|r| !r.ends_with(" keys"))
+        .collect()
+}
+
+/// A summary row's count (`... x<n> +...`) and whether it is exact (`x>=<n>`: a lower bound).
+fn row_count(row: &str) -> Option<(u64, bool)> {
+    let (_, rest) = row.rsplit_once(" x")?;
+    let n = rest.split(' ').next()?;
+    match n.strip_prefix(">=") {
+        Some(lower) => Some((lower.parse().ok()?, false)),
+        None => Some((n.parse().ok()?, true)),
+    }
+}
+
+/// The end of the run (plan diagnostics-f4 D4): the services stopped by SIGTERM within their grace and wrote the fixture key's exact total (only checked once the app ran: `ran`); atld printed a
+/// summary whose first row is exact and whose rows rank by count; binderd ended in order.
+fn exit_failures(ran: bool, services: &str, atld: &str, binderd: &str) -> Vec<String> {
+    let mut whys = Vec::new();
+    if !atld.lines().any(|l| l == SERVICES_STOPPED) {
+        whys.push(format!("no `{SERVICES_STOPPED}` line: the services did not end within their grace after SIGTERM"));
+    }
+    if ran && !services.lines().any(|l| l.starts_with(FORCED_TOTAL)) {
+        whys.push(format!("no `{FORCED_TOTAL}...` line in the services log: no exact exit total for the fixture's key"));
+    }
+    let rows = summary_rows(atld);
+    match rows.first() {
+        None => whys.push("atld printed no summary row".to_owned()),
+        Some(first) if !row_count(first).is_some_and(|(_, exact)| exact) => {
+            whys.push(format!(
+                "summary's first row is not an exact count: {first}"
+            ));
+        }
+        Some(_) => {
+            let counts: Vec<u64> = rows
+                .iter()
+                .filter_map(|r| row_count(r))
+                .map(|c| c.0)
+                .collect();
+            if counts.windows(2).any(|w| w[0] < w[1]) {
+                whys.push(format!("summary not ranked by count: {counts:?}"));
+            }
+        }
+    }
+    if !binderd.lines().any(|l| l.starts_with(BINDERD_EXIT)) {
+        whys.push(format!("binderd.log holds no `{BINDERD_EXIT}` line"));
+    }
+    whys
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1367,6 +1444,32 @@ mod tests {
             assert!(features_why(Some(bad)).is_some(), "{bad}");
         }
         assert!(features_why(None).is_some());
+    }
+
+    /// A good end passes; the break (services SIGKILLed: no stop line, only the power-of-two line 2, lower bounds in the summary, no binderd exit line) fails on each count.
+    #[test]
+    fn exit_failures_need_totals_summary_and_binderd_exit() {
+        let services = "diag: count answered INotificationManager.getNotificationChannel 2 at=1.000\n\
+                        diag: total answered INotificationManager.getNotificationChannel 3 first=1.000\n";
+        let atld = "atld: stopped services\n\
+                    atld: summary 2 keys\n\
+                    atld: summary unimplemented I.a x5 +0.100s\n\
+                    atld: summary refused-parcel P x>=1 +0.400s\n";
+        let binderd = "binderd: exit (0 nonzero counters)\n";
+        assert!(exit_failures(true, services, atld, binderd).is_empty());
+        let killed_services =
+            "diag: count answered INotificationManager.getNotificationChannel 2 at=1.000\n";
+        let killed_atld = "atld: services: no exit 2s after SIGTERM: killed\n\
+                           atld: summary 1 keys\n\
+                           atld: summary unimplemented I.a x>=4 +0.100s\n";
+        assert_eq!(
+            exit_failures(true, killed_services, killed_atld, "").len(),
+            4
+        );
+        // not ranked
+        let unranked =
+            "atld: stopped services\natld: summary I.a x1 +0.1s\natld: summary I.b x2 +0.2s\n";
+        assert_eq!(exit_failures(true, services, unranked, binderd).len(), 1);
     }
 
     #[test]

@@ -36,10 +36,10 @@ uses = ["binder", "android-paths", "bwrap"]
 crates = ["atl-android-paths"]
 exports = ["atl-android-paths"]
 
-# M2 wiring: binderd, servicemanager, the services and the apps, each a process started through the broker; serves the services' process control; the install step reads the package records (services' plain types); the VINTF manifests declare the graphics HALs (gralloc's definitions); the system font files come from the desktop's fonts (fonts)
+# M2 wiring: binderd, servicemanager, the services and the apps, each a process started through the broker; serves the services' process control; the install step reads the package records (services' plain types); the VINTF manifests declare the graphics HALs (gralloc's definitions); the system font files come from the desktop's fonts (fonts); the run's end summary parses every process's counter lines (diag)
 [atld]
 crates = ["atld"]
-uses = ["binder", "broker", "gralloc", "platform-host", "property-service", "services", "services-types", "services-wire", "android-paths", "fonts", "fonts-table"]
+uses = ["binder", "broker", "diag", "gralloc", "platform-host", "property-service", "services", "services-types", "services-wire", "android-paths", "fonts", "fonts-table"]
 
 # the user's launch surface (plan gpu-selection S2.5): `run --gpu`, the per-app GPU preference, the `.desktop` writer; it execs the ATL command (or switcherooctl) and links no ATL crate
 [launch]

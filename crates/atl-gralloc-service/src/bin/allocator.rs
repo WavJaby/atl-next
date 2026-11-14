@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: MIT
-//! atl-gralloc-allocator: registers `android.hardware.graphics.allocator.IAllocator/default` with servicemanager and serves it on libbinder's thread pool until killed.
+//! atl-gralloc-allocator: registers `android.hardware.graphics.allocator.IAllocator/default` with servicemanager and serves it on libbinder's thread pool until SIGTERM (exit totals, exit 0) or killed.
 //! Runs as the system uid (servicemanager accepts addService from it) and needs the VINTF manifest to declare the instance (atl_gralloc::vintf::device_hals): servicemanager refuses to register an undeclared @VintfStability service.
 //! Prints `gralloc: ready (<DRM node>)` once registered; refusals and allocation failures print on stderr.
 #![forbid(unsafe_code)]
 
 // the converter's rlib, on the crate search path build.rs sets (no cargo dependency names it)
 extern crate binder;
+// the converter's one libatl_diag, which the allocator stub's reply hook counts into
+extern crate atl_diag;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -19,6 +21,8 @@ use atl_gralloc_service::backend::{Backend, DRM_DIR};
 use atl_gralloc_service::service;
 use binder::ProcessState;
 use clap::Parser;
+use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
 
 #[derive(Parser)]
 struct Args {
@@ -57,6 +61,16 @@ fn main() -> Result<()> {
         service::new_binder(Arc::clone(&allocator), a.modifiers),
     )
     .context("addService (is the instance declared in the VINTF manifest?)")?;
+    // SIGTERM (atld's stop) or SIGINT: the exact total of every counter key, then an orderly exit 0
+    let mut signals = Signals::new([SIGTERM, SIGINT]).context("SIGTERM/SIGINT handler")?;
+    std::thread::Builder::new()
+        .name("exit-totals".into())
+        .spawn(move || {
+            if signals.forever().next().is_some() {
+                atl_diag::flush_totals();
+                std::process::exit(0);
+            }
+        })?;
     writeln!(std::io::stderr(), "{}", allocator.counters_line())?;
     writeln!(std::io::stderr(), "gralloc: ready ({})", node.display())?;
     ProcessState::join_thread_pool();

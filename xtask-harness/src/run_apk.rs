@@ -721,7 +721,6 @@ fn copy_logs(run: &Run, to: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The run's printed verdict: the pass line, or the failure with the app's and the services' log tails. Then atld's end lines, and where the logs are.
 /// `KEY=VALUE` of `--env`.
 fn parse_env(s: &str) -> Result<(String, String), String> {
     match s.split_once('=') {
@@ -772,6 +771,7 @@ fn render_path_check(atld_log: &str, app: &str) -> Result<String, String> {
     }
 }
 
+/// The run's printed verdict: the pass line, or the failure with the app's and the services' log tails. Then atld's end lines and its summary block, and where the logs are.
 fn finish(
     outcome: Result<String, String>,
     app: &str,
@@ -790,11 +790,11 @@ fn finish(
             );
         }
     }
-    // the app's end as its parent saw it: a signal leaves no line of its own in the app's or the services' log
+    // the app's end as its parent saw it (a signal leaves no line of its own in the app's or the services' log), then atld's ranked API outcomes of the run (atld main.rs print_summary)
     for line in std::fs::read_to_string(atld_log)
         .unwrap_or_default()
         .lines()
-        .filter(|l| l.contains(" ended: "))
+        .filter(|l| l.contains(" ended: ") || l.starts_with("atld: summary "))
     {
         println!("run-apk: {line}");
     }

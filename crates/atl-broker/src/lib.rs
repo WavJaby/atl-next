@@ -579,18 +579,55 @@ pub fn kill_sandbox(host_pid: i32) -> io::Result<()> {
     kill_process(pid, Signal::KILL).map_err(io::Error::from)
 }
 
-/// The pid the program of the sandbox whose first process is `host_pid` has in its own pid namespace (its getpid(), Process.myPid()): bwrap's init is that first process (pid 1; no `--as-pid-1`)
-/// and forks the program as its one child, which the stub execs into. Read from the kernel: the init's children (`/proc/<pid>/task/<pid>/children`), then that child's `NSpid` (innermost last).
-pub fn program_pid(host_pid: i32) -> io::Result<i32> {
-    let children = fs::read_to_string(format!("/proc/{host_pid}/task/{host_pid}/children"))?;
-    let child = match children.split_whitespace().collect::<Vec<_>>()[..] {
-        [one] => one,
-        ref all => {
-            return Err(other(format!(
-                "sandbox {host_pid}: init has children {all:?}, want one"
-            )));
+/// Poll step of [`terminate_sandbox`]'s wait: short against any grace worth configuring, long against a busy loop.
+const END_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Stops the sandbox whose first process is `host_pid` the Linux way: SIGTERM to its program (the init's one child; the init, pid 1 of its namespace, ignores a signal it has no handler for, and
+/// ends when its child does), then [`kill_sandbox`] once `grace` passes without the sandbox ending. Returns whether it ended within `grace` (false: killed).
+pub fn terminate_sandbox(host_pid: i32, grace: std::time::Duration) -> io::Result<bool> {
+    if !running(host_pid) {
+        return Ok(true);
+    }
+    let child = program_host_pid(host_pid)?;
+    let pid = Pid::from_raw(child).ok_or_else(|| other(format!("{child}: not a process id")))?;
+    kill_process(pid, Signal::TERM)?;
+    let deadline = std::time::Instant::now() + grace;
+    while std::time::Instant::now() < deadline {
+        if !running(host_pid) {
+            return Ok(true);
         }
-    };
+        std::thread::sleep(END_POLL);
+    }
+    kill_sandbox(host_pid)?;
+    Ok(false)
+}
+
+/// Whether `pid` still runs: its `/proc` entry exists and is not a zombie (stat field 3, proc(5); the comm before it is parenthesised and may hold spaces).
+fn running(pid: i32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
+        s.rsplit_once(") ")
+            .and_then(|(_, rest)| rest.chars().next())
+            .is_some_and(|state| state != 'Z' && state != 'X')
+    })
+}
+
+/// The host pid of the program of the sandbox whose first process is `host_pid`: bwrap's init is that first process (pid 1; no `--as-pid-1`) and forks the program as its one child, which the stub
+/// execs into. Read from the kernel: the init's children (`/proc/<pid>/task/<pid>/children`).
+fn program_host_pid(host_pid: i32) -> io::Result<i32> {
+    let children = fs::read_to_string(format!("/proc/{host_pid}/task/{host_pid}/children"))?;
+    match children.split_whitespace().collect::<Vec<_>>()[..] {
+        [one] => one
+            .parse()
+            .map_err(|_| other(format!("sandbox {host_pid}: child {one:?} is not a pid"))),
+        ref all => Err(other(format!(
+            "sandbox {host_pid}: init has children {all:?}, want one"
+        ))),
+    }
+}
+
+/// The pid the program of the sandbox whose first process is `host_pid` has in its own pid namespace (its getpid(), Process.myPid()): [`program_host_pid`]'s process, its `NSpid` (innermost last).
+pub fn program_pid(host_pid: i32) -> io::Result<i32> {
+    let child = program_host_pid(host_pid)?;
     let status = fs::read_to_string(format!("/proc/{child}/status"))?;
     innermost_pid(&status).ok_or_else(|| other(format!("sandbox {host_pid}: no NSpid for {child}")))
 }
@@ -705,6 +742,12 @@ impl Broker {
         )
         .map_err(|e| other(format!("starting binderd {}: {e}", program.display())))?;
         Ok((Broker::new(admin, stub), process))
+    }
+
+    /// Ends binderd the way its admin contract says (atl-binderd main: it exits on a closed admin connection and prints its counters), while threads still hold this Broker: shuts the
+    /// connection down for both directions. Spawns after it fail.
+    pub fn close_admin(&self) -> io::Result<()> {
+        rustix::net::shutdown(&self.admin, rustix::net::Shutdown::Both).map_err(io::Error::from)
     }
 
     fn new(admin: OwnedFd, stub: &Path) -> Self {

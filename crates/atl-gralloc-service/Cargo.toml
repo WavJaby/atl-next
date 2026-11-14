@@ -30,6 +30,7 @@ atl-gralloc = { path = "../atl-gralloc" }
 clap.workspace = true
 gbm.workspace = true
 rustix.workspace = true
+signal-hook.workspace = true
 
 [build-dependencies]
 anyhow.workspace = true
