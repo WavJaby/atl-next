@@ -28,6 +28,8 @@ const SEEDED: usize = 4;
 const SEED_PREFIX: &str = "atl.qt.p.";
 /// fixture.c `qt_props_expected` reads this property.
 const SEED_EXPECT: &str = "atl.qt.expect";
+/// fixture.c `qt_prop_unset` reads this name, which the gate never seeds: the plain run's log must hold its `prop:miss` first-hit line.
+const UNSET: &str = "atl.qt.unset";
 const HARNESS: Harness = Harness {
     test: "qemu_thread",
     prefix: "qemu-thread",
@@ -100,7 +102,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let mut fails = Vec::new();
     for brk in runs {
         let name = format!("{}-{}", HARNESS.prefix, brk.unwrap_or("plain"));
-        if let Err(e) = qemu_linker::harness(root, &dir, &HARNESS, &env, &dir, brk, &name) {
+        let run = qemu_linker::harness(root, &dir, &HARNESS, &env, &dir, brk, &name)
+            .and_then(|()| match brk {
+                None => prop_miss_logged(&dir.join(format!("{name}.log"))),
+                Some(_) => Ok(()),
+            });
+        if let Err(e) = run {
             fails.push(Failure::step(&name, format!("{e:#}")));
         }
     }
@@ -116,6 +123,18 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         ExitCode::FAILURE
     })
+}
+
+/// The guest's read of [`UNSET`] reached the provider's one lookup (atl-bionic `store::find`, via the NBS stub and the provider's `__system_property_get`): its first-hit line is in the run's log.
+fn prop_miss_logged(log: &Path) -> Result<()> {
+    let text = std::fs::read_to_string(log).with_context(|| format!("reading {}", log.display()))?;
+    let want = format!("diag: first {} {UNSET} 1 at=", atl_diag::PROP_MISS);
+    ensure!(
+        text.lines().any(|l| l.starts_with(&want)),
+        "no `{want}` line: the guest's unset read was not counted, log {}",
+        log.display()
+    );
+    Ok(())
 }
 
 /// The property area the harness maps (`ATL_PROP_AREA`): the native out dir's default build.prop plus the seeded properties, laid out by the area writer into `dir`.

@@ -46,6 +46,12 @@ long qt_props_count(void) {
     return count;
 }
 
+// Reads `atl.qt.unset`, a name the gate never seeds (qemu_thread.rs `UNSET`): the stub's __system_property_get reaches the provider's, whose count writes `prop:miss atl.qt.unset`. The value's length (0).
+long qt_prop_unset(void) {
+    char value[PROP_VALUE_MAX];
+    return __system_property_get("atl.qt.unset", value);
+}
+
 // The count the gate seeded (`atl.qt.expect`), in decimal.
 long qt_props_expected(void) {
     char value[PROP_VALUE_MAX];

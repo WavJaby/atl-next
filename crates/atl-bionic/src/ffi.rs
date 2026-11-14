@@ -81,9 +81,7 @@ pub unsafe extern "C" fn __system_property_find(name: *const c_char) -> *const p
     let Some(name) = (unsafe { c_str(name) }) else {
         return core::ptr::null();
     };
-    store::area()
-        .and_then(|a| Some(handle(&a, a.find(name)?)))
-        .unwrap_or(core::ptr::null())
+    store::find(name).map_or(core::ptr::null(), |(a, pi)| handle(&a, pi))
 }
 
 #[unsafe(no_mangle)]
@@ -95,9 +93,14 @@ pub unsafe extern "C" fn __system_property_read_callback(
     let Some((area, callback)) = store::area().zip(callback) else {
         return;
     };
-    let Some(s) = record(&area, pi).and_then(|pi| area.snapshot(pi)) else {
+    let Some((pi, s)) = record(&area, pi).and_then(|pi| Some((pi, area.snapshot(pi)?))) else {
         return;
     };
+    let empty = match &s.value {
+        Value::InArea(v) => area.byte(*v) == Some(0),
+        Value::Copied(v) => v[0] == 0,
+    };
+    store::delivered(area, pi, empty);
     let name = area.ptr(s.name).cast();
     match &s.value {
         // SAFETY: the caller's callback; name and value are NUL-terminated in the area, which is never

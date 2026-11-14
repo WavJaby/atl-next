@@ -12,11 +12,11 @@
 # Module edges form no cycle. External crates are not listed here; deny.toml governs them.
 # Covers cargo crates only (no AOSP / ninja modules yet).
 
-# the bionic-only C API for source-built AOSP code (bridge 1 class b); the loader uses it later
+# the bionic-only C API for source-built AOSP code (bridge 1 class b); the loader uses it later; diag: reads of unset properties counted as prop:miss
 [bionic]
 crates = ["atl-bionic"]
 exports = ["atl-bionic"]
-uses = ["generators", "android-paths"]
+uses = ["generators", "android-paths", "diag"]
 
 # the system property service: the default property set as a bionic property area, written through bionic's image builder; atld writes the area through it, the binary serves test harnesses
 [property-service]

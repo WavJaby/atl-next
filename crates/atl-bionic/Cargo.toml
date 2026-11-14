@@ -10,6 +10,8 @@ publish.workspace = true
 [dependencies]
 # the property area's variable name (one definition, no state; launcher-scope-split X2)
 atl-android-paths = { path = "../atl-android-paths" }
+# prop:miss counts (a leaf, no dependencies); the only copy that counts `prop:` keys, so a second copy in the process splits no key
+atl-diag = { path = "../atl-diag" }
 errno.workspace = true
 rustix.workspace = true
 

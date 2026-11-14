@@ -9,10 +9,12 @@
 //! No dependencies (feature `serde` only for xtask's report): every converter-built AIDL crate, atl-parcelables and the services link the converter's one `libatl_diag` (bp2ninja aidlcrates.go
 //! `reply_hook`), so a process holds one map and one cause; a second copy linked by cargo would split them.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering::Relaxed;
 
 pub mod summary;
 
@@ -103,10 +105,52 @@ struct Record {
     first: String,
 }
 
-static COUNTS: Mutex<BTreeMap<(String, String), Record>> = Mutex::new(BTreeMap::new());
+/// outcome -> api -> record: nested so a hit looks both up by `&str` and allocates nothing (a flat `(String, String)` key needs owned strings to look up).
+static COUNTS: Mutex<BTreeMap<String, BTreeMap<String, Record>>> = Mutex::new(BTreeMap::new());
+
+/// Outcome of a property read that finds nothing, or finds an empty value (AOSP readers treat "" as unset); the api field is the property name, nothing else (plan M59: no thread, library, package or caller).
+pub const PROP_MISS: &str = "prop:miss";
+/// Outcome under which [`flush_totals`] reports [`count`] calls dropped because the thread was already inside one (a signal handler reading a property while its thread held the map).
+pub const REENTRANT: &str = "diag:reentrant";
+/// [`REENTRANT`]'s api field.
+const REENTRANT_API: &str = "dropped";
+
+/// Nested counts dropped: atomics only, so a signal handler can record without the lock or an allocation.
+static DROPPED: AtomicU64 = AtomicU64::new(0);
+/// Wall clock (ms since the epoch) of the first dropped count; 0 = none yet.
+static DROPPED_FIRST_MS: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static CAUSE: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// This thread is inside [`count`]: a nested call (signal handler) must not take the map lock it may already hold.
+    static INSIDE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Held while a thread is inside [`count`]; none when it already was.
+struct Inside;
+
+impl Inside {
+    fn enter() -> Option<Self> {
+        // a const Cell has no destructor, so the slot is never torn down; try_with only guards the contract
+        let first = INSIDE.try_with(|i| !i.replace(true)).unwrap_or(false);
+        first.then_some(Self)
+    }
+}
+
+impl Drop for Inside {
+    fn drop(&mut self) {
+        let _ = INSIDE.try_with(|i| i.set(false));
+    }
+}
+
+fn drop_nested() {
+    DROPPED.fetch_add(1, Relaxed);
+    let _ = DROPPED_FIRST_MS.compare_exchange(0, wall_ms(), Relaxed, Relaxed);
+}
+
+/// Count calls dropped as nested so far (see [`REENTRANT`]).
+pub fn reentrant() -> u64 {
+    DROPPED.load(Relaxed)
 }
 
 /// Records why the next transport status this thread replies with happens (a refused parcelable, an unimplemented sub-case, a hand-written refusal); [`binder_reply`] takes it.
@@ -120,20 +164,35 @@ fn logs(n: u64) -> bool {
 }
 
 /// Counts one `outcome` of `api`, writes its line when [`logs`] says so, returns the new count.
+/// A call nested in another on the same thread (a signal handler) is dropped into [`REENTRANT`] and returns 0: taking the map lock again would deadlock a crashing app.
+/// A hit of a known key allocates only when it writes a line.
 pub fn count(outcome: &str, api: &str, cause: Option<&str>) -> u64 {
-    let stamp = wall_stamp();
+    let Some(_inside) = Inside::enter() else {
+        drop_nested();
+        return 0;
+    };
     // a poisoned map still counts: it holds plain numbers
     let mut map = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
-    let r = map
-        .entry((outcome.to_owned(), api.to_owned()))
-        .or_insert_with(|| Record {
-            n: 0,
-            first: stamp.clone(),
-        });
-    r.n += 1;
-    let n = r.n;
+    let (n, stamp) = match map.get_mut(outcome).and_then(|m| m.get_mut(api)) {
+        Some(r) => {
+            r.n += 1;
+            (r.n, None)
+        }
+        None => {
+            let stamp = wall_stamp();
+            map.entry(outcome.to_owned()).or_default().insert(
+                api.to_owned(),
+                Record {
+                    n: 1,
+                    first: stamp.clone(),
+                },
+            );
+            (1, Some(stamp))
+        }
+    };
     drop(map);
     if logs(n) {
+        let stamp = stamp.unwrap_or_else(wall_stamp);
         let _ = writeln!(
             std::io::stderr(),
             "{}",
@@ -204,16 +263,26 @@ macro_rules! unimplemented_api {
 pub fn counts() -> Vec<(String, String, u64)> {
     let map = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
     map.iter()
-        .map(|((o, a), r)| (o.clone(), a.clone(), r.n))
+        .flat_map(|(o, apis)| apis.iter().map(move |(a, r)| (o.clone(), a.clone(), r.n)))
         .collect()
 }
 
-/// Writes the exact total of every key (`diag: total ...`): call on an orderly exit.
+/// Writes the exact total of every key (`diag: total ...`), then `diag:reentrant dropped` if any count was dropped: call on an orderly exit.
 pub fn flush_totals() {
     let map = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
     let mut err = std::io::stderr().lock();
-    for ((o, a), r) in map.iter() {
-        let _ = writeln!(err, "diag: total {o} {a} {} first={}", r.n, r.first);
+    for (o, apis) in map.iter() {
+        for (a, r) in apis {
+            let _ = writeln!(err, "diag: total {o} {a} {} first={}", r.n, r.first);
+        }
+    }
+    let dropped = reentrant();
+    if dropped > 0 {
+        let first = stamp_of(DROPPED_FIRST_MS.load(Relaxed));
+        let _ = writeln!(
+            err,
+            "diag: total {REENTRANT} {REENTRANT_API} {dropped} first={first}"
+        );
     }
 }
 
@@ -225,10 +294,19 @@ fn line(outcome: &str, api: &str, n: u64, stamp: &str, cause: Option<&str>) -> S
 
 /// The wall clock as logcat stamps lines (`secs.mmm`), the app log's clock.
 pub fn wall_stamp() -> String {
+    stamp_of(wall_ms())
+}
+
+/// The wall clock in ms since the epoch (clock_gettime: no lock, no allocation).
+fn wall_ms() -> u64 {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    format!("{}.{:03}", now.as_secs(), now.subsec_millis())
+    u64::try_from(now.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn stamp_of(ms: u64) -> String {
+    format!("{}.{:03}", ms / 1000, ms % 1000)
 }
 
 #[cfg(test)]
@@ -300,6 +378,29 @@ mod tests {
             line("answered", "I.a b", 4, "100.000", None),
             "diag: count answered I.a b 4 at=100.000"
         );
+    }
+
+    /// A signal handler's count while its thread is inside `count` (the guard taken, the map locked): dropped into `diag:reentrant`, 1 more, the key never created.
+    /// Break check: without the guard test in `count`, the nested call locks the map this thread holds and the test hangs (or std panics on the relock).
+    #[test]
+    fn nested_count_is_dropped_not_deadlocked() {
+        let before = reentrant();
+        let inside = Inside::enter().expect("not inside count yet");
+        let held = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(count(PROP_MISS, "t.nested", None), 0);
+        drop(held);
+        drop(inside);
+        assert_eq!(reentrant(), before + 1);
+        assert!(!counts().iter().any(|(_, a, _)| a == "t.nested"));
+        // the guard was released: the next call counts
+        assert_eq!(count(PROP_MISS, "t.nested", None), 1);
+    }
+
+    /// 1794661778402 ms = the S4 example stamp `1794661778.402`; a value under 100 ms keeps its leading zeros.
+    #[test]
+    fn stamp_of_ms() {
+        assert_eq!(stamp_of(1_794_661_778_402), "1794661778.402");
+        assert_eq!(stamp_of(5_007), "5.007");
     }
 
     /// The stamp is logcat's shape: `secs.mmm`, three digits of milliseconds.

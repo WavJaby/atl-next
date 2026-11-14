@@ -182,6 +182,7 @@ dependencies = [
  "anyhow",
  "atl-android-paths",
  "atl-bridgegen",
+ "atl-diag",
  "errno",
  "rustix",
 ]

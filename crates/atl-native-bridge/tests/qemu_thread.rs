@@ -24,7 +24,7 @@ use atl_native_bridge::engine::{Config, Guest, qemu};
 use object::{Object, ObjectSymbol, read::elf::ElfFile64};
 
 /// The fixture functions the host calls, in the order `Expected::values` holds them.
-const SYMBOLS: [&str; 19] = [
+const SYMBOLS: [&str; 20] = [
     "qt_props_count",
     "qt_props_expected",
     "qt_join",
@@ -44,6 +44,7 @@ const SYMBOLS: [&str; 19] = [
     "qt_exit_run",
     "qt_resolve",
     "qt_kill",
+    "qt_prop_unset",
 ];
 /// bionic `PTHREAD_STACK_SIZE_DEFAULT` order (1 MiB; R-10 plan D2): the guest stack of a thread created without an attr.
 const DEFAULT_STACK: u64 = 1 << 20;
@@ -160,13 +161,15 @@ fn started(r: Result<Guest, String>) -> u64 {
     let count = unsafe { guest.call(props_count, 0, 0, 0) } as u64;
     // SAFETY: as above; the count the gate seeded, read through __system_property_get.
     let expected_count = unsafe { guest.call(props_expected, 0, 0, 0) } as u64;
+    // SAFETY: as above; reads a name nobody set (its prop:miss line is the xtask side's check, qemu_thread.rs `UNSET`).
+    let unset_len = unsafe { guest.call(addr(19), 0, 0, 0) } as u64;
     ok &= check(
         'p',
-        if expected_count > 0 && count == expected_count {
+        if expected_count > 0 && count == expected_count && unset_len == 0 {
             Ok(())
         } else {
             Err(format!(
-                "foreach counted {count} seeded properties, atl.qt.expect says {expected_count}"
+                "foreach counted {count} seeded properties, atl.qt.expect says {expected_count}; unset read {unset_len} bytes"
             ))
         },
     );
