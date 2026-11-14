@@ -12,26 +12,35 @@ PreInitializeNativeBridge and InitNonZygoteOrPostFork; as in the
 zygote child, an ISA other than kRuntimeISA initializes the bridge.
 An unknown ISA string is refused at parse.
 
+-Xnative-bridge-app-data-dir:<dir> stands in for zygote's
+specialization in a sandboxed launcher: the bridge is pre-initialized
+with <dir> (code cache <dir>/code_cache instead of ./code_cache) and a
+null instruction set, so ART neither unshares a mount namespace nor
+bind-mounts cpuinfo; the sandbox already provides both.
+
 Upstream-Status: Pending
-Patch-Reason: non-zygote starts hardcode kRuntimeISA and no option
- carries an ISA; the zygote child path that does carry one unloads the
- bridge for the runtime ISA, which a host-ISA bridge (-Xforce-nb-testing)
- needs, so the launcher cannot reach a foreign-ISA bridge without ART.
+Patch-Reason: non-zygote starts hardcode kRuntimeISA and "." and no
+ option carries an ISA or a data dir; the zygote child path that does
+ carry them unloads the bridge for the runtime ISA, which a host-ISA
+ bridge (-Xforce-nb-testing) needs, so the launcher cannot reach a
+ foreign-ISA bridge without ART; an unprivileged process cannot
+ unshare a mount namespace, so the cpuinfo bind must come from the
+ sandbox.
 ---
 SPDX-License-Identifier: Apache-2.0
- runtime/native_bridge_art_interface.cc |  6 +++---
+ runtime/native_bridge_art_interface.cc | 10 ++++++----
  runtime/native_bridge_art_interface.h  |  2 +-
- runtime/parsed_options.cc              | 12 ++++++++++++
- runtime/runtime.cc                     | 12 +++++++++---
- runtime/runtime.h                      |  3 +++
- runtime/runtime_options.def            |  1 +
- 6 files changed, 29 insertions(+), 7 deletions(-)
+ runtime/parsed_options.cc              | 16 ++++++++++++++++
+ runtime/runtime.cc                     | 19 ++++++++++++++++---
+ runtime/runtime.h                      |  7 +++++++
+ runtime/runtime_options.def            |  2 ++
+ 6 files changed, 48 insertions(+), 8 deletions(-)
 
 diff --git a/runtime/native_bridge_art_interface.cc b/runtime/native_bridge_art_interface.cc
-index 404d1f1ad6369aa743430bac49096a1a60362a1a..f23137b4d62456777acb90ef019a5f80c9760a42 100644
+index 404d1f1ad6369aa743430bac49096a1a60362a1a..589bc681803a653f74e3c8b25334a411f3d73c57 100644
 --- a/runtime/native_bridge_art_interface.cc
 +++ b/runtime/native_bridge_art_interface.cc
-@@ -98,15 +98,15 @@ bool LoadNativeBridge(const std::string& native_bridge_library_filename) {
+@@ -98,15 +98,17 @@ bool LoadNativeBridge(const std::string& native_bridge_library_filename) {
                                     &native_bridge_art_callbacks_);
  }
  
@@ -39,7 +48,10 @@ index 404d1f1ad6369aa743430bac49096a1a60362a1a..f23137b4d62456777acb90ef019a5f80
 +void PreInitializeNativeBridge(const std::string& dir, const char* instruction_set) {
    VLOG(startup) << "Runtime::Pre-initialize native bridge";
  #ifndef __APPLE__  // Mac OS does not support CLONE_NEWNS.
-   if (unshare(CLONE_NEWNS) == -1) {
+-  if (unshare(CLONE_NEWNS) == -1) {
++  // A null instruction set: the environment already gave this process its mount namespace and
++  // /proc/cpuinfo, so there is nothing to unshare or bind-mount (libnativebridge skips the mount).
++  if (instruction_set != nullptr && unshare(CLONE_NEWNS) == -1) {
      LOG(WARNING) << "Could not create mount namespace.";
    }
 -  android::PreInitializeNativeBridge(dir.c_str(), GetInstructionSetString(kRuntimeISA));
@@ -64,10 +76,10 @@ index 5aeaebf2ca35dbc145c56f2ea1ce483ad327d471..11f1f1e89f4db3df37c22da187201773
  void PreZygoteForkNativeBridge();
  
 diff --git a/runtime/parsed_options.cc b/runtime/parsed_options.cc
-index ab07ea0f020cb09d46cf822ff98984bb1e2ab6bc..54c5b7388334a21aab3cc9ed0e4f521a2b7796c8 100644
+index ab07ea0f020cb09d46cf822ff98984bb1e2ab6bc..963c5d8c9fb327d16d569c705df434bafce7ee43 100644
 --- a/runtime/parsed_options.cc
 +++ b/runtime/parsed_options.cc
-@@ -398,6 +398,10 @@ std::unique_ptr<RuntimeParser> ParsedOptions::MakeParser(bool ignore_unrecognize
+@@ -398,6 +398,14 @@ std::unique_ptr<RuntimeParser> ParsedOptions::MakeParser(bool ignore_unrecognize
            .IntoKey(M::Experimental)
        .Define("-Xforce-nb-testing")
            .IntoKey(M::ForceNativeBridge)
@@ -75,10 +87,14 @@ index ab07ea0f020cb09d46cf822ff98984bb1e2ab6bc..54c5b7388334a21aab3cc9ed0e4f521a
 +          .WithType<std::string>()
 +          .WithHelp("Instruction set the native bridge is initialized for in a non-zygote runtime.")
 +          .IntoKey(M::NativeBridgeIsa)
++      .Define("-Xnative-bridge-app-data-dir:_")
++          .WithType<std::string>()
++          .WithHelp("App data dir of a non-zygote native bridge; its mount namespace and cpuinfo come from the environment.")
++          .IntoKey(M::NativeBridgeAppDataDir)
        .Define("-Xplugin:_")
            .WithHelp("Load and initialize the specified art-plugin.")
            .WithType<std::vector<Plugin>>().AppendValues()
-@@ -774,6 +778,14 @@ bool ParsedOptions::DoParse(const RuntimeOptions& options,
+@@ -774,6 +782,14 @@ bool ParsedOptions::DoParse(const RuntimeOptions& options,
      args.Set(M::AllowInMemoryCompilation, Unit());
    }
  
@@ -94,7 +110,7 @@ index ab07ea0f020cb09d46cf822ff98984bb1e2ab6bc..54c5b7388334a21aab3cc9ed0e4f521a
        use_default_bootclasspath) {
      const bool deny_art_apex_data_files = args.Exists(M::DenyArtApexDataFiles);
 diff --git a/runtime/runtime.cc b/runtime/runtime.cc
-index d6c11628feaf9422dbaceba4c82bd0e6224e6b90..00e2a8b5cb3c5176c4f64f390c35a4f15883ca9f 100644
+index d6c11628feaf9422dbaceba4c82bd0e6224e6b90..1ab957d42b37003fa2661ca359fc3cf2691373bf 100644
 --- a/runtime/runtime.cc
 +++ b/runtime/runtime.cc
 @@ -296,6 +296,7 @@ Runtime::Runtime()
@@ -105,12 +121,18 @@ index d6c11628feaf9422dbaceba4c82bd0e6224e6b90..00e2a8b5cb3c5176c4f64f390c35a4f1
        is_native_bridge_loaded_(false),
        is_native_debuggable_(false),
        async_exceptions_thrown_(false),
-@@ -1117,16 +1118,17 @@ bool Runtime::Start() {
+@@ -1117,16 +1118,23 @@ bool Runtime::Start() {
  
    if (!is_zygote_) {
      if (is_native_bridge_loaded_) {
 -      PreInitializeNativeBridge(".");
-+      PreInitializeNativeBridge(".", GetInstructionSetString(native_bridge_isa_));
++      // With -Xnative-bridge-app-data-dir the launcher's sandbox stands in for zygote's
++      // specialization: the app's data dir is known and cpuinfo is already in place.
++      if (native_bridge_app_data_dir_.empty()) {
++        PreInitializeNativeBridge(".", GetInstructionSetString(native_bridge_isa_));
++      } else {
++        PreInitializeNativeBridge(native_bridge_app_data_dir_, nullptr);
++      }
      }
 -    NativeBridgeAction action = force_native_bridge_
 +    // As in the zygote child (ZygoteHooks nativePostForkChild): a foreign ISA needs the bridge.
@@ -126,7 +148,7 @@ index d6c11628feaf9422dbaceba4c82bd0e6224e6b90..00e2a8b5cb3c5176c4f64f390c35a4f1
    }
  
    {
-@@ -1737,6 +1739,10 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
+@@ -1737,6 +1745,11 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
    // and it passes the `NoSigChain` option to `Runtime` to indicate this.
    no_sig_chain_ = runtime_options.Exists(Opt::NoSigChain);
    force_native_bridge_ = runtime_options.Exists(Opt::ForceNativeBridge);
@@ -134,32 +156,38 @@ index d6c11628feaf9422dbaceba4c82bd0e6224e6b90..00e2a8b5cb3c5176c4f64f390c35a4f1
 +  native_bridge_isa_ = runtime_options.Exists(Opt::NativeBridgeIsa)
 +      ? GetInstructionSetFromString(runtime_options.GetOrDefault(Opt::NativeBridgeIsa).c_str())
 +      : kRuntimeISA;
++  native_bridge_app_data_dir_ = runtime_options.GetOrDefault(Opt::NativeBridgeAppDataDir);
  
    Split(runtime_options.GetOrDefault(Opt::CpuAbiList), ',', &cpu_abilist_);
  
 diff --git a/runtime/runtime.h b/runtime/runtime.h
-index 8f781cff3451d22a6dadf53587e2067d445c9682..194db4e51b074491db5676107100fa6a3729695f 100644
+index 8f781cff3451d22a6dadf53587e2067d445c9682..42fc0e3b768220a238895db771eb582a7f82719c 100644
 --- a/runtime/runtime.h
 +++ b/runtime/runtime.h
-@@ -1379,6 +1379,9 @@ class Runtime {
+@@ -1379,6 +1379,13 @@ class Runtime {
    // Force the use of native bridge even if the app ISA matches the runtime ISA.
    bool force_native_bridge_;
  
 +  // Instruction set a non-zygote runtime initializes the native bridge for (-Xnative-bridge-isa).
 +  InstructionSet native_bridge_isa_;
 +
++  // App data dir a non-zygote runtime pre-initializes the native bridge with
++  // (-Xnative-bridge-app-data-dir); empty: ".", with ART's own mount namespace and cpuinfo mount.
++  std::string native_bridge_app_data_dir_;
++
    // Whether or not a native bridge has been loaded.
    //
    // The native bridge allows running native code compiled for a foreign ISA. The way it works is,
 diff --git a/runtime/runtime_options.def b/runtime/runtime_options.def
-index 010dc04c706d440292e4f9786211ef9aac8c4fb0..72e84bc2b3504db36c7372b10c700b741b79d4ea 100644
+index 010dc04c706d440292e4f9786211ef9aac8c4fb0..493eaf99e23fecfbf0028fd1b2495a2e6a8705f1 100644
 --- a/runtime/runtime_options.def
 +++ b/runtime/runtime_options.def
-@@ -119,6 +119,7 @@ RUNTIME_OPTIONS_KEY (Unit,                DisableExplicitGC)
+@@ -119,6 +119,8 @@ RUNTIME_OPTIONS_KEY (Unit,                DisableExplicitGC)
  RUNTIME_OPTIONS_KEY (Unit,                DisableEagerlyReleaseExplicitGC)
  RUNTIME_OPTIONS_KEY (Unit,                NoSigChain)
  RUNTIME_OPTIONS_KEY (Unit,                ForceNativeBridge)
 +RUNTIME_OPTIONS_KEY (std::string,         NativeBridgeIsa)
++RUNTIME_OPTIONS_KEY (std::string,         NativeBridgeAppDataDir)
  RUNTIME_OPTIONS_KEY (LogVerbosity,        Verbose)
  RUNTIME_OPTIONS_KEY (unsigned int,        LockProfThreshold)
  RUNTIME_OPTIONS_KEY (unsigned int,        StackDumpLockProfThreshold)

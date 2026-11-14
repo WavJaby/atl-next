@@ -534,6 +534,20 @@ public class Main extends Activity {
         }
     }
 
+    /** /proc/cpuinfo as this process's Java reads it (the cpuinfoView row); what it threw instead, so the row shows the reason. */
+    private static String procCpuinfo() {
+        try (java.io.FileInputStream in = new java.io.FileInputStream("/proc/cpuinfo")) {
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            for (int n; (n = in.read(buf)) > 0; ) {
+                out.write(buf, 0, n);
+            }
+            return new String(out.toByteArray(), java.nio.charset.StandardCharsets.UTF_8);
+        } catch (java.io.IOException e) {
+            return "threw " + e;
+        }
+    }
+
     /** The bridge-1 fixture class once loaded (onActivityResult makes the looperLater call with it); null without it. */
     private Class<?> bridge1;
 
@@ -604,6 +618,7 @@ public class Main extends Activity {
         bridge1Call(jni, "mediandkLinked", "mediandkLinked");
         bridge1Call(jni, "resolverProbe", "resolverProbe");
         bridge1Call(jni, "cpuProbe", "cpuProbe", Runtime.getRuntime().availableProcessors());
+        bridge1Call(jni, "cpuinfoView", "cpuinfoView", procCpuinfo());
         bridge1Call(jni, "keyDtorDetachReturn", "keyDtorDetach", 0);
         bridge1Call(jni, "keyDtorDetachExit", "keyDtorDetach", 1);
         // tr-first blocker 5: (a) on this thread inside the call; then a fresh thread arms the main looper for (b), read in onActivityResult

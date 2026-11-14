@@ -272,33 +272,47 @@ pub fn execute(root: &Path, b: &Build) -> Result<PathBuf> {
     Ok(b.exe())
 }
 
-/// The engine boot executable's crate root (atl-qemu-boot): `no_std`, its entry in `global_asm!`.
+/// The engine's guest executables' crate root (atl-qemu-boot): `no_std`, each entry in `global_asm!`, chosen by cfg.
 const BOOT_CRATE: &str = "crates/atl-qemu-boot/src/lib.rs";
-/// Its file name, as atl-android-paths `engine_boot` installs it.
+/// The boot entry's file name, as atl-android-paths `engine_boot` installs it.
 const BOOT_NAME: &str = "atl_engine_boot";
+/// The cpuinfo entry's file name, as atl-android-paths `engine_cpuinfo` installs it.
+const CPUINFO_NAME: &str = "atl_engine_cpuinfo";
 
-/// The boot executable's deliberate break: the cfg that drops its BOOT svc (atl-qemu-boot lib.rs; its build.rs `BREAKS` declares the same cfg).
+/// The boot executable's deliberate break: the cfg that drops its BOOT svc (atl-qemu-boot lib.rs; its build.rs `CFGS` declares the same cfg).
 pub const SKIP_BOOT: &str = "atl_qb_skip_boot";
+/// The cfg that selects atl-qemu-boot's cpuinfo entry (its build.rs `CFGS` declares it).
+const CPUINFO: &str = "atl_qb_cpuinfo";
 
 /// The engine boot executable for `b`'s guest arch, `<out>/atl_engine_boot`: atl-qemu-boot compiled by rust-toolchain.toml's rustc for the arches.toml guest `rust` triple as a static non-PIE executable, linked by rust-lld (no NDK, no libc: the entry is the crate's `_start`).
 pub fn boot_exe(root: &Path, b: &Build, out: &Path) -> Result<PathBuf> {
-    boot_exe_break(root, b, out, None)
+    guest_exe(root, b, out, BOOT_NAME, None)
 }
 
 /// [`boot_exe`] with `brk`, a break cfg ([`SKIP_BOOT`]) passed as `--cfg`.
 pub fn boot_exe_break(root: &Path, b: &Build, out: &Path, brk: Option<&str>) -> Result<PathBuf> {
+    guest_exe(root, b, out, BOOT_NAME, brk)
+}
+
+/// The engine cpuinfo probe for `b`'s guest arch, `<out>/atl_engine_cpuinfo`: atl-qemu-boot's cpuinfo entry, built as [`boot_exe`].
+pub fn cpuinfo_exe(root: &Path, b: &Build, out: &Path) -> Result<PathBuf> {
+    guest_exe(root, b, out, CPUINFO_NAME, Some(CPUINFO))
+}
+
+/// atl-qemu-boot as `<out>/<name>`, with `cfg` passed as `--cfg`.
+fn guest_exe(root: &Path, b: &Build, out: &Path, name: &str, cfg: Option<&str>) -> Result<PathBuf> {
     let arches = arches::load(root)?;
     let triple = arches::guest_rust(&arches, &b.arch)?;
     std::fs::create_dir_all(out).with_context(|| format!("creating {}", out.display()))?;
-    let bin = out.join(BOOT_NAME);
+    let bin = out.join(name);
     let mut cmd = Command::new("rustc");
-    if let Some(cfg) = brk {
+    if let Some(cfg) = cfg {
         cmd.args(["--cfg", cfg]);
     }
     let status = cmd
         .current_dir(root)
         .args(["--edition", "2024", "--target", triple])
-        .args(["--crate-type", "bin", "--crate-name", BOOT_NAME])
+        .args(["--crate-type", "bin", "--crate-name", name])
         .args(["-C", "panic=abort", "-C", "opt-level=1"])
         .args(["-C", "linker=rust-lld", "-C", "linker-flavor=ld.lld"])
         .args([
@@ -357,11 +371,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 mod tests {
     use super::*;
 
-    /// The boot crate's build.rs declares the break cfg xtask passes, so its host lint build knows it.
+    /// The boot crate's build.rs declares every cfg xtask passes, so its host lint build knows them.
     #[test]
-    fn boot_break_is_declared_by_the_boot_crate() {
+    fn boot_cfgs_are_declared_by_the_boot_crate() {
         let build_rs = include_str!("../../crates/atl-qemu-boot/build.rs");
-        assert!(build_rs.contains(&format!("\"{SKIP_BOOT}\"")));
+        for cfg in [SKIP_BOOT, CPUINFO] {
+            assert!(build_rs.contains(&format!("\"{cfg}\"")), "{cfg}");
+        }
     }
 
     fn build(target: &str) -> Build {

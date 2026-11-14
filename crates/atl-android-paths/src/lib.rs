@@ -36,6 +36,14 @@ pub fn engine_boot(isa: &str) -> String {
     format!("{}/atl_engine_boot", native_bridge_bin(isa))
 }
 
+/// The CPU description a native-bridge app's host-side readers (Java, the runtime) see; a device bind-mounts the bridge's `cpuinfo.<isa>.txt` over it (libnativebridge `MountCpuinfo`), here the broker binds atld's guest cpuinfo ([`engine_cpuinfo`]).
+pub const PROC_CPUINFO: &str = "/proc/cpuinfo";
+
+/// The engine's cpuinfo probe for guest ISA `isa`: a static guest executable that copies the guest's `/proc/cpuinfo` (the engine's own formatter) to stdout; atld runs it once through [`engine_library`] and binds the output over translated apps' `/proc/cpuinfo`.
+pub fn engine_cpuinfo(isa: &str) -> String {
+    format!("{}/atl_engine_cpuinfo", native_bridge_bin(isa))
+}
+
 /// libEGL's Loader.cpp `VENDOR_LIB_EGL_DIR` for the process's pointer width: where it looks for `lib{EGL,GLESv1_CM,GLESv2}_<ro.hardware.egl>.so`.
 pub const VENDOR_EGL: &str = if cfg!(target_pointer_width = "64") {
     "/vendor/lib64/egl"

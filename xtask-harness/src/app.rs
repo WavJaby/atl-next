@@ -77,6 +77,9 @@ pub struct Args {
     /// RLIMIT_NICE below 40, Process.setThreadPriority throws SecurityException and the priority line must go red.
     #[arg(long)]
     priority_break: bool,
+    /// The cpuinfo break (with `--fixture-arch` foreign): atld gets no `--cpuinfo-probe`, so the app's Java reads the host's /proc/cpuinfo while its translated library reads the engine's, and the cpuinfoView line must go red.
+    #[arg(long)]
+    cpuinfo_break: bool,
     /// The system-features break: the run places none of AOSP's static permission files (atld_run.rs FEATURE_FILES), so the always-present feature reads false and the features line must go red.
     #[arg(long)]
     features_break: bool,
@@ -524,6 +527,10 @@ fn bridge1_call_failures(app: &str, deferred: &[&str], foreign: bool) -> Vec<Str
     if let Some(why) = cpu_probe_why(got(CPU_PROBE).as_deref(), foreign) {
         whys.push(format!("bridge1 call {CPU_PROBE}: {why}"));
     }
+    let host_word = cpuinfo_features(&std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default());
+    if let Some(why) = cpuinfo_view_why(got(CPUINFO_VIEW).as_deref(), foreign, host_word) {
+        whys.push(format!("bridge1 call {CPUINFO_VIEW}: {why}"));
+    }
     if app.contains("called unimplemented OpenGL ES API") {
         whys.push("GL: the front reports an unimplemented OpenGL ES API call".to_owned());
     }
@@ -639,6 +646,32 @@ fn cpu_probe_why(value: Option<&str>, foreign: bool) -> Option<String> {
         ));
     }
     (!wrong.is_empty()).then(|| format!("{value:?}: {}", wrong.join(", ")))
+}
+
+/// Main.bridge1Calls' cpuinfoView row (atl_jni_test.c cpuinfoView): `same features W` or `differs java J guest G bytes A/B`.
+const CPUINFO_VIEW: &str = "cpuinfoView";
+
+/// The cpuinfoView row's judge: Java and the app's native code must read one /proc/cpuinfo (on a device the bridge's cpuinfo.<isa>.txt is bound over it), the native code's own ISA's: a foreign guest's word is neither
+/// `host_word` nor "none" (atld's guest cpuinfo bound for Java), an identity guest's is the host's. `None`: the row passes.
+fn cpuinfo_view_why(value: Option<&str>, foreign: bool, host_word: &str) -> Option<String> {
+    let Some(value) = value else {
+        return Some("no line".to_owned());
+    };
+    let ok = match value.strip_prefix("same features ") {
+        Some(w) if foreign => w != host_word && w != "none",
+        Some(w) => w == host_word,
+        None => false,
+    };
+    (!ok).then(|| {
+        format!(
+            "{value:?}: want `same features <{}>` (host's word {host_word:?})",
+            if foreign {
+                "the guest ISA's word"
+            } else {
+                "the host's word"
+            }
+        )
+    })
 }
 
 /// The firstConfig row's judge: its visual (EGL_NATIVE_VISUAL_ID) must be one of [`FIXED_FORMATS`]. The sizes sit in the reason, so a failure shows which config came first. `None`: the row passes.
@@ -971,6 +1004,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     };
     let rt = if args.result_break {
         rt.without_activity_result()
+    } else {
+        rt
+    };
+    let rt = if args.cpuinfo_break {
+        rt.without_cpuinfo()
     } else {
         rt
     };
@@ -1541,6 +1579,31 @@ mod tests {
             cpuinfo_features("processor\t: 0\nflags\t\t: fpu sse\n"),
             "none"
         );
+    }
+
+    /// cpuinfoView: one text for Java and native, of the native code's ISA; a difference (the bind missing) or the wrong ISA's word fails.
+    #[test]
+    fn cpuinfo_view_wants_one_text_of_the_guest_isa() {
+        assert_eq!(
+            cpuinfo_view_why(Some("same features asimd"), true, "sse2"),
+            None
+        );
+        assert_eq!(
+            cpuinfo_view_why(Some("same features sse2"), false, "sse2"),
+            None
+        );
+        // the break: Java reads the host's file, the guest the engine's
+        assert!(
+            cpuinfo_view_why(
+                Some("differs java sse2 guest asimd bytes 9000/800"),
+                true,
+                "sse2"
+            )
+            .is_some()
+        );
+        assert!(cpuinfo_view_why(Some("same features sse2"), true, "sse2").is_some());
+        assert!(cpuinfo_view_why(Some("same features none"), true, "sse2").is_some());
+        assert!(cpuinfo_view_why(None, true, "sse2").is_some());
     }
 
     const T: u64 = 1_000_000;

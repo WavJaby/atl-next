@@ -211,10 +211,11 @@ exports = ["atl-native-bridge"]
 uses = ["generators", "android-paths", "cpu-pressure", "engine-api", "diag"]
 
 # the QEMU translator engine (QEMU bridge plan Q2 spike): QEMU's linux-user core dlopened as a library, P1's svc hook, the fault chain in front of QEMU's handler; CPU layouts generated from QEMU's cpu.h; exports its `Trap` to the native bridge's QEMU crossing (Q4)
+# atl-qemu-boot: the engine's guest executables (boot, cpuinfo probe); atl-engine-cpuinfo: the host runner atld starts once for the guest cpuinfo (android-paths: the installed engine and probe)
 [qemu-engine]
-crates = ["atl-qemu-engine", "atl-qemu-boot"]
+crates = ["atl-qemu-engine", "atl-qemu-boot", "atl-engine-cpuinfo"]
 exports = ["atl-qemu-engine"]
-uses = ["generators", "engine-api"]
+uses = ["generators", "engine-api", "android-paths"]
 
 # the engine C ABI (QEMU bridge plan Q5-1a): include/atl_engine.h and its Rust mirror, the table the engine `.so` exports as atl_engine; no code of its own
 [engine-api]

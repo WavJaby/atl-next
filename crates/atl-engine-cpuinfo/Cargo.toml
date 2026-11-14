@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-engine-cpuinfo"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# atld's guest cpuinfo source: the engine `.so` run on its cpuinfo probe (atl-qemu-boot cpuinfo entry), whose stdout is the guest's /proc/cpuinfo as the engine formats it.
+
+[dependencies]
+atl-android-paths = { path = "../atl-android-paths" }
+atl-engine-api = { path = "../atl-engine-api" }
+libloading.workspace = true
+
+[lints]
+workspace = true

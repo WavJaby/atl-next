@@ -318,6 +318,15 @@ name = "atl-engine-api"
 version = "0.0.0"
 
 [[package]]
+name = "atl-engine-cpuinfo"
+version = "0.0.0"
+dependencies = [
+ "atl-android-paths",
+ "atl-engine-api",
+ "libloading",
+]
+
+[[package]]
 name = "atl-fonts"
 version = "0.0.0"
 dependencies = [

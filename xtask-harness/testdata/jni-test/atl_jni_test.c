@@ -691,6 +691,63 @@ JNI_FN(jstring, cpuProbe)(JNIEnv *env, jclass cls, jint java)
     return (*env)->NewStringUTF(env, out);
 }
 
+// The features word of a whole cpuinfo text, by cpuProbe's rule.
+static const char *cpu_features_of(const char *text)
+{
+    const char *word = "none";
+    for (const char *line = text; *line != '\0';) {
+        const char *end = strchr(line, '\n');
+        size_t n = end != NULL ? (size_t)(end - line) : strlen(line);
+        char buf[4096];
+        if (n >= sizeof buf)
+            n = sizeof buf - 1;
+        memcpy(buf, line, n);
+        buf[n] = '\0';
+        if (strncmp(buf, "Features", 8) == 0 && cpu_word_in(buf, "asimd"))
+            word = "asimd";
+        else if (strncmp(buf, "flags", 5) == 0 && cpu_word_in(buf, "sse2"))
+            word = "sse2";
+        line = end != NULL ? end + 1 : line + n;
+    }
+    return word;
+}
+
+// AtlJniTest.cpuinfoView (fid-nbridge): `java` is the caller's whole /proc/cpuinfo as Java read it; this code reads its own (under QEMU: the engine's formatter). "same features W" when the two texts are equal, else
+// "differs java J guest G bytes A/B". On a device the bridge's cpuinfo.<isa>.txt is bound over /proc/cpuinfo, so Java and a translated library see one CPU; here atld's guest cpuinfo is.
+JNI_FN(jstring, cpuinfoView)(JNIEnv *env, jclass cls, jstring java)
+{
+    size_t cap = 4096, len = 0;
+    char *mine = malloc(cap);
+    FILE *f = fopen("/proc/cpuinfo", "re");
+    if (mine != NULL && f != NULL) {
+        size_t n;
+        while ((n = fread(mine + len, 1, cap - len - 1, f)) > 0) {
+            len += n;
+            if (cap - len - 1 == 0) {
+                char *grown = realloc(mine, cap * 2);
+                if (grown == NULL)
+                    break;
+                mine = grown;
+                cap *= 2;
+            }
+        }
+    }
+    if (f != NULL)
+        fclose(f);
+    if (mine == NULL)
+        return (*env)->NewStringUTF(env, "no memory");
+    mine[len] = '\0';
+    const char *theirs = (*env)->GetStringUTFChars(env, java, NULL);
+    char out[160];
+    if (strcmp(theirs, mine) == 0)
+        snprintf(out, sizeof out, "same features %s", cpu_features_of(mine));
+    else
+        snprintf(out, sizeof out, "differs java %s guest %s bytes %zu/%zu", cpu_features_of(theirs), cpu_features_of(mine), strlen(theirs), len);
+    (*env)->ReleaseStringUTFChars(env, java, theirs);
+    free(mine);
+    return (*env)->NewStringUTF(env, out);
+}
+
 // AtlJniTest.keyDtorDetach (bridge-keydtor): Android's documented JNI thread pattern (developer.android.com JNI tips "Threads"): a native thread attaches, stores its JNIEnv under a pthread key whose destructor calls DetachCurrentThread, then ends without detaching -- by returning (exit 0) or by pthread_exit (exit 1). ART's ThreadExitCallback re-arms once for exactly this (thread.cc) and aborts only if the thread is still attached on its second call.
 // Answer "ran R rc C attach A": R = destructor runs (1), C = its DetachCurrentThread result (JNI_OK 0), A = the thread's AttachCurrentThread result (0). A process abort instead of an answer is the failure this row guards.
 static JavaVM *kd_vm;

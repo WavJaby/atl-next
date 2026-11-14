@@ -1020,7 +1020,30 @@ fn read_info(mut f: io::PipeReader) -> io::Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atl_android_paths::{DATA, SDCARD, SHARED_STORAGE, SYSTEM};
+    use atl_android_paths::{DATA, PROC_CPUINFO, SDCARD, SHARED_STORAGE, SYSTEM};
+
+    /// A file mount over a /proc entry (atld's guest cpuinfo for a translated app) lands after the fresh `--proc /proc`, so it covers the kernel's file instead of being covered by the procfs; and it is granted read-only.
+    #[test]
+    fn proc_file_mount_follows_the_fresh_proc() {
+        let mut sp = spawn();
+        sp.mounts.push(Mount {
+            host: "/r/cpuinfo.arm64".into(),
+            at: PROC_CPUINFO.into(),
+            writable: false,
+        });
+        let (args, grants) = bwrap_args(&sp, Profile::App, &[], Path::new("/b/stub"), 9, None);
+        let args = s(&args);
+        // the fresh procfs is the only argument naming /proc itself; the bind names its source
+        let proc_at = args.iter().position(|a| a == "/proc");
+        let bind_at = args
+            .windows(2)
+            .position(|w| w == ["/r/cpuinfo.arm64", PROC_CPUINFO]);
+        assert!(
+            matches!((proc_at, bind_at), (Some(p), Some(b)) if p < b),
+            "{args:?}"
+        );
+        assert!(grants.contains(&(Access::Ro, PathBuf::from(PROC_CPUINFO))));
+    }
 
     /// Spawn.links follow the mounts as bwrap `--symlink TARGET AT`: the app's /sdcard -> the shared storage root.
     #[test]

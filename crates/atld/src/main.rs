@@ -31,8 +31,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use atl_android_paths::{
-    DATA, DATA_APP, DATA_USER, DATA_USER_DE, PROPERTY_AREA, PROPERTY_AREA_ENV, SDCARD,
-    SHARED_STORAGE, SYSTEM, SYSTEM_FONTS, SYSTEM_FRAMEWORK, VENDOR,
+    DATA, DATA_APP, DATA_USER, DATA_USER_DE, PROC_CPUINFO, PROPERTY_AREA, PROPERTY_AREA_ENV,
+    SDCARD, SHARED_STORAGE, SYSTEM, SYSTEM_FONTS, SYSTEM_FRAMEWORK, VENDOR,
 };
 use atl_broker::control::{self, Request, Response, StagedName, StartRequest};
 use atl_broker::{
@@ -81,6 +81,10 @@ struct Args {
     /// Needed whenever both are given. Headless runs, and displays naming no node, keep gralloc's own trial (the baseline tier).
     #[arg(long)]
     gpu_probe: Option<PathBuf>,
+    /// atl-engine-cpuinfo executable: for each `--abi` ISA whose engine `.so` a `--file` places (atl-android-paths `engine_library`), run once in the sandbox; its stdout, the guest's /proc/cpuinfo as the engine formats it, is cached as `<root>/cpuinfo.<isa>`
+    /// and bound read-only over /proc/cpuinfo of every app process of that ISA, so Java and the runtime read what guest code reads (a device binds the bridge's `cpuinfo.<isa>.txt` the same way). Omitted: no bind; host readers see the host's file.
+    #[arg(long)]
+    cpuinfo_probe: Option<PathBuf>,
     /// atl-app-launcher executable.
     #[arg(long)]
     launcher: PathBuf,
@@ -827,10 +831,47 @@ struct Host {
     app_env: Vec<(OsString, OsString)>,
     /// The run's GPU: gralloc's DRM node and how it was chosen, pushed to each app process (atl_gralloc::node). None: no gralloc in this run.
     gpu: Option<(String, NodeSource)>,
+    /// The guest cpuinfo of each translated ISA (`--cpuinfo-probe`): bound over /proc/cpuinfo of that ISA's app processes ([`cpuinfo_mount`]).
+    cpuinfo: BTreeMap<String, PathBuf>,
     /// installd's role: the sessions' files, the installer, what is staged and installed (an app process mounts its package's own directories, package_mounts).
     installd: Installd,
     /// When the services' first app process started (wall-clock ms): the summary's first-seen offsets count from it.
     first_app_ms: OnceLock<u64>,
+}
+
+/// `package`'s credential-encrypted data dir of user 0 as the app sees it (ApplicationInfo.dataDir, `/data/user/0/<package>`): writable in its sandbox ([`Host::package_mounts`]).
+fn app_data_dir(package: &str) -> String {
+    format!("{DATA_USER}/0/{package}")
+}
+
+/// The `--abi` ISAs (`<abi>=<isa>`) whose engine `.so` a `--file` places at atl-android-paths `engine_library`: the translated ISAs, each probed once for its guest cpuinfo. Sorted, once each.
+/// `files` as [`partition_file`] parses them: Android paths relative to `/`.
+fn staged_engines(abis: &[String], files: &[(PathBuf, PathBuf)]) -> Vec<String> {
+    abis.iter()
+        .filter_map(|a| a.split_once('=').map(|(_, isa)| isa.to_owned()))
+        .filter(|isa| {
+            let engine = PathBuf::from(atl_android_paths::engine_library(isa));
+            files
+                .iter()
+                .any(|(_, at)| Path::new("/").join(at) == engine)
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// The guest cpuinfo bind of an app process of `instruction_set`: its cached file read-only at /proc/cpuinfo when that ISA was probed ([`staged_engines`]); none for the host ISA or a process of no package.
+fn cpuinfo_mount(
+    cpuinfo: &BTreeMap<String, PathBuf>,
+    instruction_set: Option<&str>,
+) -> Option<Mount> {
+    instruction_set
+        .and_then(|isa| cpuinfo.get(isa))
+        .map(|host| Mount {
+            host: host.clone(),
+            at: PROC_CPUINFO.into(),
+            writable: false,
+        })
 }
 
 /// A host path read-only at the same path in the sandbox: the runtime's shared host paths name themselves in both trees.
@@ -915,7 +956,8 @@ impl Host {
 
     /// The launcher running `class` as zygote's child runs it (`--app`), as `uid`, in the sandbox with /system, /data and its property area; its log is `log/<name>.log` (appended to: a process
     /// that starts again keeps the earlier run's lines). `instruction_set`: an app package's ([`InstructionSets`]), passed as zygote args carry it; None for a process of no package (the shell's), which runs
-    /// the runtime's own ISA.
+    /// the runtime's own ISA. `package`: the app's, whose data dir ([`app_data_dir`]) ART's native bridge gets as zygote's specialization hands it (`-Xnative-bridge-app-data-dir`, patches/aosp/art 0004: its code cache there, no
+    /// mount namespace or cpuinfo mount of ART's own; the sandbox gives both); ignored by ART when no bridge is loaded.
     #[allow(clippy::too_many_arguments)]
     fn app_spawn(
         &self,
@@ -923,6 +965,7 @@ impl Host {
         name: &str,
         target_sdk: i32,
         instruction_set: Option<&str>,
+        package: Option<&str>,
         boot: &[String],
         class: &str,
         args: &[String],
@@ -951,8 +994,9 @@ impl Host {
                     format!("-Xbootclasspath:{boot}"),
                     format!("-Xbootclasspath-locations:{boot}"),
                     "-Xnoimage-dex2oat".to_owned(),
-                    class.to_owned(),
                 ])
+                .chain(package.map(|p| format!("-Xnative-bridge-app-data-dir:{}", app_data_dir(p))))
+                .chain([class.to_owned()])
                 .chain(args.iter().cloned())
                 .map(OsString::from)
                 .collect();
@@ -989,6 +1033,8 @@ impl Host {
             .chain(self.shared_ro.iter().cloned())
             .chain(self.desktop_ro.iter().cloned())
             .chain(self.pipewire.iter().map(|p| ro_at_own_path(p)))
+            // a translated app's host readers see the guest's CPU, as on a device (libnativebridge MountCpuinfo); the broker binds it after the fresh /proc
+            .chain(cpuinfo_mount(&self.cpuinfo, instruction_set))
             .collect(),
             links: vec![],
             devices: self.app_devices.clone(),
@@ -1012,7 +1058,7 @@ impl Host {
     fn package_mounts(&self, package: &str) -> Result<Vec<Mount>> {
         [
             (format!("{DATA_APP}/{package}"), false),
-            (format!("{DATA_USER}/0/{package}"), true),
+            (app_data_dir(package), true),
             (format!("{DATA_USER_DE}/0/{package}"), true),
         ]
         .into_iter()
@@ -1111,6 +1157,7 @@ impl Host {
             &req.process_name,
             req.target_sdk,
             Some(&req.instruction_set),
+            Some(&req.package),
             &self.boot,
             &req.entry_point,
             &req.args,
@@ -1490,6 +1537,35 @@ fn run(a: &Args) -> Result<ExitCode> {
         )?)
         .context("starting servicemanager")?;
     log(format_args!("servicemanager: host pid {}", sm.host_pid));
+    // the guest cpuinfo before any app can start: the probe under the installed engine, with /system as apps see it
+    let mut cpuinfo = BTreeMap::new();
+    if let Some(probe) = &a.cpuinfo_probe {
+        for isa in staged_engines(&a.abis, &a.files) {
+            let name = format!("cpuinfo-probe-{isa}");
+            let cached = r.root.join(format!("cpuinfo.{isa}"));
+            let mut spawn = system_spawn(&name, probe, vec![isa.clone().into()], false, None)?;
+            spawn.mounts.push(Mount {
+                host: r.system(),
+                at: SYSTEM.into(),
+                writable: false,
+            });
+            spawn.stdout = std::fs::File::create(&cached)?.into();
+            let status = broker
+                .spawn(spawn)
+                .with_context(|| format!("starting {}", probe.display()))?
+                .child
+                .wait()?;
+            let len = std::fs::metadata(&cached)?.len();
+            ensure!(
+                status.success() && len > 0,
+                "{} {isa} exited {status} after {len} bytes:\n{}",
+                probe.display(),
+                std::fs::read_to_string(r.log(&name))?.trim()
+            );
+            log(format_args!("cpuinfo-probe: {isa} {len} bytes"));
+            cpuinfo.insert(isa, cached);
+        }
+    }
     // gralloc before any app can start (a --launch request may come with the services' first breath): the node it allocates on goes into every app's properties
     let mut gralloc = None;
     let mut gpu = None;
@@ -1721,6 +1797,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         app_env,
         app_devices,
         gpu,
+        cpuinfo,
         broker,
         launcher: a.launcher.clone(),
         lib: lib.clone(),
@@ -1908,7 +1985,16 @@ fn run(a: &Args) -> Result<ExitCode> {
 
     if let (Some(class), Some(uid), Some(name)) = (&a.run_class, a.run_uid, &a.run_name) {
         let boot: Vec<String> = host.boot.iter().cloned().chain(run_boot).collect();
-        let spawn = host.app_spawn(uid, name, PLATFORM_SDK, None, &boot, class, &a.run_args)?;
+        let spawn = host.app_spawn(
+            uid,
+            name,
+            PLATFORM_SDK,
+            None,
+            None,
+            &boot,
+            class,
+            &a.run_args,
+        )?;
         let pid = host.start(spawn, true, false)?;
         log(format_args!("{name}: uid {uid}, host pid {pid}: {class}"));
     }
@@ -2150,5 +2236,42 @@ mod tests {
         let log = "gralloc: counters allocate=0\ngralloc: ready (/dev/dri/renderD128)\n";
         assert_eq!(gralloc_node(log).as_deref(), Some("/dev/dri/renderD128"));
         assert_eq!(gralloc_node("gralloc: ready\n"), None);
+    }
+
+    /// Only an ISA whose engine `.so` is placed is probed: the host ISA (identity, no engine) and an ISA with no engine file are not; an ABI pair sharing one ISA probes it once. Files as `--file` parses them.
+    #[test]
+    fn cpuinfo_probe_runs_for_staged_engines_only() {
+        let abis = ["x86_64=x86_64", "arm64-v8a=arm64", "armeabi-v7a=arm"].map(String::from);
+        let engine = |isa: &str| {
+            partition_file(&format!(
+                "/out/libatl_engine.so={}",
+                atl_android_paths::engine_library(isa)
+            ))
+            .expect("engine --file")
+        };
+        let other = partition_file("/out/x=/vendor/lib64/egl/x.so").expect("other --file");
+        assert_eq!(
+            staged_engines(&abis, &[other.clone(), engine("arm64")]),
+            ["arm64"]
+        );
+        assert!(staged_engines(&abis, &[other]).is_empty());
+        let twice = ["arm64-v8a=arm64", "arm64-v8a-hwasan=arm64"].map(String::from);
+        assert_eq!(staged_engines(&twice, &[engine("arm64")]), ["arm64"]);
+    }
+
+    /// A probed ISA's app process gets its cached file read-only at /proc/cpuinfo; the host ISA and a process of no package get none.
+    #[test]
+    fn cpuinfo_mount_only_for_a_probed_isa() {
+        let cpuinfo = BTreeMap::from([("arm64".to_owned(), PathBuf::from("/r/cpuinfo.arm64"))]);
+        assert_eq!(
+            cpuinfo_mount(&cpuinfo, Some("arm64")),
+            Some(Mount {
+                host: "/r/cpuinfo.arm64".into(),
+                at: PROC_CPUINFO.into(),
+                writable: false,
+            })
+        );
+        assert_eq!(cpuinfo_mount(&cpuinfo, Some("x86_64")), None);
+        assert_eq!(cpuinfo_mount(&cpuinfo, None), None);
     }
 }

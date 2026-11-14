@@ -202,6 +202,8 @@ pub struct Runtime {
     gralloc: Option<(PathBuf, PathBuf)>,
     /// atl-egl-probe, atld's GPU selector (`--gpu-probe`), with [`Runtime::with_gralloc`].
     gpu_probe: Option<PathBuf>,
+    /// atl-engine-cpuinfo, atld's guest cpuinfo source (`--cpuinfo-probe`), with [`Runtime::with_qemu_engine`].
+    cpuinfo_probe: Option<PathBuf>,
     /// The GL driver and the fronts, when [`Runtime::with_gl_driver`] asked for them: files placed by atld `--file`.
     gl_driver: Vec<(PathBuf, String)>,
     /// A gate's own test files placed by atld `--file` ([`Runtime::with_fixture_file`]): never shipped, so outside `refuse_test_only`.
@@ -696,6 +698,7 @@ impl Runtime {
             keychars,
             gralloc: None,
             gpu_probe: None,
+            cpuinfo_probe: None,
             gl_driver: Vec::new(),
             fixture_files: Vec::new(),
             native_bridge_guest: Vec::new(),
@@ -835,7 +838,18 @@ impl Runtime {
         let boot = crate::qemu::boot_exe(root, &b, &dir)?;
         self.platform_files
             .extend(qemu_engine_files(isa, &so, &boot));
+        // the guest cpuinfo atld binds over translated apps' /proc/cpuinfo: the probe beside the boot executable, run by atl-engine-cpuinfo
+        let probe = crate::qemu::cpuinfo_exe(root, &b, &dir)?;
+        self.platform_files
+            .push((probe, atl_android_paths::engine_cpuinfo(isa)));
+        self.cpuinfo_probe = Some(cargo_bin(root, &self.out, "atl-engine-cpuinfo")?);
         Ok(self)
+    }
+
+    /// The cpuinfo break (`test app --cpuinfo-break`): atld gets no `--cpuinfo-probe`, so translated apps' host readers see the host's /proc/cpuinfo.
+    pub fn without_cpuinfo(mut self) -> Self {
+        self.cpuinfo_probe = None;
+        self
     }
 
     /// The C12 break (`test app --drop-nb-lib`): leaves the NB_LIBS file `file` out of the guest's lib dir, so a guest load that needs it fails naming it. Errors when no placed file has that name.
@@ -1283,6 +1297,7 @@ impl Runtime {
             inputs.files.extend(remote::lib_files(mapper_dir)?);
         }
         inputs.files.extend(self.gpu_probe.iter().cloned());
+        inputs.files.extend(self.cpuinfo_probe.iter().cloned());
         inputs
             .files
             .extend(self.gl_driver.iter().map(|(f, _)| f.clone()));
@@ -1437,6 +1452,9 @@ impl Runtime {
         }
         if let Some(probe) = &self.gpu_probe {
             cmd.arg("--gpu-probe").arg(probe);
+        }
+        if let Some(probe) = &self.cpuinfo_probe {
+            cmd.arg("--cpuinfo-probe").arg(probe);
         }
         if let Some((allocator, _)) = &self.gralloc {
             cmd.arg("--gralloc").arg(allocator);
