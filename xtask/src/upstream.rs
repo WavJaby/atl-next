@@ -176,11 +176,12 @@ fn drop_stale_cache(src: &Path, build: &Path, wanted: &[(&str, &str)]) -> Result
         why = Some(format!("generated from {old}, not {}", src.display()));
     }
     for (key, value) in wanted.iter().filter(|(k, _)| COMPILER_ENTRIES.contains(k)) {
-        // the cache holds the PATH lookup of the value given (/usr/bin/clang-19 for clang-19)
-        let given = crate::arches::on_path(value).unwrap_or_else(|| PathBuf::from(value));
+        // both sides through the same PATH lookup: a fresh configure records `:STRING=/usr/bin/clang-19`, a later configure given the same -D rewrites it `:UNINITIALIZED=clang-19`;
+        // comparing the bare name as a path dropped the cache every second run -> full reconfigure + rebuild + relink of every dependant (1,301 ninja edges). Do not compare unresolved values.
+        let resolve = |v: &str| crate::arches::on_path(v).unwrap_or_else(|| PathBuf::from(v));
         if let Some(old) = entry(key)
             && why.is_none()
-            && !same_file(Path::new(old), &given)
+            && !same_file(&resolve(old), &resolve(value))
         {
             why = Some(format!("{key} was {old}, now {value}"));
         }
@@ -317,6 +318,26 @@ mod tests {
             drop_stale_cache(&src, &build, &[("CMAKE_INSTALL_PREFIX", new_s)]).expect("other"),
             None
         );
+        // cmake's rewrite on a reconfigure: `:UNINITIALIZED=<bare name>`, the same compiler as its PATH lookup; `sh` stands in for a compiler name found on PATH
+        let sh = crate::arches::on_path("sh").expect("sh on PATH");
+        std::fs::write(
+            build.join("CMakeCache.txt"),
+            format!(
+                "CMAKE_HOME_DIRECTORY:INTERNAL={}\nCMAKE_C_COMPILER:UNINITIALIZED=sh\n",
+                src.display()
+            ),
+        )
+        .expect("test cache");
+        assert_eq!(
+            drop_stale_cache(
+                &src,
+                &build,
+                &[("CMAKE_C_COMPILER", sh.to_str().expect("utf-8"))]
+            )
+            .expect("bare name"),
+            None
+        );
+        write();
         let why = drop_stale_cache(&src, &build, &[("CMAKE_C_COMPILER", new_s)]).expect("changed");
         assert!(why.expect("dropped").contains("CMAKE_C_COMPILER"));
         assert!(!build.join("CMakeCache.txt").exists() && !build.join("CMakeFiles").exists());
