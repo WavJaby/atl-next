@@ -33,10 +33,22 @@ pub type Sample = (u32, f64, f64);
 
 /// The moves of one compressed GTK motion event, oldest first: GDK coalesces motion per frame clock and keeps the dropped samples in `gdk_event_get_history`, which excludes the event's own position.
 /// Each sample becomes its own MOVE, as an evdev device's are: AOSP's InputConsumer (consumeBatch) then folds them into one ACTION_MOVE with history samples per frame, so the app's VelocityTracker sees every sample.
-/// A history sample timed after `current` is dropped: MotionEvent.addBatch refuses a sample older than the last.
-pub fn motion_samples(history: impl IntoIterator<Item = Sample>, current: Sample) -> Vec<Sample> {
-    let mut samples: Vec<Sample> = history.into_iter().filter(|s| s.0 <= current.0).collect();
-    samples.push(current);
+/// Times strictly increase, after `last` (the time of the pointer event published before): an evdev stream never repeats a time, while GDK on WSLg stamps every history sample of a frame with the frame's ms time (owner drag: ~15 one-pixel samples per 15 ms, all one time).
+/// AOSP keeps such duplicates as zero-dt history (InputConsumer canAddSample/resampleTouchState only skip them), so app-side per-sample velocity divides by 0; samples sharing a time collapse to the last position, and one timed at or before `last` (or after `current`) is dropped.
+pub fn motion_samples(
+    history: impl IntoIterator<Item = Sample>,
+    current: Sample,
+    last: Option<u32>,
+) -> Vec<Sample> {
+    let mut samples: Vec<Sample> = Vec::new();
+    let fresh = |s: &Sample| s.0 <= current.0 && last.is_none_or(|t| s.0 > t);
+    for s in history.into_iter().chain([current]).filter(fresh) {
+        match samples.last_mut() {
+            Some(prev) if prev.0 == s.0 => *prev = s,
+            Some(prev) if prev.0 > s.0 => {}
+            _ => samples.push(s),
+        }
+    }
     samples
 }
 
@@ -264,11 +276,59 @@ mod tests {
     fn compressed_motion_becomes_every_sample() {
         let current = (40, 9.0, 9.0);
         assert_eq!(
-            motion_samples([(8, 1.0, 2.0), (24, 5.0, 6.0)], current),
+            motion_samples([(8, 1.0, 2.0), (24, 5.0, 6.0)], current, None),
             vec![(8, 1.0, 2.0), (24, 5.0, 6.0), current]
         );
-        assert_eq!(motion_samples([], current), vec![current]);
-        assert_eq!(motion_samples([(41, 0.0, 0.0)], current), vec![current]);
+        assert_eq!(motion_samples([], current, None), vec![current]);
+        assert_eq!(
+            motion_samples([(41, 0.0, 0.0)], current, None),
+            vec![current]
+        );
+    }
+
+    /// Owner's WSLg drag (tr-play-m1 log, DOWN at 7600 ms (x, y) (141, 458)): frames at 7613/7631/7643 ms each published 3-5 one-pixel moves sharing the frame's time.
+    /// Each frame collapses to its last position -> one move per distinct time, increasing; a frame at or before the previous event's time (DOWN 7600) publishes nothing.
+    #[test]
+    fn shared_times_collapse_to_last_position() {
+        let frames: [(&[Sample], Sample); 3] = [
+            (
+                &[(7613, 141.0, 457.0), (7613, 142.0, 457.0)],
+                (7613, 142.0, 456.0),
+            ),
+            (
+                &[(7631, 142.0, 455.0), (7631, 142.0, 454.0)],
+                (7631, 142.0, 453.0),
+            ),
+            (
+                &[
+                    (7643, 142.0, 452.0),
+                    (7643, 142.0, 451.0),
+                    (7643, 142.0, 450.0),
+                    (7643, 142.0, 449.0),
+                ],
+                (7643, 142.0, 448.0),
+            ),
+        ];
+        let mut last = Some(7600);
+        let mut published = Vec::new();
+        for (history, current) in frames {
+            let moves = motion_samples(history.iter().copied(), current, last);
+            last = moves.last().map(|s| s.0).or(last);
+            published.extend(moves);
+        }
+        assert_eq!(
+            published,
+            vec![
+                (7613, 142.0, 456.0),
+                (7631, 142.0, 453.0),
+                (7643, 142.0, 448.0)
+            ]
+        );
+        assert_eq!(motion_samples([], (7600, 1.0, 1.0), Some(7600)), vec![]);
+        assert_eq!(
+            motion_samples([(30, 1.0, 1.0)], (40, 2.0, 2.0), Some(30)),
+            vec![(40, 2.0, 2.0)]
+        );
     }
 
     #[test]

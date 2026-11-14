@@ -61,6 +61,8 @@ struct Shared {
     monitor: RefCell<Option<(gdk::Monitor, Vec<glib::SignalHandlerId>)>>,
     /// The pointer's last position over the content (logical pixels): GTK's leave and scroll signals carry none.
     pointer_at: Cell<(f64, f64)>,
+    /// Time (ms) of the last pointer event published: moves must come strictly after it (`input::motion_samples`).
+    pointer_time: Cell<Option<u32>>,
     /// A touchpad swipe is open: its end (GTK `scroll-end`) is reported; a wheel's is not.
     swiping: Cell<bool>,
     /// Contact ids of the touch sequences down.
@@ -217,6 +219,7 @@ impl GtkWindow {
             (time_ms, x, y): input::Sample,
         ) {
             shared.pointer_at.set((x, y));
+            shared.pointer_time.set(Some(time_ms));
             let event = input::pointer(phase, x, y, scale_of(controller), time_ms);
             shared.on_event.call(|f| f(event));
         }
@@ -250,7 +253,7 @@ impl GtkWindow {
                 let at = surface_to_view(view.as_ref()?, (axes[AXIS_X], axes[AXIS_Y]))?;
                 Some((t.time(), at.0, at.1))
             });
-            for sample in input::motion_samples(earlier, current) {
+            for sample in input::motion_samples(earlier, current, s.pointer_time.get()) {
                 emit_at(&s, c, PointerPhase::Move, sample);
             }
         });
@@ -423,6 +426,7 @@ impl Window for GtkWindow {
             on_event: Slot::new(),
             on_resize: Slot::new(),
             pointer_at: Cell::new((0.0, 0.0)),
+            pointer_time: Cell::new(None),
             swiping: Cell::new(false),
             touch_ids: RefCell::default(),
             on_monitor: Slot::new(),
