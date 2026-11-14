@@ -454,7 +454,7 @@ impl IPackageManager for PackageManager {
     }
 
     /// PackageManagerService.notifyDexLoad:5611-5628: the system or the loading package's own uid may report; others are ignored (logged in AOSP). The report then goes to ART Service's
-    /// dexopt bookkeeping, which ATL does not have: an accepted report is dropped.
+    /// dexopt bookkeeping, which ATL does not have: an accepted report is dropped, counted `answered IPackageManager.notifyDexLoad (not recorded)` (the app gate's evidence it arrived).
     fn r#notifyDexLoad(
         &self,
         package: Option<&str>,
@@ -470,6 +470,8 @@ impl IPackageManager for PackageManager {
                 std::io::stderr(),
                 "services: invalid dex load report: package {package:?}, uid {caller}"
             );
+        } else {
+            atl_diag::answered("IPackageManager", "notifyDexLoad (not recorded)");
         }
         Ok(())
     }

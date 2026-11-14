@@ -34,6 +34,7 @@ import android.content.pm.ActivityInfo;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.ConfigurationInfo;
 import android.content.pm.FeatureInfo;
+import android.content.pm.IPackageManager;
 import android.content.pm.InstrumentationInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.ParceledListSlice;
@@ -1470,12 +1471,43 @@ public class ParcelTruth {
         result(ok, name, ok ? java.length + " bytes, java -> rust byte-equal, java reads rust's text back equal" : "java reads rust's bytes as " + back + " (consumed " + consumed + ")");
     }
 
-    /// java.util.Map, the Java-only builtin, as Parcel.writeMap writes it; Java reads Rust's bytes back with readHashMap.
+    /// Captures the map span of the notifyDexLoad transaction the generated IPackageManager Proxy sends (after token + package name, before the ISA).
+    static class DexLoadCapture extends Binder {
+        byte[] map;
+
+        @Override
+        protected boolean onTransact(int code, Parcel data, Parcel reply, int flags) {
+            data.enforceInterface("android.content.pm.IPackageManager");
+            data.readString();
+            int start = data.dataPosition();
+            readTypedStringMap(data);
+            map = Arrays.copyOfRange(data.marshall(), start, data.dataPosition());
+            return true;
+        }
+    }
+
+    /// The generated Stub's read of `in Map<String, String>`: size (negative = null), then readString key / value per entry.
+    static HashMap<String, String> readTypedStringMap(Parcel p) {
+        int n = p.readInt();
+        HashMap<String, String> m = n < 0 ? null : new HashMap<>();
+        for (int i = 0; i < n; i++) {
+            String k = p.readString();
+            m.put(k, p.readString());
+        }
+        return m;
+    }
+
+    /// java.util.Map as AIDL's typed `in Map<String, String>` carries it: the bytes come from the real generated IPackageManager Proxy (notifyDexLoad), so the codec is checked against the
+    /// AIDL compiler's output, not a hand-written writer; Java reads Rust's bytes back the generated Stub's way.
     static void checkMap(String name, Map<String, String> m) {
-        Parcel parcel = Parcel.obtain();
-        parcel.writeMap(m);
-        byte[] java = parcel.marshall();
-        parcel.recycle();
+        DexLoadCapture capture = new DexLoadCapture();
+        try {
+            IPackageManager.Stub.asInterface(capture).notifyDexLoad("com.example.app", m, "x86_64");
+        } catch (Exception e) {
+            result(false, name, "generated proxy: " + e);
+            return;
+        }
+        byte[] java = capture.map;
         byte[] rust = roundTrip("java.util.Map", java, MODE_PLAIN);
         if (rust == null) {
             result(false, name, "rust: " + lastError());
@@ -1488,7 +1520,7 @@ public class ParcelTruth {
         Parcel in = Parcel.obtain();
         in.unmarshall(rust, 0, rust.length);
         in.setDataPosition(0);
-        HashMap back = in.readHashMap(null);
+        HashMap<String, String> back = readTypedStringMap(in);
         boolean consumed = in.dataPosition() == rust.length;
         in.recycle();
         boolean ok = consumed && Objects.equals(m, back);

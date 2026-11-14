@@ -819,6 +819,24 @@ fn result_to_security_failures(app: &str, services: &str) -> Vec<String> {
     whys
 }
 
+const DEX_LOAD_API: &str = "IPackageManager.notifyDexLoad";
+
+/// Every app's startup dex-load report (DexLoadReporter, a non-empty classLoaderContextMap through the generated Proxy's typed Map) reached PackageService's handler: it counts
+/// `answered IPackageManager.notifyDexLoad (not recorded)`. A map the codec cannot decode never reaches the handler (refused-parcel + status:BAD_VALUE instead).
+fn dex_load_failures(services: &str) -> Vec<String> {
+    let counted = counters(services)
+        .iter()
+        .any(|c| c.outcome == atl_diag::ANSWERED && c.api.starts_with(DEX_LOAD_API) && c.count > 0);
+    if counted {
+        Vec::new()
+    } else {
+        vec![format!(
+            "dex-load: no `{} {DEX_LOAD_API}` count in the services log",
+            atl_diag::ANSWERED
+        )]
+    }
+}
+
 /// The round trip's lines against what Main.java and ResultChild.java log, one reason per missing or wrong line. The child's result carries its code and extra. Main's first
 /// result or resume after the child finished is that result: a pending result goes out before the resume (ActivityResultItem, TaskFragment.java:1665-1693). The self-start's
 /// cancel comes before its new intent (ActivityStarter.java:2469).
@@ -1222,6 +1240,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // a startActivity whose resultTo is not the calling package's (Main.java resultToSecurity): the app sees SecurityException, the reply hook counts it
     if passed {
         whys.extend(result_to_security_failures(&app, &services_log));
+    }
+    if passed {
+        whys.extend(dex_load_failures(&services_log));
     }
     // startActivityForResult round trip (Main.java, ResultChild.java): the result, its order against Main's resume, and the singleTop self-start's cancel
     if passed {
@@ -1795,6 +1816,17 @@ mod tests {
             .len(),
             1
         );
+    }
+
+    /// The accepted report's count passes; the refusal the untagged-map bug produced, or no line, fails.
+    #[test]
+    fn dex_load_needs_the_answered_count() {
+        let ok = "diag: first answered IPackageManager.notifyDexLoad (not recorded) 1 at=1.000\n";
+        assert!(dex_load_failures(ok).is_empty());
+        let refused = "diag: first refused-parcel java.util.Map value 1 at=1.000\n\
+                       diag: first status:BAD_VALUE IPackageManager.notifyDexLoad 1 at=1.001\n";
+        assert_eq!(dex_load_failures(refused).len(), 1);
+        assert_eq!(dex_load_failures("").len(), 1);
     }
 
     #[test]

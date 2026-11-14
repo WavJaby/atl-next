@@ -140,7 +140,7 @@ fn round_trip_part<T: Part>(input: &[u8], mode: i32) -> Result<Vec<u8>, String> 
     finish(&out, mode)
 }
 
-/// java.util.Map as Parcel.writeMap writes it (no parcelable null flag: null is size -1), so through its Option form.
+/// java.util.Map as AIDL's typed `in Map<String, String>` carries it (no parcelable null flag: null is size -1), so through its Option form.
 fn round_trip_map(input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
     let p = unmarshal(input)?;
     let v: Option<Map> = p.read().map_err(|e| format!("decode refused: {e:?}"))?;
