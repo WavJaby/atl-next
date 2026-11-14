@@ -356,7 +356,6 @@ fn fit_window(window: &gtk4::Window, view: &SceneView) {
     window.set_default_size(width + chrome_w, height + chrome_h);
 }
 
-/// The scale of the controller's `SceneView` (1 before it is attached).
 /// A raw event's position in the view: the event's is the surface's, the content's is past the shadow and the header bar.
 fn view_point(c: &gtk4::EventControllerLegacy, event: &gdk::Event) -> Option<(f64, f64)> {
     let view = c.widget()?;
@@ -370,6 +369,7 @@ fn view_point(c: &gtk4::EventControllerLegacy, event: &gdk::Event) -> Option<(f6
     Some((f64::from(at.x()), f64::from(at.y())))
 }
 
+/// The scale of the controller's `SceneView` (1 before it is attached).
 fn scale_of(controller: &impl IsA<gtk4::EventController>) -> Scale {
     controller
         .widget()
