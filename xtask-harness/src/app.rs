@@ -83,7 +83,7 @@ pub struct Args {
     /// The system-features break: the run places none of AOSP's static permission files (atld_run.rs FEATURE_FILES), so the always-present feature reads false and the features line must go red.
     #[arg(long)]
     features_break: bool,
-    /// The WebView feature break: the run places no FEATURE_WEBVIEW test file, so getDefaultUserAgent throws today's no-WebView UnsupportedOperationException and the webview line must go red.
+    /// The WebView feature break: the run places no FEATURE_WEBVIEW test file, so getDefaultUserAgent throws today's no-WebView UnsupportedOperationException and the webview-ua line must go red.
     #[arg(long)]
     webview_feature_break: bool,
     /// The WebView provider break: the run does not place the provider package (`<out>/partitions/product/app/webview/webview.apk`), so webviewupdate has no current package and the
@@ -160,13 +160,56 @@ const PROCESSES_WANT: &str = "count=1 own=1 uid=true name=true pkg=true importan
 /// Without the provider placed, AOSP: `webviewupdate`'s waitForAndGetProvider answers LIBLOAD_FAILED_LISTING_WEBVIEW_PACKAGES -> WebViewFactory.getWebViewContextAndSetProvider throws
 /// MissingWebViewPackageException, getProviderClass wraps it in AndroidRuntimeException, getProvider's catch (Exception) wraps that once more. Without the feature: UnsupportedOperationException
 /// alone (getProvider :345); without the service: asInterface(null)'s NullPointerException, wrapped once by getProvider (measured).
-/// With the provider placed and shown to apps (system + forceQueryable, Packages::visible): getProvider loads the provider APK's class loader (createApplicationContext), takes
-/// WebViewChromiumFactoryProviderForT (use_b_entry_point off) and its `create` returns the instance; getDefaultUserAgent then calls its `getStatics`, a native with no implementation until
-/// libatl_webview.so exists (webview plan W1c) -> UnsatisfiedLinkError, not wrapped (outside getProvider's catch). The frame proves `create` ran and names the entry class.
-const WEBVIEW: (&str, &str) = (
-    "AtlTest: webview: ",
-    "threw=java.lang.UnsatisfiedLinkError at=com.android.webview.chromium.WebViewChromiumFactoryProviderForT.getStatics",
-);
+/// With the provider placed and shown to apps (system + forceQueryable, Packages::visible): getProvider loads the provider APK's class loader, WebViewChromiumFactoryProviderForT.create, then
+/// getStatics -> getDefaultUserAgent in libatl_webview.so (webview plan W1). Pass ([`webview_ua_why`]): `cts=true` (CTS's pattern, run in the app) and `ua=` equal to [`webview_ua_want`].
+const WEBVIEW_UA: &str = "AtlTest: webview-ua: ";
+/// libatl_webview.so's record of the engine's own default UA (atl-webview `default_user_agent`), what [`webview_ua_want`] takes the engine tokens from.
+const WEBVIEW_ENGINE_UA: &str = "webview: engine user agent: ";
+
+/// The expected UA, assembled here from webview plan S5 (CDD 3.4.1 format), independently of atl-webview `ua`: the device fields the app logged (its android.os.Build), the engine's
+/// `AppleWebKit/` and `Safari/` versions cut to `<major>.<minor>`, `Version/4.0`, the engine's Chrome quirk token `Chrome/300.0.0.0` (WebKit UserAgentQuirks.cpp), no ` Mobile` (desktop).
+fn webview_ua_want(engine: &str, release: &str, model: &str, id: &str) -> Option<String> {
+    let token = |name: &str| -> Option<String> {
+        let v = engine.split(' ').find_map(|t| t.strip_prefix(name))?;
+        let mut parts = v.splitn(3, '.');
+        Some(format!("{name}{}.{}", parts.next()?, parts.next()?))
+    };
+    Some(format!(
+        "Mozilla/5.0 (Linux; Android {release}; {model} Build/{id}; wv) {} (KHTML, like Gecko) Version/4.0 Chrome/300.0.0.0 {}",
+        token("AppleWebKit/")?,
+        token("Safari/")?
+    ))
+}
+
+/// Why the webview-ua line fails, None when it passes: `line` = the line after [`WEBVIEW_UA`], `engine` = the engine record's UA.
+fn webview_ua_why(line: Option<&str>, engine: Option<&str>) -> Option<String> {
+    let Some(line) = line else {
+        return Some("no webview-ua line".into());
+    };
+    let parsed = (|| {
+        let rest = line.strip_prefix("cts=")?;
+        let (cts, rest) = rest.split_once(" release=")?;
+        let (fields, ua) = rest.split_once(" ua=")?;
+        let mut f = fields.split('|');
+        let release = f.next()?;
+        let model = f.next()?.strip_prefix("model=")?;
+        let id = f.next()?.strip_prefix("id=")?;
+        Some((cts, release, model, id, ua))
+    })();
+    let Some((cts, release, model, id, ua)) = parsed else {
+        return Some(format!("webview-ua: {line:?}"));
+    };
+    if cts != "true" {
+        return Some(format!("webview-ua: CTS pattern does not match {ua:?}"));
+    }
+    let Some(engine) = engine else {
+        return Some("webview-ua: no engine user agent record".into());
+    };
+    match webview_ua_want(engine, release, model, id) {
+        Some(want) if want == ua => None,
+        want => Some(format!("webview-ua: want {want:?}, got {ua:?}")),
+    }
+}
 /// Main.webViewPackage's line: WebView.getCurrentWebViewPackage (webviewupdate's getCurrentWebViewPackage, WebView.java:3128-3140) with the provider placed: the scanned
 /// `com.android.webview` with FLAG_SYSTEM (WebViewUpdateServiceImpl2.providerHasValidSignature accepts a system app). `null` = no valid provider.
 const WEBVIEW_PACKAGE: (&str, &str) = (
@@ -1117,6 +1160,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         rt.with_fixture_file(built, &at)
     };
     let work = rt.out.join("app");
+    // UI mode on a nested compositor: an app on a desktop has a display, and WebKit cannot make its settings (the default UA's source) without one -- WebKitSettings' constructor
+    // dereferences a missing GDK display (atl-webview-linux `default_user_agent`); its AppleWebKit token is a literal in WebKit's UserAgentGLib.cpp, not derivable from webkit_get_*_version
+    let nested = crate::nested_wayland::NestedCompositor::start(&work.join("nested"))?;
+    let rt = rt.with_ui("gtk").with_wayland(&nested.socket);
     // the bridge-1 JNI fixture rides along in lib/<abi>/ (jni_fixture.rs); the NativeBridge core loads it into the guest
     let native = jni_fixture::apk_libs(
         root,
@@ -1319,12 +1366,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             "processes: want {PROCESSES_WANT:?}, got {processes:?}"
         ));
     }
-    let (prefix, want) = WEBVIEW;
-    let webview = app
-        .lines()
-        .find_map(|l| l.split_once(prefix).map(|(_, r)| r.trim_end().to_owned()));
-    if passed && webview.as_deref() != Some(want) {
-        whys.push(format!("webview: want {want:?}, got {webview:?}"));
+    let after = |prefix: &str| {
+        app.lines()
+            .find_map(|l| l.split_once(prefix).map(|(_, r)| r.trim_end().to_owned()))
+    };
+    let (webview_ua, engine_ua) = (after(WEBVIEW_UA), after(WEBVIEW_ENGINE_UA));
+    if passed && let Some(why) = webview_ua_why(webview_ua.as_deref(), engine_ua.as_deref()) {
+        whys.push(why);
     }
     let (prefix, want) = WEBVIEW_PACKAGE;
     let webview_package = app
@@ -1470,7 +1518,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             println!("app: pass {service} {}", service_want(want));
         }
         println!("app: pass processes {PROCESSES_WANT}");
-        println!("app: pass webview {}", WEBVIEW.1);
+        println!(
+            "app: pass webview-ua {}",
+            webview_ua.as_deref().unwrap_or_default()
+        );
         println!("app: pass webview-package {}", WEBVIEW_PACKAGE.1);
         println!(
             "app: pass priority {} ({})",
@@ -1641,6 +1692,31 @@ fn exit_failures(ran: bool, services: &str, atld: &str, binderd: &str) -> Vec<St
 mod tests {
     use super::*;
     use crate::window::stamp_text;
+
+    /// The webview-ua judge: the CDD string from WebKit 2.54's measured default passes; a CTS mismatch, the engine's raw 3-part tokens, a missing engine record and a thrown line fail.
+    #[test]
+    fn webview_ua_judge() {
+        let engine = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/60.5 Safari/605.1.15";
+        let good = "Mozilla/5.0 (Linux; Android 16; ATL Build/BP2A.1; wv) AppleWebKit/605.1 (KHTML, like Gecko) Version/4.0 Chrome/300.0.0.0 Safari/605.1";
+        let line =
+            |cts: &str, ua: &str| format!("cts={cts} release=16|model=ATL|id=BP2A.1 ua={ua}");
+        assert_eq!(
+            webview_ua_why(Some(&line("true", good)), Some(engine)),
+            None
+        );
+        assert!(webview_ua_why(Some(&line("false", good)), Some(engine)).is_some());
+        let raw = good.replace("605.1 ", "605.1.15 ");
+        assert!(webview_ua_why(Some(&line("true", &raw)), Some(engine)).is_some());
+        assert!(webview_ua_why(Some(&line("true", good)), None).is_some());
+        assert!(
+            webview_ua_why(
+                Some("threw=java.lang.UnsupportedOperationException at=x.y"),
+                Some(engine)
+            )
+            .is_some()
+        );
+        assert!(webview_ua_why(None, Some(engine)).is_some());
+    }
 
     /// The features line: a host with AEP and one without both pass when the app's GL agrees; the break run (no static files) and a probe that disagrees with the app's GL fail.
     #[test]

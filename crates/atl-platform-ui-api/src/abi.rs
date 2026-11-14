@@ -1015,3 +1015,22 @@ pub struct UiVtable {
     /// `PcmOutput::underruns`.
     pub pcm_underruns: unsafe extern "C" fn(pcm: *mut PcmHandle) -> u64,
 }
+
+/// The WebView module's file name (webview plan S2.3): the web engine in a module of its own, loaded `RTLD_LOCAL` on first provider use, because its closure (~170 objects, +33 MB, ~70 ms measured) is not paid by apps that never touch WebView.
+pub const WEBVIEW_MODULE_FILE: &str = "libatl_webview_linux.so";
+
+/// The WebView module's one exported symbol, a [`WebViewEntry`].
+pub const WEBVIEW_ENTRY_SYMBOL: &str = "atl_webview_entry";
+
+/// The WebView module's entry: its static vtable; starts nothing. The caller checks [`WebViewVtable::abi`] first.
+pub type WebViewEntry = unsafe extern "C" fn() -> *const WebViewVtable;
+
+/// The WebView module's functions (the [`crate::webview`] traits as a C ABI).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct WebViewVtable {
+    /// The module's [`ABI_ID`]; the only field read before the check.
+    pub abi: AbiId,
+    /// `WebEngine::default_user_agent`: the engine's own default UA string into `out` and true; false with the reason in `out` when the engine cannot run (no display). Any thread.
+    pub default_user_agent: unsafe extern "C" fn(out: *mut BytesOut) -> bool,
+}

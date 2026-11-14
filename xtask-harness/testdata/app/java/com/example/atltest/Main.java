@@ -82,12 +82,30 @@ public class Main extends Activity {
     }
 
     /**
-     * The WebView line (app.rs WEBVIEW): WebSettings.getDefaultUserAgent, AdMob's first WebView call; `ua=<string>`, or `threw=` the throwable's class and each cause's, outermost first, joined by `<`,
-     * then ` at=` the innermost one's top frame (class.method): for an unimplemented native it names the provider method reached.
+     * CTS's default-UA pattern (cts WebSettingsTest.checkUserAgentStringHelper, CDD 3.4.1/C-1-3), with find() as CTS uses it. Release non-REL builds: CTS is lenient, `[^;]+`.
+     */
+    private static boolean ctsUserAgent(String ua) {
+        String release = "REL".equals(android.os.Build.VERSION.CODENAME) ? java.util.regex.Pattern.quote(android.os.Build.VERSION.RELEASE) : "[^;]+";
+        String p = java.util.regex.Pattern.quote("Mozilla/5.0 (Linux; Android ") + release + ";"
+                + "( " + java.util.regex.Pattern.quote(android.os.Build.MODEL) + ")?"
+                + "( Build/" + java.util.regex.Pattern.quote(android.os.Build.ID) + ")?"
+                + "((?<=;)|(?<!;);)"
+                + java.util.regex.Pattern.quote(" wv) ")
+                + "AppleWebKit/\\d+\\.\\d+ "
+                + java.util.regex.Pattern.quote("(KHTML, like Gecko) Version/4.0 ")
+                + "Chrome/\\d+\\.\\d+\\.\\d+\\.\\d+ "
+                + "(Mobile )?Safari/\\d+\\.\\d+";
+        return java.util.regex.Pattern.compile(p).matcher(ua).find();
+    }
+
+    /**
+     * The WebView UA line (app.rs WEBVIEW_UA): WebSettings.getDefaultUserAgent, AdMob's first WebView call; `cts=<pattern matched> release=<R>|model=<M>|id=<I> ua=<string>` (ua last: it has spaces),
+     * or `threw=` the throwable's class and each cause's, outermost first, joined by `<`, then ` at=` the innermost one's top frame (class.method).
      */
     private String webView() {
         try {
-            return "ua=" + android.webkit.WebSettings.getDefaultUserAgent(this);
+            String ua = android.webkit.WebSettings.getDefaultUserAgent(this);
+            return "cts=" + ctsUserAgent(ua) + " release=" + android.os.Build.VERSION.RELEASE + "|model=" + android.os.Build.MODEL + "|id=" + android.os.Build.ID + " ua=" + ua;
         } catch (Throwable e) {
             StringBuilder out = new StringBuilder("threw=");
             Throwable last = e;
@@ -127,7 +145,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "features: " + features());
         Log.i("AtlTest", "signatures: " + signatures());
         Log.i("AtlTest", "priority: " + priority());
-        Log.i("AtlTest", "webview: " + webView());
+        Log.i("AtlTest", "webview-ua: " + webView());
         Log.i("AtlTest", "webview-package: " + webViewPackage());
         mediaPlayerService();
         mediaExtractorWav();

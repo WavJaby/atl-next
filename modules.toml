@@ -159,11 +159,16 @@ reason = "the probes allocate through the same GBM backend as the allocator serv
 crates = ["atl-vulkan-driver"]
 uses = ["gralloc", "generators"]
 
-# the app-process half of the platform layer (M3 slice 6, plan S1 `atl-platform-ui`): the -api traits (window, frame clock, input, main loop), the GTK4 implementation (the one crate deny.toml lets depend on GTK) and the facade core crates use; presents the compositor's Scene, importing each quad's dma-buf as a GTK dmabuf texture (layout through scene-buffer, the read fence through gralloc-dmabuf)
+# the app-process half of the platform layer (M3 slice 6, plan S1 `atl-platform-ui`): the -api traits (window, frame clock, input, main loop), the GTK4 implementation (the one crate deny.toml lets depend on GTK) and the facade core crates use; presents the compositor's Scene, importing each quad's dma-buf as a GTK dmabuf texture (layout through scene-buffer, the read fence through gralloc-dmabuf); the web engine module (WebKitGTK, its own RTLD_LOCAL cdylib, webview plan S2.3)
 [platform-ui]
-crates = ["atl-platform-ui-api", "atl-platform-ui-linux", "atl-platform-ui", "atl-platform-ui-module-fixture"]
+crates = ["atl-platform-ui-api", "atl-platform-ui-linux", "atl-platform-ui", "atl-platform-ui-module-fixture", "atl-webview-linux"]
 exports = ["atl-platform-ui"]
 uses = ["compositor", "libgui-parcel", "gralloc", "scene-buffer", "platform-types", "generators"]
+
+# the WebView provider's JNI library libatl_webview.so (webview plan S4.1): natives of the java/webview-provider forwarders, Android semantics (default UA, refusals) over the platform layer's web engine; its JNIEnv table generated from jni.h
+[webview]
+crates = ["atl-webview"]
+uses = ["platform-ui", "diag", "generators"]
 
 [platform-ui.direct_link.gralloc]
 reason = "the facade's gate example (xtask test platform-ui) allocates real dma-bufs through gralloc's GBM backend (atl-gralloc-service), as the allocator service does: a dmabuf texture needs a real dma-buf, a memfd is refused"

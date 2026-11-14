@@ -22,6 +22,11 @@ import android.webkit.WebViewProvider;
  * getPacProcessor / createPacProcessor keep the interface's defaults (UnsupportedOperationException), as AOSP's own provider contract states.
  */
 public final class WebViewChromiumFactoryProviderForT implements WebViewFactoryProvider {
+    // the provider's natives: a platform library on the runtime library path (Soong's /system/lib64 role), not in the APK
+    static {
+        System.loadLibrary("atl_webview");
+    }
+
     private final WebViewDelegate mDelegate;
 
     private WebViewChromiumFactoryProviderForT(WebViewDelegate delegate) {

@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-webview-linux"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The Linux web engine (webview plan M68, S2.3): WebKitGTK 6.0 through webkit6, the only crate allowed to depend on it (deny.toml `wrappers`).
+# Only a cdylib, `libatl_webview_linux.so`: the atl-platform-ui facade dlopens it RTLD_LOCAL on the first WebView call (`PlatformWebEngine`) and calls atl-platform-ui-api's `abi::WebViewVtable`, so WebKit's ~170-object closure loads only in processes that use WebView.
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+atl-platform-ui-api = { path = "../atl-platform-ui-api" }
+webkit6.workspace = true
+
+[lints]
+workspace = true

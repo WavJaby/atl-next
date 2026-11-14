@@ -2,6 +2,7 @@
 //! The platform layer's app-process facade: the `atl-platform-ui-api` traits and types, plus the implementation for the target OS as [`PlatformUi`], [`PlatformWindow`], [`PlatformTextInput`], [`PlatformAudioHost`] and [`PlatformPcmOutput`].
 //! Core crates depend on this crate only, so the choice of OS is made here and nowhere else (plan S1); `deny.toml` keeps GTK out of every other crate.
 //! On Linux the implementation is the platform module `libatl_platform_ui_linux.so` (launcher-ui-module plan S2/S3): `module` loads it `RTLD_NOW | RTLD_LOCAL` by file name from the runtime library path on first use, and the `Platform*` types are proxies over its `abi` vtable, so GTK, GLib and PipeWire never join the process's global symbol scope. A missing module or one of another build is `UiError::Unavailable` naming the file: the process runs without UI, as with no display.
+//! The web engine is a second module, `libatl_webview_linux.so` ([`PlatformWebEngine`], webview plan S2.3), loaded the same way on the first WebView call only.
 #![deny(unsafe_code)]
 
 pub use atl_platform_ui_api::*;
@@ -12,6 +13,13 @@ mod module;
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 mod proxy;
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+mod web_engine;
+
+#[cfg(target_os = "linux")]
+pub use web_engine::PlatformWebEngine;
 
 #[cfg(target_os = "linux")]
 pub use proxy::{
@@ -39,4 +47,6 @@ fn implements_the_api() {
     text_input::<PlatformTextInput>();
     audio_host::<PlatformAudioHost>();
     pcm_output::<PlatformPcmOutput>();
+    fn web_engine<T: webview::WebEngine>() {}
+    web_engine::<PlatformWebEngine>();
 }

@@ -310,6 +310,16 @@ min_reason = "observed 2026-11-14; older is untested"
 scope = ["build", "test"]
 used_by = ["crate:atld", "xtask:keys"]
 
+# the web engine behind android.webkit.WebView (webview plan M68, atl-webview-linux): webkit6-sys's build script resolves webkitgtk-6.0 through pkg-config
+[webkitgtk]
+debian = "libwebkitgtk-6.0-dev"
+arch = "webkitgtk-6.0"
+pkgconfig = "webkitgtk-6.0"
+min = "2.54.0"
+min_reason = "observed 2026-11-14 (W0 probes, UA format measured on it); older is untested"
+scope = ["build", "runtime"]
+used_by = ["crate:atl-webview-linux"]
+
 # the PCM output (plan A0, atl-platform-ui-linux audio.rs): pipewire-sys's build script resolves libpipewire-0.3 through pkg-config; min = the crate's `v0_3_49` feature (Buffer::requested)
 [pipewire]
 debian = "libpipewire-0.3-dev"

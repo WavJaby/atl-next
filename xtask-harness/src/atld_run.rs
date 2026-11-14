@@ -675,6 +675,7 @@ impl Runtime {
             atl_native_bridge::LIBRARY,
         )?;
         let platform_module = crate::ui_module::stage_module(root, &out)?;
+        crate::ui_module::stage_webview(root, &out)?;
         let arches = crate::arches::load(root)?;
         let abis = device_abis(&arches, host)?;
         let licenses = crate::licenses::load(root, &crate::sources::load(root)?.upstream_names())?;

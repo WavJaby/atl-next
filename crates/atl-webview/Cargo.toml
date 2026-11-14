@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-webview"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The WebView provider's JNI library `libatl_webview.so` (webview plan S4.1): the natives of the Java forwarders in java/webview-provider (package com.android.webview), loaded by the provider class itself (System.loadLibrary), a platform library like Soong's under /system/lib64 -- not in the APK, so no per-APK ABI.
+# Android semantics here (`ua`: the CDD default user agent; refusals); the engine through the atl-platform-ui facade (`PlatformWebEngine`, which dlopens libatl_webview_linux.so on first use).
+# `unsafe` only in `jni` (the JNI exports; build.rs generates the JNIEnv table from libnativehelper's jni.h with atl-bridgegen).
+# Staged beside the platform modules (xtask-harness ui_module.rs `stage_webview`) on every app's library path, where the provider's System.loadLibrary finds it as Android finds a /system/lib64 library; `install_cdylib` covers converter packages only.
+
+[lib]
+name = "atl_webview"
+crate-type = ["cdylib"]
+
+[dependencies]
+atl-diag = { path = "../atl-diag" }
+atl-platform-ui = { path = "../atl-platform-ui" }
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[build-dependencies]
+anyhow.workspace = true
+atl-bridgegen = { path = "../atl-bridgegen" }
+
+[lints]
+workspace = true

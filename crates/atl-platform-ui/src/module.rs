@@ -26,17 +26,17 @@ fn dlerror() -> String {
     }
 }
 
-/// The file the loader resolved `addr`'s object to, or the bare module name.
-fn object_path(addr: *const c_void) -> String {
+/// The file the loader resolved `addr`'s object to, or `fallback` (the bare module name).
+fn object_path(addr: *const c_void, fallback: &str) -> String {
     let mut info = std::mem::MaybeUninit::<libc::Dl_info>::zeroed();
     // SAFETY: `addr` is a symbol address dlsym returned; `info` is a zeroed out-parameter of the right type.
     if unsafe { libc::dladdr(addr, info.as_mut_ptr()) } == 0 {
-        return abi::MODULE_FILE.into();
+        return fallback.into();
     }
     // SAFETY: dladdr succeeded, so `info` is filled; dli_fname is null or a NUL-terminated path the loader owns.
     let name = unsafe { info.assume_init() }.dli_fname;
     if name.is_null() {
-        return abi::MODULE_FILE.into();
+        return fallback.into();
     }
     // SAFETY: non-null, NUL-terminated (above).
     unsafe { CStr::from_ptr(name) }
@@ -44,28 +44,26 @@ fn object_path(addr: *const c_void) -> String {
         .into_owned()
 }
 
-fn load() -> Result<&'static UiVtable, String> {
-    let file = CString::new(abi::MODULE_FILE).map_err(|e| e.to_string())?;
+/// `dlopen(file, RTLD_NOW | RTLD_LOCAL)` and its `entry` symbol: (symbol address, resolved file). The handle is never closed. Shared by both modules (UI, WebView).
+pub(crate) fn open(file: &str, entry: &str) -> Result<(*mut c_void, String), String> {
+    let name = CString::new(file).map_err(|e| e.to_string())?;
     // SAFETY: a NUL-terminated name; loading runs the module's and its closure's constructors, which is the point. RTLD_LOCAL keeps every symbol of the group out of global lookup.
-    let handle = unsafe { libc::dlopen(file.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+    let handle = unsafe { libc::dlopen(name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
     if handle.is_null() {
-        return Err(format!(
-            "platform module {}: {}",
-            abi::MODULE_FILE,
-            dlerror()
-        ));
+        return Err(format!("platform module {file}: {}", dlerror()));
     }
-    let symbol = CString::new(abi::ENTRY_SYMBOL).map_err(|e| e.to_string())?;
+    let symbol = CString::new(entry).map_err(|e| e.to_string())?;
     // SAFETY: a live handle and a NUL-terminated name.
-    let entry = unsafe { libc::dlsym(handle, symbol.as_ptr()) };
-    let path = object_path(entry);
-    if entry.is_null() {
-        return Err(format!(
-            "platform module {path}: {}: {}",
-            abi::ENTRY_SYMBOL,
-            dlerror()
-        ));
+    let addr = unsafe { libc::dlsym(handle, symbol.as_ptr()) };
+    let path = object_path(addr, file);
+    if addr.is_null() {
+        return Err(format!("platform module {path}: {entry}: {}", dlerror()));
     }
+    Ok((addr, path))
+}
+
+fn load() -> Result<&'static UiVtable, String> {
+    let (entry, path) = open(abi::MODULE_FILE, abi::ENTRY_SYMBOL)?;
     // SAFETY: the module's `atl_platform_ui_entry`, an `abi::Entry` (the one definition both sides compile).
     let entry: Entry = unsafe { std::mem::transmute::<*mut c_void, Entry>(entry) };
     // SAFETY: the entry has no precondition; it returns its static vtable.
