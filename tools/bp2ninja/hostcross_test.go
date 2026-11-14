@@ -164,6 +164,23 @@ cc_library_static { name: "libu", srcs: ["u.cc"], host_supported: true }
 	}
 }
 
+// device_first_generated_headers (Soong cc.go: the first device target's variant): a host tool waits on the device-side genrule and sees its header dir, as with generated_headers.
+// Break: the property ignored leaves the host node without the genrule (adb's fastdeploy.cpp: deployagent.inc not found).
+func TestDeviceFirstGeneratedHeaders(t *testing.T) {
+	g := graphForCfg(t, Config{Arch: "x86_64", PointerBits: 64}, map[string]string{"p/Android.bp": `
+genrule { name: "gen", cmd: "echo > $(out)", out: ["g.inc"] }
+cc_binary_host { name: "tool", srcs: ["tool.cc"], device_first_generated_headers: ["gen"] }
+`, "p/tool.cc": ""})
+	tool := g.node("tool", Host, Binary, "test")
+	gen := g.nodes[key{"gen", Device, Gen}]
+	if tool == nil || gen == nil {
+		t.Fatalf("tool %v, device gen %v: %v", tool, gen, g.problems)
+	}
+	if !tool.usedGens[gen] || len(tool.genIncs) == 0 {
+		t.Errorf("tool does not use the device genrule: used %v, incs %v", tool.usedGens, tool.genIncs)
+	}
+}
+
 // A provided module resolves per machine: a cross host's build tool links the build machine's copy (-build-provided), its products the host's (-provided); on the build machine both are the one -provided set.
 func TestProvidedPerMachine(t *testing.T) {
 	files := map[string]string{"p/Android.bp": `

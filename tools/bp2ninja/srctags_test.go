@@ -56,3 +56,25 @@ func TestJavaOutputTags(t *testing.T) {
 		t.Error("{.generated_srcjars} of a plain library resolved")
 	}
 }
+
+// Untagged `:name` of a Java module = base.go outputFile: the dex jar when it dexes (java_binary is installable), else the implementation and resources jar.
+// Break: without the case a genrule src `:deployagent` (adb's bin2c_fastdeployagent) is unresolved.
+func TestJavaUntaggedOutput(t *testing.T) {
+	g := javaTestGraph(t, map[string]string{
+		"j/Android.bp": `
+java_library { name: "lib", srcs: ["A.java"], sdk_version: "none", system_modules: "none" }
+java_binary { name: "bin", srcs: ["A.java"], sdk_version: "none", system_modules: "none" }
+`,
+		"j/A.java": "",
+	}, nil)
+	lib, bin := g.jnode("lib", Device, "test"), g.jnode("bin", Device, "test")
+	if lib == nil || bin == nil || bin.dex == "" {
+		t.Fatalf("lib %v, bin %v: %v", lib, bin, g.problems)
+	}
+	for name, want := range map[string]string{"lib": lib.implRes, "bin": bin.dex} {
+		files, ok := g.resolveSrc("j", Device, ":"+name, "test")
+		if !ok || len(files) != 1 || files[0].path != want {
+			t.Errorf(":%s: %+v ok %v, want %s", name, files, ok, want)
+		}
+	}
+}

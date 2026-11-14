@@ -844,6 +844,12 @@ func (g *Graph) treeNode(ref string, side Side, want Kind, from string) *Node {
 			}
 		}
 	}
+	// Soong's device_first_generated_headers (cc/cc.go: genHeaderDepTag on the first device target's variant, never re-exported): a host tool embedding a device file (adb's fastdeploy agent)
+	for _, r := range n.props.strs("device_first_generated_headers") {
+		if gn := g.ccGenNode(r, Device, m.Name); gn != nil {
+			g.useGen(n, gn)
+		}
+	}
 	skip := map[string]bool{}
 	for _, r := range n.props.strs("exclude_generated_sources") {
 		skip[r] = true
@@ -986,6 +992,20 @@ func (g *Graph) resolveSrc(dir string, side Side, s, from string) (files []srcFi
 			if out == "" {
 				g.problem("%s: %s has no %s output", from, name, tag)
 				return nil, false
+			}
+			return []srcFile{{path: out, root: filepath.Dir(out)}}, true
+		}
+	}
+	// untagged: the module's outputFile (java/base.go compile: the dex jar when it dexes, else the implementation and resources jar); adb's java_genrule bin2c_fastdeployagent embeds :deployagent's
+	if name, tag := splitTag(s); tag == "" && g.java != nil {
+		if m := g.lookupJava(name, side); m != nil && g.isJava(m.Type) && !isApp(g.baseType(m.Type)) {
+			jn := g.jnode(name, side, from)
+			if jn == nil {
+				return nil, false
+			}
+			out := jn.dex
+			if out == "" {
+				out = jn.implRes
 			}
 			return []srcFile{{path: out, root: filepath.Dir(out)}}, true
 		}
