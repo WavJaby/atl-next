@@ -269,6 +269,10 @@ type GoalsOf = fn() -> Goals;
 
 /// Every gate that reads a native out dir: `xtask test <name>`, `xtask run-apk`, and the `xtask check` steps that read built files. Declared here, not in the gates' own modules: `xtask native --for` (bootstrap) reads them, and the gates live in xtask-harness.
 pub const GATES: &[(&str, GoalsOf)] = &[
+    // AOSP adbd (device variant) and what `adb shell` runs
+    ("adb", || {
+        Goals::host(&["adbd", "sh", "toolbox", "service", "cmd", "dumpsys"])
+    }),
     ("app", app),
     ("audio-app", app),
     ("binder", binder),

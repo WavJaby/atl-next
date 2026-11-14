@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Sat, 14 Nov 2026 14:33:58 +0800
+Subject: [PATCH] adb: include the OpenSSL headers adb_auth.h uses
+
+adb_auth.h declares functions taking STACK_OF(X509_NAME) but includes
+only <openssl/rsa.h>. It compiles against AOSP's BoringSSL because its
+ex_data.h pulls in <openssl/stack.h>; upstream BoringSSL no longer
+does, so the macro is undefined. Include what the header uses.
+
+Upstream-Status: Pending
+Patch-Reason: a missing include in adb's own header; the launcher, loader or environment cannot add it, and the OpenSSL provider (upstream BoringSSL, chosen for licence reasons) is correct to omit the transitive include
+---
+SPDX-License-Identifier: Apache-2.0
+ adb_auth.h | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/adb_auth.h b/adb_auth.h
+index 38312211f3ade275e210e6346f905775c7611300..6ab009fd9d95b077acd89c8aae81fc9bd2dc5b05 100644
+--- a/adb_auth.h
++++ b/adb_auth.h
+@@ -23,6 +23,8 @@
+ #include <memory>
+ 
+ #include <openssl/rsa.h>
++#include <openssl/stack.h>
++#include <openssl/x509.h>
+ 
+ /* AUTH packets first argument */
+ /* Request */
