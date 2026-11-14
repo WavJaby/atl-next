@@ -210,7 +210,8 @@ fn binder() -> Goals {
 }
 
 /// Host ART with the boot classpath and its JNI libraries: what nb-isa runs, and native-load's base.
-const HOST_ART: [&str; 8] = [
+/// libandroid: host_art.rs `stage_art` refuses to stage an ART root without it (libhwui dlopens it by name), so every HostArt gate needs it.
+const HOST_ART: [&str; 9] = [
     "platform-bootclasspath",
     "libart",
     "libnativehelper",
@@ -218,6 +219,7 @@ const HOST_ART: [&str; 8] = [
     "libopenjdk",
     "libicu_jni",
     "libandroid_runtime",
+    "libandroid",
     "libsigchain",
 ];
 
@@ -303,6 +305,8 @@ pub const GATES: &[(&str, GoalsOf)] = &[
             "libbinder_rs",
             "libatl_parcelables",
             "atl-aidl-stubs-rust",
+            // Conscrypt's JNI library (a boot-jar loadLibrary, bootjni-loads.txt): the java cases reach it; a slot built `--for parcel` without it failed the gate
+            "libjavacrypto",
         ]))
     }),
     ("run-apk", app),
