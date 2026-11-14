@@ -28,7 +28,7 @@ const CATEGORY_LAUNCHER: &str = "android.intent.category.LAUNCHER";
 const ACTION_MANAGE_PERMISSIONS: &str = "android.intent.action.MANAGE_PERMISSIONS";
 const CATEGORY_DEFAULT: &str = "android.intent.category.DEFAULT";
 /// ApplicationInfo.FLAG_SYSTEM (1<<0) and PRIVATE_FLAG_PRIVILEGED (1<<3), ApplicationInfo.java:189, :535.
-const FLAG_SYSTEM: i32 = 1;
+pub(crate) const FLAG_SYSTEM: i32 = 1;
 const PRIVATE_FLAG_PRIVILEGED: i32 = 1 << 3;
 
 /// One installed package.

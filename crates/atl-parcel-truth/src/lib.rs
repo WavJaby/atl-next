@@ -48,6 +48,7 @@ use atl_parcelables::android::view::{
     DisplayInfo, InputChannel, InputDevice, InsetsSourceControl_Array, InsetsState, PointerIcon,
     SurfaceControl, WindowManager_LayoutParams, WindowRelayoutResult,
 };
+use atl_parcelables::android::webkit::WebViewProviderResponse;
 use atl_parcelables::android::window::{
     ClientWindowFrames, ImeOnBackInvokedDispatcher, SizeConfigurationBuckets,
 };
@@ -308,6 +309,9 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
         "android.content.IntentFilter" => round_trip_as::<IntentFilter>(input, mode),
         "android.content.ComponentName" => round_trip_as::<ComponentName>(input, mode),
         "android.content.pm.ConfigurationInfo" => round_trip_as::<ConfigurationInfo>(input, mode),
+        "android.webkit.WebViewProviderResponse" => {
+            round_trip_as::<WebViewProviderResponse>(input, mode)
+        }
         "android.os.Bundle" => round_trip_as::<Bundle>(input, mode),
         "android.app.servertransaction.ClientTransaction" => {
             round_trip_as::<ClientTransaction>(input, mode)

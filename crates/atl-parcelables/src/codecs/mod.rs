@@ -85,6 +85,9 @@ pub mod android {
         pub mod WindowManager_LayoutParams;
         pub mod WindowRelayoutResult;
     }
+    pub mod webkit {
+        pub mod WebViewProviderResponse;
+    }
     pub mod window {
         pub mod ClientWindowFrames;
         pub mod ImeOnBackInvokedDispatcher;

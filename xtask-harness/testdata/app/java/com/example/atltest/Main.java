@@ -81,6 +81,20 @@ public class Main extends Activity {
         return out.toString();
     }
 
+    /** The WebView line (app.rs WEBVIEW): WebSettings.getDefaultUserAgent, AdMob's first WebView call; `ua=<string>`, or `threw=` the throwable's class and each cause's, outermost first, joined by `<`. */
+    private String webView() {
+        try {
+            return "ua=" + android.webkit.WebSettings.getDefaultUserAgent(this);
+        } catch (Throwable e) {
+            StringBuilder out = new StringBuilder("threw=");
+            for (Throwable t = e; t != null; t = t.getCause()) {
+                if (t != e) out.append('<');
+                out.append(t.getClass().getName());
+            }
+            return out.toString();
+        }
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -98,6 +112,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "features: " + features());
         Log.i("AtlTest", "signatures: " + signatures());
         Log.i("AtlTest", "priority: " + priority());
+        Log.i("AtlTest", "webview: " + webView());
         mediaPlayerService();
         mediaExtractorWav();
         mediaRetrieverWav();

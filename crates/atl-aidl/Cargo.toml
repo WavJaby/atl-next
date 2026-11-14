@@ -80,6 +80,8 @@ types = [
     "android.os.IThermalService",
     # the uimode service (uimode.rs)
     "android.app.IUiModeManager",
+    # the webviewupdate service (webview_update.rs)
+    "android.webkit.IWebViewUpdateService",
     # the permissionmgr service (permission_manager.rs)
     "android.permission.IPermissionManager",
     "android.app.IApplicationThread",

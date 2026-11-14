@@ -105,6 +105,9 @@ const FEATURE_FILES: [&str; 3] = [
     "android.hardware.audio.output.xml",
 ];
 
+/// FEATURE_WEBVIEW's permission file, placed only by gates that test the WebView provider path ([`Runtime::with_webview_feature`]).
+const WEBVIEW_FEATURE_FILE: &str = "android.software.webview.xml";
+
 /// The /system files of the media stack an app process reads: the extractor plugins (MediaExtractorFactory loads `lib64/extractors`) and AOSP's codec lists (`media_codecs.xml` is the software list; the Codec2 list is `media_codecs_c2.xml`, read from the parser's default search dirs, which include /system/etc).
 /// And the system features' permission files ([`FEATURE_FILES`]).
 /// One list for every /system placement: atld `--file` rows (every [`Runtime`]) and native-load's test layout (binder.rs `link_rows`). Hard error when a host file is missing: xtask native builds them.
@@ -967,6 +970,23 @@ impl Runtime {
                 .is_none_or(|n| !FEATURE_FILES.iter().any(|f| n == *f))
         });
         self
+    }
+
+    /// Also places AOSP's FEATURE_WEBVIEW file (android.software.webview.xml) in /system/etc/permissions: the WebView provider path is gated under it before the product declares the feature
+    /// (product keeps it off until a WebView renders). A test environment file, not product config: SystemConfig reads it as it reads [`FEATURE_FILES`].
+    pub fn with_webview_feature(mut self, aosp: &Path) -> Result<Self> {
+        let host = aosp.join(FEATURE_FILES_DIR).join(WEBVIEW_FEATURE_FILE);
+        ensure!(
+            host.is_file(),
+            "missing input {} (the pinned AOSP tree)",
+            host.display()
+        );
+        let at = format!(
+            "{}/etc/permissions/{WEBVIEW_FEATURE_FILE}",
+            atl_android_paths::SYSTEM
+        );
+        self.platform_files.push((host, at));
+        Ok(self)
     }
 
     /// Input method clients get no death link (atld `--no-ime-death-link`): the ime gate's death sub-gate must then fail.

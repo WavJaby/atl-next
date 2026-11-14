@@ -288,6 +288,18 @@ mirrors = [
     "frameworks/base/services/core/java/com/android/server/UiModeManagerService.java#getForceInvertState",
 ]
 
+[webviewupdate]
+src = ["crates/atl-services/src/webview_update.rs"]
+mirrors = [
+    "frameworks/base/services/core/java/com/android/server/webkit/WebViewUpdateServiceImpl2.java#waitForAndGetProvider",
+    "frameworks/base/services/core/java/com/android/server/webkit/WebViewUpdateServiceImpl2.java#getValidWebViewPackages",
+    "frameworks/base/services/core/java/com/android/server/webkit/WebViewUpdateServiceImpl2.java#getCurrentWebViewPackage",
+    "frameworks/base/services/core/java/com/android/server/webkit/WebViewUpdateServiceImpl2.java#validityResult",
+    "frameworks/base/services/core/java/com/android/server/webkit/WebViewUpdateServiceImpl2.java#providerHasValidSignature",
+    "frameworks/base/services/core/java/com/android/server/webkit/WebViewUpdateService.java#getCurrentWebViewPackageName",
+    "frameworks/base/core/res/res/xml/config_webview_packages.xml",
+]
+
 [connectivity]
 src = ["crates/atl-services/src/connectivity.rs"]
 mirrors = [

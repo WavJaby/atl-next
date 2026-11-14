@@ -1276,6 +1276,12 @@ impl IActivityManager for ActivityManager {
         Ok(())
     }
 
+    /// ActivityManagerService.addPackageDependency (WebViewFactory registers on its provider package): AMS records the package so the caller dies when it is updated or removed.
+    /// Packages here change only at atld start (install sessions), never under a running process, so the record would have no reader: accepted and dropped, as AOSP also returns void.
+    fn r#addPackageDependency(&self, _package_name: Option<&str>) -> binder::Result<()> {
+        Ok(())
+    }
+
     /// ActivityManagerService.getRunningAppProcesses: the attached processes the caller may see (running_processes). Not enforced: enforceNotIsolatedCaller (no isolated uids).
     fn r#getRunningAppProcesses(
         &self,

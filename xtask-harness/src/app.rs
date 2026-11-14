@@ -80,6 +80,9 @@ pub struct Args {
     /// The system-features break: the run places none of AOSP's static permission files (atld_run.rs FEATURE_FILES), so the always-present feature reads false and the features line must go red.
     #[arg(long)]
     features_break: bool,
+    /// The WebView feature break: the run places no FEATURE_WEBVIEW test file, so getDefaultUserAgent throws today's no-WebView UnsupportedOperationException and the webview line must go red.
+    #[arg(long)]
+    webview_feature_break: bool,
 }
 
 /// The fixture's dir.
@@ -146,6 +149,14 @@ const SIGNATURES: &str = "AtlTest: signatures: ";
 /// package, and IMPORTANCE_FOREGROUND (100: ATL answers every app process as PROCESS_STATE_TOP). `null` = the list AOSP gives a caller with no attached process.
 const PROCESSES: &str = "AtlTest: processes: ";
 const PROCESSES_WANT: &str = "count=1 own=1 uid=true name=true pkg=true importance=100";
+/// Main.webView's line: WebSettings.getDefaultUserAgent with FEATURE_WEBVIEW declared (the run's test feature file, Runtime::with_webview_feature) and no provider package installed.
+/// AOSP: `webviewupdate`'s waitForAndGetProvider answers LIBLOAD_FAILED_LISTING_WEBVIEW_PACKAGES -> WebViewFactory.getWebViewContextAndSetProvider throws MissingWebViewPackageException,
+/// getProviderClass wraps it in AndroidRuntimeException, getProvider's catch (Exception) wraps that once more. Without the feature: UnsupportedOperationException alone (getProvider :345);
+/// without the service: asInterface(null)'s NullPointerException, wrapped once by getProvider (measured).
+const WEBVIEW: (&str, &str) = (
+    "AtlTest: webview: ",
+    "threw=android.util.AndroidRuntimeException<android.util.AndroidRuntimeException<android.webkit.WebViewFactory$MissingWebViewPackageException",
+);
 
 /// A [`SERVICE_LINES`] expectation: the fixed value, or for connectivity (None) [`connectivity_want`].
 fn service_want(fixed: Option<&str>) -> String {
@@ -978,6 +989,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         rt
     };
+    let rt = if args.webview_feature_break {
+        rt
+    } else {
+        rt.with_webview_feature(&layout.src().join("aosp"))?
+    };
     let work = rt.out.join("app");
     // the bridge-1 JNI fixture rides along in lib/<abi>/ (jni_fixture.rs); the NativeBridge core loads it into the guest
     let native = jni_fixture::apk_libs(
@@ -1172,6 +1188,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             "processes: want {PROCESSES_WANT:?}, got {processes:?}"
         ));
     }
+    let (prefix, want) = WEBVIEW;
+    let webview = app
+        .lines()
+        .find_map(|l| l.split_once(prefix).map(|(_, r)| r.trim_end().to_owned()));
+    if passed && webview.as_deref() != Some(want) {
+        whys.push(format!("webview: want {want:?}, got {webview:?}"));
+    }
     let features = app
         .lines()
         .find_map(|l| l.split_once(FEATURES).map(|(_, r)| r.trim_end().to_owned()));
@@ -1307,6 +1330,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             println!("app: pass {service} {}", service_want(want));
         }
         println!("app: pass processes {PROCESSES_WANT}");
+        println!("app: pass webview {}", WEBVIEW.1);
         println!(
             "app: pass priority {} ({})",
             priority.as_deref().unwrap_or_default(),

@@ -65,6 +65,8 @@ import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.ImeTracker;
 import android.view.inputmethod.InputBinding;
 import android.view.inputmethod.SurroundingText;
+import android.webkit.WebViewFactory;
+import android.webkit.WebViewProviderResponse;
 import android.window.ImeOnBackInvokedDispatcher;
 import com.android.internal.infra.AndroidFuture;
 import com.android.internal.inputmethod.InputBindResult;
@@ -206,6 +208,9 @@ public class ParcelTruth {
         holder.noReleaseNeeded = true;
         check("ContentProviderHolder", holder, ContentProviderHolder.CREATOR);
         check("PackageInfo", packageInfo(ai), PackageInfo.CREATOR);
+        // IWebViewUpdateService.waitForAndGetProvider's reply: no valid provider (null package, LIBLOAD_FAILED_LISTING_WEBVIEW_PACKAGES), and a provider found
+        check("WebViewProviderResponse:none", new WebViewProviderResponse(null, WebViewFactory.LIBLOAD_FAILED_LISTING_WEBVIEW_PACKAGES), WebViewProviderResponse.CREATOR);
+        check("WebViewProviderResponse", new WebViewProviderResponse(packageInfo(ai), WebViewFactory.LIBLOAD_SUCCESS), WebViewProviderResponse.CREATOR);
         // getPackageInfo with GET_SIGNATURES | GET_SIGNING_CERTIFICATES (PackageInfoCommonUtils.generate:196-219): the signer array and the SigningInfo, whose public keys go as Serializable values
         check("PackageInfo:signatures", signedPackageInfo(ai, false), PackageInfo.CREATOR);
         // a signer with a rotation history (v3 lineage): signingInfo also carries the past certificates
