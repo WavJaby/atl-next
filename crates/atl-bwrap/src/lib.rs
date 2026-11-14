@@ -80,6 +80,16 @@ impl Args {
             .word(id.to_string())
     }
 
+    /// `--userns-block-fd FD`: bwrap writes no id map; the sandbox's first process waits until FD becomes readable, by which time the caller has written the maps (newuidmap/newgidmap on the `--info-fd` child pid). Its ids are then the caller's ids under those maps.
+    pub fn userns_block_fd(&mut self, fd: i32) -> &mut Self {
+        self.word("--userns-block-fd").word(fd.to_string())
+    }
+
+    /// `--cap-add CAP`: keep CAP (e.g. `CAP_SETUID`) inside the user namespace for the program.
+    pub fn cap_add(&mut self, cap: &str) -> &mut Self {
+        self.word("--cap-add").word(cap)
+    }
+
     /// `--die-with-parent`: the sandbox is killed when bwrap's parent dies.
     pub fn die_with_parent(&mut self) -> &mut Self {
         self.word("--die-with-parent")

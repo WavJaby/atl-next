@@ -97,7 +97,8 @@ impl NiceTiers {
 /// `profile`'s program.
 pub fn program(profile: Profile) -> io::Result<BpfProgram> {
     match profile {
-        Profile::App => app_program(NiceTiers::for_limit(granted_nice())),
+        // adbd and its shell are Android processes: the app's allow-list (drop_privileges' setgroups/setres*id/capset included, or the gate shows the kill)
+        Profile::App | Profile::Adb => app_program(NiceTiers::for_limit(granted_nice())),
         Profile::BinderDaemon => binderd_program(),
         Profile::Installer => installer_program(),
     }

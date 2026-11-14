@@ -9,6 +9,7 @@
     reason = "a test harness: it runs compilers and test drivers on the host; the runtime processes of its gates start through atl_broker"
 )]
 
+mod adb;
 mod app;
 mod app_imports;
 mod atld_run;
@@ -137,6 +138,8 @@ enum Test {
     Installer(installer::Args),
     /// AOSP servicemanager + `service list` / `check` through atl-binderd on libbinder's driver seam; binderd's counters must show the expected driver paths firing.
     Binder(binder::Args),
+    /// AOSP adbd in the broker's adb profile (plan adbd S2): AOSP's host adb gets `getprop ro.build.version.sdk` = build.prop's from ATL's property area over 127.0.0.1:5555 only, `id` = uid 2000 + drop_privileges' groups; `--break-auth`: unauthorized without adb_keys.
+    Adb(adb::Args),
     /// The app sandbox (plan Q5): a probe as an app process (uid 10123, the broker's App profile) reaches neither the real $HOME nor anything outside its data dir, and writes its own. Its deliberate break is by hand (sandbox.rs).
     Sandbox(sandbox::Args),
     /// Parcel encodings vs ground truth: atl-aidl-probe through AOSP's C++ Parcel (its size check fires on a wrong size), then atl-parcelables' codecs vs Java's Parcelables on host ART, byte-equal both ways.
@@ -300,6 +303,9 @@ fn main() -> Result<ExitCode> {
             test: Test::Binder(args),
         } => binder::run(&root, &args),
         Command::Test {
+            test: Test::Adb(args),
+        } => adb::run(&root, &args),
+        Command::Test {
             test: Test::Sandbox(args),
         } => sandbox::run(&root, &args),
         Command::Test {
@@ -441,6 +447,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::Compositor(_) => "compositor",
             Test::Gralloc(_) => "gralloc",
             Test::Binder(_) => "binder",
+            Test::Adb(_) => "adb",
             Test::Sandbox(_) => "sandbox",
             Test::App(_) => "app",
             Test::AudioApp(_) => "audio-app",

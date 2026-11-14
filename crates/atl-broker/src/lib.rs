@@ -8,6 +8,7 @@
 //! [`control`] is how the system services ask atld (which owns the broker) to start and kill processes.
 #![forbid(unsafe_code)]
 
+pub mod adb;
 pub mod app_env;
 
 pub mod control;
@@ -157,6 +158,8 @@ pub enum Profile {
     /// The package installer ([`Broker::spawn_installer`], plan 4b): AOSP's package parse and native-code choice over the caller's package dir and one output dir.
     /// Its own uid ([`INSTALLER_UID`]), no network namespace, not registered with binderd (no binder), the caller's environment alone, the installer allow-list ([`seccomp`]).
     Installer,
+    /// AOSP's adbd ([`Broker::spawn_adbd`], plan adbd S2): a user namespace mapped by the setuid helpers ([`adb`]) so its drop_privileges runs unpatched, the host's network (its listener is loopback by property), the app seccomp program, not registered with binderd (S3 gives its shell a binder door).
+    Adb,
 }
 
 /// The uid and gid binderd runs as inside its user namespace: the overflow id (nobody), which owns nothing binderd could reach.
@@ -230,9 +233,16 @@ pub fn bwrap_args(
     seccomp_fd: Option<i32>,
 ) -> (Vec<OsString>, Vec<(Access, PathBuf)>) {
     let mut a = bwrap::Args::new();
-    a.unshare_user()
-        .ids(spawn.uid)
-        .unshare_pid()
+    a.unshare_user();
+    if profile == Profile::Adb {
+        // the maps come from newuidmap/newgidmap (adb.rs), the ids with them; the caller adds --userns-block-fd
+        for cap in adb::ADBD_CAPS {
+            a.cap_add(cap);
+        }
+    } else {
+        a.ids(spawn.uid);
+    }
+    a.unshare_pid()
         .die_with_parent()
         .info_fd(info_fd)
         .tmpfs("/")
@@ -253,14 +263,13 @@ pub fn bwrap_args(
     if let Some(fd) = seccomp_fd {
         a.seccomp(fd);
     }
-    // a root dir is left out only when a mount sits at exactly its path; a mount below it is bound over it, after it
+    // a root dir is left out only when a mount or link sits at exactly its path (adb's /bin -> /system/bin); a mount below it is bound over it, after it
     let covered = |name: &str| {
+        let at = Path::new("/").join(name);
         name == "dev"
             || name == "proc"
-            || spawn
-                .mounts
-                .iter()
-                .any(|m| m.at == Path::new("/").join(name))
+            || spawn.mounts.iter().any(|m| m.at == at)
+            || spawn.links.iter().any(|l| l.at == at)
     };
     for e in root {
         match e {
@@ -679,7 +688,8 @@ fn launch(l: Launch<'_>, info_r: io::PipeReader, inherit: Vec<OwnedFd>) -> io::R
         clippy::disallowed_types,
         reason = "the one launcher of the runtime: every process atld starts is a bwrap run built here"
     )]
-    let mut cmd = std::process::Command::new(BWRAP);
+    // bwrap found through the broker's PATH: std resolves a bare name through the child's PATH when the child's environment sets one (adbd's is init's /system/bin:...)
+    let mut cmd = std::process::Command::new(host_program(BWRAP)?);
     cmd.env_clear()
         .args(&l.bwrap_args)
         .arg(l.program)
@@ -699,6 +709,16 @@ fn launch(l: Launch<'_>, info_r: io::PipeReader, inherit: Vec<OwnedFd>) -> io::R
             Err(e)
         }
     }
+}
+
+/// `name`'s path in the broker's own PATH (the first directory holding it).
+fn host_program(name: &str) -> io::Result<PathBuf> {
+    std::env::var_os("PATH")
+        .iter()
+        .flat_map(std::env::split_paths)
+        .map(|d| d.join(name))
+        .find(|p| p.is_file())
+        .ok_or_else(|| other(format!("{name} is not in the broker's PATH")))
 }
 
 impl Broker {
@@ -866,6 +886,58 @@ impl Broker {
             vec![info_w.into(), seccomp],
         )?;
         Ok(Process { child, host_pid })
+    }
+}
+
+impl Broker {
+    /// Starts adbd in [`Profile::Adb`]: bwrap blocks its first process until `maps` are written into the new user namespace ([`adb::write_maps`] on the reported pid), then runs the stub (TCP left open: adbd listens) and adbd as namespace [`adb::AID_SHELL`] with [`adb::ADBD_CAPS`].
+    /// `spawn.uid` must be AID_SHELL (the id the maps give the caller); its environment is `spawn.env` alone (init's, as adbd's on a device); no binderd registration. Maps that fail to write end the sandbox.
+    pub fn spawn_adbd(&self, mut spawn: Spawn, maps: &adb::IdMaps) -> io::Result<Process> {
+        if spawn.uid != adb::AID_SHELL || spawn.context_manager || !spawn.devices.is_empty() {
+            return Err(other(
+                "adbd spawn refused: uid must be AID_SHELL, no context manager, no devices",
+            ));
+        }
+        let _one_at_a_time = self.spawning.lock().unwrap_or_else(|e| e.into_inner());
+        complete_mounts(&mut spawn)?;
+        let (info_r, info_w) = io::pipe()?;
+        let (block_r, mut block_w) = io::pipe()?;
+        let seccomp = seccomp_memfd(Profile::Adb)?;
+        let (mut bwrap_args, grants) = bwrap_args(
+            &spawn,
+            Profile::Adb,
+            &host_root()?,
+            &self.stub,
+            info_w.as_raw_fd(),
+            Some(seccomp.as_raw_fd()),
+        );
+        let block = [
+            OsString::from("--userns-block-fd"),
+            block_r.as_raw_fd().to_string().into(),
+        ];
+        bwrap_args.splice(0..0, block);
+        let mut args = stub_args(&grants, true, &spawn.program);
+        args.extend(spawn.args.iter().cloned());
+        let process = launch(
+            Launch {
+                bwrap_args,
+                program: Path::new(SANDBOX_STUB_AT),
+                args: &args,
+                env: spawn.env,
+                stdin: spawn.stdin.map_or_else(Stdio::null, Stdio::from),
+                stdout: spawn.stdout,
+                stderr: spawn.stderr,
+            },
+            info_r,
+            vec![info_w.into(), block_r.into(), seccomp],
+        )?;
+        if let Err(e) = adb::write_maps(process.host_pid, maps) {
+            let _ = kill_sandbox(process.host_pid);
+            return Err(e);
+        }
+        // readable = maps written: bwrap's first process goes on
+        block_w.write_all(b"1")?;
+        Ok(process)
     }
 }
 
