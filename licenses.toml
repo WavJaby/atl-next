@@ -28,6 +28,7 @@
 # Apache-2.0 WITH LLVM-exception: owner decision 2026-11-06 (llvm-project runtimes libc++/libc++abi/libunwind/compiler-rt builtins for the bionic targets; llvm-project's LICENSE.TXT); the exception only removes Apache-2.0 attribution duties for compiled-in runtime code, so it stays GPL-3-compatible as Apache-2.0 is.
 # TU-Berlin-2.0: accepted 2026-11-07 (libgsm, via the GSM soft decoder the Codec2 store lists); all-permissive (use/copy/modify/distribute for any purpose if the notice is kept), the same class as LicenseRef-AGG-2.3, GPL-3-compatible.
 # GPL-3.0-or-later WITH Bison-exception-2.2: plan angle S0 (owner 2026-11-09, "全部照建議"); checked-in Bison parser output of ANGLE's translator and preprocessor and of third_party/glslang. The notice is GPL-3.0-or-later plus the Bison skeleton exception, which frees a parser's users (as GCC-exception-3.1 does); the phrase rules read it.
+# MirOS: owner decision 2026-11-14 (mksh = /system/bin/sh, for `adb shell` and Runtime.exec("sh")); all-permissive notice-retention terms, same class as TU-Berlin-2.0; upstream source built as a separate binary with its notice shipped, nothing of ours relicensed. GPL-3 compatibility unverified: a future qemu-bridge list needs a cited source before it may carry MirOS.
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
@@ -45,6 +46,7 @@ allow = [
     "LicenseRef-Public-Domain",
     "Libpng",
     "libpng-2.0",
+    "MirOS",
     "MIT",
     "MIT-Khronos-old",
     "MIT-Modern-Variant",
