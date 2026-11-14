@@ -40,10 +40,10 @@ pub struct Args {
     /// Key set the product APKs are signed with, `<role>.x509.pem` + `<role>.pk8` per certificate role (keys.rs; default: the workspace's dev set, <workspace>/keys, made by `xtask keys --execute`).
     #[arg(long)]
     keys: Option<PathBuf>,
-    /// C compiler (default: deps.toml row `clang`'s binary).
+    /// C compiler of the build machine's code (default: deps.toml row `clang`'s binary); a cross host's own code takes its arches.toml `cc` row.
     #[arg(long)]
     cc: Option<String>,
-    /// C++ compiler and link driver (default: deps.toml row `clang-cxx`'s binary).
+    /// C++ compiler and link driver of the build machine's code (default: deps.toml row `clang-cxx`'s binary); a cross host's own code takes its arches.toml `cxx` row.
     #[arg(long)]
     cxx: Option<String>,
     /// Archiver (default: deps.toml row `llvm`'s binary).
