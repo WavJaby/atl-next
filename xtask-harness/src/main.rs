@@ -138,7 +138,7 @@ enum Test {
     Installer(installer::Args),
     /// AOSP servicemanager + `service list` / `check` through atl-binderd on libbinder's driver seam; binderd's counters must show the expected driver paths firing.
     Binder(binder::Args),
-    /// AOSP adbd in the broker's adb profile (plan adbd S2): AOSP's host adb gets `getprop ro.build.version.sdk` = build.prop's from ATL's property area over 127.0.0.1:5555 only, `id` = uid 2000 + drop_privileges' groups; `--break-auth`: unauthorized without adb_keys.
+    /// AOSP adbd in the broker's adb profile (plan adbd S2): AOSP's host adb gets `getprop ro.build.version.sdk` = build.prop's from ATL's property area over 127.0.0.1:5555 only, the shell's status = uid/gid 2000 + drop_privileges' groups; `--break-auth`: unauthorized without adb_keys.
     Adb(adb::Args),
     /// The app sandbox (plan Q5): a probe as an app process (uid 10123, the broker's App profile) reaches neither the real $HOME nor anything outside its data dir, and writes its own. Its deliberate break is by hand (sandbox.rs).
     Sandbox(sandbox::Args),

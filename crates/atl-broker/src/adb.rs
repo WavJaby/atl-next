@@ -13,8 +13,8 @@ use crate::other;
 /// Android's shell uid and gid (android_filesystem_config.h AID_SHELL): adbd's identity after drop_privileges, mapped to the desktop user.
 pub const AID_SHELL: u32 = 2000;
 
-/// The highest namespace id adbd sets: its supplementary groups (daemon/main.cpp `drop_privileges`, android_filesystem_config.h) top out at AID_UHID = 3011. A subordinate range too short to map it is refused.
-const HIGHEST_ADBD_ID: u32 = 3011;
+/// The highest namespace id adbd sets: its supplementary groups (daemon/main.cpp `drop_privileges`, android_filesystem_config.h) top out at AID_READTRACEFS = 3012. A subordinate range too short to map it is refused.
+const HIGHEST_ADBD_ID: u32 = 3012;
 
 /// What the sandbox's first process keeps: minijail's set_supplementary_gids needs CAP_SETGID, change_uid CAP_SETUID, its bounding-set drop CAP_SETPCAP, and drop_caps raises the caps adbd keeps (daemon/main.cpp `minijail_use_caps`: SETUID | SETGID | SYS_NICE) into permitted, so one missing = "can't apply initial cleaned capset" abort.
 /// All are namespace capabilities: none reaches the host (CAP_SYS_NICE over the init namespace's tasks is checked against the init user namespace).

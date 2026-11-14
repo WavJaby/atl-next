@@ -3,7 +3,7 @@
 //!
 //! adbd reads only what its environment gives (plan adbd A3): ATL's property area (+ `service.adb.listen_addrs=tcp:localhost:5555`, a loopback listener by property), a device view with `/system/bin/{sh,toolbox,getprop -> toolbox}` and `/bin -> /system/bin`,
 //! `/data/misc/adb/adb_keys` holding the client's public key, init's environment. `ro.debuggable=0` (a user build) keeps auth required, as on a phone.
-//! Gate: `adb -s 127.0.0.1:5555 shell getprop ro.build.version.sdk` prints the build.prop's value (the source the property service loads, read here independently); the only listener on the port is 127.0.0.1 (`/proc/net/tcp{,6}`, what `ss -ltn` reads); `adb shell id` shows uid 2000 with drop_privileges' groups.
+//! Gate: `adb -s 127.0.0.1:5555 shell getprop ro.build.version.sdk` prints the build.prop's value (the source the property service loads, read here independently); the only listener on the port is 127.0.0.1 (`/proc/net/tcp{,6}`, what `ss -ltn` reads); the shell's `/proc/self/status` shows uid/gid 2000 and exactly drop_privileges' 14 groups.
 //! Break `--break-auth`: no adb_keys -> the client's device state is `unauthorized` and the shell never runs.
 
 use std::path::{Path, PathBuf};
@@ -57,20 +57,31 @@ const INIT_ENV: &[(&str, &str)] = &[
 /// How long adbd may take to listen, and one client command to answer (a loaded machine: a cold adbd listens well under a second).
 const START_LIMIT: Duration = Duration::from_secs(10);
 const RUN_LIMIT: Duration = Duration::from_secs(20);
-/// drop_privileges' supplementary groups as `id` prints them (daemon/main.cpp; names from android_filesystem_config.h via bionic's getgrgid, which toybox's id uses): the phone's `adb shell id` (A024) lists these.
-const SHELL_GROUPS: &[&str] = &[
-    "1004(input)",
-    "1007(log)",
-    "1011(adb)",
-    "1015(sdcard_rw)",
-    "1028(sdcard_r)",
-    "3001(net_bt_admin)",
-    "3002(net_bt)",
-    "3003(inet)",
-    "3006(net_bw_stats)",
-    "3009(readproc)",
-    "3011(uhid)",
+/// drop_privileges' 14 supplementary groups (daemon/main.cpp `groups[]`, numbers from android_filesystem_config.h), sorted as the kernel lists them in `/proc/<pid>/status` `Groups:`.
+const SHELL_GROUPS: &[u32] = &[
+    1004, 1007, 1011, 1015, 1028, 1078, 1079, 3001, 3002, 3003, 3006, 3009, 3011, 3012,
 ];
+/// The shell's identity from the kernel, with mksh builtins only: `id` is a toybox applet, and toybox waits for its own slice (plan adbd A1).
+const IDENTITY: &str = "while read -r k v; do case $k in Uid:|Gid:|Groups:) echo \"$k $v\";; esac; done </proc/self/status";
+
+/// Whether `status` (IDENTITY's output) shows real/effective/saved/fs uid and gid AID_SHELL and exactly SHELL_GROUPS.
+fn is_shell_identity(status: &str) -> bool {
+    let field = |k: &str| -> Vec<u32> {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(k))
+            .map(|v| {
+                v.split_whitespace()
+                    .filter_map(|n| n.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let shell = [adb::AID_SHELL; 4];
+    let mut groups = field("Groups:");
+    groups.sort_unstable();
+    field("Uid:") == shell && field("Gid:") == shell && groups == SHELL_GROUPS
+}
 
 /// The value `key` has in build.prop text `text` (last assignment wins, as the property service loads it).
 fn prop_of(text: &str, key: &str) -> Option<String> {
@@ -123,7 +134,7 @@ fn client(adb: &Path, home: &Path, server_port: u16, args: &[&str]) -> Result<(S
     let log = home.join("client.log");
     let mut child = Command::new(adb)
         .args(args)
-        .env("ANDROID_USER_HOME", home)
+        // the client's key dir is $HOME/.android (adb_utils.cpp adb_get_android_dir_path; this adb reads no ANDROID_USER_HOME)
         .env("HOME", home)
         .env("ANDROID_ADB_SERVER_PORT", server_port.to_string())
         .stdin(Stdio::null())
@@ -174,7 +185,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // the client's key pair, made by the client itself (adb keygen), as ~/.android/adbkey{,.pub} on a desktop
     let mut keys = Vec::new();
     if args.client.is_none() {
-        let key = home.join("adbkey");
+        let dot = home.join(".android");
+        std::fs::create_dir_all(&dot)?;
+        let key = dot.join("adbkey");
         let (text, ok) = client(
             &adb_client,
             &home,
@@ -182,7 +195,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             &["keygen", &key.display().to_string()],
         )?;
         ensure!(ok, "adb keygen failed: {text}");
-        keys.push(home.join("adbkey.pub"));
+        keys.push(dot.join("adbkey.pub"));
     }
     keys.extend(args.key.clone());
     if args.break_auth {
@@ -266,7 +279,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         &adb_client,
         &home,
         server_port,
-        &["-s", &serial, "shell", "id"],
+        &["-s", &serial, "shell", IDENTITY],
     )?;
     let (devices, _) = client(&adb_client, &home, server_port, &["devices"])?;
     println!(
@@ -286,9 +299,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 sdk.trim()
             ));
         }
-        if !id.contains("uid=2000(shell)") || SHELL_GROUPS.iter().any(|g| !id.contains(g)) {
+        if !is_shell_identity(&id) {
             fails.push(format!(
-                "adb shell id = {:?}, want uid 2000 with {SHELL_GROUPS:?}",
+                "adb shell identity = {:?}, want uid/gid 2000 and groups {SHELL_GROUPS:?}",
                 id.trim()
             ));
         }
@@ -337,6 +350,20 @@ mod tests {
         // 5555 = 0x15B3
         assert_eq!(listeners(t, 5555), ["0100007F:15B3", "00000000:15B3"]);
         assert_eq!(loopback(5555), "0100007F:15B3");
+    }
+
+    /// proc(5) status lines as IDENTITY prints them; a missing group, an extra one or a root saved uid fail.
+    #[test]
+    fn shell_identity_reads_status() {
+        let groups = "1004 1007 1011 1015 1028 1078 1079 3001 3002 3003 3006 3009 3011 3012";
+        let ok =
+            format!("Uid: 2000\t2000\t2000\t2000\nGid: 2000\t2000\t2000\t2000\nGroups: {groups}\n");
+        assert!(is_shell_identity(&ok));
+        assert!(!is_shell_identity(&ok.replace(" 3012", "")));
+        assert!(!is_shell_identity(&ok.replace("3012", "3012 65534")));
+        assert!(!is_shell_identity(
+            &ok.replace("Uid: 2000\t2000\t2000", "Uid: 2000\t2000\t0")
+        ));
     }
 
     #[test]
