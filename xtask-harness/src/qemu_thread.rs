@@ -102,10 +102,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let mut fails = Vec::new();
     for brk in runs {
         let name = format!("{}-{}", HARNESS.prefix, brk.unwrap_or("plain"));
-        let run = qemu_linker::harness(root, &dir, &HARNESS, &env, &dir, brk, &name)
-            .and_then(|()| match brk {
-                None => prop_miss_logged(&dir.join(format!("{name}.log"))),
-                Some(_) => Ok(()),
+        let run =
+            qemu_linker::harness(root, &dir, &HARNESS, &env, &dir, brk, &name).and_then(|()| {
+                match brk {
+                    None => prop_miss_logged(&dir.join(format!("{name}.log"))),
+                    Some(_) => Ok(()),
+                }
             });
         if let Err(e) = run {
             fails.push(Failure::step(&name, format!("{e:#}")));
@@ -127,7 +129,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 
 /// The guest's read of [`UNSET`] reached the provider's one lookup (atl-bionic `store::find`, via the NBS stub and the provider's `__system_property_get`): its first-hit line is in the run's log.
 fn prop_miss_logged(log: &Path) -> Result<()> {
-    let text = std::fs::read_to_string(log).with_context(|| format!("reading {}", log.display()))?;
+    let text =
+        std::fs::read_to_string(log).with_context(|| format!("reading {}", log.display()))?;
     let want = format!("diag: first {} {UNSET} 1 at=", atl_diag::PROP_MISS);
     ensure!(
         text.lines().any(|l| l.starts_with(&want)),

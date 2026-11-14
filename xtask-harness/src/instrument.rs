@@ -238,6 +238,7 @@ fn check_sample(s: &Session) -> Vec<String> {
         ("testPass", STATUS_OK),
         ("testFail", STATUS_FAILURE),
         ("testError", STATUS_ERROR),
+        ("testUnsetProperty", STATUS_OK),
     ] {
         let want = vec![STATUS_START, end];
         let got = s.codes(test);
@@ -262,10 +263,10 @@ fn check_sample(s: &Session) -> Vec<String> {
     if !s
         .result
         .get("stream")
-        .is_some_and(|r| r.contains("Tests run: 3"))
+        .is_some_and(|r| r.contains("Tests run: 4"))
     {
         fails.push(format!(
-            "INSTRUMENTATION_RESULT stream lacks `Tests run: 3`: {:?}",
+            "INSTRUMENTATION_RESULT stream lacks `Tests run: 4`: {:?}",
             s.result.get("stream")
         ));
     }
@@ -273,6 +274,15 @@ fn check_sample(s: &Session) -> Vec<String> {
         fails.push(format!("INSTRUMENTATION_FAILED/ABORTED: {f}"));
     }
     fails
+}
+
+/// SampleTest.java `testUnsetProperty` reads this name, which nothing sets.
+const UNSET: &str = "atl.instr.unset";
+
+/// Run 1's Java route of prop:miss: the instrumented process's log holds the first-hit line of [`UNSET`] (Java `SystemProperties` -> libatl_bionic `store::find`).
+fn prop_miss_missing(app_log: &str) -> Option<String> {
+    let want = format!("diag: first {} {UNSET} 1 at=", atl_diag::PROP_MISS);
+    (!app_log.lines().any(|l| l.contains(&want))).then(|| format!("app log lacks `{want}`"))
 }
 
 /// The checks of a run of tests that must all pass: each named test started (1) and ended OK (0), the final code RESULT_OK, no failed session.
@@ -612,6 +622,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 }
             }
         }
+        if matches!(expect, Expect::Sample) {
+            let app_log = std::fs::read_to_string(run.log(&m.name)).unwrap_or_default();
+            fails.extend(prop_miss_missing(&app_log));
+        }
         let services_log = std::fs::read_to_string(run.log("services")).unwrap_or_default();
         for l in counter_lines(&services_log) {
             println!("instrument: {label}: counter {l}");
@@ -620,7 +634,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             let pid = life.as_ref().map_or(0, |l| l.pid);
             match expect {
                 Expect::Sample => println!(
-                    "instrument: sample pass (testPass 1,0; testFail 1,-2; testError 1,-1; final code -1; process {pid} killed by the finish)"
+                    "instrument: sample pass (testPass 1,0; testFail 1,-2; testError 1,-1; testUnsetProperty 1,0 + prop:miss {UNSET}; final code -1; process {pid} killed by the finish)"
                 ),
                 Expect::Crash => println!(
                     "instrument: crash pass (process {pid} died mid-run: code 0, shortMsg \"Process crashed.\")"
@@ -745,10 +759,16 @@ INSTRUMENTATION_CODE: -1
              INSTRUMENTATION_STATUS: stack=AssertionFailedError: deliberate failure\nINSTRUMENTATION_STATUS: test=testFail\nINSTRUMENTATION_STATUS_CODE: -2\n\
              INSTRUMENTATION_STATUS: test=testError\nINSTRUMENTATION_STATUS_CODE: 1\n\
              INSTRUMENTATION_STATUS: stack=java.lang.IllegalStateException: deliberate error\nINSTRUMENTATION_STATUS: test=testError\nINSTRUMENTATION_STATUS_CODE: -1\n\
-             INSTRUMENTATION_RESULT: stream=Tests run: 3,  Failures: 1,  Errors: 1\nINSTRUMENTATION_CODE: -1\n",
+             INSTRUMENTATION_STATUS: test=testUnsetProperty\nINSTRUMENTATION_STATUS_CODE: 1\n\
+             INSTRUMENTATION_STATUS: test=testUnsetProperty\nINSTRUMENTATION_STATUS_CODE: 0\n\
+             INSTRUMENTATION_RESULT: stream=Tests run: 4,  Failures: 1,  Errors: 1\nINSTRUMENTATION_CODE: -1\n",
         );
         assert_eq!(check_sample(&ok), Vec::<String>::new());
         assert!(!check_sample(&Session::default()).is_empty());
+        assert!(
+            prop_miss_missing("x I diag: first prop:miss atl.instr.unset 1 at=1.000\n").is_none()
+        );
+        assert!(prop_miss_missing("x I diag: first prop:miss other 1 at=1.000\n").is_some());
         let crashed = session(
             "INSTRUMENTATION_STATUS: test=testCrash\nINSTRUMENTATION_STATUS_CODE: 1\n\
              INSTRUMENTATION_RESULT: shortMsg=Process crashed.\nINSTRUMENTATION_CODE: 0\n",

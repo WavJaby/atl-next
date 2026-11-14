@@ -165,10 +165,37 @@ mod tests {
         assert_eq!(misses("a.noarea"), 1);
     }
 
+    /// S14's cost check, run by hand (`--release -- --ignored miss_loop`): ns per lookup of a missing name (count on a known key) vs a found one; prints both.
+    #[test]
+    #[ignore = "measurement, not a gate"]
+    fn miss_loop_cost() {
+        use std::io::Write as _;
+        const N: u32 = 1_000_000;
+        let mut image = Image::new();
+        image.add("b.set", "x").expect("fits");
+        let w = words(&image.into_bytes());
+        let area = Area::new(&w).expect("bionic's format");
+        let ns = |name: &[u8]| {
+            let t = std::time::Instant::now();
+            for _ in 0..N {
+                std::hint::black_box(lookup(Some(area), std::hint::black_box(name)));
+            }
+            t.elapsed().as_nanos() as f64 / f64::from(N)
+        };
+        let (miss, hit) = (ns(b"b.unset"), ns(b"b.set"));
+        let _ = writeln!(
+            std::io::stderr(),
+            "miss-loop: miss {miss:.1} ns, hit {hit:.1} ns"
+        );
+    }
+
     /// S4's escaping: space, `\` and non-ASCII bytes as `\xHH` (0x20, 0x5c, 0xff); a bionic-valid name borrowed.
     #[test]
     fn key_escapes_what_the_parser_splits_on() {
-        assert!(matches!(key(b"ro.a_b-c:d@e"), Cow::Borrowed("ro.a_b-c:d@e")));
+        assert!(matches!(
+            key(b"ro.a_b-c:d@e"),
+            Cow::Borrowed("ro.a_b-c:d@e")
+        ));
         assert_eq!(key(b"a b\\c\xff"), "a\\x20b\\x5cc\\xff");
     }
 }
