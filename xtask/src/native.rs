@@ -962,7 +962,25 @@ impl CompilerCache {
     }
 
     /// Stops this cache's server and removes its socket file (sccache leaves it behind). Runs on `Drop`: a build's server ends with the build.
+    /// Prints this run's stats first: the server is the build's own, so its counters are this build's alone.
     fn stop(&self) {
+        let stats = Command::new(&self.launcher)
+            .args(["--show-stats", "--stats-format=json"])
+            .envs(self.env())
+            .output();
+        match stats {
+            Ok(out) if out.status.success() => {
+                match stats_line(&String::from_utf8_lossy(&out.stdout)) {
+                    Ok(line) => println!("native: compiler cache this run: {line}"),
+                    Err(e) => println!("native: compiler cache stats unreadable: {e:#}"),
+                }
+            }
+            Ok(out) => println!(
+                "native: compiler cache stats unreadable: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            Err(e) => println!("native: compiler cache stats unreadable: {e}"),
+        }
         let _ = Command::new(&self.launcher)
             .arg("--stop-server")
             .envs(self.env())
@@ -1020,6 +1038,29 @@ impl Drop for CompilerCache {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// One line from `sccache --show-stats --stats-format=json` (sccache 0.10 shape): compile requests, hits, misses (summed over languages), hit rate of hits + misses.
+fn stats_line(json: &str) -> Result<String> {
+    let v: serde_json::Value = serde_json::from_str(json).context("sccache stats JSON")?;
+    let s = &v["stats"];
+    let sum = |key: &str| -> Result<u64> {
+        let counts = s[key]["counts"]
+            .as_object()
+            .with_context(|| format!("stats.{key}.counts missing"))?;
+        Ok(counts.values().filter_map(serde_json::Value::as_u64).sum())
+    };
+    let requests = s["compile_requests"]
+        .as_u64()
+        .context("stats.compile_requests missing")?;
+    let (hits, misses) = (sum("cache_hits")?, sum("cache_misses")?);
+    let rate = match hits + misses {
+        0 => "-".to_owned(),
+        n => format!("{:.1}%", hits as f64 * 100.0 / n as f64),
+    };
+    Ok(format!(
+        "{requests} compile requests, {hits} hits, {misses} misses, hit rate {rate}"
+    ))
 }
 
 /// Differs between processes and between calls (pid + clock): the socket name must never name an earlier build's server.
@@ -1932,6 +1973,23 @@ nope
         std::fs::remove_dir_all(&sized).expect("cleanup");
         let env: BTreeMap<_, _> = cache.env().into_iter().collect();
         assert_eq!(env["SCCACHE_CACHE_SIZE"], "7G");
+    }
+
+    /// Fixture = sccache 0.10 `--show-stats --stats-format=json` shape (counts per language); hits 30 + 5 = 35, misses 9 + 1 = 10, rate 35/45 = 77.8%.
+    #[test]
+    fn stats_line_sums_languages() {
+        let json = r#"{"stats":{"compile_requests":50,"cache_hits":{"counts":{"C/C++":30,"Assembler":5},"adv_counts":{}},"cache_misses":{"counts":{"C/C++":9,"Assembler":1},"adv_counts":{}}},"version":"0.10.0"}"#;
+        assert_eq!(
+            super::stats_line(json).expect("parses"),
+            "50 compile requests, 35 hits, 10 misses, hit rate 77.8%"
+        );
+        // a no-compile run: empty counts, no rate
+        let idle = r#"{"stats":{"compile_requests":0,"cache_hits":{"counts":{}},"cache_misses":{"counts":{}}}}"#;
+        assert_eq!(
+            super::stats_line(idle).expect("parses"),
+            "0 compile requests, 0 hits, 0 misses, hit rate -"
+        );
+        assert!(super::stats_line("{}").is_err());
     }
 
     /// sccache leaves its socket file behind; a dropped cache's file must go with it.
