@@ -34,6 +34,10 @@ fn engine_name(arch: &str) -> String {
 const CPU_LOOP: &str = "linux-user/aarch64/cpu_loop.c";
 const UACCESS: &str = "linux-user/uaccess.c";
 const QEMU_H: &str = "linux-user/qemu.h";
+/// linux-user's `main`, whose `parse_args` patch 0003 stops reading `QEMU_*` variables.
+const MAIN_C: &str = "linux-user/main.c";
+/// The QEMU option variables the boot gate sets; the engine must ignore them (spike.rs gate (z) checks they are set). `QEMU_CPU=help` read by QEMU lists the models and exits before BOOT.
+const QEMU_ENV_PROBE: [(&str, &str); 2] = [("QEMU_CPU", "help"), ("QEMU_STRACE", "1")];
 const PACKAGE: &str = "atl-qemu-engine";
 const GATES: [char; 23] = [
     'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 's', 't', 'u',
@@ -83,6 +87,12 @@ struct Swap {
 /// P1 removed: the pin's `cpu_loop.c`.
 const NO_P1: Swap = Swap {
     file: CPU_LOOP,
+    beside: &[],
+    whole_range: false,
+};
+/// QEMU's option variables read again: the pin's `main.c` (patch 0003 removed; `QEMU_CPU=help` then ends the engine before BOOT).
+const ENV_OPTIONS: Swap = Swap {
+    file: MAIN_C,
     beside: &[],
     whole_range: false,
 };
@@ -522,8 +532,24 @@ fn link_with(
     Ok(so.to_owned())
 }
 
-/// The library with `swap.file` compiled from the pin in place of the build's copy, by the build's own command for that file. The pin's `swap.beside` files go into the same directory.
+/// The library with `swap.file` compiled from the pin in place of the build's copy ([`swap_object`]).
 fn unpatched(root: &Path, b: &Build, dir: &Path, name: &str, swap: Swap) -> Result<PathBuf> {
+    let (output, obj) = swap_object(root, b, dir, name, swap)?;
+    link(
+        b,
+        &dir.join(format!("libqemu-spike-{name}.so")),
+        Some((&output, &obj)),
+    )
+}
+
+/// `swap.file` compiled from the pin by the build's own command for that file: (the build's object it replaces, the new object). The pin's `swap.beside` files go into the same directory.
+fn swap_object(
+    root: &Path,
+    b: &Build,
+    dir: &Path,
+    name: &str,
+    swap: Swap,
+) -> Result<(String, PathBuf)> {
     let pin = sources::load(root)?
         .git
         .get(qemu::UPSTREAM)
@@ -572,11 +598,7 @@ fn unpatched(root: &Path, b: &Build, dir: &Path, name: &str, swap: Swap) -> Resu
         "{name} swap failed to compile, log {}",
         log.display()
     );
-    link(
-        b,
-        &dir.join(format!("libqemu-spike-{name}.so")),
-        Some((output, &obj)),
-    )
+    Ok((output.to_owned(), obj))
 }
 
 fn basename(path: &str) -> Result<&str> {
@@ -700,7 +722,7 @@ fn sigchain(root: &Path, dir: &Path) -> Result<PathBuf> {
 }
 
 /// The engine `.so` (QEMU bridge plan Q5-1a): atl-qemu-engine's `engine-so` build (the C ABI, as a staticlib) linked with the PIC build's objects into `libatl_engine_<arch>.so`, the version script keeping `atl_engine` and the TLS exports.
-/// Gates: the defined dynamic symbols are exactly those names; `sigaction` and `sigprocmask` are undefined references ([`sigaction_gate`]); the C ABI boots the Q4-4 boot executable, its AT_ENTRY equals llvm-readelf's e_entry, and BOOT maps and attaches (D9). Breaks: a TLS export dropped (exports gate red); the table at major + 1 (the host refuses it: boot gate red); the boot env published after BOOT, or create returning before BOOT (boot gate red); the boot executable without its BOOT svc (`qemu::SKIP_BOOT`: boot gate red, its error printed).
+/// Gates: the defined dynamic symbols are exactly those names; `sigaction` and `sigprocmask` are undefined references ([`sigaction_gate`]); the C ABI boots the Q4-4 boot executable, its AT_ENTRY equals llvm-readelf's e_entry, and BOOT maps and attaches (D9); the guest's hwcaps are the device CPU profile with [`QEMU_ENV_PROBE`] set (spike gate (z)). Breaks: a TLS export dropped (exports gate red); the table at major + 1 (the host refuses it: boot gate red); the boot env published after BOOT, or create returning before BOOT (boot gate red); no `-cpu` (`cpu-max`: (z) red); the pin's `main.c` linked in ([`ENV_OPTIONS`]: QEMU reads `QEMU_CPU=help` and exits before BOOT, boot gate red); the boot executable without its BOOT svc (`qemu::SKIP_BOOT`: boot gate red, its error printed).
 fn engine_so(
     root: &Path,
     b: &Build,
@@ -763,6 +785,29 @@ fn engine_so(
         fails.push(Failure::step(
             "engine-so break boot-late",
             "the boot gate is green with the boot env published after BOOT's callback".to_owned(),
+        ));
+    }
+    let cpu_max = engine_staticlib(root, b, &out, "cpu-max", Some("cpu-max"))?;
+    let cpu_max = engine_link(b, &cpu_max, &out, "cpu-max.so", engine_abi::TLS_EXPORTS)?;
+    if boot_gate(root, b, &out, "cpu-max", &cpu_max, &boot, entry).is_ok() {
+        fails.push(Failure::step(
+            "engine-so break cpu-max",
+            "the boot gate is green with QEMU's default CPU".to_owned(),
+        ));
+    }
+    let (main_o, env_obj) = swap_object(root, b, &out, "env-options", ENV_OPTIONS)?;
+    let env_so = engine_link_swapped(
+        b,
+        &staticlib,
+        &out,
+        "env-options.so",
+        engine_abi::TLS_EXPORTS,
+        Some((&main_o, &env_obj)),
+    )?;
+    if boot_gate(root, b, &out, "env-options", &env_so, &boot, entry).is_ok() {
+        fails.push(Failure::step(
+            "engine-so break env-options",
+            "the boot gate is green with QEMU reading its QEMU_* variables".to_owned(),
         ));
     }
     let nojoin = engine_staticlib(root, b, &out, "no-boot-join", Some("no-boot-join"))?;
@@ -877,6 +922,18 @@ fn engine_link(
     name: &str,
     exports: &[&str],
 ) -> Result<PathBuf> {
+    engine_link_swapped(b, staticlib, out, name, exports, None)
+}
+
+/// [`engine_link`] with `replace` = (the build's object, its stand-in), as [`link`].
+fn engine_link_swapped(
+    b: &Build,
+    staticlib: &Path,
+    out: &Path,
+    name: &str,
+    exports: &[&str],
+    replace: Option<(&str, &Path)>,
+) -> Result<PathBuf> {
     let map = out.join(format!("{name}.map"));
     std::fs::write(&map, engine_abi::version_script(exports))
         .with_context(|| format!("writing {}", map.display()))?;
@@ -888,7 +945,7 @@ fn engine_link(
     ];
     // the Rust standard library's native dependencies (`rustc --print native-static-libs` on linux-gnu)
     extra.extend(["-lgcc_s", "-lutil", "-lrt", "-lpthread", "-lm", "-ldl"].map(str::to_owned));
-    link_with(b, &out.join(name), None, &extra)
+    link_with(b, &out.join(name), replace, &extra)
 }
 
 /// The nm gate: the library's defined dynamic symbols are exactly `expected`.
@@ -975,6 +1032,7 @@ fn boot_gate(
         .env("ATL_ENGINE_SO", so)
         .env("ATL_ENGINE_BOOT", boot)
         .env("ATL_ENGINE_ENTRY", format!("{entry:#x}"))
+        .envs(QEMU_ENV_PROBE)
         .current_dir(root)
         .output()
         .context("running cargo test --test spike --engine-so")?;
@@ -984,6 +1042,7 @@ fn boot_gate(
     ensure!(
         o.status.success()
             && text.lines().any(|l| l == "spike: (q) ok")
+            && text.lines().any(|l| l == "spike: (z) ok")
             && text.lines().any(|l| l == "spike: (r) ok"),
         "engine boot gate ({tag}) not ok ({}), log {}",
         o.status,

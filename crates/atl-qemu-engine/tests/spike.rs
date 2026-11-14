@@ -1580,6 +1580,7 @@ fn main() {
 /// Env (xtask qemu_spike.rs sets it): `ATL_ENGINE_SO` the library, `ATL_ENGINE_BOOT` the static boot executable, `ATL_ENGINE_ENTRY` the expected entry in hex.
 /// BOOT also probes D9: `map` of a host page and `attach` from a host thread both succeed inside the BOOT trap.
 /// Gate (r), after (q) in the same process: `attach` then `detach` of a CPU on a thread of its own.
+/// Gate (z), from the same BOOT auxv: AT_HWCAP / AT_HWCAP2 equal the device profile the engine selects (engine.rs `GUEST_CPU`). xtask also sets `QEMU_CPU=help` (QEMU would list its models and exit before BOOT) and `QEMU_STRACE=1` in this process: the engine must not read them (QEMU patch 0003); (z) fails if they are not set, so the probe is armed.
 #[cfg(feature = "qemu")]
 mod engine_so {
     use std::ffi::{CStr, CString, c_void};
@@ -1682,16 +1683,16 @@ mod engine_so {
         }
     }
 
-    /// AT_ENTRY from the auxv at `auxv` (identity addresses: the host address is the guest's).
-    fn at_entry(auxv: u64) -> Result<u64, String> {
+    /// The entry `key` of the auxv at `auxv` (identity addresses: the host address is the guest's).
+    fn at(auxv: u64, key: u64) -> Result<u64, String> {
         let mut p = auxv as *const u64;
         loop {
             // SAFETY: auxv is QEMU's (type, value) array for the boot executable, ended by AT_NULL; its stack stays mapped (the boot thread is parked in BOOT).
             let (t, v) = unsafe { (*p, *p.add(1)) };
             if t == libc::AT_NULL as u64 {
-                return Err("auxv has no AT_ENTRY".to_owned());
+                return Err(format!("auxv has no entry {key}"));
             }
-            if t == libc::AT_ENTRY as u64 {
+            if t == key {
                 return Ok(v);
             }
             // SAFETY: as above; the next pair is inside the array, which AT_NULL ends.
@@ -1699,7 +1700,37 @@ mod engine_so {
         }
     }
 
-    fn run() -> Result<(&'static AtlEngine, *mut AtlEngineHandle), String> {
+    /// Reference phone (hwcap-diff evidence S7, `LD_SHOW_AUXV`): AT_HWCAP 0xefbfffff, AT_HWCAP2 0x1ae181. The cortex-a710 profile differs by exactly (S8): HWCAP - EVTSTRM; HWCAP2 - DGH - ECV - AFP + MTE. Bits: arm64 uapi asm/hwcap.h.
+    const PHONE_HWCAP: u64 = 0xefbf_ffff;
+    const PHONE_HWCAP2: u64 = 0x1a_e181;
+    const HWCAP_EVTSTRM: u64 = 1 << 2;
+    const HWCAP2_DGH: u64 = 1 << 15;
+    const HWCAP2_MTE: u64 = 1 << 18;
+    const HWCAP2_ECV: u64 = 1 << 19;
+    const HWCAP2_AFP: u64 = 1 << 20;
+    const WANT_HWCAP: u64 = PHONE_HWCAP & !HWCAP_EVTSTRM;
+    const WANT_HWCAP2: u64 = (PHONE_HWCAP2 & !(HWCAP2_DGH | HWCAP2_ECV | HWCAP2_AFP)) | HWCAP2_MTE;
+    /// QEMU option variables xtask sets for (z); patch 0003 keeps QEMU from reading them.
+    const QEMU_VARS: [&str; 2] = ["QEMU_CPU", "QEMU_STRACE"];
+
+    /// Gate (z): the guest's hwcaps are the device profile, and the probe's QEMU_* variables were set.
+    fn cpu_profile(auxv: u64) -> Result<(), String> {
+        for v in QEMU_VARS {
+            if std::env::var_os(v).is_none() {
+                return Err(format!("{v} unset: the env probe is not armed"));
+            }
+        }
+        let hwcap = at(auxv, libc::AT_HWCAP)?;
+        let hwcap2 = at(auxv, libc::AT_HWCAP2)?;
+        if (hwcap, hwcap2) != (WANT_HWCAP, WANT_HWCAP2) {
+            return Err(format!(
+                "AT_HWCAP {hwcap:#x} AT_HWCAP2 {hwcap2:#x} != device profile {WANT_HWCAP:#x} {WANT_HWCAP2:#x}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn run() -> Result<(&'static AtlEngine, *mut AtlEngineHandle, u64), String> {
         let so = CString::new(env("ATL_ENGINE_SO")?).map_err(|e| e.to_string())?;
         let boot = CString::new(env("ATL_ENGINE_BOOT")?).map_err(|e| e.to_string())?;
         let want = u64::from_str_radix(env("ATL_ENGINE_ENTRY")?.trim_start_matches("0x"), 16)
@@ -1744,13 +1775,13 @@ mod engine_so {
             Some(Err(e)) => return Err(e.clone()),
             None => return Err("the BOOT probe did not run".to_owned()),
         }
-        let entry = at_entry(auxv)?;
+        let entry = at(auxv, libc::AT_ENTRY)?;
         if entry != want {
             return Err(format!(
                 "AT_ENTRY {entry:#x} != llvm-readelf e_entry {want:#x}"
             ));
         }
-        Ok((table, probe.engine.load(Ordering::SeqCst)))
+        Ok((table, probe.engine.load(Ordering::SeqCst), auxv))
     }
 
     /// Gate (r): `attach_ex` then `detach` on a thread of its own, the thread that attached (the ABI's rule), with no guest call between. The copied CPU has not run its queued work, so detach must enter it in `plugin.cpu_ht` itself: without that, plugins/core.c:293 aborts.
@@ -1779,8 +1810,15 @@ mod engine_so {
 
     pub(super) fn main() {
         match run() {
-            Ok((table, engine)) => {
+            Ok((table, engine, auxv)) => {
                 println!("spike: (q) ok");
+                match cpu_profile(auxv) {
+                    Ok(()) => println!("spike: (z) ok"),
+                    Err(e) => {
+                        println!("spike: FAIL (z) {e}");
+                        std::process::exit(1);
+                    }
+                }
                 match detach_probe(table, engine) {
                     Ok(()) => println!("spike: (r) ok"),
                     Err(e) => {

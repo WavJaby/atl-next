@@ -291,10 +291,25 @@ pub fn start(library: &Path, argv: &[&str], on_trap: OnTrap) -> Result<Booted, S
     boot_on_helper(move || run_spike(&path, &args, on_trap))
 }
 
-/// The engine `.so`'s start (C ABI `create`): QEMU is linked into this object, so the helper runs its `main` on this object's own symbols. The command line is the engine's: `-B 0` is identity addresses (guest = host, the ABI's `map`), and the host names only `boot_exe`.
+/// The guest CPU QEMU emulates (`-cpu`): what an app reads from HWCAP, /proc/cpuinfo and `mrs` follows the reference device class (behaviour decision 1), today's Android arm64 phone = ARMv9.2 Cortex-A720/X4 with SVE not exposed.
+/// This QEMU has no A720/X model; cortex-a710 is the closest (vs the phone: + mte, - afp dgh ecv evtstrm), `sve=off` as the phone. QEMU's default `max` adds SVE/SME/MOPS/GCS/FP8 and more no phone exposes.
+/// `midr` = QEMU's own `max` value (implementer 0 "software", part 'Q'): no claim to be Arm silicon an app might key errata or tuning on.
+/// Tied to the pinned QEMU: a bump that adds a closer model, or a property this string names going away, changes it (gate (z) of tests/spike.rs pins the result).
+#[cfg(all(feature = "engine-so", not(atl_qe_cpu_max)))]
+const GUEST_CPU: &[&str] = &["-cpu", "cortex-a710,sve=off,midr=0x000f0510"];
+// break cpu-max (gate z): no `-cpu`, QEMU's default `max`
+#[cfg(all(feature = "engine-so", atl_qe_cpu_max))]
+const GUEST_CPU: &[&str] = &[];
+
+/// The engine `.so`'s start (C ABI `create`): QEMU is linked into this object, so the helper runs its `main` on this object's own symbols. The command line is the engine's: `-B 0` is identity addresses (guest = host, the ABI's `map`), [`GUEST_CPU`], and the host names only `boot_exe`. QEMU's `QEMU_*` option variables are not read (QEMU patch 0003): argv is the whole configuration.
 #[cfg(feature = "engine-so")]
 pub(crate) fn start_linked(boot_exe: &str, on_trap: OnTrap) -> Result<Booted, String> {
-    let args = c_args(&["qemu-aarch64", "-B", "0", boot_exe])?;
+    let argv: Vec<&str> = ["qemu-aarch64", "-B", "0"]
+        .into_iter()
+        .chain(GUEST_CPU.iter().copied())
+        .chain([boot_exe])
+        .collect();
+    let args = c_args(&argv)?;
     boot_on_helper(move || run_main(self_handle()?, &args, on_trap))
 }
 

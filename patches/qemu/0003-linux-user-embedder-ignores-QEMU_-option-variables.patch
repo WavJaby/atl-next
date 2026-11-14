@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Sun, 15 Nov 2026 02:47:20 +0800
+Subject: [PATCH] linux-user: embedder ignores QEMU_* option variables
+
+Embedded in a host application, linux-user's main runs in that
+application's process, so getenv() reads the application's
+environment: a QEMU_CPU, QEMU_STRACE, QEMU_LD_PREFIX or
+QEMU_GUEST_BASE meant for anything else reconfigures the emulator
+under the embedder's argv. The embedder's argv is the whole
+configuration: parse_args no longer reads the arg_table variables.
+Removing them from the environment instead would race other host
+threads' getenv().
+
+Upstream-Status: Inappropriate [embedding is ATL-only]
+Patch-Reason: in-process QEMU shares the host process environment; argv alone must configure it
+---
+SPDX-License-Identifier: GPL-2.0-or-later
+ linux-user/main.c | 15 +++++----------
+ 1 file changed, 5 insertions(+), 10 deletions(-)
+
+diff --git a/linux-user/main.c b/linux-user/main.c
+index 60a695b7ca3e9f79406436219fb0ad7896ad6b6d..5c22ad999afc555979c5abff48c4c447f20aee8c 100644
+--- a/linux-user/main.c
++++ b/linux-user/main.c
+@@ -615,16 +615,11 @@ static int parse_args(int argc, char **argv)
+     int optind;
+     const struct qemu_argument *arginfo;
+ 
+-    for (arginfo = arg_table; arginfo->handle_opt != NULL; arginfo++) {
+-        if (arginfo->env == NULL) {
+-            continue;
+-        }
+-
+-        r = getenv(arginfo->env);
+-        if (r != NULL) {
+-            arginfo->handle_opt(r);
+-        }
+-    }
++    /*
++     * Embedded: the embedder's argv is the whole configuration. The
++     * QEMU_* option variables live in the host process's environment,
++     * which belongs to the embedding application, not to QEMU.
++     */
+ 
+     optind = 1;
+     for (;;) {

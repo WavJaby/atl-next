@@ -101,6 +101,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("abi-major-next", "atl_qe_abi_major_next"),
     // gate (q, D9): the boot env is published after BOOT's callback, so map and attach inside BOOT fail
     ("boot-late", "atl_qe_boot_late"),
+    // gate (z): the engine passes no `-cpu`, so the guest gets QEMU's `max` and its HWCAP differs from the device profile
+    ("cpu-max", "atl_qe_cpu_max"),
     // gate (q, D9): the creator returns before BOOT (no wait on the boot helper)
     ("no-boot-join", "atl_qe_no_boot_join"),
     // gate (r): attach skips the copy's queued work (its plugin init hook), so detach's exit hook asserts (plugins/core.c:293)
