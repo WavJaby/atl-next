@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! The source state a native out dir was built from, so a runtime gate refuses artifacts from another tree (a rebase without `xtask native` once cost a whole round).
 //!
-//! The state is the checkout's working tree as git sees it (tracked + untracked, ignored excluded), hashed through a scratch index: `git add -A` into a copy of the index,
-//! `git write-tree`. The top-level entries listed in [`GATE_SIDE`] are left out of the hash. `native` deletes the record when it starts and writes it once ninja and the converter
+//! The state is the checkout's tracked files as they are on disk, hashed through a scratch index: `git add -u` into a copy of the index, `git write-tree`.
+//! Tracked only: `add -A` stored every untracked, unignored file (stray build outputs included) as a blob in `.git`; a new source file counts once it is `git add`ed. The top-level entries listed in [`GATE_SIDE`] are left out of the hash. `native` deletes the record when it starts and writes it once ninja and the converter
 //! packages succeeded (the state taken before the build, so an edit during the build reads as a mismatch); a gate compares it with the checkout's state now.
 //! The record also lists the goals built from that state (line 1 state, then one goal per line, nb goals as `nb:<arch>:<module>`): a run from the same state adds its goals to the
 //! previous record's, a run from another state starts over, since the older goals' outputs are stale. A gate refuses a slot lacking its goals (gate_goals.rs).
@@ -57,7 +57,7 @@ pub fn of_checkout(root: &Path) -> Result<String> {
         std::fs::copy(&index, &scratch).context("copying the git index")?;
     }
     let result = (|| {
-        git(root, &["add", "-A"], Some(&scratch))?;
+        git(root, &["add", "-u"], Some(&scratch))?;
         let tree = git(root, &["write-tree"], Some(&scratch))?;
         let listing = git(root, &["ls-tree", &tree], None)?;
         let mut kept = Vec::new();
@@ -262,7 +262,23 @@ mod tests {
         std::fs::write(d.join("crates/a.rs"), "a").unwrap();
         std::fs::write(d.join("xtask/g.rs"), "g").unwrap();
         std::fs::write(d.join("test-apks.toml"), "[fossify-notes]\n").unwrap();
+        std::fs::write(d.join(MANIFEST), "[workspace]\n").unwrap();
         git(&d, &["init", "-q"], None).unwrap();
+        git(&d, &["add", "-A"], None).unwrap();
+        git(
+            &d,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "base",
+            ],
+            None,
+        )
+        .unwrap();
         d
     }
 
@@ -301,16 +317,24 @@ mod tests {
         ensure_current(&d, &out).expect("gate side is not native input");
         std::fs::write(d.join("test-apks.toml"), "[fossify-notes]\nsize = 1\n").unwrap();
         ensure_current(&d, &out).expect("test APK table is not native input");
+        // an untracked file (a stray build output) neither counts nor lands in .git as a blob
+        std::fs::write(d.join("crates/stray.so"), "build output").unwrap();
+        ensure_current(&d, &out).expect("untracked files are not source state");
+        let stray = git_stdin(&d, &["hash-object", "--stdin"], "build output").unwrap();
+        assert!(
+            git(&d, &["cat-file", "-e", &stray], None).is_err(),
+            "untracked file stored in .git"
+        );
         std::fs::write(d.join("crates/a.rs"), "edited").unwrap();
         let e = ensure_current(&d, &out).expect_err("source edited");
         assert!(
             format!("{e}").contains("built from another source state"),
             "{e}"
         );
-        let status = git(&d, &["status", "--porcelain"], None).unwrap();
+        let staged = git(&d, &["diff", "--cached", "--name-only"], None).unwrap();
         assert!(
-            status.lines().all(|l| l.starts_with("??")),
-            "the real index stays empty: {status}"
+            staged.is_empty(),
+            "the real index stays untouched: {staged}"
         );
         forget(&out, "").unwrap();
         assert!(
