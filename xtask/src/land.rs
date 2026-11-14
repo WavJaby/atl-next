@@ -43,6 +43,9 @@ pub struct Args {
     /// Internal: the inputs child (`inputs_child`) in the worktree or the main checkout; prints what that checkout's check reads (`check_inputs`), read-only.
     #[arg(long, hide = true, conflicts_with_all = ["execute", "cleanup", "facts"])]
     inputs: bool,
+    /// Internal: the slot child in the worktree (`slot_child`); prints whether the worktree's slot is current for every gate's goals, read-only.
+    #[arg(long, hide = true, conflicts_with_all = ["execute", "cleanup", "facts", "inputs"])]
+    slot: bool,
 }
 
 /// What the branch's own tables say, as the branch's xtask reads them (`branch_facts`).
@@ -77,8 +80,10 @@ struct Runner<'a> {
     cleanup: &'a dyn Fn(&Path, &str) -> Result<String>,
     /// `(checkout, branch)` -> what that checkout's check reads, by its own xtask (`inputs_child`).
     inputs: &'a dyn Fn(&Path, &str) -> Result<Inputs>,
-    /// `(main checkout, host)` -> `xtask native --for all-gates` there, by its own xtask (`native_execute`): verify-main's slot rebuild.
+    /// `(checkout, host)` -> `xtask native --for all-gates` there, by its own xtask (`native_execute`): Build's worktree slot, verify-main's main slot.
     native: &'a dyn Fn(&Path, &str) -> Result<String>,
+    /// `(worktree, branch)` -> None when the worktree's slot is current for every gate's goals, else why not; by the branch's xtask (`slot_child`).
+    stale: &'a dyn Fn(&Path, &str) -> Result<Option<String>>,
 }
 
 /// One step of a landing, in run order.
@@ -86,6 +91,8 @@ struct Runner<'a> {
 enum Stage {
     /// A task copy for an upstream whose patches/ or pin differ from origin/main's.
     Edit(String),
+    /// The worktree's slot brought to the rebased tree: `xtask native --for all-gates` there unless already current (`Plan::build`). Verify's check refuses a stale slot by name.
+    Build,
     /// `cargo xtask check` in the branch's worktree.
     Verify,
     Push,
@@ -101,6 +108,7 @@ impl Stage {
     fn name(&self) -> &'static str {
         match self {
             Stage::Edit(_) => "edit",
+            Stage::Build => "build",
             Stage::Verify => "verify",
             Stage::Push => "push",
             Stage::Sync => "sync",
@@ -150,6 +158,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
         return Ok(ExitCode::SUCCESS);
     }
+    if args.slot {
+        match slot_staleness(root)? {
+            None => println!("{SLOT_CURRENT}"),
+            Some(why) => println!("{SLOT_STALE}{why}"),
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     let started = Instant::now();
     let plan = Plan::new(root, &args.branch, args.execute, &facts_child)?;
     let stages = plan.stages();
@@ -172,6 +187,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         cleanup: &cleanup_execute,
         inputs: &inputs_child,
         native: &native_execute,
+        stale: &slot_child,
     };
     let line = plan.execute(&stages, &runner);
     println!("{line}");
@@ -270,7 +286,8 @@ impl Plan {
     /// The stages in run order; the push is absent when origin/main already is the branch.
     fn stages(&self) -> Vec<Stage> {
         let mut stages: Vec<Stage> = self.edits.iter().cloned().map(Stage::Edit).collect();
-        stages.push(Stage::Verify);
+        // after the edits: a new task copy changes what native builds (build_state::of_build)
+        stages.extend([Stage::Build, Stage::Verify]);
         if self.head != self.origin {
             stages.push(Stage::Push);
         }
@@ -293,8 +310,13 @@ impl Plan {
                 "edit {up}: task copy src-wt/{branch}/{up} on atl-patches-{branch} (its patches/ or pin differ from {})",
                 fetch::MAIN_REF
             ),
+            Stage::Build => format!(
+                "build in {wt}: `cargo xtask native --host {} --for {}` unless its slot is current for the rebased tree",
+                self.host,
+                crate::gate_goals::ALL
+            ),
             Stage::Verify => format!(
-                "verify in {wt}: `cargo xtask check` must print `check: ok` (the task copies hold the branch's patches)"
+                "verify in {wt}:`cargo xtask check` must print `check: ok` (the task copies hold the branch's patches)"
             ),
             Stage::Push => format!(
                 "push: {} {} -> {} (git push origin refs/heads/{branch}:refs/heads/main)",
@@ -379,6 +401,7 @@ impl Plan {
     ) -> Result<String> {
         match stage {
             Stage::Edit(up) => (runner.edit)(&self.wt, up),
+            Stage::Build => self.build(runner),
             Stage::Verify => {
                 let line = (runner.check)(self.wt.as_path()).with_context(|| {
                     format!("nothing pushed: check in {} failed", self.wt.display())
@@ -406,6 +429,20 @@ impl Plan {
             Stage::Cleanup => (runner.cleanup)(&self.repo, &self.branch)
                 .context("pushed and checked, but cleanup failed: finish it by hand"),
         }
+    }
+
+    /// The worktree's slot as Verify needs it: built from the tree as it is now (after the rebase and the edits) with every gate's goals.
+    /// Current -> nothing runs (a land whose child round already built this tree). Stale, or the question unanswerable -> native first: it is the reference, a needless build costs time, a skipped one fails Verify.
+    fn build(&self, runner: &Runner) -> Result<String> {
+        let why = match (runner.stale)(&self.wt, &self.branch) {
+            Ok(None) => return Ok("slot current for the worktree, not rebuilt".to_owned()),
+            Ok(Some(why)) => why,
+            Err(e) => format!("slot state not read: {e:#}"),
+        };
+        println!("land: build: {why}: rebuilding the worktree's slot");
+        let note = (runner.native)(&self.wt, &self.host)
+            .with_context(|| format!("nothing pushed: native in {} failed", self.wt.display()))?;
+        Ok(format!("{note} ({why})"))
     }
 
     fn sync(&self, runner: &Runner) -> Result<String> {
@@ -601,7 +638,50 @@ fn parse_inputs(stdout: &str) -> Inputs {
         .collect()
 }
 
-/// `cargo xtask native --host <host> --for all-gates` in the main checkout, run by its own xtask: the slot verify-main's check reads, built from main as it is now.
+/// `--slot` output lines.
+const SLOT_CURRENT: &str = "land-slot: current";
+const SLOT_STALE: &str = "land-slot: stale ";
+
+/// None when the slot of the checkout at `root` was built from it as it is now with every gate's goals for the build machine's host, else why not (build_state::gate_out's refusal).
+fn slot_staleness(root: &Path) -> Result<Option<String>> {
+    let arches = crate::arches::load(root)?;
+    let host = crate::arches::build_machine(root, &arches)?.0;
+    Ok(
+        crate::build_state::gate_out(root, None, host, crate::gate_goals::ALL)
+            .err()
+            .map(|e| format!("{e:#}")),
+    )
+}
+
+/// `cargo xtask land <branch> --slot` in the worktree, run by the branch's xtask: the slot record and the goal tables are the branch's.
+fn slot_child(wt: &Path, branch: &str) -> Result<Option<String>> {
+    let mut cmd = crate::cargo_command();
+    cmd.args(["xtask", "land", branch, "--slot"])
+        .current_dir(wt);
+    let run = unit_use::run(&mut cmd, Units::Plain, Echo::Nothing)
+        .with_context(|| format!("running cargo xtask land --slot in {}", wt.display()))?;
+    ensure!(
+        run.status.success(),
+        "{}: {}",
+        run.status,
+        run.stderr.trim_end()
+    );
+    parse_slot(&run.stdout)
+}
+
+fn parse_slot(stdout: &str) -> Result<Option<String>> {
+    for line in stdout.lines() {
+        if line == SLOT_CURRENT {
+            return Ok(None);
+        }
+        if let Some(why) = line.strip_prefix(SLOT_STALE) {
+            return Ok(Some(why.to_owned()));
+        }
+    }
+    bail!("the slot child printed no slot line")
+}
+
+/// `cargo xtask native --host <host> --for all-gates` in `repo` (the worktree for Build, the main checkout for verify-main), run by its own xtask: the slot that checkout's check reads, built from it as it is now.
 fn native_execute(repo: &Path, host: &str) -> Result<String> {
     let mut cmd = crate::cargo_command();
     cmd.args([
@@ -869,9 +949,10 @@ mod tests {
                 cleanup: &cleanup_fn,
                 inputs: &same_inputs,
                 native: &no_native,
+                stale: &current,
             },
         );
-        assert_eq!(line, "land: ok (5 steps)");
+        assert_eq!(line, "land: ok (6 steps)");
         // the child's output is what the parent plans from
         assert_eq!(
             parse_facts(
@@ -890,8 +971,140 @@ mod tests {
         Ok(Inputs::from([(".".to_owned(), "t".to_owned())]))
     }
 
-    fn no_native(_: &Path, host: &str) -> Result<String> {
-        panic!("verify-main rebuilt main's slot for {host}")
+    fn no_native(d: &Path, host: &str) -> Result<String> {
+        panic!("native ran in {} for {host}", d.display())
+    }
+
+    /// The worktree's slot is current: Build runs nothing.
+    fn current(_: &Path, _: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// A slot built before the rebase, simulated: `stale` compares its record with the tree, `native` rebuilds it, `check` refuses it by name as check.rs ConverterPackages does (build_state::ensure_current).
+    struct Slot {
+        built: std::cell::RefCell<&'static str>,
+        calls: std::cell::RefCell<Vec<String>>,
+    }
+
+    const REBASED: &str = "rebased";
+    const STALE_MSG: &str = "was built from another source state";
+
+    impl Slot {
+        fn before_rebase() -> Self {
+            Slot {
+                built: std::cell::RefCell::new("pre-rebase"),
+                calls: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        fn run(&self, plan: &Plan, stages: &[Stage]) -> String {
+            let stale_fn = |d: &Path, _: &str| -> Result<Option<String>> {
+                self.calls
+                    .borrow_mut()
+                    .push(format!("stale? {}", d.display()));
+                let b = *self.built.borrow();
+                Ok((b != REBASED).then(|| format!("slot {STALE_MSG} ({b})")))
+            };
+            let native_fn = |d: &Path, host: &str| -> Result<String> {
+                self.calls
+                    .borrow_mut()
+                    .push(format!("native {host} {}", d.display()));
+                *self.built.borrow_mut() = REBASED;
+                Ok("built".to_owned())
+            };
+            let check_fn = |d: &Path| -> Result<String> {
+                self.calls
+                    .borrow_mut()
+                    .push(format!("check {}", d.display()));
+                let b = *self.built.borrow();
+                ensure!(b == REBASED, "check: FAILED: slot {STALE_MSG} ({b})");
+                Ok("check: ok (12 steps)".to_owned())
+            };
+            let fetch_fn = |_: &Path| -> Result<()> { Ok(()) };
+            let cleanup_fn = |_: &Path, _: &str| -> Result<String> { Ok("cleaned".to_owned()) };
+            plan.execute(
+                stages,
+                &Runner {
+                    edit: &no_edit,
+                    check: &check_fn,
+                    fetch: &fetch_fn,
+                    cleanup: &cleanup_fn,
+                    inputs: &same_inputs,
+                    native: &native_fn,
+                    stale: &stale_fn,
+                },
+            )
+        }
+    }
+
+    /// A slot built before the rebase: Build rebuilds the worktree's slot, then Verify passes on the first attempt; verify-main reuses Verify's verdict (equal inputs), so main's slot is not built.
+    #[test]
+    fn stale_slot_is_built_before_verify() {
+        let env = Env::new("stale");
+        let plan = Plan::new(&env.repo, "land", true, &in_process).unwrap();
+        let slot = Slot::before_rebase();
+        assert_eq!(slot.run(&plan, &plan.stages()), "land: ok (6 steps)");
+        let wt = env.wt.display();
+        assert_eq!(
+            *slot.calls.borrow(),
+            [
+                format!("stale? {wt}"),
+                format!("native {} {wt}", plan.host),
+                format!("check {wt}"),
+            ]
+        );
+    }
+
+    /// The break: without Build, the same stale slot fails Verify by name and nothing is pushed: the failure the retry path used to absorb.
+    #[test]
+    fn without_build_the_stale_slot_fails_verify() {
+        let env = Env::new("nobuild");
+        let before = env.origin_main();
+        let plan = Plan::new(&env.repo, "land", true, &in_process).unwrap();
+        let stages: Vec<Stage> = plan
+            .stages()
+            .into_iter()
+            .filter(|s| *s != Stage::Build)
+            .collect();
+        let line = Slot::before_rebase().run(&plan, &stages);
+        assert!(
+            line.starts_with("land: FAILED 1 of 5 steps: verify;") && line.contains(STALE_MSG),
+            "{line}"
+        );
+        assert_eq!(env.origin_main(), before);
+    }
+
+    /// A slot already built from the rebased tree: Build asks, runs no native, and the land goes through.
+    #[test]
+    fn current_slot_is_not_rebuilt() {
+        let env = Env::new("current");
+        let plan = Plan::new(&env.repo, "land", true, &in_process).unwrap();
+        let slot = Slot::before_rebase();
+        *slot.built.borrow_mut() = REBASED;
+        assert_eq!(slot.run(&plan, &plan.stages()), "land: ok (6 steps)");
+        let wt = env.wt.display();
+        assert_eq!(
+            *slot.calls.borrow(),
+            [format!("stale? {wt}"), format!("check {wt}")]
+        );
+        assert_eq!(parse_slot("x\nland-slot: current\n").unwrap(), None);
+        assert_eq!(
+            parse_slot("land-slot: stale no record\n")
+                .unwrap()
+                .as_deref(),
+            Some("no record")
+        );
+        assert!(parse_slot("noise\n").is_err());
+    }
+
+    /// The real question on a worktree whose slot never finished a native run: stale, naming the missing record.
+    #[test]
+    fn a_slot_without_a_record_is_stale() {
+        let env = Env::new("norecord");
+        let why = slot_staleness(&env.wt)
+            .unwrap()
+            .expect("no record must be stale");
+        assert!(why.contains("no record"), "{why}");
     }
 
     /// Main's inputs equal the worktree's: verify-main records Verify's verdict, no rebuild, no second check. Inputs read by this code in-process, as both children would.
@@ -916,9 +1129,10 @@ mod tests {
                 cleanup: &cleanup_fn,
                 inputs: &inputs_fn,
                 native: &no_native,
+                stale: &current,
             },
         );
-        assert_eq!(line, "land: ok (5 steps)");
+        assert_eq!(line, "land: ok (6 steps)");
         assert_eq!(
             *checked.borrow(),
             std::slice::from_ref(&env.wt),
@@ -960,9 +1174,10 @@ mod tests {
                 cleanup: &cleanup_fn,
                 inputs: &inputs_fn,
                 native: &native_fn,
+                stale: &current,
             },
         );
-        assert_eq!(line, "land: ok (5 steps)");
+        assert_eq!(line, "land: ok (6 steps)");
         assert_eq!(
             *calls.borrow(),
             [
@@ -1099,14 +1314,17 @@ mod tests {
         let plan = Plan::new(&env.repo, "land", false, &in_process).unwrap();
         let stages = plan.stages();
         let names: Vec<&str> = stages.iter().map(Stage::name).collect();
-        assert_eq!(names, ["verify", "push", "sync", "verify-main", "cleanup"]);
+        assert_eq!(
+            names,
+            ["build", "verify", "push", "sync", "verify-main", "cleanup"]
+        );
         let lines = plan.describe(&stages);
         assert!(
-            lines[1].contains("refs/heads/land:refs/heads/main"),
+            lines[2].contains("refs/heads/land:refs/heads/main"),
             "{}",
-            lines[1]
+            lines[2]
         );
-        assert!(lines[4].contains("branch land"), "{}", lines[4]);
+        assert!(lines[5].contains("branch land"), "{}", lines[5]);
         assert_eq!(env.origin_main(), before);
         assert!(env.wt.is_dir());
     }
@@ -1150,11 +1368,12 @@ mod tests {
                 cleanup: &cleanup_fn,
                 inputs: &inputs_fn,
                 native: &no_native,
+                stale: &current,
             },
         );
         assert!(
             line.starts_with(
-                "land: FAILED 1 of 5 steps: verify; first error (verify): \"nothing pushed"
+                "land: FAILED 1 of 6 steps: verify; first error (verify): \"nothing pushed"
             ),
             "{line}"
         );
@@ -1187,9 +1406,10 @@ mod tests {
                 cleanup: &cleanup_fn,
                 inputs: &same_inputs,
                 native: &no_native,
+                stale: &current,
             },
         );
-        assert_eq!(line, "land: ok (5 steps)");
+        assert_eq!(line, "land: ok (6 steps)");
         assert_eq!(*children.borrow(), [(env.repo.clone(), "land".to_owned())]);
         assert_eq!(env.origin_main(), head);
         assert_eq!(git(Some(&env.repo), &["rev-parse", "HEAD"]).unwrap(), head);

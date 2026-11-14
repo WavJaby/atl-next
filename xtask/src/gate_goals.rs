@@ -386,7 +386,8 @@ pub fn ensure_built(
     host_arch: &str,
     built: &BTreeSet<String>,
 ) -> Result<()> {
-    let missing: Vec<String> = of(root, name)?
+    // union, not `of`: it also takes `all-gates` (land's build stage)
+    let missing: Vec<String> = union(root, &[name.to_owned()])?
         .recorded(host_arch)
         .into_iter()
         .filter(|g| !built.contains(g))
