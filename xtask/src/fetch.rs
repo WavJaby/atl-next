@@ -133,7 +133,7 @@ pub struct Args {
         conflicts_with_all = ["play", "execute"]
     )]
     store_token: bool,
-    /// Delete and clone again the checkouts of these pinned AOSP projects (tree paths) whose keep-set differs from sources.toml [aosp.sparse]: a keep-set is fixed at creation. Only a checkout at its pin with no uncommitted changes; the remote must still resolve the pin. Dry run unless --execute.
+    /// Delete and clone again the checkouts of these pinned AOSP projects (tree paths) whose keep-set differs from sources.toml [aosp.sparse] in a way fetch cannot apply in place (a shrink, sparse <-> full; adding dirs at the pin needs no flag). Only a checkout at its pin with no uncommitted changes; the remote must still resolve the pin. Dry run unless --execute.
     #[arg(long, value_name = "PATH", num_args = 1.., conflicts_with_all = ["bump", "add", "migrate_git_dirs", "test_apks"])]
     recreate: Vec<String>,
     /// Also fetch the sources.toml [aosp.needed_by] projects of these gates (`native --for` names, `all-gates`); with --execute, adds them to `<workspace>/workspace.toml` [fetch] for, which keeps them requested. Without either, fetch checks out core only.
@@ -525,7 +525,9 @@ fn sync(ctx: &Ctx, c: &Checkout) -> Result<Row> {
     let local = inspect(dir)?;
     let mut action = decide(&local, &c.commit, u.branch());
     if let Some(why) = keep_mismatch(&local, &c.sparse) {
-        action = if recreates(ctx, c, &local) {
+        action = if let Some(dirs) = keep_growth(&local, &c.sparse, &c.commit) {
+            Action::Grow(dirs)
+        } else if recreates(ctx, c, &local) {
             Action::Recreate(why)
         } else {
             Action::Blocked(why)
@@ -667,6 +669,8 @@ enum Action {
     LeaveBranch(String),
     /// Keep-set differs and `--recreate` names the project: delete the checkout, clone it again (the why).
     Recreate(String),
+    /// The table only adds cone dirs to a clean checkout at its pin: `git sparse-checkout add` them in place (these dirs); existing files untouched, the new dirs' blobs fetched from the promisor remote.
+    Grow(Vec<String>),
     Blocked(String),
 }
 
@@ -681,6 +685,9 @@ impl Action {
             Action::PatchBranch => "on its patch branch".into(),
             Action::LeaveBranch(b) => format!("on branch {b}, left alone"),
             Action::Recreate(why) => format!("{why} -> delete, clone again"),
+            Action::Grow(dirs) => {
+                format!("keep-set grows by {} -> added in place", dirs.join(", "))
+            }
             Action::Blocked(why) => format!("blocked: {why}"),
         }
     }
@@ -752,7 +759,7 @@ fn inspect(dir: &Path) -> Result<Local> {
     })
 }
 
-/// A present checkout's keep-set must equal sources.toml's: cone patterns are fixed when the checkout is created, and a table change that the tree ignores would leave both disagreeing without a word.
+/// A present checkout's keep-set must equal sources.toml's: a table change that the tree ignores would leave both disagreeing without a word. Growth at the pin is fixed in place ([`keep_growth`]); a shrink, a sparse <-> full change or a checkout off its pin is not.
 fn keep_mismatch(local: &Local, want: &[String]) -> Option<String> {
     let Local::Present { sparse, .. } = local else {
         return None;
@@ -769,11 +776,47 @@ fn keep_mismatch(local: &Local, want: &[String]) -> Option<String> {
     want.sort();
     (have != want).then(|| {
         format!(
-            "keep-set differs: checkout holds {}, sources.toml [aosp.sparse] wants {}; a keep-set is fixed at creation: delete the checkout at its pin and fetch again",
+            "keep-set differs: checkout holds {}, sources.toml [aosp.sparse] wants {}; only adding dirs at the pin is done in place: delete the checkout at its pin and fetch again",
             show(&have),
             show(&want)
         )
     })
+}
+
+/// The dirs to add when the table only grows a sparse checkout's keep-set and the checkout is clean at `pin`, else None. Growing a cone in place leaves every checked-out file alone (readers of the shared checkout unaffected);
+/// removing a dir would delete files under live readers, and leaving the pin is MoveToPin's business, so both keep the delete-and-clone rule.
+fn keep_growth(local: &Local, want: &[String], pin: &str) -> Option<Vec<String>> {
+    let Local::Present {
+        head,
+        dirty: false,
+        sparse,
+        ..
+    } = local
+    else {
+        return None;
+    };
+    if head != pin || sparse.is_empty() || !sparse.iter().all(|d| want.contains(d)) {
+        return None;
+    }
+    let mut add: Vec<String> = want
+        .iter()
+        .filter(|d| !sparse.contains(d))
+        .cloned()
+        .collect();
+    add.sort();
+    (!add.is_empty()).then_some(add)
+}
+
+/// `git sparse-checkout add dirs` at `commit` in `dir`, each dir checked to exist there first (cone mode silently checks out nothing for a missing one).
+fn grow_checkout(dir: &Path, commit: &str, dirs: &[String]) -> Result<()> {
+    for d in dirs {
+        git(Some(dir), &["cat-file", "-e", &format!("{commit}:{d}")])
+            .with_context(|| format!("keep-set dir `{d}` is not in the tree at {commit}"))?;
+    }
+    let mut args = vec!["sparse-checkout", "add"];
+    args.extend(dirs.iter().map(String::as_str));
+    git(Some(dir), &args)?;
+    Ok(())
 }
 
 /// A keep-set mismatch that `--recreate` names and the checkout can lose: at its pin, nothing uncommitted.
@@ -818,6 +861,7 @@ fn apply(action: &Action, c: &Checkout, dir: &Path, git_dir: &Path) -> Result<()
             remove_checkout(dir, git_dir)?;
             apply(&Action::Clone, c, dir, git_dir)
         }
+        Action::Grow(dirs) => grow_checkout(dir, &c.commit, dirs),
         Action::MoveToPin => {
             verify_ref(c)?;
             fetch_pin(c, dir)?;
@@ -1050,6 +1094,119 @@ mod tests {
             other.contains("holds a,") && other.contains("wants a, b"),
             "{other}"
         );
+    }
+
+    /// Growth at the pin is in place; a shrink, a swap, a dirty or off-pin checkout and a full tree are not.
+    #[test]
+    fn keep_set_grows_only_by_adding_at_the_pin() {
+        let strs = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let at = |head: &str, dirty: bool, sparse: &[&str]| Local::Present {
+            head: head.into(),
+            branch: None,
+            dirty,
+            sparse: strs(sparse),
+        };
+        let clean = at("p", false, &["28", "36"]);
+        assert_eq!(
+            keep_growth(&clean, &strs(&["36", "24", "28"]), "p"),
+            Some(strs(&["24"]))
+        );
+        assert_eq!(keep_growth(&clean, &strs(&["28"]), "p"), None, "shrink");
+        assert_eq!(
+            keep_growth(&clean, &strs(&["24", "28"]), "p"),
+            None,
+            "swap drops 36"
+        );
+        assert_eq!(
+            keep_growth(&clean, &strs(&["28", "36"]), "p"),
+            None,
+            "equal"
+        );
+        assert_eq!(
+            keep_growth(&clean, &strs(&["24", "28", "36"]), "q"),
+            None,
+            "off pin"
+        );
+        assert_eq!(
+            keep_growth(&at("p", true, &["28"]), &strs(&["24", "28"]), "p"),
+            None,
+            "dirty"
+        );
+        assert_eq!(
+            keep_growth(&at("p", false, &[]), &strs(&["24"]), "p"),
+            None,
+            "full tree"
+        );
+    }
+
+    /// A real promisor partial clone (file:// remote with filters allowed), created as fetch creates one with keep-set [a], grown to [a, b]:
+    /// b's file appears, a's file keeps its bytes and its inode (not rewritten). Break: `grow_checkout` with a dir absent at the pin fails and adds nothing.
+    #[test]
+    fn grow_in_place_keeps_existing_files() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = std::env::temp_dir().join(format!("xtask-grow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (src, dir, gd) = (tmp.join("src"), tmp.join("co"), tmp.join("git/co"));
+        std::fs::create_dir_all(src.join("a")).unwrap();
+        std::fs::create_dir_all(src.join("b")).unwrap();
+        std::fs::write(src.join("a/f"), "alpha\n").unwrap();
+        std::fs::write(src.join("b/g"), "beta\n").unwrap();
+        let g = |at: &Path, args: &[&str]| {
+            let o = std::process::Command::new("git")
+                .arg("-C")
+                .arg(at)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            String::from_utf8(o.stdout).unwrap().trim().to_owned()
+        };
+        g(&src, &["init", "-q", "-b", "rel"]);
+        g(&src, &["config", "uploadpack.allowFilter", "true"]);
+        g(&src, &["add", "."]);
+        g(&src, &["commit", "-q", "-m", "a"]);
+        let pin = g(&src, &["rev-parse", "HEAD"]);
+        let url = format!("file://{}", src.display());
+        let keep = vec!["a".to_owned()];
+        create_checkout(
+            &dir,
+            &gd,
+            &url,
+            "refs/heads/rel",
+            &Sparse::Cone(&keep),
+            Some(&pin),
+        )
+        .unwrap();
+        let before = std::fs::metadata(dir.join("a/f")).unwrap();
+        assert!(!dir.join("b").exists());
+        let local = inspect(&dir).unwrap();
+        let want = vec!["a".to_owned(), "b".to_owned()];
+        assert!(grow_checkout(&dir, &pin, &["nope".to_owned()]).is_err());
+        let add = keep_growth(&local, &want, &pin).expect("growth");
+        grow_checkout(&dir, &pin, &add).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("b/g")).unwrap(), "beta\n");
+        let after = std::fs::metadata(dir.join("a/f")).unwrap();
+        assert_eq!(std::fs::read(dir.join("a/f")).unwrap(), b"alpha\n");
+        assert_eq!(
+            (before.ino(), before.mtime_nsec()),
+            (after.ino(), after.mtime_nsec())
+        );
+        assert!(keep_mismatch(&inspect(&dir).unwrap(), &want).is_none());
+        // the shrink back is still refused in place
+        assert_eq!(keep_growth(&inspect(&dir).unwrap(), &keep, &pin), None);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
