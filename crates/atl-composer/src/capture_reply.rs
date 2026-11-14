@@ -46,9 +46,10 @@ pub fn serve(
     ui_window::capture(Box::new(move |picture| answer(&listener, picture)));
 }
 
-/// The reply that carries only a status (ScreenCaptureResults.fenceResult = the status, its other fields the header defaults).
+/// The reply that carries only a status (ScreenCaptureResults.fenceResult = the status, its other fields the header defaults), counted as that status: the oneway call has no reply for the hook to see.
 fn refuse(listener: &Strong<dyn IScreenCaptureListener>, status: StatusCode, why: &str) {
-    tracing::warn!("atl-composer: capture refused: {why}");
+    let outcome = atl_diag::outcome(atl_diag::EX_TRANSACTION_FAILED, status as i32);
+    atl_diag::count(&outcome, "ISurfaceComposer.captureDisplay", Some(why));
     send(
         listener,
         ScreenCaptureResults {

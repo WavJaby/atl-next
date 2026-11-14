@@ -2,9 +2,9 @@
 //! OpenSL ES over the proxy object tables (opensl-es plan 2.2 items 2-4): the guest holds guest proxies (objects.rs `GuestObj`), the host library (AOSP wilhelm, resolved as the binding table's `libOpenSLES.so`) holds the real interfaces.
 //! The map: host interface + table -> guest proxy (callbacks, out-parameters), guest proxy -> host interface (validated by membership before word 1 is trusted). A proxy made for an object (`slCreateEngine`, `Create*`) or by its `GetInterface` is owned by that object and freed after the host `Destroy`. A proxy first met as a callback's caller is owned by nobody and kept: it is (table, host address), so a later interface at a reused address of the same table is the same proxy.
 //! Specials (host functions bound into a table, as jni.rs `GetJavaVM`): `slCreateEngine` (a binding shim), Object `GetInterface` / `Destroy` / `RegisterCallback`, Engine `CreateOutputMix` / `CreateAudioPlayer`, `RegisterCallback` of BufferQueue, AndroidSimpleBufferQueue, Play and PrefetchStatus (guest callback -> down shell of kind `Down::Itf`).
-//! Outside the proxy scope (plan section 3): refused with `SL_RESULT_FEATURE_UNSUPPORTED` and counted by name (`refused sles.<method>.<name>`), never a fake success.
+//! Outside the proxy scope (plan section 3): refused with `SL_RESULT_FEATURE_UNSUPPORTED` and counted by name (atl-diag `unimplemented sles.<method>.<name>`), never a fake success.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use super::identity::Down;
@@ -159,33 +159,10 @@ pub fn ownerless() -> usize {
     map().proxies.values().filter(|p| p.owner.is_none()).count()
 }
 
-/// Refusals so far, by name (`sles.<method>.<name>`), for the gates.
-static REFUSED: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
-
-/// Counts and reports refusal `what`; answers `SL_RESULT_FEATURE_UNSUPPORTED`, a legal SL result.
-#[allow(
-    clippy::print_stderr,
-    reason = "the refusal line names what the app asked for, as the bindings report does, before any logger"
-)]
+/// Counts refusal `what` as the API `sles.<what>` atl-diag's `unimplemented` (the process's one counter family); answers `SL_RESULT_FEATURE_UNSUPPORTED`, a legal SL result.
 fn refuse(what: &str) -> u32 {
-    let n = {
-        let mut r = REFUSED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let n = r.entry(format!("sles.{what}")).or_insert(0);
-        *n += 1;
-        *n
-    };
-    eprintln!("atl-native-bridge: refused sles.{what} ({n})");
+    atl_diag::unimplemented_api!(&format!("sles.{what}"));
     SL_RESULT_FEATURE_UNSUPPORTED
-}
-
-/// Every refusal name and its count.
-pub fn refusals() -> Vec<(String, u64)> {
-    REFUSED
-        .lock()
-        .map(|r| r.iter().map(|(k, &v)| (k.clone(), v)).collect())
-        .unwrap_or_default()
 }
 
 /// OpenSLES.h `struct SLInterfaceID_`: 16 bytes, compared by content (wilhelm does too).

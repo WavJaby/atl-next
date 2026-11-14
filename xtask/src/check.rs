@@ -55,6 +55,8 @@ enum Step {
     BwrapFlags,
     /// tracked code never invokes Soong (`soong_ui`, `lunch`; Soong retired a84d9b6): comments and Markdown pass
     Soong,
+    /// no crate logs a free-text `refused` / `unimplemented` line: API outcomes go through atl-diag; lines of another subject listed with a reason (diag_shape.rs)
+    DiagShape,
     /// clippy on all targets, warnings denied
     Clippy,
     /// cargo-deny: advisories, bans, licences, sources
@@ -75,7 +77,7 @@ enum Step {
     CrossBionic,
 }
 
-const ALL: [Step; 22] = [
+const ALL: [Step; 23] = [
     Step::Fmt,
     Step::Spdx,
     Step::Tables,
@@ -89,6 +91,7 @@ const ALL: [Step; 22] = [
     Step::AndroidPaths,
     Step::BwrapFlags,
     Step::Soong,
+    Step::DiagShape,
     Step::Clippy,
     Step::Deny,
     Step::Test,
@@ -116,6 +119,7 @@ impl Step {
             Step::AndroidPaths => "android-paths",
             Step::BwrapFlags => "bwrap-flags",
             Step::Soong => "soong",
+            Step::DiagShape => "diag-shape",
             Step::Clippy => "clippy",
             Step::Deny => "deny",
             Step::Test => "test",
@@ -285,6 +289,7 @@ impl Step {
             Step::AndroidPaths => crate::android_paths::check(root),
             Step::BwrapFlags => crate::bwrap_flags::check(root),
             Step::Soong => crate::soong::check(root),
+            Step::DiagShape => crate::diag_shape::check(root),
             Step::Clippy => cargo(
                 root,
                 &[

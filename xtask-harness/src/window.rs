@@ -2679,10 +2679,11 @@ mod tests {
         assert!(burst_check(&layout(last), &uncoalesced, &steps).is_err());
     }
 
-    /// An unanswered setInTouchMode counts under its bare name (counters::count_unimplemented): only the answered line passes.
+    /// An unanswered setInTouchMode counts `unimplemented` under its bare name (the reply hook, atl-diag `binder_reply`): only the answered line passes.
     #[test]
     fn touch_mode_check_needs_the_answered_line() {
-        let line = |kind: &str, m: &str| format!("services: {kind} IWindowManager.{m} 1 at=1.000");
+        let line =
+            |kind: &str, m: &str| format!("diag: first {kind} IWindowManager.{m} 1 at=1.000");
         assert!(touch_mode_check(&line("answered", "setInTouchMode (answered)")).is_ok());
         assert!(touch_mode_check(&line("unimplemented", "setInTouchMode")).is_err());
         assert!(touch_mode_check("").is_err());

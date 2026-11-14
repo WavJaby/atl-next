@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! `sensorservice`'s server on binder: the interfaces, codes and modes are libsensor's hand-written wire (atl-services-wire `sensor_wire`); this module serves them over sensor.rs's logic.
-//! Codes not served (direct channels, operation parameters) are counted and answered UNKNOWN_TRANSACTION.
+//! Codes not served (direct channels, operation parameters) are answered UNKNOWN_TRANSACTION, counted by the dispatcher's reply hook (atl-services-wire `sensor_wire`).
 
 use std::sync::Arc;
 
@@ -17,9 +17,8 @@ use atl_services_wire::sensor_wire::{
     MODE_NORMAL, MODE_REPLAY_DATA_INJECTION, SET_EVENT_RATE, read_string8,
 };
 
-/// The interface names counters use.
+/// The interface name in-band refusals count under (the reply hook's, atl-services-wire sensor_wire).
 const SERVER: &str = "ISensorServer";
-const CONNECTION: &str = "ISensorEventConnection";
 
 /// `Parcel::write(const LightFlattenable<T>&)` of a variable-size one (`Sensor`; read side Parcel.h `read(LightFlattenable<T>&)` :1540-1558): int32 size, then the payload padded to 4 (readInplace). Written as int32 words of the native byte order, which is the parcel's.
 fn write_light_flattenable(reply: &mut BorrowedParcel<'_>, bytes: &[u8]) -> Result<(), StatusCode> {
@@ -109,10 +108,8 @@ impl IHandWritten for SensorServer {
             ENABLE_HAL_BYPASS_REPLAY_DATA_INJECTION => {
                 reply.write(&i32::from(self.hub.hal_bypass_injection()))
             }
-            _ => {
-                atl_diag::unimplemented(SERVER, &format!("code {code}"));
-                Err(StatusCode::UNKNOWN_TRANSACTION)
-            }
+            // counted by the dispatcher's reply hook (atl-services-wire sensor_wire.rs)
+            _ => Err(StatusCode::UNKNOWN_TRANSACTION),
         }
     }
 }
@@ -172,11 +169,8 @@ impl IConnection for EventConnection {
                 self.hub.drop_connection(self.id);
                 Ok(())
             }
-            _ => {
-                // FLUSH_SENSOR (flush-complete meta events), CONFIGURE_CHANNEL (direct channels only: INVALID_OPERATION in AOSP too)
-                atl_diag::unimplemented(CONNECTION, &format!("code {code}"));
-                Err(StatusCode::UNKNOWN_TRANSACTION)
-            }
+            // FLUSH_SENSOR (flush-complete meta events), CONFIGURE_CHANNEL (direct channels only: INVALID_OPERATION in AOSP too); counted by the dispatcher's reply hook
+            _ => Err(StatusCode::UNKNOWN_TRANSACTION),
         }
     }
 }

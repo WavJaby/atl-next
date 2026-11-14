@@ -67,8 +67,39 @@ declare_binder_interface! {
     }
 }
 
-/// REGISTER: the UI agent; the calling uid is taken from the transaction.
+/// The protocol's name of `code` (compositor_registry.rs), for the reply hook.
+fn method_name(code: TransactionCode) -> Option<&'static str> {
+    [
+        (REGISTER, "REGISTER"),
+        (GET_COMPOSER, "GET_COMPOSER"),
+        (SET_BOUNDS, "SET_BOUNDS"),
+        (SET_DISPLAY, "SET_DISPLAY"),
+        (TASK_INFO, "TASK_INFO"),
+    ]
+    .into_iter()
+    .find_map(|(c, n)| (c == code).then_some(n))
+}
+
+/// Every `Err` leaving [`dispatch`] passes the reply hook once, as a generated `on_transact`'s does.
 fn on_transact(
+    service: &dyn ICompositorRegistry,
+    code: TransactionCode,
+    data: &BorrowedParcel<'_>,
+    reply: &mut BorrowedParcel<'_>,
+) -> Result<(), StatusCode> {
+    dispatch(service, code, data, reply).inspect_err(|e| {
+        atl_diag::binder_reply(
+            INTERFACE,
+            method_name(code),
+            code,
+            atl_diag::EX_TRANSACTION_FAILED,
+            *e as i32,
+        );
+    })
+}
+
+/// REGISTER: the UI agent; the calling uid is taken from the transaction.
+fn dispatch(
     service: &dyn ICompositorRegistry,
     code: TransactionCode,
     data: &BorrowedParcel<'_>,
@@ -82,7 +113,17 @@ fn on_transact(
                 reply.write(&Status::ok())?;
                 reply.write(&composer)
             }
-            Err(status) => reply.write(&status),
+            Err(status) => {
+                reply.write(&status)?;
+                atl_diag::binder_reply(
+                    INTERFACE,
+                    method_name(code),
+                    code,
+                    status.exception_code() as i32,
+                    status.transaction_error() as i32,
+                );
+                Ok(())
+            }
         };
     }
     if code == SET_BOUNDS {
@@ -102,7 +143,6 @@ fn on_transact(
         return reply.write(&info.package);
     }
     if code != REGISTER {
-        atl_diag::unimplemented(INTERFACE, &format!("code {code}"));
         return Err(StatusCode::UNKNOWN_TRANSACTION);
     }
     let ui_agent: SpIBinder = data.read()?;
@@ -224,18 +264,11 @@ impl ICompositorRegistry for Registry {
         let Some(task) =
             TaskId::from_raw(task).filter(|t| self.tasks.owner(*t) == Some(caller_uid))
         else {
-            let _ = writeln!(
-                std::io::stderr(),
-                "services: bounds refused uid {caller_uid}: task {task} is not its"
-            );
+            atl_diag::set_cause(&format!("uid {caller_uid} does not own task {task}"));
             return Err(StatusCode::PERMISSION_DENIED);
         };
         if width <= 0 || height <= 0 {
-            let _ = writeln!(
-                std::io::stderr(),
-                "services: bounds refused task {}: {width}x{height}",
-                task.raw()
-            );
+            atl_diag::set_cause(&format!("task {} size {width}x{height}", task.raw()));
             return Err(StatusCode::BAD_VALUE);
         }
         if self.tasks.set_size(task, TaskSize { width, height }) {
@@ -252,14 +285,11 @@ impl ICompositorRegistry for Registry {
     fn set_display(&self, caller_uid: u32, display: &str) -> Result<(), StatusCode> {
         // only an app with a window reports its monitor
         if !self.tasks.owns_any(caller_uid) {
-            let _ = writeln!(
-                std::io::stderr(),
-                "services: display refused uid {caller_uid}: owns no task"
-            );
+            atl_diag::set_cause(&format!("uid {caller_uid} owns no task"));
             return Err(StatusCode::PERMISSION_DENIED);
         }
         let model = DisplayModel::parse_arg(display).map_err(|why| {
-            let _ = writeln!(std::io::stderr(), "services: display refused: {why}");
+            atl_diag::set_cause(&why.to_string());
             StatusCode::BAD_VALUE
         })?;
         let tasks = self.tasks.set_display(model);
@@ -303,11 +333,7 @@ impl ICompositorRegistry for Registry {
 
     fn composer(&self, caller_uid: u32, package: &str) -> binder::Result<Option<SpIBinder>> {
         if caller_uid != SHELL_UID && caller_uid != SYSTEM_UID {
-            let _ = writeln!(
-                std::io::stderr(),
-                "services: composer refused uid {caller_uid}: not the shell or system"
-            );
-            // AOSP's SecurityException: captureDisplay needs READ_FRAME_BUFFER
+            // counted by the reply hook (exception:SECURITY); AOSP's SecurityException: captureDisplay needs READ_FRAME_BUFFER
             return Err(Status::new_exception_str(
                 ExceptionCode::SECURITY,
                 Some("composer: the caller is not the shell or system"),

@@ -27,7 +27,7 @@ fn on_transact(
     _: &BorrowedParcel<'_>,
     _: &mut BorrowedParcel<'_>,
 ) -> Result<(), StatusCode> {
-    atl_diag::unimplemented("ITransactionCompletedListener", &format!("code {code}"));
+    atl_diag::unknown_code("ITransactionCompletedListener", code);
     Err(StatusCode::UNKNOWN_TRANSACTION)
 }
 

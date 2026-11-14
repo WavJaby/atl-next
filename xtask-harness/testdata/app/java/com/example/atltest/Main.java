@@ -117,8 +117,55 @@ public class Main extends Activity {
             bridge1 = jni;
         }
         bridge1Legacy();
+        resultToSecurity();
         Log.i("AtlTest", "onCreate reached");
         startActivityForResult(new Intent(this, ResultChild.class), REQUEST_CHILD);
+    }
+
+    /** IActivityTaskManager.aidl: startActivity is the interface's first method, so FIRST_CALL_TRANSACTION. */
+    private static final int START_ACTIVITY = android.os.IBinder.FIRST_CALL_TRANSACTION;
+    private static final String ATM_DESCRIPTOR = "android.app.IActivityTaskManager";
+
+    /**
+     * "result-to-security <outcome>" (app.rs RESULT_TO_SECURITY): IActivityTaskManager.startActivity with this activity as resultTo but another calling package, as the generated proxy parcels it;
+     * the services refuse it fail-closed with a SecurityException (activity_start.rs check), counted by the reply hook as exception:SECURITY. The binder is raw: ActivityTaskManager.getService is not
+     * on the greylist, ServiceManager.getService, currentActivityThread, getApplicationThread and getActivityToken are (@UnsupportedAppUsage).
+     */
+    private void resultToSecurity() {
+        String outcome;
+        android.os.Parcel data = android.os.Parcel.obtain();
+        android.os.Parcel reply = android.os.Parcel.obtain();
+        try {
+            android.os.IBinder atm = (android.os.IBinder) Class.forName("android.os.ServiceManager")
+                    .getMethod("getService", String.class).invoke(null, "activity_task");
+            Object thread = Class.forName("android.app.ActivityThread").getMethod("currentActivityThread").invoke(null);
+            Object appThread = thread.getClass().getMethod("getApplicationThread").invoke(thread);
+            android.os.IBinder token = (android.os.IBinder) Activity.class.getMethod("getActivityToken").invoke(this);
+            data.writeInterfaceToken(ATM_DESCRIPTOR);
+            data.writeStrongBinder(((android.os.IInterface) appThread).asBinder());
+            data.writeString("com.example.other");
+            data.writeString(null);
+            data.writeInt(1);
+            new Intent(this, ResultChild.class).writeToParcel(data, 0);
+            data.writeString(null);
+            data.writeStrongBinder(token);
+            data.writeString(null);
+            data.writeInt(-1);
+            data.writeInt(0);
+            data.writeInt(0);
+            data.writeInt(0);
+            atm.transact(START_ACTIVITY, data, reply, 0);
+            reply.readException();
+            outcome = "returned " + reply.readInt();
+        } catch (SecurityException e) {
+            outcome = "threw SecurityException";
+        } catch (Exception e) {
+            outcome = "failed " + e;
+        } finally {
+            data.recycle();
+            reply.recycle();
+        }
+        Log.i("AtlTest", "result-to-security " + outcome);
     }
 
     /** The order check's marker: a result line must come before Main's next resume (app.rs RESULT). */

@@ -118,6 +118,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 atl-android-paths = { path = "../atl-android-paths" }
+atl-diag = { path = "../atl-diag" }
 atl-engine-api = { path = "../atl-engine-api" }
 libc.workspace = true
 object.workspace = true

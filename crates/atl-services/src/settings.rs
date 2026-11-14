@@ -38,7 +38,7 @@ fn on_transact(
         reply.write(&NO_EXCEPTION)?;
         return reply.write(&NULL_BUNDLE);
     }
-    atl_diag::unimplemented(INTERFACE, &format!("code {code}"));
+    atl_diag::unknown_code(INTERFACE, code);
     Err(StatusCode::UNKNOWN_TRANSACTION)
 }
 

@@ -659,7 +659,14 @@ mod publish {
                             state.windows.borrow_mut().add(token, publisher, flags);
                             publish_focus(&state);
                         }
-                        Err(err) => tracing::warn!("input: input channel refused: {err:?}"),
+                        // the app's window gets no input: counted under the call that sent the channel (atl-services-wire ui_agent INPUT_SERVER)
+                        Err(err) => {
+                            atl_diag::count(
+                                atl_diag::REFUSED,
+                                "IUiAgent.INPUT_SERVER",
+                                Some(&format!("{err:?}")),
+                            );
+                        }
                     },
                     Message::WindowRemoved(token) => {
                         state.windows.borrow_mut().remove(&token);

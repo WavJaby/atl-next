@@ -32,11 +32,20 @@ fn on_transact(
     data: &BorrowedParcel<'_>,
     _reply: &mut BorrowedParcel<'_>,
 ) -> Result<(), StatusCode> {
-    if code == SET_TRANSACTION_STATE {
-        return service.set_transaction_state(data);
+    if code != SET_TRANSACTION_STATE {
+        atl_diag::unknown_code(INTERFACE, code);
+        return Err(StatusCode::UNKNOWN_TRANSACTION);
     }
-    atl_diag::unimplemented(INTERFACE, &format!("code {code}"));
-    Err(StatusCode::UNKNOWN_TRANSACTION)
+    // its BAD_VALUE passes the reply hook once, with the cause host.rs set, as a generated on_transact's
+    service.set_transaction_state(data).inspect_err(|e| {
+        atl_diag::binder_reply(
+            INTERFACE,
+            Some("setTransactionState"),
+            code,
+            atl_diag::EX_TRANSACTION_FAILED,
+            *e as i32,
+        );
+    })
 }
 
 impl ISurfaceFlinger for BpSurfaceFlinger {

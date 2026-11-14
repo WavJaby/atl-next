@@ -279,7 +279,7 @@ fn on_transact(
     _: &BorrowedParcel<'_>,
     _: &mut BorrowedParcel<'_>,
 ) -> Result<(), StatusCode> {
-    atl_diag::unimplemented("ILayerHandle", &format!("code {code}"));
+    atl_diag::unknown_code("ILayerHandle", code);
     Err(StatusCode::UNKNOWN_TRANSACTION)
 }
 
@@ -440,7 +440,8 @@ impl Composer {
         st.stats.fds_taken += (st.fds.len() - held) as u64;
         let decoded = wire.and_then(|w| {
             TransactionState::decode_call(&w).map_err(|e| {
-                tracing::warn!("composer: setTransactionState refused: {e}");
+                // the dispatcher's reply hook counts the BAD_VALUE with this cause (surface_flinger.rs)
+                atl_diag::set_cause(&e.to_string());
                 StatusCode::BAD_VALUE
             })
         });
@@ -497,7 +498,8 @@ impl Composer {
                 Ok(t)
             })
             .map_err(|e| {
-                tracing::warn!("composer: post-draw Transaction refused: {e}");
+                // the UI agent dispatcher's reply hook counts the BAD_VALUE with this cause (atl-services-wire ui_agent.rs)
+                atl_diag::set_cause(&e.to_string());
                 StatusCode::BAD_VALUE
             });
         match decoded {

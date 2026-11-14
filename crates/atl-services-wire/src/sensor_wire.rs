@@ -55,13 +55,59 @@ declare_binder_interface! {
     }
 }
 
+/// The names the reply hook counts under (ISensorServer.cpp / ISensorEventConnection.cpp class names).
+const SERVER: &str = "ISensorServer";
+const CONNECTION: &str = "ISensorEventConnection";
+
+/// ISensorServer.cpp's name of `code`, for the reply hook.
+fn server_method(code: TransactionCode) -> Option<&'static str> {
+    [
+        (GET_SENSOR_LIST, "getSensorList"),
+        (
+            CREATE_SENSOR_EVENT_CONNECTION,
+            "createSensorEventConnection",
+        ),
+        (ENABLE_DATA_INJECTION, "isDataInjectionEnabled"),
+        (GET_DYNAMIC_SENSOR_LIST, "getDynamicSensorList"),
+        (GET_RUNTIME_SENSOR_LIST, "getRuntimeSensorList"),
+        (ENABLE_REPLAY_DATA_INJECTION, "isReplayDataInjectionEnabled"),
+        (
+            ENABLE_HAL_BYPASS_REPLAY_DATA_INJECTION,
+            "isHalBypassReplayDataInjectionEnabled",
+        ),
+    ]
+    .into_iter()
+    .find_map(|(c, n)| (c == code).then_some(n))
+}
+
+/// ISensorEventConnection.cpp's name of `code`, for the reply hook.
+fn connection_method(code: TransactionCode) -> Option<&'static str> {
+    [
+        (GET_SENSOR_CHANNEL, "getSensorChannel"),
+        (ENABLE_DISABLE, "enableDisable"),
+        (SET_EVENT_RATE, "setEventRate"),
+        (DESTROY, "destroy"),
+    ]
+    .into_iter()
+    .find_map(|(c, n)| (c == code).then_some(n))
+}
+
+/// Every `Err` leaving the service's `transact` passes the reply hook once, as a generated `on_transact`'s does.
 fn server_on_transact(
     service: &dyn IHandWritten,
     code: TransactionCode,
     data: &BorrowedParcel<'_>,
     reply: &mut BorrowedParcel<'_>,
 ) -> Result<(), StatusCode> {
-    service.transact(code, data, reply)
+    service.transact(code, data, reply).inspect_err(|e| {
+        atl_diag::binder_reply(
+            SERVER,
+            server_method(code),
+            code,
+            atl_diag::EX_TRANSACTION_FAILED,
+            *e as i32,
+        );
+    })
 }
 
 impl IHandWritten for BpSensorServer {
@@ -103,13 +149,22 @@ declare_binder_interface! {
     }
 }
 
+/// As [`server_on_transact`].
 fn connection_on_transact(
     service: &dyn IConnection,
     code: TransactionCode,
     data: &BorrowedParcel<'_>,
     reply: &mut BorrowedParcel<'_>,
 ) -> Result<(), StatusCode> {
-    service.transact(code, data, reply)
+    service.transact(code, data, reply).inspect_err(|e| {
+        atl_diag::binder_reply(
+            CONNECTION,
+            connection_method(code),
+            code,
+            atl_diag::EX_TRANSACTION_FAILED,
+            *e as i32,
+        );
+    })
 }
 
 impl IConnection for BpSensorEventConnection {

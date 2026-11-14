@@ -82,7 +82,44 @@ declare_binder_interface! {
     }
 }
 
+/// The protocol's name of `code`, for the reply hook.
+fn method_name(code: TransactionCode) -> Option<&'static str> {
+    [
+        (WINDOW_SURFACE, "WINDOW_SURFACE"),
+        (INPUT_SERVER, "INPUT_SERVER"),
+        (REMOVE_INPUT, "REMOVE_INPUT"),
+        (INPUT_FRAME, "INPUT_FRAME"),
+        (TASK, "TASK"),
+        (POINTER_ICON, "POINTER_ICON"),
+        (MINIMIZE, "MINIMIZE"),
+        (WINDOW_POSITION, "WINDOW_POSITION"),
+        (INPUT_METHOD, "INPUT_METHOD"),
+        (POST_DRAW_TRANSACTION, "POST_DRAW_TRANSACTION"),
+        (DIM_LAYER, "DIM_LAYER"),
+    ]
+    .into_iter()
+    .find_map(|(c, n)| (c == code).then_some(n))
+}
+
+/// Every `Err` leaving [`dispatch`] passes the reply hook once, as a generated `on_transact`'s does.
 fn on_transact(
+    service: &dyn IUiAgent,
+    code: TransactionCode,
+    data: &BorrowedParcel<'_>,
+    reply: &mut BorrowedParcel<'_>,
+) -> Result<(), StatusCode> {
+    dispatch(service, code, data, reply).inspect_err(|e| {
+        atl_diag::binder_reply(
+            INTERFACE,
+            method_name(code),
+            code,
+            atl_diag::EX_TRANSACTION_FAILED,
+            *e as i32,
+        );
+    })
+}
+
+fn dispatch(
     service: &dyn IUiAgent,
     code: TransactionCode,
     data: &BorrowedParcel<'_>,
@@ -139,10 +176,7 @@ fn on_transact(
             let height: i32 = data.read()?;
             service.dim_layer(layer_id, amount, width, height)
         }
-        _ => {
-            atl_diag::unimplemented(INTERFACE, &format!("code {code}"));
-            Err(StatusCode::UNKNOWN_TRANSACTION)
-        }
+        _ => Err(StatusCode::UNKNOWN_TRANSACTION),
     }
 }
 

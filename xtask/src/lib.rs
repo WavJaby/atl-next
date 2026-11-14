@@ -24,6 +24,7 @@ pub mod converter;
 pub mod cross;
 pub mod cts_table;
 pub mod deps;
+pub mod diag_shape;
 pub mod fetch;
 pub mod gate_goals;
 pub mod git;

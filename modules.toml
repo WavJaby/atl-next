@@ -96,13 +96,13 @@ uses = ["generators"]
 [composer]
 crates = ["atl-composer"]
 exports = ["atl-composer"]
-uses = ["aidl", "compositor", "libgui-parcel", "ime", "libinput", "platform-ui", "scene-buffer", "services-wire", "services-types", "generators", "android-paths", "service-view", "gralloc"]
+uses = ["aidl", "compositor", "libgui-parcel", "ime", "libinput", "platform-ui", "scene-buffer", "services-wire", "services-types", "generators", "android-paths", "service-view", "gralloc", "diag"]
 
 # framework natives (libandroid_runtime) ATL implements itself instead of building their AOSP sources
 [android-runtime]
 crates = ["atl-android-runtime"]
 
-# binder reply outcomes counted per process: the aidl patch's reply hook (a leaf; converter-built AIDL crates and atl-parcelables link it as rust_library libatl_diag)
+# API outcomes counted per process: the aidl patch's reply hook, hand-written dispatchers, the native bridge's refusals (a leaf; converter-built AIDL crates and atl-parcelables link it as rust_library libatl_diag)
 [diag]
 crates = ["atl-diag"]
 exports = ["atl-diag"]
@@ -207,8 +207,8 @@ uses = ["generators"]
 [native-bridge]
 crates = ["atl-native-bridge", "atl-guest-dlsym"]
 exports = ["atl-native-bridge"]
-# cpu-pressure: g4's starvation share over its run (test-only dev-dependency); engine-api: the engine C ABI the QEMU crossing calls the engine `.so` through (plain dependency, no code; the engine is a dlopen, not a cargo edge)
-uses = ["generators", "android-paths", "cpu-pressure", "engine-api"]
+# cpu-pressure: g4's starvation share over its run (test-only dev-dependency); engine-api: the engine C ABI the QEMU crossing calls the engine `.so` through (plain dependency, no code; the engine is a dlopen, not a cargo edge); diag: OpenSL ES refusals counted as `unimplemented` (the app process links no converter libatl_diag)
+uses = ["generators", "android-paths", "cpu-pressure", "engine-api", "diag"]
 
 # the QEMU translator engine (QEMU bridge plan Q2 spike): QEMU's linux-user core dlopened as a library, P1's svc hook, the fault chain in front of QEMU's handler; CPU layouts generated from QEMU's cpu.h; exports its `Trap` to the native bridge's QEMU crossing (Q4)
 [qemu-engine]

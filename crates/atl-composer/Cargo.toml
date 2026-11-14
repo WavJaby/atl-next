@@ -21,7 +21,9 @@ converter = ["atl-aidl/converter", "atl-ime/converter", "atl-libinput/converter"
 atl-aidl = { path = "../atl-aidl" }
 atl-android-paths = { path = "../atl-android-paths" }
 atl-compositor = { path = "../atl-compositor" }
-atl-gralloc = { path = "../atl-gralloc" }
+# plain builds' atl_diag (lib.rs); converter builds link the converter's libatl_diag instead
+atl-diag-plain = { package = "atl-diag", path = "../atl-diag" }
+atl-gralloc ={ path = "../atl-gralloc" }
 atl-gralloc-dmabuf = { path = "../atl-gralloc-dmabuf" }
 atl-libgui-parcel = { path = "../atl-libgui-parcel" }
 atl-ime = { path = "../atl-ime" }

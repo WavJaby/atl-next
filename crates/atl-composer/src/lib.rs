@@ -22,6 +22,9 @@ extern crate binder;
 extern crate gui_aidl_types_rs;
 #[cfg(feature = "converter")]
 extern crate rustutils;
+// One atl_diag per process (the converter's); plain builds (the input thread's tests) take cargo's under another dependency name, as atl-services does.
+#[cfg(not(feature = "converter"))]
+extern crate atl_diag_plain as atl_diag;
 
 pub mod capture;
 pub mod clock;

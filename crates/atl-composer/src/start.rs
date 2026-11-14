@@ -60,7 +60,7 @@ fn on_transact(
     _: &BorrowedParcel<'_>,
     _: &mut BorrowedParcel<'_>,
 ) -> Result<(), StatusCode> {
-    atl_diag::unimplemented("IRegistry", &format!("code {code}"));
+    atl_diag::unknown_code("IRegistry", code);
     Err(StatusCode::UNKNOWN_TRANSACTION)
 }
 

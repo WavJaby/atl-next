@@ -791,6 +791,34 @@ fn round_failures(app: &str, prefix: &str, rounds: usize, bound_ms: Option<u64>)
     whys
 }
 
+/// Main.java resultToSecurity's line, and what it must read: the services' SecurityException reached the app.
+const RESULT_TO_SECURITY: &str = "AtlTest: result-to-security ";
+const RESULT_TO_SECURITY_WANT: &str = "threw SecurityException";
+/// The key the reply hook counts that refusal under (atl-diag `binder_reply`: outcome `exception:SECURITY`, api `<Interface>.<method>`).
+const SECURITY_OUTCOME: &str = "exception:SECURITY";
+const START_ACTIVITY_API: &str = "IActivityTaskManager.startActivity";
+
+/// The resultTo refusal row (plan diagnostics-f4 D3): the app's line says it threw SecurityException and the services counted `exception:SECURITY` for startActivity at least once
+/// (a lower bound until the services exit cleanly: the fixture makes one such call, and no other call of the run is refused that way).
+fn result_to_security_failures(app: &str, services: &str) -> Vec<String> {
+    let mut whys = Vec::new();
+    let got = app
+        .lines()
+        .find_map(|l| l.split_once(RESULT_TO_SECURITY).map(|(_, r)| r.trim_end()));
+    if got != Some(RESULT_TO_SECURITY_WANT) {
+        whys.push(format!(
+            "result-to-security: want {RESULT_TO_SECURITY_WANT:?}, got {got:?}"
+        ));
+    }
+    let counted = counters(services)
+        .iter()
+        .any(|c| c.outcome == SECURITY_OUTCOME && c.api == START_ACTIVITY_API && c.count > 0);
+    if !counted {
+        whys.push(format!("result-to-security: no `{SECURITY_OUTCOME} {START_ACTIVITY_API}` count in the services log"));
+    }
+    whys
+}
+
 /// The round trip's lines against what Main.java and ResultChild.java log, one reason per missing or wrong line. The child's result carries its code and extra. Main's first
 /// result or resume after the child finished is that result: a pending result goes out before the resume (ActivityResultItem, TaskFragment.java:1665-1693). The self-start's
 /// cancel comes before its new intent (ActivityStarter.java:2469).
@@ -1180,6 +1208,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             MEDIA_RESET_ROUNDS,
             Some(MEDIA_ROUND_BOUND_MS),
         ));
+    }
+    // a startActivity whose resultTo is not the calling package's (Main.java resultToSecurity): the app sees SecurityException, the reply hook counts it
+    if passed {
+        whys.extend(result_to_security_failures(&app, &services_log));
     }
     // startActivityForResult round trip (Main.java, ResultChild.java): the result, its order against Main's resume, and the singleTop self-start's cancel
     if passed {
@@ -1638,6 +1670,28 @@ mod tests {
         }
         // nothing logged after the marker: all four required lines are reported
         assert_eq!(result_failures("AtlTest: onCreate reached\n").len(), 4);
+    }
+
+    /// Lines in the shapes Main.java and atl-diag write; each half missing gives its own reason.
+    #[test]
+    fn result_to_security_needs_the_throw_and_the_count() {
+        let app = "I AtlTest: result-to-security threw SecurityException\n";
+        let services =
+            "diag: first exception:SECURITY IActivityTaskManager.startActivity 1 at=1.000\n";
+        assert!(result_to_security_failures(app, services).is_empty());
+        assert_eq!(
+            result_to_security_failures("I AtlTest: result-to-security returned 0\n", services)
+                .len(),
+            1
+        );
+        assert_eq!(
+            result_to_security_failures(
+                app,
+                "diag: first exception:SECURITY IActivityTaskManager.finishActivity 1 at=1.000\n"
+            )
+            .len(),
+            1
+        );
     }
 
     #[test]

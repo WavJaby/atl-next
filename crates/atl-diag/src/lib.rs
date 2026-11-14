@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The one counter family: API outcomes of this process, keyed by (outcome, api). [`binder_reply`] is the aidl patch's `--rust_reply_hook` (patches/aosp/system/tools/aidl): every generated
-//! `on_transact` calls it once per non-OK outcome it sends back; hand-written code counts served-by-design calls with [`answered`], [`refused`], [`sent`], [`unimplemented`].
+//! `on_transact` calls it once per non-OK outcome it sends back, and hand-written dispatchers call it the same way ([`unknown_code`] for a code they do not serve); hand-written code counts
+//! served-by-design calls with [`answered`], [`refused`], [`sent`], and an API it does not implement with [`unimplemented_api!`]. Free-text refusal lines are not written (xtask check step `diag-shape`).
 //! Log policy (owner 2026-11-14, M60 R2): a line at the first hit and at each power-of-two count, so a SIGKILLed process still leaves first-seen and a lower bound within 2x without flooding
 //! (50,708 hits of one key -> 16 lines); [`flush_totals`] writes the exact total per key on an orderly exit. Line shapes ([`summary`] parses them; outcome before api: an api may hold spaces, an
 //! outcome never does): `diag: first <outcome> <api> 1 at=<stamp>[ cause=<what>]`, `diag: count <outcome> <api> <n> at=<stamp>[ cause=<what>]`, `diag: total <outcome> <api> <n> first=<stamp>`.
@@ -106,7 +107,7 @@ thread_local! {
     static CAUSE: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
-/// Records why the next UNKNOWN_TRANSACTION or BAD_VALUE this thread replies with happens (a refused parcelable, an unimplemented sub-case); [`binder_reply`] takes it.
+/// Records why the next transport status this thread replies with happens (a refused parcelable, an unimplemented sub-case, a hand-written refusal); [`binder_reply`] takes it.
 pub fn set_cause(what: &str) {
     CAUSE.with(|c| *c.borrow_mut() = Some(what.to_owned()));
 }
@@ -141,7 +142,8 @@ pub fn count(outcome: &str, api: &str, cause: Option<&str>) -> u64 {
 }
 
 /// The reply hook (aidl `--rust_reply_hook`): counts one non-OK outcome of `descriptor`'s `method` (None: unknown `code`), returns the new count.
-/// A pending cause is taken on every call (so it never outlives the reply it was set for) and printed only with UNKNOWN_TRANSACTION or BAD_VALUE, the statuses its setters produce.
+/// A pending cause is taken on every call (so it never outlives the reply it was set for) and printed only with a transport status, the replies its setters produce (an exception carries its own message).
+/// Hand-written dispatchers (no generated `on_transact`) call it too: for every `Err` leaving their `on_transact` and every exception they write, one site per outcome as in generated code.
 pub fn binder_reply(
     descriptor: &str,
     method: Option<&str>,
@@ -150,13 +152,27 @@ pub fn binder_reply(
     status: i32,
 ) -> u64 {
     let cause = CAUSE.with(|c| c.borrow_mut().take());
-    let caused = exception == EX_TRANSACTION_FAILED
-        && (status == STATUS_BAD_VALUE || status == STATUS_UNKNOWN_TRANSACTION);
     count(
         &outcome(exception, status),
         &api(descriptor, method, code),
-        cause.as_deref().filter(|_| caused),
+        kept_cause(exception, cause.as_deref()),
     )
+}
+
+/// A hand-written dispatcher's reply to a code it does not serve: [`binder_reply`] with UNKNOWN_TRANSACTION; the caller returns that status.
+pub fn unknown_code(interface: &str, code: u32) -> u64 {
+    binder_reply(
+        interface,
+        None,
+        code,
+        EX_TRANSACTION_FAILED,
+        STATUS_UNKNOWN_TRANSACTION,
+    )
+}
+
+/// The cause a reply prints: only a transport status (EX_TRANSACTION_FAILED) takes one.
+fn kept_cause(exception: i32, cause: Option<&str>) -> Option<&str> {
+    cause.filter(|_| exception == EX_TRANSACTION_FAILED)
 }
 
 /// A call served on purpose but worth a count (`interface`.`what`).
@@ -172,11 +188,6 @@ pub fn refused(interface: &str, what: &str) -> u64 {
 /// An outgoing call the services made on `interface`.
 pub fn sent(interface: &str, call: &str) -> u64 {
     count(SENT, &format!("{interface}.{call}"), None)
-}
-
-/// A call a hand-written dispatcher does not implement; the caller answers UNKNOWN_TRANSACTION.
-pub fn unimplemented(interface: &str, what: &str) -> u64 {
-    count(UNIMPLEMENTED, &format!("{interface}.{what}"), None)
 }
 
 /// Hand-written Rust's entry for an API it does not implement (AGENTS "Lints", plan F4/F7): counts `unimplemented` under the api string; the caller returns the API's default.
@@ -251,6 +262,13 @@ mod tests {
         set_cause("x");
         binder_reply(d, Some("b"), 2, -1, 0);
         assert!(CAUSE.with(|c| c.borrow().is_none()));
+    }
+
+    /// binder_status.h: EX_TRANSACTION_FAILED -129 carries a status (PERMISSION_DENIED -1 here: a hand-written refusal), EX_SECURITY -1 is an exception with its own message.
+    #[test]
+    fn cause_rides_any_transport_status_never_an_exception() {
+        assert_eq!(kept_cause(-129, Some("owns no task")), Some("owns no task"));
+        assert_eq!(kept_cause(-1, Some("owns no task")), None);
     }
 
     /// The policy: hits 1..=5 write lines at 1, 2 and 4 (powers of two); the total is 5. Break check: logging every hit makes the first assertion 5 lines.

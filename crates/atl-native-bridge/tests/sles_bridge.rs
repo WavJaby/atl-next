@@ -219,10 +219,10 @@ fn run(env: &common::Nb) -> Result<(), String> {
 
     // g: unknown IID refused and counted
     let rc = fx.step("sles_g_unknown")? as u32 as usize;
-    let count = sles::refusals()
+    let count = atl_diag::counts()
         .into_iter()
-        .find(|(k, _)| k == UNKNOWN_REFUSAL)
-        .map_or(0, |(_, n)| n);
+        .find(|(o, k, _)| o == atl_diag::UNIMPLEMENTED && k == UNKNOWN_REFUSAL)
+        .map_or(0, |(_, _, n)| n);
     check!(
         'g',
         if rc == FEATURE_UNSUPPORTED && count == 1 {

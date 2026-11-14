@@ -4,8 +4,8 @@
 //! instance), singleTop (onNewIntent to the top when it is that class, else new), singleTask (onNewIntent to its instance in the task after clearing what is above, else new; a new instance while a result is owed).
 //! A start for a result (startActivityForResult) is accepted too: the result it owes its caller is answered by the services (see [`Call::result_requested`]).
 //! And a start with no caller app (shell / home) of a package's launcher whose process is not running ([`check_shell`]).
-//! Every other call is refused: a SecurityException when the caller does not own the activity it names (fail-closed), otherwise the START code AOSP returns for the case
-//! (ActivityManager.java:162 FIRST_START_FATAL = -100), counted by `atl_diag::refused` under its reason. Refusals are never silent: the app sees the code, the log sees the count.
+//! Every other call is refused: a SecurityException when the caller does not own the activity it names (fail-closed; counted `exception:SECURITY` by the reply hook, not here), otherwise the START code
+//! AOSP returns for the case (ActivityManager.java:162 FIRST_START_FATAL = -100), counted by `atl_diag::refused` under its reason. Refusals are never silent: the app sees the code, the log sees the count.
 //! Refused, not modelled: implicit intents (intent filters), other packages, singleInstance, other processes, intent flags except NEW_TASK, task affinity
 //! across tasks (NEW_TASK into another affinity), more than one task per package, bringing a running app's task to front.
 
@@ -112,10 +112,6 @@ pub fn check<'a>(call: &Call<'_>, target: Target<'a>) -> Result<(&'a Declared, S
         return Err(refused(START_CANCELED, "resultTo names no activity"));
     };
     if source.uid != call.calling_uid || source.package != call.calling_package {
-        atl_diag::refused(
-            INTERFACE,
-            "startActivity (resultTo is not the caller's activity)",
-        );
         return Err(Refusal::Security("resultTo is not the caller's activity"));
     }
     let Some((package, class)) = call.component else {
@@ -200,10 +196,6 @@ pub fn check_shell(
     running: bool,
 ) -> Result<(), Refusal> {
     if calling_uid != SYSTEM_UID && calling_uid != SHELL_UID {
-        atl_diag::refused(
-            INTERFACE,
-            "startActivity (no caller app, uid without START_ANY_ACTIVITY)",
-        );
         return Err(Refusal::Security("startActivity: no caller app thread"));
     }
     let Some((_, class)) = component else {
