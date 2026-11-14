@@ -27,7 +27,8 @@ pub struct Image {
     segments: Vec<(usize, usize, i32)>,
 }
 
-fn page() -> usize {
+/// The host page size; QEMU linux-user gives the guest the same (bionic's `page_size()`).
+pub fn page() -> usize {
     // SAFETY: sysconf has no memory effects.
     unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
 }

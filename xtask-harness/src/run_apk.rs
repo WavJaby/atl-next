@@ -264,7 +264,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         end_ms: window::now_ms(),
     };
     let scripted = args.pointer.is_some() || args.drive.is_some();
-    let outcome = check_delivery(foreign.as_deref(), &m.name, &app)
+    let outcome = check_delivery(foreign.as_ref(), &m.name, &app)
         .and_then(|()| judge_ending(&services, &app, &ending, watch_ms, scripted))
         .and_then(|ok| {
             render_path_check(&read(&run.atld_log()), &app).map(|p| format!("{ok}; {p}"))
@@ -438,7 +438,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
             atld_exited: !stopped_at_limit(rc),
             end_ms,
         };
-        check_delivery(foreign.as_deref(), &m.name, &app)?;
+        check_delivery(foreign.as_ref(), &m.name, &app)?;
         judge_ending(&services, &app, &ending, watch_ms, a.pointer.is_some())
     });
     let outcome = outcome.and_then(|ok| {
@@ -479,9 +479,13 @@ fn library_entry(entry: &str) -> Option<(&str, &str)> {
         .then_some((abi, file))
 }
 
-/// The app's ISA when foreign (not `host`): the device ABI the install picks over every file of the package ([`find_supported_abi`]; a config split carries the libraries), whose guest and
-/// engine the test image then needs. Empty for a host-ISA or no-native-code app.
-fn foreign_isa(abis: &[SupportedAbi], host: &str, files: &[PackageFile]) -> Result<Option<String>> {
+/// The app's ABI when its ISA is foreign (not `host`): the device ABI the install picks over every file of the package ([`find_supported_abi`]; a config split carries the libraries), whose
+/// guest and engine the test image then needs. Empty for a host-ISA or no-native-code app.
+fn foreign_abi(
+    abis: &[SupportedAbi],
+    host: &str,
+    files: &[PackageFile],
+) -> Result<Option<SupportedAbi>> {
     let mut entries = String::new();
     for f in files {
         let list = Command::new("unzip")
@@ -498,12 +502,16 @@ fn foreign_isa(abis: &[SupportedAbi], host: &str, files: &[PackageFile]) -> Resu
         entries.push_str(&String::from_utf8_lossy(&list.stdout));
     }
     Ok(find_supported_abi(entries.lines(), abis)
-        .map(|i| abis[i].isa.clone())
-        .filter(|isa| isa != host))
+        .map(|i| abis[i].clone())
+        .filter(|a| a.isa != host))
 }
 
 /// The staged runtime of a run of `args` for the package `files`: the window gate's staging, with the GL driver, the native bridge guest of the host and, for a foreign-ISA app ([`foreign_isa`]), that ISA's guest and QEMU engine, and the GTK UI. Its display is set by the caller.
-fn runtime(root: &Path, args: &Args, files: &[PackageFile]) -> Result<(Runtime, Option<String>)> {
+fn runtime(
+    root: &Path,
+    args: &Args,
+    files: &[PackageFile],
+) -> Result<(Runtime, Option<SupportedAbi>)> {
     let rt = Runtime::new(
         root,
         "run-apk",
@@ -517,12 +525,12 @@ fn runtime(root: &Path, args: &Args, files: &[PackageFile]) -> Result<(Runtime, 
     .with_gl_driver(root)?
     .with_native_bridge_guest(&args.host)?
     .with_ui("gtk");
-    let foreign = foreign_isa(rt.abis(), &args.host, files)?;
+    let foreign = foreign_abi(rt.abis(), &args.host, files)?;
     let rt = match &foreign {
-        Some(isa) => {
-            crate::build_state::foreign_out(root, &rt.out, &args.host, isa, "run-apk")?;
-            rt.with_native_bridge_guest(isa)?
-                .with_qemu_engine(root, isa)?
+        Some(a) => {
+            crate::build_state::foreign_out(root, &rt.out, &args.host, &a.isa, "run-apk")?;
+            rt.with_native_bridge_guest(&a.isa)?
+                .with_qemu_engine(root, &a.isa)?
         }
         None => rt,
     };
@@ -558,19 +566,31 @@ fn runtime(root: &Path, args: &Args, files: &[PackageFile]) -> Result<(Runtime, 
     Ok((rt.with_app_env(&args.app_env), foreign))
 }
 
-/// The bridge's load line (atl-native-bridge loader.rs) for a library of `package`'s `lib/<isa>/`.
-fn delivery_line(package: &str, isa: &str) -> String {
-    format!("atl-native-bridge: loaded /data/app/{package}/lib/{isa}/")
+/// Whether `line` is the bridge's load line (atl-native-bridge loader.rs) for a library of `package` and ABI `a`: extracted, `/data/app/<package>/lib/<isa>/` (PackageManager's
+/// `lib/<instruction set>` dir), or straight from an APK (extractNativeLibs=false), `/data/app/<package>/<apk>!/lib/<abi>/` (the zip entry dir).
+fn is_delivery_line(line: &str, package: &str, a: &SupportedAbi) -> bool {
+    let prefix = format!("atl-native-bridge: loaded /data/app/{package}/");
+    let Some(path) = line.split_once(&prefix).map(|(_, p)| p) else {
+        return false;
+    };
+    path.starts_with(&format!("lib/{}/", a.isa))
+        || path.split_once(".apk!/").is_some_and(|(apk, entry)| {
+            !apk.contains('/') && entry.starts_with(&format!("lib/{}/", a.abi))
+        })
 }
 
-/// The delivery check of a foreign-ISA app (`foreign`): the app log `app` has the bridge loading one of the package's `lib/<isa>/` libraries into the guest, so ART handed the bridge the app's ISA and the engine took the library.
+/// The delivery check of a foreign-ISA app (`foreign`): the app log `app` has the bridge loading one of the package's libraries of that ABI into the guest, so ART handed the bridge the app's ISA and the engine took the library.
 /// Checked before the window verdict: without delivery nothing the app's native code does is the guest's.
-fn check_delivery(foreign: Option<&str>, package: &str, app: &str) -> Result<(), String> {
-    let Some(isa) = foreign else {
+fn check_delivery(foreign: Option<&SupportedAbi>, package: &str, app: &str) -> Result<(), String> {
+    let Some(a) = foreign else {
         return Ok(());
     };
-    let line = delivery_line(package, isa);
-    match app.lines().find(|l| l.contains(&line)) {
+    let isa = &a.isa;
+    let line = format!(
+        "atl-native-bridge: loaded /data/app/{package}/(lib/{isa}|<apk>!/lib/{})/",
+        a.abi
+    );
+    match app.lines().find(|l| is_delivery_line(l, package, a)) {
         Some(l) => {
             println!("run-apk: guest delivery {isa}: ok ({})", l.trim());
             Ok(())
@@ -1008,11 +1028,26 @@ mod tests {
     fn delivery_needs_the_guest_load_of_the_apps_isa() {
         let pkg = "com.zeptolab.ctr.ads";
         let app = "atl-native-bridge: loaded /data/app/com.zeptolab.ctr.ads/lib/arm64/libctro.so into the guest\n";
-        assert!(check_delivery(Some("arm64"), pkg, app).is_ok());
-        assert!(check_delivery(Some("arm64"), pkg, "").is_err());
-        assert!(check_delivery(Some("riscv64"), pkg, app).is_err());
+        let arm64 = &abis(&[("arm64-v8a", "arm64")])[0];
+        let riscv64 = &abis(&[("riscv64", "riscv64")])[0];
+        assert!(check_delivery(Some(arm64), pkg, app).is_ok());
+        assert!(check_delivery(Some(arm64), pkg, "").is_err());
+        assert!(check_delivery(Some(riscv64), pkg, app).is_err());
         // a host-ISA app has nothing to deliver
         assert!(check_delivery(None, pkg, "").is_ok());
+    }
+
+    /// The load line of an extractNativeLibs=false app: ART passes the zip entry path (bionic `kZipFileSeparator`), the entry dir named by the ABI, not the ISA.
+    #[test]
+    fn delivery_from_an_apk_entry_names_the_abi() {
+        let pkg = "jp.co.ponos.battlecatstw";
+        let app = "atl-native-bridge: loaded /data/app/jp.co.ponos.battlecatstw/split_config.arm64_v8a.apk!/lib/arm64-v8a/libnative-lib.so into the guest\n";
+        let arm64 = &abis(&[("arm64-v8a", "arm64")])[0];
+        let armv7 = &abis(&[("armeabi-v7a", "arm")])[0];
+        assert!(check_delivery(Some(arm64), pkg, app).is_ok());
+        assert!(check_delivery(Some(armv7), pkg, app).is_err());
+        // another package's APK is not this app's delivery
+        assert!(check_delivery(Some(arm64), "com.other", app).is_err());
     }
 
     /// Lines as atld prints them (atld main.rs `run`): a GPU desktop, its display tier, the trial tier, and WSLg's vgem-only devices.

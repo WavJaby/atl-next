@@ -481,6 +481,7 @@ dependencies = [
  "atl-engine-api",
  "libc",
  "object",
+ "zip",
 ]
 
 [[package]]

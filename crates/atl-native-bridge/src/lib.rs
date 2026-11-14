@@ -9,6 +9,7 @@
 //! Boundary crate: `unsafe` only in `exports`, `engine`, `loader`, `counters` (feature `crossing-count`) and the generated shells.
 #![deny(unsafe_code)]
 
+mod apk;
 #[cfg(feature = "crossing-count")]
 #[allow(unsafe_code)]
 pub mod counters;

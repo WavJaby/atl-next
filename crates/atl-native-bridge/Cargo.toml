@@ -122,6 +122,8 @@ atl-diag = { path = "../atl-diag" }
 atl-engine-api = { path = "../atl-engine-api" }
 libc.workspace = true
 object.workspace = true
+# `<apk>!/<entry>` libraries (extractNativeLibs=false): classify the entry, check bionic's stored + page-aligned conditions (apk.rs)
+zip.workspace = true
 
 [build-dependencies]
 anyhow.workspace = true
