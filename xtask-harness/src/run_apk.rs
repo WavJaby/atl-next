@@ -846,6 +846,23 @@ fn presented_since(app_log: &str, from_ms: u64) -> usize {
         .count()
 }
 
+/// Where the frames stopped, from the composer's last counters line: buffers latched from the app, scenes published, and scenes the window took (each take is one present line).
+/// Buffers without scenes = the clock never composed; scenes without takes = the window's frame clock never took one (unmapped, or not ticking).
+fn scene_counts(app: &str) -> String {
+    let Some(line) = crate::composer::last_counters(app) else {
+        return "no `composer: counters` line either".to_owned();
+    };
+    let n = |key| crate::composer::field(line, key).map_or("?".to_owned(), |v| v.to_string());
+    format!(
+        "composer: buffers_acquired={} scenes={} scenes_taken={} scenes_dropped={} presents_refused={}",
+        n("buffers_acquired"),
+        n("scenes"),
+        n("scenes_taken"),
+        n("scenes_dropped"),
+        n("presents_refused")
+    )
+}
+
 /// The run's verdict over its two logs, about the last activity the app resumed: the services are settled (nothing pending after that resume), no fault in the app log within
 /// `watch_ms` after it (`atld_exited` is a fault at the window's end), the watch was run to its end (`complete`), and a frame was presented after it.
 /// Ok: the pass line; Err: the first failed part.
@@ -880,8 +897,9 @@ fn judge(
     let frames = presented_since(app, last.ms);
     if frames == 0 {
         return Err(format!(
-            "no frame presented after {} resumed: the app log has no `{PRESENT_LINE}` line after it",
-            last.class
+            "no frame presented after {} resumed: the app log has no `{PRESENT_LINE}` line after it; {}",
+            last.class,
+            scene_counts(app)
         ));
     }
     Ok(format!(
@@ -1028,6 +1046,19 @@ mod tests {
                         services: activity settled at=103.501\n";
         let err = judge(services, PRESENT, true, false, 2_000).unwrap_err();
         assert!(err.contains("no frame presented after org.x.Main"), "{err}");
+    }
+
+    /// The tr-try5 shape: the composer latched buffers and published scenes the window never took. The failure names those counts, so it reads as "the window took none", not "the app drew none".
+    #[test]
+    fn no_frame_failure_names_the_composer_scene_counts() {
+        let app = "100.900  INFO composer: counters ticks=9 buffers_acquired=90159 scenes=90163 scenes_taken=0 scenes_dropped=90161 presents_refused=0\n";
+        let err = judge(RESUME, app, true, false, 2_000).unwrap_err();
+        assert!(
+            err.contains("buffers_acquired=90159 scenes=90163 scenes_taken=0 scenes_dropped=90161"),
+            "{err}"
+        );
+        let err = judge(RESUME, "100.500 I tag: x\n", true, false, 2_000).unwrap_err();
+        assert!(err.contains("no `composer: counters` line"), "{err}");
     }
 
     #[test]
