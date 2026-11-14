@@ -3,6 +3,7 @@
 //! ([`enter`]: xtask re-executes itself under `bwrap --dev-bind / /`), so every path, canonical or not, is the one a plain build sees.
 //! Why not a link farm (removed): javac checks `--patch-module` membership by canonical path (a farm's libcore resolved into `src-wt/` -> "package exists in another module: java.base"), and `#include "../.."` leaving an edited project resolved physically.
 //! Only AOSP task copies are bound: the other upstreams (llvm-project, qemu, boringssl …) are built by their own build systems from `Layout::locate`'s real directory, so no path is resolved through another tree.
+//! Plus one repo bind in every checkout: the repo's [`VENDOR_SRC`] at `src/aosp/`[`VENDOR_PROJECT`], AOSP's place for product code outside the platform tree, so our `Android.bp` modules are converted, signed and installed like the tree's. Its mount point is an empty dir xtask makes in the shared tree (no checkout holds `vendor/`, so the drift test never sees it); no build writes below it.
 //! Remaining risk: `ninja` run by hand outside the namespace reads the unpatched `src/aosp`; `cargo xtask native --shell` opens a shell inside it.
 
 use std::os::unix::fs::MetadataExt;
@@ -116,10 +117,39 @@ pub fn verify(overlays: &[Overlay]) -> Result<()> {
     Ok(())
 }
 
-/// The repo checkout at `root`'s overlay set.
+/// The tree path of the repo's product modules: AOSP's `vendor/<name>/` convention for code outside the platform tree.
+pub const VENDOR_PROJECT: &str = "vendor/atl";
+/// The repo dir shown there.
+pub const VENDOR_SRC: &str = "java";
+
+/// The repo bind: the checkout at `root`'s [`VENDOR_SRC`] over `src/aosp/`[`VENDOR_PROJECT`].
+pub fn vendor_overlay(layout: &Layout, root: &Path) -> Overlay {
+    Overlay {
+        project: VENDOR_PROJECT.into(),
+        copy: root.join(VENDOR_SRC),
+        target: shared_tree(layout).join(VENDOR_PROJECT),
+    }
+}
+
+/// The repo checkout at `root`'s AOSP task copies: what makes a task build differ from a plain one (build_state, the compiler cache's view). The repo bind is not among them: the checkout's own state covers it, and it holds no C/C++ a compiler cache would see.
 pub fn overlays_of(root: &Path) -> Result<Vec<Overlay>> {
     let layout = Layout::of(root)?;
     overlays(&layout, &crate::sources::load(root)?.checkouts(None))
+}
+
+/// Every bind of the build namespace ([`enter`], [`verify`]): the task copies, then the repo bind. A pinned project at or below the repo bind's path is refused: the bind would hide it.
+pub fn binds_of(root: &Path) -> Result<Vec<Overlay>> {
+    let layout = Layout::of(root)?;
+    let checkouts = crate::sources::load(root)?.checkouts(None);
+    let mut out = overlays(&layout, &checkouts)?;
+    if let Some(q) = checkouts.iter().find_map(|c| match &c.pin {
+        Pin::Aosp(q) if Path::new(q).starts_with(VENDOR_PROJECT) => Some(q),
+        _ => None,
+    }) {
+        bail!("{q} is a pinned project below the repo bind {VENDOR_PROJECT}");
+    }
+    out.push(vendor_overlay(&layout, root));
+    Ok(out)
 }
 
 /// The AOSP file `rel` (tree-relative) as the build reads it, for a reader outside the namespace: in its task copy when one covers it, else in the shared tree.
@@ -159,6 +189,11 @@ pub fn enter(
         Err(_) => {}
     }
     for o in overlays {
+        // the repo bind's mount point is xtask's to make: an empty dir in the shared tree; a task copy's is its src/ checkout
+        if o.project == VENDOR_PROJECT {
+            std::fs::create_dir_all(&o.target)
+                .with_context(|| format!("making the mount point {}", o.target.display()))?;
+        }
         ensure!(
             o.target.is_dir(),
             "{} is missing: the task copy needs its src/ checkout as mount point (cargo xtask fetch --execute)",
@@ -175,9 +210,7 @@ pub fn enter(
             .args(std::env::args_os().skip(1))
             .current_dir(std::env::current_dir()?);
     }
-    if !want.is_empty() {
-        println!("tree: task copies bound over src/aosp: {want}");
-    }
+    println!("tree: bound over src/aosp: {want}");
     let status = cmd.status().context("running bwrap")?;
     Ok(Some(match status.code() {
         Some(c) => ExitCode::from(u8::try_from(c).unwrap_or(1)),
@@ -245,6 +278,23 @@ mod tests {
             .map(|w| w.to_string_lossy().into_owned())
             .collect();
         assert_eq!(got.join(" "), want);
+    }
+
+    /// The repo bind: the checkout's java/ at src/aosp/vendor/atl (AOSP's vendor/<name> place), whatever the task.
+    #[test]
+    fn repo_bind_shape() {
+        let ws = Path::new("/ws");
+        let want = Overlay {
+            project: "vendor/atl".into(),
+            copy: "/repo/java".into(),
+            target: "/ws/src/aosp/vendor/atl".into(),
+        };
+        for task in [None, Some("t")] {
+            assert_eq!(
+                vendor_overlay(&Layout::new(ws, task), Path::new("/repo")),
+                want
+            );
+        }
     }
 
     #[test]

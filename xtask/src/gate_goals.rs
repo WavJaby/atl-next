@@ -312,6 +312,10 @@ pub const GATES: &[(&str, GoalsOf)] = &[
     ("run-apk", app),
     ("sandbox", Goals::default),
     ("sensors", runtime_gralloc),
+    // the signed product APKs it verifies (framework-res: platform role; the repo bind's fixture: default role) and apksigner, the verifier
+    ("signing", || {
+        Goals::host(&["framework-res", "AtlSigningFixture", APK_SIGNER])
+    }),
     // the fixture's libsigchain is a converter-package goal of every build (packages.rs)
     ("ui-module", Goals::default),
     ("window", window),

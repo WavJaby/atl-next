@@ -188,8 +188,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let ws = layout.workspace();
     // the task copies are bound over it: main entered the namespace (tree::enter)
     let tree = tree::shared_tree(&layout);
+    tree::verify(&tree::binds_of(root)?)?;
     let overlays = tree::overlays_of(root)?;
-    tree::verify(&overlays)?;
     let cache = CompilerCache::of(args, ws, &tree::describe(&overlays))?;
     // the signing key set (keys.rs): checked before converting, so a missing set fails with the command that makes it rather than at the first sign edge
     let keys = args

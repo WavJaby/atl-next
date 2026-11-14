@@ -58,6 +58,7 @@ mod sandbox;
 mod screencopy;
 mod sensors;
 mod services;
+mod signing;
 mod sles_bridge;
 mod test_fonts;
 mod tree_gate;
@@ -74,8 +75,9 @@ use clap::{Parser, Subcommand};
 
 use xtask::{
     arches, build_state, cargo_command, cdylib, checkout_root, codec2_store, cts_table, deps,
-    gate_goals, git, host_art, licenses, native, ndk, ndk_surface, packages, provided_gate, qemu,
-    runtimes, slot, sources, stage_env, test_apks, tree, triage, unit_use, verdict, ws_config,
+    gate_goals, git, host_art, keys, licenses, native, ndk, ndk_surface, packages, provided_gate,
+    qemu, runtimes, slot, sources, stage_env, test_apks, tree, triage, unit_use, verdict,
+    ws_config,
 };
 
 /// Runtime gates of the ATL-next repo, run as `cargo xtask test|run-apk|remote ...`.
@@ -205,6 +207,10 @@ enum Test {
     ///
     /// Controls run every time: the symlinked (link-farm) shape must make javac fail. Needs the prebuilt JDK and bwrap; no native build unless comparing.
     TaskBind(tree_gate::Args),
+    /// Product APK signing (signing.rs): framework-res installed at system/framework carries the key set's platform certificate, the repo bind's fixture (src/aosp/vendor/atl) at system/app its testkey (default role), per AOSP's apksigner against openssl's digest of each role certificate.
+    ///
+    /// Control every run: the two roles' certificates differ. `--break swap-role` expects the swapped roles and must fail. Needs `native --for signing`.
+    Signing(signing::Args),
     /// AOSP's GL fronts (USE_SLOW_BINDING) dispatch each thread's GL calls through its own hooks table, libEGL -> libGLESv2, via atl-bionic's `__get_tls()`; prints the per-call cost.
     ///
     /// Control every run: a libGLESv2 with its own atl-bionic copy (dlmopen) must fail. Needs libEGL + libGLESv2 in --out; no driver.
@@ -275,6 +281,9 @@ fn main() -> Result<ExitCode> {
         Command::Test {
             test: Test::Installer(args),
         } => installer::run(&root, &args),
+        Command::Test {
+            test: Test::Signing(args),
+        } => signing::run(&root, &args),
         Command::Test {
             test: Test::Parcel(args),
         } => parcel::run(&root, &args),
@@ -419,6 +428,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::NativeLoad(_) => "native-load",
             Test::NbIsa(_) => "nb-isa",
             Test::Installer(_) => "installer",
+            Test::Signing(_) => "signing",
             Test::Parcel(_) => "parcel",
             Test::Provider(_) => "provider",
             Test::Compositor(_) => "compositor",

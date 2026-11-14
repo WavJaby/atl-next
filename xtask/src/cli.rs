@@ -131,18 +131,18 @@ pub fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
     let root = checkout_root()?;
     let name = verdict_name(&cli.command);
-    // the commands that read src/aosp see the task copies through it (tree.rs)
+    // the commands that read src/aosp see the task copies and the repo bind through it (tree.rs)
     let shell = match &cli.command {
         Command::Native(a) => Some(a.shell),
         Command::Check(_) => Some(false),
         _ => None,
     };
     if let Some(shell) = shell {
-        let overlays = tree::overlays_of(&root)?;
+        let overlays = tree::binds_of(&root)?;
         // `native --shell`: the shell gets the compiler-cache variables of its own source view, as each ninja run does
         let env = match &cli.command {
             Command::Native(a) if a.shell => {
-                native::shell_env(a, &root, &tree::describe(&overlays))?
+                native::shell_env(a, &root, &tree::describe(&tree::overlays_of(&root)?))?
             }
             _ => Vec::new(),
         };

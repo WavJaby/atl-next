@@ -201,7 +201,7 @@ pub fn check(root: &Path) -> Result<()> {
     let (name, arch) = arches::build_machine(root, &arches)?;
     // the task copies are bound over it: main runs `check` inside the namespace (tree::enter)
     let tree = tree::shared_tree(&layout);
-    tree::verify(&tree::overlays_of(root)?)?;
+    tree::verify(&tree::binds_of(root)?)?;
     let libc = tree.join(BIONIC_INCLUDE);
     ensure!(
         libc.join("android/api-level.h").is_file(),
