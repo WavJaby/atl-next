@@ -213,30 +213,25 @@ impl GtkWindow {
             );
             shared.on_event.call(|f| f(event));
         }
-        // button 0: every button
-        let click = gtk4::GestureClick::new();
-        click.set_button(0);
+        // raw wl_pointer buttons, not GestureClick: a click gesture interprets presses (gtk-dnd-drag-threshold -> "stopped", n_press counting), and a drag past it lost its release -> the mouse finger never lifted
+        let buttons = gtk4::EventControllerLegacy::new();
         let s = Rc::clone(shared);
-        click.connect_pressed(move |g, _, x, y| {
-            emit(
-                &s,
-                g,
-                PointerPhase::Down(input::button(g.current_button())),
-                x,
-                y,
-            );
+        buttons.connect_event(move |c, event| {
+            let Some(b) = event.downcast_ref::<gdk::ButtonEvent>() else {
+                return glib::Propagation::Proceed;
+            };
+            let button = input::button(b.button());
+            let phase = match event.event_type() {
+                gdk::EventType::ButtonPress => PointerPhase::Down(button),
+                gdk::EventType::ButtonRelease => PointerPhase::Up(button),
+                _ => return glib::Propagation::Proceed,
+            };
+            if let Some((x, y)) = view_point(c, event) {
+                emit(&s, c, phase, x, y);
+            }
+            glib::Propagation::Proceed
         });
-        let s = Rc::clone(shared);
-        click.connect_released(move |g, _, x, y| {
-            emit(
-                &s,
-                g,
-                PointerPhase::Up(input::button(g.current_button())),
-                x,
-                y,
-            );
-        });
-        view.add_controller(click);
+        view.add_controller(buttons);
         let motion = gtk4::EventControllerMotion::new();
         let s = Rc::clone(shared);
         motion.connect_motion(move |c, x, y| emit(&s, c, PointerPhase::Move, x, y));
@@ -298,24 +293,8 @@ impl GtkWindow {
             };
             let sequence: *mut gdk::ffi::GdkEventSequence = event.event_sequence().to_glib_none().0;
             let id = s.touch_ids.borrow_mut().id(sequence as usize, phase);
-            // the event's position is the surface's; the content's is past the shadow and the header bar
-            let at = c.widget().zip(event.position()).and_then(|(view, (x, y))| {
-                let native = view.native()?;
-                let (shadow_x, shadow_y) = native.surface_transform();
-                native.compute_point(
-                    &view,
-                    &graphene::Point::new((x - shadow_x) as f32, (y - shadow_y) as f32),
-                )
-            });
-            if let (Some(id), Some(at)) = (id, at) {
-                let event = input::touch(
-                    phase,
-                    id,
-                    f64::from(at.x()),
-                    f64::from(at.y()),
-                    scale_of(c),
-                    c.current_event_time(),
-                );
+            if let (Some(id), Some((x, y))) = (id, view_point(c, event)) {
+                let event = input::touch(phase, id, x, y, scale_of(c), c.current_event_time());
                 s.on_event.call(|f| f(event));
             }
             glib::Propagation::Stop
@@ -378,6 +357,19 @@ fn fit_window(window: &gtk4::Window, view: &SceneView) {
 }
 
 /// The scale of the controller's `SceneView` (1 before it is attached).
+/// A raw event's position in the view: the event's is the surface's, the content's is past the shadow and the header bar.
+fn view_point(c: &gtk4::EventControllerLegacy, event: &gdk::Event) -> Option<(f64, f64)> {
+    let view = c.widget()?;
+    let (x, y) = event.position()?;
+    let native = view.native()?;
+    let (shadow_x, shadow_y) = native.surface_transform();
+    let at = native.compute_point(
+        &view,
+        &graphene::Point::new((x - shadow_x) as f32, (y - shadow_y) as f32),
+    )?;
+    Some((f64::from(at.x()), f64::from(at.y())))
+}
+
 fn scale_of(controller: &impl IsA<gtk4::EventController>) -> Scale {
     controller
         .widget()
