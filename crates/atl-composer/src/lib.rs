@@ -29,6 +29,7 @@ extern crate atl_diag_plain as atl_diag;
 pub mod capture;
 pub mod clock;
 pub mod cursor;
+pub mod frame_rate;
 pub mod input;
 pub mod mailbox;
 pub mod objects;

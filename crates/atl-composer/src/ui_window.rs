@@ -16,6 +16,7 @@ use atl_platform_ui::{
 
 use atl_services_types::display_model::DisplayModel;
 
+use crate::frame_rate::{FrameRate, largest_buffer};
 use crate::host::Composer;
 use crate::input::{InputSender, Message};
 use crate::mailbox::Mailbox;
@@ -153,7 +154,8 @@ fn open() {
         let first_frame = session.input.clone();
         let mailbox = Arc::clone(&session.mailbox);
         let composer = Arc::clone(&session.composer);
-        let (mut tick_count, mut presented) = (0u32, 0u32);
+        let mut tick_count = 0u32;
+        let mut rate = FrameRate::default();
         let requester = window.frame_requester();
         session
             .composer
@@ -163,20 +165,27 @@ fn open() {
             if let Some(taken) = mailbox.take() {
                 tracing::debug!(
                     "atl-composer: ui: present n={} time_ns={time_ns}",
-                    presented + 1
+                    rate.total() + 1
                 );
-                match shown.present(&taken.scene) {
+                let buffer = largest_buffer(&taken.scene);
+                let sizes = match shown.present(&taken.scene) {
                     Ok(()) => {
-                        presented += 1;
-                        if presented == 1 {
-                            let _ = first_frame.send(Message::FirstFrame);
-                        }
+                        let size = shown.size();
+                        Some((buffer, (size.width, size.height)))
                     }
                     Err(e) => {
                         tracing::warn!("atl-composer: ui present: {e}");
                         mailbox.refused(taken);
                         composer.presenter_reported();
+                        None
                     }
+                };
+                let first = sizes.is_some() && rate.total() == 0;
+                if let Some(second) = rate.record(time_ns, mailbox.stats().taken, sizes) {
+                    tracing::info!("{}", second.line());
+                }
+                if first {
+                    let _ = first_frame.send(Message::FirstFrame);
                 }
             }
             if tick_count == 0 {

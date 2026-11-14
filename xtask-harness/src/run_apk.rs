@@ -797,12 +797,48 @@ fn finish(
     {
         println!("run-apk: {line}");
     }
+    for line in fps_summary(app) {
+        println!("run-apk: {line}");
+    }
     println!("run-apk: logs {}", log_dir.display());
     if outcome.is_ok() {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// The composer's per-second `composer: fps` lines (atl-composer frame_rate.rs) summarised per buffer size, in first-seen order: `fps buffer=WxH seconds=<n> mean=<f> min=<n> p5=<n>`.
+/// p5 is nearest-rank (the ceil(0.05 n)-th smallest second): an observed second, never interpolated.
+fn fps_summary(app: &str) -> Vec<String> {
+    let mut sizes: Vec<(String, Vec<u64>)> = Vec::new();
+    for line in app.lines().filter(|l| l.contains("composer: fps ")) {
+        let (Some(n), Some(buffer)) = (
+            crate::composer::field(line, "presented"),
+            line.split_whitespace()
+                .find_map(|w| w.strip_prefix("buffer=")),
+        ) else {
+            continue;
+        };
+        match sizes.iter_mut().find(|(b, _)| b == buffer) {
+            Some((_, v)) => v.push(n),
+            None => sizes.push((buffer.to_owned(), vec![n])),
+        }
+    }
+    sizes
+        .into_iter()
+        .map(|(buffer, mut v)| {
+            v.sort_unstable();
+            let rank = (v.len() * 5).div_ceil(100).max(1);
+            let mean = v.iter().sum::<u64>() as f64 / v.len() as f64;
+            format!(
+                "fps buffer={buffer} seconds={} mean={mean:.1} min={} p5={}",
+                v.len(),
+                v[0],
+                v[rank - 1]
+            )
+        })
+        .collect()
 }
 
 /// The package to run, base first: a row's pinned files (verified by `test_apks::ensure`), or the one base APK a path names, which no row pins.
@@ -911,6 +947,26 @@ fn judge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two sizes: 121x175 seconds 45,44,46 -> mean 135/3 = 45.0, min 44, p5 rank ceil(0.15)=1 -> 44; 447x745 seconds 9,8 -> mean 8.5, min 8, p5 8. A line without `buffer=` is skipped.
+    #[test]
+    fn fps_summary_per_buffer_size() {
+        let app = "\
+1.0 INFO composer: fps presented=45 taken=46 buffer=121x175 window=480x800
+2.0 INFO composer: fps presented=44 taken=44 buffer=121x175 window=480x800
+2.5 INFO composer: fps presented=7
+3.0 INFO composer: fps presented=9 taken=9 buffer=447x745 window=480x800
+4.0 INFO composer: fps presented=46 taken=46 buffer=121x175 window=480x800
+5.0 INFO composer: fps presented=8 taken=8 buffer=447x745 window=480x800
+";
+        assert_eq!(
+            fps_summary(app),
+            [
+                "fps buffer=121x175 seconds=3 mean=45.0 min=44 p5=44",
+                "fps buffer=447x745 seconds=2 mean=8.5 min=8 p5=8",
+            ]
+        );
+    }
 
     fn abis(list: &[(&str, &str)]) -> Vec<SupportedAbi> {
         list.iter()
