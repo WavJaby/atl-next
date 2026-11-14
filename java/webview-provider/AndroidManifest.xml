@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- versionCode = WebViewFactoryProvider.MINIMUM_SUPPORTED_VERSION_CODE (WebViewFactoryProvider.java:51), the lowest isCompatibleImplementationPackage accepts under use_b_entry_point; targetSdkVersion
+     comes from platform_apis (the platform's), which meets the other branch (>= TIRAMISU). forceQueryable: AppsFilterImpl makes a system package with it visible to every app, as WebViewFactory's
+     getPackageInfo of the provider needs. The meta-data names the provider's JNI library (WebViewFactory.getWebViewLibrary); WebViewFactory ignores its relro load, the factory loads it itself. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.android.webview"
+    android:versionCode="661308800" android:versionName="atl">
+    <application android:label="Android System WebView" android:forceQueryable="true">
+        <meta-data android:name="com.android.webview.WebViewLibrary" android:value="libatl_webview.so" />
+    </application>
+</manifest>

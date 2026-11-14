@@ -95,6 +95,14 @@ public class Main extends Activity {
         }
     }
 
+    /** The WebView package line (app.rs WEBVIEW_PACKAGE): WebView.getCurrentWebViewPackage's name and whether it is a system app; `null` without one. */
+    private String webViewPackage() {
+        android.content.pm.PackageInfo p = android.webkit.WebView.getCurrentWebViewPackage();
+        if (p == null) return "null";
+        boolean system = (p.applicationInfo.flags & android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0;
+        return "name=" + p.packageName + " system=" + system;
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -113,6 +121,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "signatures: " + signatures());
         Log.i("AtlTest", "priority: " + priority());
         Log.i("AtlTest", "webview: " + webView());
+        Log.i("AtlTest", "webview-package: " + webViewPackage());
         mediaPlayerService();
         mediaExtractorWav();
         mediaRetrieverWav();

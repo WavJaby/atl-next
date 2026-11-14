@@ -265,10 +265,15 @@ fn main() -> Result<()> {
             .collect::<Vec<_>>()
             .join(" ")
     )?;
-    let pm = BnPackageManager::new_binder(
-        PackageManager::new(packages.clone(), Arc::clone(&permissions), features, gl_es),
-        BinderFeatures::default(),
-    );
+    let manager = PackageManager::new(packages.clone(), Arc::clone(&permissions), features, gl_es);
+    let webview_package = match atl_services::webview_update::current_package(&packages, &manager) {
+        Ok(p) => p,
+        Err(why) => {
+            writeln!(std::io::stderr(), "services: webviewupdate: {why}")?;
+            None
+        }
+    };
+    let pm = BnPackageManager::new_binder(manager, BinderFeatures::default());
     binder::add_service(PACKAGE, pm.as_binder()).context("addService package")?;
     let focus = Arc::new(atl_services::focus::FocusedProcess::default());
     binder::add_service(
@@ -369,7 +374,7 @@ fn main() -> Result<()> {
     if !a.omit_service.iter().any(|s| s == WEBVIEW_UPDATE) {
         binder::add_service(
             WEBVIEW_UPDATE,
-            atl_services::webview_update::new_binder(&packages)?,
+            atl_services::webview_update::new_binder(webview_package)?,
         )
         .context("addService webviewupdate")?;
     }

@@ -36,7 +36,9 @@ const SIGNATURE_SECOND_NOT_SIGNED: i32 = -2;
 const SIGNATURE_NO_MATCH: i32 = -3;
 const SIGNATURE_UNKNOWN_PACKAGE: i32 = -4;
 /// PackageManager.GET_SIGNATURES, GET_SIGNING_CERTIFICATES (PackageManager.java:1084, :1309).
-const GET_SIGNATURES: i64 = 0x40;
+pub const GET_SIGNATURES: i64 = 0x40;
+/// ApplicationInfo.FLAG_INSTALLED (1 << 23).
+pub const FLAG_INSTALLED: i32 = 1 << 23;
 const GET_SIGNING_CERTIFICATES: i64 = 0x0800_0000;
 /// PackageManager.GET_ACTIVITIES, GET_RECEIVERS, GET_SERVICES, GET_PROVIDERS, GET_INSTRUMENTATION, GET_PERMISSIONS (PackageManager.java): what PackageInfoCommonUtils.generate copies.
 const GET_ACTIVITIES: i64 = 0x1;
@@ -56,6 +58,8 @@ pub const STOCK_PM_FLAGS: i64 = 0x400;
 /// android.test.base for old targetSdk levels).
 pub fn application_info(p: &PackageRecord, packages: &Packages, flags: i64) -> ApplicationInfo {
     let mut a = p.app().clone();
+    // PackageInfoUtils.updateApplicationInfo: FLAG_INSTALLED from the user state; every record is installed for the one user
+    a.flags |= FLAG_INSTALLED;
     if flags & GET_META_DATA == 0 {
         a.item.meta_data = None;
     }
@@ -242,7 +246,7 @@ impl PackageManager {
     }
 
     /// getPackageInfo after the visibility check (PackageInfoCommonUtils.generate over the stored info, cut to `flags`).
-    fn package_info(&self, p: &PackageRecord, flags: i64) -> PackageInfo {
+    pub fn package_info(&self, p: &PackageRecord, flags: i64) -> PackageInfo {
         let packages = &self.packages;
         let c = |c: &mut ComponentInfo| cut(p, packages, c, flags).is_some();
         let info = &p.info;

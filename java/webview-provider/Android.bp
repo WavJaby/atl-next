@@ -1,0 +1,9 @@
+// SPDX-License-Identifier: MIT
+// The WebView provider package com.android.webview (plan webview S4.1, system-packages R2): converted from src/aosp/vendor/atl, signed with the default certificate role (testkey), installed at
+// product/app/webview/webview.apk -- AOSP's module name and partition (build/make/target/product/media_product.mk lists `webview`). No native code in the APK: its JNI library is a platform library.
+android_app {
+    name: "webview",
+    srcs: ["java/**/*.java"],
+    platform_apis: true,
+    product_specific: true,
+}

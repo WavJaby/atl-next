@@ -181,11 +181,16 @@ pub fn nb_guest() -> Goals {
 }
 
 /// `xtask test app` (and run-apk, audio-app, drive): atl-audio-bridge (the server's mixer, game audio A2) links AudioMixerBase's library and the utilities its gain conversion uses; the launcher builds it in every app run.
+/// `webview`: the WebView provider package (repo `java/webview-provider`), which the app gate places in /product.
 fn app() -> Goals {
     runtime()
         .with(gralloc())
         .with(nb_guest())
-        .with(Goals::host(&["libaudioprocessing_base", "libaudioutils"]))
+        .with(Goals::host(&[
+            "libaudioprocessing_base",
+            "libaudioutils",
+            "webview",
+        ]))
 }
 
 fn runtime_gralloc() -> Goals {

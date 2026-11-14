@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use atl_layout::Layout;
 
 use crate::atld_run::{Package, Run, Runtime, children_outside_broker, counter_lines, counters};
@@ -86,6 +86,10 @@ pub struct Args {
     /// The WebView feature break: the run places no FEATURE_WEBVIEW test file, so getDefaultUserAgent throws today's no-WebView UnsupportedOperationException and the webview line must go red.
     #[arg(long)]
     webview_feature_break: bool,
+    /// The WebView provider break: the run does not place the provider package (`<out>/partitions/product/app/webview/webview.apk`), so webviewupdate has no current package and the
+    /// webview-package line must go red (null).
+    #[arg(long)]
+    webview_provider_break: bool,
 }
 
 /// The fixture's dir.
@@ -152,14 +156,24 @@ const SIGNATURES: &str = "AtlTest: signatures: ";
 /// package, and IMPORTANCE_FOREGROUND (100: ATL answers every app process as PROCESS_STATE_TOP). `null` = the list AOSP gives a caller with no attached process.
 const PROCESSES: &str = "AtlTest: processes: ";
 const PROCESSES_WANT: &str = "count=1 own=1 uid=true name=true pkg=true importance=100";
-/// Main.webView's line: WebSettings.getDefaultUserAgent with FEATURE_WEBVIEW declared (the run's test feature file, Runtime::with_webview_feature) and no provider package installed.
-/// AOSP: `webviewupdate`'s waitForAndGetProvider answers LIBLOAD_FAILED_LISTING_WEBVIEW_PACKAGES -> WebViewFactory.getWebViewContextAndSetProvider throws MissingWebViewPackageException,
-/// getProviderClass wraps it in AndroidRuntimeException, getProvider's catch (Exception) wraps that once more. Without the feature: UnsupportedOperationException alone (getProvider :345);
-/// without the service: asInterface(null)'s NullPointerException, wrapped once by getProvider (measured).
+/// Main.webView's line: WebSettings.getDefaultUserAgent with FEATURE_WEBVIEW declared (the run's test feature file, Runtime::with_webview_feature).
+/// Without the provider placed, AOSP: `webviewupdate`'s waitForAndGetProvider answers LIBLOAD_FAILED_LISTING_WEBVIEW_PACKAGES -> WebViewFactory.getWebViewContextAndSetProvider throws
+/// MissingWebViewPackageException, getProviderClass wraps it in AndroidRuntimeException, getProvider's catch (Exception) wraps that once more. Without the feature: UnsupportedOperationException
+/// alone (getProvider :345); without the service: asInterface(null)'s NullPointerException, wrapped once by getProvider (measured).
+/// With the provider placed the same chain stays until PackageManager shows the provider to apps (forceQueryable, webview plan W1b-2): getPackageInfo's NameNotFoundException is wrapped as
+/// MissingWebViewPackageException (WebViewFactory.java:520-521).
 const WEBVIEW: (&str, &str) = (
     "AtlTest: webview: ",
     "threw=android.util.AndroidRuntimeException<android.util.AndroidRuntimeException<android.webkit.WebViewFactory$MissingWebViewPackageException",
 );
+/// Main.webViewPackage's line: WebView.getCurrentWebViewPackage (webviewupdate's getCurrentWebViewPackage, WebView.java:3128-3140) with the provider placed: the scanned
+/// `com.android.webview` with FLAG_SYSTEM (WebViewUpdateServiceImpl2.providerHasValidSignature accepts a system app). `null` = no valid provider.
+const WEBVIEW_PACKAGE: (&str, &str) = (
+    "AtlTest: webview-package: ",
+    "name=com.android.webview system=true",
+);
+/// Where the run places the provider, as AOSP's product image does (media_product.mk `webview`): `<partition>/app/<module>/<module>.apk` (build/soong/java/app.go installPath).
+const WEBVIEW_PROVIDER: &str = "app/webview/webview.apk";
 
 /// A [`SERVICE_LINES`] expectation: the fixed value, or for connectivity (None) [`connectivity_want`].
 fn service_want(fixed: Option<&str>) -> String {
@@ -1092,6 +1106,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         rt.with_webview_feature(&layout.src().join("aosp"))?
     };
+    // the converter's installed provider (system-packages R2); placed by the run until the product ships it with FEATURE_WEBVIEW (webview plan S4.2, W3)
+    let rt = if args.webview_provider_break {
+        rt
+    } else {
+        let built = rt.out.join("partitions/product").join(WEBVIEW_PROVIDER);
+        ensure!(built.is_file(), "missing input {}", built.display());
+        let at = format!("{}/{WEBVIEW_PROVIDER}", atl_android_paths::PRODUCT);
+        rt.with_fixture_file(built, &at)
+    };
     let work = rt.out.join("app");
     // the bridge-1 JNI fixture rides along in lib/<abi>/ (jni_fixture.rs); the NativeBridge core loads it into the guest
     let native = jni_fixture::apk_libs(
@@ -1293,6 +1316,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if passed && webview.as_deref() != Some(want) {
         whys.push(format!("webview: want {want:?}, got {webview:?}"));
     }
+    let (prefix, want) = WEBVIEW_PACKAGE;
+    let webview_package = app
+        .lines()
+        .find_map(|l| l.split_once(prefix).map(|(_, r)| r.trim_end().to_owned()));
+    if passed && webview_package.as_deref() != Some(want) {
+        whys.push(format!(
+            "webview-package: want {want:?}, got {webview_package:?}"
+        ));
+    }
     let features = app
         .lines()
         .find_map(|l| l.split_once(FEATURES).map(|(_, r)| r.trim_end().to_owned()));
@@ -1429,6 +1461,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
         println!("app: pass processes {PROCESSES_WANT}");
         println!("app: pass webview {}", WEBVIEW.1);
+        println!("app: pass webview-package {}", WEBVIEW_PACKAGE.1);
         println!(
             "app: pass priority {} ({})",
             priority.as_deref().unwrap_or_default(),
