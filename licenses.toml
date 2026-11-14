@@ -786,6 +786,10 @@ reason = "generated static mode tables, no notice; libopus COPYING (BSD-3-Clause
 licence = "BSD-3-Clause"
 reason = "generated table data, no notice; libopus COPYING (BSD-3-Clause)"
 
+[upstream.aosp.paths."external/libvpx/config/generic/vpx_version.h"]
+licence = "BSD-3-Clause"
+reason = "generated version header (the riscv64 build's generic config), no notice; libvpx LICENSE (WebM Project, BSD-3-Clause)"
+
 [upstream.aosp.paths."external/libvpx/config/x86_64/vpx_config.asm"]
 licence = "BSD-3-Clause"
 reason = "generated configure output (%define lines), no notice; libvpx LICENSE (WebM Project, BSD-3-Clause)"

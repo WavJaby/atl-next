@@ -148,6 +148,12 @@ func TestSplitTag(t *testing.T) {
 // javaTestGraph evaluates blueprint files in a temporary tree into a Graph with Java nodes enabled, tools at fixed fake paths.
 func javaTestGraph(t *testing.T, files map[string]string, flags map[string]string) *Graph {
 	t.Helper()
+	return javaTestGraphCfg(t, Config{Arch: "x86_64", PointerBits: 64}, files, flags)
+}
+
+// javaTestGraphCfg: javaTestGraph for cfg (a cross host's, for one).
+func javaTestGraphCfg(t *testing.T, cfg Config, files map[string]string, flags map[string]string) *Graph {
+	t.Helper()
 	tree, out := t.TempDir(), t.TempDir()
 	for path, body := range files {
 		p := filepath.Join(tree, path)
@@ -162,7 +168,6 @@ func javaTestGraph(t *testing.T, files map[string]string, flags map[string]strin
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := Config{Arch: "x86_64", PointerBits: 64}
 	g := &Graph{tree: tree, out: out, cfg: cfg, nodes: map[key]*Node{}, baseTypes: map[string]string{}, mods: map[Side]map[string][]*Module{}}
 	for _, side := range cfg.sides() {
 		g.mods[side], _ = (&evaluator{cfg: cfg, os: side.evalOS()}).modules(parsed)

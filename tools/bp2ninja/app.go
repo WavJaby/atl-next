@@ -840,7 +840,8 @@ func (g *Graph) signApk(n *jNode, out, in string, c keyCert, signed bool) {
 	}
 	jar := g.jtoolJar("signapk", n.name)
 	jni := filepath.Join(g.out, "missing-tool", signapkJni+".so")
-	if ln := g.node(signapkJni, Host, Shared, n.name); ln != nil {
+	// the build machine's JVM loads it: the tool side (a cross host's Host side is the target's)
+	if ln := g.node(signapkJni, g.cfg.toolSide(), Shared, n.name); ln != nil {
 		jni = g.nodeOut(ln)
 	}
 	g.java.edge("signapk", []string{out}, []string{in}, []string{jar, jni, c.pem, c.key}, nil,

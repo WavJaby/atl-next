@@ -274,6 +274,21 @@ android_app { name: "pre", certificate: "PRESIGNED", product_specific: true, src
 	}
 }
 
+// signapk runs in the build machine's JVM, so its JNI library comes from the tool side: Host natively, Build on a cross host (whose Host side is the target's: a riscv64 .so the x86_64 JVM cannot load).
+func TestSignapkJniOnToolSide(t *testing.T) {
+	for _, cfg := range []Config{{Arch: "x86_64", PointerBits: 64}, riscvOnX86} {
+		g := javaTestGraphCfg(t, cfg, appFixture(nil), appFlags)
+		n := g.jnode("framework-res", Device, "test")
+		if n == nil || n.apk == "" {
+			t.Fatalf("%s: no framework-res apk: %v", cfg.Arch, g.problems)
+		}
+		sg := ninjaEdgeVars(g.java.b.String(), n.apk)
+		if want := filepath.Join(g.out, cfg.toolSide().String(), "libconscrypt_openjdk_jni"); sg == nil || sg["jnidir"] != want {
+			t.Errorf("%s: jnidir %q, want %q", cfg.Arch, sg["jnidir"], want)
+		}
+	}
+}
+
 // A module that sets use_resource_processor: false (CtsUtilTestCases) compiles aapt2's R.java: `--java <dir>` with a soong_zip of it into
 // gen/android/R.srcjar (aapt2Link, the `android` subdir PathForModuleGen keeps), the srcjar among javac's sources, no R.jar.
 func TestAndroidLibraryWithoutBusybox(t *testing.T) {
