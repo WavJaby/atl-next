@@ -69,6 +69,7 @@ func main() {
 	var jt JavaTools
 	flag.StringVar(&jt.JDK, "jdk", "", "Java goals: JDK home (Soong's ANDROID_JAVA_HOME, prebuilts/jdk/jdk21/<host tag>)")
 	flag.StringVar(&jt.BuildTools, "build-tools", "", "Java goals: directory holding soong_zip, merge_zips, zip2zip, zipalign")
+	flag.StringVar(&jt.Keys, "keys", "", "Java goals: key set dir android apps are signed with, <role>.x509.pem + <role>.pk8 per Soong certificate role, testkey the default role (Soong's DefaultAppCertificateDir); its testkey also decides ro.build.tags (buildprop.go)")
 	release := flag.String("release", "", "build/release config (TARGET_RELEASE): build flags and aconfig values (aconfig flag libraries; Java goals)")
 	measure := flag.Bool("measure", false, "write <out>/measure.txt (module types and source kinds the goals reach, measure.go) instead of a build")
 	cxxProbe := flag.String("device-cxx-flags", "", "tree dir: instead of a build, write <out>/compat (the libc provider from -provided) and print as JSON {argv, android} the C++ command line a device module there gets with nothing of its own, and the -D__ANDROID__ define in it (xtask check step libcxx); takes no goals")
@@ -332,7 +333,7 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 		if err != nil {
 			return err
 		}
-		prop, err := buildProp(g.release, id)
+		prop, err := buildProp(g.release, id, js.tools.Keys)
 		if err != nil {
 			return err
 		}

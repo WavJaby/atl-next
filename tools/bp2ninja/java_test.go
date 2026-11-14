@@ -174,7 +174,7 @@ func javaTestGraph(t *testing.T, files map[string]string, flags map[string]strin
 	}
 	g.release = &Release{Name: "r", flags: fl}
 	g.acfg = newAconfigGraph("/aconfig")
-	g.java = &javaGraph{tools: JavaTools{JDK: "/jdk", BuildTools: "/bt"}, cfg: JavaConfig{JavacHeapSize: "1M"}, nodes: map[jKey]*jNode{}}
+	g.java = &javaGraph{tools: JavaTools{JDK: "/jdk", BuildTools: "/bt", Keys: "/keys"}, cfg: JavaConfig{JavacHeapSize: "1M"}, nodes: map[jKey]*jNode{}}
 	return g
 }
 

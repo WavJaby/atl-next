@@ -35,6 +35,7 @@ pub mod host_disk;
 pub mod isa_gate;
 pub mod isa_tiers;
 pub mod keepset;
+pub mod keys;
 pub mod land;
 pub mod launcher_closure;
 pub mod libcxx_gate;

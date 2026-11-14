@@ -37,6 +37,9 @@ pub struct Args {
     /// Guest arch of the native bridge side (an arches.toml row with `[guest]`): first builds its LLVM runtimes (runtimes.rs) against bionic's `libc_headers`, then converts `nb:` goals against bionic into `<out>/nb/<arch>`, or for a guest other than the host's into its own graph dir (`graph_dir`).
     #[arg(long)]
     native_bridge: Option<String>,
+    /// Key set the product APKs are signed with, `<role>.x509.pem` + `<role>.pk8` per certificate role (keys.rs; default: the workspace's dev set, <workspace>/keys, made by `xtask keys --execute`).
+    #[arg(long)]
+    keys: Option<PathBuf>,
     /// C compiler (default: deps.toml row `clang`'s binary).
     #[arg(long)]
     cc: Option<String>,
@@ -188,6 +191,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let overlays = tree::overlays_of(root)?;
     tree::verify(&overlays)?;
     let cache = CompilerCache::of(args, ws, &tree::describe(&overlays))?;
+    // the signing key set (keys.rs): checked before converting, so a missing set fails with the command that makes it rather than at the first sign edge
+    let keys = args
+        .keys
+        .clone()
+        .unwrap_or_else(|| crate::keys::dev_dir(&layout));
+    crate::keys::check_set(&keys)?;
     // go.work and the converter binary live in the build dir, so concurrent checkouts (each in its own dir) do not overwrite each other's converter
     // a cross host's outputs go under its arch's dir, so two arches in one slot never write the same path; the build machine's stay at the out dir, where its gates read them
     let out = slot::out_dir(root, args.out.as_deref(), "--out", |workspace| {
@@ -373,6 +382,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             path(&jdk),
             "-build-tools".into(),
             path(&build_tools),
+            "-keys".into(),
+            path(&keys),
             "-out".into(),
             path(&graph_out),
         ];

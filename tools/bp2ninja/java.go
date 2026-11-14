@@ -31,6 +31,8 @@ import (
 // metalava is built from tools/metalava (J1) like any host Java tool.
 type JavaTools struct {
 	JDK, BuildTools string
+	// Keys: the key set apps are signed with, Soong's DefaultAppCertificateDir layout (<role>.x509.pem + <role>.pk8 per certificate role)
+	Keys string
 }
 
 type jKey struct {
@@ -81,6 +83,7 @@ type jNode struct {
 	aapt      *aaptOut
 	apk       string
 	extraApks []string // split apks (Module.extraOutputFiles)
+	installed []string // the apk and its splits at their install paths (app.go installDir)
 }
 
 // javaGraph holds the Java side of a Graph.
@@ -1003,11 +1006,12 @@ func (g *Graph) javaHeaders(n *jNode, impl string, turbine bool, localHdr []stri
 	g.java.edgeV("header", []string{n.header}, []string{impl}, nil, nil, validations, nil)
 }
 
-// output is what building a Java goal means: its dex jar, else its jar with resources, else its stubs / system modules.
+// output is what building a Java goal means: an app's apk installed (and its splits), else its dex jar, else its jar with resources, else
+// its stubs / system modules.
 func (n *jNode) output() []string {
 	switch {
 	case n.apk != "":
-		return []string{n.apk}
+		return append([]string{n.apk}, n.installed...)
 	case n.dex != "":
 		return []string{n.dex}
 	case n.implRes != "":

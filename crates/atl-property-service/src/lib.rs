@@ -3,7 +3,7 @@
 //! The broker's role, played for now by xtask and test harnesses through the `atl-property-service` binary; atld's live service (setprop, persist.*) comes later.
 //!
 //! Defaults, by source (a key no AOSP code needs from us stays unset: readers take their own default, e.g. `ro.hw_timeout_multiplier` -> 1, `log.tag.*` -> INFO):
-//! - the converter's build.prop (bp2ninja buildprop.go): `ro.build.id`, `ro.build.version.*` from the release config.
+//! - the converter's build.prop (bp2ninja buildprop.go): `ro.build.id`, `ro.build.version.*` from the release config; `ro.build.tags` from the key set that signed the build (get_build_keys).
 //! - `CONSTANTS`: what neither the tree nor the host decides, each with its reason.
 //! - arches.toml as the board config, AOSP's board_config.mk rules (build.rs): `ro.product.cpu.abilist`, `abilist32`, `abilist64`.
 //! - derived as init derives it when unset: `ro.build.fingerprint` (`fingerprint`).
@@ -27,8 +27,6 @@ const CONSTANTS: &[(&str, &str)] = &[
     ("ro.build.type", "user"),
     // what a user build sets (gen_build_prop.py: ro.debuggable=0 without target debugging): liblog __android_log_is_debuggable and libnativehelper JniInvocation (no persist.sys.dalvik.vm.lib.2 override) read it
     ("ro.debuggable", "0"),
-    // gen_build_prop.py get_build_keys: "test-keys" only when the product's DefaultAppCertificate is AOSP's public test key; ATL ships nothing signed with it, and apps' root detection reads "test-keys" as a rooted or engineering device
-    ("ro.build.tags", "release-keys"),
     // BUILD_NUMBER: a build server's number; ATL numbers no builds yet
     ("ro.build.version.incremental", "0"),
     // Build.BRAND / MANUFACTURER / MODEL / DEVICE / PRODUCT: the runtime, not the host hardware (apps key device quirks on them; no real device's quirks apply)
@@ -213,7 +211,7 @@ mod tests {
     use atl_bionic::props::{Area, VALUE_MAX, value_len};
     use std::sync::atomic::AtomicU32;
 
-    const BUILD_PROP: &str = "# generated\nro.build.id=BP2A.1\n\nro.build.version.release_or_codename = 16\nro.build.version.sdk=36\n";
+    const BUILD_PROP: &str = "# generated\nro.build.id=BP2A.1\n\nro.build.version.release_or_codename = 16\nro.build.version.sdk=36\nro.build.tags=dev-keys\n";
 
     fn words(bytes: &[u8]) -> Vec<AtomicU32> {
         bytes
@@ -269,7 +267,8 @@ mod tests {
             p[1],
             ("ro.build.version.release_or_codename".into(), "16".into())
         );
-        assert_eq!(p.len(), 3);
+        // the fixture's four name=value lines; the comment and blank line skipped
+        assert_eq!(p.len(), 4);
         for bad in ["novalue", "ro.x?=1", "=1", "a b=1"] {
             assert!(
                 matches!(
@@ -290,10 +289,10 @@ mod tests {
         assert_eq!(read(&a, "sys.boot_completed").as_deref(), Some("1"));
         assert_eq!(read(&a, "ro.debuggable").as_deref(), Some("0"));
         assert_eq!(read(&a, "media.metrics.enabled").as_deref(), Some("0"));
-        // init's layout over the constants above and the fixture's id / release
+        // init's layout over the constants above and the fixture's id / release / tags
         assert_eq!(
             read(&a, "ro.build.fingerprint").as_deref(),
-            Some("ATL/atl/atl:16/BP2A.1/0:user/release-keys")
+            Some("ATL/atl/atl:16/BP2A.1/0:user/dev-keys")
         );
         // unset keys stay unset: their readers' defaults apply
         assert_eq!(read(&a, "ro.hw_timeout_multiplier"), None);

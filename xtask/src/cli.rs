@@ -65,6 +65,11 @@ enum Command {
     /// Task copies (`xtask patch --edit`) replace their src/ checkout. With AOSP ones, `native` and `check` re-execute inside a mount namespace (`bwrap --dev-bind / /`) where each is bind-mounted over src/aosp/<project>, so the tree path is always src/aosp; the slot's `built-from` record names each bound copy and its state.
     /// Risk: `ninja` run by hand outside the namespace reads the unpatched src/aosp; `native --shell <goal> --host <h>` opens $SHELL inside it.
     Native(native::Args),
+    /// The key set product APKs are signed with (keys.rs): per Soong certificate role (`platform`, `testkey`) `<role>.x509.pem` + `<role>.pk8`.
+    ///
+    /// Default dir: the workspace's dev set <workspace>/keys, shared by every slot; `native` signs with it unless given `--keys`. Never AOSP's published keys, never committed.
+    /// Dry run by default: lists the roles present and missing. `--execute` makes the missing ones with openssl as AOSP's make_key does.
+    Keys(keys::Args),
     /// The pinned QEMU's user-mode executable for a guest arch (`qemu-<target>`), built with no patch.
     ///
     /// Dry run unless `--execute`: then QEMU's own `configure` and ninja build `qemu-<target>` into `<out>/qemu/<target>-linux-user`, and its `--version` must name the sources.toml pin.
@@ -164,6 +169,7 @@ pub fn main() -> Result<ExitCode> {
         Command::Aosp(args) => aosp::run(&root, &args),
         Command::Keepset(args) => keepset::run(&root, &args),
         Command::Native(args) => native::run(&root, &args),
+        Command::Keys(args) => keys::run(&root, &args),
         Command::Qemu(args) => qemu::run(&root, &args),
         Command::Slot { slot } => slot::run(&root, &slot),
         Command::Patch(args) => patch::run(&root, &args),

@@ -20,8 +20,8 @@ import (
 //     Without busybox the link writes R.java (`--java`) into an R.srcjar compiled with the module.
 //   - Manifests: manifest_fixer on the module's, manifest-merger over the transitive static libraries' (not merged for a library: the app does).
 //   - An app's classes are dexed by javaDex (d8; the framework-res apk has none); the apk is merge_zips of the dex jar, the resource package and
-//     the JNI zip, then zipalign -p 4 where Soong signs. NOT SIGNED: nothing here verifies a signature (the package manager is atld's, which
-//     reads the manifest), and signapk needs its host JNI library built.
+//     the JNI zip, signed by signapk with the key of its `certificate` role (signApk) and copied to its install path (installDir) below
+//     <out>/partitions.
 //   - Not modelled: product characteristics / RRO / overlays, the asset-dir hash comment, uses-library class loader contexts beyond uses_libs
 //     and optional_uses_libs, extra_packages, proguard, resource shrinking, split packages, the tradefed test config, test data installs.
 //     `instrumentation_for` and the properties listed in appUnsupported are reported as problems.
@@ -754,8 +754,9 @@ func (g *Graph) hasCode(n *jNode) bool {
 	return false
 }
 
-// appPackage is CreateAndSignAppPackage (without the signature) and jniBuildActions: merge_zips of the dex jar, the resource package and the
-// JNI zip into <name>-unsigned.apk, aligned into <name>.apk.
+// appPackage is CreateAndSignAppPackage and jniBuildActions: merge_zips of the dex jar, the resource package and the JNI zip into
+// <name>-unsigned.apk, signed into <name>.apk (signapk aligns as it signs), then installed (installPath). Splits are signed with the same
+// certificate and installed beside the apk, as Soong does.
 func (g *Graph) appPackage(n *jNode) {
 	j := g.java
 	name := n.name
@@ -770,19 +771,112 @@ func (g *Graph) appPackage(n *jNode) {
 	if jni := g.jniZip(n); jni != "" {
 		inputs = append(inputs, jni)
 	}
-	unsigned := filepath.Join(n.dir, name+"-unsigned.apk")
-	j.edge("mergezips", []string{unsigned}, inputs, nil, nil, nil)
-	n.apk = filepath.Join(n.dir, name+".apk")
-	j.edge("zipalign", []string{n.apk}, []string{unsigned}, nil, nil, nil)
+	cert, signed := g.appCertificate(n)
+	installDir := g.installDir(n, name)
+	pack := func(stem string, in []string) string {
+		unsigned := filepath.Join(n.dir, stem+"-unsigned.apk")
+		j.edge("mergezips", []string{unsigned}, in, nil, nil, nil)
+		apk := filepath.Join(n.dir, stem+".apk")
+		g.signApk(n, apk, unsigned, cert, signed)
+		installed := filepath.Join(installDir, stem+".apk")
+		j.edge("installapk", []string{installed}, []string{apk}, nil, nil, nil)
+		n.installed = append(n.installed, installed)
+		return apk
+	}
+	n.apk = pack(name, inputs)
 	// a split is packaged alone (no dex, no JNI): <name>_<suffix>.apk, the module's extraOutputFiles
 	for _, s := range n.aapt.splits {
-		su := filepath.Join(n.dir, name+"_"+s.suffix+"-unsigned.apk")
-		j.edge("mergezips", []string{su}, []string{s.path}, nil, nil, nil)
-		apk := filepath.Join(n.dir, name+"_"+s.suffix+".apk")
-		j.edge("zipalign", []string{apk}, []string{su}, nil, nil, nil)
-		n.extraApks = append(n.extraApks, apk)
+		n.extraApks = append(n.extraApks, pack(name+"_"+s.suffix, []string{s.path}))
 	}
 }
+
+// presigned is the certificate value of a module whose apk keeps the signature it has (app.go: android_app_import's `presigned`; an
+// android_app setting it is passed through unsigned here, Soong's own handling being an import's).
+const presigned = "PRESIGNED"
+
+// keyCert is one Soong Certificate: the x509 PEM and the PKCS#8 key of a role in the key set.
+type keyCert struct{ pem, key string }
+
+// appCertificate is processMainCert for a certificate that is not a module reference: `certificate: "<role>"` names
+// <DefaultAppCertificateDir>/<role>.{x509.pem,pk8}; unset, DefaultAppCertificate (the key set's testkey, Soong's default role). The key set
+// dir is the converter's -keys (Soong's PRODUCT_DEFAULT_DEV_CERTIFICATE dir). signed=false: PRESIGNED, the apk is passed through. A module
+// reference (`:name`, android_app_certificate) and lineage / additional_certificates are unsupported (problem).
+func (g *Graph) appCertificate(n *jNode) (c keyCert, signed bool) {
+	role := n.props.str("certificate")
+	if role == presigned {
+		return keyCert{}, false
+	}
+	for _, k := range []string{"additional_certificates", "lineage", "rotationMinSdkVersion"} {
+		if n.props.get(k) != nil {
+			g.problem("%s: %s is unsupported", n.name, k)
+		}
+	}
+	if strings.HasPrefix(role, ":") {
+		g.problem("%s: certificate module reference %s is unsupported", n.name, role)
+		role = ""
+	}
+	if role == "" {
+		role = defaultCertRole
+	}
+	dir := g.java.tools.Keys
+	if dir == "" {
+		g.problem("%s: no key set to sign with (-keys)", n.name)
+		dir = filepath.Join(g.out, "missing-keys")
+	}
+	return keyCert{pem: filepath.Join(dir, role+".x509.pem"), key: filepath.Join(dir, role+".pk8")}, true
+}
+
+// defaultCertRole: the file name of DefaultAppCertificate in its dir (build/make/target/product/security/testkey when the product sets
+// none).
+const defaultCertRole = "testkey"
+
+// signApk is SignAppPackage: signapk (SignapkCmd, the host jar) with its JNI library's dir on java.library.path (SignapkJniLibrary,
+// libconscrypt_openjdk_jni), the main certificate's pem and key, no flags (no v4, lineage or rotation). A PRESIGNED apk is aligned instead,
+// as the unsigned apk was before signing existed (zipalign -p 4).
+func (g *Graph) signApk(n *jNode, out, in string, c keyCert, signed bool) {
+	if !signed {
+		g.java.edge("zipalign", []string{out}, []string{in}, nil, nil, nil)
+		return
+	}
+	jar := g.jtoolJar("signapk", n.name)
+	jni := filepath.Join(g.out, "missing-tool", signapkJni+".so")
+	if ln := g.node(signapkJni, Host, Shared, n.name); ln != nil {
+		jni = g.nodeOut(ln)
+	}
+	g.java.edge("signapk", []string{out}, []string{in}, []string{jar, jni, c.pem, c.key}, nil,
+		[][2]string{{"signapk", esc(jar)}, {"jnidir", esc(filepath.Dir(jni))}, {"certificates", esc(c.pem) + " " + esc(c.key)}})
+}
+
+// signapkJni: java/config/config.go SignapkJniLibrary.
+const signapkJni = "libconscrypt_openjdk_jni"
+
+// installDir is AndroidApp.installPath below the partition Soong installs the module to (PathForModuleInstall, Module.PartitionTag):
+// framework-res in system/framework, a privileged app in priv-app/<name>, any other in app/<name>.
+func (g *Graph) installDir(n *jNode, name string) string {
+	p := n.props
+	partition := "system"
+	switch {
+	case p.boolean("device_specific", false):
+		partition = "odm"
+	case p.boolean("soc_specific", false) || p.boolean("vendor", false) || p.boolean("proprietary", false):
+		partition = "vendor"
+	case p.boolean("product_specific", false):
+		partition = "product"
+	case p.boolean("system_ext_specific", false):
+		partition = "system_ext"
+	}
+	root := filepath.Join(g.out, partitionsDir, partition)
+	switch {
+	case n.name == "framework-res":
+		return filepath.Join(root, "framework")
+	case p.boolean("privileged", false):
+		return filepath.Join(root, "priv-app", name)
+	}
+	return filepath.Join(root, "app", name)
+}
+
+// partitionsDir: below -out, one directory per partition holding what Soong installs there (the product's install tree, TARGET_OUT_*).
+const partitionsDir = "partitions"
 
 // jniZip is TransformJniLibsToJar: the jni_libs shared libraries stored under lib/<abi>/ in one zip ("" without any).
 func (g *Graph) jniZip(n *jNode) string {
@@ -916,4 +1010,10 @@ rule unzipaar
 rule jnizip
   command = $soongzip -o $out $args
   description = zip jni libs $out
+rule signapk
+  command = rm -f $out && $jdk/bin/java -Djava.library.path=$jnidir -jar $signapk $certificates $in $out
+  description = sign $out
+rule installapk
+  command = cp -f $in $out
+  description = install $out
 `

@@ -263,12 +263,17 @@ min_reason = "observed 2026-11-07; older is untested"
 scope = ["build"]
 used_by = ["xtask:native", "upstream:qemu"]
 
-# atld's CA store tests: `openssl x509 -subject_hash_old` is the independent oracle of the store's file names; `openssl req` makes the same-subject pair of the collision test
+# atld's CA store tests: `openssl x509 -subject_hash_old` is the independent oracle of the store's file names; `openssl req` makes the same-subject pair of the collision test.
+# `xtask keys --execute` makes the workspace's dev key set with it as AOSP's development/tools/make_key does (genrsa, pkcs8 DER, req -x509)
 [openssl]
 debian = "openssl"
 arch = "openssl"
-scope = ["test"]
-used_by = ["crate:atld"]
+binary = "openssl"
+version_arg = "version"
+min = "3.5.7"
+min_reason = "observed 2026-11-14; older is untested"
+scope = ["build", "test"]
+used_by = ["crate:atld", "xtask:keys"]
 
 # the PCM output (plan A0, atl-platform-ui-linux audio.rs): pipewire-sys's build script resolves libpipewire-0.3 through pkg-config; min = the crate's `v0_3_49` feature (Buffer::requested)
 [pipewire]

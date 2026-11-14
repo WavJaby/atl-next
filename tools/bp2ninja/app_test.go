@@ -25,6 +25,9 @@ python_binary_host { name: "manifest_fixer", main: "manifest_fixer.py", srcs: ["
 		"prebuilts/manifest-merger/M.java":     "", "prebuilts/manifest-merger/mm": "",
 		"prebuilts/r8/Android.bp": `java_binary_host { name: "d8", wrapper: "d8", srcs: ["W.java"] }`,
 		"prebuilts/r8/W.java":     "", "prebuilts/r8/d8": "",
+		"build/make/tools/signapk/Android.bp": `java_binary_host { name: "signapk", srcs: ["S.java"], jni_libs: ["libconscrypt_openjdk_jni"] }
+cc_library_host_shared { name: "libconscrypt_openjdk_jni", srcs: ["j.cc"] }`,
+		"build/make/tools/signapk/S.java": "", "build/make/tools/signapk/j.cc": "",
 		busyboxPath:                                    "",
 		"frameworks/base/core/res/Android.bp":          `android_app { name: "framework-res", sdk_version: "core_platform" }`,
 		"frameworks/base/core/res/AndroidManifest.xml": "", "frameworks/base/core/res/res/values/strings.xml": "",
@@ -219,13 +222,55 @@ func TestAndroidAppResourcesAndPackage(t *testing.T) {
 	if comb == nil || !strings.Contains(comb[""], filepath.Join(ap, "javac", "app.jar")+" "+filepath.Join(ap, "busybox", "R.jar")+" ") {
 		t.Errorf("combined %v", comb)
 	}
-	// CreateAndSignAppPackage: dex jar, resource package; unsigned, then aligned in place of signapk
+	// CreateAndSignAppPackage: dex jar, resource package; unsigned, then SignAppPackage: signapk's jar (host/framework), its JNI library's dir,
+	// "<pem> <key>" of the default role testkey of the key set
 	unsigned := ninjaEdgeVars(ninja, filepath.Join(ap, "app-unsigned.apk"))
 	if unsigned == nil || !strings.Contains(unsigned[""], ": mergezips "+filepath.Join(ap, "aligned", "app.jar")+" "+filepath.Join(ap, "package-res.apk")) {
 		t.Errorf("unsigned apk %v", unsigned)
 	}
-	if al := ninjaEdgeVars(ninja, filepath.Join(ap, "app.apk")); al == nil || !strings.Contains(al[""], ": zipalign "+filepath.Join(ap, "app-unsigned.apk")) || n.apk != filepath.Join(ap, "app.apk") {
-		t.Errorf("aligned apk %v", al)
+	sg := ninjaEdgeVars(ninja, filepath.Join(ap, "app.apk"))
+	if sg == nil || !strings.Contains(sg[""], ": signapk "+filepath.Join(ap, "app-unsigned.apk")) || sg["certificates"] != "/keys/testkey.x509.pem /keys/testkey.pk8" ||
+		sg["signapk"] != filepath.Join(g.out, "host", "framework", "signapk.jar") || !strings.Contains(sg["jnidir"], "libconscrypt_openjdk_jni") || n.apk != filepath.Join(ap, "app.apk") {
+		t.Errorf("signed apk %v problems %v", sg, g.problems)
+	}
+	// installPath: not privileged, system partition -> system/app/<name>/<name>.apk; the goal output is the apk and its installed copy
+	inst := filepath.Join(g.out, "partitions", "system", "app", "app", "app.apk")
+	if in := ninjaEdgeVars(ninja, inst); in == nil || !strings.Contains(in[""], ": installapk "+filepath.Join(ap, "app.apk")) {
+		t.Errorf("installed apk %v", in)
+	}
+	if got := n.output(); !reflect.DeepEqual(got, []string{n.apk, inst}) {
+		t.Errorf("output %v", got)
+	}
+}
+
+// processMainCert and installPath per module: `certificate: "<role>"` names the role's files in the key set; PRESIGNED is passed through
+// unsigned; privileged and the partition properties pick the install dir (PartitionTag; framework-res in system/framework).
+func TestAppSigningAndInstallPath(t *testing.T) {
+	g := appGraph(t, `android_app { name: "plat", certificate: "platform", privileged: true, system_ext_specific: true, srcs: ["A.java"], sdk_version: "34" }
+android_app { name: "pre", certificate: "PRESIGNED", product_specific: true, srcs: ["A.java"], sdk_version: "34" }`, nil)
+	for _, m := range []string{"plat", "pre", "framework-res"} {
+		if n := g.jnode(m, Device, "test"); n == nil || n.apk == "" {
+			t.Fatalf("%s: no apk: %v", m, g.problems)
+		}
+	}
+	ninja := g.java.b.String()
+	d := func(m string) string { return filepath.Join(g.out, "device", m) }
+	if sg := ninjaEdgeVars(ninja, filepath.Join(d("plat"), "plat.apk")); sg == nil || sg["certificates"] != "/keys/platform.x509.pem /keys/platform.pk8" {
+		t.Errorf("platform role %v", sg)
+	}
+	if cp := ninjaEdgeVars(ninja, filepath.Join(d("pre"), "pre.apk")); cp == nil || !strings.Contains(cp[""], ": zipalign "+filepath.Join(d("pre"), "pre-unsigned.apk")) {
+		t.Errorf("PRESIGNED %v", cp)
+	}
+	for _, inst := range []string{"system_ext/priv-app/plat/plat.apk", "product/app/pre/pre.apk", "system/framework/framework-res.apk"} {
+		if ninjaEdgeVars(ninja, filepath.Join(g.out, "partitions", inst)) == nil {
+			t.Errorf("no install edge for %s", inst)
+		}
+	}
+	// Break: no key set -> a problem names -keys
+	g.java.tools.Keys = ""
+	g.appCertificate(g.jnode("plat", Device, "test"))
+	if !strings.Contains(strings.Join(g.problems, "\n"), "no key set to sign with (-keys)") {
+		t.Errorf("problems %v", g.problems)
 	}
 }
 
@@ -348,7 +393,7 @@ prebuilt_apex { name: "ap", src: "generic.apex", arch: { x86_64: { src: "x86/ap.
 	if su := ninjaEdgeVars(ninja, filepath.Join(d, "h_a_b-unsigned.apk")); su == nil || !strings.Contains(su[""], ": mergezips "+filepath.Join(d, "package_a_b.apk")) {
 		t.Errorf("split apk %v", su)
 	}
-	if al := ninjaEdgeVars(ninja, filepath.Join(d, "h_a_b.apk")); al == nil || !strings.Contains(al[""], ": zipalign "+filepath.Join(d, "h_a_b-unsigned.apk")) {
+	if al := ninjaEdgeVars(ninja, filepath.Join(d, "h_a_b.apk")); al == nil || !strings.Contains(al[""], ": signapk "+filepath.Join(d, "h_a_b-unsigned.apk")) {
 		t.Errorf("split aligned apk %v", al)
 	}
 }
