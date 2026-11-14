@@ -203,6 +203,67 @@ cc_library { name: "lib", srcs: ["a.cc"], generated_headers: ["gen"], shared_lib
 	}
 }
 
+// A cross host's own drivers (arches.toml cc / cxx) compile and link its device and host nodes; the build side keeps -cc / -cxx, so a tool the build executes is the build machine's.
+// Its extra flags (cflags) ride every host-machine compile and link. On the build machine's own host nothing changes: no edge names a driver beyond the rule's.
+// Break: ccTools returning the -cc pair for the host machine (the M63 link failure: libhwui linked by clang-19), or giving the build side the cross driver (an Exec format error tool), fails here.
+func TestCrossDriversPerMachine(t *testing.T) {
+	files := map[string]string{"p/Android.bp": `
+cc_binary_host { name: "tool", srcs: ["tool.cc"] }
+genrule { name: "gen", tools: ["tool"], cmd: "$(location tool) > $(out)", out: ["g.h"] }
+cc_library { name: "lib", srcs: ["a.c", "b.cc"], generated_headers: ["gen"], host_supported: true }
+`, "p/tool.cc": "", "p/a.c": "", "p/b.cc": ""}
+	cross := riscvCross
+	cross.CC, cross.CXX, cross.Flags = "clang-21", "clang++-21", []string{"-mno-relax"}
+	if got := cross.compileFlags(); got[len(got)-1] != "-mno-relax" {
+		t.Errorf("compile flags %q end without the cflags", got)
+	}
+	if got := cross.linkFlags(); got[len(got)-1] != "-mno-relax" {
+		t.Errorf("link flags %q end without the cflags", got)
+	}
+	tools := Tools{CC: "clang-19", CXX: "clang++-19", AR: "ar"}
+	cfg := riscvOnX86
+	cfg.HostCross = cross
+	for s, want := range map[Side]string{Device: "clang++-21", Host: "clang++-21", Build: "clang++-19"} {
+		if got := cfg.ccTools(s, tools).CXX; got != want {
+			t.Errorf("%v: cxx %s, want %s", s, got, want)
+		}
+	}
+	// an edge's lines up to the next build statement
+	edge := func(ninja, prefix string) string {
+		i := strings.Index(ninja, "build "+prefix)
+		if i < 0 {
+			t.Fatalf("no edge %s", prefix)
+		}
+		rest := ninja[i+1:]
+		if j := strings.Index(rest, "\nbuild "); j >= 0 {
+			rest = rest[:j]
+		}
+		return rest
+	}
+	g := graphForCfg(t, cfg, files)
+	if g.node("lib", Host, Shared, "test") == nil {
+		t.Fatalf("lib not built: %v", g.problems)
+	}
+	ninja := g.emit(tools)
+	hostObj, buildObj := g.out+"/obj/host/lib/shared/p/", g.out+"/obj/build/tool/binary/p/"
+	for prefix, want := range map[string]string{hostObj + "a.c.o": "cc = clang-21", hostObj + "b.cc.o": "cc = clang++-21", buildObj + "tool.cc.o": "cc = clang++-19"} {
+		if e := edge(ninja, prefix); !strings.Contains(e, want) {
+			t.Errorf("%s: want %q in %q", prefix, want, e)
+		}
+	}
+	if e := edge(ninja, g.out+"/host/lib"); !strings.Contains(e, "cxx = clang++-21") {
+		t.Errorf("host link without the cross driver: %q", e)
+	}
+	if e := edge(ninja, g.out+"/build/tool"); strings.Contains(e, "cxx =") {
+		t.Errorf("build link names a driver: %q", e)
+	}
+	plain := graphForCfg(t, Config{Arch: "x86_64", PointerBits: 64}, files)
+	plain.node("lib", Host, Shared, "test")
+	if n := plain.emit(tools); strings.Contains(n, "  cxx = ") || strings.Contains(n, "clang-21") {
+		t.Error("the build machine's own host names another driver")
+	}
+}
+
 // A cross host's libc++ headers must lie under its sysroot: the distro's own include dir is the build machine's libc++. The sysroot prefix ends at a separator, so root-other is not under root.
 func TestLibcxxInSysroot(t *testing.T) {
 	for _, c := range []struct {

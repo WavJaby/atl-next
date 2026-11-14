@@ -303,6 +303,8 @@ func (g *Graph) emit(tools Tools) string {
 			continue
 		}
 		flags := g.compileFlags(n)
+		// the drivers of the node's machine: a cross host's own on its device and host sides
+		nt := g.cfg.ccTools(n.side, tools)
 		var waits []string
 		genClosure(n, map[*Node]bool{}, &waits)
 		for _, s := range n.srcs {
@@ -313,12 +315,12 @@ func (g *Graph) emit(tools Tools) string {
 			rel := strings.TrimPrefix(strings.TrimPrefix(src, g.tree+"/"), g.out+"/")
 			obj := filepath.Join(g.out, "obj", n.side.String(), n.name, n.kind.String(), rel+".o")
 			lang := flags.cxx
-			cc := tools.CXX
+			cc := nt.CXX
 			switch filepath.Ext(s) {
 			case ".c":
-				lang, cc = flags.c, tools.CC
+				lang, cc = flags.c, nt.CC
 			case ".S", ".s":
-				lang, cc = flags.asm, tools.CC
+				lang, cc = flags.asm, nt.CC
 			case ".asm":
 				if why := g.soong.Flags.NoToolchain[n.side]; why != "" {
 					g.problem("%s: source %s: %s", n.mod.Name, s, why)
@@ -360,6 +362,10 @@ func (g *Graph) emit(tools Tools) string {
 				linkOut = filepath.Join(filepath.Dir(n.out), "unprefixed", filepath.Base(n.out))
 			}
 			fmt.Fprintf(&b, "build %s: link %s | %s\n  mode = %s\n  libs = %s\n", esc(linkOut), join(n.objs), join(inputs), shellQuote(mode), shellQuote(libs))
+			// the link rule's $cxx is -cxx; only another machine's driver is named on the edge
+			if nt.CXX != tools.CXX {
+				fmt.Fprintf(&b, "  cxx = %s\n", esc(nt.CXX))
+			}
 			if strings.HasPrefix(linkOut, filepath.Join(g.out, "device")+"/") {
 				g.deviceLinks = append(g.deviceLinks, linkOut)
 			}

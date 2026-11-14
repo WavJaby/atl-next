@@ -132,7 +132,7 @@ fn compiler_args(args: &Args, root: &Path) -> Result<[String; 4]> {
     ])
 }
 
-/// The converter's flags for a cross host (`cross`: arches::cross_target): the target's clang triple, its fetched sysroot, its isa, its rust target and rustc features (arches::rustc_target_features) and the libc++ headers in that sysroot (atl_layout::libcxx_dir, the one derivation),
+/// The converter's flags for a cross host (`cross`: arches::cross_target): the target's clang triple, its fetched sysroot, its isa, its rust target and rustc features (arches::rustc_target_features), the libc++ headers in that sysroot (atl_layout::libcxx_dir, the one derivation), its compiler (cc / cxx rows) and extra target flags (cflags),
 /// and the build machine's row and pointer width (`build`: arches::build_machine), which the converter's build side (tools a build rule executes or loads) is compiled for. Empty for the build machine, whose compiler already targets it.
 fn cross_args(
     root: &Path,
@@ -157,6 +157,12 @@ fn cross_args(
         c.rust.clone(),
         "-host-rust-features".to_owned(),
         arches::rustc_target_features(&c.isa)?,
+        "-host-cc".to_owned(),
+        deps::binary(root, &c.cc)?,
+        "-host-cxx".to_owned(),
+        deps::binary(root, &c.cxx)?,
+        "-host-cflags".to_owned(),
+        c.cflags.join(","),
         "-build-arch".to_owned(),
         build_name.to_owned(),
         "-build-pointer-bits".to_owned(),
@@ -504,8 +510,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         c.start()?;
     }
     // gate a (isa-tiers.toml): each tier source compiles at its tier's isa and fails at its row's, before ninja builds the rest
-    if cross.is_some() {
-        let probed = crate::isa_tiers::probe(&graph_out, &cc)?;
+    // tier sources are the host's: its own compiler (arches.toml cc), as their ninja compiles
+    if let Some(c) = &cross {
+        let probed = crate::isa_tiers::probe(&graph_out, &deps::binary(root, &c.cc)?)?;
         println!("native: isa tiers: {probed} source(s) probed");
     }
     let log = graph_out.join("ninja.log");
@@ -701,6 +708,7 @@ fn native_bridge_flags(
             .arg("-llvm")
             .arg(llvm)
             .args(&side)
+            // no cross_args: exportsOf a bionic side = tree include dirs; HostCross only picks the glibc sides' libc++ (libcxxProvider), which a bionic compile never searches (-nostdinc++)
             .args(compiler_args(args, root)?)
             .args(["-nb-exports", "libc_headers"]),
         "bp2ninja -nb-exports libc_headers",
@@ -1304,17 +1312,15 @@ fn provide<'a>(ctx: &ProvideCtx<'a>, m: &Machine) -> Result<BTreeMap<&'a str, Pr
         );
         systems.insert(row, p);
     }
-    // the converter's own libc++ and target flags: an upstream compiles and links as the machine's tree modules do
+    // the converter's own compilers, libc++ and target flags: an upstream compiles and links as the machine's tree modules do
     let flags: upstream::Flags = serde_json::from_str(&crate::host_art::output(
         Command::new(ctx.converter)
-            .args(["-upstream-toolchain", "-cxx", ctx.cxx])
+            .args(["-upstream-toolchain", "-cc", ctx.cc, "-cxx", ctx.cxx])
             .args(m.flags),
         "bp2ninja -upstream-toolchain",
     )?)
     .context("parsing bp2ninja -upstream-toolchain")?;
     let toolchain = upstream::Toolchain {
-        cc: ctx.cc,
-        cxx: ctx.cxx,
         flags: &flags,
         // CMake's cross mode (CMAKE_CROSSCOMPILING): the arch name is the clang triple's arch part (arches.toml `clang`)
         cross_processor: m.cross_processor,

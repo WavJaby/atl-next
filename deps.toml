@@ -93,6 +93,23 @@ min_reason = "observed 2026-11-07; older is untested"
 scope = ["build"]
 used_by = ["xtask:native", "xtask:check"]
 
+# riscv64's cross compiler (arches.toml [riscv64.host] cc / cxx): memory M63, clang-19 cannot link libhwui for riscv64. Debian 13: trixie-backports.
+[clang-21]
+debian = "clang-21"
+binary = "clang-21"
+min = "21.1.8"
+min_reason = "M63 measured 21.1.8 (trixie-backports) linking libhwui with -mno-relax; 19 fails"
+scope = ["build"]
+used_by = ["host:riscv64"]
+
+[clang-21-cxx]
+debian = "clang-21"
+binary = "clang++-21"
+min = "21.1.8"
+min_reason = "M63 measured 21.1.8 (trixie-backports) linking libhwui with -mno-relax; 19 fails"
+scope = ["build"]
+used_by = ["host:riscv64"]
+
 # CMake is the build system of upstream BoringSSL and the LLVM runtimes (runtimes.rs): their only supported build (CLAUDE.md). BoringSSL's CMakeLists.txt needs 3.22
 [cmake]
 debian = "cmake"
@@ -232,6 +249,15 @@ min = "19.1.7"
 min_reason = "observed 2026-11-07; older is untested"
 scope = ["build"]
 used_by = ["xtask:native", "xtask:cross"]
+
+# riscv64's cross linker (arches.toml [riscv64.host] lld): the ld.lld the `clang-21` row's clang runs from its own install
+[lld-21]
+debian = "lld-21"
+binary = "ld.lld-21"
+min = "21.1.8"
+min_reason = "the clang-21 row's release (M63); its clang runs its own ld.lld"
+scope = ["build"]
+used_by = ["host:riscv64"]
 
 # the archiver (native --ar default; the converter's ninja rules run it)
 [llvm]

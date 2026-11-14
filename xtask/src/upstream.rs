@@ -41,18 +41,18 @@ pub fn recipe(name: &str) -> Option<&'static Recipe> {
     RECIPES.iter().find(|r| r.name == name)
 }
 
-/// What the converter derives for its host modules (`bp2ninja -upstream-toolchain`), not restated here: the libc++ headers and, for a cross host, the target flags (`--target`, `--sysroot`, `-march`) from arches.toml.
+/// What the converter derives for its host modules (`bp2ninja -upstream-toolchain`), not restated here: the compilers, the libc++ headers and, for a cross host, the target flags (`--target`, `--sysroot`, `-march`, cflags) from arches.toml.
 #[derive(serde::Deserialize)]
 pub struct Flags {
+    pub cc: String,
+    pub cxx: String,
     pub libcxx: PathBuf,
     pub compile: Vec<String>,
     pub link: Vec<String>,
 }
 
-/// The C/C++ toolchain of the converter's build; an upstream is compiled with the same one.
+/// The C/C++ toolchain of the converter's host modules; an upstream is compiled with the same one.
 pub struct Toolchain<'a> {
-    pub cc: &'a str,
-    pub cxx: &'a str,
     pub flags: &'a Flags,
     /// Cross host: its arch name, CMake's `CMAKE_SYSTEM_PROCESSOR` (with `CMAKE_SYSTEM_NAME` it puts CMake in cross mode: no try_run, no build-machine search paths).
     pub cross_processor: Option<&'a str>,
@@ -66,8 +66,8 @@ fn toolchain_cache(tc: &Toolchain) -> Vec<(&'static str, String)> {
     let target = tc.flags.compile.join(" ");
     let link = format!("{} {STL_LINK_FLAGS}", tc.flags.link.join(" "));
     let mut cache = vec![
-        ("CMAKE_C_COMPILER", tc.cc.to_owned()),
-        ("CMAKE_CXX_COMPILER", tc.cxx.to_owned()),
+        ("CMAKE_C_COMPILER", tc.flags.cc.clone()),
+        ("CMAKE_CXX_COMPILER", tc.flags.cxx.clone()),
         ("CMAKE_C_FLAGS", target.clone()),
         ("CMAKE_ASM_FLAGS", target.clone()),
         // one C++ runtime per process, selected as the converter selects it for a module with the default stl (bp2ninja stl.go, after Soong's cc/stl.go non-Bionic branch)
@@ -147,34 +147,55 @@ pub fn build(
     Ok(provided)
 }
 
-/// Deletes `build`'s CMakeCache.txt + CMakeFiles when the cache names another source dir (`CMAKE_HOME_DIRECTORY`), e.g. a removed task copy: cmake refuses such a cache.
-/// Returns the old source dir when it deleted.
-fn drop_foreign_cache(src: &Path, build: &Path) -> Result<Option<String>> {
+/// Compiler entries whose change makes cmake delete its cache and re-run configure without the other `-D`s: CMAKE_INSTALL_PREFIX then falls back to the project's default
+/// (BoringSSL's `${CMAKE_SOURCE_DIR}/install`, its CMakeLists.txt), and install writes into the source tree.
+const COMPILER_ENTRIES: [&str; 2] = ["CMAKE_C_COMPILER", "CMAKE_CXX_COMPILER"];
+
+/// Deletes `build`'s CMakeCache.txt + CMakeFiles when cmake cannot reuse it with `-D` entries `wanted`: the cache names another source dir (`CMAKE_HOME_DIRECTORY`, e.g. a removed task copy: cmake refuses it),
+/// or another compiler (COMPILER_ENTRIES: cmake's own reset would drop the other entries). Returns why when it deleted.
+fn drop_stale_cache(src: &Path, build: &Path, wanted: &[(&str, &str)]) -> Result<Option<String>> {
     let cache = build.join("CMakeCache.txt");
     let Ok(text) = std::fs::read_to_string(&cache) else {
         return Ok(None);
     };
-    let Some(old) = text
-        .lines()
-        .find_map(|l| l.strip_prefix("CMAKE_HOME_DIRECTORY:INTERNAL="))
-    else {
-        return Ok(None);
+    let entry = |key: &str| {
+        text.lines().find_map(|l| {
+            let (k, v) = l.split_once('=')?;
+            (k.split(':').next() == Some(key)).then_some(v)
+        })
     };
-    let same = match (std::fs::canonicalize(old), std::fs::canonicalize(src)) {
+    let same_file = |a: &Path, b: &Path| match (std::fs::canonicalize(a), std::fs::canonicalize(b))
+    {
         (Ok(a), Ok(b)) => a == b,
-        _ => Path::new(old) == src,
+        _ => a == b,
     };
-    if same {
-        return Ok(None);
+    let mut why = None;
+    if let Some(old) = entry("CMAKE_HOME_DIRECTORY")
+        && !same_file(Path::new(old), src)
+    {
+        why = Some(format!("generated from {old}, not {}", src.display()));
     }
-    std::fs::remove_file(&cache).context("removing a foreign CMakeCache.txt")?;
+    for (key, value) in wanted.iter().filter(|(k, _)| COMPILER_ENTRIES.contains(k)) {
+        // the cache holds the PATH lookup of the value given (/usr/bin/clang-19 for clang-19)
+        let given = crate::arches::on_path(value).unwrap_or_else(|| PathBuf::from(value));
+        if let Some(old) = entry(key)
+            && why.is_none()
+            && !same_file(Path::new(old), &given)
+        {
+            why = Some(format!("{key} was {old}, now {value}"));
+        }
+    }
+    let Some(why) = why else {
+        return Ok(None);
+    };
+    std::fs::remove_file(&cache).context("removing a stale CMakeCache.txt")?;
     match std::fs::remove_dir_all(build.join("CMakeFiles")) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
             return Err(e).context("removing a foreign CMakeFiles");
         }
         _ => {}
     }
-    Ok(Some(old.to_owned()))
+    Ok(Some(why))
 }
 
 /// Configures (Ninja generator, `cache` as `-D` entries), builds `all`, then `targets` (what `all` leaves out, e.g. tools under `LLVM_BUILD_TOOLS=OFF`) and, with `install`, installs one CMake project; all output to `log`. Incremental: a rerun reuses `build`.
@@ -187,11 +208,10 @@ pub fn cmake(
     install: bool,
 ) -> Result<()> {
     std::fs::create_dir_all(build)?;
-    if let Some(old) = drop_foreign_cache(src, build)? {
+    if let Some(why) = drop_stale_cache(src, build, cache)? {
         println!(
-            "cmake: {}: cache was generated from {old}, not {}: deleted, reconfiguring",
-            build.display(),
-            src.display()
+            "cmake: {}: cache {why}: deleted, reconfiguring",
+            build.display()
         );
     }
     let mut configure = Command::new("cmake");
@@ -249,11 +269,56 @@ mod tests {
             .expect("test cache")
         };
         cache(&src);
-        assert_eq!(drop_foreign_cache(&src, &build).expect("same"), None);
+        assert_eq!(drop_stale_cache(&src, &build, &[]).expect("same"), None);
         assert!(build.join("CMakeCache.txt").is_file());
         cache(&gone);
-        let old = drop_foreign_cache(&src, &build).expect("foreign");
-        assert_eq!(old.as_deref(), Some(gone.to_str().expect("utf-8")));
+        let why = drop_stale_cache(&src, &build, &[]).expect("foreign");
+        assert!(
+            why.expect("dropped")
+                .contains(gone.to_str().expect("utf-8"))
+        );
+        assert!(!build.join("CMakeCache.txt").exists() && !build.join("CMakeFiles").exists());
+        std::fs::remove_dir_all(&dir).expect("test dir cleanup");
+    }
+
+    /// A compiler change drops the cache before configure: cmake's own reset would re-run without CMAKE_INSTALL_PREFIX and install into the source tree.
+    #[test]
+    fn a_cache_from_another_compiler_is_dropped() {
+        let dir = std::env::temp_dir().join(format!("xtask-cmake-cc-{}", std::process::id()));
+        let (src, build) = (dir.join("src"), dir.join("build"));
+        std::fs::create_dir_all(build.join("CMakeFiles")).expect("test dir");
+        std::fs::create_dir_all(&src).expect("test dir");
+        // two stand-in compilers by absolute path: what the cache records and what is given
+        let (old_cc, new_cc) = (dir.join("cc-old"), dir.join("cc-new"));
+        std::fs::write(&old_cc, "").expect("test file");
+        std::fs::write(&new_cc, "").expect("test file");
+        let write = || {
+            std::fs::write(
+                build.join("CMakeCache.txt"),
+                format!(
+                    "CMAKE_HOME_DIRECTORY:INTERNAL={}\nCMAKE_C_COMPILER:STRING={}\n",
+                    src.display(),
+                    old_cc.display()
+                ),
+            )
+            .expect("test cache")
+        };
+        let (old_s, new_s) = (
+            old_cc.to_str().expect("utf-8"),
+            new_cc.to_str().expect("utf-8"),
+        );
+        write();
+        assert_eq!(
+            drop_stale_cache(&src, &build, &[("CMAKE_C_COMPILER", old_s)]).expect("same"),
+            None
+        );
+        // a non-compiler entry never drops it: -D sets those on the next configure
+        assert_eq!(
+            drop_stale_cache(&src, &build, &[("CMAKE_INSTALL_PREFIX", new_s)]).expect("other"),
+            None
+        );
+        let why = drop_stale_cache(&src, &build, &[("CMAKE_C_COMPILER", new_s)]).expect("changed");
+        assert!(why.expect("dropped").contains("CMAKE_C_COMPILER"));
         assert!(!build.join("CMakeCache.txt").exists() && !build.join("CMakeFiles").exists());
         std::fs::remove_dir_all(&dir).expect("test dir cleanup");
     }

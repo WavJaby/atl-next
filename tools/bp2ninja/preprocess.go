@@ -69,12 +69,15 @@ func (g *Graph) preprocessRule(n *Node) *genRule {
 		g.problem("%s: cc_preprocess_no_configuration must have a -E cflag", m.Name)
 		return nil
 	}
-	var cc string
+	// $clang / $cxx are -cc / -cxx; a cross host's device and host sides name its own drivers (ccTools)
+	cc, cxx := "$clang", "$cxx"
+	if host := g.cfg.ccTools(n.side, Tools{}); host.CC != "" {
+		cc, cxx = esc(host.CC), esc(host.CXX)
+	}
 	switch filepath.Ext(files[0].path) {
 	case ".c":
-		cc = "$clang"
 	case ".cc", ".cpp", ".cxx", ".mm":
-		cc = "$cxx"
+		cc = cxx
 	default:
 		g.problem("%s: source %s has an unknown extension (.c, .cc, .cpp, .cxx, .mm)", m.Name, files[0].path)
 		return nil

@@ -20,6 +20,10 @@
 #   glibc_floor       newest GLIBC_x.y an output of this host may need: the glibc of the oldest machine it runs on (owner decision). Cross hosts only (with isa). Checked: dotted version; isa_gate fails any output that needs a newer one.
 #   clang             clang triple of the cross compiler and link driver (`--target=<it>`), cross builds only; its arch part is the arch name. Checked: clang accepts it.
 #   sysroot           deps.toml row of this host's sysroot (a `sysroot_debs` row). Every host's atl-bridgegen probes read it (atl-bridgegen buildscript::host_sysroot_args), the build machine's too; a cross build also links against it. Checked: the row exists.
+#   cc, cxx, lld      deps.toml rows of the cross compiler (C driver, C++ driver) and of the ld.lld it links with; required with isa, absent on the build machine (deps.toml `clang` / `clang-cxx`).
+#                     It compiles and links everything of this host (converter host and device sides, upstream CMake builds, cargo's link driver); the build side keeps the build machine's.
+#                     Checked: cxx sits in cc's install, and `cc -fuse-ld=lld` runs lld's binary.
+#   cflags            extra target flags of every cross compile and link (converter, upstream CMake, cargo link); absent = none. Checked: cc takes each for the clang triple under -Werror.
 # `[<arch>.guest]` present = app native code of this arch runs (natively on a matching host, else via
 # the QEMU bridge):
 #   android_abis      APK `lib/<abi>/` names, preferred first
@@ -77,6 +81,12 @@ isa = "rv64gc_zba_zbb"
 glibc_floor = "2.39"
 clang = "riscv64-linux-gnu"
 sysroot = "riscv64-sysroot"
+# memory M63 (measured 2026-11-13): libhwui's .gcc_except_table relocations keep dead code alive at link under clang-19 with or without relaxation, and under clang-21 with it; clang-21 + -mno-relax links.
+# AOSP passes no relax flag (riscv64_device.go) and clang defaults to -mrelax on every riscv triple (Driver/ToolChains/Arch/RISCV.cpp), so -mno-relax departs from AOSP on measurement.
+cc = "clang-21"
+cxx = "clang-21-cxx"
+lld = "lld-21"
+cflags = ["-mno-relax"]
 
 [riscv64.guest]
 android_abis = ["riscv64"]

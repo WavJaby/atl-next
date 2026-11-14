@@ -76,9 +76,11 @@ pub fn cargo_target(root: &Path, arch: &str) -> Result<CargoTarget> {
         .get(arch)
         .and_then(|a| a.host.as_ref())
         .with_context(|| format!("{}: no [{arch}.host] row", arches::FILE))?;
-    let (Some(isa), Some(clang), Some(sysroot)) = (&host.isa, &host.clang, &host.sysroot) else {
+    let (Some(isa), Some(clang), Some(sysroot), Some(cc)) =
+        (&host.isa, &host.clang, &host.sysroot, &host.cc)
+    else {
         bail!(
-            "{}: [{arch}.host] has no isa, clang and sysroot: not a cross target",
+            "{}: [{arch}.host] has no isa, clang, sysroot and cc: not a cross target",
             arches::FILE
         );
     };
@@ -98,8 +100,15 @@ pub fn cargo_target(root: &Path, arch: &str) -> Result<CargoTarget> {
         "sysroot path {} has whitespace",
         sysroot.display()
     );
-    let rustflags = rustflags(&arches::rustc_target_features(isa)?, clang, &sysroot, &lib);
-    let driver = deps::binary(root, "clang")?;
+    let rustflags = rustflags(
+        &arches::rustc_target_features(isa)?,
+        clang,
+        &host.cflags,
+        &sysroot,
+        &lib,
+    );
+    // the host's own compiler links its crates, as it links the converter's modules
+    let driver = deps::binary(root, cc)?;
     Ok(CargoTarget {
         triple: host.rust.clone(),
         env: vec![
@@ -133,10 +142,11 @@ pub fn sysroot_lib_dirs(sysroot: &Path, clang: &str) -> [PathBuf; 2] {
     ]
 }
 
-/// The RUSTFLAGS of a cross link: the ISA features for rustc (arches::rustc_target_features), then the clang triple, lld and the sysroot for the linker.
-fn rustflags(features: &str, clang: &str, sysroot: &Path, lib: &Path) -> String {
+/// The RUSTFLAGS of a cross link: the ISA features for rustc (arches::rustc_target_features), then the clang triple, the row's cflags (`-mno-relax` reaches lld as --no-relax), lld and the sysroot for the linker.
+fn rustflags(features: &str, clang: &str, cflags: &[String], sysroot: &Path, lib: &Path) -> String {
+    let extra: String = cflags.iter().map(|f| format!(" -C link-arg={f}")).collect();
     format!(
-        "-C target-feature={features} -C link-arg=--target={clang} -C link-arg=-fuse-ld=lld -C link-arg=--sysroot={} -C link-arg=-L{}",
+        "-C target-feature={features} -C link-arg=--target={clang}{extra} -C link-arg=-fuse-ld=lld -C link-arg=--sysroot={} -C link-arg=-L{}",
         sysroot.display(),
         lib.display()
     )
@@ -175,12 +185,13 @@ mod tests {
         let flags = rustflags(
             "+zba,+zbb",
             "riscv64-linux-gnu",
+            &["-mno-relax".to_owned()],
             Path::new("/s"),
             Path::new("/s/usr/riscv64-linux-gnu/lib"),
         );
         assert_eq!(
             flags,
-            "-C target-feature=+zba,+zbb -C link-arg=--target=riscv64-linux-gnu -C link-arg=-fuse-ld=lld -C link-arg=--sysroot=/s -C link-arg=-L/s/usr/riscv64-linux-gnu/lib"
+            "-C target-feature=+zba,+zbb -C link-arg=--target=riscv64-linux-gnu -C link-arg=-mno-relax -C link-arg=-fuse-ld=lld -C link-arg=--sysroot=/s -C link-arg=-L/s/usr/riscv64-linux-gnu/lib"
         );
     }
 

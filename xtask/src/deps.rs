@@ -65,10 +65,11 @@ pub struct Consumers {
     pub hosts: BTreeMap<String, HostRows>,
 }
 
-/// The rows of a cross host: its sysroot (`sysroot`) and the rust std of its target (`rust`, a `rustup_target` row).
+/// The rows of a cross host: its sysroot (`sysroot`), the rust std of its target (`rust`, a `rustup_target` row) and its toolchain rows (`cc`, `cxx`, `lld`).
 pub struct HostRows {
     pub sysroot: String,
     pub rust: String,
+    pub toolchain: Vec<String>,
 }
 
 impl Consumers {
@@ -84,7 +85,19 @@ impl Consumers {
                     let host = a.host.as_ref()?;
                     let sysroot = host.sysroot.clone()?;
                     let rust = host.rust.clone();
-                    Some((arch.clone(), HostRows { sysroot, rust }))
+                    let toolchain = [&host.cc, &host.cxx, &host.lld]
+                        .into_iter()
+                        .flatten()
+                        .cloned()
+                        .collect();
+                    Some((
+                        arch.clone(),
+                        HostRows {
+                            sysroot,
+                            rust,
+                            toolchain,
+                        },
+                    ))
                 })
                 .collect(),
         }
@@ -119,6 +132,18 @@ pub fn row(root: &Path, name: &str) -> Result<Dep> {
     let mut deps: Deps = toml::from_str(&text).with_context(|| format!("in {FILE}"))?;
     deps.remove(name)
         .with_context(|| format!("{FILE}: no row `{name}`"))
+}
+
+/// The names of every `sysroot_debs` row: Debian package trees, the platform's files for the licence gate (memory M41 F1).
+pub fn sysroot_rows(root: &Path) -> Result<Vec<String>> {
+    let text =
+        std::fs::read_to_string(root.join(FILE)).with_context(|| format!("reading {FILE}"))?;
+    let deps: Deps = toml::from_str(&text).with_context(|| format!("in {FILE}"))?;
+    Ok(deps
+        .into_iter()
+        .filter(|(_, d)| d.sysroot_debs.is_some())
+        .map(|(n, _)| n)
+        .collect())
 }
 
 /// The executable row `name` declares (`binary`): the name xtask runs.
@@ -241,14 +266,15 @@ fn validate(name: &str, dep: &Dep, consumers: &Consumers) -> Result<()> {
     ensure!(!dep.used_by.is_empty(), "empty used_by");
     for reference in &dep.used_by {
         match reference.strip_prefix(HOST_REF) {
-            // the native build of cross host `arch` uses this row only if its arches.toml [<arch>.host] names it as sysroot, or its rust target's std
+            // the native build of cross host `arch` uses this row only if its arches.toml [<arch>.host] names it as sysroot or toolchain row, or its rust target's std
             Some(arch) => ensure!(
                 consumers
                     .hosts
                     .get(arch)
                     .is_some_and(|host| host.sysroot == name
+                        || host.toolchain.iter().any(|t| t == name)
                         || dep.rustup_target.as_deref() == Some(host.rust.as_str())),
-                "`{reference}`: arches.toml [{arch}.host] does not name this row as its sysroot or rust target's std"
+                "`{reference}`: arches.toml [{arch}.host] does not name this row as its sysroot, cc, cxx, lld or rust target's std"
             ),
             // an optional consumer runs without this row; its target is checked like any other reference
             None => consumers.resolve(reference.strip_prefix(OPTIONAL_REF).unwrap_or(reference))?,
@@ -985,6 +1011,7 @@ mod tests {
                 HostRows {
                     sysroot: "riscv64-sysroot".to_owned(),
                     rust: "riscv64gc-unknown-linux-gnu".to_owned(),
+                    toolchain: vec!["clang-21".to_owned()],
                 },
             )]),
         }
@@ -1023,6 +1050,10 @@ mod tests {
             err(&format!("{other_std}used_by = [\"host:riscv64\"]\n"))
                 .contains("does not name this row as its sysroot")
         );
+        // a toolchain row the host names (cc / cxx / lld), and one it does not
+        let tool = "debian = \"clang-21\"\nbinary = \"clang-21\"\nmin = \"21.1.8\"\nmin_reason = \"r\"\nscope = [\"build\"]\nused_by = [\"host:riscv64\"]\n";
+        parse(&format!("[clang-21]\n{tool}"), &consumers()).expect("a named toolchain row");
+        assert!(err(&format!("[clang-22]\n{tool}")).contains("cc, cxx, lld"));
     }
 
     /// A cross host's rust std row against the installed std targets: the named `rustup target add` problem that cross::cargo_target stops on before any build, and none once installed.

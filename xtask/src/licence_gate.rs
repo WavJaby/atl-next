@@ -11,7 +11,7 @@
 //!
 //! - A member of an archive no edge of this build makes (built by an upstream's own CMake/ninja build: `xtask runtimes`, providers.toml `upstream:`) is mapped to its object through that build's edges and deps log (`external_build`).
 //!
-//! Not checked, only counted: files generated into a build dir (aidl, protobuf, sysprop, genrule outputs, our crates' generated headers; their generators' inputs are not followed) -- except staged copies of sources (`Staged`), judged as the source they copy; system files under `/usr` and `/lib*` (toolchain, distro headers and libraries: the platform's, not ours to ship).
+//! Not checked, only counted: files generated into a build dir (aidl, protobuf, sysprop, genrule outputs, our crates' generated headers; their generators' inputs are not followed) -- except staged copies of sources (`Staged`), judged as the source they copy; system files under `/usr`, `/lib*` and the fetched sysroots (toolchain, distro headers and libraries: the platform's, not ours to ship; `Places`).
 //! A file anywhere else fails: nothing passes because the gate cannot place it.
 //! Not in the depfile: build.ninja and the deps logs. An archive's members or an object's headers change only through an edit to an input already listed (a source, a header, a blueprint) or a relinked artifact, and a regenerated build.ninja alone would rerun the whole gate.
 
@@ -26,6 +26,36 @@ use crate::notice;
 
 /// Toolchain and distro files: the platform's.
 const SYSTEM_DIRS: &[&str] = &["/usr", "/lib", "/lib64"];
+
+/// Where the gate places a reached file: the checkouts (`roots`), and the platform's dirs (`system`: SYSTEM_DIRS plus every deps.toml sysroot row's root -- Debian packages a cross link
+/// loads crt objects, libgcc and libc_nonshared from, the platform's as the build machine's /usr is; memory M41 F1).
+pub struct Places {
+    pub roots: Vec<Root>,
+    pub system: Vec<PathBuf>,
+}
+
+impl Places {
+    /// The checkouts' roots (`roots`) and the system dirs of the checkout at `root`.
+    pub fn of(
+        root: &Path,
+        layout: &atl_layout::Layout,
+        checkouts: &[crate::sources::Checkout],
+    ) -> Result<Self> {
+        let mut system: Vec<PathBuf> = SYSTEM_DIRS.iter().map(PathBuf::from).collect();
+        for row in crate::deps::sysroot_rows(root)? {
+            // an unfetched sysroot holds nothing a link loaded
+            system.extend(std::fs::canonicalize(layout.sysroot(&row)).ok());
+        }
+        Ok(Self {
+            roots: roots(layout, checkouts),
+            system,
+        })
+    }
+
+    fn is_system(&self, path: &Path) -> bool {
+        self.system.iter().any(|d| path.starts_with(d))
+    }
+}
 
 /// A checkout as the gate places files: its canonical directory, its licence key, and where it sits inside its upstream (an AOSP project's tree path; empty for other upstreams).
 #[derive(Debug, PartialEq)]
@@ -87,7 +117,7 @@ pub fn run_edge(root: &Path, args: &EdgeArgs) -> Result<std::process::ExitCode> 
     let licenses = licenses::load(root, &sources.upstream_names())?;
     licenses::check_test_only(&licenses)?;
     let out = std::fs::canonicalize(&args.out)?;
-    let roots = roots(&layout, &sources.checkouts(None));
+    let places = Places::of(root, &layout, &sources.checkouts(None))?;
     let test_only = licenses::test_only_outputs(&licenses, &out)?
         .into_iter()
         .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
@@ -102,7 +132,7 @@ pub fn run_edge(root: &Path, args: &EdgeArgs) -> Result<std::process::ExitCode> 
     inputs.extend(TABLES.iter().map(|t| root.join(t)));
     inputs.extend(licenses.aosp_index.file.clone());
     inputs.insert(std::env::current_exe().context("the gate's own binary")?);
-    let report = check(&out, artifacts, &roots, &licenses, &test_only, &mut inputs)?;
+    let report = check(&out, artifacts, &places, &licenses, &test_only, &mut inputs)?;
     std::fs::write(&args.report, serde_json::to_string_pretty(&report)?)
         .with_context(|| format!("writing {}", args.report.display()))?;
     write_depfile(&args.depfile, &args.report, &inputs)?;
@@ -176,7 +206,7 @@ fn write_depfile(path: &Path, target: &Path, inputs: &Inputs) -> Result<()> {
 pub fn check(
     out: &Path,
     mut artifacts: Vec<PathBuf>,
-    roots: &[Root],
+    places: &Places,
     licenses: &Licenses,
     test_only: &BTreeSet<PathBuf>,
     inputs: &mut Inputs,
@@ -235,7 +265,7 @@ pub fn check(
     let mut external: BTreeMap<PathBuf, Vec<(&Path, &str, &Path)>> = BTreeMap::new();
     for (archive, member, artifact) in &members {
         let Some(objs) = archive_inputs.get(archive) else {
-            if is_system(archive) {
+            if places.is_system(archive) {
                 report.system += 1;
             } else if let Some(b) = external_build(archive, out) {
                 external
@@ -273,7 +303,7 @@ pub fn check(
     // file -> first artifact reaching it
     let mut files: BTreeMap<PathBuf, &Path> = BTreeMap::new();
     for (object, artifact) in &objects {
-        if is_system(object) {
+        if places.is_system(object) {
             continue;
         }
         if !deps.contains_key(object) {
@@ -286,14 +316,14 @@ pub fn check(
             files.entry(f.to_path_buf()).or_insert(artifact);
         }
     }
-    judge_files(files, roots, out, licenses, &mut report, inputs)?;
+    judge_files(files, places, out, licenses, &mut report, inputs)?;
     for (build, loaded) in external {
         check_external(
             &build,
             out,
             Reach::Members(&loaded),
             &[],
-            roots,
+            places,
             licenses,
             &mut report,
             inputs,
@@ -318,7 +348,7 @@ fn check_external(
     out: &Path,
     reach: Reach,
     staged: &[Staged],
-    roots: &[Root],
+    places: &Places,
     licenses: &Licenses,
     report: &mut Report,
     inputs: &mut Inputs,
@@ -355,7 +385,7 @@ fn check_external(
     }
     inputs.extend(placed.keys().cloned());
     let (placed, configured) = unstage(placed, staged);
-    judge(placed, roots, out, licenses, report, inputs)?;
+    judge(placed, places, out, licenses, report, inputs)?;
     for (file, s, artifact) in configured {
         let text = String::from_utf8_lossy(
             &std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?,
@@ -430,7 +460,7 @@ fn member_objects<'a>(
 /// `judge` over reached files (file -> first artifact reaching it), canonicalized first; each reached path, as named and as placed, is an input.
 fn judge_files(
     files: BTreeMap<PathBuf, &Path>,
-    roots: &[Root],
+    places: &Places,
     out: &Path,
     licenses: &Licenses,
     report: &mut Report,
@@ -443,7 +473,7 @@ fn judge_files(
         placed.entry(real).or_insert(artifact);
     }
     inputs.extend(placed.keys().cloned());
-    judge(placed, roots, out, licenses, report, inputs)
+    judge(placed, places, out, licenses, report, inputs)
 }
 
 /// The CMake/ninja build an archive outside this build's edges came from: the nearest ancestor below `out` holding `build.ninja` (the archive sits in its build dir, as `xtask runtimes` leaves it) or `build/build.ninja` (an install prefix beside its build dir, as `upstream::build` leaves it).
@@ -506,7 +536,7 @@ fn unstage<'a>(
 pub fn check_build(
     build: &Path,
     staged: &[Staged],
-    roots: &[Root],
+    places: &Places,
     licenses: &Licenses,
 ) -> Result<Report> {
     let mut report = Report::default();
@@ -516,7 +546,7 @@ pub fn check_build(
         build,
         Reach::All,
         staged,
-        roots,
+        places,
         licenses,
         &mut report,
         &mut Inputs::new(),
@@ -538,10 +568,10 @@ pub fn gate_builds(root: &Path, label: &str, builds: &[Build]) -> Result<bool> {
     let sources = crate::sources::load(root)?;
     let checkouts = sources.checkouts(None);
     let licenses = licenses::load(root, &sources.upstream_names())?;
-    let roots = roots(&layout, &checkouts);
+    let places = Places::of(root, &layout, &checkouts)?;
     let mut ok = true;
     for b in builds {
-        let r = check_build(&b.dir, &b.staged, &roots, &licenses)?;
+        let r = check_build(&b.dir, &b.staged, &places, &licenses)?;
         println!(
             "{label}: licence {:<20} {} objects, {} files checked, {} generated, {} system",
             b.name, r.artifacts, r.checked, r.generated, r.system
@@ -565,7 +595,7 @@ pub fn gate_builds(root: &Path, label: &str, builds: &[Build]) -> Result<bool> {
 /// Resolves and checks the licence of each placed file (canonical path -> the first artifact reaching it); files under `out` count as generated.
 fn judge(
     placed: BTreeMap<PathBuf, &Path>,
-    roots: &[Root],
+    places: &Places,
     out: &Path,
     licenses: &Licenses,
     report: &mut Report,
@@ -575,7 +605,7 @@ fn judge(
         let name = artifact
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-        match place(&file, roots, out) {
+        match place(&file, places, out) {
             Place::Upstream { root, rel } => {
                 let text = String::from_utf8_lossy(
                     &std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?,
@@ -642,10 +672,6 @@ pub(crate) fn lines(text: &str) -> impl Iterator<Item = &str> {
     text.lines().map(str::trim).filter(|l| !l.is_empty())
 }
 
-fn is_system(path: &Path) -> bool {
-    SYSTEM_DIRS.iter().any(|d| path.starts_with(d))
-}
-
 #[derive(Debug, PartialEq)]
 enum Place<'a> {
     Upstream { root: &'a Root, rel: String },
@@ -655,8 +681,9 @@ enum Place<'a> {
 }
 
 /// Where a reached file lives; the innermost checkout wins (AOSP projects nest).
-fn place<'a>(path: &Path, roots: &'a [Root], out: &Path) -> Place<'a> {
-    let root = roots
+fn place<'a>(path: &Path, places: &'a Places, out: &Path) -> Place<'a> {
+    let root = places
+        .roots
         .iter()
         .filter(|r| path.starts_with(&r.dir))
         .max_by_key(|r| r.dir.components().count());
@@ -668,7 +695,7 @@ fn place<'a>(path: &Path, roots: &'a [Root], out: &Path) -> Place<'a> {
     }
     if path.starts_with(out) {
         Place::Generated
-    } else if is_system(path) {
+    } else if places.is_system(path) {
         Place::System
     } else {
         Place::Unknown
@@ -931,18 +958,21 @@ mod tests {
             &["aosp".to_owned()].into(),
         )
         .unwrap();
-        let roots = [Root {
-            dir: std::fs::canonicalize(src).unwrap(),
-            key: "aosp".into(),
-            prefix: PathBuf::new(),
-        }];
+        let places = Places {
+            roots: vec![Root {
+                dir: std::fs::canonicalize(src).unwrap(),
+                key: "aosp".into(),
+                prefix: PathBuf::new(),
+            }],
+            system: SYSTEM_DIRS.iter().map(PathBuf::from).collect(),
+        };
         let out = std::fs::canonicalize(out).unwrap();
         let artifacts = crate::runpath_gate::link_outputs(&out, &[out.join("device")]).unwrap();
         let mut inputs = Inputs::new();
         let report = check(
             &out,
             artifacts,
-            &roots,
+            &places,
             &licenses,
             &BTreeSet::new(),
             &mut inputs,
@@ -1115,27 +1145,38 @@ mod tests {
 
     #[test]
     fn files_placed_by_innermost_checkout() {
-        let roots = [
-            Root {
-                dir: "/src/aosp".into(),
-                key: "aosp".into(),
-                prefix: PathBuf::new(),
-            },
-            // a task copy of an AOSP project lives outside the shared tree
-            Root {
-                dir: "/src-wt/t/aosp/external/skia".into(),
-                key: "aosp".into(),
-                prefix: "external/skia".into(),
-            },
-            Root {
-                dir: "/src/boringssl".into(),
-                key: "boringssl".into(),
-                prefix: PathBuf::new(),
-            },
-        ];
-        let out = Path::new("/out/n");
+        let places = Places {
+            roots: vec![
+                Root {
+                    dir: "/src/aosp".into(),
+                    key: "aosp".into(),
+                    prefix: PathBuf::new(),
+                },
+                // a task copy of an AOSP project lives outside the shared tree
+                Root {
+                    dir: "/src-wt/t/aosp/external/skia".into(),
+                    key: "aosp".into(),
+                    prefix: "external/skia".into(),
+                },
+                Root {
+                    dir: "/src/boringssl".into(),
+                    key: "boringssl".into(),
+                    prefix: PathBuf::new(),
+                },
+            ],
+            // a cross sysroot is a system dir (M41 F1)
+            system: [
+                "/usr",
+                "/lib",
+                "/lib64",
+                "/cache/sysroot/riscv64-sysroot/root",
+            ]
+            .map(PathBuf::from)
+            .to_vec(),
+        };
+        let (roots, out) = (&places, Path::new("/out/n"));
         let up = |root: usize, rel: &str| Place::Upstream {
-            root: &roots[root],
+            root: &places.roots[root],
             rel: rel.to_owned(),
         };
         assert_eq!(
@@ -1172,5 +1213,33 @@ mod tests {
             place(Path::new("/home/me/a.h"), &roots, out),
             Place::Unknown
         );
+        // the sysroot's crt objects and libgcc: the platform's; a sibling dir is not
+        let crt = "/cache/sysroot/riscv64-sysroot/root/usr/lib/gcc-cross/riscv64-linux-gnu/14/crtbeginS.o";
+        assert_eq!(place(Path::new(crt), &roots, out), Place::System);
+        assert_eq!(
+            place(Path::new("/cache/sysroot/other/a.o"), &roots, out),
+            Place::Unknown
+        );
+    }
+
+    /// Places::of: SYSTEM_DIRS plus the root of every fetched deps.toml sysroot row, canonical. Break: dropping the sysroot rows leaves only SYSTEM_DIRS.
+    #[test]
+    fn places_count_fetched_sysroots_as_system() {
+        let root = crate::test_root();
+        let layout = atl_layout::Layout::of(&root).unwrap();
+        let places = Places::of(&root, &layout, &[]).unwrap();
+        let fetched: Vec<PathBuf> = crate::deps::sysroot_rows(&root)
+            .unwrap()
+            .iter()
+            .filter_map(|r| std::fs::canonicalize(layout.sysroot(r)).ok())
+            .collect();
+        assert_eq!(places.system.len(), SYSTEM_DIRS.len() + fetched.len());
+        for dir in &fetched {
+            assert!(
+                places.is_system(&dir.join("usr/lib/x.o")),
+                "{}",
+                dir.display()
+            );
+        }
     }
 }

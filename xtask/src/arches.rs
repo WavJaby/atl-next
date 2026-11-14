@@ -40,6 +40,13 @@ pub struct Host {
     pub sysroot: Option<String>,
     /// Newest GLIBC_x.y an output may need (dotted, `2.39`): the glibc of the oldest machine the outputs run on. Required with isa.
     pub glibc_floor: Option<String>,
+    /// deps.toml rows of the cross compiler (C, C++) and the lld it resolves; required with isa.
+    pub cc: Option<String>,
+    pub cxx: Option<String>,
+    pub lld: Option<String>,
+    /// Extra target flags of every cross compile and link (`-mno-relax`); empty = none.
+    #[serde(default)]
+    pub cflags: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,29 +90,35 @@ fn host_row<'a>(arches: &'a Arches, triple: &str) -> Result<(&'a str, &'a Arch)>
         .with_context(|| format!("no {FILE} [host] row has rust = {triple:?}"))
 }
 
-/// What a host of another arch than the build machine is compiled and linked for: its `[host]` row's clang, sysroot, isa and rust target.
+/// What a host of another arch than the build machine is compiled and linked for: its `[host]` row's clang triple, sysroot, isa, rust target, compiler rows (`cc`, `cxx`: deps.toml names) and extra target flags.
 #[derive(Debug, PartialEq)]
 pub struct CrossTarget {
     pub clang: String,
     pub sysroot: String,
     pub isa: String,
     pub rust: String,
+    pub cc: String,
+    pub cxx: String,
+    pub cflags: Vec<String>,
 }
 
-/// The cross target of host `name` when the build machine is `build` (build_machine's name): None for the build machine itself; another arch needs all three columns of its row.
+/// The cross target of host `name` when the build machine is `build` (build_machine's name): None for the build machine itself; another arch needs clang, sysroot, isa, cc and cxx in its row.
 pub fn cross_target(name: &str, host: &Host, build: &str) -> Result<Option<CrossTarget>> {
     if name == build {
         return Ok(None);
     }
-    match (&host.clang, &host.sysroot, &host.isa) {
-        (Some(clang), Some(sysroot), Some(isa)) => Ok(Some(CrossTarget {
+    match (&host.clang, &host.sysroot, &host.isa, &host.cc, &host.cxx) {
+        (Some(clang), Some(sysroot), Some(isa), Some(cc), Some(cxx)) => Ok(Some(CrossTarget {
             clang: clang.clone(),
             sysroot: sysroot.clone(),
             isa: isa.clone(),
             rust: host.rust.clone(),
+            cc: cc.clone(),
+            cxx: cxx.clone(),
+            cflags: host.cflags.clone(),
         })),
         _ => bail!(
-            "{FILE}: {name} is not the build machine ({build}): a cross host needs clang, sysroot and isa in its [host] row"
+            "{FILE}: {name} is not the build machine ({build}): a cross host needs clang, sysroot, isa, cc and cxx in its [host] row"
         ),
     }
 }
@@ -140,6 +153,16 @@ fn validate(arches: &Arches) -> Result<()> {
             ensure!(
                 host.isa.is_none() || host.glibc_floor.is_some(),
                 "{name}: isa without glibc_floor (the outputs' glibc floor)"
+            );
+            // the toolchain columns are a cross host's: the build machine compiles with deps.toml `clang` / `clang-cxx`
+            let toolchain = [&host.cc, &host.cxx, &host.lld];
+            ensure!(
+                if host.isa.is_some() {
+                    toolchain.iter().all(|c| c.is_some())
+                } else {
+                    toolchain.iter().all(|c| c.is_none()) && host.cflags.is_empty()
+                },
+                "{name}: cc, cxx and lld go with isa (a cross host), cflags only with them"
             );
             if let Some(floor) = &host.glibc_floor {
                 dotted_version(floor).with_context(|| format!("{name}: glibc_floor"))?;
@@ -314,15 +337,35 @@ pub fn check_cross(root: &Path, arches: &Arches) -> Result<()> {
             }
         }
         if let Some(triple) = &host.clang {
-            let out = Command::new(deps::binary(root, "clang")?)
+            // the host's own compiler (cc row) where it names one, else the build machine's
+            let cc = deps::binary(root, host.cc.as_deref().unwrap_or("clang"))?;
+            let out = Command::new(&cc)
                 .arg(format!("--target={triple}"))
                 .arg("-print-target-triple")
                 .output()
-                .context("running clang -print-target-triple")?;
+                .with_context(|| format!("running {cc} -print-target-triple"))?;
             ensure!(
                 out.status.success() && triple.split('-').next() == Some(name.as_str()),
-                "{FILE}: {name}: clang does not accept {triple} as a target with arch {name}"
+                "{FILE}: {name}: {cc} does not accept {triple} as a target with arch {name}"
             );
+            // cflags: the compiler takes each for the triple as a used flag (an unused or unknown one fails under -Werror)
+            if !host.cflags.is_empty() {
+                let out = Command::new(&cc)
+                    .arg(format!("--target={triple}"))
+                    .args(&host.cflags)
+                    .args(["-Werror", "-x", "c", "-c", "/dev/null", "-o", "/dev/null"])
+                    .output()
+                    .with_context(|| format!("running {cc} with cflags"))?;
+                ensure!(
+                    out.status.success(),
+                    "{FILE}: {name}: {cc} --target={triple} rejects cflags {:?}: {}",
+                    host.cflags,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+        }
+        if let (Some(cc), Some(cxx), Some(lld)) = (&host.cc, &host.cxx, &host.lld) {
+            check_toolchain(root, name, cc, cxx, lld)?;
         }
         if let Some(sysroot) = &host.sysroot {
             let row =
@@ -334,6 +377,46 @@ pub fn check_cross(root: &Path, arches: &Arches) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A cross host's toolchain rows: `cxx` is the C++ driver of `cc`'s install (same bin dir once symlinks resolve), and the ld.lld `cc -fuse-ld=lld` runs is row `lld`'s binary.
+/// The last one is what makes the lld row honest: clang searches its own bin dir first, so the linker follows the compiler, not PATH.
+fn check_toolchain(root: &Path, name: &str, cc: &str, cxx: &str, lld: &str) -> Result<()> {
+    let resolve = |row: &str| -> Result<PathBuf> {
+        let bin = deps::binary(root, row).with_context(|| format!("{FILE}: {name}: {row}"))?;
+        on_path(&bin)
+            .with_context(|| format!("{FILE}: {name}: `{bin}` (deps.toml {row}) is not on PATH"))
+    };
+    let (cc_path, cxx_path, lld_path) = (resolve(cc)?, resolve(cxx)?, resolve(lld)?);
+    ensure!(
+        cc_path.parent() == cxx_path.parent(),
+        "{FILE}: {name}: cxx {} is not in cc's install {}",
+        cxx_path.display(),
+        cc_path.display()
+    );
+    let out = Command::new(&cc_path)
+        .args(["-fuse-ld=lld", "-print-prog-name=ld.lld"])
+        .output()
+        .with_context(|| format!("running {} -print-prog-name=ld.lld", cc_path.display()))?;
+    let linker = PathBuf::from(String::from_utf8(out.stdout)?.trim());
+    ensure!(
+        out.status.success() && linker.canonicalize().ok().as_ref() == Some(&lld_path),
+        "{FILE}: {name}: cc runs ld.lld {}, not lld row {lld}'s {}",
+        linker.display(),
+        lld_path.display()
+    );
+    Ok(())
+}
+
+/// The canonical path of executable `bin`: as given when it has a `/`, else the first PATH entry holding it.
+pub fn on_path(bin: &str) -> Option<PathBuf> {
+    if bin.contains('/') {
+        return Path::new(bin).canonicalize().ok();
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(bin))
+        .find(|p| p.is_file())
+        .and_then(|p| p.canonicalize().ok())
 }
 
 /// Every guest row's `rust` is a target rustc knows (`rustc --print target-list`) whose arch part is the row's `qemu_target` (the CPU QEMU runs it on).
@@ -553,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_target_needs_all_three_columns_off_the_build_machine() {
+    fn cross_target_needs_its_columns_off_the_build_machine() {
         let row = |clang: Option<&str>, sysroot: Option<&str>, isa: Option<&str>| super::Host {
             rust: "t".into(),
             meson_cpu_family: "m".into(),
@@ -564,6 +647,10 @@ mod tests {
             clang: clang.map(Into::into),
             sysroot: sysroot.map(Into::into),
             glibc_floor: None,
+            cc: isa.map(|_| "cc-row".into()),
+            cxx: isa.map(|_| "cxx-row".into()),
+            lld: isa.map(|_| "lld-row".into()),
+            cflags: isa.map(|_| vec!["-mno-relax".into()]).unwrap_or_default(),
         };
         // the build machine's own row is native, whatever it lists
         assert_eq!(
@@ -583,8 +670,15 @@ mod tests {
                 sysroot: "riscv64-sysroot".into(),
                 isa: "rv64gc_zba_zbb".into(),
                 rust: "t".into(),
+                cc: "cc-row".into(),
+                cxx: "cxx-row".into(),
+                cflags: vec!["-mno-relax".into()],
             })
         );
+        // a cross row without its compiler: an error, never the build machine's compiler
+        let mut no_cc = row(Some("c"), Some("s"), Some("rv64gc"));
+        no_cc.cc = None;
+        assert!(super::cross_target("riscv64", &no_cc, "x86_64").is_err());
         // another arch with no or a partial row: an error, never the build machine's flags
         assert!(super::cross_target("arm64", &row(None, None, None), "x86_64").is_err());
         assert!(
@@ -662,5 +756,18 @@ mod tests {
             "[a]\npointer_bits = 64\n{K}[a.guest]\n{GUEST}[b]\npointer_bits = 64\n{K}[b.guest]\n{GUEST}"
         );
         assert!(err(&text).contains("listed by both a and b"));
+    }
+
+    #[test]
+    fn toolchain_columns_go_with_isa() {
+        let host = "[a]\npointer_bits = 64\nkernel_arch = \"k\"\nuapi_records = [\"r\"]\n[a.host]\nrust = \"t\"\nmeson_cpu_family = \"m\"\ndebian = \"d\"\n";
+        let cross = "isa = \"rv64gc\"\nglibc_floor = \"2.39\"\n";
+        let tc = "cc = \"c\"\ncxx = \"x\"\nlld = \"l\"\n";
+        parse(&format!("{host}{cross}{tc}cflags = [\"-mno-relax\"]\n")).unwrap();
+        // a cross host without its compiler rows
+        assert!(err(&format!("{host}{cross}")).contains("cc, cxx and lld go with isa"));
+        // the build machine (no isa) takes deps.toml clang: no toolchain columns, no cflags
+        assert!(err(&format!("{host}{tc}")).contains("go with isa"));
+        assert!(err(&format!("{host}cflags = [\"-x\"]\n")).contains("go with isa"));
     }
 }

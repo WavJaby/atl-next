@@ -588,7 +588,7 @@ func (g *Graph) emitRust(b *strings.Builder, n *Node, tools Tools) {
 	implicit = append(implicit, inputs...)
 	flags := append([]string{}, r.flags...)
 	if n.kind == Binary {
-		link, linkInputs := g.rustLinkArgs(n, tools.CXX)
+		link, linkInputs := g.rustLinkArgs(n, g.cfg.ccTools(n.side, tools).CXX)
 		flags = append(flags, link...)
 		implicit = append(implicit, linkInputs...)
 	}

@@ -965,6 +965,10 @@ mod tests {
             clang: Some("riscv64-linux-gnu".to_owned()),
             sysroot: Some("riscv64-sysroot".to_owned()),
             glibc_floor: Some("2.39".to_owned()),
+            cc: Some("clang-21".to_owned()),
+            cxx: Some("clang-21-cxx".to_owned()),
+            lld: Some("lld-21".to_owned()),
+            cflags: vec!["-mno-relax".to_owned()],
         };
         let report = check(
             &out,

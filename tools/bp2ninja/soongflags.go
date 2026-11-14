@@ -81,17 +81,20 @@ func toolchainLocation(f string) int {
 // The distro clang compiles and links for any target it knows given --target and --sysroot (the sysroot's libraries, crt objects and GCC runtime dir are found under it). -march pins the ISA baseline: no V or Zbs reaches an object, except an isa-tiers.toml row's file (isatier.go; readelf -A Tag_RISCV_arch).
 // Rust follows the same row: rustc --target and the isa's extensions as target features (rustFlags), so no product crate takes the build machine's default target or Soong's riscv64 Rust features.
 // No -fuse-ld here: Soong's lldflags give every host link -fuse-ld=lld already (readLldflags).
+// The host has its own compiler (arches.toml cc / cxx): it compiles and links every node of the host's machine (Config.machine "host": device and host sides); the build side keeps -cc / -cxx (ccTools).
 type HostCross struct {
-	Target       string // clang --target
-	Sysroot      string // the sysroot directory (a fetched sysroot_debs row)
-	ISA          string // -march
-	Libcxx       string // the sysroot's libc++ headers (xtask cross::libcxx_dir): the one c++/v1 holding __config
-	RustTarget   string // rustc --target of the host's product crates (arches.toml rust); its std is a rustup_target row
-	RustFeatures string // rustc -C target-feature: the isa's extensions past the base (arches::rustc_target_features); empty for the base alone
+	Target       string   // clang --target
+	Sysroot      string   // the sysroot directory (a fetched sysroot_debs row)
+	ISA          string   // -march
+	Libcxx       string   // the sysroot's libc++ headers (xtask cross::libcxx_dir): the one c++/v1 holding __config
+	RustTarget   string   // rustc --target of the host's product crates (arches.toml rust); its std is a rustup_target row
+	RustFeatures string   // rustc -C target-feature: the isa's extensions past the base (arches::rustc_target_features); empty for the base alone
+	CC, CXX      string   // the host's C and C++ drivers (arches.toml cc / cxx rows)
+	Flags        []string // extra target flags of every compile and link (arches.toml cflags: -mno-relax); may be empty
 }
 
-// set: the host is cross. main.go requires Target, Sysroot, ISA, Libcxx and RustTarget together; RustFeatures may be empty.
-func (h HostCross) set() bool { return h != (HostCross{}) }
+// set: the host is cross. main.go requires Target, Sysroot, ISA, Libcxx, RustTarget, CC and CXX together; RustFeatures and Flags may be empty.
+func (h HostCross) set() bool { return h.Target != "" }
 
 // rustFlags: the rustc flags of a cross host's product crates, in place of rustc's default target (Soong's RustTriple: --target, then the target's features).
 func (h HostCross) rustFlags() []string {
@@ -110,31 +113,44 @@ func (h HostCross) compileFlags() []string {
 	if !h.set() {
 		return nil
 	}
-	return []string{"--target=" + h.Target, "--sysroot=" + h.Sysroot, "-march=" + h.ISA}
+	return append([]string{"--target=" + h.Target, "--sysroot=" + h.Sysroot, "-march=" + h.ISA}, h.Flags...)
 }
 
-// linkFlags: the target and sysroot of every host link. clang adds the sysroot's library and GCC runtime dirs itself (checked on riscv64: a link with no -L).
+// linkFlags: the target and sysroot of every host link, and the extra flags (clang turns -mno-relax into lld's --no-relax). clang adds the sysroot's library and GCC runtime dirs itself (checked on riscv64: a link with no -L).
 func (h HostCross) linkFlags() []string {
 	if !h.set() {
 		return nil
 	}
-	return []string{"--target=" + h.Target, "--sysroot=" + h.Sysroot}
+	return append([]string{"--target=" + h.Target, "--sysroot=" + h.Sysroot}, h.Flags...)
+}
+
+// ccTools: tools with the C and C++ drivers of the machine side s runs on: the cross host's own for its device and host sides, else -cc / -cxx unchanged (the build side, the native bridge guest, a plain host).
+func (c Config) ccTools(s Side, tools Tools) Tools {
+	if c.HostCross.set() && c.machine(s) == "host" {
+		tools.CC, tools.CXX = c.HostCross.CC, c.HostCross.CXX
+	}
+	return tools
 }
 
 // UpstreamToolchain: what a build outside the converter (xtask upstream.rs: CMake) needs to compile and link like a host module: one derivation, read through -upstream-toolchain.
 type UpstreamToolchain struct {
+	CC      string   `json:"cc"`
+	CXX     string   `json:"cxx"`
 	Libcxx  string   `json:"libcxx"`
 	Compile []string `json:"compile"`
 	Link    []string `json:"link"`
 }
 
-// upstreamToolchainOf: the converter's libc++ and host target flags. Link adds -fuse-ld=lld, which the converter's host links get from Soong's lldflags (readLldflags) and which a cross link needs: the distro's ld is the build machine's.
-func upstreamToolchainOf(cxx string, h HostCross) (UpstreamToolchain, error) {
-	dir, err := libcxxProvider(cxx, h)
+// upstreamToolchainOf: the host side's compilers (ccTools), the converter's libc++ and host target flags. Link adds -fuse-ld=lld, which the converter's host links get from Soong's lldflags (readLldflags) and which a cross link needs: the distro's ld is the build machine's.
+func upstreamToolchainOf(tools Tools, h HostCross) (UpstreamToolchain, error) {
+	dir, err := libcxxProvider(tools.CXX, h)
 	if err != nil {
 		return UpstreamToolchain{}, err
 	}
+	tools = Config{HostCross: h}.ccTools(Host, tools)
 	return UpstreamToolchain{
+		CC:     tools.CC,
+		CXX:    tools.CXX,
 		Libcxx: dir,
 		// non-nil: the build machine's empty list must read as [] (json: nil -> null)
 		Compile: append([]string{}, h.compileFlags()...),
