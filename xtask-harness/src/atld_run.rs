@@ -1385,6 +1385,8 @@ impl Runtime {
             self.sandbox_join.clone(),
             self.flatpak_spawn.clone(),
             self.atld.clone(),
+            self.installer.clone(),
+            self.api_impl.clone(),
             self.framework_res.clone(),
             self.fonts.conf.clone(),
         ]);
