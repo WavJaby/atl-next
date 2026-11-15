@@ -4,7 +4,7 @@
 //! publishService, unbindService, unbindFinished, and the sender of the calls bound_services.rs returns. The rules themselves are bound_services.rs.
 //! Calls leave on one thread in the order the state lock produced them (broadcast_queue.rs's reason: no call out of the system process with the lock held; in-process connections, the job runner's,
 //! run their `connected` there too, so they may call back into the services).
-//! Not modelled: implicit service Intents (a component-less Intent answers 0, counted: queryIntentServices is not served), instanceName (ignored, counted), bindings across users.
+//! Not modelled: implicit service Intents (a component-less Intent answers 0, counted: ActiveServices.retrieveServiceLocked's resolveService over PackageManager.queryIntentServices is not wired here), instanceName (ignored, counted), bindings across users.
 
 use std::sync::Mutex;
 use std::sync::mpsc::{self, Sender};

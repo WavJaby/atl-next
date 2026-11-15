@@ -85,46 +85,59 @@ impl IntentKey {
 /// matchAction:872-891 (a null action matches nothing), matchData:1742 (no types and no schemes: only a type-less, data-less intent; schemes: the intent's scheme, "" for none; no schemes: only
 /// none / "" / content / file; types: the resolved type by findMimeType, else a typed intent fails), matchCategories:1904 (every intent category in the filter).
 pub fn matches(f: &Filter, k: &IntentKey) -> bool {
-    let Some(action) = &k.action else {
-        return false;
-    };
+    match_value(f, k).is_some()
+}
+
+/// IntentFilter.MATCH_CATEGORY_EMPTY, MATCH_CATEGORY_SCHEME, MATCH_CATEGORY_TYPE, MATCH_ADJUSTMENT_NORMAL (IntentFilter.java:246-279).
+pub const MATCH_CATEGORY_EMPTY: i32 = 0x0100000;
+pub const MATCH_CATEGORY_SCHEME: i32 = 0x0200000;
+pub const MATCH_CATEGORY_TYPE: i32 = 0x0600000;
+pub const MATCH_ADJUSTMENT_NORMAL: i32 = 0x8000;
+
+/// IntentFilter.match's positive result (what ResolveInfo.match carries), None for any NO_MATCH_*; the rules [`matches`] documents. matchData:1747-1832 starts at MATCH_CATEGORY_EMPTY, a matched
+/// scheme raises it to SCHEME, a matched type to TYPE, then adds MATCH_ADJUSTMENT_NORMAL.
+pub fn match_value(f: &Filter, k: &IntentKey) -> Option<i32> {
+    let action = k.action.as_ref()?;
     if !f.actions.contains(action) {
-        return false;
+        return None;
     }
     let scheme = k.scheme();
     let resolved = k.resolved_type.as_deref();
+    let mut category = MATCH_CATEGORY_EMPTY;
     if f.types.is_none() && f.schemes.is_none() {
         if resolved.is_some() || k.data.is_some() {
-            return false;
+            return None;
         }
     } else {
         match &f.schemes {
             Some(schemes) => {
                 if !schemes.iter().any(|s| s == scheme.unwrap_or("")) {
-                    return false;
+                    return None;
                 }
+                category = MATCH_CATEGORY_SCHEME;
             }
             None => {
                 if !matches!(scheme, None | Some("" | "content" | "file")) {
-                    return false;
+                    return None;
                 }
             }
         }
         match (&f.types, resolved) {
             (Some(types), Some(t)) => {
                 if !types.iter().any(|ft| mime_matches(ft, t)) {
-                    return false;
+                    return None;
                 }
+                category = MATCH_CATEGORY_TYPE;
             }
-            (Some(_), None) => return false,
-            (None, Some(_)) => return false,
+            (Some(_), None) | (None, Some(_)) => return None,
             (None, None) => {}
         }
     }
-    match &f.categories {
+    let categories = match &f.categories {
         None => k.categories.is_empty(),
         Some(cats) => k.categories.iter().all(|c| cats.contains(c)),
-    }
+    };
+    categories.then_some(category + MATCH_ADJUSTMENT_NORMAL)
 }
 
 /// IntentFilter.findMimeType, reduced: equal, `*/*` / `*`, or a partial type against `<base>/<sub>`. A partial type is `<base>/*` as the manifest writes it, or `<base>` as a parcelled

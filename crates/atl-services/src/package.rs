@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Derived from the Android Open Source Project: frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java, frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java, frameworks/base/services/core/java/com/android/server/pm/IPackageManagerBase.java, frameworks/base/services/core/java/com/android/server/pm/parsing/PackageInfoUtils.java
 //! IPackageManager, subset: getApplicationInfo, getPackageInfo, getActivityInfo, getServiceInfo, getProviderInfo, resolveContentProvider, hasSystemFeature, getSystemAvailableFeatures, getPackagesForUid, notifyDexLoad,
-//! getInstrumentationInfoAsUser, queryInstrumentationAsUser, checkSignatures. Every other method is counted unimplemented (counters).
+//! getInstrumentationInfoAsUser, queryInstrumentationAsUser, checkSignatures, queryIntentServices. Every other method is counted unimplemented (counters).
 //! Every answer is a clone of the installer's PackageInfo (crate::packages) cut to the caller's flags: GET_META_DATA, MATCH_DISABLED_COMPONENTS, and getPackageInfo's GET_<component> / GET_PERMISSIONS.
 //! One user (0): a userId other than 0 is a user that does not exist. `sharedLibraryFiles` is always filled (ActivityManagerService's STOCK_PM_FLAGS asks for it on every app path).
 
@@ -9,12 +9,18 @@ use std::io::Write;
 use std::sync::Arc;
 
 use atl_aidl::aidl::android::content::pm::IPackageManager::{EnforcePermission, IPackageManager};
-use atl_parcelables::android::content::ComponentName;
 use atl_parcelables::android::content::pm::{
     ActivityInfo, ApplicationInfo, FeatureInfo, InstrumentationInfo, PackageInfo,
     ParceledListSlice, ProviderInfo, ServiceInfo,
 };
+use atl_parcelables::android::content::{ComponentName, Intent};
 use atl_parcelables::codecs::android::content::pm::PackageInfo::{Signature, SigningDetails};
+use atl_parcelables::codecs::android::content::pm::ResolveInfo::{ResolveInfo, Resolved};
+use atl_services_types::installer_output::Kind;
+
+use crate::activity::{filter_of, intent_key};
+use crate::broadcast;
+use crate::packages::FLAG_SYSTEM;
 use atl_parcelables::parts::{ComponentInfo, SharedLibraryInfo};
 use atl_services_types::system_config::Features;
 use binder::{ExceptionCode, Interface, Status, ThreadState};
@@ -51,6 +57,11 @@ const GET_PERMISSIONS: i64 = 0x1000;
 const REQUESTED_PERMISSION_GRANTED: i32 = 1 << 1;
 /// ActivityManagerService.STOCK_PM_FLAGS: GET_SHARED_LIBRARY_FILES, the flags AMS reads an app's ApplicationInfo with (bindApplication's, the launch's).
 pub const STOCK_PM_FLAGS: i64 = 0x400;
+/// PackageManager.GET_RESOLVED_FILTER (:1091; the same bit as GET_SIGNATURES) and MATCH_DEFAULT_ONLY (:1194).
+const GET_RESOLVED_FILTER: i64 = 0x40;
+const MATCH_DEFAULT_ONLY: i64 = 0x0001_0000;
+/// Intent.CATEGORY_DEFAULT.
+const CATEGORY_DEFAULT: &str = "android.intent.category.DEFAULT";
 
 /// The ApplicationInfo of `p` for `flags` (PackageInfoUtils.generateApplicationInfo over the stored one): meta-data only with GET_META_DATA, and the shared libraries its `<uses-library>`s name:
 /// `sharedLibraryFiles` (their jars; what ComputerEngine fills for GET_SHARED_LIBRARY_FILES, which STOCK_PM_FLAGS always sets) and `sharedLibraryInfos`, from which LoadedApk builds the libraries' class
@@ -152,6 +163,14 @@ pub fn process_providers(
         .collect();
     list.sort_by_key(|d| std::cmp::Reverse(d.init_order));
     list
+}
+
+/// The package name of a service result (RESOLVE_PRIORITY_SORTER's last key).
+fn service_package(r: &ResolveInfo) -> &str {
+    match &r.info {
+        Resolved::Service(s) => s.component.item.package_name.as_deref().unwrap_or_default(),
+        _ => "",
+    }
 }
 
 /// getActivityInfo after the visibility check: `class` of `p` for `flags`; None for a class `p` does not declare or a disabled one without MATCH_DISABLED_COMPONENTS.
@@ -261,6 +280,100 @@ impl PackageManager {
                 })
                 .collect(),
         )
+    }
+
+    /// ComputerEngine.queryIntentServicesInternal:649 for `caller`: an Intent naming no component but a selector resolves the selector. An explicit component -> its getServiceInfo (visible package,
+    /// declared, enabled or MATCH_DISABLED_COMPONENTS). Otherwise queryIntentServicesInternalBody:731 over every package `caller` may see, or only `intent.package` (AppsFilter as
+    /// Packages::visible); each `<service>` `<intent-filter>` that IntentFilter.match accepts (MATCH_DEFAULT_ONLY: only filters with CATEGORY_DEFAULT, IntentResolver.buildResolveList) gives one result
+    /// per component (ServiceIntentResolver.allowFilterResult), built as newResult:1661 and sorted by ComponentResolver.RESOLVE_PRIORITY_SORTER. Empty, never null, when nothing matches or the user
+    /// does not exist. Not modelled: instant apps (none are installed), SaferIntentUtils enforcement (aconfig-flag / compat-change gated; null actions already match nothing here).
+    fn query_intent_services(
+        &self,
+        caller: u32,
+        intent: &Intent,
+        resolved_type: Option<&str>,
+        flags: i64,
+        user: i32,
+    ) -> Vec<ResolveInfo> {
+        if user != USER_SYSTEM {
+            return Vec::new();
+        }
+        let intent = match (&intent.component, &intent.selector) {
+            (None, Some(selector)) => selector.as_ref(),
+            _ => intent,
+        };
+        if let Some(c) = &intent.component {
+            return self
+                .packages
+                .visible(caller, &c.package)
+                .and_then(|p| {
+                    let mut s = p.service_info(&c.class, flags)?;
+                    s.component.application_info = application_info(p, &self.packages, flags);
+                    Some(ResolveInfo {
+                        info: Resolved::Service(s),
+                        ..ResolveInfo::default()
+                    })
+                })
+                .into_iter()
+                .collect();
+        }
+        let key = intent_key(intent, resolved_type);
+        let default_only = flags & MATCH_DEFAULT_ONLY != 0;
+        let mut found: Vec<(bool, ResolveInfo)> = Vec::new();
+        for p in self.packages.all() {
+            if intent.package.as_deref().is_some_and(|n| n != p.name())
+                || self.packages.visible(caller, p.name()).is_none()
+            {
+                continue;
+            }
+            for s in p.services() {
+                let class = s.component.item.name.as_deref().unwrap_or_default();
+                for ii in p.intents(Kind::ServiceIntents, class) {
+                    let Some(f) = &ii.intent_filter else { continue };
+                    if default_only
+                        && !f
+                            .categories
+                            .iter()
+                            .flatten()
+                            .flatten()
+                            .any(|c| c == CATEGORY_DEFAULT)
+                    {
+                        continue;
+                    }
+                    let Some(m) = broadcast::match_value(&filter_of(f), &key) else {
+                        continue;
+                    };
+                    let Some(mut si) = p.service_info(class, flags) else {
+                        continue;
+                    };
+                    si.component.application_info = application_info(p, &self.packages, flags);
+                    let system = si.component.application_info.flags & FLAG_SYSTEM != 0;
+                    found.push((
+                        ii.has_default,
+                        ResolveInfo {
+                            info: Resolved::Service(si),
+                            filter: (flags & GET_RESOLVED_FILTER != 0).then(|| f.clone()),
+                            priority: f.priority,
+                            r#match: m,
+                            label_res: ii.label_res,
+                            non_localized_label: ii.non_localized_label.clone(),
+                            icon: ii.icon,
+                            system,
+                            ..ResolveInfo::default()
+                        },
+                    ));
+                    // allowFilterResult: one result per component, its first matching filter
+                    break;
+                }
+            }
+        }
+        // RESOLVE_PRIORITY_SORTER: priority, preferredOrder (never set), isDefault, match, system descending, then package name; a stable sort keeps manifest order on ties
+        found.sort_by(|(da, a), (db, b)| {
+            (b.priority, b.preferred_order, *db, b.r#match, b.system)
+                .cmp(&(a.priority, a.preferred_order, *da, a.r#match, a.system))
+                .then_with(|| service_package(a).cmp(service_package(b)))
+        });
+        found.into_iter().map(|(_, r)| r).collect()
     }
 
     /// getPackageInfo after the visibility check (PackageInfoCommonUtils.generate over the stored info, cut to `flags`).
@@ -454,6 +567,30 @@ impl IPackageManager for PackageManager {
         Ok(Some(ParceledListSlice::new(
             self.system_available_features(),
         )))
+    }
+
+    /// IPackageManagerBase.queryIntentServices:1094: queryIntentServicesInternal for the calling uid, never null. A null Intent is Java's NullPointerException.
+    fn r#queryIntentServices(
+        &self,
+        intent: Option<&Intent>,
+        resolved_type: Option<&str>,
+        flags: i64,
+        user: i32,
+    ) -> binder::Result<Option<ParceledListSlice>> {
+        let Some(intent) = intent else {
+            return Err(Status::new_exception_str(
+                ExceptionCode::NULL_POINTER,
+                Some("queryIntentServices: null intent"),
+            ));
+        };
+        let caller = ThreadState::get_calling_uid();
+        Ok(Some(ParceledListSlice::new(self.query_intent_services(
+            caller,
+            intent,
+            resolved_type,
+            flags,
+            user,
+        ))))
     }
 
     /// ComputerEngine.getPackagesForUid:1987: the packages of the uid's app id; null when none, or when the caller may not see them (an app sees its own uid only).
@@ -702,6 +839,98 @@ mod tests {
         let mut removed = p.clone();
         removed.info.activities = Some(vec![]);
         assert!(find_activity_info(&removed, &packages, "a.Native", GET_META_DATA).is_none());
+    }
+
+    /// queryIntentServicesInternal: implicit -> the caller's visible packages' matching `<service>` filters, higher priority first, disabled ones dropped, an invisible package's left out;
+    /// explicit -> getServiceInfo; nothing found -> an empty list (Doodle's BillingClient asks for vending's billing service). Expected match = MATCH_CATEGORY_EMPTY + MATCH_ADJUSTMENT_NORMAL
+    /// (0x100000 + 0x8000, IntentFilter.java:246-251): action-only filter, data-less Intent.
+    #[test]
+    fn query_intent_services_resolves_as_component_resolver() {
+        const SYNC: &str = "a.SYNC";
+        let service = |pkg: &str, class: &str, enabled: bool| {
+            let mut c = component(pkg, class);
+            c.enabled = enabled;
+            Some(ServiceInfo {
+                component: c,
+                ..ServiceInfo::default()
+            })
+        };
+        let intents = |class: &str, priority: i32| {
+            let mut f = filter(&[SYNC], &[]);
+            if let Some(f) = f.intent_filter.as_mut() {
+                f.priority = priority;
+            }
+            crate::installed::ComponentIntents {
+                kind: Kind::ServiceIntents,
+                name: class.to_owned(),
+                intents: vec![f],
+            }
+        };
+        let mut a = record("a");
+        a.info.services = Some(vec![
+            service("a", "a.Low", true),
+            service("a", "a.High", true),
+            service("a", "a.Off", false),
+        ]);
+        a.intents = vec![
+            intents("a.Low", 0),
+            intents("a.High", 5),
+            intents("a.Off", 9),
+        ];
+        let mut b = record("b");
+        b.uid = 10_002;
+        b.info.services = Some(vec![service("b", "b.Sync", true)]);
+        b.intents = vec![intents("b.Sync", 7)];
+        let packages = Arc::new(Packages::new(vec![a, b], BTreeMap::new()));
+        let pm = PackageManager::new(
+            Arc::clone(&packages),
+            Arc::new(Permissions::new(&packages, &[])),
+            Features::default(),
+            0,
+        );
+        let caller = 10_001;
+        let classes = |intent: &Intent, flags| -> Vec<(String, i32)> {
+            pm.query_intent_services(caller, intent, None, flags, USER_SYSTEM)
+                .iter()
+                .map(|r| match &r.info {
+                    Resolved::Service(s) => {
+                        (s.component.item.name.clone().unwrap_or_default(), r.r#match)
+                    }
+                    _ => (String::new(), 0),
+                })
+                .collect()
+        };
+        let implicit = Intent {
+            action: Some(SYNC.to_owned()),
+            ..Intent::default()
+        };
+        let m = 0x10_8000;
+        assert_eq!(
+            classes(&implicit, 0),
+            [("a.High".to_owned(), m), ("a.Low".to_owned(), m)]
+        );
+        assert_eq!(classes(&implicit, MATCH_DISABLED_COMPONENTS).len(), 3);
+        // MATCH_DEFAULT_ONLY: no filter here lists CATEGORY_DEFAULT
+        assert!(classes(&implicit, MATCH_DEFAULT_ONLY).is_empty());
+        // another user does not exist
+        assert!(
+            pm.query_intent_services(caller, &implicit, None, 0, 10)
+                .is_empty()
+        );
+        let explicit = Intent {
+            component: Some(ComponentName {
+                package: "a".to_owned(),
+                class: "a.Low".to_owned(),
+            }),
+            ..Intent::default()
+        };
+        assert_eq!(classes(&explicit, 0), [("a.Low".to_owned(), 0)]);
+        let billing = Intent {
+            action: Some("com.android.vending.billing.InAppBillingService.BIND".to_owned()),
+            package: Some("com.android.vending".to_owned()),
+            ..Intent::default()
+        };
+        assert!(classes(&billing, 0).is_empty());
     }
 
     /// PackageInfoCommonUtils.generate: activities only with GET_ACTIVITIES, disabled ones dropped without MATCH_DISABLED_COMPONENTS.

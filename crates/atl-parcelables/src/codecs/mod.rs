@@ -37,6 +37,7 @@ pub mod android {
             pub mod PermissionInfo;
             pub mod ProviderInfo;
             pub mod ProviderInfoList;
+            pub mod ResolveInfo;
             pub mod ServiceInfo;
             pub mod UserInfo;
         }

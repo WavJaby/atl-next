@@ -10,6 +10,7 @@ use std::io::Write;
 use super::FeatureInfo::FeatureInfo;
 use super::InstrumentationInfo::InstrumentationInfo;
 use super::PackageInfo::PackageInfo;
+use super::ResolveInfo::ResolveInfo;
 use crate::codecs::android::app::NotificationChannel::NotificationChannel;
 use crate::codecs::android::app::job::JobInfo::JobInfo;
 use crate::parcel::*;
@@ -77,6 +78,8 @@ elements! {
     FeatureInfo => "android.content.pm.FeatureInfo",
     // IPackageManager.getInstalledPackages' reply
     PackageInfo => "android.content.pm.PackageInfo",
+    // IPackageManager.queryIntentServices' reply
+    ResolveInfo => "android.content.pm.ResolveInfo",
     // INotificationManager.createNotificationChannels / getNotificationChannels
     NotificationChannel => "android.app.NotificationChannel",
     // IJobScheduler.getAllPendingJobs / getAllPendingJobsInNamespace

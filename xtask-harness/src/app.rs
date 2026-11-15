@@ -130,7 +130,15 @@ const MEDIAPLAYER_START: &str = "MediaPlayerNative: start called in state 1";
 /// a job whose service is an activity fails enforceValidJobRequest ("non-existent component") -> IllegalArgumentException.
 /// appops: Main.appOps (AppOpsManager.MODE_ALLOWED 0, MODE_IGNORED 1, MODE_ERRORED 2): POST_NOTIFICATION's permission is requested and denied -> PermissionPolicyService's MODE_IGNORED; COARSE_LOCATION's is not
 /// requested -> the op's default MODE_ALLOWED, noted the same; noted for `android` (not the fixture's uid) -> MODE_ERRORED (noteOperationUnchecked); checkPackage passes for the fixture, throws for `android`.
-const SERVICE_LINES: [(&str, &str, Option<&str>); 7] = [
+/// queryservices: Main.queryServices: PackageManager.queryIntentServices of action atl.test.BIND scoped to the fixture finds its one `<service>` with that filter (AtlBound; ComputerEngine
+/// queryIntentServicesInternalBody), and of Play billing's Intent (action ...InAppBillingService.BIND, package com.android.vending, not installed) an empty list. A service without the method
+/// answers null, which ApplicationPackageManager turns into an empty list: `own=0`.
+const SERVICE_LINES: [(&str, &str, Option<&str>); 8] = [
+    (
+        "package",
+        "AtlTest: queryservices: ",
+        Some("own=1 com.example.atltest.AtlBound billing=0"),
+    ),
     (
         "jobscheduler",
         "AtlTest: jobscheduler: ",

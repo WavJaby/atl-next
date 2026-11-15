@@ -142,6 +142,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "uimode: " + uiMode());
         Log.i("AtlTest", "appops: " + appOps());
         Log.i("AtlTest", "jobscheduler: " + jobs());
+        Log.i("AtlTest", "queryservices: " + queryServices());
         jobRun();
         Log.i("AtlTest", "bindservice: " + bound());
         bindMissing();
@@ -507,6 +508,22 @@ public class Main extends Activity {
                 Log.i("AtlTest", "bindmissing: " + line + " called=" + called[0]);
             }
         });
+    }
+
+    /** queryIntentServices: the fixture's own atl.test.BIND service (AtlBound), then Play billing's Intent to the absent com.android.vending (empty, as on a device without Play). */
+    private String queryServices() {
+        try {
+            java.util.List<android.content.pm.ResolveInfo> own = getPackageManager().queryIntentServices(new Intent("atl.test.BIND").setPackage(getPackageName()), 0);
+            java.util.List<android.content.pm.ResolveInfo> billing = getPackageManager().queryIntentServices(
+                    new Intent("com.android.vending.billing.InAppBillingService.BIND").setPackage("com.android.vending"), 0);
+            String r = "own=" + own.size();
+            for (android.content.pm.ResolveInfo ri : own) {
+                r += " " + ri.serviceInfo.name;
+            }
+            return r + " billing=" + billing.size();
+        } catch (Throwable t) {
+            return "threw " + t;
+        }
     }
 
     private String jobs() {

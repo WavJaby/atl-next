@@ -438,7 +438,7 @@ impl PartialEq for ReceiverHandle {
 }
 
 /// What the broadcast rules read of an Intent (broadcast::IntentKey); the categories as a set. resolvedType falls back to the Intent's own type (Intent.resolveTypeIfNeeded without a resolver).
-fn intent_key(intent: &Intent, resolved_type: Option<&str>) -> IntentKey {
+pub(crate) fn intent_key(intent: &Intent, resolved_type: Option<&str>) -> IntentKey {
     let mut categories: Vec<String> = intent.categories.iter().flatten().cloned().collect();
     categories.sort();
     categories.dedup();
@@ -459,8 +459,8 @@ fn intent_key(intent: &Intent, resolved_type: Option<&str>) -> IntentKey {
     }
 }
 
-/// A registered IntentFilter in the rules' form: actions, categories, schemes, types (mDataTypes).
-fn filter_of(f: &IntentFilter) -> broadcast::Filter {
+/// An IntentFilter (registered, or a manifest `<intent-filter>`) in the rules' form: actions, categories, schemes, types (mDataTypes).
+pub(crate) fn filter_of(f: &IntentFilter) -> broadcast::Filter {
     let flat = |v: &Vec<Option<String>>| v.iter().flatten().cloned().collect::<Vec<_>>();
     broadcast::Filter {
         actions: flat(&f.actions),
