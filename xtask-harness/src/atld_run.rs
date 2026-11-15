@@ -280,6 +280,8 @@ pub struct Runtime {
     gate: String,
     /// The AOSP tree (`src/aosp`): the record's root for the `src/aosp/` bundle names.
     tree: PathBuf,
+    /// The LLVM runtimes this host's outputs link against (remote.rs `llvm_lib_dir`): the record's `lib` root, the bundle's `lib/`.
+    llvm_lib: PathBuf,
     /// Where atld runs: this host, or a target running it from the bundle (`remote test`, remote.rs [`remote::Site`]).
     site: remote::Site,
 }
@@ -680,7 +682,9 @@ impl Runtime {
         let abis = device_abis(&arches, host)?;
         let licenses = crate::licenses::load(root, &crate::sources::load(root)?.upstream_names())?;
         let test_only = crate::licenses::test_only_outputs(&licenses, &out)?;
+        let llvm_lib = remote::llvm_lib_dir(root, &out)?;
         Ok(Runtime {
+            llvm_lib,
             gate: gate.to_owned(),
             tree: tree::shared_tree(&layout),
             test_only,
@@ -1356,7 +1360,14 @@ impl Runtime {
         if let Some(shell) = &run.shell {
             inputs.files.extend(shell.boot_jars.iter().cloned());
         }
-        remote::write_record(&self.out, &self.gate, &self.java_out, &self.tree, &inputs)
+        remote::write_record(
+            &self.out,
+            &self.gate,
+            &self.java_out,
+            &self.tree,
+            &self.llvm_lib,
+            &inputs,
+        )
     }
 
     /// Starts atld for `run`, its stdout and stderr in `run.atld_log()`. The caller waits for it and ends it.
@@ -1386,7 +1397,7 @@ impl Runtime {
                 .with_context(|| format!("copying {}", self.fonts.conf.display()))?;
             cmd.env("FONTCONFIG_FILE", &conf);
             written.push(conf);
-            let roots = remote::Roots::of(&self.out, &self.java_out, &self.tree);
+            let roots = remote::Roots::of(&self.out, &self.java_out, &self.tree, &self.llvm_lib);
             return target.spawn(&roots, &cmd, &run.root, &run.scratch, &written);
         }
         let log_file = std::fs::File::create(run.atld_log())?;
@@ -1435,10 +1446,10 @@ impl Runtime {
             lib_path.push(":");
             lib_path.push(dir);
         }
-        // a remote target has no libc++ of its own: the bundle's `lib/` (remote.rs `LLVM_LIB_DIR`) joins the runtime's library path there
+        // a remote target has no libc++ of its own: the bundle's `lib/` (relocated from `llvm_lib`) joins the runtime's library path there
         if matches!(self.site, remote::Site::Remote(_)) {
             lib_path.push(":");
-            lib_path.push(remote::LLVM_LIB_DIR);
+            lib_path.push(&self.llvm_lib);
         }
         // unshare and sh both exec (no --fork): the child's pid stays atld's, so stop() still reaches it
         let mut cmd = match &self.fake_devices {

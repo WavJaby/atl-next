@@ -22,7 +22,22 @@ use sha2::{Digest, Sha256};
 use crate::{arches, gate_goals, gl_probe, provided_gate, slot, verdict};
 
 /// The bundle's `lib/`: Debian's LLVM 19 runtimes. Arch ships libc++ 23 but no LLVM `libunwind.so.1` (plan L1 section 3). A labelled patch: the ideal is our pinned runtimes (runtimes.rs) in a packaged install tree (plan D1).
+/// The build machine's own copy; a cross host's runs take its sysroot's ([`llvm_lib_dir`]).
 pub const LLVM_LIB_DIR: &str = "/usr/lib/llvm-19/lib";
+
+/// The LLVM runtimes' dir of a run whose out dir is `out`: the build machine's [`LLVM_LIB_DIR`]; a cross host's out dir (native.rs `cross_host_of`) takes the same path inside its sysroot (deps.toml: trixie's native llvm-toolchain-19 packages of that arch) -- the build machine's are the wrong ISA there.
+pub fn llvm_lib_dir(root: &Path, out: &Path) -> Result<PathBuf> {
+    let Some(host) = xtask::native::cross_host_of(root, out)? else {
+        return Ok(PathBuf::from(LLVM_LIB_DIR));
+    };
+    let arches = arches::load(root)?;
+    let sysroot = arches
+        .get(&host)
+        .and_then(|r| r.host.as_ref())
+        .and_then(|h| h.sysroot.clone())
+        .with_context(|| format!("arches.toml `{host}`: a cross host without a sysroot"))?;
+    Ok(xtask::deps::sysroot_root(root, &sysroot)?.join(LLVM_LIB_DIR.trim_start_matches('/')))
+}
 /// (soname, file in [`LLVM_LIB_DIR`]). Each file's SONAME must equal its soname before it is bundled.
 const LLVM_RUNTIMES: [(&str, &str); 3] = [
     ("libc++.so.1", "libc++.so.1.0"),
@@ -63,9 +78,10 @@ pub enum Remote {
     /// Dry run by default: prints the bundle summary (`--list`: every entry) and the rsync it would run. `--apply` stages the bundle under `<out>/remote/bundle/<gate>` with a manifest, then runs `rsync -a --delete` to `~/atl-next-run/<slot>/` on the host.
     /// The record is written by a gate's run in the slot (`xtask test <gate>`); without it this names that command.
     Push(PushArgs),
-    /// The prerequisite check on the target: `ldd` over the bundle, every `not found` named with the file that needs it. Then the gate's runtime half: its atld runs execute on the target (`gl` only).
+    /// The prerequisite check on the target: `ldd` over the bundle, every `not found` named with the file that needs it. Then the gate's runtime half: its atld runs execute on the target (`gl`, `app`).
     ///
-    /// Dry run by default: prints the check it would run. `--apply` runs it over ssh (or locally for `local:`). Run `push --apply` first: a file the push did not deliver is named as missing.
+    /// Dry run by default: prints the check it would run. `--apply` runs it over ssh (or locally for `local:`). `gl`: run `push --apply` first: a file the push did not deliver is named as missing.
+    /// `app`: the headless subset (app.rs `remote`): records its run for `--arch`, pushes and checks it, runs atld headless on the target, judges the checks that need no compositor and names each one it skips.
     Test(TestArgs),
     /// `run-apk` on the target: pushes the bundle of the run's record (its APK, the runtime, `lib/`), checks it there, then runs the APK under atld on the target's desktop for `--hold` seconds, with run-apk's verdict.
     ///
@@ -101,16 +117,22 @@ pub struct TestArgs {
     gate: String,
     /// ssh alias from WSL `~/.ssh/config`, or `local:<absolute dir>`.
     #[arg(long)]
-    host: String,
+    pub(crate) host: String,
     /// The native out dir holding the record (default: this checkout's slot, see `xtask slot`).
     #[arg(long)]
-    out: Option<PathBuf>,
+    pub(crate) out: Option<PathBuf>,
     /// Runs the check on the target. Without it: prints the check.
     #[arg(long)]
-    apply: bool,
+    pub(crate) apply: bool,
     /// Deliberate break: the bundle without its copy of the named runtime (see the values).
     #[arg(long = "break", value_enum)]
-    brk: Option<Break>,
+    pub(crate) brk: Option<Break>,
+    /// `app` only: the target's arch (an arches.toml row with `[host]`); the bundle comes from its out dir (a cross host's under the slot, native.rs `host_out`). Default: the build machine's.
+    #[arg(long)]
+    pub(crate) arch: Option<String>,
+    /// `app` only: the fixture's ISA (`test app --fixture-arch`); needed where `--arch` has no identity engine.
+    #[arg(long)]
+    pub(crate) fixture_arch: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -157,6 +179,14 @@ fn push(root: &Path, a: &PushArgs) -> Result<ExitCode> {
 }
 
 fn test(root: &Path, a: &TestArgs) -> Result<ExitCode> {
+    // `app` records its own run here (a cross host's run cannot happen on this host to leave one), then delivers and runs it on the same Target and RemoteRun
+    if a.gate == "app" {
+        return crate::app::remote(root, a);
+    }
+    ensure!(
+        a.arch.is_none() && a.fixture_arch.is_none(),
+        "--arch and --fixture-arch are `app` options"
+    );
     let out = out_of(root, a.out.as_deref())?;
     let target = Target::of(&out, &a.gate, &a.host, a.brk)?;
     if !a.apply {
@@ -213,7 +243,7 @@ fn test(root: &Path, a: &TestArgs) -> Result<ExitCode> {
 fn runtime_half(root: &Path, a: &TestArgs, target: &Target, out: &Path) -> Result<bool> {
     ensure!(
         a.gate == "gl",
-        "gate `{}`: its runtime half is not remotable yet (only `gl`: its runs are one-shot; the others drive a live runtime)",
+        "gate `{}`: its runtime half is not remotable yet (`gl`: one-shot runs; `app`: its headless subset; the others drive a live runtime)",
         a.gate
     );
     let arches = arches::load(root)?;
@@ -251,26 +281,28 @@ pub struct RemoteRun {
     session: bool,
 }
 
-/// The host roots a runtime names, absolute on this host: the slot, the java out and the AOSP tree. Their bundle names are [`ROOT_NAMES`].
+/// The host roots a runtime names, absolute on this host: the slot, the java out and the AOSP tree (bundle names [`ROOT_NAMES`]), and the run's LLVM runtimes dir ([`llvm_lib_dir`], bundle name `lib`).
 pub struct Roots {
     out: PathBuf,
     java: PathBuf,
     tree: PathBuf,
+    lib: PathBuf,
 }
 
 impl Roots {
-    pub fn of(out: &Path, java: &Path, tree: &Path) -> Roots {
+    pub fn of(out: &Path, java: &Path, tree: &Path, lib: &Path) -> Roots {
         Roots {
             out: out.to_path_buf(),
             java: java.to_path_buf(),
             tree: tree.to_path_buf(),
+            lib: lib.to_path_buf(),
         }
     }
 
-    /// Each root with its bundle name. The fourth is the bundle's `lib/`: the runtimes it ships stand for [`LLVM_LIB_DIR`] on this host.
+    /// Each root with its bundle name. The fourth is the bundle's `lib/`: the runtimes it ships stand for the run's LLVM runtimes dir.
     fn named(&self) -> [(&Path, &'static str); 4] {
         let [out, java, tree] = ROOT_NAMES.map(|(key, name)| (self.path(key), name));
-        [out, java, tree, (Path::new(LLVM_LIB_DIR), "lib")]
+        [out, java, tree, (self.lib.as_path(), "lib")]
     }
 
     fn path(&self, key: &str) -> &Path {
@@ -847,6 +879,24 @@ impl Target {
         self.host.sync(&self.stage, &self.slot)
     }
 
+    /// [`Target::push`], then [`Target::check`], its lines printed as `remote prereq <what>: ...`. The check's problems: empty = delivered and checked.
+    pub fn deliver(&self, what: &str) -> Result<Vec<String>> {
+        self.push()?;
+        let prereq = self.check()?;
+        let problems = prereq.problems();
+        for p in &problems {
+            println!("remote prereq {what}: {p}");
+        }
+        if problems.is_empty() {
+            println!(
+                "remote prereq {what}: PASS, {} ELF checked on {}",
+                prereq.checked,
+                self.label()
+            );
+        }
+        Ok(problems)
+    }
+
     /// The prerequisite check on the target: `ldd` over every ELF file of the bundle.
     pub fn check(&self) -> Result<Prereq> {
         let script = prereq_script(&self.host.base(&self.slot), &self.elf, &self.lib_dirs)?;
@@ -922,12 +972,13 @@ pub struct Inputs {
     pub dirs: Vec<PathBuf>,
 }
 
-/// Writes gate `gate`'s record: its inputs (absolute), with the roots their bundle names come from (`java`, `tree`; the slot is `out`).
+/// Writes gate `gate`'s record: its inputs (absolute), with the roots their bundle names come from (`java`, `tree`; the slot is `out`) and the LLVM runtimes dir the run links against (`lib`, [`llvm_lib_dir`]).
 pub fn write_record(
     out: &Path,
     gate: &str,
     java: &Path,
     tree: &Path,
+    lib: &Path,
     inputs: &Inputs,
 ) -> Result<()> {
     let file = record_path(out, gate);
@@ -936,7 +987,12 @@ pub fn write_record(
     }
     let mut text =
         format!("# runtime inputs of gate {gate}, written by its last run (xtask remote)\n");
-    for (name, dir) in [("out", out), ("java", java), ("tree", tree)] {
+    for (name, dir) in [
+        ("out", out),
+        ("java", java),
+        ("tree", tree),
+        (LIB_ROOT, lib),
+    ] {
         text.push_str(&format!("{name} {}\n", std::path::absolute(dir)?.display()));
     }
     let mut lines = BTreeSet::new();
@@ -957,9 +1013,14 @@ pub fn write_record(
 /// A gate's record: its roots and what its run read.
 pub struct Record {
     roots: BTreeMap<&'static str, PathBuf>,
+    /// The run's LLVM runtimes dir: the bundle's `lib/` comes from it.
+    lib: PathBuf,
     files: Vec<PathBuf>,
     dirs: Vec<PathBuf>,
 }
+
+/// The record's root line naming the run's LLVM runtimes dir.
+const LIB_ROOT: &str = "lib";
 
 fn read_record(out: &Path, gate: &str) -> Result<Record> {
     let file = record_path(out, gate);
@@ -975,13 +1036,16 @@ fn read_record(out: &Path, gate: &str) -> Result<Record> {
 /// The record text: `out` / `java` / `tree` root lines, `dir <path>` lines, then one file path per line; `#` lines are comments. Paths are absolute.
 fn parse_record(text: &str) -> Result<Record> {
     let mut roots = BTreeMap::new();
+    let mut lib = None;
     let mut files = Vec::new();
     let mut dirs = Vec::new();
     for line in text.lines() {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Some((key, path)) = ROOT_NAMES
+        if let Some(path) = line.strip_prefix(&format!("{LIB_ROOT} ")) {
+            lib = Some(absolute_path(path)?);
+        } else if let Some((key, path)) = ROOT_NAMES
             .iter()
             .find_map(|(key, _)| line.strip_prefix(&format!("{key} ")).map(|p| (*key, p)))
         {
@@ -995,7 +1059,13 @@ fn parse_record(text: &str) -> Result<Record> {
     for (key, _) in ROOT_NAMES {
         ensure!(roots.contains_key(key), "record has no `{key}` root line");
     }
-    Ok(Record { roots, files, dirs })
+    let lib = lib.with_context(|| format!("record has no `{LIB_ROOT}` root line"))?;
+    Ok(Record {
+        roots,
+        lib,
+        files,
+        dirs,
+    })
 }
 
 fn absolute_path(text: &str) -> Result<PathBuf> {
@@ -1193,7 +1263,7 @@ impl Bundle {
             add_tree(dir, &bundle_name(dir, &record.roots)?, &mut map)?;
         }
         for (soname, file) in LLVM_RUNTIMES {
-            let src = Path::new(LLVM_LIB_DIR).join(file);
+            let src = record.lib.join(file);
             ensure!(src.is_file(), "missing LLVM runtime {}", src.display());
             let got = provided_gate::exported(&src)?.soname;
             ensure!(
@@ -1494,17 +1564,22 @@ mod tests {
 
     #[test]
     fn record_parses_roots_dirs_and_files() {
-        let text = "# c\nout /w/out/slot-9\njava /w/out/slot-9\ntree /w/src/aosp\ndir /w/out/slot-9/gl-art\n/w/out/slot-9/a.so\n";
+        let text = "# c\nout /w/out/slot-9\njava /w/out/slot-9\ntree /w/src/aosp\nlib /s/usr/lib/llvm-19/lib\ndir /w/out/slot-9/gl-art\n/w/out/slot-9/a.so\n";
         let rec = parse_record(text).unwrap();
         assert_eq!(rec.files, vec![PathBuf::from("/w/out/slot-9/a.so")]);
         assert_eq!(rec.dirs, vec![PathBuf::from("/w/out/slot-9/gl-art")]);
         assert_eq!(rec.roots["tree"], PathBuf::from("/w/src/aosp"));
+        assert_eq!(rec.lib, PathBuf::from("/s/usr/lib/llvm-19/lib"));
         assert!(
-            parse_record("out /o\njava /o\n/x.so\n").is_err(),
+            parse_record("out /o\njava /o\nlib /l\n/x.so\n").is_err(),
             "no tree root"
         );
-        assert!(parse_record("out /o\njava /o\ntree /t\nrelative.so\n").is_err());
-        assert!(parse_record("out /o\njava /o\ntree /t\ndir relative\n").is_err());
+        assert!(
+            parse_record("out /o\njava /o\ntree /t\n/x.so\n").is_err(),
+            "no lib root"
+        );
+        assert!(parse_record("out /o\njava /o\ntree /t\nlib /l\nrelative.so\n").is_err());
+        assert!(parse_record("out /o\njava /o\ntree /t\nlib /l\ndir relative\n").is_err());
     }
 
     #[test]
@@ -1606,7 +1681,7 @@ mod tests {
             files: vec![out.join("device/a.so"), tree.join("x.kcm")],
             dirs: vec![out.join("gl-art")],
         };
-        write_record(&out, "gl", &out, &tree, &inputs).unwrap();
+        write_record(&out, "gl", &out, &tree, Path::new(LLVM_LIB_DIR), &inputs).unwrap();
         let rec = read_record(&out, "gl").unwrap();
         assert_eq!(rec.files, inputs.files);
         assert_eq!(rec.dirs, inputs.dirs);
@@ -1649,6 +1724,7 @@ mod tests {
             Path::new("/w/out/slot-9"),
             Path::new("/w/out/java/build"),
             Path::new("/w/src/aosp"),
+            Path::new(LLVM_LIB_DIR),
         )
     }
 
@@ -1836,7 +1912,7 @@ mod tests {
             ],
             dirs: vec![art],
         };
-        write_record(&out, "gl", &out, &tree, &inputs).unwrap();
+        write_record(&out, "gl", &out, &tree, Path::new(LLVM_LIB_DIR), &inputs).unwrap();
         let full = Bundle::of("gl", &out, None).unwrap();
         assert_eq!(
             names(&full),

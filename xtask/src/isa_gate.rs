@@ -500,6 +500,17 @@ fn side_of(rel: &Path) -> Option<Side> {
         ["build" | "build-provided", _, ..] => Some(Side::Build),
         ["obj", "device" | "host", _, ..] => Some(Side::Product),
         ["obj", "build", _, ..] => Some(Side::Build),
+        // cargo target dirs (packages.rs TARGET_DIR, `xtask cross`'s `cargo`): a cross build puts the target's units under `<triple>/` (a Rust triple has dashes) and the build machine's
+        // (build scripts, proc macros) under the profile dir. The gate reads only cross hosts' out dirs, so the profile dir never holds products here.
+        [crate::packages::TARGET_DIR | "cargo", triple, _, ..] if triple.contains('-') => {
+            Some(Side::Product)
+        }
+        [
+            crate::packages::TARGET_DIR | "cargo",
+            "release" | "debug",
+            _,
+            ..,
+        ] => Some(Side::Build),
         _ => None,
     }
 }
@@ -852,6 +863,8 @@ mod tests {
             "cinstall/atl-bionic/x.so",
             "obj/device/libx/a.o",
             "obj/host/libx/a.o",
+            "cargo-converter/riscv64gc-unknown-linux-gnu/release/atl-system-services",
+            "cargo/riscv64gc-unknown-linux-gnu/release/atld",
         ] {
             assert_eq!(side(p), Some(Side::Product), "{p}");
         }
@@ -859,6 +872,8 @@ mod tests {
             "build/aidl/aidl",
             "build-provided/crates/atl-bionic/lib/libatl_bionic.so",
             "obj/build/aidl/a.o",
+            "cargo-converter/release/deps/libserde_derive-1.so",
+            "cargo/release/build/x-1/build-script-build",
         ] {
             assert_eq!(side(p), Some(Side::Build), "{p}");
         }
@@ -867,7 +882,7 @@ mod tests {
             "nb/arm64/libc/libc.so",
             "upstream/llvm-project/arm64/builtins/build/test.o",
             "device",
-            "cargo/release/deps/libserde_derive.so",
+            "cargo-converter-test/release/deps/x",
             "bp2ninja/bp2ninja",
             "obj/other/x.o",
         ] {

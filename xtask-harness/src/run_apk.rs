@@ -30,7 +30,7 @@ pub(crate) const STAGE: &str = "window-art";
 /// What a remote run returns under its scratch dir besides the logs: atld's log, its exit code (`atld.rc`) and its end time (`end.ms`, the target's clock).
 const END_FILES: [&str; 3] = ["atld.log", "atld.rc", "end.ms"];
 /// How long past the target's limit the transfer may run (its tar and ssh) before it is stopped and the run fails.
-const TRANSFER_MARGIN: Duration = Duration::from_secs(60);
+pub(crate) const TRANSFER_MARGIN: Duration = Duration::from_secs(60);
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -370,21 +370,11 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         }
         return Ok(ExitCode::SUCCESS);
     }
-    target.push()?;
-    let prereq = target.check()?;
-    let problems = prereq.problems();
+    let problems = target.deliver("run-apk")?;
     if !problems.is_empty() {
-        for p in &problems {
-            println!("remote prereq run-apk: {p}");
-        }
         println!("{}", verdict::gate("remote run-apk", &problems));
         return Ok(ExitCode::FAILURE);
     }
-    println!(
-        "remote prereq run-apk: PASS, {} ELF checked on {}",
-        prereq.checked,
-        target.label()
-    );
     // what an earlier run left here is not this run's: a run that ends before its logs return reads none of it
     let _ = std::fs::remove_dir_all(&logs);
     std::fs::create_dir_all(&logs).with_context(|| format!("creating {}", logs.display()))?;
@@ -658,7 +648,7 @@ fn run_of(work: &Path, files: Vec<PackageFile>, m: &Manifest, log_tags: &str) ->
 }
 
 /// Waits for the transfer that runs the app on the target: its status, or `None` once `limit` has passed (the transfer is then killed). `tick` runs between the status checks.
-fn wait_transfer(
+pub(crate) fn wait_transfer(
     child: &mut Child,
     limit: Duration,
     mut tick: impl FnMut(),
@@ -679,7 +669,7 @@ fn wait_transfer(
 }
 
 /// The target's end record of a remote run (remote.rs `Plan::script`): atld's exit status (`timeout`'s, when the limit ended it) and the end's time in ms on the target's clock.
-fn end_record(scratch: &Path) -> Result<(i32, u64), String> {
+pub(crate) fn end_record(scratch: &Path) -> Result<(i32, u64), String> {
     let read = |name: &str| {
         std::fs::read_to_string(scratch.join(name))
             .map(|text| text.trim().to_owned())
@@ -695,7 +685,7 @@ fn end_record(scratch: &Path) -> Result<(i32, u64), String> {
 }
 
 /// Whether the target's `timeout` ended atld: 124 when the limit did, 137 when its KILL did (timeout(1)). Any other status is atld's own end.
-fn stopped_at_limit(rc: i32) -> bool {
+pub(crate) fn stopped_at_limit(rc: i32) -> bool {
     matches!(rc, 124 | 137)
 }
 

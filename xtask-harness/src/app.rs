@@ -99,6 +99,79 @@ pub struct Args {
     /// The settings provider break: the run does not place AOSP SettingsProvider, so no package declares the `settings` authority, getContentProvider answers null and the settings line must go red.
     #[arg(long)]
     settings_provider_break: bool,
+    /// Set by `remote test app` ([`remote`]): the run goes to this target, headless.
+    #[arg(skip)]
+    remote: Option<RemoteTest>,
+}
+
+/// `remote test app`'s target: ssh alias (or `local:<dir>`), the bundle break, and whether it runs (`--apply`) or only prints the plan.
+pub(crate) struct RemoteTest {
+    host: String,
+    brk: Option<crate::remote::Break>,
+    apply: bool,
+}
+
+/// atld's limit on the target: the marker's [`LIMIT`], then the watch and the round trip's wait after it. atld runs to it (nothing stops it earlier there), and its logs come back then.
+const REMOTE_LIMIT: Duration =
+    Duration::from_secs(LIMIT.as_secs() + RESULT_WAIT.as_secs() + WINDOW_MS / 1000 + 1);
+
+/// The local gate's checks the headless subset does not claim, each with why (printed as `app: SKIP`).
+const REMOTE_SKIPPED: [(&str, &str); 4] = [
+    (
+        "children_outside_broker",
+        "reads atld's process tree through this host's /proc; atld runs on the target",
+    ),
+    (
+        "exit totals",
+        "atld ends at the target's limit (timeout), not at the gate's stop, so the exit rows have nothing to compare",
+    ),
+    (
+        "webview-ua",
+        "WebKitSettings needs a GDK display: no compositor on a headless run",
+    ),
+    (
+        "fonts, cacerts, soundpool, mediaplayer, media.player, services, async and result rows, signatures, pendingintent, processes, settings, webview-package, features, priority, counters, prop rows",
+        "outside the headless subset (start, onCreate/onResume, no fault, guest JNI rows); the local gate judges them",
+    ),
+];
+
+/// `xtask remote test app` (remote.rs): the headless subset of the gate on a target. The run is built for `--arch` and recorded here, pushed and checked on the target (remote.rs `Target::deliver`), then atld runs there headless
+/// (no compositor) through the same `RemoteRun` as `gl`'s; the logs come back at its limit. Judged: the process start, Main's onCreate and resume lines, no fault, the guest JNI (bridge1) rows. Every other check is named as skipped.
+pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
+    let arches = crate::arches::load(root)?;
+    let (build, _) = crate::arches::build_machine(root, &arches)?;
+    let args = Args {
+        host: a.arch.clone().unwrap_or_else(|| build.to_owned()),
+        out: a.out.clone(),
+        java_out: None,
+        log_tags: "*:i".to_owned(),
+        verbose: false,
+        font_break: false,
+        fixture_api: jni_fixture::EMULATED_TLS_API,
+        fixture_arch: a.fixture_arch.clone(),
+        drop_nb_lib: None,
+        soundpool_break: false,
+        mediaplayer_break: false,
+        omit_service: Vec::new(),
+        media_player_break: false,
+        gl_selection_break: false,
+        result_break: false,
+        bind_break: false,
+        job_runner_break: false,
+        legacy_no_libc: false,
+        priority_break: false,
+        cpuinfo_break: false,
+        features_break: false,
+        webview_feature_break: false,
+        webview_provider_break: false,
+        settings_provider_break: false,
+        remote: Some(RemoteTest {
+            host: a.host.clone(),
+            brk: a.brk,
+            apply: a.apply,
+        }),
+    };
+    run(root, &args)
 }
 
 /// The fixture's dir.
@@ -1289,8 +1362,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let work = rt.out.join("app");
     // UI mode on a nested compositor: an app on a desktop has a display, and WebKit cannot make its settings (the default UA's source) without one -- WebKitSettings' constructor
     // dereferences a missing GDK display (atl-webview-linux `default_user_agent`); its AppleWebKit token is a literal in WebKit's UserAgentGLib.cpp, not derivable from webkit_get_*_version
-    let nested = crate::nested_wayland::NestedCompositor::start(&work.join("nested"))?;
-    let rt = rt.with_ui("gtk").with_wayland(&nested.socket);
+    // a remote run is headless: the target has no compositor of the gate's, and the checks that need one are skipped there ([`REMOTE_SKIPPED`])
+    let (_nested, rt) = if args.remote.is_some() {
+        (None, rt)
+    } else {
+        let nested = crate::nested_wayland::NestedCompositor::start(&work.join("nested"))?;
+        let rt = rt.with_ui("gtk").with_wayland(&nested.socket);
+        (Some(nested), rt)
+    };
     // the bridge-1 JNI fixture rides along in lib/<abi>/ (jni_fixture.rs); the NativeBridge core loads it into the guest
     let native = jni_fixture::apk_libs(
         root,
@@ -1338,6 +1417,47 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         shell: None,
         log_tags: args.log_tags.clone(),
     };
+    if let Some(r) = &args.remote {
+        rt.record_inputs(&run)?;
+        let target = crate::remote::Target::of(&rt.out, "app", &r.host, r.brk)?;
+        if !r.apply {
+            println!("{}", target.summary());
+            println!(
+                "dry run: pushes the bundle to {}, checks {} ELF files there, then runs {} headless with atld's limit at {} s; --apply runs it",
+                target.target(),
+                target.elf_count(),
+                m.name,
+                REMOTE_LIMIT.as_secs()
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
+        let problems = target.deliver("app")?;
+        if !problems.is_empty() {
+            println!("{}", crate::verdict::gate("remote app", &problems));
+            return Ok(ExitCode::FAILURE);
+        }
+        let dir = rt
+            .out
+            .join(crate::remote::REMOTE_DIR)
+            .join(target.log_dir());
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let log = dir.join("app.log");
+        std::fs::write(&log, "").with_context(|| format!("writing {}", log.display()))?;
+        let rt = rt.with_site(target.run_site(REMOTE_LIMIT, log.clone(), false));
+        let child = rt.start_atld(&run)?;
+        let code = remote_verdict(
+            &rt,
+            &run,
+            child,
+            &m.name,
+            &native.libs,
+            deferred,
+            isa != args.host,
+            &scene,
+        )?;
+        println!("remote test app: transcript {}", log.display());
+        return Ok(code);
+    }
     let mut atld_child = rt.start_atld(&run)?;
     let app_log = run.log(&m.name);
     let start = Instant::now();
@@ -1743,6 +1863,101 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         crate::verdict::gate("app", std::slice::from_ref(&why))
     );
     Ok(ExitCode::FAILURE)
+}
+
+/// The headless subset's verdict ([`remote`]) once the transfer `child` ends: the target's end record, then the process start ([`MARKER`]), Main's resume ([`MAIN_RESUMED`]), no fault, the bridge1 rows as the local gate judges them, and the fixture's own ELF checks. The rest is printed as skipped.
+#[allow(clippy::too_many_arguments)]
+fn remote_verdict(
+    rt: &Runtime,
+    run: &Run,
+    mut child: std::process::Child,
+    app_name: &str,
+    libs: &[PathBuf],
+    deferred: &[&str],
+    foreign: bool,
+    scene: &Scene,
+) -> Result<ExitCode> {
+    let started = Instant::now();
+    let bound = REMOTE_LIMIT + crate::run_apk::TRANSFER_MARGIN;
+    let status = crate::run_apk::wait_transfer(&mut child, bound, || {})?.with_context(|| {
+        format!(
+            "the transfer did not end within {} s and was stopped",
+            bound.as_secs()
+        )
+    })?;
+    rt.check_end(status, run)?;
+    let (rc, _) = crate::run_apk::end_record(&run.scratch).map_err(anyhow::Error::msg)?;
+    let atld_exited = !crate::run_apk::stopped_at_limit(rc);
+    let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+    let app = read(&run.log(app_name));
+    println!(
+        "app: remote run ended after {:.1?}: atld rc {rc} ({})",
+        started.elapsed(),
+        if atld_exited {
+            "its own end"
+        } else {
+            "the target's limit"
+        }
+    );
+    let mut whys = jni_fixture::legacy_failures(libs)?;
+    whys.extend(jni_fixture::ndk_failures(libs)?);
+    whys.extend(jni_fixture::es1_failures(libs)?);
+    let passed = app.lines().any(|l| l.contains(MARKER));
+    if passed {
+        if !app.contains(MAIN_RESUMED) {
+            whys.push(format!("no {MAIN_RESUMED:?} line after onCreate"));
+        }
+        if let Some(f) = fault(&app, atld_exited) {
+            whys.push(format!("the app faulted: {f}"));
+        }
+        match app.lines().find(|l| l.contains(BRIDGE1)) {
+            None => whys.push(format!(
+                "bridge1: want {BRIDGE1:?}, got {:?}",
+                app.lines().find(|l| l.contains("AtlTest: bridge1"))
+            )),
+            Some(line) => {
+                whys.extend(bridge1_call_failures(&app, deferred, foreign));
+                if !deferred.contains(&"sigsegvRecover")
+                    && !app.lines().any(|l| l.contains(GUEST_FAULT_REPORT))
+                {
+                    whys.push(format!(
+                        "bridge1: sigsegvRecover left no {GUEST_FAULT_REPORT:?} line"
+                    ));
+                }
+                if !deferred.contains(&"es1Pixels")
+                    && let Err(why) = es1_pixels(&app, scene)
+                {
+                    whys.push(format!("es1 pixels: {why}"));
+                }
+                println!("app: remote {}", line.trim());
+            }
+        }
+    } else {
+        whys.push(format!("no {MARKER:?} line (atld rc {rc})"));
+        println!("---- atld log\n{}", tail(&read(&run.atld_log()), TAIL));
+        println!(
+            "---- services log (last {TAIL} lines)\n{}",
+            tail(&read(&run.log("services")), TAIL)
+        );
+    }
+    if !whys.is_empty() {
+        println!("---- app log (last {TAIL} lines)\n{}", tail(&app, TAIL));
+    }
+    if !deferred.is_empty() {
+        println!("app: under QEMU: not claimed (Q7): {}", deferred.join(", "));
+    }
+    for (row, why) in REMOTE_SKIPPED {
+        println!("app: SKIP {row}: {why}");
+    }
+    for why in &whys {
+        println!("app: FAIL {why}");
+    }
+    println!("{}", crate::verdict::gate("remote app", &whys));
+    Ok(if whys.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }
 
 /// The app's first fault up to the watch's end (marker + WINDOW_MS), from the log's start: the app's other threads run before onCreate (hwui's RenderThread made its EGL context 50 ms before the marker when it aborted, round-4 run). None without a marker.
