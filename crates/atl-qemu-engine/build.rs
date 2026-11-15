@@ -228,6 +228,10 @@ fn unit_entry(build: &Path) -> Result<(PathBuf, PathBuf, Vec<String>)> {
 }
 
 /// Compiles `src/host_signal.c` with [`UNIT`]'s command (its source, `-o` and depfile words swapped) and archives it with the build's `STATIC_LINKER` tool into `out/libatl_host_signal.a`; links it into this crate.
+#[expect(
+    clippy::disallowed_types,
+    reason = "a build script: it runs the QEMU build's compiler and archiver on the host, never a runtime process"
+)]
 fn host_signal(build: &Path, manifest: &Path, out: &Path) -> Result<()> {
     let (dir, _, cmd) = unit_entry(build)?;
     let shim = manifest.join("src/host_signal.c");
@@ -237,7 +241,10 @@ fn host_signal(build: &Path, manifest: &Path, out: &Path) -> Result<()> {
         .filter_map(|a| a.strip_prefix("-I"))
         .find(|p| p.contains("linux-user/include/host/"))
         .context("unit command: no -I linux-user/include/host/<host>")?;
-    println!("cargo::rerun-if-changed={}", dir.join(host_dir).join("host-signal.h").display());
+    println!(
+        "cargo::rerun-if-changed={}",
+        dir.join(host_dir).join("host-signal.h").display()
+    );
     let obj = out.join("host_signal.o");
     let mut words = cmd.iter();
     let mut c = std::process::Command::new(words.next().context("empty unit command")?);
