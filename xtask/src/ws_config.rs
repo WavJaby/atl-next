@@ -23,8 +23,8 @@ use anyhow::{Context, Result, bail, ensure};
 /// File name under the workspace.
 pub const FILE: &str = "workspace.toml";
 
-/// Keys of the fixed slot pool, replaced by per-checkout build dirs (out.rs): accepted and ignored, with a note, so a workspace.toml still read by binaries from before the pool keeps working for them.
-/// Condition: some checkout still runs a pre-pool xtask. Delete this list, and the keys from the file, once none does (the slot disks' retirement).
+/// Keys of the retired slot pool: per-checkout build dirs (out.rs) replaced it. Refused by name with the replacement, so a workspace.toml left from before the pool fails loudly.
+/// Condition: some workspace.toml still carries one. Delete this list once none does; the unknown-key refusal then covers them.
 const RETIRED: [&str; 3] = ["slots", "slow_slots", "slow_builds"];
 
 /// Concurrent full native builds. 2 = the owner's limit on the dev machine (20 cores, 31 GB RAM): one ninja `-k 0` build already takes every core, and its peak link steps (ART, libcore) take several GB each, so a third build only adds memory pressure.
@@ -36,7 +36,7 @@ pub const DEFAULT_SCCACHE_SIZE: &str = "5G";
 
 /// `build.refresh_min_upstream_files`: native refreshes a rebased checkout's build dir (out::refresh) only when at least this many upstream-input files (out::UPSTREAM_INPUTS: patches/, sources.toml) changed between the dir's base and the newer base.
 /// Why upstream inputs: refresh keeps the checkout's own cargo roots (cargo units key on the checkout path), so it can only gain on ninja/AOSP outputs, which upstream inputs drive.
-/// Measured (snapshot-slots D11, 2026-11-16): 0 upstream files changed -> keep 149-171 s vs refresh 214-232 s (README-only rebase); 0 upstream + 40 other native files (crates, bp2ninja) -> keep 157-175 s vs refresh 185 s. Refresh never won without an upstream change, so 1 = any upstream change; no rebase with one was measurable yet (no two bases differ there).
+/// Measured (2026-11-16): 0 upstream files changed -> keep 149-171 s vs refresh 214-232 s (README-only rebase); 0 upstream + 40 other native files (crates, bp2ninja) -> keep 157-175 s vs refresh 185 s. Refresh never won without an upstream change, so 1 = any upstream change; no rebase with one was measurable yet (no two bases differ there).
 pub const DEFAULT_REFRESH_MIN_UPSTREAM_FILES: u32 = 1;
 
 /// `disk.host_min_free` (GiB): the Windows drive holding the WSL vhdx. A full libandroid_runtime build from cold grows the vhdx by several GiB, and a host drive that fills mid-build fails writes inside the distro: owner's hard stop 6.
@@ -45,7 +45,7 @@ pub const DEFAULT_HOST_MIN_FREE: u64 = 6;
 pub const DEFAULT_HOST_COMPACT_BELOW: u64 = 30;
 /// `disk.workspace_min_free` (GiB): the filesystem holding the workspace (src/, cache/, out/ logs; WSL `/`, filled to 0 B twice on 2026-11-15). One build can grow sccache from empty to its cap ([`DEFAULT_SCCACHE_SIZE`] 5 GiB) + 1 GiB for logs, cargo's registry and /tmp.
 pub const DEFAULT_WORKSPACE_MIN_FREE: u64 = 6;
-/// `disk.pool_min_free` (GiB): the filesystem holding the build-dir pool. One child build that rewrites its whole copy writes ~4.2 GB on disk (base 8.0 GB logical at zstd ~2x, snapshot-slots D10) + margin.
+/// `disk.pool_min_free` (GiB): the filesystem holding the build-dir pool. One child build that rewrites its whole copy writes ~4.2 GB on disk (measured 2026-11-15: 8.0 GB logical base at zstd:1 ~2x) + margin.
 pub const DEFAULT_POOL_MIN_FREE: u64 = 5;
 
 /// `[disk]`: free-space floors in GiB (`disk_floor`).
@@ -212,15 +212,9 @@ pub fn parse(text: &str, path: &Path) -> Result<WsConfig> {
                 ("build", "refresh_min_upstream_files") => {
                     cfg.refresh_min_upstream_files = Setting::file(count(value, &at)?);
                 }
-                ("build", k) if RETIRED.contains(&k) => {
-                    static NOTED: std::sync::atomic::AtomicBool =
-                        std::sync::atomic::AtomicBool::new(false);
-                    if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        eprintln!(
-                            "{at}: retired with the slot pool, ignored (with any other {RETIRED:?}); delete them once no pre-pool checkout runs"
-                        );
-                    }
-                }
+                ("build", k) if RETIRED.contains(&k) => bail!(
+                    "{at} is retired: each checkout has its own build dir now (`cargo xtask out show` names it); delete the key from {shown}"
+                ),
                 ("cache", "sccache_size") => cfg.sccache_size = Setting::file(size(value, &at)?),
                 ("fetch", "for") => cfg.fetch_for = Setting::file(gates(value, &at)?),
                 ("disk", "host_min_free") => {
@@ -335,15 +329,16 @@ mod tests {
         assert_eq!(all.parallel_builds, Setting::file(4));
     }
 
-    /// The live workspace.toml of pre-pool checkouts still carries the slot keys: accepted, whatever their value, and ignored.
+    /// A workspace.toml from before the pool: each retired key is refused by name, with its replacement.
     #[test]
-    fn retired_slot_keys_are_ignored() {
-        let cfg = parse(
-            "[build]\nslots = 6\nparallel_builds = 2\nslow_slots = [5, 6]\nslow_builds = 1\n",
-            path(),
-        )
-        .expect("retired keys accepted");
-        assert_eq!(cfg.parallel_builds, Setting::file(2));
+    fn retired_slot_keys_are_refused_with_their_replacement() {
+        for key in ["slots", "slow_slots", "slow_builds"] {
+            let m = err(&format!("[build]\n{key} = 1\n"));
+            assert!(
+                m.contains(&format!("`build.{key}`")) && m.contains("out show"),
+                "{m}"
+            );
+        }
     }
 
     #[test]
@@ -360,9 +355,9 @@ mod tests {
 
     #[test]
     fn unknown_keys_and_tables_are_refused_by_name() {
-        let m = err("[build]\nslot = 3\n");
+        let m = err("[build]\nparallel = 3\n");
         assert!(
-            m.contains("/ws/workspace.toml") && m.contains("`build.slot`"),
+            m.contains("/ws/workspace.toml") && m.contains("`build.parallel`"),
             "{m}"
         );
         let m = err("[cash]\nsccache_size = \"5G\"\n");
