@@ -408,11 +408,15 @@ pub fn elf_closure(program: &Path) -> io::Result<Vec<PathBuf>> {
 
 /// `path`'s PT_INTERP and DT_NEEDED names; 32- and 64-bit ELF (an arm32 game's libraries are ELFCLASS32).
 pub fn elf_deps(path: &Path) -> io::Result<(Option<PathBuf>, Vec<String>)> {
-    let data = std::fs::read(path)?;
+    elf_deps_in(path, &std::fs::read(path)?)
+}
+
+/// [`elf_deps`] of an ELF image already in memory (a zip entry); `path` names it in errors.
+pub fn elf_deps_in(path: &Path, data: &[u8]) -> io::Result<(Option<PathBuf>, Vec<String>)> {
     // e_ident[EI_CLASS] (EI_CLASS = 4) is ELFCLASS32 = 1 or ELFCLASS64 = 2 (ELF spec, e_ident layout)
     match data.get(4) {
-        Some(1) => elf_deps_of::<object::elf::FileHeader32<object::Endianness>>(path, &data),
-        _ => elf_deps_of::<object::elf::FileHeader64<object::Endianness>>(path, &data),
+        Some(1) => elf_deps_of::<object::elf::FileHeader32<object::Endianness>>(path, data),
+        _ => elf_deps_of::<object::elf::FileHeader64<object::Endianness>>(path, data),
     }
 }
 

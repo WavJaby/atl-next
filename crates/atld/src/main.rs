@@ -629,20 +629,42 @@ fn partition_file(s: &str) -> Result<(PathBuf, PathBuf), String> {
     Ok((PathBuf::from(host), rel.to_path_buf()))
 }
 
-/// Whether a native library under `lib/<isa>/` DT_NEEDs [`gl_driver::ES1_LIB`]: the install-time ES1 rule (an ES1 app links it, or a JNI fixture of one does).
-fn needs_es1(lib: &Path) -> Result<bool> {
-    if !lib.is_dir() {
-        return Ok(false);
-    }
-    for isa in std::fs::read_dir(lib)? {
-        for entry in std::fs::read_dir(isa?.path())? {
-            let so = entry?.path();
-            if so.extension().is_some_and(|e| e == "so") && atl_broker::is_elf(&so) {
-                let (_, needed) = atl_broker::elf_deps(&so)
-                    .with_context(|| format!("reading {}", so.display()))?;
-                if needed.iter().any(|n| n == gl_driver::ES1_LIB) {
-                    return Ok(true);
-                }
+/// Whether a native library of the package DT_NEEDs [`gl_driver::ES1_LIB`]: the install-time ES1 rule (an ES1 app links it, or a JNI fixture of one does).
+/// Reads the `lib/<abi>/*.so` entries of every APK in `code`: the APKs hold every library whether or not the installer extracted it (extractNativeLibs=false leaves them only there, Doodle Jump).
+fn needs_es1(code: &Path) -> Result<bool> {
+    use std::io::Read;
+    for entry in std::fs::read_dir(code)? {
+        let apk = entry?.path();
+        if !apk.extension().is_some_and(|e| e == "apk") {
+            continue;
+        }
+        let file =
+            std::fs::File::open(&apk).with_context(|| format!("opening {}", apk.display()))?;
+        let mut zip =
+            zip::ZipArchive::new(file).with_context(|| format!("reading {}", apk.display()))?;
+        for i in 0..zip.len() {
+            let mut f = zip
+                .by_index(i)
+                .with_context(|| format!("reading {}", apk.display()))?;
+            let name = f
+                .name()
+                .with_context(|| format!("reading {}", apk.display()))?
+                .into_owned();
+            let lib = name.strip_prefix("lib/").and_then(|r| r.split_once('/'));
+            if !lib.is_some_and(|(_, so)| !so.contains('/') && so.ends_with(".so")) {
+                continue;
+            }
+            let mut data = Vec::new();
+            f.read_to_end(&mut data)
+                .with_context(|| format!("{}!/{name}", apk.display()))?;
+            // a `.so` that is not ELF is data (Unity's `libil2cpp.usym.so`), not a library; ELF magic = e_ident[EI_MAG0..3]
+            if !data.starts_with(b"\x7fELF") {
+                continue;
+            }
+            let at = PathBuf::from(format!("{}!/{name}", apk.display()));
+            let (_, needed) = atl_broker::elf_deps_in(&at, &data)?;
+            if needed.iter().any(|n| n == gl_driver::ES1_LIB) {
+                return Ok(true);
             }
         }
     }
@@ -856,7 +878,7 @@ impl Host {
         std::fs::rename(&staged_dir, &code)
             .with_context(|| format!("moving session {session} to {}", code.display()))?;
         self.create_app_data(package)?;
-        let es1 = needs_es1(&code.join(LIB_DIR_NAME))?;
+        let es1 = needs_es1(&code)?;
         staged.remove(&session);
         committed.insert(package.to_owned(), Committed { uid, system: false });
         log(format_args!("installed {package}: uid {uid}"));
@@ -2455,18 +2477,121 @@ mod tests {
         }
     }
 
-    /// A `.so` under `lib/<isa>/` that is not ELF (Unity's symbol data `libil2cpp.usym.so`, Angry Birds 2) is data, not a library: the ES1 rule skips it instead of failing the commit.
+    /// A minimal ELF64 LE shared object whose only dynamic entry is DT_NEEDED `needed`: header, .dynstr, .dynamic, .shstrtab, section table (layouts from the ELF spec / gABI).
+    fn elf_needing(needed: &str) -> Vec<u8> {
+        let u16b = |v: u16| v.to_le_bytes().to_vec();
+        let u32b = |v: u32| v.to_le_bytes().to_vec();
+        let u64b = |v: u64| v.to_le_bytes().to_vec();
+        let pad8 = |b: &mut Vec<u8>| b.resize(b.len().next_multiple_of(8), 0);
+        let mut dynstr = vec![0u8];
+        dynstr.extend_from_slice(needed.as_bytes());
+        dynstr.push(0);
+        let shstr = b"\0.dynstr\0.dynamic\0.shstrtab\0";
+        // shstrtab name offsets of ".dynstr", ".dynamic", ".shstrtab" in `shstr`
+        let (n_dynstr, n_dynamic, n_shstrtab) = (1u32, 9u32, 18u32);
+        let ehsize = 64;
+        let mut body = Vec::new();
+        let dynstr_off = ehsize;
+        body.extend_from_slice(&dynstr);
+        pad8(&mut body);
+        let dynamic_off = ehsize + body.len();
+        // DT_NEEDED (1) -> dynstr offset 1; DT_NULL (0)
+        for (tag, val) in [(1u64, 1u64), (0, 0)] {
+            body.extend(u64b(tag));
+            body.extend(u64b(val));
+        }
+        let shstr_off = ehsize + body.len();
+        body.extend_from_slice(shstr);
+        pad8(&mut body);
+        let shoff = ehsize + body.len();
+        let mut out = b"\x7fELF".to_vec();
+        // ELFCLASS64, ELFDATA2LSB, EV_CURRENT, ELFOSABI_NONE, 8 pad bytes
+        out.extend([2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        // ET_DYN, EM_AARCH64 (183), EV_CURRENT, entry, phoff
+        out.extend(u16b(3));
+        out.extend(u16b(183));
+        out.extend(u32b(1));
+        out.extend(u64b(0));
+        out.extend(u64b(0));
+        out.extend(u64b(shoff as u64));
+        // flags, ehsize, phentsize, phnum, shentsize, shnum, shstrndx
+        out.extend(u32b(0));
+        for v in [64u16, 56, 0, 64, 4, 3] {
+            out.extend(u16b(v));
+        }
+        out.extend(body);
+        // (name, type, flags, offset, size, link, entsize): null, SHT_STRTAB, SHT_DYNAMIC (SHF_ALLOC, link .dynstr), SHT_STRTAB
+        let sections = [
+            (0, 0, 0, 0, 0, 0, 0),
+            (n_dynstr, 3, 2, dynstr_off, dynstr.len(), 0, 0),
+            (n_dynamic, 6, 2, dynamic_off, 32, 1, 16),
+            (n_shstrtab, 3, 0, shstr_off, shstr.len(), 0, 0),
+        ];
+        for (name, ty, flags, off, size, link, entsize) in sections {
+            out.extend(u32b(name));
+            out.extend(u32b(ty));
+            out.extend(u64b(flags));
+            out.extend(u64b(0));
+            out.extend(u64b(off as u64));
+            out.extend(u64b(size as u64));
+            out.extend(u32b(link));
+            out.extend(u32b(0));
+            out.extend(u64b(8));
+            out.extend(u64b(entsize));
+        }
+        out
+    }
+
+    /// `dir/<apk>` holding `entries` (name, bytes), stored as an extractNativeLibs=false APK keeps its libraries.
+    fn apk_with(dir: &Path, apk: &str, entries: &[(&str, &[u8])]) {
+        let mut w = zip::ZipWriter::new(std::fs::File::create(dir.join(apk)).expect("apk"));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, data) in entries {
+            w.start_file(*name, opts).expect("entry");
+            w.write_all(data).expect("data");
+        }
+        w.finish().expect("finish");
+    }
+
+    /// The ES1 rule reads the APKs' `lib/<abi>/` entries: an ES1 library kept inside a split APK (extractNativeLibs=false, nothing under the code dir's `lib/`) selects ANGLE; a library needing only other libs does not.
+    #[test]
+    fn es1_rule_reads_libraries_inside_apks() {
+        let dir = staged("es1-apk", &[]);
+        let es2 = elf_needing("libGLESv2.so");
+        apk_with(
+            &dir,
+            "base.apk",
+            &[("classes.dex", b"dex"), ("lib/arm64-v8a/libother.so", &es2)],
+        );
+        assert!(!needs_es1(&dir).expect("no error"));
+        let es1 = elf_needing(gl_driver::ES1_LIB);
+        apk_with(
+            &dir,
+            "split_config.arm64_v8a.apk",
+            &[("lib/arm64-v8a/libgame.so", &es1)],
+        );
+        assert!(needs_es1(&dir).expect("no error"));
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// A `.so` under `lib/<abi>/` that is not ELF (Unity's symbol data `libil2cpp.usym.so`, Angry Birds 2) is data, not a library: the ES1 rule skips it instead of failing the commit.
     #[test]
     fn es1_rule_skips_non_elf_so_files() {
         let dir = staged("es1", &[]);
-        let isa = dir.join(LIB_DIR_NAME).join("arm64");
-        std::fs::create_dir_all(&isa).expect("isa dir");
-        std::fs::write(isa.join("libil2cpp.usym.so"), b"USYM symbol data").expect("usym");
-        assert!(!needs_es1(&dir.join(LIB_DIR_NAME)).expect("no error"));
-        // a truncated ELF is still read as one, and its error still fails the commit
-        // the ELF magic (ELF spec e_ident[EI_MAG0..3]) and nothing after it
-        std::fs::write(isa.join("libbroken.so"), b"\x7fELF").expect("broken");
-        assert!(needs_es1(&dir.join(LIB_DIR_NAME)).is_err());
+        apk_with(
+            &dir,
+            "base.apk",
+            &[("lib/arm64-v8a/libil2cpp.usym.so", b"USYM symbol data")],
+        );
+        assert!(!needs_es1(&dir).expect("no error"));
+        // a truncated ELF is still read as one, and its error still fails the commit: the ELF magic (e_ident[EI_MAG0..3]) and nothing after it
+        apk_with(
+            &dir,
+            "base.apk",
+            &[("lib/arm64-v8a/libbroken.so", b"\x7fELF")],
+        );
+        assert!(needs_es1(&dir).is_err());
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 

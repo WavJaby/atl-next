@@ -28,6 +28,7 @@ rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 signal-hook.workspace = true
+zip.workspace = true
 
 [lints]
 workspace = true
