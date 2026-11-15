@@ -90,11 +90,11 @@ const BREAKS: &[(&str, &str)] = &[
     ("no-noreturn", "atl_qe_no_noreturn"),
     // gate (l): the bind decode tests bit 14, so a binding thunk (bit 15) reaches QEMU's syscall path
     ("bind-decode", "atl_qe_bind_decode"),
-    // gate (m): attach hands every host thread the boot CPU instead of a `cpu_copy`
+    // gate (u): attach hands every host thread the boot CPU instead of a `cpu_copy`
     ("shared-cpu", "atl_qe_shared_cpu"),
-    // gate (m): attach leaves `thread_cpu` NULL, which `lock_user` (linux-user/uaccess.c) reads on every syscall buffer
+    // gate (n): attach leaves `thread_cpu` NULL, which `lock_user` (linux-user/uaccess.c) reads on every syscall buffer
     ("skip-thread-cpu", "atl_qe_skip_thread_cpu"),
-    // gate (m): attach skips `tcg_register_thread`, so the thread's `tcg_ctx` stays NULL for its first translation
+    // gate (n): attach skips `tcg_register_thread`, so the thread's `tcg_ctx` stays NULL for its first translation
     ("skip-tcg", "atl_qe_skip_tcg"),
     // gate (m): the `svc #RET` stub address stays thread-local, set only on the BOOT thread
     ("ret-stub-local", "atl_qe_ret_stub_local"),

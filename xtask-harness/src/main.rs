@@ -76,10 +76,10 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use xtask::{
-    arches, build_state, cargo_command, cdylib, checkout_root, codec2_store, cts_table, deps,
-    gate_goals, git, host_art, keys, licenses, native, ndk, ndk_surface, packages, provided_gate,
-    qemu, runtimes, slot, sources, stage_env, test_apks, tree, triage, unit_use, verdict,
-    ws_config,
+    arches, build_state, cargo_command, cdylib, checkout_root, codec2_store, cross, cts_table,
+    deps, gate_goals, git, host_art, keys, licenses, native, ndk, ndk_surface, packages,
+    provided_gate, qemu, runtimes, slot, sources, stage_env, test_apks, tree, triage, unit_use,
+    verdict, ws_config,
 };
 
 /// Runtime gates of the ATL-next repo, run as `cargo xtask test|run-apk|remote ...`.

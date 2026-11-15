@@ -17,13 +17,13 @@ use atl_bridgegen::{aarch64, engine_abi};
 use atl_layout::Layout;
 use object::{Object, ObjectSection, ObjectSymbol};
 
-use crate::deps;
 use crate::git::git_raw;
 use crate::ndk::NdkTarget;
 use crate::qemu::{self, Build, GUEST_API};
 use crate::sources;
 use crate::unit_use::{self, Echo, Units};
 use crate::verdict::{Failure, Verdict};
+use crate::{cross, deps};
 
 const FIXTURE_SRC: &str = "xtask-harness/testdata/qemu-spike/fixture.c";
 /// The engine `.so`'s file name per arch (`libatl_engine_arm64.so`, plan Q5-1a).
@@ -39,9 +39,9 @@ const MAIN_C: &str = "linux-user/main.c";
 /// The QEMU option variables the boot gate sets; the engine must ignore them (spike.rs gate (z) checks they are set). `QEMU_CPU=help` read by QEMU lists the models and exits before BOOT.
 const QEMU_ENV_PROBE: [(&str, &str); 2] = [("QEMU_CPU", "help"), ("QEMU_STRACE", "1")];
 const PACKAGE: &str = "atl-qemu-engine";
-const GATES: [char; 23] = [
-    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 's', 't', 'u',
-    'v', 'w', 'x', 'y',
+const GATES: [char; 24] = [
+    'B', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 's', 't',
+    'u', 'v', 'w', 'x', 'y',
 ];
 /// Thunk slots in the fixture's pool, as the NB pool is sized (atl-native-bridge build.rs: stub rows + fixed bindings + JNI slots, rounded to a power of two; 3860 + 6 + 256 > 4096). Gate (l) uses the last slot, 8191.
 const POOL_SLOTS: u32 = 8192;
@@ -186,7 +186,8 @@ const RUNS: &[RunSpec] = &[
         pool_skew: false,
         base: "0",
         engine_break: None,
-        red: Some('a'),
+        // without P1 no trap reaches the host, BOOT included: the process ends inside the boot
+        red: Some('B'),
     },
     RunSpec {
         name: "no-access-ok",
@@ -252,7 +253,7 @@ const RUNS: &[RunSpec] = &[
         engine_break: Some("boot-only"),
         red: Some('g'),
     },
-    // gate (i) hangs (observed): QEMU's own threads take the kill, the faulting thread sleeps in sigsuspend; the timeout kills the run
+    // gate (i)'s child hangs (observed): QEMU's own threads take the kill, the faulting thread sleeps in sigsuspend; spike.rs `CHILD_DEADLINE` kills it
     RunSpec {
         name: "no-fatal",
         swap: None,
@@ -261,7 +262,7 @@ const RUNS: &[RunSpec] = &[
         engine_break: Some("no-fatal"),
         red: Some('i'),
     },
-    // gate (k) re-faults under SIG_IGN until the timeout kills it
+    // gate (k)'s child re-faults under SIG_IGN until spike.rs `CHILD_DEADLINE` kills it
     RunSpec {
         name: "ign-loop",
         swap: None,
@@ -288,32 +289,32 @@ const RUNS: &[RunSpec] = &[
         engine_break: None,
         red: Some('l'),
     },
-    // gate (m): both host threads run on the boot CPU's one state
+    // gate (u), the first gate with concurrent attached threads (it runs before (m)): they all run on the boot CPU's one state
     RunSpec {
         name: "shared-cpu",
         swap: None,
         pool_skew: false,
         base: "0",
         engine_break: Some("shared-cpu"),
-        red: Some('m'),
+        red: Some('u'),
     },
-    // gate (m): lock_user reads a NULL thread_cpu at the first write(2)
+    // gate (n), the first attach (its creator thread): lock_user reads a NULL thread_cpu
     RunSpec {
         name: "skip-thread-cpu",
         swap: None,
         pool_skew: false,
         base: "0",
         engine_break: Some("skip-thread-cpu"),
-        red: Some('m'),
+        red: Some('n'),
     },
-    // gate (m): the attached thread's first translation runs with a NULL tcg_ctx
+    // gate (n), the first attach: the attached thread's first translation runs with a NULL tcg_ctx
     RunSpec {
         name: "skip-tcg",
         swap: None,
         pool_skew: false,
         base: "0",
         engine_break: Some("skip-tcg"),
-        red: Some('m'),
+        red: Some('n'),
     },
     // gate (m): an attached thread has no return stub, so its first guest call asserts
     RunSpec {
@@ -856,7 +857,7 @@ fn engine_so(
     Ok(())
 }
 
-/// The engine `.so` of a cross PIC build (riscv64 plan v2 C0): linked as [`engine_so_file`] links it, then the static gates only -- exports, the sigaction route and the host's isa gate (`qemu::isa_gate_cross`); the boot gate needs the host.
+/// The engine `.so` of a cross PIC build (riscv64 plan v2 C0): linked as [`engine_so_file`] links it, then the static gates only -- exports, the sigaction route, the host's isa gate (`qemu::isa_gate_cross`) and the spike harness's cross build ([`cross_spike_bin`]); the boot gate runs that harness on the host.
 fn cross_engine_so(root: &Path, b: &Build, c: &qemu::Cross) -> Result<ExitCode> {
     let out = b.dir.join("spike/engine");
     let so = engine_so_file(root, b, &out)?;
@@ -875,9 +876,17 @@ fn cross_engine_so(root: &Path, b: &Build, c: &qemu::Cross) -> Result<ExitCode> 
         fails.push(Failure::step("engine-so isa", format!("{e:#}")));
     }
     println!("qemu-spike: engine .so for {}: {}", c.host, so.display());
+    match cross_spike_bin(root, b, c) {
+        Ok(bin) => println!(
+            "qemu-spike: spike harness for {}: {}",
+            c.host,
+            bin.display()
+        ),
+        Err(e) => fails.push(Failure::step("spike harness build", format!("{e:#}"))),
+    }
     let verdict = Verdict {
         cmd: "qemu-spike",
-        total: Some((3, "gates")),
+        total: Some((4, "gates")),
         skipped: Vec::new(),
         failures: fails,
     };
@@ -887,6 +896,51 @@ fn cross_engine_so(root: &Path, b: &Build, c: &qemu::Cross) -> Result<ExitCode> 
     } else {
         ExitCode::FAILURE
     })
+}
+
+/// The spike harness (tests/spike.rs) compiled and linked for the cross host, not run: its `--engine-so` boot gate runs on that host. Returns the test executable.
+fn cross_spike_bin(root: &Path, b: &Build, c: &qemu::Cross) -> Result<PathBuf> {
+    let target = cross::cargo_target(root, &c.host)?;
+    let out = b.dir.join("spike");
+    let mut cmd = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    cmd.args([
+        "test",
+        "--locked",
+        "--no-run",
+        "--target",
+        &target.triple,
+        "-p",
+        PACKAGE,
+        "--features",
+        "qemu",
+        "--test",
+        "spike",
+        "--target-dir",
+    ])
+    .arg(out.join("cargo"))
+    .env("ATL_QEMU_BUILD", b.build_dir())
+    .env_remove("ATL_QEMU_ENGINE_BREAK")
+    .env_remove("ATL_QEMU_SIGCHAIN_OBJ")
+    .envs(target.env.iter().map(|(k, v)| (k, v)))
+    .current_dir(root);
+    let o = cmd
+        .output()
+        .context("running cargo test --no-run (spike)")?;
+    let log = out.join("cross-spike.log");
+    std::fs::write(&log, [o.stdout.as_slice(), o.stderr.as_slice()].concat())?;
+    ensure!(
+        o.status.success(),
+        "spike build failed, log {}",
+        log.display()
+    );
+    // cargo prints `Executable tests/spike.rs (<path>)` on stderr
+    String::from_utf8_lossy(&o.stderr)
+        .lines()
+        .find_map(|l| {
+            let (_, rest) = l.split_once("Executable tests/spike.rs (")?;
+            rest.strip_suffix(')').map(PathBuf::from)
+        })
+        .with_context(|| format!("no spike executable named, log {}", log.display()))
 }
 
 /// The engine `.so` of build `b` in `out` (QEMU bridge plan Q5-1b): the plain staticlib linked with the PIC objects, exporting `atl_engine` and the TLS names. The file the core dlopens (`ATL_ENGINE_SO` in the gates).
@@ -1183,7 +1237,7 @@ fn harness(
     Ok(())
 }
 
-/// A break run counts as red only when its target gate printed its own `spike: (<g>) FAIL` line (spike.rs), printed no `ok`, and the run exited nonzero.
+/// A break run counts as red only when its target gate failed, printed no `ok`, and the run exited nonzero. Failed = its own `spike: (<g>) FAIL` line (spike.rs), or the process ended inside the gate: `spike: (<g>) run` is the last run marker and nothing judged `g` (QEMU's kill or the pre-QEMU handler's `_exit` leaves no line to print).
 /// Missing ok + nonzero exit alone is not enough: a crash or hang before the gate ran (boot, an earlier gate) looks the same and says nothing about gate `g`.
 fn break_red(stdout: &str, g: char, exit_ok: bool) -> Result<(), String> {
     let ok = format!("spike: ({g}) ok");
@@ -1191,9 +1245,14 @@ fn break_red(stdout: &str, g: char, exit_ok: bool) -> Result<(), String> {
     if stdout.lines().any(|l| l == ok) {
         return Err(format!("break left gate ({g}) ok"));
     }
-    if !stdout.lines().any(|l| l.starts_with(&fail)) {
+    let last_run = stdout
+        .lines()
+        .filter_map(|l| l.strip_prefix("spike: (")?.strip_suffix(") run"))
+        .next_back();
+    let died_inside = last_run == Some(g.encode_utf8(&mut [0; 4]));
+    if !died_inside && !stdout.lines().any(|l| l.starts_with(&fail)) {
         return Err(format!(
-            "break printed no `{fail}` line: gate ({g}) never judged"
+            "break printed no `{fail}` line and did not end inside gate ({g}): never judged"
         ));
     }
     if exit_ok {
@@ -1228,6 +1287,12 @@ mod tests {
                 .unwrap_err()
                 .contains("exited 0")
         );
+        // the process ended inside (e): its run marker is the last one
+        let died = "spike: (a) run\nspike: (a) ok\nspike: (e) run\n";
+        assert_eq!(break_red(died, 'e', false), Ok(()));
+        // ended inside a later gate: (e) passed, or was never reached
+        assert!(break_red("spike: (e) run\nspike: (h) run\n", 'e', false).is_err());
+        assert!(break_red("spike: (a) run\n", 'e', false).is_err());
     }
 
     /// timeout(1): 124 at the limit, 137 for `-s KILL` (128 + SIGKILL 9); any other status is the command's own.
