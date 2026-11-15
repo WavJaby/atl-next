@@ -74,6 +74,9 @@ pub struct Args {
     /// Only the plain run, no breaks.
     #[arg(long)]
     pub no_breaks: bool,
+    /// arches.toml host row the engine runs on (default: the build machine). Another arch builds only the engine `.so` from the cross PIC build (`xtask qemu --pic --host`), gated by exports, the sigaction route and the host's isa gate; the runtime gates run there.
+    #[arg(long)]
+    pub host: Option<String>,
 }
 
 /// A break that compiles one pin file in place of the build's copy. `beside`: pin files written next to it, since a quoted include resolves from the including file's directory first. `whole_range`: the `qemu.h` beside is the build's, with access_ok in its pre-page-walk form, not the pin's.
@@ -414,8 +417,17 @@ const RUNS: &[RunSpec] = &[
 ];
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let b = qemu::plan(root, &args.arch, args.out.as_deref(), true)?;
+    let b = qemu::plan_on(
+        root,
+        &args.arch,
+        args.host.as_deref(),
+        args.out.as_deref(),
+        true,
+    )?;
     qemu::execute(root, &b)?;
+    if let Some(c) = &b.cross {
+        return cross_engine_so(root, &b, c);
+    }
     let dir = b.dir.join("spike");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let so = link(&b, &dir.join("libqemu-spike.so"), None)?;
@@ -844,6 +856,39 @@ fn engine_so(
     Ok(())
 }
 
+/// The engine `.so` of a cross PIC build (riscv64 plan v2 C0): linked as [`engine_so_file`] links it, then the static gates only -- exports, the sigaction route and the host's isa gate (`qemu::isa_gate_cross`); the boot gate needs the host.
+fn cross_engine_so(root: &Path, b: &Build, c: &qemu::Cross) -> Result<ExitCode> {
+    let out = b.dir.join("spike/engine");
+    let so = engine_so_file(root, b, &out)?;
+    let expected: BTreeSet<String> = std::iter::once(engine_abi::TABLE)
+        .chain(engine_abi::TLS_EXPORTS.iter().copied())
+        .map(str::to_owned)
+        .collect();
+    let mut fails = Vec::new();
+    if let Err(e) = exports_gate(&so, &expected) {
+        fails.push(Failure::step("engine-so exports", format!("{e:#}")));
+    }
+    if let Err(e) = sigaction_gate(&so) {
+        fails.push(Failure::step("engine-so sigaction", format!("{e:#}")));
+    }
+    if let Err(e) = qemu::isa_gate_cross(root, c, &so, "engine-so") {
+        fails.push(Failure::step("engine-so isa", format!("{e:#}")));
+    }
+    println!("qemu-spike: engine .so for {}: {}", c.host, so.display());
+    let verdict = Verdict {
+        cmd: "qemu-spike",
+        total: Some((3, "gates")),
+        skipped: Vec::new(),
+        failures: fails,
+    };
+    println!("{}", verdict.line());
+    Ok(if verdict.failures.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
 /// The engine `.so` of build `b` in `out` (QEMU bridge plan Q5-1b): the plain staticlib linked with the PIC objects, exporting `atl_engine` and the TLS names. The file the core dlopens (`ATL_ENGINE_SO` in the gates).
 pub(crate) fn engine_so_file(root: &Path, b: &Build, out: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(out).with_context(|| format!("creating {}", out.display()))?;
@@ -878,6 +923,8 @@ fn engine_staticlib(
     brk: Option<&str>,
 ) -> Result<PathBuf> {
     let target = out.join("cargo-so");
+    // a cross PIC build links Rust compiled for its host: `--target` puts the output under `<target>/<triple>/`
+    let rust_target = b.cross.as_ref().map(|c| c.rust.as_str());
     let mut cmd = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
     cmd.args([
         "rustc",
@@ -894,6 +941,9 @@ fn engine_staticlib(
     .arg(&target)
     .env("ATL_QEMU_BUILD", b.build_dir())
     .current_dir(root);
+    if let Some(t) = rust_target {
+        cmd.args(["--target", t]);
+    }
     match brk {
         Some(x) => cmd.env("ATL_QEMU_ENGINE_BREAK", x),
         None => cmd.env_remove("ATL_QEMU_ENGINE_BREAK"),
@@ -909,7 +959,11 @@ fn engine_staticlib(
         log.display()
     );
     let kept = out.join(format!("libatl_qemu_engine-{tag}.a"));
-    std::fs::copy(target.join("debug/libatl_qemu_engine.a"), &kept)
+    let built = match rust_target {
+        Some(t) => target.join(t),
+        None => target,
+    };
+    std::fs::copy(built.join("debug/libatl_qemu_engine.a"), &kept)
         .with_context(|| format!("keeping {}", kept.display()))?;
     Ok(kept)
 }

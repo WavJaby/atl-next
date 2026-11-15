@@ -86,6 +86,8 @@ pub struct Cross {
     pub host: String,
     /// Its meson_cpu_family, QEMU's `--cpu`.
     pub cpu: String,
+    /// Its Rust target (`rust` column): what Rust code linked into the build's objects compiles for.
+    pub rust: String,
     /// Its clang triple: `--target` and the `--cross-prefix` QEMU derives tool names from.
     pub clang: String,
     /// The unpacked sysroot (deps `sysroot_debs` row).
@@ -263,6 +265,7 @@ fn cross_host(root: &Path, arches: &arches::Arches, host: &str) -> Result<Option
     Ok(Some(Cross {
         host: host.to_owned(),
         cpu: row.meson_cpu_family.clone(),
+        rust: row.rust.clone(),
         sysroot: deps::sysroot_root(root, &t.sysroot)?,
         clang: t.clang,
         isa: t.isa,
@@ -394,25 +397,25 @@ pub fn execute(root: &Path, b: &Build) -> Result<PathBuf> {
     ninja(b)?;
     match &b.cross {
         None => check_version(b)?,
-        Some(c) => check_cross(root, b, c)?,
+        Some(c) => isa_gate_cross(root, c, &b.exe(), "qemu")?,
     }
     Ok(b.exe())
 }
 
-/// A cross executable cannot run here: the host's isa gate holds it to the row's isa closure, glibc_floor and sysroot libraries.
-fn check_cross(root: &Path, b: &Build, c: &Cross) -> Result<()> {
+/// A cross output cannot run here: the host's isa gate holds `path` to the row's isa closure, glibc_floor and sysroot libraries; summary lines print under `tag`.
+pub fn isa_gate_cross(root: &Path, c: &Cross, path: &Path, tag: &str) -> Result<()> {
     let arches = arches::load(root)?;
     let host = arches
         .get(&c.host)
         .and_then(|a| a.host.as_ref())
         .with_context(|| format!("{}: no [{}.host] row", arches::FILE, c.host))?;
-    let report = isa_gate::check_executable(&b.exe(), host, &isa_gate::sysroot_dirs(root, host)?)?;
+    let report = isa_gate::check_executable(path, host, &isa_gate::sysroot_dirs(root, host)?)?;
     for line in isa_gate::summary(&report) {
-        println!("qemu: isa gate: {line}");
+        println!("{tag}: isa gate: {line}");
     }
     ensure!(
         report.violations.is_empty(),
-        "qemu: isa gate: {}",
+        "{tag}: isa gate: {}",
         isa_gate::first_violation(&report).unwrap_or_default()
     );
     Ok(())
@@ -589,6 +592,7 @@ mod tests {
         b.cross = Some(Cross {
             host: "riscv64".to_owned(),
             cpu: "riscv64".to_owned(),
+            rust: "riscv64gc-unknown-linux-gnu".to_owned(),
             clang: "riscv64-linux-gnu".to_owned(),
             sysroot: PathBuf::from("/s"),
             isa: "rv64gc".to_owned(),

@@ -2,6 +2,7 @@
 //! Always: `OUT_DIR/aarch64_constants.rs`, atl-bridgegen's aarch64 thunk constants (`lib.rs` `thunk`).
 //! With feature `qemu`: `OUT_DIR/qemu_layout.rs`, atl-bridgegen's `layout_module` of QEMU's `target/arm/cpu.h` (`CPUArchState` and the records it holds), parsed with the exact flags the PIC build compiles `linux-user/aarch64/cpu_loop.c` with -- the file P1's hook is called from.
 //! With feature `qemu`: `OUT_DIR/engine_abi_layout.rs`, the engine C ABI's sizes, offsets and values from atl-engine-api's `atl_engine.h` (atl-bridgegen `engine_abi`); lib.rs checks the Rust mirror against them.
+//! With feature `qemu`: `libatl_host_signal.a`, `src/host_signal.c` (QEMU's host fault decode, `linux-user/include/host/<host>/host-signal.h`, for signal.rs) compiled by the unit's own compile command and archived by the build's own `STATIC_LINKER` (build.ninja): the host arch's decode is QEMU's, not a second copy.
 //! Flags and the source tree come from `$ATL_QEMU_BUILD/compile_commands.json` (meson's), so the offsets are clang's for the pinned, patched headers and that build's generated config headers; nothing is hand-copied.
 //! Breaks (`ATL_QEMU_ENGINE_BREAK=<name>[,<name>]`, [`BREAKS`]) turn a cfg on for this package only.
 
@@ -202,7 +203,8 @@ fn preprocessor_args(cmd: &[String], dir: &Path) -> Vec<String> {
     out
 }
 
-fn layout(build: &Path, out: &Path, host: &str) -> Result<String> {
+/// [`UNIT`]'s compile_commands.json entry: (its directory, the QEMU source root, its command words).
+fn unit_entry(build: &Path) -> Result<(PathBuf, PathBuf, Vec<String>)> {
     let db_path = build.join("compile_commands.json");
     println!("cargo::rerun-if-changed={}", db_path.display());
     let db: serde_json::Value = serde_json::from_str(
@@ -222,6 +224,68 @@ fn layout(build: &Path, out: &Path, host: &str) -> Result<String> {
         .map(PathBuf::from)
         .context("entry file does not end with the unit")?;
     let cmd = words(entry["command"].as_str().context("entry: no command")?);
+    Ok((dir, src, cmd))
+}
+
+/// Compiles `src/host_signal.c` with [`UNIT`]'s command (its source, `-o` and depfile words swapped) and archives it with the build's `STATIC_LINKER` tool into `out/libatl_host_signal.a`; links it into this crate.
+fn host_signal(build: &Path, manifest: &Path, out: &Path) -> Result<()> {
+    let (dir, _, cmd) = unit_entry(build)?;
+    let shim = manifest.join("src/host_signal.c");
+    println!("cargo::rerun-if-changed={}", shim.display());
+    let host_dir = cmd
+        .iter()
+        .filter_map(|a| a.strip_prefix("-I"))
+        .find(|p| p.contains("linux-user/include/host/"))
+        .context("unit command: no -I linux-user/include/host/<host>")?;
+    println!("cargo::rerun-if-changed={}", dir.join(host_dir).join("host-signal.h").display());
+    let obj = out.join("host_signal.o");
+    let mut words = cmd.iter();
+    let mut c = std::process::Command::new(words.next().context("empty unit command")?);
+    while let Some(w) = words.next() {
+        match w.as_str() {
+            "-MD" => {}
+            "-MQ" | "-MF" | "-o" | "-c" => {
+                words.next();
+            }
+            _ => {
+                c.arg(w);
+            }
+        }
+    }
+    let status = c
+        .arg("-c")
+        .arg(&shim)
+        .arg("-o")
+        .arg(&obj)
+        .current_dir(&dir)
+        .status()
+        .context("compiling host_signal.c")?;
+    ensure!(status.success(), "host_signal.c: compile failed");
+    // meson's rule: `rm -f $out && <ar> $LINK_ARGS $out $in`
+    let ninja = std::fs::read_to_string(build.join("build.ninja"))?;
+    let ar = ninja
+        .split("rule STATIC_LINKER\n")
+        .nth(1)
+        .and_then(|r| r.lines().next())
+        .and_then(|l| l.split("&& ").nth(1))
+        .and_then(|l| l.split_whitespace().next())
+        .context("build.ninja: no STATIC_LINKER archiver")?;
+    let lib = out.join("libatl_host_signal.a");
+    let _ = std::fs::remove_file(&lib);
+    let status = std::process::Command::new(ar)
+        .arg("crs")
+        .arg(&lib)
+        .arg(&obj)
+        .status()
+        .with_context(|| format!("running {ar}"))?;
+    ensure!(status.success(), "{ar}: archive failed");
+    println!("cargo::rustc-link-search=native={}", out.display());
+    println!("cargo::rustc-link-lib=static=atl_host_signal");
+    Ok(())
+}
+
+fn layout(build: &Path, out: &Path, host: &str) -> Result<String> {
+    let (dir, src, cmd) = unit_entry(build)?;
     let args = preprocessor_args(&cmd, &dir);
     ensure!(
         args.iter().any(|a| a.starts_with("-DCONFIG_TARGET=")),
@@ -298,6 +362,7 @@ fn main() -> Result<()> {
         out.join("qemu_layout.rs"),
         layout(&build, &out, &host.arch)?,
     )?;
+    host_signal(&build, &manifest, &out)?;
     // the engine C ABI's facts, read from the header by clang; lib.rs checks atl-engine-api's Rust mirror against them
     let header = manifest.join("../atl-engine-api/include/atl_engine.h");
     println!("cargo::rerun-if-changed={}", header.display());

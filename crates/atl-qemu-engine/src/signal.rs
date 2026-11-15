@@ -22,8 +22,6 @@ use crate::engine::{helper_retaddr_slot, lib};
 const SIGNALS: [c_int; 2] = [libc::SIGSEGV, libc::SIGBUS];
 /// QEMU's `PAGE_WRITE_ORG` (include/exec/page-protection.h): the page is writable for the guest; QEMU clears the host write permission while it holds translated code.
 const PAGE_WRITE_ORG: c_int = 0x0010;
-/// x86_64 `REG_ERR` bit 1: the faulting access was a write.
-const PF_WRITE: u64 = 0x2;
 /// `si_code` of a SIGSEGV protection violation (uapi asm-generic/siginfo.h); the libc crate does not export it.
 const SEGV_ACCERR: c_int = 2;
 
@@ -161,27 +159,27 @@ pub(crate) fn install() {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+// QEMU's host decode (src/host_signal.c, build.rs): host_signal_pc / host_signal_write of the build's host-signal.h, so every QEMU host arch is covered by QEMU's own code
+unsafe extern "C" {
+    fn atl_host_signal_pc(uc: *mut c_void) -> usize;
+    fn atl_host_signal_write(info: *mut libc::siginfo_t, uc: *mut c_void) -> bool;
+}
+
 fn host_pc(uc: *mut c_void) -> usize {
     // SAFETY: the kernel's ucontext for this signal (SA_SIGINFO third argument).
-    unsafe { (*uc.cast::<libc::ucontext_t>()).uc_mcontext.gregs[libc::REG_RIP as usize] as usize }
+    unsafe { atl_host_signal_pc(uc) }
 }
 
-#[cfg(target_arch = "x86_64")]
-fn host_is_write(uc: *mut c_void) -> bool {
-    // SAFETY: as for host_pc.
-    let err = unsafe { (*uc.cast::<libc::ucontext_t>()).uc_mcontext.gregs[libc::REG_ERR as usize] };
-    (err as u64) & PF_WRITE != 0
+fn host_is_write(info: *mut libc::siginfo_t, uc: *mut c_void) -> bool {
+    // SAFETY: the kernel's siginfo and ucontext of this delivery; riscv64's decode reads the faulting instruction at the pc, which is mapped since it just executed.
+    unsafe { atl_host_signal_write(info, uc) }
 }
-
-#[cfg(not(target_arch = "x86_64"))]
-compile_error!("atl-qemu-engine: host_pc and host_is_write for this host arch are not written yet");
 
 /// A write with SEGV_ACCERR to a guest page that QEMU write-protected for translated code. QEMU's `host_sigsegv_handler` un-protects it and the write retries. The preconditions are QEMU's (is_write, is_valid, SEGV_ACCERR); the flag is `page_unprotect`'s own test.
 fn is_tb_write(info: *mut libc::siginfo_t, uc: *mut c_void) -> bool {
     // SAFETY: the kernel's siginfo of this delivery.
     let (code, addr) = unsafe { ((*info).si_code, (*info).si_addr() as usize) };
-    if code != SEGV_ACCERR || !host_is_write(uc) {
+    if code != SEGV_ACCERR || !host_is_write(info, uc) {
         return false;
     }
     let l = lib();
