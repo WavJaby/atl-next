@@ -239,20 +239,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .unwrap_or_else(|| crate::keys::dev_dir(&layout));
     crate::keys::check_set(&keys)?;
     // go.work and the converter binary live in the build dir, so concurrent checkouts (each in its own dir) do not overwrite each other's converter
-    // a cross host's outputs go under its arch's dir, so two arches in one slot never write the same path; the build machine's stay at the out dir, where its gates read them
-    let out = slot::out_dir(root, args.out.as_deref(), "--out", |workspace| {
-        let native = workspace.join("out").join("native");
-        if cross.is_some() {
-            native
-        } else {
-            native.join(&args.host)
-        }
-    })?;
-    let out = if cross.is_some() {
-        out.join(&args.host)
-    } else {
-        out
-    };
+    let out = host_out(root, args.out.as_deref(), &args.host)?;
     // the converter graph and what it builds: the host's out dir, or a foreign guest's own dir (graph_dir), so a foreign run writes neither the host build.ninja nor its args file
     let graph_out = match &args.native_bridge {
         Some(arch) => graph_dir(&out, &args.host, arch),
@@ -371,12 +358,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let srcs_file = out.join("srcs.json");
     write_if_changed(&srcs_file, &serde_json::to_string_pretty(&partial)?)?;
     // workspace packages' AIDL crates (packages.rs aidl_crates): always converted and built, so those packages build whatever the goals
-    // cross host: not converted, their packages are not built (plan A3)
-    let (aidl_crates, aidl_goals) = if cross.is_some() {
-        (BTreeMap::new(), Vec::new())
-    } else {
-        packages::workspace_aidl_crates(root)?
-    };
+    let (aidl_crates, aidl_goals) = packages::workspace_aidl_crates(root)?;
     // a foreign graph builds no workspace packages (below), so it converts none of their AIDL goals
     let aidl_goals = if foreign { Vec::new() } else { aidl_goals };
     let aidl_crates_file = out.join("aidl-crates.json");
@@ -594,8 +576,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     if status.success() {
         println!("native: built -> {}", graph_out.display());
-        let packages_built = if cross.is_some() || foreign {
-            println!("native: cross host or foreign guest: workspace packages not built (plan A3)");
+        let packages_built = if foreign {
+            println!("native: foreign guest graph: workspace packages are the host run's");
             Vec::new()
         } else {
             packages::build(root, &out)?
@@ -953,6 +935,29 @@ pub fn graph_dir(out: &Path, host: &str, arch: &str) -> PathBuf {
     } else {
         out.join(format!("{NB_GRAPH_DIR}{arch}"))
     }
+}
+
+/// Host `host`'s out dir: the slot (or `explicit`), else `<workspace>/out/native/<host>`. A cross host's outputs go under its arch's dir, so two arches in one slot never write the same path; the build machine's stay at the out dir, where its gates read them.
+pub fn host_out(root: &Path, explicit: Option<&Path>, host: &str) -> Result<PathBuf> {
+    let arches = arches::load(root)?;
+    let (build_name, _) = arches::build_machine(root, &arches)?;
+    let cross = host != build_name;
+    let out = slot::out_dir(root, explicit, "--out", |workspace| {
+        let native = workspace.join("out").join("native");
+        if cross { native } else { native.join(host) }
+    })?;
+    Ok(if cross { out.join(host) } else { out })
+}
+
+/// The cross host whose out dir `out` is ([`host_out`]: its last component names a `[host]` row other than the build machine's); None for the build machine's.
+pub fn cross_host_of(root: &Path, out: &Path) -> Result<Option<String>> {
+    let arches = arches::load(root)?;
+    let (build_name, _) = arches::build_machine(root, &arches)?;
+    Ok(out
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| *n != build_name && arches.get(*n).is_some_and(|r| r.host.is_some()))
+        .map(str::to_owned))
 }
 
 /// Whether a dir entry under an out dir is a foreign guest's graph dir ([`graph_dir`]).

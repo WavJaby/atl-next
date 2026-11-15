@@ -67,6 +67,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 pub struct CargoTarget {
     pub triple: String,
     pub env: Vec<(String, String)>,
+    /// The RUSTFLAGS of `env`, one flag per item: for a caller that sets the target's rustflags through `--config` (packages.rs).
+    pub rustflags: Vec<String>,
+    /// The cc-rs part of `env` (compiler + flags per target): for a caller that sets linker and rustflags itself.
+    pub cc_env: Vec<(String, String)>,
 }
 
 /// The cargo target of cross host `arch`, once its rows are satisfied. `cross` runs cargo with it; `native` builds the host's crates with it.
@@ -103,13 +107,62 @@ pub fn cargo_target(root: &Path, arch: &str) -> Result<CargoTarget> {
     let rustflags = rustflags(&arches::rustc_target_features(isa)?, clang, &sysroot, &lib);
     // the host's own compiler links its crates, as it links the converter's modules
     let driver = deps::binary(root, cc)?;
+    let cxx = host
+        .cxx
+        .as_ref()
+        .with_context(|| format!("{}: [{arch}.host] has no cxx", arches::FILE))?;
+    // build scripts compiling C/C++ through cc-rs (link-cplusplus, ...) take the same compiler, target, sysroot and ISA as the converter's modules
+    let cflags = format!(
+        "--target={clang} --sysroot={} -march={isa}",
+        sysroot.display()
+    );
+    // C++: the sysroot's libc++, selected as the converter selects it for its host modules (upstream.rs `toolchain_cache`, bp2ninja stl.go); cc-rs links it by CXXSTDLIB
+    let libcxx = atl_layout::libcxx_dir(&sysroot)?;
+    let cc_env = vec![
+        (cc_key("CC", &host.rust), driver.clone()),
+        (cc_key("CXX", &host.rust), deps::binary(root, cxx)?),
+        (cc_key("CFLAGS", &host.rust), cflags.clone()),
+        (
+            cc_key("CXXFLAGS", &host.rust),
+            format!("{cflags} -nostdinc++ -isystem {}", libcxx.display()),
+        ),
+        (cc_key("CXXSTDLIB", &host.rust), "c++".to_owned()),
+    ];
+    let mut cc_env = cc_env;
+    // the pkg-config crate's per-target keys (pkg-config-rs `targeted_env_var`): a set sysroot allows the cross query
+    for (k, v) in pkg_config_env(&sysroot, clang) {
+        cc_env.push((cc_key(k, &host.rust), v));
+    }
+    let mut env = vec![
+        (env_key(&host.rust, "LINKER"), driver),
+        (env_key(&host.rust, "RUSTFLAGS"), rustflags.clone()),
+    ];
+    env.extend(cc_env.iter().cloned());
     Ok(CargoTarget {
         triple: host.rust.clone(),
-        env: vec![
-            (env_key(&host.rust, "LINKER"), driver),
-            (env_key(&host.rust, "RUSTFLAGS"), rustflags),
-        ],
+        rustflags: rustflags.split_whitespace().map(str::to_owned).collect(),
+        env,
+        cc_env,
     })
+}
+
+/// pkg-config confined to `sysroot` for clang triple `clang`: (PKG_CONFIG_SYSROOT_DIR, PKG_CONFIG_LIBDIR) values; only the sysroot's .pc files are read, every dir answered is under it. Callers also clear PKG_CONFIG_PATH or use per-target keys.
+pub fn pkg_config_env(sysroot: &Path, clang: &str) -> [(&'static str, String); 2] {
+    [
+        ("PKG_CONFIG_SYSROOT_DIR", sysroot.display().to_string()),
+        (
+            "PKG_CONFIG_LIBDIR",
+            format!(
+                "{0}/usr/lib/{clang}/pkgconfig:{0}/usr/share/pkgconfig",
+                sysroot.display()
+            ),
+        ),
+    ]
+}
+
+/// cc-rs's per-target environment key, `<VAR>_<triple with _>` (cc-rs `getenv_with_target_prefixes`).
+fn cc_key(var: &str, triple: &str) -> String {
+    format!("{var}_{}", triple.replace(['-', '.'], "_"))
 }
 
 fn plan(root: &Path, arch: &str, cargo: &[String]) -> Result<Plan> {

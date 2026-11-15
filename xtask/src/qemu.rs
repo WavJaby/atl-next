@@ -103,21 +103,12 @@ pub struct Cross {
 impl Cross {
     /// configure's environment: the binutils and pkg-config restricted to the sysroot (no build-machine .pc file can leak in).
     fn env(&self) -> Vec<(String, String)> {
-        let pc = |dir: &str| self.sysroot.join(dir).display().to_string();
         let mut env = self.tools.clone();
         env.push(("PKG_CONFIG".to_owned(), "pkg-config".to_owned()));
-        env.push((
-            "PKG_CONFIG_SYSROOT_DIR".to_owned(),
-            self.sysroot.display().to_string(),
-        ));
-        env.push((
-            "PKG_CONFIG_LIBDIR".to_owned(),
-            format!(
-                "{}:{}",
-                pc(&format!("usr/lib/{}/pkgconfig", self.clang)),
-                pc("usr/share/pkgconfig")
-            ),
-        ));
+        env.extend(
+            crate::cross::pkg_config_env(&self.sysroot, &self.clang)
+                .map(|(k, v)| (k.to_owned(), v)),
+        );
         env
     }
 }

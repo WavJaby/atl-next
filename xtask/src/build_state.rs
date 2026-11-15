@@ -132,9 +132,7 @@ pub fn record(out: &Path, state: &str, goals: &BTreeSet<String>) -> Result<()> {
 
 /// Gate `gate`'s native out dir (`--out`, else the slot): refused unless built from the checkout at `root` as it is now, with every goal the gate declares (gate_goals.rs; `all-gates` = every gate's, land's build stage).
 pub fn gate_out(root: &Path, explicit: Option<&Path>, host: &str, gate: &str) -> Result<PathBuf> {
-    let out = crate::slot::out_dir(root, explicit, "--out", |workspace| {
-        workspace.join("out/native").join(host)
-    })?;
+    let out = crate::native::host_out(root, explicit, host)?;
     ensure_current(root, &out).with_context(|| {
         format!(
             "gate `{gate}`: the slot is stale: run `cargo xtask native --host {host} --for {gate}`"

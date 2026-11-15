@@ -23,15 +23,7 @@ pub fn resolve(row: &str, pkg: &str, target: Option<Sysroot>) -> Result<Provided
     let query = |flag: &str| -> Result<String> {
         let mut cmd = Command::new("pkg-config");
         if let Some(t) = target {
-            cmd.env("PKG_CONFIG_SYSROOT_DIR", t.root)
-                .env(
-                    "PKG_CONFIG_LIBDIR",
-                    format!(
-                        "{0}/usr/lib/{1}/pkgconfig:{0}/usr/share/pkgconfig",
-                        t.root.display(),
-                        t.triple
-                    ),
-                )
+            cmd.envs(crate::cross::pkg_config_env(t.root, t.triple))
                 .env_remove("PKG_CONFIG_PATH");
         }
         let out = cmd.args([flag, pkg]).output().with_context(|| {

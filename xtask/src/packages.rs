@@ -536,8 +536,10 @@ struct Selection<'a> {
     selected: Vec<&'a Package>,
     /// each package the graph lacks a module of, with that module
     skipped: Vec<(&'a Package, &'a str)>,
-    /// the build machine's Rust target triple (cargo's linker config key)
+    /// the Rust target triple of the out dir's host (cargo's linker config key): the build machine's, or a cross host's (native.rs `cross_host_of`)
     triple: String,
+    /// a cross host's cargo target (cross.rs): `--target` and its rustflags (ISA features, sysroot); None on the build machine
+    cross: Option<crate::cross::CargoTarget>,
 }
 
 impl<'a> Selection<'a> {
@@ -551,12 +553,18 @@ impl<'a> Selection<'a> {
         let (selected, skipped) = select(packages, &graph);
         let arches = arches::load(root)?;
         let (_, machine) = arches::build_machine(root, &arches)?;
-        let triple = machine
-            .host
-            .as_ref()
-            .context("the build machine's row is a [host] row")?
-            .rust
-            .clone();
+        let cross = crate::native::cross_host_of(root, out)?
+            .map(|host| crate::cross::cargo_target(root, &host))
+            .transpose()?;
+        let triple = match &cross {
+            Some(c) => c.triple.clone(),
+            None => machine
+                .host
+                .as_ref()
+                .context("the build machine's row is a [host] row")?
+                .rust
+                .clone(),
+        };
         Ok(Self {
             root,
             out,
@@ -565,7 +573,16 @@ impl<'a> Selection<'a> {
             selected,
             skipped,
             triple,
+            cross,
         })
+    }
+
+    /// cargo's output dir of a `--release` build in `target`: `<target>/<triple>/release` for a cross host.
+    fn release(&self, target: &Path) -> PathBuf {
+        match &self.cross {
+            Some(c) => target.join(&c.triple).join("release"),
+            None => target.join("release"),
+        }
     }
 
     fn names(&self) -> String {
@@ -609,6 +626,16 @@ impl<'a> Selection<'a> {
                 &format!("{}/{FEATURE}", p.name),
             ]);
         }
+        // a cross host's flags (cross.rs `rustflags`: ISA features, link target, sysroot) lead; one --config array, as an env RUSTFLAGS beside it would merge by cargo's precedence rules
+        let mut flags: Vec<String> = match &self.cross {
+            Some(c) => {
+                cmd.args(["--target", &c.triple])
+                    .envs(c.cc_env.iter().cloned());
+                c.rustflags.clone()
+            }
+            None => Vec::new(),
+        };
+        flags.push(format!("-Clink-arg={link_arg}"));
         cmd.args(["--config", "profile.release.panic=\"abort\""])
             .args([
                 "--config",
@@ -616,11 +643,7 @@ impl<'a> Selection<'a> {
             ])
             .args([
                 "--config",
-                &format!(
-                    "target.{}.rustflags=[{:?}]",
-                    self.triple,
-                    format!("-Clink-arg={link_arg}")
-                ),
+                &format!("target.{}.rustflags={flags:?}", self.triple),
             ])
             .env(NATIVE_OUT, self.out);
         Ok(cmd)
@@ -677,12 +700,12 @@ pub fn build(root: &Path, out: &Path) -> Result<Vec<Built>> {
         let leading = leading_needed(p, &sel.graph)?;
         let mut bins = Vec::new();
         for b in &p.bins {
-            let bin = sel.target.join("release").join(b);
+            let bin = sel.release(&sel.target).join(b);
             check_needed(&bin, &provided_gate::needed(&bin)?, &leading)?;
             bins.push(bin);
         }
         if let Some(lib) = &p.cdylib {
-            install_cdylib(&sel.target.join("release"), sel.out, &p.name, lib)?;
+            install_cdylib(&sel.release(&sel.target), sel.out, &p.name, lib)?;
         }
         built.push(Built {
             package: p.name.clone(),
