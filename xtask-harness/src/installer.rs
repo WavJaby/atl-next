@@ -42,7 +42,7 @@ use atl_property_service::{LinearTier, Property};
 use crate::atld_run::ApkTools;
 use crate::host_art::{ArtRun, HostArt};
 use crate::installer_parse::{Full, compare, oracle};
-use crate::{binder, packages, slot, test_apks, verdict};
+use crate::{binder, out, packages, test_apks, verdict};
 
 const CMD: &str = "installer";
 /// The package that builds both loaders, and the installer's executable.
@@ -1067,7 +1067,7 @@ pub fn install_fixture(
     work: &Path,
     manifest_text: &str,
 ) -> Result<PathBuf> {
-    let java_out = slot::out_dir(root, None, "--java-out", |w| w.join("out/java/build"))?;
+    let java_out = out::out_dir(root, None)?;
     let host = HostArt::new(
         root,
         host_arch,
@@ -1120,9 +1120,7 @@ fn build_probe(root: &Path, out: &Path) -> Result<PathBuf> {
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let out = crate::build_state::gate_out(root, args.out.as_deref(), &args.host, CMD)?;
-    let java_out = slot::out_dir(root, args.java_out.as_deref(), "--java-out", |w| {
-        w.join("out/java/build")
-    })?;
+    let java_out = out::out_dir(root, args.java_out.as_deref())?;
     let host = HostArt::new(
         root,
         &args.host,

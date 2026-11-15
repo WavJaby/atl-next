@@ -13,7 +13,7 @@ use std::process::{Command, ExitCode};
 use anyhow::{Context, Result, ensure};
 
 use crate::arches;
-use crate::slot;
+use crate::out;
 use crate::unit_use::{self, Echo, Units};
 use crate::verdict::{Failure, Verdict};
 
@@ -31,9 +31,7 @@ pub struct Args {
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let out = slot::out_dir(root, args.out.as_deref(), "--out", |ws| {
-        ws.join("out/native").join(ARCH)
-    })?;
+    let out = out::out_dir(root, args.out.as_deref())?;
     let env = identity_env(root, &out, out.join("app/jni-fixture/android-21"))?;
     let dir = out.join("nb-identity");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;

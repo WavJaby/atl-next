@@ -17,7 +17,7 @@ use atl_layout::Layout;
 use crate::atld_run::{ApkTools, NativeLibs};
 use crate::jni_fixture::{self, CFLAGS};
 use crate::ndk::NdkTarget;
-use crate::{host_art, manifest, slot};
+use crate::{host_art, manifest, out};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -287,9 +287,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         None => Layout::of(root)?.workspace().join("out/gles2-fixture"),
     };
     let out = crate::build_state::gate_out(root, args.out.as_deref(), &args.host, "gles2-fixture")?;
-    let java_out = slot::out_dir(root, args.java_out.as_deref(), "--java-out", |w| {
-        w.join("out/java/build")
-    })?;
+    let java_out = out::out_dir(root, args.java_out.as_deref())?;
     let native = apk_libs(root, &ndk, &args.arch, &work.join("lib"), false)?;
     let shape = jni_fixture::shape(&work.join("lib").join(LIB))?;
     let mut fails = needed_failures(&shape.needed);

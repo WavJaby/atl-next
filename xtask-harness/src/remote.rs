@@ -19,7 +19,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use sha2::{Digest, Sha256};
 
-use crate::{arches, gate_goals, gl_probe, provided_gate, slot, verdict};
+use crate::{arches, gate_goals, gl_probe, out, provided_gate, verdict};
 
 /// The bundle's `lib/`: Debian's LLVM 19 runtimes. Arch ships libc++ 23 but no LLVM `libunwind.so.1` (plan L1 section 3). A labelled patch: the ideal is our pinned runtimes (runtimes.rs) in a packaged install tree (plan D1).
 /// The build machine's own copy; a cross host's runs take its sysroot's ([`llvm_lib_dir`]).
@@ -1022,12 +1022,12 @@ fn valid_alias(text: &str) -> bool {
 }
 
 fn out_of(root: &Path, explicit: Option<&Path>) -> Result<PathBuf> {
-    slot::out_dir(root, explicit, "--out", |ws| ws.join("out/native"))
+    out::out_dir(root, explicit)
 }
 
-/// The target's directory name for out dir `out`: its slot's name (`slot-4`), from the real dir (inside the build namespace every slot is `out/build`, slot::real). A `cross` host's out is `<slot>/<arch>` (native::host_out), so it is `<slot>-<arch>`: named by the arch alone, two slots pushing one arch would share (and `rsync --delete`) one dir.
+/// The target's directory name for out dir `out`: its build dir's name (the checkout id, `snap-x3`), from the real dir (inside the build namespace every build dir is `out/build`, out::real). A `cross` host's out is `<dir>/<arch>` (native::host_out), so it is `<dir>-<arch>`: named by the arch alone, two checkouts pushing one arch would share (and `rsync --delete`) one dir.
 fn slot_name(out: &Path, cross: bool) -> Result<String> {
-    let out = &slot::real(out);
+    let out = &out::real(out);
     let name = |p: &Path| {
         p.file_name()
             .and_then(|n| n.to_str())

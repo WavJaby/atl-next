@@ -15,10 +15,10 @@ use anyhow::{Context, Result, ensure};
 
 use crate::host_art;
 use crate::ndk::NdkTarget;
+use crate::out;
 use crate::qemu::{self, GUEST_API};
 use crate::qemu_linker::{self, Harness};
 use crate::qemu_spike;
-use crate::slot;
 use crate::verdict::{Failure, Verdict};
 
 const TESTDATA: &str = "xtask-harness/testdata/qemu-thread";
@@ -84,7 +84,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let fixture = fixture_build(root, &target, &dir.join("fixture"))?;
     let boot = qemu::boot_exe(root, &b, &dir)?;
     // the host's out dir, whichever graph `--nb` names: build.prop and the property-service cargo target are the host's
-    let out = slot::out_dir(root, args.out.as_deref(), "--out", |ws| ws.join("out"))?;
+    let out = out::out_dir(root, args.out.as_deref())?;
     let area = seed_area(root, &out, &dir)?;
     let env: [(&str, &Path); 6] = [
         ("ATL_ENGINE_SO", &so),

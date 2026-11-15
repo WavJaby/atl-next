@@ -21,7 +21,7 @@ use crate::gate_goals::{
     ANGLE_FRONTS, EXTRACTOR_PLUGINS, GL_FRONTS, NB_EXE, NB_GUEST_LIBS, NB_LINKER, NDK_PROXIED,
 };
 use crate::host_art::{self, HostArt};
-use crate::{manifest, packages, remote, slot, tree};
+use crate::{manifest, out, packages, remote, tree};
 
 /// framework-res.apk in the Java pipeline's out: built as Soong builds it (manifest_fixer, link, merge, align; bp2ninja app.go), unsigned.
 const FRAMEWORK_RES: &str = "device/framework-res/framework-res.apk";
@@ -645,9 +645,7 @@ impl Runtime {
         // a cross host's graph builds its own Java outputs and build-side tools (aapt2 under `build/`) into its out dir; the slot's are the build machine's graph's
         let java_out = match (java_out, xtask::native::cross_host_of(root, &out)?) {
             (None, Some(_)) => out.clone(),
-            (java_out, _) => slot::out_dir(root, java_out, "--java-out", |workspace| {
-                workspace.join("out/java/build")
-            })?,
+            (java_out, _) => out::out_dir(root, java_out)?,
         };
         let art = HostArt::new(root, host, Some(&java_out), &out, stage, verbose)?;
         let servicemanager = out.join("device/servicemanager/servicemanager");
