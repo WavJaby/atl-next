@@ -327,7 +327,7 @@ pub fn stage_module(root: &Path, out: &Path) -> Result<PathBuf> {
 
 /// The web engine module (atl-platform-ui-api `abi::WEBVIEW_MODULE_FILE`, webview plan S2.3), which the facade dlopens by name on the first WebView call.
 const WEBVIEW_MODULE_PACKAGE: &str = "atl-webview-linux";
-const WEBVIEW_MODULE_FILE: &str = "libatl_webview_linux.so";
+pub(crate) const WEBVIEW_MODULE_FILE: &str = "libatl_webview_linux.so";
 
 /// The WebView provider's JNI library (atl-webview, webview plan S4.1), which the provider class loads with System.loadLibrary from the app's library path (Soong's /system/lib64 role).
 const WEBVIEW_JNI_PACKAGE: &str = "atl-webview";

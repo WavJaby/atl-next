@@ -188,6 +188,7 @@ final class WebViewProviderImpl implements WebViewProvider, WebViewProvider.View
     @Override public void onOverScrolled(int scrollX, int scrollY, boolean clampedX, boolean clampedY) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onOverScrolled"); }
     @Override public void onWindowVisibilityChanged(int visibility) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onWindowVisibilityChanged"); }
     @Override public void onDraw(Canvas canvas) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onDraw"); }
+    @Override public void onDrawVerticalScrollBar(Canvas canvas, android.graphics.drawable.Drawable scrollBar, int l, int t, int r, int b) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onDrawVerticalScrollBar"); }
     @Override public void setLayoutParams(LayoutParams layoutParams) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.setLayoutParams"); }
     @Override public boolean performLongClick() { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.performLongClick"); }
     @Override public void onConfigurationChanged(Configuration newConfig) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onConfigurationChanged"); }

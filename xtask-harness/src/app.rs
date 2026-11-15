@@ -99,6 +99,14 @@ pub struct Args {
     /// The settings provider break: the run does not place AOSP SettingsProvider, so no package declares the `settings` authority, getContentProvider answers null and the settings line must go red.
     #[arg(long)]
     settings_provider_break: bool,
+    /// The WebView engine break: the run's library dir lacks the engine module (libatl_webview_linux.so), so createWebView refuses with a counted UnsupportedOperationException
+    /// ("WebViewFactoryProvider.createWebView") and the webview-page line (and webview-ua) must go red.
+    #[arg(long)]
+    webview_engine_break: bool,
+    /// The WebView sandbox break: atld runs without the apps' web-process channel (no `--sandbox-join` / `--flatpak-spawn`), so WebKit tries its own bubblewrap inside the app sandbox, which
+    /// Landlock forbids, and aborts the app at the first load (`Connection: failed to receive credentials`): the webview-page line must go red.
+    #[arg(long)]
+    webview_sandbox_break: bool,
     /// Set by `remote test app` ([`remote`]): the run goes to this target, headless.
     #[arg(skip)]
     remote: Option<RemoteTest>,
@@ -165,6 +173,8 @@ pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
         webview_feature_break: false,
         webview_provider_break: false,
         settings_provider_break: false,
+        webview_engine_break: false,
+        webview_sandbox_break: false,
         remote: Some(RemoteTest {
             host: a.host.clone(),
             brk: a.brk,
@@ -357,6 +367,14 @@ const WEBVIEW_PACKAGE: (&str, &str) = (
 );
 /// Where the run places the provider, as AOSP's product image does (media_product.mk `webview`): `<partition>/app/<module>/<module>.apk` (build/soong/java/app.go installPath).
 const WEBVIEW_PROVIDER: &str = "app/webview/webview.apk";
+/// Main.webViewPage's line (webview plan W2 gate): an unattached WebView loads Main.WEBVIEW_PAGE through loadData, then runs Main.WEBVIEW_SCRIPT at the first onPageFinished.
+/// `events`: AOSP's order -- onPageStarted, onReceivedTitle (the `<title>` arrives while the page loads), onPageFinished once. `js`: evaluateJavascript's JSON of the script's array (JSON.stringify form):
+/// `typeof atl.add` "function" (annotated, exposed), `atl.add(2, 3)` 5 and `atl.echo('hi')` "hi!" (the bridge round trip: Bridge.add / Bridge.echo), `typeof atl.hidden` "undefined"
+/// (no @JavascriptInterface: not callable, WebView.addJavascriptInterface doc for API >= 17), `document.title` "atl" (the page's title).
+const WEBVIEW_PAGE: (&str, &str) = (
+    "AtlTest: webview-page: ",
+    r#"events=started,title,finished js=["function",5,"hi!","undefined","atl"]"#,
+);
 
 /// Lines the fixture logs after onCreate, from binder callbacks: (row, line prefix, expected value). The watch waits for all of them (up to RESULT_WAIT).
 /// bindservice: Main.bound's bindService(AtlBound, BIND_AUTO_CREATE) answers true (bindServiceLocked found the service: code 1).
@@ -1359,6 +1377,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         rt.with_settings_provider()?
     };
+    let rt = if args.webview_engine_break {
+        rt.without_webview_engine()?
+    } else {
+        rt
+    };
+    let rt = if args.webview_sandbox_break {
+        rt.without_webspawn()
+    } else {
+        rt
+    };
     let work = rt.out.join("app");
     // UI mode on a nested compositor: an app on a desktop has a display, and WebKit cannot make its settings (the default UA's source) without one -- WebKitSettings' constructor
     // dereferences a missing GDK display (atl-webview-linux `default_user_agent`); its AppleWebKit token is a literal in WebKit's UserAgentGLib.cpp, not derivable from webkit_get_*_version
@@ -1800,6 +1828,11 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
         whys.push(format!(
             "webview-package: want {want:?}, got {webview_package:?}"
         ));
+    }
+    let (prefix, want) = WEBVIEW_PAGE;
+    let webview_page = after(prefix);
+    if passed && webview_page.as_deref() != Some(want) {
+        whys.push(format!("webview-page: want {want:?}, got {webview_page:?}"));
     }
     let features = app
         .lines()

@@ -120,6 +120,65 @@ public class Main extends Activity {
         }
     }
 
+    /** The JS bridge object of webViewPage: two annotated methods and one a page must not reach (no @JavascriptInterface). */
+    public static final class Bridge {
+        @android.webkit.JavascriptInterface
+        public int add(int a, int b) { return a + b; }
+
+        @android.webkit.JavascriptInterface
+        public String echo(String s) { return s + "!"; }
+
+        public String hidden() { return "reached"; }
+    }
+
+    /** The page webViewPage loads: its title arrives during the load (onReceivedTitle before onPageFinished). */
+    static final String WEBVIEW_PAGE = "<html><head><title>atl</title></head><body>page</body></html>";
+
+    /** The script run after onPageFinished: the bridge round trip (number and string), the unannotated method's absence, the title. */
+    static final String WEBVIEW_SCRIPT = "[typeof atl.add, atl.add(2, 3), atl.echo('hi'), typeof atl.hidden, document.title]";
+
+    /**
+     * The WebView page line (app.rs WEBVIEW_PAGE): an unattached WebView (no composition before W3) with JavaScript on and the Bridge as `atl` loads WEBVIEW_PAGE through loadData;
+     * `events=` the client callbacks in order (started, title, finished; progress left out) then, at the first onPageFinished, `js=` evaluateJavascript(WEBVIEW_SCRIPT)'s JSON;
+     * or `threw=` as webView().
+     */
+    private void webViewPage() {
+        try {
+            final StringBuilder events = new StringBuilder();
+            android.webkit.WebView w = new android.webkit.WebView(this);
+            w.getSettings().setJavaScriptEnabled(true);
+            w.addJavascriptInterface(new Bridge(), "atl");
+            w.setWebChromeClient(new android.webkit.WebChromeClient() {
+                @Override public void onReceivedTitle(android.webkit.WebView view, String title) { events.append("title,"); }
+            });
+            w.setWebViewClient(new android.webkit.WebViewClient() {
+                private boolean mDone;
+                @Override public void onPageStarted(android.webkit.WebView view, String url, android.graphics.Bitmap favicon) { events.append("started,"); }
+                @Override public void onPageFinished(android.webkit.WebView view, String url) {
+                    events.append("finished");
+                    if (mDone) return;
+                    mDone = true;
+                    // an anonymous class: the fixture's javac has no LambdaMetafactory on its boot classpath
+                    view.evaluateJavascript(WEBVIEW_SCRIPT, new android.webkit.ValueCallback<String>() {
+                        @Override public void onReceiveValue(String v) { Log.i("AtlTest", "webview-page: events=" + events + " js=" + v); }
+                    });
+                }
+            });
+            mWebView = w;
+            w.loadData(WEBVIEW_PAGE, "text/html", null);
+        } catch (Throwable e) {
+            StringBuilder out = new StringBuilder("threw=");
+            for (Throwable t = e; t != null; t = t.getCause()) {
+                if (t != e) out.append('<');
+                out.append(t.getClass().getName()).append('(').append(t.getMessage()).append(')');
+            }
+            Log.i("AtlTest", "webview-page: " + out);
+        }
+    }
+
+    /** Keeps webViewPage's WebView reachable until its line is logged. */
+    private android.webkit.WebView mWebView;
+
     /** The WebView package line (app.rs WEBVIEW_PACKAGE): WebView.getCurrentWebViewPackage's name and whether it is a system app; `null` without one. */
     private String webViewPackage() {
         android.content.pm.PackageInfo p = android.webkit.WebView.getCurrentWebViewPackage();
@@ -154,6 +213,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "priority: " + priority());
         Log.i("AtlTest", "webview-ua: " + webView());
         Log.i("AtlTest", "webview-package: " + webViewPackage());
+        webViewPage();
         mediaPlayerService();
         mediaExtractorWav();
         mediaRetrieverWav();

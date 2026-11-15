@@ -1030,6 +1030,22 @@ impl Runtime {
         self
     }
 
+    /// atld without the apps' web-process channel (no `--sandbox-join` / `--flatpak-spawn`): the app gate's WebView sandbox break.
+    pub fn without_webspawn(mut self) -> Self {
+        self.webspawn = false;
+        self
+    }
+
+    /// Removes the web engine module from the run's library dir (staged anew by every [`Runtime::new`]): a host without WebKit, for the app gate's engine break.
+    pub fn without_webview_engine(self) -> Result<Self> {
+        let module = self
+            .out
+            .join("ui-module-lib")
+            .join(crate::ui_module::WEBVIEW_MODULE_FILE);
+        std::fs::remove_file(&module).with_context(|| format!("removing {}", module.display()))?;
+        Ok(self)
+    }
+
     /// Also places AOSP's FEATURE_WEBVIEW file (android.software.webview.xml) in /system/etc/permissions: the WebView provider path is gated under it before the product declares the feature
     /// (product keeps it off until a WebView renders). A test environment file, not product config: SystemConfig reads it as it reads [`FEATURE_FILES`].
     pub fn with_webview_feature(mut self, aosp: &Path) -> Result<Self> {
