@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! `cargo xtask out prune --units`: deletes the cargo units of the target trees that no recorded build used for `--older-than` days, and the incremental sessions no build will load.
-//! Trees (a profile dir holding `.fingerprint`, or `<triple>/<profile>`) under these roots: each build dir's `cargo`, `cargo-converter`, `cargo-converter-test`, `target` (what a checkout's `target/` links to) and `gl/cargo*`; with the unowned trees also a real `repo/target` and `out/egl-driver/<checkout>/cargo*`, which no build dir owns.
+//! Trees (a profile dir holding `.fingerprint`, or `<triple>/<profile>`) under these roots: each build dir's `cargo`, `cargo-converter`, `cargo-converter-test`, `cargo-converter-lint`, `target` (what a checkout's `target/` links to) and `gl/cargo*`; with the unowned trees also a real `repo/target` and `out/egl-driver/<checkout>/cargo*`, which no build dir owns.
 //! Use is the record each recorded build writes (`unit_use`): a unit's last reported build, fresh or rebuilt. A unit with no entry is judged by its fingerprint dir's mtime, which cargo moves when it rebuilds the unit: approximate, and the worst case is one rebuild.
 //! A unit is `.fingerprint/<pkg>-<hash>/`, `build/<pkg>-<hash>/` (build-script output), the `deps/` and `examples/` files `*-<hash>` or `*-<hash>.<ext>`, and the uplifted hard links (`<tree>/<name>`) of those files; `<hash>` is 16 lowercase hex digits.
 //! Incremental (`<tree>/incremental/<crate>/`): keeps the newest finalized session, the one rustc loads (`rustc_incremental/src/persist/fs.rs`, `find_source_directory_in_iter`, rustc 1.99.1; rustc reads an older one only when copying the newest fails). Removed: every other finalized session, `-working` sessions older than 10 s (rustc's own grace), and lock files whose session is gone. A held lock is never touched.
@@ -28,10 +28,11 @@ const SECS_PER_DAY: u64 = 86_400;
 const MIB: f64 = 1_048_576.0;
 const GIB: f64 = 1_073_741_824.0;
 /// Target roots directly under a build dir: xtask's `--target-dir` names, and `target`, what a checkout's `target/` links to (out.rs). Cargo units key on the checkout path, so `out::refresh` keeps these from the checkout's own dir.
-pub const DIR_ROOTS: [&str; 4] = [
+pub const DIR_ROOTS: [&str; 5] = [
     "cargo",
     crate::packages::TARGET_DIR,
     crate::packages::TEST_TARGET_DIR,
+    crate::packages::LINT_TARGET_DIR,
     "target",
 ];
 /// `<build dir>/gl/cargo*`: the GL probes' target roots.
@@ -1255,7 +1256,7 @@ mod tests {
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 
-    /// The root names of a build dir: the target names xtask gives cargo (build, converter build, converter test), the checkout's `target`, and the `cargo*` probes under `gl/`.
+    /// The root names of a build dir: the target names xtask gives cargo (build, converter build, test and lint), the checkout's `target`, and the `cargo*` probes under `gl/`.
     #[test]
     fn dir_roots_are_the_target_names_and_the_gl_cargo_probes() {
         let ws = scratch("roots");
@@ -1274,6 +1275,7 @@ mod tests {
             [
                 "cargo",
                 "cargo-converter",
+                "cargo-converter-lint",
                 "cargo-converter-test",
                 "gl/cargo",
                 "gl/cargo-undefined-gl",

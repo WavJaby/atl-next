@@ -451,6 +451,14 @@ pub fn target_dir(out: &Path) -> PathBuf {
 pub const TARGET_DIR: &str = "cargo-converter";
 /// [`test_target_dir`]'s name under the out dir (out_prune's roots).
 pub const TEST_TARGET_DIR: &str = "cargo-converter-test";
+/// [`lint_target_dir`]'s name under the out dir (out_prune's roots).
+pub const LINT_TARGET_DIR: &str = "cargo-converter-lint";
+
+/// The cargo target dir of the converter packages' clippy (`Selection::lint`), apart from [`target_dir`]: clippy's workspace wrapper changes no unit hash, so in one dir `xtask native`'s build and `xtask check`'s lint
+/// rebuilt each other's build scripts and every lib behind them (measured: 36 units in native, 20 in check, on every native -> check alternation of an unchanged tree).
+fn lint_target_dir(out: &Path) -> PathBuf {
+    out.join(LINT_TARGET_DIR)
+}
 
 /// The cargo target dir of the converter packages' unit tests (`Selection::test`), apart from [`target_dir`]: the test build runs under `RUSTC_BOOTSTRAP=1`, which proc-macro2's build script probes
 /// (`rerun-if-env-changed`), turning on its nightly cfgs; that changes no unit hash, so in one shared dir clippy and test rebuilt each other's whole proc-macro tree every `xtask check`
@@ -532,7 +540,7 @@ pub struct Built {
 struct Selection<'a> {
     root: &'a Path,
     out: &'a Path,
-    /// cargo's target dir of `build` and `lint` ([`target_dir`]), the one `xtask native` builds in
+    /// cargo's target dir of `build` ([`target_dir`]), the one `xtask native` builds in; `lint` and `test` have their own
     target: PathBuf,
     graph: Graph,
     selected: Vec<&'a Package>,
@@ -654,7 +662,7 @@ impl<'a> Selection<'a> {
     /// The code behind feature `converter` is linted where it is built (`xtask check` step clippy runs without the feature).
     fn lint(&self) -> Result<()> {
         let status = crate::unit_use::status(
-            self.cargo("clippy", &self.target)?
+            self.cargo("clippy", &lint_target_dir(self.out))?
                 .args(["--lib", "--bins", "--", "-D", "warnings"]),
         )
         .context("running cargo clippy (converter packages)")?;
