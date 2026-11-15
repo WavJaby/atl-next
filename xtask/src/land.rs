@@ -45,10 +45,9 @@ pub struct Args {
     /// Internal: the preflight's child in the branch's worktree (`facts_child`); prints what the branch's tables say, read-only.
     #[arg(long, hide = true, conflicts_with_all = ["execute", "cleanup"])]
     facts: bool,
-    /// Internal: the build dir child in the land worktree (`slot_child`); prints whether its build dir is current for every gate's goals, read-only.
-    /// Flag and output lines keep the pre-pool name `slot`: it is the wire between the main checkout's xtask and a branch's, and a branch from before the build-dir pool answers only to it. Rename once no such branch is left.
+    /// Internal: the build dir child in the land worktree (`build_dir_child`); prints whether its build dir is current for every gate's goals, read-only.
     #[arg(long, hide = true, conflicts_with_all = ["execute", "cleanup", "facts"])]
-    slot: bool,
+    build_dir: bool,
 }
 
 /// What the branch's own tables say, as the branch's xtask reads them (`branch_facts`).
@@ -77,7 +76,7 @@ struct Runner<'a> {
     cleanup: &'a dyn Fn(&Path, &str) -> Result<String>,
     /// `(checkout, host)` -> `xtask native --for all-gates` there, by its own xtask (`native_execute`).
     native: &'a dyn Fn(&Path, &str) -> Result<String>,
-    /// `(land worktree, branch)` -> None when its build dir is current for every gate's goals, else why not; by the branch's xtask (`slot_child`).
+    /// `(land worktree, branch)` -> None when its build dir is current for every gate's goals, else why not; by the branch's xtask (`build_dir_child`).
     stale: &'a dyn Fn(&Path, &str) -> Result<Option<String>>,
     /// The land worktree's build dir published as `base/<its HEAD>` (`out::publish`); its line.
     publish: &'a dyn Fn(&Path) -> Result<String>,
@@ -165,10 +164,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         println!("{FACT_HOST}{}", f.host);
         return Ok(ExitCode::SUCCESS);
     }
-    if args.slot {
-        match slot_staleness(root)? {
-            None => println!("{SLOT_CURRENT}"),
-            Some(why) => println!("{SLOT_STALE}{why}"),
+    if args.build_dir {
+        match build_dir_staleness(root)? {
+            None => println!("{BUILD_DIR_CURRENT}"),
+            Some(why) => println!("{BUILD_DIR_STALE}{why}"),
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -193,7 +192,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         fetch: &fetch_execute,
         cleanup: &cleanup_execute,
         native: &native_execute,
-        stale: &slot_child,
+        stale: &build_dir_child,
         publish: &out::publish,
         recopy: &out::recopy,
     };
@@ -652,12 +651,12 @@ fn parse_facts(stdout: &str) -> BranchFacts {
     f
 }
 
-/// `--slot` output lines.
-const SLOT_CURRENT: &str = "land-slot: current";
-const SLOT_STALE: &str = "land-slot: stale ";
+/// `--build-dir` output lines.
+const BUILD_DIR_CURRENT: &str = "land-build-dir: current";
+const BUILD_DIR_STALE: &str = "land-build-dir: stale ";
 
-/// None when the slot of the checkout at `root` was built from it as it is now with every gate's goals for the build machine's host, else why not (build_state::gate_out's refusal).
-fn slot_staleness(root: &Path) -> Result<Option<String>> {
+/// None when the build dir of the checkout at `root` was built from it as it is now with every gate's goals for the build machine's host, else why not (build_state::gate_out's refusal).
+fn build_dir_staleness(root: &Path) -> Result<Option<String>> {
     let arches = crate::arches::load(root)?;
     let host = crate::arches::build_machine(root, &arches)?.0;
     Ok(
@@ -667,32 +666,32 @@ fn slot_staleness(root: &Path) -> Result<Option<String>> {
     )
 }
 
-/// `cargo xtask land <branch> --slot` in the worktree, run by the branch's xtask: the slot record and the goal tables are the branch's.
-fn slot_child(wt: &Path, branch: &str) -> Result<Option<String>> {
+/// `cargo xtask land <branch> --build-dir` in the worktree, run by the branch's xtask: the build dir record and the goal tables are the branch's.
+fn build_dir_child(wt: &Path, branch: &str) -> Result<Option<String>> {
     let mut cmd = crate::cargo_command();
-    cmd.args(["xtask", "land", branch, "--slot"])
+    cmd.args(["xtask", "land", branch, "--build-dir"])
         .current_dir(wt);
     let run = unit_use::run(&mut cmd, Units::Plain, Echo::Nothing)
-        .with_context(|| format!("running cargo xtask land --slot in {}", wt.display()))?;
+        .with_context(|| format!("running cargo xtask land --build-dir in {}", wt.display()))?;
     ensure!(
         run.status.success(),
         "{}: {}",
         run.status,
         run.stderr.trim_end()
     );
-    parse_slot(&run.stdout)
+    parse_build_dir(&run.stdout)
 }
 
-fn parse_slot(stdout: &str) -> Result<Option<String>> {
+fn parse_build_dir(stdout: &str) -> Result<Option<String>> {
     for line in stdout.lines() {
-        if line == SLOT_CURRENT {
+        if line == BUILD_DIR_CURRENT {
             return Ok(None);
         }
-        if let Some(why) = line.strip_prefix(SLOT_STALE) {
+        if let Some(why) = line.strip_prefix(BUILD_DIR_STALE) {
             return Ok(Some(why.to_owned()));
         }
     }
-    bail!("the slot child printed no slot line")
+    bail!("the build dir child printed no build dir line")
 }
 
 /// `cargo xtask native --host <host> --for all-gates` in `repo` (the land worktree), run by its own xtask: the build dir that checkout's check reads, built from it as it is now.
@@ -986,7 +985,7 @@ mod tests {
     }
 
     /// A build dir built before the rebase, simulated: `stale` compares its record with the tree, `native` rebuilds it, `check` refuses it by name as check.rs ConverterPackages does (build_state::ensure_current); `recopy` puts it back to the base state.
-    struct Slot {
+    struct BuildDir {
         built: std::cell::RefCell<&'static str>,
         calls: std::cell::RefCell<Vec<String>>,
     }
@@ -995,9 +994,9 @@ mod tests {
     const BASE: &str = "pre-rebase";
     const STALE_MSG: &str = "was built from another source state";
 
-    impl Slot {
+    impl BuildDir {
         fn before_rebase() -> Self {
-            Slot {
+            BuildDir {
                 built: std::cell::RefCell::new(BASE),
                 calls: std::cell::RefCell::new(Vec::new()),
             }
@@ -1009,7 +1008,7 @@ mod tests {
                     .borrow_mut()
                     .push(format!("stale? {}", d.display()));
                 let b = *self.built.borrow();
-                Ok((b != REBASED).then(|| format!("slot {STALE_MSG} ({b})")))
+                Ok((b != REBASED).then(|| format!("build dir {STALE_MSG} ({b})")))
             };
             let native_fn = |d: &Path, host: &str| -> Result<String> {
                 self.calls
@@ -1023,7 +1022,7 @@ mod tests {
                     .borrow_mut()
                     .push(format!("check {}", d.display()));
                 let b = *self.built.borrow();
-                ensure!(b == REBASED, "check: FAILED: slot {STALE_MSG} ({b})");
+                ensure!(b == REBASED, "check: FAILED: build dir {STALE_MSG} ({b})");
                 Ok("check: ok (12 steps)".to_owned())
             };
             let publish_fn = |d: &Path| -> Result<String> {
@@ -1059,14 +1058,14 @@ mod tests {
 
     /// A build dir from before the branch: Build rebuilds it in the land worktree, Verify passes there on the first attempt, Publish copies it; the branch's own worktree is never built or checked.
     #[test]
-    fn stale_slot_is_built_before_verify() {
+    fn stale_build_dir_is_built_before_verify() {
         let env = Env::new("stale");
         let plan = Plan::new(&env.repo, "task", true, &in_process).unwrap();
-        let slot = Slot::before_rebase();
-        assert_eq!(slot.run(&plan, &plan.stages()), "land: ok (7 steps)");
+        let dir = BuildDir::before_rebase();
+        assert_eq!(dir.run(&plan, &plan.stages()), "land: ok (7 steps)");
         let land = env.land.display();
         assert_eq!(
-            *slot.calls.borrow(),
+            *dir.calls.borrow(),
             [
                 format!("stale? {land}"),
                 format!("native {} {land}", plan.host),
@@ -1078,7 +1077,7 @@ mod tests {
 
     /// The break: without Build, the same stale build dir fails Verify by name and nothing is pushed; the land worktree goes back to origin/main and its build dir is re-copied.
     #[test]
-    fn without_build_the_stale_slot_fails_verify() {
+    fn without_build_the_stale_build_dir_fails_verify() {
         let env = Env::new("nobuild");
         let before = env.origin_main();
         let plan = Plan::new(&env.repo, "task", true, &in_process).unwrap();
@@ -1087,8 +1086,8 @@ mod tests {
             .into_iter()
             .filter(|s| *s != Stage::Build)
             .collect();
-        let slot = Slot::before_rebase();
-        let line = slot.run(&plan, &stages);
+        let dir = BuildDir::before_rebase();
+        let line = dir.run(&plan, &stages);
         assert!(
             line.starts_with("land: FAILED 1 of 6 steps: verify;") && line.contains(STALE_MSG),
             "{line}"
@@ -1096,7 +1095,7 @@ mod tests {
         assert_eq!(env.origin_main(), before);
         let land = env.land.display();
         assert_eq!(
-            *slot.calls.borrow(),
+            *dir.calls.borrow(),
             [format!("check {land}"), format!("recopy {land}")]
         );
         assert_eq!(env.land_head(), (None, before));
@@ -1104,36 +1103,36 @@ mod tests {
 
     /// A build dir already built from the branch's tree: Build asks, runs no native, and the land goes through.
     #[test]
-    fn current_slot_is_not_rebuilt() {
+    fn current_build_dir_is_not_rebuilt() {
         let env = Env::new("current");
         let plan = Plan::new(&env.repo, "task", true, &in_process).unwrap();
-        let slot = Slot::before_rebase();
-        *slot.built.borrow_mut() = REBASED;
-        assert_eq!(slot.run(&plan, &plan.stages()), "land: ok (7 steps)");
+        let dir = BuildDir::before_rebase();
+        *dir.built.borrow_mut() = REBASED;
+        assert_eq!(dir.run(&plan, &plan.stages()), "land: ok (7 steps)");
         let land = env.land.display();
         assert_eq!(
-            *slot.calls.borrow(),
+            *dir.calls.borrow(),
             [
                 format!("stale? {land}"),
                 format!("check {land}"),
                 format!("publish {land}")
             ]
         );
-        assert_eq!(parse_slot("x\nland-slot: current\n").unwrap(), None);
+        assert_eq!(parse_build_dir("x\nland-build-dir: current\n").unwrap(), None);
         assert_eq!(
-            parse_slot("land-slot: stale no record\n")
+            parse_build_dir("land-build-dir: stale no record\n")
                 .unwrap()
                 .as_deref(),
             Some("no record")
         );
-        assert!(parse_slot("noise\n").is_err());
+        assert!(parse_build_dir("noise\n").is_err());
     }
 
     /// The real question on a checkout whose build dir never finished a native run: stale, naming the missing record.
     #[test]
-    fn a_slot_without_a_record_is_stale() {
+    fn a_build_dir_without_a_record_is_stale() {
         let env = Env::new("norecord");
-        let why = slot_staleness(&env.wt)
+        let why = build_dir_staleness(&env.wt)
             .unwrap()
             .expect("no record must be stale");
         assert!(why.contains("no record"), "{why}");
@@ -1145,8 +1144,8 @@ mod tests {
         let env = Env::new("twice");
         let first = git(Some(&env.wt), &["rev-parse", "HEAD"]).unwrap();
         let plan = Plan::new(&env.repo, "task", true, &in_process).unwrap();
-        let slot = Slot::before_rebase();
-        assert_eq!(slot.run(&plan, &plan.stages()), "land: ok (7 steps)");
+        let dir = BuildDir::before_rebase();
+        assert_eq!(dir.run(&plan, &plan.stages()), "land: ok (7 steps)");
         assert_eq!(env.land_head(), (None, first.clone()));
         // the mock cleanup left the branch's worktree: remove it as the real child would
         let wt_arg = env.wt.display().to_string();
@@ -1163,10 +1162,10 @@ mod tests {
         commit(&wt2, "second");
         let second = git(Some(&wt2), &["rev-parse", "HEAD"]).unwrap();
         let plan = Plan::new(&env.repo, "task2", true, &in_process).unwrap();
-        let slot = Slot::before_rebase();
-        assert_eq!(slot.run(&plan, &plan.stages()), "land: ok (7 steps)");
+        let dir = BuildDir::before_rebase();
+        assert_eq!(dir.run(&plan, &plan.stages()), "land: ok (7 steps)");
         assert!(
-            !slot.calls.borrow().iter().any(|c| c.starts_with("recopy")),
+            !dir.calls.borrow().iter().any(|c| c.starts_with("recopy")),
             "a green land re-copied"
         );
         assert_eq!(env.land_head(), (None, second.clone()));
