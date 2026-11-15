@@ -139,6 +139,13 @@ pub fn main() -> Result<ExitCode> {
         _ => Some(false),
     };
     if let Some(shell) = shell {
+        // before the bind: the refresh replaces the dir the namespace would bind; inside the namespace (the re-exec) the dir is bound and stays
+        if matches!(cli.command, Command::Native(_))
+            && tree::bound(crate::out::CANONICAL).is_none()
+            && let Some(line) = crate::out::refresh(&root)?
+        {
+            println!("{line}");
+        }
         let overlays = tree::binds_of(&root)?;
         // `native --shell`: the shell gets the compiler-cache variables of its own source view, as each ninja run does
         let env = match &cli.command {

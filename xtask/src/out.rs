@@ -267,12 +267,24 @@ fn bases(ws: &Path) -> Result<Vec<String>> {
     Ok(found.into_iter().rev().map(|(_, n)| n).collect())
 }
 
-/// Which tier copies `src` into `dst_parent`: a one-byte probe file reflinked from `src` into `dst_parent` succeeds -> `Reflink`, else `Copy`. Probes the real pair, not the host: a source off the pool (an adopted slot on ext4) is a `Copy`.
+/// Which tier copies `src` into `dst_parent`: a regular file of `src` reflinked into `dst_parent` succeeds -> `Reflink`, else `Copy`. Probes the real pair, not the host: a source off the pool (an adopted slot on ext4) is a `Copy`.
+/// Reads `src` only when it holds a top-level file: a write there would bump a base's mtime, the order [`bases`] ranks by, so the base just copied would rank newest. An empty `src` gets a probe file of its own (nothing to rank yet).
 pub fn probe(src: &Path, dst_parent: &Path) -> Result<Tier> {
     let pid = std::process::id();
-    let from = src.join(format!(".atl-reflink-probe-{pid}"));
     let to = dst_parent.join(format!(".atl-reflink-probe-{pid}"));
-    std::fs::write(&from, b"x").with_context(|| format!("writing {}", from.display()))?;
+    let existing = std::fs::read_dir(src)
+        .with_context(|| format!("reading {}", src.display()))?
+        .filter_map(Result::ok)
+        .find(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .map(|e| e.path());
+    let (from, made) = match existing {
+        Some(f) => (f, false),
+        None => {
+            let f = src.join(format!(".atl-reflink-probe-{pid}"));
+            std::fs::write(&f, b"x").with_context(|| format!("writing {}", f.display()))?;
+            (f, true)
+        }
+    };
     let ok = Command::new("cp")
         .arg("--reflink=always")
         .arg(&from)
@@ -281,7 +293,9 @@ pub fn probe(src: &Path, dst_parent: &Path) -> Result<Tier> {
         .status()
         .context("running cp")?
         .success();
-    let _ = std::fs::remove_file(&from);
+    if made {
+        let _ = std::fs::remove_file(&from);
+    }
     let _ = std::fs::remove_file(&to);
     Ok(if ok { Tier::Reflink } else { Tier::Copy })
 }
@@ -758,6 +772,72 @@ pub fn recopy(land: &Path) -> Result<String> {
     Ok(format!("ws/{LAND_ID} re-copied from {base}"))
 }
 
+/// `native`'s refresh after a rebase: when a base newer than the one `ws/<id>` came from (`.base`) is an ancestor of HEAD, the dir is replaced by a copy of it. Returns the line to print; None = nothing to do.
+/// Why: the dir's own outputs were built on the old base and are mostly stale after the rebase, while the new base holds main's build of everything the rebase brought; the checkout's compiles hit sccache at the canonical path, so redoing its own delta is cheap.
+/// Kept: the dir's cargo target roots (`out_prune::DIR_ROOTS`), moved into the new copy: `target/` holds this running xtask binary (re-executed by path into the namespace), and every root holds the checkout's cargo units, which key on the checkout path a base's units (built in the land worktree) never match: taking the base's cost a 72-crate rebuild (X4 gate).
+/// Not refreshed: the land worktree (land owns `ws/land`), an adopted slot link, a dir without `.base` (built from zero) or whose base is not an ancestor of the newer one, a dir another process holds (the line says so).
+pub fn refresh(root: &Path) -> Result<Option<String>> {
+    let ws = Layout::of(root)?.workspace().to_owned();
+    let id = checkout_id(root)?;
+    let dir = dir_of(&ws, &id);
+    if id == LAND_ID || !matches!(entry(&dir)?, Entry::Dir) {
+        return Ok(None);
+    }
+    let Ok(cur) = std::fs::read_to_string(dir.join(BASE_FILE)) else {
+        return Ok(None);
+    };
+    let cur = cur.trim().to_owned();
+    let bases = bases(&ws)?;
+    let Some(pick) = bases
+        .iter()
+        .find(|c| git(Some(root), &["merge-base", "--is-ancestor", c, "HEAD"]).is_ok())
+    else {
+        return Ok(None);
+    };
+    if *pick == cur || git(Some(root), &["merge-base", "--is-ancestor", &cur, pick]).is_err() {
+        return Ok(None);
+    }
+    let Some(_lock) = build_pool::try_lock_dir(&ws, &id)? else {
+        return Ok(Some(format!(
+            "out: ws/{id} not refreshed to base/{pick}: another process holds it"
+        )));
+    };
+    let parent = dir.parent().context("build dir has no parent")?;
+    let old = parent.join(format!(".{id}.old-{}", std::process::id()));
+    std::fs::rename(&dir, &old)
+        .with_context(|| format!("renaming {} -> {}", dir.display(), old.display()))?;
+    let tier = match copy_tree(&base_of(&ws, pick), &dir, Some(pick)) {
+        Ok(t) => t,
+        Err(e) => {
+            // the old dir back: a failed copy must not cost the checkout its build
+            std::fs::rename(&old, &dir)
+                .with_context(|| format!("restoring {} after: {e:#}", dir.display()))?;
+            return Err(e);
+        }
+    };
+    count(&ws, tier);
+    let mut kept = Vec::new();
+    for root_name in out_prune::DIR_ROOTS {
+        let (own, fresh) = (old.join(root_name), dir.join(root_name));
+        if !own.is_dir() {
+            continue;
+        }
+        if present(&fresh)? {
+            std::fs::remove_dir_all(&fresh)
+                .with_context(|| format!("removing {}", fresh.display()))?;
+        }
+        std::fs::rename(&own, &fresh)
+            .with_context(|| format!("moving {} -> {}", own.display(), fresh.display()))?;
+        kept.push(root_name);
+    }
+    remove_build_dir(&old)?;
+    Ok(Some(format!(
+        "out: ws/{id} refreshed from base/{cur} to base/{pick} ({}); kept: {}",
+        tier.name(),
+        kept.join(", ")
+    )))
+}
+
 /// The checkout's build dir made ([`ensure`]) with its `target/`, before a parent runs cargo there: the checkout's `target` link may name this dir's target/ already (a re-copied or deleted dir), an empty copy (no base) lacks it, and cargo, which runs before any xtask code can settle the link, fails on a dangling one.
 pub fn prepare(root: &Path) -> Result<PathBuf> {
     let (_, dir) = ensure(root)?;
@@ -1044,6 +1124,70 @@ mod tests {
         assert!(!present(&dir_of(&ws, "wt")).expect("present"));
         assert!(ws.join("out/slot-4").is_dir());
         assert!(!ws.join("out/slot-4/build.ninja").exists());
+        std::fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// A checkout rebased past a newer base: native's refresh swaps its dir for that base, keeps its target/, and is then a no-op; a dir whose base is not older (or the land worktree) is left alone.
+    #[test]
+    fn a_rebased_checkout_is_refreshed_from_the_newer_base_keeping_target() {
+        let ws = scratch("refresh");
+        let repo = ws.join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let g = |args: &[&str]| git(Some(&repo), args).expect("git");
+        g(&["init", "-q", "-b", "main"]);
+        let commit = |m: &str| {
+            g(&[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                m,
+            ]);
+            g(&["rev-parse", "HEAD"])
+        };
+        let (a, b) = (commit("a"), commit("b"));
+        for (i, c) in [&a, &b].iter().enumerate() {
+            let base = base_of(&ws, c);
+            put(&base.join("from"));
+            std::fs::write(base.join("from"), c.as_str()).expect("mark");
+            std::fs::create_dir_all(base.join(TARGET)).expect("base target");
+            let t =
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000 + i as u64);
+            std::fs::File::open(&base)
+                .expect("open")
+                .set_modified(t)
+                .expect("mtime");
+        }
+        // HEAD at a: the dir came from base a, nothing newer is an ancestor
+        g(&["checkout", "-q", "--detach", &a]);
+        std::fs::create_dir_all(pool(&ws).join("ws")).expect("pool ws");
+        copy_tree(&base_of(&ws, &a), &dir_of(&ws, MAIN_ID), Some(&a)).expect("copy a");
+        put(&dir_of(&ws, MAIN_ID).join("target/debug/own"));
+        assert_eq!(
+            refresh(&repo).expect("refresh"),
+            None,
+            "base b is not an ancestor of a"
+        );
+        // the rebase: HEAD at b
+        g(&["checkout", "-q", "--detach", &b]);
+        let line = refresh(&repo).expect("refresh").expect("refreshed");
+        assert!(
+            line.contains(&format!("from base/{a} to base/{b}")),
+            "{line}"
+        );
+        let dir = dir_of(&ws, MAIN_ID);
+        assert_eq!(std::fs::read_to_string(dir.join("from")).expect("from"), b);
+        assert!(dir.join("target/debug/own").is_file(), "target/ not kept");
+        assert_eq!(refresh(&repo).expect("refresh"), None, "second refresh");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.parent().expect("parent"))
+            .expect("ls")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(leftovers, [MAIN_ID], "old dir or temp left");
         std::fs::remove_dir_all(&ws).expect("cleanup");
     }
 

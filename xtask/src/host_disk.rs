@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Free space of the Windows drive that holds this WSL distro's virtual disk (ext4.vhdx), checked before `native`.
+//! Free space of the Windows drive that holds this WSL distro's virtual disk (ext4.vhdx): one of the disks `disk_floor` checks before `native`.
 //!
 //! WSL cannot see the vhdx's own headroom: the ext4 inside reports the vhdx's virtual size, while the file grows on the host drive and a full host drive fails writes in
 //! the distro mid-build. The drive is the one the distro's `Lxss` registry row names (`BasePath`), seen at `/mnt/<letter>`; free space = drvfs statvfs there (9p, no interop;
@@ -15,22 +15,22 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 const LXSS_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss";
-const GIB: u64 = 1 << 30;
 /// WSL2's disk file name inside BasePath (fixed by WSL; WSL1 distros have none and are unsupported here).
 const VHDX: &str = "ext4.vhdx";
 /// Where Windows drives are mounted in the guest (WSL's default `automount.root`).
 const DRVFS_ROOT: &str = "/mnt";
 
-/// The thresholds, in GiB (native's `--host-free-stop-gib` / `--host-free-compact-gib`).
-#[derive(Clone, Copy, Debug)]
-pub struct Limits {
-    pub stop_gib: u64,
-    pub compact_gib: u64,
+/// The host drive as measured: its drvfs mount, free bytes, the distro's BasePath and how that was found.
+pub struct HostDrive {
+    pub mount: PathBuf,
+    pub free: u64,
+    pub base: String,
+    pub found: Found,
 }
 
 /// How the BasePath was found, for the guard's log line.
 #[derive(Debug, PartialEq)]
-enum Found {
+pub enum Found {
     Cached,
     Queried,
 }
@@ -83,8 +83,8 @@ fn vhdx_of(base: &str, drvfs: &Path) -> Option<PathBuf> {
     Some(v.join(VHDX))
 }
 
-/// The host drive's mount, free bytes and how the BasePath was found, or `None` off WSL.
-fn host_free(workspace: &Path) -> Result<Option<(PathBuf, u64, String, Found)>> {
+/// The host drive holding the vhdx, or `None` off WSL; `workspace` holds the BasePath cache.
+pub fn host_free(workspace: &Path) -> Result<Option<HostDrive>> {
     let Ok(distro) = std::env::var("WSL_DISTRO_NAME") else {
         return Ok(None);
     };
@@ -103,7 +103,12 @@ fn host_free(workspace: &Path) -> Result<Option<(PathBuf, u64, String, Found)>> 
     )?;
     let mount = mount_of(&base, drvfs).context("BasePath lost its drive letter")?;
     let st = rustix::fs::statvfs(&mount).with_context(|| format!("statvfs {}", mount.display()))?;
-    Ok(Some((mount, st.f_bavail * st.f_frsize, base, found)))
+    Ok(Some(HostDrive {
+        free: st.f_bavail * st.f_frsize,
+        mount,
+        base,
+        found,
+    }))
 }
 
 /// Interop under heavy build load fails transiently (same moments as `Wsl/Service/0x8007274c`) and a rerun seconds later works: 3 tries 2 s apart span ~4 s of
@@ -205,58 +210,9 @@ fn mount_of(base: &str, drvfs: &Path) -> Option<PathBuf> {
     (chars.next() == Some(':')).then(|| drvfs.join(letter.to_ascii_lowercase().to_string()))
 }
 
-/// Refuses below `stop_gib`; a note below `compact_gib`.
-fn judge(mount: &str, free: u64, limits: Limits) -> Result<Option<String>> {
-    let gib = free / GIB;
-    if free < limits.stop_gib * GIB {
-        bail!(
-            "host drive {mount} (holds the WSL vhdx) has {gib} GiB free, under {} GiB: free space or compact the vhdx before `native` (a full host drive fails the build's writes)",
-            limits.stop_gib
-        );
-    }
-    Ok((free < limits.compact_gib * GIB).then(|| {
-        format!("native: host drive {mount} (holds the WSL vhdx) has {gib} GiB free, under {} GiB: compact the vhdx soon", limits.compact_gib)
-    }))
-}
-
-/// `native`'s preflight; `workspace` holds the BasePath cache.
-pub fn check(workspace: &Path, limits: Limits) -> Result<()> {
-    if let Some((mount, free, base, found)) = host_free(workspace)? {
-        let m = mount.display().to_string();
-        let note = judge(&m, free, limits)?;
-        println!(
-            "native: host drive {m} has {} GiB free (floor {} GiB; vhdx at {base}, {found:?})",
-            free / GIB,
-            limits.stop_gib
-        );
-        if let Some(note) = note {
-            println!("{note}");
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const LIMITS: Limits = Limits {
-        stop_gib: 6,
-        compact_gib: 30,
-    };
-
-    /// Injected free space: under the stop refuses, between stop and compact notes, above passes quietly.
-    #[test]
-    fn thresholds() {
-        let e = judge("/mnt/c", 5 * GIB, LIMITS).expect_err("under the stop");
-        assert!(format!("{e}").contains("5 GiB free, under 6 GiB"), "{e}");
-        assert!(
-            judge("/mnt/c", 6 * GIB, LIMITS)
-                .unwrap()
-                .is_some_and(|n| n.contains("compact"))
-        );
-        assert!(judge("/mnt/c", 30 * GIB, LIMITS).unwrap().is_none());
-    }
 
     fn fake(ok: bool, stdout: &str) -> RegRun {
         RegRun {

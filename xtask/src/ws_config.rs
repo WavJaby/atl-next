@@ -9,6 +9,11 @@
 //! sccache_size = "5G"  # shared C/C++ compiler cache
 //! [fetch]
 //! for = ["cts"]        # gates whose sources.toml [aosp.needed_by] projects fetch checks out (`native --for` names, `all-gates`); absent = core only
+//! [disk]               # free-space floors in GiB, checked before `native` (disk_floor)
+//! host_min_free = 6    # Windows drive holding the WSL vhdx
+//! host_compact_below = 30
+//! workspace_min_free = 6
+//! pool_min_free = 5    # build-dir pool
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -28,6 +33,24 @@ pub const DEFAULT_PARALLEL_BUILDS: u32 = 2;
 /// Size limit of the compiler cache (sccache evicts least recently used entries past it), in sccache's `SCCACHE_CACHE_SIZE` syntax.
 /// One clean build of the libandroid_runtime closure stores ~80 MB (2026-11-01, zstd entries); 1.7 GB was in use under the old 2 GB limit (2026-11-11), so the owner raised it to 5 GB: ~60 such generations, room for the goal closure to grow.
 pub const DEFAULT_SCCACHE_SIZE: &str = "5G";
+
+/// `disk.host_min_free` (GiB): the Windows drive holding the WSL vhdx. A full libandroid_runtime build from cold grows the vhdx by several GiB, and a host drive that fills mid-build fails writes inside the distro: owner's hard stop 6.
+pub const DEFAULT_HOST_MIN_FREE: u64 = 6;
+/// `disk.host_compact_below` (GiB): under it, a note asks to compact the vhdx (owner: compact when C: < 30 GB). A note, never a refusal.
+pub const DEFAULT_HOST_COMPACT_BELOW: u64 = 30;
+/// `disk.workspace_min_free` (GiB): the filesystem holding the workspace (src/, cache/, out/ logs; WSL `/`, filled to 0 B twice on 2026-11-15). One build can grow sccache from empty to its cap ([`DEFAULT_SCCACHE_SIZE`] 5 GiB) + 1 GiB for logs, cargo's registry and /tmp.
+pub const DEFAULT_WORKSPACE_MIN_FREE: u64 = 6;
+/// `disk.pool_min_free` (GiB): the filesystem holding the build-dir pool. One child build that rewrites its whole copy writes ~4.2 GB on disk (base 8.0 GB logical at zstd ~2x, snapshot-slots D10) + margin.
+pub const DEFAULT_POOL_MIN_FREE: u64 = 5;
+
+/// `[disk]`: free-space floors in GiB (`disk_floor`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskFloors {
+    pub host_min_free: Setting<u64>,
+    pub host_compact_below: Setting<u64>,
+    pub workspace_min_free: Setting<u64>,
+    pub pool_min_free: Setting<u64>,
+}
 
 /// Where an effective value came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +102,8 @@ pub struct WsConfig {
     pub sccache_size: Setting<String>,
     /// `fetch.for`: gates (`gate_goals` names or `all-gates`) whose `needed_by` projects fetch checks out; empty = core only.
     pub fetch_for: Setting<Vec<String>>,
+    /// `[disk]` floors.
+    pub disk: DiskFloors,
 }
 
 impl WsConfig {
@@ -150,6 +175,12 @@ fn defaults(path: PathBuf) -> WsConfig {
         parallel_builds: Setting::default(DEFAULT_PARALLEL_BUILDS),
         sccache_size: Setting::default(DEFAULT_SCCACHE_SIZE.to_owned()),
         fetch_for: Setting::default(Vec::new()),
+        disk: DiskFloors {
+            host_min_free: Setting::default(DEFAULT_HOST_MIN_FREE),
+            host_compact_below: Setting::default(DEFAULT_HOST_COMPACT_BELOW),
+            workspace_min_free: Setting::default(DEFAULT_WORKSPACE_MIN_FREE),
+            pool_min_free: Setting::default(DEFAULT_POOL_MIN_FREE),
+        },
     }
 }
 
@@ -162,7 +193,7 @@ pub fn parse(text: &str, path: &Path) -> Result<WsConfig> {
     let mut cfg = defaults(path.to_owned());
     for (name, section) in &table {
         let toml::Value::Table(section) = section else {
-            bail!("{shown}: `{name}` must be a table ([build] or [cache])");
+            bail!("{shown}: `{name}` must be a table ([build], [cache], [fetch] or [disk])");
         };
         for (key, value) in section {
             let at = format!("{shown}: `{name}.{key}`");
@@ -181,8 +212,20 @@ pub fn parse(text: &str, path: &Path) -> Result<WsConfig> {
                 }
                 ("cache", "sccache_size") => cfg.sccache_size = Setting::file(size(value, &at)?),
                 ("fetch", "for") => cfg.fetch_for = Setting::file(gates(value, &at)?),
+                ("disk", "host_min_free") => {
+                    cfg.disk.host_min_free = Setting::file(gib(value, &at)?);
+                }
+                ("disk", "host_compact_below") => {
+                    cfg.disk.host_compact_below = Setting::file(gib(value, &at)?);
+                }
+                ("disk", "workspace_min_free") => {
+                    cfg.disk.workspace_min_free = Setting::file(gib(value, &at)?);
+                }
+                ("disk", "pool_min_free") => {
+                    cfg.disk.pool_min_free = Setting::file(gib(value, &at)?);
+                }
                 _ => bail!(
-                    "{at} is not a known key (known: build.parallel_builds, cache.sccache_size, fetch.for)"
+                    "{at} is not a known key (known: build.parallel_builds, cache.sccache_size, fetch.for, disk.host_min_free, disk.host_compact_below, disk.workspace_min_free, disk.pool_min_free)"
                 ),
             }
         }
@@ -197,6 +240,14 @@ fn count(value: &toml::Value, at: &str) -> Result<u32> {
     };
     let n = u32::try_from(*n).ok().filter(|&n| n > 0);
     n.with_context(|| format!("{at} must be a positive integer, not {value}"))
+}
+
+/// A whole number of GiB, 0 allowed (no floor).
+fn gib(value: &toml::Value, at: &str) -> Result<u64> {
+    let toml::Value::Integer(n) = value else {
+        bail!("{at} must be a whole number of GiB, not {value}");
+    };
+    u64::try_from(*n).with_context(|| format!("{at} must be a whole number of GiB, not {value}"))
 }
 
 /// A list of distinct `--for` values (gate names, `all-gates`).
@@ -392,5 +443,34 @@ mod tests {
         );
         assert_eq!(cfg.fetch_for.value, ["cts", "gl"]);
         assert_eq!(cfg.parallel_builds, Setting::file(1));
+    }
+
+    /// `[disk]` floors: absent -> the documented defaults (6/30/6/5 GiB, each const's derivation); set -> file; 0 allowed; negative or a string refused by key.
+    #[test]
+    fn disk_floors() {
+        let d = parse("", path()).unwrap().disk;
+        assert_eq!(d.host_min_free, Setting::default(6));
+        assert_eq!(d.host_compact_below, Setting::default(30));
+        assert_eq!(d.workspace_min_free, Setting::default(6));
+        assert_eq!(d.pool_min_free, Setting::default(5));
+        let d = parse(
+            "[disk]\npool_min_free = 8\nworkspace_min_free = 0\n",
+            path(),
+        )
+        .unwrap()
+        .disk;
+        assert_eq!(d.pool_min_free, Setting::file(8));
+        assert_eq!(d.workspace_min_free, Setting::file(0));
+        assert_eq!(d.host_min_free, Setting::default(6));
+        let e = format!(
+            "{:#}",
+            parse("[disk]\npool_min_free = -1\n", path()).unwrap_err()
+        );
+        assert!(
+            e.contains("disk.pool_min_free` must be a whole number"),
+            "{e}"
+        );
+        let e = format!("{:#}", parse("[disk]\npool = 1\n", path()).unwrap_err());
+        assert!(e.contains("not a known key"), "{e}");
     }
 }
