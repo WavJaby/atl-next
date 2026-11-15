@@ -54,6 +54,16 @@ pub const VENDOR_EGL: &str = if cfg!(target_pointer_width = "64") {
 } else {
     "/vendor/lib/egl"
 };
+/// The GL driver's three files in [`VENDOR_EGL`], Loader.cpp's `lib<kind>_<ro.hardware.egl>.so` with `ro.hardware.egl=atl`: the driver (atl-egl-driver) as the EGL library and again as the ES2 library (same file, so the dynamic loader maps it once), ANGLE's ES1 library as the ES1 one.
+pub const GL_DRIVER_EGL: &str = "libEGL_atl.so";
+pub const GL_DRIVER_GLES2: &str = "libGLESv2_atl.so";
+pub const GL_DRIVER_GLES1: &str = "libGLESv1_CM_atl.so";
+/// ANGLE's EGL library, where Loader.cpp opens the ANGLE driver (`SYSTEM_LIB_PATH`): the driver's ES1 contexts run on it (atl-egl-driver es1.rs).
+pub const ANGLE_EGL: &str = if cfg!(target_pointer_width = "64") {
+    "/system/lib64/libEGL_angle.so"
+} else {
+    "/system/lib/libEGL_angle.so"
+};
 /// The vendor partition's properties (`ro.hardware.egl`), joined into the property area.
 pub const VENDOR_BUILD_PROP: &str = "/vendor/build.prop";
 /// Framework jars and their libraries (`Environment.getRootDirectory()/framework`).

@@ -23,10 +23,10 @@ SPDX-License-Identifier: BSD-3-Clause
  1 file changed, 12 insertions(+)
 
 diff --git a/Android.bp b/Android.bp
-index 2412a222ca9a63e715383362b68c73012d720ec5..a3dc1574edf64a2ba778d3dad27c0486f3411a11 100644
+index 5c282e7f650fbd6f439d4350e6fdb39724479b73..a9a7f6a1b9c9cc7514f4f4a3c9cd92f53f53b0e1 100644
 --- a/Android.bp
 +++ b/Android.bp
-@@ -2716,8 +2716,18 @@ cc_library_static {
+@@ -2672,8 +2672,18 @@ cc_library_static {
          "src/compiler/translator/ValidateVaryingLocations.cpp",
          "src/compiler/translator/VariablePacker.cpp",
          "src/compiler/translator/blocklayout.cpp",
@@ -45,7 +45,7 @@ index 2412a222ca9a63e715383362b68c73012d720ec5..a3dc1574edf64a2ba778d3dad27c0486
          "src/compiler/translator/glslang_lex_autogen.cpp",
          "src/compiler/translator/glslang_tab_autogen.cpp",
          "src/compiler/translator/spirv/BuildSPIRV.cpp",
-@@ -2862,6 +2872,8 @@ cc_library_static {
+@@ -2816,6 +2826,8 @@ cc_library_static {
          "-Wno-gnu-statement-expression",
          "-Wno-gnu-zero-variadic-macro-arguments",
          "-Wno-zero-length-array",

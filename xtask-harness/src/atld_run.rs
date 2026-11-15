@@ -70,6 +70,18 @@ pub fn gl_front(out: &Path, module: &str) -> PathBuf {
     out.join("device").join(module).join(format!("{module}.so"))
 }
 
+/// ANGLE's ES1 library module, one of gate_goals.rs `ANGLE_FRONTS`: the driver's ES1 library.
+const ANGLE_GLES1: &str = "libGLESv1_CM_angle";
+
+/// Where the driver's ES1 library sits (Loader.cpp's `libGLESv1_CM_<ro.hardware.egl>.so` in the driver dir).
+fn es1_driver_lib() -> String {
+    format!(
+        "{}/{}",
+        atl_android_paths::VENDOR_EGL,
+        atl_android_paths::GL_DRIVER_GLES1
+    )
+}
+
 /// What the runtime reads from the staged ART `art`: its tree and library dir (whole, remote.rs `Inputs`), the launcher, the property service's input and the boot jars.
 fn art_inputs(art: &HostArt) -> remote::Inputs {
     remote::Inputs {
@@ -800,7 +812,7 @@ impl Runtime {
         Ok(self)
     }
 
-    /// Also builds and places the GL driver (`libGLES_atl.so` over the host's EGL, egl_driver.rs `placement`) where AOSP's libEGL loader finds it: /vendor/lib64/egl and `ro.hardware.egl` in /vendor/build.prop.
+    /// Also builds and places the GL driver (`libEGL_atl.so` + `libGLESv2_atl.so` over the host's EGL, egl_driver.rs `placement`) where AOSP's libEGL loader finds it: /vendor/lib64/egl and `ro.hardware.egl` in /vendor/build.prop; ANGLE's ES1 library there as `libGLESv1_CM_atl.so` (the driver's ES1 contexts, atl-egl-driver es1.rs).
     /// Also the fronts at Loader.cpp's `SYSTEM_LIB_PATH` (`/system/lib64` in LP64): it dlopens them there as the "wrapper" libraries (`load_wrapper`) and aborts without them; the links name the files already loaded, so glibc returns the loaded copy (same inode).
     pub fn with_gl_driver(mut self, root: &Path) -> Result<Self> {
         let mut files = crate::egl_driver::placement(root, &self.out)?;
@@ -814,8 +826,16 @@ impl Runtime {
             );
             files.push((lib, format!("{system_lib}/{m}.so")));
         }
+        files.push((gl_front(&self.out, ANGLE_GLES1), es1_driver_lib()));
         self.gl_driver = files;
         Ok(self)
+    }
+
+    /// The GL driver without its ES1 library (`xtask test es1-angle`'s break): ES1 contexts must then fail named, not call the fronts.
+    pub fn without_es1_driver_lib(mut self) -> Self {
+        let at = es1_driver_lib();
+        self.gl_driver.retain(|(_, a)| *a != at);
+        self
     }
 
     /// Restages the test fonts with `family` preferred for sans-serif (the font gate's deliberate break: the mono font).
@@ -995,7 +1015,7 @@ impl Runtime {
         self
     }
 
-    /// Packages install with the native GL driver: no owner row, no ES1 rule (app.rs `--gl-selection-break`, test only).
+    /// Packages install with the native GL driver: no owner row, no ES1 rule (app.rs `--gl-selection-break`, test only). Since the driver serves ES1 contexts itself (gl-honesty H2a) this run is green: the routing-keys-empty run until H3 deletes the selection.
     pub fn without_gl_selection(mut self) -> Self {
         self.gl_selection = false;
         self

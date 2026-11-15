@@ -470,7 +470,7 @@ fn connect(_: &Window) -> Result<bool, EglError> {
     Ok(false)
 }
 
-/// The readback counter's log text after `libGLES_atl: ` (count follows).
+/// The readback counter's log text after `libEGL_atl: ` (count follows).
 pub const READBACK_FRAMES_LINE: &str = "readback_frames=";
 
 /// One stderr line per window event (the app's log), so a run shows which path ran; plus the readback counter at powers of two.
@@ -479,7 +479,7 @@ pub const READBACK_FRAMES_LINE: &str = "readback_frames=";
     reason = "one line per window connect or teardown, which path ran; the readback counter log2(frames) times"
 )]
 fn log(line: &str) {
-    eprintln!("libGLES_atl: {line}");
+    eprintln!("libEGL_atl: {line}");
 }
 
 impl Drop for WindowSurface {

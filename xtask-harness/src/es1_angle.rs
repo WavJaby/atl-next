@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test es1-angle` (gl-honesty H1 spike, test-only): ANGLE embedded over our driver draws an ES1 frame into the window surface our driver connected.
-//! The fixture (xtask-harness/testdata/es1-angle) runs as a plain app process (`--run-class`) with the GL driver + ANGLE placed as for an app (`Runtime::with_gl_driver`); one layer + BLASTBufferQueue, its Surface handed to the JNI lib
-//! (jni/lib.rs has the sequence: ANGLE display with the driver's handle, driver window surface + ES3 carrier through libEGL, ANGLE ES1 external context + external surface, acquire / draw / release / swap).
-//! Pass: the compositor's ReportSink digest of a `atl-es1` buffer equals [`expected_digest`] (clear + top-left quad, upright: buffer row 0 is the top); `version OpenGL ES 1.1` with `ANGLE` in the fixture log; the lib's `ok`.
-//! Break (`break` arg): the driver's current context is cleared before the ANGLE external context is made; the run must end in an `error angle ...` line and show no expected buffer.
+//! `xtask test es1-angle`: ANGLE embedded over our driver draws an ES1 frame into the window surface our driver connected.
+//! The fixture (xtask-harness/testdata/es1-angle) runs as a plain app process (`--run-class`) with the GL driver + ANGLE placed as for an app (`Runtime::with_gl_driver`); one layer + BLASTBufferQueue, its Surface handed to the JNI lib.
+//! Runs ([`Mode`]): `run` (H1 spike: the external-context sequence done from outside the driver, jni/lib.rs `run`), `driver` (H2a: the driver's own ES1 context kind through libEGL and the libGLESv1_CM front, jni/lib.rs `run_driver`).
+//! Pass (both): the compositor's ReportSink digest of a `atl-es1` buffer equals [`expected_digest`] (clear + top-left quad, upright: buffer row 0 is the top); `version OpenGL ES 1.1` with `ANGLE`; the lib's `ok`.
+//! `driver` also: the chosen ES1 config reports the ES1 bit; eglQueryContext says version 1; an ES3 context in the same process reports the host's GLES 3 (not ANGLE); both cross-kind share contexts fail EGL_BAD_CONTEXT, each counted by a driver line.
+//! Breaks: `break` (the driver's current context is cleared before the ANGLE external context: an `error angle ...` line, no expected buffer); `driver-nolib` (no `libGLESv1_CM_atl.so` placed: the ES1 create fails EGL_BAD_ALLOC with the driver's named line, no expected buffer).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -94,53 +95,129 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     ];
     let want = expected_digest();
     let mut ok = true;
-    for broken in [false, true] {
-        let tag = if broken { "break" } else { "run" };
+    for mode in [Mode::Spike, Mode::SpikeBreak, Mode::Driver] {
         let mut shell_args = base.clone();
-        if broken {
-            shell_args.push("break".to_owned());
+        shell_args.push(mode.arg().to_owned());
+        let log = run_client(
+            &rt,
+            &apk,
+            &work.join(mode.tag()),
+            shell_args,
+            &args.log_tags,
+        )?;
+        ok &= judge(mode, &log, want, args.verbose);
+    }
+    // the driver without its ES1 library: placed last, the runtime keeps the change
+    let rt = rt.without_es1_driver_lib();
+    let mut shell_args = base.clone();
+    shell_args.push(Mode::DriverNoLib.arg().to_owned());
+    let log = run_client(
+        &rt,
+        &apk,
+        &work.join(Mode::DriverNoLib.tag()),
+        shell_args,
+        &args.log_tags,
+    )?;
+    ok &= judge(Mode::DriverNoLib, &log, want, args.verbose);
+    println!("es1-angle: {}", if ok { "PASS" } else { "FAIL" });
+    Ok(if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// H1: ANGLE external context made from outside the driver.
+    Spike,
+    /// H1 break: the carrier cleared first; ANGLE must be refused, named.
+    SpikeBreak,
+    /// H2a: the driver's own ES1 context kind, through libEGL and the libGLESv1_CM front.
+    Driver,
+    /// H2a break: `Driver` with no `libGLESv1_CM_atl.so` placed; the ES1 create must fail named.
+    DriverNoLib,
+}
+
+impl Mode {
+    /// The fixture's mode argument (Client.java).
+    fn arg(self) -> &'static str {
+        match self {
+            Mode::Spike => "spike",
+            Mode::SpikeBreak => "break",
+            Mode::Driver | Mode::DriverNoLib => "driver",
         }
-        let log = run_client(&rt, &apk, &work.join(tag), shell_args, &args.log_tags)?;
-        if args.verbose {
-            println!("---- {tag} log\n{log}");
+    }
+
+    fn tag(self) -> &'static str {
+        match self {
+            Mode::Spike => "run",
+            Mode::SpikeBreak => "break",
+            Mode::Driver => "driver",
+            Mode::DriverNoLib => "driver-nolib",
         }
-        let lines: Vec<&str> = log
-            .lines()
-            .filter_map(|l| l.split_once(TAG).map(|(_, t)| t))
-            .collect();
-        for l in &lines {
-            println!("es1-angle: [{tag}] {l}");
+    }
+}
+
+/// The driver's refusal lines (atl-egl-driver es1.rs `create` / `refuse_share`).
+const NOLIB_LINE: &str = "libEGL_atl: es1 context refused: ";
+const SHARE_LINE: &str = "libEGL_atl: es1 share refused (";
+/// EGL_BAD_CONTEXT (egl.h): the share refusal's error.
+const BAD_CONTEXT: &str = "0x3006";
+/// EGL_BAD_ALLOC (egl.h): the missing-ES1-library refusal's error.
+const BAD_ALLOC: &str = "0x3003";
+
+/// One run's verdict lines; true when it passed (a break passes by failing as it must).
+fn judge(mode: Mode, log: &str, want: u64, verbose: bool) -> bool {
+    let tag = mode.tag();
+    if verbose {
+        println!("---- {tag} log\n{log}");
+    }
+    let lines: Vec<&str> = log
+        .lines()
+        .filter_map(|l| l.split_once(TAG).map(|(_, t)| t))
+        .collect();
+    for l in &lines {
+        println!("es1-angle: [{tag}] {l}");
+    }
+    let digests: Vec<u64> = log
+        .lines()
+        .filter(|l| l.starts_with("composer: quad ") && word(l, "name") == Some(LAYER))
+        .filter_map(|l| word(l, "digest").and_then(|d| u64::from_str_radix(d, 16).ok()))
+        .collect();
+    let shown = digests.contains(&want);
+    let field = |p: &str| lines.iter().find_map(|l| l.strip_prefix(p)).unwrap_or("");
+    let result = lines
+        .iter()
+        .rev()
+        .find(|l| **l == "ok" || l.starts_with("error"))
+        .copied()
+        .unwrap_or("no result line");
+    let mut checks: Vec<(&str, bool, String)> = Vec::new();
+    match mode {
+        Mode::SpikeBreak => {
+            let angle_err = lines.iter().find(|l| l.starts_with("error angle"));
+            checks.push((
+                "break",
+                !shown && angle_err.is_some(),
+                format!("expected buffer shown={shown}, angle error={angle_err:?}"),
+            ));
         }
-        let digests: Vec<u64> = log
-            .lines()
-            .filter(|l| l.starts_with("composer: quad ") && word(l, "name") == Some(LAYER))
-            .filter_map(|l| word(l, "digest").and_then(|d| u64::from_str_radix(d, 16).ok()))
-            .collect();
-        let shown = digests.contains(&want);
-        let version = lines
-            .iter()
-            .find_map(|l| l.strip_prefix("version "))
-            .unwrap_or("");
-        let version_ok = version.starts_with("OpenGL ES 1.1") && version.contains("ANGLE");
-        let lib_ok = lines.contains(&"ok");
-        let angle_err = lines.iter().find(|l| l.starts_with("error angle"));
-        if broken {
-            let fired = !shown && angle_err.is_some();
-            ok &= fired;
-            println!(
-                "es1-angle: {} break: {}",
-                verdict(fired),
-                match angle_err {
-                    Some(e) if !shown => format!("fails as it must: {e}"),
-                    _ => format!(
-                        "NOT caught (expected buffer shown={shown}, angle error={angle_err:?})"
-                    ),
-                }
-            );
-            continue;
+        Mode::DriverNoLib => {
+            let named = log
+                .lines()
+                .find_map(|l| l.split_once(NOLIB_LINE).map(|(_, t)| t));
+            let refused =
+                result.starts_with("error es1 eglCreateContext") && result.contains(BAD_ALLOC);
+            checks.push((
+                "break no ES1 library",
+                !shown && refused && named.is_some(),
+                format!("shown={shown}, result `{result}`, driver line {named:?}"),
+            ));
         }
-        for (what, pass, detail) in [
-            (
+        Mode::Spike | Mode::Driver => {
+            let version = field("version ");
+            checks.push((
                 "pixels",
                 shown,
                 format!(
@@ -148,30 +225,57 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                     digests.len(),
                     if shown { "among them" } else { "MISSING" }
                 ),
-            ),
-            ("version", version_ok, format!("`{version}`")),
-            (
-                "lib",
-                lib_ok,
-                lines
-                    .iter()
-                    .rev()
-                    .find(|l| **l == "ok" || l.starts_with("error"))
-                    .copied()
-                    .unwrap_or("no result line")
-                    .to_owned(),
-            ),
-        ] {
-            ok &= pass;
-            println!("es1-angle: {} {what}: {detail}", verdict(pass));
+            ));
+            checks.push((
+                "version",
+                version.starts_with("OpenGL ES 1.1") && version.contains("ANGLE"),
+                format!("`{version}`"),
+            ));
+            checks.push(("lib", result == "ok", result.to_owned()));
         }
     }
-    println!("es1-angle: {}", if ok { "PASS" } else { "FAIL" });
-    Ok(if ok {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    })
+    if mode == Mode::Driver {
+        // the ES3 context in this ES1 process is the host's: GLES 3, not ANGLE's
+        let es3 = field("es3 version ");
+        checks.push((
+            "es3 in es1 process",
+            es3.starts_with("OpenGL ES 3.") && !es3.contains("ANGLE"),
+            format!("`{es3}`"),
+        ));
+        let config = field("config renderable ");
+        let es1_bit =
+            i64::from_str_radix(config.trim_start_matches("0x"), 16).is_ok_and(|v| v & 1 != 0);
+        checks.push((
+            "config ES1 bit",
+            es1_bit,
+            format!("RENDERABLE_TYPE {config}"),
+        ));
+        checks.push((
+            "query version",
+            field("query version ") == "1",
+            field("query version ").to_owned(),
+        ));
+        let counted = log.lines().filter(|l| l.contains(SHARE_LINE)).count();
+        for what in ["es1-on-es3", "es3-on-es1"] {
+            let line = field(&format!("share {what} "));
+            checks.push((
+                "share refused",
+                line == format!("refused {BAD_CONTEXT}"),
+                format!("{what}: `{line}`, driver refusal lines {counted}"),
+            ));
+        }
+        checks.push((
+            "share counted",
+            counted == 2,
+            format!("{counted} driver refusal lines"),
+        ));
+    }
+    let mut ok = true;
+    for (what, pass, detail) in checks {
+        ok &= pass;
+        println!("es1-angle: {} [{tag}] {what}: {detail}", verdict(pass));
+    }
+    ok
 }
 
 fn run_client(

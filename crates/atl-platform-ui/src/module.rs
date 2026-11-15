@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Loading the platform module (launcher-ui-module plan S3): `dlopen(abi::MODULE_FILE, RTLD_NOW | RTLD_LOCAL)` through the dynamic loader's search path (the runtime library dir `LD_LIBRARY_PATH` names, as for `libGLES_atl.so`); no environment switch picks it.
+//! Loading the platform module (launcher-ui-module plan S3): `dlopen(abi::MODULE_FILE, RTLD_NOW | RTLD_LOCAL)` through the dynamic loader's search path (the runtime library dir `LD_LIBRARY_PATH` names, as for the GL driver); no environment switch picks it.
 //! Once per process, on the first `PlatformUi::attach` or `PlatformAudioHost::connect`; a failure is kept and every later call gets the same text. The handle is never closed: the module's objects live as long as the process.
 //! The identity check reads only `UiVtable::abi` before comparing it with this build's `ABI_ID`; then the module's log records are routed into this process's `tracing` subscriber.
 

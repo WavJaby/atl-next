@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! atl-egl-driver-probe: renders through the GLES driver (`libGLES_atl.so`, crate atl-egl-driver) into an ANativeWindow and checks every pixel of every queued buffer, orientation included.
+//! atl-egl-driver-probe: renders through the GLES driver (`libEGL_atl.so`, crate atl-egl-driver) into an ANativeWindow and checks every pixel of every queued buffer, orientation included.
 //! Loads the driver as AOSP's Loader.cpp does (`initialize_api`: each egl* by dlsym, else the driver's eglGetProcAddress; each gl* the same, and the driver must export no gl* name) and calls it as libEGL's fronts would after their own window setup.
 //! The window is this probe's: [`EDGE`]-square RGBA_8888 gralloc buffers (gralloc's GBM backend, LINEAR, pre-filled with [`POISON`]) behind window.h's hooks, recording the transform and fence of each queue.
 //! Per frame, as hwui draws: bind framebuffer 0 and read the binding back (must read 0), invalidate GL_COLOR (an error on an FBO unless the driver maps it), then [`FILLS`] as scissored clears in GL coordinates; swap. [`FRAMES`] frames, so the swap's dequeue-and-rebind is exercised.
@@ -62,7 +62,7 @@ enum Break {
 
 #[derive(Parser)]
 struct Args {
-    /// The driver library (libGLES_atl.so).
+    /// The driver library (libEGL_atl.so).
     #[arg(long)]
     driver: PathBuf,
     /// DRM node gralloc allocates on (default: gralloc's own trial); the driver is handed it as an app is by atld (trial tier).

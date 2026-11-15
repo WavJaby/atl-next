@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! JNI native of com.example.atles1.Client (gl-honesty H1 spike, O1 mechanism = ANGLE external context): what the driver's ES1 context kind will do, done from outside it.
+//! JNI native of com.example.atles1.Client. Mode `driver` ([`run_driver`], gl-honesty H2a): the driver's ES1 context kind as an app reaches it. Modes `spike` / `break` (H1, O1 mechanism = ANGLE external context): the same sequence done from outside the driver, below.
 //! 1. ANGLE display over our driver: eglGetPlatformDisplay(OPENGLES, EGL_PLATFORM_ANGLE_EGL_HANDLE_ANGLE = the driver's dlopen handle), eglInitialize. ANGLE's init leaves its mock pbuffer + renderer context current on the driver, so this goes first.
 //! 2. Host carrier: our driver's window surface on the app's Surface + an ES3 context through AOSP libEGL, made current (break: the driver's current context is cleared instead, so ANGLE finds none).
 //! 3. ANGLE ES1 context with EGL_EXTERNAL_CONTEXT_ANGLE (adopts the driver's current context) + an EGL_EXTERNAL_SURFACE_ANGLE pbuffer (ANGLE's FB 0 = the native FB 0 -> the driver's FBO-0 wrapper -> the surface FBO).
@@ -122,6 +122,8 @@ type GetProcAddress = unsafe extern "C" fn(*const c_char) -> P;
 type Acquire = unsafe extern "C" fn(P, P);
 type Release = unsafe extern "C" fn(P);
 type FromSurface = unsafe extern "C" fn(*mut *const *const c_void, P) -> P;
+type GetConfigAttrib = unsafe extern "C" fn(P, P, i32, *mut i32) -> u32;
+type QueryContext = unsafe extern "C" fn(P, P, i32, *mut i32) -> u32;
 
 struct Egl {
     get_display: GetDisplay,
@@ -259,7 +261,7 @@ impl Gl1 {
     }
 }
 
-/// `draw(surface, angleEgl, angleGles1, driver, broken)`: newline-separated result lines; the last is `ok` or `error <step>: <why>`.
+/// `draw(surface, angleEgl, angleGles1, driver, mode)`: newline-separated result lines; the last is `ok` or `error <step>: <why>`. Modes: `spike`, `break` ([`run`]), `driver` ([`run_driver`]).
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_com_example_atles1_Client_draw(
     env: *mut *const *const c_void,
@@ -268,16 +270,26 @@ pub extern "C" fn Java_com_example_atles1_Client_draw(
     angle_egl: P,
     angle_gles1: P,
     driver: P,
-    broken: u8,
+    mode: P,
 ) -> P {
     let mut out = String::new();
     let args = (
         java_text(env, angle_egl),
         java_text(env, angle_gles1),
         java_text(env, driver),
+        java_text(env, mode),
     );
     let r = match args {
-        (Some(a), Some(g), Some(d)) => run(env, surface, &a, &g, &d, broken != 0, &mut out),
+        (_, _, _, Some(m)) if m == "driver" => run_driver(env, surface, &mut out),
+        (Some(a), Some(g), Some(d), m) => run(
+            env,
+            surface,
+            &a,
+            &g,
+            &d,
+            m.as_deref() == Some("break"),
+            &mut out,
+        ),
         _ => Err("args: a path is null".to_owned()),
     };
     match r {
@@ -499,6 +511,150 @@ fn run(
         (host.make_current)(dpy, none, none, none);
         (host.destroy_surface)(dpy, hsurf);
         (host.destroy_context)(dpy, hctx);
+    }
+    Ok(())
+}
+
+/// H2a: the driver's own ES1 context kind as an app reaches it. A config with the ES1 bit (GLSurfaceView's default chooser), an ES1 context (no routing: libEGL -> the driver), frames through AOSP's libGLESv1_CM front;
+/// then in the same process an ES3 context (must be the host's, not ANGLE's) and the two cross-kind share contexts (must fail EGL_BAD_CONTEXT).
+fn run_driver(env: *mut *const *const c_void, surface: P, out: &mut String) -> Result<(), String> {
+    let none = std::ptr::null_mut::<c_void>();
+    let libegl = Lib::open("libEGL.so", RTLD_NOW)?;
+    let host = Egl::load(&libegl)?;
+    let attrib: GetConfigAttrib = libegl.sym(c"eglGetConfigAttrib")?;
+    let query: QueryContext = libegl.sym(c"eglQueryContext")?;
+    let android = Lib::open("libandroid.so", RTLD_NOW)?;
+    let from_surface: FromSurface = android.sym(c"ANativeWindow_fromSurface")?;
+    // SAFETY (this function): EGL / GL calls through their own libraries with the arguments their prototypes take; attribute lists EGL_NONE-terminated.
+    let dpy = unsafe { (host.get_display)(none) };
+    if unsafe { (host.initialize)(dpy, std::ptr::null_mut(), std::ptr::null_mut()) } == 0 {
+        return Err(format!("eglInitialize: {:#x}", host.error()));
+    }
+    let cfg = host.config(
+        dpy,
+        &[
+            EGL_RED_SIZE,
+            8,
+            EGL_GREEN_SIZE,
+            8,
+            EGL_BLUE_SIZE,
+            8,
+            EGL_ALPHA_SIZE,
+            8,
+            EGL_SURFACE_TYPE,
+            EGL_WINDOW_BIT,
+            EGL_RENDERABLE_TYPE,
+            EGL_OPENGL_ES_BIT,
+            EGL_NONE,
+        ],
+    )?;
+    let mut rt = 0;
+    unsafe { attrib(dpy, cfg, EGL_RENDERABLE_TYPE, &mut rt) };
+    let _ = writeln!(out, "config renderable {rt:#x}");
+    let window = unsafe { from_surface(env, surface) };
+    if window.is_null() {
+        return Err("ANativeWindow_fromSurface: null".to_owned());
+    }
+    let cws: CreateWindowSurface = libegl.sym(c"eglCreateWindowSurface")?;
+    let hsurf = unsafe { cws(dpy, cfg, window, [EGL_NONE].as_ptr()) };
+    if hsurf.is_null() {
+        return Err(format!("eglCreateWindowSurface: {:#x}", host.error()));
+    }
+    let ctx = unsafe {
+        (host.create_context)(
+            dpy,
+            cfg,
+            none,
+            [EGL_CONTEXT_CLIENT_VERSION, 1, EGL_NONE].as_ptr(),
+        )
+    };
+    if ctx.is_null() {
+        return Err(format!("es1 eglCreateContext: {:#x}", host.error()));
+    }
+    let mut v = 0;
+    unsafe { query(dpy, ctx, EGL_CONTEXT_CLIENT_VERSION, &mut v) };
+    let _ = writeln!(out, "query version {v}");
+    if unsafe { (host.make_current)(dpy, hsurf, hsurf, ctx) } == 0 {
+        return Err(format!("es1 eglMakeCurrent: {:#x}", host.error()));
+    }
+    let gl = Gl1::load(&Lib::open("libGLESv1_CM.so", RTLD_NOW)?)?;
+    let _ = writeln!(out, "version {}", gl.string(GL_VERSION));
+    let _ = writeln!(out, "renderer {}", gl.string(GL_RENDERER));
+    let _ = writeln!(
+        out,
+        "extensions {}",
+        gl.string(GL_EXTENSIONS).split_whitespace().count()
+    );
+    for n in 0..FRAMES {
+        let err = gl.frame();
+        if n == 0 {
+            let _ = writeln!(
+                out,
+                "px quad {} clear {}",
+                gl.pixel(8, EDGE - 8),
+                gl.pixel(EDGE - 8, 8)
+            );
+        }
+        if err != 0 {
+            return Err(format!("frame {n}: gl error {err:#x}"));
+        }
+        if unsafe { (host.swap)(dpy, hsurf) } == 0 {
+            return Err(format!("frame {n}: eglSwapBuffers: {:#x}", host.error()));
+        }
+    }
+    let _ = writeln!(out, "frames {FRAMES}");
+
+    // an ES3 context in this ES1 process: the host's GLES, surfaceless
+    let ctx3 = unsafe {
+        (host.create_context)(
+            dpy,
+            cfg,
+            none,
+            [EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE].as_ptr(),
+        )
+    };
+    if ctx3.is_null() {
+        return Err(format!("es3 eglCreateContext: {:#x}", host.error()));
+    }
+    if unsafe { (host.make_current)(dpy, none, none, ctx3) } == 0 {
+        return Err(format!("es3 eglMakeCurrent: {:#x}", host.error()));
+    }
+    let gles2 = Lib::open("libGLESv2.so", RTLD_NOW)?;
+    let get_string: unsafe extern "C" fn(u32) -> *const c_char = gles2.sym(c"glGetString")?;
+    let s = unsafe { get_string(GL_VERSION) };
+    let es3 = if s.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(s) }.to_string_lossy().into_owned()
+    };
+    let _ = writeln!(out, "es3 version {es3}");
+
+    // cross-kind share contexts: refused by the driver
+    for (what, version, share) in [("es1-on-es3", 1, ctx3), ("es3-on-es1", 3, ctx)] {
+        let c = unsafe {
+            (host.create_context)(
+                dpy,
+                cfg,
+                share,
+                [EGL_CONTEXT_CLIENT_VERSION, version, EGL_NONE].as_ptr(),
+            )
+        };
+        let _ = writeln!(
+            out,
+            "share {what} {} {:#x}",
+            if c.is_null() { "refused" } else { "made" },
+            host.error()
+        );
+        if !c.is_null() {
+            unsafe { (host.destroy_context)(dpy, c) };
+        }
+    }
+
+    unsafe {
+        (host.make_current)(dpy, none, none, none);
+        (host.destroy_context)(dpy, ctx3);
+        (host.destroy_context)(dpy, ctx);
+        (host.destroy_surface)(dpy, hsurf);
     }
     Ok(())
 }

@@ -51,8 +51,8 @@ impl Verdict {
 }
 
 /// atl-egl-driver surface.rs: its tier line and its counter line (`READBACK_FRAMES_LINE`, logged at powers of two).
-const READBACK_TIER: &str = "libGLES_atl: buffer tier readback";
-const READBACK_FRAMES: &str = "libGLES_atl: readback_frames=";
+const READBACK_TIER: &str = "libEGL_atl: buffer tier readback";
+const READBACK_FRAMES: &str = "libEGL_atl: readback_frames=";
 
 /// The largest readback count the driver logged, 0 without its tier line.
 pub fn readback_frames(log: &str) -> u64 {
@@ -108,16 +108,15 @@ mod tests {
     #[test]
     fn mmap_needs_counted_readback() {
         let mmap = "Gdk-DEBUG: Used mmap for downloading 562x900 dmabuf (format AB24:0)\n";
-        let tier = "libGLES_atl: buffer tier readback (this device cannot import gralloc's buffer, EGL error 0x3003)\n";
-        let counted = format!(
-            "{tier}libGLES_atl: readback_frames=1\nlibGLES_atl: readback_frames=64\n{mmap}"
-        );
+        let tier = "libEGL_atl: buffer tier readback (this device cannot import gralloc's buffer, EGL error 0x3003)\n";
+        let counted =
+            format!("{tier}libEGL_atl: readback_frames=1\nlibEGL_atl: readback_frames=64\n{mmap}");
         assert_eq!(readback_frames(&counted), 64);
         assert!(Verdict::of(&counted).ok_in(&counted));
         assert!(!Verdict::of(mmap).ok_in(mmap));
         let uncounted = format!("{tier}{mmap}");
         assert!(!Verdict::of(&uncounted).ok_in(&uncounted));
-        let untiered = format!("libGLES_atl: readback_frames=8\n{mmap}");
+        let untiered = format!("libEGL_atl: readback_frames=8\n{mmap}");
         assert!(!Verdict::of(&untiered).ok_in(&untiered));
     }
 }

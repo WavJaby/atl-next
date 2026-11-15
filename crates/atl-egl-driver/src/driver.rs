@@ -58,6 +58,11 @@ host_table!(
         eglSwapBuffers,
         eglSwapInterval,
         eglCreateImageKHR,
+        eglCreateContext,
+        eglDestroyContext,
+        eglQueryContext,
+        eglGetCurrentContext,
+        eglGetCurrentSurface,
     }
 );
 
@@ -213,7 +218,7 @@ pub fn get() -> Option<&'static Driver> {
                 // the process's stderr is its log (atl-broker); without this line every egl* call would just fail
                 #[allow(clippy::print_stderr, reason = "one line, once per process")]
                 {
-                    eprintln!("libGLES_atl: no host EGL device: {err:#}");
+                    eprintln!("libEGL_atl: no host EGL device: {err:#}");
                 }
                 None
             }
@@ -236,7 +241,7 @@ impl Driver {
             reason = "one line, once per process: which tier ran"
         )]
         {
-            eprintln!("libGLES_atl: window tier {tier}");
+            eprintln!("libEGL_atl: window tier {tier}");
         }
         let egl = HostEgl::resolve(&host)?;
         let gl = HostGl::resolve(&host)?;
@@ -280,7 +285,7 @@ impl Driver {
         };
         #[allow(clippy::print_stderr, reason = "one line, once per process")]
         {
-            eprintln!("libGLES_atl: device {} GL_RENDERER {renderer}", self.device);
+            eprintln!("libEGL_atl: device {} GL_RENDERER {renderer}", self.device);
         }
     }
 

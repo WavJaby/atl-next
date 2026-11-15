@@ -20,7 +20,7 @@ use crate::{
     UiError,
 };
 
-/// The module's file name, found by the dynamic loader's search path (the runtime library dir the process's `LD_LIBRARY_PATH` names, as for `libGLES_atl.so`).
+/// The module's file name, found by the dynamic loader's search path (the runtime library dir the process's `LD_LIBRARY_PATH` names, as for the GL driver).
 pub const MODULE_FILE: &str = "libatl_platform_ui_linux.so";
 
 /// The module's one exported symbol, an [`Entry`].

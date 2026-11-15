@@ -282,6 +282,7 @@ name = "atl-egl-driver"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "atl-android-paths",
  "atl-bridgegen",
  "atl-egl-host",
  "atl-gralloc",

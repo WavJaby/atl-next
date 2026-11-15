@@ -13,7 +13,7 @@ pub const SELECTION_PKGS: &str = "angle_gl_driver_selection_pkgs";
 pub const SELECTION_VALUES: &str = "angle_gl_driver_selection_values";
 /// AOSP's value for ANGLE (GraphicsEnvironment ANGLE_GL_DRIVER_CHOICE_ANGLE).
 const ANGLE_VALUE: &str = "angle";
-/// The library whose DT_NEEDED selects ANGLE: ES1 is served by ANGLE only, our driver has no ES1.
+/// The library whose DT_NEEDED selects ANGLE (per-process routing, retired by gl-honesty H3; the driver serves ES1 contexts itself on embedded ANGLE since H2a).
 pub const ES1_LIB: &str = "libGLESv1_CM.so";
 
 /// The driver an app process loads as its native EGL.

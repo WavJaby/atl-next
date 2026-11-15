@@ -23,14 +23,14 @@ Patch-Reason: a native context is current on one thread at a time:
  likely holder). A loader or environment switch cannot pick the
  renderer: the app's attribute does it, and ANGLE has no feature flag
  for a default. The driver-side alternative (per-thread host contexts
- in libGLES_atl) is a new mechanism in our layer.
+ in libEGL_atl) is a new mechanism in our layer.
 ---
 SPDX-License-Identifier: BSD-3-Clause
  src/libANGLE/renderer/gl/egl/DisplayEGL.cpp | 17 +++++++++++++----
  1 file changed, 13 insertions(+), 4 deletions(-)
 
 diff --git a/src/libANGLE/renderer/gl/egl/DisplayEGL.cpp b/src/libANGLE/renderer/gl/egl/DisplayEGL.cpp
-index 732b7c92cea6f1a0896eea40ec093e09264877b9..ef3cb4ad13accc5591d0879e9dbe8399f02d70e8 100644
+index bd4d69860a2c19d70bf1b84fdadc9c591ac6daf5..c6d154a718ceb1ef30b1b93eaa4d05a63e4a67ec 100644
 --- a/src/libANGLE/renderer/gl/egl/DisplayEGL.cpp
 +++ b/src/libANGLE/renderer/gl/egl/DisplayEGL.cpp
 @@ -498,7 +498,10 @@ ContextImpl *DisplayEGL::createContext(const gl::State &state,

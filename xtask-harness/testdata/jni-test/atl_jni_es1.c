@@ -26,7 +26,7 @@ JNI_FN(jint, es1Version)(JNIEnv *env, jclass cls)
     return strncmp(v, "OpenGL ES 1.", 12) == 0 && strstr(v, "ANGLE") != NULL;
 }
 
-// 1 when /proc/self/maps names ANGLE's GL backend libGLESv2_angle.so and our driver libGLES_atl.so (the ES1 context runs through ANGLE over the driver), 0 when not, -1 when unreadable.
+// 1 when /proc/self/maps names ANGLE's GL backend libGLESv2_angle.so and our driver libEGL_atl.so (the ES1 context runs through ANGLE over the driver), 0 when not, -1 when unreadable.
 JNI_FN(jint, es1Driver)(JNIEnv *env, jclass cls)
 {
     FILE *f = fopen("/proc/self/maps", "re");
@@ -36,7 +36,7 @@ JNI_FN(jint, es1Driver)(JNIEnv *env, jclass cls)
     jint angle = 0, driver = 0;
     while (fgets(line, sizeof line, f) != NULL) {
         angle |= strstr(line, "libGLESv2_angle.so") != NULL;
-        driver |= strstr(line, "libGLES_atl.so") != NULL;
+        driver |= strstr(line, "libEGL_atl.so") != NULL;
     }
     fclose(f);
     return angle && driver;

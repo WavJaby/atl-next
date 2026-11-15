@@ -30,6 +30,11 @@ pub fn current() -> Option<(usize, usize)> {
     CURRENT.with(Cell::get)
 }
 
+/// This thread's (current, FBO) pair, for [`set_current`] to put back (es1.rs: ANGLE's display init makes its own context current through the driver's eglMakeCurrent).
+pub fn state() -> (Option<(usize, usize)>, u32) {
+    (current(), fbo())
+}
+
 /// The surface FBO now standing for framebuffer 0 (after a swap bound the next buffer).
 pub fn set_fbo(fbo: u32) {
     FBO.with(|f| f.set(fbo));

@@ -1,29 +1,67 @@
 // SPDX-License-Identifier: MIT
-//! Generates with atl-bridgegen (bridge controls 1 and 2) `OUT_DIR/window.rs`: libnativewindow's `ANativeWindow` / `ANativeWindowBuffer` / `native_handle_t` records with clang's layout asserted.
+//! Generates with atl-bridgegen (bridge controls 1 and 2) `OUT_DIR/window.rs`: libnativewindow's `ANativeWindow` / `ANativeWindowBuffer` / `native_handle_t` records with clang's layout asserted; `OUT_DIR/angle.rs`: ANGLE's EGL entries and external-context constants (eglext_angle.h).
 //! The EGL / GLES ABI is atl-egl-host's (one typing of every entry, its build.rs); this crate adds only the window side.
 
 use atl_bridgegen::buildscript::{HeaderImport, import_headers};
 
-const IMPORTS: &[HeaderImport] = &[HeaderImport {
-    name: "window",
-    source: "frameworks/native/libs/nativewindow/include/system/window.h",
-    also: &[
-        "frameworks/native/libs/nativebase/include/nativebase/nativebase.h",
-        "system/core/libcutils/include/cutils/native_handle.h",
-    ],
-    include_dirs: &[
-        "frameworks/native/libs/nativewindow/include",
-        "frameworks/native/libs/nativebase/include",
-        "frameworks/native/libs/arect/include",
-        "system/core/libcutils/include",
-        "system/core/libsystem/include",
-    ],
-    defines: &[],
-    force_include: None,
-    functions: &[],
-    types: &["ANativeWindow", "ANativeWindowBuffer_t", "native_handle_t"],
-    macros: &["ANDROID_NATIVE_WINDOW_MAGIC", "ANDROID_NATIVE_BUFFER_MAGIC"],
-}];
+const IMPORTS: &[HeaderImport] = &[
+    // ANGLE's EGL as the ES1 context kind calls it (es1.rs): its own headers, so the external-context entries and attributes are typed from the library they belong to
+    HeaderImport {
+        name: "angle",
+        // ANGLE's eglext.h includes eglext_angle.h at its end
+        source: "external/angle/include/EGL/eglext.h",
+        also: &[
+            "external/angle/include/EGL/egl.h",
+            "external/angle/include/EGL/eglext_angle.h",
+        ],
+        include_dirs: &["external/angle/include"],
+        defines: &["EGL_EGLEXT_PROTOTYPES"],
+        force_include: Some("EGL/egl.h"),
+        functions: &[
+            "eglGetProcAddress",
+            "eglGetError",
+            "eglGetPlatformDisplay",
+            "eglInitialize",
+            "eglChooseConfig",
+            "eglCreateContext",
+            "eglDestroyContext",
+            "eglCreatePbufferFromClientBuffer",
+            "eglDestroySurface",
+            "eglMakeCurrent",
+            "eglAcquireExternalContextANGLE",
+            "eglReleaseExternalContextANGLE",
+        ],
+        types: &[],
+        macros: &[
+            "EGL_PLATFORM_ANGLE_ANGLE",
+            "EGL_PLATFORM_ANGLE_TYPE_ANGLE",
+            "EGL_PLATFORM_ANGLE_TYPE_OPENGLES_ANGLE",
+            "EGL_PLATFORM_ANGLE_EGL_HANDLE_ANGLE",
+            "EGL_EXTERNAL_CONTEXT_ANGLE",
+            "EGL_EXTERNAL_SURFACE_ANGLE",
+        ],
+    },
+    HeaderImport {
+        name: "window",
+        source: "frameworks/native/libs/nativewindow/include/system/window.h",
+        also: &[
+            "frameworks/native/libs/nativebase/include/nativebase/nativebase.h",
+            "system/core/libcutils/include/cutils/native_handle.h",
+        ],
+        include_dirs: &[
+            "frameworks/native/libs/nativewindow/include",
+            "frameworks/native/libs/nativebase/include",
+            "frameworks/native/libs/arect/include",
+            "system/core/libcutils/include",
+            "system/core/libsystem/include",
+        ],
+        defines: &[],
+        force_include: None,
+        functions: &[],
+        types: &["ANativeWindow", "ANativeWindowBuffer_t", "native_handle_t"],
+        macros: &["ANDROID_NATIVE_WINDOW_MAGIC", "ANDROID_NATIVE_BUFFER_MAGIC"],
+    },
+];
 
 /// `ATL_EGL_BREAK=<name>[,<name>]` selects [`BREAKS`] (atl-native-bridge's pattern). Read here, so the cfg reaches this package only; the run that stages the driver sets it (`xtask test app`).
 const BREAK_ENV: &str = "ATL_EGL_BREAK";

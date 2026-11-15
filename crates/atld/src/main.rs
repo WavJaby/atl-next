@@ -242,7 +242,7 @@ struct Args {
     /// Test only: apps start with `--no-media-player-service` (their launcher serves no media.player), the deliberate break of the media player gate.
     #[arg(long)]
     no_media_player_service: bool,
-    /// Test only: every package installs with the native GL driver (no owner row, no ES1 rule), the GL selection gate's break.
+    /// Test only: every package installs with the native GL driver (no owner row, no ES1 rule): the routing-keys-empty run (app / run-apk gates) until gl-honesty H3 deletes the selection.
     #[arg(long)]
     no_gl_selection: bool,
     /// Test only: apps start with `--break-mix` (their AudioFlinger's mixer plays silence), the audio gate's third break.

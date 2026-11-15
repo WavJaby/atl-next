@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test gl`: GLES on the real driver in an app process -- AOSP's libEGL / libGLESv2 fronts (slow binding, patches 0009 + 0010) over `libGLES_atl.so` (the host's system EGL), placed as for an app (`Runtime::with_gl_driver`).
+//! `xtask test gl`: GLES on the real driver in an app process -- AOSP's libEGL / libGLESv2 fronts (slow binding, patches 0009 + 0010) over `libEGL_atl.so` (the host's system EGL), placed as for an app (`Runtime::with_gl_driver`).
 //! The fixture (xtask-harness/testdata/gl-probe) runs as a plain app process (`--run-class`): Probe.java makes a GLES3 pbuffer with the framework's EGL14 / GLES20, clears it, reads it back;
 //! its JNI library (jni/, a cargo package of its own for `unsafe`, placed as [`LIB`] in /system's library dir) calls [`EXTENSION`] through eglGetProcAddress.
 //! 0. elf: the driver has no undefined gl*/egl* dynamic symbol or a dynamic relocation naming one -- such a reference would bind to AOSP's fronts, which call back into the driver (recursion).
@@ -540,7 +540,7 @@ fn judge_extension(lines: &[String]) -> Result<String, String> {
     if name != EXTENSION || v != g || g <= 0 {
         return Err(format!("{name} wrote {v}, glGetIntegerv gives {g}"));
     }
-    // libGLES_atl passes non-own names to the host's eglGetProcAddress: the address is the host GL's, never an AOSP front's or the driver's own
+    // libEGL_atl passes non-own names to the host's eglGetProcAddress: the address is the host GL's, never an AOSP front's or the driver's own
     let in_android = |root: &str| Path::new(file).starts_with(root);
     if in_android(atl_android_paths::SYSTEM) || in_android(atl_android_paths::VENDOR) {
         return Err(format!(
@@ -722,7 +722,7 @@ mod tests {
         let ok = "ext glGetInteger64vEXT 16384 glGetIntegerv 16384 from /usr/lib/x86_64-linux-gnu/libGLdispatch.so.0";
         assert!(judge_extension(&lines(&[ok])).is_ok());
         assert!(judge_extension(&lines(&["ext glGetInteger64vEXT -1 glGetIntegerv 16384 from /usr/lib/x86_64-linux-gnu/libGLdispatch.so.0"])).is_err());
-        assert!(judge_extension(&lines(&["ext glGetInteger64vEXT 16384 glGetIntegerv 16384 from /vendor/lib64/egl/libGLES_atl.so"])).is_err());
+        assert!(judge_extension(&lines(&["ext glGetInteger64vEXT 16384 glGetIntegerv 16384 from /vendor/lib64/egl/libEGL_atl.so"])).is_err());
         assert!(
             judge_extension(&lines(&[
                 "ext glGetInteger64vEXT 16384 glGetIntegerv 16384 from /system/lib64/libEGL.so"

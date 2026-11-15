@@ -59,6 +59,9 @@ pub struct Args {
     /// Deliberate-failure check: apps run without the app seccomp filter (atl-broker seccomp.rs). Without the filter the app's queued-work looper dies with SecurityException.
     #[arg(long)]
     no_app_seccomp: bool,
+    /// The package installs with the native GL driver (atld `--no-gl-selection`: no owner row, no ES1 rule, routing keys empty): an ES1 app's contexts then run on the driver's embedded ANGLE (gl-honesty H2a gate) instead of a routed ANGLE. Until H3 deletes the selection.
+    #[arg(long)]
+    no_gl_selection: bool,
     /// Deliberate-failure check: every device ABI maps to the host ISA (atld_run `with_broken_instruction_set`), so a foreign-ABI app gets the host ISA from the broker and its bridge runs identity.
     #[arg(long)]
     break_isa: bool,
@@ -150,6 +153,7 @@ impl Args {
             log_tags: "*:i".to_owned(),
             verbose: false,
             no_app_seccomp: false,
+            no_gl_selection: false,
             break_isa: false,
             break_render_path: false,
             pointer: None,
@@ -308,6 +312,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         log_tags: "*:i".to_owned(),
         verbose: false,
         no_app_seccomp: false,
+        no_gl_selection: false,
         break_isa: false,
         break_render_path: false,
         pointer: a.pointer.clone(),
@@ -530,6 +535,11 @@ fn runtime(
                 .with_qemu_engine(root, &a.isa)?
         }
         None => rt,
+    };
+    let rt = if args.no_gl_selection {
+        rt.without_gl_selection()
+    } else {
+        rt
     };
     let rt = if args.no_app_seccomp {
         rt.without_app_seccomp()
@@ -776,7 +786,7 @@ fn render_path_check(atld_log: &str, app: &str) -> Result<String, String> {
     let tier = app
         .lines()
         .rev()
-        .find_map(|l| l.split_once("libGLES_atl: buffer tier ").map(|(_, t)| t))
+        .find_map(|l| l.split_once("libEGL_atl: buffer tier ").map(|(_, t)| t))
         .unwrap_or("not logged");
     let offered_not_taken = path.starts_with("baseline (")
         && !path.starts_with("baseline (no kernel render path offered");
@@ -1084,7 +1094,7 @@ mod tests {
     /// Lines as atld prints them (atld main.rs `run`): a GPU desktop, its display tier, the trial tier, and WSLg's vgem-only devices.
     #[test]
     fn render_path_check_reds_an_offer_not_taken() {
-        let app = "libGLES_atl: buffer tier readback (x)\n";
+        let app = "libEGL_atl: buffer tier readback (x)\n";
         let taken = "atld: gpu-render: path dxgkrnl (renderer D3D12 (GPU), OpenGL ES 3.1 Mesa)\n";
         assert!(
             render_path_check(taken, app)

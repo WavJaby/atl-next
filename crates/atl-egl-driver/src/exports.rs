@@ -9,9 +9,9 @@ use atl_gralloc::handle::{FD_DMABUF, Params};
 
 use crate::abi::egl as e;
 use crate::driver::{self, Driver, set_error, take_error};
-use crate::fbo0;
 use crate::surface::{self, WindowSurface};
 use crate::window::{Buffer, Window};
+use crate::{es1, fbo0};
 
 const _: e::eglGetProcAddress = eglGetProcAddress;
 const _: e::eglGetError = eglGetError;
@@ -30,6 +30,9 @@ const _: e::eglSwapBuffers = eglSwapBuffers;
 const _: e::eglSwapBuffersWithDamageKHR = eglSwapBuffersWithDamageKHR;
 const _: e::eglSwapInterval = eglSwapInterval;
 const _: e::eglCreateImageKHR = eglCreateImageKHR;
+const _: e::eglCreateContext = eglCreateContext;
+const _: e::eglDestroyContext = eglDestroyContext;
+const _: e::eglQueryContext = eglQueryContext;
 
 type Proc = Option<unsafe extern "C" fn()>;
 
@@ -84,6 +87,9 @@ pub unsafe extern "C" fn eglGetProcAddress(name: *const c_char) -> Proc {
         b"eglSwapBuffersWithDamageKHR" => Some(eglSwapBuffersWithDamageKHR as *const ()),
         b"eglSwapInterval" => Some(eglSwapInterval as *const ()),
         b"eglCreateImageKHR" => Some(eglCreateImageKHR as *const ()),
+        b"eglCreateContext" => Some(eglCreateContext as *const ()),
+        b"eglDestroyContext" => Some(eglDestroyContext as *const ()),
+        b"eglQueryContext" => Some(eglQueryContext as *const ()),
         _ => fbo0::wrapper(b),
     };
     if let Some(f) = ours {
@@ -269,6 +275,10 @@ pub unsafe extern "C" fn eglChooseConfig(
                 };
                 host_attribs.extend([k, v]);
             }
+            // ES1 renders on any config that renders ES2 (es1.rs: the carrier is an ES2/3 context of it), so the host is asked for ES2 in its place
+            e::EGL_RENDERABLE_TYPE if v != e::EGL_DONT_CARE && v & e::EGL_OPENGL_ES_BIT != 0 => {
+                host_attribs.extend([k, (v & !e::EGL_OPENGL_ES_BIT) | e::EGL_OPENGL_ES2_BIT]);
+            }
             _ => host_attribs.extend([k, v]),
         }
     }
@@ -337,6 +347,12 @@ pub unsafe extern "C" fn eglGetConfigAttrib(
         e::EGL_SURFACE_TYPE => match d.host_attrib(config, attr) {
             Some(st) if window => st | e::EGL_WINDOW_BIT,
             Some(st) => st,
+            None => return fail(e::EGL_BAD_CONFIG, 0),
+        },
+        // every ES2 config renders ES1 too (es1.rs); one that renders no ES2 renders no ES1 here, whatever the host says (WSL Mesa sets the bit, then refuses ES1 contexts)
+        e::EGL_RENDERABLE_TYPE => match d.host_attrib(config, attr) {
+            Some(rt) if rt & e::EGL_OPENGL_ES2_BIT != 0 => rt | e::EGL_OPENGL_ES_BIT,
+            Some(rt) => rt & !e::EGL_OPENGL_ES_BIT,
             None => return fail(e::EGL_BAD_CONFIG, 0),
         },
         // SAFETY: the host entry with the caller's arguments.
@@ -479,6 +495,50 @@ pub unsafe extern "C" fn eglMakeCurrent(
     let Some(d) = driver_for(dpy) else {
         return fail(e::EGL_BAD_DISPLAY, 0);
     };
+    // an ES1 context current on this thread leaves ANGLE first; an ES1 target binds its carrier, then enters ANGLE (es1.rs frame sequence)
+    es1::leave_current();
+    let Some(c) = es1::lookup(ctx) else {
+        // SAFETY: the caller's arguments.
+        return unsafe { make_current_native(d, dpy, draw, read, ctx) };
+    };
+    // SAFETY: the caller's surfaces with the ES1 context's carrier.
+    if unsafe { make_current_native(d, dpy, draw, read, c.carrier) } == 0 {
+        return 0;
+    }
+    match c.enter(surface_size(d, draw)) {
+        Ok(()) => e::EGL_TRUE as u32,
+        Err(err) => fail(err, 0),
+    }
+}
+
+/// The size of a draw surface: the driver's window surface's, a host surface's, 1x1 when surfaceless.
+fn surface_size(d: &Driver, draw: e::EGLSurface) -> (i32, i32) {
+    if let Some(s) = d.surface(draw) {
+        return s.lock().map_or((1, 1), |s| (s.width, s.height));
+    }
+    if draw.is_null() {
+        return (1, 1);
+    }
+    let (mut w, mut h) = (1, 1);
+    // SAFETY: the host's surface, valid out-pointers.
+    unsafe {
+        (d.egl.eglQuerySurface)(d.display.raw(), draw, e::EGL_WIDTH, &mut w);
+        (d.egl.eglQuerySurface)(d.display.raw(), draw, e::EGL_HEIGHT, &mut h);
+    }
+    (w, h)
+}
+
+/// eglMakeCurrent of a host context: the driver's window surfaces through their FBO, everything else the host's.
+///
+/// # Safety
+/// eglMakeCurrent's contract for the arguments.
+unsafe fn make_current_native(
+    d: &'static Driver,
+    dpy: e::EGLDisplay,
+    draw: e::EGLSurface,
+    read: e::EGLSurface,
+    ctx: e::EGLContext,
+) -> u32 {
     let (ds, rs) = (d.surface(draw), d.surface(read));
     if ds.is_none() && rs.is_none() {
         // SAFETY: none of ours: the host's surfaces (or none).
@@ -547,12 +607,70 @@ pub unsafe extern "C" fn eglSwapBuffers(dpy: e::EGLDisplay, s: e::EGLSurface) ->
     let Ok(mut s) = surface.lock() else {
         return fail(e::EGL_BAD_SURFACE, 0);
     };
-    match s.swap(d, ctx) {
+    // an ES1 context hands the native state back to the carrier for the swap (es1.rs frame sequence)
+    match es1::around_swap(|| s.swap(d, ctx)) {
         Ok(fbo) => {
             fbo0::set_fbo(fbo);
             e::EGL_TRUE as u32
         }
         Err(err) => fail(err, 0),
+    }
+}
+
+/// Client version 1 (EGL's default) is an ES1 context ([`es1::create`]); 2 and 3 are the host's. A share context across the two kinds is refused (es1.rs).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn eglCreateContext(
+    dpy: e::EGLDisplay,
+    config: e::EGLConfig,
+    share: e::EGLContext,
+    attribs: *const i32,
+) -> e::EGLContext {
+    let Some(d) = driver_for(dpy) else {
+        return fail(e::EGL_BAD_DISPLAY, std::ptr::null_mut());
+    };
+    // SAFETY: a non-null list is NONE-terminated (EGL's contract).
+    let pairs = unsafe { attrib_pairs(attribs) };
+    // EGL_CONTEXT_MAJOR_VERSION (EGL 1.5) is the same attribute as EGL_CONTEXT_CLIENT_VERSION; 1 when absent (EGL 1.5 §3.7.1.1, egl_platform_entries.cpp GLESv1_INDEX)
+    let version = pairs
+        .iter()
+        .find(|&&(k, _)| k == e::EGL_CONTEXT_CLIENT_VERSION)
+        .map_or(1, |&(_, v)| v);
+    if version == 1 {
+        return es1::create(d, config, share);
+    }
+    if es1::lookup(share).is_some() {
+        return es1::refuse_share("an ES2/3 context with ES1: the two engines share no objects");
+    }
+    // SAFETY: the host entry with the caller's arguments.
+    unsafe { (d.egl.eglCreateContext)(dpy, config, share, attribs) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn eglDestroyContext(dpy: e::EGLDisplay, ctx: e::EGLContext) -> u32 {
+    let Some(d) = driver_for(dpy) else {
+        return fail(e::EGL_BAD_DISPLAY, 0);
+    };
+    match es1::destroy(ctx) {
+        Some(ok) => ok,
+        // SAFETY: not ours: the host's context.
+        None => unsafe { (d.egl.eglDestroyContext)(dpy, ctx) },
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn eglQueryContext(
+    dpy: e::EGLDisplay,
+    ctx: e::EGLContext,
+    attr: i32,
+    value: *mut i32,
+) -> u32 {
+    let Some(d) = driver_for(dpy) else {
+        return fail(e::EGL_BAD_DISPLAY, 0);
+    };
+    match es1::query(d, ctx, attr, value) {
+        Some(ok) => ok,
+        // SAFETY: not ours: the host's context, the caller's arguments.
+        None => unsafe { (d.egl.eglQueryContext)(dpy, ctx, attr, value) },
     }
 }
 

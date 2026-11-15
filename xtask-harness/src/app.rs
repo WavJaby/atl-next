@@ -65,7 +65,7 @@ pub struct Args {
     /// The media player break: the app starts with `--no-media-player-service` (atld, then the launcher), so the view answers no media.player; the probe's lookup is never answered and its line reads "no answer", so the gate must go red.
     #[arg(long)]
     media_player_break: bool,
-    /// The GL selection break: packages install with the native GL driver (atld `--no-gl-selection`), so the ES1 scene's EGL10 context cannot be made and the es1 lines must go red.
+    /// The GL selection run: packages install with the native GL driver (atld `--no-gl-selection`, routing keys empty). Before gl-honesty H2a this was a break (no ES1 context); now the driver serves ES1 contexts itself, so the es1 lines must stay green. H3 deletes the selection and this flag.
     #[arg(long)]
     gl_selection_break: bool,
     /// The result break: the services owe no start its result (atld `--no-activity-result`), so Main's startActivityForResult answers never arrive and the result lines must go red.
@@ -655,7 +655,7 @@ const BRIDGE1_CALLS: &[(&str, &str)] = &[
     ("propCallbacks", "11"),
     // GLES2 through the GL proxies: 64x64 pixels that equal the scene's geometry (jni-test atl_jni_test.c glesPbuffer)
     ("glesPbuffer", "4096"),
-    // after glesPbuffer, the process maps libGLES_atl.so (a /proc/self/maps line naming it): the proxies reached the driver, not a stand-in
+    // after glesPbuffer, the process maps libEGL_atl.so (a /proc/self/maps line naming it): the proxies reached the driver, not a stand-in
     ("driverMapped", "1"),
     // S3 guest ES1 (plan gs3 S3): es1Begin makes an EGL10 pbuffer and ES1 context on this thread, as Happy Jump's GLSurfaceView does; es1Pixels is 1 when the scene ran with no GL error, and its rows are judged by es1_pixels
     ("es1Begin", "true"),

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test egl-driver`: the GLES driver over the host's system EGL (crate atl-egl-driver, `libGLES_atl.so`) rendering into an ANativeWindow, every pixel checked, orientation included (atl-egl-driver-probe's module doc has the scenario and the judge).
+//! `xtask test egl-driver`: the GLES driver over the host's system EGL (crate atl-egl-driver, `libEGL_atl.so`) rendering into an ANativeWindow, every pixel checked, orientation included (atl-egl-driver-probe's module doc has the scenario and the judge).
 //! Runs on this host's own EGL: llvmpipe on WSL, the GPU of gralloc's node on a desktop. No native build and no build dir: the driver and the probe are plain cargo outputs (in --out).
 //! Two runs, one per orientation tier (driver.rs `Orientation`): the driver as built for this host (its probe picks the tier, logged), then built with `ATL_EGL_TIER=blit` (the baseline, forced through the probe's input). Both must pass.
 //! Breaks, each must fail: `fbo0` on both (framebuffer entries from the host, not the driver: framebuffer 0 is not the window); on a FlipY run `flip-y` (the surface FBO's flip-y undone: the frame stored upside down); on a Blit run the driver break `no_blit_flip` (the swap's copy not inverted); once, the driver break `no_device_check` (a buffer whose handle names another DRM device is imported).
 //! Destination tier (driver.rs `Destination`): those runs must log `buffer tier import` (this host's renderer imports gralloc's buffers). With `--render-env` (a renderer that cannot import, chosen environment-side) two more runs, host and blit builds, must log `buffer tier readback` and pass every pixel; breaks `no_readback` (each) and `force_import` (once) must fail.
-//! On another host: copy `<out>/<host|blit>/egl/libGLES_atl.so` and the probe (`<out>/cargo/release/atl-egl-driver-probe`) and run `atl-egl-driver-probe --driver libGLES_atl.so [--break flip-y|fbo0]`; the probe links no workspace library dynamically.
+//! On another host: copy `<out>/<host|blit>/egl/libEGL_atl.so` and the probe (`<out>/cargo/release/atl-egl-driver-probe`) and run `atl-egl-driver-probe --driver libEGL_atl.so [--break flip-y|fbo0]`; the probe links no workspace library dynamically.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -177,42 +177,44 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 const TIER_ENV: &str = "ATL_EGL_TIER";
 const BREAK_ENV: &str = "ATL_EGL_BREAK";
 /// The driver's one stderr line naming the tier that ran (driver.rs `Driver::load`).
-const TIER_LINE: &str = "libGLES_atl: window tier ";
+const TIER_LINE: &str = "libEGL_atl: window tier ";
 /// The driver's line naming the destination tier its first-buffer probe chose (surface.rs `probe_destination`).
-const BUFFER_TIER_LINE: &str = "libGLES_atl: buffer tier ";
+const BUFFER_TIER_LINE: &str = "libEGL_atl: buffer tier ";
 /// The driver's line naming the device and `GL_RENDERER` (driver.rs `log_renderer_once`).
-const RENDERER_LINE: &str = "libGLES_atl: device ";
+const RENDERER_LINE: &str = "libEGL_atl: device ";
 /// The probe's failure when the destination probe is skipped on a renderer that cannot import: the first make-current fails EGL_BAD_ALLOC (0x3003), named, not a hang.
 const FORCED_IMPORT_RED: &str = "EGL error 0x3003";
 const ORIENTATION_RED: &str = "orientation red";
 /// The probe's failure when the driver imports a buffer naming another DRM device (atl-egl-driver-probe `wrong_device`).
 const WRONG_DEVICE_RED: &str = "wrong-device import accepted";
 
-/// The value of `ro.hardware.egl` that selects the driver: Loader.cpp opens `libGLES_<value>.so` in the driver dir.
+/// The value of `ro.hardware.egl` that selects the driver: Loader.cpp opens `lib{EGL,GLESv1_CM,GLESv2}_<value>.so` in the driver dir (atl_android_paths `GL_DRIVER_*`).
 const HARDWARE: &str = "atl";
 
-/// The app process's GL driver, built and placed as the runtime root holds it: (host file, Android path) pairs -- `libGLES_atl.so` in /vendor's egl dir and a /vendor/build.prop with `ro.hardware.egl` (`<out>/egl`).
+/// The app process's GL driver, built and placed as the runtime root holds it: (host file, Android path) pairs -- the driver in /vendor's egl dir as `libEGL_atl.so` and `libGLESv2_atl.so` (one host file: the dynamic loader maps it once, by inode) and a /vendor/build.prop with `ro.hardware.egl` (`<out>/egl`).
+/// The ES1 library (ANGLE's, `libGLESv1_CM_atl.so`) is placed with the ANGLE fronts (atld_run.rs `with_gl_driver`).
 /// It links only system libraries (the host's libEGL is dlopened by atl-egl-host), so no library dir joins the path.
 pub fn placement(root: &Path, out: &Path) -> Result<Vec<(PathBuf, String)>> {
     let dir = crate::cdylib::stage(root, out, DRIVER_PACKAGE, "egl", atl_egl_driver_name())?;
     let prop = dir.join("vendor-build.prop");
     std::fs::write(&prop, format!("ro.hardware.egl={HARDWARE}\n"))?;
+    let vendor = |name: &str| format!("{}/{name}", atl_android_paths::VENDOR_EGL);
     Ok(vec![
         (
             dir.join(atl_egl_driver_name()),
-            format!(
-                "{}/{}",
-                atl_android_paths::VENDOR_EGL,
-                atl_egl_driver_name()
-            ),
+            vendor(atl_android_paths::GL_DRIVER_EGL),
+        ),
+        (
+            dir.join(atl_egl_driver_name()),
+            vendor(atl_android_paths::GL_DRIVER_GLES2),
         ),
         (prop, atl_android_paths::VENDOR_BUILD_PROP.to_owned()),
     ])
 }
 
-/// The file name AOSP's loader opens for `ro.hardware.egl=atl` (Loader.cpp `libGLES_<name>.so`).
+/// The driver's file name: the EGL library AOSP's loader opens for `ro.hardware.egl=atl`.
 pub fn atl_egl_driver_name() -> &'static str {
-    "libGLES_atl.so"
+    atl_android_paths::GL_DRIVER_EGL
 }
 
 fn build_probe(root: &Path, target: &Path) -> Result<PathBuf> {
