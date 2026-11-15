@@ -48,7 +48,7 @@ pub trait WebView {
     fn dom_storage_enabled(&self) -> bool;
 }
 
-/// What a view reports. Order within one load: `LoadStarted`, then `Title` / `Progress` as they come -- a title the page set is reported before its `LoadFinished` -- then `LoadFinished`.
+/// What a view reports. Within one load `LoadStarted` comes first; `Title` / `Progress` come as the engine notifies them, before or after `LoadFinished` (AOSP fixes no title order either).
 pub enum WebEvent {
     /// The main frame started loading `uri`.
     LoadStarted(String),

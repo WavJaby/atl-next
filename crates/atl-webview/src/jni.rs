@@ -451,7 +451,7 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProvid
     obj
 }
 
-/// One engine event on the UI thread, to the app's clients (Chromium's order: onPageStarted, title/progress as they come, onPageFinished).
+/// One engine event on the UI thread, to the app's clients in the engine's order (onPageStarted first; title/progress as they come).
 fn on_event(shared: &Shared, ev: WebEvent) {
     let Some(env) = env_now() else { return };
     if let WebEvent::Prompt { message, reply, .. } = ev {

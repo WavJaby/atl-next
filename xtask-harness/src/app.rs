@@ -368,12 +368,13 @@ const WEBVIEW_PACKAGE: (&str, &str) = (
 /// Where the run places the provider, as AOSP's product image does (media_product.mk `webview`): `<partition>/app/<module>/<module>.apk` (build/soong/java/app.go installPath).
 const WEBVIEW_PROVIDER: &str = "app/webview/webview.apk";
 /// Main.webViewPage's line (webview plan W2 gate): an unattached WebView loads Main.WEBVIEW_PAGE through loadData, then runs Main.WEBVIEW_SCRIPT at the first onPageFinished.
-/// `events`: AOSP's order -- onPageStarted, onReceivedTitle (the `<title>` arrives while the page loads), onPageFinished once. `js`: evaluateJavascript's JSON of the script's array (JSON.stringify form):
+/// `events`: the WebViewClient order -- onPageStarted, then onPageFinished once. `titles`: onReceivedTitle once with the page's `<title>`, in no fixed order with onPageFinished (AOSP fixes none:
+/// CTS WebChromeClientTest.testOnReceivedTitle polls for the title after the load completes; WebKit notifies it after LOAD_FINISHED for this data: page, W2 run w2-app5x). `js`: evaluateJavascript's JSON of the script's array (JSON.stringify form):
 /// `typeof atl.add` "function" (annotated, exposed), `atl.add(2, 3)` 5 and `atl.echo('hi')` "hi!" (the bridge round trip: Bridge.add / Bridge.echo), `typeof atl.hidden` "undefined"
 /// (no @JavascriptInterface: not callable, WebView.addJavascriptInterface doc for API >= 17), `document.title` "atl" (the page's title).
 const WEBVIEW_PAGE: (&str, &str) = (
     "AtlTest: webview-page: ",
-    r#"events=started,title,finished js=["function",5,"hi!","undefined","atl"]"#,
+    r#"events=started,finished, titles=atl, js=["function",5,"hi!","undefined","atl"]"#,
 );
 
 /// Lines the fixture logs after onCreate, from binder callbacks: (row, line prefix, expected value). The watch waits for all of them (up to RESULT_WAIT).

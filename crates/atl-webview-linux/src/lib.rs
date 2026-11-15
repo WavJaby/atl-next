@@ -190,8 +190,6 @@ unsafe extern "C" fn view_create(
                 ev.emit(web_event::LOAD_STARTED, &uri, "", 0, 0, None);
             }
             webkit6::LoadEvent::Finished => {
-                // the trait's order: a title the page set is reported before its finish (WebKit may notify `title` after LOAD_FINISHED, measured W2 for a data: page)
-                ev.title_changed(w);
                 ev.emit(web_event::LOAD_FINISHED, &uri, "", 0, 0, None);
             }
             _ => {}

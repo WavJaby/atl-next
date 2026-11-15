@@ -131,7 +131,7 @@ public class Main extends Activity {
         public String hidden() { return "reached"; }
     }
 
-    /** The page webViewPage loads: its title arrives during the load (onReceivedTitle before onPageFinished). */
+    /** The page webViewPage loads; its title reaches onReceivedTitle in no fixed order with onPageFinished (CTS WebChromeClientTest.testOnReceivedTitle polls for it after the load completes). */
     static final String WEBVIEW_PAGE = "<html><head><title>atl</title></head><body>page</body></html>";
 
     /** The script run after onPageFinished: the bridge round trip (number and string), the unannotated method's absence, the title. */
@@ -139,28 +139,44 @@ public class Main extends Activity {
 
     /**
      * The WebView page line (app.rs WEBVIEW_PAGE): an unattached WebView (no composition before W3) with JavaScript on and the Bridge as `atl` loads WEBVIEW_PAGE through loadData;
-     * `events=` the client callbacks in order (started, title, finished; progress left out) then, at the first onPageFinished, `js=` evaluateJavascript(WEBVIEW_SCRIPT)'s JSON;
-     * or `threw=` as webView().
+     * `events=` the WebViewClient callbacks in order (started, finished); `titles=` every onReceivedTitle; `js=` evaluateJavascript(WEBVIEW_SCRIPT)'s JSON, run at the first onPageFinished.
+     * Logged once both the script's result and a title have arrived (UI thread only: no locking); or `threw=` as webView().
      */
     private void webViewPage() {
         try {
             final StringBuilder events = new StringBuilder();
+            final StringBuilder titles = new StringBuilder();
+            final String[] js = new String[1];
+            final Runnable report = new Runnable() {
+                private boolean mLogged;
+                @Override public void run() {
+                    if (mLogged || js[0] == null || titles.length() == 0) return;
+                    mLogged = true;
+                    Log.i("AtlTest", "webview-page: events=" + events + " titles=" + titles + " js=" + js[0]);
+                }
+            };
             android.webkit.WebView w = new android.webkit.WebView(this);
             w.getSettings().setJavaScriptEnabled(true);
             w.addJavascriptInterface(new Bridge(), "atl");
             w.setWebChromeClient(new android.webkit.WebChromeClient() {
-                @Override public void onReceivedTitle(android.webkit.WebView view, String title) { events.append("title,"); }
+                @Override public void onReceivedTitle(android.webkit.WebView view, String title) {
+                    titles.append(title).append(',');
+                    report.run();
+                }
             });
             w.setWebViewClient(new android.webkit.WebViewClient() {
                 private boolean mDone;
                 @Override public void onPageStarted(android.webkit.WebView view, String url, android.graphics.Bitmap favicon) { events.append("started,"); }
                 @Override public void onPageFinished(android.webkit.WebView view, String url) {
-                    events.append("finished");
+                    events.append("finished,");
                     if (mDone) return;
                     mDone = true;
                     // an anonymous class: the fixture's javac has no LambdaMetafactory on its boot classpath
                     view.evaluateJavascript(WEBVIEW_SCRIPT, new android.webkit.ValueCallback<String>() {
-                        @Override public void onReceiveValue(String v) { Log.i("AtlTest", "webview-page: events=" + events + " js=" + v); }
+                        @Override public void onReceiveValue(String v) {
+                            js[0] = v;
+                            report.run();
+                        }
                     });
                 }
             });
