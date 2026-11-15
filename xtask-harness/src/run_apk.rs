@@ -821,7 +821,14 @@ fn finish(
     for line in std::fs::read_to_string(atld_log)
         .unwrap_or_default()
         .lines()
-        .filter(|l| l.contains(" ended: ") || is_summary_line(l))
+        .filter(|l| l.contains(" ended: ") || l.starts_with("atld: log ") || is_summary_line(l))
+    {
+        println!("run-apk: {line}");
+    }
+    // the GL driver of each app process and its rule (atl-services activity attach)
+    for line in services
+        .lines()
+        .filter(|l| l.starts_with("services: gl-driver "))
     {
         println!("run-apk: {line}");
     }

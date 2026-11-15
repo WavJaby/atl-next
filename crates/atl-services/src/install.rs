@@ -57,11 +57,19 @@ pub fn install(
             .with_context(|| format!("session {session}: no ApplicationInfo"))
             .and_then(staged_names)
             .with_context(|| format!("session {session}"))?;
-        let needs_es1 = control
+        let es1_library = control
             .commit(session, &parsed.name, uid, names)
             .with_context(|| format!("committing {}", parsed.name))?;
         let code_dir = format!("{DATA_APP}/{}", parsed.name);
-        records.push(parsed.record(uid, &code_dir, true, (0, 0), needs_es1, &owner, c));
+        records.push(parsed.record(
+            uid,
+            &code_dir,
+            true,
+            (0, 0),
+            es1_library.as_deref(),
+            &owner,
+            c,
+        ));
     }
     Ok(records)
 }
@@ -113,7 +121,7 @@ pub fn scan(
             None => ids.acquire(),
         }
         .context("no application id left")?;
-        let needs_es1 = control
+        let es1_library = control
             .scan_commit(&dir, &parsed.name, uid)
             .with_context(|| format!("committing scanned {}", parsed.name))?;
         records.push(parsed.record(
@@ -121,7 +129,7 @@ pub fn scan(
             &dir,
             false,
             (d.flags, d.private_flags),
-            needs_es1,
+            es1_library.as_deref(),
             &owner,
             c,
         ));
@@ -162,7 +170,7 @@ impl Parsed {
         code_dir: &str,
         uniform_names: bool,
         (flags, private_flags): (i32, i32),
-        needs_es1: bool,
+        es1_library: Option<&str>,
         owner: &BTreeMap<String, gl_driver::GlDriver>,
         c: &Config,
     ) -> PackageRecord {
@@ -175,10 +183,13 @@ impl Parsed {
             .application_info
             .as_ref()
             .and_then(|a| a.primary_cpu_abi.clone());
-        let gl_driver = if c.no_gl_selection {
-            gl_driver::GlDriver::Native
+        let gl = if c.no_gl_selection {
+            gl_driver::Selection {
+                driver: gl_driver::GlDriver::Native,
+                reason: gl_driver::Reason::SelectionOff,
+            }
         } else {
-            gl_driver::select(owner, &name, needs_es1)
+            gl_driver::select(owner, &name, es1_library)
         };
         let isa = instruction_set(primary.as_deref(), &c.abis).to_owned();
         InstallFields {
@@ -203,7 +214,7 @@ impl Parsed {
             force_queryable: installed.force_queryable,
             uid,
             instruction_set: isa,
-            gl_driver,
+            gl,
         }
     }
 }

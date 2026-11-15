@@ -639,9 +639,9 @@ fn partition_file(s: &str) -> Result<(PathBuf, PathBuf), String> {
     Ok((PathBuf::from(host), rel.to_path_buf()))
 }
 
-/// Whether a native library of the package DT_NEEDs [`gl_driver::ES1_LIB`]: the install-time ES1 rule (an ES1 app links it, or a JNI fixture of one does).
+/// The file name of the first native library of the package that DT_NEEDs [`gl_driver::ES1_LIB`]: the install-time ES1 rule (an ES1 app links it, or a JNI fixture of one does); the services log it as the rule's reason.
 /// Reads the `lib/<abi>/*.so` entries of every APK in `code`: the APKs hold every library whether or not the installer extracted it (extractNativeLibs=false leaves them only there, Doodle Jump).
-fn needs_es1(code: &Path) -> Result<bool> {
+fn es1_library(code: &Path) -> Result<Option<String>> {
     use std::io::Read;
     for entry in std::fs::read_dir(code)? {
         let apk = entry?.path();
@@ -674,11 +674,16 @@ fn needs_es1(code: &Path) -> Result<bool> {
             let at = PathBuf::from(format!("{}!/{name}", apk.display()));
             let (_, needed) = atl_broker::elf_deps_in(&at, &data)?;
             if needed.iter().any(|n| n == gl_driver::ES1_LIB) {
-                return Ok(true);
+                return Ok(Some(so_name(&name).to_owned()));
             }
         }
     }
-    Ok(false)
+    Ok(None)
+}
+
+/// The file name of an APK entry `lib/<abi>/<name>.so`.
+fn so_name(entry: &str) -> &str {
+    entry.rsplit('/').next().unwrap_or(entry)
 }
 
 /// installd's file work for the services' install (owner option I): the sessions' files, the installer's view, and what was staged and committed.
@@ -864,8 +869,14 @@ impl Host {
         }
     }
 
-    /// Request `Commit`: session `session` (staged for `uid`) becomes `/data/app/<package>` (PackageInstallerSession's rename), with its data dirs (installd createAppData) and external dirs; whether a library needs ES1.
-    fn commit(&self, session: u32, package: &str, uid: u32, names: &[StagedName]) -> Result<bool> {
+    /// Request `Commit`: session `session` (staged for `uid`) becomes `/data/app/<package>` (PackageInstallerSession's rename), with its data dirs (installd createAppData) and external dirs; the native library that needs ES1, if any.
+    fn commit(
+        &self,
+        session: u32,
+        package: &str,
+        uid: u32,
+        names: &[StagedName],
+    ) -> Result<Option<String>> {
         ensure!(
             valid_package_name(package),
             "{package:?}: not a package name"
@@ -888,7 +899,7 @@ impl Host {
         std::fs::rename(&staged_dir, &code)
             .with_context(|| format!("moving session {session} to {}", code.display()))?;
         self.create_app_data(package)?;
-        let es1 = needs_es1(&code)?;
+        let es1 = es1_library(&code)?;
         staged.remove(&session);
         committed.insert(package.to_owned(), Committed { uid, system: false });
         log(format_args!("installed {package}: uid {uid}"));
@@ -954,7 +965,7 @@ impl Host {
     /// Request `ScanCommit`: scanned `dir` is package `package` of `uid`: its data dirs and external dirs (installd createAppData, as for any package); no ES1 fact (no native-library root).
     /// Unlike a session's commit, a system uid is accepted: a system package of a predefined shared user runs as that user's fixed uid (android.uid.system = 1000), and only the runtime's
     /// read-only partitions are scanned. Root and the installer's uid stay refused.
-    fn scan_commit(&self, dir: &str, package: &str, uid: u32) -> Result<bool> {
+    fn scan_commit(&self, dir: &str, package: &str, uid: u32) -> Result<Option<String>> {
         ensure!(
             uid != atl_services_types::permission::ROOT_UID && uid != INSTALLER_UID,
             "uid {uid}: root or the installer's ({INSTALLER_UID}); no package runs as either"
@@ -979,7 +990,7 @@ impl Host {
         self.create_app_data(package)?;
         committed.insert(package.to_owned(), Committed { uid, system: true });
         log(format_args!("scanned {package}: uid {uid}, code {dir}"));
-        Ok(false)
+        Ok(None)
     }
 
     /// installd createAppData: the package's data dirs and its external dirs.
@@ -1647,11 +1658,11 @@ fn serve_control(host: Arc<Host>, fd: std::os::fd::OwnedFd) {
                 names,
             } => host
                 .commit(session, &package, uid, &names)
-                .map(|needs_es1| Response::Committed { needs_es1 }),
+                .map(|es1_library| Response::Committed { es1_library }),
             Request::Scan { dir } => host.scan(&dir).map(|frames| Response::Staged { frames }),
             Request::ScanCommit { dir, package, uid } => host
                 .scan_commit(&dir, &package, uid)
-                .map(|needs_es1| Response::Committed { needs_es1 }),
+                .map(|es1_library| Response::Committed { es1_library }),
         };
         outcome.unwrap_or_else(|e| {
             log(format_args!("control request failed: {e:#}"));
@@ -2627,14 +2638,18 @@ mod tests {
             "base.apk",
             &[("classes.dex", b"dex"), ("lib/arm64-v8a/libother.so", &es2)],
         );
-        assert!(!needs_es1(&dir).expect("no error"));
+        assert_eq!(es1_library(&dir).expect("no error"), None);
         let es1 = elf_needing(gl_driver::ES1_LIB);
         apk_with(
             &dir,
             "split_config.arm64_v8a.apk",
             &[("lib/arm64-v8a/libgame.so", &es1)],
         );
-        assert!(needs_es1(&dir).expect("no error"));
+        // the rule's reason names the library that matched
+        assert_eq!(
+            es1_library(&dir).expect("no error").as_deref(),
+            Some("libgame.so")
+        );
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
@@ -2647,14 +2662,14 @@ mod tests {
             "base.apk",
             &[("lib/arm64-v8a/libil2cpp.usym.so", b"USYM symbol data")],
         );
-        assert!(!needs_es1(&dir).expect("no error"));
+        assert_eq!(es1_library(&dir).expect("no error"), None);
         // a truncated ELF is still read as one, and its error still fails the commit: the ELF magic (e_ident[EI_MAG0..3]) and nothing after it
         apk_with(
             &dir,
             "base.apk",
             &[("lib/arm64-v8a/libbroken.so", b"\x7fELF")],
         );
-        assert!(needs_es1(&dir).is_err());
+        assert!(es1_library(&dir).is_err());
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 

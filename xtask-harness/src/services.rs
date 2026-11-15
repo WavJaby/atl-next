@@ -248,7 +248,7 @@ pub fn stage(
             },
             Request::Commit {
                 session: 0, uid, ..
-            } if uid == APP_UID => Response::Committed { needs_es1: false },
+            } if uid == APP_UID => Response::Committed { es1_library: None },
             other => Response::Error {
                 message: format!(
                     "the services stage holds session 0 for uid {APP_UID} only ({other:?})"

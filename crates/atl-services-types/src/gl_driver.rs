@@ -72,13 +72,62 @@ fn valid_package(name: &str) -> bool {
         })
 }
 
-/// The driver of package `name`: its owner row, else ANGLE when `needs_es1` (a native library DT_NEEDs [`ES1_LIB`]), else native.
-pub fn select(owner: &BTreeMap<String, GlDriver>, name: &str, needs_es1: bool) -> GlDriver {
-    owner.get(name).copied().unwrap_or(if needs_es1 {
-        GlDriver::Angle
-    } else {
-        GlDriver::Native
-    })
+/// Why a package got its driver.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reason {
+    /// Its gl-drivers.toml row.
+    Owner,
+    /// The ES1 rule: this native library of it DT_NEEDs [`ES1_LIB`].
+    Es1(String),
+    /// No row, no ES1 library: AOSP's default.
+    Default,
+    /// The GL selection gate's break (`--no-gl-selection`).
+    SelectionOff,
+}
+
+/// A package's driver and why: what the services log per app process.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Selection {
+    pub driver: GlDriver,
+    pub reason: Reason,
+}
+
+impl std::fmt::Display for Selection {
+    /// `ANGLE (es1: libX.so needs libGLESv1_CM.so)`, `native (default)`, ...
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let driver = match self.driver {
+            GlDriver::Native => "native",
+            GlDriver::Angle => "ANGLE",
+        };
+        match &self.reason {
+            Reason::Owner => write!(f, "{driver} (gl-drivers.toml row)"),
+            Reason::Es1(lib) => write!(f, "{driver} (es1: {lib} needs {ES1_LIB})"),
+            Reason::Default => write!(f, "{driver} (default)"),
+            Reason::SelectionOff => write!(f, "{driver} (selection off)"),
+        }
+    }
+}
+
+/// The driver of package `name`: its owner row, else ANGLE when `es1_library` names a native library of it that DT_NEEDs [`ES1_LIB`], else native.
+pub fn select(
+    owner: &BTreeMap<String, GlDriver>,
+    name: &str,
+    es1_library: Option<&str>,
+) -> Selection {
+    match (owner.get(name), es1_library) {
+        (Some(&driver), _) => Selection {
+            driver,
+            reason: Reason::Owner,
+        },
+        (None, Some(lib)) => Selection {
+            driver: GlDriver::Angle,
+            reason: Reason::Es1(lib.to_owned()),
+        },
+        (None, None) => Selection {
+            driver: GlDriver::Native,
+            reason: Reason::Default,
+        },
+    }
 }
 
 /// The values of [`SELECTION_PKGS`] and [`SELECTION_VALUES`] for bindApplication: the `angle` packages, index-matched (GraphicsEnvironment splits both on ','). None when no package is ANGLE, so no key is set.
@@ -132,8 +181,24 @@ mod tests {
     #[test]
     fn owner_row_overrides_es1_rule() {
         let owner = owner_table(&row("a.b", "native", "r")).expect("one row");
-        assert_eq!(select(&owner, "a.b", true), GlDriver::Native);
-        assert_eq!(select(&owner, "c.d", true), GlDriver::Angle);
-        assert_eq!(select(&owner, "c.d", false), GlDriver::Native);
+        let es1 = Some("libgame.so");
+        assert_eq!(select(&owner, "a.b", es1).driver, GlDriver::Native);
+        assert_eq!(select(&owner, "c.d", es1).driver, GlDriver::Angle);
+        assert_eq!(select(&owner, "c.d", None).driver, GlDriver::Native);
+    }
+
+    /// The logged line names the driver and the rule, and for ES1 the library that matched.
+    #[test]
+    fn selection_names_its_reason() {
+        let owner = owner_table(&row("a.b", "native", "r")).expect("one row");
+        assert_eq!(
+            select(&owner, "c.d", Some("libDoodleJump.so")).to_string(),
+            "ANGLE (es1: libDoodleJump.so needs libGLESv1_CM.so)"
+        );
+        assert_eq!(select(&owner, "c.d", None).to_string(), "native (default)");
+        assert_eq!(
+            select(&owner, "a.b", None).to_string(),
+            "native (gl-drivers.toml row)"
+        );
     }
 }

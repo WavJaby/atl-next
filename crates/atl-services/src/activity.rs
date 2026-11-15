@@ -1575,8 +1575,10 @@ impl IActivityManager for ActivityManager {
             .as_binder()
             .link_to_death(&mut death)
             .map_err(|e| illegal_state(&format!("linkToDeath: {e:?}")))?;
+        // one line per app process: the driver its libEGL loads (the core settings below) and the rule that chose it
+        log(format_args!("gl-driver {process_name} pid {pid}: {}", p.gl));
         let core_settings = match atl_services_types::gl_driver::selection(
-            inner.packages.all().iter().map(|p| (p.name(), p.gl_driver)),
+            inner.packages.all().iter().map(|p| (p.name(), p.gl.driver)),
         ) {
             Some((pkgs, values)) => Bundle::from_strings(&[
                 (atl_services_types::gl_driver::SELECTION_PKGS, pkgs.as_str()),

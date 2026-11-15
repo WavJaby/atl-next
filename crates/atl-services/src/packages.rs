@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use atl_parcelables::parts::{ComponentInfo, ParsedIntentInfo};
-use atl_services_types::gl_driver::GlDriver;
+use atl_services_types::gl_driver;
 use atl_services_types::installer_output::Kind;
 use atl_services_types::packages::{Library, LibraryNode, PermissionDecl, used_libraries};
 use atl_services_types::permission::{self, PermissionState};
@@ -41,7 +41,8 @@ pub struct PackageRecord {
     pub uid: u32,
     /// The instruction set the process runs (arches.toml row key): primaryCpuAbi's, else the device's first (InstructionSets.getPrimaryInstructionSet); zygote's `--instruction-set`.
     pub instruction_set: String,
-    pub gl_driver: GlDriver,
+    /// The GL driver its processes load, and why (install::record).
+    pub gl: gl_driver::Selection,
 }
 
 fn listed<T>(v: &Option<Vec<Option<T>>>) -> impl Iterator<Item = &T> {
@@ -653,7 +654,10 @@ pub mod fixture {
             force_queryable: false,
             uid: 10_001,
             instruction_set: "x86_64".to_owned(),
-            gl_driver: GlDriver::Native,
+            gl: gl_driver::Selection {
+                driver: gl_driver::GlDriver::Native,
+                reason: gl_driver::Reason::Default,
+            },
         }
     }
 }

@@ -99,9 +99,9 @@ pub enum Response {
     Staged {
         frames: String,
     },
-    /// The package is in place; `needs_es1`: a native library of it DT_NEEDs libGLESv1_CM (the ES1 rule's file fact; the services choose the driver).
+    /// The package is in place; `es1_library`: the file name of a native library of it that DT_NEEDs libGLESv1_CM (the ES1 rule's file fact; the services choose the driver and log it).
     Committed {
-        needs_es1: bool,
+        es1_library: Option<String>,
     },
     Error {
         message: String,
