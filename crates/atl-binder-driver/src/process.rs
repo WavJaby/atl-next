@@ -305,7 +305,7 @@ mod tests {
 
     fn connect(admin: &OwnedFd, uid: u32, cm: bool) -> Process {
         let (ours, theirs) = pair();
-        register(admin.as_fd(), theirs.as_fd(), uid, 1, cm).expect("register");
+        register(admin.as_fd(), theirs.as_fd(), uid, 1, false, cm).expect("register");
         let p = Process::connect(ours).expect("connect");
         p.mmap(REGION).expect("mmap");
         p

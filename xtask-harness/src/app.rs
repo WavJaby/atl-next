@@ -206,7 +206,9 @@ fn settings_why(line: Option<&str>) -> Option<String> {
     let ok = line.and_then(|l| l.strip_prefix("id=")).is_some_and(|r| {
         r.split_once(' ').is_some_and(|(id, rest)| {
             id.len() == 16
-                && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
                 && rest == SETTINGS_WANT_REST
         })
     });

@@ -55,6 +55,7 @@ use crate::activity_task::{ActivityTasks, Back};
 use crate::broadcast::{self, BroadcastFilter, Broadcasts, IntentKey, StickyRefusal};
 use crate::broadcast_queue::{self, Job};
 use crate::config_diff::{self, Config, Delivery};
+use crate::package;
 use crate::packages::{PackageRecord, Packages, Permissions};
 use crate::pending_intent::{self, PendingIntents};
 use crate::pending_intent_table::Key;
@@ -63,7 +64,6 @@ use crate::running_processes;
 use crate::shared_memory::ApplicationSharedMemory;
 use crate::tasks::{TaskId, TaskSize, Tasks, initial_size};
 use crate::ui_agents::UiAgents;
-use crate::package;
 use atl_services_types::display_model::DisplayModel;
 use atl_services_types::permission::{self, ROOT_UID, SHELL_UID, SYSTEM_UID};
 use atl_services_types::size_buckets::SizeBuckets;
@@ -1186,8 +1186,12 @@ impl Inner {
             }
         };
         for (w, holder, auth) in lost {
-            if let Err(e) = w.r#notifyContentProviderPublishStatus(Some(&holder), Some(&auth), 0, false) {
-                log(format_args!("notifyContentProviderPublishStatus {auth}: {e}"));
+            if let Err(e) =
+                w.r#notifyContentProviderPublishStatus(Some(&holder), Some(&auth), 0, false)
+            {
+                log(format_args!(
+                    "notifyContentProviderPublishStatus {auth}: {e}"
+                ));
             }
         }
         self.kill(&pids);
@@ -1200,7 +1204,11 @@ impl Inner {
         st: &mut State,
         package: &str,
         process: &str,
-    ) -> Vec<(Strong<dyn IApplicationThread>, ContentProviderHolder, String)> {
+    ) -> Vec<(
+        Strong<dyn IApplicationThread>,
+        ContentProviderHolder,
+        String,
+    )> {
         let mut lost = Vec::new();
         st.providers.retain_mut(|r| {
             if r.package != package || r.process != process {
@@ -1914,8 +1922,12 @@ impl IActivityManager for ActivityManager {
         drop(st);
         atl_diag::answered(AM, "publishContentProviders");
         for (w, holder, auth) in sends {
-            if let Err(e) = w.r#notifyContentProviderPublishStatus(Some(&holder), Some(&auth), 0, true) {
-                log(format_args!("notifyContentProviderPublishStatus {auth}: {e}"));
+            if let Err(e) =
+                w.r#notifyContentProviderPublishStatus(Some(&holder), Some(&auth), 0, true)
+            {
+                log(format_args!(
+                    "notifyContentProviderPublishStatus {auth}: {e}"
+                ));
             }
         }
         Ok(())

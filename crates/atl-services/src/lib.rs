@@ -92,13 +92,13 @@ pub mod sensor_wire;
 #[cfg(feature = "converter")]
 pub mod storage;
 #[cfg(feature = "converter")]
+pub mod system_config;
+#[cfg(feature = "converter")]
 mod token;
 #[cfg(feature = "converter")]
 pub mod ui_agents;
 #[cfg(feature = "converter")]
 pub mod uimode;
-#[cfg(feature = "converter")]
-pub mod system_config;
 #[cfg(feature = "converter")]
 pub mod user;
 #[cfg(feature = "converter")]

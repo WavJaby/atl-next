@@ -37,6 +37,9 @@ impl ISystemConfig for SystemConfigService {
 
 /// The service's binder, for `addService`.
 pub fn new_binder(permissions: Arc<Permissions>) -> SpIBinder {
-    BnSystemConfig::new_binder(SystemConfigService { permissions }, BinderFeatures::default())
-        .as_binder()
+    BnSystemConfig::new_binder(
+        SystemConfigService { permissions },
+        BinderFeatures::default(),
+    )
+    .as_binder()
 }
