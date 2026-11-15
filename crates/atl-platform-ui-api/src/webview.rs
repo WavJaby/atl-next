@@ -48,12 +48,10 @@ pub trait WebView {
     fn dom_storage_enabled(&self) -> bool;
 }
 
-/// What a view reports.
+/// What a view reports. Order within one load: `LoadStarted`, then `Title` / `Progress` as they come -- a title the page set is reported before its `LoadFinished` -- then `LoadFinished`.
 pub enum WebEvent {
     /// The main frame started loading `uri`.
     LoadStarted(String),
-    /// The main frame received its first data for `uri` (WebKit `LOAD_COMMITTED`).
-    LoadCommitted(String),
     /// The main frame finished loading `uri` (also after a failure, as WebKit reports it).
     LoadFinished(String),
     /// The main frame's load of `uri` failed.

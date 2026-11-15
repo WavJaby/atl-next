@@ -69,7 +69,6 @@ impl WebEngine for PlatformWebEngine {
                 unsafe { (e.text.get().into_owned(), e.detail.get().into_owned()) };
             let ev = match e.kind {
                 web_event::LOAD_STARTED => WebEvent::LoadStarted(text),
-                web_event::LOAD_COMMITTED => WebEvent::LoadCommitted(text),
                 web_event::LOAD_FINISHED => WebEvent::LoadFinished(text),
                 web_event::LOAD_FAILED => WebEvent::LoadFailed {
                     uri: text,

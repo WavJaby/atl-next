@@ -84,9 +84,23 @@ struct Events {
     sink: RefCell<Callback<WebEventView>>,
     queue: RefCell<std::collections::VecDeque<Pending>>,
     busy: std::cell::Cell<bool>,
+    /// The title last reported for the current load.
+    title: RefCell<Option<String>>,
 }
 
 impl Events {
+    /// Reports `w`'s title if it differs from the last one reported for this load.
+    fn title_changed(&self, w: &webkit6::WebView) {
+        let Some(t) = w.title().map(|t| t.to_string()) else {
+            return;
+        };
+        if self.title.borrow().as_deref() == Some(t.as_str()) {
+            return;
+        }
+        self.title.replace(Some(t.clone()));
+        self.emit(web_event::TITLE, &t, "", 0, 0, None);
+    }
+
     fn emit(
         &self,
         kind: u32,
@@ -164,17 +178,24 @@ unsafe extern "C" fn view_create(
         sink: RefCell::new(events),
         queue: RefCell::default(),
         busy: std::cell::Cell::new(false),
+        title: RefCell::default(),
     });
     let ev = events.clone();
     web.connect_load_changed(move |w, e| {
         let uri = w.uri().map(|u| u.to_string()).unwrap_or_default();
-        let kind = match e {
-            webkit6::LoadEvent::Started => web_event::LOAD_STARTED,
-            webkit6::LoadEvent::Committed => web_event::LOAD_COMMITTED,
-            webkit6::LoadEvent::Finished => web_event::LOAD_FINISHED,
-            _ => return,
-        };
-        ev.emit(kind, &uri, "", 0, 0, None);
+        match e {
+            webkit6::LoadEvent::Started => {
+                // a new load reports its title again, even an equal one
+                ev.title.replace(None);
+                ev.emit(web_event::LOAD_STARTED, &uri, "", 0, 0, None);
+            }
+            webkit6::LoadEvent::Finished => {
+                // the trait's order: a title the page set is reported before its finish (WebKit may notify `title` after LOAD_FINISHED, measured W2 for a data: page)
+                ev.title_changed(w);
+                ev.emit(web_event::LOAD_FINISHED, &uri, "", 0, 0, None);
+            }
+            _ => {}
+        }
     });
     let ev = events.clone();
     web.connect_load_failed(move |_, _, uri, e| {
@@ -189,16 +210,7 @@ unsafe extern "C" fn view_create(
         false // WebKit's own error page handling continues, then LOAD_FINISHED follows
     });
     let ev = events.clone();
-    web.connect_title_notify(move |w| {
-        ev.emit(
-            web_event::TITLE,
-            &w.title().map(|t| t.to_string()).unwrap_or_default(),
-            "",
-            0,
-            0,
-            None,
-        );
-    });
+    web.connect_title_notify(move |w| ev.title_changed(w));
     let ev = events.clone();
     web.connect_estimated_load_progress_notify(move |w| {
         ev.emit(

@@ -1089,8 +1089,6 @@ impl Drop for PromptReplyAbi {
 pub mod web_event {
     /// `LoadStarted(uri)`.
     pub const LOAD_STARTED: u32 = 1;
-    /// `LoadCommitted(uri)`.
-    pub const LOAD_COMMITTED: u32 = 2;
     /// `LoadFinished(uri)`.
     pub const LOAD_FINISHED: u32 = 3;
     /// `LoadFailed { uri, message, kind = error }`.
