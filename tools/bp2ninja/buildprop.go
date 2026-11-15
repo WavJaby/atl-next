@@ -20,6 +20,7 @@ const buildPropFile = "gen/build.prop"
 //   - ro.build.tags: gen_build_prop.py BuildVersionTags = BUILD_VERSION_TAGS (none in this product) + get_build_keys (buildKeys) of the product's DefaultAppCertificate, which is -keys' testkey.
 //     release-keys is not a build's: AOSP's release re-sign (sign_target_files_apks) rewrites the tag, and ATL has no such step yet.
 //   - Not written: preview_sdk_fingerprint (an md5 over the API files, not a release flag) and base_os (PRODUCT_BASE_OS, product config; empty without one, the same as unset to Build.VERSION.BASE_OS).
+//   - Not here either: build.version.extensions.{r,s,t,u,v,b,ad_services} (derive_sdk at boot in AOSP; no ro. prefix). sdkExtensions (sdkext.go) derives them from the tree and the installed APEXes; run() appends them after the module evaluation.
 func buildProp(r *Release, buildID, keys string) (string, error) {
 	field := func(name string) string { return strings.Join(strings.Fields(r.Flag(name)), " ") }
 	sdk := field("RELEASE_PLATFORM_SDK_VERSION")

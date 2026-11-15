@@ -41,6 +41,7 @@ import javax.net.ssl.X509TrustManager;
  * WAV lines (app.rs MEDIA_WAV): a valid WAV is prepared, started, sought and reset per round, by fd and by path; the served extractor must sniff it.
  * Reset lines (app.rs MEDIA_RESET): reset with a seek pending, each within a bound; a reset that never returns is named.
  * result lines (app.rs RESULT): after the marker, Main starts ResultChild for request 7; its result comes back in onActivityResult, and the singleTop self-start from it cancels request 9 before its new intent.
+ * sdkext line (app.rs ASYNC_LINES `sdkext`): SdkExtensions.getExtensionVersion for R and for AD_SERVICES, the values bp2ninja's sdkext.go derives for build.prop.
  */
 public class Main extends Activity {
     /** A root every supported distro bundle carries (Let's Encrypt's). */
@@ -226,6 +227,8 @@ public class Main extends Activity {
         Log.i("AtlTest", "processes: " + processes());
         Log.i("AtlTest", "settings: " + settings());
         Log.i("AtlTest", "features: " + features());
+        Log.i("AtlTest", "sdkext: r=" + android.os.ext.SdkExtensions.getExtensionVersion(android.os.Build.VERSION_CODES.R)
+                + " ad_services=" + android.os.ext.SdkExtensions.getExtensionVersion(android.os.ext.SdkExtensions.AD_SERVICES));
         Log.i("AtlTest", "signatures: " + signatures());
         Log.i("AtlTest", "priority: " + priority());
         Log.i("AtlTest", "webview-ua: " + webView());

@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: MIT
+# Synthetic stand-in in extensions_db.textpb's shape (requirements cumulative per version), for sdkext_test.go. Not AOSP's data.
+versions {
+  version: 1
+  requirements { module: ART version { version: 1 } }
+  requirements { module: MEDIA_PROVIDER version { version: 1 } }
+}
+versions {
+  version: 2
+  requirements { module: ART version { version: 2 } }
+  requirements { module: MEDIA_PROVIDER version { version: 2 } }
+  requirements { module: AD_SERVICES version { version: 2 } }
+}
+versions {
+  version: 3
+  requirements { module: ART version { version: 2 } }
+  requirements { module: MEDIA_PROVIDER version { version: 3 } }
+  requirements { module: AD_SERVICES version { version: 3 } }
+  requirements { module: EXT_SERVICES version { version: 3 } }
+}
+versions {
+  version: 4
+  requirements { module: ART version { version: 2 } }
+  requirements { module: MEDIA_PROVIDER version { version: 4 } }
+  requirements { module: AD_SERVICES version { version: 4 } }
+  requirements { module: EXT_SERVICES version { version: 4 } }
+}

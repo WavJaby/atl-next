@@ -386,7 +386,10 @@ const WEBVIEW_PAGE: (&str, &str) = (
 /// completeWork accepted (JobParameters.completeWork throws when the item is not executing), then dequeueWork answers null (the last work dequeued finishes the job).
 /// bindmissing: Main.bindMissing binds to the absent com.android.vending (implicit with package, then explicit): bindServiceLocked answers 0 for both (no ServiceRecord, no callback),
 /// and unbindService right after finds the dispatcher ContextImpl.bindServiceCommon registered before the AM call (LoadedApk.forgetServiceDispatcher does not throw).
-const ASYNC_LINES: [(&str, &str, &str); 6] = [
+/// sdkext: Main.onCreate's SdkExtensions.getExtensionVersion for R and AD_SERVICES (not a binder callback; logged in onCreate). The values are the build.prop rows
+/// sdkext.go derives as derive_sdk.cpp SetSdkLevels computes them: r stops at 8, the last db version that does not require EXT_SERVICES (not installed in ATL; version 9 is the first that does).
+/// ad_services is AD_SERVICES' module version, 17.
+const ASYNC_LINES: [(&str, &str, &str); 7] = [
     ("bindservice", "AtlTest: bindservice: ", "bindService=true"),
     (
         "bindimplicit",
@@ -413,6 +416,7 @@ const ASYNC_LINES: [(&str, &str, &str); 6] = [
         "AtlTest: jobrun: ",
         "started=9 work=atl.test.WORK delivery=1 completed=true next=null",
     ),
+    ("sdkext", "AtlTest: sdkext: ", "r=8 ad_services=17"),
 ];
 
 /// A [`SERVICE_LINES`] expectation: the fixed value, or for connectivity (None) [`connectivity_want`].

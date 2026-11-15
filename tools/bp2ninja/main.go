@@ -334,6 +334,7 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 		}
 	}
 	// the release first: select(release_flag(…)) and the soong config variables it sets are evaluated with it
+	var prop string // build.prop: written once the modules are evaluated, since its sdkExtensions rows read the boot fragments through them
 	if js.release != "" {
 		if g.release, err = readRelease(tree, js.release); err != nil {
 			return err
@@ -342,11 +343,9 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 		if err != nil {
 			return err
 		}
-		prop, err := buildProp(g.release, id, js.tools.Keys)
-		if err != nil {
+		if prop, err = buildProp(g.release, id, js.tools.Keys); err != nil {
 			return err
 		}
-		g.genFile(filepath.Join(out, buildPropFile), prop)
 		g.acfg = newAconfigGraph("")
 	}
 	g.mods = map[Side]map[string][]*Module{}
@@ -359,6 +358,20 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 		for _, p := range problems {
 			g.problem("%s eval: %s", side, p)
 		}
+	}
+	if js.release != "" {
+		jars, err := g.bootJars()
+		if err != nil {
+			return err
+		}
+		rows, err := sdkExtensions(tree, g.release, installedApexes(jars))
+		if err != nil {
+			return err
+		}
+		for _, row := range rows {
+			prop += row[0] + "=" + row[1] + "\n"
+		}
+		g.genFile(filepath.Join(out, buildPropFile), prop)
 	}
 	g.baseTypes = map[string]string{}
 	g.soongConfigTypes = map[string]*soongConfigType{}
