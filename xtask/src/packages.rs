@@ -454,7 +454,7 @@ pub const TEST_TARGET_DIR: &str = "cargo-converter-test";
 
 /// The cargo target dir of the converter packages' unit tests (`Selection::test`), apart from [`target_dir`]: the test build runs under `RUSTC_BOOTSTRAP=1`, which proc-macro2's build script probes
 /// (`rerun-if-env-changed`), turning on its nightly cfgs; that changes no unit hash, so in one shared dir clippy and test rebuilt each other's whole proc-macro tree every `xtask check`
-/// (measured: 64 then 128 units recompiled on an unchanged slot, 53 s then 86 s).
+/// (measured: 64 then 128 units recompiled on an unchanged build dir, 53 s then 86 s).
 fn test_target_dir(out: &Path) -> PathBuf {
     out.join(TEST_TARGET_DIR)
 }
@@ -730,7 +730,7 @@ fn install_cdylib(release: &Path, out: &Path, package: &str, lib: &str) -> Resul
 }
 
 /// `xtask check` step converter-packages: clippy (as `build` lints them) then unit tests on the converter packages of `out`'s graph.json. Returns the packages it could not check, each with the
-/// module the graph lacks (a slot behind the checkout): the converter feature links converter outputs, so without them nothing compiles those modules, and `check` names
+/// module the graph lacks (a build dir behind the checkout): the converter feature links converter outputs, so without them nothing compiles those modules, and `check` names
 /// the step skipped rather than reporting it passed.
 pub fn check(root: &Path, out: &Path) -> Result<Vec<String>> {
     let packages = workspace_packages(root)?;

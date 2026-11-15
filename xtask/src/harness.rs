@@ -67,7 +67,7 @@ pub fn pass_through(root: &Path, name: &str, args: &[OsString]) -> Result<ExitCo
 /// The line a harness check step prints for "not checked: <why>"; absent = checked.
 pub const SKIP_PREFIX: &str = "skip: ";
 
-/// Runs harness check step `step` on slot `out`: `Some(why)` when it skipped, an error with its output when it failed.
+/// Runs harness check step `step` on build dir `out`: `Some(why)` when it skipped, an error with its output when it failed.
 pub fn check_step(root: &Path, step: &str, out: &Path) -> Result<Option<String>> {
     let run = command(
         root,

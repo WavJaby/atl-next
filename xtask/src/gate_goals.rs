@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! The native goals each runtime gate reads, declared once here by gate name in [`GATES`] (the gates themselves live in xtask-harness; `native --for` must not link them).
-//! `xtask native --for <gate>[,<gate>]` builds their union; a gate's [`crate::build_state::gate_out`] refuses a slot whose record lacks one (built-from state + goals, build_state.rs),
+//! `xtask native --for <gate>[,<gate>]` builds their union; a gate's [`crate::build_state::gate_out`] refuses a build dir whose record lacks one (built-from state + goals, build_state.rs),
 //! naming the missing goals and the `--for` command, so no gate discovers a missing input mid-run. The native-bridge guest is part of the same record (`nb:` goals), so stale `<out>/nb` is refused the same way; a foreign guest's `nb:` goals are checked in its own graph dir (`build_state::foreign_out`).
 
 use std::collections::BTreeSet;
@@ -71,7 +71,7 @@ impl Goals {
     }
 }
 
-/// Every gate's goals (`native --for all-gates`), as the converter's argument file names them: the set a slot's graph must cover for keepset to read it (keepset.rs).
+/// Every gate's goals (`native --for all-gates`), as the converter's argument file names them: the set a build dir's graph must cover for keepset to read it (keepset.rs).
 pub fn all_converter(root: &Path) -> Result<BTreeSet<String>> {
     Ok(union(root, &[ALL.to_owned()])?
         .converter()
@@ -316,7 +316,7 @@ pub const GATES: &[(&str, GoalsOf)] = &[
             "libbinder_rs",
             "libatl_parcelables",
             "atl-aidl-stubs-rust",
-            // Conscrypt's JNI library (a boot-jar loadLibrary, bootjni-loads.txt): the java cases reach it; a slot built `--for parcel` without it failed the gate
+            // Conscrypt's JNI library (a boot-jar loadLibrary, bootjni-loads.txt): the java cases reach it; a build dir built `--for parcel` without it failed the gate
             "libjavacrypto",
         ]))
     }),

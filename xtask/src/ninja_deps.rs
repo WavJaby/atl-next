@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! A ninja build's deps log (`<dir>/.ninja_deps`, `deps = gcc` records), read-only: each output's dependencies as its last record names them, what `ninja -t deps` prints.
 //! Read from the file, never through `ninja -t deps`: that loads the log for writing, which recompacts it when ninja finds it worth it (`DepsLog::OpenForWrite`), and truncates a torn last record (`DepsLog::Load`) --
-//! inside a running build (the licence gate is one of its edges) or beside one (keepset over a slot mid-build) either rewrites the log under the build that appends to it.
+//! inside a running build (the licence gate is one of its edges) or beside one (keepset over a build dir mid-build) either rewrites the log under the build that appends to it.
 //! Here a torn last record (a write in progress) ends the read; every record before it is complete, ninja appending each with one flush.
 //!
 //! Format, ninja 1.10+ (deps_log.cc, version 4, native byte order): `# ninjadeps\n`, u32 version; then records, each a u32 size word.

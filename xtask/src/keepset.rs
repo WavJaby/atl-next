@@ -1051,7 +1051,7 @@ mod tests {
             rel("/home/u/atl-next/src/aosp/a/b.jar$"),
             Some("a/b.jar".into())
         );
-        assert_eq!(rel("/home/u/atl-next/out/slot-3/x.o"), None);
+        assert_eq!(rel("/home/u/atl-next/out/pool/ws/x/x.o"), None);
         assert_eq!(rel("/home/u/atl-next/src/aosp/"), None);
         let joined =
             p.rels("/home/u/atl-next/src/aosp/a/b.proto/home/u/atl-next/src/aosp/c/d.java");
@@ -1133,7 +1133,7 @@ mod tests {
         Need {
             path: path.into(),
             keep: keep.into(),
-            from: BTreeSet::from(["slot-3/build.ninja".to_owned()]),
+            from: BTreeSet::from(["ws/x/build.ninja".to_owned()]),
         }
     }
 

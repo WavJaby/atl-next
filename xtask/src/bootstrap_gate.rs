@@ -34,7 +34,7 @@ pub fn check(root: &Path) -> Result<()> {
     let layout = Layout::of(root)?;
     let hidden = hidden_dirs(&layout);
     // one target per checkout (`repo`, or the worktree dir's name): a shared one fed a worktree at another commit stale crate outputs (E0061 in xtask).
-    // Not in the slot: the sandbox hides out/ (hidden_dirs).
+    // Not in the build dir: the sandbox hides out/ (hidden_dirs).
     let checkout = root
         .file_name()
         .with_context(|| format!("checkout {} has no name", root.display()))?;

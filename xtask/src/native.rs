@@ -1838,7 +1838,7 @@ mod tests {
     /// The host's own guest stays in the host graph dir; a foreign guest gets `nb-graph-<arch>` under it, and its modules sit under that dir's `nb/<arch>`.
     #[test]
     fn foreign_guest_has_its_own_graph_dir() {
-        let out = Path::new("/w/out/slot-3");
+        let out = Path::new("/w/out/build");
         assert_eq!(graph_dir(out, "x86_64", "x86_64"), out);
         let foreign = graph_dir(out, "x86_64", "arm64");
         assert_eq!(foreign, out.join("nb-graph-arm64"));
@@ -2128,8 +2128,8 @@ nope
         std::fs::write(
             &graph,
             edge(
-                "/w/out/slot-2/bp2ninja/bp2ninja",
-                "/w/out/slot-2/bp2ninja.args",
+                "/w/out/build/bp2ninja/bp2ninja",
+                "/w/out/build/bp2ninja.args",
             ),
         )
         .unwrap();

@@ -5,7 +5,7 @@
 //! Tracked only: `add -A` stored every untracked, unignored file (stray build outputs included) as a blob in `.git`; a new source file counts once it is `git add`ed. The top-level entries listed in [`GATE_SIDE`] are left out of the hash. `native` deletes the record when it starts and writes it once ninja and the converter
 //! packages succeeded (the state taken before the build, so an edit during the build reads as a mismatch); a gate compares it with the checkout's state now.
 //! The record also lists the goals built from that state (line 1 state, then one goal per line, nb goals as `nb:<arch>:<module>`): a run from the same state adds its goals to the
-//! previous record's, a run from another state starts over, since the older goals' outputs are stale. A gate refuses a slot lacking its goals (gate_goals.rs).
+//! previous record's, a run from another state starts over, since the older goals' outputs are stale. A gate refuses a build dir lacking its goals (gate_goals.rs).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail, ensure};
 const RECORD: &str = "built-from";
 /// Top-level entries native's artifacts do not come from: `xtask/` and `xtask-harness/` are the gate side (gate code and the fixtures each gate builds itself), so editing a gate needs no native run.
 /// `test-apks.toml` feeds only `run-apk`, `fetch --test-apks` and the `tables` check: a row or pin change needs no native run.
-/// Trade-off: native's own code (xtask/src/native.rs, the converter driver) is in it too; a change there reaches the slot only through a native run anyway.
+/// Trade-off: native's own code (xtask/src/native.rs, the converter driver) is in it too; a change there reaches the build dir only through a native run anyway.
 const GATE_SIDE: &[&str] = &["xtask", "xtask-harness", "test-apks.toml"];
 /// The root manifest: it enters the state as [`native_manifest`], not as the file.
 const MANIFEST: &str = "Cargo.toml";
@@ -26,7 +26,7 @@ pub const NATIVE_PROFILE: &str = "release";
 
 /// The part of the root manifest a native build reads: the parsed TOML (comments and layout drop out) with every profile but [`NATIVE_PROFILE`] removed and,
 /// in that one, the per-package overrides of gate-side packages (a [`GATE_SIDE`] directory holds the package of its name: `xtask`, `xtask-harness`).
-/// So `[profile.dev.package.xtask]` or a comment edit keeps the slot current; members, `[workspace.*]`, `[patch]`, lints and the release profile still count.
+/// So `[profile.dev.package.xtask]` or a comment edit keeps the build dir current; members, `[workspace.*]`, `[patch]`, lints and the release profile still count.
 fn native_manifest(text: &str) -> Result<String> {
     let mut doc: toml::Table = toml::from_str(text).context("parsing the root Cargo.toml")?;
     if let Some(toml::Value::Table(profiles)) = doc.get_mut("profile") {
