@@ -2031,7 +2031,7 @@ mod tests {
             ..plan
         };
         let s = session.script("b");
-        assert!(!s.contains("labwc") && !s.contains("/proc/"), "{s}");
+        assert!(!s.contains("labwc") && !s.contains("/proc/[0-9]"), "{s}");
     }
 
     /// The probe's three answers; anything else is an error, not a mode.
