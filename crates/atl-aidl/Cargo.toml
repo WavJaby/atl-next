@@ -64,6 +64,8 @@ types = [
     "android.gui.IDisplayEventConnection",
     "android.os.IServiceManager",
     "android.os.IUserManager",
+    # the system_config service (system_config.rs): SettingsProvider's DatabaseHelper asks it for the default VR components
+    "android.os.ISystemConfig",
     # the processinfo service (process_info.rs): libmedia ProcessInfo asks it for a client's priority
     "android.os.IProcessInfoService",
     "android.os.storage.IStorageManager",

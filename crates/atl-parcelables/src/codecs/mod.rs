@@ -38,6 +38,7 @@ pub mod android {
             pub mod ProviderInfo;
             pub mod ProviderInfoList;
             pub mod ServiceInfo;
+            pub mod UserInfo;
         }
         pub mod res {
             pub mod CompatibilityInfo;

@@ -498,6 +498,27 @@ impl IPackageManager for PackageManager {
         Ok(())
     }
 
+    /// ComputerEngine.getInstalledPackages: every package the caller may see, its PackageInfo cut to `flags`, in install order; empty for a user that does not exist.
+    /// MATCH_UNINSTALLED_PACKAGES changes nothing: no package here is uninstalled while keeping its data.
+    fn r#getInstalledPackages(
+        &self,
+        flags: i64,
+        user: i32,
+    ) -> binder::Result<Option<ParceledListSlice>> {
+        let caller = ThreadState::get_calling_uid();
+        let list: Vec<PackageInfo> = if user != USER_SYSTEM {
+            Vec::new()
+        } else {
+            self.packages
+                .all()
+                .iter()
+                .filter(|p| self.packages.visible(caller, p.name()).is_some())
+                .map(|p| self.package_info(p, flags))
+                .collect()
+        };
+        Ok(Some(ParceledListSlice::new(list)))
+    }
+
     /// ComputerEngine.getInstrumentationInfoAsUser:4944-4961: null for a user that does not exist, a package that does not exist or the caller may not see, or a class the package does not
     /// declare as an instrumentation.
     fn r#getInstrumentationInfoAsUser(

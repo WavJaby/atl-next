@@ -9,6 +9,7 @@ use std::io::Write;
 
 use super::FeatureInfo::FeatureInfo;
 use super::InstrumentationInfo::InstrumentationInfo;
+use super::PackageInfo::PackageInfo;
 use crate::codecs::android::app::NotificationChannel::NotificationChannel;
 use crate::codecs::android::app::job::JobInfo::JobInfo;
 use crate::parcel::*;
@@ -27,10 +28,10 @@ pub trait ListElement: Part + Clone + 'static {
 /// The element table: one row per modelled element class (Rust type => Java class name).
 macro_rules! elements {
     ($($ty:ident => $class:literal),* $(,)?) => {
-        /// One element of a list, of whichever modelled class the list carries.
+        /// One element of a list, of whichever modelled class the list carries; boxed, as the classes differ widely in size (PackageInfo vs FeatureInfo).
         #[derive(Debug, Clone)]
         pub enum Element {
-            $($ty($ty),)*
+            $($ty(Box<$ty>),)*
         }
 
         impl Element {
@@ -47,7 +48,7 @@ macro_rules! elements {
             /// The reader of `class`'s elements; None for a class with no row.
             fn reader(class: &str) -> Option<fn(&In<'_>) -> Result<Element>> {
                 match class {
-                    $($class => Some(|p| $ty::read(p).map(Element::$ty)),)*
+                    $($class => Some(|p| $ty::read(p).map(|v| Element::$ty(Box::new(v)))),)*
                     _ => None,
                 }
             }
@@ -56,11 +57,11 @@ macro_rules! elements {
         $(impl ListElement for $ty {
             const CLASS: &'static str = $class;
             fn wrap(self) -> Element {
-                Element::$ty(self)
+                Element::$ty(Box::new(self))
             }
             fn unwrap(e: &Element) -> Option<&Self> {
                 match e {
-                    Element::$ty(x) => Some(x),
+                    Element::$ty(x) => Some(x.as_ref()),
                     #[allow(unreachable_patterns)]
                     _ => None,
                 }
@@ -74,6 +75,8 @@ elements! {
     InstrumentationInfo => "android.content.pm.InstrumentationInfo",
     // IPackageManager.getSystemAvailableFeatures' reply
     FeatureInfo => "android.content.pm.FeatureInfo",
+    // IPackageManager.getInstalledPackages' reply
+    PackageInfo => "android.content.pm.PackageInfo",
     // INotificationManager.createNotificationChannels / getNotificationChannels
     NotificationChannel => "android.app.NotificationChannel",
     // IJobScheduler.getAllPendingJobs / getAllPendingJobsInNamespace

@@ -118,6 +118,8 @@ pub(crate) fn spawn_of(cmd: &Command, uid: u32) -> Result<Spawn> {
     Ok(Spawn {
         uid,
         context_manager: false,
+        // the gate's processes see the host's pids, as before sandbox tags existed: its checks read sender pids as host pids
+        binder_pids: atl_broker::BinderPids::Host,
         mounts,
         links: vec![],
         devices: vec![],

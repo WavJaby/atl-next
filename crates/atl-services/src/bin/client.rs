@@ -2,7 +2,7 @@
 //! atl-services-client: `xtask test binder`'s client of the M2 services, through binderd and AOSP servicemanager. Prints `client: pass|FAIL <check> <detail>`; exit 0 = all passed.
 //! - `app`: the calls an app process makes, as the app uid: getService of each; attachApplication -> bindApplication with the package's ApplicationInfo; finishAttachApplication ->
 //!   scheduleTransaction(LaunchActivityItem) of its launcher activity; getDisplayId on the controller it carries; the PackageManager subset (an absent package reads as null);
-//!   getContentProvider("settings") and the provider's `call` (null Bundle), an absent authority (null); an unimplemented method (UNKNOWN_TRANSACTION, counted by the services);
+//!   getContentProvider of an authority no package declares (null); an unimplemented method (UNKNOWN_TRANSACTION, counted by the services);
 //!   an @EnforcePermission method (SECURITY: the hook denies an app).
 //! - `system`: the same @EnforcePermission method as the system uid passes the hook and reaches the unimplemented default (UNKNOWN_TRANSACTION).
 //! - `codes`: the transaction codes the gate's `service call` uses (from the stubs, so they follow the AIDL).
@@ -26,7 +26,6 @@ use atl_parcelables::android::os::Bundle;
 use atl_parcelables::codecs::android::app::servertransaction::ClientTransaction::ClientTransactionItem;
 use atl_parcelables::codecs::android::os::Bundle::BUNDLE_MAGIC;
 use atl_parcelables::java::util::Map;
-use atl_services::settings;
 use binder::binder_impl::{Parcel, UnstructuredParcelable};
 use binder::{
     BinderFeatures, ExceptionCode, Interface, ParcelFileDescriptor, ProcessState, StatusCode,
@@ -329,28 +328,6 @@ fn app(package: &str, uid: i32, activity: &str, start_seq: i64) -> Result<usize>
     let dex = pm.notifyDexLoad(Some(package), Some(&map), Some("x86_64"));
     r.check("notifyDexLoad", dex.is_ok(), format!("{dex:?}"));
 
-    let holder = am.getContentProvider(Some(&thread), Some(package), Some("settings"), 0, true);
-    match holder {
-        Ok(Some(h)) if h.info.authority.as_deref() == Some("settings") => {
-            r.check("getContentProvider", true, "settings");
-            match h.provider {
-                Some(b) => {
-                    let called = call_settings(b);
-                    r.check(
-                        "IContentProvider.call",
-                        matches!(called, Ok((0, -1))),
-                        format!("(exception, bundle length) {called:?}"),
-                    );
-                }
-                None => r.check("IContentProvider.call", false, "no provider binder"),
-            }
-        }
-        other => r.check(
-            "getContentProvider",
-            false,
-            format!("{:?}", other.map(|h| h.map(|h| h.info.authority))),
-        ),
-    }
     let none = am.getContentProvider(
         Some(&thread),
         Some(package),
@@ -471,21 +448,6 @@ fn broadcast_and_fds(
         format!("{finished:?}"),
     );
     Ok(())
-}
-
-/// IContentProvider.call on the settings provider (ContentProviderNative's wire format: interface token, AttributionSource, authority, method, arg, extras); returns the reply's
-/// exception status and Bundle length (-1 = null). The provider reads none of the arguments, so the AttributionSource is not written.
-fn call_settings(b: binder::SpIBinder) -> Result<(i32, i32)> {
-    use binder::binder_impl::IBinderInternal;
-    let p: Strong<dyn settings::IContentProvider> = b.into_interface()?;
-    let binder = p.as_binder();
-    let mut data = binder.prepare_transact()?;
-    data.write("settings")?;
-    data.write("GET_system")?;
-    data.write("font_scale")?;
-    data.write(&-1i32)?;
-    let reply = binder.submit_transact(settings::CALL_TRANSACTION, data, 0)?;
-    Ok((reply.read()?, reply.read()?))
 }
 
 fn system() -> Result<usize> {

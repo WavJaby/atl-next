@@ -32,7 +32,7 @@ use atl_parcelables::android::app::SyncNotedAppOp;
 use atl_parcelables::android::app::servertransaction::ClientTransaction;
 use atl_parcelables::android::content::pm::{
     ActivityInfo, ApplicationInfo, ConfigurationInfo, InstrumentationInfo, PackageInfo,
-    ParceledListSlice, PermissionInfo, ProviderInfo, ProviderInfoList, ServiceInfo,
+    ParceledListSlice, PermissionInfo, ProviderInfo, ProviderInfoList, ServiceInfo, UserInfo,
 };
 use atl_parcelables::android::content::res::{CompatibilityInfo, Configuration};
 use atl_parcelables::android::content::{ComponentName, Intent, IntentFilter};
@@ -311,6 +311,7 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
         "android.content.IntentFilter" => round_trip_as::<IntentFilter>(input, mode),
         "android.content.ComponentName" => round_trip_as::<ComponentName>(input, mode),
         "android.content.pm.ConfigurationInfo" => round_trip_as::<ConfigurationInfo>(input, mode),
+        "android.content.pm.UserInfo" => round_trip_as::<UserInfo>(input, mode),
         "android.webkit.WebViewProviderResponse" => {
             round_trip_as::<WebViewProviderResponse>(input, mode)
         }

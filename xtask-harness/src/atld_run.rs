@@ -25,6 +25,8 @@ use crate::{manifest, packages, remote, slot, tree};
 
 /// framework-res.apk in the Java pipeline's out: built as Soong builds it (manifest_fixer, link, merge, align; bp2ninja app.go), unsigned.
 const FRAMEWORK_RES: &str = "device/framework-res/framework-res.apk";
+/// SettingsProvider's install path below a partitions root (`certificate: "platform"`, `privileged: true` in its Android.bp).
+const SETTINGS_PROVIDER: &str = "system/priv-app/SettingsProvider/SettingsProvider.apk";
 /// The device's ABI list (`ro.product.cpu.abilist`'s role), each with its instruction set (arches.toml row key): the host row's `android_abis` first (native), then the other `[guest]` rows' as
 /// translated, 64-bit before 32-bit, rows in key order within each (arches.toml: preference follows host match and pointer_bits). An app whose only native code is foreign thus installs with
 /// that ISA, which the broker passes the launcher; host-native libraries still win when an APK carries both.
@@ -884,6 +886,15 @@ impl Runtime {
         let at = self.art.lib_path.join(file);
         std::fs::remove_file(&at).with_context(|| format!("unlinking {}", at.display()))?;
         Ok(self)
+    }
+
+    /// Places the converter's AOSP SettingsProvider (`<out>/partitions/system/priv-app/SettingsProvider/SettingsProvider.apk`, Soong's install path) at the same /system path, where the system scan finds
+    /// it (priv-app: privileged); the `settings` authority is then served by its own process, started at the first getContentProvider. Placed by the run until the product's runtime ships it.
+    pub fn with_settings_provider(self) -> Result<Self> {
+        let built = self.out.join("partitions").join(SETTINGS_PROVIDER);
+        ensure!(built.is_file(), "missing input {}", built.display());
+        let at = format!("/{SETTINGS_PROVIDER}");
+        Ok(self.with_fixture_file(built, &at))
     }
 
     /// Places a gate's fixture file `host` at `at` (a /system or /vendor path) in every app sandbox.

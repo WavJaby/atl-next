@@ -52,7 +52,7 @@ impl Harness {
         let (ours, theirs) = pair();
         proto::send(
             self.admin.as_fd(),
-            &encode_register(uid, 1, cm),
+            &encode_register(uid, 1, false, cm),
             &[theirs.as_fd()],
         )
         .unwrap();
@@ -174,7 +174,7 @@ fn control_requests() {
     proto::send(app.as_fd(), &[1, 2], &[]).unwrap();
     assert_eq!(recv(&app), errno(rustix::io::Errno::PROTO));
     // admin: a registration without its fd
-    proto::send(h.admin.as_fd(), &encode_register(1, 1, false), &[]).unwrap();
+    proto::send(h.admin.as_fd(), &encode_register(1, 1, false, false), &[]).unwrap();
     assert_eq!(recv(&h.admin), errno(rustix::io::Errno::INVAL));
     let s = h.stop();
     let f = s.faults();

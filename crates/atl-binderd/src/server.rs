@@ -44,25 +44,27 @@ pub enum Fault {
     Overflow,
 }
 
-/// Admin registration: uid, host pid, context-manager flag; the control connection is its fd.
-pub fn encode_register(uid: u32, host_pid: i32, context_manager: bool) -> Vec<u8> {
+/// Admin registration: uid, host pid, whether the process lives in a sandbox pid namespace of its own, context-manager flag; the control connection is its fd.
+pub fn encode_register(uid: u32, host_pid: i32, sandboxed: bool, context_manager: bool) -> Vec<u8> {
     let mut v = uid.to_ne_bytes().to_vec();
     v.extend_from_slice(&host_pid.to_ne_bytes());
+    v.extend_from_slice(&u32::from(sandboxed).to_ne_bytes());
     v.extend_from_slice(&u32::from(context_manager).to_ne_bytes());
     v
 }
 
-/// The admin side (broker, test harness): registers the process whose control connection is `control` and waits for binderd's answer.
+/// The admin side (broker, test harness): registers the process whose control connection is `control` and waits for binderd's answer. `sandboxed`: see [`Server::register`].
 pub fn register(
     admin: BorrowedFd<'_>,
     control: BorrowedFd<'_>,
     uid: u32,
     host_pid: i32,
+    sandboxed: bool,
     context_manager: bool,
 ) -> Result<(), SysErrno> {
     proto::send(
         admin,
-        &encode_register(uid, host_pid, context_manager),
+        &encode_register(uid, host_pid, sandboxed, context_manager),
         &[control],
     )?;
     let (msg, _) = proto::recv(admin)?.ok_or(SysErrno::PIPE)?;
@@ -73,12 +75,12 @@ pub fn register(
     }
 }
 
-fn decode_register(b: &[u8]) -> Option<(u32, i32, bool)> {
-    if b.len() != 12 {
+fn decode_register(b: &[u8]) -> Option<(u32, i32, bool, bool)> {
+    if b.len() != 16 {
         return None;
     }
     let u = |o: usize| u32::from_ne_bytes(b[o..o + 4].try_into().expect("4 bytes"));
-    Some((u(0), u(4) as i32, u(8) != 0))
+    Some((u(0), u(4) as i32, u(8) != 0, u(12) != 0))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -259,8 +261,8 @@ impl Server {
 
     fn admin_message(&mut self, id: ConnId, msg: &[u8], mut fds: Vec<OwnedFd>) {
         let status = match (decode_register(msg), fds.len()) {
-            (Some((uid, host_pid, cm)), 1) => {
-                self.register(fds.remove(0), uid, host_pid, cm);
+            (Some((uid, host_pid, sandboxed, cm)), 1) => {
+                self.register(fds.remove(0), uid, host_pid, sandboxed, cm);
                 0
             }
             _ => {
@@ -271,13 +273,31 @@ impl Server {
         self.send(id, &Reply::Status(status), vec![]);
     }
 
-    /// A process whose control connection is `control`, tagged as the host's pid namespace sees it (sandbox pid namespaces come with the broker).
-    pub fn register(&mut self, control: OwnedFd, uid: u32, host_pid: i32, context_manager: bool) {
+    /// A process whose control connection is `control`. `sandboxed`: it lives in a pid namespace of its own (an app sandbox; the namespace is keyed by `host_pid`, its first process), so its binder
+    /// peers outside it read its calling pid as 0 and it reads theirs as 0, as the kernel's task_tgid_nr_ns gives between sibling namespaces; else it is tagged with the host's namespace, seeing and
+    /// seen by every host pid (atld's system processes: system_server shares the apps' namespace on a device). The pid inside the sandbox is 0: one process per sandbox, and libbinder never
+    /// transacts to a node of its own process, so no peer shares its namespace.
+    pub fn register(
+        &mut self,
+        control: OwnedFd,
+        uid: u32,
+        host_pid: i32,
+        sandboxed: bool,
+        context_manager: bool,
+    ) {
+        let pid_ns = if sandboxed {
+            PidNs::Sandbox {
+                id: host_pid as u64,
+                pid: 0,
+            }
+        } else {
+            PidNs::Host
+        };
         let proc = self.core.add_proc(ProcSpec {
             tag: Tag {
                 uid,
                 host_pid,
-                pid_ns: PidNs::Host,
+                pid_ns,
             },
             may_be_context_manager: context_manager,
         });

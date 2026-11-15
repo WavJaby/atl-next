@@ -32,9 +32,7 @@ use atl_parcelables::android::app::{
     ActivityManager_TaskDescription, ApplicationErrorReport_ParcelableCrashInfo,
     ContentProviderHolder,
 };
-use atl_parcelables::android::content::pm::{
-    ActivityInfo, ApplicationInfo, ProviderInfo, ProviderInfoList,
-};
+use atl_parcelables::android::content::pm::{ActivityInfo, ProviderInfo, ProviderInfoList};
 use atl_parcelables::android::content::res::{CompatibilityInfo, Configuration};
 use atl_parcelables::android::content::{ComponentName, Intent, IntentFilter};
 use atl_parcelables::android::graphics::Rect;
@@ -44,8 +42,8 @@ use atl_parcelables::android::window::SizeConfigurationBuckets;
 use atl_parcelables::codecs::android::app::servertransaction::ClientTransaction::ClientTransactionItem;
 use atl_parcelables::java::io::FileDescriptor;
 use atl_parcelables::parts::{
-    ActivityConfigurationChangeItem, ActivityRelaunchItem, ActivityWindowInfo, ComponentInfo,
-    ConfigurationChangeItem, LaunchActivityItem, PackageItemInfo, ResumeActivityItem,
+    ActivityConfigurationChangeItem, ActivityRelaunchItem, ActivityWindowInfo,
+    ConfigurationChangeItem, LaunchActivityItem, ResumeActivityItem,
 };
 use binder::{
     BinderFeatures, DeathRecipient, ExceptionCode, IBinder, Interface, SpIBinder, Status, Strong,
@@ -65,7 +63,7 @@ use crate::running_processes;
 use crate::shared_memory::ApplicationSharedMemory;
 use crate::tasks::{TaskId, TaskSize, Tasks, initial_size};
 use crate::ui_agents::UiAgents;
-use crate::{package, settings};
+use crate::package;
 use atl_services_types::display_model::DisplayModel;
 use atl_services_types::permission::{self, ROOT_UID, SHELL_UID, SYSTEM_UID};
 use atl_services_types::size_buckets::SizeBuckets;
@@ -314,12 +312,63 @@ pub(crate) fn launch_item(
     }
 }
 
-/// The settings provider (packages/SettingsProvider/AndroidManifest.xml): authority, package, class, process, initOrder; it runs as the system uid.
-const SETTINGS_AUTHORITY: &str = "settings";
-const SETTINGS_PACKAGE: &str = "com.android.providers.settings";
-const SETTINGS_CLASS: &str = "com.android.providers.settings.SettingsProvider";
-const SETTINGS_PROCESS: &str = "system";
-const SETTINGS_INIT_ORDER: i32 = 100;
+/// ContentProviderRecord, reduced: a provider some caller asked for, from its process start until its process dies.
+struct ProviderRecord {
+    package: String,
+    class: String,
+    /// the process that hosts it (ProviderInfo.processName)
+    process: String,
+    /// resolved for the stock PackageManager flags (package::process_providers)
+    info: ProviderInfo,
+    /// IContentProvider, once publishContentProviders delivered it
+    provider: Option<SpIBinder>,
+    /// the publishing process
+    pid: Option<i32>,
+    /// callers told at publication (ContentProviderConnection.waiting)
+    waiters: Vec<Strong<dyn IApplicationThread>>,
+}
+
+impl ProviderRecord {
+    /// ContentProviderRecord.newHolder (ContentProviderRecord.java:89-96), no connection; noReleaseNeeded as its constructor (:75-76): a root or system uid provider, Settings app excepted.
+    fn holder(&self) -> ContentProviderHolder {
+        let uid = self.info.component.application_info.uid as u32;
+        ContentProviderHolder {
+            info: self.info.clone(),
+            provider: self.provider.clone(),
+            connection: None,
+            no_release_needed: permission::is_system_or_root(uid)
+                && self.package != SETTINGS_APP_PACKAGE,
+            local: false,
+        }
+    }
+}
+
+/// The Settings app, the exception to a system provider's noReleaseNeeded (ContentProviderRecord.java:76).
+const SETTINGS_APP_PACKAGE: &str = "com.android.settings";
+
+/// PMS resolveContentProvider, user 0: the first package with a provider of `authority` (ProviderInfo.authority is `;`-separated), resolved as process_providers does for its process.
+fn resolve_provider<'a>(
+    packages: &'a Packages,
+    authority: &str,
+) -> Option<(&'a PackageRecord, ProviderInfo)> {
+    let has = |d: &ProviderInfo| {
+        d.authority
+            .as_deref()
+            .is_some_and(|a| a.split(';').any(|x| x == authority))
+    };
+    packages.all().iter().find_map(|p| {
+        let process = p
+            .providers()
+            .find(|d| has(d))?
+            .component
+            .process_name
+            .clone()?;
+        package::process_providers(p, packages, &process, package::STOCK_PM_FLAGS)
+            .into_iter()
+            .find(|d| has(d))
+            .map(|d| (p, d))
+    })
+}
 
 /// ActiveInstrumentation (frameworks/base/services/core/java/com/android/server/am/ActiveInstrumentation.java), reduced: one target process, no profiler, no SDK sandbox.
 struct ActiveInstrumentation {
@@ -374,6 +423,8 @@ struct State {
     broadcasts: Broadcasts<ReceiverHandle, Intent, Job>,
     /// ActiveServices' bound services (bound_services.rs)
     services: active_services::Services,
+    /// ProviderMap: the providers asked for, starting or published
+    providers: Vec<ProviderRecord>,
 }
 
 /// An IIntentReceiver as a registration key: equal when the binder is (mRegisteredReceivers is keyed by `receiver.asBinder()`).
@@ -496,7 +547,6 @@ struct Inner {
     reporter: Reporter,
     /// the activity lifecycle: records, launches and starts (activity_task.rs); the client controller forwards its acks here
     atm: Arc<ActivityTasks>,
-    settings: SpIBinder,
     /// the Tasks: a launch that starts a Task creates it here and binds its activity's token to it (tasks.rs)
     tasks: Arc<Tasks<SpIBinder>>,
     /// what each activity reported (ReportedBuckets), shared with the activity client controller
@@ -605,7 +655,6 @@ impl ActivityManager {
                     control,
                     state: Mutex::new(State::default()),
                     reporter: Reporter::new(),
-                    settings: settings::new_binder(),
                     tasks,
                     buckets,
                     broadcast_queue: broadcast_queue::Queue::new(),
@@ -916,45 +965,93 @@ impl Inner {
         Ok(())
     }
 
-    /// realStartActivityLocked (ActivityTaskSupervisor.java:1021-1029): the LaunchActivityItem of the package's launcher activity, under `token` (the one its ResumeActivityItem carries).
-    /// ActivityInfo.flags are the activity's manifest flags (manifest_flags). Not sent yet (slice 7 needs them): results, new intents, saved state; the assist / shareable / fragment tokens stay null.
-    /// ContentProviderHelper.getContentProviderImpl's result for the settings provider: ContentProviderRecord.newHolder (ContentProviderRecord.java:89-96) with noReleaseNeeded
-    /// (:75, the provider runs as the system uid) and no connection object.
-    fn settings_holder(&self) -> ContentProviderHolder {
-        let app = ApplicationInfo {
-            item: PackageItemInfo {
-                package_name: Some(SETTINGS_PACKAGE.into()),
-                ..Default::default()
-            },
-            process_name: Some(SETTINGS_PROCESS.into()),
-            uid: permission::SYSTEM_UID as i32,
-            enabled: true,
-            ..Default::default()
+    /// ContentProviderHelper.getContentProviderImpl for a caller with an app thread, user 0: the provider of `authority` (PMS resolveContentProvider over the installed packages), its
+    /// record found or made (mProviderMap); published -> the full holder; else its process is started unless running (:547-614) and the caller is kept as a waiter, which gets
+    /// notifyContentProviderPublishStatus at publication (:620-648, ActivityThread.acquireProvider waits for it). None: no such provider, or its process failed to start (:604-611).
+    /// Not modelled: connections and their ref counts (holder.connection null), a provider able to run in the caller's process (multiprocess / same uid: ActivityThread finds its own first).
+    fn content_provider_locked(
+        &self,
+        st: &mut State,
+        caller: &Strong<dyn IApplicationThread>,
+        caller_uid: u32,
+        authority: &str,
+    ) -> binder::Result<Option<ContentProviderHolder>> {
+        let Some((p, info)) = resolve_provider(&self.packages, authority) else {
+            return Ok(None);
         };
-        ContentProviderHolder {
-            info: ProviderInfo {
-                component: ComponentInfo {
-                    item: PackageItemInfo {
-                        name: Some(SETTINGS_CLASS.into()),
-                        package_name: Some(SETTINGS_PACKAGE.into()),
-                        ..Default::default()
-                    },
-                    application_info: app,
-                    process_name: Some(SETTINGS_PROCESS.into()),
-                    enabled: true,
-                    exported: true,
-                    ..Default::default()
-                },
-                authority: Some(SETTINGS_AUTHORITY.into()),
-                multiprocess: false,
-                init_order: SETTINGS_INIT_ORDER,
-                ..Default::default()
-            },
-            provider: Some(self.settings.clone()),
-            connection: None,
-            no_release_needed: true,
-            local: false,
+        // checkContentProviderPermission's first rule: an unexported provider serves its own uid only (ContentProviderHelper :1186-1192)
+        if !info.component.exported
+            && permission::app_id(p.uid) != permission::app_id(caller_uid)
+            && !permission::is_system_or_root(caller_uid)
+        {
+            return Err(security(&format!(
+                "Permission Denial: opening provider {} from uid {caller_uid} that is not exported from uid {}",
+                info.component.item.name.as_deref().unwrap_or(""),
+                p.uid
+            )));
         }
+        let class = info.component.item.name.clone().unwrap_or_default();
+        let i = match st
+            .providers
+            .iter()
+            .position(|r| r.package == p.name() && r.class == class)
+        {
+            Some(i) => i,
+            None => {
+                st.providers.push(ProviderRecord {
+                    package: p.name().to_owned(),
+                    class,
+                    process: info
+                        .component
+                        .process_name
+                        .clone()
+                        .unwrap_or_else(|| p.process_name().to_owned()),
+                    info,
+                    provider: None,
+                    pid: None,
+                    waiters: Vec::new(),
+                });
+                st.providers.len() - 1
+            }
+        };
+        let process = st.providers[i].process.clone();
+        // ContentProviderRecord.canRunHere (:122-125): the caller's own process may host it -> newHolder(null, true), the caller instantiates its own (ContentProviderHelper :278-286 running,
+        // :481-487 not running). A provider reading its own authority from onCreate (SettingsProvider does) would otherwise wait for its own publication.
+        let here = Self::record_for_thread(st, caller)
+            .and_then(|pid| st.processes.iter().find(|r| r.pid == pid))
+            .is_some_and(|r| {
+                (st.providers[i].info.multiprocess || r.process_name == process) && r.uid == p.uid
+            });
+        if here {
+            let mut h = st.providers[i].holder();
+            h.provider = None;
+            h.local = true;
+            return Ok(Some(h));
+        }
+        if st.providers[i].provider.is_some() {
+            return Ok(Some(st.providers[i].holder()));
+        }
+        let running = st
+            .processes
+            .iter()
+            .any(|r| r.package == p.name() && r.process_name == process);
+        if !running {
+            if let Err(e) = self.start_process_locked(st, p, &process, false, None) {
+                log(format_args!(
+                    "Unable to launch app {}/{} for provider {authority}: process is bad ({e})",
+                    p.name(),
+                    p.uid
+                ));
+                st.providers.remove(i);
+                return Ok(None);
+            }
+            log(format_args!(
+                "provider {authority}: started process {process} of {}",
+                p.name()
+            ));
+        }
+        st.providers[i].waiters.push(caller.clone());
+        Ok(Some(st.providers[i].holder()))
     }
 
     /// ActivityManagerService.reportStartInstrumentationFailureLocked (:14804-14815): written to the log, and sent to the watcher as status -1 with the id and the error.
@@ -1050,6 +1147,7 @@ impl Inner {
 
     /// AppDeathRecipient.binderDied -> appDiedLocked -> handleAppDiedLocked (:3347-3367): the record leaves the table, and an instrumentation it ran ends CANCELED with "Process crashed.".
     fn app_died(&self, pid: i32) {
+        let lost;
         let pids = {
             let mut st = self.state();
             let Some(i) = st
@@ -1065,6 +1163,7 @@ impl Inner {
             }
             Self::broadcasts_died(&mut st, pid);
             self.services_died(&mut st, pid);
+            lost = Self::providers_died(&mut st, &rec.package, &rec.process_name);
             log(format_args!(
                 "process {} (pid {pid}) died",
                 rec.process_name
@@ -1086,7 +1185,35 @@ impl Inner {
                 None => Vec::new(),
             }
         };
+        for (w, holder, auth) in lost {
+            if let Err(e) = w.r#notifyContentProviderPublishStatus(Some(&holder), Some(&auth), 0, false) {
+                log(format_args!("notifyContentProviderPublishStatus {auth}: {e}"));
+            }
+        }
         self.kill(&pids);
+    }
+
+    /// ContentProviderHelper.removeDyingProviderLocked for the providers the dead process hosted: their records go; callers still waiting get publish status false (:1546-1556), sent by the caller after the lock.
+    /// Not modelled: killing the stable clients of a published provider (AOSP kills them, :1520-1540).
+    #[allow(clippy::type_complexity)]
+    fn providers_died(
+        st: &mut State,
+        package: &str,
+        process: &str,
+    ) -> Vec<(Strong<dyn IApplicationThread>, ContentProviderHolder, String)> {
+        let mut lost = Vec::new();
+        st.providers.retain_mut(|r| {
+            if r.package != package || r.process != process {
+                return true;
+            }
+            let holder = r.holder();
+            let auth = r.info.authority.clone().unwrap_or_default();
+            for w in std::mem::take(&mut r.waiters) {
+                lost.push((w, holder.clone(), auth.clone()));
+            }
+            false
+        });
+        lost
     }
 
     /// BroadcastQueueImpl.onApplicationCleanupLocked + the ReceiverList cleanup of a dead process: its registrations and waiting deliveries go; dropped deliveries are counted.
@@ -1695,7 +1822,7 @@ impl IActivityManager for ActivityManager {
     }
 
     /// ActivityManagerService.getContentProvider:7074 -> ContentProviderHelper.getContentProvider:134: a null caller is a SecurityException (:137-141), as is a callingPackage not
-    /// of the caller's uid (:145-149); then the provider of `name`, or null when none (getContentProviderImpl). M2 knows one provider: settings.
+    /// of the caller's uid (:145-149); then the provider of `name`, or null when none (getContentProviderImpl, [`Inner::content_provider_locked`]).
     fn r#getContentProvider(
         &self,
         caller: Option<&Strong<dyn IApplicationThread>>,
@@ -1704,11 +1831,11 @@ impl IActivityManager for ActivityManager {
         _user: i32,
         _stable: bool,
     ) -> binder::Result<Option<ContentProviderHolder>> {
-        if caller.is_none() {
+        let Some(caller) = caller else {
             return Err(security(&format!(
                 "null IApplicationThread when getting content provider {name:?}"
             )));
-        }
+        };
         let uid = ThreadState::get_calling_uid();
         if let Some(pkg) = calling_package {
             let owns = self
@@ -1722,29 +1849,75 @@ impl IActivityManager for ActivityManager {
                 )));
             }
         }
-        Ok((name == Some(SETTINGS_AUTHORITY)).then(|| self.inner.settings_holder()))
+        let Some(name) = name else {
+            return Ok(None);
+        };
+        let mut st = self.inner.state();
+        self.inner
+            .content_provider_locked(&mut st, caller, uid, name)
     }
 
-    /// ContentProviderHelper.publishContentProviders:731: an unknown caller is a SecurityException (:742). ActivityThread.installContentProviders calls it before Application.onCreate; a failure there rethrows and kills the app.
-    /// Not kept: nothing here serves another process's provider yet (getContentProvider knows settings only); a process finds its own in ActivityThread's mProviderMap without asking.
+    /// ContentProviderHelper.publishContentProviders:731: an unknown caller is a SecurityException (:742); each holder whose provider a caller asked for (mProviderMap's record of the
+    /// caller's package and class, :750-760) gets its binder and the publishing pid, and its waiters notifyContentProviderPublishStatus (:780-790, sent after the lock). A holder nobody asked for
+    /// yet is recorded too (the process publishes all its providers at bind; a later getContentProvider must find it published, not wait).
     fn r#publishContentProviders(
         &self,
         caller: Option<&Strong<dyn IApplicationThread>>,
-        _providers: Option<&[Option<ContentProviderHolder>]>,
+        providers: Option<&[Option<ContentProviderHolder>]>,
     ) -> binder::Result<()> {
-        let known = caller.is_some_and(|t| {
-            let st = self.inner.state();
-            Inner::record_for_thread(&st, t).is_some()
-        });
-        if !known {
+        let mut st = self.inner.state();
+        let Some(pid) = caller.and_then(|t| Inner::record_for_thread(&st, t)) else {
             return Err(security(
                 "Unable to find app for caller when publishing content providers",
             ));
+        };
+        let Some(proc) = st.processes.iter().find(|r| r.pid == pid) else {
+            return Err(security(
+                "Unable to find app for caller when publishing content providers",
+            ));
+        };
+        let (package, process) = (proc.package.clone(), proc.process_name.clone());
+        let mut sends = Vec::new();
+        for h in providers.into_iter().flatten().flatten() {
+            let Some(binder) = h.provider.clone() else {
+                continue;
+            };
+            let class = h.info.component.item.name.clone().unwrap_or_default();
+            let i = match st
+                .providers
+                .iter()
+                .position(|r| r.package == package && r.class == class)
+            {
+                Some(i) => i,
+                None => {
+                    st.providers.push(ProviderRecord {
+                        package: package.clone(),
+                        class,
+                        process: process.clone(),
+                        info: h.info.clone(),
+                        provider: None,
+                        pid: None,
+                        waiters: Vec::new(),
+                    });
+                    st.providers.len() - 1
+                }
+            };
+            let r = &mut st.providers[i];
+            r.provider = Some(binder);
+            r.pid = Some(pid);
+            let holder = r.holder();
+            let auth = r.info.authority.clone().unwrap_or_default();
+            for w in std::mem::take(&mut r.waiters) {
+                sends.push((w, holder.clone(), auth.clone()));
+            }
         }
-        atl_diag::answered(
-            AM,
-            "publishContentProviders (not kept: no cross-process lookup)",
-        );
+        drop(st);
+        atl_diag::answered(AM, "publishContentProviders");
+        for (w, holder, auth) in sends {
+            if let Err(e) = w.r#notifyContentProviderPublishStatus(Some(&holder), Some(&auth), 0, true) {
+                log(format_args!("notifyContentProviderPublishStatus {auth}: {e}"));
+            }
+        }
         Ok(())
     }
 

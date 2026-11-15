@@ -144,6 +144,8 @@ const PERMISSION_MANAGER: &str = "permissionmgr";
 /// Context.POWER_SERVICE and Context.THERMAL_SERVICE: SystemServiceRegistry builds PowerManager from both (getServiceOrThrow each).
 const POWER: &str = "power";
 const THERMAL: &str = "thermalservice";
+/// Context.SYSTEM_CONFIG_SERVICE (SystemConfigManager looks ISystemConfig up by it).
+const SYSTEM_CONFIG: &str = "system_config";
 const UI_MODE: &str = "uimode";
 /// Context.APP_OPS_SERVICE.
 const APP_OPS: &str = "appops";
@@ -375,6 +377,11 @@ fn main() -> Result<()> {
     }
     binder::add_service(THERMAL, atl_services::power::new_thermal_binder())
         .context("addService thermalservice")?;
+    binder::add_service(
+        SYSTEM_CONFIG,
+        atl_services::system_config::new_binder(Arc::clone(&permissions)),
+    )
+    .context("addService system_config")?;
     if !a.omit_service.iter().any(|s| s == UI_MODE) {
         binder::add_service(
             UI_MODE,

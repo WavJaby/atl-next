@@ -146,6 +146,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "bindservice: " + bound());
         Log.i("AtlTest", "pendingintent: " + pendingIntent());
         Log.i("AtlTest", "processes: " + processes());
+        Log.i("AtlTest", "settings: " + settings());
         Log.i("AtlTest", "features: " + features());
         Log.i("AtlTest", "signatures: " + signatures());
         Log.i("AtlTest", "priority: " + priority());
@@ -351,6 +352,24 @@ public class Main extends Activity {
      * "interactive=<bool> powersave=<bool> partial=<bool> held=<bool> released=<bool>": PowerManager (vungle's AndroidPlatform.<init> path) answers isInteractive / isPowerSaveMode /
      * isWakeLockLevelSupported(PARTIAL), and a PARTIAL wake lock's isHeld after acquire and after release; "absent" when getSystemService returns null; else what it threw.
      */
+    /**
+     * "id=<s> again=<bool> screen_off=<s> auto_time=<s> rotation=<s>": Settings.Secure ANDROID_ID (the SSAID of this package's signer), whether a second read equals it, and three keys AOSP's
+     * DatabaseHelper loads from SettingsProvider's defaults.xml (System screen_off_timeout, Global auto_time, System accelerometer_rotation); "null" for an absent key; a throwable's class otherwise.
+     */
+    private String settings() {
+        try {
+            android.content.ContentResolver r = getContentResolver();
+            String id = android.provider.Settings.Secure.getString(r, android.provider.Settings.Secure.ANDROID_ID);
+            String again = android.provider.Settings.Secure.getString(r, android.provider.Settings.Secure.ANDROID_ID);
+            return "id=" + id + " again=" + java.util.Objects.equals(id, again)
+                    + " screen_off=" + android.provider.Settings.System.getString(r, android.provider.Settings.System.SCREEN_OFF_TIMEOUT)
+                    + " auto_time=" + android.provider.Settings.Global.getString(r, android.provider.Settings.Global.AUTO_TIME)
+                    + " rotation=" + android.provider.Settings.System.getString(r, android.provider.Settings.System.ACCELEROMETER_ROTATION);
+        } catch (Throwable t) {
+            return t.getClass().getSimpleName() + ": " + t.getMessage();
+        }
+    }
+
     /**
      * "count=<n> own=<n> uid=<bool> name=<bool> pkg=<bool> importance=<n>": ActivityManager.getRunningAppProcesses as SDK "am I the main process" checks read it: how many records, how many carry
      * Process.myPid(), whether every one has Process.myUid(), and the own record's processName (= ApplicationInfo.processName), pkgList (= the package) and importance; "null" for a null list.

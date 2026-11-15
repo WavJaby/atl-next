@@ -181,7 +181,7 @@ pub fn nb_guest() -> Goals {
 }
 
 /// `xtask test app` (and run-apk, audio-app, drive): atl-audio-bridge (the server's mixer, game audio A2) links AudioMixerBase's library and the utilities its gain conversion uses; the launcher builds it in every app run.
-/// `webview`: the WebView provider package (repo `java/webview-provider`), which the app gate places in /product.
+/// `webview`: the WebView provider package (repo `java/webview-provider`), which the app gate places in /product. `SettingsProvider`: AOSP's settings provider package, placed in /system/priv-app.
 fn app() -> Goals {
     runtime()
         .with(gralloc())
@@ -190,6 +190,7 @@ fn app() -> Goals {
             "libaudioprocessing_base",
             "libaudioutils",
             "webview",
+            "SettingsProvider",
         ]))
 }
 

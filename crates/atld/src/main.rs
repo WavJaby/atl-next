@@ -37,7 +37,7 @@ use atl_android_paths::{
 };
 use atl_broker::control::{self, Request, Response, StagedName, StartRequest};
 use atl_broker::{
-    Broker, INSTALLER_UID, Link, Mount, Process, Spawn, gpu, kill_sandbox, terminate_sandbox,
+    BinderPids, Broker, INSTALLER_UID, Link, Mount, Process, Spawn, gpu, kill_sandbox, terminate_sandbox,
     to_log, tree_mounts,
 };
 use atl_gralloc::node::{self, NodeSource};
@@ -762,6 +762,7 @@ impl Host {
             let spawn = Spawn {
                 uid: INSTALLER_UID,
                 context_manager: false,
+                binder_pids: BinderPids::Sandbox,
                 mounts: i
                     .mounts
                     .iter()
@@ -881,6 +882,7 @@ impl Host {
         let spawn = Spawn {
             uid: INSTALLER_UID,
             context_manager: false,
+            binder_pids: BinderPids::Sandbox,
             mounts: i.mounts.iter().chain(&i.scan_mounts).cloned().collect(),
             links: vec![],
             devices: vec![],
@@ -918,10 +920,12 @@ impl Host {
     }
 
     /// Request `ScanCommit`: scanned `dir` is package `package` of `uid`: its data dirs and external dirs (installd createAppData, as for any package); no ES1 fact (no native-library root).
+    /// Unlike a session's commit, a system uid is accepted: a system package of a predefined shared user runs as that user's fixed uid (android.uid.system = 1000), and only the runtime's
+    /// read-only partitions are scanned. Root and the installer's uid stay refused.
     fn scan_commit(&self, dir: &str, package: &str, uid: u32) -> Result<bool> {
         ensure!(
-            uid > INSTALLER_UID,
-            "uid {uid}: at or below the installer's ({INSTALLER_UID}); package uids start above it"
+            uid != atl_services_types::permission::ROOT_UID && uid != INSTALLER_UID,
+            "uid {uid}: root or the installer's ({INSTALLER_UID}); no package runs as either"
         );
         ensure!(
             valid_package_name(package),
@@ -1216,6 +1220,7 @@ impl Host {
         Ok(Spawn {
             uid,
             context_manager: false,
+            binder_pids: BinderPids::Sandbox,
             mounts: [Mount {
                 host: self.root.system(),
                 at: SYSTEM.into(),
@@ -1380,6 +1385,17 @@ impl Host {
         spawn
             .mounts
             .extend(self.package_mounts(&req.package, system)?);
+        // /data/system is the system uid's (init.rc `mkdir /data/system 0775 system system`): a process of that uid (SettingsProvider, shared user android.uid.system) writes its state
+        // there (Environment.getUserSystemDirectory: /data/system/users/<user>); no other uid sees it
+        if atl_services_types::permission::app_id(req.uid) == AID_SYSTEM {
+            let host = self.root.data().join("system");
+            std::fs::create_dir_all(&host)?;
+            spawn.mounts.push(Mount {
+                host,
+                at: PathBuf::from(format!("{DATA}/system")),
+                writable: true,
+            });
+        }
         spawn.rights = req.rights.clone();
         let pid = self.start(spawn, false, true)?;
         let _ = self.first_app_ms.set(wall_ms());
@@ -1435,6 +1451,7 @@ impl Host {
             Ok(Spawn {
                 uid: AID_SHELL,
                 context_manager: false,
+                binder_pids: BinderPids::Host,
                 mounts: vec![],
                 links: vec![],
                 devices: vec![],
@@ -1490,6 +1507,7 @@ impl Host {
             Ok(Spawn {
                 uid: AID_SHELL,
                 context_manager: false,
+                binder_pids: BinderPids::Host,
                 mounts: vec![],
                 links: vec![],
                 devices: vec![],
@@ -1712,6 +1730,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         Ok(Spawn {
             uid: AID_SYSTEM,
             context_manager: cm,
+            binder_pids: BinderPids::Host,
             // the VINTF manifests are servicemanager's alone to read; the others reach HALs through it
             mounts: shared_ro
                 .iter()

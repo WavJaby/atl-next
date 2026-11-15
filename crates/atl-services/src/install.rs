@@ -107,7 +107,12 @@ pub fn scan(
                 continue;
             }
         };
-        let uid = ids.acquire().context("no application id left")?;
+        // a shared user's package runs under the shared user's id (ScanPackageUtils: the PackageSetting's appId is its SharedUserSetting's)
+        let uid = match parsed.info.shared_user_id.as_deref() {
+            Some(shared) => ids.shared_user(shared),
+            None => ids.acquire(),
+        }
+        .context("no application id left")?;
         let needs_es1 = control
             .scan_commit(&dir, &parsed.name, uid)
             .with_context(|| format!("committing scanned {}", parsed.name))?;

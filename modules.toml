@@ -114,7 +114,7 @@ exports = ["atl-aidl"]
 # compositor, libgui-parcel: atl-parcel-truth's compositor.rs checks their codecs against libgui (test-only)
 uses = ["generators", "compositor", "libgui-parcel"]
 
-# the M2 system services in Rust (ActivityManager subset, PackageManager subset, the settings provider stub) on the aidl stubs; libbinder_rs and the codecs come from the converter, not cargo
+# the M2 system services in Rust (ActivityManager subset, PackageManager subset) on the aidl stubs; libbinder_rs and the codecs come from the converter, not cargo
 [services]
 crates = ["atl-services"]
 # the package record types (plain Rust, no converter) are what atld installs and xtask writes

@@ -4,11 +4,11 @@ name = "atl-services"
 version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
-# activity.rs, package.rs, settings.rs translate AOSP's Java system services (Apache-2.0, attribution in each file); the rest is ours
+# activity.rs, package.rs translate AOSP's Java system services (Apache-2.0, attribution in each file); the rest is ours
 license = "MIT AND Apache-2.0"
 publish.workspace = true
 
-# The M2 system services in Rust (owner 2026-11-03): ActivityManager (+ the ActivityTaskManager launch path and IActivityClientController), PackageManager, the settings IContentProvider stub.
+# The M2 system services in Rust (owner 2026-11-03): ActivityManager (+ the ActivityTaskManager launch path and IActivityClientController), PackageManager.
 # They implement the converter's AIDL stubs (atl-aidl) against libbinder_rs and the parcelable codecs (libatl_parcelables), so only `xtask native` builds them (feature `converter`);
 # plain workspace builds take the policy modules (permission, packages) and their tests, counting into cargo's atl-diag (dependency `atl-diag-plain`, lib.rs).
 # The stubs' module is named too: a package's link arguments reach only its own links (atl-bridgegen converter.rs), and the stubs' cc libraries (libnativewindow, libcutils, ...) come from their rlib closure.

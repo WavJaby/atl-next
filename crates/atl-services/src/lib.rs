@@ -90,8 +90,6 @@ pub mod registry_service;
 #[cfg(feature = "converter")]
 pub mod sensor_wire;
 #[cfg(feature = "converter")]
-pub mod settings;
-#[cfg(feature = "converter")]
 pub mod storage;
 #[cfg(feature = "converter")]
 mod token;
@@ -99,6 +97,8 @@ mod token;
 pub mod ui_agents;
 #[cfg(feature = "converter")]
 pub mod uimode;
+#[cfg(feature = "converter")]
+pub mod system_config;
 #[cfg(feature = "converter")]
 pub mod user;
 #[cfg(feature = "converter")]

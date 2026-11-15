@@ -122,6 +122,7 @@ mirrors = [
     "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#getPackagesForUid",
     "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#checkSignatures",
     "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#getInstrumentationInfoAsUser",
+    "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#getInstalledPackages",
     "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#queryInstrumentationAsUser",
     "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java#hasSystemFeature",
     "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java#notifyDexLoad",
@@ -299,6 +300,8 @@ mirrors = [
     "frameworks/base/services/core/java/com/android/server/pm/UserManagerService.java#isUserRunning",
     "frameworks/base/services/core/java/com/android/server/pm/UserManagerService.java#isUserUnlocked",
     "frameworks/base/services/core/java/com/android/server/pm/UserManagerService.java#isUserUnlockingOrUnlocked",
+    "frameworks/base/services/core/java/com/android/server/pm/UserManagerService.java#getUsers",
+    "frameworks/base/services/core/java/com/android/server/pm/UserManagerService.java#getUserInfo",
 ]
 
 [mount]
@@ -326,6 +329,12 @@ mirrors = [
 src = ["crates/atl-services/src/power.rs"]
 mirrors = []
 reason = "registered only so SystemServiceRegistry can build PowerManager (it looks up power and thermalservice together); every method keeps the stub's UNKNOWN_TRANSACTION default (power.rs)"
+
+[system_config]
+src = ["crates/atl-services/src/system_config.rs"]
+mirrors = [
+    "frameworks/base/services/java/com/android/server/SystemConfigService.java#getDefaultVrComponents",
+]
 
 [uimode]
 src = ["crates/atl-services/src/uimode.rs"]

@@ -4,12 +4,19 @@
 //! `removeSetting` frees an id but raises `mFirstAvailableAppId` to id + 1, so within one run a freed id below that mark is not handed out again (a later boot, rebuilding from packages.xml, may).
 //! Our installer's uid ([`atl_broker::INSTALLER_UID`]) is registered at construction like any taken id, not skipped by a second rule.
 
-use atl_services_types::permission::{FIRST_APPLICATION_UID, LAST_APPLICATION_UID};
+use std::collections::BTreeMap;
 
-/// Registered application ids (AppIdSettingMap's mNonSystemSettings, index = id - FIRST_APPLICATION_UID) and the first id a new acquire may take.
+use atl_services_types::permission::{FIRST_APPLICATION_UID, LAST_APPLICATION_UID, SYSTEM_UID};
+
+/// The shared users PackageManagerService's constructor adds before any scan (PackageManagerService.java:2048-2065 addSharedUserLPw), with their fixed system uids. Rows are added when a
+/// scanned package first declares one; the rest of AOSP's list (phone, log, nfc, bluetooth, shell, se, networkstack, uwb) has no package here yet.
+const PREDEFINED_SHARED_USERS: &[(&str, u32)] = &[("android.uid.system", SYSTEM_UID)];
+
+/// Registered application ids (AppIdSettingMap's mNonSystemSettings, index = id - FIRST_APPLICATION_UID) and the first id a new acquire may take; and the shared users (Settings.mSharedUsers).
 pub struct AppIds {
     taken: Vec<bool>,
     first_available: u32,
+    shared: BTreeMap<String, u32>,
 }
 
 impl Default for AppIds {
@@ -24,10 +31,25 @@ impl AppIds {
         let mut ids = Self {
             taken: Vec::new(),
             first_available: FIRST_APPLICATION_UID,
+            shared: PREDEFINED_SHARED_USERS
+                .iter()
+                .map(|&(n, id)| (n.to_owned(), id))
+                .collect(),
         };
         let installer = ids.register(atl_broker::INSTALLER_UID);
         debug_assert!(installer, "fresh pool");
         ids
+    }
+
+    /// Settings.getSharedUserLPw(name, create = true): the shared user's id; a name first seen gets a new application id (acquireAndRegisterNewAppId), later packages of it share that id.
+    /// None when the pool is exhausted. Not modelled: the signature check that a package joining a shared user is signed like its members (ReconcilePackageUtils).
+    pub fn shared_user(&mut self, name: &str) -> Option<u32> {
+        if let Some(&id) = self.shared.get(name) {
+            return Some(id);
+        }
+        let id = self.acquire()?;
+        self.shared.insert(name.to_owned(), id);
+        Some(id)
     }
 
     /// registerExistingAppId: false when `id` is not an application id or is already registered.
@@ -111,6 +133,16 @@ mod tests {
             assert_eq!(ids.acquire(), Some(want));
         }
         assert_eq!(ids.acquire(), None);
+    }
+
+    /// android.uid.system is Process.SYSTEM_UID (1000, Process.java) before any scan; a new shared user takes one application id, shared by its later packages.
+    #[test]
+    fn shared_users_share_one_id() {
+        let mut ids = AppIds::new();
+        assert_eq!(ids.shared_user("android.uid.system"), Some(1_000));
+        assert_eq!(ids.shared_user("com.example.shared"), Some(10_001));
+        assert_eq!(ids.shared_user("com.example.shared"), Some(10_001));
+        assert_eq!(ids.acquire(), Some(10_002));
     }
 
     /// Break check: an allocator that hands out a taken id (here the installer's) fails here, since `register` refuses it and `acquire` would return None or a duplicate.

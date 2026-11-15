@@ -245,6 +245,7 @@ public class ParcelTruth {
         check("ParsedIntentInfo:plain", new ParsedIntentInfoImpl(), ParsedIntentInfoImpl.CREATOR);
         check("ComponentName", new ComponentName("com.example.app", "com.example.app.Runner"), ComponentName.CREATOR);
         check("ConfigurationInfo", configurationInfo(), ConfigurationInfo.CREATOR);
+        check("UserInfo", userInfo(), android.content.pm.UserInfo.CREATOR);
         check("InstrumentationInfo", instrumentationInfo(ai), InstrumentationInfo.CREATOR);
         // IPackageManager.queryInstrumentationAsUser's reply: the inline list, its element class written once
         check("ParceledListSlice", new ParceledListSlice<>(Arrays.asList(instrumentationInfo(ai), instrumentationInfo(ai))), ParceledListSlice.CREATOR);
@@ -1284,6 +1285,22 @@ public class ParcelTruth {
     static void result(boolean ok, String name, String detail) {
         System.out.println("pt " + (ok ? "pass " : "fail ") + name + " " + detail);
         if (!ok) failures++;
+    }
+
+    /// IUserManager.getUserInfo's reply: every field set and distinct so a swapped pair shows (the strings, the longs, the booleans in order true / false / true).
+    static android.content.pm.UserInfo userInfo() {
+        android.content.pm.UserInfo u = new android.content.pm.UserInfo(0, "Owner", "/icon", 0xc13, "android.os.usertype.full.SYSTEM");
+        u.serialNumber = 7;
+        u.creationTime = 1_700_000_000_000L;
+        u.lastLoggedInTime = 1_700_000_100_000L;
+        u.lastLoggedInFingerprint = "fp";
+        u.partial = true;
+        u.preCreated = false;
+        u.profileGroupId = 3;
+        u.guestToRemove = true;
+        u.restrictedProfileParentId = 5;
+        u.profileBadge = 2;
+        return u;
     }
 
     /// IActivityTaskManager.getDeviceConfigurationInfo's reply, each field distinct so a swapped pair shows: finger touch, qwerty, no navigation, hard keyboard, ES 3.1.

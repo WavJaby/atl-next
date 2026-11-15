@@ -55,6 +55,15 @@ pub struct Link {
     pub at: PathBuf,
 }
 
+/// The pid namespace binderd tags a spawned process with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinderPids {
+    /// The host's: it sees every caller's host pid and is seen by its host pid (the system services' view, as system_server shares the apps' namespace on a device).
+    Host,
+    /// Its sandbox's own: peers in other sandboxes read 0.
+    Sandbox,
+}
+
 /// What to start.
 #[derive(Debug)]
 pub struct Spawn {
@@ -62,6 +71,9 @@ pub struct Spawn {
     pub uid: u32,
     /// May become binder's context manager (servicemanager only).
     pub context_manager: bool,
+    /// The pids its binder peers see, as binderd tags it ([`atl_binderd::server::Server::register`]): [`BinderPids::Sandbox`] for an app process (calls across sandboxes carry calling pid 0,
+    /// as the kernel gives between sibling pid namespaces; AttributionSource then takes the pid as unknown instead of refusing a namespace-local one), [`BinderPids::Host`] for atld's system processes.
+    pub binder_pids: BinderPids,
     pub mounts: Vec<Mount>,
     /// Symbolic links made after the mounts (bwrap `--symlink`): the app's `/sdcard`.
     pub links: Vec<Link>,
@@ -843,6 +855,7 @@ impl Broker {
             ours.as_fd(),
             spawn.uid,
             host_pid,
+            spawn.binder_pids == BinderPids::Sandbox,
             spawn.context_manager,
         )
         .map_err(|e| registration_error(host_pid, e))?;
@@ -1134,6 +1147,7 @@ mod tests {
         Spawn {
             uid: 10_123,
             context_manager: false,
+            binder_pids: BinderPids::Sandbox,
             mounts: vec![
                 Mount {
                     host: "/r/system".into(),

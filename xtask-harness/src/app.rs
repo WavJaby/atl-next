@@ -96,6 +96,9 @@ pub struct Args {
     /// webview-package line must go red (null).
     #[arg(long)]
     webview_provider_break: bool,
+    /// The settings provider break: the run does not place AOSP SettingsProvider, so no package declares the `settings` authority, getContentProvider answers null and the settings line must go red.
+    #[arg(long)]
+    settings_provider_break: bool,
 }
 
 /// The fixture's dir.
@@ -191,6 +194,24 @@ const SIGNATURES: &str = "AtlTest: signatures: ";
 /// package, and IMPORTANCE_FOREGROUND (100: ATL answers every app process as PROCESS_STATE_TOP). `null` = the list AOSP gives a caller with no attached process.
 const PROCESSES: &str = "AtlTest: processes: ";
 const PROCESSES_WANT: &str = "count=1 own=1 uid=true name=true pkg=true importance=100";
+/// Main.settings' line, answered by AOSP SettingsProvider in its own process (`id=<s> again=<b> screen_off=<s> auto_time=<s> rotation=<s>`, [`settings_why`]).
+const SETTINGS: &str = "AtlTest: settings: ";
+/// The line after `id=`: the defaults DatabaseHelper loads from SettingsProvider's res/values/defaults.xml -- def_screen_off_timeout 60000, def_auto_time true (loadBooleanSetting writes "1"),
+/// def_accelerometer_rotation false ("0") -- and a second ANDROID_ID read equal to the first.
+const SETTINGS_WANT_REST: &str = "again=true screen_off=60000 auto_time=1 rotation=0";
+
+/// Why the settings line fails: ANDROID_ID must be the SSAID's form, 16 lowercase hex digits (SettingsProvider.generateSsaidLocked: HMAC-SHA256 of the signer, first 8 bytes as hex), and the rest
+/// must equal [`SETTINGS_WANT_REST`]. Without the provider (`--settings-provider-break`) every read is null.
+fn settings_why(line: Option<&str>) -> Option<String> {
+    let ok = line.and_then(|l| l.strip_prefix("id=")).is_some_and(|r| {
+        r.split_once(' ').is_some_and(|(id, rest)| {
+            id.len() == 16
+                && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                && rest == SETTINGS_WANT_REST
+        })
+    });
+    (!ok).then(|| format!("settings: want \"id=<16 hex> {SETTINGS_WANT_REST}\", got {line:?}"))
+}
 /// Main.webView's line: WebSettings.getDefaultUserAgent with FEATURE_WEBVIEW declared (the run's test feature file, Runtime::with_webview_feature).
 /// Without the provider placed, AOSP: `webviewupdate`'s waitForAndGetProvider answers LIBLOAD_FAILED_LISTING_WEBVIEW_PACKAGES -> WebViewFactory.getWebViewContextAndSetProvider throws
 /// MissingWebViewPackageException, getProviderClass wraps it in AndroidRuntimeException, getProvider's catch (Exception) wraps that once more. Without the feature: UnsupportedOperationException
@@ -1229,6 +1250,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let at = format!("{}/{WEBVIEW_PROVIDER}", atl_android_paths::PRODUCT);
         rt.with_fixture_file(built, &at)
     };
+    let rt = if args.settings_provider_break {
+        rt
+    } else {
+        rt.with_settings_provider()?
+    };
     let work = rt.out.join("app");
     // UI mode on a nested compositor: an app on a desktop has a display, and WebKit cannot make its settings (the default UA's source) without one -- WebKitSettings' constructor
     // dereferences a missing GDK display (atl-webview-linux `default_user_agent`); its AppleWebKit token is a literal in WebKit's UserAgentGLib.cpp, not derivable from webkit_get_*_version
@@ -1467,6 +1493,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         app.lines()
             .find_map(|l| l.split_once(prefix).map(|(_, r)| r.trim_end().to_owned()))
     };
+    if passed && let Some(why) = settings_why(after(SETTINGS).as_deref()) {
+        whys.push(why);
+    }
     let (webview_ua, engine_ua) = (after(WEBVIEW_UA), after(WEBVIEW_ENGINE_UA));
     if passed && let Some(why) = webview_ua_why(webview_ua.as_deref(), engine_ua.as_deref()) {
         whys.push(why);
