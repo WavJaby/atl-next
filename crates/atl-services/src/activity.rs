@@ -57,6 +57,7 @@ use crate::broadcast_queue::{self, Job};
 use crate::config_diff::{self, Config, Delivery};
 use crate::package;
 use crate::packages::{PackageRecord, Packages, Permissions};
+use crate::pattern_matcher;
 use crate::pending_intent::{self, PendingIntents};
 use crate::pending_intent_table::Key;
 use crate::process_control::ProcessControl;
@@ -464,14 +465,35 @@ pub(crate) fn intent_key(intent: &Intent, resolved_type: Option<&str>) -> Intent
     }
 }
 
-/// An IntentFilter (registered, or a manifest `<intent-filter>`) in the rules' form: actions, categories, schemes, types (mDataTypes).
+/// An IntentFilter (registered, or a manifest `<intent-filter>`) in the rules' form: actions, categories, schemes, scheme-specific parts, authorities, paths, types (mDataTypes).
 pub(crate) fn filter_of(f: &IntentFilter) -> broadcast::Filter {
     let flat = |v: &Vec<Option<String>>| v.iter().flatten().cloned().collect::<Vec<_>>();
     broadcast::Filter {
         actions: flat(&f.actions),
         categories: f.categories.as_ref().map(flat),
         schemes: f.data_schemes.as_ref().map(flat),
+        ssps: non_empty(&f.data_scheme_specific_parts, pattern_of),
+        authorities: non_empty(&f.data_authorities, |a| broadcast::Authority {
+            host: a.host.clone().unwrap_or_default(),
+            wild: a.wild,
+            port: a.port,
+        }),
+        paths: non_empty(&f.data_paths, pattern_of),
         types: f.data_types.as_ref().map(flat),
+    }
+}
+
+/// The codec reads a count of 0 as an empty list; AOSP writes null and an empty list alike (IntentFilter.writeToParcel), so empty is null.
+fn non_empty<T, U>(v: &[T], map: impl Fn(&T) -> U) -> Option<Vec<U>> {
+    (!v.is_empty()).then(|| v.iter().map(map).collect())
+}
+
+/// A parcelled PatternMatcher. A null pattern is not a valid filter (AOSP's matchPattern throws on it); it reads as "".
+fn pattern_of(p: &atl_parcelables::parts::PatternMatcher) -> pattern_matcher::Pattern {
+    pattern_matcher::Pattern {
+        pattern: p.pattern.clone().unwrap_or_default(),
+        kind: p.kind,
+        parsed: p.parsed_pattern.clone().unwrap_or_default(),
     }
 }
 

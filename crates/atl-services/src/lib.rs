@@ -27,6 +27,7 @@ pub mod desktop_bounds;
 pub mod focus;
 pub mod ime_bind;
 pub mod observer_rules;
+pub mod pattern_matcher;
 pub mod pending_intent_table;
 pub mod players;
 pub mod process_control;

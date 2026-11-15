@@ -13,6 +13,8 @@ use std::collections::{BTreeMap, VecDeque};
 
 use atl_services_types::permission;
 
+use crate::pattern_matcher::{self, Pattern};
+
 /// Context.RECEIVER_EXPORTED / RECEIVER_NOT_EXPORTED (Context.java:781, :795).
 pub const RECEIVER_EXPORTED: i32 = 0x2;
 pub const RECEIVER_NOT_EXPORTED: i32 = 0x4;
@@ -25,13 +27,24 @@ pub const BROADCAST_STICKY_CANT_HAVE_PERMISSION: i32 = -1;
 /// BroadcastController.DYNAMIC_RECEIVER_EXPLICIT_EXPORT_REQUIRED (:145-146): @EnabledSince(targetSdkVersion = UPSIDE_DOWN_CAKE), API 34.
 const EXPLICIT_EXPORT_REQUIRED_SDK: i32 = 34;
 
-/// An intent filter reduced to what broadcast matching reads (a registered IntentFilter is converted into it): actions, categories, `<data android:scheme>` and `<data android:mimeType>`.
+/// IntentFilter.AuthorityEntry: `host` without the `*` of `wild` (the parcel keeps it stripped), `port` -1 = any port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Authority {
+    pub host: String,
+    pub wild: bool,
+    pub port: i32,
+}
+
+/// An intent filter reduced to what broadcast matching reads (a registered IntentFilter is converted into it): actions, categories, `<data>` schemes, scheme-specific parts, authorities, paths and MIME types.
 /// None = the filter names none (IntentFilter's null lists), which matchData treats differently from an empty list.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Filter {
     pub actions: Vec<String>,
     pub categories: Option<Vec<String>>,
     pub schemes: Option<Vec<String>>,
+    pub ssps: Option<Vec<Pattern>>,
+    pub authorities: Option<Vec<Authority>>,
+    pub paths: Option<Vec<Pattern>>,
     pub types: Option<Vec<String>>,
 }
 
@@ -72,30 +85,100 @@ impl IntentKey {
         )
     }
 
-    /// Uri.getScheme of the data: the part before the first `:` when no `/`, `?` or `#` precedes it.
-    fn scheme(&self) -> Option<&str> {
+    /// Uri.findSchemeSeparator, reduced: the first ':' when no '/', '?' or '#' precedes it. None = relative (no scheme).
+    fn scheme_end(&self) -> Option<usize> {
         let data = self.data.as_deref()?;
         let end = data.find(':')?;
-        let scheme = &data[..end];
-        (!scheme.contains(['/', '?', '#'])).then_some(scheme)
+        (!data[..end].contains(['/', '?', '#'])).then_some(end)
+    }
+
+    /// Uri.getScheme of the data.
+    fn scheme(&self) -> Option<&str> {
+        let data = self.data.as_deref()?;
+        self.scheme_end().map(|end| &data[..end])
+    }
+
+    /// Uri.getSchemeSpecificPart (decoded): from after the scheme separator up to '#'. None = no data.
+    fn ssp(&self) -> Option<String> {
+        let data = self.data.as_deref()?;
+        let start = self.scheme_end().map_or(0, |end| end + 1);
+        let end = data[start..].find('#').map_or(data.len(), |i| start + i);
+        Some(uri_decode(&data[start..end]))
+    }
+
+    /// Uri.parseAuthority: the text after the `//` that follows the scheme separator, up to '/', '\', '?' or '#'. None = no authority.
+    fn authority(&self) -> Option<&str> {
+        let data = self.data.as_deref()?;
+        let start = self.scheme_end().map_or(0, |end| end + 1);
+        let after = data[start..].strip_prefix("//")?;
+        Some(
+            after
+                .split(['/', '\\', '?', '#'])
+                .next()
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Uri.getHost (decoded): after the last '@', before the port.
+    fn host(&self) -> Option<String> {
+        let authority = self.authority()?;
+        let start = authority.rfind('@').map_or(0, |i| i + 1);
+        let end = port_separator(authority).unwrap_or(authority.len());
+        Some(uri_decode(authority.get(start..end).unwrap_or_default()))
+    }
+
+    /// Uri.getPort: the digits after the port separator; -1 when there are none or they are not an int.
+    fn port(&self) -> i32 {
+        let Some(authority) = self.authority() else {
+            return -1;
+        };
+        let Some(sep) = port_separator(authority) else {
+            return -1;
+        };
+        authority[sep + 1..].parse().unwrap_or(-1)
+    }
+
+    /// Uri.getPath (decoded): the path after the authority, cut at '?' / '#'. None = opaque URI (no '/' after the scheme separator).
+    fn path(&self) -> Option<String> {
+        let data = self.data.as_deref()?;
+        let rest = match self.scheme_end() {
+            Some(end) if data[end + 1..].starts_with('/') => &data[end + 1..],
+            Some(_) => return None,
+            None => data,
+        };
+        // after the authority the path starts at its '/' or '\'; a '?' or '#' first leaves it empty
+        let path = match rest.strip_prefix("//") {
+            Some(after) => match after.find(['/', '\\', '?', '#']) {
+                Some(i) if matches!(after.as_bytes()[i], b'/' | b'\\') => &after[i..],
+                _ => "",
+            },
+            None => rest,
+        };
+        let end = path.find(['?', '#']).unwrap_or(path.len());
+        Some(uri_decode(&path[..end]))
     }
 }
 
-/// IntentFilter.match(action, type, scheme, data, categories) >= 0, for the parts the filter models (no authorities, paths or scheme-specific parts: the codec refuses those).
-/// matchAction:872-891 (a null action matches nothing), matchData:1742 (no types and no schemes: only a type-less, data-less intent; schemes: the intent's scheme, "" for none; no schemes: only
+/// IntentFilter.match(action, type, scheme, data, categories) >= 0 for the parts the filter models: actions, categories, schemes, scheme-specific parts, authorities, paths and types.
+/// Relative-reference filter groups are not modelled (the codec refuses them).
+/// matchAction:872-891 (a null action matches nothing), matchData:1742 (no types and no schemes: only a type-less, data-less intent; schemes: the intent's scheme, "" for none, then the data parts; no schemes: only
 /// none / "" / content / file; types: the resolved type by findMimeType, else a typed intent fails), matchCategories:1904 (every intent category in the filter).
 pub fn matches(f: &Filter, k: &IntentKey) -> bool {
     match_value(f, k).is_some()
 }
 
-/// IntentFilter.MATCH_CATEGORY_EMPTY, MATCH_CATEGORY_SCHEME, MATCH_CATEGORY_TYPE, MATCH_ADJUSTMENT_NORMAL (IntentFilter.java:246-279).
+/// IntentFilter.MATCH_CATEGORY_* and MATCH_ADJUSTMENT_NORMAL (IntentFilter.java:246-279).
 pub const MATCH_CATEGORY_EMPTY: i32 = 0x0100000;
 pub const MATCH_CATEGORY_SCHEME: i32 = 0x0200000;
+pub const MATCH_CATEGORY_HOST: i32 = 0x0300000;
+pub const MATCH_CATEGORY_PORT: i32 = 0x0400000;
+pub const MATCH_CATEGORY_PATH: i32 = 0x0500000;
+pub const MATCH_CATEGORY_SCHEME_SPECIFIC_PART: i32 = 0x0580000;
 pub const MATCH_CATEGORY_TYPE: i32 = 0x0600000;
 pub const MATCH_ADJUSTMENT_NORMAL: i32 = 0x8000;
 
 /// IntentFilter.match's positive result (what ResolveInfo.match carries), None for any NO_MATCH_*; the rules [`matches`] documents. matchData:1747-1832 starts at MATCH_CATEGORY_EMPTY, a matched
-/// scheme raises it to SCHEME, a matched type to TYPE, then adds MATCH_ADJUSTMENT_NORMAL.
+/// scheme raises it to SCHEME, the data parts (scheme-specific part, host, port, path: [`data_category`]) raise it to theirs, a matched type to TYPE, then adds MATCH_ADJUSTMENT_NORMAL.
 pub fn match_value(f: &Filter, k: &IntentKey) -> Option<i32> {
     let action = k.action.as_ref()?;
     if !f.actions.contains(action) {
@@ -114,7 +197,7 @@ pub fn match_value(f: &Filter, k: &IntentKey) -> Option<i32> {
                 if !schemes.iter().any(|s| s == scheme.unwrap_or("")) {
                     return None;
                 }
-                category = MATCH_CATEGORY_SCHEME;
+                category = data_category(f, k)?;
             }
             None => {
                 if !matches!(scheme, None | Some("" | "content" | "file")) {
@@ -138,6 +221,122 @@ pub fn match_value(f: &Filter, k: &IntentKey) -> Option<i32> {
         Some(cats) => k.categories.iter().all(|c| cats.contains(c)),
     };
     categories.then_some(category + MATCH_ADJUSTMENT_NORMAL)
+}
+
+/// matchData:1754-1801 after the scheme check: the scheme-specific part, else authority then path, else SCHEME (the filter names none of them). None = no match.
+fn data_category(f: &Filter, k: &IntentKey) -> Option<i32> {
+    // a missed SSP still goes on to the authorities (AOSP keeps match = NO_MATCH_DATA, which a matching authority overwrites); it is a miss only without them
+    let mut ssp_missed = false;
+    if let (Some(ssps), Some(ssp)) = (&f.ssps, k.ssp()) {
+        if ssps.iter().any(|p| pattern_matcher::matches(p, &ssp)) {
+            return Some(MATCH_CATEGORY_SCHEME_SPECIFIC_PART);
+        }
+        ssp_missed = true;
+    }
+    let Some(authorities) = &f.authorities else {
+        return (!ssp_missed).then_some(MATCH_CATEGORY_SCHEME);
+    };
+    let (host, port) = (k.host(), k.port());
+    let category = authorities
+        .iter()
+        .find_map(|a| match_authority(a, host.as_deref(), port))?;
+    let Some(paths) = &f.paths else {
+        return Some(category);
+    };
+    let path = k.path()?;
+    paths
+        .iter()
+        .any(|p| pattern_matcher::matches(p, &path))
+        .then_some(MATCH_CATEGORY_PATH)
+}
+
+/// AuthorityEntry.match(data, false), IntentFilter.java:1263-1293: PORT when the entry names a port, else HOST. None = no match.
+fn match_authority(a: &Authority, host: Option<&str>, port: i32) -> Option<i32> {
+    let mut host = host?;
+    if a.wild {
+        // `*.example.com` keeps ".example.com": the host's tail of that many chars must equal it, so a shorter host cannot match
+        let tail = host.chars().count().checked_sub(a.host.chars().count())?;
+        let whole = host;
+        host = whole
+            .char_indices()
+            .nth(tail)
+            .map_or("", |(i, _)| &whole[i..]);
+    }
+    if !eq_ignore_case(host, &a.host) {
+        return None;
+    }
+    if a.port >= 0 {
+        return (a.port == port).then_some(MATCH_CATEGORY_PORT);
+    }
+    Some(MATCH_CATEGORY_HOST)
+}
+
+/// String.compareToIgnoreCase == 0, per char (Java's CaseInsensitiveComparator): equal, or equal once upper-cased, or once lower-cased after upper-casing.
+fn eq_ignore_case(a: &str, b: &str) -> bool {
+    a.chars().count() == b.chars().count() && a.chars().zip(b.chars()).all(|(x, y)| fold_eq(x, y))
+}
+
+fn fold_eq(x: char, y: char) -> bool {
+    // Character.toUpperCase / toLowerCase: a single-char mapping, else the char itself
+    fn single(mut mapped: impl Iterator<Item = char>, c: char) -> char {
+        match (mapped.next(), mapped.next()) {
+            (Some(m), None) => m,
+            _ => c,
+        }
+    }
+    let (ux, uy) = (single(x.to_uppercase(), x), single(y.to_uppercase(), y));
+    x == y || ux == uy || single(ux.to_lowercase(), ux) == single(uy.to_lowercase(), uy)
+}
+
+/// Uri.findPortSeparator: the last ':' when only ASCII digits follow it, else None.
+fn port_separator(authority: &str) -> Option<usize> {
+    for (i, b) in authority.bytes().enumerate().rev() {
+        if b == b':' {
+            return Some(i);
+        }
+        if !b.is_ascii_digit() {
+            return None;
+        }
+    }
+    None
+}
+
+/// Uri.decode = UriCodec.decode(s, no '+' conversion, UTF-8, no throw): %XX bytes decoded as UTF-8, U+FFFD where AOSP writes it.
+/// A bad digit writes U+FFFD and the byte built so far (AOSP breaks out of the loop, then puts it); a truncated escape writes only U+FFFD.
+fn uri_decode(s: &str) -> String {
+    fn flush(out: &mut String, pending: &mut Vec<u8>) {
+        if !pending.is_empty() {
+            out.push_str(&String::from_utf8_lossy(pending));
+            pending.clear();
+        }
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut pending = Vec::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            flush(&mut out, &mut pending);
+            out.push(c);
+            continue;
+        }
+        let mut byte = 0u8;
+        for _ in 0..2 {
+            let Some(d) = chars.next() else {
+                flush(&mut out, &mut pending);
+                out.push(char::REPLACEMENT_CHARACTER);
+                return out;
+            };
+            let Some(v) = d.to_digit(16) else {
+                flush(&mut out, &mut pending);
+                out.push(char::REPLACEMENT_CHARACTER);
+                break;
+            };
+            byte = byte * 16 + v as u8;
+        }
+        pending.push(byte);
+    }
+    flush(&mut out, &mut pending);
+    out
 }
 
 /// IntentFilter.findMimeType, reduced: equal, `*/*` / `*`, or a partial type against `<base>/<sub>`. A partial type is `<base>/*` as the manifest writes it, or `<base>` as a parcelled
@@ -578,6 +777,216 @@ mod tests {
                 ..key("a.X")
             }
         ));
+    }
+
+    fn data_key(data: &str) -> IntentKey {
+        IntentKey {
+            action: Some("a.X".into()),
+            data: Some(data.into()),
+            ..Default::default()
+        }
+    }
+
+    fn auth(host: &str, wild: bool, port: i32) -> Authority {
+        Authority {
+            host: host.into(),
+            wild,
+            port,
+        }
+    }
+
+    fn pat(pattern: &str, kind: i32) -> Pattern {
+        Pattern {
+            pattern: pattern.into(),
+            kind,
+            parsed: Vec::new(),
+        }
+    }
+
+    /// scheme https with the given authorities and paths
+    fn https(authorities: Vec<Authority>, paths: Option<Vec<Pattern>>) -> Filter {
+        Filter {
+            actions: vec!["a.X".into()],
+            schemes: Some(vec!["https".into()]),
+            authorities: Some(authorities),
+            paths,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn data_parts_match_as_match_data() {
+        // PATH 0x500000, HOST 0x300000, PORT 0x400000, SSP 0x580000, SCHEME 0x200000, + MATCH_ADJUSTMENT_NORMAL 0x8000 (IntentFilter.java:246-275)
+        let with_path = https(
+            vec![auth("example.com", false, -1)],
+            Some(vec![pat("/app", pattern_matcher::PATTERN_PREFIX)]),
+        );
+        assert_eq!(
+            match_value(&with_path, &data_key("https://example.com/app/x")),
+            Some(0x508000)
+        );
+        assert_eq!(
+            match_value(&with_path, &data_key("https://other.com/app/x")),
+            None
+        );
+        assert_eq!(
+            match_value(&with_path, &data_key("https://example.com/other")),
+            None
+        );
+        assert_eq!(
+            match_value(&with_path, &data_key("https://EXAMPLE.com/app")),
+            Some(0x508000),
+            "compareToIgnoreCase"
+        );
+        let host_only = https(vec![auth("example.com", false, -1)], None);
+        assert_eq!(
+            match_value(&host_only, &data_key("https://example.com/z")),
+            Some(0x308000)
+        );
+        let with_port = https(vec![auth("example.com", false, 8080)], None);
+        assert_eq!(
+            match_value(&with_port, &data_key("https://example.com:8080/")),
+            Some(0x408000)
+        );
+        assert_eq!(
+            match_value(&with_port, &data_key("https://example.com:9090/")),
+            None
+        );
+        assert_eq!(
+            match_value(&with_port, &data_key("https://example.com/")),
+            None,
+            "no port reads as -1"
+        );
+        // parcel host `.example.com` with wild: `*.example.com`
+        let wild = https(vec![auth(".example.com", true, -1)], None);
+        assert_eq!(
+            match_value(&wild, &data_key("https://m.example.com/")),
+            Some(0x308000)
+        );
+        assert_eq!(match_value(&wild, &data_key("https://example.org/")), None);
+        // non-ASCII case folding as Character.toUpperCase: 'Ü' == 'ü'
+        let umlaut = https(vec![auth("bücher.de", false, -1)], None);
+        assert_eq!(
+            match_value(&umlaut, &data_key("https://BÜCHER.de/")),
+            Some(0x308000)
+        );
+        let tel = Filter {
+            actions: vec!["a.X".into()],
+            schemes: Some(vec!["tel".into()]),
+            ssps: Some(vec![pat("123", pattern_matcher::PATTERN_LITERAL)]),
+            ..Default::default()
+        };
+        assert_eq!(match_value(&tel, &data_key("tel:123")), Some(0x588000));
+        assert_eq!(match_value(&tel, &data_key("tel:456")), None);
+        // the path is percent-decoded before matching
+        let decoded = https(
+            vec![auth("example.com", false, -1)],
+            Some(vec![pat("/a b", pattern_matcher::PATTERN_LITERAL)]),
+        );
+        assert_eq!(
+            match_value(&decoded, &data_key("https://example.com/a%20b")),
+            Some(0x508000)
+        );
+        // scheme only: the filter names no data part
+        let scheme_only = Filter {
+            actions: vec!["a.X".into()],
+            schemes: Some(vec!["https".into()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            match_value(&scheme_only, &data_key("https://x/y")),
+            Some(0x208000)
+        );
+    }
+
+    #[test]
+    fn a_missed_ssp_falls_through_to_the_authority() {
+        // matchData:1763-1797: a missed SSP still tries the authorities; without them it is a miss
+        let f = Filter {
+            actions: vec!["a.X".into()],
+            schemes: Some(vec!["https".into()]),
+            ssps: Some(vec![pat("x", pattern_matcher::PATTERN_LITERAL)]),
+            authorities: Some(vec![auth("example.com", false, -1)]),
+            ..Default::default()
+        };
+        assert_eq!(
+            match_value(&f, &data_key("https://example.com/")),
+            Some(0x308000)
+        );
+        let no_authority = Filter {
+            authorities: None,
+            ..f.clone()
+        };
+        assert_eq!(
+            match_value(&no_authority, &data_key("https://example.com/")),
+            None
+        );
+    }
+
+    #[test]
+    fn authority_and_path_follow_uri_parsing() {
+        let with_port = https(vec![auth("example.com", false, 8080)], None);
+        // userinfo ends at the last '@'; the port follows the host
+        assert_eq!(
+            match_value(&with_port, &data_key("https://u:p@example.com:8080")),
+            Some(0x408000)
+        );
+        let host = https(vec![auth("example.com", false, -1)], None);
+        assert_eq!(
+            match_value(&host, &data_key("https://example.com:")),
+            Some(0x308000),
+            "an empty port reads as -1"
+        );
+        assert_eq!(
+            match_value(&host, &data_key("https://example.com?x=/")),
+            Some(0x308000),
+            "'?' ends the host"
+        );
+        // opaque URI: no authority, so an authority filter misses
+        let mailto = Filter {
+            actions: vec!["a.X".into()],
+            schemes: Some(vec!["mailto".into()]),
+            authorities: Some(vec![auth("example.com", false, -1)]),
+            ..Default::default()
+        };
+        assert_eq!(
+            match_value(&mailto, &data_key("mailto:x@example.com")),
+            None
+        );
+        // no path after the host reads as "": PREFIX "/" misses it, PREFIX "" takes it
+        let prefix_slash = https(
+            vec![auth("example.com", false, -1)],
+            Some(vec![pat("/", pattern_matcher::PATTERN_PREFIX)]),
+        );
+        assert_eq!(
+            match_value(&prefix_slash, &data_key("https://example.com")),
+            None
+        );
+        assert_eq!(
+            match_value(&prefix_slash, &data_key("https://example.com?q")),
+            None
+        );
+        assert_eq!(
+            match_value(&prefix_slash, &data_key("https://example.com/?q")),
+            Some(0x508000)
+        );
+        let any_path = https(
+            vec![auth("example.com", false, -1)],
+            Some(vec![pat("", pattern_matcher::PATTERN_PREFIX)]),
+        );
+        assert_eq!(
+            match_value(&any_path, &data_key("https://example.com")),
+            Some(0x508000)
+        );
+    }
+
+    #[test]
+    fn uri_decode_follows_uri_codec() {
+        assert_eq!(uri_decode("a%20b%41%C3%A9+"), "a bAé+");
+        // a truncated escape is U+FFFD; a bad digit is U+FFFD plus the byte built so far, and the bad digit is consumed (UriCodec.java:128)
+        assert_eq!(uri_decode("%4"), "\u{FFFD}");
+        assert_eq!(uri_decode("%4z"), "\u{FFFD}\u{4}");
+        assert_eq!(uri_decode("%FF"), "\u{FFFD}");
     }
 
     #[test]
