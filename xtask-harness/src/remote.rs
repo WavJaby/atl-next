@@ -1868,7 +1868,10 @@ mod tests {
             "<dir>@BASE@/out/fonts/files</dir>"
         );
         // a root followed by a name character is another path
-        assert_eq!(relocate("/w/out/pool/ws/x9.bak", &r), "/w/out/pool/ws/x9.bak");
+        assert_eq!(
+            relocate("/w/out/pool/ws/x9.bak", &r),
+            "/w/out/pool/ws/x9.bak"
+        );
         // the bundle's `lib/` stands for the host's LLVM runtimes
         assert_eq!(
             relocate("--lib-path=/w/out/pool/ws/x9/a:/usr/lib/llvm-19/lib", &r),

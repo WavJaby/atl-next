@@ -1118,7 +1118,10 @@ mod tests {
                 format!("publish {land}")
             ]
         );
-        assert_eq!(parse_build_dir("x\nland-build-dir: current\n").unwrap(), None);
+        assert_eq!(
+            parse_build_dir("x\nland-build-dir: current\n").unwrap(),
+            None
+        );
         assert_eq!(
             parse_build_dir("land-build-dir: stale no record\n")
                 .unwrap()
