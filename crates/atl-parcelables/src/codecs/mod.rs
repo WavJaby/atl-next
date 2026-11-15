@@ -14,6 +14,7 @@ pub mod android {
         pub mod PendingIntent;
         pub mod job {
             pub mod JobInfo;
+            pub mod JobParameters;
             pub mod JobWorkItem;
         }
         pub mod servertransaction {

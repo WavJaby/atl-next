@@ -188,6 +188,12 @@ struct Args {
     /// Test only: passed to the services (`--no-back-finish`), the deliberate break of the dialog gate's back sub-gate.
     #[arg(long)]
     no_back_finish: bool,
+    /// Test only: passed to the services (`--no-bind-service`), the deliberate break of the app gate's bound-service and jobscheduler lines: every bindService answers 0.
+    #[arg(long)]
+    no_bind_service: bool,
+    /// Test only: passed to the services (`--no-job-runner`), the deliberate break of the app gate's jobscheduler line: jobs are stored, never run.
+    #[arg(long)]
+    no_job_runner: bool,
     /// What an unhandled Back on an app's root activity does, passed to the services: `minimize` (the window is minimized, the app keeps running; Android 12+) or `close` (the app's window closes).
     #[arg(long, value_parser = ["minimize", "close"], default_value = "minimize")]
     root_back: String,
@@ -2135,6 +2141,12 @@ fn run(a: &Args) -> Result<ExitCode> {
     }
     if a.no_back_finish {
         services_args.push("--no-back-finish".into());
+    }
+    if a.no_bind_service {
+        services_args.push("--no-bind-service".into());
+    }
+    if a.no_job_runner {
+        services_args.push("--no-job-runner".into());
     }
     services_args.push("--root-back".into());
     services_args.push(a.root_back.clone().into());

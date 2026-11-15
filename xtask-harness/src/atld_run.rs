@@ -256,6 +256,10 @@ pub struct Runtime {
     new_intent: bool,
     /// Starts owe their callers a result unless this is cleared (`--no-activity-result`, the app gate's deliberate break).
     activity_result: bool,
+    /// bindService works unless this is cleared (`--no-bind-service`, the app gate's bound-service break).
+    bind_service: bool,
+    /// The jobscheduler runs jobs unless this is cleared (`--no-job-runner`, the app gate's job-runner break).
+    job_runner: bool,
     /// An unhandled Back finishes an activity unless this is cleared (`--no-back-finish`, the dialog gate's back sub-gate's deliberate break).
     back_finish: bool,
     /// An unhandled Back on the root closes it instead of minimizing (atld `--root-back close`, the dialog gate's minimize sub-gate's deliberate break).
@@ -729,6 +733,8 @@ impl Runtime {
             ime_death_link: true,
             new_intent: true,
             activity_result: true,
+            bind_service: true,
+            job_runner: true,
             back_finish: true,
             root_back_close: false,
             sensor_service: true,
@@ -1026,6 +1032,18 @@ impl Runtime {
     /// Starts owe their callers no result (atld `--no-activity-result`): the app gate's result sub-gate must then fail.
     pub fn without_activity_result(mut self) -> Self {
         self.activity_result = false;
+        self
+    }
+
+    /// Every bindService answers 0 (atld `--no-bind-service`): the app gate's bound-service and jobscheduler lines must then fail.
+    pub fn without_bind_service(mut self) -> Self {
+        self.bind_service = false;
+        self
+    }
+
+    /// The jobscheduler never runs a job (atld `--no-job-runner`): the app gate's jobscheduler line must then fail.
+    pub fn without_job_runner(mut self) -> Self {
+        self.job_runner = false;
         self
     }
 
@@ -1566,6 +1584,12 @@ impl Runtime {
         }
         if !self.activity_result {
             cmd.arg("--no-activity-result");
+        }
+        if !self.bind_service {
+            cmd.arg("--no-bind-service");
+        }
+        if !self.job_runner {
+            cmd.arg("--no-job-runner");
         }
         if !self.back_finish {
             cmd.arg("--no-back-finish");

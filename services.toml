@@ -19,8 +19,20 @@ src = [
     "crates/atl-services/src/broadcast.rs",
     "crates/atl-services/src/broadcast_queue.rs",
     "crates/atl-services/src/running_processes.rs",
+    "crates/atl-services/src/active_services.rs",
+    "crates/atl-services/src/bound_services.rs",
 ]
 mirrors = [
+    "frameworks/base/services/core/java/com/android/server/am/ActiveServices.java#bindServiceLocked",
+    "frameworks/base/services/core/java/com/android/server/am/ActiveServices.java#requestServiceBindingLocked",
+    "frameworks/base/services/core/java/com/android/server/am/ActiveServices.java#realStartServiceLocked",
+    "frameworks/base/services/core/java/com/android/server/am/ActiveServices.java#publishServiceLocked",
+    "frameworks/base/services/core/java/com/android/server/am/ActiveServices.java#unbindServiceLocked",
+    "frameworks/base/services/core/java/com/android/server/am/ActiveServices.java#removeConnectionLocked",
+    "frameworks/base/services/core/java/com/android/server/am/ActiveServices.java#bringDownServiceLocked",
+    "frameworks/base/services/core/java/com/android/server/am/ActiveServices.java#unbindFinishedLocked",
+    "frameworks/base/services/core/java/com/android/server/am/ActiveServices.java#killServicesLocked",
+    "frameworks/base/services/core/java/com/android/server/am/ActiveServices.java#attachApplicationLocked",
     "frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java#getRunningAppProcesses",
     "frameworks/base/services/core/java/com/android/server/am/ProcessList.java#getRunningAppProcessesLOSP",
     "frameworks/base/services/core/java/com/android/server/am/ProcessList.java#fillInProcMemInfoLOSP",
@@ -218,6 +230,14 @@ mirrors = [
     "frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobSchedulerService.java#cancelJobsForUid",
     "frameworks/base/apex/jobscheduler/framework/java/android/app/job/JobInfo.java#writeToParcel",
     "frameworks/base/apex/jobscheduler/framework/java/android/app/job/JobWorkItem.java#writeToParcel",
+    "frameworks/base/apex/jobscheduler/framework/java/android/app/job/JobParameters.java#writeToParcel",
+    "frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobServiceContext.java#executeRunnableJob",
+    "frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobServiceContext.java#doDequeueWork",
+    "frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobServiceContext.java#doCompleteWork",
+    "frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobServiceContext.java#handleStartedLocked",
+    "frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobServiceContext.java#closeAndCleanupJobLocked",
+    "frameworks/base/apex/jobscheduler/service/java/com/android/server/job/controllers/JobStatus.java#dequeueWorkLocked",
+    "frameworks/base/apex/jobscheduler/service/java/com/android/server/job/controllers/JobStatus.java#completeWorkLocked",
 ]
 
 [content]

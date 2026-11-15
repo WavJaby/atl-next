@@ -81,6 +81,12 @@ struct Args {
     /// Test only: onBackPressed sends no requestFinish, the deliberate break of the dialog gate's back sub-gate (no activity finishes on an unhandled Back).
     #[arg(long)]
     no_back_finish: bool,
+    /// Test only: every bindService answers 0 (no such service), the deliberate break of the app gate's bound-service and jobscheduler lines (no ServiceConnection connects, no job starts).
+    #[arg(long)]
+    no_bind_service: bool,
+    /// Test only: the jobscheduler stores jobs and never runs them, the deliberate break of the app gate's jobscheduler line (no onStartJob).
+    #[arg(long)]
+    no_job_runner: bool,
     /// What an unhandled Back on a Task's launcher root does: `minimize` (Android 12+ moveTaskToBack; the app keeps running) or `close` (the root finishes; pre-Android-12).
     #[arg(long, value_parser = parse_root_back, default_value = "minimize")]
     root_back: RootBack,
@@ -229,6 +235,7 @@ fn main() -> Result<()> {
         Arc::clone(&agents),
         !a.no_back_finish,
         a.root_back,
+        !a.no_bind_service,
     );
     if let Some(package) = &a.launch
         && packages.by_name(package).is_none()
@@ -410,6 +417,7 @@ fn main() -> Result<()> {
             atl_services::job_scheduler::new_binder(
                 Arc::clone(&packages),
                 Arc::clone(&permissions),
+                (!a.no_job_runner).then(|| activity.clone()),
             ),
         )
         .context("addService jobscheduler")?;

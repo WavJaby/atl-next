@@ -21,6 +21,7 @@ use atl_aidl::aidl::android::app::IActivityManager::{EnforcePermission, IActivit
 use atl_aidl::aidl::android::app::IApplicationThread::IApplicationThread;
 use atl_aidl::aidl::android::app::IInstrumentationWatcher::IInstrumentationWatcher;
 use atl_aidl::aidl::android::app::IRequestFinishCallback::IRequestFinishCallback;
+use atl_aidl::aidl::android::app::IServiceConnection::IServiceConnection;
 use atl_aidl::aidl::android::app::IUiAutomationConnection::IUiAutomationConnection;
 use atl_aidl::aidl::android::content::IIntentReceiver::IIntentReceiver;
 use atl_aidl::aidl::android::content::IIntentSender::IIntentSender;
@@ -69,6 +70,9 @@ use atl_services_types::display_model::DisplayModel;
 use atl_services_types::permission::{self, ROOT_UID, SHELL_UID, SYSTEM_UID};
 use atl_services_types::size_buckets::SizeBuckets;
 use atl_services_wire::ui_agent::IUiAgent;
+
+#[path = "active_services.rs"]
+mod active_services;
 
 const AM: &str = "IActivityManager";
 const ACC: &str = "IActivityClientController";
@@ -368,6 +372,8 @@ struct State {
     shared_memory: Option<ApplicationSharedMemory>,
     /// BroadcastController's registrations and stickies, and the deliveries waiting for a process to attach
     broadcasts: Broadcasts<ReceiverHandle, Intent, Job>,
+    /// ActiveServices' bound services (bound_services.rs)
+    services: active_services::Services,
 }
 
 /// An IIntentReceiver as a registration key: equal when the binder is (mRegisteredReceivers is keyed by `receiver.asBinder()`).
@@ -499,6 +505,10 @@ struct Inner {
     broadcast_queue: broadcast_queue::Queue,
     /// the PendingIntent records (pending_intent.rs)
     pending: PendingIntents,
+    /// the sender of the bound-service calls (active_services.rs)
+    service_calls: active_services::Outbox,
+    /// false is the test-only break (`--no-bind-service`): every bindService answers 0 (no such service), so ServiceConnection and the job runner never connect
+    bind_services: bool,
 }
 
 /// The service; a clone shares it (one is registered with servicemanager, another starts the launcher package).
@@ -556,7 +566,9 @@ fn under_policy(back: Back, root: RootBack) -> Back {
 
 impl ActivityManager {
     /// `tasks` is the table the window service and the registry read: the launch binds each activity it starts to its Task there. `agents` are the apps' UI agents: a root Back minimizes through them.
-    /// `back_finish` false is the test-only break (`--no-back-finish`): see [`ActivityClientController::back_finish`]. `root_back`: see [`RootBack`].
+    /// `back_finish` false is the test-only break (`--no-back-finish`): see [`ActivityClientController::back_finish`]. `root_back`: see [`RootBack`]. `bind_services` false is the test-only
+    /// break `--no-bind-service`: every bindService answers 0.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         packages: Arc<Packages>,
         permissions: Arc<Permissions>,
@@ -565,6 +577,7 @@ impl ActivityManager {
         agents: Arc<UiAgents>,
         back_finish: bool,
         root_back: RootBack,
+        bind_services: bool,
     ) -> Self {
         let buckets = Arc::new(ReportedBuckets::default());
         ActivityManager {
@@ -597,6 +610,8 @@ impl ActivityManager {
                     buckets,
                     broadcast_queue: broadcast_queue::Queue::new(),
                     pending: PendingIntents::default(),
+                    service_calls: active_services::Outbox::new(),
+                    bind_services,
                 }
             }),
         }
@@ -621,6 +636,24 @@ impl ActivityManager {
 
     /// startActivity with no caller app thread (`am start`, a home screen): checked by activity_start::check_shell; accepted -> the package's process is started through the
     /// control and its launcher launched on attach (ActivityTaskManagerService.startProcessAsync, then realStartActivityLocked from attachApplication). Ok: the START code.
+    /// The services' own bind (the job runner: JobServiceContext.executeRunnableJob's bindServiceAsUser): bindServiceLocked as the system uid. bindService's code: 1 bound, 0 no such service, -1 denied.
+    pub fn bind_service_as_system(
+        &self,
+        intent: &Intent,
+        conn: Strong<dyn IServiceConnection>,
+        flags: i64,
+    ) -> i32 {
+        self.inner
+            .bind_service_as_system(intent, conn, flags)
+            .code()
+    }
+
+    /// unbindService of a connection [`Self::bind_service_as_system`] made; false when it had no bindings.
+    pub fn unbind_service_as_system(&self, conn: Strong<dyn IServiceConnection>) -> bool {
+        let mut st = self.inner.state();
+        self.inner.unbind_service_locked(&mut st, conn)
+    }
+
     pub(crate) fn start_without_caller(
         &self,
         calling_uid: u32,
@@ -956,6 +989,7 @@ impl Inner {
         for mut rec in stopped {
             pids.push(rec.pid);
             Self::broadcasts_died(st, rec.pid);
+            self.services_died(st, rec.pid);
             if let Some(instr) = rec.instr.take() {
                 // the process is being killed with its package: the same CANCELED a crash reports (no further force stop: the package's processes are all gone)
                 self.report_finished(instr, RESULT_CANCELED, Some(crash_info()));
@@ -1030,6 +1064,7 @@ impl Inner {
                 self.atm.process_died(&a.thread.as_binder());
             }
             Self::broadcasts_died(&mut st, pid);
+            self.services_died(&mut st, pid);
             log(format_args!(
                 "process {} (pid {pid}) died",
                 rec.process_name
@@ -1521,6 +1556,141 @@ impl IActivityManager for ActivityManager {
         if let Some(r) = st.processes.iter_mut().find(|r| r.pid == pid) {
             r.broadcasts_attached = true;
         }
+        // :4921 mServices.attachApplicationLocked: the services that waited for this process start (their order against the broadcasts is no app's concern: separate senders, as in AOSP)
+        inner.services_attached(&mut st, pid);
+        Ok(())
+    }
+
+    /// bindService (the greylisted form) -> bindServiceInstance without an instance name.
+    fn r#bindService(
+        &self,
+        caller: Option<&Strong<dyn IApplicationThread>>,
+        token: Option<&SpIBinder>,
+        service: Option<&Intent>,
+        resolved_type: Option<&str>,
+        connection: Option<&Strong<dyn IServiceConnection>>,
+        flags: i64,
+        calling_package: Option<&str>,
+        user_id: i32,
+    ) -> binder::Result<i32> {
+        self.r#bindServiceInstance(
+            caller,
+            token,
+            service,
+            resolved_type,
+            connection,
+            flags,
+            None,
+            calling_package,
+            user_id,
+        )
+    }
+
+    /// ActivityManagerService.bindServiceInstance -> ActiveServices.bindServiceLocked: the caller must be an attached app (SecurityException "Unable to find app for caller"), then the lookup,
+    /// checkComponentPermission and the binding rules (active_services.rs, bound_services.rs). ContextImpl turns -1 into SecurityException and 0 into a false bindService.
+    fn r#bindServiceInstance(
+        &self,
+        caller: Option<&Strong<dyn IApplicationThread>>,
+        _token: Option<&SpIBinder>,
+        service: Option<&Intent>,
+        _resolved_type: Option<&str>,
+        connection: Option<&Strong<dyn IServiceConnection>>,
+        flags: i64,
+        instance_name: Option<&str>,
+        _calling_package: Option<&str>,
+        _user_id: i32,
+    ) -> binder::Result<i32> {
+        let inner = &self.inner;
+        let uid = ThreadState::get_calling_uid();
+        let mut st = inner.state();
+        let client = caller.and_then(|c| Inner::record_for_thread(&st, c));
+        let Some(client_pid) = client else {
+            return Err(security(&format!(
+                "Unable to find app for caller (pid={}) when binding service",
+                ThreadState::get_calling_pid()
+            )));
+        };
+        let (Some(intent), Some(conn)) = (service, connection) else {
+            return Err(Status::new_exception_str(
+                ExceptionCode::NULL_POINTER,
+                Some("bindService: null service or connection"),
+            ));
+        };
+        if instance_name.is_some() {
+            atl_diag::answered(AM, "bindServiceInstance: instanceName ignored");
+        }
+        Ok(inner
+            .bind_service_locked(&mut st, client_pid, uid, intent, conn.clone(), flags)
+            .code())
+    }
+
+    /// ActiveServices.unbindServiceLocked: false when the connection has no bindings.
+    fn r#unbindService(
+        &self,
+        connection: Option<&Strong<dyn IServiceConnection>>,
+    ) -> binder::Result<bool> {
+        let Some(conn) = connection else {
+            return Ok(false);
+        };
+        let mut st = self.inner.state();
+        Ok(self.inner.unbind_service_locked(&mut st, conn.clone()))
+    }
+
+    /// ActiveServices.publishServiceLocked: the service's onBind result reaches the binding's connections. A null token is IllegalArgumentException ("Invalid service token").
+    /// A token of no current record is ignored: AOSP's token is the ServiceRecord itself, so a publish that arrives after the service was brought down (its last client unbound while onBind ran)
+    /// finds no binding and does nothing. A forged token, which AOSP refuses, is ignored too: the services keep no record of tokens they minted once the record is gone.
+    fn r#publishService(
+        &self,
+        token: Option<&SpIBinder>,
+        intent: Option<&Intent>,
+        service: Option<&SpIBinder>,
+    ) -> binder::Result<()> {
+        let (Some(token), Some(intent)) = (token, intent) else {
+            return Err(illegal_argument("Invalid service token"));
+        };
+        let inner = &self.inner;
+        let mut st = inner.state();
+        let mut calls = Vec::new();
+        if !st.services.publish(
+            token,
+            &intent_key(intent, None),
+            service.cloned(),
+            &mut calls,
+        ) {
+            atl_diag::answered(AM, "publishService: service already brought down (ignored)");
+        }
+        inner.service_calls.post(calls);
+        Ok(())
+    }
+
+    /// ActiveServices.unbindFinishedLocked: onUnbind returned true.
+    fn r#unbindFinished(
+        &self,
+        token: Option<&SpIBinder>,
+        service: Option<&Intent>,
+    ) -> binder::Result<()> {
+        let (Some(token), Some(intent)) = (token, service) else {
+            return Err(illegal_argument("Invalid service token"));
+        };
+        let inner = &self.inner;
+        let mut st = inner.state();
+        let mut calls = Vec::new();
+        st.services
+            .unbind_finished(token, &intent_key(intent, None), &mut calls);
+        inner.service_calls.post(calls);
+        Ok(())
+    }
+
+    /// serviceDoneExecuting: the app finished a scheduled service call. Accepted: nothing waits on it (no service ANR timeouts).
+    fn r#serviceDoneExecuting(
+        &self,
+        _token: Option<&SpIBinder>,
+        _type: i32,
+        _start_id: i32,
+        _res: i32,
+        _intent: Option<&Intent>,
+    ) -> binder::Result<()> {
+        atl_diag::answered(AM, "serviceDoneExecuting");
         Ok(())
     }
 

@@ -70,6 +70,12 @@ pub struct Args {
     /// The result break: the services owe no start its result (atld `--no-activity-result`), so Main's startActivityForResult answers never arrive and the result lines must go red.
     #[arg(long)]
     result_break: bool,
+    /// The bound-service break: every bindService answers 0 (atld `--no-bind-service`), so no ServiceConnection connects and no job service is bound: the bound-service and jobrun lines must go red.
+    #[arg(long)]
+    bind_break: bool,
+    /// The job-runner break: the jobscheduler stores jobs and never runs them (atld `--no-job-runner`), so AtlJob.onStartJob never runs and the jobrun line must go red.
+    #[arg(long)]
+    job_runner_break: bool,
     /// The routing break: the legacy fixture is linked without DT_NEEDED `libc.so`, so the NativeBridge core refuses it, glibc's dlerror surfaces and the legacy rows must go red.
     #[arg(long)]
     legacy_no_libc: bool,
@@ -227,6 +233,31 @@ const WEBVIEW_PACKAGE: (&str, &str) = (
 );
 /// Where the run places the provider, as AOSP's product image does (media_product.mk `webview`): `<partition>/app/<module>/<module>.apk` (build/soong/java/app.go installPath).
 const WEBVIEW_PROVIDER: &str = "app/webview/webview.apk";
+
+/// Lines the fixture logs after onCreate, from binder callbacks: (row, line prefix, expected value). The watch waits for all of them (up to RESULT_WAIT).
+/// bindservice: Main.bound's bindService(AtlBound, BIND_AUTO_CREATE) answers true (bindServiceLocked found the service: code 1).
+/// bound: its onServiceConnected names AtlBound and the binder it got is AtlBound's (FIRST_CALL_TRANSACTION answers AtlBound.ANSWER, 42).
+/// unbind: unbindService from onServiceConnected reaches AtlBound.onUnbind with the bound Intent (action atl.test.BIND): the last connection left (removeConnectionLocked -> scheduleUnbindService).
+/// jobrun: Main.jobRun's job 9 runs (onStartJob) and drains its one work item: action atl.test.WORK, delivery count 1 (JobStatus.dequeueWorkLocked bumps it from 0 on its first delivery),
+/// completeWork accepted (JobParameters.completeWork throws when the item is not executing), then dequeueWork answers null (the last work dequeued finishes the job).
+const ASYNC_LINES: [(&str, &str, &str); 4] = [
+    ("bindservice", "AtlTest: bindservice: ", "bindService=true"),
+    (
+        "bound",
+        "AtlTest: bound: ",
+        "connected=com.example.atltest.AtlBound answer=42",
+    ),
+    (
+        "unbind",
+        "AtlTest: unbind: ",
+        "onUnbind action=atl.test.BIND",
+    ),
+    (
+        "jobrun",
+        "AtlTest: jobrun: ",
+        "started=9 work=atl.test.WORK delivery=1 completed=true next=null",
+    ),
+];
 
 /// A [`SERVICE_LINES`] expectation: the fixed value, or for connectivity (None) [`connectivity_want`].
 fn service_want(fixed: Option<&str>) -> String {
@@ -1129,6 +1160,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         rt
     };
+    let rt = if args.bind_break {
+        rt.without_bind_service()
+    } else {
+        rt
+    };
+    let rt = if args.job_runner_break {
+        rt.without_job_runner()
+    } else {
+        rt
+    };
     let rt = if args.result_break {
         rt.without_activity_result()
     } else {
@@ -1252,9 +1293,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let mut ended = ended;
     if passed && ended.is_none() {
         let watch = Instant::now();
+        let waiting = || {
+            let log = read(&app_log);
+            !log.contains(PERMISSION_REQUEST)
+                || ASYNC_LINES
+                    .iter()
+                    .any(|(_, prefix, _)| !log.contains(prefix))
+        };
         while ended.is_none()
             && (watch.elapsed() < Duration::from_millis(WINDOW_MS)
-                || (watch.elapsed() < RESULT_WAIT && !read(&app_log).contains(PERMISSION_REQUEST)))
+                || (watch.elapsed() < RESULT_WAIT && waiting()))
         {
             ended = atld_child.try_wait()?;
             if ended.is_none() && run.app_ended() {
@@ -1349,6 +1397,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .find_map(|l| l.split_once(prefix).map(|(_, r)| r.to_owned()));
         if passed && got.as_deref() != Some(want.as_str()) {
             whys.push(format!("{service}: want {want:?}, got {got:?}"));
+        }
+    }
+    for (row, prefix, want) in ASYNC_LINES {
+        let got = app
+            .lines()
+            .find_map(|l| l.split_once(prefix).map(|(_, r)| r.trim_end().to_owned()));
+        if passed && got.as_deref() != Some(want) {
+            whys.push(format!("{row}: want {want:?}, got {got:?}"));
         }
     }
     let signatures = app.lines().find_map(|l| {
@@ -1525,6 +1581,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         );
         for (service, _, want) in SERVICE_LINES {
             println!("app: pass {service} {}", service_want(want));
+        }
+        for (row, _, want) in ASYNC_LINES {
+            println!("app: pass {row} {want}");
         }
         println!("app: pass processes {PROCESSES_WANT}");
         println!(

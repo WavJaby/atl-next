@@ -141,6 +141,8 @@ public class Main extends Activity {
         Log.i("AtlTest", "power: " + power());
         Log.i("AtlTest", "uimode: " + uiMode());
         Log.i("AtlTest", "jobscheduler: " + jobs());
+        jobRun();
+        Log.i("AtlTest", "bindservice: " + bound());
         Log.i("AtlTest", "pendingintent: " + pendingIntent());
         Log.i("AtlTest", "processes: " + processes());
         Log.i("AtlTest", "features: " + features());
@@ -394,6 +396,53 @@ public class Main extends Activity {
     }
 
     /** JobIntentService's path: enqueue the same job twice (its work joins one job), read it back, cancel it; a job naming an activity as its service is refused. "absent" when getSystemService returns null. */
+    /** JobIntentService's run: one work item for AtlJob.WORK_JOB, which AtlJob drains and logs (`jobrun:`). A failure to enqueue shows as the absent line. */
+    private void jobRun() {
+        try {
+            android.app.job.JobScheduler js = (android.app.job.JobScheduler) getSystemService(JOB_SCHEDULER_SERVICE);
+            if (js != null) {
+                js.enqueue(new android.app.job.JobInfo.Builder(AtlJob.WORK_JOB, new android.content.ComponentName(this, AtlJob.class)).setOverrideDeadline(0).build(),
+                        new android.app.job.JobWorkItem(new Intent("atl.test.WORK")));
+            }
+        } catch (Throwable t) {
+            Log.i("AtlTest", "jobrun: threw " + t);
+        }
+    }
+
+    /** bindService(AtlBound, BIND_AUTO_CREATE): onServiceConnected calls the service's binder (`bound:`), then unbinds, which reaches AtlBound.onUnbind (`unbind:`). Returns bindService's answer. */
+    private String bound() {
+        try {
+            Intent intent = new Intent("atl.test.BIND").setClass(this, AtlBound.class);
+            boolean ok = bindService(intent, new android.content.ServiceConnection() {
+                @Override
+                public void onServiceConnected(android.content.ComponentName name, android.os.IBinder service) {
+                    String answer;
+                    android.os.Parcel data = android.os.Parcel.obtain();
+                    android.os.Parcel reply = android.os.Parcel.obtain();
+                    try {
+                        service.transact(android.os.IBinder.FIRST_CALL_TRANSACTION, data, reply, 0);
+                        answer = String.valueOf(reply.readInt());
+                    } catch (Throwable t) {
+                        answer = "threw " + t;
+                    } finally {
+                        data.recycle();
+                        reply.recycle();
+                    }
+                    Log.i("AtlTest", "bound: connected=" + name.getClassName() + " answer=" + answer);
+                    unbindService(this);
+                }
+
+                @Override
+                public void onServiceDisconnected(android.content.ComponentName name) {
+                    Log.i("AtlTest", "bound-lost: " + name.getClassName());
+                }
+            }, BIND_AUTO_CREATE);
+            return "bindService=" + ok;
+        } catch (Throwable t) {
+            return "threw " + t;
+        }
+    }
+
     private String jobs() {
         try {
             android.app.job.JobScheduler js = (android.app.job.JobScheduler) getSystemService(JOB_SCHEDULER_SERVICE);

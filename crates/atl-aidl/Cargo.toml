@@ -72,6 +72,9 @@ types = [
     "android.app.IAlarmManager",
     # the jobscheduler service (job_scheduler.rs)
     "android.app.job.IJobScheduler",
+    # the jobscheduler's job runner (job_scheduler.rs, JobServiceContext): the app's JobService and the callback the system serves
+    "android.app.job.IJobService",
+    "android.app.job.IJobCallback",
     # the activity service's PendingIntent records (pending_intent.rs): BnIntentSender
     "android.content.IIntentSender",
     # the connectivity service (connectivity.rs) and the client Messenger its network callbacks go to

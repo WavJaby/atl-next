@@ -116,6 +116,24 @@ pub fn activity_info(
     a
 }
 
+/// PackageInfoUtils.generateServiceInfo of `service` for `flags`: what scheduleCreateService carries (ServiceRecord.serviceInfo, resolved by the bind, enabled or not).
+pub fn service_info(
+    p: &PackageRecord,
+    packages: &Packages,
+    service: &ServiceInfo,
+    flags: i64,
+) -> ServiceInfo {
+    let mut s = service.clone();
+    let matched = cut(
+        p,
+        packages,
+        &mut s.component,
+        flags | crate::packages::MATCH_DISABLED_COMPONENTS,
+    );
+    debug_assert!(matched.is_some());
+    s
+}
+
 /// ComputerEngine.queryContentProviders for one package (ContentProviderHelper.generateApplicationProvidersLocked's call): its providers that match `flags` and have an authority in `process`,
 /// higher initOrder first (sProviderInitOrderSorter). Equal orders stay in manifest order; AOSP leaves them in its map's order, which no app can rely on.
 pub fn process_providers(
