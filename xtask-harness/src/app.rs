@@ -390,7 +390,8 @@ const WEBVIEW_PAGE: (&str, &str) = (
 /// sdkext: Main.onCreate's SdkExtensions.getExtensionVersion for R and AD_SERVICES (not a binder callback; logged in onCreate). The values are the build.prop rows
 /// sdkext.go derives as derive_sdk.cpp SetSdkLevels computes them: r stops at 8, the last db version that does not require EXT_SERVICES (not installed in ATL; version 9 is the first that does).
 /// ad_services is AD_SERVICES' module version, 17.
-const ASYNC_LINES: [(&str, &str, &str); 7] = [
+/// timezone: Main.onCreate's TimeZone.getDefault(), from persist.sys.timezone (RuntimeInit.java:252 reads it; atld sets it to the host zone). The gate runs with TZ=Asia/Taipei: raw offset UTC+8 = 8 * 3600 * 1000 ms.
+const ASYNC_LINES: [(&str, &str, &str); 8] = [
     ("bindservice", "AtlTest: bindservice: ", "bindService=true"),
     (
         "bindimplicit",
@@ -418,6 +419,11 @@ const ASYNC_LINES: [(&str, &str, &str); 7] = [
         "started=9 work=atl.test.WORK delivery=1 completed=true next=null",
     ),
     ("sdkext", "AtlTest: sdkext: ", "r=8 ad_services=17"),
+    (
+        "timezone",
+        "AtlTest: timezone: ",
+        "id=Asia/Taipei raw=28800000",
+    ),
 ];
 
 /// A [`SERVICE_LINES`] expectation: the fixed value, or for connectivity (None) [`connectivity_want`].

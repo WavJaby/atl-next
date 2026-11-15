@@ -2006,6 +2006,15 @@ fn run(a: &Args) -> Result<ExitCode> {
     if let Some(tag) = &locale {
         defaults.push(atl_property_service::persist_locale(tag));
     }
+    // the desktop's time zone (TZ, else /etc/localtime: atl_platform_host::time_zone): the apps' persist.sys.timezone; none: AOSP's GMT
+    let zone = atl_platform_host::time_zone();
+    log(format_args!(
+        "timezone: {}",
+        zone.as_deref().unwrap_or("none, GMT")
+    ));
+    if let Some(id) = &zone {
+        defaults.push(atl_property_service::persist_timezone(id));
+    }
     // the run's GPU's device class (gpu::device_class), as AOSP grants an app gpu_device per device (system/sepolicy private/app.te:393): the host EGL driver renders into, and imports, the gralloc dmabufs through them;
     // without them it falls back to the software device, which cannot import a window's buffers. No gralloc: no chosen GPU, every GPU's class.
     // + the DMABUF system heap on the heap tier only (narrowest grant): Codec2 allocates linear blocks from it in the app process

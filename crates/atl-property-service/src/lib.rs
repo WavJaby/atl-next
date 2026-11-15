@@ -73,6 +73,14 @@ pub fn persist_locale(tag: &str) -> Property {
     (PERSIST_LOCALE.to_owned(), tag.to_owned())
 }
 
+/// `persist.sys.timezone`: the host's zone id. AOSP's TimeZone.getDefault reads it through RuntimeInit's supplier (RuntimeInit.java:252); unset, the default is GMT.
+pub const PERSIST_TIMEZONE: &str = "persist.sys.timezone";
+
+/// [`PERSIST_TIMEZONE`] for the zone id `id`.
+pub fn persist_timezone(id: &str) -> Property {
+    (PERSIST_TIMEZONE.to_owned(), id.to_owned())
+}
+
 /// Why the default set or its area could not be built.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -335,6 +343,10 @@ mod tests {
         assert_eq!(
             persist_locale("zh-TW"),
             ("persist.sys.locale".to_owned(), "zh-TW".to_owned())
+        );
+        assert_eq!(
+            persist_timezone("Asia/Taipei"),
+            ("persist.sys.timezone".to_owned(), "Asia/Taipei".to_owned())
         );
         // init's layout over the constants above and the fixture's id / release / tags
         assert_eq!(

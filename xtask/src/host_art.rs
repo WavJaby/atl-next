@@ -462,11 +462,70 @@ fn provided_lib_dirs(out: &Path) -> Result<Vec<PathBuf>> {
     Ok(dirs)
 }
 
+/// The time zone module's source dir, relative to the AOSP tree: the APEX inputs of system/timezone (its sparse keep-set in sources.toml).
+const TZDATA_ROOT: &str = "system/timezone/output_data";
+
+/// com.android.tzdata's files as its APEX installs them (output_data/Android.bp `prebuilt_etc`): source relative to TZDATA_ROOT, target relative to the module root.
+/// libcore and ICU read `etc/tz/versioned/<format>/` (TimeZoneDataFiles.java, IcuRegistration.cpp); bionic reads `etc/tz/tzdata`.
+const TZDATA_FILES: [(&str, &str); 18] = [
+    ("iana/tzdata", "etc/tz/tzdata"),
+    ("version/tz_version", "etc/tz/tz_version"),
+    (
+        "versioned/8/version/tz_version",
+        "etc/tz/versioned/8/tz_version",
+    ),
+    ("iana/tzdata", "etc/tz/versioned/8/tzdata"),
+    ("android/tzlookup.xml", "etc/tz/versioned/8/tzlookup.xml"),
+    (
+        "android/telephonylookup.xml",
+        "etc/tz/versioned/8/telephonylookup.xml",
+    ),
+    (
+        "icu_overlay/zoneinfo64.res",
+        "etc/tz/versioned/8/icu/zoneinfo64.res",
+    ),
+    (
+        "icu_overlay/metaZones.res",
+        "etc/tz/versioned/8/icu/metaZones.res",
+    ),
+    (
+        "icu_overlay/timezoneTypes.res",
+        "etc/tz/versioned/8/icu/timezoneTypes.res",
+    ),
+    (
+        "icu_overlay/windowsZones.res",
+        "etc/tz/versioned/8/icu/windowsZones.res",
+    ),
+    ("version/tz_version", "etc/tz/versioned/9/tz_version"),
+    ("iana/tzdata", "etc/tz/versioned/9/tzdata"),
+    ("android/tzlookup.xml", "etc/tz/versioned/9/tzlookup.xml"),
+    (
+        "android/telephonylookup.xml",
+        "etc/tz/versioned/9/telephonylookup.xml",
+    ),
+    (
+        "icu_overlay/zoneinfo64.res",
+        "etc/tz/versioned/9/icu/zoneinfo64.res",
+    ),
+    (
+        "icu_overlay/metaZones.res",
+        "etc/tz/versioned/9/icu/metaZones.res",
+    ),
+    (
+        "icu_overlay/timezoneTypes.res",
+        "etc/tz/versioned/9/icu/timezoneTypes.res",
+    ),
+    (
+        "icu_overlay/windowsZones.res",
+        "etc/tz/versioned/9/icu/windowsZones.res",
+    ),
+];
+
 /// Stages the converter's ART in `out` as an ART root at `art`, laid out as Android installs it and rebuilt every run (links only); returns its library dir.
 /// - lib<64|"">: every shared library the converter linked (<out>/device/*/*.so), one dir as Android's APEX lib dirs. The build tree has none: the launcher dlopens libnativehelper, libnativehelper libart.so and libcore System.loadLibrary's libjavacore by name, found on Android through the linker's default search path, here through LD_LIBRARY_PATH.
 ///   Plus the provided libraries built outside the tree (<out>/crates/*/lib, <out>/upstream/*/prefix/lib: libatl_bionic as libc, BoringSSL), installed beside them as Android installs libc: converter outputs carry no runpath (runpath_gate), so this dir is the only place their needs are found. System providers stay in the distro's default path.
 ///   libhwui dlopens libandroid by name too (HardwareBufferHelpers, HardwareRenderer, HintSessionWrapper), with no DT_NEEDED on it, so no dependency closure builds it: required here.
-/// - com.android.art -> the root (ANDROID_ART_ROOT); com.android.i18n/etc/icu/<ICU_DATA's icu*.dat>; an empty com.android.tzdata.
+/// - com.android.art -> the root (ANDROID_ART_ROOT); com.android.i18n/etc/icu/<ICU_DATA's icu*.dat>; com.android.tzdata/<TZDATA_FILES>.
 /// - etc/security/cacerts -> /system/etc/security/cacerts (dangling outside the sandbox): Conscrypt's system CA dir is `$ANDROID_ROOT/etc/security/cacerts` when no APEX one exists; atld writes /system's from the distro bundle.
 fn stage_art(out: &Path, art: &Path, tree: &Path, pointer_bits: u32) -> Result<PathBuf> {
     let device = out.join("device");
@@ -513,6 +572,19 @@ fn stage_art(out: &Path, art: &Path, tree: &Path, pointer_bits: u32) -> Result<P
         }
     }
     ensure!(data > 0, "no icu*.dat in {}", tree.join(ICU_DATA).display());
+    let tzdata = tree.join(TZDATA_ROOT);
+    for (src, dst) in TZDATA_FILES {
+        let (from, at) = (tzdata.join(src), art.join("com.android.tzdata").join(dst));
+        ensure!(
+            from.is_file(),
+            "no {src} in {}: fetch system/timezone",
+            tzdata.display()
+        );
+        if let Some(dir) = at.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        link(&from, &at)?;
+    }
     Ok(lib)
 }
 

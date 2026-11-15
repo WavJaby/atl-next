@@ -254,6 +254,7 @@ sdk = "31cc765be3e9407422fb47dafbef9434b051868e"
 "system/security" = "ce2aa0ef49158d0d45fb133fd42ab1deff210f8c"
 "system/sepolicy" = "d4a7f392598cee96d9479a8ac0f84259c19b043a"
 "system/server_configurable_flags" = "3df6afddea58e802591487bba79b362611dafa89"
+"system/timezone" = "3584420250d8375c82809f0c20782844bedd3629"
 "system/tools/aidl" = "5bde6fcffe8e3ac6feca449f7bc3502eed5fc0f5"
 "system/tools/hidl" = "9118bce274377031a1425919678094ededf240d9"
 "system/tools/sysprop" = "5612a6cb5b56b654f6cd4f1c955606b732a62710"
@@ -282,6 +283,7 @@ cts = ["cts"] # cts.toml rows' modules; no build graph reads it
 "prebuilts/sdk" = ["24/public", "28/public", "29/public", "30/public", "31/public", "34/public", "35", "36", "9/public", "current", "tools"]
 "prebuilts/misc" = ["common/androidx-test/androidx/test/core/1.6.0", "common/androidx-test/androidx/test/ext/junit/1.2.0", "common/androidx-test/androidx/test/monitor/1.7.0", "common/androidx-test/androidx/test/rules/1.6.0", "common/androidx-test/androidx/test/runner/1.6.0", "common/androidx-test/androidx/test/services/storage/1.5.0", "common/androidx-test/manifests/androidx.test.core", "common/androidx-test/manifests/androidx.test.ext.junit", "common/androidx-test/manifests/androidx.test.monitor", "common/androidx-test/manifests/androidx.test.rules", "common/androidx-test/manifests/androidx.test.runner", "common/androidx-test/manifests/androidx.test.services.storage", "common/asm", "common/commons-cli", "common/ub-uiautomator"]
 development = ["sdk"]
+"system/timezone" = ["apex", "output_data"] # the com.android.tzdata APEX's inputs, linked by stage_art (no build graph reads it); drops every other dir
 
 # toolchain/llvm_android: read-only reference for the runtimes variants (xtask runtimes.rs mirrors its builders.py), never built.
 # clang-r547379/clang_source_info.md names 9596955b, the merge into llvm-r547379-release; no published branch or tag reaches

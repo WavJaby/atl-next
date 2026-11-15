@@ -42,6 +42,7 @@ import javax.net.ssl.X509TrustManager;
  * Reset lines (app.rs MEDIA_RESET): reset with a seek pending, each within a bound; a reset that never returns is named.
  * result lines (app.rs RESULT): after the marker, Main starts ResultChild for request 7; its result comes back in onActivityResult, and the singleTop self-start from it cancels request 9 before its new intent.
  * sdkext line (app.rs ASYNC_LINES `sdkext`): SdkExtensions.getExtensionVersion for R and for AD_SERVICES, the values bp2ninja's sdkext.go derives for build.prop.
+ * timezone line (app.rs ASYNC_LINES `timezone`): TimeZone.getDefault()'s id and raw offset, from persist.sys.timezone (the host zone, RuntimeInit.java:252).
  */
 public class Main extends Activity {
     /** A root every supported distro bundle carries (Let's Encrypt's). */
@@ -229,6 +230,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "features: " + features());
         Log.i("AtlTest", "sdkext: r=" + android.os.ext.SdkExtensions.getExtensionVersion(android.os.Build.VERSION_CODES.R)
                 + " ad_services=" + android.os.ext.SdkExtensions.getExtensionVersion(android.os.ext.SdkExtensions.AD_SERVICES));
+        Log.i("AtlTest", "timezone: id=" + java.util.TimeZone.getDefault().getID() + " raw=" + java.util.TimeZone.getDefault().getRawOffset());
         Log.i("AtlTest", "signatures: " + signatures());
         Log.i("AtlTest", "priority: " + priority());
         Log.i("AtlTest", "webview-ua: " + webView());
