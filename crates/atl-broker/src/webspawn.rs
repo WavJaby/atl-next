@@ -6,7 +6,7 @@
 //!
 //! Channel: one SEQPACKET socketpair per app sandbox, the app's end at fd [`FD_ENV`]; identity is the socket itself, so a request names no app. One JSON request per packet with [`FDS`] fds
 //! (SCM_RIGHTS): WebKit's socket for the child, a reply socket (one per request: concurrent shims share the channel), stdout, stderr. The reply ([`Reply`]) goes to the reply socket.
-//! Not here, on purpose: any other program, an unsandboxed start, a kill (the web process ends with its IPC socket, or with the app's pid namespace), anything outside the app's writable dirs.
+//! Not here, on purpose: any other program, an unsandboxed start, a kill (the web process ends with its IPC socket, or with the app's pid namespace), a bind outside the app's writable dirs (a read-only expose of what the sandbox already shows read-only is admitted as a no-op).
 
 use std::ffi::OsString;
 use std::io::{self, IoSlice, IoSliceMut};
@@ -108,6 +108,8 @@ pub struct Plan {
     pub env: Vec<(OsString, OsString)>,
     /// Expose paths, each at its own path in the app's view (`host` = `at`: the web sandbox is built inside the app's mount namespace).
     pub expose: Vec<Mount>,
+    /// Read-only expose paths (canonical) the sandbox already shows read-only: admitted, nothing bound ([`RO_EXPOSE_ALREADY_BOUND`]). WebKitGTK 2.52 asks for its injected-bundle dir under `/usr`.
+    pub already_bound: Vec<PathBuf>,
     pub gpu: bool,
 }
 
@@ -149,12 +151,19 @@ fn dropped(name: &str) -> bool {
     name.starts_with("LD_") || name == FD_ENV || name == crate::CONTROL_ENV
 }
 
-/// Checks `req` against the app's view. `canonical`: a path's canonical form on the host (None = absent); `exists`: whether a host path exists. Refusals are not counted here ([`admit`] counts).
+/// Whether the web sandbox shows `p` read-only from the host: under a [`crate::APP_ROOT_DIRS`] dir, bound at its own path in [`crate::Profile::WebProcess`] (`bwrap_args`). By text: pass plain or canonical paths.
+fn ro_bound(p: &Path) -> bool {
+    crate::APP_ROOT_DIRS
+        .iter()
+        .any(|d| p.starts_with(Path::new("/").join(d)))
+}
+
+/// Checks `req` against the app's view. `canonical`: a path's canonical form on the host (None = absent); `is_file`: whether a host path is a regular file. Refusals are not counted here ([`admit`] counts).
 pub fn check(
     req: &Request,
     app: &AppView,
     canonical: impl Fn(&Path) -> Option<PathBuf>,
-    exists: impl Fn(&Path) -> bool,
+    is_file: impl Fn(&Path) -> bool,
 ) -> Result<Plan, Refusal> {
     if !req.sandbox {
         return Err(refuse("unsandboxed", "no --sandbox"));
@@ -166,7 +175,10 @@ pub fn check(
         return Err(refuse("directory", req.directory.clone()));
     }
     let program = PathBuf::from(&req.program);
-    if !program_allowed(&program) || canonical(&program).as_deref() != Some(program.as_path()) {
+    if !program_allowed(&program)
+        || canonical(&program).as_deref() != Some(program.as_path())
+        || !is_file(&program)
+    {
         return Err(refuse("program", req.program.clone()));
     }
     // WebKit's argv: <identifier> <socket fd> (ProcessLauncherGLib); nothing else
@@ -182,19 +194,30 @@ pub fn check(
         return Err(refuse("flag", f.clone()));
     }
     let mut expose = Vec::new();
+    let mut already_bound = Vec::new();
     for e in &req.expose {
         let at = PathBuf::from(&e.path);
-        let host = plain(&at)
-            .then(|| {
-                app.writable
-                    .iter()
-                    .find_map(|m| Some(m.host.join(at.strip_prefix(&m.at).ok()?)))
-            })
-            .flatten();
-        let Some(host) = host else {
+        if !plain(&at) {
             return Err(refuse("expose", e.path.clone()));
+        }
+        let host = app
+            .writable
+            .iter()
+            .find_map(|m| Some(m.host.join(at.strip_prefix(&m.at).ok()?)));
+        let Some(host) = host else {
+            // ro outside the app's data: admitted only where the web sandbox already shows the host read-only, judged on the canonical path (a link out of that dir is refused); no bind added
+            if e.writable || !ro_bound(&at) {
+                return Err(refuse("expose", e.path.clone()));
+            }
+            match canonical(&at) {
+                None if e.must_exist => return Err(refuse("expose-missing", e.path.clone())),
+                None => {}
+                Some(c) if ro_bound(&c) => already_bound.push(c),
+                Some(c) => return Err(refuse("expose", format!("{} -> {}", e.path, c.display()))),
+            }
+            continue;
         };
-        if !exists(&host) {
+        if canonical(&host).is_none() {
             if e.must_exist {
                 return Err(refuse("expose-missing", e.path.clone()));
             }
@@ -216,25 +239,29 @@ pub fn check(
             .map(|(k, v)| (k.into(), v.into()))
             .collect(),
         expose,
+        already_bound,
         gpu: req.flags.iter().any(|f| f == "share-gpu"),
     })
 }
 
+/// [`admit`]'s count (`answered WebProcessSpawn.<this>`) per read-only expose the web sandbox already shows.
+pub const RO_EXPOSE_ALREADY_BOUND: &str = "ro-expose-already-bound";
+
 /// [`check`] on the host's filesystem, a refusal counted (`refused WebProcessSpawn.<what>`) and answered.
 pub fn admit(req: &Request, app: &AppView) -> Result<Plan, Reply> {
-    check(
-        req,
-        app,
-        |p| std::fs::canonicalize(p).ok().filter(|c| c.is_file()),
-        |p| p.exists(),
-    )
-    .map_err(|r| {
-        atl_diag::refused(INTERFACE, r.what);
-        Reply::Refused {
-            what: r.what.to_owned(),
-            why: r.why,
-        }
-    })
+    check(req, app, |p| std::fs::canonicalize(p).ok(), Path::is_file)
+        .inspect(|plan| {
+            for _ in &plan.already_bound {
+                atl_diag::answered(INTERFACE, RO_EXPOSE_ALREADY_BOUND);
+            }
+        })
+        .map_err(|r| {
+            atl_diag::refused(INTERFACE, r.what);
+            Reply::Refused {
+                what: r.what.to_owned(),
+                why: r.why,
+            }
+        })
 }
 
 /// The shim's side: sends `req` with `fds` ([`FDS`], in their order) on `channel`.
@@ -380,14 +407,104 @@ mod tests {
         }
     }
 
-    /// Host filesystem stand-ins: every plain path is its own canonical form and exists, except names holding `missing` / `link`.
+    /// Where a stand-in `link` resolves: outside every bind.
+    const ESCAPE: &str = "/home/user/secret";
+
+    /// Host filesystem stand-ins: every path exists as its own canonical form, except names holding `missing` (absent) or `link` (resolves to [`ESCAPE`]); files are the `*Process` names.
     fn fs_check(req: &Request) -> Result<Plan, Refusal> {
         check(
             req,
             &app(),
-            |p| (!p.to_string_lossy().contains("link")).then(|| p.to_path_buf()),
-            |p| !p.to_string_lossy().contains("missing"),
+            |p| {
+                let s = p.to_string_lossy();
+                if s.contains("missing") {
+                    None
+                } else if s.contains("link") {
+                    Some(PathBuf::from(ESCAPE))
+                } else {
+                    Some(p.to_path_buf())
+                }
+            },
+            |p| p.to_string_lossy().ends_with("Process"),
         )
+    }
+
+    fn expose(path: &str, writable: bool, must_exist: bool) -> Request {
+        Request {
+            expose: vec![Expose {
+                path: path.into(),
+                writable,
+                must_exist,
+            }],
+            ..web()
+        }
+    }
+
+    /// WebKitGTK 2.52's line: a read-only expose of its injected-bundle dir, which the web sandbox already binds read-only (/usr): admitted, no bind, recorded for the count.
+    #[test]
+    fn ro_expose_of_a_ro_bound_dir_is_a_no_op() {
+        const BUNDLE: &str = "/usr/lib/riscv64-linux-gnu/webkitgtk-6.0/injected-bundle/";
+        let plan = fs_check(&expose(BUNDLE, false, true)).expect("admitted");
+        assert!(plan.expose.is_empty(), "no bind: {:?}", plan.expose);
+        assert_eq!(plan.already_bound, vec![PathBuf::from(BUNDLE)]);
+        // a missing -try path is skipped, a missing required one refused, as in the app's dirs
+        let missing = "/usr/lib/missing";
+        assert!(
+            fs_check(&expose(missing, false, false))
+                .expect("try")
+                .already_bound
+                .is_empty()
+        );
+        assert_eq!(
+            fs_check(&expose(missing, false, true)).map_err(|r| r.what),
+            Err("expose-missing")
+        );
+    }
+
+    /// Writable stays app-data-only; a ro path outside every bind, not plain, or linking out of the bind is refused.
+    #[test]
+    fn ro_expose_gets_no_new_rights() {
+        for (p, writable) in [
+            (
+                "/usr/lib/riscv64-linux-gnu/webkitgtk-6.0/injected-bundle",
+                true,
+            ),
+            ("/home/user", false),
+            ("/var/appdata/com.other", false),
+            ("/usr/../home/user", false),
+            ("/usr/lib/link", false),
+        ] {
+            assert_eq!(
+                fs_check(&expose(p, writable, true)).map_err(|r| r.what),
+                Err("expose"),
+                "{p} writable={writable}"
+            );
+        }
+    }
+
+    /// Over [`admit`] on the host's filesystem: each no-op is counted, a refused request counts none. The admitted half needs the host's WebKitGTK (skipped without it).
+    #[test]
+    fn ro_expose_no_op_is_counted() {
+        let api = format!("{INTERFACE}.{RO_EXPOSE_ALREADY_BOUND}");
+        let n = || {
+            atl_diag::counts()
+                .into_iter()
+                .find(|(o, a, _)| o == "answered" && *a == api)
+                .map_or(0, |(_, _, n)| n)
+        };
+        let before = n();
+        let req = Request {
+            directory: "/var".into(),
+            ..expose("/usr", false, true)
+        };
+        // refused (directory, a counter no other test reads) before any expose is judged: not counted
+        assert!(admit(&req, &app()).is_err());
+        assert_eq!(n(), before);
+        if Path::new(WEB).is_file() {
+            let plan = admit(&expose("/usr/lib", false, true), &app()).expect("admitted");
+            assert!(plan.expose.is_empty());
+            assert_eq!(n(), before + 1);
+        }
     }
 
     #[test]
