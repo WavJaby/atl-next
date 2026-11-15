@@ -607,16 +607,26 @@ pub fn describe_step(step: &Step) -> String {
 }
 
 /// Links the checkout's `target/` to its build dir's, when the dir exists. Run by the outermost xtask process as it ends (cli): the running binary may live in the real `target/` this removes, and the namespace re-exec still needs it.
+/// Only while no other xtask process holds the dir (its exclusive lock, not waited for): a concurrent build may run its xtask from that `target/` (2026-11-15: `out prune` beside a `native` removed the running binary's dir). Busy: left for a later command.
 pub fn settle_target(root: &Path) -> Result<()> {
     if std::env::var_os(crate::tree::ENV).is_some() {
         return Ok(());
     }
     let ws = Layout::of(root)?.workspace().to_owned();
-    let dir = dir_of(&ws, &checkout_id(root)?);
+    let id = checkout_id(root)?;
+    let dir = dir_of(&ws, &id);
     if !present(&dir)? {
         return Ok(());
     }
-    let steps = link_steps(&root.join(TARGET), &target_of(&dir))?;
+    let want = target_of(&dir);
+    if link_steps(&root.join(TARGET), &want)?.is_empty() {
+        return Ok(());
+    }
+    release_holds()?;
+    let Some(_lock) = build_pool::try_lock_dir(&ws, &id)? else {
+        return Ok(());
+    };
+    let steps = link_steps(&root.join(TARGET), &want)?;
     for step in &steps {
         println!("out: target: {}", describe_step(step));
     }
