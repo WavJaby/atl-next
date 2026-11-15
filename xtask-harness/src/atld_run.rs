@@ -509,7 +509,7 @@ impl ApkTools {
     /// `out` = the native build dir (its build.prop names the API level), `java_out` = the Java pipeline build dir, `host` = the arches.toml host row (its prebuilt JDK); every input checked to exist.
     pub fn new(root: &Path, host: &str, out: &Path, java_out: &Path) -> Result<ApkTools> {
         let layout = Layout::of(root)?;
-        let (d8, jdk) = host_art::java_tools(root, host, java_out)?;
+        let (d8, jdk) = host_art::java_tools(root, java_out)?;
         let arches = crate::arches::load(root)?;
         let (build, _) = crate::arches::build_machine(root, &arches)?;
         let t = ApkTools {

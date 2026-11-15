@@ -115,15 +115,16 @@ fn boot_jars(java_out: &Path) -> Result<Vec<PathBuf>> {
     Ok(jars)
 }
 
-/// The Java pipeline's d8 in `java_out` and the prebuilt JDK of host arch `host` (its arches.toml `soong_prebuilt_os`); not checked to exist.
-pub fn java_tools(root: &Path, host: &str, java_out: &Path) -> Result<(PathBuf, PathBuf)> {
+/// The Java pipeline's d8 in `java_out` and the prebuilt JDK of the build machine (its arches.toml `soong_prebuilt_os`): both run here, whichever host the runtime is for; not checked to exist.
+pub fn java_tools(root: &Path, java_out: &Path) -> Result<(PathBuf, PathBuf)> {
     let arches = arches::load(root)?;
-    let os = arches
-        .get(host)
-        .and_then(|a| a.host.as_ref())
+    let (build, row) = arches::build_machine(root, &arches)?;
+    let os = row
+        .host
+        .as_ref()
         .and_then(|h| h.soong_prebuilt_os.as_deref())
         .with_context(|| {
-            format!("{host}: no host row with soong_prebuilt_os (no prebuilt JDK or host ART)")
+            format!("build machine {build}: no soong_prebuilt_os (no prebuilt JDK or host ART)")
         })?;
     let layout = Layout::of(root)?;
     let jdk = crate::deps::aosp_project(root, "jdk")?;
@@ -152,7 +153,7 @@ impl HostArt {
         let java_out = slot::out_dir(root, java_out, "--java-out", |workspace| {
             workspace.join("out/java/build")
         })?;
-        let (d8, jdk) = java_tools(root, host, &java_out)?;
+        let (d8, jdk) = java_tools(root, &java_out)?;
         let art = out.join(stage);
         let lib_path = stage_art(out, &art, &tree::shared_tree(&layout), arch.pointer_bits)?;
         let h = HostArt {
@@ -401,12 +402,12 @@ pub fn api_impl_dex(out: &Path) -> PathBuf {
 }
 
 /// `xtask native`'s api-impl step: [`API_IMPL_SRC`] compiled against the Java pipeline's framework of `out` into [`api_impl_dex`]. None when `out` holds no framework header jar (the goals built no Java), so there is nothing to compile against.
-pub fn build_api_impl(root: &Path, host: &str, out: &Path) -> Result<Option<PathBuf>> {
+pub fn build_api_impl(root: &Path, out: &Path) -> Result<Option<PathBuf>> {
     let boot = javac_boot(out);
     if !boot.iter().all(|j| j.is_file()) {
         return Ok(None);
     }
-    let (d8, jdk) = java_tools(root, host, out)?;
+    let (d8, jdk) = java_tools(root, out)?;
     compile_dex(
         &jdk,
         &d8,

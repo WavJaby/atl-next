@@ -43,7 +43,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         None => keys::dev_dir(&atl_layout::Layout::of(root)?),
     };
     keys::check_set(&dir)?;
-    let (_, jdk) = host_art::java_tools(root, &args.host, &out)?;
+    let (_, jdk) = host_art::java_tools(root, &out)?;
     let java = jdk.join("bin/java");
     let jar = out.join(APK_SIGNER_JAR);
     ensure!(jar.is_file(), "missing input {}", jar.display());
