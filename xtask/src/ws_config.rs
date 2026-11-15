@@ -34,6 +34,11 @@ pub const DEFAULT_PARALLEL_BUILDS: u32 = 2;
 /// One clean build of the libandroid_runtime closure stores ~80 MB (2026-11-01, zstd entries); 1.7 GB was in use under the old 2 GB limit (2026-11-11), so the owner raised it to 5 GB: ~60 such generations, room for the goal closure to grow.
 pub const DEFAULT_SCCACHE_SIZE: &str = "5G";
 
+/// `build.refresh_min_upstream_files`: native refreshes a rebased checkout's build dir (out::refresh) only when at least this many upstream-input files (out::UPSTREAM_INPUTS: patches/, sources.toml) changed between the dir's base and the newer base.
+/// Why upstream inputs: refresh keeps the checkout's own cargo roots (cargo units key on the checkout path), so it can only gain on ninja/AOSP outputs, which upstream inputs drive.
+/// Measured (snapshot-slots D11, 2026-11-16): 0 upstream files changed -> keep 149-171 s vs refresh 214-232 s (README-only rebase); 0 upstream + 40 other native files (crates, bp2ninja) -> keep 157-175 s vs refresh 185 s. Refresh never won without an upstream change, so 1 = any upstream change; no rebase with one was measurable yet (no two bases differ there).
+pub const DEFAULT_REFRESH_MIN_UPSTREAM_FILES: u32 = 1;
+
 /// `disk.host_min_free` (GiB): the Windows drive holding the WSL vhdx. A full libandroid_runtime build from cold grows the vhdx by several GiB, and a host drive that fills mid-build fails writes inside the distro: owner's hard stop 6.
 pub const DEFAULT_HOST_MIN_FREE: u64 = 6;
 /// `disk.host_compact_below` (GiB): under it, a note asks to compact the vhdx (owner: compact when C: < 30 GB). A note, never a refusal.
@@ -98,6 +103,8 @@ pub struct WsConfig {
     pub path: PathBuf,
     /// `build.parallel_builds`: build tokens (`build_pool`).
     pub parallel_builds: Setting<u32>,
+    /// `build.refresh_min_upstream_files`: out::refresh's threshold.
+    pub refresh_min_upstream_files: Setting<u32>,
     /// `cache.sccache_size`: `SCCACHE_CACHE_SIZE`.
     pub sccache_size: Setting<String>,
     /// `fetch.for`: gates (`gate_goals` names or `all-gates`) whose `needed_by` projects fetch checks out; empty = core only.
@@ -173,6 +180,7 @@ fn defaults(path: PathBuf) -> WsConfig {
     WsConfig {
         path,
         parallel_builds: Setting::default(DEFAULT_PARALLEL_BUILDS),
+        refresh_min_upstream_files: Setting::default(DEFAULT_REFRESH_MIN_UPSTREAM_FILES),
         sccache_size: Setting::default(DEFAULT_SCCACHE_SIZE.to_owned()),
         fetch_for: Setting::default(Vec::new()),
         disk: DiskFloors {
@@ -201,6 +209,9 @@ pub fn parse(text: &str, path: &Path) -> Result<WsConfig> {
                 ("build", "parallel_builds") => {
                     cfg.parallel_builds = Setting::file(count(value, &at)?);
                 }
+                ("build", "refresh_min_upstream_files") => {
+                    cfg.refresh_min_upstream_files = Setting::file(count(value, &at)?);
+                }
                 ("build", k) if RETIRED.contains(&k) => {
                     static NOTED: std::sync::atomic::AtomicBool =
                         std::sync::atomic::AtomicBool::new(false);
@@ -225,7 +236,7 @@ pub fn parse(text: &str, path: &Path) -> Result<WsConfig> {
                     cfg.disk.pool_min_free = Setting::file(gib(value, &at)?);
                 }
                 _ => bail!(
-                    "{at} is not a known key (known: build.parallel_builds, cache.sccache_size, fetch.for, disk.host_min_free, disk.host_compact_below, disk.workspace_min_free, disk.pool_min_free)"
+                    "{at} is not a known key (known: build.parallel_builds, build.refresh_min_upstream_files, cache.sccache_size, fetch.for, disk.host_min_free, disk.host_compact_below, disk.workspace_min_free, disk.pool_min_free)"
                 ),
             }
         }

@@ -775,16 +775,24 @@ pub fn recopy(land: &Path) -> Result<String> {
 /// `native`'s refresh after a rebase: when a base newer than the one `ws/<id>` came from (`.base`) is an ancestor of HEAD, the dir is replaced by a copy of it. Returns the line to print; None = nothing to do.
 /// Why: the dir's own outputs were built on the old base and are mostly stale after the rebase, while the new base holds main's build of everything the rebase brought; the checkout's compiles hit sccache at the canonical path, so redoing its own delta is cheap.
 /// Kept: the dir's cargo target roots (`out_prune::DIR_ROOTS`), moved into the new copy: `target/` holds this running xtask binary (re-executed by path into the namespace), and every root holds the checkout's cargo units, which key on the checkout path a base's units (built in the land worktree) never match: taking the base's cost a 72-crate rebuild (X4 gate).
-/// Not refreshed: the land worktree (land owns `ws/land`), an adopted slot link, a dir without `.base` (built from zero) or whose base is not an ancestor of the newer one, a dir another process holds (the line says so).
+/// Only when main brought a large change (owner 2026-11-16): at least `build.refresh_min_upstream_files` files under [`UPSTREAM_INPUTS`] changed from the dir's base to the newer one (derivation on ws_config.rs DEFAULT_REFRESH_MIN_UPSTREAM_FILES); below it keeping the old dir rebuilds less.
+/// Kept (line `out: keep <reason>`): an adopted slot link, a dir without `.base` (built from zero), one already on the newest base or whose base is not an ancestor of it, a small change, a dir another process holds. None: the land worktree (land owns `ws/land`) or no dir yet (the first build makes it).
 pub fn refresh(root: &Path) -> Result<Option<String>> {
     let ws = Layout::of(root)?.workspace().to_owned();
     let id = checkout_id(root)?;
     let dir = dir_of(&ws, &id);
-    if id == LAND_ID || !matches!(entry(&dir)?, Entry::Dir) {
+    if id == LAND_ID {
         return Ok(None);
     }
+    match entry(&dir)? {
+        Entry::Dir => {}
+        Entry::Absent => return Ok(None),
+        _ => return Ok(Some(format!("out: keep ws/{id}: not a dir of its own"))),
+    }
     let Ok(cur) = std::fs::read_to_string(dir.join(BASE_FILE)) else {
-        return Ok(None);
+        return Ok(Some(format!(
+            "out: keep ws/{id}: built from zero (no {BASE_FILE})"
+        )));
     };
     let cur = cur.trim().to_owned();
     let bases = bases(&ws)?;
@@ -792,14 +800,28 @@ pub fn refresh(root: &Path) -> Result<Option<String>> {
         .iter()
         .find(|c| git(Some(root), &["merge-base", "--is-ancestor", c, "HEAD"]).is_ok())
     else {
-        return Ok(None);
+        return Ok(Some(format!(
+            "out: keep ws/{id}: no base is an ancestor of HEAD"
+        )));
     };
-    if *pick == cur || git(Some(root), &["merge-base", "--is-ancestor", &cur, pick]).is_err() {
-        return Ok(None);
+    if *pick == cur {
+        return Ok(Some(format!("out: keep ws/{id}: on the newest base/{cur}")));
+    }
+    if git(Some(root), &["merge-base", "--is-ancestor", &cur, pick]).is_err() {
+        return Ok(Some(format!(
+            "out: keep ws/{id}: its base/{cur} is not an ancestor of base/{pick}"
+        )));
+    }
+    let changed = upstream_changed(root, &cur, pick)?;
+    let min = crate::ws_config::load(&ws)?.refresh_min_upstream_files;
+    if !wants_refresh(changed, min.value) {
+        return Ok(Some(format!(
+            "out: keep ws/{id} on base/{cur}: {changed} upstream input files changed to base/{pick}, under build.refresh_min_upstream_files {min}"
+        )));
     }
     let Some(_lock) = build_pool::try_lock_dir(&ws, &id)? else {
         return Ok(Some(format!(
-            "out: ws/{id} not refreshed to base/{pick}: another process holds it"
+            "out: keep ws/{id}: not refreshed to base/{pick}: another process holds it"
         )));
     };
     let parent = dir.parent().context("build dir has no parent")?;
@@ -832,10 +854,28 @@ pub fn refresh(root: &Path) -> Result<Option<String>> {
     }
     remove_build_dir(&old)?;
     Ok(Some(format!(
-        "out: ws/{id} refreshed from base/{cur} to base/{pick} ({}); kept: {}",
+        "out: refresh ws/{id} from base/{cur} to base/{pick} ({changed} upstream input files changed; {}); kept: {}",
         tier.name(),
         kept.join(", ")
     )))
+}
+
+/// Repo paths whose change makes native redo ninja/AOSP work a newer base already did: the upstream patches and the pins. Refresh gains only there (see [`refresh`]).
+pub const UPSTREAM_INPUTS: [&str; 2] = ["patches", crate::sources::FILE];
+
+/// Files under [`UPSTREAM_INPUTS`] that differ between commits `from` and `to`.
+fn upstream_changed(root: &Path, from: &str, to: &str) -> Result<usize> {
+    let mut args = vec!["diff", "--name-only", from, to, "--"];
+    args.extend(UPSTREAM_INPUTS);
+    Ok(git(Some(root), &args)?
+        .lines()
+        .filter(|l| !l.is_empty())
+        .count())
+}
+
+/// The refresh decision: `changed` upstream input files reach the threshold `min`.
+fn wants_refresh(changed: usize, min: u32) -> bool {
+    changed >= min as usize
 }
 
 /// The checkout's build dir made ([`ensure`]) with its `target/`, before a parent runs cargo there: the checkout's `target` link may name this dir's target/ already (a re-copied or deleted dir), an empty copy (no base) lacks it, and cargo, which runs before any xtask code can settle the link, fails on a dangling one.
@@ -1127,7 +1167,18 @@ mod tests {
         std::fs::remove_dir_all(&ws).expect("cleanup");
     }
 
-    /// A checkout rebased past a newer base: native's refresh swaps its dir for that base, keeps its target/, and is then a no-op; a dir whose base is not older (or the land worktree) is left alone.
+    /// The threshold: the two measured cases (D11: 0 upstream files changed, README-only and 40 crate/bp2ninja files) keep at the default; any upstream change refreshes.
+    #[test]
+    fn refresh_wants_an_upstream_change_at_the_default_threshold() {
+        let min = crate::ws_config::DEFAULT_REFRESH_MIN_UPSTREAM_FILES;
+        assert!(
+            !wants_refresh(0, min),
+            "D11 cases changed no upstream input"
+        );
+        assert!(wants_refresh(1, min));
+    }
+
+    /// A checkout rebased past a newer base: native keeps its dir while the rebase changed no upstream input, refreshes it from the newest base (keeping target/) once one changed, and is then a no-op; a dir whose base is not older is left alone.
     #[test]
     fn a_rebased_checkout_is_refreshed_from_the_newer_base_keeping_target() {
         let ws = scratch("refresh");
@@ -1135,7 +1186,13 @@ mod tests {
         std::fs::create_dir_all(&repo).expect("repo");
         let g = |args: &[&str]| git(Some(&repo), args).expect("git");
         g(&["init", "-q", "-b", "main"]);
-        let commit = |m: &str| {
+        // a commit writing `file` (None = empty)
+        let commit = |m: &str, file: Option<&str>| {
+            if let Some(f) = file {
+                put(&repo.join(f));
+                std::fs::write(repo.join(f), m).expect("write");
+                g(&["add", f]);
+            }
             g(&[
                 "-c",
                 "user.name=t",
@@ -1149,8 +1206,10 @@ mod tests {
             ]);
             g(&["rev-parse", "HEAD"])
         };
-        let (a, b) = (commit("a"), commit("b"));
-        for (i, c) in [&a, &b].iter().enumerate() {
+        let a = commit("a", None);
+        let b = commit("b", Some("crates/x/src/lib.rs"));
+        let c = commit("c", Some("patches/aosp/x/0001-x.patch"));
+        for (i, c) in [&a, &b, &c].iter().enumerate() {
             let base = base_of(&ws, c);
             put(&base.join("from"));
             std::fs::write(base.join("from"), c.as_str()).expect("mark");
@@ -1167,22 +1226,32 @@ mod tests {
         std::fs::create_dir_all(pool(&ws).join("ws")).expect("pool ws");
         copy_tree(&base_of(&ws, &a), &dir_of(&ws, MAIN_ID), Some(&a)).expect("copy a");
         put(&dir_of(&ws, MAIN_ID).join("target/debug/own"));
-        assert_eq!(
-            refresh(&repo).expect("refresh"),
-            None,
-            "base b is not an ancestor of a"
-        );
-        // the rebase: HEAD at b
-        g(&["checkout", "-q", "--detach", &b]);
-        let line = refresh(&repo).expect("refresh").expect("refreshed");
+        let line = refresh(&repo).expect("refresh").expect("line");
         assert!(
-            line.contains(&format!("from base/{a} to base/{b}")),
+            line.starts_with("out: keep") && line.contains("newest"),
             "{line}"
         );
         let dir = dir_of(&ws, MAIN_ID);
-        assert_eq!(std::fs::read_to_string(dir.join("from")).expect("from"), b);
+        // a small rebase: HEAD at b, only a crate changed -> kept
+        g(&["checkout", "-q", "--detach", &b]);
+        let line = refresh(&repo).expect("refresh").expect("line");
+        assert!(
+            line.starts_with("out: keep") && line.contains("0 upstream input files"),
+            "{line}"
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("from")).expect("from"), a);
+        // the large rebase: HEAD at c, a patch changed -> refreshed
+        g(&["checkout", "-q", "--detach", &c]);
+        let line = refresh(&repo).expect("refresh").expect("refreshed");
+        assert!(
+            line.starts_with("out: refresh")
+                && line.contains(&format!("from base/{a} to base/{c}")),
+            "{line}"
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("from")).expect("from"), c);
         assert!(dir.join("target/debug/own").is_file(), "target/ not kept");
-        assert_eq!(refresh(&repo).expect("refresh"), None, "second refresh");
+        let line = refresh(&repo).expect("refresh").expect("line");
+        assert!(line.starts_with("out: keep"), "second refresh: {line}");
         let leftovers: Vec<_> = std::fs::read_dir(dir.parent().expect("parent"))
             .expect("ls")
             .map(|e| e.expect("entry").file_name())
