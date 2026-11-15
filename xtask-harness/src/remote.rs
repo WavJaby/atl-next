@@ -153,7 +153,7 @@ pub fn run(root: &Path, cmd: &Remote) -> Result<ExitCode> {
 
 fn push(root: &Path, a: &PushArgs) -> Result<ExitCode> {
     let out = out_of(root, a.out.as_deref())?;
-    let target = Target::of(&out, &a.gate, &a.host, a.brk)?;
+    let target = Target::of(root, &out, &a.gate, &a.host, a.brk)?;
     if a.list {
         for e in target.entries() {
             println!("{}\t{}", e.name, e.src.display());
@@ -188,7 +188,7 @@ fn test(root: &Path, a: &TestArgs) -> Result<ExitCode> {
         "--arch and --fixture-arch are `app` options"
     );
     let out = out_of(root, a.out.as_deref())?;
-    let target = Target::of(&out, &a.gate, &a.host, a.brk)?;
+    let target = Target::of(root, &out, &a.gate, &a.host, a.brk)?;
     if !a.apply {
         println!("{}", target.summary());
         println!(
@@ -826,9 +826,16 @@ pub struct Target {
 
 impl Target {
     /// The bundle of gate `gate`'s record in `out`, with `brk` applied, for the host `host` (an ssh alias or `local:<dir>`). Its ELF files and library dirs are read here.
-    pub fn of(out: &Path, gate: &str, host: &str, brk: Option<Break>) -> Result<Target> {
+    pub fn of(
+        root: &Path,
+        out: &Path,
+        gate: &str,
+        host: &str,
+        brk: Option<Break>,
+    ) -> Result<Target> {
         let host = Host::parse(host)?;
-        let slot = slot_name(out)?;
+        let cross = xtask::native::cross_host_of(root, out)?.is_some();
+        let slot = slot_name(out, cross)?;
         let bundle = Bundle::of(gate, out, brk)?;
         let elf = bundle.elf_names()?;
         let lib_dirs = bundle.lib_dirs(&elf);
@@ -941,17 +948,27 @@ fn out_of(root: &Path, explicit: Option<&Path>) -> Result<PathBuf> {
     slot::out_dir(root, explicit, "--out", |ws| ws.join("out/native"))
 }
 
-/// The slot's directory name: the target's directory is named after it.
-fn slot_name(out: &Path) -> Result<String> {
-    let name = out
-        .file_name()
-        .and_then(|n| n.to_str())
-        .with_context(|| format!("out dir {} has no name", out.display()))?;
+/// The target's directory name for out dir `out`: its slot's name (`slot-4`). A `cross` host's out is `<slot>/<arch>` (native::host_out), so it is `<slot>-<arch>`: named by the arch alone, two slots pushing one arch would share (and `rsync --delete`) one dir.
+fn slot_name(out: &Path, cross: bool) -> Result<String> {
+    let name = |p: &Path| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_owned)
+            .with_context(|| format!("out dir {} has no name", p.display()))
+    };
+    let name = if cross {
+        let slot = out
+            .parent()
+            .with_context(|| format!("cross out dir {} has no slot dir", out.display()))?;
+        format!("{}-{}", name(slot)?, name(out)?)
+    } else {
+        name(out)?
+    };
     ensure!(
-        valid_name(name),
+        valid_name(&name),
         "out dir name `{name}` has characters the target path does not take"
     );
-    Ok(name.to_owned())
+    Ok(name)
 }
 
 fn stage_dir(out: &Path, gate: &str) -> PathBuf {
@@ -1580,6 +1597,18 @@ mod tests {
         );
         assert!(parse_record("out /o\njava /o\ntree /t\nlib /l\nrelative.so\n").is_err());
         assert!(parse_record("out /o\njava /o\ntree /t\nlib /l\ndir relative\n").is_err());
+    }
+
+    /// Two slots' riscv64 outs get two target dirs; a build machine out keeps its slot name. Break: naming a cross out by its arch alone makes the first pair equal.
+    #[test]
+    fn cross_outs_of_two_slots_get_two_target_dirs() {
+        let n = |p: &str, cross| slot_name(Path::new(p), cross).unwrap();
+        assert_eq!(n("/w/out/slot-4/riscv64", true), "slot-4-riscv64");
+        assert_ne!(
+            n("/w/out/slot-4/riscv64", true),
+            n("/w/out/slot-5/riscv64", true)
+        );
+        assert_eq!(n("/w/out/slot-9", false), "slot-9");
     }
 
     #[test]

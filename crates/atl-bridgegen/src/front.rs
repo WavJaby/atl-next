@@ -507,7 +507,7 @@ fn args(lang: Lang, t: &Target) -> Result<Vec<String>> {
     Ok(args)
 }
 
-/// The pinned host sysroot args of this build script's target (buildscript::host_sysroot_args), derived once per script; the first derivation prints the rerun on the sysroot's stamp. Outside a build script (no TARGET: unit tests on fake trees): none.
+/// The pinned host sysroot args of this build script's target (buildscript::host_sysroot_args), derived once per script; the first derivation prints the reruns on the sysroot's stamp and deps.toml. Outside a build script (no TARGET: unit tests on fake trees): none.
 #[allow(
     clippy::print_stdout,
     reason = "a build script's stdout is cargo's instruction channel"
@@ -524,8 +524,10 @@ fn extra_clang_args() -> Result<Vec<String>> {
             let checkout = crate::buildscript::checkout(&manifest)?;
             Ok(
                 match crate::buildscript::host_sysroot_args(&checkout, &target)? {
-                    Some((args, stamp)) => {
-                        println!("cargo::rerun-if-changed={}", stamp.display());
+                    Some((args, inputs)) => {
+                        for input in inputs {
+                            println!("cargo::rerun-if-changed={}", input.display());
+                        }
                         args
                     }
                     None => Vec::new(),

@@ -83,9 +83,16 @@ impl Layout {
         &self.workspace
     }
 
-    /// The directory of deps.toml sysroot row `name`: `cache/sysroot/<name>`, holding the unpacked tree `root/` and `stamp.txt` (`xtask deps --fetch` writes both). The only place this path is built: xtask fetches and links against it, build scripts probe it.
-    pub fn sysroot(&self, name: &str) -> PathBuf {
-        self.workspace.join("cache").join("sysroot").join(name)
+    /// The directory of deps.toml sysroot row `name` pinning `pins`: `cache/sysroot/<name>-<sysroot_key(pins)>`, holding the unpacked tree `root/` and `stamp.txt` (`xtask deps --fetch` writes both). The only place this path is built: xtask fetches and links against it, build scripts probe it.
+    /// Content-keyed: checkouts pinning different lists share `cache/` without refetching over each other (keyed by name alone, one checkout's fetch broke another's land).
+    pub fn sysroot(&self, name: &str, pins: &[String]) -> PathBuf {
+        self.sysroots()
+            .join(format!("{name}-{}", sysroot_key(pins)))
+    }
+
+    /// `cache/sysroot`: every row's trees, each pin set its own dir ([`Layout::sysroot`]).
+    pub fn sysroots(&self) -> PathBuf {
+        self.workspace.join("cache").join("sysroot")
     }
 
     /// The shared checkouts' root. Only for what is not one upstream's file: fetch's dry-run summary, the shared AOSP tree's root.
@@ -176,6 +183,17 @@ pub fn git_store(root: &Path, dir: &Path) -> PathBuf {
     root.join(".git-dirs").join(name)
 }
 
+/// The key of a sysroot pin list: FNV-1a 64 over the pins in row order, each `\n`-terminated (order matters: later debs unpack over earlier ones), 16 hex digits. Stable across Rust versions, unlike `DefaultHasher`; not a security hash -- `stamp.txt` checks each deb's SHA256.
+pub fn sysroot_key(pins: &[String]) -> String {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0100_0000_01b3;
+    let mut h = OFFSET;
+    for byte in pins.iter().flat_map(|p| p.bytes().chain(*b"\n")) {
+        h = (h ^ u64::from(byte)).wrapping_mul(PRIME);
+    }
+    format!("{h:016x}")
+}
+
 /// A sysroot's libc++ headers: the one `c++/v1` directory holding `__config`, with `__config_site` beside it.
 /// The one derivation: xtask native passes it to bp2ninja (`-host-libcxx`), atl-bridgegen's probes put it on the include path.
 pub fn libcxx_dir(sysroot: &Path) -> Result<PathBuf> {
@@ -254,6 +272,24 @@ mod tests {
         let d = ws.join("src-wt").join(task).join(dir);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join(".git"), "gitdir: x\n").unwrap();
+    }
+
+    /// Two pin sets of one row get two dirs; the same set (another checkout) the same dir. Expected FNV-1a 64 values: the published test vectors ("" -> cbf29ce484222325, "a" -> af63dc4c8601ec8c); "a\n" is that "a" state stepped once more with 0x0a. Break: keying by name alone collides the first pair.
+    #[test]
+    fn sysroot_dirs_are_keyed_by_pins() {
+        let l = Layout::new(Path::new("/ws"), Some("t"));
+        let pins = |p: &[&str]| p.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(sysroot_key(&[]), "cbf29ce484222325");
+        let a = (0xaf63_dc4c_8601_ec8c_u64 ^ 0x0a).wrapping_mul(0x0100_0000_01b3);
+        assert_eq!(sysroot_key(&pins(&["a"])), format!("{a:016x}"));
+        let one = l.sysroot("r", &pins(&["a=1", "b=1"]));
+        assert_ne!(one, l.sysroot("r", &pins(&["a=1", "b=2"])));
+        assert_ne!(one, l.sysroot("r", &pins(&["b=1", "a=1"])));
+        assert_eq!(
+            one,
+            Layout::new(Path::new("/ws"), None).sysroot("r", &pins(&["a=1", "b=1"]))
+        );
+        assert!(one.starts_with("/ws/cache/sysroot"));
     }
 
     #[test]

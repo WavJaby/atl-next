@@ -1419,7 +1419,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     };
     if let Some(r) = &args.remote {
         rt.record_inputs(&run)?;
-        let target = crate::remote::Target::of(&rt.out, "app", &r.host, r.brk)?;
+        let target = crate::remote::Target::of(root, &rt.out, "app", &r.host, r.brk)?;
         if !r.apply {
             println!("{}", target.summary());
             println!(

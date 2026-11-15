@@ -336,7 +336,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
     let run = run_of(&work, files, &m, &args.log_tags);
     // the record first: the bundle is what the run reads (remote.rs `Target::of`)
     rt.record_inputs(&run)?;
-    let target = remote::Target::of(&rt.out, "run-apk", &a.host, a.brk)?;
+    let target = remote::Target::of(root, &rt.out, "run-apk", &a.host, a.brk)?;
     let stem = if test_apks::names_row(&a.target) {
         a.target.clone()
     } else {

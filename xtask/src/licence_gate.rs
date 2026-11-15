@@ -44,7 +44,7 @@ impl Places {
         let mut system: Vec<PathBuf> = SYSTEM_DIRS.iter().map(PathBuf::from).collect();
         for row in crate::deps::sysroot_rows(root)? {
             // an unfetched sysroot holds nothing a link loaded
-            system.extend(std::fs::canonicalize(layout.sysroot(&row)).ok());
+            system.extend(std::fs::canonicalize(crate::deps::sysroot_dir(root, &row)?).ok());
         }
         Ok(Self {
             roots: roots(layout, checkouts),
@@ -1231,7 +1231,7 @@ mod tests {
         let fetched: Vec<PathBuf> = crate::deps::sysroot_rows(&root)
             .unwrap()
             .iter()
-            .filter_map(|r| std::fs::canonicalize(layout.sysroot(r)).ok())
+            .filter_map(|r| std::fs::canonicalize(crate::deps::sysroot_dir(&root, r).unwrap()).ok())
             .collect();
         assert_eq!(places.system.len(), SYSTEM_DIRS.len() + fetched.len());
         for dir in &fetched {

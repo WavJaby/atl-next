@@ -218,11 +218,11 @@ pub fn checkout(manifest_dir: &Path) -> Result<PathBuf> {
 
 /// The clang args that make a probe read host `rust_target`'s pinned sysroot (arches.toml `[<arch>.host] sysroot`, a deps.toml `sysroot_debs` row) and its libc++: `--sysroot`, `-nostdinc++ -isystem <c++/v1>`, as device compiles use libc++.
 /// One environment for every host, build machine or cross: generation never reads the build machine's /usr/include, its optional -dev packages or libstdc++ (each once changed a verdict). None: `rust_target` is no arches.toml host (a guest target: its views carry their own `-nostdlibinc` headers).
-/// Also the sysroot's `stamp.txt`, for the build script to rerun on a refetch.
+/// Also the build script's rerun inputs: the sysroot's `stamp.txt` (a refetch) and deps.toml (new pins = another dir, Layout::sysroot).
 pub fn host_sysroot_args(
     checkout: &Path,
     rust_target: &str,
-) -> Result<Option<(Vec<String>, PathBuf)>> {
+) -> Result<Option<(Vec<String>, [PathBuf; 2])>> {
     let table: toml::Table =
         toml::from_str(&std::fs::read_to_string(checkout.join("arches.toml"))?)
             .context("parsing arches.toml")?;
@@ -238,7 +238,22 @@ pub fn host_sysroot_args(
         .with_context(|| {
             format!("arches.toml [{arch}.host]: no sysroot (every host's probes read a pinned one)")
         })?;
-    let dir = Layout::of(checkout)?.sysroot(name);
+    let deps_toml = checkout.join("deps.toml");
+    let deps: toml::Table =
+        toml::from_str(&std::fs::read_to_string(&deps_toml)?).context("parsing deps.toml")?;
+    let pins = deps
+        .get(name)
+        .and_then(|r| r.get("sysroot_debs"))
+        .and_then(|p| p.as_array())
+        .with_context(|| format!("deps.toml: no sysroot_debs row `{name}`"))?
+        .iter()
+        .map(|p| {
+            p.as_str()
+                .map(str::to_owned)
+                .context("deps.toml: a sysroot_debs pin is no string")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let dir = Layout::of(checkout)?.sysroot(name, &pins);
     let root = dir.join("root");
     ensure!(
         root.is_dir(),
@@ -251,7 +266,7 @@ pub fn host_sysroot_args(
         "-isystem".to_owned(),
         libcxx.display().to_string(),
     ];
-    Ok(Some((args, dir.join("stamp.txt"))))
+    Ok(Some((args, [dir.join("stamp.txt"), deps_toml])))
 }
 
 /// The upstream sources a build script reads, where `atl_layout` places them for this repo checkout: a task copy (`xtask patch --edit`) replaces its `src/` checkout here exactly as in xtask.

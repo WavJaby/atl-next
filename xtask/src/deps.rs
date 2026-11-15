@@ -391,7 +391,7 @@ pub struct Args {
     /// Verify every row is installed at its required version (sysroot rows: fetched at the indexed SHA256).
     #[arg(long, conflicts_with = "fetch", required_unless_present = "fetch")]
     check: bool,
-    /// Download and unpack the `sysroot_debs` row NAME into cache/sysroot/NAME/root, without root. `--execute` refreshes the row's private apt index (cache/apt/<arch>) first.
+    /// Download and unpack the `sysroot_debs` row NAME into cache/sysroot/NAME-<key of its pins>/root, without root. `--execute` refreshes the row's private apt index (cache/apt/<arch>) first.
     #[arg(long, value_name = "NAME", conflicts_with = "check")]
     fetch: Option<String>,
     /// With `--fetch`: does it. Without: prints the packages it would fetch.
@@ -739,16 +739,21 @@ fn parse_install_list(text: &str) -> BTreeMap<String, String> {
 
 // ---- sysroots (`sysroot_debs`) ------------------------------------------------------------------
 
-/// `cache/sysroot/<name>/` (Layout::sysroot): `debs/` (the downloads), `root/` (the unpacked tree), `stamp.txt` (written last).
-fn sysroot_dir(root: &Path, name: &str) -> Result<PathBuf> {
-    Ok(Layout::of(root)?.sysroot(name))
+/// The pins of sysroot row `name`.
+fn sysroot_pins(root: &Path, name: &str) -> Result<Vec<String>> {
+    row(root, name)?
+        .sysroot_debs
+        .with_context(|| format!("{FILE}: row `{name}` is not a sysroot_debs row"))
+}
+
+/// `cache/sysroot/<name>-<key of this checkout's pins>/` (Layout::sysroot): `debs/` (the downloads), `root/` (the unpacked tree), `stamp.txt` (written last).
+pub fn sysroot_dir(root: &Path, name: &str) -> Result<PathBuf> {
+    Ok(Layout::of(root)?.sysroot(name, &sysroot_pins(root, name)?))
 }
 
 /// The unpacked tree of sysroot row `name`, once every pin is fetched at its indexed SHA256. `xtask cross` links against it.
 pub fn sysroot_root(root: &Path, name: &str) -> Result<PathBuf> {
-    let pins = row(root, name)?
-        .sysroot_debs
-        .with_context(|| format!("{FILE}: row `{name}` is not a sysroot_debs row"))?;
+    let pins = sysroot_pins(root, name)?;
     if let Some(problem) = sysroot_problem(root, name, &pins)? {
         bail!("sysroot {name}: {problem}");
     }
@@ -903,9 +908,7 @@ fn sysroot_problem(root: &Path, name: &str, pins: &[String]) -> Result<Option<St
 
 /// `deps --fetch NAME`: refreshes the private index, then for each pin `apt-get download` (no root), its SHA256 checked against that index, `dpkg -x` into `root/`; `stamp.txt` last. Dry run unless `execute`.
 fn fetch_sysroot(root: &Path, name: &str, execute: bool) -> Result<ExitCode> {
-    let pins = row(root, name)?
-        .sysroot_debs
-        .with_context(|| format!("{FILE}: row `{name}` is not a sysroot_debs row"))?;
+    let pins = sysroot_pins(root, name)?;
     let dir = sysroot_dir(root, name)?;
     let apt = PrivateApt::of_sysroot(root, name)?;
     if !execute {
