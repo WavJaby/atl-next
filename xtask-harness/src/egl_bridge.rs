@@ -36,7 +36,7 @@ const RUN_TIMEOUT_SECS: u32 = 600;
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// Native out dir holding `nb/x86_64` and `app/` (default: this checkout's slot, see `xtask slot`).
+    /// Native out dir holding `nb/x86_64` and `app/` (default: this checkout's build dir, see `cargo xtask out show`).
     #[arg(long)]
     pub out: Option<PathBuf>,
     /// Only the plain run and the trap run, no breaks.

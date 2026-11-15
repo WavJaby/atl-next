@@ -26,10 +26,10 @@ pub struct Args {
     /// The host arch (an arches.toml row with `[host]`): the default --out.
     #[arg(long)]
     host: String,
-    /// Native build directory (default: this checkout's slot, see `xtask slot`).
+    /// Native build directory (default: this checkout's build dir, see `cargo xtask out show`).
     #[arg(long)]
     out: Option<PathBuf>,
-    /// Java pipeline build directory: boot jars, d8, aapt2 (default: this checkout's slot).
+    /// Java pipeline build directory: boot jars, d8, aapt2 (default: this checkout's build dir).
     #[arg(long)]
     java_out: Option<PathBuf>,
     /// liblog tag filter of the app (ANDROID_LOG_TAGS).

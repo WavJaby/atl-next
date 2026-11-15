@@ -24,10 +24,10 @@ pub struct Args {
     /// The host arch (an arches.toml row with `[host]`): the default --out.
     #[arg(long)]
     host: String,
-    /// Native build directory whose graph holds libgui, libbinder and ART (default: this checkout's slot, see `xtask slot`; else <workspace>/out/native/<host>).
+    /// Native build directory whose graph holds libgui, libbinder and ART (default: this checkout's build dir, see `cargo xtask out show`; else <workspace>/out/native/<host>).
     #[arg(long)]
     out: Option<PathBuf>,
-    /// Java pipeline build directory: the ART host boot jars, framework-minus-apex and its d8 (default: this checkout's slot, see `xtask slot`; else <workspace>/out/java/build).
+    /// Java pipeline build directory: the ART host boot jars, framework-minus-apex and its d8 (default: this checkout's build dir, see `cargo xtask out show`; else <workspace>/out/java/build).
     #[arg(long)]
     java_out: Option<PathBuf>,
     /// Write the libgui-written Transaction dump into this existing directory.
@@ -121,7 +121,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     );
     let cmd = art.command(&fixture, &fixture.area.1, &[], DRIVER, &extra);
     let what = format!("{cmd:?}");
-    // the sandbox shows only what is mounted (binder::spawn_of): the slot read-only at its own path, so the launcher finds the property area its variable names; ANDROID_DATA and --golden writable (parcel.rs does the same)
+    // the sandbox shows only what is mounted (binder::spawn_of): the build dir read-only at its own path, so the launcher finds the property area its variable names; ANDROID_DATA and --golden writable (parcel.rs does the same)
     let run = (|| -> Result<_> {
         let mut s = binder::spawn_of(&cmd, AID_SYSTEM)?;
         s.stdout = std::process::Stdio::piped();
@@ -131,7 +131,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             at: out.clone(),
             writable: false,
         });
-        // the staged ART root's links name files outside the slot (ICU data in src/aosp, tzdata): their targets are mounted too (parcel.rs does the same)
+        // the staged ART root's links name files outside the build dir (ICU data in src/aosp, tzdata): their targets are mounted too (parcel.rs does the same)
         s.mounts.extend(atl_broker::tree_mounts(&art.art)?);
         for dir in &writable {
             s.mounts.push(atl_broker::Mount {

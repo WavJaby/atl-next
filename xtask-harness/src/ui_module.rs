@@ -41,7 +41,7 @@ const GLIBC: &[&str] = &["/libc.so.6", "/ld-linux-x86-64.so.2"];
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// The native build dir (default: this checkout's slot).
+    /// The native build dir (default: this checkout's build dir).
     #[arg(long)]
     out: Option<PathBuf>,
     /// NDK root (default: the workspace's tools dir).

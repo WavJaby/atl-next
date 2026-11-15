@@ -99,10 +99,10 @@ pub struct Args {
     /// The host arch (an arches.toml row with `[host]`).
     #[arg(long)]
     host: String,
-    /// Java pipeline build directory (default: this checkout's slot, see `xtask slot`; else <workspace>/out/java/build).
+    /// Java pipeline build directory (default: this checkout's build dir, see `cargo xtask out show`; else <workspace>/out/java/build).
     #[arg(long)]
     java_out: Option<PathBuf>,
-    /// Native build directory (default: this checkout's slot; else <workspace>/out/native/<host>).
+    /// Native build directory (default: this checkout's build dir; else <workspace>/out/native/<host>).
     #[arg(long)]
     out: Option<PathBuf>,
     /// Deliberate break that must turn the gate red with the refusal named (module doc): `drop-split`, `abi-arm64` (check 1: no config split in the dir; the device's ABI lists are arm64-v8a only), `feature` (check 6: the installer is told the device has android.hardware.camera),

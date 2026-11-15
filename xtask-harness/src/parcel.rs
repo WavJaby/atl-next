@@ -28,10 +28,10 @@ pub struct Args {
     /// The host arch (an arches.toml row with `[host]`): the default --out.
     #[arg(long)]
     host: String,
-    /// Native build directory whose graph holds libbinder_rs, libatl_parcelables and ART (default: this checkout's slot, see `xtask slot`; else <workspace>/out/native/<host>).
+    /// Native build directory whose graph holds libbinder_rs, libatl_parcelables and ART (default: this checkout's build dir, see `cargo xtask out show`; else <workspace>/out/native/<host>).
     #[arg(long)]
     out: Option<PathBuf>,
-    /// Java pipeline build directory: the ART host boot jars, framework-minus-apex and its d8 (default: this checkout's slot, see `xtask slot`; else <workspace>/out/java/build).
+    /// Java pipeline build directory: the ART host boot jars, framework-minus-apex and its d8 (default: this checkout's build dir, see `cargo xtask out show`; else <workspace>/out/java/build).
     #[arg(long)]
     java_out: Option<PathBuf>,
     /// Print every ART run's command, stdout and stderr.
@@ -386,7 +386,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     let cmd = art.command(&fixture, &fixture.area.1, &[], DRIVER, &driver_args);
     let what = format!("{cmd:?}");
-    // the sandbox shows only what is mounted: the slot read-only at its own path (boot jars, ART root, launcher, fixture dex, runtime, keymap, property area: the launcher
+    // the sandbox shows only what is mounted: the build dir read-only at its own path (boot jars, ART root, launcher, fixture dex, runtime, keymap, property area: the launcher
     // refuses to start without the area its variable names), ANDROID_DATA writable inside it, as native_load runs its launcher
     let run = (|| -> Result<_> {
         let mut s = binder::spawn_of(&cmd, AID_APP_START)?;
@@ -397,7 +397,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             at: out.clone(),
             writable: false,
         });
-        // the staged ART root's links name files outside the slot (ICU data in src/aosp): their targets are mounted too
+        // the staged ART root's links name files outside the build dir (ICU data in src/aosp): their targets are mounted too
         s.mounts.extend(atl_broker::tree_mounts(&art.art)?);
         let data = fixture.work.join("data");
         std::fs::create_dir_all(&data)?;

@@ -643,7 +643,7 @@ impl Signer {
 
 impl Runtime {
     /// Stages ART into `<out>/<stage>`, builds the cargo binaries, checks every input exists; the test fonts are written to `<out>/fonts`. `gate` names the caller in gate_goals.rs GATES:
-    /// the slot is refused up front unless built with its goals.
+    /// the build dir is refused up front unless built with its goals.
     pub fn new(
         root: &Path,
         gate: &str,
@@ -655,7 +655,7 @@ impl Runtime {
     ) -> Result<Runtime> {
         let layout = Layout::of(root)?;
         let out = crate::build_state::gate_out(root, out, host, gate)?;
-        // a cross host's graph builds its own Java outputs and build-side tools (aapt2 under `build/`) into its out dir; the slot's are the build machine's graph's
+        // a cross host's graph builds its own Java outputs and build-side tools (aapt2 under `build/`) into its out dir; the build dir's are the build machine's graph's
         let java_out = match (java_out, xtask::native::cross_host_of(root, &out)?) {
             (None, Some(_)) => out.clone(),
             (java_out, _) => out::out_dir(root, java_out)?,

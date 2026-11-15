@@ -21,7 +21,7 @@ pub struct Args {
     /// The host arch (an arches.toml row with `[host]`): the default --out.
     #[arg(long)]
     host: String,
-    /// Native build directory holding servicemanager and service (default: this checkout's slot, see `xtask slot`; else <workspace>/out/native/<host>).
+    /// Native build directory holding servicemanager and service (default: this checkout's build dir, see `cargo xtask out show`; else <workspace>/out/native/<host>).
     #[arg(long)]
     out: Option<PathBuf>,
     /// Break: the harness answers the services' control `Install` with atld's installer-exit error (atl-installer exited non-zero); the services stage passes only if they exit before `ready` with no package installed. The sweep stage is skipped.

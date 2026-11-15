@@ -32,10 +32,10 @@ pub struct Args {
     /// The host arch (an arches.toml row with `[host]`).
     #[arg(long)]
     host: String,
-    /// Java pipeline build directory (default: this checkout's slot, see `xtask slot`; else <workspace>/out/java/build).
+    /// Java pipeline build directory (default: this checkout's build dir, see `cargo xtask out show`; else <workspace>/out/java/build).
     #[arg(long)]
     java_out: Option<PathBuf>,
-    /// Native build directory (default: this checkout's slot; else <workspace>/out/native/<host>).
+    /// Native build directory (default: this checkout's build dir; else <workspace>/out/native/<host>).
     #[arg(long)]
     out: Option<PathBuf>,
     /// Deliberate break that must turn its check red: `delivery` or `parse`.

@@ -25,7 +25,7 @@ pub struct Args {
     /// The host arch (an arches.toml row with `[host]`): the default --out.
     #[arg(long)]
     host: String,
-    /// Native build directory (default: this checkout's slot, see `xtask slot`; else <workspace>/out/native/<host>).
+    /// Native build directory (default: this checkout's build dir, see `cargo xtask out show`; else <workspace>/out/native/<host>).
     #[arg(long)]
     out: Option<PathBuf>,
     /// The DRM node the allocator uses instead of trying /dev/dri's render then card nodes.
@@ -226,7 +226,7 @@ pub fn start_allocator(
     }
 }
 
-/// The allocator binary (`xtask native` builds it into the slot).
+/// The allocator binary (`xtask native` builds it into the build dir).
 pub fn allocator(root: &Path, out: &Path) -> Result<PathBuf> {
     packages::bin(root, out, ALLOCATOR_PACKAGE, ALLOCATOR_BIN)
 }

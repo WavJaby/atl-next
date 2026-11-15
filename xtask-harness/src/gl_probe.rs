@@ -31,10 +31,10 @@ pub struct Args {
     /// The host arch (an arches.toml row with `[host]`): the default --out.
     #[arg(long)]
     host: String,
-    /// Native build directory holding ART, the services and the fronts (default: this checkout's slot, see `xtask slot`; else <workspace>/out/native/<host>).
+    /// Native build directory holding ART, the services and the fronts (default: this checkout's build dir, see `cargo xtask out show`; else <workspace>/out/native/<host>).
     #[arg(long)]
     out: Option<PathBuf>,
-    /// Java pipeline build directory: boot jars, aapt2, d8 (default: this checkout's slot; else <workspace>/out/java/build).
+    /// Java pipeline build directory: boot jars, aapt2, d8 (default: this checkout's build dir; else <workspace>/out/java/build).
     #[arg(long)]
     java_out: Option<PathBuf>,
     /// Timed frames of the scene, after one untimed warm-up; the median and p95 are over these. At least 20: below that the p95 is the slowest frame.
@@ -86,7 +86,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     judge(root, args, remote::Site::Host)
 }
 
-/// `remote test gl` (remote.rs): the same gate, its atld runs on `site`. `host` is the arches.toml `[host]` row, `out` the slot the bundle was pushed from.
+/// `remote test gl` (remote.rs): the same gate, its atld runs on `site`. `host` is the arches.toml `[host]` row, `out` the build dir the bundle was pushed from.
 pub fn run_on(root: &Path, host: &str, out: &Path, site: remote::Site) -> Result<ExitCode> {
     let args = Args {
         host: host.to_owned(),

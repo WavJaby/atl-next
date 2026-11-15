@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! `xtask-harness`: the runtime gates (`test`, `run-apk`, `remote`) and the check steps that need product logic. `cargo xtask test|run-apk|remote ...` runs this binary (xtask harness.rs); run it through that alias, not directly.
-//! Links the bootstrap library (xtask) for everything that is not a runtime gate: layout, slots, build records, native goals, verdict lines. Its modules reach that code as `crate::<module>` through the imports below.
+//! Links the bootstrap library (xtask) for everything that is not a runtime gate: layout, build dirs, build records, native goals, verdict lines. Its modules reach that code as `crate::<module>` through the imports below.
 #![forbid(unsafe_code)]
 // Terminal output is this tool's product, not logging.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
@@ -109,7 +109,7 @@ enum Command {
         #[command(subcommand)]
         test: Test,
     },
-    /// A `cargo xtask check` step that needs product logic, run by check as a process: prints `skip: <why>` when the slot lacks its inputs.
+    /// A `cargo xtask check` step that needs product logic, run by check as a process: prints `skip: <why>` when the build dir lacks its inputs.
     #[command(hide = true)]
     CheckStep {
         step: CheckStep,
@@ -416,7 +416,7 @@ fn main() -> Result<ExitCode> {
     result
 }
 
-/// Runs check step `step` on slot `out`; a skip is printed for check (xtask harness.rs `check_step`) and exits 0.
+/// Runs check step `step` on build dir `out`; a skip is printed for check (xtask harness.rs `check_step`) and exits 0.
 fn check_step(root: &std::path::Path, step: CheckStep, out: &std::path::Path) -> Result<ExitCode> {
     let skipped = match step {
         CheckStep::GlProxies => {

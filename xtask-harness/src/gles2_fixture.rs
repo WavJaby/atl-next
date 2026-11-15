@@ -30,10 +30,10 @@ pub struct Args {
     /// NDK root (default: <workspace>/tools/android-ndk-r30, as `xtask test jni-fixture`).
     #[arg(long)]
     ndk: Option<PathBuf>,
-    /// Native build directory: only its build.prop is read, for the SDK level of android.jar (default: this checkout's slot, see `xtask slot`; else <workspace>/out/native/<host>).
+    /// Native build directory: only its build.prop is read, for the SDK level of android.jar (default: this checkout's build dir, see `cargo xtask out show`; else <workspace>/out/native/<host>).
     #[arg(long)]
     out: Option<PathBuf>,
-    /// Java pipeline build directory: aapt2, d8 (default: this checkout's slot; else <workspace>/out/java/build).
+    /// Java pipeline build directory: aapt2, d8 (default: this checkout's build dir; else <workspace>/out/java/build).
     #[arg(long)]
     java_out: Option<PathBuf>,
     /// Where the library and APK go (default: <workspace>/out/gles2-fixture).

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 //! `cargo xtask remote`: runs WSL-built outputs on a Linux desktop over ssh (the owner's laptop, plan L1).
 //!
-//! The record: a gate's last run in a slot writes what its runtime read (atld_run.rs `record_inputs`, via [`write_record`]): host files, and host directories whose trees the bundle takes whole.
+//! The record: a gate's last run in a build dir writes what its runtime read (atld_run.rs `record_inputs`, via [`write_record`]): host files, and host directories whose trees the bundle takes whole.
 //! `push` bundles that record, mapped to `out/`, `java/` and `src/aosp/` names, plus `lib/`: Debian's LLVM 19 runtimes (a labelled patch until our pinned runtimes ship in an install tree, plan L1 / D1).
 //! A directory is replicated with its symlinks kept as links and never followed (the ART tree's `com.android.art -> .` would loop); files are hard links, copies across filesystems.
-//! Dry run by default. `--apply` stages the bundle under `<out>/remote/bundle/<gate>` (with a manifest of sha256 + size, or the link target) and runs `rsync -a --delete` to `~/atl-next-run/<slot>/` on the host.
+//! Dry run by default. `--apply` stages the bundle under `<out>/remote/bundle/<gate>` (with a manifest of sha256 + size, or the link target) and runs `rsync -a --delete` to `~/atl-next-run/<name>/` on the host.
 //! `test` runs the prerequisite check on the target first: `ldd` over every ELF of the bundle, with the bundle's directories on `LD_LIBRARY_PATH`. Each `not found` soname is named with the file that needs it, a file the push did not deliver is named, and any of them is red. Then the runtime half ([`runtime_half`]): `gl` runs here, each of its atld runs runs on the target from the bundle ([`RemoteRun::spawn`]), and its judge reads the logs the target returns.
 //! Host: an ssh alias from the operator's WSL `~/.ssh/config`. The alias is the only handle: no address, user or key goes into the repo or a flag. `local:<absolute dir>` is a directory standing in for the target (the local gate).
 //! Limit: `ldd` here also searches this host's own libraries, so on WSL a missing bundle copy still resolves. The `drop-libunwind` break is red only on a host without its own `libunwind.so.1`.
@@ -48,11 +48,11 @@ const LLVM_RUNTIMES: [(&str, &str); 3] = [
 const LIB_PREFIX: &str = "lib/";
 /// The break's entry: its name in the bundle.
 const LIBUNWIND: &str = "lib/libunwind.so.1";
-/// atld's entry: `cargo_bin` (atld_run.rs) under the slot.
+/// atld's entry: `cargo_bin` (atld_run.rs) under the build dir.
 const ATLD: &str = "out/cargo/release/atld";
-/// Bundle names of a record's roots: the slot, the java out and the AOSP tree.
+/// Bundle names of a record's roots: the build dir, the java out and the AOSP tree.
 const ROOT_NAMES: [(&str, &str); 3] = [("out", "out"), ("java", "java"), ("tree", "src/aosp")];
-/// The target's directory for a slot's bundle, relative to the host's home: `~/atl-next-run/<slot>/`.
+/// The target's directory for a build dir's bundle, relative to the host's home: `~/atl-next-run/<name>/`.
 const REMOTE_ROOT: &str = "atl-next-run";
 /// `<out>/remote/...`: the record and the staged bundle.
 pub const REMOTE_DIR: &str = "remote";
@@ -73,10 +73,10 @@ const MIB: f64 = 1024.0 * 1024.0;
 
 #[derive(clap::Subcommand)]
 pub enum Remote {
-    /// Bundles a gate's runtime inputs (its last run's record in the slot) and `lib/`, and copies them to an ssh alias or a local dir.
+    /// Bundles a gate's runtime inputs (its last run's record in the build dir) and `lib/`, and copies them to an ssh alias or a local dir.
     ///
-    /// Dry run by default: prints the bundle summary (`--list`: every entry) and the rsync it would run. `--apply` stages the bundle under `<out>/remote/bundle/<gate>` with a manifest, then runs `rsync -a --delete` to `~/atl-next-run/<slot>/` on the host.
-    /// The record is written by a gate's run in the slot (`xtask test <gate>`); without it this names that command.
+    /// Dry run by default: prints the bundle summary (`--list`: every entry) and the rsync it would run. `--apply` stages the bundle under `<out>/remote/bundle/<gate>` with a manifest, then runs `rsync -a --delete` to `~/atl-next-run/<name>/` on the host.
+    /// The record is written by a gate's run in the build dir (`xtask test <gate>`); without it this names that command.
     Push(PushArgs),
     /// The prerequisite check on the target: `ldd` over the bundle, every `not found` named with the file that needs it. Then the gate's runtime half: its atld runs execute on the target (`gl`, `app`).
     ///
@@ -97,7 +97,7 @@ pub struct PushArgs {
     /// The gate whose record is bundled (gate_goals.rs name).
     #[arg(long)]
     gate: String,
-    /// The native out dir holding the record (default: this checkout's slot, see `xtask slot`).
+    /// The native out dir holding the record (default: this checkout's build dir, see `cargo xtask out show`).
     #[arg(long)]
     out: Option<PathBuf>,
     /// Copies the bundle to the target. Without it: prints what would be copied.
@@ -118,7 +118,7 @@ pub struct TestArgs {
     /// ssh alias from WSL `~/.ssh/config`, or `local:<absolute dir>`.
     #[arg(long)]
     pub(crate) host: String,
-    /// The native out dir holding the record (default: this checkout's slot, see `xtask slot`).
+    /// The native out dir holding the record (default: this checkout's build dir, see `cargo xtask out show`).
     #[arg(long)]
     pub(crate) out: Option<PathBuf>,
     /// Runs the check on the target. Without it: prints the check.
@@ -127,7 +127,7 @@ pub struct TestArgs {
     /// Deliberate break: the bundle without its copy of the named runtime (see the values).
     #[arg(long = "break", value_enum)]
     pub(crate) brk: Option<Break>,
-    /// `app` only: the target's arch (an arches.toml row with `[host]`); the bundle comes from its out dir (a cross host's under the slot, native.rs `host_out`). Default: the build machine's.
+    /// `app` only: the target's arch (an arches.toml row with `[host]`); the bundle comes from its out dir (a cross host's under the build dir, native.rs `host_out`). Default: the build machine's.
     #[arg(long)]
     pub(crate) arch: Option<String>,
     /// `app` only: the fixture's ISA (`test app --fixture-arch`); needed where `--arch` has no identity engine.
@@ -340,7 +340,7 @@ fn nested_script(tag: &str, cfg: &str, log: &str) -> String {
     )
 }
 
-/// The host roots a runtime names, absolute on this host: the slot, the java out and the AOSP tree (bundle names [`ROOT_NAMES`]), and the run's LLVM runtimes dir ([`llvm_lib_dir`], bundle name `lib`).
+/// The host roots a runtime names, absolute on this host: the build dir, the java out and the AOSP tree (bundle names [`ROOT_NAMES`]), and the run's LLVM runtimes dir ([`llvm_lib_dir`], bundle name `lib`).
 pub struct Roots {
     out: PathBuf,
     java: PathBuf,
@@ -448,9 +448,9 @@ pub(crate) fn session_script(tag: &str) -> String {
     )
 }
 
-/// One atld run as the target runs it: the command, its environment, and the files this host wrote for it, all with bundle paths (`@BASE@`). `root` and `scratch` are relative to the slot's out dir, where the logs return.
+/// One atld run as the target runs it: the command, its environment, and the files this host wrote for it, all with bundle paths (`@BASE@`). `root` and `scratch` are relative to the out dir, where the logs return.
 struct Plan {
-    /// The run's name, its dir under the slot, e.g. `gl/run`.
+    /// The run's name, its dir under the out dir, e.g. `gl/run`.
     tag: String,
     root: String,
     scratch: String,
@@ -572,7 +572,7 @@ impl RemoteRun {
         self.display != Display::Headless
     }
 
-    /// Starts `cmd` (atld's command, host paths) on the target as one run. The child is the transfer, `<transport> < plan | tar -x` (`sh -s` for `local:`), and its end is the run's. `root` and `scratch` lie under the slot's out dir, where the logs return. `written` are the files the command reads that this host wrote: their content goes into the plan.
+    /// Starts `cmd` (atld's command, host paths) on the target as one run. The child is the transfer, `<transport> < plan | tar -x` (`sh -s` for `local:`), and its end is the run's. `root` and `scratch` lie under the out dir, where the logs return. `written` are the files the command reads that this host wrote: their content goes into the plan.
     pub fn spawn(
         &self,
         roots: &Roots,
@@ -681,11 +681,11 @@ impl RemoteRun {
     }
 }
 
-/// `path` relative to the slot's out dir: the target keeps that layout. A path outside the slot is refused.
+/// `path` relative to the out dir: the target keeps that layout. A path outside the out dir is refused.
 pub(crate) fn rel_out(out: &Path, path: &Path) -> Result<String> {
     let rel = path.strip_prefix(out).with_context(|| {
         format!(
-            "{} is not under the slot {}: a remote run keeps its files there",
+            "{} is not under the out dir {}: a remote run keeps its files there",
             path.display(),
             out.display()
         )
@@ -748,17 +748,17 @@ impl Host {
         }
     }
 
-    /// Where the bundle sits on the target: `~/atl-next-run/<slot>` (relative to the home dir), or the local dir.
-    fn base(&self, slot: &str) -> String {
+    /// Where the bundle sits on the target: `~/atl-next-run/<name>` (relative to the home dir), or the local dir.
+    fn base(&self, dir_name: &str) -> String {
         match self {
-            Host::Ssh(_) => format!("{REMOTE_ROOT}/{slot}"),
+            Host::Ssh(_) => format!("{REMOTE_ROOT}/{dir_name}"),
             Host::Local(dir) => dir.display().to_string(),
         }
     }
 
-    fn target(&self, slot: &str) -> String {
+    fn target(&self, dir_name: &str) -> String {
         match self {
-            Host::Ssh(alias) => format!("{alias}:{REMOTE_ROOT}/{slot}/"),
+            Host::Ssh(alias) => format!("{alias}:{REMOTE_ROOT}/{dir_name}/"),
             Host::Local(dir) => format!("{}/", dir.display()),
         }
     }
@@ -778,14 +778,14 @@ impl Host {
         Ok(())
     }
 
-    fn sync(&self, stage: &Path, slot: &str) -> Result<()> {
+    fn sync(&self, stage: &Path, dir_name: &str) -> Result<()> {
         let src = format!("{}/", stage.display());
         let status = match self {
             Host::Ssh(alias) => Command::new("rsync")
                 .args(["-a", "--delete", "--mkpath", "-e"])
                 .arg(format!("ssh {}", SSH_OPTS.join(" ")))
                 .arg(&src)
-                .arg(format!("{alias}:{REMOTE_ROOT}/{slot}/"))
+                .arg(format!("{alias}:{REMOTE_ROOT}/{dir_name}/"))
                 .status(),
             Host::Local(dir) => {
                 std::fs::create_dir_all(dir)?;
@@ -893,7 +893,7 @@ fn ssh(alias: &str) -> Command {
 /// A gate's bundle on one host: what `push`, the prerequisite check and a remote run share.
 pub struct Target {
     host: Host,
-    slot: String,
+    dir_name: String,
     bundle: Bundle,
     /// Bundle names of the ELF files, and of the directories holding them: the check's search path, and a run's `LD_LIBRARY_PATH`.
     elf: Vec<String>,
@@ -912,13 +912,13 @@ impl Target {
     ) -> Result<Target> {
         let host = Host::parse(host)?;
         let cross = xtask::native::cross_host_of(root, out)?.is_some();
-        let slot = slot_name(out, cross)?;
+        let dir_name = target_dir_name(out, cross)?;
         let bundle = Bundle::of(gate, out, brk)?;
         let elf = bundle.elf_names()?;
         let lib_dirs = bundle.lib_dirs(&elf);
         Ok(Target {
             host,
-            slot,
+            dir_name,
             bundle,
             elf,
             lib_dirs,
@@ -934,9 +934,9 @@ impl Target {
         &self.bundle.entries
     }
 
-    /// `alias:~/atl-next-run/<slot>/` (or the local dir): where the bundle goes.
+    /// `alias:~/atl-next-run/<name>/` (or the local dir): where the bundle goes.
     pub fn target(&self) -> String {
-        self.host.target(&self.slot)
+        self.host.target(&self.dir_name)
     }
 
     pub fn label(&self) -> String {
@@ -960,7 +960,7 @@ impl Target {
     pub fn push(&self) -> Result<()> {
         self.host.reach()?;
         self.bundle.stage(&self.stage)?;
-        self.host.sync(&self.stage, &self.slot)
+        self.host.sync(&self.stage, &self.dir_name)
     }
 
     /// [`Target::push`], then [`Target::check`], its lines printed as `remote prereq <what>: ...`. The check's problems: empty = delivered and checked.
@@ -983,7 +983,7 @@ impl Target {
 
     /// The prerequisite check on the target: `ldd` over every ELF file of the bundle.
     pub fn check(&self) -> Result<Prereq> {
-        let script = prereq_script(&self.host.base(&self.slot), &self.elf, &self.lib_dirs)?;
+        let script = prereq_script(&self.host.base(&self.dir_name), &self.elf, &self.lib_dirs)?;
         Ok(parse_prereq(&self.host.run_script(&script)?))
     }
 
@@ -991,7 +991,7 @@ impl Target {
     pub fn run_site(&self, limit: Duration, log: PathBuf, display: Display) -> Site {
         Site::Remote(RemoteRun {
             host: self.host.clone(),
-            base: self.host.base(&self.slot),
+            base: self.host.base(&self.dir_name),
             lib_dirs: self.lib_dirs.clone(),
             limit,
             log,
@@ -999,9 +999,9 @@ impl Target {
         })
     }
 
-    /// The bundle dir on the target, where a run's `out/` lives: `~/atl-next-run/<slot>` relative to home, or the local dir.
+    /// The bundle dir on the target, where a run's `out/` lives: `~/atl-next-run/<name>` relative to home, or the local dir.
     pub fn base(&self) -> String {
-        self.host.base(&self.slot)
+        self.host.base(&self.dir_name)
     }
 
     /// `script` on the target, its stdout as bytes, bounded by `limit` (see `Host::run_bounded`).
@@ -1026,7 +1026,7 @@ fn out_of(root: &Path, explicit: Option<&Path>) -> Result<PathBuf> {
 }
 
 /// The target's directory name for out dir `out`: its build dir's name (the checkout id, `snap-x3`), from the real dir (inside the build namespace every build dir is `out/build`, out::real). A `cross` host's out is `<dir>/<arch>` (native::host_out), so it is `<dir>-<arch>`: named by the arch alone, two checkouts pushing one arch would share (and `rsync --delete`) one dir.
-fn slot_name(out: &Path, cross: bool) -> Result<String> {
+fn target_dir_name(out: &Path, cross: bool) -> Result<String> {
     let out = &out::real(out);
     let name = |p: &Path| {
         p.file_name()
@@ -1035,10 +1035,10 @@ fn slot_name(out: &Path, cross: bool) -> Result<String> {
             .with_context(|| format!("out dir {} has no name", p.display()))
     };
     let name = if cross {
-        let slot = out
+        let build = out
             .parent()
-            .with_context(|| format!("cross out dir {} has no slot dir", out.display()))?;
-        format!("{}-{}", name(slot)?, name(out)?)
+            .with_context(|| format!("cross out dir {} has no build dir", out.display()))?;
+        format!("{}-{}", name(build)?, name(out)?)
     } else {
         name(out)?
     };
@@ -1067,7 +1067,7 @@ pub struct Inputs {
     pub dirs: Vec<PathBuf>,
 }
 
-/// Writes gate `gate`'s record: its inputs (absolute), with the roots their bundle names come from (`java`, `tree`; the slot is `out`) and the LLVM runtimes dir the run links against (`lib`, [`llvm_lib_dir`]).
+/// Writes gate `gate`'s record: its inputs (absolute), with the roots their bundle names come from (`java`, `tree`; the build dir is `out`) and the LLVM runtimes dir the run links against (`lib`, [`llvm_lib_dir`]).
 pub fn write_record(
     out: &Path,
     gate: &str,
@@ -1121,7 +1121,7 @@ fn read_record(out: &Path, gate: &str) -> Result<Record> {
     let file = record_path(out, gate);
     let text = std::fs::read_to_string(&file).with_context(|| {
         format!(
-            "gate `{gate}`: no runtime-input record at {}: run `cargo xtask test {gate}` in this slot once (its run records what it reads)",
+            "gate `{gate}`: no runtime-input record at {}: run `cargo xtask test {gate}` in this build dir once (its run records what it reads)",
             file.display()
         )
     })?;
@@ -1171,7 +1171,7 @@ fn absolute_path(text: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(text))
 }
 
-/// A record path's bundle name: under the slot as `out/...`, else the java out as `java/...`, else the AOSP tree as `src/aosp/...`. Anything else is refused: the bundle lays out known roots only.
+/// A record path's bundle name: under the build dir as `out/...`, else the java out as `java/...`, else the AOSP tree as `src/aosp/...`. Anything else is refused: the bundle lays out known roots only.
 fn bundle_name(path: &Path, roots: &BTreeMap<&'static str, PathBuf>) -> Result<String> {
     for (key, name) in ROOT_NAMES {
         if let Some(root) = roots.get(key)
@@ -1181,7 +1181,7 @@ fn bundle_name(path: &Path, roots: &BTreeMap<&'static str, PathBuf>) -> Result<S
         }
     }
     bail!(
-        "runtime input outside the slot, the java out and the AOSP tree: {}",
+        "runtime input outside the build dir, the java out and the AOSP tree: {}",
         path.display()
     )
 }
@@ -1240,7 +1240,7 @@ fn insert(map: &mut BTreeMap<String, Entry>, e: Entry) -> Result<()> {
     Ok(())
 }
 
-/// Adds the tree at `dir` under bundle name `name`. Directories recurse. A link to a regular file becomes that file's content under the link's name: its absolute target (a slot path) would dangle on the target. A link to a directory inside the tree stays a link (the tree's own alias, `com.android.art -> .`); one outside is refused. A dangling link stays as it is.
+/// Adds the tree at `dir` under bundle name `name`. Directories recurse. A link to a regular file becomes that file's content under the link's name: its absolute target (a build dir path) would dangle on the target. A link to a directory inside the tree stays a link (the tree's own alias, `com.android.art -> .`); one outside is refused. A dangling link stays as it is.
 fn add_tree(dir: &Path, name: &str, map: &mut BTreeMap<String, Entry>) -> Result<()> {
     let root =
         std::fs::canonicalize(dir).with_context(|| format!("resolving {}", dir.display()))?;
@@ -1335,7 +1335,7 @@ impl Bundle {
         for file in &record.files {
             ensure!(
                 file.is_file(),
-                "record names {} but it is not a file: rebuild the slot or rerun `cargo xtask test {gate}`",
+                "record names {} but it is not a file: rebuild the build dir or rerun `cargo xtask test {gate}`",
                 file.display()
             );
             insert(
@@ -1352,7 +1352,7 @@ impl Bundle {
         for dir in &record.dirs {
             ensure!(
                 dir.is_dir(),
-                "record names {} but it is not a directory: rebuild the slot or rerun `cargo xtask test {gate}`",
+                "record names {} but it is not a directory: rebuild the build dir or rerun `cargo xtask test {gate}`",
                 dir.display()
             );
             add_tree(dir, &bundle_name(dir, &record.roots)?, &mut map)?;
@@ -1485,7 +1485,7 @@ impl Bundle {
     }
 }
 
-/// A path the target takes unquoted (the slot's directory name, via [`valid_name`]): `[A-Za-z0-9._+/-]`, no `..` component.
+/// A path the target takes unquoted (the target's directory name, via [`valid_name`]): `[A-Za-z0-9._+/-]`, no `..` component.
 fn safe_name(name: &str) -> bool {
     !name.is_empty()
         && !name.split('/').any(|c| c == "..")
@@ -1594,8 +1594,8 @@ mod tests {
 
     fn roots() -> BTreeMap<&'static str, PathBuf> {
         BTreeMap::from([
-            ("out", PathBuf::from("/w/out/slot-9")),
-            ("java", PathBuf::from("/w/out/slot-9")),
+            ("out", PathBuf::from("/w/out/pool/ws/x9")),
+            ("java", PathBuf::from("/w/out/pool/ws/x9")),
             ("tree", PathBuf::from("/w/src/aosp")),
         ])
     }
@@ -1647,7 +1647,7 @@ mod tests {
     fn bundle_names_follow_the_roots() {
         let r = roots();
         assert_eq!(
-            bundle_name(Path::new("/w/out/slot-9/device/libart/libart.so"), &r).unwrap(),
+            bundle_name(Path::new("/w/out/pool/ws/x9/device/libart/libart.so"), &r).unwrap(),
             "out/device/libart/libart.so"
         );
         assert_eq!(
@@ -1659,10 +1659,10 @@ mod tests {
 
     #[test]
     fn record_parses_roots_dirs_and_files() {
-        let text = "# c\nout /w/out/slot-9\njava /w/out/slot-9\ntree /w/src/aosp\nlib /s/usr/lib/llvm-19/lib\ndir /w/out/slot-9/gl-art\n/w/out/slot-9/a.so\n";
+        let text = "# c\nout /w/out/pool/ws/x9\njava /w/out/pool/ws/x9\ntree /w/src/aosp\nlib /s/usr/lib/llvm-19/lib\ndir /w/out/pool/ws/x9/gl-art\n/w/out/pool/ws/x9/a.so\n";
         let rec = parse_record(text).unwrap();
-        assert_eq!(rec.files, vec![PathBuf::from("/w/out/slot-9/a.so")]);
-        assert_eq!(rec.dirs, vec![PathBuf::from("/w/out/slot-9/gl-art")]);
+        assert_eq!(rec.files, vec![PathBuf::from("/w/out/pool/ws/x9/a.so")]);
+        assert_eq!(rec.dirs, vec![PathBuf::from("/w/out/pool/ws/x9/gl-art")]);
         assert_eq!(rec.roots["tree"], PathBuf::from("/w/src/aosp"));
         assert_eq!(rec.lib, PathBuf::from("/s/usr/lib/llvm-19/lib"));
         assert!(
@@ -1677,28 +1677,28 @@ mod tests {
         assert!(parse_record("out /o\njava /o\ntree /t\nlib /l\ndir relative\n").is_err());
     }
 
-    /// Two slots' riscv64 outs get two target dirs; a build machine out keeps its slot name. Break: naming a cross out by its arch alone makes the first pair equal.
+    /// Two build dirs' riscv64 outs get two target dirs; a build machine out keeps its dir name. Break: naming a cross out by its arch alone makes the first pair equal.
     #[test]
-    fn cross_outs_of_two_slots_get_two_target_dirs() {
-        let n = |p: &str, cross| slot_name(Path::new(p), cross).unwrap();
-        assert_eq!(n("/w/out/slot-4/riscv64", true), "slot-4-riscv64");
+    fn cross_outs_of_two_build_dirs_get_two_target_dirs() {
+        let n = |p: &str, cross| target_dir_name(Path::new(p), cross).unwrap();
+        assert_eq!(n("/w/out/pool/ws/x4/riscv64", true), "x4-riscv64");
         assert_ne!(
-            n("/w/out/slot-4/riscv64", true),
-            n("/w/out/slot-5/riscv64", true)
+            n("/w/out/pool/ws/x4/riscv64", true),
+            n("/w/out/pool/ws/x5/riscv64", true)
         );
-        assert_eq!(n("/w/out/slot-9", false), "slot-9");
+        assert_eq!(n("/w/out/pool/ws/x9", false), "x9");
     }
 
     #[test]
     fn prereq_script_quotes_and_orders_the_check() {
         let s = prereq_script(
-            "atl-next-run/slot-9",
+            "atl-next-run/x9",
             &["lib/libc++.so.1".to_owned(), "out/device/x.so".to_owned()],
             &["lib".to_owned(), "out/device".to_owned()],
         )
         .unwrap();
         let want = concat!(
-            "cd 'atl-next-run/slot-9' || exit 2\n",
+            "cd 'atl-next-run/x9' || exit 2\n",
             "LD_LIBRARY_PATH=\"$PWD\"/'lib':\"$PWD\"/'out/device'\n",
             "export LD_LIBRARY_PATH\n",
             "for f in 'lib/libc++.so.1' 'out/device/x.so'; do\n",
@@ -1782,7 +1782,7 @@ mod tests {
     #[test]
     fn record_round_trips_through_its_file() {
         let dir = temp("record");
-        let out = dir.join("slot");
+        let out = dir.join("build");
         let tree = dir.join("tree");
         let inputs = Inputs {
             files: vec![out.join("device/a.so"), tree.join("x.kcm")],
@@ -1828,7 +1828,7 @@ mod tests {
 
     fn host_roots() -> Roots {
         Roots::of(
-            Path::new("/w/out/slot-9"),
+            Path::new("/w/out/pool/ws/x9"),
             Path::new("/w/out/java/build"),
             Path::new("/w/src/aosp"),
             Path::new(LLVM_LIB_DIR),
@@ -1839,7 +1839,7 @@ mod tests {
     fn relocate_maps_each_root_at_a_token_start_only() {
         let r = host_roots();
         assert_eq!(
-            relocate("--root=/w/out/slot-9/gl/run/root", &r),
+            relocate("--root=/w/out/pool/ws/x9/gl/run/root", &r),
             "--root=@BASE@/out/gl/run/root"
         );
         assert_eq!(
@@ -1849,33 +1849,33 @@ mod tests {
         assert_eq!(relocate("/w/src/aosp/k.kcm", &r), "@BASE@/src/aosp/k.kcm");
         // `--file host=at`: the host side moves, the Android path stays
         assert_eq!(
-            relocate("--file=/w/out/slot-9/a.so=/system/lib64/a.so", &r),
+            relocate("--file=/w/out/pool/ws/x9/a.so=/system/lib64/a.so", &r),
             "--file=@BASE@/out/a.so=/system/lib64/a.so"
         );
         // a library path joins roots with `:`
         assert_eq!(
-            relocate("/w/out/slot-9/a:/w/out/slot-9/b", &r),
+            relocate("/w/out/pool/ws/x9/a:/w/out/pool/ws/x9/b", &r),
             "@BASE@/out/a:@BASE@/out/b"
         );
         // a JSON string value
         assert_eq!(
-            relocate(r#"{"apk": "/w/out/slot-9/x.apk"}"#, &r),
+            relocate(r#"{"apk": "/w/out/pool/ws/x9/x.apk"}"#, &r),
             r#"{"apk": "@BASE@/out/x.apk"}"#
         );
         // element text: `>` and `<` bound a path too (fontconfig's `<dir>`)
         assert_eq!(
-            relocate("<dir>/w/out/slot-9/fonts/files</dir>", &r),
+            relocate("<dir>/w/out/pool/ws/x9/fonts/files</dir>", &r),
             "<dir>@BASE@/out/fonts/files</dir>"
         );
         // a root followed by a name character is another path
-        assert_eq!(relocate("/w/out/slot-9.bak", &r), "/w/out/slot-9.bak");
+        assert_eq!(relocate("/w/out/pool/ws/x9.bak", &r), "/w/out/pool/ws/x9.bak");
         // the bundle's `lib/` stands for the host's LLVM runtimes
         assert_eq!(
-            relocate("--lib-path=/w/out/slot-9/a:/usr/lib/llvm-19/lib", &r),
+            relocate("--lib-path=/w/out/pool/ws/x9/a:/usr/lib/llvm-19/lib", &r),
             "--lib-path=@BASE@/out/a:@BASE@/lib"
         );
         // a directory that only starts with the root's name is not under it
-        assert_eq!(relocate("/w/out/slot-90/x", &r), "/w/out/slot-90/x");
+        assert_eq!(relocate("/w/out/pool/ws/x90/x", &r), "/w/out/pool/ws/x90/x");
     }
 
     #[test]
@@ -1884,10 +1884,10 @@ mod tests {
     }
 
     #[test]
-    fn remote_runs_keep_their_files_under_the_slot() {
-        let out = Path::new("/w/out/slot-9");
+    fn remote_runs_keep_their_files_under_the_build_dir() {
+        let out = Path::new("/w/out/pool/ws/x9");
         assert_eq!(
-            rel_out(out, Path::new("/w/out/slot-9/gl/run/root")).unwrap(),
+            rel_out(out, Path::new("/w/out/pool/ws/x9/gl/run/root")).unwrap(),
             "gl/run/root"
         );
         assert!(rel_out(out, Path::new("/w/elsewhere/x")).is_err());
@@ -1916,7 +1916,7 @@ mod tests {
         };
         let want = concat!(
             "# xtask remote run gl/run: written by remote.rs, do not edit\n",
-            "cd 'atl-next-run/slot-9' || exit 2\n",
+            "cd 'atl-next-run/x9' || exit 2\n",
             "set -u\n",
             "BASE=$(pwd)\n",
             "rm -rf \"$BASE/out/gl/run/root\"\n",
@@ -1935,7 +1935,7 @@ mod tests {
             "echo \"atld rc=$rc, remote run gl/run\" >&2\n",
             "tar -c -C \"$BASE/out\" --ignore-failed-read 'gl/run/root/log' 'gl/run/scratch/atld.log' 'gl/run/scratch/atld.rc' 'gl/run/scratch/end.ms'\n",
         );
-        assert_eq!(plan.script("atl-next-run/slot-9"), want);
+        assert_eq!(plan.script("atl-next-run/x9"), want);
     }
 
     /// A session run: after the launcher check, the one `wayland-*` socket of the desktop session is found, and atld's environment names it. The count check is what refuses a second compositor's socket.
@@ -1953,7 +1953,7 @@ mod tests {
             limit: 300,
             display: Display::Session,
         };
-        let s = plan.script("atl-next-run/slot-3");
+        let s = plan.script("atl-next-run/x3");
         let launcher = s.find("is not an executable").expect("launcher check");
         let discover = s.find("WL_DIR=\"/run/user/$(id -u)\"").expect("discovery");
         let env_line = s.find("env -i PATH=").expect("env line");
@@ -1988,7 +1988,7 @@ mod tests {
             limit: 60,
             display: Display::NestedX11,
         };
-        let s = plan.script("atl-next-run/slot-4-riscv64");
+        let s = plan.script("atl-next-run/x4-riscv64");
         let at = |needle: &str| {
             s.find(needle)
                 .unwrap_or_else(|| panic!("{needle:?} in\n{s}"))
@@ -2058,11 +2058,11 @@ mod tests {
         assert!(!s.contains("WAYLAND_DISPLAY"), "{s}");
     }
 
-    /// A record of one slot file, one slot tree holding a link to itself (`com.android.art -> .`, the ART staging's alias) and one AOSP file: the names, `lib/` from the LLVM runtimes, the link kept as a link in the stage, and the break removing exactly `lib/libunwind.so.1`.
+    /// A record of one out dir file, one out dir tree holding a link to itself (`com.android.art -> .`, the ART staging's alias) and one AOSP file: the names, `lib/` from the LLVM runtimes, the link kept as a link in the stage, and the break removing exactly `lib/libunwind.so.1`.
     #[test]
     fn bundle_lists_record_entries_then_lib_and_the_break_drops_libunwind() {
         let dir = temp("bundle");
-        let out = dir.join("slot");
+        let out = dir.join("build");
         let tree = dir.join("tree");
         let art = out.join("gl-art");
         std::fs::create_dir_all(art.join("lib64")).unwrap();
@@ -2070,11 +2070,11 @@ mod tests {
         std::os::unix::fs::symlink(".", art.join("com.android.art")).unwrap();
         std::fs::create_dir_all(out.join("device")).unwrap();
         std::fs::write(out.join("device/a.so"), b"x").unwrap();
-        // a file link to a slot file: bundled as that file's content, its absolute target not kept
+        // a file link to an out dir file: bundled as that file's content, its absolute target not kept
         std::os::unix::fs::symlink(out.join("device/a.so"), art.join("lib64/b.so")).unwrap();
         std::fs::create_dir_all(&tree).unwrap();
         std::fs::write(tree.join("x.kcm"), b"x").unwrap();
-        // a record file that is a symlink (slot-4's libglapi.so.0 is one): bundled from the real file
+        // a record file that is a symlink (an out dir's libglapi.so.0 is one): bundled from the real file
         std::os::unix::fs::symlink("a.so", out.join("device/link.so")).unwrap();
         let inputs = Inputs {
             files: vec![

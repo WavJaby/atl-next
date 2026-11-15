@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
-//! `xtask check` step gl-proxies: the guest proxies (NBS `libnative_bridge_guest_*`, built by `xtask native --native-bridge`: the GL fronts and the NDK libraries of C3) against what an NDK app may call and what the host libraries serve. Static tier, on the slot's built files:
+//! `xtask check` step gl-proxies: the guest proxies (NBS `libnative_bridge_guest_*`, built by `xtask native --native-bridge`: the GL fronts and the NDK libraries of C3) against what an NDK app may call and what the host libraries serve. Static tier, on the build dir's built files:
 //! 1. every NDK name of an AOSP `<lib>.map.txt` (any `introduced` level; `# llndk` names are vendor-only, not NDK) is a defined dynamic symbol of the guest proxy, or an [`ABSENT`] entry;
 //! 2. every stub of the binding table (atl-native-bridge engine `bindings::rows`) of a checked library is a defined dynamic symbol of its host library, unless the table traps it as unbound (no prototype in the EGL/GLES headers, or C++ internals);
 //! 3. every [`ABSENT`] entry still holds: its map line names it, and neither the front nor the guest proxy exports it -- else the entry is stale (red).
 //!
-//! Skipped, naming why, when the slot has no guest proxies or fronts (`xtask native` without the nb guest set).
+//! Skipped, naming why, when the build dir has no guest proxies or fronts (`xtask native` without the nb guest set).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -98,7 +98,7 @@ fn map_dir(lib: &str) -> &'static str {
     }
 }
 
-/// Runs the step on slot `out` for guest arch `arch` (the identity engine: the host's); `Some(why)` when the slot lacks the inputs.
+/// Runs the step on build dir `out` for guest arch `arch` (the identity engine: the host's); `Some(why)` when the build dir lacks the inputs.
 pub fn check(root: &Path, out: &Path, arch: &str) -> Result<Option<String>> {
     let libs = checked_libs();
     let missing: Vec<String> = libs

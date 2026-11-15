@@ -22,7 +22,7 @@ pub struct Args {
     /// The host arch (an arches.toml row with `[host]`): the default --out.
     #[arg(long)]
     host: String,
-    /// Native build directory holding adbd, sh, toolbox and the host adb (default: this checkout's slot, see `xtask slot`).
+    /// Native build directory holding adbd, sh, toolbox and the host adb (default: this checkout's build dir, see `cargo xtask out show`).
     #[arg(long)]
     out: Option<PathBuf>,
     /// Break: adbd gets no adb_keys; passes only if the client sees `unauthorized` and no shell output.
@@ -34,7 +34,7 @@ pub struct Args {
     /// Also authorize this public key (a manual client's `adbkey.pub`) in adb_keys.
     #[arg(long, value_name = "PUB")]
     key: Option<PathBuf>,
-    /// Run this adb instead of the slot's AOSP host adb (e.g. an SDK's, for a side-by-side with a phone); it keeps its own key home, so --key must name its adbkey.pub.
+    /// Run this adb instead of the build dir's AOSP host adb (e.g. an SDK's, for a side-by-side with a phone); it keeps its own key home, so --key must name its adbkey.pub.
     #[arg(long, value_name = "ADB", requires = "key")]
     client: Option<PathBuf>,
 }

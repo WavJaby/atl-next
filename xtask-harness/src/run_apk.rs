@@ -41,10 +41,10 @@ pub struct Args {
     /// The host arch (an arches.toml row with `[host]`): the default --out.
     #[arg(long)]
     host: String,
-    /// Native build directory (default: this checkout's slot, see `xtask slot`; else <workspace>/out/native/<host>).
+    /// Native build directory (default: this checkout's build dir, see `cargo xtask out show`; else <workspace>/out/native/<host>).
     #[arg(long)]
     out: Option<PathBuf>,
-    /// Java pipeline build directory: boot jars, aapt2, d8 (default: this checkout's slot, see `xtask slot`; else <workspace>/out/java/build).
+    /// Java pipeline build directory: boot jars, aapt2, d8 (default: this checkout's build dir, see `cargo xtask out show`; else <workspace>/out/java/build).
     #[arg(long)]
     java_out: Option<PathBuf>,
     /// Keeps the app up this many seconds after its resume, the window open for drags: no probe, no injected input. Without it the run ends once a frame is presented and the watch is over.
@@ -114,7 +114,7 @@ pub struct RemoteArgs {
     /// A variable in atld's environment on the target, `KEY=VALUE`, repeatable: what the desktop sets for a launch, e.g. NVIDIA's offload `__NV_PRIME_RENDER_OFFLOAD=1` (the run is otherwise `env -i`).
     #[arg(long = "env", value_name = "KEY=VALUE", value_parser = parse_env)]
     env: Vec<(String, String)>,
-    /// The native out dir holding the record, the bundle and the run (default: this checkout's slot, see `xtask slot`).
+    /// The native out dir holding the record, the bundle and the run (default: this checkout's build dir, see `cargo xtask out show`).
     #[arg(long)]
     out: Option<PathBuf>,
     /// Pushes the bundle, runs the check there, then the app. Without it: prints the plan.

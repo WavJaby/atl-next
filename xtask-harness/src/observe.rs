@@ -578,7 +578,7 @@ clients-end
 
     fn plan(shots_ms: Vec<u64>) -> Plan {
         Plan {
-            base: "atl-next-run/slot-3".to_owned(),
+            base: "atl-next-run/x3".to_owned(),
             root: "run-apk/root".to_owned(),
             app_log: "run-apk/root/log/com.noodlecake.happyjump.log".to_owned(),
             shots_ms,

@@ -30,10 +30,10 @@ pub struct Args {
     /// The host arch (an arches.toml row with `[host]`): the default --out.
     #[arg(long)]
     host: String,
-    /// Native build directory holding ART, servicemanager and the services (default: this checkout's slot, see `xtask slot`; else <workspace>/out/native/<host>).
+    /// Native build directory holding ART, servicemanager and the services (default: this checkout's build dir, see `cargo xtask out show`; else <workspace>/out/native/<host>).
     #[arg(long)]
     out: Option<PathBuf>,
-    /// Java pipeline build directory: boot jars, aapt2, d8, `am` and the android.test.* libraries (default: this checkout's slot, see `xtask slot`; else <workspace>/out/java/build); build them with
+    /// Java pipeline build directory: boot jars, aapt2, d8, `am` and the android.test.* libraries (default: this checkout's build dir, see `cargo xtask out show`; else <workspace>/out/java/build); build them with
     /// `xtask native --for instrument`.
     #[arg(long)]
     java_out: Option<PathBuf>,

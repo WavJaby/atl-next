@@ -354,7 +354,7 @@ fn resolve_class(package: &str, name: &str) -> String {
 
 /// The `<meta-data>` children of `element` (ParsingPackageUtils.parseMetaData): `android:resource` -> its id; else `android:value` typed by how aapt2 printed it (ResourceValues.cpp BinaryPrimitive::PrettyPrint):
 /// quoted = string, `true`/`false` = boolean, a decimal / `0x%08x` / `#%08x` (color) = int, another number = float. A reference or other type AOSP drops (Slog.w, no Property); so does this.
-/// Known loss (measured, aapt2 of slot 3): a float with no fraction prints as an int (`2.0` -> `2`), so it reads as Int here where AOSP puts a Float; the installer process (ParsingPackageUtils on the binary manifest) has the type.
+/// Known loss (measured, aapt2): a float with no fraction prints as an int (`2.0` -> `2`), so it reads as Int here where AOSP puts a Float; the installer process (ParsingPackageUtils on the binary manifest) has the type.
 fn meta_data(element: &Element) -> Result<Vec<(String, MetaValue)>> {
     let mut out = Vec::new();
     for m in element.children("meta-data") {
@@ -763,7 +763,7 @@ mod tests {
         A: http://schemas.android.com/apk/res/android:functionalTest(0x01010023)=true
 "#;
 
-    /// `<application>`'s meta-data as aapt2 (slot 3) printed a manifest declaring value="12", "0x1F", "true", "1.5", "#ff112233", "text" and resource="@android:style/Theme" (2026-11-06).
+    /// `<application>`'s meta-data as aapt2 printed a manifest declaring value="12", "0x1F", "true", "1.5", "#ff112233", "text" and resource="@android:style/Theme" (2026-11-06).
     const META: &str = r#"N: android=http://schemas.android.com/apk/res/android (line=1)
   E: manifest (line=1)
     A: package="com.example.meta" (Raw: "com.example.meta")

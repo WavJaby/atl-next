@@ -54,10 +54,10 @@ pub struct Args {
     /// Default: the converter's ART in --out (`xtask native` goals dalvikvm, libart, ...), staged into <out>/native-load-art as an install would lay it out (see `stage_art`).
     #[arg(long)]
     art: Option<PathBuf>,
-    /// Java pipeline build directory: the ART host boot jars, framework-minus-apex and its d8 (default: this checkout's slot, see `xtask slot`; else <workspace>/out/java/build).
+    /// Java pipeline build directory: the ART host boot jars, framework-minus-apex and its d8 (default: this checkout's build dir, see `cargo xtask out show`; else <workspace>/out/java/build).
     #[arg(long)]
     java_out: Option<PathBuf>,
-    /// Native build directory holding libandroid_runtime (default: this checkout's slot, see `xtask slot`; else <workspace>/out/native/<host>); the fixture is built into its native-load/.
+    /// Native build directory holding libandroid_runtime (default: this checkout's build dir, see `cargo xtask out show`; else <workspace>/out/native/<host>); the fixture is built into its native-load/.
     #[arg(long)]
     out: Option<PathBuf>,
     /// Stage 4 fails, instead of warning, when a library is mapped more than once (for an ART built by the converter).
@@ -556,7 +556,7 @@ impl Env {
         let lib_path = format!("{}:{}", self.host.lib_path.display(), mapper_dir.display());
         cmd.env("LD_LIBRARY_PATH", lib_path);
         let what = format!("{cmd:?}");
-        // the sandbox shows only what is mounted: the slot read-only at its own path (boot jars, fixture dex + shim, property area, extracted clips, launcher), the staged ART root with what its links name (ICU / tzdata files link out of the slot), ANDROID_DATA writable inside the slot
+        // the sandbox shows only what is mounted: the build dir read-only at its own path (boot jars, fixture dex + shim, property area, extracted clips, launcher), the staged ART root with what its links name (ICU / tzdata files link out of the build dir), ANDROID_DATA writable inside the build dir
         let mut mounts = crate::binder::layout_mounts(&test_root)?;
         mounts.push(atl_broker::Mount {
             host: self.out.clone(),

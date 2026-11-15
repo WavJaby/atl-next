@@ -73,10 +73,10 @@ pub struct Args {
     /// A deliberate break: the gate must then fail.
     #[arg(long = "break", value_enum)]
     break_: Option<Break>,
-    /// Native build directory (default: this checkout's slot).
+    /// Native build directory (default: this checkout's build dir).
     #[arg(long)]
     out: Option<PathBuf>,
-    /// Java pipeline build directory (default: this checkout's slot).
+    /// Java pipeline build directory (default: this checkout's build dir).
     #[arg(long)]
     java_out: Option<PathBuf>,
     /// Print the whole app log.

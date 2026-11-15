@@ -184,7 +184,7 @@ impl NestedCompositor {
         let config = work.join("labwc");
         std::fs::create_dir_all(&config)?;
         std::fs::write(config.join("rc.xml"), rc_xml)?;
-        // a private runtime dir, emptied first: a killed run's socket left there would move wlroots to the next name (sun_path holds 108 bytes; the slot work dirs stay well under)
+        // a private runtime dir, emptied first: a killed run's socket left there would move wlroots to the next name (sun_path holds 108 bytes; the build dir work dirs stay well under)
         let runtime = work.join("rt");
         if runtime.exists() {
             std::fs::remove_dir_all(&runtime)?;

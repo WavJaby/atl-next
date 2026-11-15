@@ -25,7 +25,7 @@ pub struct Args {
     /// The host arch (an arches.toml row with `[host]`).
     #[arg(long)]
     host: String,
-    /// Native build directory (default: this checkout's slot; else <workspace>/out/native/<host>).
+    /// Native build directory (default: this checkout's build dir; else <workspace>/out/native/<host>).
     #[arg(long)]
     out: Option<PathBuf>,
     /// Key set the build was signed with (default: the workspace's dev set, as `native` defaults).

@@ -25,7 +25,7 @@ pub(crate) const ARCH: &str = "x86_64";
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// Native out dir holding `nb/x86_64` and `app/` (default: this checkout's slot, see `xtask slot`; else <workspace>/out/native/x86_64).
+    /// Native out dir holding `nb/x86_64` and `app/` (default: this checkout's build dir, see `cargo xtask out show`; else <workspace>/out/native/x86_64).
     #[arg(long)]
     pub out: Option<PathBuf>,
 }

@@ -19,7 +19,7 @@ const HOOKS_H: &str = "frameworks/native/opengl/libs/hooks.h";
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// The native build dir (default: this checkout's slot).
+    /// The native build dir (default: this checkout's build dir).
     #[arg(long)]
     out: Option<PathBuf>,
 }
