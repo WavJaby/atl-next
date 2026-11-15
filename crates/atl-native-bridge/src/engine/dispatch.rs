@@ -310,7 +310,7 @@ fn refuse(r: Refused) -> ! {
     ))
 }
 
-/// Host->guest entry (Q6-4, x86.rs `down_entries_asm`): the shell of down slot `slot` calls it with its frame's lanes.
+/// Host->guest entry (Q6-4, bridgegen down.rs): the shell of down slot `slot` calls it with its frame's lanes.
 ///
 /// # Safety
 /// `host` is the shell's frame, an `AtlLanes` live for the call and not otherwise accessed until it returns.
@@ -325,7 +325,7 @@ fn down_body(slot: usize, host: &mut AtlLanes) {
     let Some(d) = super::qemu::down_slot(slot) else {
         unsupported("qemu crossing: down shell without a binding")
     };
-    let Some(mut guest) = place(&d.params, host) else {
+    let Some(mut guest) = place(&d.params, host, HOST) else {
         refuse_down(d.target)
     };
     // the first argument of a JNI method, of JNI_OnLoad or of an SL callback is a host env, vm or interface: the guest's own object stands for it (jni.rs, sles.rs), and it is the first integer, in x0; an slObjectCallback's 6th is the 6th integer, in x5
@@ -339,8 +339,59 @@ fn down_body(slot: usize, host: &mut AtlLanes) {
     #[cfg(atl_nb_down_noenv)]
     let _ = d.kind;
     super::qemu::call_down(d.target, &mut guest);
-    host.x[0] = guest.x[0];
-    host.v[0] = guest.v[0];
+    (host.x[0], host.v[0]) = host_result(d.ret, guest.x[0], guest.v[0], HOST);
+}
+
+/// How the host calling convention fills and reads a down call's lanes (bridgegen down.rs `HostAbi`, generated per host ISA).
+#[derive(Clone, Copy, Debug)]
+pub(in crate::engine) struct HostRules {
+    /// integer argument registers in the lanes' x bank
+    int_lanes: usize,
+    /// an fp argument past the fp registers takes a free integer register before the stack
+    fp_to_int: bool,
+    /// a narrow integer result is widened to 64 bits by its type
+    extend_int_ret: bool,
+    /// a float result is NaN-boxed
+    nan_box_f32: bool,
+}
+
+/// The build's host rules.
+const HOST: HostRules = {
+    use super::qemu::down_pool as p;
+    HostRules {
+        int_lanes: p::HOST_INT_LANES,
+        fp_to_int: p::HOST_FP_TO_INT,
+        extend_int_ret: p::HOST_EXTEND_INT_RET,
+        nan_box_f32: p::HOST_NAN_BOX_F32,
+    }
+};
+const _: () = assert!(HOST.int_lanes <= 8, "the lanes' x bank holds eight words");
+
+/// The result shorty type of a down call: the shorty's first byte; JNI_OnLoad / JNI_OnUnload (no shorty) answer a `jint` / nothing, so `I`.
+pub(in crate::engine) fn down_ret(shorty: Option<&[u8]>) -> u8 {
+    shorty.and_then(|s| s.first().copied()).unwrap_or(b'I')
+}
+
+/// The host's answer words (x0 lane, v0 lane) for a guest result of shorty type `ret`: AAPCS64 leaves the bits above a narrow result unspecified (w0, s0 with zero upper bits), so a host that needs them shaped gets them so -- integers widened by their type (`Z`/`C` zero-, `B`/`S`/`I` sign-extended), a float NaN-boxed.
+fn host_result(ret: u8, x: u64, v: u64, rules: HostRules) -> (u64, u64) {
+    let x = if rules.extend_int_ret {
+        match ret {
+            b'Z' => u64::from(x as u8),
+            b'C' => u64::from(x as u16),
+            b'B' => x as i8 as i64 as u64,
+            b'S' => x as i16 as i64 as u64,
+            b'I' => x as i32 as i64 as u64,
+            _ => x,
+        }
+    } else {
+        x
+    };
+    let v = if rules.nan_box_f32 && ret == b'F' {
+        v | 0xFFFF_FFFF_0000_0000
+    } else {
+        v
+    };
+    (x, v)
 }
 
 /// The lane classes of a down call's arguments (Q6-4). A JNI method's env and class (or `this`) come first, a `@CriticalNative` method's none; JNI_OnLoad and JNI_OnUnload, which ART calls with no shorty, take `(JavaVM*, void*)`. The shorty is `ArtMethod::GetShorty`: its first byte is the result, each further byte one parameter.
@@ -389,20 +440,24 @@ pub(in crate::engine) fn down_params(
     Ok(params)
 }
 
-/// The guest call's lanes for a host call whose arguments have the classes `params` (Q6-4). Both ABIs take an integer from the integer registers (six on SysV, eight on AAPCS64) and a float or double from the fp registers (eight each), in declaration order; the rest go to the stack, one word each, in declaration order. Each side reads its words from its own image: `host` is the SysV image (x[0..6], v[0..8], the eight stack words), the result the AAPCS64 one. `None` when the host call needs more than eight stack words (R-1). The guest side never overflows the image: AAPCS64 has at least as many registers per class, so its stack words are a subset of the host's.
-fn place(params: &[Class], host: &AtlLanes) -> Option<AtlLanes> {
+/// The guest call's lanes for a host call whose arguments have the classes `params` (Q6-4). Every ABI here takes an integer from the integer registers (`rules.int_lanes` on the host: SysV 6, LP64D 8; AAPCS64 8) and a float or double from the fp registers (eight each), in declaration order; an fp argument past them takes a free integer register first where `rules.fp_to_int` (RISC-V), else the stack; the rest go to the stack, one word each, in declaration order. Each side reads its words from its own image: `host` is the host's (x[0..int_lanes], v[0..8], the eight stack words), the result the AAPCS64 one. `None` when either side needs more than eight stack words (R-1): with fp-to-int on the host, AAPCS64 can need more stack words than the host.
+fn place(params: &[Class], host: &AtlLanes, rules: HostRules) -> Option<AtlLanes> {
     let mut guest = AtlLanes::default();
     let (mut host_x, mut host_v, mut host_stack) = (0, 0, 0);
     let (mut guest_x, mut guest_v, mut guest_stack) = (0, 0, 0);
     for &class in params {
         let word = match class {
-            Class::Int if host_x < 6 => {
-                host_x += 1;
-                host.x[host_x - 1]
-            }
             Class::Fp if host_v < 8 => {
                 host_v += 1;
                 host.v[host_v - 1]
+            }
+            Class::Int if host_x < rules.int_lanes => {
+                host_x += 1;
+                host.x[host_x - 1]
+            }
+            Class::Fp if rules.fp_to_int && host_x < rules.int_lanes => {
+                host_x += 1;
+                host.x[host_x - 1]
             }
             _ => {
                 let word = *host.stack.get(host_stack)?;
@@ -420,7 +475,7 @@ fn place(params: &[Class], host: &AtlLanes) -> Option<AtlLanes> {
                 guest_v += 1;
             }
             _ => {
-                guest.stack[guest_stack] = word;
+                *guest.stack.get_mut(guest_stack)? = word;
                 guest_stack += 1;
             }
         }
@@ -441,6 +496,95 @@ fn refuse_down(target: usize) -> ! {
 mod down_tests {
     use super::*;
 
+    /// x86_64 SysV (bridgegen x86.rs `DOWN`): six integer registers, fp overflow to the stack, results unshaped.
+    const SYSV: HostRules = HostRules {
+        int_lanes: 6,
+        fp_to_int: false,
+        extend_int_ret: false,
+        nan_box_f32: false,
+    };
+    /// riscv64 LP64D (bridgegen riscv64.rs `DOWN`): eight integer registers, fp overflow to a free integer register, results shaped.
+    const LP64D: HostRules = HostRules {
+        int_lanes: 8,
+        fp_to_int: true,
+        extend_int_ret: true,
+        nan_box_f32: true,
+    };
+
+    /// LP64D, ten doubles then one int: fa0..fa7 take eight, the ninth and tenth take a0 and a1 (psABI: integer convention once the fp registers are used up), the int takes a2. AAPCS64: v0..v7, then the ninth and tenth are its first two stack words, the int is x0.
+    #[test]
+    fn lp64d_fp_overflow_takes_integer_registers() {
+        let host = AtlLanes {
+            x: [9, 10, 77, 0, 0, 0, 0, 0],
+            v: [1, 2, 3, 4, 5, 6, 7, 8],
+            stack: [0; 8],
+        };
+        let mut params = vec![Class::Fp; 10];
+        params.push(Class::Int);
+        let guest = place(&params, &host, LP64D).expect("no host stack word");
+        assert_eq!(guest.v, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!((guest.stack[0], guest.stack[1], guest.x[0]), (9, 10, 77));
+    }
+
+    /// LP64D, nine integers: a0..a7 take eight, the ninth is the host's first stack word; AAPCS64 alike (x0..x7, stack 0).
+    #[test]
+    fn lp64d_nine_integers() {
+        let host = AtlLanes {
+            x: [1, 2, 3, 4, 5, 6, 7, 8],
+            stack: [9, 0, 0, 0, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        let guest = place(&[Class::Int; 9], &host, LP64D).expect("one stack word");
+        assert_eq!((guest.x, guest.stack[0]), ([1, 2, 3, 4, 5, 6, 7, 8], 9));
+    }
+
+    /// LP64D, seventeen doubles: the host holds them all in registers (8 fp + 8 int) plus one stack word; AAPCS64 needs nine stack words (8 in v) -> refused, never an out-of-bounds write.
+    #[test]
+    fn lp64d_guest_stack_overflow_is_refused() {
+        assert!(place(&[Class::Fp; 16], &AtlLanes::default(), LP64D).is_some());
+        assert!(place(&[Class::Fp; 17], &AtlLanes::default(), LP64D).is_none());
+    }
+
+    /// LP64D results (psABI: widen by type to 32 bits, then sign-extend to 64; float NaN-boxed); SysV results pass unchanged.
+    #[test]
+    fn host_result_shapes_narrow_answers() {
+        let junk = 0xDEAD_BEEF_0000_0000;
+        assert_eq!(host_result(b'Z', junk | 0x01, 0, LP64D).0, 1);
+        assert_eq!(host_result(b'C', junk | 0xFFFF, 0, LP64D).0, 0xFFFF);
+        assert_eq!(
+            host_result(b'B', junk | 0x80, 0, LP64D).0,
+            0xFFFF_FFFF_FFFF_FF80
+        );
+        assert_eq!(
+            host_result(b'S', junk | 0x8000, 0, LP64D).0,
+            0xFFFF_FFFF_FFFF_8000
+        );
+        assert_eq!(
+            host_result(b'I', junk | 0x8000_0000, 0, LP64D).0,
+            0xFFFF_FFFF_8000_0000
+        );
+        assert_eq!(host_result(b'J', junk | 1, 0, LP64D).0, junk | 1);
+        // 1.0f = 0x3F80_0000
+        assert_eq!(
+            host_result(b'F', 0, 0x3F80_0000, LP64D).1,
+            0xFFFF_FFFF_3F80_0000
+        );
+        assert_eq!(
+            host_result(b'D', 0, 0x3FF0_0000_0000_0000, LP64D).1,
+            0x3FF0_0000_0000_0000
+        );
+        assert_eq!(
+            host_result(b'I', junk | 7, 0x3F80_0000, SYSV),
+            (junk | 7, 0x3F80_0000)
+        );
+    }
+
+    #[test]
+    fn down_ret_reads_the_shorty() {
+        assert_eq!(down_ret(Some(&b"FI"[..])), b'F');
+        assert_eq!(down_ret(None), b'I');
+    }
+
     /// Nine integers: SysV takes six in %rdi..%r9 and three from the stack; AAPCS64 takes eight in x0..x7 and one from its stack. Expected values follow from those two rules.
     #[test]
     fn nine_integers_split_across_both_banks() {
@@ -449,7 +593,7 @@ mod down_tests {
             stack: [100, 101, 102, 0, 0, 0, 0, 0],
             ..Default::default()
         };
-        let guest = place(&[Class::Int; 9], &host).expect("three stack words fit");
+        let guest = place(&[Class::Int; 9], &host, SYSV).expect("three stack words fit");
         assert_eq!(guest.x, [10, 11, 12, 13, 14, 15, 100, 101]);
         assert_eq!(guest.stack[0], 102);
     }
@@ -464,7 +608,7 @@ mod down_tests {
         };
         let mut params = vec![Class::Fp; 9];
         params.push(Class::Int);
-        let guest = place(&params, &host).expect("one stack word");
+        let guest = place(&params, &host, SYSV).expect("one stack word");
         assert_eq!(
             (guest.v, guest.stack[0], guest.x[0]),
             ([1, 2, 3, 4, 5, 6, 7, 8], 9, 77)
@@ -481,7 +625,7 @@ mod down_tests {
         };
         let mut params = vec![Class::Int; 7];
         params.push(Class::Fp);
-        let guest = place(&params, &host).expect("one stack word");
+        let guest = place(&params, &host, SYSV).expect("one stack word");
         assert_eq!(guest.x, [1, 2, 3, 4, 5, 6, 7, 0]);
         assert_eq!((guest.v[0], guest.stack), (8, [0; 8]));
     }
@@ -489,8 +633,8 @@ mod down_tests {
     /// Fourteen integers need eight stack words on SysV (six registers): the image holds them. Fifteen need nine: refused (R-1).
     #[test]
     fn nine_host_stack_words_are_refused() {
-        assert!(place(&[Class::Int; 14], &AtlLanes::default()).is_some());
-        assert!(place(&[Class::Int; 15], &AtlLanes::default()).is_none());
+        assert!(place(&[Class::Int; 14], &AtlLanes::default(), SYSV).is_some());
+        assert!(place(&[Class::Int; 15], &AtlLanes::default(), SYSV).is_none());
     }
 
     /// The shorty `DIDJ` (result double; int, double, long) under a JNI method: env and class first, then the three. JNI_OnLoad (no shorty) is `(JavaVM*, void*)`; a shorty without a method's env is refused.

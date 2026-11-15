@@ -5,6 +5,8 @@
 
 use std::fmt::Write;
 
+use crate::down::{DownBackend, HostAbi, LANES, STACK_AT, V_AT};
+
 /// Opcode of `call rel32`.
 pub const CALL_REL32: u8 = 0xE8;
 /// Bytes of a `call rel32`: a pool call returns to slot + this, which the shell subtracts out.
@@ -232,14 +234,23 @@ fn pool(s: &mut String, name: &str, target: &str, slots: usize, end: usize) {
 
 /// Bytes of one down shell (Q6-4): `movl $slot, %r11d` (6) and `jmp atl_nb_down_entry` (5), padded to 16, so slot k is at `atl_nb_down_pool + k * DOWN_SHELL`.
 pub const DOWN_SHELL: usize = 16;
-/// Bytes of a down call's lanes (`atl_lanes`, atl_engine.h): x[8] at 0, v[8] at [`DOWN_V_AT`], stack[8] at [`DOWN_STACK_AT`]. The entry's frame holds one.
-pub const DOWN_LANES: usize = 192;
-/// Offset of `v` in the down call's lanes.
-pub const DOWN_V_AT: usize = 64;
-/// Offset of `stack` in the down call's lanes.
-pub const DOWN_STACK_AT: usize = 128;
 
-/// Assembly for the down shells (QEMU host->guest, Q6-4), `.text`, for the engine's `global_asm!`: slot k is `movl $k, %r11d; jmp atl_nb_down_entry`. A host SysV call enters the shell; the entry builds the call's lanes on its own frame (x[0..6] = %rdi..%r9, v[0..8] = %xmm0..7, stack = the eight words above the return address), calls `atl_nb_down_dispatch(slot, lanes)` (engine/dispatch.rs), and returns %rax = lanes.x[0] and %xmm0 = lanes.v[0]. Both answers are always set; the caller reads the one its prototype names. The shells use only %r10, %r11 and the frame; %rbp is saved and restored. `drop_stack` and `swap_v` are the breaks `down_drop_stack` and `down_swap_v` (build.rs `BREAKS`): the stack words start one word late, and %xmm0 and %xmm1 are exchanged on entry. Both false in every shipped build.
+/// The x86_64 down-shell backend (down.rs [`crate::down::backend`]): SysV, six integer argument registers, an fp argument past %xmm7 goes to the stack, no result widening (callers read only the bits their type names).
+pub const DOWN: DownBackend = DownBackend {
+    shell: DOWN_SHELL,
+    // `movl $k, %r11d`: a 32-bit immediate
+    max_slots: 1 << 32,
+    att_syntax: true,
+    abi: HostAbi {
+        int_lanes: 6,
+        fp_to_int: false,
+        extend_int_ret: false,
+        nan_box_f32: false,
+    },
+    entries_asm: down_entries_asm,
+};
+
+/// Assembly for the down shells (QEMU host->guest, Q6-4), `.text`, AT&T syntax (backend `att_syntax`), for the engine's `global_asm!`: slot k is `movl $k, %r11d; jmp atl_nb_down_entry`. A host SysV call enters the shell; the entry builds the call's lanes on its own frame (x[0..6] = %rdi..%r9, v[0..8] = %xmm0..7, stack = the eight words above the return address), calls `atl_nb_down_dispatch(slot, lanes)` (engine/dispatch.rs), and returns %rax = lanes.x[0] and %xmm0 = lanes.v[0]. Both answers are always set; the caller reads the one its prototype names. The shells use only %r10, %r11 and the frame; %rbp is saved and restored. `drop_stack` and `swap_v` are the breaks `down_drop_stack` and `down_swap_v` (build.rs `BREAKS`): the stack words start one word late, and %xmm0 and %xmm1 are exchanged on entry. Both false in every shipped build.
 pub fn down_entries_asm(slots: usize, drop_stack: bool, swap_v: bool) -> String {
     let mut s = String::from(
         ".text\n.p2align 4\n.hidden atl_nb_down_pool\n.globl atl_nb_down_pool\natl_nb_down_pool:\n",
@@ -253,7 +264,7 @@ pub fn down_entries_asm(slots: usize, drop_stack: bool, swap_v: bool) -> String 
     }
     write!(
         s,
-        "atl_nb_down_entry:\n    push %rbp\n    mov %rsp, %rbp\n    sub ${DOWN_LANES}, %rsp\n"
+        "atl_nb_down_entry:\n    push %rbp\n    mov %rsp, %rbp\n    sub ${LANES}, %rsp\n"
     )
     .expect("writing to a String");
     for (i, reg) in ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"]
@@ -267,8 +278,7 @@ pub fn down_entries_asm(slots: usize, drop_stack: bool, swap_v: bool) -> String 
     }
     for i in 0..8 {
         let src = if swap_v && i < 2 { 1 - i } else { i };
-        writeln!(s, "    movsd %xmm{src}, {}(%rsp)", DOWN_V_AT + 8 * i)
-            .expect("writing to a String");
+        writeln!(s, "    movsd %xmm{src}, {}(%rsp)", V_AT + 8 * i).expect("writing to a String");
     }
     // the caller's first stack argument: above the return address, which the push of %rbp moved one word down; `drop_stack` starts one word later
     let first = 16 + 8 * usize::from(drop_stack);
@@ -277,13 +287,13 @@ pub fn down_entries_asm(slots: usize, drop_stack: bool, swap_v: bool) -> String 
             s,
             "    mov {}(%rbp), %r10\n    mov %r10, {}(%rsp)",
             first + 8 * i,
-            DOWN_STACK_AT + 8 * i
+            STACK_AT + 8 * i
         )
         .expect("writing to a String");
     }
     write!(
         s,
-        "    mov %r11, %rdi\n    mov %rsp, %rsi\n    call atl_nb_down_dispatch\n    mov 0(%rsp), %rax\n    movsd {DOWN_V_AT}(%rsp), %xmm0\n    leave\n    ret\n"
+        "    mov %r11, %rdi\n    mov %rsp, %rsi\n    call atl_nb_down_dispatch\n    mov 0(%rsp), %rax\n    movsd {V_AT}(%rsp), %xmm0\n    leave\n    ret\n"
     )
     .expect("writing to a String");
     s

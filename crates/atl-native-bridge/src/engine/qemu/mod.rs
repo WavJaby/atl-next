@@ -28,7 +28,7 @@ pub use place::{
     OBJECT_STUBS, bind, bind_result, down, is_stub, object_stub, patch_entry, patch_hook,
     patch_site, register, register_data,
 };
-pub(super) use place::down_slot;
+pub(super) use place::{down_pool, down_slot};
 
 /// The guest ISA (atl-android-paths `native_bridge_bin` / `native_bridge_lib` directory): QEMU runs aarch64 guests.
 pub const GUEST_ISA: &str = "arm64";

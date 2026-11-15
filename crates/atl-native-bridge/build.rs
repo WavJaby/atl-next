@@ -1293,10 +1293,10 @@ const BREAKS: &[(&str, &str)] = &[
     ("x86_disp", X86_DISP_CFG),
     // Q5-8b (bridgegen x86.rs `entries_asm`, `counted`): the identity shells call no counter, so every identity crossing counts 0 (identity gate `identity_crossing`, check t)
     ("id_count", X86_COUNT_CFG),
-    // Q6-4 (bridgegen x86.rs `down_entries_asm`, `drop_stack`): a down call's stack words start one word late (qemu-jni gate, check m)
-    ("down_drop_stack", X86_DOWN_DROP_CFG),
-    // Q6-4 (x86.rs `down_entries_asm`, `swap_v`): a down call's %xmm0 and %xmm1 are exchanged on entry (qemu-jni gate, checks m and x: the one fp argument moves to %xmm1)
-    ("down_swap_v", X86_DOWN_SWAP_CFG),
+    // Q6-4 (bridgegen down.rs `entries_asm`, `drop_stack`): a down call's stack words start one word late (qemu-jni gate, check m)
+    ("down_drop_stack", DOWN_DROP_CFG),
+    // Q6-4 (down.rs `entries_asm`, `swap_v`): a down call's fp argument registers 0 and 1 are exchanged on entry (qemu-jni gate, checks m and x: the one fp argument moves to register 1)
+    ("down_swap_v", DOWN_SWAP_CFG),
     // Q6-4 (engine/dispatch.rs `down_params`): the first shorty parameter's class is flipped (qemu-jni gate, checks m, x and R: the 15-integer R-1 call then fits in eight stack words)
     ("shorty_swap", "atl_nb_shorty_swap"),
     // Q6-4 (engine/dispatch.rs `down_body`): a down call's first argument stays the host's, not the guest env or vm (qemu-jni gate, checks o, m and x)
@@ -1316,10 +1316,12 @@ const BREAKS: &[(&str, &str)] = &[
 const X86_DISP_CFG: &str = "atl_nb_x86_disp";
 /// The cfg of the `id_count` break: with it the identity shells are generated plain, feature or not.
 const X86_COUNT_CFG: &str = "atl_nb_id_count";
-/// The cfgs of the `down_drop_stack` and `down_swap_v` breaks, read here: they select the down shells' generator flags (x86.rs `down_entries_asm`), no crate code.
-const X86_DOWN_DROP_CFG: &str = "atl_nb_down_drop_stack";
-const X86_DOWN_SWAP_CFG: &str = "atl_nb_down_swap_v";
-/// Down shells of the QEMU engine (Q6-4, x86.rs `down_entries_asm`): one per host->guest trampoline a process binds (each native method, JNI_OnLoad, JNI_OnUnload). Fixed; a binding past it fails with an error (place.rs `down`).
+/// The cfgs of the `down_drop_stack` and `down_swap_v` breaks, read here: they select the down shells' generator flags (bridgegen down.rs `entries_asm`), no crate code.
+const DOWN_DROP_CFG: &str = "atl_nb_down_drop_stack";
+const DOWN_SWAP_CFG: &str = "atl_nb_down_swap_v";
+/// The cfg naming a host down-shell backend whose text is AT&T syntax (bridgegen down.rs `att_syntax`).
+const DOWN_ATT_CFG: &str = "atl_nb_down_att";
+/// Down shells of the QEMU engine (Q6-4, bridgegen down.rs): one per host->guest trampoline a process binds (each native method, JNI_OnLoad, JNI_OnUnload). Fixed; a binding past it fails with an error (place.rs `down`).
 const DOWN_SLOTS: usize = 1024;
 
 /// Host ISAs (arches.toml keys) with an identity crossing (engine/identity: host-arch guest bionic run natively, thread-pointer switch). riscv64 gets one at B2, after an arm64 app runs there (owner decision M63); every host has the QEMU engine.
@@ -1441,22 +1443,32 @@ fn main() -> Result<()> {
     // the counted shells: feature `crossing-count` (cargo's env for build scripts), unless the `id_count` break is selected
     let x86_counted = std::env::var_os("CARGO_FEATURE_CROSSING_COUNT").is_some()
         && !selected_breaks()?.contains(&X86_COUNT_CFG);
-    // Q6-4: the QEMU engine's down shells (x86.rs `down_entries_asm`) and their sizes for place.rs
+    // Q6-4: the QEMU engine's down shells for the host ISA (atl-bridgegen down.rs `backend`), their sizes and the host ABI rules for place.rs / dispatch.rs
     let breaks = selected_breaks()?;
+    let down = atl_bridgegen::down::backend(&host.arch)
+        .with_context(|| format!("host {}: no down-shell backend in atl-bridgegen", host.arch))?;
+    // the backend's asm syntax picks place.rs's `global_asm!` options
+    println!("cargo::rustc-check-cfg=cfg({DOWN_ATT_CFG})");
+    if down.att_syntax {
+        println!("cargo::rustc-cfg={DOWN_ATT_CFG}");
+    }
+    ensure!(
+        DOWN_SLOTS <= down.max_slots,
+        "DOWN_SLOTS {DOWN_SLOTS}: host {} shells name at most {}",
+        host.arch,
+        down.max_slots
+    );
     std::fs::write(
-        out.join("x86_down.s"),
-        atl_bridgegen::x86::down_entries_asm(
+        out.join("down.s"),
+        (down.entries_asm)(
             DOWN_SLOTS,
-            breaks.contains(&X86_DOWN_DROP_CFG),
-            breaks.contains(&X86_DOWN_SWAP_CFG),
+            breaks.contains(&DOWN_DROP_CFG),
+            breaks.contains(&DOWN_SWAP_CFG),
         ),
     )?;
     std::fs::write(
         out.join("down_pool.rs"),
-        format!(
-            "pub const DOWN_SLOTS: usize = {DOWN_SLOTS};\npub const DOWN_SHELL: usize = {};\n",
-            atl_bridgegen::x86::DOWN_SHELL
-        ),
+        atl_bridgegen::down::pool_rust(&down, DOWN_SLOTS),
     )?;
     let engines: &[(&str, bool)] = if identity {
         &[("identity", false), ("qemu", true)]
