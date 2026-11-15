@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! The seccomp target arch of the host this crate is built for and its per-arch rows: seccompiler's arch (its audit value) and binderd's measured allow-list.
 //! Numbers are the target's own (libc::SYS_*, per target arch), never another arch's; seccompiler 0.5 checks HOST's audit arch (AUDIT_ARCH_X86_64 / AUDIT_ARCH_RISCV64) first, so a filter built for one arch kills every call on another.
-//! riscv64 rows (asm-generic syscall table: no open, access, poll, readlink, unlink, chmod, rename, mkdir, arch_prctl): the x86_64 measurement with each x86-only call swapped for the *at / p* call glibc issues instead (sysdeps/unix/sysv/linux: access -> faccessat, rename -> renameat2, poll -> ppoll, ...). Not measured on riscv64 yet: kill mode on a riscv64 host (plan B3b) confirms or extends them; each swap is a cfg pair in the list.
+//! riscv64 rows (asm-generic syscall table: no open, access, poll, readlink, unlink, chmod, rename, mkdir, arch_prctl): the x86_64 measurement with each x86-only call swapped for the *at / p* call glibc issues instead (sysdeps/unix/sysv/linux: access -> faccessat, rename -> renameat2, poll -> ppoll, ...); each swap is a cfg pair in the list.
+//! riscv64 measured 2026-11-15 (sifive, Ubuntu glibc 2.39, kernel 6.12): a full app-gate run with the filters in log mode under the host's strace -f; every call of the installer and binderd trees is listed. Kill-mode runs added the two riscv64-only installer rows (statx, riscv_flush_icache).
 //!
 //! BINDERD_SYSCALLS derivation (x86_64, measured 2026-11-06, WSL2 kernel 6.6.87.2; strace is not installed, and RET_LOG lost records to kauditd's printk ratelimit: 1470 suppressed in one run):
 //! kill-mode iteration -- binderd's filter = allow the known set, default KILL_PROCESS; each run dies at the first call outside it and the kernel's one audit record (`type=1326 ... syscall=N`, in dmesg) names it; add, rerun, until the workload passes.
