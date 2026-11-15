@@ -252,7 +252,7 @@ fn runtime_half(root: &Path, a: &TestArgs, target: &Target, out: &Path) -> Resul
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let log = dir.join(format!("{}.log", a.gate));
     std::fs::write(&log, "").with_context(|| format!("writing {}", log.display()))?;
-    let site = target.run_site(gl_probe::LIMIT, log.clone(), false);
+    let site = target.run_site(gl_probe::LIMIT, log.clone(), Display::Headless);
     let code = gl_probe::run_on(root, arch, out, site)?;
     println!("remote test {}: transcript {}", a.gate, log.display());
     Ok(code == ExitCode::SUCCESS)
@@ -277,8 +277,67 @@ pub struct RemoteRun {
     limit: Duration,
     /// Each run's header, then the stderr of its transfer.
     log: PathBuf,
-    /// The target's desktop session supplies `WAYLAND_DISPLAY`: its one Wayland socket ([`session_script`]).
-    session: bool,
+    /// Where the run's `WAYLAND_DISPLAY` comes from, if anywhere.
+    display: Display,
+}
+
+/// Where a remote run's Wayland display comes from: the capability the target has, probed before the run ([`Target::probe_display`]), never named by host.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Display {
+    /// No compositor: atld runs headless.
+    Headless,
+    /// The desktop session's one Wayland socket ([`session_script`]).
+    Session,
+    /// An X11 session without a Wayland socket: the run starts labwc nested in it ([`nested_script`]) and ends it after atld.
+    NestedX11,
+}
+
+/// Defines `wl_scan` and runs it once: `WL` = the last `wayland-*` socket (not a lock file) in the session's `$XDG_RUNTIME_DIR` (`WL_DIR`, `/run/user/<uid>`), `WL_N` = how many there are.
+const WL_SCAN: &str = "WL_DIR=\"/run/user/$(id -u)\"\nwl_scan() {\n  WL=\"\"\n  WL_N=0\n  for s in \"$WL_DIR\"/wayland-*; do\n    case \"$s\" in *.lock) continue ;; esac\n    [ -S \"$s\" ] || continue\n    WL=${s##*/}\n    WL_N=$((WL_N + 1))\n  done\n}\nwl_scan\n";
+
+/// The target's X11 session, read only: `XD`/`XA` = `DISPLAY`/`XAUTHORITY` of the first own process naming a DISPLAY whose socket (`/tmp/.X11-unix/X<n>`) is live; empty when none.
+/// From a session process's environment because an ssh login has neither variable.
+const X_SESSION: &str = "XD=\"\"\nXA=\"\"\nfor e in /proc/[0-9]*/environ; do\n  [ -O \"$e\" ] && [ -r \"$e\" ] || continue\n  d=$(tr '\\0' '\\n' < \"$e\" 2>/dev/null | sed -n 's/^DISPLAY=//p' | head -n 1)\n  [ -n \"$d\" ] || continue\n  n=${d#*:}\n  n=${n%%.*}\n  [ -S \"/tmp/.X11-unix/X$n\" ] || continue\n  XD=$d\n  XA=$(tr '\\0' '\\n' < \"$e\" 2>/dev/null | sed -n 's/^XAUTHORITY=//p' | head -n 1)\n  break\ndone\n";
+
+/// How long the run waits for a nested labwc's Wayland socket, in 1 s polls. labwc 0.7.1 on sifive's X11 session made its socket within 4 s.
+const NESTED_WAIT_S: u32 = 10;
+
+/// The display probe ([`Target::probe_display`]): one line, `session`, `nested <DISPLAY>`, or `headless <why>`.
+fn probe_script() -> String {
+    format!(
+        "{WL_SCAN}[ \"$WL_N\" -eq 1 ] && {{ echo session; exit 0; }}\n[ \"$WL_N\" -eq 0 ] || {{ echo \"headless $WL_N Wayland sockets in $WL_DIR, want 0 or 1\"; exit 0; }}\ncommand -v labwc >/dev/null 2>&1 || {{ echo \"headless no Wayland socket and no labwc to nest\"; exit 0; }}\n{X_SESSION}[ -n \"$XD\" ] || {{ echo \"headless no Wayland socket and no X11 session to nest labwc in\"; exit 0; }}\necho \"nested $XD\"\n"
+    )
+}
+
+/// The Wayland display a UI run on target `host` (ssh alias or `local:<dir>`) can have, and why ([`probe_script`], read only): the session's one socket, else labwc nested in its X11 session, else none (headless; the reason says what is missing).
+pub fn probe_display(host: &str) -> Result<(Display, String)> {
+    parse_probe(&Host::parse(host)?.run_script(&probe_script())?)
+}
+
+/// Reads [`probe_script`]'s line.
+fn parse_probe(out: &str) -> Result<(Display, String)> {
+    let line = out.lines().next().unwrap_or_default().trim();
+    let (word, rest) = line.split_once(' ').unwrap_or((line, ""));
+    Ok(match word {
+        "session" => (
+            Display::Session,
+            "the desktop session's Wayland socket".to_owned(),
+        ),
+        "nested" => (
+            Display::NestedX11,
+            format!("labwc nested in X11 display {rest}"),
+        ),
+        "headless" => (Display::Headless, rest.to_owned()),
+        _ => bail!("display probe: unexpected answer {line:?}"),
+    })
+}
+
+/// Starts labwc nested in the target's X11 session (`WLR_BACKENDS=x11`, its own empty config dir `cfg`, output to `log`) and waits for its Wayland socket: sets `WL` and `LW` (labwc's pid).
+/// Exit 5 when a Wayland socket already exists (the session's must be used, not shadowed), no X11 session is found, or labwc makes no socket within [`NESTED_WAIT_S`].
+fn nested_script(tag: &str, cfg: &str, log: &str) -> String {
+    format!(
+        "{WL_SCAN}[ \"$WL_N\" -eq 0 ] || {{ echo \"remote run {tag}: $WL_N Wayland sockets in $WL_DIR, want 0 for a nested labwc\" >&2; exit 5; }}\n{X_SESSION}[ -n \"$XD\" ] || {{ echo \"remote run {tag}: no X11 session to nest labwc in\" >&2; exit 5; }}\nmkdir -p {cfg}\nenv -i PATH=/usr/local/bin:/usr/bin:/bin HOME=\"$HOME\" XDG_RUNTIME_DIR=\"$WL_DIR\" DISPLAY=\"$XD\" XAUTHORITY=\"$XA\" WLR_BACKENDS=x11 labwc -C {cfg} < /dev/null > {log} 2>&1 &\nLW=$!\ni=0\nwhile wl_scan; [ \"$WL_N\" -eq 0 ] && [ \"$i\" -lt {NESTED_WAIT_S} ]; do\n  kill -0 \"$LW\" 2>/dev/null || break\n  sleep 1\n  i=$((i + 1))\ndone\n[ \"$WL_N\" -eq 1 ] || {{ echo \"remote run {tag}: nested labwc gave $WL_N Wayland sockets in $WL_DIR, want 1\" >&2; kill \"$LW\" 2>/dev/null; exit 5; }}\n"
+    )
 }
 
 /// The host roots a runtime names, absolute on this host: the slot, the java out and the AOSP tree (bundle names [`ROOT_NAMES`]), and the run's LLVM runtimes dir ([`llvm_lib_dir`], bundle name `lib`).
@@ -385,7 +444,7 @@ fn dq(s: &str) -> String {
 /// The target's Wayland socket for a session run: the one `wayland-*` socket that is not a lock file, in the desktop session's `$XDG_RUNTIME_DIR` (`/run/user/<uid>`). Sets `WL` to its name. Any other count stops the run with exit 5 before atld starts, and names the count: a second compositor's socket must not be picked by chance.
 pub(crate) fn session_script(tag: &str) -> String {
     format!(
-        "WL_DIR=\"/run/user/$(id -u)\"\nWL=\"\"\nWL_N=0\nfor s in \"$WL_DIR\"/wayland-*; do\n  case \"$s\" in *.lock) continue ;; esac\n  [ -S \"$s\" ] || continue\n  WL=${{s##*/}}\n  WL_N=$((WL_N + 1))\ndone\n[ \"$WL_N\" -eq 1 ] || {{ echo \"remote run {tag}: $WL_N Wayland sockets in $WL_DIR, want 1 (the desktop session's)\" >&2; exit 5; }}\n"
+        "{WL_SCAN}[ \"$WL_N\" -eq 1 ] || {{ echo \"remote run {tag}: $WL_N Wayland sockets in $WL_DIR, want 1 (the desktop session's)\" >&2; exit 5; }}\n"
     )
 }
 
@@ -402,8 +461,8 @@ struct Plan {
     files: Vec<(String, String)>,
     lib_dirs: Vec<String>,
     limit: u64,
-    /// `WAYLAND_DISPLAY` comes from the target's session: [`session_script`] finds the socket.
-    session: bool,
+    /// Where `WAYLAND_DISPLAY` comes from ([`Display`]).
+    display: Display,
 }
 
 fn out_path(rel: &str) -> String {
@@ -437,8 +496,15 @@ impl Plan {
             self.tag,
             dq(&shown)
         ));
-        if self.session {
-            s.push_str(&session_script(&self.tag));
+        let labwc_log = format!("{}/labwc.log", self.scratch);
+        match self.display {
+            Display::Headless => {}
+            Display::Session => s.push_str(&session_script(&self.tag)),
+            Display::NestedX11 => s.push_str(&nested_script(
+                &self.tag,
+                &word(&out_path(&format!("{}/labwc", self.scratch))),
+                &word(&out_path(&labwc_log)),
+            )),
         }
         let lib_path: Vec<String> = self
             .lib_dirs
@@ -449,7 +515,7 @@ impl Plan {
             "env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=\"$HOME\" XDG_RUNTIME_DIR=\"/run/user/$(id -u)\" LD_LIBRARY_PATH={}",
             word(&lib_path.join(":"))
         ));
-        if self.session {
+        if self.display != Display::Headless {
             s.push_str(" WAYLAND_DISPLAY=\"$WL\"");
         }
         for (key, value) in &self.env {
@@ -466,6 +532,12 @@ impl Plan {
         ));
         s.push_str("pid=$!\nwait \"$pid\"\nrc=$?\n");
         s.push_str("kill -KILL -- \"-$pid\" 2>/dev/null || true\n");
+        // the nested compositor lives for the run only: its window leaves the target's desktop with it
+        if self.display == Display::NestedX11 {
+            s.push_str(
+                "kill -TERM \"$LW\" 2>/dev/null || true\nwait \"$LW\" 2>/dev/null || true\n",
+            );
+        }
         s.push_str(&format!(
             "printf '%s\\n' \"$rc\" > {}\n",
             word(&out_path(&format!("{}/atld.rc", self.scratch)))
@@ -485,14 +557,19 @@ impl Plan {
             sh_quote(&format!("{}/atld.rc", self.scratch)),
             sh_quote(&format!("{}/end.ms", self.scratch))
         ));
+        if self.display == Display::NestedX11 {
+            // the tar line ends with its last path: labwc's log rides along
+            s.pop();
+            s.push_str(&format!(" {}\n", sh_quote(&labwc_log)));
+        }
         s
     }
 }
 
 impl RemoteRun {
-    /// Whether the target's desktop session supplies `WAYLAND_DISPLAY` (`session`).
-    pub fn has_session(&self) -> bool {
-        self.session
+    /// Whether the run has a Wayland display ([`Display`]): a UI run needs one.
+    pub fn has_display(&self) -> bool {
+        self.display != Display::Headless
     }
 
     /// Starts `cmd` (atld's command, host paths) on the target as one run. The child is the transfer, `<transport> < plan | tar -x` (`sh -s` for `local:`), and its end is the run's. `root` and `scratch` lie under the slot's out dir, where the logs return. `written` are the files the command reads that this host wrote: their content goes into the plan.
@@ -545,7 +622,7 @@ impl RemoteRun {
             files,
             lib_dirs: self.lib_dirs.clone(),
             limit: self.limit.as_secs(),
-            session: self.session,
+            display: self.display,
         };
         let script = scratch.join(REMOTE_SCRIPT);
         std::fs::write(&script, plan.script(&self.base))
@@ -910,15 +987,15 @@ impl Target {
         Ok(parse_prereq(&self.host.run_script(&script)?))
     }
 
-    /// A run's site on the target: atld runs from the bundle there, ends at `limit`, and its transcript is appended to `log`. `session`: the target's desktop session supplies `WAYLAND_DISPLAY`.
-    pub fn run_site(&self, limit: Duration, log: PathBuf, session: bool) -> Site {
+    /// A run's site on the target: atld runs from the bundle there, ends at `limit`, and its transcript is appended to `log`. `display`: where its `WAYLAND_DISPLAY` comes from.
+    pub fn run_site(&self, limit: Duration, log: PathBuf, display: Display) -> Site {
         Site::Remote(RemoteRun {
             host: self.host.clone(),
             base: self.host.base(&self.slot),
             lib_dirs: self.lib_dirs.clone(),
             limit,
             log,
-            session,
+            display,
         })
     }
 
@@ -1736,7 +1813,7 @@ mod tests {
             lib_dirs: Vec::new(),
             limit: Duration::from_secs(1),
             log: log.clone(),
-            session: false,
+            display: Display::Headless,
         };
         // a wait status: exit code 2 is `2 << 8`
         let end = std::os::unix::process::ExitStatusExt::from_raw(2 << 8);
@@ -1834,7 +1911,7 @@ mod tests {
             )],
             lib_dirs: vec!["lib".to_owned()],
             limit: 120,
-            session: false,
+            display: Display::Headless,
         };
         let want = concat!(
             "# xtask remote run gl/run: written by remote.rs, do not edit\n",
@@ -1873,7 +1950,7 @@ mod tests {
             files: Vec::new(),
             lib_dirs: vec!["lib".to_owned()],
             limit: 300,
-            session: true,
+            display: Display::Session,
         };
         let s = plan.script("atl-next-run/slot-3");
         let launcher = s.find("is not an executable").expect("launcher check");
@@ -1895,6 +1972,71 @@ mod tests {
         assert!(s.contains(" XDG_RUNTIME_DIR=\"/run/user/$(id -u)\" LD_LIBRARY_PATH=\"$BASE/lib\" WAYLAND_DISPLAY=\"$WL\" RUST_LOG=\"info\" timeout -k 10 300 "), "{s}");
     }
 
+    /// A nested run: labwc starts on the X11 session found read-only, the run waits for its socket, atld gets it, labwc ends after atld's group and its log rides in the tar. Break: a Session-mode script has no labwc and no X11 lookup.
+    #[test]
+    fn nested_run_starts_and_ends_labwc_around_atld() {
+        let plan = Plan {
+            tag: "app".to_owned(),
+            root: "app/root".to_owned(),
+            scratch: "app/scratch".to_owned(),
+            env: Vec::new(),
+            program: "@BASE@/out/cargo/release/atld".to_owned(),
+            args: vec!["--ui".to_owned(), "gtk".to_owned()],
+            files: Vec::new(),
+            lib_dirs: vec!["lib".to_owned()],
+            limit: 60,
+            display: Display::NestedX11,
+        };
+        let s = plan.script("atl-next-run/slot-4-riscv64");
+        let at = |needle: &str| {
+            s.find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} in\n{s}"))
+        };
+        let x = at("for e in /proc/[0-9]*/environ; do");
+        let start = at(
+            "WLR_BACKENDS=x11 labwc -C \"$BASE/out/app/scratch/labwc\" < /dev/null > \"$BASE/out/app/scratch/labwc.log\" 2>&1 &\nLW=$!\n",
+        );
+        let wait = at("while wl_scan; [ \"$WL_N\" -eq 0 ]");
+        let atld = at(" WAYLAND_DISPLAY=\"$WL\" timeout -k 10 60 ");
+        let group = at("kill -KILL -- \"-$pid\"");
+        let end = at("kill -TERM \"$LW\"");
+        assert!(
+            x < start && start < wait && wait < atld && atld < group && group < end,
+            "{s}"
+        );
+        assert!(
+            s.ends_with(" 'app/scratch/end.ms' 'app/scratch/labwc.log'\n"),
+            "{s}"
+        );
+        let session = Plan {
+            display: Display::Session,
+            ..plan
+        };
+        let s = session.script("b");
+        assert!(!s.contains("labwc") && !s.contains("/proc/"), "{s}");
+    }
+
+    /// The probe's three answers; anything else is an error, not a mode.
+    #[test]
+    fn display_probe_answers() {
+        assert_eq!(parse_probe("session\n").unwrap().0, Display::Session);
+        let (d, why) = parse_probe("nested :1\n").unwrap();
+        assert_eq!(
+            (d, why.as_str()),
+            (Display::NestedX11, "labwc nested in X11 display :1")
+        );
+        let (d, why) = parse_probe("headless no labwc\n").unwrap();
+        assert_eq!((d, why.as_str()), (Display::Headless, "no labwc"));
+        assert!(parse_probe("").is_err());
+    }
+
+    /// The probe on this host (`local:`) answers one of the three modes: the script runs as a whole under sh.
+    #[test]
+    fn display_probe_runs_under_sh() {
+        let host = Host::Local(std::env::temp_dir());
+        parse_probe(&host.run_script(&probe_script()).unwrap()).unwrap();
+    }
+
     /// A run without a session has no discovery: its environment names no Wayland socket.
     #[test]
     fn plain_run_has_no_session_discovery() {
@@ -1908,7 +2050,7 @@ mod tests {
             files: Vec::new(),
             lib_dirs: Vec::new(),
             limit: 120,
-            session: false,
+            display: Display::Headless,
         };
         let s = plan.script("b");
         assert!(!s.contains("WL_DIR"), "{s}");

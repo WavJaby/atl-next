@@ -381,7 +381,14 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
     for name in END_FILES {
         let _ = std::fs::remove_file(run.scratch.join(name));
     }
-    let rt = rt.with_site(target.run_site(limit, logs.join("transcript.log"), true));
+    // the window needs a display: the session's, else labwc nested in its X11 session (remote.rs Display)
+    let (display, why) = remote::probe_display(&a.host)?;
+    ensure!(
+        display != remote::Display::Headless,
+        "remote run-apk: the target has no display for the window: {why}"
+    );
+    println!("remote run-apk: display: {why}");
+    let rt = rt.with_site(target.run_site(limit, logs.join("transcript.log"), display));
     // before the transfer: the run's root is cleared on the target then, so a present line the watch reads is this run's
     let mut watch = if observe_on {
         let plan = observe::Plan {

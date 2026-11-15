@@ -1386,13 +1386,13 @@ impl Runtime {
         }
         let (mut cmd, mut written) = self.atld_command(run)?;
         if let remote::Site::Remote(target) = &self.site {
-            // a UI window needs the target's desktop session (its WAYLAND_DISPLAY, remote.rs `session`); this host's socket has no target
+            // a UI window needs the target's display (remote.rs Display: its session's socket or a nested labwc); this host's socket has no target
             ensure!(
                 self.fake_devices.is_none()
                     && self.wayland.is_none()
                     && run.libraries.is_empty()
-                    && (self.ui.is_none() || target.has_session()),
-                "remote run {}: not remotable yet (sensor injection, a gate's own Wayland socket, shared libraries, and a UI without the target's desktop session need a target runner)",
+                    && (self.ui.is_none() || target.has_display()),
+                "remote run {}: not remotable yet (sensor injection, a gate's own Wayland socket, shared libraries, and a UI without a target display need a target runner)",
                 run.root.display()
             );
             // fontconfig's `<dir>` and `<cachedir>` name this host's paths: the run reads a copy that the script relocates

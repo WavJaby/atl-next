@@ -1362,9 +1362,25 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let work = rt.out.join("app");
     // UI mode on a nested compositor: an app on a desktop has a display, and WebKit cannot make its settings (the default UA's source) without one -- WebKitSettings' constructor
     // dereferences a missing GDK display (atl-webview-linux `default_user_agent`); its AppleWebKit token is a literal in WebKit's UserAgentGLib.cpp, not derivable from webkit_get_*_version
-    // a remote run is headless: the target has no compositor of the gate's, and the checks that need one are skipped there ([`REMOTE_SKIPPED`])
+    // a remote run takes the target's display (remote.rs Display: its session's socket, else labwc nested in its X11 session) and the full judge; with none it falls back to the headless subset ([`REMOTE_SKIPPED`])
+    let display = match &args.remote {
+        Some(r) => {
+            let (display, why) = crate::remote::probe_display(&r.host)?;
+            if display == crate::remote::Display::Headless {
+                println!("app: remote display: none ({why}): falling back to the headless subset");
+            } else {
+                println!("app: remote display: {why}: the full gate (UI mode)");
+            }
+            display
+        }
+        None => crate::remote::Display::Headless,
+    };
     let (_nested, rt) = if args.remote.is_some() {
-        (None, rt)
+        if display == crate::remote::Display::Headless {
+            (None, rt)
+        } else {
+            (None, rt.with_ui("gtk"))
+        }
     } else {
         let nested = crate::nested_wayland::NestedCompositor::start(&work.join("nested"))?;
         let rt = rt.with_ui("gtk").with_wayland(&nested.socket);
@@ -1423,10 +1439,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         if !r.apply {
             println!("{}", target.summary());
             println!(
-                "dry run: pushes the bundle to {}, checks {} ELF files there, then runs {} headless with atld's limit at {} s; --apply runs it",
+                "dry run: pushes the bundle to {}, checks {} ELF files there, then runs {} {} with atld's limit at {} s; --apply runs it",
                 target.target(),
                 target.elf_count(),
                 m.name,
+                match display {
+                    crate::remote::Display::Headless => "headless (the headless subset)",
+                    crate::remote::Display::Session => "on the session's display (the full gate)",
+                    crate::remote::Display::NestedX11 =>
+                        "on labwc nested in the X11 session (the full gate)",
+                },
                 REMOTE_LIMIT.as_secs()
             );
             return Ok(ExitCode::SUCCESS);
@@ -1443,8 +1465,34 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let log = dir.join("app.log");
         std::fs::write(&log, "").with_context(|| format!("writing {}", log.display()))?;
-        let rt = rt.with_site(target.run_site(REMOTE_LIMIT, log.clone(), false));
+        let rt = rt.with_site(target.run_site(REMOTE_LIMIT, log.clone(), display));
         let child = rt.start_atld(&run)?;
+        if display != crate::remote::Display::Headless {
+            let (rc, atld_exited, elapsed) = remote_end(&rt, &run, child)?;
+            let code = judge(&AppJudge {
+                run: &run,
+                app_name: &m.name,
+                verbose: args.verbose,
+                libs: &native.libs,
+                layout: &layout,
+                cert: &cert,
+                deferred,
+                isa,
+                foreign: isa != args.host,
+                scene: &scene,
+                activity: &activity,
+                elapsed,
+                passed: std::fs::read_to_string(run.log(&m.name))
+                    .unwrap_or_default()
+                    .lines()
+                    .any(|l| l.contains(MARKER)),
+                atld_exited,
+                no_marker: format!("no {MARKER:?} line (atld rc {rc})"),
+                local: None,
+            })?;
+            println!("remote test app: transcript {}", log.display());
+            return Ok(code);
+        }
         let code = remote_verdict(
             &rt,
             &run,
@@ -1511,12 +1559,99 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if ended.is_none() {
         run.stop(&mut atld_child)?;
     }
-    let app = read(&app_log);
-    let fault = fault(&app, ended.is_some());
+    let no_marker = match ended {
+        Some(s) => format!("atld exited {s} before the marker"),
+        None if elapsed > LIMIT => format!("no marker after {LIMIT:?}"),
+        None => "no marker".to_owned(),
+    };
+    judge(&AppJudge {
+        run: &run,
+        app_name: &m.name,
+        verbose: args.verbose,
+        libs: &native.libs,
+        layout: &layout,
+        cert: &cert,
+        deferred,
+        isa,
+        foreign: isa != args.host,
+        scene: &scene,
+        activity: &activity,
+        elapsed,
+        passed,
+        atld_exited: ended.is_some(),
+        no_marker,
+        local: Some(outside),
+    })
+}
+
+/// What [`judge`] reads besides the run's logs.
+struct AppJudge<'a> {
+    run: &'a Run,
+    app_name: &'a str,
+    verbose: bool,
+    libs: &'a [PathBuf],
+    layout: &'a Layout,
+    cert: &'a str,
+    deferred: &'a [&'a str],
+    isa: &'a str,
+    /// The fixture's ISA is not the host's (a guest run through the bridge).
+    foreign: bool,
+    scene: &'a Scene,
+    activity: &'a str,
+    /// Start to marker (or to the give-up).
+    elapsed: Duration,
+    /// The marker was logged.
+    passed: bool,
+    atld_exited: bool,
+    /// Why there is no marker, for the verdict.
+    no_marker: String,
+    /// A run on this host: the children-outside-broker snapshot (None = atld had ended first). None here = a remote UI run, whose checks that read this host
+    /// (its /proc, its nice limit, its network) or need the gate's own stop (exit totals) are skipped and named ([`REMOTE_UI_SKIPPED`]).
+    local: Option<Option<Vec<String>>>,
+}
+
+/// The checks a remote UI run (app.rs `remote` with a target display) does not claim, each with why (printed as `app: SKIP`); every other row of the local gate is judged from the logs that came back.
+const REMOTE_UI_SKIPPED: [(&str, &str); 4] = [
+    REMOTE_SKIPPED[0],
+    REMOTE_SKIPPED[1],
+    (
+        "priority",
+        "its want derives from this host's RLIMIT_NICE (atl_broker::granted_nice), not the target's",
+    ),
+    (
+        "connectivity",
+        "its want derives from this host's default route and NetworkManager, not the target's",
+    ),
+];
+
+/// The app gate's verdict from a finished run's logs: one judge for a run on this host and a remote UI run.
+fn judge(j: &AppJudge) -> Result<ExitCode> {
+    let AppJudge {
+        run,
+        app_name,
+        verbose,
+        libs,
+        layout,
+        cert,
+        deferred,
+        isa,
+        foreign,
+        scene,
+        activity,
+        elapsed,
+        passed,
+        atld_exited,
+        ref no_marker,
+        ref local,
+    } = *j;
+    let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+    let app = read(&run.log(app_name));
+    let fault = fault(&app, atld_exited);
     let services_log = read(&run.log("services"));
-    if args.verbose {
+    if verbose {
         println!("---- app log\n{app}");
     }
+    let remote = local.is_none();
     for l in counter_lines(&services_log) {
         println!("app: counter {l}");
     }
@@ -1529,9 +1664,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .unwrap_or_else(|| "FAIL no cacerts line".to_owned());
     let bridge1 = app.lines().find(|l| l.contains(BRIDGE1));
     let bridge1_ok = bridge1.is_some();
-    let mut whys = jni_fixture::legacy_failures(&native.libs)?;
-    whys.extend(jni_fixture::ndk_failures(&native.libs)?);
-    whys.extend(jni_fixture::es1_failures(&native.libs)?);
+    let mut whys = jni_fixture::legacy_failures(libs)?;
+    whys.extend(jni_fixture::ndk_failures(libs)?);
+    whys.extend(jni_fixture::es1_failures(libs)?);
     if let Some(f) = &fault {
         whys.push(format!("the app faulted: {f}"));
         println!("---- app log (last {TAIL} lines)\n{}", tail(&app, TAIL));
@@ -1553,31 +1688,33 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         whys.extend(prop_block_failures(&atld_log));
         whys.extend(device_set_failures(&app));
     }
-    whys.extend(exit_failures(
-        passed,
-        &services_log,
-        &atld_log,
-        &read(&run.log("binderd")),
-    ));
+    if !remote {
+        whys.extend(exit_failures(
+            passed,
+            &services_log,
+            &atld_log,
+            &read(&run.log("binderd")),
+        ));
+    }
     whys.extend(missing_service_failures(&app));
-    match &outside {
-        Some(o) => {
+    match local {
+        Some(Some(o)) => {
             println!("app: counter children_outside_broker {}", o.len());
             if !o.is_empty() {
                 whys.push(format!("atld children outside the broker: {o:?}"));
             }
         }
-        None if passed => whys.push(
+        Some(None) if passed => whys.push(
             "children_outside_broker not measured: atld had ended before the snapshot".into(),
         ),
-        None => {}
+        _ => {}
     }
     let fonts_line = app
         .lines()
         .find_map(|l| l.split_once(FONTS).map(|(_, r)| r.to_owned()));
     if passed {
         whys.extend(
-            font_check(&layout, fonts_line.as_deref())?
+            font_check(layout, fonts_line.as_deref())?
                 .into_iter()
                 .map(|w| format!("fonts: {w}")),
         );
@@ -1588,8 +1725,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if passed && soundpool.as_deref() != Some("constructed") {
         whys.push(format!("soundpool: want constructed, got {soundpool:?}"));
     }
-    for (service, prefix, want) in SERVICE_LINES {
-        let want = service_want(want);
+    // a host-derived want (connectivity) is this host's: a remote run skips it (REMOTE_UI_SKIPPED)
+    for (service, prefix, want) in SERVICE_LINES
+        .iter()
+        .filter(|(_, _, w)| !remote || w.is_some())
+    {
+        let want = service_want(*want);
         let got = app
             .lines()
             .find_map(|l| l.split_once(prefix).map(|(_, r)| r.to_owned()));
@@ -1620,7 +1761,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         l.split_once(SIGNATURES)
             .map(|(_, r)| r.trim_end().to_owned())
     });
-    let want = signatures_want(&cert);
+    let want = signatures_want(cert);
     if passed && signatures.as_deref() != Some(want.as_str()) {
         whys.push(format!("signatures: want {want:?}, got {signatures:?}"));
     }
@@ -1670,7 +1811,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .lines()
         .find_map(|l| l.split_once(PRIORITY).map(|(_, r)| r.trim_end().to_owned()));
     let tiers = atl_broker::NiceTiers::for_limit(atl_broker::granted_nice());
-    if passed && let Some(why) = priority_why(priority.as_deref(), tiers.floor) {
+    if passed
+        && !remote
+        && let Some(why) = priority_why(priority.as_deref(), tiers.floor)
+    {
         whys.push(format!("priority ({}): {why}", tiers.describe()));
     }
     // the row's release: releasePlayer is oneway, so the app sees no error; the audio service's own count shows that the track and the release reached it and were served
@@ -1744,7 +1888,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     let mut es1_compared = None;
     if passed && bridge1_ok {
-        whys.extend(bridge1_call_failures(&app, deferred, isa != args.host));
+        whys.extend(bridge1_call_failures(&app, deferred, foreign));
         // sigsegvRecover's fault reaches the fixture's own handler through the bridge (signal.rs guest_handler), which reports it first: the report's only gate in a real app process
         if !deferred.contains(&"sigsegvRecover")
             && !app.lines().any(|l| l.contains(GUEST_FAULT_REPORT))
@@ -1754,7 +1898,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             ));
         }
         if !deferred.contains(&"es1Pixels") {
-            match es1_pixels(&app, &scene) {
+            match es1_pixels(&app, scene) {
                 Ok(n) => es1_compared = Some(n),
                 Err(why) => whys.push(format!("es1 pixels: {why}")),
             }
@@ -1766,11 +1910,17 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             deferred.join(", ")
         );
     }
+    let gate = if remote { "remote app" } else { "app" };
+    if remote {
+        for (row, why) in REMOTE_UI_SKIPPED {
+            println!("app: SKIP {row}: {why}");
+        }
+    }
     if !whys.is_empty() {
         for why in &whys {
             println!("app: FAIL {why}");
         }
-        println!("{}", crate::verdict::gate("app", &whys));
+        println!("{}", crate::verdict::gate(gate, &whys));
         return Ok(ExitCode::FAILURE);
     }
     if passed {
@@ -1791,8 +1941,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             "app: pass mediaplayer {} (no media.player lookup)",
             mediaplayer_steps(&app)
         );
-        for (service, _, want) in SERVICE_LINES {
-            println!("app: pass {service} {}", service_want(want));
+        for (service, _, want) in SERVICE_LINES
+            .iter()
+            .filter(|(_, _, w)| !remote || w.is_some())
+        {
+            println!("app: pass {service} {}", service_want(*want));
         }
         for (row, _, want) in ASYNC_LINES {
             println!("app: pass {row} {want}");
@@ -1803,11 +1956,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             webview_ua.as_deref().unwrap_or_default()
         );
         println!("app: pass webview-package {}", WEBVIEW_PACKAGE.1);
-        println!(
-            "app: pass priority {} ({})",
-            priority.as_deref().unwrap_or_default(),
-            tiers.describe()
-        );
+        if !remote {
+            println!(
+                "app: pass priority {} ({})",
+                priority.as_deref().unwrap_or_default(),
+                tiers.describe()
+            );
+        }
         println!(
             "app: pass features {}",
             features.as_deref().unwrap_or_default()
@@ -1832,6 +1987,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
         println!("app: pass ({activity} Activity.onCreate logged after {elapsed:.1?})");
         println!("app: gralloc registered: {}", gralloc_log.trim());
+        // the local gate's ok line is the test runner's; a remote run's verdict line is its own, as the headless subset's
+        if remote {
+            println!("{}", crate::verdict::gate(gate, &[]));
+        }
         return Ok(ExitCode::SUCCESS);
     }
     if passed {
@@ -1840,17 +1999,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             gralloc_log.trim()
         );
         let why = format!("the allocator did not register: {}", gralloc_log.trim());
-        println!(
-            "{}",
-            crate::verdict::gate("app", std::slice::from_ref(&why))
-        );
+        println!("{}", crate::verdict::gate(gate, std::slice::from_ref(&why)));
         return Ok(ExitCode::FAILURE);
     }
-    let why = match ended {
-        Some(s) => format!("atld exited {s} before the marker"),
-        None if elapsed > LIMIT => format!("no marker after {LIMIT:?}"),
-        None => "no marker".to_owned(),
-    };
+    let why = no_marker.clone();
     println!("app: FAIL {why}");
     println!("---- atld log\n{}", tail(&read(&run.atld_log()), TAIL));
     println!("---- app log (last {TAIL} lines)\n{}", tail(&app, TAIL));
@@ -1858,25 +2010,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         "---- services log (last {TAIL} lines)\n{}",
         tail(&services_log, TAIL)
     );
-    println!(
-        "{}",
-        crate::verdict::gate("app", std::slice::from_ref(&why))
-    );
+    println!("{}", crate::verdict::gate(gate, std::slice::from_ref(&why)));
     Ok(ExitCode::FAILURE)
 }
 
-/// The headless subset's verdict ([`remote`]) once the transfer `child` ends: the target's end record, then the process start ([`MARKER`]), Main's resume ([`MAIN_RESUMED`]), no fault, the bridge1 rows as the local gate judges them, and the fixture's own ELF checks. The rest is printed as skipped.
-#[allow(clippy::too_many_arguments)]
-fn remote_verdict(
+/// A remote run's end: waits for the transfer `child` (atld's limit + the margin), checks it, reads the target's end record. (atld rc, atld ended by itself rather than at the limit, the wait's duration).
+fn remote_end(
     rt: &Runtime,
     run: &Run,
     mut child: std::process::Child,
-    app_name: &str,
-    libs: &[PathBuf],
-    deferred: &[&str],
-    foreign: bool,
-    scene: &Scene,
-) -> Result<ExitCode> {
+) -> Result<(i32, bool, Duration)> {
     let started = Instant::now();
     let bound = REMOTE_LIMIT + crate::run_apk::TRANSFER_MARGIN;
     let status = crate::run_apk::wait_transfer(&mut child, bound, || {})?.with_context(|| {
@@ -1888,8 +2031,6 @@ fn remote_verdict(
     rt.check_end(status, run)?;
     let (rc, _) = crate::run_apk::end_record(&run.scratch).map_err(anyhow::Error::msg)?;
     let atld_exited = !crate::run_apk::stopped_at_limit(rc);
-    let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
-    let app = read(&run.log(app_name));
     println!(
         "app: remote run ended after {:.1?}: atld rc {rc} ({})",
         started.elapsed(),
@@ -1899,6 +2040,24 @@ fn remote_verdict(
             "the target's limit"
         }
     );
+    Ok((rc, atld_exited, started.elapsed()))
+}
+
+/// The headless subset's verdict ([`remote`]) once the transfer `child` ends: the target's end record, then the process start ([`MARKER`]), Main's resume ([`MAIN_RESUMED`]), no fault, the bridge1 rows as the local gate judges them, and the fixture's own ELF checks. The rest is printed as skipped.
+#[allow(clippy::too_many_arguments)]
+fn remote_verdict(
+    rt: &Runtime,
+    run: &Run,
+    child: std::process::Child,
+    app_name: &str,
+    libs: &[PathBuf],
+    deferred: &[&str],
+    foreign: bool,
+    scene: &Scene,
+) -> Result<ExitCode> {
+    let (rc, atld_exited, _) = remote_end(rt, run, child)?;
+    let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+    let app = read(&run.log(app_name));
     let mut whys = jni_fixture::legacy_failures(libs)?;
     whys.extend(jni_fixture::ndk_failures(libs)?);
     whys.extend(jni_fixture::es1_failures(libs)?);
