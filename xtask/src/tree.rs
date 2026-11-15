@@ -145,7 +145,7 @@ pub fn overlays_of(root: &Path) -> Result<Vec<Overlay>> {
     overlays(&layout, &crate::sources::load(root)?.checkouts(None))
 }
 
-/// Every bind of the build namespace ([`enter`], [`verify`]): the task copies, the repo bind, then the checkout's slot at the canonical build path (`slot::build_bind`). A pinned project at or below the repo bind's path is refused: the bind would hide it.
+/// Every bind of the build namespace ([`enter`], [`verify`]): the task copies, the repo bind, then the checkout's build dir at the canonical build path (`out::build_bind`, which makes the dir on first use). A pinned project at or below the repo bind's path is refused: the bind would hide it.
 pub fn binds_of(root: &Path) -> Result<Vec<Overlay>> {
     let layout = Layout::of(root)?;
     let checkouts = crate::sources::load(root)?.checkouts(None);
@@ -157,7 +157,7 @@ pub fn binds_of(root: &Path) -> Result<Vec<Overlay>> {
         bail!("{q} is a pinned project below the repo bind {VENDOR_PROJECT}");
     }
     out.push(vendor_overlay(&layout, root));
-    out.extend(crate::slot::build_bind(root)?);
+    out.push(crate::out::build_bind(root)?);
     Ok(out)
 }
 
@@ -204,7 +204,7 @@ pub fn enter(
                 .with_context(|| format!("making the mount point {}", o.target.display()))?;
         }
         // the canonical build path's mount point: empty and read-only, so outside every namespace a write there fails
-        if o.project == crate::slot::CANONICAL && !o.target.is_dir() {
+        if o.project == crate::out::CANONICAL && !o.target.is_dir() {
             use std::os::unix::fs::PermissionsExt;
             std::fs::create_dir_all(&o.target)
                 .with_context(|| format!("making the mount point {}", o.target.display()))?;

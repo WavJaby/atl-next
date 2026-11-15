@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Machine-wide build tokens: `xtask native` holds one while ninja runs, so at most [`tokens`] full native builds run at once whatever the number of checkouts and slots.
+//! Machine-wide build tokens: `xtask native` holds one while ninja runs, so at most [`tokens`] full native builds run at once whatever the number of checkouts.
 //! Only the ninja build queues; tests, `check` and cargo builds never take a token.
 //! A token is an exclusive `flock` on `<workspace>/cache/build-pool/token-<i>`: the kernel drops it when the holder's file closes, so exit, error, panic and SIGKILL all free it -- no stale-lock cleanup exists or is needed.
 //! The holder writes `<checkout> pid <pid>` into its token file; a waiter prints those once, then retries every [`POLL`].
@@ -55,52 +55,11 @@ pub fn acquire(
     }
 }
 
-/// A build's tokens: the pool token, plus a slow-class token when it builds in a slow slot.
-#[derive(Debug)]
-pub struct BuildTokens {
-    pub class: Option<Token>,
-    pub token: Token,
-}
-
-/// The slow class's token dir under pool dir `dir`; its tokens are counted apart from the pool's.
-pub fn slow_dir(dir: &Path) -> PathBuf {
-    dir.join("slow")
-}
-
-/// A native build's tokens for checkout `root` in workspace `ws`: a slot listed in `build.slow_slots` first takes one of `build.slow_builds` class tokens, then a pool token, so at most that many pool tokens ever go to slow slots and fast slots never wait behind more. Prints each wait as `<tag>: <line>`.
-pub fn acquire_build(ws: &Path, root: &Path, tag: &str) -> Result<BuildTokens> {
-    let cfg = crate::ws_config::load(ws)?;
-    let slot = crate::slot::record_slot(root)?;
-    let slow = slot
-        .filter(|n| cfg.slow_slots.value.contains(n))
-        .map(|_| cfg.slow_builds.value);
-    acquire_classed(
-        &dir(ws),
-        cfg.parallel_builds.value,
-        slow,
-        &this_holder(root),
-        POLL,
-        |line| println!("{tag}: {line}"),
-    )
-}
-
-/// `slow` = the class size when the build is in a slow slot. The class token is taken before the pool token: a slow build never holds a pool token while it queues for its class. `on_wait` gets one line per stage that waits.
-pub fn acquire_classed(
-    dir: &Path,
-    tokens: u32,
-    slow: Option<u32>,
-    who: &str,
-    poll: Duration,
-    mut on_wait: impl FnMut(&str),
-) -> Result<BuildTokens> {
-    let class = match slow {
-        Some(n) => Some(acquire(&slow_dir(dir), n, who, poll, |line| {
-            on_wait(&format!("slow class: {line}"))
-        })?),
-        None => None,
-    };
-    let token = acquire(dir, tokens, who, poll, |line| on_wait(line))?;
-    Ok(BuildTokens { class, token })
+/// A native build's pool token for checkout `root` in workspace `ws`. Prints the wait as `<tag>: <line>`.
+pub fn acquire_build(ws: &Path, root: &Path, tag: &str) -> Result<Token> {
+    acquire(&dir(ws), tokens(ws)?, &this_holder(root), POLL, |line| {
+        println!("{tag}: {line}")
+    })
 }
 
 /// Every one of `tokens` tokens without waiting (a quiet window: no ninja build runs while they are held): Ok(all), or Err(the holders line) when any is held -- the ones taken are released again.
@@ -166,20 +125,20 @@ pub fn this_holder(root: &Path) -> String {
     format!("{} pid {}", root.display(), std::process::id())
 }
 
-/// Per-slot lock `<workspace>/cache/build-pool/slot-<n>.lock`. Every process that resolves slot `n` (`slot::out_dir`) holds it shared until it exits; `slot prune` takes it exclusive without waiting, so a slot is pruned only while no build runs in it. Freed by the kernel on exit or SIGKILL, like the tokens.
-/// Covers only xtask processes: cargo runs that xtask does not wrap, and binaries built before this lock, are invisible to it.
-pub fn slot_lock_path(ws: &Path, slot: u32) -> PathBuf {
-    dir(ws).join(format!("slot-{slot}.lock"))
+/// Per-build-dir lock `<workspace>/cache/build-pool/ws-<id>.lock`. Every process that resolves build dir `id` (`out::out_dir`) holds it shared until it exits; making, deleting and pruning the dir take it exclusive, so a dir is never changed under a build. Freed by the kernel on exit or SIGKILL, like the tokens.
+/// Covers only xtask processes: cargo runs that xtask does not wrap are invisible to it.
+pub fn dir_lock_path(ws: &Path, id: &str) -> PathBuf {
+    dir(ws).join(format!("ws-{id}.lock"))
 }
 
-/// A held slot lock; dropping it (or the process dying) releases it.
+/// A held dir lock; dropping it (or the process dying) releases it.
 #[derive(Debug)]
-pub struct SlotLock {
+pub struct DirLock {
     _file: File,
 }
 
-fn open_slot_lock(ws: &Path, slot: u32) -> Result<(PathBuf, File)> {
-    let p = slot_lock_path(ws, slot);
+fn open_dir_lock(ws: &Path, id: &str) -> Result<(PathBuf, File)> {
+    let p = dir_lock_path(ws, id);
     std::fs::create_dir_all(dir(ws)).with_context(|| format!("creating {}", dir(ws).display()))?;
     let file = OpenOptions::new()
         .read(true)
@@ -191,26 +150,46 @@ fn open_slot_lock(ws: &Path, slot: u32) -> Result<(PathBuf, File)> {
     Ok((p, file))
 }
 
-/// Shared hold on `slot`: any number of builds at once; refused only while prune holds it. When prune does, `on_wait` runs once and the call waits for prune to finish.
-pub fn hold_slot(ws: &Path, slot: u32, on_wait: impl FnOnce()) -> Result<SlotLock> {
-    let (p, file) = open_slot_lock(ws, slot)?;
-    match flock(&file, FlockOperation::NonBlockingLockShared) {
+/// Takes `op` on `id`'s lock; when it would block, `on_wait` runs once and the call waits.
+fn take_dir(ws: &Path, id: &str, shared: bool, on_wait: impl FnOnce()) -> Result<DirLock> {
+    let (p, file) = open_dir_lock(ws, id)?;
+    let (try_op, op) = if shared {
+        (
+            FlockOperation::NonBlockingLockShared,
+            FlockOperation::LockShared,
+        )
+    } else {
+        (
+            FlockOperation::NonBlockingLockExclusive,
+            FlockOperation::LockExclusive,
+        )
+    };
+    match flock(&file, try_op) {
         Ok(()) => {}
         Err(e) if std::io::Error::from(e).kind() == ErrorKind::WouldBlock => {
             on_wait();
-            flock(&file, FlockOperation::LockShared)
-                .with_context(|| format!("flock {}", p.display()))?;
+            flock(&file, op).with_context(|| format!("flock {}", p.display()))?;
         }
         Err(e) => return Err(e).with_context(|| format!("flock {}", p.display())),
     }
-    Ok(SlotLock { _file: file })
+    Ok(DirLock { _file: file })
 }
 
-/// Exclusive hold on `slot`, without waiting: `None` when a build holds it or another prune runs.
-pub fn try_prune_slot(ws: &Path, slot: u32) -> Result<Option<SlotLock>> {
-    let (p, file) = open_slot_lock(ws, slot)?;
+/// Shared hold on build dir `id`: any number of builds at once; waits (after `on_wait`) only while the dir is being made, deleted or pruned.
+pub fn hold_dir(ws: &Path, id: &str, on_wait: impl FnOnce()) -> Result<DirLock> {
+    take_dir(ws, id, true, on_wait)
+}
+
+/// Exclusive hold on build dir `id` for making it: waits (after `on_wait`) for every holder.
+pub fn lock_dir(ws: &Path, id: &str, on_wait: impl FnOnce()) -> Result<DirLock> {
+    take_dir(ws, id, false, on_wait)
+}
+
+/// Exclusive hold on build dir `id`, without waiting: `None` when a build holds it or another prune runs.
+pub fn try_lock_dir(ws: &Path, id: &str) -> Result<Option<DirLock>> {
+    let (p, file) = open_dir_lock(ws, id)?;
     match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(Some(SlotLock { _file: file })),
+        Ok(()) => Ok(Some(DirLock { _file: file })),
         Err(e) if std::io::Error::from(e).kind() == ErrorKind::WouldBlock => Ok(None),
         Err(e) => Err(e).with_context(|| format!("flock {}", p.display())),
     }
@@ -246,43 +225,43 @@ mod tests {
         None
     }
 
-    /// Every build's shared hold keeps prune out of its slot and no other: prune gets slot 1 only after the last hold is gone; slot 2 was never held.
+    /// Every build's shared hold keeps prune out of its dir and no other: prune gets dir a only after the last hold is gone; dir b was never held.
     #[test]
     fn prune_waits_for_every_build_hold() {
-        let dir = scratch("slot-lock");
-        let first = hold_slot(&dir, 1, || panic!("uncontended hold waited")).unwrap();
-        let second = hold_slot(&dir, 1, || panic!("a second build waited")).unwrap();
+        let dir = scratch("dir-lock");
+        let first = hold_dir(&dir, "a", || panic!("uncontended hold waited")).unwrap();
+        let second = hold_dir(&dir, "a", || panic!("a second build waited")).unwrap();
         assert!(
-            try_prune_slot(&dir, 1).unwrap().is_none(),
-            "builds hold slot 1, prune got it"
+            try_lock_dir(&dir, "a").unwrap().is_none(),
+            "builds hold dir a, prune got it"
         );
         drop(first);
         assert!(
-            try_prune_slot(&dir, 1).unwrap().is_none(),
-            "one build still holds slot 1"
+            try_lock_dir(&dir, "a").unwrap().is_none(),
+            "one build still holds dir a"
         );
         drop(second);
         assert!(
-            retry_until_free(|| try_prune_slot(&dir, 1).expect("lock file")).is_some(),
-            "no build left, prune must get slot 1"
+            retry_until_free(|| try_lock_dir(&dir, "a").expect("lock file")).is_some(),
+            "no build left, prune must get dir a"
         );
         assert!(
-            try_prune_slot(&dir, 2).unwrap().is_some(),
-            "slot 2 has no holder"
+            try_lock_dir(&dir, "b").unwrap().is_some(),
+            "dir b has no holder"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A build that starts while prune holds its slot reports the wait once, then runs after prune.
+    /// A build that starts while prune holds its dir reports the wait once, then runs after prune.
     #[test]
     fn build_waits_for_a_running_prune() {
-        let dir = scratch("slot-prune-first");
-        let prune = try_prune_slot(&dir, 1).unwrap().expect("free slot");
+        let dir = scratch("dir-prune-first");
+        let prune = try_lock_dir(&dir, "a").unwrap().expect("free dir");
         let (wtx, wrx) = mpsc::channel();
         let (tx, rx) = mpsc::channel();
         let d = dir.clone();
         let build = std::thread::spawn(move || {
-            let hold = hold_slot(&d, 1, || wtx.send(()).unwrap()).unwrap();
+            let hold = hold_dir(&d, "a", || wtx.send(()).unwrap()).unwrap();
             tx.send(()).unwrap();
             drop(hold);
         });
@@ -290,11 +269,11 @@ mod tests {
             .expect("build did not report the wait");
         assert!(
             rx.recv_timeout(STILL_WAITING).is_err(),
-            "build ran while prune held the slot"
+            "build ran while prune held the dir"
         );
         drop(prune);
         rx.recv_timeout(STILL_WAITING * 4)
-            .expect("build did not get the slot after prune");
+            .expect("build did not get the dir after prune");
         build.join().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -327,44 +306,6 @@ mod tests {
         assert_eq!(rx.recv_timeout(STILL_WAITING * 4).unwrap(), freed);
         waiter.join().unwrap();
         drop(b);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// Class 1 of pool 2: a second slow build waits for the class (one wait line, holding no pool token), while a fast build still gets the free pool token.
-    #[test]
-    fn slow_class_caps_slow_builds_and_spares_fast_ones() {
-        let dir = scratch("slow");
-        let s1 = acquire_classed(&dir, 2, Some(1), "s1", FAST, |_| panic!("s1 waited")).unwrap();
-        assert!(s1.class.is_some());
-        let (tx, rx) = mpsc::channel();
-        let (wtx, wrx) = mpsc::channel();
-        let d = dir.clone();
-        let s2 = std::thread::spawn(move || {
-            let t = acquire_classed(&d, 2, Some(1), "s2", FAST, |l| {
-                wtx.send(l.to_owned()).unwrap()
-            })
-            .unwrap();
-            tx.send(()).unwrap();
-            drop(t);
-        });
-        let line = wrx.recv_timeout(STILL_WAITING).expect("no class wait line");
-        assert!(
-            line.starts_with("slow class: ") && line.contains("s1"),
-            "{line}"
-        );
-        assert!(
-            rx.recv_timeout(STILL_WAITING).is_err(),
-            "second slow build ran"
-        );
-        // the waiting slow build holds no pool token: a fast build takes the second one at once
-        let fast =
-            acquire_classed(&dir, 2, None, "fast", FAST, |l| panic!("fast waited: {l}")).unwrap();
-        assert!(fast.class.is_none());
-        drop(fast);
-        drop(s1);
-        rx.recv_timeout(STILL_WAITING * 4)
-            .expect("second slow build never ran");
-        s2.join().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

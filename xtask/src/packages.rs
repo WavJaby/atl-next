@@ -447,9 +447,9 @@ pub fn target_dir(out: &Path) -> PathBuf {
     out.join(TARGET_DIR)
 }
 
-/// [`target_dir`]'s name under the out dir (slot_prune's roots).
+/// [`target_dir`]'s name under the out dir (out_prune's roots).
 pub const TARGET_DIR: &str = "cargo-converter";
-/// [`test_target_dir`]'s name under the out dir (slot_prune's roots).
+/// [`test_target_dir`]'s name under the out dir (out_prune's roots).
 pub const TEST_TARGET_DIR: &str = "cargo-converter-test";
 
 /// The cargo target dir of the converter packages' unit tests (`Selection::test`), apart from [`target_dir`]: the test build runs under `RUSTC_BOOTSTRAP=1`, which proc-macro2's build script probes

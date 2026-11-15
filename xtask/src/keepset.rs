@@ -2,7 +2,7 @@
 //! `cargo xtask keepset`: each `[aosp.sparse]` keep-set derived from the build graphs, and the rows checked against it.
 //!
 //! A read is a tree path a graph names: every token of `<out>/build.ninja` (inputs, implicit and order-only inputs, `cp =` bindings such as a javac classpath), the header reads of its deps log (ninja_deps.rs), the strings of `graph.json` (include dirs), the `Android.bp` of every module a graph or a `cts.toml` row names, and the `<os>/bin` dir of each host row's `soong_prebuilt_os` (`arches.toml`).
-//! Reads come from one graph: this checkout's own slot (slot.rs record), refused unless its converter argument file names every gate's goals (gate_goals.rs `all_converter`, the set `native --for all-gates` builds), so one graph holds the reads of all goals and another checkout's slot (mid-build, other converter code) never enters the check. A foreign native-bridge graph (native.rs `graph_dir`) has its own dir and argument file, so it is not read here.
+//! Reads come from one graph: this checkout's own build dir (out.rs), refused unless its converter argument file names every gate's goals (gate_goals.rs `all_converter`, the set `native --for all-gates` builds), so one graph holds the reads of all goals and another checkout's build dir (mid-build, other converter code) never enters the check. A foreign native-bridge graph (native.rs `graph_dir`) has its own dir and argument file, so it is not read here.
 //! Cone mode keeps whole dirs: a project's keep-set is the minimal cover of its reads by non-nested dirs. A dir read keeps itself, a file read keeps its parent dir; root files are always kept. Dir or file is decided on disk.
 //! A read through a tracked symlink needs the link (its project) and the target (the project owning it); see [`locate`].
 //! `[aosp.needed_by]` is checked against per-gate reads ([`groups`]); `cts.toml` rows are reads of gate `cts`.
@@ -55,7 +55,7 @@ pub struct Need {
 
 /// The reads of the graphs, classified by owning pinned project.
 pub struct Derived {
-    /// Label of the out dir read, e.g. `slot-3`.
+    /// Label of the out dir read, e.g. `ws/repo`.
     graph: String,
     owned: BTreeMap<String, Vec<Need>>,
     /// Tree paths no pinned project owns (an unpinned project, or a file outside every project).
@@ -200,7 +200,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     })
 }
 
-/// Step `keepset` of `xtask check`: every row covers the reads of this checkout's slot graph. `Some(why)` (skipped) without a slot or a graph: main's land verify holds no slot. A graph converted for fewer goals fails.
+/// Step `keepset` of `xtask check`: every row covers the reads of this checkout's build dir graph. `Some(why)` (skipped) without a graph. A graph converted for fewer goals fails.
 pub fn check_own(root: &Path) -> Result<Option<String>> {
     let layout = Layout::of(root)?;
     let graph = match own_graph(root, &layout)? {
@@ -224,27 +224,22 @@ pub fn check_own(root: &Path) -> Result<Option<String>> {
     Ok(None)
 }
 
-/// `(label, out dir)` of the checkout's own slot graph; `Ok(Err(why))` when there is none to read yet.
+/// `(label, out dir)` of the checkout's own build dir graph; `Ok(Err(why))` when there is none to read yet.
 fn own_graph(root: &Path, layout: &Layout) -> Result<Result<(String, PathBuf), String>> {
-    let slot = crate::slot::record_slot(root)?;
+    let id = crate::out::checkout_id(root)?;
     let required = crate::gate_goals::all_converter(root)?;
-    select_graph(layout.workspace(), slot, &required)
+    select_graph(layout.workspace(), &id, &required)
 }
 
-/// The graph of slot `slot` under `ws`, refused (Err) when its argument file lacks a goal of `required`. No other slot is read: another checkout's graph may be mid-conversion from other code.
+/// The graph of build dir `id` under `ws`, refused (Err) when its argument file lacks a goal of `required`. No other build dir is read: another checkout's graph may be mid-conversion from other code.
 fn select_graph(
     ws: &Path,
-    slot: Option<u32>,
+    id: &str,
     required: &BTreeSet<String>,
 ) -> Result<Result<(String, PathBuf), String>> {
     const FIX: &str = "cargo xtask native --for all-gates";
-    let Some(n) = slot else {
-        return Ok(Err(format!(
-            "this checkout holds no slot: run `cargo xtask slot assign <n> --execute`, then `{FIX}`"
-        )));
-    };
-    let label = format!("slot-{n}");
-    let dir = crate::slot::slot_dir(ws, n);
+    let label = format!("ws/{id}");
+    let dir = crate::out::dir_of(ws, id);
     if !dir.join(NINJA).is_file() {
         return Ok(Err(format!(
             "no {}: run `{FIX}`",
@@ -730,7 +725,7 @@ fn scan_ninja(file: &Path, prefixes: &Prefixes, from: &str, reads: &mut Reads) -
     Ok(())
 }
 
-/// The header reads of a graph's deps log (ninja_deps.rs, read-only, so safe beside a build of that slot): each path a step's record names, once.
+/// The header reads of a graph's deps log (ninja_deps.rs, read-only, so safe beside a build of that dir): each path a step's record names, once.
 /// Unique paths rather than a target map: the log holds ~8M dependency entries per graph and only the paths matter here.
 /// Not the records of build.ninja's regeneration edge (every file the converter read; ninja files them under each of its outputs, graph.json and problems.txt too), of its directory probe checks (`globs/<n>.result`: every directory it walked) or of the licence gate edge (what it checked): those read whatever the checkout holds, they do not need it held.
 fn scan_deps(out: &Path, prefixes: &Prefixes, from: &str, reads: &mut Reads) -> Result<()> {
@@ -1164,18 +1159,18 @@ mod tests {
         assert_eq!(unused, 1);
     }
 
-    /// A scratch workspace: slot 1 half-converted (partial goals, garbage graph, as another checkout mid-build), slot 2 converted for the full set `{a, nb:b}`, slot 3 for `{a}` only.
+    /// A scratch workspace: build dir `a` half-converted (partial goals, garbage graph, as another checkout mid-build), `b` converted for the full set `{a, nb:b}`, `c` for `{a}` only.
     fn scratch_ws(tag: &str) -> PathBuf {
         let ws = std::env::temp_dir().join(format!("xtask-keepset-{tag}-{}", std::process::id()));
-        let slot = |n: u32, ninja: &str, args: &str| {
-            let dir = crate::slot::slot_dir(&ws, n);
-            fs::create_dir_all(&dir).expect("slot dir");
+        let dir = |id: &str, ninja: &str, args: &str| {
+            let dir = crate::out::dir_of(&ws, id);
+            fs::create_dir_all(&dir).expect("build dir");
             fs::write(dir.join(NINJA), ninja).expect("build.ninja");
             fs::write(dir.join("bp2ninja.args"), args).expect("args");
         };
-        slot(1, "build $broken: \n", "-tree\n/t\na\n");
-        slot(2, "", "-tree\n/t\na\nnb:b\naidl-extra\n");
-        slot(3, "", "-tree\n/t\na\n");
+        dir("a", "build $broken: \n", "-tree\n/t\na\n");
+        dir("b", "", "-tree\n/t\na\nnb:b\naidl-extra\n");
+        dir("c", "", "-tree\n/t\na\n");
         ws
     }
 
@@ -1183,33 +1178,29 @@ mod tests {
         BTreeSet::from(["a".to_owned(), "nb:b".to_owned()])
     }
 
-    /// Only the checkout's own slot is read, whatever state the others are in.
+    /// Only the checkout's own build dir is read, whatever state the others are in.
     #[test]
-    fn reads_only_the_own_slot() {
+    fn reads_only_the_own_build_dir() {
         let ws = scratch_ws("own");
-        let got = select_graph(&ws, Some(2), &full())
+        let got = select_graph(&ws, "b", &full())
             .expect("full set")
             .expect("a graph");
-        assert_eq!(got, ("slot-2".to_owned(), crate::slot::slot_dir(&ws, 2)));
+        assert_eq!(got, ("ws/b".to_owned(), crate::out::dir_of(&ws, "b")));
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 
-    /// A graph converted for fewer goals is refused, naming the slot, each missing goal and the command.
+    /// A graph converted for fewer goals is refused, naming the build dir, each missing goal and the command.
     #[test]
     fn partial_goal_set_is_refused() {
         let ws = scratch_ws("partial");
-        let err = select_graph(&ws, Some(3), &full()).expect_err("partial set");
+        let err = select_graph(&ws, "c", &full()).expect_err("partial set");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("slot-3") && msg.contains("1 goal(s): nb:b"),
+            msg.contains("ws/c") && msg.contains("1 goal(s): nb:b"),
             "{msg}"
         );
         assert!(msg.contains("cargo xtask native --for all-gates"), "{msg}");
-        let none = select_graph(&ws, None, &full())
-            .expect("no slot")
-            .expect_err("skip");
-        assert!(none.contains("cargo xtask slot assign"), "{none}");
-        let unbuilt = select_graph(&ws, Some(4), &full())
+        let unbuilt = select_graph(&ws, "d", &full())
             .expect("no graph")
             .expect_err("skip");
         assert!(unbuilt.contains("build.ninja"), "{unbuilt}");

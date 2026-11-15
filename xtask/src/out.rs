@@ -1,0 +1,1126 @@
+// SPDX-License-Identifier: MIT
+//! Build dirs: the out dir a checkout builds into when `--out` / `--java-out` is not given.
+//!
+//! Pool `<workspace>/out/pool` (one copy-on-write filesystem where the host has one): `ws/<id>` per checkout -- `repo` for the main checkout, the git worktree name otherwise (`.git/worktrees/<name>`), so no record file exists -- and `base/<commit>`, main's published builds.
+//! The first command that needs a checkout's dir makes it ([`ensure`]): a copy of the newest base whose commit is an ancestor of HEAD (else the newest base, else an empty dir), into a temp name renamed into place, so a half copy is never a build dir. Its `.base` names the base.
+//! The copy is one interface with two capability tiers (probed per copy, never by host name): `reflink` (`cp --reflink=always`, extents shared, ~2-3 s for main's 100k-entry build on btrfs) and the baseline `copy` (`cp -a`, any filesystem). The create line names the tier; `pool/tier-<name>.count` counts each.
+//! Every build sees its dir at [`CANONICAL`] (the build namespace binds it there), so a base copy stays valid at its new real path.
+//! A process that resolves the dir holds its lock shared until it exits (`build_pool::hold_dir`); create, delete and prune take it exclusive, so a dir is never deleted under a build.
+//! The checkout's `target/` is a symlink to its dir's `target/` (the only per-checkout switch cargo reads with no tracked file or env var), settled when the outermost process ends ([`settle_target`]): the xtask binary running from a real `target/` must outlive the swap.
+//! A dir leaves with its checkout (land `Cleanup`, [`leave`]); `out prune` deletes the dirs of checkouts removed outside xtask and every base but the newest [`KEEP_BASES`].
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
+use std::sync::Mutex;
+
+use anyhow::{Context, Result, bail, ensure};
+use atl_layout::Layout;
+
+use crate::build_pool::{self, DirLock};
+use crate::git::git;
+use crate::out_prune::{self, Outcome};
+use crate::unit_use;
+
+/// The pool root, workspace-relative.
+pub const POOL: &str = "out/pool";
+/// The main checkout's id; a worktree of that name is refused.
+pub const MAIN_ID: &str = "repo";
+/// Bases `out prune` keeps: the newest, plus the one a child may still be copying from.
+pub const KEEP_BASES: usize = 2;
+/// A checkout's cargo target dir: a link to its build dir's `target/`.
+const TARGET: &str = "target";
+/// In a build dir: the commit of the base it was copied from.
+const BASE_FILE: &str = ".base";
+/// Pre-pool slot record (`<git dir>/atl-out-slot`). Condition: a checkout made before the build-dir pool still holds a slot record; its slot is adopted as its build dir (a link `ws/<id>` -> `out/slot-<n>`) and the record deleted.
+/// Delete this, [`adopt`] and `out_prune`'s slot-link acceptance once no record is left (`ls ~/atl-next/repo/.git/atl-out-slot ~/atl-next/repo/.git/worktrees/*/atl-out-slot`) and the slot disks are retired.
+const LEGACY_RECORD: &str = "atl-out-slot";
+
+/// `out` subcommands.
+#[derive(clap::Subcommand)]
+pub enum Out {
+    /// This checkout's build dir, its base, its `target/` link, and the pool: free space, bases, every build dir.
+    Show,
+    /// Deletes the build dirs whose checkout is gone and every base but the newest two (dry run unless --execute).
+    ///
+    /// A dir a build holds is skipped with a line saying so. With --units: instead, the cargo units and incremental sessions no build used for --older-than days in every build dir plus the trees no build dir owns (`out/egl-driver/*/cargo*`, a real `repo/target`); use is what each recorded build wrote (`<tree>/.atl-unit-use.json`), a unit with no entry is judged by its fingerprint dir's mtime.
+    Prune {
+        /// Prune cargo units and incremental sessions instead of dirs.
+        #[arg(long)]
+        units: bool,
+        /// With --units: stale after this many days since the last build that used the unit.
+        #[arg(long, value_name = "DAYS", default_value_t = out_prune::PRUNE_AFTER_DAYS)]
+        older_than: u64,
+        /// Delete (default: print the plan only).
+        #[arg(long)]
+        execute: bool,
+    },
+    /// Copies the main checkout's build dir to `base/<HEAD>`, the base new build dirs copy (dry run unless --execute). Land's verify-main runs it after it rebuilt and checked main.
+    Publish {
+        /// Copy (default: print the plan only).
+        #[arg(long)]
+        execute: bool,
+    },
+}
+
+/// The copy tiers of [`copy_tree`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tier {
+    Reflink,
+    Copy,
+}
+
+impl Tier {
+    fn name(self) -> &'static str {
+        match self {
+            Tier::Reflink => "reflink",
+            Tier::Copy => "copy",
+        }
+    }
+}
+
+pub fn pool(ws: &Path) -> PathBuf {
+    ws.join(POOL)
+}
+
+/// The build dir of checkout `id`.
+pub fn dir_of(ws: &Path, id: &str) -> PathBuf {
+    pool(ws).join("ws").join(id)
+}
+
+/// The workspace of a build dir path ([`dir_of`]'s inverse).
+fn workspace_of(dir: &Path) -> Option<&Path> {
+    dir.ancestors().nth(4)
+}
+
+pub fn base_of(ws: &Path, commit: &str) -> PathBuf {
+    pool(ws).join("base").join(commit)
+}
+
+/// The id of the checkout at `root`: [`MAIN_ID`] for the main checkout, else its worktree name.
+pub fn checkout_id(root: &Path) -> Result<String> {
+    let git_dir = git(Some(root), &["rev-parse", "--absolute-git-dir"])?;
+    let common = git(
+        Some(root),
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    id_of(Path::new(&git_dir), Path::new(&common))
+}
+
+fn id_of(git_dir: &Path, common: &Path) -> Result<String> {
+    if git_dir == common {
+        return Ok(MAIN_ID.to_owned());
+    }
+    let name = git_dir
+        .strip_prefix(common.join("worktrees"))
+        .ok()
+        .and_then(|rest| rest.to_str())
+        .filter(|n| !n.is_empty() && !n.contains('/') && !n.starts_with('.'))
+        .with_context(|| {
+            format!(
+                "{} is neither {} nor a worktree dir under it",
+                git_dir.display(),
+                common.display()
+            )
+        })?;
+    ensure!(
+        name != MAIN_ID,
+        "worktree name {MAIN_ID:?} is the main checkout's build dir id: rename the worktree (`git worktree move`)"
+    );
+    Ok(name.to_owned())
+}
+
+/// The ids of every checkout of the repository whose git common dir is `common`: the main checkout and each linked worktree whose checkout dir exists.
+fn live_ids(common: &Path) -> Result<BTreeSet<String>> {
+    let mut ids = BTreeSet::from([MAIN_ID.to_owned()]);
+    let worktrees = common.join("worktrees");
+    if worktrees.is_dir() {
+        for entry in std::fs::read_dir(&worktrees)
+            .with_context(|| format!("reading {}", worktrees.display()))?
+        {
+            let git_dir = entry?.path();
+            let gitfile = git_dir.join("gitdir");
+            let Ok(text) = std::fs::read_to_string(&gitfile) else {
+                continue;
+            };
+            // `gitdir` names the worktree's `.git` file; its parent is the checkout
+            if Path::new(text.trim()).parent().is_some_and(Path::exists)
+                && let Some(name) = git_dir.file_name().and_then(|n| n.to_str())
+            {
+                ids.insert(name.to_owned());
+            }
+        }
+    }
+    Ok(ids)
+}
+
+/// The out dir for `--out` / `--java-out` of the checkout at `root`: the explicit dir, else the checkout's build dir (made if missing), held shared until exit. Inside the build namespace that is [`CANONICAL`].
+pub fn out_dir(root: &Path, explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(dir) = explicit {
+        return Ok(std::path::absolute(dir)?);
+    }
+    let ws = Layout::of(root)?.workspace().to_owned();
+    let (id, dir) = ensure(root)?;
+    hold(&ws, &id)?;
+    if crate::tree::bound(CANONICAL).as_deref() == Some(dir.as_path()) {
+        return Ok(ws.join(CANONICAL));
+    }
+    Ok(dir)
+}
+
+/// The checkout's id and build dir, made when missing: adopted from a pre-pool slot record, else copied from a base, else empty. Prints one line when it makes one.
+pub fn ensure(root: &Path) -> Result<(String, PathBuf)> {
+    let ws = Layout::of(root)?.workspace().to_owned();
+    let id = checkout_id(root)?;
+    let dir = dir_of(&ws, &id);
+    if present(&dir)? {
+        return Ok((id, dir));
+    }
+    let _lock = build_pool::lock_dir(&ws, &id, || {
+        eprintln!("out: ws/{id} is being made or deleted by another process, waiting")
+    })?;
+    if present(&dir)? {
+        return Ok((id, dir));
+    }
+    let parent = dir.parent().context("build dir has no parent")?;
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let git_dir = PathBuf::from(git(Some(root), &["rev-parse", "--absolute-git-dir"])?);
+    if let Some(line) = adopt(&ws, &id, &git_dir.join(LEGACY_RECORD))? {
+        println!("{line}");
+        return Ok((id, dir));
+    }
+    let bases = bases(&ws)?;
+    let pick = bases
+        .iter()
+        .find(|c| git(Some(root), &["merge-base", "--is-ancestor", c, "HEAD"]).is_ok())
+        .or(bases.first());
+    let line = match pick {
+        Some(c) => {
+            let tier = copy_tree(&base_of(&ws, c), &dir, Some(c))?;
+            count(&ws, tier);
+            format!("out: ws/{id} from base/{c} ({})", tier.name())
+        }
+        None => {
+            std::fs::create_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
+            format!(
+                "out: ws/{id} new and empty: no base under {} (a build from zero)",
+                pool(&ws).join("base").display()
+            )
+        }
+    };
+    println!("{line}");
+    Ok((id, dir))
+}
+
+/// Whether `path` exists as a dir or a link (an adopted slot); a link is not followed.
+fn present(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// [`LEGACY_RECORD`]'s migration: links `ws/<id>` to the recorded slot and deletes the record. None without a record.
+fn adopt(ws: &Path, id: &str, record: &Path) -> Result<Option<String>> {
+    let text = match std::fs::read_to_string(record) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", record.display())),
+    };
+    let n: u32 = text
+        .trim()
+        .parse()
+        .with_context(|| format!("slot record {} is not a number", record.display()))?;
+    let slot = ws.join("out").join(format!("slot-{n}"));
+    let dir = dir_of(ws, id);
+    let line = if slot.is_dir() {
+        std::os::unix::fs::symlink(&slot, &dir)
+            .with_context(|| format!("linking {} -> {}", dir.display(), slot.display()))?;
+        format!(
+            "out: ws/{id} adopted {} (pre-pool slot; deleted with the checkout)",
+            slot.display()
+        )
+    } else {
+        std::fs::create_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        format!(
+            "out: ws/{id} new and empty: its slot record named a missing {}",
+            slot.display()
+        )
+    };
+    std::fs::remove_file(record).with_context(|| format!("removing {}", record.display()))?;
+    Ok(Some(line))
+}
+
+/// Base commits, newest first (by the base dir's mtime: publish order). Temp names (`.`-prefixed) are skipped.
+fn bases(ws: &Path) -> Result<Vec<String>> {
+    let dir = pool(ws).join("base");
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return Ok(Vec::new());
+    };
+    let mut found = Vec::new();
+    for e in rd {
+        let e = e?;
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || !e.file_type()?.is_dir() {
+            continue;
+        }
+        found.push((e.metadata()?.modified()?, name));
+    }
+    found.sort();
+    Ok(found.into_iter().rev().map(|(_, n)| n).collect())
+}
+
+/// Which tier copies `src` into `dst_parent`: a one-byte probe file reflinked from `src` into `dst_parent` succeeds -> `Reflink`, else `Copy`. Probes the real pair, not the host: a source off the pool (an adopted slot on ext4) is a `Copy`.
+pub fn probe(src: &Path, dst_parent: &Path) -> Result<Tier> {
+    let pid = std::process::id();
+    let from = src.join(format!(".atl-reflink-probe-{pid}"));
+    let to = dst_parent.join(format!(".atl-reflink-probe-{pid}"));
+    std::fs::write(&from, b"x").with_context(|| format!("writing {}", from.display()))?;
+    let ok = Command::new("cp")
+        .arg("--reflink=always")
+        .arg(&from)
+        .arg(&to)
+        .stderr(std::process::Stdio::null())
+        .status()
+        .context("running cp")?
+        .success();
+    let _ = std::fs::remove_file(&from);
+    let _ = std::fs::remove_file(&to);
+    Ok(if ok { Tier::Reflink } else { Tier::Copy })
+}
+
+/// Copies dir `src` to the absent `dst` with the probed tier, through a temp name renamed into place; `base` (when given) goes to `dst/.base`. Returns the tier.
+pub fn copy_tree(src: &Path, dst: &Path, base: Option<&str>) -> Result<Tier> {
+    let parent = dst.parent().context("copy target has no parent")?;
+    let name = dst
+        .file_name()
+        .context("copy target has no name")?
+        .to_string_lossy();
+    let tmp = parent.join(format!(".{name}.tmp-{}", std::process::id()));
+    if present(&tmp)? {
+        std::fs::remove_dir_all(&tmp).with_context(|| format!("removing {}", tmp.display()))?;
+    }
+    let tier = probe(src, parent)?;
+    let mut cp = Command::new("cp");
+    cp.arg("-a");
+    if tier == Tier::Reflink {
+        cp.arg("--reflink=always");
+    }
+    // `src/.` copies the contents, so a link to a dir (an adopted slot) is copied as the dir it names
+    let status = cp
+        .arg("-T")
+        .arg(src.join("."))
+        .arg(&tmp)
+        .status()
+        .context("running cp")?;
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&tmp);
+        bail!(
+            "cp -a ({}) {} -> {} failed: {status}",
+            tier.name(),
+            src.display(),
+            tmp.display()
+        );
+    }
+    let mark = tmp.join(BASE_FILE);
+    match base {
+        Some(c) => std::fs::write(&mark, format!("{c}\n"))
+            .with_context(|| format!("writing {}", mark.display()))?,
+        None => {
+            let _ = std::fs::remove_file(&mark);
+        }
+    }
+    std::fs::rename(&tmp, dst)
+        .with_context(|| format!("renaming {} -> {}", tmp.display(), dst.display()))?;
+    Ok(tier)
+}
+
+/// Adds one to `pool/tier-<name>.count`. Read-modify-write without a lock: two copies ending at once may count one; the count is a tier-usage signal, not an invariant.
+fn count(ws: &Path, tier: Tier) {
+    let file = pool(ws).join(format!("tier-{}.count", tier.name()));
+    let n: u64 = std::fs::read_to_string(&file)
+        .ok()
+        .and_then(|t| t.trim().parse().ok())
+        .unwrap_or(0);
+    if let Err(e) = std::fs::write(&file, format!("{}\n", n + 1)) {
+        eprintln!("out: tier count {}: {e}", file.display());
+    }
+}
+
+/// The one path every build sees its out dir at (workspace-relative): the build namespace binds the checkout's build dir over it ([`build_bind`]), so build.ninja, CMake caches, dep files and DWARF name it in every build dir and a copy stays valid at another real path.
+/// Outside every namespace it is an empty dir, mode 0555 (`tree::enter` makes it): a tool following a logged path there fails loudly instead of reading or writing another checkout's build.
+pub const CANONICAL: &str = "out/build";
+
+/// The build namespace's bind of the checkout's build dir (made if missing) over [`CANONICAL`].
+pub fn build_bind(root: &Path) -> Result<crate::tree::Overlay> {
+    let ws = Layout::of(root)?.workspace().to_owned();
+    let (_, dir) = ensure(root)?;
+    Ok(crate::tree::Overlay {
+        project: CANONICAL.into(),
+        copy: dir,
+        target: ws.join(CANONICAL),
+    })
+}
+
+/// The bound build dir and its workspace; None outside a namespace.
+fn bound() -> Option<(PathBuf, PathBuf)> {
+    let dir = crate::tree::bound(CANONICAL)?;
+    let ws = workspace_of(&dir)?.to_owned();
+    Some((ws, dir))
+}
+
+/// `path` below the bound build dir (as bound, or resolved: the `target` link and `/proc/self/exe` name the resolved path) shown at the canonical path instead, for paths a build output records. Other paths, and any path outside a namespace, unchanged.
+pub fn canonical(path: &Path) -> PathBuf {
+    let Some((ws, dir)) = bound() else {
+        return path.to_owned();
+    };
+    let resolved = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+    match path
+        .strip_prefix(&dir)
+        .or_else(|_| path.strip_prefix(&resolved))
+    {
+        Ok(rest) => ws.join(CANONICAL).join(rest),
+        Err(_) => path.to_owned(),
+    }
+}
+
+/// `dir` with the canonical prefix translated back to the bound build dir, for names that must differ per checkout outside the namespace (remote run dirs); other paths, and any path outside a namespace, unchanged.
+pub fn real(dir: &Path) -> PathBuf {
+    let Some((ws, bound)) = bound() else {
+        return dir.to_owned();
+    };
+    match dir.strip_prefix(ws.join(CANONICAL)) {
+        Ok(rest) if rest.as_os_str().is_empty() => bound,
+        Ok(rest) => bound.join(rest),
+        Err(_) => dir.to_owned(),
+    }
+}
+
+/// The first real build dir path (`<ws>/out/pool/...` or a pre-pool `<ws>/out/slot-<n>`) that `text` names, inside a namespace; None outside, or when `text` names only [`CANONICAL`]. A cache naming one was configured at that real path and would write there.
+pub fn foreign_build_dir(text: &str) -> Option<String> {
+    let (ws, _) = bound()?;
+    let out = format!("{}/out/", ws.display());
+    text.match_indices(&out).find_map(|(at, _)| {
+        let rest = &text[at + out.len()..];
+        let seg = rest.split(['/', ';', '\n', ' ', '"']).next()?;
+        (seg == "pool" || seg.starts_with("slot-")).then(|| format!("{out}{seg}"))
+    })
+}
+
+/// Dir locks this process holds shared, one per id; released at exit or by [`after_build`].
+static HELD: Mutex<Vec<(String, DirLock)>> = Mutex::new(Vec::new());
+
+fn hold(ws: &Path, id: &str) -> Result<()> {
+    let mut held = HELD
+        .lock()
+        .map_err(|_| anyhow::anyhow!("dir lock table poisoned"))?;
+    if held.iter().all(|(m, _)| m != id) {
+        let lock = build_pool::hold_dir(ws, id, || {
+            eprintln!("out: ws/{id} is being pruned, waiting")
+        })?;
+        held.push((id.to_owned(), lock));
+    }
+    Ok(())
+}
+
+/// Drops this process's dir locks and returns their ids.
+fn release_holds() -> Result<BTreeSet<String>> {
+    let mut held = HELD
+        .lock()
+        .map_err(|_| anyhow::anyhow!("dir lock table poisoned"))?;
+    Ok(held.drain(..).map(|(id, _lock)| id).collect())
+}
+
+/// The end of a checkout's build (`native`, `check`, `cross`, the harness commands): the stale incremental sessions of the trees it wrote go, one line per build dir. `result` passes through unless the prune fails.
+pub fn after_build(root: &Path, result: Result<ExitCode>) -> Result<ExitCode> {
+    match (result, finish_build(root)) {
+        (result, Ok(())) => result,
+        (Ok(_), Err(e)) => Err(e),
+        (Err(e), Err(prune)) => {
+            eprintln!("session prune: {prune:#}");
+            Err(e)
+        }
+    }
+}
+
+/// Prunes the sessions of the dirs this process held and of the checkout's own.
+fn finish_build(root: &Path) -> Result<()> {
+    let ws = Layout::of(root)?.workspace().to_owned();
+    let now = unit_use::now()?;
+    // a shared hold blocks the prune, so the dirs this process resolved are released first
+    let mut ids = release_holds()?;
+    ids.insert(checkout_id(root)?);
+    for id in ids {
+        let line = match out_prune::prune_sessions(&ws, &id, now)? {
+            Outcome::NotBuilt => format!("session prune: ws/{id}: not built"),
+            Outcome::Busy => {
+                format!("session prune: ws/{id}: busy, skipped: another process holds it")
+            }
+            Outcome::Done(plans) => out_prune::sessions_line(&format!("ws/{id}"), &plans),
+        };
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// `<checkout>/target` as found on disk: nothing, a link (its target), a real dir, or another file.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Entry {
+    Absent,
+    Link(PathBuf),
+    Dir,
+    Other,
+}
+
+/// What `link` is now; does not follow a symlink.
+pub fn entry(link: &Path) -> Result<Entry> {
+    let meta = match std::fs::symlink_metadata(link) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Entry::Absent),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", link.display())),
+    };
+    if meta.file_type().is_symlink() {
+        let to = std::fs::read_link(link).with_context(|| format!("reading {}", link.display()))?;
+        Ok(Entry::Link(to))
+    } else if meta.is_dir() {
+        Ok(Entry::Dir)
+    } else {
+        Ok(Entry::Other)
+    }
+}
+
+/// One change to a checkout's `target/`. `link_steps` plans them, `apply_steps` runs them in order.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Step {
+    /// Create the build dir's target dir.
+    Mkdir(PathBuf),
+    /// Move a checkout's own real `target/` into an absent build-dir target, keeping its build.
+    Adopt { from: PathBuf, to: PathBuf },
+    /// Remove a checkout's own real `target/` on another filesystem than its build dir: rename cannot cross (EXDEV), and cargo's rebuild costs less than a 10-30 GB copy.
+    Discard(PathBuf),
+    /// Remove a checkout's own real `target/`: its build dir has a target already (copied from the base).
+    Remove(PathBuf),
+    /// Make `at` a link to `to`, creating `to`; replaces a link at `at`.
+    Link { at: PathBuf, to: PathBuf },
+}
+
+/// The target `<checkout>/target` links to: the resolved build dir's `target/` (an adopted slot keeps the link it had).
+fn target_of(dir: &Path) -> PathBuf {
+    std::fs::canonicalize(dir)
+        .unwrap_or_else(|_| dir.to_owned())
+        .join(TARGET)
+}
+
+/// Steps that make `link` (`<checkout>/target`) a link to `want`: none when it is one already (a missing `want` is created), else a link, after a real dir is moved into an absent `want` or removed.
+pub fn link_steps(link: &Path, want: &Path) -> Result<Vec<Step>> {
+    let relink = Step::Link {
+        at: link.to_owned(),
+        to: want.to_owned(),
+    };
+    Ok(match entry(link)? {
+        Entry::Link(to) if to.as_path() == want => {
+            if want.exists() {
+                Vec::new()
+            } else {
+                vec![Step::Mkdir(want.to_owned())]
+            }
+        }
+        Entry::Absent | Entry::Link(_) => vec![relink],
+        Entry::Dir if want.exists() => vec![Step::Remove(link.to_owned()), relink],
+        Entry::Dir if !same_filesystem(link, want)? => vec![Step::Discard(link.to_owned()), relink],
+        Entry::Dir => vec![
+            Step::Adopt {
+                from: link.to_owned(),
+                to: want.to_owned(),
+            },
+            relink,
+        ],
+        Entry::Other => bail!("{} is a file: remove it, then rerun", link.display()),
+    })
+}
+
+/// Whether `dir` and `want` (missing: its nearest existing ancestor, where it will be created) are on one filesystem, i.e. a rename between them works.
+fn same_filesystem(dir: &Path, want: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let dev = |p: &Path| {
+        std::fs::metadata(p)
+            .map(|m| m.dev())
+            .with_context(|| format!("reading {}", p.display()))
+    };
+    let existing = want
+        .ancestors()
+        .find(|p| p.exists())
+        .unwrap_or(Path::new("/"));
+    Ok(dev(dir)? == dev(existing)?)
+}
+
+/// Runs `steps` in order; the only place they change anything.
+pub fn apply_steps(steps: &[Step]) -> Result<()> {
+    for step in steps {
+        match step {
+            Step::Remove(p) | Step::Discard(p) => {
+                std::fs::remove_dir_all(p).with_context(|| format!("removing {}", p.display()))?;
+            }
+            Step::Mkdir(p) => {
+                std::fs::create_dir_all(p).with_context(|| format!("creating {}", p.display()))?;
+            }
+            Step::Adopt { from, to } => {
+                let parent = to.parent().unwrap_or(to);
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+                std::fs::rename(from, to)
+                    .with_context(|| format!("moving {} -> {}", from.display(), to.display()))?;
+            }
+            Step::Link { at, to } => {
+                std::fs::create_dir_all(to)
+                    .with_context(|| format!("creating {}", to.display()))?;
+                if let Entry::Link(_) = entry(at)? {
+                    std::fs::remove_file(at)
+                        .with_context(|| format!("unlinking {}", at.display()))?;
+                }
+                std::os::unix::fs::symlink(to, at)
+                    .with_context(|| format!("linking {} -> {}", at.display(), to.display()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn describe_step(step: &Step) -> String {
+    match step {
+        Step::Mkdir(p) => format!("create {}", p.display()),
+        Step::Adopt { from, to } => {
+            format!(
+                "move {} -> {} (keeps its build)",
+                from.display(),
+                to.display()
+            )
+        }
+        Step::Remove(p) => format!("remove {} (the build dir has a target)", p.display()),
+        Step::Discard(p) => format!(
+            "remove {} (on another filesystem than the build dir: cannot be moved; cargo rebuilds it)",
+            p.display()
+        ),
+        Step::Link { at, to } => format!("link {} -> {}", at.display(), to.display()),
+    }
+}
+
+/// Links the checkout's `target/` to its build dir's, when the dir exists. Run by the outermost xtask process as it ends (cli): the running binary may live in the real `target/` this removes, and the namespace re-exec still needs it.
+pub fn settle_target(root: &Path) -> Result<()> {
+    if std::env::var_os(crate::tree::ENV).is_some() {
+        return Ok(());
+    }
+    let ws = Layout::of(root)?.workspace().to_owned();
+    let dir = dir_of(&ws, &checkout_id(root)?);
+    if !present(&dir)? {
+        return Ok(());
+    }
+    let steps = link_steps(&root.join(TARGET), &target_of(&dir))?;
+    for step in &steps {
+        println!("out: target: {}", describe_step(step));
+    }
+    apply_steps(&steps)
+}
+
+/// The `target/` line of `out show`.
+fn describe_entry(e: &Entry, want: &Path) -> String {
+    match e {
+        Entry::Link(to) if to.as_path() == want => format!("linked to {}", want.display()),
+        Entry::Link(to) => format!(
+            "links to {}, not this build dir's target: relinked when this command ends",
+            to.display()
+        ),
+        Entry::Dir => "real dir, not linked: moved or removed when this command ends".to_owned(),
+        Entry::Absent => "missing: linked when this command ends".to_owned(),
+        Entry::Other => "a file: remove it".to_owned(),
+    }
+}
+
+/// Deletes build dir `dir`: a dir with its contents; an adopted slot link with the slot's contents (the slot dir stays: it may be a mount point), `lost+found` kept.
+fn remove_build_dir(dir: &Path) -> Result<()> {
+    if let Entry::Link(slot) = entry(dir)? {
+        for e in std::fs::read_dir(&slot).with_context(|| format!("reading {}", slot.display()))? {
+            let e = e?;
+            if e.file_name() == "lost+found" {
+                continue;
+            }
+            let p = e.path();
+            if e.file_type()?.is_dir() {
+                std::fs::remove_dir_all(&p)
+            } else {
+                std::fs::remove_file(&p)
+            }
+            .with_context(|| format!("removing {}", p.display()))?;
+        }
+        return std::fs::remove_file(dir).with_context(|| format!("unlinking {}", dir.display()));
+    }
+    std::fs::remove_dir_all(dir).with_context(|| format!("removing {}", dir.display()))
+}
+
+/// Land: the checkout's `target/` and build dir leave with it. Refused while a process holds the dir. Returns land's summary line.
+pub fn leave(root: &Path, ws: &Path) -> Result<String> {
+    let id = checkout_id(root)?;
+    let mut removed = Vec::new();
+    let link = root.join(TARGET);
+    match entry(&link)? {
+        Entry::Link(_) => {
+            std::fs::remove_file(&link).with_context(|| format!("unlinking {}", link.display()))?;
+            removed.push(link.display().to_string());
+        }
+        Entry::Dir => {
+            std::fs::remove_dir_all(&link)
+                .with_context(|| format!("removing {}", link.display()))?;
+            removed.push(link.display().to_string());
+        }
+        Entry::Absent | Entry::Other => {}
+    }
+    let dir = dir_of(ws, &id);
+    if present(&dir)? {
+        let Some(_lock) = build_pool::try_lock_dir(ws, &id)? else {
+            bail!(
+                "{} is held by a running process: not removed",
+                dir.display()
+            );
+        };
+        remove_build_dir(&dir)?;
+        removed.push(dir.display().to_string());
+    }
+    Ok(if removed.is_empty() {
+        "no build dir".to_owned()
+    } else {
+        format!("removed: {}", removed.join(", "))
+    })
+}
+
+/// Copies the main checkout's build dir to `base/<HEAD>` (dry run unless `execute`). Returns the summary line.
+pub fn publish(root: &Path, execute: bool) -> Result<String> {
+    let ws = Layout::of(root)?.workspace().to_owned();
+    let id = checkout_id(root)?;
+    ensure!(
+        id == MAIN_ID,
+        "only the main checkout publishes a base (this is worktree {id})"
+    );
+    let head = git(Some(root), &["rev-parse", "HEAD"])?;
+    let dst = base_of(&ws, &head);
+    let src = dir_of(&ws, &id);
+    if present(&dst)? {
+        return Ok(format!("out: base/{head} exists, not published again"));
+    }
+    ensure!(
+        present(&src)?,
+        "{} does not exist: nothing to publish",
+        src.display()
+    );
+    if !execute {
+        return Ok(format!(
+            "dry run: would copy {} -> {} (add --execute)",
+            src.display(),
+            dst.display()
+        ));
+    }
+    // this process's own shared hold would refuse the exclusive lock
+    release_holds()?;
+    let Some(_lock) = build_pool::try_lock_dir(&ws, &id)? else {
+        bail!(
+            "{} is held by a running process: not published",
+            src.display()
+        );
+    };
+    let parent = dst.parent().context("base has no parent")?;
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let tier = copy_tree(&src, &dst, None)?;
+    count(&ws, tier);
+    Ok(format!("out: base/{head} from ws/{id} ({})", tier.name()))
+}
+
+/// Free bytes for unprivileged writes on the filesystem holding `path`.
+fn free_bytes(path: &Path) -> Result<u64> {
+    let st = rustix::fs::statvfs(path).with_context(|| format!("statvfs {}", path.display()))?;
+    Ok(st.f_bavail * st.f_frsize)
+}
+
+/// The build dirs under the pool: (id, path), sorted; temp names (`.`-prefixed, a crashed copy) included as written.
+fn build_dirs(ws: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let dir = pool(ws).join("ws");
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return Ok(Vec::new());
+    };
+    let mut found = Vec::new();
+    for e in rd {
+        let e = e?;
+        found.push((e.file_name().to_string_lossy().into_owned(), e.path()));
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// `(id, path)` of build dirs.
+type Dirs = Vec<(String, PathBuf)>;
+
+/// What `out prune` deletes: build dirs whose id no live checkout has (temp leftovers included) and bases beyond the newest [`KEEP_BASES`].
+fn orphans(ws: &Path, live: &BTreeSet<String>) -> Result<(Dirs, Vec<PathBuf>)> {
+    let dirs = build_dirs(ws)?
+        .into_iter()
+        .filter(|(id, _)| !live.contains(id))
+        .collect();
+    let old = bases(ws)?
+        .into_iter()
+        .skip(KEEP_BASES)
+        .map(|c| base_of(ws, &c))
+        .collect();
+    Ok((dirs, old))
+}
+
+fn age(path: &Path) -> String {
+    std::fs::symlink_metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map_or("?".to_owned(), |d| {
+            format!("{:.1} h", d.as_secs_f64() / 3600.0)
+        })
+}
+
+/// The ids of the live checkouts of `root`'s repository.
+fn live_of(root: &Path) -> Result<BTreeSet<String>> {
+    let common = PathBuf::from(git(
+        Some(root),
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?);
+    live_ids(&common)
+}
+
+/// The ids of the build dirs whose checkout is live (`root`'s repository).
+pub fn live_dirs(root: &Path) -> Result<Vec<String>> {
+    let ws = Layout::of(root)?.workspace().to_owned();
+    let live = live_of(root)?;
+    Ok(build_dirs(&ws)?
+        .into_iter()
+        .map(|(id, _)| id)
+        .filter(|id| live.contains(id))
+        .collect())
+}
+
+pub fn run(root: &Path, cmd: &Out) -> Result<ExitCode> {
+    let ws = Layout::of(root)?.workspace().to_owned();
+    let live = live_of(root)?;
+    match cmd {
+        Out::Show => {
+            let id = checkout_id(root)?;
+            let dir = dir_of(&ws, &id);
+            if present(&dir)? {
+                let real = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+                let base = std::fs::read_to_string(dir.join(BASE_FILE))
+                    .map_or("no base".to_owned(), |c| format!("from base/{}", c.trim()));
+                println!("out: ws/{id}: {} ({base})", real.display());
+                let state = describe_entry(&entry(&root.join(TARGET))?, &target_of(&dir));
+                println!("target: {state}");
+            } else {
+                println!("out: ws/{id}: not made yet: the next build command makes it");
+            }
+            let p = pool(&ws);
+            match free_bytes(&p) {
+                Ok(b) => println!(
+                    "pool: {} free {:.1} GiB",
+                    p.display(),
+                    b as f64 / 1_073_741_824.0
+                ),
+                Err(e) => println!("pool: {}: {e:#}", p.display()),
+            }
+            for c in bases(&ws)? {
+                println!("base/{c}: {}", age(&base_of(&ws, &c)));
+            }
+            for (id, path) in build_dirs(&ws)? {
+                let state = if live.contains(&id) { "live" } else { "orphan" };
+                println!("ws/{id}: {state}, {}", age(&path));
+            }
+        }
+        Out::Prune {
+            units: true,
+            older_than,
+            execute,
+        } => {
+            let sweep = out_prune::sweep(&ws, &live_dirs(root)?, true, *older_than, *execute)?;
+            return Ok(if sweep.failed == 0 {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            });
+        }
+        Out::Prune {
+            units: false,
+            execute,
+            ..
+        } => {
+            let (dirs, old) = orphans(&ws, &live)?;
+            let mut failed = 0;
+            for (id, path) in &dirs {
+                if !*execute {
+                    println!("orphan ws/{id}: {} (checkout gone)", path.display());
+                    continue;
+                }
+                match build_pool::try_lock_dir(&ws, id)? {
+                    None => println!("orphan ws/{id}: busy, skipped: a process holds it"),
+                    Some(_lock) => match remove_build_dir(path) {
+                        Ok(()) => println!("orphan ws/{id}: removed"),
+                        Err(e) => {
+                            failed += 1;
+                            println!("orphan ws/{id}: FAILED: {e:#}");
+                        }
+                    },
+                }
+            }
+            for path in &old {
+                if !*execute {
+                    println!("old base {}", path.display());
+                    continue;
+                }
+                match std::fs::remove_dir_all(path) {
+                    Ok(()) => println!("old base {}: removed", path.display()),
+                    Err(e) => {
+                        failed += 1;
+                        println!("old base {}: FAILED: {e}", path.display());
+                    }
+                }
+            }
+            let verb = if *execute {
+                "removed"
+            } else {
+                "dry run, would remove (add --execute)"
+            };
+            println!(
+                "out prune: {verb} {} orphan build dir(s) and {} old base(s)",
+                dirs.len(),
+                old.len()
+            );
+            if failed > 0 {
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+        Out::Publish { execute } => println!("{}", publish(root, *execute)?),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("xtask-out-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("scratch");
+        d
+    }
+
+    fn put(path: &Path) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+        std::fs::write(path, "x\n").expect("file");
+    }
+
+    #[test]
+    fn ids_are_main_or_the_worktree_name() {
+        let common = Path::new("/r/.git");
+        assert_eq!(id_of(common, common).expect("main"), MAIN_ID);
+        assert_eq!(
+            id_of(&common.join("worktrees/snap-x3"), common).expect("worktree"),
+            "snap-x3"
+        );
+        assert!(id_of(&common.join("worktrees/repo"), common).is_err());
+        assert!(id_of(Path::new("/elsewhere/.git"), common).is_err());
+    }
+
+    #[test]
+    fn workspace_of_inverts_dir_of() {
+        let ws = Path::new("/home/u/atl-next");
+        assert_eq!(workspace_of(&dir_of(ws, "a")), Some(ws));
+    }
+
+    #[test]
+    fn live_ids_skip_worktrees_whose_checkout_is_gone() {
+        let d = scratch("live");
+        let common = d.join("repo/.git");
+        for (name, checkout) in [("here", d.join("wt/here")), ("gone", d.join("wt/gone"))] {
+            put(&common.join("worktrees").join(name).join("gitdir"));
+            std::fs::write(
+                common.join("worktrees").join(name).join("gitdir"),
+                format!("{}\n", checkout.join(".git").display()),
+            )
+            .expect("gitdir");
+        }
+        std::fs::create_dir_all(d.join("wt/here")).expect("checkout");
+        let ids = live_ids(&common).expect("ids");
+        assert_eq!(ids, BTreeSet::from([MAIN_ID.to_owned(), "here".to_owned()]));
+        std::fs::remove_dir_all(&d).expect("cleanup");
+    }
+
+    /// Both tiers copy the same tree and leave no temp name; `/dev/shm` (tmpfs, no reflink) must probe `Copy`. The `Reflink` tier is gated on the btrfs pool by hand (`cargo xtask out show` after a fresh worktree's first build): a test cannot assume a reflink filesystem.
+    #[test]
+    fn copy_tree_copies_through_a_temp_name_with_the_probed_tier() {
+        let d = PathBuf::from("/dev/shm").join(format!("xtask-out-tier-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        put(&d.join("base/c1/build.ninja"));
+        put(&d.join("base/c1/sub/x.o"));
+        std::os::unix::fs::symlink("sub/x.o", d.join("base/c1/link")).expect("link");
+        std::fs::create_dir_all(d.join("ws")).expect("ws");
+        assert_eq!(
+            probe(&d.join("base/c1"), &d.join("ws")).expect("probe"),
+            Tier::Copy
+        );
+        let tier = copy_tree(&d.join("base/c1"), &d.join("ws/a"), Some("c1")).expect("copy");
+        assert_eq!(tier, Tier::Copy);
+        assert!(d.join("ws/a/sub/x.o").is_file());
+        assert_eq!(
+            std::fs::read_link(d.join("ws/a/link")).expect("link kept"),
+            Path::new("sub/x.o")
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.join("ws/a").join(BASE_FILE)).expect(".base"),
+            "c1\n"
+        );
+        let names: Vec<String> = std::fs::read_dir(d.join("ws"))
+            .expect("ws")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a".to_owned()],
+            "a temp name or probe file stayed"
+        );
+        assert!(!d.join("base/c1").join(".atl-reflink-probe").exists());
+        std::fs::remove_dir_all(&d).expect("cleanup");
+    }
+
+    #[test]
+    fn a_slot_record_is_adopted_as_a_link_and_deleted() {
+        let ws = scratch("adopt");
+        put(&ws.join("out/slot-4/build.ninja"));
+        std::fs::create_dir_all(pool(&ws).join("ws")).expect("pool");
+        let record = ws.join("git/atl-out-slot");
+        put(&record);
+        std::fs::write(&record, "4\n").expect("record");
+        let line = adopt(&ws, "wt", &record).expect("adopt").expect("a record");
+        assert!(line.contains("adopted"), "{line}");
+        assert_eq!(
+            entry(&dir_of(&ws, "wt")).expect("entry"),
+            Entry::Link(ws.join("out/slot-4"))
+        );
+        assert!(!record.exists());
+        assert_eq!(adopt(&ws, "wt", &record).expect("again"), None);
+        // deleting the adopted dir empties the slot and keeps the slot dir (a mount point)
+        remove_build_dir(&dir_of(&ws, "wt")).expect("remove");
+        assert!(!present(&dir_of(&ws, "wt")).expect("present"));
+        assert!(ws.join("out/slot-4").is_dir());
+        assert!(!ws.join("out/slot-4/build.ninja").exists());
+        std::fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    #[test]
+    fn prune_lists_dirs_of_gone_checkouts_and_bases_beyond_the_newest_two() {
+        let ws = scratch("orphans");
+        for id in ["repo", "live", "gone", ".x.tmp-1"] {
+            std::fs::create_dir_all(dir_of(&ws, id)).expect("dir");
+        }
+        for (i, c) in ["c1", "c2", "c3"].iter().enumerate() {
+            let b = base_of(&ws, c);
+            std::fs::create_dir_all(&b).expect("base");
+            let t =
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000 + i as u64);
+            std::fs::File::open(&b)
+                .expect("open")
+                .set_modified(t)
+                .expect("mtime");
+        }
+        let live = BTreeSet::from(["repo".to_owned(), "live".to_owned()]);
+        let (dirs, old) = orphans(&ws, &live).expect("orphans");
+        let ids: Vec<&str> = dirs.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec![".x.tmp-1", "gone"]);
+        assert_eq!(old, vec![base_of(&ws, "c1")]);
+        assert_eq!(bases(&ws).expect("bases"), vec!["c3", "c2", "c1"]);
+        std::fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    #[test]
+    fn a_fresh_checkout_links_its_build_dir_target() {
+        let d = scratch("link-fresh");
+        let root = d.join("wt/this");
+        std::fs::create_dir_all(&root).expect("checkout");
+        let want = d.join("pool/ws/this/target");
+        let steps = link_steps(&root.join(TARGET), &want).expect("steps");
+        assert_eq!(
+            steps,
+            vec![Step::Link {
+                at: root.join(TARGET),
+                to: want.clone(),
+            }]
+        );
+        apply_steps(&steps).expect("apply");
+        assert_eq!(
+            entry(&root.join(TARGET)).expect("entry"),
+            Entry::Link(want.clone())
+        );
+        assert!(
+            link_steps(&root.join(TARGET), &want)
+                .expect("again")
+                .is_empty()
+        );
+        std::fs::remove_dir_all(&d).expect("cleanup");
+    }
+
+    #[test]
+    fn an_own_real_target_is_moved_into_an_absent_build_dir_target() {
+        let d = scratch("link-adopt");
+        let root = d.join("wt/this");
+        put(&root.join(TARGET).join("debug/build.txt"));
+        let want = d.join("pool/ws/this/target");
+        let steps = link_steps(&root.join(TARGET), &want).expect("steps");
+        assert_eq!(
+            steps[0],
+            Step::Adopt {
+                from: root.join(TARGET),
+                to: want.clone(),
+            }
+        );
+        apply_steps(&steps).expect("apply");
+        assert!(want.join("debug/build.txt").is_file());
+        std::fs::remove_dir_all(&d).expect("cleanup");
+    }
+
+    /// The build dir on another filesystem (the pool's own mount; here /dev/shm's tmpfs): the own target is removed, not renamed (EXDEV, os error 18).
+    #[test]
+    fn an_own_real_target_on_another_filesystem_is_discarded() {
+        let d = scratch("link-xdev");
+        let root = d.join("wt/this");
+        put(&root.join(TARGET).join("own.txt"));
+        let disk = PathBuf::from("/dev/shm").join(format!("xtask-out-xdev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&disk);
+        std::fs::create_dir_all(&disk).expect("disk");
+        let want = disk.join(TARGET);
+        assert!(
+            !same_filesystem(&root.join(TARGET), &want).expect("dev"),
+            "fixture: /dev/shm shares the scratch filesystem, the case is not exercised"
+        );
+        let steps = link_steps(&root.join(TARGET), &want).expect("steps");
+        assert_eq!(steps[0], Step::Discard(root.join(TARGET)));
+        apply_steps(&steps).expect("apply");
+        assert!(want.is_dir());
+        std::fs::remove_dir_all(&disk).expect("cleanup disk");
+        std::fs::remove_dir_all(&d).expect("cleanup");
+    }
+
+    #[test]
+    fn an_own_real_target_is_removed_when_the_build_dir_has_one() {
+        let d = scratch("link-remove");
+        let root = d.join("wt/this");
+        let want = d.join("pool/ws/this/target");
+        put(&want.join("kept.txt"));
+        put(&root.join(TARGET).join("own.txt"));
+        let steps = link_steps(&root.join(TARGET), &want).expect("steps");
+        assert_eq!(steps[0], Step::Remove(root.join(TARGET)));
+        apply_steps(&steps).expect("apply");
+        assert!(want.join("kept.txt").is_file());
+        assert_eq!(entry(&root.join(TARGET)).expect("entry"), Entry::Link(want));
+        std::fs::remove_dir_all(&d).expect("cleanup");
+    }
+}

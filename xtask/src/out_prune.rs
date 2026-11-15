@@ -1,25 +1,24 @@
 // SPDX-License-Identifier: MIT
-//! `cargo xtask slot prune`: deletes the cargo units of the target trees that no recorded build used for `--older-than` days, and the incremental sessions no build will load.
-//! Trees (a profile dir holding `.fingerprint`, or `<triple>/<profile>`) under these roots: each slot's `cargo`, `cargo-converter`, `cargo-converter-test`, `target` (the default of a slotted checkout) and `gl/cargo*`; with `--all` also `repo/target` and `out/egl-driver/<checkout>/cargo*`, which no slot owns.
+//! `cargo xtask out prune --units`: deletes the cargo units of the target trees that no recorded build used for `--older-than` days, and the incremental sessions no build will load.
+//! Trees (a profile dir holding `.fingerprint`, or `<triple>/<profile>`) under these roots: each build dir's `cargo`, `cargo-converter`, `cargo-converter-test`, `target` (what a checkout's `target/` links to) and `gl/cargo*`; with the unowned trees also a real `repo/target` and `out/egl-driver/<checkout>/cargo*`, which no build dir owns.
 //! Use is the record each recorded build writes (`unit_use`): a unit's last reported build, fresh or rebuilt. A unit with no entry is judged by its fingerprint dir's mtime, which cargo moves when it rebuilds the unit: approximate, and the worst case is one rebuild.
 //! A unit is `.fingerprint/<pkg>-<hash>/`, `build/<pkg>-<hash>/` (build-script output), the `deps/` and `examples/` files `*-<hash>` or `*-<hash>.<ext>`, and the uplifted hard links (`<tree>/<name>`) of those files; `<hash>` is 16 lowercase hex digits.
 //! Incremental (`<tree>/incremental/<crate>/`): keeps the newest finalized session, the one rustc loads (`rustc_incremental/src/persist/fs.rs`, `find_source_directory_in_iter`, rustc 1.99.1; rustc reads an older one only when copying the newest fails). Removed: every other finalized session, `-working` sessions older than 10 s (rustc's own grace), and lock files whose session is gone. A held lock is never touched.
-//! Kept, never deleted: entries that are no unit, `deps/` and `examples/` files no unit owns (counted as orphans). A tree whose record cannot be read refuses its slot.
-//! Busy: a slot's build holds the slot lock (`build_pool::hold_slot`); prune takes it exclusive without waiting and skips the slot. Every tree also has cargo's own build-dir lock (`<tree>/.cargo-lock`), taken without waiting and held from plan to removal: a tree a build holds is skipped and reported.
-//! Symlinks are refused, never followed: a link under a root could point the prune outside it.
+//! Kept, never deleted: entries that are no unit, `deps/` and `examples/` files no unit owns (counted as orphans). A tree whose record cannot be read refuses its build dir.
+//! Busy: a build holds the dir lock (`build_pool::hold_dir`); prune takes it exclusive without waiting and skips the dir. Every tree also has cargo's own build-dir lock (`<tree>/.cargo-lock`), taken without waiting and held from plan to removal: a tree a build holds is skipped and reported.
+//! Symlinks are refused, never followed: a link under a root could point the prune outside it. One exception, `out::LEGACY_RECORD`'s: a build dir that is a link to `out/slot-<n>` (an adopted pre-pool slot).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
 
 use anyhow::{Context, Result, ensure};
 use rustix::fs::{FlockOperation, flock};
 
 use crate::build_pool;
-use crate::slot::{self, Holder};
+use crate::out;
 use crate::unit_use::{self, BUILD, DEPS, EXAMPLES, FINGERPRINT};
 
 /// Default `--older-than`, in days: a unit no cargo build used for this long is stale. First guess, not measured. A shorter cutoff frees more but recompiles stable dependencies more often; a rebuilt dependency also recompiles its dependents (2026-11-08: pruning one unit recompiled it and its dependent crate). Re-fit from the rebuild counts after a few lands.
@@ -28,16 +27,16 @@ pub const PRUNE_AFTER_DAYS: u64 = 14;
 const SECS_PER_DAY: u64 = 86_400;
 const MIB: f64 = 1_048_576.0;
 const GIB: f64 = 1_073_741_824.0;
-/// Target roots directly under a slot: xtask's `--target-dir` names, and `target`, the default a slotted checkout links to (slot.rs).
-const SLOT_ROOTS: [&str; 4] = [
+/// Target roots directly under a build dir: xtask's `--target-dir` names, and `target`, what a checkout's `target/` links to (out.rs).
+const DIR_ROOTS: [&str; 4] = [
     "cargo",
     crate::packages::TARGET_DIR,
     crate::packages::TEST_TARGET_DIR,
     "target",
 ];
-/// `<slot>/gl/cargo*`: the GL probes' target roots.
+/// `<build dir>/gl/cargo*`: the GL probes' target roots.
 const GL_DIR: &str = "gl";
-/// `<ws>/out/egl-driver/<checkout>/cargo*`: EGL driver probes, not under a slot.
+/// `<ws>/out/egl-driver/<checkout>/cargo*`: EGL driver probes, not under a build dir.
 const EGL_DIR: &str = "egl-driver";
 /// Prefix of the root names under `gl/` and `egl-driver/<checkout>/`.
 const CARGO_ROOT: &str = "cargo";
@@ -51,7 +50,7 @@ const LOCK_EXT: &str = ".lock";
 /// rustc's grace before it collects a `-working` session (fs.rs `is_old_enough_to_be_collected`), in micros.
 const SESSION_GRACE_MICROS: u64 = 10_000_000;
 
-/// What one slot's prune found: no out dir, a build holds it, or one plan per target tree.
+/// What one build dir's prune found: no dir, a build holds it, or one plan per target tree.
 #[derive(Debug)]
 pub enum Outcome {
     NotBuilt,
@@ -62,9 +61,9 @@ pub enum Outcome {
 /// One target tree: its units and incremental sessions, and what the stale ones take. `busy`: a cargo build holds the tree; nothing is planned.
 #[derive(Debug, Default)]
 pub struct TreePlan {
-    /// The root it sits under, relative to the workspace, e.g. `out/slot-1/cargo`.
+    /// The root it sits under, relative to the workspace, e.g. `out/pool/ws/repo/cargo`.
     pub root: String,
-    /// The tree relative to the workspace, e.g. `out/slot-1/cargo/release`.
+    /// The tree relative to the workspace, e.g. `out/pool/ws/repo/cargo/release`.
     pub tree: String,
     pub dir: PathBuf,
     pub busy: bool,
@@ -112,7 +111,7 @@ pub struct Session {
     _held: Option<File>,
 }
 
-/// Totals of one sweep: stale units, stale sessions and their bytes, and the slots or trees that failed.
+/// Totals of one sweep: stale units, stale sessions and their bytes, and the build dirs or trees that failed.
 #[derive(Debug, Default)]
 pub struct Sweep {
     pub units: usize,
@@ -127,44 +126,11 @@ struct Found {
     dir: PathBuf,
 }
 
-/// `cargo xtask slot prune`. Exactly one of `slot` / `all` names the scope; `all` adds the trees no slot owns. A dry run unless `execute`.
-pub fn run(
-    ws: &Path,
-    holders: &[Holder],
-    pool: u32,
-    slot: Option<u32>,
-    all: bool,
-    older_than: u64,
-    execute: bool,
-) -> Result<ExitCode> {
-    ensure!(
-        slot.is_some() != all,
-        "name one slot (`slot prune 2`) or every slot (`slot prune --all`)"
-    );
-    let slots: Vec<u32> = match slot {
-        Some(n) => {
-            ensure!(
-                (1..=pool).contains(&n),
-                "slot {n} is outside 1..={pool} (`build.slots`)"
-            );
-            vec![n]
-        }
-        None => (1..=pool).collect(),
-    };
-    let sweep = sweep(ws, holders, &slots, all, older_than, execute)?;
-    Ok(if sweep.failed == 0 {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    })
-}
-
-/// Prunes each slot of `slots`, then with `unslotted` the trees no slot owns. Prints one line per target tree, one per root and a summary. Busy and failed scopes are reported; a failure is counted in `failed`, not returned.
+/// Prunes each build dir of `ids`, then with `unowned` the trees no build dir owns. Prints one line per target tree, one per root and a summary. Busy and failed scopes are reported; a failure is counted in `failed`, not returned.
 pub fn sweep(
     ws: &Path,
-    holders: &[Holder],
-    slots: &[u32],
-    unslotted: bool,
+    ids: &[String],
+    unowned: bool,
     older_than: u64,
     execute: bool,
 ) -> Result<Sweep> {
@@ -174,37 +140,25 @@ pub fn sweep(
     let now = unit_use::now()?;
     let mut total = Sweep::default();
     let mut roots: BTreeMap<String, Sweep> = BTreeMap::new();
-    for &n in slots {
-        match prune_slot(ws, n, cutoff, now, execute) {
-            Ok(Outcome::NotBuilt) => println!("slot {n}: not built"),
-            Ok(Outcome::Busy) => {
-                let record: Vec<String> = holders
-                    .iter()
-                    .filter(|h| h.slot == n)
-                    .map(|h| h.checkout.display().to_string())
-                    .collect();
-                let record = if record.is_empty() {
-                    String::new()
-                } else {
-                    format!(" (record: {})", record.join(", "))
-                };
-                println!("slot {n}: busy, skipped: a build holds its lock{record}");
-            }
-            Ok(Outcome::Done(plans)) if plans.is_empty() => println!("slot {n}: no cargo trees"),
+    for id in ids {
+        match prune_dir(ws, id, cutoff, now, execute) {
+            Ok(Outcome::NotBuilt) => println!("ws/{id}: not built"),
+            Ok(Outcome::Busy) => println!("ws/{id}: busy, skipped: a build holds its lock"),
+            Ok(Outcome::Done(plans)) if plans.is_empty() => println!("ws/{id}: no cargo trees"),
             Ok(Outcome::Done(plans)) => report(&plans, &mut total, &mut roots),
             Err(e) => {
                 total.failed += 1;
-                println!("slot {n}: FAILED: {e:#}");
+                println!("ws/{id}: FAILED: {e:#}");
             }
         }
     }
-    if unslotted {
-        match prune_unslotted(ws, cutoff, now, execute) {
-            Ok(plans) if plans.is_empty() => println!("unslotted: no cargo trees"),
+    if unowned {
+        match prune_unowned(ws, cutoff, now, execute) {
+            Ok(plans) if plans.is_empty() => println!("unowned: no cargo trees"),
             Ok(plans) => report(&plans, &mut total, &mut roots),
             Err(e) => {
                 total.failed += 1;
-                println!("unslotted: FAILED: {e:#}");
+                println!("unowned: FAILED: {e:#}");
             }
         }
     }
@@ -222,7 +176,7 @@ pub fn sweep(
         "dry run, would remove (add --execute)"
     };
     println!(
-        "slot prune: {verb} {} stale units and {} stale sessions, {}",
+        "unit prune: {verb} {} stale units and {} stale sessions, {}",
         total.units,
         total.sessions,
         human(total.bytes)
@@ -262,7 +216,7 @@ fn report(plans: &[TreePlan], total: &mut Sweep, roots: &mut BTreeMap<String, Sw
     }
 }
 
-/// What a prune removes: units and sessions (`slot prune`), or sessions only (the end of a build, `prune_sessions`).
+/// What a prune removes: units and sessions (`out prune --units`), or sessions only (the end of a build, `prune_sessions`).
 #[derive(Clone, Copy, Debug)]
 enum Scope {
     /// units last used `cutoff` seconds or more ago, and the stale sessions
@@ -271,48 +225,35 @@ enum Scope {
     SessionsOnly,
 }
 
-/// Plans slot `n`'s prune and, with `execute`, removes what it names. Holds the slot's lock for the whole call.
-pub fn prune_slot(ws: &Path, n: u32, cutoff: u64, now: u64, execute: bool) -> Result<Outcome> {
-    prune_slot_in(ws, n, Scope::Everything { cutoff }, now, execute)
+/// Plans build dir `id`'s prune and, with `execute`, removes what it names. Holds the dir's lock for the whole call.
+pub fn prune_dir(ws: &Path, id: &str, cutoff: u64, now: u64, execute: bool) -> Result<Outcome> {
+    prune_dir_in(ws, id, Scope::Everything { cutoff }, now, execute)
 }
 
-/// The end of a build in slot `n` (`slot::after_build`): removes the slot's stale incremental sessions, never units. Busy while any process holds the slot, so the caller drops its own shared hold first.
-pub fn prune_sessions(ws: &Path, n: u32, now: u64) -> Result<Outcome> {
-    prune_slot_in(ws, n, Scope::SessionsOnly, now, true)
+/// The end of a build in build dir `id` (`out::after_build`): removes its stale incremental sessions, never units. Busy while any process holds the dir, so the caller drops its own shared hold first.
+pub fn prune_sessions(ws: &Path, id: &str, now: u64) -> Result<Outcome> {
+    prune_dir_in(ws, id, Scope::SessionsOnly, now, true)
 }
 
-fn prune_slot_in(ws: &Path, n: u32, scope: Scope, now: u64, execute: bool) -> Result<Outcome> {
-    let dir = slot::slot_dir(ws, n);
-    match fs::symlink_metadata(&dir) {
-        Ok(meta) => ensure!(
-            meta.is_dir(),
-            "refused: {} is not a directory (a symlink is never followed)",
-            dir.display()
-        ),
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Outcome::NotBuilt),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
-    }
-    check_slot_dir(ws, &dir)?;
-    let Some(_lock) = build_pool::try_prune_slot(ws, n)? else {
+fn prune_dir_in(ws: &Path, id: &str, scope: Scope, now: u64, execute: bool) -> Result<Outcome> {
+    let dir = out::dir_of(ws, id);
+    let Some(real) = checked_dir(ws, &dir)? else {
+        return Ok(Outcome::NotBuilt);
+    };
+    let Some(_lock) = build_pool::try_lock_dir(ws, id)? else {
         return Ok(Outcome::Busy);
     };
-    let found = trees_under(&slot_roots(&dir)?)?;
+    let found = trees_under(&dir_roots(&real)?)?;
     Ok(Outcome::Done(prune_trees(ws, &found, scope, now, execute)?))
 }
 
-/// The trees no slot owns (`--all`): `repo/target` and the EGL driver probes. Each is busy-checked by its own `.cargo-lock`.
-pub fn prune_unslotted(ws: &Path, cutoff: u64, now: u64, execute: bool) -> Result<Vec<TreePlan>> {
-    let found = trees_under(&unslotted_roots(ws)?)?;
+/// The trees no build dir owns: a real `repo/target` (a main checkout not yet on its build dir) and the EGL driver probes. Each is busy-checked by its own `.cargo-lock`.
+pub fn prune_unowned(ws: &Path, cutoff: u64, now: u64, execute: bool) -> Result<Vec<TreePlan>> {
+    let found = trees_under(&unowned_roots(ws)?)?;
     prune_trees(ws, &found, Scope::Everything { cutoff }, now, execute)
 }
 
-/// The sessions of an unslotted target dir (the main checkout's `repo/target`), without units. Each tree is busy-checked by its own `.cargo-lock`.
-pub fn prune_target_sessions(ws: &Path, target: &Path, now: u64) -> Result<Vec<TreePlan>> {
-    let found = trees_under(&[target.to_owned()])?;
-    prune_trees(ws, &found, Scope::SessionsOnly, now, true)
-}
-
-/// The one line the end of a build prints for `what` (a slot or a target dir): sessions removed and kept, their bytes, busy trees.
+/// The one line the end of a build prints for `what` (a build dir): sessions removed and kept, their bytes, busy trees.
 pub fn sessions_line(what: &str, plans: &[TreePlan]) -> String {
     let removed: usize = plans.iter().map(|p| p.sessions.len()).sum();
     let bytes: u64 = plans.iter().map(TreePlan::session_bytes).sum();
@@ -329,36 +270,47 @@ pub fn sessions_line(what: &str, plans: &[TreePlan]) -> String {
     )
 }
 
-/// The slot number `n` when `dir` is exactly `<ws>/out/slot-<n>`, `n` >= 1 in canonical spelling. Whether `n` is within `build.slots` is the callers' check (`slot::pool`, `run`), so this reads no config.
-pub fn pool_slot(ws: &Path, dir: &Path) -> Option<u32> {
-    let name = dir.strip_prefix(ws.join("out")).ok()?.to_str()?;
-    let n: u32 = name.strip_prefix("slot-")?.parse().ok()?;
-    (n >= 1 && slot::slot_dir(ws, n) == dir).then_some(n)
-}
-
-/// The slot dir must be a pool slot whose canonical path is directly under `<ws>/out`.
-fn check_slot_dir(ws: &Path, dir: &Path) -> Result<()> {
-    let out = fs::canonicalize(ws.join("out")).context("reading the out dir")?;
-    let real = fs::canonicalize(dir).with_context(|| format!("reading {}", dir.display()))?;
+/// The dir to prune for build dir `dir`: itself when a real dir, the slot it names when it is an adopted slot link (`out::LEGACY_RECORD`: a link to `<ws>/out/slot-<n>` exactly); None when absent. Any other link is refused, never followed.
+fn checked_dir(ws: &Path, dir: &Path) -> Result<Option<PathBuf>> {
+    let meta = match fs::symlink_metadata(dir) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+    };
+    if meta.is_dir() {
+        return Ok(Some(dir.to_owned()));
+    }
+    let to = fs::read_link(dir)
+        .with_context(|| format!("refused: {} is not a directory", dir.display()))?;
+    let slot = to
+        .strip_prefix(ws.join("out"))
+        .ok()
+        .and_then(Path::to_str)
+        .and_then(|n| n.strip_prefix("slot-"))
+        .is_some_and(|n| n.parse::<u32>().is_ok());
     ensure!(
-        pool_slot(ws, dir).is_some() && real.parent() == Some(out.as_path()),
-        "refused: {} is not a slot of the pool under {}",
+        slot && real_dir(&to)?,
+        "refused: {} links to {}, not an adopted slot (a symlink is never followed)",
         dir.display(),
-        out.display()
+        to.display()
     );
-    Ok(())
+    Ok(Some(to))
 }
 
-/// The roots of slot `slot`: [`SLOT_ROOTS`] and `gl/cargo*`.
-fn slot_roots(slot: &Path) -> Result<Vec<PathBuf>> {
-    let mut roots: Vec<PathBuf> = SLOT_ROOTS.iter().map(|name| slot.join(name)).collect();
-    roots.extend(prefixed(&slot.join(GL_DIR), CARGO_ROOT)?);
+/// The roots of build dir `dir`: [`DIR_ROOTS`] and `gl/cargo*`.
+fn dir_roots(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut roots: Vec<PathBuf> = DIR_ROOTS.iter().map(|name| dir.join(name)).collect();
+    roots.extend(prefixed(&dir.join(GL_DIR), CARGO_ROOT)?);
     Ok(roots)
 }
 
-/// The roots no slot owns: the main checkout's default target, and each EGL driver checkout's `cargo*`.
-fn unslotted_roots(ws: &Path) -> Result<Vec<PathBuf>> {
-    let mut roots = vec![ws.join("repo").join("target")];
+/// The roots no build dir owns: the main checkout's `target` while it is a real dir (once linked it is its build dir's), and each EGL driver checkout's `cargo*`.
+fn unowned_roots(ws: &Path) -> Result<Vec<PathBuf>> {
+    let main = ws.join("repo").join("target");
+    let mut roots = Vec::new();
+    if fs::symlink_metadata(&main).is_ok_and(|m| m.is_dir()) {
+        roots.push(main);
+    }
     for checkout in children(&ws.join("out").join(EGL_DIR))? {
         roots.extend(prefixed(&checkout, CARGO_ROOT)?);
     }
@@ -923,7 +875,7 @@ mod tests {
 
     /// `cargo/release` of slot 1 with one unit per name above, two orphan `deps/` files, and no record. Every fingerprint dir's mtime is 30 days old, except FRESH's, a day old.
     fn tree_fixture(ws: &Path) -> PathBuf {
-        let tree = ws.join("out/slot-1/cargo/release");
+        let tree = ws.join("out/pool/ws/a/cargo/release");
         let fp = tree.join(FINGERPRINT);
         let deps = tree.join(DEPS);
         sized(&fp.join(STALE).join("lib-atl_stale"), 10);
@@ -982,19 +934,19 @@ mod tests {
         ]
     }
 
-    /// Tries before a slot lock released a moment ago reads as free (the fork race in build_pool.rs tests): FREE_TRIES x FREE_POLL.
+    /// Tries before a dir lock released a moment ago reads as free (the fork race in build_pool.rs tests): FREE_TRIES x FREE_POLL.
     const FREE_TRIES: u32 = 100;
     const FREE_POLL: Duration = Duration::from_millis(10);
 
-    /// `prune_slot` again once the lock is free. A `Busy` answer while the previous hold drains is retried, never accepted as the answer.
-    fn prune_once_free(ws: &Path, n: u32, cutoff: u64, now: u64, execute: bool) -> Outcome {
+    /// `prune_dir` again once the lock is free. A `Busy` answer while the previous hold drains is retried, never accepted as the answer.
+    fn prune_once_free(ws: &Path, id: &str, cutoff: u64, now: u64, execute: bool) -> Outcome {
         for _ in 0..FREE_TRIES {
-            match prune_slot(ws, n, cutoff, now, execute).expect("prune") {
+            match prune_dir(ws, id, cutoff, now, execute).expect("prune") {
                 Outcome::Busy => std::thread::sleep(FREE_POLL),
                 done => return done,
             }
         }
-        panic!("slot {n} stayed busy after {FREE_TRIES} tries");
+        panic!("ws/{id} stayed busy after {FREE_TRIES} tries");
     }
 
     fn only_plan(outcome: Outcome) -> Vec<TreePlan> {
@@ -1015,9 +967,9 @@ mod tests {
         let ws = scratch("plan");
         let tree = tree_fixture(&ws);
         write_record(&tree, &recent_uses());
-        let plan = only_plan(prune_slot(&ws, 1, CUTOFF, NOW, false).expect("prune")).remove(0);
-        assert_eq!(plan.tree, "out/slot-1/cargo/release");
-        assert_eq!(plan.root, "out/slot-1/cargo");
+        let plan = only_plan(prune_dir(&ws, "a", CUTOFF, NOW, false).expect("prune")).remove(0);
+        assert_eq!(plan.tree, "out/pool/ws/a/cargo/release");
+        assert_eq!(plan.root, "out/pool/ws/a/cargo");
         assert_eq!(stale_names(&plan), [EXAMPLE, JUST, NEVER, OLD, STALE]);
         assert_eq!(plan.units, 10, "every fingerprint entry");
         assert_eq!(plan.kept, 4, "EDGE, LIVE, NEW, FRESH");
@@ -1053,13 +1005,13 @@ mod tests {
         let ws = scratch("execute");
         let tree = tree_fixture(&ws);
         write_record(&tree, &recent_uses());
-        let dry = only_plan(prune_slot(&ws, 1, CUTOFF, NOW, false).expect("dry run"));
+        let dry = only_plan(prune_dir(&ws, "a", CUTOFF, NOW, false).expect("dry run"));
         assert_eq!(dry[0].stale.len(), 5);
         assert!(
             tree.join(FINGERPRINT).join(STALE).exists(),
             "dry run removed"
         );
-        only_plan(prune_once_free(&ws, 1, CUTOFF, NOW, true));
+        only_plan(prune_once_free(&ws, "a", CUTOFF, NOW, true));
         let fp = tree.join(FINGERPRINT);
         let deps = tree.join(DEPS);
         for gone in [
@@ -1120,7 +1072,7 @@ mod tests {
             "filenames": [tree.join("deps/libatl_stale-0123456789abcdef.rlib").display().to_string()],
             "executable": null, "fresh": true});
         unit_use::record(&[reused], NOW).expect("record the reuse");
-        let plan = only_plan(prune_slot(&ws, 1, CUTOFF, NOW, false).expect("prune")).remove(0);
+        let plan = only_plan(prune_dir(&ws, "a", CUTOFF, NOW, false).expect("prune")).remove(0);
         let stale = stale_names(&plan);
         assert!(
             !stale.contains(&STALE.to_owned()),
@@ -1139,7 +1091,7 @@ mod tests {
         let ws = scratch("mtime");
         let tree = tree_fixture(&ws);
         write_record(&tree, &[]);
-        let plan = only_plan(prune_slot(&ws, 1, CUTOFF, NOW, false).expect("prune")).remove(0);
+        let plan = only_plan(prune_dir(&ws, "a", CUTOFF, NOW, false).expect("prune")).remove(0);
         assert_eq!(
             stale_names(&plan),
             [EDGE, EXAMPLE, JUST, LIVE, NEVER, OLD, NEW, STALE]
@@ -1154,7 +1106,7 @@ mod tests {
     fn no_record_file_judges_every_unit_by_mtime_too() {
         let ws = scratch("no-record");
         tree_fixture(&ws);
-        let plan = only_plan(prune_slot(&ws, 1, CUTOFF, NOW, false).expect("prune")).remove(0);
+        let plan = only_plan(prune_dir(&ws, "a", CUTOFF, NOW, false).expect("prune")).remove(0);
         assert_eq!(plan.kept, 1, "FRESH");
         assert_eq!(plan.unrecorded, 9);
         fs::remove_dir_all(&ws).expect("cleanup");
@@ -1165,7 +1117,7 @@ mod tests {
     fn dry_run_creates_no_cargo_lock() {
         let ws = scratch("dry-lock");
         let tree = tree_fixture(&ws);
-        only_plan(prune_slot(&ws, 1, CUTOFF, NOW, false).expect("dry run"));
+        only_plan(prune_dir(&ws, "a", CUTOFF, NOW, false).expect("dry run"));
         assert!(
             !tree.join(CARGO_LOCK).exists(),
             "dry run created a lock file"
@@ -1174,22 +1126,22 @@ mod tests {
     }
 
     #[test]
-    fn busy_slot_is_skipped_and_untouched() {
+    fn busy_dir_is_skipped_and_untouched() {
         let ws = scratch("busy");
         let tree = tree_fixture(&ws);
         write_record(&tree, &recent_uses());
-        let build = build_pool::hold_slot(&ws, 1, || {}).expect("build holds slot 1");
+        let build = build_pool::hold_dir(&ws, "a", || {}).expect("build holds dir a");
         assert!(matches!(
-            prune_slot(&ws, 1, CUTOFF, NOW, true).expect("prune"),
+            prune_dir(&ws, "a", CUTOFF, NOW, true).expect("prune"),
             Outcome::Busy
         ));
         assert!(
             tree.join(FINGERPRINT).join(STALE).exists(),
-            "busy slot pruned"
+            "busy dir pruned"
         );
         drop(build);
         assert!(matches!(
-            prune_once_free(&ws, 1, CUTOFF, NOW, false),
+            prune_once_free(&ws, "a", CUTOFF, NOW, false),
             Outcome::Done(_)
         ));
         fs::remove_dir_all(&ws).expect("cleanup");
@@ -1203,7 +1155,7 @@ mod tests {
         write_record(&tree, &recent_uses());
         let build = fs::File::create(tree.join(CARGO_LOCK)).expect("cargo lock");
         flock(&build, FlockOperation::NonBlockingLockExclusive).expect("hold");
-        let plan = only_plan(prune_slot(&ws, 1, CUTOFF, NOW, true).expect("prune")).remove(0);
+        let plan = only_plan(prune_dir(&ws, "a", CUTOFF, NOW, true).expect("prune")).remove(0);
         assert!(plan.busy);
         assert!(plan.stale.is_empty() && plan.sessions.is_empty());
         assert!(
@@ -1219,7 +1171,7 @@ mod tests {
         let ws = scratch("garbled");
         let tree = tree_fixture(&ws);
         fs::write(tree.join(".atl-unit-use.json"), "{garbled").expect("record");
-        let err = prune_slot(&ws, 1, CUTOFF, NOW, true).expect_err("garbled record must refuse");
+        let err = prune_dir(&ws, "a", CUTOFF, NOW, true).expect_err("garbled record must refuse");
         assert!(
             format!("{err:#}").contains("unreadable use record"),
             "{err:#}"
@@ -1232,30 +1184,43 @@ mod tests {
     }
 
     #[test]
-    fn slot_without_an_out_dir_is_not_built() {
+    fn a_missing_build_dir_is_not_built() {
         let ws = scratch("not-built");
         assert!(matches!(
-            prune_slot(&ws, 2, CUTOFF, NOW, true).expect("prune"),
+            prune_dir(&ws, "b", CUTOFF, NOW, true).expect("prune"),
             Outcome::NotBuilt
         ));
     }
 
     #[test]
-    fn symlinked_slot_is_refused_and_its_target_untouched() {
-        let ws = scratch("slot-link");
+    fn symlinked_build_dir_is_refused_and_its_target_untouched() {
+        let ws = scratch("dir-link");
         let elsewhere = ws.join("elsewhere");
         tree_fixture(&elsewhere);
-        fs::create_dir_all(ws.join("out")).expect("out");
-        symlink(elsewhere.join("out/slot-1"), ws.join("out/slot-3")).expect("link");
-        let err = prune_slot(&ws, 3, CUTOFF, NOW, true).expect_err("symlink refused");
+        fs::create_dir_all(ws.join("out/pool/ws")).expect("pool");
+        symlink(elsewhere.join("out/pool/ws/a"), ws.join("out/pool/ws/c")).expect("link");
+        let err = prune_dir(&ws, "c", CUTOFF, NOW, true).expect_err("symlink refused");
         assert!(format!("{err:#}").contains("refused"), "{err:#}");
         assert!(
             elsewhere
-                .join("out/slot-1/cargo/release/.fingerprint")
+                .join("out/pool/ws/a/cargo/release/.fingerprint")
                 .join(STALE)
                 .exists(),
             "the link target was pruned"
         );
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// An adopted pre-pool slot (`ws/<id>` -> `out/slot-<n>`) is pruned in the slot it names.
+    #[test]
+    fn an_adopted_slot_link_is_pruned_in_its_slot() {
+        let ws = scratch("adopted");
+        let tree = ws.join("out/slot-3/cargo/release");
+        sized(&tree.join(FINGERPRINT).join("x-0123456789abcdef/y"), 1);
+        fs::create_dir_all(ws.join("out/pool/ws")).expect("pool");
+        symlink(ws.join("out/slot-3"), ws.join("out/pool/ws/a")).expect("link");
+        let plan = only_plan(prune_dir(&ws, "a", CUTOFF, NOW, false).expect("prune")).remove(0);
+        assert_eq!(plan.tree, "out/slot-3/cargo/release");
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 
@@ -1268,7 +1233,7 @@ mod tests {
         let fp = tree.join(FINGERPRINT);
         fs::rename(&fp, ws.join("fp-moved")).expect("move");
         symlink(&outside, &fp).expect("link");
-        let err = prune_slot(&ws, 1, CUTOFF, NOW, true).expect_err("symlink refused");
+        let err = prune_dir(&ws, "a", CUTOFF, NOW, true).expect_err("symlink refused");
         assert!(format!("{err:#}").contains("symlink"), "{err:#}");
         assert!(
             outside.join(STALE).join("lib-x").exists(),
@@ -1281,7 +1246,7 @@ mod tests {
     #[test]
     fn trees_are_profiles_and_triple_profiles_under_the_roots_only() {
         let ws = scratch("trees");
-        let slot = ws.join("out/slot-1");
+        let slot = ws.join("out/pool/ws/a");
         sized(&slot.join("cargo/release/.fingerprint/x/y"), 1);
         sized(
             &slot.join("cargo/x86_64-unknown-linux-gnu/release/.fingerprint/x/y"),
@@ -1296,7 +1261,7 @@ mod tests {
         sized(&slot.join("gl/other/debug/.fingerprint/x/y"), 1);
         sized(&slot.join("cargo/cxxbridge/somecrate/src/lib.rs"), 1);
         sized(&slot.join("cargo/tmp/file"), 1);
-        let mut found: Vec<String> = trees_under(&slot_roots(&slot).expect("roots"))
+        let mut found: Vec<String> = trees_under(&dir_roots(&slot).expect("roots"))
             .expect("trees")
             .iter()
             .map(|f| relative(&ws, &f.dir))
@@ -1305,25 +1270,25 @@ mod tests {
         assert_eq!(
             found,
             [
-                "out/slot-1/cargo-converter/release",
-                "out/slot-1/cargo/release",
-                "out/slot-1/cargo/x86_64-unknown-linux-gnu/release",
-                "out/slot-1/gl/cargo-undefined-gl/release",
-                "out/slot-1/target/debug",
+                "out/pool/ws/a/cargo-converter/release",
+                "out/pool/ws/a/cargo/release",
+                "out/pool/ws/a/cargo/x86_64-unknown-linux-gnu/release",
+                "out/pool/ws/a/gl/cargo-undefined-gl/release",
+                "out/pool/ws/a/target/debug",
             ]
         );
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 
-    /// The root names of a slot: the target names xtask gives cargo (build, converter build, converter test), the checkout default `target`, and the `cargo*` probes under `gl/`.
+    /// The root names of a build dir: the target names xtask gives cargo (build, converter build, converter test), the checkout's `target`, and the `cargo*` probes under `gl/`.
     #[test]
-    fn slot_roots_are_the_target_names_and_the_gl_cargo_probes() {
+    fn dir_roots_are_the_target_names_and_the_gl_cargo_probes() {
         let ws = scratch("roots");
-        let slot = ws.join("out/slot-2");
+        let slot = ws.join("out/pool/ws/b");
         fs::create_dir_all(slot.join("gl/cargo")).expect("gl");
         fs::create_dir_all(slot.join("gl/cargo-undefined-gl")).expect("gl");
         fs::create_dir_all(slot.join("gl/other")).expect("gl");
-        let mut names: Vec<String> = slot_roots(&slot)
+        let mut names: Vec<String> = dir_roots(&slot)
             .expect("roots")
             .iter()
             .map(|p| relative(&slot, p))
@@ -1343,10 +1308,10 @@ mod tests {
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 
-    /// The trees no slot owns: the main checkout's default target, and each EGL driver checkout's `cargo*` roots only.
+    /// The trees no build dir owns: the main checkout's real target, and each EGL driver checkout's `cargo*` roots only; a linked `repo/target` is its build dir's, not listed here.
     #[test]
-    fn unslotted_roots_are_repo_target_and_the_egl_driver_cargo_probes() {
-        let ws = scratch("unslotted");
+    fn unowned_roots_are_a_real_repo_target_and_the_egl_driver_cargo_probes() {
+        let ws = scratch("unowned");
         sized(&ws.join("repo/target/debug/.fingerprint/x/y"), 1);
         sized(
             &ws.join("repo/target/x86_64-unknown-linux-gnu/release/.fingerprint/x/y"),
@@ -1365,7 +1330,7 @@ mod tests {
             &ws.join("out/egl-driver/chk2/cargo-probe/debug/.fingerprint/x/y"),
             1,
         );
-        let mut found: Vec<String> = trees_under(&unslotted_roots(&ws).expect("roots"))
+        let mut found: Vec<String> = trees_under(&unowned_roots(&ws).expect("roots"))
             .expect("trees")
             .iter()
             .map(|f| relative(&ws, &f.dir))
@@ -1379,6 +1344,13 @@ mod tests {
                 "repo/target/debug",
                 "repo/target/x86_64-unknown-linux-gnu/release",
             ]
+        );
+        fs::rename(ws.join("repo/target"), ws.join("linked")).expect("move");
+        symlink(ws.join("linked"), ws.join("repo/target")).expect("link");
+        assert_eq!(
+            unowned_roots(&ws).expect("roots").len(),
+            2,
+            "a linked repo/target was listed"
         );
         fs::remove_dir_all(&ws).expect("cleanup");
     }
@@ -1430,11 +1402,11 @@ mod tests {
     #[test]
     fn incremental_keeps_the_newest_finalized_session_and_every_held_or_young_one() {
         let ws = scratch("incremental");
-        let tree = ws.join("out/slot-1/cargo/debug");
+        let tree = ws.join("out/pool/ws/a/cargo/debug");
         fs::create_dir_all(tree.join(FINGERPRINT)).expect("fingerprint");
         let x = incremental_fixture(&tree);
         let _held = hold_incremental_locks(&x);
-        let plan = only_plan(prune_slot(&ws, 1, CUTOFF, NOW, false).expect("prune")).remove(0);
+        let plan = only_plan(prune_dir(&ws, "a", CUTOFF, NOW, false).expect("prune")).remove(0);
         let mut dirs: Vec<String> = plan
             .sessions
             .iter()
@@ -1462,11 +1434,11 @@ mod tests {
     #[test]
     fn incremental_removal_takes_the_stale_sessions_and_their_locks_only() {
         let ws = scratch("incremental-exec");
-        let tree = ws.join("out/slot-1/cargo/debug");
+        let tree = ws.join("out/pool/ws/a/cargo/debug");
         fs::create_dir_all(tree.join(FINGERPRINT)).expect("fingerprint");
         let x = incremental_fixture(&tree);
         let _held = hold_incremental_locks(&x);
-        only_plan(prune_once_free(&ws, 1, CUTOFF, NOW, true));
+        only_plan(prune_once_free(&ws, "a", CUTOFF, NOW, true));
         for gone in [
             "s-1-a-svh1",
             "s-1-a.lock",
@@ -1513,20 +1485,6 @@ mod tests {
     }
 
     #[test]
-    fn slot_must_be_a_pool_dir() {
-        let ws = Path::new("/ws");
-        assert_eq!(pool_slot(ws, &ws.join("out/slot-2")), Some(2));
-        assert_eq!(pool_slot(ws, &ws.join("out/slot-0")), None);
-        // any number: the pool size is checked against the config elsewhere
-        assert_eq!(pool_slot(ws, &ws.join("out/slot-9")), Some(9));
-        assert_eq!(pool_slot(ws, &ws.join("out/slot-01")), None);
-        assert_eq!(pool_slot(ws, &ws.join("out/slot-x")), None);
-        assert_eq!(pool_slot(ws, &ws.join("out/native")), None);
-        assert_eq!(pool_slot(ws, &ws.join("out/slot-1/cargo")), None);
-        assert_eq!(pool_slot(ws, Path::new("/elsewhere/out/slot-1")), None);
-    }
-
-    #[test]
     fn staleness_is_strictly_older_than_the_cutoff() {
         assert!(
             !is_stale(NOW - CUTOFF, NOW, CUTOFF),
@@ -1552,14 +1510,14 @@ mod tests {
     }
 
     /// `prune_sessions` again once the lock is free; a `Busy` while the previous hold drains is retried, as in `prune_once_free`.
-    fn sessions_once_free(ws: &Path, n: u32, now: u64) -> Vec<TreePlan> {
+    fn sessions_once_free(ws: &Path, id: &str, now: u64) -> Vec<TreePlan> {
         for _ in 0..FREE_TRIES {
-            match prune_sessions(ws, n, now).expect("prune") {
+            match prune_sessions(ws, id, now).expect("prune") {
                 Outcome::Busy => std::thread::sleep(FREE_POLL),
                 done => return only_plan(done),
             }
         }
-        panic!("slot {n} stayed busy after {FREE_TRIES} tries");
+        panic!("ws/{id} stayed busy after {FREE_TRIES} tries");
     }
 
     #[test]
@@ -1567,11 +1525,11 @@ mod tests {
         let ws = scratch("sessions-only");
         let release = tree_fixture(&ws);
         write_record(&release, &recent_uses());
-        let debug = ws.join("out/slot-1/cargo/debug");
+        let debug = ws.join("out/pool/ws/a/cargo/debug");
         fs::create_dir_all(debug.join(FINGERPRINT)).expect("fingerprint");
         let x = incremental_fixture(&debug);
         let _held = hold_incremental_locks(&x);
-        let plans = only_plan(prune_sessions(&ws, 1, NOW).expect("prune"));
+        let plans = only_plan(prune_sessions(&ws, "a", NOW).expect("prune"));
         assert!(
             plans.iter().all(|p| p.stale.is_empty()),
             "a unit was planned"
@@ -1605,44 +1563,41 @@ mod tests {
 
     /// The caller's own shared hold blocks the prune (why `finish_build` drops it first); once free, the prune runs.
     #[test]
-    fn session_prune_skips_a_slot_a_build_holds() {
+    fn session_prune_skips_a_dir_a_build_holds() {
         let ws = scratch("sessions-busy");
-        let debug = ws.join("out/slot-1/cargo/debug");
+        let debug = ws.join("out/pool/ws/a/cargo/debug");
         fs::create_dir_all(debug.join(FINGERPRINT)).expect("fingerprint");
         let x = incremental_fixture(&debug);
-        let build = build_pool::hold_slot(&ws, 1, || {}).expect("build holds slot 1");
+        let build = build_pool::hold_dir(&ws, "a", || {}).expect("build holds dir a");
         assert!(matches!(
-            prune_sessions(&ws, 1, NOW).expect("prune"),
+            prune_sessions(&ws, "a", NOW).expect("prune"),
             Outcome::Busy
         ));
-        assert!(x.join("s-1-a-svh1").exists(), "a busy slot was pruned");
+        assert!(x.join("s-1-a-svh1").exists(), "a busy dir was pruned");
         drop(build);
-        sessions_once_free(&ws, 1, NOW);
+        sessions_once_free(&ws, "a", NOW);
         assert!(
             !x.join("s-1-a-svh1").exists(),
-            "stale session survived once the slot was free"
+            "stale session survived once the dir was free"
         );
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 
     #[test]
-    fn session_prune_leaves_the_other_slots_alone() {
-        let ws = scratch("sessions-other-slot");
-        let one = ws.join("out/slot-1/cargo/debug");
-        let two = ws.join("out/slot-2/cargo/debug");
+    fn session_prune_leaves_the_other_dirs_alone() {
+        let ws = scratch("sessions-other-dir");
+        let one = ws.join("out/pool/ws/a/cargo/debug");
+        let two = ws.join("out/pool/ws/b/cargo/debug");
         fs::create_dir_all(one.join(FINGERPRINT)).expect("fingerprint");
         fs::create_dir_all(two.join(FINGERPRINT)).expect("fingerprint");
         let x1 = incremental_fixture(&one);
         let x2 = incremental_fixture(&two);
-        sessions_once_free(&ws, 1, NOW);
+        sessions_once_free(&ws, "a", NOW);
         assert!(
             !x1.join("s-1-a-svh1").exists(),
-            "slot 1's stale session survived"
+            "dir a's stale session survived"
         );
-        assert!(
-            x2.join("s-1-a-svh1").exists(),
-            "slot 2's session was pruned"
-        );
+        assert!(x2.join("s-1-a-svh1").exists(), "dir b's session was pruned");
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 
@@ -1650,14 +1605,14 @@ mod tests {
     #[test]
     fn after_a_build_only_the_newest_session_is_left() {
         let ws = scratch("sessions-steady");
-        let debug = ws.join("out/slot-1/cargo/debug");
+        let debug = ws.join("out/pool/ws/a/cargo/debug");
         fs::create_dir_all(debug.join(FINGERPRINT)).expect("fingerprint");
         let x = debug.join("incremental/atl_x-0123456789abcdef");
         sized(&x.join("s-1-a-svh1/query-cache.bin"), 100);
         sized(&x.join("s-2-b-svh2/query-cache.bin"), 200);
         fs::write(x.join("s-1-a.lock"), "").expect("lock");
         fs::write(x.join("s-2-b.lock"), "").expect("lock");
-        let plans = sessions_once_free(&ws, 1, NOW);
+        let plans = sessions_once_free(&ws, "a", NOW);
         assert_eq!(session_dirs(&x), ["s-2-b-svh2"]);
         assert_eq!(plans.iter().map(TreePlan::session_bytes).sum::<u64>(), 100);
         fs::remove_dir_all(&ws).expect("cleanup");
@@ -1675,9 +1630,9 @@ mod tests {
             kept_sessions: 3,
             ..TreePlan::default()
         }];
-        let line = sessions_line("slot 2", &plans);
+        let line = sessions_line("ws/b", &plans);
         assert!(
-            line.starts_with("session prune: slot 2: removed 1 stale session entries ("),
+            line.starts_with("session prune: ws/b: removed 1 stale session entries ("),
             "{line}"
         );
         assert!(line.ends_with("), kept 3"), "{line}");

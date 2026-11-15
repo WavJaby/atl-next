@@ -15,14 +15,13 @@ use atl_layout::{Layout, MAIN};
 
 use crate::fetch;
 use crate::git::{git, git_raw};
+use crate::out;
+use crate::out_prune;
 use crate::patch;
-use crate::slot;
-use crate::slot_prune;
 use crate::sources::{self, Sources};
 use crate::timing::{self, Timings};
 use crate::unit_use::{self, Echo, Units};
 use crate::verdict::{self, Failure, Verdict};
-use crate::ws_config;
 
 /// The note a task keeps in its worktree: untracked by design, copied to `out/` when the branch lands.
 const STATE_NOTE: &str = ".state-note.md";
@@ -43,7 +42,8 @@ pub struct Args {
     /// Internal: the inputs child (`inputs_child`) in the worktree or the main checkout; prints what that checkout's check reads (`check_inputs`), read-only.
     #[arg(long, hide = true, conflicts_with_all = ["execute", "cleanup", "facts"])]
     inputs: bool,
-    /// Internal: the slot child in the worktree (`slot_child`); prints whether the worktree's slot is current for every gate's goals, read-only.
+    /// Internal: the build dir child in the worktree (`slot_child`); prints whether the worktree's build dir is current for every gate's goals, read-only.
+    /// Flag and output lines keep the pre-pool name `slot`: it is the wire between the main checkout's xtask and a branch's, and a branch from before the build-dir pool answers only to it. Rename once no such branch is left.
     #[arg(long, hide = true, conflicts_with_all = ["execute", "cleanup", "facts", "inputs"])]
     slot: bool,
 }
@@ -84,6 +84,8 @@ struct Runner<'a> {
     native: &'a dyn Fn(&Path, &str) -> Result<String>,
     /// `(worktree, branch)` -> None when the worktree's slot is current for every gate's goals, else why not; by the branch's xtask (`slot_child`).
     stale: &'a dyn Fn(&Path, &str) -> Result<Option<String>>,
+    /// The main checkout's build dir published as the base new build dirs copy, by its own xtask (`publish_execute`); its line.
+    publish: &'a dyn Fn(&Path) -> Result<String>,
 }
 
 /// One step of a landing, in run order.
@@ -188,6 +190,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         inputs: &inputs_child,
         native: &native_execute,
         stale: &slot_child,
+        publish: &publish_execute,
     };
     let line = plan.execute(&stages, &runner);
     println!("{line}");
@@ -488,10 +491,13 @@ impl Plan {
             Some((v, Ok(now))) => format!("check inputs differ: {}", differing(v, &now)),
             Some((_, Err(e))) => format!("main's check inputs not read: {e:#}"),
         };
-        println!("land: verify-main: {why}: rebuilding main's slot, then checking");
+        println!("land: verify-main: {why}: rebuilding main's build dir, then checking");
         (runner.native)(&self.repo, &self.host).with_context(pushed)?;
         let line = (runner.check)(self.repo.as_path()).with_context(pushed)?;
-        Ok(format!("{line} ({why})"))
+        // main's build dir is now built and checked at the pushed commit: new build dirs copy it. Never fatal: the land is pushed and verified.
+        let published =
+            (runner.publish)(&self.repo).unwrap_or_else(|e| format!("base not published: {e:#}"));
+        Ok(format!("{line} ({why}); {published}"))
     }
 }
 
@@ -681,7 +687,28 @@ fn parse_slot(stdout: &str) -> Result<Option<String>> {
     bail!("the slot child printed no slot line")
 }
 
-/// `cargo xtask native --host <host> --for all-gates` in `repo` (the worktree for Build, the main checkout for verify-main), run by its own xtask: the slot that checkout's check reads, built from it as it is now.
+/// `cargo xtask out publish --execute` in the main checkout, by its own (post-sync) xtask. Returns the line it printed.
+fn publish_execute(repo: &Path) -> Result<String> {
+    let mut cmd = crate::cargo_command();
+    cmd.args(["xtask", "out", "publish", "--execute"])
+        .current_dir(repo);
+    let run = unit_use::run(&mut cmd, Units::Plain, Echo::Both)
+        .with_context(|| format!("running cargo xtask out publish in {}", repo.display()))?;
+    ensure!(
+        run.status.success(),
+        "cargo xtask out publish exited with {}",
+        run.status
+    );
+    run.stdout
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_owned)
+        .context("the publish child printed no line")
+}
+
+/// `cargo xtask native --host <host> --for all-gates` in `repo` (the worktree for Build, the main checkout for verify-main), run by its own xtask: the build dir that checkout's check reads, built from it as it is now.
 fn native_execute(repo: &Path, host: &str) -> Result<String> {
     let mut cmd = crate::cargo_command();
     cmd.args([
@@ -781,35 +808,25 @@ fn clean_up_child(repo: &Path, branch: &str) -> Result<String> {
         .with_context(|| format!("branch {branch} is not checked out in a worktree"))?;
     let ws = Layout::of(repo)?.workspace().to_path_buf();
     let note = clean_up(repo, &ws, &wt, branch)?;
-    prune_slots_after_land(repo, &ws);
+    prune_units_after_land(repo, &ws);
     Ok(note)
 }
 
-/// After a land: `slot prune --execute` over the pool's slots. The trees no slot owns (`repo/target`, EGL probes) are not pruned here: `slot prune --all` does that by hand. A busy slot is skipped; a failure is logged, never fatal, since the land is already pushed.
-fn prune_slots_after_land(repo: &Path, ws: &Path) {
-    let swept = slot::holders_of(repo).and_then(|holders| {
-        let pool = slot::pool(&ws_config::load(ws)?, &holders)?;
-        let slots: Vec<u32> = (1..=pool).collect();
-        slot_prune::sweep(
-            ws,
-            &holders,
-            &slots,
-            false,
-            slot_prune::PRUNE_AFTER_DAYS,
-            true,
-        )
-    });
+/// After a land: `out prune --units --execute` over every live checkout's build dir. The trees no build dir owns (EGL probes) are not pruned here: `out prune --units` does that by hand. A busy dir is skipped; a failure is logged, never fatal, since the land is already pushed.
+fn prune_units_after_land(repo: &Path, ws: &Path) {
+    let swept = out::live_dirs(repo)
+        .and_then(|ids| out_prune::sweep(ws, &ids, false, out_prune::PRUNE_AFTER_DAYS, true));
     match swept {
         Ok(sweep) if sweep.failed == 0 => {}
         Ok(sweep) => eprintln!(
-            "slot prune after land: {} slot(s) failed (rows above)",
+            "unit prune after land: {} dir(s) failed (rows above)",
             sweep.failed
         ),
-        Err(e) => eprintln!("slot prune after land failed: {e:#}"),
+        Err(e) => eprintln!("unit prune after land failed: {e:#}"),
     }
 }
 
-/// The task copies, then the state note (kept in out/), the checkout's target (`slot::leave`), the worktree and the branch. Copies go through `patch --done --task`, the command's own path.
+/// The task copies, then the state note (kept in out/), the checkout's target and build dir (`out::leave`), the worktree and the branch. Copies go through `patch --done --task`, the command's own path.
 fn clean_up(repo: &Path, ws: &Path, wt: &Path, branch: &str) -> Result<String> {
     let copies = copies_of(&Layout::new(ws, Some(branch)), &sources::load(wt)?);
     if !copies.is_empty() {
@@ -823,7 +840,7 @@ fn clean_up(repo: &Path, ws: &Path, wt: &Path, branch: &str) -> Result<String> {
         let kept = out.join(format!("{branch}-state-note.md"));
         std::fs::copy(&note, &kept).with_context(|| format!("keeping {}", note.display()))?;
     }
-    let target = slot::leave(wt, ws, slot::record_slot(wt)?)?;
+    let target = out::leave(wt, ws)?;
     let wt_arg = wt.display().to_string();
     git(Some(repo), &["worktree", "remove", "--force", &wt_arg])?;
     git(Some(repo), &["branch", "-d", branch])?;
@@ -950,6 +967,7 @@ mod tests {
                 inputs: &same_inputs,
                 native: &no_native,
                 stale: &current,
+                publish: &no_publish,
             },
         );
         assert_eq!(line, "land: ok (6 steps)");
@@ -975,7 +993,11 @@ mod tests {
         panic!("native ran in {} for {host}", d.display())
     }
 
-    /// The worktree's slot is current: Build runs nothing.
+    fn no_publish(_: &Path) -> Result<String> {
+        Ok("out: base/c from ws/repo (reflink)".to_owned())
+    }
+
+    /// The worktree's build dir is current: Build runs nothing.
     fn current(_: &Path, _: &str) -> Result<Option<String>> {
         Ok(None)
     }
@@ -1032,6 +1054,7 @@ mod tests {
                     inputs: &same_inputs,
                     native: &native_fn,
                     stale: &stale_fn,
+                    publish: &no_publish,
                 },
             )
         }
@@ -1130,6 +1153,7 @@ mod tests {
                 inputs: &inputs_fn,
                 native: &no_native,
                 stale: &current,
+                publish: &no_publish,
             },
         );
         assert_eq!(line, "land: ok (6 steps)");
@@ -1175,6 +1199,7 @@ mod tests {
                 inputs: &inputs_fn,
                 native: &native_fn,
                 stale: &current,
+                publish: &no_publish,
             },
         );
         assert_eq!(line, "land: ok (6 steps)");
@@ -1369,6 +1394,7 @@ mod tests {
                 inputs: &inputs_fn,
                 native: &no_native,
                 stale: &current,
+                publish: &no_publish,
             },
         );
         assert!(
@@ -1407,6 +1433,7 @@ mod tests {
                 inputs: &same_inputs,
                 native: &no_native,
                 stale: &current,
+                publish: &no_publish,
             },
         );
         assert_eq!(line, "land: ok (6 steps)");
@@ -1456,22 +1483,18 @@ mod tests {
     }
 
     #[test]
-    fn clean_up_removes_the_checkouts_target_and_its_slot_build() {
+    fn clean_up_removes_the_checkouts_target_and_its_build_dir() {
         let env = Env::new("target");
         let ws = env.root.join("ws");
-        let slot_target = ws.join("out/slot-1/target");
-        std::fs::create_dir_all(slot_target.join("debug")).unwrap();
-        write(&slot_target.join("debug"), "build.txt", "x\n");
-        std::os::unix::fs::symlink(&slot_target, env.wt.join("target")).unwrap();
-        std::fs::write(env.repo.join(".git/worktrees/land/atl-out-slot"), "1\n").unwrap();
+        let dir = out::dir_of(&ws, "land");
+        std::fs::create_dir_all(dir.join("target/debug")).unwrap();
+        write(&dir.join("target/debug"), "build.txt", "x\n");
+        std::os::unix::fs::symlink(dir.join("target"), env.wt.join("target")).unwrap();
         // `branch -d` in clean_up refuses a branch that is not merged into the checked-out main
         git(Some(&env.repo), &["merge", "-q", "--ff-only", "land"]).unwrap();
         let summary = clean_up(&env.repo, &ws, &env.wt, "land").expect("clean up");
-        assert!(summary.contains("target removed:"), "{summary}");
-        assert!(
-            !slot_target.exists(),
-            "the slot's build leaves with its holder"
-        );
+        assert!(summary.contains("removed:"), "{summary}");
+        assert!(!dir.exists(), "the build dir leaves with its checkout");
         assert!(!env.wt.exists(), "the worktree is removed");
     }
 

@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
-//! The one way xtask runs cargo, and the unit use it records per target tree: the record `slot prune` reads instead of rebuild times.
+//! The one way xtask runs cargo, and the unit use it records per target tree: the record `out prune --units` reads instead of rebuild times.
 //!
 //! [`run`] is the only spawn point. A `Units::Recorded` run (build, test, clippy) gets `--message-format=json-render-diagnostics` (human diagnostics stay on stderr, JSON messages come on stdout), returns those messages, and records each unit that a `compiler-artifact` or `build-script-executed` message names, fresh ones included. Cargo reports every unit of a build's graph on every build, reused or not, so the last build that reports a unit is its last use. Schema: cargo book, External tools, JSON messages (https://doc.rust-lang.org/cargo/reference/external-tools.html#json-messages). `compiler-artifact` carries `package_id`, `filenames`, `executable`, `fresh`; `build-script-executed` carries `package_id`, `out_dir`.
 //!
-//! `Units::Plain` runs add no flag and record nothing: `cargo metadata`, `fmt`, `deny` and `install --list` take no `--message-format`, and the `cargo xtask` alias would hand it to xtask. The alias's own units (xtask and its dependencies) are compiled before any xtask code runs, so no run records them; `slot prune` judges them by mtime.
+//! `Units::Plain` runs add no flag and record nothing: `cargo metadata`, `fmt`, `deny` and `install --list` take no `--message-format`, and the `cargo xtask` alias would hand it to xtask. The alias's own units (xtask and its dependencies) are compiled before any xtask code runs, so no run records them; `out prune --units` judges them by mtime.
 //!
 //! A unit is named by the 16-hex-digit hash in its paths: `deps/<crate>-<hash>.*`, `examples/<name>-<hash>`, `build/<pkg>-<hash>/`, `.fingerprint/<pkg>-<hash>/`. An uplifted output (`<tree>/<name>`) is a hard link of its hashed file, so its inode names the hash. An output with no hash (a cdylib's `deps/lib<x>.so`) names only its package: every fingerprint dir of that package in the tree is recorded, superseded ones included. That keeps more, never less.
 //!
-//! The record `<tree>/.atl-unit-use.json` holds `units` (hash -> last use, unix seconds). A unit without an entry has no recorded use: `slot prune` judges it by its fingerprint dir's mtime. Updates take `flock` on `<tree>/.atl-unit-use.lock` and replace the file by rename. An unreadable record is an error for prune; the next recorded build replaces it with an empty record.
+//! The record `<tree>/.atl-unit-use.json` holds `units` (hash -> last use, unix seconds). A unit without an entry has no recorded use: `out prune --units` judges it by its fingerprint dir's mtime. Updates take `flock` on `<tree>/.atl-unit-use.lock` and replace the file by rename. An unreadable record is an error for prune; the next recorded build replaces it with an empty record.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -238,7 +238,7 @@ pub fn record(messages: &[Value], now: u64) -> Result<()> {
     Ok(())
 }
 
-/// Drops the entries of units that `slot prune` removed from `tree`. A tree with no record is left alone.
+/// Drops the entries of units that `out prune --units` removed from `tree`. A tree with no record is left alone.
 pub fn forget(tree: &Path, hashes: &[String]) -> Result<()> {
     if load(tree)?.is_none() {
         return Ok(());

@@ -20,7 +20,7 @@ use object::{Endianness, elf};
 use serde::Deserialize;
 
 use crate::provided_gate::{self, Linkage};
-use crate::{arches, cross, deps, isa_tiers, slot};
+use crate::{arches, cross, deps, isa_tiers, out};
 
 /// psABI build attribute `Tag_RISCV_arch`: an odd tag, so its value is a NUL-terminated string.
 const TAG_RISCV_ARCH: u64 = 5;
@@ -39,7 +39,7 @@ pub struct Args {
     /// The arch of arches.toml whose `[host]` row (isa, glibc_floor) the outputs are checked against.
     #[arg(long)]
     arch: String,
-    /// Build dir root, as `native --out` (default: this checkout's slot); the arch's outputs are `<out>/<arch>`.
+    /// Build dir root, as `native --out` (default: this checkout's build dir); the arch's outputs are `<out>/<arch>`.
     #[arg(long, conflicts_with = "elf")]
     out: Option<PathBuf>,
     /// Instead of an out dir: one ELF built outside it (a `cross` cargo output such as libatl_native_bridge.so), held to the row's isa closure (no tier applies), glibc_floor, and sysroot libraries for its DT_NEEDED (`check_executable`).
@@ -125,10 +125,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let report = if let Some(elf) = &args.elf {
         check_executable(elf, host, &sysroot_dirs(root, host)?)?
     } else {
-        let out = slot::out_dir(root, args.out.as_deref(), "--out", |workspace| {
-            workspace.join("out").join("native")
-        })?
-        .join(&args.arch);
+        let out = out::out_dir(root, args.out.as_deref())?.join(&args.arch);
         let provided = provided_libs(&out)?;
         let provided: Vec<&Path> = provided.iter().map(PathBuf::as_path).collect();
         check(

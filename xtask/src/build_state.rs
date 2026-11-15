@@ -130,12 +130,12 @@ pub fn record(out: &Path, state: &str, goals: &BTreeSet<String>) -> Result<()> {
     std::fs::write(out.join(RECORD), text).context("writing the build record")
 }
 
-/// Gate `gate`'s native out dir (`--out`, else the slot): refused unless built from the checkout at `root` as it is now, with every goal the gate declares (gate_goals.rs; `all-gates` = every gate's, land's build stage).
+/// Gate `gate`'s native out dir (`--out`, else the build dir): refused unless built from the checkout at `root` as it is now, with every goal the gate declares (gate_goals.rs; `all-gates` = every gate's, land's build stage).
 pub fn gate_out(root: &Path, explicit: Option<&Path>, host: &str, gate: &str) -> Result<PathBuf> {
     let out = crate::native::host_out(root, explicit, host)?;
     ensure_current(root, &out).with_context(|| {
         format!(
-            "gate `{gate}`: the slot is stale: run `cargo xtask native --host {host} --for {gate}`"
+            "gate `{gate}`: the build dir is stale: run `cargo xtask native --host {host} --for {gate}`"
         )
     })?;
     let built = read(&out).map(|r| r.goals).unwrap_or_default();

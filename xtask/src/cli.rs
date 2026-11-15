@@ -59,27 +59,27 @@ enum Command {
     ///
     /// Runtime libraries come from each module's android source set compiled for glibc, build tools
     /// (aidl) from their host source set; bionic itself is replaced by the system C library. Output in
-    /// this checkout's build-output slot (`xtask slot`), else <workspace>/out/native/<host>; failures are summarised per module (`ninja -k 0`) against the goals: which failed modules each goal reaches, those with no failed dependency first (most modules waiting on them first), each with its cause (compiler `error:` lines, a link's undefined symbols).
+    /// this checkout's build dir (`xtask out`); failures are summarised per module (`ninja -k 0`) against the goals: which failed modules each goal reaches, those with no failed dependency first (most modules waiting on them first), each with its cause (compiler `error:` lines, a link's undefined symbols).
     /// Gates over what was built, each failing the run: the provided gate (provided libraries win symbol lookup) and the licence gate (every source and header linked into a device artifact has a licence licenses.toml allows in the runtime).
     /// Preflight: every AOSP checkout and every upstream built for providers.toml must be its pin + patches/ (the drift test), since the build compiles checkouts as they are and never writes patches/.
-    /// Task copies (`xtask patch --edit`) replace their src/ checkout. With AOSP ones, `native` and `check` re-execute inside a mount namespace (`bwrap --dev-bind / /`) where each is bind-mounted over src/aosp/<project>, so the tree path is always src/aosp; the slot's `built-from` record names each bound copy and its state.
+    /// Task copies (`xtask patch --edit`) replace their src/ checkout. With AOSP ones, `native` and `check` re-execute inside a mount namespace (`bwrap --dev-bind / /`) where each is bind-mounted over src/aosp/<project>, so the tree path is always src/aosp; the build dir's `built-from` record names each bound copy and its state.
     /// Risk: `ninja` run by hand outside the namespace reads the unpatched src/aosp; `native --shell <goal> --host <h>` opens $SHELL inside it.
     Native(native::Args),
     /// The key set product APKs are signed with (keys.rs): per Soong certificate role (`platform`, `testkey`) `<role>.x509.pem` + `<role>.pk8`.
     ///
-    /// Default dir: the workspace's dev set <workspace>/keys, shared by every slot; `native` signs with it unless given `--keys`. Never AOSP's published keys, never committed.
+    /// Default dir: the workspace's dev set <workspace>/keys, shared by every build dir; `native` signs with it unless given `--keys`. Never AOSP's published keys, never committed.
     /// Dry run by default: lists the roles present and missing. `--execute` makes the missing ones with openssl as AOSP's make_key does.
     Keys(keys::Args),
     /// The pinned QEMU's user-mode executable for a guest arch (`qemu-<target>`), built with no patch.
     ///
     /// Dry run unless `--execute`: then QEMU's own `configure` and ninja build `qemu-<target>` into `<out>/qemu/<target>-linux-user`, and its `--version` must name the sources.toml pin.
     Qemu(qemu::Args),
-    /// Build-output slots: the out dir each checkout builds into by default (`show`, `list`, `assign`).
+    /// Build dirs: the out dir each checkout builds into by default (`show`, `prune`, `publish`).
     ///
-    /// The pool is `build.slots` dirs <workspace>/out/slot-<n> (<workspace>/workspace.toml, default 3; `list` prints the effective limits); a checkout holds at most one, recorded in its git dir. `native`, `check` and `test` build into it without `--out` / `--java-out`. A slotted checkout's `target/` links to the slot's `target/`, so its cargo builds go there too.
-    Slot {
+    /// One per checkout, <workspace>/out/pool/ws/<id> (`repo` = the main checkout, else the worktree name), made by the first build command from main's newest published build (`base/<commit>`, a reflink copy where the filesystem has them, else a full copy). `native`, `check` and `test` build into it without `--out` / `--java-out`, seen at <workspace>/out/build. The checkout's `target/` links to the dir's `target/`, so its cargo builds go there too.
+    Out {
         #[command(subcommand)]
-        slot: slot::Slot,
+        out: out::Out,
     },
     /// Our commits on upstream checkouts: patch branch -> patches/<upstream>/*.patch.
     ///
@@ -131,11 +131,11 @@ pub fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
     let root = checkout_root()?;
     let name = verdict_name(&cli.command);
-    // every command that builds or runs from the out dir sees the task copies, the repo bind and its slot at the canonical build path (tree.rs, slot::CANONICAL).
-    // Outside stay the ones that change what the namespace binds or that orchestrate other checkouts: fetch and patch write src/ (a bind would redirect the write into a task copy), slot moves the bind, land's children enter their own.
+    // every command that builds or runs from the out dir sees the task copies, the repo bind and its build dir at the canonical build path (tree.rs, out::CANONICAL).
+    // Outside stay the ones that change what the namespace binds or that orchestrate other checkouts: fetch and patch write src/ (a bind would redirect the write into a task copy), out copies and deletes build dirs, land's children enter their own.
     let shell = match &cli.command {
         Command::Native(a) => Some(a.shell),
-        Command::Fetch(_) | Command::Patch(_) | Command::Slot { .. } | Command::Land(_) => None,
+        Command::Fetch(_) | Command::Patch(_) | Command::Out { .. } | Command::Land(_) => None,
         _ => Some(false),
     };
     if let Some(shell) = shell {
@@ -151,7 +151,7 @@ pub fn main() -> Result<ExitCode> {
             return Ok(code);
         }
     }
-    // commands whose cargo builds write the checkout's target dir: their stale incremental sessions go when they end (slot::after_build)
+    // commands whose cargo builds write the checkout's target dir: their stale incremental sessions go when they end (out::after_build)
     let builds_trees = matches!(
         cli.command,
         Command::Native(_)
@@ -172,7 +172,7 @@ pub fn main() -> Result<ExitCode> {
         Command::Native(args) => native::run(&root, &args),
         Command::Keys(args) => keys::run(&root, &args),
         Command::Qemu(args) => qemu::run(&root, &args),
-        Command::Slot { slot } => slot::run(&root, &slot),
+        Command::Out { out } => out::run(&root, &out),
         Command::Patch(args) => patch::run(&root, &args),
         Command::Land(args) => land::run(&root, &args),
         Command::Licence(args) => notice::run(&root, &args),
@@ -191,9 +191,18 @@ pub fn main() -> Result<ExitCode> {
         Command::Test(p) => harness::pass_through(&root, "test", &p.args),
     };
     let result = if builds_trees {
-        slot::after_build(&root, result)
+        out::after_build(&root, result)
     } else {
         result
+    };
+    // after the command, never before: the binary may run from the real `target/` this replaces (out::settle_target)
+    let result = match (result, out::settle_target(&root)) {
+        (result, Ok(())) => result,
+        (Ok(_), Err(e)) => Err(e),
+        (Err(e), Err(settle)) => {
+            eprintln!("out: target: {settle:#}");
+            Err(e)
+        }
     };
     // a run that ends in an error (`?`, bail!) still ends with its verdict line; main prints the error after it
     if let (Err(e), Some(name)) = (&result, name) {

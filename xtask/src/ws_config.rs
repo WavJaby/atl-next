@@ -4,10 +4,7 @@
 //!
 //! ```toml
 //! [build]
-//! slots = 3            # out/slot-<n> count
 //! parallel_builds = 2  # machine-wide full native builds
-//! slow_slots = [5, 6]  # slots on slow (HDD) disks
-//! slow_builds = 1      # of parallel_builds, at most this many go to slow slots at once
 //! [cache]
 //! sccache_size = "5G"  # shared C/C++ compiler cache
 //! [fetch]
@@ -21,9 +18,9 @@ use anyhow::{Context, Result, bail, ensure};
 /// File name under the workspace.
 pub const FILE: &str = "workspace.toml";
 
-/// Slots in the pool = checkouts that hold an out dir at once, i.e. agents working in parallel. Disk is the limit: each slot is a whole out dir (9-15 GB measured 2026-11-07, ~25 GB planned per slot), so one per worktree is too much; 3 keeps the vhdx's host drive from filling between owner compactions (2026-11-08: 52.8 GB free, vhdx 146 GB vs 113 GB used; owner cut 5 -> 3).
-/// Concurrent builds are a separate limit (CPU/RAM), [`DEFAULT_PARALLEL_BUILDS`]: a slot holder mostly edits and tests, and queues only for ninja.
-pub const DEFAULT_SLOTS: u32 = 3;
+/// Keys of the fixed slot pool, replaced by per-checkout build dirs (out.rs): accepted and ignored, with a note, so a workspace.toml still read by binaries from before the pool keeps working for them.
+/// Condition: some checkout still runs a pre-pool xtask. Delete this list, and the keys from the file, once none does (the slot disks' retirement).
+const RETIRED: [&str; 3] = ["slots", "slow_slots", "slow_builds"];
 
 /// Concurrent full native builds. 2 = the owner's limit on the dev machine (20 cores, 31 GB RAM): one ninja `-k 0` build already takes every core, and its peak link steps (ART, libcore) take several GB each, so a third build only adds memory pressure.
 pub const DEFAULT_PARALLEL_BUILDS: u32 = 2;
@@ -76,39 +73,15 @@ impl<T: std::fmt::Display> std::fmt::Display for Setting<T> {
 pub struct WsConfig {
     /// The file read, or that would be read.
     pub path: PathBuf,
-    /// `build.slots`: dirs `out/slot-1..=slots`.
-    pub slots: Setting<u32>,
     /// `build.parallel_builds`: build tokens (`build_pool`).
     pub parallel_builds: Setting<u32>,
     /// `cache.sccache_size`: `SCCACHE_CACHE_SIZE`.
     pub sccache_size: Setting<String>,
     /// `fetch.for`: gates (`gate_goals` names or `all-gates`) whose `needed_by` projects fetch checks out; empty = core only.
     pub fetch_for: Setting<Vec<String>>,
-    /// `build.slow_slots`: slots on slow disks (HDD-backed); a native build in one also needs a slow-class token (`build_pool`). Declared, not probed: inside WSL every virtual disk reports `queue/rotational` 1, SSD-backed ones too (2026-11-14).
-    pub slow_slots: Setting<Vec<u32>>,
-    /// `build.slow_builds`: how many of the `parallel_builds` tokens slow-slot builds may hold at once, [`DEFAULT_SLOW_BUILDS`].
-    pub slow_builds: Setting<u32>,
 }
 
-/// Slow-slot builds at once. 1 of the default 2 tokens: the other always stays free for a fast slot, so an SSD lane never waits behind an HDD build (owner rule 2026-11-13).
-pub const DEFAULT_SLOW_BUILDS: u32 = 1;
-
 impl WsConfig {
-    /// The one line `slot list` prints.
-    pub fn summary(&self) -> String {
-        let slow: Vec<String> = self.slow_slots.value.iter().map(u32::to_string).collect();
-        format!(
-            "{}: slots {}, parallel_builds {}, slow_slots [{}], slow_builds {}, sccache_size {}, fetch.for {}",
-            self.path.display(),
-            self.slots,
-            self.parallel_builds,
-            slow.join(", "),
-            self.slow_builds,
-            self.sccache_size,
-            self.fetch_for_shown()
-        )
-    }
-
     /// `fetch.for` as a report shows it.
     pub fn fetch_for_shown(&self) -> String {
         let from = match self.fetch_for.origin {
@@ -174,12 +147,9 @@ pub fn load(ws: &Path) -> Result<WsConfig> {
 fn defaults(path: PathBuf) -> WsConfig {
     WsConfig {
         path,
-        slots: Setting::default(DEFAULT_SLOTS),
         parallel_builds: Setting::default(DEFAULT_PARALLEL_BUILDS),
         sccache_size: Setting::default(DEFAULT_SCCACHE_SIZE.to_owned()),
         fetch_for: Setting::default(Vec::new()),
-        slow_slots: Setting::default(Vec::new()),
-        slow_builds: Setting::default(DEFAULT_SLOW_BUILDS),
     }
 }
 
@@ -197,42 +167,27 @@ pub fn parse(text: &str, path: &Path) -> Result<WsConfig> {
         for (key, value) in section {
             let at = format!("{shown}: `{name}.{key}`");
             match (name.as_str(), key.as_str()) {
-                ("build", "slots") => cfg.slots = Setting::file(count(value, &at)?),
                 ("build", "parallel_builds") => {
                     cfg.parallel_builds = Setting::file(count(value, &at)?);
                 }
-                ("build", "slow_slots") => cfg.slow_slots = Setting::file(slot_list(value, &at)?),
-                ("build", "slow_builds") => cfg.slow_builds = Setting::file(count(value, &at)?),
+                ("build", k) if RETIRED.contains(&k) => {
+                    static NOTED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!(
+                            "{at}: retired with the slot pool, ignored (with any other {RETIRED:?}); delete them once no pre-pool checkout runs"
+                        );
+                    }
+                }
                 ("cache", "sccache_size") => cfg.sccache_size = Setting::file(size(value, &at)?),
                 ("fetch", "for") => cfg.fetch_for = Setting::file(gates(value, &at)?),
                 _ => bail!(
-                    "{at} is not a known key (known: build.slots, build.parallel_builds, build.slow_slots, build.slow_builds, cache.sccache_size, fetch.for)"
+                    "{at} is not a known key (known: build.parallel_builds, cache.sccache_size, fetch.for)"
                 ),
             }
         }
     }
-    // a slow class as large as the pool lets slow builds take every token, the case the class exists to prevent
-    ensure!(
-        cfg.slow_slots.value.is_empty() || cfg.slow_builds.value < cfg.parallel_builds.value,
-        "{shown}: `build.slow_builds` ({}) must be below `build.parallel_builds` ({}) so a fast slot always has a token",
-        cfg.slow_builds.value,
-        cfg.parallel_builds.value
-    );
     Ok(cfg)
-}
-
-/// A list of distinct slot numbers.
-fn slot_list(value: &toml::Value, at: &str) -> Result<Vec<u32>> {
-    let toml::Value::Array(items) = value else {
-        bail!("{at} must be a list of slot numbers, not {value}");
-    };
-    let mut out = Vec::new();
-    for item in items {
-        let n = count(item, at)?;
-        ensure!(!out.contains(&n), "{at} lists slot {n} twice");
-        out.push(n);
-    }
-    Ok(out)
 }
 
 /// A positive integer.
@@ -294,11 +249,10 @@ mod tests {
         format!("{:#}", parse(text, path()).expect_err("must refuse"))
     }
 
-    // expected defaults are the spec's (owner 2026-11-11): slots 3, parallel_builds 2, sccache_size 5G
+    // expected defaults are the spec's (owner 2026-11-11): parallel_builds 2, sccache_size 5G
     #[test]
     fn empty_file_and_absent_file_give_the_defaults() {
         let cfg = parse("", path()).expect("empty");
-        assert_eq!(cfg.slots, Setting::default(3));
         assert_eq!(cfg.parallel_builds, Setting::default(2));
         assert_eq!(cfg.sccache_size, Setting::default("5G".to_owned()));
         let dir = std::env::temp_dir().join(format!("xtask-wscfg-{}-absent", std::process::id()));
@@ -306,22 +260,28 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("scratch");
         let absent = load(&dir).expect("absent file");
         std::fs::remove_dir_all(&dir).expect("cleanup");
-        assert_eq!(absent.slots, Setting::default(3));
+        assert_eq!(absent.parallel_builds, Setting::default(2));
         assert_eq!(absent.sccache_size.origin, Origin::Default);
     }
 
     #[test]
     fn file_values_override_and_absent_keys_default() {
-        let cfg = parse(
-            "[build]\nslots = 5\n[cache]\nsccache_size = \"8G\"\n",
-            path(),
-        )
-        .expect("valid");
-        assert_eq!(cfg.slots, Setting::file(5));
+        let cfg = parse("[cache]\nsccache_size = \"8G\"\n", path()).expect("valid");
         assert_eq!(cfg.parallel_builds, Setting::default(2));
         assert_eq!(cfg.sccache_size, Setting::file("8G".to_owned()));
-        let all = parse("[build]\nslots = 1\nparallel_builds = 4\n", path()).expect("valid");
+        let all = parse("[build]\nparallel_builds = 4\n", path()).expect("valid");
         assert_eq!(all.parallel_builds, Setting::file(4));
+    }
+
+    /// The live workspace.toml of pre-pool checkouts still carries the slot keys: accepted, whatever their value, and ignored.
+    #[test]
+    fn retired_slot_keys_are_ignored() {
+        let cfg = parse(
+            "[build]\nslots = 6\nparallel_builds = 2\nslow_slots = [5, 6]\nslow_builds = 1\n",
+            path(),
+        )
+        .expect("retired keys accepted");
+        assert_eq!(cfg.parallel_builds, Setting::file(2));
     }
 
     #[test]
@@ -345,16 +305,19 @@ mod tests {
         );
         let m = err("[cash]\nsccache_size = \"5G\"\n");
         assert!(m.contains("`cash.sccache_size`"), "{m}");
-        let m = err("slots = 3\n");
-        assert!(m.contains("`slots` must be a table"), "{m}");
+        let m = err("parallel_builds = 3\n");
+        assert!(m.contains("`parallel_builds` must be a table"), "{m}");
     }
 
     #[test]
     fn invalid_values_are_refused_by_name() {
         for (text, key) in [
-            ("[build]\nslots = 0\n", "`build.slots`"),
-            ("[build]\nslots = -1\n", "`build.slots`"),
-            ("[build]\nslots = \"3\"\n", "`build.slots`"),
+            ("[build]\nparallel_builds = 0\n", "`build.parallel_builds`"),
+            ("[build]\nparallel_builds = -1\n", "`build.parallel_builds`"),
+            (
+                "[build]\nparallel_builds = \"3\"\n",
+                "`build.parallel_builds`",
+            ),
             (
                 "[build]\nparallel_builds = 2.5\n",
                 "`build.parallel_builds`",
@@ -372,29 +335,6 @@ mod tests {
             );
         }
         assert!(err("[build\n").contains("not valid TOML"));
-    }
-
-    #[test]
-    fn summary_names_each_origin() {
-        let cfg = parse("[build]\nslots = 2\n", path()).expect("valid");
-        assert_eq!(
-            cfg.summary(),
-            "/ws/workspace.toml: slots 2 (file), parallel_builds 2 (default), slow_slots [], slow_builds 1 (default), sccache_size 5G (default), fetch.for [] = core only (default)"
-        );
-    }
-
-    #[test]
-    fn slow_class_is_parsed_and_bounded() {
-        let cfg = parse("[build]\nslow_slots = [5, 6]\n", path()).expect("valid");
-        assert_eq!(cfg.slow_slots, Setting::file(vec![5, 6]));
-        assert_eq!(cfg.slow_builds, Setting::default(1));
-        assert!(err("[build]\nslow_slots = [5, 5]\n").contains("twice"));
-        assert!(err("[build]\nslow_slots = [0]\n").contains("positive integer"));
-        // the class must leave at least one pool token to fast slots
-        assert!(
-            err("[build]\nparallel_builds = 2\nslow_builds = 2\nslow_slots = [5]\n")
-                .contains("must be below")
-        );
     }
 
     // gate names from gate_goals.rs GATES (`cts`, `gl`) and its `--for` value `all-gates`
@@ -435,7 +375,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("xtask-wscfg-{}-for", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch");
-        std::fs::write(dir.join(FILE), "# mine\n[build]\nslots = 2\n").expect("file");
+        std::fs::write(dir.join(FILE), "# mine\n[build]\nparallel_builds = 1\n").expect("file");
         assert_eq!(add_fetch_for(&dir, &["cts".into()]).unwrap(), ["cts"]);
         assert_eq!(
             add_fetch_for(&dir, &["cts".into(), "gl".into()]).unwrap(),
@@ -446,8 +386,11 @@ mod tests {
         let text = std::fs::read_to_string(dir.join(FILE)).unwrap();
         let cfg = load(&dir).unwrap();
         std::fs::remove_dir_all(&dir).expect("cleanup");
-        assert!(text.starts_with("# mine\n[build]\nslots = 2\n"), "{text}");
+        assert!(
+            text.starts_with("# mine\n[build]\nparallel_builds = 1\n"),
+            "{text}"
+        );
         assert_eq!(cfg.fetch_for.value, ["cts", "gl"]);
-        assert_eq!(cfg.slots, Setting::file(2));
+        assert_eq!(cfg.parallel_builds, Setting::file(1));
     }
 }

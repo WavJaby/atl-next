@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 
 pub const FILE: &str = "launcher-closure.toml";
-/// The launcher's package and executable, the loader (packages.rs: built into the slot's converter target dir).
+/// The launcher's package and executable, the loader (packages.rs: built into the build dir's converter target dir).
 const LAUNCHER: &str = "atl-app-launcher";
 /// The runtime cdylib the loader dlopens `RTLD_LOCAL` (atl-app-launcher main.rs), installed in `<out>/crates/<LAUNCHER>/lib` (packages.rs `install_cdylib`).
 pub const RUNTIME: &str = "libatl_app_runtime.so";
@@ -239,13 +239,13 @@ fn interpreter(exe: &Path) -> Result<PathBuf> {
     bail!("{}: no PT_INTERP", exe.display())
 }
 
-/// Step `launcher-closure` on this checkout's slot; `Some(why)` (a skip) without a slot or a built launcher. The table's build-free rules are checked first, slot or not.
+/// Step `launcher-closure` on this checkout's build dir; `Some(why)` (a skip) without a built launcher. The table's build-free rules are checked first.
 pub fn check_own(root: &Path) -> Result<Option<String>> {
     let table = load(root)?;
-    let Some(n) = crate::slot::record_slot(root)? else {
-        return Ok(Some("this checkout holds no slot: run `cargo xtask slot assign <n> --execute`, then `cargo xtask native`".into()));
-    };
-    let out = crate::slot::slot_dir(atl_layout::Layout::of(root)?.workspace(), n);
+    let out = crate::out::dir_of(
+        atl_layout::Layout::of(root)?.workspace(),
+        &crate::out::checkout_id(root)?,
+    );
     let bin_dir = crate::packages::target_dir(&out).join("release");
     let launcher = bin_dir.join(LAUNCHER);
     if !launcher.is_file() {
@@ -266,7 +266,7 @@ pub fn check_own(root: &Path) -> Result<Option<String>> {
         "no {}: `cargo xtask native` builds it with the launcher",
         installer.display()
     );
-    // reads built binaries: a slot from another source state would judge a stale launcher
+    // reads built binaries: a build from another source state would judge a stale launcher
     crate::build_state::ensure_current(root, &out)?;
     let libs = crate::host_art::runtime_libs(&out)?;
     let lines = check(&table, &launcher, &runtime, &libs)?;

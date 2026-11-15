@@ -9,7 +9,7 @@ use std::process::Command;
 use anyhow::{Context, Result, ensure};
 use atl_layout::Layout;
 
-use crate::{arches, packages, slot, tree};
+use crate::{arches, packages, tree};
 
 /// The boot classpath: the dex jars the Java pipeline's goal `platform-bootclasspath` built, one per line in BOOTCLASSPATH order (bp2ninja bootclasspath.go derives it as Soong's product config and derive_classpath do).
 const BOOTCLASSPATH: &str = "bootclasspath.txt";
@@ -135,7 +135,7 @@ pub fn java_tools(root: &Path, java_out: &Path) -> Result<(PathBuf, PathBuf)> {
 }
 
 impl HostArt {
-    /// Stages the converter's ART of build dir `out` into `<out>/<stage>` and checks every input exists; `java_out` = the Java pipeline build dir (default: this checkout's slot, see `xtask slot`; else <workspace>/out/java/build).
+    /// Stages the converter's ART of build dir `out` into `<out>/<stage>` and checks every input exists; `java_out` = the Java pipeline build dir (default: this checkout's build dir, see `xtask out`).
     pub fn new(
         root: &Path,
         host: &str,
@@ -150,9 +150,7 @@ impl HostArt {
             .filter(|a| a.host.is_some())
             .with_context(|| format!("{host}: not a host arch in {}", arches::FILE))?;
         let layout = Layout::of(root)?;
-        let java_out = slot::out_dir(root, java_out, "--java-out", |workspace| {
-            workspace.join("out/java/build")
-        })?;
+        let java_out = crate::out::out_dir(root, java_out)?;
         let (d8, jdk) = java_tools(root, &java_out)?;
         let art = out.join(stage);
         let lib_path = stage_art(out, &art, &tree::shared_tree(&layout), arch.pointer_bits)?;

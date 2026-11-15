@@ -402,7 +402,7 @@ pub fn ensure_built(
     let missing: Vec<String> = wanted.into_iter().filter(|g| !built.contains(g)).collect();
     if !missing.is_empty() {
         bail!(
-            "gate `{name}`: the slot was not built with native goal(s) {}: run `cargo xtask native --host {host_arch} --for {name}`",
+            "gate `{name}`: the build dir was not built with native goal(s) {}: run `cargo xtask native --host {host_arch} --for {name}`",
             missing.join(" ")
         );
     }

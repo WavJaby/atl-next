@@ -175,15 +175,12 @@ fn drop_stale_cache(src: &Path, build: &Path, wanted: &[(&str, &str)]) -> Result
     {
         why = Some(format!("generated from {old}, not {}", src.display()));
     }
-    // configured before the canonical build path (slot::CANONICAL): cmake accepts the bound dir as the same build dir (CMAKE_CACHEFILE_DIR is rewritten),
-    // but keeps derived entries naming the slot's real path (compiler-rt's COMPILER_RT_OUTPUT_DIR, LLVM_THINLTO_CACHE_PATH), so a copy of the slot would write into the original
-    let real = crate::slot::real(build);
-    if why.is_none() && real != build && text.contains(&*real.to_string_lossy()) {
-        why = Some(format!(
-            "entries name {}, not {}",
-            real.display(),
-            build.display()
-        ));
+    // configured before the canonical build path (out::CANONICAL), e.g. in a base copied from such a build: cmake accepts the bound dir as the same build dir (CMAKE_CACHEFILE_DIR is rewritten),
+    // but keeps derived entries naming that build dir's real path (compiler-rt's COMPILER_RT_OUTPUT_DIR, LLVM_THINLTO_CACHE_PATH), so the copy would write into the original
+    if why.is_none()
+        && let Some(other) = crate::out::foreign_build_dir(&text)
+    {
+        why = Some(format!("entries name {other}, not {}", build.display()));
     }
     for (key, value) in wanted.iter().filter(|(k, _)| COMPILER_ENTRIES.contains(k)) {
         // both sides through the same PATH lookup: a fresh configure records `:STRING=/usr/bin/clang-19`, a later configure given the same -D rewrites it `:UNINITIALIZED=clang-19`;

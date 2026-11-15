@@ -44,7 +44,7 @@ pub struct Args {
     /// arches.toml host row the executable runs on (default: the build machine). Another arch is a cross build (`<target>-linux-user-<host>`) gated by the host's isa, glibc_floor and sysroot instead of a `--version` run.
     #[arg(long)]
     pub host: Option<String>,
-    /// Out dir (default: this checkout's slot, see `xtask slot`; else <workspace>/out).
+    /// Out dir (default: this checkout's build dir, see `xtask out`).
     #[arg(long)]
     pub out: Option<PathBuf>,
     /// The `-fPIC` variant (`<target>-linux-user-pic`) the spike library links, not the executable the gates run.
@@ -172,7 +172,7 @@ impl Build {
     }
 }
 
-/// The build of `arch` into `out` (default: this checkout's slot). Reads only: the pin, the NDK and the deps rows, then the out dir (which takes the slot lock, as every build does).
+/// The build of `arch` into `out` (default: this checkout's build dir). Reads only: the pin, the NDK and the deps rows, then the out dir (which takes the dir lock, as every build does).
 pub fn plan(root: &Path, arch: &str, out: Option<&Path>, pic: bool) -> Result<Build> {
     plan_on(root, arch, None, out, pic)
 }

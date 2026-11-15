@@ -19,8 +19,8 @@ use crate::sources::Pin;
 use crate::verdict::{Failure, Verdict};
 use crate::{
     arches, build_pool, converter, deps, fetch, licence_gate, licenses, ndk_surface, none_gate,
-    packages, patch, provided_gate, providers, prune, runtimes, slot, sources, system, tree,
-    triage, upstream, workspace, ws_config,
+    packages, patch, provided_gate, providers, prune, runtimes, sources, system, tree, triage,
+    upstream, workspace, ws_config,
 };
 
 #[derive(clap::Args, Clone)]
@@ -55,7 +55,7 @@ pub struct Args {
     /// Compile without the compiler cache, e.g. to rule it out while debugging a build.
     #[arg(long)]
     no_compiler_cache: bool,
-    /// Build nothing: open $SHELL inside the task-copy namespace (task copies bound over src/aosp), e.g. to run `ninja` by hand on the slot; outside it ninja reads the unpatched src/aosp.
+    /// Build nothing: open $SHELL inside the task-copy namespace (task copies bound over src/aosp), e.g. to run `ninja` by hand on the build dir; outside it ninja reads the unpatched src/aosp.
     #[arg(long)]
     pub shell: bool,
     /// Before building, convert again and again: pin and fetch the AOSP projects behind the modules and
@@ -63,7 +63,7 @@ pub struct Args {
     /// runs once, after that.
     #[arg(long)]
     fetch_missing: bool,
-    /// Build directory (default: this checkout's slot, see `xtask slot`; else `<workspace>/out/native/<host>`): concurrent checkouts keep their outputs apart.
+    /// Build directory (default: this checkout's build dir, see `xtask out`): concurrent checkouts keep their outputs apart.
     #[arg(long)]
     out: Option<std::path::PathBuf>,
     /// Failure summary: every distinct error message, undefined symbol and failed dependency per module (default: the first few; ninja.log keeps the full output).
@@ -526,13 +526,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // only ninja queues for a machine-wide token (build_pool.rs); the gates below run after it is released
     let tokens = build_pool::tokens(ws)?;
     let token = build_pool::acquire_build(ws, root, "native")?;
-    match &token.class {
-        Some(c) => println!(
-            "native: build token {} of {tokens}, slow-class token {}",
-            token.token.index, c.index
-        ),
-        None => println!("native: build token {} of {tokens}", token.token.index),
-    }
+    println!("native: build token {} of {tokens}", token.index);
     let graph_file = graph_out.join("graph.json");
     let graph: triage::Graph = serde_json::from_str(
         &std::fs::read_to_string(&graph_file)
@@ -926,7 +920,7 @@ pub fn nb_module_dir(graph: &Path, arch: &str, m: &str) -> PathBuf {
 const NB_GRAPH_DIR: &str = "nb-graph-";
 
 /// The dir of the native-bridge graph of guest `arch` under out dir `out` of host `host`: `out` for the host's own arch (the identity guest is part of the host graph, `nb/<host>`), else `out/nb-graph-<arch>`.
-/// Accepted constraint: one graph per foreign nb arch, not one multi-arch graph, since one converter run takes one `--native-bridge`. Its cost: each foreign graph has its own host closure of its nb goals and its own guest runtimes (compiles hit sccache, CompilerCache); one dir per arch per slot.
+/// Accepted constraint: one graph per foreign nb arch, not one multi-arch graph, since one converter run takes one `--native-bridge`. Its cost: each foreign graph has its own host closure of its nb goals and its own guest runtimes (compiles hit sccache, CompilerCache); one dir per arch per build dir.
 /// What it buys: a foreign build writes only its own dir, so the host graph and `bp2ninja.args` are never rewritten, and keepset and check keep reading the host graph.
 /// Retired when bp2ninja converts several nb arches into one graph (per-arch nb variants) and `Goals::nb` is keyed by ISA: then this dir, `build_state::foreign_out` and the `graph_out` split go.
 pub fn graph_dir(out: &Path, host: &str, arch: &str) -> PathBuf {
@@ -937,15 +931,12 @@ pub fn graph_dir(out: &Path, host: &str, arch: &str) -> PathBuf {
     }
 }
 
-/// Host `host`'s out dir: the slot (or `explicit`), else `<workspace>/out/native/<host>`. A cross host's outputs go under its arch's dir, so two arches in one slot never write the same path; the build machine's stay at the out dir, where its gates read them.
+/// Host `host`'s out dir: the checkout's build dir (or `explicit`). A cross host's outputs go under its arch's dir, so two arches in one build dir never write the same path; the build machine's stay at the out dir, where its gates read them.
 pub fn host_out(root: &Path, explicit: Option<&Path>, host: &str) -> Result<PathBuf> {
     let arches = arches::load(root)?;
     let (build_name, _) = arches::build_machine(root, &arches)?;
     let cross = host != build_name;
-    let out = slot::out_dir(root, explicit, "--out", |workspace| {
-        let native = workspace.join("out").join("native");
-        if cross { native } else { native.join(host) }
-    })?;
+    let out = crate::out::out_dir(root, explicit)?;
     Ok(if cross { out.join(host) } else { out })
 }
 
@@ -1651,7 +1642,7 @@ fn regen_runs(graph: &Path, converter: &Path, args: &Path) -> Result<bool> {
 
 /// Brings `<out>/build.ninja` up to date with `argv` (the converter's flags and goals): ninja decides whether to convert again, from the regeneration edge's depfile (every file the last conversion read, this argument file among them).
 /// Bootstrap (`bp2ninja -bootstrap`: a build.ninja holding only that edge) when there is no build.ninja, the argument file is new (a build.ninja from before it cannot rerun on it),
-/// or its regeneration edge runs another converter or argument file path: bp2ninja writes its own invocation path into the edge it emits, so a graph converted at another path (a slot from before the canonical build path, slot::CANONICAL) would regenerate itself with that path forever.
+/// or its regeneration edge runs another converter or argument file path: bp2ninja writes its own invocation path into the edge it emits, so a graph converted at another path (a build from before the canonical build path, out::CANONICAL) would regenerate itself with that path forever.
 fn convert(
     converter: &Path,
     out: &Path,
@@ -1703,7 +1694,7 @@ pub(crate) const GLOB_DIR: &str = "globs";
 
 /// The command of build.ninja's licence gate edge (bp2ninja -licence-gate): this xtask binary's hidden `licence-gate`, run from the checkout (xtask finds its root from the working directory).
 fn licence_gate_command(root: &Path, out: &Path) -> Result<String> {
-    let exe = crate::slot::canonical(&std::env::current_exe().context("the xtask binary")?);
+    let exe = crate::out::canonical(&std::env::current_exe().context("the xtask binary")?);
     let quote = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
     Ok(format!(
         "cd {} && {} licence-gate --out {} --artifacts $out.rsp --report $out --depfile $out.d",
