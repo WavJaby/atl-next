@@ -549,7 +549,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if let Some(first) = runpath_gate(&graph_out)? {
         failed.push(Failure::step("runpath gate", first));
     }
-    if let Some(first) = isa_floor_gate(root, &graph_out, host, &tiers, &provided_libs)? {
+    // a foreign guest graph holds only guest-arch ELFs under nb/<arch> (no host-ISA product to check): the gate would fail on "nothing checked"
+    if foreign {
+        println!("native: isa gate: foreign guest graph holds no host-ISA products: not checked");
+    } else if let Some(first) = isa_floor_gate(root, &graph_out, host, &tiers, &provided_libs)? {
         failed.push(Failure::step("isa gate", first));
     }
     if let Some(first) = fronts_gate(&graph_out, &tree)? {
