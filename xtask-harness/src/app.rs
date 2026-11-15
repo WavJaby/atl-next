@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use atl_layout::Layout;
+use atl_services_types::gl_driver;
 
 use crate::atld_run::{Package, Run, Runtime, children_outside_broker, counter_lines, counters};
 use crate::gl_scene::{Judged, Scene};
@@ -508,12 +509,12 @@ const PRIORITY_ASKS: [(&str, Option<i32>); 3] = [
     ("foreground", Some(-2)),
 ];
 
-/// Why the features line is wrong, else None. This headless run has:
+/// Why the features line is wrong under `cap`, else None. This headless run has:
 /// - landscape: an always-present feature (atld_run.rs FEATURE_FILES, AOSP's own file in /system/etc/permissions) -> true;
 /// - touchscreen: none, as no window takes input (atld declares it only with `--ui` and mouse-touch) -> false;
-/// - aep: atld's probed feature, compared with what the app's own ES 3 context lists (`gl-aep`, GL_EXTENSIONS has GL_ANDROID_extension_pack_es31a): equal whatever the host GPU;
+/// - aep: atld's advertised feature. `cap` withholds it -> false whatever the app's own ES 3 context lists (`gl-aep`, GL_EXTENSIONS has GL_ANDROID_extension_pack_es31a); not withheld -> equal to `gl-aep`;
 /// - listed: getSystemAvailableFeatures holds landscape; `gles` (its GL ES entry) = `config` (ActivityManager.getDeviceConfigurationInfo().reqGlEsVersion), both ro.opengles.version, non-zero (the run probes GL).
-fn features_why(line: Option<&str>) -> Option<String> {
+fn features_why(line: Option<&str>, cap: &gl_driver::GlCeiling) -> Option<String> {
     let Some(line) = line else {
         return Some("no line".to_owned());
     };
@@ -531,9 +532,19 @@ fn features_why(line: Option<&str>) -> Option<String> {
             return Some(format!("{key}: want {want}, got {:?}", get(key)));
         }
     }
-    match (get("aep"), get("gl-aep")) {
-        (Some(a), Some(g)) if a == g && (a == "true" || a == "false") => {}
-        (a, g) => return Some(format!("aep {a:?} != the app's GL {g:?}")),
+    // withheld: false whatever the app's GL lists; advertised: equal to it
+    let aep_ok = match (get("aep"), get("gl-aep"), cap.aep) {
+        (Some("false"), Some(_), false) => true,
+        (Some(a), Some(g), true) => a == g && (a == "true" || a == "false"),
+        _ => false,
+    };
+    if !aep_ok {
+        return Some(format!(
+            "aep {:?} vs the app's GL {:?}, ceiling aep={}",
+            get("aep"),
+            get("gl-aep"),
+            cap.aep
+        ));
     }
     match (get("gles"), get("config")) {
         (Some(g), Some(c)) if g == c && g != "0x0" => None,
@@ -1848,7 +1859,7 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
     let features = app
         .lines()
         .find_map(|l| l.split_once(FEATURES).map(|(_, r)| r.trim_end().to_owned()));
-    if passed && let Some(why) = features_why(features.as_deref()) {
+    if passed && let Some(why) = features_why(features.as_deref(), &gl_driver::ANGLE_GL_CEILING) {
         whys.push(format!("features: {why} (line {features:?})"));
     }
     let priority = app
@@ -2316,24 +2327,37 @@ mod tests {
         assert!(webview_ua_why(None, Some(engine)).is_some());
     }
 
-    /// The features line: a host with AEP and one without both pass when the app's GL agrees; the break run (no static files) and a probe that disagrees with the app's GL fail.
+    /// The features line under the ANGLE ceiling: AEP withheld passes whatever the app's GL lists; lifted, AEP must equal it. The break run (no static files), a GL ES mismatch and a probe that disagrees with the app's GL fail.
     #[test]
     fn features_line_judges_presence_probe_and_gles() {
-        let ok = "landscape=true touchscreen=false aep=true gl-aep=true listed=true gles=0x30002 config=0x30002";
-        assert_eq!(features_why(Some(ok)), None);
+        let withheld = gl_driver::ANGLE_GL_CEILING;
+        let lifted = gl_driver::GlCeiling { aep: true };
+        // sifive: the host GL lists AEP, the device does not advertise it
+        let ok = "landscape=true touchscreen=false aep=false gl-aep=true listed=true gles=0x30002 config=0x30002";
+        assert_eq!(features_why(Some(ok), &withheld), None);
         let no_aep = "landscape=true touchscreen=false aep=false gl-aep=false listed=true gles=0x30001 config=0x30001";
-        assert_eq!(features_why(Some(no_aep)), None);
+        assert_eq!(features_why(Some(no_aep), &withheld), None);
+        let aep_lifted = "landscape=true touchscreen=false aep=true gl-aep=true listed=true gles=0x30002 config=0x30002";
+        assert_eq!(features_why(Some(aep_lifted), &lifted), None);
         for bad in [
             // --features-break: no static permission files
-            "landscape=false touchscreen=false aep=true gl-aep=true listed=false gles=0x30002 config=0x30002",
-            "landscape=true touchscreen=true aep=true gl-aep=true listed=true gles=0x30002 config=0x30002",
-            "landscape=true touchscreen=false aep=false gl-aep=true listed=true gles=0x30002 config=0x30002",
-            "landscape=true touchscreen=false aep=true gl-aep=true listed=true gles=0x0 config=0x0",
-            "landscape=true touchscreen=false aep=true gl-aep=true listed=true gles=0x30002 config=0x30001",
+            "landscape=false touchscreen=false aep=false gl-aep=false listed=false gles=0x30002 config=0x30002",
+            "landscape=true touchscreen=true aep=false gl-aep=false listed=true gles=0x30002 config=0x30002",
+            "landscape=true touchscreen=false aep=false gl-aep=false listed=true gles=0x0 config=0x0",
+            "landscape=true touchscreen=false aep=false gl-aep=false listed=true gles=0x30002 config=0x30001",
+            // withheld, yet advertised
+            "landscape=true touchscreen=false aep=true gl-aep=true listed=true gles=0x30002 config=0x30002",
         ] {
-            assert!(features_why(Some(bad)).is_some(), "{bad}");
+            assert!(features_why(Some(bad), &withheld).is_some(), "{bad}");
         }
-        assert!(features_why(None).is_some());
+        // lifted: advertised must equal the app's GL, both ways
+        for bad in [
+            "landscape=true touchscreen=false aep=true gl-aep=false listed=true gles=0x30002 config=0x30002",
+            "landscape=true touchscreen=false aep=false gl-aep=true listed=true gles=0x30002 config=0x30002",
+        ] {
+            assert!(features_why(Some(bad), &lifted).is_some(), "{bad}");
+        }
+        assert!(features_why(None, &withheld).is_some());
     }
 
     /// A good end passes; the break (services SIGKILLed: no stop line, only the power-of-two line 2, lower bounds in the summary, no binderd exit line) fails on each count.

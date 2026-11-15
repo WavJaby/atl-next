@@ -27,6 +27,19 @@ pub enum GlDriver {
     Angle,
 }
 
+/// What ANGLE's GL backend exposes to an app routed to it, beyond what the host GL answers. atld applies it to the device-wide features.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GlCeiling {
+    /// android.hardware.opengles.aep is advertised only when true.
+    pub aep: bool,
+}
+
+/// The ceiling of ANGLE's GL backend at the sources.toml pin. AEP is withheld: ANGLE's `CanSupportAEP` (Context.cpp) needs OES_sample_shading, EXT_copy_image, EXT_tessellation_shader and more, and the GL backend (renderer/gl/*.cpp) never sets sampleShadingOES, copyImageEXT, tessellationShaderEXT or primitiveBoundingBoxEXT.
+/// Condition: patch 0011 (patches/aosp/frameworks/native) forces ANGLE's OpenGL ES platform, so any app may be routed to ANGLE, and AOSP keeps one device-wide feature list: an advertised feature the app's driver lacks breaks it, an unadvertised one only sends it to its fallback.
+/// GLES version is not capped (owner decision 2026-11-16): GenerateCaps (renderergl_utils.cpp) starts from ES 3.1 and nothing raises it, so an ES1-path app on an ES 3.2 host is told 3.2 and gets 3.1. Capping the device-wide version would withhold 3.2 from every host-GL app.
+/// Retire when ANGLE runs its Vulkan backend: then delete this constant and its uses in the same change.
+pub const ANGLE_GL_CEILING: GlCeiling = GlCeiling { aep: false };
+
 #[derive(Deserialize)]
 struct Table {
     #[serde(default)]
@@ -148,6 +161,18 @@ pub fn selection<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Patch 0011's added line forces the GL platform; a patch that stops doing so fails here. Dropping or renaming the file breaks the build (include_str!). The `+` filter: the commit message also names the token.
+    #[test]
+    fn angle_gl_backend_forced_by_patch_0011() {
+        const PATCH: &str = include_str!(
+            "../../../patches/aosp/frameworks/native/0011-feat-egl-request-ANGLE-s-OpenGL-ES-platform-on-Andro.patch"
+        );
+        assert!(
+            PATCH.lines().any(|l| l.starts_with('+') && l.contains("EGL_PLATFORM_ANGLE_TYPE_OPENGLES_ANGLE")),
+            "patch 0011 no longer adds the GL platform"
+        );
+    }
 
     fn row(name: &str, driver: &str, reason: &str) -> String {
         format!("[[package]]\nname = \"{name}\"\ndriver = \"{driver}\"\nreason = \"{reason}\"\n")

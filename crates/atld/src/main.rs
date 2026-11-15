@@ -593,8 +593,16 @@ const FEATURES_TOUCHSCREEN: [(&str, i32); 2] = [
     ("android.hardware.touchscreen", 0),
     ("android.hardware.faketouch", 0),
 ];
-/// PackageManager.FEATURE_OPENGLES_EXTENSION_PACK (frameworks/native/data/etc/android.hardware.opengles.aep.xml).
+/// PackageManager.FEATURE_OPENGLES_EXTENSION_PACK (frameworks/native/data/etc/android.hardware.opengles.aep.xml). Withheld while `gl_driver::ANGLE_GL_CEILING` withholds it ([`device_gl`]).
 const FEATURE_OPENGLES_AEP: (&str, i32) = ("android.hardware.opengles.aep", 0);
+
+/// The device's extension pack and GLES version for a probed host GL: the pack only where `cap` allows it; the version is the host's, `GlCeiling` has no version field.
+fn device_gl(gl_version: &str, aep: bool, cap: &gl_driver::GlCeiling) -> (bool, Option<Property>) {
+    (
+        aep && cap.aep,
+        atl_property_service::gles_version(gl_version),
+    )
+}
 
 /// Writes [`HOST_FEATURES_FILE`] (also when empty: the file says which run found nothing) and logs `features: host <names>`.
 fn host_features_layout(r: &Root, features: &[(&str, i32)]) -> Result<()> {
@@ -2092,22 +2100,32 @@ fn run(a: &Args) -> Result<ExitCode> {
                 baseline.ok()
             }
         };
-        // the Android extension pack: a device with it declares the feature (CDD 7.1.4.1), as its vendor permission file does
-        if ran.as_ref().is_some_and(|r| r.aep) {
-            host_features.push(FEATURE_OPENGLES_AEP);
-        }
-        // the GLES version of the path that runs, as the device's vendor build.prop states it on Android; unset when no probe answered or the string is not GLES's
-        match ran.as_ref().map(|r| {
+        // the extension pack (a device with it declares the feature, CDD 7.1.4.1, as its vendor permission file does) and the GLES version of the path that runs (the vendor build.prop's, on Android); unset when no probe answered or the string is not GLES's; both via device_gl
+        let advertised = ran.as_ref().map(|r| {
             (
-                r.version.as_str(),
-                atl_property_service::gles_version(&r.version),
+                r,
+                device_gl(&r.version, r.aep, &gl_driver::ANGLE_GL_CEILING),
             )
-        }) {
-            Some((v, Some(prop))) => {
-                log(format_args!("gles: {}={} ({v})", prop.0, prop.1));
-                defaults.push(prop);
+        });
+        match advertised {
+            Some((r, (aep, gles))) => {
+                if r.aep && !aep {
+                    log(format_args!("features: aep withheld (ANGLE GL backend)"));
+                }
+                if aep {
+                    host_features.push(FEATURE_OPENGLES_AEP);
+                }
+                match gles {
+                    Some(prop) => {
+                        log(format_args!("gles: {}={} ({})", prop.0, prop.1, r.version));
+                        defaults.push(prop);
+                    }
+                    None => log(format_args!(
+                        "gles: unset (GL_VERSION {:?} not GLES)",
+                        r.version
+                    )),
+                }
             }
-            Some((v, None)) => log(format_args!("gles: unset (GL_VERSION {v:?} not GLES)")),
             None => log(format_args!("gles: unset (no renderer probed)")),
         }
     }
@@ -2541,6 +2559,59 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The device's extension pack and GLES version for a host GL: the pack only where the ANGLE ceiling allows it; the version is the host's, encoded major << 16 | minor (GLES_VERSION).
+    #[test]
+    fn device_gl_withholds_aep_keeps_gles_version() {
+        let cap = gl_driver::ANGLE_GL_CEILING;
+        // ES 3.2 with the pack (sifive): pack withheld, version kept
+        assert_eq!(
+            device_gl("OpenGL ES 3.2 Mesa 22.3.5", true, &cap),
+            (
+                false,
+                Some((
+                    "ro.opengles.version".to_owned(),
+                    ((3 << 16) | 2).to_string()
+                ))
+            )
+        );
+        // ES 3.1 without the pack (WSL D3D12): unchanged
+        assert_eq!(
+            device_gl("OpenGL ES 3.1 Mesa 25.0.7-2", false, &cap),
+            (
+                false,
+                Some((
+                    "ro.opengles.version".to_owned(),
+                    ((3 << 16) | 1).to_string()
+                ))
+            )
+        );
+        // ES 2.0: unchanged
+        assert_eq!(
+            device_gl("OpenGL ES 2.0", false, &cap),
+            (
+                false,
+                Some(("ro.opengles.version".to_owned(), (2 << 16).to_string()))
+            )
+        );
+        // not a GLES string: unset
+        assert_eq!(device_gl("4.6 (Core Profile)", true, &cap), (false, None));
+        // ceiling lifted: the host's answer passes through
+        assert_eq!(
+            device_gl(
+                "OpenGL ES 3.2 Mesa 22.3.5",
+                true,
+                &gl_driver::GlCeiling { aep: true }
+            ),
+            (
+                true,
+                Some((
+                    "ro.opengles.version".to_owned(),
+                    ((3 << 16) | 2).to_string()
+                ))
+            )
+        );
+    }
 
     /// KernelLogLine's shape (`<6>` = INFO, libbase logging.cpp) becomes a stamped logcat line atl-diag reads; other lines pass unchanged.
     #[test]
