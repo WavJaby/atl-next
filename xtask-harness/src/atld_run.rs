@@ -387,10 +387,16 @@ impl Run {
     }
 }
 
-/// The program name ([`atl_bwrap::PROGRAM`]) every process atld starts runs as: the broker launches nothing else.
-const BROKER_CHILD_COMM: &str = atl_bwrap::PROGRAM;
+/// The program names every process atld starts runs as, the broker's stages: bwrap ([`atl_bwrap::PROGRAM`]), and atl-sandbox-join, which runs bwrap for a web process inside its app's
+/// namespaces (atl_broker::webspawn). The broker launches nothing else.
+const BROKER_CHILD_PROGRAMS: [&str; 2] = [atl_bwrap::PROGRAM, "atl-sandbox-join"];
 
-/// atld's live children that did not come from the broker, as `<pid> <comm>`: every child of `atld` whose comm is not bwrap's. Read from `/proc/*/stat` (ppid, comm): `/proc/<pid>/task/*/children` needs CONFIG_PROC_CHILDREN, which the WSL kernel lacks.
+/// The kernel's comm of a program name: its first TASK_COMM_LEN - 1 = 15 bytes (linux/sched.h TASK_COMM_LEN 16, the NUL included).
+fn comm_of(program: &str) -> &str {
+    program.get(..15).unwrap_or(program)
+}
+
+/// atld's live children that did not come from the broker, as `<pid> <comm>`: every child of `atld` whose comm is no [`BROKER_CHILD_PROGRAMS`] one. Read from `/proc/*/stat` (ppid, comm): `/proc/<pid>/task/*/children` needs CONFIG_PROC_CHILDREN, which the WSL kernel lacks.
 /// A process that exits between the directory listing and its stat read is skipped; atld is alive when this runs, so its sandboxes are too. A child between fork and exec carries its forker's comm: match it by pid, not comm.
 pub fn children_outside_broker(atld: u32) -> Result<Vec<String>> {
     let mut outside = Vec::new();
@@ -405,7 +411,7 @@ pub fn children_outside_broker(atld: u32) -> Result<Vec<String>> {
         let Some((comm, ppid)) = stat_comm_ppid(&stat) else {
             continue;
         };
-        if ppid == atld && comm != BROKER_CHILD_COMM {
+        if ppid == atld && !BROKER_CHILD_PROGRAMS.iter().any(|p| comm_of(p) == comm) {
             outside.push(format!("{pid} {comm}"));
         }
     }
@@ -1759,6 +1765,9 @@ mod tests {
             .arg("5")
             .spawn()
             .unwrap();
+        // the comm the kernel showed for the join stage in a real run ("763341 atl-sandbox-joi", webview-d2 app gate), and bwrap's whole name
+        assert_eq!(comm_of("atl-sandbox-join"), "atl-sandbox-joi");
+        assert_eq!(comm_of("bwrap"), "bwrap");
         let outside = children_outside_broker(std::process::id()).unwrap();
         let _ = child.kill();
         let _ = child.wait();
