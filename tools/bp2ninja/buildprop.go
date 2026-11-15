@@ -16,7 +16,7 @@ const buildPropFile = "gen/build.prop"
 //   - ro.build.version.*: gen_build_prop.py lines 200-212 from Soong's product variables, which build/make/core/version_util.mk + soong_config.mk derive from release flags:
 //     sdk = RELEASE_PLATFORM_SDK_VERSION; sdk_full = RELEASE_PLATFORM_SDK_VERSION_FULL, else "<sdk>.0", its major must equal sdk; preview_sdk = 0 when the codename is REL, else 1;
 //     codename = RELEASE_PLATFORM_VERSION_CODENAME; all_codenames = RELEASE_PLATFORM_VERSION_ALL_CODENAMES as a list (add_json_csv: split on commas and blanks) joined by ","; known_codenames = RELEASE_PLATFORM_VERSION_KNOWN_CODENAMES;
-//     release = RELEASE_PLATFORM_VERSION_LAST_STABLE; release_or_codename = PLATFORM_VERSION (last stable when REL, else the codename); release_or_preview_display = PLATFORM_DISPLAY_VERSION, which defaults to PLATFORM_VERSION; security_patch = RELEASE_PLATFORM_SECURITY_PATCH.
+//     release = RELEASE_PLATFORM_VERSION_LAST_STABLE; release_or_codename = PLATFORM_VERSION (last stable when REL, else the codename); release_or_preview_display = PLATFORM_DISPLAY_VERSION, which defaults to PLATFORM_VERSION; security_patch = RELEASE_PLATFORM_SECURITY_PATCH; min_supported_target_sdk = RELEASE_PLATFORM_MIN_SUPPORTED_TARGET_SDK_VERSION.
 //   - ro.build.tags: gen_build_prop.py BuildVersionTags = BUILD_VERSION_TAGS (none in this product) + get_build_keys (buildKeys) of the product's DefaultAppCertificate, which is -keys' testkey.
 //     release-keys is not a build's: AOSP's release re-sign (sign_target_files_apks) rewrites the tag, and ATL has no such step yet.
 //   - Not written: preview_sdk_fingerprint (an md5 over the API files, not a release flag) and base_os (PRODUCT_BASE_OS, product config; empty without one, the same as unset to Build.VERSION.BASE_OS).
@@ -50,6 +50,7 @@ func buildProp(r *Release, buildID, keys string) (string, error) {
 		{"ro.build.version.release_or_codename", version},
 		{"ro.build.version.release_or_preview_display", version},
 		{"ro.build.version.security_patch", field("RELEASE_PLATFORM_SECURITY_PATCH")},
+		{"ro.build.version.min_supported_target_sdk", field("RELEASE_PLATFORM_MIN_SUPPORTED_TARGET_SDK_VERSION")},
 		{"ro.build.tags", buildKeys(defaultCert(keys))},
 	}
 	var b strings.Builder

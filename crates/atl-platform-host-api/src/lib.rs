@@ -233,3 +233,94 @@ pub trait SampleStream: Send {
     /// The newest sample not returned before. Returns as soon as one is ready, or `Ok(None)` after `timeout` with none; the polled tier returns after one read (its span is its interval). The caller paces one call per period and repeats its last sample on `None`.
     fn next(&mut self, timeout: std::time::Duration) -> Result<Option<Sample>, SensorError>;
 }
+
+/// The UI language of a native program: glibc's `LC_MESSAGES` (POSIX XBD 8.2), the first non-empty of `LC_ALL`, `LC_MESSAGES`, `LANG`, as one BCP-47 tag.
+/// `LANGUAGE` (gettext's fallback list) is not read. `C`, `POSIX`, all unset, or a name [`bcp47_of_posix`] refuses: `None`, and the caller's default applies.
+/// `lookup` reads one environment variable; the Linux crate passes `std::env::var`.
+pub fn ui_locale_from(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .into_iter()
+        .find_map(|name| lookup(name).filter(|value| !value.is_empty()))
+        .and_then(|posix| bcp47_of_posix(&posix))
+}
+
+/// A POSIX locale name as a BCP-47 tag: `language[_territory][.codeset][@modifier]` -> `language[-TERRITORY]`, codeset and modifier dropped.
+/// `None` where the language is not 2-3 ASCII letters (so `C` and `POSIX` give none) or the territory is not 2 letters or 3 digits (RFC 5646 region).
+pub fn bcp47_of_posix(name: &str) -> Option<String> {
+    let base = name.split_once(['.', '@']).map_or(name, |(head, _)| head);
+    let (language, territory) = match base.split_once('_') {
+        Some((language, territory)) => (language, Some(territory)),
+        None => (base, None),
+    };
+    if !(2..=3).contains(&language.len()) || !language.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return None;
+    }
+    let mut tag = language.to_ascii_lowercase();
+    if let Some(territory) = territory {
+        let letters = territory.len() == 2 && territory.bytes().all(|b| b.is_ascii_alphabetic());
+        let digits = territory.len() == 3 && territory.bytes().all(|b| b.is_ascii_digit());
+        if !(letters || digits) {
+            return None;
+        }
+        tag.push('-');
+        tag.push_str(&territory.to_ascii_uppercase());
+    }
+    Some(tag)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A lookup over fixed variables; a name not listed is unset.
+    fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            vars.iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| (*v).to_owned())
+        }
+    }
+
+    #[test]
+    fn posix_names_map_to_bcp47_tags() {
+        // XBD 8.2 grammar; RFC 5646 region: 2 letters or 3 digits
+        for (name, tag) in [
+            ("zh_TW.UTF-8", "zh-TW"),
+            ("en_US", "en-US"),
+            ("de", "de"),
+            ("sr_RS@latin", "sr-RS"),
+            ("es_419.UTF-8", "es-419"),
+        ] {
+            assert_eq!(bcp47_of_posix(name).as_deref(), Some(tag), "{name}");
+        }
+    }
+
+    #[test]
+    fn c_posix_and_malformed_names_give_no_tag() {
+        for name in [
+            "C", "C.UTF-8", "POSIX", "", "e_US", "en_U", "en_USA", "en_1234",
+        ] {
+            assert_eq!(bcp47_of_posix(name), None, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn lc_messages_precedence_and_empty_is_unset() {
+        let fr = env(&[("LC_ALL", ""), ("LC_MESSAGES", "fr_FR"), ("LANG", "de_DE")]);
+        assert_eq!(ui_locale_from(fr).as_deref(), Some("fr-FR"));
+        let ja = env(&[
+            ("LC_ALL", "ja_JP"),
+            ("LC_MESSAGES", "fr_FR"),
+            ("LANG", "de_DE"),
+        ]);
+        assert_eq!(ui_locale_from(ja).as_deref(), Some("ja-JP"));
+        // LC_ALL=C is set, so no tag: LANG is not consulted
+        assert_eq!(
+            ui_locale_from(env(&[("LC_ALL", "C"), ("LANG", "zh_TW.UTF-8")])),
+            None
+        );
+        // WSL's usual default
+        assert_eq!(ui_locale_from(env(&[("LANG", "C.UTF-8")])), None);
+        assert_eq!(ui_locale_from(env(&[])), None);
+    }
+}

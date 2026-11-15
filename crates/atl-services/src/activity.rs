@@ -93,7 +93,7 @@ const DISABLED_COMPAT_CHANGES: [i64; 1] = [147_798_919];
 const FLAG_RECEIVER_BOOT_UPGRADE: i32 = 0x0200_0000;
 /// ActivityManager.BROADCAST_SUCCESS (ActivityManager.java:639).
 const BROADCAST_SUCCESS: i32 = 0;
-/// The locale of the global configuration until the platform layer supplies the desktop's: what Android uses when neither `persist.sys.locale` nor `ro.product.locale` is set (LocaleList's default,
+/// The locale of the global configuration when the host gives no UI language (`--locale` absent): what Android uses when neither `persist.sys.locale` nor `ro.product.locale` is set (LocaleList's default,
 /// `Locale.US`). A started app needs at least one: ActivityThread.handleBindApplication calls `LocaleList.setDefault(config.getLocales())`, which throws on an empty list.
 const DEFAULT_LOCALE: &str = "en-US";
 /// ProcessList.startProcessLocked's entryPoint (ProcessList.java:2093): every app process runs ActivityThread.main.
@@ -134,16 +134,16 @@ const DENSITY_DEFAULT: f32 = 160.0;
 /// writes for a normal device with the default night mode (config_defaultNightMode = MODE_NIGHT_NO). Following the desktop's dark appearance is a later setting.
 pub(crate) const GLOBAL_UI_MODE: i32 = 0x11;
 
-/// The global configuration a started app gets (ActivityTaskManagerService's `getGlobalConfiguration`), from the display model: font scale 1 (the `font_scale` setting's default), the locale,
+/// The global configuration a started app gets (ActivityTaskManagerService's `getGlobalConfiguration`), from the display model: font scale 1 (the `font_scale` setting's default), the locale (`locale`, the host's UI language tag; None: DEFAULT_LOCALE),
 /// and the display's density and size. The size is DisplayContent.computeScreenAppConfiguration:2462-2468 for the one display: dp = px / (dpi / 160), rounded; portrait when width <= height.
 /// The input fields stay undefined (0) until the platform layer supplies input. Shared with window.rs (the MergedConfiguration of a relayout).
-pub(crate) fn global_configuration(display: &DisplayModel) -> Configuration {
+pub(crate) fn global_configuration(display: &DisplayModel, locale: Option<&str>) -> Configuration {
     let density = display.dpi as f32 / DENSITY_DEFAULT;
     let width_dp = (display.width as f32 / density + 0.5) as i32;
     let height_dp = (display.height as f32 / density + 0.5) as i32;
     Configuration {
         font_scale: 1.0,
-        locale_list: Some(DEFAULT_LOCALE.to_owned()),
+        locale_list: Some(locale.unwrap_or(DEFAULT_LOCALE).to_owned()),
         density_dpi: display.dpi,
         screen_width_dp: width_dp,
         screen_height_dp: height_dp,
@@ -206,9 +206,13 @@ pub(crate) fn task_override(display: &DisplayModel, size: TaskSize) -> Configura
 }
 
 /// The configuration of a Task of `size` on `display`: the global configuration with the Task's override (the fields the override sets replace the global ones).
-pub(crate) fn task_configuration(display: &DisplayModel, size: TaskSize) -> Configuration {
+pub(crate) fn task_configuration(
+    display: &DisplayModel,
+    locale: Option<&str>,
+    size: TaskSize,
+) -> Configuration {
     let over = task_override(display, size);
-    let mut config = global_configuration(display);
+    let mut config = global_configuration(display, locale);
     config.screen_width_dp = over.screen_width_dp;
     config.screen_height_dp = over.screen_height_dp;
     config.smallest_screen_width_dp = over.smallest_screen_width_dp;
@@ -288,6 +292,7 @@ pub(crate) fn resume_item(token: SpIBinder) -> ResumeActivityItem {
 pub(crate) fn launch_item(
     packages: &Packages,
     display: &DisplayModel,
+    locale: Option<&str>,
     controller: &SpIBinder,
     p: &PackageRecord,
     activity: &ActivityInfo,
@@ -299,7 +304,7 @@ pub(crate) fn launch_item(
     LaunchActivityItem {
         activity_token: Some(token),
         ident,
-        cur_config: Some(global_configuration(display)),
+        cur_config: Some(global_configuration(display, locale)),
         override_config: Some(Configuration::default()),
         device_id: DEVICE_ID_DEFAULT,
         proc_state: PROCESS_STATE_TOP,
@@ -747,7 +752,7 @@ impl ActivityManager {
     /// (WindowProcessController.dispatchConfiguration:1773: ConfigurationChangeItem, device 0). Needed: a Task's override leaves density to the global configuration (task_override), so without it
     /// an activity's merged configuration and the Application's resources keep the old density. Returns the processes told.
     pub(crate) fn global_configuration_changed(&self) -> usize {
-        let config = global_configuration(&self.inner.tasks.display());
+        let config = global_configuration(&self.inner.tasks.display(), self.inner.tasks.locale());
         let threads: Vec<_> = self
             .inner
             .state()
@@ -808,7 +813,7 @@ impl Inner {
             seq: self.tasks.config_seq(task),
             ..task_override(&display, size)
         };
-        let new = Config::from(&task_configuration(&display, size));
+        let new = Config::from(&task_configuration(&display, self.tasks.locale(), size));
         let task_rect = || Rect {
             left: 0,
             top: 0,
@@ -866,9 +871,9 @@ impl Inner {
                             Box::new(ActivityRelaunchItem {
                                 activity_token: Some(token.clone()),
                                 config: Some(MergedConfiguration {
-                                    global: global_configuration(&display),
+                                    global: global_configuration(&display, self.tasks.locale()),
                                     override_config: over.clone(),
-                                    merged: task_configuration(&display, size),
+                                    merged: task_configuration(&display, self.tasks.locale(), size),
                                 }),
                                 activity_window_info: window_info(),
                                 config_changes: changes as i32,
@@ -1630,7 +1635,10 @@ impl IActivityManager for ActivityManager {
             false,
             false,
             false,
-            Some(&global_configuration(&inner.tasks.display())),
+            Some(&global_configuration(
+                &inner.tasks.display(),
+                inner.tasks.locale(),
+            )),
             Some(&CompatibilityInfo::default()),
             None,
             Some(&core_settings),
@@ -2817,6 +2825,16 @@ mod tests {
     use binder::StatusCode;
 
     use super::*;
+
+    /// The global configuration's locale: the host's UI language tag as given, else AOSP's en-US (LocaleList needs one; ActivityThread.handleBindApplication).
+    #[test]
+    fn global_configuration_locale_is_the_host_tag_or_the_default() {
+        let display = DisplayModel::default();
+        let config = global_configuration(&display, Some("zh-TW"));
+        assert_eq!(config.locale_list.as_deref(), Some("zh-TW"));
+        let config = global_configuration(&display, None);
+        assert_eq!(config.locale_list.as_deref(), Some("en-US"));
+    }
 
     /// Counts requestFinish calls; `fail` answers each with DEAD_OBJECT (the app died before the oneway call landed).
     struct Callback {

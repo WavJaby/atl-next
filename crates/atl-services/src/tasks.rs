@@ -111,6 +111,8 @@ impl<C> State<C> {
 /// The Tasks of the display: their owners and sizes, the window tokens bound to each, and the windows of each. `C` is the handle an activity or window is known by.
 pub struct Tasks<C> {
     state: Mutex<State<C>>,
+    /// The host's UI language tag (BCP-47), fixed at start; every service's global configuration reads it here, none keeps a copy.
+    locale: Option<String>,
 }
 
 /// A new Task's size on `display`: AOSP's initial bounds of `activity` (desktop_bounds.rs), centred on the display. The origin is dropped: the compositor places the window.
@@ -134,16 +136,22 @@ fn next_config_seq(seq: i32) -> i32 {
 }
 
 impl<C: Clone + PartialEq> Tasks<C> {
-    /// `display` is the monitor at start.
-    pub fn new(display: DisplayModel) -> Self {
+    /// `display` is the monitor at start; `locale` the host's UI language tag, None when the host gives none.
+    pub fn new(display: DisplayModel, locale: Option<String>) -> Self {
         Tasks {
             state: Mutex::new(State::new(display)),
+            locale,
         }
     }
 
     /// The display now (the monitor's values, [`Tasks::set_display`]): unchanged by any window's size. The one owner: every service reads it here, none keeps a copy.
     pub fn display(&self) -> DisplayModel {
         self.lock().display
+    }
+
+    /// The host's UI language tag, None when the host gives none (the global configuration then takes `DEFAULT_LOCALE`).
+    pub fn locale(&self) -> Option<&str> {
+        self.locale.as_deref()
     }
 
     fn lock(&self) -> MutexGuard<'_, State<C>> {
@@ -329,7 +337,7 @@ mod tests {
 
     /// The display the tests use: DisplayModel's default, 1280x800.
     fn tasks() -> Tasks<Handle> {
-        Tasks::new(DisplayModel::default())
+        Tasks::new(DisplayModel::default(), None)
     }
 
     /// 3/4 of each side of the 1280x800 display: a new Task's size there, for a landscape app (AOSP desktop default bounds, DesktopModeUtils.kt:49-56).

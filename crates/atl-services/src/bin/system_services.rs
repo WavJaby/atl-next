@@ -61,6 +61,9 @@ struct Args {
     /// The display the services answer with (`WxH@hz,dpi`, display_model.rs). Omitted: the model's default.
     #[arg(long, value_parser = DisplayModel::parse_arg)]
     display: Option<DisplayModel>,
+    /// The desktop's UI language as a BCP-47 tag (atld: atl_platform_host::ui_locale). Omitted: none, and the global configuration takes activity.rs DEFAULT_LOCALE.
+    #[arg(long)]
+    locale: Option<String>,
     /// The directory holding the partitions (`system/`, `vendor/`, ...) as this process sees them: SystemConfig's system features are read from their `etc/{sysconfig,permissions}/*.xml`
     /// (atl_services_types::system_config), and the preinstalled packages scanned from their `priv-app/`, `app/` (atl_services_types::system_packages). Omitted: no feature, hasSystemFeature false for
     /// every name, no system package.
@@ -228,7 +231,7 @@ fn main() -> Result<()> {
     // the UI agents the registry takes in REGISTER, read by the window service at each window's first relayout
     let agents = Arc::new(UiAgents::default());
     // the Tasks of the display: each app's window size (tasks.rs), read by the window service and the registry; the activity service creates each launch's Task here
-    let tasks = Arc::new(atl_services::tasks::Tasks::new(display));
+    let tasks = Arc::new(atl_services::tasks::Tasks::new(display, a.locale));
     // the display listeners of the apps (IDisplayManager.registerCallback): the display service takes them, the registry tells them of a change
     let display_callbacks = Arc::new(atl_services::display::DisplayCallbacks::default());
     let activity = ActivityManager::new(

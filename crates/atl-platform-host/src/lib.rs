@@ -16,6 +16,9 @@ pub use atl_platform_host_linux::IioSensors as PlatformSensors;
 /// What an app process's UI side reads from the desktop, as host paths the broker shows read-only at their own place: `wayland_socket()` (the compositor's) and `fontconfig_paths()` (config file + font dirs).
 #[cfg(target_os = "linux")]
 pub use atl_platform_host_linux::app_access;
+/// The desktop's UI language as one BCP-47 tag, from the process's locale variables (`LC_ALL`, `LC_MESSAGES`, `LANG`); `None` for C/POSIX, none set, or a malformed name.
+#[cfg(target_os = "linux")]
+pub use atl_platform_host_linux::ui_locale;
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("atl-platform-host has no implementation for this target OS");

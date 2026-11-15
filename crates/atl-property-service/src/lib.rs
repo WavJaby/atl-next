@@ -65,6 +65,14 @@ pub fn lcd_density(dpi: i32) -> Property {
     (LCD_DENSITY.to_owned(), dpi.to_string())
 }
 
+/// `persist.sys.locale`: the desktop's UI language. AOSP's readLocale reads it first (AndroidRuntime.cpp:471), so the app's locale is this tag.
+pub const PERSIST_LOCALE: &str = "persist.sys.locale";
+
+/// [`PERSIST_LOCALE`] for the BCP-47 tag `tag`.
+pub fn persist_locale(tag: &str) -> Property {
+    (PERSIST_LOCALE.to_owned(), tag.to_owned())
+}
+
 /// Why the default set or its area could not be built.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -324,6 +332,10 @@ mod tests {
         // the density is the display's, added by atld once it is known
         assert_eq!(read(&a, LCD_DENSITY), None);
         assert_eq!(lcd_density(240), (LCD_DENSITY.to_owned(), "240".to_owned()));
+        assert_eq!(
+            persist_locale("zh-TW"),
+            ("persist.sys.locale".to_owned(), "zh-TW".to_owned())
+        );
         // init's layout over the constants above and the fixture's id / release / tags
         assert_eq!(
             read(&a, "ro.build.fingerprint").as_deref(),

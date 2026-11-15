@@ -13,13 +13,14 @@ import (
 
 func release(flags map[string]string) *Release {
 	base := map[string]string{
-		"RELEASE_PLATFORM_SDK_VERSION":             "36",
-		"RELEASE_PLATFORM_SDK_VERSION_FULL":        "",
-		"RELEASE_PLATFORM_VERSION_CODENAME":        "REL",
-		"RELEASE_PLATFORM_VERSION_ALL_CODENAMES":   "REL",
-		"RELEASE_PLATFORM_VERSION_KNOWN_CODENAMES": "Base,Baklava",
-		"RELEASE_PLATFORM_VERSION_LAST_STABLE":     "16",
-		"RELEASE_PLATFORM_SECURITY_PATCH":          "2025-06-05",
+		"RELEASE_PLATFORM_SDK_VERSION":                      "36",
+		"RELEASE_PLATFORM_SDK_VERSION_FULL":                 "",
+		"RELEASE_PLATFORM_VERSION_CODENAME":                 "REL",
+		"RELEASE_PLATFORM_VERSION_ALL_CODENAMES":            "REL",
+		"RELEASE_PLATFORM_VERSION_KNOWN_CODENAMES":          "Base,Baklava",
+		"RELEASE_PLATFORM_VERSION_LAST_STABLE":              "16",
+		"RELEASE_PLATFORM_SECURITY_PATCH":                   "2025-06-05",
+		"RELEASE_PLATFORM_MIN_SUPPORTED_TARGET_SDK_VERSION": "28",
 	}
 	for k, v := range flags {
 		base[k] = v
@@ -47,6 +48,8 @@ func TestBuildPropFinal(t *testing.T) {
 		"ro.build.version.release_or_codename=16",
 		"ro.build.version.release_or_preview_display=16",
 		"ro.build.version.security_patch=2025-06-05",
+		// gen_build_prop.py:212: the declaration's default
+		"ro.build.version.min_supported_target_sdk=28",
 		// get_build_keys: a default certificate that is not AOSP's testKey
 		"ro.build.tags=dev-keys",
 	}
@@ -88,6 +91,7 @@ func TestBuildPropPreview(t *testing.T) {
 		"ro.build.version.preview_sdk=1",
 		"ro.build.version.release_or_codename=Baklava",
 		"ro.build.version.release_or_preview_display=Baklava",
+		"ro.build.version.min_supported_target_sdk=28",
 		// add_json_csv splits on commas and blanks
 		"ro.build.version.all_codenames=VanillaIceCream,Baklava",
 		// no key set: get_build_keys' empty default certificate

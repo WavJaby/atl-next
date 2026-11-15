@@ -645,12 +645,12 @@ impl IWindowSession for Session {
         *out_relayout_result = Some(WindowRelayoutResult {
             frames,
             merged_configuration: MergedConfiguration {
-                global: activity::global_configuration(&display),
+                global: activity::global_configuration(&display, self.tasks.locale()),
                 override_config: Configuration {
                     seq: self.tasks.config_seq(task),
                     ..activity::task_override(&display, size)
                 },
-                merged: activity::task_configuration(&display, size),
+                merged: activity::task_configuration(&display, self.tasks.locale(), size),
             },
             surface_control: surface.unwrap_or_default(),
             insets_state: display_insets(&self.tasks),
@@ -798,12 +798,12 @@ pub fn notify_resized(tasks: &Tasks<SpIBinder>, task: TaskId) -> usize {
         return 0;
     };
     let merged = MergedConfiguration {
-        global: activity::global_configuration(&display),
+        global: activity::global_configuration(&display, tasks.locale()),
         override_config: Configuration {
             seq: tasks.config_seq(task),
             ..activity::task_override(&display, size)
         },
-        merged: activity::task_configuration(&display, size),
+        merged: activity::task_configuration(&display, tasks.locale(), size),
     };
     let clients = tasks.windows_of(task);
     for (client, placement) in &clients {
@@ -853,7 +853,7 @@ mod tests {
     /// The missing-Task path: no size is refused (BAD_VALUE) and counted, never a panic; a created Task answers its size.
     #[test]
     fn size_of_refuses_a_task_without_a_size() {
-        let tasks = Tasks::<u32>::new(DisplayModel::default());
+        let tasks = Tasks::<u32>::new(DisplayModel::default(), None);
         let refused = |label: &str| {
             atl_diag::counts()
                 .into_iter()

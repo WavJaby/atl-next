@@ -271,6 +271,7 @@ impl ActivityTasks {
                 ClientTransactionItem::LaunchActivity(Box::new(launch_item(
                     &self.packages,
                     &self.tasks.display(),
+                    self.tasks.locale(),
                     &self.controller,
                     p,
                     &launch.decl,
@@ -717,7 +718,7 @@ impl ActivityTasks {
 
     /// ActivityTaskManagerService.getGlobalConfigurationForCallingPid: one display, so every caller's is the global one.
     fn global_configuration(&self) -> Configuration {
-        global_configuration(&self.tasks.display())
+        global_configuration(&self.tasks.display(), self.tasks.locale())
     }
 
     /// The records of `task` with their owners, bottom -> top, that a configuration change of the Task is delivered to: not finishing (ActivityRecord.java:8441-8445 ensureActivityConfiguration
@@ -933,7 +934,7 @@ mod tests {
         ActivityTasks::new(
             Arc::clone(&packages),
             Arc::new(Permissions::new(&packages, &[])),
-            Arc::new(Tasks::new(DisplayModel::default())),
+            Arc::new(Tasks::new(DisplayModel::default(), None)),
             token::new(),
         )
     }
@@ -1158,7 +1159,7 @@ mod tests {
         let atm = ActivityTasks::new(
             Arc::clone(&packages),
             Arc::new(Permissions::new(&packages, &[])),
-            Arc::new(Tasks::new(DisplayModel::default())),
+            Arc::new(Tasks::new(DisplayModel::default(), None)),
             token::new(),
         );
         let (status, results) = request_permissions(&atm);

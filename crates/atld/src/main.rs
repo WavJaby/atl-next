@@ -1989,6 +1989,15 @@ fn run(a: &Args) -> Result<ExitCode> {
     let display = a.display.unwrap_or_else(host_display);
     // its density, as a device's vendor build.prop states its panel's (DisplayMetrics DENSITY_DEVICE); into the services' and the apps' areas below
     defaults.push(atl_property_service::lcd_density(display.dpi));
+    // the desktop's UI language (LC_MESSAGES, atl_platform_host::ui_locale): the apps' persist.sys.locale and the services' --locale; none: AOSP's en-US
+    let locale = atl_platform_host::ui_locale();
+    log(format_args!(
+        "locale: {}",
+        locale.as_deref().unwrap_or("none, en-US")
+    ));
+    if let Some(tag) = &locale {
+        defaults.push(atl_property_service::persist_locale(tag));
+    }
     // the run's GPU's device class (gpu::device_class), as AOSP grants an app gpu_device per device (system/sepolicy private/app.te:393): the host EGL driver renders into, and imports, the gralloc dmabufs through them;
     // without them it falls back to the software device, which cannot import a window's buffers. No gralloc: no chosen GPU, every GPU's class.
     // + the DMABUF system heap on the heap tier only (narrowest grant): Codec2 allocates linear blocks from it in the app process
@@ -2246,6 +2255,9 @@ fn run(a: &Args) -> Result<ExitCode> {
         services_args.extend(["--launch".into(), p.into()]);
     }
     services_args.extend(["--display".into(), display.to_arg().into()]);
+    if let Some(tag) = &locale {
+        services_args.extend(["--locale".into(), tag.into()]);
+    }
     if a.no_ime_death_link {
         services_args.push("--no-ime-death-link".into());
     }
