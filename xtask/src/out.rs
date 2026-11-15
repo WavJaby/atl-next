@@ -34,9 +34,6 @@ pub const KEEP_BASES: usize = 2;
 const TARGET: &str = "target";
 /// In a build dir: the commit of the base it was copied from.
 const BASE_FILE: &str = ".base";
-/// Pre-pool slot record (`<git dir>/atl-out-slot`). Condition: a checkout made before the build-dir pool still holds a slot record; its slot is adopted as its build dir (a link `ws/<id>` -> `out/slot-<n>`) and the record deleted.
-/// Delete this, [`adopt`] and `out_prune`'s slot-link acceptance once no record is left (`ls ~/atl-next/repo/.git/atl-out-slot ~/atl-next/repo/.git/worktrees/*/atl-out-slot`) and the slot disks are retired.
-const LEGACY_RECORD: &str = "atl-out-slot";
 
 /// `out` subcommands.
 #[derive(clap::Subcommand)]
@@ -164,7 +161,7 @@ pub fn out_dir(root: &Path, explicit: Option<&Path>) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// The checkout's id and build dir, made when missing: adopted from a pre-pool slot record, else copied from a base, else empty. Prints one line when it makes one.
+/// The checkout's id and build dir, made when missing: copied from a base, else empty. Prints one line when it makes one.
 pub fn ensure(root: &Path) -> Result<(String, PathBuf)> {
     let ws = Layout::of(root)?.workspace().to_owned();
     let id = checkout_id(root)?;
@@ -180,11 +177,6 @@ pub fn ensure(root: &Path) -> Result<(String, PathBuf)> {
     }
     let parent = dir.parent().context("build dir has no parent")?;
     std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    let git_dir = PathBuf::from(git(Some(root), &["rev-parse", "--absolute-git-dir"])?);
-    if let Some(line) = adopt(&ws, &id, &git_dir.join(LEGACY_RECORD))? {
-        println!("{line}");
-        return Ok((id, dir));
-    }
     let bases = bases(&ws)?;
     let pick = bases
         .iter()
@@ -208,44 +200,13 @@ pub fn ensure(root: &Path) -> Result<(String, PathBuf)> {
     Ok((id, dir))
 }
 
-/// Whether `path` exists as a dir or a link (an adopted slot); a link is not followed.
+/// Whether `path` exists as a dir or a link; a link is not followed.
 fn present(path: &Path) -> Result<bool> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }
-}
-
-/// [`LEGACY_RECORD`]'s migration: links `ws/<id>` to the recorded slot and deletes the record. None without a record.
-fn adopt(ws: &Path, id: &str, record: &Path) -> Result<Option<String>> {
-    let text = match std::fs::read_to_string(record) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", record.display())),
-    };
-    let n: u32 = text
-        .trim()
-        .parse()
-        .with_context(|| format!("slot record {} is not a number", record.display()))?;
-    let slot = ws.join("out").join(format!("slot-{n}"));
-    let dir = dir_of(ws, id);
-    let line = if slot.is_dir() {
-        std::os::unix::fs::symlink(&slot, &dir)
-            .with_context(|| format!("linking {} -> {}", dir.display(), slot.display()))?;
-        format!(
-            "out: ws/{id} adopted {} (pre-pool slot; deleted with the checkout)",
-            slot.display()
-        )
-    } else {
-        std::fs::create_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        format!(
-            "out: ws/{id} new and empty: its slot record named a missing {}",
-            slot.display()
-        )
-    };
-    std::fs::remove_file(record).with_context(|| format!("removing {}", record.display()))?;
-    Ok(Some(line))
 }
 
 /// Base commits, newest first (by the base dir's mtime: publish order). Temp names (`.`-prefixed) are skipped.
@@ -267,7 +228,7 @@ fn bases(ws: &Path) -> Result<Vec<String>> {
     Ok(found.into_iter().rev().map(|(_, n)| n).collect())
 }
 
-/// Which tier copies `src` into `dst_parent`: a regular file of `src` reflinked into `dst_parent` succeeds -> `Reflink`, else `Copy`. Probes the real pair, not the host: a source off the pool (an adopted slot on ext4) is a `Copy`.
+/// Which tier copies `src` into `dst_parent`: a regular file of `src` reflinked into `dst_parent` succeeds -> `Reflink`, else `Copy`. Probes the real pair, not the host: a source off the pool's filesystem is a `Copy`.
 /// Reads `src` only when it holds a top-level file: a write there would bump a base's mtime, the order [`bases`] ranks by, so the base just copied would rank newest. An empty `src` gets a probe file of its own (nothing to rank yet).
 pub fn probe(src: &Path, dst_parent: &Path) -> Result<Tier> {
     let pid = std::process::id();
@@ -317,10 +278,9 @@ pub fn copy_tree(src: &Path, dst: &Path, base: Option<&str>) -> Result<Tier> {
     if tier == Tier::Reflink {
         cp.arg("--reflink=always");
     }
-    // `src/.` copies the contents, so a link to a dir (an adopted slot) is copied as the dir it names
     let status = cp
         .arg("-T")
-        .arg(src.join("."))
+        .arg(src)
         .arg(&tmp)
         .status()
         .context("running cp")?;
@@ -407,14 +367,14 @@ pub fn real(dir: &Path) -> PathBuf {
     }
 }
 
-/// The first real build dir path (`<ws>/out/pool/...` or a pre-pool `<ws>/out/slot-<n>`) that `text` names, inside a namespace; None outside, or when `text` names only [`CANONICAL`]. A cache naming one was configured at that real path and would write there.
+/// The first real build dir path (`<ws>/out/pool/...`) that `text` names, inside a namespace; None outside, or when `text` names only [`CANONICAL`]. A cache naming one was configured at that real path and would write there.
 pub fn foreign_build_dir(text: &str) -> Option<String> {
     let (ws, _) = bound()?;
     let out = format!("{}/out/", ws.display());
     text.match_indices(&out).find_map(|(at, _)| {
         let rest = &text[at + out.len()..];
         let seg = rest.split(['/', ';', '\n', ' ', '"']).next()?;
-        (seg == "pool" || seg.starts_with("slot-")).then(|| format!("{out}{seg}"))
+        (seg == "pool").then(|| format!("{out}{seg}"))
     })
 }
 
@@ -515,7 +475,7 @@ pub enum Step {
     Link { at: PathBuf, to: PathBuf },
 }
 
-/// The target `<checkout>/target` links to: the resolved build dir's `target/` (an adopted slot keeps the link it had).
+/// The target `<checkout>/target` links to: the resolved build dir's `target/`.
 fn target_of(dir: &Path) -> PathBuf {
     std::fs::canonicalize(dir)
         .unwrap_or_else(|_| dir.to_owned())
@@ -657,24 +617,8 @@ fn describe_entry(e: &Entry, want: &Path) -> String {
     }
 }
 
-/// Deletes build dir `dir`: a dir with its contents; an adopted slot link with the slot's contents (the slot dir stays: it may be a mount point), `lost+found` kept.
+/// Deletes build dir `dir` with its contents.
 fn remove_build_dir(dir: &Path) -> Result<()> {
-    if let Entry::Link(slot) = entry(dir)? {
-        for e in std::fs::read_dir(&slot).with_context(|| format!("reading {}", slot.display()))? {
-            let e = e?;
-            if e.file_name() == "lost+found" {
-                continue;
-            }
-            let p = e.path();
-            if e.file_type()?.is_dir() {
-                std::fs::remove_dir_all(&p)
-            } else {
-                std::fs::remove_file(&p)
-            }
-            .with_context(|| format!("removing {}", p.display()))?;
-        }
-        return std::fs::remove_file(dir).with_context(|| format!("unlinking {}", dir.display()));
-    }
     std::fs::remove_dir_all(dir).with_context(|| format!("removing {}", dir.display()))
 }
 
@@ -776,7 +720,7 @@ pub fn recopy(land: &Path) -> Result<String> {
 /// Why: the dir's own outputs were built on the old base and are mostly stale after the rebase, while the new base holds main's build of everything the rebase brought; the checkout's compiles hit sccache at the canonical path, so redoing its own delta is cheap.
 /// Kept: the dir's cargo target roots (`out_prune::DIR_ROOTS`), moved into the new copy: `target/` holds this running xtask binary (re-executed by path into the namespace), and every root holds the checkout's cargo units, which key on the checkout path a base's units (built in the land worktree) never match: taking the base's cost a 72-crate rebuild (X4 gate).
 /// Only when main brought a large change (owner 2026-11-16): at least `build.refresh_min_upstream_files` files under [`UPSTREAM_INPUTS`] changed from the dir's base to the newer one (derivation on ws_config.rs DEFAULT_REFRESH_MIN_UPSTREAM_FILES); below it keeping the old dir rebuilds less.
-/// Kept (line `out: keep <reason>`): an adopted slot link, a dir without `.base` (built from zero), one already on the newest base or whose base is not an ancestor of it, a small change, a dir another process holds. None: the land worktree (land owns `ws/land`) or no dir yet (the first build makes it).
+/// Kept (line `out: keep <reason>`): a dir without `.base` (built from zero), one already on the newest base or whose base is not an ancestor of it, a small change, a dir another process holds. None: the land worktree (land owns `ws/land`) or no dir yet (the first build makes it).
 pub fn refresh(root: &Path) -> Result<Option<String>> {
     let ws = Layout::of(root)?.workspace().to_owned();
     let id = checkout_id(root)?;
@@ -1141,30 +1085,6 @@ mod tests {
         );
         assert!(!d.join("base/c1").join(".atl-reflink-probe").exists());
         std::fs::remove_dir_all(&d).expect("cleanup");
-    }
-
-    #[test]
-    fn a_slot_record_is_adopted_as_a_link_and_deleted() {
-        let ws = scratch("adopt");
-        put(&ws.join("out/slot-4/build.ninja"));
-        std::fs::create_dir_all(pool(&ws).join("ws")).expect("pool");
-        let record = ws.join("git/atl-out-slot");
-        put(&record);
-        std::fs::write(&record, "4\n").expect("record");
-        let line = adopt(&ws, "wt", &record).expect("adopt").expect("a record");
-        assert!(line.contains("adopted"), "{line}");
-        assert_eq!(
-            entry(&dir_of(&ws, "wt")).expect("entry"),
-            Entry::Link(ws.join("out/slot-4"))
-        );
-        assert!(!record.exists());
-        assert_eq!(adopt(&ws, "wt", &record).expect("again"), None);
-        // deleting the adopted dir empties the slot and keeps the slot dir (a mount point)
-        remove_build_dir(&dir_of(&ws, "wt")).expect("remove");
-        assert!(!present(&dir_of(&ws, "wt")).expect("present"));
-        assert!(ws.join("out/slot-4").is_dir());
-        assert!(!ws.join("out/slot-4/build.ninja").exists());
-        std::fs::remove_dir_all(&ws).expect("cleanup");
     }
 
     /// The threshold: the two measured cases (D11: 0 upstream files changed, README-only and 40 crate/bp2ninja files) keep at the default; any upstream change refreshes.

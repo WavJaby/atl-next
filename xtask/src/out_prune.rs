@@ -6,7 +6,7 @@
 //! Incremental (`<tree>/incremental/<crate>/`): keeps the newest finalized session, the one rustc loads (`rustc_incremental/src/persist/fs.rs`, `find_source_directory_in_iter`, rustc 1.99.1; rustc reads an older one only when copying the newest fails). Removed: every other finalized session, `-working` sessions older than 10 s (rustc's own grace), and lock files whose session is gone. A held lock is never touched.
 //! Kept, never deleted: entries that are no unit, `deps/` and `examples/` files no unit owns (counted as orphans). A tree whose record cannot be read refuses its build dir.
 //! Busy: a build holds the dir lock (`build_pool::hold_dir`); prune takes it exclusive without waiting and skips the dir. Every tree also has cargo's own build-dir lock (`<tree>/.cargo-lock`), taken without waiting and held from plan to removal: a tree a build holds is skipped and reported.
-//! Symlinks are refused, never followed: a link under a root could point the prune outside it. One exception, `out::LEGACY_RECORD`'s: a build dir that is a link to `out/slot-<n>` (an adopted pre-pool slot).
+//! Symlinks are refused, never followed: a link under a root could point the prune outside it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -237,7 +237,7 @@ pub fn prune_sessions(ws: &Path, id: &str, now: u64) -> Result<Outcome> {
 
 fn prune_dir_in(ws: &Path, id: &str, scope: Scope, now: u64, execute: bool) -> Result<Outcome> {
     let dir = out::dir_of(ws, id);
-    let Some(real) = checked_dir(ws, &dir)? else {
+    let Some(real) = checked_dir(&dir)? else {
         return Ok(Outcome::NotBuilt);
     };
     let Some(_lock) = build_pool::try_lock_dir(ws, id)? else {
@@ -270,31 +270,19 @@ pub fn sessions_line(what: &str, plans: &[TreePlan]) -> String {
     )
 }
 
-/// The dir to prune for build dir `dir`: itself when a real dir, the slot it names when it is an adopted slot link (`out::LEGACY_RECORD`: a link to `<ws>/out/slot-<n>` exactly); None when absent. Any other link is refused, never followed.
-fn checked_dir(ws: &Path, dir: &Path) -> Result<Option<PathBuf>> {
+/// The dir to prune for build dir `dir`: itself when a real dir; None when absent. Anything else is refused: a symlink is never followed.
+fn checked_dir(dir: &Path) -> Result<Option<PathBuf>> {
     let meta = match fs::symlink_metadata(dir) {
         Ok(meta) => meta,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
     };
-    if meta.is_dir() {
-        return Ok(Some(dir.to_owned()));
-    }
-    let to = fs::read_link(dir)
-        .with_context(|| format!("refused: {} is not a directory", dir.display()))?;
-    let slot = to
-        .strip_prefix(ws.join("out"))
-        .ok()
-        .and_then(Path::to_str)
-        .and_then(|n| n.strip_prefix("slot-"))
-        .is_some_and(|n| n.parse::<u32>().is_ok());
     ensure!(
-        slot && real_dir(&to)?,
-        "refused: {} links to {}, not an adopted slot (a symlink is never followed)",
-        dir.display(),
-        to.display()
+        meta.is_dir(),
+        "refused: {} is not a real dir (a symlink is never followed)",
+        dir.display()
     );
-    Ok(Some(to))
+    Ok(Some(dir.to_owned()))
 }
 
 /// The roots of build dir `dir`: [`DIR_ROOTS`] and `gl/cargo*`.
@@ -873,7 +861,7 @@ mod tests {
             .expect("set mtime");
     }
 
-    /// `cargo/release` of slot 1 with one unit per name above, two orphan `deps/` files, and no record. Every fingerprint dir's mtime is 30 days old, except FRESH's, a day old.
+    /// `cargo/release` of build dir `a` with one unit per name above, two orphan `deps/` files, and no record. Every fingerprint dir's mtime is 30 days old, except FRESH's, a day old.
     fn tree_fixture(ws: &Path) -> PathBuf {
         let tree = ws.join("out/pool/ws/a/cargo/release");
         let fp = tree.join(FINGERPRINT);
@@ -1147,7 +1135,7 @@ mod tests {
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 
-    /// A cargo build that does not go through xtask holds only its tree's `.cargo-lock`: that tree is reported busy and left alone, while the slot is pruned as usual.
+    /// A cargo build that does not go through xtask holds only its tree's `.cargo-lock`: that tree is reported busy and left alone, while the build dir is pruned as usual.
     #[test]
     fn a_tree_whose_cargo_lock_is_held_is_busy_and_untouched() {
         let ws = scratch("tree-busy");
@@ -1167,7 +1155,7 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_record_refuses_its_slot_and_removes_nothing() {
+    fn unreadable_record_refuses_its_build_dir_and_removes_nothing() {
         let ws = scratch("garbled");
         let tree = tree_fixture(&ws);
         fs::write(tree.join(".atl-unit-use.json"), "{garbled").expect("record");
@@ -1211,19 +1199,6 @@ mod tests {
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 
-    /// An adopted pre-pool slot (`ws/<id>` -> `out/slot-<n>`) is pruned in the slot it names.
-    #[test]
-    fn an_adopted_slot_link_is_pruned_in_its_slot() {
-        let ws = scratch("adopted");
-        let tree = ws.join("out/slot-3/cargo/release");
-        sized(&tree.join(FINGERPRINT).join("x-0123456789abcdef/y"), 1);
-        fs::create_dir_all(ws.join("out/pool/ws")).expect("pool");
-        symlink(ws.join("out/slot-3"), ws.join("out/pool/ws/a")).expect("link");
-        let plan = only_plan(prune_dir(&ws, "a", CUTOFF, NOW, false).expect("prune")).remove(0);
-        assert_eq!(plan.tree, "out/slot-3/cargo/release");
-        fs::remove_dir_all(&ws).expect("cleanup");
-    }
-
     #[test]
     fn symlinked_unit_directory_is_refused() {
         let ws = scratch("unit-link");
@@ -1246,22 +1221,22 @@ mod tests {
     #[test]
     fn trees_are_profiles_and_triple_profiles_under_the_roots_only() {
         let ws = scratch("trees");
-        let slot = ws.join("out/pool/ws/a");
-        sized(&slot.join("cargo/release/.fingerprint/x/y"), 1);
+        let dir = ws.join("out/pool/ws/a");
+        sized(&dir.join("cargo/release/.fingerprint/x/y"), 1);
         sized(
-            &slot.join("cargo/x86_64-unknown-linux-gnu/release/.fingerprint/x/y"),
+            &dir.join("cargo/x86_64-unknown-linux-gnu/release/.fingerprint/x/y"),
             1,
         );
-        sized(&slot.join("cargo-converter/release/.fingerprint/x/y"), 1);
-        sized(&slot.join("target/debug/.fingerprint/x/y"), 1);
+        sized(&dir.join("cargo-converter/release/.fingerprint/x/y"), 1);
+        sized(&dir.join("target/debug/.fingerprint/x/y"), 1);
         sized(
-            &slot.join("gl/cargo-undefined-gl/release/.fingerprint/x/y"),
+            &dir.join("gl/cargo-undefined-gl/release/.fingerprint/x/y"),
             1,
         );
-        sized(&slot.join("gl/other/debug/.fingerprint/x/y"), 1);
-        sized(&slot.join("cargo/cxxbridge/somecrate/src/lib.rs"), 1);
-        sized(&slot.join("cargo/tmp/file"), 1);
-        let mut found: Vec<String> = trees_under(&dir_roots(&slot).expect("roots"))
+        sized(&dir.join("gl/other/debug/.fingerprint/x/y"), 1);
+        sized(&dir.join("cargo/cxxbridge/somecrate/src/lib.rs"), 1);
+        sized(&dir.join("cargo/tmp/file"), 1);
+        let mut found: Vec<String> = trees_under(&dir_roots(&dir).expect("roots"))
             .expect("trees")
             .iter()
             .map(|f| relative(&ws, &f.dir))
@@ -1284,14 +1259,14 @@ mod tests {
     #[test]
     fn dir_roots_are_the_target_names_and_the_gl_cargo_probes() {
         let ws = scratch("roots");
-        let slot = ws.join("out/pool/ws/b");
-        fs::create_dir_all(slot.join("gl/cargo")).expect("gl");
-        fs::create_dir_all(slot.join("gl/cargo-undefined-gl")).expect("gl");
-        fs::create_dir_all(slot.join("gl/other")).expect("gl");
-        let mut names: Vec<String> = dir_roots(&slot)
+        let dir = ws.join("out/pool/ws/b");
+        fs::create_dir_all(dir.join("gl/cargo")).expect("gl");
+        fs::create_dir_all(dir.join("gl/cargo-undefined-gl")).expect("gl");
+        fs::create_dir_all(dir.join("gl/other")).expect("gl");
+        let mut names: Vec<String> = dir_roots(&dir)
             .expect("roots")
             .iter()
-            .map(|p| relative(&slot, p))
+            .map(|p| relative(&dir, p))
             .collect();
         names.sort();
         assert_eq!(
