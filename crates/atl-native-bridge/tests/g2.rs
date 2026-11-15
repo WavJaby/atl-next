@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+#![cfg(atl_nb_identity)]
 //! Spike gate g2 (bridge-1 route N): the guest linker `dlopen`s an NDK-built app library and its native functions run, the host thread intact after each call.
 //! Library: `libatl-jni-test.so` built by NDK r29 for android-29 (native ELF TLS: `__thread` through the guest's `__tls_get_addr`), linked against guest `libc++_shared.so`; it dlopens `libatl-jni-sibling.so` itself.
 //! Env: tests/common/mod.rs, plus `ATL_NB_TESTLIB`; SKIP without them. Its JNI functions are called with env = cls = NULL: the ones called use neither.
@@ -99,7 +100,7 @@ fn run(env: &common::Nb) -> Result<(), String> {
     println!(
         "g2: ok: dlopen({LIB:?}) = {h:#x}, {} calls, guest FS {:#x}",
         CALLS.len(),
-        g.thread().guest_fs()
+        g.thread().guest_tp()
     );
     Ok(())
 }

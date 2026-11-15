@@ -26,7 +26,7 @@ pub(super) fn call_mapped((soname, symbol, maps): MappedRow, mut lanes: [usize; 
             #[cfg(not(atl_nb_cb_down_skip))]
             LaneMap::Down(shorty) if lanes[i] != 0 => {
                 lanes[i] = super::active()
-                    .down(lanes[i], super::identity::Down::Plain, Some(shorty))
+                    .down(lanes[i], super::Down::Plain, Some(shorty))
                     .unwrap_or_else(|e| unsupported(&format!("{symbol}: callback lane {i}: {e}")));
             }
             LaneMap::Down(_) => {}

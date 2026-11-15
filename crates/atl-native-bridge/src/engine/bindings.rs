@@ -11,6 +11,7 @@ use super::objects::Class;
 use super::{Active, active, unsupported};
 
 /// The identity engine's table: the host arch's NBS libc stub list, every shim bound.
+#[cfg(atl_nb_identity)]
 pub(super) mod identity {
     include!(concat!(env!("OUT_DIR"), "/bindings_table_identity.rs"));
 }
@@ -49,6 +50,7 @@ pub enum LaneMap {
 /// The table of the process's engine.
 fn table() -> Table {
     match active() {
+        #[cfg(atl_nb_identity)]
         Active::Identity => Table {
             libs: identity::LIBS,
             trap_names: identity::TRAP_NAMES,
@@ -113,7 +115,8 @@ pub struct Lib {
 }
 
 /// JNI stubs per engine: one per slot of the largest JNI table (build.rs `OBJECT_STUBS`).
-pub const OBJECT_STUBS: usize = identity::OBJECT_STUBS;
+pub const OBJECT_STUBS: usize = qemu::OBJECT_STUBS;
+#[cfg(atl_nb_identity)]
 const _: () = assert!(identity::OBJECT_STUBS == qemu::OBJECT_STUBS);
 
 /// One row of the table, for gates outside the engine (xtask `gl-proxies`, tests/qemu_gl.rs).
@@ -196,6 +199,7 @@ fn shim(name: &str) -> Option<usize> {
         "gai_strerror" => super::netdb::gai_strerror as *const () as usize,
         "__system_property_foreach" => super::provider::foreach as *const () as usize,
         "__system_property_read_callback" => super::provider::read_callback as *const () as usize,
+        #[cfg(atl_nb_identity)]
         "sigaction" | "sigaction64" => super::signal::sigaction as *const () as usize,
         "slCreateEngine" => super::sles::create_engine as *const () as usize,
         // GS2.2 G1: the answer is a row's guest address or a bound host answer (proc.rs); build.rs `PROXY_SHIMS`

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+#![cfg(atl_nb_identity)]
 //! Spike gate g4 (bridge-1 route N): crossing cost. RUNS runs x CALLS calls each of
 //! - guest->host: a guest loop (`g4_guest_loop`, run on a stand-in guest TCB) calls an engine thunk (`identity::bind`) bound to an empty host function: shadow-stack push, FS switch both ways;
 //! - host->guest: a host loop calls `identity::Identity`'s `Engine::call` on an empty guest function: FS switch both ways;

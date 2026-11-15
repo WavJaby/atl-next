@@ -9,8 +9,13 @@
 use std::ffi::{c_int, c_void};
 use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
 
+use crate::engine::bindings::OBJECT_STUBS;
 use crate::engine::bindings::qemu::THUNKS;
-use crate::engine::identity::{OBJECT_STUBS, THUNKS as HOST_THUNKS};
+#[cfg(atl_nb_identity)]
+use crate::engine::identity::THUNKS as HOST_THUNKS;
+/// No host thunks in a core without the identity engine: its pool is empty.
+#[cfg(not(atl_nb_identity))]
+const HOST_THUNKS: usize = 0;
 use crate::engine::objects::{TABLES, TableId};
 
 /// Histogram bins: the bit lengths 0..=64 of a `usize` size.

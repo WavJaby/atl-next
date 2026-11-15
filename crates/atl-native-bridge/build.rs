@@ -1162,8 +1162,8 @@ fn bindings_table(
         code.push_str(&format!("    mapped::<{i}>,\n"));
     }
     code.push_str("];\n");
-    // one copy: sles.rs asserts against the identity table's (the layout is the host view's, the same for both tables)
-    if !qemu {
+    // one copy: sles.rs asserts against the QEMU table's, the one every core has (the layout is the host view's, the same for both tables)
+    if qemu {
         code.push_str(&sl_layout);
     }
     Ok(code)
@@ -1322,6 +1322,11 @@ const X86_DOWN_SWAP_CFG: &str = "atl_nb_down_swap_v";
 /// Down shells of the QEMU engine (Q6-4, x86.rs `down_entries_asm`): one per host->guest trampoline a process binds (each native method, JNI_OnLoad, JNI_OnUnload). Fixed; a binding past it fails with an error (place.rs `down`).
 const DOWN_SLOTS: usize = 1024;
 
+/// Host ISAs (arches.toml keys) with an identity crossing (engine/identity: host-arch guest bionic run natively, thread-pointer switch). riscv64 gets one at B2, after an arm64 app runs there (owner decision M63); every host has the QEMU engine.
+const IDENTITY_HOSTS: &[&str] = &["x86_64"];
+/// The cfg naming a core built with the identity engine; crate code gates on it, never on an arch name.
+const IDENTITY_CFG: &str = "atl_nb_identity";
+
 /// The cfgs `ATL_NB_BREAK` names, in order; an unknown name fails the build, naming it and the known ones.
 fn selected_breaks() -> Result<Vec<&'static str>> {
     let Ok(value) = std::env::var(BREAK_ENV) else {
@@ -1362,7 +1367,13 @@ fn main() -> Result<()> {
     let arches = checkout.join("arches.toml");
     let arches_text = std::fs::read_to_string(&arches)?;
     let host = buildscript::host_arch(&arches_text, &std::env::var("TARGET")?)?;
-    // one guest bionic view per engine, both compiled into one core (runtime selection, engine/mod.rs `Active`): identity = the host arch, QEMU = arm64 (engine/qemu/mod.rs GUEST_ISA)
+    // the identity engine is a per-host-ISA capability (engine/mod.rs `Active`): cfg `IDENTITY_CFG` on a host ISA that has its crossing
+    println!("cargo::rustc-check-cfg=cfg({IDENTITY_CFG})");
+    let identity = IDENTITY_HOSTS.contains(&host.arch.as_str());
+    if identity {
+        println!("cargo::rustc-cfg={IDENTITY_CFG}");
+    }
+    // one guest bionic view per engine compiled into the core (runtime selection, engine/mod.rs `Active`): identity = the host arch, QEMU = arm64 (engine/qemu/mod.rs GUEST_ISA)
     let qemu_guest = buildscript::guest_arch(&arches_text, QEMU_GUEST_ARCH)?;
     let path = up.file(&format!("aosp/{HEADER}"))?;
     let target = Target {
@@ -1420,10 +1431,12 @@ fn main() -> Result<()> {
     std::fs::write(out.join("gai_errlist.rs"), gai_errlist_rs(&up)?)?;
     let provider_soname = provider_soname(&manifest)?;
     // Q5-7: the identity engine's byte templates (patch encodings), and its shells and pools (`bindings_table`)
-    std::fs::write(
-        out.join("x86_encodings.rs"),
-        atl_bridgegen::x86::constants_rust(),
-    )?;
+    if identity {
+        std::fs::write(
+            out.join("x86_encodings.rs"),
+            atl_bridgegen::x86::constants_rust(),
+        )?;
+    }
     let x86_disp_bias = usize::from(selected_breaks()?.contains(&X86_DISP_CFG));
     // the counted shells: feature `crossing-count` (cargo's env for build scripts), unless the `id_count` break is selected
     let x86_counted = std::env::var_os("CARGO_FEATURE_CROSSING_COUNT").is_some()
@@ -1445,7 +1458,12 @@ fn main() -> Result<()> {
             atl_bridgegen::x86::DOWN_SHELL
         ),
     )?;
-    for (name, qemu) in [("identity", false), ("qemu", true)] {
+    let engines: &[(&str, bool)] = if identity {
+        &[("identity", false), ("qemu", true)]
+    } else {
+        &[("qemu", true)]
+    };
+    for &(name, qemu) in engines {
         std::fs::write(
             out.join(format!("bindings_table_{name}.rs")),
             bindings_table(

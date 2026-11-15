@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+#![cfg(atl_nb_identity)]
 //! Spike gate g3 (bridge-1 route N): a SIGSEGV raised in guest code reaches a host handler installed through the engine (`engine::install_signal`) on the host thread pointer, and the guest resumes on its own.
 //! Stages:
 //! - A, always: guest = `g3_guest_load` below on a stand-in guest TCB: `mov (%rdi), %eax` faults on NULL; the handler records its FS, sets RAX = 41, skips the 2-byte load; the guest adds 1 and stores the FS it resumed on. Want: handler FS = host, resumed FS = guest, return 42.
@@ -201,7 +202,7 @@ fn stage_b(env: &common::Nb) -> Result<(), String> {
     if strlen == 0 {
         return Err("stage B: guest dlsym(strlen) = NULL".into());
     }
-    let tp = g.thread().guest_fs();
+    let tp = g.thread().guest_tp();
     reset();
     MODE.store(1, Ordering::SeqCst);
     let before = HITS.load(Ordering::SeqCst);
@@ -220,10 +221,10 @@ fn stage_b(env: &common::Nb) -> Result<(), String> {
     if ret != STRLEN_RET as usize {
         return Err(format!("stage B: strlen returned {ret}, want {STRLEN_RET}"));
     }
-    if g.thread().guest_fs() != tp {
+    if g.thread().guest_tp() != tp {
         return Err(format!(
             "stage B: guest FS at return {:#x}, want {tp:#x}",
-            g.thread().guest_fs()
+            g.thread().guest_tp()
         ));
     }
     println!(

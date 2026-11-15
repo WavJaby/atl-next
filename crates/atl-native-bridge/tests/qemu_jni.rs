@@ -22,7 +22,7 @@ use std::process::{Command, ExitCode};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
-use atl_native_bridge::engine::identity::Down;
+use atl_native_bridge::engine::Down;
 use atl_native_bridge::engine::jni::{guest_env, guest_vm, set_method_shorty};
 use atl_native_bridge::engine::objects::Class;
 use atl_native_bridge::engine::{Config, Guest, qemu};

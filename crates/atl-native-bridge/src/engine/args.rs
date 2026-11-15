@@ -19,6 +19,7 @@ fn leak_cstr(bytes: &[u8]) -> Result<usize, String> {
 }
 
 /// This process's auxv (`/proc/self/auxv`), AT_NULL dropped: the identity guest's kernel auxv.
+#[cfg(atl_nb_identity)]
 pub fn process_auxv() -> Result<Vec<(usize, usize)>, String> {
     let raw = std::fs::read("/proc/self/auxv").map_err(|e| format!("/proc/self/auxv: {e}"))?;
     let word = std::mem::size_of::<usize>();

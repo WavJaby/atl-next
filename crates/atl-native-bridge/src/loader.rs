@@ -8,7 +8,7 @@ use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::engine::identity::Down;
+use crate::engine::Down;
 use crate::engine::{Config, Guest, active};
 
 /// bionic `RTLD_NOW` (dlfcn.h): what the guest dlopen gets whatever ART's flag; `RTLD_LOCAL` = 0.

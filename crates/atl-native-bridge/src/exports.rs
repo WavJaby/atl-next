@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 
 use crate::apk;
 use crate::elf::{self, Verdict};
-use crate::engine::identity::Down;
+use crate::engine::Down;
 use crate::engine::{self, Config};
 use crate::generated::{
     NativeBridgeCallbacks, NativeBridgeRuntimeCallbacks, NativeBridgeRuntimeValues,
@@ -100,6 +100,7 @@ pub unsafe fn initialize(
         return false;
     }
     // ART calls this after FaultManager::Init: its claimed signals get the host-FS entry before any guest code runs
+    #[cfg(atl_nb_identity)]
     engine::signal::rewrap_all();
     true
 }
@@ -114,6 +115,7 @@ pub unsafe fn loadLibrary(libpath: *const c_char, _flag: i32) -> *mut c_void {
     };
     let path = Path::new(OsStr::from_bytes(path.to_bytes()));
     // a rewrap point (engine/signal.rs): host handlers installed since the last one
+    #[cfg(atl_nb_identity)]
     crate::engine::signal::rewrap_all();
     // an `<apk>!/<entry>` the guest linker would refuse: refused here by name
     if let Err(e) = path.to_str().map_or(Ok(()), |p| {

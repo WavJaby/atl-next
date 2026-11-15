@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+#![cfg(atl_nb_identity)]
 //! Spike gate g1 (bridge-1 route N): the identity crossing leaves the host thread intact, and the guest linker initialises through it.
 //! Build env: tests/common/mod.rs; stage 2 prints SKIP without a native-bridge build.
 //! Deliberate break: `ATL_NB_BREAK=no_fs_restore` drops the crossing's FS restore -> the probes of stage 0 and stage 2 both fail (every stage runs; exit 1).
@@ -53,10 +54,10 @@ fn crossing() -> Result<(), String> {
             "stage 0: guest ran on FS {inside:#x}, want {tcb:#x}"
         ));
     }
-    if ht.host_fs() != host {
+    if ht.host_tp() != host {
         return Err(format!(
             "stage 0: saved host FS {:#x}, want {host:#x}",
-            ht.host_fs()
+            ht.host_tp()
         ));
     }
     println!("g1: stage 0 ok: guest call on FS {inside:#x}, host FS {host:#x} restored");
@@ -155,11 +156,11 @@ fn linker_init(env: &common::Nb) -> Result<(), String> {
     println!(
         "g1: linker initialised, exe entry {:#x}, guest FS {:#x}; stubs bound {} unbound {}",
         g.exe_entry,
-        g.thread().guest_fs(),
+        g.thread().guest_tp(),
         vdso::BOUND.load(Ordering::Relaxed),
         vdso::UNBOUND.load(Ordering::Relaxed)
     );
-    if g.thread().guest_fs() == g.thread().host_fs() || g.thread().guest_fs() == 0 {
+    if g.thread().guest_tp() == g.thread().host_tp() || g.thread().guest_tp() == 0 {
         return Err("the guest linker installed no thread pointer of its own".into());
     }
     let dlopen = need(&g.linker, "__dl___loader_dlopen")?;

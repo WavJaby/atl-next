@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use super::identity::Down;
+use super::Down;
 use super::objects::{
     self, GuestObj, TableId, host_slot, sl_android_configuration, sl_android_simple_buffer_queue,
     sl_buffer_queue, sl_engine, sl_object, sl_output_mix, sl_play, sl_prefetch_status, sl_seek,
@@ -64,7 +64,7 @@ struct DataEnds {
 
 // the Rust mirrors against the header's host view (build.rs `sl_layout_rs`; guest == host is checked there too)
 const _: () = {
-    use super::bindings::identity::{SL_DATA_SINK, SL_OUTPUT_MIX};
+    use super::bindings::qemu::{SL_DATA_SINK, SL_OUTPUT_MIX};
     use std::mem::{offset_of, size_of};
     assert!(size_of::<DataEnds>() as u64 == SL_DATA_SINK[0]);
     assert!(offset_of!(DataEnds, locator) as u64 == SL_DATA_SINK[1]);

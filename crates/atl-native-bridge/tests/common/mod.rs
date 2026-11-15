@@ -5,7 +5,9 @@
 
 use std::path::{Path, PathBuf};
 
-use atl_native_bridge::engine::{Config, Guest, identity, image::Image};
+#[cfg(atl_nb_identity)]
+use atl_native_bridge::engine::identity;
+use atl_native_bridge::engine::{Config, Guest, image::Image};
 
 pub const RTLD_NOW: usize = 2;
 
@@ -130,6 +132,7 @@ pub fn dlerror(g: &mut Guest) -> String {
 }
 
 /// The host FS is this thread's again (`host` read before the crossing) and the probe passes; puts it back on failure so the next stage runs.
+#[cfg(atl_nb_identity)]
 pub fn host_intact(
     g: &Guest,
     self0: libc::pthread_t,

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+#![cfg(atl_nb_identity)]
 //! Gate g5: the signal entry's last-chance report fires when it finds no host thread pointer (`no_host_fs` -> `fault_report`).
 //! Child (`g5 --child`): SIGUSR1 goes through the engine's signal entry while FS points at a zeroed fake TCB (not a glibc TCB, no guest-state slot, no bootstrap record) -> the entry must
 //! write the report on stderr, then still run the host handler (TLS-free, sets a flag) and put the fake FS back; the child restores its own FS and exits 0 when the handler ran.

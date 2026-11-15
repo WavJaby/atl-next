@@ -9,9 +9,9 @@ use atl_engine_api::AtlLanes;
 use super::jni;
 use super::objects::{self, Class, Refused};
 use super::{unsupported, va_list};
+use crate::engine::Down;
 use crate::engine::bindings::OBJECT_STUBS;
 use crate::engine::bindings::qemu::THUNKS;
-use crate::engine::identity::Down;
 
 /// A trap from the engine, decoded from `atl_trap_kind`. `Boot` x0 = the auxv QEMU built for the boot executable (x1, its return stub, the engine keeps); `Call` and `Bind` carry their lanes (`atl_lanes`: x0..x7, v0..v7, eight stack words); `Report` x0.
 #[derive(Clone, Copy, Debug)]

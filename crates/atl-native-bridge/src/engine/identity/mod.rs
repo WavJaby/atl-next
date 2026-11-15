@@ -14,10 +14,9 @@ mod encodings {
     include!(concat!(env!("OUT_DIR"), "/x86_encodings.rs"));
 }
 
-/// Guest->host frames one thread can nest (JNI down -> up -> Java -> down chains); overflow traps (`ud2`) instead of writing past the record.
-const SHADOW_FRAMES: usize = 64;
-/// Words per frame, both directions: return address, guest FS (up) / guest target (down), host target (up) / unused (down), the caller's `%rbx`.
-const FRAME_WORDS: usize = 4;
+use super::{Down, HostThread};
+// the record's frame shape (record.rs): x86_64 keeps the caller's `%rbx` in a frame's last word; overflow traps with `ud2`
+use super::record::FRAME_WORDS;
 
 /// Byte offset of `TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE` from the guest thread pointer (generated from bionic's tls_defines.h).
 const SLOT_OFFSET: usize = {
@@ -29,28 +28,6 @@ const SLOT_OFFSET: usize = {
     slot as usize * std::mem::size_of::<usize>()
 };
 
-/// Per-thread crossing record, addressed through a register by the asm below; field offsets are fixed by it (asserted).
-#[repr(C)]
-pub struct HostThread {
-    shadow_sp: *mut usize,
-    host_fs: usize,
-    guest_fs: usize,
-    shadow_end: *mut usize,
-    /// The innermost running `atl_nb_call_guest`'s saved-register frame (its sp after the saves), where `atl_nb_end_call` resumes; the outer call's is kept in that frame. 0 outside any call.
-    exit_sp: usize,
-    shadow: [usize; SHADOW_FRAMES * FRAME_WORDS],
-    /// The stack this thread's guest code runs on (`Engine::attach`'s answer); the guest's `pthread_getattr_np` reports it.
-    stack: super::Stack,
-}
-
-const _: () = {
-    assert!(std::mem::offset_of!(HostThread, shadow_sp) == 0);
-    assert!(std::mem::offset_of!(HostThread, host_fs) == 8);
-    assert!(std::mem::offset_of!(HostThread, guest_fs) == 16);
-    assert!(std::mem::offset_of!(HostThread, shadow_end) == 24);
-    assert!(std::mem::offset_of!(HostThread, exit_sp) == 32);
-};
-
 /// Bootstrap record: the starting thread's, while its `Tp::Bootstrap` call runs (`Identity::call`: `Guest::start`'s `__linker_init`).
 /// Defends against: the NBS linker runs `__linker_init` and the guest libc constructors (which already call the host: vdso `native_bridge_intercept_symbol`) first on the host's FS, then on its own stack `temp_tcb` (bionic `__libc_init_main_thread_early`), whose slot the engine cannot write; the main thread's real TCB is the engine's (`Guest::start`, after `__native_bridge_config_static_tls`).
 /// Delete when the guest main thread's first TCB carries the slot (e.g. NBS asks the host for it at `__libc_init_main_thread_early`).
@@ -59,49 +36,6 @@ static atl_nb_bootstrap: AtomicUsize = AtomicUsize::new(0);
 /// The bootstrap thread's tid: a signal on another thread during bootstrap must not get its host FS.
 #[unsafe(no_mangle)]
 static atl_nb_bootstrap_tid: AtomicI32 = AtomicI32::new(0);
-
-impl HostThread {
-    /// A record for the calling thread; leaked: its guest TCB keeps pointing at it.
-    pub fn leak() -> &'static mut HostThread {
-        let t = Box::leak(Box::new(HostThread {
-            shadow_sp: std::ptr::null_mut(),
-            host_fs: 0,
-            guest_fs: 0,
-            shadow_end: std::ptr::null_mut(),
-            exit_sp: 0,
-            shadow: [0; SHADOW_FRAMES * FRAME_WORDS],
-            stack: super::Stack::default(),
-        }));
-        let range = t.shadow.as_mut_ptr_range();
-        t.shadow_sp = range.start;
-        t.shadow_end = range.end;
-        t
-    }
-
-    /// The guest thread pointer the last crossing back from the guest saw (0 before the first).
-    pub fn guest_fs(&self) -> usize {
-        self.guest_fs
-    }
-
-    /// Sets the guest thread pointer the next crossing into the guest installs (a guest TCB; step 4.2's attach makes one per thread).
-    pub fn set_guest_fs(&mut self, v: usize) {
-        self.guest_fs = v;
-    }
-
-    /// The stack this thread's guest code runs on.
-    pub fn stack(&self) -> super::Stack {
-        self.stack
-    }
-
-    pub fn set_stack(&mut self, s: super::Stack) {
-        self.stack = s;
-    }
-
-    /// The host thread pointer the last crossing into the guest saved.
-    pub fn host_fs(&self) -> usize {
-        self.host_fs
-    }
-}
 
 /// The guest TCB words the engine owns: `%fs:0` = the thread pointer itself (TLS variant II; bionic `TLS_SLOT_SELF` = 0, `__init_tcb`), and the native-bridge slot = `ht`, which the guest->host and signal entries read.
 ///
@@ -140,7 +74,7 @@ pub fn host_stack() -> Result<super::Stack, String> {
 }
 
 /// The guest ISA (atl-android-paths `native_bridge_bin` / `native_bridge_lib` directory): the identity guest is the host's own.
-pub const GUEST_ISA: &str = std::env::consts::ARCH;
+pub const GUEST_ISA: &str = super::HOST_ISA;
 
 /// The kernel's auxv for this guest: the process's own, the identity guest runs on the real kernel.
 pub fn kernel_auxv() -> Result<Vec<(usize, usize)>, String> {
@@ -807,16 +741,16 @@ impl super::Engine for Identity {
         args: &[usize; 4],
     ) -> usize {
         let bootstrap = match tp {
-            // host FS: the asm installs guest_fs only when it is nonzero, so 0 keeps the call on the host thread pointer
+            // host FS: the asm installs guest_tp only when it is nonzero, so 0 keeps the call on the host thread pointer
             super::Tp::Bootstrap => {
-                cpu.set_guest_fs(0);
+                cpu.set_guest_tp(0);
                 true
             }
             super::Tp::Guest(t) => {
                 // a guest call with no TCB would run on the host TLS; attach and `Guest::start` always install one
                 assert!(t != 0, "guest call with no guest thread pointer");
                 // deliberate break of gate g1 (`ATL_NB_BREAK=swap_tp`): the guest enters on the host thread pointer
-                cpu.set_guest_fs(if cfg!(atl_nb_swap_tp) { fs_base() } else { t });
+                cpu.set_guest_tp(if cfg!(atl_nb_swap_tp) { fs_base() } else { t });
                 false
             }
         };
@@ -845,19 +779,7 @@ pub fn bind(target: usize) -> Option<usize> {
     Some(base + i * encodings::SLOT)
 }
 
-/// What a down call's host arguments are, so the crossing hands the guest its own objects for them (jni.rs, sles.rs). Both engines: identity carries it in the stub ([`Down::code`]), QEMU in the down slot.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Down {
-    /// passed through: plain C, `@CriticalNative`
-    Plain,
-    /// a host `JNIEnv*` -> this thread's guest env (Regular / FastNative JNI methods)
-    Env,
-    /// a host `JavaVM*` -> the guest vm (`JNI_OnLoad`)
-    Vm,
-    /// an OpenSL ES callback: its first argument a host interface of proxy table `t` -> its guest proxy (sles.rs `down_args`, which also rewrites `slObjectCallback`'s 6th)
-    Itf(super::objects::TableId),
-}
-
+/// The identity stub's encoding of a [`Down`] kind.
 impl Down {
     /// The kind word a down stub pushes for [`attach_entry`]: 0 plain, 1 env, 2 vm, 3 + table for an interface.
     pub const fn code(self) -> u32 {
@@ -876,16 +798,6 @@ impl Down {
             1 => Down::Env,
             2 => Down::Vm,
             c => Down::Itf(c - 3),
-        }
-    }
-
-    /// Rewrites the host argument words `first` and `sixth` of a down call of this kind to the guest's objects for them. Both engines' crossings call it before the guest runs.
-    pub(in crate::engine) fn guest_args(self, first: &mut usize, sixth: &mut usize) {
-        match self {
-            Down::Plain => {}
-            Down::Env => *first = super::jni::guest_env(*first),
-            Down::Vm => *first = super::jni::guest_vm(*first),
-            Down::Itf(t) => super::sles::down_args(t, first, sixth),
         }
     }
 }

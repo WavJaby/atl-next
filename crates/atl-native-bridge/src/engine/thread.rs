@@ -73,6 +73,7 @@ macro_rules! abi {
 /// The active engine's guest layout.
 fn abi() -> Abi {
     match active() {
+        #[cfg(atl_nb_identity)]
         Active::Identity => abi!(identity),
         Active::Qemu => abi!(qemu),
     }
@@ -269,7 +270,7 @@ pub fn attach_with(req: StackReq) -> *mut HostThread {
             // SAFETY: `tp` is a fresh guest TCB inside static TLS; `ht` is leaked until this thread's detach, after which no guest code runs on `tp`.
             unsafe {
                 active().init_tcb(tp, ht);
-                (*ht).set_guest_fs(tp);
+                (*ht).set_guest_tp(tp);
             }
             ht
         })
@@ -320,7 +321,7 @@ extern "C" fn detach(value: *mut libc::c_void) {
     }
     // SAFETY: `ht` was leaked by attach for this thread, which runs no guest code after its destructors; its guest TLS block was `alloc_static_tls`'s.
     unsafe {
-        let tp = (*ht).guest_fs();
+        let tp = (*ht).guest_tp();
         if let Some(t) = static_tls()
             && tp != 0
         {
