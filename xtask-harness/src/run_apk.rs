@@ -790,6 +790,13 @@ fn render_path_check(atld_log: &str, app: &str) -> Result<String, String> {
     }
 }
 
+/// A line of one of atld's summary blocks (print_summary): `atld: summary ...` (the API block) or `atld: <family>-summary ...` (one per atl_diag family), so a new family is forwarded without a change here.
+fn is_summary_line(line: &str) -> bool {
+    line.strip_prefix("atld: ")
+        .and_then(|rest| rest.split(' ').next())
+        .is_some_and(|word| word == "summary" || word.ends_with("-summary"))
+}
+
 /// The run's printed verdict: the pass line, or the failure with the app's and the services' log tails. Then atld's end lines and its summary block, and where the logs are.
 fn finish(
     outcome: Result<String, String>,
@@ -809,11 +816,11 @@ fn finish(
             );
         }
     }
-    // the app's end as its parent saw it (a signal leaves no line of its own in the app's or the services' log), then atld's ranked API outcomes of the run (atld main.rs print_summary)
+    // the app's end as its parent saw it (a signal leaves no line of its own in the app's or the services' log), then every block of atld's ranked outcomes (atld main.rs print_summary)
     for line in std::fs::read_to_string(atld_log)
         .unwrap_or_default()
         .lines()
-        .filter(|l| l.contains(" ended: ") || l.starts_with("atld: summary "))
+        .filter(|l| l.contains(" ended: ") || is_summary_line(l))
     {
         println!("run-apk: {line}");
     }
@@ -967,6 +974,26 @@ fn judge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every print_summary block is forwarded (API, prop, a future family); other atld lines are not.
+    #[test]
+    fn summary_lines_of_every_family() {
+        for yes in [
+            "atld: summary 3 keys",
+            "atld: prop-summary 173 keys",
+            "atld: prop-summary prop:miss apex.all.ready x>=8 +0.000s",
+            "atld: fs-summary 1 keys",
+        ] {
+            assert!(is_summary_line(yes), "{yes}");
+        }
+        for no in [
+            "atld: control: /x/control.sock",
+            "atld: summaryx 1",
+            "run-apk: atld: summary 1",
+        ] {
+            assert!(!is_summary_line(no), "{no}");
+        }
+    }
 
     /// Two sizes: 121x175 seconds 45,44,46 -> mean 135/3 = 45.0, min 44, p5 rank ceil(0.15)=1 -> 44; 447x745 seconds 9,8 -> mean 8.5, min 8, p5 8. A line without `buffer=` is skipped.
     #[test]

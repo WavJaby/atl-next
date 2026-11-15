@@ -1374,6 +1374,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     if passed {
         whys.extend(prop_block_failures(&atld_log));
+        whys.extend(device_set_failures(&app));
     }
     whys.extend(exit_failures(
         passed,
@@ -1742,6 +1743,26 @@ fn prop_block_failures(atld: &str) -> Vec<String> {
     whys
 }
 
+/// Properties every device sets that every app process reads at start (plan diagnostics-misses S18, the A024 dump and an ATL Bad Piggies run): apexd, base_system.mk, ATMS retrieveSettings, the display density (atl-property-service).
+const DEVICE_SET: [&str; 4] = [
+    "apex.all.ready",
+    "debug.atrace.tags.enableflags",
+    "debug.force_rtl",
+    "ro.sf.lcd_density",
+];
+
+/// S18: the app's own reads of [`DEVICE_SET`] found a value: its log (atl_diag `prop:miss` lines, raw stderr) names none of them.
+fn device_set_failures(app_log: &str) -> Vec<String> {
+    DEVICE_SET
+        .iter()
+        .filter(|name| {
+            let key = format!("{} {name} ", atl_diag::PROP_MISS);
+            app_log.lines().any(|l| l.contains(&key))
+        })
+        .map(|name| format!("the app read {name} unset (a device sets it)"))
+        .collect()
+}
+
 /// A summary row's count (`... x<n> +...`) and whether it is exact (`x>=<n>`: a lower bound).
 fn row_count(row: &str) -> Option<(u64, bool)> {
     let (_, rest) = row.rsplit_once(" x")?;
@@ -1861,6 +1882,15 @@ mod tests {
         let unranked =
             "atld: stopped services\natld: summary I.a x1 +0.1s\natld: summary I.b x2 +0.2s\n";
         assert_eq!(exit_failures(true, services, unranked, binderd).len(), 1);
+    }
+
+    /// S18: a miss line of a device-set name fails once; another name's miss does not.
+    #[test]
+    fn device_set_names_read_found() {
+        let log = "diag: first prop:miss debug.gles.layers 1 at=1\n";
+        assert!(device_set_failures(log).is_empty());
+        let log = format!("{log}diag: first prop:miss apex.all.ready 1 at=2\n");
+        assert_eq!(device_set_failures(&log).len(), 1);
     }
 
     /// S17: the fixture's row in the prop block passes; a missing prop block row and a `prop:` row in the API block (the regression's shape) each fail once.

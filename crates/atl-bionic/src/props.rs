@@ -343,6 +343,39 @@ impl<'a> Area<'a> {
         len
     }
 
+    /// Every property's name and value in `for_each` order, as `getprop` lists an area (values as `snapshot` reads them); None when the walk or a string is corrupt.
+    pub fn entries(&self) -> Option<Vec<(String, String)>> {
+        let mut out = Vec::new();
+        let mut bad = false;
+        let ok = self.for_each(&mut |pi| {
+            let Some(s) = self.snapshot(pi) else {
+                bad = true;
+                return;
+            };
+            let value = match &s.value {
+                Value::InArea(off) => self.string(*off),
+                Value::Copied(c) => {
+                    let n = c.iter().position(|b| *b == 0).unwrap_or(c.len());
+                    Some(String::from_utf8_lossy(&c[..n]).into_owned())
+                }
+            };
+            match (self.string(s.name), value) {
+                (Some(n), Some(v)) => out.push((n, v)),
+                _ => bad = true,
+            }
+        });
+        (ok && !bad).then_some(out)
+    }
+
+    /// The NUL-terminated string at `off`, lossily UTF-8.
+    fn string(&self, off: usize) -> Option<String> {
+        let len = self.c_str_len(off)?;
+        let bytes: Vec<u8> = (0..len)
+            .map(|i| self.byte(off + i).unwrap_or_default())
+            .collect();
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
     /// Address of byte `off` of the area, for C callers; `info_at` maps it back.
     pub fn ptr(&self, off: usize) -> *const u8 {
         self.words.as_ptr().cast::<u8>().wrapping_add(off)

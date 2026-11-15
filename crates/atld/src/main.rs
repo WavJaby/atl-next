@@ -1883,6 +1883,8 @@ fn run(a: &Args) -> Result<ExitCode> {
     }
     // the services and every app process answer with this one display
     let display = a.display.unwrap_or_else(host_display);
+    // its density, as a device's vendor build.prop states its panel's (DisplayMetrics DENSITY_DEVICE); into the services' and the apps' areas below
+    defaults.push(atl_property_service::lcd_density(display.dpi));
     // the run's GPU's device class (gpu::device_class), as AOSP grants an app gpu_device per device (system/sepolicy private/app.te:393): the host EGL driver renders into, and imports, the gralloc dmabufs through them;
     // without them it falls back to the software device, which cannot import a window's buffers. No gralloc: no chosen GPU, every GPU's class.
     // + the DMABUF system heap on the heap tier only (narrowest grant): Codec2 allocates linear blocks from it in the app process

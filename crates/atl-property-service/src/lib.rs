@@ -49,7 +49,21 @@ const CONSTANTS: &[(&str, &str)] = &[
     // libcutils ashmem-dev.cpp __has_memfd_support: memfd only when both are true, else it opens /dev/ashmem, which Linux lacks (Codec2's FMQ and input buffers then fail NO_MEMORY, measured 2026-11-07, native-load stage 9). Every Treble device (Android 8+) sets ro.treble.enabled=true
     ("ro.treble.enabled", "true"),
     ("sys.use_memfd", "true"),
+    // apexd.cpp OnAllPackagesReady sets it once every APEX is activated; ATL's APEX contents are laid out (atld system_layout) before any process starts, so every process starts past that point
+    ("apex.all.ready", "true"),
+    // base_system.mk PRODUCT_SYSTEM_PROPERTIES: in every device's /system/build.prop (atrace: no tags on). The converter's build.prop does not read product makefiles
+    ("debug.atrace.tags.enableflags", "0"),
+    // ActivityTaskManagerService retrieveSettings writes DisplayProperties.debug_force_rtl from Settings.Global development_force_rtl at system start; ATL has no such setting, so its default 0 -> "false"
+    ("debug.force_rtl", "false"),
 ];
+
+/// DisplayMetrics.getDeviceDensity reads it (after `qemu.sf.lcd_density`) into DENSITY_DEVICE / DENSITY_DEVICE_STABLE; SurfaceFlinger likewise. A device's vendor build.prop states its panel's; here the host display's dpi (DisplayModel), the density the services report.
+pub const LCD_DENSITY: &str = "ro.sf.lcd_density";
+
+/// [`LCD_DENSITY`] for a display of `dpi`.
+pub fn lcd_density(dpi: i32) -> Property {
+    (LCD_DENSITY.to_owned(), dpi.to_string())
+}
 
 /// Why the default set or its area could not be built.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -289,6 +303,27 @@ mod tests {
         assert_eq!(read(&a, "sys.boot_completed").as_deref(), Some("1"));
         assert_eq!(read(&a, "ro.debuggable").as_deref(), Some("0"));
         assert_eq!(read(&a, "media.metrics.enabled").as_deref(), Some("0"));
+        // what every device sets (apexd, base_system.mk, ATMS retrieveSettings; the A024 dump has these exact values)
+        assert_eq!(read(&a, "apex.all.ready").as_deref(), Some("true"));
+        assert_eq!(
+            read(&a, "debug.atrace.tags.enableflags").as_deref(),
+            Some("0")
+        );
+        assert_eq!(read(&a, "debug.force_rtl").as_deref(), Some("false"));
+        // getprop's view (--dump): every property once, values as written, a long ro. value whole
+        let all = a.entries().unwrap();
+        assert_eq!(
+            all.len(),
+            defaults(BUILD_PROP, LinearTier::DmaBufHeap).unwrap().len()
+        );
+        assert!(all.contains(&("apex.all.ready".to_owned(), "true".to_owned())));
+        assert!(
+            all.iter()
+                .any(|(n, v)| n == "ro.build.fingerprint" && v.starts_with("ATL/atl/atl:16/"))
+        );
+        // the density is the display's, added by atld once it is known
+        assert_eq!(read(&a, LCD_DENSITY), None);
+        assert_eq!(lcd_density(240), (LCD_DENSITY.to_owned(), "240".to_owned()));
         // init's layout over the constants above and the fixture's id / release / tags
         assert_eq!(
             read(&a, "ro.build.fingerprint").as_deref(),
