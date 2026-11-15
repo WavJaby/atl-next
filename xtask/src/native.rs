@@ -79,22 +79,44 @@ pub struct Args {
 }
 
 impl Args {
-    /// The explicit goals plus those of the `--for` gates; their nb goals set --native-bridge to the host (the identity engine's guest, atld_run.rs).
+    /// The explicit goals plus those of the `--for` gates; their nb goals set --native-bridge to the host on an identity host (arches.toml `identity`, the identity engine's guest, atld_run.rs); elsewhere the guest is the caller's foreign one.
     fn resolved(&self, root: &Path) -> Result<Args> {
         let mut a = self.clone();
         let wanted = crate::gate_goals::union(root, &self.for_gates)?;
         if !wanted.nb.is_empty() {
-            match &a.native_bridge {
-                None => a.native_bridge = Some(a.host.clone()),
-                Some(arch) if *arch != a.host => bail!(
+            let arches = crate::arches::load(root)?;
+            let identity = arches
+                .get(&a.host)
+                .and_then(|r| r.host.as_ref())
+                .is_some_and(|h| h.identity);
+            match (&a.native_bridge, identity) {
+                (None, true) => a.native_bridge = Some(a.host.clone()),
+                // no identity guest: this run builds the host goals; the gates' foreign guest is a second run with --native-bridge <arch>
+                (None, false) => println!(
+                    "native: --host {} has no identity engine (arches.toml): building the host goals of --for {}; its guest goals need --native-bridge <arch>",
+                    a.host,
+                    self.for_gates.join(",")
+                ),
+                (Some(arch), true) if *arch != a.host => bail!(
                     "--for {}: the gates need the native-bridge guest for --host {}, not --native-bridge {arch}",
                     self.for_gates.join(","),
                     a.host
                 ),
-                Some(_) => {}
+                (Some(arch), false) if *arch == a.host => bail!(
+                    "--for {}: --host {} has no identity engine (arches.toml), so its own ISA is no native-bridge guest",
+                    self.for_gates.join(","),
+                    a.host
+                ),
+                _ => {}
             }
         }
+        // a foreign guest's graph (graph_dir) takes only the gates' nb goals; their host goals are the host run's (same --for, no --native-bridge), which takes no nb goal
+        let foreign = a.native_bridge.as_ref().is_some_and(|nb| *nb != a.host);
         for g in wanted.converter() {
+            let nb = g.starts_with(NB_GOAL);
+            if (foreign && !nb) || (a.native_bridge.is_none() && nb) {
+                continue;
+            }
             if !a.goals.contains(&g) {
                 a.goals.push(g);
             }
@@ -554,13 +576,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .collect();
     // every check that fails the run, with its first error line: the last line names and quotes them (`verdict`)
     let mut failed: Vec<Failure> = Vec::new();
-    if let Some(first) = gate(&graph_out, provided_libs.into_iter())? {
+    let provided_libs: Vec<&Path> = provided_libs.into_iter().collect();
+    if let Some(first) = gate(&graph_out, provided_libs.iter().copied())? {
         failed.push(Failure::step("provided gate", first));
     }
     if let Some(first) = runpath_gate(&graph_out)? {
         failed.push(Failure::step("runpath gate", first));
     }
-    if let Some(first) = isa_floor_gate(root, &graph_out, host, &tiers)? {
+    if let Some(first) = isa_floor_gate(root, &graph_out, host, &tiers, &provided_libs)? {
         failed.push(Failure::step("isa gate", first));
     }
     if let Some(first) = fronts_gate(&graph_out, &tree)? {
@@ -930,6 +953,11 @@ pub fn graph_dir(out: &Path, host: &str, arch: &str) -> PathBuf {
     } else {
         out.join(format!("{NB_GRAPH_DIR}{arch}"))
     }
+}
+
+/// Whether a dir entry under an out dir is a foreign guest's graph dir ([`graph_dir`]).
+pub fn is_graph_dir(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|n| n.starts_with(NB_GRAPH_DIR))
 }
 
 /// The compiler cache of the converter's C/C++ compiles: sccache, prefixed to the cc rule by the converter's `-launcher` (tools/bp2ninja ninja.go says why Rust and yasm steps go uncached).
@@ -1545,6 +1573,7 @@ fn isa_floor_gate(
     out: &Path,
     host: &arches::Host,
     tiers: &crate::isa_tiers::Tiers,
+    provided: &[&Path],
 ) -> Result<Option<String>> {
     if host.isa.is_none() {
         return Ok(None);
@@ -1555,6 +1584,7 @@ fn isa_floor_gate(
         host,
         tiers,
         &crate::isa_tiers::current_objects(out)?,
+        provided,
         &sysroot,
     )?;
     for line in crate::isa_gate::summary(&report) {

@@ -845,9 +845,9 @@ impl Runtime {
         &self.abis
     }
 
-    /// Also places the QEMU engine of foreign guest ISA `isa` (test images only, [`qemu_engine_files`]): `xtask qemu --pic` of its arch (built when stale), the engine `.so` linked from it and the boot executable, kept under `<qemu dir>/app-engine`.
+    /// Also places the QEMU engine of foreign guest ISA `isa` (test images only, [`qemu_engine_files`]): `xtask qemu --pic` of its arch for this run's host (built when stale), the engine `.so` linked from it and the boot executable, kept under `<qemu dir>/app-engine`.
     pub fn with_qemu_engine(mut self, root: &Path, isa: &str) -> Result<Self> {
-        let b = crate::qemu::plan(root, isa, None, true)?;
+        let b = crate::qemu::plan_on(root, isa, Some(&self.host), None, true)?;
         crate::qemu::execute(root, &b)?;
         let dir = b.dir.join("app-engine");
         let so = crate::qemu_spike::engine_so_file(root, &b, &dir)?;

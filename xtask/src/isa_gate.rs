@@ -2,7 +2,7 @@
 //! Static gate over a cross host's ELF outputs: `xtask native --host <arch>` runs it after the build, `xtask isa-gate --arch <arch>` alone.
 //! ISA: every riscv64 ELF64 file under the arch's out dir claims only the ISA its arches.toml row allows (`Tag_RISCV_arch`, implied extensions included: arches::isa_closure), and every GLIBC_x.y version its undefined dynamic symbols need is at or below the row's `glibc_floor`.
 //! Machine: every ELF in a product dir (device/, host/, the provided set's crates/, upstream/, cinstall/, and obj/device, obj/host) is RISC-V; every ELF in a build dir (build/, build-provided/, obj/build) is the build machine's, which is this binary's own e_machine (the machine that runs the build). Every ELF is 64-bit. Other dirs (cargo/, bp2ninja/) mix machines and are counted, not read.
-//! NEEDED: every DT_NEEDED of a current product output (graph.json device/ and host/) resolves to a product, a provided library (provided.json, srcs.json) or a sysroot library (cross::sysroot_lib_dirs); a name only a build-side library has fails.
+//! NEEDED: every DT_NEEDED of a current product output (graph.json device/ and host/) resolves to a product, a provided library (the host out dir's provided.json + srcs.json providers, passed in by native.rs; a foreign guest graph has none of its own) or a sysroot library (cross::sysroot_lib_dirs); a name only a build-side library has fails.
 //! It reads what the object declares, not what its code executes: `Tag_RISCV_arch` is the assembler's -march, so a TU built with a wider -march fails even if it never runs the extension.
 //! Run-time tiers (isa-tiers.toml, isa_tiers.rs): an object named by a row may claim the row's extension and must claim it; a product of the row's module may claim it; nothing else may.
 //! Not checked: static archives (object is built without its `archive` feature, so their members are not read), GLIBCXX_/CXXABI_/GCC_ needs, GTK (no riscv64 output links it yet). GLIBC_PRIVATE is the loader's own interface, not a number: skipped.
@@ -129,11 +129,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             workspace.join("out").join("native")
         })?
         .join(&args.arch);
+        let provided = provided_libs(&out)?;
+        let provided: Vec<&Path> = provided.iter().map(PathBuf::as_path).collect();
         check(
             &out,
             host,
             &isa_tiers::load(root)?,
             &isa_tiers::current_objects(&out)?,
+            &provided,
             &sysroot_dirs(root, host)?,
         )?
     };
@@ -168,6 +171,7 @@ pub fn check(
     host: &arches::Host,
     tiers: &isa_tiers::Tiers,
     current: &BTreeSet<String>,
+    provided: &[&Path],
     sysroot: &[PathBuf],
 ) -> Result<Report> {
     let (Some(isa), Some(floor)) = (&host.isa, &host.glibc_floor) else {
@@ -258,7 +262,7 @@ pub fn check(
             format!("no riscv64 ELF64 under {}: nothing checked", out.display()),
         );
     }
-    for lib in provided_libs(out)? {
+    for lib in provided {
         let data = std::fs::read(&lib).with_context(|| format!("reading {}", lib.display()))?;
         let linkage = provided_gate::linkage(&data)?
             .with_context(|| format!("provided {}: not a 64-bit ELF", lib.display()))?;
@@ -434,10 +438,14 @@ fn claims(claim: &str, ext: &str) -> bool {
 }
 
 /// Every regular file under `dir`, recursively; symlinks are not followed.
+/// Every file under `dir`, except foreign guest graph dirs (native.rs `graph_dir`): each is its own graph, gated by its own run.
 fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry?;
         let kind = entry.file_type()?;
+        if kind.is_dir() && crate::native::is_graph_dir(&entry.file_name()) {
+            continue;
+        }
         if kind.is_dir() {
             collect(&entry.path(), out)?;
         } else if kind.is_file() {
@@ -482,6 +490,8 @@ fn build_machine() -> Result<u16> {
 fn side_of(rel: &Path) -> Option<Side> {
     let parts: Vec<&str> = rel.iter().filter_map(|p| p.to_str()).collect();
     match parts.as_slice() {
+        // guest outputs (bionic, not this host's glibc products): the nb modules (`nb/<arch>`, native.rs NB_DIR) and the guest LLVM runtimes (runtimes.rs, `upstream/llvm-project/<arch>`)
+        ["nb", ..] | ["upstream", "llvm-project", ..] => None,
         [
             "device" | "host" | "crates" | "upstream" | "cinstall",
             _,
@@ -550,7 +560,7 @@ fn needed_violations(owner: &str, needed: &[String], index: &Index) -> Vec<Strin
         .collect()
 }
 
-/// The provided set of an out dir: the `lib` of each provided.json entry and of each srcs.json provider (native.rs writes both; the provided gate checks their union).
+/// The provided set native.rs recorded in a host out dir: the `lib` of each provided.json entry and of each srcs.json provider (the provided gate checks their union).
 fn provided_libs(out: &Path) -> Result<Vec<PathBuf>> {
     #[derive(Deserialize)]
     struct Lib {
@@ -852,8 +862,10 @@ mod tests {
         ] {
             assert_eq!(side(p), Some(Side::Build), "{p}");
         }
-        // a directory's own name, or a dir that mixes machines, is not classified
+        // a directory's own name, a dir that mixes machines, or a guest output is not classified
         for p in [
+            "nb/arm64/libc/libc.so",
+            "upstream/llvm-project/arm64/builtins/build/test.o",
             "device",
             "cargo/release/deps/libserde_derive.so",
             "bp2ninja/bp2ninja",
@@ -1010,22 +1022,12 @@ mod tests {
             )
             .as_bytes(),
         );
-        write(
-            "provided.json",
-            format!(
-                r#"{{"libc": {{"lib": "{d}/crates/atl-bionic/lib/libatl_bionic.so"}}}}"#,
-                d = out.display()
-            )
-            .as_bytes(),
-        );
-        write(
-            "srcs.json",
-            br#"{"libsrc": {"srcs": [], "provider": null}}"#,
-        );
+        let bionic = out.join("crates/atl-bionic/lib/libatl_bionic.so");
         std::fs::create_dir_all(&sysroot).expect("test dir");
         std::fs::write(sysroot.join("libc.so.6"), riscv(&[], "libc.so.6")).expect("test file");
         let host = arches::Host {
             rust: "riscv64gc-unknown-linux-gnu".to_owned(),
+            identity: false,
             meson_cpu_family: "riscv64".to_owned(),
             debian: "riscv64".to_owned(),
             archlinux: None,
@@ -1044,6 +1046,7 @@ mod tests {
             &host,
             &BTreeMap::new(),
             &BTreeSet::new(),
+            &[bionic.as_path()],
             std::slice::from_ref(&sysroot),
         )
         .unwrap();

@@ -1165,9 +1165,23 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     )?
     // the activity's window renders through hwui, which needs EGL: the allocator and the GL driver are part of every run (needs a DRM device that allocates, WSL: vgem)
     .with_gralloc(root)?
-    .with_gl_driver(root)?
-    .with_native_bridge_guest(&args.host)?;
+    .with_gl_driver(root)?;
+    // the host ISA's guest exists only where its identity engine does (arches.toml `identity`); elsewhere every fixture is foreign
+    let identity = crate::arches::load(root)?
+        .get(&args.host)
+        .and_then(|r| r.host.as_ref())
+        .is_some_and(|h| h.identity);
+    let rt = if identity {
+        rt.with_native_bridge_guest(&args.host)?
+    } else {
+        rt
+    };
     let isa = args.fixture_arch.as_deref().unwrap_or(&args.host);
+    ensure!(
+        identity || isa != args.host,
+        "--host {}: no identity engine (arches.toml), so the fixture needs a foreign --fixture-arch",
+        args.host
+    );
     let deferred = deferred(isa, &args.host);
     let rt = if isa == args.host {
         rt

@@ -31,6 +31,9 @@ pub struct Arch {
 #[serde(deny_unknown_fields)]
 pub struct Host {
     pub rust: String,
+    /// The NativeBridge identity crossing exists for this ISA: gates' NB guest is the host's own; else a foreign guest (QEMU).
+    #[serde(default)]
+    pub identity: bool,
     pub meson_cpu_family: String,
     pub debian: String,
     pub archlinux: Option<String>,
@@ -673,6 +676,7 @@ mod tests {
     fn cross_target_needs_its_columns_off_the_build_machine() {
         let row = |clang: Option<&str>, sysroot: Option<&str>, isa: Option<&str>| super::Host {
             rust: "t".into(),
+            identity: false,
             meson_cpu_family: "m".into(),
             debian: "d".into(),
             archlinux: None,

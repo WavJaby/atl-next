@@ -1324,9 +1324,7 @@ const DOWN_ATT_CFG: &str = "atl_nb_down_att";
 /// Down shells of the QEMU engine (Q6-4, bridgegen down.rs): one per host->guest trampoline a process binds (each native method, JNI_OnLoad, JNI_OnUnload). Fixed; a binding past it fails with an error (place.rs `down`).
 const DOWN_SLOTS: usize = 1024;
 
-/// Host ISAs (arches.toml keys) with an identity crossing (engine/identity: host-arch guest bionic run natively, thread-pointer switch). riscv64 gets one at B2, after an arm64 app runs there (owner decision M63); every host has the QEMU engine.
-const IDENTITY_HOSTS: &[&str] = &["x86_64"];
-/// The cfg naming a core built with the identity engine; crate code gates on it, never on an arch name.
+/// The cfg naming a core built with the identity engine (arches.toml `[<arch>.host] identity`); crate code gates on it, never on an arch name.
 const IDENTITY_CFG: &str = "atl_nb_identity";
 
 /// The cfgs `ATL_NB_BREAK` names, in order; an unknown name fails the build, naming it and the known ones.
@@ -1371,7 +1369,7 @@ fn main() -> Result<()> {
     let host = buildscript::host_arch(&arches_text, &std::env::var("TARGET")?)?;
     // the identity engine is a per-host-ISA capability (engine/mod.rs `Active`): cfg `IDENTITY_CFG` on a host ISA that has its crossing
     println!("cargo::rustc-check-cfg=cfg({IDENTITY_CFG})");
-    let identity = IDENTITY_HOSTS.contains(&host.arch.as_str());
+    let identity = host.identity;
     if identity {
         println!("cargo::rustc-cfg={IDENTITY_CFG}");
     }

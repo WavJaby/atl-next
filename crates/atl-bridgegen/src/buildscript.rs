@@ -203,6 +203,8 @@ pub struct ArchRow {
     pub bionic_clang: String,
     /// Records of `asm-<kernel_arch>/asm/ptrace.h` that bionic-view consumers read by layout (arches.toml `uapi_records`).
     pub uapi_records: Vec<String>,
+    /// `[<arch>.host] identity`: this host ISA has the NativeBridge identity crossing (its own guest bionic run natively); false for a guest-only row.
+    pub identity: bool,
 }
 
 /// The checkout holding `manifest_dir`: the nearest ancestor with arches.toml.
@@ -348,6 +350,11 @@ fn arch_row(arch: &str, row: &toml::Value) -> Result<ArchRow> {
         kernel_arch: kernel_arch.to_owned(),
         bionic_clang: bionic_clang.to_owned(),
         uapi_records,
+        identity: row
+            .get("host")
+            .and_then(|h| h.get("identity"))
+            .and_then(|i| i.as_bool())
+            .unwrap_or(false),
     })
 }
 
@@ -542,7 +549,7 @@ mod tests {
 
     #[test]
     fn host_row_by_rust_triple() {
-        let text = "[a]\nkernel_arch = \"ka\"\nuapi_records = [\"r\"]\n[a.host]\nrust = \"a-unknown-linux-gnu\"\n[a.guest]\nclang = \"a-linux-android\"\n[b]\nkernel_arch = \"kb\"\n[b.guest]\nclang = \"b-linux-android\"\n";
+        let text = "[a]\nkernel_arch = \"ka\"\nuapi_records = [\"r\"]\n[a.host]\nrust = \"a-unknown-linux-gnu\"\nidentity = true\n[a.guest]\nclang = \"a-linux-android\"\n[b]\nkernel_arch = \"kb\"\n[b.guest]\nclang = \"b-linux-android\"\n";
         assert_eq!(
             host_arch(text, "a-unknown-linux-gnu").unwrap(),
             ArchRow {
@@ -550,6 +557,7 @@ mod tests {
                 kernel_arch: "ka".into(),
                 bionic_clang: "a-linux-android".into(),
                 uapi_records: vec!["r".into()],
+                identity: true,
             }
         );
         // a guest-only row is never a host
