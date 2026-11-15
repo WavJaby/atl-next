@@ -381,6 +381,7 @@ fn names() -> String {
 }
 
 /// Refuses unless `built` (the record's goals) holds all of gate `name`'s, naming the missing ones and the command that builds them.
+/// The nb goals count here only on an identity host (arches.toml `identity`: its guest is part of the host graph); elsewhere the host graph has none (native.rs `resolved`) and the foreign guest's graph is checked by build_state.rs `foreign_out`.
 pub fn ensure_built(
     root: &Path,
     name: &str,
@@ -388,11 +389,17 @@ pub fn ensure_built(
     built: &BTreeSet<String>,
 ) -> Result<()> {
     // union, not `of`: it also takes `all-gates` (land's build stage)
-    let missing: Vec<String> = union(root, &[name.to_owned()])?
-        .recorded(host_arch)
-        .into_iter()
-        .filter(|g| !built.contains(g))
-        .collect();
+    let goals = union(root, &[name.to_owned()])?;
+    let identity = crate::arches::load(root)?
+        .get(host_arch)
+        .and_then(|r| r.host.as_ref())
+        .is_some_and(|h| h.identity);
+    let wanted = if identity {
+        goals.recorded(host_arch)
+    } else {
+        goals.host
+    };
+    let missing: Vec<String> = wanted.into_iter().filter(|g| !built.contains(g)).collect();
     if !missing.is_empty() {
         bail!(
             "gate `{name}`: the slot was not built with native goal(s) {}: run `cargo xtask native --host {host_arch} --for {name}`",
