@@ -702,7 +702,6 @@ pub struct WebSpawnBins {
 /// What a web-process channel's thread needs of the broker.
 struct WebSpawner {
     bins: WebSpawnBins,
-    stub: PathBuf,
     app_seccomp: bool,
     spawning: Arc<Mutex<()>>,
 }
@@ -978,7 +977,6 @@ impl Broker {
         let (pidns, mntns) = (ns("pid")?, ns("mnt")?);
         let spawner = WebSpawner {
             bins,
-            stub: self.stub.clone(),
             app_seccomp: self.app_seccomp,
             spawning: Arc::clone(&self.spawning),
         };
@@ -1049,11 +1047,12 @@ impl WebSpawner {
             .app_seccomp
             .then(|| seccomp_memfd(Profile::WebProcess))
             .transpose()?;
+        // the stub as the app's view shows it: its host path is not in that view
         let (bwrap_args, grants) = bwrap_args(
             &spawn,
             Profile::WebProcess,
             &host_root()?,
-            &self.stub,
+            Path::new(SANDBOX_STUB_AT),
             info_w.as_raw_fd(),
             seccomp.as_ref().map(AsRawFd::as_raw_fd),
         );

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! flatpak-spawn as an app sandbox shows it (atl_broker::webspawn): the subset of Flatpak's `flatpak-spawn` CLI WebKitGTK uses (FlatpakLauncher.cpp, ProcessLauncherGLib.cpp), turned into one request
+//! flatpak-spawn as an app sandbox shows it (at atl_broker::webspawn::SHIM_AT, the name WebKit runs): the subset of Flatpak's `flatpak-spawn` CLI WebKitGTK uses (FlatpakLauncher.cpp, ProcessLauncherGLib.cpp), turned into one request
 //! on the app's web-process channel. Nothing runs here: the broker starts the process, or refuses. This program is no security boundary (it runs with the app's rights); the broker's check is.
 //!
 //! Accepted: `--forward-fd=N` (once), `--expose-pids`, `--watch-bus`, `--sandbox`, `--directory=D`, `--no-network`, `--sandbox-flag=F`, `--sandbox-expose-path[-ro][-try]=P`, `--env=K=V`, then

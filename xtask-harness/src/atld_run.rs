@@ -656,7 +656,8 @@ impl Runtime {
         let binderd = cargo_bin(root, &out, "atl-binderd")?;
         let sandbox_stub = cargo_bin(root, &out, "atl-sandbox-stub")?;
         let sandbox_join = cargo_bin(root, &out, "atl-sandbox-join")?;
-        let flatpak_spawn = packages::bin(root, &out, "atl-flatpak-spawn", "flatpak-spawn")?;
+        // shown in the sandbox as flatpak-spawn (atl_broker::webspawn::SHIM_AT), the name WebKit runs
+        let flatpak_spawn = cargo_bin(root, &out, "atl-flatpak-spawn")?;
         let atld = cargo_bin(root, &out, "atld")?;
         let installer = packages::bin(root, &out, "atl-app-launcher", "atl-installer")?;
         let api_impl = host_art::api_impl_dex(&java_out);
