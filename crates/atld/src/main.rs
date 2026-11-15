@@ -54,6 +54,7 @@ use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
+mod applog;
 mod cacerts;
 use serde::Deserialize;
 
@@ -251,6 +252,15 @@ struct Args {
     /// C4 `prop_diag.summary_rows`: rows of the `atld: prop-summary` block (the full list stays in each process's log).
     #[arg(long, default_value_t = PROP_SUMMARY_ROWS)]
     prop_diag_summary_rows: usize,
+    /// App log capture (atld applog, journald's `RateLimitIntervalSec=`): the window, ms, of `--log-rate-burst`.
+    #[arg(long, default_value_t = applog::RATE_INTERVAL_MS_DEFAULT)]
+    log_rate_interval_ms: u64,
+    /// App log capture (journald's `RateLimitBurst=`): lines an app process may log per window; the rest is dropped and counted. 0: no rate limit.
+    #[arg(long, default_value_t = applog::RATE_BURST_DEFAULT)]
+    log_rate_burst: u64,
+    /// App log capture (journald's `SystemMaxFileSize=`): bytes an app process's log may grow by in this run; the rest is dropped and counted. 0: no cap.
+    #[arg(long, default_value_t = applog::MAX_BYTES_DEFAULT)]
+    log_max_bytes: u64,
 }
 
 /// `prop_diag.summary_rows` default [est]: one terminal screen beside the API block; the device diff (plan S18) reads the logs, not this block.
@@ -1070,6 +1080,10 @@ struct Host {
     installd: Installd,
     /// When the services' first app process started (wall-clock ms): the summary's first-seen offsets count from it.
     first_app_ms: OnceLock<u64>,
+    /// The bounds of an app process's log capture ([`Host::bounded_log`]).
+    log_limits: applog::Limits,
+    /// The app processes' log copiers: joined at the run's end, before the summary reads the logs.
+    app_logs: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 /// `package`'s credential-encrypted data dir of user 0 as the app sees it (ApplicationInfo.dataDir, `/data/user/0/<package>`): writable in its sandbox ([`Host::package_mounts`]).
@@ -1149,6 +1163,35 @@ fn art_env(
 }
 
 impl Host {
+    /// stdout + stderr of an app process: one pipe atld copies into `log/<name>.log` (appended) under [`Host::log_limits`] ([`applog`]); a drop also gives one atld line when the pipe ends.
+    fn bounded_log(&self, name: &str) -> Result<(std::process::Stdio, std::process::Stdio)> {
+        let (reader, writer) = std::io::pipe().context("app log pipe")?;
+        let mut out = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root.log(name))?;
+        let limits = self.log_limits;
+        let name = name.to_owned();
+        let copier = std::thread::Builder::new()
+            .name("app-log".into())
+            .spawn(move || {
+                match applog::copy_bounded(BufReader::new(reader), &mut out, limits, Instant::now) {
+                    Ok(d) if d.lines > 0 => log(format_args!(
+                        "log {name}: suppressed {} lines ({} bytes)",
+                        d.lines, d.bytes
+                    )),
+                    Ok(_) => {}
+                    Err(e) => log(format_args!("log {name}: {e}")),
+                }
+            })
+            .context("app log thread")?;
+        self.app_logs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(copier);
+        Ok((writer.try_clone()?.into(), writer.into()))
+    }
+
     fn art_env(&self) -> Vec<(OsString, OsString)> {
         art_env(&self.art_root, &self.lib, &self.log_tags)
     }
@@ -1233,12 +1276,7 @@ impl Host {
                 .chain(args.iter().cloned())
                 .map(OsString::from)
                 .collect();
-        let (stdout, stderr) = to_log(
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(self.root.log(name))?,
-        )?;
+        let (stdout, stderr) = self.bounded_log(name)?;
         Ok(Spawn {
             uid,
             context_manager: false,
@@ -2089,6 +2127,16 @@ fn run(a: &Args) -> Result<ExitCode> {
         },
         pipewire: atl_platform_host::app_access::pipewire_socket(),
         first_app_ms: OnceLock::new(),
+        log_limits: applog::Limits {
+            rate: (a.log_rate_burst > 0).then(|| {
+                (
+                    Duration::from_millis(a.log_rate_interval_ms),
+                    a.log_rate_burst,
+                )
+            }),
+            max_bytes: (a.log_max_bytes > 0).then_some(a.log_max_bytes),
+        },
+        app_logs: Mutex::new(Vec::new()),
         installd: Installd {
             sessions,
             installer: a.installer.clone(),
@@ -2356,6 +2404,21 @@ fn run(a: &Args) -> Result<ExitCode> {
         std::thread::sleep(STOP_POLL);
     }
     let since = host.first_app_ms.get().copied().unwrap_or(started_ms);
+    // the app logs' copiers end at their pipes' EOF (every app process was killed above); the summary reads what they wrote
+    let copiers = std::mem::take(&mut *host.app_logs.lock().unwrap_or_else(|e| e.into_inner()));
+    let deadline = Instant::now() + grace;
+    for c in copiers {
+        while !c.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(STOP_POLL);
+        }
+        if c.is_finished() {
+            let _ = c.join();
+        } else {
+            log(format_args!(
+                "an app log copier still runs {grace:?} after the end: its log may be cut"
+            ));
+        }
+    }
     drop(host);
     // the C4 row cap of each family block (atl_diag::FAMILIES)
     let prop_rows = a.prop_diag_summary_rows;
