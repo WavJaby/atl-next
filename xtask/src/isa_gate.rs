@@ -40,8 +40,11 @@ pub struct Args {
     #[arg(long)]
     arch: String,
     /// Build dir root, as `native --out` (default: this checkout's slot); the arch's outputs are `<out>/<arch>`.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "elf")]
     out: Option<PathBuf>,
+    /// Instead of an out dir: one ELF built outside it (a `cross` cargo output such as libatl_native_bridge.so), held to the row's isa closure (no tier applies), glibc_floor, and sysroot libraries for its DT_NEEDED (`check_executable`).
+    #[arg(long)]
+    elf: Option<PathBuf>,
 }
 
 /// One undefined dynamic symbol's version need: the symbol, its version (`GLIBC_2.41`) and the library providing it.
@@ -119,17 +122,21 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .get(&args.arch)
         .and_then(|a| a.host.as_ref())
         .with_context(|| format!("{}: no [{}.host] row", arches::FILE, args.arch))?;
-    let out = slot::out_dir(root, args.out.as_deref(), "--out", |workspace| {
-        workspace.join("out").join("native")
-    })?
-    .join(&args.arch);
-    let report = check(
-        &out,
-        host,
-        &isa_tiers::load(root)?,
-        &isa_tiers::current_objects(&out)?,
-        &sysroot_dirs(root, host)?,
-    )?;
+    let report = if let Some(elf) = &args.elf {
+        check_executable(elf, host, &sysroot_dirs(root, host)?)?
+    } else {
+        let out = slot::out_dir(root, args.out.as_deref(), "--out", |workspace| {
+            workspace.join("out").join("native")
+        })?
+        .join(&args.arch);
+        check(
+            &out,
+            host,
+            &isa_tiers::load(root)?,
+            &isa_tiers::current_objects(&out)?,
+            &sysroot_dirs(root, host)?,
+        )?
+    };
     for line in summary(&report) {
         println!("isa gate: {line}");
     }
