@@ -204,6 +204,25 @@ mirrors = [
     "frameworks/base/services/core/java/com/android/server/notification/NotificationManagerService.java#finishToken",
     "frameworks/base/services/core/java/com/android/server/notification/NotificationManagerService.java#showNextToastLocked",
     "frameworks/base/services/core/java/com/android/server/notification/NotificationManagerService.java#areNotificationsEnabled",
+    "frameworks/base/services/core/java/com/android/server/notification/NotificationManagerService.java#cancelNotificationWithTag",
+    "frameworks/base/services/core/java/com/android/server/notification/NotificationManagerService.java#cancelNotificationInternal",
+    "frameworks/base/services/core/java/com/android/server/notification/NotificationManagerService.java#resolveNotificationUid",
+]
+
+[appops]
+src = ["crates/atl-services/src/appops.rs", "crates/atl-services/src/app_ops.rs"]
+mirrors = [
+    "frameworks/base/core/java/android/app/AppOpInfo.java",
+    "frameworks/base/core/java/android/app/AppOpsManager.java#opToDefaultMode",
+    "frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java#checkOperationImpl",
+    "frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java#checkOperationRawForDevice",
+    "frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java#checkOperationForDevice",
+    "frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java#checkOperationUnchecked",
+    "frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java#noteOperationImpl",
+    "frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java#checkPackage",
+    "frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java#shouldCollectNotes",
+    "frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java#reportRuntimeAppOpAccessMessageAndGetConfig",
+    "frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java",
 ]
 
 [alarm]

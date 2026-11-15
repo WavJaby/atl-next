@@ -12,6 +12,7 @@ pub mod android {
         pub mod ContentProviderHolder;
         pub mod NotificationChannel;
         pub mod PendingIntent;
+        pub mod SyncNotedAppOp;
         pub mod job {
             pub mod JobInfo;
             pub mod JobParameters;
@@ -115,6 +116,9 @@ pub mod java {
 pub mod com {
     pub mod android {
         pub mod internal {
+            pub mod app {
+                pub mod MessageSamplingConfig;
+            }
             pub mod infra {
                 pub mod AndroidFuture;
             }

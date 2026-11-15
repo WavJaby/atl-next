@@ -20,6 +20,7 @@ pub mod activity_stack;
 pub mod activity_start;
 pub mod alarm_table;
 pub mod app_id;
+pub mod app_ops;
 pub mod bound_services;
 pub mod broadcast;
 pub mod config_diff;
@@ -42,6 +43,8 @@ pub mod activity;
 pub mod activity_task;
 #[cfg(feature = "converter")]
 pub mod alarm;
+#[cfg(feature = "converter")]
+pub mod appops;
 #[cfg(feature = "converter")]
 pub mod audio;
 #[cfg(feature = "converter")]

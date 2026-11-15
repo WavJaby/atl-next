@@ -140,6 +140,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "notification: " + channels());
         Log.i("AtlTest", "power: " + power());
         Log.i("AtlTest", "uimode: " + uiMode());
+        Log.i("AtlTest", "appops: " + appOps());
         Log.i("AtlTest", "jobscheduler: " + jobs());
         jobRun();
         Log.i("AtlTest", "bindservice: " + bound());
@@ -338,6 +339,8 @@ public class Main extends Activity {
             nm.createNotificationChannel(new android.app.NotificationChannel(
                     "atl.test", "ATL test", android.app.NotificationManager.IMPORTANCE_HIGH));
             android.app.NotificationChannel again = nm.getNotificationChannel("atl.test");
+            // nothing was posted, so AOSP's cancel finds no record and returns; the services' count shows it was served (app.rs SERVICE_CALLS)
+            nm.cancel("atl.tag", 7);
             return read + " count=" + count + " absent=" + absent + " raised=" + (again == null ? "none" : again.getImportance());
         } catch (Throwable t) {
             return "threw " + t;
@@ -477,6 +480,42 @@ public class Main extends Activity {
                 return "absent";
             }
             return "type=" + um.getCurrentModeType() + " night=" + um.getNightMode() + " config=" + getResources().getConfiguration().uiMode;
+        } catch (Throwable t) {
+            return "threw " + t;
+        }
+    }
+
+    /**
+     * AppOpsManager against the `appops` service: the mode of POST_NOTIFICATION (its runtime permission requested and denied), of COARSE_LOCATION (not requested: the op's default), a noted
+     * COARSE_LOCATION for this package and for one that is not this uid's, then checkPackage for both ("ok" / what it threw); "absent" when getSystemService returns null; else what it threw.
+     */
+    private String appOps() {
+        try {
+            android.app.AppOpsManager ops = (android.app.AppOpsManager) getSystemService(APP_OPS_SERVICE);
+            if (ops == null) {
+                return "absent";
+            }
+            int uid = android.os.Process.myUid();
+            String pkg = getPackageName();
+            String own;
+            try {
+                ops.checkPackage(uid, pkg);
+                own = "ok";
+            } catch (SecurityException e) {
+                own = "SecurityException";
+            }
+            String foreign;
+            try {
+                ops.checkPackage(uid, "android");
+                foreign = "ok";
+            } catch (SecurityException e) {
+                foreign = "SecurityException";
+            }
+            return "post=" + ops.unsafeCheckOpNoThrow("android:post_notification", uid, pkg)
+                    + " coarse=" + ops.unsafeCheckOpNoThrow(android.app.AppOpsManager.OPSTR_COARSE_LOCATION, uid, pkg)
+                    + " noted=" + ops.noteOpNoThrow(android.app.AppOpsManager.OPSTR_COARSE_LOCATION, uid, pkg)
+                    + " noted-foreign=" + ops.noteOpNoThrow(android.app.AppOpsManager.OPSTR_COARSE_LOCATION, uid, "android")
+                    + " own=" + own + " foreign=" + foreign;
         } catch (Throwable t) {
             return "threw " + t;
         }

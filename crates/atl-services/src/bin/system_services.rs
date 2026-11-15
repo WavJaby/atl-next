@@ -93,7 +93,7 @@ struct Args {
     /// Test only: `sensorservice` is not registered, the deliberate break of the sensors gate's empty stage (SensorManager then waits for it, SensorManager.cpp `waitForSensorService`).
     #[arg(long)]
     no_sensor_service: bool,
-    /// Test only: this service (`connectivity`, `jobscheduler`, `permissionmgr`, `power`, `uimode`, `webviewupdate`) is not registered (repeat), the deliberate break of the app gate's line for it (its manager is then null).
+    /// Test only: this service (`appops`, `connectivity`, `jobscheduler`, `permissionmgr`, `power`, `uimode`, `webviewupdate`) is not registered (repeat), the deliberate break of the app gate's line for it (its manager is then null).
     #[arg(long)]
     omit_service: Vec<String>,
     /// Start `sensorservice` in HAL bypass data injection mode with this package allow-listed (AOSP `dumpsys sensorservice hal_bypass_replay_data_injection <package>`); refused while the machine has a real accelerometer. atld `--tilt-keys` sets it.
@@ -145,6 +145,8 @@ const PERMISSION_MANAGER: &str = "permissionmgr";
 const POWER: &str = "power";
 const THERMAL: &str = "thermalservice";
 const UI_MODE: &str = "uimode";
+/// Context.APP_OPS_SERVICE.
+const APP_OPS: &str = "appops";
 /// WebViewFactory.WEBVIEW_UPDATE_SERVICE_NAME.
 const WEBVIEW_UPDATE: &str = "webviewupdate";
 
@@ -379,6 +381,13 @@ fn main() -> Result<()> {
             atl_services::uimode::new_binder(Arc::clone(&permissions)),
         )
         .context("addService uimode")?;
+    }
+    if !a.omit_service.iter().any(|s| s == APP_OPS) {
+        binder::add_service(
+            APP_OPS,
+            atl_services::appops::new_binder(Arc::clone(&permissions), Arc::clone(&packages)),
+        )
+        .context("addService appops")?;
     }
     if !a.omit_service.iter().any(|s| s == WEBVIEW_UPDATE) {
         binder::add_service(

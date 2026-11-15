@@ -387,6 +387,18 @@ impl Permissions {
         Ok(())
     }
 
+    /// `uid`'s grant of runtime permission `p` when its state holds one (the app requested it), else None: the permissions PermissionPolicyService syncs app-op modes from.
+    pub fn runtime_grant(&self, uid: u32, p: &str) -> Option<bool> {
+        self.state(uid, p).filter(|s| s.runtime).map(|s| s.granted)
+    }
+
+    /// The registered definition is runtime or an app-op permission (AppOpsService.shouldCollectNotes' test); an undefined one is neither.
+    pub fn is_runtime_or_app_op(&self, p: &str) -> bool {
+        self.registry
+            .get(p)
+            .is_some_and(|d| d.is_runtime() || d.is_app_op())
+    }
+
     /// `permission::holds` against `uid`'s grants.
     pub fn holds(&self, uid: u32, permissions: &[&str], any: bool) -> bool {
         permission::holds(uid, permissions, any, |p| self.granted(uid, p))

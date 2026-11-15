@@ -12,6 +12,8 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
+import android.app.SyncNotedAppOp;
+import android.app.AppOpsManager;
 import android.app.ResultInfo;
 import android.content.IIntentSender;
 import android.app.servertransaction.ActivityConfigurationChangeItem;
@@ -172,6 +174,11 @@ public class ParcelTruth {
         // getInfoForIntentSender's answer for a record (package, uid, immutable, INTENT_SENDER_BROADCAST) and for a foreign sender (null, INVALID_UID, mutable, INTENT_SENDER_UNKNOWN)
         check("ActivityManager.PendingIntentInfo", new ActivityManager.PendingIntentInfo("com.example.atltest", 10123, true, ActivityManager.INTENT_SENDER_BROADCAST), ActivityManager.PendingIntentInfo.CREATOR);
         check("ActivityManager.PendingIntentInfo:unknown", new ActivityManager.PendingIntentInfo(null, -1, false, ActivityManager.INTENT_SENDER_UNKNOWN), ActivityManager.PendingIntentInfo.CREATOR);
+        // noteOperation's answer (atl-services appops.rs): MODE_IGNORED for OP_GPS with a tag and a package, then MODE_ALLOWED for OP_RUN_IN_BACKGROUND with neither (both flag bits off)
+        check("SyncNotedAppOp", new SyncNotedAppOp(AppOpsManager.MODE_IGNORED, AppOpsManager.OP_GPS, "tag", "com.example.atltest"), SyncNotedAppOp.CREATOR);
+        check("SyncNotedAppOp:bare", new SyncNotedAppOp(AppOpsManager.MODE_ALLOWED, AppOpsManager.OP_RUN_IN_BACKGROUND, null, null), SyncNotedAppOp.CREATOR);
+        // reportRuntimeAppOpAccessMessageAndGetConfig's answer for a package not sampled: OP_NONE, distance 0, an hour past an epoch time
+        check("MessageSamplingConfig", new com.android.internal.app.MessageSamplingConfig(AppOpsManager.OP_NONE, 0, 1794712434158L + 3600000L), com.android.internal.app.MessageSamplingConfig.CREATOR);
         // getRunningAppProcesses' element: every field off its default, a reason component, pkgDeps null (the services' answer) and set
         check("ActivityManager.RunningAppProcessInfo", runningAppProcess(), ActivityManager.RunningAppProcessInfo.CREATOR);
         ActivityManager.RunningAppProcessInfo bare = new ActivityManager.RunningAppProcessInfo("com.example.atltest", 2, new String[] {"com.example.atltest"});

@@ -6,6 +6,7 @@
 //! TYPE_TOAST window with that token; the token is bound to the caller's newest Task here (WindowManagerInternal.addWindowToken), which is where window.rs places the window.
 //! Channels: apps create and read back their own (notification_channels.rs), as a device answers (behaviour decision 1); nothing is displayed for them.
 //! Not modelled: rate limiting, per-user visibility, suspended/blocked packages, accessibility timeouts, enqueueTextToast (no system UI: answered false), channel groups and posting (counted UNKNOWN).
+//! Cancelling a notification checks the caller as AOSP does and finds nothing, since nothing is posted.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -29,6 +30,8 @@ use atl_services_types::permission;
 const INTERFACE: &str = "INotificationManager";
 /// Manifest.permission.INTERACT_ACROSS_USERS: canNotifyAsPackage's check for another user's channels.
 const INTERACT_ACROSS_USERS: &str = "android.permission.INTERACT_ACROSS_USERS";
+/// UserHandle.USER_CURRENT: handleIncomingUser resolves it to the caller's own user.
+const USER_CURRENT: i32 = -2;
 /// NotificationManagerService.MAX_PACKAGE_TOASTS (:444).
 const MAX_PACKAGE_TOASTS: usize = 5;
 /// Toast.LENGTH_LONG; LONG_DELAY / SHORT_DELAY / FINISH_TOKEN_TIMEOUT (:461-465).
@@ -337,6 +340,40 @@ impl INotificationManager for NotificationManager {
             .collect();
         drop(st);
         self.0.finish(|w| windows.contains(w));
+        Ok(())
+    }
+
+    /// cancelNotificationWithTag (:4219 -> cancelNotificationInternal:8282): handleIncomingUser (another user needs INTERACT_ACROSS_USERS), resolveNotificationUid (pkg and opPkg must be the
+    /// caller's: no delegates exist, else SecurityException), then cancel the (pkg, tag, id, user) record. Nothing is ever posted here, so no record matches and the cancel is a no-op, as AOSP's
+    /// cancelNotification is for an id never posted.
+    fn r#cancelNotificationWithTag(
+        &self,
+        pkg: Option<&str>,
+        op_pkg: Option<&str>,
+        _tag: Option<&str>,
+        _id: i32,
+        user_id: i32,
+    ) -> binder::Result<()> {
+        let pkg = pkg.ok_or_else(|| Status::new_exception(ExceptionCode::NULL_POINTER, None))?;
+        let uid = self.0.check_same_app("cancelNotificationWithTag", pkg)?;
+        if let Some(op_pkg) = op_pkg.filter(|o| *o != pkg) {
+            self.0.check_same_app("cancelNotificationWithTag", op_pkg)?;
+        }
+        if user_id != USER_CURRENT
+            && i64::from(permission::user_id(uid)) != i64::from(user_id)
+            && !self
+                .0
+                .permissions
+                .holds(uid, &[INTERACT_ACROSS_USERS], false)
+        {
+            return Err(Status::new_exception_str(
+                ExceptionCode::SECURITY,
+                Some(format!(
+                    "cancelNotificationWithTag for user {user_id}: caller lacks {INTERACT_ACROSS_USERS}"
+                )),
+            ));
+        }
+        atl_diag::answered(INTERFACE, "cancelNotificationWithTag (nothing posted)");
         Ok(())
     }
 

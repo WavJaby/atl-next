@@ -125,7 +125,9 @@ const MEDIAPLAYER_START: &str = "MediaPlayerNative: start called in state 1";
 /// uimode: Main.uiMode: UI_MODE_TYPE_NORMAL (1), MODE_NIGHT_NO (1), and the Configuration's uiMode TYPE_NORMAL | NIGHT_NO = 0x11 = 17 (UiModeManagerService's default for a normal device).
 /// jobscheduler: Main.jobs: each enqueue answers RESULT_SUCCESS (1); the second, of an equal JobInfo, joins the first job (JobSchedulerService.scheduleAsPackage), so one job is pending; cancel removes it;
 /// a job whose service is an activity fails enforceValidJobRequest ("non-existent component") -> IllegalArgumentException.
-const SERVICE_LINES: [(&str, &str, Option<&str>); 6] = [
+/// appops: Main.appOps (AppOpsManager.MODE_ALLOWED 0, MODE_IGNORED 1, MODE_ERRORED 2): POST_NOTIFICATION's permission is requested and denied -> PermissionPolicyService's MODE_IGNORED; COARSE_LOCATION's is not
+/// requested -> the op's default MODE_ALLOWED, noted the same; noted for `android` (not the fixture's uid) -> MODE_ERRORED (noteOperationUnchecked); checkPackage passes for the fixture, throws for `android`.
+const SERVICE_LINES: [(&str, &str, Option<&str>); 7] = [
     (
         "jobscheduler",
         "AtlTest: jobscheduler: ",
@@ -153,6 +155,24 @@ const SERVICE_LINES: [(&str, &str, Option<&str>); 6] = [
         "uimode",
         "AtlTest: uimode: ",
         Some("type=1 night=1 config=17"),
+    ),
+    (
+        "appops",
+        "AtlTest: appops: ",
+        Some("post=1 coarse=0 noted=0 noted-foreign=2 own=ok foreign=SecurityException"),
+    ),
+];
+/// Calls a [`SERVICE_LINES`] row makes that the app cannot see refused (a method a service lacks reads back as no error and zeros), so the services' own `answered` count must show each:
+/// (service, counter key). notification: Main.channels' NotificationManager.cancel of a never-posted id. appops: Main.appOps' first noted COARSE_LOCATION (runtime permission -> notes collected)
+/// reports its stack trace, AppOpsManager's sConfig starting expired.
+const SERVICE_CALLS: [(&str, &str); 2] = [
+    (
+        "notification",
+        "INotificationManager.cancelNotificationWithTag (nothing posted)",
+    ),
+    (
+        "appops",
+        "IAppOpsService.reportRuntimeAppOpAccessMessageAndGetConfig (not sampled)",
     ),
 ];
 /// Main.pendingIntent's line: PendingIntent's creator getters for this package's own immutable broadcast, then isImmutable of a FLAG_MUTABLE one (ActivityManagerService.getInfoForIntentSender reports the record's
@@ -1405,6 +1425,17 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .find_map(|l| l.split_once(prefix).map(|(_, r)| r.trim_end().to_owned()));
         if passed && got.as_deref() != Some(want) {
             whys.push(format!("{row}: want {want:?}, got {got:?}"));
+        }
+    }
+    if passed {
+        let served = counters(&services_log);
+        for (service, key) in SERVICE_CALLS {
+            if !served
+                .iter()
+                .any(|c| c.outcome == "answered" && c.api == key && c.count > 0)
+            {
+                whys.push(format!("{service}: the services did not answer {key}"));
+            }
         }
     }
     let signatures = app.lines().find_map(|l| {

@@ -68,17 +68,26 @@ pub const TARGET_SDK_RUNTIME_PERMISSIONS: i32 = 23;
 /// PermissionManagerServiceImpl.PLATFORM_PACKAGE_NAME: the defining package of framework-res's permissions.
 pub const PLATFORM_PACKAGE: &str = "android";
 
-/// The registry's view of one permission (PermissionRegistry / Permission): who defines it and its base protection.
+/// PermissionInfo.PROTECTION_FLAG_APPOP: the permission is granted through its app op.
+const PROTECTION_FLAG_APPOP: u32 = 0x40;
+
+/// The registry's view of one permission (PermissionRegistry / Permission): who defines it, its base protection and its protection flags.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Definition {
     pub owner: String,
     base: u32,
+    flags: u32,
 }
 
 impl Definition {
     /// Permission.isRuntime: base protection DANGEROUS.
     pub fn is_runtime(&self) -> bool {
         self.base == PROTECTION_DANGEROUS
+    }
+
+    /// Permission.isAppOp: PROTECTION_FLAG_APPOP set.
+    pub fn is_app_op(&self) -> bool {
+        self.flags & PROTECTION_FLAG_APPOP != 0
     }
 }
 
@@ -92,6 +101,7 @@ pub fn registry<'a>(definitions: impl IntoIterator<Item = (&'a str, &'a str, u32
         defined.entry(name.to_owned()).or_insert(Definition {
             owner: owner.to_owned(),
             base: level & PROTECTION_MASK_BASE,
+            flags: level & !PROTECTION_MASK_BASE,
         });
     }
     defined

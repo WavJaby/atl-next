@@ -83,6 +83,8 @@ types = [
     # the power service and the thermalservice PowerManager needs beside it (power.rs)
     "android.os.IPowerManager",
     "android.os.IThermalService",
+    # the appops service (appops.rs)
+    "com.android.internal.app.IAppOpsService",
     # the uimode service (uimode.rs)
     "android.app.IUiModeManager",
     # the webviewupdate service (webview_update.rs)

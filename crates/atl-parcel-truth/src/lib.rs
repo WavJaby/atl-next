@@ -28,6 +28,7 @@ use atl_parcelables::android::app::ApplicationErrorReport_ParcelableCrashInfo;
 use atl_parcelables::android::app::ContentProviderHolder;
 use atl_parcelables::android::app::NotificationChannel;
 use atl_parcelables::android::app::PendingIntent;
+use atl_parcelables::android::app::SyncNotedAppOp;
 use atl_parcelables::android::app::servertransaction::ClientTransaction;
 use atl_parcelables::android::content::pm::{
     ActivityInfo, ApplicationInfo, ConfigurationInfo, InstrumentationInfo, PackageInfo,
@@ -52,6 +53,7 @@ use atl_parcelables::android::webkit::WebViewProviderResponse;
 use atl_parcelables::android::window::{
     ClientWindowFrames, ImeOnBackInvokedDispatcher, SizeConfigurationBuckets,
 };
+use atl_parcelables::com::android::internal::app::MessageSamplingConfig;
 use atl_parcelables::com::android::internal::infra::AndroidFuture;
 use atl_parcelables::com::android::internal::inputmethod::{
     InputBindResult, InputConnectionCommandHeader, InputMethodInfoSafeList,
@@ -318,6 +320,7 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
         }
         "android.app.ContentProviderHolder" => round_trip_as::<ContentProviderHolder>(input, mode),
         "android.app.PendingIntent" => round_trip_as::<PendingIntent>(input, mode),
+        "android.app.SyncNotedAppOp" => round_trip_as::<SyncNotedAppOp>(input, mode),
         "android.app.ActivityManager$PendingIntentInfo" => {
             round_trip_as::<ActivityManager_PendingIntentInfo>(input, mode)
         }
@@ -347,6 +350,9 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
         "java.lang.CharSequence" => round_trip_as::<CharSequence>(input, mode),
         "android.view.inputmethod.SurroundingText" => round_trip_as::<SurroundingText>(input, mode),
         "com.android.internal.infra.AndroidFuture" => round_trip_as::<AndroidFuture>(input, mode),
+        "com.android.internal.app.MessageSamplingConfig" => {
+            round_trip_as::<MessageSamplingConfig>(input, mode)
+        }
         "com.android.internal.inputmethod.InputMethodInfoSafeList" => {
             round_trip_as::<InputMethodInfoSafeList>(input, mode)
         }
