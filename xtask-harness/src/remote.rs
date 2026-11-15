@@ -63,16 +63,32 @@ pub const CPU_INFO: &str = "cpuinfo";
 /// The manifest file at the bundle's root: `sha256  size  name` per file, `link  target  name` per link.
 const MANIFEST: &str = "bundle.manifest";
 /// ssh options: never prompt, never hang. The alias check is the first contact with the host. ServerAlive: a link that dies mid-call fails in about 3 min instead of hanging until the caller's limit.
-const SSH_OPTS: [&str; 8] = [
-    "-o",
-    "BatchMode=yes",
-    "-o",
-    "ConnectTimeout=20",
-    "-o",
-    "ServerAliveInterval=30",
-    "-o",
-    "ServerAliveCountMax=6",
-];
+/// `-F` the user's config: xtask runs inside the build namespace (tree.rs `enter`), a user namespace where root-owned files show as the overflow uid, and ssh refuses the system config's root-owned
+/// includes there ("Bad owner or permissions on /etc/ssh/ssh_config.d/..."); the host aliases live in the user's own config.
+fn ssh_opts() -> Vec<String> {
+    let config = std::env::home_dir()
+        .unwrap_or_default()
+        .join(".ssh/config");
+    let mut opts = vec!["-F".to_owned(), config.display().to_string()];
+    for o in [
+        "BatchMode=yes",
+        "ConnectTimeout=20",
+        "ServerAliveInterval=30",
+        "ServerAliveCountMax=6",
+    ] {
+        opts.extend(["-o".to_owned(), o.to_owned()]);
+    }
+    opts
+}
+
+/// [`ssh_opts`] as shell words.
+fn ssh_opts_sh() -> String {
+    ssh_opts()
+        .iter()
+        .map(|o| sh_quote(o))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 const MIB: f64 = 1024.0 * 1024.0;
 
 #[derive(clap::Subcommand)]
@@ -640,7 +656,7 @@ impl RemoteRun {
         std::fs::write(&script, plan.script(&self.base))
             .with_context(|| format!("writing {}", script.display()))?;
         let transport = match &self.host {
-            Host::Ssh(alias) => format!("ssh {} {} sh -s", SSH_OPTS.join(" "), sh_quote(alias)),
+            Host::Ssh(alias) => format!("ssh {} {} sh -s", ssh_opts_sh(), sh_quote(alias)),
             Host::Local(_) => "sh -s".to_owned(),
         };
         let transfer = format!(
@@ -795,7 +811,7 @@ impl Host {
         let status = match self {
             Host::Ssh(alias) => Command::new("rsync")
                 .args(["-a", "--delete", "--mkpath", "-e"])
-                .arg(format!("ssh {}", SSH_OPTS.join(" ")))
+                .arg(format!("ssh {}", ssh_opts_sh()))
                 .arg(&src)
                 .arg(format!("{alias}:{REMOTE_ROOT}/{dir_name}/"))
                 .status(),
@@ -855,7 +871,7 @@ impl Host {
         cmd.args(["-k", "5", secs.as_str()]);
         match self {
             Host::Ssh(alias) => {
-                cmd.arg("ssh").args(SSH_OPTS).arg(alias).args(["sh", "-s"]);
+                cmd.arg("ssh").args(ssh_opts()).arg(alias).args(["sh", "-s"]);
             }
             Host::Local(_) => {
                 cmd.args(["sh", "-s"]);
@@ -898,7 +914,7 @@ fn feed_and_wait(mut child: Child, script: &str) -> Result<Output> {
 
 fn ssh(alias: &str) -> Command {
     let mut c = Command::new("ssh");
-    c.args(SSH_OPTS).arg(alias);
+    c.args(ssh_opts()).arg(alias);
     c
 }
 
