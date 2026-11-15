@@ -85,14 +85,12 @@ impl IntentKey {
         )
     }
 
-    /// Uri.findSchemeSeparator, reduced: the first ':' when no '/', '?' or '#' precedes it. None = relative (no scheme).
+    /// Uri.findSchemeSeparator (Uri.java:528-532): the first ':', so the scheme is everything before it, '/', '?' and '#' included. None = no ':' (a relative URI).
     fn scheme_end(&self) -> Option<usize> {
-        let data = self.data.as_deref()?;
-        let end = data.find(':')?;
-        (!data[..end].contains(['/', '?', '#'])).then_some(end)
+        self.data.as_deref()?.find(':')
     }
 
-    /// Uri.getScheme of the data.
+    /// Uri.getScheme of the data (parseScheme, Uri.java:574-577).
     fn scheme(&self) -> Option<&str> {
         let data = self.data.as_deref()?;
         self.scheme_end().map(|end| &data[..end])
@@ -987,6 +985,42 @@ mod tests {
         assert_eq!(uri_decode("%4"), "\u{FFFD}");
         assert_eq!(uri_decode("%4z"), "\u{FFFD}\u{4}");
         assert_eq!(uri_decode("%FF"), "\u{FFFD}");
+    }
+
+    #[test]
+    fn scheme_ends_at_the_first_colon() {
+        // Uri.findSchemeSeparator = indexOf(':') (Uri.java:528-532), parseScheme = substring(0, ssi) (:574-577): "a/b:c" has scheme "a/b" and ssp "c"; '?' and '#' before the colon stay in the scheme
+        let scheme_of = |s: &str| Filter {
+            actions: vec!["a.X".into()],
+            schemes: Some(vec![s.into()]),
+            ..Default::default()
+        };
+        // SCHEME 0x200000 + MATCH_ADJUSTMENT_NORMAL 0x8000
+        assert_eq!(
+            match_value(&scheme_of("a/b"), &data_key("a/b:c")),
+            Some(0x208000)
+        );
+        assert_eq!(
+            match_value(&scheme_of("x?y"), &data_key("x?y:z")),
+            Some(0x208000)
+        );
+        assert_eq!(
+            match_value(&scheme_of("p#q"), &data_key("p#q:r")),
+            Some(0x208000)
+        );
+        assert_eq!(
+            match_value(&scheme_of("a"), &data_key("a/b:c")),
+            None,
+            "a prefix before '/' is not the scheme"
+        );
+        // SSP 0x580000 + 0x8000: the text after the colon
+        let ssp = Filter {
+            actions: vec!["a.X".into()],
+            schemes: Some(vec!["a/b".into()]),
+            ssps: Some(vec![pat("c", pattern_matcher::PATTERN_LITERAL)]),
+            ..Default::default()
+        };
+        assert_eq!(match_value(&ssp, &data_key("a/b:c")), Some(0x588000));
     }
 
     #[test]
