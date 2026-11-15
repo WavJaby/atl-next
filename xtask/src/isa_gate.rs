@@ -263,10 +263,10 @@ pub fn check(
         );
     }
     for lib in provided {
-        let data = std::fs::read(&lib).with_context(|| format!("reading {}", lib.display()))?;
+        let data = std::fs::read(lib).with_context(|| format!("reading {}", lib.display()))?;
         let linkage = provided_gate::linkage(&data)?
             .with_context(|| format!("provided {}: not a 64-bit ELF", lib.display()))?;
-        index.provided.extend(library_names(&lib, &linkage));
+        index.provided.extend(library_names(lib, &linkage));
     }
     index.sysroot = sysroot_names(sysroot)?;
     for (owner, linkage) in &owners {
