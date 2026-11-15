@@ -97,7 +97,7 @@ func askProbe(p probe) (string, error) {
 }
 
 // globShards: probes are split by anchor into this many check edges, so a changed directory re-asks one shard's questions, not all.
-// Basis: ~97k probes on a full conversion (slot-1, 2026-11-12: 97478 directories in the old regen depfile); 64 shards -> ~1.5k re-asked questions per changed directory, a few ms beside the converter binary's start (Soong's old bpglob made a file per glob; per question here would be ~97k edges in build.ninja).
+// Basis: ~97k probes on a full conversion (2026-11-12: 97478 directories in the old regen depfile); 64 shards -> ~1.5k re-asked questions per changed directory, a few ms beside the converter binary's start (Soong's old bpglob made a file per glob; per question here would be ~97k edges in build.ninja).
 const globShards = 64
 
 func shardOf(p probe) int {
