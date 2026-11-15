@@ -70,6 +70,10 @@ pub const BINDERD_SYSCALLS: &[i64] = &[
     libc::SYS_wait4,
 ];
 
+/// riscv64 uapi asm/unistd.h: __NR_riscv_flush_icache = __NR_arch_specific_syscall (244) + 15; libc 0.2 does not export it.
+#[cfg(target_arch = "riscv64")]
+const SYS_RISCV_FLUSH_ICACHE: i64 = 244 + 15;
+
 /// The installer's syscalls (x86_64, 2026-11-13, WSL2 kernel 6.6.87.2), derived by measurement:
 /// 1. gdb `catch syscall` census of the installer's gate paths: the union of 57 numbers. alto's run was cut at 900 s (8.4 M stops) before its native copy; `feature` ran to its end (56 numbers); the others ended early.
 /// 2. Kill-mode gate runs: alto's native copy makes calls no census reached: unlink (87), chmod (90), fsync (74), utimensat (280), fallocate (285), rename (82). Each run ended at the first unlisted call (SIGSYS, the call named by dmesg `type=1326`).
@@ -90,6 +94,9 @@ pub const INSTALLER_SYSCALLS: &[i64] = &[
     libc::SYS_close,
     libc::SYS_fstat,
     libc::SYS_newfstatat,
+    // riscv64 measured (sifive, Ubuntu glibc 2.39, kernel kill + strace 2026-11-15): atl-installer's first call after exec is statx(openat("/", O_PATH), ".", TYPE|INO|MNT_ID)
+    #[cfg(target_arch = "riscv64")]
+    libc::SYS_statx,
     libc::SYS_lseek,
     libc::SYS_pread64,
     #[cfg(target_arch = "x86_64")]
@@ -151,6 +158,9 @@ pub const INSTALLER_SYSCALLS: &[i64] = &[
     libc::SYS_set_robust_list,
     libc::SYS_rseq,
     libc::SYS_membarrier,
+    // riscv64 measured (sifive 2026-11-15, the run after statx): ART's code writes flush the icache by syscall; x86 icache is coherent, no counterpart
+    #[cfg(target_arch = "riscv64")]
+    SYS_RISCV_FLUSH_ICACHE,
     libc::SYS_rt_sigaction,
     libc::SYS_rt_sigprocmask,
     libc::SYS_rt_sigtimedwait,

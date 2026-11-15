@@ -764,7 +764,12 @@ fn deferred(isa: &str, host: &str) -> &'static [&'static str] {
 }
 
 /// Every bridge-1 call whose line is missing or wrong (a `deferred` label's line must be `skipped`), then the thread balance.
-fn bridge1_call_failures(app: &str, deferred: &[&str], foreign: bool) -> Vec<String> {
+fn bridge1_call_failures(
+    app: &str,
+    deferred: &[&str],
+    foreign: bool,
+    cpu: &Result<CpuFacts, String>,
+) -> Vec<String> {
     let got = |name: &str| {
         app.lines().find_map(|l| {
             let (_, r) = l.split_once(BRIDGE1_CALL)?;
@@ -799,10 +804,15 @@ fn bridge1_call_failures(app: &str, deferred: &[&str], foreign: bool) -> Vec<Str
     } else if let Some(why) = first_config_why(got(FIRST_CONFIG).as_deref()) {
         whys.push(format!("bridge1 call {FIRST_CONFIG}: {why}"));
     }
-    if let Some(why) = cpu_probe_why(got(CPU_PROBE).as_deref(), foreign) {
-        whys.push(format!("bridge1 call {CPU_PROBE}: {why}"));
+    match cpu {
+        Ok(cpu) => {
+            if let Some(why) = cpu_probe_why(got(CPU_PROBE).as_deref(), foreign, cpu) {
+                whys.push(format!("bridge1 call {CPU_PROBE}: {why}"));
+            }
+        }
+        Err(e) => whys.push(format!("bridge1 call {CPU_PROBE}: the host's CPU facts: {e}")),
     }
-    let host_word = cpuinfo_features(&std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default());
+    let host_word = cpuinfo_features(cpu.as_ref().map_or("", |c| c.cpuinfo.as_str()));
     if let Some(why) = cpuinfo_view_why(got(CPUINFO_VIEW).as_deref(), foreign, host_word) {
         whys.push(format!("bridge1 call {CPUINFO_VIEW}: {why}"));
     }
@@ -834,6 +844,62 @@ const CPU_PROBE: &str = "cpuProbe";
 const CPU_POSSIBLE: &str = "/sys/devices/system/cpu/possible";
 const CPU_ONLINE: &str = "/sys/devices/system/cpu/online";
 
+/// The run host's answers the cpuProbe / cpuinfoView rows are judged against: CPU counts and /proc/cpuinfo of the machine atld ran on.
+struct CpuFacts {
+    /// [`CPU_POSSIBLE`]'s count
+    possible: usize,
+    /// [`CPU_ONLINE`]'s count
+    online: usize,
+    /// CPUs in the affinity mask atld inherits
+    affinity: usize,
+    /// /proc/cpuinfo text
+    cpuinfo: String,
+}
+
+use crate::remote::{CPU_FACTS, CPU_INFO};
+
+impl CpuFacts {
+    /// This host's own answers (a local run: the app inherits atld's affinity, which inherits the gate's).
+    fn here() -> Result<Self, String> {
+        let read = |p: &str| std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"));
+        let count = |p: &str| {
+            cpu_list_count(&read(p)?).ok_or_else(|| format!("{p} does not parse"))
+        };
+        let set = rustix::thread::sched_getaffinity(None)
+            .map_err(|e| format!("the gate's own sched_getaffinity: {e}"))?;
+        Ok(Self {
+            possible: count(CPU_POSSIBLE)?,
+            online: count(CPU_ONLINE)?,
+            affinity: (0..rustix::thread::CpuSet::MAX_CPU)
+                .filter(|&i| set.is_set(i))
+                .count(),
+            cpuinfo: read("/proc/cpuinfo")?,
+        })
+    }
+
+    /// The target's answers a remote run brought back in `scratch`.
+    fn of_remote(scratch: &Path) -> Result<Self, String> {
+        let read = |n: &str| {
+            let p = scratch.join(n);
+            std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))
+        };
+        let facts = read(CPU_FACTS)?;
+        let mut lines = facts.lines();
+        let mut next = |what: &str, parse: fn(&str) -> Option<usize>| {
+            lines
+                .next()
+                .and_then(parse)
+                .ok_or_else(|| format!("{CPU_FACTS}: no {what} line"))
+        };
+        Ok(Self {
+            possible: next("possible", cpu_list_count)?,
+            online: next("online", cpu_list_count)?,
+            affinity: next("nproc", |l| l.trim().parse().ok())?,
+            cpuinfo: read(CPU_INFO)?,
+        })
+    }
+}
+
 /// The number of CPUs a kernel cpu list names (Documentation/admin-guide/cputopology.rst: `0-3,8,10-11`); None when it does not parse.
 fn cpu_list_count(list: &str) -> Option<usize> {
     list.trim().split(',').try_fold(0, |n, part| {
@@ -864,28 +930,17 @@ fn cpuinfo_features(text: &str) -> &'static str {
 
 /// The cpuProbe row's judge. Each count must equal the host's answer to the same question: conf the possible list, onln, java and the cpuinfo `processor` lines the online list, affinity this process's affinity mask (the app inherits atld's, which inherits the gate's).
 /// features: an identity guest sees the host's own cpuinfo (the host's word); a foreign guest (`foreign`, QEMU) must see its own ISA's, so a word that is neither the host's nor "none". `None`: the row passes.
-fn cpu_probe_why(value: Option<&str>, foreign: bool) -> Option<String> {
+fn cpu_probe_why(value: Option<&str>, foreign: bool, cpu: &CpuFacts) -> Option<String> {
     let Some(value) = value else {
         return Some("no line".to_owned());
     };
-    let read_count = |p: &str| {
-        std::fs::read_to_string(p)
-            .ok()
-            .as_deref()
-            .and_then(cpu_list_count)
-    };
-    let (Some(possible), Some(online)) = (read_count(CPU_POSSIBLE), read_count(CPU_ONLINE)) else {
-        return Some(format!(
-            "the host's {CPU_POSSIBLE} or {CPU_ONLINE} does not parse"
-        ));
-    };
-    let affinity = match rustix::thread::sched_getaffinity(None) {
-        Ok(set) => (0..rustix::thread::CpuSet::MAX_CPU)
-            .filter(|&i| set.is_set(i))
-            .count(),
-        Err(e) => return Some(format!("the gate's own sched_getaffinity: {e}")),
-    };
-    let host_word = cpuinfo_features(&std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default());
+    let CpuFacts {
+        possible,
+        online,
+        affinity,
+        ref cpuinfo,
+    } = *cpu;
+    let host_word = cpuinfo_features(cpuinfo);
     let fields: BTreeMap<&str, &str> = value
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -1949,7 +2004,12 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
     }
     let mut es1_compared = None;
     if passed && bridge1_ok {
-        whys.extend(bridge1_call_failures(&app, deferred, foreign));
+        let cpu = if local.is_some() {
+            CpuFacts::here()
+        } else {
+            CpuFacts::of_remote(&run.scratch)
+        };
+        whys.extend(bridge1_call_failures(&app, deferred, foreign, &cpu));
         // sigsegvRecover's fault reaches the fixture's own handler through the bridge (signal.rs guest_handler), which reports it first: the report's only gate in a real app process
         if !deferred.contains(&"sigsegvRecover")
             && !app.lines().any(|l| l.contains(GUEST_FAULT_REPORT))
@@ -2136,7 +2196,12 @@ fn remote_verdict(
                 app.lines().find(|l| l.contains("AtlTest: bridge1"))
             )),
             Some(line) => {
-                whys.extend(bridge1_call_failures(&app, deferred, foreign));
+                whys.extend(bridge1_call_failures(
+                    &app,
+                    deferred,
+                    foreign,
+                    &CpuFacts::of_remote(&run.scratch),
+                ));
                 if !deferred.contains(&"sigsegvRecover")
                     && !app.lines().any(|l| l.contains(GUEST_FAULT_REPORT))
                 {

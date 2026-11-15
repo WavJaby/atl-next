@@ -55,7 +55,11 @@ const ROOT_NAMES: [(&str, &str); 3] = [("out", "out"), ("java", "java"), ("tree"
 /// The target's directory for a build dir's bundle, relative to the host's home: `~/atl-next-run/<name>/`.
 const REMOTE_ROOT: &str = "atl-next-run";
 /// `<out>/remote/...`: the record and the staged bundle.
-pub const REMOTE_DIR: &str = "remote";
+pub use xtask::native::REMOTE_DIR;
+/// In a run's scratch on the target: its CPU possible list, online list and `nproc`, one per line (app.rs CpuFacts).
+pub const CPU_FACTS: &str = "cpu.facts";
+/// In a run's scratch on the target: its /proc/cpuinfo.
+pub const CPU_INFO: &str = "cpuinfo";
 /// The manifest file at the bundle's root: `sha256  size  name` per file, `link  target  name` per link.
 const MANIFEST: &str = "bundle.manifest";
 /// ssh options: never prompt, never hang. The alias check is the first contact with the host. ServerAlive: a link that dies mid-call fails in about 3 min instead of hanging until the caller's limit.
@@ -550,12 +554,20 @@ impl Plan {
             "echo \"atld rc=$rc, remote run {}\" >&2\n",
             self.tag
         ));
+        // the target's CPU answers, for the rows judged against the run host (app.rs CpuFacts); nproc = this shell's affinity, which atld inherited
         s.push_str(&format!(
-            "tar -c -C \"$BASE/out\" --ignore-failed-read {} {} {} {}\n",
+            "{{ cat /sys/devices/system/cpu/possible /sys/devices/system/cpu/online; nproc; }} > {}\ncat /proc/cpuinfo > {}\n",
+            word(&out_path(&format!("{}/{CPU_FACTS}", self.scratch))),
+            word(&out_path(&format!("{}/{CPU_INFO}", self.scratch)))
+        ));
+        s.push_str(&format!(
+            "tar -c -C \"$BASE/out\" --ignore-failed-read {} {} {} {} {} {}\n",
             sh_quote(&format!("{}/log", self.root)),
             sh_quote(&format!("{}/atld.log", self.scratch)),
             sh_quote(&format!("{}/atld.rc", self.scratch)),
-            sh_quote(&format!("{}/end.ms", self.scratch))
+            sh_quote(&format!("{}/end.ms", self.scratch)),
+            sh_quote(&format!("{}/{CPU_FACTS}", self.scratch)),
+            sh_quote(&format!("{}/{CPU_INFO}", self.scratch))
         ));
         if self.display == Display::NestedX11 {
             // the tar line ends with its last path: labwc's log rides along
@@ -1936,7 +1948,9 @@ mod tests {
             "printf '%s\\n' \"$rc\" > \"$BASE/out/gl/run/scratch/atld.rc\"\n",
             "date +%s%3N > \"$BASE/out/gl/run/scratch/end.ms\"\n",
             "echo \"atld rc=$rc, remote run gl/run\" >&2\n",
-            "tar -c -C \"$BASE/out\" --ignore-failed-read 'gl/run/root/log' 'gl/run/scratch/atld.log' 'gl/run/scratch/atld.rc' 'gl/run/scratch/end.ms'\n",
+            "{ cat /sys/devices/system/cpu/possible /sys/devices/system/cpu/online; nproc; } > \"$BASE/out/gl/run/scratch/cpu.facts\"\n",
+            "cat /proc/cpuinfo > \"$BASE/out/gl/run/scratch/cpuinfo\"\n",
+            "tar -c -C \"$BASE/out\" --ignore-failed-read 'gl/run/root/log' 'gl/run/scratch/atld.log' 'gl/run/scratch/atld.rc' 'gl/run/scratch/end.ms' 'gl/run/scratch/cpu.facts' 'gl/run/scratch/cpuinfo'\n",
         );
         assert_eq!(plan.script("atl-next-run/x9"), want);
     }
@@ -2009,7 +2023,7 @@ mod tests {
             "{s}"
         );
         assert!(
-            s.ends_with(" 'app/scratch/end.ms' 'app/scratch/labwc.log'\n"),
+            s.ends_with(" 'app/scratch/cpuinfo' 'app/scratch/labwc.log'\n"),
             "{s}"
         );
         let session = Plan {

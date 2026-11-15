@@ -183,6 +183,9 @@ pub fn check(
     let products = provided_gate::current_outputs(out, &["device", "host"])?;
     let mut paths = Vec::new();
     collect(out, &mut paths)?;
+    // the remote bundle holds copies of this out's files (riscv64 tier libs among them): gating it would judge each file twice, its tier claim lost
+    let remote = out.join(crate::native::REMOTE_DIR);
+    paths.retain(|p| !p.starts_with(&remote));
     paths.sort();
     let mut report = Report {
         build_machine: build,

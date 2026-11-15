@@ -941,6 +941,9 @@ pub fn cross_host_of(root: &Path, out: &Path) -> Result<Option<String>> {
         .map(str::to_owned))
 }
 
+/// The dir under an out dir that `xtask remote` owns (records, the staged bundle: copies of this out's products, gated where they were built).
+pub const REMOTE_DIR: &str = "remote";
+
 /// Whether a dir entry under an out dir is a foreign guest's graph dir ([`graph_dir`]).
 pub fn is_graph_dir(name: &std::ffi::OsStr) -> bool {
     name.to_str().is_some_and(|n| n.starts_with(NB_GRAPH_DIR))
