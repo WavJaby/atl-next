@@ -631,9 +631,13 @@ impl Runtime {
     ) -> Result<Runtime> {
         let layout = Layout::of(root)?;
         let out = crate::build_state::gate_out(root, out, host, gate)?;
-        let java_out = slot::out_dir(root, java_out, "--java-out", |workspace| {
-            workspace.join("out/java/build")
-        })?;
+        // a cross host's graph builds its own Java outputs and build-side tools (aapt2 under `build/`) into its out dir; the slot's are the build machine's graph's
+        let java_out = match (java_out, xtask::native::cross_host_of(root, &out)?) {
+            (None, Some(_)) => out.clone(),
+            (java_out, _) => slot::out_dir(root, java_out, "--java-out", |workspace| {
+                workspace.join("out/java/build")
+            })?,
+        };
         let art = HostArt::new(root, host, Some(&java_out), &out, stage, verbose)?;
         let servicemanager = out.join("device/servicemanager/servicemanager");
         ensure!(
