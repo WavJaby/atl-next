@@ -325,7 +325,7 @@ extern "C" fn detach(value: *mut libc::c_void) {
         if let Some(t) = static_tls()
             && tp != 0
         {
-            free(tp - t.tpoff, t.size, page_size());
+            free(tp - t.tpoff, t.size, super::image::page());
         }
         drop(Box::from_raw(ht));
     }
@@ -440,7 +440,7 @@ pub fn alloc_static_tls(t: &StaticTls) -> Result<usize, String> {
             return Err(format!("static TLS: slot {slot} outside the block"));
         }
     }
-    let block = zeroed(t.size, page_size());
+    let block = zeroed(t.size, super::image::page());
     let rec = current();
     // SAFETY: `init_img` holds `size` bytes (NBS `new char[layout.size()]`); `block` is `size` fresh bytes. Slots are words at `tp + i * word` inside the block (bionic's TCB lies inside static TLS, `offset_bionic_tcb`); `bionic_tls` is a pointer field of the record built by `build`.
     unsafe {
@@ -454,11 +454,6 @@ pub fn alloc_static_tls(t: &StaticTls) -> Result<usize, String> {
         tp.offset(t.slot_bionic_tls as isize).write(tls);
         Ok(tp as usize)
     }
-}
-
-fn page_size() -> usize {
-    // SAFETY: no memory effects.
-    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
 }
 
 fn zeroed(size: usize, align: usize) -> *mut u8 {

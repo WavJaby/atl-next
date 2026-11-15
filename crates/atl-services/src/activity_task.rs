@@ -872,7 +872,6 @@ mod tests {
     use atl_aidl::aidl::android::app::IApplicationThread::BnApplicationThread;
     use atl_parcelables::codecs::android::os::Bundle::Value;
     use atl_services_types::display_model::DisplayModel;
-    use binder::StatusCode;
 
     use super::*;
     use crate::tasks::TaskSize;
