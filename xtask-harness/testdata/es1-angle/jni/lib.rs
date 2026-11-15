@@ -78,7 +78,11 @@ impl Lib {
         if h.is_null() {
             // SAFETY: dlerror returns a NUL-terminated message or null.
             let e = unsafe { dlerror() };
-            let why = if e.is_null() { "?".to_owned() } else { unsafe { CStr::from_ptr(e) }.to_string_lossy().into_owned() };
+            let why = if e.is_null() {
+                "?".to_owned()
+            } else {
+                unsafe { CStr::from_ptr(e) }.to_string_lossy().into_owned()
+            };
             return Err(format!("dlopen {path}: {why}"));
         }
         Ok(Lib(h, path.to_owned()))
@@ -154,7 +158,11 @@ impl Egl {
         // SAFETY: attrs is EGL_NONE-terminated; one config slot.
         let ok = unsafe { (self.choose_config)(dpy, attrs.as_ptr(), &mut cfg, 1, &mut n) };
         if ok == 0 || n < 1 {
-            return Err(format!("eglChooseConfig: {} configs, error {:#x}", n, self.error()));
+            return Err(format!(
+                "eglChooseConfig: {} configs, error {:#x}",
+                n,
+                self.error()
+            ));
         }
         Ok(cfg)
     }
@@ -203,7 +211,11 @@ impl Gl1 {
     fn string(&self, name: u32) -> String {
         // SAFETY: an ES1 context is current; the string is static per context.
         let s = unsafe { (self.get_string)(name) };
-        if s.is_null() { String::new() } else { unsafe { CStr::from_ptr(s) }.to_string_lossy().into_owned() }
+        if s.is_null() {
+            String::new()
+        } else {
+            unsafe { CStr::from_ptr(s) }.to_string_lossy().into_owned()
+        }
     }
 
     /// One frame: clear, the quad; returns the GL error after it (0 = none).
@@ -232,7 +244,17 @@ impl Gl1 {
     fn pixel(&self, x: i32, y: i32) -> String {
         let mut px = [0u8; 4];
         // SAFETY: an ES1 context is current; 1x1 RGBA into a 4-byte buffer.
-        unsafe { (self.read_pixels)(x, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px.as_mut_ptr().cast()) };
+        unsafe {
+            (self.read_pixels)(
+                x,
+                y,
+                1,
+                1,
+                GL_RGBA,
+                GL_UNSIGNED_BYTE,
+                px.as_mut_ptr().cast(),
+            )
+        };
         format!("{:02x}{:02x}{:02x}{:02x}", px[0], px[1], px[2], px[3])
     }
 }
@@ -249,7 +271,11 @@ pub extern "C" fn Java_com_example_atles1_Client_draw(
     broken: u8,
 ) -> P {
     let mut out = String::new();
-    let args = (java_text(env, angle_egl), java_text(env, angle_gles1), java_text(env, driver));
+    let args = (
+        java_text(env, angle_egl),
+        java_text(env, angle_gles1),
+        java_text(env, driver),
+    );
     let r = match args {
         (Some(a), Some(g), Some(d)) => run(env, surface, &a, &g, &d, broken != 0, &mut out),
         _ => Err("args: a path is null".to_owned()),
@@ -263,7 +289,15 @@ pub extern "C" fn Java_com_example_atles1_Client_draw(
     new_string(env, &out)
 }
 
-fn run(env: *mut *const *const c_void, surface: P, angle_egl: &str, angle_gles1: &str, driver: &str, broken: bool, out: &mut String) -> Result<(), String> {
+fn run(
+    env: *mut *const *const c_void,
+    surface: P,
+    angle_egl: &str,
+    angle_gles1: &str,
+    driver: &str,
+    broken: bool,
+    out: &mut String,
+) -> Result<(), String> {
     let none = std::ptr::null_mut::<c_void>();
     let libegl = Lib::open("libEGL.so", RTLD_NOW)?;
     let host = Egl::load(&libegl)?;
@@ -282,7 +316,13 @@ fn run(env: *mut *const *const c_void, surface: P, angle_egl: &str, angle_gles1:
     let angle_lib = Lib::open(angle_egl, RTLD_NOW)?;
     let angle = Egl::load(&angle_lib)?;
     let platform: GetPlatformDisplay = angle_lib.sym(c"eglGetPlatformDisplay")?;
-    let attrs = [EGL_PLATFORM_ANGLE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_TYPE_OPENGLES_ANGLE, EGL_PLATFORM_ANGLE_EGL_HANDLE_ANGLE, drv_lib.0 as isize, EGL_NONE as isize];
+    let attrs = [
+        EGL_PLATFORM_ANGLE_TYPE_ANGLE,
+        EGL_PLATFORM_ANGLE_TYPE_OPENGLES_ANGLE,
+        EGL_PLATFORM_ANGLE_EGL_HANDLE_ANGLE,
+        drv_lib.0 as isize,
+        EGL_NONE as isize,
+    ];
     // SAFETY: attribute list EGL_NONE-terminated.
     let adpy = unsafe { platform(EGL_PLATFORM_ANGLE_ANGLE, none, attrs.as_ptr()) };
     if adpy.is_null() {
@@ -297,7 +337,24 @@ fn run(env: *mut *const *const c_void, surface: P, angle_egl: &str, angle_gles1:
     unsafe { (drv.make_current)(ddpy, none, none, none) };
 
     // 2. host carrier: the driver's window surface + an ES3 context, through libEGL
-    let hcfg = host.config(dpy, &[EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT, EGL_NONE])?;
+    let hcfg = host.config(
+        dpy,
+        &[
+            EGL_RED_SIZE,
+            8,
+            EGL_GREEN_SIZE,
+            8,
+            EGL_BLUE_SIZE,
+            8,
+            EGL_ALPHA_SIZE,
+            8,
+            EGL_SURFACE_TYPE,
+            EGL_WINDOW_BIT,
+            EGL_RENDERABLE_TYPE,
+            EGL_OPENGL_ES3_BIT,
+            EGL_NONE,
+        ],
+    )?;
     // SAFETY: env and surface are the JNI arguments.
     let window = unsafe { from_surface(env, surface) };
     if window.is_null() {
@@ -308,7 +365,14 @@ fn run(env: *mut *const *const c_void, surface: P, angle_egl: &str, angle_gles1:
     if hsurf.is_null() {
         return Err(format!("host eglCreateWindowSurface: {:#x}", host.error()));
     }
-    let hctx = unsafe { (host.create_context)(dpy, hcfg, none, [EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE].as_ptr()) };
+    let hctx = unsafe {
+        (host.create_context)(
+            dpy,
+            hcfg,
+            none,
+            [EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE].as_ptr(),
+        )
+    };
     if hctx.is_null() {
         return Err(format!("host eglCreateContext: {:#x}", host.error()));
     }
@@ -324,15 +388,62 @@ fn run(env: *mut *const *const c_void, surface: P, angle_egl: &str, angle_gles1:
     if unsafe { current() }.is_null() {
         return Err("angle external context: no native context current on the driver (EGL_BAD_MATCH; ANGLE would SIGSEGV in FunctionsGL::initialize)".to_owned());
     }
-    let acfg = angle.config(adpy, &[EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES_BIT, EGL_NONE]).map_err(|e| format!("angle {e}"))?;
-    let actx = unsafe { (angle.create_context)(adpy, acfg, none, [EGL_CONTEXT_CLIENT_VERSION, 1, EGL_EXTERNAL_CONTEXT_ANGLE, EGL_TRUE, EGL_NONE].as_ptr()) };
+    let acfg = angle
+        .config(
+            adpy,
+            &[
+                EGL_RED_SIZE,
+                8,
+                EGL_GREEN_SIZE,
+                8,
+                EGL_BLUE_SIZE,
+                8,
+                EGL_ALPHA_SIZE,
+                8,
+                EGL_SURFACE_TYPE,
+                EGL_PBUFFER_BIT,
+                EGL_RENDERABLE_TYPE,
+                EGL_OPENGL_ES_BIT,
+                EGL_NONE,
+            ],
+        )
+        .map_err(|e| format!("angle {e}"))?;
+    let actx = unsafe {
+        (angle.create_context)(
+            adpy,
+            acfg,
+            none,
+            [
+                EGL_CONTEXT_CLIENT_VERSION,
+                1,
+                EGL_EXTERNAL_CONTEXT_ANGLE,
+                EGL_TRUE,
+                EGL_NONE,
+            ]
+            .as_ptr(),
+        )
+    };
     if actx.is_null() {
-        return Err(format!("angle eglCreateContext(ES1, external): {:#x}", angle.error()));
+        return Err(format!(
+            "angle eglCreateContext(ES1, external): {:#x}",
+            angle.error()
+        ));
     }
     let pfcb: CreatePbufferFromClientBuffer = angle_lib.sym(c"eglCreatePbufferFromClientBuffer")?;
-    let asurf = unsafe { pfcb(adpy, EGL_EXTERNAL_SURFACE_ANGLE, none, acfg, [EGL_WIDTH, EDGE, EGL_HEIGHT, EDGE, EGL_NONE].as_ptr()) };
+    let asurf = unsafe {
+        pfcb(
+            adpy,
+            EGL_EXTERNAL_SURFACE_ANGLE,
+            none,
+            acfg,
+            [EGL_WIDTH, EDGE, EGL_HEIGHT, EDGE, EGL_NONE].as_ptr(),
+        )
+    };
     if asurf.is_null() {
-        return Err(format!("angle eglCreatePbufferFromClientBuffer(external): {:#x}", angle.error()));
+        return Err(format!(
+            "angle eglCreatePbufferFromClientBuffer(external): {:#x}",
+            angle.error()
+        ));
     }
     if unsafe { (angle.make_current)(adpy, asurf, asurf, actx) } == 0 {
         return Err(format!("angle eglMakeCurrent: {:#x}", angle.error()));
@@ -348,7 +459,11 @@ fn run(env: *mut *const *const c_void, surface: P, angle_egl: &str, angle_gles1:
     let gl = Gl1::load(&Lib::open(angle_gles1, RTLD_NOW)?)?;
     let _ = writeln!(out, "version {}", gl.string(GL_VERSION));
     let _ = writeln!(out, "renderer {}", gl.string(GL_RENDERER));
-    let _ = writeln!(out, "extensions {}", gl.string(GL_EXTENSIONS).split_whitespace().count());
+    let _ = writeln!(
+        out,
+        "extensions {}",
+        gl.string(GL_EXTENSIONS).split_whitespace().count()
+    );
 
     // 4. frames
     for n in 0..FRAMES {
@@ -356,14 +471,22 @@ fn run(env: *mut *const *const c_void, surface: P, angle_egl: &str, angle_gles1:
         let err = gl.frame();
         if n == 0 {
             // GL coordinates: inside the quad (top-left quadrant), and the clear (bottom-right)
-            let _ = writeln!(out, "px quad {} clear {}", gl.pixel(8, EDGE - 8), gl.pixel(EDGE - 8, 8));
+            let _ = writeln!(
+                out,
+                "px quad {} clear {}",
+                gl.pixel(8, EDGE - 8),
+                gl.pixel(EDGE - 8, 8)
+            );
         }
         unsafe { release(adpy) };
         if err != 0 {
             return Err(format!("frame {n}: gl error {err:#x}"));
         }
         if unsafe { (host.swap)(dpy, hsurf) } == 0 {
-            return Err(format!("frame {n}: host eglSwapBuffers: {:#x}", host.error()));
+            return Err(format!(
+                "frame {n}: host eglSwapBuffers: {:#x}",
+                host.error()
+            ));
         }
     }
     let _ = writeln!(out, "frames {FRAMES}");

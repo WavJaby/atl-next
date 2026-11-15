@@ -51,28 +51,46 @@ fn expected_digest() -> u64 {
     let mut px = Vec::with_capacity(EDGE * EDGE * 4);
     for y in 0..EDGE {
         for x in 0..EDGE {
-            px.extend(if x < EDGE / 2 && y < EDGE / 2 { QUAD } else { CLEAR });
+            px.extend(if x < EDGE / 2 && y < EDGE / 2 {
+                QUAD
+            } else {
+                CLEAR
+            });
         }
     }
     fnv1a64(&px)
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let rt = Runtime::new(root, "es1-angle", &args.host, args.out.as_deref(), args.java_out.as_deref(), "es1-art", args.verbose)?
-        .with_gralloc(root)?
-        .with_gl_driver(root)?;
+    let rt = Runtime::new(
+        root,
+        "es1-angle",
+        &args.host,
+        args.out.as_deref(),
+        args.java_out.as_deref(),
+        "es1-art",
+        args.verbose,
+    )?
+    .with_gralloc(root)?
+    .with_gl_driver(root)?;
     let rt = rt.with_display(run_display().to_arg());
     let work = rt.out.join("es1-angle");
     let lib = build_lib(root, &work.join("cargo"))?;
     let lib_at = format!("{}/{LIB}", atl_android_paths::SYSTEM_LIB);
     let rt = rt.with_fixture_file(lib, &lib_at);
-    let apk = rt.apk.build(&root.join(FIXTURE), &work.join("apk"), &[], None, None)?;
+    let apk = rt
+        .apk
+        .build(&root.join(FIXTURE), &work.join("apk"), &[], None, None)?;
     let sys = atl_android_paths::SYSTEM_LIB;
     let base = vec![
         lib_at.clone(),
         format!("{sys}/libEGL_angle.so"),
         format!("{sys}/libGLESv1_CM_angle.so"),
-        format!("{}/{}", atl_android_paths::VENDOR_EGL, crate::egl_driver::atl_egl_driver_name()),
+        format!(
+            "{}/{}",
+            atl_android_paths::VENDOR_EGL,
+            crate::egl_driver::atl_egl_driver_name()
+        ),
     ];
     let want = expected_digest();
     let mut ok = true;
@@ -86,7 +104,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         if args.verbose {
             println!("---- {tag} log\n{log}");
         }
-        let lines: Vec<&str> = log.lines().filter_map(|l| l.split_once(TAG).map(|(_, t)| t)).collect();
+        let lines: Vec<&str> = log
+            .lines()
+            .filter_map(|l| l.split_once(TAG).map(|(_, t)| t))
+            .collect();
         for l in &lines {
             println!("es1-angle: [{tag}] {l}");
         }
@@ -96,7 +117,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .filter_map(|l| word(l, "digest").and_then(|d| u64::from_str_radix(d, 16).ok()))
             .collect();
         let shown = digests.contains(&want);
-        let version = lines.iter().find_map(|l| l.strip_prefix("version ")).unwrap_or("");
+        let version = lines
+            .iter()
+            .find_map(|l| l.strip_prefix("version "))
+            .unwrap_or("");
         let version_ok = version.starts_with("OpenGL ES 1.1") && version.contains("ANGLE");
         let lib_ok = lines.contains(&"ok");
         let angle_err = lines.iter().find(|l| l.starts_with("error angle"));
@@ -108,25 +132,55 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 verdict(fired),
                 match angle_err {
                     Some(e) if !shown => format!("fails as it must: {e}"),
-                    _ => format!("NOT caught (expected buffer shown={shown}, angle error={angle_err:?})"),
+                    _ => format!(
+                        "NOT caught (expected buffer shown={shown}, angle error={angle_err:?})"
+                    ),
                 }
             );
             continue;
         }
         for (what, pass, detail) in [
-            ("pixels", shown, format!("{} {LAYER} buffers, expected digest {want:016x} {}", digests.len(), if shown { "among them" } else { "MISSING" })),
+            (
+                "pixels",
+                shown,
+                format!(
+                    "{} {LAYER} buffers, expected digest {want:016x} {}",
+                    digests.len(),
+                    if shown { "among them" } else { "MISSING" }
+                ),
+            ),
             ("version", version_ok, format!("`{version}`")),
-            ("lib", lib_ok, lines.iter().rev().find(|l| **l == "ok" || l.starts_with("error")).copied().unwrap_or("no result line").to_owned()),
+            (
+                "lib",
+                lib_ok,
+                lines
+                    .iter()
+                    .rev()
+                    .find(|l| **l == "ok" || l.starts_with("error"))
+                    .copied()
+                    .unwrap_or("no result line")
+                    .to_owned(),
+            ),
         ] {
             ok &= pass;
             println!("es1-angle: {} {what}: {detail}", verdict(pass));
         }
     }
     println!("es1-angle: {}", if ok { "PASS" } else { "FAIL" });
-    Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE })
+    Ok(if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }
 
-fn run_client(rt: &Runtime, apk: &Path, work: &Path, args: Vec<String>, log_tags: &str) -> Result<String> {
+fn run_client(
+    rt: &Runtime,
+    apk: &Path,
+    work: &Path,
+    args: Vec<String>,
+    log_tags: &str,
+) -> Result<String> {
     let run = Run {
         root: work.join("root"),
         scratch: work.join("scratch"),
