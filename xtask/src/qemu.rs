@@ -22,7 +22,6 @@ use crate::git::git;
 use crate::isa_gate;
 use crate::ndk::{self, NdkTarget};
 use crate::patch;
-use crate::slot;
 use crate::sources;
 use crate::verdict::Verdict;
 
@@ -64,7 +63,7 @@ pub struct Build {
     pub target: String,
     /// Whether this is the `-fPIC` variant (`--pic`).
     pub pic: bool,
-    /// `<out>/qemu/<target>-linux-user`, or `-pic` for the PIC variant.
+    /// `<host out>/qemu/<target>-linux-user` (native.rs host_out of the executable's host), or `-pic` for the PIC variant.
     pub dir: PathBuf,
     /// The pinned checkout.
     pub src: PathBuf,
@@ -203,16 +202,18 @@ pub fn plan_on(
         guest_cc.display(),
         ndk.display()
     );
-    let out = slot::out_dir(root, out, "--out", |ws| ws.join("out"))?;
+    // the executable is a product of its host: under that host's out dir (native.rs host_out), as the host's other outputs
+    let host_name = match &cross {
+        Some(c) => c.host.clone(),
+        None => arches::build_machine(root, &arches)?.0.to_owned(),
+    };
+    let out = crate::native::host_out(root, out, &host_name)?;
     let pic_suffix = if pic { "-pic" } else { "" };
-    let host_suffix = cross
-        .as_ref()
-        .map_or_else(String::new, |c| format!("-{}", c.host));
     Ok(Build {
         arch: arch.to_owned(),
         dir: out
             .join(DIR)
-            .join(format!("{target}-linux-user{pic_suffix}{host_suffix}")),
+            .join(format!("{target}-linux-user{pic_suffix}")),
         target,
         pic,
         src,
