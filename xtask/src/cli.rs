@@ -131,11 +131,12 @@ pub fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
     let root = checkout_root()?;
     let name = verdict_name(&cli.command);
-    // the commands that read src/aosp see the task copies and the repo bind through it (tree.rs)
+    // every command that builds or runs from the out dir sees the task copies, the repo bind and its slot at the canonical build path (tree.rs, slot::CANONICAL).
+    // Outside stay the ones that change what the namespace binds or that orchestrate other checkouts: fetch and patch write src/ (a bind would redirect the write into a task copy), slot moves the bind, land's children enter their own.
     let shell = match &cli.command {
         Command::Native(a) => Some(a.shell),
-        Command::Check(_) => Some(false),
-        _ => None,
+        Command::Fetch(_) | Command::Patch(_) | Command::Slot { .. } | Command::Land(_) => None,
+        _ => Some(false),
     };
     if let Some(shell) = shell {
         let overlays = tree::binds_of(&root)?;

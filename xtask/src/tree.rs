@@ -90,6 +90,14 @@ pub fn describe(overlays: &[Overlay]) -> String {
         .join(" ")
 }
 
+/// The copy bound at `project` in the namespace this process runs in (from [`ENV`]); None outside, or with no such bind.
+pub fn bound(project: &str) -> Option<PathBuf> {
+    let had = std::env::var(ENV).ok()?;
+    let prefix = format!("{project}=");
+    had.split(' ')
+        .find_map(|e| e.strip_prefix(&prefix).map(PathBuf::from))
+}
+
 /// bubblewrap options for the build namespace: the host's `/` as is (devices too), each task copy bound over its target. Not a sandbox: it isolates nothing, it only changes which tree a path shows; it shares the broker's flag spelling, not its profiles.
 pub fn namespace_args(overlays: &[Overlay]) -> bwrap::Args {
     let mut a = bwrap::Args::new();
@@ -137,7 +145,7 @@ pub fn overlays_of(root: &Path) -> Result<Vec<Overlay>> {
     overlays(&layout, &crate::sources::load(root)?.checkouts(None))
 }
 
-/// Every bind of the build namespace ([`enter`], [`verify`]): the task copies, then the repo bind. A pinned project at or below the repo bind's path is refused: the bind would hide it.
+/// Every bind of the build namespace ([`enter`], [`verify`]): the task copies, the repo bind, then the checkout's slot at the canonical build path (`slot::build_bind`). A pinned project at or below the repo bind's path is refused: the bind would hide it.
 pub fn binds_of(root: &Path) -> Result<Vec<Overlay>> {
     let layout = Layout::of(root)?;
     let checkouts = crate::sources::load(root)?.checkouts(None);
@@ -149,6 +157,7 @@ pub fn binds_of(root: &Path) -> Result<Vec<Overlay>> {
         bail!("{q} is a pinned project below the repo bind {VENDOR_PROJECT}");
     }
     out.push(vendor_overlay(&layout, root));
+    out.extend(crate::slot::build_bind(root)?);
     Ok(out)
 }
 
@@ -194,6 +203,13 @@ pub fn enter(
             std::fs::create_dir_all(&o.target)
                 .with_context(|| format!("making the mount point {}", o.target.display()))?;
         }
+        // the canonical build path's mount point: empty and read-only, so outside every namespace a write there fails
+        if o.project == crate::slot::CANONICAL && !o.target.is_dir() {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::create_dir_all(&o.target)
+                .with_context(|| format!("making the mount point {}", o.target.display()))?;
+            std::fs::set_permissions(&o.target, std::fs::Permissions::from_mode(0o555))?;
+        }
         ensure!(
             o.target.is_dir(),
             "{} is missing: the task copy needs its src/ checkout as mount point (cargo xtask fetch --execute)",
@@ -210,7 +226,7 @@ pub fn enter(
             .args(std::env::args_os().skip(1))
             .current_dir(std::env::current_dir()?);
     }
-    println!("tree: bound over src/aosp: {want}");
+    println!("tree: bound: {want}");
     let status = cmd.status().context("running bwrap")?;
     Ok(Some(match status.code() {
         Some(c) => ExitCode::from(u8::try_from(c).unwrap_or(1)),

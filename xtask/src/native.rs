@@ -1624,8 +1624,34 @@ fn goals_of_args(text: &str) -> BTreeSet<String> {
     lines.into_iter().skip(i).map(str::to_owned).collect()
 }
 
+/// Bytes read from build.ninja's end to find the regeneration rule: bp2ninja writes it last (main.go after the graph, regen.go regenNinja); ~1.4 KB measured, the rest is headroom.
+const REGEN_TAIL: u64 = 64 * 1024;
+
+/// build.ninja's regeneration rule (`rule bp2ninja`, in its last [`REGEN_TAIL`] bytes) runs `converter -args <args>`. Not found = false: the caller bootstraps, which rewrites it.
+fn regen_runs(graph: &Path, converter: &Path, args: &Path) -> Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f =
+        std::fs::File::open(graph).with_context(|| format!("opening {}", graph.display()))?;
+    let len = f.metadata()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(REGEN_TAIL)))?;
+    let mut tail = Vec::new();
+    f.read_to_end(&mut tail)?;
+    let tail = String::from_utf8_lossy(&tail);
+    let want = format!(
+        "  command = {} -args {}",
+        converter.display(),
+        args.display()
+    );
+    Ok(tail
+        .split("rule bp2ninja\n")
+        .nth(1)
+        .and_then(|rest| rest.lines().next())
+        .is_some_and(|line| line == want))
+}
+
 /// Brings `<out>/build.ninja` up to date with `argv` (the converter's flags and goals): ninja decides whether to convert again, from the regeneration edge's depfile (every file the last conversion read, this argument file among them).
-/// Bootstrap (`bp2ninja -bootstrap`: a build.ninja holding only that edge) when there is no build.ninja, or the argument file is new: a build.ninja from before it cannot rerun on it.
+/// Bootstrap (`bp2ninja -bootstrap`: a build.ninja holding only that edge) when there is no build.ninja, the argument file is new (a build.ninja from before it cannot rerun on it),
+/// or its regeneration edge runs another converter or argument file path: bp2ninja writes its own invocation path into the edge it emits, so a graph converted at another path (a slot from before the canonical build path, slot::CANONICAL) would regenerate itself with that path forever.
 fn convert(
     converter: &Path,
     out: &Path,
@@ -1633,7 +1659,9 @@ fn convert(
     env: &[(&'static str, OsString)],
 ) -> Result<()> {
     let args_file = out.join(CONVERTER_ARGS);
-    let bootstrap = !args_file.is_file() || !out.join("build.ninja").is_file();
+    let graph = out.join("build.ninja");
+    let bootstrap =
+        !args_file.is_file() || !graph.is_file() || !regen_runs(&graph, converter, &args_file)?;
     let text: String = argv.iter().map(|a| format!("{a}\n")).collect();
     ensure!(
         argv.iter().all(|a| !a.contains('\n')),
@@ -1675,7 +1703,7 @@ pub(crate) const GLOB_DIR: &str = "globs";
 
 /// The command of build.ninja's licence gate edge (bp2ninja -licence-gate): this xtask binary's hidden `licence-gate`, run from the checkout (xtask finds its root from the working directory).
 fn licence_gate_command(root: &Path, out: &Path) -> Result<String> {
-    let exe = std::env::current_exe().context("the xtask binary")?;
+    let exe = crate::slot::canonical(&std::env::current_exe().context("the xtask binary")?);
     let quote = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
     Ok(format!(
         "cd {} && {} licence-gate --out {} --artifacts $out.rsp --report $out --depfile $out.d",
@@ -2088,6 +2116,46 @@ nope
         let gone = !socket.exists();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(gone, "the socket file of a dropped cache is still there");
+    }
+
+    /// The regeneration edge is reused only when it runs this converter on this argument file; another path (a graph converted before the canonical build path) or no edge -> bootstrap.
+    #[test]
+    fn regen_edge_must_name_this_converter() {
+        let dir = std::env::temp_dir().join(format!("xtask-regen-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test dir");
+        let graph = dir.join("build.ninja");
+        let (conv, args) = (
+            Path::new("/w/out/build/bp2ninja/bp2ninja"),
+            Path::new("/w/out/build/bp2ninja.args"),
+        );
+        // padding past REGEN_TAIL: the edge is found in the tail only, where bp2ninja writes it
+        let pad = "#\n".repeat(usize::try_from(REGEN_TAIL).unwrap());
+        let edge = |c: &str, a: &str| {
+            format!(
+                "{pad}rule bp2ninja_globs\n  command = x\nrule bp2ninja\n  command = {c} -args {a}\n  generator = 1\n"
+            )
+        };
+        std::fs::write(
+            &graph,
+            edge(
+                "/w/out/build/bp2ninja/bp2ninja",
+                "/w/out/build/bp2ninja.args",
+            ),
+        )
+        .unwrap();
+        assert!(regen_runs(&graph, conv, args).unwrap());
+        std::fs::write(
+            &graph,
+            edge(
+                "/w/out/slot-2/bp2ninja/bp2ninja",
+                "/w/out/slot-2/bp2ninja.args",
+            ),
+        )
+        .unwrap();
+        assert!(!regen_runs(&graph, conv, args).unwrap());
+        std::fs::write(&graph, &pad).unwrap();
+        assert!(!regen_runs(&graph, conv, args).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

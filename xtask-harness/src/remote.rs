@@ -1025,8 +1025,9 @@ fn out_of(root: &Path, explicit: Option<&Path>) -> Result<PathBuf> {
     slot::out_dir(root, explicit, "--out", |ws| ws.join("out/native"))
 }
 
-/// The target's directory name for out dir `out`: its slot's name (`slot-4`). A `cross` host's out is `<slot>/<arch>` (native::host_out), so it is `<slot>-<arch>`: named by the arch alone, two slots pushing one arch would share (and `rsync --delete`) one dir.
+/// The target's directory name for out dir `out`: its slot's name (`slot-4`), from the real dir (inside the build namespace every slot is `out/build`, slot::real). A `cross` host's out is `<slot>/<arch>` (native::host_out), so it is `<slot>-<arch>`: named by the arch alone, two slots pushing one arch would share (and `rsync --delete`) one dir.
 fn slot_name(out: &Path, cross: bool) -> Result<String> {
+    let out = &slot::real(out);
     let name = |p: &Path| {
         p.file_name()
             .and_then(|n| n.to_str())

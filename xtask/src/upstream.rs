@@ -175,6 +175,16 @@ fn drop_stale_cache(src: &Path, build: &Path, wanted: &[(&str, &str)]) -> Result
     {
         why = Some(format!("generated from {old}, not {}", src.display()));
     }
+    // configured before the canonical build path (slot::CANONICAL): cmake accepts the bound dir as the same build dir (CMAKE_CACHEFILE_DIR is rewritten),
+    // but keeps derived entries naming the slot's real path (compiler-rt's COMPILER_RT_OUTPUT_DIR, LLVM_THINLTO_CACHE_PATH), so a copy of the slot would write into the original
+    let real = crate::slot::real(build);
+    if why.is_none() && real != build && text.contains(&*real.to_string_lossy()) {
+        why = Some(format!(
+            "entries name {}, not {}",
+            real.display(),
+            build.display()
+        ));
+    }
     for (key, value) in wanted.iter().filter(|(k, _)| COMPILER_ENTRIES.contains(k)) {
         // both sides through the same PATH lookup: a fresh configure records `:STRING=/usr/bin/clang-19`, a later configure given the same -D rewrites it `:UNINITIALIZED=clang-19`;
         // comparing the bare name as a path dropped the cache every second run -> full reconfigure + rebuild + relink of every dependant (1,301 ninja edges). Do not compare unresolved values.

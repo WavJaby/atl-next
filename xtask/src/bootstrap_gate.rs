@@ -33,7 +33,16 @@ pub fn check(root: &Path) -> Result<()> {
     })?;
     let layout = Layout::of(root)?;
     let hidden = hidden_dirs(&layout);
-    let target = layout.workspace().join("cache").join("bootstrap-gate");
+    // one target per checkout (`repo`, or the worktree dir's name): a shared one fed a worktree at another commit stale crate outputs (E0061 in xtask).
+    // Not in the slot: the sandbox hides out/ (hidden_dirs).
+    let checkout = root
+        .file_name()
+        .with_context(|| format!("checkout {} has no name", root.display()))?;
+    let target = layout
+        .workspace()
+        .join("cache")
+        .join("bootstrap-gate")
+        .join(checkout);
     let tool = sandboxed_build(root, &hidden, &target, TOOL)?;
     if !tool.0 {
         bail!(

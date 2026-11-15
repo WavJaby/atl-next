@@ -176,7 +176,59 @@ pub fn out_dir(
         );
     }
     hold_if_slot(&workspace, &target.dir)?;
+    // inside the build namespace the slot is seen at the canonical path: every output names that, never the slot's own
+    if matches!(target.source, Source::Slot(_))
+        && crate::tree::bound(CANONICAL).as_deref() == Some(target.dir.as_path())
+    {
+        return Ok(workspace.join(CANONICAL));
+    }
     Ok(target.dir)
+}
+
+/// The one path every build sees its out dir at (workspace-relative): the build namespace binds the checkout's slot over it ([`build_bind`]), so build.ninja, CMake caches, dep files and DWARF name it in every slot and a copied slot stays valid at another real path.
+/// Outside every namespace it is an empty dir, mode 0555 (`tree::enter` makes it): a tool following a logged path there fails loudly instead of reading or writing another slot.
+pub const CANONICAL: &str = "out/build";
+
+/// The build namespace's bind of the checkout's slot over [`CANONICAL`]; None without a slot (the old default dirs are used at their real paths).
+pub fn build_bind(root: &Path) -> Result<Option<crate::tree::Overlay>> {
+    let ws = Layout::of(root)?.workspace().to_owned();
+    Ok(
+        read_record(&record_of(root)?)?.map(|n| crate::tree::Overlay {
+            project: CANONICAL.into(),
+            copy: slot_dir(&ws, n),
+            target: ws.join(CANONICAL),
+        }),
+    )
+}
+
+/// `path` below the bound slot's real dir shown at the canonical path instead: for paths reached through the checkout's `target` link (it points at the real slot, cargo builds xtask before any namespace) that a build output records. Other paths, and any path outside a namespace, unchanged.
+pub fn canonical(path: &Path) -> PathBuf {
+    let Some(slot) = crate::tree::bound(CANONICAL) else {
+        return path.to_owned();
+    };
+    match (
+        path.strip_prefix(&slot),
+        slot.parent().and_then(Path::parent),
+    ) {
+        (Ok(rest), Some(ws)) => ws.join(CANONICAL).join(rest),
+        _ => path.to_owned(),
+    }
+}
+
+/// `dir` with the canonical prefix translated back to the bound slot's real path, for names that must differ per slot outside the namespace (remote run dirs); other paths, and any path outside a namespace, unchanged.
+/// The workspace is the bound slot's grandparent (`slot_dir`: `<ws>/out/slot-<n>`).
+pub fn real(dir: &Path) -> PathBuf {
+    let Some(slot) = crate::tree::bound(CANONICAL) else {
+        return dir.to_owned();
+    };
+    match slot.parent().and_then(Path::parent) {
+        Some(ws) => match dir.strip_prefix(ws.join(CANONICAL)) {
+            Ok(rest) if rest.as_os_str().is_empty() => slot,
+            Ok(rest) => slot.join(rest),
+            Err(_) => dir.to_owned(),
+        },
+        None => dir.to_owned(),
+    }
 }
 
 /// Slot locks this process holds, one per slot number; released at exit.
