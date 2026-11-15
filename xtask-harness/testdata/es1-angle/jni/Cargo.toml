@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: MIT
+# `xtask test es1-angle`'s JNI library (gl-honesty H1 spike): our driver's window surface through AOSP libEGL, ANGLE's ES1 external context drawing into it. Its own package (and workspace) for `unsafe`; never shipped.
+[package]
+name = "atl-es1-angle"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "lib.rs"
+
+[workspace]

@@ -26,6 +26,7 @@ mod drive;
 mod drive_gate;
 mod egl_bridge;
 mod egl_driver;
+mod es1_angle;
 mod gdk_dmabuf;
 mod gl_dispatch;
 mod gl_probe;
@@ -233,6 +234,8 @@ enum Test {
     ///
     /// Needs the fronts, gralloc and the services in --out (`xtask native`).
     Gl(gl_probe::Args),
+    /// gl-honesty H1 spike: ANGLE's ES1 external context over our driver draws into the driver's window surface; the compositor's digest, ANGLE's GL_VERSION, and a no-native-context break.
+    Es1Angle(es1_angle::Args),
     /// QEMU's `qemu-<target>` against ground truth: a bionic hello built by the NDK clang, and QEMU's own tests/tcg smoke programs.
     ///
     /// Builds first (as `xtask qemu --execute`). Pass = every program's output and exit status as the checks say; the logs are in `<out>/qemu/<target>-linux-user/gate/`.
@@ -372,6 +375,9 @@ fn main() -> Result<ExitCode> {
             test: Test::Gl(args),
         } => gl_probe::run(&root, &args),
         Command::Test {
+            test: Test::Es1Angle(args),
+        } => es1_angle::run(&root, &args),
+        Command::Test {
             test: Test::Qemu(args),
         } => qemu_gate::run(&root, &args),
         Command::Test {
@@ -468,6 +474,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::EglDriver(_) => "egl-driver",
             Test::VkDriver(_) => "vk-driver",
             Test::Gl(_) => "gl",
+            Test::Es1Angle(_) => "es1-angle",
             Test::Qemu(_) => "qemu-gate",
             Test::QemuSpike(_) => "qemu-spike",
             Test::QemuLinker(_) => "qemu-linker",

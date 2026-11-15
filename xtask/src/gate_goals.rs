@@ -292,6 +292,7 @@ pub const GATES: &[(&str, GoalsOf)] = &[
     ("drive", app),
     ("cts", instrument),
     ("gl", runtime_gralloc),
+    ("es1-angle", runtime_gralloc),
     ("gl-dispatch", || Goals::host(&["libEGL", "libGLESv2"])),
     ("gl-proxies", gl_proxies),
     ("gles2-fixture", || Goals::host(&[APK_SIGNER])),
