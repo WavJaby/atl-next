@@ -24,12 +24,14 @@ crates = ["atl-property-service"]
 exports = ["atl-property-service"]
 uses = ["bionic", "android-paths"]
 
-# the one launcher of sandboxed processes (plan Q5; M2 depth Q4(a): bwrap user + pid namespaces, /system and /data mounts), each registered with binderd; its `control` module is the protocol by which the services ask for process starts and kills
+# the one launcher of sandboxed processes (plan Q5; M2 depth Q4(a): bwrap user + pid namespaces, /system and /data mounts), each registered with binderd; its `control` module is the protocol by which the services ask for process starts and kills,
+# its `webspawn` module the one request an app may make (a WebKit web process; refusals counted through diag)
 [broker]
-# atl-sandbox-stub: the in-child stage bwrap runs before the program (Landlock, then exec); atl-sandbox-probe: what an app process reaches (`xtask test sandbox`)
-crates = ["atl-broker", "atl-sandbox-stub", "atl-sandbox-probe"]
+# atl-sandbox-stub: the in-child stage bwrap runs before the program (Landlock, then exec); atl-sandbox-probe: what an app process reaches (`xtask test sandbox`);
+# atl-sandbox-join: runs a web process's bwrap inside its app's pid and mount namespaces; atl-flatpak-spawn: the `flatpak-spawn` shim every app sandbox shows, webspawn's client
+crates = ["atl-broker", "atl-sandbox-stub", "atl-sandbox-probe", "atl-sandbox-join", "atl-flatpak-spawn"]
 exports = ["atl-broker"]
-uses = ["binder", "android-paths", "bwrap"]
+uses = ["binder", "android-paths", "bwrap", "diag"]
 
 # the Android filesystem layout inside the sandbox: the only home of Android path literals (xtask check step android-paths)
 [android-paths]

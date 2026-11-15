@@ -70,6 +70,13 @@ struct Args {
     /// atl-sandbox-stub executable: the in-child stage that applies Landlock before binderd runs.
     #[arg(long)]
     sandbox_stub: PathBuf,
+    /// atl-sandbox-join executable: starts a web process an app asks for inside the app's pid namespace (atl_broker::webspawn). Given with `--flatpak-spawn`; both omitted: apps get no
+    /// web-process channel, and WebKit's own sandbox then cannot start inside theirs (it aborts at the first page load).
+    #[arg(long, requires = "flatpak_spawn")]
+    sandbox_join: Option<PathBuf>,
+    /// The `flatpak-spawn` shim (crate atl-flatpak-spawn) every app sandbox shows on its PATH: WebKit's route to that channel.
+    #[arg(long, requires = "sandbox_join")]
+    flatpak_spawn: Option<PathBuf>,
     /// AOSP servicemanager executable.
     #[arg(long)]
     servicemanager: PathBuf,
@@ -1771,6 +1778,13 @@ fn run(a: &Args) -> Result<ExitCode> {
         broker.without_app_seccomp()
     } else {
         broker
+    };
+    let broker = match (&a.sandbox_join, &a.flatpak_spawn) {
+        (Some(join), Some(shim)) => broker.with_webspawn(atl_broker::WebSpawnBins {
+            join: join.clone(),
+            shim: shim.clone(),
+        }),
+        _ => broker,
     };
     let lib = (OsString::from("LD_LIBRARY_PATH"), a.lib_path.clone());
     // what the runtime's environment and partitions name, read-only at the same paths in every process: the LD_LIBRARY_PATH dirs and the ART root, and the host files

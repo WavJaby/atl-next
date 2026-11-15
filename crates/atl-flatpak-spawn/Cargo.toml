@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-flatpak-spawn"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# WebKit runs it by this name (FlatpakLauncher.cpp)
+[[bin]]
+name = "flatpak-spawn"
+path = "src/main.rs"
+
+[dependencies]
+atl-broker = { path = "../atl-broker" }
+libc.workspace = true
+rustix.workspace = true
+
+[lints]
+workspace = true

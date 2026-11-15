@@ -5,7 +5,7 @@
 //!
 //! Tag pid: the host pid bwrap reports on `--info-fd` (`child-pid`), the namespace's first process, which the broker owns (killing it ends the sandbox: `--unshare-pid` makes it pid 1).
 //! Spawns are serialised by a lock in [`Broker`]: the control, info and seccomp fds are made inheritable just before the spawn and closed right after it, and a concurrent spawn would inherit them.
-//! [`control`] is how the system services ask atld (which owns the broker) to start and kill processes.
+//! [`control`] is how the system services ask atld (which owns the broker) to start and kill processes; [`webspawn`] is the one thing an app may ask for (a WebKit web process).
 #![forbid(unsafe_code)]
 
 pub mod adb;
@@ -14,6 +14,7 @@ pub mod app_env;
 pub mod control;
 pub mod gpu;
 mod seccomp;
+pub mod webspawn;
 pub use seccomp::{NiceTiers, granted_nice};
 
 use std::ffi::{OsStr, OsString};
@@ -25,7 +26,7 @@ use std::path::{Path, PathBuf};
 
 use atl_android_paths::PROPERTY_AREA;
 use std::process::{Child, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rustix::fs::{MemfdFlags, memfd_create};
 use rustix::io::{FdFlags, fcntl_setfd};
@@ -172,6 +173,9 @@ pub enum Profile {
     Installer,
     /// AOSP's adbd ([`Broker::spawn_adbd`], plan adbd S2): a user namespace mapped by the setuid helpers ([`adb`]) so its drop_privileges runs unpatched, the host's network (its listener is loopback by property), the app seccomp program, not registered with binderd (S3 gives its shell a binder door).
     Adb,
+    /// A WebKit web process an app asked for ([`webspawn`]): built inside the app's mount namespace (bind sources are app paths) as a child of its pid namespace, the app's uid,
+    /// no further user namespaces, its own network (loopback only), ipc, uts and session, no `/dev/socket`, `/.flatpak-info` (WebKit's route switch), Landlock over exactly its binds, TCP refused, the app seccomp program.
+    WebProcess,
 }
 
 /// The uid and gid binderd runs as inside its user namespace: the overflow id (nobody), which owns nothing binderd could reach.
@@ -259,11 +263,12 @@ pub fn bwrap_args(
         .info_fd(info_fd)
         .tmpfs("/")
         .dev("/dev")
-        .grant(Access::Rw, "/dev")
-        // init's /dev/socket (first_stage_init.cpp `mkdir("/dev/socket", 0755)`): the process's own liblog sink binds `logdw` there (atl-app-launcher logdw.rs)
-        .dir(SOCKET_DIR)
-        .proc("/proc")
-        .grant(Access::Ro, "/proc");
+        .grant(Access::Rw, "/dev");
+    if profile != Profile::WebProcess {
+        // init's /dev/socket (first_stage_init.cpp `mkdir("/dev/socket", 0755)`): the process's own liblog sink binds `logdw` there (atl-app-launcher logdw.rs); a web process is no Android process
+        a.dir(SOCKET_DIR);
+    }
+    a.proc("/proc").grant(Access::Ro, "/proc");
     if profile != Profile::Installer {
         // the app's private /tmp; the installer writes nowhere but its output dir
         a.tmpfs("/tmp").grant(Access::Rw, "/tmp");
@@ -271,6 +276,13 @@ pub fn bwrap_args(
     if profile == Profile::Installer {
         // no network: a namespace with loopback only; no controlling terminal
         a.unshare_net().new_session();
+    }
+    if profile == Profile::WebProcess {
+        // flatpak-spawn --sandbox --no-network: loopback only; no user namespaces of its own (WebKit's own sandbox denies CLONE_NEWUSER too); nothing of the app's ipc, hostname or terminal
+        a.disable_userns()
+            .unshare_net()
+            .unshare_ipc_uts_cgroup()
+            .new_session();
     }
     if let Some(fd) = seccomp_fd {
         a.seccomp(fd);
@@ -306,6 +318,10 @@ pub fn bwrap_args(
     }
     if let Some(area) = &spawn.property_area {
         a.ro_bind(area, PROPERTY_AREA);
+    }
+    if profile == Profile::WebProcess {
+        // the app's own copy (a WebProcess sandbox is built from the app's view), as Flatpak's sub-sandboxes show theirs
+        a.ro_bind(webspawn::FLATPAK_INFO, webspawn::FLATPAK_INFO);
     }
     // last: a directory mounted after these would shadow the files. The stub is exec'd by bwrap before it restricts itself, the program by the stub after: both read-only.
     // The stub sits at SANDBOX_STUB_AT, which no host mount can cover (its host path lies under build trees that other mounts show).
@@ -666,12 +682,29 @@ fn innermost_pid(status: &str) -> Option<i32> {
 /// The broker's side of binderd: its admin connection. Dropping it closes the connection, which ends binderd.
 pub struct Broker {
     admin: OwnedFd,
-    /// Held across a spawn: the fds made inheritable for it must not reach another spawn's child.
-    spawning: Mutex<()>,
+    /// Held across a spawn: the fds made inheritable for it must not reach another spawn's child. Shared with the web-process channels' threads, whose starts inherit fds too.
+    spawning: Arc<Mutex<()>>,
     /// Whether apps get the app seccomp filter (seccomp.rs); off only for the `--no-app-seccomp` check.
     app_seccomp: bool,
     /// The sandbox stub every app process runs under (bwrap execs it, it restricts itself and execs the program).
     stub: PathBuf,
+    /// The web-process channel's programs ([`Broker::with_webspawn`]); None: app sandboxes get no channel, no shim and no `/.flatpak-info`.
+    webspawn: Option<WebSpawnBins>,
+}
+
+/// The programs behind [`webspawn`]: atl-sandbox-join (host side) and the `flatpak-spawn` shim (shown in every app sandbox at [`webspawn::SHIM_AT`]).
+#[derive(Debug, Clone)]
+pub struct WebSpawnBins {
+    pub join: PathBuf,
+    pub shim: PathBuf,
+}
+
+/// What a web-process channel's thread needs of the broker.
+struct WebSpawner {
+    bins: WebSpawnBins,
+    stub: PathBuf,
+    app_seccomp: bool,
+    spawning: Arc<Mutex<()>>,
 }
 
 fn other(what: impl std::fmt::Display) -> io::Error {
@@ -680,6 +713,8 @@ fn other(what: impl std::fmt::Display) -> io::Error {
 
 /// One bwrap run: its arguments up to `--`, then the program; `env` its whole environment (bwrap adds PWD); `inherit` = the fds the child alone gets (cleared close-on-exec just before the spawn, closed right after it). Returns bwrap and the host pid it reports on `info_r`.
 struct Launch<'a> {
+    /// A stage that runs bwrap for us (atl-sandbox-join and its options, up to its `--`); None: bwrap is the broker's child.
+    via: Option<Vec<OsString>>,
     bwrap_args: Vec<OsString>,
     program: &'a Path,
     args: &'a [OsString],
@@ -700,12 +735,21 @@ fn launch(l: Launch<'_>, info_r: io::PipeReader, inherit: Vec<OwnedFd>) -> io::R
             "{argc} arguments for bwrap, which accepts {BWRAP_MAX_ARGS} (bubblewrap.c): the sandbox shows too many paths"
         )));
     }
+    // bwrap found through the broker's PATH: std resolves a bare name through the child's PATH when the child's environment sets one (adbd's is init's /system/bin:...)
+    let bwrap = host_program(BWRAP)?;
     #[expect(
         clippy::disallowed_types,
         reason = "the one launcher of the runtime: every process atld starts is a bwrap run built here"
     )]
-    // bwrap found through the broker's PATH: std resolves a bare name through the child's PATH when the child's environment sets one (adbd's is init's /system/bin:...)
-    let mut cmd = std::process::Command::new(host_program(BWRAP)?);
+    let mut cmd = match l.via {
+        Some(via) => {
+            let (stage, opts) = via.split_first().ok_or_else(|| other("empty via"))?;
+            let mut c = std::process::Command::new(stage);
+            c.args(opts).arg(&bwrap);
+            c
+        }
+        None => std::process::Command::new(&bwrap),
+    };
     cmd.env_clear()
         .args(&l.bwrap_args)
         .arg(l.program)
@@ -764,6 +808,7 @@ impl Broker {
         let args = stub_args(&grants, false, program);
         let process = launch(
             Launch {
+                via: None,
                 bwrap_args,
                 program: stub,
                 args: &args,
@@ -789,10 +834,18 @@ impl Broker {
     fn new(admin: OwnedFd, stub: &Path) -> Self {
         Broker {
             admin,
-            spawning: Mutex::new(()),
+            spawning: Arc::new(Mutex::new(())),
             app_seccomp: true,
             stub: stub.to_path_buf(),
+            webspawn: None,
         }
+    }
+
+    /// App sandboxes get the web-process channel ([`webspawn`]): the shim, `/.flatpak-info` and the channel together, never one without the others (with `/.flatpak-info` and a
+    /// failing `flatpak-spawn` probe WebKit starts its web process unsandboxed: ProcessLauncherGLib's fallback branch).
+    pub fn with_webspawn(mut self, bins: WebSpawnBins) -> Self {
+        self.webspawn = Some(bins);
+        self
     }
 
     /// Apps start without the seccomp filter: the deliberate-failure check that shows what the filter answers (atld `--no-app-seccomp`, test only).
@@ -805,6 +858,13 @@ impl Broker {
     pub fn spawn(&self, mut spawn: Spawn) -> io::Result<Process> {
         // a panic elsewhere leaves nothing half-done here: the guard only orders spawns
         let _one_at_a_time = self.spawning.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(bins) = &self.webspawn {
+            spawn.mounts.push(Mount {
+                host: bins.shim.clone(),
+                at: webspawn::SHIM_AT.into(),
+                writable: false,
+            });
+        }
         complete_mounts(&mut spawn)?;
         let (ours, theirs) = socketpair(
             AddressFamily::UNIX,
@@ -819,7 +879,7 @@ impl Broker {
             .app_seccomp
             .then(|| seccomp_memfd(Profile::App))
             .transpose()?;
-        let (bwrap_args, grants) = bwrap_args(
+        let (mut bwrap_args, mut grants) = bwrap_args(
             &spawn,
             Profile::App,
             &host_root()?,
@@ -827,6 +887,25 @@ impl Broker {
             info_w.as_raw_fd(),
             seccomp.as_ref().map(AsRawFd::as_raw_fd),
         );
+        // the web-process channel: the app's end, and /.flatpak-info (empty, from a memfd) spliced before bwrap's `--`
+        let channel = match &self.webspawn {
+            Some(_) => {
+                let (broker_end, app_end) = socketpair(
+                    AddressFamily::UNIX,
+                    SocketType::SEQPACKET,
+                    SocketFlags::CLOEXEC,
+                    None,
+                )?;
+                let info = File::from(memfd_create("atl-flatpak-info", MemfdFlags::CLOEXEC)?);
+                let mut data = bwrap::Args::new();
+                data.ro_bind_data(info.as_raw_fd(), webspawn::FLATPAK_INFO);
+                grants.extend(data.grants().iter().cloned());
+                let at = bwrap_args.len() - 1;
+                bwrap_args.splice(at..at, data.options());
+                Some((broker_end, app_end, OwnedFd::from(info)))
+            }
+            None => None,
+        };
         // the stub applies the grants, then execs the program with the spawn's arguments
         let mut args = stub_args(&grants, spawn.rights.contains(&Right::Net), &spawn.program);
         // the app's thread-priority tiers (seccomp.rs NiceTiers): the stub raises the soft RLIMIT_NICE to the hard one and logs the tier line once per process
@@ -841,8 +920,25 @@ impl Broker {
         env.push((CONTROL_ENV.into(), theirs.as_raw_fd().to_string().into()));
         let mut inherit: Vec<OwnedFd> = vec![theirs, info_w.into()];
         inherit.extend(seccomp);
+        let mut broker_end = None;
+        if let Some((ours, app_end, info)) = channel {
+            env.push(("PATH".into(), webspawn::APP_PATH.into()));
+            env.push((
+                webspawn::FD_ENV.into(),
+                app_end.as_raw_fd().to_string().into(),
+            ));
+            inherit.extend([app_end, info]);
+            broker_end = Some(ours);
+        }
+        // the web-process channel's view of this app, before the spawn's fields move
+        let view = webspawn::AppView {
+            uid: spawn.uid,
+            devices: spawn.devices.clone(),
+            writable: spawn.mounts.iter().filter(|m| m.writable).cloned().collect(),
+        };
         let Process { child, host_pid } = launch(
             Launch {
+                via: None,
                 bwrap_args,
                 program: Path::new(SANDBOX_STUB_AT),
                 args: &args,
@@ -863,7 +959,143 @@ impl Broker {
             spawn.context_manager,
         )
         .map_err(|e| registration_error(host_pid, e))?;
+        if let (Some(channel), Some(bins)) = (broker_end, &self.webspawn) {
+            self.serve_webspawn(channel, view, host_pid, bins.clone())?;
+        }
         Ok(Process { child, host_pid })
+    }
+
+    /// Serves the web-process channel of the sandbox whose pid 1 is `host_pid` on a thread of its own until the app's end closes. Its namespaces are opened now, while the broker's own child holds the
+    /// sandbox: the thread then never names it by pid again (no pid reuse can redirect a start).
+    fn serve_webspawn(
+        &self,
+        channel: OwnedFd,
+        app: webspawn::AppView,
+        host_pid: i32,
+        bins: WebSpawnBins,
+    ) -> io::Result<()> {
+        let ns = |kind: &str| File::open(format!("/proc/{host_pid}/ns/{kind}")).map(OwnedFd::from);
+        let (pidns, mntns) = (ns("pid")?, ns("mnt")?);
+        let spawner = WebSpawner {
+            bins,
+            stub: self.stub.clone(),
+            app_seccomp: self.app_seccomp,
+            spawning: Arc::clone(&self.spawning),
+        };
+        std::thread::Builder::new()
+            .name(format!("webspawn-{host_pid}"))
+            .spawn(move || {
+                let _ = webspawn::serve(&channel, &app, |plan, fds| {
+                    match spawner.start(&app, plan, &pidns, &mntns, fds) {
+                        Ok(pid) => webspawn::Reply::Started { pid },
+                        Err(e) => webspawn::Reply::Failed {
+                            message: e.to_string(),
+                        },
+                    }
+                });
+            })?;
+        Ok(())
+    }
+}
+
+impl WebSpawner {
+    /// Starts `plan` for `app` in [`Profile::WebProcess`] through atl-sandbox-join (`pidns`, `mntns`: the app's): bwrap runs inside the app's mount namespace, so every path below is an app path.
+    /// `fds`: WebKit's socket (kept at its number, which becomes the web process's argv[2]), stdout, stderr. Returns the pid bwrap reports, in the app's pid namespace.
+    fn start(
+        &self,
+        app: &webspawn::AppView,
+        plan: &webspawn::Plan,
+        pidns: &OwnedFd,
+        mntns: &OwnedFd,
+        fds: [OwnedFd; 3],
+    ) -> io::Result<i32> {
+        let [socket, stdout, stderr] = fds;
+        let bwrap = host_program(BWRAP)?;
+        // bwrap is exec'd inside the app's view, which shows the host's /usr and /etc only
+        if !APP_ROOT_DIRS
+            .iter()
+            .any(|d| bwrap.starts_with(Path::new("/").join(d)))
+        {
+            return Err(other(format!(
+                "{} is outside what an app sandbox shows",
+                bwrap.display()
+            )));
+        }
+        let mut spawn = Spawn {
+            uid: app.uid,
+            context_manager: false,
+            binder_pids: BinderPids::Sandbox,
+            mounts: plan.expose.clone(),
+            links: vec![],
+            devices: if plan.gpu {
+                app.devices.clone()
+            } else {
+                vec![]
+            },
+            property_area: None,
+            rights: vec![],
+            program: plan.program.clone(),
+            args: vec![],
+            env: plan.env.clone(),
+            cwd: None,
+            stdin: None,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        };
+        let _one_at_a_time = self.spawning.lock().unwrap_or_else(|e| e.into_inner());
+        complete_mounts(&mut spawn)?;
+        let (info_r, info_w) = io::pipe()?;
+        let seccomp = self
+            .app_seccomp
+            .then(|| seccomp_memfd(Profile::WebProcess))
+            .transpose()?;
+        let (bwrap_args, grants) = bwrap_args(
+            &spawn,
+            Profile::WebProcess,
+            &host_root()?,
+            &self.stub,
+            info_w.as_raw_fd(),
+            seccomp.as_ref().map(AsRawFd::as_raw_fd),
+        );
+        // no rights: TCP stays handled (refused) by the stub, and the namespace has loopback only
+        let mut args = stub_args(&grants, false, &spawn.program);
+        args.extend([
+            OsString::from(&plan.identifier),
+            socket.as_raw_fd().to_string().into(),
+        ]);
+        // per-start copies: launch clears close-on-exec on what it inherits and closes it after the spawn, and the channel keeps the originals
+        let (pidns, mntns) = (pidns.try_clone()?, mntns.try_clone()?);
+        let via = vec![
+            self.bins.join.clone().into_os_string(),
+            "--pidns".into(),
+            pidns.as_raw_fd().to_string().into(),
+            "--mntns".into(),
+            mntns.as_raw_fd().to_string().into(),
+            "--".into(),
+        ];
+        let mut inherit: Vec<OwnedFd> = vec![socket, info_w.into(), pidns, mntns];
+        inherit.extend(seccomp);
+        let Process { mut child, host_pid } = launch(
+            Launch {
+                via: Some(via),
+                bwrap_args,
+                program: Path::new(SANDBOX_STUB_AT),
+                args: &args,
+                env: spawn.env,
+                stdin: Stdio::null(),
+                stdout: spawn.stdout,
+                stderr: spawn.stderr,
+            },
+            info_r,
+            inherit,
+        )?;
+        // atl-sandbox-join waits for bwrap, which ends with the web process (its socket closed, or the app's pid namespace gone)
+        std::thread::Builder::new()
+            .name(format!("webproc-{host_pid}"))
+            .spawn(move || {
+                let _ = child.wait();
+            })?;
+        Ok(host_pid)
     }
 }
 
@@ -891,6 +1123,7 @@ impl Broker {
         args.extend(spawn.args.iter().cloned());
         let Process { child, host_pid } = launch(
             Launch {
+                via: None,
                 bwrap_args,
                 program: Path::new(SANDBOX_STUB_AT),
                 args: &args,
@@ -935,6 +1168,7 @@ impl Broker {
         args.extend(spawn.args.iter().cloned());
         let process = launch(
             Launch {
+                via: None,
                 bwrap_args,
                 program: Path::new(SANDBOX_STUB_AT),
                 args: &args,

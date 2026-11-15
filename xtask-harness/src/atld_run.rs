@@ -191,6 +191,11 @@ pub struct Runtime {
     screencap: PathBuf,
     binderd: PathBuf,
     sandbox_stub: PathBuf,
+    /// atl-sandbox-join and the `flatpak-spawn` shim: atld's `--sandbox-join` / `--flatpak-spawn` (the apps' web-process channel, atl_broker::webspawn)
+    sandbox_join: PathBuf,
+    flatpak_spawn: PathBuf,
+    /// Whether atld gets the two above; false only for the deliberate break that shows WebKit's abort without the channel.
+    webspawn: bool,
     atld: PathBuf,
     /// atl-installer and the api-impl dex: atld's `--installer`, `--installer-class-path`
     installer: PathBuf,
@@ -650,6 +655,8 @@ impl Runtime {
         let screencap = packages::bin(root, &out, "atl-services", "atl-screencap")?;
         let binderd = cargo_bin(root, &out, "atl-binderd")?;
         let sandbox_stub = cargo_bin(root, &out, "atl-sandbox-stub")?;
+        let sandbox_join = cargo_bin(root, &out, "atl-sandbox-join")?;
+        let flatpak_spawn = packages::bin(root, &out, "atl-flatpak-spawn", "flatpak-spawn")?;
         let atld = cargo_bin(root, &out, "atld")?;
         let installer = packages::bin(root, &out, "atl-app-launcher", "atl-installer")?;
         let api_impl = host_art::api_impl_dex(&java_out);
@@ -706,6 +713,9 @@ impl Runtime {
             screencap,
             binderd,
             sandbox_stub,
+            sandbox_join,
+            flatpak_spawn,
+            webspawn: true,
             atld,
             installer,
             api_impl,
@@ -1319,6 +1329,8 @@ impl Runtime {
             self.am.clone(),
             self.binderd.clone(),
             self.sandbox_stub.clone(),
+            self.sandbox_join.clone(),
+            self.flatpak_spawn.clone(),
             self.atld.clone(),
             self.framework_res.clone(),
             self.fonts.conf.clone(),
@@ -1510,8 +1522,14 @@ impl Runtime {
             .arg("--binderd")
             .arg(&self.binderd)
             .arg("--sandbox-stub")
-            .arg(&self.sandbox_stub)
-            .arg("--servicemanager")
+            .arg(&self.sandbox_stub);
+        if self.webspawn {
+            cmd.arg("--sandbox-join")
+                .arg(&self.sandbox_join)
+                .arg("--flatpak-spawn")
+                .arg(&self.flatpak_spawn);
+        }
+        cmd.arg("--servicemanager")
             .arg(&self.servicemanager)
             .arg("--services")
             .arg(&self.services)

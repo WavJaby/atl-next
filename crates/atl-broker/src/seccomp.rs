@@ -98,7 +98,10 @@ impl NiceTiers {
 pub fn program(profile: Profile) -> io::Result<BpfProgram> {
     match profile {
         // adbd and its shell are Android processes: the app's allow-list (drop_privileges' setgroups/setres*id/capset included, or the gate shows the kill)
-        Profile::App | Profile::Adb => app_program(NiceTiers::for_limit(granted_nice())),
+        // a WebKit web process: the app's program, the app being what it runs for (narrowing to WebKit's own seccomp list is a step still to measure)
+        Profile::App | Profile::Adb | Profile::WebProcess => {
+            app_program(NiceTiers::for_limit(granted_nice()))
+        }
         Profile::BinderDaemon => binderd_program(),
         Profile::Installer => installer_program(),
     }

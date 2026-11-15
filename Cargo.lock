@@ -208,6 +208,7 @@ dependencies = [
  "atl-android-paths",
  "atl-binderd",
  "atl-bwrap",
+ "atl-diag",
  "libc",
  "object",
  "rustix",
@@ -325,6 +326,15 @@ dependencies = [
  "atl-android-paths",
  "atl-engine-api",
  "libloading",
+]
+
+[[package]]
+name = "atl-flatpak-spawn"
+version = "0.0.0"
+dependencies = [
+ "atl-broker",
+ "libc",
+ "rustix",
 ]
 
 [[package]]
@@ -629,6 +639,14 @@ dependencies = [
  "atl-service-view",
  "cxx",
  "cxx-build",
+]
+
+[[package]]
+name = "atl-sandbox-join"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "rustix",
 ]
 
 [[package]]

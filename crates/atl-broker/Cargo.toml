@@ -11,6 +11,7 @@ publish.workspace = true
 atl-android-paths = { path = "../atl-android-paths" }
 atl-binderd = { path = "../atl-binderd" }
 atl-bwrap = { path = "../atl-bwrap" }
+atl-diag = { path = "../atl-diag" }
 libc.workspace = true
 object.workspace = true
 rustix.workspace = true

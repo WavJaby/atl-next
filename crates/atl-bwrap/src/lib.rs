@@ -67,6 +67,24 @@ impl Args {
         self.word("--unshare-net")
     }
 
+    /// `--unshare-ipc --unshare-uts --unshare-cgroup-try`: no System V IPC, hostname or cgroup view shared with the caller.
+    pub fn unshare_ipc_uts_cgroup(&mut self) -> &mut Self {
+        self.word("--unshare-ipc")
+            .word("--unshare-uts")
+            .word("--unshare-cgroup-try")
+    }
+
+    /// `--disable-userns`: the sandbox cannot create user namespaces (needs `--unshare-user`).
+    pub fn disable_userns(&mut self) -> &mut Self {
+        self.word("--disable-userns")
+    }
+
+    /// `--ro-bind-data FD AT`: a read-only file at AT holding FD's content: grant Ro at AT.
+    pub fn ro_bind_data(&mut self, fd: i32, at: impl AsRef<Path>) -> &mut Self {
+        self.grant(Access::Ro, at.as_ref());
+        self.pair("--ro-bind-data", fd.to_string(), at.as_ref())
+    }
+
     /// `--unshare-all`: user (try), ipc, pid, net, uts, cgroup (try) namespaces.
     pub fn unshare_all(&mut self) -> &mut Self {
         self.word("--unshare-all")
