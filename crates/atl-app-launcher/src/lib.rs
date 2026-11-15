@@ -89,14 +89,31 @@ use std::path::Path;
 use anyhow::{Context as _, Result, anyhow, bail};
 use atl_platform_ui::Ui;
 
-/// The compositor's threads: attached to the VM, as a binder thread is.
+/// The compositor's view of the VM: its threads attached, as a binder thread is, and the activity label lookup through the app's own PackageManager.
 #[cfg(feature = "converter")]
-struct AttachedThreads(ffi::VmHandle);
+struct VmServices(ffi::VmHandle);
 
 #[cfg(feature = "converter")]
-impl atl_composer::ThreadHost for AttachedThreads {
+impl atl_composer::VmHost for VmServices {
     fn spawn(&self, name: &str, f: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
         self.0.spawn_attached(name, f)
+    }
+
+    fn activity_label(&self, package: &str, class: &str) -> Option<String> {
+        use std::io::Write;
+        match self
+            .0
+            .on_this_thread(|vm| vm.activity_label(package, class))
+        {
+            Ok(label) => label,
+            Err(e) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "atl-app-launcher: label of {package}/{class}: {e:#}"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -105,7 +122,7 @@ impl atl_composer::ThreadHost for AttachedThreads {
 #[cfg(feature = "converter")]
 fn start_compositor(vm: &ffi::Vm, ui: Option<atl_platform_ui::PlatformUi>) {
     use std::io::Write;
-    if let Err(e) = atl_composer::start(&AttachedThreads(vm.handle()), ui) {
+    if let Err(e) = atl_composer::start(std::sync::Arc::new(VmServices(vm.handle())), ui) {
         let _ = writeln!(std::io::stderr(), "atl-app-launcher: no compositor: {e}");
     }
 }

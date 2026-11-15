@@ -59,6 +59,6 @@ pub mod ui_agent;
 pub mod ui_window;
 
 #[cfg(feature = "converter")]
-pub use host::ThreadHost;
+pub use host::VmHost;
 #[cfg(feature = "converter")]
 pub use start::start;

@@ -85,6 +85,17 @@ pub(crate) struct Owner {
     pub relaunching: bool,
     /// started by the launcher with its MAIN / LAUNCHER intent (ActivityRecord LAUNCH_SOURCE_TYPE_HOME + isMainIntent): an unhandled Back on it as the Task's root moves the Task back, see [`ActivityTasks::back`]
     pub entry: bool,
+    /// the label of the activity's last setTaskDescription (ActivityRecord.taskDescription.getLabel()); None until it sets one, and for a null label
+    pub task_label: Option<String>,
+}
+
+/// What a Task's window is titled from ([`ActivityTasks::task_title`]): the merged TaskDescription label, and the root activity whose label stands in when there is none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TaskTitle {
+    pub uid: u32,
+    pub label: Option<String>,
+    pub package: String,
+    pub class: String,
 }
 
 /// What an unhandled Back on an activity does (ActivityClientController.onBackPressed:1720-1747).
@@ -365,6 +376,7 @@ impl ActivityTasks {
                 .map_or(0, |_| real_config_changes(decl)),
             relaunching: false,
             entry: true,
+            task_label: None,
         };
         let launch = Launch {
             package: package.to_owned(),
@@ -552,6 +564,7 @@ impl ActivityTasks {
             declared: package.map_or(0, |_| real_config_changes(decl)),
             relaunching: false,
             entry: false,
+            task_label: None,
         };
         let launch = Launch {
             package: calling_package.to_owned(),
@@ -720,6 +733,26 @@ impl ActivityTasks {
     /// Changes the owner of `token`'s record; false when no record has it.
     pub(crate) fn update_owner(&self, token: &SpIBinder, f: impl FnOnce(&mut Owner)) -> bool {
         self.machine().owner_mut(token).map(f).is_some()
+    }
+
+    /// setTaskDescription of `token` with `label`, then the title of its Task; None when no record has the token. Task.updateTaskDescription (Task.java:1919-1932,
+    /// setTaskDescriptionFromActivityAboveRoot): forAllActivities walks top -> bottom and stops at the root; the first non-null label wins. Task overlays are not modelled.
+    pub(crate) fn set_task_label(
+        &self,
+        token: &SpIBinder,
+        label: Option<String>,
+    ) -> Option<TaskTitle> {
+        let mut m = self.machine();
+        m.owner_mut(token)?.task_label = label;
+        let task = m.task_of(token)?;
+        let records: Vec<_> = m.records(task).collect();
+        let (_, root) = records.first()?;
+        Some(TaskTitle {
+            uid: root.uid,
+            label: records.iter().rev().find_map(|(_, o)| o.task_label.clone()),
+            package: root.package.clone(),
+            class: root.component.clone(),
+        })
     }
 
     /// Whether a record of `task` waits for its relaunch.

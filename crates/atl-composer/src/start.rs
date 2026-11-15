@@ -17,7 +17,7 @@ use binder::{Interface, SpIBinder, StatusCode, Strong, declare_binder_interface}
 use atl_compositor::model::CompositorConfig;
 use atl_platform_ui::{PhysSize, PlatformUi, Ui, WindowAttributes};
 
-use crate::host::{Composer, ComposerConfig, Presenter, ThreadHost};
+use crate::host::{Composer, ComposerConfig, Presenter, VmHost};
 use crate::input::{self, Message};
 use crate::mailbox::Mailbox;
 use crate::sink::{FirstFrame, ReportSink};
@@ -128,9 +128,10 @@ fn register(ui_agent: &SpIBinder, composer: &SpIBinder) -> Result<(), String> {
 }
 
 /// Starts this process's compositor and registers it. Call it with libbinder's thread pool running (the registry's reply and libgui's calls arrive on its threads) and before anything uses libgui.
-/// The clock thread and the present thread come from `threads` in both modes. Headless (`ui` None): scenes go to a report sink, and a scripted pointer goes in at the first frame. UI mode (`ui`: the toolkit
+/// The clock thread and the present thread come from `host` in both modes; the UI agent keeps it for the window title's label lookup. Headless (`ui` None): scenes go to a report sink, and a scripted pointer goes in at the first frame. UI mode (`ui`: the toolkit
 /// this UI thread attached): scenes go through a mailbox to a GTK window ([`ui_window`]), which takes the latest on its frame clock. The caller is the UI thread in UI mode.
-pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Composer>, String> {
+pub fn start(host: Arc<dyn VmHost>, ui: Option<PlatformUi>) -> Result<Arc<Composer>, String> {
+    let threads: &dyn VmHost = &*host;
     let display = DisplayModel::parse_arg(&property(DISPLAY_PROPERTY)?)?;
     let script = match optional_property(POINTER_PROPERTY)? {
         Some(script) => input::parse_script(&script)?,
@@ -164,10 +165,11 @@ pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Com
     let mut input_method = None;
     let sender = if let Some(ui) = ui {
         input_method = Some(atl_ime::new_binder(Arc::new(ui.invoker())));
-        // the services' size and package for this process's Task: the window opens at the size, so its first bounds report changes nothing; the app id is named before its first commit
+        // the services' size and package for this process's Task: the window opens at the size, so its first bounds report changes nothing; the app id is named before its first commit.
+        // Titled by the package until the first activity's setTaskDescription (onApplyThemeResource, in its create) brings the task label (UI agent TASK_TITLE): resolving that needs the app's Java side.
         let (size, package) = task_info()?;
         let attributes = WindowAttributes {
-            title: "atl".to_owned(),
+            title: package.clone(),
             app_id: (!package.is_empty()).then(|| format!("atl.{package}")),
             size,
         };
@@ -205,7 +207,13 @@ pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Com
     let surface_flinger_aidl = service::new_binder(Arc::clone(&composer));
     // the registry gets its own reference: the service view takes the object below
     let registered_composer = surface_flinger_aidl.clone();
-    let ui_agent = ui_agent::new_binder(Arc::clone(&composer), input_tx, sender, input_method);
+    let ui_agent = ui_agent::new_binder(
+        Arc::clone(&composer),
+        input_tx,
+        sender,
+        input_method,
+        Arc::clone(&host),
+    );
     if std::env::var(BREAK_ENV).as_deref() == Ok(BREAK_NO_SERVE) {
         // the deliberate failure: the binders die with this frame, nothing serves the names
         drop((surface_flinger, surface_flinger_aidl));

@@ -70,6 +70,21 @@ pub fn minimize() {
     }));
 }
 
+/// The task's title (UI agent TASK_TITLE) as the window's title; from any thread. Logged as `atl-composer: ui: title "<title>"`. Headless mode has no window.
+pub fn set_title(title: String) {
+    let Some(invoker) = INVOKER.get() else {
+        return;
+    };
+    invoker.invoke(Box::new(move || {
+        SESSION.with_borrow(|session| {
+            if let Some(window) = session.as_ref().and_then(|s| s.window.as_ref()) {
+                tracing::info!("atl-composer: ui: title {title:?}");
+                window.set_title(&title);
+            }
+        });
+    }));
+}
+
 /// Whether captures can be served: UI mode attached the toolkit (a headless compositor has no window to read back).
 pub fn available() -> bool {
     INVOKER.get().is_some()

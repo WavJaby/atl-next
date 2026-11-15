@@ -2,6 +2,7 @@
 package com.example.atlwindow;
 
 import android.app.Activity;
+import android.app.ActivityManager;
 import android.content.Context;
 import android.graphics.Canvas;
 import android.graphics.Color;
@@ -31,6 +32,8 @@ public class Main extends Activity {
     static final String TAG = "AtlWindow";
     /** The window's title: the compositor's layer name, by which the frames stage finds the first frame (xtask-harness/src/window.rs WINDOW_TITLE). */
     static final String WINDOW_TITLE = "AtlWindowFixture";
+    /** The TaskDescription label set after the first draw: the desktop window's title must become it (xtask-harness/src/window.rs TASK_LABEL). */
+    static final String TASK_LABEL = "ATL task description";
     /** Frame callbacks per run (xtask-harness/src/window.rs FRAME_CALLBACKS). */
     static final int FRAME_CALLBACKS = 31;
     /** The compositor registry's name and descriptor, and its GET_COMPOSER code (atl-services compositor_registry.rs). */
@@ -148,6 +151,14 @@ public class Main extends Activity {
                 drawn = true;
                 // hardware=true: a RecordingCanvas, so hwui's RenderThread draws it (stage hwui checks this)
                 Log.i(TAG, "onDraw reached hardware=" + canvas.isHardwareAccelerated());
+                // the title stage: the window was titled by the label (no TaskDescription label yet); a label set now retitles it
+                post(new Runnable() {
+                    @Override
+                    public void run() {
+                        ((Activity) getContext()).setTaskDescription(new ActivityManager.TaskDescription(TASK_LABEL));
+                        Log.i(TAG, "task description set");
+                    }
+                });
             }
             int halfWidth = getWidth() / 2;
             int halfHeight = getHeight() / 2;

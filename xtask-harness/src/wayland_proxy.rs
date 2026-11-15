@@ -5,7 +5,7 @@
 //! * `wl_display.get_registry` and `wl_registry.bind` -> which object id is which interface (`xdg_wm_base`, `wl_shm`, ...);
 //! * `xdg_wm_base.pong(serial)` (request opcode 3) -> [`Event::Pong`], `wl_shm.create_pool` (opcode 0) -> [`Event::ShmPool`];
 //! * `xdg_wm_base.ping(serial)` from the compositor (event opcode 0) -> [`Event::Ping`] with `injected: false`;
-//! * `xdg_toplevel.set_app_id(app_id)` of the window's toplevel (request opcode 3) -> [`Event::AppId`], its `set_minimized` (opcode 13) -> [`Event::Minimized`];
+//! * `xdg_toplevel.set_title(title)` of the window's toplevel (request opcode 2) -> [`Event::Title`], its `set_app_id(app_id)` (opcode 3) -> [`Event::AppId`], its `set_minimized` (opcode 13) -> [`Event::Minimized`];
 //! * the window's first `wl_surface.commit` (xdg-shell's initial one, no buffer) -> [`Event::FirstCommit`].
 //!
 //! Injections go to the connection that bound `xdg_wm_base` (the window's); an app's other connections forward only.
@@ -52,7 +52,8 @@ const XDG_SURFACE_ACK_CONFIGURE: u16 = 4;
 const XDG_SURFACE_GET_TOPLEVEL: u16 = 1;
 const XDG_SURFACE_SET_WINDOW_GEOMETRY: u16 = 3;
 const XDG_TOPLEVEL: &str = "xdg_toplevel";
-/// `xdg_toplevel.set_app_id(app_id: string)`, request 3 (xdg-shell.xml).
+/// `xdg_toplevel.set_title(title: string)`, request 2, and `set_app_id(app_id: string)`, request 3 (xdg-shell.xml: destroy 0, set_parent 1).
+const XDG_TOPLEVEL_SET_TITLE: u16 = 2;
 const XDG_TOPLEVEL_SET_APP_ID: u16 = 3;
 /// `xdg_toplevel.set_minimized()`, request 13 (xdg-shell.xml: destroy 0 ... unset_fullscreen 12, set_minimized 13).
 const XDG_TOPLEVEL_SET_MINIMIZED: u16 = 13;
@@ -141,6 +142,8 @@ pub enum Event {
     },
     /// The client's `xdg_toplevel.set_app_id` on the window: the id the compositor sees the window by. Every one is sent, in order.
     AppId { app_id: String },
+    /// The client's `xdg_toplevel.set_title` on the window: the title the desktop shows. Every one is sent, in order.
+    Title { title: String },
     /// The client's `xdg_toplevel.set_minimized` on the window: it asked the desktop to minimize it.
     Minimized,
     /// The window's first `wl_surface.commit`: the initial one, which carries no buffer; the desktop matches the window's rules on it, before any frame.
@@ -274,6 +277,11 @@ fn note_request(ids: &mut Ids, object: u32, opcode: u16, body: &[u8]) -> Option<
         (Some(XDG_TOPLEVEL), XDG_TOPLEVEL_SET_APP_ID) if ids.toplevel == Some(object) => {
             Some(Event::AppId {
                 app_id: wl_string(body, 0)?,
+            })
+        }
+        (Some(XDG_TOPLEVEL), XDG_TOPLEVEL_SET_TITLE) if ids.toplevel == Some(object) => {
+            Some(Event::Title {
+                title: wl_string(body, 0)?,
             })
         }
         (Some(XDG_TOPLEVEL), XDG_TOPLEVEL_SET_MINIMIZED) if ids.toplevel == Some(object) => {
@@ -1037,6 +1045,26 @@ mod tests {
         );
         assert_eq!(
             note_request(&mut ids, 13, XDG_TOPLEVEL_SET_APP_ID, &body),
+            None
+        );
+    }
+
+    /// `xdg_toplevel.set_title` is request 2; length 16 counts the NUL of the 15 letters, no pad (16 is a multiple of 4). Only the window's toplevel reports it.
+    #[test]
+    fn set_title_is_an_event() {
+        let mut ids = Ids::default();
+        ids.interfaces.insert(12, XDG_TOPLEVEL.to_owned());
+        ids.toplevel = Some(12);
+        let mut body = 16u32.to_ne_bytes().to_vec();
+        body.extend_from_slice(b"ATL window test\0");
+        assert_eq!(
+            note_request(&mut ids, 12, XDG_TOPLEVEL_SET_TITLE, &body),
+            Some(Event::Title {
+                title: "ATL window test".into(),
+            })
+        );
+        assert_eq!(
+            note_request(&mut ids, 13, XDG_TOPLEVEL_SET_TITLE, &body),
             None
         );
     }

@@ -13,7 +13,7 @@ use atl_parcelables::codecs::android::view::SurfaceControl::NativeSurfaceControl
 use atl_services_wire::ui_agent::{BnUiAgent, IUiAgent};
 use binder::{BinderFeatures, Interface, SpIBinder, StatusCode};
 
-use crate::host::Composer;
+use crate::host::{Composer, VmHost};
 use crate::input::{InputSender, Message};
 use crate::service;
 use crate::task_sender::TaskSender;
@@ -31,6 +31,8 @@ struct UiAgent {
     input_method: Option<SpIBinder>,
     /// dim layers (DIM_LAYER) by the dimming window's layer id: the handle that keeps the layer alive, and its id
     dims: Mutex<HashMap<i32, (SpIBinder, i32)>>,
+    /// the launcher's VM: the task title's label lookup (TASK_TITLE)
+    host: Arc<dyn VmHost>,
 }
 
 impl Interface for UiAgent {}
@@ -119,6 +121,25 @@ impl IUiAgent for UiAgent {
         Ok(())
     }
 
+    /// The task's title as recents shows it: the TaskDescription label when it has text, else the root activity's label loaded by the app's PackageManager (Launcher3 TaskIconCache's fallback,
+    /// ActivityInfo.loadLabel). The one place the window's title is decided after it opens. A failed lookup keeps the current title.
+    fn task_title(
+        &self,
+        label: Option<&str>,
+        package: &str,
+        class: &str,
+    ) -> Result<(), StatusCode> {
+        let title = match label.map(str::trim).filter(|l| !l.is_empty()) {
+            Some(label) => Some(label.to_owned()),
+            None => self.host.activity_label(package, class),
+        };
+        match title {
+            Some(title) => crate::ui_window::set_title(title),
+            None => tracing::warn!("atl-composer: ui: no label for {package}/{class}"),
+        }
+        Ok(())
+    }
+
     /// WMS Dimmer: one colour layer per dimming window (Dimmer.java:169-173 makeDimLayer), a root at the Task origin like every window layer here, cropped to the Task
     /// (DimmerAnimationHelper.java:286-287), relative z -1 to the window (:257), black at alpha `amount` (:293 setAlpha). Dropping the handle destroys the layer.
     fn dim_layer(
@@ -159,12 +180,13 @@ impl IUiAgent for UiAgent {
     }
 }
 
-/// A new UI agent binder of `composer`; `input` takes the windows' input channels, `sender` the window's Task, `input_method` is the app's IInputMethod.
+/// A new UI agent binder of `composer`; `input` takes the windows' input channels, `sender` the window's Task, `input_method` is the app's IInputMethod, `host` answers the title's label lookup.
 pub fn new_binder(
     composer: Arc<Composer>,
     input: InputSender<Message>,
     sender: Option<Arc<TaskSender>>,
     input_method: Option<SpIBinder>,
+    host: Arc<dyn VmHost>,
 ) -> SpIBinder {
     BnUiAgent::new_binder(
         UiAgent {
@@ -173,6 +195,7 @@ pub fn new_binder(
             sender,
             input_method,
             dims: Mutex::default(),
+            host,
         },
         BinderFeatures::default(),
     )

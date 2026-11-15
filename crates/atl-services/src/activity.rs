@@ -2777,14 +2777,35 @@ impl IActivityClientController for ActivityClientController {
         Ok(())
     }
 
-    /// ActivityClientController.setTaskDescription: Activity.onApplyThemeResource sends it for every themed activity, so the launch fails without it. The values are read (the codec
-    /// checks them) and not kept: the task description is for the recents, which ATL does not have yet. Counted, so the run shows the call.
+    /// ActivityClientController.setTaskDescription -> ActivityRecord.setTaskDescription + Task.updateTaskDescription. Activity.onApplyThemeResource sends it for every themed activity (label null),
+    /// so each activity's create retitles. The label is kept per activity; the Task's merged label (ActivityTasks::set_task_label) and root activity go to the app's UI agent, whose window is
+    /// titled as recents labels the task. Only the label is kept: colours and icon have no desktop consumer. Not recomputed when an activity leaves (AOSP also updates on removal).
     fn r#setTaskDescription(
         &self,
-        _token: Option<&SpIBinder>,
-        _values: Option<&ActivityManager_TaskDescription>,
+        token: Option<&SpIBinder>,
+        values: Option<&ActivityManager_TaskDescription>,
     ) -> binder::Result<()> {
-        atl_diag::answered(ACC, "setTaskDescription (not kept: no recents)");
+        let (Some(token), Some(inner)) = (token, self.inner.upgrade()) else {
+            atl_diag::answered(ACC, "setTaskDescription: no token");
+            return Ok(());
+        };
+        let label = values.and_then(|v| v.label.clone());
+        let Some(title) = inner.atm.set_task_label(token, label) else {
+            atl_diag::answered(ACC, "setTaskDescription: no such activity");
+            return Ok(());
+        };
+        let Some(agent) = self
+            .agents
+            .get(title.uid)
+            .and_then(|b| b.into_interface::<dyn IUiAgent>().ok())
+        else {
+            atl_diag::answered(ACC, "setTaskDescription (kept, no UI agent)");
+            return Ok(());
+        };
+        atl_diag::answered(ACC, "setTaskDescription (window titled)");
+        if let Err(e) = agent.task_title(title.label.as_deref(), &title.package, &title.class) {
+            log(format_args!("setTaskDescription: task title: {e:?}"));
+        }
         Ok(())
     }
 }

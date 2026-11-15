@@ -43,10 +43,13 @@ use atl_libgui_parcel::wire::canonical_binder;
 pub const DISPLAY_ID: u64 = 1;
 
 /// Where the compositor's threads come from. libgui's callbacks into Java (SurfaceControl transaction listeners) find the JNIEnv of the thread they run on, as on a binder thread (which libandroid_runtime
-/// creates attached to the VM): a plain thread would crash them. The launcher owns the VM, so it supplies the threads (JNI AttachCurrentThread).
-pub trait ThreadHost: Send + Sync {
+/// creates attached to the VM): a plain thread would crash them. The launcher owns the VM, so it supplies the threads (JNI AttachCurrentThread) and the one Java query the compositor needs.
+pub trait VmHost: Send + Sync {
     /// Runs `f` on a new thread called `name`, attached to the VM.
     fn spawn(&self, name: &str, f: Box<dyn FnOnce() + Send>) -> std::io::Result<()>;
+    /// The label of activity `package`/`class` as the app's PackageManager loads it (`getActivityInfo(component, 0).loadLabel(pm)`: the activity's label, else the application's, in the app's
+    /// locale); None when the lookup failed (logged by the host). Called on a VM-attached thread (a binder thread).
+    fn activity_label(&self, package: &str, class: &str) -> Option<String>;
 }
 
 /// Ticks' output queued for the present thread: one sink read longer than a period is absorbed; a sink slower than the clock for longer than this holds the clock back, so the queue cannot grow without bound.
@@ -694,10 +697,10 @@ impl Composer {
     }
 
     /// Runs the frame clock and the present thread on threads of `threads` until [`Composer::stop`]. The present thread delivers the core's calls into libgui, whose SurfaceControl callbacks call into Java:
-    /// it must be one the VM knows ([`ThreadHost`]).
+    /// it must be one the VM knows ([`VmHost`]).
     pub fn start(
         self: &Arc<Self>,
-        threads: &dyn ThreadHost,
+        threads: &dyn VmHost,
         presenter: Presenter,
     ) -> std::io::Result<()> {
         let sink = match presenter {

@@ -13,6 +13,7 @@
 //! Stage `suspended` (window lifecycle S0): the probe sends the maximized control and the suspended state through the proxy; the platform layer must log each as the toplevel's state ([`suspended::checks`]).
 //! Stage `portrait` (window bounds, slice 3): the portrait fixture in UI mode; its readback and every layout are [`portrait_expected`], AOSP's size for a portrait app on the gate's landscape output.
 //! Stage `app-id`: UI mode; the last `xdg_toplevel.set_app_id` the window sends before its first commit (the initial one, no buffer) is `atl.<package>` ([`app_id_check`]), read by the proxy ([`crate::wayland_proxy::Event::AppId`], [`crate::wayland_proxy::Event::FirstCommit`]).
+//! Stage `title`: UI mode; the window's `xdg_toplevel.set_title`s ([`crate::wayland_proxy::Event::Title`]) hold the fixture's label (recents' fallback), then end at the TaskDescription label the fixture sets after its first draw ([`title_check`]).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -184,6 +185,8 @@ enum Stage {
     Portrait,
     /// UI mode: the last `xdg_toplevel.set_app_id` the window sends before its first commit is `atl.<package>` ([`app_id_check`]).
     AppId,
+    /// UI mode: the window's `xdg_toplevel.set_title`s are the task's label as recents shows it, then the TaskDescription label the fixture sets ([`title_check`]).
+    Title,
     /// UI mode, the gtk fixture: the display capture through the harness route (atld `capture`, atl-screencap) is the quadrants at the opening size, and a caller that is not the shell or system is refused with SECURITY (xtask-harness/src/window/capture.rs).
     Capture,
 }
@@ -211,6 +214,7 @@ impl Stage {
             Stage::Suspended => "suspended",
             Stage::Portrait => "portrait",
             Stage::AppId => "app-id",
+            Stage::Title => "title",
             Stage::Capture => "capture",
         }
     }
@@ -226,7 +230,8 @@ impl Stage {
             | Stage::Hwui
             | Stage::Gles2
             | Stage::Portrait
-            | Stage::AppId => GTK_WINDOW_MS,
+            | Stage::AppId
+            | Stage::Title => GTK_WINDOW_MS,
             Stage::Dialog => DIALOG_WINDOW_MS,
             Stage::Capture => capture::CAPTURE_WINDOW_MS,
             Stage::Widgets | Stage::Ime | Stage::MouseTouch => WIDGETS_WINDOW_MS,
@@ -340,6 +345,11 @@ const INPUT_SETTLE: Duration = Duration::from_millis(500);
 const FRAME_CALLBACKS: usize = 31;
 /// The layer name of the fixture's window (Main.java WINDOW_TITLE, set by `Window.setTitle`): the compositor's report names the layer by it.
 const WINDOW_TITLE: &str = "AtlWindowFixture";
+/// The title stage's labels: the fixture manifest's `<application android:label>` (its activity has none, so ActivityInfo.loadLabel falls back to it), and Main.java TASK_LABEL with the line logged
+/// once it is set.
+const FIXTURE_LABEL: &str = "ATL window test";
+const TASK_LABEL: &str = "ATL task description";
+const TASK_LINE: &str = "AtlWindow: task description set";
 /// The mean interval may differ from the display period by this share: the callbacks run on the app's main thread, which the vsync timer does not wait for.
 const CADENCE_TOLERANCE: f64 = 0.10;
 /// No single interval may exceed this many periods: a missed vsync shows as two.
@@ -373,6 +383,7 @@ fn marker(stage: Stage) -> &'static str {
         | Stage::Capture
         | Stage::Portrait
         | Stage::AppId
+        | Stage::Title
         | Stage::Hwui
         | Stage::Widgets
         | Stage::Ime
@@ -806,6 +817,28 @@ fn app_id_check(
     }
 }
 
+/// Stage `title` sub-gate: the window's titles, in order, hold `label` (recents' fallback: the root activity's label as PackageManager loads it), then `task_label` after it, and end at `task_label`
+/// (the fixture's setTaskDescription retitled it). A title from the window's LayoutParams (Main.java WINDOW_TITLE) never matches either.
+fn title_check(
+    titles: &[String],
+    label: &str,
+    task_label: &str,
+    liveness: &Result<Liveness, String>,
+) -> Result<String, String> {
+    liveness.as_ref().map_err(Clone::clone)?;
+    let Some(first) = titles.iter().position(|t| t == label) else {
+        return Err(format!("no title {label:?} (titles {titles:?})"));
+    };
+    if !titles[first..].iter().any(|t| t == task_label)
+        || titles.last().map(String::as_str) != Some(task_label)
+    {
+        return Err(format!(
+            "titles {titles:?}: want {task_label:?} after {label:?} and last"
+        ));
+    }
+    Ok(format!("titles {titles:?}"))
+}
+
 /// Stops the app processes atld started, before atld is killed: an app whose atld dies under it aborts on its binder calls (DEAD_OBJECT, ~5 s after onResume). SIGTERM, then up to STOP_WAIT for them to exit.
 pub(crate) fn stop_apps(atld: u32) {
     let apps = app_pids(atld);
@@ -1043,6 +1076,28 @@ fn drive_app_id(
         }
     }
     *seen.lock().map_err(|e| e.to_string())? = split;
+    Ok(Liveness::default())
+}
+
+/// The title stage's probe, from the proxy's side: once the fixture logged its setTaskDescription ([`TASK_LINE`]), and a settle for the retitle to reach the window, the titles it sent go to `seen`.
+fn drive_title(
+    proxy: Proxy,
+    app_log: &Path,
+    seen: &Mutex<Vec<String>>,
+) -> Result<Liveness, String> {
+    wait_for_line(app_log, TASK_LINE, ACK_WAIT)
+        .then_some(())
+        .ok_or("the fixture never set its task description")?;
+    std::thread::sleep(RESIZE_SETTLE);
+    let titles = proxy
+        .events
+        .try_iter()
+        .filter_map(|(_, event)| match event {
+            ProxyEvent::Title { title } => Some(title),
+            _ => None,
+        })
+        .collect();
+    *seen.lock().map_err(|e| e.to_string())? = titles;
     Ok(Liveness::default())
 }
 
@@ -1795,6 +1850,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         | Stage::Capture
         | Stage::Portrait
         | Stage::AppId
+        | Stage::Title
         | Stage::Hwui
         | Stage::Widgets
         | Stage::Ime
@@ -1978,6 +2034,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let break_suspended = args.break_suspended;
     // the app-id stage's probe leaves the window's app ids here; the sub-gates read them once the probe is joined
     let app_ids: Arc<Mutex<AppIdsSeen>> = Arc::default();
+    // the title stage's probe leaves the window's titles here, in order
+    let titles: Arc<Mutex<Vec<String>>> = Arc::default();
     // the probe records its pictures (and the capture stage's refused caller) in `captured`; the sub-gates read them once the probe is joined
     let captured: Arc<Mutex<capture::Seen>> = Arc::default();
     let capture_probe = takes_pictures(args.stage).then(|| capture::Probe {
@@ -1991,6 +2049,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let log = run.log(&m.name);
         let services_log = run.log("services");
         let seen = Arc::clone(&app_ids);
+        let titles_seen = Arc::clone(&titles);
         let fake_ime = fake_ime.take();
         let relaunch = (run.root.clone(), format!("{}/{activity}", m.name));
         std::thread::spawn(move || match (stage, outputs, fake_ime) {
@@ -2033,6 +2092,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 }
             }
             (Stage::AppId, _, _) => drive_app_id(p, &log, &seen),
+            (Stage::Title, _, _) => drive_title(p, &log, &titles_seen),
             (Stage::Suspended, _, _) => suspended::drive(p, &log, break_suspended),
             (Stage::Move, Some(outputs), _) => move_output::drive(p, &log, outputs),
             _ => drive(p, &log),
@@ -2178,6 +2238,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             vec![(
                 "app-id",
                 app_id_check(&seen, &format!("atl.{}", m.name), &liveness),
+            )]
+        }
+        (Stage::Title, Some(_)) => {
+            let seen = titles.lock().map(|seen| seen.clone()).unwrap_or_default();
+            vec![(
+                "title",
+                title_check(&seen, FIXTURE_LABEL, TASK_LABEL, &liveness),
             )]
         }
         (Stage::Capture, Some(_)) => capture::checks(&captured, opening_size(display), &liveness),
@@ -2397,6 +2464,28 @@ mod tests {
     }
 
     /// The app id is the last `set_app_id` sent before the first commit: GTK's default before it does not count, an id sent after the first commit is too late (the old path: set after `present`, one commit late), a missing prefix fails, and no commit, no id or a dead probe fails.
+    /// The label, then the task label, last: pass. The LayoutParams title (the old path), no task label, a task label not last, or the task label alone fails.
+    #[test]
+    fn title_check_wants_the_label_then_the_task_label() {
+        let ok = Ok(Liveness::default());
+        let t = |titles: &[&str]| titles.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let check = |titles: &[&str]| title_check(&t(titles), FIXTURE_LABEL, TASK_LABEL, &ok);
+        assert!(check(&["com.example.atlwindow", FIXTURE_LABEL, TASK_LABEL]).is_ok());
+        assert!(check(&[WINDOW_TITLE]).is_err());
+        assert!(check(&["com.example.atlwindow", FIXTURE_LABEL]).is_err());
+        assert!(check(&[FIXTURE_LABEL, TASK_LABEL, WINDOW_TITLE]).is_err());
+        assert!(check(&[TASK_LABEL]).is_err());
+        assert!(
+            title_check(
+                &t(&[FIXTURE_LABEL, TASK_LABEL]),
+                FIXTURE_LABEL,
+                TASK_LABEL,
+                &Err("dead".into())
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn app_id_check_reads_the_last_set_app_id_before_the_first_commit() {
         let ok: Result<Liveness, String> = Ok(Liveness::default());

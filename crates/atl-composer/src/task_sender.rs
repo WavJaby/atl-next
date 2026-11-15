@@ -13,7 +13,7 @@ use atl_services_types::display_model::DisplayModel;
 use binder::binder_impl::IBinderInternal;
 use binder::{SpIBinder, Strong};
 
-use crate::host::ThreadHost;
+use crate::host::VmHost;
 use crate::start::IRegistry;
 
 /// What the sender waits for: the Task the window is (none until the services name it) and the latest values not yet sent.
@@ -49,7 +49,7 @@ pub struct TaskSender {
 
 impl TaskSender {
     /// Starts the sender's thread on `threads`; the handle is what the UI thread submits values to, and what the UI agent names the Task to.
-    pub fn spawn(threads: &dyn ThreadHost) -> std::io::Result<Arc<Self>> {
+    pub fn spawn(threads: &dyn VmHost) -> std::io::Result<Arc<Self>> {
         let sender = Arc::new(TaskSender {
             pending: Mutex::new(Pending::default()),
             wake: Condvar::new(),

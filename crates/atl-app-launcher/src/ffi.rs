@@ -415,6 +415,26 @@ impl VmHandle {
             })
             .map(|_| ())
     }
+
+    /// Runs `f` with a [`Vm`] view of the calling thread's JNIEnv (`GetEnv`), inside a local frame: a native thread such as a binder thread has no Java frame that would free its local
+    /// references. Fails on a thread not attached to the VM. The view's helpers say "the main thread's env"; here it is this thread's, which JNI allows for every call they make.
+    pub fn on_this_thread<T>(self, f: impl FnOnce(&Vm) -> Result<T>) -> Result<T> {
+        let vm = self.raw();
+        let mut env: *mut c_void = core::ptr::null_mut();
+        // SAFETY: the VM's own invoke table, valid for the process's life
+        let get_env = unsafe { (**vm).GetEnv }.context("the VM has no GetEnv")?;
+        // SAFETY: a live VM and a writable out pointer
+        let rc = unsafe { get_env(vm, &mut env, jni::JNI_VERSION_1_6) };
+        ensure!(
+            rc == jni::JNI_OK && !env.is_null(),
+            "thread not attached to the VM (GetEnv {rc})"
+        );
+        let view = Vm {
+            vm,
+            env: env.cast(),
+        };
+        view.frame(|| f(&view))
+    }
 }
 
 const EXIT_FAILURE: i32 = 1;
@@ -1253,6 +1273,78 @@ impl Vm {
         )?;
         let lite = self.parse_result(result, "ApkLiteParseUtils.parseClusterPackageLite")?;
         Ok(Cluster { vm: self, lite })
+    }
+
+    /// What recents shows for a task without a TaskDescription label (Launcher3 TaskIconCache, recall: not in the pinned tree): `ActivityThread.currentApplication().getPackageManager()`
+    /// `.getActivityInfo(new ComponentName(package, class), 0).loadLabel(pm).toString()`. ComponentInfo.loadUnsafeLabel (ComponentInfo.java:124-146): the activity's label, else the application's, else
+    /// the class name, resource labels through pm.getText in the app's configuration (its locale). None before the app is bound (no Application yet).
+    #[cfg(feature = "converter")]
+    pub fn activity_label(&self, package: &str, class: &str) -> Result<Option<String>> {
+        let thread = self.find_class(c"android/app/ActivityThread")?;
+        let current = self.method(
+            thread,
+            c"currentApplication",
+            c"()Landroid/app/Application;",
+            true,
+        )?;
+        let app =
+            self.call_static_object(thread, current, &[], "ActivityThread.currentApplication")?;
+        if app.is_null() {
+            return Ok(None);
+        }
+        let context = self.find_class(c"android/content/Context")?;
+        let get_pm = self.method(
+            context,
+            c"getPackageManager",
+            c"()Landroid/content/pm/PackageManager;",
+            false,
+        )?;
+        let pm = self.call_object(app, get_pm, &[], "Context.getPackageManager")?;
+        let name_class = self.find_class(c"android/content/ComponentName")?;
+        let init = self.method(
+            name_class,
+            c"<init>",
+            c"(Ljava/lang/String;Ljava/lang/String;)V",
+            false,
+        )?;
+        let args = [
+            jni::jvalue {
+                l: self.new_string(package)?,
+            },
+            jni::jvalue {
+                l: self.new_string(class)?,
+            },
+        ];
+        let component = self.new_object(name_class, init, &args, "new ComponentName")?;
+        let pm_class = self.find_class(c"android/content/pm/PackageManager")?;
+        let get_info = self.method(
+            pm_class,
+            c"getActivityInfo",
+            c"(Landroid/content/ComponentName;I)Landroid/content/pm/ActivityInfo;",
+            false,
+        )?;
+        let args = [jni::jvalue { l: component }, jni::jvalue { i: 0 }];
+        let info = self.call_object(pm, get_info, &args, "PackageManager.getActivityInfo")?;
+        let item = self.find_class(c"android/content/pm/PackageItemInfo")?;
+        let load = self.method(
+            item,
+            c"loadLabel",
+            c"(Landroid/content/pm/PackageManager;)Ljava/lang/CharSequence;",
+            false,
+        )?;
+        let label = self.call_object(
+            info,
+            load,
+            &[jni::jvalue { l: pm }],
+            "PackageItemInfo.loadLabel",
+        )?;
+        if label.is_null() {
+            return Ok(None);
+        }
+        let object = self.find_class(c"java/lang/Object")?;
+        let to_string = self.method(object, c"toString", c"()Ljava/lang/String;", false)?;
+        let text = self.call_object(label, to_string, &[], "CharSequence.toString")?;
+        self.string(text)
     }
 
     /// The VM, for threads other than this one.
