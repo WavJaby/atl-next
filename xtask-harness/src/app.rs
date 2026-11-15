@@ -283,8 +283,15 @@ const WEBVIEW_PROVIDER: &str = "app/webview/webview.apk";
 /// unbind: unbindService from onServiceConnected reaches AtlBound.onUnbind with the bound Intent (action atl.test.BIND): the last connection left (removeConnectionLocked -> scheduleUnbindService).
 /// jobrun: Main.jobRun's job 9 runs (onStartJob) and drains its one work item: action atl.test.WORK, delivery count 1 (JobStatus.dequeueWorkLocked bumps it from 0 on its first delivery),
 /// completeWork accepted (JobParameters.completeWork throws when the item is not executing), then dequeueWork answers null (the last work dequeued finishes the job).
-const ASYNC_LINES: [(&str, &str, &str); 4] = [
+/// bindmissing: Main.bindMissing binds to the absent com.android.vending (implicit with package, then explicit): bindServiceLocked answers 0 for both (no ServiceRecord, no callback),
+/// and unbindService right after finds the dispatcher ContextImpl.bindServiceCommon registered before the AM call (LoadedApk.forgetServiceDispatcher does not throw).
+const ASYNC_LINES: [(&str, &str, &str); 5] = [
     ("bindservice", "AtlTest: bindservice: ", "bindService=true"),
+    (
+        "bindmissing",
+        "AtlTest: bindmissing: ",
+        "bindService=false explicit=false unbind=ok called=false",
+    ),
     (
         "bound",
         "AtlTest: bound: ",

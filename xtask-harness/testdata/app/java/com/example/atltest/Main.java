@@ -144,6 +144,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "jobscheduler: " + jobs());
         jobRun();
         Log.i("AtlTest", "bindservice: " + bound());
+        bindMissing();
         Log.i("AtlTest", "pendingintent: " + pendingIntent());
         Log.i("AtlTest", "processes: " + processes());
         Log.i("AtlTest", "settings: " + settings());
@@ -463,6 +464,49 @@ public class Main extends Activity {
         } catch (Throwable t) {
             return "threw " + t;
         }
+    }
+
+    /** bindService to the absent com.android.vending (Play billing's implicit-with-package Intent, then explicit), unbindService at once: AOSP answers false (bindServiceLocked found nothing: 0),
+     * never calls the connection, and unbind finds the dispatcher bindServiceCommon registered before asking ActivityManager. Logged from a main-thread post so a queued callback is seen. */
+    private void bindMissing() {
+        final boolean[] called = {false};
+        String r;
+        try {
+            android.content.ServiceConnection[] conns = new android.content.ServiceConnection[2];
+            for (int i = 0; i < conns.length; i++) {
+                conns[i] = new android.content.ServiceConnection() {
+                    @Override
+                    public void onServiceConnected(android.content.ComponentName name, android.os.IBinder service) {
+                        called[0] = true;
+                    }
+
+                    @Override
+                    public void onServiceDisconnected(android.content.ComponentName name) {
+                        called[0] = true;
+                    }
+
+                    @Override
+                    public void onNullBinding(android.content.ComponentName name) {
+                        called[0] = true;
+                    }
+                };
+            }
+            r = "bindService=" + bindService(new Intent("com.android.vending.billing.InAppBillingService.BIND").setPackage("com.android.vending"), conns[0], BIND_AUTO_CREATE);
+            r += " explicit=" + bindService(new Intent().setClassName("com.android.vending", "com.android.vending.billing.InAppBillingService"), conns[1], BIND_AUTO_CREATE);
+            for (android.content.ServiceConnection c : conns) {
+                unbindService(c);
+            }
+            r += " unbind=ok";
+        } catch (Throwable t) {
+            r = "threw " + t;
+        }
+        final String line = r;
+        new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+            @Override
+            public void run() {
+                Log.i("AtlTest", "bindmissing: " + line + " called=" + called[0]);
+            }
+        });
     }
 
     private String jobs() {
