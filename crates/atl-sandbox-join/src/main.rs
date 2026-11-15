@@ -9,12 +9,13 @@
 //! - user before pid: pidns_install also checks the caller's own user namespace; `bwrap --userns --pidns` joins in the other order and fails.
 //! - a child, not exec: setns(pid) moves only future children (pid_for_children), and that process may not create a pid namespace itself (copy_pid_ns: EINVAL), which bwrap does.
 //! - the mount namespace: bwrap reads `/proc/<its pid>`, which only the app's procfs numbers right; bwrap then builds the new sandbox from the app's view, so it can show nothing the app cannot see.
+//!
 //! Single-threaded on purpose: setns(CLONE_NEWUSER) refuses a multithreaded caller, the reason this is a process and not code in atld.
 //! Rights held here (full capabilities over the app's namespaces, as uid 0 of the owner) end at PROGRAM's exec: bwrap drops them for its sandbox.
 
 use std::ffi::OsString;
 use std::os::fd::{AsFd, FromRawFd, OwnedFd};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 
 use rustix::io::{FdFlags, fcntl_setfd};
 use rustix::thread::{LinkNameSpaceType, move_into_link_name_space};
@@ -90,7 +91,7 @@ fn run(j: Join) -> Result<ExitCode, String> {
         clippy::disallowed_types,
         reason = "the broker's own stage: runs the bwrap command the broker built, in the namespaces just joined"
     )]
-    let status = Command::new(&j.program)
+    let status = std::process::Command::new(&j.program)
         .args(&j.args)
         .status()
         .map_err(|e| format!("starting {}: {e}", j.program.to_string_lossy()))?;
@@ -131,8 +132,16 @@ mod tests {
 
     #[test]
     fn parses_fds_and_program() {
-        let j = parse(args(&["--pidns", "5", "--mntns", "6", "--", "/usr/bin/bwrap", "--x"]))
-            .expect("parse");
+        let j = parse(args(&[
+            "--pidns",
+            "5",
+            "--mntns",
+            "6",
+            "--",
+            "/usr/bin/bwrap",
+            "--x",
+        ]))
+        .expect("parse");
         assert_eq!((j.pidns, j.mntns), (5, 6));
         assert_eq!(j.program, "/usr/bin/bwrap");
         assert_eq!(j.args, vec![OsString::from("--x")]);

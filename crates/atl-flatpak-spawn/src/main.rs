@@ -141,7 +141,7 @@ mod tests {
     fn parses_webkits_line() {
         let (fwd, req) = parse(&line(
             "--forward-fd=15 --expose-pids --watch-bus --sandbox --directory=/ --no-network --sandbox-flag=share-gpu --sandbox-flag=allow-dbus \
-             --sandbox-expose-path-ro=/data/x --sandbox-expose-path=/data/y --env=A=b=c /usr/lib/webkitgtk-6.0/WebKitWebProcess 7 15",
+             --sandbox-expose-path-ro=/var/x --sandbox-expose-path=/var/y --env=A=b=c /usr/lib/webkitgtk-6.0/WebKitWebProcess 7 15",
         ))
         .expect("parse");
         assert_eq!(fwd, Some(15));
@@ -152,12 +152,12 @@ mod tests {
             req.expose,
             vec![
                 Expose {
-                    path: "/data/x".into(),
+                    path: "/var/x".into(),
                     writable: false,
                     must_exist: true
                 },
                 Expose {
-                    path: "/data/y".into(),
+                    path: "/var/y".into(),
                     writable: true,
                     must_exist: true
                 }

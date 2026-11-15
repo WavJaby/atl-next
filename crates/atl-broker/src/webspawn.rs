@@ -174,7 +174,11 @@ pub fn check(
         [id, fd] if id.parse::<u64>().is_ok() && *fd == req.forward_fd.to_string() => id.clone(),
         _ => return Err(refuse("args", format!("{:?}", req.args))),
     };
-    if let Some(f) = req.flags.iter().find(|f| !SANDBOX_FLAGS.contains(&f.as_str())) {
+    if let Some(f) = req
+        .flags
+        .iter()
+        .find(|f| !SANDBOX_FLAGS.contains(&f.as_str()))
+    {
         return Err(refuse("flag", f.clone()));
     }
     let mut expose = Vec::new();
@@ -350,8 +354,8 @@ mod tests {
             uid: 10_123,
             devices: vec![PathBuf::from("/dev/dri")],
             writable: vec![Mount {
-                host: PathBuf::from("/host/data/data/com.example"),
-                at: PathBuf::from("/data/data/com.example"),
+                host: PathBuf::from("/host/appdata/com.example"),
+                at: PathBuf::from("/var/appdata/com.example"),
                 writable: true,
             }],
         }
@@ -365,7 +369,7 @@ mod tests {
             forward_fd: 15,
             env: vec![
                 ("HOME".into(), "/tmp".into()),
-                ("LD_LIBRARY_PATH".into(), "/system/lib64".into()),
+                ("LD_LIBRARY_PATH".into(), "/opt/lib64".into()),
                 (FD_ENV.into(), "9".into()),
             ],
             directory: "/".into(),
@@ -403,7 +407,7 @@ mod tests {
             "/usr/bin/sh",
             "/usr/lib/x86_64-linux-gnu/webkitgtk-6.0/WebKitNetworkProcess",
             "/usr/lib/x86_64-linux-gnu/webkitgtk-6.0/WebKitGPUProcess",
-            "/data/data/com.example/webkitgtk-6.0/WebKitWebProcess",
+            "/var/appdata/com.example/webkitgtk-6.0/WebKitWebProcess",
             "/tmp/webkitgtk-6.0/WebKitWebProcess",
             "/usr/lib/../../data/data/com.example/webkitgtk-6.0/WebKitWebProcess",
             "usr/lib/webkitgtk-6.0/WebKitWebProcess",
@@ -441,7 +445,7 @@ mod tests {
             ),
             (
                 Request {
-                    directory: "/data".into(),
+                    directory: "/var".into(),
                     ..web()
                 },
                 "directory",
@@ -455,7 +459,11 @@ mod tests {
             ),
             (
                 Request {
-                    args: vec!["7".into(), "15".into(), "--configure-jsc-for-testing".into()],
+                    args: vec![
+                        "7".into(),
+                        "15".into(),
+                        "--configure-jsc-for-testing".into(),
+                    ],
                     ..web()
                 },
                 "args",
@@ -491,25 +499,25 @@ mod tests {
             }],
             ..web()
         };
-        let plan = fs_check(&with("/data/data/com.example/cache/gst", true)).expect("inside");
+        let plan = fs_check(&with("/var/appdata/com.example/cache/gst", true)).expect("inside");
         assert_eq!(
             plan.expose,
             vec![Mount {
-                host: "/data/data/com.example/cache/gst".into(),
-                at: "/data/data/com.example/cache/gst".into(),
+                host: "/var/appdata/com.example/cache/gst".into(),
+                at: "/var/appdata/com.example/cache/gst".into(),
                 writable: true
             }]
         );
         assert!(
-            fs_check(&with("/data/data/com.example/missing", false))
+            fs_check(&with("/var/appdata/com.example/missing", false))
                 .expect("try")
                 .expose
                 .is_empty()
         );
         for (p, what) in [
-            ("/data/data/com.example/missing", "expose-missing"),
-            ("/data/data/com.other", "expose"),
-            ("/data/data/com.example/../com.other", "expose"),
+            ("/var/appdata/com.example/missing", "expose-missing"),
+            ("/var/appdata/com.other", "expose"),
+            ("/var/appdata/com.example/../com.other", "expose"),
             ("/usr", "expose"),
             ("/tmp", "expose"),
             ("data/data/com.example", "expose"),
@@ -565,12 +573,7 @@ mod tests {
         send_request(
             &shim,
             &req,
-            [
-                sock.as_fd(),
-                reply_theirs.as_fd(),
-                out.as_fd(),
-                err.as_fd(),
-            ],
+            [sock.as_fd(), reply_theirs.as_fd(), out.as_fd(), err.as_fd()],
         )
         .expect("send");
         drop(reply_theirs);

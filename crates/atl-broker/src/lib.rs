@@ -924,7 +924,12 @@ impl Broker {
         let view = webspawn::AppView {
             uid: spawn.uid,
             devices: spawn.devices.clone(),
-            writable: spawn.mounts.iter().filter(|m| m.writable).cloned().collect(),
+            writable: spawn
+                .mounts
+                .iter()
+                .filter(|m| m.writable)
+                .cloned()
+                .collect(),
         };
         let Process { child, host_pid } = launch(
             Launch {
@@ -1066,7 +1071,10 @@ impl WebSpawner {
         ];
         let mut inherit: Vec<OwnedFd> = vec![socket, info_w.into(), pidns, mntns, info];
         inherit.extend(seccomp);
-        let Process { mut child, host_pid } = launch(
+        let Process {
+            mut child,
+            host_pid,
+        } = launch(
             Launch {
                 via: Some(via),
                 bwrap_args,
@@ -1304,7 +1312,10 @@ fn registration_error(host_pid: i32, e: impl Into<io::Error>) -> io::Error {
 
 /// An empty `/.flatpak-info` ([`webspawn::FLATPAK_INFO`]) from a memfd, spliced before the `--` closing `bwrap_args` and granted read-only; the memfd is the caller's to inherit.
 /// Each sandbox gets its own: a web sandbox cannot bind the app's copy (bwrap's data file lives on a tmpfs detached with its old root: the bind fails ENOENT, measured).
-fn flatpak_info(bwrap_args: &mut Vec<OsString>, grants: &mut Vec<(Access, PathBuf)>) -> io::Result<OwnedFd> {
+fn flatpak_info(
+    bwrap_args: &mut Vec<OsString>,
+    grants: &mut Vec<(Access, PathBuf)>,
+) -> io::Result<OwnedFd> {
     let info = memfd_create("atl-flatpak-info", MemfdFlags::CLOEXEC)?;
     let mut data = bwrap::Args::new();
     data.ro_bind_data(info.as_raw_fd(), webspawn::FLATPAK_INFO);
