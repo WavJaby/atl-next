@@ -587,8 +587,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 println!("native: package {} -> {}", built.package, bin.display());
             }
         }
-        // the JDK of the host row runs on the build machine only when they are one arch, as for the packages above
-        if cross.is_none() {
+        // the build machine's JDK and d8 (host_art.rs java_tools) compile it for any host; a foreign guest graph has no framework of its own
+        if !foreign {
             match crate::host_art::build_api_impl(root, &out)? {
                 Some(dex) => println!("native: api-impl -> {}", dex.display()),
                 None => {
