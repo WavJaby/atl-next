@@ -129,6 +129,11 @@ pub fn cargo_target(root: &Path, arch: &str) -> Result<CargoTarget> {
         (cc_key("CXXSTDLIB", &host.rust), "c++".to_owned()),
     ];
     let mut cc_env = cc_env;
+    // bindgen's libclang (libspa-sys, ...) parses the target's headers: without the sysroot it reads the build machine's /usr/include and misses the target's bits/ headers (bindgen `BINDGEN_EXTRA_CLANG_ARGS_<triple>`)
+    cc_env.push((
+        cc_key("BINDGEN_EXTRA_CLANG_ARGS", &host.rust),
+        format!("--target={clang} --sysroot={}", sysroot.display()),
+    ));
     // the pkg-config crate's per-target keys (pkg-config-rs `targeted_env_var`): a set sysroot allows the cross query
     for (k, v) in pkg_config_env(&sysroot, clang) {
         cc_env.push((cc_key(k, &host.rust), v));
