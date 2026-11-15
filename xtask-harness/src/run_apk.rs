@@ -521,7 +521,6 @@ fn runtime(
     .with_gralloc(root)?
     .with_gl_driver(root)?
     .with_native_bridge_guest(&args.host)?
-    .with_settings_provider()?
     .with_ui("gtk");
     let foreign = foreign_abi(rt.abis(), &args.host, files)?;
     let rt = match &foreign {

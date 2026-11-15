@@ -148,6 +148,19 @@ pub(crate) fn platform_rows(out: &Path, aosp: &Path) -> Result<Vec<(PathBuf, Str
     Ok(rows)
 }
 
+/// The converter's AOSP SettingsProvider at its Soong install path, as a device's /system always has it: the system scan finds it (priv-app: privileged) and the `settings` authority is served by its
+/// own process, started at the first getContentProvider. Every [`Runtime`] places it (PhoneWindow's constructor reads Settings.Global, so any Activity needs it); not in [`platform_rows`], whose
+/// native-load layout reads no APK.
+fn settings_provider_row(out: &Path) -> Result<(PathBuf, String)> {
+    let built = out.join("partitions").join(SETTINGS_PROVIDER);
+    ensure!(
+        built.is_file(),
+        "missing input {} (xtask native builds goal SettingsProvider)",
+        built.display()
+    );
+    Ok((built, format!("/{SETTINGS_PROVIDER}")))
+}
+
 /// The namespace script of [`Runtime::atld_command`]: `$0` fake `/sys/bus`, `$1` fake udev database, `$2` a directory for the host's `/dev`, then `name host` pairs (char devices), `--`, atld's command.
 /// `/dev` is rebuilt, not bound over: a mount point cannot be made in the host's devtmpfs from a user namespace, so a tmpfs takes `/dev`'s place and every host entry is bound back into it.
 const FAKE_KERNEL: &str = r#"set -eu
@@ -680,7 +693,8 @@ impl Runtime {
         let fonts =
             crate::test_fonts::stage(&layout, &out.join("fonts"), crate::test_fonts::ROBOTO.2)?;
         let keychars = tree::keyboards(&layout);
-        let platform_files = platform_rows(&out, &layout.src().join("aosp"))?;
+        let mut platform_files = platform_rows(&out, &layout.src().join("aosp"))?;
+        platform_files.push(settings_provider_row(&out)?);
         for (file, _) in tree::KEYBOARD_FILES {
             let path = keychars.join(file);
             ensure!(path.is_file(), "missing input {}", path.display());
@@ -905,13 +919,11 @@ impl Runtime {
         Ok(self)
     }
 
-    /// Places the converter's AOSP SettingsProvider (`<out>/partitions/system/priv-app/SettingsProvider/SettingsProvider.apk`, Soong's install path) at the same /system path, where the system scan finds
-    /// it (priv-app: privileged); the `settings` authority is then served by its own process, started at the first getContentProvider. Placed by the run until the product's runtime ships it.
-    pub fn with_settings_provider(self) -> Result<Self> {
-        let built = self.out.join("partitions").join(SETTINGS_PROVIDER);
-        ensure!(built.is_file(), "missing input {}", built.display());
+    /// The settings provider break (`test app --settings-provider-break`): the run places no SettingsProvider ([`settings_provider_row`]), so no package declares the `settings` authority.
+    pub fn without_settings_provider(mut self) -> Self {
         let at = format!("/{SETTINGS_PROVIDER}");
-        Ok(self.with_fixture_file(built, &at))
+        self.platform_files.retain(|(_, a)| *a != at);
+        self
     }
 
     /// Places a gate's fixture file `host` at `at` (a /system or /vendor path) in every app sandbox.

@@ -1380,9 +1380,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         rt.with_fixture_file(built, &at)
     };
     let rt = if args.settings_provider_break {
-        rt
+        rt.without_settings_provider()
     } else {
-        rt.with_settings_provider()?
+        rt
     };
     let rt = if args.webview_engine_break {
         rt.without_webview_engine()?

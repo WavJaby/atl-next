@@ -129,11 +129,12 @@ pub const NB_GUEST_LIBS: [&str; 23] = [
 /// (ParsingPackageUtils.getSigningDetails) and refuses an unsigned APK. Every gate that builds an APK through ApkTools (atld runs, binder's and the installer's fixtures, gles2-fixture) reads it.
 pub const APK_SIGNER: &str = "apksigner";
 
-/// What every atld run (atld_run `Runtime`) reads: ART and its boot jars' JNI libraries, servicemanager, framework-res, the converter crates the service packages link (packages.rs), and the Codec2 store's libraries (codec2_store.rs: its constructor dlopens each one in every app process that decodes).
+/// What every atld run (atld_run `Runtime`) reads: ART and its boot jars' JNI libraries, servicemanager, framework-res, AOSP's SettingsProvider (placed in /system/priv-app by every run), the converter crates the service packages link (packages.rs), and the Codec2 store's libraries (codec2_store.rs: its constructor dlopens each one in every app process that decodes).
 pub fn runtime() -> Goals {
     Goals::host(&[
         "servicemanager",
         "framework-res",
+        "SettingsProvider",
         "platform-bootclasspath",
         // the APEX jars' JNI libraries (libframework-connectivity-tiramisu-jni: TrafficStats' static init aborts ZygoteInit without it)
         "platform-bootclasspath-jni",
@@ -181,7 +182,7 @@ pub fn nb_guest() -> Goals {
 }
 
 /// `xtask test app` (and run-apk, audio-app, drive): atl-audio-bridge (the server's mixer, game audio A2) links AudioMixerBase's library and the utilities its gain conversion uses; the launcher builds it in every app run.
-/// `webview`: the WebView provider package (repo `java/webview-provider`), which the app gate places in /product. `SettingsProvider`: AOSP's settings provider package, placed in /system/priv-app.
+/// `webview`: the WebView provider package (repo `java/webview-provider`), which the app gate places in /product.
 fn app() -> Goals {
     runtime()
         .with(gralloc())
@@ -190,7 +191,6 @@ fn app() -> Goals {
             "libaudioprocessing_base",
             "libaudioutils",
             "webview",
-            "SettingsProvider",
         ]))
 }
 
