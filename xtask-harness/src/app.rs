@@ -379,14 +379,20 @@ const WEBVIEW_PAGE: (&str, &str) = (
 
 /// Lines the fixture logs after onCreate, from binder callbacks: (row, line prefix, expected value). The watch waits for all of them (up to RESULT_WAIT).
 /// bindservice: Main.bound's bindService(AtlBound, BIND_AUTO_CREATE) answers true (bindServiceLocked found the service: code 1).
+/// bindimplicit: Main.bindImplicit's bindService(Intent atl.test.BIND, setPackage) answers true and connects to AtlBound: the implicit Intent resolves as retrieveServiceLocked resolves it (queryIntentServices, first match).
 /// bound: its onServiceConnected names AtlBound and the binder it got is AtlBound's (FIRST_CALL_TRANSACTION answers AtlBound.ANSWER, 42).
 /// unbind: unbindService from onServiceConnected reaches AtlBound.onUnbind with the bound Intent (action atl.test.BIND): the last connection left (removeConnectionLocked -> scheduleUnbindService).
 /// jobrun: Main.jobRun's job 9 runs (onStartJob) and drains its one work item: action atl.test.WORK, delivery count 1 (JobStatus.dequeueWorkLocked bumps it from 0 on its first delivery),
 /// completeWork accepted (JobParameters.completeWork throws when the item is not executing), then dequeueWork answers null (the last work dequeued finishes the job).
 /// bindmissing: Main.bindMissing binds to the absent com.android.vending (implicit with package, then explicit): bindServiceLocked answers 0 for both (no ServiceRecord, no callback),
 /// and unbindService right after finds the dispatcher ContextImpl.bindServiceCommon registered before the AM call (LoadedApk.forgetServiceDispatcher does not throw).
-const ASYNC_LINES: [(&str, &str, &str); 5] = [
+const ASYNC_LINES: [(&str, &str, &str); 6] = [
     ("bindservice", "AtlTest: bindservice: ", "bindService=true"),
+    (
+        "bindimplicit",
+        "AtlTest: bindimplicit: ",
+        "bindService=true connected=com.example.atltest.AtlBound",
+    ),
     (
         "bindmissing",
         "AtlTest: bindmissing: ",

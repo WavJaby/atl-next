@@ -4,7 +4,7 @@
 //! publishService, unbindService, unbindFinished, and the sender of the calls bound_services.rs returns. The rules themselves are bound_services.rs.
 //! Calls leave on one thread in the order the state lock produced them (broadcast_queue.rs's reason: no call out of the system process with the lock held; in-process connections, the job runner's,
 //! run their `connected` there too, so they may call back into the services).
-//! Not modelled: implicit service Intents (a component-less Intent answers 0, counted: ActiveServices.retrieveServiceLocked's resolveService over PackageManager.queryIntentServices is not wired here), instanceName (ignored, counted), bindings across users.
+//! Implicit service Intents resolve as retrieveServiceLocked's resolveService does (resolve_implicit: the first of package::query_intent_services, STOCK_PM_FLAGS); no match answers 0, counted. Not modelled: AOSP's MATCH_DEBUG_TRIAGED_MISSING (ActiveServices.java:4877), instanceName (ignored, counted), bindings across users.
 
 use std::sync::Mutex;
 use std::sync::mpsc::{self, Sender};
@@ -14,6 +14,7 @@ use atl_aidl::aidl::android::app::IServiceConnection::IServiceConnection;
 use atl_parcelables::android::content::pm::ServiceInfo;
 use atl_parcelables::android::content::res::CompatibilityInfo;
 use atl_parcelables::android::content::{ComponentName, Intent};
+use atl_parcelables::codecs::android::content::pm::ResolveInfo::Resolved;
 use binder::{SpIBinder, Strong};
 
 use super::{AM, Inner, State, intent_key, log};
@@ -187,7 +188,30 @@ impl Inner {
         perm.is_none_or(|p| self.holds(caller_uid, p))
     }
 
+    /// retrieveServiceLocked's resolveService for an implicit Intent (no component): the first of queryIntentServices (resolveServiceInternal:453, highest priority), STOCK_PM_FLAGS
+    /// (no MATCH_DEFAULT_ONLY), as the system user. `resolvedType` is the Intent's own type: bindServiceInstance gets the caller's but does not pass it down (intent_key falls back to the Intent's type).
+    fn resolve_implicit(&self, caller_uid: u32, intent: &Intent) -> Option<ComponentName> {
+        let first = package::query_intent_services(
+            &self.packages,
+            caller_uid,
+            intent,
+            None,
+            package::STOCK_PM_FLAGS,
+            package::USER_SYSTEM,
+        )
+        .into_iter()
+        .next()?;
+        let Resolved::Service(s) = first.info else {
+            return None;
+        };
+        Some(ComponentName {
+            package: s.component.item.package_name?,
+            class: s.component.item.name?,
+        })
+    }
+
     /// bindServiceLocked under the state lock: lookup, permission, the rules, and the process start the rules ask for (headless, as a broadcast's cold start).
+    /// An implicit Intent resolves first (resolve_implicit); the bound Intent stays the caller's.
     pub(crate) fn bind_service_locked(
         &self,
         st: &mut State,
@@ -201,9 +225,15 @@ impl Inner {
             atl_diag::answered(AM, "bindService: disabled (--no-bind-service)");
             return Bound::NotFound;
         }
-        let Some(c) = &intent.component else {
-            atl_diag::answered(AM, "bindService: implicit Intent (not resolved)");
-            return Bound::NotFound;
+        let c = match &intent.component {
+            Some(c) => c.clone(),
+            None => {
+                let Some(c) = self.resolve_implicit(caller_uid, intent) else {
+                    atl_diag::answered(AM, "bindService: implicit Intent matched no <service>");
+                    return Bound::NotFound;
+                };
+                c
+            }
         };
         let Some(p) = self.packages.by_name(&c.package) else {
             return Bound::NotFound;
@@ -238,7 +268,7 @@ impl Inner {
             .filter(|r| r.broadcasts_attached)
             .and_then(|r| r.attached.as_ref().map(|a| (r.pid, a.thread.clone())));
         let starting = running.is_some();
-        // the bound Intent as the service gets it: the caller's, with its component (ServiceRecord's IntentBindRecord.intent)
+        // the bound Intent as the service gets it: the caller's, unchanged (ServiceRecord's IntentBindRecord.intent); an implicit one keeps no component: retrieveServiceLocked sets it only for BIND_EXTERNAL_SERVICE (ActiveServices.java:4956)
         let mut calls = Vec::new();
         let req = Bind {
             component: (c.package.clone(), c.class.clone()),

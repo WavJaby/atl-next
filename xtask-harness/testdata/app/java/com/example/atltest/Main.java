@@ -220,6 +220,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "queryservices: " + queryServices());
         jobRun();
         Log.i("AtlTest", "bindservice: " + bound());
+        bindImplicit();
         bindMissing();
         Log.i("AtlTest", "pendingintent: " + pendingIntent());
         Log.i("AtlTest", "processes: " + processes());
@@ -540,6 +541,31 @@ public class Main extends Activity {
             return "bindService=" + ok;
         } catch (Throwable t) {
             return "threw " + t;
+        }
+    }
+
+    /** bindService(Intent atl.test.BIND with setPackage: implicit, no component), BIND_AUTO_CREATE: onServiceConnected logs the connected class with bindService's answer, then unbinds (`bindimplicit:`). */
+    private void bindImplicit() {
+        final boolean[] answer = {false};
+        try {
+            Intent intent = new Intent("atl.test.BIND").setPackage(getPackageName());
+            answer[0] = bindService(intent, new android.content.ServiceConnection() {
+                @Override
+                public void onServiceConnected(android.content.ComponentName name, android.os.IBinder service) {
+                    Log.i("AtlTest", "bindimplicit: bindService=" + answer[0] + " connected=" + name.getClassName());
+                    unbindService(this);
+                }
+
+                @Override
+                public void onServiceDisconnected(android.content.ComponentName name) {
+                    Log.i("AtlTest", "bindimplicit-lost: " + name.getClassName());
+                }
+            }, BIND_AUTO_CREATE);
+            if (!answer[0]) {
+                Log.i("AtlTest", "bindimplicit: bindService=false connected=none");
+            }
+        } catch (Throwable t) {
+            Log.i("AtlTest", "bindimplicit: threw " + t);
         }
     }
 

@@ -30,7 +30,7 @@ use atl_services_types::packages::LibraryNode;
 use atl_services_types::permission;
 
 /// The only user (UserHandle.USER_SYSTEM).
-const USER_SYSTEM: i32 = 0;
+pub(crate) const USER_SYSTEM: i32 = 0;
 /// SharedLibraryInfo.TYPE_BUILTIN and VERSION_UNDEFINED (SharedLibraryInfo.java:60, :92).
 const SHARED_LIBRARY_TYPE_BUILTIN: i32 = 0;
 const SHARED_LIBRARY_VERSION_UNDEFINED: i64 = -1;
@@ -173,6 +173,100 @@ fn service_package(r: &ResolveInfo) -> &str {
     }
 }
 
+/// ComputerEngine.queryIntentServicesInternal:649 for `caller`: an Intent naming no component but a selector resolves the selector. An explicit component -> its getServiceInfo (visible package,
+/// declared, enabled or MATCH_DISABLED_COMPONENTS). Otherwise queryIntentServicesInternalBody:731 over every package `caller` may see, or only `intent.package` (AppsFilter as
+/// Packages::visible); each `<service>` `<intent-filter>` that IntentFilter.match accepts (MATCH_DEFAULT_ONLY: only filters with CATEGORY_DEFAULT, IntentResolver.buildResolveList) gives one result
+/// per component (ServiceIntentResolver.allowFilterResult), built as newResult:1661 and sorted by ComponentResolver.RESOLVE_PRIORITY_SORTER. Empty, never null, when nothing matches or the user
+/// does not exist. Not modelled: instant apps (none are installed), SaferIntentUtils enforcement (aconfig-flag / compat-change gated; null actions already match nothing here).
+/// `resolved_type`: the caller's resolvedType; None falls back to the Intent's own type (intent_key).
+pub(crate) fn query_intent_services(
+    packages: &Packages,
+    caller: u32,
+    intent: &Intent,
+    resolved_type: Option<&str>,
+    flags: i64,
+    user: i32,
+) -> Vec<ResolveInfo> {
+    if user != USER_SYSTEM {
+        return Vec::new();
+    }
+    let intent = match (&intent.component, &intent.selector) {
+        (None, Some(selector)) => selector.as_ref(),
+        _ => intent,
+    };
+    if let Some(c) = &intent.component {
+        return packages
+            .visible(caller, &c.package)
+            .and_then(|p| {
+                let mut s = p.service_info(&c.class, flags)?;
+                s.component.application_info = application_info(p, packages, flags);
+                Some(ResolveInfo {
+                    info: Resolved::Service(s),
+                    ..ResolveInfo::default()
+                })
+            })
+            .into_iter()
+            .collect();
+    }
+    let key = intent_key(intent, resolved_type);
+    let default_only = flags & MATCH_DEFAULT_ONLY != 0;
+    let mut found: Vec<(bool, ResolveInfo)> = Vec::new();
+    for p in packages.all() {
+        if intent.package.as_deref().is_some_and(|n| n != p.name())
+            || packages.visible(caller, p.name()).is_none()
+        {
+            continue;
+        }
+        for s in p.services() {
+            let class = s.component.item.name.as_deref().unwrap_or_default();
+            for ii in p.intents(Kind::ServiceIntents, class) {
+                let Some(f) = &ii.intent_filter else { continue };
+                if default_only
+                    && !f
+                        .categories
+                        .iter()
+                        .flatten()
+                        .flatten()
+                        .any(|c| c == CATEGORY_DEFAULT)
+                {
+                    continue;
+                }
+                let Some(m) = broadcast::match_value(&filter_of(f), &key) else {
+                    continue;
+                };
+                let Some(mut si) = p.service_info(class, flags) else {
+                    continue;
+                };
+                si.component.application_info = application_info(p, packages, flags);
+                let system = si.component.application_info.flags & FLAG_SYSTEM != 0;
+                found.push((
+                    ii.has_default,
+                    ResolveInfo {
+                        info: Resolved::Service(si),
+                        filter: (flags & GET_RESOLVED_FILTER != 0).then(|| f.clone()),
+                        priority: f.priority,
+                        r#match: m,
+                        label_res: ii.label_res,
+                        non_localized_label: ii.non_localized_label.clone(),
+                        icon: ii.icon,
+                        system,
+                        ..ResolveInfo::default()
+                    },
+                ));
+                // allowFilterResult: one result per component, its first matching filter
+                break;
+            }
+        }
+    }
+    // RESOLVE_PRIORITY_SORTER: priority, preferredOrder (never set), isDefault, match, system descending, then package name; a stable sort keeps manifest order on ties
+    found.sort_by(|(da, a), (db, b)| {
+        (b.priority, b.preferred_order, *db, b.r#match, b.system)
+            .cmp(&(a.priority, a.preferred_order, *da, a.r#match, a.system))
+            .then_with(|| service_package(a).cmp(service_package(b)))
+    });
+    found.into_iter().map(|(_, r)| r).collect()
+}
+
 /// getActivityInfo after the visibility check: `class` of `p` for `flags`; None for a class `p` does not declare or a disabled one without MATCH_DISABLED_COMPONENTS.
 fn find_activity_info(
     p: &PackageRecord,
@@ -282,11 +376,7 @@ impl PackageManager {
         )
     }
 
-    /// ComputerEngine.queryIntentServicesInternal:649 for `caller`: an Intent naming no component but a selector resolves the selector. An explicit component -> its getServiceInfo (visible package,
-    /// declared, enabled or MATCH_DISABLED_COMPONENTS). Otherwise queryIntentServicesInternalBody:731 over every package `caller` may see, or only `intent.package` (AppsFilter as
-    /// Packages::visible); each `<service>` `<intent-filter>` that IntentFilter.match accepts (MATCH_DEFAULT_ONLY: only filters with CATEGORY_DEFAULT, IntentResolver.buildResolveList) gives one result
-    /// per component (ServiceIntentResolver.allowFilterResult), built as newResult:1661 and sorted by ComponentResolver.RESOLVE_PRIORITY_SORTER. Empty, never null, when nothing matches or the user
-    /// does not exist. Not modelled: instant apps (none are installed), SaferIntentUtils enforcement (aconfig-flag / compat-change gated; null actions already match nothing here).
+    /// IPackageManager.queryIntentServices over the stored packages (query_intent_services).
     fn query_intent_services(
         &self,
         caller: u32,
@@ -295,85 +385,7 @@ impl PackageManager {
         flags: i64,
         user: i32,
     ) -> Vec<ResolveInfo> {
-        if user != USER_SYSTEM {
-            return Vec::new();
-        }
-        let intent = match (&intent.component, &intent.selector) {
-            (None, Some(selector)) => selector.as_ref(),
-            _ => intent,
-        };
-        if let Some(c) = &intent.component {
-            return self
-                .packages
-                .visible(caller, &c.package)
-                .and_then(|p| {
-                    let mut s = p.service_info(&c.class, flags)?;
-                    s.component.application_info = application_info(p, &self.packages, flags);
-                    Some(ResolveInfo {
-                        info: Resolved::Service(s),
-                        ..ResolveInfo::default()
-                    })
-                })
-                .into_iter()
-                .collect();
-        }
-        let key = intent_key(intent, resolved_type);
-        let default_only = flags & MATCH_DEFAULT_ONLY != 0;
-        let mut found: Vec<(bool, ResolveInfo)> = Vec::new();
-        for p in self.packages.all() {
-            if intent.package.as_deref().is_some_and(|n| n != p.name())
-                || self.packages.visible(caller, p.name()).is_none()
-            {
-                continue;
-            }
-            for s in p.services() {
-                let class = s.component.item.name.as_deref().unwrap_or_default();
-                for ii in p.intents(Kind::ServiceIntents, class) {
-                    let Some(f) = &ii.intent_filter else { continue };
-                    if default_only
-                        && !f
-                            .categories
-                            .iter()
-                            .flatten()
-                            .flatten()
-                            .any(|c| c == CATEGORY_DEFAULT)
-                    {
-                        continue;
-                    }
-                    let Some(m) = broadcast::match_value(&filter_of(f), &key) else {
-                        continue;
-                    };
-                    let Some(mut si) = p.service_info(class, flags) else {
-                        continue;
-                    };
-                    si.component.application_info = application_info(p, &self.packages, flags);
-                    let system = si.component.application_info.flags & FLAG_SYSTEM != 0;
-                    found.push((
-                        ii.has_default,
-                        ResolveInfo {
-                            info: Resolved::Service(si),
-                            filter: (flags & GET_RESOLVED_FILTER != 0).then(|| f.clone()),
-                            priority: f.priority,
-                            r#match: m,
-                            label_res: ii.label_res,
-                            non_localized_label: ii.non_localized_label.clone(),
-                            icon: ii.icon,
-                            system,
-                            ..ResolveInfo::default()
-                        },
-                    ));
-                    // allowFilterResult: one result per component, its first matching filter
-                    break;
-                }
-            }
-        }
-        // RESOLVE_PRIORITY_SORTER: priority, preferredOrder (never set), isDefault, match, system descending, then package name; a stable sort keeps manifest order on ties
-        found.sort_by(|(da, a), (db, b)| {
-            (b.priority, b.preferred_order, *db, b.r#match, b.system)
-                .cmp(&(a.priority, a.preferred_order, *da, a.r#match, a.system))
-                .then_with(|| service_package(a).cmp(service_package(b)))
-        });
-        found.into_iter().map(|(_, r)| r).collect()
+        query_intent_services(&self.packages, caller, intent, resolved_type, flags, user)
     }
 
     /// getPackageInfo after the visibility check (PackageInfoCommonUtils.generate over the stored info, cut to `flags`).
@@ -931,6 +943,65 @@ mod tests {
             ..Intent::default()
         };
         assert!(classes(&billing, 0).is_empty());
+    }
+
+    /// Implicit bind (ActiveServices.retrieveServiceLocked -> resolveServiceInternal, STOCK_PM_FLAGS, no MATCH_DEFAULT_ONLY): a filter without CATEGORY_DEFAULT still matches, and the first
+    /// result (query.get(0)) is the highest priority. Match = MATCH_CATEGORY_EMPTY + MATCH_ADJUSTMENT_NORMAL (0x100000 + 0x8000, IntentFilter.java:246-251), action-only filter, data-less Intent.
+    #[test]
+    fn query_intent_services_implicit_bind_matches_without_default_category() {
+        const SYNC: &str = "a.SYNC";
+        let with_priority = |class: &str, priority: i32| {
+            let mut f = filter(&[SYNC], &[]);
+            if let Some(f) = f.intent_filter.as_mut() {
+                f.priority = priority;
+            }
+            crate::installed::ComponentIntents {
+                kind: Kind::ServiceIntents,
+                name: class.to_owned(),
+                intents: vec![f],
+            }
+        };
+        let mut a = record("a");
+        a.info.services = Some(vec![
+            Some(ServiceInfo {
+                component: component("a", "a.Low"),
+                ..ServiceInfo::default()
+            }),
+            Some(ServiceInfo {
+                component: component("a", "a.High"),
+                ..ServiceInfo::default()
+            }),
+        ]);
+        a.intents = vec![with_priority("a.Low", 0), with_priority("a.High", 5)];
+        let packages = Packages::new(vec![a], BTreeMap::new());
+        let implicit = Intent {
+            action: Some(SYNC.to_owned()),
+            ..Intent::default()
+        };
+        let found = query_intent_services(
+            &packages,
+            10_001,
+            &implicit,
+            None,
+            STOCK_PM_FLAGS,
+            USER_SYSTEM,
+        );
+        let names: Vec<(String, i32)> = found
+            .iter()
+            .map(|r| match &r.info {
+                Resolved::Service(s) => {
+                    (s.component.item.name.clone().unwrap_or_default(), r.r#match)
+                }
+                _ => (String::new(), 0),
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("a.High".to_owned(), 0x10_8000),
+                ("a.Low".to_owned(), 0x10_8000)
+            ]
+        );
     }
 
     /// PackageInfoCommonUtils.generate: activities only with GET_ACTIVITIES, disabled ones dropped without MATCH_DISABLED_COMPONENTS.
