@@ -319,10 +319,6 @@ pub fn bwrap_args(
     if let Some(area) = &spawn.property_area {
         a.ro_bind(area, PROPERTY_AREA);
     }
-    if profile == Profile::WebProcess {
-        // the app's own copy (a WebProcess sandbox is built from the app's view), as Flatpak's sub-sandboxes show theirs
-        a.ro_bind(webspawn::FLATPAK_INFO, webspawn::FLATPAK_INFO);
-    }
     // last: a directory mounted after these would shadow the files. The stub is exec'd by bwrap before it restricts itself, the program by the stub after: both read-only.
     // The stub sits at SANDBOX_STUB_AT, which no host mount can cover (its host path lies under build trees that other mounts show).
     a.ro_bind(stub, SANDBOX_STUB_AT);
@@ -895,13 +891,8 @@ impl Broker {
                     SocketFlags::CLOEXEC,
                     None,
                 )?;
-                let info = File::from(memfd_create("atl-flatpak-info", MemfdFlags::CLOEXEC)?);
-                let mut data = bwrap::Args::new();
-                data.ro_bind_data(info.as_raw_fd(), webspawn::FLATPAK_INFO);
-                grants.extend(data.grants().iter().cloned());
-                let at = bwrap_args.len() - 1;
-                bwrap_args.splice(at..at, data.options());
-                Some((broker_end, app_end, OwnedFd::from(info)))
+                let info = flatpak_info(&mut bwrap_args, &mut grants)?;
+                Some((broker_end, app_end, info))
             }
             None => None,
         };
@@ -1048,7 +1039,7 @@ impl WebSpawner {
             .then(|| seccomp_memfd(Profile::WebProcess))
             .transpose()?;
         // the stub as the app's view shows it: its host path is not in that view
-        let (bwrap_args, grants) = bwrap_args(
+        let (mut bwrap_args, mut grants) = bwrap_args(
             &spawn,
             Profile::WebProcess,
             &host_root()?,
@@ -1056,6 +1047,7 @@ impl WebSpawner {
             info_w.as_raw_fd(),
             seccomp.as_ref().map(AsRawFd::as_raw_fd),
         );
+        let info = flatpak_info(&mut bwrap_args, &mut grants)?;
         // no rights: TCP stays handled (refused) by the stub, and the namespace has loopback only
         let mut args = stub_args(&grants, false, &spawn.program);
         args.extend([
@@ -1072,7 +1064,7 @@ impl WebSpawner {
             mntns.as_raw_fd().to_string().into(),
             "--".into(),
         ];
-        let mut inherit: Vec<OwnedFd> = vec![socket, info_w.into(), pidns, mntns];
+        let mut inherit: Vec<OwnedFd> = vec![socket, info_w.into(), pidns, mntns, info];
         inherit.extend(seccomp);
         let Process { mut child, host_pid } = launch(
             Launch {
@@ -1308,6 +1300,18 @@ fn registration_error(host_pid: i32, e: impl Into<io::Error>) -> io::Error {
         )),
         _ => other(format!("registering pid {host_pid} with binderd: {e}")),
     }
+}
+
+/// An empty `/.flatpak-info` ([`webspawn::FLATPAK_INFO`]) from a memfd, spliced before the `--` closing `bwrap_args` and granted read-only; the memfd is the caller's to inherit.
+/// Each sandbox gets its own: a web sandbox cannot bind the app's copy (bwrap's data file lives on a tmpfs detached with its old root: the bind fails ENOENT, measured).
+fn flatpak_info(bwrap_args: &mut Vec<OsString>, grants: &mut Vec<(Access, PathBuf)>) -> io::Result<OwnedFd> {
+    let info = memfd_create("atl-flatpak-info", MemfdFlags::CLOEXEC)?;
+    let mut data = bwrap::Args::new();
+    data.ro_bind_data(info.as_raw_fd(), webspawn::FLATPAK_INFO);
+    grants.extend(data.grants().iter().cloned());
+    let at = bwrap_args.len() - 1;
+    bwrap_args.splice(at..at, data.options());
+    Ok(info)
 }
 
 /// `profile`'s seccomp program in a memfd, rewound: bwrap reads it from `--seccomp`.
