@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MIT
 //! `xtask land <branch>`: puts a task branch on origin/main, with the branch's own patches checked before the push.
 //! Why this order: `src/<up>` is one checkout shared by every worktree and holds origin/main's pins and patches (`fetch::Main`), so a branch's unlanded patches exist only in its task copies (`src-wt/<branch>/<up>`), which only the branch's worktree resolves (`atl-layout`).
-//! Main has no task copies, so `check` run on main sees `src/` alone. That is why the branch is checked in its own worktree before the push, and why its copies go only after main and `src/` reached the new commit.
+//! Main has no task copies, so `check` run on main sees `src/` alone. That is why the branch is checked before the push in a checkout on the branch, and why its copies go only after main and `src/` reached the new commit.
+//! That checkout is the land worktree [`LAND_WT`] (build dir `ws/land`), never the branch's own: one fixed path whose build dir holds the last landed tree, so Build compiles only the branch's diff (cargo outputs key on the checkout path too).
+//! It checks the branch out beside the branch's own worktree (`--ignore-other-worktrees`; land changes neither), so the task copies resolve by branch name as there. Green and pushed -> `ws/land` is published as `base/<commit>`, the copy new build dirs start from.
+//! Failed before the push -> the land worktree goes back to origin/main and `ws/land` is re-copied from the newest base: no failed branch's outputs stay in the dir the next base comes from.
 //! Nothing reaches origin before the push. A task copy is a worktree of `src/` on `atl-patches-<branch>`: it leaves every other worktree's checkout alone.
 //! This process is main's xtask, so it never parses the branch's tables: a branch may change their schema. What they say comes from the branch's own xtask in its worktree (`--facts` child, `patch --edit`, `check`).
 //! Cleanup runs in a child `cargo xtask land <branch> --cleanup --execute` in main: this process's binary predates the sync, so it cannot parse the tables the sync brought in.
@@ -26,11 +29,14 @@ use crate::verdict::{self, Failure, Verdict};
 /// The note a task keeps in its worktree: untracked by design, copied to `out/` when the branch lands.
 const STATE_NOTE: &str = ".state-note.md";
 
+/// The land worktree, workspace-relative; its git worktree name is [`out::LAND_ID`], so its build dir is `ws/land`. Made detached at origin/main by the first land.
+pub const LAND_WT: &str = "wt/land";
+
 #[derive(clap::Args)]
 pub struct Args {
     /// Task branch to land: checked out in a worktree, and a fast-forward of origin/main.
     branch: String,
-    /// Act: check, push, bring the main checkout and `src/` to the new commit, check again, clean up. Without it, prints the steps only.
+    /// Act: build and check in the land worktree, push, bring the main checkout and `src/` to the new commit, publish the land build dir as a base, clean up. Without it, prints the steps only.
     #[arg(long)]
     execute: bool,
     /// Internal: the cleanup stage's child (`cleanup_execute`); runs only the cleanup. Needs `--execute`.
@@ -39,12 +45,9 @@ pub struct Args {
     /// Internal: the preflight's child in the branch's worktree (`facts_child`); prints what the branch's tables say, read-only.
     #[arg(long, hide = true, conflicts_with_all = ["execute", "cleanup"])]
     facts: bool,
-    /// Internal: the inputs child (`inputs_child`) in the worktree or the main checkout; prints what that checkout's check reads (`check_inputs`), read-only.
-    #[arg(long, hide = true, conflicts_with_all = ["execute", "cleanup", "facts"])]
-    inputs: bool,
-    /// Internal: the build dir child in the worktree (`slot_child`); prints whether the worktree's build dir is current for every gate's goals, read-only.
+    /// Internal: the build dir child in the land worktree (`slot_child`); prints whether its build dir is current for every gate's goals, read-only.
     /// Flag and output lines keep the pre-pool name `slot`: it is the wire between the main checkout's xtask and a branch's, and a branch from before the build-dir pool answers only to it. Rename once no such branch is left.
-    #[arg(long, hide = true, conflicts_with_all = ["execute", "cleanup", "facts", "inputs"])]
+    #[arg(long, hide = true, conflicts_with_all = ["execute", "cleanup", "facts"])]
     slot: bool,
 }
 
@@ -55,22 +58,16 @@ struct BranchFacts {
     edits: Vec<String>,
     /// Upstreams whose task copy exists already.
     copies: Vec<String>,
-    /// The build machine's arches.toml host: what verify-main builds the main checkout's slot for.
+    /// The build machine's arches.toml host: what Build builds the land build dir for.
     host: String,
 }
-
-/// What a checkout's `check` reads from the source side, as `check_inputs` hashes it: `.` = the checkout's tracked files, then each upstream dir as the checkout's layout resolves it (task copy or `src/`) -> its tree, or [`ABSENT`].
-type Inputs = std::collections::BTreeMap<String, String>;
-
-/// An upstream not fetched where the layout resolves it.
-const ABSENT: &str = "absent";
 
 /// `(worktree, branch)` -> the branch's facts; `facts_child` in production.
 type FactsFn<'a> = dyn Fn(&Path, &str) -> Result<BranchFacts> + 'a;
 
-/// What `land` runs beside its git work: the check of a checkout, the fetch of the main checkout, the branch's task copies and the cleanup child. Tests substitute them.
+/// What `land` runs beside its git work: the build and check of the land worktree, the fetch of the main checkout, the branch's task copies, the base publish and reset, and the cleanup child. Tests substitute them.
 struct Runner<'a> {
-    /// `xtask patch --edit <up>` in the worktree, by the branch's xtask (`edit_execute`).
+    /// `xtask patch --edit <up>` in the branch's worktree, by the branch's xtask (`edit_execute`).
     edit: &'a dyn Fn(&Path, &str) -> Result<String>,
     /// The checkout's verdict line, Ok only when that check passed (`check_verdict`).
     check: &'a dyn Fn(&Path) -> Result<String>,
@@ -78,14 +75,14 @@ struct Runner<'a> {
     fetch: &'a dyn Fn(&Path) -> Result<()>,
     /// The cleanup child for the main checkout and the branch; its note line (`cleanup_execute`).
     cleanup: &'a dyn Fn(&Path, &str) -> Result<String>,
-    /// `(checkout, branch)` -> what that checkout's check reads, by its own xtask (`inputs_child`).
-    inputs: &'a dyn Fn(&Path, &str) -> Result<Inputs>,
-    /// `(checkout, host)` -> `xtask native --for all-gates` there, by its own xtask (`native_execute`): Build's worktree slot, verify-main's main slot.
+    /// `(checkout, host)` -> `xtask native --for all-gates` there, by its own xtask (`native_execute`).
     native: &'a dyn Fn(&Path, &str) -> Result<String>,
-    /// `(worktree, branch)` -> None when the worktree's slot is current for every gate's goals, else why not; by the branch's xtask (`slot_child`).
+    /// `(land worktree, branch)` -> None when its build dir is current for every gate's goals, else why not; by the branch's xtask (`slot_child`).
     stale: &'a dyn Fn(&Path, &str) -> Result<Option<String>>,
-    /// The main checkout's build dir published as the base new build dirs copy, by its own xtask (`publish_execute`); its line.
+    /// The land worktree's build dir published as `base/<its HEAD>` (`out::publish`); its line.
     publish: &'a dyn Fn(&Path) -> Result<String>,
+    /// The land worktree's build dir deleted and copied again from the newest base (`out::recopy`); its line.
+    recopy: &'a dyn Fn(&Path) -> Result<String>,
 }
 
 /// One step of a landing, in run order.
@@ -93,15 +90,17 @@ struct Runner<'a> {
 enum Stage {
     /// A task copy for an upstream whose patches/ or pin differ from origin/main's.
     Edit(String),
-    /// The worktree's slot brought to the rebased tree: `xtask native --for all-gates` there unless already current (`Plan::build`). Verify's check refuses a stale slot by name.
+    /// The land worktree on the branch (`Plan::enter`), made first when missing.
+    Enter,
+    /// The land build dir brought to the branch's tree: `xtask native --for all-gates` there unless already current (`Plan::build`). Verify's check refuses a stale build dir by name.
     Build,
-    /// `cargo xtask check` in the branch's worktree.
+    /// `cargo xtask check` in the land worktree.
     Verify,
     Push,
     /// Main fast-forwards to origin/main, then `fetch --execute` moves `src/` there.
     Sync,
-    /// The main checkout's verdict: Verify's, when main's check inputs equal the ones Verify checked (`Plan::verify_main`); else `xtask native` + `cargo xtask check` there.
-    VerifyMain,
+    /// The land worktree detached at the pushed commit, its build dir published as `base/<commit>` (`Plan::publish`).
+    Publish,
     /// Task copies, the state note (kept in out/), the worktree and the branch, in a child (`cleanup_execute`): this process's binary predates the sync.
     Cleanup,
 }
@@ -110,13 +109,22 @@ impl Stage {
     fn name(&self) -> &'static str {
         match self {
             Stage::Edit(_) => "edit",
+            Stage::Enter => "enter",
             Stage::Build => "build",
             Stage::Verify => "verify",
             Stage::Push => "push",
             Stage::Sync => "sync",
-            Stage::VerifyMain => "verify-main",
+            Stage::Publish => "publish",
             Stage::Cleanup => "cleanup",
         }
+    }
+
+    /// A failure here leaves origin as it was: the land worktree is reset (`Plan::reset`).
+    fn before_push(&self) -> bool {
+        matches!(
+            self,
+            Stage::Edit(_) | Stage::Enter | Stage::Build | Stage::Verify | Stage::Push
+        )
     }
 }
 
@@ -124,7 +132,10 @@ impl Stage {
 struct Plan {
     repo: PathBuf,
     branch: String,
+    /// The branch's own worktree: task copies are made from it (Edit), and it goes in Cleanup.
     wt: PathBuf,
+    /// The land worktree ([`LAND_WT`]); may not exist yet (Enter makes it).
+    land: PathBuf,
     /// origin/main before the push.
     origin: String,
     /// The branch's tip: origin/main after the push.
@@ -154,12 +165,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         println!("{FACT_HOST}{}", f.host);
         return Ok(ExitCode::SUCCESS);
     }
-    if args.inputs {
-        for (name, tree) in check_inputs(root)? {
-            println!("{INPUT}{name} {tree}");
-        }
-        return Ok(ExitCode::SUCCESS);
-    }
     if args.slot {
         match slot_staleness(root)? {
             None => println!("{SLOT_CURRENT}"),
@@ -187,10 +192,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         check: &check_verdict,
         fetch: &fetch_execute,
         cleanup: &cleanup_execute,
-        inputs: &inputs_child,
         native: &native_execute,
         stale: &slot_child,
-        publish: &publish_execute,
+        publish: &out::publish,
+        recopy: &out::recopy,
     };
     let line = plan.execute(&stages, &runner);
     println!("{line}");
@@ -206,6 +211,11 @@ impl Plan {
     /// `facts`: what the branch's own tables say (`facts_child` = the branch's xtask in its worktree); this process never parses them, since its binary is main's.
     fn new(repo: &Path, branch: &str, update: bool, facts: &FactsFn<'_>) -> Result<Self> {
         ensure!(branch != MAIN, "`{MAIN}` is the trunk: land a task branch");
+        ensure!(
+            branch != out::LAND_ID,
+            "`{}` names the land worktree {LAND_WT}: rename the branch",
+            out::LAND_ID
+        );
         ensure!(
             !branch.contains('/'),
             "branch {branch} holds `/`: task copies live in src-wt/<branch>/: rename the branch"
@@ -256,8 +266,10 @@ impl Plan {
             fetch::MAIN_REF,
             short(&origin)
         );
+        let land = Layout::of(repo)?.workspace().join(LAND_WT);
+        land_ready(&land)?;
         let worktrees = git_raw(repo, &["worktree", "list", "--porcelain"])?;
-        let wt = find_worktree(&worktrees, branch).with_context(|| {
+        let wt = find_worktree(&worktrees, branch, &land).with_context(|| {
             format!("branch {branch} is not checked out in a worktree: `git worktree add <ws>/wt/{branch} {branch}`")
         })?;
         let status = git_raw(&wt, &["status", "--porcelain"])?;
@@ -278,6 +290,7 @@ impl Plan {
             repo: repo.to_path_buf(),
             branch: branch.to_owned(),
             wt,
+            land,
             origin,
             head,
             edits,
@@ -290,11 +303,11 @@ impl Plan {
     fn stages(&self) -> Vec<Stage> {
         let mut stages: Vec<Stage> = self.edits.iter().cloned().map(Stage::Edit).collect();
         // after the edits: a new task copy changes what native builds (build_state::of_build)
-        stages.extend([Stage::Build, Stage::Verify]);
+        stages.extend([Stage::Enter, Stage::Build, Stage::Verify]);
         if self.head != self.origin {
             stages.push(Stage::Push);
         }
-        stages.extend([Stage::Sync, Stage::VerifyMain, Stage::Cleanup]);
+        stages.extend([Stage::Sync, Stage::Publish, Stage::Cleanup]);
         stages
     }
 
@@ -308,18 +321,26 @@ impl Plan {
 
     fn describe_stage(&self, stage: &Stage) -> String {
         let (branch, wt, repo) = (&self.branch, self.wt.display(), self.repo.display());
+        let land = self.land.display();
         match stage {
             Stage::Edit(up) => format!(
                 "edit {up}: task copy src-wt/{branch}/{up} on atl-patches-{branch} (its patches/ or pin differ from {})",
                 fetch::MAIN_REF
             ),
+            Stage::Enter => format!(
+                "enter {land}: check out {branch} there (made detached at {} first if missing)",
+                fetch::MAIN_REF
+            ),
             Stage::Build => format!(
-                "build in {wt}: `cargo xtask native --host {} --for {}` unless its slot is current for the rebased tree",
+                "build in {land}: `cargo xtask native --host {} --for {}` unless ws/{} is current for the branch's tree",
                 self.host,
-                crate::gate_goals::ALL
+                crate::gate_goals::ALL,
+                out::LAND_ID
             ),
             Stage::Verify => format!(
-                "verify in {wt}:`cargo xtask check` must print `check: ok` (the task copies hold the branch's patches)"
+                "verify in {land}: `cargo xtask check` must print `check: ok` (the task copies hold the branch's patches); a failure up to the push resets {land} to {} and re-copies ws/{} from the newest base",
+                fetch::MAIN_REF,
+                out::LAND_ID
             ),
             Stage::Push => format!(
                 "push: {} {} -> {} (git push origin refs/heads/{branch}:refs/heads/main)",
@@ -331,10 +352,11 @@ impl Plan {
                 "sync in {repo}: merge --ff-only origin/main, then `cargo xtask fetch --execute` (src/ moves to {})",
                 short(&self.head)
             ),
-            Stage::VerifyMain => format!(
-                "verify in {repo}: verify's verdict if its check inputs equal the worktree's, else `cargo xtask native --host {} --for {}` then `cargo xtask check` must print `check: ok`",
-                self.host,
-                crate::gate_goals::ALL
+            Stage::Publish => format!(
+                "publish: {land} detached at {}, ws/{} copied to base/{}",
+                short(&self.head),
+                out::LAND_ID,
+                short(&self.head)
             ),
             Stage::Cleanup => {
                 let gone: Vec<&str> = self
@@ -360,11 +382,9 @@ impl Plan {
     fn execute(&self, stages: &[Stage], runner: &Runner) -> String {
         let total = stages.len();
         let mut times = Timings::default();
-        // what Verify's check read; None until it passed and was read
-        let mut verified: Option<Inputs> = None;
         for stage in stages {
             let started = Instant::now();
-            let result = self.run_stage(stage, runner, &mut verified);
+            let result = self.run_stage(stage, runner);
             let took = started.elapsed();
             times.push(stage.name(), took);
             match result {
@@ -375,6 +395,10 @@ impl Plan {
                         stage.name(),
                         timing::secs(took)
                     );
+                    let started = Instant::now();
+                    let after = self.after_failure(stage, runner);
+                    times.push("reset", started.elapsed());
+                    println!("land: reset: {after}");
                     println!("{}", times.table("land").trim_end());
                     return Verdict {
                         cmd: "land",
@@ -396,31 +420,14 @@ impl Plan {
         .line()
     }
 
-    fn run_stage(
-        &self,
-        stage: &Stage,
-        runner: &Runner,
-        verified: &mut Option<Inputs>,
-    ) -> Result<String> {
+    fn run_stage(&self, stage: &Stage, runner: &Runner) -> Result<String> {
         match stage {
             Stage::Edit(up) => (runner.edit)(&self.wt, up),
+            Stage::Enter => self.enter(),
             Stage::Build => self.build(runner),
-            Stage::Verify => {
-                let line = (runner.check)(self.wt.as_path()).with_context(|| {
-                    format!("nothing pushed: check in {} failed", self.wt.display())
-                })?;
-                // read after the check: nothing in land writes the worktree or its task copies between the two
-                Ok(match (runner.inputs)(&self.wt, &self.branch) {
-                    Ok(inputs) => {
-                        let note = format!("{line}; {} check inputs read", inputs.len());
-                        *verified = Some(inputs);
-                        note
-                    }
-                    Err(e) => format!(
-                        "{line}; check inputs not read, verify-main will check main in full: {e:#}"
-                    ),
-                })
-            }
+            Stage::Verify => (runner.check)(self.land.as_path()).with_context(|| {
+                format!("nothing pushed: check in {} failed", self.land.display())
+            }),
             Stage::Push => {
                 let refspec = format!("refs/heads/{}:refs/heads/main", self.branch);
                 git(Some(&self.repo), &["push", "-q", "origin", &refspec])
@@ -428,24 +435,104 @@ impl Plan {
                 Ok(format!("origin/main is {}", short(&self.head)))
             }
             Stage::Sync => self.sync(runner),
-            Stage::VerifyMain => self.verify_main(runner, verified.as_ref()),
+            Stage::Publish => self.publish(runner),
             Stage::Cleanup => (runner.cleanup)(&self.repo, &self.branch)
                 .context("pushed and checked, but cleanup failed: finish it by hand"),
         }
     }
 
-    /// The worktree's slot as Verify needs it: built from the tree as it is now (after the rebase and the edits) with every gate's goals.
-    /// Current -> nothing runs (a land whose child round already built this tree). Stale, or the question unanswerable -> native first: it is the reference, a needless build costs time, a skipped one fails Verify.
+    /// The land worktree on the branch. Missing -> made detached at origin/main first (its build dir follows from the newest ancestor base on the first xtask command there, `out::ensure`).
+    /// `--ignore-other-worktrees`: the branch's own worktree keeps it checked out; land writes neither the branch nor that worktree until Cleanup, which detaches this one first (Publish).
+    fn enter(&self) -> Result<String> {
+        let mut made = " ";
+        if !self.land.exists() {
+            let parent = self.land.parent().context("land worktree has no parent")?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+            let arg = self.land.display().to_string();
+            git(
+                Some(&self.repo),
+                &["worktree", "add", "-q", "--detach", &arg, &self.origin],
+            )
+            .context("nothing pushed: making the land worktree")?;
+            made = " made, ";
+        }
+        let id = out::checkout_id(&self.land)?;
+        ensure!(
+            id == out::LAND_ID,
+            "nothing pushed: {} is git worktree {id}, not {}: `git worktree move` or remove it",
+            self.land.display(),
+            out::LAND_ID
+        );
+        git(
+            Some(&self.land),
+            &["checkout", "-q", "--ignore-other-worktrees", &self.branch],
+        )
+        .with_context(|| {
+            format!(
+                "nothing pushed: checking {} out in the land worktree",
+                self.branch
+            )
+        })?;
+        out::prepare(&self.land).context("nothing pushed: making the land build dir")?;
+        Ok(format!("{}{made}on {}", self.land.display(), self.branch))
+    }
+
+    /// The land build dir as Verify needs it: built from the branch's tree (after the edits) with every gate's goals.
+    /// Current -> nothing runs. Stale, or the question unanswerable -> native first: it is the reference, a needless build costs time, a skipped one fails Verify.
     fn build(&self, runner: &Runner) -> Result<String> {
-        let why = match (runner.stale)(&self.wt, &self.branch) {
-            Ok(None) => return Ok("slot current for the worktree, not rebuilt".to_owned()),
+        let why = match (runner.stale)(&self.land, &self.branch) {
+            Ok(None) => return Ok("build dir current for the branch, not rebuilt".to_owned()),
             Ok(Some(why)) => why,
-            Err(e) => format!("slot state not read: {e:#}"),
+            Err(e) => format!("build dir state not read: {e:#}"),
         };
-        println!("land: build: {why}: rebuilding the worktree's slot");
-        let note = (runner.native)(&self.wt, &self.host)
-            .with_context(|| format!("nothing pushed: native in {} failed", self.wt.display()))?;
+        println!("land: build: {why}: building ws/{}", out::LAND_ID);
+        let note = (runner.native)(&self.land, &self.host)
+            .with_context(|| format!("nothing pushed: native in {} failed", self.land.display()))?;
         Ok(format!("{note} ({why})"))
+    }
+
+    /// Detaches the land worktree at the pushed commit (Cleanup deletes the branch), then publishes its build dir: built and checked from this tree, at the canonical path. Never fatal: the land is pushed and verified; a missing base only makes the next children copy an older one.
+    fn publish(&self, runner: &Runner) -> Result<String> {
+        git(
+            Some(&self.land),
+            &["checkout", "-q", "--detach", &self.head],
+        )
+        .with_context(|| {
+            format!(
+                "pushed: origin/main is {}; detaching the land worktree failed",
+                short(&self.head)
+            )
+        })?;
+        Ok((runner.publish)(&self.land).unwrap_or_else(|e| format!("base not published: {e:#}")))
+    }
+
+    /// After a failed stage: before the push the land worktree goes back to origin/main and its build dir is re-copied from the newest base (no failed branch's outputs reach a later base); after it the worktree is detached at the pushed commit, its build dir kept (built from that commit).
+    /// Returns what was done; a reset that itself fails is reported, the next land's preflight refuses an unready worktree by name.
+    fn after_failure(&self, stage: &Stage, runner: &Runner) -> String {
+        if matches!(stage, Stage::Edit(_)) || !self.land.exists() {
+            return "land worktree untouched".to_owned();
+        }
+        let (at, recopy) = if stage.before_push() {
+            (&self.origin, true)
+        } else {
+            (&self.head, false)
+        };
+        if let Err(e) = git(Some(&self.land), &["checkout", "-q", "-f", "--detach", at]) {
+            return format!(
+                "FAILED to detach {} at {}: {e:#}",
+                self.land.display(),
+                short(at)
+            );
+        }
+        let detached = format!("{} detached at {}", self.land.display(), short(at));
+        if !recopy {
+            return format!("{detached}, ws/{} kept", out::LAND_ID);
+        }
+        match (runner.recopy)(&self.land) {
+            Ok(line) => format!("{detached}; {line}"),
+            Err(e) => format!("{detached}; re-copy FAILED: {e:#}"),
+        }
     }
 
     fn sync(&self, runner: &Runner) -> Result<String> {
@@ -465,87 +552,36 @@ impl Plan {
         })?;
         Ok(format!("main and src/ at {}", short(&self.head)))
     }
-
-    /// The main checkout's verdict.
-    /// Invariant for the skip: `check` is a function of the checkout's tracked files (its own code included), the upstream trees its layout resolves, the slot's build and the workspace's shared config/caches.
-    /// The slot's build is in turn derived from the first two by `native`; the shared part is the same files for both checkouts. So when main's tracked files and resolved upstream trees (`check_inputs`)
-    /// equal what Verify's check read in the worktree (task copies included), main's check would reach Verify's verdict: it is recorded, and neither main's slot rebuild nor its check runs.
-    /// Main's slot stays as it was; its gates refuse it by name until the next `native` there (build_state::ensure_current). Not covered: untracked or ignored files a check reads (both checkouts are clean, the state note aside).
-    /// Inputs that differ (fetch built `src/<up>` other than the task copy, an unexported edit, Verify's inputs unread) -> native for every gate's goals (a stale slot failed "built from another source state" otherwise), then check.
-    fn verify_main(&self, runner: &Runner, verified: Option<&Inputs>) -> Result<String> {
-        let pushed = || {
-            format!(
-                "pushed: origin/main is {}, and the check in {} failed",
-                short(&self.head),
-                self.repo.display()
-            )
-        };
-        let why = match verified.map(|v| (v, (runner.inputs)(&self.repo, &self.branch))) {
-            None => "the worktree's check inputs were not read".to_owned(),
-            Some((v, Ok(now))) if now == *v => {
-                return Ok(format!(
-                    "verify's verdict: main's {} check inputs equal the worktree's (slot not rebuilt, check not run)",
-                    now.len()
-                ));
-            }
-            Some((v, Ok(now))) => format!("check inputs differ: {}", differing(v, &now)),
-            Some((_, Err(e))) => format!("main's check inputs not read: {e:#}"),
-        };
-        println!("land: verify-main: {why}: rebuilding main's build dir, then checking");
-        (runner.native)(&self.repo, &self.host).with_context(pushed)?;
-        let line = (runner.check)(self.repo.as_path()).with_context(pushed)?;
-        // main's build dir is now built and checked at the pushed commit: new build dirs copy it. Never fatal: the land is pushed and verified.
-        let published =
-            (runner.publish)(&self.repo).unwrap_or_else(|e| format!("base not published: {e:#}"));
-        Ok(format!("{line} ({why}); {published}"))
-    }
 }
 
-/// The first few names whose trees differ between `a` and `b`, either side's absence included.
-fn differing(a: &Inputs, b: &Inputs) -> String {
-    let names: Vec<&str> = a
-        .keys()
-        .chain(b.keys())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .filter(|k| a.get(*k) != b.get(*k))
-        .map(String::as_str)
-        .collect();
-    format!("{} ({} in all)", first(&names), names.len())
-}
-
-/// What `check` in the checkout at `root` reads from the source side (`Inputs`), each tree as its tracked files are on disk (build_state::tracked_tree).
-/// Every upstream sources.toml lists (the AOSP manifest included), located as this checkout's layout locates it: a branch worktree sees its task copies, main sees `src/`.
-fn check_inputs(root: &Path) -> Result<Inputs> {
-    let layout = Layout::of(root)?;
-    let sources = sources::load(root)?;
-    let mut ups = sources.checkouts(None);
-    ups.push(sources.manifest_checkout());
-    let dirs: Vec<(String, PathBuf)> = ups
-        .iter()
-        .map(|c| (c.dir.display().to_string(), layout.locate(&c.dir).dir))
-        .collect();
-    let workers = std::thread::available_parallelism().map_or(1, usize::from);
-    let trees = crate::par::map(&dirs, workers, |(name, dir)| -> Result<String> {
-        if !dir.exists() {
-            return Ok(ABSENT.to_owned());
-        }
-        crate::build_state::tracked_tree(dir).with_context(|| format!("reading upstream {name}"))
-    });
-    let mut out = Inputs::new();
-    out.insert(".".to_owned(), crate::build_state::tracked_tree(root)?);
-    for ((name, _), tree) in dirs.into_iter().zip(trees) {
-        out.insert(name, tree?);
+/// The land worktree as the preflight accepts it: absent (Enter makes it), or a clean checkout on a detached HEAD (a land between Enter and Publish holds it on a branch; a crashed one leaves it there).
+fn land_ready(land: &Path) -> Result<()> {
+    if !land.exists() {
+        return Ok(());
     }
-    Ok(out)
+    let on = git(Some(land), &["symbolic-ref", "-q", "--short", "HEAD"]).ok();
+    ensure!(
+        on.is_none(),
+        "land worktree {} is on {}: another land runs, or one crashed: `git -C {} checkout --detach {}` once none runs",
+        land.display(),
+        on.unwrap_or_default(),
+        land.display(),
+        fetch::MAIN_REF
+    );
+    let changes = git_raw(land, &["status", "--porcelain"])?;
+    ensure!(
+        changes.trim().is_empty(),
+        "land worktree {} has changes:\n{}",
+        land.display(),
+        changes.trim_end()
+    );
+    Ok(())
 }
 
 /// `--facts` output line prefixes.
 const FACT_EDIT: &str = "land-facts: edit ";
 const FACT_COPY: &str = "land-facts: copy ";
 const FACT_HOST: &str = "land-facts: host ";
-/// `--inputs` output line prefix: `<name> <tree>` follows.
-const INPUT: &str = "land-inputs: ";
 
 /// The branch's facts from its own tables, read by whichever xtask runs this: the `--facts` child in the worktree `wt`, i.e. the branch's xtask, so a table schema the branch changes is read by the code that changed it.
 /// origin/main's tables (`fetch::Main`) are read through the refs the worktree shares with the main checkout.
@@ -616,34 +652,6 @@ fn parse_facts(stdout: &str) -> BranchFacts {
     f
 }
 
-/// `cargo xtask land <branch> --inputs` in `dir` (the worktree or the main checkout), run by that checkout's own xtask: both sides hash with the code being landed.
-fn inputs_child(dir: &Path, branch: &str) -> Result<Inputs> {
-    let mut cmd = crate::cargo_command();
-    cmd.args(["xtask", "land", branch, "--inputs"])
-        .current_dir(dir);
-    let run = unit_use::run(&mut cmd, Units::Plain, Echo::Nothing)
-        .with_context(|| format!("running cargo xtask land --inputs in {}", dir.display()))?;
-    ensure!(
-        run.status.success(),
-        "{}: {}",
-        run.status,
-        run.stderr
-            .rfind("Error:")
-            .map_or(run.stderr.trim_end(), |at| run.stderr[at..].trim_end())
-    );
-    let inputs = parse_inputs(&run.stdout);
-    ensure!(!inputs.is_empty(), "the inputs child printed no input");
-    Ok(inputs)
-}
-
-fn parse_inputs(stdout: &str) -> Inputs {
-    stdout
-        .lines()
-        .filter_map(|l| l.strip_prefix(INPUT)?.rsplit_once(' '))
-        .map(|(name, tree)| (name.to_owned(), tree.to_owned()))
-        .collect()
-}
-
 /// `--slot` output lines.
 const SLOT_CURRENT: &str = "land-slot: current";
 const SLOT_STALE: &str = "land-slot: stale ";
@@ -687,28 +695,7 @@ fn parse_slot(stdout: &str) -> Result<Option<String>> {
     bail!("the slot child printed no slot line")
 }
 
-/// `cargo xtask out publish --execute` in the main checkout, by its own (post-sync) xtask. Returns the line it printed.
-fn publish_execute(repo: &Path) -> Result<String> {
-    let mut cmd = crate::cargo_command();
-    cmd.args(["xtask", "out", "publish", "--execute"])
-        .current_dir(repo);
-    let run = unit_use::run(&mut cmd, Units::Plain, Echo::Both)
-        .with_context(|| format!("running cargo xtask out publish in {}", repo.display()))?;
-    ensure!(
-        run.status.success(),
-        "cargo xtask out publish exited with {}",
-        run.status
-    );
-    run.stdout
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .map(str::to_owned)
-        .context("the publish child printed no line")
-}
-
-/// `cargo xtask native --host <host> --for all-gates` in `repo` (the worktree for Build, the main checkout for verify-main), run by its own xtask: the build dir that checkout's check reads, built from it as it is now.
+/// `cargo xtask native --host <host> --for all-gates` in `repo` (the land worktree), run by its own xtask: the build dir that checkout's check reads, built from it as it is now.
 fn native_execute(repo: &Path, host: &str) -> Result<String> {
     let mut cmd = crate::cargo_command();
     cmd.args([
@@ -804,9 +791,9 @@ fn cleanup_execute(repo: &Path, branch: &str) -> Result<String> {
 /// The cleanup child's body. The parent names only the branch, so the worktree is looked up again here.
 fn clean_up_child(repo: &Path, branch: &str) -> Result<String> {
     let porcelain = git_raw(repo, &["worktree", "list", "--porcelain"])?;
-    let wt = find_worktree(&porcelain, branch)
-        .with_context(|| format!("branch {branch} is not checked out in a worktree"))?;
     let ws = Layout::of(repo)?.workspace().to_path_buf();
+    let wt = find_worktree(&porcelain, branch, &ws.join(LAND_WT))
+        .with_context(|| format!("branch {branch} is not checked out in a worktree"))?;
     let note = clean_up(repo, &ws, &wt, branch)?;
     prune_units_after_land(repo, &ws);
     Ok(note)
@@ -869,15 +856,12 @@ fn is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
     }
 }
 
-/// The worktree with `branch` checked out, from `git worktree list --porcelain` (blocks of `worktree <path>` and `branch refs/heads/<name>` lines).
-fn find_worktree(porcelain: &str, branch: &str) -> Option<PathBuf> {
+/// The worktree with `branch` checked out other than the land worktree `land` (which holds it during a land), from `git worktree list --porcelain` (blocks of `worktree <path>` and `branch refs/heads/<name>` lines).
+fn find_worktree(porcelain: &str, branch: &str, land: &Path) -> Option<PathBuf> {
     let want = format!("branch refs/heads/{branch}");
     porcelain.split("\n\n").find_map(|block| {
         let path = block.lines().find_map(|l| l.strip_prefix("worktree "))?;
-        block
-            .lines()
-            .any(|l| l == want)
-            .then(|| PathBuf::from(path))
+        (Path::new(path) != land && block.lines().any(|l| l == want)).then(|| PathBuf::from(path))
     })
 }
 
@@ -950,9 +934,9 @@ mod tests {
                 host: "h".to_owned(),
             })
         };
-        let plan = Plan::new(&env.repo, "land", true, &facts)
+        let plan = Plan::new(&env.repo, "task", true, &facts)
             .expect("main's binary must not parse the branch's tables");
-        assert_eq!(*asked.borrow(), [(env.wt.clone(), "land".to_owned())]);
+        assert_eq!(*asked.borrow(), [(env.wt.clone(), "task".to_owned())]);
         assert_eq!(plan.copies, ["up"]);
         let check_fn = |_: &Path| -> Result<String> { Ok("check: ok (12 steps)".to_owned()) };
         let fetch_fn = |_: &Path| -> Result<()> { Ok(()) };
@@ -964,13 +948,13 @@ mod tests {
                 check: &check_fn,
                 fetch: &fetch_fn,
                 cleanup: &cleanup_fn,
-                inputs: &same_inputs,
                 native: &no_native,
                 stale: &current,
                 publish: &no_publish,
+                recopy: &no_recopy,
             },
         );
-        assert_eq!(line, "land: ok (6 steps)");
+        assert_eq!(line, "land: ok (7 steps)");
         // the child's output is what the parent plans from
         assert_eq!(
             parse_facts(
@@ -984,17 +968,16 @@ mod tests {
         );
     }
 
-    /// Every checkout reads the same inputs.
-    fn same_inputs(_: &Path, _: &str) -> Result<Inputs> {
-        Ok(Inputs::from([(".".to_owned(), "t".to_owned())]))
-    }
-
     fn no_native(d: &Path, host: &str) -> Result<String> {
         panic!("native ran in {} for {host}", d.display())
     }
 
     fn no_publish(_: &Path) -> Result<String> {
-        Ok("out: base/c from ws/repo (reflink)".to_owned())
+        Ok("out: base/c from ws/land (reflink)".to_owned())
+    }
+
+    fn no_recopy(d: &Path) -> Result<String> {
+        panic!("ws/land of {} re-copied after a green land", d.display())
     }
 
     /// The worktree's build dir is current: Build runs nothing.
@@ -1002,19 +985,20 @@ mod tests {
         Ok(None)
     }
 
-    /// A slot built before the rebase, simulated: `stale` compares its record with the tree, `native` rebuilds it, `check` refuses it by name as check.rs ConverterPackages does (build_state::ensure_current).
+    /// A build dir built before the rebase, simulated: `stale` compares its record with the tree, `native` rebuilds it, `check` refuses it by name as check.rs ConverterPackages does (build_state::ensure_current); `recopy` puts it back to the base state.
     struct Slot {
         built: std::cell::RefCell<&'static str>,
         calls: std::cell::RefCell<Vec<String>>,
     }
 
     const REBASED: &str = "rebased";
+    const BASE: &str = "pre-rebase";
     const STALE_MSG: &str = "was built from another source state";
 
     impl Slot {
         fn before_rebase() -> Self {
             Slot {
-                built: std::cell::RefCell::new("pre-rebase"),
+                built: std::cell::RefCell::new(BASE),
                 calls: std::cell::RefCell::new(Vec::new()),
             }
         }
@@ -1042,6 +1026,19 @@ mod tests {
                 ensure!(b == REBASED, "check: FAILED: slot {STALE_MSG} ({b})");
                 Ok("check: ok (12 steps)".to_owned())
             };
+            let publish_fn = |d: &Path| -> Result<String> {
+                self.calls
+                    .borrow_mut()
+                    .push(format!("publish {}", d.display()));
+                Ok("published".to_owned())
+            };
+            let recopy_fn = |d: &Path| -> Result<String> {
+                self.calls
+                    .borrow_mut()
+                    .push(format!("recopy {}", d.display()));
+                *self.built.borrow_mut() = BASE;
+                Ok("re-copied".to_owned())
+            };
             let fetch_fn = |_: &Path| -> Result<()> { Ok(()) };
             let cleanup_fn = |_: &Path, _: &str| -> Result<String> { Ok("cleaned".to_owned()) };
             plan.execute(
@@ -1051,64 +1048,76 @@ mod tests {
                     check: &check_fn,
                     fetch: &fetch_fn,
                     cleanup: &cleanup_fn,
-                    inputs: &same_inputs,
                     native: &native_fn,
                     stale: &stale_fn,
-                    publish: &no_publish,
+                    publish: &publish_fn,
+                    recopy: &recopy_fn,
                 },
             )
         }
     }
 
-    /// A slot built before the rebase: Build rebuilds the worktree's slot, then Verify passes on the first attempt; verify-main reuses Verify's verdict (equal inputs), so main's slot is not built.
+    /// A build dir from before the branch: Build rebuilds it in the land worktree, Verify passes there on the first attempt, Publish copies it; the branch's own worktree is never built or checked.
     #[test]
     fn stale_slot_is_built_before_verify() {
         let env = Env::new("stale");
-        let plan = Plan::new(&env.repo, "land", true, &in_process).unwrap();
+        let plan = Plan::new(&env.repo, "task", true, &in_process).unwrap();
         let slot = Slot::before_rebase();
-        assert_eq!(slot.run(&plan, &plan.stages()), "land: ok (6 steps)");
-        let wt = env.wt.display();
+        assert_eq!(slot.run(&plan, &plan.stages()), "land: ok (7 steps)");
+        let land = env.land.display();
         assert_eq!(
             *slot.calls.borrow(),
             [
-                format!("stale? {wt}"),
-                format!("native {} {wt}", plan.host),
-                format!("check {wt}"),
+                format!("stale? {land}"),
+                format!("native {} {land}", plan.host),
+                format!("check {land}"),
+                format!("publish {land}"),
             ]
         );
     }
 
-    /// The break: without Build, the same stale slot fails Verify by name and nothing is pushed: the failure the retry path used to absorb.
+    /// The break: without Build, the same stale build dir fails Verify by name and nothing is pushed; the land worktree goes back to origin/main and its build dir is re-copied.
     #[test]
     fn without_build_the_stale_slot_fails_verify() {
         let env = Env::new("nobuild");
         let before = env.origin_main();
-        let plan = Plan::new(&env.repo, "land", true, &in_process).unwrap();
+        let plan = Plan::new(&env.repo, "task", true, &in_process).unwrap();
         let stages: Vec<Stage> = plan
             .stages()
             .into_iter()
             .filter(|s| *s != Stage::Build)
             .collect();
-        let line = Slot::before_rebase().run(&plan, &stages);
+        let slot = Slot::before_rebase();
+        let line = slot.run(&plan, &stages);
         assert!(
-            line.starts_with("land: FAILED 1 of 5 steps: verify;") && line.contains(STALE_MSG),
+            line.starts_with("land: FAILED 1 of 6 steps: verify;") && line.contains(STALE_MSG),
             "{line}"
         );
         assert_eq!(env.origin_main(), before);
+        let land = env.land.display();
+        assert_eq!(
+            *slot.calls.borrow(),
+            [format!("check {land}"), format!("recopy {land}")]
+        );
+        assert_eq!(env.land_head(), (None, before));
     }
 
-    /// A slot already built from the rebased tree: Build asks, runs no native, and the land goes through.
+    /// A build dir already built from the branch's tree: Build asks, runs no native, and the land goes through.
     #[test]
     fn current_slot_is_not_rebuilt() {
         let env = Env::new("current");
-        let plan = Plan::new(&env.repo, "land", true, &in_process).unwrap();
+        let plan = Plan::new(&env.repo, "task", true, &in_process).unwrap();
         let slot = Slot::before_rebase();
         *slot.built.borrow_mut() = REBASED;
-        assert_eq!(slot.run(&plan, &plan.stages()), "land: ok (6 steps)");
-        let wt = env.wt.display();
+        assert_eq!(slot.run(&plan, &plan.stages()), "land: ok (7 steps)");
+        let land = env.land.display();
         assert_eq!(
             *slot.calls.borrow(),
-            [format!("stale? {wt}"), format!("check {wt}")]
+            [
+                format!("stale? {land}"),
+                format!("check {land}"),
+                format!("publish {land}")
+            ]
         );
         assert_eq!(parse_slot("x\nland-slot: current\n").unwrap(), None);
         assert_eq!(
@@ -1120,7 +1129,7 @@ mod tests {
         assert!(parse_slot("noise\n").is_err());
     }
 
-    /// The real question on a worktree whose slot never finished a native run: stale, naming the missing record.
+    /// The real question on a checkout whose build dir never finished a native run: stale, naming the missing record.
     #[test]
     fn a_slot_without_a_record_is_stale() {
         let env = Env::new("norecord");
@@ -1130,109 +1139,69 @@ mod tests {
         assert!(why.contains("no record"), "{why}");
     }
 
-    /// Main's inputs equal the worktree's: verify-main records Verify's verdict, no rebuild, no second check. Inputs read by this code in-process, as both children would.
+    /// Two lands back to back: the first makes the land worktree, the second finds it detached at the first's commit and reuses it (its build dir is the one the first published).
     #[test]
-    fn equal_inputs_skip_the_main_check() {
-        let env = Env::new("skip");
-        let plan = Plan::new(&env.repo, "land", true, &in_process).unwrap();
-        let checked = std::cell::RefCell::new(Vec::new());
-        let check_fn = |d: &Path| -> Result<String> {
-            checked.borrow_mut().push(d.to_path_buf());
-            Ok("check: ok (12 steps)".to_owned())
-        };
-        let fetch_fn = |_: &Path| -> Result<()> { Ok(()) };
-        let cleanup_fn = |_: &Path, _: &str| -> Result<String> { Ok("cleaned".to_owned()) };
-        let inputs_fn = |d: &Path, _: &str| check_inputs(d);
-        let line = plan.execute(
-            &plan.stages(),
-            &Runner {
-                edit: &no_edit,
-                check: &check_fn,
-                fetch: &fetch_fn,
-                cleanup: &cleanup_fn,
-                inputs: &inputs_fn,
-                native: &no_native,
-                stale: &current,
-                publish: &no_publish,
-            },
+    fn a_second_land_reuses_the_land_worktree() {
+        let env = Env::new("twice");
+        let first = git(Some(&env.wt), &["rev-parse", "HEAD"]).unwrap();
+        let plan = Plan::new(&env.repo, "task", true, &in_process).unwrap();
+        let slot = Slot::before_rebase();
+        assert_eq!(slot.run(&plan, &plan.stages()), "land: ok (7 steps)");
+        assert_eq!(env.land_head(), (None, first.clone()));
+        // the mock cleanup left the branch's worktree: remove it as the real child would
+        let wt_arg = env.wt.display().to_string();
+        git(Some(&env.repo), &["worktree", "remove", "--force", &wt_arg]).unwrap();
+        git(Some(&env.repo), &["branch", "-D", "task"]).unwrap();
+        let wt2 = env.root.join("ws").join("wt").join("task2");
+        let wt2_arg = wt2.display().to_string();
+        git(
+            Some(&env.repo),
+            &["worktree", "add", "-q", "-b", "task2", &wt2_arg],
+        )
+        .unwrap();
+        write(&wt2, "second.txt", "2\n");
+        commit(&wt2, "second");
+        let second = git(Some(&wt2), &["rev-parse", "HEAD"]).unwrap();
+        let plan = Plan::new(&env.repo, "task2", true, &in_process).unwrap();
+        let slot = Slot::before_rebase();
+        assert_eq!(slot.run(&plan, &plan.stages()), "land: ok (7 steps)");
+        assert!(
+            !slot.calls.borrow().iter().any(|c| c.starts_with("recopy")),
+            "a green land re-copied"
         );
-        assert_eq!(line, "land: ok (6 steps)");
-        assert_eq!(
-            *checked.borrow(),
-            std::slice::from_ref(&env.wt),
-            "main was checked"
-        );
+        assert_eq!(env.land_head(), (None, second.clone()));
+        assert_eq!(env.origin_main(), second);
     }
 
-    /// Main's inputs differ (an upstream fetch built otherwise than the task copy): verify-main rebuilds main's slot for the branch's host, then checks main; the note names what differed.
+    /// The preflight refuses a land worktree left on a branch (a running or crashed land) and a branch named like the land worktree.
     #[test]
-    fn differing_inputs_rebuild_and_check_main() {
-        let env = Env::new("differ");
-        let plan = Plan::new(&env.repo, "land", true, &in_process).unwrap();
-        let calls = std::cell::RefCell::new(Vec::new());
-        let check_fn = |d: &Path| -> Result<String> {
-            calls.borrow_mut().push(format!("check {}", d.display()));
-            Ok("check: ok (12 steps)".to_owned())
-        };
-        let native_fn = |d: &Path, host: &str| -> Result<String> {
-            calls
-                .borrow_mut()
-                .push(format!("native {host} {}", d.display()));
-            Ok("built".to_owned())
-        };
-        let inputs_fn = |d: &Path, _: &str| -> Result<Inputs> {
-            let tree = if d == env.wt { "copy" } else { "fetched" };
-            Ok(Inputs::from([
-                (".".to_owned(), "t".to_owned()),
-                ("aosp/art".to_owned(), tree.to_owned()),
-            ]))
-        };
-        let fetch_fn = |_: &Path| -> Result<()> { Ok(()) };
-        let cleanup_fn = |_: &Path, _: &str| -> Result<String> { Ok("cleaned".to_owned()) };
-        let line = plan.execute(
-            &plan.stages(),
-            &Runner {
-                edit: &no_edit,
-                check: &check_fn,
-                fetch: &fetch_fn,
-                cleanup: &cleanup_fn,
-                inputs: &inputs_fn,
-                native: &native_fn,
-                stale: &current,
-                publish: &no_publish,
-            },
-        );
-        assert_eq!(line, "land: ok (6 steps)");
-        assert_eq!(
-            *calls.borrow(),
-            [
-                format!("check {}", env.wt.display()),
-                format!("native {} {}", plan.host, env.repo.display()),
-                format!("check {}", env.repo.display()),
-            ]
-        );
-        assert_eq!(
-            differing(
-                &inputs_fn(&env.wt, "land").unwrap(),
-                &Inputs::from([(".".to_owned(), "t".to_owned())])
-            ),
-            "aosp/art (1 in all)"
-        );
-        assert_eq!(
-            parse_inputs("noise\nland-inputs: . abc\nland-inputs: aosp/a b c0\n"),
-            Inputs::from([
-                (".".to_owned(), "abc".to_owned()),
-                ("aosp/a b".to_owned(), "c0".to_owned())
-            ])
-        );
+    fn an_unready_land_worktree_is_refused() {
+        let env = Env::new("unready");
+        let land_arg = env.land.display().to_string();
+        git(
+            Some(&env.repo),
+            &["worktree", "add", "-q", "-b", "other", &land_arg],
+        )
+        .unwrap();
+        let err = Plan::new(&env.repo, "task", true, &in_process)
+            .err()
+            .expect("a land worktree on a branch must be refused");
+        assert!(format!("{err:#}").contains("is on other"), "{err:#}");
+        git(Some(&env.land), &["checkout", "-q", "--detach"]).unwrap();
+        Plan::new(&env.repo, "task", true, &in_process).expect("detached and clean: ready");
+        let err = Plan::new(&env.repo, out::LAND_ID, true, &in_process)
+            .err()
+            .expect("a branch named land must be refused");
+        assert!(format!("{err:#}").contains("rename the branch"), "{err:#}");
     }
 
-    /// Temp tree: `origin.git` (bare, the remote), `ws/repo` (the main checkout on main, pushed) and `ws/wt/land` (a worktree on `land`, one commit ahead). No upstreams, so `check` has nothing to fetch.
+    /// Temp tree: `origin.git` (bare, the remote), `ws/repo` (the main checkout on main, pushed) and `ws/wt/task` (a worktree on `task`, one commit ahead); `ws/wt/land` is where the land worktree goes. No upstreams, so `check` has nothing to fetch.
     struct Env {
         root: PathBuf,
         origin: PathBuf,
         repo: PathBuf,
         wt: PathBuf,
+        land: PathBuf,
     }
 
     impl Env {
@@ -1242,7 +1211,8 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
             let origin = root.join("origin.git");
             let repo = root.join("ws").join("repo");
-            let wt = root.join("ws").join("wt").join("land");
+            let wt = root.join("ws").join("wt").join("task");
+            let land = root.join("ws").join(LAND_WT);
             std::fs::create_dir_all(&repo).unwrap();
             // HEAD of the bare remote must name main, or a clone of it has no branch to push onto
             git(
@@ -1272,24 +1242,34 @@ mod tests {
             let origin_arg = origin.display().to_string();
             git(Some(&repo), &["remote", "add", "origin", &origin_arg]).unwrap();
             git(Some(&repo), &["push", "-q", "origin", "main"]).unwrap();
+            git(Some(&repo), &["fetch", "-q", "origin"]).unwrap();
             let wt_arg = wt.display().to_string();
             git(
                 Some(&repo),
-                &["worktree", "add", "-q", "-b", "land", &wt_arg],
+                &["worktree", "add", "-q", "-b", "task", &wt_arg],
             )
             .unwrap();
-            write(&wt, "change.txt", "land\n");
-            commit(&wt, "land");
+            write(&wt, "change.txt", "task\n");
+            commit(&wt, "task");
             Env {
                 root,
                 origin,
                 repo,
                 wt,
+                land,
             }
         }
 
         fn origin_main(&self) -> String {
             git(Some(&self.origin), &["rev-parse", "refs/heads/main"]).unwrap()
+        }
+
+        /// The land worktree's branch (None = detached) and commit.
+        fn land_head(&self) -> (Option<String>, String) {
+            (
+                git(Some(&self.land), &["symbolic-ref", "-q", "--short", "HEAD"]).ok(),
+                git(Some(&self.land), &["rev-parse", "HEAD"]).unwrap(),
+            )
         }
 
         /// Another clone pushes to origin's main: origin/main moves on, this repo does not.
@@ -1336,22 +1316,25 @@ mod tests {
     fn dry_run_lists_the_stages_and_changes_nothing() {
         let env = Env::new("dry");
         let before = env.origin_main();
-        let plan = Plan::new(&env.repo, "land", false, &in_process).unwrap();
+        let plan = Plan::new(&env.repo, "task", false, &in_process).unwrap();
         let stages = plan.stages();
         let names: Vec<&str> = stages.iter().map(Stage::name).collect();
         assert_eq!(
             names,
-            ["build", "verify", "push", "sync", "verify-main", "cleanup"]
+            [
+                "enter", "build", "verify", "push", "sync", "publish", "cleanup"
+            ]
         );
         let lines = plan.describe(&stages);
         assert!(
-            lines[2].contains("refs/heads/land:refs/heads/main"),
+            lines[3].contains("refs/heads/task:refs/heads/main"),
             "{}",
-            lines[2]
+            lines[3]
         );
-        assert!(lines[5].contains("branch land"), "{}", lines[5]);
+        assert!(lines[6].contains("branch task"), "{}", lines[6]);
         assert_eq!(env.origin_main(), before);
         assert!(env.wt.is_dir());
+        assert!(!env.land.exists(), "a dry run made the land worktree");
     }
 
     #[test]
@@ -1359,7 +1342,7 @@ mod tests {
         let env = Env::new("nonff");
         env.advance_origin();
         let moved = env.origin_main();
-        let err = Plan::new(&env.repo, "land", true, &in_process)
+        let err = Plan::new(&env.repo, "task", true, &in_process)
             .err()
             .expect("a branch behind origin/main must be refused");
         assert!(format!("{err:#}").contains("not a fast-forward"), "{err:#}");
@@ -1370,7 +1353,7 @@ mod tests {
     fn failing_check_stops_before_the_push() {
         let env = Env::new("failing");
         let before = env.origin_main();
-        let plan = Plan::new(&env.repo, "land", true, &in_process).unwrap();
+        let plan = Plan::new(&env.repo, "task", true, &in_process).unwrap();
         let stages = plan.stages();
         let check_fn = |_: &Path| -> Result<String> {
             bail!("check: FAILED 1 of 12 steps: drift; first error (drift): \"x\"")
@@ -1381,8 +1364,12 @@ mod tests {
         let cleanup_fn = |_: &Path, _: &str| -> Result<String> {
             panic!("the cleanup child ran after a failed check")
         };
-        let inputs_fn = |d: &Path, _: &str| -> Result<Inputs> {
-            panic!("inputs of {} read after a failed check", d.display())
+        let publish_fn =
+            |_: &Path| -> Result<String> { panic!("a base was published after a failed check") };
+        let recopied = std::cell::RefCell::new(0);
+        let recopy_fn = |_: &Path| -> Result<String> {
+            *recopied.borrow_mut() += 1;
+            Ok("re-copied".to_owned())
         };
         let line = plan.execute(
             &stages,
@@ -1391,27 +1378,29 @@ mod tests {
                 check: &check_fn,
                 fetch: &fetch_fn,
                 cleanup: &cleanup_fn,
-                inputs: &inputs_fn,
                 native: &no_native,
                 stale: &current,
-                publish: &no_publish,
+                publish: &publish_fn,
+                recopy: &recopy_fn,
             },
         );
         assert!(
             line.starts_with(
-                "land: FAILED 1 of 6 steps: verify; first error (verify): \"nothing pushed"
+                "land: FAILED 1 of 7 steps: verify; first error (verify): \"nothing pushed"
             ),
             "{line}"
         );
         assert_eq!(env.origin_main(), before);
         assert!(env.wt.is_dir());
+        assert_eq!(*recopied.borrow(), 1);
+        assert_eq!(env.land_head(), (None, before));
     }
 
     #[test]
     fn passing_checks_land_and_clean_up() {
         let env = Env::new("landed");
         let head = git(Some(&env.wt), &["rev-parse", "HEAD"]).unwrap();
-        let plan = Plan::new(&env.repo, "land", true, &in_process).unwrap();
+        let plan = Plan::new(&env.repo, "task", true, &in_process).unwrap();
         let check_fn = |_: &Path| -> Result<String> { Ok("check: ok (12 steps)".to_owned()) };
         let fetch_fn = |_: &Path| -> Result<()> { Ok(()) };
         // the cleanup child, run in this process: the stage must reach it through the runner
@@ -1430,38 +1419,43 @@ mod tests {
                 check: &check_fn,
                 fetch: &fetch_fn,
                 cleanup: &cleanup_fn,
-                inputs: &same_inputs,
                 native: &no_native,
                 stale: &current,
                 publish: &no_publish,
+                recopy: &no_recopy,
             },
         );
-        assert_eq!(line, "land: ok (6 steps)");
-        assert_eq!(*children.borrow(), [(env.repo.clone(), "land".to_owned())]);
+        assert_eq!(line, "land: ok (7 steps)");
+        assert_eq!(*children.borrow(), [(env.repo.clone(), "task".to_owned())]);
         assert_eq!(env.origin_main(), head);
         assert_eq!(git(Some(&env.repo), &["rev-parse", "HEAD"]).unwrap(), head);
         assert!(!env.wt.exists(), "the worktree is not removed");
         assert!(
             git(
                 Some(&env.repo),
-                &["rev-parse", "--verify", "-q", "refs/heads/land"]
+                &["rev-parse", "--verify", "-q", "refs/heads/task"]
             )
             .is_err(),
             "the branch is not removed"
+        );
+        assert_eq!(
+            env.land_head(),
+            (None, head),
+            "land worktree stays, detached"
         );
     }
 
     #[test]
     fn cleanup_removes_the_task_copies_from_main() {
         let env = Env::new("copies");
-        // an upstream checkout `src/up` and its task copy `src-wt/land/up`, as `patch --edit` leaves them
+        // an upstream checkout `src/up` and its task copy `src-wt/task/up`, as `patch --edit` leaves them
         let up = env.root.join("ws").join("src").join("up");
         std::fs::create_dir_all(&up).unwrap();
         git(Some(&up), &["init", "-q"]).unwrap();
         write(&up, "a.c", "int a;\n");
         commit(&up, "up");
         let pin = git(Some(&up), &["rev-parse", "HEAD"]).unwrap();
-        let copy = env.root.join("ws").join("src-wt").join("land").join("up");
+        let copy = env.root.join("ws").join("src-wt").join("task").join("up");
         std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
         let copy_arg = copy.display().to_string();
         git(
@@ -1475,7 +1469,7 @@ mod tests {
         );
         write(&env.repo, "sources.toml", &sources);
         assert_eq!(
-            patch::done_task(&env.repo, "land", vec!["up".to_owned()]).unwrap(),
+            patch::done_task(&env.repo, "task", vec!["up".to_owned()]).unwrap(),
             0
         );
         assert!(!copy.exists(), "the task copy is kept");
@@ -1486,13 +1480,13 @@ mod tests {
     fn clean_up_removes_the_checkouts_target_and_its_build_dir() {
         let env = Env::new("target");
         let ws = env.root.join("ws");
-        let dir = out::dir_of(&ws, "land");
+        let dir = out::dir_of(&ws, "task");
         std::fs::create_dir_all(dir.join("target/debug")).unwrap();
         write(&dir.join("target/debug"), "build.txt", "x\n");
         std::os::unix::fs::symlink(dir.join("target"), env.wt.join("target")).unwrap();
         // `branch -d` in clean_up refuses a branch that is not merged into the checked-out main
-        git(Some(&env.repo), &["merge", "-q", "--ff-only", "land"]).unwrap();
-        let summary = clean_up(&env.repo, &ws, &env.wt, "land").expect("clean up");
+        git(Some(&env.repo), &["merge", "-q", "--ff-only", "task"]).unwrap();
+        let summary = clean_up(&env.repo, &ws, &env.wt, "task").expect("clean up");
         assert!(summary.contains("removed:"), "{summary}");
         assert!(!dir.exists(), "the build dir leaves with its checkout");
         assert!(!env.wt.exists(), "the worktree is removed");
@@ -1510,18 +1504,20 @@ mod tests {
         ));
     }
 
+    /// The whole branch name matches, and the land worktree (on the branch during a land) is never the branch's worktree.
     #[test]
     fn worktree_lookup_matches_the_whole_branch_name() {
-        let list = "worktree /a/repo\nHEAD 1\nbranch refs/heads/main\n\nworktree /a/wt/land\nHEAD 2\nbranch refs/heads/land\n\nworktree /a/wt/landing\nHEAD 3\nbranch refs/heads/landing\n";
+        let list = "worktree /a/repo\nHEAD 1\nbranch refs/heads/main\n\nworktree /a/wt/land\nHEAD 2\nbranch refs/heads/task\n\nworktree /a/wt/task\nHEAD 2\nbranch refs/heads/task\n\nworktree /a/wt/tasking\nHEAD 3\nbranch refs/heads/tasking\n";
+        let land = Path::new("/a/wt/land");
         assert_eq!(
-            find_worktree(list, "land"),
-            Some(PathBuf::from("/a/wt/land"))
+            find_worktree(list, "task", land),
+            Some(PathBuf::from("/a/wt/task"))
         );
         assert_eq!(
-            find_worktree(list, "landing"),
-            Some(PathBuf::from("/a/wt/landing"))
+            find_worktree(list, "tasking", land),
+            Some(PathBuf::from("/a/wt/tasking"))
         );
-        assert_eq!(find_worktree(list, "lan"), None);
+        assert_eq!(find_worktree(list, "tas", land), None);
     }
 
     #[test]

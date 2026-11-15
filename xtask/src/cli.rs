@@ -74,7 +74,7 @@ enum Command {
     ///
     /// Dry run unless `--execute`: then QEMU's own `configure` and ninja build `qemu-<target>` into `<out>/qemu/<target>-linux-user`, and its `--version` must name the sources.toml pin.
     Qemu(qemu::Args),
-    /// Build dirs: the out dir each checkout builds into by default (`show`, `prune`, `publish`).
+    /// Build dirs: the out dir each checkout builds into by default (`show`, `prune`).
     ///
     /// One per checkout, <workspace>/out/pool/ws/<id> (`repo` = the main checkout, else the worktree name), made by the first build command from main's newest published build (`base/<commit>`, a reflink copy where the filesystem has them, else a full copy). `native`, `check` and `test` build into it without `--out` / `--java-out`, seen at <workspace>/out/build. The checkout's `target/` links to the dir's `target/`, so its cargo builds go there too.
     Out {

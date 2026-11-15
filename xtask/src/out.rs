@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Build dirs: the out dir a checkout builds into when `--out` / `--java-out` is not given.
 //!
-//! Pool `<workspace>/out/pool` (one copy-on-write filesystem where the host has one): `ws/<id>` per checkout -- `repo` for the main checkout, the git worktree name otherwise (`.git/worktrees/<name>`), so no record file exists -- and `base/<commit>`, main's published builds.
+//! Pool `<workspace>/out/pool` (one copy-on-write filesystem where the host has one): `ws/<id>` per checkout -- `repo` for the main checkout, the git worktree name otherwise (`.git/worktrees/<name>`), so no record file exists -- and `base/<commit>`, main's published builds: copies of `ws/land` taken by land after a green verify (`land::LAND_WT`, [`publish`]).
 //! The first command that needs a checkout's dir makes it ([`ensure`]): a copy of the newest base whose commit is an ancestor of HEAD (else the newest base, else an empty dir), into a temp name renamed into place, so a half copy is never a build dir. Its `.base` names the base.
 //! The copy is one interface with two capability tiers (probed per copy, never by host name): `reflink` (`cp --reflink=always`, extents shared, ~2-3 s for main's 100k-entry build on btrfs) and the baseline `copy` (`cp -a`, any filesystem). The create line names the tier; `pool/tier-<name>.count` counts each.
 //! Every build sees its dir at [`CANONICAL`] (the build namespace binds it there), so a base copy stays valid at its new real path.
@@ -26,6 +26,8 @@ use crate::unit_use;
 pub const POOL: &str = "out/pool";
 /// The main checkout's id; a worktree of that name is refused.
 pub const MAIN_ID: &str = "repo";
+/// The land worktree's id (`land::LAND_WT`): the one build dir published as a base.
+pub const LAND_ID: &str = "land";
 /// Bases `out prune` keeps: the newest, plus the one a child may still be copying from.
 pub const KEEP_BASES: usize = 2;
 /// A checkout's cargo target dir: a link to its build dir's `target/`.
@@ -52,12 +54,6 @@ pub enum Out {
         #[arg(long, value_name = "DAYS", default_value_t = out_prune::PRUNE_AFTER_DAYS)]
         older_than: u64,
         /// Delete (default: print the plan only).
-        #[arg(long)]
-        execute: bool,
-    },
-    /// Copies the main checkout's build dir to `base/<HEAD>`, the base new build dirs copy (dry run unless --execute). Land's verify-main runs it after it rebuilt and checked main.
-    Publish {
-        /// Copy (default: print the plan only).
         #[arg(long)]
         execute: bool,
     },
@@ -703,17 +699,24 @@ pub fn leave(root: &Path, ws: &Path) -> Result<String> {
     })
 }
 
-/// Copies the main checkout's build dir to `base/<HEAD>` (dry run unless `execute`). Returns the summary line.
-pub fn publish(root: &Path, execute: bool) -> Result<String> {
-    let ws = Layout::of(root)?.workspace().to_owned();
-    let id = checkout_id(root)?;
+/// The land worktree at `land`: its id must be [`LAND_ID`] (the only checkout whose build dir is built from exactly a landed commit at the canonical path).
+fn land_id(land: &Path) -> Result<()> {
+    let id = checkout_id(land)?;
     ensure!(
-        id == MAIN_ID,
-        "only the main checkout publishes a base (this is worktree {id})"
+        id == LAND_ID,
+        "only the land worktree's build dir becomes a base (this is {id})"
     );
-    let head = git(Some(root), &["rev-parse", "HEAD"])?;
+    Ok(())
+}
+
+/// Land's Publish: copies `ws/land` to `base/<HEAD of land>` under its exclusive lock (no build runs in it), through a temp name renamed into place. Returns the summary line.
+pub fn publish(land: &Path) -> Result<String> {
+    land_id(land)?;
+    let ws = Layout::of(land)?.workspace().to_owned();
+    let id = LAND_ID;
+    let head = git(Some(land), &["rev-parse", "HEAD"])?;
     let dst = base_of(&ws, &head);
-    let src = dir_of(&ws, &id);
+    let src = dir_of(&ws, id);
     if present(&dst)? {
         return Ok(format!("out: base/{head} exists, not published again"));
     }
@@ -722,16 +725,7 @@ pub fn publish(root: &Path, execute: bool) -> Result<String> {
         "{} does not exist: nothing to publish",
         src.display()
     );
-    if !execute {
-        return Ok(format!(
-            "dry run: would copy {} -> {} (add --execute)",
-            src.display(),
-            dst.display()
-        ));
-    }
-    // this process's own shared hold would refuse the exclusive lock
-    release_holds()?;
-    let Some(_lock) = build_pool::try_lock_dir(&ws, &id)? else {
+    let Some(_lock) = build_pool::try_lock_dir(&ws, id)? else {
         bail!(
             "{} is held by a running process: not published",
             src.display()
@@ -742,6 +736,34 @@ pub fn publish(root: &Path, execute: bool) -> Result<String> {
     let tier = copy_tree(&src, &dst, None)?;
     count(&ws, tier);
     Ok(format!("out: base/{head} from ws/{id} ({})", tier.name()))
+}
+
+/// Land's reset after a failed verify: deletes `ws/land` under its exclusive lock and copies it again from the newest base that is an ancestor of the land worktree's HEAD ([`ensure`]). Returns the create line.
+pub fn recopy(land: &Path) -> Result<String> {
+    land_id(land)?;
+    let ws = Layout::of(land)?.workspace().to_owned();
+    let dir = dir_of(&ws, LAND_ID);
+    if present(&dir)? {
+        let Some(_lock) = build_pool::try_lock_dir(&ws, LAND_ID)? else {
+            bail!(
+                "{} is held by a running process: not re-copied",
+                dir.display()
+            );
+        };
+        remove_build_dir(&dir)?;
+    }
+    let dir = prepare(land)?;
+    let base = std::fs::read_to_string(dir.join(BASE_FILE))
+        .map_or("no base".to_owned(), |c| format!("base/{}", c.trim()));
+    Ok(format!("ws/{LAND_ID} re-copied from {base}"))
+}
+
+/// The checkout's build dir made ([`ensure`]) with its `target/`, before a parent runs cargo there: the checkout's `target` link may name this dir's target/ already (a re-copied or deleted dir), an empty copy (no base) lacks it, and cargo, which runs before any xtask code can settle the link, fails on a dangling one.
+pub fn prepare(root: &Path) -> Result<PathBuf> {
+    let (_, dir) = ensure(root)?;
+    let target = target_of(&dir);
+    std::fs::create_dir_all(&target).with_context(|| format!("creating {}", target.display()))?;
+    Ok(dir)
 }
 
 /// Free bytes for unprivileged writes on the filesystem holding `path`.
@@ -908,7 +930,6 @@ pub fn run(root: &Path, cmd: &Out) -> Result<ExitCode> {
                 return Ok(ExitCode::FAILURE);
             }
         }
-        Out::Publish { execute } => println!("{}", publish(root, *execute)?),
     }
     Ok(ExitCode::SUCCESS)
 }
