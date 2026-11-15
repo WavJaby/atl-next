@@ -2128,8 +2128,8 @@ nope
         std::fs::write(
             &graph,
             edge(
-                "/w/out/build/bp2ninja/bp2ninja",
-                "/w/out/build/bp2ninja.args",
+                "/w/out/pool/ws/x2/bp2ninja/bp2ninja",
+                "/w/out/pool/ws/x2/bp2ninja.args",
             ),
         )
         .unwrap();
