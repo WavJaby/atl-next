@@ -66,9 +66,7 @@ const MANIFEST: &str = "bundle.manifest";
 /// `-F` the user's config: xtask runs inside the build namespace (tree.rs `enter`), a user namespace where root-owned files show as the overflow uid, and ssh refuses the system config's root-owned
 /// includes there ("Bad owner or permissions on /etc/ssh/ssh_config.d/..."); the host aliases live in the user's own config.
 fn ssh_opts() -> Vec<String> {
-    let config = std::env::home_dir()
-        .unwrap_or_default()
-        .join(".ssh/config");
+    let config = std::env::home_dir().unwrap_or_default().join(".ssh/config");
     let mut opts = vec!["-F".to_owned(), config.display().to_string()];
     for o in [
         "BatchMode=yes",
@@ -871,7 +869,10 @@ impl Host {
         cmd.args(["-k", "5", secs.as_str()]);
         match self {
             Host::Ssh(alias) => {
-                cmd.arg("ssh").args(ssh_opts()).arg(alias).args(["sh", "-s"]);
+                cmd.arg("ssh")
+                    .args(ssh_opts())
+                    .arg(alias)
+                    .args(["sh", "-s"]);
             }
             Host::Local(_) => {
                 cmd.args(["sh", "-s"]);

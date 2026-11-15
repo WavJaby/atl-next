@@ -810,7 +810,9 @@ fn bridge1_call_failures(
                 whys.push(format!("bridge1 call {CPU_PROBE}: {why}"));
             }
         }
-        Err(e) => whys.push(format!("bridge1 call {CPU_PROBE}: the host's CPU facts: {e}")),
+        Err(e) => whys.push(format!(
+            "bridge1 call {CPU_PROBE}: the host's CPU facts: {e}"
+        )),
     }
     let host_word = cpuinfo_features(cpu.as_ref().map_or("", |c| c.cpuinfo.as_str()));
     if let Some(why) = cpuinfo_view_why(got(CPUINFO_VIEW).as_deref(), foreign, host_word) {
@@ -862,9 +864,8 @@ impl CpuFacts {
     /// This host's own answers (a local run: the app inherits atld's affinity, which inherits the gate's).
     fn here() -> Result<Self, String> {
         let read = |p: &str| std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"));
-        let count = |p: &str| {
-            cpu_list_count(&read(p)?).ok_or_else(|| format!("{p} does not parse"))
-        };
+        let count =
+            |p: &str| cpu_list_count(&read(p)?).ok_or_else(|| format!("{p} does not parse"));
         let set = rustix::thread::sched_getaffinity(None)
             .map_err(|e| format!("the gate's own sched_getaffinity: {e}"))?;
         Ok(Self {
