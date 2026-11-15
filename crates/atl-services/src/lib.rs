@@ -20,7 +20,6 @@ pub mod activity_stack;
 pub mod activity_start;
 pub mod alarm_table;
 pub mod app_id;
-pub mod app_ops;
 pub mod bound_services;
 pub mod broadcast;
 pub mod config_diff;

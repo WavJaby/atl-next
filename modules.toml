@@ -274,7 +274,7 @@ exports = ["atl-fonts-table"]
 [xtask]
 crates = ["xtask"]
 exports = ["xtask"]
-# bwrap: the build-tree namespace's argv (tree.rs); services-types: the package manifest records xtask writes for atld, and gl-drivers.toml's parser (step tables); android-paths: the roots its android-paths check step scans for; fonts-table: the tables step checks fonts.toml
+# bwrap: the build-tree namespace's argv (tree.rs); services-types: the package manifest records xtask writes for atld, gl-drivers.toml's parser and the AppOpInfo table (step tables); android-paths: the roots its android-paths check step scans for; fonts-table: the tables step checks fonts.toml
 uses = ["layout", "bwrap", "services-types", "android-paths", "fonts-table"]
 
 # the runtime harness: `cargo xtask test|run-apk|remote` and the check steps that need product logic (gl-proxies), run by xtask as a process

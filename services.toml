@@ -211,7 +211,7 @@ mirrors = [
 ]
 
 [appops]
-src = ["crates/atl-services/src/appops.rs", "crates/atl-services/src/app_ops.rs"]
+src = ["crates/atl-services/src/appops.rs", "crates/atl-services-types/src/app_ops.rs"]
 mirrors = [
     "frameworks/base/core/java/android/app/AppOpInfo.java",
     "frameworks/base/core/java/android/app/AppOpsManager.java#opToDefaultMode",

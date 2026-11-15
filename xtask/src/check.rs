@@ -12,8 +12,8 @@ use crate::timing::{self, Timings};
 use crate::unit_use::{self, Echo, Units};
 use crate::verdict::{self, Failure, Verdict};
 use crate::{
-    aosp, arches, converter, cts_table, deps, libcxx_gate, licenses, modules, packages, patch,
-    providers, prune, service_mirrors, slot, sources, spdx, test_apks, workspace,
+    aosp, app_ops_table, arches, converter, cts_table, deps, libcxx_gate, licenses, modules,
+    packages, patch, providers, prune, service_mirrors, slot, sources, spdx, test_apks, workspace,
 };
 use atl_layout::Layout;
 
@@ -234,6 +234,24 @@ impl Step {
                     "tables: {} ok ({} services, {entries} mirrored entries at the pin)",
                     service_mirrors::FILE,
                     mirrors.len()
+                );
+                // the OPS table and NUM_OP against AppOpsManager.sAppOpInfos at the pin, row by row
+                let app_ops = app_ops_table::check(&sources.aosp, &|project| {
+                    layout.locate(&Path::new("aosp").join(project)).dir
+                })?;
+                let flags = if app_ops.flags.is_empty() {
+                    "none".to_owned()
+                } else {
+                    app_ops
+                        .flags
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                eprintln!(
+                    "tables: app_ops ok ({} ops at the pin; flags assumed off: {flags})",
+                    app_ops.ops
                 );
                 // fonts.toml: rows = AOSP's named families at the pin
                 let fonts = atl_fonts_table::Table::parse(&std::fs::read_to_string(

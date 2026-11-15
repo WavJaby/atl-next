@@ -14,9 +14,8 @@ use atl_parcelables::android::app::SyncNotedAppOp;
 use atl_parcelables::com::android::internal::app::MessageSamplingConfig;
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, ThreadState};
 
-use crate::app_ops;
 use crate::packages::{Packages, Permissions};
-use atl_services_types::permission;
+use atl_services_types::{app_ops, permission};
 
 /// The interface name counters use.
 const INTERFACE: &str = "IAppOpsService";

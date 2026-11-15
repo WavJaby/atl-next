@@ -12,13 +12,14 @@ pub const DEFAULT: i32 = 3;
 pub const FOREGROUND: i32 = 4;
 
 /// One op's AppOpInfo: default mode, switch code, permission.
-type Op = (i32, usize, Option<&'static str>);
+pub type Op = (i32, usize, Option<&'static str>);
 
-/// AppOpsManager.sAppOpInfos at the pin, index = op code (AOSP asserts sAppOpInfos[i].code == i; `_NUM_OP` = the length). Generated from the Builder chain: `setDefaultMode` (absent ->
-/// AppOpInfo.Builder's MODE_DEFAULT), `setSwitchCode` (absent -> the op itself), `setPermission`. SYSTEM_ALERT_WINDOW's getSystemAlertWindowDefault = MODE_DEFAULT on a device that is not
-/// low-RAM (a desktop); READ_HEART_RATE / READ_SKIN_TEMPERATURE / READ_OXYGEN_SATURATION / RANGING take a permission only behind aconfig flags off at the pin -> none.
+/// AppOpsManager.sAppOpInfos at the pin, index = op code (`_NUM_OP` = the length). Checked row by row against the pin by `cargo xtask check` step `tables` (xtask/src/app_ops_table.rs).
+/// Absent `setDefaultMode` -> MODE_DEFAULT (AppOpInfo.Builder's default); absent `setSwitchCode` -> the op itself. SYSTEM_ALERT_WINDOW's getSystemAlertWindowDefault() = MODE_DEFAULT on a desktop, which is not low-RAM.
+/// READ_HEART_RATE, READ_SKIN_TEMPERATURE, READ_OXYGEN_SATURATION, RANGING, WRITE_SYSTEM_PREFERENCES and the XR tracking ops take a permission only behind flags, taken flag-off -> none.
+/// READ_SYSTEM_GRAMMATICAL_GENDER: its setPermission is commented out at the pin -> none.
 #[rustfmt::skip]
-const OPS: [Op; 163] = [
+pub const OPS: [Op; 163] = [
     (ALLOWED, 0, Some("android.permission.ACCESS_COARSE_LOCATION")), // 0 COARSE_LOCATION
     (ALLOWED, 1, Some("android.permission.ACCESS_FINE_LOCATION")), // 1 FINE_LOCATION
     (ALLOWED, 0, None), // 2 GPS
@@ -162,7 +163,7 @@ const OPS: [Op; 163] = [
     (ALLOWED, 140, None), // 140 ENABLE_MOBILE_DATA_BY_USER
     (ALLOWED, 141, None), // 141 RESERVED_FOR_TESTING
     (ALLOWED, 142, None), // 142 RAPID_CLEAR_NOTIFICATIONS_BY_LISTENER
-    (DEFAULT, 143, Some("android.permission.READ_SYSTEM_GRAMMATICAL_GENDER")), // 143 READ_SYSTEM_GRAMMATICAL_GENDER
+    (DEFAULT, 143, None), // 143 READ_SYSTEM_GRAMMATICAL_GENDER
     (IGNORED, 144, None), // 144 DEPRECATED_4
     (ALLOWED, 145, None), // 145 ARCHIVE_ICON_OVERLAY
     (ALLOWED, 146, None), // 146 UNARCHIVAL_CONFIRMATION
