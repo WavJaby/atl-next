@@ -478,17 +478,11 @@ pub fn run_display() -> DisplayModel {
     }
 }
 
-/// `package`'s `bin`, built plainly (release) into `out`'s cargo target dir; its path.
+/// `package`'s `bin`, built plainly (release) into `out`'s cargo target dir, for a cross host's out dir that host's (cdylib::release_build); its path.
 fn cargo_bin(root: &Path, out: &Path, package: &str) -> Result<PathBuf> {
-    crate::unit_use::exec(
-        crate::cargo_command()
-            .current_dir(root)
-            .args(["build", "--release", "--locked", "-p", package])
-            .arg("--target-dir")
-            .arg(out.join("cargo")),
-        &format!("cargo build -p {package}"),
-    )?;
-    Ok(out.join("cargo/release").join(package))
+    let (mut cmd, release) = crate::cdylib::release_build(root, out, package)?;
+    crate::unit_use::exec(cmd.arg("--locked"), &format!("cargo build -p {package}"))?;
+    Ok(release.join(package))
 }
 
 /// The platform's API level: `ro.build.version.sdk` of the converter's build.prop.

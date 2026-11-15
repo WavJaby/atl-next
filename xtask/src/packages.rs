@@ -510,11 +510,13 @@ fn leading_needed(package: &Package, graph: &Graph) -> Result<Vec<String>> {
         .collect()
 }
 
-/// `needed` (DT_NEEDED in order) starts with `leading`.
+/// `needed` (DT_NEEDED in order) starts with the entries of `leading` the link kept, in order. Under rustc's `--as-needed` lld keeps only a module the link references (ld.bfd also counts an earlier library's references): a dropped one still loads through the library that needs it,
+/// and an interposer stays, since it resolves the references (libsigchain's sigaction before libc's). Stable rustc has no positional `--no-as-needed` (the `as-needed` modifier and `-l link-arg` are nightly).
 fn check_needed(bin: &Path, needed: &[String], leading: &[String]) -> Result<()> {
+    let kept: Vec<&String> = leading.iter().filter(|m| needed.contains(m)).collect();
     ensure!(
-        needed.starts_with(leading),
-        "{}: DT_NEEDED {needed:?} does not start with {leading:?}",
+        needed.iter().take(kept.len()).eq(kept.iter().copied()),
+        "{}: DT_NEEDED {needed:?} does not start with {kept:?} (of {leading:?})",
         bin.display()
     );
     Ok(())
@@ -1034,5 +1036,11 @@ mod tests {
             check_needed(bin, &["libc.so.6".into(), "libsigchain.so".into()], &lead).unwrap_err();
         assert!(format!("{err:#}").contains("does not start with"));
         assert!(check_needed(bin, &["libc.so.6".into()], &[]).is_ok());
+        // lld dropped the unreferenced libutils: the kept two still lead, in order
+        let three = ["libinput.so", "libbinder.so", "libutils.so"].map(str::to_owned);
+        let kept = ["libinput.so", "libbinder.so", "libc.so.6"].map(str::to_owned);
+        assert!(check_needed(bin, &kept, &three).is_ok());
+        let swapped = ["libbinder.so", "libinput.so", "libc.so.6"].map(str::to_owned);
+        assert!(check_needed(bin, &swapped, &three).is_err());
     }
 }
