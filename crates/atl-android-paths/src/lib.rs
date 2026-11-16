@@ -105,3 +105,40 @@ pub const ROOTS: &[&str] = &[
     "/sdcard",
     "/mnt",
 ];
+
+/// A package name as atld's commit accepts it, and the only form run-apk builds paths from: ASCII letters, digits, `.` and `_`, not starting with `.`. Empty is no name.
+pub fn valid_package_name(package: &str) -> bool {
+    !package.is_empty()
+        && package
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+        && !package.starts_with('.')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_package_name;
+
+    /// Each example is one clause of the rule: charset, leading `.`, separator, empty, non-ASCII.
+    #[test]
+    fn package_names_follow_the_commit_rule() {
+        for ok in ["com.example.app", "a", "A_b.c1", "x..y"] {
+            assert!(valid_package_name(ok), "{ok:?} is a package name");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            ".x",
+            "/home/u/proj",
+            "../x",
+            "a/b",
+            "a b",
+            "a-b",
+            "a\u{e9}",
+            "a\0",
+        ] {
+            assert!(!valid_package_name(bad), "{bad:?} is no package name");
+        }
+    }
+}

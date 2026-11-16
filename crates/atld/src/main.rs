@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
+use atl_android_paths::valid_package_name;
 use atl_android_paths::{
     DATA, DATA_APP, DATA_USER, DATA_USER_DE, PROC_CPUINFO, PRODUCT, PROPERTY_AREA,
     PROPERTY_AREA_ENV, SDCARD, SHARED_STORAGE, SYSTEM, SYSTEM_EXT, SYSTEM_FONTS, SYSTEM_FRAMEWORK,
@@ -994,15 +995,6 @@ impl Host {
         }
         Ok(())
     }
-}
-
-/// A package name as commit accepts it: ASCII letters, digits, `.` and `_`, not starting with `.`.
-fn valid_package_name(package: &str) -> bool {
-    !package.is_empty()
-        && package
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
-        && !package.starts_with('.')
 }
 
 /// Writes the default property area (system processes map it) and returns the properties it holds, to which each app process's area adds its own.

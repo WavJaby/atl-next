@@ -244,6 +244,12 @@ pub(crate) fn run_on(
         (None, _) => rt.clone().with_display(run_display().to_arg()),
     };
     let m = timing::phase("run: package", || package(&rt, &files, pin, &args.target))?;
+    // the name becomes the log and data paths below: refuse a name that is no package name before any is built
+    ensure!(
+        atl_android_paths::valid_package_name(&m.name),
+        "run-apk: the manifest's package {:?} is no package name: nothing started",
+        m.name
+    );
     if args.clear_data {
         let device = rt
             .device()

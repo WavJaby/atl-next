@@ -6,7 +6,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
@@ -1231,18 +1231,39 @@ impl Runtime {
 
 /// `pm clear` of `package` on the persistent `device` (run-apk `--clear-data`): its user and device-protected data dirs (`data/user/0/<p>`, `data/user_de/0/<p>`) and its external dirs (`external/<p>`), the layout atld's Root gives them (crates/atld main.rs).
 /// Its code and every other package's state stay; the next launch makes the dirs again. Missing dirs are fine.
+/// A name that is no package name, or a dir not strictly below `device`, is refused before anything is removed.
 pub fn clear_package_data(device: &Path, package: &str) -> Result<()> {
+    ensure!(
+        atl_android_paths::valid_package_name(package),
+        "--clear-data: {package:?} is no package name: nothing cleared"
+    );
     let data = device.join("data");
-    for dir in [
+    let dirs = [
         data.join("user/0").join(package),
         data.join("user_de/0").join(package),
         device.join("external").join(package),
-    ] {
+    ];
+    for dir in &dirs {
+        ensure!(
+            strictly_inside(device, dir),
+            "--clear-data: {} is not below the device: nothing cleared",
+            dir.display()
+        );
+    }
+    for dir in dirs {
         if dir.exists() {
             std::fs::remove_dir_all(&dir).with_context(|| format!("clearing {}", dir.display()))?;
         }
     }
     Ok(())
+}
+
+/// Whether `dir` lies strictly below `device`, by plain names only: no `..`, no absolute part, not the device itself.
+fn strictly_inside(device: &Path, dir: &Path) -> bool {
+    dir.strip_prefix(device).is_ok_and(|rel| {
+        rel.components().next().is_some()
+            && rel.components().all(|c| matches!(c, Component::Normal(_)))
+    })
 }
 
 /// An APK's native libraries, stored under `lib/<abi>/` as an app's packager lays them out.
@@ -1899,6 +1920,40 @@ mod tests {
             assert!(device.join(kept).is_file(), "{kept} should stay");
         }
         std::fs::remove_dir_all(&device).unwrap();
+    }
+
+    /// A name that is no package name is refused before anything is deleted: `..` would clear every app's external dir, an absolute name a path outside the device.
+    #[test]
+    fn clear_package_data_refuses_a_name_that_is_no_package() {
+        let base = std::env::temp_dir().join(format!("atl-clear-refused-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let device = base.join("device");
+        let victim = base.join("outside").join("victim");
+        let keep = device.join("data/user/0/a/keep.txt");
+        for f in [
+            keep.clone(),
+            device.join("external/a/keep.txt"),
+            victim.join("f"),
+        ] {
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(&f, b"x").unwrap();
+        }
+        assert!(
+            clear_package_data(&device, "..").is_err(),
+            "'..' was accepted"
+        );
+        assert!(keep.is_file(), "'..' deleted the device's data");
+        let absolute = victim.to_str().unwrap();
+        assert!(
+            clear_package_data(&device, absolute).is_err(),
+            "an absolute name was accepted"
+        );
+        assert!(
+            victim.join("f").is_file(),
+            "an absolute name deleted a path outside the device"
+        );
+        assert!(keep.is_file(), "an absolute name deleted the device's data");
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// proc(5) stat lines: comm may hold spaces and parens (the last `)` ends it); the 4th field is ppid. And the live check: this test process's own child, `sleep`, is outside the broker.
