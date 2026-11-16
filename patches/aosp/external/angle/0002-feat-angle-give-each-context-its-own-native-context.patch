@@ -30,10 +30,10 @@ SPDX-License-Identifier: BSD-3-Clause
  1 file changed, 13 insertions(+), 4 deletions(-)
 
 diff --git a/src/libANGLE/renderer/gl/egl/DisplayEGL.cpp b/src/libANGLE/renderer/gl/egl/DisplayEGL.cpp
-index bd4d69860a2c19d70bf1b84fdadc9c591ac6daf5..c6d154a718ceb1ef30b1b93eaa4d05a63e4a67ec 100644
+index acada69f43589682252c47fbab66e4c12aaacf4d..fc67186d8e6546762bff4029f677a39956f4cb14 100644
 --- a/src/libANGLE/renderer/gl/egl/DisplayEGL.cpp
 +++ b/src/libANGLE/renderer/gl/egl/DisplayEGL.cpp
-@@ -498,7 +498,10 @@ ContextImpl *DisplayEGL::createContext(const gl::State &state,
+@@ -497,7 +497,10 @@ ContextImpl *DisplayEGL::createContext(const gl::State &state,
      bool globalTextureShareGroup =
          attribs.get(EGL_DISPLAY_TEXTURE_SHARE_GROUP_ANGLE, EGL_FALSE) == EGL_TRUE;
  
@@ -45,7 +45,7 @@ index bd4d69860a2c19d70bf1b84fdadc9c591ac6daf5..c6d154a718ceb1ef30b1b93eaa4d05a6
      if (usingExternalContext)
      {
          ASSERT(!shareContext);
-@@ -509,9 +512,12 @@ ContextImpl *DisplayEGL::createContext(const gl::State &state,
+@@ -508,9 +511,12 @@ ContextImpl *DisplayEGL::createContext(const gl::State &state,
              return nullptr;
          }
      }
@@ -60,7 +60,7 @@ index bd4d69860a2c19d70bf1b84fdadc9c591ac6daf5..c6d154a718ceb1ef30b1b93eaa4d05a6
          if (!renderer)
          {
              // If the user requested a dispaly-level texture share group, all contexts must be in
-@@ -535,7 +541,10 @@ ContextImpl *DisplayEGL::createContext(const gl::State &state,
+@@ -534,7 +540,10 @@ ContextImpl *DisplayEGL::createContext(const gl::State &state,
                  return nullptr;
              }
  

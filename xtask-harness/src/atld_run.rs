@@ -280,8 +280,6 @@ pub struct Runtime {
     audio_break_cblk: bool,
     /// Apps serve media.player unless this is cleared (`--no-media-player-service`, the media player gate's break).
     media_player_service: bool,
-    /// Packages take their GL driver from the owner list and the ES1 rule unless this is cleared (`--no-gl-selection`, the GL selection gate's break).
-    gl_selection: bool,
     /// Apps' AudioFlinger mixes silence when this is set (`--break-mix`, the audio gate's third break).
     audio_break_mix: bool,
     /// atld's `PIPEWIRE_REMOTE` (the desktop's server socket, which atld grants the apps) when set: a stale socket file makes an unreachable server (audio_app.rs `--unreachable`).
@@ -781,7 +779,6 @@ impl Runtime {
             audio_service: true,
             audio_break_cblk: false,
             media_player_service: true,
-            gl_selection: true,
             audio_break_mix: false,
             pipewire_remote: None,
             wayland: None,
@@ -1024,12 +1021,6 @@ impl Runtime {
     /// Apps start with `--no-media-player-service`: they serve no media.player (app.rs `--media-player-break`, test only).
     pub fn without_media_player_service(mut self) -> Self {
         self.media_player_service = false;
-        self
-    }
-
-    /// Packages install with the native GL driver: no owner row, no ES1 rule (app.rs `--gl-selection-break`, test only). Since the driver serves ES1 contexts itself (gl-honesty H2a) this run is green: the routing-keys-empty run until H3 deletes the selection.
-    pub fn without_gl_selection(mut self) -> Self {
-        self.gl_selection = false;
         self
     }
 
@@ -1670,9 +1661,6 @@ impl Runtime {
         }
         if !self.media_player_service {
             cmd.arg("--no-media-player-service");
-        }
-        if !self.gl_selection {
-            cmd.arg("--no-gl-selection");
         }
         if self.audio_break_mix {
             cmd.arg("--break-mix");

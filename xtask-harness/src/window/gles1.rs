@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Stage `gles1` of `xtask test window` (gl-honesty H2b): the GLES1 fixture (xtask-harness/testdata/gles1, Main.java), a Java-only GLSurfaceView that never sets a client version, so its context is ES 1 (GLSurfaceView's default) and the GL driver serves it with embedded ANGLE (atl-egl-driver es1.rs). Run with routing keys empty (`Runtime::without_gl_selection`).
-//! Sub-gates ([`checks`]): `probe` (the window acked, the fixture read back, the picture settled), `version` (the context is ANGLE's ES 1.1), `readback` (the app's glReadPixels at each probe is the expectation), `composed` (the picture at each probe), `present` (no failed present).
+//! Stage `gles1` of `xtask test window` (gl-honesty H2b): the GLES1 fixture (xtask-harness/testdata/gles1, Main.java), a Java-only GLSurfaceView that never sets a client version, so its context is ES 1 (GLSurfaceView's default) and the GL driver serves it with embedded ANGLE (atl-egl-driver es1.rs).//! Sub-gates ([`checks`]): `probe` (the window acked, the fixture read back, the picture settled), `version` (the context is ANGLE's ES 1.1), `readback` (the app's glReadPixels at each probe is the expectation), `composed` (the picture at each probe), `present` (no failed present).
 //! The expectation is Main.java's PROBES (worked out from its scene in the comment there), parsed from the fixture source: one copy.
 
 use std::path::Path;

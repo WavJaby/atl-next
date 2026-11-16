@@ -49,9 +49,6 @@ struct Args {
     /// framework-res's permission definitions: a JSON array of `PermissionDecl` (the grant rule's platform half). Omitted: no platform permission is granted.
     #[arg(long)]
     platform_permissions: Option<PathBuf>,
-    /// Test only: every package gets the native GL driver (the GL selection gate's break).
-    #[arg(long)]
-    no_gl_selection: bool,
     /// A shared library an app may `<uses-library>`: `<name>=<jar path as the app processes see it>[,<dependency name>...]` (repeat). SystemConfig's `<library name file dependency>`.
     #[arg(long = "shared-library", value_parser = Library::parse_arg)]
     shared_libraries: Vec<(String, Library)>,
@@ -209,7 +206,6 @@ fn main() -> Result<()> {
     // the package list: installed now through the host's file work (atl_services::install), before any service answers
     let config = install::Config {
         abis: a.abis.clone(),
-        no_gl_selection: a.no_gl_selection,
     };
     // one appId pool across the system scan and the sessions, system packages first (PMS's boot order)
     let mut ids = AppIds::new();

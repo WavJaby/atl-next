@@ -16,7 +16,7 @@
 
 static GLubyte es1_px[ES1_W * ES1_H * 4];
 
-// 1 when GL_VERSION is GLES 1.x served by ANGLE ("OpenGL ES 1." and "ANGLE"; ES1 is ANGLE-only, gl_driver.rs), else 0 (no current context: 0).
+// 1 when GL_VERSION is GLES 1.x served by ANGLE ("OpenGL ES 1." and "ANGLE"; the driver embeds ANGLE for ES1 contexts, atl-egl-driver es1.rs), else 0 (no current context: 0).
 JNI_FN(jint, es1Version)(JNIEnv *env, jclass cls)
 {
     const char *v = (const char *)glGetString(GL_VERSION);

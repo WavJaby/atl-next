@@ -30,21 +30,21 @@ impl ControlSocket {
         }
     }
 
-    /// Renames session `session`'s files to `names`, moves it to `/data/app/<package>` and creates its data dirs: the native library that needs ES1, if any.
+    /// Renames session `session`'s files to `names`, moves it to `/data/app/<package>` and creates its data dirs.
     pub fn commit(
         &self,
         session: u32,
         package: &str,
         uid: u32,
         names: Vec<StagedName>,
-    ) -> io::Result<Option<String>> {
+    ) -> io::Result<()> {
         match self.call(&Request::Commit {
             session,
             package: package.to_owned(),
             uid,
             names,
         })? {
-            Response::Committed { es1_library } => Ok(es1_library),
+            Response::Committed => Ok(()),
             Response::Error { message } => Err(io::Error::other(message)),
             other => Err(io::Error::other(format!("commit answered {other:?}"))),
         }
@@ -61,14 +61,14 @@ impl ControlSocket {
         }
     }
 
-    /// Accepts scan `dir` as `package` of `uid`: its data dirs are created; the native library that needs ES1, if any.
-    pub fn scan_commit(&self, dir: &str, package: &str, uid: u32) -> io::Result<Option<String>> {
+    /// Accepts scan `dir` as `package` of `uid`: its data dirs are created.
+    pub fn scan_commit(&self, dir: &str, package: &str, uid: u32) -> io::Result<()> {
         match self.call(&Request::ScanCommit {
             dir: dir.to_owned(),
             package: package.to_owned(),
             uid,
         })? {
-            Response::Committed { es1_library } => Ok(es1_library),
+            Response::Committed => Ok(()),
             Response::Error { message } => Err(io::Error::other(message)),
             other => Err(io::Error::other(format!("scan commit answered {other:?}"))),
         }

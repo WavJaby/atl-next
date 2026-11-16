@@ -45,7 +45,6 @@ use atl_gralloc::vintf;
 use atl_property_service::{LinearTier, Property};
 use atl_services_types::compositor_registry;
 use atl_services_types::display_model::DisplayModel;
-use atl_services_types::gl_driver;
 use atl_services_types::native_libs::LIB_DIR_NAME;
 use atl_services_types::packages::Library;
 use atl_services_types::system_packages;
@@ -242,9 +241,6 @@ struct Args {
     /// Test only: apps start with `--no-media-player-service` (their launcher serves no media.player), the deliberate break of the media player gate.
     #[arg(long)]
     no_media_player_service: bool,
-    /// Test only: every package installs with the native GL driver (no owner row, no ES1 rule): the routing-keys-empty run (app / run-apk gates) until gl-honesty H3 deletes the selection.
-    #[arg(long)]
-    no_gl_selection: bool,
     /// Test only: apps start with `--break-mix` (their AudioFlinger's mixer plays silence), the audio gate's third break.
     #[arg(long)]
     break_mix: bool,
@@ -593,15 +589,12 @@ const FEATURES_TOUCHSCREEN: [(&str, i32); 2] = [
     ("android.hardware.touchscreen", 0),
     ("android.hardware.faketouch", 0),
 ];
-/// PackageManager.FEATURE_OPENGLES_EXTENSION_PACK (frameworks/native/data/etc/android.hardware.opengles.aep.xml). Withheld while `gl_driver::ANGLE_GL_CEILING` withholds it ([`device_gl`]).
+/// PackageManager.FEATURE_OPENGLES_EXTENSION_PACK (frameworks/native/data/etc/android.hardware.opengles.aep.xml).
 const FEATURE_OPENGLES_AEP: (&str, i32) = ("android.hardware.opengles.aep", 0);
 
-/// The device's extension pack and GLES version for a probed host GL: the pack only where `cap` allows it; the version is the host's, `GlCeiling` has no version field.
-fn device_gl(gl_version: &str, aep: bool, cap: &gl_driver::GlCeiling) -> (bool, Option<Property>) {
-    (
-        aep && cap.aep,
-        atl_property_service::gles_version(gl_version),
-    )
+/// The device's extension pack and GLES version for a probed host GL, both the host's: AOSP keeps one device-wide list and the driver answers per context (gl-honesty M74 D1). The version is unset unless GL_VERSION is GLES's.
+fn device_gl(gl_version: &str, aep: bool) -> (bool, Option<Property>) {
+    (aep, atl_property_service::gles_version(gl_version))
 }
 
 /// Writes [`HOST_FEATURES_FILE`] (also when empty: the file says which run found nothing) and logs `features: host <names>`.
@@ -652,53 +645,6 @@ fn partition_file(s: &str) -> Result<(PathBuf, PathBuf), String> {
         ));
     }
     Ok((PathBuf::from(host), rel.to_path_buf()))
-}
-
-/// The file name of the first native library of the package that DT_NEEDs [`gl_driver::ES1_LIB`]: the install-time ES1 rule (an ES1 app links it, or a JNI fixture of one does); the services log it as the rule's reason.
-/// Reads the `lib/<abi>/*.so` entries of every APK in `code`: the APKs hold every library whether or not the installer extracted it (extractNativeLibs=false leaves them only there, Doodle Jump).
-fn es1_library(code: &Path) -> Result<Option<String>> {
-    use std::io::Read;
-    for entry in std::fs::read_dir(code)? {
-        let apk = entry?.path();
-        if !apk.extension().is_some_and(|e| e == "apk") {
-            continue;
-        }
-        let file =
-            std::fs::File::open(&apk).with_context(|| format!("opening {}", apk.display()))?;
-        let mut zip =
-            zip::ZipArchive::new(file).with_context(|| format!("reading {}", apk.display()))?;
-        for i in 0..zip.len() {
-            let mut f = zip
-                .by_index(i)
-                .with_context(|| format!("reading {}", apk.display()))?;
-            let name = f
-                .name()
-                .with_context(|| format!("reading {}", apk.display()))?
-                .into_owned();
-            let lib = name.strip_prefix("lib/").and_then(|r| r.split_once('/'));
-            if !lib.is_some_and(|(_, so)| !so.contains('/') && so.ends_with(".so")) {
-                continue;
-            }
-            let mut data = Vec::new();
-            f.read_to_end(&mut data)
-                .with_context(|| format!("{}!/{name}", apk.display()))?;
-            // a `.so` that is not ELF is data (Unity's `libil2cpp.usym.so`), not a library; ELF magic = e_ident[EI_MAG0..3]
-            if !data.starts_with(b"\x7fELF") {
-                continue;
-            }
-            let at = PathBuf::from(format!("{}!/{name}", apk.display()));
-            let (_, needed) = atl_broker::elf_deps_in(&at, &data)?;
-            if needed.iter().any(|n| n == gl_driver::ES1_LIB) {
-                return Ok(Some(so_name(&name).to_owned()));
-            }
-        }
-    }
-    Ok(None)
-}
-
-/// The file name of an APK entry `lib/<abi>/<name>.so`.
-fn so_name(entry: &str) -> &str {
-    entry.rsplit('/').next().unwrap_or(entry)
 }
 
 /// installd's file work for the services' install (owner option I): the sessions' files, the installer's view, and what was staged and committed.
@@ -884,14 +830,8 @@ impl Host {
         }
     }
 
-    /// Request `Commit`: session `session` (staged for `uid`) becomes `/data/app/<package>` (PackageInstallerSession's rename), with its data dirs (installd createAppData) and external dirs; the native library that needs ES1, if any.
-    fn commit(
-        &self,
-        session: u32,
-        package: &str,
-        uid: u32,
-        names: &[StagedName],
-    ) -> Result<Option<String>> {
+    /// Request `Commit`: session `session` (staged for `uid`) becomes `/data/app/<package>` (PackageInstallerSession's rename), with its data dirs (installd createAppData) and external dirs.
+    fn commit(&self, session: u32, package: &str, uid: u32, names: &[StagedName]) -> Result<()> {
         ensure!(
             valid_package_name(package),
             "{package:?}: not a package name"
@@ -914,11 +854,10 @@ impl Host {
         std::fs::rename(&staged_dir, &code)
             .with_context(|| format!("moving session {session} to {}", code.display()))?;
         self.create_app_data(package)?;
-        let es1 = es1_library(&code)?;
         staged.remove(&session);
         committed.insert(package.to_owned(), Committed { uid, system: false });
         log(format_args!("installed {package}: uid {uid}"));
-        Ok(es1)
+        Ok(())
     }
 
     /// Request `Scan`: runs the installer over the preinstalled package dir `dir` (an Android path), which must be one atl-services-types `system_packages::scan` finds in the root: parse only, in
@@ -980,7 +919,7 @@ impl Host {
     /// Request `ScanCommit`: scanned `dir` is package `package` of `uid`: its data dirs and external dirs (installd createAppData, as for any package); no ES1 fact (no native-library root).
     /// Unlike a session's commit, a system uid is accepted: a system package of a predefined shared user runs as that user's fixed uid (android.uid.system = 1000), and only the runtime's
     /// read-only partitions are scanned. Root and the installer's uid stay refused.
-    fn scan_commit(&self, dir: &str, package: &str, uid: u32) -> Result<Option<String>> {
+    fn scan_commit(&self, dir: &str, package: &str, uid: u32) -> Result<()> {
         ensure!(
             uid != atl_services_types::permission::ROOT_UID && uid != INSTALLER_UID,
             "uid {uid}: root or the installer's ({INSTALLER_UID}); no package runs as either"
@@ -1005,7 +944,7 @@ impl Host {
         self.create_app_data(package)?;
         committed.insert(package.to_owned(), Committed { uid, system: true });
         log(format_args!("scanned {package}: uid {uid}, code {dir}"));
-        Ok(None)
+        Ok(())
     }
 
     /// installd createAppData: the package's data dirs and its external dirs.
@@ -1673,11 +1612,11 @@ fn serve_control(host: Arc<Host>, fd: std::os::fd::OwnedFd) {
                 names,
             } => host
                 .commit(session, &package, uid, &names)
-                .map(|es1_library| Response::Committed { es1_library }),
+                .map(|()| Response::Committed),
             Request::Scan { dir } => host.scan(&dir).map(|frames| Response::Staged { frames }),
             Request::ScanCommit { dir, package, uid } => host
                 .scan_commit(&dir, &package, uid)
-                .map(|es1_library| Response::Committed { es1_library }),
+                .map(|()| Response::Committed),
         };
         outcome.unwrap_or_else(|e| {
             log(format_args!("control request failed: {e:#}"));
@@ -2110,17 +2049,9 @@ fn run(a: &Args) -> Result<ExitCode> {
             }
         };
         // the extension pack (a device with it declares the feature, CDD 7.1.4.1, as its vendor permission file does) and the GLES version of the path that runs (the vendor build.prop's, on Android); unset when no probe answered or the string is not GLES's; both via device_gl
-        let advertised = ran.as_ref().map(|r| {
-            (
-                r,
-                device_gl(&r.version, r.aep, &gl_driver::ANGLE_GL_CEILING),
-            )
-        });
+        let advertised = ran.as_ref().map(|r| (r, device_gl(&r.version, r.aep)));
         match advertised {
             Some((r, (aep, gles))) => {
-                if r.aep && !aep {
-                    log(format_args!("features: aep withheld (ANGLE GL backend)"));
-                }
                 if aep {
                     host_features.push(FEATURE_OPENGLES_AEP);
                 }
@@ -2271,9 +2202,6 @@ fn run(a: &Args) -> Result<ExitCode> {
     }
     if let Some(p) = &a.platform_permissions {
         services_args.extend(["--platform-permissions".into(), p.into()]);
-    }
-    if a.no_gl_selection {
-        services_args.push("--no-gl-selection".into());
     }
     for library in &libraries {
         services_args.extend(["--shared-library".into(), library.into()]);
@@ -2569,15 +2497,14 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
-    /// The device's extension pack and GLES version for a host GL: the pack only where the ANGLE ceiling allows it; the version is the host's, encoded major << 16 | minor (GLES_VERSION).
+    /// The device's extension pack and GLES version are the host's (no ceiling, gl-honesty H3); the version is encoded major << 16 | minor (GLES_VERSION).
     #[test]
-    fn device_gl_withholds_aep_keeps_gles_version() {
-        let cap = gl_driver::ANGLE_GL_CEILING;
-        // ES 3.2 with the pack (sifive): pack withheld, version kept
+    fn device_gl_is_the_hosts() {
+        // ES 3.2 with the pack (sifive): both kept
         assert_eq!(
-            device_gl("OpenGL ES 3.2 Mesa 22.3.5", true, &cap),
+            device_gl("OpenGL ES 3.2 Mesa 22.3.5", true),
             (
-                false,
+                true,
                 Some((
                     "ro.opengles.version".to_owned(),
                     ((3 << 16) | 2).to_string()
@@ -2586,7 +2513,7 @@ mod tests {
         );
         // ES 3.1 without the pack (WSL D3D12): unchanged
         assert_eq!(
-            device_gl("OpenGL ES 3.1 Mesa 25.0.7-2", false, &cap),
+            device_gl("OpenGL ES 3.1 Mesa 25.0.7-2", false),
             (
                 false,
                 Some((
@@ -2597,29 +2524,14 @@ mod tests {
         );
         // ES 2.0: unchanged
         assert_eq!(
-            device_gl("OpenGL ES 2.0", false, &cap),
+            device_gl("OpenGL ES 2.0", false),
             (
                 false,
                 Some(("ro.opengles.version".to_owned(), (2 << 16).to_string()))
             )
         );
         // not a GLES string: unset
-        assert_eq!(device_gl("4.6 (Core Profile)", true, &cap), (false, None));
-        // ceiling lifted: the host's answer passes through
-        assert_eq!(
-            device_gl(
-                "OpenGL ES 3.2 Mesa 22.3.5",
-                true,
-                &gl_driver::GlCeiling { aep: true }
-            ),
-            (
-                true,
-                Some((
-                    "ro.opengles.version".to_owned(),
-                    ((3 << 16) | 2).to_string()
-                ))
-            )
-        );
+        assert_eq!(device_gl("4.6 (Core Profile)", true), (true, None));
     }
 
     /// KernelLogLine's shape (`<6>` = INFO, libbase logging.cpp) becomes a stamped logcat line atl-diag reads; other lines pass unchanged.
@@ -2655,128 +2567,6 @@ mod tests {
             staged: staged.into(),
             name: name.into(),
         }
-    }
-
-    /// A minimal ELF64 LE shared object whose only dynamic entry is DT_NEEDED `needed`: header, .dynstr, .dynamic, .shstrtab, section table (layouts from the ELF spec / gABI).
-    fn elf_needing(needed: &str) -> Vec<u8> {
-        let u16b = |v: u16| v.to_le_bytes().to_vec();
-        let u32b = |v: u32| v.to_le_bytes().to_vec();
-        let u64b = |v: u64| v.to_le_bytes().to_vec();
-        let pad8 = |b: &mut Vec<u8>| b.resize(b.len().next_multiple_of(8), 0);
-        let mut dynstr = vec![0u8];
-        dynstr.extend_from_slice(needed.as_bytes());
-        dynstr.push(0);
-        let shstr = b"\0.dynstr\0.dynamic\0.shstrtab\0";
-        // shstrtab name offsets of ".dynstr", ".dynamic", ".shstrtab" in `shstr`
-        let (n_dynstr, n_dynamic, n_shstrtab) = (1u32, 9u32, 18u32);
-        let ehsize = 64;
-        let mut body = Vec::new();
-        let dynstr_off = ehsize;
-        body.extend_from_slice(&dynstr);
-        pad8(&mut body);
-        let dynamic_off = ehsize + body.len();
-        // DT_NEEDED (1) -> dynstr offset 1; DT_NULL (0)
-        for (tag, val) in [(1u64, 1u64), (0, 0)] {
-            body.extend(u64b(tag));
-            body.extend(u64b(val));
-        }
-        let shstr_off = ehsize + body.len();
-        body.extend_from_slice(shstr);
-        pad8(&mut body);
-        let shoff = ehsize + body.len();
-        let mut out = b"\x7fELF".to_vec();
-        // ELFCLASS64, ELFDATA2LSB, EV_CURRENT, ELFOSABI_NONE, 8 pad bytes
-        out.extend([2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        // ET_DYN, EM_AARCH64 (183), EV_CURRENT, entry, phoff
-        out.extend(u16b(3));
-        out.extend(u16b(183));
-        out.extend(u32b(1));
-        out.extend(u64b(0));
-        out.extend(u64b(0));
-        out.extend(u64b(shoff as u64));
-        // flags, ehsize, phentsize, phnum, shentsize, shnum, shstrndx
-        out.extend(u32b(0));
-        for v in [64u16, 56, 0, 64, 4, 3] {
-            out.extend(u16b(v));
-        }
-        out.extend(body);
-        // (name, type, flags, offset, size, link, entsize): null, SHT_STRTAB, SHT_DYNAMIC (SHF_ALLOC, link .dynstr), SHT_STRTAB
-        let sections = [
-            (0, 0, 0, 0, 0, 0, 0),
-            (n_dynstr, 3, 2, dynstr_off, dynstr.len(), 0, 0),
-            (n_dynamic, 6, 2, dynamic_off, 32, 1, 16),
-            (n_shstrtab, 3, 0, shstr_off, shstr.len(), 0, 0),
-        ];
-        for (name, ty, flags, off, size, link, entsize) in sections {
-            out.extend(u32b(name));
-            out.extend(u32b(ty));
-            out.extend(u64b(flags));
-            out.extend(u64b(0));
-            out.extend(u64b(off as u64));
-            out.extend(u64b(size as u64));
-            out.extend(u32b(link));
-            out.extend(u32b(0));
-            out.extend(u64b(8));
-            out.extend(u64b(entsize));
-        }
-        out
-    }
-
-    /// `dir/<apk>` holding `entries` (name, bytes), stored as an extractNativeLibs=false APK keeps its libraries.
-    fn apk_with(dir: &Path, apk: &str, entries: &[(&str, &[u8])]) {
-        let mut w = zip::ZipWriter::new(std::fs::File::create(dir.join(apk)).expect("apk"));
-        let opts = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
-        for (name, data) in entries {
-            w.start_file(*name, opts).expect("entry");
-            w.write_all(data).expect("data");
-        }
-        w.finish().expect("finish");
-    }
-
-    /// The ES1 rule reads the APKs' `lib/<abi>/` entries: an ES1 library kept inside a split APK (extractNativeLibs=false, nothing under the code dir's `lib/`) selects ANGLE; a library needing only other libs does not.
-    #[test]
-    fn es1_rule_reads_libraries_inside_apks() {
-        let dir = staged("es1-apk", &[]);
-        let es2 = elf_needing("libGLESv2.so");
-        apk_with(
-            &dir,
-            "base.apk",
-            &[("classes.dex", b"dex"), ("lib/arm64-v8a/libother.so", &es2)],
-        );
-        assert_eq!(es1_library(&dir).expect("no error"), None);
-        let es1 = elf_needing(gl_driver::ES1_LIB);
-        apk_with(
-            &dir,
-            "split_config.arm64_v8a.apk",
-            &[("lib/arm64-v8a/libgame.so", &es1)],
-        );
-        // the rule's reason names the library that matched
-        assert_eq!(
-            es1_library(&dir).expect("no error").as_deref(),
-            Some("libgame.so")
-        );
-        std::fs::remove_dir_all(&dir).expect("cleanup");
-    }
-
-    /// A `.so` under `lib/<abi>/` that is not ELF (Unity's symbol data `libil2cpp.usym.so`, Angry Birds 2) is data, not a library: the ES1 rule skips it instead of failing the commit.
-    #[test]
-    fn es1_rule_skips_non_elf_so_files() {
-        let dir = staged("es1", &[]);
-        apk_with(
-            &dir,
-            "base.apk",
-            &[("lib/arm64-v8a/libil2cpp.usym.so", b"USYM symbol data")],
-        );
-        assert_eq!(es1_library(&dir).expect("no error"), None);
-        // a truncated ELF is still read as one, and its error still fails the commit: the ELF magic (e_ident[EI_MAG0..3]) and nothing after it
-        apk_with(
-            &dir,
-            "base.apk",
-            &[("lib/arm64-v8a/libbroken.so", b"\x7fELF")],
-        );
-        assert!(es1_library(&dir).is_err());
-        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     /// Files staged under source names, one of which already carries another file's target name: each ends under its parsed name with its own bytes.

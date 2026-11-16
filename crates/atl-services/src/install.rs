@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! The services' install (owner option I, 2026-11-13): PackageManagerService's half. The host does the file work (atld: staging, the installer run, the rename, the data dirs; installd's role) over the
 //! control socket; here the installer's frames are decoded ([`crate::installed`]) into the package's record: PMS's per-install fields (uid, code and data paths) set on its PackageInfo, its instruction
-//! set from `primaryCpuAbi`, the GL driver from the owner table and the host's ES1 fact. Permission states are the PermissionManager's (`packages::Permissions`), made from these records.
+//! set from `primaryCpuAbi`. Permission states are the PermissionManager's (`packages::Permissions`), made from these records.
 //! All or nothing: any session that fails (installer exit, decode, commit) fails the install, and no package is registered.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
@@ -12,7 +11,7 @@ use atl_android_paths::{DATA_APP, DATA_USER, DATA_USER_DE};
 use atl_broker::control::StagedName;
 use atl_parcelables::android::content::pm::{ApplicationInfo, PackageInfo};
 use atl_services_types::native_libs::{SupportedAbi, instruction_set};
-use atl_services_types::{gl_driver, system_packages};
+use atl_services_types::system_packages;
 
 use crate::activity::log;
 use crate::app_id::AppIds;
@@ -24,8 +23,6 @@ use crate::process_control::ControlSocket;
 pub struct Config {
     /// The device's ABIs, preferred first: primaryCpuAbi -> instruction set.
     pub abis: Vec<SupportedAbi>,
-    /// Test only: every package gets the native GL driver (the GL selection gate's break).
-    pub no_gl_selection: bool,
 }
 
 /// Installs every session the host holds files for, in order (PMS's boot scan of installed packages), after the system packages `records` (the scan's): every record the services answer from. Each
@@ -38,7 +35,6 @@ pub fn install(
     mut records: Vec<PackageRecord>,
 ) -> Result<Vec<PackageRecord>> {
     ensure!(!c.abis.is_empty(), "no device ABI");
-    let owner = gl_driver::owner_table(gl_driver::OWNER_TABLE).map_err(anyhow::Error::msg)?;
     for &session in sessions {
         let uid = ids.acquire().context("no application id left")?;
         let frames = control
@@ -57,19 +53,11 @@ pub fn install(
             .with_context(|| format!("session {session}: no ApplicationInfo"))
             .and_then(staged_names)
             .with_context(|| format!("session {session}"))?;
-        let es1_library = control
+        control
             .commit(session, &parsed.name, uid, names)
             .with_context(|| format!("committing {}", parsed.name))?;
         let code_dir = format!("{DATA_APP}/{}", parsed.name);
-        records.push(parsed.record(
-            uid,
-            &code_dir,
-            true,
-            (0, 0),
-            es1_library.as_deref(),
-            &owner,
-            c,
-        ));
+        records.push(parsed.record(uid, &code_dir, true, (0, 0), c));
     }
     Ok(records)
 }
@@ -84,7 +72,6 @@ pub fn scan(
     c: &Config,
 ) -> Result<Vec<PackageRecord>> {
     ensure!(!c.abis.is_empty(), "no device ABI");
-    let owner = gl_driver::owner_table(gl_driver::OWNER_TABLE).map_err(anyhow::Error::msg)?;
     let found =
         system_packages::scan(root).with_context(|| format!("scanning {}", root.display()))?;
     let mut skipped = found.skipped.len();
@@ -121,18 +108,10 @@ pub fn scan(
             None => ids.acquire(),
         }
         .context("no application id left")?;
-        let es1_library = control
+        control
             .scan_commit(&dir, &parsed.name, uid)
             .with_context(|| format!("committing scanned {}", parsed.name))?;
-        records.push(parsed.record(
-            uid,
-            &dir,
-            false,
-            (d.flags, d.private_flags),
-            es1_library.as_deref(),
-            &owner,
-            c,
-        ));
+        records.push(parsed.record(uid, &dir, false, (d.flags, d.private_flags), c));
     }
     log(format_args!(
         "scan: {} system packages, {skipped} skipped",
@@ -162,16 +141,13 @@ impl Parsed {
         })
     }
 
-    /// The package's record: PMS's per-package fields (uid, code and data paths, flags by location), its instruction set from `primaryCpuAbi`, the GL driver.
-    #[allow(clippy::too_many_arguments)]
+    /// The package's record: PMS's per-package fields (uid, code and data paths, flags by location), its instruction set from `primaryCpuAbi`.
     fn record(
         self,
         uid: u32,
         code_dir: &str,
         uniform_names: bool,
         (flags, private_flags): (i32, i32),
-        es1_library: Option<&str>,
-        owner: &BTreeMap<String, gl_driver::GlDriver>,
         c: &Config,
     ) -> PackageRecord {
         let Parsed {
@@ -183,14 +159,6 @@ impl Parsed {
             .application_info
             .as_ref()
             .and_then(|a| a.primary_cpu_abi.clone());
-        let gl = if c.no_gl_selection {
-            gl_driver::Selection {
-                driver: gl_driver::GlDriver::Native,
-                reason: gl_driver::Reason::SelectionOff,
-            }
-        } else {
-            gl_driver::select(owner, &name, es1_library)
-        };
         let isa = instruction_set(primary.as_deref(), &c.abis).to_owned();
         InstallFields {
             uid,
@@ -219,7 +187,6 @@ impl Parsed {
             force_queryable: installed.force_queryable,
             uid,
             instruction_set: isa,
-            gl,
         }
     }
 }

@@ -720,7 +720,6 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
- "toml",
 ]
 
 [[package]]
@@ -792,7 +791,6 @@ dependencies = [
  "serde",
  "serde_json",
  "signal-hook",
- "zip",
 ]
 
 [[package]]

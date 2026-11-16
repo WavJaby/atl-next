@@ -1602,23 +1602,9 @@ impl IActivityManager for ActivityManager {
             .as_binder()
             .link_to_death(&mut death)
             .map_err(|e| illegal_state(&format!("linkToDeath: {e:?}")))?;
-        // one line per app process: the driver its libEGL loads (the core settings below) and the rule that chose it
-        log(format_args!("gl-driver {process_name} pid {pid}: {}", p.gl));
-        let core_settings = match atl_services_types::gl_driver::selection(
-            inner.packages.all().iter().map(|p| (p.name(), p.gl.driver)),
-        ) {
-            Some((pkgs, values)) => Bundle::from_strings(&[
-                (atl_services_types::gl_driver::SELECTION_PKGS, pkgs.as_str()),
-                (
-                    atl_services_types::gl_driver::SELECTION_VALUES,
-                    values.as_str(),
-                ),
-            ]),
-            None => Bundle::default(),
-        };
         // what attachApplicationLocked passes for a plain app start (no profiler, backup or sdk sandbox): nulls, the global configuration, the default compat info,
-        // the process's providers (generateApplicationProvidersLocked; ActivityThread installs them before Application.onCreate), no disabled compat changes; coreSettings never null (empty unless an app takes ANGLE) (attachApplicationLocked passes
-        // mCoreSettingsObserver.getCoreSettingsLocked(), and ActivityThread.updateDebugViewAttributeState reads it unconditionally); its keys are the GL driver selection (gl_driver.rs), nothing else.
+        // the process's providers (generateApplicationProvidersLocked; ActivityThread installs them before Application.onCreate), no disabled compat changes; coreSettings never null (empty: ATL writes no keys, gl-honesty D5) (attachApplicationLocked passes
+        // mCoreSettingsObserver.getCoreSettingsLocked(), and ActivityThread.updateDebugViewAttributeState reads it unconditionally); its keys are AOSP's own; ATL writes none (gl-honesty D5).
         // An instrumentation passes its class, arguments, watcher and UiAutomation connection (:4723-4737).
         let (test_name, test_arguments, test_watcher, test_ui) = match instr {
             Some(i) => (
@@ -1663,7 +1649,7 @@ impl IActivityManager for ActivityManager {
             )),
             Some(&CompatibilityInfo::default()),
             None,
-            Some(&core_settings),
+            Some(&Bundle::default()),
             Some(BUILD_UNKNOWN),
             None,
             None,

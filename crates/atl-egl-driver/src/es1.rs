@@ -280,7 +280,7 @@ pub fn lookup(ctx: e::EGLContext) -> Option<Arc<Es1Context>> {
 }
 
 /// The ES1 lib must be the one libEGL loaded from the driver dir: without it Loader.cpp fills the ES1 table by `dlsym(NULL, ...)`, which finds the fronts' own gl* (they would call themselves).
-fn es1_library() -> Result<(), String> {
+fn es1_lib_placed() -> Result<(), String> {
     let path = format!("{VENDOR_EGL}/{GL_DRIVER_GLES1}");
     // SAFETY: NOLOAD only looks the library up: nothing is loaded, no constructor runs.
     unsafe { Library::open(Some(&path), RTLD_NOW | RTLD_NOLOAD) }
@@ -299,7 +299,7 @@ pub fn create(d: &'static Driver, config: e::EGLConfig, share: e::EGLContext) ->
             "ES1 with an ES2/3 context: the two engines share no objects"
         });
     }
-    if let Err(why) = es1_library() {
+    if let Err(why) = es1_lib_placed() {
         log(&format!("es1 context refused: {why}"));
         return fail(e::EGL_BAD_ALLOC, std::ptr::null_mut());
     }

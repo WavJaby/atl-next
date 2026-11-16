@@ -59,9 +59,6 @@ pub struct Args {
     /// Deliberate-failure check: apps run without the app seccomp filter (atl-broker seccomp.rs). Without the filter the app's queued-work looper dies with SecurityException.
     #[arg(long)]
     no_app_seccomp: bool,
-    /// The package installs with the native GL driver (atld `--no-gl-selection`: no owner row, no ES1 rule, routing keys empty): an ES1 app's contexts then run on the driver's embedded ANGLE (gl-honesty H2a gate) instead of a routed ANGLE. Until H3 deletes the selection.
-    #[arg(long)]
-    no_gl_selection: bool,
     /// Deliberate-failure check: every device ABI maps to the host ISA (atld_run `with_broken_instruction_set`), so a foreign-ABI app gets the host ISA from the broker and its bridge runs identity.
     #[arg(long)]
     break_isa: bool,
@@ -153,7 +150,6 @@ impl Args {
             log_tags: "*:i".to_owned(),
             verbose: false,
             no_app_seccomp: false,
-            no_gl_selection: false,
             break_isa: false,
             break_render_path: false,
             pointer: None,
@@ -312,7 +308,6 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         log_tags: "*:i".to_owned(),
         verbose: false,
         no_app_seccomp: false,
-        no_gl_selection: false,
         break_isa: false,
         break_render_path: false,
         pointer: a.pointer.clone(),
@@ -535,11 +530,6 @@ fn runtime(
                 .with_qemu_engine(root, &a.isa)?
         }
         None => rt,
-    };
-    let rt = if args.no_gl_selection {
-        rt.without_gl_selection()
-    } else {
-        rt
     };
     let rt = if args.no_app_seccomp {
         rt.without_app_seccomp()

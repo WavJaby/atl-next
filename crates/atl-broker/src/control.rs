@@ -99,10 +99,8 @@ pub enum Response {
     Staged {
         frames: String,
     },
-    /// The package is in place; `es1_library`: the file name of a native library of it that DT_NEEDs libGLESv1_CM (the ES1 rule's file fact; the services choose the driver and log it).
-    Committed {
-        es1_library: Option<String>,
-    },
+    /// The package is in place.
+    Committed,
     Error {
         message: String,
     },
