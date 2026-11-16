@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_void};
 use std::sync::Mutex;
 
-use super::objects::Class;
+use super::objects::{Class, Sig};
 use super::{Active, active, unsupported};
 
 /// The identity engine's table: the host arch's NBS libc stub list, every shim bound.
@@ -29,7 +29,7 @@ struct Table {
     mapped_rows: &'static [MappedRow],
     mapped_fns: &'static [MappedFn],
     provider_soname: &'static str,
-    prototypes: &'static [(&'static str, Class, Option<&'static str>)],
+    prototypes: &'static [(&'static str, Sig, Option<&'static str>)],
 }
 
 /// An `Entry::Mapped` row: library, symbol, the (parameter, map) pairs (build.rs from atl_bridgegen `jni::route`).
@@ -77,8 +77,8 @@ fn qemu_table() -> Table {
     }
 }
 
-/// The process engine's prototype descriptors (build.rs `PROTOTYPES`): name, return class, the QEMU lane refusal of its parameters (None: carried). Engine/proc.rs binds a host answer for a name with no row by one.
-pub fn prototypes() -> &'static [(&'static str, Class, Option<&'static str>)] {
+/// The process engine's prototype descriptors (build.rs `PROTOTYPES`): name, lanes, the QEMU lane refusal of its parameters (None: carried). Engine/proc.rs binds a host answer for a name with no row by one.
+pub fn prototypes() -> &'static [(&'static str, Sig, Option<&'static str>)] {
     table().prototypes
 }
 
@@ -96,8 +96,8 @@ pub enum Host {
 /// What a stub binds to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Entry {
-    /// this symbol of that host library, whose result is of class `Class` (the proxy prototype's `ret`; integer for every libc row)
-    Generic(Host, &'static str, Class),
+    /// this symbol of that host library, of lanes `Sig` (the proxy prototype's; an integer result and no prototype for every libc row)
+    Generic(Host, &'static str, Sig),
     /// [`shim`] of the stub's name
     Shim,
     /// the lane-mapped class (build.rs `ENV_SHIMS`, `CALLBACKS`): `table::MAPPED_FNS[i]` maps the lanes `table::MAPPED_ROWS[i]` names and calls that symbol of the host library (ndk.rs `call_mapped`)
@@ -125,8 +125,8 @@ pub enum Binding {
     Generic {
         host: Host,
         symbol: &'static str,
-        /// the result class the binding answers by (the prototype's `ret`)
-        ret: Class,
+        /// the lanes the binding places and answers by (the prototype's)
+        sig: Sig,
     },
     Shim,
     /// the lane-mapped class: `symbol` of the host library, these parameters mapped first
@@ -157,7 +157,7 @@ fn rows_of(t: Table) -> impl Iterator<Item = (&'static str, &'static str, Bindin
     t.libs.iter().flat_map(move |l| {
         l.stubs.iter().map(move |&(name, e)| {
             let b = match e {
-                Entry::Generic(host, symbol, ret) => Binding::Generic { host, symbol, ret },
+                Entry::Generic(host, symbol, sig) => Binding::Generic { host, symbol, sig },
                 Entry::Shim => Binding::Shim,
                 Entry::Mapped(i) => Binding::Mapped {
                     symbol: t.mapped_rows[i].1,
@@ -215,21 +215,21 @@ fn shim(name: &str) -> Option<usize> {
     })
 }
 
-/// What a stub binds to, with its host address and result class (a thunk is made of it by the caller).
+/// What a stub binds to, with its host address and lanes (a thunk is made of it by the caller).
 pub enum Target {
-    Host(usize, Class),
-    /// a trap aborts, so its class is never read: integer
+    Host(usize, Sig),
+    /// a trap aborts, so its lanes are never read: integer
     Trap(usize),
     /// no host symbol: the stub stays unbound
     Absent,
 }
 
 impl Target {
-    /// The host function the stub's thunk crosses to and its result class; None when absent.
-    pub fn callee(self) -> Option<(usize, Class)> {
+    /// The host function the stub's thunk crosses to and its lanes; None when absent.
+    pub fn callee(self) -> Option<(usize, Sig)> {
         match self {
-            Target::Host(a, ret) => Some((a, ret)),
-            Target::Trap(a) => Some((a, Class::Int)),
+            Target::Host(a, sig) => Some((a, sig)),
+            Target::Trap(a) => Some((a, Sig::INT)),
             Target::Absent => None,
         }
     }
@@ -325,17 +325,17 @@ pub fn target(soname: &str, name: &str) -> Option<Target> {
     let table = table();
     let lib = table.libs.iter().find(|l| l.soname == soname)?;
     let entry = lib.stubs.iter().find(|(n, _)| *n == name).map(|&(_, e)| e);
-    let found = |a: Option<usize>, ret: Class| match a {
-        Some(a) => (Target::Host(a, ret), 0),
+    let found = |a: Option<usize>, sig: Sig| match a {
+        Some(a) => (Target::Host(a, sig), 0),
         None => (Target::Absent, 3),
     };
     let (t, outcome) = match entry {
-        Some(Entry::Generic(host, sym, ret)) => found(symbol(host, lib.soname, sym), ret),
-        Some(Entry::Shim) => found(shim(name), Class::Int),
+        Some(Entry::Generic(host, sym, sig)) => found(symbol(host, lib.soname, sym), sig),
+        Some(Entry::Shim) => found(shim(name), Sig::INT),
         // its host symbol must be there too: the forwarder would abort at the first call otherwise
         Some(Entry::Mapped(i)) => found(
             system_symbol(lib.soname, table.mapped_rows[i].1).map(|_| table.mapped_fns[i] as usize),
-            Class::Int,
+            Sig::INT,
         ),
         // a variable is never a stub: [`variable`] resolves it
         Some(Entry::Variable(..)) => (Target::Absent, 3),

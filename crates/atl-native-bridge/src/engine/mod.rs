@@ -248,15 +248,15 @@ impl Active {
 
     /// A guest-callable address that crosses to host function `target` with an integer result; None when the engine's thunks are used up.
     pub fn bind(self, target: usize) -> Option<usize> {
-        self.bind_result(target, objects::Class::Int)
+        self.bind_result(target, objects::Sig::INT)
     }
 
-    /// [`Active::bind`] for a host function whose result is of class `ret`: the QEMU engine answers the binding trap in x0 or v0 by it. Identity's native call returns in its own registers, so it ignores `ret`.
-    pub fn bind_result(self, target: usize, ret: objects::Class) -> Option<usize> {
+    /// [`Active::bind`] for a host function of lanes `sig`: the QEMU engine places the arguments and answers the binding trap in x0 or v0 by it. Identity's native call passes and returns in its own registers, so it ignores `sig`.
+    pub fn bind_result(self, target: usize, sig: objects::Sig) -> Option<usize> {
         match self {
             #[cfg(atl_nb_identity)]
             Active::Identity => identity::bind(target),
-            Active::Qemu => qemu::bind_result(target, ret),
+            Active::Qemu => qemu::bind_result(target, sig),
         }
     }
 

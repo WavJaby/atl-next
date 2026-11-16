@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering}
 
 use atl_native_bridge::engine::Down;
 use atl_native_bridge::engine::jni::{guest_env, guest_vm, set_method_shorty};
-use atl_native_bridge::engine::objects::Class;
+use atl_native_bridge::engine::objects::{Class, Sig};
 use atl_native_bridge::engine::{Config, Guest, qemu};
 use object::{Object, ObjectSymbol, read::elf::ElfFile64};
 
@@ -610,9 +610,9 @@ fn started(r: Result<Guest, String>) -> u64 {
     out[8] = qemu::bind(snprintf as *const () as usize).expect("a free pool slot") as i64;
     out[9] = text.as_mut_ptr() as i64;
     out[11] = SNP_CAP as i64;
-    // the atof row (`a`): glibc's atof bound with result class Fp (the proxy table's one fp row, glGetPathLengthNV, needs the GL front this gate does not load); its argument is host memory
-    out[12] =
-        qemu::bind_result(atof as *const () as usize, Class::Fp).expect("a free pool slot") as i64;
+    // the atof row (`a`): glibc's atof bound with result class F64 (the proxy table's fp rows need the GL front this gate does not load); its argument is host memory
+    out[12] = qemu::bind_result(atof as *const () as usize, Sig::ret(Class::F64))
+        .expect("a free pool slot") as i64;
     out[13] = ATOF_TEXT.as_ptr() as i64;
     // the down calls (Q6-4): the host calls guest functions through `qemu::down`, as ART calls them: JNI_OnLoad with the host vm, nativeMix and nativeScale with the host env and class. They run before qj_run, which copies what the guest recorded to out[15..]
     // SAFETY: a down shell bound for JNI_OnLoad (Vm kind, no shorty); OnLoadFn is its prototype, rax its answer

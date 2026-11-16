@@ -507,7 +507,7 @@ mod tests {
     use super::place::{THUNK_BYTES, pool};
     use super::*;
     use crate::engine::dispatch::call_binding;
-    use crate::engine::objects::Class;
+    use crate::engine::objects::{Class, Sig};
 
     /// A binding trap runs the host function of its slot with the eight argument words and answers with its result.
     #[test]
@@ -535,13 +535,14 @@ mod tests {
         assert_eq!(call_binding(id, &lanes).x0, 108);
     }
 
-    /// A binding bound with class Fp answers its host function's xmm0 result in v0, and x0 = 0. The target is a host double function of 5.0 halved (its one parameter is the first fp lane).
+    /// A binding bound with result class F64 answers its host function's fp result in v0, and x0 = 0. The target is a host double function of 5.0 halved (its one parameter is the first fp lane).
     #[test]
     fn binding_trap_answers_an_fp_result_in_v0() {
         extern "C" fn half(v0: f64) -> f64 {
             v0 * 0.5
         }
-        let thunk = bind_result(half as *const () as usize, Class::Fp).expect("a free pool slot");
+        let thunk = bind_result(half as *const () as usize, Sig::ret(Class::F64))
+            .expect("a free pool slot");
         let base = &raw const pool::POOL as usize;
         let id = u32::try_from((thunk - base) / THUNK_BYTES).expect("slot fits an id");
         let lanes = atl_engine_api::AtlLanes {
@@ -550,5 +551,29 @@ mod tests {
         };
         let answer = call_binding(id, &lanes);
         assert_eq!((answer.x0, answer.v0), (0, 2.5f64.to_bits()));
+    }
+
+    /// A float binding with its prototype: the guest's s0 (upper lane bits zero, as AArch64 writes it) reaches a host `float(int, float)` as its float on this host (NaN-boxed where its rules say so), and the float result comes back in v0's low 32 bits with the upper ones clear, as AArch64 reads s0.
+    /// 3.0f halved plus the int 1 = 2.5f = 0x4020_0000.
+    #[test]
+    fn binding_trap_places_a_float_by_its_prototype() {
+        extern "C" fn half_plus(i: i32, v: f32) -> f32 {
+            v * 0.5 + i as f32
+        }
+        const PARAMS: &[Class] = &[Class::Int, Class::F32];
+        let sig = Sig {
+            ret: Class::F32,
+            params: Some(PARAMS),
+        };
+        let thunk = bind_result(half_plus as *const () as usize, sig).expect("a free pool slot");
+        let base = &raw const pool::POOL as usize;
+        let id = u32::try_from((thunk - base) / THUNK_BYTES).expect("slot fits an id");
+        let lanes = atl_engine_api::AtlLanes {
+            x: [1, 0, 0, 0, 0, 0, 0, 0],
+            v: [u64::from(3.0f32.to_bits()), 0, 0, 0, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        let answer = call_binding(id, &lanes);
+        assert_eq!((answer.x0, answer.v0), (0, 0x4020_0000));
     }
 }

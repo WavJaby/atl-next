@@ -20,8 +20,26 @@ pub(super) use slots::{
 mod lanes {
     include!(concat!(env!("OUT_DIR"), "/object_lanes.rs"));
 }
-/// Public: the result class a QEMU binding is bound with (`Active::bind_result`).
+/// Public: the classes of a QEMU binding's [`Sig`] (`Active::bind_result`).
 pub use lanes::{Class, LANES, Lane};
+
+/// A host function's lanes as a QEMU binding crosses them (dispatch.rs `call_host`): the result class, and the parameter classes from its prototype.
+/// `params` None: no prototype (a `bind` caller, a libc row): the guest's lanes cross as they stand, which is right for integer arguments and doubles on every host, and for floats where the host keeps them unshaped (SysV).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sig {
+    pub ret: Class,
+    pub params: Option<&'static [Class]>,
+}
+
+impl Sig {
+    /// An integer result, no prototype.
+    pub const INT: Sig = Sig::ret(Class::Int);
+
+    /// Result class `ret`, no prototype.
+    pub const fn ret(ret: Class) -> Sig {
+        Sig { ret, params: None }
+    }
+}
 
 /// Index of a table in [`TABLES`].
 pub type TableId = usize;

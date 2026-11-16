@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use atl_native_bridge::engine::bindings::{Binding, Host, rows, target};
-use atl_native_bridge::engine::objects::Class;
+use atl_native_bridge::engine::objects::{Class, Sig};
 use atl_native_bridge::engine::{self, proc, qemu};
 
 /// The guest library of the GLES2 proxies.
@@ -264,7 +264,7 @@ fn calls() -> Vec<Call> {
         call(
             'n',
             "glGetPathLengthNV",
-            Class::Fp,
+            Class::F32,
             gl_get_path_length_nv as *const () as usize,
             vec![uint(11), int(2), int(3)],
         ),
@@ -298,18 +298,18 @@ fn on_trap(trap: qemu::Trap) -> qemu::Answer {
     }
 }
 
-/// The result class of `name`'s row in the QEMU table, or why it has none.
-fn row_class(name: &str) -> Result<Class, String> {
+/// The lanes of `name`'s row in the QEMU table, or why it has none.
+fn row_sig(name: &str) -> Result<Sig, String> {
     match rows().find(|&(lib, n, _)| lib == SONAME && n == name) {
         Some((
             _,
             _,
             Binding::Generic {
                 host: Host::System,
-                ret,
+                sig,
                 ..
             },
-        )) => Ok(ret),
+        )) => Ok(sig),
         Some((_, _, other)) => Err(format!(
             "{name}: row {other:?}, not a Generic System binding"
         )),
@@ -317,18 +317,18 @@ fn row_class(name: &str) -> Result<Class, String> {
     }
 }
 
-/// Binds each call's recorder by its row's class, runs the fixture's entry with that pool address, and checks the recorded words.
+/// Binds each call's recorder by its row's lanes (result class and the parameter classes the host call places by), runs the fixture's entry with that pool address, and checks the recorded words.
 fn checks(table: u64) -> bool {
     let calls = calls();
     let mut ok = true;
     let mut bound = Vec::new();
     let mut bad_rows = Vec::new();
     for c in &calls {
-        match row_class(c.name) {
-            Ok(ret) if ret == c.ret => bound.push(Some(ret)),
-            Ok(ret) => {
+        match row_sig(c.name) {
+            Ok(sig) if sig.ret == c.ret && sig.params.is_some() => bound.push(Some(sig)),
+            Ok(sig) => {
                 bad_rows.push(format!(
-                    "{}: class {ret:?}, prototype gives {:?}",
+                    "{}: lanes {sig:?}, prototype gives result {:?} and a parameter list",
                     c.name, c.ret
                 ));
                 bound.push(None);
@@ -347,12 +347,12 @@ fn checks(table: u64) -> bool {
             Err(bad_rows.join("; "))
         },
     );
-    for (i, (c, ret)) in calls.iter().zip(bound).enumerate() {
-        let Some(ret) = ret else {
+    for (i, (c, sig)) in calls.iter().zip(bound).enumerate() {
+        let Some(sig) = sig else {
             ok &= check(c.letter, Err(format!("{}: not bound (check b)", c.name)));
             continue;
         };
-        let Some(addr) = qemu::bind_result(c.recorder, ret) else {
+        let Some(addr) = qemu::bind_result(c.recorder, sig) else {
             ok &= check(c.letter, Err("pool used up".to_owned()));
             continue;
         };
@@ -365,7 +365,8 @@ fn checks(table: u64) -> bool {
         if seen != c.args {
             why.push(format!("{} got {seen:x?}, want {:x?}", c.name, c.args));
         }
-        let want_ret = if ret == Class::Fp {
+        // a float answer: its bits in v0's low half, the upper clear (dispatch.rs `call_host`)
+        let want_ret = if sig.ret == Class::F32 {
             u64::from(PATH_LENGTH.to_bits())
         } else {
             0
@@ -393,8 +394,8 @@ fn entry(table: u64, i: usize) -> u64 {
 
 /// One name the fixture asks eglGetProcAddress for: the row's guest address is the answer, and the call through it reaches the recorder with `c.args`. The answer is compared before the call, so a host address (break `egl_raw`) fails here without a guest call to it.
 fn egl_row(table: u64, index: usize, gpa: u64, c: &Call) -> Result<(), String> {
-    row_class(c.name)?;
-    let row = qemu::bind_result(c.recorder, c.ret).ok_or("pool used up")?;
+    let sig = row_sig(c.name)?;
+    let row = qemu::bind_result(c.recorder, sig).ok_or("pool used up")?;
     // what init reports for the row: its exported entry (the address a guest import resolves to) and its host function
     proc::note_exported(SONAME, c.name, row);
     proc::note_bound(SONAME, c.name, c.recorder);
@@ -417,10 +418,10 @@ fn egl_row(table: u64, index: usize, gpa: u64, c: &Call) -> Result<(), String> {
 
 /// The QEMU binding of libEGL's eglGetProcAddress (its table row's shim): the `gpa` every eglGetProcAddress fixture entry takes.
 fn egl_gpa() -> Result<u64, String> {
-    let (addr, ret) = target("libEGL.so", "eglGetProcAddress")
+    let (addr, sig) = target("libEGL.so", "eglGetProcAddress")
         .and_then(|t| t.callee())
         .ok_or("eglGetProcAddress has no binding in the QEMU table")?;
-    qemu::bind_result(addr, ret)
+    qemu::bind_result(addr, sig)
         .map(|a| a as u64)
         .ok_or_else(|| "pool used up".to_owned())
 }

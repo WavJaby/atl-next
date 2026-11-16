@@ -9,7 +9,7 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::{Mutex, PoisonError};
 
 use super::bindings;
-use super::objects::Class;
+use super::objects::Sig;
 use super::{active, unsupported};
 
 /// The libraries a name is looked up in, in order: a name two of them hold answers the first one's row.
@@ -72,22 +72,22 @@ fn row_address(name: &str) -> Option<usize> {
     })
 }
 
-/// What a name with no row answers, from the host's answer (0: none) and the name's prototype descriptor (return class, the QEMU lane refusal).
+/// What a name with no row answers, from the host's answer (0: none) and the name's prototype descriptor (lanes, the QEMU lane refusal).
 #[derive(Debug, PartialEq, Eq)]
 enum Answer {
     Null,
-    /// bind the host address with this result class
-    Bind(usize, Class),
+    /// bind the host address with these lanes
+    Bind(usize, Sig),
     /// a named trap, with why
     Trap(&'static str),
 }
 
-fn decide(host: usize, proto: Option<(Class, Option<&'static str>)>) -> Answer {
+fn decide(host: usize, proto: Option<(Sig, Option<&'static str>)>) -> Answer {
     if host == 0 {
         return Answer::Null;
     }
     match proto {
-        Some((ret, None)) => Answer::Bind(host, ret),
+        Some((sig, None)) => Answer::Bind(host, sig),
         Some((_, Some(why))) => Answer::Trap(why),
         None => Answer::Trap("no prototype descriptor"),
     }
@@ -96,18 +96,18 @@ fn decide(host: usize, proto: Option<(Class, Option<&'static str>)>) -> Answer {
 /// Host answers bound so far: host address -> guest thunk.
 static BOUND: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
 
-/// The guest address of host function `host` (result class `ret`), bound by `bind` once per host address. Break `egl_nodedup` binds on every call.
+/// The guest address of host function `host` (lanes `sig`), bound by `bind` once per host address. Break `egl_nodedup` binds on every call.
 fn bind_host(
     bound: &mut BTreeMap<usize, usize>,
     host: usize,
-    ret: Class,
-    bind: impl FnOnce(usize, Class) -> Option<usize>,
+    sig: Sig,
+    bind: impl FnOnce(usize, Sig) -> Option<usize>,
 ) -> Option<usize> {
     #[cfg(not(atl_nb_egl_nodedup))]
     if let Some(&thunk) = bound.get(&host) {
         return Some(thunk);
     }
-    let thunk = bind(host, ret)?;
+    let thunk = bind(host, sig)?;
     bound.insert(host, thunk);
     Some(thunk)
 }
@@ -150,7 +150,7 @@ fn named_trap_for(name: &str, why: &'static str) -> Result<usize, String> {
         .get(slot)
         .ok_or_else(|| format!("named-trap slots used up ({NAMED_TRAPS})"))?;
     let at = active()
-        .bind_result(target as usize, Class::Int)
+        .bind_result(target as usize, Sig::INT)
         .ok_or("the binding pool is used up")?;
     named.push((name.to_owned(), why, at));
     Ok(at)
@@ -173,11 +173,11 @@ fn host_answer(name: &str) -> usize {
 }
 
 /// The prototype descriptor of `name` in the process's engine table (build.rs `PROTOTYPES`).
-fn prototype(name: &str) -> Option<(Class, Option<&'static str>)> {
+fn prototype(name: &str) -> Option<(Sig, Option<&'static str>)> {
     bindings::prototypes()
         .iter()
         .find(|(n, _, _)| *n == name)
-        .map(|&(_, ret, why)| (ret, why))
+        .map(|&(_, sig, why)| (sig, why))
 }
 
 /// libEGL's `eglGetProcAddress` (bindings.rs `shim`): the guest's name in, the address its guest calls the name by out.
@@ -194,9 +194,9 @@ pub(super) extern "C" fn get_proc_address(name: *const c_char) -> *const c_void 
     }
     let at = match decide(host_answer(&name), prototype(&name)) {
         Answer::Null => 0,
-        Answer::Bind(host, ret) => {
+        Answer::Bind(host, sig) => {
             let mut bound = BOUND.lock().unwrap_or_else(PoisonError::into_inner);
-            bind_host(&mut bound, host, ret, |h, r| active().bind_result(h, r)).unwrap_or_else(
+            bind_host(&mut bound, host, sig, |h, s| active().bind_result(h, s)).unwrap_or_else(
                 || {
                     unsupported(&format!(
                         "eglGetProcAddress({name}): the binding pool is used up"
@@ -215,21 +215,22 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+    use crate::engine::objects::Class;
 
     /// A name with no row: no host answer gives NULL; a described host answer is bound by its descriptor; an undescribed or refused one is trapped.
     #[test]
     fn fallback_decision() {
-        assert_eq!(decide(0, Some((Class::Void, None))), Answer::Null);
+        assert_eq!(decide(0, Some((Sig::ret(Class::Void), None))), Answer::Null);
         assert_eq!(
-            decide(0x1000, Some((Class::Void, None))),
-            Answer::Bind(0x1000, Class::Void)
+            decide(0x1000, Some((Sig::ret(Class::Void), None))),
+            Answer::Bind(0x1000, Sig::ret(Class::Void))
         );
         assert_eq!(
             decide(0x1000, None),
             Answer::Trap("no prototype descriptor")
         );
         assert_eq!(
-            decide(0x1000, Some((Class::Int, Some("refused")))),
+            decide(0x1000, Some((Sig::INT, Some("refused")))),
             Answer::Trap("refused")
         );
     }
@@ -239,12 +240,12 @@ mod tests {
     fn fallback_dedup() {
         let mut bound = BTreeMap::new();
         let made = Cell::new(0usize);
-        let bind = |_: usize, _: Class| {
+        let bind = |_: usize, _: Sig| {
             made.set(made.get() + 1);
             Some(0x9000 + made.get() * 8)
         };
-        let first = bind_host(&mut bound, 0x7000, Class::Void, bind);
-        let second = bind_host(&mut bound, 0x7000, Class::Void, bind);
+        let first = bind_host(&mut bound, 0x7000, Sig::ret(Class::Void), bind);
+        let second = bind_host(&mut bound, 0x7000, Sig::ret(Class::Void), bind);
         assert_eq!(first, Some(0x9008));
         assert_eq!(second, first);
         assert_eq!(made.get(), 1);

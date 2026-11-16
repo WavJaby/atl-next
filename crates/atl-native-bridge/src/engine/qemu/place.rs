@@ -11,7 +11,7 @@ use crate::engine::Engine as _;
 use crate::engine::bindings::qemu::THUNKS;
 use crate::engine::dispatch::{TARGETS, down_params, down_ret};
 use crate::engine::image::{Image, write_sealed};
-use crate::engine::objects::Class;
+use crate::engine::objects::{Class, Sig};
 
 use super::CROSSING;
 
@@ -38,17 +38,17 @@ pub const OBJECT_STUBS: usize = crate::engine::bindings::OBJECT_STUBS;
 
 /// A guest-callable address that crosses to host function `target` with an integer result ([`bind_result`]). None when the pool is used up.
 pub fn bind(target: usize) -> Option<usize> {
-    bind_result(target, Class::Int)
+    bind_result(target, Sig::INT)
 }
 
-/// A guest-callable address that crosses to host function `target`, whose result is of class `ret`: the address of a free pool slot, which the binding trap routes to `target` and answers by `ret` (dispatch.rs `call_binding`). None when the pool is used up.
-pub fn bind_result(target: usize, ret: Class) -> Option<usize> {
+/// A guest-callable address that crosses to host function `target` of lanes `sig`: the address of a free pool slot, which the binding trap routes to `target`, placing its arguments and answering by `sig` (dispatch.rs `call_binding`). None when the pool is used up.
+pub fn bind_result(target: usize, sig: Sig) -> Option<usize> {
     let slot = NEXT.fetch_add(1, Ordering::Relaxed);
     if slot >= THUNKS {
         return None;
     }
     TARGETS[slot]
-        .set((target, ret))
+        .set((target, sig))
         .expect("a pool slot is bound once: NEXT only grows");
     Some((&raw const pool::POOL) as usize + slot * THUNK_BYTES)
 }

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use atl_engine_api::AtlLanes;
 
 use super::jni;
-use super::objects::{self, Class, Refused};
+use super::objects::{self, Class, Refused, Sig};
 use super::{unsupported, va_list};
 use crate::engine::Down;
 use crate::engine::bindings::OBJECT_STUBS;
@@ -38,8 +38,8 @@ pub struct Answer {
 /// A trap callback. Its answer is [`Answer`] (REPORT ignores it).
 pub type OnTrap = fn(Trap) -> Answer;
 
-/// The host function and result class of each pool slot, read by the binding trap ([`call_binding`]). The QEMU placement sets a slot once (`place::bind_result`), so a slot is bound before any trap reads it.
-pub(super) static TARGETS: [OnceLock<(usize, Class)>; THUNKS] = [const { OnceLock::new() }; THUNKS];
+/// The host function and lanes of each pool slot, read by the binding trap ([`call_binding`]). The QEMU placement sets a slot once (`place::bind_result`), so a slot is bound before any trap reads it.
+pub(super) static TARGETS: [OnceLock<(usize, Sig)>; THUNKS] = [const { OnceLock::new() }; THUNKS];
 
 /// The default trap callback: a JNI trap calls the host object's table (`call_object`), a binding trap its host target (`call_binding`), and each answers with x0 and v0 from the host result. Other kinds abort until a route is built; BOOT is the start, answered by `qemu::run` or by the gate's own callback.
 pub fn on_trap(trap: Trap) -> Answer {
@@ -56,7 +56,7 @@ const ID_SKEW: usize = 0;
 #[cfg(atl_nb_qe_id)]
 const ID_SKEW: usize = 1;
 
-/// Calls the host function of the slot `id + ID_SKEW` with the guest's lanes ([`call_host`], answered by the slot's result class). Every argument lane is forwarded, fp included. The counter sees the slot that ran, so a skewed dispatch shows up as a wrong count.
+/// Calls the host function of the slot `id + ID_SKEW` with the guest's lanes ([`call_host`], placed and answered by the slot's lanes). Every argument lane is forwarded, fp included. The counter sees the slot that ran, so a skewed dispatch shows up as a wrong count.
 pub(super) fn call_binding(id: u32, lanes: &AtlLanes) -> Answer {
     let Some(slot) = usize::try_from(id)
         .ok()
@@ -65,12 +65,12 @@ pub(super) fn call_binding(id: u32, lanes: &AtlLanes) -> Answer {
     else {
         unsupported("qemu crossing: binding id past the pool")
     };
-    let Some(&(target, ret)) = TARGETS[slot].get() else {
+    let Some(&(target, sig)) = TARGETS[slot].get() else {
         unsupported("qemu crossing: binding trap for an unbound slot")
     };
     #[cfg(feature = "crossing-count")]
     crate::counters::count_binding(slot, target);
-    call_host(target, lanes, ret)
+    call_host(target, lanes, sig)
 }
 
 /// The object crossing counter's one entry (QEMU bridge plan section 5, per proxy table + slot): a guest->host call of slot `slot` of table `table` to host `target`. QEMU's [`call_object`] calls it with the table `lane_of` found; the identity object shell reaches it through [`count_object_shell`]. Break `qe_jni_count`: [`call_object`] skips it, so only identity counts.
@@ -133,134 +133,49 @@ fn call_object(id: u32, lanes: &AtlLanes) -> Answer {
     #[cfg(not(atl_nb_jni_guest_env))]
     let arg0 = host as u64;
     lanes.x[0] = arg0;
-    call_host(target, &lanes, lane.ret)
-}
-
-/// The host call's image, SysV x86_64: integer words x0..x7 then the eight stack words (SysV takes the sixth and later integer words from the stack, in order), and fp lanes v0..v7 in xmm0..7. Both ABIs assign integer and fp arguments to registers by class in declaration order, so the guest's lanes are the callee's register image as they stand; the descriptor's parameter classes need no walk. Eight fp words always pass, so the call sets %al = 8: a variadic callee (glibc printf) saves its xmm arguments only when %al is nonzero. 8 is the ABI's upper bound on the vector registers used; the descriptor cannot count a variadic call's fp arguments, so the exact count is not built.
-/// Not represented: fp arguments past eight, or more than 16 integers (R-1). A proxy row with such a prototype is a named trap from build time (atl_bridgegen::jni `lane_refusal`); a JNI or `bind` caller has no prototype and is not checked. x86_64 host only (R-3).
-#[cfg(not(atl_nb_al_zero))]
-type HostWords = unsafe extern "C" fn(u64, ...) -> u64;
-/// The same image, for a result in xmm0.
-#[cfg(not(atl_nb_al_zero))]
-type HostFp = unsafe extern "C" fn(u64, ...) -> f64;
-
-/// Calls `target` with the guest lanes `lanes` and answers its result by `ret`: a double or float from xmm0 (its bits in v0), a void as x0 = 0, anything else from x0.
-/// Breaks: `v_drop` zeroes the fp lanes; `drop_stack` moves the stack words down one; `ret_int` reads an fp result from x0; `al_zero` makes the call with %al = 0 ([`call_al0`]).
-fn call_host(target: usize, lanes: &AtlLanes, ret: Class) -> Answer {
-    let [x0, x1, x2, x3, x4, x5, x6, x7] = lanes.x;
-    #[cfg(not(atl_nb_v_drop))]
-    let [v0, v1, v2, v3, v4, v5, v6, v7] = lanes.v.map(f64::from_bits);
-    #[cfg(atl_nb_v_drop)]
-    let [v0, v1, v2, v3, v4, v5, v6, v7] = [0.0; 8];
-    #[cfg(not(atl_nb_drop_stack))]
-    let stack = lanes.stack;
-    #[cfg(atl_nb_drop_stack)]
-    let stack = {
-        let mut s = lanes.stack;
-        s.copy_within(1.., 0);
-        s[7] = 0;
-        s
+    // the fixed parameters place the call (a `...V` slot's va_list lane now holds the jvalue array, an int lane: `place`); a variadic slot's `...` follows them unclassed, so it crosses as the guest set it
+    let sig = Sig {
+        ret: lane.ret,
+        params: (!lane.variadic).then_some(lane.params),
     };
-    #[cfg(not(atl_nb_al_zero))]
-    let [s0, s1, s2, s3, s4, s5, s6, s7] = stack;
-    match fp_result(ret) {
-        Class::Fp => {
-            #[cfg(not(atl_nb_al_zero))]
-            let r = {
-                // SAFETY: `target` is the host C function a binding or JNI entry names, and its result is a double or float (the descriptor's or the table's `ret`); the call passes the guest words in the image above, which such a callee reads by its own prototype.
-                let f = unsafe { std::mem::transmute::<usize, HostFp>(target) };
-                // SAFETY: as above; a callee with fewer parameters ignores the rest.
-                unsafe {
-                    f(
-                        x0, x1, x2, x3, x4, x5, x6, x7, v0, v1, v2, v3, v4, v5, v6, v7, s0, s1, s2,
-                        s3, s4, s5, s6, s7,
-                    )
-                }
-            };
-            #[cfg(atl_nb_al_zero)]
-            let r = call_al0(
-                target,
-                [x0, x1, x2, x3, x4, x5, x6, x7],
-                [v0, v1, v2, v3, v4, v5, v6, v7],
-                stack,
-            )
-            .1;
-            Answer {
-                x0: 0,
-                v0: r.to_bits(),
-            }
-        }
-        _ => {
-            #[cfg(not(atl_nb_al_zero))]
-            let r = {
-                // SAFETY: `target` is a C-ABI host function of this trap (see above); the same image as the fp arm, with an integer or pointer result.
-                let f = unsafe { std::mem::transmute::<usize, HostWords>(target) };
-                // SAFETY: as above; a callee with fewer parameters ignores the rest.
-                unsafe {
-                    f(
-                        x0, x1, x2, x3, x4, x5, x6, x7, v0, v1, v2, v3, v4, v5, v6, v7, s0, s1, s2,
-                        s3, s4, s5, s6, s7,
-                    )
-                }
-            };
-            #[cfg(atl_nb_al_zero)]
-            let r = call_al0(
-                target,
-                [x0, x1, x2, x3, x4, x5, x6, x7],
-                [v0, v1, v2, v3, v4, v5, v6, v7],
-                stack,
-            )
-            .0;
-            Answer {
-                x0: if ret == Class::Void { 0 } else { r },
-                v0: 0,
-            }
-        }
-    }
+    call_host(target, &lanes, sig)
 }
 
-/// Break `al_zero` (`ATL_NB_BREAK=al_zero`): [`call_host`]'s image, called from asm with %al = 0 where the normal call sets 8. A variadic callee saves its xmm arguments only when %al is nonzero (SysV), so a double vararg reads garbage. Returns rax and xmm0. The ten stack words (x6, x7, then s0..s7) are pushed so the callee finds the first at the lowest address.
-#[cfg(atl_nb_al_zero)]
-fn call_al0(target: usize, x: [u64; 8], v: [f64; 8], s: [u64; 8]) -> (u64, f64) {
-    let stack = [x[6], x[7], s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]];
-    let p = stack.as_ptr();
-    let (int, fp): (u64, f64);
-    // SAFETY: `target` is a C host function of this trap, called with `call_host`'s image: the register words in their registers, the stack words pushed in reverse (ten pushes keep rsp 16-byte aligned at the call), rsp restored after the call. `stack` outlives the asm block. %al is zero, the one register this break changes.
-    unsafe {
-        std::arch::asm!(
-            "push qword ptr [{p} + 72]",
-            "push qword ptr [{p} + 64]",
-            "push qword ptr [{p} + 56]",
-            "push qword ptr [{p} + 48]",
-            "push qword ptr [{p} + 40]",
-            "push qword ptr [{p} + 32]",
-            "push qword ptr [{p} + 24]",
-            "push qword ptr [{p} + 16]",
-            "push qword ptr [{p} + 8]",
-            "push qword ptr [{p}]",
-            "call {f}",
-            "add rsp, 80",
-            p = in(reg) p,
-            f = in(reg) target,
-            in("rdi") x[0],
-            in("rsi") x[1],
-            in("rdx") x[2],
-            in("rcx") x[3],
-            in("r8") x[4],
-            in("r9") x[5],
-            inout("xmm0") v[0] => fp,
-            in("xmm1") v[1],
-            in("xmm2") v[2],
-            in("xmm3") v[3],
-            in("xmm4") v[4],
-            in("xmm5") v[5],
-            in("xmm6") v[6],
-            in("xmm7") v[7],
-            inout("rax") 0_u64 => int,
-            clobber_abi("C"),
-        );
+/// The up call per host ISA (`cfg(target_arch)` only here): `call(target, lanes, fp, sig) -> (x result, fp result bits)`, same interface on each. riscv64 places the lanes by the prototype into LP64D and calls from asm; every other host takes them as one variadic call (x86_64 SysV the reference).
+#[cfg(target_arch = "riscv64")]
+mod riscv64;
+#[cfg(target_arch = "riscv64")]
+use riscv64 as host_call;
+#[cfg(not(target_arch = "riscv64"))]
+mod variadic;
+#[cfg(not(target_arch = "riscv64"))]
+use variadic as host_call;
+
+/// Calls `target` with the guest lanes `lanes` and answers its result by `sig.ret`: a double from the fp result register (its bits in v0), a float as its low 32 bits with the upper ones clear (AArch64 reads s0; LP64D's fa0 holds it NaN-boxed), a void as x0 = 0, anything else from x0.
+/// Breaks: `v_drop` zeroes the fp lanes; `drop_stack` moves the stack words down one; `ret_int` reads an fp result from x0; per host, `al_zero` (variadic.rs) and `up_no_nanbox` (riscv64.rs).
+fn call_host(target: usize, lanes: &AtlLanes, sig: Sig) -> Answer {
+    #[allow(unused_mut, reason = "only the breaks below change the lanes")]
+    let mut lanes = *lanes;
+    #[cfg(atl_nb_v_drop)]
+    {
+        lanes.v = [0; 8];
     }
-    (int, fp)
+    #[cfg(atl_nb_drop_stack)]
+    {
+        lanes.stack.copy_within(1.., 0);
+        lanes.stack[7] = 0;
+    }
+    let ret = fp_result(sig.ret);
+    let (x, v) = host_call::call(target, &lanes, ret.is_fp(), sig);
+    match ret {
+        Class::F32 => Answer {
+            x0: 0,
+            v0: v & 0xFFFF_FFFF,
+        },
+        Class::F64 => Answer { x0: 0, v0: v },
+        Class::Void => Answer { x0: 0, v0: 0 },
+        _ => Answer { x0: x, v0: 0 },
+    }
 }
 
 /// The result class the call is made with: an fp result in x0 is the break `ret_int`.
@@ -272,6 +187,19 @@ fn fp_result(ret: Class) -> Class {
 #[cfg(atl_nb_ret_int)]
 fn fp_result(_ret: Class) -> Class {
     Class::Int
+}
+
+/// Refuses an up call whose arguments do not fit the lane image on one side (R-1): with fp-to-int on the host, a prototype's ninth fp argument is a guest stack word but a host register, so the counts differ. Named and counted, as [`refuse_down`].
+#[cfg_attr(
+    not(target_arch = "riscv64"),
+    allow(dead_code, reason = "only the placing host call refuses")
+)]
+fn refuse_up(target: usize) -> ! {
+    static REFUSED: AtomicUsize = AtomicUsize::new(0);
+    let n = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+    unsupported(&format!(
+        "qemu crossing: refused up call to {target:#x}: its arguments need more than eight stack words on one side, the lane image holds eight (R-1, refusals: {n})"
+    ))
 }
 
 /// Refusals by kind, in [`refuse`]'s order: a forged id, a slot with no function, a `va_list` without a shorty source, a shorty character outside jni's, an x0 that is no proxy object. A refusal aborts, so each count reaches the abort message only.
@@ -325,7 +253,7 @@ fn down_body(slot: usize, host: &mut AtlLanes) {
     let Some(d) = super::qemu::down_slot(slot) else {
         unsupported("qemu crossing: down shell without a binding")
     };
-    let Some(mut guest) = place(&d.params, host, HOST) else {
+    let Some(mut guest) = place(&d.params, host, HOST, AAPCS64) else {
         refuse_down(d.target)
     };
     // the first argument of a JNI method, of JNI_OnLoad or of an SL callback is a host env, vm or interface: the guest's own object stands for it (jni.rs, sles.rs), and it is the first integer, in x0; an slObjectCallback's 6th is the 6th integer, in x5
@@ -342,7 +270,7 @@ fn down_body(slot: usize, host: &mut AtlLanes) {
     (host.x[0], host.v[0]) = host_result(d.ret, guest.x[0], guest.v[0], HOST);
 }
 
-/// How the host calling convention fills and reads a down call's lanes (bridgegen down.rs `HostAbi`, generated per host ISA).
+/// How a calling convention fills and reads a call's lanes: the host's (bridgegen down.rs `HostAbi`, generated per host ISA) or the guest's ([`AAPCS64`]).
 #[derive(Clone, Copy, Debug)]
 pub(in crate::engine) struct HostRules {
     /// integer argument registers in the lanes' x bank
@@ -351,9 +279,17 @@ pub(in crate::engine) struct HostRules {
     fp_to_int: bool,
     /// a narrow integer result is widened to 64 bits by its type
     extend_int_ret: bool,
-    /// a float result is NaN-boxed
+    /// a float in an fp register is NaN-boxed (argument and result)
     nan_box_f32: bool,
 }
+
+/// The guest's rules, AAPCS64: eight integer registers, an fp argument past v7 goes to the stack, results and floats unshaped (a narrow value's upper bits are unspecified, s-registers are read low).
+const AAPCS64: HostRules = HostRules {
+    int_lanes: 8,
+    fp_to_int: false,
+    extend_int_ret: false,
+    nan_box_f32: false,
+};
 
 /// The build's host rules.
 const HOST: HostRules = {
@@ -418,7 +354,8 @@ pub(in crate::engine) fn down_params(
     let mut params = implicit.to_vec();
     for &c in args {
         params.push(match c {
-            b'F' | b'D' => Class::Fp,
+            b'F' => Class::F32,
+            b'D' => Class::F64,
             b'Z' | b'B' | b'C' | b'S' | b'I' | b'J' | b'L' => Class::Int,
             other => {
                 return Err(format!(
@@ -432,7 +369,7 @@ pub(in crate::engine) fn down_params(
     #[cfg(atl_nb_shorty_swap)]
     if let Some(p) = params.get_mut(2) {
         *p = if *p == Class::Int {
-            Class::Fp
+            Class::F64
         } else {
             Class::Int
         };
@@ -440,47 +377,78 @@ pub(in crate::engine) fn down_params(
     Ok(params)
 }
 
-/// The guest call's lanes for a host call whose arguments have the classes `params` (Q6-4). Every ABI here takes an integer from the integer registers (`rules.int_lanes` on the host: SysV 6, LP64D 8; AAPCS64 8) and a float or double from the fp registers (eight each), in declaration order; an fp argument past them takes a free integer register first where `rules.fp_to_int` (RISC-V), else the stack; the rest go to the stack, one word each, in declaration order. Each side reads its words from its own image: `host` is the host's (x[0..int_lanes], v[0..8], the eight stack words), the result the AAPCS64 one. `None` when either side needs more than eight stack words (R-1): with fp-to-int on the host, AAPCS64 can need more stack words than the host.
-fn place(params: &[Class], host: &AtlLanes, rules: HostRules) -> Option<AtlLanes> {
-    let mut guest = AtlLanes::default();
-    let (mut host_x, mut host_v, mut host_stack) = (0, 0, 0);
-    let (mut guest_x, mut guest_v, mut guest_stack) = (0, 0, 0);
-    for &class in params {
-        let word = match class {
-            Class::Fp if host_v < 8 => {
-                host_v += 1;
-                host.v[host_v - 1]
-            }
-            Class::Int if host_x < rules.int_lanes => {
-                host_x += 1;
-                host.x[host_x - 1]
-            }
-            Class::Fp if rules.fp_to_int && host_x < rules.int_lanes => {
-                host_x += 1;
-                host.x[host_x - 1]
-            }
-            _ => {
-                let word = *host.stack.get(host_stack)?;
-                host_stack += 1;
-                word
-            }
-        };
-        match class {
-            Class::Int if guest_x < 8 => {
-                guest.x[guest_x] = word;
-                guest_x += 1;
-            }
-            Class::Fp if guest_v < 8 => {
-                guest.v[guest_v] = word;
-                guest_v += 1;
-            }
-            _ => {
-                *guest.stack.get_mut(guest_stack)? = word;
-                guest_stack += 1;
-            }
+/// Where one argument sits in an image: an integer register, an fp register, or a stack word (indices into the lanes' x, v, stack).
+#[derive(Clone, Copy)]
+enum Slot {
+    X(usize),
+    V(usize),
+    Stack(usize),
+}
+
+/// Assigns argument slots under `rules`, in declaration order (one walk per side of [`place`]).
+struct Assign {
+    rules: HostRules,
+    x: usize,
+    v: usize,
+    stack: usize,
+}
+
+impl Assign {
+    fn new(rules: HostRules) -> Self {
+        Self {
+            rules,
+            x: 0,
+            v: 0,
+            stack: 0,
         }
     }
-    Some(guest)
+
+    /// The next slot of an argument of class `class`: an integer (a `va_list` lane holds a pointer) from the integer registers, a float or double from the eight fp registers; an fp argument past them takes a free integer register first where `fp_to_int` (RISC-V), else the stack; the rest the stack, one word each. None past the eight stack words.
+    fn next(&mut self, class: Class) -> Option<Slot> {
+        let take = |n: &mut usize| {
+            *n += 1;
+            *n - 1
+        };
+        let slot = if class.is_fp() && self.v < 8 {
+            Slot::V(take(&mut self.v))
+        } else if self.x < self.rules.int_lanes && (!class.is_fp() || self.rules.fp_to_int) {
+            Slot::X(take(&mut self.x))
+        } else {
+            Slot::Stack(take(&mut self.stack))
+        };
+        match slot {
+            Slot::Stack(s) if s >= 8 => None,
+            s => Some(s),
+        }
+    }
+}
+
+/// The `to` side's lanes for a call whose arguments have the classes `params`, read from `from`, the `from` side's image (x[0..int_lanes], v[0..8], the eight stack words). One placement for both directions: down = (host rules -> [`AAPCS64`]), up = (AAPCS64 -> host rules).
+/// Every ABI here takes integers and fp arguments by class in declaration order ([`Assign::next`]: SysV 6 integer registers, LP64D and AAPCS64 8, eight fp registers each). A float going into an fp register of a `nan_box_f32` side is NaN-boxed (RISC-V: upper 32 bits ones; AArch64 leaves them zero). `None` when either side needs more than eight stack words (R-1): with fp-to-int on one side, the other can need more stack words.
+fn place(
+    params: &[Class],
+    from: &AtlLanes,
+    from_rules: HostRules,
+    to_rules: HostRules,
+) -> Option<AtlLanes> {
+    let mut to = AtlLanes::default();
+    let (mut src, mut dst) = (Assign::new(from_rules), Assign::new(to_rules));
+    for &class in params {
+        let word = match src.next(class)? {
+            Slot::X(i) => from.x[i],
+            Slot::V(i) => from.v[i],
+            Slot::Stack(i) => from.stack[i],
+        };
+        match dst.next(class)? {
+            Slot::X(i) => to.x[i] = word,
+            Slot::V(i) if class == Class::F32 && to_rules.nan_box_f32 => {
+                to.v[i] = word | 0xFFFF_FFFF_0000_0000;
+            }
+            Slot::V(i) => to.v[i] = word,
+            Slot::Stack(i) => to.stack[i] = word,
+        }
+    }
+    Some(to)
 }
 
 /// Refuses a down call whose host arguments need more than eight stack words (R-1, Q6-4): the lane image cannot carry them. Named and counted: a shorty this size fails on every call, so the count says how often it was asked.
@@ -493,7 +461,7 @@ fn refuse_down(target: usize) -> ! {
 }
 
 #[cfg(test)]
-mod down_tests {
+mod place_tests {
     use super::*;
 
     /// x86_64 SysV (bridgegen x86.rs `DOWN`): six integer registers, fp overflow to the stack, results unshaped.
@@ -511,6 +479,98 @@ mod down_tests {
         nan_box_f32: true,
     };
 
+    /// Up, glClearColor(1, 0, 0, 1): AArch64 writes s0..s3 with the upper 32 bits zero (1.0f = 0x3F80_0000); LP64D reads a float in fa0..fa3 only NaN-boxed (psABI: upper 32 bits ones), else as canonical NaN.
+    #[test]
+    fn up_floats_are_nan_boxed_on_lp64d() {
+        let guest = AtlLanes {
+            v: [0x3F80_0000, 0, 0, 0x3F80_0000, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        let host = place(&[Class::F32; 4], &guest, AAPCS64, LP64D).expect("four fp registers");
+        assert_eq!(
+            host.v[..4],
+            [
+                0xFFFF_FFFF_3F80_0000,
+                0xFFFF_FFFF_0000_0000,
+                0xFFFF_FFFF_0000_0000,
+                0xFFFF_FFFF_3F80_0000
+            ]
+        );
+        // SysV reads xmm's low 32 bits: no shaping
+        let sysv = place(&[Class::F32; 4], &guest, AAPCS64, SYSV).expect("four fp registers");
+        assert_eq!(sysv.v, guest.v);
+        // a double is never boxed: 1.0 = 0x3FF0_0000_0000_0000
+        let d = AtlLanes {
+            v: [0x3FF0_0000_0000_0000, 0, 0, 0, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        let host = place(&[Class::F64], &d, AAPCS64, LP64D).expect("one fp register");
+        assert_eq!(host.v[0], 0x3FF0_0000_0000_0000);
+    }
+
+    /// Up, glTexImage2D's nine integers: AAPCS64 x0..x7 + its first stack word -> LP64D a0..a7 + its first stack word (both: eight integer registers, the rest on the stack in order).
+    #[test]
+    fn up_nine_integers_on_lp64d() {
+        let guest = AtlLanes {
+            x: [1, 2, 3, 4, 5, 6, 7, 8],
+            stack: [9, 0, 0, 0, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        let host = place(&[Class::Int; 9], &guest, AAPCS64, LP64D).expect("one stack word");
+        assert_eq!(
+            (host.x, host.stack),
+            ([1, 2, 3, 4, 5, 6, 7, 8], [9, 0, 0, 0, 0, 0, 0, 0])
+        );
+    }
+
+    /// Up, ten doubles then one int: AAPCS64 v0..v7, the ninth and tenth its first two stack words, the int x0; LP64D fa0..fa7, then a0, a1 (integer convention once the fp registers are used up), the int a2 -- the down test's rule read the other way.
+    #[test]
+    fn up_fp_overflow_takes_integer_registers_on_lp64d() {
+        let guest = AtlLanes {
+            x: [77, 0, 0, 0, 0, 0, 0, 0],
+            v: [1, 2, 3, 4, 5, 6, 7, 8],
+            stack: [9, 10, 0, 0, 0, 0, 0, 0],
+        };
+        let mut params = vec![Class::F64; 10];
+        params.push(Class::Int);
+        let host = place(&params, &guest, AAPCS64, LP64D).expect("two guest stack words");
+        assert_eq!(host.v, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(host.x[..3], [9, 10, 77]);
+        assert_eq!(host.stack, [0; 8]);
+    }
+
+    /// Up, glUniform4f(GLint, 4 x GLfloat): the int in a0, the floats boxed in fa0..fa3 -- banks counted apart.
+    #[test]
+    fn up_int_then_floats_count_banks_apart() {
+        let guest = AtlLanes {
+            x: [5, 0, 0, 0, 0, 0, 0, 0],
+            v: [
+                0x3F80_0000,
+                0x4000_0000,
+                0x4040_0000,
+                0x4080_0000,
+                0,
+                0,
+                0,
+                0,
+            ],
+            ..Default::default()
+        };
+        let mut params = vec![Class::Int];
+        params.extend([Class::F32; 4]);
+        let host = place(&params, &guest, AAPCS64, LP64D).expect("registers only");
+        assert_eq!(host.x[0], 5);
+        assert_eq!(
+            host.v[..4],
+            [
+                0xFFFF_FFFF_3F80_0000,
+                0xFFFF_FFFF_4000_0000,
+                0xFFFF_FFFF_4040_0000,
+                0xFFFF_FFFF_4080_0000
+            ]
+        );
+    }
+
     /// LP64D, ten doubles then one int: fa0..fa7 take eight, the ninth and tenth take a0 and a1 (psABI: integer convention once the fp registers are used up), the int takes a2. AAPCS64: v0..v7, then the ninth and tenth are its first two stack words, the int is x0.
     #[test]
     fn lp64d_fp_overflow_takes_integer_registers() {
@@ -519,9 +579,9 @@ mod down_tests {
             v: [1, 2, 3, 4, 5, 6, 7, 8],
             stack: [0; 8],
         };
-        let mut params = vec![Class::Fp; 10];
+        let mut params = vec![Class::F64; 10];
         params.push(Class::Int);
-        let guest = place(&params, &host, LP64D).expect("no host stack word");
+        let guest = place(&params, &host, LP64D, AAPCS64).expect("no host stack word");
         assert_eq!(guest.v, [1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!((guest.stack[0], guest.stack[1], guest.x[0]), (9, 10, 77));
     }
@@ -534,15 +594,15 @@ mod down_tests {
             stack: [9, 0, 0, 0, 0, 0, 0, 0],
             ..Default::default()
         };
-        let guest = place(&[Class::Int; 9], &host, LP64D).expect("one stack word");
+        let guest = place(&[Class::Int; 9], &host, LP64D, AAPCS64).expect("one stack word");
         assert_eq!((guest.x, guest.stack[0]), ([1, 2, 3, 4, 5, 6, 7, 8], 9));
     }
 
     /// LP64D, seventeen doubles: the host holds them all in registers (8 fp + 8 int) plus one stack word; AAPCS64 needs nine stack words (8 in v) -> refused, never an out-of-bounds write.
     #[test]
     fn lp64d_guest_stack_overflow_is_refused() {
-        assert!(place(&[Class::Fp; 16], &AtlLanes::default(), LP64D).is_some());
-        assert!(place(&[Class::Fp; 17], &AtlLanes::default(), LP64D).is_none());
+        assert!(place(&[Class::F64; 16], &AtlLanes::default(), LP64D, AAPCS64).is_some());
+        assert!(place(&[Class::F64; 17], &AtlLanes::default(), LP64D, AAPCS64).is_none());
     }
 
     /// LP64D results (psABI: widen by type to 32 bits, then sign-extend to 64; float NaN-boxed); SysV results pass unchanged.
@@ -593,7 +653,7 @@ mod down_tests {
             stack: [100, 101, 102, 0, 0, 0, 0, 0],
             ..Default::default()
         };
-        let guest = place(&[Class::Int; 9], &host, SYSV).expect("three stack words fit");
+        let guest = place(&[Class::Int; 9], &host, SYSV, AAPCS64).expect("three stack words fit");
         assert_eq!(guest.x, [10, 11, 12, 13, 14, 15, 100, 101]);
         assert_eq!(guest.stack[0], 102);
     }
@@ -606,9 +666,9 @@ mod down_tests {
             v: [1, 2, 3, 4, 5, 6, 7, 8],
             stack: [9, 0, 0, 0, 0, 0, 0, 0],
         };
-        let mut params = vec![Class::Fp; 9];
+        let mut params = vec![Class::F64; 9];
         params.push(Class::Int);
-        let guest = place(&params, &host, SYSV).expect("one stack word");
+        let guest = place(&params, &host, SYSV, AAPCS64).expect("one stack word");
         assert_eq!(
             (guest.v, guest.stack[0], guest.x[0]),
             ([1, 2, 3, 4, 5, 6, 7, 8], 9, 77)
@@ -624,8 +684,8 @@ mod down_tests {
             stack: [7, 0, 0, 0, 0, 0, 0, 0],
         };
         let mut params = vec![Class::Int; 7];
-        params.push(Class::Fp);
-        let guest = place(&params, &host, SYSV).expect("one stack word");
+        params.push(Class::F64);
+        let guest = place(&params, &host, SYSV, AAPCS64).expect("one stack word");
         assert_eq!(guest.x, [1, 2, 3, 4, 5, 6, 7, 0]);
         assert_eq!((guest.v[0], guest.stack), (8, [0; 8]));
     }
@@ -633,8 +693,8 @@ mod down_tests {
     /// Fourteen integers need eight stack words on SysV (six registers): the image holds them. Fifteen need nine: refused (R-1).
     #[test]
     fn nine_host_stack_words_are_refused() {
-        assert!(place(&[Class::Int; 14], &AtlLanes::default(), SYSV).is_some());
-        assert!(place(&[Class::Int; 15], &AtlLanes::default(), SYSV).is_none());
+        assert!(place(&[Class::Int; 14], &AtlLanes::default(), SYSV, AAPCS64).is_some());
+        assert!(place(&[Class::Int; 15], &AtlLanes::default(), SYSV, AAPCS64).is_none());
     }
 
     /// The shorty `DIDJ` (result double; int, double, long) under a JNI method: env and class first, then the three. JNI_OnLoad (no shorty) is `(JavaVM*, void*)`; a shorty without a method's env is refused.
@@ -646,13 +706,13 @@ mod down_tests {
                 Class::Int,
                 Class::Int,
                 Class::Int,
-                Class::Fp,
+                Class::F64,
                 Class::Int
             ])
         );
         assert_eq!(
             down_params(Down::Plain, Some(&b"VF"[..])),
-            Ok(vec![Class::Fp])
+            Ok(vec![Class::F32])
         );
         assert_eq!(
             down_params(Down::Vm, None),

@@ -48,10 +48,10 @@ extern "C" fn intercept_symbol(addr: *mut c_void, library: *const c_char, symbol
     let bound = if name == "glClear" {
         host.map(|(h, _)| h)
     } else {
-        host.and_then(|(h, ret)| engine.bind_result(h, ret))
+        host.and_then(|(h, sig)| engine.bind_result(h, sig))
     };
     #[cfg(not(atl_nb_gl_direct))]
-    let bound = host.and_then(|(h, ret)| engine.bind_result(h, ret));
+    let bound = host.and_then(|(h, sig)| engine.bind_result(h, sig));
     match bound {
         Some(thunk) if engine.patch_site(addr, thunk) => {
             BOUND.fetch_add(1, Ordering::Relaxed);

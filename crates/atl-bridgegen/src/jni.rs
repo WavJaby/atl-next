@@ -11,8 +11,10 @@ use crate::ir::{ArchView, Signature, Ty};
 pub enum Class {
     /// Integer or pointer: an int lane.
     Int,
-    /// `float` or `double`: an fp lane, its bits as the register holds them.
-    Fp,
+    /// `float`: an fp lane, its bits as the register holds them. Its own class: a host whose fp registers hold a float NaN-boxed (RISC-V LP64D) shapes it on the way in.
+    F32,
+    /// `double`: an fp lane.
+    F64,
     /// No value (a `void` result).
     Void,
     /// `va_list` (the `...V` variants).
@@ -53,7 +55,8 @@ pub fn rust(tables: &[(&str, Vec<Option<Lane>>)]) -> String {
         "/// Lane class of a JNI parameter or result (`atl_bridgegen::objects::Class`).\n\
          #[allow(dead_code)]\n\
          #[derive(Clone, Copy, Debug, PartialEq, Eq)]\n\
-         pub enum Class {\n    Int,\n    Fp,\n    Void,\n    VaList,\n}\n\n\
+         pub enum Class {\n    Int,\n    F32,\n    F64,\n    Void,\n    VaList,\n}\n\n\
+         impl Class {\n    /// An fp lane (`F32` or `F64`).\n    pub const fn is_fp(self) -> bool {\n        matches!(self, Class::F32 | Class::F64)\n    }\n}\n\n\
          /// A function slot's lanes (`atl_bridgegen::jni::Lane`).\n\
          #[allow(dead_code)]\n\
          #[derive(Clone, Copy, Debug)]\n\
@@ -125,7 +128,7 @@ pub fn lane_refusal(params: &[Class]) -> Option<&'static str> {
     let count = |c| params.iter().filter(|&&p| p == c).count();
     if count(Class::VaList) > 0 {
         Some("refused: R-1, a va_list parameter has no lane")
-    } else if count(Class::Fp) > 8 {
+    } else if count(Class::F32) + count(Class::F64) > 8 {
         Some("refused: R-1, a ninth fp argument interleaves with the stack integers")
     } else if count(Class::Int) > 16 {
         Some("refused: R-1, more than 16 integers need a ninth stack word")
@@ -223,12 +226,13 @@ pub fn route(name: &str, sig: &Signature, env_listed: bool, callbacks: &[&str]) 
     Ok(Route::Mapped(maps))
 }
 
-/// A callback signature's lanes as a shorty: the result's letter, then one per parameter. Only the bank matters to the down shell (atl-native-bridge dispatch.rs `down_params`), so every int lane is `J` and every fp lane `D`.
+/// A callback signature's lanes as a shorty: the result's letter, then one per parameter. The down shell (atl-native-bridge dispatch.rs `down_params`) needs the bank and an fp lane's width, so every int lane is `J`, a float `F`, a double `D`.
 fn shorty(sig: &Signature) -> Result<String> {
     ensure!(!sig.variadic, "a variadic callback has no fixed lanes");
     let letter = |c: Class| match c {
         Class::Int => Ok('J'),
-        Class::Fp => Ok('D'),
+        Class::F32 => Ok('F'),
+        Class::F64 => Ok('D'),
         Class::Void => Ok('V'),
         Class::VaList => bail!("a va_list callback argument has no lane"),
     };
@@ -297,7 +301,8 @@ fn param(ty: &Ty) -> Result<Class> {
 /// An integer, pointer or floating type's class; anything else has no lane.
 fn scalar(ty: &Ty) -> Result<Class> {
     match ty.resolved() {
-        Ty::Float { .. } => Ok(Class::Fp),
+        Ty::Float { bits: 32 } => Ok(Class::F32),
+        Ty::Float { bits: 64 } => Ok(Class::F64),
         Ty::Int { .. } | Ty::Bool | Ty::Pointer { .. } | Ty::Reference { .. } => Ok(Class::Int),
         other => bail!("no lane class for {other:?}"),
     }
@@ -353,17 +358,17 @@ mod tests {
     /// Expected lanes written from the C shapes above, not from the code under test.
     #[test]
     fn classes_follow_the_lane_banks() {
-        use Class::{Fp, Int, VaList, Void};
+        use Class::{F32, F64, Int, VaList, Void};
         let iface = parse("classes", TABLE);
         assert_eq!(
             lanes(&iface.arches["x86_64"], "JNINativeInterface").unwrap(),
             vec![
                 None,
                 lane("GetVersion", &[Int], Int, false),
-                lane("SetDoubleField", &[Int, Int, Int, Fp], Void, false),
-                lane("CallDoubleMethod", &[Int, Int, Int], Fp, true),
-                lane("CallDoubleMethodV", &[Int, Int, Int, VaList], Fp, false),
-                lane("GetFloatField", &[Int, Int, Int], Fp, false),
+                lane("SetDoubleField", &[Int, Int, Int, F64], Void, false),
+                lane("CallDoubleMethod", &[Int, Int, Int], F64, true),
+                lane("CallDoubleMethodV", &[Int, Int, Int, VaList], F64, false),
+                lane("GetFloatField", &[Int, Int, Int], F32, false),
                 lane("IsSameObject", &[Int, Int, Int], Int, false),
                 lane("NewLong", &[Int, Int], Int, false),
             ]
@@ -384,10 +389,10 @@ mod tests {
         assert!(err.contains("no lane class"), "{err}");
     }
 
-    /// Expected classes written from the C shapes, not from the code under test: void, an enum and a boolean (int lanes), a pointer (int), float and double (fp).
+    /// Expected classes written from the C shapes, not from the code under test: void, an enum and a boolean (int lanes), a pointer (int), float (F32) and double (F64).
     #[test]
     fn result_classes_follow_the_return_banks() {
-        use Class::{Fp, Int, Void};
+        use Class::{F32, F64, Int, Void};
         let iface = parse(
             "results",
             "typedef unsigned int GLenum;\ntypedef unsigned char GLboolean;\ntypedef float GLfloat;\ntypedef double GLdouble;\nvoid f_void(void);\nGLenum f_enum(void);\nGLboolean f_bool(void);\nvoid *f_ptr(void);\nGLfloat f_float(void);\nGLdouble f_double(void);\n",
@@ -397,7 +402,7 @@ mod tests {
             .iter()
             .map(|name| result_class(&view.functions[*name].ret).unwrap())
             .collect();
-        assert_eq!(got, [Void, Int, Int, Int, Fp, Fp]);
+        assert_eq!(got, [Void, Int, Int, Int, F32, F64]);
     }
 
     /// R-1 at bind time (Q7-4), classes from GL-shaped prototypes. Fit: glTexImage2D (9 integers: one guest stack word), glUniform4f (int + 4 fp), 8 fp + 16 integers (the image's edge). Refused, each by its own reason: 9 floats, 17 integers, a va_list. Expected outcomes follow from the rule in `lane_refusal`'s doc (SysV 6 + AAPCS64 8 integer registers, 8 fp registers each, 8 trap stack words), not from the code.
@@ -463,18 +468,19 @@ mod tests {
         assert!(stale.contains("no JNI type"), "{stale}");
     }
 
-    /// GS2.2 callback-param (tr-first blocker 5), NDK-shaped prototypes. Expected outcomes from the C shapes: looper.h's `ALooper_addFd` maps lane 4 to a down shell of `int(int, int, void*)` = `JJJJ`; choreographer.h's frame callback `void(long, void*)` = `VJJ`; a double argument takes `D`; an unreviewed typedef and an unnamed function-pointer type stay pending; a seven-lane prototype fails by the lane rule.
+    /// GS2.2 callback-param (tr-first blocker 5), NDK-shaped prototypes. Expected outcomes from the C shapes: looper.h's `ALooper_addFd` maps lane 4 to a down shell of `int(int, int, void*)` = `JJJJ`; choreographer.h's frame callback `void(long, void*)` = `VJJ`; a double argument takes `D`, a float `F`; an unreviewed typedef and an unnamed function-pointer type stay pending; a seven-lane prototype fails by the lane rule.
     #[test]
     fn route_maps_reviewed_callbacks_to_down_shells() {
         let iface = parse(
             "cb",
-            "typedef struct ALooper ALooper;\ntypedef int (*ALooper_callbackFunc)(int fd, int events, void *data);\ntypedef void (*AChoreographer_frameCallback)(long t, void *data);\ntypedef void (*fp_cb)(double v, void *data);\ntypedef void (*other_cb)(void *data);\nint ALooper_addFd(ALooper *l, int fd, int ident, int events, ALooper_callbackFunc cb, void *data);\nvoid post(void *c, AChoreographer_frameCallback cb, void *data);\nvoid with_fp(fp_cb cb, void *data);\nvoid unreviewed(other_cb cb);\nvoid unnamed(void (*cb)(void *));\nint seven(ALooper_callbackFunc cb, int a, int b, int c, int d, int e, int f);\n",
+            "typedef struct ALooper ALooper;\ntypedef int (*ALooper_callbackFunc)(int fd, int events, void *data);\ntypedef void (*AChoreographer_frameCallback)(long t, void *data);\ntypedef void (*fp_cb)(double v, void *data);\ntypedef void (*f32_cb)(float v, void *data);\nvoid with_f32(f32_cb cb, void *data);\ntypedef void (*other_cb)(void *data);\nint ALooper_addFd(ALooper *l, int fd, int ident, int events, ALooper_callbackFunc cb, void *data);\nvoid post(void *c, AChoreographer_frameCallback cb, void *data);\nvoid with_fp(fp_cb cb, void *data);\nvoid unreviewed(other_cb cb);\nvoid unnamed(void (*cb)(void *));\nint seven(ALooper_callbackFunc cb, int a, int b, int c, int d, int e, int f);\n",
         );
         let view = &iface.arches["x86_64"];
         let reviewed = [
             "ALooper_callbackFunc",
             "AChoreographer_frameCallback",
             "fp_cb",
+            "f32_cb",
         ];
         let bind = |name: &str| route(name, &view.functions[name], false, &reviewed);
         let down = |i, ty: &str, shorty: &str| {
@@ -495,6 +501,7 @@ mod tests {
             down(1, "AChoreographer_frameCallback", "VJJ")
         );
         assert_eq!(bind("with_fp").unwrap(), down(0, "fp_cb", "VDJ"));
+        assert_eq!(bind("with_f32").unwrap(), down(0, "f32_cb", "VFJ"));
         assert_eq!(
             bind("unreviewed").unwrap(),
             Route::Pending(UNREVIEWED_CALLBACK)
