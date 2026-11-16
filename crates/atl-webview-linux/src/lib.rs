@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! The WebView module's exports (`atl_platform_ui_api::abi::WebViewVtable`): WebKitGTK behind the facade's `PlatformWebEngine`.
-//! Default UA: `webkit_settings_get_user_agent` of fresh settings -- the engine's own default. Measured (W1c probe, WebKitGTK 2.54): works with no display, without gtk_init and off the main thread, so a provider call from an app worker thread (AdMob) needs no UI.
+//! Default UA: `webkit_settings_get_user_agent` of fresh settings -- the engine's own default, made once on the GTK main thread and cached. WebKit binds its main thread to the first thread that
+//! touches it: settings made on an app worker (AdMob's AdWorker asks the UA first) made every later WebView on the UI thread SIGSEGV/abort in instance init (AB2, Temple Run; test app row
+//! webview-ua runs on a worker for this). So WebKit is touched on the UI thread only; a worker's call hops there and waits.
 //! Views: a `WebKitWebView` (W0: loads and runs JS unrealized, before any window parents it); shown by the UI module, which parents it into the window whose scene has its sideband quad (`view_widget`). Every `view_*` runs on the GTK main thread (the Android UI thread); signals arrive there.
 
 use std::cell::RefCell;
@@ -45,17 +47,55 @@ pub extern "C" fn atl_webview_entry() -> *const WebViewVtable {
 const NO_DISPLAY: &[u8] = b"no display: the process has no GTK display (no-UI mode)";
 
 unsafe extern "C" fn default_user_agent(out: *mut BytesOut) -> bool {
-    // WebKitSettings' constructor reads the default GDK display's GL support and dereferences a missing display (SIGSEGV, measured in the no-UI app run and a probe with no reachable compositor).
-    // The display is GTK's: opened by the UI module's attach (same libgtk object in the process). A process without one gets a refusal, never the crash; GTK is not initialised here, because that would bind GTK's main thread to whichever thread called.
-    if webkit6::gdk::Display::default().is_none() {
-        // SAFETY: `out` is the sink the caller lent for this call.
-        unsafe { BytesOut::put_to(out, NO_DISPLAY) };
-        return false;
+    let (ok, bytes) = match user_agent() {
+        Ok(ua) => (true, ua.into_bytes()),
+        Err(why) => (false, why.to_vec()),
+    };
+    // SAFETY: `out` is the sink the caller lent for this call.
+    unsafe { BytesOut::put_to(out, &bytes) };
+    ok
+}
+
+/// The engine's default UA, made once on the UI thread ([`ui_user_agent`]).
+static USER_AGENT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// [`USER_AGENT`] from any thread. The UI thread owns GLib's default context for the process's life (the UI module's mirror acquires it at attach), so: owner -> run here; a context nobody
+/// owns -> no UI thread in this process, refuse (invoking would run WebKit right here, on the caller); else invoke on the UI thread and wait.
+/// Deadlock: a worker waits here while the UI thread runs its Looper; if the app blocks its UI thread on this worker (join, Future.get) both wait -- as Chromium's provider, whose statics start
+/// the engine on the UI thread and block a background caller until it ran. No fallback: answering on the worker is exactly the off-thread WebKit touch this avoids.
+fn user_agent() -> Result<String, &'static [u8]> {
+    if let Some(ua) = USER_AGENT.get() {
+        return Ok(ua.clone());
     }
-    let ua = webkit6::Settings::new().user_agent().unwrap_or_default();
-    // SAFETY: as above.
-    unsafe { BytesOut::put_to(out, ua.as_bytes()) };
-    true
+    let ctx = glib::MainContext::default();
+    if ctx.is_owner() {
+        return ui_user_agent();
+    }
+    if ctx.acquire().is_ok() {
+        return Err(NO_DISPLAY);
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    ctx.invoke(move || {
+        let _ = tx.send(ui_user_agent());
+    });
+    rx.recv().unwrap_or(Err(
+        b"web engine: the UI thread dropped the user agent call",
+    ))
+}
+
+/// On the UI thread only. WebKitSettings' constructor reads the default GDK display's GL support and dereferences a missing display (SIGSEGV, measured in the no-UI app run): no display -> refusal.
+fn ui_user_agent() -> Result<String, &'static [u8]> {
+    if webkit6::gdk::Display::default().is_none() {
+        return Err(NO_DISPLAY);
+    }
+    Ok(USER_AGENT
+        .get_or_init(|| {
+            webkit6::Settings::new()
+                .user_agent()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .clone())
 }
 
 /// A view and its event sink (shared with the signal closures).

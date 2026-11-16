@@ -1169,7 +1169,8 @@ pub enum BoolSetting {
 pub struct WebViewVtable {
     /// The module's [`ABI_ID`]; the only field read before the check.
     pub abi: AbiId,
-    /// `WebEngine::default_user_agent`: the engine's own default UA string into `out` and true; false with the reason in `out` when the engine cannot run (no display). Any thread.
+    /// `WebEngine::default_user_agent`: the engine's own default UA string into `out` and true; false with the reason in `out` when the engine cannot run (no display, no UI thread). Any thread: the engine is touched on the UI thread only, so a call from another thread
+    /// waits until the UI thread's Looper has run it (blocks while the UI thread is blocked).
     pub default_user_agent: unsafe extern "C" fn(out: *mut BytesOut) -> bool,
     /// `WebEngine::create_view`.
     pub view_create: unsafe extern "C" fn(
