@@ -138,7 +138,7 @@ pub(crate) fn apk_libs(
 }
 
 /// Main.java's PROBES rows, in order (`{x, y, 0xRRGGBBAA},`); a row that does not parse is dropped and then named by [`probe_failures`].
-fn java_probes(java: &str) -> Vec<(u32, u32, u32)> {
+pub(crate) fn java_probes(java: &str) -> Vec<(u32, u32, u32)> {
     java.lines()
         .filter_map(|line| {
             let row = line.trim().strip_prefix('{')?.strip_suffix("},")?;

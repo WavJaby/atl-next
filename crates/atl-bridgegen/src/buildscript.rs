@@ -491,6 +491,45 @@ pub struct HeaderImport {
 
 /// A build script's whole job for [`HeaderImport`]s: each generated twice, failing unless byte-identical (bridge control 1), written to `OUT_DIR`, with its rerun lines.
 pub fn import_headers(imports: &[HeaderImport]) -> Result<()> {
+    generate_headers(imports, &|iface, arch, import| {
+        crate::rust::import_module(iface, arch, import.functions, import.types)
+    })
+}
+
+/// [`import_headers`] with `rust::selector_module` as the backend: `OUT_DIR/<import.name>.rs` holds a per-call selecting shell for each of `candidates` the header itself declares (its `also` headers included), in `candidates`' order; `import.functions` and `types` are unused. Shells call `selector`; `on_null` as `resolver_module`'s.
+pub fn select_shells(
+    import: &HeaderImport,
+    candidates: &[&str],
+    selector: &str,
+    on_null: &dyn Fn(&str, &crate::ir::Ty) -> Result<String>,
+) -> Result<()> {
+    generate_headers(std::slice::from_ref(import), &|iface, arch, _| {
+        let view = iface
+            .arches
+            .get(arch)
+            .with_context(|| format!("{}: no view for {arch}", iface.name))?;
+        let declared: Vec<&str> = candidates
+            .iter()
+            .copied()
+            .filter(|f| view.functions.contains_key(*f))
+            .collect();
+        crate::rust::selector_module(iface, arch, &declared, selector, on_null)
+    })
+}
+
+/// The names an AOSP `*.in` entry list declares, in its order: `GL_ENTRY(ret, name, params)` lines (opengl/libs `entries.in`, `entries_gles1.in`).
+pub fn gl_entry_names(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter_map(|l| l.trim().strip_prefix("GL_ENTRY("))
+        .filter_map(|rest| rest.split(',').nth(1))
+        .map(str::trim)
+        .collect()
+}
+
+type Backend<'a> = dyn Fn(&crate::ir::Interface, &str, &HeaderImport) -> Result<String> + 'a;
+
+/// Each import parsed and emitted by `backend` twice, failing unless byte-identical (bridge control 1), written to `OUT_DIR/<name>.rs`, with its rerun lines.
+fn generate_headers(imports: &[HeaderImport], backend: &Backend) -> Result<()> {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let checkout = checkout(&manifest)?;
     let up = Upstreams::of(&checkout)?;
@@ -535,7 +574,7 @@ pub fn import_headers(imports: &[HeaderImport]) -> Result<()> {
                 std::slice::from_ref(&target),
             )
             .context(import.source)?;
-            crate::rust::import_module(&iface, &host.arch, import.functions, import.types)
+            backend(&iface, &host.arch, import)
         };
         let code = generate()?;
         ensure!(
@@ -561,6 +600,16 @@ pub fn import_headers(imports: &[HeaderImport]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gl_entry_names_in_order() {
+        // two lines in entries_gles1.in's shape plus a comment line, which declares nothing
+        let text = "// header\nGL_ENTRY(void, glActiveTexture, GLenum texture)\nGL_ENTRY(GLboolean, glIsVertexArrayOES, GLuint array)\n";
+        assert_eq!(
+            gl_entry_names(text),
+            ["glActiveTexture", "glIsVertexArrayOES"]
+        );
+    }
 
     #[test]
     fn host_row_by_rust_triple() {

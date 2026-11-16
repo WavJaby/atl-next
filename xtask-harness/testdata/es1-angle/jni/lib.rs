@@ -65,6 +65,7 @@ const GL_FLOAT: u32 = 0x1406;
 const GL_TRIANGLE_STRIP: u32 = 0x0005;
 const GL_RGBA: u32 = 0x1908;
 const GL_UNSIGNED_BYTE: u32 = 0x1401;
+const GL_TEXTURE_2D: u32 = 0x0DE1;
 
 type P = *mut c_void;
 
@@ -603,6 +604,9 @@ fn run_driver(env: *mut *const *const c_void, surface: P, out: &mut String) -> R
         }
     }
     let _ = writeln!(out, "frames {FRAMES}");
+    // an extension name in both libEGL tables, not exported by ANGLE's ES1 library: the driver's shell must pick ANGLE's entry under ES1, so ANGLE's error state (read through the ES1 front) records the invalid call
+    let gles1 = Lib::open("libGLESv1_CM.so", RTLD_NOW)?;
+    let _ = writeln!(out, "ext es1 error {:#x}", ext_error(&gles1)?);
 
     // an ES3 context in this ES1 process: the host's GLES, surfaceless
     let ctx3 = unsafe {
@@ -628,6 +632,8 @@ fn run_driver(env: *mut *const *const c_void, surface: P, out: &mut String) -> R
         unsafe { CStr::from_ptr(s) }.to_string_lossy().into_owned()
     };
     let _ = writeln!(out, "es3 version {es3}");
+    // the same name under ES3: the host's entry and error state
+    let _ = writeln!(out, "ext es3 error {:#x}", ext_error(&gles2)?);
 
     // cross-kind share contexts: refused by the driver
     for (what, version, share) in [("es1-on-es3", 1, ctx3), ("es3-on-es1", 3, ctx)] {
@@ -657,6 +663,18 @@ fn run_driver(env: *mut *const *const c_void, surface: P, out: &mut String) -> R
         (host.destroy_surface)(dpy, hsurf);
     }
     Ok(())
+}
+
+/// `glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, no image)` through `front`, then its glGetError: non-zero from the implementation that took the call (OES_EGL_image: an invalid image is GL_INVALID_VALUE; without the extension, GL_INVALID_OPERATION), zero from one that never saw it.
+fn ext_error(front: &Lib) -> Result<u32, String> {
+    let target: unsafe extern "C" fn(u32, P) = front.sym(c"glEGLImageTargetTexture2DOES")?;
+    let get_error: unsafe extern "C" fn() -> u32 = front.sym(c"glGetError")?;
+    // SAFETY: a context is current; a null image is refused by validation, nothing is dereferenced.
+    unsafe {
+        while get_error() != 0 {}
+        target(GL_TEXTURE_2D, std::ptr::null_mut());
+        Ok(get_error())
+    }
 }
 
 /// JNI NewStringUTF of `text`.

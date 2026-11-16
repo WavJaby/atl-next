@@ -15,10 +15,9 @@ use crate::wayland_proxy::{Event as ProxyEvent, Proxy};
 
 /// The marker: the fixture's surface line (Main.java onSurfaceChanged), logged once the GL surface exists.
 pub const MARKER: &str = "AtlGles2: surface ";
-/// Main.java's readback lines: `readback pass`, or one `readback FAIL` per wrong probe.
+/// Main.java's log tag; its readback lines are `<TAG>: readback pass`, or one `<TAG>: readback FAIL` per wrong probe.
+const TAG: &str = "AtlGles2";
 const READBACK_LINE: &str = "AtlGles2: readback";
-const READBACK_PASS: &str = "AtlGles2: readback pass";
-const READBACK_FAIL: &str = "AtlGles2: readback FAIL";
 /// The composer's failed present (atl-composer ui_window.rs).
 const PRESENT_WARN: &str = "atl-composer: ui present:";
 /// The bridge's exit line (atl-native-bridge engine/thread.rs `detach`): `attached A, detached D`.
@@ -29,7 +28,7 @@ const WORKER_LINE: &str = "AtlGles2: worker JNI version ";
 const SLACK: u32 = 1;
 
 /// Row `y` of GL's bottom-left origin in a window `height` tall, as the picture's top-left row; None when `y` is outside.
-fn composed_row(height: u32, y: u32) -> Option<u32> {
+pub(super) fn composed_row(height: u32, y: u32) -> Option<u32> {
     height.checked_sub(1)?.checked_sub(y)
 }
 
@@ -62,21 +61,23 @@ pub fn checks(
                 Err(e) => Err(e.clone()),
             },
         ),
-        ("readback", readback_check(app)),
-        ("composed", composed_check(seen, width, height)),
+        ("readback", readback_check(app, TAG, PROBES.len())),
+        ("composed", composed_check(seen, width, height, &PROBES)),
         ("present", present_check(app)),
         ("balance", balance_check(app)),
     ]
 }
 
-/// The app's own glReadPixels at each probe: its `readback pass` line, and no `readback FAIL` line.
-fn readback_check(app: &str) -> Result<String, String> {
-    let pass = app.contains(READBACK_PASS);
-    let fails: Vec<&str> = app.lines().filter(|l| l.contains(READBACK_FAIL)).collect();
+/// The app's own glReadPixels at each of its `probes` probes: its `<tag>: readback pass` line, and no `<tag>: readback FAIL` line.
+pub(super) fn readback_check(app: &str, tag: &str, probes: usize) -> Result<String, String> {
+    let pass_line = format!("{tag}: readback pass");
+    let fail_line = format!("{tag}: readback FAIL");
+    let pass = app.contains(&pass_line);
+    let fails: Vec<&str> = app.lines().filter(|l| l.contains(&fail_line)).collect();
     match (pass, fails.first()) {
-        (true, None) => Ok(format!("{} probes read back as PROBES", PROBES.len())),
+        (true, None) => Ok(format!("{probes} probes read back as PROBES")),
         (_, first) => Err(format!(
-            "`{READBACK_PASS}` logged: {pass}; {} FAIL lines, first: {}",
+            "`{pass_line}` logged: {pass}; {} FAIL lines, first: {}",
             fails.len(),
             first.copied().unwrap_or("none")
         )),
@@ -101,8 +102,13 @@ fn same(got: u32, want: u32) -> bool {
         .all(|shift| ((got >> shift) & 0xff).abs_diff((want >> shift) & 0xff) <= SLACK)
 }
 
-/// The window's picture at each probe: the settled picture, at the window's opening size, holds PROBES at their composed rows, each channel within [`SLACK`].
-fn composed_check(seen: &Mutex<capture::Seen>, width: u32, height: u32) -> Result<String, String> {
+/// The window's picture at each probe: the settled picture, at the window's opening size, holds `probes` (GL window coordinates) at their composed rows, each channel within [`SLACK`].
+pub(super) fn composed_check(
+    seen: &Mutex<capture::Seen>,
+    width: u32,
+    height: u32,
+    probes: &[(u32, u32, u32)],
+) -> Result<String, String> {
     let shot = capture::picture(seen, 0)?;
     if shot.size != (width, height) {
         return Err(format!(
@@ -111,7 +117,7 @@ fn composed_check(seen: &Mutex<capture::Seen>, width: u32, height: u32) -> Resul
         ));
     }
     let mut fails = Vec::new();
-    for (x, y, want) in PROBES {
+    for &(x, y, want) in probes {
         let Some(row) = composed_row(height, y).filter(|_| x < width) else {
             fails.push(format!("({x},{y}) outside the window"));
             continue;
@@ -124,7 +130,7 @@ fn composed_check(seen: &Mutex<capture::Seen>, width: u32, height: u32) -> Resul
     if fails.is_empty() {
         Ok(format!(
             "the picture ({width}x{height}) = PROBES at {} points",
-            PROBES.len()
+            probes.len()
         ))
     } else {
         Err(fails.join("; "))
@@ -132,7 +138,7 @@ fn composed_check(seen: &Mutex<capture::Seen>, width: u32, height: u32) -> Resul
 }
 
 /// No failed present in the app's log.
-fn present_check(app: &str) -> Result<String, String> {
+pub(super) fn present_check(app: &str) -> Result<String, String> {
     if app.contains(PRESENT_WARN) {
         Err(format!("`{PRESENT_WARN}` logged"))
     } else {
@@ -213,11 +219,13 @@ mod tests {
 
     #[test]
     fn composed_probes_pass_and_a_wrong_one_is_named() {
-        assert!(composed_check(&seen_with(HEIGHT, &composed_probes()), WIDTH, HEIGHT).is_ok());
+        assert!(
+            composed_check(&seen_with(HEIGHT, &composed_probes()), WIDTH, HEIGHT, &PROBES).is_ok()
+        );
         let mut bad = composed_probes();
         bad[0].2 = 0x00ff_00ff;
-        let err =
-            composed_check(&seen_with(HEIGHT, &bad), WIDTH, HEIGHT).expect_err("a wrong pixel");
+        let err = composed_check(&seen_with(HEIGHT, &bad), WIDTH, HEIGHT, &PROBES)
+            .expect_err("a wrong pixel");
         assert!(
             err.contains("(8,8) composed 00ff00ff, want ff0000ff"),
             "{err}"
@@ -228,13 +236,13 @@ mod tests {
     #[test]
     fn unflipped_rows_are_rejected() {
         let unflipped: Vec<(u32, u32, u32)> = PROBES.to_vec();
-        assert!(composed_check(&seen_with(HEIGHT, &unflipped), WIDTH, HEIGHT).is_err());
+        assert!(composed_check(&seen_with(HEIGHT, &unflipped), WIDTH, HEIGHT, &PROBES).is_err());
     }
 
     #[test]
     fn a_picture_of_another_size_is_named() {
-        let err =
-            composed_check(&seen_with(HEIGHT, &composed_probes()), 1280, 800).expect_err("a size");
+        let err = composed_check(&seen_with(HEIGHT, &composed_probes()), 1280, 800, &PROBES)
+            .expect_err("a size");
         assert!(err.contains("the picture is 960x600"), "{err}");
     }
 
@@ -246,9 +254,9 @@ mod tests {
 
     #[test]
     fn readback_needs_the_pass_line_and_no_fail() {
-        assert!(readback_check("AtlGles2: readback pass\n").is_ok());
-        assert!(readback_check("").is_err());
-        let err = readback_check("AtlGles2: readback FAIL (8,8): got 00 want ff\n")
+        assert!(readback_check("AtlGles2: readback pass\n", TAG, 6).is_ok());
+        assert!(readback_check("", TAG, 6).is_err());
+        let err = readback_check("AtlGles2: readback FAIL (8,8): got 00 want ff\n", TAG, 6)
             .expect_err("a fail line");
         assert!(err.contains("1 FAIL lines"), "{err}");
     }

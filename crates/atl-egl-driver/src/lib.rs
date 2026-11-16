@@ -33,6 +33,7 @@ pub mod abi {
 
 mod driver;
 mod es1;
+mod es1_ext;
 mod exports;
 mod fbo0;
 mod surface;

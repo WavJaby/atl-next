@@ -3,7 +3,7 @@
 //! The fixture (xtask-harness/testdata/es1-angle) runs as a plain app process (`--run-class`) with the GL driver + ANGLE placed as for an app (`Runtime::with_gl_driver`); one layer + BLASTBufferQueue, its Surface handed to the JNI lib.
 //! Runs ([`Mode`]): `run` (H1 spike: the external-context sequence done from outside the driver, jni/lib.rs `run`), `driver` (H2a: the driver's own ES1 context kind through libEGL and the libGLESv1_CM front, jni/lib.rs `run_driver`).
 //! Pass (both): the compositor's ReportSink digest of a `atl-es1` buffer equals [`expected_digest`] (clear + top-left quad, upright: buffer row 0 is the top); `version OpenGL ES 1.1` with `ANGLE`; the lib's `ok`.
-//! `driver` also: the chosen ES1 config reports the ES1 bit; eglQueryContext says version 1; an ES3 context in the same process reports the host's GLES 3 (not ANGLE); both cross-kind share contexts fail EGL_BAD_CONTEXT, each counted by a driver line.
+//! `driver` also: the chosen ES1 config reports the ES1 bit; eglQueryContext says version 1; an ES3 context in the same process reports the host's GLES 3 (not ANGLE); both cross-kind share contexts fail EGL_BAD_CONTEXT, each counted by a driver line; `glEGLImageTargetTexture2DOES` with no image (an extension name in both libEGL tables, one driver shell) sets an error in ANGLE's state under ES1 and in the host's under ES3.
 //! Breaks: `break` (the driver's current context is cleared before the ANGLE external context: an `error angle ...` line, no expected buffer); `driver-nolib` (no `libGLESv1_CM_atl.so` placed: the ES1 create fails EGL_BAD_ALLOC with the driver's named line, no expected buffer).
 
 use std::path::{Path, PathBuf};
@@ -162,6 +162,8 @@ impl Mode {
 /// The driver's refusal lines (atl-egl-driver es1.rs `create` / `refuse_share`).
 const NOLIB_LINE: &str = "libEGL_atl: es1 context refused: ";
 const SHARE_LINE: &str = "libEGL_atl: es1 share refused (";
+/// The driver's line for an ES1 extension name ANGLE has no entry for (atl-egl-driver es1_ext.rs `select`).
+const MISSING_LINE: &str = "libEGL_atl: es1 entry missing ";
 /// EGL_BAD_CONTEXT (egl.h): the share refusal's error.
 const BAD_CONTEXT: &str = "0x3006";
 /// EGL_BAD_ALLOC (egl.h): the missing-ES1-library refusal's error.
@@ -269,6 +271,19 @@ fn judge(mode: Mode, log: &str, want: u64, verbose: bool) -> bool {
             counted == 2,
             format!("{counted} driver refusal lines"),
         ));
+        // atl-egl-driver es1_ext.rs: one shell serves an extension name from both libEGL tables; ES1 -> ANGLE (ANGLE's error state took the invalid call), ES3 -> the host's
+        let missing: Vec<&str> = log
+            .lines()
+            .filter_map(|l| l.split_once(MISSING_LINE).map(|(_, t)| t))
+            .collect();
+        for kind in ["es1", "es3"] {
+            let err = field(&format!("ext {kind} error "));
+            checks.push((
+                "ext dispatch",
+                !err.is_empty() && err != "0x0",
+                format!("{kind}: glEGLImageTargetTexture2DOES(no image) error `{err}`, es1 entries missing {missing:?}"),
+            ));
+        }
     }
     let mut ok = true;
     for (what, pass, detail) in checks {

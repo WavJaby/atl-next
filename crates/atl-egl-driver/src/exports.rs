@@ -11,7 +11,7 @@ use crate::abi::egl as e;
 use crate::driver::{self, Driver, set_error, take_error};
 use crate::surface::{self, WindowSurface};
 use crate::window::{Buffer, Window};
-use crate::{es1, fbo0};
+use crate::{es1, es1_ext, fbo0};
 
 const _: e::eglGetProcAddress = eglGetProcAddress;
 const _: e::eglGetError = eglGetError;
@@ -92,16 +92,21 @@ pub unsafe extern "C" fn eglGetProcAddress(name: *const c_char) -> Proc {
         b"eglQueryContext" => Some(eglQueryContext as *const ()),
         _ => fbo0::wrapper(b),
     };
-    if let Some(f) = ours {
-        return own(f);
-    }
     if WITHHELD.contains(&b) {
         return None;
     }
-    let p = driver::get()?.display.host().proc_address(n);
-    // SAFETY: the host's address for `name`, the same contract as ours.
-    (!p.is_null())
-        .then(|| unsafe { std::mem::transmute::<*const c_void, unsafe extern "C" fn()>(p) })
+    let answer = match ours {
+        Some(f) => f,
+        None => driver::get().map_or(std::ptr::null(), |d| {
+            d.display.host().proc_address(n).cast::<()>()
+        }),
+    };
+    // libEGL fills its ES1 and ES2 tables from this one answer: an ES1 extension name gets a shell picking by the current context (es1_ext.rs); ANGLE's own native lookups get the host's
+    let answer = match es1::in_angle() {
+        false => es1_ext::shell(b, answer).unwrap_or(answer),
+        true => answer,
+    };
+    (!answer.is_null()).then(|| own(answer)).flatten()
 }
 
 #[unsafe(no_mangle)]

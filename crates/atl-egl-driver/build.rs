@@ -1,8 +1,55 @@
 // SPDX-License-Identifier: MIT
 //! Generates with atl-bridgegen (bridge controls 1 and 2) `OUT_DIR/window.rs`: libnativewindow's `ANativeWindow` / `ANativeWindowBuffer` / `native_handle_t` records with clang's layout asserted; `OUT_DIR/angle.rs`: ANGLE's EGL entries and external-context constants (eglext_angle.h).
+//! `OUT_DIR/es1_ext.rs`: per-call selecting shells for the ES1 extension entries (from AOSP's `entries_gles1.in` and `GLES/glext.h`).
 //! The EGL / GLES ABI is atl-egl-host's (one typing of every entry, its build.rs); this crate adds only the window side.
 
-use atl_bridgegen::buildscript::{HeaderImport, import_headers};
+use atl_bridgegen::buildscript::{
+    HeaderImport, Upstreams, checkout, gl_entry_names, import_headers, select_shells,
+};
+use atl_bridgegen::ir::Ty;
+
+/// libEGL's ES1 table (Loader.cpp `gl_names_1`): the names it fills from `libGLESv1_CM_atl.so`, else from this driver's eglGetProcAddress.
+const ES1_ENTRIES: &str = "frameworks/native/opengl/libs/entries_gles1.in";
+
+/// The ES1 extension entries (es1_ext.rs): every name of [`ES1_ENTRIES`] that ES1's `GLES/glext.h` declares, as a shell picking by the current context's kind.
+/// Core ES 1.1 (`GLES/gl.h`, force-included, so not the header's own) is not among them: ANGLE's ES1 library exports all of it, so the ES1 table never asks this driver.
+const ES1_EXT: HeaderImport = HeaderImport {
+    name: "es1_ext",
+    source: "frameworks/native/opengl/include/GLES/glext.h",
+    also: &[],
+    include_dirs: &["frameworks/native/opengl/include"],
+    defines: &["GL_GLEXT_PROTOTYPES"],
+    force_include: Some("GLES/gl.h"),
+    functions: &[],
+    types: &[],
+    macros: &[],
+};
+
+#[allow(
+    clippy::print_stdout,
+    reason = "a build script's stdout is cargo's instruction channel"
+)]
+fn es1_ext() -> anyhow::Result<()> {
+    let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
+    let up = Upstreams::of(&checkout(&manifest)?)?;
+    let entries = std::fs::read_to_string(up.file(&format!("aosp/{ES1_ENTRIES}"))?)?;
+    for path in up.rerun_paths(&format!("aosp/{ES1_ENTRIES}")) {
+        println!("cargo::rerun-if-changed={}", path.display());
+    }
+    // no implementation: AOSP's gl_unimplemented answer, 0 of the return type (es1_ext.rs counts it); every GL return type (integers, pointers) has all-zero as a valid value
+    let on_null = |_: &str, ret: &Ty| -> anyhow::Result<String> {
+        Ok(match ret.resolved() {
+            Ty::Void => "return".to_owned(),
+            _ => "\n        // SAFETY: a GL return type, valid all-zero\n        return unsafe { ::core::mem::zeroed() };\n    ".to_owned(),
+        })
+    };
+    select_shells(
+        &ES1_EXT,
+        &gl_entry_names(&entries),
+        "crate::es1_ext::pick",
+        &on_null,
+    )
+}
 
 const IMPORTS: &[HeaderImport] = &[
     // ANGLE's EGL as the ES1 context kind calls it (es1.rs): its own headers, so the external-context entries and attributes are typed from the library they belong to
@@ -142,5 +189,6 @@ fn main() -> anyhow::Result<()> {
     for cfg in selected_breaks()?.into_iter().chain(selected_tier()?) {
         println!("cargo::rustc-cfg={cfg}");
     }
-    import_headers(IMPORTS)
+    import_headers(IMPORTS)?;
+    es1_ext()
 }

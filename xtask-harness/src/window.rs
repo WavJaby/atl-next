@@ -37,6 +37,7 @@ use atl_cpu_pressure::{Sampler, Samples, judge_window};
 
 mod capture;
 mod dialog;
+mod gles1;
 mod gles2;
 mod ime;
 mod move_output;
@@ -186,6 +187,8 @@ enum Stage {
     Dialog,
     /// The GLES2 fixture in UI mode, its `.so` a guest library through the native bridge: the app's readback and the window's picture at its probes are the expectation (xtask-harness/src/window/gles2.rs; GS2.5).
     Gles2,
+    /// UI mode, routing keys empty: a Java GLSurfaceView that never sets a client version (ES1 default) draws with GL10 on the driver's embedded ANGLE; the app's readback, its GL_VERSION and the window's picture at its probes (xtask-harness/src/window/gles1.rs; gl-honesty H2b).
+    Gles1,
     /// UI mode: the probe sends the maximized control, then the suspended state through the proxy; the platform layer must log each as the toplevel's state (xtask-harness/src/window/suspended.rs; window lifecycle S0).
     Suspended,
     /// UI mode with the portrait fixture (xtask-harness/testdata/window-portrait): the readback and every layout are [`portrait_expected`] on the gate output.
@@ -219,6 +222,7 @@ impl Stage {
             Stage::Hwui => "hwui",
             Stage::Dialog => "dialog",
             Stage::Gles2 => "gles2",
+            Stage::Gles1 => "gles1",
             Stage::Suspended => "suspended",
             Stage::Portrait => "portrait",
             Stage::AppId => "app-id",
@@ -238,6 +242,7 @@ impl Stage {
             | Stage::UiBlock
             | Stage::Hwui
             | Stage::Gles2
+            | Stage::Gles1
             | Stage::Portrait
             | Stage::AppId
             | Stage::Title => GTK_WINDOW_MS,
@@ -263,6 +268,7 @@ fn takes_pictures(stage: Stage) -> bool {
             | Stage::Hwui
             | Stage::Portrait
             | Stage::Gles2
+            | Stage::Gles1
             | Stage::Widgets
             | Stage::SurfaceView
             | Stage::WebView
@@ -409,6 +415,7 @@ fn marker(stage: Stage) -> &'static str {
         Stage::WebView => webview::MARKER,
         Stage::Dialog => dialog::MARKER,
         Stage::Gles2 => gles2::MARKER,
+        Stage::Gles1 => gles1::MARKER,
     }
 }
 
@@ -1838,6 +1845,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     .with_gl_driver(root)?
     // the native-bridge guest: every window stage carries it, as `app` does (the GLES2 fixture's library is a guest library)
     .with_native_bridge_guest(&args.host)?;
+    // the GLES1 fixture must render with routing keys empty: its ES1 context is the driver's own (gl-honesty H2b)
+    let rt = match args.stage {
+        Stage::Gles1 => rt.without_gl_selection(),
+        _ => rt,
+    };
     if args.hold.is_some() && !matches!(args.stage, Stage::Gtk | Stage::Widgets | Stage::Resize) {
         anyhow::bail!("--hold needs a UI stage (gtk, widgets or resize)");
     }
@@ -1873,6 +1885,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         | Stage::UiBlock
         | Stage::Dialog
         | Stage::Gles2
+        | Stage::Gles1
         | Stage::Suspended
         | Stage::MouseTouch => {
             // a hold has no proxy: the compositor sees the window alone, so its border and size are the owner's drags
@@ -1996,6 +2009,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Stage::Hwui => HWUI_FIXTURE,
         Stage::Dialog => dialog::FIXTURE,
         Stage::Gles2 => gles2_fixture::FIXTURE,
+        Stage::Gles1 => gles1::FIXTURE,
         Stage::Portrait => PORTRAIT_FIXTURE,
         _ => FIXTURE,
     };
@@ -2113,6 +2127,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 Some(capture_probe) => gles2::drive(p, &log, capture_probe),
                 None => Err("no capture probe".to_owned()),
             },
+            (Stage::Gles1, _, _) => match &capture_probe {
+                Some(capture_probe) => gles1::drive(p, &log, capture_probe),
+                None => Err("no capture probe".to_owned()),
+            },
             (Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish, _, _) => {
                 match &capture_probe {
                     Some(capture_probe) => drive_resize(p, &log, capture_probe),
@@ -2204,6 +2222,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             dialog::checks(&app, &services, &liveness, &captured, ended.is_some())
         }
         (Stage::Gles2, Some(_)) => gles2::checks(&app, display, &liveness, &captured),
+        (Stage::Gles1, Some(_)) => gles1::checks(root, &app, display, &liveness, &captured),
         (Stage::Suspended, Some(_)) => suspended::checks(&after_marker(&app, marker), &liveness),
         (Stage::Ime, Some(_)) => {
             let mut sub = ime::checks(&app, &services, &liveness);

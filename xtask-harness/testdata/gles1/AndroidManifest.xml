@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- `xtask test window`, stage gles1: a Java-only GLSurfaceView app that never sets a client version, so GLSurfaceView makes an ES 1 context (its default), drawn with GL10. No native library: no install-time GL routing applies. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.atlgles1"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
+    <uses-feature android:glEsVersion="0x00010001" android:required="true" />
+
+    <application android:label="ATL GLES1" android:hardwareAccelerated="true">
+        <activity android:name=".Main" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
