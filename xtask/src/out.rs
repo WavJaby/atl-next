@@ -697,7 +697,7 @@ fn land_id(land: &Path) -> Result<()> {
     Ok(())
 }
 
-/// What `publish` keeps of `ws/land`: all but the gate's target ([`BOOTSTRAP_DIR`]). Its cargo units key on the land checkout's path; a child reflinking it would inherit foreign-path state.
+/// What `publish` keeps of `ws/land`: all but the gate's target ([`BOOTSTRAP_DIR`]). Cargo reuses a target's outputs as fresh when the checkout's sources are older than them, and the unit key does not include the checkout path: a child would pass its gate on the land's artifacts. [`recopy`] carries the land's own back.
 fn copy_base(src: &Path, dst: &Path) -> Result<Tier> {
     copy_tree(src, dst, None, &[BOOTSTRAP_DIR])
 }
@@ -731,11 +731,14 @@ pub fn publish(land: &Path) -> Result<String> {
     Ok(format!("out: base/{head} from ws/{id} ({})", tier.name()))
 }
 
-/// Land's reset after a failed verify: deletes `ws/land` under its exclusive lock and copies it again from the newest base that is an ancestor of the land worktree's HEAD ([`ensure`]). Returns the create line.
+/// Land's reset after a failed verify: deletes `ws/land` under its exclusive lock and copies it again from the newest base that is an ancestor of the land worktree's HEAD ([`ensure`]). The land's own gate state is carried over: [`copy_base`] leaves it out of bases. Returns the create line.
 pub fn recopy(land: &Path) -> Result<String> {
     land_id(land)?;
     let ws = Layout::of(land)?.workspace().to_owned();
     let dir = dir_of(&ws, LAND_ID);
+    // aside at the pool root, which no id lists: the copy below would otherwise delete the gate state with the dir
+    let aside = pool(&ws).join(format!(".{LAND_ID}-{BOOTSTRAP_DIR}-{}", std::process::id()));
+    let mut kept = false;
     if present(&dir)? {
         let Some(_lock) = build_pool::try_lock_dir(&ws, LAND_ID)? else {
             bail!(
@@ -743,9 +746,27 @@ pub fn recopy(land: &Path) -> Result<String> {
                 dir.display()
             );
         };
+        let state = dir.join(BOOTSTRAP_DIR);
+        if present(&state)? {
+            std::fs::rename(&state, &aside)
+                .with_context(|| format!("moving {} aside", state.display()))?;
+            kept = true;
+        }
         remove_build_dir(&dir)?;
     }
-    let dir = prepare(land)?;
+    let dir = match prepare(land) {
+        Ok(dir) => dir,
+        Err(e) => {
+            if kept {
+                let _ = remove_build_dir(&aside);
+            }
+            return Err(e);
+        }
+    };
+    if kept {
+        std::fs::rename(&aside, dir.join(BOOTSTRAP_DIR))
+            .with_context(|| format!("restoring {}", aside.display()))?;
+    }
     let base = std::fs::read_to_string(dir.join(BASE_FILE))
         .map_or("no base".to_owned(), |c| format!("base/{}", c.trim()));
     Ok(format!("ws/{LAND_ID} re-copied from {base}"))
@@ -1135,6 +1156,50 @@ mod tests {
         assert!(d.join("base/c/cargo/y").is_file());
         assert!(!d.join("base/c").join(BOOTSTRAP_DIR).exists());
         std::fs::remove_dir_all(&d).expect("cleanup");
+    }
+
+    /// The land's gate state is its own: publish leaves it out of the base (other checkouts would reuse it as fresh), and recopy puts the land's back, so the next land's gate runs warm.
+    #[test]
+    fn a_land_recopy_keeps_the_gate_state() {
+        let ws = scratch("recopy");
+        let repo = ws.join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let g = |args: &[&str]| git(Some(&repo), args).expect("git");
+        g(&["init", "-q", "-b", "main"]);
+        put(&repo.join("f"));
+        g(&["add", "f"]);
+        g(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "a",
+        ]);
+        let head = g(&["rev-parse", "HEAD"]);
+        let land = ws.join("land");
+        let land_str = land.to_str().expect("utf-8 path");
+        g(&["worktree", "add", "-q", "--detach", land_str, head.as_str()]);
+        let dir = dir_of(&ws, LAND_ID);
+        put(&dir.join(BOOTSTRAP_DIR).join("debug/own"));
+        put(&dir.join(TARGET).join("debug/own"));
+        publish(&land).expect("publish");
+        assert!(
+            !base_of(&ws, &head).join(BOOTSTRAP_DIR).exists(),
+            "publish put the gate state in a base"
+        );
+        recopy(&land).expect("recopy");
+        assert!(
+            dir.join(BOOTSTRAP_DIR).join("debug/own").is_file(),
+            "recopy dropped the land's gate state"
+        );
+        assert!(
+            dir.join(TARGET).join("debug/own").is_file(),
+            "recopy did not copy the base"
+        );
+        std::fs::remove_dir_all(&ws).expect("cleanup");
     }
 
     /// The threshold: the two measured cases (D11: 0 upstream files changed, README-only and 40 crate/bp2ninja files) keep at the default; any upstream change refreshes.
