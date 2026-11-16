@@ -4,15 +4,33 @@
 //! the WebView's rectangle (the carrier SurfaceView's hole, drawn by the platform at the carrier layer's depth), the overlay above it.
 //! Sub-gates ([`checks`]): loaded (the page's onPageFinished), readback (the settled capture is that picture, pixel for pixel; the capture route renders the window's own widget, so it holds the page),
 //! pong (the window answered a ping), controls: pictures with one rule broken differ (no page: the carrier's black background colour layer; page over the overlay; page under the window).
+//! Input (W3b, hold-and-replay): page-tap (a click on the page reaches it), view-tap (a click on the overlapping View reaches the View, not the page), intercept (a drag the WebView's parent takes:
+//! ACTION_CANCEL after the page's press, `webview.input.intercept-no-cancel` counted, no click), after-intercept (the next click reaches the page).
 //! Break `--break-webview-engine`: the run's library dir lacks the engine module, the fixture's WebView cannot be made, the readback must fail.
 
 use std::path::Path;
 use std::sync::Mutex;
 
-use super::capture;
 use super::{ACK_WAIT, Liveness, PONG_WAIT, Sub, await_event, wait_for_line};
+use super::{capture, widgets};
 use crate::composer::{fnv1a64, word};
-use crate::wayland_proxy::{Event as ProxyEvent, Proxy};
+use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
+
+/// A page title (Main.java onReceivedTitle): every click the page gets sets `tap<n>`.
+const TITLE: &str = "AtlWindow: wv title ";
+/// The overlay View's click (Main.java).
+const OVERLAY_TAP: &str = "AtlWindow: wv overlay tap";
+/// The WebView's parent took the drag (Main.java Intercept).
+const INTERCEPTED: &str = "AtlWindow: wv intercepted";
+/// The provider's divergence counter (atl-webview jni.rs `INTERCEPT_NO_CANCEL`, webview plan S2.2 amended).
+const INTERCEPT_COUNTER: &str = "webview.input.intercept-no-cancel";
+/// Its first record in the app log (atl-diag: `diag: first <outcome> <api> ...`).
+const DIVERGENCE_LINE: &str = "diag: first divergence webview.input.intercept-no-cancel";
+/// How long each input waits for the fixture's line: one Looper trip plus one web-process round trip; generous for a loaded host.
+const INPUT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// The drag: steps of this many pixels, past the 8 dp touch slop of a scrolling parent (the fixture's Intercept takes the first move anyway).
+const DRAG_STEPS: u32 = 3;
+const DRAG_STEP_PX: u32 = 20;
 
 /// The fixture's dir.
 pub const FIXTURE: &str = "xtask-harness/testdata/webview";
@@ -224,10 +242,160 @@ pub fn checks(
             },
         ),
         ("controls", controls(app)),
+        ("page-tap", page_tap(app)),
+        ("view-tap", view_tap(app)),
+        ("intercept", intercept(app)),
+        ("after-intercept", after_intercept(app)),
     ]
 }
 
-/// The probe: the window's configure is acked, the fixture laid out and its page loaded (or the fixture said it has no WebView), WebKit's paint settles, then one settled picture and a ping.
+/// The fixture's input lines in log order: page titles (`tap<n>`), the overlay's click, the parent's intercept, the divergence counter's first record.
+fn input_lines(app: &str) -> Vec<&str> {
+    app.lines()
+        .filter_map(|l| {
+            if let Some(i) = l.find(TITLE) {
+                Some(&l[i + TITLE.len()..])
+            } else if l.contains(OVERLAY_TAP) {
+                Some("overlay")
+            } else if l.contains(INTERCEPTED) {
+                Some("intercepted")
+            } else if l.contains(DIVERGENCE_LINE) {
+                Some("divergence")
+            } else {
+                None
+            }
+        })
+        // the page's own title before any click (the data URL) is not a click
+        .filter(|s| !s.starts_with("data:"))
+        .collect()
+}
+
+/// The position of `what` in `lines`, or why it is missing.
+fn at(lines: &[&str], what: &str) -> Result<usize, String> {
+    lines
+        .iter()
+        .position(|l| *l == what)
+        .ok_or_else(|| format!("no `{what}` in the input lines {lines:?}"))
+}
+
+/// Sub-gate page-tap: the first tap (on the page, off the overlay) reached the page: its first title is `tap1`, before anything else.
+fn page_tap(app: &str) -> Result<String, String> {
+    let lines = input_lines(app);
+    match lines.first() {
+        Some(&"tap1") => Ok("the tap on the page reached it (title tap1)".to_owned()),
+        _ => Err(format!("input lines {lines:?}: want tap1 first")),
+    }
+}
+
+/// Sub-gate view-tap: the tap on the overlay reached the overlay View and not the page: `overlay` follows `tap1`, and the next page title comes only after the intercept.
+fn view_tap(app: &str) -> Result<String, String> {
+    let lines = input_lines(app);
+    let (t1, o) = (at(&lines, "tap1")?, at(&lines, "overlay")?);
+    if o != t1 + 1 {
+        return Err(format!(
+            "input lines {lines:?}: want overlay right after tap1"
+        ));
+    }
+    if lines.get(o + 1).is_some_and(|l| l.starts_with("tap")) {
+        return Err(format!(
+            "input lines {lines:?}: the overlay's tap also reached the page"
+        ));
+    }
+    Ok("the tap on the overlay reached the View only".to_owned())
+}
+
+/// Sub-gate intercept: the drag on the page was intercepted by the WebView's parent, the divergence counted once, and the drag's release did not click the page.
+fn intercept(app: &str) -> Result<String, String> {
+    let lines = input_lines(app);
+    let (i, d) = (at(&lines, "intercepted")?, at(&lines, "divergence")?);
+    if d < i {
+        return Err(format!(
+            "input lines {lines:?}: divergence before the intercept"
+        ));
+    }
+    if lines[i..d].iter().any(|l| l.starts_with("tap")) {
+        return Err(format!(
+            "input lines {lines:?}: the intercepted drag clicked the page"
+        ));
+    }
+    Ok(format!(
+        "ACTION_CANCEL after the page's press: `{INTERCEPT_COUNTER}` counted"
+    ))
+}
+
+/// Sub-gate after-intercept: a tap on the page after the intercept reaches it (title tap2), the last input line: the page is not stuck.
+fn after_intercept(app: &str) -> Result<String, String> {
+    let lines = input_lines(app);
+    let i = at(&lines, "intercepted")?;
+    match lines.last() {
+        Some(&"tap2") if at(&lines, "tap2")? > i => {
+            Ok("the next tap reached the page (title tap2)".to_owned())
+        }
+        _ => Err(format!(
+            "input lines {lines:?}: want tap2 last, after the intercept"
+        )),
+    }
+}
+
+/// One click at `(x, y)` (surface-local, logical): move there, press, release.
+fn click(proxy: &Proxy, (x, y): (f64, f64)) -> Result<(), String> {
+    widgets::inject(
+        proxy,
+        vec![
+            PointerAction::Motion { x, y },
+            widgets::press(true),
+            widgets::press(false),
+        ],
+    )
+}
+
+/// The input part of the probe: tap the page, tap the overlay, drag on the page (the parent intercepts), tap the page again; each waits for its line (a missing line is the sub-gate's failure).
+fn drive_input(proxy: &Proxy, app_log: &Path) -> Result<(), String> {
+    let text = std::fs::read_to_string(app_log).map_err(|e| e.to_string())?;
+    let l = layout(&text)?;
+    let (ox, oy) = super::content_origin(&text)?;
+    // window pixels -> surface (scale 1 on the gate output)
+    let s = |x: u32, y: u32| (f64::from(x) + f64::from(ox), f64::from(y) + f64::from(oy));
+    // on the page, right of the overlay
+    let page = s(l.web.right - 50, l.web.bottom - 50);
+    let overlay = s(
+        (l.over.left + l.over.right) / 2,
+        (l.over.top + l.over.bottom) / 2,
+    );
+    let (dx, dy) = (l.web.right - 100, l.web.top + 20);
+    widgets::inject(
+        proxy,
+        vec![PointerAction::Enter {
+            x: page.0,
+            y: page.1,
+        }],
+    )?;
+    click(proxy, page)?;
+    let _ = widgets::wait_until(app_log, INPUT_WAIT, |t| t.contains("wv title tap1"));
+    click(proxy, overlay)?;
+    let _ = widgets::wait_until(app_log, INPUT_WAIT, |t| t.contains(OVERLAY_TAP));
+    let start = s(dx, dy);
+    let mut drag = vec![
+        PointerAction::Motion {
+            x: start.0,
+            y: start.1,
+        },
+        widgets::press(true),
+    ];
+    for step in 1..=DRAG_STEPS {
+        let p = s(dx + step * DRAG_STEP_PX, dy);
+        drag.push(PointerAction::Motion { x: p.0, y: p.1 });
+    }
+    drag.push(widgets::press(false));
+    widgets::inject(proxy, drag)?;
+    let _ = widgets::wait_until(app_log, INPUT_WAIT, |t| t.contains(INTERCEPTED));
+    click(proxy, page)?;
+    let _ = widgets::wait_until(app_log, INPUT_WAIT, |t| t.contains("wv title tap2"));
+    Ok(())
+}
+
+/// The probe: the window's configure is acked, the fixture laid out and its page loaded (or the fixture said it has no WebView), WebKit's paint settles, then one settled picture and a ping,
+/// then the input ([`drive_input`]).
 pub fn drive(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liveness, String> {
     await_event(&proxy.events, ACK_WAIT, |e| {
         matches!(e, ProxyEvent::Acked { .. })
@@ -247,6 +415,9 @@ pub fn drive(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liv
         *e == ProxyEvent::Pong { serial: 1 }
     })
     .is_some();
+    if !no_webview {
+        drive_input(&proxy, app_log)?;
+    }
     Ok(Liveness {
         answered,
         ..Liveness::default()
@@ -262,6 +433,28 @@ mod tests {
     fn at(p: &[u8], x: usize, y: usize) -> [u8; 4] {
         let i = (y * 8 + x) * 4;
         [p[i], p[i + 1], p[i + 2], p[i + 3]]
+    }
+
+    /// The input sub-gates on hand-written logs: the expected order passes; the overlay's tap leaking to the page, a clicking drag, and no second page tap each fail.
+    #[test]
+    fn input_sub_gates_by_hand() {
+        let ok = "x AtlWindow: wv title data:text/html,x\nx AtlWindow: wv title tap1\nx AtlWindow: wv overlay tap\nx AtlWindow: wv intercepted\n\
+                  diag: first divergence webview.input.intercept-no-cancel 1 at=1\nx AtlWindow: wv title tap2\n";
+        assert!(
+            page_tap(ok).is_ok()
+                && view_tap(ok).is_ok()
+                && intercept(ok).is_ok()
+                && after_intercept(ok).is_ok()
+        );
+        let leaked =
+            "x AtlWindow: wv title tap1\nx AtlWindow: wv overlay tap\nx AtlWindow: wv title tap2\n";
+        assert!(view_tap(leaked).is_err());
+        let clicked = "x AtlWindow: wv title tap1\nx AtlWindow: wv overlay tap\nx AtlWindow: wv intercepted\nx AtlWindow: wv title tap2\n\
+                       diag: first divergence webview.input.intercept-no-cancel 1 at=1\n";
+        assert!(intercept(clicked).is_err());
+        let stuck = "x AtlWindow: wv title tap1\nx AtlWindow: wv overlay tap\nx AtlWindow: wv intercepted\n\
+                     diag: first divergence webview.input.intercept-no-cancel 1 at=1\n";
+        assert!(after_intercept(stuck).is_err());
     }
 
     /// The picture by hand on a small layout: window, page, overlay over the page and past its edge.

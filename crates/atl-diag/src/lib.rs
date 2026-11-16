@@ -35,6 +35,8 @@ pub const REFUSED: &str = "refused";
 pub const REFUSED_PARCEL: &str = "refused-parcel";
 /// Outcome of an outgoing call the services made, so `unimplemented` keeps meaning unimplemented.
 pub const SENT: &str = "sent";
+/// Outcome of an app-observable departure from AOSP behaviour the design accepts and counts instead of patching (webview plan S2.2 `webview.input.intercept-no-cancel`).
+pub const DIVERGENCE: &str = "divergence";
 /// Outcome of a service lookup nobody serves; the api field is the name. Read from upstream's own log lines ([`summary::MISSING_SERVICE_LINES`]), not counted in process.
 pub const MISSING_SERVICE: &str = "missing-service";
 

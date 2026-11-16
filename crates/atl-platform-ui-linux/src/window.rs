@@ -19,6 +19,7 @@ use crate::input;
 use crate::mirror;
 use crate::outputs;
 use crate::scene;
+use crate::sideband;
 use crate::text_input::GtkTextInput;
 use crate::ui::GtkUi;
 use crate::view::{SceneView, logical_px};
@@ -247,11 +248,17 @@ impl GtkWindow {
             }
             let event = input::pointer(phase, x, y, scale_of(controller), monotonic_ns);
             shared.on_event.call(|f| f(event));
+            sideband::stamp(controller.current_event(), monotonic_ns);
         }
+        // Every pointer controller runs in the capture phase, so it publishes an event before a sideband widget's gate holds it (sideband.rs); a held event put back is Android's already and skipped.
         // raw wl_pointer buttons, not GestureClick: a click gesture interprets presses (gtk-dnd-drag-threshold -> "stopped", n_press counting), and a drag past it lost its release -> the mouse finger never lifted
         let buttons = gtk4::EventControllerLegacy::new();
+        buttons.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let s = Rc::clone(shared);
         buttons.connect_event(move |c, event| {
+            if sideband::replayed(Some(event)) {
+                return glib::Propagation::Proceed;
+            }
             let Some(b) = event.downcast_ref::<gdk::ButtonEvent>() else {
                 return glib::Propagation::Proceed;
             };
@@ -268,8 +275,12 @@ impl GtkWindow {
         });
         view.add_controller(buttons);
         let motion = gtk4::EventControllerMotion::new();
+        motion.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let s = Rc::clone(shared);
         motion.connect_motion(move |c, x, y| {
+            if sideband::replayed(c.current_event().as_ref()) {
+                return;
+            }
             let current = (c.current_event_time(), x, y);
             let history = c.current_event().map(|e| e.history()).unwrap_or_default();
             let view = c.widget();
@@ -285,9 +296,16 @@ impl GtkWindow {
             }
         });
         let s = Rc::clone(shared);
-        motion.connect_enter(move |c, x, y| emit(&s, c, PointerPhase::Enter, x, y));
+        motion.connect_enter(move |c, x, y| {
+            if !sideband::replayed(c.current_event().as_ref()) {
+                emit(&s, c, PointerPhase::Enter, x, y)
+            }
+        });
         let s = Rc::clone(shared);
         motion.connect_leave(move |c| {
+            if sideband::replayed(c.current_event().as_ref()) {
+                return;
+            }
             let (x, y) = s.pointer_at.get();
             emit(&s, c, PointerPhase::Leave, x, y);
         });
@@ -298,23 +316,27 @@ impl GtkWindow {
     /// The unit tells a wheel from fingers; GDK gives finger scrolling its own device, so `scroll-end` marks the fingers lifting (wl_pointer.axis_stop).
     fn wire_scroll(view: &SceneView, shared: &Rc<Shared>) {
         let scroll = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::BOTH_AXES);
+        scroll.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let s = Rc::clone(shared);
         scroll.connect_scroll(move |c, dx, dy| {
+            if sideband::replayed(c.current_event().as_ref()) {
+                return gtk4::glib::Propagation::Proceed;
+            }
             let unit = match c.unit() {
                 gdk::ScrollUnit::Wheel => input::ScrollUnit::Wheel,
                 _ => input::ScrollUnit::Surface,
             };
             s.swiping.set(unit == input::ScrollUnit::Surface);
-            let event = input::scroll(
-                unit,
-                dx,
-                dy,
-                s.pointer_at.get(),
-                scale_of(c),
-                s.stamp("scroll", c.current_event_time()),
-            );
+            let at = s.stamp("scroll", c.current_event_time());
+            let event = input::scroll(unit, dx, dy, s.pointer_at.get(), scale_of(c), at);
             s.on_event.call(|f| f(event));
-            gtk4::glib::Propagation::Stop
+            sideband::stamp(c.current_event(), at);
+            // a scroll over a sideband widget goes on to its gate
+            if sideband::routes_to_gate(picked(c, s.pointer_at.get())) {
+                gtk4::glib::Propagation::Proceed
+            } else {
+                gtk4::glib::Propagation::Stop
+            }
         });
         let s = Rc::clone(shared);
         scroll.connect_scroll_end(move |c| {
@@ -333,6 +355,9 @@ impl GtkWindow {
         legacy.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let s = Rc::clone(shared);
         legacy.connect_event(move |c, event| {
+            if sideband::replayed(Some(event)) {
+                return glib::Propagation::Proceed;
+            }
             let phase = match event.event_type() {
                 gdk::EventType::TouchBegin => TouchPhase::Down,
                 gdk::EventType::TouchUpdate => TouchPhase::Move,
@@ -342,20 +367,32 @@ impl GtkWindow {
             };
             let sequence: *mut gdk::ffi::GdkEventSequence = event.event_sequence().to_glib_none().0;
             let id = s.touch_ids.borrow_mut().id(sequence as usize, phase);
-            if let (Some(id), Some((x, y))) = (id, view_point(c, event)) {
+            let point = view_point(c, event);
+            if let (Some(id), Some((x, y))) = (id, point) {
                 let at = s.stamp("touch", c.current_event_time());
                 let event = input::touch(phase, id, x, y, scale_of(c), at);
                 s.on_event.call(|f| f(event));
+                sideband::stamp(c.current_event(), at);
             }
-            glib::Propagation::Stop
+            // a touch on a sideband widget goes on to its gate
+            if point.is_some_and(|p| sideband::routes_to_gate(picked(c, p))) {
+                glib::Propagation::Proceed
+            } else {
+                glib::Propagation::Stop
+            }
         });
         view.add_controller(legacy);
     }
 
     /// Keys of the toplevel (the window has keyboard focus): presses, GDK's synthesized repeats (the desktop's `repeat_info`), releases. The IME item puts its GtkIMContext on this controller, so keys it consumes never arrive here.
+    /// Capture phase, so a key reaches Android before a focused sideband widget's gate holds it; a held key put back is skipped (sideband.rs).
     fn wire_keys(window: &gtk4::Window, shared: &Rc<Shared>) {
         let keys = gtk4::EventControllerKey::new();
+        keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let send = |s: &Rc<Shared>, c: &gtk4::EventControllerKey, down: bool, keycode: u32| {
+            if sideband::replayed(c.current_event().as_ref()) {
+                return glib::Propagation::Proceed;
+            }
             let locks = c
                 .current_event_device()
                 .map(|d| Locks {
@@ -364,19 +401,24 @@ impl GtkWindow {
                     scroll: d.is_scroll_locked(),
                 })
                 .unwrap_or_default();
-            if let Some(event) =
-                input::key(down, keycode, locks, s.stamp("key", c.current_event_time()))
-            {
+            let at = s.stamp("key", c.current_event_time());
+            if let Some(event) = input::key(down, keycode, locks, at) {
                 s.on_event.call(|f| f(event));
+                sideband::stamp(c.current_event(), at);
+            }
+            let focus = c.widget().and_then(|w| w.root()).and_then(|r| r.focus());
+            if sideband::routes_to_gate(focus) {
+                glib::Propagation::Proceed
+            } else {
+                glib::Propagation::Stop
             }
         };
         let s = Rc::clone(shared);
-        keys.connect_key_pressed(move |c, _, keycode, _| {
-            send(&s, c, true, keycode);
-            glib::Propagation::Stop
-        });
+        keys.connect_key_pressed(move |c, _, keycode, _| send(&s, c, true, keycode));
         let s = Rc::clone(shared);
-        keys.connect_key_released(move |c, _, keycode, _| send(&s, c, false, keycode));
+        keys.connect_key_released(move |c, _, keycode, _| {
+            send(&s, c, false, keycode);
+        });
         window.add_controller(keys);
     }
 }
@@ -428,8 +470,13 @@ fn surface_to_view(view: &gtk4::Widget, (x, y): (f64, f64)) -> Option<(f64, f64)
     Some((f64::from(at.x()), f64::from(at.y())))
 }
 
+/// The widget under `(x, y)` of the controller's view (logical pixels).
+fn picked(c: &impl IsA<gtk4::EventController>, (x, y): (f64, f64)) -> Option<gtk4::Widget> {
+    c.widget()?.pick(x, y, gtk4::PickFlags::DEFAULT)
+}
+
 /// CLOCK_MONOTONIC now, ns: the base of published input times (`input::ClockMap`).
-fn monotonic_ns() -> i64 {
+pub(crate) fn monotonic_ns() -> i64 {
     let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
     now.tv_sec * 1_000_000_000 + now.tv_nsec
 }

@@ -238,7 +238,6 @@ impl Stage {
             Stage::Frames | Stage::Input => FRAMES_WINDOW_MS,
             Stage::Gtk
             | Stage::SurfaceView
-            | Stage::WebView
             | Stage::UiBlock
             | Stage::Hwui
             | Stage::Gles2
@@ -248,7 +247,8 @@ impl Stage {
             | Stage::Title => GTK_WINDOW_MS,
             Stage::Dialog => DIALOG_WINDOW_MS,
             Stage::Capture => capture::CAPTURE_WINDOW_MS,
-            Stage::Widgets | Stage::Ime | Stage::MouseTouch => WIDGETS_WINDOW_MS,
+            // the webview stage's picture, then four inputs each waiting for the page's answer
+            Stage::Widgets | Stage::Ime | Stage::MouseTouch | Stage::WebView => WIDGETS_WINDOW_MS,
             Stage::Resize
             | Stage::Relaunch
             | Stage::Declared

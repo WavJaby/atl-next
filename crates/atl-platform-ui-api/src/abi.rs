@@ -1036,6 +1036,10 @@ pub struct UiVtable {
     pub sideband_attach: unsafe extern "C" fn(key: i32, widget: *mut c_void),
     /// Drops `key`'s widget (unparented from its window, its reference released); a quad still naming it shows nothing. UI thread.
     pub sideband_detach: unsafe extern "C" fn(key: i32),
+    /// `WebView::claim_input` for `key`'s widget: `claim` an [`InputClaim`](crate::webview::InputClaim) number; returns the left-pressed flag. UI thread.
+    pub sideband_claim: unsafe extern "C" fn(key: i32, claim: u32, time_ns: i64) -> bool,
+    /// `WebView::set_focused` for `key`'s widget. UI thread.
+    pub sideband_focus: unsafe extern "C" fn(key: i32, on: bool),
 }
 
 /// The WebView module's file name (webview plan S2.3): the web engine in a module of its own, loaded `RTLD_LOCAL` on first provider use, because its closure (~170 objects, +33 MB, ~70 ms measured) is not paid by apps that never touch WebView.

@@ -9,7 +9,9 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 use std::sync::mpsc;
 
-use atl_platform_ui::webview::{LoadError, PromptReply, WebEngine as _, WebEvent, WebView as _};
+use atl_platform_ui::webview::{
+    InputClaim, LoadError, PromptReply, WebEngine as _, WebEvent, WebView as _,
+};
 use atl_platform_ui::{PlatformWebEngine, PlatformWebView};
 
 use crate::bridge;
@@ -152,6 +154,22 @@ fn call_obj(env: Env, obj: Obj, name: &CStr, sig: &CStr, args: &[jvalue]) -> Obj
 fn call_bool(env: Env, obj: Obj, name: &CStr, sig: &CStr, args: &[jvalue]) -> bool {
     let m = method(env, obj, name, sig);
     !m.is_null() && jni_call!(env, CallBooleanMethodA, obj, m, args.as_ptr()) != 0
+}
+
+fn call_int(env: Env, obj: Obj, name: &CStr, sig: &CStr) -> i32 {
+    let m = method(env, obj, name, sig);
+    if m.is_null() {
+        return 0;
+    }
+    jni_call!(env, CallIntMethodA, obj, m, std::ptr::null())
+}
+
+fn call_long(env: Env, obj: Obj, name: &CStr, sig: &CStr) -> i64 {
+    let m = method(env, obj, name, sig);
+    if m.is_null() {
+        return 0;
+    }
+    jni_call!(env, CallLongMethodA, obj, m, std::ptr::null())
 }
 
 fn field(env: Env, obj: Obj, name: &CStr, sig: &CStr) -> *mut _jfieldID {
@@ -1144,6 +1162,86 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_getProgre
     let _ = env;
     n.view.progress()
 });
+
+// ---- input (webview plan S2.2 amended, hold-and-replay) ----
+
+/// MotionEvent.ACTION_* (MotionEvent.java).
+mod action {
+    pub const DOWN: i32 = 0;
+    pub const UP: i32 = 1;
+    pub const MOVE: i32 = 2;
+    pub const CANCEL: i32 = 3;
+    pub const POINTER_DOWN: i32 = 5;
+    pub const POINTER_UP: i32 = 6;
+    pub const SCROLL: i32 = 8;
+}
+
+/// The divergence a Cancel can leave: the page got the press, Android cancelled the gesture (a parent intercepted), and the page is told of no cancel (webview plan S2.2: no toolkit API sends one).
+const INTERCEPT_NO_CANCEL: &str = "webview.input.intercept-no-cancel";
+
+/// Claims `claim` at `ev`'s own time (`getEventTimeNanos`: the CLOCK_MONOTONIC stamp the toolkit event was published with).
+fn claim(env: Env, n: &Native, claim: InputClaim, ev: Obj) {
+    let t = call_long(env, ev, c"getEventTimeNanos", c"()J");
+    if n.view.claim_input(claim, t) {
+        atl_diag::count(atl_diag::DIVERGENCE, INTERCEPT_NO_CANCEL, None);
+    }
+}
+
+// Chromium consumes every touch it is given (AwContents.onTouchEvent)
+provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_onTouchEvent, (env, n, ev: Obj) -> u8 = 0, {
+    let c = match call_int(env, ev, c"getActionMasked", c"()I") {
+        action::DOWN => InputClaim::Down,
+        action::UP => InputClaim::Up,
+        action::CANCEL => InputClaim::Cancel,
+        action::MOVE | action::POINTER_DOWN | action::POINTER_UP => InputClaim::Move,
+        _ => InputClaim::Move,
+    };
+    claim(env, n, c, ev);
+    1
+});
+
+provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_onHoverEvent, (env, n, ev: Obj) -> u8 = 0, {
+    claim(env, n, InputClaim::Hover, ev);
+    1
+});
+
+// a scroll is the page's; any other generic motion (a joystick) goes on as View's
+provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_onGenericMotionEvent, (env, n, ev: Obj) -> u8 = 0, {
+    if call_int(env, ev, c"getActionMasked", c"()I") == action::SCROLL {
+        claim(env, n, InputClaim::Move, ev);
+        return 1;
+    }
+    super_bool(env, n, c"super_onGenericMotionEvent", c"(Landroid/view/MotionEvent;)Z", ev)
+});
+
+// a system key (BACK, HOME, volume: KeyEvent.isSystem) goes on to the framework as View's, as Chromium leaves it; any other is the page's
+provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_dispatchKeyEvent, (env, n, ev: Obj) -> u8 = 0, {
+    if call_bool(env, ev, c"isSystem", c"()Z", &[]) {
+        return super_bool(env, n, c"super_dispatchKeyEvent", c"(Landroid/view/KeyEvent;)Z", ev);
+    }
+    claim(env, n, InputClaim::Key, ev);
+    1
+});
+
+provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_onFocusChanged, (env, n, focused: u8, _direction: i32, _previous: Obj) -> () = (), {
+    let _ = env;
+    n.view.set_focused(focused != 0);
+});
+
+/// `WebView.PrivateAccess.<name>(ev)` of the provider's WebView (View's own answer).
+fn super_bool(env: Env, n: &Native, name: &CStr, sig: &CStr, ev: Obj) -> u8 {
+    let provider = jni_call!(env, NewLocalRef, n.shared.provider.get() as Obj);
+    let access = object_field(
+        env,
+        provider,
+        c"mWebViewPrivate",
+        c"Landroid/webkit/WebView$PrivateAccess;",
+    );
+    let r = !access.is_null() && call_bool(env, access, name, sig, &[l(ev)]);
+    delete_local(env, access);
+    delete_local(env, provider);
+    r as u8
+}
 
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_addJavascriptInterface, (env, n, object: Obj, name: Obj) -> () = (), {
     // WebView.addJavascriptInterface's own null checks are the caller's; a null name or object adds nothing

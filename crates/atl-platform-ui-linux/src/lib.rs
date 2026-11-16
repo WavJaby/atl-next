@@ -18,6 +18,7 @@ pub(crate) mod mirror;
 mod module;
 mod outputs;
 mod scene;
+mod sideband;
 mod text_input;
 mod ui;
 mod view;

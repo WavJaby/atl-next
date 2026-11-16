@@ -75,6 +75,8 @@ static VTABLE: UiVtable = UiVtable {
     pcm_underruns,
     sideband_attach,
     sideband_detach,
+    sideband_claim,
+    sideband_focus,
 };
 
 unsafe extern "C" fn sideband_attach(key: i32, widget: *mut std::ffi::c_void) {
@@ -82,11 +84,20 @@ unsafe extern "C" fn sideband_attach(key: i32, widget: *mut std::ffi::c_void) {
     // SAFETY: a live GtkWidget of the same libgtk (the vtable contract); from_glib_none takes our own reference.
     let w: gtk4::Widget =
         unsafe { gtk4::Widget::from_glib_none(widget.cast::<gtk4::ffi::GtkWidget>()) };
-    crate::view::attach(key, w);
+    crate::sideband::attach(key, w);
 }
 
 unsafe extern "C" fn sideband_detach(key: i32) {
-    crate::view::detach(key);
+    crate::sideband::detach(key);
+}
+
+unsafe extern "C" fn sideband_claim(key: i32, claim: u32, time_ns: i64) -> bool {
+    atl_platform_ui_api::webview::InputClaim::of(claim)
+        .is_some_and(|c| crate::sideband::claim(key, c, time_ns))
+}
+
+unsafe extern "C" fn sideband_focus(key: i32, on: bool) {
+    crate::sideband::focus(key, on);
 }
 
 /// [`abi::Entry`]: the static vtable; starts nothing.

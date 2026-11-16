@@ -195,14 +195,17 @@ final class WebViewProviderImpl implements WebViewProvider, WebViewProvider.View
     // Chromium's answer (WebViewChromium.shouldDelayChildPressedState)
     @Override public boolean shouldDelayChildPressedState() { return true; }
     @Override public boolean requestFocus(int direction, Rect previouslyFocusedRect) { return mWebViewPrivate.super_requestFocus(direction, previouslyFocusedRect); }
-    @Override public boolean dispatchKeyEvent(KeyEvent event) { return mWebViewPrivate.super_dispatchKeyEvent(event); }
     @Override public void computeScroll() { mWebViewPrivate.super_computeScroll(); }
-    // ---- ViewDelegate input (W3b): counted, View's answer meanwhile ----
-    @Override public boolean onTouchEvent(MotionEvent ev) { Unimplemented.accept("WebViewProvider.ViewDelegate.onTouchEvent"); return false; }
-    @Override public boolean onHoverEvent(MotionEvent event) { Unimplemented.accept("WebViewProvider.ViewDelegate.onHoverEvent"); return mWebViewPrivate.super_onHoverEvent(event); }
-    @Override public boolean onGenericMotionEvent(MotionEvent event) { Unimplemented.accept("WebViewProvider.ViewDelegate.onGenericMotionEvent"); return mWebViewPrivate.super_onGenericMotionEvent(event); }
-    @Override public void onWindowFocusChanged(boolean hasWindowFocus) { Unimplemented.accept("WebViewProvider.ViewDelegate.onWindowFocusChanged"); }
-    @Override public void onFocusChanged(boolean focused, int direction, Rect previouslyFocusedRect) { Unimplemented.accept("WebViewProvider.ViewDelegate.onFocusChanged"); }
+    // ---- ViewDelegate input (W3b, webview plan S2.2 amended): Android's dispatch reached the View, so the natives let the page have the toolkit events held for it up to this event's time ----
+    @Override public native boolean onTouchEvent(MotionEvent ev);
+    @Override public native boolean onHoverEvent(MotionEvent event);
+    @Override public native boolean onGenericMotionEvent(MotionEvent event);
+    @Override public native boolean dispatchKeyEvent(KeyEvent event);
+    @Override public native void onFocusChanged(boolean focused, int direction, Rect previouslyFocusedRect);
+    // window focus moves the toolkit focus with the window already
+    @Override public void onWindowFocusChanged(boolean hasWindowFocus) {}
+    // no Android input connection: the page's text input goes through the engine's own input method context, the desktop's (Linux convention); View's answer
+    @Override public InputConnection onCreateInputConnection(EditorInfo outAttrs) { return null; }
 
     // ---- ViewDelegate, not yet ----
     @Override public void onProvideVirtualStructure(android.view.ViewStructure structure) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onProvideVirtualStructure"); }
@@ -212,7 +215,6 @@ final class WebViewProviderImpl implements WebViewProvider, WebViewProvider.View
     @Override public boolean performAccessibilityAction(int action, Bundle arguments) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.performAccessibilityAction"); }
     @Override public void onOverScrolled(int scrollX, int scrollY, boolean clampedX, boolean clampedY) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onOverScrolled"); }
     @Override public boolean performLongClick() { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.performLongClick"); }
-    @Override public InputConnection onCreateInputConnection(EditorInfo outAttrs) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onCreateInputConnection"); }
     @Override public boolean onDragEvent(DragEvent event) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onDragEvent"); }
     @Override public boolean onTrackballEvent(MotionEvent ev) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onTrackballEvent"); }
     @Override public void onActivityResult(int requestCode, int resultCode, Intent data) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onActivityResult"); }

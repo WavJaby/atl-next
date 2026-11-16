@@ -49,6 +49,44 @@ pub trait WebView {
     /// The ints of the sideband stream that shows this view (webview plan S2.2 amended): the provider sets them on the layer that carries the view, and every window draws the view where a quad with
     /// that stream lands, at that quad's depth. The same ints for the view's life.
     fn sideband_stream(&self) -> [i32; 2];
+    /// Android's dispatch delivered `claim`, stamped `time_ns` (CLOCK_MONOTONIC, the event's own time), to the View: the toolkit events held for the view up to that time reach the page
+    /// (webview plan S2.2 amended, hold-and-replay). True when a Cancel left the page mid-press: the page is told of no cancel (a counted divergence).
+    fn claim_input(&self, claim: InputClaim, time_ns: i64) -> bool;
+    /// Android focus: the view takes the toolkit's keyboard focus (and with it the desktop input method, through the engine's own context), or gives it back.
+    fn set_focused(&self, on: bool);
+}
+
+/// What Android delivered to a WebView ([`WebView::claim_input`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum InputClaim {
+    /// ACTION_DOWN: a gesture starts at the View.
+    Down = 1,
+    /// ACTION_MOVE (all its batched samples), or a generic motion (scroll).
+    Move = 2,
+    /// ACTION_UP.
+    Up = 3,
+    /// ACTION_CANCEL: a parent took the gesture.
+    Cancel = 4,
+    /// A hover event.
+    Hover = 5,
+    /// A KeyEvent.
+    Key = 6,
+}
+
+impl InputClaim {
+    /// The claim of its `repr` number, None for another.
+    pub fn of(n: u32) -> Option<Self> {
+        Some(match n {
+            1 => Self::Down,
+            2 => Self::Move,
+            3 => Self::Up,
+            4 => Self::Cancel,
+            5 => Self::Hover,
+            6 => Self::Key,
+            _ => return None,
+        })
+    }
 }
 
 /// The first int of a WebView's sideband stream ([`WebView::sideband_stream`]): a sideband quad with another tag is not a WebView (a TV tuner's stream) and shows nothing. ASCII "WebV".

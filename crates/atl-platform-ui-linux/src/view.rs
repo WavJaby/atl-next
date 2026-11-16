@@ -1,62 +1,21 @@
 // SPDX-License-Identifier: MIT
 //! `SceneView`: the one widget of a window, drawing the presented scene's pieces. No per-widget GTK peers (plan S3): Android renders every pixel of the app, GTK draws only these nodes and its own chrome.
-//! The one exception is a sideband quad's content (webview plan S2.2 amended): a toolkit widget registered under its stream ([`attach`]; WebKit's view), made a child of the view whose scene shows it,
+//! The one exception is a sideband quad's content (webview plan S2.2 amended): a toolkit widget registered under its stream (`sideband`; WebKit's view), made a child of the view whose scene shows it,
 //! allocated at the quad's place and drawn by `snapshot_child` at the quad's depth under its scissor and alpha, so GTK's picking finds it there.
 
 use std::cell::{Cell, RefCell};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use atl_libgui_parcel::state::FloatRect;
-use atl_platform_ui_api::webview::SIDEBAND_WEB_VIEW;
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 use gtk4::{gdk, glib, graphene, gsk};
 
 use crate::scene::Piece;
+use crate::sideband::resolve;
 
-/// The widgets registered for sideband streams, by key: UI thread only (ThreadGuard panics elsewhere), in a static, not a thread-local (module rule: no module object in the process's thread-local teardown).
-static SIDEBANDS: Mutex<Vec<(i32, glib::thread_guard::ThreadGuard<gtk4::Widget>)>> =
-    Mutex::new(Vec::new());
-
-/// Sideband quads drawn as nothing: a tag other than [`SIDEBAND_WEB_VIEW`] or a key with no widget (logged on the first of each).
+/// Sideband quads drawn as nothing: a tag other than `SIDEBAND_WEB_VIEW` or a key with no widget (logged on the first of each).
 static SIDEBAND_UNRESOLVED: AtomicU64 = AtomicU64::new(0);
-
-/// Registers `widget` as the content of the sideband stream `[SIDEBAND_WEB_VIEW, key]`; UI thread.
-pub fn attach(key: i32, widget: gtk4::Widget) {
-    let mut list = SIDEBANDS.lock().unwrap_or_else(|p| p.into_inner());
-    list.retain(|(k, _)| *k != key);
-    list.push((key, glib::thread_guard::ThreadGuard::new(widget)));
-}
-
-/// Drops `key`'s widget: unparented from the view drawing it (which then draws nothing there); UI thread.
-pub fn detach(key: i32) {
-    let gone = {
-        let mut list = SIDEBANDS.lock().unwrap_or_else(|p| p.into_inner());
-        list.iter()
-            .position(|(k, _)| *k == key)
-            .map(|i| list.remove(i).1.into_inner())
-    };
-    if let Some(w) = gone
-        && let Some(parent) = w.parent()
-    {
-        w.unparent();
-        parent.queue_draw();
-    }
-}
-
-/// The widget of a sideband stream, if it names a registered one.
-fn resolve(stream: &[i32]) -> Option<gtk4::Widget> {
-    let [SIDEBAND_WEB_VIEW, key] = stream else {
-        return None;
-    };
-    SIDEBANDS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .iter()
-        .find(|(k, _)| k == key)
-        .map(|(_, w)| w.get_ref().clone())
-}
 
 fn logical_rect(r: &FloatRect, to_logical: f32) -> graphene::Rect {
     graphene::Rect::new(
