@@ -52,5 +52,6 @@ public final class WebViewChromiumFactoryProviderForT implements WebViewFactoryP
     @Override public WebIconDatabase getWebIconDatabase() { throw Unimplemented.refuse("WebViewFactoryProvider.getWebIconDatabase"); }
     @Override public WebStorage getWebStorage() { throw Unimplemented.refuse("WebViewFactoryProvider.getWebStorage"); }
     @Override public WebViewDatabase getWebViewDatabase(Context context) { throw Unimplemented.refuse("WebViewFactoryProvider.getWebViewDatabase"); }
-    @Override public ClassLoader getWebViewClassLoader() { throw Unimplemented.refuse("WebViewFactoryProvider.getWebViewClassLoader"); }
+    // the loader WebViewFactory loaded this provider with (the provider APK's, WebView.getWebViewClassLoader); it holds no Chromium support-library glue, so androidx.webkit finds no extra features
+    @Override public ClassLoader getWebViewClassLoader() { return WebViewChromiumFactoryProviderForT.class.getClassLoader(); }
 }

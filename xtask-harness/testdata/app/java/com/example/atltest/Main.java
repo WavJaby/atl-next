@@ -297,6 +297,27 @@ public class Main extends Activity {
 
     private android.webkit.WebView mScaleView;
 
+    /**
+     * The class loader line (app.rs WEBVIEW_CLASSLOADER): WebView.getWebViewClassLoader loads the provider's own factory class (`provider=`, the class WebViewFactory instantiated), and a
+     * Chromium support-library glue class is absent (`glue=`), the probe androidx.webkit makes.
+     */
+    private String webViewClassLoader() {
+        try {
+            ClassLoader cl = android.webkit.WebView.getWebViewClassLoader();
+            Class<?> p = Class.forName("com.android.webview.chromium.WebViewChromiumFactoryProviderForT", false, cl);
+            boolean glue;
+            try {
+                Class.forName("org.chromium.support_lib_glue.SupportLibReflectionUtil", false, cl);
+                glue = true;
+            } catch (ClassNotFoundException e) {
+                glue = false;
+            }
+            return "provider=" + (p.getClassLoader() == cl) + " glue=" + glue;
+        } catch (Throwable e) {
+            return "threw=" + e;
+        }
+    }
+
     private void webViewDownload() {
         try {
             final android.webkit.WebView w = new android.webkit.WebView(this);
@@ -379,6 +400,7 @@ public class Main extends Activity {
                         webViewCookies();
                         webViewDownload();
                         webViewScale();
+                        Log.i("AtlTest", "webview-classloader: " + webViewClassLoader());
                     }
                 });
             }

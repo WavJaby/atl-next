@@ -128,7 +128,7 @@ const REMOTE_SKIPPED: [(&str, &str); 4] = [
         "atld ends at the target's limit (timeout), not at the gate's stop, so the exit rows have nothing to compare",
     ),
     (
-        "webview-ua, webview-settings, webview-cookie-set, webview-cookie-web, webview-download, webview-scale",
+        "webview-ua, webview-settings, webview-cookie-set, webview-cookie-web, webview-download, webview-scale, webview-classloader",
         "WebKitSettings needs a GDK display: no compositor on a headless run",
     ),
     (
@@ -387,6 +387,10 @@ const WEBVIEW_DOWNLOAD: (&str, &str) = (
 );
 /// Main.webViewScale's line: setInitialScale(200) -> 200 % = 2 device pixels per CSS pixel whatever the screen density (WebView.java:1184-1188), the page's devicePixelRatio.
 const WEBVIEW_SCALE: (&str, &str) = ("AtlTest: webview-scale: ", "dpr=2");
+/// Main.webViewClassLoader's line: WebView.getWebViewClassLoader is the loader of the provider's factory class (WebView.java:2428, WebViewFactoryProvider.java:262); it has no Chromium
+/// support-library glue, so androidx.webkit reports its extra features unsupported.
+const WEBVIEW_CLASSLOADER: (&str, &str) =
+    ("AtlTest: webview-classloader: ", "provider=true glue=false");
 
 /// Lines the fixture logs after onCreate, from binder callbacks: (row, line prefix, expected value). The watch waits for all of them (up to RESULT_WAIT).
 /// bindservice: Main.bound's bindService(AtlBound, BIND_AUTO_CREATE) answers true (bindServiceLocked found the service: code 1).
@@ -1987,7 +1991,12 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
             "webview-settings: want {want:?}, got {webview_settings:?}"
         ));
     }
-    for (prefix, want) in [WEBVIEW_COOKIE_SET, WEBVIEW_DOWNLOAD, WEBVIEW_SCALE] {
+    for (prefix, want) in [
+        WEBVIEW_COOKIE_SET,
+        WEBVIEW_DOWNLOAD,
+        WEBVIEW_SCALE,
+        WEBVIEW_CLASSLOADER,
+    ] {
         let got = after(prefix);
         if passed && got.as_deref() != Some(want) {
             whys.push(format!(
@@ -2166,6 +2175,7 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
         );
         println!("app: pass webview-download {}", WEBVIEW_DOWNLOAD.1);
         println!("app: pass webview-scale {}", WEBVIEW_SCALE.1);
+        println!("app: pass webview-classloader {}", WEBVIEW_CLASSLOADER.1);
         if !remote {
             println!(
                 "app: pass priority {} ({})",
