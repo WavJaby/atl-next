@@ -140,10 +140,8 @@ const REMOTE_SKIPPED: [(&str, &str); 4] = [
 /// `xtask remote test app` (remote.rs): the headless subset of the gate on a target. The run is built for `--arch` and recorded here, pushed and checked on the target (remote.rs `Target::deliver`), then atld runs there headless
 /// (no compositor) through the same `RemoteRun` as `gl`'s; the logs come back at its limit. Judged: the process start, Main's onCreate and resume lines, no fault, the guest JNI (bridge1) rows. Every other check is named as skipped.
 pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
-    let arches = crate::arches::load(root)?;
-    let (build, _) = crate::arches::build_machine(root, &arches)?;
     let args = Args {
-        host: a.arch.clone().unwrap_or_else(|| build.to_owned()),
+        host: a.target_arch.resolve(root)?,
         out: a.out.clone(),
         java_out: None,
         log_tags: "*:i".to_owned(),
@@ -1437,10 +1435,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     .with_gralloc(root)?
     .with_gl_driver(root)?;
     // the host ISA's guest exists only where its identity engine does (arches.toml `identity`); elsewhere every fixture is foreign
-    let identity = crate::arches::load(root)?
-        .get(&args.host)
-        .and_then(|r| r.host.as_ref())
-        .is_some_and(|h| h.identity);
+    let identity = crate::arches::identity(root, &args.host)?;
     let rt = if identity {
         rt.with_native_bridge_guest(&args.host)?
     } else {

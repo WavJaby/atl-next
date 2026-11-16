@@ -152,12 +152,34 @@ pub struct TestArgs {
     /// Deliberate break: the bundle without its copy of the named runtime (see the values).
     #[arg(long = "break", value_enum)]
     pub(crate) brk: Option<Break>,
-    /// `app` only: the target's arch (an arches.toml row with `[host]`); the bundle comes from its out dir (a cross host's under the build dir, native.rs `host_out`). Default: the build machine's.
-    #[arg(long)]
-    pub(crate) arch: Option<String>,
+    /// `app` only: the target's arch (see [`TargetArch`]).
+    #[command(flatten)]
+    pub(crate) target_arch: TargetArch,
     /// `app` only: the fixture's ISA (`test app --fixture-arch`); needed where `--arch` has no identity engine.
     #[arg(long)]
     pub(crate) fixture_arch: Option<String>,
+}
+
+/// `--arch` of a remote run (`remote test app`, `remote run-apk`): one declaration, one selection ([`TargetArch::resolve`]).
+#[derive(clap::Args, Clone, Default)]
+pub struct TargetArch {
+    /// The target's arch (an arches.toml row with `[host]`); its bundle comes from its out dir (a cross host's under the build dir, native.rs `host_out`). Default: the build machine's.
+    #[arg(long)]
+    pub(crate) arch: Option<String>,
+}
+
+impl TargetArch {
+    /// The target's arch: `--arch`, else the build machine's. A name without a `[host]` row is refused here, before any build or transfer.
+    pub fn resolve(&self, root: &Path) -> Result<String> {
+        let arches = arches::load(root)?;
+        let (build, _) = arches::build_machine(root, &arches)?;
+        let arch = self.arch.as_deref().unwrap_or(build);
+        ensure!(
+            arches.get(arch).is_some_and(|r| r.host.is_some()),
+            "--arch {arch}: not a host arch (an arches.toml row with `[host]`)"
+        );
+        Ok(arch.to_owned())
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -209,7 +231,7 @@ fn test(root: &Path, a: &TestArgs) -> Result<ExitCode> {
         return crate::app::remote(root, a);
     }
     ensure!(
-        a.arch.is_none() && a.fixture_arch.is_none(),
+        a.target_arch.arch.is_none() && a.fixture_arch.is_none(),
         "--arch and --fixture-arch are `app` options"
     );
     let out = out_of(root, a.out.as_deref())?;

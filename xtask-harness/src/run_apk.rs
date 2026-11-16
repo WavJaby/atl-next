@@ -22,7 +22,7 @@ use crate::manifest::Manifest;
 use atl_services_types::native_libs::{LIB_DIR_NAME, SupportedAbi};
 
 use crate::nested_wayland::NestedCompositor;
-use crate::{arches, drive, manifest, observe, remote, test_apks, verdict, window};
+use crate::{drive, manifest, observe, remote, test_apks, verdict, window};
 use xtask::timing;
 
 /// The app process's log line for a presented frame (atl-composer ui_window.rs, debug level: UI mode enables it).
@@ -103,6 +103,9 @@ pub struct RemoteArgs {
     /// A row of test-apks.toml, or an APK file path, as for `run-apk`.
     #[arg(value_name = "ROW|PATH")]
     target: String,
+    /// The target's arch, as for `remote test app`: the run's out dir is the build dir's (a cross host's under it) unless `--out`.
+    #[command(flatten)]
+    target_arch: crate::remote::TargetArch,
     /// ssh alias from WSL `~/.ssh/config` (its `Host` name), or `local:<absolute dir>` (a directory standing in for the target).
     #[arg(long)]
     host: String,
@@ -382,11 +385,9 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
     );
     let observe_on = a.observe || !shots.is_empty();
     let (pin, files) = source(root, &a.target)?;
-    let arches = arches::load(root)?;
-    let (arch, _) = arches::build_machine(root, &arches)?;
     let args = Args {
         target: a.target.clone(),
-        host: arch.to_owned(),
+        host: a.target_arch.resolve(root)?,
         out: a.out.clone(),
         java_out: None,
         hold: Some(a.hold),
@@ -610,7 +611,7 @@ fn runtime(
     Ok((rt, foreign))
 }
 
-/// The run-apk configuration of the staged runtime `rt` for `args` and the APKs' foreign ABI `foreign`: the window gate's staging with the GL driver, the native bridge guest of the host and the GTK UI; for a foreign ISA, that ISA's guest and QEMU engine; then `args`' toggles.
+/// The run-apk configuration of the staged runtime `rt` for `args` and the APKs' foreign ABI `foreign`: the window gate's staging with the GL driver, the native bridge guest of the host (identity hosts only) and the GTK UI; for a foreign ISA, that ISA's guest and QEMU engine; then `args`' toggles.
 /// The builders accumulate (`with_native_bridge_guest` extends its list): configure a staged runtime once.
 pub(crate) fn configure(
     root: &Path,
@@ -618,11 +619,14 @@ pub(crate) fn configure(
     rt: Runtime,
     foreign: Option<&SupportedAbi>,
 ) -> Result<Runtime> {
-    let rt = rt
-        .with_gralloc(root)?
-        .with_gl_driver(root)?
-        .with_native_bridge_guest(&args.host)?
-        .with_ui("gtk");
+    let rt = rt.with_gralloc(root)?.with_gl_driver(root)?;
+    // the host ISA's guest exists only where its identity engine does, as app.rs; elsewhere the guest is foreign (below)
+    let rt = if crate::arches::identity(root, &args.host)? {
+        rt.with_native_bridge_guest(&args.host)?
+    } else {
+        rt
+    };
+    let rt = rt.with_ui("gtk");
     let rt = match foreign {
         Some(a) => {
             crate::build_state::foreign_out(root, &rt.out, &args.host, &a.isa, "run-apk")?;

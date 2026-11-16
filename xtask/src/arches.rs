@@ -86,6 +86,14 @@ pub fn load(root: &Path) -> Result<Arches> {
     parse(&text).with_context(|| format!("in {FILE}"))
 }
 
+/// Whether host `host` has the identity engine (`[host] identity`): its own guest runs natively, so its guest is part of its graph. Elsewhere every guest is foreign (QEMU).
+pub fn identity(root: &Path, host: &str) -> Result<bool> {
+    Ok(load(root)?
+        .get(host)
+        .and_then(|r| r.host.as_ref())
+        .is_some_and(|h| h.identity))
+}
+
 /// The row of the machine xtask runs on: the `[host]` row whose `rust` triple is rustc's host (`rustc -vV` in `root`, so rust-toolchain.toml's rustc).
 pub fn build_machine<'a>(root: &Path, arches: &'a Arches) -> Result<(&'a str, &'a Arch)> {
     let out = std::process::Command::new("rustc")
