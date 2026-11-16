@@ -217,11 +217,15 @@ fn make(root: &Path, restore: bool) -> Result<(String, PathBuf)> {
     Ok((id, dir))
 }
 
-/// The checkout at `root` gets `base`'s recorded mtimes where its content is the recorded one. Returns the line part. A base published before stamps existed restores nothing.
+/// The checkout at `root` gets `base`'s recorded mtimes where its content is the recorded one, now elsewhere. Returns the line part. A base published before stamps existed restores nothing: every path gets now.
 fn restore_stamps(root: &Path, base: &Path) -> Result<String> {
     let file = base.join(crate::checkout_stamps::FILE);
     let Ok(text) = std::fs::read_to_string(&file) else {
-        return Ok(format!("no {}: mtimes kept", crate::checkout_stamps::FILE));
+        crate::checkout_stamps::restore(root, "")?;
+        return Ok(format!(
+            "no {}: mtimes set to now",
+            crate::checkout_stamps::FILE
+        ));
     };
     let (n, m) = crate::checkout_stamps::restore(root, &text)?;
     Ok(format!("restored {n} of {m} mtimes"))
@@ -834,7 +838,7 @@ pub fn recopy(land: &Path) -> Result<String> {
 /// `native`'s refresh after a rebase: when a base newer than the one `ws/<id>` came from (`.base`) is an ancestor of HEAD, the dir is replaced by a copy of it. Returns the line to print; None = nothing to do.
 /// Why: the dir's own outputs were built on the old base and are mostly stale after the rebase, while the new base holds main's build of everything the rebase brought; the checkout's compiles hit sccache at the canonical path, so redoing its own delta is cheap.
 /// Kept: the dir's cargo target roots (`out_prune::DIR_ROOTS`), moved into the new copy: `target/` holds this running xtask binary (re-executed by path into the namespace), and every root holds the checkout's cargo units, which key on the checkout path a base's units (built in the land worktree) never match: taking the base's cost a 72-crate rebuild (X4 gate).
-/// No mtime restore (`checkout_stamps`): the kept roots hold units built from the checkout's own content after the base's recorded mtimes, so an old mtime on a file rebased back to the base's content would make them fresh.
+/// No mtime restore (`checkout_stamps`): the kept roots hold units built from the checkout's own content after the base's recorded mtimes, so an old mtime on a file rebased back to the base's content would make them fresh. Instead every path differing from the new base gets now (`touch_changed_since`): the base's ninja outputs are newer than an old own edit.
 /// Only when main brought a large change (owner 2026-11-16): at least `build.refresh_min_upstream_files` files under [`UPSTREAM_INPUTS`] changed from the dir's base to the newer one (derivation on ws_config.rs DEFAULT_REFRESH_MIN_UPSTREAM_FILES); below it keeping the old dir rebuilds less.
 /// Kept (line `out: keep <reason>`): a dir without `.base` (built from zero), one already on the newest base or whose base is not an ancestor of it, a small change, a dir another process holds. None: the land worktree (land owns `ws/land`) or no dir yet (the first build makes it).
 pub fn refresh(root: &Path) -> Result<Option<String>> {
@@ -913,8 +917,10 @@ pub fn refresh(root: &Path) -> Result<Option<String>> {
         kept.push(root_name);
     }
     remove_build_dir(&old)?;
+    // the new base's outputs postdate an older own edit of the checkout's: its delta to base/pick must read newer
+    let touched = crate::checkout_stamps::touch_changed_since(root, pick)?;
     Ok(Some(format!(
-        "out: refresh ws/{id} from base/{cur} to base/{pick} ({changed} upstream input files changed; {}); kept: {}",
+        "out: refresh ws/{id} from base/{cur} to base/{pick} ({changed} upstream input files changed; {}); kept: {}; {touched} paths differing from base/{pick} set to now",
         tier.name(),
         kept.join(", ")
     )))
