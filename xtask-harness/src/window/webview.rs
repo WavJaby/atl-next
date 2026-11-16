@@ -22,6 +22,8 @@ pub const MARKER: &str = "AtlWindow: onResume reached";
 const LAYOUT: &str = "AtlWindow: wv layout ";
 /// The page's onPageFinished (Main.java).
 const LOADED: &str = "AtlWindow: wv page finished";
+/// The fixture could not make its WebView (Main.java onCreate, before the layout line).
+const NO_WEBVIEW: &str = "AtlWindow: wv no webview";
 /// After the load, the time WebKit's first paint of the page may take to reach the window (one web-process frame and one present; generous for a loaded host).
 const PAINT_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
 /// Main.java's colours as RGBA bytes: WINDOW 0xff204060, OVERLAY 0xfff0f0f0, the page's CSS rgb(48,112,192).
@@ -234,8 +236,9 @@ pub fn drive(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liv
     wait_for_line(app_log, LAYOUT, ACK_WAIT)
         .then_some(())
         .ok_or("the fixture never laid out")?;
-    // a missing page is the readback's failure (the break), not the probe's
-    if wait_for_line(app_log, LOADED, ACK_WAIT) {
+    // a missing page is the readback's failure (the break), not the probe's: a fixture without a WebView said so in onCreate, before its layout line, and has no load to wait for
+    let no_webview = std::fs::read_to_string(app_log).is_ok_and(|l| l.contains(NO_WEBVIEW));
+    if !no_webview && wait_for_line(app_log, LOADED, ACK_WAIT) {
         std::thread::sleep(PAINT_SETTLE);
     }
     probe.record_settled();

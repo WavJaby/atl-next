@@ -47,6 +47,9 @@ public class Main extends Activity {
                 }
             });
             w.loadData(PAGE_HTML, "text/html", null);
+            // the focused WebView (a desktop is not in touch mode) would get View's default focus highlight, a faint white over its whole rectangle (measured: page 48,112,192 read as
+            // 54,116,194): AOSP draws it there too, but this picture is about composition
+            w.setDefaultFocusHighlightEnabled(false);
             web = w;
         } catch (Throwable t) {
             Log.i(TAG, "wv no webview: " + t);
