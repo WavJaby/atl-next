@@ -96,6 +96,8 @@ pub mod system_config;
 #[cfg(feature = "converter")]
 mod token;
 #[cfg(feature = "converter")]
+pub mod trust;
+#[cfg(feature = "converter")]
 pub mod ui_agents;
 #[cfg(feature = "converter")]
 pub mod uimode;

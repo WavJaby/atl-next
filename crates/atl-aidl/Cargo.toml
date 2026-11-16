@@ -89,6 +89,8 @@ types = [
     "com.android.internal.app.IAppOpsService",
     # the uimode service (uimode.rs)
     "android.app.IUiModeManager",
+    # the trust service (trust.rs): KeyguardManager's and TrustManager's constructors look ITrustManager up by Context.TRUST_SERVICE
+    "android.app.trust.ITrustManager",
     # the webviewupdate service (webview_update.rs)
     "android.webkit.IWebViewUpdateService",
     # the permissionmgr service (permission_manager.rs)

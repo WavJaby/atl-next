@@ -156,6 +156,8 @@ mirrors = [
     "frameworks/base/core/java/android/view/Gravity.java#apply",
     "frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java#openSession",
     "frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java#hasNavigationBar",
+    "frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java#isKeyguardLocked",
+    "frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java#isKeyguardSecure",
     "frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java#setInTouchMode",
     "frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java#getCurrentAnimatorScale",
     "frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java#addWindow",
@@ -345,6 +347,22 @@ mirrors = [
     "frameworks/base/services/core/java/com/android/server/UiModeManagerService.java#isNightModeLocked",
     "frameworks/base/services/core/java/com/android/server/UiModeManagerService.java#getContrast",
     "frameworks/base/services/core/java/com/android/server/UiModeManagerService.java#getForceInvertState",
+]
+
+[trust]
+src = ["crates/atl-services/src/trust.rs"]
+mirrors = [
+    "frameworks/base/services/core/java/com/android/server/trust/TrustManagerService.java#isDeviceLocked",
+    "frameworks/base/services/core/java/com/android/server/trust/TrustManagerService.java#isDeviceSecure",
+    "frameworks/base/services/core/java/com/android/server/trust/TrustManagerService.java#refreshDeviceLockedForUser",
+    "frameworks/base/services/core/java/com/android/server/trust/TrustManagerService.java#enforceReportPermission",
+    "frameworks/base/services/core/java/com/android/server/trust/TrustManagerService.java#enforceListenerPermission",
+    "frameworks/base/services/core/java/com/android/server/trust/TrustManagerService.java#registerTrustListener",
+    "frameworks/base/services/core/java/com/android/server/trust/TrustManagerService.java#isTrustUsuallyManaged",
+    "frameworks/base/services/core/java/com/android/server/trust/TrustManagerService.java#isActiveUnlockRunning",
+    "frameworks/base/services/core/java/com/android/server/trust/TrustManagerService.java#isInSignificantPlace",
+    "frameworks/base/services/core/java/com/android/server/trust/TrustManagerService.java#registerDeviceLockedStateListener",
+    "frameworks/base/core/java/com/android/internal/widget/LockPatternUtils.java#isSecure",
 ]
 
 [webviewupdate]

@@ -369,6 +369,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "notification: " + channels());
         Log.i("AtlTest", "power: " + power());
         Log.i("AtlTest", "uimode: " + uiMode());
+        Log.i("AtlTest", "keyguard: " + keyguard());
         Log.i("AtlTest", "appops: " + appOps());
         Log.i("AtlTest", "jobscheduler: " + jobs());
         Log.i("AtlTest", "queryservices: " + queryServices());
@@ -836,6 +837,20 @@ public class Main extends Activity {
                 return "absent";
             }
             return "type=" + um.getCurrentModeType() + " night=" + um.getNightMode() + " config=" + getResources().getConfiguration().uiMode;
+        } catch (Throwable t) {
+            return "threw " + t;
+        }
+    }
+
+    /** KeyguardManager on a device with no lock-screen credential: the manager (its constructor needs `trust`, and the window service's keyguard calls), and isDeviceLocked, isKeyguardLocked, isDeviceSecure, isKeyguardSecure all false; "absent" when getSystemService returns null; else what it threw. */
+    private String keyguard() {
+        try {
+            android.app.KeyguardManager km = getSystemService(android.app.KeyguardManager.class);
+            if (km == null) {
+                return "absent";
+            }
+            return "manager=yes locked=" + km.isDeviceLocked() + " keyguardLocked=" + km.isKeyguardLocked()
+                    + " secure=" + km.isDeviceSecure() + " keyguardSecure=" + km.isKeyguardSecure();
         } catch (Throwable t) {
             return "threw " + t;
         }

@@ -263,6 +263,19 @@ impl IWindowManager for WindowManager {
         Ok(false)
     }
 
+    /// WindowManagerService.isKeyguardLocked:3469 -> mPolicy.isKeyguardLocked, the keyguard's showing state. The desktop has no keyguard (no Android lock screen), so false.
+    fn r#isKeyguardLocked(&self) -> binder::Result<bool> {
+        atl_diag::answered(WINDOW_MANAGER, "isKeyguardLocked (no keyguard: false)");
+        Ok(false)
+    }
+
+    /// WindowManagerService.isKeyguardSecure:3478 -> the user's lock-screen credential (LockPatternUtils.isSecure): none on the desktop, so false.
+    /// Its INTERACT_ACROSS_USERS check for another user is not modelled: KeyguardManager asks for its own user only.
+    fn r#isKeyguardSecure(&self, _user_id: i32) -> binder::Result<bool> {
+        atl_diag::answered(WINDOW_MANAGER, "isKeyguardSecure (no credential: false)");
+        Ok(false)
+    }
+
     /// WindowManagerService.setInTouchMode:4045: records the mode and has the dispatcher tell the display's other windows (TouchModeEvent). The caller changes its own mode locally after the call
     /// (ViewRootImpl.ensureTouchMode:7233-7242), and an error there is a RuntimeException in the app. No other app window shares this display process's input: accept.
     fn r#setInTouchMode(&self, _in_touch: bool, _display_id: i32) -> binder::Result<()> {

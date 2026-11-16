@@ -147,6 +147,8 @@ const THERMAL: &str = "thermalservice";
 /// Context.SYSTEM_CONFIG_SERVICE (SystemConfigManager looks ISystemConfig up by it).
 const SYSTEM_CONFIG: &str = "system_config";
 const UI_MODE: &str = "uimode";
+/// Context.TRUST_SERVICE (KeyguardManager's and TrustManager's constructors look ITrustManager up by it).
+const TRUST: &str = "trust";
 /// Context.APP_OPS_SERVICE.
 const APP_OPS: &str = "appops";
 /// WebViewFactory.WEBVIEW_UPDATE_SERVICE_NAME.
@@ -395,6 +397,11 @@ fn main() -> Result<()> {
         )
         .context("addService uimode")?;
     }
+    binder::add_service(
+        TRUST,
+        atl_services::trust::new_binder(Arc::clone(&permissions)),
+    )
+    .context("addService trust")?;
     if !a.omit_service.iter().any(|s| s == APP_OPS) {
         binder::add_service(
             APP_OPS,

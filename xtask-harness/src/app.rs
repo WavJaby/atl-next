@@ -201,6 +201,7 @@ const MEDIAPLAYER_START: &str = "MediaPlayerNative: start called in state 1";
 /// power: Main.power: a desktop session is interactive with battery saver off; PARTIAL is a supported level; a PARTIAL wake lock is held after acquire and not after release
 /// (WAKE_LOCK is requested + NORMAL -> granted; a refused acquire or release throws SecurityException and the line reads `threw ...`).
 /// uimode: Main.uiMode: UI_MODE_TYPE_NORMAL (1), MODE_NIGHT_NO (1), and the Configuration's uiMode TYPE_NORMAL | NIGHT_NO = 0x11 = 17 (UiModeManagerService's default for a normal device).
+/// trust: Main.keyguard: KeyguardManager's constructor needs `trust` (getServiceOrThrow) and the window service's keyguard calls; with no lock-screen credential the manager is non-null and isDeviceLocked, isKeyguardLocked, isDeviceSecure, isKeyguardSecure are all false.
 /// jobscheduler: Main.jobs: each enqueue answers RESULT_SUCCESS (1); the second, of an equal JobInfo, joins the first job (JobSchedulerService.scheduleAsPackage), so one job is pending; cancel removes it;
 /// a job whose service is an activity fails enforceValidJobRequest ("non-existent component") -> IllegalArgumentException.
 /// appops: Main.appOps (AppOpsManager.MODE_ALLOWED 0, MODE_IGNORED 1, MODE_ERRORED 2): POST_NOTIFICATION's permission is requested and denied -> PermissionPolicyService's MODE_IGNORED; COARSE_LOCATION's is not
@@ -208,7 +209,7 @@ const MEDIAPLAYER_START: &str = "MediaPlayerNative: start called in state 1";
 /// queryservices: Main.queryServices: PackageManager.queryIntentServices of action atl.test.BIND scoped to the fixture finds its one `<service>` with that filter (AtlBound; ComputerEngine
 /// queryIntentServicesInternalBody), and of Play billing's Intent (action ...InAppBillingService.BIND, package com.android.vending, not installed) an empty list. A service without the method
 /// answers null, which ApplicationPackageManager turns into an empty list: `own=0`.
-const SERVICE_LINES: [(&str, &str, Option<&str>); 8] = [
+const SERVICE_LINES: [(&str, &str, Option<&str>); 9] = [
     (
         "package",
         "AtlTest: queryservices: ",
@@ -243,6 +244,11 @@ const SERVICE_LINES: [(&str, &str, Option<&str>); 8] = [
         Some("type=1 night=1 config=17"),
     ),
     (
+        "trust",
+        "AtlTest: keyguard: ",
+        Some("manager=yes locked=false keyguardLocked=false secure=false keyguardSecure=false"),
+    ),
+    (
         "appops",
         "AtlTest: appops: ",
         Some("post=1 coarse=0 noted=0 noted-foreign=2 own=ok foreign=SecurityException"),
@@ -251,7 +257,7 @@ const SERVICE_LINES: [(&str, &str, Option<&str>); 8] = [
 /// Calls a [`SERVICE_LINES`] row makes that the app cannot see refused (a method a service lacks reads back as no error and zeros), so the services' own `answered` count must show each:
 /// (service, counter key). notification: Main.channels' NotificationManager.cancel of a never-posted id. appops: Main.appOps' first noted COARSE_LOCATION (runtime permission -> notes collected)
 /// reports its stack trace, AppOpsManager's sConfig starting expired.
-const SERVICE_CALLS: [(&str, &str); 2] = [
+const SERVICE_CALLS: [(&str, &str); 6] = [
     (
         "notification",
         "INotificationManager.cancelNotificationWithTag (nothing posted)",
@@ -259,6 +265,22 @@ const SERVICE_CALLS: [(&str, &str); 2] = [
     (
         "appops",
         "IAppOpsService.reportRuntimeAppOpAccessMessageAndGetConfig (not sampled)",
+    ),
+    (
+        "trust",
+        "ITrustManager.isDeviceLocked (no credential: false)",
+    ),
+    (
+        "trust",
+        "ITrustManager.isDeviceSecure (no credential: false)",
+    ),
+    (
+        "window",
+        "IWindowManager.isKeyguardLocked (no keyguard: false)",
+    ),
+    (
+        "window",
+        "IWindowManager.isKeyguardSecure (no credential: false)",
     ),
 ];
 /// Main.pendingIntent's line: PendingIntent's creator getters for this package's own immutable broadcast, then isImmutable of a FLAG_MUTABLE one (ActivityManagerService.getInfoForIntentSender reports the record's
