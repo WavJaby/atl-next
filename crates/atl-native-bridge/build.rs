@@ -12,6 +12,12 @@ use atl_bridgegen::jni::{LaneMap, Route};
 use atl_bridgegen::rust::{Table, api_module_with_table};
 use atl_bridgegen::{Lang, Source, Target};
 
+/// `rerun-if-changed` for `path`: relative to the package root when built from it (cargo resolves a relative path there), so a checkout at another path prints the same text and the script is not rerun. Other paths stay as given.
+fn rerun_if_changed(manifest: &std::path::Path, path: &std::path::Path) {
+    let shown = path.strip_prefix(manifest).unwrap_or(path);
+    println!("cargo::rerun-if-changed={}", shown.display());
+}
+
 /// The interface header, relative to the AOSP tree.
 const HEADER: &str = "art/libnativebridge/include/nativebridge/native_bridge.h";
 /// Where its `#include "jni.h"` resolves (libnativebridge's `export_header_lib_headers: ["jni_headers"]`).
@@ -321,7 +327,7 @@ const GLIBC: &[(&str, &str)] = &[
 fn provider_soname(manifest_dir: &std::path::Path) -> Result<String> {
     const CRATE: &str = "atl_bionic";
     let path = manifest_dir.join("../atl-bionic/Cargo.toml");
-    println!("cargo::rerun-if-changed={}", path.display());
+    rerun_if_changed(manifest_dir, &path);
     let text = std::fs::read_to_string(&path).with_context(|| path.display().to_string())?;
     let version = text
         .lines()
@@ -1379,7 +1385,8 @@ fn main() -> Result<()> {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let checkout = buildscript::checkout(&manifest)?;
     let up = Upstreams::of(&checkout)?;
-    let arches = checkout.join("arches.toml");
+    // the repo root's arches.toml: the package is crates/<name>, so cargo's relative path is ../../
+    let arches = manifest.join("../../arches.toml");
     let arches_text = std::fs::read_to_string(&arches)?;
     let host = buildscript::host_arch(&arches_text, &std::env::var("TARGET")?)?;
     // the identity engine is a per-host-ISA capability (engine/mod.rs `Active`): cfg `IDENTITY_CFG` on a host ISA that has its crossing
@@ -1502,7 +1509,7 @@ fn main() -> Result<()> {
             )?,
         )?;
     }
-    println!("cargo::rerun-if-changed={}", arches.display());
+    rerun_if_changed(&manifest, &arches);
     for rel in std::iter::once(&HEADER)
         .chain(std::iter::once(&JNI_HEADER))
         .chain(INCLUDE_DIRS)

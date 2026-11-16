@@ -25,6 +25,12 @@ fn sources(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// `rerun-if-changed` for `path`: relative to the package root when built from it (cargo resolves a relative path there), so a checkout at another path prints the same text and the script is not rerun. Other paths stay as given.
+fn rerun_if_changed(manifest: &Path, path: &Path) {
+    let shown = path.strip_prefix(manifest).unwrap_or(path);
+    println!("cargo:rerun-if-changed={}", shown.display());
+}
+
 fn main() {
     let manifest =
         PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
@@ -32,13 +38,13 @@ fn main() {
     files.extend(sources(&manifest.join("../atl-platform-types/src")));
     let mut h = FNV_OFFSET;
     for f in &files {
-        println!("cargo:rerun-if-changed={}", f.display());
+        rerun_if_changed(&manifest, f);
         h = fnv(h, f.file_name().expect("file name").as_encoded_bytes());
         h = fnv(h, &std::fs::read(f).expect("read source"));
     }
     // the pinned toolchain: one rustc for both artifacts, and a pin bump changes the id
     let toolchain = manifest.join("../../rust-toolchain.toml");
-    println!("cargo:rerun-if-changed={}", toolchain.display());
+    rerun_if_changed(&manifest, &toolchain);
     h = fnv(
         h,
         &std::fs::read(&toolchain).expect("read rust-toolchain.toml"),
