@@ -127,7 +127,8 @@ pub struct Grant {
     /// CPU slots the pool has in total.
     pub cpu_of: u32,
     pub mem_gib: u32,
-    files: Vec<File>,
+    /// The slot files: their locks are the reservation, released when the grant drops.
+    _files: Vec<File>,
     /// Thread-bound: the grant marker is per thread, so the grant must drop on the thread that made it.
     _thread: PhantomData<*const ()>,
 }
@@ -187,7 +188,7 @@ fn acquire_with(
                 cpu,
                 cpu_of: pool.cpu_slots.value,
                 mem_gib: w.mem_gib,
-                files,
+                _files: files,
                 _thread: PhantomData,
             });
         }
@@ -227,7 +228,7 @@ pub fn try_take_all(ws: &Path, who: &Path) -> Result<std::result::Result<Grant, 
         cpu,
         cpu_of: cpu,
         mem_gib: pool.mem_gib.value,
-        files,
+        _files: files,
         _thread: PhantomData,
     }))
 }
