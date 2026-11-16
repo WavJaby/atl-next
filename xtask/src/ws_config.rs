@@ -609,4 +609,112 @@ mod tests {
         let e = format!("{:#}", parse("[disk]\npool = 1\n", path()).unwrap_err());
         assert!(e.contains("not a known key"), "{e}");
     }
+
+    /// `workspace.toml.pool` (the pool-format machine file, swapped in at the admission land), copied here so the test needs no local file.
+    const POOL_FORMAT: &str = r#"# Per-machine workspace settings (not tracked; xtask/src/ws_config.rs reads it).
+# 2026-11-16: [build] parallel_builds retired; the machine pool (xtask/src/build_pool.rs) replaces it: CPU slots and reserved memory, held around each leaf build.
+# Since 2026-11-16 ~06:00 the host pagefile is 32 GB (commit limit 95.8 GB) and WSL is capped at 24 GB; raise mem_gib only with a measured memory/commit budget.
+[pool]
+# concurrent jobs machine-wide: the dev host's 16 CPUs
+cpu_slots = 16
+# GiB reservable by admitted work: the 24 GB WSL cap minus 4 GB for kernel, page cache, WSLg and editors
+mem_gib = 20
+
+# per class: CPU min..max (elastic: a grant takes the free slots up to max, at least min; the count is the tool's job count) and GiB reserved (measured peak RSS, rounded up)
+# cpu_max 8 would admit two full natives at once (memory fits two); 16 lets one full native take the whole pool and the second wait for CPU
+[pool.native-full]
+# ninja on a cold or reconfigured graph: peak 7.0 GB (2026-11-16)
+cpu_min = 8
+cpu_max = 16
+mem_gib = 7
+
+[pool.native-incr]
+# ninja on a warm graph: peak 1.8 GB
+cpu_min = 4
+cpu_max = 16
+mem_gib = 2
+
+[pool.cargo]
+# one cargo build, test or clippy run: check peak 5.4 GB (whole check)
+cpu_min = 4
+cpu_max = 16
+mem_gib = 6
+
+[pool.harness]
+# a runtime gate: not measured yet
+cpu_min = 4
+cpu_max = 6
+mem_gib = 2
+
+[pool.light]
+# static checks
+cpu_min = 1
+cpu_max = 1
+mem_gib = 0
+
+[fetch]
+# The dev machine verifies every gate: fetch keeps every gate's projects (cts included) and check covers them all.
+for = ["all-gates"]
+"#;
+
+    #[test]
+    fn pool_format_file_parses_to_the_shipped_weights() {
+        let cfg = parse(POOL_FORMAT, path()).expect("the pool-format file parses");
+        assert_eq!(cfg.pool.cpu_slots, Setting::file(16));
+        assert_eq!(cfg.pool.mem_gib, Setting::file(20));
+        let weight = |c: Class| cfg.pool.classes[&c];
+        assert_eq!(
+            weight(Class::NativeFull),
+            ClassWeight {
+                cpu_min: 8,
+                cpu_max: 16,
+                mem_gib: 7
+            }
+        );
+        assert_eq!(
+            weight(Class::NativeIncr),
+            ClassWeight {
+                cpu_min: 4,
+                cpu_max: 16,
+                mem_gib: 2
+            }
+        );
+        assert_eq!(
+            weight(Class::Cargo),
+            ClassWeight {
+                cpu_min: 4,
+                cpu_max: 16,
+                mem_gib: 6
+            }
+        );
+        assert_eq!(
+            weight(Class::Harness),
+            ClassWeight {
+                cpu_min: 4,
+                cpu_max: 6,
+                mem_gib: 2
+            }
+        );
+        assert_eq!(
+            weight(Class::Light),
+            ClassWeight {
+                cpu_min: 1,
+                cpu_max: 1,
+                mem_gib: 0
+            }
+        );
+        assert_eq!(cfg.fetch_for.value, ["all-gates"]);
+    }
+
+    /// The main-format file (`[build] parallel_builds`) is refused by name with its replacement; the rest of such a file parses once that key is gone.
+    #[test]
+    fn main_format_file_is_refused_with_the_replacement() {
+        let text = "# Per-machine workspace settings\n[build]\n# full native builds machine-wide\nparallel_builds = 2\n\n[fetch]\nfor = [\"all-gates\"]\n";
+        let m = err(text);
+        assert!(m.contains("`build.parallel_builds` is retired"), "{m}");
+        assert!(m.contains("`[pool]` cpu_slots and mem_gib"), "{m}");
+        assert!(m.contains("delete the key from /ws/workspace.toml"), "{m}");
+        let rest = parse("[fetch]\nfor = [\"all-gates\"]\n", path()).expect("the rest parses");
+        assert_eq!(rest.fetch_for.value, ["all-gates"]);
+    }
 }

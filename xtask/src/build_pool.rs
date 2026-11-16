@@ -779,11 +779,16 @@ mod tests {
             .waits
             .recv_timeout(WAIT)
             .expect("the third native did not wait");
+        // a probe can also count a slot that another test's fork still holds (flock is shared with a child until its exec), so the line is checked for the wait and the two live holders only
         assert!(
-            line.contains("native-full wants cpu >=8 mem 7 GiB, free cpu 16/32 mem 6/20"),
+            line.contains("native-full wants cpu >=8 mem 7 GiB"),
             "{line}"
         );
-        assert_eq!(line.matches("cpu 8 mem 7").count(), 2, "{line}");
+        assert_eq!(
+            line.matches("class native-full cpu 8 mem 7").count(),
+            2,
+            "{line}"
+        );
         assert!(
             c.granted.recv_timeout(STILL_WAITING).is_err(),
             "the third native ran past the memory"
@@ -805,7 +810,8 @@ mod tests {
             .waits
             .recv_timeout(WAIT)
             .expect("the second native did not wait");
-        assert!(line.contains("free cpu 0/16 mem 13/20"), "{line}");
+        // CPU is the limit: a holds all 16 slots (the memory count is left out, as in the memory test)
+        assert!(line.contains("free cpu 0/16"), "{line}");
         a.release.send(()).unwrap();
         assert!(
             b.granted.recv_timeout(WAIT).is_ok(),
