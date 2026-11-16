@@ -27,6 +27,13 @@ pub fn candidates(expander: &LocaleExpander, tag: &str) -> Vec<String> {
     out
 }
 
+/// The script a tag maximizes to (CLDR likelySubtags): the key a fallback group's `covers` names; None for an unparsable tag.
+pub fn script(expander: &LocaleExpander, tag: &str) -> Option<String> {
+    let mut max = tag.parse::<LanguageIdentifier>().ok()?;
+    expander.maximize(&mut max);
+    max.script.map(|s| s.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -39,6 +46,19 @@ mod tests {
         assert_eq!(candidates(&e, "zh-Hant"), ["zh-hant", "zh-tw", "zh"]);
         assert_eq!(candidates(&e, "zh-Hans"), ["zh-hans", "zh-cn", "zh"]);
         assert_eq!(candidates(&e, "ja"), ["ja", "ja-jp"]);
+    }
+
+    #[test]
+    fn script_is_the_likely_script_of_each_tag() {
+        let e = LocaleExpander::new_common();
+        // CLDR likelySubtags: ja -> ja-Jpan-JP, ko -> ko-Kore-KR, zh-Hant -> zh-Hant-TW, und-Hebr -> he-Hebr-IL
+        assert_eq!(script(&e, "ja").as_deref(), Some("Jpan"));
+        assert_eq!(script(&e, "ko").as_deref(), Some("Kore"));
+        assert_eq!(script(&e, "zh-Hant").as_deref(), Some("Hant"));
+        assert_eq!(script(&e, "zh-Hans").as_deref(), Some("Hans"));
+        assert_eq!(script(&e, "und-Zsye").as_deref(), Some("Zsye"));
+        assert_eq!(script(&e, "und-Hebr").as_deref(), Some("Hebr"));
+        assert_eq!(script(&e, "!!"), None);
     }
 
     #[test]

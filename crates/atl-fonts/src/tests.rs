@@ -300,6 +300,70 @@ fn both_files_follow_the_parser_schema() {
     );
 }
 
+fn groups() -> Vec<atl_fonts_table::Group> {
+    atl_fonts_table::groups(atl_fonts_table::DEPS_TOML).expect("groups")
+}
+
+/// A desktop with Sans only: no lang has a face, and serif and monospace answer Sans, which they reject.
+fn sans_only() -> Desktop {
+    let mut d = Desktop::default();
+    d.face(
+        "/f/a/Sans.ttf",
+        0,
+        "Sans",
+        100,
+        &["en"],
+        stat(400, false, false),
+    );
+    d
+}
+
+#[test]
+fn a_desktop_without_cjk_or_emoji_names_both_groups() {
+    let d = sans_only();
+    let m = build(&d, &d, &table(MINI), vec![], &langs()).expect("model");
+    assert_eq!(m.missing.langs, langs());
+    assert_eq!(m.missing.families, ["serif", "monospace"]);
+    assert_eq!(
+        report(&m, &groups()),
+        [
+            "no CJK face on this desktop (zh-Hans, zh-Hant,zh-Bopo, ja, ko render as boxes); install: apt install fonts-noto-cjk | pacman -S noto-fonts-cjk",
+            "no emoji face on this desktop (und-Zsye render as boxes); install: apt install fonts-noto-color-emoji | pacman -S noto-fonts-emoji",
+            "diag missing_groups=2 missing_langs=5 missing_families=2",
+        ]
+    );
+}
+
+#[test]
+fn a_desktop_with_cjk_and_emoji_names_no_group() {
+    let mut d = cjk_desktop();
+    d.face(
+        "/f/emoji/NotoColorEmoji.ttf",
+        0,
+        "Noto Color Emoji",
+        100,
+        &["und-zsye"],
+        stat(400, false, false),
+    );
+    let m = build(&d, &d, &table(MINI), vec![], &langs()).expect("model");
+    assert!(m.missing.langs.is_empty());
+    assert_eq!(
+        report(&m, &groups()),
+        ["diag missing_groups=0 missing_langs=0 missing_families=2"]
+    );
+}
+
+#[test]
+fn the_tracked_groups_cover_known_scripts() {
+    let e = icu_locale::LocaleExpander::new_common();
+    for g in groups() {
+        for s in &g.covers {
+            // ICU reads `und-<s>` back as script `s` only when `s` is an ISO 15924 script
+            assert_eq!(lang::script(&e, &format!("und-{s}")), Some(s.clone()));
+        }
+    }
+}
+
 #[test]
 fn a_variable_family_takes_supported_axes_only_in_font_fallback() {
     let mut d = Desktop::default();

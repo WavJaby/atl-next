@@ -12,7 +12,7 @@ mod xml;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use atl_fonts_table::{Accept, Alias, DEFAULT_FAMILY, Table};
+use atl_fonts_table::{Accept, Alias, DEFAULT_FAMILY, Group, Table};
 use atl_platform_host::{Face, FontQuery, FontSource};
 
 pub use face::{Axis, FaceInfo};
@@ -57,6 +57,16 @@ pub struct Model {
     pub aliases: Vec<Alias>,
     /// Host directories of every listed face, canonical and sorted: dir k is /system/fonts/<k>.
     pub dirs: Vec<PathBuf>,
+    pub missing: Missing,
+}
+
+/// What the desktop lacks, as [`build`] met it: the fallback langs and named families that got no face.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Missing {
+    /// AOSP's fallback lang strings (`fallback_order.json`, verbatim) with no desktop face, in order.
+    pub langs: Vec<String>,
+    /// Named families whose row emitted nothing although it has a query (`none` rows are by design, not missing).
+    pub families: Vec<String>,
 }
 
 impl Model {
@@ -147,6 +157,7 @@ pub fn build(
         raw: Vec::new(),
     };
     let mut heads: BTreeMap<&str, Face> = BTreeMap::new();
+    let mut missing = Missing::default();
     for (name, row) in &table.rows {
         let (Some(query), Some(accept)) = (&row.query, row.accept) else {
             continue;
@@ -155,6 +166,7 @@ pub fn build(
             if accept == Accept::Required {
                 return Err(Error::Required(name.clone(), query.clone()));
             }
+            missing.families.push(name.clone());
             continue;
         };
         let faces = b.family_faces(&head)?;
@@ -177,6 +189,8 @@ pub fn build(
                 fonts: vec![],
             };
             b.raw.push((fam, faces));
+        } else {
+            missing.families.push(name.clone());
         }
     }
     let expander = icu_locale::LocaleExpander::new_common();
@@ -187,6 +201,7 @@ pub fn build(
         .collect();
     for l in order {
         let Some(head) = lang_head(&b, &expander, l)? else {
+            missing.langs.push(l.clone());
             continue;
         };
         if !used.insert((head.path.clone(), head.index)) {
@@ -233,7 +248,45 @@ pub fn build(
         families,
         aliases,
         dirs,
+        missing,
     })
+}
+
+/// atld's start report: one line per fallback group with a missing lang (`no <name> face on this desktop (<langs> render as boxes); install: <cmds>`), then the counted `diag` line.
+pub fn report(model: &Model, groups: &[Group]) -> Vec<String> {
+    let e = icu_locale::LocaleExpander::new_common();
+    let mut members: Vec<Vec<&str>> = vec![Vec::new(); groups.len()];
+    for l in &model.missing.langs {
+        let script = l.split(',').find_map(|t| lang::script(&e, t.trim()));
+        if let Some(i) = script.and_then(|s| groups.iter().position(|g| g.covers.contains(&s))) {
+            members[i].push(l.as_str());
+        }
+    }
+    let mut lines = Vec::new();
+    for (g, langs) in groups.iter().zip(&members) {
+        if langs.is_empty() {
+            continue;
+        }
+        let cmds: Vec<String> = g
+            .debian
+            .iter()
+            .map(|p| format!("apt install {p}"))
+            .chain(g.arch.iter().map(|p| format!("pacman -S {p}")))
+            .collect();
+        lines.push(format!(
+            "no {} face on this desktop ({} render as boxes); install: {}",
+            g.name,
+            langs.join(", "),
+            cmds.join(" | ")
+        ));
+    }
+    let warned = lines.len();
+    lines.push(format!(
+        "diag missing_groups={warned} missing_langs={} missing_families={}",
+        model.missing.langs.len(),
+        model.missing.families.len()
+    ));
+    lines
 }
 
 fn dir_of(p: &Path) -> Result<PathBuf, Error> {

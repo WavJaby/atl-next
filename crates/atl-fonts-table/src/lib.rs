@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The font tables Android's system font list is built from (plan C7), as definitions only: the tracked `fonts.toml` ([`Table`], checked against AOSP's own fonts.xml names), AOSP's `alias.json` and `fallback_order.json` (frameworks/base/data/fonts, read as-is).
+//! The font tables Android's system font list is built from (plan C7), as definitions only: the tracked `fonts.toml` ([`Table`], checked against AOSP's own fonts.xml names), AOSP's `alias.json` and `fallback_order.json` (frameworks/base/data/fonts, read as-is). The fallback groups are the `group` rows of the tracked `deps.toml` ([`groups`]).
 //! No desktop access and no build script: atl-fonts builds the model from these with the platform layer's fonts; xtask step `tables` checks `fonts.toml` with the same parser.
 #![forbid(unsafe_code)]
 
@@ -9,6 +9,8 @@ use serde::Deserialize;
 
 /// The tracked table (repo root `fonts.toml`), compiled in: rows change with the code that reads them.
 pub const FONTS_TOML: &str = include_str!("../../../fonts.toml");
+/// The tracked package table (repo root `deps.toml`); its `group` rows are the fallback groups ([`groups`]).
+pub const DEPS_TOML: &str = include_str!("../../../deps.toml");
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -16,6 +18,8 @@ pub enum Error {
     Table(String),
     #[error("{0}: {1}")]
     Json(&'static str, serde_json::Error),
+    #[error("deps.toml: {0}")]
+    Deps(String),
 }
 
 /// When a row's head counts as the family (fonts.toml header).
@@ -120,6 +124,49 @@ impl Table {
     }
 }
 
+/// A fallback group: the faces one optional distro package provides, named in atld's missing-font warning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Group {
+    /// The name the warning gives the group (`CJK`, `emoji`).
+    pub name: String,
+    /// ISO 15924 scripts the group's faces render (a fallback lang's likely script); atl-fonts checks them against ICU.
+    pub covers: Vec<String>,
+    pub debian: Option<String>,
+    pub arch: Option<String>,
+}
+
+/// The `group` rows of deps.toml, in key order.
+pub fn groups(deps_toml: &str) -> Result<Vec<Group>, Error> {
+    #[derive(Deserialize)]
+    struct Row {
+        group: String,
+        #[serde(default)]
+        covers: Vec<String>,
+        debian: Option<String>,
+        arch: Option<String>,
+    }
+    let t: toml::Table = deps_toml
+        .parse()
+        .map_err(|e: toml::de::Error| Error::Deps(e.to_string()))?;
+    let mut out = Vec::new();
+    for (key, v) in &t {
+        if v.get("group").is_none() {
+            continue;
+        }
+        let r: Row = v
+            .clone()
+            .try_into()
+            .map_err(|e: toml::de::Error| Error::Deps(format!("[{key}]: {e}")))?;
+        out.push(Group {
+            name: r.group,
+            covers: r.covers,
+            debian: r.debian,
+            arch: r.arch,
+        });
+    }
+    Ok(out)
+}
+
 /// Typeface.DEFAULT_FAMILY, which Typeface.setSystemFontMap requires.
 pub const DEFAULT_FAMILY: &str = "sans-serif";
 
@@ -213,6 +260,25 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn the_tracked_groups_name_their_distro_packages() {
+        let want = [
+            Group {
+                name: "CJK".into(),
+                covers: ["Hans", "Hant", "Jpan", "Kore"].map(String::from).to_vec(),
+                debian: Some("fonts-noto-cjk".into()),
+                arch: Some("noto-fonts-cjk".into()),
+            },
+            Group {
+                name: "emoji".into(),
+                covers: vec!["Zsye".into()],
+                debian: Some("fonts-noto-color-emoji".into()),
+                arch: Some("noto-fonts-emoji".into()),
+            },
+        ];
+        assert_eq!(groups(DEPS_TOML).expect("groups"), want);
     }
 
     #[test]

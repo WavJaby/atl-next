@@ -501,6 +501,7 @@ const CACERTS: &str = "etc/security/cacerts";
 /// The system font list from the desktop's (atl-fonts): `/system/etc/font_fallback.xml` (SystemFonts.FONTS_XML) and the legacy `/system/etc/fonts.xml`, each face named `<k>/<file>` below /system/fonts.
 /// Returns the host dirs of the faces: dir k is bound read-only at /system/fonts/<k> into every app (empty mount points made here, since /system is read-only inside).
 /// No sans-serif on the desktop fails the start: Typeface.setSystemFontMap needs DEFAULT_FAMILY.
+/// Logs what the desktop lacks: one line per fallback group with a missing face (install hint), then the counted `diag` line (atl-fonts report).
 fn font_layout(a: &Args, r: &Root) -> Result<Vec<PathBuf>> {
     let data = |f: &str| {
         let p = a.font_data.join(f);
@@ -515,6 +516,12 @@ fn font_layout(a: &Args, r: &Root) -> Result<Vec<PathBuf>> {
         atl_fonts_table::parse_aliases(&data("alias.json")?)?,
         &atl_fonts_table::parse_order(&data("fallback_order.json")?)?,
     )?;
+    for line in atl_fonts::report(
+        &model,
+        &atl_fonts_table::groups(atl_fonts_table::DEPS_TOML)?,
+    ) {
+        log(format_args!("fonts: {line}"));
+    }
     let etc = r.system().join("etc");
     std::fs::create_dir_all(&etc)?;
     std::fs::write(etc.join("font_fallback.xml"), model.font_fallback_xml())?;

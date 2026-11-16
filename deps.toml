@@ -18,6 +18,8 @@
 #                 `<binary> <version_arg>`) must be >= min. Other distro rows: pkg-config or package version.
 #                 aosp rows take no min: the pin is the version. A min without an upstream requirement records
 #                 the version observed on 2026-11-07 (min_reason says so): older is untested.
+#   group, covers  optional distro row only (atld): `group` is the name atld's missing-font warning gives the faces the
+#                 package provides, `covers` their ISO 15924 scripts (a fallback lang's likely script; atl-fonts' tests check them against ICU)
 # Every row:
 #   scope    build | runtime | test (static checks count as test)
 #   used_by  typed references, each checked to exist: crate:<workspace crate>,
@@ -297,6 +299,24 @@ min = "1.12.1"
 min_reason = "observed 2026-11-07; older is untested"
 scope = ["build"]
 used_by = ["xtask:native", "upstream:qemu"]
+
+# Fallback groups (atld): when a group's faces resolve to nothing at start, atld warns with these install commands.
+# The fonts are never bundled or installed by ATL.
+[noto-cjk]
+debian = "fonts-noto-cjk"
+arch = "noto-fonts-cjk"
+group = "CJK"
+covers = ["Hans", "Hant", "Jpan", "Kore"]
+scope = ["runtime"]
+used_by = ["optional:crate:atld"]
+
+[noto-color-emoji]
+debian = "fonts-noto-color-emoji"
+arch = "noto-fonts-emoji"
+group = "emoji"
+covers = ["Zsye"]
+scope = ["runtime"]
+used_by = ["optional:crate:atld"]
 
 # atld's CA store tests: `openssl x509 -subject_hash_old` is the independent oracle of the store's file names; `openssl req` makes the same-subject pair of the collision test.
 # `xtask keys --execute` makes the workspace's dev key set with it as AOSP's development/tools/make_key does (genrsa, pkcs8 DER, req -x509)

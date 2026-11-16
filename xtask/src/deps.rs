@@ -44,6 +44,11 @@ pub struct Dep {
     pub version_arg: Option<String>,
     pub scope: Vec<Scope>,
     pub used_by: Vec<String>,
+    /// A fallback group (atl-fonts' missing-font warning names it, e.g. `CJK`): with `covers`, on an optional distro row.
+    pub group: Option<String>,
+    /// ISO 15924 scripts of the fallback langs the group's faces render (atl-fonts checks each against ICU).
+    #[serde(default)]
+    pub covers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
@@ -188,6 +193,23 @@ fn validate(name: &str, dep: &Dep, consumers: &Consumers) -> Result<()> {
     );
     if let Some(pins) = &dep.sysroot_debs {
         validate_sysroot(dep, pins)?;
+    }
+    if dep.group.is_some() || !dep.covers.is_empty() {
+        ensure!(
+            distro && dep.group.is_some() && !dep.covers.is_empty(),
+            "a fallback group needs debian or arch, group and covers"
+        );
+        ensure!(
+            optional_only(dep),
+            "a fallback group is optional: its consumers run without it"
+        );
+        // ISO 15924 script codes are four letters; atl-fonts' tests check the codes against ICU
+        ensure!(
+            dep.covers
+                .iter()
+                .all(|s| s.len() == 4 && s.chars().all(|c| c.is_ascii_alphabetic())),
+            "covers: ISO 15924 script codes, four letters each"
+        );
     }
     if let Some(project) = &dep.aosp {
         ensure!(
@@ -1005,7 +1027,7 @@ mod tests {
     fn consumers() -> Consumers {
         let set = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
         Consumers {
-            crates: set(&["xtask"]),
+            crates: set(&["xtask", "atld"]),
             upstreams: set(&["aosp"]),
             xtask: set(&["check", "cross"]),
             projects: set(&["prebuilts/jdk/jdk21", "prebuilts/r8"]),
@@ -1102,6 +1124,28 @@ mod tests {
         assert!(parse(&ok, &consumers()).is_ok());
         let unknown = format!("[secret-tool]\n{pins}used_by = [\"optional:xtask:nope\"]\n");
         assert!(err(&unknown).contains("no such xtask"));
+    }
+
+    #[test]
+    fn fallback_groups_are_optional_distro_rows() {
+        let row = |extra: &str, used: &str| {
+            format!(
+                "[noto-cjk]\ndebian = \"fonts-noto-cjk\"\n{extra}scope = [\"runtime\"]\nused_by = [\"{used}\"]\n"
+            )
+        };
+        let ok = row(
+            "group = \"CJK\"\ncovers = [\"Hans\"]\n",
+            "optional:crate:atld",
+        );
+        assert!(parse(&ok, &consumers()).is_ok());
+        assert!(err(&row("group = \"CJK\"\n", "optional:crate:atld")).contains("fallback group"));
+        let bad_code = row(
+            "group = \"CJK\"\ncovers = [\"Hansx\"]\n",
+            "optional:crate:atld",
+        );
+        assert!(err(&bad_code).contains("ISO 15924"));
+        let required = row("group = \"CJK\"\ncovers = [\"Hans\"]\n", "crate:atld");
+        assert!(err(&required).contains("optional"));
     }
 
     #[test]
