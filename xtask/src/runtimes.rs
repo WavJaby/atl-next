@@ -174,6 +174,45 @@ const VARIANTS: &[Variant] = &[
     },
 ];
 
+/// BuiltinsBuilder, is_exported=True: llvm_android builds this copy for arm and i386 only (builders.py `for arch in [AndroidARMConfig(), AndroidI386Config()]`), so
+/// libc.so's builtins keep exported symbols. The converter's graph names it [`BUILTINS_EXPORTED`] in those guests' libc, libm and libnative_bridge_guest_libc.
+const BUILTINS_EXPORTED_ARCHES: &[&str] = &["arm", "x86"];
+
+/// The exported builtins' module name, provided to the converter by `-nb-provided` (see [`BUILTINS_EXPORTED_ARCHES`]).
+pub const BUILTINS_EXPORTED: &str = "libclang_rt.builtins-exported";
+
+/// The exported copy's variant: the builtins cache with COMPILER_RT_BUILTINS_HIDE_SYMBOLS FALSE (builders.py `is_exported`).
+static BUILTINS_EXPORTED_VARIANT: Variant = Variant {
+    name: "builtins-exported",
+    runtimes: "compiler-rt",
+    cache: &[
+        ("COMPILER_RT_BUILD_BUILTINS", "ON"),
+        ("COMPILER_RT_BUILD_CRT", "OFF"),
+        ("COMPILER_RT_BUILD_SANITIZERS", "OFF"),
+        ("COMPILER_RT_BUILD_XRAY", "OFF"),
+        ("COMPILER_RT_BUILD_LIBFUZZER", "OFF"),
+        ("COMPILER_RT_BUILD_PROFILE", "OFF"),
+        ("COMPILER_RT_BUILD_MEMPROF", "OFF"),
+        ("COMPILER_RT_BUILD_ORC", "OFF"),
+        ("COMPILER_RT_BUILD_CTX_PROFILE", "OFF"),
+        ("COMPILER_RT_DEFAULT_TARGET_ONLY", "ON"),
+        ("COMPILER_RT_BUILTINS_HIDE_SYMBOLS", "FALSE"),
+    ],
+    cflags: "",
+    cxxflags: "",
+    modules: &[(BUILTINS_EXPORTED, "libclang_rt.builtins-")],
+    staged: &[],
+};
+
+/// The variants guest `arch` builds: [`VARIANTS`], plus the exported builtins where llvm_android builds them.
+fn variants_of(arch: &str) -> Vec<&'static Variant> {
+    let mut all: Vec<&'static Variant> = VARIANTS.iter().collect();
+    if BUILTINS_EXPORTED_ARCHES.contains(&arch) {
+        all.push(&BUILTINS_EXPORTED_VARIANT);
+    }
+    all
+}
+
 /// Pass 2, after the converter's ninja built the guest libc: the shared half of DeviceLibcxxBuilder platform=True noexcept=False (builders.py:1176 `LIBCXX_ENABLE_SHARED` ON), the `libc++` module dynamic-STL platform modules link (cc/stl.go).
 /// A build dir of its own, so pass 1's libc++_static.a, which the converter's links already took, is never rebuilt. builders.py links it against its sysroot (`CMAKE_SYSROOT`, 1156): the NDK's libc/libm/libdl stubs + crt objects; ours holds the converter-built guest ones (`sysroot`).
 const SHARED: Variant = Variant {
@@ -332,8 +371,9 @@ pub fn build_guest(
     let base = out.join("upstream").join(UPSTREAM).join(arch);
     let triple = format!("{}{PLATFORM_API}", guest.clang);
     let includes = includes(bionic)?;
+    let variants = variants_of(arch);
     let mut built = Vec::new();
-    for v in VARIANTS {
+    for v in variants.iter().copied() {
         let dir = base.join(v.name);
         println!("runtimes: {arch} {} -> {}", v.name, dir.display());
         built.extend(build(
@@ -350,7 +390,7 @@ pub fn build_guest(
         println!("runtimes: {:<26} {}", b.module, b.lib.display());
     }
     ensure!(
-        gate(root, &base, &VARIANTS.iter().collect::<Vec<_>>())?,
+        gate(root, &base, &variants)?,
         "runtimes {arch}: licence gate failed"
     );
     Ok(built)

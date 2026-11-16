@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Tue, 17 Nov 2026 01:53:40 +0800
+Subject: [PATCH] Drop the ARM stop-unwind marker
+
+BIONIC_STOP_UNWIND on ARM is .cfi_undefined r14. LLVM's ELF ARM target
+emits EHABI (.fnstart) and no .cfi_startproc, so the directive is an
+assembler error in __libc_init (libc_init_dynamic.cpp,
+libc_init_static.cpp) and __start_thread (clone.cpp). The marker only
+ends backtraces at libc's entry frames; without it those frames stay in
+the trace. Not measured on a device.
+
+Upstream-Status: Inappropriate [the marker is right for a DWARF CFI ARM toolchain; the pinned LLVM ARM backend emits EHABI for ELF targets]
+Patch-Reason: the pinned LLVM ARM backend (ARMMCAsmInfo.cpp) emits EHABI for ELF targets, so no compiler flag selects the CFI frame the directive needs; .cantunwind must precede the prologue and cannot be placed from inline asm
+---
+SPDX-License-Identifier: Apache-2.0
+ libc/platform/bionic/macros.h | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/libc/platform/bionic/macros.h b/libc/platform/bionic/macros.h
+index c4af3b9eb38781f63c1085af74e23dbfb255a16a..261ab41b7c0bb701ecc5cc06ab35fc2b8d8c62bc 100644
+--- a/libc/platform/bionic/macros.h
++++ b/libc/platform/bionic/macros.h
+@@ -32,8 +32,10 @@
+     ? (1UL << (64 - __builtin_clzl(static_cast<unsigned long>(value)))) \
+     : (1UL << (32 - __builtin_clz(static_cast<unsigned int>(value)))))
+ 
++// ARM's ELF target uses EHABI (LLVM ARMMCAsmInfo: ExceptionHandling::ARM), which emits .fnstart and no .cfi_startproc, so
++// .cfi_undefined outside a CFI frame is an assembler error. .cantunwind must precede the prologue, not sit in the body.
+ #if defined(__arm__)
+-#define BIONIC_STOP_UNWIND asm volatile(".cfi_undefined r14")
++#define BIONIC_STOP_UNWIND ((void)0)
+ #elif defined(__aarch64__)
+ #define BIONIC_STOP_UNWIND asm volatile(".cfi_undefined x30")
+ #elif defined(__i386__)

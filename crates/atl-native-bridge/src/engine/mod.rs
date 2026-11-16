@@ -156,6 +156,15 @@ impl Active {
         }
     }
 
+    /// The engine's guest pointer width in bits (arches.toml `pointer_bits` of the guest row): picks the guest library dir (atl-android-paths `native_bridge_lib`).
+    pub fn guest_pointer_bits(self) -> u32 {
+        match self {
+            #[cfg(atl_nb_identity)]
+            Active::Identity => identity::GUEST_POINTER_BITS,
+            Active::Qemu => qemu::GUEST_POINTER_BITS,
+        }
+    }
+
     /// The ELF machine of the libraries this engine runs (elf.rs `classify`): the host's, or QEMU's guest machine.
     pub fn machine(self) -> Result<object::elf::Machine, String> {
         match self {
@@ -421,9 +430,13 @@ pub struct Config {
 impl Config {
     /// The guest as the sandbox holds it (atl-android-paths `native_bridge_bin` / `native_bridge_lib`), for the active engine's guest ISA (identity: the host's own; QEMU: arm64).
     pub fn installed() -> Config {
-        let isa = active().guest_isa();
+        let engine = active();
+        let isa = engine.guest_isa();
         let bin = PathBuf::from(atl_android_paths::native_bridge_bin(isa));
-        let lib = PathBuf::from(atl_android_paths::native_bridge_lib(isa));
+        let lib = PathBuf::from(atl_android_paths::native_bridge_lib(
+            isa,
+            engine.guest_pointer_bits(),
+        ));
         Config {
             linker: bin.join("linker64"),
             vdso: lib.join(VDSO_FILE),

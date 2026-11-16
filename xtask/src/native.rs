@@ -592,6 +592,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else if let Some(first) = isa_floor_gate(root, &graph_out, host, &tiers, &provided_libs)? {
         failed.push(Failure::step("isa gate", first));
     }
+    // a foreign guest graph's own outputs: the guest row's class, machine and (arm) softfp EABI5 (isa_gate `guest_check`)
+    if let Some(arch) = args.native_bridge.as_deref().filter(|_| foreign) {
+        let bits = arches
+            .get(arch)
+            .with_context(|| format!("--native-bridge {arch}: no row in {}", arches::FILE))?
+            .pointer_bits;
+        if let Some(first) = guest_abi_gate(&graph_out, arch, bits)? {
+            failed.push(Failure::step("guest abi gate", first));
+        }
+    }
     if let Some(first) = fronts_gate(&graph_out, &tree)? {
         failed.push(Failure::step("fronts gate", first));
     }
@@ -1743,6 +1753,20 @@ fn isa_floor_gate(
         println!("native:   isa: {v}");
     }
     Ok(crate::isa_gate::first_violation(&report).map(str::to_owned))
+}
+
+/// The guest gate (isa_gate.rs `guest_check`) over a foreign native-bridge graph: every ELF of guest `arch` (pointer width `bits`) has the guest row's ABI. Its first violation, None when it passes.
+fn guest_abi_gate(out: &Path, arch: &str, bits: u32) -> Result<Option<String>> {
+    let report = crate::isa_gate::guest_check(out, arch, bits)?;
+    println!(
+        "native: guest abi gate: {arch}: {} ELF files, {} violations",
+        report.files,
+        report.violations.len()
+    );
+    for v in report.violations.iter().take(5) {
+        println!("native:   guest abi: {v}");
+    }
+    Ok(report.violations.first().cloned())
 }
 
 /// The converter's argument file in the out dir (tools/bp2ninja regen.go): build.ninja's regeneration edge reads it, so a changed flag or goal reruns the conversion.

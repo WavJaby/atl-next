@@ -50,6 +50,18 @@ size = 35799987
 signer_sha256 = "597d7771ec20993d1c45310913d2d4e4e8de1638b4ba58c5fbfbc071812236f4"
 source = "github-release"
 
+# the author's release asset of tag v1.0.7: Ballance, a Unity 2021.3 Mono remake (GPL-3 code; levels bundled). armeabi-v7a only, GLES 3.0: it runs only under the arm32
+# guest, which is not built yet, so it is run by name on that lane and never by a host-native gate.
+[ballance]
+package = "com.MengyuGame.Ballance"
+version_name = "1.0.7"
+version_code = 1
+url = "https://github.com/imengyu/Ballance/releases/download/v1.0.7/Ballance-1.0.7-android.apk"
+sha256 = "0be85c668bb1c61fcdc083fcc55e8397aba9f97e23c708807473e7cf0d065898"
+size = 67549203
+signer_sha256 = "240d35ef90772364fd37e3167fdade99ae452414759497dbdcc4710f333c6a88"
+source = "github-release"
+
 # google-play row: Battle Cats TW 15.7.0, the base and every split. Values read from the local copy in ~/atl-next/apk/battle-cats-tw (2026-11-10).
 # device px_9a is inferred, not read back from Play: apkeep's default, and its arm64_v8a and xxhdpi splits fit a Pixel 9a.
 [battle-cats-tw]

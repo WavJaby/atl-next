@@ -425,11 +425,11 @@ rustup_target = "aarch64-linux-android"
 scope = ["build"]
 used_by = ["xtask:native", "xtask:test"]
 
-# the arm32 QEMU engine boot executable (qemu.rs `boot_exe`, arches.toml [arm.guest] rust; phase 4 P1)
+# the arm32 QEMU engine boot executable (qemu.rs `boot_exe`, arches.toml [arm.guest] rust; phase 4 P1) and the arm native bridge side's guest crates (`--native-bridge arm`, arm_device.go RustTriple)
 [rust-std-android-arm]
 rustup_target = "armv7-linux-androideabi"
 scope = ["build"]
-used_by = ["xtask:test"]
+used_by = ["xtask:native", "xtask:test"]
 
 # the riscv64 cross build's std (`xtask cross --arch riscv64`, and the native build of the riscv64 host's crates)
 [rust-std-riscv64]

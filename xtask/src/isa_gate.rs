@@ -6,6 +6,7 @@
 //! It reads what the object declares, not what its code executes: `Tag_RISCV_arch` is the assembler's -march, so a TU built with a wider -march fails even if it never runs the extension.
 //! Run-time tiers (isa-tiers.toml, isa_tiers.rs): an object named by a row may claim the row's extension and must claim it; a product of the row's module may claim it; nothing else may.
 //! Not checked: static archives (object is built without its `archive` feature, so their members are not read), GLIBCXX_/CXXABI_/GCC_ needs, GTK (no riscv64 output links it yet). GLIBC_PRIVATE is the loader's own interface, not a number: skipped.
+//! Guest (`guest_check`, a foreign native-bridge graph, native.rs `guest_abi_gate`): every ELF under `nb/<arch>` and `upstream/llvm-project/<arch>` has the guest row's class and e_machine; arm outputs also EABI5 with no `Tag_ABI_VFP_args` (the softfp armeabi-v7a ABI).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -15,7 +16,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail, ensure};
 use object::read::SymbolIndex;
-use object::read::elf::{ElfFile64, FileHeader, SectionHeader, Sym};
+use object::read::elf::{ElfFile32, ElfFile64, FileHeader, SectionHeader, Sym};
 use object::{Endianness, elf};
 use serde::Deserialize;
 
@@ -24,6 +25,10 @@ use crate::{arches, cross, deps, isa_tiers, out};
 
 /// psABI build attribute `Tag_RISCV_arch`: an odd tag, so its value is a NUL-terminated string.
 const TAG_RISCV_ARCH: u64 = 5;
+/// aeabi build attribute `Tag_ABI_VFP_args` (ARM IHI 0045): an even tag, so an integer; 1 claims the VFP hard-float convention.
+const TAG_ABI_VFP_ARGS: u64 = 28;
+/// aeabi build attribute `Tag_compatibility`: an integer, then a NUL-terminated string.
+const TAG_COMPATIBILITY: u64 = 32;
 /// `e_ident` indexes of the class and data-encoding bytes (ELF gABI).
 const EI_CLASS: usize = 4;
 const EI_DATA: usize = 5;
@@ -640,6 +645,139 @@ fn isa_claim<'data>(f: &ElfFile64<'data, Endianness>, data: &'data [u8]) -> Resu
                         reader.read_string()?;
                     } else {
                         reader.read_integer()?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// What a guest arch's ELF outputs must claim: e_machine, and for arm the armeabi-v7a ABI.
+#[derive(Clone, Copy)]
+struct GuestAbi {
+    machine: u16,
+    /// EABI5 with no `Tag_ABI_VFP_args`: AAPCS, floating-point arguments in core registers.
+    softfp: bool,
+}
+
+/// The rule of guest arch `arch` (its arches.toml `[<arch>.guest]` row); an arch without one fails the gate.
+fn guest_abi(arch: &str) -> Result<GuestAbi> {
+    match arch {
+        "arm" => Ok(GuestAbi {
+            machine: elf::EM_ARM.0,
+            softfp: true,
+        }),
+        other => bail!(
+            "{}: no guest ABI rule for `{other}` (isa_gate.rs guest_abi)",
+            arches::FILE
+        ),
+    }
+}
+
+/// What the guest gate read and found in one foreign native-bridge graph.
+#[derive(Default)]
+pub struct GuestReport {
+    /// ELF files read under the guest's dirs.
+    pub files: usize,
+    /// One line per violation, prefixed with its file.
+    pub violations: Vec<String>,
+}
+
+/// The guest gate over foreign graph `out` for guest `arch` of pointer width `bits` (its arches.toml row): every ELF under `nb/<arch>` and
+/// `upstream/llvm-project/<arch>` has that class and e_machine; a softfp guest's also EABI5 and no `Tag_ABI_VFP_args`. Only the guest's dirs are read: the graph's host products belong to the host run.
+pub fn guest_check(out: &Path, arch: &str, bits: u32) -> Result<GuestReport> {
+    let rule = guest_abi(arch)?;
+    let mut paths = Vec::new();
+    for dir in [
+        out.join("nb").join(arch),
+        out.join("upstream/llvm-project").join(arch),
+    ] {
+        if dir.is_dir() {
+            collect(&dir, &mut paths)?;
+        }
+    }
+    paths.sort();
+    let mut report = GuestReport::default();
+    for path in &paths {
+        let name = path.strip_prefix(out).unwrap_or(path).display().to_string();
+        let data = std::fs::read(path).with_context(|| format!("reading {name}"))?;
+        let Some((is64, machine)) = elf_header(&data) else {
+            continue;
+        };
+        report.files += 1;
+        if is64 != (bits == 64) {
+            let class = if is64 { 64 } else { 32 };
+            report
+                .violations
+                .push(format!("{name}: ELF{class} in a {bits}-bit guest"));
+            continue;
+        }
+        if machine != rule.machine {
+            report.violations.push(format!(
+                "{name}: e_machine {machine}, want {}",
+                rule.machine
+            ));
+        }
+        if rule.softfp && !is64 {
+            let f = ElfFile32::<Endianness>::parse(&*data).with_context(|| name.clone())?;
+            let eabi = f.elf_header().e_flags(f.endian()).0 & elf::EF_ARM_EABIMASK;
+            if eabi != elf::EF_ARM_EABI_VER5.0 {
+                report.violations.push(format!(
+                    "{name}: EABI flags {eabi:#x}, want EABI5 ({:#x})",
+                    elf::EF_ARM_EABI_VER5.0
+                ));
+            }
+            if let Some(v) = arm_vfp_args(&f, &data).with_context(|| name.clone())? {
+                report.violations.push(format!(
+                    "{name}: Tag_ABI_VFP_args {v}: a hard-float ABI, softfp expected"
+                ));
+            }
+        }
+    }
+    if report.files == 0 {
+        report
+            .violations
+            .push(format!("no ELF under {}: nothing checked", out.display()));
+    }
+    Ok(report)
+}
+
+/// `Tag_ABI_VFP_args` of `f` (aeabi build attributes): its value, None when the file does not carry it.
+fn arm_vfp_args<'data>(f: &ElfFile32<'data, Endianness>, data: &'data [u8]) -> Result<Option<u64>> {
+    let endian = f.endian();
+    for section in f.elf_section_table().iter() {
+        if section.sh_type(endian) != elf::SHT_ARM_ATTRIBUTES {
+            continue;
+        }
+        let attributes = section.attributes(endian, data)?;
+        let mut subsections = attributes.subsections()?;
+        while let Some(subsection) = subsections.next()? {
+            if subsection.vendor() != b"aeabi" {
+                continue;
+            }
+            let mut subsubsections = subsection.subsubsections();
+            while let Some(subsubsection) = subsubsections.next()? {
+                if subsubsection.tag() != elf::Tag_File {
+                    continue;
+                }
+                let mut reader = subsubsection.attributes();
+                while let Some(tag) = reader.read_tag()? {
+                    if tag == TAG_ABI_VFP_ARGS {
+                        return Ok(Some(reader.read_integer()?));
+                    }
+                    // aeabi: odd tags carry a string, Tag_compatibility an integer then a string, the rest an integer
+                    match tag {
+                        TAG_COMPATIBILITY => {
+                            reader.read_integer()?;
+                            reader.read_string()?;
+                        }
+                        _ if tag % 2 == 1 => {
+                            reader.read_string()?;
+                        }
+                        _ => {
+                            reader.read_integer()?;
+                        }
                     }
                 }
             }

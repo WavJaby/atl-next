@@ -20,9 +20,15 @@ pub const SYSTEM_LIB: &str = if cfg!(target_pointer_width = "64") {
 /// The platform's executables.
 pub const SYSTEM_BIN: &str = "/system/bin";
 
-/// Guest native libraries of native-bridge ISA `isa` (Soong installs a `native_bridge_supported` module's bridge variant under `lib64/<NativeBridgeRelativePath>`, the guest arch name): the guest linker's default search path.
-pub fn native_bridge_lib(isa: &str) -> String {
-    format!("{SYSTEM_LIB}/{isa}")
+/// Guest native libraries of native-bridge ISA `isa` at guest pointer width `pointer_bits`: Soong installs a `native_bridge_supported` module's bridge variant under
+/// `lib<bits>/<NativeBridgeRelativePath>` by the module's own width (`lib` for 32-bit, `lib64` for 64-bit), whatever the host's: the guest linker's default search path.
+pub fn native_bridge_lib(isa: &str, pointer_bits: u32) -> String {
+    let dir = if pointer_bits == 32 {
+        "/system/lib"
+    } else {
+        "/system/lib64"
+    };
+    format!("{dir}/{isa}")
 }
 
 /// Guest executables of native-bridge ISA `isa` (`bin/<NativeBridgeRelativePath>`): its `linker64` and `app_process64`.

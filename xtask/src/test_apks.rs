@@ -828,6 +828,7 @@ mod tests {
                 "altos-odyssey",
                 "angry-birds-2",
                 "bad-piggies",
+                "ballance",
                 "battle-cats-tw",
                 "fossify-math",
                 "fossify-notes",

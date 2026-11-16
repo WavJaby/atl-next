@@ -77,6 +77,9 @@ pub fn host_stack() -> Result<super::Stack, String> {
 /// The guest ISA (atl-android-paths `native_bridge_bin` / `native_bridge_lib` directory): the identity guest is the host's own.
 pub const GUEST_ISA: &str = super::HOST_ISA;
 
+/// The guest's pointer width: the host's own (the identity guest runs on the real kernel).
+pub const GUEST_POINTER_BITS: u32 = usize::BITS;
+
 /// The kernel's auxv for this guest: the process's own, the identity guest runs on the real kernel.
 pub fn kernel_auxv() -> Result<Vec<(usize, usize)>, String> {
     super::args::process_auxv()

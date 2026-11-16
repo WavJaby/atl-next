@@ -32,6 +32,8 @@ pub(super) use place::{down_pool, down_slot};
 
 /// The guest ISA (atl-android-paths `native_bridge_bin` / `native_bridge_lib` directory): QEMU runs aarch64 guests.
 pub const GUEST_ISA: &str = "arm64";
+/// [`GUEST_ISA`]'s pointer width: LP64.
+pub const GUEST_POINTER_BITS: u32 = 64;
 /// The ELF machine of [`GUEST_ISA`] libraries (elf.rs `classify` under this engine).
 pub const GUEST_MACHINE: object::elf::Machine = object::elf::EM_AARCH64;
 
