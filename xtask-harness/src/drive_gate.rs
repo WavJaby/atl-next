@@ -142,9 +142,19 @@ impl<'a> Gate<'a> {
 /// Catches a covered / unmapped window (blank first shot) and lost input (no change); the quadrants and the still-picture shots stay in `xtask test drive`.
 /// Prints the phase report on stderr (the check log shows it), also when the run fails: the phases say where the time went up to it.
 pub fn quick(root: &Path, host: &str, out: &Path) -> Result<()> {
+    let load_start = load1();
     let result = timing::phase("drive-tap", || quick_run(root, host, out));
+    eprintln!("drive-tap load1: start {load_start}, end {}", load1());
     eprintln!("{}", timing::report("drive-tap").trim_end());
     result
+}
+
+/// The 1-minute load average from /proc/loadavg, as the kernel prints it; `?` when unreadable.
+fn load1() -> String {
+    std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|text| text.split_whitespace().next().map(str::to_owned))
+        .unwrap_or_else(|| "?".to_owned())
 }
 
 fn quick_run(root: &Path, host: &str, out: &Path) -> Result<()> {
