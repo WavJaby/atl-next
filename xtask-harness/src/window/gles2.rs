@@ -220,7 +220,13 @@ mod tests {
     #[test]
     fn composed_probes_pass_and_a_wrong_one_is_named() {
         assert!(
-            composed_check(&seen_with(HEIGHT, &composed_probes()), WIDTH, HEIGHT, &PROBES).is_ok()
+            composed_check(
+                &seen_with(HEIGHT, &composed_probes()),
+                WIDTH,
+                HEIGHT,
+                &PROBES
+            )
+            .is_ok()
         );
         let mut bad = composed_probes();
         bad[0].2 = 0x00ff_00ff;

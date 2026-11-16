@@ -683,7 +683,8 @@ fn ext_error(front: &Lib) -> Result<u32, String> {
 
 /// `glMultiDrawArraysEXT(GL_TRIANGLES, -, -, 0)` through `front`: a name no ANGLE library exports, so both libEGL tables hold the driver's shell (the harness reads the driver's lines); primcount 0 reads no array.
 fn gap_call(front: &Lib) -> Result<(), String> {
-    let multi: unsafe extern "C" fn(u32, *const i32, *const i32, i32) = front.sym(c"glMultiDrawArraysEXT")?;
+    let multi: unsafe extern "C" fn(u32, *const i32, *const i32, i32) =
+        front.sym(c"glMultiDrawArraysEXT")?;
     // SAFETY: a context is current; primcount 0 dereferences neither array.
     unsafe { multi(GL_TRIANGLES, std::ptr::null(), std::ptr::null(), 0) };
     Ok(())

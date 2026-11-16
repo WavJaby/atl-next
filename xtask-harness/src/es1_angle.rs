@@ -292,7 +292,10 @@ fn judge(mode: Mode, log: &str, want: u64, verbose: bool) -> bool {
             checks.push((
                 "ext dispatch",
                 missing_of(EXT_NAME) == 0 && !err.is_empty() && err != "0x0",
-                format!("{kind}: {EXT_NAME}(no image) error `{err}`, driver missing lines for it {}", missing_of(EXT_NAME)),
+                format!(
+                    "{kind}: {EXT_NAME}(no image) error `{err}`, driver missing lines for it {}",
+                    missing_of(EXT_NAME)
+                ),
             ));
         }
         // a name no ANGLE library has: the ES1 call reaches the shell, which answers none (one counted line), the ES3 call the host (no line)
@@ -300,7 +303,10 @@ fn judge(mode: Mode, log: &str, want: u64, verbose: bool) -> bool {
         checks.push((
             "ext gap",
             gap == "es1 es3" && missing_of(GAP_NAME) == 1,
-            format!("calls `{gap}`, driver missing lines for {GAP_NAME}: {} (all: {missing:?})", missing_of(GAP_NAME)),
+            format!(
+                "calls `{gap}`, driver missing lines for {GAP_NAME}: {} (all: {missing:?})",
+                missing_of(GAP_NAME)
+            ),
         ));
     }
     let mut ok = true;

@@ -421,7 +421,10 @@ pub fn selector_module(
             args = s.args,
         )?;
         s.width_asserts(&mut out)?;
-        writeln!(arms, "        b\"{f}\" => Some(({index}, {name} as *const ())),")?;
+        writeln!(
+            arms,
+            "        b\"{f}\" => Some(({index}, {name} as *const ())),"
+        )?;
     }
     let names: Vec<String> = functions.iter().map(|f| format!("\"{f}\"")).collect();
     writeln!(
@@ -454,7 +457,10 @@ impl<'v> Shell<'v> {
             .functions
             .get(f)
             .with_context(|| format!("{}: no function {f}", iface.header))?;
-        ensure!(!sig.variadic, "{f}: a variadic function cannot be forwarded");
+        ensure!(
+            !sig.variadic,
+            "{f}: a variadic function cannot be forwarded"
+        );
         // a forwarded record is only ever behind a pointer: no layout to assert, it is opaque here
         for t in sig.params.iter().chain(std::iter::once(&sig.ret)) {
             ensure!(

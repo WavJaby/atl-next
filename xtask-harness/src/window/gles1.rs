@@ -89,7 +89,9 @@ mod tests {
 
     #[test]
     fn version_must_be_angle_es11() {
-        assert!(version_check("I AtlGles1: version OpenGL ES 1.1.0 (ANGLE 2.1 git hash: x)\n").is_ok());
+        assert!(
+            version_check("I AtlGles1: version OpenGL ES 1.1.0 (ANGLE 2.1 git hash: x)\n").is_ok()
+        );
         assert!(version_check("I AtlGles1: version OpenGL ES 3.1 Mesa 25.0.7\n").is_err());
         assert!(version_check("").is_err());
     }
@@ -99,6 +101,9 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let java = std::fs::read_to_string(root.join(FIXTURE).join(MAIN_JAVA)).expect("Main.java");
         // Main.java's PROBES comment: (8, 8) inside the red triangle, (56, 56) the clear colour
-        assert_eq!(java_probes(&java), [(8, 8, 0xff00_00ff), (56, 56, 0x4080_c0ff)]);
+        assert_eq!(
+            java_probes(&java),
+            [(8, 8, 0xff00_00ff), (56, 56, 0x4080_c0ff)]
+        );
     }
 }
