@@ -159,6 +159,9 @@ pub enum WebEvent {
         /// The answer channel.
         reply: Box<dyn PromptReply>,
     },
+    /// The page left the key Android delivered stamped this monotonic ns (`KeyEvent.getEventTimeNanos`, the time [`WebView::claim_input`] got) unhandled: no handler took it, the engine's default did nothing.
+    /// Only key presses are reported (WebKitGTK puts back an unhandled press, not a release). The provider reports it to the app (WebViewClient.onUnhandledKeyEvent).
+    UnhandledKey(i64),
     /// A navigation's response is one the engine does not show (a type it cannot render, or `Content-Disposition: attachment`): the navigation was dropped, nothing is saved.
     Download {
         /// The response's URL.

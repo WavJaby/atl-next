@@ -9,6 +9,7 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+use atl_platform_ui_api::abi::Callback;
 use atl_platform_ui_api::webview::{InputClaim, SIDEBAND_WEB_VIEW};
 use gtk4::prelude::*;
 use gtk4::{gdk, glib};
@@ -128,10 +129,11 @@ impl<E> Gate<E> {
     }
 }
 
-/// A registered widget and its gate.
+/// A registered widget, its gate and its unhandled-key report (UiVtable::sideband_attach).
 struct Entry {
     widget: gtk4::Widget,
     gate: std::cell::RefCell<Gate<gdk::Event>>,
+    unhandled_key: std::cell::RefCell<Callback<i64>>,
 }
 
 /// The registered widgets, by key.
@@ -146,6 +148,11 @@ static STAMPS: Mutex<VecDeque<Stamp>> = Mutex::new(VecDeque::new());
 /// input never reached the widget), and a mark keyed by a freed event's address then matched the next real event allocated there, which the window's controllers skipped unpublished.
 static REPLAYING: Mutex<VecDeque<(usize, glib::thread_guard::ThreadGuard<gdk::Event>)>> =
     Mutex::new(VecDeque::new());
+
+/// Key presses a gate let through to its widget: (event address, the event, widget key, Android's stamp). WebKitGTK puts back the same GdkEvent when the page leaves a press unhandled (PageClientImpl::doneWithKeyEvent re-propagates it for the toplevel's
+/// accelerators; measured with WebKitGTK 2.54: presses only, after the key's release), so a listed address coming back to the window's controllers is that report ([`unhandled_key`]). Handled presses never come back: the bound evicts them.
+type Delivered = (usize, glib::thread_guard::ThreadGuard<gdk::Event>, i32, i64);
+static DELIVERED: Mutex<VecDeque<Delivered>> = Mutex::new(VecDeque::new());
 
 fn address(e: &gdk::Event) -> usize {
     use glib::translate::ToGlibPtr;
@@ -164,8 +171,8 @@ fn entry(key: i32) -> Option<std::rc::Rc<Entry>> {
         .map(|(_, e)| e.get_ref().clone())
 }
 
-/// Registers `widget` as the content of `[SIDEBAND_WEB_VIEW, key]` and puts the input gate on it.
-pub fn attach(key: i32, widget: gtk4::Widget) {
+/// Registers `widget` as the content of `[SIDEBAND_WEB_VIEW, key]` and puts the input gate on it; `unhandled_key` takes the stamps of the presses it leaves unhandled.
+pub fn attach(key: i32, widget: gtk4::Widget, unhandled_key: Callback<i64>) {
     let gate = gtk4::EventControllerLegacy::new();
     gate.set_propagation_phase(gtk4::PropagationPhase::Capture);
     gate.connect_event(move |_, event| on_gate(key, event));
@@ -173,6 +180,7 @@ pub fn attach(key: i32, widget: gtk4::Widget) {
     let e = std::rc::Rc::new(Entry {
         widget,
         gate: std::cell::RefCell::default(),
+        unhandled_key: std::cell::RefCell::new(unhandled_key),
     });
     let mut list = lock(&SIDEBANDS);
     list.retain(|(k, _)| *k != key);
@@ -231,6 +239,39 @@ pub fn replayed(event: Option<&gdk::Event>) -> bool {
     })
 }
 
+/// Whether `event` is a key press a widget's page left unhandled (WebKit put it back, [`DELIVERED`]): its widget's report runs with the press's stamp, from an idle callback (the report reaches the app's
+/// Java code, which must not run inside this toolkit dispatch), and the window's controllers neither publish it again (Android had it) nor let it on.
+pub fn unhandled_key(event: Option<&gdk::Event>) -> bool {
+    let Some(e) = event else { return false };
+    let a = address(e);
+    let found = {
+        let mut d = lock(&DELIVERED);
+        d.iter()
+            .position(|(x, ..)| *x == a)
+            .and_then(|i| d.remove(i))
+    };
+    let Some((_, held, key, ns)) = found else {
+        return false;
+    };
+    drop(held);
+    glib::idle_add_local_once(move || {
+        if let Some(e) = entry(key) {
+            e.unhandled_key.borrow_mut().call(&ns);
+        }
+    });
+    true
+}
+
+/// The stamp the window's controllers published the event at `address` with, now for one they did not publish.
+fn stamp_of(address: usize) -> i64 {
+    lock(&STAMPS)
+        .iter()
+        .rev()
+        .find(|(x, _, _)| *x == address)
+        .map(|(_, _, ns)| *ns)
+        .unwrap_or_else(crate::window::monotonic_ns)
+}
+
 fn kind(t: gdk::EventType) -> Option<(bool, bool, bool)> {
     use gdk::EventType as T;
     // (key, press, release)
@@ -255,6 +296,21 @@ fn on_gate(key: i32, event: &gdk::Event) -> glib::Propagation {
             .and_then(|i| r.remove(i))
     };
     if mark.is_some() {
+        if event.event_type() == gdk::EventType::KeyPress {
+            let ns = stamp_of(a);
+            let evicted = {
+                let mut d = lock(&DELIVERED);
+                let evicted = (d.len() == MAX_MARKS).then(|| d.pop_front()).flatten();
+                d.push_back((
+                    a,
+                    glib::thread_guard::ThreadGuard::new(event.clone()),
+                    key,
+                    ns,
+                ));
+                evicted
+            };
+            drop(evicted);
+        }
         return glib::Propagation::Proceed;
     }
     let Some((key_event, press, release)) = kind(event.event_type()) else {
@@ -263,12 +319,7 @@ fn on_gate(key: i32, event: &gdk::Event) -> glib::Propagation {
     let Some(e) = entry(key) else {
         return glib::Propagation::Proceed;
     };
-    let ns = lock(&STAMPS)
-        .iter()
-        .rev()
-        .find(|(x, _, _)| *x == a)
-        .map(|(_, _, ns)| *ns)
-        .unwrap_or_else(crate::window::monotonic_ns);
+    let ns = stamp_of(a);
     e.gate.borrow_mut().hold(Held {
         event: event.clone(),
         ns,

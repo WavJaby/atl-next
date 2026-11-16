@@ -80,12 +80,16 @@ static VTABLE: UiVtable = UiVtable {
     sideband_focus,
 };
 
-unsafe extern "C" fn sideband_attach(key: i32, widget: *mut std::ffi::c_void) {
+unsafe extern "C" fn sideband_attach(
+    key: i32,
+    widget: *mut std::ffi::c_void,
+    unhandled_key: atl_platform_ui_api::abi::Callback<i64>,
+) {
     use gtk4::glib::translate::FromGlibPtrNone;
     // SAFETY: a live GtkWidget of the same libgtk (the vtable contract); from_glib_none takes our own reference.
     let w: gtk4::Widget =
         unsafe { gtk4::Widget::from_glib_none(widget.cast::<gtk4::ffi::GtkWidget>()) };
-    crate::sideband::attach(key, w);
+    crate::sideband::attach(key, w, unhandled_key);
 }
 
 unsafe extern "C" fn sideband_detach(key: i32) {

@@ -1071,7 +1071,9 @@ pub struct UiVtable {
     pub pcm_underruns: unsafe extern "C" fn(pcm: *mut PcmHandle) -> u64,
     /// Makes the toolkit widget `widget` (a `GtkWidget *` of the same libgtk, from another module: the WebView module's [`WebViewVtable::view_widget`]) the content of every sideband quad whose
     /// stream is `[SIDEBAND_WEB_VIEW, key]` (crate::webview); the module takes its own reference. UI thread.
-    pub sideband_attach: unsafe extern "C" fn(key: i32, widget: *mut c_void),
+    /// `unhandled_key` (kept until detach, called on the UI thread): the widget left a key unhandled (the toolkit put back a delivered key event); its value is that key's stamp, the monotonic ns Android's KeyEvent carries (`WebEvent::UnhandledKey`).
+    pub sideband_attach:
+        unsafe extern "C" fn(key: i32, widget: *mut c_void, unhandled_key: Callback<i64>),
     /// Drops `key`'s widget (unparented from its window, its reference released); a quad still naming it shows nothing. UI thread.
     pub sideband_detach: unsafe extern "C" fn(key: i32),
     /// `WebView::claim_input` for `key`'s widget: `claim` an [`InputClaim`](crate::webview::InputClaim) number; returns the left-pressed flag. UI thread.

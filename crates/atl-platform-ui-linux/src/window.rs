@@ -394,6 +394,10 @@ impl GtkWindow {
             if sideband::replayed(c.current_event().as_ref()) {
                 return glib::Propagation::Proceed;
             }
+            // a page's unhandled press, put back by WebKit: reported to Android as unhandled, not published a second time
+            if sideband::unhandled_key(c.current_event().as_ref()) {
+                return glib::Propagation::Stop;
+            }
             let locks = c
                 .current_event_device()
                 .map(|d| Locks {

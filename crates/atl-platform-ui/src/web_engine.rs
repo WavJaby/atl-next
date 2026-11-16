@@ -68,8 +68,18 @@ impl WebEngine for PlatformWebEngine {
         }
     }
 
-    fn create_view(mut events: Box<dyn FnMut(WebEvent)>) -> Result<PlatformWebView, WebViewError> {
+    fn create_view(events: Box<dyn FnMut(WebEvent)>) -> Result<PlatformWebView, WebViewError> {
         let m = module()?;
+        // two sources, one sink: the engine module's events and the UI module's unhandled-key reports, both on the UI thread
+        let events = std::rc::Rc::new(std::cell::RefCell::new(events));
+        let unhandled_events = std::rc::Rc::clone(&events);
+        let unhandled_key =
+            Callback::new(move |ns: &i64| match unhandled_events.try_borrow_mut() {
+                Ok(mut events) => events(WebEvent::UnhandledKey(*ns)),
+                Err(_) => tracing::warn!(
+                    "atl-platform-ui: unhandled key {ns} reported inside a view event; dropped"
+                ),
+            });
         let sink = Callback::new(move |e: &WebEventView| {
             // SAFETY: the view's strings are alive for this call (module contract).
             let (text, detail) =
@@ -106,7 +116,12 @@ impl WebEngine for PlatformWebEngine {
                 },
                 _ => return,
             };
-            events(ev);
+            match events.try_borrow_mut() {
+                Ok(mut events) => events(ev),
+                Err(_) => tracing::warn!(
+                    "atl-platform-ui: view event inside an unhandled-key report; dropped"
+                ),
+            }
         });
         // the window draws the view through the UI module (sideband quads), so a process without it has no use for a view
         let ui = crate::module::module().map_err(WebViewError::Unavailable)?;
@@ -121,7 +136,7 @@ impl WebEngine for PlatformWebEngine {
         static NEXT_KEY: AtomicI32 = AtomicI32::new(1);
         let key = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
         // SAFETY: UI thread; the widget is the live view's (borrowed), the UI module takes its own reference (same libgtk in both modules).
-        unsafe { (ui.sideband_attach)(key, (m.view_widget)(h)) };
+        unsafe { (ui.sideband_attach)(key, (m.view_widget)(h), unhandled_key) };
         Ok(PlatformWebView { m, ui, h, key })
     }
 

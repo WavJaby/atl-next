@@ -4,6 +4,7 @@
 //! where the engine's events arrive too; `Statics.getDefaultUserAgent` runs on whatever thread called; bridge calls run on the "JavaBridge" thread ([`bridge_thread`]).
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_void};
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -416,7 +417,19 @@ impl Native {
 /// What the event sink needs: the provider (a weak global ref, so the app's WebView stays collectable).
 struct Shared {
     provider: Cell<usize>,
+    /// Copies of the keys the page was given (dispatchKeyEvent's claim), oldest first: (stamp ns, global ref to the KeyEvent copy, action, keycode). An unhandled report names one by its stamp.
+    keys: RefCell<VecDeque<(i64, usize, i32, i32)>>,
+    /// Keycodes whose press the page left unhandled while their release had not reached the view yet: that release is reported unhandled when it comes.
+    unhandled_presses: RefCell<Vec<i32>>,
 }
+
+/// Key copies a view keeps at most ([`Shared::keys`]): a report comes one engine round trip after its key (WebKitGTK: after the release), so a few keys are in flight; 32 is a fast typist's second of presses and releases.
+/// A handled key is never reported, so the bound is also what evicts those.
+const KEPT_KEYS: usize = 32;
+
+/// KeyEvent.ACTION_DOWN / ACTION_UP.
+const KEY_ACTION_DOWN: i32 = 0;
+const KEY_ACTION_UP: i32 = 1;
 
 /// `provider.mNative` as the view, None after destroy.
 fn native<'a>(env: Env, provider: Obj) -> Option<&'a Native> {
@@ -507,6 +520,8 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProvid
     }
     let shared = Rc::new(Shared {
         provider: Cell::new(0),
+        keys: RefCell::default(),
+        unhandled_presses: RefCell::default(),
     });
     let sink_shared = shared.clone();
     let view = match PlatformWebEngine::create_view(Box::new(move |ev| on_event(&sink_shared, ev)))
@@ -593,6 +608,9 @@ fn on_event(shared: &Shared, ev: WebEvent) {
     let Some(env) = env_now() else { return };
     if let WebEvent::Prompt { message, reply, .. } = ev {
         return on_prompt(env, shared, &message, reply);
+    }
+    if let WebEvent::UnhandledKey(t) = ev {
+        return on_unhandled_key(env, shared, t);
     }
     let provider = jni_call!(env, NewLocalRef, shared.provider.get() as Obj);
     if provider.is_null() {
@@ -1541,14 +1559,154 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_onGeneric
     super_bool(env, n, c"super_onGenericMotionEvent", c"(Landroid/view/MotionEvent;)Z", ev)
 });
 
-// a system key (BACK, HOME, volume: KeyEvent.isSystem) goes on to the framework as View's, as Chromium leaves it; any other is the page's
+// a system key (BACK, HOME, volume: KeyEvent.isSystem), or one WebViewClient.shouldOverrideKeyEvent takes, goes on to the framework as View's, as Chromium leaves it; any other is the page's, claimed
+// (WebViewClient.java: "Except system keys, WebView always consumes the keys in the normal flow"); one the page leaves unhandled comes back later as WebEvent::UnhandledKey
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_dispatchKeyEvent, (env, n, ev: Obj) -> u8 = 0, {
-    if call_bool(env, ev, c"isSystem", c"()Z", &[]) {
+    if call_bool(env, ev, c"isSystem", c"()Z", &[]) || should_override_key(env, &n.shared, ev) {
         return super_bool(env, n, c"super_dispatchKeyEvent", c"(Landroid/view/KeyEvent;)Z", ev);
     }
     claim(env, n, InputClaim::Key, ev);
+    keep_key(env, &n.shared, ev);
     1
 });
+
+/// The provider's WebView and its WebViewClient (a default `WebViewClient` when the app set none: Chromium's adapter uses a null-object client the same way), as local refs; None once the WebView was collected.
+fn view_and_client(env: Env, shared: &Shared) -> Option<(Obj, Obj)> {
+    let provider = jni_call!(env, NewLocalRef, shared.provider.get() as Obj);
+    if provider.is_null() {
+        return None;
+    }
+    let web_view = object_field(env, provider, c"mWebView", c"Landroid/webkit/WebView;");
+    let mut client = object_field(
+        env,
+        provider,
+        c"mWebViewClient",
+        c"Landroid/webkit/WebViewClient;",
+    );
+    delete_local(env, provider);
+    if client.is_null() {
+        client = new_object(env, c"android/webkit/WebViewClient", c"()V", &[]);
+    }
+    if client.is_null() || web_view.is_null() {
+        for o in [web_view, client] {
+            delete_local(env, o);
+        }
+        return None;
+    }
+    Some((web_view, client))
+}
+
+/// WebViewClient.shouldOverrideKeyEvent(view, ev): the app takes the key from the page.
+fn should_override_key(env: Env, shared: &Shared, ev: Obj) -> bool {
+    let Some((web_view, client)) = view_and_client(env, shared) else {
+        return false;
+    };
+    let r = call_bool(
+        env,
+        client,
+        c"shouldOverrideKeyEvent",
+        c"(Landroid/webkit/WebView;Landroid/view/KeyEvent;)Z",
+        &[l(web_view), l(ev)],
+    );
+    raise_uncaught(env);
+    for o in [web_view, client] {
+        delete_local(env, o);
+    }
+    r
+}
+
+/// Keeps a copy of claimed key `ev` (the framework recycles the original after dispatch) for its unhandled report; a release whose press was already reported unhandled is reported now.
+fn keep_key(env: Env, shared: &Shared, ev: Obj) {
+    let t = call_long(env, ev, c"getEventTimeNanos", c"()J");
+    let action = call_int(env, ev, c"getAction", c"()I", &[]);
+    let code = call_int(env, ev, c"getKeyCode", c"()I", &[]);
+    let copy = new_object(
+        env,
+        c"android/view/KeyEvent",
+        c"(Landroid/view/KeyEvent;)V",
+        &[l(ev)],
+    );
+    if copy.is_null() {
+        raise_uncaught(env);
+        return;
+    }
+    let global = jni_call!(env, NewGlobalRef, copy) as usize;
+    delete_local(env, copy);
+    let pressed_unhandled = action == KEY_ACTION_UP && {
+        let mut p = shared.unhandled_presses.borrow_mut();
+        let found = p.iter().position(|c| *c == code).map(|i| p.remove(i));
+        found.is_some()
+    };
+    if pressed_unhandled {
+        report_unhandled(env, shared, global);
+        return;
+    }
+    let evicted = {
+        let mut keys = shared.keys.borrow_mut();
+        let evicted = (keys.len() == KEPT_KEYS)
+            .then(|| keys.pop_front())
+            .flatten();
+        keys.push_back((t, global, action, code));
+        evicted
+    };
+    if let Some((_, g, ..)) = evicted {
+        jni_call!(env, DeleteGlobalRef, g as Obj);
+    }
+}
+
+/// The page left the press stamped `t` unhandled (WebEvent::UnhandledKey): it goes to the app, then its release (claimed already, or when it comes). WebKitGTK reports presses only; the release follows
+/// its press's verdict, so SyntheticKeyboardHandler gets the pair a fallback needs (a back press acts on the up). A page that handled the press (an Esc handler) has neither reported.
+fn on_unhandled_key(env: Env, shared: &Shared, t: i64) {
+    let press = {
+        let mut keys = shared.keys.borrow_mut();
+        keys.iter()
+            .position(|(s, _, a, _)| *s == t && *a == KEY_ACTION_DOWN)
+            .and_then(|i| keys.remove(i))
+    };
+    let Some((_, global, _, code)) = press else {
+        tracing::warn!("webview: unhandled key {t}: no kept press with that stamp");
+        return;
+    };
+    report_unhandled(env, shared, global);
+    let release = {
+        let mut keys = shared.keys.borrow_mut();
+        keys.iter()
+            .position(|(s, _, a, c)| *s > t && *a == KEY_ACTION_UP && *c == code)
+            .and_then(|i| keys.remove(i))
+    };
+    match release {
+        Some((_, g, ..)) => report_unhandled(env, shared, g),
+        None => {
+            let mut p = shared.unhandled_presses.borrow_mut();
+            if !p.contains(&code) {
+                p.push(code);
+            }
+        }
+    }
+}
+
+/// WebViewClient.onUnhandledKeyEvent(view, key) with the kept copy `global` (released after: the framework queue holds its own reference). Its default re-dispatches through
+/// ViewRootImpl.dispatchUnhandledInputEvent -> SyntheticKeyboardHandler, which sends the key map's fallback (Esc -> BACK with the desktop's esc-back map).
+fn report_unhandled(env: Env, shared: &Shared, global: usize) {
+    let key = global as Obj;
+    if let Some((web_view, client)) = view_and_client(env, shared) {
+        let code = call_int(env, key, c"getKeyCode", c"()I", &[]);
+        let action = call_int(env, key, c"getAction", c"()I", &[]);
+        tracing::info!("webview: unhandled key code={code} action={action} -> onUnhandledKeyEvent");
+        call_void(
+            env,
+            client,
+            c"onUnhandledKeyEvent",
+            c"(Landroid/webkit/WebView;Landroid/view/KeyEvent;)V",
+            &[l(web_view), l(key)],
+        );
+        raise_uncaught(env);
+        for o in [web_view, client] {
+            delete_local(env, o);
+        }
+    }
+    jni_call!(env, DeleteGlobalRef, key);
+}
 
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_onFocusChanged, (env, n, focused: u8, _direction: i32, _previous: Obj) -> () = (), {
     let _ = env;
