@@ -1668,10 +1668,11 @@ fn on_unhandled_key(env: Env, shared: &Shared, t: i64) {
         return;
     };
     report_unhandled(env, shared, global);
+    // `>=`: the toolkit's clock is ms, so a quick release can carry its press's very stamp
     let release = {
         let mut keys = shared.keys.borrow_mut();
         keys.iter()
-            .position(|(s, _, a, c)| *s > t && *a == KEY_ACTION_UP && *c == code)
+            .position(|(s, _, a, c)| *s >= t && *a == KEY_ACTION_UP && *c == code)
             .and_then(|i| keys.remove(i))
     };
     match release {
