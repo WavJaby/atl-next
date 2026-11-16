@@ -22,6 +22,7 @@ use atl_services_types::native_libs::{LIB_DIR_NAME, SupportedAbi};
 
 use crate::nested_wayland::NestedCompositor;
 use crate::{arches, drive, manifest, observe, remote, test_apks, verdict, window};
+use xtask::timing;
 
 /// The app process's log line for a presented frame (atl-composer ui_window.rs, debug level: UI mode enables it).
 pub(crate) const PRESENT_LINE: &str = "atl-composer: ui: present";
@@ -193,16 +194,19 @@ pub(crate) fn run_on(
     let work = rt.out.join("run-apk");
     std::fs::create_dir_all(&work)?;
     // without --hold nobody watches the window: it maps in the gate's own compositor, which outlives atld (declared before it)
-    let nested = match (args.hold, &steps) {
-        (Some(_), _) => None,
-        (None, Some(_)) => Some(NestedCompositor::start_placed(&work.join("nested"))?),
-        (None, None) => Some(NestedCompositor::start(&work.join("nested"))?),
-    };
-    // a script's input goes through the proxy
-    let proxy = match (&nested, &steps) {
-        (Some(n), Some(_)) => Some(window::start_proxy(&n.socket)?),
-        _ => None,
-    };
+    let (nested, proxy) = timing::phase("run: compositor", || -> Result<_> {
+        let nested = match (args.hold, &steps) {
+            (Some(_), _) => None,
+            (None, Some(_)) => Some(NestedCompositor::start_placed(&work.join("nested"))?),
+            (None, None) => Some(NestedCompositor::start(&work.join("nested"))?),
+        };
+        // a script's input goes through the proxy
+        let proxy = match (&nested, &steps) {
+            (Some(n), Some(_)) => Some(window::start_proxy(&n.socket)?),
+            _ => None,
+        };
+        Ok((nested, proxy))
+    })?;
     // the display at the rate of the compositor the window maps on; on a copy, so the shared runtime keeps no run's wiring
     let rt = match (&nested, &proxy) {
         (Some(n), Some(p)) => rt
@@ -215,7 +219,7 @@ pub(crate) fn run_on(
             .with_display(n.display().to_arg()),
         (None, _) => rt.clone().with_display(run_display().to_arg()),
     };
-    let m = package(&rt, &files, pin, &args.target)?;
+    let m = timing::phase("run: package", || package(&rt, &files, pin, &args.target))?;
     let run = run_of(&work, files, &m, &args.log_tags);
     let app_log = run.log(&m.name);
     let services_log = run.log("services");
@@ -225,12 +229,22 @@ pub(crate) fn run_on(
     // a pointer script runs from the first present: the run lasts at least its waits plus the watch, and faults count from the last resume to the run's end
     let script_ms = args.pointer.as_deref().map_or(0, script_wait_ms);
     let started = Instant::now();
-    let mut atld = rt.start_atld(&run)?;
+    let mut atld = timing::phase("run: atld start", || rt.start_atld(&run))?;
+    let booted = Instant::now();
+    let mut resumed_at = None;
+    let mut presented_at = None;
+    let mut done_at = None;
     let mut ended = None;
     let mut complete = false;
     let mut driven = None;
     loop {
         let services = read(&services_log);
+        if resumed_at.is_none() && last_resumed(&services).is_some() {
+            resumed_at = Some(Instant::now());
+        }
+        if presented_at.is_none() && presented_since(&read(&app_log), 0) > 0 {
+            presented_at = Some(Instant::now());
+        }
         let scripted = started.elapsed() >= Duration::from_millis(script_ms + watch_ms);
         let done = scripted
             && last_resumed(&services).is_some_and(|r| {
@@ -240,6 +254,7 @@ pub(crate) fn run_on(
             });
         if done {
             complete = true;
+            done_at = Some(Instant::now());
             if let (Some(steps), Some(proxy), Some(nested)) = (&steps, &proxy, &nested) {
                 let target = drive::Target {
                     proxy,
@@ -249,7 +264,7 @@ pub(crate) fn run_on(
                     alive: &|| !run.app_ended(),
                     break_blank: args.break_blank_capture,
                 };
-                driven = Some(drive::run(steps, target));
+                driven = Some(timing::phase("run: script", || drive::run(steps, target)));
             }
             break;
         }
@@ -267,9 +282,33 @@ pub(crate) fn run_on(
         }
         std::thread::sleep(window::POLL);
     }
+    // boot: start_atld's return to the app's resume, then to its first present; watch: the first present to the script's start, or to the loop's end
+    let loop_end = Instant::now();
+    let resumed = resumed_at.unwrap_or(presented_at.unwrap_or(loop_end));
+    timing::add(
+        "run: boot to activity resumed",
+        resumed.saturating_duration_since(booted),
+    );
+    if let Some(from) = resumed_at {
+        timing::add(
+            "run: resumed to first present",
+            presented_at
+                .unwrap_or(loop_end)
+                .saturating_duration_since(from),
+        );
+    }
+    if let Some(from) = presented_at {
+        timing::add(
+            "run: watch",
+            done_at.unwrap_or(loop_end).saturating_duration_since(from),
+        );
+    }
     if ended.is_none() {
-        window::stop_apps(atld.id());
-        run.stop(&mut atld)?;
+        timing::phase("run: stop", || -> Result<()> {
+            window::stop_apps(atld.id());
+            run.stop(&mut atld)?;
+            Ok(())
+        })?;
     }
     let app = read(&app_log);
     let services = read(&services_log);

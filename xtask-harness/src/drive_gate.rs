@@ -8,6 +8,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, ensure};
 use atl_services_types::native_libs::SupportedAbi;
+use xtask::timing;
 
 use crate::atld_run::{PackageFile, Runtime};
 use crate::screencopy::Image;
@@ -139,10 +140,21 @@ impl<'a> Gate<'a> {
 
 /// `cargo xtask check`'s form (check step drive-tap): one widgets run, first shot non-uniform (drive's own blank check) + one tap that changes pixels.
 /// Catches a covered / unmapped window (blank first shot) and lost input (no change); the quadrants and the still-picture shots stay in `xtask test drive`.
+/// Prints the phase report on stderr (the check log shows it), also when the run fails: the phases say where the time went up to it.
 pub fn quick(root: &Path, host: &str, out: &Path) -> Result<()> {
-    let gate = Gate::new(root, host, Some(out.to_owned()), None, false)?;
-    let widgets = gate.apk(window::WIDGETS_FIXTURE, "apk-widgets")?;
-    let gate = gate.stage(&[&widgets])?;
+    let result = timing::phase("drive-tap", || quick_run(root, host, out));
+    eprintln!("{}", timing::report("drive-tap").trim_end());
+    result
+}
+
+fn quick_run(root: &Path, host: &str, out: &Path) -> Result<()> {
+    let gate = timing::phase("runtime: new", || {
+        Gate::new(root, host, Some(out.to_owned()), None, false)
+    })?;
+    let widgets = timing::phase("apk: build and sign", || {
+        gate.apk(window::WIDGETS_FIXTURE, "apk-widgets")
+    })?;
+    let gate = timing::phase("stage: configure", || gate.stage(&[&widgets]))?;
     let (first, before, after) = (
         gate.work.join("first.png"),
         gate.work.join("before.png"),
@@ -151,16 +163,18 @@ pub fn quick(root: &Path, host: &str, out: &Path) -> Result<()> {
     let (x, y) = BUTTON;
     // the first shot is the blank check at first present; the tap and its comparison wait SETTLE_MS each side, as `run`'s tap stage:
     // 300 ms after the very first present failed 3/6 under load (dfs-loopL: tap delivered, a frame came, no pixel changed)
-    let code = gate.drive(
-        &widgets,
-        "tap.drive",
-        format!(
-            "shot {}\nwait {SETTLE_MS}\nshot {}\ntap {x} {y}\nwait-frames 1\nwait {SETTLE_MS}\nshot {}\n",
-            first.display(),
-            before.display(),
-            after.display()
-        ),
-    )?;
+    let code = timing::phase("drive: run-apk", || {
+        gate.drive(
+            &widgets,
+            "tap.drive",
+            format!(
+                "shot {}\nwait {SETTLE_MS}\nshot {}\ntap {x} {y}\nwait-frames 1\nwait {SETTLE_MS}\nshot {}\n",
+                first.display(),
+                before.display(),
+                after.display()
+            ),
+        )
+    })?;
     ensure!(code == ExitCode::SUCCESS, "the tap drive failed");
     let changed = changed_pixels(&Image::read_png(&before)?, &Image::read_png(&after)?);
     ensure!(changed > 0, "the tap changed no pixel");

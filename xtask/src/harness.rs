@@ -3,8 +3,13 @@
 //! It links the product crates, whose build scripts read fetched trees (bionic headers, native_bridge.h), so it builds only after `xtask fetch`; this tool must not link it.
 
 use std::ffi::OsString;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
+use std::thread;
+use std::time::Instant;
+
+use crate::timing::secs;
 
 use anyhow::{Context, Result, bail};
 use atl_layout::Layout;
@@ -68,8 +73,10 @@ pub fn pass_through(root: &Path, name: &str, args: &[OsString]) -> Result<ExitCo
 pub const SKIP_PREFIX: &str = "skip: ";
 
 /// Runs harness check step `step` on build dir `out`: `Some(why)` when it skipped, an error with its output when it failed.
+/// The harness's stderr (its phase report, lock waits, cargo's lines) shows as it arrives, so the check log has it; a failure's error carries it too.
 pub fn check_step(root: &Path, step: &str, out: &Path) -> Result<Option<String>> {
-    let run = command(
+    let built = Instant::now();
+    let mut cmd = command(
         root,
         [
             OsString::from("check-step"),
@@ -77,16 +84,56 @@ pub fn check_step(root: &Path, step: &str, out: &Path) -> Result<Option<String>>
             "--out".into(),
             out.into(),
         ],
-    )?
-    .output()
-    .with_context(|| format!("spawning xtask-harness check-step {step}"))?;
+    )?;
+    let build_took = built.elapsed();
+    let started = Instant::now();
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawning xtask-harness check-step {step}"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("xtask-harness stderr is not piped")?;
+    let shown = thread::spawn(move || show_and_keep(stderr));
+    let run = child
+        .wait_with_output()
+        .with_context(|| format!("waiting for xtask-harness check-step {step}"))?;
+    let stderr = shown.join().unwrap_or_default();
+    // outside the harness's own phase report: the xtask-side build of the harness (a no-op when current) and the process's wall time
+    eprintln!(
+        "check-step {step}: harness build {}, harness process {}",
+        secs(build_took),
+        secs(started.elapsed())
+    );
     let stdout = String::from_utf8_lossy(&run.stdout);
     if !run.status.success() {
-        let stderr = String::from_utf8_lossy(&run.stderr);
         bail!("{}\n{}", stdout.trim_end(), stderr.trim_end());
     }
     Ok(stdout
         .lines()
         .find_map(|l| l.strip_prefix(SKIP_PREFIX))
         .map(str::to_owned))
+}
+
+/// Copies `from` to our stderr line by line as it arrives; returns what it copied.
+fn show_and_keep(from: impl Read) -> String {
+    let mut kept = String::new();
+    let mut reader = BufReader::new(from);
+    let mut raw = Vec::new();
+    loop {
+        raw.clear();
+        match reader.read_until(b'\n', &mut raw) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let line = String::from_utf8_lossy(&raw);
+                let mut err = std::io::stderr().lock();
+                // a closed stderr loses the echo, not the capture
+                let _ = err.write_all(line.as_bytes()).and_then(|()| err.flush());
+                kept.push_str(&line);
+            }
+        }
+    }
+    kept
 }

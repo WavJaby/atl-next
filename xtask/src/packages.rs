@@ -690,8 +690,8 @@ impl<'a> Selection<'a> {
 
 /// Builds every package of `root` whose converter modules `out`'s graph.json holds (printing the others with the module they lack) and checks their executables; what was built.
 pub fn build(root: &Path, out: &Path) -> Result<Vec<Built>> {
-    let packages = workspace_packages(root)?;
-    let sel = Selection::new(root, out, &packages)?;
+    let packages = crate::timing::phase("packages::metadata", || workspace_packages(root))?;
+    let sel = crate::timing::phase("packages::select", || Selection::new(root, out, &packages))?;
     for (p, m) in &sel.skipped {
         println!(
             "native: package {} not built: the goals' closure lacks {m}",
@@ -701,10 +701,12 @@ pub fn build(root: &Path, out: &Path) -> Result<Vec<Built>> {
     if sel.selected.is_empty() {
         return Ok(Vec::new());
     }
-    let status = crate::unit_use::status(&mut sel.cargo("build", &sel.target)?)
-        .context("running cargo build (converter packages)")?;
+    let status = crate::timing::phase("packages::cargo build", || {
+        crate::unit_use::status(&mut sel.cargo("build", &sel.target)?)
+            .context("running cargo build (converter packages)")
+    })?;
     ensure!(status.success(), "building {} failed", sel.names());
-    sel.lint()?;
+    crate::timing::phase("packages::clippy", || sel.lint())?;
     let mut built = Vec::new();
     for p in sel.selected.iter().copied() {
         let leading = leading_needed(p, &sel.graph)?;
@@ -757,7 +759,7 @@ pub fn check(root: &Path, out: &Path) -> Result<Vec<String>> {
 
 /// Executable `bin` of `package`, built as `build` builds it; fails when the graph lacks the package's modules.
 pub fn bin(root: &Path, out: &Path, package: &str, bin: &str) -> Result<PathBuf> {
-    build(root, out)?
+    crate::timing::phase("packages::bin", || build(root, out))?
         .into_iter()
         .find(|b| b.package == package)
         .with_context(|| {

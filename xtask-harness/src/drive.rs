@@ -190,7 +190,7 @@ pub fn run(steps: &[Step], target: Target<'_>) -> Result<()> {
     };
     for (index, step) in steps.iter().enumerate() {
         println!("drive: step {}: {step:?}", index + 1);
-        d.step(step)
+        xtask::timing::phase(step_phase(step), || d.step(step))
             .with_context(|| format!("step {} {step:?}", index + 1))?;
         ensure!(
             (d.t.alive)(),
@@ -199,6 +199,23 @@ pub fn run(steps: &[Step], target: Target<'_>) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The phase a script step's time counts in: waits and shots on the app's own clock, input, resizes.
+fn step_phase(step: &Step) -> &'static str {
+    match step {
+        Step::Wait(_) => "script: wait",
+        Step::WaitFrames(_) => "script: wait frames",
+        Step::Shot(_) => "script: shot",
+        Step::Resize(..) => "script: resize",
+        Step::Tap(..)
+        | Step::Touch(..)
+        | Step::TouchSwipe { .. }
+        | Step::Leave
+        | Step::Swipe { .. }
+        | Step::Key(_)
+        | Step::KeyHalf(..) => "script: input",
+    }
 }
 
 impl Driver<'_> {

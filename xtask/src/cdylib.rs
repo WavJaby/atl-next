@@ -27,7 +27,7 @@ pub fn stage_with(
             None => cmd.env_remove(k),
         };
     }
-    let status = crate::unit_use::status(&mut cmd)?;
+    let status = crate::timing::phase("cdylib stage", || crate::unit_use::status(&mut cmd))?;
     ensure!(status.success(), "building {package} failed");
     let dir = out.join(dir);
     std::fs::create_dir_all(&dir)?;

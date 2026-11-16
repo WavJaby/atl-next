@@ -154,12 +154,16 @@ impl HostArt {
         let java_out = crate::out::out_dir(root, java_out)?;
         let (d8, jdk) = java_tools(root, &java_out)?;
         let art = out.join(stage);
-        let lib_path = stage_art(out, &art, &tree::shared_tree(&layout), arch.pointer_bits)?;
+        let lib_path = crate::timing::phase("host art: stage ART", || {
+            stage_art(out, &art, &tree::shared_tree(&layout), arch.pointer_bits)
+        })?;
         let h = HostArt {
             art,
             lib_path,
             launcher: packages::bin(root, out, LAUNCHER, LAUNCHER)?,
-            property_service: build_property_service(root, &out.join("cargo"))?,
+            property_service: crate::timing::phase("host art: property service", || {
+                build_property_service(root, &out.join("cargo"))
+            })?,
             build_prop: out.join(BUILD_PROP),
             boot: boot_jars(&java_out)?,
             javac_boot: javac_boot(&java_out),

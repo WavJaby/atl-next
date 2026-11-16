@@ -16,13 +16,16 @@ use std::io::{BufRead, BufReader, ErrorKind, IsTerminal, Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::{Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 use rustix::fs::{FlockOperation, flock};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::{cargo_lock, timing};
 
 /// JSON messages on stdout; diagnostics stay rendered on stderr.
 const MESSAGE_FORMAT: &str = "--message-format=json-render-diagnostics";
@@ -87,6 +90,10 @@ pub struct Run {
 
 /// Runs `cmd` and returns its [`Run`]. A recorded run records its units whatever the status: a failed build still reports the units it finished. `cmd` may be a wrapper (`timeout -s KILL <secs> cargo ...`): the flag goes before its first `--`.
 pub fn run(cmd: &mut Command, units: Units, echo: Echo) -> Result<Run> {
+    timing::phase("cargo: process", || run_process(cmd, units, echo))
+}
+
+fn run_process(cmd: &mut Command, units: Units, echo: Echo) -> Result<Run> {
     let mut child_cmd = with_units(cmd, units)?;
     child_cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     if echo == Echo::Both {
@@ -106,7 +113,8 @@ pub fn run(cmd: &mut Command, units: Units, echo: Echo) -> Result<Run> {
     // stderr is drained beside stdout: a full stderr pipe would block cargo
     let stderr_pipe = child.stderr.take().context("cargo stderr is not piped")?;
     let show_stderr = echo == Echo::Both;
-    let stderr = thread::spawn(move || drain(stderr_pipe, show_stderr));
+    let target = cargo_lock::target_dir(cmd);
+    let stderr = thread::spawn(move || drain(stderr_pipe, show_stderr, target));
     let stdout_pipe = child.stdout.take().context("cargo stdout is not piped")?;
     let mut reader = BufReader::new(stdout_pipe);
     let mut text = String::new();
@@ -141,7 +149,8 @@ pub fn run(cmd: &mut Command, units: Units, echo: Echo) -> Result<Run> {
     let status = child.wait().context("waiting for cargo")?;
     let stderr = stderr.join().unwrap_or_default();
     if units == Units::Recorded {
-        record(&messages, now()?).context("recording cargo unit use")?;
+        timing::phase("cargo: record units", || record(&messages, now()?))
+            .context("recording cargo unit use")?;
     }
     Ok(Run {
         status,
@@ -169,26 +178,60 @@ pub fn exec(cmd: &mut Command, what: &str) -> Result<()> {
 }
 
 /// Reads `from` to its end. With `show`, each chunk also goes to our stderr as it arrives; a failed write stops the showing, never the capture.
-fn drain(mut from: impl Read, show: bool) -> String {
+/// The same bytes carry cargo's lock waits (`cargo_lock`): each closed wait goes to the phase clock, and a wait past the threshold is announced while it lasts.
+fn drain(mut from: impl Read, show: bool, target: Option<PathBuf>) -> String {
     let mut captured = Vec::new();
     let mut chunk = [0u8; TEE_CHUNK];
     let mut showing = show;
-    loop {
-        match from.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => {
-                captured.extend_from_slice(&chunk[..n]);
-                if showing {
-                    let mut err = std::io::stderr().lock();
-                    let written = err.write_all(&chunk[..n]);
-                    showing = written.and_then(|()| err.flush()).is_ok();
+    let watch = Mutex::new(cargo_lock::Watch::default());
+    let (done, watching) = mpsc::channel::<()>();
+    let (watch_ref, target_ref) = (&watch, target.as_deref());
+    thread::scope(|s| {
+        s.spawn(move || announce_waits(watch_ref, &watching, target_ref));
+        loop {
+            match from.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    captured.extend_from_slice(&chunk[..n]);
+                    if showing {
+                        let mut err = std::io::stderr().lock();
+                        let written = err.write_all(&chunk[..n]);
+                        showing = written.and_then(|()| err.flush()).is_ok();
+                    }
+                    record_waits(lock(watch_ref).feed(&chunk[..n], Instant::now()));
                 }
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(_) => break,
             }
-            Err(e) if e.kind() == ErrorKind::Interrupted => {}
-            Err(_) => break,
+        }
+        record_waits(lock(watch_ref).finish(Instant::now()));
+        drop(done);
+    });
+    String::from_utf8_lossy(&captured).into_owned()
+}
+
+fn record_waits(ended: impl IntoIterator<Item = cargo_lock::Ended>) {
+    for wait in ended {
+        timing::record_wait(&wait.what, wait.took, wait.holder);
+    }
+}
+
+/// Announces the open wait once it passes the threshold; returns when `watching` disconnects (the stream ended).
+fn announce_waits(
+    watch: &Mutex<cargo_lock::Watch>,
+    watching: &mpsc::Receiver<()>,
+    target: Option<&Path>,
+) {
+    while let Err(mpsc::RecvTimeoutError::Timeout) = watching.recv_timeout(cargo_lock::TICK) {
+        let line = lock(watch).announce(Instant::now(), |what| cargo_lock::holder_of(what, target));
+        if let Some(line) = line {
+            eprintln!("cargo lock: {line}");
         }
     }
-    String::from_utf8_lossy(&captured).into_owned()
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// `cmd` as a new command, with the message format added before its first `--` (clippy's `-- -D warnings` must not receive it). `Recorded` refuses a `--message-format` the caller set: the run owns it.

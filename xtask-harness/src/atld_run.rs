@@ -543,7 +543,9 @@ pub fn run_display() -> DisplayModel {
 /// `package`'s `bin`, built plainly (release) into `out`'s cargo target dir, for a cross host's out dir that host's (cdylib::release_build); its path.
 fn cargo_bin(root: &Path, out: &Path, package: &str) -> Result<PathBuf> {
     let (mut cmd, release) = crate::cdylib::release_build(root, out, package)?;
-    crate::unit_use::exec(cmd.arg("--locked"), &format!("cargo build -p {package}"))?;
+    xtask::timing::phase("cargo_bin", || {
+        crate::unit_use::exec(cmd.arg("--locked"), &format!("cargo build -p {package}"))
+    })?;
     Ok(release.join(package))
 }
 
@@ -698,7 +700,9 @@ impl Runtime {
             (None, Some(_)) => out.clone(),
             (java_out, _) => out::out_dir(root, java_out)?,
         };
-        let art = HostArt::new(root, host, Some(&java_out), &out, stage, verbose)?;
+        let art = xtask::timing::phase("runtime: host art", || {
+            HostArt::new(root, host, Some(&java_out), &out, stage, verbose)
+        })?;
         let servicemanager = out.join("device/servicemanager/servicemanager");
         ensure!(
             servicemanager.is_file(),

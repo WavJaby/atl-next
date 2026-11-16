@@ -18,6 +18,7 @@ pub mod bootstrap_gate;
 pub mod build_pool;
 pub mod build_state;
 pub mod bwrap_flags;
+pub mod cargo_lock;
 pub mod cdylib;
 pub mod check;
 pub mod codec2_store;
