@@ -2,6 +2,7 @@
 //! Machine-wide admission: a weighted pool of CPU slots and memory (GiB). Heavy work holds a [`Grant`] around one leaf (a ninja build, a cargo run) and releases it after.
 //! A slot is an exclusive `flock` on `<workspace>/cache/build-pool/cpu-<i>` or `mem-<i>`: the kernel drops it when the holder's file closes, so exit, error, panic and SIGKILL all free it -- no stale-lock cleanup exists or is needed.
 //! Waiters queue as tickets in `cache/build-pool/queue/`; the oldest live ticket is served first, so a large request is not starved by small ones behind it.
+//! Light work takes no ticket: a free CPU slot serves it at once (`acquire_with`).
 //! A grant takes CPU elastically (the free slots up to the class max, at least its min); the count is the tool's job count (ninja `-j`, cargo `CARGO_BUILD_JOBS`).
 //! Nested admission is refused: a thread holding a grant, or a process with a holder among its ancestors, would wait for slots its own holder keeps.
 //! Sizes and weights: `[pool]` in `workspace.toml` (ws_config.rs); the defaults and their derivation are on [`Class::default_weight`].
@@ -37,7 +38,7 @@ pub enum Class {
     Cargo,
     /// a runtime gate: the product's processes plus the cargo and JVM work around them
     Harness,
-    /// static checks
+    /// static checks: one CPU slot, no queue place (`acquire_with`). Held while a check reads the checkouts' git dirs; the migrate quiet window (git_dirs.rs `migrate`) refuses on that hold.
     Light,
 }
 
@@ -166,13 +167,20 @@ fn acquire_with(
     std::fs::create_dir_all(&queue).with_context(|| format!("creating {}", queue.display()))?;
     check_nesting(&pool, &dir)?;
     let record = holder_record(who, class.name());
-    let ticket = Ticket::new(&queue, std::process::id())?;
+    // light takes no ticket: a heavy head queued for memory must not hold back a free CPU slot, and one light slot cannot starve it
+    let ticket = match class {
+        Class::Light => None,
+        _ => Some(Ticket::new(&queue, std::process::id())?),
+    };
     let started = Instant::now();
     let mut waited = false;
     loop {
-        let (ahead, queued) = scan(&queue, &ticket.name)?;
+        let queue_state = match &ticket {
+            Some(t) => Some(scan(&queue, &t.name)?),
+            None => None,
+        };
         // the head of the queue gathers; nobody behind it is served
-        if ahead == 0
+        if queue_state.is_none_or(|(ahead, _)| ahead == 0)
             && let Some((cpu, files)) = try_grant(&dir, &pool, w, &record)?
         {
             let waited = if waited {
@@ -202,7 +210,7 @@ fn acquire_with(
         if !waited {
             waited = true;
             let snap = snapshot(&dir, &pool)?;
-            report(&wait_line(class, w, &pool, &snap, (ahead, queued)));
+            report(&wait_line(class, w, &pool, &snap, queue_state));
         }
         std::thread::sleep(poll);
     }
@@ -529,10 +537,14 @@ fn wait_line(
     w: ClassWeight,
     pool: &PoolConfig,
     snap: &Snapshot,
-    queue: (usize, usize),
+    queue: Option<(usize, usize)>,
 ) -> String {
+    let queue = match queue {
+        Some((ahead, queued)) => format!("queue {queued} ({ahead} ahead)"),
+        None => "queue bypassed".to_owned(),
+    };
     format!(
-        "pool: {} wants cpu >={} mem {} GiB, free cpu {}/{} mem {}/{}, queue {} ({} ahead); held: {}",
+        "pool: {} wants cpu >={} mem {} GiB, free cpu {}/{} mem {}/{}, {queue}; held: {}",
         class.name(),
         w.cpu_min,
         w.mem_gib,
@@ -540,8 +552,6 @@ fn wait_line(
         pool.cpu_slots.value,
         snap.free_mem,
         pool.mem_gib.value,
-        queue.1,
-        queue.0,
         snap.held_list()
     )
 }
@@ -718,19 +728,24 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Waiters are granted in arrival order: each one's wait line means its ticket is queued before the next one arrives, and no later waiter is granted before an earlier one released.
+    /// Heavy waiters are granted in arrival order: each one's wait line means its ticket is queued before the next one arrives, and no later waiter is granted before an earlier one released. Cargo stands in for the heavy classes; light takes no ticket (the next test).
     #[test]
     fn waiters_are_served_in_arrival_order() {
-        let ws = scratch_ws("fifo", Some("[pool]\ncpu_slots = 1\nmem_gib = 1\n"));
-        let holder = acquire_with(&ws, Path::new("holder"), Class::Light, FAST, &mut |_| {
+        let ws = scratch_ws(
+            "fifo",
+            Some(
+                "[pool]\ncpu_slots = 1\nmem_gib = 1\n[pool.cargo]\ncpu_min = 1\ncpu_max = 1\nmem_gib = 0\n",
+            ),
+        );
+        let holder = acquire_with(&ws, Path::new("holder"), Class::Cargo, FAST, &mut |_| {
             panic!("holder waited")
         })
         .unwrap();
         let mut queued = Vec::new();
         for who in ["a", "b", "c"] {
-            let c = contender(&ws, who, Class::Light);
+            let c = contender(&ws, who, Class::Cargo);
             let line = c.waits.recv_timeout(WAIT).expect("no wait line");
-            assert!(line.contains("wants cpu >=1 mem 0 GiB"), "{line}");
+            assert!(line.contains("cargo wants cpu >=1 mem 0 GiB"), "{line}");
             queued.push(c);
         }
         drop(holder);
@@ -746,6 +761,48 @@ mod tests {
             }
             c.release.send(()).unwrap();
         }
+    }
+
+    /// Light takes a free CPU slot while a heavy request queues ahead of it: the heavy head waits for memory the holder keeps, and light gets the slot the head cannot use. With no slot free, light waits (queue bypassed) and runs when one frees, still ahead of the heavy head.
+    #[test]
+    fn light_takes_a_free_slot_past_a_queued_heavy_request() {
+        let ws = scratch_ws(
+            "light-bypass",
+            Some(
+                "[pool]\ncpu_slots = 2\nmem_gib = 1\n[pool.cargo]\ncpu_min = 1\ncpu_max = 1\nmem_gib = 1\n",
+            ),
+        );
+        let holder = contender(&ws, "holder", Class::Cargo);
+        assert_eq!(holder.granted.recv_timeout(WAIT).unwrap(), "cpu 1 mem 1");
+        let heavy = contender(&ws, "heavy", Class::Cargo);
+        let line = heavy
+            .waits
+            .recv_timeout(WAIT)
+            .expect("the heavy request did not wait");
+        assert!(line.contains("cargo wants cpu >=1 mem 1 GiB"), "{line}");
+        // a CPU slot is free and the queued heavy request cannot use it (no memory)
+        let light = contender(&ws, "light", Class::Light);
+        assert_eq!(light.granted.recv_timeout(WAIT).unwrap(), "cpu 1 mem 0");
+        assert!(
+            light.waits.try_recv().is_err(),
+            "light waited with a slot free"
+        );
+        // no slot free now: light waits, its line names no queue position
+        let light2 = contender(&ws, "light2", Class::Light);
+        let line = light2
+            .waits
+            .recv_timeout(WAIT)
+            .expect("light2 did not wait with no slot free");
+        assert!(
+            line.contains("light wants cpu >=1 mem 0 GiB") && line.contains("queue bypassed"),
+            "{line}"
+        );
+        light.release.send(()).unwrap();
+        assert_eq!(light2.granted.recv_timeout(WAIT).unwrap(), "cpu 1 mem 0");
+        light2.release.send(()).unwrap();
+        holder.release.send(()).unwrap();
+        assert_eq!(heavy.granted.recv_timeout(WAIT).unwrap(), "cpu 1 mem 1");
+        heavy.release.send(()).unwrap();
     }
 
     /// Memory admits two full natives (7 GiB each of 20) and not a third; the third's wait line names the memory.

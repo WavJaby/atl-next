@@ -295,7 +295,7 @@ pub fn migrate(scope: &Scope, execute: bool) -> Result<Summary> {
     let src = scope.ws.join("src");
     let tasks = scope.ws.join("src-wt");
     let mut s = Summary::default();
-    // held for the whole run: no leaf build runs while the git dirs move (a quiet window: every pool slot, none waited for).
+    // held for the whole run: no leaf work runs while the git dirs move (a quiet window: every pool slot, none waited for). Static checks hold a light slot and drift reads these git dirs, so light work is refused here too.
     let quiet = match build_pool::try_take_all(scope.ws, Path::new("migrate-git-dirs"))? {
         Ok(q) => Some(q),
         Err(holders) => {
