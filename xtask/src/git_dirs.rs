@@ -3,7 +3,7 @@
 //! `cargo xtask fetch --migrate-git-dirs [--execute]` moves in-tree git dirs there once per workspace: per checkout rename (same filesystem, no copy, no download -- promisor/sparse config moves with the dir), gitfile, `git worktree repair` of its task copies, then HEAD / branch / status / sparse file compared before and after.
 //! Resumable by state, not by a journal: `.git` dir + no store -> migrate; gitfile -> store -> done; no `.git` + store (killed between rename and gitfile) -> write the gitfile, repair; both -> refused, by hand.
 //! A task copy whose pointer still leads to the old place is repaired on every run, so a run killed before its repair finishes on the next.
-//! Quiet window, enforced: `--execute` holds every build-pool token for the run and refuses while another process of this user has a cwd under `src/` / `src-wt/` or is inside a task-copy namespace of this workspace (tree::ENV naming `src-wt/`), and while any git lock exists.
+//! Quiet window, enforced: `--execute` holds every build-pool slot for the run and refuses while another process of this user has a cwd under `src/` / `src-wt/` or is inside a task-copy namespace of this workspace (tree::ENV naming `src-wt/`), and while any git lock exists.
 //! Delete this subcommand (not the gitfile helper) once every workspace is migrated; `fetch` refuses an in-tree git dir until then.
 
 use std::os::unix::fs::MetadataExt;
@@ -269,9 +269,9 @@ fn remove_shadow(dir: &Path) -> Result<()> {
         .with_context(|| format!("{} holds more than a git shadow", dir.display()))
 }
 
-/// Retries for the build-pool tokens: a fork-to-exec window is microseconds to milliseconds, so 5 x 50 ms outlasts it, while a real build holds its token for minutes.
-const TOKEN_TRIES: u32 = 5;
-const TOKEN_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
+/// Retries for the build-pool quiet window: a fork-to-exec window is microseconds to milliseconds, so 5 x 50 ms outlasts it, while a real build holds its slots for minutes.
+const SLOT_TRIES: u32 = 5;
+const SLOT_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// What one run found (and, executed, did).
 #[derive(Debug, Default, PartialEq)]
@@ -299,32 +299,25 @@ pub fn migrate(scope: &Scope, execute: bool) -> Result<Summary> {
     let src = scope.ws.join("src");
     let tasks = scope.ws.join("src-wt");
     let mut s = Summary::default();
-    // held for the whole run: no ninja build starts while the git dirs move.
-    // A few tries: a token's flock is shared with every child the last holder's process forked until that child's exec, so a token released a moment ago can still read as held (seen with parallel tests).
-    let tokens = build_pool::tokens(scope.ws)?;
-    let take = || {
-        build_pool::try_take_all(
-            &build_pool::dir(scope.ws),
-            tokens,
-            &format!("migrate-git-dirs pid {}", std::process::id()),
-        )
-    };
+    // held for the whole run: no leaf build runs while the git dirs move (a quiet window: every pool slot, none waited for).
+    // A few tries: a slot's flock is shared with every child the last holder's process forked until that child's exec, so a slot released a moment ago can still read as held (seen with parallel tests).
+    let take = || build_pool::try_take_all(scope.ws, std::path::Path::new("migrate-git-dirs"));
     let mut taken = take()?;
-    for _ in 0..TOKEN_TRIES {
+    for _ in 0..SLOT_TRIES {
         if taken.is_ok() {
             break;
         }
-        std::thread::sleep(TOKEN_RETRY);
+        std::thread::sleep(SLOT_RETRY);
         taken = take()?;
     }
-    let tokens = match taken {
-        Ok(t) => t,
+    let quiet = match taken {
+        Ok(q) => Some(q),
         Err(holders) => {
             s.problems.push(format!(
                 "{holders} ({})",
                 build_pool::dir(scope.ws).display()
             ));
-            Vec::new()
+            None
         }
     };
     s.problems.extend(busy_processes(&src, &tasks));
@@ -394,7 +387,7 @@ pub fn migrate(scope: &Scope, execute: bool) -> Result<Summary> {
     for sh in &shadows {
         remove_shadow(sh)?;
     }
-    drop(tokens);
+    drop(quiet);
     println!("git-dirs: migrated");
     Ok(s)
 }
@@ -550,7 +543,7 @@ mod tests {
             self.root.join("src").join(d)
         }
 
-        /// Every path under `src/` and `src-wt/` with its file content (dirs as empty): equal listings = nothing changed there. The build pool's token files are not counted: a dry run takes the tokens too.
+        /// Every path under `src/` and `src-wt/` with its file content (dirs as empty): equal listings = nothing changed there. The build pool's slot files are not counted: a dry run takes the slots too.
         fn listing(&self) -> Vec<(PathBuf, Vec<u8>)> {
             fn walk(d: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
                 for e in std::fs::read_dir(d).unwrap().flatten() {
@@ -684,12 +677,25 @@ mod tests {
             assert!(e.contains("refusing"), "{e}");
             assert!(ws.src("qemu/.git").is_dir(), "{what}: migrated anyway");
         };
-        // a held build token
-        let pool = build_pool::dir(&ws.root);
-        let token =
-            build_pool::acquire(&pool, 1, "builder", Duration::from_millis(10), |_| {}).unwrap();
+        // a held pool slot: a light grant from another thread (a thread's own grant would refuse the quiet window as nested)
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let root = ws.root.clone();
+        let holder = std::thread::spawn(move || {
+            let grant = build_pool::acquire(
+                &root,
+                std::path::Path::new("builder"),
+                build_pool::Class::Light,
+            )
+            .unwrap();
+            held_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            drop(grant);
+        });
+        held_rx.recv().unwrap();
         refused("builder");
-        drop(token);
+        go_tx.send(()).unwrap();
+        holder.join().unwrap();
         // a git lock
         let lock = ws.src("qemu/.git/index.lock");
         std::fs::write(&lock, "").unwrap();

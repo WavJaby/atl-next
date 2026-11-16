@@ -146,7 +146,7 @@ min_reason = "observed 2026-11-07; older is untested"
 scope = ["build"]
 used_by = ["xtask:native"]
 
-# build_pool.rs test: a killed holder frees its token, the holder being flock(1)
+# build_pool.rs test: a killed holder frees its slot, the holder being flock(1)
 [flock]
 debian = "util-linux"
 arch = "util-linux"

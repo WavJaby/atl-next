@@ -381,6 +381,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         )?),
         None => None,
     };
+    // compared after the rounds: a rewritten build.ninja means the graph was (re)converted this run
+    let manifest_before = manifest_mtime(&graph_out);
     let mut round = 0;
     loop {
         round += 1;
@@ -513,10 +515,20 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         println!("native: isa tiers: {probed} source(s) probed");
     }
     let log = graph_out.join("ninja.log");
-    // only ninja queues for a machine-wide token (build_pool.rs); the gates below run after it is released
-    let tokens = build_pool::tokens(ws)?;
-    let token = build_pool::acquire_build(ws, root, "native")?;
-    println!("native: build token {} of {tokens}", token.index);
+    // only ninja runs under the grant (build_pool.rs); the gates below run after it is released
+    // a (re)converted graph is a cold-class build (native-full), a warm one native-incr
+    let class = if manifest_mtime(&graph_out) == manifest_before {
+        build_pool::Class::NativeIncr
+    } else {
+        build_pool::Class::NativeFull
+    };
+    let grant = build_pool::acquire(ws, root, class)?;
+    println!(
+        "native: pool {} cpu {} of {}",
+        class.name(),
+        grant.cpu,
+        grant.cpu_of
+    );
     let graph_file = graph_out.join("graph.json");
     let graph: triage::Graph = serde_json::from_str(
         &std::fs::read_to_string(&graph_file)
@@ -527,14 +539,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         runtimes_pass2(root, args, &graph_out, &tree, &graph, p, &env)?;
     }
     let status = Command::new("ninja")
-        .args(["-k", "0", "-C"])
+        .args(["-k", "0", "-j"])
+        .arg(grant.cpu.to_string())
+        .args(["-C"])
         .arg(&graph_out)
         .envs(env.iter().cloned())
         .stdout(std::fs::File::create(&log)?)
         .stderr(std::fs::File::create(graph_out.join("ninja.err"))?)
         .status()
         .context("running ninja")?;
-    drop(token);
+    drop(grant);
     let provided_libs: BTreeSet<&Path> = provided
         .values()
         .chain(partial.values().filter_map(|p| p.provider.as_ref()))
@@ -567,6 +581,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             println!("native: foreign guest graph: workspace packages are the host run's");
             Vec::new()
         } else {
+            // the workspace packages are cargo runs: one cargo grant, its job count reaches cargo_command
+            let _grant = build_pool::acquire(ws, root, build_pool::Class::Cargo)?;
             packages::build(root, &out)?
         };
         for built in packages_built {
@@ -807,7 +823,11 @@ fn runtimes_pass2(
         })
         .collect::<Result<Vec<_>>>()?;
     let log = out.join("ninja-pass2.log");
+    // runs under the native grant (native's ninja, before the main one): its job count is the grant's
+    let jobs = build_pool::held_jobs().context("runtimes pass 2 runs under the native grant")?;
     let status = Command::new("ninja")
+        .args(["-j"])
+        .arg(jobs.to_string())
         .args(["-C"])
         .arg(out)
         .args(&libs)
@@ -1639,6 +1659,13 @@ fn regen_runs(graph: &Path, converter: &Path, args: &Path) -> Result<bool> {
 /// Brings `<out>/build.ninja` up to date with `argv` (the converter's flags and goals): ninja decides whether to convert again, from the regeneration edge's depfile (every file the last conversion read, this argument file among them).
 /// Bootstrap (`bp2ninja -bootstrap`: a build.ninja holding only that edge) when there is no build.ninja, the argument file is new (a build.ninja from before it cannot rerun on it),
 /// or its regeneration edge runs another converter or argument file path: bp2ninja writes its own invocation path into the edge it emits, so a graph converted at another path (a build from before the canonical build path, out::CANONICAL) would regenerate itself with that path forever.
+/// When `build.ninja` was last written; the converter rewrites it only when its output changes (write-if-changed).
+fn manifest_mtime(out: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(out.join("build.ninja"))
+        .and_then(|m| m.modified())
+        .ok()
+}
+
 fn convert(
     converter: &Path,
     out: &Path,

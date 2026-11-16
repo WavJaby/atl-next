@@ -335,10 +335,12 @@ fn remove_if_present(path: &Path) -> Result<()> {
     }
 }
 
-/// Builds `qemu-<target>` (incremental) with ninja.
-fn ninja(b: &Build) -> Result<()> {
+/// Builds `qemu-<target>` (incremental) with ninja, `jobs` wide (the grant's CPU slots).
+fn ninja(b: &Build, jobs: u32) -> Result<()> {
     let log = b.dir.join("ninja.log");
     let status = Command::new(&b.ninja)
+        .arg("-j")
+        .arg(jobs.to_string())
         .arg("-C")
         .arg(b.build_dir())
         .arg(b.exe_name())
@@ -381,12 +383,13 @@ fn check_version(b: &Build) -> Result<()> {
     Ok(())
 }
 
-/// Configures and builds under one build token, then checks the version. Returns the executable.
+/// Configures and builds under one grant, then checks the version. Returns the executable.
 pub fn execute(root: &Path, b: &Build) -> Result<PathBuf> {
     let ws = Layout::of(root)?.workspace().to_owned();
-    let _token = build_pool::acquire_build(&ws, root, "qemu")?;
+    // configure runs on every build, so this is a cold-class ninja graph
+    let grant = build_pool::acquire(&ws, root, build_pool::Class::NativeFull)?;
     configure(b)?;
-    ninja(b)?;
+    ninja(b, grant.cpu)?;
     match &b.cross {
         None => check_version(b)?,
         Some(c) => isa_gate_cross(root, c, &b.exe(), "qemu")?,

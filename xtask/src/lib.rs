@@ -85,9 +85,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-/// `cargo` of the pinned toolchain: `CARGO` is set by `cargo run`.
+/// `cargo` of the pinned toolchain: `CARGO` is set by `cargo run`. Run under a pool grant (build_pool.rs), its job count is the grant's CPU slots.
 pub fn cargo_command() -> std::process::Command {
-    std::process::Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+    let mut cmd =
+        std::process::Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    if let Some(jobs) = build_pool::held_jobs() {
+        cmd.env("CARGO_BUILD_JOBS", jobs.to_string());
+    }
+    cmd
 }
 
 /// The checkout the command runs in (main repo or worktree): the git toplevel of the cwd. Not the checkout that compiled the binary; a binary built in main also runs in worktrees.
