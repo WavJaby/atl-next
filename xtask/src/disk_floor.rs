@@ -2,11 +2,13 @@
 //! Free-space floors of every disk a build writes, checked before `native`: a disk that fills mid-build fails writes far from the cause (ENOSPC in a link step, a torn sccache entry, a vhdx that stops growing).
 //! Disks: the host drive holding the WSL vhdx (`host_disk`, WSL only), the filesystem holding the workspace (src/, cache/ with sccache, out/ logs) and the one holding the build-dir pool (out.rs).
 //! Two of them on one filesystem -> one disk whose floor is the sum: both writers land there. Floors are `[disk]` keys of workspace.toml (ws_config, each default carries its derivation); under one refuses, naming every short disk.
+//! The build-dir pool also has a metadata floor on btrfs (`btrfs_space`): statfs cannot see metadata, which filled while statfs still showed 6-7 GB free.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+use crate::btrfs_space::{self, Headroom};
 use crate::ws_config::WsConfig;
 
 const GIB: u64 = 1 << 30;
@@ -48,8 +50,8 @@ fn merge(rows: Vec<(u64, u64, String, u64)>) -> Vec<Disk> {
     out.into_iter().map(|(_, d)| d).collect()
 }
 
-/// One line per disk; Err naming every disk under its floor.
-fn judge(disks: &[Disk]) -> Result<Vec<String>> {
+/// One line per disk and metadata row; Err naming every short one. A metadata row is `(line, short)`.
+fn judge(disks: &[Disk], metadata: &[(String, bool)]) -> Result<Vec<String>> {
     let mut lines = Vec::new();
     let mut short = Vec::new();
     for d in disks {
@@ -64,9 +66,15 @@ fn judge(disks: &[Disk]) -> Result<Vec<String>> {
         }
         lines.push(line);
     }
+    for (line, is_short) in metadata {
+        if *is_short {
+            short.push(line.clone());
+        }
+        lines.push(line.clone());
+    }
     if !short.is_empty() {
         bail!(
-            "disk floor: {}: free space there before `native` (floors: workspace.toml [disk])",
+            "disk floor: {}: short before `native` (floors: workspace.toml [disk])",
             short.join("; ")
         );
     }
@@ -110,10 +118,52 @@ pub fn check(ws: &Path, cfg: &WsConfig) -> Result<()> {
         let (dev, free) = measure(&path)?;
         rows.push((dev, free, format!("{holds} {}", path.display()), floor));
     }
-    for line in judge(&merge(rows))? {
+    let metadata = pool_metadata(ws, cfg)?;
+    for line in judge(&merge(rows), &metadata)? {
         println!("native: disk {line}");
     }
     Ok(())
+}
+
+/// The build-dir pool's metadata row `(line, short)`; none when the pool is not on btrfs.
+pub fn pool_metadata(ws: &Path, cfg: &WsConfig) -> Result<Vec<(String, bool)>> {
+    let pool = crate::out::pool(ws);
+    let probed =
+        btrfs_space::probe(&pool).with_context(|| format!("metadata of {}", pool.display()))?;
+    let Some(h) = probed else {
+        return Ok(Vec::new());
+    };
+    Ok(vec![metadata_row(
+        &pool,
+        &h,
+        cfg.disk.pool_metadata_min_free.value,
+    )])
+}
+
+/// Metadata row for the pool at `path`: headroom, its parts, and whether it is under `floor_gib`.
+fn metadata_row(path: &Path, h: &Headroom, floor_gib: u64) -> (String, bool) {
+    let line = format!(
+        "build-dir pool {} metadata: headroom {:.2} GiB (floor {floor_gib} GiB) = {:.2} GiB free in its chunks + {:.2} GiB from {:.2} GiB unallocated at profile {:.1}",
+        path.display(),
+        gib(h.bytes()),
+        gib(h.free_in_chunks),
+        gib(h.from_unallocated),
+        gib(h.unallocated),
+        h.profile,
+    );
+    (line, h.bytes() < floor_gib.saturating_mul(GIB))
+}
+
+/// Refuses a copy into the build-dir pool of `ws` while its metadata headroom is under the floor. A base copy writes ~0.14 GiB of metadata (ws_config `pool_metadata_min_free`), which statfs does not show.
+pub fn metadata_gate(ws: &Path, cfg: &WsConfig) -> Result<()> {
+    if let Some((line, _)) = pool_metadata(ws, cfg)?.iter().find(|(_, short)| *short) {
+        bail!("out: refusing a reflink copy into the pool: {line}");
+    }
+    Ok(())
+}
+
+fn gib(bytes: u64) -> f64 {
+    bytes as f64 / GIB as f64
 }
 
 #[cfg(test)]
@@ -153,14 +203,57 @@ mod tests {
             free,
             floor_gib,
         };
-        let e = judge(&[at(4 * GIB, 5), at(6 * GIB, 6), at(GIB, 2)]).expect_err("two short");
+        let e = judge(&[at(4 * GIB, 5), at(6 * GIB, 6), at(GIB, 2)], &[]).expect_err("two short");
         let e = format!("{e}");
         assert!(
             e.contains("d5: 4 GiB free (floor 5 GiB)") && e.contains("d2: 1 GiB"),
             "{e}"
         );
         assert!(!e.contains("d6"), "{e}");
-        assert_eq!(judge(&[at(5 * GIB, 5)]).unwrap().len(), 1);
+        assert_eq!(judge(&[at(5 * GIB, 5)], &[]).unwrap().len(), 1);
+    }
+
+    /// Live pool 2026-11-16: 0.31 GiB free in metadata chunks (3.76 GiB total, 3.45 GiB used or reserved), 18 GiB unallocated at DUP (x0.5): headroom 9.31 GiB.
+    /// Full chunks and no unallocated space is the incident's shape: short.
+    #[test]
+    fn metadata_row_names_its_parts_and_trips_under_the_floor() {
+        let live = Headroom {
+            free_in_chunks: 328_843_264,
+            unallocated: 19_328_401_408,
+            from_unallocated: 9_663_676_416,
+            profile: 2.0,
+        };
+        let (line, short) = metadata_row(Path::new("/p"), &live, 1);
+        assert!(!short, "{line}");
+        assert!(
+            line.contains("headroom 9.31 GiB (floor 1 GiB) = 0.31 GiB free in its chunks + 9.00 GiB from 18.00 GiB unallocated at profile 2.0"),
+            "{line}"
+        );
+        let full = Headroom {
+            free_in_chunks: 0,
+            unallocated: 0,
+            from_unallocated: 0,
+            profile: 2.0,
+        };
+        assert!(metadata_row(Path::new("/p"), &full, 1).1);
+        let at_floor = Headroom {
+            free_in_chunks: 0,
+            unallocated: 2 * GIB,
+            from_unallocated: GIB,
+            profile: 2.0,
+        };
+        assert!(!metadata_row(Path::new("/p"), &at_floor, 1).1);
+    }
+
+    /// A short metadata row is refused by name, next to the statfs disks.
+    #[test]
+    fn a_short_metadata_row_is_refused_by_name() {
+        let row = (
+            "build-dir pool /p metadata: headroom 0.02 GiB".to_owned(),
+            true,
+        );
+        let e = format!("{}", judge(&[], &[row]).expect_err("short"));
+        assert!(e.contains("headroom 0.02 GiB"), "{e}");
     }
 
     /// The real filesystem answers: a probe that measured nothing would report 0 free.

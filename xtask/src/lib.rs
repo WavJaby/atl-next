@@ -15,6 +15,7 @@ pub mod apk_sig;
 pub mod app_ops_table;
 pub mod arches;
 pub mod bootstrap_gate;
+pub mod btrfs_space;
 pub mod build_pool;
 pub mod build_state;
 pub mod bwrap_flags;

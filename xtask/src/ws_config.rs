@@ -19,6 +19,7 @@
 //! host_compact_below = 30
 //! workspace_min_free = 6
 //! pool_min_free = 5    # build-dir pool
+//! pool_metadata_min_free = 1  # build-dir pool: btrfs metadata headroom (btrfs_space)
 //! ```
 
 use std::collections::BTreeMap;
@@ -81,6 +82,9 @@ pub const DEFAULT_HOST_COMPACT_BELOW: u64 = 30;
 pub const DEFAULT_WORKSPACE_MIN_FREE: u64 = 6;
 /// `disk.pool_min_free` (GiB): the filesystem holding the build-dir pool. One child build that rewrites its whole copy writes ~4.2 GB on disk (measured 2026-11-15: 8.0 GB logical base at zstd:1 ~2x) + margin.
 pub const DEFAULT_POOL_MIN_FREE: u64 = 5;
+/// `disk.pool_metadata_min_free` (GiB): btrfs metadata headroom of the build-dir pool (`btrfs_space`: metadata free in its chunks + unallocated raw space at the profile ratio). statfs cannot see it: 2026-11-16 the pool had 6-7 GB data free while metadata was full with unallocated 0.
+/// Derivation (pool measured 2026-11-16): 2.08 GB metadata over 2.16 M paths = ~960 B per path, an upper bound for a reflink copy (a copy shares extent and csum items). A base is 156k paths = ~0.14 GiB. 1 GiB = ~7 base copies: two copies at once plus a build's metadata churn [estimate; re-measure with a real copy's metadata cost].
+pub const DEFAULT_POOL_METADATA_MIN_FREE: u64 = 1;
 
 /// `[disk]`: free-space floors in GiB (`disk_floor`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +93,7 @@ pub struct DiskFloors {
     pub host_compact_below: Setting<u64>,
     pub workspace_min_free: Setting<u64>,
     pub pool_min_free: Setting<u64>,
+    pub pool_metadata_min_free: Setting<u64>,
 }
 
 /// `[pool]`: the machine-wide admission pool (build_pool.rs).
@@ -240,6 +245,7 @@ fn defaults(path: PathBuf) -> WsConfig {
             host_compact_below: Setting::default(DEFAULT_HOST_COMPACT_BELOW),
             workspace_min_free: Setting::default(DEFAULT_WORKSPACE_MIN_FREE),
             pool_min_free: Setting::default(DEFAULT_POOL_MIN_FREE),
+            pool_metadata_min_free: Setting::default(DEFAULT_POOL_METADATA_MIN_FREE),
         },
     }
 }
@@ -284,8 +290,11 @@ pub fn parse(text: &str, path: &Path) -> Result<WsConfig> {
                 ("disk", "pool_min_free") => {
                     cfg.disk.pool_min_free = Setting::file(gib(value, &at)?);
                 }
+                ("disk", "pool_metadata_min_free") => {
+                    cfg.disk.pool_metadata_min_free = Setting::file(gib(value, &at)?);
+                }
                 _ => bail!(
-                    "{at} is not a known key (known: build.refresh_min_upstream_files, cache.sccache_size, fetch.for, disk.host_min_free, disk.host_compact_below, disk.workspace_min_free, disk.pool_min_free, pool.cpu_slots, pool.mem_gib, pool.<class>)"
+                    "{at} is not a known key (known: build.refresh_min_upstream_files, cache.sccache_size, fetch.for, disk.host_min_free, disk.host_compact_below, disk.workspace_min_free, disk.pool_min_free, disk.pool_metadata_min_free, pool.cpu_slots, pool.mem_gib, pool.<class>)"
                 ),
             }
         }
@@ -608,6 +617,12 @@ mod tests {
         );
         let e = format!("{:#}", parse("[disk]\npool = 1\n", path()).unwrap_err());
         assert!(e.contains("not a known key"), "{e}");
+        let d = parse("", path()).unwrap().disk;
+        assert_eq!(d.pool_metadata_min_free, Setting::default(1));
+        let d = parse("[disk]\npool_metadata_min_free = 2\n", path())
+            .unwrap()
+            .disk;
+        assert_eq!(d.pool_metadata_min_free, Setting::file(2));
     }
 
     /// `workspace.toml.pool` (the pool-format machine file, swapped in at the admission land), copied here so the test needs no local file.

@@ -9,7 +9,7 @@
 //! The checkout's `target/` is a symlink to its dir's `target/` (the only per-checkout switch cargo reads with no tracked file or env var), settled when the outermost process ends ([`settle_target`]): the xtask binary running from a real `target/` must outlive the swap.
 //! A dir leaves with its checkout (land `Cleanup`, [`leave`]); `out prune` deletes the dirs of checkouts removed outside xtask and every base but the newest [`KEEP_BASES`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::Mutex;
@@ -86,6 +86,12 @@ pub fn dir_of(ws: &Path, id: &str) -> PathBuf {
 /// The workspace of a build dir path ([`dir_of`]'s inverse).
 fn workspace_of(dir: &Path) -> Option<&Path> {
     dir.ancestors().nth(4)
+}
+
+/// The workspace whose build-dir pool holds `dst`, when it does: only a copy into the pool writes the pool's metadata.
+fn pool_ws(dst: &Path) -> Option<&Path> {
+    let ws = workspace_of(dst)?;
+    dst.starts_with(pool(ws)).then_some(ws)
 }
 
 pub fn base_of(ws: &Path, commit: &str) -> PathBuf {
@@ -292,6 +298,9 @@ pub fn probe(src: &Path, dst_parent: &Path) -> Result<Tier> {
 
 /// Copies dir `src` to the absent `dst` with the probed tier, through a temp name renamed into place; `base` (when given) goes to `dst/.base`; top-level entries of `src` named in `skip` are left out. Returns the tier.
 pub fn copy_tree(src: &Path, dst: &Path, base: Option<&str>, skip: &[&str]) -> Result<Tier> {
+    if let Some(ws) = pool_ws(dst) {
+        crate::disk_floor::metadata_gate(ws, &crate::ws_config::load(ws)?)?;
+    }
     let parent = dst.parent().context("copy target has no parent")?;
     let name = dst
         .file_name()
@@ -963,6 +972,40 @@ fn orphans(ws: &Path, live: &BTreeSet<String>) -> Result<(Dirs, Vec<PathBuf>)> {
     Ok((dirs, old))
 }
 
+/// Sorts prune candidates most paths first and returns each one's path count. A copy's metadata scales with its paths, so this is what a prune frees first.
+fn rank_by_paths(dirs: &mut Dirs, old: &mut [PathBuf]) -> Result<BTreeMap<PathBuf, u64>> {
+    let mut counts = BTreeMap::new();
+    for path in dirs.iter().map(|(_, p)| p).chain(old.iter()) {
+        counts.insert(path.clone(), path_count(path)?);
+    }
+    dirs.sort_by_key(|(_, p)| std::cmp::Reverse(counts[p]));
+    old.sort_by_key(|p| std::cmp::Reverse(counts[p]));
+    Ok(counts)
+}
+
+/// The ` (N paths)` note a ranked candidate prints with; empty when unranked.
+fn paths_note(counts: &BTreeMap<PathBuf, u64>, path: &Path) -> String {
+    counts
+        .get(path)
+        .map_or_else(String::new, |n| format!(" ({n} paths)"))
+}
+
+/// Entries under `dir`, recursively, symlinks not followed.
+fn path_count(dir: &Path) -> Result<u64> {
+    let mut count = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).with_context(|| format!("reading {}", d.display()))? {
+            let entry = entry?;
+            count += 1;
+            if entry.file_type()?.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    Ok(count)
+}
+
 fn age(path: &Path) -> String {
     std::fs::symlink_metadata(path)
         .and_then(|m| m.modified())
@@ -1019,6 +1062,16 @@ pub fn run(root: &Path, cmd: &Out) -> Result<ExitCode> {
                 ),
                 Err(e) => println!("pool: {}: {e:#}", p.display()),
             }
+            match crate::ws_config::load(&ws)
+                .and_then(|cfg| crate::disk_floor::pool_metadata(&ws, &cfg))
+            {
+                Ok(rows) => {
+                    for (line, _) in rows {
+                        println!("{line}");
+                    }
+                }
+                Err(e) => println!("pool metadata: {e:#}"),
+            }
             for c in bases(&ws)? {
                 println!("base/{c}: {}", age(&base_of(&ws, &c)));
             }
@@ -1044,11 +1097,35 @@ pub fn run(root: &Path, cmd: &Out) -> Result<ExitCode> {
             execute,
             ..
         } => {
-            let (dirs, old) = orphans(&ws, &live)?;
+            let rows = match crate::ws_config::load(&ws)
+                .and_then(|cfg| crate::disk_floor::pool_metadata(&ws, &cfg))
+            {
+                Ok(rows) => rows,
+                Err(e) => {
+                    println!("pool metadata: {e:#}");
+                    Vec::new()
+                }
+            };
+            for (line, _) in &rows {
+                println!("{line}");
+            }
+            let (mut dirs, mut old) = orphans(&ws, &live)?;
+            let counts = if rows.iter().any(|(_, short)| *short) {
+                println!(
+                    "out prune: pool metadata short: candidates ranked most paths first (a copy's metadata scales with its paths)"
+                );
+                rank_by_paths(&mut dirs, &mut old)?
+            } else {
+                BTreeMap::new()
+            };
             let mut failed = 0;
             for (id, path) in &dirs {
                 if !*execute {
-                    println!("orphan ws/{id}: {} (checkout gone)", path.display());
+                    println!(
+                        "orphan ws/{id}: {} (checkout gone){}",
+                        path.display(),
+                        paths_note(&counts, path)
+                    );
                     continue;
                 }
                 match build_pool::try_lock_dir(&ws, id)? {
@@ -1064,7 +1141,7 @@ pub fn run(root: &Path, cmd: &Out) -> Result<ExitCode> {
             }
             for path in &old {
                 if !*execute {
-                    println!("old base {}", path.display());
+                    println!("old base {}{}", path.display(), paths_note(&counts, path));
                     continue;
                 }
                 match std::fs::remove_dir_all(path) {
@@ -1107,6 +1184,47 @@ mod tests {
     fn put(path: &Path) {
         std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
         std::fs::write(path, "x\n").expect("file");
+    }
+
+    /// Independent counts: a = 3 files; b = 1 file + dir s with 2 files = 4 entries; c = empty = 0. Ranked most paths first.
+    #[test]
+    fn prune_ranks_candidates_by_paths() {
+        let root = scratch("rank");
+        let (a, b, c) = (root.join("a"), root.join("b"), root.join("c"));
+        for i in 0..3 {
+            put(&a.join(format!("f{i}")));
+        }
+        put(&b.join("f0"));
+        put(&b.join("s").join("f0"));
+        put(&b.join("s").join("f1"));
+        std::fs::create_dir_all(&c).expect("empty dir");
+        let mut dirs = vec![("x".to_owned(), a.clone()), ("y".to_owned(), c.clone())];
+        let mut old = vec![b.clone()];
+        let counts = rank_by_paths(&mut dirs, &mut old).expect("ranked");
+        assert_eq!(old.as_slice(), std::slice::from_ref(&b));
+        assert_eq!(
+            dirs.iter().map(|(_, p)| p.clone()).collect::<Vec<_>>(),
+            [a.clone(), c.clone()]
+        );
+        assert_eq!(counts[&a], 3);
+        assert_eq!(counts[&b], 4);
+        assert_eq!(counts[&c], 0);
+        assert_eq!(paths_note(&counts, &b), " (4 paths)");
+        assert_eq!(paths_note(&BTreeMap::new(), &b), "");
+    }
+
+    /// Only a copy into `<ws>/out/pool` writes the pool's metadata; a copy elsewhere is not gated.
+    #[test]
+    fn pool_ws_is_the_workspace_of_a_pool_copy_only() {
+        assert_eq!(
+            pool_ws(Path::new("/w/out/pool/ws/repo")),
+            Some(Path::new("/w"))
+        );
+        assert_eq!(
+            pool_ws(Path::new("/w/out/pool/base/c1")),
+            Some(Path::new("/w"))
+        );
+        assert_eq!(pool_ws(Path::new("/w/out/other/c1")), None);
     }
 
     #[test]
