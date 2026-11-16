@@ -270,6 +270,33 @@ public class Main extends Activity {
      * The download line (app.rs WEBVIEW_DOWNLOAD): a response the engine does not render (a MIME type it has no viewer for) reaches DownloadListener.onDownloadStart instead:
      * `mime=` its type, `ua=` whether its userAgent is the view's WebSettings.getUserAgentString.
      */
+    /**
+     * The initial scale line (app.rs WEBVIEW_SCALE): setInitialScale(200) = 2 device pixels per CSS pixel (WebView.java:1184-1188, density not applied), what the page reads as devicePixelRatio.
+     */
+    private void webViewScale() {
+        try {
+            android.webkit.WebView w = new android.webkit.WebView(this);
+            w.getSettings().setJavaScriptEnabled(true);
+            w.setInitialScale(200);
+            w.setWebViewClient(new android.webkit.WebViewClient() {
+                private boolean mDone;
+                @Override public void onPageFinished(android.webkit.WebView view, String url) {
+                    if (mDone) return;
+                    mDone = true;
+                    view.evaluateJavascript("window.devicePixelRatio", new android.webkit.ValueCallback<String>() {
+                        @Override public void onReceiveValue(String v) { Log.i("AtlTest", "webview-scale: dpr=" + v); }
+                    });
+                }
+            });
+            mScaleView = w;
+            w.loadData("<html><body>scale</body></html>", "text/html", null);
+        } catch (Throwable e) {
+            Log.i("AtlTest", "webview-scale: threw=" + e);
+        }
+    }
+
+    private android.webkit.WebView mScaleView;
+
     private void webViewDownload() {
         try {
             final android.webkit.WebView w = new android.webkit.WebView(this);
@@ -351,6 +378,7 @@ public class Main extends Activity {
                         webViewPage();
                         webViewCookies();
                         webViewDownload();
+                        webViewScale();
                     }
                 });
             }
