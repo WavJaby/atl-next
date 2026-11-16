@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! `xtask run-apk <ROW|PATH>`: a test APK row of test-apks.toml, or an APK file given by path (unpinned), started by atld the way an app is (its launcher activity), in UI mode: the app's window is a GTK window of this desktop with --hold, else of the gate's headless compositor (nested_wayland.rs).
 //! Staging is the window gate's: the runtime (Runtime::new, gralloc, the display), the APK copied into the run's work dir, the package file from the APK's real manifest (manifest::read).
+//! The device is kept across launches ([`device_dir`]): an app's data survives them, as on a device, until `--clear-data` (`pm clear` of the package) or the dir is removed.
 //! No probe; injected input only with `--pointer` (a scripted tap sequence the app runs from its first present). The verdict is about the last activity the app resumed (`services: activity resumed <class>`, sent after onResume returns). The run waits until the services
 //! are settled (`services: activity settled`: no launch, start or lifecycle step unacknowledged), so a Splash that starts Main is judged on Main. Pass: that resume is the last one, a frame is
 //! presented after it (`atl-composer: ui: present`), and no fault in the app log within the watch after it (window::fault_after). The run ends once all of that holds and the watch is over
@@ -90,6 +91,10 @@ pub struct Args {
     /// A variable in every app process's environment (repeat), atld `--app-env`: test-environment setup such as `LD_DEBUG=bindings` (the launcher-closure measurement; glibc's lines land in the app log). The product reads none of these.
     #[arg(long = "app-env", value_name = "KEY=VALUE")]
     app_env: Vec<String>,
+    /// `pm clear` of the package before the launch: its data (user and device-protected user dirs, its external dirs) left by earlier launches is removed, so the app starts from empty data.
+    /// Other packages' data and the device's own state stay. The device is `<out>/run-apk/device`, kept across launches: without this flag the app keeps its data.
+    #[arg(long)]
+    clear_data: bool,
 }
 
 /// `xtask remote run-apk` (remote.rs `Remote::RunApk`): the same run on a target's desktop. `--hold` is required: the window is the target's, on its Wayland session, not a headless one.
@@ -163,7 +168,14 @@ impl Args {
             tilt_keys: false,
             mouse_touch: false,
             app_env: Vec::new(),
+            clear_data: false,
         }
+    }
+
+    /// The same run with `--clear-data` set to `clear` (the gates that launch an app twice and check its data).
+    pub(crate) fn with_clear_data(mut self, clear: bool) -> Self {
+        self.clear_data = clear;
+        self
     }
 }
 
@@ -179,7 +191,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         None => None,
     };
     let (rt, foreign) = runtime(root, args, &files)?;
+    // the device outlives the launch: the app's data is still there at the next one (`--clear-data` clears one package of it)
+    let device = device_dir(&rt.out);
+    println!("run-apk: device {}", device.display());
+    let rt = rt.with_device(&device);
     run_on(&rt, args, foreign.as_ref(), pin.as_ref(), files, steps)
+}
+
+/// The device of run-apk's launches under the native out dir `out`: kept across launches (atld `--device`), so an app's data survives them.
+pub(crate) fn device_dir(out: &Path) -> PathBuf {
+    out.join("run-apk").join("device")
 }
 
 /// One run of `args` on the staged runtime `rt` ([`configure`]d for `foreign`) of the package `files` (`pin`: its row). A drive gate's runs all share `rt`: each run's wiring goes on a copy, so none carries over to the next.
@@ -220,6 +241,13 @@ pub(crate) fn run_on(
         (None, _) => rt.clone().with_display(run_display().to_arg()),
     };
     let m = timing::phase("run: package", || package(&rt, &files, pin, &args.target))?;
+    if args.clear_data {
+        let device = rt
+            .device()
+            .context("--clear-data: no persistent device (run() sets one)")?;
+        crate::atld_run::clear_package_data(device, &m.name)?;
+        println!("run-apk: --clear-data: {} starts from empty data", m.name);
+    }
     let run = run_of(&work, files, &m, &args.log_tags);
     let app_log = run.log(&m.name);
     let services_log = run.log("services");
@@ -374,6 +402,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         tilt_keys: a.tilt_keys,
         mouse_touch: a.mouse_touch,
         app_env: Vec::new(),
+        clear_data: false,
     };
     // no `--display`: atld reads the target's own monitor, as on the product's host (host_display); this host's monitor is not the target's
     let (rt, foreign) = runtime(root, &args, &files)?;

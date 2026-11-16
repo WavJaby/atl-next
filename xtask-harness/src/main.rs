@@ -11,6 +11,7 @@
 
 mod adb;
 mod app;
+mod app_data;
 mod app_imports;
 mod atld_run;
 mod audio_app;
@@ -166,6 +167,8 @@ enum Test {
     Broadcast(broadcast::Args),
     /// An app's ContentProviders (xtask-harness/testdata/provider) under atld: initOrder before Application.onCreate, disabled and other-process ones skipped, PackageManager lookups, a call to its own provider.
     Provider(provider::Args),
+    /// An app's data outlives a run-apk launch (xtask-harness/testdata/app-data): three launches on one device; the second reads what the first wrote, `--clear-data` (`pm clear`) starts the third from empty data. `--break-keep` must turn it red.
+    AppData(app_data::Args),
     /// A preinstalled package (xtask-harness/testdata/system-scan) placed in /product under atld: scanned at start, FLAG_SYSTEM and its /product sourceDir via PackageManager, readable from its sandbox, a write there EROFS.
     SystemScan(system_scan::Args),
     /// The CTS instrumentation path: AOSP's `am instrument` runs a JUnit3 test APK (xtask-harness/testdata/instrument) through the services; its INSTRUMENTATION_* text is parsed and checked.
@@ -325,6 +328,9 @@ fn main() -> Result<ExitCode> {
             test: Test::Provider(args),
         } => provider::run(&root, &args),
         Command::Test {
+            test: Test::AppData(args),
+        } => app_data::run(&root, &args),
+        Command::Test {
             test: Test::SystemScan(args),
         } => system_scan::run(&root, &args),
         Command::Test {
@@ -456,6 +462,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::Signing(_) => "signing",
             Test::Parcel(_) => "parcel",
             Test::Provider(_) => "provider",
+            Test::AppData(_) => "app-data",
             Test::SystemScan(_) => "system-scan",
             Test::Compositor(_) => "compositor",
             Test::Gralloc(_) => "gralloc",

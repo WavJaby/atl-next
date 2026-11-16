@@ -338,6 +338,8 @@ pub struct Runtime {
     llvm_lib: PathBuf,
     /// Where atld runs: this host, or a target running it from the bundle (`remote test`, remote.rs [`remote::Site`]).
     site: remote::Site,
+    /// The device's persistent storage (atld `--device`) when [`Runtime::with_device`] set it: kept across runs. Unset: atld's root holds a fresh device (the gates).
+    device: Option<PathBuf>,
 }
 
 /// A command the shell runs once the system is up (`am instrument ...`).
@@ -818,6 +820,7 @@ impl Runtime {
             mouse_touch: false,
             fake_devices: None,
             site: remote::Site::Host,
+            device: None,
         })
     }
 
@@ -825,6 +828,17 @@ impl Runtime {
     pub fn with_site(mut self, site: remote::Site) -> Self {
         self.site = site;
         self
+    }
+
+    /// atld's device is the persistent dir `dir` (`--device`): app data and system state survive the run, and the next run on `dir` sees them (run-apk). Gates keep the fresh device of their root.
+    pub fn with_device(mut self, dir: &Path) -> Self {
+        self.device = Some(dir.to_path_buf());
+        self
+    }
+
+    /// The persistent device set by [`Runtime::with_device`], if any.
+    pub fn device(&self) -> Option<&Path> {
+        self.device.as_deref()
     }
 
     /// Also starts the graphics allocator HAL under atld (`--gralloc`): the allocator `xtask native` built, and `mapper.atl.so` installed in `<out>/gralloc/lib`, which joins every process's library path.
@@ -1189,6 +1203,22 @@ impl Runtime {
     }
 }
 
+/// `pm clear` of `package` on the persistent `device` (run-apk `--clear-data`): its user and device-protected data dirs (`data/user/0/<p>`, `data/user_de/0/<p>`) and its external dirs (`external/<p>`), the layout atld's Root gives them (crates/atld main.rs).
+/// Its code and every other package's state stay; the next launch makes the dirs again. Missing dirs are fine.
+pub fn clear_package_data(device: &Path, package: &str) -> Result<()> {
+    let data = device.join("data");
+    for dir in [
+        data.join("user/0").join(package),
+        data.join("user_de/0").join(package),
+        device.join("external").join(package),
+    ] {
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).with_context(|| format!("clearing {}", dir.display()))?;
+        }
+    }
+    Ok(())
+}
+
 /// An APK's native libraries, stored under `lib/<abi>/` as an app's packager lays them out.
 pub struct NativeLibs {
     pub abi: String,
@@ -1472,8 +1502,9 @@ impl Runtime {
                 self.fake_devices.is_none()
                     && self.wayland.is_none()
                     && run.libraries.is_empty()
+                    && self.device.is_none()
                     && (self.ui.is_none() || target.has_display()),
-                "remote run {}: not remotable yet (sensor injection, a gate's own Wayland socket, shared libraries, and a UI without a target display need a target runner)",
+                "remote run {}: not remotable yet (sensor injection, a gate's own Wayland socket, shared libraries, a persistent device, and a UI without a target display need a target runner)",
                 run.root.display()
             );
             // fontconfig's `<dir>` and `<cachedir>` name this host's paths: the run reads a copy that the script relocates
@@ -1592,6 +1623,9 @@ impl Runtime {
             .arg(&self.binderd)
             .arg("--sandbox-stub")
             .arg(&self.sandbox_stub);
+        if let Some(device) = &self.device {
+            cmd.arg("--device").arg(device);
+        }
         if self.webspawn {
             cmd.arg("--sandbox-join")
                 .arg(&self.sandbox_join)
@@ -1813,6 +1847,33 @@ fn check_code_policy(manifest_xml: &str, has_dex: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `pm clear` removes the package's three dirs and leaves its code and another package's dirs.
+    #[test]
+    fn clear_package_data_removes_only_that_package() {
+        let device = std::env::temp_dir().join(format!("atl-clear-data-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&device);
+        let made = [
+            "data/user/0/a/files/save.txt",
+            "data/user_de/0/a/cache/x",
+            "external/a/data/y",
+            "data/app/a/base.apk",
+            "data/user/0/b/files/keep.txt",
+        ];
+        for f in made {
+            let p = device.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"x").unwrap();
+        }
+        clear_package_data(&device, "a").unwrap();
+        for gone in ["data/user/0/a", "data/user_de/0/a", "external/a"] {
+            assert!(!device.join(gone).exists(), "{gone} should be cleared");
+        }
+        for kept in ["data/app/a/base.apk", "data/user/0/b/files/keep.txt"] {
+            assert!(device.join(kept).is_file(), "{kept} should stay");
+        }
+        std::fs::remove_dir_all(&device).unwrap();
+    }
 
     /// proc(5) stat lines: comm may hold spaces and parens (the last `)` ends it); the 4th field is ppid. And the live check: this test process's own child, `sleep`, is outside the broker.
     #[test]

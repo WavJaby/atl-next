@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- `xtask test app-data` (app_data.rs): one launcher activity with a window, software drawing (as the window fixture): it writes or reads one file under its files dir, so the data outlives the launch. -->
+
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.atldata"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
+
+    <application android:label="ATL app data test">
+        <activity android:name=".DataMain" android:exported="true" android:hardwareAccelerated="false"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

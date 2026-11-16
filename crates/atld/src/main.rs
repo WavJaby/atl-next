@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! atld, M2 wiring: starts the system the Android way, each process through the broker, then serves the services' process control until the run ends (step 7).
 //! 1. the runtime root `--root` (made fresh): `properties` (the default property area, atl-property-service; `properties.d/` one area per app process: the defaults plus the properties only that process has, [`Host::process_properties`]), `system/` (build.prop, `framework/` = the boot jars and shared libraries),
-//!    `data/` (`app/<package>/{base.apk,split_<name>.apk,lib/<isa>/}`, `user/0/<package>/`, `dalvik-cache/`), `install/` (the installer's frames of each session, read by the services), `log/<process>.log` (each process's stdout + stderr).
+//!    `install/` (the installer's frames of each session, read by the services), `log/<process>.log` (each process's stdout + stderr). The device (`--device`, kept across runs): `data/` (`app/<package>/{base.apk,split_<name>.apk,lib/<isa>/}`, `user/0/<package>/`, `dalvik-cache/`, `system/`) and `external/`.
 //! 2. the install sessions: each `--package` (its APK files) is a session the services install at their start (owner option I, 2026-11-13): they own the package list; atld does installd's
 //!    file work on their request (control `Install`: stage under session names (hard links where possible) + run atl-installer in the broker's installer profile; `Commit`: rename each file by its
 //!    parsed split (`base.apk`, `split_<name>.apk`), then the dir to `/data/app/<package>`, create the data dirs).
@@ -63,6 +63,10 @@ struct Args {
     /// Runtime root (removed and made again).
     #[arg(long)]
     root: PathBuf,
+    /// The device's persistent storage, kept across runs: `data/` (/data: app code and data, system state, dalvik-cache) and `external/<package>/` (the shared storage's Android/data and obb of a package).
+    /// Default: `<root>/device`, made fresh with the root. Must lie outside `--root`, which is removed at start.
+    #[arg(long, value_name = "DIR")]
+    device: Option<PathBuf>,
     /// atl-binderd executable.
     #[arg(long)]
     binderd: PathBuf,
@@ -435,9 +439,10 @@ fn kernel_line(line: &str) -> String {
     })
 }
 
-/// The runtime root's layout.
+/// The runtime root's layout: `root` is removed and made again at start; `device` (`--device`) is kept across runs.
 struct Root {
     root: PathBuf,
+    device: PathBuf,
 }
 
 impl Root {
@@ -455,7 +460,7 @@ impl Root {
         ]
     }
     fn data(&self) -> PathBuf {
-        self.root.join("data")
+        self.device.join("data")
     }
     fn properties(&self) -> PathBuf {
         self.root.join("properties")
@@ -469,9 +474,9 @@ impl Root {
     fn log(&self, name: &str) -> PathBuf {
         self.root.join("log").join(format!("{name}.log"))
     }
-    /// The app's external root (`apps/<package>/external`): `data` is its Android/data/<package>, `obb` its Android/obb/<package> (the broker mounts both, app_spawn).
+    /// The app's external root (`external/<package>`): `data` is its Android/data/<package>, `obb` its Android/obb/<package> (the broker mounts both, app_spawn).
     fn external(&self, package: &str) -> PathBuf {
-        self.root.join("apps").join(package).join("external")
+        self.device.join("external").join(package)
     }
 }
 
@@ -764,6 +769,10 @@ impl Host {
         let name = staging_name(session);
         let host_dir = self.root.data().join("app").join(&name);
         let at = Path::new(DATA_APP).join(&name);
+        // a dir a killed run left under this session name (the device outlives runs): the session's files must be the only ones here
+        if host_dir.exists() {
+            std::fs::remove_dir_all(&host_dir)?;
+        }
         std::fs::create_dir_all(&host_dir)?;
         let staged = (|| -> Result<String> {
             for f in files {
@@ -868,6 +877,10 @@ impl Host {
         let code = app.join(package);
         let staged_dir = app.join(staging_name(session));
         rename_staged(&staged_dir, names)?;
+        // the device keeps /data/app across runs: the new code replaces an earlier install's, as an update does (the data dirs are elsewhere and stay)
+        if code.exists() {
+            std::fs::remove_dir_all(&code)?;
+        }
         std::fs::rename(&staged_dir, &code)
             .with_context(|| format!("moving session {session} to {}", code.display()))?;
         self.create_app_data(package)?;
@@ -1686,12 +1699,24 @@ fn wait_ready(
 
 fn run(a: &Args) -> Result<ExitCode> {
     let started_ms = wall_ms();
+    let root = std::path::absolute(&a.root)?;
+    let device = match &a.device {
+        Some(d) => {
+            let d = std::path::absolute(d)?;
+            ensure!(
+                !d.starts_with(&root),
+                "--device {}: inside --root {}, which is removed at start",
+                d.display(),
+                root.display()
+            );
+            d
+        }
+        None => root.join("device"),
+    };
     if a.root.exists() {
         std::fs::remove_dir_all(&a.root)?;
     }
-    let r = Root {
-        root: std::path::absolute(&a.root)?,
-    };
+    let r = Root { root, device };
     std::fs::create_dir_all(r.root.join("log"))?;
     let tier = LinearTier::probe();
     log(format_args!("linear allocator tier {}", tier.name()));
@@ -2222,6 +2247,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         },
         root: Root {
             root: r.root.clone(),
+            device: r.device.clone(),
         },
     });
     // the control server answers from the moment the services exist: a start request may come with their first breath (--launch)
