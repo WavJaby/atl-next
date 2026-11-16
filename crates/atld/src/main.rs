@@ -591,34 +591,19 @@ const FEATURES_TOUCHSCREEN: [(&str, i32); 2] = [
 ];
 /// PackageManager.FEATURE_OPENGLES_EXTENSION_PACK (frameworks/native/data/etc/android.hardware.opengles.aep.xml).
 const FEATURE_OPENGLES_AEP: (&str, i32) = ("android.hardware.opengles.aep", 0);
-/// PackageManager.FEATURE_WEBVIEW (frameworks/native/data/etc/android.software.webview.xml): declared when the web engine module loads ([`web_engine_probe`], webview plan S6); absent -> apps get AOSP's
-/// no-WebView device (getProvider throws UnsupportedOperationException). The provider package ships with every runtime; without the feature AOSP never asks for it.
+/// PackageManager.FEATURE_WEBVIEW (frameworks/native/data/etc/android.software.webview.xml): declared when the web engine module loads (the `webview-probe` process, webview plan S6); absent -> apps
+/// get AOSP's no-WebView device (getProvider throws UnsupportedOperationException). The provider package ships with every runtime; without the feature AOSP never asks for it.
 const FEATURE_WEBVIEW: (&str, i32) = ("android.software.webview", 0);
-/// atld's first argument that makes it the web engine probe instead of a run: load the module (atl_platform_ui::probe_web_engine), print the result, exit 0 when it loaded.
+/// atld's first argument that makes it the web engine probe instead of a run: load the module (atl_platform_ui::probe_web_engine), say why on stderr, exit 0 when it loaded. atld starts it through
+/// the broker with the apps' library path, so the module resolves as an app's first WebView call resolves it, and GTK never loads into atld.
 const PROBE_WEB_ENGINE: &str = "--probe-web-engine";
-
-/// The host's WebView capability: atld itself as [`PROBE_WEB_ENGINE`] in its own process (loading WebKitGTK pulls GTK in, which stays out of atld), with the apps' library path, so the module
-/// resolves as an app's first WebView call resolves it. Err(why) when it does not load (WebKitGTK not installed, module missing).
-fn web_engine_probe(lib_path: &OsString) -> Result<std::result::Result<(), String>> {
-    let out = std::process::Command::new(std::env::current_exe()?)
-        .arg(PROBE_WEB_ENGINE)
-        .env("LD_LIBRARY_PATH", lib_path)
-        .output()
-        .context("starting the web engine probe")?;
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    Ok(if out.status.success() {
-        Ok(())
-    } else {
-        Err(format!("{}: {text}", out.status))
-    })
-}
 
 /// The [`PROBE_WEB_ENGINE`] process.
 fn probe_web_engine_main() -> ExitCode {
     match atl_platform_ui::probe_web_engine() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            println!("{e}");
+            log(format_args!("webview-probe: {e}"));
             ExitCode::FAILURE
         }
     }
@@ -2101,9 +2086,24 @@ fn run(a: &Args) -> Result<ExitCode> {
             None => log(format_args!("gles: unset (no renderer probed)")),
         }
     }
-    match web_engine_probe(&a.lib_path)? {
-        Ok(()) => host_features.push(FEATURE_WEBVIEW),
-        Err(why) => log(format_args!("webview: no engine ({why})")),
+    // the host's WebView capability: the web engine module loads in a process with the apps' library path (PROBE_WEB_ENGINE)
+    {
+        let name = "webview-probe";
+        let exe = std::env::current_exe().context("atld's own path")?;
+        let spawn = system_spawn(name, &exe, vec![PROBE_WEB_ENGINE.into()], false, None)?;
+        let mut p = broker
+            .spawn(spawn)
+            .with_context(|| format!("starting {name}"))?;
+        let status = p.child.wait()?;
+        if status.success() {
+            host_features.push(FEATURE_WEBVIEW);
+        } else {
+            let text = std::fs::read_to_string(r.log(name))?;
+            log(format_args!(
+                "webview: no engine ({status}: {})",
+                text.trim()
+            ));
+        }
     }
     host_features_layout(&r, &host_features)?;
     // the services' area: the defaults with what the probes above added (ActivityTaskManagerService reads ro.opengles.version); the processes started before the probes keep the first area
@@ -2519,7 +2519,10 @@ fn wall_ms() -> u64 {
 }
 
 fn main() -> ExitCode {
-    if std::env::args_os().nth(1).is_some_and(|a| a == PROBE_WEB_ENGINE) {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|a| a == PROBE_WEB_ENGINE)
+    {
         return probe_web_engine_main();
     }
     let a = Args::parse();

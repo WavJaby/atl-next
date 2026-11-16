@@ -191,7 +191,10 @@ fn webview_provider_row(out: &Path) -> Result<(PathBuf, String)> {
         "missing input {} (xtask native builds goal webview)",
         built.display()
     );
-    Ok((built, format!("{}/{WEBVIEW_PROVIDER}", atl_android_paths::PRODUCT)))
+    Ok((
+        built,
+        format!("{}/{WEBVIEW_PROVIDER}", atl_android_paths::PRODUCT),
+    ))
 }
 
 /// The namespace script of [`Runtime::atld_command`]: `$0` fake `/sys/bus`, `$1` fake udev database, `$2` a directory for the host's `/dev`, then `name host` pairs (char devices), `--`, atld's command.
