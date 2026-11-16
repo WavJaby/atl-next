@@ -81,6 +81,8 @@ mod abi_check {
     const _: () = assert!(offset_of!(AtlHost, ctx) as u64 == l::ATL_OFFSET_HOST_CTX);
     const _: () = assert!(offset_of!(AtlHost, trap) as u64 == l::ATL_OFFSET_HOST_TRAP);
     const _: () = assert!(offset_of!(AtlHost, trap_ex) as u64 == l::ATL_OFFSET_HOST_TRAP_EX);
+    const _: () =
+        assert!(offset_of!(AtlHost, fault_report) as u64 == l::ATL_OFFSET_HOST_FAULT_REPORT);
     const _: () = assert!(size_of::<AtlLanes>() as u64 == l::ATL_SIZEOF_LANES);
     const _: () = assert!(offset_of!(AtlLanes, x) as u64 == l::ATL_OFFSET_LANES_X);
     const _: () = assert!(offset_of!(AtlLanes, v) as u64 == l::ATL_OFFSET_LANES_V);
@@ -200,7 +202,8 @@ mod capi {
         {
             return -libc::EINVAL;
         }
-        let (Some(trap), Some(trap_ex)) = (h.trap, h.trap_ex) else {
+        let (Some(trap), Some(trap_ex), Some(fault_report)) = (h.trap, h.trap_ex, h.fault_report)
+        else {
             return -libc::EINVAL;
         };
         // SAFETY: boot_exe is a NUL-terminated string (the ABI; checked non-null above).
@@ -217,6 +220,7 @@ mod capi {
         {
             return -libc::EEXIST;
         }
+        crate::signal::set_fault_report(h.ctx, fault_report);
         // SAFETY: out is non-null (checked); the handle is published before QEMU runs, so BOOT's callbacks reach the engine through it.
         unsafe { *out = (&raw const ENGINE).cast_mut().cast() };
         match start_linked(exe, host_trap) {

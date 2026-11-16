@@ -7,6 +7,8 @@
 mod args;
 pub mod bindings;
 mod dispatch;
+/// The fatal-signal report both engines use (identity's signal paths, QEMU's `atl_host.fault_report`).
+pub mod fault_report;
 /// The identity crossing (the host arch's thread-pointer switch), a per-host-ISA capability: compiled where build.rs `IDENTITY_HOSTS` names the host ISA (cfg `atl_nb_identity`). QEMU's binding thunks (`qemu/mod.rs`, placement in `qemu/place.rs`) are in every core. Shared code reaches the process's engine through [`active`] (an [`Active`]), whose methods dispatch to the functions each provides (`is_stub`, `patch_site`, `patch_hook`, `patch_entry`, `bind`, ...).
 #[cfg(atl_nb_identity)]
 pub mod identity;

@@ -142,6 +142,19 @@ mod spike {
 
     /// The guest's reports on any thread: the callback runs on the faulting thread, so this is process-wide.
     static REPORTS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+    /// Calls of the host's `fault_report` so far (signal context: an atomic only).
+    static FAULT_REPORTS: AtomicU64 = AtomicU64::new(0);
+
+    /// The host's `fault_report` stub: counts.
+    unsafe extern "C" fn count_fault_report(
+        _: *mut std::ffi::c_void,
+        _: std::ffi::c_int,
+        _: *mut std::ffi::c_void,
+        _: *mut std::ffi::c_void,
+    ) {
+        FAULT_REPORTS.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Calls of the special handler so far: every SIGSEGV of the process reaches it first.
     static SPECIAL_SEEN: AtomicU64 = AtomicU64::new(0);
     /// `SPECIAL_SEEN` at the fork of gates (e) and (h): the child's previous handler checks that exactly one call, its own fault, came since.
@@ -310,6 +323,8 @@ mod spike {
             );
         }
         let fixture = fixture.to_string_lossy().into_owned();
+        // the host's fault report, as capi `create` registers the C host's (gate d counts it)
+        atl_qemu_engine::signal::set_fault_report(std::ptr::null_mut(), count_fault_report);
         run_gate_k(&so, &fixture);
         // gate (B): the boot reaches the fixture's BOOT trap (`on_trap` prints the ok)
         run_marker('B');
@@ -510,8 +525,16 @@ mod spike {
     /// A store fault in translated code (address 0): QEMU delivers it (the code route) and the guest's own SIGSEGV handler runs and reports D_MARK.
     fn gate_d(g: Guest) -> Result<(), String> {
         let before = atl_qemu_engine::signal::routed().code;
+        let reported = FAULT_REPORTS.load(Ordering::Relaxed);
         let r = g.call(w(t::STORE_FAULT), &[]);
         let faults = atl_qemu_engine::signal::routed().code - before;
+        let fault_reports = FAULT_REPORTS.load(Ordering::Relaxed) - reported;
+        // break `no-fault-report`: QEMU gets the fault without the host's report
+        if fault_reports != faults {
+            return Err(format!(
+                "{fault_reports} host fault reports for {faults} routed translated-code faults"
+            ));
+        }
         let reports = reports();
         if reports != [w(t::D_MARK)] {
             return Err(format!(
@@ -1699,6 +1722,15 @@ mod engine_so {
         lanes.x[0] = unsafe { trap(ctx, kind, id, lanes.x.as_ptr()) };
     }
 
+    /// The host's fault report: no guest fault is expected in this probe, so nothing to report.
+    unsafe extern "C" fn fault_report(
+        _: *mut c_void,
+        _: std::ffi::c_int,
+        _: *mut c_void,
+        _: *mut c_void,
+    ) {
+    }
+
     /// D9 at BOOT: `map` a host page, then `attach` a CPU from a thread of its own, both inside the trap. Attach runs on another thread: a boot thread attaching itself would register its RCU state twice. That thread parks with its CPU, since a thread that exits while registered with RCU leaves a dangling registry node; gate (r) detaches its own.
     fn boot_probe(p: &Probe) -> Result<(), String> {
         let engine = p.engine.load(Ordering::SeqCst);
@@ -1831,6 +1863,7 @@ mod engine_so {
             ctx: std::ptr::from_ref(probe).cast_mut().cast(),
             trap: Some(trap),
             trap_ex: Some(trap_ex),
+            fault_report: Some(fault_report),
         };
         let create = table.create.ok_or("engine table has no create")?;
         // SAFETY: host, boot (NUL-terminated) and the handle out parameter (in the leaked probe) outlive the call; the ABI's create.

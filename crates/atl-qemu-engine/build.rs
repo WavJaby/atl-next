@@ -70,6 +70,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("ret-reg", "atl_qe_ret_reg"),
     // gate (d): the special declines a fault in TCG code, so it reaches the pre-QEMU handler instead of QEMU's
     ("fault-route", "atl_qe_fault_route"),
+    // gate (s1): the special hands a guest fault to QEMU without calling the host's fault_report
+    ("no-fault-report", "atl_qe_no_fault_report"),
     // gate (e): the special hands a host-only fault to QEMU's handler (which aborts) instead of declining it
     ("chain-order", "atl_qe_chain_order"),
     // gate (f): the special declines a host write to a write-protected translated-code page instead of handing it to QEMU's handler (which un-protects it)

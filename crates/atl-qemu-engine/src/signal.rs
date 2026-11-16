@@ -78,6 +78,24 @@ static CODE_FAULTS: AtomicU64 = AtomicU64::new(0);
 static ACCERR_FAULTS: AtomicU64 = AtomicU64::new(0);
 static HOST_FAULTS: AtomicU64 = AtomicU64::new(0);
 
+/// The C host's `fault_report` + its ctx, set by `create` before QEMU runs; unset for an in-process Rust host (no report).
+static FAULT_REPORT: OnceLock<FaultReport> = OnceLock::new();
+
+struct FaultReport {
+    ctx: *mut c_void,
+    report: atl_engine_api::FaultReportFn,
+}
+
+// SAFETY: the ABI's contract: the host keeps ctx and the callback valid until the process ends; never mutated after create.
+unsafe impl Send for FaultReport {}
+// SAFETY: as for Send.
+unsafe impl Sync for FaultReport {}
+
+/// Records the host's fault report (capi `create`); a second call keeps the first (create refuses a second engine anyway).
+pub fn set_fault_report(ctx: *mut c_void, report: atl_engine_api::FaultReportFn) {
+    let _ = FAULT_REPORT.set(FaultReport { ctx, report });
+}
+
 /// Faults routed so far.
 pub fn routed() -> Routed {
     Routed {
@@ -313,6 +331,14 @@ pub extern "C" fn special(sig: c_int, info: *mut libc::siginfo_t, uc: *mut c_voi
     };
     if let Some(reason) = reason {
         count(reason);
+        // a guest fault leaves a report before QEMU takes the guest's action (a crash handler re-raising with SIG_DFL leaves no ART dump); not Accerr: an internal translated-code page unprotect, no guest signal. break `no-fault-report` (gate s1) skips it.
+        if !matches!(reason, Reason::Accerr)
+            && !cfg!(atl_qe_no_fault_report)
+            && let Some(r) = FAULT_REPORT.get()
+        {
+            // SAFETY: the host's callback and ctx (ABI: async-signal-safe, returns); info / uc are this delivery's.
+            unsafe { (r.report)(r.ctx, sig, info.cast(), uc) };
+        }
         deliver(&qemu.0[i], sig, info, uc);
         return true;
     }

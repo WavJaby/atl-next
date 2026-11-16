@@ -13,7 +13,7 @@
 #include <stdint.h>
 
 #define ATL_ENGINE_ABI_MAJOR 3
-#define ATL_ENGINE_ABI_MINOR 0
+#define ATL_ENGINE_ABI_MINOR 1
 
 /* Page protection, QEMU's page flags (include/exec/page-protection.h). */
 #define ATL_PROT_READ 0x1u
@@ -56,6 +56,8 @@ typedef struct atl_host {
     uint64_t (*trap)(void *ctx, uint32_t kind, uint32_t id, const uint64_t regs[8]);
     /* CALL and BIND, the same contract with lanes; the answer is lanes->x[0] and lanes->v[0]. */
     void (*trap_ex)(void *ctx, uint32_t kind, uint32_t id, atl_lanes *lanes);
+    /* 3.1: a guest fault the engine is about to hand to its guest delivery; info / ucontext are the kernel's siginfo_t * / ucontext_t *. Signal context, every signal blocked, possibly on a guest thread pointer: async-signal-safe, no TLS, must return. */
+    void (*fault_report)(void *ctx, int sig, void *info, void *ucontext);
 } atl_host;
 
 typedef struct atl_engine {

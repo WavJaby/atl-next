@@ -32,6 +32,10 @@ const FACTS: &[(&str, &str)] = &[
     ("ATL_OFFSET_HOST_CTX", "offsetof(atl_host, ctx)"),
     ("ATL_OFFSET_HOST_TRAP", "offsetof(atl_host, trap)"),
     ("ATL_OFFSET_HOST_TRAP_EX", "offsetof(atl_host, trap_ex)"),
+    (
+        "ATL_OFFSET_HOST_FAULT_REPORT",
+        "offsetof(atl_host, fault_report)",
+    ),
     ("ATL_SIZEOF_LANES", "sizeof(atl_lanes)"),
     ("ATL_OFFSET_LANES_X", "offsetof(atl_lanes, x)"),
     ("ATL_OFFSET_LANES_V", "offsetof(atl_lanes, v)"),

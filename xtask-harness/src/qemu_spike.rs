@@ -230,6 +230,14 @@ const RUNS: &[RunSpec] = &[
         red: Some('d'),
     },
     RunSpec {
+        name: "no-fault-report",
+        swap: None,
+        pool_skew: false,
+        base: "0",
+        engine_break: Some("no-fault-report"),
+        red: Some('d'),
+    },
+    RunSpec {
         name: "chain-order",
         swap: None,
         pool_skew: false,

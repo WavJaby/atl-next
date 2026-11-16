@@ -8,7 +8,7 @@ use core::ffi::{c_char, c_int, c_void};
 /// Major version: a host refuses an engine with another major.
 pub const ABI_MAJOR: u32 = 3;
 /// Minor version: additions only, appended to a struct.
-pub const ABI_MINOR: u32 = 0;
+pub const ABI_MINOR: u32 = 1;
 
 /// `ATL_PROT_READ`.
 pub const PROT_READ: u32 = 0x1;
@@ -87,7 +87,13 @@ pub struct AtlHost {
     pub trap: Option<TrapFn>,
     /// The trap callback for CALL and BIND.
     pub trap_ex: Option<TrapExFn>,
+    /// 3.1: reports a guest fault before the engine's guest delivery (signal context; header).
+    pub fault_report: Option<FaultReportFn>,
 }
+
+/// The fault-report callback of [`AtlHost`]: `info` / `ucontext` are the kernel's `siginfo_t *` / `ucontext_t *`. Signal context, async-signal-safe, must return (header).
+pub type FaultReportFn =
+    unsafe extern "C" fn(ctx: *mut c_void, sig: c_int, info: *mut c_void, ucontext: *mut c_void);
 
 /// `atl_engine::create`: `boot_exe` is a NUL-terminated path; QEMU's flags are the engine's own.
 pub type CreateFn = unsafe extern "C" fn(

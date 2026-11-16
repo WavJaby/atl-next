@@ -581,9 +581,14 @@ fn priority_why(line: Option<&str>, floor: i32) -> Option<String> {
     None
 }
 
-/// The native bridge's report of a fault handed to a guest handler (identity/mod.rs fault_report via signal.rs guest_handler); bridge1's sigsegvRecover must produce one (SIGSEGV = 11).
-const GUEST_FAULT_REPORT: &str =
-    "atl-native-bridge: fatal-signal report: fault handed to the guest's handler: sig 11 ";
+/// The native bridge's report of a fault handed to a guest handler (engine/fault_report.rs): identity reports it in signal.rs guest_handler, a foreign guest's QEMU engine through `atl_host.fault_report` (qemu/mod.rs `host_fault_report`); bridge1's sigsegvRecover must produce one (SIGSEGV = 11).
+fn guest_fault_report(foreign: bool) -> &'static str {
+    if foreign {
+        "atl-native-bridge: fatal-signal report: guest fault handed to QEMU: sig 11 "
+    } else {
+        "atl-native-bridge: fatal-signal report: fault handed to the guest's handler: sig 11 "
+    }
+}
 /// Main.mediaPlayerService's line: "returned" when the view answered the lookup and setDataSource(fd) returned, "no answer" when nothing did. A return means an answer (getMediaPlayerService waits for media.player, IMediaDeathNotifier.cpp:41); a native setDataSource error is logged and dropped by MediaPlayer.java:1305, so a return does not prove setDataSource ran: MEDIA_WAV is that check.
 const MEDIA_PLAYER_SERVICE: &str = "AtlTest: media.player: ";
 /// The probe's line when its lookup was answered and setDataSource(fd) returned (MEDIA_PLAYER_SERVICE).
@@ -728,11 +733,10 @@ fn write_assets(dir: &Path, deferred: &[&str]) -> Result<()> {
 const SKIPPED: &str = "skipped";
 /// The asset naming the calls Main skips, one label a line (Main.java SKIP_ASSET); written only for a run with [`deferred`] calls.
 const SKIP_ASSET: &str = "bridge1-skip.txt";
-/// The [`BRIDGE1_CALLS`] labels the QEMU engine does not carry yet: C++ exceptions through the guest unwinder (cppThrowCatch), guest signals (sigsegvRecover, nullFieldRead), the JIT up-call (jitUpCall), guest liblog / property callbacks (guestLog, propCallbacks), the EGL config list (FIRST_CONFIG), GL through the proxies and the ES1 context (glesPbuffer, es1Begin, es1Version, es1Pixels, es1End), and the C12 legacy library (legacyStdio, legacyNew, zRoundTrip).
+/// The [`BRIDGE1_CALLS`] labels the QEMU engine does not carry yet: C++ exceptions through the guest unwinder (cppThrowCatch), the null-field fault (nullFieldRead), the JIT up-call (jitUpCall), guest liblog / property callbacks (guestLog, propCallbacks), the EGL config list (FIRST_CONFIG), GL through the proxies and the ES1 context (glesPbuffer, es1Begin, es1Version, es1Pixels, es1End), and the C12 legacy library (legacyStdio, legacyNew, zRoundTrip).
 /// Each is skipped by Main and must log `skipped`.
 const QEMU_DEFERRED: &[&str] = &[
     "cppThrowCatch",
-    "sigsegvRecover",
     "nullFieldRead",
     "jitUpCall",
     "guestLog",
@@ -1991,13 +1995,10 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
             CpuFacts::of_remote(&run.scratch)
         };
         whys.extend(bridge1_call_failures(&app, deferred, foreign, &cpu));
-        // sigsegvRecover's fault reaches the fixture's own handler through the bridge (signal.rs guest_handler), which reports it first: the report's only gate in a real app process
-        if !deferred.contains(&"sigsegvRecover")
-            && !app.lines().any(|l| l.contains(GUEST_FAULT_REPORT))
-        {
-            whys.push(format!(
-                "bridge1: sigsegvRecover left no {GUEST_FAULT_REPORT:?} line"
-            ));
+        // sigsegvRecover's fault reaches the fixture's own handler through the bridge, which reports it first: the report's only gate in a real app process
+        let report = guest_fault_report(foreign);
+        if !deferred.contains(&"sigsegvRecover") && !app.lines().any(|l| l.contains(report)) {
+            whys.push(format!("bridge1: sigsegvRecover left no {report:?} line"));
         }
         if !deferred.contains(&"es1Pixels") {
             match es1_pixels(&app, scene) {
@@ -2183,12 +2184,10 @@ fn remote_verdict(
                     foreign,
                     &CpuFacts::of_remote(&run.scratch),
                 ));
-                if !deferred.contains(&"sigsegvRecover")
-                    && !app.lines().any(|l| l.contains(GUEST_FAULT_REPORT))
+                let report = guest_fault_report(foreign);
+                if !deferred.contains(&"sigsegvRecover") && !app.lines().any(|l| l.contains(report))
                 {
-                    whys.push(format!(
-                        "bridge1: sigsegvRecover left no {GUEST_FAULT_REPORT:?} line"
-                    ));
+                    whys.push(format!("bridge1: sigsegvRecover left no {report:?} line"));
                 }
                 if !deferred.contains(&"es1Pixels")
                     && let Err(why) = es1_pixels(&app, scene)

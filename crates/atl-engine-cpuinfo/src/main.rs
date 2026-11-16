@@ -5,7 +5,7 @@
 //! Exit status: the probe's (0, or 1 on a guest syscall error); 2 when the engine cannot be loaded or `create` fails (the reason on stderr).
 
 use std::convert::Infallible;
-use std::ffi::{CString, c_void};
+use std::ffi::{CString, c_int, c_void};
 use std::io::Write;
 use std::process::ExitCode;
 
@@ -25,6 +25,9 @@ unsafe extern "C" fn no_trap_ex(ctx: *mut c_void, kind: u32, id: u32, _: *mut At
     // SAFETY: no_trap reads none of its pointers and never returns.
     unsafe { no_trap(ctx, kind, id, std::ptr::null()) };
 }
+
+/// The probe raises no guest fault worth a report: nothing to do.
+unsafe extern "C" fn no_fault_report(_: *mut c_void, _: c_int, _: *mut c_void, _: *mut c_void) {}
 
 fn run(isa: &str) -> Result<Infallible, String> {
     let library = atl_android_paths::engine_library(isa);
@@ -53,9 +56,10 @@ fn run(isa: &str) -> Result<Infallible, String> {
         minor: ABI_MINOR,
         size: std::mem::size_of::<AtlHost>() as u32,
         ctx: std::ptr::null_mut(),
-        // the engine requires both callbacks
+        // the engine requires every callback
         trap: Some(no_trap),
         trap_ex: Some(no_trap_ex),
+        fault_report: Some(no_fault_report),
     };
     let mut engine = std::ptr::null_mut();
     // SAFETY: host and probe live for the call (the ABI); engine is an out parameter. The probe's exit_group ends the process inside this call.

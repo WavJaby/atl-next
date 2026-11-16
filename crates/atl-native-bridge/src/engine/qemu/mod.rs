@@ -120,6 +120,7 @@ pub fn boot(library: &Path, boot_exe: &Path, on_trap: OnTrap) -> Result<(), Stri
         ctx: std::ptr::null_mut(),
         trap: Some(host_trap),
         trap_ex: Some(host_trap_ex),
+        fault_report: Some(host_fault_report),
     };
     let mut engine = std::ptr::null_mut();
     // SAFETY: host and exe live for the call (the ABI); engine is an out parameter. create returns after BOOT answered.
@@ -133,6 +134,19 @@ pub fn boot(library: &Path, boot_exe: &Path, on_trap: OnTrap) -> Result<(), Stri
             handle: engine,
         })
         .map_err(|_| "qemu crossing: engine set twice".to_owned())
+}
+
+/// `atl_host.fault_report`: the engine is about to hand a guest fault to QEMU, which then takes the guest's action (handler or default) -> report first, as identity does before a guest handler. Signal context.
+unsafe extern "C" fn host_fault_report(
+    _: *mut c_void,
+    sig: c_int,
+    info: *mut c_void,
+    uc: *mut c_void,
+) {
+    // SAFETY: the engine passes this delivery's kernel siginfo / ucontext (ABI).
+    unsafe {
+        super::fault_report::fault_report("guest fault handed to QEMU", sig, info.cast(), uc, 0)
+    };
 }
 
 /// NativeBridge `getSignalHandler` under this engine: [`fault`] for SIGSEGV and SIGBUS, whose guest faults the engine owns; none for any other signal.
