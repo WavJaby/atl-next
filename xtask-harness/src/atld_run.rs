@@ -122,6 +122,9 @@ const FEATURE_FILES: [&str; 3] = [
 /// FEATURE_WEBVIEW's permission file, placed only by gates that test the WebView provider path ([`Runtime::with_webview_feature`]).
 const WEBVIEW_FEATURE_FILE: &str = "android.software.webview.xml";
 
+/// Where the run places the WebView provider ([`Runtime::with_webview_provider`]), as AOSP's product image does (media_product.mk `webview`): `<partition>/app/<module>/<module>.apk` (build/soong/java/app.go installPath).
+const WEBVIEW_PROVIDER: &str = "app/webview/webview.apk";
+
 /// The /system files of the media stack an app process reads: the extractor plugins (MediaExtractorFactory loads `lib64/extractors`) and AOSP's codec lists (`media_codecs.xml` is the software list; the Codec2 list is `media_codecs_c2.xml`, read from the parser's default search dirs, which include /system/etc).
 /// And the system features' permission files ([`FEATURE_FILES`]).
 /// One list for every /system placement: atld `--file` rows (every [`Runtime`]) and native-load's test layout (binder.rs `link_rows`). Hard error when a host file is missing: xtask native builds them.
@@ -1091,6 +1094,14 @@ impl Runtime {
         );
         self.platform_files.push((host, at));
         Ok(self)
+    }
+
+    /// Also places the converter's installed WebView provider (system-packages R2) in /product: placed by the run until the product ships it with FEATURE_WEBVIEW (webview plan S4.2, W3c).
+    pub fn with_webview_provider(self) -> Result<Self> {
+        let built = self.out.join("partitions/product").join(WEBVIEW_PROVIDER);
+        ensure!(built.is_file(), "missing input {}", built.display());
+        let at = format!("{}/{WEBVIEW_PROVIDER}", atl_android_paths::PRODUCT);
+        Ok(self.with_fixture_file(built, &at))
     }
 
     /// Input method clients get no death link (atld `--no-ime-death-link`): the ime gate's death sub-gate must then fail.

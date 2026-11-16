@@ -43,6 +43,7 @@ mod move_output;
 mod surface_view;
 mod suspended;
 mod ui_block;
+mod webview;
 mod widgets;
 
 #[derive(clap::Args)]
@@ -141,6 +142,9 @@ pub struct Args {
     /// Stage hwui only: this `[[reverse]]` row of launcher-closure.toml is dropped before judging, so its soname is a new reverse binding and the bindings sub-gate must fail naming it (the gate's deliberate break).
     #[arg(long, value_name = "SONAME")]
     break_forget_reverse: Option<String>,
+    /// Stage webview only: the run's library dir lacks the web engine module (a host without WebKit), the fixture's WebView cannot be made, so the readback sub-gate must fail (the gate's deliberate break, environment-side).
+    #[arg(long)]
+    break_webview_engine: bool,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -171,6 +175,9 @@ enum Stage {
     Move,
     /// UI mode at scale 1.6: software SurfaceViews below and above a software window; the readback against the picture worked out from the fixture's spec (xtask-harness/src/window/surface_view.rs).
     SurfaceView,
+    /// UI mode: a WebView (the provider placed, FEATURE_WEBVIEW's test file) with a native View over it; the readback against the picture worked out from the fixture's spec (xtask-harness/src/window/webview.rs; webview plan W3a).
+    #[value(name = "webview")]
+    WebView,
     /// UI mode: a SurfaceView's thread keeps posting while the UI thread sleeps 2 s; the compositor's clock must keep releasing its buffers (xtask-harness/src/window/ui_block.rs; composer threading S2).
     UiBlock,
     /// The gtk stage on window-hwui (hardware accelerated): onDraw gets hwui's RecordingCanvas, and the frame hwui's RenderThread draws through EGL reaches the window's picture as the quadrants.
@@ -207,6 +214,7 @@ impl Stage {
             Stage::StartFinish => "start-finish",
             Stage::Move => "move",
             Stage::SurfaceView => "surface-view",
+            Stage::WebView => "webview",
             Stage::UiBlock => "ui-block",
             Stage::Hwui => "hwui",
             Stage::Dialog => "dialog",
@@ -226,6 +234,7 @@ impl Stage {
             Stage::Frames | Stage::Input => FRAMES_WINDOW_MS,
             Stage::Gtk
             | Stage::SurfaceView
+            | Stage::WebView
             | Stage::UiBlock
             | Stage::Hwui
             | Stage::Gles2
@@ -256,6 +265,7 @@ fn takes_pictures(stage: Stage) -> bool {
             | Stage::Gles2
             | Stage::Widgets
             | Stage::SurfaceView
+            | Stage::WebView
             | Stage::Dialog
             | Stage::Resize
             | Stage::Relaunch
@@ -396,6 +406,7 @@ fn marker(stage: Stage) -> &'static str {
         | Stage::Suspended
         | Stage::MouseTouch => "AtlWindow: onResume reached",
         Stage::SurfaceView => surface_view::MARKER,
+        Stage::WebView => webview::MARKER,
         Stage::Dialog => dialog::MARKER,
         Stage::Gles2 => gles2::MARKER,
     }
@@ -1858,6 +1869,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         | Stage::StartFinish
         | Stage::Move
         | Stage::SurfaceView
+        | Stage::WebView
         | Stage::UiBlock
         | Stage::Dialog
         | Stage::Gles2
@@ -1948,6 +1960,19 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         rt
     };
+    // the WebView provider path as the app gate runs it, until the product declares FEATURE_WEBVIEW (webview plan W3c); the break takes the engine module away
+    let rt = if matches!(args.stage, Stage::WebView) {
+        let rt = rt
+            .with_webview_feature(&Layout::of(root)?.src().join("aosp"))?
+            .with_webview_provider()?;
+        if args.break_webview_engine {
+            rt.without_webview_engine()?
+        } else {
+            rt
+        }
+    } else {
+        rt
+    };
     // the desktop's mouse-as-one-finger adaptation (atld `--mouse-touch`): this stage's drag is a touchscreen's; its break is the adaptation off, the AOSP mouse
     let rt = if matches!(args.stage, Stage::MouseTouch) && !args.break_mouse_touch {
         rt.with_mouse_touch()
@@ -1966,6 +1991,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Stage::Declared => DECLARED_FIXTURE,
         Stage::StartFinish => START_FIXTURE,
         Stage::SurfaceView => surface_view::FIXTURE,
+        Stage::WebView => webview::FIXTURE,
         Stage::UiBlock => ui_block::FIXTURE,
         Stage::Hwui => HWUI_FIXTURE,
         Stage::Dialog => dialog::FIXTURE,
@@ -2073,6 +2099,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 Some(capture_probe) => surface_view::drive(p, &log, capture_probe),
                 None => Err("no capture probe".to_owned()),
             },
+            (Stage::WebView, _, _) => match &capture_probe {
+                Some(capture_probe) => webview::drive(p, &log, capture_probe),
+                None => Err("no capture probe".to_owned()),
+            },
             (Stage::UiBlock, _, _) => ui_block::drive(p, &log),
             (Stage::MouseTouch, _, _) => widgets::drive_mouse_touch(p, &log),
             (Stage::Dialog, _, _) => match &capture_probe {
@@ -2167,6 +2197,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             ("touch-mode", touch_mode_check(&services)),
         ],
         (Stage::SurfaceView, Some(_)) => surface_view::checks(&app, &liveness, &captured),
+        (Stage::WebView, Some(_)) => webview::checks(&app, &liveness, &captured),
         (Stage::UiBlock, Some(_)) => ui_block::checks(&app),
         (Stage::MouseTouch, Some(_)) => widgets::mouse_touch_checks(&app, &liveness),
         (Stage::Dialog, Some(_)) => {

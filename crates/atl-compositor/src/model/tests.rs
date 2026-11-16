@@ -1215,7 +1215,7 @@ fn colour_layer_fills_its_parent_crop_below_the_window() {
         scene.quads[0].alpha, 1.0,
         "eColorChanged leaves the alpha alone"
     );
-    assert_eq!(c.counters().unbounded_color_skipped, 1);
+    assert_eq!(c.counters().unbounded_skipped, 1);
     let mut lit = LayerState::new();
     lit.surface = plain;
     lit.what = what::E_COLOR_CHANGED;
@@ -1228,6 +1228,70 @@ fn colour_layer_fills_its_parent_crop_below_the_window() {
             .iter()
             .any(|q| q.layer_id == 4 && q.content == Content::Color([1.0, 0.0, 0.0])),
         "setColor with components >= 0 makes a bufferless layer fill (RequestedLayerState::fillsColor)"
+    );
+}
+
+/// The WebView provider's carrier (webview plan S2.2 amended): a SurfaceView surface layer (setWindowCrop(w, h) = its own crop) under a cropped container, given a sideband stream through BLASTBufferQueue.
+/// The quad shows the stream's ints over the layer's own crop mapped (unclipped), scissored by the container; a buffer queued on it changes nothing (SurfaceFlinger: Composition::SIDEBAND wins);
+/// a null stream (cleared) brings the buffer back.
+#[test]
+fn sideband_layer_shows_its_stream_over_its_own_crop() {
+    let (window, container, carrier) = (local(1), local(2), local(3));
+    let mut c = Compositor::new(CompositorConfig::default());
+    c.create_layer(spec(window, 1, None)).unwrap();
+    c.create_layer(spec(container, 2, Some(key(&window))))
+        .unwrap();
+    c.create_layer(spec(carrier, 3, Some(key(&container))))
+        .unwrap();
+    let rect = |l, t, r, b| FloatRect {
+        left: l,
+        top: t,
+        right: r,
+        bottom: b,
+    };
+    let mut parent = LayerState::new();
+    parent.surface = container;
+    parent.what = what::E_POSITION_CHANGED | what::E_CROP_CHANGED;
+    (parent.x, parent.y) = (10.0, 20.0);
+    // the container shows only the top 20 rows of the carrier's 40 (a scrolled-off part)
+    parent.crop = rect(0.0, 0.0, 30.0, 20.0);
+    let mut own = LayerState::new();
+    own.surface = carrier;
+    own.what = what::E_CROP_CHANGED | what::E_SIDEBAND_STREAM_CHANGED;
+    own.crop = rect(0.0, 0.0, 30.0, 40.0);
+    own.sideband_stream = Some(atl_libgui_parcel::state::NativeHandle {
+        fds: Vec::new(),
+        ints: vec![7, 42],
+    });
+    c.queue_transaction(tx(vec![parent, own]));
+    show(&mut c, &window, 11, 64, 64);
+    let scene = c.on_frame(1).scene.unwrap();
+    let q = scene
+        .quads
+        .iter()
+        .find(|q| q.layer_id == 3)
+        .expect("the carrier has a quad");
+    assert_eq!(q.content, Content::Sideband(vec![7, 42]));
+    // own crop (0,0,30,40) at the container's (10,20); scissor = the container's crop there
+    assert_eq!(q.dst, rect(10.0, 20.0, 40.0, 60.0));
+    assert_eq!(q.clip, Some(rect(10.0, 20.0, 40.0, 40.0)));
+    show(&mut c, &carrier, 12, 30, 40);
+    let scene = c.on_frame(2).scene.unwrap();
+    let q = scene.quads.iter().find(|q| q.layer_id == 3).unwrap();
+    assert_eq!(
+        q.content,
+        Content::Sideband(vec![7, 42]),
+        "a buffer does not replace the stream"
+    );
+    let mut cleared = LayerState::new();
+    cleared.surface = carrier;
+    cleared.what = what::E_SIDEBAND_STREAM_CHANGED;
+    c.queue_transaction(tx(vec![cleared]));
+    let scene = c.on_frame(3).scene.unwrap();
+    let q = scene.quads.iter().find(|q| q.layer_id == 3).unwrap();
+    assert!(
+        q.buffer().is_some(),
+        "a cleared stream shows the buffer again"
     );
 }
 

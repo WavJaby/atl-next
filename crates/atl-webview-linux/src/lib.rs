@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The WebView module's exports (`atl_platform_ui_api::abi::WebViewVtable`): WebKitGTK behind the facade's `PlatformWebEngine`.
 //! Default UA: `webkit_settings_get_user_agent` of fresh settings -- the engine's own default. Measured (W1c probe, WebKitGTK 2.54): works with no display, without gtk_init and off the main thread, so a provider call from an app worker thread (AdMob) needs no UI.
-//! Views: a `WebKitWebView` never parented (W0: loads and runs JS unrealized). Every `view_*` runs on the GTK main thread (the Android UI thread); signals arrive there.
+//! Views: a `WebKitWebView` (W0: loads and runs JS unrealized, before any window parents it); shown by the UI module, which parents it into the window whose scene has its sideband quad (`view_widget`). Every `view_*` runs on the GTK main thread (the Android UI thread); signals arrive there.
 
 use std::cell::RefCell;
 use std::mem::ManuallyDrop;
@@ -33,6 +33,7 @@ static VTABLE: WebViewVtable = WebViewVtable {
     view_get_bool,
     view_set_user_agent,
     view_user_agent,
+    view_widget,
 };
 
 /// [`abi::WebViewEntry`]: the static vtable; starts nothing.
@@ -397,6 +398,16 @@ unsafe extern "C" fn view_get_bool(h: *mut WebViewHandle, which: BoolSetting) ->
 unsafe extern "C" fn view_set_user_agent(h: *mut WebViewHandle, ua: Str) {
     // SAFETY: `ua` is alive for this call.
     settings(h).set_user_agent(Some(&unsafe { ua.get() }));
+}
+
+unsafe extern "C" fn view_widget(h: *mut WebViewHandle) -> *mut std::ffi::c_void {
+    use webkit6::glib::translate::ToGlibPtr;
+    let w: *mut webkit6::gtk::ffi::GtkWidget = view(h)
+        .web
+        .upcast_ref::<webkit6::gtk::Widget>()
+        .to_glib_none()
+        .0;
+    w.cast()
 }
 
 unsafe extern "C" fn view_user_agent(h: *mut WebViewHandle, out: *mut BytesOut) {

@@ -178,55 +178,64 @@ final class WebViewProviderImpl implements WebViewProvider, WebViewProvider.View
     @Override public boolean getRendererPriorityWaivedWhenNotVisible() { throw Unimplemented.refuse("WebViewProvider.getRendererPriorityWaivedWhenNotVisible"); }
     @Override public void notifyFindDialogDismissed() { throw Unimplemented.refuse("WebViewProvider.notifyFindDialogDismissed"); }
 
-    // ---- ViewDelegate, not yet (composition and input are W3) ----
-    @Override public boolean shouldDelayChildPressedState() { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.shouldDelayChildPressedState"); }
+    // ---- ViewDelegate, composition (W3a): the page is drawn by the platform in the hole of the carrier SurfaceView child (the native init adds it), so the View side keeps View's defaults ----
+    // WebView.onMeasure ran AbsoluteLayout's measure (the carrier included) before this: kept (Chromium sizes wrap_content by page content, not yet)
+    @Override public void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {}
+    @Override public boolean setFrame(int left, int top, int right, int bottom) { return mWebViewPrivate.super_setFrame(left, top, right, bottom); }
+    @Override public void setLayoutParams(LayoutParams layoutParams) { mWebViewPrivate.super_setLayoutParams(layoutParams); }
+    // the carrier follows the WebView's layout; the platform sizes the page to the carrier's layer
+    @Override public void onSizeChanged(int w, int h, int ow, int oh) {}
+    // nothing to draw: the carrier's hole shows the page
+    @Override public void onDraw(Canvas canvas) {}
+    @Override public void onAttachedToWindow() {}
+    @Override public void onDetachedFromWindow() {}
+    @Override public void onVisibilityChanged(View changedView, int visibility) {}
+    @Override public void onWindowVisibilityChanged(int visibility) {}
+    @Override public void onScrollChanged(int l, int t, int oldl, int oldt) {}
+    // Chromium's answer (WebViewChromium.shouldDelayChildPressedState)
+    @Override public boolean shouldDelayChildPressedState() { return true; }
+    @Override public boolean requestFocus(int direction, Rect previouslyFocusedRect) { return mWebViewPrivate.super_requestFocus(direction, previouslyFocusedRect); }
+    @Override public boolean dispatchKeyEvent(KeyEvent event) { return mWebViewPrivate.super_dispatchKeyEvent(event); }
+    @Override public void computeScroll() { mWebViewPrivate.super_computeScroll(); }
+    // ---- ViewDelegate input (W3b): counted, View's answer meanwhile ----
+    @Override public boolean onTouchEvent(MotionEvent ev) { Unimplemented.accept("WebViewProvider.ViewDelegate.onTouchEvent"); return false; }
+    @Override public boolean onHoverEvent(MotionEvent event) { Unimplemented.accept("WebViewProvider.ViewDelegate.onHoverEvent"); return mWebViewPrivate.super_onHoverEvent(event); }
+    @Override public boolean onGenericMotionEvent(MotionEvent event) { Unimplemented.accept("WebViewProvider.ViewDelegate.onGenericMotionEvent"); return mWebViewPrivate.super_onGenericMotionEvent(event); }
+    @Override public void onWindowFocusChanged(boolean hasWindowFocus) { Unimplemented.accept("WebViewProvider.ViewDelegate.onWindowFocusChanged"); }
+    @Override public void onFocusChanged(boolean focused, int direction, Rect previouslyFocusedRect) { Unimplemented.accept("WebViewProvider.ViewDelegate.onFocusChanged"); }
+
+    // ---- ViewDelegate, not yet ----
     @Override public void onProvideVirtualStructure(android.view.ViewStructure structure) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onProvideVirtualStructure"); }
     @Override public AccessibilityNodeProvider getAccessibilityNodeProvider() { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.getAccessibilityNodeProvider"); }
     @Override public void onInitializeAccessibilityNodeInfo(AccessibilityNodeInfo info) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onInitializeAccessibilityNodeInfo"); }
     @Override public void onInitializeAccessibilityEvent(AccessibilityEvent event) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onInitializeAccessibilityEvent"); }
     @Override public boolean performAccessibilityAction(int action, Bundle arguments) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.performAccessibilityAction"); }
     @Override public void onOverScrolled(int scrollX, int scrollY, boolean clampedX, boolean clampedY) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onOverScrolled"); }
-    @Override public void onWindowVisibilityChanged(int visibility) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onWindowVisibilityChanged"); }
-    @Override public void onDraw(Canvas canvas) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onDraw"); }
-    @Override public void onDrawVerticalScrollBar(Canvas canvas, android.graphics.drawable.Drawable scrollBar, int l, int t, int r, int b) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onDrawVerticalScrollBar"); }
-    @Override public void setLayoutParams(LayoutParams layoutParams) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.setLayoutParams"); }
     @Override public boolean performLongClick() { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.performLongClick"); }
-    @Override public void onConfigurationChanged(Configuration newConfig) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onConfigurationChanged"); }
     @Override public InputConnection onCreateInputConnection(EditorInfo outAttrs) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onCreateInputConnection"); }
     @Override public boolean onDragEvent(DragEvent event) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onDragEvent"); }
-    @Override public boolean onKeyMultiple(int keyCode, int repeatCount, KeyEvent event) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onKeyMultiple"); }
-    @Override public boolean onKeyDown(int keyCode, KeyEvent event) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onKeyDown"); }
-    @Override public boolean onKeyUp(int keyCode, KeyEvent event) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onKeyUp"); }
-    @Override public void onAttachedToWindow() { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onAttachedToWindow"); }
-    @Override public void onDetachedFromWindow() { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onDetachedFromWindow"); }
-    @Override public void onVisibilityChanged(View changedView, int visibility) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onVisibilityChanged"); }
-    @Override public void onWindowFocusChanged(boolean hasWindowFocus) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onWindowFocusChanged"); }
-    @Override public void onFocusChanged(boolean focused, int direction, Rect previouslyFocusedRect) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onFocusChanged"); }
-    @Override public boolean setFrame(int left, int top, int right, int bottom) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.setFrame"); }
-    @Override public void onSizeChanged(int w, int h, int ow, int oh) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onSizeChanged"); }
-    @Override public void onScrollChanged(int l, int t, int oldl, int oldt) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onScrollChanged"); }
-    @Override public boolean dispatchKeyEvent(KeyEvent event) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.dispatchKeyEvent"); }
-    @Override public boolean onTouchEvent(MotionEvent ev) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onTouchEvent"); }
-    @Override public boolean onHoverEvent(MotionEvent event) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onHoverEvent"); }
-    @Override public boolean onGenericMotionEvent(MotionEvent event) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onGenericMotionEvent"); }
     @Override public boolean onTrackballEvent(MotionEvent ev) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onTrackballEvent"); }
-    @Override public boolean requestFocus(int direction, Rect previouslyFocusedRect) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.requestFocus"); }
-    @Override public void onMeasure(int widthMeasureSpec, int heightMeasureSpec) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onMeasure"); }
-    @Override public boolean requestChildRectangleOnScreen(View child, Rect rect, boolean immediate) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.requestChildRectangleOnScreen"); }
-    @Override public void setBackgroundColor(int color) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.setBackgroundColor"); }
-    @Override public void setLayerType(int layerType, Paint paint) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.setLayerType"); }
-    @Override public void preDispatchDraw(Canvas canvas) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.preDispatchDraw"); }
-    @Override public void onStartTemporaryDetach() { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onStartTemporaryDetach"); }
-    @Override public void onFinishTemporaryDetach() { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onFinishTemporaryDetach"); }
     @Override public void onActivityResult(int requestCode, int resultCode, Intent data) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onActivityResult"); }
-    @Override public Handler getHandler(Handler originalHandler) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.getHandler"); }
-    @Override public View findFocus(View originalFocusedView) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.findFocus"); }
 
-    // ---- ScrollDelegate, not yet ----
-    @Override public int computeHorizontalScrollRange() { throw Unimplemented.refuse("WebViewProvider.ScrollDelegate.computeHorizontalScrollRange"); }
-    @Override public int computeHorizontalScrollOffset() { throw Unimplemented.refuse("WebViewProvider.ScrollDelegate.computeHorizontalScrollOffset"); }
-    @Override public int computeVerticalScrollRange() { throw Unimplemented.refuse("WebViewProvider.ScrollDelegate.computeVerticalScrollRange"); }
-    @Override public int computeVerticalScrollOffset() { throw Unimplemented.refuse("WebViewProvider.ScrollDelegate.computeVerticalScrollOffset"); }
-    @Override public int computeVerticalScrollExtent() { throw Unimplemented.refuse("WebViewProvider.ScrollDelegate.computeVerticalScrollExtent"); }
-    @Override public void computeScroll() { throw Unimplemented.refuse("WebViewProvider.ScrollDelegate.computeScroll"); }
+    // ---- ViewDelegate on the View system's own paths (draw, focus search, post, detach): View's answer; the page-side meaning (Chromium's) counted until a slice needs it ----
+    @Override public void onDrawVerticalScrollBar(Canvas canvas, android.graphics.drawable.Drawable scrollBar, int l, int t, int r, int b) { mWebViewPrivate.super_onDrawVerticalScrollBar(canvas, scrollBar, l, t, r, b); }
+    @Override public void preDispatchDraw(Canvas canvas) {}
+    @Override public Handler getHandler(Handler originalHandler) { return originalHandler; }
+    @Override public View findFocus(View originalFocusedView) { return originalFocusedView; }
+    @Override public void onStartTemporaryDetach() {}
+    @Override public void onFinishTemporaryDetach() {}
+    @Override public void setLayerType(int layerType, Paint paint) {}
+    @Override public void onConfigurationChanged(Configuration newConfig) { Unimplemented.accept("WebViewProvider.ViewDelegate.onConfigurationChanged"); }
+    @Override public void setBackgroundColor(int color) { Unimplemented.accept("WebViewProvider.ViewDelegate.setBackgroundColor"); }
+    @Override public boolean requestChildRectangleOnScreen(View child, Rect rect, boolean immediate) { Unimplemented.accept("WebViewProvider.ViewDelegate.requestChildRectangleOnScreen"); return false; }
+    @Override public boolean onKeyMultiple(int keyCode, int repeatCount, KeyEvent event) { Unimplemented.accept("WebViewProvider.ViewDelegate.onKeyMultiple"); return false; }
+    @Override public boolean onKeyDown(int keyCode, KeyEvent event) { Unimplemented.accept("WebViewProvider.ViewDelegate.onKeyDown"); return false; }
+    @Override public boolean onKeyUp(int keyCode, KeyEvent event) { Unimplemented.accept("WebViewProvider.ViewDelegate.onKeyUp"); return false; }
+
+    // ---- ScrollDelegate: View's defaults (the page fits the view) until the page's scroll extent is read from the engine ----
+    @Override public int computeHorizontalScrollRange() { return mWebView.getWidth(); }
+    @Override public int computeHorizontalScrollOffset() { return mWebView.getScrollX(); }
+    @Override public int computeVerticalScrollRange() { return mWebView.getHeight(); }
+    @Override public int computeVerticalScrollOffset() { return mWebView.getScrollY(); }
+    @Override public int computeVerticalScrollExtent() { return mWebView.getHeight(); }
 }

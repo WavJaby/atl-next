@@ -18,6 +18,10 @@ mod generated {
     #![allow(non_camel_case_types, non_snake_case, dead_code, clippy::all)]
     include!(concat!(env!("OUT_DIR"), "/jni.rs"));
 }
+mod window {
+    #![allow(non_camel_case_types, non_snake_case, dead_code, clippy::all)]
+    include!(concat!(env!("OUT_DIR"), "/window.rs"));
+}
 use generated::{_jfieldID, _jmethodID, JNIInvokeInterface, JNINativeInterface, jvalue};
 
 type Env = *mut *const JNINativeInterface;
@@ -348,6 +352,9 @@ pub extern "C" fn Java_com_android_webview_chromium_Unimplemented_accept(
 /// The native side of one `WebViewProviderImpl` (its `mNative`).
 struct Native {
     view: PlatformWebView,
+    /// The view's sideband stream as a `native_handle_t` (no fds, the stream's ints): leaked, because the carrier's BufferQueue keeps a non-owning NativeHandle on it
+    /// (Surface::dispatchSetSidebandStream, `NativeHandle::create(h, false)`) that may outlive this provider; 20 bytes per WebView.
+    sideband: &'static [i32],
     shared: Rc<Shared>,
     /// `addJavascriptInterface` objects: name, global ref, the `@JavascriptInterface` method names.
     interfaces: RefCell<Vec<(String, usize, Vec<String>)>>,
@@ -408,8 +415,18 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProvid
     if pending(env) {
         return NULL;
     }
+    let stream = view.sideband_stream();
+    let handle: Vec<i32> = [
+        std::mem::size_of::<window::native_handle>() as i32, // version: sizeof(native_handle_t), as native_handle_create sets it
+        0,                                                   // numFds
+        stream.len() as i32,                                 // numInts
+    ]
+    .into_iter()
+    .chain(stream)
+    .collect();
     let native = Box::into_raw(Box::new(Native {
         view,
+        sideband: Box::leak(handle.into_boxed_slice()),
         shared: shared.clone(),
         interfaces: RefCell::default(),
     }));
@@ -824,6 +841,168 @@ fn add_interface(env: Env, n: &Native, object: Obj, name: &str) {
     refresh_scripts(n);
 }
 
+// ---- the carrier layer (webview plan S2.2 amended) ----
+
+/// A new object of `class` through constructor `sig` (private ones too), or null with an exception pending.
+fn new_object(env: Env, class: &CStr, sig: &CStr, args: &[jvalue]) -> Obj {
+    let c = jni_call!(env, FindClass, class.as_ptr());
+    if c.is_null() {
+        return NULL;
+    }
+    let init = jni_call!(env, GetMethodID, c, c"<init>".as_ptr(), sig.as_ptr());
+    let o = if init.is_null() {
+        NULL
+    } else {
+        jni_call!(env, NewObjectA, c, init, args.as_ptr())
+    };
+    delete_local(env, c);
+    o
+}
+
+/// Adds the carrier of `provider`'s view: a SurfaceView filling the WebView (WebView is an AbsoluteLayout), whose holder's LayerCallback sets the view's sideband stream on each new Surface.
+/// SurfaceView brings the rest: its layer below the window, the hole hwui leaves there, the transparent region, the layer following the view's position.
+fn add_carrier(env: Env, provider: Obj) {
+    jni_call!(env, PushLocalFrame, 16);
+    let web_view = object_field(env, provider, c"mWebView", c"Landroid/webkit/WebView;");
+    let context = call_obj(
+        env,
+        web_view,
+        c"getContext",
+        c"()Landroid/content/Context;",
+        &[],
+    );
+    let carrier = new_object(
+        env,
+        c"android/view/SurfaceView",
+        c"(Landroid/content/Context;)V",
+        &[l(context)],
+    );
+    let callback = new_object(
+        env,
+        c"com/android/webview/chromium/LayerCallback",
+        c"(Lcom/android/webview/chromium/WebViewProviderImpl;)V",
+        &[l(provider)],
+    );
+    // ViewGroup.LayoutParams.MATCH_PARENT
+    const MATCH_PARENT: i32 = -1;
+    let params = new_object(
+        env,
+        c"android/view/ViewGroup$LayoutParams",
+        c"(II)V",
+        &[jvalue { i: MATCH_PARENT }, jvalue { i: MATCH_PARENT }],
+    );
+    if !pending(env) && !carrier.is_null() && !callback.is_null() && !params.is_null() {
+        let holder = call_obj(
+            env,
+            carrier,
+            c"getHolder",
+            c"()Landroid/view/SurfaceHolder;",
+            &[],
+        );
+        call_void(
+            env,
+            holder,
+            c"addCallback",
+            c"(Landroid/view/SurfaceHolder$Callback;)V",
+            &[l(callback)],
+        );
+        call_void(
+            env,
+            web_view,
+            c"addView",
+            c"(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V",
+            &[l(carrier), l(params)],
+        );
+    }
+    jni_call!(env, PopLocalFrame, NULL);
+}
+
+/// libandroid's `ANativeWindow_fromSurface` (NDK: the Surface's window, one reference taken), looked up once.
+fn window_from_surface() -> Result<WindowFromSurface, String> {
+    static F: OnceLock<Result<usize, String>> = OnceLock::new();
+    let f = F
+        .get_or_init(|| {
+            // SAFETY: dlopen/dlsym with NUL-terminated names; libandroid.so is on every app's library path (the runtime's LD_LIBRARY_PATH) and stays loaded (no dlclose).
+            unsafe {
+                let lib = libc::dlopen(c"libandroid.so".as_ptr(), libc::RTLD_NOW);
+                if lib.is_null() {
+                    return Err("dlopen libandroid.so failed".into());
+                }
+                let sym = libc::dlsym(lib, c"ANativeWindow_fromSurface".as_ptr());
+                if sym.is_null() {
+                    return Err("libandroid.so has no ANativeWindow_fromSurface".into());
+                }
+                Ok(sym as usize)
+            }
+        })
+        .clone()?;
+    // SAFETY: the NDK's prototype `ANativeWindow* ANativeWindow_fromSurface(JNIEnv*, jobject)` (android/native_window_jni.h).
+    Ok(unsafe { std::mem::transmute::<usize, WindowFromSurface>(f) })
+}
+
+type WindowFromSurface = unsafe extern "C" fn(Env, Obj) -> *mut window::ANativeWindow;
+
+/// `native_window_set_sideband_stream(window(surface), handle)` (system/window.h): libgui's Surface hands it to BLASTBufferQueue, which sets it on the carrier's layer (eSidebandStreamChanged).
+fn set_sideband(env: Env, surface: Obj, handle: &'static [i32]) -> Result<(), String> {
+    if surface.is_null() {
+        return Err("no Surface".into());
+    }
+    let from_surface = window_from_surface()?;
+    // SAFETY: a live Surface local ref on a thread with this env.
+    let w = unsafe { from_surface(env, surface) };
+    if w.is_null() {
+        return Err("ANativeWindow_fromSurface returned null".into());
+    }
+    // SAFETY: `w` is a live window holding the reference fromSurface took; `perform` is variadic and this op's one argument is a `native_handle_t*` (window.h), whose memory is 'static.
+    // decRef is ANativeWindow_release's call (the reference fromSurface took).
+    let r = unsafe {
+        let r = match (*w).perform {
+            Some(perform) => perform(
+                w,
+                window::NATIVE_WINDOW_SET_SIDEBAND_STREAM as i32,
+                handle.as_ptr(),
+            ),
+            None => i32::MIN,
+        };
+        if let Some(dec) = (*w).common.decRef {
+            dec(&raw mut (*w).common);
+        }
+        r
+    };
+    match r {
+        0 => Ok(()),
+        i32::MIN => Err("the window has no perform hook".into()),
+        e => Err(format!("NATIVE_WINDOW_SET_SIDEBAND_STREAM: {e}")),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_android_webview_chromium_LayerCallback_surfaceCreated(
+    env: Env,
+    this: Obj,
+    holder: Obj,
+) {
+    let provider = object_field(
+        env,
+        this,
+        c"mProvider",
+        c"Lcom/android/webview/chromium/WebViewProviderImpl;",
+    );
+    let Some(n) = (!provider.is_null())
+        .then(|| native(env, provider))
+        .flatten()
+    else {
+        return; // destroyed: the carrier shows nothing
+    };
+    let surface = call_obj(env, holder, c"getSurface", c"()Landroid/view/Surface;", &[]);
+    match set_sideband(env, surface, n.sideband) {
+        Ok(()) => tracing::info!("webview: carrier stream set {:?}", &n.sideband[3..]),
+        Err(e) => tracing::error!("webview: carrier stream not set: {e}"),
+    }
+    delete_local(env, surface);
+    delete_local(env, provider);
+}
+
 /// Declares one provider native whose body gets `(env, &Native, args...)`; after destroy it returns `$default` (Chromium logs and ignores calls on a destroyed WebView).
 macro_rules! provider_native {
     ($sym:ident, ($env:ident, $n:ident $(, $p:ident: $t:ty)*) -> $ret:ty = $default:expr, $body:block) => {
@@ -840,6 +1019,12 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_init, (en
     if private_browsing != 0 {
         // Chromium's WebViewChromium.init for apps targeting KitKat and later
         return throw(env, c"java/lang/IllegalArgumentException", "Private browsing is not supported in WebView.");
+    }
+    let provider = jni_call!(env, NewLocalRef, n.shared.provider.get() as Obj);
+    add_carrier(env, provider);
+    delete_local(env, provider);
+    if pending(env) {
+        return;
     }
     if interfaces.is_null() {
         return;

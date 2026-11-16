@@ -50,6 +50,24 @@ fn gsk_transform(place: &Placement) -> gsk::Transform {
 /// GSK rotates positive angles clockwise on its y-down plane, like cairo.
 const CLOCKWISE_QUARTER_TURN_DEGREES: f32 = 90.0;
 
+/// One step of a built scene, bottom first: a render node, or a sideband stream's content, which the view draws itself at that depth (a toolkit widget can only be drawn by its parent's snapshot).
+#[derive(Debug)]
+pub enum Piece {
+    /// A quad's render node, physical pixels.
+    Node(gsk::RenderNode),
+    /// A sideband quad: its stream's ints, where it lands (`dst`) and its scissor, physical pixels, and its alpha.
+    Sideband {
+        /// The stream's ints.
+        stream: Vec<i32>,
+        /// The quad's destination.
+        dst: FloatRect,
+        /// The quad's scissor cut with `dst`.
+        clip: FloatRect,
+        /// The layer alpha.
+        alpha: f32,
+    },
+}
+
 /// The node of one quad, `None` when nothing of it shows (empty rectangles, scissored away); a buffer quad's buffer is added to `shown`.
 fn quad_node(
     display: &gdk::Display,
@@ -59,6 +77,7 @@ fn quad_node(
 ) -> Result<Option<gsk::RenderNode>, PresentError> {
     let b = match &quad.content {
         Content::Buffer(b) => b,
+        Content::Sideband(_) => unreachable!("build takes sideband quads apart"),
         // the layer alpha is the colour's own: no opacity node
         Content::Color([r, g, b]) => {
             let Some(shown) = visible(&quad.dst, quad.clip.as_ref()) else {
@@ -110,19 +129,41 @@ fn quad_node(
     ))
 }
 
-/// The render node of `scene` in physical pixels of `display`, with the buffers it samples. Fails without side effects on the first buffer that cannot be imported.
-/// `device`: the DRM device every buffer must come from (GtkUi's `buffer_device`).
+/// The pieces of `scene` in physical pixels of `display`, bottom first (consecutive quads in one container node, a sideband quad on its own), with the buffers it samples. Fails without side
+/// effects on the first buffer that cannot be imported. `device`: the DRM device every buffer must come from (GtkUi's `buffer_device`).
 pub fn build(
     display: &gdk::Display,
     scene: &Scene,
     device: Option<DeviceNumber>,
-) -> Result<(gsk::RenderNode, Vec<Shown>), PresentError> {
+) -> Result<(Vec<Piece>, Vec<Shown>), PresentError> {
     let mut shown = Vec::new();
-    let mut children = Vec::new();
+    let mut pieces = Vec::new();
+    let mut run = Vec::new();
+    let flush = |run: &mut Vec<gsk::RenderNode>, pieces: &mut Vec<Piece>| {
+        if !run.is_empty() {
+            pieces.push(Piece::Node(
+                gsk::ContainerNode::new(&std::mem::take(run)).upcast(),
+            ));
+        }
+    };
     for quad in &scene.quads {
-        children.extend(quad_node(display, device, quad, &mut shown)?);
+        if let Content::Sideband(stream) = &quad.content {
+            let Some(clip) = visible(&quad.dst, quad.clip.as_ref()) else {
+                continue;
+            };
+            flush(&mut run, &mut pieces);
+            pieces.push(Piece::Sideband {
+                stream: stream.clone(),
+                dst: quad.dst,
+                clip,
+                alpha: quad.alpha,
+            });
+            continue;
+        }
+        run.extend(quad_node(display, device, quad, &mut shown)?);
     }
-    Ok((gsk::ContainerNode::new(&children).upcast(), shown))
+    flush(&mut run, &mut pieces);
+    Ok((pieces, shown))
 }
 
 #[cfg(test)]

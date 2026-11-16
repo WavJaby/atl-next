@@ -219,7 +219,7 @@ fn quad(layer_id: i32, buffer: Arc<SceneBuffer>, src: FloatRect, dst: FloatRect)
 fn content(q: &mut Quad) -> &mut BufferContent {
     match &mut q.content {
         Content::Buffer(b) => b,
-        Content::Color(_) => unreachable!("quad() makes buffer quads"),
+        Content::Color(_) | Content::Sideband(_) => unreachable!("quad() makes buffer quads"),
     }
 }
 

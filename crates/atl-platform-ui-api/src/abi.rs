@@ -683,14 +683,24 @@ pub struct BufferView {
     buffer_transform: u32,
 }
 
+/// [`QuadView::kind`] of a [`Content::Color`] quad.
+pub const QUAD_COLOR: u32 = 0;
+/// [`QuadView::kind`] of a [`Content::Buffer`] quad.
+pub const QUAD_BUFFER: u32 = 1;
+/// [`QuadView::kind`] of a [`Content::Sideband`] quad.
+pub const QUAD_SIDEBAND: u32 = 2;
+
 /// One [`Quad`].
 #[repr(C)]
 pub struct QuadView {
     layer_id: i32,
     name: Str,
-    is_buffer: bool,
+    /// [`QUAD_COLOR`], [`QUAD_BUFFER`] or [`QUAD_SIDEBAND`]: which of `color`, `buffer`, `sideband` holds the content.
+    kind: u32,
     color: [f32; 3],
     buffer: BufferView,
+    sideband: *const i32,
+    sideband_len: usize,
     dst: RectView,
     has_clip: bool,
     clip: RectView,
@@ -714,32 +724,30 @@ impl SceneView {
         for (q, fd_store) in scene.quads.iter().zip(fds.iter_mut()) {
             fd_store.clear();
             let zero = RectView::of(&q.dst);
-            let (is_buffer, color, buffer) = match &q.content {
-                Content::Color(rgb) => (
-                    false,
-                    *rgb,
-                    BufferView {
-                        width: 0,
-                        height: 0,
-                        stride: 0,
-                        format: 0,
-                        usage: 0,
-                        id: 0,
-                        fds: std::ptr::null(),
-                        fds_len: 0,
-                        ints: std::ptr::null(),
-                        ints_len: 0,
-                        frame_number: 0,
-                        acquire_fence: -1,
-                        src: zero,
-                        opaque: false,
-                        buffer_transform: 0,
-                    },
-                ),
+            let no_buffer = BufferView {
+                width: 0,
+                height: 0,
+                stride: 0,
+                format: 0,
+                usage: 0,
+                id: 0,
+                fds: std::ptr::null(),
+                fds_len: 0,
+                ints: std::ptr::null(),
+                ints_len: 0,
+                frame_number: 0,
+                acquire_fence: -1,
+                src: zero,
+                opaque: false,
+                buffer_transform: 0,
+            };
+            let (kind, color, buffer, sideband) = match &q.content {
+                Content::Color(rgb) => (QUAD_COLOR, *rgb, no_buffer, &[][..]),
+                Content::Sideband(ints) => (QUAD_SIDEBAND, [0.0; 3], no_buffer, &ints[..]),
                 Content::Buffer(b) => {
                     fd_store.extend(b.buffer.fds.iter().map(|f| f.raw()));
                     (
-                        true,
+                        QUAD_BUFFER,
                         [0.0; 3],
                         BufferView {
                             width: b.buffer.width,
@@ -758,15 +766,18 @@ impl SceneView {
                             opaque: b.opaque,
                             buffer_transform: b.buffer_transform,
                         },
+                        &[][..],
                     )
                 }
             };
             quads.push(QuadView {
                 layer_id: q.layer_id,
                 name: Str::of(&q.name),
-                is_buffer,
+                kind,
                 color,
                 buffer,
+                sideband: sideband.as_ptr(),
+                sideband_len: sideband.len(),
                 dst: RectView::of(&q.dst),
                 has_clip: q.clip.is_some(),
                 clip: q.clip.as_ref().map_or(zero, RectView::of),
@@ -797,7 +808,13 @@ impl SceneView {
                     layer_id: q.layer_id,
                     // SAFETY: the caller's contract.
                     name: unsafe { q.name.get() }.into_owned(),
-                    content: if q.is_buffer {
+                    content: if q.kind == QUAD_SIDEBAND {
+                        // SAFETY: the caller's contract: the ints belong to the live scene (a non-null pointer, also for none).
+                        Content::Sideband(
+                            unsafe { std::slice::from_raw_parts(q.sideband, q.sideband_len) }
+                                .to_vec(),
+                        )
+                    } else if q.kind == QUAD_BUFFER {
                         let b = &q.buffer;
                         // SAFETY: the caller's contract: both arrays belong to the live scene.
                         let (fds, ints) = unsafe {
@@ -1014,6 +1031,11 @@ pub struct UiVtable {
     pub pcm_rt_fallbacks: unsafe extern "C" fn(pcm: *mut PcmHandle) -> u64,
     /// `PcmOutput::underruns`.
     pub pcm_underruns: unsafe extern "C" fn(pcm: *mut PcmHandle) -> u64,
+    /// Makes the toolkit widget `widget` (a `GtkWidget *` of the same libgtk, from another module: the WebView module's [`WebViewVtable::view_widget`]) the content of every sideband quad whose
+    /// stream is `[SIDEBAND_WEB_VIEW, key]` (crate::webview); the module takes its own reference. UI thread.
+    pub sideband_attach: unsafe extern "C" fn(key: i32, widget: *mut c_void),
+    /// Drops `key`'s widget (unparented from its window, its reference released); a quad still naming it shows nothing. UI thread.
+    pub sideband_detach: unsafe extern "C" fn(key: i32),
 }
 
 /// The WebView module's file name (webview plan S2.3): the web engine in a module of its own, loaded `RTLD_LOCAL` on first provider use, because its closure (~170 objects, +33 MB, ~70 ms measured) is not paid by apps that never touch WebView.
@@ -1188,4 +1210,6 @@ pub struct WebViewVtable {
     pub view_set_user_agent: unsafe extern "C" fn(view: *mut WebViewHandle, ua: Str),
     /// `WebView::user_agent` into `out`.
     pub view_user_agent: unsafe extern "C" fn(view: *mut WebViewHandle, out: *mut BytesOut),
+    /// The view's toolkit widget (`GtkWidget *`), borrowed: valid while the view lives; handed to [`UiVtable::sideband_attach`].
+    pub view_widget: unsafe extern "C" fn(view: *mut WebViewHandle) -> *mut c_void,
 }

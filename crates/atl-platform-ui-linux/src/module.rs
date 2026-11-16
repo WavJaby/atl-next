@@ -73,7 +73,21 @@ static VTABLE: UiVtable = UiVtable {
     pcm_set_active,
     pcm_rt_fallbacks,
     pcm_underruns,
+    sideband_attach,
+    sideband_detach,
 };
+
+unsafe extern "C" fn sideband_attach(key: i32, widget: *mut std::ffi::c_void) {
+    use gtk4::glib::translate::FromGlibPtrNone;
+    // SAFETY: a live GtkWidget of the same libgtk (the vtable contract); from_glib_none takes our own reference.
+    let w: gtk4::Widget =
+        unsafe { gtk4::Widget::from_glib_none(widget.cast::<gtk4::ffi::GtkWidget>()) };
+    crate::view::attach(key, w);
+}
+
+unsafe extern "C" fn sideband_detach(key: i32) {
+    crate::view::detach(key);
+}
 
 /// [`abi::Entry`]: the static vtable; starts nothing.
 #[unsafe(no_mangle)]

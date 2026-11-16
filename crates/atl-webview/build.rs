@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, ensure};
-use atl_bridgegen::buildscript::{self, Upstreams};
+use atl_bridgegen::buildscript::{self, HeaderImport, Upstreams, import_headers};
 use atl_bridgegen::{Lang, Source, Target};
 
 const JNI_H: &str = "libnativehelper/include_jni/jni.h";
@@ -51,5 +51,25 @@ fn main() -> Result<()> {
     }
     // the library's ABI is its `Java_*` and `JNI_OnLoad` exports; every archive symbol stays local, as the launcher runtime's
     println!("cargo::rustc-link-arg-cdylib=-Wl,--exclude-libs,ALL");
-    Ok(())
+    // the carrier layer's sideband stream (jni `set_sideband`): ANativeWindow's perform hook and native_handle_t, bionic view, layout asserted (atl-egl-driver's import)
+    import_headers(&[HeaderImport {
+        name: "window",
+        source: "frameworks/native/libs/nativewindow/include/system/window.h",
+        also: &[
+            "frameworks/native/libs/nativebase/include/nativebase/nativebase.h",
+            "system/core/libcutils/include/cutils/native_handle.h",
+        ],
+        include_dirs: &[
+            "frameworks/native/libs/nativewindow/include",
+            "frameworks/native/libs/nativebase/include",
+            "frameworks/native/libs/arect/include",
+            "system/core/libcutils/include",
+            "system/core/libsystem/include",
+        ],
+        defines: &[],
+        force_include: None,
+        functions: &[],
+        types: &["ANativeWindow", "native_handle_t"],
+        macros: &[],
+    }])
 }

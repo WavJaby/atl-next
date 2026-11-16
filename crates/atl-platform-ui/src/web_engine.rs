@@ -4,13 +4,14 @@
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use atl_platform_ui_api::abi::{
-    self, BoolSetting, BytesOut, Callback, EvalResultView, Str, WebEventView, WebViewEntry,
-    WebViewHandle, WebViewVtable, web_event,
+    self, BoolSetting, BytesOut, Callback, EvalResultView, Str, UiVtable, WebEventView,
+    WebViewEntry, WebViewHandle, WebViewVtable, web_event,
 };
 use atl_platform_ui_api::webview::{
-    LoadError, PromptReply, WebEngine, WebEvent, WebView, WebViewError,
+    LoadError, PromptReply, SIDEBAND_WEB_VIEW, WebEngine, WebEvent, WebView, WebViewError,
 };
 
 static MODULE: OnceLock<Result<&'static WebViewVtable, String>> = OnceLock::new();
@@ -94,6 +95,8 @@ impl WebEngine for PlatformWebEngine {
             };
             events(ev);
         });
+        // the window draws the view through the UI module (sideband quads), so a process without it has no use for a view
+        let ui = crate::module::module().map_err(WebViewError::Unavailable)?;
         let mut h: *mut WebViewHandle = std::ptr::null_mut();
         // SAFETY: UI thread (the trait's contract); out and err live for the call.
         let (status, err) = BytesOut::collect(|err| unsafe { (m.view_create)(sink, &mut h, err) });
@@ -102,14 +105,21 @@ impl WebEngine for PlatformWebEngine {
                 String::from_utf8_lossy(&err).into_owned(),
             ));
         }
-        Ok(PlatformWebView { m, h })
+        static NEXT_KEY: AtomicI32 = AtomicI32::new(1);
+        let key = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: UI thread; the widget is the live view's (borrowed), the UI module takes its own reference (same libgtk in both modules).
+        unsafe { (ui.sideband_attach)(key, (m.view_widget)(h)) };
+        Ok(PlatformWebView { m, ui, h, key })
     }
 }
 
 /// A view of the module; UI thread only.
 pub struct PlatformWebView {
     m: &'static WebViewVtable,
+    ui: &'static UiVtable,
     h: *mut WebViewHandle,
+    /// The second int of the view's sideband stream ([`WebView::sideband_stream`]): process-unique, never reused.
+    key: i32,
 }
 
 impl PlatformWebView {
@@ -216,11 +226,18 @@ impl WebView for PlatformWebView {
         // SAFETY: see the impl comment.
         unsafe { (self.m.view_get_bool)(self.h, BoolSetting::DomStorage) }
     }
+
+    fn sideband_stream(&self) -> [i32; 2] {
+        [SIDEBAND_WEB_VIEW, self.key]
+    }
 }
 
 impl Drop for PlatformWebView {
     fn drop(&mut self) {
-        // SAFETY: the handle `view_create` made; dropped once, on the UI thread.
-        unsafe { (self.m.view_drop)(self.h) }
+        // SAFETY: UI thread; the window lets go of the widget before the view (its owner) is destroyed. Then the handle `view_create` made, dropped once.
+        unsafe {
+            (self.ui.sideband_detach)(self.key);
+            (self.m.view_drop)(self.h)
+        }
     }
 }

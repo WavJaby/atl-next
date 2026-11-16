@@ -620,9 +620,9 @@ impl Window for GtkWindow {
     }
 
     fn present(&self, scene: &Scene) -> Result<(), PresentError> {
-        let (node, shown) =
+        let (pieces, shown) =
             scene::build(&WidgetExt::display(&self.window), scene, self.buffer_device)?;
-        self.view.show_node(node);
+        self.view.show_pieces(pieces);
         // a buffer still in the new scene stays shown; the rest is retired until the paint that stops drawing it
         let old = std::mem::replace(&mut *self.shared.shown.borrow_mut(), shown);
         let still = |s: &scene::Shown| {
@@ -667,7 +667,8 @@ impl Window for GtkWindow {
         let area = graphene::Rect::new(0.0, 0.0, size.width as f32, size.height as f32);
         let background = gsk::ColorNode::new(&gdk::RGBA::BLACK, &area);
         let mut nodes: Vec<gsk::RenderNode> = vec![background.upcast()];
-        nodes.extend(self.view.node());
+        // the widget's own picture, so sideband children (WebKit) are in it
+        nodes.extend(self.view.picture());
         let root = gsk::ContainerNode::new(&nodes);
         let texture = renderer.render_texture(&root, Some(&area));
         let mut downloader = gdk::TextureDownloader::new(&texture);

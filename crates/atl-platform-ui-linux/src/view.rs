@@ -1,11 +1,71 @@
 // SPDX-License-Identifier: MIT
-//! `SceneView`: the one widget of a window, drawing the presented scene's render node. No per-widget GTK peers (plan S3): Android renders every pixel of the app, GTK draws only this node and its own chrome.
+//! `SceneView`: the one widget of a window, drawing the presented scene's pieces. No per-widget GTK peers (plan S3): Android renders every pixel of the app, GTK draws only these nodes and its own chrome.
+//! The one exception is a sideband quad's content (webview plan S2.2 amended): a toolkit widget registered under its stream ([`attach`]; WebKit's view), made a child of the view whose scene shows it,
+//! allocated at the quad's place and drawn by `snapshot_child` at the quad's depth under its scissor and alpha, so GTK's picking finds it there.
 
 use std::cell::{Cell, RefCell};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use atl_libgui_parcel::state::FloatRect;
+use atl_platform_ui_api::webview::SIDEBAND_WEB_VIEW;
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 use gtk4::{gdk, glib, graphene, gsk};
+
+use crate::scene::Piece;
+
+/// The widgets registered for sideband streams, by key: UI thread only (ThreadGuard panics elsewhere), in a static, not a thread-local (module rule: no module object in the process's thread-local teardown).
+static SIDEBANDS: Mutex<Vec<(i32, glib::thread_guard::ThreadGuard<gtk4::Widget>)>> =
+    Mutex::new(Vec::new());
+
+/// Sideband quads drawn as nothing: a tag other than [`SIDEBAND_WEB_VIEW`] or a key with no widget (logged on the first of each).
+static SIDEBAND_UNRESOLVED: AtomicU64 = AtomicU64::new(0);
+
+/// Registers `widget` as the content of the sideband stream `[SIDEBAND_WEB_VIEW, key]`; UI thread.
+pub fn attach(key: i32, widget: gtk4::Widget) {
+    let mut list = SIDEBANDS.lock().unwrap_or_else(|p| p.into_inner());
+    list.retain(|(k, _)| *k != key);
+    list.push((key, glib::thread_guard::ThreadGuard::new(widget)));
+}
+
+/// Drops `key`'s widget: unparented from the view drawing it (which then draws nothing there); UI thread.
+pub fn detach(key: i32) {
+    let gone = {
+        let mut list = SIDEBANDS.lock().unwrap_or_else(|p| p.into_inner());
+        list.iter()
+            .position(|(k, _)| *k == key)
+            .map(|i| list.remove(i).1.into_inner())
+    };
+    if let Some(w) = gone
+        && let Some(parent) = w.parent()
+    {
+        w.unparent();
+        parent.queue_draw();
+    }
+}
+
+/// The widget of a sideband stream, if it names a registered one.
+fn resolve(stream: &[i32]) -> Option<gtk4::Widget> {
+    let [SIDEBAND_WEB_VIEW, key] = stream else {
+        return None;
+    };
+    SIDEBANDS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, w)| w.get_ref().clone())
+}
+
+fn logical_rect(r: &FloatRect, to_logical: f32) -> graphene::Rect {
+    graphene::Rect::new(
+        r.left * to_logical,
+        r.top * to_logical,
+        (r.right - r.left) * to_logical,
+        (r.bottom - r.top) * to_logical,
+    )
+}
 
 /// A content size change in physical pixels ([`SceneView::connect_allocation`]).
 type AllocateFn = Box<dyn FnMut(atl_platform_ui_api::PhysSize)>;
@@ -36,8 +96,10 @@ mod imp {
 
     #[derive(Default)]
     pub struct SceneView {
-        /// The presented scene in physical pixels; `None` before the first present.
-        pub node: RefCell<Option<gsk::RenderNode>>,
+        /// The presented scene in physical pixels, bottom first; empty before the first present.
+        pub pieces: RefCell<Vec<Piece>>,
+        /// The sideband widgets of the presented scene (children of this view) and where each lands, physical pixels.
+        pub placed: RefCell<Vec<(gtk4::Widget, FloatRect)>>,
         /// The natural size in physical pixels (what the window asked for), 0 x 0 until set; `measure` converts it at the current scale. The minimum is always 0, so the user can shrink the window.
         pub wanted: Cell<atl_platform_ui_api::PhysSize>,
         /// The last allocation reported to `on_allocate`, logical pixels: the same size is not reported twice.
@@ -62,6 +124,14 @@ mod imp {
             // quads outside the content area must not paint over the window chrome
             widget.set_overflow(gtk4::Overflow::Hidden);
         }
+
+        fn dispose(&self) {
+            // GTK requires a widget's children unparented before it goes
+            self.placed.borrow_mut().clear();
+            while let Some(child) = self.obj().first_child() {
+                child.unparent();
+            }
+        }
     }
 
     impl WidgetImpl for SceneView {
@@ -78,6 +148,7 @@ mod imp {
 
         fn size_allocate(&self, width: i32, height: i32, baseline: i32) {
             self.parent_size_allocate(width, height, baseline);
+            self.obj().allocate_children();
             if width <= 0 || height <= 0 || self.allocated.get() == (width, height) {
                 return;
             }
@@ -99,12 +170,39 @@ mod imp {
                 &gdk::RGBA::BLACK,
                 &graphene::Rect::new(0.0, 0.0, widget.width() as f32, widget.height() as f32),
             );
-            if let Some(node) = self.node.borrow().as_ref() {
-                let to_logical = (1.0 / widget.scale().get()) as f32;
-                snapshot.save();
-                snapshot.scale(to_logical, to_logical);
-                snapshot.append_node(node);
-                snapshot.restore();
+            let to_logical = (1.0 / widget.scale().get()) as f32;
+            let placed = self.placed.borrow();
+            for piece in self.pieces.borrow().iter() {
+                match piece {
+                    Piece::Node(node) => {
+                        snapshot.save();
+                        snapshot.scale(to_logical, to_logical);
+                        snapshot.append_node(node);
+                        snapshot.restore();
+                    }
+                    Piece::Sideband {
+                        stream,
+                        clip,
+                        alpha,
+                        ..
+                    } => {
+                        let Some(child) = resolve(stream).filter(|c| {
+                            c.parent().as_ref() == Some(widget.upcast_ref())
+                                && placed.iter().any(|(p, _)| p == c)
+                        }) else {
+                            continue;
+                        };
+                        snapshot.push_clip(&logical_rect(clip, to_logical));
+                        if *alpha < 1.0 {
+                            snapshot.push_opacity(f64::from(*alpha));
+                        }
+                        widget.snapshot_child(&child, snapshot);
+                        if *alpha < 1.0 {
+                            snapshot.pop();
+                        }
+                        snapshot.pop();
+                    }
+                }
             }
         }
     }
@@ -122,15 +220,71 @@ impl SceneView {
         glib::Object::new()
     }
 
-    /// Replaces the scene shown at the next frame.
-    pub fn show_node(&self, node: gsk::RenderNode) {
-        self.imp().node.replace(Some(node));
+    /// Replaces the scene shown at the next frame. Each sideband piece naming a registered widget makes it a child of this view (taken from another view first) placed at the piece;
+    /// children no piece names stay parented but hidden (`child_visible` false: neither drawn nor picked), so a layer missing for a frame does not unrealize the page.
+    pub fn show_pieces(&self, pieces: Vec<Piece>) {
+        let mut placed = Vec::new();
+        for piece in &pieces {
+            let Piece::Sideband { stream, dst, .. } = piece else {
+                continue;
+            };
+            let Some(child) = resolve(stream) else {
+                if SIDEBAND_UNRESOLVED.fetch_add(1, Ordering::Relaxed) == 0 {
+                    tracing::warn!(
+                        "atl-platform-ui: sideband stream {stream:?} names no widget: drawn as nothing (first of a count)"
+                    );
+                }
+                continue;
+            };
+            if child.parent().as_ref() != Some(self.upcast_ref()) {
+                if child.parent().is_some() {
+                    child.unparent();
+                }
+                child.set_parent(self);
+                tracing::info!("atl-platform-ui: sideband widget parented, stream {stream:?}");
+            }
+            placed.push((child, *dst));
+        }
+        let mut next = self.first_child();
+        while let Some(child) = next {
+            child.set_child_visible(placed.iter().any(|(p, _)| *p == child));
+            next = child.next_sibling();
+        }
+        let moved = *self.imp().placed.borrow() != placed;
+        self.imp().placed.replace(placed);
+        self.imp().pieces.replace(pieces);
+        if moved {
+            self.queue_allocate();
+        }
         self.queue_draw();
     }
 
-    /// The node last shown, in physical pixels.
-    pub fn node(&self) -> Option<gsk::RenderNode> {
-        self.imp().node.borrow().clone()
+    /// Allocates each placed child at its quad, in logical pixels (GTK picking follows the transform).
+    fn allocate_children(&self) {
+        let to_logical = (1.0 / self.scale().get()) as f32;
+        for (child, dst) in self.imp().placed.borrow().iter() {
+            let r = logical_rect(dst, to_logical);
+            let transform = gsk::Transform::new().translate(&graphene::Point::new(r.x(), r.y()));
+            child.allocate(
+                r.width().round() as i32,
+                r.height().round() as i32,
+                -1,
+                Some(transform),
+            );
+        }
+    }
+
+    /// What the view draws now (its scene and the sideband children), in physical pixels: the picture `Window::capture` reads.
+    pub fn picture(&self) -> Option<gsk::RenderNode> {
+        let scale = self.scale().get() as f32;
+        let snapshot = gtk4::Snapshot::new();
+        snapshot.scale(scale, scale);
+        gtk4::WidgetPaintable::new(Some(self)).snapshot(
+            &snapshot,
+            f64::from(self.width()),
+            f64::from(self.height()),
+        );
+        snapshot.to_node()
     }
 
     /// Calls `on_allocate` with the content's size in physical pixels when a layout gives it a new one (not twice for the same size).

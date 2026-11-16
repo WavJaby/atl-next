@@ -81,13 +81,15 @@ pub struct BufferContent {
     pub buffer_transform: u32,
 }
 
-/// What a quad shows: a buffer, or a solid colour (SurfaceFlinger's `fillsColor`: a layer with no buffer and colour components >= 0, LayerSnapshot.cpp).
+/// What a quad shows: a buffer, a solid colour (SurfaceFlinger's `fillsColor`: a layer with no buffer and colour components >= 0, LayerSnapshot.cpp), or a sideband stream.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Content {
     /// The layer's latched buffer.
     Buffer(BufferContent),
     /// Straight (non-premultiplied) r, g, b in [0, 1]; the quad's `alpha` is its opacity.
     Color([f32; 3]),
+    /// The layer's sideband stream (`eSidebandStreamChanged`, a native handle's ints): content another engine supplies out of band, which only the platform layer resolves (SurfaceFlinger hands it to the HWC as Composition::SIDEBAND).
+    Sideband(Vec<i32>),
 }
 
 /// One layer's content, placed on the screen.
@@ -99,7 +101,7 @@ pub struct Quad {
     pub name: String,
     /// What the quad shows.
     pub content: Content,
-    /// Where the content lands on the screen, in layer-stack pixels, before `clip`: a buffer's `src` mapped, a colour layer's bounds (its clip).
+    /// Where the content lands on the screen, in layer-stack pixels, before `clip`: a buffer's `src` mapped, a colour layer's bounds (its clip), a sideband layer's own crop mapped (else its bounds).
     pub dst: FloatRect,
     /// The scissor, in layer-stack pixels: every ancestor's and the layer's own crop; `None` when nothing crops.
     pub clip: Option<FloatRect>,
@@ -108,11 +110,11 @@ pub struct Quad {
 }
 
 impl Quad {
-    /// The buffer content, `None` for a colour quad.
+    /// The buffer content, `None` for a colour or sideband quad.
     pub fn buffer(&self) -> Option<&BufferContent> {
         match &self.content {
             Content::Buffer(b) => Some(b),
-            Content::Color(_) => None,
+            Content::Color(_) | Content::Sideband(_) => None,
         }
     }
 }

@@ -46,7 +46,13 @@ pub trait WebView {
     fn set_dom_storage_enabled(&self, on: bool);
     /// Whether DOM storage is enabled.
     fn dom_storage_enabled(&self) -> bool;
+    /// The ints of the sideband stream that shows this view (webview plan S2.2 amended): the provider sets them on the layer that carries the view, and every window draws the view where a quad with
+    /// that stream lands, at that quad's depth. The same ints for the view's life.
+    fn sideband_stream(&self) -> [i32; 2];
 }
+
+/// The first int of a WebView's sideband stream ([`WebView::sideband_stream`]): a sideband quad with another tag is not a WebView (a TV tuner's stream) and shows nothing. ASCII "WebV".
+pub const SIDEBAND_WEB_VIEW: i32 = 0x5765_6256;
 
 /// What a view reports. Within one load `LoadStarted` comes first; `Title` / `Progress` come as the engine notifies them, before or after `LoadFinished` (AOSP fixes no title order either).
 pub enum WebEvent {

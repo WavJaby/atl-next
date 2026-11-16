@@ -150,8 +150,8 @@ pub struct Counters {
     pub cache_misses: u64,
     /// `eMatrixChanged` with rotation or shear (only scale is applied).
     pub matrix_rotation_ignored: u64,
-    /// Scenes that skipped a colour layer with no crop on it or any ancestor: SurfaceFlinger bounds it by the display, which this model does not know.
-    pub unbounded_color_skipped: u64,
+    /// Colour or sideband layers skipped for having no crop on them or any ancestor: SurfaceFlinger bounds them by the display, which this model does not know.
+    pub unbounded_skipped: u64,
     /// Transactions with a desired present time (applied at the next tick regardless).
     pub desired_present_time_ignored: u64,
     /// Display states (one display, one layer stack: not applied).
@@ -258,6 +258,8 @@ struct Layer {
     held: Option<Held>,
     /// r, g, b as `eColorChanged` set them; a component < 0 = no colour fill (RequestedLayerState's encoding).
     color: [f32; 3],
+    /// The sideband stream's ints as `eSidebandStreamChanged` set them (None: no stream); its fds are not kept (no consumer of this compositor reads one).
+    sideband: Option<Vec<i32>>,
     release_channel: Option<FdObject>,
     latched_this_frame: bool,
     seq: u64,
@@ -567,6 +569,7 @@ impl Compositor {
                 } else {
                     [NO_COLOR_FILL; 3]
                 },
+                sideband: None,
                 release_channel: None,
                 latched_this_frame: false,
                 seq: self.next_seq,
@@ -784,7 +787,7 @@ impl Compositor {
         self.complete(applied, now_ns, &mut calls);
         let scene = if std::mem::take(&mut self.dirty) {
             let (scene, unbounded) = self.build_scene();
-            self.counters.unbounded_color_skipped += unbounded;
+            self.counters.unbounded_skipped += unbounded;
             Some(scene)
         } else {
             None
@@ -913,6 +916,10 @@ impl Compositor {
             if w & what::E_BUFFER_TRANSFORM_CHANGED != 0 {
                 l.buffer_transform = s.buffer_transform;
                 handled |= what::E_BUFFER_TRANSFORM_CHANGED;
+            }
+            if w & what::E_SIDEBAND_STREAM_CHANGED != 0 {
+                l.sideband = s.sideband_stream.as_ref().map(|h| h.ints.clone());
+                handled |= what::E_SIDEBAND_STREAM_CHANGED;
             }
             if w & what::E_BUFFER_RELEASE_CHANNEL_CHANGED != 0 {
                 l.release_channel = s.buffer_release_channel.as_ref().map(|c| c.fd);
@@ -1280,7 +1287,7 @@ impl Compositor {
         }
     }
 
-    /// The scene, and how many colour layers it skipped for having no bounds ([`Counters::unbounded_color_skipped`]).
+    /// The scene, and how many colour or sideband layers it skipped for having no bounds ([`Counters::unbounded_skipped`]).
     fn build_scene(&self) -> (Scene, u64) {
         let mut quads = Vec::new();
         let mut unbounded = 0;
@@ -1290,6 +1297,22 @@ impl Compositor {
                 continue;
             };
             if g.hidden || g.alpha <= 0.0 || g.layer_stack != self.config.layer_stack {
+                continue;
+            }
+            // a layer with a sideband stream shows the stream, whatever buffer it holds (SurfaceFlinger composes it as Composition::SIDEBAND); bounds as a colour layer's
+            if let Some(ints) = &l.sideband {
+                match g.clip {
+                    Some(bounds) => quads.push(Quad {
+                        layer_id: l.id,
+                        name: l.name.clone(),
+                        content: Content::Sideband(ints.clone()),
+                        // unclipped: the stream is laid out at the layer's own size (SurfaceView.setWindowCrop(w, h)) and scissored by ancestors through `clip`
+                        dst: l.crop.map_or(bounds, |c| g.map(c)),
+                        clip: g.clip,
+                        alpha: g.alpha,
+                    }),
+                    None => unbounded += 1,
+                }
                 continue;
             }
             let Some(held) = &l.held else {

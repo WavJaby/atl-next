@@ -99,6 +99,10 @@ impl<W: Write + Send> SceneSink for ReportSink<W> {
                     "color={r},{g},{b} alpha={} dst={},{},{},{}",
                     q.alpha, q.dst.left, q.dst.top, q.dst.right, q.dst.bottom
                 ),
+                Content::Sideband(ints) => format!(
+                    "sideband={ints:?} alpha={} dst={},{},{},{}",
+                    q.alpha, q.dst.left, q.dst.top, q.dst.right, q.dst.bottom
+                ),
             };
             let _ = writeln!(
                 self.0,

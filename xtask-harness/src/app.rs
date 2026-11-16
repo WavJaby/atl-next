@@ -366,8 +366,6 @@ const WEBVIEW_PACKAGE: (&str, &str) = (
     "AtlTest: webview-package: ",
     "name=com.android.webview system=true",
 );
-/// Where the run places the provider, as AOSP's product image does (media_product.mk `webview`): `<partition>/app/<module>/<module>.apk` (build/soong/java/app.go installPath).
-const WEBVIEW_PROVIDER: &str = "app/webview/webview.apk";
 /// Main.webViewPage's line (webview plan W2 gate): an unattached WebView loads Main.WEBVIEW_PAGE through loadData, then runs Main.WEBVIEW_SCRIPT at the first onPageFinished.
 /// `events`: the WebViewClient order -- onPageStarted, then onPageFinished once. `titles`: onReceivedTitle once with the page's `<title>`, in no fixed order with onPageFinished (AOSP fixes none:
 /// CTS WebChromeClientTest.testOnReceivedTitle polls for the title after the load completes; WebKit notifies it after LOAD_FINISHED for this data: page, W2 run w2-app5x). `js`: evaluateJavascript's JSON of the script's array (JSON.stringify form):
@@ -1447,14 +1445,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         rt.with_webview_feature(&layout.src().join("aosp"))?
     };
-    // the converter's installed provider (system-packages R2); placed by the run until the product ships it with FEATURE_WEBVIEW (webview plan S4.2, W3)
     let rt = if args.webview_provider_break {
         rt
     } else {
-        let built = rt.out.join("partitions/product").join(WEBVIEW_PROVIDER);
-        ensure!(built.is_file(), "missing input {}", built.display());
-        let at = format!("{}/{WEBVIEW_PROVIDER}", atl_android_paths::PRODUCT);
-        rt.with_fixture_file(built, &at)
+        rt.with_webview_provider()?
     };
     let rt = if args.settings_provider_break {
         rt.without_settings_provider()
