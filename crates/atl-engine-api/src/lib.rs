@@ -252,8 +252,12 @@ mod tests {
         }
     }
 
-    // "3.0" in the expected texts is the spec, typed here: ABI_MAJOR/ABI_MINOR are the code under test
+    /// The host version as refusals name it: the ABI constants are the version spec (bumped by hand with the header), not output of `check_engine_table`, so the tests follow each bump.
+    fn host() -> String {
+        format!("{ABI_MAJOR}.{ABI_MINOR}")
+    }
 
+    // engine-side 3.0 stays the fixture: 3.1 appended only to `atl_host`, the engine table is unchanged
     #[test]
     fn admits_a_full_3_0_engine() {
         assert_eq!(check_engine_table(&full(3, 0)), Ok(()));
@@ -264,7 +268,7 @@ mod tests {
         // a complete 2.3 table (the last 2.x minor) is still another major: 3.0 dropped `attach`
         assert_eq!(
             check_engine_table(&full(2, 3)),
-            Err("engine ABI 2.3 refused, host speaks 3.0".to_owned())
+            Err(format!("engine ABI 2.3 refused, host speaks {}", host()))
         );
     }
 
@@ -276,7 +280,10 @@ mod tests {
         };
         assert_eq!(
             check_engine_table(&table),
-            Err("engine ABI 3.0 lacks [fault], host needs 3.0".to_owned())
+            Err(format!(
+                "engine ABI 3.0 lacks [fault], host needs {}",
+                host()
+            ))
         );
     }
 }
