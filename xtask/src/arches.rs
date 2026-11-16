@@ -456,7 +456,7 @@ pub fn on_path(bin: &str) -> Option<PathBuf> {
         .and_then(|p| p.canonicalize().ok())
 }
 
-/// Every guest row's `rust` is a target rustc knows (`rustc --print target-list`) whose arch part is the row's `qemu_target` (the CPU QEMU runs it on).
+/// Every guest row's `rust` is a target rustc knows (`rustc --print target-list`) whose `target_arch` (`rustc --print cfg`) is the row's `qemu_target` (the CPU QEMU runs it on). Not the triple's first word: `armv7-linux-androideabi` is target_arch `arm`.
 pub fn check_guest_rust(root: &Path, arches: &Arches) -> Result<()> {
     let out = Command::new("rustc")
         .current_dir(root)
@@ -474,13 +474,37 @@ pub fn check_guest_rust(root: &Path, arches: &Arches) -> Result<()> {
             targets.lines().any(|t| t == rust),
             "{FILE}: {name}: guest rust {rust} is not a rustc target"
         );
+        let arch = rustc_target_arch(root, rust)?;
         ensure!(
-            rust.split('-').next() == Some(guest.qemu_target.as_str()),
-            "{FILE}: {name}: guest rust {rust} does not run on qemu_target {}",
+            arch == guest.qemu_target,
+            "{FILE}: {name}: guest rust {rust} (target_arch {arch}) does not run on qemu_target {}",
             guest.qemu_target
         );
     }
     Ok(())
+}
+
+/// `target_arch` of `triple`: the `target_arch="..."` line of `rustc --print cfg --target <triple>`.
+fn rustc_target_arch(root: &Path, triple: &str) -> Result<String> {
+    let out = Command::new("rustc")
+        .current_dir(root)
+        .args(["--print", "cfg", "--target", triple])
+        .output()
+        .context("running rustc --print cfg")?;
+    ensure!(
+        out.status.success(),
+        "rustc --print cfg --target {triple}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    target_arch_of(&String::from_utf8_lossy(&out.stdout))
+        .with_context(|| format!("rustc --print cfg --target {triple}: no target_arch"))
+}
+
+fn target_arch_of(cfg: &str) -> Option<String> {
+    cfg.lines()
+        .find_map(|l| l.strip_prefix("target_arch=\""))
+        .and_then(|v| v.strip_suffix('"'))
+        .map(str::to_owned)
 }
 
 /// The Rust target triple of guest arch `name`: its `[<name>.guest]` `rust` column.
@@ -763,6 +787,15 @@ mod tests {
         let arches = parse(&format!("[a]\npointer_bits = 32\n{K}[a.guest]\n{GUEST}")).unwrap();
         assert_eq!(arches["a"].pointer_bits, 32);
         assert!(arches["a"].host.is_none());
+    }
+
+    /// rustc's `--print cfg` lines (format: rustc book, "Conditional compilation"; armv7-linux-androideabi prints `target_arch="arm"`).
+    #[test]
+    fn target_arch_from_rustc_cfg() {
+        let cfg =
+            "debug_assertions\ntarget_abi=\"eabi\"\ntarget_arch=\"arm\"\ntarget_os=\"android\"\n";
+        assert_eq!(target_arch_of(cfg).as_deref(), Some("arm"));
+        assert_eq!(target_arch_of("target_os=\"linux\"\n"), None);
     }
 
     #[test]

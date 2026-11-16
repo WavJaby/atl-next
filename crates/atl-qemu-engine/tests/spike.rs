@@ -6,7 +6,7 @@
 //! Signals: the harness registers on the linked sigchain what ART does -- an ART FaultManager stand-in, then the engine's special (`signal::special`) with a full mask and `SIGCHAIN_ALLOW_NORETURN` -- and sets the pre-QEMU user action.
 #![allow(clippy::print_stdout, reason = "test harness output is its verdict")]
 
-#[cfg(feature = "qemu")]
+#[cfg(all(feature = "qemu", not(atl_qe_guest = "arm")))]
 mod spike {
     use std::cell::{Cell, RefCell};
     use std::ffi::c_int;
@@ -1661,14 +1661,14 @@ mod spike {
 
 fn main() {
     if std::env::args().any(|a| a == "--engine-so") {
-        #[cfg(feature = "qemu")]
+        #[cfg(all(feature = "qemu", not(atl_qe_guest = "arm")))]
         engine_so::main();
         return;
     }
-    #[cfg(feature = "qemu")]
+    #[cfg(all(feature = "qemu", not(atl_qe_guest = "arm")))]
     spike::main();
-    #[cfg(not(feature = "qemu"))]
-    println!("spike: SKIP (feature qemu off)");
+    #[cfg(not(all(feature = "qemu", not(atl_qe_guest = "arm"))))]
+    println!("spike: SKIP (feature qemu off, or an arm build: tests/spike_arm.rs)");
 }
 
 /// Gate (q), the engine `.so` through its C ABI (QEMU bridge plan Q5-1a), in a process of its own: dlopen the library, refuse it unless its table speaks the host's major and fits its size, resolve the TLS exports, create the engine on the boot executable, and read the auxv QEMU built for it at BOOT. Its AT_ENTRY must equal `ATL_ENGINE_ENTRY` (xtask: llvm-readelf's e_entry of that executable).
@@ -1676,7 +1676,7 @@ fn main() {
 /// BOOT also probes D9: `map` of a host page and `attach` from a host thread both succeed inside the BOOT trap.
 /// Gate (r), after (q) in the same process: `attach` then `detach` of a CPU on a thread of its own.
 /// Gate (z), from the same BOOT auxv: AT_HWCAP / AT_HWCAP2 equal the device profile the engine selects (engine.rs `GUEST_CPU`). xtask also sets `QEMU_CPU=help` (QEMU would list its models and exit before BOOT) and `QEMU_STRACE=1` in this process: the engine must not read them (QEMU patch 0003); (z) fails if they are not set, so the probe is armed.
-#[cfg(feature = "qemu")]
+#[cfg(all(feature = "qemu", not(atl_qe_guest = "arm")))]
 mod engine_so {
     use std::ffi::{CStr, CString, c_void};
     use std::sync::OnceLock;

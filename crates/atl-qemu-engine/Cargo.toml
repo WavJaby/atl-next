@@ -32,5 +32,10 @@ serde_json.workspace = true
 name = "spike"
 harness = false
 
+# the arm32 spike gates (phase 4 P1) on an arm-linux-user build; skips on any other
+[[test]]
+name = "spike_arm"
+harness = false
+
 [lints]
 workspace = true

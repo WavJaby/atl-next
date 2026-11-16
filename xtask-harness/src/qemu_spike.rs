@@ -25,6 +25,10 @@ use crate::unit_use::{self, Echo, Units};
 use crate::verdict::{Failure, Verdict};
 use crate::{cross, deps};
 
+mod arm;
+
+/// The guest fixtures' directory: `fixture.c` (aarch64), `fixture_arm.c` (arm, [`arm`]).
+const FIXTURE_DIR: &str = "xtask-harness/testdata/qemu-spike";
 const FIXTURE_SRC: &str = "xtask-harness/testdata/qemu-spike/fixture.c";
 /// The engine `.so`'s file name per arch (`libatl_engine_arm64.so`, plan Q5-1a).
 fn engine_name(arch: &str) -> String {
@@ -65,7 +69,7 @@ const SHIFTED_BASE: &str = "0x10000000000";
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// arches.toml guest row whose `qemu_target` is driven (the spike engine is aarch64-only).
+    /// arches.toml guest row whose `qemu_target` is driven: arm64 (the full spike) or arm (the arm32 spike, `qemu_spike/arm.rs`).
     #[arg(long, default_value = qemu::DEFAULT_ARCH)]
     pub arch: String,
     /// Out dir (default: as for `xtask qemu`).
@@ -437,6 +441,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if let Some(c) = &b.cross {
         return cross_engine_so(root, &b, c);
     }
+    // arm32 guests: their own spike (phase 4 P1); no engine `.so` until engine ABI 4.0
+    if b.target == "arm" {
+        return Ok(if arm::run(root, &b, args.no_breaks)? {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        });
+    }
     let dir = b.dir.join("spike");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let so = link(&b, &dir.join("libqemu-spike.so"), None)?;
@@ -588,20 +600,33 @@ fn swap_object(
         std::fs::write(flat.join(basename(rel)?), text)?;
     }
     let src = flat.join(basename(swap.file)?);
+    compile_as(b, dir, name, swap.file, &src)
+}
+
+/// `src` compiled by the build's own command for its file `rel`, into `<dir>/<name>/swapped.o`: (the build's object it replaces, the new object). Log `<dir>/<name>.log`.
+fn compile_as(
+    b: &Build,
+    dir: &Path,
+    name: &str,
+    rel: &str,
+    src: &Path,
+) -> Result<(String, PathBuf)> {
+    let flat = dir.join(name);
+    std::fs::create_dir_all(&flat).with_context(|| format!("creating {}", flat.display()))?;
     let db_path = b.build_dir().join("compile_commands.json");
     let db: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&db_path)?)?;
     let entry = db
         .as_array()
         .context("compile_commands.json: not an array")?
         .iter()
-        .find(|e| e["file"].as_str().is_some_and(|f| f.ends_with(swap.file)))
-        .with_context(|| format!("no {} entry", swap.file))?;
+        .find(|e| e["file"].as_str().is_some_and(|f| f.ends_with(rel)))
+        .with_context(|| format!("no {rel} entry"))?;
     let (Some(command), Some(file), Some(output)) = (
         entry["command"].as_str(),
         entry["file"].as_str(),
         entry["output"].as_str(),
     ) else {
-        bail!("{} entry lacks command/file/output", swap.file);
+        bail!("{rel} entry lacks command/file/output");
     };
     let obj = flat.join("swapped.o");
     let cmd = command

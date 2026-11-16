@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The QEMU translator engine, spike shape (QEMU bridge plan Q2): QEMU's aarch64 linux-user core as a library in the host process, identity addresses (`-B 0`).
+//! The QEMU translator engine, spike shape (QEMU bridge plan Q2): QEMU's aarch64 linux-user core as a library in the host process, identity addresses (`-B 0`). The arm (arm32) target is the phase 4 P1 spike: same engine, its registers in engine/arm.rs, its guest below 4 GiB (QEMU patch 0006, no reservation under `-B 0`).
 //!
 //! Start: [`start`] spawns a boot helper thread that dlopens the spike library (QEMU's PIC objects linked `-shared`, `main` aliased `atl_qemu_user_main`) and runs QEMU's own `main` on a static guest ELF: QEMU's init, loader and `cpu_loop`, nothing replayed here.
 //! Hand-over: the guest's bootstrap `svc #BOOT` (x0 = payload, x1 = its `svc #RET` stub) reaches P1's hook ([`trap`]), which runs the BOOT callback on the helper, hands its answer to `start`'s caller and parks the helper for the life of the process. QEMU's `main` never returns to a library caller, so the boot thread is spent; no QEMU change.
@@ -107,8 +107,12 @@ mod abi_check {
     const _: () = assert!(offset_of!(AtlStack, len) as u64 == l::ATL_OFFSET_STACK_LEN);
 }
 
+// The ABI's lanes are AAPCS64-shaped (x0..x7, v0..v7); the guest-neutral lanes an arm engine `.so` needs are engine ABI 4.0 (phase 4 P3). Until then arm runs only in the spike harness (rlib).
+#[cfg(all(feature = "engine-so", atl_qe_guest = "arm"))]
+compile_error!("engine .so for an arm guest: needs engine ABI 4.0 lanes (phase 4 P3)");
+
 /// The C ABI (QEMU bridge plan Q5-1a), built into the engine `.so` only: the table `atl_engine` and its functions, contract in `include/atl_engine.h`. One engine per process.
-#[cfg(feature = "engine-so")]
+#[cfg(all(feature = "engine-so", not(atl_qe_guest = "arm")))]
 mod capi {
     use std::ffi::{CStr, c_char, c_int, c_void};
     use std::sync::OnceLock;

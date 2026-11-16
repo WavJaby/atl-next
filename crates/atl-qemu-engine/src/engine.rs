@@ -291,24 +291,19 @@ pub fn start(library: &Path, argv: &[&str], on_trap: OnTrap) -> Result<Booted, S
     boot_on_helper(move || run_spike(&path, &args, on_trap))
 }
 
-/// The guest CPU QEMU emulates (`-cpu`): what an app reads from HWCAP, /proc/cpuinfo and `mrs` follows the reference device class (behaviour decision 1), today's Android arm64 phone = ARMv9.2 Cortex-A720/X4 with SVE not exposed.
-/// This QEMU has no A720/X model; cortex-a710 is the closest (vs the phone: + mte, - afp dgh ecv evtstrm), `sve=off` as the phone. QEMU's default `max` adds SVE/SME/MOPS/GCS/FP8 and more no phone exposes.
-/// `midr` = QEMU's own `max` value (implementer 0 "software", part 'Q'): no claim to be Arm silicon an app might key errata or tuning on.
-/// Tied to the pinned QEMU: a bump that adds a closer model, or a property this string names going away, changes it (gate (z) of tests/spike.rs pins the result).
-#[cfg(all(feature = "engine-so", not(atl_qe_cpu_max)))]
-const GUEST_CPU: &[&str] = &["-cpu", "cortex-a710,sve=off,midr=0x000f0510"];
-// break cpu-max (gate z): no `-cpu`, QEMU's default `max`
-#[cfg(all(feature = "engine-so", atl_qe_cpu_max))]
-const GUEST_CPU: &[&str] = &[];
+/// The target's guest registers and calls (build.rs `TARGETS`, cfg `atl_qe_guest`).
+#[cfg_attr(atl_qe_guest = "arm", path = "engine/arm.rs")]
+#[cfg_attr(not(atl_qe_guest = "arm"), path = "engine/aarch64.rs")]
+mod target;
 
-/// The engine `.so`'s start (C ABI `create`): QEMU is linked into this object, so the helper runs its `main` on this object's own symbols. The command line is the engine's: `-B 0` is identity addresses (guest = host, the ABI's `map`), [`GUEST_CPU`], and the host names only `boot_exe`. QEMU's `QEMU_*` option variables are not read (QEMU patch 0003): argv is the whole configuration.
+/// The engine `.so`'s start (C ABI `create`): QEMU is linked into this object, so the helper runs its `main` on this object's own symbols. The command line is the engine's: `-B 0` is identity addresses (guest = host, the ABI's `map`), the target's `GUEST_CPU`, and the host names only `boot_exe`. QEMU's `QEMU_*` option variables are not read (QEMU patch 0003): argv is the whole configuration.
 /// RCU: QEMU's constructor (util/rcu.c `rcu_init`) registers the thread that ran it -- in a QEMU executable the thread that runs `main`, here the host's loading thread ([`on_loader_thread`]). That thread is moved to the helper: unregistered here, registered there before `main`, as the spike's helper is. Left registered, a later attach on the loading thread registers it twice, the registry becomes a cycle, the next grace period never ends, and QEMU's prefork handler blocks every fork in the process.
 /// Call on the loading thread ([`on_loader_thread`]; C ABI `create` refuses any other).
 #[cfg(feature = "engine-so")]
 pub(crate) fn start_linked(boot_exe: &str, on_trap: OnTrap) -> Result<Booted, String> {
-    let argv: Vec<&str> = ["qemu-aarch64", "-B", "0"]
+    let argv: Vec<&str> = [target::ARGV0, "-B", "0"]
         .into_iter()
-        .chain(GUEST_CPU.iter().copied())
+        .chain(target::GUEST_CPU.iter().copied())
         .chain([boot_exe])
         .collect();
     let args = c_args(&argv)?;
@@ -407,13 +402,13 @@ pub(crate) fn boot_env() -> Option<usize> {
 
 /// The BOOT trap, on the boot helper: fault chain, parallel code, the callback, then the answer to [`start`] and a park that never ends.
 pub(crate) fn boot(g: Guest) -> ! {
-    set_ret_stub(g.x(1));
+    set_ret_stub(g.arg(1));
     crate::signal::install();
     crate::attach::parallel(g.env.cast());
     // break boot-late (gate q): the env is published after the callback, so map and attach inside BOOT fail
     #[cfg(not(atl_qe_boot_late))]
     let _ = BOOT_ENV.set(g.env as usize);
-    let answer = (lib().on_trap)(g, Trap::Boot(g.x(0)));
+    let answer = (lib().on_trap)(g, Trap::Boot(g.arg(0)));
     #[cfg(atl_qe_boot_late)]
     let _ = BOOT_ENV.set(g.env as usize);
     publish(BootState::Ready {
@@ -523,15 +518,6 @@ pub(crate) fn set_pages(start: usize, len: usize, set: i32, clear: i32) -> Resul
     Ok(())
 }
 
-/// Byte offset of TPIDR_EL0 in `CPUArchState` (clang's `offsetof`, a `size_t` the generator types u64; an offset inside a 79 KB record fits any usize).
-const TPIDR_EL0: usize = crate::layout::ATL_OFFSET_TPIDR_EL0 as usize;
-const _: () = assert!(TPIDR_EL0 + 8 <= Env::SIZE);
-/// `vfp.zregs` (v<i> is zregs[i]; its low 64 bits are `d[0]`): offsets and stride from clang (build.rs `FIELD_OFFSETS`).
-const ZREGS: usize = crate::layout::ATL_OFFSET_ZREGS as usize;
-const ZREG_SIZE: usize = crate::layout::ATL_SIZEOF_ZREG as usize;
-const ZREG_D: usize = crate::layout::ATL_OFFSET_ZREG_D as usize;
-const _: () = assert!(ZREGS + 32 * ZREG_SIZE <= Env::SIZE);
-
 /// The guest CPU as P1's hook received it (`CPUArchState *`), valid while the hook runs.
 #[derive(Clone, Copy, Debug)]
 pub struct Guest {
@@ -553,53 +539,24 @@ impl Guest {
         unsafe { self.env.add(offset).cast::<u64>().write(v) }
     }
 
-    /// x<i> (0..=30), or sp for 31.
-    pub fn x(&self, i: usize) -> u64 {
-        assert!(i < 32, "x{i}");
-        self.reg(Env::xregs + 8 * i)
+    /// The whole CPU state, for [`Guest::restore`] after a nested call.
+    fn save(&self) -> Vec<u8> {
+        let mut saved = vec![0u8; Env::SIZE];
+        // SAFETY: env is a live CPUArchState of Env::SIZE bytes (clang layout); saved is that long.
+        unsafe { std::ptr::copy_nonoverlapping(self.env, saved.as_mut_ptr(), Env::SIZE) };
+        saved
     }
 
-    pub fn set_x(&self, i: usize, v: u64) {
-        assert!(i < 32, "x{i}");
-        self.set_reg(Env::xregs + 8 * i, v);
+    fn restore(&self, saved: &[u8]) {
+        assert_eq!(saved.len(), Env::SIZE);
+        // SAFETY: as for the save.
+        unsafe { std::ptr::copy_nonoverlapping(saved.as_ptr(), self.env, Env::SIZE) };
     }
 
-    /// v<i> (0..=31): its low 64 bits, the lane a `double` argument or result uses.
-    pub fn v(&self, i: usize) -> u64 {
-        assert!(i < 32, "v{i}");
-        self.reg(ZREGS + ZREG_SIZE * i + ZREG_D)
-    }
-
-    /// Sets v<i>'s low 64 bits and clears the high 64, as a write to d<i> does.
-    pub fn set_v(&self, i: usize, v: u64) {
-        assert!(i < 32, "v{i}");
-        let at = ZREGS + ZREG_SIZE * i + ZREG_D;
-        self.set_reg(at, v);
-        self.set_reg(at + 8, 0);
-    }
-
-    /// Stack word `i` (0..8) at the guest's sp: where a call's stack arguments sit. `None` when the word's address is not mapped for the guest (QEMU bridge plan R-5: the trap reads all eight, and past a shallow thread's stack top they are refused, not read). Identity: a mapped word is read at its host address.
-    pub fn stack_word(&self, i: usize) -> Option<u64> {
-        assert!(i < 8, "stack word {i}");
-        let addr = self.x(31) + 8 * i as u64;
-        if addr > *lib().guest_addr_max as u64 || self.page_flags(addr) & page::VALID == 0 {
-            return None;
-        }
-        // SAFETY: the page is mapped for the guest, so its host address is mapped (identity); an unaligned read is fine for any alignment.
-        Some(unsafe { (self.host_addr(addr) as *const u64).read_unaligned() })
-    }
-
-    pub fn pc(&self) -> u64 {
-        self.reg(Env::pc)
-    }
-
-    /// The guest thread pointer, TPIDR_EL0 (what the guest's `msr tpidr_el0` and linux-user's `cpu_set_tls` write).
-    pub fn tp(&self) -> u64 {
-        self.reg(TPIDR_EL0)
-    }
-
-    pub fn set_tp(&self, v: u64) {
-        self.set_reg(TPIDR_EL0, v);
+    /// QEMU's `cpu_loop` on this CPU until the guest reaches its return stub.
+    fn run(&self) {
+        // SAFETY: cpu_loop on this thread's CPU; P1 makes it return when the guest reaches `svc #RET` (trap.rs).
+        unsafe { (lib().cpu_loop)(self.env.cast()) };
     }
 
     /// The host address of guest address `addr` (`g2h`: plus `guest_base`; identity at `-B 0`).
@@ -619,58 +576,18 @@ impl Guest {
         set_pages(start, len, flags | page::VALID, 0)
     }
 
-    /// Calls guest function `f` with `args` in x0.. and returns its x0, on the interrupted code's thread pointer. As [`Guest::call_on`].
+    /// Calls guest function `f` with `args` in the integer argument registers and returns the answer register, on the interrupted code's thread pointer. As [`Guest::call_on`].
     pub fn call(&self, f: u64, args: &[u64]) -> u64 {
         self.call_on(self.tp(), f, args).0
     }
 
-    /// Calls guest function `f` with `args` in x0.. on thread pointer `tp`; returns its x0 and the thread pointer it returned with. The integer lanes of [`Guest::call_lanes`].
+    /// Calls guest function `f` with `args` in the integer argument lanes on thread pointer `tp`; returns the answer and the thread pointer it returned with. The integer lanes of the target's `call_lanes` (aarch64: x0..x7; arm: r0..r3, the rest is not passed).
     pub fn call_on(&self, tp: u64, f: u64, args: &[u64]) -> (u64, u64) {
-        assert!(args.len() <= 8, "{} arguments, x0..x7 only", args.len());
+        assert!(args.len() <= 8, "{} arguments, 8 lanes only", args.len());
         let mut lanes = AtlLanes::default();
         lanes.x[..args.len()].copy_from_slice(args);
         let tp_out = self.call_lanes(tp, f, &mut lanes);
         (lanes.x[0], tp_out)
-    }
-
-    /// Calls guest function `f` with `lanes` on thread pointer `tp`: x0..x7, v0..v7 (low 64 bits) and the eight stack words at the callee's sp. The answer is `lanes.x[0]` and `lanes.v[0]`; returns the thread pointer the call returned with. Nested: may run from inside a trap callback, which may itself call again.
-    /// The whole CPU state is saved and restored around the call (the thread pointer included), so the interrupted guest code resumes exactly where its trap left it.
-    pub fn call_lanes(&self, tp: u64, f: u64, lanes: &mut AtlLanes) -> u64 {
-        let ret = ret_stub();
-        assert!(ret != 0, "no BOOT trap yet: no return stub");
-        let mut saved = vec![0u8; Env::SIZE];
-        // SAFETY: env is a live CPUArchState of Env::SIZE bytes (clang layout); saved is that long.
-        unsafe { std::ptr::copy_nonoverlapping(self.env, saved.as_mut_ptr(), Env::SIZE) };
-        self.set_tp(tp);
-        for (i, a) in lanes.x.iter().enumerate() {
-            self.set_x(i, *a);
-        }
-        // break `call-v` (qemu-abi gate, check d): the FP lanes are not set, so v0..v7 keep the CPU's values
-        if !cfg!(atl_qe_call_v) {
-            for (i, v) in lanes.v.iter().enumerate() {
-                self.set_v(i, *v);
-            }
-        }
-        // AAPCS64: sp 16-aligned; below the interrupted frame (no red zone on aarch64, the margin is for a stray store)
-        let sp = (self.x(31) - 256) & !15;
-        // break `call-stack` (qemu-abi gate, check d): the stack words are not written, so the callee's stack arguments are what lies at sp
-        if !cfg!(atl_qe_call_stack) {
-            for (i, w) in lanes.stack.iter().enumerate() {
-                // SAFETY: sp..sp+64 lies in the CPU's guest stack below the interrupted sp, where the callee's own frame goes too; the host address is mapped (identity).
-                unsafe { (self.host_addr(sp + 8 * i as u64) as *mut u64).write_unaligned(*w) };
-            }
-        }
-        self.set_x(31, sp);
-        self.set_x(30, ret);
-        self.set_reg(Env::pc, f);
-        // SAFETY: cpu_loop on this thread's CPU; P1 makes it return when the guest reaches `svc #RET` (trap.rs).
-        unsafe { (lib().cpu_loop)(self.env.cast()) };
-        lanes.x[0] = self.x(0);
-        lanes.v[0] = self.v(0);
-        let tp_out = self.tp();
-        // SAFETY: as for the save.
-        unsafe { std::ptr::copy_nonoverlapping(saved.as_ptr(), self.env, Env::SIZE) };
-        tp_out
     }
 
     /// Whether guest and host addresses are the same (`guest_base` 0, `-B 0`). Not merely a convenience: with a nonzero base TCG on an x86_64 host sets GS to it (tcg/x86_64/tcg-target.c.inc, `ARCH_SET_GS`), which ART owns on every thread.

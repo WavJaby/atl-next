@@ -1,0 +1,153 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Tue, 17 Nov 2026 00:47:17 +0800
+Subject: [PATCH] linux-user: no address space reservation for 32-bit guests at
+ -B 0
+
+A 32-bit guest on a 64-bit host reserves its whole 4 GiB by default,
+and -B 0 then needs the host low 4 GiB free. An embedder that loads
+QEMU into a process whose low 4 GiB already holds mappings (ART maps
+its heap there) cannot start. With -B 0 nothing is reserved: guest
+addresses stay below 4 GiB (guest_addr_max). -R 0 cannot express
+this: 0 means unset and the default re-sets it.
+
+Without the reservation the guest shares that range with mappings
+QEMU did not make, and a busy or absent hint makes the kernel place a
+host mmap above 4 GiB (mmap_h_eq_g then asserts h2g_valid). So a
+non-fixed guest mmap searches the holes of /proc/self/maps below
+guest_addr_max and reserves the one found with MAP_FIXED_NOREPLACE,
+as the reserved_va path searches its own page table.
+
+Upstream-Status: Inappropriate [identity embedding of a 32-bit guest]
+Patch-Reason: the reservation is decided in main before any embedder code runs, and placement of every guest mmap is inside target_mmap; no option or environment changes either
+---
+SPDX-License-Identifier: GPL-2.0-or-later
+ linux-user/main.c |  9 ++++++-
+ linux-user/mmap.c | 66 ++++++++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 71 insertions(+), 4 deletions(-)
+
+diff --git a/linux-user/main.c b/linux-user/main.c
+index 5c22ad999afc555979c5abff48c4c447f20aee8c..dc64747d19115d4c758c91455719c7fb26bff5b9 100644
+--- a/linux-user/main.c
++++ b/linux-user/main.c
+@@ -835,7 +835,14 @@ int main(int argc, char **argv, char **envp)
+             fprintf(stderr, "Reserved virtual address too big\n");
+             exit(EXIT_FAILURE);
+         }
+-    } else if (HOST_LONG_BITS == 64 && TARGET_VIRT_ADDR_SPACE_BITS <= 32) {
++    } else if (HOST_LONG_BITS == 64 && TARGET_VIRT_ADDR_SPACE_BITS <= 32 &&
++               !(have_guest_base && guest_base == 0)) {
++        /*
++         * ATL P6: not under -B 0. There the guest shares the host's low
++         * 4 GiB with mappings made before main (an embedder's heap), so
++         * nothing is reserved: guest_addr_max is 4 GiB below and guest
++         * mmap probes host holes, as on a 32-bit host.
++         */
+         /* MAX_RESERVED_VA + 1 is a large power of 2, so is aligned. */
+         reserved_va = max_reserved_va;
+     }
+diff --git a/linux-user/mmap.c b/linux-user/mmap.c
+index cc0c2ee6c2770f5d26c64c834a696b1796e251cf..9a02a4b14716f633bd8f952473993ac39786e00a 100644
+--- a/linux-user/mmap.c
++++ b/linux-user/mmap.c
+@@ -29,6 +29,7 @@
+ #include "user-mmap.h"
+ #include "target_mman.h"
+ #include "qemu/interval-tree.h"
++#include "user/selfmap.h"
+ 
+ #ifdef TARGET_ARM
+ #include "target/arm/cpu-features.h"
+@@ -438,6 +439,59 @@ static abi_ulong mmap_find_vma_reserved(abi_ulong start, abi_ulong size,
+     return ret;
+ }
+ 
++/*
++ * ATL P6: a guest narrower than the host and no reservation (-B 0, see
++ * main.c). The guest shares the host's low address space with mappings
++ * QEMU did not make, and a busy hint makes the kernel fall back above
++ * the guest's range. So search the holes in the host's own map, from
++ * start upward, then from mmap_min_addr, and reserve the hole found.
++ */
++static bool mmap_narrow_unreserved(void)
++{
++    return !reserved_va && guest_addr_max < UINTPTR_MAX;
++}
++
++static abi_ulong mmap_find_vma_narrow(abi_ulong start, abi_ulong size,
++                                      abi_ulong align)
++{
++    IntervalTreeRoot *maps = read_self_maps();
++    uint64_t low = ROUND_UP(MAX(mmap_min_addr, TARGET_PAGE_SIZE), align);
++    abi_ulong ret = -1;
++    int pass;
++
++    for (pass = 0; pass < 2 && ret == (abi_ulong)-1; pass++) {
++        uint64_t addr = pass ? low : MAX(start, low);
++        uint64_t host;
++        IntervalTreeNode *n;
++        void *p;
++
++        while (addr + size - 1 <= guest_addr_max) {
++            host = (uintptr_t)g2h_untagged(addr);
++            n = maps ? interval_tree_iter_first(maps, host, host + size - 1)
++                     : NULL;
++            if (n) {
++                addr = ROUND_UP(n->last + 1 - guest_base, align);
++                continue;
++            }
++            p = mmap((void *)host, size, PROT_NONE,
++                     MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE |
++                     MAP_FIXED_NOREPLACE, -1, 0);
++            if (p != MAP_FAILED) {
++                ret = addr;
++                break;
++            }
++            /* mapped since the read, by another thread: step past it */
++            addr += align;
++        }
++    }
++    free_self_maps(maps);
++    if (ret != (abi_ulong)-1 && start == mmap_next_start &&
++        ret >= task_unmapped_base) {
++        mmap_next_start = ret + size;
++    }
++    return ret;
++}
++
+ /*
+  * Find and reserve a free memory area of size 'size'. The search
+  * starts at 'start'.
+@@ -465,6 +519,9 @@ abi_ulong mmap_find_vma(abi_ulong start, abi_ulong size, abi_ulong align)
+     if (reserved_va) {
+         return mmap_find_vma_reserved(start, size, align);
+     }
++    if (mmap_narrow_unreserved()) {
++        return mmap_find_vma_narrow(start, size, align);
++    }
+ 
+     addr = start;
+     wrapped = repeat = 0;
+@@ -921,16 +978,19 @@ static abi_long target_mmap__locked(abi_ulong start, abi_ulong len,
+     /*
+      * For reserved_va, we are in full control of the allocation.
+      * Find a suitable hole and convert to MAP_FIXED.
++     * ATL P6: the same search for a narrow guest without a reservation,
++     * whose hole mmap_find_vma reserves; MAP_FIXED_NOREPLACE stays the
++     * host's, which knows the mappings QEMU did not make.
+      */
+-    if (reserved_va) {
+-        if (flags & MAP_FIXED_NOREPLACE) {
++    if (reserved_va || mmap_narrow_unreserved()) {
++        if (reserved_va && (flags & MAP_FIXED_NOREPLACE)) {
+             /* Validate that the chosen range is empty. */
+             if (!page_check_range_empty(start, start + len - 1)) {
+                 errno = EEXIST;
+                 return -1;
+             }
+             flags = (flags & ~MAP_FIXED_NOREPLACE) | MAP_FIXED;
+-        } else if (!(flags & MAP_FIXED)) {
++        } else if (!(flags & (MAP_FIXED | MAP_FIXED_NOREPLACE))) {
+             abi_ulong real_start = start & -host_page_size;
+             off_t host_offset = offset & -host_page_size;
+             size_t real_len = len + offset - host_offset;

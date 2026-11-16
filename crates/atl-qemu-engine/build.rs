@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Always: `OUT_DIR/aarch64_constants.rs`, atl-bridgegen's aarch64 thunk constants (`lib.rs` `thunk`).
-//! With feature `qemu`: `OUT_DIR/qemu_layout.rs`, atl-bridgegen's `layout_module` of QEMU's `target/arm/cpu.h` (`CPUArchState` and the records it holds), parsed with the exact flags the PIC build compiles `linux-user/aarch64/cpu_loop.c` with -- the file P1's hook is called from.
+//! With feature `qemu`: `OUT_DIR/qemu_layout.rs`, atl-bridgegen's `layout_module` of QEMU's `target/arm/cpu.h` (`CPUArchState` and the records it holds), parsed with the exact flags the PIC build compiles its target's `linux-user/<target>/cpu_loop.c` with -- the file P1's hook is called from ([`TARGETS`]: aarch64 or arm); cfg `atl_qe_guest = "<target>"` names it for the engine's per-target code.
 //! With feature `qemu`: `OUT_DIR/engine_abi_layout.rs`, the engine C ABI's sizes, offsets and values from atl-engine-api's `atl_engine.h` (atl-bridgegen `engine_abi`); lib.rs checks the Rust mirror against them.
 //! With feature `qemu`: `libatl_host_signal.a`, `src/host_signal.c` (QEMU's host fault decode, `linux-user/include/host/<host>/host-signal.h`, for signal.rs) compiled by the unit's own compile command and archived by the build's own `STATIC_LINKER` (build.ninja): the host arch's decode is QEMU's, not a second copy.
 //! Flags and the source tree come from `$ATL_QEMU_BUILD/compile_commands.json` (meson's), so the offsets are clang's for the pinned, patched headers and that build's generated config headers; nothing is hand-copied.
@@ -14,24 +14,19 @@ use atl_bridgegen::{Lang, Source, Target};
 
 /// The PIC build dir (`<out>/qemu/<target>-linux-user-pic/build`); `xtask test qemu-spike` sets it.
 const BUILD_ENV: &str = "ATL_QEMU_BUILD";
-/// The translation unit whose compile command is reused: P1's call site.
-const UNIT: &str = "linux-user/aarch64/cpu_loop.c";
-/// Headers whose records form the interface, relative to the QEMU tree.
-const HEADERS: &[&str] = &["target/arm/cpu.h"];
-/// Headers the unit also includes for [`FIELD_OFFSETS`] only; their records are not part of the interface. linux-user/qemu.h: `TaskState`; exec/translation-block.h: `CF_PARALLEL`.
-const OFFSET_HEADERS: &[&str] = &["linux-user/qemu.h", "exec/translation-block.h"];
-/// Offsets, sizes and flag values the engine reads, evaluated by clang in the unit: (macro name, C integer expression).
-/// TPIDR_EL0 = `cp15.tpidr_el[0]`, the register linux-user's `cpu_set_tls` writes (linux-user/aarch64/target_cpu.h).
-/// The rest is what a host-attached CPU needs (attach.rs), as linux-user's clone path builds a thread (syscall.c `do_fork`): `env_cpu` = env - sizeof(CPUState) (include/exec/cpu-common.h), `CPUState.opaque` = the TaskState, the TaskState fields `do_fork` copies from the parent, GCS state, and `CF_PARALLEL` (`begin_parallel_context`, linux-user/user-internals.h).
-const FIELD_OFFSETS: &[(&str, &str)] = &[
-    (
-        "ATL_OFFSET_TPIDR_EL0",
-        "offsetof(CPUARMState, cp15.tpidr_el[0])",
-    ),
-    // v<i>'s low lane is `vfp.zregs[i].d[0]` (target/arm/cpu.h:675, vector-type.h:35); the stride is one ARMVectorReg (Q6-1)
-    ("ATL_OFFSET_ZREGS", "offsetof(CPUARMState, vfp.zregs)"),
-    ("ATL_SIZEOF_ZREG", "sizeof(ARMVectorReg)"),
-    ("ATL_OFFSET_ZREG_D", "offsetof(ARMVectorReg, d)"),
+
+/// One QEMU linux-user target the engine drives: the build dir's compile database names which (the unit it holds).
+struct GuestTarget {
+    /// The QEMU target dir (`linux-user/<it>/`), also the cfg value `atl_qe_guest="<it>"` the engine's per-target code selects on.
+    name: &'static str,
+    /// The translation unit whose compile command is reused: P1's call site.
+    unit: &'static str,
+    /// Offsets, sizes and flag values the engine reads, evaluated by clang in the unit: (macro name, C integer expression).
+    fields: &'static [(&'static str, &'static str)],
+}
+
+/// What a host-attached CPU needs on every target (attach.rs), as linux-user's clone path builds a thread (syscall.c `do_fork`): `env_cpu` = env - sizeof(CPUState) (include/exec/cpu-common.h), `CPUState.opaque` = the TaskState, the TaskState fields `do_fork` copies from the parent, and `CF_PARALLEL` (`begin_parallel_context`, linux-user/user-internals.h).
+const COMMON_FIELDS: &[(&str, &str)] = &[
     ("ATL_SIZEOF_CPUSTATE", "sizeof(CPUState)"),
     ("ATL_OFFSET_CPU_OPAQUE", "offsetof(CPUState, opaque)"),
     ("ATL_SIZEOF_TASKSTATE", "sizeof(TaskState)"),
@@ -45,21 +40,64 @@ const FIELD_OFFSETS: &[(&str, &str)] = &[
         "ATL_SIZEOF_TS_SIGNAL_MASK",
         "sizeof(((TaskState *)0)->signal_mask)",
     ),
-    (
-        "ATL_OFFSET_TS_GCS_EL0_LOCKED",
-        "offsetof(TaskState, gcs_el0_locked)",
-    ),
-    (
-        "ATL_OFFSET_GCSPR_EL0",
-        "offsetof(CPUARMState, cp15.gcspr_el[0])",
-    ),
-    (
-        "ATL_OFFSET_GCSCR_EL0",
-        "offsetof(CPUARMState, cp15.gcscr_el[0])",
-    ),
-    ("ATL_GCSCR_PCRSEL", "GCSCR_PCRSEL"),
     ("ATL_CF_PARALLEL", "CF_PARALLEL"),
 ];
+
+/// The targets: aarch64 (arm64 guests) and arm (arm32 guests, phase 4 P1). Both read `target/arm/cpu.h`; the fields differ by what the target's linux-user uses.
+const TARGETS: &[GuestTarget] = &[
+    GuestTarget {
+        name: "aarch64",
+        unit: "linux-user/aarch64/cpu_loop.c",
+        // TPIDR_EL0 = `cp15.tpidr_el[0]`, the register linux-user's `cpu_set_tls` writes (linux-user/aarch64/target_cpu.h); GCS state (attach refuses GCS on, `do_fork` copies the lock)
+        fields: &[
+            (
+                "ATL_OFFSET_TPIDR_EL0",
+                "offsetof(CPUARMState, cp15.tpidr_el[0])",
+            ),
+            // v<i>'s low lane is `vfp.zregs[i].d[0]` (target/arm/cpu.h:675, vector-type.h:35); the stride is one ARMVectorReg (Q6-1)
+            ("ATL_OFFSET_ZREGS", "offsetof(CPUARMState, vfp.zregs)"),
+            ("ATL_SIZEOF_ZREG", "sizeof(ARMVectorReg)"),
+            ("ATL_OFFSET_ZREG_D", "offsetof(ARMVectorReg, d)"),
+            (
+                "ATL_OFFSET_TS_GCS_EL0_LOCKED",
+                "offsetof(TaskState, gcs_el0_locked)",
+            ),
+            (
+                "ATL_OFFSET_GCSPR_EL0",
+                "offsetof(CPUARMState, cp15.gcspr_el[0])",
+            ),
+            (
+                "ATL_OFFSET_GCSCR_EL0",
+                "offsetof(CPUARMState, cp15.gcscr_el[0])",
+            ),
+            ("ATL_GCSCR_PCRSEL", "GCSCR_PCRSEL"),
+        ],
+    },
+    GuestTarget {
+        name: "arm",
+        unit: "linux-user/arm/cpu_loop.c",
+        // r0..r15 = `regs[16]` (uint32_t, r15 = pc); `thumb` and `condexec_bits` (IT state) are the parts of CPSR a call sets; the thread pointer is TPIDRURO = `cp15.tpidrro_el[0]` (linux-user/arm/target_cpu.h `cpu_set_tls`, non-secure: user mode has no EL3 view)
+        fields: &[
+            ("ATL_OFFSET_REGS", "offsetof(CPUARMState, regs)"),
+            ("ATL_OFFSET_THUMB", "offsetof(CPUARMState, thumb)"),
+            (
+                "ATL_OFFSET_CONDEXEC",
+                "offsetof(CPUARMState, condexec_bits)",
+            ),
+            (
+                "ATL_OFFSET_TPIDRURO",
+                "offsetof(CPUARMState, cp15.tpidrro_el[0])",
+            ),
+        ],
+    },
+];
+
+/// Headers whose records form the interface, relative to the QEMU tree.
+const HEADERS: &[&str] = &["target/arm/cpu.h"];
+/// Headers the unit also includes for the field offsets only; their records are not part of the interface. linux-user/qemu.h: `TaskState`; exec/translation-block.h: `CF_PARALLEL`.
+const OFFSET_HEADERS: &[&str] = &["linux-user/qemu.h", "exec/translation-block.h"];
+/// The cfg naming the target (`atl_qe_guest = "<name>"`).
+const GUEST_CFG: &str = "atl_qe_guest";
 
 const BREAK_ENV: &str = "ATL_QEMU_ENGINE_BREAK";
 /// AOSP libsigchain's object (art/sigchainlib/sigchain.cc, built as-is by `xtask test qemu-spike`); the spike harness links it and registers the engine's special handler on it, as ART does.
@@ -207,37 +245,64 @@ fn preprocessor_args(cmd: &[String], dir: &Path) -> Vec<String> {
     out
 }
 
-/// [`UNIT`]'s compile_commands.json entry: (its directory, the QEMU source root, its command words).
-fn unit_entry(build: &Path) -> Result<(PathBuf, PathBuf, Vec<String>)> {
+/// The build's target and its unit's compile_commands.json entry. A one-target build (`xtask qemu` builds one) holds exactly one of [`TARGETS`]' units.
+struct UnitEntry {
+    target: &'static GuestTarget,
+    /// The entry's directory.
+    dir: PathBuf,
+    /// The QEMU source root.
+    src: PathBuf,
+    /// The command, as words.
+    cmd: Vec<String>,
+}
+
+fn unit_entry(build: &Path) -> Result<UnitEntry> {
     let db_path = build.join("compile_commands.json");
     buildscript::rerun_if_changed(&db_path);
     let db: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(&db_path).with_context(|| db_path.display().to_string())?,
     )?;
-    let entry = db
+    let entries = db
         .as_array()
-        .context("compile_commands.json: not an array")?
-        .iter()
-        .find(|e| e["file"].as_str().is_some_and(|f| f.ends_with(UNIT)))
-        .with_context(|| format!("{}: no entry for {UNIT}", db_path.display()))?;
+        .context("compile_commands.json: not an array")?;
+    let mut found = TARGETS.iter().filter_map(|t| {
+        entries
+            .iter()
+            .find(|e| e["file"].as_str().is_some_and(|f| f.ends_with(t.unit)))
+            .map(|e| (t, e))
+    });
+    let (target, entry) = found.next().with_context(|| {
+        let units: Vec<&str> = TARGETS.iter().map(|t| t.unit).collect();
+        format!("{}: no entry for any of {units:?}", db_path.display())
+    })?;
+    ensure!(
+        found.next().is_none(),
+        "{}: units of more than one target",
+        db_path.display()
+    );
     let dir = PathBuf::from(entry["directory"].as_str().context("entry: no directory")?);
     let file = dir.join(entry["file"].as_str().context("entry: no file")?);
     let src = file
         .to_str()
-        .and_then(|f| f.strip_suffix(UNIT))
+        .and_then(|f| f.strip_suffix(target.unit))
         .map(PathBuf::from)
         .context("entry file does not end with the unit")?;
     let cmd = words(entry["command"].as_str().context("entry: no command")?);
-    Ok((dir, src, cmd))
+    Ok(UnitEntry {
+        target,
+        dir,
+        src,
+        cmd,
+    })
 }
 
-/// Compiles `src/host_signal.c` with [`UNIT`]'s command (its source, `-o` and depfile words swapped) and archives it with the build's `STATIC_LINKER` tool into `out/libatl_host_signal.a`; links it into this crate.
+/// Compiles `src/host_signal.c` with the unit's command (its source, `-o` and depfile words swapped) and archives it with the build's `STATIC_LINKER` tool into `out/libatl_host_signal.a`; links it into this crate.
 #[expect(
     clippy::disallowed_types,
     reason = "a build script: it runs the QEMU build's compiler and archiver on the host, never a runtime process"
 )]
 fn host_signal(build: &Path, manifest: &Path, out: &Path) -> Result<()> {
-    let (dir, _, cmd) = unit_entry(build)?;
+    let UnitEntry { dir, cmd, .. } = unit_entry(build)?;
     let shim = manifest.join("src/host_signal.c");
     buildscript::rerun_if_changed(&shim);
     let host_dir = cmd
@@ -292,13 +357,21 @@ fn host_signal(build: &Path, manifest: &Path, out: &Path) -> Result<()> {
     Ok(())
 }
 
-fn layout(build: &Path, out: &Path, host: &str) -> Result<String> {
-    let (dir, src, cmd) = unit_entry(build)?;
+/// The layout module of the build's target, and that target.
+fn layout(build: &Path, out: &Path, host: &str) -> Result<(String, &'static GuestTarget)> {
+    let UnitEntry {
+        target: guest,
+        dir,
+        src,
+        cmd,
+    } = unit_entry(build)?;
     let args = preprocessor_args(&cmd, &dir);
     ensure!(
         args.iter().any(|a| a.starts_with("-DCONFIG_TARGET=")),
-        "{UNIT}: compile command defines no CONFIG_TARGET"
+        "{}: compile command defines no CONFIG_TARGET",
+        guest.unit
     );
+    let fields: Vec<(&str, &str)> = COMMON_FIELDS.iter().chain(guest.fields).copied().collect();
     let also: Vec<PathBuf> = HEADERS.iter().map(|h| src.join(h)).collect();
     let offset_headers: Vec<PathBuf> = OFFSET_HEADERS.iter().map(|h| src.join(h)).collect();
     for h in also.iter().chain(&offset_headers) {
@@ -310,11 +383,11 @@ fn layout(build: &Path, out: &Path, host: &str) -> Result<String> {
         text.push_str(&format!("#include \"{h}\"\n"));
     }
     // fields inside anonymous unions get generated names (`cp15.anon13`) that renumber when cpu.h gains a union: name the path instead, clang evaluates it
-    for (name, expr) in FIELD_OFFSETS {
+    for (name, expr) in &fields {
         text.push_str(&format!("#define {name} {expr}\n"));
     }
     std::fs::write(&unit, text)?;
-    let macros: Vec<&str> = FIELD_OFFSETS.iter().map(|&(n, _)| n).collect();
+    let macros: Vec<&str> = fields.iter().map(|&(n, _)| n).collect();
     let source = Source {
         path: &unit,
         lang: Lang::C,
@@ -327,14 +400,13 @@ fn layout(build: &Path, out: &Path, host: &str) -> Result<String> {
         triple: buildscript::clang_triple_from_cargo()?,
         args,
     };
-    let iface = atl_bridgegen::interface(
-        "qemu_cpu",
-        "qemu target/arm/cpu.h (aarch64-linux-user, PIC build flags)",
-        &source,
-        std::slice::from_ref(&target),
-    )
-    .context("QEMU CPU layouts")?;
-    atl_bridgegen::rust::layout_module(&iface, host)
+    let what = format!(
+        "qemu target/arm/cpu.h ({}-linux-user, PIC build flags)",
+        guest.name
+    );
+    let iface = atl_bridgegen::interface("qemu_cpu", &what, &source, std::slice::from_ref(&target))
+        .context("QEMU CPU layouts")?;
+    Ok((atl_bridgegen::rust::layout_module(&iface, host)?, guest))
 }
 
 fn main() -> Result<()> {
@@ -345,6 +417,11 @@ fn main() -> Result<()> {
     println!("cargo::rerun-if-env-changed={BUILD_ENV}");
     println!("cargo::rerun-if-env-changed={SIGCHAIN_ENV}");
     println!("cargo::rustc-check-cfg=cfg(atl_qe_sigchain)");
+    let names: Vec<String> = TARGETS.iter().map(|t| format!("\"{}\"", t.name)).collect();
+    println!(
+        "cargo::rustc-check-cfg=cfg({GUEST_CFG}, values({}))",
+        names.join(", ")
+    );
     for cfg in selected_breaks()? {
         println!("cargo::rustc-cfg={cfg}");
     }
@@ -366,10 +443,9 @@ fn main() -> Result<()> {
     let build = PathBuf::from(std::env::var(BUILD_ENV).with_context(|| {
         format!("feature qemu needs {BUILD_ENV} (`xtask qemu --pic` build dir)")
     })?);
-    std::fs::write(
-        out.join("qemu_layout.rs"),
-        layout(&build, &out, &host.arch)?,
-    )?;
+    let (module, guest) = layout(&build, &out, &host.arch)?;
+    std::fs::write(out.join("qemu_layout.rs"), module)?;
+    println!("cargo::rustc-cfg={GUEST_CFG}=\"{}\"", guest.name);
     host_signal(&build, &manifest, &out)?;
     // the engine C ABI's facts, read from the header by clang; lib.rs checks atl-engine-api's Rust mirror against them
     let header = manifest.join("../atl-engine-api/include/atl_engine.h");

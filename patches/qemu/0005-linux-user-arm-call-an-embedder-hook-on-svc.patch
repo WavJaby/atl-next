@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Tue, 17 Nov 2026 00:47:17 +0800
+Subject: [PATCH] linux-user: arm: call an embedder hook on svc
+
+The engine needs each svc before the syscall path, as on aarch64 (the
+hook of the aarch64 patch). The immediate is read from the insn: imm8 of
+a Thumb svc, imm24 of an Arm svc, before the OABI decode that reads the
+same Arm immediate as a syscall number. The weak default returns -1, so
+an unhooked executable runs the upstream path.
+
+Upstream-Status: Inappropriate [embedder seam for the ATL translator engine]
+Patch-Reason: cpu_loop has no seam where an embedder sees EXCP_SWI; a copy of its dispatch would be a second copy to maintain
+---
+SPDX-License-Identifier: GPL-2.0-or-later
+ linux-user/arm/cpu_loop.c | 44 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 44 insertions(+)
+
+diff --git a/linux-user/arm/cpu_loop.c b/linux-user/arm/cpu_loop.c
+index 262ab5cc416dcdcd7878a0d2360b58680d3f7087..26bf9b958fbfca26b497d9ac2e0d6f0e180f0838 100644
+--- a/linux-user/arm/cpu_loop.c
++++ b/linux-user/arm/cpu_loop.c
+@@ -267,12 +267,48 @@ static bool emulate_arm_fpa11(CPUARMState *env, uint32_t opcode)
+     return true;
+ }
+ 
++/*
++ * ATL P1 default: no embedder, every svc is a syscall. A strong definition
++ * in the embedder replaces this at link time, so the patched executable
++ * behaves as upstream.
++ */
++int __attribute__((weak)) atl_svc_hook(CPUARMState *env, uint32_t imm)
++{
++    return -1;
++}
++
++/*
++ * ATL P1: the svc immediate as the guest wrote it, read from the insn
++ * before pc: imm8 of a 16-bit Thumb svc, imm24 of an Arm svc.
++ * An unreadable insn gives 0, which the hook never takes.
++ */
++static uint32_t atl_svc_imm(CPUARMState *env)
++{
++    uint32_t insn = 0;
++    uint16_t insn16 = 0;
++
++    if (env->thumb) {
++        if (get_user_u16(insn16, env->regs[15] - 2)) {
++            return 0;
++        }
++        if (bswap_code(arm_sctlr_b(env))) {
++            insn16 = bswap16(insn16);
++        }
++        return insn16 & 0xff;
++    }
++    if (get_user_code_u32(insn, env->regs[15] - 4, env)) {
++        return 0;
++    }
++    return insn & 0xffffff;
++}
++
+ void cpu_loop(CPUARMState *env)
+ {
+     CPUState *cs = env_cpu(env);
+     int trapnr, si_signo, si_code;
+     unsigned int n, insn;
+     abi_ulong ret;
++    int hook;
+ 
+     for(;;) {
+         cpu_exec_start(cs);
+@@ -311,6 +347,14 @@ void cpu_loop(CPUARMState *env)
+             }
+             break;
+         case EXCP_SWI:
++            /* ATL P1: see atl_svc_hook() in include/user/cpu_loop.h. */
++            hook = atl_svc_hook(env, atl_svc_imm(env));
++            if (hook == 0) {
++                break;
++            }
++            if (hook == 1) {
++                return;
++            }
+             {
+                 env->eabi = true;
+                 /* system call */

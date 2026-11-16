@@ -15,7 +15,18 @@ type PtrFn = unsafe extern "C" fn(*mut c_void);
 type CpuCopyFn = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
 type CflagsHasFn = unsafe extern "C" fn(*mut c_void, u32) -> bool;
 type CflagsSetFn = unsafe extern "C" fn(*mut c_void, u32);
-type SigaltstackFn = unsafe extern "C" fn(u64, u64, *mut c_void) -> i64;
+/// The target's `abi_ulong` / `abi_long` (include/user/abitypes.h): 64-bit for aarch64, 32-bit for arm.
+#[cfg(not(atl_qe_guest = "arm"))]
+type AbiUlong = u64;
+#[cfg(not(atl_qe_guest = "arm"))]
+type AbiLong = i64;
+#[cfg(atl_qe_guest = "arm")]
+type AbiUlong = u32;
+#[cfg(atl_qe_guest = "arm")]
+type AbiLong = i32;
+type SigaltstackFn = unsafe extern "C" fn(AbiUlong, AbiUlong, *mut c_void) -> AbiLong;
+#[cfg(atl_qe_guest = "arm")]
+type TargetMmapFn = unsafe extern "C" fn(AbiUlong, AbiUlong, i32, i32, i32, i64) -> AbiLong;
 
 /// linux-user's functions a host-attached CPU needs, resolved once with the library.
 pub(crate) struct Api {
@@ -42,6 +53,9 @@ pub(crate) struct Api {
     process_queued_cpu_work: PtrFn,
     /// `abi_long do_sigaltstack(abi_ulong uss, abi_ulong uoss, CPUArchState *)` (linux-user/signal.c): the guest `sigaltstack` syscall; returns 0 or a negative target errno.
     do_sigaltstack: SigaltstackFn,
+    /// `abi_long target_mmap(abi_ulong start, abi_ulong len, int prot, int flags, int fd, off_t offset)` (include/user/mmap.h): the guest's own mmap, which a 32-bit guest's stacks go through so they land below 4 GiB in a host hole (patch 0006: no reservation, QEMU probes the host). Freed by host munmap after their page marks are cleared, as for 64-bit guests.
+    #[cfg(atl_qe_guest = "arm")]
+    target_mmap: TargetMmapFn,
 }
 
 /// dlsym `$name` and type it as `$ty`, the prototype the field doc names.
@@ -69,6 +83,8 @@ impl Api {
             tb_flush: func!(h, c"tb_flush__exclusive_or_serial", VoidFn),
             process_queued_cpu_work: func!(h, c"process_queued_cpu_work", PtrFn),
             do_sigaltstack: func!(h, c"do_sigaltstack", SigaltstackFn),
+            #[cfg(atl_qe_guest = "arm")]
+            target_mmap: func!(h, c"target_mmap", TargetMmapFn),
         })
     }
 }
@@ -81,15 +97,23 @@ const TS_INFO: usize = layout::ATL_OFFSET_TS_INFO as usize;
 const TS_BPRM: usize = layout::ATL_OFFSET_TS_BPRM as usize;
 const TS_SIGNAL_MASK: usize = layout::ATL_OFFSET_TS_SIGNAL_MASK as usize;
 const SIZEOF_TS_SIGNAL_MASK: usize = layout::ATL_SIZEOF_TS_SIGNAL_MASK as usize;
+#[cfg(not(atl_qe_guest = "arm"))]
 const TS_GCS_EL0_LOCKED: usize = layout::ATL_OFFSET_TS_GCS_EL0_LOCKED as usize;
+#[cfg(not(atl_qe_guest = "arm"))]
 const GCSPR_EL0: usize = layout::ATL_OFFSET_GCSPR_EL0 as usize;
+#[cfg(not(atl_qe_guest = "arm"))]
 const GCSCR_EL0: usize = layout::ATL_OFFSET_GCSCR_EL0 as usize;
+#[cfg(not(atl_qe_guest = "arm"))]
 const GCSCR_PCRSEL: u64 = layout::ATL_GCSCR_PCRSEL;
 const CF_PARALLEL: u32 = layout::ATL_CF_PARALLEL as u32;
-const _: () = assert!(
-    TS_GCS_EL0_LOCKED + 8 <= SIZEOF_TASKSTATE
-        && TS_SIGNAL_MASK + SIZEOF_TS_SIGNAL_MASK <= SIZEOF_TASKSTATE
-);
+const _: () = assert!(TS_SIGNAL_MASK + SIZEOF_TS_SIGNAL_MASK <= SIZEOF_TASKSTATE);
+/// The 8-byte TaskState fields `do_fork` copies from the parent: the `bprm` and `info` pointers, on aarch64 also `gcs_el0_locked` (an aarch64-only `abi_ulong`).
+#[cfg(not(atl_qe_guest = "arm"))]
+const TS_COPIED: [usize; 3] = [TS_BPRM, TS_INFO, TS_GCS_EL0_LOCKED];
+#[cfg(atl_qe_guest = "arm")]
+const TS_COPIED: [usize; 2] = [TS_BPRM, TS_INFO];
+#[cfg(not(atl_qe_guest = "arm"))]
+const _: () = assert!(TS_GCS_EL0_LOCKED + 8 <= SIZEOF_TASKSTATE);
 
 /// Default guest stack per attached CPU (attach_ex size 0): 1 MiB, bionic's default pthread stack order (D2). A host thread's own stack cannot serve: its `cpu_loop` frames live there while the guest runs.
 const DEFAULT_STACK: usize = 1 << 20;
@@ -216,6 +240,7 @@ pub(crate) fn attach(boot_env: usize, size: usize, guard: usize) -> Result<Cpu, 
     let _held = ATTACH
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    #[cfg(not(atl_qe_guest = "arm"))]
     if read_u64(boot_env, GCSCR_EL0) & GCSCR_PCRSEL != 0 {
         return Err("attach: the boot CPU has GCS on; a host CPU would need its own GCS stack (do_fork's gcs_new_stack)".to_owned());
     }
@@ -266,7 +291,7 @@ pub(crate) fn attach(boot_env: usize, size: usize, guard: usize) -> Result<Cpu, 
     let stack = guest_stack(len, guard)?;
     // break `copy-caller` keeps the template's sp when the template is not the boot CPU
     if template == boot_env {
-        Guest::new(env.cast()).set_x(31, (stack + len) as u64);
+        Guest::new(env.cast()).set_sp((stack + len) as u64);
     }
     // the breaks that leave this thread without its own TaskState or thread_cpu would register on the boot CPU or dereference NULL; they are red at (m) already
     let alt_guard = page_size();
@@ -303,7 +328,7 @@ fn task_state(api: &Api, boot_env: *mut u8, env: *mut u8) -> Result<*mut u8, Str
     }
     // SAFETY: ts is zeroed TaskState memory, init_task_state's precondition.
     unsafe { (api.init_task_state)(ts.cast()) };
-    for field in [TS_BPRM, TS_INFO, TS_GCS_EL0_LOCKED] {
+    for field in TS_COPIED {
         write_u64(ts, field, read_u64(parent, field));
     }
     // SAFETY: both are TaskStates of SIZEOF_TASKSTATE bytes; the mask lies inside (const assert above).
@@ -315,6 +340,7 @@ fn task_state(api: &Api, boot_env: *mut u8, env: *mut u8) -> Result<*mut u8, Str
         );
     }
     write_u64(env_cpu(env), CPU_OPAQUE, ts as u64);
+    #[cfg(not(atl_qe_guest = "arm"))]
     write_u64(env, GCSPR_EL0, 0);
     Ok(ts)
 }
@@ -332,9 +358,11 @@ fn guest_stack(len: usize, guard: usize) -> Result<usize, String> {
     Ok(stack)
 }
 
-/// The alternate signal stack's usable bytes: bionic's per-thread `SIGNAL_STACK_SIZE_WITHOUT_GUARD` for LP64 (libc/bionic/pthread_internal.h, 32 KiB: "ucontext is comically large on aarch64"), plus one guard page below as bionic's `SIGNAL_STACK_SIZE` adds. Break `small-altstack`: 8 KiB, the size the gate's size check names red.
+/// The alternate signal stack's usable bytes: bionic's per-thread `SIGNAL_STACK_SIZE_WITHOUT_GUARD` (libc/bionic/pthread_internal.h): 32 KiB for LP64 ("ucontext is comically large on aarch64"), 16 KiB for ILP32; plus one guard page below as bionic's `SIGNAL_STACK_SIZE` adds. Break `small-altstack`: 8 KiB, the size the gate's size check names red.
 const ALT_STACK: usize = if cfg!(atl_qe_small_altstack) {
     8 << 10
+} else if cfg!(atl_qe_guest = "arm") {
+    16 << 10
 } else {
     32 << 10
 };
@@ -343,12 +371,12 @@ const ALT_STACK: usize = if cfg!(atl_qe_small_altstack) {
 #[cfg(atl_qe_shared_altstack)]
 static SHARED_ALT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
-/// `target_stack_t` (linux-user/generic/signal.h) for aarch64: abi_ulong ss_sp, abi_int ss_flags, abi_ulong ss_size.
+/// `target_stack_t` (linux-user/generic/signal.h, which aarch64 and arm both use): abi_ulong ss_sp, abi_int ss_flags, abi_ulong ss_size.
 #[repr(C)]
 struct TargetStack {
-    sp: u64,
+    sp: AbiUlong,
     flags: i32,
-    size: u64,
+    size: AbiUlong,
 }
 
 /// bionic's per-thread alternate signal stack (`__init_alternate_signal_stack`): a guard page + [`ALT_STACK`] bytes, registered with QEMU's `do_sigaltstack` on `env` (this thread's CPU, `thread_cpu` set, sp already on the guest stack so the EPERM check passes) as the guest's own `sigaltstack` syscall would. A guest handler with SA_ONSTACK then runs there (`target_sigsp`), also when the fault is a guest stack overflow. Returns the alternate stack's base, or 0 when break `no-altstack` registers none.
@@ -369,16 +397,19 @@ fn alt_stack(api: &Api, env: *mut u8, guard: usize) -> Result<usize, String> {
     let base = guarded_mapping(ALT_STACK, guard, true)?;
     // the syscall's argument must be guest-readable memory: the alternate stack's own top, unused until the first SA_ONSTACK delivery
     let uss = (base + ALT_STACK - std::mem::size_of::<TargetStack>()) & !15;
+    // a guest address: below guest_addr_max (set_pages in guarded_mapping checked it), so it fits abi_ulong
+    let abi =
+        |v: usize| AbiUlong::try_from(v).map_err(|_| format!("attach: {v:#x} is no guest address"));
     // SAFETY: uss lies inside the RW mapping just made (or the shared one, idle: no handler runs during attach).
     unsafe {
         (uss as *mut TargetStack).write(TargetStack {
-            sp: base as u64,
+            sp: abi(base)?,
             flags: 0,
-            size: ALT_STACK as u64,
+            size: abi(ALT_STACK)?,
         });
     }
     // SAFETY: env is this thread's complete CPU with thread_cpu set (attach); uss a guest-readable target_stack_t.
-    let r = unsafe { (api.do_sigaltstack)(uss as u64, 0, env.cast()) };
+    let r = unsafe { (api.do_sigaltstack)(abi(uss)?, 0, env.cast()) };
     if r != 0 {
         return Err(format!(
             "attach: do_sigaltstack refused the alternate stack: {r}"
@@ -389,20 +420,7 @@ fn alt_stack(api: &Api, env: *mut u8, guard: usize) -> Result<usize, String> {
 
 /// One PROT_NONE mapping of `guard` + `len` bytes (page multiples); the top `len` (plus the guard when `!guarded`) made RW on the host and READ|WRITE|VALID for QEMU. Returns mapping + guard.
 fn guarded_mapping(len: usize, guard: usize, guarded: bool) -> Result<usize, String> {
-    // SAFETY: a fresh private anonymous mapping, all PROT_NONE; unmapped in detach.
-    let p = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            guard + len,
-            libc::PROT_NONE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        )
-    };
-    if p == libc::MAP_FAILED {
-        return Err("attach: mmap of a guest stack failed".to_owned());
-    }
+    let p = reserve(guard + len)?;
     let low = if guarded { guard } else { 0 };
     let open = p as usize + low;
     // SAFETY: [open, p + guard + len) lies inside the mapping just made.
@@ -425,6 +443,48 @@ fn guarded_mapping(len: usize, guard: usize, guarded: bool) -> Result<usize, Str
         0,
     )?;
     Ok(p as usize + guard)
+}
+
+/// A fresh private anonymous PROT_NONE host mapping of `len` bytes that QEMU's page table does not mark, anywhere the host puts it (a 64-bit guest addresses all of it).
+#[cfg(not(atl_qe_guest = "arm"))]
+fn reserve(len: usize) -> Result<*mut c_void, String> {
+    // SAFETY: a fresh private anonymous mapping, all PROT_NONE; unmapped in detach.
+    let p = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if p == libc::MAP_FAILED {
+        return Err("attach: mmap of a guest stack failed".to_owned());
+    }
+    Ok(p)
+}
+
+/// arm `MAP_PRIVATE` / `MAP_ANONYMOUS` (linux-user/generic/target_mman.h via arm's): target values, which `target_mmap` translates.
+#[cfg(atl_qe_guest = "arm")]
+const TARGET_MAP_PRIVATE: i32 = 0x02;
+#[cfg(atl_qe_guest = "arm")]
+const TARGET_MAP_ANONYMOUS: i32 = 0x20;
+
+/// [`reserve`] for a 32-bit guest: the mapping must lie below 4 GiB, in a hole of a host whose low 4 GiB other code also maps (patch 0006). QEMU's own guest `mmap` finds one (its host probe, linux-user/mmap.c `mmap_find_vma`) and marks the pages; their marks are cleared here, so the caller marks exactly what it opens.
+#[cfg(atl_qe_guest = "arm")]
+fn reserve(len: usize) -> Result<*mut c_void, String> {
+    let api = &lib().thread;
+    let n = AbiUlong::try_from(len).map_err(|_| "attach: guest stack beyond 4 GiB".to_owned())?;
+    // SAFETY: QEMU's guest mmap of fresh anonymous PROT_NONE memory (no fd); it takes the mmap lock itself.
+    let r = unsafe { (api.target_mmap)(0, n, 0, TARGET_MAP_PRIVATE | TARGET_MAP_ANONYMOUS, -1, 0) };
+    // a negative target errno is in -4095..-1 (linux-user/mmap.c returns -TARGET_E*)
+    if (-4095..0).contains(&r) {
+        return Err(format!("attach: target_mmap of a guest stack: {r}"));
+    }
+    let p = r as u32 as usize;
+    set_pages(p, len, 0, page::VALID)?;
+    Ok(p as *mut c_void)
 }
 
 /// Undo [`guarded_mapping`]: clear VALID (a no-op on the never-registered guard; covering it keeps the unguarded variant consistent) and unmap.

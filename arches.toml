@@ -31,7 +31,7 @@
 #   android_abis      APK `lib/<abi>/` names, preferred first
 #   clang             clang triple for guest bionic and guest libs (Soong `ClangTriple`)
 #   qemu_target       QEMU linux-user target (`<qemu_target>-linux-user`)
-#   rust              Rust target triple of our guest code (the engine boot executable, crates/atl-qemu-boot); absent = none for this arch yet. Checked: rustc lists it, and its arch part is qemu_target.
+#   rust              Rust target triple of our guest code (the engine boot executable, crates/atl-qemu-boot); absent = none for this arch yet. Checked: rustc lists it, and its target_arch (`rustc --print cfg`) is qemu_target.
 #
 # No priority or engine columns: ABI preference (native > translated 64-bit > translated 32-bit) follows
 # from host match and pointer_bits; one translator engine exists.
@@ -48,6 +48,7 @@ soong_arch_variant = "armv7-a-neon"
 android_abis = ["armeabi-v7a", "armeabi"]
 clang = "armv7a-linux-androideabi"
 qemu_target = "arm"
+rust = "armv7-linux-androideabi"
 
 [arm64]
 pointer_bits = 64
