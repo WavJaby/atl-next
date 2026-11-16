@@ -4,7 +4,8 @@
 //! The record: a gate's last run in a build dir writes what its runtime read (atld_run.rs `record_inputs`, via [`write_record`]): host files, and host directories whose trees the bundle takes whole.
 //! `push` bundles that record, mapped to `out/`, `java/` and `src/aosp/` names, plus `lib/`: Debian's LLVM 19 runtimes (a labelled patch until our pinned runtimes ship in an install tree, plan L1 / D1).
 //! A directory is replicated with its symlinks kept as links and never followed (the ART tree's `com.android.art -> .` would loop); files are hard links, copies across filesystems.
-//! Dry run by default. `--apply` stages the bundle under `<out>/remote/bundle/<gate>` (with a manifest of sha256 + size, or the link target) and runs `rsync -a --delete` to `~/atl-next-run/<name>/` on the host.
+//! Every name of one source file stays one file on the target (staged as hard links, synced with `rsync -H`): a library reached by two names (an `app-art/lib64` link and its `device/` file) would otherwise load twice with separate state -- ANGLE's EGL loader opens `libGLESv2_angle.so` beside itself while DT_NEEDED finds the other copy, so its EGL current context and its GL entries part.
+//! Dry run by default. `--apply` stages the bundle under `<out>/remote/bundle/<gate>` (with a manifest of sha256 + size, or the link target) and runs `rsync -aH --delete` to `~/atl-next-run/<name>/` on the host.
 //! `test` runs the prerequisite check on the target first: `ldd` over every ELF of the bundle, with the bundle's directories on `LD_LIBRARY_PATH`. Each `not found` soname is named with the file that needs it, a file the push did not deliver is named, and any of them is red. Then the runtime half ([`runtime_half`]): `gl` runs here, each of its atld runs runs on the target from the bundle ([`RemoteRun::spawn`]), and its judge reads the logs the target returns.
 //! Host: an ssh alias from the operator's WSL `~/.ssh/config`. The alias is the only handle: no address, user or key goes into the repo or a flag. `local:<absolute dir>` is a directory standing in for the target (the local gate).
 //! Limit: `ldd` here also searches this host's own libraries, so on WSL a missing bundle copy still resolves. The `drop-libunwind` break is red only on a host without its own `libunwind.so.1`.
@@ -20,6 +21,9 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use sha2::{Digest, Sha256};
 
 use crate::{arches, gate_goals, gl_probe, out, provided_gate, verdict};
+
+/// rsync's flags for the bundle: archive, the staged hard links kept (`-H`: one source = one file on the target, see the module doc), stale entries deleted.
+const RSYNC: [&str; 3] = ["-a", "-H", "--delete"];
 
 /// The bundle's `lib/`: Debian's LLVM 19 runtimes. Arch ships libc++ 23 but no LLVM `libunwind.so.1` (plan L1 section 3). A labelled patch: the ideal is our pinned runtimes (runtimes.rs) in a packaged install tree (plan D1).
 /// The build machine's own copy; a cross host's runs take its sysroot's ([`llvm_lib_dir`]).
@@ -814,11 +818,13 @@ impl Host {
         Ok(())
     }
 
+    /// Copies the staged tree to the target with rsync's [`RSYNC`] flags.
     fn sync(&self, stage: &Path, dir_name: &str) -> Result<()> {
         let src = format!("{}/", stage.display());
         let status = match self {
             Host::Ssh(alias) => Command::new("rsync")
-                .args(["-a", "--delete", "--mkpath", "-e"])
+                .args(RSYNC)
+                .args(["--mkpath", "-e"])
                 .arg(format!("ssh {}", ssh_opts_sh()))
                 .arg(&src)
                 .arg(format!("{alias}:{REMOTE_ROOT}/{dir_name}/"))
@@ -826,7 +832,7 @@ impl Host {
             Host::Local(dir) => {
                 std::fs::create_dir_all(dir)?;
                 Command::new("rsync")
-                    .args(["-a", "--delete"])
+                    .args(RSYNC)
                     .arg(&src)
                     .arg(format!("{}/", dir.display()))
                     .status()
@@ -2241,6 +2247,32 @@ mod tests {
             manifest,
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  3  out/device/a.so\n"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Two names of one source arrive as one file (one inode) on the target, as they are one file here: a library loaded by both names must not map twice.
+    #[test]
+    fn sync_keeps_one_file_per_source() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = temp("one-file");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.so");
+        std::fs::write(&file, b"abc").unwrap();
+        let entry = |name: &str| Entry {
+            name: name.to_owned(),
+            src: file.clone(),
+            kind: Kind::File,
+        };
+        let bundle = Bundle {
+            gate: "t".to_owned(),
+            entries: vec![entry("out/app-art/lib64/a.so"), entry("out/device/a/a.so")],
+        };
+        let stage = dir.join("stage");
+        bundle.stage(&stage).unwrap();
+        let target = dir.join("target");
+        Host::Local(target.clone()).sync(&stage, "t").unwrap();
+        let ino = |name: &str| std::fs::metadata(target.join(name)).unwrap().ino();
+        assert_eq!(ino("out/app-art/lib64/a.so"), ino("out/device/a/a.so"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
