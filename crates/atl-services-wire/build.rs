@@ -76,7 +76,7 @@ fn sensor_event(manifest: &Path) -> Result<()> {
         "atl-bridgegen output differs between two runs on the same input"
     );
     std::fs::write(out.join("sensor_event.rs"), first).context("writing sensor_event.rs")?;
-    println!("cargo::rerun-if-changed={}", header.display());
-    println!("cargo::rerun-if-changed={}", arches.display());
+    buildscript::rerun_if_changed(&header);
+    buildscript::rerun_if_changed(&arches);
     Ok(())
 }

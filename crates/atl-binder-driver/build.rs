@@ -26,7 +26,7 @@ const DRIVER: &[Api] = &[Api {
 
 fn main() -> Result<()> {
     for path in buildscript::api_crate(DRIVER, "crate::exports")? {
-        println!("cargo::rerun-if-changed={}", path.display());
+        buildscript::rerun_if_changed(&path);
     }
     Ok(())
 }

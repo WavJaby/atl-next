@@ -47,7 +47,7 @@ fn main() -> Result<()> {
     let mut rerun = vec![arches];
     rerun.extend(up.rerun_paths("aosp/libnativehelper/include_jni"));
     for p in rerun {
-        println!("cargo::rerun-if-changed={}", p.display());
+        buildscript::rerun_if_changed(&p);
     }
     // the library's ABI is its `Java_*` and `JNI_OnLoad` exports; every archive symbol stays local, as the launcher runtime's
     println!("cargo::rustc-link-arg-cdylib=-Wl,--exclude-libs,ALL");

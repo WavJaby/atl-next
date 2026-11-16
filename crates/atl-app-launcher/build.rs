@@ -305,7 +305,7 @@ fn main() -> Result<()> {
         }
     }
     for path in rerun {
-        println!("cargo::rerun-if-changed={}", path.display());
+        buildscript::rerun_if_changed(&path);
     }
     // The runtime's ABI is `atl_app_main` only, defined in this crate's own objects; every symbol from an archive (each dependency's rlib: cxx's `cxxbridge1$*`, std) stays local.
     // Its NEEDed libraries resolve in its group with it first: an exported copy would interpose theirs (libinput.so's own cxx runtime; AOSP libraries' libatl_bionic.so, the process's one bionic).
@@ -326,10 +326,7 @@ fn main() -> Result<()> {
             std::env::var_os(atl_bridgegen::converter::NATIVE_OUT).context("ATL_NATIVE_OUT")?,
         )
         .join("upstream/boringssl/prefix/lib");
-        println!(
-            "cargo::rerun-if-changed={}",
-            prefix.join("libcrypto.so").display()
-        );
+        buildscript::rerun_if_changed(&prefix.join("libcrypto.so"));
         println!("cargo::rustc-link-search=native={}", prefix.display());
         println!("cargo::rustc-link-arg-cdylib=-Wl,--no-as-needed,-lcrypto,--as-needed");
     }

@@ -379,7 +379,7 @@ fn count(ws: &Path, tier: Tier) {
 
 /// The one path every build sees its out dir at (workspace-relative): the build namespace binds the checkout's build dir over it ([`build_bind`]), so build.ninja, CMake caches, dep files and DWARF name it in every build dir and a copy stays valid at another real path.
 /// Outside every namespace it is an empty dir, mode 0555 (`tree::enter` makes it): a tool following a logged path there fails loudly instead of reading or writing another checkout's build.
-pub const CANONICAL: &str = "out/build";
+pub const CANONICAL: &str = atl_layout::BUILD;
 
 /// The build namespace's bind of the checkout's build dir (made if missing) over [`CANONICAL`].
 pub fn build_bind(root: &Path) -> Result<crate::tree::Overlay> {

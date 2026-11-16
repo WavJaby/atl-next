@@ -22,7 +22,7 @@ uses = ["generators", "android-paths", "diag"]
 [property-service]
 crates = ["atl-property-service"]
 exports = ["atl-property-service"]
-uses = ["bionic", "android-paths"]
+uses = ["bionic", "android-paths", "layout"]
 
 # the one launcher of sandboxed processes (plan Q5; M2 depth Q4(a): bwrap user + pid namespaces, /system and /data mounts), each registered with binderd; its `control` module is the protocol by which the services ask for process starts and kills,
 # its `webspawn` module the one request an app may make (a WebKit web process; refusals counted through diag)
@@ -165,7 +165,7 @@ uses = ["gralloc", "generators"]
 [platform-ui]
 crates = ["atl-platform-ui-api", "atl-platform-ui-linux", "atl-platform-ui", "atl-platform-ui-module-fixture", "atl-webview-linux"]
 exports = ["atl-platform-ui"]
-uses = ["compositor", "libgui-parcel", "gralloc", "scene-buffer", "platform-types", "generators"]
+uses = ["compositor", "libgui-parcel", "gralloc", "scene-buffer", "platform-types", "generators", "layout"]
 
 # the WebView provider's JNI library libatl_webview.so (webview plan S4.1): natives of the java/webview-provider forwarders, Android semantics (default UA, refusals) over the platform layer's web engine; its JNIEnv table generated from jni.h
 [webview]

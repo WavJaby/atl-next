@@ -147,6 +147,10 @@ pub fn main() -> Result<ExitCode> {
             println!("{line}");
         }
         let overlays = tree::binds_of(&root)?;
+        // what the build scripts' resolution reads (atl-layout resolution_input), written into the dir about to be bound, before any build in it
+        if let Some(build) = overlays.iter().find(|o| o.project == crate::out::CANONICAL) {
+            atl_layout::Layout::of(&root)?.write_resolution_stamp(&build.copy)?;
+        }
         // `native --shell`: the shell gets the compiler-cache variables of its own source view, as each ninja run does
         let mut env = match &cli.command {
             Command::Native(a) if a.shell => {

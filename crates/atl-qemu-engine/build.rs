@@ -210,7 +210,7 @@ fn preprocessor_args(cmd: &[String], dir: &Path) -> Vec<String> {
 /// [`UNIT`]'s compile_commands.json entry: (its directory, the QEMU source root, its command words).
 fn unit_entry(build: &Path) -> Result<(PathBuf, PathBuf, Vec<String>)> {
     let db_path = build.join("compile_commands.json");
-    println!("cargo::rerun-if-changed={}", db_path.display());
+    buildscript::rerun_if_changed(&db_path);
     let db: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(&db_path).with_context(|| db_path.display().to_string())?,
     )?;
@@ -239,16 +239,13 @@ fn unit_entry(build: &Path) -> Result<(PathBuf, PathBuf, Vec<String>)> {
 fn host_signal(build: &Path, manifest: &Path, out: &Path) -> Result<()> {
     let (dir, _, cmd) = unit_entry(build)?;
     let shim = manifest.join("src/host_signal.c");
-    println!("cargo::rerun-if-changed={}", shim.display());
+    buildscript::rerun_if_changed(&shim);
     let host_dir = cmd
         .iter()
         .filter_map(|a| a.strip_prefix("-I"))
         .find(|p| p.contains("linux-user/include/host/"))
         .context("unit command: no -I linux-user/include/host/<host>")?;
-    println!(
-        "cargo::rerun-if-changed={}",
-        dir.join(host_dir).join("host-signal.h").display()
-    );
+    buildscript::rerun_if_changed(&dir.join(host_dir).join("host-signal.h"));
     let obj = out.join("host_signal.o");
     let mut words = cmd.iter();
     let mut c = std::process::Command::new(words.next().context("empty unit command")?);
@@ -305,7 +302,7 @@ fn layout(build: &Path, out: &Path, host: &str) -> Result<String> {
     let also: Vec<PathBuf> = HEADERS.iter().map(|h| src.join(h)).collect();
     let offset_headers: Vec<PathBuf> = OFFSET_HEADERS.iter().map(|h| src.join(h)).collect();
     for h in also.iter().chain(&offset_headers) {
-        println!("cargo::rerun-if-changed={}", h.display());
+        buildscript::rerun_if_changed(h);
     }
     let unit = out.join("qemu_cpu.c");
     let mut text = String::from("#include \"qemu/osdep.h\"\n");
@@ -376,7 +373,7 @@ fn main() -> Result<()> {
     host_signal(&build, &manifest, &out)?;
     // the engine C ABI's facts, read from the header by clang; lib.rs checks atl-engine-api's Rust mirror against them
     let header = manifest.join("../atl-engine-api/include/atl_engine.h");
-    println!("cargo::rerun-if-changed={}", header.display());
+    buildscript::rerun_if_changed(&header);
     std::fs::write(
         out.join("engine_abi_layout.rs"),
         atl_bridgegen::engine_abi::layout_module(&header, &out, &host.arch)?,

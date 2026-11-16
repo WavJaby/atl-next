@@ -32,7 +32,7 @@ fn main() -> Result<()> {
     let up = Upstreams::of(&checkout)?;
     let service_dir = format!("aosp/{SERVICE_DIR}");
     for path in up.rerun_paths(&service_dir) {
-        println!("cargo::rerun-if-changed={}", path.display());
+        buildscript::rerun_if_changed(&path);
     }
     let out = Converter::from_env()?;
     let mut build = cxx_build::bridge("src/bridge.rs");

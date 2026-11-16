@@ -565,6 +565,7 @@ version = "0.0.0"
 dependencies = [
  "atl-compositor",
  "atl-gralloc",
+ "atl-layout",
  "atl-libgui-parcel",
  "atl-platform-types",
  "thiserror",
@@ -612,6 +613,7 @@ dependencies = [
  "anyhow",
  "atl-android-paths",
  "atl-bionic",
+ "atl-layout",
  "clap",
  "toml",
 ]

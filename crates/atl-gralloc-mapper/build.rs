@@ -88,10 +88,10 @@ fn main() -> Result<()> {
     );
     let out = PathBuf::from(std::env::var("OUT_DIR")?);
     std::fs::write(out.join("imapper.rs"), code)?;
-    println!("cargo::rerun-if-changed={}", arches.display());
+    buildscript::rerun_if_changed(&arches);
     for rel in std::iter::once(&HEADER).chain(ALSO) {
         for p in up.rerun_paths(&format!("aosp/{rel}")) {
-            println!("cargo::rerun-if-changed={}", p.display());
+            buildscript::rerun_if_changed(&p);
         }
     }
     Ok(())

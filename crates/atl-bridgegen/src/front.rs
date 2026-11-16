@@ -508,10 +508,6 @@ fn args(lang: Lang, t: &Target) -> Result<Vec<String>> {
 }
 
 /// The pinned host sysroot args of this build script's target (buildscript::host_sysroot_args), derived once per script; the first derivation prints the reruns on the sysroot's stamp and deps.toml. Outside a build script (no TARGET: unit tests on fake trees): none.
-#[allow(
-    clippy::print_stdout,
-    reason = "a build script's stdout is cargo's instruction channel"
-)]
 fn extra_clang_args() -> Result<Vec<String>> {
     static ARGS: std::sync::OnceLock<std::result::Result<Vec<String>, String>> =
         std::sync::OnceLock::new();
@@ -526,7 +522,7 @@ fn extra_clang_args() -> Result<Vec<String>> {
                 match crate::buildscript::host_sysroot_args(&checkout, &target)? {
                     Some((args, inputs)) => {
                         for input in inputs {
-                            println!("cargo::rerun-if-changed={}", input.display());
+                            crate::buildscript::rerun_if_changed(&input);
                         }
                         args
                     }

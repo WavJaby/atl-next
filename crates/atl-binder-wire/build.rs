@@ -54,10 +54,10 @@ fn main() -> Result<()> {
     // the IR next to it, for review and upgrade diffs
     std::fs::write(out.join("binder.ir.json"), &first.1).context("writing binder.ir.json")?;
 
-    println!("cargo::rerun-if-changed={}", arches.display());
+    buildscript::rerun_if_changed(&arches);
     for dir in buildscript::bionic_uapi_dirs(&host) {
         for path in up.rerun_paths(&dir) {
-            println!("cargo::rerun-if-changed={}", path.display());
+            buildscript::rerun_if_changed(&path);
         }
     }
     Ok(())

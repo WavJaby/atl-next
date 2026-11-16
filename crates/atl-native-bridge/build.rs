@@ -12,12 +12,6 @@ use atl_bridgegen::jni::{LaneMap, Route};
 use atl_bridgegen::rust::{Table, api_module_with_table};
 use atl_bridgegen::{Lang, Source, Target};
 
-/// `rerun-if-changed` for `path`: relative to the package root when built from it (cargo resolves a relative path there), so a checkout at another path prints the same text and the script is not rerun. Other paths stay as given.
-fn rerun_if_changed(manifest: &std::path::Path, path: &std::path::Path) {
-    let shown = path.strip_prefix(manifest).unwrap_or(path);
-    println!("cargo::rerun-if-changed={}", shown.display());
-}
-
 /// The interface header, relative to the AOSP tree.
 const HEADER: &str = "art/libnativebridge/include/nativebridge/native_bridge.h";
 /// Where its `#include "jni.h"` resolves (libnativebridge's `export_header_lib_headers: ["jni_headers"]`).
@@ -327,7 +321,7 @@ const GLIBC: &[(&str, &str)] = &[
 fn provider_soname(manifest_dir: &std::path::Path) -> Result<String> {
     const CRATE: &str = "atl_bionic";
     let path = manifest_dir.join("../atl-bionic/Cargo.toml");
-    rerun_if_changed(manifest_dir, &path);
+    buildscript::rerun_if_changed(&path);
     let text = std::fs::read_to_string(&path).with_context(|| path.display().to_string())?;
     let version = text
         .lines()
@@ -354,7 +348,7 @@ const GAI_ERRLIST_LEN: usize = 16;
 fn gai_errlist_rs(up: &Upstreams) -> Result<String> {
     const REL: &str = "bionic/libc/dns/net/getaddrinfo.c";
     let path = up.aosp(REL);
-    println!("cargo::rerun-if-changed={}", path.display());
+    buildscript::rerun_if_changed(&path);
     let text = std::fs::read_to_string(&path).with_context(|| path.display().to_string())?;
     let head = "static const char * const ai_errlist[] = {";
     let body = text
@@ -679,7 +673,7 @@ fn host_compat(
     std::fs::write(android.join("api-level.h"), text)?;
     std::fs::copy(up.aosp(VERSIONING_H), android.join("versioning.h"))?;
     for p in up.rerun_paths(&format!("aosp/{VERSIONING_H}")) {
-        println!("cargo::rerun-if-changed={}", p.display());
+        buildscript::rerun_if_changed(&p);
     }
     Ok(vec![
         format!("-I{}", dir.display()),
@@ -757,7 +751,7 @@ fn stub_names(up: &Upstreams, rel: &str) -> Result<Vec<String>> {
         .collect();
     ensure!(!names.is_empty(), "no stubs in {}", path.display());
     for p in up.rerun_paths(&format!("aosp/{rel}")) {
-        println!("cargo::rerun-if-changed={}", p.display());
+        buildscript::rerun_if_changed(&p);
     }
     Ok(names)
 }
@@ -916,15 +910,15 @@ fn bindings_table(
     for dir in ["EGL", "GLES", "GLES2", "GLES3", "KHR"] {
         headers_under(&root.join(dir), &mut also)?;
     }
-    println!("cargo::rerun-if-changed={}", root.display());
+    buildscript::rerun_if_changed(&root);
     for (dir, headers) in NDK_HEADERS {
         let dir = up.aosp(dir);
         also.extend(headers.iter().map(|h| dir.join(h)));
-        println!("cargo::rerun-if-changed={}", dir.display());
+        buildscript::rerun_if_changed(&dir);
     }
     let sles = up.aosp(SLES_DIR);
     also.extend(SL_HEADERS.iter().map(|h| sles.join(h)));
-    println!("cargo::rerun-if-changed={}", sles.display());
+    buildscript::rerun_if_changed(&sles);
     let src = Source {
         path: &unit,
         lang: Lang::Cxx,
@@ -1385,8 +1379,7 @@ fn main() -> Result<()> {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let checkout = buildscript::checkout(&manifest)?;
     let up = Upstreams::of(&checkout)?;
-    // the repo root's arches.toml: the package is crates/<name>, so cargo's relative path is ../../
-    let arches = manifest.join("../../arches.toml");
+    let arches = checkout.join("arches.toml");
     let arches_text = std::fs::read_to_string(&arches)?;
     let host = buildscript::host_arch(&arches_text, &std::env::var("TARGET")?)?;
     // the identity engine is a per-host-ISA capability (engine/mod.rs `Active`): cfg `IDENTITY_CFG` on a host ISA that has its crossing
@@ -1509,7 +1502,7 @@ fn main() -> Result<()> {
             )?,
         )?;
     }
-    rerun_if_changed(&manifest, &arches);
+    buildscript::rerun_if_changed(&arches);
     for rel in std::iter::once(&HEADER)
         .chain(std::iter::once(&JNI_HEADER))
         .chain(INCLUDE_DIRS)
@@ -1518,7 +1511,7 @@ fn main() -> Result<()> {
         .chain(PROVIDER_FILES)
     {
         for p in up.rerun_paths(&format!("aosp/{rel}")) {
-            println!("cargo::rerun-if-changed={}", p.display());
+            buildscript::rerun_if_changed(&p);
         }
     }
     Ok(())

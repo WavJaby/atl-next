@@ -15,6 +15,7 @@ clap.workspace = true
 
 [build-dependencies]
 anyhow.workspace = true
+atl-layout = { path = "../atl-layout" }
 toml.workspace = true
 
 [lints]

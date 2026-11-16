@@ -4,7 +4,7 @@
 //! - abilist = CPU 64, CPU 32, bridge 64, bridge 32 ("all CPU_ABIs are preferred over all NATIVE_BRIDGE_ABIs"); abilist64 = CPU 64 + bridge 64; abilist32 = CPU 32 + bridge 32.
 //! - AOSP boards bridge one guest arch per width; with several, rows keep arches.toml's row order (row keys sorted) -- ATL's own rule, no AOSP one exists. Each row's ABIs keep their order (preferred first).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, ensure};
 
@@ -102,17 +102,9 @@ impl Classes {
     }
 }
 
-fn checkout(manifest: &Path) -> Result<PathBuf> {
-    manifest
-        .ancestors()
-        .find(|d| d.join("arches.toml").is_file())
-        .map(Path::to_path_buf)
-        .context("no arches.toml above the crate")
-}
-
 fn main() -> Result<()> {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
-    let arches = checkout(&manifest)?.join("arches.toml");
+    let arches = atl_layout::checkout(&manifest)?.join("arches.toml");
     let rows = rows(&std::fs::read_to_string(&arches)?)?;
     let [all, l64, l32] = Classes::of(&rows, &std::env::var("TARGET")?)?.lists();
     let code = format!(
@@ -122,6 +114,6 @@ fn main() -> Result<()> {
         PathBuf::from(std::env::var("OUT_DIR")?).join("abis.rs"),
         code,
     )?;
-    println!("cargo::rerun-if-changed={}", arches.display());
+    atl_layout::rerun_if_changed(&arches);
     Ok(())
 }

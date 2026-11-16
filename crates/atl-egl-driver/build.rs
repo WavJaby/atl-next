@@ -4,7 +4,8 @@
 //! The EGL / GLES ABI is atl-egl-host's (one typing of every entry, its build.rs); this crate adds only the window side.
 
 use atl_bridgegen::buildscript::{
-    HeaderImport, Upstreams, checkout, gl_entry_names, import_headers, select_shells,
+    HeaderImport, Upstreams, checkout, gl_entry_names, import_headers, rerun_if_changed,
+    select_shells,
 };
 use atl_bridgegen::ir::Ty;
 
@@ -34,7 +35,7 @@ fn es1_ext() -> anyhow::Result<()> {
     let up = Upstreams::of(&checkout(&manifest)?)?;
     let entries = std::fs::read_to_string(up.file(&format!("aosp/{ES1_ENTRIES}"))?)?;
     for path in up.rerun_paths(&format!("aosp/{ES1_ENTRIES}")) {
-        println!("cargo::rerun-if-changed={}", path.display());
+        rerun_if_changed(&path);
     }
     // no implementation: AOSP's gl_unimplemented answer, 0 of the return type (es1_ext.rs counts it); every GL return type (integers, pointers) has all-zero as a valid value
     let on_null = |_: &str, ret: &Ty| -> anyhow::Result<String> {

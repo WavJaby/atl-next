@@ -19,5 +19,8 @@ atl-libgui-parcel = { path = "../atl-libgui-parcel" }
 atl-platform-types = { path = "../atl-platform-types" }
 thiserror.workspace = true
 
+[build-dependencies]
+atl-layout = { path = "../atl-layout" }
+
 [lints]
 workspace = true

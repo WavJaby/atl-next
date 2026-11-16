@@ -18,6 +18,10 @@ use anyhow::{Context, Result, ensure};
 pub const MAIN: &str = "main";
 const SHARED: &str = "src";
 const TASKS: &str = "src-wt";
+/// The build dir every build sees, workspace-relative: xtask's build namespace binds the checkout's own build dir over it (xtask `out::CANONICAL`), so one path names each checkout's own.
+pub const BUILD: &str = "out/build";
+/// [`Layout::resolution_key`] as xtask last wrote it, in the build dir.
+const STAMP: &str = "layout.stamp";
 
 #[derive(Clone)]
 pub struct Layout {
@@ -25,8 +29,6 @@ pub struct Layout {
     src: PathBuf,
     /// Task name (the branch) and `src-wt/<task>`; None on main or a detached HEAD.
     task: Option<(String, PathBuf)>,
-    /// The repo checkout's HEAD file: its branch picks the task. None for `new`.
-    head: Option<PathBuf>,
 }
 
 /// A path as the resolver places it.
@@ -52,13 +54,7 @@ impl Layout {
             )
         })?;
         let branch = git(repo, &["symbolic-ref", "-q", "--short", "HEAD"]).ok();
-        let head = git(
-            repo,
-            &["rev-parse", "--path-format=absolute", "--git-path", "HEAD"],
-        )?;
-        let mut layout = Self::new(ws, branch.as_deref());
-        layout.head = Some(head.into());
-        Ok(layout)
+        Ok(Self::new(ws, branch.as_deref()))
     }
 
     /// Workspace `ws` as a repo checkout on `branch` sees it (None = detached HEAD).
@@ -69,7 +65,6 @@ impl Layout {
             task: branch
                 .filter(|b| *b != MAIN)
                 .map(|b| (b.to_owned(), ws.join(TASKS).join(b))),
-            head: None,
         }
     }
 
@@ -127,18 +122,56 @@ impl Layout {
         git_store(&self.src, dir)
     }
 
-    /// What a build script watches besides the located path so cargo reruns it when `locate(path)` would answer differently: the repo checkout's HEAD (a branch switch), and on a task branch the owner's worktree list
-    /// `<git dir>/worktrees` (`xtask patch --edit` / `--done` add and remove entries there). Before the owner's first worktree that dir does not exist, and cargo reruns a script on every build for a missing input, so the git dir itself stands in: creating `worktrees` changes it.
-    pub fn resolution_inputs(&self, path: &Path) -> Vec<PathBuf> {
-        let mut out: Vec<PathBuf> = self.head.iter().cloned().collect();
-        if self.task.is_some()
-            && let Some(owner) = self.owner(path)
-        {
-            let store = self.git_dir(owner);
-            let worktrees = store.join("worktrees");
-            out.push(if worktrees.is_dir() { worktrees } else { store });
+    /// What `locate` answers depend on, as text: one line per task copy this checkout resolves into (`src-wt/<task>/<owner>`, workspace-relative), sorted. Empty on main, detached and on a task without copies: those resolve alike, so a build dir copied from main's base stays fresh for them.
+    /// The task name alone is not in it: a branch switch that moves no path must not rerun every upstream-reading build script.
+    pub fn resolution_key(&self) -> Result<String> {
+        let Some((_, task_dir)) = &self.task else {
+            return Ok(String::new());
+        };
+        let mut owners = Vec::new();
+        stores(&self.src.join(".git-dirs"), Path::new(""), &mut owners)?;
+        owners.sort();
+        let mut out = String::new();
+        for owner in owners {
+            let copy = task_dir.join(&owner);
+            if copy.join(".git").exists() {
+                let rel = copy.strip_prefix(&self.workspace).unwrap_or(&copy);
+                out.push_str(&format!("{}\n", rel.display()));
+            }
         }
-        out
+        Ok(out)
+    }
+
+    /// The resolution stamp at the build path every build sees ([`BUILD`]): inside xtask's build namespace the checkout's own; outside it names the empty mount point.
+    pub fn resolution_stamp(&self) -> PathBuf {
+        self.workspace.join(BUILD).join(STAMP)
+    }
+
+    /// For xtask, before any build: write [`Layout::resolution_key`] to the stamp in `build_dir` (the checkout's build dir, which its namespace binds at [`BUILD`]) when it differs. An equal stamp keeps its mtime, so a build dir copied from a base keeps its build scripts fresh. True = written.
+    pub fn write_resolution_stamp(&self, build_dir: &Path) -> Result<bool> {
+        let stamp = build_dir.join(STAMP);
+        let key = self.resolution_key()?;
+        if std::fs::read_to_string(&stamp).is_ok_and(|had| had == key) {
+            return Ok(false);
+        }
+        std::fs::write(&stamp, key).with_context(|| format!("writing {}", stamp.display()))?;
+        Ok(true)
+    }
+
+    /// For build scripts: the one input that changes when `locate` would answer differently -- the stamp xtask writes. Never the checkout's git HEAD: a build dir copied to another checkout would watch the HEAD of the checkout that built it and rerun on every move of it.
+    /// Missing or not equal to [`Layout::resolution_key`] is an error, not a fallback: plain `cargo` outside xtask is no build entry, so nothing would keep the stamp current.
+    pub fn resolution_input(&self) -> Result<PathBuf> {
+        let stamp = self.resolution_stamp();
+        let fix = "build through `cargo xtask` (it writes the stamp in its build namespace; plain cargo is no build entry)";
+        let had = std::fs::read_to_string(&stamp)
+            .ok()
+            .with_context(|| format!("{} missing: {fix}", stamp.display()))?;
+        ensure!(
+            had == self.resolution_key()?,
+            "{} is stale (task copies changed since xtask wrote it): {fix}",
+            stamp.display()
+        );
+        Ok(stamp)
     }
 
     /// The nearest ancestor of `path` (itself included) that is a shared checkout.
@@ -173,6 +206,67 @@ impl Layout {
                 break;
             }
         }
+    }
+}
+
+/// Each store under `.git-dirs` (`<rel>.git`), as the shared checkout's path `<rel>`. Not descended into: a nested checkout's store is a sibling (`a.git`, `a/b.git`).
+fn stores(root: &Path, rel: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    let dir = root.join(rel);
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        match name.to_str().and_then(|n| n.strip_suffix(".git")) {
+            Some(owner) => out.push(rel.join(owner)),
+            None => stores(root, &rel.join(&name), out)?,
+        }
+    }
+    Ok(())
+}
+
+/// The repo checkout holding a package dir (a build script's `CARGO_MANIFEST_DIR`): the nearest ancestor with arches.toml.
+pub fn checkout(manifest_dir: &Path) -> Result<PathBuf> {
+    manifest_dir
+        .ancestors()
+        .find(|d| d.join("arches.toml").is_file())
+        .map(Path::to_path_buf)
+        .with_context(|| format!("no arches.toml above {}", manifest_dir.display()))
+}
+
+/// Prints `cargo::rerun-if-changed` for `path` from the build script of the package at `CARGO_MANIFEST_DIR` ([`rerun_arg`]). The one way a build script names a path input.
+#[expect(
+    clippy::print_stdout,
+    reason = "a build script's stdout is cargo's instruction channel"
+)]
+pub fn rerun_if_changed(path: &Path) {
+    let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_default());
+    println!(
+        "cargo::rerun-if-changed={}",
+        rerun_arg(&manifest, path).display()
+    );
+}
+
+/// `path` as a rerun input of package `manifest`: relative to the package dir when inside the repo checkout holding it (cargo resolves a relative path there), so the recorded inputs never name the checkout's path and a build dir copied to another checkout stays fresh.
+/// As given otherwise: `src/`, `cache/` and [`BUILD`] are one path for every checkout.
+pub fn rerun_arg(manifest: &Path, path: &Path) -> PathBuf {
+    if let Ok(rest) = path.strip_prefix(manifest) {
+        return rest.to_owned();
+    }
+    let Ok(root) = checkout(manifest) else {
+        return path.to_owned();
+    };
+    match (path.strip_prefix(&root), manifest.strip_prefix(&root)) {
+        (Ok(rest), Ok(pkg)) => pkg
+            .components()
+            .map(|_| Path::new(".."))
+            .collect::<PathBuf>()
+            .join(rest),
+        _ => path.to_owned(),
     }
 }
 
@@ -330,33 +424,76 @@ mod tests {
         std::fs::remove_dir_all(&ws).unwrap();
     }
 
+    /// The key lists task copies only: main, detached and a copy-less task share one key (a base's stamp stays valid for them); a copy, or the same copy under another task, changes it. A nested checkout's store is found beside its parent's.
     #[test]
-    fn resolution_inputs_name_the_owner_git_dir_on_a_task_branch() {
-        let ws = temp("inputs");
+    fn resolution_key_names_the_task_copies() {
+        let ws = temp("key");
         shared(&ws, "aosp/a");
-        let p = Path::new("aosp/a/inc");
+        shared(&ws, "aosp/a/b");
+        shared(&ws, "qemu");
         let task = Layout::new(&ws, Some("t"));
-        // no worktree yet: the git dir, whose entry list changes when `worktrees` appears
+        assert_eq!(task.resolution_key().unwrap(), "");
+        assert_eq!(Layout::new(&ws, None).resolution_key().unwrap(), "");
+        copy(&ws, "t", "qemu");
+        copy(&ws, "t", "aosp/a/b");
         assert_eq!(
-            task.resolution_inputs(p),
-            vec![ws.join("src/.git-dirs/aosp/a.git")]
+            task.resolution_key().unwrap(),
+            "src-wt/t/aosp/a/b\nsrc-wt/t/qemu\n"
         );
-        std::fs::create_dir_all(ws.join("src/.git-dirs/aosp/a.git/worktrees")).unwrap();
+        copy(&ws, "u", "qemu");
         assert_eq!(
-            task.resolution_inputs(p),
-            vec![ws.join("src/.git-dirs/aosp/a.git/worktrees")]
+            Layout::new(&ws, Some("u")).resolution_key().unwrap(),
+            "src-wt/u/qemu\n"
         );
-        // a nested checkout's dir does not collide with its parent's
-        assert_eq!(
-            task.git_dir(Path::new("aosp/a/b")),
-            ws.join("src/.git-dirs/aosp/a/b.git")
-        );
-        // on main a task copy never applies: nothing but HEAD (absent for `new`)
-        assert!(Layout::new(&ws, None).resolution_inputs(p).is_empty());
+        // main never sees task copies
+        assert_eq!(Layout::new(&ws, Some(MAIN)).resolution_key().unwrap(), "");
         std::fs::remove_dir_all(&ws).unwrap();
     }
 
-    /// `of` on a real worktree: workspace = the main checkout's parent, task = the worktree's branch, HEAD = the worktree's own.
+    /// A build script's input: missing and stale are errors naming xtask; xtask's write leaves an equal stamp untouched (its mtime is what cargo compares).
+    #[test]
+    fn resolution_input_is_the_stamp_xtask_keeps_current() {
+        let ws = temp("stamp");
+        shared(&ws, "qemu");
+        std::fs::create_dir_all(ws.join(BUILD)).unwrap();
+        let task = Layout::new(&ws, Some("t"));
+        let e = format!("{:#}", task.resolution_input().unwrap_err());
+        assert!(e.contains("missing") && e.contains("cargo xtask"), "{e}");
+        let dir = ws.join(BUILD);
+        assert!(task.write_resolution_stamp(&dir).unwrap());
+        let stamp = task.resolution_input().unwrap();
+        assert_eq!(stamp, ws.join("out/build/layout.stamp"));
+        let mtime = || std::fs::metadata(&stamp).unwrap().modified().unwrap();
+        let before = mtime();
+        assert!(!task.write_resolution_stamp(&dir).unwrap());
+        assert_eq!(mtime(), before);
+        copy(&ws, "t", "qemu");
+        let e = format!("{:#}", task.resolution_input().unwrap_err());
+        assert!(e.contains("stale"), "{e}");
+        assert!(task.write_resolution_stamp(&dir).unwrap());
+        assert!(task.resolution_input().is_ok());
+        std::fs::remove_dir_all(&ws).unwrap();
+    }
+
+    /// Inside the checkout a rerun path is package-relative (also through `..`, and the checkout's root files); outside it stays as given.
+    #[test]
+    fn rerun_args_are_package_relative_inside_the_checkout() {
+        let co = temp("rerun");
+        let pkg = co.join("crates/p");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(co.join("arches.toml"), "").unwrap();
+        let arg = |p: &Path| rerun_arg(&pkg, p);
+        assert_eq!(arg(&pkg.join("src/x.rs")), Path::new("src/x.rs"));
+        assert_eq!(arg(&pkg.join("../q/src")), Path::new("../q/src"));
+        assert_eq!(arg(&co.join("deps.toml")), Path::new("../../deps.toml"));
+        assert_eq!(
+            arg(Path::new("/ws/src/aosp/x.h")),
+            Path::new("/ws/src/aosp/x.h")
+        );
+        std::fs::remove_dir_all(&co).unwrap();
+    }
+
+    /// `of` on a real worktree: workspace = the main checkout's parent, task = the worktree's branch.
     #[test]
     fn of_a_worktree() {
         let ws = temp("of");
@@ -396,7 +533,6 @@ mod tests {
         let ws = ws.canonicalize().unwrap();
         assert_eq!(l.workspace(), ws);
         assert_eq!(l.task().map(|(n, _)| n), Some("x"));
-        assert_eq!(l.head, Some(ws.join("repo/.git/worktrees/x/HEAD")));
         assert!(Layout::of(&repo).unwrap().task().is_none());
         std::fs::remove_dir_all(&ws).unwrap();
     }

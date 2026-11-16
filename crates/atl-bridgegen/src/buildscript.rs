@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 use atl_layout::Layout;
+pub use atl_layout::{checkout, rerun_if_changed};
 
 use crate::c::Kept;
 use crate::{Lang, Source, Target};
@@ -207,15 +208,6 @@ pub struct ArchRow {
     pub identity: bool,
 }
 
-/// The checkout holding `manifest_dir`: the nearest ancestor with arches.toml.
-pub fn checkout(manifest_dir: &Path) -> Result<PathBuf> {
-    manifest_dir
-        .ancestors()
-        .find(|d| d.join("arches.toml").is_file())
-        .map(Path::to_path_buf)
-        .with_context(|| format!("no arches.toml above {}", manifest_dir.display()))
-}
-
 /// The clang args that make a probe read host `rust_target`'s pinned sysroot (arches.toml `[<arch>.host] sysroot`, a deps.toml `sysroot_debs` row) and its libc++: `--sysroot`, `-nostdinc++ -isystem <c++/v1>`, as device compiles use libc++.
 /// One environment for every host, build machine or cross: generation never reads the build machine's /usr/include, its optional -dev packages or libstdc++ (each once changed a verdict). None: `rust_target` is no arches.toml host (a guest target: its views carry their own `-nostdlibinc` headers).
 /// Also the build script's rerun inputs: the sysroot's `stamp.txt` (a refetch) and deps.toml (new pins = another dir, Layout::sysroot).
@@ -272,14 +264,16 @@ pub fn host_sysroot_args(
 /// The upstream sources a build script reads, where `atl_layout` places them for this repo checkout: a task copy (`xtask patch --edit`) replaces its `src/` checkout here exactly as in xtask.
 pub struct Upstreams {
     layout: Layout,
+    /// `Layout::resolution_input`: checked current when made.
+    stamp: PathBuf,
 }
 
 impl Upstreams {
-    /// The upstreams of the repo checkout `checkout`.
+    /// The upstreams of the repo checkout `checkout`. Fails outside `cargo xtask` (no current resolution stamp).
     pub fn of(checkout: &Path) -> Result<Self> {
-        Ok(Upstreams {
-            layout: Layout::of(checkout)?,
-        })
+        let layout = Layout::of(checkout)?;
+        let stamp = layout.resolution_input()?;
+        Ok(Upstreams { layout, stamp })
     }
 
     /// `rel`, relative to `src/` (`aosp/bionic/libc/include`), where this checkout reads it.
@@ -303,11 +297,9 @@ impl Upstreams {
         Ok(path)
     }
 
-    /// The `cargo::rerun-if-changed` paths for reading `rel`: where it is now, and what moves it (a branch switch, a task copy made or removed).
+    /// The `cargo::rerun-if-changed` paths for reading `rel`: where it is now, and the resolution stamp (what moves it: a task copy made or removed, a branch switch that changes the copies).
     pub fn rerun_paths(&self, rel: &str) -> Vec<PathBuf> {
-        let mut out = vec![self.path(rel)];
-        out.extend(self.layout.resolution_inputs(Path::new(rel)));
-        out
+        vec![self.path(rel), self.stamp.clone()]
     }
 }
 
@@ -587,12 +579,8 @@ fn generate_headers(imports: &[HeaderImport], backend: &Backend) -> Result<()> {
         }
         rerun.extend(up.rerun_paths(&format!("aosp/{}", import.source)));
     }
-    #[allow(
-        clippy::print_stdout,
-        reason = "a build script's stdout is cargo's instruction channel"
-    )]
     for path in rerun {
-        println!("cargo::rerun-if-changed={}", path.display());
+        rerun_if_changed(&path);
     }
     Ok(())
 }

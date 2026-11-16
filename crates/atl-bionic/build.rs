@@ -542,14 +542,14 @@ fn main() -> Result<()> {
         std::env::var("TARGET")?
     );
 
-    println!("cargo::rerun-if-changed={}", arches.display());
+    buildscript::rerun_if_changed(&arches);
     println!("cargo::rerun-if-env-changed=ATL_BIONIC_BREAK");
     for path in &first.host_inputs {
-        println!("cargo::rerun-if-changed={}", path.display());
+        buildscript::rerun_if_changed(path);
     }
     for dir in INPUT_DIRS {
         for path in up.rerun_paths(&format!("aosp/{dir}")) {
-            println!("cargo::rerun-if-changed={}", path.display());
+            buildscript::rerun_if_changed(&path);
         }
     }
     Ok(())
