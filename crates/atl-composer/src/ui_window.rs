@@ -324,6 +324,9 @@ fn wire(window: Rc<PlatformWindow>, splash_started: Option<Instant>) {
         window.on_presented(move |sample| presented.on_presented(sample));
         let sizes = Arc::clone(&session.sender);
         window.on_resize(move |size| sizes.submit_size(size));
+        // the desktop closing the window is the Shell removing its Task (REMOVE_TASK, task_sender.rs)
+        let closes = Arc::clone(&session.sender);
+        window.on_close_requested(move || closes.submit_remove_task());
         // the monitor is this process's compositor display (its vsync interval, SurfaceFlinger's display info) and the services' display (DisplayInfo, Configuration)
         let monitors = Arc::clone(&session.sender);
         let frames = Arc::clone(&session.composer);

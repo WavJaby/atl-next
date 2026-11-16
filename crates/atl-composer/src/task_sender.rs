@@ -4,11 +4,12 @@
 //! The platform reports at each change, many in a burst during a drag: the sender keeps only the latest of each and sends that, so a burst costs one transaction, not one per step. The display goes before the size: a size measured on the new monitor belongs to the new display.
 //! The UI thread only stores the values. A transaction is a blocking binder call and runs on the sender's own thread, so it never stalls the toolkit's main loop.
 //! One window per process, so one Task: a different number named later is refused, and nothing is ever sent under the first Task's number for it.
+//! The desktop closing the window is `REMOVE_TASK`, the Shell's removeTask: sent after any pending display and size, once per close request.
 
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use atl_platform_ui::PhysSize;
-use atl_services_types::compositor_registry::{SERVICE, SET_BOUNDS, SET_DISPLAY};
+use atl_services_types::compositor_registry::{REMOVE_TASK, SERVICE, SET_BOUNDS, SET_DISPLAY};
 use atl_services_types::display_model::DisplayModel;
 use binder::binder_impl::IBinderInternal;
 use binder::{SpIBinder, Strong};
@@ -22,22 +23,28 @@ struct Pending {
     task: Option<i32>,
     size: Option<PhysSize>,
     display: Option<DisplayModel>,
+    /// The desktop asked to close the window; requests before the send coalesce into one.
+    remove: bool,
 }
 
 /// One report, taken from [`Pending`].
 enum Report {
     Display(DisplayModel),
     Size(i32, PhysSize),
+    RemoveTask(i32),
 }
 
 impl Pending {
-    /// The next report to send, once the Task is named: the display first.
+    /// The next report to send, once the Task is named: the display first, the removal last.
     fn take(&mut self) -> Option<Report> {
         let task = self.task?;
         if let Some(display) = self.display.take() {
             return Some(Report::Display(display));
         }
-        self.size.take().map(|size| Report::Size(task, size))
+        if let Some(size) = self.size.take() {
+            return Some(Report::Size(task, size));
+        }
+        std::mem::take(&mut self.remove).then_some(Report::RemoveTask(task))
     }
 }
 
@@ -84,6 +91,12 @@ impl TaskSender {
     /// The window's monitor changed (UI thread): replaces the pending display. The services ignore a display equal to theirs (tasks.rs `set_display`).
     pub fn submit_display(&self, display: DisplayModel) {
         self.lock().display = Some(display);
+        self.wake.notify_one();
+    }
+
+    /// The desktop asked to close the window (UI thread): the Task's removal goes after the pending reports.
+    pub fn submit_remove_task(&self) {
+        self.lock().remove = true;
         self.wake.notify_one();
     }
 
@@ -136,6 +149,11 @@ fn send(report: &Report) -> Result<(), String> {
             data.write(&height).map_err(|e| e.to_string())?;
             SET_BOUNDS
         }
+        Report::RemoveTask(task) => {
+            data.write(task).map_err(|e| e.to_string())?;
+            tracing::info!("atl-composer: task sender: REMOVE_TASK task {task}");
+            REMOVE_TASK
+        }
     };
     binder
         .submit_transact(code, data, 0)
@@ -164,6 +182,22 @@ mod tests {
         p.task = Some(3);
         assert!(matches!(p.take(), Some(Report::Display(d)) if d == second));
         assert!(matches!(p.take(), Some(Report::Size(3, s)) if s == size(800, 600)));
+        assert!(p.take().is_none());
+    }
+
+    /// A close waits for the Task, goes after a pending size, and two requests before the send are one removal.
+    #[test]
+    fn remove_task_goes_last_once() {
+        let mut p = Pending {
+            remove: true,
+            size: Some(size(800, 600)),
+            ..Pending::default()
+        };
+        assert!(p.take().is_none());
+        p.task = Some(3);
+        p.remove = true;
+        assert!(matches!(p.take(), Some(Report::Size(3, _))));
+        assert!(matches!(p.take(), Some(Report::RemoveTask(3))));
         assert!(p.take().is_none());
     }
 }

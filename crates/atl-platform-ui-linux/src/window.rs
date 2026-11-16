@@ -58,6 +58,7 @@ struct Shared {
     on_event: Slot<dyn FnMut(InputEvent)>,
     on_resize: Slot<dyn FnMut(PhysSize)>,
     on_monitor: Slot<dyn FnMut(Monitor)>,
+    on_close_requested: Slot<dyn FnMut()>,
     /// The monitor entered last, with the handlers of its change notifications (disconnected when another is entered).
     monitor: RefCell<Option<(gdk::Monitor, Vec<glib::SignalHandlerId>)>>,
     /// The pointer's last position over the content (logical pixels): GTK's leave and scroll signals carry none.
@@ -514,6 +515,7 @@ impl Window for GtkWindow {
             swiping: Cell::new(false),
             touch_ids: RefCell::default(),
             on_monitor: Slot::new(),
+            on_close_requested: Slot::new(),
             monitor: RefCell::new(None),
             on_painted: Slot::new(),
             on_presented: Slot::new(),
@@ -581,6 +583,13 @@ impl Window for GtkWindow {
             let active = w.is_active();
             tracing::info!("atl-platform-ui: focus {active}");
             focused.on_event.call(|f| f(InputEvent::Focus(active)));
+        });
+        // the desktop's close (xdg_toplevel.close): reported, then GTK's default closes the window as before (Window::on_close_requested)
+        let closing = Rc::clone(&shared);
+        window.connect_close_request(move |_| {
+            tracing::info!("atl-platform-ui: close requested");
+            closing.on_close_requested.call(|f| f());
+            glib::Propagation::Proceed
         });
         let resized = Rc::clone(&shared);
         view.connect_allocation(move |size| resized.on_resize.call(|f| f(size)));
@@ -736,6 +745,12 @@ impl Window for GtkWindow {
 
     fn on_resize<F: FnMut(PhysSize) + 'static>(&self, on_resize: F) {
         self.shared.on_resize.set(Box::new(on_resize));
+    }
+
+    fn on_close_requested<F: FnMut() + 'static>(&self, on_close_requested: F) {
+        self.shared
+            .on_close_requested
+            .set(Box::new(on_close_requested));
     }
 
     fn on_monitor<F: FnMut(Monitor) + 'static>(&self, on_monitor: F) {

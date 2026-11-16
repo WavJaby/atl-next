@@ -17,7 +17,7 @@ use crate::display::DisplayCallbacks;
 use crate::tasks::{TaskId, TaskSize, Tasks};
 use crate::ui_agents::UiAgents;
 use atl_services_types::compositor_registry::{
-    DESCRIPTOR, GET_COMPOSER, REGISTER, SET_BOUNDS, SET_DISPLAY, TASK_INFO,
+    DESCRIPTOR, GET_COMPOSER, REGISTER, REMOVE_TASK, SET_BOUNDS, SET_DISPLAY, TASK_INFO,
 };
 use atl_services_types::display_model::DisplayModel;
 use atl_services_types::permission::{SHELL_UID, SYSTEM_UID};
@@ -55,6 +55,9 @@ pub trait ICompositorRegistry: Interface {
     /// SET_DISPLAY once its argument is read: the monitor in the `--display` form. The caller's uid must own a Task; a malformed form is refused; a change reaches every app (registry `display_changed`).
     fn set_display(&self, caller_uid: u32, display: &str) -> Result<(), StatusCode>;
 
+    /// REMOVE_TASK once its argument is read: the desktop closed the window of Task `task`. The caller's uid must own the Task, as for SET_BOUNDS.
+    fn remove_task(&self, caller_uid: u32, task: i32) -> Result<(), StatusCode>;
+
     /// TASK_INFO once the caller's pid is read: the size the process's window opens at and its Task's package; None for a process with no Task, which opens no window (compositor_registry.rs TASK_INFO).
     fn task_info(&self, caller_pid: i32) -> Result<Option<TaskInfo>, StatusCode>;
 }
@@ -74,6 +77,7 @@ fn method_name(code: TransactionCode) -> Option<&'static str> {
         (SET_BOUNDS, "SET_BOUNDS"),
         (SET_DISPLAY, "SET_DISPLAY"),
         (TASK_INFO, "TASK_INFO"),
+        (REMOVE_TASK, "REMOVE_TASK"),
     ]
     .into_iter()
     .find_map(|(c, n)| (c == code).then_some(n))
@@ -131,6 +135,10 @@ fn dispatch(
         let height: i32 = data.read()?;
         return service.set_bounds(ThreadState::get_calling_uid(), task, width, height);
     }
+    if code == REMOVE_TASK {
+        let task: i32 = data.read()?;
+        return service.remove_task(ThreadState::get_calling_uid(), task);
+    }
     if code == SET_DISPLAY {
         let display: String = data.read()?;
         return service.set_display(ThreadState::get_calling_uid(), &display);
@@ -162,6 +170,10 @@ impl ICompositorRegistry for BpCompositorRegistry {
         Err(StatusCode::INVALID_OPERATION)
     }
 
+    fn remove_task(&self, _: u32, _: i32) -> Result<(), StatusCode> {
+        Err(StatusCode::INVALID_OPERATION)
+    }
+
     fn task_info(&self, _: i32) -> Result<Option<TaskInfo>, StatusCode> {
         Err(StatusCode::INVALID_OPERATION)
     }
@@ -188,6 +200,10 @@ impl ICompositorRegistry for Binder<BnCompositorRegistry> {
 
     fn set_display(&self, caller_uid: u32, display: &str) -> Result<(), StatusCode> {
         self.0.set_display(caller_uid, display)
+    }
+
+    fn remove_task(&self, caller_uid: u32, task: i32) -> Result<(), StatusCode> {
+        self.0.remove_task(caller_uid, task)
     }
 
     fn task_info(&self, caller_pid: i32) -> Result<Option<TaskInfo>, StatusCode> {
@@ -222,6 +238,16 @@ struct Registry {
 impl Interface for Registry {}
 
 impl Registry {
+    /// `task` (its wire number) when `caller_uid` owns it; otherwise PERMISSION_DENIED, its cause set for the reply hook's count.
+    fn owned_task(&self, caller_uid: u32, task: i32) -> Result<TaskId, StatusCode> {
+        TaskId::from_raw(task)
+            .filter(|t| self.tasks.owner(*t) == Some(caller_uid))
+            .ok_or_else(|| {
+                atl_diag::set_cause(&format!("uid {caller_uid} does not own task {task}"));
+                StatusCode::PERMISSION_DENIED
+            })
+    }
+
     /// `task`'s configuration changed (its size or the display): its activities get the change (activity.rs task_resized), then its windows `resized`, unless a relaunch holds them.
     fn task_changed(&self, task: TaskId) {
         self.activities.task_resized(task);
@@ -243,6 +269,19 @@ impl Registry {
 }
 
 impl ICompositorRegistry for Registry {
+    fn remove_task(&self, caller_uid: u32, task: i32) -> Result<(), StatusCode> {
+        // an app closes its own Tasks only
+        let task = self.owned_task(caller_uid, task)?;
+        let _ = writeln!(
+            std::io::stderr(),
+            "services: removeTask task {} of uid {caller_uid}",
+            task.raw()
+        );
+        // received, not acted on: ending the Task and its process (ActivityTaskSupervisor.removeTask) is not built
+        atl_diag::unimplemented_api!("ICompositorRegistry.REMOVE_TASK");
+        Ok(())
+    }
+
     fn task_info(&self, caller_pid: i32) -> Result<Option<TaskInfo>, StatusCode> {
         // a process started for a provider, service or receiver has no Task (activity.rs start_process_locked): AOSP shows no window for it
         let Some(task) = self.activities.task_of_process(caller_pid) else {
@@ -261,13 +300,8 @@ impl ICompositorRegistry for Registry {
         width: i32,
         height: i32,
     ) -> Result<(), StatusCode> {
-        // an app sizes its own Tasks only: the caller's uid must own the one it names
-        let Some(task) =
-            TaskId::from_raw(task).filter(|t| self.tasks.owner(*t) == Some(caller_uid))
-        else {
-            atl_diag::set_cause(&format!("uid {caller_uid} does not own task {task}"));
-            return Err(StatusCode::PERMISSION_DENIED);
-        };
+        // an app sizes its own Tasks only
+        let task = self.owned_task(caller_uid, task)?;
         if width <= 0 || height <= 0 {
             atl_diag::set_cause(&format!("task {} size {width}x{height}", task.raw()));
             return Err(StatusCode::BAD_VALUE);

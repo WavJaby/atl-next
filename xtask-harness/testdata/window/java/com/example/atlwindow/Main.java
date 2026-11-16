@@ -40,6 +40,9 @@ public class Main extends Activity {
     static final String COMPOSER_REGISTRY = "atl.compositor_registry";
     static final String COMPOSER_REGISTRY_DESCRIPTOR = "atl.ICompositorRegistry";
     static final int GET_COMPOSER = 5;
+    /** REMOVE_TASK (compositor_registry.rs) and the Task it names for the foreign-close probe: Integer.MAX_VALUE, a valid Task number the services never reach in one run, so no Task of this uid. */
+    static final int REMOVE_TASK = 6;
+    static final int FOREIGN_TASK = Integer.MAX_VALUE;
 
     private int frameCallbacks;
 
@@ -105,6 +108,33 @@ public class Main extends Activity {
             Log.w(TAG, "composer GET_COMPOSER failed: " + e);
         }
         Log.i(TAG, "composer GET_COMPOSER status=" + status + " uid=" + Process.myUid());
+        removeForeignTask();
+    }
+
+    /**
+     * The capture stage's foreign-close probe (capture.rs, sub-gate foreign): REMOVE_TASK naming FOREIGN_TASK, a Task this uid does not own, must be refused by the registry
+     * (PERMISSION_DENIED, counted in the services log). The reply carries a status only, so the line here records that the call was made; the verdict is the services' count.
+     */
+    private void removeForeignTask() {
+        String sent = "yes";
+        try {
+            IBinder registry = (IBinder) Class.forName("android.os.ServiceManager")
+                    .getMethod("getService", String.class).invoke(null, COMPOSER_REGISTRY);
+            Parcel data = Parcel.obtain();
+            Parcel reply = Parcel.obtain();
+            try {
+                data.writeInterfaceToken(COMPOSER_REGISTRY_DESCRIPTOR);
+                data.writeInt(FOREIGN_TASK);
+                registry.transact(REMOVE_TASK, data, reply, 0);
+            } finally {
+                data.recycle();
+                reply.recycle();
+            }
+        } catch (Exception e) {
+            // a refused status may surface as an exception: the call was still made
+            sent = "yes " + e.getClass().getSimpleName();
+        }
+        Log.i(TAG, "composer REMOVE_TASK foreign task=" + FOREIGN_TASK + " sent=" + sent);
     }
 
     /** A configuration change delivered without a relaunch (ActivityConfigurationChangeItem): one line each, with the screenWidthDp it now has. */

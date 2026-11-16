@@ -20,6 +20,8 @@ pub const SET_DISPLAY: u32 = 3;
 pub const TASK_INFO: u32 = 4;
 /// The transaction the shell (AID_SHELL 2000) or system (AID_SYSTEM 1000) uid sends to read an app's display: the app's package (String). Reply: the AOSP exception header (ok, or SECURITY for any other caller: AOSP's SecurityException, as captureDisplay needs READ_FRAME_BUFFER, which only those uids hold here), then the compositor binder of the newest UI-mode launch of that package, or null when there is none.
 pub const GET_COMPOSER: u32 = 5;
+/// The transaction a UI-mode app process sends when the desktop asks to close its window: the Task's number (i32). The Shell's removeTask (WindowContainerTransaction.removeTask). The caller's uid must own that Task, as for [`SET_BOUNDS`]. Reply: a status only.
+pub const REMOVE_TASK: u32 = 6;
 /// The system property holding the display the in-app compositor answers with (`DisplayModel::to_arg`): the same model atld forwards to the services, delivered to the app the way its other environment is. Its presence marks an ATL app process (atl-composer start).
 pub const DISPLAY_PROPERTY: &str = "ro.atl.display";
 /// The system property holding the headless pointer script (atld `--headless-pointer`, parsed by atl-composer `input::parse_script`), delivered like [`DISPLAY_PROPERTY`]. Unset: no input thread; the window handoff still works.

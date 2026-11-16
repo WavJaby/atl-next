@@ -2110,7 +2110,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 None => Err("no capture probe".to_owned()),
             },
             (Stage::Capture, _, _) => match &capture_probe {
-                Some(capture_probe) => capture::drive(p, &log, capture_probe),
+                Some(capture_probe) => capture::drive(p, &log, &services_log, capture_probe),
                 None => Err("no capture probe".to_owned()),
             },
             (Stage::Ime, _, Some(ime)) => {

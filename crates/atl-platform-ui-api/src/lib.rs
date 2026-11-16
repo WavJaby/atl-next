@@ -242,6 +242,10 @@ pub trait Window: FrameClock + InputSource + Sized {
 
     /// Calls `on_monitor` with the monitor the window is on once it is on one, then each time it moves to another or that monitor's mode, rate or scale changes. On two monitors at once, the one entered last counts.
     fn on_monitor<F: FnMut(Monitor) + 'static>(&self, on_monitor: F);
+
+    /// Calls `on_close_requested` each time the desktop asks to close the window (its close button, a shortcut; Wayland `xdg_toplevel.close`), replacing the previous callback.
+    /// The toolkit still closes the window after the call: nothing on Android's side removes it yet.
+    fn on_close_requested<F: FnMut() + 'static>(&self, on_close_requested: F);
 }
 
 /// Window content pixels, as [`Window::capture`] returns them.

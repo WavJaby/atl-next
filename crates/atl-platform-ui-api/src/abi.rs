@@ -995,6 +995,8 @@ pub struct UiVtable {
     ) -> Status,
     /// `Window::on_resize`.
     pub window_on_resize: unsafe extern "C" fn(window: *mut WindowHandle, f: Callback<PhysSize>),
+    /// `Window::on_close_requested`; the callback's argument is unit.
+    pub window_on_close_requested: unsafe extern "C" fn(window: *mut WindowHandle, f: Callback<()>),
     /// `Window::on_monitor`.
     pub window_on_monitor:
         unsafe extern "C" fn(window: *mut WindowHandle, f: Callback<MonitorView>),

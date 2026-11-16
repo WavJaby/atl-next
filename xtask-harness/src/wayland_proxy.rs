@@ -61,6 +61,8 @@ const XDG_TOPLEVEL_SET_MINIMIZED: u16 = 13;
 const WL_SURFACE_COMMIT: u16 = 6;
 /// The `configure` events of xdg_toplevel and xdg_surface are both opcode 0 (their requests are other opcodes).
 const XDG_TOPLEVEL_CONFIGURE: u16 = 0;
+/// `xdg_toplevel.close` event, opcode 1 (xdg-shell.xml event order: configure 0, close 1, configure_bounds 2, wm_capabilities 3): the desktop closed the window.
+const XDG_TOPLEVEL_CLOSE: u16 = 1;
 const XDG_SURFACE_CONFIGURE: u16 = 0;
 /// xdg-shell's `activated` window state: the injected configure says the window has focus, as the compositor's do for the focused window.
 const XDG_STATE_ACTIVATED: u32 = 4;
@@ -405,6 +407,8 @@ enum Injection {
         serial: u32,
         states: Vec<u32>,
     },
+    /// `xdg_toplevel.close` event: the desktop closed the window (the capture stage's close row).
+    ToplevelClose,
 }
 
 /// The proxy: accepts clients on `listen`, relays them to `upstream`, reports [`Event`]s.
@@ -500,6 +504,11 @@ impl Proxy {
             serial,
             states: states.to_vec(),
         })
+    }
+
+    /// Queues `xdg_toplevel.close` on the window's toplevel, as the desktop closing the window. Nothing else is forwarded for it: the client's own close handling decides what follows.
+    pub fn inject_toplevel_close(&self) -> Result<()> {
+        self.queue(Injection::ToplevelClose)
     }
 
     fn queue(&self, item: Injection) -> Result<()> {
@@ -844,6 +853,15 @@ fn server_to_client(
                         continue;
                     }
                 },
+                Injection::ToplevelClose => match toplevel {
+                    Some(toplevel) => toplevel_close_bytes(toplevel),
+                    None => {
+                        eprintln!(
+                            "wayland proxy: toplevel close dropped, the client has no window role yet"
+                        );
+                        continue;
+                    }
+                },
             };
             forward(client.as_fd(), &bytes, &mut Vec::new())?;
         }
@@ -858,6 +876,11 @@ fn event(object: u32, opcode: u16, body: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&((size << 16) | u32::from(opcode)).to_ne_bytes());
     out.extend_from_slice(body);
     out
+}
+
+/// `xdg_toplevel.close` as a client receives it: object, `8 << 16 | 1`, no body.
+fn toplevel_close_bytes(toplevel: u32) -> Vec<u8> {
+    event(toplevel, XDG_TOPLEVEL_CLOSE, &[])
 }
 
 /// `xdg_wm_base.ping(serial)` as a client receives it: object, `12 << 16 | 0`, serial.
@@ -1090,6 +1113,17 @@ mod tests {
             note_request(&mut ids, 13, XDG_TOPLEVEL_SET_TITLE, &body),
             None
         );
+    }
+
+    /// `xdg_toplevel.close` (event 1, no arguments): the header is the toplevel's object id and `8 << 16 | 1`, both native endian. Expected bytes from the wire format, not from [`toplevel_close_bytes`].
+    #[test]
+    fn toplevel_close_is_event_one_without_arguments() {
+        let want = [
+            0x0102_0304u32.to_ne_bytes(),
+            ((8u32 << 16) | 1).to_ne_bytes(),
+        ]
+        .concat();
+        assert_eq!(toplevel_close_bytes(0x0102_0304), want);
     }
 
     /// `xdg_toplevel.set_minimized` (request 13, no arguments) of the window's toplevel is [`Event::Minimized`]; another toplevel's is not.
