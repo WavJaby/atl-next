@@ -839,8 +839,7 @@ mod tests {
         let grant = acquire_with(&ws, who, Class::Light, FAST, &mut |_| panic!("waited")).unwrap();
         assert_eq!(held_jobs(), Some(1));
         let e = acquire_with(&ws, who, Class::Light, FAST, &mut |_| panic!("waited"))
-            .err()
-            .expect("a nested acquire must be refused");
+            .expect_err("a nested acquire must be refused");
         assert!(
             format!("{e:#}").contains("nested admission refused"),
             "{e:#}"
@@ -883,8 +882,7 @@ mod tests {
         let e = acquire_with(&ws, Path::new("nested"), Class::Light, FAST, &mut |_| {
             panic!("nested waited")
         })
-        .err()
-        .expect("a child of the holder must be refused");
+        .expect_err("a child of the holder must be refused");
         assert!(
             format!("{e:#}").contains("nested admission refused"),
             "{e:#}"
@@ -922,8 +920,7 @@ mod tests {
         assert_eq!(c.granted.recv_timeout(WAIT).unwrap(), "cpu 1 mem 0");
         let refused = try_take_all(&ws, who)
             .unwrap()
-            .err()
-            .expect("a held slot must refuse the quiet window");
+            .expect_err("a held slot must refuse the quiet window");
         assert!(
             refused.contains("quiet window refused") && refused.contains("held pid"),
             "{refused}"
@@ -937,8 +934,7 @@ mod tests {
         let e = acquire_with(&ws, Path::new("big"), Class::NativeFull, FAST, &mut |_| {
             panic!("waited")
         })
-        .err()
-        .expect("must refuse");
+        .expect_err("must refuse");
         assert!(
             format!("{e:#}").contains("needs cpu_min 8 but the pool has 4"),
             "{e:#}"
