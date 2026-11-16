@@ -3,11 +3,12 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 
+use crate::build_pool::{self, Class};
 use crate::timing::{self, Timings};
 use crate::unit_use::{self, Echo, Units};
 use crate::verdict::{self, Failure, Verdict};
@@ -133,6 +134,20 @@ impl Step {
             Step::GlProxies => "gl-proxies",
             Step::DriveTap => "drive-tap",
             Step::CrossBionic => "cross-bionic",
+        }
+    }
+
+    /// The pool class the step's leaf work takes (build_pool.rs): cargo/go compiles `cargo`, runtime gates `harness`, the rest `light`.
+    fn class(self) -> Class {
+        match self {
+            Step::Clippy
+            | Step::Test
+            | Step::Bootstrap
+            | Step::Converter
+            | Step::ConverterPackages
+            | Step::CrossBionic => Class::Cargo,
+            Step::GlProxies | Step::DriveTap => Class::Harness,
+            _ => Class::Light,
         }
     }
 
@@ -352,18 +367,33 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .filter(|s| args.only.is_empty() || args.only.contains(s))
         .collect();
     let out = out::out_dir(root, args.out.as_deref())?;
+    let ws = Layout::of(root)?.workspace().to_owned();
     let mut skipped = Vec::new();
     let mut failures = Vec::new();
     let mut times = Timings::default();
     for step in &steps {
         eprintln!("== check: {}", step.name());
-        let started = Instant::now();
+        let mut started = Instant::now();
+        let mut wait = Duration::ZERO;
         // every step ends with one `== check: <step> (<s>) <outcome>` line: the time sits on the line that names the outcome
         let outcome = if let Some(why) = step.skip(&out) {
             skipped.push(step.name());
             format!("skipped: {why}")
         } else {
-            match step.run(root, &out) {
+            // one grant per step, around its own work only: check itself holds nothing between steps (no hold-and-wait)
+            let run = build_pool::acquire(&ws, root, step.class()).and_then(|grant| {
+                wait = grant.waited;
+                started = Instant::now();
+                eprintln!(
+                    "check: {} pool {} cpu {} of {}",
+                    step.name(),
+                    grant.class,
+                    grant.cpu,
+                    grant.cpu_of
+                );
+                step.run(root, &out)
+            });
+            match run {
                 Ok(None) => "ok".to_owned(),
                 Ok(Some(why)) => {
                     skipped.push(step.name());
@@ -376,9 +406,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             }
         };
         let took = started.elapsed();
-        times.push(step.name(), took);
+        times.push_waited(step.name(), took, wait);
+        let waited = if wait.is_zero() {
+            String::new()
+        } else {
+            format!(", pool wait {}", timing::secs(wait))
+        };
         eprintln!(
-            "== check: {} ({}) {outcome}",
+            "== check: {} ({}{waited}) {outcome}",
             step.name(),
             timing::secs(took)
         );

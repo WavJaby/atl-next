@@ -11,39 +11,63 @@ pub fn secs(d: Duration) -> String {
     format!("{:.1}s", d.as_secs_f64())
 }
 
-/// Each step's wall time, in run order.
+/// Each step's wall time, in run order, and its pool wait when the step took a grant (build_pool.rs).
 #[derive(Default)]
-pub struct Timings(Vec<(String, Duration)>);
+pub struct Timings(Vec<(String, Duration, Option<Duration>)>);
 
 impl Timings {
     pub fn push(&mut self, step: &str, took: Duration) {
-        self.0.push((step.to_owned(), took));
+        self.0.push((step.to_owned(), took, None));
+    }
+
+    /// A step that queued `wait` for its pool grant before running `took`.
+    pub fn push_waited(&mut self, step: &str, took: Duration, wait: Duration) {
+        self.0.push((step.to_owned(), took, Some(wait)));
     }
 
     /// `<cmd> times:` then one row per step, longest first (ties keep run order): name, seconds, share of the total; then the total.
+    /// With pool waits recorded: a `wait` column (excluded from the step's seconds) and a `pool waits: <n>, <s>` line.
     pub fn table(&self, cmd: &str) -> String {
-        let total: Duration = self.0.iter().map(|(_, d)| *d).sum();
-        let mut rows: Vec<&(String, Duration)> = self.0.iter().collect();
+        let total: Duration = self.0.iter().map(|r| r.1).sum();
+        let pooled = self.0.iter().any(|r| r.2.is_some());
+        let mut rows: Vec<&(String, Duration, Option<Duration>)> = self.0.iter().collect();
         rows.sort_by_key(|r| std::cmp::Reverse(r.1));
         let width = rows
             .iter()
-            .map(|(n, _)| n.len())
+            .map(|r| r.0.len())
             .max()
             .unwrap_or(0)
             .max("total".len());
         let mut out = format!("{cmd} times:\n");
-        for (name, took) in rows {
+        for (name, took, wait) in rows {
             let share = if total.is_zero() {
                 0.0
             } else {
                 100.0 * took.as_secs_f64() / total.as_secs_f64()
             };
             out.push_str(&format!(
-                "  {name:<width$} {:>8} {share:>5.1}%\n",
+                "  {name:<width$} {:>8} {share:>5.1}%",
                 secs(*took)
             ));
+            if let Some(w) = wait.filter(|w| !w.is_zero()) {
+                out.push_str(&format!(" wait {}", secs(w)));
+            }
+            out.push('\n');
         }
         out.push_str(&format!("  {:<width$} {:>8}\n", "total", secs(total)));
+        if pooled {
+            let waits: Vec<Duration> = self
+                .0
+                .iter()
+                .filter_map(|r| r.2)
+                .filter(|w| !w.is_zero())
+                .collect();
+            out.push_str(&format!(
+                "{cmd} pool waits: {}, {}\n",
+                waits.len(),
+                secs(waits.iter().sum())
+            ));
+        }
         out
     }
 }
@@ -216,6 +240,20 @@ mod tests {
         t.push("spdx", Duration::from_millis(0));
         // shares by hand: 3/4 = 75 %, 1/4 = 25 %, 0
         let want = "check times:\n  clippy     3.0s  75.0%\n  fmt        1.0s  25.0%\n  spdx       0.0s   0.0%\n  total      4.0s\n";
+        assert_eq!(t.table("check"), want);
+    }
+
+    #[test]
+    fn pool_waits_show_beside_their_step_and_are_summed() {
+        let mut t = Timings::default();
+        t.push_waited(
+            "test",
+            Duration::from_millis(3_000),
+            Duration::from_millis(2_000),
+        );
+        t.push_waited("fmt", Duration::from_millis(1_000), Duration::ZERO);
+        // the wait is not in the step's seconds: shares 3/4 and 1/4; one nonzero wait of 2 s; name column width 5 ("total")
+        let want = "check times:\n  test      3.0s  75.0% wait 2.0s\n  fmt       1.0s  25.0%\n  total     4.0s\ncheck pool waits: 1, 2.0s\n";
         assert_eq!(t.table("check"), want);
     }
 

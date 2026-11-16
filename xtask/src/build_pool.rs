@@ -127,6 +127,8 @@ pub struct Grant {
     /// CPU slots the pool has in total.
     pub cpu_of: u32,
     pub mem_gib: u32,
+    /// Time spent queued before the grant: zero when the slots were free (`check times` wait column).
+    pub waited: Duration,
     /// The slot files: their locks are the reservation, released when the grant drops.
     _files: Vec<Flock>,
     /// Thread-bound: the grant marker is per thread, so the grant must drop on the thread that made it.
@@ -173,14 +175,18 @@ fn acquire_with(
         if ahead == 0
             && let Some((cpu, files)) = try_grant(&dir, &pool, w, &record)?
         {
-            if waited {
+            let waited = if waited {
+                let took = started.elapsed();
                 report(&format!(
                     "pool: {} granted cpu {cpu} mem {} after {:.1} s",
                     class.name(),
                     w.mem_gib,
-                    started.elapsed().as_secs_f64()
+                    took.as_secs_f64()
                 ));
-            }
+                took
+            } else {
+                Duration::ZERO
+            };
             drop(ticket);
             HELD.with(|h| *h.borrow_mut() = Some((record, cpu)));
             return Ok(Grant {
@@ -188,6 +194,7 @@ fn acquire_with(
                 cpu,
                 cpu_of: pool.cpu_slots.value,
                 mem_gib: w.mem_gib,
+                waited,
                 _files: files,
                 _thread: PhantomData,
             });
@@ -228,6 +235,7 @@ pub fn try_take_all(ws: &Path, who: &Path) -> Result<std::result::Result<Grant, 
         cpu,
         cpu_of: cpu,
         mem_gib: pool.mem_gib.value,
+        waited: Duration::ZERO,
         _files: files,
         _thread: PhantomData,
     }))

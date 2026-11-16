@@ -167,6 +167,8 @@ fn sandboxed_build(
     std::fs::create_dir_all(target).with_context(|| target.display().to_string())?;
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut cmd = Command::new(bwrap::PROGRAM);
+    // the step's grant reaches the sandboxed cargo through the environment
+    crate::grant_jobs(&mut cmd);
     cmd.args(sandbox(root, hidden, target).end())
         .arg(cargo)
         .args([

@@ -82,7 +82,7 @@ fn parse_go_mod(text: &str) -> Result<(String, Vec<String>)> {
 
 /// `go <args>` in the converter's directory under `go_work`: every dependency is a pinned checkout or a stub, so no toolchain or module downloads.
 pub fn go(root: &Path, go_work: &Path, args: &[&str]) -> Result<()> {
-    let status = Command::new("go")
+    let status = crate::grant_jobs(&mut Command::new("go"))
         .args(args)
         .current_dir(root.join(DIR))
         .env("GOWORK", go_work)

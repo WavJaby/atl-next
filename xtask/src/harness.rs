@@ -52,6 +52,8 @@ where
     S: Into<OsString>,
 {
     let mut cmd = Command::new(build(root)?);
+    // a check step's grant reaches the harness's nested cargo runs through the environment (lib.rs grant_jobs)
+    crate::grant_jobs(&mut cmd);
     cmd.args(args.into_iter().map(Into::into)).current_dir(root);
     Ok(cmd)
 }

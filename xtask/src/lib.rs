@@ -90,8 +90,18 @@ use anyhow::{Context, Result};
 pub fn cargo_command() -> std::process::Command {
     let mut cmd =
         std::process::Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    grant_jobs(&mut cmd);
+    cmd
+}
+
+/// Under a pool grant (build_pool.rs), sets the grant's CPU slots as the job count every tool of a leaf reads: cargo `CARGO_BUILD_JOBS`, libtest `RUST_TEST_THREADS`, go `GOFLAGS=-p=<n>`. Outside a grant: unchanged.
+/// Children inherit it: a process started under a grant (an xtask-harness step, cargo inside bwrap) runs its own cargo at the grant's count without a grant of its own (nested admission is refused).
+pub fn grant_jobs(cmd: &mut std::process::Command) -> &mut std::process::Command {
     if let Some(jobs) = build_pool::held_jobs() {
-        cmd.env("CARGO_BUILD_JOBS", jobs.to_string());
+        let jobs = jobs.to_string();
+        cmd.env("CARGO_BUILD_JOBS", &jobs)
+            .env("RUST_TEST_THREADS", &jobs)
+            .env("GOFLAGS", format!("-p={jobs}"));
     }
     cmd
 }
