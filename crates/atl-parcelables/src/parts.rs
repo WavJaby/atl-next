@@ -2,7 +2,7 @@
 //! Parcel layouts the codecs share or embed without being AIDL parcelables themselves (base classes, values written in place), each from its AOSP writeToParcel / reader.
 //! Paths in docs are below frameworks/base/core/java unless stated.
 
-use binder::SpIBinder;
+use binder::{ParcelFileDescriptor, SpIBinder};
 
 use crate::codecs::android::content::Intent::Intent;
 use crate::codecs::android::content::IntentFilter::IntentFilter;
@@ -193,6 +193,82 @@ pub fn r_char_sequence(p: &In<'_>) -> Result<Option<String>> {
             "android.text.Spanned (with a ParcelableSpan)",
         )),
     }
+}
+
+/// android.graphics.Bitmap as Bitmap.writeToParcel writes it (hwui Bitmap.cpp writeToParcel / createFromParcel; Bitmap.java writeToParcel 2390-2402): the native part, then the gainmap flag and its Gainmap. Pixels are read past, not kept: an in-place blob by its length, an ashmem blob as its descriptor (closed on drop). `write` is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bitmap {
+    pub width: i32,
+    pub height: i32,
+    pub gainmap: bool,
+}
+
+/// hwui ScopedParcel.h BlobType.
+const BLOB_IN_PLACE: i32 = 0;
+const BLOB_ASHMEM: i32 = 1;
+/// Gainmap_writeToParcel: ratio min, ratio max, gamma, epsilon sdr, epsilon hdr (3 floats each), display ratio sdr and hdr (1 each); then the base image type (int32).
+const GAINMAP_FLOATS: usize = 17;
+
+impl Part for Bitmap {
+    fn write(&self, _p: &mut In<'_>) -> Result<()> {
+        Err(crate::refuse("android.graphics.Bitmap.write"))
+    }
+
+    fn read(p: &In<'_>) -> Result<Self> {
+        read_bitmap(p, false)
+    }
+}
+
+/// `nested`: the contents of a gainmap. AOSP's Gainmap takes a plain Bitmap; contents with a gainmap of their own are refused, counted.
+fn read_bitmap(p: &In<'_>, nested: bool) -> Result<Bitmap> {
+    r_i32(p)?; // isMutable
+    r_i32(p)?; // colorType
+    r_i32(p)?; // alphaType
+    r_bytes(p)?; // colour space (ScopedParcel::readData): null or its bytes
+    let width = r_i32(p)?;
+    let height = r_i32(p)?;
+    r_i32(p)?; // rowBytes
+    r_i32(p)?; // density
+    r_i64(p)?; // sourceId
+    match r_i32(p)? {
+        BLOB_IN_PLACE => match r_bytes(p)? {
+            Some(pixels) if !pixels.is_empty() => {}
+            _ => return Err(crate::refuse("android.graphics.Bitmap.blob")),
+        },
+        BLOB_ASHMEM => {
+            r_i32(p)?; // size
+            let _fd: ParcelFileDescriptor = p.read()?;
+        }
+        _ => return Err(crate::refuse("android.graphics.Bitmap.blob")),
+    }
+    let gainmap = r_bool(p)?;
+    if gainmap {
+        if nested {
+            return Err(crate::refuse("android.graphics.Gainmap.nested"));
+        }
+        read_gainmap(p)?;
+    }
+    Ok(Bitmap {
+        width,
+        height,
+        gainmap,
+    })
+}
+
+/// writeTypedObject(mGainmap): presence, then Gainmap.writeToParcel = presence + contents (a typed Bitmap), the floats, the base image type. A null on either presence is never written by AOSP: refused.
+fn read_gainmap(p: &In<'_>) -> Result<()> {
+    if !r_present(p)? {
+        return Err(crate::refuse("android.graphics.Gainmap.null"));
+    }
+    if !r_present(p)? {
+        return Err(crate::refuse("android.graphics.Gainmap.contents"));
+    }
+    read_bitmap(p, true)?;
+    for _ in 0..GAINMAP_FLOATS {
+        r_f32(p)?;
+    }
+    r_i32(p)?; // baseImageType
+    Ok(())
 }
 
 /// android.graphics.Rect (frameworks/base/graphics/java/android/graphics/Rect.java writeToParcel / readFromParcel).

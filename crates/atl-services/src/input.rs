@@ -23,6 +23,8 @@ const INTERFACE: &str = "IInputManager";
 const KEYBOARD_TYPE_ALPHABETIC: i32 = 2;
 /// Display.INVALID_DISPLAY: the Builder default, a device not tied to a display.
 const INVALID_DISPLAY: i32 = -1;
+/// PointerIcon.TYPE_ARROW (TYPE_DEFAULT): what a custom icon shows until the image cursor lands.
+const TYPE_ARROW: i32 = 1000;
 
 struct InputManager {
     permissions: Arc<Permissions>,
@@ -156,7 +158,14 @@ impl IInputManager for InputManager {
             atl_diag::answered(INTERFACE, "setPointerIcon (no icon or no UI agent)");
             return Ok(false);
         };
-        Ok(agent.pointer_icon(icon.kind).is_ok())
+        // A custom icon's image is not shown yet, so the default arrow stands in rather than the previous view's cursor.
+        let kind = if icon.custom.is_some() {
+            atl_diag::answered(INTERFACE, "setPointerIcon (custom icon shown as default)");
+            TYPE_ARROW
+        } else {
+            icon.kind
+        };
+        Ok(agent.pointer_icon(kind).is_ok())
     }
 }
 

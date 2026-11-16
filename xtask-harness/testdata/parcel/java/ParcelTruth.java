@@ -48,6 +48,8 @@ import android.content.pm.ServiceInfo;
 import android.content.pm.SharedLibraryInfo;
 import android.content.res.CompatibilityInfo;
 import android.content.res.Configuration;
+import android.graphics.Bitmap;
+import android.graphics.Gainmap;
 import android.graphics.Rect;
 import android.hardware.OverlayProperties;
 import android.view.Display;
@@ -123,6 +125,8 @@ public class ParcelTruth {
     static native int roundTripParcel(String className, Parcel in, Parcel out);
     /// The codec's has_file_descriptors of the value at `in`'s position: 1 or 0, -1 = failed (lastError).
     static native int rustHasFileDescriptors(String className, Parcel in);
+    /// The custom PointerIcon at `in`'s position read with the codec (every byte consumed): the text it read; null = failed (lastError).
+    static native String parseCustomIcon(Parcel in);
 
     static final int MODE_PLAIN = 0;
     static final int MODE_CORRUPT = 1;
@@ -337,6 +341,11 @@ public class ParcelTruth {
         check("StorageVolume", new StorageVolume.Builder("emulated", new File("/storage/emulated/0"), "Internal shared storage", UserHandle.SYSTEM, "mounted").setPrimary(true).setEmulated(true).build(), StorageVolume.CREATOR);
         checkInputChannel("InputChannel");
         check("PointerIcon", systemIcon(PointerIcon.TYPE_ARROW), PointerIcon.CREATOR);
+        // TYPE_CUSTOM as AOSP writes it into a Parcel: in place (768 B), ashmem (16 KB > 12 KB), with a gainmap, and a nested gainmap (refused)
+        checkPointerIconCustom("PointerIcon:custom", 16, 12, 3.5f, 4.25f, false, false);
+        checkPointerIconCustom("PointerIcon:custom-ashmem", 64, 64, 40.5f, 21.25f, true, false);
+        checkPointerIconCustom("PointerIcon:gainmap", 16, 12, 3.5f, 4.25f, true, true);
+        checkPointerIconGainmapNested("PointerIcon:gainmap-nested");
         // the focus path: InputMethodManager.startInputInner sends both on every window focus gain (atl-services input_method.rs)
         check("EditorInfo", editorInfo(), EditorInfo.CREATOR);
         check("EditorInfo:empty", new EditorInfo(), EditorInfo.CREATOR);
@@ -452,6 +461,60 @@ public class ParcelTruth {
         PointerIcon icon = PointerIcon.CREATOR.createFromParcel(p);
         p.recycle();
         return icon;
+    }
+
+    /// PointerIcon.TYPE_CUSTOM as AOSP writes it into a Java Parcel: a w x h bitmap, hot spot, drop shadow, optional gainmap. parseCustomIcon must read it with every byte consumed and return the text Java wrote; the re-encode must be refused (the codec keeps no pixels to write back).
+    static void checkPointerIconCustom(String name, int w, int h, float hotX, float hotY, boolean dropShadow, boolean gainmap) {
+        String want = "custom " + w + "x" + h + " hot " + hotX + "," + hotY + " shadow " + (dropShadow ? 1 : 0) + (gainmap ? " gainmap" : "");
+        Parcel in = writeIcon(pointerIcon(w, h, hotX, hotY, dropShadow, gainmap));
+        // AOSP's writeBlob sends a blob above its 12 KB in-place limit (hwui Bitmap.cpp BLOB_INPLACE_LIMIT) as a descriptor; ARGB_8888 is 4 bytes a pixel
+        boolean ashmem = w * h * 4 > 12 * 1024;
+        if (in.hasFileDescriptors() != ashmem) {
+            result(false, name, "parcel descriptors " + in.hasFileDescriptors() + ", AOSP writes " + (ashmem ? "ashmem" : "in place"));
+            return;
+        }
+        String got = parseCustomIcon(in);
+        if (got == null) {
+            result(false, name, "rust: " + lastError());
+            return;
+        }
+        if (!got.equals(want)) {
+            result(false, name, "rust read \"" + got + "\", java wrote \"" + want + "\"");
+            return;
+        }
+        in.setDataPosition(0);
+        boolean refused = roundTripParcel(PointerIcon.class.getName(), in, Parcel.obtain()) == -1 && lastError().contains("encode refused");
+        result(refused, name, refused ? want + (ashmem ? " (ashmem)" : " (in place)") + ", re-encode refused" : "re-encode not refused: " + lastError());
+    }
+
+    /// A gainmap whose contents carry a gainmap of their own: AOSP writes it, the codec refuses the nesting (counted in refused()).
+    static void checkPointerIconGainmapNested(String name) {
+        Bitmap contents = Bitmap.createBitmap(4, 4, Bitmap.Config.ARGB_8888);
+        contents.setGainmap(new Gainmap(Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888)));
+        Bitmap bitmap = Bitmap.createBitmap(16, 12, Bitmap.Config.ARGB_8888);
+        bitmap.setGainmap(new Gainmap(contents));
+        String got = parseCustomIcon(writeIcon(PointerIcon.create(bitmap, 3.5f, 4.25f)));
+        boolean ok = got == null && refused().contains("android.graphics.Gainmap.nested=");
+        result(ok, name, ok ? "nested gainmap refused, counted" : "parsed " + got + "; " + lastError());
+    }
+
+    /// The icon as an app sets it with PointerIcon.create (gainmap contents 4x4).
+    static PointerIcon pointerIcon(int w, int h, float hotX, float hotY, boolean dropShadow, boolean gainmap) {
+        Bitmap bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+        if (gainmap) {
+            bitmap.setGainmap(new Gainmap(Bitmap.createBitmap(4, 4, Bitmap.Config.ARGB_8888)));
+        }
+        PointerIcon icon = PointerIcon.create(bitmap, hotX, hotY);
+        icon.setDrawNativeDropShadow(dropShadow);
+        return icon;
+    }
+
+    /// The parcelable written into a fresh Parcel, rewound for the Rust reads.
+    static Parcel writeIcon(Parcelable p) {
+        Parcel in = Parcel.obtain();
+        p.writeToParcel(in, 0);
+        in.setDataPosition(0);
+        return in;
     }
 
     /// A local binder that answers transaction 1: the string it reads, prefixed.

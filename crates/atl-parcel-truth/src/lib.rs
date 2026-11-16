@@ -188,6 +188,7 @@ fn copy_class(
         "android.content.Intent" => copy_as::<Intent>(src, dst),
         "android.app.PendingIntent" => copy_as::<PendingIntent>(src, dst),
         "android.view.InputChannel" => copy_as::<InputChannel>(src, dst),
+        "android.view.PointerIcon" => copy_as::<PointerIcon>(src, dst),
         "android.view.SurfaceControl" => copy_as::<SurfaceControl>(src, dst),
         "android.app.servertransaction.ClientTransaction" => copy_as::<ClientTransaction>(src, dst),
         "android.window.ImeOnBackInvokedDispatcher" => {
@@ -602,6 +603,53 @@ pub unsafe extern "C" fn Java_ParcelTruth_roundTripParcel(
         Err(e) => {
             set_error(e);
             -1
+        }
+    }
+}
+
+/// The custom PointerIcon at `src`'s position, read with the codec, every byte of `src` consumed: its size, hot spot, drop shadow and gainmap as text (`custom WxH hot X,Y shadow 0|1[ gainmap]`, the floats in Debug form), which ParcelTruth compares with what it wrote.
+fn parse_custom_icon(src: &BorrowedParcel<'_>) -> Result<String, String> {
+    let v = PointerIcon::from_parcel(src).map_err(|e| format!("decode refused: {e:?}"))?;
+    if src.get_data_position() != src.get_data_size() {
+        return Err(format!(
+            "decode stopped at byte {} of {}",
+            src.get_data_position(),
+            src.get_data_size()
+        ));
+    }
+    let kind = v.kind;
+    let c = v
+        .custom
+        .ok_or_else(|| format!("kind {kind} is not a custom icon"))?;
+    let gainmap = if c.gainmap { " gainmap" } else { "" };
+    Ok(format!(
+        "custom {}x{} hot {:?},{:?} shadow {}{gainmap}",
+        c.width,
+        c.height,
+        c.hot_x,
+        c.hot_y,
+        u8::from(c.drop_shadow)
+    ))
+}
+
+/// `static native String parseCustomIcon(Parcel in)`: `parse_custom_icon` on `in`'s own Parcel (binder and descriptor objects included); null on failure (`lastError`).
+///
+/// # Safety
+/// Called by ART as that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_ParcelTruth_parseCustomIcon(
+    env: JniEnv,
+    _class: JObject,
+    input: JObject,
+) -> JObject {
+    // SAFETY: ART's arguments to this native method; `input` is a Parcel for the call
+    let parsed = unsafe { with_java_parcel(env, input, |src| parse_custom_icon(src)) };
+    match parsed {
+        // SAFETY: ART's JNIEnv
+        Ok(text) => unsafe { java_string(env, &text) },
+        Err(e) => {
+            set_error(e);
+            std::ptr::null_mut()
         }
     }
 }
