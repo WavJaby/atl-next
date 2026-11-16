@@ -128,7 +128,7 @@ const REMOTE_SKIPPED: [(&str, &str); 4] = [
         "atld ends at the target's limit (timeout), not at the gate's stop, so the exit rows have nothing to compare",
     ),
     (
-        "webview-ua",
+        "webview-ua, webview-settings",
         "WebKitSettings needs a GDK display: no compositor on a headless run",
     ),
     (
@@ -365,6 +365,12 @@ const WEBVIEW_PACKAGE: (&str, &str) = (
 const WEBVIEW_PAGE: (&str, &str) = (
     "AtlTest: webview-page: ",
     r#"events=started,finished, titles=atl, js=["function",5,"hi!","undefined","atl"]"#,
+);
+/// Main.webViewSettings's line (webview plan S4.1, W4a): a WebView reads back what it sets, a flag and an int and a text the engine applies (font-size 20, serif "atl-serif", text-zoom 150) and
+/// the stored ones; the rest are AOSP's defaults (WebSettings.java:333, :934, :902, :640 MEDIUM, :797 NARROW_COLUMNS), the table in atl-webview settings.rs.
+const WEBVIEW_SETTINGS: (&str, &str) = (
+    "AtlTest: webview-settings: ",
+    "js=true font-size=20 serif=atl-serif text-zoom=150 min-font=8 zoom=MEDIUM layout=NARROW_COLUMNS support-zoom=true",
 );
 
 /// Lines the fixture logs after onCreate, from binder callbacks: (row, line prefix, expected value). The watch waits for all of them (up to RESULT_WAIT).
@@ -1959,6 +1965,13 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
     if passed && webview_page.as_deref() != Some(want) {
         whys.push(format!("webview-page: want {want:?}, got {webview_page:?}"));
     }
+    let (prefix, want) = WEBVIEW_SETTINGS;
+    let webview_settings = after(prefix);
+    if passed && webview_settings.as_deref() != Some(want) {
+        whys.push(format!(
+            "webview-settings: want {want:?}, got {webview_settings:?}"
+        ));
+    }
     let features = app
         .lines()
         .find_map(|l| l.split_once(FEATURES).map(|(_, r)| r.trim_end().to_owned()));
@@ -2111,6 +2124,7 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
             webview_ua.as_deref().unwrap_or_default()
         );
         println!("app: pass webview-package {}", WEBVIEW_PACKAGE.1);
+        println!("app: pass webview-settings {}", WEBVIEW_SETTINGS.1);
         if !remote {
             println!(
                 "app: pass priority {} ({})",

@@ -10,10 +10,10 @@ use std::mem::ManuallyDrop;
 use std::rc::Rc;
 
 use atl_platform_ui_api::abi::{
-    self, BoolSetting, BytesOut, Callback, EvalResultView, PromptReplyAbi, Status, Str,
-    WebEventView, WebViewHandle, WebViewVtable, web_event,
+    self, BytesOut, Callback, EvalResultView, PromptReplyAbi, Status, Str, WebEventView,
+    WebViewHandle, WebViewVtable, web_event,
 };
-use atl_platform_ui_api::webview::LoadError;
+use atl_platform_ui_api::webview::{LoadError, WebSetting};
 use webkit6::glib;
 use webkit6::prelude::*;
 
@@ -32,9 +32,9 @@ static VTABLE: WebViewVtable = WebViewVtable {
     view_title,
     view_progress,
     view_set_bool,
-    view_get_bool,
-    view_set_user_agent,
-    view_user_agent,
+    view_set_int,
+    view_set_str,
+    view_set_background,
     view_widget,
 };
 
@@ -419,25 +419,63 @@ fn settings(h: *mut WebViewHandle) -> webkit6::Settings {
     WebViewExt::settings(&view(h).web).expect("WebKitWebView without settings")
 }
 
-unsafe extern "C" fn view_set_bool(h: *mut WebViewHandle, which: BoolSetting, on: bool) {
+// The core's setting table (atl-webview settings.rs) decides each value's kind; a setting of another kind here is a broken table row and only logged.
+unsafe extern "C" fn view_set_bool(h: *mut WebViewHandle, which: WebSetting, on: bool) {
     let s = settings(h);
     match which {
-        BoolSetting::JavaScript => s.set_enable_javascript(on),
-        BoolSetting::DomStorage => s.set_enable_html5_local_storage(on),
+        WebSetting::JavaScript => s.set_enable_javascript(on),
+        WebSetting::DomStorage => s.set_enable_html5_local_storage(on),
+        WebSetting::MediaPlaybackRequiresUserGesture => {
+            s.set_media_playback_requires_user_gesture(on)
+        }
+        WebSetting::AllowUniversalAccessFromFileUrls => {
+            s.set_allow_universal_access_from_file_urls(on)
+        }
+        WebSetting::AllowFileAccessFromFileUrls => s.set_allow_file_access_from_file_urls(on),
+        WebSetting::JavaScriptCanOpenWindowsAutomatically => {
+            s.set_javascript_can_open_windows_automatically(on)
+        }
+        WebSetting::AutoLoadImages => s.set_auto_load_images(on),
+        other => tracing::warn!("webview: {other:?} is not a boolean setting"),
     }
 }
 
-unsafe extern "C" fn view_get_bool(h: *mut WebViewHandle, which: BoolSetting) -> bool {
+unsafe extern "C" fn view_set_int(h: *mut WebViewHandle, which: WebSetting, value: i32) {
     let s = settings(h);
+    // WebKit's font sizes are unsigned; a negative one is no size
+    let size = u32::try_from(value).unwrap_or(0);
     match which {
-        BoolSetting::JavaScript => s.enables_javascript(),
-        BoolSetting::DomStorage => s.enables_html5_local_storage(),
+        WebSetting::MinimumFontSize => s.set_minimum_font_size(size),
+        WebSetting::DefaultFontSize => s.set_default_font_size(size),
+        WebSetting::DefaultMonospaceFontSize => s.set_default_monospace_font_size(size),
+        other => tracing::warn!("webview: {other:?} is not an int setting"),
     }
 }
 
-unsafe extern "C" fn view_set_user_agent(h: *mut WebViewHandle, ua: Str) {
-    // SAFETY: `ua` is alive for this call.
-    settings(h).set_user_agent(Some(&unsafe { ua.get() }));
+unsafe extern "C" fn view_set_str(h: *mut WebViewHandle, which: WebSetting, value: Str) {
+    // SAFETY: `value` is alive for this call.
+    let text = unsafe { value.get() };
+    let text: &str = &text;
+    let s = settings(h);
+    match which {
+        // empty = the engine's own default (WebKit: a NULL user agent)
+        WebSetting::UserAgent => s.set_user_agent((!text.is_empty()).then_some(text)),
+        WebSetting::DefaultFontFamily => s.set_default_font_family(text),
+        WebSetting::MonospaceFontFamily => s.set_monospace_font_family(text),
+        WebSetting::SansSerifFontFamily => s.set_sans_serif_font_family(text),
+        WebSetting::SerifFontFamily => s.set_serif_font_family(text),
+        WebSetting::CursiveFontFamily => s.set_cursive_font_family(text),
+        WebSetting::FantasyFontFamily => s.set_fantasy_font_family(text),
+        WebSetting::DefaultCharset => s.set_default_charset(text),
+        other => tracing::warn!("webview: {other:?} is not a text setting"),
+    }
+}
+
+unsafe extern "C" fn view_set_background(h: *mut WebViewHandle, argb: u32) {
+    // Android's colour int (alpha in the top byte); GdkRGBA takes each channel as 0..=1
+    let channel = |shift: u32| f32::from(((argb >> shift) & 0xff) as u8) / 255.0;
+    let rgba = webkit6::gdk::RGBA::new(channel(16), channel(8), channel(0), channel(24));
+    view(h).web.set_background_color(&rgba);
 }
 
 unsafe extern "C" fn view_widget(h: *mut WebViewHandle) -> *mut std::ffi::c_void {
@@ -448,10 +486,4 @@ unsafe extern "C" fn view_widget(h: *mut WebViewHandle) -> *mut std::ffi::c_void
         .to_glib_none()
         .0;
     w.cast()
-}
-
-unsafe extern "C" fn view_user_agent(h: *mut WebViewHandle, out: *mut BytesOut) {
-    let ua = settings(h).user_agent().unwrap_or_default();
-    // SAFETY: the sink the caller lent.
-    unsafe { BytesOut::put_to(out, ua.as_bytes()) };
 }

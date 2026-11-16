@@ -92,7 +92,8 @@ final class WebViewProviderImpl implements WebViewProvider, WebViewProvider.View
     @Override public ScrollDelegate getScrollDelegate() { return this; }
 
     // ---- View-system callbacks on every WebView: counted, not thrown (Unimplemented.accept) ----
-    @Override public void setOverScrollMode(int mode) { Unimplemented.accept("WebViewProvider.ViewDelegate.setOverScrollMode"); }
+    // View state: WebView.setOverScrollMode's super call (WebView.java:2703) keeps it, so getOverScrollMode answers; the page has no overscroll mode of its own
+    @Override public void setOverScrollMode(int mode) {}
     @Override public void setScrollBarStyle(int style) { Unimplemented.accept("WebViewProvider.ViewDelegate.setScrollBarStyle"); }
 
     // ---- WebViewProvider, not yet ----
@@ -228,7 +229,7 @@ final class WebViewProviderImpl implements WebViewProvider, WebViewProvider.View
     @Override public void onFinishTemporaryDetach() {}
     @Override public void setLayerType(int layerType, Paint paint) {}
     @Override public void onConfigurationChanged(Configuration newConfig) { Unimplemented.accept("WebViewProvider.ViewDelegate.onConfigurationChanged"); }
-    @Override public void setBackgroundColor(int color) { Unimplemented.accept("WebViewProvider.ViewDelegate.setBackgroundColor"); }
+    @Override public native void setBackgroundColor(int color);
     @Override public boolean requestChildRectangleOnScreen(View child, Rect rect, boolean immediate) { Unimplemented.accept("WebViewProvider.ViewDelegate.requestChildRectangleOnScreen"); return false; }
     @Override public boolean onKeyMultiple(int keyCode, int repeatCount, KeyEvent event) { Unimplemented.accept("WebViewProvider.ViewDelegate.onKeyMultiple"); return false; }
     @Override public boolean onKeyDown(int keyCode, KeyEvent event) { Unimplemented.accept("WebViewProvider.ViewDelegate.onKeyDown"); return false; }

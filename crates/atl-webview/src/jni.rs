@@ -10,11 +10,12 @@ use std::sync::OnceLock;
 use std::sync::mpsc;
 
 use atl_platform_ui::webview::{
-    InputClaim, LoadError, PromptReply, WebEngine as _, WebEvent, WebView as _,
+    InputClaim, LoadError, PromptReply, SettingValue, WebEngine as _, WebEvent, WebView as _,
 };
 use atl_platform_ui::{PlatformWebEngine, PlatformWebView};
 
 use crate::bridge;
+use crate::settings::{AppDefaults, Setting, Settings};
 
 mod generated {
     #![allow(non_camel_case_types, non_snake_case, dead_code, clippy::all)]
@@ -156,12 +157,12 @@ fn call_bool(env: Env, obj: Obj, name: &CStr, sig: &CStr, args: &[jvalue]) -> bo
     !m.is_null() && jni_call!(env, CallBooleanMethodA, obj, m, args.as_ptr()) != 0
 }
 
-fn call_int(env: Env, obj: Obj, name: &CStr, sig: &CStr) -> i32 {
+fn call_int(env: Env, obj: Obj, name: &CStr, sig: &CStr, args: &[jvalue]) -> i32 {
     let m = method(env, obj, name, sig);
     if m.is_null() {
         return 0;
     }
-    jni_call!(env, CallIntMethodA, obj, m, std::ptr::null())
+    jni_call!(env, CallIntMethodA, obj, m, args.as_ptr())
 }
 
 fn call_long(env: Env, obj: Obj, name: &CStr, sig: &CStr) -> i64 {
@@ -376,6 +377,30 @@ struct Native {
     shared: Rc<Shared>,
     /// `addJavascriptInterface` objects: name, global ref, the `@JavascriptInterface` method names.
     interfaces: RefCell<Vec<(String, usize, Vec<String>)>>,
+    /// The WebSettings values (settings.rs table): stored here, the engine's own pushed on set.
+    settings: RefCell<Settings>,
+}
+
+impl Native {
+    /// Stores `v` for `s` and pushes it to the view when the engine has the setting.
+    fn put(&self, s: Setting, v: SettingValue) {
+        if let Some(e) = s.engine() {
+            self.view.set_setting(e, &v);
+        }
+        self.settings.borrow_mut().set(s, v);
+    }
+
+    fn flag(&self, s: Setting) -> bool {
+        self.settings.borrow().flag(s)
+    }
+
+    fn int(&self, s: Setting) -> i32 {
+        self.settings.borrow().int(s)
+    }
+
+    fn text(&self, s: Setting) -> String {
+        self.settings.borrow().text(s).to_owned()
+    }
 }
 
 /// What the event sink needs: the provider (a weak global ref, so the app's WebView stays collectable).
@@ -405,6 +430,60 @@ fn settings_native<'a>(env: Env, settings: Obj) -> Option<&'a Native> {
     if p.is_null() { None } else { native(env, p) }
 }
 
+/// What the settings defaults depend on, from the WebView's app: `targetSdkVersion`, the INTERNET permission (WebSettings.java:426, :1022, :1061, :1500), and the device user agent (webview plan S5; empty when unknown).
+fn app_defaults(env: Env, web_view: Obj) -> AppDefaults {
+    let user_agent = device_user_agent(env).unwrap_or_else(|e| {
+        tracing::warn!("webview: default user agent not set: {e}");
+        String::new()
+    });
+    let ctx = call_obj(
+        env,
+        web_view,
+        c"getContext",
+        c"()Landroid/content/Context;",
+        &[],
+    );
+    if ctx.is_null() {
+        return AppDefaults {
+            target_sdk: i32::MAX,
+            internet: false,
+            user_agent,
+        };
+    }
+    let info = call_obj(
+        env,
+        ctx,
+        c"getApplicationInfo",
+        c"()Landroid/content/pm/ApplicationInfo;",
+        &[],
+    );
+    let target_sdk = if info.is_null() {
+        i32::MAX
+    } else {
+        let f = field(env, info, c"targetSdkVersion", c"I");
+        jni_call!(env, GetIntField, info, f)
+    };
+    let permission = new_string(env, "android.permission.INTERNET");
+    // PackageManager.PERMISSION_GRANTED
+    let internet = call_int(
+        env,
+        ctx,
+        c"checkSelfPermission",
+        c"(Ljava/lang/String;)I",
+        &[l(permission)],
+    ) == 0;
+    delete_local(env, permission);
+    if !info.is_null() {
+        delete_local(env, info);
+    }
+    delete_local(env, ctx);
+    AppDefaults {
+        target_sdk,
+        internet,
+        user_agent,
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProviderForT_createWebView(
     env: Env,
@@ -412,6 +491,10 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProvid
     web_view: Obj,
     access: Obj,
 ) -> Obj {
+    let app = app_defaults(env, web_view);
+    if pending(env) {
+        return NULL;
+    }
     let shared = Rc::new(Shared {
         provider: Cell::new(0),
     });
@@ -425,10 +508,10 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProvid
             return NULL;
         }
     };
-    // S5: the engine sends exactly the string getDefaultUserAgent reports
-    match device_user_agent(env) {
-        Ok(ua) => view.set_user_agent(&ua),
-        Err(e) => tracing::warn!("webview: default user agent not set: {e}"),
+    // the defaults reach the engine before the page can load; the user agent is the device's string (S5)
+    let settings = Settings::new(app);
+    for (which, value) in settings.engine_values() {
+        view.set_setting(which, value);
     }
     if pending(env) {
         return NULL;
@@ -447,6 +530,7 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProvid
         sideband: Box::leak(handle.into_boxed_slice()),
         shared: shared.clone(),
         interfaces: RefCell::default(),
+        settings: RefCell::new(settings),
     }));
     let c = jni_call!(
         env,
@@ -1163,6 +1247,12 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_getProgre
     n.view.progress()
 });
 
+// WebView.setBackgroundColor hands the colour to the provider only (WebView.java:3072): the page's background is the one there is
+provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_setBackgroundColor, (env, n, color: i32) -> () = (), {
+    let _ = env;
+    n.view.set_background_color(color as u32);
+});
+
 // ---- input (webview plan S2.2 amended, hold-and-replay) ----
 
 /// MotionEvent.ACTION_* (MotionEvent.java).
@@ -1189,7 +1279,7 @@ fn claim(env: Env, n: &Native, claim: InputClaim, ev: Obj) {
 
 // Chromium consumes every touch it is given (AwContents.onTouchEvent)
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_onTouchEvent, (env, n, ev: Obj) -> u8 = 0, {
-    let c = match call_int(env, ev, c"getActionMasked", c"()I") {
+    let c = match call_int(env, ev, c"getActionMasked", c"()I", &[]) {
         action::DOWN => InputClaim::Down,
         action::UP => InputClaim::Up,
         action::CANCEL => InputClaim::Cancel,
@@ -1207,7 +1297,7 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_onHoverEv
 
 // a scroll is the page's; any other generic motion (a joystick) goes on as View's
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_onGenericMotionEvent, (env, n, ev: Obj) -> u8 = 0, {
-    if call_int(env, ev, c"getActionMasked", c"()I") == action::SCROLL {
+    if call_int(env, ev, c"getActionMasked", c"()I", &[]) == action::SCROLL {
         claim(env, n, InputClaim::Move, ev);
         return 1;
     }
@@ -1275,37 +1365,328 @@ macro_rules! settings_native {
     };
 }
 
-settings_native!(Java_com_android_webview_chromium_WebSettingsImpl_setJavaScriptEnabled, (env, n, on: u8) -> () = (), {
-    let _ = env;
-    n.view.set_javascript_enabled(on != 0);
-});
+// ---- WebSettingsImpl: each property is one row of the table in settings.rs. A setter stores the value and pushes the engine's; a getter returns the stored value. ----
 
-settings_native!(Java_com_android_webview_chromium_WebSettingsImpl_getJavaScriptEnabled, (env, n) -> u8 = 0, {
-    let _ = env;
-    n.view.javascript_enabled() as u8
-});
+/// A flag property's setter and getter.
+macro_rules! flag_setting {
+    ($set:ident, $get:ident, $which:ident) => {
+        flag_set!($set, $which);
+        settings_native!($get, (env, n) -> u8 = 0, {
+            let _ = env;
+            n.flag(Setting::$which) as u8
+        });
+    };
+}
 
-settings_native!(Java_com_android_webview_chromium_WebSettingsImpl_setDomStorageEnabled, (env, n, on: u8) -> () = (), {
-    let _ = env;
-    n.view.set_dom_storage_enabled(on != 0);
-});
+/// A flag property's setter alone.
+macro_rules! flag_set {
+    ($set:ident, $which:ident) => {
+        settings_native!($set, (env, n, on: u8) -> () = (), {
+            let _ = env;
+            n.put(Setting::$which, SettingValue::Bool(on != 0));
+        });
+    };
+}
 
-settings_native!(Java_com_android_webview_chromium_WebSettingsImpl_getDomStorageEnabled, (env, n) -> u8 = 0, {
-    let _ = env;
-    n.view.dom_storage_enabled() as u8
+/// An int property's setter and getter.
+macro_rules! int_setting {
+    ($set:ident, $get:ident, $which:ident) => {
+        int_set!($set, $which);
+        settings_native!($get, (env, n) -> i32 = 0, {
+            let _ = env;
+            n.int(Setting::$which)
+        });
+    };
+}
+
+/// An int property's setter alone.
+macro_rules! int_set {
+    ($set:ident, $which:ident) => {
+        settings_native!($set, (env, n, v: i32) -> () = (), {
+            let _ = env;
+            n.put(Setting::$which, SettingValue::Int(v));
+        });
+    };
+}
+
+/// A text property's setter and getter.
+macro_rules! text_setting {
+    ($set:ident, $get:ident, $which:ident) => {
+        settings_native!($set, (env, n, v: Obj) -> () = (), {
+            n.put(Setting::$which, SettingValue::Str(string(env, v).unwrap_or_default()));
+        });
+        text_get!($get, $which);
+    };
+}
+
+/// A text property's getter.
+macro_rules! text_get {
+    ($get:ident, $which:ident) => {
+        settings_native!($get, (env, n) -> Obj = NULL, {
+            new_string(env, &n.text(Setting::$which))
+        });
+    };
+}
+
+flag_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setJavaScriptEnabled,
+    Java_com_android_webview_chromium_WebSettingsImpl_getJavaScriptEnabled,
+    JavaScriptEnabled
+);
+flag_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setDomStorageEnabled,
+    Java_com_android_webview_chromium_WebSettingsImpl_getDomStorageEnabled,
+    DomStorageEnabled
+);
+flag_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setNavDump,
+    Java_com_android_webview_chromium_WebSettingsImpl_getNavDump,
+    NavDump
+);
+flag_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setSupportZoom,
+    Java_com_android_webview_chromium_WebSettingsImpl_supportZoom,
+    SupportZoom
+);
+flag_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setMediaPlaybackRequiresUserGesture,
+    Java_com_android_webview_chromium_WebSettingsImpl_getMediaPlaybackRequiresUserGesture,
+    MediaPlaybackRequiresUserGesture
+);
+flag_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setBuiltInZoomControls,
+    Java_com_android_webview_chromium_WebSettingsImpl_getBuiltInZoomControls,
+    BuiltInZoomControls
+);
+flag_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setDisplayZoomControls,
+    Java_com_android_webview_chromium_WebSettingsImpl_getDisplayZoomControls,
+    DisplayZoomControls
+);
+flag_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setAllowFileAccess,
+    Java_com_android_webview_chromium_WebSettingsImpl_getAllowFileAccess,
+    AllowFileAccess
+);
+flag_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setAllowContentAccess,
+    Java_com_android_webview_chromium_WebSettingsImpl_getAllowContentAccess,
+    AllowContentAccess
+);
+flag_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setLoadWithOverviewMode,
+    Java_com_android_webview_chromium_WebSettingsImpl_getLoadWithOverviewMode,
+    LoadWithOverviewMode
+);
+flag_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setEnableSmoothTransition,
+    Java_com_android_webview_chromium_WebSettingsImpl_enableSmoothTransition,
+    EnableSmoothTransition
+);
+flag_setting!(Java_com_android_webview_chromium_WebSettingsImpl_setUseWebViewBackgroundForOverscrollBackground, Java_com_android_webview_chromium_WebSettingsImpl_getUseWebViewBackgroundForOverscrollBackground, UseWebViewBackgroundForOverscrollBackground);
+flag_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setSaveFormData,
+    Java_com_android_webview_chromium_WebSettingsImpl_getSaveFormData,
+    SaveFormData
+);
+flag_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setSavePassword,
+    Java_com_android_webview_chromium_WebSettingsImpl_getSavePassword,
+    SavePassword
+);
+flag_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setLightTouchEnabled,
+    Java_com_android_webview_chromium_WebSettingsImpl_getLightTouchEnabled,
+    LightTouchEnabled
+);
+flag_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setUseWideViewPort,
+    Java_com_android_webview_chromium_WebSettingsImpl_getUseWideViewPort,
+    UseWideViewPort
+);
+flag_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setSupportMultipleWindows,
+    Java_com_android_webview_chromium_WebSettingsImpl_supportMultipleWindows,
+    SupportMultipleWindows
+);
+flag_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setBlockNetworkImage,
+    Java_com_android_webview_chromium_WebSettingsImpl_getBlockNetworkImage,
+    BlockNetworkImage
+);
+settings_native!(Java_com_android_webview_chromium_WebSettingsImpl_setBlockNetworkLoads, (env, n, block: u8) -> () = (), {
+    // WebSettings.java:1019-1021: false needs the INTERNET permission
+    if block == 0 && !n.settings.borrow().internet() {
+        return throw(env, c"java/lang/SecurityException", "setBlockNetworkLoads(false) needs android.permission.INTERNET");
+    }
+    n.put(Setting::BlockNetworkLoads, SettingValue::Bool(block != 0));
 });
+settings_native!(Java_com_android_webview_chromium_WebSettingsImpl_getBlockNetworkLoads, (env, n) -> u8 = 0, {
+    let _ = env;
+    n.flag(Setting::BlockNetworkLoads) as u8
+});
+flag_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setAllowUniversalAccessFromFileURLs,
+    Java_com_android_webview_chromium_WebSettingsImpl_getAllowUniversalAccessFromFileURLs,
+    AllowUniversalAccessFromFileUrls
+);
+flag_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setAllowFileAccessFromFileURLs,
+    Java_com_android_webview_chromium_WebSettingsImpl_getAllowFileAccessFromFileURLs,
+    AllowFileAccessFromFileUrls
+);
+flag_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setPluginsEnabled,
+    Java_com_android_webview_chromium_WebSettingsImpl_getPluginsEnabled,
+    PluginsEnabled
+);
+flag_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setDatabaseEnabled,
+    Java_com_android_webview_chromium_WebSettingsImpl_getDatabaseEnabled,
+    DatabaseEnabled
+);
+flag_set!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setGeolocationEnabled,
+    GeolocationEnabled
+);
+flag_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setJavaScriptCanOpenWindowsAutomatically,
+    Java_com_android_webview_chromium_WebSettingsImpl_getJavaScriptCanOpenWindowsAutomatically,
+    JavaScriptCanOpenWindowsAutomatically
+);
+flag_set!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setNeedInitialFocus,
+    NeedInitialFocus
+);
+flag_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setOffscreenPreRaster,
+    Java_com_android_webview_chromium_WebSettingsImpl_getOffscreenPreRaster,
+    OffscreenPreRaster
+);
+flag_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setSafeBrowsingEnabled,
+    Java_com_android_webview_chromium_WebSettingsImpl_getSafeBrowsingEnabled,
+    SafeBrowsingEnabled
+);
+flag_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setLoadsImagesAutomatically,
+    Java_com_android_webview_chromium_WebSettingsImpl_getLoadsImagesAutomatically,
+    LoadsImagesAutomatically
+);
+flag_setting!(Java_com_android_webview_chromium_WebSettingsImpl_setVideoOverlayForEmbeddedEncryptedVideoEnabled, Java_com_android_webview_chromium_WebSettingsImpl_getVideoOverlayForEmbeddedEncryptedVideoEnabled, VideoOverlayForEmbeddedEncryptedVideoEnabled);
+int_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setTextZoom,
+    Java_com_android_webview_chromium_WebSettingsImpl_getTextZoom,
+    TextZoom
+);
+int_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setUserAgent,
+    Java_com_android_webview_chromium_WebSettingsImpl_getUserAgent,
+    UserAgentCode
+);
+int_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setMinimumFontSize,
+    Java_com_android_webview_chromium_WebSettingsImpl_getMinimumFontSize,
+    MinimumFontSize
+);
+int_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setMinimumLogicalFontSize,
+    Java_com_android_webview_chromium_WebSettingsImpl_getMinimumLogicalFontSize,
+    MinimumLogicalFontSize
+);
+int_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setDefaultFontSize,
+    Java_com_android_webview_chromium_WebSettingsImpl_getDefaultFontSize,
+    DefaultFontSize
+);
+int_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setDefaultFixedFontSize,
+    Java_com_android_webview_chromium_WebSettingsImpl_getDefaultFixedFontSize,
+    DefaultFixedFontSize
+);
+int_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setCacheMode,
+    Java_com_android_webview_chromium_WebSettingsImpl_getCacheMode,
+    CacheMode
+);
+int_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setMixedContentMode,
+    Java_com_android_webview_chromium_WebSettingsImpl_getMixedContentMode,
+    MixedContentMode
+);
+int_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setDisabledActionModeMenuItems,
+    Java_com_android_webview_chromium_WebSettingsImpl_getDisabledActionModeMenuItems,
+    DisabledActionModeMenuItems
+);
+int_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setDefaultZoomValue,
+    Java_com_android_webview_chromium_WebSettingsImpl_getDefaultZoomValue,
+    DefaultZoom
+);
+int_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setLayoutAlgorithmValue,
+    Java_com_android_webview_chromium_WebSettingsImpl_getLayoutAlgorithmValue,
+    LayoutAlgorithm
+);
+int_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setPluginStateValue,
+    Java_com_android_webview_chromium_WebSettingsImpl_getPluginStateValue,
+    PluginState
+);
+int_set!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setRenderPriorityValue,
+    RenderPriority
+);
+text_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setStandardFontFamily,
+    Java_com_android_webview_chromium_WebSettingsImpl_getStandardFontFamily,
+    StandardFontFamily
+);
+text_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setFixedFontFamily,
+    Java_com_android_webview_chromium_WebSettingsImpl_getFixedFontFamily,
+    FixedFontFamily
+);
+text_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setSansSerifFontFamily,
+    Java_com_android_webview_chromium_WebSettingsImpl_getSansSerifFontFamily,
+    SansSerifFontFamily
+);
+text_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setSerifFontFamily,
+    Java_com_android_webview_chromium_WebSettingsImpl_getSerifFontFamily,
+    SerifFontFamily
+);
+text_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setCursiveFontFamily,
+    Java_com_android_webview_chromium_WebSettingsImpl_getCursiveFontFamily,
+    CursiveFontFamily
+);
+text_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setFantasyFontFamily,
+    Java_com_android_webview_chromium_WebSettingsImpl_getFantasyFontFamily,
+    FantasyFontFamily
+);
+text_get!(
+    Java_com_android_webview_chromium_WebSettingsImpl_getDatabasePath,
+    DatabasePath
+);
+text_setting!(
+    Java_com_android_webview_chromium_WebSettingsImpl_setDefaultTextEncodingName,
+    Java_com_android_webview_chromium_WebSettingsImpl_getDefaultTextEncodingName,
+    DefaultTextEncodingName
+);
 
 settings_native!(Java_com_android_webview_chromium_WebSettingsImpl_setUserAgentString, (env, n, ua: Obj) -> () = (), {
-    // null or empty restores the default (WebSettings.setUserAgentString doc)
-    match string(env, ua).filter(|s| !s.is_empty()) {
-        Some(s) => n.view.set_user_agent(&s),
-        None => match device_user_agent(env) {
-            Ok(d) => n.view.set_user_agent(&d),
-            Err(e) => tracing::warn!("webview: default user agent not restored: {e}"),
-        },
-    }
+    // null or empty restores the default: the device's user agent (WebSettings.java:1416-1419)
+    let text = string(env, ua)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| n.settings.borrow().default_text(Setting::UserAgentString));
+    n.put(Setting::UserAgentString, SettingValue::Str(text));
 });
 
-settings_native!(Java_com_android_webview_chromium_WebSettingsImpl_getUserAgentString, (env, n) -> Obj = NULL, {
-    new_string(env, &n.view.user_agent())
-});
+text_get!(
+    Java_com_android_webview_chromium_WebSettingsImpl_getUserAgentString,
+    UserAgentString
+);

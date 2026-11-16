@@ -15,6 +15,7 @@ use atl_compositor::scene::{BufferContent, Content, Quad, Scene, SceneBuffer, Sc
 use atl_libgui_parcel::state::FloatRect;
 
 use crate::audio::AudioError;
+use crate::webview::WebSetting;
 use crate::{
     FdEvents, Looper, Monitor, Painted, PhysSize, QuadRelease, Rotation, Scale, TextInputEvent,
     UiError,
@@ -1153,16 +1154,6 @@ pub struct EvalResultView {
     pub text: Str,
 }
 
-/// The boolean view settings [`WebViewVtable::view_set_bool`] knows.
-#[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BoolSetting {
-    /// JavaScript enabled.
-    JavaScript = 1,
-    /// DOM storage enabled.
-    DomStorage = 2,
-}
-
 /// The WebView module's functions (the [`crate::webview`] traits as a C ABI). `view_*` on the UI thread.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1207,14 +1198,14 @@ pub struct WebViewVtable {
     pub view_title: unsafe extern "C" fn(view: *mut WebViewHandle, out: *mut BytesOut) -> bool,
     /// `WebView::progress`.
     pub view_progress: unsafe extern "C" fn(view: *mut WebViewHandle) -> i32,
-    /// A boolean setting's setter.
-    pub view_set_bool: unsafe extern "C" fn(view: *mut WebViewHandle, which: BoolSetting, on: bool),
-    /// A boolean setting's value.
-    pub view_get_bool: unsafe extern "C" fn(view: *mut WebViewHandle, which: BoolSetting) -> bool,
-    /// `WebView::set_user_agent`.
-    pub view_set_user_agent: unsafe extern "C" fn(view: *mut WebViewHandle, ua: Str),
-    /// `WebView::user_agent` into `out`.
-    pub view_user_agent: unsafe extern "C" fn(view: *mut WebViewHandle, out: *mut BytesOut),
+    /// `WebView::set_setting` for a boolean setting.
+    pub view_set_bool: unsafe extern "C" fn(view: *mut WebViewHandle, which: WebSetting, on: bool),
+    /// `WebView::set_setting` for an int setting.
+    pub view_set_int: unsafe extern "C" fn(view: *mut WebViewHandle, which: WebSetting, value: i32),
+    /// `WebView::set_setting` for a string setting; empty = the engine's own default.
+    pub view_set_str: unsafe extern "C" fn(view: *mut WebViewHandle, which: WebSetting, value: Str),
+    /// `WebView::set_background_color`: an Android colour int (ARGB).
+    pub view_set_background: unsafe extern "C" fn(view: *mut WebViewHandle, argb: u32),
     /// The view's toolkit widget (`GtkWidget *`), borrowed: valid while the view lives; handed to [`UiVtable::sideband_attach`].
     pub view_widget: unsafe extern "C" fn(view: *mut WebViewHandle) -> *mut c_void,
 }

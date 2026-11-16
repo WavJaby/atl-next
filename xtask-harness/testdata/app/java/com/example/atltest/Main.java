@@ -197,6 +197,22 @@ public class Main extends Activity {
     /** Keeps webViewPage's WebView reachable until its line is logged. */
     private android.webkit.WebView mWebView;
 
+    /**
+     * The WebView settings line (app.rs WEBVIEW_SETTINGS, webview plan S4.1): a WebView reads back what it sets across the kinds (a flag and an int the engine applies, a text the engine applies, an int the core stores), and AOSP's defaults for what it leaves alone.
+     */
+    private void webViewSettings() {
+        try {
+            android.webkit.WebSettings s = new android.webkit.WebView(this).getSettings();
+            s.setJavaScriptEnabled(true);
+            s.setDefaultFontSize(20);
+            s.setSerifFontFamily("atl-serif");
+            s.setTextZoom(150);
+            Log.i("AtlTest", "webview-settings: js=" + s.getJavaScriptEnabled() + " font-size=" + s.getDefaultFontSize() + " serif=" + s.getSerifFontFamily() + " text-zoom=" + s.getTextZoom() + " min-font=" + s.getMinimumFontSize() + " zoom=" + s.getDefaultZoom() + " layout=" + s.getLayoutAlgorithm() + " support-zoom=" + s.supportZoom());
+        } catch (Throwable e) {
+            Log.i("AtlTest", "webview-settings: threw=" + e);
+        }
+    }
+
     /** The WebView package line (app.rs WEBVIEW_PACKAGE): WebView.getCurrentWebViewPackage's name and whether it is a system app; `null` without one. */
     private String webViewPackage() {
         android.content.pm.PackageInfo p = android.webkit.WebView.getCurrentWebViewPackage();
@@ -243,6 +259,7 @@ public class Main extends Activity {
                 ui.post(new Runnable() {
                     @Override public void run() {
                         Log.i("AtlTest", "webview-ua: " + ua);
+                        webViewSettings();
                         webViewPage();
                     }
                 });

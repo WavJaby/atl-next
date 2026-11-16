@@ -7,12 +7,12 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use atl_platform_ui_api::abi::{
-    self, BoolSetting, BytesOut, Callback, EvalResultView, Str, UiVtable, WebEventView,
-    WebViewEntry, WebViewHandle, WebViewVtable, web_event,
+    self, BytesOut, Callback, EvalResultView, Str, UiVtable, WebEventView, WebViewEntry,
+    WebViewHandle, WebViewVtable, web_event,
 };
 use atl_platform_ui_api::webview::{
-    InputClaim, LoadError, PromptReply, SIDEBAND_WEB_VIEW, WebEngine, WebEvent, WebView,
-    WebViewError,
+    InputClaim, LoadError, PromptReply, SIDEBAND_WEB_VIEW, SettingValue, WebEngine, WebEvent,
+    WebSetting, WebView, WebViewError,
 };
 
 static MODULE: OnceLock<Result<&'static WebViewVtable, String>> = OnceLock::new();
@@ -202,35 +202,20 @@ impl WebView for PlatformWebView {
         unsafe { (self.m.view_progress)(self.h) }
     }
 
-    fn set_javascript_enabled(&self, on: bool) {
-        // SAFETY: see the impl comment.
-        unsafe { (self.m.view_set_bool)(self.h, BoolSetting::JavaScript, on) }
+    fn set_setting(&self, which: WebSetting, value: &SettingValue) {
+        // SAFETY: see the impl comment; the value's text lives for the call.
+        unsafe {
+            match value {
+                SettingValue::Bool(on) => (self.m.view_set_bool)(self.h, which, *on),
+                SettingValue::Int(v) => (self.m.view_set_int)(self.h, which, *v),
+                SettingValue::Str(s) => (self.m.view_set_str)(self.h, which, Str::of(s)),
+            }
+        }
     }
 
-    fn javascript_enabled(&self) -> bool {
+    fn set_background_color(&self, argb: u32) {
         // SAFETY: see the impl comment.
-        unsafe { (self.m.view_get_bool)(self.h, BoolSetting::JavaScript) }
-    }
-
-    fn set_user_agent(&self, ua: &str) {
-        // SAFETY: see the impl comment.
-        unsafe { (self.m.view_set_user_agent)(self.h, Str::of(ua)) }
-    }
-
-    fn user_agent(&self) -> String {
-        // SAFETY: see the impl comment.
-        let ((), bytes) = BytesOut::collect(|out| unsafe { (self.m.view_user_agent)(self.h, out) });
-        String::from_utf8_lossy(&bytes).into_owned()
-    }
-
-    fn set_dom_storage_enabled(&self, on: bool) {
-        // SAFETY: see the impl comment.
-        unsafe { (self.m.view_set_bool)(self.h, BoolSetting::DomStorage, on) }
-    }
-
-    fn dom_storage_enabled(&self) -> bool {
-        // SAFETY: see the impl comment.
-        unsafe { (self.m.view_get_bool)(self.h, BoolSetting::DomStorage) }
+        unsafe { (self.m.view_set_background)(self.h, argb) }
     }
 
     fn sideband_stream(&self) -> [i32; 2] {

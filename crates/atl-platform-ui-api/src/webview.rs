@@ -34,18 +34,10 @@ pub trait WebView {
     fn title(&self) -> Option<String>;
     /// The estimated progress of the current load, 0..=100.
     fn progress(&self) -> i32;
-    /// Enables or disables JavaScript for later loads.
-    fn set_javascript_enabled(&self, on: bool);
-    /// Whether JavaScript is enabled.
-    fn javascript_enabled(&self) -> bool;
-    /// Sets the user agent string sent with requests and seen by `navigator.userAgent`.
-    fn set_user_agent(&self, ua: &str);
-    /// The user agent string in use.
-    fn user_agent(&self) -> String;
-    /// Enables DOM storage (`localStorage` / `sessionStorage`).
-    fn set_dom_storage_enabled(&self, on: bool);
-    /// Whether DOM storage is enabled.
-    fn dom_storage_enabled(&self) -> bool;
+    /// Applies one engine-backed setting to the view; `value` has the kind of `which` ([`WebSetting::kind`]). The core stores every WebSettings value and calls this only for the ones WebKit has.
+    fn set_setting(&self, which: WebSetting, value: &SettingValue);
+    /// The view's background colour, an Android colour int (ARGB). WebView.setBackgroundColor hands it to the provider only (WebView.java:3072), so the page's background is the only one.
+    fn set_background_color(&self, argb: u32);
     /// The ints of the sideband stream that shows this view (webview plan S2.2 amended): the provider sets them on the layer that carries the view, and every window draws the view where a quad with
     /// that stream lands, at that quad's depth. The same ints for the view's life.
     fn sideband_stream(&self) -> [i32; 2];
@@ -151,4 +143,153 @@ pub enum WebViewError {
     /// The engine needs a display the process does not have (WebKitGTK reads the GDK display's GL support when its settings are made).
     #[error("web engine: {0}")]
     NoDisplay(String),
+}
+
+/// The engine-backed WebSettings properties: the engine's own setting per variant (the linux module maps them). The numbers are the vtable's ABI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum WebSetting {
+    /// enable-javascript.
+    JavaScript = 1,
+    /// enable-html5-local-storage (DOM storage).
+    DomStorage = 2,
+    /// media-playback-requires-user-gesture.
+    MediaPlaybackRequiresUserGesture = 3,
+    /// allow-universal-access-from-file-urls.
+    AllowUniversalAccessFromFileUrls = 4,
+    /// allow-file-access-from-file-urls.
+    AllowFileAccessFromFileUrls = 5,
+    /// javascript-can-open-windows-automatically.
+    JavaScriptCanOpenWindowsAutomatically = 6,
+    /// auto-load-images.
+    AutoLoadImages = 7,
+    /// minimum-font-size.
+    MinimumFontSize = 8,
+    /// default-font-size.
+    DefaultFontSize = 9,
+    /// default-monospace-font-size.
+    DefaultMonospaceFontSize = 10,
+    /// user-agent; empty = the engine's own default.
+    UserAgent = 11,
+    /// default-font-family (WebSettings' standard font).
+    DefaultFontFamily = 12,
+    /// monospace-font-family (WebSettings' fixed font).
+    MonospaceFontFamily = 13,
+    /// sans-serif-font-family.
+    SansSerifFontFamily = 14,
+    /// serif-font-family.
+    SerifFontFamily = 15,
+    /// cursive-font-family.
+    CursiveFontFamily = 16,
+    /// fantasy-font-family.
+    FantasyFontFamily = 17,
+    /// default-charset.
+    DefaultCharset = 18,
+}
+
+/// The value kinds of settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingKind {
+    /// On or off.
+    Bool,
+    /// A number (font sizes, enum ordinals, ints of WebSettings).
+    Int,
+    /// Text.
+    Str,
+}
+
+impl WebSetting {
+    /// The kind of this setting's value; fixed per variant.
+    pub fn kind(self) -> SettingKind {
+        match self {
+            Self::JavaScript
+            | Self::DomStorage
+            | Self::MediaPlaybackRequiresUserGesture
+            | Self::AllowUniversalAccessFromFileUrls
+            | Self::AllowFileAccessFromFileUrls
+            | Self::JavaScriptCanOpenWindowsAutomatically
+            | Self::AutoLoadImages => SettingKind::Bool,
+            Self::MinimumFontSize | Self::DefaultFontSize | Self::DefaultMonospaceFontSize => {
+                SettingKind::Int
+            }
+            Self::UserAgent
+            | Self::DefaultFontFamily
+            | Self::MonospaceFontFamily
+            | Self::SansSerifFontFamily
+            | Self::SerifFontFamily
+            | Self::CursiveFontFamily
+            | Self::FantasyFontFamily
+            | Self::DefaultCharset => SettingKind::Str,
+        }
+    }
+}
+
+/// A setting's value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SettingValue {
+    /// A boolean setting.
+    Bool(bool),
+    /// An int setting.
+    Int(i32),
+    /// A string setting.
+    Str(String),
+}
+
+impl SettingValue {
+    /// The kind of this value.
+    pub fn kind(&self) -> SettingKind {
+        match self {
+            Self::Bool(_) => SettingKind::Bool,
+            Self::Int(_) => SettingKind::Int,
+            Self::Str(_) => SettingKind::Str,
+        }
+    }
+
+    /// The boolean, None for another kind.
+    pub fn as_bool(&self) -> Option<bool> {
+        match *self {
+            Self::Bool(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// The int, None for another kind.
+    pub fn as_int(&self) -> Option<i32> {
+        match *self {
+            Self::Int(i) => Some(i),
+            _ => None,
+        }
+    }
+
+    /// The text, None for another kind.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
+impl From<bool> for SettingValue {
+    fn from(b: bool) -> Self {
+        Self::Bool(b)
+    }
+}
+
+impl From<i32> for SettingValue {
+    fn from(i: i32) -> Self {
+        Self::Int(i)
+    }
+}
+
+impl From<&str> for SettingValue {
+    fn from(s: &str) -> Self {
+        Self::Str(s.to_owned())
+    }
+}
+
+impl From<String> for SettingValue {
+    fn from(s: String) -> Self {
+        Self::Str(s)
+    }
 }

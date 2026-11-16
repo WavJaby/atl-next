@@ -8,6 +8,7 @@
 pub mod bridge;
 #[allow(unsafe_code)]
 mod jni;
+mod settings;
 pub mod ua;
 
 use atl_platform_ui::PlatformWebEngine;

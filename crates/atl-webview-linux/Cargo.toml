@@ -15,6 +15,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 atl-platform-ui-api = { path = "../atl-platform-ui-api" }
+tracing.workspace = true
 webkit6.workspace = true
 
 [lints]
