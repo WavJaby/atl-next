@@ -116,6 +116,11 @@ impl Args {
                 a.goals.push(g);
             }
         }
+        // convert for all-gates always (flow-opt R5): a foreign graph holds every gate's nb goals, so no run narrows it; the run's own goals only add
+        if foreign {
+            let all = crate::gate_goals::union(root, &[crate::gate_goals::ALL.to_owned()])?;
+            with_nb_goals(&mut a.goals, &all.nb);
+        }
         Ok(a)
     }
 
@@ -623,6 +628,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
         // the runtime gates read the converter packages and crates from here (build_state::gate_out); a failed ninja leaves the old packages, so no record
         build_state::record(&graph_out, &state, &built_goals)?;
+        // a host run takes its foreign graphs to its state too: one source state per out dir, so no foreign gate or app refuses a stale graph (build_state.rs foreign_out)
+        if !foreign {
+            failed.extend(refresh_foreign(root, args, &out)?);
+        }
         if let Some(first) = table_check(&table) {
             failed.push(Failure::step("table check", first));
         }
@@ -965,6 +974,64 @@ pub fn graph_dir(out: &Path, host: &str, arch: &str) -> PathBuf {
         out.to_owned()
     } else {
         out.join(format!("{NB_GRAPH_DIR}{arch}"))
+    }
+}
+
+/// Refreshes each foreign guest graph `out` holds at the host run's state: one inner run per graph. Its goals are the foreign set ([`Args::resolved`]), so it takes none of its own.
+/// Returns a failure per graph that did not build; that run's verdict is printed above.
+fn refresh_foreign(root: &Path, args: &Args, out: &Path) -> Result<Vec<Failure>> {
+    let arches = arches::load(root)?;
+    let mut failed = Vec::new();
+    for arch in foreign_graphs(out)? {
+        if arch == args.host || arches.get(arch.as_str()).is_none_or(|r| r.guest.is_none()) {
+            continue;
+        }
+        println!("native: foreign graph {arch}: refresh at this run's state");
+        let inner = Args {
+            native_bridge: Some(arch.clone()),
+            goals: Vec::new(),
+            for_gates: Vec::new(),
+            fetch_missing: false,
+            shell: false,
+            ..args.clone()
+        };
+        if run(root, &inner)? != ExitCode::SUCCESS {
+            failed.push(Failure::step(
+                &format!("native-bridge {arch} graph"),
+                "not refreshed: see its verdict above",
+            ));
+        }
+    }
+    Ok(failed)
+}
+
+/// The guest arches whose graph dirs `out` holds (`nb-graph-<arch>`, [`graph_dir`]), sorted.
+fn foreign_graphs(out: &Path) -> Result<Vec<String>> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(out).with_context(|| format!("reading {}", out.display()))? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        if let Some(arch) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.strip_prefix(NB_GRAPH_DIR))
+        {
+            found.push(arch.to_owned());
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// `goals` with each `nb:<m>` of `nb` added once, after the goals it already has.
+fn with_nb_goals(goals: &mut Vec<String>, nb: &BTreeSet<String>) {
+    for m in nb {
+        let goal = format!("{NB_GOAL}{m}");
+        if !goals.contains(&goal) {
+            goals.push(goal);
+        }
     }
 }
 
@@ -2020,6 +2087,28 @@ mod tests {
             nb_module_dir(&foreign, "arm64", "libc"),
             foreign.join("nb/arm64/libc")
         );
+    }
+
+    /// A foreign graph takes every gate's nb goal once: the run's own `nb:libm` stays first, the missing `nb:libc` is added after it, and no goal repeats.
+    #[test]
+    fn foreign_graph_takes_the_all_gates_nb_goals_once() {
+        let nb = BTreeSet::from(["libc".to_owned(), "libm".to_owned()]);
+        let mut goals = vec!["nb:libm".to_owned(), "libbase".to_owned()];
+        with_nb_goals(&mut goals, &nb);
+        assert_eq!(goals, ["nb:libm", "libbase", "nb:libc"]);
+    }
+
+    /// Only `nb-graph-<arch>` directories count as foreign graphs: a file of that name, and the host's own dirs, do not.
+    #[test]
+    fn foreign_graphs_are_the_nb_graph_dirs() {
+        let out = std::env::temp_dir().join(format!("xtask-foreign-graphs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        for dir in ["nb-graph-arm64", "nb-graph-riscv64", "nb", "bp2ninja"] {
+            std::fs::create_dir_all(out.join(dir)).expect("creating a test dir");
+        }
+        std::fs::write(out.join("nb-graph-x86_64"), "").expect("writing a test file");
+        assert_eq!(foreign_graphs(&out).expect("listing"), ["arm64", "riscv64"]);
+        let _ = std::fs::remove_dir_all(&out);
     }
 
     /// Soong's ninja environment (config.go NewConfig): JAVA_HOME is the JDK, whose bin precedes the inherited PATH, so `java` resolves to the JDK's.
