@@ -77,7 +77,6 @@ impl<E> Gate<E> {
     /// Android delivered `claim` stamped `t` (ns) to the View.
     pub fn claim(&mut self, claim: InputClaim, t: i64) -> Claimed<E> {
         let mut left_pressed = false;
-        let key = matches!(claim, InputClaim::Key);
         match claim {
             InputClaim::Down => {
                 // what came before the press went elsewhere (or was hover nobody claimed)
@@ -99,10 +98,18 @@ impl<E> Gate<E> {
             }
             InputClaim::Move | InputClaim::Hover | InputClaim::Key => {}
         }
+        // each claim takes only its own kinds: a press only with Down, a release only with Up. Events of one click can share a stamp (ms toolkit times), and Android hands hover to a
+        // WebView under a View that takes the click (an overlapping button does not handle hover), so a Hover claim must not deliver that click's press and release.
+        let takes = |h: &Held<E>| match claim {
+            InputClaim::Key => h.key,
+            InputClaim::Down => !h.key && !h.release,
+            InputClaim::Up => !h.key && !h.press,
+            _ => !h.key && !h.press && !h.release,
+        };
         let mut replay = Vec::new();
         let mut rest = VecDeque::with_capacity(self.held.len());
         for h in self.held.drain(..) {
-            if h.key == key && h.ns <= t {
+            if h.ns <= t && takes(&h) {
                 replay.push(h.event);
             } else {
                 rest.push_back(h);
@@ -131,11 +138,14 @@ struct Entry {
 static SIDEBANDS: Mutex<Vec<(i32, glib::thread_guard::ThreadGuard<std::rc::Rc<Entry>>)>> =
     Mutex::new(Vec::new());
 
-/// (event address, monotonic ns) of the events the window's controllers published last ([`stamp`]).
-static STAMPS: Mutex<VecDeque<(usize, i64)>> = Mutex::new(VecDeque::new());
+/// (event address, the event, monotonic ns) of the events the window's controllers published last ([`stamp`]); the reference keeps the address from being reused while it is listed.
+type Stamp = (usize, glib::thread_guard::ThreadGuard<gdk::Event>, i64);
+static STAMPS: Mutex<VecDeque<Stamp>> = Mutex::new(VecDeque::new());
 
-/// Addresses of events put back on the queue and not yet through their gate ([`replayed`]).
-static REPLAYING: Mutex<VecDeque<usize>> = Mutex::new(VecDeque::new());
+/// Events put back on the queue and not yet through their gate ([`replayed`]), each with a reference of its own: GTK may drop a put-back event (measured: a press put back after later
+/// input never reached the widget), and a mark keyed by a freed event's address then matched the next real event allocated there, which the window's controllers skipped unpublished.
+static REPLAYING: Mutex<VecDeque<(usize, glib::thread_guard::ThreadGuard<gdk::Event>)>> =
+    Mutex::new(VecDeque::new());
 
 fn address(e: &gdk::Event) -> usize {
     use glib::translate::ToGlibPtr;
@@ -204,16 +214,21 @@ pub fn routes_to_gate(w: Option<gtk4::Widget>) -> bool {
 /// The window's controllers published `event` to Android stamped `ns`.
 pub fn stamp(event: Option<gdk::Event>, ns: i64) {
     let Some(e) = event else { return };
-    let mut s = lock(&STAMPS);
-    if s.len() == MAX_MARKS {
-        s.pop_front();
-    }
-    s.push_back((address(&e), ns));
+    let evicted = {
+        let mut s = lock(&STAMPS);
+        let evicted = (s.len() == MAX_MARKS).then(|| s.pop_front()).flatten();
+        s.push_back((address(&e), glib::thread_guard::ThreadGuard::new(e), ns));
+        evicted
+    };
+    drop(evicted);
 }
 
 /// Whether `event` is a held event put back on the queue: the window's controllers skip it (Android has it already).
 pub fn replayed(event: Option<&gdk::Event>) -> bool {
-    event.is_some_and(|e| lock(&REPLAYING).contains(&address(e)))
+    event.is_some_and(|e| {
+        let a = address(e);
+        lock(&REPLAYING).iter().any(|(x, _)| *x == a)
+    })
 }
 
 fn kind(t: gdk::EventType) -> Option<(bool, bool, bool)> {
@@ -233,12 +248,14 @@ fn kind(t: gdk::EventType) -> Option<(bool, bool, bool)> {
 /// The gate on `key`'s widget: a put-back event passes; a fresh one is held, stamped as the window's controllers stamped it (or now, for one they did not publish).
 fn on_gate(key: i32, event: &gdk::Event) -> glib::Propagation {
     let a = address(event);
-    {
+    let mark = {
         let mut r = lock(&REPLAYING);
-        if let Some(i) = r.iter().position(|x| *x == a) {
-            r.remove(i);
-            return glib::Propagation::Proceed;
-        }
+        r.iter()
+            .position(|(x, _)| *x == a)
+            .and_then(|i| r.remove(i))
+    };
+    if mark.is_some() {
+        return glib::Propagation::Proceed;
     }
     let Some((key_event, press, release)) = kind(event.event_type()) else {
         return glib::Propagation::Proceed;
@@ -249,8 +266,15 @@ fn on_gate(key: i32, event: &gdk::Event) -> glib::Propagation {
     let ns = lock(&STAMPS)
         .iter()
         .rev()
-        .find(|(x, _)| *x == a)
-        .map_or_else(crate::window::monotonic_ns, |(_, ns)| *ns);
+        .find(|(x, _, _)| *x == a)
+        .map(|(_, _, ns)| *ns);
+    // DIAG (temporary, INFO): stamped = the window's controllers published it
+    tracing::info!(
+        "atl-platform-ui: sideband {key}: hold {:?} stamped={}",
+        event.event_type(),
+        ns.is_some()
+    );
+    let ns = ns.unwrap_or_else(crate::window::monotonic_ns);
     e.gate.borrow_mut().hold(Held {
         event: event.clone(),
         ns,
@@ -265,14 +289,22 @@ fn on_gate(key: i32, event: &gdk::Event) -> glib::Propagation {
 pub fn claim(key: i32, claim: InputClaim, t: i64) -> bool {
     let Some(e) = entry(key) else { return false };
     let claimed = e.gate.borrow_mut().claim(claim, t);
+    tracing::info!(
+        "atl-platform-ui: sideband {key}: claim {claim:?} at {t} ns: {} replayed",
+        claimed.replay.len()
+    );
     for ev in claimed.replay {
-        {
+        let evicted = {
             let mut r = lock(&REPLAYING);
-            if r.len() == MAX_MARKS {
-                r.pop_front();
-            }
-            r.push_back(address(&ev));
-        }
+            let evicted = (r.len() == MAX_MARKS).then(|| r.pop_front()).flatten();
+            r.push_back((
+                address(&ev),
+                glib::thread_guard::ThreadGuard::new(ev.clone()),
+            ));
+            evicted
+        };
+        // a dropped mark's reference goes outside the lock
+        drop(evicted);
         if let Some(display) = ev.display() {
             #[allow(deprecated)]
             // GTK4 has no other way to deliver an event to a widget (module doc)
@@ -390,6 +422,21 @@ mod tests {
         assert_eq!(g.claim(InputClaim::Down, 10).replay, vec![10]);
         assert_eq!(g.claim(InputClaim::Key, 5).replay, vec![5]);
         assert_eq!(g.len(), 0);
+    }
+
+    /// A click on a View over the WebView (measured: the overlay's click reached the page): motion, press and release share one stamp; Android hands the hover to the WebView, not the click.
+    /// The Hover claim replays the motion only; the next gesture's press drops the unclaimed press and release.
+    #[test]
+    fn hover_claim_does_not_deliver_a_click() {
+        let mut g = Gate::default();
+        g.hold(ptr(50, false, false));
+        g.hold(ptr(50, true, false));
+        g.hold(ptr(50, false, true));
+        assert_eq!(g.claim(InputClaim::Hover, 50).replay, vec![50]);
+        assert_eq!(g.len(), 2);
+        g.hold(ptr(60, true, false));
+        assert_eq!(g.len(), 1);
+        assert_eq!(g.claim(InputClaim::Down, 60).replay, vec![60]);
     }
 
     /// The bound: past MAX_HELD the oldest goes.
