@@ -18,7 +18,7 @@ use atl_layout::Layout;
 const PACKAGE: &str = "xtask-harness";
 
 /// Builds the harness (a no-op when current) and returns its binary.
-/// The binary is this executable's sibling: both are workspace members built with the same profile into the same target dir.
+/// The binary is in the running xtask's profile dir of the target dir cargo writes (out::cargo_target_dir).
 fn build(root: &Path) -> Result<PathBuf> {
     let status = crate::cargo_command()
         .args(["build", "--quiet", "--package", PACKAGE])
@@ -34,8 +34,15 @@ fn build(root: &Path) -> Result<PathBuf> {
         };
         bail!("cargo build --package {PACKAGE} exited with {status}{hint}");
     }
+    // same profile dir as the running xtask, under the target dir cargo just wrote (a new checkout's xtask runs from its real `target/`, cargo writes the build dir's: out::pending_target)
     let exe = std::env::current_exe().context("locating the running xtask binary")?;
-    let bin = exe.with_file_name(PACKAGE);
+    let profile = exe
+        .parent()
+        .and_then(Path::file_name)
+        .context("xtask binary has no profile dir")?;
+    let bin = crate::out::cargo_target_dir(root)
+        .join(profile)
+        .join(PACKAGE);
     if !bin.is_file() {
         bail!(
             "{} missing after cargo build --package {PACKAGE}",

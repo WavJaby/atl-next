@@ -143,7 +143,7 @@ pub fn check(root: &Path) -> Result<()> {
         "{DIR}: not gofmt-formatted (gofmt -w): {}",
         bad.join(", ")
     );
-    let dir = root.join("target").join("bp2ninja");
+    let dir = crate::out::cargo_target_dir(root).join("bp2ninja");
     let work = go_work(root, &Layout::of(root)?, &dir)?;
     let bin = dir.join("bp2ninja").display().to_string();
     go(root, &work, &["build", "-o", &bin, "."])?;

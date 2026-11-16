@@ -643,6 +643,23 @@ pub fn describe_step(step: &Step) -> String {
     }
 }
 
+/// The build dir's target while `<checkout>/target` is not yet the link [`settle_target`] makes (a new worktree's first command: `cargo xtask` compiled xtask into a real `target/`); None once linked.
+/// The caller hands it to the command's cargo runs as `CARGO_TARGET_DIR`: without it the first command's whole build lands in the real dir on the checkout's disk and is discarded at settle.
+pub fn pending_target(root: &Path) -> Result<Option<PathBuf>> {
+    let (_, dir) = ensure(root)?;
+    let want = target_of(&dir);
+    Ok(if link_steps(&root.join(TARGET), &want)?.is_empty() {
+        None
+    } else {
+        Some(want)
+    })
+}
+
+/// The target dir this process's cargo runs write: `CARGO_TARGET_DIR` ([`pending_target`] sets it), else `<checkout>/target`. For tools placed beside cargo's units (bp2ninja).
+pub fn cargo_target_dir(root: &Path) -> PathBuf {
+    std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| root.join(TARGET), PathBuf::from)
+}
+
 /// Links the checkout's `target/` to its build dir's, when the dir exists. Run by the outermost xtask process as it ends (cli): the running binary may live in the real `target/` this removes, and the namespace re-exec still needs it.
 /// Only while no other xtask process holds the dir (its exclusive lock, not waited for): a concurrent build may run its xtask from that `target/` (2026-11-15: `out prune` beside a `native` removed the running binary's dir). Busy: left for a later command.
 pub fn settle_target(root: &Path) -> Result<()> {

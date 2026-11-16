@@ -209,7 +209,8 @@ pub fn check(root: &Path) -> Result<()> {
         libc.display()
     );
     // the converter as step converter builds it, under this checkout's target dir
-    let tools = root.join("target").join("bp2ninja");
+    let target = crate::out::cargo_target_dir(root);
+    let tools = target.join("bp2ninja");
     let go_work = converter::go_work(root, &layout, &tools)?;
     let bin = tools.join("bp2ninja");
     converter::go(
@@ -218,7 +219,7 @@ pub fn check(root: &Path) -> Result<()> {
         &["build", "-o", &bin.display().to_string(), "."],
     )
     .context("building bp2ninja")?;
-    let work = root.join("target").join("libcxx-gate");
+    let work = target.join("libcxx-gate");
     std::fs::create_dir_all(&work)?;
     let provided = work.join("provided.json");
     std::fs::write(

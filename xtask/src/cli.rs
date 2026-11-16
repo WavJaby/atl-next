@@ -148,12 +148,16 @@ pub fn main() -> Result<ExitCode> {
         }
         let overlays = tree::binds_of(&root)?;
         // `native --shell`: the shell gets the compiler-cache variables of its own source view, as each ninja run does
-        let env = match &cli.command {
+        let mut env = match &cli.command {
             Command::Native(a) if a.shell => {
                 native::shell_env(a, &root, &tree::describe(&tree::overlays_of(&root)?))?
             }
             _ => Vec::new(),
         };
+        // until settle_target links `target/` (at the end), cargo builds go to the build dir's target, never the checkout's real one
+        if let Some(target) = crate::out::pending_target(&root)? {
+            env.push(("CARGO_TARGET_DIR", target.into_os_string()));
+        }
         if let Some(code) = tree::enter(&overlays, shell, &env)? {
             return Ok(code);
         }
