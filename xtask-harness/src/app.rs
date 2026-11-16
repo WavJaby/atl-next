@@ -728,8 +728,8 @@ fn write_assets(dir: &Path, deferred: &[&str]) -> Result<()> {
 const SKIPPED: &str = "skipped";
 /// The asset naming the calls Main skips, one label a line (Main.java SKIP_ASSET); written only for a run with [`deferred`] calls.
 const SKIP_ASSET: &str = "bridge1-skip.txt";
-/// The [`BRIDGE1_CALLS`] labels (and [`FIRST_CONFIG`], `guestLog`) the QEMU engine does not carry yet (QEMU Q6 plan Q6-6 subset; the rest is Q7): C++ exceptions through the guest unwinder, guest signals,
-/// the JIT up-call and guest liblog / property callbacks (not in the subset), GL through the proxies, and the C12 legacy fixture. Each is skipped by Main and must log `skipped`.
+/// The [`BRIDGE1_CALLS`] labels the QEMU engine does not carry yet: C++ exceptions through the guest unwinder (cppThrowCatch), guest signals (sigsegvRecover, nullFieldRead), the JIT up-call (jitUpCall), guest liblog / property callbacks (guestLog, propCallbacks), the EGL config list (FIRST_CONFIG), GL through the proxies and the ES1 context (glesPbuffer, es1Begin, es1Version, es1Pixels, es1End), and the C12 legacy library (legacyStdio, legacyNew, zRoundTrip).
+/// Each is skipped by Main and must log `skipped`.
 const QEMU_DEFERRED: &[&str] = &[
     "cppThrowCatch",
     "sigsegvRecover",
@@ -739,10 +739,8 @@ const QEMU_DEFERRED: &[&str] = &[
     "propCallbacks",
     FIRST_CONFIG,
     "glesPbuffer",
-    "driverMapped",
     "es1Begin",
     "es1Version",
-    "es1Driver",
     "es1Pixels",
     "es1End",
     "legacyStdio",

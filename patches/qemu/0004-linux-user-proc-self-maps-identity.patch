@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Mon, 16 Nov 2026 10:47:24 +0800
+Subject: [PATCH] linux-user: proc/self/maps identity
+
+Under identity mapping (guest_base == 0) guest pointers are host
+pointers and the guest runs in the host process. The faked maps and
+smaps list only QEMU's guest page regions, so a library the host
+dlopened (the GL driver, ANGLE) never appears to the guest. With
+guest_base == 0 the open goes to the kernel, which lists the process's
+real mappings. guest_base != 0 keeps the fakes: there guest addresses
+differ from host ones and the fake is the guest's own view.
+
+Upstream-Status: Inappropriate [identity mapping is ATL-only]
+Patch-Reason: the embedder shares one address space with the host, so QEMU's guest-region view is a partial list of reachable memory; the loader cannot filter what QEMU fakes
+---
+SPDX-License-Identifier: GPL-2.0-or-later
+ linux-user/syscall.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/linux-user/syscall.c b/linux-user/syscall.c
+index 9f454502cb6f6642a57c95f077a9f3d5c38826e2..cc965b06003e040d2cce86eaeafb405779d62488 100644
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -8879,6 +8879,16 @@ static int maybe_do_fake_open(CPUArchState *cpu_env, int dirfd,
+     }
+ 
+     for (fake_open = fakes; fake_open->filename; fake_open++) {
++        /*
++         * Identity map (guest_base == 0): guest pointers are host pointers.
++         * The kernel's maps and smaps list the host's libraries too; the
++         * faked ones list only QEMU's guest pages.
++         */
++        if (guest_base == 0 &&
++            (fake_open->fill == open_self_maps ||
++             fake_open->fill == open_self_smaps)) {
++            continue;
++        }
+         if (fake_open->cmp(pathname, fake_open->filename)) {
+             break;
+         }
