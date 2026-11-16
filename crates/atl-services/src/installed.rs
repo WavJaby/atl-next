@@ -27,6 +27,93 @@ pub struct UsesLibrary {
     pub required: bool,
 }
 
+/// SharedLibraryNames.ORG_APACHE_HTTP_LEGACY (services/core/java/com/android/server/pm/parsing/library/SharedLibraryNames.java:35).
+pub const ORG_APACHE_HTTP_LEGACY: &str = "org.apache.http.legacy";
+/// Build.VERSION_CODES.P (frameworks/base/core/java/android/os/Build.java:1207): targetSdk below it gets the legacy library implicitly.
+pub const VERSION_CODES_P: i32 = 28;
+
+/// The libraries a package uses with the implicit one of PackageBackwardCompatibility's OrgApacheHttpLegacyUpdater (scan time, ScanPackageUtils.java:978):
+/// an app targeting below P gets `org.apache.http.legacy` first among its required libraries (OrgApacheHttpLegacyUpdater.java:45-47, PackageSharedLibraryUpdater.java:88-97
+/// prefixRequiredLibrary), unless it names the library already, required or optional (isLibraryPresent :58-62). Nothing else changes.
+pub fn with_implicit_libraries(
+    mut libraries: Vec<UsesLibrary>,
+    target_sdk: i32,
+) -> Vec<UsesLibrary> {
+    let named = libraries.iter().any(|l| l.name == ORG_APACHE_HTTP_LEGACY);
+    if target_sdk < VERSION_CODES_P && !named {
+        libraries.insert(
+            0,
+            UsesLibrary {
+                name: ORG_APACHE_HTTP_LEGACY.to_owned(),
+                required: true,
+            },
+        );
+    }
+    libraries
+}
+
+#[cfg(test)]
+mod implicit_library_tests {
+    use super::*;
+
+    fn lib(name: &str, required: bool) -> UsesLibrary {
+        UsesLibrary {
+            name: name.to_owned(),
+            required,
+        }
+    }
+
+    /// targetSdk 27 (below P) and no declaration: the library comes first, required (prefixRequiredLibrary's addUsesLibrary(0, ...)).
+    #[test]
+    fn below_p_without_declaration_gets_the_library_first_and_required() {
+        assert_eq!(
+            with_implicit_libraries(Vec::new(), 27),
+            [lib("org.apache.http.legacy", true)]
+        );
+    }
+
+    /// targetSdk 28 is P itself: the rule's `< P` test fails, nothing is added (AOSP: `targetSdkVersion < Build.VERSION_CODES.P`).
+    #[test]
+    fn at_p_nothing_is_added() {
+        assert!(with_implicit_libraries(Vec::new(), 28).is_empty());
+    }
+
+    /// An optional declaration already names the library: isLibraryPresent checks both lists, so nothing changes.
+    #[test]
+    fn optional_declaration_below_p_is_kept_as_declared() {
+        let declared = vec![lib("org.apache.http.legacy", false)];
+        assert_eq!(with_implicit_libraries(declared.clone(), 27), declared);
+    }
+
+    /// A declaration below P also stays where the manifest put it: the required list is not reordered.
+    #[test]
+    fn required_declaration_below_p_is_kept_in_place() {
+        let declared = vec![lib("a.req", true), lib("org.apache.http.legacy", true)];
+        assert_eq!(with_implicit_libraries(declared.clone(), 27), declared);
+    }
+
+    /// At P a declared library is only what the manifest says, same as below P without the rule.
+    #[test]
+    fn at_p_declared_libraries_are_unchanged() {
+        let declared = vec![lib("a.req", true), lib("b.opt", false)];
+        assert_eq!(with_implicit_libraries(declared.clone(), 28), declared);
+    }
+
+    /// Below P the implicit library goes in front of the manifest's libraries, which keep their order (required first, as the installer lists them).
+    #[test]
+    fn below_p_prefixes_before_the_manifest_order() {
+        let declared = vec![lib("b.req", true), lib("a.opt", false)];
+        assert_eq!(
+            with_implicit_libraries(declared, 27),
+            [
+                lib("org.apache.http.legacy", true),
+                lib("b.req", true),
+                lib("a.opt", false)
+            ]
+        );
+    }
+}
+
 /// A decoded installer output.
 #[derive(Debug, Clone)]
 pub struct Installed {

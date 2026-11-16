@@ -207,10 +207,15 @@ impl Parsed {
             "install {name}: uid {uid}, code {code_dir}, flags {flags:#x} private {private_flags:#x}, primary-abi {}, isa {isa}",
             primary.as_deref().unwrap_or("none")
         ));
+        // targetSdk decides the implicit org.apache.http.legacy (installed.rs with_implicit_libraries)
+        let target_sdk = info
+            .application_info
+            .as_ref()
+            .map_or(0, |a| a.target_sdk_version);
         PackageRecord {
             info,
             intents: installed.intents,
-            libraries: installed.libraries,
+            libraries: crate::installed::with_implicit_libraries(installed.libraries, target_sdk),
             force_queryable: installed.force_queryable,
             uid,
             instruction_set: isa,
