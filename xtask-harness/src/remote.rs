@@ -56,8 +56,11 @@ const ROOT_NAMES: [(&str, &str); 3] = [("out", "out"), ("java", "java"), ("tree"
 const REMOTE_ROOT: &str = "atl-next-run";
 /// `<out>/remote/...`: the record and the staged bundle.
 pub use xtask::native::REMOTE_DIR;
-/// In a run's scratch on the target: its CPU possible list, online list and `nproc`, one per line (app.rs CpuFacts).
-pub const CPU_FACTS: &str = "cpu.facts";
+/// In a run's scratch on the target: its CPU possible list, online list and `nproc`, then [`ZONE_SH`]'s two lines, one per line (app.rs HostFacts).
+pub const HOST_FACTS: &str = "host.facts";
+/// The zone a program started from this shell runs in, as glibc `tzset` picks it (`TZ` when set, else the `/etc/localtime` link), read with the shell's own tools: line 1 the zone id (after `/zoneinfo/`, less a `posix/` / `right/` tree; empty = UTC),
+/// line 2 the zone file's TZif footer (RFC 8536 3.3: the POSIX TZ string of its current rule, from which app.rs takes the standard offset). An empty `TZ` reads as UTC with no file. Run locally by `sh -c` and on a target after the run.
+pub const ZONE_SH: &str = r#"if [ "${TZ+x}" ]; then z=${TZ#:}; f=$z; case $z in ''|/*) ;; *) f=/usr/share/zoneinfo/$z;; esac; else z=$(readlink /etc/localtime); f=/etc/localtime; fi; z=${z#*/zoneinfo/}; z=${z#posix/}; z=${z#right/}; printf '%s\n' "${z:-UTC}"; if [ -n "$f" ]; then tail -n 1 "$f"; else echo UTC0; fi"#;
 /// In a run's scratch on the target: its /proc/cpuinfo.
 pub const CPU_INFO: &str = "cpuinfo";
 /// The manifest file at the bundle's root: `sha256  size  name` per file, `link  target  name` per link.
@@ -569,10 +572,16 @@ impl Plan {
             "echo \"atld rc=$rc, remote run {}\" >&2\n",
             self.tag
         ));
-        // the target's CPU answers, for the rows judged against the run host (app.rs CpuFacts); nproc = this shell's affinity, which atld inherited
+        // the target's answers, for the rows judged against the run host (app.rs HostFacts); nproc = this shell's affinity, which atld inherited; the zone with atld's TZ (env -i above: only its own env row)
+        let tz = self
+            .env
+            .iter()
+            .find(|(k, _)| k == "TZ")
+            .map_or_else(String::new, |(_, v)| format!(" TZ={}", word(v)));
         s.push_str(&format!(
-            "{{ cat /sys/devices/system/cpu/possible /sys/devices/system/cpu/online; nproc; }} > {}\ncat /proc/cpuinfo > {}\n",
-            word(&out_path(&format!("{}/{CPU_FACTS}", self.scratch))),
+            "{{ cat /sys/devices/system/cpu/possible /sys/devices/system/cpu/online; nproc; env -i PATH=/usr/bin:/bin{tz} sh -c {}; }} > {}\ncat /proc/cpuinfo > {}\n",
+            sh_quote(ZONE_SH),
+            word(&out_path(&format!("{}/{HOST_FACTS}", self.scratch))),
             word(&out_path(&format!("{}/{CPU_INFO}", self.scratch)))
         ));
         s.push_str(&format!(
@@ -581,7 +590,7 @@ impl Plan {
             sh_quote(&format!("{}/atld.log", self.scratch)),
             sh_quote(&format!("{}/atld.rc", self.scratch)),
             sh_quote(&format!("{}/end.ms", self.scratch)),
-            sh_quote(&format!("{}/{CPU_FACTS}", self.scratch)),
+            sh_quote(&format!("{}/{HOST_FACTS}", self.scratch)),
             sh_quote(&format!("{}/{CPU_INFO}", self.scratch))
         ));
         if self.display == Display::NestedX11 {
@@ -1966,11 +1975,15 @@ mod tests {
             "printf '%s\\n' \"$rc\" > \"$BASE/out/gl/run/scratch/atld.rc\"\n",
             "date +%s%3N > \"$BASE/out/gl/run/scratch/end.ms\"\n",
             "echo \"atld rc=$rc, remote run gl/run\" >&2\n",
-            "{ cat /sys/devices/system/cpu/possible /sys/devices/system/cpu/online; nproc; } > \"$BASE/out/gl/run/scratch/cpu.facts\"\n",
+            "{ cat /sys/devices/system/cpu/possible /sys/devices/system/cpu/online; nproc; env -i PATH=/usr/bin:/bin sh -c @ZONE_SH@; } > \"$BASE/out/gl/run/scratch/host.facts\"\n",
             "cat /proc/cpuinfo > \"$BASE/out/gl/run/scratch/cpuinfo\"\n",
-            "tar -c -C \"$BASE/out\" --ignore-failed-read 'gl/run/root/log' 'gl/run/scratch/atld.log' 'gl/run/scratch/atld.rc' 'gl/run/scratch/end.ms' 'gl/run/scratch/cpu.facts' 'gl/run/scratch/cpuinfo'\n",
+            "tar -c -C \"$BASE/out\" --ignore-failed-read 'gl/run/root/log' 'gl/run/scratch/atld.log' 'gl/run/scratch/atld.rc' 'gl/run/scratch/end.ms' 'gl/run/scratch/host.facts' 'gl/run/scratch/cpuinfo'\n",
         );
-        assert_eq!(plan.script("atl-next-run/x9"), want);
+        // no TZ row in env: the zone probe runs without TZ, as atld does
+        assert_eq!(
+            plan.script("atl-next-run/x9"),
+            want.replace("@ZONE_SH@", &sh_quote(ZONE_SH))
+        );
     }
 
     /// A session run: after the launcher check, the one `wayland-*` socket of the desktop session is found, and atld's environment names it. The count check is what refuses a second compositor's socket.

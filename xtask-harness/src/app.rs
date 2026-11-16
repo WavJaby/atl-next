@@ -383,40 +383,40 @@ const WEBVIEW_PAGE: (&str, &str) = (
 /// sdkext: Main.onCreate's SdkExtensions.getExtensionVersion for R and AD_SERVICES (not a binder callback; logged in onCreate). The values are the build.prop rows
 /// sdkext.go derives as derive_sdk.cpp SetSdkLevels computes them: r stops at 8, the last db version that does not require EXT_SERVICES (not installed in ATL; version 9 is the first that does).
 /// ad_services is AD_SERVICES' module version, 17.
-/// timezone: Main.onCreate's TimeZone.getDefault(), from persist.sys.timezone (RuntimeInit.java:252 reads it; atld sets it to the host zone). The gate runs with TZ=Asia/Taipei: raw offset UTC+8 = 8 * 3600 * 1000 ms.
-const ASYNC_LINES: [(&str, &str, &str); 8] = [
-    ("bindservice", "AtlTest: bindservice: ", "bindService=true"),
+/// timezone: Main.onCreate's TimeZone.getDefault(), from persist.sys.timezone (RuntimeInit.java:252 reads it; atld sets it to the host zone). None = the run host's zone ([`HostFacts::zone_want`]: the target's on a remote run, never the build host's).
+const ASYNC_LINES: [(&str, &str, Option<&str>); 8] = [
+    (
+        "bindservice",
+        "AtlTest: bindservice: ",
+        Some("bindService=true"),
+    ),
     (
         "bindimplicit",
         "AtlTest: bindimplicit: ",
-        "bindService=true connected=com.example.atltest.AtlBound",
+        Some("bindService=true connected=com.example.atltest.AtlBound"),
     ),
     (
         "bindmissing",
         "AtlTest: bindmissing: ",
-        "bindService=false explicit=false unbind=ok called=false",
+        Some("bindService=false explicit=false unbind=ok called=false"),
     ),
     (
         "bound",
         "AtlTest: bound: ",
-        "connected=com.example.atltest.AtlBound answer=42",
+        Some("connected=com.example.atltest.AtlBound answer=42"),
     ),
     (
         "unbind",
         "AtlTest: unbind: ",
-        "onUnbind action=atl.test.BIND",
+        Some("onUnbind action=atl.test.BIND"),
     ),
     (
         "jobrun",
         "AtlTest: jobrun: ",
-        "started=9 work=atl.test.WORK delivery=1 completed=true next=null",
+        Some("started=9 work=atl.test.WORK delivery=1 completed=true next=null"),
     ),
-    ("sdkext", "AtlTest: sdkext: ", "r=8 ad_services=17"),
-    (
-        "timezone",
-        "AtlTest: timezone: ",
-        "id=Asia/Taipei raw=28800000",
-    ),
+    ("sdkext", "AtlTest: sdkext: ", Some("r=8 ad_services=17")),
+    ("timezone", "AtlTest: timezone: ", None),
 ];
 
 /// A [`SERVICE_LINES`] expectation: the fixed value, or for connectivity (None) [`connectivity_want`].
@@ -761,7 +761,7 @@ fn bridge1_call_failures(
     app: &str,
     deferred: &[&str],
     foreign: bool,
-    cpu: &Result<CpuFacts, String>,
+    cpu: &Result<HostFacts, String>,
 ) -> Vec<String> {
     let got = |name: &str| {
         app.lines().find_map(|l| {
@@ -839,8 +839,8 @@ const CPU_PROBE: &str = "cpuProbe";
 const CPU_POSSIBLE: &str = "/sys/devices/system/cpu/possible";
 const CPU_ONLINE: &str = "/sys/devices/system/cpu/online";
 
-/// The run host's answers the cpuProbe / cpuinfoView rows are judged against: CPU counts and /proc/cpuinfo of the machine atld ran on.
-struct CpuFacts {
+/// The run host's answers the cpuProbe / cpuinfoView / timezone rows are judged against: CPU counts, /proc/cpuinfo and time zone of the machine atld ran on.
+struct HostFacts {
     /// [`CPU_POSSIBLE`]'s count
     possible: usize,
     /// [`CPU_ONLINE`]'s count
@@ -849,12 +849,14 @@ struct CpuFacts {
     affinity: usize,
     /// /proc/cpuinfo text
     cpuinfo: String,
+    /// [`ZONE_SH`]'s output: zone id, then its TZif footer
+    zone: String,
 }
 
-use crate::remote::{CPU_FACTS, CPU_INFO};
+use crate::remote::{CPU_INFO, HOST_FACTS, ZONE_SH};
 
-impl CpuFacts {
-    /// This host's own answers (a local run: the app inherits atld's affinity, which inherits the gate's).
+impl HostFacts {
+    /// This host's own answers (a local run: the app inherits atld's affinity and environment, which inherit the gate's).
     fn here() -> Result<Self, String> {
         let read = |p: &str| std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"));
         let count =
@@ -868,6 +870,11 @@ impl CpuFacts {
                 .filter(|&i| set.is_set(i))
                 .count(),
             cpuinfo: read("/proc/cpuinfo")?,
+            zone: std::process::Command::new("sh")
+                .args(["-c", ZONE_SH])
+                .output()
+                .map_err(|e| format!("sh -c ZONE_SH: {e}"))
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())?,
         })
     }
 
@@ -877,21 +884,62 @@ impl CpuFacts {
             let p = scratch.join(n);
             std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))
         };
-        let facts = read(CPU_FACTS)?;
+        let facts = read(HOST_FACTS)?;
         let mut lines = facts.lines();
         let mut next = |what: &str, parse: fn(&str) -> Option<usize>| {
             lines
                 .next()
                 .and_then(parse)
-                .ok_or_else(|| format!("{CPU_FACTS}: no {what} line"))
+                .ok_or_else(|| format!("{HOST_FACTS}: no {what} line"))
         };
         Ok(Self {
             possible: next("possible", cpu_list_count)?,
             online: next("online", cpu_list_count)?,
             affinity: next("nproc", |l| l.trim().parse().ok())?,
             cpuinfo: read(CPU_INFO)?,
+            zone: lines.collect::<Vec<_>>().join("\n"),
         })
     }
+
+    /// The timezone row this host must show: `id=<zone> raw=<ms>`, raw = the footer's standard offset (POSIX TZ: `std offset ...`, offset `[+-]hh[:mm[:ss]]` west of Greenwich, so negated), as libcore's getRawOffset.
+    fn zone_want(&self) -> Result<String, String> {
+        let mut lines = self.zone.lines();
+        let (Some(id), Some(footer)) = (lines.next(), lines.next()) else {
+            return Err(format!(
+                "zone facts: want id and footer lines, got {:?}",
+                self.zone
+            ));
+        };
+        let raw = posix_std_offset_s(footer)
+            .ok_or_else(|| format!("zone facts: footer {footer:?} does not parse"))?;
+        Ok(format!("id={id} raw={}", -raw * 1000))
+    }
+}
+
+/// The std offset (seconds, positive west) of a POSIX TZ string (XBD 8.3): std a `<...>` quoted name or 3+ letters, then `[+-]hh[:mm[:ss]]`. None when it does not parse.
+fn posix_std_offset_s(tz: &str) -> Option<i64> {
+    let rest = match tz.strip_prefix('<') {
+        Some(q) => q.split_once('>')?.1,
+        None => tz.trim_start_matches(|c: char| c.is_ascii_alphabetic()),
+    };
+    let (sign, rest) = match rest.as_bytes().first()? {
+        b'-' => (-1, &rest[1..]),
+        b'+' => (1, &rest[1..]),
+        _ => (1, rest),
+    };
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit() && c != ':')
+        .unwrap_or(rest.len());
+    let mut secs = 0;
+    let mut scale = 3600;
+    for part in rest[..end].split(':') {
+        if part.is_empty() || scale == 0 {
+            return None;
+        }
+        secs += part.parse::<i64>().ok()? * scale;
+        scale /= 60;
+    }
+    Some(sign * secs)
 }
 
 /// The number of CPUs a kernel cpu list names (Documentation/admin-guide/cputopology.rst: `0-3,8,10-11`); None when it does not parse.
@@ -924,15 +972,16 @@ fn cpuinfo_features(text: &str) -> &'static str {
 
 /// The cpuProbe row's judge. Each count must equal the host's answer to the same question: conf the possible list, onln, java and the cpuinfo `processor` lines the online list, affinity this process's affinity mask (the app inherits atld's, which inherits the gate's).
 /// features: an identity guest sees the host's own cpuinfo (the host's word); a foreign guest (`foreign`, QEMU) must see its own ISA's, so a word that is neither the host's nor "none". `None`: the row passes.
-fn cpu_probe_why(value: Option<&str>, foreign: bool, cpu: &CpuFacts) -> Option<String> {
+fn cpu_probe_why(value: Option<&str>, foreign: bool, cpu: &HostFacts) -> Option<String> {
     let Some(value) = value else {
         return Some("no line".to_owned());
     };
-    let CpuFacts {
+    let HostFacts {
         possible,
         online,
         affinity,
         ref cpuinfo,
+        ..
     } = *cpu;
     let host_word = cpuinfo_features(cpuinfo);
     let fields: BTreeMap<&str, &str> = value
@@ -1834,12 +1883,34 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
             whys.push(format!("{service}: want {want:?}, got {got:?}"));
         }
     }
-    for (row, prefix, want) in ASYNC_LINES {
+    let facts = if remote {
+        HostFacts::of_remote(&run.scratch)
+    } else {
+        HostFacts::here()
+    };
+    let async_wants: Vec<(&str, Result<String, String>)> = ASYNC_LINES
+        .iter()
+        .map(|&(row, _, fixed)| {
+            let want = match fixed {
+                Some(w) => Ok(w.to_owned()),
+                None => facts
+                    .as_ref()
+                    .map_err(Clone::clone)
+                    .and_then(HostFacts::zone_want),
+            };
+            (row, want)
+        })
+        .collect();
+    for ((row, prefix, _), (_, want)) in ASYNC_LINES.iter().zip(&async_wants) {
         let got = app
             .lines()
             .find_map(|l| l.split_once(prefix).map(|(_, r)| r.trim_end().to_owned()));
-        if passed && got.as_deref() != Some(want) {
-            whys.push(format!("{row}: want {want:?}, got {got:?}"));
+        match want {
+            Err(e) if passed => whys.push(format!("{row}: the run host's facts: {e}")),
+            Ok(want) if passed && got.as_deref() != Some(want.as_str()) => {
+                whys.push(format!("{row}: want {want:?}, got {got:?}"));
+            }
+            _ => {}
         }
     }
     if passed {
@@ -1989,12 +2060,7 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
     }
     let mut es1_compared = None;
     if passed && bridge1_ok {
-        let cpu = if local.is_some() {
-            CpuFacts::here()
-        } else {
-            CpuFacts::of_remote(&run.scratch)
-        };
-        whys.extend(bridge1_call_failures(&app, deferred, foreign, &cpu));
+        whys.extend(bridge1_call_failures(&app, deferred, foreign, &facts));
         // sigsegvRecover's fault reaches the fixture's own handler through the bridge, which reports it first: the report's only gate in a real app process
         let report = guest_fault_report(foreign);
         if !deferred.contains(&"sigsegvRecover") && !app.lines().any(|l| l.contains(report)) {
@@ -2050,8 +2116,8 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
         {
             println!("app: pass {service} {}", service_want(*want));
         }
-        for (row, _, want) in ASYNC_LINES {
-            println!("app: pass {row} {want}");
+        for (row, want) in &async_wants {
+            println!("app: pass {row} {}", want.as_deref().unwrap_or_default());
         }
         println!("app: pass processes {PROCESSES_WANT}");
         println!(
@@ -2182,7 +2248,7 @@ fn remote_verdict(
                     &app,
                     deferred,
                     foreign,
-                    &CpuFacts::of_remote(&run.scratch),
+                    &HostFacts::of_remote(&run.scratch),
                 ));
                 let report = guest_fault_report(foreign);
                 if !deferred.contains(&"sigsegvRecover") && !app.lines().any(|l| l.contains(report))
@@ -2352,6 +2418,49 @@ fn exit_failures(ran: bool, services: &str, atld: &str, binderd: &str) -> Vec<St
 mod tests {
     use super::*;
     use crate::window::stamp_text;
+
+    /// XBD 8.3: the offset is added to local time to reach UTC, so east of Greenwich is negative; expected seconds = hh*3600 + mm*60 + ss with that sign.
+    #[test]
+    fn posix_tz_std_offset() {
+        for (tz, want) in [
+            ("CST-8", Some(-8 * 3600)),
+            ("UTC0", Some(0)),
+            ("EST5EDT,M3.2.0,M11.1.0", Some(5 * 3600)),
+            ("<+0545>-5:45", Some(-(5 * 3600 + 45 * 60))),
+            ("<-03>3", Some(3 * 3600)),
+            ("XYZ+1:02:03", Some(3600 + 2 * 60 + 3)),
+            ("UTC", None),
+            ("", None),
+            ("ABC1:2:3:4", None),
+        ] {
+            assert_eq!(posix_std_offset_s(tz), want, "{tz:?}");
+        }
+        let taipei = HostFacts {
+            possible: 1,
+            online: 1,
+            affinity: 1,
+            cpuinfo: String::new(),
+            zone: "Asia/Taipei\nCST-8\n".to_owned(),
+        };
+        // UTC+8 = 8 * 3600 * 1000 ms, libcore's getRawOffset for Asia/Taipei
+        assert_eq!(
+            taipei.zone_want().as_deref(),
+            Ok("id=Asia/Taipei raw=28800000")
+        );
+    }
+
+    /// glibc reads an empty TZ as UTC without a zone file; the probe says so on any host.
+    #[test]
+    fn zone_probe_empty_tz_is_utc() {
+        let out = std::process::Command::new("sh")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("TZ", "")
+            .args(["-c", ZONE_SH])
+            .output()
+            .expect("sh runs");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "UTC\nUTC0\n");
+    }
 
     /// The webview-ua judge: the CDD string from WebKit 2.54's measured default passes; a CTS mismatch, the engine's raw 3-part tokens, a missing engine record and a thrown line fail.
     #[test]
