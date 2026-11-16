@@ -375,9 +375,9 @@ fn split_at_esc(app: &str) -> (&str, &str) {
     (app, "")
 }
 
-/// The esc-back step (drive's, after the side buttons): Esc, which no view of the fixture consumes, finished unhandled; the dispatcher's fallback (the keyboard map's, atl-composer input/fallback.rs) follows.
-/// esc-back on: ESC down/up (flags FROM_SYSTEM 8), then KEYCODE_BACK down with FALLBACK | FROM_SYSTEM (0x408) and up with that | CANCELED (0x428, ViewRootImpl's back dispatch, as the mouse's back up), from the keyboard, and the back callback once.
-/// Off (AOSP's map, Generic.kcm ESCAPE `base: none`): ESC down/up only, no BACK, no callback. Values: keycodes.h, input.h AKEY_EVENT_FLAG_*, InputDispatcher::afterKeyEventLockedInterruptable (fallback flags = original | FALLBACK).
+/// The esc-back step (drive's, after the side buttons): Esc twice. The first is consumed: the keys step left the text field focused, and AOSP's TextView.onKeyDown ESCAPE (flag escapeClearsFocus) clears its focus and returns handled, so no fallback. The second finds no view to consume it and finishes unhandled; the dispatcher's fallback (the keyboard map's, atl-composer input/fallback.rs) follows.
+/// esc-back on: ESC down/up twice (flags FROM_SYSTEM 8), then KEYCODE_BACK down with FALLBACK | FROM_SYSTEM (0x408) and up with that | CANCELED (0x428, ViewRootImpl's back dispatch, as the mouse's back up), from the keyboard, and the back callback once.
+/// Off (AOSP's map, Generic.kcm ESCAPE `base: none`): ESC down/up twice only, no BACK, no callback. Values: keycodes.h, input.h AKEY_EVENT_FLAG_*, InputDispatcher::afterKeyEventLockedInterruptable (fallback flags = original | FALLBACK).
 /// ESC up and BACK down race (the fallback goes out when ESC down finishes), so each key's own order is compared, not their interleaving.
 fn esc_back_check(app: &str, esc_back: bool) -> Result<String, String> {
     let (_, from_esc) = split_at_esc(app);
@@ -394,7 +394,7 @@ fn esc_back_check(app: &str, esc_back: bool) -> Result<String, String> {
             .collect()
     };
     let (esc, back) = (of(KEYCODE_ESCAPE), of(KEYCODE_BACK));
-    let want_esc = [(0, FLAG_FROM_SYSTEM), (1, FLAG_FROM_SYSTEM)];
+    let want_esc = [(0, FLAG_FROM_SYSTEM), (1, FLAG_FROM_SYSTEM)].repeat(2);
     if esc != want_esc {
         return Err(format!("Esc (action, flags) {esc:?}, want {want_esc:?}"));
     }
@@ -422,7 +422,7 @@ fn esc_back_check(app: &str, esc_back: bool) -> Result<String, String> {
         ));
     }
     Ok(if esc_back {
-        "unhandled Esc -> fallback BACK down 0x408 / up 0x428 from the keyboard, back callback once"
+        "Esc clears the field's focus, then unhandled Esc -> fallback BACK down 0x408 / up 0x428 from the keyboard, back callback once"
             .to_owned()
     } else {
         "unhandled Esc -> no fallback (AOSP map), no back callback".to_owned()
@@ -1131,10 +1131,12 @@ pub fn drive(
         ],
     )?;
     wait_until(app_log, LINE_WAIT, |t| buttons_check(t).is_ok());
-    // Esc, which no view consumes: its fallback (esc-back on) is BACK; the checks judge the whole log at the end, so a late BACK with esc-back off still fails
+    // Esc twice: the first clears the text field's focus (TextView ESCAPE, handled), the second no view consumes: its fallback (esc-back on) is BACK; the checks judge the whole log at the end, so a late BACK with esc-back off still fails
     let key = |code: u32, pressed: bool| proxy.inject_key(code, pressed).map_err(|e| e.to_string());
-    key(KEY_ESC, true)?;
-    key(KEY_ESC, false)?;
+    for _ in 0..2 {
+        key(KEY_ESC, true)?;
+        key(KEY_ESC, false)?;
+    }
     wait_until(app_log, LINE_WAIT, |t| esc_back_check(t, esc_back).is_ok());
     // the idle window: nothing is injected, so the app must request no frame (`idle`); the composer's parking is not observed
     std::thread::sleep(IDLE_SETTLE);
@@ -1348,19 +1350,26 @@ mod tests {
         )
     }
 
-    /// Esc then its fallback BACK (0x408 down, 0x428 up) and one callback after Esc: passes with esc-back on, in either interleaving; the mouse's earlier callback does not count; off wants no BACK.
+    /// Esc twice (the first consumed by the focused field), then the fallback BACK (0x408 down, 0x428 up) and one callback after Esc: passes with esc-back on, in either interleaving; the mouse's earlier callback does not count; off wants no BACK; one Esc is not the step.
     #[test]
     fn esc_back_check_wants_the_fallback_back_after_esc() {
         // 0x408 = 1032, 0x428 = 1064 (input.h FALLBACK 0x400 | FROM_SYSTEM 0x8, + CANCELED 0x20)
+        let first_esc = [
+            keyboard_key(0, KEYCODE_ESCAPE, 8),
+            keyboard_key(1, KEYCODE_ESCAPE, 8),
+        ]
+        .concat();
+        let mouse = format!("AtlWindow: back callback\n{first_esc}");
         let (esc_down, esc_up) = (
             keyboard_key(0, KEYCODE_ESCAPE, 8),
             keyboard_key(1, KEYCODE_ESCAPE, 8),
         );
+        let single = format!("AtlWindow: back callback\n{esc_down}{esc_up}");
+        assert!(esc_back_check(&single, false).is_err());
         let (back_down, back_up) = (
             keyboard_key(0, KEYCODE_BACK, 1032),
             keyboard_key(1, KEYCODE_BACK, 1064),
         );
-        let mouse = "AtlWindow: back callback\n";
         let good =
             format!("{mouse}{esc_down}{esc_up}{back_down}{back_up}AtlWindow: back callback\n");
         assert!(esc_back_check(&good, true).is_ok());
