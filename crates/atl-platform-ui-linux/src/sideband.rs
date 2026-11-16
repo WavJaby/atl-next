@@ -267,14 +267,8 @@ fn on_gate(key: i32, event: &gdk::Event) -> glib::Propagation {
         .iter()
         .rev()
         .find(|(x, _, _)| *x == a)
-        .map(|(_, _, ns)| *ns);
-    // DIAG (temporary, INFO): stamped = the window's controllers published it
-    tracing::info!(
-        "atl-platform-ui: sideband {key}: hold {:?} stamped={}",
-        event.event_type(),
-        ns.is_some()
-    );
-    let ns = ns.unwrap_or_else(crate::window::monotonic_ns);
+        .map(|(_, _, ns)| *ns)
+        .unwrap_or_else(crate::window::monotonic_ns);
     e.gate.borrow_mut().hold(Held {
         event: event.clone(),
         ns,
@@ -289,10 +283,6 @@ fn on_gate(key: i32, event: &gdk::Event) -> glib::Propagation {
 pub fn claim(key: i32, claim: InputClaim, t: i64) -> bool {
     let Some(e) = entry(key) else { return false };
     let claimed = e.gate.borrow_mut().claim(claim, t);
-    tracing::info!(
-        "atl-platform-ui: sideband {key}: claim {claim:?} at {t} ns: {} replayed",
-        claimed.replay.len()
-    );
     for ev in claimed.replay {
         let evicted = {
             let mut r = lock(&REPLAYING);

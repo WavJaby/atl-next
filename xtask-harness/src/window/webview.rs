@@ -31,6 +31,9 @@ const INPUT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// The drag: steps of this many pixels, past the 8 dp touch slop of a scrolling parent (the fixture's Intercept takes the first move anyway).
 const DRAG_STEPS: u32 = 3;
 const DRAG_STEP_PX: u32 = 20;
+/// Between the drag's press and each move: past the toolkit's 1 ms event clock, so each move has its own time as a device's would; injected in one batch all share the press's ms, and the
+/// window drops motion samples timed at or before the last published event (input.rs `motion_samples`), so Android would see Down then Up and no MOVE for the parent to intercept.
+const DRAG_STEP_MS: u64 = 10;
 
 /// The fixture's dir.
 pub const FIXTURE: &str = "xtask-harness/testdata/webview";
@@ -375,19 +378,23 @@ fn drive_input(proxy: &Proxy, app_log: &Path) -> Result<(), String> {
     click(proxy, overlay)?;
     let _ = widgets::wait_until(app_log, INPUT_WAIT, |t| t.contains(OVERLAY_TAP));
     let start = s(dx, dy);
-    let mut drag = vec![
-        PointerAction::Motion {
-            x: start.0,
-            y: start.1,
-        },
-        widgets::press(true),
-    ];
+    widgets::inject(
+        proxy,
+        vec![
+            PointerAction::Motion {
+                x: start.0,
+                y: start.1,
+            },
+            widgets::press(true),
+        ],
+    )?;
     for step in 1..=DRAG_STEPS {
+        std::thread::sleep(std::time::Duration::from_millis(DRAG_STEP_MS));
         let p = s(dx + step * DRAG_STEP_PX, dy);
-        drag.push(PointerAction::Motion { x: p.0, y: p.1 });
+        widgets::inject(proxy, vec![PointerAction::Motion { x: p.0, y: p.1 }])?;
     }
-    drag.push(widgets::press(false));
-    widgets::inject(proxy, drag)?;
+    std::thread::sleep(std::time::Duration::from_millis(DRAG_STEP_MS));
+    widgets::inject(proxy, vec![widgets::press(false)])?;
     let _ = widgets::wait_until(app_log, INPUT_WAIT, |t| t.contains(INTERCEPTED));
     click(proxy, page)?;
     let _ = widgets::wait_until(app_log, INPUT_WAIT, |t| t.contains("wv title tap2"));
