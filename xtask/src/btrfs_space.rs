@@ -3,20 +3,18 @@
 //! statfs counts data space only. 2026-11-16: the build pool showed 6-7 GB free while metadata was full and unallocated was 0, so every build failed (ENOSPC, then read-only).
 //! Headroom = metadata free inside its allocated chunks + unallocated raw bytes at the metadata profile's ratio (a new metadata chunk is cut from unallocated space: DUP takes 2 raw bytes per logical byte).
 //! Data chunks are cut from the same unallocated space, so the headroom is an upper bound.
-//! Source, read unprivileged (live 2026-11-16): `/sys/fs/btrfs/<uuid>/allocation/<type>/{total_bytes,bytes_used,bytes_reserved,bytes_pinned,bytes_readonly,bytes_may_use,disk_total}`; device bytes from `<uuid>/devices/<dev>/size` (a link to the block device, 512-byte sectors).
+//! Source, read unprivileged (live 2026-11-16): `/sys/fs/btrfs/<uuid>/allocation/<type>/{total_bytes,bytes_used,bytes_reserved,bytes_pinned,bytes_readonly,bytes_may_use,disk_total}`; the filesystem's size from statfs `f_blocks` x `f_bsize`, not the block devices' sizes (a vhdx grown without `btrfs filesystem resize` makes them larger).
 //! Mapping: statfs `f_type` says btrfs; `/proc/self/mountinfo` names the mount's device; the `devices/<dev>` entry names the filesystem.
 //! Not btrfs: no headroom, the statfs floors stay the only check.
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 
 /// statfs `f_type` of a btrfs filesystem (linux/magic.h).
 const BTRFS_SUPER_MAGIC: u64 = 0x9123_683E;
 const SYSFS_BTRFS: &str = "/sys/fs/btrfs";
 const MOUNTINFO: &str = "/proc/self/mountinfo";
-/// Unit of a block device's `size` file in sysfs.
-const SECTOR_BYTES: u64 = 512;
 
 /// One allocation type's counters, bytes: `total` is logical space in its block groups, `disk_total` the raw bytes they take.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,7 +46,7 @@ impl Space {
 pub struct Headroom {
     /// Logical metadata bytes free inside the allocated metadata chunks.
     pub free_in_chunks: u64,
-    /// Raw device bytes in no chunk, all profiles.
+    /// Raw bytes of the filesystem in no chunk, all profiles.
     pub unallocated: u64,
     /// Logical metadata bytes `unallocated` becomes at the metadata profile's ratio (DUP: half).
     pub from_unallocated: u64,
@@ -64,7 +62,7 @@ impl Headroom {
 }
 
 /// Headroom of the btrfs that holds `path` (its nearest existing ancestor is measured). `None`: not btrfs.
-/// Err: btrfs whose counters cannot be read or mapped; a floor must not pass on that.
+/// Err: btrfs whose counters cannot be read or mapped, or whose data is replicated; a floor must not pass on that.
 pub fn probe(path: &Path) -> Result<Option<Headroom>> {
     let existing = path
         .ancestors()
@@ -86,7 +84,11 @@ pub fn probe(path: &Path) -> Result<Option<Headroom>> {
         .file_name()
         .and_then(|n| n.to_str())
         .with_context(|| format!("device {} has no name", device.display()))?;
-    headroom_of(&fs_dir_of(Path::new(SYSFS_BTRFS), name)?).map(Some)
+    // the filesystem's own size: statfs counts `f_blocks` blocks of `f_bsize` bytes
+    let block =
+        u64::try_from(stat.f_bsize).with_context(|| format!("statfs f_bsize {}", stat.f_bsize))?;
+    let fs_bytes = stat.f_blocks.saturating_mul(block);
+    headroom_of(&fs_dir_of(Path::new(SYSFS_BTRFS), name)?, fs_bytes).map(Some)
 }
 
 /// The source device of the mount that holds `path` (the longest mount point that prefixes it); that mount must be btrfs.
@@ -146,17 +148,23 @@ fn fs_dir_of(root: &Path, device: &str) -> Result<PathBuf> {
     )
 }
 
-/// Headroom of the filesystem at `fs_dir` (its `<uuid>` dir in sysfs).
-fn headroom_of(fs_dir: &Path) -> Result<Headroom> {
+/// Headroom of the filesystem at `fs_dir` (its `<uuid>` dir in sysfs), whose size is `fs_bytes` (statfs).
+fn headroom_of(fs_dir: &Path, fs_bytes: u64) -> Result<Headroom> {
     let data = space_of(fs_dir, "data")?;
+    // statfs reports logical bytes: the raw size only with one copy per byte. Replicated data is refused, not converted.
+    ensure!(
+        data.disk_total == data.total,
+        "data is replicated ({} raw bytes for {} logical): statfs does not give the raw size",
+        data.disk_total,
+        data.total
+    );
     let meta = space_of(fs_dir, "metadata")?;
     let system = space_of(fs_dir, "system")?;
-    let raw = device_bytes(fs_dir)?;
     let allocated = data
         .disk_total
         .saturating_add(meta.disk_total)
         .saturating_add(system.disk_total);
-    headroom(&meta, raw.saturating_sub(allocated))
+    headroom(&meta, fs_bytes.saturating_sub(allocated))
 }
 
 /// Metadata headroom from its counters and the unallocated raw bytes. The ratio is `total / disk_total`, so no profile name is read.
@@ -191,22 +199,6 @@ fn space_of(fs_dir: &Path, kind: &str) -> Result<Space> {
     })
 }
 
-/// Raw bytes of all the filesystem's devices: each `devices/<dev>` links to its block device, whose `size` counts 512-byte sectors.
-fn device_bytes(fs_dir: &Path) -> Result<u64> {
-    let dir = fs_dir.join("devices");
-    let mut total = 0u64;
-    let mut count = 0usize;
-    for entry in std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
-        let sectors = counter(&entry?.path(), "size")?;
-        total = total.saturating_add(sectors.saturating_mul(SECTOR_BYTES));
-        count += 1;
-    }
-    if count == 0 {
-        bail!("{} lists no device", dir.display());
-    }
-    Ok(total)
-}
-
 /// One sysfs counter: a decimal number and a newline.
 fn counter(dir: &Path, name: &str) -> Result<u64> {
     let path = dir.join(name);
@@ -223,6 +215,8 @@ mod tests {
 
     const MIB: u64 = 1 << 20;
     const GIB: u64 = 1 << 30;
+    /// The fixtures write a block device's `size` file in sysfs; the headroom must not read it.
+    const SECTOR_BYTES: u64 = 512;
     const NAMES: [&str; 7] = [
         "total_bytes",
         "bytes_used",
@@ -245,7 +239,7 @@ mod tests {
         std::fs::write(dir.join(file), format!("{value}\n")).expect("counter file");
     }
 
-    /// A sysfs-shaped tree: `uuid-1/allocation/<kind>/` from `types` (values in `NAMES` order), and device `sde` of `dev_bytes`.
+    /// A sysfs-shaped tree: `uuid-1/allocation/<kind>/` from `types` (values in `NAMES` order), and device `sde` of `dev_bytes` (a size the headroom ignores: statfs gives it).
     fn fs_tree(root: &Path, dev_bytes: u64, types: &[(&str, [u64; 7])]) -> PathBuf {
         let fs = root.join("uuid-1");
         for (kind, values) in types {
@@ -278,7 +272,7 @@ mod tests {
     #[test]
     fn headroom_adds_unallocated_at_the_profile_ratio() {
         let root = scratch("dup");
-        let h = headroom_of(&dup_tree(&root, 8 * GIB)).expect("headroom");
+        let h = headroom_of(&dup_tree(&root, 8 * GIB), 8 * GIB).expect("headroom");
         assert_eq!(h.unallocated, 2 * GIB - 16 * MIB);
         assert_eq!(h.from_unallocated, GIB - 8 * MIB);
         assert_eq!(h.free_in_chunks, 24 * MIB);
@@ -290,7 +284,8 @@ mod tests {
     #[test]
     fn no_unallocated_leaves_only_the_chunk_free() {
         let root = scratch("full");
-        let h = headroom_of(&dup_tree(&root, 6 * GIB + 16 * MIB)).expect("headroom");
+        let h = headroom_of(&dup_tree(&root, 6 * GIB + 16 * MIB), 6 * GIB + 16 * MIB)
+            .expect("headroom");
         assert_eq!((h.unallocated, h.from_unallocated), (0, 0));
         assert_eq!(h.bytes(), 24 * MIB);
     }
@@ -308,7 +303,7 @@ mod tests {
                 ("system", [8 * MIB, 0, 0, 0, 0, 0, 8 * MIB]),
             ],
         );
-        let h = headroom_of(&fs).expect("headroom");
+        let h = headroom_of(&fs, 8 * GIB).expect("headroom");
         assert_eq!(h.from_unallocated, 3 * GIB - 8 * MIB);
         assert_eq!(h.free_in_chunks, GIB);
         assert_eq!(h.profile, 1.0);
@@ -320,7 +315,7 @@ mod tests {
         let fs = dup_tree(&root, 8 * GIB);
         std::fs::remove_file(fs.join("allocation").join("metadata").join("bytes_may_use"))
             .expect("remove counter");
-        let e = format!("{:#}", headroom_of(&fs).unwrap_err());
+        let e = format!("{:#}", headroom_of(&fs, 8 * GIB).unwrap_err());
         assert!(e.contains("bytes_may_use"), "{e}");
     }
 
@@ -332,24 +327,33 @@ mod tests {
             8 * GIB,
             &[("metadata", [0; 7]), ("data", [0; 7]), ("system", [0; 7])],
         );
-        assert!(headroom_of(&fs).is_err());
+        assert!(headroom_of(&fs, 8 * GIB).is_err());
     }
 
-    /// Independent: 1024 + 2048 sectors of 512 bytes.
+    /// Block device 10 GiB, filesystem 8 GiB (a vhdx grown without `btrfs filesystem resize`): unallocated must follow the filesystem.
+    /// Independent: 8 GiB - (2 GiB + 4 GiB + 16 MiB) = 2 GiB - 16 MiB.
     #[test]
-    fn device_bytes_sum_the_linked_block_sizes() {
-        let root = scratch("devices");
-        let devs = root.join("uuid-1").join("devices");
-        std::fs::create_dir_all(&devs).expect("devices dir");
-        for (name, sectors) in [("sda", 1024u64), ("sdb", 2048)] {
-            let block = root.join("block").join(name);
-            put(&block, "size", sectors);
-            std::os::unix::fs::symlink(&block, devs.join(name)).expect("device link");
-        }
-        assert_eq!(
-            device_bytes(&root.join("uuid-1")).expect("bytes"),
-            (1024 + 2048) * 512
+    fn a_block_device_larger_than_the_fs_is_not_counted() {
+        let root = scratch("grown");
+        let h = headroom_of(&dup_tree(&root, 10 * GIB), 8 * GIB).expect("headroom");
+        assert_eq!(h.unallocated, 2 * GIB - 16 * MIB);
+    }
+
+    /// Replicated data (two raw bytes per logical byte here) is refused: statfs would report logical bytes, not the raw size.
+    #[test]
+    fn replicated_data_is_refused() {
+        let root = scratch("replicated");
+        let fs = fs_tree(
+            &root,
+            8 * GIB,
+            &[
+                ("metadata", [GIB, 0, 0, 0, 0, 0, GIB]),
+                ("data", [4 * GIB, 0, 0, 0, 0, 0, 8 * GIB]),
+                ("system", [8 * MIB, 0, 0, 0, 0, 0, 8 * MIB]),
+            ],
         );
+        let e = format!("{:#}", headroom_of(&fs, 8 * GIB).unwrap_err());
+        assert!(e.contains("replicated"), "{e}");
     }
 
     #[test]
