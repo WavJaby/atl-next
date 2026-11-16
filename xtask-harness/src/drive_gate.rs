@@ -38,50 +38,119 @@ pub struct Args {
     break_colour: bool,
 }
 
-pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let rt = Runtime::new(
-        root,
-        "drive",
-        &args.host,
-        args.out.as_deref(),
-        args.java_out.as_deref(),
-        run_apk::STAGE,
-        false,
-    )?;
-    let work = rt.out.join("drive-gate");
-    if work.exists() {
-        std::fs::remove_dir_all(&work)?;
+/// The gate's work dir (emptied) and a runner of one drive script on one apk.
+struct Gate<'a> {
+    root: &'a Path,
+    rt: Runtime,
+    work: PathBuf,
+    host: &'a str,
+    out: Option<PathBuf>,
+    java_out: Option<PathBuf>,
+    break_blank: bool,
+}
+
+impl<'a> Gate<'a> {
+    fn new(
+        root: &'a Path,
+        host: &'a str,
+        out: Option<PathBuf>,
+        java_out: Option<PathBuf>,
+        break_blank: bool,
+    ) -> Result<Self> {
+        let rt = Runtime::new(
+            root,
+            "drive",
+            host,
+            out.as_deref(),
+            java_out.as_deref(),
+            run_apk::STAGE,
+            false,
+        )?;
+        let work = rt.out.join("drive-gate");
+        if work.exists() {
+            std::fs::remove_dir_all(&work)?;
+        }
+        std::fs::create_dir_all(&work)?;
+        Ok(Gate {
+            root,
+            rt,
+            work,
+            host,
+            out,
+            java_out,
+            break_blank,
+        })
     }
-    std::fs::create_dir_all(&work)?;
-    let quadrants = rt.apk.build(
-        &root.join(window::FIXTURE),
-        &work.join("apk-window"),
-        &[],
-        None,
-        None,
-    )?;
-    let widgets = rt.apk.build(
-        &root.join(window::WIDGETS_FIXTURE),
-        &work.join("apk-widgets"),
-        &[],
-        None,
-        None,
-    )?;
-    let drive = |apk: &Path, name: &str, script: String| -> Result<ExitCode> {
-        let file = work.join(name);
+
+    fn apk(&self, fixture: &str, dir: &str) -> Result<PathBuf> {
+        self.rt.apk.build(
+            &self.root.join(fixture),
+            &self.work.join(dir),
+            &[],
+            None,
+            None,
+        )
+    }
+
+    fn drive(&self, apk: &Path, name: &str, script: String) -> Result<ExitCode> {
+        let file = self.work.join(name);
         std::fs::write(&file, script)?;
         run_apk::run(
-            root,
+            self.root,
             &run_apk::Args::driven(
                 apk,
-                &args.host,
-                args.out.clone(),
-                args.java_out.clone(),
+                self.host,
+                self.out.clone(),
+                self.java_out.clone(),
                 file,
-                args.break_blank,
+                self.break_blank,
             ),
         )
-    };
+    }
+}
+
+/// `cargo xtask check`'s form (check step drive-tap): one widgets run, first shot non-uniform (drive's own blank check) + one tap that changes pixels.
+/// Catches a covered / unmapped window (blank first shot) and lost input (no change); the quadrants and the still-picture shots stay in `xtask test drive`.
+pub fn quick(root: &Path, host: &str, out: &Path) -> Result<()> {
+    let gate = Gate::new(root, host, Some(out.to_owned()), None, false)?;
+    let widgets = gate.apk(window::WIDGETS_FIXTURE, "apk-widgets")?;
+    let (first, before, after) = (
+        gate.work.join("first.png"),
+        gate.work.join("before.png"),
+        gate.work.join("after.png"),
+    );
+    let (x, y) = BUTTON;
+    // the first shot is the blank check at first present; the tap and its comparison wait SETTLE_MS each side, as `run`'s tap stage:
+    // 300 ms after the very first present failed 3/6 under load (dfs-loopL: tap delivered, a frame came, no pixel changed)
+    let code = gate.drive(
+        &widgets,
+        "tap.drive",
+        format!(
+            "shot {}\nwait {SETTLE_MS}\nshot {}\ntap {x} {y}\nwait-frames 1\nwait {SETTLE_MS}\nshot {}\n",
+            first.display(),
+            before.display(),
+            after.display()
+        ),
+    )?;
+    ensure!(code == ExitCode::SUCCESS, "the tap drive failed");
+    let changed = changed_pixels(&Image::read_png(&before)?, &Image::read_png(&after)?);
+    ensure!(changed > 0, "the tap changed no pixel");
+    println!("drive-tap: the tap changed {changed} pixels");
+    Ok(())
+}
+
+pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
+    let gate = Gate::new(
+        root,
+        &args.host,
+        args.out.clone(),
+        args.java_out.clone(),
+        args.break_blank,
+    )?;
+    let work = gate.work.clone();
+    let quadrants = gate.apk(window::FIXTURE, "apk-window")?;
+    let widgets = gate.apk(window::WIDGETS_FIXTURE, "apk-widgets")?;
+    let drive = |apk: &Path, name: &str, script: String| gate.drive(apk, name, script);
     let (open, resized) = (work.join("open.png"), work.join("resized.png"));
     let (w, h) = RESIZED;
     let code = drive(

@@ -8,7 +8,7 @@
 //! * `xdg_toplevel.set_title(title)` of the window's toplevel (request opcode 2) -> [`Event::Title`], its `set_app_id(app_id)` (opcode 3) -> [`Event::AppId`], its `set_minimized` (opcode 13) -> [`Event::Minimized`];
 //! * the window's first `wl_surface.commit` (xdg-shell's initial one, no buffer) -> [`Event::FirstCommit`].
 //!
-//! Injections go to the connection that bound `xdg_wm_base` (the window's); an app's other connections forward only.
+//! Injections go to the window's connection: the first to create an `xdg_toplevel` owns them; every other connection forwards only.
 //! [`Proxy::inject_ping`] writes a synthetic `xdg_wm_base.ping(serial)` to the client between two forwarded messages, which is what a compositor's ping is on the wire. A client whose main loop is blocked reads nothing, so no `pong` comes back; a client iterating answers at once.
 //! [`Proxy::inject_pointer`] writes `wl_pointer` events (enter, leave, motion, button, wheel and finger scrolls, each then `frame`; scrolls honour the bound `wl_seat` version) on the pointer `wl_seat.get_pointer` created, at the surface of the first `xdg_surface` (the window); the client sees them as the compositor's pointer input.
 //! [`Proxy::inject_touch`] writes `wl_touch` events on a touch that is the proxy's alone: the gates' compositor has no touch device and wlroots has no virtual-touch protocol, so the proxy adds TOUCH to `wl_seat.capabilities`, turns the client's `get_touch` into a `wl_display.sync` (which takes the new id in order), drops that callback's `done` and `delete_id`, and absorbs the client's requests on the touch.
@@ -436,9 +436,11 @@ impl Proxy {
             Arc::clone(&injections),
             Arc::clone(&wakes),
         );
+        // the connection that owns the window (server_to_client): set once, never handed over
+        let window: Shared<Option<usize>> = Arc::default();
         thread::spawn(move || {
             for client in listener.incoming().flatten() {
-                match serve(client, &up, &tx, &inj, &wk) {
+                match serve(client, &up, &tx, &inj, &wk, &window) {
                     Ok(()) => {}
                     Err(e) => eprintln!("wayland proxy: connection setup failed: {e:#}"),
                 }
@@ -531,6 +533,7 @@ fn serve(
     events: &Sender<(Instant, Event)>,
     injections: &Shared<Vec<Injection>>,
     wakes: &Shared<Vec<OwnedFd>>,
+    window: &Shared<Option<usize>>,
 ) -> Result<()> {
     let server = UnixStream::connect(upstream)
         .with_context(|| format!("connecting to {}", upstream.display()))?;
@@ -548,9 +551,18 @@ fn serve(
         let _ = server_w.shutdown(std::net::Shutdown::Both);
         let _ = events_c.send((Instant::now(), Event::Closed));
     });
-    let (events_s, injections) = (events.clone(), Arc::clone(injections));
+    let (events_s, injections, window) =
+        (events.clone(), Arc::clone(injections), Arc::clone(window));
     thread::spawn(move || {
-        let _ = server_to_client(&server, &client, &wake, &ids, &events_s, &injections);
+        let _ = server_to_client(
+            &server,
+            &client,
+            &wake,
+            &ids,
+            &events_s,
+            &injections,
+            &window,
+        );
         let _ = client.shutdown(std::net::Shutdown::Both);
     });
     Ok(())
@@ -618,6 +630,7 @@ fn server_to_client(
     ids: &Shared<Ids>,
     events: &Sender<(Instant, Event)>,
     injections: &Shared<Vec<Injection>>,
+    window: &Shared<Option<usize>>,
 ) -> Result<()> {
     let mut pending: Vec<u8> = Vec::new();
     let mut fds: Vec<OwnedFd> = Vec::new();
@@ -692,12 +705,22 @@ fn server_to_client(
             let mut counter = [0u8; 8];
             let _ = read(wake, &mut counter);
         }
-        // only a connection with windows takes injections: an app may hold others (atl-platform-ui-linux's own wl_output connection, outputs.rs), and one of those taking the queue would drop it
-        if ids
+        // only the window's connection takes injections: the first one to create an xdg_toplevel claims them for its lifetime.
+        // Every connection is woken per injection, so "has bound xdg_wm_base" raced: a windowless one (another process, or one that binds wm_base and never maps) took the queue and dropped the configure / tap -- drive gate's "no configure ack" and "no frame" (tap lost -> app idle).
+        let has_window = ids
             .lock()
             .map_err(|_| anyhow::anyhow!("ids poisoned"))?
-            .id_of(WM_BASE)
-            .is_none()
+            .toplevel
+            .is_some();
+        if !has_window {
+            continue;
+        }
+        let me = Arc::as_ptr(ids) as usize;
+        if *window
+            .lock()
+            .map_err(|_| anyhow::anyhow!("window owner poisoned"))?
+            .get_or_insert(me)
+            != me
         {
             continue;
         }

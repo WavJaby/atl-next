@@ -122,6 +122,7 @@ enum Command {
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum CheckStep {
     GlProxies,
+    DriveTap,
 }
 
 #[derive(Subcommand)]
@@ -429,6 +430,12 @@ fn check_step(root: &std::path::Path, step: CheckStep, out: &std::path::Path) ->
             let arches = arches::load(root)?;
             let (arch, _) = arches::build_machine(root, &arches)?;
             gl_proxies::check(root, out, arch)?
+        }
+        CheckStep::DriveTap => {
+            let arches = arches::load(root)?;
+            let (arch, _) = arches::build_machine(root, &arches)?;
+            drive_gate::quick(root, arch, out)?;
+            None
         }
     };
     if let Some(why) = skipped {
