@@ -30,6 +30,7 @@ pub const BUILD_PROP: &str = "gen/build.prop";
 const ICU_DATA: &str = "external/icu/icu4c/source/stubdata";
 
 /// The staged ART and the tools around it.
+#[derive(Clone)]
 pub struct HostArt {
     pub art: PathBuf,
     /// The staged ART's library dir, every run's LD_LIBRARY_PATH (stage_art).

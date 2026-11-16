@@ -204,6 +204,7 @@ shift
 exec "$@""#;
 
 /// The sensors gate's fake kernel views (see [`Runtime::with_fake_devices`]).
+#[derive(Clone)]
 struct FakeDevices {
     sys_bus: PathBuf,
     udev_data: PathBuf,
@@ -211,7 +212,8 @@ struct FakeDevices {
     nodes: Vec<(String, PathBuf)>,
 }
 
-/// The staged runtime and the tools around it.
+/// The staged runtime and the tools around it. Clone: a run's wiring goes on a copy ([`crate::run_apk::run_on`]).
+#[derive(Clone)]
 pub struct Runtime {
     pub art: HostArt,
     /// The native build directory: the gates keep their work below it.
@@ -543,6 +545,7 @@ fn sdk_level(build_prop: &Path) -> Result<String> {
 }
 
 /// What building an APK needs, and nothing of the runtime: aapt2 and d8 of the Java pipeline, the prebuilt JDK, the SDK's android.jar of the platform's API level. The static fixture gates use it without a staged ART.
+#[derive(Clone)]
 pub struct ApkTools {
     pub aapt2: PathBuf,
     pub android_jar: PathBuf,
@@ -580,6 +583,7 @@ impl ApkTools {
 
 /// AOSP's apksigner (gate_goals.rs APK_SIGNER: tools/apksig's `apksigner` module as the converter builds it, its static libs included) and a debug key, as an app build signs its debug APK: the
 /// device's install path verifies every APK (ParsingPackageUtils.getSigningDetails -> ApkSignatureVerifier.verify) and refuses an unsigned one, so every fixture is signed (apksigner's default schemes).
+#[derive(Clone)]
 pub struct Signer {
     jar: PathBuf,
     keystore: PathBuf,

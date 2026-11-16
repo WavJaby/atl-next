@@ -6,11 +6,12 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
+use atl_services_types::native_libs::SupportedAbi;
 
-use crate::atld_run::Runtime;
+use crate::atld_run::{PackageFile, Runtime};
 use crate::screencopy::Image;
-use crate::{run_apk, window};
+use crate::{drive, run_apk, window};
 
 /// `resize` target of the quadrant stage: even sides, so the halves are exact.
 const RESIZED: (u32, u32) = (640, 400);
@@ -38,10 +39,12 @@ pub struct Args {
     break_colour: bool,
 }
 
-/// The gate's work dir (emptied) and a runner of one drive script on one apk.
+/// The gate's work dir (emptied) and its one runtime: `new` stages it for the APK tools, `stage` configures it once, and every drive of the gate call runs on it.
 struct Gate<'a> {
     root: &'a Path,
     rt: Runtime,
+    /// The foreign ABI the staged APKs share (`run_apk::shared_foreign`); None for host-ISA APKs.
+    foreign: Option<SupportedAbi>,
     work: PathBuf,
     host: &'a str,
     out: Option<PathBuf>,
@@ -57,9 +60,10 @@ impl<'a> Gate<'a> {
         java_out: Option<PathBuf>,
         break_blank: bool,
     ) -> Result<Self> {
+        // staged as run-apk: the drives are run-apk runs, and their remote record (Runtime::record_inputs) is run-apk's
         let rt = Runtime::new(
             root,
-            "drive",
+            "run-apk",
             host,
             out.as_deref(),
             java_out.as_deref(),
@@ -74,6 +78,7 @@ impl<'a> Gate<'a> {
         Ok(Gate {
             root,
             rt,
+            foreign: None,
             work,
             host,
             out,
@@ -92,19 +97,36 @@ impl<'a> Gate<'a> {
         )
     }
 
+    /// Configures the runtime once, for the APKs the gate's drives run (`run_apk::configure`).
+    fn stage(self, apks: &[&Path]) -> Result<Self> {
+        let first = apks.first().context("the gate stages no APK")?;
+        let foreign = run_apk::shared_foreign(&self.rt, self.host, apks)?;
+        let args = self.args(first);
+        let rt = run_apk::configure(self.root, &args, self.rt, foreign.as_ref())?;
+        Ok(Gate { rt, foreign, ..self })
+    }
+
+    fn args(&self, apk: &Path) -> run_apk::Args {
+        run_apk::Args::driven(
+            apk,
+            self.host,
+            self.out.clone(),
+            self.java_out.clone(),
+            self.break_blank,
+        )
+    }
+
     fn drive(&self, apk: &Path, name: &str, script: String) -> Result<ExitCode> {
         let file = self.work.join(name);
-        std::fs::write(&file, script)?;
-        run_apk::run(
-            self.root,
-            &run_apk::Args::driven(
-                apk,
-                self.host,
-                self.out.clone(),
-                self.java_out.clone(),
-                file,
-                self.break_blank,
-            ),
+        std::fs::write(&file, &script)?;
+        let steps = drive::parse(&script).with_context(|| file.display().to_string())?;
+        run_apk::run_on(
+            &self.rt,
+            &self.args(apk),
+            self.foreign.as_ref(),
+            None,
+            vec![PackageFile { path: apk.to_path_buf() }],
+            Some(steps),
         )
     }
 }
@@ -114,6 +136,7 @@ impl<'a> Gate<'a> {
 pub fn quick(root: &Path, host: &str, out: &Path) -> Result<()> {
     let gate = Gate::new(root, host, Some(out.to_owned()), None, false)?;
     let widgets = gate.apk(window::WIDGETS_FIXTURE, "apk-widgets")?;
+    let gate = gate.stage(&[&widgets])?;
     let (first, before, after) = (
         gate.work.join("first.png"),
         gate.work.join("before.png"),
@@ -150,6 +173,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let work = gate.work.clone();
     let quadrants = gate.apk(window::FIXTURE, "apk-window")?;
     let widgets = gate.apk(window::WIDGETS_FIXTURE, "apk-widgets")?;
+    let gate = gate.stage(&[&quadrants, &widgets])?;
     let drive = |apk: &Path, name: &str, script: String| gate.drive(apk, name, script);
     let (open, resized) = (work.join("open.png"), work.join("resized.png"));
     let (w, h) = RESIZED;

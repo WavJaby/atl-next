@@ -22,6 +22,7 @@ pub const MONO: (&str, &str, &str) = (
 const FONT_DATA: &str = "frameworks/base/data/fonts";
 
 /// A staged set: the conf for FONTCONFIG_FILE and the font files it lists.
+#[derive(Clone)]
 pub struct TestFonts {
     pub conf: PathBuf,
     pub files: Vec<PathBuf>,

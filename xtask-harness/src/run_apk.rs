@@ -132,13 +132,12 @@ pub struct RemoteArgs {
 }
 
 impl Args {
-    /// A `--drive` run of the APK file `apk`, for `xtask test drive`.
+    /// A `--drive` run of the APK file `apk`, for `xtask test drive`: its steps go to [`run_on`], not through `drive`.
     pub(crate) fn driven(
         apk: &Path,
         host: &str,
         out: Option<PathBuf>,
         java_out: Option<PathBuf>,
-        script: PathBuf,
         break_blank_capture: bool,
     ) -> Self {
         Self {
@@ -153,7 +152,7 @@ impl Args {
             break_isa: false,
             break_render_path: false,
             pointer: None,
-            drive: Some(script),
+            drive: None,
             break_blank_capture,
             tilt_keys: false,
             mouse_touch: false,
@@ -174,6 +173,18 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         None => None,
     };
     let (rt, foreign) = runtime(root, args, &files)?;
+    run_on(&rt, args, foreign.as_ref(), pin.as_ref(), files, steps)
+}
+
+/// One run of `args` on the staged runtime `rt` ([`configure`]d for `foreign`) of the package `files` (`pin`: its row). A drive gate's runs all share `rt`: each run's wiring goes on a copy, so none carries over to the next.
+pub(crate) fn run_on(
+    rt: &Runtime,
+    args: &Args,
+    foreign: Option<&SupportedAbi>,
+    pin: Option<&test_apks::Row>,
+    files: Vec<PackageFile>,
+    steps: Option<Vec<drive::Step>>,
+) -> Result<ExitCode> {
     let work = rt.out.join("run-apk");
     std::fs::create_dir_all(&work)?;
     // without --hold nobody watches the window: it maps in the gate's own compositor, which outlives atld (declared before it)
@@ -187,17 +198,19 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         (Some(n), Some(_)) => Some(window::start_proxy(&n.socket)?),
         _ => None,
     };
-    // the display at the rate of the compositor the window maps on
+    // the display at the rate of the compositor the window maps on; on a copy, so the shared runtime keeps no run's wiring
     let rt = match (&nested, &proxy) {
         (Some(n), Some(p)) => rt
+            .clone()
             .with_wayland(&p.listen)
             .with_display(n.display().to_arg()),
         (Some(n), None) => rt
+            .clone()
             .with_wayland(&n.socket)
             .with_display(n.display().to_arg()),
-        (None, _) => rt.with_display(run_display().to_arg()),
+        (None, _) => rt.clone().with_display(run_display().to_arg()),
     };
-    let m = package(&rt, &files, pin.as_ref(), &args.target)?;
+    let m = package(&rt, &files, pin, &args.target)?;
     let run = run_of(&work, files, &m, &args.log_tags);
     let app_log = run.log(&m.name);
     let services_log = run.log("services");
@@ -263,14 +276,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         atld_exited: ended.is_some(),
         end_ms: window::now_ms(),
     };
-    let scripted = args.pointer.is_some() || args.drive.is_some();
-    let outcome = check_delivery(foreign.as_ref(), &m.name, &app)
+    let scripted = args.pointer.is_some() || steps.is_some();
+    let outcome = check_delivery(foreign, &m.name, &app)
         .and_then(|()| judge_ending(&services, &app, &ending, watch_ms, scripted))
         .and_then(|ok| {
             render_path_check(&read(&run.atld_log()), &app).map(|p| format!("{ok}; {p}"))
         });
     // the drive's failure first: it says what the script could not do, the verdict only what the app did
-    let outcome = match (driven, args.drive.is_some()) {
+    let outcome = match (driven, steps.is_some()) {
         (Some(Err(e)), _) => Err(format!("drive: {e:#}")),
         (None, true) => outcome.and(Err("the script never ran".to_owned())),
         _ => outcome,
@@ -503,7 +516,7 @@ fn foreign_abi(
         .filter(|a| a.isa != host))
 }
 
-/// The staged runtime of a run of `args` for the package `files`: the window gate's staging, with the GL driver, the native bridge guest of the host and, for a foreign-ISA app ([`foreign_isa`]), that ISA's guest and QEMU engine, and the GTK UI. Its display is set by the caller.
+/// The staged runtime of a run of `args` for the package `files`, [`configure`]d for the package's foreign ABI, which is returned for the delivery check.
 fn runtime(
     root: &Path,
     args: &Args,
@@ -517,13 +530,26 @@ fn runtime(
         args.java_out.as_deref(),
         STAGE,
         args.verbose,
-    )?
-    .with_gralloc(root)?
-    .with_gl_driver(root)?
-    .with_native_bridge_guest(&args.host)?
-    .with_ui("gtk");
+    )?;
     let foreign = foreign_abi(rt.abis(), &args.host, files)?;
-    let rt = match &foreign {
+    let rt = configure(root, args, rt, foreign.as_ref())?;
+    Ok((rt, foreign))
+}
+
+/// The run-apk configuration of the staged runtime `rt` for `args` and the APKs' foreign ABI `foreign`: the window gate's staging with the GL driver, the native bridge guest of the host and the GTK UI; for a foreign ISA, that ISA's guest and QEMU engine; then `args`' toggles.
+/// The builders accumulate (`with_native_bridge_guest` extends its list): configure a staged runtime once.
+pub(crate) fn configure(
+    root: &Path,
+    args: &Args,
+    rt: Runtime,
+    foreign: Option<&SupportedAbi>,
+) -> Result<Runtime> {
+    let rt = rt
+        .with_gralloc(root)?
+        .with_gl_driver(root)?
+        .with_native_bridge_guest(&args.host)?
+        .with_ui("gtk");
+    let rt = match foreign {
         Some(a) => {
             crate::build_state::foreign_out(root, &rt.out, &args.host, &a.isa, "run-apk")?;
             rt.with_native_bridge_guest(&a.isa)?
@@ -560,7 +586,29 @@ fn runtime(
     } else {
         rt
     };
-    Ok((rt.with_app_env(&args.app_env), foreign))
+    Ok(rt.with_app_env(&args.app_env))
+}
+
+/// The foreign ABI the APKs `apks` share ([`foreign_abi`] of each): one configured runtime serves them all, so they must agree.
+pub(crate) fn shared_foreign(
+    rt: &Runtime,
+    host: &str,
+    apks: &[&Path],
+) -> Result<Option<SupportedAbi>> {
+    let per_apk = apks
+        .iter()
+        .map(|apk| foreign_abi(rt.abis(), host, &[PackageFile { path: apk.to_path_buf() }]))
+        .collect::<Result<Vec<_>>>()?;
+    if let Some(first) = per_apk.first() {
+        for (apk, found) in apks.iter().zip(&per_apk) {
+            ensure!(
+                found == first,
+                "{}: foreign ABI {found:?} differs from {first:?}: one runtime serves every APK of a gate",
+                apk.display()
+            );
+        }
+    }
+    Ok(per_apk.into_iter().next().flatten())
 }
 
 /// Whether `line` is the bridge's load line (atl-native-bridge loader.rs) for a library of `package` and ABI `a`: extracted, `/data/app/<package>/lib/<isa>/` (PackageManager's

@@ -277,7 +277,7 @@ fn runtime_half(root: &Path, a: &TestArgs, target: &Target, out: &Path) -> Resul
 }
 
 /// Where a runtime's atld runs: this host, or a target that runs it from the bundle. The gate's judge reads the same log lines either way.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub enum Site {
     #[default]
     Host,
@@ -285,6 +285,7 @@ pub enum Site {
 }
 
 /// A remote site: the target, the bundle's directory there, the library search path `test` checked, atld's time limit, and the transcript the transfers append to.
+#[derive(Clone)]
 pub struct RemoteRun {
     host: Host,
     /// Relative to the target's home dir over ssh, absolute for `local:`.
