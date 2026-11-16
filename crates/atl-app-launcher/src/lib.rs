@@ -27,6 +27,8 @@
 
 mod args;
 #[allow(unsafe_code)]
+mod crash;
+#[allow(unsafe_code)]
 mod ffi;
 mod installer;
 mod log;

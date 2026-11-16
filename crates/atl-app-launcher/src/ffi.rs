@@ -1480,13 +1480,16 @@ pub fn install_crash_handler() -> Result<()> {
 
 /// debuggerd's `resend_signal` for a crash: the signal's action back to SIG_DFL, then the same signal with the same siginfo queued to this thread (`rt_tgsigqueueinfo`), so the process dies of it and a parent's `waitpid` sees it.
 /// The queued signal is blocked (the full mask) until the handler returns, and so is the faulting one when ART's handler chains here; on return it is delivered under SIG_DFL.
-/// Not done: the dump. debuggerd forks crash_dump, which writes a tombstone through tombstoned; this host has neither, and ART's handler has already logged the signal, the fault address and its own backtrace.
+/// Before the resend, `crash::report` writes one line (signal, fault address, thread, frames): the line a crash used to leave out when no ART handler ran first.
+/// Not done: the tombstone. debuggerd forks crash_dump and writes through tombstoned; this host has neither.
 /// Async-signal-safe only: libc's sigaction, getpid, gettid (a raw syscall) and syscall. errno is not restored as debuggerd does: no interrupted code runs after the resent signal is delivered.
 extern "C" fn on_crash(sig: c_int, info: *mut signal::siginfo_t, _context: *mut c_void) {
     // set before any handler was installed: always present
     let Some(libc_sigaction) = LIBC_SIGACTION.get() else {
         return;
     };
+    // SAFETY: `info` is the kernel's siginfo for this delivery (SA_SIGINFO), valid for the call
+    unsafe { crate::crash::report(sig, info.cast_const().cast()) };
     let default = signal::sigaction {
         // SIG_DFL is the null handler
         __sigaction_handler: signal::sigaction___sigaction_handler { sa_handler: None },

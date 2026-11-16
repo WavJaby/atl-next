@@ -102,7 +102,16 @@ const IMPORTS: &[Import] = &[
         view: View::Host,
         functions: &[],
         types: &[],
-        macros: &["SYS_rt_tgsigqueueinfo"],
+        // the crash report's raw syscalls (crash.rs), and the resend (ffi `on_crash`)
+        macros: &[
+            "SYS_rt_tgsigqueueinfo",
+            "SYS_read",
+            "SYS_write",
+            "SYS_close",
+            "SYS_openat",
+            "SYS_prctl",
+            "SYS_clock_gettime",
+        ],
         include_dirs: &[],
     },
     // libc's soname: the object libc's own sigaction is looked up in, as libsigchain looks up its linked_sigaction

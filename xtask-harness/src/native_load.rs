@@ -1112,9 +1112,18 @@ fn crash_result(run: &ArtRun) -> Result<String, String> {
         ));
     }
     match run.signal {
-        Some(s) if s == want => Ok(format!(
-            "native SIGABRT -> ART's unexpected-signal handler -> the launcher's crash handler -> died of signal {s}"
-        )),
+        Some(s) if s == want => {
+            // crash.rs: the launcher's handler writes this line before it resends the signal
+            let header = format!("FATAL atl-crash: signal {s} (SIGABRT) ");
+            if !run.stderr.lines().any(|l| l.contains(&header)) {
+                return Err(format!(
+                    "died of SIGABRT with no crash report line (`{header}`) on stderr: the launcher's crash handler resent it unreported"
+                ));
+            }
+            Ok(format!(
+                "native SIGABRT -> ART's unexpected-signal handler -> the launcher's crash handler (report line on stderr) -> died of signal {s}"
+            ))
+        }
         Some(s) => Err(format!(
             "died of signal {s}, not the raised SIGABRT ({want}): ART's unexpected-signal handler chained to no crash handler ({})",
             run.failure()
@@ -1236,7 +1245,14 @@ mod tests {
     #[test]
     fn crash_check() {
         let printed = format!("nlt signal {SIGABRT}\n");
-        assert!(crash_result(&crash_run(&printed, Some(SIGABRT))).is_ok());
+        let mut reported = crash_run(&printed, Some(SIGABRT));
+        reported.stderr = format!(
+            "1794847571.974 FATAL atl-crash: signal {SIGABRT} (SIGABRT) code -6 fault addr 0x0 thread 1 \"main\"\n"
+        );
+        assert!(crash_result(&reported).is_ok());
+        // the same death with no report line: the launcher's handler did not write it
+        let e = crash_result(&crash_run(&printed, Some(SIGABRT))).unwrap_err();
+        assert!(e.contains("no crash report line"), "{e}");
         // no crash handler: ART's unexpected-signal handler jumps to the null old action
         let e = crash_result(&crash_run(&printed, Some(SIGSEGV))).unwrap_err();
         assert!(e.contains("died of signal 11"), "{e}");
