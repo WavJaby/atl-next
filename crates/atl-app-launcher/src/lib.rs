@@ -4,6 +4,7 @@
 //! 0. what bionic sets up on Android before any code runs: the main thread's alternate signal stack (`ffi::install_signal_stack`), and debuggerd_init's crash-signal disposition, so a crash ends the process with its own signal (`ffi::install_crash_handler`; no tombstone).
 //! 1. refuse to start without a property area: bionic's `__system_properties_init` maps `$ATL_PROP_AREA` (atl-android-paths `PROPERTY_AREA_ENV`), else `/dev/__properties__`; without it every property reads unset and the runtime runs on defaults no Android process sees.
 //!    Then (step 1b) the process's view of servicemanager (atl-service-view, feature `converter`): libbinder's default service manager, answering the names this process serves itself (its SurfaceFlinger) and forwarding the rest; it must precede any `defaultServiceManager()`.
+//!    Then (step 1d, app mode, UI mode) the Task's window, opened before ART boots and showing the starting window (`ro.atl.splash`) until the app's first frame (`open_window`); its toolkit is step 5b''.
 //! 2. `JNI_CreateJavaVM` through libnativehelper's JniInvocation, the VM options as dalvikvm takes them (`args`).
 //! 3. our logger via `__android_log_set_logger`, after the VM exists: ART's InitLogging (ART_TARGET_LINUX) installs libbase's StderrLogger through the same call (system/libbase/logging.cpp SetLogger), replacing any earlier one. The logger turns each message into a C6 record (`log`); liblog filters before calling it.
 //!
@@ -117,19 +118,73 @@ impl atl_composer::VmHost for VmServices {
     }
 }
 
-/// Step 5b'. The compositor lives as long as the process (its clock or deliver thread holds it); a start that fails is reported and the app starts without one, and waits at its first libgui call.
-/// `ui`: UI mode's toolkit (step 5b''), whose window the compositor shows.
 #[cfg(feature = "converter")]
-fn start_compositor(vm: &ffi::Vm, ui: Option<atl_platform_ui::PlatformUi>) {
+use atl_composer::OpenWindow;
+
+/// Without the converter's libraries there is no compositor, so no window to open.
+#[cfg(not(feature = "converter"))]
+enum OpenWindow {}
+
+/// Step 5b'. The compositor lives as long as the process (its clock or deliver thread holds it); a start that fails is reported and the app starts without one, and waits at its first libgui call.
+/// `window`: UI mode's window (step 1d), which the compositor shows.
+#[cfg(feature = "converter")]
+fn start_compositor(vm: &ffi::Vm, window: Option<OpenWindow>) {
     use std::io::Write;
-    if let Err(e) = atl_composer::start(std::sync::Arc::new(VmServices(vm.handle())), ui) {
+    if let Err(e) = atl_composer::start(std::sync::Arc::new(VmServices(vm.handle())), window) {
         let _ = writeln!(std::io::stderr(), "atl-app-launcher: no compositor: {e}");
     }
 }
 
-/// Without the converter's libraries there is no binder to serve it with.
 #[cfg(not(feature = "converter"))]
-fn start_compositor(_vm: &ffi::Vm, _ui: Option<atl_platform_ui::PlatformUi>) {}
+fn start_compositor(_vm: &ffi::Vm, _window: Option<OpenWindow>) {}
+
+/// How long step 1d polls the UI thread's Looper for the starting window's first paint before ART boots anyway: the desktop maps and paints a new toplevel within a few frames,
+/// so this bounds only a desktop that never maps it (a hidden workspace), which must not delay the app's start by more than a blink. Not an Android value: AOSP's system_server draws the splash in another process.
+#[cfg(feature = "converter")]
+const SPLASH_PAINT_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Step 1d. UI mode's window before ART boots: the toolkit (step 5b''), the Task's window with the starting window in it (atl-composer `open_window`), and the Looper polled until its first paint,
+/// since GTK runs only inside that poll and Java's MessageQueue polls it only after the VM, the framework and ActivityThread are up. During ART's boot the desktop keeps showing that frame.
+/// A process with no Task, or a window that fails to open, gets none (said on stderr) and runs as headless.
+#[cfg(feature = "converter")]
+fn open_window(rt: &ffi::Runtime, started: std::time::Instant) -> Option<OpenWindow> {
+    use std::io::Write;
+    let opened = std::ffi::CString::new(atl_gralloc::node::RENDER_NODE_PROPERTY)
+        .map_err(anyhow::Error::from)
+        .and_then(|name| start_ui(rt.property(&name)))
+        .and_then(|(ui, looper)| {
+            atl_composer::open_window(ui, started)
+                .map_err(|e| anyhow!(e))
+                .map(|w| w.map(|w| (w, looper)))
+        });
+    let (window, looper) = match opened {
+        Ok(Some(opened)) => opened,
+        Ok(None) => return None,
+        Err(e) => {
+            let _ = writeln!(std::io::stderr(), "atl-app-launcher: no UI mode: {e:#}");
+            return None;
+        }
+    };
+    let deadline = std::time::Instant::now() + SPLASH_PAINT_WAIT;
+    while !window.painted() {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            let _ = writeln!(
+                std::io::stderr(),
+                "splash: not painted within {} ms; ART boots",
+                SPLASH_PAINT_WAIT.as_millis()
+            );
+            break;
+        }
+        looper.poll_once(i32::try_from(left.as_millis()).unwrap_or(i32::MAX));
+    }
+    Some(window)
+}
+
+#[cfg(not(feature = "converter"))]
+fn open_window(_rt: &ffi::Runtime, _started: std::time::Instant) -> Option<OpenWindow> {
+    None
+}
 
 /// Step 1b. The process's view of servicemanager (atl-service-view), before `JNI_CreateJavaVM`: nothing has called libbinder's `defaultServiceManager()` yet (the launcher reaches libbinder only from step 5b on),
 /// and libbinder aborts if the view comes after it. Every process gets it; one that never asks for a service never opens the driver.
@@ -190,7 +245,9 @@ fn serve_media_services(
 /// Step 5b''. UI mode (`ro.atl.ui=gtk`, atld `--ui gtk`): the main thread's Looper is made before Java (its MessageQueue adopts it), then GTK starts on this thread with its GLib main context mirrored
 /// into the Looper (atl-platform-ui-linux `mirror`, over the `looper` seam), so GTK runs while the app's main thread idles in its Looper and a blocked one answers no ping.
 /// `gralloc_node`: the run's node (`ro.atl.gpu.render_node`), whose device number every presented buffer must carry; unset: no gralloc, the window refuses every buffer.
-fn start_ui(gralloc_node: Option<String>) -> Result<atl_platform_ui::PlatformUi> {
+/// Returns the Looper too, which step 1d polls before Java exists.
+#[cfg_attr(not(feature = "converter"), allow(dead_code))]
+fn start_ui(gralloc_node: Option<String>) -> Result<(atl_platform_ui::PlatformUi, ffi::Looper)> {
     let device = gralloc_node
         .map(|n| {
             atl_gralloc::node::device_number(std::path::Path::new(&n))
@@ -198,8 +255,12 @@ fn start_ui(gralloc_node: Option<String>) -> Result<atl_platform_ui::PlatformUi>
         })
         .transpose()?;
     let thread_looper = ffi::LooperApi::load()?.prepare_looper()?;
-    atl_platform_ui::PlatformUi::attach(Box::new(looper::AndroidLooper::new(thread_looper)), device)
-        .map_err(|e| anyhow!("{e}"))
+    let ui = atl_platform_ui::PlatformUi::attach(
+        Box::new(looper::AndroidLooper::new(thread_looper)),
+        device,
+    )
+    .map_err(|e| anyhow!("{e}"))?;
+    Ok((ui, thread_looper))
 }
 
 /// AndroidRuntime::startVm's NativeBridge option from `ro.dalvik.vm.native.bridge` (unset, empty or "0": none), plus `-Xforce-nb-testing`: a non-zygote ART unloads the bridge unless forced
@@ -235,6 +296,7 @@ fn load_runtime() -> Result<ffi::Runtime> {
 }
 
 fn run(argv: Vec<std::ffi::OsString>) -> Result<i32> {
+    let started = std::time::Instant::now();
     let launch = args::parse(argv).map_err(|e| anyhow!(e))?;
     let rt = load_runtime()?;
     install_service_view()?;
@@ -246,6 +308,11 @@ fn run(argv: Vec<std::ffi::OsString>) -> Result<i32> {
         launch.break_mix,
         launch.pipewire_socket.as_deref(),
     )?;
+    let window = if launch.app && rt.property(c"ro.atl.ui").as_deref() == Some("gtk") {
+        open_window(&rt, started)
+    } else {
+        None
+    };
     let mut vm_options = launch.vm_options.clone();
     if launch.app {
         vm_options.extend(native_bridge_options(
@@ -274,19 +341,7 @@ fn run(argv: Vec<std::ffi::OsString>) -> Result<i32> {
         let android = ffi::AndroidRuntime::load()?;
         android.attach(&vm)?;
         android.start_thread_pool();
-        let ui = if rt.property(c"ro.atl.ui").as_deref() == Some("gtk") {
-            std::ffi::CString::new(atl_gralloc::node::RENDER_NODE_PROPERTY)
-                .map_err(anyhow::Error::from)
-                .and_then(|name| start_ui(rt.property(&name)))
-                .inspect_err(|e| {
-                    use std::io::Write;
-                    let _ = writeln!(std::io::stderr(), "atl-app-launcher: no UI mode: {e:#}");
-                })
-                .ok()
-        } else {
-            None
-        };
-        start_compositor(&vm, ui);
+        start_compositor(&vm, window);
         vm.run_zygote_init(launch.target_sdk, class, &launch.args)
     } else {
         vm.run_main(class, &launch.args)

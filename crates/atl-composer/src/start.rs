@@ -4,24 +4,25 @@
 //! is not an ATL app process and gets no compositor.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use atl_services_types::compositor_registry::{
     DESCRIPTOR, DESKTOP_INPUT_PROPERTY, DISPLAY_PROPERTY, DesktopInput, POINTER_PROPERTY, REGISTER,
-    SERVICE, SURFACE_FLINGER, SURFACE_FLINGER_AIDL, TASK_INFO,
+    SERVICE, SPLASH_PROPERTY, SURFACE_FLINGER, SURFACE_FLINGER_AIDL, Splash, TASK_INFO,
 };
 use atl_services_types::display_model::DisplayModel;
 use binder::binder_impl::{Binder, BorrowedParcel, IBinderInternal, TransactionCode};
 use binder::{Interface, SpIBinder, StatusCode, Strong, declare_binder_interface};
 
 use atl_compositor::model::CompositorConfig;
-use atl_platform_ui::{PhysSize, PlatformUi, Ui, WindowAttributes};
+use atl_platform_ui::{PhysSize, PlatformUi, WindowAttributes};
 
 use crate::host::{Composer, ComposerConfig, Presenter, VmHost};
 use crate::input::{self, Message};
 use crate::mailbox::Mailbox;
 use crate::sink::{FirstFrame, ReportSink};
 use crate::task_sender::TaskSender;
+use crate::ui_window::OpenWindow;
 use crate::{service, surface_flinger, ui_agent, ui_window};
 
 /// How long the registry may be missing. atld starts an app process only after the services printed `services: ready`, which follows the registry's addService, so this covers a slow machine, not a race.
@@ -130,10 +131,29 @@ fn register(ui_agent: &SpIBinder, composer: &SpIBinder) -> Result<(), String> {
     Ok(())
 }
 
+/// UI mode's window, opened before ART boots (launcher step 1d): the services' size and package for this process's Task (TASK_INFO, a main-thread transaction: no thread pool is needed for a synchronous call),
+/// the window at that size, so its first bounds report changes nothing, with the app id named before its first commit, showing the starting window from `ro.atl.splash`. `started`: the launcher's start, the origin of the `splash:` lines.
+/// No Task (a provider, service or receiver process): no window -- AOSP shows none, and a second toplevel took the desktop focus from the app's.
+pub fn open_window(ui: PlatformUi, started: Instant) -> Result<Option<OpenWindow>, String> {
+    let Some((size, package)) = task_info()? else {
+        return Ok(None);
+    };
+    let splash = optional_property(SPLASH_PROPERTY)?
+        .map(|arg| Splash::parse_arg(&arg))
+        .transpose()?;
+    // Titled by the package until the first activity's setTaskDescription (onApplyThemeResource, in its create) brings the task label (UI agent TASK_TITLE): resolving that needs the app's Java side.
+    let attributes = WindowAttributes {
+        title: package.clone(),
+        app_id: Some(format!("atl.{package}")),
+        size,
+    };
+    ui_window::open(ui, &attributes, splash, started).map(Some)
+}
+
 /// Starts this process's compositor and registers it. Call it with libbinder's thread pool running (the registry's reply and libgui's calls arrive on its threads) and before anything uses libgui.
-/// The clock thread and the present thread come from `host` in both modes; the UI agent keeps it for the window title's label lookup. Headless (`ui` None): scenes go to a report sink, and a scripted pointer goes in at the first frame. UI mode (`ui`: the toolkit
-/// this UI thread attached): scenes go through a mailbox to a GTK window ([`ui_window`]), which takes the latest on its frame clock. The caller is the UI thread in UI mode. A UI-mode process with no Task (TASK_INFO) opens no window and runs as headless.
-pub fn start(host: Arc<dyn VmHost>, ui: Option<PlatformUi>) -> Result<Arc<Composer>, String> {
+/// The clock thread and the present thread come from `host` in both modes; the UI agent keeps it for the window title's label lookup. Headless (`window` None): scenes go to a report sink, and a scripted pointer goes in at the first frame. UI mode (`window`: the Task's window
+/// [`open_window`] opened on this UI thread): scenes go through a mailbox to it ([`ui_window`]), which takes the latest on its frame clock. The caller is the UI thread in UI mode.
+pub fn start(host: Arc<dyn VmHost>, window: Option<OpenWindow>) -> Result<Arc<Composer>, String> {
     let threads: &dyn VmHost = &*host;
     let display = DisplayModel::parse_arg(&property(DISPLAY_PROPERTY)?)?;
     let script = match optional_property(POINTER_PROPERTY)? {
@@ -166,31 +186,18 @@ pub fn start(host: Arc<dyn VmHost>, ui: Option<PlatformUi>) -> Result<Arc<Compos
     });
     // the in-app input method exists only with a window: its desktop side is the window's TextInput (headless: none, IMMS-lite answers NO_IME)
     let mut input_method = None;
-    // the services' size and package for this process's Task: the window opens at the size, so its first bounds report changes nothing; the app id is named before its first commit.
-    // No Task (a provider, service or receiver process): no window -- AOSP shows none, and a second toplevel took the desktop focus from the app's.
-    let window = match ui {
-        Some(ui) => task_info()?.map(|task| (ui, task)),
-        None => None,
-    };
-    let sender = if let Some((ui, (size, package))) = window {
-        input_method = Some(atl_ime::new_binder(Arc::new(ui.invoker())));
-        // Titled by the package until the first activity's setTaskDescription (onApplyThemeResource, in its create) brings the task label (UI agent TASK_TITLE): resolving that needs the app's Java side.
-        let attributes = WindowAttributes {
-            title: package.clone(),
-            app_id: Some(format!("atl.{package}")),
-            size,
-        };
+    let sender = if let Some(window) = window {
+        input_method = Some(atl_ime::new_binder(Arc::new(window.invoker())));
         let mailbox = Arc::new(Mailbox::default());
         composer
             .start(threads, Presenter::Window(Arc::clone(&mailbox)))
             .map_err(|e| format!("frame clock thread: {e}"))?;
         let sender = TaskSender::spawn(threads).map_err(|e| format!("task sender thread: {e}"))?;
         ui_window::install(
-            ui,
+            window,
             Arc::clone(&composer),
             mailbox,
             input_tx.clone(),
-            attributes,
             Arc::clone(&sender),
         );
         Some(sender)

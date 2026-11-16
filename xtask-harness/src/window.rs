@@ -41,6 +41,7 @@ mod gles1;
 mod gles2;
 mod ime;
 mod move_output;
+mod splash;
 mod surface_view;
 mod suspended;
 mod ui_block;
@@ -146,6 +147,9 @@ pub struct Args {
     /// Stage webview only: the run's library dir lacks the web engine module (a host without WebKit), the fixture's WebView cannot be made, so the readback sub-gate must fail (the gate's deliberate break, environment-side).
     #[arg(long)]
     break_webview_engine: bool,
+    /// Stage splash only: `ro.atl.splash` is left unset, so the launcher shows no starting window and the order sub-gate must fail (the gate's deliberate break, environment-side).
+    #[arg(long)]
+    break_splash: bool,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -199,6 +203,8 @@ enum Stage {
     Title,
     /// UI mode, the gtk fixture: the display capture through the harness route (atld `capture`, atl-screencap) is the quadrants at the opening size, and a caller that is not the shell or system is refused with SECURITY (xtask-harness/src/window/capture.rs).
     Capture,
+    /// UI mode with `ro.atl.splash` set: the window shows the starting window before ART boots, and the app's first present replaces it; time-to-splash and time-to-first-app-frame (xtask-harness/src/window/splash.rs).
+    Splash,
 }
 
 impl Stage {
@@ -228,6 +234,7 @@ impl Stage {
             Stage::AppId => "app-id",
             Stage::Title => "title",
             Stage::Capture => "capture",
+            Stage::Splash => "splash",
         }
     }
 
@@ -244,7 +251,8 @@ impl Stage {
             | Stage::Gles1
             | Stage::Portrait
             | Stage::AppId
-            | Stage::Title => GTK_WINDOW_MS,
+            | Stage::Title
+            | Stage::Splash => GTK_WINDOW_MS,
             Stage::Dialog => DIALOG_WINDOW_MS,
             Stage::Capture => capture::CAPTURE_WINDOW_MS,
             // the webview stage's picture, then four inputs each waiting for the page's answer
@@ -400,6 +408,7 @@ fn marker(stage: Stage) -> &'static str {
         | Stage::Portrait
         | Stage::AppId
         | Stage::Title
+        | Stage::Splash
         | Stage::Hwui
         | Stage::Widgets
         | Stage::Ime
@@ -1867,6 +1876,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         | Stage::Portrait
         | Stage::AppId
         | Stage::Title
+        | Stage::Splash
         | Stage::Hwui
         | Stage::Widgets
         | Stage::Ime
@@ -1926,6 +1936,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             }
         }
         Stage::Resume | Stage::Frames => rt,
+    };
+    let rt = if matches!(args.stage, Stage::Splash) {
+        splash::setup(rt, args.break_splash)?
+    } else {
+        rt
     };
     // the bindings sub-gate reads glibc's records from the app log (test-environment setup: the product reads neither variable)
     let rt = if matches!(args.stage, Stage::Hwui) {
@@ -2127,6 +2142,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             }
             (Stage::AppId, _, _) => drive_app_id(p, &log, &seen),
             (Stage::Title, _, _) => drive_title(p, &log, &titles_seen),
+            (Stage::Splash, _, _) => splash::drive(p, &log),
             (Stage::Suspended, _, _) => suspended::drive(p, &log, break_suspended),
             (Stage::Move, Some(outputs), _) => move_output::drive(p, &log, outputs),
             _ => drive(p, &log),
@@ -2138,9 +2154,22 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let window_ms = args.hold.map_or(args.stage.window_ms(), |s| s * 1_000);
     let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
     let mut ended = None;
+    // the splash stage's picture, taken by this loop while the starting window shows
+    let mut splash_shot = None;
+    let splash_png = work.join("splash.png");
     loop {
+        let app = read(&app_log);
+        if matches!(args.stage, Stage::Splash) {
+            splash::take(
+                &mut splash_shot,
+                &app,
+                &app_log,
+                nested.as_ref(),
+                &splash_png,
+            );
+        }
         // the window runs from the marker's own stamp, not from when this loop saw the marker
-        if marker_stamp(&read(&app_log), marker).is_some_and(|t| now_ms() >= t + window_ms) {
+        if marker_stamp(&app, marker).is_some_and(|t| now_ms() >= t + window_ms) {
             break;
         }
         if let Some(s) = atld_child.try_wait()? {
@@ -2284,6 +2313,17 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             )]
         }
         (Stage::Capture, Some(_)) => capture::checks(&captured, opening_size(display), &liveness),
+        (Stage::Splash, Some(_)) => {
+            let mut sub = splash::checks(&app, splash_shot.take(), opening_size(display));
+            sub.push((
+                "probe",
+                liveness
+                    .as_ref()
+                    .map(|_| "the fixture drew".to_owned())
+                    .map_err(Clone::clone),
+            ));
+            sub
+        }
         (Stage::Hwui, Some(_)) => vec![
             ("mapped", gtk_window_check(&app)),
             ("hardware", hardware_check(&app)),

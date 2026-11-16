@@ -228,13 +228,14 @@ pub struct LooperApi {
     prepare: looper::ALooper_prepare,
     add_fd: looper::ALooper_addFd,
     remove_fd: looper::ALooper_removeFd,
+    poll_once: looper::ALooper_pollOnce,
 }
 
 /// libandroid by soname: found on the library path as libandroid_runtime is.
 const ANDROID: &CStr = c"libandroid.so";
 
 impl LooperApi {
-    /// Loads libandroid (`RTLD_NOW | RTLD_LOCAL`, as `Runtime::load`) and resolves the three functions from its handle; the handle is never closed.
+    /// Loads libandroid (`RTLD_NOW | RTLD_LOCAL`, as `Runtime::load`) and resolves the four functions from its handle; the handle is never closed.
     pub fn load() -> Result<Self> {
         // SAFETY: a NUL-terminated soname and the header's flag values
         let h = unsafe { dlopen(ANDROID.as_ptr(), dlfcn::RTLD_NOW | dlfcn::RTLD_LOCAL) };
@@ -245,6 +246,7 @@ impl LooperApi {
                 prepare: sym(h, c"ALooper_prepare")?,
                 add_fd: sym(h, c"ALooper_addFd")?,
                 remove_fd: sym(h, c"ALooper_removeFd")?,
+                poll_once: sym(h, c"ALooper_pollOnce")?,
             })
         }
     }
@@ -259,6 +261,7 @@ impl LooperApi {
             ptr: ptr.cast(),
             add_fd: self.add_fd,
             remove_fd: self.remove_fd,
+            poll_once: self.poll_once,
         })
     }
 }
@@ -272,6 +275,8 @@ pub struct Looper {
     ptr: *mut c_void,
     add_fd: looper::ALooper_addFd,
     remove_fd: looper::ALooper_removeFd,
+    #[cfg_attr(not(feature = "converter"), allow(dead_code))]
+    poll_once: looper::ALooper_pollOnce,
 }
 
 impl Looper {
@@ -304,6 +309,20 @@ impl Looper {
         let rc = unsafe { (self.remove_fd)(self.ptr.cast(), fd) };
         ensure!(rc == 0 || rc == 1, "ALooper_removeFd({fd}) returned {rc}");
         Ok(())
+    }
+
+    /// `ALooper_pollOnce(timeout_ms)` with no out-parameters: runs the callbacks of the fds ready within the timeout (the GLib mirror's), as Java's MessageQueue does once Java runs. Its result is not needed: the caller checks its own condition.
+    #[cfg_attr(not(feature = "converter"), allow(dead_code))]
+    pub fn poll_once(&self, timeout_ms: c_int) {
+        // SAFETY: this thread's live Looper; null out-parameters are allowed (looper.h)
+        unsafe {
+            (self.poll_once)(
+                timeout_ms,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
     }
 }
 

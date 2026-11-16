@@ -990,6 +990,32 @@ impl Runtime {
         self
     }
 
+    /// Adds `name=value` to the /vendor/build.prop the run places (the GL driver's, so call it after [`Runtime::with_gl_driver`]; else one of its own), so every process's area holds it: a gate's test input
+    /// for a property no product writer sets yet (the splash stage's `ro.atl.splash`). The file is a copy under `<out>`, named by this process, so concurrent gates do not share it.
+    pub fn with_vendor_property(mut self, name: &str, value: &str) -> Result<Self> {
+        let at = atl_android_paths::VENDOR_BUILD_PROP;
+        let slot = self
+            .gl_driver
+            .iter_mut()
+            .chain(self.fixture_files.iter_mut())
+            .find(|(_, a)| a == at);
+        let mut text = match &slot {
+            Some((host, _)) => std::fs::read_to_string(host)
+                .with_context(|| format!("reading {}", host.display()))?,
+            None => String::new(),
+        };
+        text += &format!("{name}={value}\n");
+        let file = self
+            .out
+            .join(format!("vendor-build.{}.prop", std::process::id()));
+        std::fs::write(&file, text).with_context(|| format!("writing {}", file.display()))?;
+        match slot {
+            Some((host, _)) => *host = file,
+            None => self.fixture_files.push((file, at.to_owned())),
+        }
+        Ok(self)
+    }
+
     /// Places a gate's fixture file `host` at `at` (a /system or /vendor path) in every app sandbox.
     pub fn with_fixture_file(mut self, host: PathBuf, at: &str) -> Self {
         self.fixture_files.push((host, at.to_owned()));

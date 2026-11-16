@@ -28,6 +28,43 @@ pub const POINTER_PROPERTY: &str = "ro.atl.headless.pointer";
 pub const UI_PROPERTY: &str = "ro.atl.ui";
 /// The system property holding the desktop input adaptations ([`DesktopInput::to_arg`]), read by atl-composer's input. Unset: none, exact AOSP input.
 pub const DESKTOP_INPUT_PROPERTY: &str = "ro.atl.desktop-input";
+/// The system property holding the app's starting window ([`Splash::to_arg`]): what its window shows from its opening, before ART boots, until the app's first frame (AOSP's splash screen, StartingSurfaceController). Unset: the window opens empty (atl-composer `ui_window`).
+pub const SPLASH_PROPERTY: &str = "ro.atl.splash";
+
+/// The starting window's content, from the launcher activity's theme (`windowSplashScreenBackground`, else `windowBackground`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Splash {
+    /// The background, an Android colour int (ARGB).
+    pub background: u32,
+}
+
+impl Splash {
+    /// `background=#AARRGGBB`; later keys join it `;`-separated, as [`DesktopInput::to_arg`]'s parts.
+    pub fn to_arg(&self) -> String {
+        format!("background=#{:08X}", self.background)
+    }
+
+    /// [`Splash::to_arg`]'s form: the background required, once, eight hex digits.
+    pub fn parse_arg(s: &str) -> Result<Splash, String> {
+        let bad = || format!("{s}: not background=#AARRGGBB");
+        let mut background = None;
+        for part in s.split(';') {
+            match part.split_once('=') {
+                Some(("background", v)) if background.is_none() => {
+                    let hex = v
+                        .strip_prefix('#')
+                        .filter(|h| h.len() == 8)
+                        .ok_or_else(bad)?;
+                    background = Some(u32::from_str_radix(hex, 16).map_err(|_| bad())?);
+                }
+                _ => return Err(bad()),
+            }
+        }
+        Ok(Splash {
+            background: background.ok_or_else(bad)?,
+        })
+    }
+}
 
 /// Desktop input adaptations: what a desktop lacks that a phone has, emulated with what it has. Each is a switch; off is exact AOSP behaviour.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -158,5 +195,19 @@ mod tests {
         assert_eq!(DesktopInput::default().to_arg(), "none");
         assert!(DesktopInput::parse_arg("mouse-touch;mouse-touch").is_err());
         assert!(DesktopInput::parse_arg("hover").is_err());
+    }
+
+    /// The colour int's hex digits are its bytes A, R, G, B in order; the form is strict.
+    #[test]
+    fn splash_round_trips() {
+        let s = Splash {
+            background: 0xFF20_4080,
+        };
+        assert_eq!(s.to_arg(), "background=#FF204080");
+        assert_eq!(Splash::parse_arg(&s.to_arg()), Ok(s));
+        assert!(Splash::parse_arg("background=#204080").is_err());
+        assert!(Splash::parse_arg("background=#FF204080;background=#FF204080").is_err());
+        assert!(Splash::parse_arg("icon=x").is_err());
+        assert!(Splash::parse_arg("").is_err());
     }
 }

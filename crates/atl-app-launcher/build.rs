@@ -202,7 +202,12 @@ const IMPORTS: &[Import] = &[
         also: &[],
         lang: Lang::C,
         view: View::Bionic,
-        functions: &["ALooper_prepare", "ALooper_addFd", "ALooper_removeFd"],
+        functions: &[
+            "ALooper_prepare",
+            "ALooper_addFd",
+            "ALooper_removeFd",
+            "ALooper_pollOnce",
+        ],
         types: &[],
         macros: &[],
         include_dirs: &[],

@@ -61,4 +61,6 @@ pub mod ui_window;
 #[cfg(feature = "converter")]
 pub use host::VmHost;
 #[cfg(feature = "converter")]
-pub use start::start;
+pub use start::{open_window, start};
+#[cfg(feature = "converter")]
+pub use ui_window::OpenWindow;
