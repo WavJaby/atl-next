@@ -21,6 +21,7 @@ pub mod bwrap_flags;
 pub mod cargo_lock;
 pub mod cdylib;
 pub mod check;
+pub mod checkout_stamps;
 pub mod codec2_store;
 pub mod converter;
 pub mod cross;

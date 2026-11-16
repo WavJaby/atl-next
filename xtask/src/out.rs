@@ -162,8 +162,13 @@ pub fn out_dir(root: &Path, explicit: Option<&Path>) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// The checkout's id and build dir, made when missing: copied from a base, else empty. Prints one line when it makes one.
+/// The checkout's id and build dir, made when missing: copied from a base, else empty; a copy gives the checkout the base's mtimes where its content is the base's (`checkout_stamps`). Prints one line when it makes one.
 pub fn ensure(root: &Path) -> Result<(String, PathBuf)> {
+    make(root, true)
+}
+
+/// [`ensure`]; `restore` = [`restore_stamps`] after a base copy. False when outputs the base did not build will be carried into the dir (`checkout_stamps` module doc).
+fn make(root: &Path, restore: bool) -> Result<(String, PathBuf)> {
     let ws = Layout::of(root)?.workspace().to_owned();
     let id = checkout_id(root)?;
     let dir = dir_of(&ws, &id);
@@ -187,7 +192,12 @@ pub fn ensure(root: &Path) -> Result<(String, PathBuf)> {
         Some(c) => {
             let tier = copy_tree(&base_of(&ws, c), &dir, Some(c), &[])?;
             count(&ws, tier);
-            format!("out: ws/{id} from base/{c} ({})", tier.name())
+            let stamps = if restore {
+                restore_stamps(root, &base_of(&ws, c))?
+            } else {
+                "mtimes kept: outputs carried in".to_owned()
+            };
+            format!("out: ws/{id} from base/{c} ({}); {stamps}", tier.name())
         }
         None => {
             std::fs::create_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -199,6 +209,16 @@ pub fn ensure(root: &Path) -> Result<(String, PathBuf)> {
     };
     println!("{line}");
     Ok((id, dir))
+}
+
+/// The checkout at `root` gets `base`'s recorded mtimes where its content is the recorded one. Returns the line part. A base published before stamps existed restores nothing.
+fn restore_stamps(root: &Path, base: &Path) -> Result<String> {
+    let file = base.join(crate::checkout_stamps::FILE);
+    let Ok(text) = std::fs::read_to_string(&file) else {
+        return Ok(format!("no {}: mtimes kept", crate::checkout_stamps::FILE));
+    };
+    let (n, m) = crate::checkout_stamps::restore(root, &text)?;
+    Ok(format!("restored {n} of {m} mtimes"))
 }
 
 /// [`ensure`], then a shared hold until [`after_build`]: refresh, leave and prune skip or wait for the dir meanwhile. For a build that writes its own tree there.
@@ -734,6 +754,10 @@ pub fn publish(land: &Path) -> Result<String> {
     };
     let parent = dst.parent().context("base has no parent")?;
     std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    // the mtimes ws/land was built against, into the copy: a child's new dir restores them (`checkout_stamps`)
+    let stamps = src.join(crate::checkout_stamps::FILE);
+    std::fs::write(&stamps, crate::checkout_stamps::record(land)?)
+        .with_context(|| format!("writing {}", stamps.display()))?;
     let tier = copy_base(&src, &dst)?;
     count(&ws, tier);
     Ok(format!("out: base/{head} from ws/{id} ({})", tier.name()))
@@ -762,7 +786,8 @@ pub fn recopy(land: &Path) -> Result<String> {
         }
         remove_build_dir(&dir)?;
     }
-    let dir = match prepare(land) {
+    // the carried gate state was built from the land's earlier content: no mtime restore under it
+    let dir = match prepare_with(land, !kept) {
         Ok(dir) => dir,
         Err(e) => {
             if kept {
@@ -783,6 +808,7 @@ pub fn recopy(land: &Path) -> Result<String> {
 /// `native`'s refresh after a rebase: when a base newer than the one `ws/<id>` came from (`.base`) is an ancestor of HEAD, the dir is replaced by a copy of it. Returns the line to print; None = nothing to do.
 /// Why: the dir's own outputs were built on the old base and are mostly stale after the rebase, while the new base holds main's build of everything the rebase brought; the checkout's compiles hit sccache at the canonical path, so redoing its own delta is cheap.
 /// Kept: the dir's cargo target roots (`out_prune::DIR_ROOTS`), moved into the new copy: `target/` holds this running xtask binary (re-executed by path into the namespace), and every root holds the checkout's cargo units, which key on the checkout path a base's units (built in the land worktree) never match: taking the base's cost a 72-crate rebuild (X4 gate).
+/// No mtime restore (`checkout_stamps`): the kept roots hold units built from the checkout's own content after the base's recorded mtimes, so an old mtime on a file rebased back to the base's content would make them fresh.
 /// Only when main brought a large change (owner 2026-11-16): at least `build.refresh_min_upstream_files` files under [`UPSTREAM_INPUTS`] changed from the dir's base to the newer one (derivation on ws_config.rs DEFAULT_REFRESH_MIN_UPSTREAM_FILES); below it keeping the old dir rebuilds less.
 /// Kept (line `out: keep <reason>`): a dir without `.base` (built from zero), one already on the newest base or whose base is not an ancestor of it, a small change, a dir another process holds. None: the land worktree (land owns `ws/land`) or no dir yet (the first build makes it).
 pub fn refresh(root: &Path) -> Result<Option<String>> {
@@ -888,7 +914,12 @@ fn wants_refresh(changed: usize, min: u32) -> bool {
 
 /// The checkout's build dir made ([`ensure`]) with its `target/`, before a parent runs cargo there: the checkout's `target` link may name this dir's target/ already (a re-copied or deleted dir), an empty copy (no base) lacks it, and cargo, which runs before any xtask code can settle the link, fails on a dangling one.
 pub fn prepare(root: &Path) -> Result<PathBuf> {
-    let (_, dir) = ensure(root)?;
+    prepare_with(root, true)
+}
+
+/// [`prepare`]; `restore` as in [`make`].
+fn prepare_with(root: &Path, restore: bool) -> Result<PathBuf> {
+    let (_, dir) = make(root, restore)?;
     let target = target_of(&dir);
     std::fs::create_dir_all(&target).with_context(|| format!("creating {}", target.display()))?;
     Ok(dir)
