@@ -14,10 +14,11 @@ use binder::{
 
 use crate::activity::ActivityManager;
 use crate::display::DisplayCallbacks;
+use crate::input::KeyMaps;
 use crate::tasks::{TaskId, TaskSize, Tasks};
 use crate::ui_agents::UiAgents;
 use atl_services_types::compositor_registry::{
-    DESCRIPTOR, GET_COMPOSER, REGISTER, REMOVE_TASK, SET_BOUNDS, SET_DISPLAY, TASK_INFO,
+    DESCRIPTOR, GET_COMPOSER, KEY_MAP, REGISTER, REMOVE_TASK, SET_BOUNDS, SET_DISPLAY, TASK_INFO,
 };
 use atl_services_types::display_model::DisplayModel;
 use atl_services_types::permission::{SHELL_UID, SYSTEM_UID};
@@ -60,6 +61,9 @@ pub trait ICompositorRegistry: Interface {
 
     /// TASK_INFO once the caller's pid is read: the size the process's window opens at and its Task's package; None for a process with no Task, which opens no window (compositor_registry.rs TASK_INFO).
     fn task_info(&self, caller_pid: i32) -> Result<Option<TaskInfo>, StatusCode>;
+
+    /// KEY_MAP once the device id is read: that device's key map in Parcel form, empty for an unknown device (compositor_registry.rs KEY_MAP).
+    fn key_map(&self, device_id: i32) -> Result<Vec<u8>, StatusCode>;
 }
 
 declare_binder_interface! {
@@ -78,6 +82,7 @@ fn method_name(code: TransactionCode) -> Option<&'static str> {
         (SET_DISPLAY, "SET_DISPLAY"),
         (TASK_INFO, "TASK_INFO"),
         (REMOVE_TASK, "REMOVE_TASK"),
+        (KEY_MAP, "KEY_MAP"),
     ]
     .into_iter()
     .find_map(|(c, n)| (c == code).then_some(n))
@@ -153,6 +158,10 @@ fn dispatch(
         reply.write(&height)?;
         return reply.write(&package);
     }
+    if code == KEY_MAP {
+        let device_id: i32 = data.read()?;
+        return reply.write(&service.key_map(device_id)?);
+    }
     if code != REGISTER {
         return Err(StatusCode::UNKNOWN_TRANSACTION);
     }
@@ -179,6 +188,10 @@ impl ICompositorRegistry for BpCompositorRegistry {
     }
 
     fn register(&self, _: u32, _: SpIBinder, _: SpIBinder) -> Result<(), StatusCode> {
+        Err(StatusCode::INVALID_OPERATION)
+    }
+
+    fn key_map(&self, _: i32) -> Result<Vec<u8>, StatusCode> {
         Err(StatusCode::INVALID_OPERATION)
     }
 
@@ -222,6 +235,10 @@ impl ICompositorRegistry for Binder<BnCompositorRegistry> {
     fn composer(&self, caller_uid: u32, package: &str) -> binder::Result<Option<SpIBinder>> {
         self.0.composer(caller_uid, package)
     }
+
+    fn key_map(&self, device_id: i32) -> Result<Vec<u8>, StatusCode> {
+        self.0.key_map(device_id)
+    }
 }
 
 struct Registry {
@@ -233,6 +250,8 @@ struct Registry {
     display_callbacks: Arc<DisplayCallbacks>,
     /// each registered app's compositor, under its uid (GET_COMPOSER)
     composers: Mutex<BTreeMap<u32, SpIBinder>>,
+    /// the input service's key maps (input.rs), served by KEY_MAP
+    key_maps: Arc<KeyMaps>,
 }
 
 impl Interface for Registry {}
@@ -269,6 +288,10 @@ impl Registry {
 }
 
 impl ICompositorRegistry for Registry {
+    fn key_map(&self, device_id: i32) -> Result<Vec<u8>, StatusCode> {
+        Ok(self.key_maps.of(device_id).unwrap_or_default().to_vec())
+    }
+
     fn remove_task(&self, caller_uid: u32, task: i32) -> Result<(), StatusCode> {
         // an app closes its own Tasks only
         let task = self.owned_task(caller_uid, task)?;
@@ -391,12 +414,13 @@ impl ICompositorRegistry for Registry {
     }
 }
 
-/// A new registry binder. `agents` is the table the window service reads (system_services.rs gives both the same one); `activities` is the service a Task's size change reaches.
+/// A new registry binder. `agents` is the table the window service reads (system_services.rs gives both the same one); `activities` is the service a Task's size change reaches; `key_maps` the input service's.
 pub fn new_binder(
     agents: Arc<UiAgents>,
     tasks: Arc<Tasks<SpIBinder>>,
     activities: ActivityManager,
     display_callbacks: Arc<DisplayCallbacks>,
+    key_maps: Arc<KeyMaps>,
 ) -> SpIBinder {
     BnCompositorRegistry::new_binder(
         Registry {
@@ -405,6 +429,7 @@ pub fn new_binder(
             activities,
             display_callbacks,
             composers: Mutex::new(BTreeMap::new()),
+            key_maps,
         },
         BinderFeatures::default(),
     )

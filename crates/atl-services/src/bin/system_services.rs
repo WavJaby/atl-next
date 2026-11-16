@@ -488,13 +488,16 @@ fn main() -> Result<()> {
             "off"
         }
     )?;
-    let input = atl_services::input::new_binder(
-        &kcm("Virtual.kcm", false)?,
-        &kcm("Generic.kcm", a.desktop_input.esc_back)?,
-        Arc::clone(&agents),
-        Arc::clone(&permissions),
-    )
-    .map_err(anyhow::Error::msg)?;
+    let key_maps = Arc::new(
+        atl_services::input::KeyMaps::new(
+            kcm("Virtual.kcm", false)?,
+            kcm("Generic.kcm", a.desktop_input.esc_back)?,
+        )
+        .map_err(anyhow::Error::msg)?,
+    );
+    let input =
+        atl_services::input::new_binder(&key_maps, Arc::clone(&agents), Arc::clone(&permissions))
+            .map_err(anyhow::Error::msg)?;
     binder::add_service(INPUT, input).context("addService input")?;
     binder::add_service(
         compositor_registry::SERVICE,
@@ -503,6 +506,7 @@ fn main() -> Result<()> {
             Arc::clone(&tasks),
             activity.clone(),
             display_callbacks,
+            key_maps,
         ),
     )
     .context("addService compositor registry")?;

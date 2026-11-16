@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use atl_services_types::compositor_registry::{
-    DESCRIPTOR, DESKTOP_INPUT_PROPERTY, DISPLAY_PROPERTY, DesktopInput, POINTER_PROPERTY, REGISTER,
-    SERVICE, SPLASH_PROPERTY, SURFACE_FLINGER, SURFACE_FLINGER_AIDL, Splash, TASK_INFO,
+    DESCRIPTOR, DESKTOP_INPUT_PROPERTY, DISPLAY_PROPERTY, DesktopInput, KEY_MAP, POINTER_PROPERTY,
+    REGISTER, SERVICE, SPLASH_PROPERTY, SURFACE_FLINGER, SURFACE_FLINGER_AIDL, Splash, TASK_INFO,
 };
 use atl_services_types::display_model::DisplayModel;
 use binder::binder_impl::{Binder, BorrowedParcel, IBinderInternal, TransactionCode};
@@ -116,6 +116,20 @@ fn task_info() -> Result<Option<(PhysSize, String)>, String> {
         (Some(width), Some(height)) => Ok(Some((PhysSize { width, height }, package))),
         _ => Err(format!("task info {width}x{height}: not a size")),
     }
+}
+
+/// The KEY_MAP transaction: input device `device_id`'s key map in Parcel form, as the input service serves it (compositor_registry.rs KEY_MAP); empty for an unknown device.
+pub(crate) fn key_map(device_id: i32) -> Result<Vec<u8>, String> {
+    let proxy = registry()?;
+    let binder = proxy.as_binder();
+    let mut data = binder.prepare_transact().map_err(|e| e.to_string())?;
+    data.write(&device_id).map_err(|e| e.to_string())?;
+    let reply = binder
+        .submit_transact(KEY_MAP, data, 0)
+        .map_err(|e| format!("key map {device_id}: {e}"))?;
+    reply
+        .read()
+        .map_err(|e| format!("key map {device_id}: {e}"))
 }
 
 /// The REGISTER transaction: the UI agent, then the compositor (GET_COMPOSER hands it to the shell).

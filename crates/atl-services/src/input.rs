@@ -35,10 +35,40 @@ struct InputManager {
 
 impl Interface for InputManager {}
 
-/// The desktop's devices with their key maps (see the module doc): `virtual_map` Virtual.kcm's Parcel form, `keyboard_map` Generic.kcm's.
-fn devices(virtual_map: &[u8], keyboard_map: &[u8]) -> Vec<InputDevice> {
+/// The desktop devices' key maps, each the Parcel form of a KeyCharacterMap (atl-libinput `KeyCharacterMap::parcel_bytes`): the one copy both getInputDevice and the compositor registry's KEY_MAP serve.
+pub struct KeyMaps {
+    /// Virtual.kcm: the virtual keyboard's, and every device without keys
+    virtual_map: Vec<u8>,
+    /// Generic.kcm (see [`keyboard_map`]): the physical keyboard's
+    keyboard_map: Vec<u8>,
+}
+
+impl KeyMaps {
+    /// `virtual_map` Virtual.kcm's Parcel form, `keyboard_map` Generic.kcm's. Fails when the keyboard's is not a Parcel-form blob (whole 32-bit words).
+    pub fn new(virtual_map: Vec<u8>, keyboard_map: Vec<u8>) -> Result<KeyMaps, String> {
+        if keyboard_map.is_empty() || !keyboard_map.len().is_multiple_of(4) {
+            return Err("keyboard key map: not a non-empty multiple of 4 bytes".to_owned());
+        }
+        Ok(KeyMaps {
+            virtual_map,
+            keyboard_map,
+        })
+    }
+
+    /// Device `device_id`'s map, as [`devices`] gives it; None for an id that is no device.
+    pub fn of(&self, device_id: i32) -> Option<&[u8]> {
+        match device_id {
+            KEYBOARD => Some(&self.keyboard_map),
+            VIRTUAL_KEYBOARD | POINTER | TOUCHSCREEN | TOUCHPAD => Some(&self.virtual_map),
+            _ => None,
+        }
+    }
+}
+
+/// The desktop's devices with their key maps (see the module doc and [`KeyMaps::of`]).
+fn devices(maps: &KeyMaps) -> Vec<InputDevice> {
     let base = InputDevice {
-        key_character_map: virtual_map.to_vec(),
+        key_character_map: maps.virtual_map.clone(),
         generation: 1,
         usi_version_major: -1,
         usi_version_minor: -1,
@@ -68,7 +98,7 @@ fn devices(virtual_map: &[u8], keyboard_map: &[u8]) -> Vec<InputDevice> {
             descriptor: Some("atl:keyboard".into()),
             sources: SOURCE_KEYBOARD,
             keyboard_type: KEYBOARD_TYPE_ALPHABETIC,
-            key_character_map: keyboard_map.to_vec(),
+            key_character_map: maps.keyboard_map.clone(),
             ..base.clone()
         },
         InputDevice {
@@ -191,20 +221,16 @@ pub fn keyboard_map(
     Ok(map.parcel_bytes())
 }
 
-/// A new input service binder serving the key maps `virtual_map` (Virtual.kcm) and `keyboard_map` (Generic.kcm, see [`keyboard_map`]), each the Parcel form of a KeyCharacterMap (atl-libinput `KeyCharacterMap::parcel_bytes`), relaying pointer icons to `agents` and checking @EnforcePermission against `permissions`. Fails when a map is not a Parcel-form blob.
+/// A new input service binder serving `maps` in its devices, relaying pointer icons to `agents` and checking @EnforcePermission against `permissions`. Fails when the virtual map is not a Parcel-form blob.
 pub fn new_binder(
-    virtual_map: &[u8],
-    keyboard_map: &[u8],
+    maps: &KeyMaps,
     agents: Arc<UiAgents>,
     permissions: Arc<Permissions>,
 ) -> Result<SpIBinder, String> {
     // the codec reads InputDevices against the virtual map (InputDevice.rs); the keyboard's is written only
-    set_key_character_map(virtual_map).map_err(str::to_owned)?;
-    if keyboard_map.is_empty() || !keyboard_map.len().is_multiple_of(4) {
-        return Err("keyboard key map: not a non-empty multiple of 4 bytes".to_owned());
-    }
+    set_key_character_map(&maps.virtual_map).map_err(str::to_owned)?;
     let service = InputManager {
-        devices: devices(virtual_map, keyboard_map),
+        devices: devices(maps),
         agents,
         permissions,
     };

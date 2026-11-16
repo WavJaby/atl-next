@@ -22,6 +22,9 @@ pub const TASK_INFO: u32 = 4;
 pub const GET_COMPOSER: u32 = 5;
 /// The transaction a UI-mode app process sends when the desktop asks to close its window: the Task's number (i32). The Shell's removeTask (WindowContainerTransaction.removeTask). The caller's uid must own that Task, as for [`SET_BOUNDS`]. Reply: a status only.
 pub const REMOVE_TASK: u32 = 6;
+/// The transaction an app process's compositor sends for an input device's key map, for the dispatcher's fallback keys (InputDispatcher / InputManagerService.dispatchUnhandledKey): the device id (i32). Reply: the map in Parcel form (byte[], atl-libinput `KeyCharacterMap::parcel_bytes`), the same bytes the input service puts in that device's InputDevice, so one owner serves one map; empty for an unknown device. Any caller: the maps are what every app reads through getInputDevice.
+/// Not getInputDevice itself: libinput's Parcel form of a map carries no length, so the Rust InputDevice codec cannot read a reply holding a map other than the one it was set up with.
+pub const KEY_MAP: u32 = 7;
 /// The system property holding the display the in-app compositor answers with (`DisplayModel::to_arg`): the same model atld forwards to the services, delivered to the app the way its other environment is. Its presence marks an ATL app process (atl-composer start).
 pub const DISPLAY_PROPERTY: &str = "ro.atl.display";
 /// The system property holding the headless pointer script (atld `--headless-pointer`, parsed by atl-composer `input::parse_script`), delivered like [`DISPLAY_PROPERTY`]. Unset: no input thread; the window handoff still works.

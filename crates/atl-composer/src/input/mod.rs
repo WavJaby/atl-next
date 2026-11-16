@@ -329,10 +329,9 @@ mod publish {
     use std::thread;
 
     use crate::tilt::Tilt;
-    use atl_aidl::aidl::android::hardware::input::IInputManager::IInputManager;
     use atl_libinput::{KeyCharacterMap, KeyEvent, KeyLayoutMap, MotionEvent, Pointer, Publisher};
     use atl_platform_ui::{InputEvent, InputSource, PointerEvent};
-    use binder::{SpIBinder, Strong};
+    use binder::SpIBinder;
 
     use super::fallback::Fallbacks;
     use super::key::{self, Key};
@@ -433,33 +432,18 @@ mod publish {
         maps: RefCell<HashMap<i32, Option<KeyCharacterMap>>>,
     }
 
-    /// Context.INPUT_SERVICE: the input service, owner of every device's key map.
-    const INPUT_SERVICE: &str = "input";
-
-    /// Device `device_id`'s key map from the input service (getInputDevice -> InputDevice's KeyCharacterMap, Parcel form): the map the app's `KeyEvent.getKeyCharacterMap()` reads, so both of AOSP's fallback points see one map, desktop overlay included.
+    /// Device `device_id`'s key map from the services (compositor registry KEY_MAP: the input service's map, Parcel form): the map the app's `KeyEvent.getKeyCharacterMap()` reads, so both of AOSP's fallback points see one map, desktop overlay included.
     fn fetch_map(device_id: i32) -> Option<KeyCharacterMap> {
-        let manager: Strong<dyn IInputManager> = binder::check_service(INPUT_SERVICE)
-            .or_else(|| {
-                tracing::warn!(
-                    "input: no {INPUT_SERVICE} service; device {device_id} keys get no fallback"
-                );
-                None
-            })?
-            .into_interface()
-            .inspect_err(|err| tracing::warn!("input: {INPUT_SERVICE}: {err}"))
+        let bytes = crate::start::key_map(device_id)
+            .inspect_err(|err| {
+                tracing::warn!("input: {err}; device {device_id} keys get no fallback")
+            })
             .ok()?;
-        let device = match manager.getInputDevice(device_id) {
-            Ok(Some(device)) => device,
-            Ok(None) => {
-                tracing::warn!("input: device {device_id} unknown to {INPUT_SERVICE}; no fallback");
-                return None;
-            }
-            Err(err) => {
-                tracing::warn!("input: getInputDevice({device_id}): {err}");
-                return None;
-            }
-        };
-        KeyCharacterMap::from_parcel(&device.key_character_map)
+        if bytes.is_empty() {
+            tracing::warn!("input: device {device_id} has no key map; no fallback");
+            return None;
+        }
+        KeyCharacterMap::from_parcel(&bytes)
             .inspect_err(|err| tracing::warn!("input: device {device_id} key map: {err:?}"))
             .ok()
     }
