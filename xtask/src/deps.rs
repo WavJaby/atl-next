@@ -174,7 +174,37 @@ fn parse(text: &str, consumers: &Consumers) -> Result<Deps> {
             "[{name}]: name must be [a-z0-9-], starting alphanumeric"
         );
     }
+    check_sysroot_floors(&deps)?;
     Ok(deps)
+}
+
+/// A distro row's `min` binds the cross builds too: a sysroot pinning that row's `debian` package pins it at >= min.
+/// A cross host links against the sysroot, so a pin below min builds a binary the row says is unsupported.
+fn check_sysroot_floors(deps: &Deps) -> Result<()> {
+    for (name, dep) in deps {
+        let (Some(package), Some(min)) = (&dep.debian, &dep.min) else {
+            continue;
+        };
+        let Some(min_v) = parse_version(min) else {
+            continue;
+        };
+        for (sysroot, s) in deps {
+            for pin in s.sysroot_debs.iter().flatten() {
+                let Some((pkg, version)) = pin.split_once('=') else {
+                    continue;
+                };
+                if pkg != package {
+                    continue;
+                }
+                let have = upstream_version(version);
+                ensure!(
+                    parse_version(have).is_some_and(|v| version_at_least(&v, &min_v)),
+                    "[{sysroot}] pins `{pin}` ({have}) below [{name}] min {min}"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate(name: &str, dep: &Dep, consumers: &Consumers) -> Result<()> {
@@ -1213,6 +1243,20 @@ mod tests {
             ))
             .contains("exactly one source")
         );
+    }
+
+    #[test]
+    fn sysroot_pins_meet_the_rows_min() {
+        let row = |pin: &str| {
+            format!(
+                "[g]\ndebian = \"libgtk-4-dev\"\nmin = \"4.18.0\"\nmin_reason = \"r\"\n{USED}[s]\nsysroot_debs = [\"{pin}\"]\n{USED}"
+            )
+        };
+        // 4.18.6+ds-2: upstream 4.18.6 >= 4.18.0; 4.14.5+ds-0ubuntu0.10 (sifive's GTK): below
+        assert!(parse(&row("libgtk-4-dev=4.18.6+ds-2"), &consumers()).is_ok());
+        assert!(err(&row("libgtk-4-dev=4.14.5+ds-0ubuntu0.10")).contains("below [g] min 4.18.0"));
+        // another package of the same sysroot is not bound by the row
+        assert!(parse(&row("libgtk-4-1=4.14.5+ds-0ubuntu0.10"), &consumers()).is_ok());
     }
 
     #[test]

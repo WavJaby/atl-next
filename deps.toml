@@ -166,6 +166,16 @@ pkgconfig = "gbm"
 scope = ["build", "runtime"]
 used_by = ["crate:atl-gralloc-service"]
 
+# window chrome, input, IME and hole views (gtk4-rs: gtk4-sys's build script resolves gtk4 through pkg-config). The riscv64 sysroot pins libgtk-4-dev at the floor (4.18.6; a pin below min fails `check`) and the UI crates link with `-z defs` (their build.rs), so a riscv64 build fails on any symbol its pinned GTK lacks. Raising that pin past the 4.18 series removes this floor gate: move min with it
+[gtk4]
+debian = "libgtk-4-dev"
+arch = "gtk4"
+pkgconfig = "gtk4"
+min = "4.18.0"
+min_reason = "plan Q10 (owner 2026-10-29): GTK minimum 4.18; webkit6's gtk_v4_18 feature turns on gtk4-rs v4_18, so 4.18 API is callable"
+scope = ["build", "runtime"]
+used_by = ["crate:atl-platform-ui-linux", "crate:atl-platform-host-linux", "crate:atl-webview-linux"]
+
 # QEMU's GLib (meson.build:1058 glib_req_ver); gmodule, which its TCG plugins load, ships in the same package
 [glib]
 debian = "libglib2.0-dev"
@@ -335,8 +345,8 @@ used_by = ["crate:atld", "xtask:keys"]
 debian = "libwebkitgtk-6.0-dev"
 arch = "webkitgtk-6.0"
 pkgconfig = "webkitgtk-6.0"
-min = "2.54.0"
-min_reason = "observed 2026-11-14 (W0 probes, UA format measured on it); older is untested"
+min = "2.52.0"
+min_reason = "2.52.6 measured: the riscv64 sysroot builds against it and the webview-page gate passes on a 2.52.6 host (sifive, 2026-11-16); W0's UA format was measured on 2.54. Older is untested"
 scope = ["build", "runtime"]
 used_by = ["crate:atl-webview-linux"]
 
