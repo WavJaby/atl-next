@@ -8,8 +8,8 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::ffi::{CString, c_void};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::ffi::{CStr, CString, c_void};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use atl_android_paths::{ANGLE_EGL, GL_DRIVER_EGL, GL_DRIVER_GLES1, VENDOR_EGL};
@@ -17,6 +17,7 @@ use libloading::os::unix::{Library, RTLD_LOCAL, RTLD_NOW};
 
 use crate::abi::angle as a;
 use crate::abi::egl as e;
+use crate::abi::gles as g;
 use crate::driver::{self, Driver, set_error};
 use crate::fbo0;
 
@@ -55,9 +56,13 @@ struct Angle {
     create_pbuffer: a::eglCreatePbufferFromClientBuffer,
     destroy_surface: a::eglDestroySurface,
     make_current: a::eglMakeCurrent,
+    get_current_context: a::eglGetCurrentContext,
     get_error: a::eglGetError,
     acquire: a::eglAcquireExternalContextANGLE,
     release: a::eglReleaseExternalContextANGLE,
+    /// ANGLE's own GL entries (its eglGetProcAddress), for the first-entry report only.
+    gl_string: g::glGetString,
+    gl_error: g::glGetError,
 }
 
 // SAFETY: the ANGLE display is a process-global EGL handle usable from any thread (EGL 1.5 §3.2); the rest are function pointers.
@@ -117,9 +122,12 @@ impl Angle {
                     create_pbuffer: sym(&lib, gpa, "eglCreatePbufferFromClientBuffer")?,
                     destroy_surface: sym(&lib, gpa, "eglDestroySurface")?,
                     make_current: sym(&lib, gpa, "eglMakeCurrent")?,
+                    get_current_context: sym(&lib, gpa, "eglGetCurrentContext")?,
                     get_error: sym(&lib, gpa, "eglGetError")?,
                     acquire: sym(&lib, gpa, "eglAcquireExternalContextANGLE")?,
                     release: sym(&lib, gpa, "eglReleaseExternalContextANGLE")?,
+                    gl_string: sym(&lib, gpa, "glGetString")?,
+                    gl_error: sym(&lib, gpa, "glGetError")?,
                 },
             )
         };
@@ -437,9 +445,33 @@ impl Es1Context {
         unsafe { (angle.acquire)(angle.dpy, raw) };
         drop(slot);
         CURRENT.with(|c| *c.borrow_mut() = Some(Arc::clone(self)));
+        if !FIRST_ENTER.swap(true, Ordering::Relaxed) {
+            self.report_first_enter(angle);
+        }
         Ok(())
     }
+
+    /// One line at the process's first ES1 entry: whether ANGLE holds this context current and answers GL itself. When the app's ES1 calls come back empty, this splits ANGLE (context or GL backend) from libEGL's ES1 table or the front.
+    fn report_first_enter(&self, angle: &Angle) {
+        // SAFETY: ANGLE's EGL and GL entries on this thread, its ES1 context current and acquired; glGetString's answer is a NUL-terminated string or null.
+        let (current, version, error) = unsafe {
+            let current = (angle.get_current_context)() == self.angle_ctx;
+            let p = (angle.gl_string)(atl_egl_host::ffi::GL_VERSION);
+            let version = if p.is_null() {
+                "null".to_owned()
+            } else {
+                CStr::from_ptr(p.cast()).to_string_lossy().into_owned()
+            };
+            (current, version, (angle.gl_error)())
+        };
+        log(&format!(
+            "es1 first enter: ANGLE current={current} GL_VERSION {version} error={error:#x}"
+        ));
+    }
 }
+
+/// [`Es1Context::report_first_enter`] ran (once per process).
+static FIRST_ENTER: AtomicBool = AtomicBool::new(false);
 
 /// An ES1 context is current on this thread (es1_ext.rs's shells answer for ES1 then).
 pub fn is_current() -> bool {

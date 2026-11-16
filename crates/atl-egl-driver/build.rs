@@ -75,6 +75,7 @@ const IMPORTS: &[HeaderImport] = &[
             "eglCreatePbufferFromClientBuffer",
             "eglDestroySurface",
             "eglMakeCurrent",
+            "eglGetCurrentContext",
             "eglAcquireExternalContextANGLE",
             "eglReleaseExternalContextANGLE",
         ],
