@@ -2,7 +2,7 @@
 //! Machine-wide admission: a weighted pool of CPU slots and memory (GiB). Heavy work holds a [`Grant`] around one leaf (a ninja build, a cargo run) and releases it after.
 //! A slot is an exclusive `flock` on `<workspace>/cache/build-pool/cpu-<i>` or `mem-<i>`: the kernel drops it when the holder's file closes, so exit, error, panic and SIGKILL all free it -- no stale-lock cleanup exists or is needed.
 //! Waiters queue as tickets in `cache/build-pool/queue/`; the oldest live ticket is served first, so a large request is not starved by small ones behind it.
-//! Light work takes no ticket: a free CPU slot serves it at once (`acquire_with`).
+//! Light work takes a free CPU slot at once when the queue head could not use it (`bypass_allowed`); otherwise it queues like heavy work.
 //! A grant takes CPU elastically (the free slots up to the class max, at least its min); the count is the tool's job count (ninja `-j`, cargo `CARGO_BUILD_JOBS`).
 //! Nested admission is refused: a thread holding a grant, or a process with a holder among its ancestors, would wait for slots its own holder keeps.
 //! Sizes and weights: `[pool]` in `workspace.toml` (ws_config.rs); the defaults and their derivation are on [`Class::default_weight`].
@@ -38,7 +38,7 @@ pub enum Class {
     Cargo,
     /// a runtime gate: the product's processes plus the cargo and JVM work around them
     Harness,
-    /// static checks: one CPU slot, no queue place (`acquire_with`). Held while a check reads the checkouts' git dirs; the migrate quiet window (git_dirs.rs `migrate`) refuses on that hold.
+    /// static checks: one CPU slot; bypasses the queue only when the head could not use it (`bypass_allowed`). Held while a check reads the checkouts' git dirs; the migrate quiet window (git_dirs.rs `migrate`) refuses on that hold.
     Light,
 }
 
@@ -167,17 +167,22 @@ fn acquire_with(
     std::fs::create_dir_all(&queue).with_context(|| format!("creating {}", queue.display()))?;
     check_nesting(&pool, &dir)?;
     let record = holder_record(who, class.name());
-    // light takes no ticket: a heavy head queued for memory must not hold back a free CPU slot, and one light slot cannot starve it
-    let ticket = match class {
+    // heavy work queues at once; light queues only when it would take a slot the head needs (`bypass_allowed`)
+    let mut ticket = match class {
         Class::Light => None,
-        _ => Some(Ticket::new(&queue, std::process::id())?),
+        _ => Some(Ticket::new(&queue, std::process::id(), class)?),
     };
     let started = Instant::now();
     let mut waited = false;
     loop {
-        let queue_state = match &ticket {
-            Some(t) => Some(scan(&queue, &t.name)?),
-            None => None,
+        let tickets = live_tickets(&queue)?;
+        let queue_state = if let Some(t) = &ticket {
+            Some(queue_position(&tickets, &t.name))
+        } else if bypass_allowed(&dir, &pool, &tickets)? {
+            None
+        } else {
+            ticket = Some(Ticket::new(&queue, std::process::id(), class)?);
+            continue;
         };
         // the head of the queue gathers; nobody behind it is served
         if queue_state.is_none_or(|(ahead, _)| ahead == 0)
@@ -351,8 +356,8 @@ struct Ticket {
 }
 
 impl Ticket {
-    /// Named by arrival time, pid and a counter, so names sort in arrival order. Written under `tmp-`, locked, then renamed.
-    fn new(queue: &Path, pid: u32) -> Result<Ticket> {
+    /// Named by arrival time, pid and a counter, so names sort in arrival order. Written under `tmp-` with the class name, locked, then renamed.
+    fn new(queue: &Path, pid: u32, class: Class) -> Result<Ticket> {
         let seq = TICKETS.fetch_add(1, Ordering::Relaxed);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -365,9 +370,12 @@ impl Ticket {
             .create_new(true)
             .open(&tmp)
             .with_context(|| format!("creating {}", tmp.display()))?;
-        let lock = Flock::try_take(lock, Mode::Exclusive)
+        let mut lock = Flock::try_take(lock, Mode::Exclusive)
             .with_context(|| format!("flock {}", tmp.display()))?
             .with_context(|| format!("{} is held: a fresh ticket", tmp.display()))?;
+        lock.file()
+            .write_all(class.name().as_bytes())
+            .with_context(|| format!("writing {}", tmp.display()))?;
         let path = queue.join(&name);
         std::fs::rename(&tmp, &path).with_context(|| format!("queueing {}", path.display()))?;
         Ok(Ticket {
@@ -384,9 +392,9 @@ impl Drop for Ticket {
     }
 }
 
-/// The queue as seen by `me` (its file name): (live tickets ordered before `me`, all live tickets). A ticket whose lock is free has no waiter left: it is removed.
-fn scan(queue: &Path, me: &str) -> Result<(usize, usize)> {
-    let (mut ahead, mut live) = (0, 0);
+/// The live tickets, oldest first, each with the class its waiter wrote (`None` when unreadable or unknown). A ticket whose lock is free has no waiter left: it is removed.
+fn live_tickets(queue: &Path) -> Result<Vec<(String, Option<Class>)>> {
+    let mut live = Vec::new();
     for entry in std::fs::read_dir(queue).with_context(|| format!("reading {}", queue.display()))? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -407,14 +415,25 @@ fn scan(queue: &Path, me: &str) -> Result<(usize, usize)> {
                 let _ = std::fs::remove_file(&path);
             }
             None => {
-                live += 1;
-                if name.as_str() < me {
-                    ahead += 1;
-                }
+                let class = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|text| Class::from_name(text.trim()));
+                live.push((name, class));
             }
         }
     }
-    Ok((ahead, live))
+    // names sort in arrival order: fixed-width time, then pid, then counter
+    live.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(live)
+}
+
+/// (live tickets ordered before `me`, all live tickets); `me` is a ticket's file name.
+fn queue_position(tickets: &[(String, Option<Class>)], me: &str) -> (usize, usize) {
+    let ahead = tickets
+        .iter()
+        .filter(|(name, _)| name.as_str() < me)
+        .count();
+    (ahead, tickets.len())
 }
 
 /// Takes one slot without waiting. The holder record is written under the lock; a reader may see it half-written, which costs a garbled wait line, nothing else.
@@ -513,6 +532,26 @@ impl Snapshot {
             .collect::<Vec<_>>()
             .join("; ")
     }
+}
+
+/// Light may take a free CPU slot past the queue head only when the head could not use it: its memory is short, or it still keeps `cpu_min` free after the take.
+fn may_bypass(head: ClassWeight, snap: &Snapshot) -> bool {
+    head.mem_gib > snap.free_mem || snap.free_cpu > head.cpu_min
+}
+
+/// Light may bypass the queue with no queue, or when `may_bypass` holds against the head's class. An unknown head class makes light queue: FIFO is always safe.
+fn bypass_allowed(
+    dir: &Path,
+    pool: &PoolConfig,
+    tickets: &[(String, Option<Class>)],
+) -> Result<bool> {
+    let Some(&(_, head)) = tickets.first() else {
+        return Ok(true);
+    };
+    let Some(weight) = head.and_then(|class| pool.classes.get(&class).copied()) else {
+        return Ok(false);
+    };
+    Ok(may_bypass(weight, &snapshot(dir, pool)?))
 }
 
 fn snapshot(dir: &Path, pool: &PoolConfig) -> Result<Snapshot> {
@@ -728,7 +767,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Heavy waiters are granted in arrival order: each one's wait line means its ticket is queued before the next one arrives, and no later waiter is granted before an earlier one released. Cargo stands in for the heavy classes; light takes no ticket (the next test).
+    /// Heavy waiters are granted in arrival order: each one's wait line means its ticket is queued before the next one arrives, and no later waiter is granted before an earlier one released. Cargo stands in for the heavy classes; light queues only when it would take the head's slot (the next tests).
     #[test]
     fn waiters_are_served_in_arrival_order() {
         let ws = scratch_ws(
@@ -803,6 +842,72 @@ mod tests {
         holder.release.send(()).unwrap();
         assert_eq!(heavy.granted.recv_timeout(WAIT).unwrap(), "cpu 1 mem 1");
         heavy.release.send(()).unwrap();
+    }
+
+    /// Three light streams keep churning while a heavy head needs both CPU slots: the head must be granted within HEAD_BOUND.
+    /// Light taking every freed slot starves it, since the head needs two free at one poll.
+    #[test]
+    fn light_stream_does_not_starve_a_heavy_head() {
+        use std::sync::{Arc, atomic::AtomicBool};
+        /// One slot hold per light step, long against a stream's re-entry gap (a few ms in a debug build: config load, probes), so a freed slot is almost never still free at the head's poll.
+        const HOLD: Duration = Duration::from_millis(500);
+        /// One hold plus a poll is the head's real need; the bound is generous, so the test fails on starvation, not on a slow host.
+        const HEAD_BOUND: Duration = Duration::from_secs(5);
+        let ws = scratch_ws(
+            "light-stream",
+            Some(
+                "[pool]\ncpu_slots = 2\nmem_gib = 2\n[pool.cargo]\ncpu_min = 2\ncpu_max = 2\nmem_gib = 1\n",
+            ),
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let streams: Vec<_> = (0..3)
+            .map(|i| {
+                let (ws, stop) = (ws.clone(), Arc::clone(&stop));
+                let who = format!("stream-{i}");
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let grant =
+                            acquire_with(&ws, Path::new(&who), Class::Light, FAST, &mut |_| {})
+                                .expect("light acquire");
+                        std::thread::sleep(HOLD);
+                        drop(grant);
+                    }
+                })
+            })
+            .collect();
+        std::thread::sleep(STILL_WAITING);
+        let head = contender(&ws, "head", Class::Cargo);
+        let granted = head.granted.recv_timeout(HEAD_BOUND);
+        stop.store(true, Ordering::Relaxed);
+        // a release sent before the grant makes the head drop its grant at once, so no stream waits on it
+        let _ = head.release.send(());
+        for s in streams {
+            s.join().unwrap();
+        }
+        assert!(
+            granted.is_ok(),
+            "the heavy head was not granted within {HEAD_BOUND:?} while light streams ran"
+        );
+    }
+
+    /// The bypass rule: light may take a slot past a head only while the head keeps its `cpu_min` free, or the head lacks memory anyway. Expected values follow the rule.
+    #[test]
+    fn light_bypass_keeps_the_head_grantable() {
+        let head = ClassWeight {
+            cpu_min: 4,
+            cpu_max: 8,
+            mem_gib: 7,
+        };
+        let snap = |free_cpu, free_mem| Snapshot {
+            free_cpu,
+            free_mem,
+            held: BTreeMap::new(),
+        };
+        // memory ready: one slot may go only while 4 stay free
+        assert!(may_bypass(head, &snap(5, 7)));
+        assert!(!may_bypass(head, &snap(4, 7)));
+        // memory short: the head cannot be granted anyway
+        assert!(may_bypass(head, &snap(1, 6)));
     }
 
     /// Memory admits two full natives (7 GiB each of 20) and not a third; the third's wait line names the memory.
