@@ -128,7 +128,7 @@ const REMOTE_SKIPPED: [(&str, &str); 4] = [
         "atld ends at the target's limit (timeout), not at the gate's stop, so the exit rows have nothing to compare",
     ),
     (
-        "webview-ua, webview-settings",
+        "webview-ua, webview-settings, webview-cookie-set, webview-cookie-web, webview-download",
         "WebKitSettings needs a GDK display: no compositor on a headless run",
     ),
     (
@@ -371,6 +371,19 @@ const WEBVIEW_PAGE: (&str, &str) = (
 const WEBVIEW_SETTINGS: (&str, &str) = (
     "AtlTest: webview-settings: ",
     "js=true font-size=20 serif=atl-serif text-zoom=150 min-font=8 zoom=MEDIUM layout=NARROW_COLUMNS support-zoom=true",
+);
+/// Main.webViewCookies's line (webview plan D5, W4b): CookieManager.setCookie from a thread without a Looper is readable at once on that thread (the copy), `a=1` being the cookie it set and
+/// hasCookies true; the ValueCallback reports success on the main Looper (CookieManager.java javadoc: the caller's Looper, the main one for a caller without).
+const WEBVIEW_COOKIE_SET: (&str, &str) = (
+    "AtlTest: webview-cookie-set: ",
+    "get=a=1 has=true cb=true main=true",
+);
+/// Main.webViewCookieWeb's line: a page's document.cookie set reaches CookieManager.getCookie (`visible=true`) within the poll's 5 s; `window-us=` is the measured D5 window, printed, not judged.
+const WEBVIEW_COOKIE_WEB: &str = "AtlTest: webview-cookie-web: ";
+/// Main.webViewDownload's line: a response of a type the engine does not render goes to DownloadListener (its MIME type) with the view's user agent.
+const WEBVIEW_DOWNLOAD: (&str, &str) = (
+    "AtlTest: webview-download: ",
+    "mime=application/x-atl-test ua=true",
 );
 
 /// Lines the fixture logs after onCreate, from binder callbacks: (row, line prefix, expected value). The watch waits for all of them (up to RESULT_WAIT).
@@ -1972,6 +1985,25 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
             "webview-settings: want {want:?}, got {webview_settings:?}"
         ));
     }
+    for (prefix, want) in [WEBVIEW_COOKIE_SET, WEBVIEW_DOWNLOAD] {
+        let got = after(prefix);
+        if passed && got.as_deref() != Some(want) {
+            whys.push(format!(
+                "{}want {want:?}, got {got:?}",
+                prefix.trim_start_matches("AtlTest: ")
+            ));
+        }
+    }
+    let webview_cookie_web = after(WEBVIEW_COOKIE_WEB);
+    if passed
+        && !webview_cookie_web
+            .as_deref()
+            .is_some_and(|l| l.starts_with("visible=true "))
+    {
+        whys.push(format!(
+            "webview-cookie-web: want visible=true, got {webview_cookie_web:?}"
+        ));
+    }
     let features = app
         .lines()
         .find_map(|l| l.split_once(FEATURES).map(|(_, r)| r.trim_end().to_owned()));
@@ -2125,6 +2157,12 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
         );
         println!("app: pass webview-package {}", WEBVIEW_PACKAGE.1);
         println!("app: pass webview-settings {}", WEBVIEW_SETTINGS.1);
+        println!("app: pass webview-cookie-set {}", WEBVIEW_COOKIE_SET.1);
+        println!(
+            "app: pass webview-cookie-web {}",
+            webview_cookie_web.as_deref().unwrap_or_default()
+        );
+        println!("app: pass webview-download {}", WEBVIEW_DOWNLOAD.1);
         if !remote {
             println!(
                 "app: pass priority {} ({})",

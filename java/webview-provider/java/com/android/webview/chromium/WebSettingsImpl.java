@@ -46,9 +46,9 @@ final class WebSettingsImpl extends WebSettings {
     @Override public native boolean getSavePassword();
     @Override public native void setTextZoom(int textZoom);
     @Override public native int getTextZoom();
-    // with the CookieManager (webview plan W4b): still refused
-    @Override public void setAcceptThirdPartyCookies(boolean accept) { throw Unimplemented.refuse("WebSettings.setAcceptThirdPartyCookies"); }
-    @Override public boolean getAcceptThirdPartyCookies() { throw Unimplemented.refuse("WebSettings.getAcceptThirdPartyCookies"); }
+    // the view's flag CookieManager.setAcceptThirdPartyCookies(WebView, boolean) sets too
+    @Override public native void setAcceptThirdPartyCookies(boolean accept);
+    @Override public native boolean getAcceptThirdPartyCookies();
     @Override public void setDefaultZoom(ZoomDensity zoom) { setDefaultZoomValue(zoom.getValue()); }
     @Override public ZoomDensity getDefaultZoom() { return zoomOf(getDefaultZoomValue()); }
     @Override public native void setLightTouchEnabled(boolean enabled);

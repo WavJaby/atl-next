@@ -379,6 +379,16 @@ struct Native {
     interfaces: RefCell<Vec<(String, usize, Vec<String>)>>,
     /// The WebSettings values (settings.rs table): stored here, the engine's own pushed on set.
     settings: RefCell<Settings>,
+    /// CookieManager.setAcceptThirdPartyCookies(this view) (= WebSettings.setAcceptThirdPartyCookies); counted in [`crate::cookies::third_party`] while on.
+    third_party: Cell<bool>,
+}
+
+impl Native {
+    fn set_third_party(&self, on: bool) {
+        if self.third_party.replace(on) != on {
+            crate::cookies::third_party(on);
+        }
+    }
 }
 
 impl Native {
@@ -508,6 +518,9 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProvid
             return NULL;
         }
     };
+    // CookieManager.setAcceptThirdPartyCookies javadoc: apps targeting KITKAT (19) or below allow them by default, LOLLIPOP (21) and later do not
+    let third_party = app.target_sdk < 21;
+    crate::cookies::start();
     // the defaults reach the engine before the page can load; the user agent is the device's string (S5)
     let settings = Settings::new(app);
     for (which, value) in settings.engine_values() {
@@ -531,7 +544,10 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProvid
         shared: shared.clone(),
         interfaces: RefCell::default(),
         settings: RefCell::new(settings),
+        third_party: Cell::new(false),
     }));
+    // SAFETY: just made; the only reference.
+    unsafe { &*native }.set_third_party(third_party);
     let c = jni_call!(
         env,
         FindClass,
@@ -561,7 +577,9 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProvid
     };
     if obj.is_null() {
         // SAFETY: never handed to Java: this is its only owner
-        drop(unsafe { Box::from_raw(native) });
+        let n = unsafe { Box::from_raw(native) };
+        n.set_third_party(false);
+        drop(n);
         return NULL;
     }
     shared
@@ -594,6 +612,17 @@ fn on_event(shared: &Shared, ev: WebEvent) {
         c"Landroid/webkit/WebChromeClient;",
     );
     match ev {
+        WebEvent::Download {
+            url,
+            content_disposition,
+            mime_type,
+            content_length,
+        } => on_download(
+            env,
+            provider,
+            &[&url, &content_disposition, &mime_type],
+            content_length,
+        ),
         WebEvent::LoadStarted(url) if !client.is_null() => {
             let u = new_string(env, &url);
             call_void(
@@ -658,6 +687,44 @@ fn on_event(shared: &Shared, ev: WebEvent) {
     }
     raise_uncaught(env);
     for o in [provider, web_view, client, chrome] {
+        delete_local(env, o);
+    }
+}
+
+/// A navigation the engine handed over as a download: DownloadListener.onDownloadStart(url, userAgent, contentDisposition, mimetype, contentLength), the user agent being the view's
+/// (WebSettings.getUserAgentString); without a listener nothing happens (the engine already dropped the navigation, the page stays).
+fn on_download(env: Env, provider: Obj, [url, disposition, mime]: &[&str; 3], length: i64) {
+    let listener = object_field(
+        env,
+        provider,
+        c"mDownloadListener",
+        c"Landroid/webkit/DownloadListener;",
+    );
+    if listener.is_null() {
+        tracing::info!("webview: download {url} ({mime}) with no DownloadListener: dropped");
+        return;
+    }
+    let ua = native(env, provider)
+        .map(|n| n.text(Setting::UserAgentString))
+        .unwrap_or_default();
+    let args: Vec<Obj> = [*url, &ua, *disposition, *mime]
+        .iter()
+        .map(|s| new_string(env, s))
+        .collect();
+    call_void(
+        env,
+        listener,
+        c"onDownloadStart",
+        c"(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;J)V",
+        &[
+            l(args[0]),
+            l(args[1]),
+            l(args[2]),
+            l(args[3]),
+            jvalue { j: length },
+        ],
+    );
+    for o in args.into_iter().chain([listener]) {
         delete_local(env, o);
     }
 }
@@ -1162,6 +1229,7 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewProviderImpl_destroy(
     jni_call!(env, SetLongField, this, f, 0);
     // SAFETY: the Box createWebView leaked; the field is cleared first, so no native reaches it again.
     let n = unsafe { Box::from_raw(p) };
+    n.set_third_party(false);
     for (_, g, _) in n.interfaces.borrow_mut().drain(..) {
         jni_call!(env, DeleteGlobalRef, g as Obj);
     }
@@ -1252,6 +1320,175 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_setBackgr
     let _ = env;
     n.view.set_background_color(color as u32);
 });
+
+provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_setInitialScale, (env, n, percent: i32) -> () = (), {
+    let _ = env;
+    n.view.set_initial_scale(percent);
+});
+
+// ---- CookieManager (webview plan D5): the copy in crate::cookies; one CookieManagerImpl per process ----
+
+static COOKIE_MANAGER: OnceLock<usize> = OnceLock::new();
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProviderForT_getCookieManager(
+    env: Env,
+    _this: Obj,
+) -> Obj {
+    if let Some(&g) = COOKIE_MANAGER.get() {
+        return g as Obj;
+    }
+    crate::cookies::start();
+    let obj = new_object(
+        env,
+        c"com/android/webview/chromium/CookieManagerImpl",
+        c"()V",
+        &[],
+    );
+    if obj.is_null() {
+        return NULL;
+    }
+    let global = jni_call!(env, NewGlobalRef, obj) as usize;
+    delete_local(env, obj);
+    // a racing thread's instance wins, as getStatics
+    *COOKIE_MANAGER.get_or_init(|| global) as Obj
+}
+
+/// A CookieReply (global ref) as a done callback: `post(value)` on the thread the engine answers on (the UI thread), which the reply hands to the caller's Looper.
+fn cookie_reply(env: Env, reply: Obj) -> Box<dyn FnOnce(bool) + Send> {
+    let g = (!reply.is_null()).then(|| jni_call!(env, NewGlobalRef, reply) as usize);
+    Box::new(move |ok| {
+        let Some(g) = g else { return };
+        let Some(env) = env_now() else { return };
+        call_void(env, g as Obj, c"post", c"(Z)V", &[jvalue { z: ok as u8 }]);
+        raise_uncaught(env);
+        jni_call!(env, DeleteGlobalRef, g as Obj);
+    })
+}
+
+/// The provider of `web_view` (WebView.getWebViewProvider), as its native view.
+fn web_view_native<'a>(env: Env, web_view: Obj) -> Option<&'a Native> {
+    if web_view.is_null() {
+        return None;
+    }
+    let p = call_obj(
+        env,
+        web_view,
+        c"getWebViewProvider",
+        c"()Landroid/webkit/WebViewProvider;",
+        &[],
+    );
+    let n = (!p.is_null()).then(|| native(env, p)).flatten();
+    delete_local(env, p);
+    n
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_android_webview_chromium_CookieManagerImpl_setAcceptCookie(
+    _env: Env,
+    _this: Obj,
+    accept: u8,
+) {
+    crate::cookies::set_accept(accept != 0);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_android_webview_chromium_CookieManagerImpl_acceptCookie(
+    _env: Env,
+    _this: Obj,
+) -> u8 {
+    crate::cookies::accept() as u8
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_android_webview_chromium_CookieManagerImpl_setAcceptThirdPartyCookies(
+    env: Env,
+    _this: Obj,
+    web_view: Obj,
+    accept: u8,
+) {
+    if let Some(n) = web_view_native(env, web_view) {
+        n.set_third_party(accept != 0);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_android_webview_chromium_CookieManagerImpl_acceptThirdPartyCookies(
+    env: Env,
+    _this: Obj,
+    web_view: Obj,
+) -> u8 {
+    web_view_native(env, web_view).is_some_and(|n| n.third_party.get()) as u8
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_android_webview_chromium_CookieManagerImpl_setCookieNative(
+    env: Env,
+    _class: Obj,
+    url: Obj,
+    value: Obj,
+    reply: Obj,
+) {
+    let done = cookie_reply(env, reply);
+    match (string(env, url), string(env, value)) {
+        (Some(u), Some(v)) => crate::cookies::set(&u, &v, done),
+        _ => done(false),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_android_webview_chromium_CookieManagerImpl_getCookie(
+    env: Env,
+    _this: Obj,
+    url: Obj,
+) -> Obj {
+    string(env, url)
+        .and_then(|u| crate::cookies::get(&u))
+        .map_or(NULL, |c| new_string(env, &c))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_android_webview_chromium_CookieManagerImpl_removeNative(
+    env: Env,
+    _class: Obj,
+    all: u8,
+    reply: Obj,
+) {
+    crate::cookies::remove(all != 0, cookie_reply(env, reply));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_android_webview_chromium_CookieManagerImpl_hasCookies(
+    _env: Env,
+    _this: Obj,
+) -> u8 {
+    crate::cookies::any() as u8
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_android_webview_chromium_CookieManagerImpl_removeExpiredCookie(
+    _env: Env,
+    _this: Obj,
+) {
+    crate::cookies::remove_expired();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_android_webview_chromium_CookieManagerImpl_allowFileSchemeCookiesImpl(
+    _env: Env,
+    _this: Obj,
+) -> u8 {
+    crate::cookies::file_scheme() as u8
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_android_webview_chromium_CookieManagerImpl_setAcceptFileSchemeCookiesImpl(
+    _env: Env,
+    _this: Obj,
+    accept: u8,
+) {
+    crate::cookies::set_file_scheme(accept != 0);
+}
 
 // ---- input (webview plan S2.2 amended, hold-and-replay) ----
 
@@ -1514,6 +1751,14 @@ flag_setting!(
     Java_com_android_webview_chromium_WebSettingsImpl_getBlockNetworkImage,
     BlockNetworkImage
 );
+settings_native!(Java_com_android_webview_chromium_WebSettingsImpl_setAcceptThirdPartyCookies, (env, n, accept: u8) -> () = (), {
+    let _ = env;
+    n.set_third_party(accept != 0);
+});
+settings_native!(Java_com_android_webview_chromium_WebSettingsImpl_getAcceptThirdPartyCookies, (env, n) -> u8 = 0, {
+    let _ = env;
+    n.third_party.get() as u8
+});
 settings_native!(Java_com_android_webview_chromium_WebSettingsImpl_setBlockNetworkLoads, (env, n, block: u8) -> () = (), {
     // WebSettings.java:1019-1021: false needs the INTERNET permission
     if block == 0 && !n.settings.borrow().internet() {

@@ -196,6 +196,94 @@ public class Main extends Activity {
 
     /** Keeps webViewPage's WebView reachable until its line is logged. */
     private android.webkit.WebView mWebView;
+    /** The same for webViewCookieWeb's and webViewDownload's. */
+    private android.webkit.WebView mCookieView, mDownloadView;
+
+    static final String COOKIE_URL = "https://atl.test/";
+
+    /**
+     * The cookie set line (app.rs WEBVIEW_COOKIE_SET, webview plan D5): a worker thread (no Looper) sets a cookie and reads it back at once (`get=`, `has=`); the callback reports `cb=` and
+     * runs on the main Looper (`main=`, CookieManager.java javadoc: the caller's Looper, the main one here). Then webViewCookieWeb.
+     */
+    private void webViewCookies() {
+        final String[] got = new String[2];
+        final java.util.concurrent.CountDownLatch read = new java.util.concurrent.CountDownLatch(1);
+        new Thread(new Runnable() {
+            @Override public void run() {
+                try {
+                    final android.webkit.CookieManager cm = android.webkit.CookieManager.getInstance();
+                    cm.setCookie(COOKIE_URL, "a=1; Path=/", new android.webkit.ValueCallback<Boolean>() {
+                        @Override public void onReceiveValue(Boolean ok) {
+                            try { read.await(); } catch (InterruptedException e) { }
+                            boolean main = android.os.Looper.myLooper() == android.os.Looper.getMainLooper();
+                            Log.i("AtlTest", "webview-cookie-set: get=" + got[0] + " has=" + got[1] + " cb=" + ok + " main=" + main);
+                            webViewCookieWeb(cm);
+                        }
+                    });
+                    got[0] = cm.getCookie(COOKIE_URL);
+                    got[1] = String.valueOf(cm.hasCookies());
+                } catch (Throwable e) {
+                    Log.i("AtlTest", "webview-cookie-set: threw=" + e);
+                }
+                read.countDown();
+            }
+        }, "cookie-worker").start();
+    }
+
+    /**
+     * The web cookie line (app.rs WEBVIEW_COOKIE_WEB, webview plan D5): a page at COOKIE_URL sets `w=2` through document.cookie (`page=` its document.cookie after the set, the engine has it);
+     * from then a worker polls CookieManager.getCookie until w=2 shows: `visible=` and `window-us=` the time it took (D5's accepted cost: the copy learns of web-set cookies late).
+     */
+    private void webViewCookieWeb(final android.webkit.CookieManager cm) {
+        android.webkit.WebView w = new android.webkit.WebView(this);
+        w.getSettings().setJavaScriptEnabled(true);
+        w.setWebViewClient(new android.webkit.WebViewClient() {
+            private boolean mDone;
+            @Override public void onPageFinished(android.webkit.WebView view, String url) {
+                if (mDone) return;
+                mDone = true;
+                view.evaluateJavascript("document.cookie = 'w=2; path=/'; document.cookie", new android.webkit.ValueCallback<String>() {
+                    @Override public void onReceiveValue(final String page) {
+                        final long t0 = System.nanoTime();
+                        new Thread(new Runnable() {
+                            @Override public void run() {
+                                String c = null;
+                                while (System.nanoTime() - t0 < 5000000000L) {
+                                    c = cm.getCookie(COOKIE_URL);
+                                    if (c != null && c.contains("w=2")) break;
+                                    try { Thread.sleep(1); } catch (InterruptedException e) { break; }
+                                }
+                                long us = (System.nanoTime() - t0) / 1000;
+                                boolean visible = c != null && c.contains("w=2");
+                                Log.i("AtlTest", "webview-cookie-web: visible=" + visible + " window-us=" + us + " page=" + page);
+                            }
+                        }, "cookie-poll").start();
+                    }
+                });
+            }
+        });
+        mCookieView = w;
+        w.loadDataWithBaseURL(COOKIE_URL, "<html><body>cookie</body></html>", "text/html", null, null);
+    }
+
+    /**
+     * The download line (app.rs WEBVIEW_DOWNLOAD): a response the engine does not render (a MIME type it has no viewer for) reaches DownloadListener.onDownloadStart instead:
+     * `mime=` its type, `ua=` whether its userAgent is the view's WebSettings.getUserAgentString.
+     */
+    private void webViewDownload() {
+        try {
+            final android.webkit.WebView w = new android.webkit.WebView(this);
+            w.setDownloadListener(new android.webkit.DownloadListener() {
+                @Override public void onDownloadStart(String url, String userAgent, String contentDisposition, String mimetype, long contentLength) {
+                    Log.i("AtlTest", "webview-download: mime=" + mimetype + " ua=" + userAgent.equals(w.getSettings().getUserAgentString()));
+                }
+            });
+            mDownloadView = w;
+            w.loadData("x", "application/x-atl-test", null);
+        } catch (Throwable e) {
+            Log.i("AtlTest", "webview-download: threw=" + e);
+        }
+    }
 
     /**
      * The WebView settings line (app.rs WEBVIEW_SETTINGS, webview plan S4.1): a WebView reads back what it sets across the kinds (a flag and an int the engine applies, a text the engine applies, an int the core stores), and AOSP's defaults for what it leaves alone.
@@ -261,6 +349,8 @@ public class Main extends Activity {
                         Log.i("AtlTest", "webview-ua: " + ua);
                         webViewSettings();
                         webViewPage();
+                        webViewCookies();
+                        webViewDownload();
                     }
                 });
             }

@@ -39,7 +39,8 @@ gtk4 = { version = "0.11", features = ["v4_14"] }
 gdk4-wayland = "0.11"
 # WebKitGTK 6.0 bindings (MIT; webview plan M68): only atl-webview-linux depends on it (deny.toml bans); same gtk-rs train as gtk4 0.11
 # gtk_v4_18: webkit6's WebView implements gtk::Accessible, which gtk4-rs gates behind a version feature; 4.18 = the GTK floor (plan Q10)
-webkit6 = { version = "0.6", features = ["gtk_v4_18"] }
+# v2_42: webkit_cookie_manager_get_all_cookies, the CookieManager copy's source (webview plan D5) -> WebKitGTK floor 2.42 (Debian trixie 2.54, Arch current)
+webkit6 = { version = "0.6", features = ["gtk_v4_18", "v2_42"] }
 object ={ version = "0.40", default-features = false, features = ["read_core", "elf", "std"] }
 # PipeWire client (plan A0): the PCM output of atl-platform-ui-linux, over the safe pipewire crate and its pipewire-sys / libspa bindings (libpipewire-0.3: deps.toml [pipewire]); deny.toml keeps it out of every crate but -linux
 pipewire = "0.10.1"

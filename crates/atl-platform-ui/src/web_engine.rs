@@ -7,12 +7,12 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use atl_platform_ui_api::abi::{
-    self, BytesOut, Callback, EvalResultView, Str, UiVtable, WebEventView, WebViewEntry,
-    WebViewHandle, WebViewVtable, web_event,
+    self, BytesOut, Callback, CookieList, CookieView, EvalResultView, SendCallback, Str, UiVtable,
+    WebEventView, WebViewEntry, WebViewHandle, WebViewVtable, web_event,
 };
 use atl_platform_ui_api::webview::{
-    InputClaim, LoadError, PromptReply, SIDEBAND_WEB_VIEW, SettingValue, WebEngine, WebEvent,
-    WebSetting, WebView, WebViewError,
+    Cookie, CookiePolicy, InputClaim, LoadError, PromptReply, SIDEBAND_WEB_VIEW, SettingValue,
+    WebEngine, WebEvent, WebSetting, WebView, WebViewError,
 };
 
 static MODULE: OnceLock<Result<&'static WebViewVtable, String>> = OnceLock::new();
@@ -97,6 +97,13 @@ impl WebEngine for PlatformWebEngine {
                         std::ptr::read(&e.reply)
                     })) as Box<dyn PromptReply>,
                 },
+                web_event::DOWNLOAD => WebEvent::Download {
+                    url: text,
+                    content_disposition: detail,
+                    // SAFETY: as above.
+                    mime_type: unsafe { e.extra.get() }.into_owned(),
+                    content_length: e.length,
+                },
                 _ => return,
             };
             events(ev);
@@ -117,6 +124,61 @@ impl WebEngine for PlatformWebEngine {
         unsafe { (ui.sideband_attach)(key, (m.view_widget)(h)) };
         Ok(PlatformWebView { m, ui, h, key })
     }
+
+    fn watch_cookies(mut changed: Box<dyn FnMut(Vec<Cookie>) + Send>) -> Result<(), WebViewError> {
+        let m = module()?;
+        let cb = SendCallback::new(move |list: &CookieList| {
+            // SAFETY: the module lends the list and its strings for this call.
+            let views = unsafe { std::slice::from_raw_parts(list.ptr, list.len) };
+            // SAFETY: as above.
+            changed(views.iter().map(|v| unsafe { v.get() }).collect());
+        });
+        // SAFETY: any thread (vtable contract).
+        ui_thread(unsafe { (m.cookies_watch)(cb) })
+    }
+
+    fn add_cookie(cookie: &Cookie, done: Box<dyn FnOnce(bool) + Send>) -> Result<(), WebViewError> {
+        let m = module()?;
+        let view = CookieView::of(cookie);
+        // SAFETY: any thread; the module copies the cookie before return.
+        ui_thread(unsafe { (m.cookies_add)(&view, once(done)) })
+    }
+
+    fn replace_cookies(
+        cookies: &[Cookie],
+        done: Box<dyn FnOnce(bool) + Send>,
+    ) -> Result<(), WebViewError> {
+        let m = module()?;
+        let views: Vec<CookieView> = cookies.iter().map(CookieView::of).collect();
+        let list = CookieList {
+            ptr: views.as_ptr(),
+            len: views.len(),
+        };
+        // SAFETY: as add_cookie; `views` borrows `cookies` for the call.
+        ui_thread(unsafe { (m.cookies_replace)(list, once(done)) })
+    }
+
+    fn set_cookie_policy(policy: CookiePolicy) -> Result<(), WebViewError> {
+        let m = module()?;
+        // SAFETY: any thread.
+        ui_thread(unsafe { (m.cookies_policy)(policy) })
+    }
+}
+
+/// A module's "queued on the UI thread" answer; false = the process has no UI thread (no-UI mode).
+fn ui_thread(queued: bool) -> Result<(), WebViewError> {
+    queued
+        .then_some(())
+        .ok_or_else(|| WebViewError::NoDisplay("no UI thread for the cookie store".into()))
+}
+
+fn once(done: Box<dyn FnOnce(bool) + Send>) -> SendCallback<bool> {
+    let mut done = Some(done);
+    SendCallback::new(move |ok: &bool| {
+        if let Some(d) = done.take() {
+            d(*ok);
+        }
+    })
 }
 
 /// A view of the module; UI thread only.
@@ -216,6 +278,11 @@ impl WebView for PlatformWebView {
     fn set_background_color(&self, argb: u32) {
         // SAFETY: see the impl comment.
         unsafe { (self.m.view_set_background)(self.h, argb) }
+    }
+
+    fn set_initial_scale(&self, percent: i32) {
+        // SAFETY: see the impl comment.
+        unsafe { (self.m.view_set_initial_scale)(self.h, percent) }
     }
 
     fn sideband_stream(&self) -> [i32; 2] {

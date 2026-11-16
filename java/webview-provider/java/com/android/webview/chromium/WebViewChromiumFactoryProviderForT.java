@@ -45,7 +45,7 @@ public final class WebViewChromiumFactoryProviderForT implements WebViewFactoryP
     public native WebViewProvider createWebView(WebView webView, WebView.PrivateAccess privateAccess);
 
     @Override public GeolocationPermissions getGeolocationPermissions() { throw Unimplemented.refuse("WebViewFactoryProvider.getGeolocationPermissions"); }
-    @Override public CookieManager getCookieManager() { throw Unimplemented.refuse("WebViewFactoryProvider.getCookieManager"); }
+    @Override public native CookieManager getCookieManager();
     @Override public TokenBindingService getTokenBindingService() { throw Unimplemented.refuse("WebViewFactoryProvider.getTokenBindingService"); }
     @Override public TracingController getTracingController() { throw Unimplemented.refuse("WebViewFactoryProvider.getTracingController"); }
     @Override public ServiceWorkerController getServiceWorkerController() { throw Unimplemented.refuse("WebViewFactoryProvider.getServiceWorkerController"); }

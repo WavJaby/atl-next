@@ -6,6 +6,7 @@
 #![deny(unsafe_code)]
 
 pub mod bridge;
+pub mod cookies;
 #[allow(unsafe_code)]
 mod jni;
 mod settings;

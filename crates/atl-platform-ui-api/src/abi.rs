@@ -15,7 +15,7 @@ use atl_compositor::scene::{BufferContent, Content, Quad, Scene, SceneBuffer, Sc
 use atl_libgui_parcel::state::FloatRect;
 
 use crate::audio::AudioError;
-use crate::webview::WebSetting;
+use crate::webview::{CookiePolicy, WebSetting};
 use crate::{
     FdEvents, Looper, Monitor, Painted, PhysSize, QuadRelease, Rotation, Scale, TextInputEvent,
     UiError,
@@ -159,6 +159,41 @@ impl<T> Callback<T> {
 }
 
 impl<T> Drop for Callback<T> {
+    fn drop(&mut self) {
+        // SAFETY: paired by `new`; Drop runs once.
+        unsafe { (self.drop)(self.data) }
+    }
+}
+
+/// An `FnMut(&T) + Send` closure across the boundary: made on one thread, called and dropped on another (the module's UI thread).
+#[repr(C)]
+pub struct SendCallback<T> {
+    data: *mut c_void,
+    call: unsafe extern "C" fn(*mut c_void, *const T),
+    drop: unsafe extern "C" fn(*mut c_void),
+}
+
+// SAFETY: `new` takes only Send closures.
+unsafe impl<T> Send for SendCallback<T> {}
+
+impl<T> SendCallback<T> {
+    /// Carries `f`; its code (and its drop) stay this side's.
+    pub fn new<F: FnMut(&T) + Send + 'static>(f: F) -> Self {
+        Self {
+            data: Box::into_raw(Box::new(f)).cast(),
+            call: call_box::<T, F>,
+            drop: drop_box::<F>,
+        }
+    }
+
+    /// Runs the closure with `value`.
+    pub fn call(&mut self, value: &T) {
+        // SAFETY: `data` and `call` were paired by `new` and `data` lives until drop.
+        unsafe { (self.call)(self.data, value) }
+    }
+}
+
+impl<T> Drop for SendCallback<T> {
     fn drop(&mut self) {
         // SAFETY: paired by `new`; Drop runs once.
         unsafe { (self.drop)(self.data) }
@@ -1126,6 +1161,72 @@ pub mod web_event {
     pub const PROGRESS: u32 = 6;
     /// `Prompt { message, default = text, reply }`.
     pub const PROMPT: u32 = 7;
+    /// `Download { url = text, content_disposition = detail, mime_type = extra, content_length = length }`.
+    pub const DOWNLOAD: u32 = 8;
+}
+
+/// One [`Cookie`](crate::webview::Cookie) for one call.
+#[repr(C)]
+pub struct CookieView {
+    /// The name.
+    pub name: Str,
+    /// The value.
+    pub value: Str,
+    /// The domain (leading `.` = a Domain cookie).
+    pub domain: Str,
+    /// The path.
+    pub path: Str,
+    /// Seconds since the epoch; read only when `has_expires`.
+    pub expires: i64,
+    /// False = a session cookie.
+    pub has_expires: bool,
+    /// Secure.
+    pub secure: bool,
+    /// HttpOnly.
+    pub http_only: bool,
+}
+
+impl CookieView {
+    /// Borrows `c`.
+    pub fn of(c: &crate::webview::Cookie) -> Self {
+        Self {
+            name: Str::of(&c.name),
+            value: Str::of(&c.value),
+            domain: Str::of(&c.domain),
+            path: Str::of(&c.path),
+            expires: c.expires.unwrap_or(0),
+            has_expires: c.expires.is_some(),
+            secure: c.secure,
+            http_only: c.http_only,
+        }
+    }
+
+    /// The owned cookie.
+    ///
+    /// # Safety
+    /// The strings it borrows are alive.
+    pub unsafe fn get(&self) -> crate::webview::Cookie {
+        // SAFETY: the caller's contract.
+        let s = |x: &Str| unsafe { x.get() }.into_owned();
+        crate::webview::Cookie {
+            name: s(&self.name),
+            value: s(&self.value),
+            domain: s(&self.domain),
+            path: s(&self.path),
+            expires: self.has_expires.then_some(self.expires),
+            secure: self.secure,
+            http_only: self.http_only,
+        }
+    }
+}
+
+/// A borrowed list of cookies for one call.
+#[repr(C)]
+pub struct CookieList {
+    /// The first.
+    pub ptr: *const CookieView,
+    /// How many.
+    pub len: usize,
 }
 
 /// One [`WebEvent`](crate::webview::WebEvent) for one call; a `PROMPT` event's `reply` passes to the receiver, which `take`s it once.
@@ -1141,6 +1242,10 @@ pub struct WebEventView {
     pub error: u32,
     /// `PROGRESS`.
     pub progress: i32,
+    /// `DOWNLOAD`: the MIME type.
+    pub extra: Str,
+    /// `DOWNLOAD`: the content length, -1 unknown.
+    pub length: i64,
     /// `PROMPT`: the reply, owned by the receiver.
     pub reply: ManuallyDrop<PromptReplyAbi>,
 }
@@ -1206,6 +1311,18 @@ pub struct WebViewVtable {
     pub view_set_str: unsafe extern "C" fn(view: *mut WebViewHandle, which: WebSetting, value: Str),
     /// `WebView::set_background_color`: an Android colour int (ARGB).
     pub view_set_background: unsafe extern "C" fn(view: *mut WebViewHandle, argb: u32),
+    /// `WebView::set_initial_scale`.
+    pub view_set_initial_scale: unsafe extern "C" fn(view: *mut WebViewHandle, percent: i32),
+    /// `WebEngine::watch_cookies`; any thread (queued to the UI thread). False = no UI thread in the process (`changed` dropped).
+    pub cookies_watch: unsafe extern "C" fn(changed: SendCallback<CookieList>) -> bool,
+    /// `WebEngine::add_cookie`; any thread, the cookie copied before return; `done` once, on the UI thread. False as `cookies_watch`.
+    pub cookies_add:
+        unsafe extern "C" fn(cookie: *const CookieView, done: SendCallback<bool>) -> bool,
+    /// `WebEngine::replace_cookies`; as `cookies_add`.
+    pub cookies_replace:
+        unsafe extern "C" fn(cookies: CookieList, done: SendCallback<bool>) -> bool,
+    /// `WebEngine::set_cookie_policy`; as `cookies_watch`.
+    pub cookies_policy: unsafe extern "C" fn(policy: CookiePolicy) -> bool,
     /// The view's toolkit widget (`GtkWidget *`), borrowed: valid while the view lives; handed to [`UiVtable::sideband_attach`].
     pub view_widget: unsafe extern "C" fn(view: *mut WebViewHandle) -> *mut c_void,
 }

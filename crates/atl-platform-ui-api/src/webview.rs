@@ -12,6 +12,51 @@ pub trait WebEngine {
 
     /// A new view, not shown anywhere (W0: an unparented WebKit view loads and runs JS); `events` gets every [`WebEvent`] on the UI thread until the view drops. JavaScript starts disabled (Android's default, WebSettings.getJavaScriptEnabled).
     fn create_view(events: Box<dyn FnMut(WebEvent)>) -> Result<Self::View, WebViewError>;
+
+    /// The process's cookie store (shared by every view). Any thread: the engine is touched on the UI thread only, so each call is queued there and returns at once; callbacks run on the UI thread.
+    /// `changed` gets the store's full list now and again after every change, whoever made it (a page's `document.cookie` / `Set-Cookie`, or [`Self::add_cookie`] / [`Self::replace_cookies`]).
+    /// Watching twice replaces the first watcher.
+    fn watch_cookies(changed: Box<dyn FnMut(Vec<Cookie>) + Send>) -> Result<(), WebViewError>;
+    /// Adds or replaces (same name, domain, path) `cookie`; `done(true)` once the store has it.
+    fn add_cookie(cookie: &Cookie, done: Box<dyn FnOnce(bool) + Send>) -> Result<(), WebViewError>;
+    /// Makes `cookies` the store's whole content; `done(true)` once it is.
+    fn replace_cookies(
+        cookies: &[Cookie],
+        done: Box<dyn FnOnce(bool) + Send>,
+    ) -> Result<(), WebViewError>;
+    /// Which cookies the network side accepts, for every view (the engine has one policy per store).
+    fn set_cookie_policy(policy: CookiePolicy) -> Result<(), WebViewError>;
+}
+
+/// One cookie, RFC 6265 storage model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cookie {
+    /// The name.
+    pub name: String,
+    /// The value.
+    pub value: String,
+    /// The host, lower case: `example.com` = host-only (sent to that host alone), `.example.com` = a Domain cookie (that host and its subdomains).
+    pub domain: String,
+    /// The path, starting with `/`.
+    pub path: String,
+    /// Expiry in seconds since the Unix epoch; None = a session cookie.
+    pub expires: Option<i64>,
+    /// Sent over secure schemes only.
+    pub secure: bool,
+    /// Not visible to `document.cookie`.
+    pub http_only: bool,
+}
+
+/// What the cookie store accepts ([`WebEngine::set_cookie_policy`]). The numbers are the vtable's ABI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum CookiePolicy {
+    /// Every cookie.
+    Always = 1,
+    /// None.
+    Never = 2,
+    /// First-party cookies only.
+    NoThirdParty = 3,
 }
 
 /// One page view; dropping it destroys the view.
@@ -38,6 +83,8 @@ pub trait WebView {
     fn set_setting(&self, which: WebSetting, value: &SettingValue);
     /// The view's background colour, an Android colour int (ARGB). WebView.setBackgroundColor hands it to the provider only (WebView.java:3072), so the page's background is the only one.
     fn set_background_color(&self, argb: u32);
+    /// The page scale: `percent` CSS pixels per 100 device pixels (WebView.setInitialScale's unit: screen density not applied); 0 = the engine's default scale.
+    fn set_initial_scale(&self, percent: i32);
     /// The ints of the sideband stream that shows this view (webview plan S2.2 amended): the provider sets them on the layer that carries the view, and every window draws the view where a quad with
     /// that stream lands, at that quad's depth. The same ints for the view's life.
     fn sideband_stream(&self) -> [i32; 2];
@@ -111,6 +158,17 @@ pub enum WebEvent {
         default: String,
         /// The answer channel.
         reply: Box<dyn PromptReply>,
+    },
+    /// A navigation's response is one the engine does not show (a type it cannot render, or `Content-Disposition: attachment`): the navigation was dropped, nothing is saved.
+    Download {
+        /// The response's URL.
+        url: String,
+        /// The `Content-Disposition` header, empty without one.
+        content_disposition: String,
+        /// The response's MIME type.
+        mime_type: String,
+        /// The body length, -1 when unknown.
+        content_length: i64,
     },
 }
 

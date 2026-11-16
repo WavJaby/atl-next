@@ -59,6 +59,7 @@ final class WebViewProviderImpl implements WebViewProvider, WebViewProvider.View
     private final WebSettingsImpl mSettings;
     private WebViewClient mWebViewClient = new WebViewClient();
     private WebChromeClient mWebChromeClient;
+    private DownloadListener mDownloadListener;
 
     // called by the native createWebView, which made the view
     private WebViewProviderImpl(long nativeView, WebView webView, WebView.PrivateAccess privateAccess) {
@@ -90,6 +91,9 @@ final class WebViewProviderImpl implements WebViewProvider, WebViewProvider.View
     @Override public WebChromeClient getWebChromeClient() { return mWebChromeClient; }
     @Override public ViewDelegate getViewDelegate() { return this; }
     @Override public ScrollDelegate getScrollDelegate() { return this; }
+    // read by the natives at a download (the engine dropped a navigation it does not show): no listener = nothing happens, the page stays
+    @Override public void setDownloadListener(DownloadListener listener) { mDownloadListener = listener; }
+    @Override public native void setInitialScale(int scaleInPercent);
 
     // ---- View-system callbacks on every WebView: counted, not thrown (Unimplemented.accept) ----
     // View state: WebView.setOverScrollMode's super call (WebView.java:2703) keeps it, so getOverScrollMode answers; the page has no overscroll mode of its own
@@ -129,7 +133,6 @@ final class WebViewProviderImpl implements WebViewProvider, WebViewProvider.View
     @Override public Picture capturePicture() { throw Unimplemented.refuse("WebViewProvider.capturePicture"); }
     @Override public PrintDocumentAdapter createPrintDocumentAdapter(String documentName) { throw Unimplemented.refuse("WebViewProvider.createPrintDocumentAdapter"); }
     @Override public float getScale() { throw Unimplemented.refuse("WebViewProvider.getScale"); }
-    @Override public void setInitialScale(int scaleInPercent) { throw Unimplemented.refuse("WebViewProvider.setInitialScale"); }
     @Override public void invokeZoomPicker() { throw Unimplemented.refuse("WebViewProvider.invokeZoomPicker"); }
     @Override public HitTestResult getHitTestResult() { throw Unimplemented.refuse("WebViewProvider.getHitTestResult"); }
     @Override public void requestFocusNodeHref(Message hrefMsg) { throw Unimplemented.refuse("WebViewProvider.requestFocusNodeHref"); }
@@ -160,7 +163,6 @@ final class WebViewProviderImpl implements WebViewProvider, WebViewProvider.View
     @Override public WebViewRenderProcess getWebViewRenderProcess() { throw Unimplemented.refuse("WebViewProvider.getWebViewRenderProcess"); }
     @Override public void setWebViewRenderProcessClient(Executor executor, WebViewRenderProcessClient client) { throw Unimplemented.refuse("WebViewProvider.setWebViewRenderProcessClient"); }
     @Override public WebViewRenderProcessClient getWebViewRenderProcessClient() { throw Unimplemented.refuse("WebViewProvider.getWebViewRenderProcessClient"); }
-    @Override public void setDownloadListener(DownloadListener listener) { throw Unimplemented.refuse("WebViewProvider.setDownloadListener"); }
     @Override public void setPictureListener(PictureListener listener) { throw Unimplemented.refuse("WebViewProvider.setPictureListener"); }
     @Override public WebMessagePort[] createWebMessageChannel() { throw Unimplemented.refuse("WebViewProvider.createWebMessageChannel"); }
     @Override public void postMessageToMainFrame(WebMessage message, Uri targetOrigin) { throw Unimplemented.refuse("WebViewProvider.postMessageToMainFrame"); }

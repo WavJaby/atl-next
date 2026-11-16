@@ -10,10 +10,10 @@ use std::mem::ManuallyDrop;
 use std::rc::Rc;
 
 use atl_platform_ui_api::abi::{
-    self, BytesOut, Callback, EvalResultView, PromptReplyAbi, Status, Str, WebEventView,
-    WebViewHandle, WebViewVtable, web_event,
+    self, BytesOut, Callback, CookieList, CookieView, EvalResultView, PromptReplyAbi, SendCallback,
+    Status, Str, WebEventView, WebViewHandle, WebViewVtable, web_event,
 };
-use atl_platform_ui_api::webview::{LoadError, WebSetting};
+use atl_platform_ui_api::webview::{Cookie, CookiePolicy, LoadError, WebSetting};
 use webkit6::glib;
 use webkit6::prelude::*;
 
@@ -36,6 +36,11 @@ static VTABLE: WebViewVtable = WebViewVtable {
     view_set_str,
     view_set_background,
     view_widget,
+    view_set_initial_scale,
+    cookies_watch,
+    cookies_add,
+    cookies_replace,
+    cookies_policy,
 };
 
 /// [`abi::WebViewEntry`]: the static vtable; starts nothing.
@@ -118,6 +123,8 @@ struct Pending {
     error: u32,
     progress: i32,
     reply: Option<PromptReplyAbi>,
+    extra: String,
+    length: i64,
 }
 
 /// The sink plus a queue: a callback may call back into the view (loadUrl from onPageFinished) and WebKit may signal synchronously inside it; such a nested event waits until the running one returns, so order is kept and nothing is dropped.
@@ -151,14 +158,20 @@ impl Events {
         progress: i32,
         reply: Option<PromptReplyAbi>,
     ) {
-        self.queue.borrow_mut().push_back(Pending {
+        self.push(Pending {
             kind,
             text: text.to_owned(),
             detail: detail.to_owned(),
             error,
             progress,
             reply,
+            extra: String::new(),
+            length: 0,
         });
+    }
+
+    fn push(&self, p: Pending) {
+        self.queue.borrow_mut().push_back(p);
         if self.busy.replace(true) {
             return;
         }
@@ -173,6 +186,8 @@ impl Events {
                 detail: Str::of(&p.detail),
                 error: p.error,
                 progress: p.progress,
+                extra: Str::of(&p.extra),
+                length: p.length,
                 // the receiver takes `reply` only for PROMPT; any other event carries a placeholder this side drops
                 reply: ManuallyDrop::new(p.reply.unwrap_or_else(|| PromptReplyAbi::new(|_| {}))),
             };
@@ -260,6 +275,46 @@ unsafe extern "C" fn view_create(
             (w.estimated_load_progress() * 100.0).round() as i32,
             None,
         );
+    });
+    let ev = events.clone();
+    web.connect_decide_policy(move |_, decision, kind| {
+        if kind != webkit6::PolicyDecisionType::Response {
+            return false;
+        }
+        let Some(d) = decision.downcast_ref::<webkit6::ResponsePolicyDecision>() else {
+            return false;
+        };
+        let Some(r) = d.response() else {
+            return false;
+        };
+        let disposition = r
+            .http_headers()
+            .and_then(|h| h.one("Content-Disposition"))
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        // what Chromium hands to DownloadListener instead of showing: a type it cannot render, or a response that asks to be saved (RFC 6266 disposition type, case-insensitive)
+        let attachment = disposition
+            .split(';')
+            .next()
+            .is_some_and(|t| t.trim().eq_ignore_ascii_case("attachment"));
+        if d.is_mime_type_supported() && !attachment {
+            return false;
+        }
+        // the navigation is dropped, not saved: the app's DownloadListener decides what happens (Chromium's WebView never downloads by itself)
+        decision.ignore();
+        let length = r.content_length();
+        ev.push(Pending {
+            kind: web_event::DOWNLOAD,
+            text: r.uri().map(|u| u.to_string()).unwrap_or_default(),
+            detail: disposition,
+            error: 0,
+            progress: 0,
+            reply: None,
+            extra: r.mime_type().map(|m| m.to_string()).unwrap_or_default(),
+            // WebKit reports 0 for an unknown length (no Content-Length) -> -1, the API's "unknown"
+            length: if length == 0 { -1 } else { length as i64 },
+        });
+        true
     });
     let ev = events.clone();
     web.connect_script_dialog(move |_, dialog| {
@@ -476,6 +531,163 @@ unsafe extern "C" fn view_set_background(h: *mut WebViewHandle, argb: u32) {
     let channel = |shift: u32| f32::from(((argb >> shift) & 0xff) as u8) / 255.0;
     let rgba = webkit6::gdk::RGBA::new(channel(16), channel(8), channel(0), channel(24));
     view(h).web.set_background_color(&rgba);
+}
+
+unsafe extern "C" fn view_set_initial_scale(h: *mut WebViewHandle, percent: i32) {
+    let web = &view(h).web;
+    // WebKit's zoom multiplies the toolkit's device scale; setInitialScale counts device pixels ("doesn't take the screen density into account", WebView.java:1186) -> divide it out
+    let zoom = if percent > 0 {
+        f64::from(percent) / 100.0 / f64::from(web.scale_factor().max(1))
+    } else {
+        1.0
+    };
+    web.set_zoom_level(zoom);
+}
+
+/// Runs `f` on the UI thread (the owner of GLib's default context, as [`user_agent`]): now when this is it, else queued; false = no UI thread (nobody owns the context), `f` dropped.
+fn on_ui(f: impl FnOnce() + Send + 'static) -> bool {
+    let ctx = glib::MainContext::default();
+    if ctx.is_owner() {
+        f();
+        return true;
+    }
+    if ctx.acquire().is_ok() {
+        return false;
+    }
+    ctx.invoke(f);
+    true
+}
+
+/// The default network session's cookie store (every view uses that session: `WebView::new`). UI thread.
+fn cookie_manager() -> Option<webkit6::CookieManager> {
+    webkit6::NetworkSession::default()?.cookie_manager()
+}
+
+fn soup_cookie(c: &Cookie) -> webkit6::soup::Cookie {
+    // max_age -1 = a session cookie; an expiry is set from the absolute time below
+    let mut s = webkit6::soup::Cookie::new(&c.name, &c.value, &c.domain, &c.path, -1);
+    if let Some(t) = c.expires
+        && let Ok(d) = glib::DateTime::from_unix_utc(t)
+    {
+        s.set_expires(&d);
+    }
+    s.set_secure(c.secure);
+    s.set_http_only(c.http_only);
+    s
+}
+
+fn from_soup(mut s: webkit6::soup::Cookie) -> Cookie {
+    let text = |g: Option<glib::GString>| g.map(|g| g.to_string()).unwrap_or_default();
+    Cookie {
+        name: text(s.name()),
+        value: text(s.value()),
+        domain: text(s.domain()),
+        path: text(s.path()),
+        expires: s.expires().map(|d| d.to_unix()),
+        secure: s.is_secure(),
+        http_only: s.is_http_only(),
+    }
+}
+
+/// The one watcher ([`cookies_watch`]); a second watch replaces it, the `changed` handler is connected once.
+static WATCHER: std::sync::Mutex<Option<SendCallback<CookieList>>> = std::sync::Mutex::new(None);
+
+/// Fetches the whole store and hands it to the watcher. UI thread.
+fn deliver_cookies(cm: &webkit6::CookieManager) {
+    cm.all_cookies(None::<&webkit6::gio::Cancellable>, |r| {
+        let list: Vec<Cookie> = match r {
+            Ok(v) => v.into_iter().map(from_soup).collect(),
+            Err(e) => {
+                tracing::warn!("webview: cookie fetch: {e}");
+                return;
+            }
+        };
+        let views: Vec<CookieView> = list.iter().map(CookieView::of).collect();
+        if let Some(w) = WATCHER.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+            w.call(&CookieList {
+                ptr: views.as_ptr(),
+                len: views.len(),
+            });
+        }
+    });
+}
+
+unsafe extern "C" fn cookies_watch(changed: SendCallback<CookieList>) -> bool {
+    on_ui(move || {
+        let Some(cm) = cookie_manager() else {
+            tracing::warn!("webview: no cookie manager");
+            return;
+        };
+        let first = WATCHER
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .replace(changed)
+            .is_none();
+        if first {
+            cm.connect_changed(deliver_cookies);
+        }
+        deliver_cookies(&cm);
+    })
+}
+
+fn finish(mut done: SendCallback<bool>, ok: bool) {
+    done.call(&ok);
+}
+
+unsafe extern "C" fn cookies_add(cookie: *const CookieView, done: SendCallback<bool>) -> bool {
+    // SAFETY: the caller lends the cookie and its strings for this call; copied here.
+    let c = unsafe { (*cookie).get() };
+    on_ui(move || {
+        let Some(cm) = cookie_manager() else {
+            return finish(done, false);
+        };
+        cm.add_cookie(
+            &soup_cookie(&c),
+            None::<&webkit6::gio::Cancellable>,
+            move |r| finish(done, r.is_ok()),
+        );
+    })
+}
+
+unsafe extern "C" fn cookies_replace(cookies: CookieList, done: SendCallback<bool>) -> bool {
+    // SAFETY: as cookies_add, for every cookie of the list.
+    let want: Vec<Cookie> = unsafe { std::slice::from_raw_parts(cookies.ptr, cookies.len) }
+        .iter()
+        // SAFETY: as above.
+        .map(|v| unsafe { v.get() })
+        .collect();
+    on_ui(move || {
+        let Some(cm) = cookie_manager() else {
+            return finish(done, false);
+        };
+        // WebKitGTK 2.42-2.54 has no replace call in the bindings: delete what is there, then add the list, in order on this thread
+        glib::MainContext::default().spawn_local(async move {
+            let mut ok = true;
+            match cm.all_cookies_future().await {
+                Ok(have) => {
+                    for c in have {
+                        ok &= cm.delete_cookie_future(&c).await.is_ok();
+                    }
+                }
+                Err(_) => ok = false,
+            }
+            for c in &want {
+                ok &= cm.add_cookie_future(&soup_cookie(c)).await.is_ok();
+            }
+            finish(done, ok);
+        });
+    })
+}
+
+unsafe extern "C" fn cookies_policy(policy: CookiePolicy) -> bool {
+    on_ui(move || {
+        let Some(cm) = cookie_manager() else { return };
+        cm.set_accept_policy(match policy {
+            CookiePolicy::Always => webkit6::CookieAcceptPolicy::Always,
+            CookiePolicy::Never => webkit6::CookieAcceptPolicy::Never,
+            CookiePolicy::NoThirdParty => webkit6::CookieAcceptPolicy::NoThirdParty,
+        });
+    })
 }
 
 unsafe extern "C" fn view_widget(h: *mut WebViewHandle) -> *mut std::ffi::c_void {
