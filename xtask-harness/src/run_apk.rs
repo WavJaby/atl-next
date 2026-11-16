@@ -407,6 +407,8 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
     };
     // no `--display`: atld reads the target's own monitor, as on the product's host (host_display); this host's monitor is not the target's
     let (rt, foreign) = runtime(root, &args, &files)?;
+    // the run's APK is bundled: its copy under the out dir, as the record and the bundle take only the out, java and tree roots
+    let files = bundled(&rt.out.join("run-apk").join("package"), files)?;
     let rt = match &a.display {
         Some(display) => rt.with_display(display.clone()),
         None => rt,
@@ -1002,6 +1004,21 @@ fn fps_summary(app: &str) -> Vec<String> {
                 v[0],
                 v[rank - 1]
             )
+        })
+        .collect()
+}
+
+/// `files` copied into `dir` under their own names: the copies are the run's inputs, so a remote run's bundle takes them.
+fn bundled(dir: &Path, files: Vec<PackageFile>) -> Result<Vec<PackageFile>> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    files
+        .into_iter()
+        .map(|f| {
+            let name = f.path.file_name().context("an APK without a file name")?;
+            let to = dir.join(name);
+            std::fs::copy(&f.path, &to)
+                .with_context(|| format!("copying {} to {}", f.path.display(), to.display()))?;
+            Ok(PackageFile { path: to })
         })
         .collect()
 }
