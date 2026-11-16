@@ -408,28 +408,36 @@ pub fn foreign_build_dir(text: &str) -> Option<String> {
     })
 }
 
-/// Dir locks this process holds shared, one per id; released at exit or by [`after_build`].
-static HELD: Mutex<Vec<(String, DirLock)>> = Mutex::new(Vec::new());
+/// Dir locks this process holds shared, one per (workspace, id); released at exit or by [`after_build`].
+static HELD: Mutex<Vec<(PathBuf, String, DirLock)>> = Mutex::new(Vec::new());
 
 fn hold(ws: &Path, id: &str) -> Result<()> {
     let mut held = HELD
         .lock()
         .map_err(|_| anyhow::anyhow!("dir lock table poisoned"))?;
-    if held.iter().all(|(m, _)| m != id) {
+    if held.iter().all(|(w, m, _)| w != ws || m != id) {
         let lock = build_pool::hold_dir(ws, id, || {
             eprintln!("out: ws/{id} is being pruned, waiting")
         })?;
-        held.push((id.to_owned(), lock));
+        held.push((ws.to_owned(), id.to_owned(), lock));
     }
     Ok(())
 }
 
-/// Drops this process's dir locks and returns their ids.
-fn release_holds() -> Result<BTreeSet<String>> {
+/// Drops this process's dir locks under workspace `ws` and returns their ids; other workspaces' holds stay.
+fn release_holds(ws: &Path) -> Result<BTreeSet<String>> {
     let mut held = HELD
         .lock()
         .map_err(|_| anyhow::anyhow!("dir lock table poisoned"))?;
-    Ok(held.drain(..).map(|(id, _lock)| id).collect())
+    let mut ids = BTreeSet::new();
+    held.retain(|(w, m, _)| {
+        let mine = w == ws;
+        if mine {
+            ids.insert(m.clone());
+        }
+        !mine
+    });
+    Ok(ids)
 }
 
 /// The end of a checkout's build (`native`, `check`, `cross`, the harness commands): the stale incremental sessions of the trees it wrote go, one line per build dir. `result` passes through unless the prune fails.
@@ -449,7 +457,7 @@ fn finish_build(root: &Path) -> Result<()> {
     let ws = Layout::of(root)?.workspace().to_owned();
     let now = unit_use::now()?;
     // a shared hold blocks the prune, so the dirs this process resolved are released first
-    let mut ids = release_holds()?;
+    let mut ids = release_holds(&ws)?;
     ids.insert(checkout_id(root)?);
     for id in ids {
         let line = match out_prune::prune_sessions(&ws, &id, now)? {
@@ -622,7 +630,7 @@ pub fn settle_target(root: &Path) -> Result<()> {
     if link_steps(&root.join(TARGET), &want)?.is_empty() {
         return Ok(());
     }
-    release_holds()?;
+    release_holds(&ws)?;
     let Some(_lock) = build_pool::try_lock_dir(&ws, &id)? else {
         return Ok(());
     };
@@ -1158,6 +1166,25 @@ mod tests {
         std::fs::remove_dir_all(&d).expect("cleanup");
     }
 
+    /// Holds are per workspace root: a second root's hold is taken although the id is held under the first (the table was keyed by id alone), and releasing one root leaves the other held.
+    #[test]
+    fn a_hold_is_taken_for_each_workspace_root() {
+        let (a, b) = (scratch("hold-a"), scratch("hold-b"));
+        hold(&a, "x").expect("hold a");
+        hold(&b, "x").expect("hold b");
+        let busy = |ws: &Path| build_pool::try_lock_dir(ws, "x").expect("probe").is_none();
+        assert!(busy(&a) && busy(&b), "a root's hold was skipped");
+        assert_eq!(
+            release_holds(&a).expect("release a"),
+            BTreeSet::from(["x".to_owned()])
+        );
+        assert!(!busy(&a), "releasing root a left it held");
+        assert!(busy(&b), "releasing root a dropped root b's hold");
+        release_holds(&b).expect("release b");
+        std::fs::remove_dir_all(&a).expect("cleanup a");
+        std::fs::remove_dir_all(&b).expect("cleanup b");
+    }
+
     /// The land's gate state is its own: publish leaves it out of the base (other checkouts would reuse it as fresh), and recopy puts the land's back, so the next land's gate runs warm.
     #[test]
     fn a_land_recopy_keeps_the_gate_state() {
@@ -1185,10 +1212,12 @@ mod tests {
         let dir = dir_of(&ws, LAND_ID);
         put(&dir.join(BOOTSTRAP_DIR).join("debug/own"));
         put(&dir.join(TARGET).join("debug/own"));
-        publish(&land).expect("publish");
+        // the base as publish copies it, minus publish's lock: that release sits right before recopy's try-lock on the same file, and a child another test thread forked meanwhile keeps the inherited fd (flock lasts until its exec)
+        std::fs::create_dir_all(pool(&ws).join("base")).expect("base dir");
+        copy_base(&dir, &base_of(&ws, &head)).expect("base");
         assert!(
             !base_of(&ws, &head).join(BOOTSTRAP_DIR).exists(),
-            "publish put the gate state in a base"
+            "the base carries the gate state"
         );
         recopy(&land).expect("recopy");
         assert!(
