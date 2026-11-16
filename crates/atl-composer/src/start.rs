@@ -94,8 +94,8 @@ fn registry() -> Result<Strong<dyn IRegistry>, String> {
     }
 }
 
-/// The TASK_INFO transaction: the size this process's window opens at and its Task's package, from the services (compositor_registry.rs). The size must be positive; the package is empty for a process with no Task.
-fn task_info() -> Result<(PhysSize, String), String> {
+/// The TASK_INFO transaction: the size this process's window opens at and its Task's package, from the services (compositor_registry.rs); None for a process with no Task (empty package). With a Task the size must be positive.
+fn task_info() -> Result<Option<(PhysSize, String)>, String> {
     let proxy = registry()?;
     let binder = proxy.as_binder();
     let data = binder.prepare_transact().map_err(|e| e.to_string())?;
@@ -107,9 +107,12 @@ fn task_info() -> Result<(PhysSize, String), String> {
     let package: String = reply
         .read()
         .map_err(|e| format!("task info package: {e}"))?;
+    if package.is_empty() {
+        return Ok(None);
+    }
     let side = |v: i32| u32::try_from(v).ok().filter(|v| *v > 0);
     match (side(width), side(height)) {
-        (Some(width), Some(height)) => Ok((PhysSize { width, height }, package)),
+        (Some(width), Some(height)) => Ok(Some((PhysSize { width, height }, package))),
         _ => Err(format!("task info {width}x{height}: not a size")),
     }
 }
@@ -129,7 +132,7 @@ fn register(ui_agent: &SpIBinder, composer: &SpIBinder) -> Result<(), String> {
 
 /// Starts this process's compositor and registers it. Call it with libbinder's thread pool running (the registry's reply and libgui's calls arrive on its threads) and before anything uses libgui.
 /// The clock thread and the present thread come from `host` in both modes; the UI agent keeps it for the window title's label lookup. Headless (`ui` None): scenes go to a report sink, and a scripted pointer goes in at the first frame. UI mode (`ui`: the toolkit
-/// this UI thread attached): scenes go through a mailbox to a GTK window ([`ui_window`]), which takes the latest on its frame clock. The caller is the UI thread in UI mode.
+/// this UI thread attached): scenes go through a mailbox to a GTK window ([`ui_window`]), which takes the latest on its frame clock. The caller is the UI thread in UI mode. A UI-mode process with no Task (TASK_INFO) opens no window and runs as headless.
 pub fn start(host: Arc<dyn VmHost>, ui: Option<PlatformUi>) -> Result<Arc<Composer>, String> {
     let threads: &dyn VmHost = &*host;
     let display = DisplayModel::parse_arg(&property(DISPLAY_PROPERTY)?)?;
@@ -163,14 +166,18 @@ pub fn start(host: Arc<dyn VmHost>, ui: Option<PlatformUi>) -> Result<Arc<Compos
     });
     // the in-app input method exists only with a window: its desktop side is the window's TextInput (headless: none, IMMS-lite answers NO_IME)
     let mut input_method = None;
-    let sender = if let Some(ui) = ui {
+    // the services' size and package for this process's Task: the window opens at the size, so its first bounds report changes nothing; the app id is named before its first commit.
+    // No Task (a provider, service or receiver process): no window -- AOSP shows none, and a second toplevel took the desktop focus from the app's.
+    let window = match ui {
+        Some(ui) => task_info()?.map(|task| (ui, task)),
+        None => None,
+    };
+    let sender = if let Some((ui, (size, package))) = window {
         input_method = Some(atl_ime::new_binder(Arc::new(ui.invoker())));
-        // the services' size and package for this process's Task: the window opens at the size, so its first bounds report changes nothing; the app id is named before its first commit.
         // Titled by the package until the first activity's setTaskDescription (onApplyThemeResource, in its create) brings the task label (UI agent TASK_TITLE): resolving that needs the app's Java side.
-        let (size, package) = task_info()?;
         let attributes = WindowAttributes {
             title: package.clone(),
-            app_id: (!package.is_empty()).then(|| format!("atl.{package}")),
+            app_id: Some(format!("atl.{package}")),
             size,
         };
         let mailbox = Arc::new(Mailbox::default());

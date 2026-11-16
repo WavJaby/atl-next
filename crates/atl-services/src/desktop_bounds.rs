@@ -79,18 +79,6 @@ pub struct ActivityInput {
     pub max_aspect: Option<f32>,
 }
 
-impl ActivityInput {
-    /// A process with no launch activity: AOSP's default activity (unspecified orientation, resizeable, no aspect limits).
-    pub fn no_activity() -> Self {
-        Self {
-            orientation: ActivityOrientation::Unspecified,
-            resizeable: true,
-            min_aspect: None,
-            max_aspect: None,
-        }
-    }
-}
-
 /// Ideal size as a share of the display: DESKTOP_MODE_INITIAL_BOUNDS_SCALE = 75 / 100f (DesktopModeBoundsCalculator.java:50-51), AOSP's default for persist.wm.debug.desktop_mode_initial_bounds_scale.
 const IDEAL_SCALE: f32 = 0.75;
 /// WINDOW_HEIGHT_PROPORTION (`:60`): the top offset is this share of the free height, so a centred window sits a little above middle.

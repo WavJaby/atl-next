@@ -13,9 +13,8 @@ use binder::{
 };
 
 use crate::activity::ActivityManager;
-use crate::desktop_bounds::ActivityInput;
 use crate::display::DisplayCallbacks;
-use crate::tasks::{TaskId, TaskSize, Tasks, initial_size};
+use crate::tasks::{TaskId, TaskSize, Tasks};
 use crate::ui_agents::UiAgents;
 use atl_services_types::compositor_registry::{
     DESCRIPTOR, GET_COMPOSER, REGISTER, SET_BOUNDS, SET_DISPLAY, TASK_INFO,
@@ -26,7 +25,7 @@ use atl_services_types::permission::{SHELL_UID, SYSTEM_UID};
 /// The interface name counters use.
 const INTERFACE: &str = "ICompositorRegistry";
 
-/// TASK_INFO's reply: the window's opening size and its Task's package (empty for a process with no Task).
+/// TASK_INFO's reply for a process with a Task: the window's opening size and the Task's package.
 pub struct TaskInfo {
     pub size: TaskSize,
     pub package: String,
@@ -56,8 +55,8 @@ pub trait ICompositorRegistry: Interface {
     /// SET_DISPLAY once its argument is read: the monitor in the `--display` form. The caller's uid must own a Task; a malformed form is refused; a change reaches every app (registry `display_changed`).
     fn set_display(&self, caller_uid: u32, display: &str) -> Result<(), StatusCode>;
 
-    /// TASK_INFO once the caller's pid is read: the size the process's window opens at and its Task's package (compositor_registry.rs TASK_INFO).
-    fn task_info(&self, caller_pid: i32) -> Result<TaskInfo, StatusCode>;
+    /// TASK_INFO once the caller's pid is read: the size the process's window opens at and its Task's package; None for a process with no Task, which opens no window (compositor_registry.rs TASK_INFO).
+    fn task_info(&self, caller_pid: i32) -> Result<Option<TaskInfo>, StatusCode>;
 }
 
 declare_binder_interface! {
@@ -137,10 +136,14 @@ fn dispatch(
         return service.set_display(ThreadState::get_calling_uid(), &display);
     }
     if code == TASK_INFO {
-        let info = service.task_info(ThreadState::get_calling_pid())?;
-        reply.write(&info.size.width)?;
-        reply.write(&info.size.height)?;
-        return reply.write(&info.package);
+        // no Task: 0 x 0 and an empty package (compositor_registry.rs TASK_INFO)
+        let (width, height, package) = match service.task_info(ThreadState::get_calling_pid())? {
+            Some(info) => (info.size.width, info.size.height, info.package),
+            None => (0, 0, String::new()),
+        };
+        reply.write(&width)?;
+        reply.write(&height)?;
+        return reply.write(&package);
     }
     if code != REGISTER {
         return Err(StatusCode::UNKNOWN_TRANSACTION);
@@ -159,7 +162,7 @@ impl ICompositorRegistry for BpCompositorRegistry {
         Err(StatusCode::INVALID_OPERATION)
     }
 
-    fn task_info(&self, _: i32) -> Result<TaskInfo, StatusCode> {
+    fn task_info(&self, _: i32) -> Result<Option<TaskInfo>, StatusCode> {
         Err(StatusCode::INVALID_OPERATION)
     }
 
@@ -187,7 +190,7 @@ impl ICompositorRegistry for Binder<BnCompositorRegistry> {
         self.0.set_display(caller_uid, display)
     }
 
-    fn task_info(&self, caller_pid: i32) -> Result<TaskInfo, StatusCode> {
+    fn task_info(&self, caller_pid: i32) -> Result<Option<TaskInfo>, StatusCode> {
         self.0.task_info(caller_pid)
     }
 
@@ -240,17 +243,15 @@ impl Registry {
 }
 
 impl ICompositorRegistry for Registry {
-    fn task_info(&self, caller_pid: i32) -> Result<TaskInfo, StatusCode> {
-        Ok(match self.activities.task_of_process(caller_pid) {
-            Some(task) => TaskInfo {
-                size: self.tasks.size(task).ok_or(StatusCode::BAD_VALUE)?,
-                package: self.tasks.package(task).ok_or(StatusCode::BAD_VALUE)?,
-            },
-            None => TaskInfo {
-                size: initial_size(&self.tasks.display(), &ActivityInput::no_activity()),
-                package: String::new(),
-            },
-        })
+    fn task_info(&self, caller_pid: i32) -> Result<Option<TaskInfo>, StatusCode> {
+        // a process started for a provider, service or receiver has no Task (activity.rs start_process_locked): AOSP shows no window for it
+        let Some(task) = self.activities.task_of_process(caller_pid) else {
+            return Ok(None);
+        };
+        Ok(Some(TaskInfo {
+            size: self.tasks.size(task).ok_or(StatusCode::BAD_VALUE)?,
+            package: self.tasks.package(task).ok_or(StatusCode::BAD_VALUE)?,
+        }))
     }
 
     fn set_bounds(
