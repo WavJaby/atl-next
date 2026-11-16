@@ -2,6 +2,7 @@
 //! btrfs metadata headroom: what a metadata write can still take, from btrfs's own counters.
 //! statfs counts data space only. 2026-11-16: the build pool showed 6-7 GB free while metadata was full and unallocated was 0, so every build failed (ENOSPC, then read-only).
 //! Headroom = metadata free inside its allocated chunks + unallocated raw bytes at the metadata profile's ratio (a new metadata chunk is cut from unallocated space: DUP takes 2 raw bytes per logical byte).
+//! The gate predicts persistent fullness, so chunk free = total - (used + reserved + pinned + readonly); `bytes_may_use` is not subtracted: it is other writers' in-flight reservations, released at transaction commit, and the kernel flushes and commits before it returns ENOSPC. Counting it made the headroom read 0 under load (2026-11-17: may_use 5.6 GiB of a 7.1 GiB total, 3.3 GiB settled free minutes later) and failed lands. It is read and shown as information only.
 //! Data chunks are cut from the same unallocated space, so the headroom is an upper bound.
 //! Source, read unprivileged (live 2026-11-16): `/sys/fs/btrfs/<uuid>/allocation/<type>/{total_bytes,bytes_used,bytes_reserved,bytes_pinned,bytes_readonly,bytes_may_use,disk_total}`; the filesystem's size from statfs `f_blocks` x `f_bsize`, not the block devices' sizes (a vhdx grown without `btrfs filesystem resize` makes them larger).
 //! Mapping: statfs `f_type` says btrfs; `/proc/self/mountinfo` names the mount's device; the `devices/<dev>` entry names the filesystem.
@@ -29,14 +30,13 @@ struct Space {
 }
 
 impl Space {
-    /// Logical bytes a new write can still take in the allocated chunks: `total` less btrfs's used sum (used + reserved + pinned + readonly + may_use).
+    /// Settled logical bytes free in the allocated chunks: `total` - (used + reserved + pinned + readonly). `may_use` left out: transient reservations the kernel flushes before ENOSPC.
     fn free_in_chunks(&self) -> u64 {
         let taken = self
             .used
             .saturating_add(self.reserved)
             .saturating_add(self.pinned)
-            .saturating_add(self.readonly)
-            .saturating_add(self.may_use);
+            .saturating_add(self.readonly);
         self.total.saturating_sub(taken)
     }
 }
@@ -44,8 +44,10 @@ impl Space {
 /// What metadata can still take: `bytes()` = `free_in_chunks` + `from_unallocated`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Headroom {
-    /// Logical metadata bytes free inside the allocated metadata chunks.
+    /// Settled logical metadata bytes free inside the allocated metadata chunks.
     pub free_in_chunks: u64,
+    /// Metadata `bytes_may_use`: in-flight reservations, shown only, not counted.
+    pub in_flight: u64,
     /// Raw bytes of the filesystem in no chunk, all profiles.
     pub unallocated: u64,
     /// Logical metadata bytes `unallocated` becomes at the metadata profile's ratio (DUP: half).
@@ -179,6 +181,7 @@ fn headroom(meta: &Space, unallocated: u64) -> Result<Headroom> {
     let logical = u128::from(unallocated) * u128::from(meta.total) / u128::from(meta.disk_total);
     Ok(Headroom {
         free_in_chunks: meta.free_in_chunks(),
+        in_flight: meta.may_use,
         unallocated,
         from_unallocated: u64::try_from(logical)
             .expect("total <= disk_total, so logical <= unallocated"),
@@ -268,26 +271,50 @@ mod tests {
         )
     }
 
-    /// Independent: unallocated = 8 GiB - (2 GiB + 4 GiB + 16 MiB) = 2 GiB - 16 MiB; DUP halves it; chunk free = 1 GiB - (900 + 100) MiB.
+    /// Independent: unallocated = 8 GiB - (2 GiB + 4 GiB + 16 MiB) = 2 GiB - 16 MiB; DUP halves it; chunk free = 1 GiB - 900 MiB = 124 MiB (may_use 100 MiB not counted).
     #[test]
     fn headroom_adds_unallocated_at_the_profile_ratio() {
         let root = scratch("dup");
         let h = headroom_of(&dup_tree(&root, 8 * GIB), 8 * GIB).expect("headroom");
         assert_eq!(h.unallocated, 2 * GIB - 16 * MIB);
         assert_eq!(h.from_unallocated, GIB - 8 * MIB);
-        assert_eq!(h.free_in_chunks, 24 * MIB);
-        assert_eq!(h.bytes(), GIB + 16 * MIB);
+        assert_eq!(h.free_in_chunks, 124 * MIB);
+        assert_eq!(h.in_flight, 100 * MIB);
+        assert_eq!(h.bytes(), GIB + 116 * MIB);
         assert_eq!(h.profile, 2.0);
     }
 
-    /// The incident's shape: no unallocated raw space, metadata chunks full.
+    /// The incident's shape: no unallocated raw space, metadata chunks nearly full.
     #[test]
     fn no_unallocated_leaves_only_the_chunk_free() {
         let root = scratch("full");
         let h = headroom_of(&dup_tree(&root, 6 * GIB + 16 * MIB), 6 * GIB + 16 * MIB)
             .expect("headroom");
         assert_eq!((h.unallocated, h.from_unallocated), (0, 0));
-        assert_eq!(h.bytes(), 24 * MIB);
+        assert_eq!(h.bytes(), 124 * MIB);
+    }
+
+    /// 2026-11-17 live reading: total 7258 MiB, used 3492 MiB, may_use 5684 MiB, no unallocated. may_use exceeds the free space, yet the settled headroom stays 7258 - 3492 = 3766 MiB (old formula: 0).
+    #[test]
+    fn in_flight_reservations_do_not_shrink_the_headroom() {
+        let root = scratch("in-flight");
+        let fs = fs_tree(
+            &root,
+            8 * GIB,
+            &[
+                (
+                    "metadata",
+                    [7258 * MIB, 3492 * MIB, 0, 0, 0, 5684 * MIB, 2 * 7258 * MIB],
+                ),
+                ("data", [GIB, 0, 0, 0, 0, 0, GIB]),
+                ("system", [8 * MIB, 0, 0, 0, 0, 0, 16 * MIB]),
+            ],
+        );
+        // fs size = allocated raw (2 x 7258 MiB + 1 GiB + 16 MiB): unallocated 0
+        let h = headroom_of(&fs, 2 * 7258 * MIB + GIB + 16 * MIB).expect("headroom");
+        assert_eq!(h.unallocated, 0);
+        assert_eq!(h.in_flight, 5684 * MIB);
+        assert_eq!(h.bytes(), 3766 * MIB);
     }
 
     /// Single profile: raw = logical, so unallocated counts one-to-one. Independent: 8 GiB - (1 GiB + 4 GiB + 8 MiB) = 3 GiB - 8 MiB.

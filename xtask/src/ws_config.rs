@@ -82,7 +82,7 @@ pub const DEFAULT_HOST_COMPACT_BELOW: u64 = 30;
 pub const DEFAULT_WORKSPACE_MIN_FREE: u64 = 6;
 /// `disk.pool_min_free` (GiB): the filesystem holding the build-dir pool. One child build that rewrites its whole copy writes ~4.2 GB on disk (measured 2026-11-15: 8.0 GB logical base at zstd:1 ~2x) + margin.
 pub const DEFAULT_POOL_MIN_FREE: u64 = 5;
-/// `disk.pool_metadata_min_free` (GiB): btrfs metadata headroom of the build-dir pool (`btrfs_space`: metadata free in its chunks + unallocated raw space at the profile ratio). statfs cannot see it: 2026-11-16 the pool had 6-7 GB data free while metadata was full with unallocated 0.
+/// `disk.pool_metadata_min_free` (GiB): btrfs metadata headroom of the build-dir pool (`btrfs_space`: settled metadata free in its chunks, in-flight `may_use` reservations not counted, + unallocated raw space at the profile ratio). statfs cannot see it: 2026-11-16 the pool had 6-7 GB data free while metadata was full with unallocated 0.
 /// Derivation (pool measured 2026-11-16): 2.08 GB metadata over 2.16 M paths = ~960 B per path, an upper bound for a reflink copy (a copy shares extent and csum items). A base is 156k paths = ~0.14 GiB. 1 GiB = ~7 base copies: two copies at once plus a build's metadata churn [estimate; re-measure with a real copy's metadata cost].
 pub const DEFAULT_POOL_METADATA_MIN_FREE: u64 = 1;
 

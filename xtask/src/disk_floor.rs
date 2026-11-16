@@ -143,13 +143,14 @@ pub fn pool_metadata(ws: &Path, cfg: &WsConfig) -> Result<Vec<(String, bool)>> {
 /// Metadata row for the pool at `path`: headroom, its parts, and whether it is under `floor_gib`.
 fn metadata_row(path: &Path, h: &Headroom, floor_gib: u64) -> (String, bool) {
     let line = format!(
-        "build-dir pool {} metadata: headroom {:.2} GiB (floor {floor_gib} GiB) = {:.2} GiB free in its chunks + {:.2} GiB from {:.2} GiB unallocated at profile {:.1}",
+        "build-dir pool {} metadata: headroom {:.2} GiB (floor {floor_gib} GiB) = {:.2} GiB free in its chunks + {:.2} GiB from {:.2} GiB unallocated at profile {:.1}; in flight (may_use) {:.2} GiB, not counted",
         path.display(),
         gib(h.bytes()),
         gib(h.free_in_chunks),
         gib(h.from_unallocated),
         gib(h.unallocated),
         h.profile,
+        gib(h.in_flight),
     );
     (line, h.bytes() < floor_gib.saturating_mul(GIB))
 }
@@ -219,6 +220,7 @@ mod tests {
     fn metadata_row_names_its_parts_and_trips_under_the_floor() {
         let live = Headroom {
             free_in_chunks: 328_843_264,
+            in_flight: GIB / 2,
             unallocated: 19_328_401_408,
             from_unallocated: 9_663_676_416,
             profile: 2.0,
@@ -226,11 +228,12 @@ mod tests {
         let (line, short) = metadata_row(Path::new("/p"), &live, 1);
         assert!(!short, "{line}");
         assert!(
-            line.contains("headroom 9.31 GiB (floor 1 GiB) = 0.31 GiB free in its chunks + 9.00 GiB from 18.00 GiB unallocated at profile 2.0"),
+            line.contains("headroom 9.31 GiB (floor 1 GiB) = 0.31 GiB free in its chunks + 9.00 GiB from 18.00 GiB unallocated at profile 2.0; in flight (may_use) 0.50 GiB, not counted"),
             "{line}"
         );
         let full = Headroom {
             free_in_chunks: 0,
+            in_flight: 0,
             unallocated: 0,
             from_unallocated: 0,
             profile: 2.0,
@@ -238,6 +241,7 @@ mod tests {
         assert!(metadata_row(Path::new("/p"), &full, 1).1);
         let at_floor = Headroom {
             free_in_chunks: 0,
+            in_flight: 0,
             unallocated: 2 * GIB,
             from_unallocated: GIB,
             profile: 2.0,
