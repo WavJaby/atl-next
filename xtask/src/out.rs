@@ -34,6 +34,8 @@ pub const KEEP_BASES: usize = 2;
 const TARGET: &str = "target";
 /// In a build dir: the commit of the base it was copied from.
 const BASE_FILE: &str = ".base";
+/// A build dir's bootstrap-gate target (bootstrap_gate.rs). Its cargo units key on the checkout path: refresh keeps it (out_prune::DIR_ROOTS), publish leaves it out.
+pub const BOOTSTRAP_DIR: &str = "bootstrap";
 
 /// `out` subcommands.
 #[derive(clap::Subcommand)]
@@ -153,8 +155,7 @@ pub fn out_dir(root: &Path, explicit: Option<&Path>) -> Result<PathBuf> {
         return Ok(std::path::absolute(dir)?);
     }
     let ws = Layout::of(root)?.workspace().to_owned();
-    let (id, dir) = ensure(root)?;
-    hold(&ws, &id)?;
+    let (_, dir) = ensure_held(root)?;
     if crate::tree::bound(CANONICAL).as_deref() == Some(dir.as_path()) {
         return Ok(ws.join(CANONICAL));
     }
@@ -184,7 +185,7 @@ pub fn ensure(root: &Path) -> Result<(String, PathBuf)> {
         .or(bases.first());
     let line = match pick {
         Some(c) => {
-            let tier = copy_tree(&base_of(&ws, c), &dir, Some(c))?;
+            let tier = copy_tree(&base_of(&ws, c), &dir, Some(c), &[])?;
             count(&ws, tier);
             format!("out: ws/{id} from base/{c} ({})", tier.name())
         }
@@ -197,6 +198,14 @@ pub fn ensure(root: &Path) -> Result<(String, PathBuf)> {
         }
     };
     println!("{line}");
+    Ok((id, dir))
+}
+
+/// [`ensure`], then a shared hold until [`after_build`]: refresh, leave and prune skip or wait for the dir meanwhile. For a build that writes its own tree there.
+pub fn ensure_held(root: &Path) -> Result<(String, PathBuf)> {
+    let ws = Layout::of(root)?.workspace().to_owned();
+    let (id, dir) = ensure(root)?;
+    hold(&ws, &id)?;
     Ok((id, dir))
 }
 
@@ -261,8 +270,8 @@ pub fn probe(src: &Path, dst_parent: &Path) -> Result<Tier> {
     Ok(if ok { Tier::Reflink } else { Tier::Copy })
 }
 
-/// Copies dir `src` to the absent `dst` with the probed tier, through a temp name renamed into place; `base` (when given) goes to `dst/.base`. Returns the tier.
-pub fn copy_tree(src: &Path, dst: &Path, base: Option<&str>) -> Result<Tier> {
+/// Copies dir `src` to the absent `dst` with the probed tier, through a temp name renamed into place; `base` (when given) goes to `dst/.base`; top-level entries of `src` named in `skip` are left out. Returns the tier.
+pub fn copy_tree(src: &Path, dst: &Path, base: Option<&str>, skip: &[&str]) -> Result<Tier> {
     let parent = dst.parent().context("copy target has no parent")?;
     let name = dst
         .file_name()
@@ -273,26 +282,47 @@ pub fn copy_tree(src: &Path, dst: &Path, base: Option<&str>) -> Result<Tier> {
         std::fs::remove_dir_all(&tmp).with_context(|| format!("removing {}", tmp.display()))?;
     }
     let tier = probe(src, parent)?;
-    let mut cp = Command::new("cp");
-    cp.arg("-a");
-    if tier == Tier::Reflink {
-        cp.arg("--reflink=always");
+    let mut entries = Vec::new();
+    for e in std::fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
+        let e = e?;
+        if !e.file_name().to_str().is_some_and(|n| skip.contains(&n)) {
+            entries.push(e.path());
+        }
     }
-    let status = cp
-        .arg("-T")
-        .arg(src)
-        .arg(&tmp)
-        .status()
-        .context("running cp")?;
-    if !status.success() {
-        let _ = std::fs::remove_dir_all(&tmp);
-        bail!(
-            "cp -a ({}) {} -> {} failed: {status}",
-            tier.name(),
-            src.display(),
-            tmp.display()
-        );
+    std::fs::create_dir(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    if !entries.is_empty() {
+        let mut cp = Command::new("cp");
+        cp.arg("-a");
+        if tier == Tier::Reflink {
+            cp.arg("--reflink=always");
+        }
+        let status = cp
+            .arg("-t")
+            .arg(&tmp)
+            .arg("--")
+            .args(&entries)
+            .status()
+            .context("running cp")?;
+        if !status.success() {
+            let _ = std::fs::remove_dir_all(&tmp);
+            bail!(
+                "cp -a ({}) {} -> {} failed: {status}",
+                tier.name(),
+                src.display(),
+                tmp.display()
+            );
+        }
     }
+    // the top dir keeps src's mode and mtime, as `cp -a -T` gave it: `bases` ranks by mtime
+    let meta = std::fs::metadata(src).with_context(|| format!("reading {}", src.display()))?;
+    std::fs::set_permissions(&tmp, meta.permissions())
+        .with_context(|| format!("setting the mode of {}", tmp.display()))?;
+    let mtime = meta
+        .modified()
+        .with_context(|| format!("reading the mtime of {}", src.display()))?;
+    std::fs::File::open(&tmp)
+        .and_then(|d| d.set_modified(mtime))
+        .with_context(|| format!("setting the mtime of {}", tmp.display()))?;
     let mark = tmp.join(BASE_FILE);
     match base {
         Some(c) => std::fs::write(&mark, format!("{c}\n"))
@@ -667,6 +697,11 @@ fn land_id(land: &Path) -> Result<()> {
     Ok(())
 }
 
+/// What `publish` keeps of `ws/land`: all but the gate's target ([`BOOTSTRAP_DIR`]). Its cargo units key on the land checkout's path; a child reflinking it would inherit foreign-path state.
+fn copy_base(src: &Path, dst: &Path) -> Result<Tier> {
+    copy_tree(src, dst, None, &[BOOTSTRAP_DIR])
+}
+
 /// Land's Publish: copies `ws/land` to `base/<HEAD of land>` under its exclusive lock (no build runs in it), through a temp name renamed into place. Returns the summary line.
 pub fn publish(land: &Path) -> Result<String> {
     land_id(land)?;
@@ -691,7 +726,7 @@ pub fn publish(land: &Path) -> Result<String> {
     };
     let parent = dst.parent().context("base has no parent")?;
     std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    let tier = copy_tree(&src, &dst, None)?;
+    let tier = copy_base(&src, &dst)?;
     count(&ws, tier);
     Ok(format!("out: base/{head} from ws/{id} ({})", tier.name()))
 }
@@ -772,7 +807,7 @@ pub fn refresh(root: &Path) -> Result<Option<String>> {
     let old = parent.join(format!(".{id}.old-{}", std::process::id()));
     std::fs::rename(&dir, &old)
         .with_context(|| format!("renaming {} -> {}", dir.display(), old.display()))?;
-    let tier = match copy_tree(&base_of(&ws, pick), &dir, Some(pick)) {
+    let tier = match copy_tree(&base_of(&ws, pick), &dir, Some(pick), &[]) {
         Ok(t) => t,
         Err(e) => {
             // the old dir back: a failed copy must not cost the checkout its build
@@ -1063,7 +1098,7 @@ mod tests {
             probe(&d.join("base/c1"), &d.join("ws")).expect("probe"),
             Tier::Copy
         );
-        let tier = copy_tree(&d.join("base/c1"), &d.join("ws/a"), Some("c1")).expect("copy");
+        let tier = copy_tree(&d.join("base/c1"), &d.join("ws/a"), Some("c1"), &[]).expect("copy");
         assert_eq!(tier, Tier::Copy);
         assert!(d.join("ws/a/sub/x.o").is_file());
         assert_eq!(
@@ -1084,6 +1119,21 @@ mod tests {
             "a temp name or probe file stayed"
         );
         assert!(!d.join("base/c1").join(".atl-reflink-probe").exists());
+        std::fs::remove_dir_all(&d).expect("cleanup");
+    }
+
+    /// A publish copy keeps the gate's target out of a base and every other entry in: a child reflinks the base, so a path-keyed target there would be inherited.
+    #[test]
+    fn a_base_copy_leaves_the_bootstrap_target_out() {
+        let d = scratch("base-skip");
+        put(&d.join("ws/land/target/x"));
+        put(&d.join("ws/land/cargo/y"));
+        put(&d.join("ws/land").join(BOOTSTRAP_DIR).join("z"));
+        std::fs::create_dir_all(d.join("base")).expect("base");
+        copy_base(&d.join("ws/land"), &d.join("base/c")).expect("copy");
+        assert!(d.join("base/c/target/x").is_file());
+        assert!(d.join("base/c/cargo/y").is_file());
+        assert!(!d.join("base/c").join(BOOTSTRAP_DIR).exists());
         std::fs::remove_dir_all(&d).expect("cleanup");
     }
 
@@ -1144,8 +1194,9 @@ mod tests {
         // HEAD at a: the dir came from base a, nothing newer is an ancestor
         g(&["checkout", "-q", "--detach", &a]);
         std::fs::create_dir_all(pool(&ws).join("ws")).expect("pool ws");
-        copy_tree(&base_of(&ws, &a), &dir_of(&ws, MAIN_ID), Some(&a)).expect("copy a");
+        copy_tree(&base_of(&ws, &a), &dir_of(&ws, MAIN_ID), Some(&a), &[]).expect("copy a");
         put(&dir_of(&ws, MAIN_ID).join("target/debug/own"));
+        put(&dir_of(&ws, MAIN_ID).join(BOOTSTRAP_DIR).join("debug/own"));
         let line = refresh(&repo).expect("refresh").expect("line");
         assert!(
             line.starts_with("out: keep") && line.contains("newest"),
@@ -1170,6 +1221,10 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(dir.join("from")).expect("from"), c);
         assert!(dir.join("target/debug/own").is_file(), "target/ not kept");
+        assert!(
+            dir.join(BOOTSTRAP_DIR).join("debug/own").is_file(),
+            "the gate's target not kept"
+        );
         let line = refresh(&repo).expect("refresh").expect("line");
         assert!(line.starts_with("out: keep"), "second refresh: {line}");
         let leftovers: Vec<_> = std::fs::read_dir(dir.parent().expect("parent"))

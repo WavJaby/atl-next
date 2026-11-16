@@ -2,7 +2,7 @@
 //! Check step `bootstrap`: a fresh checkout builds `xtask` without product crates or fetched trees.
 //!
 //! Two halves. Structural: every member in xtask's build closure (cargo metadata, non-dev edges) is a definition crate -- no build script, and only definition crates below it; derived from metadata, no hand list.
-//! Sandbox: `cargo build -p xtask` offline under bwrap with tmpfs over `src`, `src-wt` and `out` and no network, into a target dir outside them; a control build of [`CONTROL`] in the same sandbox must fail on a hidden path, else the sandbox hides nothing and the green build proves nothing.
+//! Sandbox: `cargo build -p xtask` offline under bwrap with tmpfs over `src`, `src-wt` and `out` and no network, into the checkout's bootstrap target bound back in place over `out` (see [`sandbox`]); a control build of [`CONTROL`] in the same sandbox must fail on a hidden path, else the sandbox hides nothing and the green build proves nothing.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -13,6 +13,7 @@ use atl_bwrap as bwrap;
 use atl_layout::Layout;
 
 use crate::modules;
+use crate::out;
 use crate::unit_use::{self, Echo, Units};
 use crate::workspace::{self, Workspace};
 
@@ -33,16 +34,10 @@ pub fn check(root: &Path) -> Result<()> {
     })?;
     let layout = Layout::of(root)?;
     let hidden = hidden_dirs(&layout);
-    // one target per checkout (`repo`, or the worktree dir's name): a shared one fed a worktree at another commit stale crate outputs (E0061 in xtask).
-    // Not in the build dir: the sandbox hides out/ (hidden_dirs).
-    let checkout = root
-        .file_name()
-        .with_context(|| format!("checkout {} has no name", root.display()))?;
-    let target = layout
-        .workspace()
-        .join("cache")
-        .join("bootstrap-gate")
-        .join(checkout);
+    // one target per checkout (its build dir): a shared one fed a worktree at another commit stale crate outputs (E0061 in xtask).
+    // Under out/, which the sandbox hides: sandbox() binds it back. ensure_held: refresh, leave and prune leave the dir alone while the gate runs.
+    let (_, dir) = out::ensure_held(root)?;
+    let target = state_dir(&dir);
     let tool = sandboxed_build(root, &hidden, &target, TOOL)?;
     if !tool.0 {
         bail!(
@@ -145,6 +140,23 @@ fn describe(dirs: &[PathBuf]) -> String {
         .join(", ")
 }
 
+/// The gate's target in build dir `dir` (`out::dir_of`): `out prune` removes it with the dir.
+fn state_dir(dir: &Path) -> PathBuf {
+    dir.join(out::BOOTSTRAP_DIR)
+}
+
+/// The sandbox options: tmpfs over each hidden dir, then `target` bound back in place. bwrap applies them in order, so the bind lands inside the tmpfs when `target` sits under a hidden dir.
+fn sandbox(root: &Path, hidden: &[PathBuf], target: &Path) -> bwrap::Args {
+    let mut a = bwrap::Args::new();
+    a.dev_bind("/", "/").unshare_net().die_with_parent();
+    for h in hidden {
+        a.tmpfs(h);
+    }
+    a.bind(target, target);
+    a.chdir(root);
+    a
+}
+
 /// (success, combined output) of `cargo build -p <krate>` in the sandbox.
 fn sandboxed_build(
     root: &Path,
@@ -153,15 +165,9 @@ fn sandboxed_build(
     krate: &str,
 ) -> Result<(bool, String)> {
     std::fs::create_dir_all(target).with_context(|| target.display().to_string())?;
-    let mut a = bwrap::Args::new();
-    a.dev_bind("/", "/").unshare_net().die_with_parent();
-    for h in hidden {
-        a.tmpfs(h);
-    }
-    a.chdir(root);
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut cmd = Command::new(bwrap::PROGRAM);
-    cmd.args(a.end())
+    cmd.args(sandbox(root, hidden, target).end())
         .arg(cargo)
         .args([
             "build",
@@ -241,5 +247,43 @@ mod tests {
             w.build_closure(TOOL),
             BTreeSet::from(["d".into(), "xtask".into()])
         );
+    }
+
+    /// Literals are the spec's pool layout (`out/pool/ws/<id>`), not `state_dir`'s own join.
+    #[test]
+    fn the_gate_state_lives_in_the_build_dir() {
+        let ws = Path::new("/home/u/atl-next");
+        assert_eq!(
+            state_dir(&out::dir_of(ws, "repo")),
+            Path::new("/home/u/atl-next/out/pool/ws/repo/bootstrap")
+        );
+        assert_eq!(
+            state_dir(&out::dir_of(ws, "bootstrap-gate-ws")),
+            Path::new("/home/u/atl-next/out/pool/ws/bootstrap-gate-ws/bootstrap")
+        );
+    }
+
+    /// Golden argv: bwrap applies options in order, so the bind back of the target follows the tmpfs over `out`; reversed, the target is an empty dir in the sandbox.
+    #[test]
+    fn sandbox_binds_the_target_after_the_hidden_dirs() {
+        let ws = Path::new("/home/u/atl-next");
+        let hidden = [ws.join("out")];
+        let target = state_dir(&out::dir_of(ws, "repo"));
+        let argv: Vec<String> = sandbox(ws, &hidden, &target)
+            .options()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let out_dir = "/home/u/atl-next/out";
+        let bootstrap = "/home/u/atl-next/out/pool/ws/repo/bootstrap";
+        let tmpfs = argv
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1] == out_dir)
+            .expect("tmpfs over out");
+        let bind = argv
+            .windows(3)
+            .position(|w| w[0] == "--bind" && w[1] == bootstrap && w[2] == bootstrap)
+            .expect("target bound back");
+        assert!(tmpfs < bind, "tmpfs at {tmpfs}, bind at {bind}: {argv:?}");
     }
 }

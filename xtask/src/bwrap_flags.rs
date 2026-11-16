@@ -55,6 +55,11 @@ const EXEMPT: &[(&str, &str, &str)] = &[
         "build",
         "aapt2 compile's `--dir`, not bwrap's",
     ),
+    (
+        "xtask/src/bootstrap_gate.rs",
+        "sandbox_binds_the_target_after_the_hidden_dirs",
+        "golden argv: bwrap applies options in order",
+    ),
 ];
 
 /// The `--name` literals of `text` (bwrap.rs).

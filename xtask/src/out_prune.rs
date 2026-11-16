@@ -28,12 +28,13 @@ const SECS_PER_DAY: u64 = 86_400;
 const MIB: f64 = 1_048_576.0;
 const GIB: f64 = 1_073_741_824.0;
 /// Target roots directly under a build dir: xtask's `--target-dir` names, and `target`, what a checkout's `target/` links to (out.rs). Cargo units key on the checkout path, so `out::refresh` keeps these from the checkout's own dir.
-pub const DIR_ROOTS: [&str; 5] = [
+pub const DIR_ROOTS: [&str; 6] = [
     "cargo",
     crate::packages::TARGET_DIR,
     crate::packages::TEST_TARGET_DIR,
     crate::packages::LINT_TARGET_DIR,
     "target",
+    crate::out::BOOTSTRAP_DIR,
 ];
 /// `<build dir>/gl/cargo*`: the GL probes' target roots.
 const GL_DIR: &str = "gl";
@@ -1256,7 +1257,7 @@ mod tests {
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 
-    /// The root names of a build dir: the target names xtask gives cargo (build, converter build, test and lint), the checkout's `target`, and the `cargo*` probes under `gl/`.
+    /// The root names of a build dir: the target names xtask gives cargo (build, converter build, test, lint and the bootstrap gate), the checkout's `target`, and the `cargo*` probes under `gl/`.
     #[test]
     fn dir_roots_are_the_target_names_and_the_gl_cargo_probes() {
         let ws = scratch("roots");
@@ -1273,6 +1274,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "bootstrap",
                 "cargo",
                 "cargo-converter",
                 "cargo-converter-lint",
