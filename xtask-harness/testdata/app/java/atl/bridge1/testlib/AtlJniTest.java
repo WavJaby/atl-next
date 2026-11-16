@@ -117,15 +117,21 @@ public final class AtlJniTest {
         return null;
     }
 
-    /** Releases es1Begin's context and pbuffer; true when EGL released both. */
-    public static boolean es1End() {
+    /** Releases es1Begin's context and pbuffer; "true" when EGL released both, else each call's result + eglGetError() right after it (names the failing call in the gate's FAIL line). */
+    public static String es1End() {
         if (egl == null) {
-            return false;
+            return "no egl (es1Begin did not run)";
         }
-        boolean ok = egl.eglMakeCurrent(dpy, EGL10.EGL_NO_SURFACE, EGL10.EGL_NO_SURFACE, EGL10.EGL_NO_CONTEXT);
-        ok &= egl.eglDestroyContext(dpy, ctx);
-        ok &= egl.eglDestroySurface(dpy, surf);
-        return ok;
+        boolean mc = egl.eglMakeCurrent(dpy, EGL10.EGL_NO_SURFACE, EGL10.EGL_NO_SURFACE, EGL10.EGL_NO_CONTEXT);
+        int mcErr = egl.eglGetError();
+        boolean dc = egl.eglDestroyContext(dpy, ctx);
+        int dcErr = egl.eglGetError();
+        boolean ds = egl.eglDestroySurface(dpy, surf);
+        int dsErr = egl.eglGetError();
+        if (mc && dc && ds) {
+            return "true";
+        }
+        return String.format("makeCurrent=%b 0x%x destroyContext=%b 0x%x destroySurface=%b 0x%x", mc, mcErr, dc, dcErr, ds, dsErr);
     }
 
     /** GL_VERSION of the current context starts "OpenGL ES-CM 1." or "OpenGL ES 1.1" (ANGLE): 1 when so, 0 when not, 0 with no current context (atl_jni_es1.c). */
