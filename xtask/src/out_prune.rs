@@ -9,15 +9,15 @@
 //! Symlinks are refused, never followed: a link under a root could point the prune outside it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
-use rustix::fs::{FlockOperation, flock};
 
 use crate::build_pool;
+use crate::flock::{Flock, Mode};
 use crate::out;
 use crate::unit_use::{self, BUILD, DEPS, EXAMPLES, FINGERPRINT};
 
@@ -110,7 +110,7 @@ pub struct Session {
     pub dir: Option<PathBuf>,
     pub lock: Option<PathBuf>,
     pub bytes: u64,
-    _held: Option<File>,
+    _held: Option<Flock>,
 }
 
 /// Totals of one sweep: stale units, stale sessions and their bytes, and the build dirs or trees that failed.
@@ -410,7 +410,7 @@ fn remove_plan(plan: &TreePlan) -> Result<()> {
 }
 
 /// cargo's build-dir lock of `tree`, taken without waiting: a build holds it for its whole run. None when one does.
-fn hold_tree(tree: &Path) -> Result<Option<File>> {
+fn hold_tree(tree: &Path) -> Result<Option<Flock>> {
     let path = tree.join(CARGO_LOCK);
     let file = OpenOptions::new()
         .read(true)
@@ -419,11 +419,7 @@ fn hold_tree(tree: &Path) -> Result<Option<File>> {
         .truncate(false)
         .open(&path)
         .with_context(|| format!("opening {}", path.display()))?;
-    match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(Some(file)),
-        Err(e) if std::io::Error::from(e).kind() == ErrorKind::WouldBlock => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("flock {}", path.display())),
-    }
+    Flock::try_take(file, Mode::Exclusive).with_context(|| format!("flock {}", path.display()))
 }
 
 /// The plan for one tree (its `.cargo-lock` held by the caller): its stale sessions in both scopes, its units under `Everything` only.
@@ -668,21 +664,24 @@ enum Lock {
     /// Another open file holds the exclusive flock.
     Held,
     /// Free: the file holding the flock now, or None when the lock file does not exist.
-    Free(Option<File>),
+    Free(Option<Flock>),
 }
 
-/// Takes `lock`'s exclusive flock without waiting. The caller keeps the returned file while it acts on the lock's state: a flock taken and dropped can still be held after the drop by a child this process forked meanwhile (the open file is shared until the child's exec), so a second probe of a lock this process freed may read it as held.
+/// Takes `lock`'s exclusive flock without waiting. The caller keeps the returned lock while it acts on the lock's state, so no process takes it in between.
 fn take_lock(lock: &Path) -> Result<Lock> {
     let file = match OpenOptions::new().read(true).open(lock) {
         Ok(file) => file,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Lock::Free(None)),
         Err(e) => return Err(e).with_context(|| format!("reading {}", lock.display())),
     };
-    match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(Lock::Free(Some(file))),
-        Err(e) if std::io::Error::from(e).kind() == ErrorKind::WouldBlock => Ok(Lock::Held),
-        Err(e) => Err(e).with_context(|| format!("flock {}", lock.display())),
-    }
+    Ok(
+        match Flock::try_take(file, Mode::Exclusive)
+            .with_context(|| format!("flock {}", lock.display()))?
+        {
+            Some(held) => Lock::Free(Some(held)),
+            None => Lock::Held,
+        },
+    )
 }
 
 /// Whether a process holds `lock` (a dry run's busy probe): the flock is taken and dropped at once.
@@ -1144,7 +1143,9 @@ mod tests {
         let tree = tree_fixture(&ws);
         write_record(&tree, &recent_uses());
         let build = fs::File::create(tree.join(CARGO_LOCK)).expect("cargo lock");
-        flock(&build, FlockOperation::NonBlockingLockExclusive).expect("hold");
+        let build = Flock::try_take(build, Mode::Exclusive)
+            .expect("flock")
+            .expect("hold");
         let plan = only_plan(prune_dir(&ws, "a", CUTOFF, NOW, true).expect("prune")).remove(0);
         assert!(plan.busy);
         assert!(plan.stale.is_empty() && plan.sessions.is_empty());
@@ -1366,13 +1367,14 @@ mod tests {
     }
 
     /// The fixture's held locks: `s-2-b`, `s-5-e` and orphan `s-8-h`. The returned files keep the flocks while the test runs.
-    fn hold_incremental_locks(x: &Path) -> Vec<File> {
+    fn hold_incremental_locks(x: &Path) -> Vec<Flock> {
         ["s-2-b.lock", "s-5-e.lock", "s-8-h.lock"]
             .iter()
             .map(|lock| {
-                let file = File::open(x.join(lock)).expect("open lock");
-                flock(&file, FlockOperation::NonBlockingLockExclusive).expect("hold");
-                file
+                let file = fs::File::open(x.join(lock)).expect("open lock");
+                Flock::try_take(file, Mode::Exclusive)
+                    .expect("flock")
+                    .expect("hold")
             })
             .collect()
     }

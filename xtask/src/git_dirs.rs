@@ -269,10 +269,6 @@ fn remove_shadow(dir: &Path) -> Result<()> {
         .with_context(|| format!("{} holds more than a git shadow", dir.display()))
 }
 
-/// Retries for the build-pool quiet window: a fork-to-exec window is microseconds to milliseconds, so 5 x 50 ms outlasts it, while a real build holds its slots for minutes.
-const SLOT_TRIES: u32 = 5;
-const SLOT_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
-
 /// What one run found (and, executed, did).
 #[derive(Debug, Default, PartialEq)]
 pub struct Summary {
@@ -300,17 +296,7 @@ pub fn migrate(scope: &Scope, execute: bool) -> Result<Summary> {
     let tasks = scope.ws.join("src-wt");
     let mut s = Summary::default();
     // held for the whole run: no leaf build runs while the git dirs move (a quiet window: every pool slot, none waited for).
-    // A few tries: a slot's flock is shared with every child the last holder's process forked until that child's exec, so a slot released a moment ago can still read as held (seen with parallel tests).
-    let take = || build_pool::try_take_all(scope.ws, std::path::Path::new("migrate-git-dirs"));
-    let mut taken = take()?;
-    for _ in 0..SLOT_TRIES {
-        if taken.is_ok() {
-            break;
-        }
-        std::thread::sleep(SLOT_RETRY);
-        taken = take()?;
-    }
-    let quiet = match taken {
+    let quiet = match build_pool::try_take_all(scope.ws, Path::new("migrate-git-dirs"))? {
         Ok(q) => Some(q),
         Err(holders) => {
             s.problems.push(format!(
@@ -475,6 +461,7 @@ fn check(tree: &Path, store: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     use std::time::Duration;
 
@@ -777,6 +764,8 @@ mod tests {
             .env(CHILD_ENV, &ws.root)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            // its own group: the kill takes the git children it runs too, as a killed terminal job would; a direct-child kill leaves them running (a busy process) or forked before exec (holding its pool slots)
+            .process_group(0)
             .spawn()
             .unwrap();
         let store = ws.root.join("src/.git-dirs");
@@ -784,8 +773,15 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
             store.is_dir()
         });
-        child.kill().unwrap();
+        let group = rustix::process::Pid::from_child(&child);
+        rustix::process::kill_process_group(group, rustix::process::Signal::KILL).unwrap();
         child.wait().unwrap();
+        // the orphans die asynchronously; their fds (and the slots) go with them
+        let gone = (0..10_000).any(|_| {
+            std::thread::sleep(Duration::from_millis(1));
+            rustix::process::test_kill_process_group(group).is_err()
+        });
+        assert!(gone, "the killed migrator's group outlived 10 s");
         assert!(started, "the child never started migrating");
         let s = migrate(&ws.scope(), false).unwrap();
         assert!(s.migrate > 0, "the kill came after the last rename: {s:?}");

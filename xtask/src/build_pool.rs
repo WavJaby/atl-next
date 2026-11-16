@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::flock::{Flock, Mode};
 use anyhow::{Context, Result, bail, ensure};
-use rustix::fs::{FlockOperation, flock};
 
 use crate::ws_config::{self, PoolConfig};
 
@@ -128,7 +128,7 @@ pub struct Grant {
     pub cpu_of: u32,
     pub mem_gib: u32,
     /// The slot files: their locks are the reservation, released when the grant drops.
-    _files: Vec<File>,
+    _files: Vec<Flock>,
     /// Thread-bound: the grant marker is per thread, so the grant must drop on the thread that made it.
     _thread: PhantomData<*const ()>,
 }
@@ -331,7 +331,7 @@ fn parent_pid(stat: &str) -> Option<u32> {
 struct Ticket {
     path: PathBuf,
     name: String,
-    _lock: File,
+    _lock: Flock,
 }
 
 impl Ticket {
@@ -349,10 +349,9 @@ impl Ticket {
             .create_new(true)
             .open(&tmp)
             .with_context(|| format!("creating {}", tmp.display()))?;
-        match flock(&lock, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => {}
-            Err(e) => return Err(e).with_context(|| format!("flock {}", tmp.display())),
-        }
+        let lock = Flock::try_take(lock, Mode::Exclusive)
+            .with_context(|| format!("flock {}", tmp.display()))?
+            .with_context(|| format!("{} is held: a fresh ticket", tmp.display()))?;
         let path = queue.join(&name);
         std::fs::rename(&tmp, &path).with_context(|| format!("queueing {}", path.display()))?;
         Ok(Ticket {
@@ -385,39 +384,40 @@ fn scan(queue: &Path, me: &str) -> Result<(usize, usize)> {
             Err(e) if e.kind() == ErrorKind::NotFound => continue,
             Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
         };
-        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => {
+        match Flock::try_take(file, Mode::Exclusive)
+            .with_context(|| format!("flock {}", path.display()))?
+        {
+            Some(_dead) => {
                 let _ = std::fs::remove_file(&path);
             }
-            Err(e) if std::io::Error::from(e).kind() == ErrorKind::WouldBlock => {
+            None => {
                 live += 1;
                 if name.as_str() < me {
                     ahead += 1;
                 }
             }
-            Err(e) => return Err(e).with_context(|| format!("flock {}", path.display())),
         }
     }
     Ok((ahead, live))
 }
 
 /// Takes one slot without waiting. The holder record is written under the lock; a reader may see it half-written, which costs a garbled wait line, nothing else.
-fn try_take(path: &Path, record: &str) -> Result<Option<File>> {
-    let mut file = OpenOptions::new()
+fn try_take(path: &Path, record: &str) -> Result<Option<Flock>> {
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(path)
         .with_context(|| format!("opening {}", path.display()))?;
-    match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => {}
-        Err(e) if std::io::Error::from(e).kind() == ErrorKind::WouldBlock => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("flock {}", path.display())),
-    }
-    file.set_len(0)?;
-    file.write_all(record.as_bytes())?;
-    Ok(Some(file))
+    let Some(mut held) = Flock::try_take(file, Mode::Exclusive)
+        .with_context(|| format!("flock {}", path.display()))?
+    else {
+        return Ok(None);
+    };
+    held.file().set_len(0)?;
+    held.file().write_all(record.as_bytes())?;
+    Ok(Some(held))
 }
 
 /// `Some(holder record)` when a holder has the slot, `None` when it is free. Takes nothing.
@@ -427,15 +427,16 @@ fn probe(path: &Path) -> Result<Option<String>> {
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
     };
-    match flock(&file, FlockOperation::NonBlockingLockShared) {
-        Ok(()) => Ok(None),
-        Err(e) if std::io::Error::from(e).kind() == ErrorKind::WouldBlock => Ok(Some(
+    match Flock::try_take(file, Mode::Shared)
+        .with_context(|| format!("flock {}", path.display()))?
+    {
+        Some(_free) => Ok(None),
+        None => Ok(Some(
             std::fs::read_to_string(path)
                 .unwrap_or_default()
                 .trim()
                 .to_owned(),
         )),
-        Err(e) => Err(e).with_context(|| format!("flock {}", path.display())),
     }
 }
 
@@ -445,7 +446,7 @@ fn try_grant(
     pool: &PoolConfig,
     w: ClassWeight,
     record: &str,
-) -> Result<Option<(u32, Vec<File>)>> {
+) -> Result<Option<(u32, Vec<Flock>)>> {
     let mut files = Vec::new();
     let mut mem = 0;
     for i in 1..=pool.mem_gib.value {
@@ -546,7 +547,7 @@ pub fn dir_lock_path(ws: &Path, id: &str) -> PathBuf {
 /// A held dir lock; dropping it (or the process dying) releases it.
 #[derive(Debug)]
 pub struct DirLock {
-    _file: File,
+    _held: Flock,
 }
 
 fn open_dir_lock(ws: &Path, id: &str) -> Result<(PathBuf, File)> {
@@ -565,26 +566,21 @@ fn open_dir_lock(ws: &Path, id: &str) -> Result<(PathBuf, File)> {
 /// Takes `op` on `id`'s lock; when it would block, `on_wait` runs once and the call waits.
 fn take_dir(ws: &Path, id: &str, shared: bool, on_wait: impl FnOnce()) -> Result<DirLock> {
     let (p, file) = open_dir_lock(ws, id)?;
-    let (try_op, op) = if shared {
-        (
-            FlockOperation::NonBlockingLockShared,
-            FlockOperation::LockShared,
-        )
+    let mode = if shared {
+        Mode::Shared
     } else {
-        (
-            FlockOperation::NonBlockingLockExclusive,
-            FlockOperation::LockExclusive,
-        )
+        Mode::Exclusive
     };
-    match flock(&file, try_op) {
-        Ok(()) => {}
-        Err(e) if std::io::Error::from(e).kind() == ErrorKind::WouldBlock => {
-            on_wait();
-            flock(&file, op).with_context(|| format!("flock {}", p.display()))?;
-        }
-        Err(e) => return Err(e).with_context(|| format!("flock {}", p.display())),
+    // a probe that fails leaves the lock untaken, so the file is reopened for the wait
+    if let Some(held) =
+        Flock::try_take(file, mode).with_context(|| format!("flock {}", p.display()))?
+    {
+        return Ok(DirLock { _held: held });
     }
-    Ok(DirLock { _file: file })
+    on_wait();
+    let (p, file) = open_dir_lock(ws, id)?;
+    let held = Flock::take(file, mode).with_context(|| format!("flock {}", p.display()))?;
+    Ok(DirLock { _held: held })
 }
 
 /// Shared hold on build dir `id`: any number of builds at once; waits (after `on_wait`) only while the dir is being made, deleted or pruned.
@@ -600,11 +596,9 @@ pub fn lock_dir(ws: &Path, id: &str, on_wait: impl FnOnce()) -> Result<DirLock> 
 /// Exclusive hold on build dir `id`, without waiting: `None` when a build holds it or another prune runs.
 pub fn try_lock_dir(ws: &Path, id: &str) -> Result<Option<DirLock>> {
     let (p, file) = open_dir_lock(ws, id)?;
-    match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(Some(DirLock { _file: file })),
-        Err(e) if std::io::Error::from(e).kind() == ErrorKind::WouldBlock => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("flock {}", p.display())),
-    }
+    Ok(Flock::try_take(file, Mode::Exclusive)
+        .with_context(|| format!("flock {}", p.display()))?
+        .map(|held| DirLock { _held: held }))
 }
 
 #[cfg(test)]
@@ -633,20 +627,6 @@ mod tests {
             std::fs::write(d.join(ws_config::FILE), t).unwrap();
         }
         d
-    }
-
-    /// Tries before a lock released a moment ago reads as free. The flock stays held by a child another test thread forked before the close and has not exec'd yet (git_dirs.rs hits the same race): FREE_TRIES x FREE_POLL covers that window.
-    const FREE_TRIES: u32 = 100;
-    const FREE_POLL: Duration = Duration::from_millis(10);
-
-    fn retry_until_free<T>(mut attempt: impl FnMut() -> Option<T>) -> Option<T> {
-        for _ in 0..FREE_TRIES {
-            if let Some(got) = attempt() {
-                return Some(got);
-            }
-            std::thread::sleep(FREE_POLL);
-        }
-        None
     }
 
     /// A thread that takes `class` as `who`, reports each wait line and then its grant, and holds the grant until `release` is sent (or dropped).
@@ -694,7 +674,7 @@ mod tests {
         );
         drop(second);
         assert!(
-            retry_until_free(|| try_lock_dir(&dir, "a").expect("lock file")).is_some(),
+            try_lock_dir(&dir, "a").unwrap().is_some(),
             "no build left, prune must get dir a"
         );
         assert!(
@@ -779,7 +759,6 @@ mod tests {
             .waits
             .recv_timeout(WAIT)
             .expect("the third native did not wait");
-        // a probe can also count a slot that another test's fork still holds (flock is shared with a child until its exec), so the line is checked for the wait and the two live holders only
         assert!(
             line.contains("native-full wants cpu >=8 mem 7 GiB"),
             "{line}"

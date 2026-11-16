@@ -29,6 +29,7 @@ pub mod deps;
 pub mod diag_shape;
 pub mod disk_floor;
 pub mod fetch;
+pub mod flock;
 pub mod gate_goals;
 pub mod git;
 pub mod git_dirs;

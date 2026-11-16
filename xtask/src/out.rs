@@ -1212,7 +1212,7 @@ mod tests {
         let dir = dir_of(&ws, LAND_ID);
         put(&dir.join(BOOTSTRAP_DIR).join("debug/own"));
         put(&dir.join(TARGET).join("debug/own"));
-        // the base as publish copies it, minus publish's lock: that release sits right before recopy's try-lock on the same file, and a child another test thread forked meanwhile keeps the inherited fd (flock lasts until its exec)
+        // the base as publish copies it (copy_base, without publish's lock)
         std::fs::create_dir_all(pool(&ws).join("base")).expect("base dir");
         copy_base(&dir, &base_of(&ws, &head)).expect("base");
         assert!(

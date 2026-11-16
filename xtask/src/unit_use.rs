@@ -21,10 +21,10 @@ use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
-use rustix::fs::{FlockOperation, flock};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::flock::{Flock, Mode};
 use crate::{cargo_lock, timing};
 
 /// JSON messages on stdout; diagnostics stay rendered on stderr.
@@ -314,7 +314,7 @@ fn update(tree: &Path, change: impl FnOnce(&mut Record)) -> Result<()> {
         .truncate(false)
         .open(&lock_path)
         .with_context(|| format!("opening {}", lock_path.display()))?;
-    flock(&lock, FlockOperation::LockExclusive)
+    let _lock = Flock::take(lock, Mode::Exclusive)
         .with_context(|| format!("flock {}", lock_path.display()))?;
     let mut record = match load(tree) {
         Ok(Some(record)) => record,
