@@ -1729,12 +1729,12 @@ fn post_draw_check(app: &str, services: &str) -> Result<String, String> {
     }
 }
 
-/// GTK's own debug output in the app log (GDK_DEBUG=dmabuf, set for every UI run): every scene buffer imported as a dmabuf texture, none downloaded through mmap (`gdk_dmabuf`), except on the driver's counted readback tier (`Verdict::ok_in`).
+/// GTK's own debug output in the app log (GDK_DEBUG=dmabuf, set for every UI run): every scene buffer imported as a dmabuf texture, none downloaded through mmap (`gdk_dmabuf`), except on a tier whose own lines allow it (`Verdict::tier`); the tier is logged.
 fn dmabuf_check(app: &str) -> Result<String, String> {
     let v = crate::gdk_dmabuf::Verdict::of(app);
-    if v.ok_in(app) {
+    if let Some(tier) = v.tier(app) {
         Ok(format!(
-            "{v} readback_frames={}",
+            "tier {tier}: {v} readback_frames={}",
             crate::gdk_dmabuf::readback_frames(app)
         ))
     } else {

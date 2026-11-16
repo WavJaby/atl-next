@@ -34,7 +34,8 @@ pub type Sample = (u32, f64, f64);
 /// The moves of one compressed GTK motion event, oldest first: GDK coalesces motion per frame clock and keeps the dropped samples in `gdk_event_get_history`, which excludes the event's own position.
 /// Each sample becomes its own MOVE, as an evdev device's are: AOSP's InputConsumer (consumeBatch) then folds them into one ACTION_MOVE with history samples per frame, so the app's VelocityTracker sees every sample.
 /// Times strictly increase, after `last` (the time of the pointer event published before): an evdev stream never repeats a time, while GDK on WSLg stamps every history sample of a frame with the frame's ms time (owner drag: ~15 one-pixel samples per 15 ms, all one time).
-/// AOSP keeps such duplicates as zero-dt history (InputConsumer canAddSample/resampleTouchState only skip them), so app-side per-sample velocity divides by 0; samples sharing a time collapse to the last position, and one timed at or before `last` (or after `current`) is dropped.
+/// AOSP keeps such duplicates as zero-dt history (InputConsumer canAddSample/resampleTouchState only skip them), so app-side per-sample velocity divides by 0; samples sharing a time collapse to the last position, and a history sample timed at or before `last` (or after `current`) is dropped.
+/// The event's own position is always published, even at `last`'s time: dropping it loses the move itself (a press and a drag in one ms -> the app saw DOWN, UP and no MOVE). Button events already share times with motion, so this adds no new zero-dt kind.
 pub fn motion_samples(
     history: impl IntoIterator<Item = Sample>,
     current: Sample,
@@ -42,7 +43,7 @@ pub fn motion_samples(
 ) -> Vec<Sample> {
     let mut samples: Vec<Sample> = Vec::new();
     let fresh = |s: &Sample| s.0 <= current.0 && last.is_none_or(|t| s.0 > t);
-    for s in history.into_iter().chain([current]).filter(fresh) {
+    for s in history.into_iter().filter(fresh).chain([current]) {
         match samples.last_mut() {
             Some(prev) if prev.0 == s.0 => *prev = s,
             Some(prev) if prev.0 > s.0 => {}
@@ -343,7 +344,7 @@ mod tests {
     }
 
     /// Owner's WSLg drag (tr-play-m1 log, DOWN at 7600 ms (x, y) (141, 458)): frames at 7613/7631/7643 ms each published 3-5 one-pixel moves sharing the frame's time.
-    /// Each frame collapses to its last position -> one move per distinct time, increasing; a frame at or before the previous event's time (DOWN 7600) publishes nothing.
+    /// Each frame collapses to its last position -> one move per distinct time, increasing; a frame at the previous event's time (DOWN 7600) still publishes its own position, its stale history dropped.
     #[test]
     fn shared_times_collapse_to_last_position() {
         let frames: [(&[Sample], Sample); 3] = [
@@ -380,7 +381,10 @@ mod tests {
                 (7643, 142.0, 448.0)
             ]
         );
-        assert_eq!(motion_samples([], (7600, 1.0, 1.0), Some(7600)), vec![]);
+        assert_eq!(
+            motion_samples([(7600, 0.0, 0.0)], (7600, 1.0, 1.0), Some(7600)),
+            vec![(7600, 1.0, 1.0)]
+        );
         assert_eq!(
             motion_samples([(30, 1.0, 1.0)], (40, 2.0, 2.0), Some(30)),
             vec![(40, 2.0, 2.0)]

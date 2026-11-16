@@ -22,6 +22,8 @@ pub struct Verdict {
     pub imported: usize,
     pub downloaded: usize,
     pub failed: usize,
+    /// [`NO_IMPORT`] lines: the renderer has no dma-buf import.
+    pub no_import: usize,
 }
 
 impl Verdict {
@@ -34,6 +36,8 @@ impl Verdict {
                 v.downloaded += 1;
             } else if FAILED.iter().any(|f| line.contains(f)) {
                 v.failed += 1;
+            } else if line.contains(NO_IMPORT) {
+                v.no_import += 1;
             }
         }
         v
@@ -44,11 +48,29 @@ impl Verdict {
         self.imported > 0 && self.downloaded == 0 && self.failed == 0
     }
 
-    /// [`Verdict::ok`], or the readback tier's presenter path (M58, plan gpu-readback S5 Q1): downloads allowed only when the same log has the driver's `buffer tier readback` line and a readback counter line > 0; still no failed import.
-    pub fn ok_in(&self, log: &str) -> bool {
-        self.ok() || (self.failed == 0 && self.downloaded > 0 && readback_frames(log) > 0)
+    /// The present tier the log shows, None when it fits none:
+    /// `import` = [`Verdict::ok`];
+    /// `readback` = the driver's readback tier (M58, plan gpu-readback S5 Q1): downloads only beside its `buffer tier readback` line and a readback counter > 0, no failed import;
+    /// `gdk-no-import` = GDK's GL renderer itself lacks dma-buf import (its [`NO_IMPORT`] line, e.g. Mesa d3d12 on atld's dxgkrnl render path): nothing imported, every failed import one of those lines, and downloads -- the host toolkit's own path, as for any native GTK program there.
+    pub fn tier(&self, log: &str) -> Option<&'static str> {
+        if self.ok() {
+            Some("import")
+        } else if self.failed == 0 && self.downloaded > 0 && readback_frames(log) > 0 {
+            Some("readback")
+        } else if self.imported == 0
+            && self.downloaded > 0
+            && self.failed > 0
+            && self.failed == self.no_import
+        {
+            Some("gdk-no-import")
+        } else {
+            None
+        }
     }
 }
+
+/// GDK 4.18 `gdk_dmabuf_egl_import_dmabuf` (gdkdmabufegl.c): `Can't import dmabufs into GL, missing EGL or EGL_EXT_image_dma_buf_import_modifiers`, printed before each `Import of ... failed` when the GL context cannot import at all.
+const NO_IMPORT: &str = "Can't import dmabufs into GL";
 
 /// atl-egl-driver surface.rs: its tier line and its counter line (`READBACK_FRAMES_LINE`, logged at powers of two).
 const READBACK_TIER: &str = "libEGL_atl: buffer tier readback";
@@ -70,8 +92,8 @@ impl std::fmt::Display for Verdict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "imported={} downloaded={} failed={}",
-            self.imported, self.downloaded, self.failed
+            "imported={} downloaded={} failed={} no_import={}",
+            self.imported, self.downloaded, self.failed, self.no_import
         )
     }
 }
@@ -92,7 +114,8 @@ mod tests {
             Verdict {
                 imported: 1,
                 downloaded: 0,
-                failed: 0
+                failed: 0,
+                no_import: 0
             }
         );
         assert!(v.ok());
@@ -112,11 +135,34 @@ mod tests {
         let counted =
             format!("{tier}libEGL_atl: readback_frames=1\nlibEGL_atl: readback_frames=64\n{mmap}");
         assert_eq!(readback_frames(&counted), 64);
-        assert!(Verdict::of(&counted).ok_in(&counted));
-        assert!(!Verdict::of(mmap).ok_in(mmap));
-        let uncounted = format!("{tier}{mmap}");
-        assert!(!Verdict::of(&uncounted).ok_in(&uncounted));
-        let untiered = format!("libEGL_atl: readback_frames=8\n{mmap}");
-        assert!(!Verdict::of(&untiered).ok_in(&untiered));
+        let tier_of = |log: &str| Verdict::of(log).tier(log);
+        assert_eq!(tier_of(&counted), Some("readback"));
+        assert_eq!(tier_of(mmap), None);
+        assert_eq!(tier_of(&format!("{tier}{mmap}")), None);
+        assert_eq!(
+            tier_of(&format!("libEGL_atl: readback_frames=8\n{mmap}")),
+            None
+        );
+    }
+
+    /// GDK's renderer without import (lines as the WSL dxgkrnl run printed them): downloads pass only when every failed import follows GDK's no-import line and nothing imported.
+    #[test]
+    fn gdk_without_import_downloads() {
+        let frame = "Creating dmabuf texture, format XB24:0,  premultiplied, 1 planes, memory format 31\n\
+                     Can't import dmabufs into GL, missing EGL or EGL_EXT_image_dma_buf_import_modifiers\n\
+                     Import of 1440x900 XB24:0 dmabuf failed\n\
+                     Used mmap for downloading 1440x900 dmabuf (format XB24:0)\n";
+        let tier_of = |log: &str| Verdict::of(log).tier(log);
+        let three = frame.repeat(3);
+        assert_eq!(tier_of(&three), Some("gdk-no-import"));
+        // a failure GDK does not explain by missing import: red
+        let other = format!("{three}Import of 4x4 ZZ99:0 dmabuf failed\n");
+        assert_eq!(tier_of(&other), None);
+        // the renderer imported once, so it can: the downloads are a fallback, red
+        let mixed = format!("{three}Imported 1440x900 XB24:0 dmabuf as GL_TEXTURE_2D texture\n");
+        assert_eq!(tier_of(&mixed), None);
+        // downloads without GDK's no-import line: red
+        let bare = "Used mmap for downloading 1440x900 dmabuf (format XB24:0)\n";
+        assert_eq!(tier_of(bare), None);
     }
 }
