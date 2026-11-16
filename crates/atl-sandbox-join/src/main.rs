@@ -76,6 +76,61 @@ fn owner_userns(ns: &OwnedFd) -> Result<OwnedFd, String> {
     Ok(unsafe { OwnedFd::from_raw_fd(r) })
 }
 
+/// The guest cpuinfo atld binds over a translated app's /proc/cpuinfo (as libnativebridge does) must not reach PROGRAM: the web process is host-ISA code, and a file overmount on proc
+/// makes the kernel refuse bwrap's `--proc` in its new user namespace (mount_too_revealing). So: a private copy of the app's mount namespace, the overmount detached there only.
+/// Unlocked here: this process sits in the user namespace that owns the app's mounts, so the copy keeps them unlocked. Private before umount: a shared peer would carry the umount back to the app.
+fn host_cpuinfo() -> Result<(), String> {
+    let os = |what: &str| format!("{what}: {}", std::io::Error::last_os_error());
+    // SAFETY: plain syscalls on this single-threaded process; the strings are NUL-terminated literals.
+    unsafe {
+        if libc::unshare(libc::CLONE_NEWNS) != 0 {
+            return Err(os("unshare(CLONE_NEWNS)"));
+        }
+        if libc::mount(
+            std::ptr::null(),
+            c"/".as_ptr(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE,
+            std::ptr::null(),
+        ) != 0
+        {
+            return Err(os("making the copied mounts private"));
+        }
+    }
+    let mut detached = 0;
+    // re-checked after each umount: stacked binds come off one at a time
+    while is_mount_root(CPUINFO)? {
+        // SAFETY: as above.
+        if unsafe { libc::umount2(c"/proc/cpuinfo".as_ptr(), libc::MNT_DETACH) } != 0 {
+            return Err(os("detaching the guest cpuinfo overmount"));
+        }
+        detached += 1;
+    }
+    if detached > 0 {
+        // stderr is the app's log: one line per web process, so every run shows it
+        let _ = std::io::Write::write_all(
+            &mut std::io::stderr(),
+            format!("sandbox-join: guest cpuinfo overmount detached x{detached}\n").as_bytes(),
+        );
+    }
+    Ok(())
+}
+
+const CPUINFO: &str = "/proc/cpuinfo";
+
+/// Whether `at` is the root of a mount (statx STATX_ATTR_MOUNT_ROOT). Not /proc/self/mountinfo: this process is outside the app's pid namespace (setns moves only children), so the
+/// app's procfs has no /proc/self for it.
+fn is_mount_root(at: &str) -> Result<bool, String> {
+    use rustix::fs::{AtFlags, CWD, StatxAttributes, StatxFlags, statx};
+    let st = statx(CWD, at, AtFlags::SYMLINK_NOFOLLOW, StatxFlags::BASIC_STATS)
+        .map_err(|e| format!("statx {at}: {e}"))?;
+    let root = StatxAttributes::MOUNT_ROOT;
+    if !st.stx_attributes_mask.contains(root) {
+        return Err(format!("statx {at}: kernel does not report MOUNT_ROOT"));
+    }
+    Ok(st.stx_attributes.contains(root))
+}
+
 fn run(j: Join) -> Result<ExitCode, String> {
     let pidns = adopt(j.pidns)?;
     let mntns = adopt(j.mntns)?;
@@ -87,6 +142,7 @@ fn run(j: Join) -> Result<ExitCode, String> {
     move_into_link_name_space(mntns.as_fd(), Some(LinkNameSpaceType::Mount))
         .map_err(|e| format!("joining the mount namespace: {e}"))?;
     drop((owner, pidns, mntns));
+    host_cpuinfo()?;
     #[expect(
         clippy::disallowed_types,
         reason = "the broker's own stage: runs the bwrap command the broker built, in the namespaces just joined"
@@ -145,6 +201,13 @@ mod tests {
         assert_eq!((j.pidns, j.mntns), (5, 6));
         assert_eq!(j.program, "/usr/bin/bwrap");
         assert_eq!(j.args, vec![OsString::from("--x")]);
+    }
+
+    /// `/` is always a mount root; a plain file under it is not.
+    #[test]
+    fn mount_root_probe_answers() {
+        assert_eq!(is_mount_root("/"), Ok(true));
+        assert_eq!(is_mount_root("/proc/self/stat"), Ok(false));
     }
 
     /// fds 0-2 are stdio, never a namespace; a missing flag or program is an error, not a default.
