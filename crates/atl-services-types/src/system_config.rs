@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
-//! The system features SystemConfig reads (frameworks/base/services/core/java/com/android/server/SystemConfig.java) and PackageManagerService answers `hasSystemFeature` / `getSystemAvailableFeatures` from.
+//! The system features and shared libraries SystemConfig reads (frameworks/base/services/core/java/com/android/server/SystemConfig.java): PackageManagerService answers `hasSystemFeature` / `getSystemAvailableFeatures` from the features, and resolves each `<uses-library>` against the libraries.
 //! Source: every `*.xml` in `<partition>/etc/{sysconfig,permissions}/` of [`PARTITIONS`] (readAllPermissionsFromXml :684-777); each partition's flags allow features, so all count alike.
 //! Per file (readPermissionsFromXml): the root is `<permissions>` or `<config>` (else the file is refused); `<feature name version>` adds the feature, a repeat keeps the higher version (addFeature :1850);
-//! `<unavailable-feature name>` removes it after every file is read (readAllPermissions :679). Union, max and the final removal commute, so file and directory order (platform.xml last) do not change the set.
-//! Not modelled: `notLowRam` (only filters when `ro.config.low_ram` is true, which ATL never sets), SKU subdirectories (`ro.boot.product.*.sku` unset), apex dirs (ATL ships no apex permission files).
-//! A file AOSP would log and skip (bad root, unparsable XML) is an error here: every file under these dirs is ATL's own placement, so a bad one is a build bug, not a device quirk.
+//! `<library name file dependency>` registers the library, a repeat replaces it (mSharedLibraries.put); `<unavailable-feature name>` removes the feature after every file is read (readAllPermissions :679). Union, max and the final removal commute, so file and directory order (platform.xml last) do not change the set.
+//! Not modelled: `notLowRam` (only filters when `ro.config.low_ram` is true, which ATL never sets), SKU subdirectories (`ro.boot.product.*.sku` unset), apex dirs (ATL ships no apex permission files), `<apex-library>`.
+//! A file AOSP would log and skip (bad root, unparsable XML, a library without name or file) is an error here: every file under these dirs is ATL's own placement, so a bad one is a build bug, not a device quirk.
 //! [`permissions_xml`] writes the same format, for the features atld derives from the host at start (vendor partition, as a device's hardware features come from its vendor build).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -12,18 +12,24 @@ use std::path::Path;
 
 use anyhow::{Context as _, Result, bail};
 
+use crate::packages::Library;
+
 /// The partitions SystemConfig reads, under the runtime root (Environment.getRootDirectory, getVendorDirectory, getOdmDirectory, getOemDirectory, getProductDirectory, getSystemExtDirectory).
 pub const PARTITIONS: [&str; 6] = ["system", "vendor", "odm", "oem", "product", "system_ext"];
 /// The directories of each partition that hold permission files.
 pub const DIRS: [&str; 2] = ["etc/sysconfig", "etc/permissions"];
 
-/// The available features: name -> version (FeatureInfo.version; 0 when the file gives none).
+/// What SystemConfig reads from the permission files: the features and the shared libraries.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Features(BTreeMap<String, i32>);
+pub struct SystemConfig {
+    pub features: Features,
+    /// name -> the library's jar and dependencies (SystemConfig's SharedLibraryEntry).
+    pub libraries: BTreeMap<String, Library>,
+}
 
-impl Features {
+impl SystemConfig {
     /// Every permission file under `root`'s partitions; a missing partition or directory adds nothing (SystemConfig.readPermissions skips it).
-    pub fn read(root: &Path) -> Result<Features> {
+    pub fn read(root: &Path) -> Result<SystemConfig> {
         let mut acc = Accumulator::default();
         for part in PARTITIONS {
             for dir in DIRS {
@@ -47,13 +53,29 @@ impl Features {
         Ok(acc.finish())
     }
 
-    /// The set from file texts, as [`Features::read`] combines them.
-    pub fn from_texts<'a>(texts: impl IntoIterator<Item = &'a str>) -> Result<Features> {
+    /// The set from file texts, as [`SystemConfig::read`] combines them.
+    pub fn from_texts<'a>(texts: impl IntoIterator<Item = &'a str>) -> Result<SystemConfig> {
         let mut acc = Accumulator::default();
         for t in texts {
             acc.file(t)?;
         }
         Ok(acc.finish())
+    }
+}
+
+/// The available features: name -> version (FeatureInfo.version; 0 when the file gives none).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Features(BTreeMap<String, i32>);
+
+impl Features {
+    /// Every permission file under `root`'s partitions (see [`SystemConfig::read`]).
+    pub fn read(root: &Path) -> Result<Features> {
+        Ok(SystemConfig::read(root)?.features)
+    }
+
+    /// The set from file texts, as [`Features::read`] combines them.
+    pub fn from_texts<'a>(texts: impl IntoIterator<Item = &'a str>) -> Result<Features> {
+        Ok(SystemConfig::from_texts(texts)?.features)
     }
 
     /// PackageManagerService.hasSystemFeature:2954: present at `version` or higher.
@@ -79,6 +101,7 @@ impl Features {
 struct Accumulator {
     available: BTreeMap<String, i32>,
     unavailable: BTreeSet<String>,
+    libraries: BTreeMap<String, Library>,
 }
 
 impl Accumulator {
@@ -107,18 +130,42 @@ impl Accumulator {
                         .context("<unavailable-feature> without name")?;
                     self.unavailable.insert(name.to_owned());
                 }
-                // libraries, permissions, privapp lists, ...: other SystemConfig tables, not features
+                "library" => {
+                    let name = e.attribute("name").context("<library> without name")?;
+                    let file = e
+                        .attribute("file")
+                        .with_context(|| format!("<library {name}> without file"))?;
+                    // readPermissionsFromXml: `dependency` is colon-separated library names
+                    let dependencies = e
+                        .attribute("dependency")
+                        .unwrap_or_default()
+                        .split(':')
+                        .filter(|d| !d.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                    self.libraries.insert(
+                        name.to_owned(),
+                        Library {
+                            file: file.to_owned(),
+                            dependencies,
+                        },
+                    );
+                }
+                // privapp lists, permissions, ...: other SystemConfig tables
                 _ => {}
             }
         }
         Ok(())
     }
 
-    fn finish(mut self) -> Features {
+    fn finish(mut self) -> SystemConfig {
         for name in &self.unavailable {
             self.available.remove(name);
         }
-        Features(self.available)
+        SystemConfig {
+            features: Features(self.available),
+            libraries: self.libraries,
+        }
     }
 }
 
@@ -156,6 +203,30 @@ mod tests {
     <feature name="android.hardware.touchscreen" />
     <feature name="android.hardware.faketouch" />
 </permissions>"#;
+
+    /// org.apache.http.legacy's permission file as Soong's sdkLibraryXml writes it (build/soong/java/sdk_library_internal.go:875-922, from external/apache-http's java_sdk_library).
+    const APACHE_HTTP_LEGACY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<!-- Copyright (C) 2018 The Android Open Source Project
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+-->
+<permissions>
+    <library
+        name="org.apache.http.legacy"
+        file="/system/framework/org.apache.http.legacy.jar"
+    />
+</permissions>
+"#;
 
     #[test]
     fn aosp_file_reads_its_features() {
@@ -215,6 +286,48 @@ mod tests {
         assert!(permissions_xml(&[("a\" />", 0)]).is_err());
     }
 
+    /// The <library> row Soong's permission file declares registers the library under its name, at its file, with no dependency.
+    #[test]
+    fn library_row_registers_the_library() {
+        let c = SystemConfig::from_texts([APACHE_HTTP_LEGACY]).unwrap();
+        assert_eq!(
+            c.libraries.get("org.apache.http.legacy"),
+            Some(&Library {
+                file: "/system/framework/org.apache.http.legacy.jar".into(),
+                dependencies: Vec::new(),
+            })
+        );
+        assert!(c.features.is_empty());
+    }
+
+    /// platform.xml's android.test.runner row (frameworks/base/data/etc/platform.xml:334-336): `dependency` is colon-separated, in order.
+    #[test]
+    fn dependency_attribute_lists_the_dependencies_in_order() {
+        let text = r#"<permissions>
+    <library name="android.test.runner"
+            file="/system/framework/android.test.runner.jar"
+            dependency="android.test.base:android.test.mock" />
+</permissions>"#;
+        let c = SystemConfig::from_texts([text]).unwrap();
+        assert_eq!(
+            c.libraries["android.test.runner"].dependencies,
+            ["android.test.base", "android.test.mock"]
+        );
+    }
+
+    /// A library row without its name or its file is refused: SystemConfig would log and skip it, and ATL's own files make that a build bug.
+    #[test]
+    fn library_without_name_or_file_is_refused() {
+        assert!(
+            SystemConfig::from_texts([r#"<permissions><library file="/f.jar" /></permissions>"#])
+                .is_err()
+        );
+        assert!(
+            SystemConfig::from_texts([r#"<permissions><library name="a" /></permissions>"#])
+                .is_err()
+        );
+    }
+
     /// The directory walk: partitions and both dirs, non-xml files and missing partitions skipped.
     #[test]
     fn read_walks_the_partitions() {
@@ -225,15 +338,20 @@ mod tests {
         std::fs::create_dir_all(&sys).unwrap();
         std::fs::create_dir_all(&ven).unwrap();
         std::fs::write(sys.join("android.hardware.touchscreen.xml"), TOUCHSCREEN).unwrap();
+        std::fs::write(sys.join("org.apache.http.legacy.xml"), APACHE_HTTP_LEGACY).unwrap();
         std::fs::write(sys.join("notes.txt"), "<not xml").unwrap();
         std::fs::write(
             ven.join("atl.xml"),
             permissions_xml(&[("android.hardware.opengles.aep", 0)]).unwrap(),
         )
         .unwrap();
-        let f = Features::read(&root).unwrap();
-        assert_eq!(f.len(), 3);
-        assert!(f.has("android.hardware.opengles.aep", 0));
+        let c = SystemConfig::read(&root).unwrap();
+        assert_eq!(c.features.len(), 3);
+        assert!(c.features.has("android.hardware.opengles.aep", 0));
+        assert_eq!(
+            c.libraries.keys().collect::<Vec<_>>(),
+            ["org.apache.http.legacy"]
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

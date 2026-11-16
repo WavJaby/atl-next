@@ -153,6 +153,15 @@ pub(crate) fn platform_rows(out: &Path, aosp: &Path) -> Result<Vec<(PathBuf, Str
             format!("{system}/etc/permissions/{file}"),
         ));
     }
+    // org.apache.http.legacy (in every runtime's goals): its implementation jar at the Soong install path, and the permission file the converter writes from the java_sdk_library (sdklibxml.go)
+    rows.push((
+        out.join("device/org.apache.http.legacy.impl/aligned/org.apache.http.legacy.jar"),
+        format!("{system}/framework/org.apache.http.legacy.jar"),
+    ));
+    rows.push((
+        out.join("gen/etc/permissions/org.apache.http.legacy.xml"),
+        format!("{system}/etc/permissions/org.apache.http.legacy.xml"),
+    ));
     for (host, _) in &rows {
         ensure!(
             host.is_file(),

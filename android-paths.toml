@@ -42,3 +42,13 @@ reason = "WSL host-drive mount as the test's expected value and input"
 file = "xtask/src/host_disk.rs"
 literal = "/mnt/d"
 reason = "WSL host-drive mount as the test's expected value"
+
+[[allow]]
+file = "crates/atl-services-types/src/system_config.rs"
+literal = "/system/framework/org.apache.http.legacy.jar"
+reason = "test fixture: the permission file Soong's sdkLibraryXml writes for org.apache.http.legacy (sdk_library_internal.go:875-922) and its expected Library file"
+
+[[allow]]
+file = "crates/atl-services-types/src/system_config.rs"
+literal = "/system/framework/android.test.runner.jar"
+reason = "test fixture: platform.xml's android.test.runner row (frameworks/base/data/etc/platform.xml:334-336)"

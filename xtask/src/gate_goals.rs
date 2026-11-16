@@ -156,6 +156,8 @@ pub fn runtime() -> Goals {
         "libgui_aidl_types_rs",
         "librustutils",
         APK_SIGNER,
+        // org.apache.http.legacy: the platform library every run registers (external/apache-http java_sdk_library; its jar and permission file, platform_rows)
+        "org.apache.http.legacy.impl",
     ])
     .with(Goals::host(&EXTRACTOR_PLUGINS))
     .with(Goals::host(&FRAMEWORK_JNI))

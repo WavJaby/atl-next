@@ -31,7 +31,7 @@ use atl_services_types::compositor_registry;
 use atl_services_types::display_model::DisplayModel;
 use atl_services_types::native_libs::SupportedAbi;
 use atl_services_types::packages::{Library, PermissionDecl};
-use atl_services_types::system_config::Features;
+use atl_services_types::system_config::SystemConfig;
 use binder::{BinderFeatures, ProcessState};
 use clap::Parser;
 use signal_hook::consts::{SIGINT, SIGTERM};
@@ -219,7 +219,17 @@ fn main() -> Result<()> {
     };
     let list: Vec<PackageRecord> =
         install::install(&control, &a.sessions, &mut ids, &config, system)?;
-    let libraries: BTreeMap<String, Library> = a.shared_libraries.into_iter().collect();
+    // the runtime's permission files (SystemConfig's <library> rows, system_config.rs) and the --shared-library rows make one registry; a name given by both is an error
+    let system = match &a.partitions {
+        Some(root) => SystemConfig::read(root)?,
+        None => SystemConfig::default(),
+    };
+    let mut libraries: BTreeMap<String, Library> = a.shared_libraries.into_iter().collect();
+    for (name, lib) in system.libraries {
+        if libraries.insert(name.clone(), lib).is_some() {
+            bail!("shared library {name}: given by --shared-library and by a permission file");
+        }
+    }
     let packages = Arc::new(Packages::new(list, libraries));
     // the permission states every service checks callers against: framework-res's definitions first, then the packages' (permission::initial_states, then runtime grants)
     let platform_permissions: Vec<PermissionDecl> = match &a.platform_permissions {
@@ -263,10 +273,7 @@ fn main() -> Result<()> {
         ),
     )
     .context("addService activity_task")?;
-    let features = match &a.partitions {
-        Some(root) => Features::read(root)?,
-        None => Features::default(),
-    };
+    let features = system.features;
     writeln!(
         std::io::stderr(),
         "services: system features {}: {}",
