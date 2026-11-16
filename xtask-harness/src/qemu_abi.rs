@@ -2,7 +2,7 @@
 //! `xtask test qemu-abi`: the engine ABI (QEMU bridge plan Q6-1), both directions. A guest host call's integer lanes, FP lanes and stack words reach the host, and the host's FP answer returns in the guest's v0; `call_ex` puts the host's lanes in the guest's registers and stack words, and returns the callee's FP result. Then each break must turn its run red.
 //!
 //! Library: the engine `.so` (`qemu_spike::engine_so_file`), as `qemu-jni` uses it. The engine breaks (`ENGINE_BREAKS`) each get their own `.so` (`qemu_spike::engine_so_break`). Fixture: `xtask-harness/testdata/qemu-abi/fixture.c`, static, built as `qemu-linker`'s boot executable. No guest linker or NB images: the gate calls the fixture's entries directly.
-//! Harness: `tests/qemu_abi.rs` (harness-less; checks s, x, v, k, r, d, e, z) run through `qemu_linker::harness`. Breaks (`ATL_NB_BREAK`): `qa_stack_off` (stack words arrive one word late, check k), `qa_v_lane` (FP lanes arrive one register late, check v). Engine breaks (`ATL_QEMU_ENGINE_BREAK`): `call-stack` (call_ex writes no stack words, check d), `call-v` (call_ex sets no FP lane, check d), `ignore-size` (attach_ex allocates the default stack whatever the request, check z).
+//! Harness: `tests/qemu_abi.rs` (harness-less; checks s, x, v, k, r, d, e, z, f) run through `qemu_linker::harness`. Breaks (`ATL_NB_BREAK`): `qa_stack_off` (stack words arrive one word late, check k), `qa_v_lane` (FP lanes arrive one register late, check v). Engine breaks (`ATL_QEMU_ENGINE_BREAK`): `call-stack` (call_ex writes no stack words, check d), `call-v` (call_ex sets no FP lane, check d), `ignore-size` (attach_ex allocates the default stack whatever the request, check z), `rcu-twice` (the loading thread stays in QEMU's RCU registry and attach adds it again, check f).
 //! Output: `<out>/qemu/<target>-linux-user-pic/qemu-abi/`, one log per run.
 
 use std::path::{Path, PathBuf};
@@ -20,11 +20,11 @@ const TESTDATA: &str = "xtask-harness/testdata/qemu-abi";
 const HARNESS: Harness = Harness {
     test: "qemu_abi",
     prefix: "qemu-abi",
-    checks: &['s', 'x', 'v', 'k', 'r', 'd', 'e', 'z'],
+    checks: &['s', 'x', 'v', 'k', 'r', 'd', 'e', 'z', 'f'],
     breaks: &["qa_stack_off", "qa_v_lane"],
 };
 /// The engine's breaks (atl-qemu-engine build.rs `BREAKS`): each runs against its own engine `.so`.
-const ENGINE_BREAKS: &[&str] = &["call-stack", "call-v", "ignore-size"];
+const ENGINE_BREAKS: &[&str] = &["call-stack", "call-v", "ignore-size", "rcu-twice"];
 
 #[derive(clap::Args)]
 pub struct Args {

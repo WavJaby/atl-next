@@ -120,6 +120,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("no-guard", "atl_qe_no_guard"),
     // gate (qemu-abi, z): attach_ex drops the requested stack size, every stack gets the 1 MiB default
     ("ignore-size", "atl_qe_ignore_size"),
+    // gate (qemu-abi, f): create leaves QEMU's RCU registration on the loading thread, which attach then registers twice: the registry turns into a cycle, the next grace period never ends and fork blocks
+    ("rcu-twice", "atl_qe_rcu_twice"),
     // gate (u): attach copies the oldest live attached CPU (a running parent) instead of the parked boot CPU, keeping its sp: the child's frames land on the parent's stack
     ("copy-caller", "atl_qe_copy_caller"),
     // gate (v): attach registers no guest alternate stack, so an SA_ONSTACK handler for a stack overflow has nowhere to run and QEMU kills the process

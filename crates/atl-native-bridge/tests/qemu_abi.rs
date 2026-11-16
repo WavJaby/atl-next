@@ -3,7 +3,7 @@
 //! The fixture (`xtask-harness/testdata/qemu-abi/fixture.c`, static) raises BOOT with a table of three entries, which the host calls: `qa_run` (checks x, v, k, r), `qa_sum` (d), `qa_edge` (e).
 //! Env (xtask qemu_abi.rs sets it; unset prints SKIP): ATL_ENGINE_SO (the engine `.so`), ATL_QEMU_ABI_FIXTURE (fixture.c, built static).
 //! Expected values are the fixture's literals, written out here again (never read from the engine): x0..x7 = 0x101 + i, v0..v7 = 1.5 + i and the stack words s0, s1 (x, v, k); the answer 3.25 is no input lane, so `qa_run` returns its bits (r); `qa_sum` returns [`SUM_EXPECT`] (d); `qa_edge` stores [`EDGE_S0`], [`EDGE_S1`] and reads its last six stack words past the mapped page as 0 (e).
-//! Checks: (s) started (BOOT delivered, the thread attached); (x) integer lanes; (v) FP lanes; (k) stack words; (r) the value `qa_run` returned; (d) `call_ex` lanes into `qa_sum`; (e) stack words past the mapped page; (z) `attach_ex` stack size: default 1 MiB, a requested 256 KiB round-trips and holds the guest's sp.
+//! Checks: (s) started (BOOT delivered, the thread attached); (x) integer lanes; (v) FP lanes; (k) stack words; (r) the value `qa_run` returned; (d) `call_ex` lanes into `qa_sum`; (e) stack words past the mapped page; (z) `attach_ex` stack size: default 1 MiB, a requested 256 KiB round-trips and holds the guest's sp; (f) after z's detach, a fork returns (QEMU's grace period ends).
 //! Output: `qemu-abi: (x) ok` per check, `(x) FAIL <why>` otherwise, exit 0 when all pass.
 #![allow(clippy::print_stdout, reason = "test harness output is its verdict")]
 
@@ -42,6 +42,11 @@ const MARKER: u64 = 0xdead_beef_dead_beef;
 const DEFAULT_STACK: u64 = 1 << 20;
 /// Check z: the requested stack, 256 KiB (plan G3), page-aligned so no rounding applies.
 const SIZED_STACK: u64 = 256 << 10;
+
+/// Check f: wait before the fork so QEMU's grace period for z's detach has started. QEMU's call_rcu thread (util/rcu.c `call_rcu_thread`) batches a lone callback for at most 5 x 10 ms before `synchronize_rcu`; 4x that for scheduling.
+const GRACE_START: std::time::Duration = std::time::Duration::from_millis(200);
+/// Check f: how long the fork may take. A sound grace period ends within `wait_for_readers`' forced phase (5 polls x 10 ms, then the readers' unlock); a broken one never ends, so any bound far above 50 ms separates them; 5 s keeps a loaded host green.
+const FORK_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// BOOT's payload: the address of the fixture's entry table (`qa_run`, `qa_sum`, `qa_edge`); identity, so the host reads it directly.
 static TABLE: AtomicU64 = AtomicU64::new(0);
@@ -175,6 +180,31 @@ fn check_stack(default: AtlStack, run: u64) -> Result<(), String> {
     .map_err(|_| "sized-stack thread panicked".to_owned())?
 }
 
+/// Check f, fork after a detach: z's detach frees the CPU's jump cache through RCU (`tcg_exec_unrealizefn` -> `g_free_rcu`), so QEMU's call_rcu thread runs a grace period, and QEMU's prefork handler (`rcu_init_lock`) waits for it. The main thread loaded the engine and attached: if it is in QEMU's RCU registry twice (the constructor's registration plus attach's), the registry is a cycle, the grace period never ends, and every fork in the process (WebKit's process spawn) blocks.
+fn check_fork() -> Result<(), String> {
+    std::thread::sleep(GRACE_START);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // SAFETY: the child calls only _exit (async-signal-safe).
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            // SAFETY: as above.
+            unsafe { libc::_exit(0) };
+        }
+        let _ = tx.send(pid);
+    });
+    let pid = rx.recv_timeout(FORK_LIMIT).map_err(|_| {
+        format!("fork did not return within {FORK_LIMIT:?}: QEMU's prefork handler waits on a grace period that does not end")
+    })?;
+    if pid < 0 {
+        return Err(format!("fork: {}", std::io::Error::last_os_error()));
+    }
+    let mut status = 0;
+    // SAFETY: pid is this process's child; status is a valid out-parameter.
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+    same("child exit", status, 0)
+}
+
 /// Whether two adjacent words `pair` lie inside `stack`'s usable range (identity: guest memory is host memory).
 fn holds_pair(stack: AtlStack, pair: [u64; 2]) -> bool {
     let words = stack.len as usize / 8;
@@ -246,7 +276,10 @@ fn main() -> ExitCode {
     if !check('s', Ok(())) {
         return ExitCode::FAILURE;
     }
-    if checks(entries) & check('z', check_stack(default_stack, entries[0])) {
+    if checks(entries)
+        & check('z', check_stack(default_stack, entries[0]))
+        & check('f', check_fork())
+    {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE

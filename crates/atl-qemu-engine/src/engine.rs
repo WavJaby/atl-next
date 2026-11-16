@@ -302,6 +302,8 @@ const GUEST_CPU: &[&str] = &["-cpu", "cortex-a710,sve=off,midr=0x000f0510"];
 const GUEST_CPU: &[&str] = &[];
 
 /// The engine `.so`'s start (C ABI `create`): QEMU is linked into this object, so the helper runs its `main` on this object's own symbols. The command line is the engine's: `-B 0` is identity addresses (guest = host, the ABI's `map`), [`GUEST_CPU`], and the host names only `boot_exe`. QEMU's `QEMU_*` option variables are not read (QEMU patch 0003): argv is the whole configuration.
+/// RCU: QEMU's constructor (util/rcu.c `rcu_init`) registers the thread that ran it -- in a QEMU executable the thread that runs `main`, here the host's loading thread ([`on_loader_thread`]). That thread is moved to the helper: unregistered here, registered there before `main`, as the spike's helper is. Left registered, a later attach on the loading thread registers it twice, the registry becomes a cycle, the next grace period never ends, and QEMU's prefork handler blocks every fork in the process.
+/// Call on the loading thread ([`on_loader_thread`]; C ABI `create` refuses any other).
 #[cfg(feature = "engine-so")]
 pub(crate) fn start_linked(boot_exe: &str, on_trap: OnTrap) -> Result<Booted, String> {
     let argv: Vec<&str> = ["qemu-aarch64", "-B", "0"]
@@ -310,7 +312,43 @@ pub(crate) fn start_linked(boot_exe: &str, on_trap: OnTrap) -> Result<Booted, St
         .chain([boot_exe])
         .collect();
     let args = c_args(&argv)?;
-    boot_on_helper(move || run_main(self_handle()?, &args, on_trap))
+    // break rcu-twice (qemu-abi check f): the loading thread stays registered and the helper is not
+    #[cfg(not(atl_qe_rcu_twice))]
+    // SAFETY: QEMU's `void rcu_unregister_thread(void)` on the thread its constructor registered (checked above).
+    unsafe {
+        linked_syms::rcu_unregister_thread()
+    };
+    boot_on_helper(move || {
+        #[cfg(not(atl_qe_rcu_twice))]
+        // SAFETY: QEMU's `void rcu_register_thread(void)` on the fresh helper, which nothing registered.
+        unsafe {
+            linked_syms::rcu_register_thread()
+        };
+        run_main(self_handle()?, &args, on_trap)
+    })
+}
+
+/// The thread that ran this object's initialisers (dlopen's caller), recorded by [`record_loader`]; 0 before.
+#[cfg(feature = "engine-so")]
+static LOADER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// An initialiser of this object: every initialiser of one dlopen runs on its caller, QEMU's `rcu_init` too, so this names the thread QEMU's RCU registered, whatever their order.
+#[cfg(feature = "engine-so")]
+extern "C" fn record_loader() {
+    // SAFETY: gettid has no preconditions.
+    LOADER.store(unsafe { libc::gettid() }, Ordering::Relaxed);
+}
+
+#[cfg(feature = "engine-so")]
+#[used]
+#[unsafe(link_section = ".init_array")]
+static RECORD_LOADER: extern "C" fn() = record_loader;
+
+/// Whether the calling thread loaded this object (and so is in QEMU's RCU registry until [`start_linked`]).
+#[cfg(feature = "engine-so")]
+pub(crate) fn on_loader_thread() -> bool {
+    // SAFETY: as in record_loader.
+    LOADER.load(Ordering::Relaxed) == unsafe { libc::gettid() }
 }
 
 fn c_args(argv: &[&str]) -> Result<Vec<CString>, String> {

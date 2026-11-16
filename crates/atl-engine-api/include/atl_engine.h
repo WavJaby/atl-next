@@ -3,7 +3,7 @@
  * The engine C ABI. The engine `.so` (libatl_engine_<arch>.so) exports one table, atl_engine, through its version script (atl_bridgegen::engine_abi::version_script), plus the TLS names the engine reads with dlsym (thread_cpu, helper_retaddr). The Rust mirror is crates/atl-engine-api/src/lib.rs; atl-qemu-engine's build script checks every layout and value here through clang.
  * Host: refuses an engine whose major differs from its own, or whose size is below atl_engine's size as the host knows it, or whose minor or entries are older than the host's (host and engine are built together, so the host requires what it calls). Minor versions only append fields.
  * One engine per process: create once. The booted engine lives until the process ends (QEMU's main never returns), so destroy has nothing to free.
- * Threads: create, map and destroy run on any thread. attach_ex gives the calling thread its CPU; call and detach take that CPU and must run on the thread that attached it.
+ * Threads: create runs on the thread that loaded the engine (-EINVAL elsewhere): QEMU's constructor registered that thread with its RCU, and create moves the registration to the engine's boot thread. map and destroy run on any thread. attach_ex gives the calling thread its CPU; call and detach take that CPU and must run on the thread that attached it.
  * Errors: 0 or -errno: -EINVAL (bad argument or state), -EEXIST (second create), -EIO (boot or mapping failed). A call on a bad engine or CPU aborts the process.
  */
 #ifndef ATL_ENGINE_H

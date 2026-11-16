@@ -93,7 +93,7 @@ pub fn boot(library: &Path, boot_exe: &Path, on_trap: OnTrap) -> Result<(), Stri
     ON_TRAP
         .set(on_trap)
         .map_err(|_| "qemu crossing: boot called twice".to_owned())?;
-    // SAFETY: lib is NUL-terminated; the library's initialisers are QEMU's own (QOM type registration) and run here; the handle is never closed.
+    // SAFETY: lib is NUL-terminated; the library's initialisers are QEMU's own (QOM type registration, RCU registration of this thread, which `create` below must therefore run on) and run here; the handle is never closed.
     let handle = unsafe { libc::dlopen(lib.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
     if handle.is_null() {
         return Err(format!("dlopen {}: {}", library.display(), dlerror()));

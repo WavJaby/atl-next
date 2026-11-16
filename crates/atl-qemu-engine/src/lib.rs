@@ -118,7 +118,7 @@ mod capi {
         PROT_EXEC, PROT_READ, PROT_WRITE, TrapExFn, TrapFn, TrapKind,
     };
 
-    use crate::engine::{boot_env, set_pages, start_linked};
+    use crate::engine::{boot_env, on_loader_thread, set_pages, start_linked};
     use crate::{Cpu, Guest, Trap, page};
 
     /// The engine handle: this static's address, the only one there is.
@@ -210,6 +210,12 @@ mod capi {
         let Ok(exe) = unsafe { CStr::from_ptr(boot_exe) }.to_str() else {
             return -libc::EINVAL;
         };
+        if !on_loader_thread() {
+            note(
+                "create: not on the thread that loaded the engine (QEMU's RCU registered that thread; start_linked moves it)",
+            );
+            return -libc::EINVAL;
+        }
         if HOST
             .set(HostRef {
                 ctx: h.ctx,
