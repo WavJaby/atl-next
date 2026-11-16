@@ -251,6 +251,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let go_work = converter::go_work(root, &layout, &tool_dir)?;
     let converter = tool_dir.join("bp2ninja");
     converter::build(root, &go_work, &converter).context("building bp2ninja")?;
+    phases.lap("bp2ninja build");
     let sources = sources::load(root)?;
     let workspace = workspace::load(root)?;
     let deps = deps::load(root, &deps::Consumers::new(&workspace, &sources, &arches))?;
@@ -266,7 +267,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .map(|(module, alt)| format!("{module}={alt}"))
         .collect::<Vec<_>>()
         .join(",");
-    patch::preflight(root, providers::upstreams(&providers))?;
+    phases.timed("patch preflight", || {
+        patch::preflight(root, providers::upstreams(&providers))
+    })?;
     // the tree first matches sources.toml: a pinned project absent or cut off mid-clone would never be
     // fetched by the loop, which only adds unpinned ones
     if args.fetch_missing {
