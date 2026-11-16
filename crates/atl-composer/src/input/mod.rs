@@ -151,10 +151,15 @@ impl<K: PartialEq + Clone, C> Windows<K, C> {
         self.focused.is_some()
     }
 
-    /// The focused window's channel (keys go there), if one is focused and still held.
-    pub fn focused_channel(&mut self) -> Option<&mut C> {
+    /// The focused window's key and channel (keys go there), if one is focused and still held.
+    pub fn focused_channel(&mut self) -> Option<(K, &mut C)> {
         let key = self.focused.clone()?;
-        self.channel(&key)
+        self.channel(&key).map(|c| (key, c))
+    }
+
+    /// `key`'s channel is held.
+    pub fn holds(&self, key: &K) -> bool {
+        self.list.iter().any(|(k, ..)| k == key)
     }
 
     /// The channel of `key`, if held.
@@ -198,18 +203,18 @@ impl<K, C: AsFd> Windows<K, C> {
     }
 }
 
-/// The channels of one poll round: a readable one is drained by `finished` (false: the channel is broken), and one that hung up, failed or broke is removed.
+/// The channels of one poll round: a readable one is drained by `finished` with its key (false: the channel is broken), and one that hung up, failed or broke is removed.
 /// A key the windows no longer hold is skipped. True when a window was removed, so the focus may have moved.
 pub fn settle<K: PartialEq + Clone, C>(
     windows: &mut Windows<K, C>,
     channels: &[(K, PollFlags)],
-    mut finished: impl FnMut(&mut C) -> bool,
+    mut finished: impl FnMut(&K, &mut C) -> bool,
 ) -> bool {
     let mut removed = false;
     for (key, revents) in channels {
         let drained = if revents.contains(PollFlags::IN) {
             match windows.channel(key) {
-                Some(channel) => finished(channel),
+                Some(channel) => finished(key, channel),
                 None => continue,
             }
         } else {
@@ -303,6 +308,7 @@ impl InputSource for HeadlessInput {
     }
 }
 
+pub mod fallback;
 pub mod key;
 pub mod pointer;
 pub mod touch;
@@ -317,15 +323,18 @@ pub use publish::spawn;
 #[cfg(feature = "converter")]
 mod publish {
     use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
     use std::thread;
 
     use crate::tilt::Tilt;
-    use atl_libinput::{KeyEvent, KeyLayoutMap, MotionEvent, Pointer, Publisher};
+    use atl_aidl::aidl::android::hardware::input::IInputManager::IInputManager;
+    use atl_libinput::{KeyCharacterMap, KeyEvent, KeyLayoutMap, MotionEvent, Pointer, Publisher};
     use atl_platform_ui::{InputEvent, InputSource, PointerEvent};
-    use binder::SpIBinder;
+    use binder::{SpIBinder, Strong};
 
+    use super::fallback::Fallbacks;
     use super::key::{self, Key};
     use super::pointer::{self, Motion};
     use super::touch;
@@ -418,6 +427,75 @@ mod publish {
         tilt: Option<Arc<Mutex<Tilt>>>,
         /// The mouse finger (`ro.atl.desktop-input` mouse-touch); None: off, the mouse is only a mouse.
         mouse_finger: Option<RefCell<touch::MouseFinger>>,
+        /// The dispatcher's fallback keys for keys a window finished unhandled.
+        fallbacks: RefCell<Fallbacks<SpIBinder>>,
+        /// Each device's key map, as the input service serves it (None: not served; that device's keys get no fallback), fetched at its first unhandled key.
+        maps: RefCell<HashMap<i32, Option<KeyCharacterMap>>>,
+    }
+
+    /// Context.INPUT_SERVICE: the input service, owner of every device's key map.
+    const INPUT_SERVICE: &str = "input";
+
+    /// Device `device_id`'s key map from the input service (getInputDevice -> InputDevice's KeyCharacterMap, Parcel form): the map the app's `KeyEvent.getKeyCharacterMap()` reads, so both of AOSP's fallback points see one map, desktop overlay included.
+    fn fetch_map(device_id: i32) -> Option<KeyCharacterMap> {
+        let manager: Strong<dyn IInputManager> = binder::check_service(INPUT_SERVICE)
+            .or_else(|| {
+                tracing::warn!(
+                    "input: no {INPUT_SERVICE} service; device {device_id} keys get no fallback"
+                );
+                None
+            })?
+            .into_interface()
+            .inspect_err(|err| tracing::warn!("input: {INPUT_SERVICE}: {err}"))
+            .ok()?;
+        let device = match manager.getInputDevice(device_id) {
+            Ok(Some(device)) => device,
+            Ok(None) => {
+                tracing::warn!("input: device {device_id} unknown to {INPUT_SERVICE}; no fallback");
+                return None;
+            }
+            Err(err) => {
+                tracing::warn!("input: getInputDevice({device_id}): {err}");
+                return None;
+            }
+        };
+        KeyCharacterMap::from_parcel(&device.key_character_map)
+            .inspect_err(|err| tracing::warn!("input: device {device_id} key map: {err:?}"))
+            .ok()
+    }
+
+    /// The fallback (keycode, meta) of `key_code` with `meta_state` in device `device_id`'s map (KeyCharacterMap::getFallbackAction).
+    fn fallback_action(
+        state: &State,
+        device_id: i32,
+        key_code: i32,
+        meta_state: i32,
+    ) -> Option<(i32, i32)> {
+        let mut maps = state.maps.borrow_mut();
+        maps.entry(device_id)
+            .or_insert_with(|| fetch_map(device_id))
+            .as_ref()?
+            .fallback_action(key_code, meta_state)
+    }
+
+    /// Publishes `k` to `publisher` (window `token`) as the next seq, recorded for its fallback. False when publishing failed.
+    fn publish_key(state: &State, token: &SpIBinder, publisher: &mut Publisher, k: &Key) -> bool {
+        let seq = next_seq(state.seq.get());
+        state.seq.set(seq);
+        if let Err(err) = publisher.publish_key(&key_event(k, seq)) {
+            tracing::warn!("input: publishing key {seq}: {err:?}");
+            return false;
+        }
+        if k.flags & super::fallback::FLAG_FALLBACK != 0 {
+            tracing::info!(
+                "input: fallback key seq {seq} action {} code {} flags {:#x}",
+                k.action,
+                k.key_code,
+                k.flags
+            );
+        }
+        state.fallbacks.borrow_mut().published(token, seq, *k);
+        true
     }
 
     /// Runs `f` on the tilt, when on.
@@ -433,7 +511,7 @@ mod publish {
             return;
         }
         let mut windows = state.windows.borrow_mut();
-        let Some(publisher) = windows.focused_channel() else {
+        let Some((token, publisher)) = windows.focused_channel() else {
             tracing::warn!(
                 "input: no focused window takes {} key(s), dropped",
                 keys.len()
@@ -441,10 +519,7 @@ mod publish {
             return;
         };
         for k in keys {
-            let seq = next_seq(state.seq.get());
-            state.seq.set(seq);
-            if let Err(err) = publisher.publish_key(&key_event(k, seq)) {
-                tracing::warn!("input: publishing key {seq}: {err:?}");
+            if !publish_key(state, &token, publisher, k) {
                 return;
             }
         }
@@ -583,16 +658,29 @@ mod publish {
         );
     }
 
-    /// Reads the finished signals a channel holds (receiveConsumerResponse until none). False when a read fails: the loop then removes the channel, since a channel left readable with every read failing spins the loop.
-    /// `Ok(None)` also covers a non-finished message; the next poll reports whatever is left.
-    fn drain_finished(publisher: &mut Publisher) -> bool {
+    /// Reads the finished signals window `token`'s channel holds (receiveConsumerResponse until none); a key finished unhandled may send its fallback ([`Fallbacks::finished`]) on the same channel. False when a read fails: the loop then removes the channel,
+    /// since a channel left readable with every read failing spins the loop. `Ok(None)` also covers a non-finished message; the next poll reports whatever is left.
+    fn drain_finished(state: &State, token: &SpIBinder, publisher: &mut Publisher) -> bool {
         loop {
             match publisher.receive_finished() {
-                Ok(Some(finished)) => tracing::debug!(
-                    "input: finished seq {} handled {}",
-                    finished.seq,
-                    finished.handled
-                ),
+                Ok(Some(finished)) => {
+                    tracing::debug!(
+                        "input: finished seq {} handled {}",
+                        finished.seq,
+                        finished.handled
+                    );
+                    let keys = state.fallbacks.borrow_mut().finished(
+                        token,
+                        finished.seq,
+                        finished.handled,
+                        |device, code, meta| fallback_action(state, device, code, meta),
+                    );
+                    for k in &keys {
+                        if !publish_key(state, token, publisher, k) {
+                            break;
+                        }
+                    }
+                }
                 Ok(None) => return true,
                 Err(err) => {
                     tracing::warn!("input: finished signal: {err:?}");
@@ -602,9 +690,13 @@ mod publish {
         }
     }
 
-    /// Publishes the focus events owed ([`Windows::focus_changes`]) to the windows still held.
+    /// Publishes the focus events owed ([`Windows::focus_changes`]) to the windows still held; a window losing focus first gets the cancel of its held fallback keys. Drops the fallback state of windows no longer held (every removal path calls this).
     fn publish_focus(state: &State) {
         let mut windows = state.windows.borrow_mut();
+        state
+            .fallbacks
+            .borrow_mut()
+            .retain(|token| windows.holds(token));
         let changes = windows.focus_changes();
         if !changes.is_empty() {
             let focused = windows.has_focus();
@@ -614,6 +706,14 @@ mod publish {
             let Some(publisher) = windows.channel(&token) else {
                 continue;
             };
+            if !has_focus {
+                let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+                let time_ns = now.tv_sec * 1_000_000_000 + now.tv_nsec;
+                let cancels = state.fallbacks.borrow_mut().focus_lost(&token, time_ns);
+                for k in &cancels {
+                    publish_key(state, &token, publisher, k);
+                }
+            }
             let seq = next_seq(state.seq.get());
             state.seq.set(seq);
             let event_id = i32::try_from(seq).unwrap_or(i32::MAX);
@@ -666,7 +766,7 @@ mod publish {
             if settle(
                 &mut state.windows.borrow_mut(),
                 &round.channels,
-                drain_finished,
+                |token, publisher| drain_finished(&state, token, publisher),
             ) {
                 publish_focus(&state);
             }
@@ -1029,7 +1129,7 @@ mod tests {
         assert_eq!(round.channels.len(), 1);
         assert_eq!(round.channels[0].0, 2);
         assert!(round.channels[0].1.contains(PollFlags::HUP));
-        assert!(settle(&mut windows, &round.channels, |_| true));
+        assert!(settle(&mut windows, &round.channels, |_, _| true));
         assert!(windows.channel(&1).is_some());
         assert!(windows.channel(&2).is_none());
         tx.send(7).expect("queue");

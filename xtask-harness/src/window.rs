@@ -119,9 +119,12 @@ pub struct Args {
     /// Stage mouse-touch only: the desktop adaptation is off (no `with_mouse_touch()`, so atld `--mouse-touch false`), the drag stays the mouse's (source 8194) and the mouse-touch sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     break_mouse_touch: bool,
-    /// Stage widgets: atld runs with the Esc -> Back adaptation on (`with_esc_back()`, atld `--esc-back true`), and the esc-fallback sub-gate expects the keyboard map's plain Esc fallback BACK; without it, AOSP's none. Run the stage both ways.
+    /// Stages widgets and webview: atld runs with the Esc -> Back adaptation on (`with_esc_back()`, atld `--esc-back true`), and the esc sub-gates expect the keyboard map's plain Esc fallback BACK (widgets: esc-fallback, esc-back; webview: esc-back); without it, AOSP's none. Run the stages both ways.
     #[arg(long)]
     esc_back: bool,
+    /// Stages widgets and webview, with `--esc-back` only: atld runs with the adaptation off (atld `--esc-back false`) while the checks expect it on, so no BACK follows the unhandled Esc and the esc-back sub-gate must fail (the gate's deliberate break).
+    #[arg(long, requires = "esc_back")]
+    break_esc_back: bool,
     /// Stage dialog only: the services send no requestFinish on an unhandled Back (atld `--no-back-finish`), so the back sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     break_back_finish: bool,
@@ -1998,7 +2001,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         rt
     };
-    let rt = if args.esc_back {
+    // the break runs atld with the adaptation off while the checks still expect it on
+    let rt = if args.esc_back && !args.break_esc_back {
         rt.with_esc_back()
     } else {
         rt
@@ -2080,6 +2084,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // the probe drives the client through its proxy from here on
     let stage = args.stage;
     let break_mouse_back = args.break_mouse_back;
+    let esc_back = args.esc_back;
     let break_suspended = args.break_suspended;
     // the app-id stage's probe leaves the window's app ids here; the sub-gates read them once the probe is joined
     let app_ids: Arc<Mutex<AppIdsSeen>> = Arc::default();
@@ -2117,7 +2122,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 ime::drive(p, &log, ime, ime_breaks, atld_pid, &services_log, relaunch)
             }
             (Stage::Widgets, _, _) => match &capture_probe {
-                Some(capture_probe) => widgets::drive(p, &log, break_mouse_back, capture_probe),
+                Some(capture_probe) => {
+                    widgets::drive(p, &log, break_mouse_back, esc_back, capture_probe)
+                }
                 None => Err("no capture probe".to_owned()),
             },
             (Stage::SurfaceView, _, _) => match &capture_probe {
@@ -2240,7 +2247,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             ("touch-mode", touch_mode_check(&services)),
         ],
         (Stage::SurfaceView, Some(_)) => surface_view::checks(&app, &liveness, &captured),
-        (Stage::WebView, Some(_)) => webview::checks(&app, &liveness, &captured),
+        (Stage::WebView, Some(_)) => webview::checks(&app, &liveness, &captured, args.esc_back),
         (Stage::UiBlock, Some(_)) => ui_block::checks(&app),
         (Stage::MouseTouch, Some(_)) => widgets::mouse_touch_checks(&app, &liveness),
         (Stage::Dialog, Some(_)) => {

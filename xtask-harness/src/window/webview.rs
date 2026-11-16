@@ -6,7 +6,9 @@
 //! pong (the window answered a ping), controls: pictures with one rule broken differ (no page: the carrier's black background colour layer; page over the overlay; page under the window).
 //! Input (W3b, hold-and-replay): page-tap (a click on the page reaches it), view-tap (a click on the overlapping View reaches the View, not the page), intercept (a drag the WebView's parent takes:
 //! ACTION_CANCEL after the page's press, `webview.input.intercept-no-cancel` counted, no click), after-intercept (the next click reaches the page).
-//! Break `--break-webview-engine`: the run's library dir lacks the engine module, the fixture's WebView cannot be made, the readback must fail.
+//! Keys: esc-handled (two Escs reach the page once each, the first taken by its handler with no back), esc-back (the second, left unhandled, reaches the app as BACK through
+//! WebViewClient.onUnhandledKeyEvent -> SyntheticKeyboardHandler with `--esc-back`; none without).
+//! Break `--break-webview-engine`: the run's library dir lacks the engine module, the fixture's WebView cannot be made, the readback must fail. Break `--esc-back --break-esc-back`: esc-back must fail.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -22,6 +24,16 @@ const TITLE: &str = "AtlWindow: wv title ";
 const OVERLAY_TAP: &str = "AtlWindow: wv overlay tap";
 /// The WebView's parent took the drag (Main.java Intercept).
 const INTERCEPTED: &str = "AtlWindow: wv intercepted";
+/// The page's titles for the two Escs (Main.java PAGE_HTML onkeydown): the first taken by its handler, the second left.
+const ESC_PREVENTED: &str = "key1Escape-prevented";
+const ESC_LEFT: &str = "key2Escape";
+/// The activity's back callback (Main.java).
+const BACK_LINE: &str = "AtlWindow: wv back";
+/// input-event-codes.h KEY_ESC.
+const KEY_ESC: u32 = 1;
+/// After the handled Esc, how long an (unwanted) unhandled report may take to show as a back before the second Esc: WebKitGTK puts back an unhandled press after the release (A0), one web-process
+/// round trip, well under a second on a quiet host; esc_handled judges a back seen before the second Esc's title.
+const ESC_SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
 /// The provider's divergence counter (atl-webview jni.rs `INTERCEPT_NO_CANCEL`, webview plan S2.2 amended).
 const INTERCEPT_COUNTER: &str = "webview.input.intercept-no-cancel";
 /// Its first record in the app log (atl-diag: `diag: first <outcome> <api> ...`).
@@ -225,6 +237,7 @@ pub fn checks(
     app: &str,
     liveness: &Result<Liveness, String>,
     pictures: &Mutex<capture::Seen>,
+    esc_back: bool,
 ) -> Vec<Sub> {
     vec![
         (
@@ -249,7 +262,62 @@ pub fn checks(
         ("view-tap", view_tap(app)),
         ("intercept", intercept(app)),
         ("after-intercept", after_intercept(app)),
+        ("esc-handled", esc_handled(app)),
+        ("esc-back", esc_back_check(app, esc_back)),
     ]
+}
+
+/// The page's key titles (`key<n>...`), in order.
+fn key_titles(app: &str) -> Vec<&str> {
+    app.lines()
+        .filter_map(|l| l.find(TITLE).map(|i| &l[i + TITLE.len()..]))
+        .filter(|t| t.starts_with("key"))
+        .collect()
+}
+
+/// Sub-gate esc-handled: the page got each Esc once (a press published twice would show a third title: WebKit's put-back of an unhandled press must be reported, not published again), and the
+/// Esc its handler took brought no back.
+fn esc_handled(app: &str) -> Result<String, String> {
+    let titles = key_titles(app);
+    if titles != [ESC_PREVENTED, ESC_LEFT] {
+        return Err(format!(
+            "page key titles {titles:?}, want [{ESC_PREVENTED}, {ESC_LEFT}]"
+        ));
+    }
+    let second = app
+        .find(&format!("{TITLE}{ESC_LEFT}"))
+        .ok_or("no second Esc title")?;
+    if app[..second].contains(BACK_LINE) {
+        return Err("a back before the second Esc: the handled Esc reached the app".to_owned());
+    }
+    Ok("each Esc reached the page once; the one its handler took brought no back".to_owned())
+}
+
+/// Sub-gate esc-back: with `esc_back` the Esc the page left reached the app's back once, after that Esc's title; without, no back (AOSP's map: Esc has no fallback).
+fn esc_back_check(app: &str, esc_back: bool) -> Result<String, String> {
+    let backs = app.matches(BACK_LINE).count();
+    let want = usize::from(esc_back);
+    if backs != want {
+        return Err(if backs == 0 {
+            "no back after the unhandled Esc".to_owned()
+        } else {
+            format!("{backs} backs, want {want}")
+        });
+    }
+    if esc_back {
+        let second = app
+            .find(&format!("{TITLE}{ESC_LEFT}"))
+            .ok_or("no second Esc title")?;
+        if app.find(BACK_LINE).is_some_and(|b| b < second) {
+            return Err("the back came before the unhandled Esc".to_owned());
+        }
+        Ok(
+            "unhandled Esc -> WebViewClient.onUnhandledKeyEvent -> BACK -> back callback"
+                .to_owned(),
+        )
+    } else {
+        Ok("unhandled Esc -> no back (AOSP map)".to_owned())
+    }
 }
 
 /// The fixture's input lines in log order: page titles (`tap<n>`), the overlay's click, the parent's intercept, the divergence counter's first record.
@@ -268,8 +336,8 @@ fn input_lines(app: &str) -> Vec<&str> {
                 None
             }
         })
-        // the page's own title before any click (the data URL) is not a click
-        .filter(|s| !s.starts_with("data:"))
+        // the page's own title before any click (the data URL) is not a click; key titles are the Esc sub-gates'
+        .filter(|s| !s.starts_with("data:") && !s.starts_with("key"))
         .collect()
 }
 
@@ -398,6 +466,18 @@ fn drive_input(proxy: &Proxy, app_log: &Path) -> Result<(), String> {
     let _ = widgets::wait_until(app_log, INPUT_WAIT, |t| t.contains(INTERCEPTED));
     click(proxy, page)?;
     let _ = widgets::wait_until(app_log, INPUT_WAIT, |t| t.contains("wv title tap2"));
+    // the page has the focus (clicked): Esc its handler takes, then Esc it leaves
+    let esc = || -> Result<(), String> {
+        proxy.inject_key(KEY_ESC, true).map_err(|e| e.to_string())?;
+        proxy.inject_key(KEY_ESC, false).map_err(|e| e.to_string())
+    };
+    esc()?;
+    let _ = widgets::wait_until(app_log, INPUT_WAIT, |t| t.contains(ESC_PREVENTED));
+    std::thread::sleep(ESC_SETTLE);
+    esc()?;
+    let _ = widgets::wait_until(app_log, INPUT_WAIT, |t| t.contains(ESC_LEFT));
+    // a back (esc-back on) comes after the title; off, the settle shows none came
+    let _ = widgets::wait_until(app_log, ESC_SETTLE, |t| t.contains(BACK_LINE));
     Ok(())
 }
 
@@ -462,6 +542,32 @@ mod tests {
         let stuck = "x AtlWindow: wv title tap1\nx AtlWindow: wv overlay tap\nx AtlWindow: wv intercepted\n\
                      diag: first divergence webview.input.intercept-no-cancel 1 at=1\n";
         assert!(after_intercept(stuck).is_err());
+        // the Esc titles after tap2 leave the tap sub-gates alone
+        let keys = format!(
+            "{ok}x AtlWindow: wv title key1Escape-prevented\nx AtlWindow: wv title key2Escape\n"
+        );
+        assert!(after_intercept(&keys).is_ok());
+    }
+
+    /// The Esc sub-gates on hand-written logs: handled Esc no back, left Esc one back after it (esc-back on) or none (off); a duplicate key, an early back or a missing back fail.
+    #[test]
+    fn esc_sub_gates_by_hand() {
+        let t = |s: &str| format!("x AtlWindow: wv title {s}\n");
+        let back = "x AtlWindow: wv back\n";
+        let on = format!("{}{}{back}", t("key1Escape-prevented"), t("key2Escape"));
+        assert!(esc_handled(&on).is_ok() && esc_back_check(&on, true).is_ok());
+        assert!(esc_back_check(&on, false).is_err());
+        let off = format!("{}{}", t("key1Escape-prevented"), t("key2Escape"));
+        assert!(esc_handled(&off).is_ok() && esc_back_check(&off, false).is_ok());
+        assert_eq!(
+            esc_back_check(&off, true),
+            Err("no back after the unhandled Esc".to_owned())
+        );
+        // WebKit's put-back published again: the page sees the second Esc twice
+        let dup = format!("{off}{}{back}", t("key3Escape"));
+        assert!(esc_handled(&dup).is_err());
+        let early = format!("{}{back}{}", t("key1Escape-prevented"), t("key2Escape"));
+        assert!(esc_handled(&early).is_err() && esc_back_check(&early, true).is_err());
     }
 
     /// The picture by hand on a small layout: window, page, overlay over the page and past its edge.

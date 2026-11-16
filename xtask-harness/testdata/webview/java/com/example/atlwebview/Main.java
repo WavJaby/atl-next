@@ -16,6 +16,8 @@ import android.widget.FrameLayout;
  * is one colour (PAGE) and an OVERLAY view of the window over part of it: the page shows in the WebView's rectangle at the WebView's depth, the overlay above it.
  * Input (W3b): every click the page gets sets its title to `tap<n>` (onReceivedTitle logs it); a click on the overlay logs `wv overlay tap`; the WebView's parent (Intercept) takes a gesture at its
  * first move, as a ScrollView does, so a drag on the page gets the WebView ACTION_DOWN, then ACTION_CANCEL.
+ * Keys: each key the page gets sets its title to `key<n><key>`; the page's handler takes the first Escape (preventDefault, title suffix `-prevented`) and leaves later ones, so an unhandled Esc reaches
+ * the app (WebViewClient.onUnhandledKeyEvent -> the key map's fallback, BACK with esc-back on): the back callback logs `wv back` and keeps the activity.
  * Rectangles are in window pixels, set as layout params so no density rounding applies; after the layout the fixture logs each view's rectangle in the window, and the page's onPageFinished.
  * A WebView that cannot be made (no provider, no engine) is logged and left out, so the gate's picture shows the window there.
  */
@@ -28,7 +30,8 @@ public class Main extends Activity {
      * PAGE's colour 0x3070c0 as the page's CSS, and the click counter. Not `#3070c0`: loadData takes the content as a URL, so a bare '#' starts its fragment and cuts the page
      * (WebView.loadData doc: escape it as %23); for the same reason no '%' or '?'.
      */
-    static final String PAGE_HTML = "<html><body style=\"margin:0;height:100vh;background:rgb(48,112,192)\" onclick=\"window.n=(window.n||0)+1;document.title='tap'+window.n\"></body></html>";
+    static final String PAGE_HTML = "<html><body style=\"margin:0;height:100vh;background:rgb(48,112,192)\" onclick=\"window.n=(window.n||0)+1;document.title='tap'+window.n\""
+            + " onkeydown=\"window.k=(window.k||0)+1;if(event.key=='Escape'&&window.k==1)event.preventDefault();document.title='key'+window.k+event.key+(event.defaultPrevented?'-prevented':'')\"></body></html>";
 
     /** The WebView's parent: intercepts a gesture at its first move (as a scrolling parent does), so the WebView gets ACTION_CANCEL. */
     static final class Intercept extends FrameLayout {
@@ -96,6 +99,15 @@ public class Main extends Activity {
         });
         place(over, 100, 80, 60, 40);
         setContentView(root);
+        // BACK through the predictive-back path (what a targetSdk 36 app gets): logged, the activity stays for the rest of the gate
+        getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+                android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT,
+                new android.window.OnBackInvokedCallback() {
+                    @Override
+                    public void onBackInvoked() {
+                        Log.i(TAG, "wv back");
+                    }
+                });
         root.getViewTreeObserver().addOnGlobalLayoutListener(new ViewTreeObserver.OnGlobalLayoutListener() {
             @Override
             public void onGlobalLayout() {

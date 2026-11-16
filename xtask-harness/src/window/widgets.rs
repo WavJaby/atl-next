@@ -112,6 +112,14 @@ const KEYCODE_FORWARD: i64 = 125;
 const BACK_CALLBACK_LINE: &str = "AtlWindow: back callback";
 /// KeyEvent.FLAG_CANCELED: ViewRootImpl.doOnBackKeyEvent cancels a back UP after its dispatch (ViewRootImpl.java:7750-7753), so the UP reaches Main canceled. Forward has no such dispatch: flags 0.
 const FLAG_CANCELED: i64 = 0x20;
+/// input-event-codes.h KEY_ESC: the key the esc-back step presses after the side buttons. keycodes.h AKEYCODE_ESCAPE: what Generic.kl maps it to (`key 1 ESCAPE`).
+const KEY_ESC: u32 = 1;
+const KEYCODE_ESCAPE: i64 = 111;
+/// input.h AKEY_EVENT_FLAG_FROM_SYSTEM (every composer key) and AKEY_EVENT_FLAG_FALLBACK (the dispatcher's fallback for an unhandled key).
+const FLAG_FROM_SYSTEM: i64 = 0x8;
+const FLAG_FALLBACK: i64 = 0x400;
+/// input_devices SOURCE_KEYBOARD: the physical keyboard's keys, fallbacks included (they keep the original's source and device).
+const SOURCE_KEYBOARD: i64 = input_devices::SOURCE_KEYBOARD as i64;
 
 /// A widget's rectangle in the content, from its `AtlWindow: layout <name>` line.
 #[derive(Debug, Clone, Copy)]
@@ -269,6 +277,11 @@ fn keys_check(app: &str) -> Result<String, String> {
             k[6], k[7]
         ));
     }
+    // the typed keys only (Shift, A): Esc and its fallback are esc_back_check's
+    let keys: Vec<[i64; 10]> = keys
+        .into_iter()
+        .filter(|k| k[1] == 59 || k[1] == 29)
+        .collect();
     // (action, code, scan, meta, char) of the downs, repeats aside
     let downs: Vec<(i64, i64, i64, i64)> = keys
         .iter()
@@ -336,7 +349,9 @@ fn buttons_check(app: &str) -> Result<String, String> {
             "mouse keys (action, code, device, repeat, flags) {got:?}, want {want:?}"
         ));
     }
-    let callbacks = app
+    // the esc-back step's callback comes after its Esc: esc_back_check's
+    let (before_esc, _) = split_at_esc(app);
+    let callbacks = before_esc
         .lines()
         .filter(|l| l.contains(BACK_CALLBACK_LINE))
         .count();
@@ -346,6 +361,72 @@ fn buttons_check(app: &str) -> Result<String, String> {
     Ok(format!(
         "BTN_SIDE -> KEYCODE_BACK down and up from the mouse ({pointer}), the back callback ran once; BTN_EXTRA -> KEYCODE_FORWARD the same way"
     ))
+}
+
+/// The app log before and from the first keyboard Esc key line (all of it before when there is none).
+fn split_at_esc(app: &str) -> (&str, &str) {
+    let mut at = 0;
+    for line in app.split_inclusive('\n') {
+        if key_line(line).is_some_and(|k| k[1] == KEYCODE_ESCAPE && k[7] == SOURCE_KEYBOARD) {
+            return app.split_at(at);
+        }
+        at += line.len();
+    }
+    (app, "")
+}
+
+/// The esc-back step (drive's, after the side buttons): Esc, which no view of the fixture consumes, finished unhandled; the dispatcher's fallback (the keyboard map's, atl-composer input/fallback.rs) follows.
+/// esc-back on: ESC down/up (flags FROM_SYSTEM 8), then KEYCODE_BACK down with FALLBACK | FROM_SYSTEM (0x408) and up with that | CANCELED (0x428, ViewRootImpl's back dispatch, as the mouse's back up), from the keyboard, and the back callback once.
+/// Off (AOSP's map, Generic.kcm ESCAPE `base: none`): ESC down/up only, no BACK, no callback. Values: keycodes.h, input.h AKEY_EVENT_FLAG_*, InputDispatcher::afterKeyEventLockedInterruptable (fallback flags = original | FALLBACK).
+/// ESC up and BACK down race (the fallback goes out when ESC down finishes), so each key's own order is compared, not their interleaving.
+fn esc_back_check(app: &str, esc_back: bool) -> Result<String, String> {
+    let (_, from_esc) = split_at_esc(app);
+    let keyboard = i64::from(input_devices::KEYBOARD);
+    let keys: Vec<[i64; 10]> = from_esc
+        .lines()
+        .filter_map(key_line)
+        .filter(|k| k[7] == SOURCE_KEYBOARD && k[6] == keyboard)
+        .collect();
+    let of = |code: i64| -> Vec<(i64, i64)> {
+        keys.iter()
+            .filter(|k| k[1] == code)
+            .map(|k| (k[0], k[5]))
+            .collect()
+    };
+    let (esc, back) = (of(KEYCODE_ESCAPE), of(KEYCODE_BACK));
+    let want_esc = [(0, FLAG_FROM_SYSTEM), (1, FLAG_FROM_SYSTEM)];
+    if esc != want_esc {
+        return Err(format!("Esc (action, flags) {esc:?}, want {want_esc:?}"));
+    }
+    let fallback = FLAG_FALLBACK | FLAG_FROM_SYSTEM;
+    let want_back: &[(i64, i64)] = if esc_back {
+        &[(0, fallback), (1, fallback | FLAG_CANCELED)]
+    } else {
+        &[]
+    };
+    if back != want_back {
+        return Err(if back.is_empty() {
+            "no BACK key after Esc".to_owned()
+        } else {
+            format!("BACK after Esc (action, flags) {back:?}, want {want_back:?}")
+        });
+    }
+    let callbacks = from_esc
+        .lines()
+        .filter(|l| l.contains(BACK_CALLBACK_LINE))
+        .count();
+    let want_callbacks = usize::from(esc_back);
+    if callbacks != want_callbacks {
+        return Err(format!(
+            "{callbacks} back callbacks after Esc, want {want_callbacks}"
+        ));
+    }
+    Ok(if esc_back {
+        "unhandled Esc -> fallback BACK down 0x408 / up 0x428 from the keyboard, back callback once"
+            .to_owned()
+    } else {
+        "unhandled Esc -> no fallback (AOSP map), no back callback".to_owned()
+    })
 }
 
 /// The hover the probe makes over the list: HOVER_ENTER (9), HOVER_MOVE (7), HOVER_EXIT (10) in that order with no touch in between (input.h codes). A tap (enter, press) makes no hover at all: the enter comes with the first move.
@@ -764,6 +845,7 @@ pub fn checks(
         ("keys", keys_check(app)),
         ("esc-fallback", esc_fallback_check(app, esc_back)),
         ("mouse-buttons", buttons_check(app)),
+        ("esc-back", esc_back_check(app, esc_back)),
         ("hover", hover_check(app)),
         ("wheel", wheel_check(app)),
         ("swipe", swipe_check(app)),
@@ -868,6 +950,7 @@ pub fn drive(
     proxy: Proxy,
     app_log: &Path,
     break_mouse_back: bool,
+    esc_back: bool,
     probe: &capture::Probe,
 ) -> Result<Liveness, String> {
     await_event(&proxy.events, ACK_WAIT, |e| {
@@ -1048,6 +1131,11 @@ pub fn drive(
         ],
     )?;
     wait_until(app_log, LINE_WAIT, |t| buttons_check(t).is_ok());
+    // Esc, which no view consumes: its fallback (esc-back on) is BACK; the checks judge the whole log at the end, so a late BACK with esc-back off still fails
+    let key = |code: u32, pressed: bool| proxy.inject_key(code, pressed).map_err(|e| e.to_string());
+    key(KEY_ESC, true)?;
+    key(KEY_ESC, false)?;
+    wait_until(app_log, LINE_WAIT, |t| esc_back_check(t, esc_back).is_ok());
     // the idle window: nothing is injected, so the app must request no frame (`idle`); the composer's parking is not observed
     std::thread::sleep(IDLE_SETTLE);
     let from = log_len(app_log)?;
@@ -1251,6 +1339,55 @@ mod tests {
             "1793995016.872 5227.437     2     2 I liblog/AtlWindow: back callback\n",
         );
         assert!(buttons_check(&logcat).is_ok());
+    }
+
+    fn keyboard_key(action: u32, code: i64, flags: i64) -> String {
+        let keyboard = input_devices::KEYBOARD;
+        format!(
+            "AtlWindow: key action={action} code={code} scan=1 meta=0 repeat=0 flags={flags} device={keyboard} source={SOURCE_KEYBOARD} char=0 kbtype=4\n"
+        )
+    }
+
+    /// Esc then its fallback BACK (0x408 down, 0x428 up) and one callback after Esc: passes with esc-back on, in either interleaving; the mouse's earlier callback does not count; off wants no BACK.
+    #[test]
+    fn esc_back_check_wants_the_fallback_back_after_esc() {
+        // 0x408 = 1032, 0x428 = 1064 (input.h FALLBACK 0x400 | FROM_SYSTEM 0x8, + CANCELED 0x20)
+        let (esc_down, esc_up) = (
+            keyboard_key(0, KEYCODE_ESCAPE, 8),
+            keyboard_key(1, KEYCODE_ESCAPE, 8),
+        );
+        let (back_down, back_up) = (
+            keyboard_key(0, KEYCODE_BACK, 1032),
+            keyboard_key(1, KEYCODE_BACK, 1064),
+        );
+        let mouse = "AtlWindow: back callback\n";
+        let good =
+            format!("{mouse}{esc_down}{esc_up}{back_down}{back_up}AtlWindow: back callback\n");
+        assert!(esc_back_check(&good, true).is_ok());
+        let raced =
+            format!("{mouse}{esc_down}{back_down}{esc_up}{back_up}AtlWindow: back callback\n");
+        assert!(esc_back_check(&raced, true).is_ok());
+        let none = format!("{mouse}{esc_down}{esc_up}");
+        assert_eq!(
+            esc_back_check(&none, true),
+            Err("no BACK key after Esc".to_owned())
+        );
+        assert!(esc_back_check(&none, false).is_ok());
+        assert!(esc_back_check(&good, false).is_err());
+        let plain_back = good.replace(&back_down, &keyboard_key(0, KEYCODE_BACK, 8));
+        assert!(esc_back_check(&plain_back, true).is_err());
+        let no_callback = format!("{mouse}{esc_down}{esc_up}{back_down}{back_up}");
+        assert!(esc_back_check(&no_callback, true).is_err());
+        // the mouse-buttons sub-gate counts only the callbacks before Esc
+        let pointer = i64::from(input_devices::POINTER);
+        let buttons = [
+            mouse_key(0, KEYCODE_BACK, pointer, 0),
+            mouse_key(1, KEYCODE_BACK, pointer, FLAG_CANCELED),
+            mouse_key(0, KEYCODE_FORWARD, pointer, 0),
+            mouse_key(1, KEYCODE_FORWARD, pointer, 0),
+        ]
+        .concat();
+        assert!(buttons_check(&format!("{buttons}{good}")).is_ok());
     }
 
     #[test]
