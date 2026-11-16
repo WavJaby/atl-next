@@ -388,6 +388,7 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 		return err
 	}
 	g.loadArt(art)
+	g.sdkLibraryXMLs(out, goals)
 	if err := g.addAidlCrates(aidlCrates); err != nil {
 		return err
 	}
