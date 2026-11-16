@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! A held `flock`, released by an explicit unlock on drop.
 //!
 //! A flock belongs to the open file description. A child that any thread of this process forks shares that description until the child's exec (`O_CLOEXEC` acts only at exec), so closing our fd alone leaves the lock held for that window: a lock this process just "released" reads as busy to the next taker. `LOCK_UN` frees the description's lock whatever fds still share it, so [`Flock`] unlocks before its file closes. Every flock xtask takes goes through this type -- a bare `File` + `flock` reopens the race.
