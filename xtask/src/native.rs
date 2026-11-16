@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use atl_layout::Layout;
@@ -16,6 +17,7 @@ use crate::aosp::{self, Index, Manifest, Prebuilts};
 use crate::build_state;
 use crate::providers::{Partial, Provided};
 use crate::sources::Pin;
+use crate::timing::Timings;
 use crate::verdict::{Failure, Verdict};
 use crate::{
     arches, build_pool, converter, deps, fetch, licence_gate, licenses, ndk_surface, none_gate,
@@ -186,6 +188,7 @@ fn cross_args(
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
+    let mut phases = Phases::new();
     let args = &args.resolved(root)?;
     {
         let ws = atl_layout::Layout::of(root)?.workspace().to_owned();
@@ -242,6 +245,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     std::fs::create_dir_all(&graph_out)?;
     let mut built_goals = build_state::forget(&graph_out, &state)?;
     built_goals.extend(args.recorded_goals());
+    phases.lap("preflight");
     let tool_dir = out.join("bp2ninja");
     std::fs::create_dir_all(&out)?;
     let go_work = converter::go_work(root, &layout, &tool_dir)?;
@@ -307,6 +311,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             flags: &cross_flags,
             cross_processor: cross.as_ref().map(|_| args.host.as_str()),
         },
+        &mut phases,
     )?;
     // a cross host's build side (tools a build rule executes or loads: bp2ninja Build) links the same providers built for the build machine, as Soong resolves a BuildOSTarget module's deps in the build OS variant;
     // in their own dir, apart from the converter's device/, host/ and build/<module> nodes and the gates over them
@@ -322,7 +327,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 flags: &[],
                 cross_processor: None,
             };
-            let mut bp = provide(&ctx, &build_machine)?;
+            let mut bp = provide(&ctx, &build_machine, &mut phases)?;
             // a srcs row's provider stands in for sources of a product module; no build-side module has one
             for (module, _) in providers::partial(to_build) {
                 bp.remove(module);
@@ -381,6 +386,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         )?),
         None => None,
     };
+    phases.lap("bootstrap");
     // compared after the rounds: a rewritten build.ninja means the graph was (re)converted this run
     let manifest_before = manifest_mtime(&graph_out);
     let mut round = 0;
@@ -458,7 +464,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         argv.extend(nb.flags.iter().cloned());
         argv.extend(args.goals.iter().cloned());
         argv.extend(aidl_goals.iter().cloned());
-        convert(&converter, &graph_out, &argv, &env)?;
+        let regen = convert(&converter, &graph_out, &argv, &env)?;
+        phases.lap(&format!("convert: {regen}"));
         let problems = std::fs::read_to_string(graph_out.join("problems.txt")).unwrap_or_default();
         if args.fetch_missing {
             let missing =
@@ -514,6 +521,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let probed = crate::isa_tiers::probe(&graph_out, &deps::binary(root, &c.cc)?)?;
         println!("native: isa tiers: {probed} source(s) probed");
     }
+    phases.lap("ninja setup");
     let log = graph_out.join("ninja.log");
     // only ninja runs under the grant (build_pool.rs); the gates below run after it is released
     // a (re)converted graph is a cold-class build (native-full), a warm one native-incr
@@ -522,7 +530,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         build_pool::Class::NativeFull
     };
-    let grant = build_pool::acquire(ws, root, class)?;
+    let grant = phases.timed("pool wait", || build_pool::acquire(ws, root, class))?;
     println!(
         "native: pool {} cpu {} of {}",
         class.name(),
@@ -535,9 +543,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .with_context(|| format!("reading {}", graph_file.display()))?,
     )
     .with_context(|| format!("parsing {}", graph_file.display()))?;
+    phases.lap("graph load");
     if let Some(p) = &nb.pass2 {
-        runtimes_pass2(root, args, &graph_out, &tree, &graph, p, &env)?;
+        phases.timed("runtimes pass 2", || {
+            runtimes_pass2(root, args, &graph_out, &tree, &graph, p, &env)
+        })?;
     }
+    let ninja_started = Instant::now();
+    let ninja_from = ninja_log_len(&graph_out);
     let status = Command::new("ninja")
         .args(["-k", "0", "-j"])
         .arg(grant.cpu.to_string())
@@ -548,6 +561,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .stderr(std::fs::File::create(graph_out.join("ninja.err"))?)
         .status()
         .context("running ninja")?;
+    let edges = ninja_log_since(&graph_out, ninja_from)
+        .map_or_else(|| "edges n/a".to_owned(), |p| format!("{} edges", p.len()));
+    phases.span(&format!("ninja ({edges})"), ninja_started.elapsed());
     drop(grant);
     let provided_libs: BTreeSet<&Path> = provided
         .values()
@@ -575,6 +591,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if let Some(first) = licence_gate(&graph_out, status.success(), args.verbose)? {
         failed.push(Failure::step("licence gate", first));
     }
+    phases.lap("gates");
     if status.success() {
         println!("native: built -> {}", graph_out.display());
         let packages_built = if foreign {
@@ -582,8 +599,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             Vec::new()
         } else {
             // the workspace packages are cargo runs: one cargo grant, its job count reaches cargo_command
-            let _grant = build_pool::acquire(ws, root, build_pool::Class::Cargo)?;
-            packages::build(root, &out)?
+            let _grant = phases.timed("pool wait", || {
+                build_pool::acquire(ws, root, build_pool::Class::Cargo)
+            })?;
+            phases.timed("packages (cargo)", || packages::build(root, &out))?
         };
         for built in packages_built {
             for bin in built.bins {
@@ -592,7 +611,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
         // the build machine's JDK and d8 (host_art.rs java_tools) compile it for any host; a foreign guest graph has no framework of its own
         if !foreign {
-            match crate::host_art::build_api_impl(root, &out)? {
+            match phases.timed("api-impl", || crate::host_art::build_api_impl(root, &out))? {
                 Some(dex) => println!("native: api-impl -> {}", dex.display()),
                 None => {
                     println!("native: api-impl not built: the goals built no framework header jar")
@@ -604,6 +623,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         if let Some(first) = table_check(&table) {
             failed.push(Failure::step("table check", first));
         }
+        phases.finish();
         return Ok(verdict(failed));
     }
     let text = std::fs::read_to_string(&log)?;
@@ -648,6 +668,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if let Some(first) = table_check(&table) {
         failed.push(Failure::step("table check", first));
     }
+    phases.finish();
     Ok(verdict(failed))
 }
 
@@ -1336,8 +1357,12 @@ struct Machine<'a> {
 }
 
 /// The provided set for machine `m`: each provider built or resolved once (crates by cargo-c, upstreams by their own build system, system libraries as installed), then each module one entry joining its row's providers in order; `srcs` rows included (the caller splits them off).
-fn provide<'a>(ctx: &ProvideCtx<'a>, m: &Machine) -> Result<BTreeMap<&'a str, Provided>> {
-    let crates = build_crates(ctx.root, &m.out, ctx.providers, m.cargo)?;
+fn provide<'a>(
+    ctx: &ProvideCtx<'a>,
+    m: &Machine,
+    phases: &mut Phases,
+) -> Result<BTreeMap<&'a str, Provided>> {
+    let crates = build_crates(ctx.root, &m.out, ctx.providers, m.cargo, phases)?;
     let mut systems = BTreeMap::new();
     for (_, row) in providers::systems(ctx.providers) {
         if systems.contains_key(row) {
@@ -1383,7 +1408,9 @@ fn provide<'a>(ctx: &ProvideCtx<'a>, m: &Machine) -> Result<BTreeMap<&'a str, Pr
             m.label,
             src.display()
         );
-        upstreams.extend(upstream::build(&src, &m.out, recipe, &toolchain)?);
+        upstreams.extend(phases.timed("upstreams", || {
+            upstream::build(&src, &m.out, recipe, &toolchain)
+        })?);
     }
     let mut provided = BTreeMap::new();
     // rust_os rows have no provider and module: rows a tree one: the tree builds them (-stand-in)
@@ -1427,6 +1454,7 @@ fn build_crates<'a>(
     out: &Path,
     providers: &'a providers::Providers,
     cross: Option<&crate::cross::CargoTarget>,
+    phases: &mut Phases,
 ) -> Result<BTreeMap<&'a str, Provided>> {
     let crates: BTreeSet<&str> = providers::crates(providers)
         .into_iter()
@@ -1452,22 +1480,26 @@ fn build_crates<'a>(
             cargo.arg("--target").arg(&target.triple);
             cargo.envs(target.env.iter().map(|(k, v)| (k, v)));
         }
-        let status = crate::unit_use::status(
-            cargo
-                .arg("--target-dir")
-                .arg(out.join("cargo"))
-                .arg("--destdir")
-                .arg(&dest)
-                .arg("--prefix")
-                .arg(&prefix)
-                .arg("--libdir")
-                .arg(prefix.join("lib"))
-                .arg("--includedir")
-                .arg(&include)
-                .current_dir(root),
-        )
-        .context("running cargo cinstall (deps.toml row cargo-c)")?;
+        let status = phases
+            .timed("cargo crates", || {
+                crate::unit_use::status(
+                    cargo
+                        .arg("--target-dir")
+                        .arg(out.join("cargo"))
+                        .arg("--destdir")
+                        .arg(&dest)
+                        .arg("--prefix")
+                        .arg(&prefix)
+                        .arg("--libdir")
+                        .arg(prefix.join("lib"))
+                        .arg("--includedir")
+                        .arg(&include)
+                        .current_dir(root),
+                )
+            })
+            .context("running cargo cinstall (deps.toml row cargo-c)")?;
         ensure!(status.success(), "building crate {krate} failed");
+        let installs = Instant::now();
         let staged_lib = staged(&dest, &prefix.join("lib"))?;
         if staged_lib.is_dir() {
             sync_tree(&staged_lib, &prefix.join("lib"), false)?;
@@ -1479,6 +1511,7 @@ fn build_crates<'a>(
         } else {
             remove_path(&include)?;
         }
+        phases.span("installs", installs.elapsed());
         // cargo's library name: the package name with `-` as `_`
         let lib = prefix
             .join("lib")
@@ -1666,12 +1699,13 @@ fn manifest_mtime(out: &Path) -> Option<std::time::SystemTime> {
         .ok()
 }
 
+/// What [`convert`] did: `bootstrap` (bp2ninja -bootstrap ran), `reconvert` (the regeneration edge ran), `keep`, or `unknown` (the log was recompacted).
 fn convert(
     converter: &Path,
     out: &Path,
     argv: &[String],
     env: &[(&'static str, OsString)],
-) -> Result<()> {
+) -> Result<&'static str> {
     let args_file = out.join(CONVERTER_ARGS);
     let graph = out.join("build.ninja");
     let bootstrap =
@@ -1690,6 +1724,7 @@ fn convert(
             .context("running bp2ninja -bootstrap")?;
         ensure!(status.success(), "bp2ninja -bootstrap failed");
     }
+    let from = ninja_log_len(out);
     let status = Command::new("ninja")
         .arg("-C")
         .arg(out)
@@ -1698,7 +1733,110 @@ fn convert(
         .status()
         .context("running ninja build.ninja")?;
     ensure!(status.success(), "bp2ninja failed (its output above)");
-    Ok(())
+    // ninja logs the regeneration edge, whose output is build.ninja, only when it ran
+    Ok(if bootstrap {
+        "bootstrap"
+    } else {
+        match ninja_log_since(out, from) {
+            Some(edges) if edges.iter().any(|e| e == "build.ninja") => "reconvert",
+            Some(_) => "keep",
+            None => "unknown",
+        }
+    })
+}
+
+/// Bytes in `out`'s `.ninja_log` (ninja's build log, one line per finished edge); 0 without one.
+fn ninja_log_len(out: &Path) -> u64 {
+    std::fs::metadata(out.join(".ninja_log")).map_or(0, |m| m.len())
+}
+
+/// Output paths of the edges ninja logged after byte `from` of `out`'s `.ninja_log`; None when the file is shorter than `from` (ninja recompacted it: the delta is unknown).
+fn ninja_log_since(out: &Path, from: u64) -> Option<Vec<String>> {
+    let text = std::fs::read(out.join(".ninja_log")).ok()?;
+    entries_after(&text, usize::try_from(from).ok()?)
+}
+
+/// The output column of each `start end mtime output hash` line from byte `from` on (tab-separated; the `#` header is skipped).
+fn entries_after(text: &[u8], from: usize) -> Option<Vec<String>> {
+    let tail = String::from_utf8_lossy(text.get(from..)?);
+    Some(
+        tail.lines()
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| l.split('\t').nth(3).map(str::to_owned))
+            .collect(),
+    )
+}
+
+/// `native times:`, printed to stderr before the verdict line (stdout's last line). `lap` closes the phase since the last mark; `span` and `timed` record a measured stretch and keep it out of the lap around it. An error return prints the table from `Drop`.
+struct Phases {
+    rows: BTreeMap<String, (Duration, u32)>,
+    at: Instant,
+    shown: bool,
+}
+
+impl Phases {
+    fn new() -> Self {
+        Phases {
+            rows: BTreeMap::new(),
+            at: Instant::now(),
+            shown: false,
+        }
+    }
+
+    fn record(&mut self, name: &str, took: Duration) {
+        let row = self.rows.entry(name.to_owned()).or_default();
+        row.0 += took;
+        row.1 += 1;
+    }
+
+    /// Closes phase `name`: the time since the last mark.
+    fn lap(&mut self, name: &str) {
+        self.record(name, self.at.elapsed());
+        self.at = Instant::now();
+    }
+
+    /// A measured stretch `took` as phase `name`; the next lap starts after it.
+    fn span(&mut self, name: &str, took: Duration) {
+        self.record(name, took);
+        self.at += took;
+    }
+
+    fn timed<T>(&mut self, name: &str, f: impl FnOnce() -> T) -> T {
+        let started = Instant::now();
+        let out = f();
+        self.span(name, started.elapsed());
+        out
+    }
+
+    /// Rows as `Timings` (`name (xN)` when a phase ran N > 1 times).
+    fn render(&self) -> String {
+        let mut times = Timings::default();
+        for (name, (took, n)) in &self.rows {
+            let label = if *n > 1 {
+                format!("{name} (x{n})")
+            } else {
+                name.clone()
+            };
+            times.push(&label, *took);
+        }
+        times.table("native")
+    }
+
+    /// Closes the last phase as `other`, then prints once.
+    fn finish(&mut self) {
+        if self.shown {
+            return;
+        }
+        self.lap("other");
+        self.shown = true;
+        eprintln!("{}", self.render().trim_end());
+    }
+}
+
+impl Drop for Phases {
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
 
 /// Writes `text` to `path` unless it already holds it: an unchanged input keeps its mtime, so the edges reading it stay clean.
@@ -2252,5 +2390,37 @@ nope
             want["external/zlib"],
             "module libz: y: source :libz#tag is not a known filegroup"
         );
+    }
+
+    #[test]
+    fn ninja_log_entries_after_the_offset() {
+        // ninja log v5: `start end mtime output hash`, tab-separated, after a `# ninja log v5` header
+        let header = "# ninja log v5\n";
+        let text = format!("{header}0\t12\t1700\tobj/a.o\t1f\n3\t9\t1700\tlib/b.so\t2e\n");
+        let want = ["obj/a.o", "lib/b.so"];
+        assert_eq!(entries_after(text.as_bytes(), header.len()).unwrap(), want);
+        assert_eq!(entries_after(text.as_bytes(), 0).unwrap(), want);
+        assert!(
+            entries_after(text.as_bytes(), text.len())
+                .unwrap()
+                .is_empty()
+        );
+        // shorter than the offset: recompacted, so the delta is unknown
+        assert!(entries_after(text.as_bytes(), text.len() + 1).is_none());
+    }
+
+    #[test]
+    fn phases_add_repeats_and_sum() {
+        let mut p = Phases::new();
+        p.span("cargo crates", Duration::from_secs(2));
+        p.span("cargo crates", Duration::from_secs(3));
+        p.span("ninja (0 edges)", Duration::from_secs(5));
+        let text = p.render();
+        assert!(text.starts_with("native times:\n"), "{text}");
+        assert!(text.contains("cargo crates (x2)"), "{text}");
+        // 2 + 3 + 5 s
+        assert!(text.trim_end().ends_with("10.0s"), "{text}");
+        // prints to the captured stderr and marks the table shown, so Drop stays quiet
+        p.finish();
     }
 }
