@@ -22,8 +22,8 @@ public class Main extends Activity {
     static final String WINDOW_TITLE = "AtlWebViewFixture";
     static final int WINDOW = 0xff204060;
     static final int OVERLAY = 0xfff0f0f0;
-    /** PAGE's colour, as the page's CSS: #3070c0 (opaque). */
-    static final String PAGE_HTML = "<html><body style=\"margin:0;background:#3070c0\"></body></html>";
+    /** PAGE's colour 0x3070c0 as the page's CSS. Not as `#3070c0`: loadData takes the content as a URL, so a bare '#' starts its fragment and cuts the page (WebView.loadData doc: escape it as %23). */
+    static final String PAGE_HTML = "<html><body style=\"margin:0;background:rgb(48,112,192)\"></body></html>";
 
     private FrameLayout root;
     private View web;

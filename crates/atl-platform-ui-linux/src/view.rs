@@ -251,6 +251,29 @@ impl SceneView {
             next = child.next_sibling();
         }
         let moved = *self.imp().placed.borrow() != placed;
+        if moved {
+            for piece in &pieces {
+                if let Piece::Sideband {
+                    stream,
+                    dst,
+                    clip,
+                    alpha,
+                } = piece
+                {
+                    tracing::info!(
+                        "atl-platform-ui: sideband {stream:?} placed dst={},{},{},{} clip={},{},{},{} alpha={alpha}",
+                        dst.left,
+                        dst.top,
+                        dst.right,
+                        dst.bottom,
+                        clip.left,
+                        clip.top,
+                        clip.right,
+                        clip.bottom
+                    );
+                }
+            }
+        }
         self.imp().placed.replace(placed);
         self.imp().pieces.replace(pieces);
         if moved {

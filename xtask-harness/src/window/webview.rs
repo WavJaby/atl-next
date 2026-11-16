@@ -24,7 +24,7 @@ const LAYOUT: &str = "AtlWindow: wv layout ";
 const LOADED: &str = "AtlWindow: wv page finished";
 /// After the load, the time WebKit's first paint of the page may take to reach the window (one web-process frame and one present; generous for a loaded host).
 const PAINT_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
-/// Main.java's colours as RGBA bytes: WINDOW 0xff204060, OVERLAY 0xfff0f0f0, the page's CSS #3070c0.
+/// Main.java's colours as RGBA bytes: WINDOW 0xff204060, OVERLAY 0xfff0f0f0, the page's CSS rgb(48,112,192).
 const WINDOW: [u8; 4] = [0x20, 0x40, 0x60, 0xff];
 const OVERLAY: [u8; 4] = [0xf0, 0xf0, 0xf0, 0xff];
 const PAGE: [u8; 4] = [0x30, 0x70, 0xc0, 0xff];
