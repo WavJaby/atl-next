@@ -373,46 +373,100 @@ fn webview_ua_why(line: Option<&str>, engine: Option<&str>) -> Option<String> {
 }
 /// Main.webViewPackage's line: WebView.getCurrentWebViewPackage (webviewupdate's getCurrentWebViewPackage, WebView.java:3128-3140) with the provider placed: the scanned
 /// `com.android.webview` with FLAG_SYSTEM (WebViewUpdateServiceImpl2.providerHasValidSignature accepts a system app). `null` = no valid provider.
-const WEBVIEW_PACKAGE: (&str, &str) = (
-    "AtlTest: webview-package: ",
-    "name=com.android.webview system=true",
-);
+const WEBVIEW_PACKAGE: Line = Line {
+    row: "webview-package",
+    prefix: "AtlTest: webview-package: ",
+    want: Want::Exact("name=com.android.webview system=true"),
+    timing: Timing::Create,
+};
 /// Main.webViewPage's line (webview plan W2 gate): an unattached WebView loads Main.WEBVIEW_PAGE through loadData, then runs Main.WEBVIEW_SCRIPT at the first onPageFinished.
 /// `events`: the WebViewClient order -- onPageStarted, then onPageFinished once. `titles`: onReceivedTitle once with the page's `<title>`, in no fixed order with onPageFinished (AOSP fixes none:
 /// CTS WebChromeClientTest.testOnReceivedTitle polls for the title after the load completes; WebKit notifies it after LOAD_FINISHED for this data: page, W2 run w2-app5x). `js`: evaluateJavascript's JSON of the script's array (JSON.stringify form):
 /// `typeof atl.add` "function" (annotated, exposed), `atl.add(2, 3)` 5 and `atl.echo('hi')` "hi!" (the bridge round trip: Bridge.add / Bridge.echo), `typeof atl.hidden` "undefined"
 /// (no @JavascriptInterface: not callable, WebView.addJavascriptInterface doc for API >= 17), `document.title` "atl" (the page's title).
-const WEBVIEW_PAGE: (&str, &str) = (
-    "AtlTest: webview-page: ",
-    r#"events=started,finished, titles=atl, js=["function",5,"hi!","undefined","atl"]"#,
-);
+const WEBVIEW_PAGE: Line = Line {
+    row: "webview-page",
+    prefix: "AtlTest: webview-page: ",
+    want: Want::Exact(
+        r#"events=started,finished, titles=atl, js=["function",5,"hi!","undefined","atl"]"#,
+    ),
+    timing: Timing::Async,
+};
 /// Main.webViewSettings's line (webview plan S4.1, W4a): a WebView reads back what it sets, a flag and an int and a text the engine applies (font-size 20, serif "atl-serif", text-zoom 150) and
 /// the stored ones; the rest are AOSP's defaults (WebSettings.java:333, :934, :902, :640 MEDIUM, :797 NARROW_COLUMNS), the table in atl-webview settings.rs.
-const WEBVIEW_SETTINGS: (&str, &str) = (
-    "AtlTest: webview-settings: ",
-    "js=true font-size=20 serif=atl-serif text-zoom=150 min-font=8 zoom=MEDIUM layout=NARROW_COLUMNS support-zoom=true",
-);
+const WEBVIEW_SETTINGS: Line = Line {
+    row: "webview-settings",
+    prefix: "AtlTest: webview-settings: ",
+    want: Want::Exact(
+        "js=true font-size=20 serif=atl-serif text-zoom=150 min-font=8 zoom=MEDIUM layout=NARROW_COLUMNS support-zoom=true",
+    ),
+    timing: Timing::Create,
+};
 /// Main.webViewCookies's line (webview plan D5, W4b): CookieManager.setCookie from a thread without a Looper is readable at once on that thread (the copy), `a=1` being the cookie it set and
 /// hasCookies true; the ValueCallback reports success on the main Looper (CookieManager.java javadoc: the caller's Looper, the main one for a caller without).
-const WEBVIEW_COOKIE_SET: (&str, &str) = (
-    "AtlTest: webview-cookie-set: ",
-    "get=a=1 has=true cb=true main=true",
-);
+const WEBVIEW_COOKIE_SET: Line = Line {
+    row: "webview-cookie-set",
+    prefix: "AtlTest: webview-cookie-set: ",
+    want: Want::Exact("get=a=1 has=true cb=true main=true"),
+    timing: Timing::Async,
+};
 /// Main.webViewCookieWeb's line: a page's document.cookie set reaches CookieManager.getCookie (`visible=true`) within the poll's 5 s; `window-us=` is the measured D5 window, printed, not judged.
-const WEBVIEW_COOKIE_WEB: &str = "AtlTest: webview-cookie-web: ";
+const WEBVIEW_COOKIE_WEB: Line = Line {
+    row: "webview-cookie-web",
+    prefix: "AtlTest: webview-cookie-web: ",
+    want: Want::Prefix("visible=true "),
+    timing: Timing::Async,
+};
 /// Main.webViewDownload's line: a response of a type the engine does not render goes to DownloadListener (its MIME type) with the view's user agent.
-const WEBVIEW_DOWNLOAD: (&str, &str) = (
-    "AtlTest: webview-download: ",
-    "mime=application/x-atl-test ua=true",
-);
+const WEBVIEW_DOWNLOAD: Line = Line {
+    row: "webview-download",
+    prefix: "AtlTest: webview-download: ",
+    want: Want::Exact("mime=application/x-atl-test ua=true"),
+    timing: Timing::Async,
+};
 /// Main.webViewScale's line: setInitialScale(200) -> 200 % = 2 device pixels per CSS pixel whatever the screen density (WebView.java:1184-1188), the page's devicePixelRatio.
-const WEBVIEW_SCALE: (&str, &str) = ("AtlTest: webview-scale: ", "dpr=2");
+const WEBVIEW_SCALE: Line = Line {
+    row: "webview-scale",
+    prefix: "AtlTest: webview-scale: ",
+    want: Want::Exact("dpr=2"),
+    timing: Timing::Async,
+};
 /// Main.webViewClassLoader's line: WebView.getWebViewClassLoader is the loader of the provider's factory class (WebView.java:2428, WebViewFactoryProvider.java:262); it has no Chromium
 /// support-library glue, so androidx.webkit reports its extra features unsupported.
-const WEBVIEW_CLASSLOADER: (&str, &str) =
-    ("AtlTest: webview-classloader: ", "provider=true glue=false");
+const WEBVIEW_CLASSLOADER: Line = Line {
+    row: "webview-classloader",
+    prefix: "AtlTest: webview-classloader: ",
+    want: Want::Exact("provider=true glue=false"),
+    timing: Timing::Create,
+};
 
-/// Lines the fixture logs after onCreate, from binder callbacks: (row, line prefix, expected value). The watch waits for all of them (up to RESULT_WAIT).
+/// When the fixture logs a judged line. `Async`: from a binder or WebView callback after onCreate; the watch waits for it, up to RESULT_WAIT once WINDOW_MS has passed.
+/// `Create`: in onCreate, or on a thread onCreate starts before any callback, so WINDOW_MS covers it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Timing {
+    Create,
+    Async,
+}
+
+/// What a judged line's value must be: `Exact` the whole value; `Prefix` its start (the rest carries measurements, printed not judged); `Host` the run host's zone ([`HostFacts::zone_want`]).
+#[derive(Clone, Copy)]
+enum Want {
+    Exact(&'static str),
+    Prefix(&'static str),
+    Host,
+}
+
+/// A fixture log line the gate judges: `row` names it in verdicts, `prefix` finds it in the app log, `want` is its value, `timing` says when the fixture logs it.
+#[derive(Clone, Copy)]
+struct Line {
+    row: &'static str,
+    prefix: &'static str,
+    want: Want,
+    timing: Timing,
+}
+
+/// Every prefix-judged line of the fixture's log: the webview rows above and the binder callbacks below, one list read twice. The watch waits for each `Async` row
+/// (`waiting` in `judge`), and the gate judges each row. A new async row is declared with `timing: Timing::Async` in this list: it is awaited and judged, and no second list names it.
 /// bindservice: Main.bound's bindService(AtlBound, BIND_AUTO_CREATE) answers true (bindServiceLocked found the service: code 1).
 /// bindimplicit: Main.bindImplicit's bindService(Intent atl.test.BIND, setPackage) answers true and connects to AtlBound: the implicit Intent resolves as retrieveServiceLocked resolves it (queryIntentServices, first match).
 /// bound: its onServiceConnected names AtlBound and the binder it got is AtlBound's (FIRST_CALL_TRANSACTION answers AtlBound.ANSWER, 42).
@@ -425,39 +479,63 @@ const WEBVIEW_CLASSLOADER: (&str, &str) =
 /// sdkext.go derives as derive_sdk.cpp SetSdkLevels computes them: r stops at 8, the last db version that does not require EXT_SERVICES (not installed in ATL; version 9 is the first that does).
 /// ad_services is AD_SERVICES' module version, 17.
 /// timezone: Main.onCreate's TimeZone.getDefault(), from persist.sys.timezone (RuntimeInit.java:252 reads it; atld sets it to the host zone). None = the run host's zone ([`HostFacts::zone_want`]: the target's on a remote run, never the build host's).
-const ASYNC_LINES: [(&str, &str, Option<&str>); 8] = [
-    (
-        "bindservice",
-        "AtlTest: bindservice: ",
-        Some("bindService=true"),
-    ),
-    (
-        "bindimplicit",
-        "AtlTest: bindimplicit: ",
-        Some("bindService=true connected=com.example.atltest.AtlBound"),
-    ),
-    (
-        "bindmissing",
-        "AtlTest: bindmissing: ",
-        Some("bindService=false explicit=false unbind=ok called=false"),
-    ),
-    (
-        "bound",
-        "AtlTest: bound: ",
-        Some("connected=com.example.atltest.AtlBound answer=42"),
-    ),
-    (
-        "unbind",
-        "AtlTest: unbind: ",
-        Some("onUnbind action=atl.test.BIND"),
-    ),
-    (
-        "jobrun",
-        "AtlTest: jobrun: ",
-        Some("started=9 work=atl.test.WORK delivery=1 completed=true next=null"),
-    ),
-    ("sdkext", "AtlTest: sdkext: ", Some("r=8 ad_services=17")),
-    ("timezone", "AtlTest: timezone: ", None),
+const LOG_LINES: [Line; 16] = [
+    Line {
+        row: "bindservice",
+        prefix: "AtlTest: bindservice: ",
+        want: Want::Exact("bindService=true"),
+        timing: Timing::Async,
+    },
+    Line {
+        row: "bindimplicit",
+        prefix: "AtlTest: bindimplicit: ",
+        want: Want::Exact("bindService=true connected=com.example.atltest.AtlBound"),
+        timing: Timing::Async,
+    },
+    Line {
+        row: "bindmissing",
+        prefix: "AtlTest: bindmissing: ",
+        want: Want::Exact("bindService=false explicit=false unbind=ok called=false"),
+        timing: Timing::Async,
+    },
+    Line {
+        row: "bound",
+        prefix: "AtlTest: bound: ",
+        want: Want::Exact("connected=com.example.atltest.AtlBound answer=42"),
+        timing: Timing::Async,
+    },
+    Line {
+        row: "unbind",
+        prefix: "AtlTest: unbind: ",
+        want: Want::Exact("onUnbind action=atl.test.BIND"),
+        timing: Timing::Async,
+    },
+    Line {
+        row: "jobrun",
+        prefix: "AtlTest: jobrun: ",
+        want: Want::Exact("started=9 work=atl.test.WORK delivery=1 completed=true next=null"),
+        timing: Timing::Async,
+    },
+    Line {
+        row: "sdkext",
+        prefix: "AtlTest: sdkext: ",
+        want: Want::Exact("r=8 ad_services=17"),
+        timing: Timing::Create,
+    },
+    Line {
+        row: "timezone",
+        prefix: "AtlTest: timezone: ",
+        want: Want::Host,
+        timing: Timing::Create,
+    },
+    WEBVIEW_PACKAGE,
+    WEBVIEW_PAGE,
+    WEBVIEW_SETTINGS,
+    WEBVIEW_COOKIE_SET,
+    WEBVIEW_COOKIE_WEB,
+    WEBVIEW_DOWNLOAD,
+    WEBVIEW_SCALE,
+    WEBVIEW_CLASSLOADER,
 ];
 
 /// A [`SERVICE_LINES`] expectation: the fixed value, or for connectivity (None) [`connectivity_want`].
@@ -658,8 +736,8 @@ const MAIN_NEW_INTENT: &str = "AtlTest: main new intent";
 const PERMISSION_REQUEST: &str = "AtlTest: permission-request ";
 const PERMISSION_DISMISSED: &str =
     "request=11 names=[android.permission.POST_NOTIFICATIONS] results=[-1] self=-1";
-/// How long the watch after the marker waits for the round trip's last line ([`PERMISSION_REQUEST`]) once WINDOW_MS has passed. The gate reads the log without it after this, so a slow host
-/// gets this long and a broken round trip fails after it.
+/// How long the watch after the marker waits for the round trip's last line ([`PERMISSION_REQUEST`]) and the Async [`LOG_LINES`] rows once WINDOW_MS has passed. The gate reads the log
+/// without them after this, so a slow host gets this long and a broken round trip or a missing callback line fails after it.
 const RESULT_WAIT: Duration = Duration::from_secs(30);
 const FONT_TEXT: &str = "Handgloves";
 /// Main.FONT_SIZE: at unitsPerEm every advance is whole pixels, so the comparison is exact; a font with another unitsPerEm fails the gate instead of being compared with rounding.
@@ -1706,17 +1784,17 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         None => Some(children_outside_broker(atld_child.id())?),
         Some(_) => None,
     };
-    // the watch after the marker: a crash shows within it (window.rs WINDOW_MS), and the round trip runs in it too, until its last line or RESULT_WAIT;
-    // the app's death ends the watch, atld outlives it
+    // the watch after the marker: a crash shows within it (window.rs WINDOW_MS); the round trip and every Async LOG_LINES row
+    // run in it too, until they are all logged or RESULT_WAIT; the app's death ends the watch, atld outlives it
     let mut ended = ended;
     if passed && ended.is_none() {
         let watch = Instant::now();
         let waiting = || {
             let log = read(&app_log);
             !log.contains(PERMISSION_REQUEST)
-                || ASYNC_LINES
+                || LOG_LINES
                     .iter()
-                    .any(|(_, prefix, _)| !log.contains(prefix))
+                    .any(|l| l.timing == Timing::Async && !log.contains(l.prefix))
         };
         while ended.is_none()
             && (watch.elapsed() < Duration::from_millis(WINDOW_MS)
@@ -1916,31 +1994,6 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
     } else {
         HostFacts::here()
     };
-    let async_wants: Vec<(&str, Result<String, String>)> = ASYNC_LINES
-        .iter()
-        .map(|&(row, _, fixed)| {
-            let want = match fixed {
-                Some(w) => Ok(w.to_owned()),
-                None => facts
-                    .as_ref()
-                    .map_err(Clone::clone)
-                    .and_then(HostFacts::zone_want),
-            };
-            (row, want)
-        })
-        .collect();
-    for ((row, prefix, _), (_, want)) in ASYNC_LINES.iter().zip(&async_wants) {
-        let got = app
-            .lines()
-            .find_map(|l| l.split_once(prefix).map(|(_, r)| r.trim_end().to_owned()));
-        match want {
-            Err(e) if passed => whys.push(format!("{row}: the run host's facts: {e}")),
-            Ok(want) if passed && got.as_deref() != Some(want.as_str()) => {
-                whys.push(format!("{row}: want {want:?}, got {got:?}"));
-            }
-            _ => {}
-        }
-    }
     if passed {
         let served = counters(&services_log);
         for (service, key) in SERVICE_CALLS {
@@ -1987,50 +2040,28 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
     if passed && let Some(why) = webview_ua_why(webview_ua.as_deref(), engine_ua.as_deref()) {
         whys.push(why);
     }
-    let (prefix, want) = WEBVIEW_PACKAGE;
-    let webview_package = app
-        .lines()
-        .find_map(|l| l.split_once(prefix).map(|(_, r)| r.trim_end().to_owned()));
-    if passed && webview_package.as_deref() != Some(want) {
-        whys.push(format!(
-            "webview-package: want {want:?}, got {webview_package:?}"
-        ));
-    }
-    let (prefix, want) = WEBVIEW_PAGE;
-    let webview_page = after(prefix);
-    if passed && webview_page.as_deref() != Some(want) {
-        whys.push(format!("webview-page: want {want:?}, got {webview_page:?}"));
-    }
-    let (prefix, want) = WEBVIEW_SETTINGS;
-    let webview_settings = after(prefix);
-    if passed && webview_settings.as_deref() != Some(want) {
-        whys.push(format!(
-            "webview-settings: want {want:?}, got {webview_settings:?}"
-        ));
-    }
-    for (prefix, want) in [
-        WEBVIEW_COOKIE_SET,
-        WEBVIEW_DOWNLOAD,
-        WEBVIEW_SCALE,
-        WEBVIEW_CLASSLOADER,
-    ] {
-        let got = after(prefix);
-        if passed && got.as_deref() != Some(want) {
-            whys.push(format!(
-                "{}want {want:?}, got {got:?}",
-                prefix.trim_start_matches("AtlTest: ")
-            ));
+    // every LOG_LINES row, Async ones included: the watch above waited for them, so a missing line here is a real miss
+    for line in &LOG_LINES {
+        let got = after(line.prefix);
+        let why = match line.want {
+            Want::Exact(want) => {
+                (got.as_deref() != Some(want)).then(|| format!("want {want:?}, got {got:?}"))
+            }
+            Want::Prefix(want) => (!got.as_deref().is_some_and(|g| g.starts_with(want)))
+                .then(|| format!("want a value starting {want:?}, got {got:?}")),
+            Want::Host => match facts
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(HostFacts::zone_want)
+            {
+                Err(e) => Some(format!("the run host's facts: {e}")),
+                Ok(want) => (got.as_deref() != Some(want.as_str()))
+                    .then(|| format!("want {want:?}, got {got:?}")),
+            },
+        };
+        if let Some(why) = why.filter(|_| passed) {
+            whys.push(format!("{}: {why}", line.row));
         }
-    }
-    let webview_cookie_web = after(WEBVIEW_COOKIE_WEB);
-    if passed
-        && !webview_cookie_web
-            .as_deref()
-            .is_some_and(|l| l.starts_with("visible=true "))
-    {
-        whys.push(format!(
-            "webview-cookie-web: want visible=true, got {webview_cookie_web:?}"
-        ));
     }
     let features = app
         .lines()
@@ -2175,24 +2206,18 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
         {
             println!("app: pass {service} {}", service_want(*want));
         }
-        for (row, want) in &async_wants {
-            println!("app: pass {row} {}", want.as_deref().unwrap_or_default());
-        }
         println!("app: pass processes {PROCESSES_WANT}");
         println!(
             "app: pass webview-ua {}",
             webview_ua.as_deref().unwrap_or_default()
         );
-        println!("app: pass webview-package {}", WEBVIEW_PACKAGE.1);
-        println!("app: pass webview-settings {}", WEBVIEW_SETTINGS.1);
-        println!("app: pass webview-cookie-set {}", WEBVIEW_COOKIE_SET.1);
-        println!(
-            "app: pass webview-cookie-web {}",
-            webview_cookie_web.as_deref().unwrap_or_default()
-        );
-        println!("app: pass webview-download {}", WEBVIEW_DOWNLOAD.1);
-        println!("app: pass webview-scale {}", WEBVIEW_SCALE.1);
-        println!("app: pass webview-classloader {}", WEBVIEW_CLASSLOADER.1);
+        for line in &LOG_LINES {
+            println!(
+                "app: pass {} {}",
+                line.row,
+                after(line.prefix).unwrap_or_default()
+            );
+        }
         if !remote {
             println!(
                 "app: pass priority {} ({})",
