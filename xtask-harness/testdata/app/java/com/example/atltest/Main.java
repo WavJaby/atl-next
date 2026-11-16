@@ -233,9 +233,21 @@ public class Main extends Activity {
         Log.i("AtlTest", "timezone: id=" + java.util.TimeZone.getDefault().getID() + " raw=" + java.util.TimeZone.getDefault().getRawOffset());
         Log.i("AtlTest", "signatures: " + signatures());
         Log.i("AtlTest", "priority: " + priority());
-        Log.i("AtlTest", "webview-ua: " + webView());
         Log.i("AtlTest", "webview-package: " + webViewPackage());
-        webViewPage();
+        // the UA on a worker thread before any WebView exists, as AdMob's AdWorker asks it; then webview-page's WebView on this (UI) thread: the engine must stay the UI thread's.
+        // The UI thread does not wait for the worker (the provider may hop to the UI thread for the UA, as Chromium's does).
+        final android.os.Handler ui = new android.os.Handler(android.os.Looper.getMainLooper());
+        new Thread(new Runnable() {
+            @Override public void run() {
+                final String ua = webView();
+                ui.post(new Runnable() {
+                    @Override public void run() {
+                        Log.i("AtlTest", "webview-ua: " + ua);
+                        webViewPage();
+                    }
+                });
+            }
+        }, "ua-worker").start();
         mediaPlayerService();
         mediaExtractorWav();
         mediaRetrieverWav();
