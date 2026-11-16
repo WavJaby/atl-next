@@ -108,11 +108,20 @@ public class Main extends Activity {
             Log.w(TAG, "composer GET_COMPOSER failed: " + e);
         }
         Log.i(TAG, "composer GET_COMPOSER status=" + status + " uid=" + Process.myUid());
-        removeForeignTask();
+    }
+
+    /** F12 is the capture stage's trigger for the foreign-close probe; no other stage presses it, so no other stage sends the probe. */
+    @Override
+    public boolean onKeyUp(int keyCode, KeyEvent event) {
+        if (keyCode == KeyEvent.KEYCODE_F12) {
+            removeForeignTask();
+            return true;
+        }
+        return super.onKeyUp(keyCode, event);
     }
 
     /**
-     * The capture stage's foreign-close probe (capture.rs, sub-gate foreign): REMOVE_TASK naming FOREIGN_TASK, a Task this uid does not own, must be refused by the registry
+     * The capture stage's foreign-close probe (capture.rs, sub-gate foreign; its trigger is F12, onKeyUp): REMOVE_TASK naming FOREIGN_TASK, a Task this uid does not own, must be refused by the registry
      * (PERMISSION_DENIED, counted in the services log). The reply carries a status only, so the line here records that the call was made; the verdict is the services' count.
      */
     private void removeForeignTask() {

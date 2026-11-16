@@ -30,6 +30,8 @@ const REMOVED_COUNT: &str = "unimplemented ICompositorRegistry.REMOVE_TASK";
 /// The reply hook's count of a refused REMOVE_TASK, and the cause naming the fixture's foreign Task (Main.java FOREIGN_TASK = i32::MAX).
 const FOREIGN_REFUSAL: &str = "status:PERMISSION_DENIED ICompositorRegistry.REMOVE_TASK";
 const FOREIGN_CAUSE: &str = "does not own task 2147483647";
+/// Linux input KEY_F12 (input-event-codes.h): the fixture's foreign-probe trigger, KEYCODE_F12 on the Android side.
+const KEY_F12: u32 = 88;
 /// How long the close waits for the services' line: one GTK dispatch plus one binder transaction; generous for a loaded host.
 const CLOSE_WAIT: Duration = Duration::from_secs(10);
 /// How long a probe polls for two captures that agree. One attempt is a spawn, a GET_COMPOSER and a readback of the frame the window shows. It ends inside the gtk and hwui windows
@@ -231,6 +233,13 @@ pub(super) fn drive(
         *e == ProxyEvent::Pong { serial: 1 }
     })
     .is_some();
+    // the foreign probe's trigger (Main.java onKeyUp): only this stage presses F12; its refusal is counted before the close
+    for pressed in [true, false] {
+        proxy
+            .inject_key(KEY_F12, pressed)
+            .map_err(|e| e.to_string())?;
+    }
+    wait_for_line(services_log, FOREIGN_CAUSE, CLOSE_WAIT);
     proxy.inject_toplevel_close().map_err(|e| e.to_string())?;
     // the line, not its arguments: a removal the registry refused never writes it, and close_judged names what is missing
     wait_for_line(services_log, REMOVED_LINE, CLOSE_WAIT);
