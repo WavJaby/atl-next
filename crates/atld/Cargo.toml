@@ -17,6 +17,8 @@ atl-fonts = { path = "../atl-fonts" }
 atl-fonts-table = { path = "../atl-fonts-table" }
 atl-gralloc = { path = "../atl-gralloc" }
 atl-platform-host = { path = "../atl-platform-host" }
+# the web engine probe only (FEATURE_WEBVIEW): the facade dlopens the module, nothing of it links here
+atl-platform-ui = { path = "../atl-platform-ui" }
 atl-property-service = { path = "../atl-property-service" }
 atl-services = { path = "../atl-services" }
 atl-services-types = { path = "../atl-services-types" }

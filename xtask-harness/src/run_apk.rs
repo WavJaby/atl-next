@@ -65,6 +65,10 @@ pub struct Args {
     /// Deliberate-failure check of the render-path choice: atld `--break-render-path` probes each candidate without its nodes, so a host that offers one must fail `render path` (offered, not taken).
     #[arg(long)]
     break_render_path: bool,
+    /// Deliberate-failure check of FEATURE_WEBVIEW: the run's library dir lacks the web engine module (atld_run `without_webview_engine`) = a host without WebKit, so atld declares no
+    /// FEATURE_WEBVIEW and the app gets AOSP's no-WebView device.
+    #[arg(long)]
+    break_webview_engine: bool,
     /// A pointer script the app injects into its window from its first present (atl-composer `input::parse_script`): `down:X,Y up:X,Y` in the content's physical pixels, `wait:MS` between steps,
     /// e.g. `wait:6000 down:792,28 up:792,28` taps (792, 28) 6 s after the first frame. The verdict is still about the last resumed activity, so wait for each tap's answer to settle.
     #[arg(long, value_name = "SCRIPT", conflicts_with = "drive")]
@@ -151,6 +155,7 @@ impl Args {
             no_app_seccomp: false,
             break_isa: false,
             break_render_path: false,
+            break_webview_engine: false,
             pointer: None,
             drive: None,
             break_blank_capture,
@@ -323,6 +328,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         no_app_seccomp: false,
         break_isa: false,
         break_render_path: false,
+        break_webview_engine: false,
         pointer: a.pointer.clone(),
         drive: None,
         break_blank_capture: false,
@@ -569,6 +575,11 @@ pub(crate) fn configure(
     };
     let rt = if args.break_render_path {
         rt.with_broken_render_path()
+    } else {
+        rt
+    };
+    let rt = if args.break_webview_engine {
+        rt.without_webview_engine()?
     } else {
         rt
     };

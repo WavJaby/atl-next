@@ -780,6 +780,7 @@ dependencies = [
  "atl-fonts-table",
  "atl-gralloc",
  "atl-platform-host",
+ "atl-platform-ui",
  "atl-property-service",
  "atl-services",
  "atl-services-types",

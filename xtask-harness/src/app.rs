@@ -86,9 +86,6 @@ pub struct Args {
     /// The system-features break: the run places none of AOSP's static permission files (atld_run.rs FEATURE_FILES), so the always-present feature reads false and the features line must go red.
     #[arg(long)]
     features_break: bool,
-    /// The WebView feature break: the run places no FEATURE_WEBVIEW test file, so getDefaultUserAgent throws today's no-WebView UnsupportedOperationException and the webview-ua line must go red.
-    #[arg(long)]
-    webview_feature_break: bool,
     /// The WebView provider break: the run does not place the provider package (`<out>/partitions/product/app/webview/webview.apk`), so webviewupdate has no current package and the
     /// webview-package line must go red (null).
     #[arg(long)]
@@ -96,8 +93,8 @@ pub struct Args {
     /// The settings provider break: the run does not place AOSP SettingsProvider, so no package declares the `settings` authority, getContentProvider answers null and the settings line must go red.
     #[arg(long)]
     settings_provider_break: bool,
-    /// The WebView engine break: the run's library dir lacks the engine module (libatl_webview_linux.so), so createWebView refuses with a counted UnsupportedOperationException
-    /// ("WebViewFactoryProvider.createWebView") and the webview-page line (and webview-ua) must go red.
+    /// The WebView engine break: the run's library dir lacks the engine module (libatl_webview_linux.so) = a host without WebKit, so atld's probe fails and declares no FEATURE_WEBVIEW:
+    /// getProvider throws AOSP's no-WebView UnsupportedOperationException (:345) and the webview-ua, webview-package (null) and webview-page lines must go red.
     #[arg(long)]
     webview_engine_break: bool,
     /// The WebView sandbox break: atld runs without the apps' web-process channel (no `--sandbox-join` / `--flatpak-spawn`), so WebKit tries its own bubblewrap inside the app sandbox, which
@@ -166,7 +163,6 @@ pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
         priority_break: false,
         cpuinfo_break: false,
         features_break: false,
-        webview_feature_break: false,
         webview_provider_break: false,
         settings_provider_break: false,
         webview_engine_break: false,
@@ -301,7 +297,7 @@ fn settings_why(line: Option<&str>) -> Option<String> {
     });
     (!ok).then(|| format!("settings: want \"id=<16 hex> {SETTINGS_WANT_REST}\", got {line:?}"))
 }
-/// Main.webView's line: WebSettings.getDefaultUserAgent with FEATURE_WEBVIEW declared (the run's test feature file, Runtime::with_webview_feature).
+/// Main.webView's line: WebSettings.getDefaultUserAgent with FEATURE_WEBVIEW declared (atld, when the web engine module loads).
 /// Without the provider placed, AOSP: `webviewupdate`'s waitForAndGetProvider answers LIBLOAD_FAILED_LISTING_WEBVIEW_PACKAGES -> WebViewFactory.getWebViewContextAndSetProvider throws
 /// MissingWebViewPackageException, getProviderClass wraps it in AndroidRuntimeException, getProvider's catch (Exception) wraps that once more. Without the feature: UnsupportedOperationException
 /// alone (getProvider :345); without the service: asInterface(null)'s NullPointerException, wrapped once by getProvider (measured).
@@ -1474,15 +1470,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         rt
     };
-    let rt = if args.webview_feature_break {
-        rt
-    } else {
-        rt.with_webview_feature(&layout.src().join("aosp"))?
-    };
     let rt = if args.webview_provider_break {
-        rt
+        rt.without_webview_provider()
     } else {
-        rt.with_webview_provider()?
+        rt
     };
     let rt = if args.settings_provider_break {
         rt.without_settings_provider()

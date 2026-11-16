@@ -591,6 +591,38 @@ const FEATURES_TOUCHSCREEN: [(&str, i32); 2] = [
 ];
 /// PackageManager.FEATURE_OPENGLES_EXTENSION_PACK (frameworks/native/data/etc/android.hardware.opengles.aep.xml).
 const FEATURE_OPENGLES_AEP: (&str, i32) = ("android.hardware.opengles.aep", 0);
+/// PackageManager.FEATURE_WEBVIEW (frameworks/native/data/etc/android.software.webview.xml): declared when the web engine module loads ([`web_engine_probe`], webview plan S6); absent -> apps get AOSP's
+/// no-WebView device (getProvider throws UnsupportedOperationException). The provider package ships with every runtime; without the feature AOSP never asks for it.
+const FEATURE_WEBVIEW: (&str, i32) = ("android.software.webview", 0);
+/// atld's first argument that makes it the web engine probe instead of a run: load the module (atl_platform_ui::probe_web_engine), print the result, exit 0 when it loaded.
+const PROBE_WEB_ENGINE: &str = "--probe-web-engine";
+
+/// The host's WebView capability: atld itself as [`PROBE_WEB_ENGINE`] in its own process (loading WebKitGTK pulls GTK in, which stays out of atld), with the apps' library path, so the module
+/// resolves as an app's first WebView call resolves it. Err(why) when it does not load (WebKitGTK not installed, module missing).
+fn web_engine_probe(lib_path: &OsString) -> Result<std::result::Result<(), String>> {
+    let out = std::process::Command::new(std::env::current_exe()?)
+        .arg(PROBE_WEB_ENGINE)
+        .env("LD_LIBRARY_PATH", lib_path)
+        .output()
+        .context("starting the web engine probe")?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    Ok(if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!("{}: {text}", out.status))
+    })
+}
+
+/// The [`PROBE_WEB_ENGINE`] process.
+fn probe_web_engine_main() -> ExitCode {
+    match atl_platform_ui::probe_web_engine() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            println!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
 
 /// The device's extension pack and GLES version for a probed host GL, both the host's: AOSP keeps one device-wide list and the driver answers per context (gl-honesty M74 D1). The version is unset unless GL_VERSION is GLES's.
 fn device_gl(gl_version: &str, aep: bool) -> (bool, Option<Property>) {
@@ -2069,6 +2101,10 @@ fn run(a: &Args) -> Result<ExitCode> {
             None => log(format_args!("gles: unset (no renderer probed)")),
         }
     }
+    match web_engine_probe(&a.lib_path)? {
+        Ok(()) => host_features.push(FEATURE_WEBVIEW),
+        Err(why) => log(format_args!("webview: no engine ({why})")),
+    }
     host_features_layout(&r, &host_features)?;
     // the services' area: the defaults with what the probes above added (ActivityTaskManagerService reads ro.opengles.version); the processes started before the probes keep the first area
     let system_area = r.root.join("properties.d").join("system");
@@ -2483,6 +2519,9 @@ fn wall_ms() -> u64 {
 }
 
 fn main() -> ExitCode {
+    if std::env::args_os().nth(1).is_some_and(|a| a == PROBE_WEB_ENGINE) {
+        return probe_web_engine_main();
+    }
     let a = Args::parse();
     match run(&a) {
         Ok(c) => c,

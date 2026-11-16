@@ -1968,16 +1968,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         rt
     };
-    // the WebView provider path as the app gate runs it, until the product declares FEATURE_WEBVIEW (webview plan W3c); the break takes the engine module away
-    let rt = if matches!(args.stage, Stage::WebView) {
-        let rt = rt
-            .with_webview_feature(&Layout::of(root)?.src().join("aosp"))?
-            .with_webview_provider()?;
-        if args.break_webview_engine {
-            rt.without_webview_engine()?
-        } else {
-            rt
-        }
+    // the webview stage's break takes the engine module away (a host without WebKit: no FEATURE_WEBVIEW)
+    let rt = if matches!(args.stage, Stage::WebView) && args.break_webview_engine {
+        rt.without_webview_engine()?
     } else {
         rt
     };

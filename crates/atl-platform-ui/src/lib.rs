@@ -19,7 +19,7 @@ mod proxy;
 mod web_engine;
 
 #[cfg(target_os = "linux")]
-pub use web_engine::{PlatformWebEngine, PlatformWebView};
+pub use web_engine::{PlatformWebEngine, PlatformWebView, probe_web_engine};
 
 #[cfg(target_os = "linux")]
 pub use proxy::{

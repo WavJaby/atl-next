@@ -45,6 +45,11 @@ fn load() -> Result<&'static WebViewVtable, String> {
     Ok(vtable)
 }
 
+/// Loads the web engine module now, with the load and identity check of the first WebView call: the host's WebView capability (webview plan S6; atld declares FEATURE_WEBVIEW on Ok).
+pub fn probe_web_engine() -> Result<(), String> {
+    MODULE.get_or_init(load).clone().map(|_| ())
+}
+
 /// The web engine of this process (Linux: WebKitGTK in its own module).
 pub struct PlatformWebEngine;
 
