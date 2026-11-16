@@ -102,6 +102,9 @@ struct Args {
     /// Test only: injected events are accepted from any process, not only the focused window's, the deliberate break of the sensors gate's tilt `focus` sub-gate.
     #[arg(long)]
     no_sensor_focus_check: bool,
+    /// The desktop input adaptations (compositor_registry `DesktopInput::to_arg`, atld's `--mouse-touch`, `--esc-back`, ...), the value apps get as `ro.atl.desktop-input`. Here `esc-back` combines ATL's overlay into the physical keyboard's map (atl_services::input::keyboard_map). Default `none`: AOSP's maps.
+    #[arg(long, value_parser = compositor_registry::DesktopInput::parse_arg, default_value = "none")]
+    desktop_input: compositor_registry::DesktopInput,
 }
 
 /// The names the framework looks the services up by (Context.ACTIVITY_SERVICE, Context.PACKAGE_SERVICE / ActivityThread.getPackageManager).
@@ -468,18 +471,26 @@ fn main() -> Result<()> {
         binder::add_service(SENSOR, atl_services::sensor_wire::new_binder(hub))
             .context("addService sensorservice")?;
     }
-    // the bare file name is the load name the Parcel form carries (atl-libinput KeyCharacterMap::load)
-    let kcm = |name: &str| -> anyhow::Result<Vec<u8>> {
+    // the bare file name is the load name the Parcel form carries (atl-libinput KeyCharacterMap::load); only the physical keyboard's map takes the desktop overlay (its keys are the composer's)
+    let kcm = |name: &str, esc_back: bool| -> anyhow::Result<Vec<u8>> {
         let path = a.keychars.join(name);
         let contents =
             std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-        let map = atl_libinput::KeyCharacterMap::load(name, &contents)
-            .with_context(|| format!("loading {}", path.display()))?;
-        Ok(map.parcel_bytes())
+        atl_services::input::keyboard_map(name, &contents, esc_back)
+            .with_context(|| format!("loading {}", path.display()))
     };
+    writeln!(
+        std::io::stderr(),
+        "input: esc-back {}",
+        if a.desktop_input.esc_back {
+            "on"
+        } else {
+            "off"
+        }
+    )?;
     let input = atl_services::input::new_binder(
-        &kcm("Virtual.kcm")?,
-        &kcm("Generic.kcm")?,
+        &kcm("Virtual.kcm", false)?,
+        &kcm("Generic.kcm", a.desktop_input.esc_back)?,
         Arc::clone(&agents),
         Arc::clone(&permissions),
     )

@@ -25,6 +25,10 @@ required-features = ["converter"]
 name = "publish"
 required-features = ["converter"]
 
+[[test]]
+name = "kcm"
+required-features = ["converter"]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true

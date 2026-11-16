@@ -328,6 +328,8 @@ pub struct Runtime {
     tilt_keys: Option<Vec<String>>,
     /// atld `--mouse-touch`: the left button is one finger. Off unless a run asks: a gate asserts exact AOSP input by default.
     mouse_touch: bool,
+    /// atld `--esc-back`: an unhandled Esc falls back to Back (the keyboard map's overlay). Off unless a run asks, as `mouse_touch`.
+    esc_back: bool,
     /// Sensors gate kernel fakes: atld runs in a private user + mount namespace (`unshare -Urm`) that shows these as the fixed paths the product reads.
     fake_devices: Option<FakeDevices>,
     /// The gate this runtime was staged for: each run writes its record (remote.rs `record_path`) under `out`.
@@ -818,6 +820,7 @@ impl Runtime {
             omitted_services: Vec::new(),
             tilt_keys: None,
             mouse_touch: false,
+            esc_back: false,
             fake_devices: None,
             site: remote::Site::Host,
             device: None,
@@ -1204,6 +1207,12 @@ impl Runtime {
     /// atld `--mouse-touch true`: the left mouse button reaches the app as one finger (the desktop adaptation atld has on by default; a run without this asserts AOSP's mouse).
     pub fn with_mouse_touch(mut self) -> Self {
         self.mouse_touch = true;
+        self
+    }
+
+    /// atld `--esc-back true`: the keyboard's map gains the Esc -> Back fallback (atld's default; a run without this asserts AOSP's map).
+    pub fn with_esc_back(mut self) -> Self {
+        self.esc_back = true;
         self
     }
 
@@ -1639,6 +1648,8 @@ impl Runtime {
         cmd.args([
             "--mouse-touch",
             if self.mouse_touch { "true" } else { "false" },
+            "--esc-back",
+            if self.esc_back { "true" } else { "false" },
         ]);
         if !self.sensor_service {
             cmd.arg("--no-sensor-service");

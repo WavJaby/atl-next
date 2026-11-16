@@ -119,6 +119,9 @@ pub struct Args {
     /// Stage mouse-touch only: the desktop adaptation is off (no `with_mouse_touch()`, so atld `--mouse-touch false`), the drag stays the mouse's (source 8194) and the mouse-touch sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     break_mouse_touch: bool,
+    /// Stage widgets: atld runs with the Esc -> Back adaptation on (`with_esc_back()`, atld `--esc-back true`), and the esc-fallback sub-gate expects the keyboard map's plain Esc fallback BACK; without it, AOSP's none. Run the stage both ways.
+    #[arg(long)]
+    esc_back: bool,
     /// Stage dialog only: the services send no requestFinish on an unhandled Back (atld `--no-back-finish`), so the back sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     break_back_finish: bool,
@@ -1995,6 +1998,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         rt
     };
+    let rt = if args.esc_back {
+        rt.with_esc_back()
+    } else {
+        rt
+    };
     let outputs = nested.as_ref().map(NestedCompositor::control);
     // the move stage's second output, as Android's display
     let moved = nested
@@ -2253,6 +2261,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             display,
             &pressure,
             &captured,
+            args.esc_back,
         ),
         (Stage::Move, Some(_)) => match moved {
             Some(moved) => move_output::checks(&app, &services, &liveness, display, moved),

@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: MIT
+# ATL's desktop key-map overlay, combined into the physical keyboard's Generic.kcm (KeyCharacterMap::combine) while atld `--esc-back` is on.
+# Esc -> Back: an Esc the app leaves unhandled falls back to BACK, as the Back key a desktop keyboard lacks. Pinned AOSP Generic.kcm has ESCAPE `base: none` (no plain Esc fallback).
+# combine replaces a key whole, so the block restates Generic.kcm's ESCAPE alt / ctrl behaviours (fallback HOME / MENU) unchanged.
+
+type OVERLAY
+
+key ESCAPE {
+    base:                               fallback BACK
+    alt:                                fallback HOME
+    ctrl:                               fallback MENU
+}

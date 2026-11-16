@@ -315,13 +315,45 @@ pub struct KeyCharacterMap(cxx::UniquePtr<ffi::KeyCharacterMap>);
 impl KeyCharacterMap {
     /// Loads `contents` (format ANY, as validatekeymaps loads a map). `file_name` is the load name the Parcel form carries: the bare file name, `Virtual.kcm`, keeps the bytes independent of the directory.
     pub fn load(file_name: &str, contents: &[u8]) -> Result<Self, Error> {
-        let map = ffi::load_kcm(file_name, contents);
+        Self::loaded(ffi::load_kcm(file_name, contents, false))
+    }
+
+    /// Loads `contents` as an overlay (format OVERLAY: the file must declare `type OVERLAY`), the form [`KeyCharacterMap::combine`] takes.
+    pub fn load_overlay(file_name: &str, contents: &[u8]) -> Result<Self, Error> {
+        Self::loaded(ffi::load_kcm(file_name, contents, true))
+    }
+
+    fn loaded(map: cxx::UniquePtr<ffi::KeyCharacterMap>) -> Result<Self, Error> {
         if map.is_null() {
             return Err(Error::Null {
                 call: "KeyCharacterMap::loadContents",
             });
         }
         Ok(Self(map))
+    }
+
+    /// The map of a Parcel form (KeyCharacterMap::readFromParcel), as an app's InputDevice reads it.
+    pub fn from_parcel(bytes: &[u8]) -> Result<Self, Error> {
+        let map = ffi::kcm_from_parcel(bytes);
+        if map.is_null() {
+            return Err(Error::Null {
+                call: "KeyCharacterMap::readFromParcel",
+            });
+        }
+        Ok(Self(map))
+    }
+
+    /// Applies `overlay` (KeyCharacterMap::combine): each key it lists replaces this map's key whole, every behaviour of it; its scan- and usage-code mappings replace these.
+    /// Called once per map: a second combine makes libinput reload the base from its load name as a file path (reloadBaseFromFile), which a map loaded from contents does not have.
+    pub fn combine(&mut self, overlay: &KeyCharacterMap) {
+        ffi::kcm_combine(self.0.pin_mut(), &overlay.0);
+    }
+
+    /// The fallback action for an unhandled `key_code` with `meta_state` (KeyCharacterMap::getFallbackAction): the fallback keycode and the meta state with the behaviour's own modifiers removed; None when the map has none.
+    pub fn fallback_action(&self, key_code: i32, meta_state: i32) -> Option<(i32, i32)> {
+        let (mut key, mut meta) = (0, 0);
+        ffi::kcm_fallback_action(&self.0, key_code, meta_state, &mut key, &mut meta)
+            .then_some((key, meta))
     }
 
     /// The Parcel form (KeyCharacterMap::writeToParcel): the bytes InputDevice carries after its device id and present flag.

@@ -169,7 +169,29 @@ impl IInputManager for InputManager {
     }
 }
 
-/// A new input service binder serving the key maps `virtual_map` (Virtual.kcm) and `keyboard_map` (Generic.kcm), each the Parcel form of a KeyCharacterMap (atl-libinput `KeyCharacterMap::parcel_bytes`), relaying pointer icons to `agents` and checking @EnforcePermission against `permissions`. Fails when a map is not a Parcel-form blob.
+/// ATL's desktop key-map overlay (`type OVERLAY`): ESCAPE `base: fallback BACK`, the Esc -> Back adaptation (DesktopInput::esc_back). Its own file, never a patch to Generic.kcm, so off is AOSP's map.
+pub const ESC_BACK_OVERLAY: &str = include_str!("../keychars/atl-desktop.kcm");
+/// The overlay's load name (KeyCharacterMap::loadContents); combine keeps the base's, so the served map stays `Generic.kcm`.
+const ESC_BACK_OVERLAY_NAME: &str = "atl-desktop.kcm";
+
+/// The physical keyboard's map in Parcel form: Generic.kcm's `contents` loaded under `name`, combined with [`ESC_BACK_OVERLAY`] when `esc_back` (AOSP's keyboard-layout overlay route, KeyCharacterMap::combine).
+pub fn keyboard_map(
+    name: &str,
+    contents: &[u8],
+    esc_back: bool,
+) -> Result<Vec<u8>, atl_libinput::Error> {
+    let mut map = atl_libinput::KeyCharacterMap::load(name, contents)?;
+    if esc_back {
+        let overlay = atl_libinput::KeyCharacterMap::load_overlay(
+            ESC_BACK_OVERLAY_NAME,
+            ESC_BACK_OVERLAY.as_bytes(),
+        )?;
+        map.combine(&overlay);
+    }
+    Ok(map.parcel_bytes())
+}
+
+/// A new input service binder serving the key maps `virtual_map` (Virtual.kcm) and `keyboard_map` (Generic.kcm, see [`keyboard_map`]), each the Parcel form of a KeyCharacterMap (atl-libinput `KeyCharacterMap::parcel_bytes`), relaying pointer icons to `agents` and checking @EnforcePermission against `permissions`. Fails when a map is not a Parcel-form blob.
 pub fn new_binder(
     virtual_map: &[u8],
     keyboard_map: &[u8],
@@ -187,4 +209,42 @@ pub fn new_binder(
         permissions,
     };
     Ok(BnInputManager::new_binder(service, BinderFeatures::default()).as_binder())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// android/keycodes.h; android/input.h AMETA_ALT_ON, AMETA_CTRL_ON.
+    const ESCAPE: i32 = 111;
+    const BACK: i32 = 4;
+    const HOME: i32 = 3;
+    const MENU: i32 = 82;
+    const ALT_ON: i32 = 0x02;
+    const CTRL_ON: i32 = 0x1000;
+    /// Pinned Generic.kcm's ESCAPE block (frameworks/base/data/keyboards/Generic.kcm:501-505) in a minimal base map.
+    const GENERIC_ESCAPE: &str = "type FULL\nkey ESCAPE {\n    base: none\n    alt: fallback HOME\n    ctrl: fallback MENU\n}\n";
+
+    fn fallbacks(esc_back: bool) -> [Option<(i32, i32)>; 3] {
+        let bytes =
+            keyboard_map("Generic.kcm", GENERIC_ESCAPE.as_bytes(), esc_back).expect("map builds");
+        // read back as an app's InputDevice does
+        let map = atl_libinput::KeyCharacterMap::from_parcel(&bytes).expect("parcel reads");
+        [0, ALT_ON, CTRL_ON].map(|meta| map.fallback_action(ESCAPE, meta))
+    }
+
+    /// On: plain Esc falls back to BACK; Generic.kcm's alt / ctrl fallbacks stay (the overlay restates them, as combine replaces the key whole).
+    #[test]
+    fn esc_back_on_falls_back_to_back() {
+        assert_eq!(
+            fallbacks(true),
+            [Some((BACK, 0)), Some((HOME, 0)), Some((MENU, 0))]
+        );
+    }
+
+    /// Off: exact AOSP, plain Esc has no fallback.
+    #[test]
+    fn esc_back_off_is_aosp() {
+        assert_eq!(fallbacks(false), [None, Some((HOME, 0)), Some((MENU, 0))]);
+    }
 }

@@ -216,6 +216,27 @@ fn key_line(line: &str) -> Option<[i64; 10]> {
     Some(out)
 }
 
+/// The physical keyboard's map, as the app reads it, gives an unhandled Esc the fallback the run's setting selects.
+/// Expected values, from AOSP sources: Generic.kcm:501-505 ESCAPE `base: none`, `alt: fallback HOME`; keycodes.h BACK 4, HOME 3; KeyCharacterMap.cpp getFallbackAction strips the behaviour's own modifiers (alt + META_ALT_ON 0x02 -> meta 0).
+/// With atld `--esc-back true` ATL's overlay (atl-services keychars/atl-desktop.kcm) adds `base: fallback BACK` -> plain `4/0`; off, AOSP's map -> `none`. alt stays `3/0` both ways (the overlay restates it).
+fn esc_fallback_check(app: &str, esc_back: bool) -> Result<String, String> {
+    let keyboard = input_devices::KEYBOARD;
+    let plain = if esc_back { "4/0" } else { "none" };
+    let want = format!("AtlWindow: esc-fallback id={keyboard} plain={plain} alt=3/0");
+    if app.contains(&want) {
+        Ok(format!(
+            "keyboard {keyboard}: Esc fallback {plain}, Alt+Esc HOME (esc-back {})",
+            if esc_back { "on" } else { "off" }
+        ))
+    } else {
+        let seen: Vec<&str> = app
+            .lines()
+            .filter(|l| l.contains(&format!("esc-fallback id={keyboard} ")))
+            .collect();
+        Err(format!("no `{want}` line; saw {seen:?}"))
+    }
+}
+
 /// The keys the probe typed reached Main as AOSP would make them, and the device list has the physical keyboard and the touchpad.
 /// Expected values, all from AOSP sources: Generic.kl `key 30 A`, `key 42 SHIFT_LEFT`; KeyEvent KEYCODE_A 29, KEYCODE_SHIFT_LEFT 59, META_SHIFT_ON | META_SHIFT_LEFT_ON = 0x41, FLAG_LONG_PRESS 0x80;
 /// Generic.kcm `key A { base: 'a' shift, capslock: 'A' }` -> char 97 / 65, `type FULL` -> kbtype 4 (KeyCharacterMap.FULL); InputDevice SOURCE_KEYBOARD 0x101, SOURCE_MOUSE | SOURCE_TOUCHPAD = 0x2002 | 0x100008, KEYBOARD_TYPE_ALPHABETIC 2.
@@ -713,7 +734,7 @@ fn presents_check(app: &str) -> Result<String, String> {
     ))
 }
 
-/// The widgets stage's sub-gates, in print order, from the probe's result, the app log and the frame callbacks after the marker.
+/// The widgets stage's sub-gates, in print order, from the probe's result, the app log and the frame callbacks after the marker; `esc_back`: the run had atld `--esc-back true`.
 pub fn checks(
     app: &str,
     after: &[&str],
@@ -721,6 +742,7 @@ pub fn checks(
     display: DisplayModel,
     pressure: &Samples,
     pictures: &Mutex<capture::Seen>,
+    esc_back: bool,
 ) -> Vec<Sub> {
     let idle = probe.as_ref().ok().and_then(|l| l.idle);
     vec![
@@ -740,6 +762,7 @@ pub fn checks(
         ("window-focus", window_focus_check(app)),
         ("cursor", cursor_check(app)),
         ("keys", keys_check(app)),
+        ("esc-fallback", esc_fallback_check(app, esc_back)),
         ("mouse-buttons", buttons_check(app)),
         ("hover", hover_check(app)),
         ("wheel", wheel_check(app)),

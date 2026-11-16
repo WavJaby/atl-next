@@ -102,10 +102,26 @@ pub(crate) mod ffi {
         /// InputConsumer::sendFinishedSignal.
         pub fn finish(consumer: Pin<&mut Consumer>, seq: u32, handled: bool) -> i32;
 
-        /// KeyCharacterMap::loadContents (format ANY) of `contents`, named `file_name`; null when libinput refuses the map.
-        pub fn load_kcm(file_name: &str, contents: &[u8]) -> UniquePtr<KeyCharacterMap>;
+        /// KeyCharacterMap::loadContents of `contents`, named `file_name`, format OVERLAY when `overlay`, else ANY; null when libinput refuses the map.
+        pub fn load_kcm(
+            file_name: &str,
+            contents: &[u8],
+            overlay: bool,
+        ) -> UniquePtr<KeyCharacterMap>;
         /// KeyCharacterMap::writeToParcel: the Parcel bytes.
         pub fn kcm_parcel_bytes(map: &KeyCharacterMap) -> Vec<u8>;
+        /// KeyCharacterMap::readFromParcel of `bytes` (writeToParcel's form); null when libinput refuses them.
+        pub fn kcm_from_parcel(bytes: &[u8]) -> UniquePtr<KeyCharacterMap>;
+        /// KeyCharacterMap::combine(overlay) on `map`.
+        pub fn kcm_combine(map: Pin<&mut KeyCharacterMap>, overlay: &KeyCharacterMap);
+        /// KeyCharacterMap::getFallbackAction: whether one exists; its keycode and meta state into the out parameters.
+        pub fn kcm_fallback_action(
+            map: &KeyCharacterMap,
+            key_code: i32,
+            meta_state: i32,
+            out_key_code: &mut i32,
+            out_meta_state: &mut i32,
+        ) -> bool;
 
         /// KeyLayoutMap::load of the file at `path`; null when libinput refuses it.
         pub fn load_key_layout(path: &str) -> UniquePtr<KeyLayoutMap>;

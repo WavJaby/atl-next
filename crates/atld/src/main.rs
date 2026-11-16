@@ -222,6 +222,10 @@ struct Args {
     /// On by default, so touch-only apps are usable with a mouse; `--mouse-touch false` is exact AOSP input.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     mouse_touch: bool,
+    /// Desktop adaptation: an Esc the app leaves unhandled falls back to Back (the keyboard's key map gains ESCAPE `base: fallback BACK`; KeyCharacterMap.getFallbackAction), as a desktop keyboard has no Back key. Pinned AOSP maps plain Esc to nothing.
+    /// On by default; `--esc-back false` is exact AOSP's map. Passed to the services, which serve the map.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    esc_back: bool,
     /// With `--tilt-keys`: the angle a held key reaches, degrees (default: atl-services `TiltConfig::default`).
     #[arg(long, requires = "tilt_keys")]
     tilt_max_deg: Option<f32>,
@@ -2153,6 +2157,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         ui: a.ui.clone(),
         desktop_input: compositor_registry::DesktopInput {
             mouse_touch: a.mouse_touch,
+            esc_back: a.esc_back,
             tilt: a.tilt_keys.then(|| {
                 let d = compositor_registry::TiltConfig::default();
                 compositor_registry::TiltConfig {
@@ -2309,6 +2314,8 @@ fn run(a: &Args) -> Result<ExitCode> {
     if a.no_sensor_focus_check {
         services_args.push("--no-sensor-focus-check".into());
     }
+    // the same adaptations the app processes get (`ro.atl.desktop-input`): the input service serves the keyboard map they select
+    services_args.extend(["--desktop-input".into(), host.desktop_input.to_arg().into()]);
     // the key maps are /system files (`--file`, usr/keychars); the services read them where they lie in the root
     services_args.extend([
         "--keychars".into(),

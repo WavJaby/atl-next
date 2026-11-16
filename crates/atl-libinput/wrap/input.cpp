@@ -144,10 +144,11 @@ int32_t finish(Consumer& consumer, uint32_t seq, bool handled) {
     return consumer.consumer.sendFinishedSignal(seq, handled);
 }
 
-std::unique_ptr<KeyCharacterMap> load_kcm(rust::Str file_name, rust::Slice<const uint8_t> contents) {
+std::unique_ptr<KeyCharacterMap> load_kcm(rust::Str file_name, rust::Slice<const uint8_t> contents, bool overlay) {
     // Tokenizer::fromContents measures the text with strlen: hand it a NUL-terminated copy
     const std::string text(reinterpret_cast<const char*>(contents.data()), contents.size());
-    auto loaded = android::KeyCharacterMap::loadContents(std::string(file_name.data(), file_name.size()), text.c_str(), android::KeyCharacterMap::Format::ANY);
+    const auto format = overlay ? android::KeyCharacterMap::Format::OVERLAY : android::KeyCharacterMap::Format::ANY;
+    auto loaded = android::KeyCharacterMap::loadContents(std::string(file_name.data(), file_name.size()), text.c_str(), format);
     if (!loaded.ok()) {
         return nullptr;
     }
@@ -164,6 +165,28 @@ rust::Vec<uint8_t> kcm_parcel_bytes(const KeyCharacterMap& map) {
         bytes.push_back(data[i]);
     }
     return bytes;
+}
+
+std::unique_ptr<KeyCharacterMap> kcm_from_parcel(rust::Slice<const uint8_t> bytes) {
+    android::Parcel parcel;
+    if (parcel.setData(bytes.data(), bytes.size()) != android::OK) {
+        return nullptr;
+    }
+    std::shared_ptr<android::KeyCharacterMap> map = android::KeyCharacterMap::readFromParcel(&parcel);
+    if (!map) {
+        return nullptr;
+    }
+    return std::make_unique<KeyCharacterMap>(std::move(map));
+}
+
+void kcm_combine(KeyCharacterMap& map, const KeyCharacterMap& overlay) { map.map->combine(*overlay.map); }
+
+bool kcm_fallback_action(const KeyCharacterMap& map, int32_t key_code, int32_t meta_state, int32_t& out_key_code, int32_t& out_meta_state) {
+    android::KeyCharacterMap::FallbackAction action;
+    const bool found = map.map->getFallbackAction(key_code, meta_state, &action);
+    out_key_code = action.keyCode;
+    out_meta_state = action.metaState;
+    return found;
 }
 
 std::unique_ptr<KeyLayoutMap> load_key_layout(rust::Str path) {

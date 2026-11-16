@@ -93,8 +93,13 @@ std::unique_ptr<Consumer> new_consumer(int32_t fd, rust::Str name);
 int32_t consume(Consumer& consumer, Message& out);
 int32_t finish(Consumer& consumer, uint32_t seq, bool handled);
 
-std::unique_ptr<KeyCharacterMap> load_kcm(rust::Str file_name, rust::Slice<const uint8_t> contents);
+// overlay: Format::OVERLAY, else Format::ANY.
+std::unique_ptr<KeyCharacterMap> load_kcm(rust::Str file_name, rust::Slice<const uint8_t> contents, bool overlay);
 rust::Vec<uint8_t> kcm_parcel_bytes(const KeyCharacterMap& map);
+// KeyCharacterMap::readFromParcel of writeToParcel's bytes; null when refused.
+std::unique_ptr<KeyCharacterMap> kcm_from_parcel(rust::Slice<const uint8_t> bytes);
+void kcm_combine(KeyCharacterMap& map, const KeyCharacterMap& overlay);
+bool kcm_fallback_action(const KeyCharacterMap& map, int32_t key_code, int32_t meta_state, int32_t& out_key_code, int32_t& out_meta_state);
 
 // KeyLayoutMap::load of the file at `path`; null when libinput refuses it.
 std::unique_ptr<KeyLayoutMap> load_key_layout(rust::Str path);

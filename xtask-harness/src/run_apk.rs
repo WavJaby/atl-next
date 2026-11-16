@@ -88,6 +88,9 @@ pub struct Args {
     /// atld `--mouse-touch`: the left mouse button (a drive's `tap` / `swipe`) reaches the app as one finger. atld's default, on; `false` is exact AOSP input.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     mouse_touch: bool,
+    /// atld `--esc-back`: an Esc the app leaves unhandled falls back to Back. atld's default, on; `false` is AOSP's key map.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    esc_back: bool,
     /// A variable in every app process's environment (repeat), atld `--app-env`: test-environment setup such as `LD_DEBUG=bindings` (the launcher-closure measurement; glibc's lines land in the app log). The product reads none of these.
     #[arg(long = "app-env", value_name = "KEY=VALUE")]
     app_env: Vec<String>,
@@ -121,6 +124,9 @@ pub struct RemoteArgs {
     /// atld `--mouse-touch`, as for `run-apk`.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     mouse_touch: bool,
+    /// atld `--esc-back`, as for `run-apk`.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    esc_back: bool,
     /// A pointer script atld injects from the app's first present (`run-apk --pointer`).
     #[arg(long, value_name = "SCRIPT")]
     pointer: Option<String>,
@@ -170,6 +176,7 @@ impl Args {
             break_blank_capture,
             tilt_keys: false,
             mouse_touch: false,
+            esc_back: false,
             app_env: Vec::new(),
             clear_data: false,
         }
@@ -408,6 +415,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         break_blank_capture: false,
         tilt_keys: a.tilt_keys,
         mouse_touch: a.mouse_touch,
+        esc_back: a.esc_back,
         app_env: Vec::new(),
         clear_data: false,
     };
@@ -674,6 +682,11 @@ pub(crate) fn configure(
     };
     let rt = if args.mouse_touch {
         rt.with_mouse_touch()
+    } else {
+        rt
+    };
+    let rt = if args.esc_back {
+        rt.with_esc_back()
     } else {
         rt
     };

@@ -82,6 +82,22 @@ public class Main extends Activity {
         for (int id : android.view.InputDevice.getDeviceIds()) {
             android.view.InputDevice d = android.view.InputDevice.getDevice(id);
             Log.i(TAG, "device id=" + id + " sources=" + d.getSources() + " kbtype=" + d.getKeyboardType());
+            // `esc-fallback` lines: the device map's fallback for an unhandled Esc, plain / alt (KeyCharacterMap.getFallbackAction, @hide, as the dispatcher and SyntheticKeyboardHandler read it): `<keycode>/<meta>` or `none`
+            Log.i(TAG, "esc-fallback id=" + id + " plain=" + escFallback(d, 0) + " alt=" + escFallback(d, android.view.KeyEvent.META_ALT_ON));
+        }
+    }
+
+    static String escFallback(android.view.InputDevice d, int meta) {
+        try {
+            android.view.KeyCharacterMap map = d.getKeyCharacterMap();
+            Object f = android.view.KeyCharacterMap.class.getMethod("getFallbackAction", int.class, int.class)
+                    .invoke(map, android.view.KeyEvent.KEYCODE_ESCAPE, meta);
+            if (f == null) {
+                return "none";
+            }
+            return f.getClass().getField("keyCode").getInt(f) + "/" + f.getClass().getField("metaState").getInt(f);
+        } catch (ReflectiveOperationException e) {
+            return "error:" + e;
         }
     }
 

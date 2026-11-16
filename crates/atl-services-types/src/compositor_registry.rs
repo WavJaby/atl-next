@@ -71,16 +71,21 @@ impl Splash {
 pub struct DesktopInput {
     /// The left mouse button is one finger: its down / move / up reach the app as a touchscreen's (atl-composer `input::touch::MouseFinger`). AOSP has none (CursorInputMapper sends SOURCE_MOUSE), and touch-only games ignore the mouse.
     pub mouse_touch: bool,
+    /// Esc -> Back: the physical keyboard's map is Generic.kcm combined with ATL's overlay (atl-services `input::ESC_BACK_OVERLAY`), so an unhandled Esc falls back to BACK (KeyCharacterMap.getFallbackAction). Pinned AOSP Generic.kcm has ESCAPE `base: none`. Served by the input service, which takes it from atld's `--desktop-input`.
+    pub esc_back: bool,
     /// The key tilt; None: off.
     pub tilt: Option<TiltConfig>,
 }
 
 impl DesktopInput {
-    /// `;`-separated: `mouse-touch`, `tilt=` + [`TiltConfig::to_arg`]; `none` when every adaptation is off.
+    /// `;`-separated: `mouse-touch`, `esc-back`, `tilt=` + [`TiltConfig::to_arg`]; `none` when every adaptation is off.
     pub fn to_arg(&self) -> String {
         let mut parts = Vec::new();
         if self.mouse_touch {
             parts.push("mouse-touch".to_owned());
+        }
+        if self.esc_back {
+            parts.push("esc-back".to_owned());
         }
         if let Some(t) = &self.tilt {
             parts.push(format!("tilt={}", t.to_arg()));
@@ -101,12 +106,13 @@ impl DesktopInput {
         for part in s.split(';') {
             match part.split_once('=') {
                 None if part == "mouse-touch" && !d.mouse_touch => d.mouse_touch = true,
+                None if part == "esc-back" && !d.esc_back => d.esc_back = true,
                 Some(("tilt", arg)) if d.tilt.is_none() => {
                     d.tilt = Some(TiltConfig::parse_arg(arg)?)
                 }
                 _ => {
                     return Err(format!(
-                        "{s}: `{part}` is not mouse-touch or tilt=<arg>, once each, or none"
+                        "{s}: `{part}` is not mouse-touch, esc-back or tilt=<arg>, once each, or none"
                     ));
                 }
             }
@@ -188,12 +194,19 @@ mod tests {
     #[test]
     fn desktop_input_round_trips() {
         let tilt = Some(TiltConfig::default());
-        for (mouse_touch, tilt) in [(false, None), (true, None), (false, tilt), (true, tilt)] {
-            let d = DesktopInput { mouse_touch, tilt };
-            assert_eq!(DesktopInput::parse_arg(&d.to_arg()), Ok(d));
+        for esc_back in [false, true] {
+            for (mouse_touch, tilt) in [(false, None), (true, None), (false, tilt), (true, tilt)] {
+                let d = DesktopInput {
+                    mouse_touch,
+                    esc_back,
+                    tilt,
+                };
+                assert_eq!(DesktopInput::parse_arg(&d.to_arg()), Ok(d));
+            }
         }
         assert_eq!(DesktopInput::default().to_arg(), "none");
         assert!(DesktopInput::parse_arg("mouse-touch;mouse-touch").is_err());
+        assert!(DesktopInput::parse_arg("esc-back;esc-back").is_err());
         assert!(DesktopInput::parse_arg("hover").is_err());
     }
 
