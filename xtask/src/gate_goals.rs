@@ -198,8 +198,11 @@ fn runtime_gralloc() -> Goals {
     runtime().with(gralloc())
 }
 
+/// `xtask test window`: the webview stage places the WebView provider package, as the app gate does.
 fn window() -> Goals {
-    runtime_gralloc().with(nb_guest())
+    runtime_gralloc()
+        .with(nb_guest())
+        .with(Goals::host(&["webview"]))
 }
 
 /// The services stage installs its fixture through the real installer first (installer.rs `install_fixture`), so binder also reads what the installer gate does: host ART.
