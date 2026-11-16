@@ -66,6 +66,7 @@ const GL_TRIANGLE_STRIP: u32 = 0x0005;
 const GL_RGBA: u32 = 0x1908;
 const GL_UNSIGNED_BYTE: u32 = 0x1401;
 const GL_TEXTURE_2D: u32 = 0x0DE1;
+const GL_TRIANGLES: u32 = 0x0004;
 
 type P = *mut c_void;
 
@@ -604,9 +605,10 @@ fn run_driver(env: *mut *const *const c_void, surface: P, out: &mut String) -> R
         }
     }
     let _ = writeln!(out, "frames {FRAMES}");
-    // an extension name in both libEGL tables, not exported by ANGLE's ES1 library: the driver's shell must pick ANGLE's entry under ES1, so ANGLE's error state (read through the ES1 front) records the invalid call
+    // extension names in both libEGL tables: one ANGLE exports (libEGL's ES1 table takes ANGLE's address; the error shows the call was validated), one no ANGLE library has (the driver's shell answers none under ES1)
     let gles1 = Lib::open("libGLESv1_CM.so", RTLD_NOW)?;
     let _ = writeln!(out, "ext es1 error {:#x}", ext_error(&gles1)?);
+    gap_call(&gles1)?;
 
     // an ES3 context in this ES1 process: the host's GLES, surfaceless
     let ctx3 = unsafe {
@@ -634,6 +636,8 @@ fn run_driver(env: *mut *const *const c_void, surface: P, out: &mut String) -> R
     let _ = writeln!(out, "es3 version {es3}");
     // the same name under ES3: the host's entry and error state
     let _ = writeln!(out, "ext es3 error {:#x}", ext_error(&gles2)?);
+    gap_call(&gles2)?;
+    let _ = writeln!(out, "gap es1 es3");
 
     // cross-kind share contexts: refused by the driver
     for (what, version, share) in [("es1-on-es3", 1, ctx3), ("es3-on-es1", 3, ctx)] {
@@ -675,6 +679,14 @@ fn ext_error(front: &Lib) -> Result<u32, String> {
         target(GL_TEXTURE_2D, std::ptr::null_mut());
         Ok(get_error())
     }
+}
+
+/// `glMultiDrawArraysEXT(GL_TRIANGLES, -, -, 0)` through `front`: a name no ANGLE library exports, so both libEGL tables hold the driver's shell (the harness reads the driver's lines); primcount 0 reads no array.
+fn gap_call(front: &Lib) -> Result<(), String> {
+    let multi: unsafe extern "C" fn(u32, *const i32, *const i32, i32) = front.sym(c"glMultiDrawArraysEXT")?;
+    // SAFETY: a context is current; primcount 0 dereferences neither array.
+    unsafe { multi(GL_TRIANGLES, std::ptr::null(), std::ptr::null(), 0) };
+    Ok(())
 }
 
 /// JNI NewStringUTF of `text`.

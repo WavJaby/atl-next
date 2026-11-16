@@ -58,8 +58,6 @@ struct Angle {
     get_error: a::eglGetError,
     acquire: a::eglAcquireExternalContextANGLE,
     release: a::eglReleaseExternalContextANGLE,
-    /// ANGLE's eglGetProcAddress: every GL entry of ANGLE's frontend, ES1 extensions included (es1_ext.rs).
-    gpa: a::eglGetProcAddress,
 }
 
 // SAFETY: the ANGLE display is a process-global EGL handle usable from any thread (EGL 1.5 §3.2); the rest are function pointers.
@@ -122,7 +120,6 @@ impl Angle {
                     get_error: sym(&lib, gpa, "eglGetError")?,
                     acquire: sym(&lib, gpa, "eglAcquireExternalContextANGLE")?,
                     release: sym(&lib, gpa, "eglReleaseExternalContextANGLE")?,
-                    gpa,
                 },
             )
         };
@@ -444,34 +441,14 @@ impl Es1Context {
     }
 }
 
-/// An ES1 context is current on this thread (es1_ext.rs picks ANGLE's entries then).
+/// An ES1 context is current on this thread (es1_ext.rs's shells answer for ES1 then).
 pub fn is_current() -> bool {
     CURRENT.with(|c| c.borrow().is_some())
 }
 
-/// Inside ANGLE's display or context creation: ANGLE resolving its native GL through this driver must get the host's entries, never es1_ext's shells (they would pick ANGLE's own frontend while an ES1 context is current).
+/// Inside ANGLE's display or context creation: ANGLE resolving its native GL through this driver must get the host's entries, never es1_ext's shells (an ES1 context may be current while ANGLE's backend calls them).
 pub fn in_angle() -> bool {
     IN_ANGLE.with(Cell::get)
-}
-
-/// ANGLE's entry for GL `name`, as libEGL's ES1 table would take it: the export of the ES1 library libEGL loaded, else ANGLE's eglGetProcAddress; null when neither has it or ANGLE's display is not up.
-pub fn entry(name: &std::ffi::CStr) -> *mut c_void {
-    let Some(Ok(angle)) = ANGLE.get() else {
-        return std::ptr::null_mut();
-    };
-    let path = format!("{VENDOR_EGL}/{GL_DRIVER_GLES1}");
-    // SAFETY: NOLOAD only looks the already-loaded library up: nothing is loaded, no constructor runs.
-    if let Ok(lib) = unsafe { Library::open(Some(&path), RTLD_NOW | RTLD_NOLOAD) } {
-        // SAFETY: the symbol is only read as an address.
-        if let Ok(s) = unsafe { lib.get::<*mut c_void>(name.to_bytes_with_nul()) } {
-            let p = *s;
-            if !p.is_null() {
-                return p;
-            }
-        }
-    }
-    // SAFETY: ANGLE's eglGetProcAddress with a NUL-terminated name.
-    unsafe { (angle.gpa)(name.as_ptr()) }.map_or(std::ptr::null_mut(), |f| f as *mut c_void)
 }
 
 /// The ES1 context current on this thread, if any, leaves ANGLE: released, ANGLE's binding cleared. Before any other make-current on the thread.
