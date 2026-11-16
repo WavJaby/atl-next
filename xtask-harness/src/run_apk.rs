@@ -595,10 +595,13 @@ pub(crate) fn shared_foreign(
     host: &str,
     apks: &[&Path],
 ) -> Result<Option<SupportedAbi>> {
-    let per_apk = apks
-        .iter()
-        .map(|apk| foreign_abi(rt.abis(), host, &[PackageFile { path: apk.to_path_buf() }]))
-        .collect::<Result<Vec<_>>>()?;
+    let mut per_apk = Vec::with_capacity(apks.len());
+    for apk in apks {
+        let file = PackageFile {
+            path: apk.to_path_buf(),
+        };
+        per_apk.push(foreign_abi(rt.abis(), host, &[file])?);
+    }
     if let Some(first) = per_apk.first() {
         for (apk, found) in apks.iter().zip(&per_apk) {
             ensure!(

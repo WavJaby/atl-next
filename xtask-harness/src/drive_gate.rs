@@ -103,7 +103,11 @@ impl<'a> Gate<'a> {
         let foreign = run_apk::shared_foreign(&self.rt, self.host, apks)?;
         let args = self.args(first);
         let rt = run_apk::configure(self.root, &args, self.rt, foreign.as_ref())?;
-        Ok(Gate { rt, foreign, ..self })
+        Ok(Gate {
+            rt,
+            foreign,
+            ..self
+        })
     }
 
     fn args(&self, apk: &Path) -> run_apk::Args {
@@ -125,7 +129,9 @@ impl<'a> Gate<'a> {
             &self.args(apk),
             self.foreign.as_ref(),
             None,
-            vec![PackageFile { path: apk.to_path_buf() }],
+            vec![PackageFile {
+                path: apk.to_path_buf(),
+            }],
             Some(steps),
         )
     }
