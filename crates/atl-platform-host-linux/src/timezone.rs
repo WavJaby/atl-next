@@ -3,11 +3,16 @@
 
 use std::path::Path;
 
+/// The host's zoneinfo dir (glibc's default TZDIR).
+const ZONEINFO: &str = "/usr/share/zoneinfo";
+
 /// The zone id this host's native programs run in; `None` where glibc names no zone file.
 pub fn time_zone() -> Option<String> {
+    let zoneinfo = Path::new(ZONEINFO);
     atl_platform_host_api::zone_id_from(
         std::env::var_os("TZ").map(|tz| tz.to_string_lossy().into_owned()),
         std::fs::canonicalize("/etc/localtime").ok(),
-        |id| Path::new("/usr/share/zoneinfo").join(id).is_file(),
+        zoneinfo,
+        |name| zoneinfo.join(name).is_file(),
     )
 }

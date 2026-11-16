@@ -271,31 +271,47 @@ pub fn bcp47_of_posix(name: &str) -> Option<String> {
 }
 
 /// The zone id a native Linux program runs in (glibc `tzset`): `TZ` when present, else the zone `/etc/localtime` links to.
-/// `zone_file_exists(id)`: is `<zoneinfo>/<id>` a file (the Linux crate's check). A leading `:` is dropped; an empty, absolute or `..` id, or a POSIX string (`CST-8`), names none.
-/// Present but empty `TZ` names none: glibc reads it as UTC and never falls back to `/etc/localtime` (measured in a private mount namespace); AOSP's GMT (offset 0) applies.
+/// `zoneinfo`: the host zoneinfo dir; `zone_file_exists(name)`: is `zoneinfo/<name>` a file (the Linux crate's check). A leading `:` is dropped.
+/// An empty name is UTC: glibc reads `TZ=""` and `TZ=:` as UTC (offset 0) and never falls back to `/etc/localtime` (measured in a private mount namespace).
+/// A name is a zone iff glibc opens `zoneinfo/<name>`; the id drops a leading `posix/` or `right/` (libcore's name for the same zone). `..` names none; a POSIX string (`CST-8`) names no file, so none.
+/// An absolute name is a file for glibc: it names a zone only under `zoneinfo` (its path there). Elsewhere it names none, though glibc would read that file: libcore has no name for it.
 pub fn zone_id_from(
     tz: Option<String>,
     localtime_target: Option<PathBuf>,
+    zoneinfo: &Path,
     zone_file_exists: impl Fn(&str) -> bool,
 ) -> Option<String> {
     match tz {
         Some(tz) => {
-            let id = tz.strip_prefix(':').unwrap_or(tz.as_str());
-            let escapes = id.starts_with('/') || id.split('/').any(|c| c == "..");
-            (!id.is_empty() && !escapes && zone_file_exists(id)).then(|| id.to_owned())
+            let spec = tz.strip_prefix(':').unwrap_or(tz.as_str());
+            if spec.is_empty() {
+                return Some("UTC".to_owned());
+            }
+            let rel = if spec.starts_with('/') {
+                Path::new(spec).strip_prefix(zoneinfo).ok()?.to_str()?
+            } else {
+                spec
+            };
+            let name = zone_name(rel)?;
+            zone_file_exists(rel).then_some(name)
         }
         None => zone_from_path(&localtime_target?),
     }
 }
 
-/// The zone a zoneinfo path names: the part after its first `/zoneinfo/`, a leading `posix/` or `right/` dropped.
-fn zone_from_path(path: &Path) -> Option<String> {
-    let (_, zone) = path.to_str()?.split_once("/zoneinfo/")?;
-    let zone = zone
+/// The libcore name of a zoneinfo-relative name: a leading `posix/` or `right/` (the same zones in other trees) dropped; empty or `..` names none.
+fn zone_name(rel: &str) -> Option<String> {
+    let name = rel
         .strip_prefix("posix/")
-        .or_else(|| zone.strip_prefix("right/"))
-        .unwrap_or(zone);
-    (!zone.is_empty()).then(|| zone.to_owned())
+        .or_else(|| rel.strip_prefix("right/"))
+        .unwrap_or(rel);
+    (!name.is_empty() && !name.split('/').any(|c| c == "..")).then(|| name.to_owned())
+}
+
+/// The zone a canonical zoneinfo path names: the part after its first `/zoneinfo/`, as [`zone_name`].
+fn zone_from_path(path: &Path) -> Option<String> {
+    let (_, rel) = path.to_str()?.split_once("/zoneinfo/")?;
+    zone_name(rel)
 }
 
 #[cfg(test)]
@@ -356,15 +372,17 @@ mod tests {
 
     #[test]
     fn tz_names_its_zone_file_else_localtime_names_it() {
-        let exists = |id: &str| ["Asia/Taipei", "Europe/Berlin", "America/New_York"].contains(&id);
+        let zoneinfo = Path::new("/usr/share/zoneinfo");
+        let exists =
+            |name: &str| ["Asia/Taipei", "Europe/Berlin", "America/New_York"].contains(&name);
         let new_york = || Some(PathBuf::from("/usr/share/zoneinfo/America/New_York"));
         // a leading ':' is dropped; the file must exist
         assert_eq!(
-            zone_id_from(Some(":Asia/Taipei".into()), new_york(), exists).as_deref(),
+            zone_id_from(Some(":Asia/Taipei".into()), new_york(), zoneinfo, exists).as_deref(),
             Some("Asia/Taipei")
         );
         assert_eq!(
-            zone_id_from(Some("Europe/Berlin".into()), new_york(), exists).as_deref(),
+            zone_id_from(Some("Europe/Berlin".into()), new_york(), zoneinfo, exists).as_deref(),
             Some("Europe/Berlin")
         );
         // a POSIX string names no file, and glibc does not fall through to /etc/localtime
@@ -372,19 +390,21 @@ mod tests {
             zone_id_from(
                 Some("CST-8".into()),
                 Some(PathBuf::from("/usr/share/zoneinfo/Asia/Tokyo")),
+                zoneinfo,
                 exists
             ),
             None
         );
         // unset: the zone /etc/localtime links to; posix/ and right/ name the same zones
         assert_eq!(
-            zone_id_from(None, new_york(), exists).as_deref(),
+            zone_id_from(None, new_york(), zoneinfo, exists).as_deref(),
             Some("America/New_York")
         );
         assert_eq!(
             zone_id_from(
                 None,
                 Some(PathBuf::from("/usr/share/zoneinfo/posix/Asia/Taipei")),
+                zoneinfo,
                 exists
             )
             .as_deref(),
@@ -394,6 +414,7 @@ mod tests {
             zone_id_from(
                 None,
                 Some(PathBuf::from("/usr/share/zoneinfo/right/Europe/Berlin")),
+                zoneinfo,
                 exists
             )
             .as_deref(),
@@ -401,30 +422,88 @@ mod tests {
         );
         // a copied /etc/localtime is no link into zoneinfo; no /etc/localtime at all
         assert_eq!(
-            zone_id_from(None, Some(PathBuf::from("/etc/localtime")), exists),
+            zone_id_from(
+                None,
+                Some(PathBuf::from("/etc/localtime")),
+                zoneinfo,
+                exists
+            ),
             None
         );
-        assert_eq!(zone_id_from(None, None, exists), None);
+        assert_eq!(zone_id_from(None, None, zoneinfo, exists), None);
     }
 
     #[test]
     fn non_zone_names_are_refused_before_the_file_check() {
         // the closure accepts everything: only the guards can refuse these
+        let zoneinfo = Path::new("/usr/share/zoneinfo");
         let any = |_: &str| true;
         for tz in [
-            ":",
             "../../etc/passwd",
             "Asia/../../etc/passwd",
-            "/usr/share/zoneinfo/Asia/Taipei",
+            "/usr/share/zoneinfo/../../etc/passwd",
+            "/usr/share/zoneinfo/posix/../../etc/passwd",
         ] {
-            assert_eq!(zone_id_from(Some(tz.into()), None, any), None, "{tz:?}");
+            assert_eq!(
+                zone_id_from(Some(tz.into()), None, zoneinfo, any),
+                None,
+                "{tz:?}"
+            );
         }
     }
 
     #[test]
-    fn empty_tz_is_present_not_unset() {
-        // glibc: TZ="" is UTC ("Universal"), /etc/localtime ignored; no zone id, so AOSP's GMT (offset 0)
-        let new_york = Some(PathBuf::from("/usr/share/zoneinfo/America/New_York"));
-        assert_eq!(zone_id_from(Some(String::new()), new_york, |_| true), None);
+    fn empty_tz_is_utc() {
+        // glibc: TZ="" and TZ=: read as UTC (`date +%Z:%z`: Universal:+0000 and UTC:+0000 in a private mount namespace), never /etc/localtime (New York there)
+        let zoneinfo = Path::new("/usr/share/zoneinfo");
+        let new_york = || Some(PathBuf::from("/usr/share/zoneinfo/America/New_York"));
+        assert_eq!(
+            zone_id_from(Some(String::new()), new_york(), zoneinfo, |_| false).as_deref(),
+            Some("UTC")
+        );
+        assert_eq!(
+            zone_id_from(Some(":".into()), new_york(), zoneinfo, |_| false).as_deref(),
+            Some("UTC")
+        );
+    }
+
+    #[test]
+    fn absolute_tz_under_zoneinfo_names_the_zone_there() {
+        // glibc reads an absolute TZ as a file; under zoneinfo its id is the path relative to it, posix/ and right/ dropped
+        let zoneinfo = Path::new("/usr/share/zoneinfo");
+        let exists = |name: &str| ["Asia/Taipei", "posix/Asia/Taipei"].contains(&name);
+        let zone = |tz: &str| zone_id_from(Some(tz.into()), None, zoneinfo, exists);
+        assert_eq!(
+            zone("/usr/share/zoneinfo/Asia/Taipei").as_deref(),
+            Some("Asia/Taipei")
+        );
+        assert_eq!(
+            zone(":/usr/share/zoneinfo/Asia/Taipei").as_deref(),
+            Some("Asia/Taipei")
+        );
+        assert_eq!(
+            zone("/usr/share/zoneinfo/posix/Asia/Taipei").as_deref(),
+            Some("Asia/Taipei")
+        );
+        // the file must exist
+        assert_eq!(zone("/usr/share/zoneinfo/Asia/Tokyo"), None);
+    }
+
+    #[test]
+    fn absolute_tz_outside_zoneinfo_names_none() {
+        // glibc would read these files; libcore has no zone name for one outside zoneinfo. The path prefix decides, not the file.
+        let zoneinfo = Path::new("/usr/share/zoneinfo");
+        for tz in [
+            "/etc/localtime",
+            "/home/u/zoneinfo/Asia/Taipei",
+            "/usr/share/zoneinfo-backup/Asia/Taipei",
+            "/",
+        ] {
+            assert_eq!(
+                zone_id_from(Some(tz.into()), None, zoneinfo, |_| true),
+                None,
+                "{tz}"
+            );
+        }
     }
 }
