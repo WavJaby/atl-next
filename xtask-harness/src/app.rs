@@ -778,6 +778,13 @@ const RESULT: &str = "AtlTest: result ";
 const RESULT_CHILD: &str = "request=7 code=-1 extra=atl-result-7";
 const RESULT_CANCELED: &str = "request=9 code=0 extra=none";
 const CHILD_FINISHING: &str = "AtlTest: result child finishing";
+/// ResultChild's getCallingActivity / getCallingPackage: the resultTo record, Main (ActivityClientController.getCallingRecord). ResultChild is started by its filter's implicit action, so the
+/// line also shows the start resolved through the package manager (ActivityTaskSupervisor.resolveIntent).
+const CALLING: &str = "AtlTest: calling ";
+const CALLING_MAIN: &str = "activity=com.example.atltest.Main package=com.example.atltest";
+/// Main.implicitNone: a market:// VIEW no installed activity filters -> START_INTENT_NOT_RESOLVED -> Instrumentation.checkStartActivityResult throws ActivityNotFoundException (AOSP without a store).
+const IMPLICIT_NONE: &str = "AtlTest: implicit-none ";
+const IMPLICIT_NONE_THROWS: &str = "threw ActivityNotFoundException";
 const MAIN_RESUMED: &str = "AtlTest: main resumed";
 const MAIN_NEW_INTENT: &str = "AtlTest: main new intent";
 /// Main.onNewIntent's requestPermissions(POST_NOTIFICATIONS, 11) (Main.java onRequestPermissionsResult), the round trip's last line. With no permission controller installed (runtime-permissions P1) the
@@ -1542,6 +1549,17 @@ fn result_failures(app: &str) -> Vec<String> {
         whys.push(format!(
             "permission request: want {PERMISSION_DISMISSED:?}, got {permission:?}"
         ));
+    }
+    for (prefix, want) in [
+        (CALLING, CALLING_MAIN),
+        (IMPLICIT_NONE, IMPLICIT_NONE_THROWS),
+    ] {
+        let got = app
+            .lines()
+            .find_map(|l| l.split_once(prefix).map(|(_, r)| r.trim_end()));
+        if got != Some(want) {
+            whys.push(format!("{}: want {want:?}, got {got:?}", prefix.trim_end()));
+        }
     }
     whys
 }
@@ -3010,7 +3028,9 @@ mod tests {
     /// The round trip as Main.java and ResultChild.java log it when AOSP's order holds: the child's result, Main's resume, the self-start's cancel, its new intent.
     const ROUND_TRIP: &str = concat!(
         "AtlTest: onCreate reached\n",
+        "AtlTest: implicit-none threw ActivityNotFoundException\n",
         "AtlTest: main resumed\n",
+        "AtlTest: calling activity=com.example.atltest.Main package=com.example.atltest\n",
         "AtlTest: result child finishing\n",
         "AtlTest: result request=7 code=-1 extra=atl-result-7\n",
         "AtlTest: main resumed\n",
@@ -3064,8 +3084,27 @@ mod tests {
                 "{got}"
             );
         }
-        // nothing logged after the marker: all four required lines are reported
-        assert_eq!(result_failures("AtlTest: onCreate reached\n").len(), 4);
+        // a null caller (getCallingActivity unanswered) and a start that did not throw ANFE are each named
+        for (from, to, why) in [
+            (
+                "activity=com.example.atltest.Main package=com.example.atltest",
+                "activity=null package=null",
+                "AtlTest: calling: want",
+            ),
+            (
+                "implicit-none threw ActivityNotFoundException",
+                "implicit-none started",
+                "AtlTest: implicit-none: want",
+            ),
+        ] {
+            let other = ROUND_TRIP.replace(from, to);
+            assert!(
+                result_failures(&other).iter().any(|w| w.starts_with(why)),
+                "{to}"
+            );
+        }
+        // nothing logged after the marker: all six required lines are reported
+        assert_eq!(result_failures("AtlTest: onCreate reached\n").len(), 6);
     }
 
     /// Lines in the shapes Main.java and atl-diag write; each half missing gives its own reason.

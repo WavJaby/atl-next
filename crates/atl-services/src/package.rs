@@ -59,7 +59,7 @@ const REQUESTED_PERMISSION_GRANTED: i32 = 1 << 1;
 pub const STOCK_PM_FLAGS: i64 = 0x400;
 /// PackageManager.GET_RESOLVED_FILTER (:1091; the same bit as GET_SIGNATURES) and MATCH_DEFAULT_ONLY (:1194).
 const GET_RESOLVED_FILTER: i64 = 0x40;
-const MATCH_DEFAULT_ONLY: i64 = 0x0001_0000;
+pub(crate) const MATCH_DEFAULT_ONLY: i64 = 0x0001_0000;
 /// Intent.CATEGORY_DEFAULT.
 const CATEGORY_DEFAULT: &str = "android.intent.category.DEFAULT";
 

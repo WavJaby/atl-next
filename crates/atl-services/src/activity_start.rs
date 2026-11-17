@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: MIT
 //! Whether the services start an activity for a startActivity call: the accepted subset of ActivityStarter, pure (no binder), so the tests build without the converter feature.
+//! An implicit intent arrives here already resolved by the package manager (activity_task: ActivityTaskSupervisor.resolveIntent), so `component` is None only when nothing matched.
 //! Accepted: an explicit component of the caller's own package, started from one of the caller's activities, in the caller's task and process: standard (a new
 //! instance), singleTop (onNewIntent to the top when it is that class, else new), singleTask (onNewIntent to its instance in the task after clearing what is above, else new; a new instance while a result is owed).
 //! A start for a result (startActivityForResult) is accepted too: the result it owes its caller is answered by the services (see [`Call::result_requested`]).
 //! And a start with no caller app (shell / home) of a package's launcher whose process is not running ([`check_shell`]).
 //! Every other call is refused: a SecurityException when the caller does not own the activity it names (fail-closed; counted `exception:SECURITY` by the reply hook, not here), otherwise the START code
 //! AOSP returns for the case (ActivityManager.java:162 FIRST_START_FATAL = -100), counted by `atl_diag::refused` under its reason. Refusals are never silent: the app sees the code, the log sees the count.
-//! Refused, not modelled: implicit intents (intent filters), other packages, singleInstance, other processes, intent flags except NEW_TASK, task affinity
+//! Refused, not modelled: implicit intents of the shell path ([`check_shell`]), a chooser tie (no ResolverActivity), other packages, singleInstance, other processes, intent flags except NEW_TASK, task affinity
 //! across tasks (NEW_TASK into another affinity), more than one task per package, bringing a running app's task to front.
 
 use atl_services_types::permission::{SHELL_UID, SYSTEM_UID};
@@ -117,7 +118,7 @@ pub fn check<'a>(call: &Call<'_>, target: Target<'a>) -> Result<(&'a Declared, S
     let Some((package, class)) = call.component else {
         return Err(refused(
             START_INTENT_NOT_RESOLVED,
-            "implicit intent (intent filters are not modelled)",
+            "implicit intent (no activity matches)",
         ));
     };
     if package != call.calling_package {
@@ -540,7 +541,7 @@ mod tests {
             code_of(check(&c, target(&main))),
             Refusal::Code {
                 code: START_INTENT_NOT_RESOLVED,
-                reason: "implicit intent (intent filters are not modelled)"
+                reason: "implicit intent (no activity matches)"
             }
         );
     }

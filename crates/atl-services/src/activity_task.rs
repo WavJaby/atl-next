@@ -29,12 +29,14 @@ use crate::activity::{
 use crate::activity_stack::{Command, Machine, ResultTo, Step};
 use crate::activity_start::{self, Call, Refusal, Source, Start, Target};
 use crate::config_diff::Config;
+use crate::package::USER_SYSTEM;
 use crate::packages::{Packages, Permissions, real_config_changes};
 use crate::permission_request;
 use crate::tasks::{TaskId, Tasks};
 use crate::token;
 use atl_parcelables::android::content::pm::{ActivityInfo, ConfigurationInfo};
 use atl_parcelables::android::content::res::Configuration;
+use atl_parcelables::codecs::android::content::pm::ResolveInfo::Resolved;
 
 const ATM: &str = "IActivityTaskManager";
 
@@ -141,6 +143,8 @@ pub(crate) struct StartArgs<'a> {
     pub result_to: Option<&'a SpIBinder>,
     /// resultWho: the name the caller gave the result (startActivity's resultWho)
     pub result_who: Option<&'a str>,
+    /// resolvedType: the intent's MIME type as the caller resolved it (Intent.resolveTypeIfNeeded), matched against the filters' data types
+    pub resolved_type: Option<&'a str>,
 }
 
 /// ActivityRecord's task affinity: the manifest's taskAffinity, else the package name.
@@ -417,7 +421,15 @@ impl ActivityTasks {
             request_code,
             result_to,
             result_who,
+            resolved_type,
         } = args;
+        // ActivityStarter.Request.resolveActivity -> ActivityTaskSupervisor.resolveIntent (MATCH_DEFAULT_ONLY, :768-769) -> the package manager's one resolver; resolveActivity stores the
+        // found component back into the intent (:712-716), so the rest decides on an explicit start. No match (or a chooser tie, M76: no ResolverActivity) keeps the intent implicit:
+        // activity_start refuses it with START_INTENT_NOT_RESOLVED -> ActivityNotFoundException.
+        let resolved = intent
+            .filter(|i| i.component.is_none())
+            .and_then(|i| self.resolve(calling_uid, i, resolved_type));
+        let intent = resolved.as_ref().or(intent);
         let component = intent
             .and_then(|i| i.component.as_ref())
             .map(|c| (c.package.as_str(), c.class.as_str()));
@@ -598,6 +610,34 @@ impl ActivityTasks {
                 Back::Finish
             },
         )
+    }
+
+    /// `intent` made explicit to the activity the package manager resolves it to for `caller` (visibility, MATCH_DEFAULT_ONLY, priority); None: no activity, or a chooser tie.
+    fn resolve(&self, caller: u32, intent: &Intent, resolved_type: Option<&str>) -> Option<Intent> {
+        let found = crate::package::resolve_activity(
+            &self.packages,
+            caller,
+            intent,
+            resolved_type,
+            crate::package::MATCH_DEFAULT_ONLY,
+            USER_SYSTEM,
+        )?;
+        let Resolved::Activity(a) = found.info else {
+            return None;
+        };
+        let item = a.component.item;
+        let component = ComponentName {
+            package: item.package_name?,
+            class: item.name?,
+        };
+        log(format_args!(
+            "activity implicit start resolved to {}/{}",
+            component.package, component.class
+        ));
+        Some(Intent {
+            component: Some(component),
+            ..intent.clone()
+        })
     }
 
     /// ActivityClientController.getCallingRecord:707-710: the (package, class) of the record `token` owes its result to; None when it was not started for a result, already finished, or unknown.
@@ -850,7 +890,7 @@ impl IActivityTaskManager for ActivityTaskService {
         calling_package: Option<&str>,
         _calling_feature_id: Option<&str>,
         intent: Option<&Intent>,
-        _resolved_type: Option<&str>,
+        resolved_type: Option<&str>,
         result_to: Option<&SpIBinder>,
         result_who: Option<&str>,
         request_code: i32,
@@ -879,6 +919,7 @@ impl IActivityTaskManager for ActivityTaskService {
             request_code,
             result_to,
             result_who,
+            resolved_type,
         };
         self.atm.start(caller, calling_uid, calling_package, args)
     }
@@ -1026,6 +1067,7 @@ mod tests {
                     request_code: REQUEST_CODE,
                     result_to: Some(&source),
                     result_who: None,
+                    resolved_type: None,
                 },
             )
             .expect("start");
@@ -1107,6 +1149,7 @@ mod tests {
                     request_code: REQUEST_CODE,
                     result_to: Some(&source),
                     result_who: Some(PERMISSIONS_WHO),
+                    resolved_type: None,
                 },
             )
             .expect("start");
@@ -1238,5 +1281,213 @@ mod tests {
             ..Configuration::default()
         };
         assert_eq!(device_configuration_info(&none, 0).req_input_features, 0);
+    }
+
+    const ACTION_VIEW: &str = "android.intent.action.VIEW";
+    const CATEGORY_DEFAULT: &str = "android.intent.category.DEFAULT";
+    const OTHER: &str = "com.example.browser";
+
+    /// `class` of `package` with one filter: ACTION_VIEW, CATEGORY_DEFAULT (what startActivity's MATCH_DEFAULT_ONLY requires).
+    fn viewer(class: &str) -> crate::installed::ComponentIntents {
+        crate::installed::ComponentIntents {
+            kind: atl_services_types::installer_output::Kind::ActivityIntents,
+            name: class.to_owned(),
+            intents: vec![crate::packages::fixture::filter(
+                &[ACTION_VIEW],
+                &[CATEGORY_DEFAULT],
+            )],
+        }
+    }
+
+    /// The player (targetSdk `target_sdk`) with VIDEO filtering ACTION_VIEW, and with `other` a second package whose one activity filters it too.
+    fn filtered_atm(other: bool, target_sdk: i32) -> ActivityTasks {
+        let mut record = crate::packages::fixture::record(PACKAGE);
+        record.uid = UID;
+        if let Some(app) = record.info.application_info.as_mut() {
+            app.target_sdk_version = target_sdk;
+        }
+        record.info.activities = Some(vec![Some(decl(LAUNCHER)), Some(decl(VIDEO))]);
+        record.intents = vec![viewer(VIDEO)];
+        let mut records = vec![record];
+        if other {
+            let class = format!("{OTHER}.View");
+            let mut o = crate::packages::fixture::record(OTHER);
+            o.uid = UID + 1;
+            o.info.activities = Some(vec![Some(crate::packages::fixture::activity(
+                OTHER, &class,
+            ))]);
+            o.intents = vec![viewer(&class)];
+            records.push(o);
+        }
+        let packages = Arc::new(Packages::new(records, BTreeMap::new()));
+        ActivityTasks::new(
+            Arc::clone(&packages),
+            Arc::new(Permissions::new(&packages, &[])),
+            Arc::new(Tasks::new(DisplayModel::default(), None)),
+            token::new(),
+        )
+    }
+
+    /// startActivity(ForResult) of `intent` from `source`.
+    fn start_of(
+        atm: &ActivityTasks,
+        thread: &Strong<dyn IApplicationThread>,
+        source: &SpIBinder,
+        intent: &Intent,
+        request_code: i32,
+    ) -> i32 {
+        atm.start(
+            thread,
+            UID,
+            PACKAGE,
+            StartArgs {
+                intent: Some(intent),
+                reuse: true,
+                results: true,
+                request_code,
+                result_to: Some(source),
+                result_who: None,
+                resolved_type: None,
+            },
+        )
+        .expect("start")
+    }
+
+    fn view() -> Intent {
+        Intent {
+            action: Some(ACTION_VIEW.into()),
+            ..Default::default()
+        }
+    }
+
+    /// The token of the record the LaunchActivityItem for `class` launched.
+    fn token_of(scheduled: &Mutex<Vec<ClientTransaction>>, class: &str) -> SpIBinder {
+        scheduled
+            .lock()
+            .expect("transactions lock")
+            .iter()
+            .flat_map(|t| t.items.iter().flatten())
+            .find_map(|item| match item {
+                ClientTransactionItem::LaunchActivity(l)
+                    if l.intent
+                        .as_ref()
+                        .and_then(|i| i.component.as_ref())
+                        .is_some_and(|c| c.class == class) =>
+                {
+                    l.activity_token.clone()
+                }
+                _ => None,
+            })
+            .expect("a LaunchActivityItem for the class")
+    }
+
+    /// An implicit intent one activity of the caller's own package filters starts that activity (ActivityTaskSupervisor.resolveIntent): the launch carries the intent made explicit
+    /// (resolveActivity stores the component, :712-716) and keeps its action.
+    #[test]
+    fn an_implicit_intent_of_the_own_package_starts_the_resolved_activity() {
+        let atm = filtered_atm(false, SDK_U);
+        let (thread, scheduled) = app_thread();
+        let source = attach_launcher(&atm, &thread);
+        assert_eq!(
+            start_of(&atm, &thread, &source, &view(), -1),
+            activity_start::START_SUCCESS
+        );
+        let launched = intent_of(&scheduled, VIDEO);
+        assert_eq!(launched.action.as_deref(), Some(ACTION_VIEW));
+        assert_eq!(
+            launched.component.map(|c| c.package),
+            Some(PACKAGE.to_owned())
+        );
+    }
+
+    /// No activity matches (Doodle Jump's `market://` VIEW, an `https://` VIEW with no browser): START_INTENT_NOT_RESOLVED -> ActivityNotFoundException in the app, as AOSP.
+    #[test]
+    fn an_implicit_intent_nothing_matches_is_not_resolved() {
+        let atm = filtered_atm(false, SDK_U);
+        let (thread, _) = app_thread();
+        let source = attach_launcher(&atm, &thread);
+        for data in ["market://details?id=x", "https://example.com/"] {
+            let market = Intent {
+                data: Some(data.into()),
+                ..view()
+            };
+            assert_eq!(
+                start_of(&atm, &thread, &source, &market, -1),
+                activity_start::START_INTENT_NOT_RESOLVED,
+                "{data}"
+            );
+        }
+    }
+
+    /// Another package filtering the same action. Caller targetSdk >= R without `<queries>`: the other package is invisible (AppsFilter, M76), so the own activity is the only match and
+    /// starts; pinned to the other package, nothing matches. Caller targetSdk < R: both are visible and tie -> null (M76: no ResolverActivity) -> not resolved; pinned to the other
+    /// package, it resolves and the existing cross-package rule refuses it (START_CANCELED, "another package's activity").
+    #[test]
+    fn an_implicit_intent_of_another_package_keeps_the_cross_package_refusal() {
+        let to_other = Intent {
+            package: Some(OTHER.into()),
+            ..view()
+        };
+        for (sdk, open, pinned) in [
+            (
+                SDK_U,
+                activity_start::START_SUCCESS,
+                activity_start::START_INTENT_NOT_RESOLVED,
+            ),
+            (
+                SDK_Q,
+                activity_start::START_INTENT_NOT_RESOLVED,
+                activity_start::START_CANCELED,
+            ),
+        ] {
+            let atm = filtered_atm(true, sdk);
+            let (thread, _) = app_thread();
+            let source = attach_launcher(&atm, &thread);
+            assert_eq!(
+                start_of(&atm, &thread, &source, &to_other, -1),
+                pinned,
+                "sdk {sdk} pinned"
+            );
+            assert_eq!(
+                start_of(&atm, &thread, &source, &view(), -1),
+                open,
+                "sdk {sdk}"
+            );
+        }
+    }
+
+    /// Build.VERSION_CODES.UPSIDE_DOWN_CAKE (34, the fixture's) and Q (29, below R = 30 where package visibility filtering starts).
+    const SDK_U: i32 = 34;
+    const SDK_Q: i32 = 29;
+
+    /// getCallingActivity / getCallingPackage (ActivityClientController.getCallingRecord): the caller's component for a start for result, null for a plain start, null once the child finished.
+    #[test]
+    fn the_calling_activity_is_the_result_caller() {
+        let atm = fixture_atm();
+        let (thread, scheduled) = app_thread();
+        let source = attach_launcher(&atm, &thread);
+        let video = Intent {
+            component: Some(ComponentName {
+                package: PACKAGE.to_owned(),
+                class: VIDEO.to_owned(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            start_of(&atm, &thread, &source, &video, REQUEST_CODE),
+            activity_start::START_SUCCESS
+        );
+        let child = token_of(&scheduled, VIDEO);
+        assert_eq!(
+            atm.calling(&child),
+            Some((PACKAGE.to_owned(), LAUNCHER.to_owned()))
+        );
+        assert_eq!(
+            atm.calling(&source),
+            None,
+            "the launcher was not started for a result"
+        );
+        atm.finish(&child, RESULT_CANCELED, None);
+        assert_eq!(atm.calling(&child), None, "the child finished");
     }
 }

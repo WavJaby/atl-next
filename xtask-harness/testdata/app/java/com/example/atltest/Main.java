@@ -427,7 +427,25 @@ public class Main extends Activity {
         bridge1Legacy();
         resultToSecurity();
         Log.i("AtlTest", "onCreate reached");
-        startActivityForResult(new Intent(this, ResultChild.class), REQUEST_CHILD);
+        implicitNone();
+        startActivityForResult(new Intent(ACTION_RESULT_CHILD), REQUEST_CHILD);
+    }
+
+    /** ResultChild's filter action: the result child is started by an implicit intent the package manager resolves to it (app.rs CALLING). */
+    private static final String ACTION_RESULT_CHILD = "atl.test.RESULT_CHILD";
+
+    /** "implicit-none <outcome>" (app.rs IMPLICIT_NONE): a market:// VIEW nothing installed handles throws ActivityNotFoundException (START_INTENT_NOT_RESOLVED), as Doodle Jump expects. */
+    private void implicitNone() {
+        String outcome;
+        try {
+            startActivity(new Intent(Intent.ACTION_VIEW, android.net.Uri.parse("market://details?id=com.example.atltest")));
+            outcome = "started";
+        } catch (android.content.ActivityNotFoundException e) {
+            outcome = "threw ActivityNotFoundException";
+        } catch (RuntimeException e) {
+            outcome = "threw " + e.getClass().getName();
+        }
+        Log.i("AtlTest", "implicit-none " + outcome);
     }
 
     /** IActivityTaskManager.aidl: startActivity is the interface's first method, so FIRST_CALL_TRANSACTION. */
