@@ -29,6 +29,18 @@ pub struct Shown {
     pub buffer_key: u64,
     /// A dup of its first plane's dma-buf: the read fence is exported from it.
     pub dmabuf: OwnedFd,
+    /// What the texture was built from: the next present reuses `texture` for the same (buffer, frame, opaque). A new `GdkDmabufTexture` of unchanged content is a GSK cache miss, which on a host that
+    /// cannot import costs a full mmap download + upload on the UI thread per present (WSLg d3d12: one per unchanged layer per frame). Same frame number = not queued again; a buffer still shown is not
+    /// released, so its producer cannot have written it.
+    pub frame_number: u64,
+    pub opaque: bool,
+    pub texture: gdk::Texture,
+}
+
+impl Shown {
+    fn same_content(&self, buffer_key: u64, frame_number: u64, opaque: bool) -> bool {
+        self.buffer_key == buffer_key && self.frame_number == frame_number && self.opaque == opaque
+    }
 }
 
 /// `place` as a GSK transform. GSK composes the last call first, so the builder order is the reverse of the order the steps apply in; only translate / scale / rotate are used (see `Placement`).
@@ -73,6 +85,7 @@ fn quad_node(
     display: &gdk::Display,
     device: Option<DeviceNumber>,
     quad: &Quad,
+    previous: &[Shown],
     shown: &mut Vec<Shown>,
 ) -> Result<Option<gsk::RenderNode>, PresentError> {
     let b = match &quad.content {
@@ -103,7 +116,15 @@ fn quad_node(
         fail("no gralloc node in this process: no DRM device to import onto".to_owned())
     })?;
     let view = DmabufView::of(&b.buffer, device).map_err(fail)?;
-    let texture = dmabuf::texture(display, &view, b.opaque).map_err(fail)?;
+    let reused = previous
+        .iter()
+        .chain(shown.iter())
+        .find(|s| s.same_content(b.buffer.id, b.frame_number, b.opaque))
+        .map(|s| s.texture.clone());
+    let texture = match reused {
+        Some(t) => t,
+        None => dmabuf::texture(display, &view, b.opaque).map_err(fail)?,
+    };
     let first = view
         .fds
         .first()
@@ -114,6 +135,9 @@ fn quad_node(
         dmabuf: first
             .try_clone_to_owned()
             .map_err(|e| fail(format!("dup: {e}")))?,
+        frame_number: b.frame_number,
+        opaque: b.opaque,
+        texture: texture.clone(),
     });
     let (width, height) = (view.layout.width as f32, view.layout.height as f32);
     let whole = graphene::Rect::new(0.0, 0.0, width, height);
@@ -135,6 +159,7 @@ pub fn build(
     display: &gdk::Display,
     scene: &Scene,
     device: Option<DeviceNumber>,
+    previous: &[Shown],
 ) -> Result<(Vec<Piece>, Vec<Shown>), PresentError> {
     let mut shown = Vec::new();
     let mut pieces = Vec::new();
@@ -160,7 +185,7 @@ pub fn build(
             });
             continue;
         }
-        run.extend(quad_node(display, device, quad, &mut shown)?);
+        run.extend(quad_node(display, device, quad, previous, &mut shown)?);
     }
     flush(&mut run, &mut pieces);
     Ok((pieces, shown))

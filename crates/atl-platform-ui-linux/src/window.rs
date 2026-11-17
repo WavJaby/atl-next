@@ -694,8 +694,12 @@ impl Window for GtkWindow {
     }
 
     fn present(&self, scene: &Scene) -> Result<(), PresentError> {
-        let (pieces, shown) =
-            scene::build(&WidgetExt::display(&self.window), scene, self.buffer_device)?;
+        let (pieces, shown) = scene::build(
+            &WidgetExt::display(&self.window),
+            scene,
+            self.buffer_device,
+            &self.shared.shown.borrow(),
+        )?;
         self.view.show_pieces(pieces);
         // a buffer still in the new scene stays shown; the rest is retired until the paint that stops drawing it
         let old = std::mem::replace(&mut *self.shared.shown.borrow_mut(), shown);
