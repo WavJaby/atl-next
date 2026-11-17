@@ -18,6 +18,9 @@ atl-gralloc = { path = "../atl-gralloc" }
 atl-libgui-parcel = { path = "../atl-libgui-parcel" }
 atl-platform-types = { path = "../atl-platform-types" }
 thiserror.workspace = true
+# abi::set_log: the subscriber a dlopened module installs in its own `tracing` copy, forwarding to the process's LogSink (one implementation for every module)
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [build-dependencies]
 atl-layout = { path = "../atl-layout" }

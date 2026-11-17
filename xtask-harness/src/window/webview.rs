@@ -257,6 +257,14 @@ pub fn checks(
                 Err(e) => Err(e.clone()),
             },
         ),
+        (
+            "module-log",
+            // the web engine module's own tracing reaches the app log (abi::set_log); text from atl-webview-linux ENGINE_LINE_PREFIX
+            app.lines()
+                .find_map(|l| l.split_once("webview: engine WebKitGTK ").map(|(_, v)| v))
+                .map(|v| format!("engine module line: WebKitGTK {v}"))
+                .ok_or_else(|| "no `webview: engine WebKitGTK` line from the engine module".to_owned()),
+        ),
         ("provider-api", provider_api(app)),
         ("controls", controls(app)),
         ("page-tap", page_tap(app)),

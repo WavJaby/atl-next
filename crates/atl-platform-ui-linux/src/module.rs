@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: MIT
 //! The cdylib's exports (launcher-ui-module plan S2, `atl_platform_ui_api::abi`): a process loads `libatl_platform_ui_linux.so` with `dlopen(RTLD_NOW | RTLD_LOCAL)` and reaches GTK and PipeWire only through [`VTABLE`], so their closure never enters its global symbol scope. Hand-written shims (owner O1): one per trait method, each turning the handle and views into the implementation's types and calling it.
 //! Handles are `Box`es of the implementation types, made and freed here. No state in a thread-local of this module, so the process's thread-local teardown never reaches a module object it did not drop itself.
-//! This copy of `tracing` has none of the process's subscribers: `set_log` installs one that formats each record and hands it to the process's [`LogSink`].
+//! This copy of `tracing` has none of the process's subscribers: `set_log` (`abi::set_log`, shared with the web engine module) installs one that formats each record and hands it to the process's `LogSink`.
 
-use std::io;
 use std::path::Path;
-use std::sync::OnceLock;
 
 use atl_platform_ui_api::abi::{
-    self, AudioHandle, BytesOut, Callback, FillCallback, InvokerHandle, LogSink, LooperAbi,
+    self, AudioHandle, BytesOut, Callback, FillCallback, InvokerHandle, LooperAbi,
     MonitorView, PaintedView, PcmHandle, RequesterHandle, SceneView, Status, Str, Task,
     TextInputEventView, TextInputHandle, UiHandle, UiVtable, WindowAttributesView, WindowHandle,
 };
@@ -18,8 +16,6 @@ use atl_platform_ui_api::{
     InputEvent, InputSource, PhysRect, PhysSize, PresentError, PresentTiming, Surrounding,
     TextInput, Ui, UiInvoker, Window,
 };
-use tracing::Metadata;
-use tracing_subscriber::fmt::MakeWriter;
 
 use crate::ui::GtkInvoker;
 use crate::window::GtkFrameRequester;
@@ -28,7 +24,7 @@ use crate::{GtkTextInput, GtkUi, GtkWindow, PipeWireHost, PipeWireOutput};
 /// The module's functions; [`atl_platform_ui_entry`] returns it.
 static VTABLE: UiVtable = UiVtable {
     abi: abi::ABI_ID,
-    set_log,
+    set_log: abi::set_log,
     ui_attach,
     ui_drop,
     ui_invoker,
@@ -139,23 +135,6 @@ unsafe fn fail(err: *mut BytesOut, (kind, text): (Status, String)) -> Status {
     // SAFETY: the caller's contract.
     unsafe { BytesOut::put_to(err, text.as_bytes()) };
     kind
-}
-
-static LOG: OnceLock<LogSink> = OnceLock::new();
-
-unsafe extern "C" fn set_log(sink: LogSink) {
-    if LOG.set(sink).is_err() {
-        return;
-    }
-    // a subscriber installed by someone else in this module copy keeps its place: try_init's error is that and nothing else
-    let _ = tracing_subscriber::fmt()
-        .with_writer(LogWriter)
-        .with_ansi(false)
-        .without_time()
-        .with_level(false)
-        .with_target(false)
-        .with_max_level(tracing::Level::DEBUG)
-        .try_init();
 }
 
 unsafe extern "C" fn ui_attach(
@@ -516,72 +495,6 @@ unsafe extern "C" fn pcm_rt_fallbacks(p: *mut PcmHandle) -> u64 {
 unsafe extern "C" fn pcm_underruns(p: *mut PcmHandle) -> u64 {
     // SAFETY: a live output.
     unsafe { pcm(p) }.underruns()
-}
-
-/// The subscriber's writer factory: one [`LogLine`] per record, carrying its level and target.
-struct LogWriter;
-
-/// One formatted record, handed to the process's sink when the formatter drops it.
-struct LogLine {
-    level: abi::Level,
-    target: String,
-    buf: Vec<u8>,
-}
-
-impl<'a> MakeWriter<'a> for LogWriter {
-    type Writer = LogLine;
-
-    fn make_writer(&'a self) -> LogLine {
-        LogLine {
-            level: 3,
-            target: String::new(),
-            buf: Vec::new(),
-        }
-    }
-
-    fn make_writer_for(&'a self, meta: &Metadata<'_>) -> LogLine {
-        let level = match *meta.level() {
-            tracing::Level::ERROR => 1,
-            tracing::Level::WARN => 2,
-            tracing::Level::INFO => 3,
-            tracing::Level::DEBUG => 4,
-            tracing::Level::TRACE => 5,
-        };
-        LogLine {
-            level,
-            target: meta.target().to_owned(),
-            buf: Vec::new(),
-        }
-    }
-}
-
-impl io::Write for LogLine {
-    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
-        self.buf.extend_from_slice(b);
-        Ok(b.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl Drop for LogLine {
-    fn drop(&mut self) {
-        let Some(sink) = LOG.get() else { return };
-        let msg = self.buf.strip_suffix(b"\n").unwrap_or(&self.buf);
-        // SAFETY: the LogSink contract (process-lifetime, any thread); both slices are valid for the call.
-        unsafe {
-            (sink.log)(
-                sink.data,
-                self.level,
-                self.target.as_ptr(),
-                self.target.len(),
-                msg.as_ptr(),
-                msg.len(),
-            )
-        }
-    }
 }
 
 /// The handles that cross threads box Send + Sync objects, as the traits require.

@@ -38,6 +38,8 @@ fn load() -> Result<&'static WebViewVtable, String> {
             abi::ABI_ID
         ));
     }
+    // SAFETY: the sink is plain data valid for the process; its `log` is callable from any thread.
+    unsafe { (vtable.set_log)(crate::module::sink()) };
     tracing::info!(
         "atl-platform-ui: web engine module {path} abi {}",
         abi::ABI_ID

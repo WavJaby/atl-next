@@ -96,6 +96,94 @@ unsafe impl Send for LogSink {}
 // SAFETY: as Send; nothing in it is mutated after it is made.
 unsafe impl Sync for LogSink {}
 
+/// The module side of [`LogSink`], one function every module's vtable carries as `set_log`: a dlopened module's copy of `tracing` has none of the process's subscribers, so this installs one in that copy that formats each record and hands it to `sink`.
+/// The first call wins; later calls (and a subscriber someone else installed in the module copy) change nothing.
+///
+/// # Safety
+/// `sink` keeps the [`LogSink`] contract.
+pub unsafe extern "C" fn set_log(sink: LogSink) {
+    if MODULE_LOG.set(sink).is_err() {
+        return;
+    }
+    // a subscriber installed by someone else in this module copy keeps its place: try_init's error is that and nothing else
+    let _ = tracing_subscriber::fmt()
+        .with_writer(LogWriter)
+        .with_ansi(false)
+        .without_time()
+        .with_level(false)
+        .with_target(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .try_init();
+}
+
+static MODULE_LOG: std::sync::OnceLock<LogSink> = std::sync::OnceLock::new();
+
+/// The module subscriber's writer factory: one [`LogLine`] per record, carrying its level and target.
+struct LogWriter;
+
+/// One formatted record, handed to the process's sink when the formatter drops it.
+struct LogLine {
+    level: Level,
+    target: String,
+    buf: Vec<u8>,
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogWriter {
+    type Writer = LogLine;
+
+    fn make_writer(&'a self) -> LogLine {
+        LogLine {
+            level: 3,
+            target: String::new(),
+            buf: Vec::new(),
+        }
+    }
+
+    fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> LogLine {
+        let level = match *meta.level() {
+            tracing::Level::ERROR => 1,
+            tracing::Level::WARN => 2,
+            tracing::Level::INFO => 3,
+            tracing::Level::DEBUG => 4,
+            tracing::Level::TRACE => 5,
+        };
+        LogLine {
+            level,
+            target: meta.target().to_owned(),
+            buf: Vec::new(),
+        }
+    }
+}
+
+impl std::io::Write for LogLine {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(b);
+        Ok(b.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for LogLine {
+    fn drop(&mut self) {
+        let Some(sink) = MODULE_LOG.get() else { return };
+        let msg = self.buf.strip_suffix(b"\n").unwrap_or(&self.buf);
+        // SAFETY: the LogSink contract (process-lifetime, any thread); both slices are valid for the call.
+        unsafe {
+            (sink.log)(
+                sink.data,
+                self.level,
+                self.target.as_ptr(),
+                self.target.len(),
+                msg.as_ptr(),
+                msg.len(),
+            )
+        }
+    }
+}
+
 /// A borrowed UTF-8 string for one call.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1269,6 +1357,8 @@ pub struct EvalResultView {
 pub struct WebViewVtable {
     /// The module's [`ABI_ID`]; the only field read before the check.
     pub abi: AbiId,
+    /// Hands the module the process's log sink, right after the check; the module's [`set_log`].
+    pub set_log: unsafe extern "C" fn(sink: LogSink),
     /// `WebEngine::default_user_agent`: the engine's own default UA string into `out` and true; false with the reason in `out` when the engine cannot run (no display, no UI thread). Any thread: the engine is touched on the UI thread only, so a call from another thread
     /// waits until the UI thread's Looper has run it (blocks while the UI thread is blocked).
     pub default_user_agent: unsafe extern "C" fn(out: *mut BytesOut) -> bool,

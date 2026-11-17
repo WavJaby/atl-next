@@ -78,12 +78,7 @@ fn load() -> Result<&'static UiVtable, String> {
         ));
     }
     // SAFETY: the sink is plain data valid for the process; `forward` is callable from any thread.
-    unsafe {
-        (vtable.set_log)(LogSink {
-            data: std::ptr::null_mut(),
-            log: forward,
-        })
-    };
+    unsafe { (vtable.set_log)(sink()) };
     tracing::info!(
         "atl-platform-ui: platform module {path} abi {}",
         abi::ABI_ID
@@ -91,7 +86,15 @@ fn load() -> Result<&'static UiVtable, String> {
     Ok(vtable)
 }
 
-/// One module record into this process's subscriber, at its level (the message already carries its `atl-platform-ui:` prefix where the implementation logs one).
+/// The process's log sink every loaded module gets through its vtable's `set_log` (the UI module here, the web engine module in web_engine.rs).
+pub(crate) fn sink() -> LogSink {
+    LogSink {
+        data: std::ptr::null_mut(),
+        log: forward,
+    }
+}
+
+/// One module record (either module's) into this process's subscriber, at its level (the message carries its own prefix, `atl-platform-ui:` / `webview:`).
 unsafe extern "C" fn forward(
     _data: *mut c_void,
     level: abi::Level,

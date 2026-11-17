@@ -19,6 +19,7 @@ use webkit6::prelude::*;
 
 static VTABLE: WebViewVtable = WebViewVtable {
     abi: abi::ABI_ID,
+    set_log: abi::set_log,
     default_user_agent,
     view_create,
     view_drop,
@@ -52,7 +53,10 @@ pub extern "C" fn atl_webview_entry() -> *const WebViewVtable {
     &VTABLE
 }
 
-const NO_DISPLAY: &[u8] = b"no display: the process has no GTK display (no-UI mode)";
+/// The first view's engine line, then `<major>.<minor>.<micro>` (the window gate's webview `module-log` sub-gate reads this text).
+const ENGINE_LINE_PREFIX: &str = "webview: engine WebKitGTK ";
+
+const NO_DISPLAY: &[u8] =b"no display: the process has no GTK display (no-UI mode)";
 
 unsafe extern "C" fn default_user_agent(out: *mut BytesOut) -> bool {
     let (ok, bytes) = match user_agent() {
@@ -228,6 +232,16 @@ unsafe extern "C" fn view_create(
         unsafe { BytesOut::put_to(err, NO_DISPLAY) };
         return 1;
     }
+    static ENGINE_LINE: std::sync::Once = std::sync::Once::new();
+    // once per process: the engine version, and proof this module's lines reach the app log (abi::set_log; window gate webview `module-log`)
+    ENGINE_LINE.call_once(|| {
+        tracing::info!(
+            "{ENGINE_LINE_PREFIX}{}.{}.{}",
+            webkit6::major_version(),
+            webkit6::minor_version(),
+            webkit6::micro_version()
+        );
+    });
     let web = webkit6::WebView::new();
     if let Some(s) = WebViewExt::settings(&web) {
         s.set_enable_javascript(false);
