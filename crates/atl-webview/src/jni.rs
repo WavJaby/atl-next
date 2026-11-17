@@ -406,6 +406,8 @@ struct Native {
     third_party: Cell<bool>,
     /// WebView.onPause called and onResume not since (WebView.isPaused): the state only; the engine has no per-view pause (webview plan, provider refusals table).
     paused: Cell<bool>,
+    /// Global ref to the carrier SurfaceView (add_carrier), 0 before init; deleted at destroy.
+    carrier: Cell<usize>,
 }
 
 impl Native {
@@ -441,6 +443,8 @@ impl Native {
 /// What the event sink needs: the provider (a weak global ref, so the app's WebView stays collectable).
 struct Shared {
     provider: Cell<usize>,
+    /// The view's sideband key (stream ints `[tag, key]`): names the view in `webview[<key>]:` log lines, so an app with several WebViews shows which one loads what and which one is on screen.
+    id: Cell<i32>,
     /// Copies of the keys the page was given (dispatchKeyEvent's claim), oldest first: (stamp ns, global ref to the KeyEvent copy, action, keycode). An unhandled report names one by its stamp.
     keys: RefCell<VecDeque<(i64, usize, i32, i32)>>,
     /// Keycodes whose press the page left unhandled while their release had not reached the view yet: that release is reported unhandled when it comes.
@@ -544,6 +548,7 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProvid
     }
     let shared = Rc::new(Shared {
         provider: Cell::new(0),
+        id: Cell::new(-1),
         keys: RefCell::default(),
         unhandled_presses: RefCell::default(),
     });
@@ -569,6 +574,8 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProvid
         return NULL;
     }
     let stream = view.sideband_stream();
+    shared.id.set(stream.last().copied().unwrap_or(-1));
+    tracing::info!("webview[{}]: created", shared.id.get());
     let handle: Vec<i32> = [
         std::mem::size_of::<window::native_handle>() as i32, // version: sizeof(native_handle_t), as native_handle_create sets it
         0,                                                   // numFds
@@ -585,6 +592,7 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProvid
         settings: RefCell::new(settings),
         third_party: Cell::new(false),
         paused: Cell::new(false),
+        carrier: Cell::new(0),
     }));
     // SAFETY: just made; the only reference.
     unsafe { &*native }.set_third_party(third_party);
@@ -639,10 +647,18 @@ fn on_event(shared: &Shared, ev: WebEvent) {
     }
     match &ev {
         WebEvent::LoadStarted(url) => {
-            tracing::info!("webview: page started {}", bridge::log_origin(url))
+            tracing::info!(
+                "webview[{}]: page started {}",
+                shared.id.get(),
+                bridge::log_origin(url)
+            )
         }
         WebEvent::LoadFinished(url) => {
-            tracing::info!("webview: page finished {}", bridge::log_origin(url))
+            tracing::info!(
+                "webview[{}]: page finished {}",
+                shared.id.get(),
+                bridge::log_origin(url)
+            )
         }
         _ => {}
     }
@@ -1081,8 +1097,12 @@ fn new_object(env: Env, class: &CStr, sig: &CStr, args: &[jvalue]) -> Obj {
 }
 
 /// Adds the carrier of `provider`'s view: a SurfaceView filling the WebView (WebView is an AbsoluteLayout), whose holder's LayerCallback sets the view's sideband stream on each new Surface.
-/// SurfaceView brings the rest: its layer below the window, the hole hwui leaves there, the transparent region, the layer following the view's position.
-fn add_carrier(env: Env, provider: Obj) {
+/// SurfaceView brings the rest: its layer below the window, the hole hwui leaves there, the layer following the view's position.
+/// A transient view (`ViewGroup.addTransientView`), not a child: drawn and attached with the WebView, but outside getChildCount / getChildAt / removeView*, so the app sees only its own children
+/// as on AOSP (Chromium draws through a functor and adds none). A real child was index 0, and an SDK removing its own loading child by index removed the page (Battle Cats TW consent dialog).
+/// The price: transients are not laid out and get no visibility dispatch, so the provider lays it out ([`Native::carrier`], sizeChanged) and forwards window visibility (onWindowVisibilityChanged);
+/// a hidden ancestor needs nothing: the carrier's RenderNode is not drawn, and SurfaceView.positionLost hides the layer.
+fn add_carrier(env: Env, provider: Obj, n: &Native) {
     jni_call!(env, PushLocalFrame, 16);
     let web_view = object_field(env, provider, c"mWebView", c"Landroid/webkit/WebView;");
     let context = call_obj(
@@ -1104,15 +1124,7 @@ fn add_carrier(env: Env, provider: Obj) {
         c"(Lcom/android/webview/chromium/WebViewProviderImpl;)V",
         &[l(provider)],
     );
-    // ViewGroup.LayoutParams.MATCH_PARENT
-    const MATCH_PARENT: i32 = -1;
-    let params = new_object(
-        env,
-        c"android/view/ViewGroup$LayoutParams",
-        c"(II)V",
-        &[jvalue { i: MATCH_PARENT }, jvalue { i: MATCH_PARENT }],
-    );
-    if !pending(env) && !carrier.is_null() && !callback.is_null() && !params.is_null() {
+    if !pending(env) && !carrier.is_null() && !callback.is_null() {
         let holder = call_obj(
             env,
             carrier,
@@ -1127,15 +1139,28 @@ fn add_carrier(env: Env, provider: Obj) {
             c"(Landroid/view/SurfaceHolder$Callback;)V",
             &[l(callback)],
         );
+        // index 0: drawn before the app's own children, which stay above the page as over Chromium's content
         call_void(
             env,
             web_view,
-            c"addView",
-            c"(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V",
-            &[l(carrier), l(params)],
+            c"addTransientView",
+            c"(Landroid/view/View;I)V",
+            &[l(carrier), jvalue { i: 0 }],
         );
+        if !pending(env) {
+            n.carrier
+                .set(jni_call!(env, NewGlobalRef, carrier) as usize);
+        }
     }
     jni_call!(env, PopLocalFrame, NULL);
+}
+
+/// The carrier, as a local ref (null before init or after destroy).
+fn carrier(env: Env, n: &Native) -> Obj {
+    match n.carrier.get() {
+        0 => NULL,
+        g => jni_call!(env, NewLocalRef, g as Obj),
+    }
 }
 
 /// libandroid's `ANativeWindow_fromSurface` (NDK: the Surface's window, one reference taken), looked up once.
@@ -1242,7 +1267,7 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_init, (en
         return throw(env, c"java/lang/IllegalArgumentException", "Private browsing is not supported in WebView.");
     }
     let provider = jni_call!(env, NewLocalRef, n.shared.provider.get() as Obj);
-    add_carrier(env, provider);
+    add_carrier(env, provider, n);
     delete_local(env, provider);
     if pending(env) {
         return;
@@ -1281,9 +1306,13 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewProviderImpl_destroy(
     jni_call!(env, SetLongField, this, f, 0);
     // SAFETY: the Box createWebView leaked; the field is cleared first, so no native reaches it again.
     let n = unsafe { Box::from_raw(p) };
+    tracing::info!("webview[{}]: destroyed", n.shared.id.get());
     n.set_third_party(false);
     for (_, g, _) in n.interfaces.borrow_mut().drain(..) {
         jni_call!(env, DeleteGlobalRef, g as Obj);
+    }
+    if n.carrier.get() != 0 {
+        jni_call!(env, DeleteGlobalRef, n.carrier.replace(0) as Obj);
     }
     jni_call!(
         env,
@@ -1299,7 +1328,7 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_loadUrl, 
     }
     match string(env, url) {
         Some(u) => {
-            tracing::info!("webview: loadUrl {}", bridge::log_origin(&u));
+            tracing::info!("webview[{}]: loadUrl {}", n.shared.id.get(), bridge::log_origin(&u));
             n.view.load_uri(&u)
         }
         None => tracing::warn!("webview: loadUrl(null) ignored"),
@@ -1316,7 +1345,7 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_loadDataW
     let mime = string(env, mime);
     let encoding = string(env, encoding);
     let base = string(env, base).filter(|b| !b.is_empty());
-    tracing::info!("webview: loadDataWithBaseURL base {}", base.as_deref().map_or("<none>".to_owned(), bridge::log_origin));
+    tracing::info!("webview[{}]: loadDataWithBaseURL base {}", n.shared.id.get(), base.as_deref().map_or("<none>".to_owned(), bridge::log_origin));
     if !history.is_null() {
         crate::refuse("WebViewProvider.loadDataWithBaseURL(historyUrl)");
     }
@@ -1406,6 +1435,36 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_isPaused,
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_setBackgroundColor, (env, n, color: i32) -> () = (), {
     let _ = env;
     n.view.set_background_color(color as u32);
+});
+
+// the carrier is a transient view: the WebView's size and window visibility reach it only through these (add_carrier)
+provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_sizeChanged, (env, n, w: i32, h: i32) -> () = (), {
+    let c = carrier(env, n);
+    if c.is_null() {
+        return;
+    }
+    // View.MeasureSpec.makeMeasureSpec(size, EXACTLY): mode in the top two bits, EXACTLY = 1 << 30
+    const EXACTLY: i32 = 1 << 30;
+    const SIZE_MASK: i32 = (1 << 30) - 1;
+    let spec = |s: i32| jvalue { i: (s & SIZE_MASK) | EXACTLY };
+    call_void(env, c, c"measure", c"(II)V", &[spec(w), spec(h)]);
+    let i = |v: i32| jvalue { i: v };
+    call_void(env, c, c"layout", c"(IIII)V", &[i(0), i(0), i(w), i(h)]);
+    delete_local(env, c);
+});
+
+provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_onWindowVisibilityChanged, (env, n, visibility: i32) -> () = (), {
+    tracing::info!("webview[{}]: window visibility {visibility}", n.shared.id.get());
+    let c = carrier(env, n);
+    if c.is_null() {
+        return;
+    }
+    call_void(env, c, c"dispatchWindowVisibilityChanged", c"(I)V", &[jvalue { i: visibility }]);
+    delete_local(env, c);
+});
+
+provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_viewEvent, (env, n, what: Obj, value: i32) -> () = (), {
+    tracing::info!("webview[{}]: {} {value}", n.shared.id.get(), string(env, what).unwrap_or_default());
 });
 
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_setInitialScale, (env, n, percent: i32) -> () = (), {

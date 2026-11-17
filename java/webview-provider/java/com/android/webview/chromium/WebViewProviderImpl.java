@@ -207,14 +207,17 @@ final class WebViewProviderImpl implements WebViewProvider, WebViewProvider.View
     @Override public void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {}
     @Override public boolean setFrame(int left, int top, int right, int bottom) { return mWebViewPrivate.super_setFrame(left, top, right, bottom); }
     @Override public void setLayoutParams(LayoutParams layoutParams) { mWebViewPrivate.super_setLayoutParams(layoutParams); }
-    // the carrier follows the WebView's layout; the platform sizes the page to the carrier's layer
-    @Override public void onSizeChanged(int w, int h, int ow, int oh) {}
+    // the carrier is a transient view of the WebView (the native init adds it): no layout pass reaches it, the natives size it to the WebView; the platform sizes the page to the carrier's layer
+    @Override public void onSizeChanged(int w, int h, int ow, int oh) { sizeChanged(w, h); }
+    private native void sizeChanged(int w, int h);
     // nothing to draw: the carrier's hole shows the page
     @Override public void onDraw(Canvas canvas) {}
-    @Override public void onAttachedToWindow() {}
-    @Override public void onDetachedFromWindow() {}
-    @Override public void onVisibilityChanged(View changedView, int visibility) {}
-    @Override public void onWindowVisibilityChanged(int visibility) {}
+    // the View-side events that decide whether the carrier is on screen, logged per view by the natives; window visibility is forwarded to the carrier (transients get no visibility dispatch)
+    @Override public void onAttachedToWindow() { viewEvent("attached", 0); }
+    @Override public void onDetachedFromWindow() { viewEvent("detached", 0); }
+    @Override public void onVisibilityChanged(View changedView, int visibility) { viewEvent("visibility", visibility); }
+    @Override public native void onWindowVisibilityChanged(int visibility);
+    private native void viewEvent(String what, int value);
     @Override public void onScrollChanged(int l, int t, int oldl, int oldt) {}
     // Chromium's answer (WebViewChromium.shouldDelayChildPressedState)
     @Override public boolean shouldDelayChildPressedState() { return true; }
@@ -250,7 +253,7 @@ final class WebViewProviderImpl implements WebViewProvider, WebViewProvider.View
     @Override public View findFocus(View originalFocusedView) { return originalFocusedView; }
     @Override public void onStartTemporaryDetach() {}
     @Override public void onFinishTemporaryDetach() {}
-    @Override public void setLayerType(int layerType, Paint paint) {}
+    @Override public void setLayerType(int layerType, Paint paint) { viewEvent("layer type", layerType); }
     @Override public void onConfigurationChanged(Configuration newConfig) { Unimplemented.accept("WebViewProvider.ViewDelegate.onConfigurationChanged"); }
     @Override public native void setBackgroundColor(int color);
     @Override public boolean requestChildRectangleOnScreen(View child, Rect rect, boolean immediate) { Unimplemented.accept("WebViewProvider.ViewDelegate.requestChildRectangleOnScreen"); return false; }
