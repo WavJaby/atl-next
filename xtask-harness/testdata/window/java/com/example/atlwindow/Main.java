@@ -65,6 +65,25 @@ public class Main extends Activity {
         Log.i(TAG, "onNewIntent reached again=" + intent.getBooleanExtra("again", false));
     }
 
+    /* The lifecycle after the desktop's close (capture stage `destroy`): AOSP's removeTask runs pause, stop, destroy in this order before the process ends. */
+    @Override
+    protected void onPause() {
+        super.onPause();
+        Log.i(TAG, "onPause reached");
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        Log.i(TAG, "onStop reached");
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        Log.i(TAG, "onDestroy reached");
+    }
+
     @Override
     protected void onResume() {
         super.onResume();

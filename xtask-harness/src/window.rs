@@ -2193,8 +2193,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             ended = Some(s);
             break;
         }
-        // the app's end is the run's end for a gate, as when atld ended with it; not in the ime stage, whose probe kills the app and relaunches it (its death sub-gate)
-        if !matches!(args.stage, Stage::Ime) && run.app_ended() {
+        // the app's end is the run's end for a gate, as when atld ended with it; not in the ime stage, whose probe kills the app and relaunches it (its death sub-gate), nor in the capture
+        // stage, whose close ends the app (its `ended` sub-gate)
+        if !matches!(args.stage, Stage::Ime | Stage::Capture) && run.app_ended() {
             ended = Some(run.stop(&mut atld_child)?);
             break;
         }

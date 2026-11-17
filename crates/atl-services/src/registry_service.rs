@@ -300,8 +300,7 @@ impl ICompositorRegistry for Registry {
             "services: removeTask task {} of uid {caller_uid}",
             task.raw()
         );
-        // received, not acted on: ending the Task and its process (ActivityTaskSupervisor.removeTask) is not built
-        atl_diag::unimplemented_api!("ICompositorRegistry.REMOVE_TASK");
+        self.activities.remove_task(task);
         Ok(())
     }
 

@@ -761,6 +761,33 @@ impl ActivityTasks {
         self.machine().records(task).any(|(_, o)| o.relaunching)
     }
 
+    /// ActivityTaskSupervisor.removeTask's lifecycle half: every record of `task` finishes (Machine::remove_task). True when the shown, unstopped top must report its destroy before the
+    /// Task's processes end (cleanUpRemovedTask's wait); false: they may end at once. Logged as `activity remove task <id>` before the commands it causes.
+    pub(crate) fn remove_task(&self, task: TaskId) -> bool {
+        let mut m = self.machine();
+        let wait = m.top_visible(task);
+        log(format_args!(
+            "activity remove task {} wait={wait} at={}",
+            task.raw(),
+            atl_diag::wall_stamp()
+        ));
+        let commands = m.remove_task(task);
+        self.note_settle(&m);
+        self.send(commands);
+        wait
+    }
+
+    /// activityDestroyed (Machine::destroyed): the record's Task and whether it has nothing left, so its processes may end; None for no destroying record.
+    pub(crate) fn destroyed(&self, token: &SpIBinder) -> Option<(TaskId, bool)> {
+        self.machine().destroyed(token)
+    }
+
+    /// A record of the process of `thread` is in a Task other than `task` (Machine::holds_other_task).
+    pub(crate) fn holds_other_task(&self, task: TaskId, thread: &SpIBinder) -> bool {
+        self.machine()
+            .holds_other_task(task, |o| o.thread.as_binder() == *thread)
+    }
+
     /// The process of `thread` died: its records leave the stack (Machine::drop_owned).
     pub(crate) fn process_died(&self, thread: &SpIBinder) {
         let mut m = self.machine();

@@ -586,6 +586,8 @@ struct Inner {
     service_calls: active_services::Outbox,
     /// false is the test-only break (`--no-bind-service`): every bindService answers 0 (no such service), so ServiceConnection and the job runner never connect
     bind_services: bool,
+    /// Removed Tasks whose processes wait for the top's activityDestroyed or the timeout (Task.mKillProcessesOnDestroyed)
+    kill_armed: Mutex<std::collections::BTreeSet<TaskId>>,
 }
 
 /// The service; a clone shares it (one is registered with servicemanager, another starts the launcher package).
@@ -688,6 +690,7 @@ impl ActivityManager {
                     pending: PendingIntents::default(),
                     service_calls: active_services::Outbox::new(),
                     bind_services,
+                    kill_armed: Mutex::default(),
                 }
             }),
         }
@@ -821,9 +824,105 @@ impl ActivityManager {
             .find(|r| r.pid == pid)
             .and_then(|r| r.task)
     }
+
+    /// ActivityTaskSupervisor.removeTask(killProcess=true), the desktop window's close (registry REMOVE_TASK): every activity of `task` finishes; its processes end once the shown top
+    /// reported its destroy, at most [`KILL_TASK_PROCESSES_TIMEOUT`] later, or at once when the top was not shown. cleanUpServices is not separate: the kill ends the process's services
+    /// (Q-B1: a foreground service does not keep it, M29).
+    pub(crate) fn remove_task(&self, task: TaskId) {
+        if !self.inner.atm.remove_task(task) {
+            self.inner.kill_task_processes(task);
+            return;
+        }
+        self.inner
+            .kill_armed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(task);
+        let inner = Arc::downgrade(&self.inner);
+        let spawned = std::thread::Builder::new()
+            .name(format!("kill-task-{}", task.raw()))
+            .spawn(move || {
+                std::thread::sleep(KILL_TASK_PROCESSES_TIMEOUT);
+                if let Some(inner) = inner.upgrade() {
+                    inner.kill_task_processes_on_timeout(task);
+                }
+            });
+        if let Err(e) = spawned {
+            log(format_args!("remove task {}: no timer thread: {e}", task.raw()));
+            self.inner.kill_task_processes(task);
+        }
+    }
 }
 
+/// ActivityTaskSupervisor.KILL_TASK_PROCESSES_TIMEOUT_MS: how long a removed Task's processes wait for its shown top's activityDestroyed (AOSP constant, not tuned).
+const KILL_TASK_PROCESSES_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
+
 impl Inner {
+    /// activityDestroyed of `token`: false when no destroying record has it. The last record of a Task gone ends its processes: after a removeTask (the wait ends early, as
+    /// killTaskProcessesOnDestroyedIfNeeded), and after the app finished its last activity itself (M29: ATL's stand-in for the low-memory killer ending a cached process).
+    fn activity_destroyed(&self, token: &SpIBinder) -> bool {
+        match self.atm.destroyed(token) {
+            Some((task, true)) => self.kill_task_processes(task),
+            Some((_, false)) => {}
+            None => return false,
+        }
+        true
+    }
+
+    /// The timer of a removeTask: the processes end now unless the destroy came first (KILL_TASK_PROCESSES_TIMEOUT_MSG).
+    fn kill_task_processes_on_timeout(&self, task: TaskId) {
+        let armed = self
+            .kill_armed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&task);
+        if armed {
+            log(format_args!(
+                "remove task {}: no destroy within {KILL_TASK_PROCESSES_TIMEOUT:?}",
+                task.raw()
+            ));
+            self.kill_task_processes(task);
+        }
+    }
+
+    /// ActivityTaskSupervisor.killTaskProcessesIfPossible: the processes of the Task's package and uid end, unless one of them holds an activity in another Task (then none ends).
+    /// A foreground service does not keep them (Q-B1, M29: nothing on the desktop shows or stops it yet). Killed after the state lock is released.
+    fn kill_task_processes(&self, task: TaskId) {
+        self.kill_armed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&task);
+        let (Some(package), Some(uid)) = (self.tasks.package(task), self.tasks.owner(task)) else {
+            return;
+        };
+        let pids: Vec<i32> = {
+            let st = self.state();
+            let procs: Vec<&ProcessRecord> = st
+                .processes
+                .iter()
+                .filter(|r| r.uid == uid && r.package == package)
+                .collect();
+            let held = procs.iter().any(|r| {
+                r.attached
+                    .as_ref()
+                    .is_some_and(|a| self.atm.holds_other_task(task, &a.thread.as_binder()))
+            });
+            if held {
+                log(format_args!(
+                    "task {} removed: a process of {package} holds another Task, kept",
+                    task.raw()
+                ));
+                return;
+            }
+            procs.iter().map(|r| r.pid).collect()
+        };
+        log(format_args!(
+            "task {} removed: killing {package} pids {pids:?} at={}",
+            task.raw(),
+            atl_diag::wall_stamp()
+        ));
+        self.kill(&pids);
+    }
     /// ActivityRecord.ensureActivityConfiguration for each activity of `task`, at the Task's size now. Reported is recorded before the send, as AOSP's mLastReportedConfiguration.
     /// Each activity is a record of the lifecycle machine (activity_task Owner): one started by startActivity gets the change as the launcher one does; the steps after a relaunch come from its phase.
     fn task_resized(&self, task: TaskId) {
@@ -2712,9 +2811,16 @@ impl IActivityClientController for ActivityClientController {
         Ok(())
     }
 
-    /// ActivityClientController.activityDestroyed (oneway): nothing to do, the record left the stack when its Destroy was sent. Counted.
-    fn r#activityDestroyed(&self, _token: Option<&SpIBinder>) -> binder::Result<()> {
-        atl_diag::answered(ACC, "activityDestroyed (the record left at its Destroy)");
+    /// ActivityClientController.activityDestroyed (oneway): the destroying record goes; the last one of a Task ends the Task's processes (ActivityRecord.destroyed ->
+    /// killTaskProcessesOnDestroyedIfNeeded). Counted when no destroying record has the token.
+    fn r#activityDestroyed(&self, token: Option<&SpIBinder>) -> binder::Result<()> {
+        let known = match (token, self.inner.upgrade()) {
+            (Some(token), Some(inner)) => inner.activity_destroyed(token),
+            _ => false,
+        };
+        if !known {
+            atl_diag::answered(ACC, "activityDestroyed: no such destroying activity");
+        }
         Ok(())
     }
 

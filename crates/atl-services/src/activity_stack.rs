@@ -99,11 +99,14 @@ pub struct Machine<K, O, L, I, R> {
     tasks: BTreeMap<TaskId, Records<K, O, L, I, R>>,
     /// Tasks whose window is hidden (minimized or occluded: one path, `suspended`). Kept while the Task has no records: the window outlives them.
     hidden: BTreeSet<TaskId>,
+    /// Records sent their Destroy and not yet acknowledged (ActivityRecord state DESTROYING): out of the stack, still counted by [`Machine::destroyed`] until `activityDestroyed`.
+    destroying: Vec<(TaskId, K, O)>,
 }
 
 impl<K, O, L, I, R> Default for Machine<K, O, L, I, R> {
     fn default() -> Self {
         Machine {
+            destroying: Vec::new(),
             tasks: BTreeMap::new(),
             hidden: BTreeSet::new(),
         }
@@ -303,7 +306,47 @@ impl<K: Clone + PartialEq, O: Clone, L, I, R> Machine<K, O, L, I, R> {
         for records in self.tasks.values_mut() {
             records.retain(|r| !dead(&r.owner));
         }
+        self.destroying.retain(|(_, _, o)| !dead(o));
         self.tasks.retain(|_, records| !records.is_empty());
+    }
+
+    /// Task.removeActivities for ActivityTaskSupervisor.removeTask: every record of `task` finishes, the top through pause and stop, a stopped one straight to its Destroy.
+    /// Owed results are dropped: their callers are in the same Task and finish too. Empty for an unknown Task.
+    pub fn remove_task(&mut self, task: TaskId) -> Commands<K, O, L, I, R> {
+        let Some(records) = self.tasks.get_mut(&task) else {
+            return Vec::new();
+        };
+        for r in records.iter_mut() {
+            r.finishing = true;
+            r.owed = None;
+            r.results.clear();
+        }
+        self.advance(task)
+    }
+
+    /// The top of `task` is shown and not stopped (ActivityTaskSupervisor.cleanUpRemovedTask: `!top.mAppStopped && top.lastVisibleTime > 0`): a removal then waits for its destroy before the kill.
+    pub fn top_visible(&self, task: TaskId) -> bool {
+        self.is_visible(task)
+            && self.tasks.get(&task).and_then(|r| r.last()).is_some_and(|r| {
+                !matches!(r.phase, Phase::Created | Phase::Stopping | Phase::Stopped)
+            })
+    }
+
+    /// activityDestroyed of `token`: the destroying record goes. Its Task, and true when the Task has nothing left, in the stack or destroying: the Task's processes may end
+    /// (ActivityTaskSupervisor.killTaskProcessesOnDestroyedIfNeeded, which counts the destroying records the same way). None when no destroying record has the token.
+    pub fn destroyed(&mut self, token: &K) -> Option<(TaskId, bool)> {
+        let i = self.destroying.iter().position(|(_, k, _)| k == token)?;
+        let (task, _, _) = self.destroying.remove(i);
+        let empty =
+            !self.tasks.contains_key(&task) && !self.destroying.iter().any(|(t, _, _)| *t == task);
+        Some((task, empty))
+    }
+
+    /// The Tasks other than `task` holding a record of an owner `of` matches (WindowProcessController.shouldKillProcessForRemovedTask: an activity in another Task keeps the process).
+    pub fn holds_other_task(&self, task: TaskId, of: impl Fn(&O) -> bool) -> bool {
+        self.tasks
+            .iter()
+            .any(|(t, records)| *t != task && records.iter().any(|r| of(&r.owner)))
     }
 
     pub fn is_finishing(&self, token: &K) -> Option<bool> {
@@ -454,6 +497,7 @@ impl<K: Clone + PartialEq, O: Clone, L, I, R> Machine<K, O, L, I, R> {
             if records[i].finishing && records[i].phase == Phase::Stopped {
                 let r = records.remove(i);
                 out.push(r.command(vec![Step::Destroy { finished: true }]));
+                self.destroying.push((task, r.token, r.owner));
             } else {
                 i += 1;
             }
@@ -792,6 +836,74 @@ mod tests {
             m.records(task(2)).map(|(k, _)| *k).collect::<Vec<_>>(),
             vec![OTHER]
         );
+    }
+
+    /// removeTask on a resumed top over a stopped record (AOSP Task.removeActivities): the stopped one is destroyed at once, the top pauses, stops and is destroyed; the Task is empty only after both destroy acks.
+    #[test]
+    fn remove_task_finishes_every_record_and_empties_after_the_destroy_acks() {
+        let mut m = Machine::new();
+        let t = task(1);
+        m.push(t, MAIN, APP, "main");
+        m.resumed(&MAIN);
+        m.push(t, OTHER, APP, "other");
+        m.paused(&MAIN);
+        m.resumed(&OTHER);
+        m.stopped(&MAIN);
+        assert!(m.top_visible(t));
+        assert_eq!(
+            sent(&m.remove_task(t)),
+            vec![
+                (OTHER, vec![pause(true, false)]),
+                (MAIN, vec![Step::Destroy { finished: true }])
+            ]
+        );
+        assert_eq!(sent(&m.paused(&OTHER)), vec![(OTHER, vec![Step::Stop])]);
+        assert_eq!(
+            sent(&m.stopped(&OTHER)),
+            vec![(OTHER, vec![Step::Destroy { finished: true }])]
+        );
+        assert_eq!(m.destroyed(&OTHER), Some((t, false)), "MAIN is still destroying");
+        assert_eq!(m.destroyed(&MAIN), Some((t, true)));
+        assert_eq!(m.destroyed(&MAIN), None, "a second ack names no record");
+    }
+
+    /// A hidden or stopped top is not waited for (cleanUpRemovedTask kills at once when the top is stopped).
+    #[test]
+    fn a_hidden_top_is_not_visible_for_removal() {
+        let mut m = Machine::new();
+        let t = task(1);
+        m.push(t, MAIN, APP, "main");
+        m.resumed(&MAIN);
+        m.set_visible(t, false);
+        m.paused(&MAIN);
+        m.stopped(&MAIN);
+        assert!(!m.top_visible(t));
+        assert!(!m.top_visible(task(9)), "unknown Task");
+    }
+
+    /// One process with records in two Tasks: removing one Task keeps the process (shouldKillProcessForRemovedTask); a process only in the removed Task does not hold another.
+    #[test]
+    fn a_record_in_another_task_holds_the_process() {
+        let mut m = Machine::new();
+        m.push(task(1), MAIN, APP, "main");
+        m.push(task(2), OTHER, APP, "other");
+        m.push(task(3), SPLASH, "solo", "splash");
+        assert!(m.holds_other_task(task(1), |o| *o == APP));
+        assert!(!m.holds_other_task(task(3), |o| *o == "solo"));
+    }
+
+    /// A dead owner's destroying records go with it: no destroy ack is waited for from a dead process.
+    #[test]
+    fn drop_owned_forgets_destroying_records() {
+        let mut m = Machine::new();
+        let t = task(1);
+        m.push(t, MAIN, APP, "main");
+        m.resumed(&MAIN);
+        m.finish(&MAIN, |_| "ok");
+        m.paused(&MAIN);
+        m.stopped(&MAIN);
+        m.drop_owned(|o| *o == APP);
+        assert_eq!(m.destroyed(&MAIN), None);
     }
 
     #[test]

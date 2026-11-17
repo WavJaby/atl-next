@@ -588,12 +588,12 @@ impl Window for GtkWindow {
             tracing::info!("atl-platform-ui: focus {active}");
             focused.on_event.call(|f| f(InputEvent::Focus(active)));
         });
-        // the desktop's close (xdg_toplevel.close): reported, then GTK's default closes the window as before (Window::on_close_requested)
+        // the desktop's close (xdg_toplevel.close): reported, and the window stays: Android removes the Task and the window goes with its process (Window::on_close_requested)
         let closing = Rc::clone(&shared);
         window.connect_close_request(move |_| {
             tracing::info!("atl-platform-ui: close requested");
             closing.on_close_requested.call(|f| f());
-            glib::Propagation::Proceed
+            glib::Propagation::Stop
         });
         let resized = Rc::clone(&shared);
         view.connect_allocation(move |size| resized.on_resize.call(|f| f(size)));

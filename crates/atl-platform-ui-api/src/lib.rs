@@ -244,7 +244,7 @@ pub trait Window: FrameClock + InputSource + Sized {
     fn on_monitor<F: FnMut(Monitor) + 'static>(&self, on_monitor: F);
 
     /// Calls `on_close_requested` each time the desktop asks to close the window (its close button, a shortcut; Wayland `xdg_toplevel.close`), replacing the previous callback.
-    /// The toolkit still closes the window after the call: nothing on Android's side removes it yet.
+    /// The toolkit never closes the window itself: the caller removes it (Android ends the Task and its process).
     fn on_close_requested<F: FnMut() + 'static>(&self, on_close_requested: F);
 }
 

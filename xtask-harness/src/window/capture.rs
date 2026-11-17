@@ -6,7 +6,8 @@
 //! (Main.java `logComposer`) and logs the status: an app uid must be refused with SECURITY (AOSP: captureDisplay needs READ_FRAME_BUFFER). `--break-capture-caller` expects `ok` instead,
 //! so (b) fails on the real refusal: a harness-side break, the registry is not changed.
 //! (c) the probe sends `xdg_toplevel.close`: the services must receive the composer's REMOVE_TASK for the fixture's Task (`close`), and must have refused and counted the fixture's own REMOVE_TASK
-//! naming a Task its uid does not own (`foreign`, Main.java `removeForeignTask`): the ownership refusal is the row's break, built into the run.
+//! naming a Task its uid does not own (`foreign`, Main.java `removeForeignTask`): the ownership refusal is the row's break, built into the run. Then AOSP's removeTask: the fixture runs
+//! onPause, onStop, onDestroy in that order (`destroy`), and the services kill its process once it reported the destroy, not by the 1000 ms timeout, and every pid they killed is gone (`ended`).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -25,8 +26,16 @@ const COMPOSER_LINE: &str = "composer GET_COMPOSER status=";
 const SENT_LINE: &str = "task sender: REMOVE_TASK task ";
 /// The services' line for a REMOVE_TASK they took (registry_service.rs `remove_task`): `services: removeTask task <n> of uid <uid>`.
 const REMOVED_LINE: &str = "services: removeTask task ";
-/// Its count: received, not acted on yet (registry_service.rs).
-const REMOVED_COUNT: &str = "unimplemented ICompositorRegistry.REMOVE_TASK";
+/// The fixture's lifecycle lines after the close (Main.java), in AOSP's removeTask order: pause, stop, destroy.
+const LIFECYCLE: [&str; 3] = ["onPause reached", "onStop reached", "onDestroy reached"];
+/// The services' removeTask line (activity_task.rs `remove_task`): `activity remove task <n> wait=<bool> at=<s>`.
+const REMOVE_LINE: &str = "activity remove task ";
+/// The services' kill line (activity.rs `kill_task_processes`): `task <n> removed: killing <package> pids [<pid>, ..] at=<s>`.
+const KILLED_LINE: &str = " removed: killing ";
+/// The timer's line when no destroy came within KILL_TASK_PROCESSES_TIMEOUT (activity.rs `kill_task_processes_on_timeout`).
+const TIMED_OUT: &str = ": no destroy within ";
+/// How long a killed pid may take to disappear: atld SIGKILLs the sandbox and its reaper thread waits on it; generous for a loaded host.
+const GONE_WAIT: Duration = Duration::from_secs(5);
 /// The reply hook's count of a refused REMOVE_TASK, and the cause naming the fixture's foreign Task (Main.java FOREIGN_TASK = i32::MAX).
 const FOREIGN_REFUSAL: &str = "status:PERMISSION_DENIED ICompositorRegistry.REMOVE_TASK";
 const FOREIGN_CAUSE: &str = "does not own task 2147483647";
@@ -58,6 +67,9 @@ pub(super) struct Seen {
     /// Capture (c): the desktop's close reached the services as REMOVE_TASK, and the foreign one was refused.
     pub(super) close: Option<Result<String, String>>,
     pub(super) foreign: Option<Result<String, String>>,
+    /// Capture (c) after the removal: the lifecycle order, and the kill with its pids gone.
+    pub(super) destroy: Option<Result<String, String>>,
+    pub(super) ended: Option<Result<String, String>>,
 }
 
 /// What a probe needs from the run: atld's root and the app's package (the capture route), where atld writes the bytes, and where its pictures go.
@@ -243,11 +255,23 @@ pub(super) fn drive(
     proxy.inject_toplevel_close().map_err(|e| e.to_string())?;
     // the line, not its arguments: a removal the registry refused never writes it, and close_judged names what is missing
     wait_for_line(services_log, REMOVED_LINE, CLOSE_WAIT);
+    wait_for_line(services_log, KILLED_LINE, CLOSE_WAIT);
     let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
-    let (app, services) = (read(app_log), read(services_log));
+    let services = read(services_log);
+    let still = killed_pids(&services).map(|pids| {
+        let alive = |pid: &i32| Path::new(&format!("/proc/{pid}")).exists();
+        let deadline = Instant::now() + GONE_WAIT;
+        while pids.iter().any(alive) && Instant::now() < deadline {
+            std::thread::sleep(ATTEMPT_GAP);
+        }
+        pids.into_iter().filter(|p| alive(p)).collect::<Vec<_>>()
+    });
+    let app = read(app_log);
     if let Ok(mut seen) = probe.seen.lock() {
         seen.close = Some(close_judged(&app, &services));
         seen.foreign = Some(foreign_judged(&services));
+        seen.destroy = Some(destroy_judged(&app));
+        seen.ended = Some(ended_judged(&services, still));
     }
     Ok(Liveness {
         answered,
@@ -273,12 +297,61 @@ fn close_judged(app: &str, services: &str) -> Result<String, String> {
             "the services never took REMOVE_TASK of task {sent} from uid {uid} (want `{want}`)"
         ));
     }
-    if !services.contains(REMOVED_COUNT) {
-        return Err(format!("no `{REMOVED_COUNT}` count in the services log"));
+    Ok(format!("REMOVE_TASK task {sent} of uid {uid} taken"))
+}
+
+/// Sub-gate (c) destroy: after the composer sent REMOVE_TASK the fixture logged onPause, onStop, onDestroy, in that order (Task.removeActivities -> finishIfPossible on the resumed top).
+fn destroy_judged(app: &str) -> Result<String, String> {
+    let after = app
+        .split_once(SENT_LINE)
+        .map(|(_, rest)| rest)
+        .ok_or("xdg_toplevel.close: the composer sent no REMOVE_TASK")?;
+    let mut at = 0;
+    for step in LIFECYCLE {
+        at += after[at..]
+            .find(step)
+            .ok_or_else(|| format!("no `{step}` after REMOVE_TASK in the order {LIFECYCLE:?}"))?;
     }
-    Ok(format!(
-        "REMOVE_TASK task {sent} of uid {uid} received and counted"
-    ))
+    Ok("onPause, onStop, onDestroy after REMOVE_TASK".to_owned())
+}
+
+/// The pids of the services' kill line; None when there is none.
+fn killed_pids(services: &str) -> Option<Vec<i32>> {
+    let line = services.lines().find(|l| l.contains(KILLED_LINE))?;
+    let list = line.split_once(" pids [")?.1.split_once(']')?.0;
+    list.split(',')
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| p.trim().parse().ok())
+        .collect()
+}
+
+/// The `at=` wall stamp of the first line holding `needle`, seconds.
+fn stamp(text: &str, needle: &str) -> Option<f64> {
+    text.lines()
+        .find(|l| l.contains(needle))
+        .and_then(|l| word(l, "at"))
+        .and_then(|s| s.parse().ok())
+}
+
+/// Sub-gate (c) ended: the services killed the Task's process (at least one pid) after its destroy report, not by the timeout, and every pid is gone. `still`: the pids alive
+/// [`GONE_WAIT`] after the kill line, None when there is no kill line. Reports the remove -> kill latency.
+fn ended_judged(services: &str, still: Option<Vec<i32>>) -> Result<String, String> {
+    let still = still.ok_or_else(|| format!("no `{KILLED_LINE}` line in the services log"))?;
+    let pids = killed_pids(services).unwrap_or_default();
+    if pids.is_empty() {
+        return Err("the kill line names no pid".to_owned());
+    }
+    if let Some(l) = services.lines().find(|l| l.contains(TIMED_OUT)) {
+        return Err(format!("killed by the timeout, not after onDestroy: {}", l.trim()));
+    }
+    if !still.is_empty() {
+        return Err(format!("pids {still:?} still alive {GONE_WAIT:?} after the kill"));
+    }
+    let latency = match (stamp(services, REMOVE_LINE), stamp(services, KILLED_LINE)) {
+        (Some(a), Some(b)) => format!("{:.0} ms", (b - a) * 1000.0),
+        _ => "unknown".to_owned(),
+    };
+    Ok(format!("pids {pids:?} killed after onDestroy and gone; remove -> kill {latency}"))
 }
 
 /// Sub-gate (c) foreign: the fixture's REMOVE_TASK naming a Task its uid does not own (Main.java FOREIGN_TASK) was refused and counted, its cause naming that Task.
@@ -334,12 +407,19 @@ pub(super) fn checks(
         .ok()
         .map(|s| (s.close.clone(), s.foreign.clone()))
         .unwrap_or_default();
+    let (destroy, ended) = seen
+        .lock()
+        .ok()
+        .map(|s| (s.destroy.clone(), s.ended.clone()))
+        .unwrap_or_default();
     let never = || Err("the probe never closed the window".to_owned());
     vec![
         ("capture", judged(seen, 0, opening, false)),
         ("refused", refusal),
         ("close", close.unwrap_or_else(never)),
         ("foreign", foreign.unwrap_or_else(never)),
+        ("destroy", destroy.unwrap_or_else(never)),
+        ("ended", ended.unwrap_or_else(never)),
         (
             "pong",
             match liveness {
@@ -359,16 +439,15 @@ mod tests {
 
     /// Log lines in the forms the composer, the fixture and the services write them (task_sender.rs, Main.java, registry_service.rs, atl-diag `line`).
     const APP: &str = "I AtlWindow: composer GET_COMPOSER status=SECURITY uid=10001\nI atl-composer: task sender: REMOVE_TASK task 1\n";
-    const TAKEN: &str = "services: removeTask task 1 of uid 10001\ndiag: first unimplemented ICompositorRegistry.REMOVE_TASK 1 at=1.000\n";
+    const TAKEN: &str = "services: removeTask task 1 of uid 10001\n";
     const REFUSED: &str = "diag: first status:PERMISSION_DENIED ICompositorRegistry.REMOVE_TASK 1 at=1.000 cause=uid 10001 does not own task 2147483647\n";
 
-    /// The close passes on the same Task and uid, counted; another Task, another uid or no count fails it.
+    /// The close passes on the same Task and uid; another Task or another uid fails it.
     #[test]
-    fn close_needs_the_sent_task_from_the_fixture_uid_counted() {
+    fn close_needs_the_sent_task_from_the_fixture_uid() {
         assert!(close_judged(APP, TAKEN).is_ok());
         assert!(close_judged(APP, &TAKEN.replace("task 1 ", "task 2 ")).is_err());
         assert!(close_judged(APP, &TAKEN.replace("uid 10001", "uid 10002")).is_err());
-        assert!(close_judged(APP, "services: removeTask task 1 of uid 10001\n").is_err());
         assert!(
             close_judged(
                 "I AtlWindow: composer GET_COMPOSER status=SECURITY uid=10001\n",
@@ -384,5 +463,35 @@ mod tests {
         assert!(foreign_judged(REFUSED).is_ok());
         assert!(foreign_judged(TAKEN).is_err());
         assert!(foreign_judged(&REFUSED.replace("2147483647", "1")).is_err());
+    }
+
+    /// The lifecycle must follow REMOVE_TASK in pause, stop, destroy order; a missing or reordered step fails, as does a lifecycle logged only before the close.
+    #[test]
+    fn destroy_needs_pause_stop_destroy_after_the_close() {
+        let ordered = format!(
+            "{APP}I AtlWindow: onPause reached\nI AtlWindow: onStop reached\nI AtlWindow: onDestroy reached\n"
+        );
+        assert!(destroy_judged(&ordered).is_ok());
+        assert!(destroy_judged(&ordered.replace("I AtlWindow: onStop reached\n", "")).is_err());
+        let swapped = format!(
+            "{APP}I AtlWindow: onPause reached\nI AtlWindow: onDestroy reached\nI AtlWindow: onStop reached\n"
+        );
+        assert!(destroy_judged(&swapped).is_err());
+        let before = "I AtlWindow: onPause reached\nI AtlWindow: onStop reached\nI AtlWindow: onDestroy reached\nI atl-composer: task sender: REMOVE_TASK task 1\n";
+        assert!(destroy_judged(before).is_err());
+    }
+
+    /// The kill line in the form activity.rs writes it; a timeout kill, a survivor, no kill line or no pid fails the row. 250 ms = the two stamps' difference.
+    #[test]
+    fn ended_needs_a_kill_after_destroy_with_every_pid_gone() {
+        let killed = "services: activity remove task 1 wait=true at=10.000\nservices: task 1 removed: killing com.example.atlwindow pids [4242] at=10.250\n";
+        assert_eq!(killed_pids(killed), Some(vec![4242]));
+        let ok = ended_judged(killed, Some(vec![])).expect("a kill after destroy, its pid gone");
+        assert!(ok.contains("250 ms"), "{ok}");
+        assert!(ended_judged(killed, Some(vec![4242])).is_err());
+        assert!(ended_judged(killed, None).is_err());
+        assert!(ended_judged(&killed.replace("[4242]", "[]"), Some(vec![])).is_err());
+        let timed = format!("{killed}services: remove task 1: no destroy within 1s\n");
+        assert!(ended_judged(&timed, Some(vec![])).is_err());
     }
 }
