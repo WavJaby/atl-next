@@ -671,7 +671,23 @@ public class Main extends Activity {
 
     /** Small system-service answers games read, one field each: what the call returned, or the throwable's simple name. */
     private String sysAnswers() {
-        return "checksums=" + checksums() + " " + audio();
+        return "checksums=" + checksums() + " " + audio() + " " + installer();
+    }
+
+    /** The fixture's own installer of record: getInstallerPackageName, then getInstallSourceInfo's installing / initiating package ("nosource" for a null InstallSourceInfo). */
+    private String installer() {
+        String out;
+        try {
+            out = "installer=" + getPackageManager().getInstallerPackageName(getPackageName());
+        } catch (Throwable t) {
+            out = "installer=" + t.getClass().getSimpleName();
+        }
+        try {
+            android.content.pm.InstallSourceInfo s = getPackageManager().getInstallSourceInfo(getPackageName());
+            return out + " source=" + (s == null ? "nosource" : s.getInstallingPackageName() + "/" + s.getInitiatingPackageName());
+        } catch (Throwable t) {
+            return out + " source=" + t.getClass().getSimpleName();
+        }
     }
 
     /** AudioManager as games read it before playing: STREAM_MUSIC volume / max, ringer mode, audio mode. */

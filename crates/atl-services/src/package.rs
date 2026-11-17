@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Derived from the Android Open Source Project: frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java, frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java, frameworks/base/services/core/java/com/android/server/pm/IPackageManagerBase.java, frameworks/base/services/core/java/com/android/server/pm/parsing/PackageInfoUtils.java
 //! IPackageManager, subset: getApplicationInfo, getPackageInfo, getActivityInfo, getServiceInfo, getProviderInfo, resolveContentProvider, hasSystemFeature, getSystemAvailableFeatures, getPackagesForUid, notifyDexLoad,
-//! getInstrumentationInfoAsUser, queryInstrumentationAsUser, checkSignatures, queryIntentServices, queryIntentActivities, resolveIntent, requestPackageChecksums. Every other method is counted unimplemented (counters).
+//! getInstrumentationInfoAsUser, queryInstrumentationAsUser, checkSignatures, queryIntentServices, queryIntentActivities, resolveIntent, requestPackageChecksums, getInstallerPackageName, getInstallSourceInfo. Every other method is counted unimplemented (counters).
 //! Every answer is a clone of the installer's PackageInfo (crate::packages) cut to the caller's flags: GET_META_DATA, MATCH_DISABLED_COMPONENTS, and getPackageInfo's GET_<component> / GET_PERMISSIONS.
 //! One user (0): a userId other than 0 is a user that does not exist. `sharedLibraryFiles` is always filled (ActivityManagerService's STOCK_PM_FLAGS asks for it on every app path).
 
@@ -11,8 +11,8 @@ use std::sync::Arc;
 use atl_aidl::aidl::android::content::pm::IOnChecksumsReadyListener::IOnChecksumsReadyListener;
 use atl_aidl::aidl::android::content::pm::IPackageManager::{EnforcePermission, IPackageManager};
 use atl_parcelables::android::content::pm::{
-    ActivityInfo, ApplicationInfo, FeatureInfo, InstrumentationInfo, PackageInfo,
-    ParceledListSlice, ProviderInfo, ServiceInfo,
+    ActivityInfo, ApplicationInfo, FeatureInfo, InstallSourceInfo, InstrumentationInfo,
+    PackageInfo, ParceledListSlice, ProviderInfo, ServiceInfo,
 };
 use atl_parcelables::android::content::{ComponentName, Intent};
 use atl_parcelables::codecs::android::content::pm::PackageInfo::{Signature, SigningDetails};
@@ -893,6 +893,32 @@ impl IPackageManager for PackageManager {
             p1.info.signing_info.as_ref(),
             p2.info.signing_info.as_ref(),
         ))
+    }
+
+    /// ComputerEngine.getInstallerPackageName:5128 for the caller's own user (IPackageManagerBase: UserHandle.getCallingUserId): IllegalArgumentException for a package the caller may not see,
+    /// else the installer of record. ATL installs carry none (no installer app: the `adb install` case), so null; never a store name (no store certification is claimed).
+    fn r#getInstallerPackageName(&self, name: Option<&str>) -> binder::Result<Option<String>> {
+        let uid = ThreadState::get_calling_uid();
+        let user = i32::try_from(permission::user_id(uid)).unwrap_or(i32::MAX);
+        if self.visible(name, user).is_none() {
+            return Err(Status::new_exception_str(
+                ExceptionCode::ILLEGAL_ARGUMENT,
+                Some(format!("Unknown package: {}", name.unwrap_or_default())),
+            ));
+        }
+        Ok(None)
+    }
+
+    /// ComputerEngine.getInstallSourceInfo: null for a package the caller may not see, else the install source with each package name the caller cannot see nulled. ATL records no installer,
+    /// initiator, originator or update owner (an `adb install`'s initiator, com.android.shell, is not installed here, so it is filtered to null too) and PACKAGE_SOURCE_UNSPECIFIED (0).
+    fn r#getInstallSourceInfo(
+        &self,
+        name: Option<&str>,
+        user: i32,
+    ) -> binder::Result<Option<InstallSourceInfo>> {
+        Ok(self
+            .visible(name, user)
+            .map(|_| InstallSourceInfo::default()))
     }
 
     /// PMS.requestChecksumsInternal:1372: NameNotFound for a package the caller may not see, else ApkChecksums.getChecksums over the APK files delivers through the (oneway) listener. Answered

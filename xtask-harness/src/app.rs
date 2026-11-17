@@ -353,7 +353,10 @@ const PROCESSES_WANT: &str = "count=1 own=1 uid=true name=true pkg=true importan
 const SYSANSWERS: &str = "AtlTest: sysanswers: ";
 /// - `volume=5 max=15 ringer=2 mode=0`: a fresh device's STREAM_MUSIC (AudioSystem.DEFAULT_STREAM_VOLUME[3] = 5, AudioService.MAX_STREAM_VOLUME[3] = 15), RINGER_MODE_NORMAL (2),
 ///   MODE_NORMAL (0). Before: all four 0 (UNKNOWN_TRANSACTION's empty reply), i.e. muted and RINGER_MODE_SILENT.
-const SYSANSWERS_WANT: &str = "checksums=0 volume=5 max=15 ringer=2 mode=0";
+/// - `installer=null source=null/null`: an install with no installer of record (the `adb install` case, ComputerEngine.getInstallerPackageName / getInstallSourceInfo): no installer, and an
+///   InstallSourceInfo whose installing and initiating packages are null. Before: the same null installer, but a null InstallSourceInfo (`nosource`), which AOSP gives only for an unknown package.
+const SYSANSWERS_WANT: &str =
+    "checksums=0 volume=5 max=15 ringer=2 mode=0 installer=null source=null/null";
 /// Main.settings' line, answered by AOSP SettingsProvider in its own process (`id=<s> again=<b> screen_off=<s> auto_time=<s> rotation=<s>`, [`settings_why`]).
 const SETTINGS: &str = "AtlTest: settings: ";
 /// The line after `id=`: the defaults DatabaseHelper loads from SettingsProvider's res/values/defaults.xml -- def_screen_off_timeout 60000, def_auto_time true (loadBooleanSetting writes "1"),

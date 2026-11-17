@@ -249,6 +249,10 @@ public class ParcelTruth {
         check("ParsedIntentInfo:plain", new ParsedIntentInfoImpl(), ParsedIntentInfoImpl.CREATOR);
         check("ComponentName", new ComponentName("com.example.app", "com.example.app.Runner"), ComponentName.CREATOR);
         check("ConfigurationInfo", configurationInfo(), ConfigurationInfo.CREATOR);
+        // IPackageManager.getInstallSourceInfo: every name set (String8 update owner included) and a package source; then the services' answer, all null (no installer of record)
+        check("InstallSourceInfo", new android.content.pm.InstallSourceInfo("com.example.init", null, "com.example.orig", "com.example.inst", "com.example.owner", 3),
+                android.content.pm.InstallSourceInfo.CREATOR);
+        check("InstallSourceInfo:none", new android.content.pm.InstallSourceInfo(null, null, null, null, null, 0), android.content.pm.InstallSourceInfo.CREATOR);
         check("UserInfo", userInfo(), android.content.pm.UserInfo.CREATOR);
         check("InstrumentationInfo", instrumentationInfo(ai), InstrumentationInfo.CREATOR);
         // IPackageManager.queryInstrumentationAsUser's reply: the inline list, its element class written once
