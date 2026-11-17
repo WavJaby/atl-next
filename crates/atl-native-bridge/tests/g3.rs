@@ -5,6 +5,7 @@
 //! - A, always: guest = `g3_guest_load` below on a stand-in guest TCB: `mov (%rdi), %eax` faults on NULL; the handler records its FS, sets RAX = 41, skips the 2-byte load; the guest adds 1 and stores the FS it resumed on. Want: handler FS = host, resumed FS = guest, return 42.
 //! - Control (the probe responds), always: the same fault with the handler installed by plain `sigaction`, no engine entry -> the handler must see the guest FS.
 //! - B, with a native-bridge build: guest bionic `strlen(NULL)`; the handler emulates a return (RIP = [RSP], RSP += 8, RAX = 7), valid while the fault is before strlen's first push (bionic x86_64 SSE2 strlen pushes nothing). Want: handler FS = host, 7, the guest FS the crossing saw at return = the guest TCB, host intact.
+//! - C, with a native-bridge build: guest `sigaction(SIGSEGV, NULL, &old)`, then guest code calls `old.sa_sigaction` (a guest crash reporter chaining to the action it replaced), with the host handler unwrapped and then wrapped. Want: never the raw host address; one address both times; the handler runs once, on the host FS.
 //!
 //! The handler touches no TLS (atomics, `rdfsbase`, the ucontext), so the control is safe on the guest FS.
 #![allow(
@@ -19,7 +20,7 @@ use std::ffi::c_void;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use atl_native_bridge::engine::{self, Engine, HostThread, Tp, identity};
+use atl_native_bridge::engine::{self, Engine, Guest, HostThread, Tp, identity};
 use common::{host_intact, need};
 
 /// Words of the stand-in guest TCB of stage A (as g1 stage 0).
@@ -181,24 +182,25 @@ fn control() -> Result<(), String> {
     Ok(())
 }
 
-fn stage_b(env: &common::Nb) -> Result<(), String> {
-    let self0 = common::self0();
-    let host = identity::fs_base();
-    let mut g = common::start(env)?;
-    host_intact(&g, self0, host, "__linker_init")?;
-    engine::install_signal(libc::SIGSEGV, on_segv)?;
+/// Guest libc's `name` (`__loader_dlopen("libc.so")` + `__loader_dlsym`); 0 when absent.
+fn guest_libc(g: &mut Guest, name: &std::ffi::CStr) -> Result<usize, String> {
     let dlopen = need(&g.linker, "__dl___loader_dlopen")?;
     let dlsym = need(&g.linker, "__dl___loader_dlsym")?;
     // SAFETY: __loader_dlopen / __loader_dlsym (const char*, int | const char*, const void* caller).
-    let strlen = unsafe {
+    Ok(unsafe {
         let h = g.call(
             dlopen,
             c"libc.so".as_ptr() as usize,
             common::RTLD_NOW,
             g.exe_entry,
         );
-        g.call(dlsym, h, c"strlen".as_ptr() as usize, g.exe_entry)
-    };
+        g.call(dlsym, h, name.as_ptr() as usize, g.exe_entry)
+    })
+}
+
+fn stage_b(g: &mut Guest, self0: libc::pthread_t, host: usize) -> Result<(), String> {
+    engine::install_signal(libc::SIGSEGV, on_segv)?;
+    let strlen = guest_libc(g, c"strlen")?;
     if strlen == 0 {
         return Err("stage B: guest dlsym(strlen) = NULL".into());
     }
@@ -208,7 +210,7 @@ fn stage_b(env: &common::Nb) -> Result<(), String> {
     let before = HITS.load(Ordering::SeqCst);
     // SAFETY: strlen(NULL) faults on its first load; the handler emulates its return.
     let ret = unsafe { g.call(strlen, 0, 0, 0) };
-    host_intact(&g, self0, host, "guest strlen(NULL)")?;
+    host_intact(g, self0, host, "guest strlen(NULL)")?;
     if HITS.load(Ordering::SeqCst) != before + 1 {
         return Err("stage B: the handler did not run once".into());
     }
@@ -233,16 +235,105 @@ fn stage_b(env: &common::Nb) -> Result<(), String> {
     Ok(())
 }
 
+/// Stage C: guest `sigaction(SIGSEGV, NULL, &old)` then a call of `old.sa_sigaction` from guest code, as a guest crash reporter chains to the action it replaced.
+/// Twice: first with the host handler installed unwrapped (plain `sigaction`: the old action is the handler itself), then wrapped (the guest sigaction rewrapped it: the old action is the arch's entry, which must answer what it wraps). Both must name one guest-callable address that runs the handler on the host FS.
+fn stage_c(g: &mut Guest, self0: libc::pthread_t, host: usize) -> Result<(), String> {
+    let sigaction = guest_libc(g, c"sigaction")?;
+    if sigaction == 0 {
+        return Err("stage C: guest dlsym(sigaction) = NULL".into());
+    }
+    install_plain()?;
+    let tp = g.thread().guest_tp();
+    // SAFETY: C records for which all-zero is a valid value.
+    let (mut info, mut uc): (libc::siginfo_t, libc::ucontext_t) =
+        unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
+    let mut seen = [0usize; 2];
+    for (i, how) in ["unwrapped", "wrapped"].iter().enumerate() {
+        // bionic LP64 struct sigaction: flags, handler, mask, restorer (signal.rs `BionicSigaction`)
+        let mut old = [0usize; 4];
+        // SAFETY: bionic `int sigaction(int, const struct sigaction*, struct sigaction*)`; `old` is its 4-word out record.
+        let rc = unsafe {
+            g.call(
+                sigaction,
+                libc::SIGSEGV as usize,
+                0,
+                old.as_mut_ptr() as usize,
+            )
+        };
+        host_intact(g, self0, host, "guest sigaction")?;
+        if rc as u32 != 0 {
+            return Err(format!("stage C ({how}): guest sigaction returned {rc}"));
+        }
+        let handler = old[1];
+        if handler == on_segv as *const () as usize {
+            return Err(format!(
+                "stage C ({how}): the guest's old action is the raw host handler {handler:#x}"
+            ));
+        }
+        reset();
+        MODE.store(0, Ordering::SeqCst);
+        let before = HITS.load(Ordering::SeqCst);
+        // SAFETY: the old action's handler, called from guest code as a chaining guest handler does, with a zeroed siginfo / ucontext (on_segv's stage A mode only rewrites the ucontext's registers).
+        unsafe {
+            g.call(
+                handler,
+                libc::SIGSEGV as usize,
+                &raw mut info as usize,
+                &raw mut uc as usize,
+            )
+        };
+        host_intact(g, self0, host, "guest call of the old action")?;
+        if HITS.load(Ordering::SeqCst) != before + 1 {
+            return Err(format!(
+                "stage C ({how}): old action {handler:#x} did not reach the host handler once"
+            ));
+        }
+        let hfs = HANDLER_FS.load(Ordering::SeqCst);
+        if hfs != host {
+            return Err(format!(
+                "stage C ({how}): host handler ran on FS {hfs:#x}, host {host:#x} (guest {tp:#x})"
+            ));
+        }
+        seen[i] = handler;
+    }
+    if seen[0] != seen[1] {
+        return Err(format!(
+            "stage C: old action {:#x} unwrapped, {:#x} wrapped: the entry must answer what it wraps",
+            seen[0], seen[1]
+        ));
+    }
+    println!(
+        "g3: stage C ok: guest old action {:#x} runs the host handler on host FS {host:#x}",
+        seen[0]
+    );
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let mut v = common::Verdict::new("g3");
     v.stage(Some(stage_a()));
     v.stage(Some(control()));
-    v.stage(match common::nb_env() {
-        Some(env) => Some(stage_b(&env)),
-        None => {
-            println!("g3: stage B SKIP (ATL_NB / ATL_NB_LIBCXX unset)");
-            None
-        }
+    let Some(env) = common::nb_env() else {
+        println!("g3: stage B, C SKIP (ATL_NB / ATL_NB_LIBCXX unset)");
+        v.stage(None);
+        v.stage(None);
+        return v.finish();
+    };
+    let self0 = common::self0();
+    let host = identity::fs_base();
+    let started = common::start(&env).and_then(|g| {
+        host_intact(&g, self0, host, "__linker_init")?;
+        Ok(g)
     });
+    match started {
+        Ok(mut g) => {
+            v.stage(Some(stage_b(&mut g, self0, host)));
+            v.stage(Some(stage_c(&mut g, self0, host)));
+        }
+        Err(e) => {
+            v.stage(Some(Err(e.clone())));
+            v.stage(Some(Err(e)));
+        }
+    }
     v.finish()
 }

@@ -2,14 +2,15 @@
 //! Signals under one process-wide kernel action table shared by host and guest.
 //! Host handlers (ART's sigchain `SignalChain::Handler` above all) assume the host thread pointer, but a signal hitting guest code arrives on the guest's: x86_64 `rt_sigreturn` restores no FS base, and nothing between kernel and handler switches it. So every installed kernel handler is re-wrapped at kernel level (`rewrap_all`): raw `rt_sigaction` reads each action, a handler that is not the arch's signal entry moves into the entry's table and the entry takes its place; the entry switches to host FS, calls it, restores the interrupted FS. Rewrap points: NB `initialize` (after ART's `FaultManager::Init`), each guest library load, and the host side of guest `sigaction`. Gap: a host library calling `sigaction` after the last point leaves its handler unwrapped (plan D6 (a)).
 //! The entry decides from the interrupted FS alone (identity/mod.rs `atl_nb_signal_entry`): host TCB -> as is; guest TCB -> its record's host FS. GS is ART's `Thread*`, never read or written.
-//! Guest `sigaction` / `sigaction64` (bionic's own is a raw syscall): NBS stubs (patch 0003) -- bionic's `sigaction.o` defines only these two, so the guest libc's archive link never pulls it and bionic needs no patch (measured: shipped libc's `sigaction` = `jmp sigaction_stub`). The guest handler is registered with sigchain's `sigaction`, so ART keeps its claimed signals first; the host side runs it on the guest thread pointer through `guest_handler`. Old actions naming `guest_handler` are answered with the guest handler they stand for (as Berberis `guest_signal_action.cc` does).
+//! Guest `sigaction` / `sigaction64` (bionic's own is a raw syscall): NBS stubs (patch 0003) -- bionic's `sigaction.o` defines only these two, so the guest libc's archive link never pulls it and bionic needs no patch (measured: shipped libc's `sigaction` = `jmp sigaction_stub`). The guest handler is registered with sigchain's `sigaction`, so ART keeps its claimed signals first; the host side runs it on the guest thread pointer through `guest_handler`. Old actions are answered with what the guest can call (`guest_view`): `guest_handler` -> the guest handler it stands for (as Berberis `guest_signal_action.cc` does), a host handler -> a thunk up to it, never a raw host address.
 
 use std::ffi::{c_int, c_void};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use super::objects::Sig;
 use super::thread::layout::identity as layout;
-use super::{call_guest, identity, thread};
+use super::{call_guest, identity, proc, thread};
 
 /// bionic LP64 `struct sigaction` / `sigaction64` (bits/signal_types.h `__SIGACTION_BODY`), offsets gated against the generated layout.
 #[repr(C)]
@@ -162,6 +163,27 @@ extern "C" fn guest_handler(sig: c_int, info: *mut libc::siginfo_t, uc: *mut c_v
     }
 }
 
+/// The handler a guest old action names for host handler `h` of `sig`: SIG_DFL / SIG_IGN as they are; `guest_handler` -> the guest handler it stood for (`prev_guest`); the arch's signal entry -> what it wraps (rewrap_all moved it); any other host function -> a thunk crossing up to it (proc.rs `guest_address`).
+/// Why: guest crash reporters chain to the old action by calling it from their handler; a raw host address runs host code on the guest thread pointer, and glibc's first `%fs:` read faults inside the handler with the signal blocked (Alto's Odyssey 2026-11-17: SIGSEGV's old action was the host chain's, the others' the entry; exit 139 with no report).
+fn guest_view(sig: usize, h: usize, prev_guest: usize) -> usize {
+    let h = if h == identity::signal_entry() {
+        identity::signal_handler(sig)
+    } else {
+        h
+    };
+    if h <= NOT_A_FUNCTION {
+        h
+    } else if h == guest_handler as *const () as usize {
+        prev_guest
+    } else {
+        proc::guest_address(h, Sig::INT).unwrap_or_else(|| {
+            super::unsupported(&format!(
+                "guest sigaction({sig}): no thunk left for the old host handler"
+            ))
+        })
+    }
+}
+
 /// Host side of guest stubs `sigaction` / `sigaction64` (one LP64 layout; a `Shim` row of the binding table).
 /// Errors return -1 with the host errno only: the guest's errno is its own TLS, which this side does not reach (only an invalid signal number fails here).
 pub(super) extern "C" fn sigaction(
@@ -204,12 +226,7 @@ pub(super) extern "C" fn sigaction(
             GUEST[slot].store(0, Ordering::Release);
         }
         if let Some(o) = old.as_mut() {
-            let h = host_old.sa_sigaction;
-            o.handler = if h == guest_handler as *const () as usize {
-                prev_guest
-            } else {
-                h
-            };
+            o.handler = guest_view(slot, host_old.sa_sigaction, prev_guest);
             o.flags = host_old.sa_flags & !SA_RESTORER;
             o.mask = std::ptr::read((&raw const host_old.sa_mask).cast::<u64>());
             o.restorer = 0;

@@ -93,7 +93,7 @@ fn decide(host: usize, proto: Option<(Sig, Option<&'static str>)>) -> Answer {
     }
 }
 
-/// Host answers bound so far: host address -> guest thunk.
+/// Host functions handed to the guest so far ([`guest_address`]): host address -> guest thunk.
 static BOUND: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
 
 /// The guest address of host function `host` (lanes `sig`), bound by `bind` once per host address. Break `egl_nodedup` binds on every call.
@@ -110,6 +110,12 @@ fn bind_host(
     let thunk = bind(host, sig)?;
     bound.insert(host, thunk);
     Some(thunk)
+}
+
+/// The guest-callable address of host function `host` (lanes `sig`), one thunk per host address for the process: every host function pointer the guest is handed goes through here (GL proc lookups, signal.rs old actions). None when the pool is used up.
+pub(super) fn guest_address(host: usize, sig: Sig) -> Option<usize> {
+    let mut bound = BOUND.lock().unwrap_or_else(PoisonError::into_inner);
+    bind_host(&mut bound, host, sig, |h, s| active().bind_result(h, s))
 }
 
 /// The named traps made so far: (name, why, guest address). Slot `i` is `NAMED_FNS[i]`.
@@ -194,16 +200,11 @@ pub(super) extern "C" fn get_proc_address(name: *const c_char) -> *const c_void 
     }
     let at = match decide(host_answer(&name), prototype(&name)) {
         Answer::Null => 0,
-        Answer::Bind(host, sig) => {
-            let mut bound = BOUND.lock().unwrap_or_else(PoisonError::into_inner);
-            bind_host(&mut bound, host, sig, |h, s| active().bind_result(h, s)).unwrap_or_else(
-                || {
-                    unsupported(&format!(
-                        "eglGetProcAddress({name}): the binding pool is used up"
-                    ))
-                },
-            )
-        }
+        Answer::Bind(host, sig) => guest_address(host, sig).unwrap_or_else(|| {
+            unsupported(&format!(
+                "eglGetProcAddress({name}): the binding pool is used up"
+            ))
+        }),
         Answer::Trap(why) => named_trap_for(&name, why)
             .unwrap_or_else(|e| unsupported(&format!("eglGetProcAddress({name}): {e}"))),
     };

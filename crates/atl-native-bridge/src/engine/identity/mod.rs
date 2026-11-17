@@ -512,6 +512,11 @@ pub fn signal_entry() -> usize {
     atl_nb_signal_entry as *const () as usize
 }
 
+/// The host handler `signal_entry` calls for `sig` (0: none stored).
+pub fn signal_handler(sig: usize) -> usize {
+    atl_nb_signal_handlers[sig].load(Ordering::Acquire)
+}
+
 /// Stores the host handler `signal_entry` calls for `sig`.
 pub fn set_signal_handler(sig: usize, handler: usize) {
     atl_nb_signal_handlers[sig].store(handler, Ordering::Release);
