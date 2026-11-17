@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Tue, 17 Nov 2026 14:20:38 +0800
+Subject: [PATCH] libunwindstack: read vlenb only on a core with V
+
+RegsRiscv64::GetVlenbFromLocal ran csrr vlenb unconditionally. On a
+riscv64 Linux host without the V extension (SiFive P550) that raises
+SIGILL, so every ucontext unwind faults, including ART's fatal-signal
+dump, which then exits on the reentered handler with no backtrace.
+Return 0 when AT_HWCAP lacks V.
+
+Upstream-Status: Inappropriate [AOSP riscv64 devices are RVA23, always with V]
+Patch-Reason: glibc riscv64 desktop hosts without V (SiFive P550) must unwind
+---
+SPDX-License-Identifier: Apache-2.0
+ libunwindstack/RegsRiscv64.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/libunwindstack/RegsRiscv64.cpp b/libunwindstack/RegsRiscv64.cpp
+index 532b3b1d9c2b491d731cd04c507ef0c31ac311bd..ac8affdb1017ea0a8621ad75f86060d0925009c6 100644
+--- a/libunwindstack/RegsRiscv64.cpp
++++ b/libunwindstack/RegsRiscv64.cpp
+@@ -17,6 +17,7 @@
+ #include <elf.h>
+ #include <stdint.h>
+ #include <string.h>
++#include <sys/auxv.h>
+ #include <sys/ptrace.h>
+ #include <sys/uio.h>
+ 
+@@ -36,6 +37,11 @@ namespace unwindstack {
+ 
+ uint64_t RegsRiscv64::GetVlenbFromLocal() {
+ #if defined(__riscv)
++  // vlenb exists only with the V extension: on a core without it (SiFive P550) the csrr raises
++  // SIGILL, inside a crash handler's unwind too. Linux hwcap bit 'V' - 'A' says whether V is there.
++  if ((getauxval(AT_HWCAP) & (1UL << ('V' - 'A'))) == 0) {
++    return 0;
++  }
+   uint64_t vlenb;
+   asm volatile("csrr %0, 0xc22\n" : "=r"(vlenb)::);
+   return vlenb;

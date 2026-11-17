@@ -1213,8 +1213,9 @@ fn crash_result(run: &ArtRun) -> Result<String, String> {
                     "died of SIGABRT with no crash report line (`{header}`) on stderr: the launcher's crash handler resent it unreported"
                 ));
             }
+            let frames = art_frames(&run.stderr)?;
             Ok(format!(
-                "native SIGABRT -> ART's unexpected-signal handler -> the launcher's crash handler (report line on stderr) -> died of signal {s}"
+                "native SIGABRT -> ART's unexpected-signal handler ({frames}) -> the launcher's crash handler (report line on stderr) -> died of signal {s}"
             ))
         }
         Some(s) => Err(format!(
@@ -1225,6 +1226,30 @@ fn crash_result(run: &ArtRun) -> Result<String, String> {
         None => Err(format!(
             "exited instead of dying of SIGABRT ({want}): {}",
             run.failure()
+        )),
+    }
+}
+
+/// The managed method that calls the shim's `raiseAbort` (NativeLoad.java `main`): ART's dump must reach it.
+/// Not the shim function itself: its `raise` is a tail call in the release build, so no frame names it (x86_64 run 2026-11-17: libc `gsignal` -> `art_quick_generic_jni_trampoline` -> `NativeLoad.main`).
+const ABORT_CALLER: &str = "NativeLoad.main";
+
+/// Stage 6's ART dump (runtime_common.cc HandleUnexpectedSignalCommonDump): a `Backtrace:` whose frames (native_stack_dump.cc, `#NN pc <rel>  <path> (<fn>+<off>)`) reach [`ABORT_CALLER`], i.e. the unwind crossed the signal frame and the JNI trampoline.
+/// Without it the handler died in its own dump: riscv64 libunwindstack read vlenb on a core without V -> SIGILL -> `HandleUnexpectedSignal reentered` -> `_exit(1)`, no frame printed.
+fn art_frames(stderr: &str) -> Result<String, String> {
+    // any prefix (tab, or the logger's when ART logs instead of writing cerr), then `#NN pc `
+    let frames: Vec<&str> = stderr
+        .lines()
+        .skip_while(|l| !l.contains("Backtrace:"))
+        .filter_map(|l| l.find('#').map(|i| &l[i..]))
+        .filter(|f| f.get(3..7) == Some(" pc "))
+        .collect();
+    match frames.iter().position(|f| f.contains(ABORT_CALLER)) {
+        Some(at) => Ok(format!("{} frames, {ABORT_CALLER} at #{at}", frames.len())),
+        None => Err(format!(
+            "ART's fatal-signal dump reaches no frame naming {ABORT_CALLER} ({} frames after `Backtrace:`): its handler printed no usable backtrace; frames: {}",
+            frames.len(),
+            frames.join(" | ")
         )),
     }
 }
@@ -1394,10 +1419,28 @@ mod tests {
     fn crash_check() {
         let printed = format!("nlt signal {SIGABRT}\n");
         let mut reported = crash_run(&printed, Some(SIGABRT));
-        reported.stderr = format!(
+        // ART's dump through the launcher's logger (x86_64 run 2026-11-17, paths cut), then the launcher's line
+        let art =
+            "1794906642.624 11150.988 1 1 F liblog/atl-app-launcher: runtime_common.cc:423] \t";
+        let dump = format!(
+            "{art}Backtrace:\n{art}#00 pc 0003fc41  /usr/lib/x86_64-linux-gnu/libc.so.6 (gsignal+17)\n{art}#01 pc 00b4a70b  /out/libart.so (art_quick_generic_jni_trampoline+219)\n{art}#02 pc 00000cf4  /out/classes.dex (NativeLoad.main+184)\n"
+        );
+        let atl = format!(
             "1794847571.974 FATAL atl-crash: signal {SIGABRT} (SIGABRT) code -6 fault addr 0x0 thread 1 \"main\"\n"
         );
+        reported.stderr = format!("{dump}{atl}");
         assert!(crash_result(&reported).is_ok());
+        // riscv64 before the vlenb patch: the handler re-faulted, no frame
+        reported.stderr = format!(
+            "art F runtime_common.cc] HandleUnexpectedSignal reentered\nart F runtime_common.cc]  S04\n{atl}"
+        );
+        let e = crash_result(&reported).unwrap_err();
+        assert!(e.contains("no frame naming"), "{e}");
+        // the unwind stopped before the managed caller
+        let cut: String = dump.lines().take(3).map(|l| format!("{l}\n")).collect();
+        reported.stderr = format!("{cut}{atl}");
+        let e = crash_result(&reported).unwrap_err();
+        assert!(e.contains("(2 frames"), "{e}");
         // the same death with no report line: the launcher's handler did not write it
         let e = crash_result(&crash_run(&printed, Some(SIGABRT))).unwrap_err();
         assert!(e.contains("no crash report line"), "{e}");
