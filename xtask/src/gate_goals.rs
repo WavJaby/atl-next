@@ -93,13 +93,13 @@ pub const ANGLE_FRONTS: [&str; 3] = ["libEGL_angle", "libGLESv1_CM_angle", "libG
 pub const EXTRACTOR_PLUGINS: [&str; 3] = ["liboggextractor", "libwavextractor", "libmp4extractor"];
 /// Framework JNI libraries an app loads by name (`System.loadLibrary`): libsoundpool (SoundPool.java:119) and libmedia_jni (MediaPlayer.java:623), built as AOSP's source as-is. Their closures build with them; stage_art links every built `device/<module>/*.so` into the ART lib dir, which atld's LD_LIBRARY_PATH names, so no placement row is needed.
 pub const FRAMEWORK_JNI: [&str; 2] = ["libsoundpool", "libmedia_jni"];
-/// NDK libraries implemented by AOSP's own source as-is on the host: libOpenSLES (frameworks/wilhelm, over libaudioclient). Staged like [`FRAMEWORK_JNI`]: stage_art links every built `device/<module>/*.so` into the ART lib dir, so an app's `DT_NEEDED libOpenSLES.so` resolves there.
-pub const NDK_FRONTS: [&str; 1] = ["libOpenSLES"];
+/// NDK libraries implemented by AOSP's own source as-is on the host: libOpenSLES (frameworks/wilhelm) and libaaudio (frameworks/av/media/libaaudio, legacy AudioStreamTrack path), both over libaudioclient. Staged like [`FRAMEWORK_JNI`]: stage_art links every built `device/<module>/*.so` into the ART lib dir, so an app's `DT_NEEDED libOpenSLES.so` resolves there.
+pub const NDK_FRONTS: [&str; 2] = ["libOpenSLES", "libaaudio"];
 /// The native-bridge guest's linker and main executable (NBS modules; `app_process64` = argv[1] of the guest linker, atl-native-bridge engine/mod.rs).
 pub const NB_LINKER: &str = "native_bridge_guest_linker";
 pub const NB_EXE: &str = "native_bridge_guest_app_process";
-/// The guest libraries `app_process64`'s closure needs (its and their `DT_NEEDED`), by module: NBS's guest libc and linker helpers, AOSP's guest libcutils / libutils / liblog (NBS `NATIVE_BRIDGE_ORIG_GUEST_LIBS`), the GL / window proxies (`libnative_bridge_guest_*`, installed under their stems) that route GL calls to the host fronts (GS2), AOSP's guest zlib and libstdc++ (C12: DT_NEEDED of the legacy fixture, not of app_process), and the NDK proxies libandroid, libandroid_runtime, libjnigraphics (C3: DT_NEEDED of the fixtures' asset and bitmap calls) and libmediandk (G6b: DT_NEEDED of every Unity libunity.so), and the vdso. libc++.so comes from the runtimes build (runtimes.rs `shared_libcxx`). Installed file names: atld_run `nb_lib_file`.
-pub const NB_GUEST_LIBS: [&str; 23] = [
+/// The guest libraries `app_process64`'s closure needs (its and their `DT_NEEDED`), by module: NBS's guest libc and linker helpers, AOSP's guest libcutils / libutils / liblog (NBS `NATIVE_BRIDGE_ORIG_GUEST_LIBS`), the GL / window proxies (`libnative_bridge_guest_*`, installed under their stems) that route GL calls to the host fronts (GS2), AOSP's guest zlib and libstdc++ (C12: DT_NEEDED of the legacy fixture, not of app_process), and the NDK proxies libandroid, libandroid_runtime, libjnigraphics (C3: DT_NEEDED of the fixtures' asset and bitmap calls) and libmediandk (G6b: DT_NEEDED of every Unity libunity.so), the audio proxies libOpenSLES and libaaudio (Unity FMOD dlopens libaaudio first and fails init without it), and the vdso. libc++.so comes from the runtimes build (runtimes.rs `shared_libcxx`). Installed file names: atld_run `nb_lib_file`.
+pub const NB_GUEST_LIBS: [&str; 24] = [
     "libnative_bridge_guest_libc",
     "libm",
     "libdl",
@@ -121,6 +121,7 @@ pub const NB_GUEST_LIBS: [&str; 23] = [
     "libnative_bridge_guest_libandroid_runtime",
     "libnative_bridge_guest_libjnigraphics",
     "libnative_bridge_guest_libOpenSLES",
+    "libnative_bridge_guest_libaaudio",
     "libnative_bridge_guest_libmediandk",
     "libnative_bridge_vdso",
 ];
@@ -251,7 +252,13 @@ fn instrument() -> Goals {
 }
 
 /// The NDK libraries with guest proxies (C3): the NativeBridge core loads their host side from SYSTEM_LIB (bindings.rs `Host::System`), atld_run places it there, and the `gl-proxies` step checks them beside the GL fronts.
-pub const NDK_PROXIED: [&str; 4] = ["libandroid", "libjnigraphics", "libmediandk", "libOpenSLES"];
+pub const NDK_PROXIED: [&str; 5] = [
+    "libandroid",
+    "libjnigraphics",
+    "libmediandk",
+    "libOpenSLES",
+    "libaaudio",
+];
 
 /// What the `gl-proxies` step checks: GL fronts then [`NDK_PROXIED`], each a host library at atld_run `gl_front`.
 pub fn gl_proxied() -> Vec<&'static str> {

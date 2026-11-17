@@ -95,6 +95,7 @@ fn map_dir(lib: &str) -> &'static str {
         "libjnigraphics" => "aosp/frameworks/base/native/graphics/jni",
         "libmediandk" => "aosp/frameworks/av/media/ndk",
         "libOpenSLES" => "aosp/frameworks/wilhelm/src",
+        "libaaudio" => "aosp/frameworks/av/media/libaaudio/src",
         _ => MAPS,
     }
 }

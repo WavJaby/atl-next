@@ -227,7 +227,7 @@ const SIGNAL_SHIMS: &[&str] = &["sigaction", "sigaction64"];
 const COUNTED_SHIMS: &[&str] = &["memcpy", "memset", "memcmp"];
 /// Proxy-library functions whose host side is hand-written, each bound `Entry::Shim` in its library; each must be in one proxy library's list (`bindings_table`). `slCreateEngine` (engine/sles.rs: its out object is wrapped in a guest proxy); `eglGetProcAddress` (engine/proc.rs: its answer is a row's guest address, never a raw host pointer; the fn-return arm below traps every other one).
 const PROXY_SHIMS: &[&str] = &["slCreateEngine", "eglGetProcAddress"];
-/// Callback typedefs whose guest function pointer a lane-mapped row hands the host as a down shell (`Entry::Mapped`, engine/ndk.rs `call_mapped`; GS2.2 callback-param, tr-first blocker 5). Reviewed: every argument the host passes the callback is a value or the guest's own user data, nothing the guest would dereference in host-only memory (QEMU maps no host heap). A function-pointer parameter of another type traps `pending` (`atl_bridgegen::jni::route`); a name here no row uses is stale.
+/// Callback typedefs whose guest function pointer a lane-mapped row hands the host as a down shell (`Entry::Mapped`, engine/ndk.rs `call_mapped`; GS2.2 callback-param, tr-first blocker 5). Reviewed: every argument the host passes the callback is a value, the guest's own user data, or a host buffer the guest only loads from or stores to (QEMU's page table holds no host heap, so a host buffer must never reach a guest syscall or be fetched as code). A function-pointer parameter of another type traps `pending` (`atl_bridgegen::jni::route`); a name here no row uses is stale.
 /// Not here, with why: `AMediaDataSourceReadAt` (its buffer is host memory the guest writes: needs the G2 copy arena), `GLDEBUGPROC*` (its message is host memory: G2 staging), `AChoreographer_vsyncCallback` (`AChoreographerFrameCallbackData*`, a host record the guest reads).
 const CALLBACKS: &[&str] = &[
     // looper.h `int (*)(int fd, int events, void* data)`
@@ -239,6 +239,11 @@ const CALLBACKS: &[&str] = &[
     // NdkMediaDataSource.h `ssize_t (*)(void* userdata)`, `void (*)(void* userdata)`
     "AMediaDataSourceGetSize",
     "AMediaDataSourceClose",
+    // AAudio.h `aaudio_data_callback_result_t (*)(AAudioStream*, void* userData, void* audioData, int32_t numFrames)`: unlike ReadAt the guest only stores into `audioData` (the track's buffer) and never hands it to a syscall, and a QEMU guest's loads and stores go straight to host addresses (only syscall buffers and code fetch need QEMU's page table); `AAudioStream*` is opaque, passed back to rows unchanged
+    "AAudioStream_dataCallback",
+    // AAudio.h `void (*)(AAudioStream*, void* userData, aaudio_result_t error)`, `void (*)(AAudioStream*, void* userData)`
+    "AAudioStream_errorCallback",
+    "AAudioStream_presentationEndCallback",
 ];
 /// NDK functions with JNI types in their prototype, bound lane-mapped (`Entry::Mapped`, engine/ndk.rs `call_mapped`: the guest's `JNIEnv*` mapped to the host's, the rest passed as int lanes; references are the host's already). A generic row would hand the host library the guest's env (tr-first blocker 3: `ANativeWindow_fromSurface` -> SEGV in `android_view_Surface_getSurface`), so a JNI-typed prototype missing here fails the build naming it (`atl_bridgegen::jni::route`), and a name here without one is stale.
 const ENV_SHIMS: &[&str] = &[
@@ -554,6 +559,8 @@ const PROXY_LIBS: &[(&str, &str)] = &[
     ("libOpenSLES.so", "libOpenSLES"),
     // G6b: every Unity libunity.so NEEDs it; the host side is AOSP's libmediandk (gate_goals `NDK_PROXIED`)
     ("libmediandk.so", "libmediandk"),
+    // aaudio-guest-route: Unity FMOD's AAudio output; host side AOSP libaaudio (gate_goals `NDK_FRONTS`, `NDK_PROXIED`)
+    ("libaaudio.so", "libaaudio"),
 ];
 /// The guest libc's stub list (NBS), per guest ISA: x86_64 for the identity guest (patch 0003 adds sigaction / sigaction64); arm64 for the QEMU guest, which has no sigaction stub (its guest libc's own syscall reaches QEMU's signal emulation) and, with patch 0006, no setjmp-family stubs (bionic's setjmp.S saves and restores guest registers in the guest).
 fn libc_stubs(qemu: bool) -> &'static str {
@@ -649,6 +656,11 @@ const NDK_HEADERS: &[(&str, &[&str])] = &[
             "media/NdkMediaFormat.h",
             "media/NdkMediaMuxer.h",
         ],
+    ),
+    // AAudio: Unity FMOD's first output (dlopen libaaudio.so); host side AOSP libaaudio (gate_goals `NDK_FRONTS`)
+    (
+        "frameworks/av/media/libaaudio/include",
+        &["aaudio/AAudio.h"],
     ),
 ];
 /// bionic's availability header, copied into the host view's compat dir ([`host_compat`]).
