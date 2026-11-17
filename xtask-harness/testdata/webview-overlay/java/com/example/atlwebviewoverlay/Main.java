@@ -25,6 +25,7 @@ import javax.microedition.khronos.opengles.GL10;
  * WebView can go back; the first scroll sets the title `scrolled`; each viewport resize sets `viewport<innerWidth>x<innerHeight>` (CSS px, device-width viewport). Each key the page gets sets the title `key<n><key>`.
  * Back (Activity.onBackPressed, as an SDK of this age overrides it): WebView can go back -> goBack, logs `wvo back page`; else the WebView is removed and destroyed, logs `wvo back dismissed`;
  * with no WebView logs `wvo back game`. The activity never finishes, so every row runs in one process.
+ * The WebView gets one child of the app's (a consent SDK's loading indicator), removed with removeViewAt(0) at the first onPageFinished; `wvo web children <n>` logs the count just before.
  * Logs: `wvo gl frame` once, `wvo web added`, `wvo page finished`, `wvo title <t>`, `wvo layout window=<w>x<h> web=<l,t,r,b>` at every layout change, `wvo gl key <code>` for a key the GL view gets.
  */
 public class Main extends Activity {
@@ -109,9 +110,19 @@ public class Main extends Activity {
     private void addWeb() {
         WebView w = new WebView(this);
         w.getSettings().setJavaScriptEnabled(true);
+        // a consent SDK's loading indicator (Battle Cats TW, owner 2026-11-17): a child the app adds to the WebView (an AbsoluteLayout), removed by index when the page has loaded
+        w.addView(new View(this), new FrameLayout.LayoutParams(1, 1));
         w.setWebViewClient(new WebViewClient() {
+            private boolean spinnerGone;
+
             @Override
             public void onPageFinished(WebView view, String url) {
+                if (!spinnerGone) {
+                    spinnerGone = true;
+                    // AOSP: a WebView's children are the app's own, so this is the indicator
+                    Log.i(TAG, "wvo web children " + view.getChildCount());
+                    view.removeViewAt(0);
+                }
                 Log.i(TAG, "wvo page finished");
             }
         });

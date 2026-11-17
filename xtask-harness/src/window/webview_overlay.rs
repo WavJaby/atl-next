@@ -2,7 +2,8 @@
 //! Stage `webview-overlay` of `xtask test window`: an in-game survey's arrangement (Angry Birds 2, owner 2026-11-18): one activity, an animating focused GLSurfaceView, a full-window WebView added
 //! over it at runtime (xtask-harness/testdata/webview-overlay, Main.java). UI mode on the nested labwc; every input goes through the Wayland proxy, so it takes the real GTK path (toplevel key
 //! controller, keyboard focus, the sideband gate), not a headless injection.
-//! Sub-gates ([`checks`]): loaded (onPageFinished), resize (after a configure, the WebView's last placement is the window: sideband dst == the fixture's window size), page-tap (a click on the
+//! Sub-gates ([`checks`]): loaded (onPageFinished), web-children (the WebView's getChildCount counts only the app's own child, which the fixture then removes by index as Battle Cats TW's consent SDK
+//! does: a provider View among the children would be the one removed, taking the page off the screen), resize (after a configure, the WebView's last placement is the window: sideband dst == the fixture's window size), page-tap (a click on the
 //! page's button reaches the page: title tap1), then three Escs (AOSP BACK semantics through the Esc -> Back adaptation; `--esc-back`): esc-page-back (WebView.canGoBack -> goBack),
 //! esc-dismiss (no history left -> the SDK's onBackPressed removes the WebView), esc-game (the WebView gone -> the activity's back). Android focus stays on the GL view throughout (the click does
 //! not move it), so each Esc goes there first and BACK is its fallback. Without `--esc-back` (AOSP's map: Esc has no fallback) the Escs reach the GL view as KEYCODE_ESCAPE and no back follows.
@@ -26,6 +27,8 @@ const BACK_PAGE: &str = "AtlWindow: wvo back page";
 const BACK_DISMISSED: &str = "AtlWindow: wvo back dismissed";
 const BACK_GAME: &str = "AtlWindow: wvo back game";
 const GL_KEY: &str = "AtlWindow: wvo gl key ";
+/// Main.java's count of the WebView's children before it removes its indicator: 1 = the app's own child only (AOSP: the WebView's rendering adds no View child).
+const WEB_CHILDREN: &str = "AtlWindow: wvo web children ";
 /// The platform's placement line of a sideband widget (atl-platform-ui-linux view.rs): `dst=l,t,r,b` in physical pixels.
 const PLACED: &str = "atl-platform-ui: sideband ";
 /// input-event-codes.h KEY_ESC.
@@ -105,8 +108,22 @@ pub fn checks(app: &str, esc_back: bool) -> Vec<Sub> {
             },
         )
     };
+    let children = match app
+        .lines()
+        .find_map(|l| l.split(WEB_CHILDREN).nth(1))
+        .map(str::trim)
+    {
+        Some("1") => Ok(
+            "the WebView's only child is the app's (removeViewAt(0) took the indicator)".to_owned(),
+        ),
+        Some(n) => Err(format!(
+            "WebView.getChildCount() {n} with one app child: the provider's own View is visible to the app"
+        )),
+        None => Err(format!("no `{WEB_CHILDREN}` line")),
+    };
     vec![
         ("loaded", line("onPageFinished", LOADED)),
+        ("web-children", children),
         ("resize", resize_check(app)),
         (
             "page-tap",
@@ -238,7 +255,7 @@ mod tests {
     /// The sub-gates on hand-written logs: the full answer passes with esc-back; a stale placement, a missing tap and a missing back each fail.
     #[test]
     fn sub_gates_by_hand() {
-        let ok = "x AtlWindow: wvo page finished\nx AtlWindow: wvo layout window=720x520 web=0,0,720,520\n\
+        let ok = "x AtlWindow: wvo web children 1\nx AtlWindow: wvo page finished\nx AtlWindow: wvo layout window=720x520 web=0,0,720,520\n\
                   y atl-platform-ui: sideband [1, 5] placed dst=0,0,720,520 clip=0,0,720,520 alpha=1\n\
                   x AtlWindow: wvo title viewport360x260\nx AtlWindow: wvo title tap1\nx AtlWindow: wvo title scrolled\nx AtlWindow: wvo back page\nx AtlWindow: wvo back dismissed\nx AtlWindow: wvo back game\n";
         assert!(checks(ok, true).iter().all(|(_, r)| r.is_ok()));
@@ -247,13 +264,16 @@ mod tests {
         // the owner's case: placed right, page kept its old height
         let old_page = ok.replace("viewport360x260", "viewport360x300");
         assert!(resize_check(&old_page).is_err());
+        // the Battle Cats case: the provider's carrier counted as a child, so the app's removeViewAt(0) took the page off the screen
+        let carrier_child = ok.replace("wvo web children 1", "wvo web children 2");
+        assert!(checks(&carrier_child, true)[1].1.is_err());
         let no_tap = ok.replace("wvo title tap1", "wvo title x");
-        assert!(checks(&no_tap, true)[2].1.is_err());
+        assert!(checks(&no_tap, true)[3].1.is_err());
         let no_back = ok.replace("wvo back page", "");
-        assert!(checks(&no_back, true)[4].1.is_err());
+        assert!(checks(&no_back, true)[5].1.is_err());
         let no_scroll = ok.replace("wvo title scrolled", "");
-        assert!(checks(&no_scroll, true)[3].1.is_err());
+        assert!(checks(&no_scroll, true)[4].1.is_err());
         // without the adaptation the same backs fail
-        assert!(checks(ok, false)[5].1.is_err());
+        assert!(checks(ok, false)[6].1.is_err());
     }
 }
