@@ -131,7 +131,7 @@ const REMOTE_SKIPPED: [(&str, &str); 4] = [
         "atld ends at the target's limit (timeout), not at the gate's stop, so the exit rows have nothing to compare",
     ),
     (
-        "webview-ua, webview-settings, webview-cookie-set, webview-cookie-web, webview-download, webview-scale, webview-classloader",
+        "webview-ua, webview-settings, webview-cookie-set, webview-cookie-web, webview-download, webview-scale, webview-override, webview-scheme, webview-http, webview-classloader",
         "WebKitSettings needs a GDK display: no compositor on a headless run",
     ),
     (
@@ -485,6 +485,36 @@ const WEBVIEW_DOWNLOAD: Line = Line {
     want: Want::Exact("mime=application/x-atl-test ua=true"),
     timing: Timing::Async,
 };
+/// Main.webViewNavigation's lines (WebViewClient.java shouldOverrideUrlLoading javadoc, :33-92): a page's script (no gesture, after the load) navigates; the app's own loadDataWithBaseURL is not asked
+/// ("not called for navigations which the app initiated with loadUrl()"), so `calls=1`; the request is the main frame's GET, no redirect, no gesture. Each row then reads the page and destroys the view.
+/// override: the client returns true -> the load is aborted: no onPageStarted for it (`started=https,` = the first page only), no error, the page is still the first one (`<row> https:`).
+const WEBVIEW_OVERRIDE: Line = Line {
+    row: "webview-override",
+    prefix: "AtlTest: webview-override: ",
+    want: Want::Exact(
+        r#"calls=1 request=atl-test://done?x=1 main=true redirect=false gesture=false method=GET started=https, error=none page="webview-override https:" destroyed=true"#,
+    ),
+    timing: Timing::Async,
+};
+/// scheme: the client returns false for a scheme no loader takes -> onReceivedError(ERROR_UNSUPPORTED_SCHEME -10, WebViewClient.java:278) for the main-frame request; nothing loads (no onPageStarted:
+/// the engine never starts it), the first page stays (not blank).
+const WEBVIEW_SCHEME: Line = Line {
+    row: "webview-scheme",
+    prefix: "AtlTest: webview-scheme: ",
+    want: Want::Exact(
+        r#"calls=1 request=atl-test://fail main=true redirect=false gesture=false method=GET started=https, error=-10 atl-test://fail main=true page="webview-scheme https:" destroyed=true"#,
+    ),
+    timing: Timing::Async,
+};
+/// http: the client returns false for an http URL -> it loads as usual (onPageStarted for it). Its error and the page after it (the port refuses: an error page) are printed, not judged.
+const WEBVIEW_HTTP: Line = Line {
+    row: "webview-http",
+    prefix: "AtlTest: webview-http: ",
+    want: Want::Prefix(
+        "calls=1 request=http://127.0.0.1:9/next main=true redirect=false gesture=false method=GET started=https,http, ",
+    ),
+    timing: Timing::Async,
+};
 /// Main.webViewScale's line: setInitialScale(200) -> 200 % = 2 device pixels per CSS pixel whatever the screen density (WebView.java:1184-1188), the page's devicePixelRatio.
 const WEBVIEW_SCALE: Line = Line {
     row: "webview-scale",
@@ -540,7 +570,7 @@ struct Line {
 /// sdkext.go derives as derive_sdk.cpp SetSdkLevels computes them: r stops at 8, the last db version that does not require EXT_SERVICES (not installed in ATL; version 9 is the first that does).
 /// ad_services is AD_SERVICES' module version, 17.
 /// timezone: Main.onCreate's TimeZone.getDefault(), from persist.sys.timezone (RuntimeInit.java:252 reads it; atld sets it to the host zone). None = the run host's zone ([`HostFacts::zone_want`]: the target's on a remote run, never the build host's).
-const LOG_LINES: [Line; 16] = [
+const LOG_LINES: [Line; 19] = [
     Line {
         row: "bindservice",
         prefix: "AtlTest: bindservice: ",
@@ -596,6 +626,9 @@ const LOG_LINES: [Line; 16] = [
     WEBVIEW_COOKIE_WEB,
     WEBVIEW_DOWNLOAD,
     WEBVIEW_SCALE,
+    WEBVIEW_OVERRIDE,
+    WEBVIEW_SCHEME,
+    WEBVIEW_HTTP,
     WEBVIEW_CLASSLOADER,
 ];
 

@@ -318,6 +318,77 @@ public class Main extends Activity {
         }
     }
 
+    /**
+     * The page of the navigation rows: marks its body with `mark` (the DOM state a later read checks: still this page), then, 500 ms after its load event (past the main-frame load, which the engine's
+     * subframe heuristic watches for http(s)), sets location to `to` from script (no gesture). Loaded with loadDataWithBaseURL at NAV_BASE (an https page, as a consent page is).
+     */
+    static String navPage(String mark, String to) {
+        return "<html><body>nav<script>onload=function(){document.body.id='" + mark + "';setTimeout(function(){location='" + to + "'},500)}</script></body></html>";
+    }
+
+    static final String NAV_BASE = "https://atl.test/";
+    /** The read after the navigation: still the first page (`<mark> https:`), not an error or blank page. */
+    static final String NAV_READ = "document.body.id+' '+location.protocol";
+    /** After the navigation's callback, before the read: an engine round trip for a load the provider failed to stop to start and replace the page; generous for a loaded host. */
+    static final long NAV_SETTLE_MS = 1000;
+
+    /** One navigation row's record (UI thread only). */
+    static final class Nav {
+        final StringBuilder started = new StringBuilder();
+        int calls;
+        String request = "none";
+        String error = "none";
+    }
+
+    /** onPageStarted's URL as its scheme only (the first page is https:, the navigations are not). */
+    static String schemeOf(String url) {
+        int c = url.indexOf(':');
+        return c < 0 ? url : url.substring(0, c);
+    }
+
+    /**
+     * The navigation rows (app.rs WEBVIEW_OVERRIDE, WEBVIEW_SCHEME, WEBVIEW_HTTP; WebViewClient.shouldOverrideUrlLoading javadoc): a page's script navigates; the client answers `take` and records
+     * each shouldOverrideUrlLoading (the app's own loadDataWithBaseURL must not reach it), onPageStarted and onReceivedError; NAV_SETTLE_MS after the callback the row reads the page (NAV_READ) and,
+     * like a consent dialog closing, destroys the WebView. `<row>: calls= request=<url> main= redirect= gesture= method= started=<schemes> error=<code url> page=<NAV_READ> destroyed=true`.
+     */
+    private void webViewNavigation(final String row, final String to, final boolean take) {
+        try {
+            final android.webkit.WebView w = new android.webkit.WebView(this);
+            final Nav nav = new Nav();
+            final android.os.Handler ui = new android.os.Handler(android.os.Looper.getMainLooper());
+            w.getSettings().setJavaScriptEnabled(true);
+            w.setWebViewClient(new android.webkit.WebViewClient() {
+                @Override public boolean shouldOverrideUrlLoading(final android.webkit.WebView view, android.webkit.WebResourceRequest r) {
+                    if (nav.calls++ == 0) {
+                        nav.request = r.getUrl() + " main=" + r.isForMainFrame() + " redirect=" + r.isRedirect() + " gesture=" + r.hasGesture() + " method=" + r.getMethod();
+                        ui.postDelayed(new Runnable() {
+                            @Override public void run() {
+                                view.evaluateJavascript(NAV_READ, new android.webkit.ValueCallback<String>() {
+                                    @Override public void onReceiveValue(String page) {
+                                        view.destroy();
+                                        Log.i("AtlTest", row + ": calls=" + nav.calls + " request=" + nav.request + " started=" + nav.started + " error=" + nav.error + " page=" + page + " destroyed=true");
+                                    }
+                                });
+                            }
+                        }, NAV_SETTLE_MS);
+                    }
+                    return take;
+                }
+                @Override public void onPageStarted(android.webkit.WebView view, String url, android.graphics.Bitmap favicon) { nav.started.append(schemeOf(url)).append(','); }
+                @Override public void onReceivedError(android.webkit.WebView view, android.webkit.WebResourceRequest r, android.webkit.WebResourceError e) {
+                    nav.error = e.getErrorCode() + " " + r.getUrl() + " main=" + r.isForMainFrame();
+                }
+            });
+            mNavViews.add(w);
+            w.loadDataWithBaseURL(NAV_BASE, navPage(row, to), "text/html", null, null);
+        } catch (Throwable e) {
+            Log.i("AtlTest", row + ": threw=" + e);
+        }
+    }
+
+    /** Keeps the navigation rows' WebViews reachable until their lines are logged. */
+    private final java.util.List<android.webkit.WebView> mNavViews = new java.util.ArrayList<>();
+
     private void webViewDownload() {
         try {
             final android.webkit.WebView w = new android.webkit.WebView(this);
@@ -402,6 +473,10 @@ public class Main extends Activity {
                         webViewCookies();
                         webViewDownload();
                         webViewScale();
+                        // a consent page's last step: a custom scheme the app takes; the same declined; an http(s) navigation declined (port 9, discard: refused at once, no network needed)
+                        webViewNavigation("webview-override", "atl-test://done?x=1", true);
+                        webViewNavigation("webview-scheme", "atl-test://fail", false);
+                        webViewNavigation("webview-http", "http://127.0.0.1:9/next", false);
                         Log.i("AtlTest", "webview-classloader: " + webViewClassLoader());
                     }
                 });
