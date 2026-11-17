@@ -2961,6 +2961,7 @@ dependencies = [
  "atl-platform-host",
  "atl-property-service",
  "atl-services-types",
+ "atl-sigaction-hook",
  "clap",
  "object",
  "png",

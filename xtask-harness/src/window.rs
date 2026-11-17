@@ -2494,6 +2494,20 @@ fn bindings_check(root: &Path, app: &str, forget: Option<&str>) -> Result<String
     if let Some(s) = forget {
         table.reverse.retain(|r| r.to != s);
     }
+    // the launcher executable exports only the sigaction interposer (atl-sigaction-hook): its row must be symbol-scoped to those names
+    let launcher = xtask::launcher_closure::LAUNCHER;
+    if let Some(r) = table.reverse.iter().find(|r| r.to == launcher) {
+        let ok = r.symbols.as_ref().is_some_and(|s| {
+            s.iter()
+                .all(|x| atl_sigaction_hook::INTERPOSED.contains(&x.as_str()))
+        });
+        if !ok {
+            return Err(format!(
+                "reverse row {launcher}: `symbols` must be a subset of atl-sigaction-hook INTERPOSED {:?}",
+                atl_sigaction_hook::INTERPOSED
+            ));
+        }
+    }
     let records = parse_bindings(app);
     // an unresponsive probe (LD_DEBUG not reaching the app) would otherwise pass with nothing judged
     if records.is_empty() {

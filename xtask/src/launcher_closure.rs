@@ -12,7 +12,7 @@ use serde::Deserialize;
 
 pub const FILE: &str = "launcher-closure.toml";
 /// The launcher's package and executable, the loader (packages.rs: built into the build dir's converter target dir).
-const LAUNCHER: &str = "atl-app-launcher";
+pub const LAUNCHER: &str = "atl-app-launcher";
 /// The runtime cdylib the loader dlopens `RTLD_LOCAL` (atl-app-launcher main.rs), installed in `<out>/crates/<LAUNCHER>/lib` (packages.rs `install_cdylib`).
 pub const RUNTIME: &str = "libatl_app_runtime.so";
 
@@ -91,6 +91,9 @@ pub struct ReverseRow {
     pub to: String,
     /// ceiling on unique (host object, symbol) bindings into it per run: a growth fails
     pub max_bindings: usize,
+    /// when set: the only symbols host objects may bind in it; any other fails (a target whose exports are a fixed contract, e.g. the launcher's sigaction interposer)
+    #[serde(default)]
+    pub symbols: Option<Vec<String>>,
     pub reason: String,
 }
 
@@ -173,6 +176,11 @@ fn parse(text: &str, providers: &toml::Table) -> Result<Table> {
         ensure!(
             !r.reason.trim().is_empty(),
             "{FILE}: reverse row {} has no reason",
+            r.to
+        );
+        ensure!(
+            r.symbols.as_ref().is_none_or(|s| !s.is_empty()),
+            "{FILE}: reverse row {}: `symbols` empty (omit it to allow any)",
             r.to
         );
     }
@@ -642,6 +650,18 @@ pub fn judge_bindings(table: &Table, records: &[Binding], module: &str) -> Judge
             j.failures
                 .push(format!("forbidden reverse binding: host {from:?} -> {to}"));
         } else if let Some(row) = rows.get(to.as_str()) {
+            if let Some(allowed) = &row.symbols {
+                let outside: BTreeSet<&str> = pairs
+                    .iter()
+                    .filter(|(_, s)| !allowed.contains(s))
+                    .map(|(_, s)| s.as_str())
+                    .collect();
+                if !outside.is_empty() {
+                    j.failures.push(format!(
+                        "reverse {to}: symbols outside its row: {outside:?}"
+                    ));
+                }
+            }
             if pairs.len() > row.max_bindings {
                 j.failures.push(format!(
                     "reverse {to}: {} host bindings > max_bindings {}",
@@ -825,6 +845,40 @@ reason = "BoringSSL vs host OpenSSL"
             f.contains("reverse libz.so: 2 host bindings > max_bindings 1"),
             "{f}"
         );
+    }
+
+    /// A symbol-scoped reverse row: its listed symbol passes; another symbol into the same object fails by name.
+    #[test]
+    fn reverse_symbols_scope_the_row() {
+        let table = format!(
+            "{TABLE}\n[[reverse]]\nto = \"atl-app-launcher\"\nmax_bindings = 5\nsymbols = [\"sigaction\"]\nreason = \"interposer\"\n"
+        );
+        let t = parse(&table, &providers()).unwrap();
+        let png = rec("/usr/lib/libpng16.so.16", "/a/libz.so", "inflate");
+        let hooked = rec(
+            "/usr/lib/libLLVM.so.19.1",
+            "/a/atl-app-launcher",
+            "sigaction",
+        );
+        // TABLE's binding row must occur too
+        let vk = rec(
+            "/a/libhwui.so",
+            "/usr/lib/libvulkan.so.1",
+            "vkGetInstanceProcAddr",
+        );
+        let clean = [vk, png, hooked];
+        let j = judge_bindings(&t, &clean, "m.so");
+        assert!(j.failures.is_empty(), "{:?}", j.failures);
+        let leak = rec("/usr/lib/libbsd.so.0", "/a/atl-app-launcher", "getprogname");
+        let f = judge_bindings(&t, &[clean.as_slice(), &[leak]].concat(), "m.so")
+            .failures
+            .join("\n");
+        assert!(
+            f.contains("reverse atl-app-launcher: symbols outside its row: {\"getprogname\"}"),
+            "{f}"
+        );
+        let empty = table.replace("symbols = [\"sigaction\"]", "symbols = []");
+        assert!(parse(&empty, &providers()).is_err());
     }
 
     /// `ld.so --list` lines: resolved, not found, the interpreter by file name, the vdso skipped.

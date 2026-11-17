@@ -16,8 +16,8 @@ pub type Hook = extern "C" fn(c_int);
 pub type Setter = unsafe extern "C" fn(Hook);
 /// The setter's symbol name, looked up with `dlsym(RTLD_DEFAULT)`; absent in a process whose executable does not invoke `interpose!()`.
 pub const SETTER: &CStr = c"atl_sigaction_hook_set";
-/// The interposed functions; with `SETTER` the executable's exported symbols.
-const INTERPOSED: [&str; 5] = ["sigaction", "signal", "bsd_signal", "sigset", "sysv_signal"];
+/// The interposed functions; with `SETTER` the executable's exported symbols (xtask-harness's hwui bindings gate holds the launcher's reverse row to these).
+pub const INTERPOSED: [&str; 5] = ["sigaction", "signal", "bsd_signal", "sigset", "sysv_signal"];
 
 /// The linker argument exporting the interposer from an executable (executables export no symbols by default).
 pub fn link_arg() -> String {

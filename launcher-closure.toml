@@ -14,6 +14,7 @@
 #   from, to   file names of the bound objects; symbols: exactly those that bind (each must occur); provider: as in [[closure]]
 # [[reverse]]  an ours/AOSP soname that host objects bind; a new soname fails. What is left in global scope is libsigchain's closure (scope-split X3 shrinks it)
 #   to         file name of the bound object; reason
+#   symbols    optional: the only symbols host objects may bind in it, any other fails (the launcher's row: a subset of atl-sigaction-hook INTERPOSED, checked by the hwui gate)
 #   max_bindings  ceiling on unique (host object, symbol) bindings into it in one hwui run; a growth fails (measured 2026-11-13: one run after X1, total 218)
 # [[forbidden_reverse]]  a soname no host object may bind (fails even once)
 
@@ -82,8 +83,14 @@ reason = "the cxx crate's C++ runtime in the runtime cdylib (launcher-ui-module 
 
 [[reverse]]
 to = "libsigchain.so"
-max_bindings = 17
-reason = "intended: every host sigaction / signal goes through libsigchain, which leads the loader's DT_NEEDED for ART's fault handler"
+max_bindings = 5
+reason = "intended: libsigchain leads the loader's DT_NEEDED for ART's fault handler; host calls of its other interposed functions bind here (sigaction / signal reach it through the launcher's interposer, next row)"
+
+[[reverse]]
+to = "atl-app-launcher"
+max_bindings = 11
+symbols = ["sigaction", "signal", "bsd_signal", "sigset", "sysv_signal"]
+reason = "intended: the executable's sigaction interposer (atl-sigaction-hook) must bind every library's call so the native bridge wraps each new kernel action; forwards to libsigchain"
 
 [[reverse]]
 to = "libz.so"
