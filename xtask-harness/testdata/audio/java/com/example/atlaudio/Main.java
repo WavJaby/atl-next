@@ -17,7 +17,7 @@ import android.util.Log;
  * `fast: state=<n>`: a low-latency track; the server refuses FAST and the track must still initialise on the normal path.
  * `static: state=<n> frames=<n>`: a shared-buffer track (MODE_STATIC): the frames are the requested ones, not rounded.
  * `props: rate=<s> frames=<s>`: AudioManager's PROPERTY_OUTPUT_SAMPLE_RATE and PROPERTY_OUTPUT_FRAMES_PER_BUFFER (the primary output's rate and HAL frame count).
- * `pcm: ...`: the PCM tones (audio_app.rs TONE_*, STREAM_*): a static track of STATIC_TONE_HZ, then a streaming track of STREAM_TONE_HZ in FMOD's shape, then a float streaming track of FLOAT_TONE_HZ, one after the other; the gate checks the recording of the sink.
+ * `pcm: ...`: the PCM tones (audio_app.rs TONE_*, STREAM_*): a static track of STATIC_TONE_HZ, then a streaming track of STREAM_TONE_HZ in FMOD's shape, then a float streaming track of FLOAT_TONE_HZ, then an OpenSL ES tone and an AAudio tone (native, `pcm: sles ...` / `pcm: aaudio ...`), one after the other; the gate checks the recording of the sink.
  * `done`: the end of the run.
  */
 public class Main extends Activity {
@@ -39,6 +39,16 @@ public class Main extends Activity {
     private static final int STREAM_FRAMES = 12000;
     /** The float tone (audio_app.rs FLOAT_TONE_HZ): Angry Birds 2's FMOD AAudio stream shape, float at STREAM_RATE_HZ, STREAM_FRAMES of it. */
     private static final int FLOAT_TONE_HZ = 750;
+    /** The native tones (audio_app.rs SLES_TONE_HZ, AAUDIO_TONE_HZ, NATIVE_*): 16-bit stereo at the output's rate, NATIVE_FRAMES each, TONE_DBFS peak. */
+    private static final int SLES_TONE_HZ = 1500;
+    private static final int AAUDIO_TONE_HZ = 250;
+    private static final int NATIVE_RATE_HZ = 48000;
+    private static final int NATIVE_FRAMES = 72000;
+
+    /** OpenSL ES simple buffer queue player (jni/atl_audio_tone.c): "sles enqueued=<n> callbacks=<n> failed=<n>". */
+    private static native String slesTone(int hz, int rate, int frames, double dbfs);
+    /** AAudio data-callback stream: "aaudio open=<rc> start=<rc> written=<n> stop=<rc> close=<rc>". */
+    private static native String aaudioTone(int hz, int rate, int frames, double dbfs);
 
     /** Stereo 16-bit samples of a sine of `hz`: `frames` frames at `rate`, TONE_DBFS peak. */
     private static short[] tone(int hz, int rate, int frames) {
@@ -174,6 +184,16 @@ public class Main extends Activity {
             tf.release();
         } catch (Throwable e) {
             Log.i(TAG, "pcm: float " + e);
+        }
+        try {
+            // the native tones (jni/atl_audio_tone.c): OpenSL ES's buffer queue, then AAudio's data callback; each call blocks until its tone was handed out
+            System.loadLibrary("atl_audio_tone");
+            Log.i(TAG, "pcm: " + slesTone(SLES_TONE_HZ, NATIVE_RATE_HZ, NATIVE_FRAMES, TONE_DBFS));
+            Thread.sleep(TONE_GAP_MS);
+            Log.i(TAG, "pcm: " + aaudioTone(AAUDIO_TONE_HZ, NATIVE_RATE_HZ, NATIVE_FRAMES, TONE_DBFS));
+            Thread.sleep(TONE_GAP_MS);
+        } catch (Throwable e) {
+            Log.i(TAG, "pcm: native " + e);
         }
         Log.i(TAG, "done");
     }

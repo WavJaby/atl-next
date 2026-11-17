@@ -2,7 +2,7 @@
 //! `xtask test audio-app`: the audio gate of A1a (AudioFlinger and AudioPolicyService served) and A1b (createTrack and IAudioTrack). The test APK (xtask-harness/testdata/audio) is started by atld as the app gate's is; its process asks the audio services for the session ids and the minimum buffer, builds a track and a low-latency track, and logs their state, piid and frame count.
 //! Expected values are AOSP's formulas worked here over the served output, not the code under test: AudioSystem::calculateMinFrameCount (AudioSystem.cpp:486) with sourceFramesNeededWithTimestretch (AudioResamplerPublic.h:84-110) at speed 1.0, and AudioFlinger's streaming-track roundup to a power of two (Tracks.cpp:162).
 //! The served profile is the PCM output's granted rate and quantum (game audio A2), which on this host are PipeWire's defaults: [`SPEC_RATE_HZ`] and the others copy them, so a different graph must change these too (a mismatch is a red gate).
-//! PCM (A2): the fixture plays a static track, a streaming track, then a float streaming track, each a tone (Main.java `pcm`). The output's sink is a null sink the gate makes the default for the run, and its monitor is recorded with `pw-record` (audio_pcm.rs). The recording must hold three runs of tone with the frequency, length and level the fixture's input gives, and no sample beyond full scale. Expected values come from the constants below, never from the server.
+//! PCM (A2): the fixture plays a static track, a streaming track, a float streaming track, then from its NDK library (jni/atl_audio_tone.c) an OpenSL ES buffer-queue player and an AAudio callback stream, each a tone (Main.java `pcm`); the native two are also checked on their own counts and the `sles-flow:` counters (`native_verdicts`). `--break-tone` builds that library silent: the two native runs must be missing. The output's sink is a null sink the gate makes the default for the run, and its monitor is recorded with `pw-record` (audio_pcm.rs). The recording must hold three runs of tone with the frequency, length and level the fixture's input gives, and no sample beyond full scale. Expected values come from the constants below, never from the server.
 //! Checks: session ids nonzero and distinct; getMinBufferSize equals the expected bytes (stereo, 16-bit); AudioManager's output rate and frames-per-buffer properties are the served profile's; a track reaches STATE_INITIALIZED with a nonzero piid (AudioTrack calls baseRegisterPlayer only after native_setup succeeds, AudioTrack.java:912) and the expected frame count; the low-latency track initialises although the server refuses FAST (counted); AudioFlinger's and AudioPolicyService's calls were answered in-process.
 //! `--break-serve` starts the app with `--no-audio-service` (atld, then the launcher): it serves neither name, so the session line must go red. `--break-cblk` starts it with `--break-cblk`: each streaming track's region is one buffer short, createTrack refuses it, and both streaming tracks fail to initialise (a static track has no buffer of its own to be short of). `--break-mix` starts it with `--break-mix`: the mixer plays silence, so the PCM checks find no tone and must go red. `--unreachable` makes the desktop's server a stale socket file (`PIPEWIRE_REMOTE` for atld): the app must still reach `done` (the launch is not fatal), its track must fail with STATE_UNINITIALIZED and a counted refusal, and no tone may reach the sink.
 
@@ -15,11 +15,12 @@ use std::os::unix::net::UnixListener;
 
 use anyhow::{Context, Result};
 
-use crate::atld_run::{Package, Run, Runtime, counter_lines};
+use crate::atld_run::{NativeLibs, Package, Run, Runtime, counter_lines};
 use crate::audio_pcm::{
     FULL_SCALE, Recorder, Recording, Routing, frequency_hz, out_of_range, read_wav, rms,
 };
-use crate::manifest;
+use crate::ndk::{NdkTarget, default_ndk};
+use crate::{host_art, jni_fixture, manifest};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -50,6 +51,93 @@ pub struct Args {
     /// The unreachable server: atld's desktop names a socket file that nothing listens on. The app must still reach `done`, its track must fail with AOSP's error path (STATE_UNINITIALIZED, counted), and no tone may reach the sink.
     #[arg(long)]
     unreachable: bool,
+    /// The native tones' break: the fixture library is built with ATL_TONE_SILENT (zero amplitude), so the OpenSL ES and AAudio runs are absent from the recording and the PCM checks must go red.
+    #[arg(long)]
+    break_tone: bool,
+}
+
+/// The native tone library for the host arch (`silent`: TONE_SILENT), built into `dir`: the APK's `lib/<abi>/` entry.
+fn tone_libs(root: &Path, arch: &str, dir: &Path, silent: bool) -> Result<NativeLibs> {
+    let t = NdkTarget::new(root, &default_ndk(root)?, arch, TONE_MIN_SDK)?;
+    if dir.exists() {
+        fs::remove_dir_all(dir)?;
+    }
+    fs::create_dir_all(dir)?;
+    let lib = dir.join(TONE_LIB);
+    host_art::exec(
+        t.cmd("clang")
+            .arg("-shared")
+            .args(jni_fixture::CFLAGS)
+            .arg("-std=c11")
+            .args(silent.then_some(TONE_SILENT))
+            .arg(root.join(FIXTURE).join(TONE_SOURCE))
+            .args(["-lOpenSLES", "-ldl", "-lm"])
+            .arg(format!("-Wl,-soname,{TONE_LIB}"))
+            .arg("-o")
+            .arg(&lib),
+        "NDK clang atl_audio_tone.c",
+    )?;
+    Ok(NativeLibs {
+        abi: t.abi.clone(),
+        libs: vec![lib],
+        min_sdk: TONE_MIN_SDK,
+    })
+}
+
+/// The native tones' own lines and the wilhelm counters: every OpenSL buffer enqueued and called back (NATIVE_FRAMES in SLES_BUFFER_FRAMES buffers), AAudio opened, started and handed out NATIVE_FRAMES, and each `sles-flow:` line within the queue's bound (enqueues <= queue_callbacks + SLES_BUFFERS) with callbacks seen.
+fn native_verdicts(app: &str, services: &str) -> bool {
+    let sles = line_value(app, "pcm: sles ");
+    let buffers = i64::try_from(NATIVE_FRAMES.div_ceil(SLES_BUFFER_FRAMES)).unwrap_or(i64::MAX);
+    let (enq, cbs, failed) = (
+        field(sles, "enqueued"),
+        field(sles, "callbacks"),
+        field(sles, "failed"),
+    );
+    let mut ok = verdict(
+        "sles queue",
+        enq == Some(buffers) && cbs == Some(buffers) && failed == Some(0),
+        &format!(
+            "enqueued {enq:?} callbacks {cbs:?} failed {failed:?}, want {buffers} {buffers} 0, line: {}",
+            sles.unwrap_or("no line")
+        ),
+    );
+    let flows: Vec<(i64, i64, i64)> = app
+        .lines()
+        .chain(services.lines())
+        .filter_map(|l| l.split(SLES_FLOW).nth(1))
+        .filter_map(|f| {
+            Some((
+                field(Some(f), "enqueues")?,
+                field(Some(f), "queue_callbacks")?,
+                field(Some(f), "enqueue_failed")?,
+            ))
+        })
+        .collect();
+    let callbacks = flows.iter().map(|f| f.1).max();
+    ok &= verdict(
+        "sles flow",
+        callbacks.is_some_and(|c| c > 0)
+            && flows
+                .iter()
+                .all(|&(e, c, f)| e <= c + SLES_BUFFERS && f == 0),
+        &format!(
+            "{} `{SLES_FLOW}` line(s) (enqueues, queue_callbacks, enqueue_failed) {flows:?}: want queue_callbacks > 0, enqueues <= queue_callbacks + {SLES_BUFFERS}, no failure",
+            flows.len()
+        ),
+    );
+    let aaudio = line_value(app, "pcm: aaudio ");
+    let want_written = i64::try_from(NATIVE_FRAMES).unwrap_or(i64::MAX);
+    ok &= verdict(
+        "aaudio stream",
+        field(aaudio, "open") == Some(0)
+            && field(aaudio, "start") == Some(0)
+            && field(aaudio, "written") == Some(want_written),
+        &format!(
+            "want open=0 start=0 written={want_written}, line: {}",
+            aaudio.unwrap_or("no line")
+        ),
+    );
+    ok
 }
 
 /// The fixture's dir.
@@ -102,6 +190,21 @@ const STATIC_TONE_HZ: f64 = 1_000.0;
 const STREAM_TONE_HZ: f64 = 500.0;
 /// The third tone: a float streaming track (ENCODING_PCM_FLOAT, Angry Birds 2's FMOD AAudio shape) of STREAM_FRAMES at STREAM_RATE_HZ, the same level.
 const FLOAT_TONE_HZ: f64 = 750.0;
+/// The native tones (testdata/audio/jni/atl_audio_tone.c, Main.java NATIVE_*): the fourth through OpenSL ES's simple buffer queue (wilhelm), the fifth through AAudio's data callback, each 16-bit stereo, NATIVE_FRAMES at NATIVE_RATE_HZ, TONE_DBFS peak. 1.5 s each, so `sles-flow:` (one line per second at most, sles.rs `flow`) prints mid-stream, after callbacks began.
+const SLES_TONE_HZ: f64 = 1_500.0;
+const AAUDIO_TONE_HZ: f64 = 250.0;
+const NATIVE_RATE_HZ: u64 = 48_000;
+const NATIVE_FRAMES: u64 = 72_000;
+/// The OpenSL queue: buffers of SLES_BUFFER_FRAMES, SLES_BUFFERS deep (atl_audio_tone.c). Every buffer enqueued past the first SLES_BUFFERS follows a completion callback, so at any moment enqueues <= queue_callbacks + SLES_BUFFERS.
+const SLES_BUFFER_FRAMES: u64 = 1_024;
+const SLES_BUFFERS: i64 = 2;
+/// The native fixture: library, source, minSdk (the APK's, AndroidManifest.xml), and the define of `--break-tone` (zero amplitude).
+const TONE_LIB: &str = "libatl_audio_tone.so";
+const TONE_SOURCE: &str = "jni/atl_audio_tone.c";
+const TONE_MIN_SDK: u32 = 21;
+const TONE_SILENT: &str = "-DATL_TONE_SILENT";
+/// The wilhelm data path's counter line (atl-native-bridge engine/sles.rs `flow`).
+const SLES_FLOW: &str = "sles-flow: ";
 /// The mixer's counter line (atl-audioflinger output.rs) and its field of frames above silence; the gate wants one line with audible > 0 (the tones went through the mix, not around it).
 const MIX_LINE: &str = "audio-mix: ";
 const MIX_AUDIBLE: &str = "audible";
@@ -194,12 +297,13 @@ fn pcm_verdicts(rec: &Recording) -> bool {
     let runs = segments(&rec.channel(0), threshold, gap);
     let mut ok = verdict(
         "pcm tones",
-        runs.len() == 3,
+        runs.len() == 5,
         &format!(
-            "{} run(s) of tone, want 3 (static, streaming, float streaming)",
+            "{} run(s) of tone, want 5 (static, streaming, float streaming, OpenSL ES, AAudio)",
             runs.len()
         ),
     );
+    let native = NATIVE_FRAMES * rate / NATIVE_RATE_HZ;
     for (i, (name, hz, want)) in [
         ("static", STATIC_TONE_HZ, TONE_FRAMES * rate / TONE_RATE_HZ),
         (
@@ -212,6 +316,8 @@ fn pcm_verdicts(rec: &Recording) -> bool {
             FLOAT_TONE_HZ,
             STREAM_FRAMES * rate / STREAM_RATE_HZ,
         ),
+        ("sles", SLES_TONE_HZ, native),
+        ("aaudio", AAUDIO_TONE_HZ, native),
     ]
     .into_iter()
     .enumerate()
@@ -352,9 +458,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         rt
     };
-    let apk = rt
-        .apk
-        .build(&root.join(FIXTURE), &work.join("apk"), &[], None, None)?;
+    let native = tone_libs(root, &args.host, &work.join("jni"), args.break_tone)?;
+    let apk = rt.apk.build(
+        &root.join(FIXTURE),
+        &work.join("apk"),
+        &[],
+        Some(&native),
+        None,
+    )?;
     let m = manifest::read(&rt.apk.aapt2, &apk)?;
     println!("audio-app: built {} ({})", apk.display(), m.name);
     let run = Run {
@@ -507,6 +618,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         audible.is_some_and(|a| a > 0),
         &format!("largest `{MIX_LINE}{MIX_AUDIBLE}=` {audible:?}, want > 0"),
     );
+    ok &= native_verdicts(&app, &services);
     let pcm = fs::read(&wav)
         .map_err(anyhow::Error::from)
         .and_then(|bytes| read_wav(&bytes));
