@@ -395,6 +395,24 @@ fn download(dir: &Path, name: &str, row: &Row, url: &str, pin: &Pin) -> Result<P
     let path = cached_path(dir, pin);
     let part = dir.join(format!("{}.{}.part", pin.sha256, std::process::id()));
     println!("test-apks: {name}: downloading {url} ({} bytes)", pin.size);
+    let result = curl_pinned(url, pin.size, &part)
+        .map_err(|e| anyhow!("{name}: {e:#}"))
+        .and_then(|()| std::fs::read(&part).with_context(|| part.display().to_string()))
+        .and_then(|bytes| verify_bytes(name, row, pin, &bytes));
+    match result {
+        Ok(()) => {
+            std::fs::rename(&part, &path).with_context(|| path.display().to_string())?;
+            Ok(path)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&part);
+            Err(e)
+        }
+    }
+}
+
+/// curl fetches `url` into `part`: https only, redirects followed, at most `max_size` bytes. The transfer every pinned download uses (test-apks rows, gtk-baseline); the caller verifies the part.
+pub fn curl_pinned(url: &str, max_size: u64, part: &Path) -> Result<()> {
     let out = Command::new("curl")
         .args([
             "--fail",
@@ -409,32 +427,18 @@ fn download(dir: &Path, name: &str, row: &Row, url: &str, pin: &Pin) -> Result<P
             "=https",
             "--max-filesize",
         ])
-        .arg(pin.size.to_string())
+        .arg(max_size.to_string())
         .arg("--output")
-        .arg(&part)
+        .arg(part)
         .arg(url)
         .output()
-        .context("running curl (deps.toml row curl)")?;
-    let result = if out.status.success() {
-        std::fs::read(&part)
-            .with_context(|| part.display().to_string())
-            .and_then(|bytes| verify_bytes(name, row, pin, &bytes))
-    } else {
-        Err(anyhow!(
-            "{name}: download of {url} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))
-    };
-    match result {
-        Ok(()) => {
-            std::fs::rename(&part, &path).with_context(|| path.display().to_string())?;
-            Ok(path)
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(&part);
-            Err(e)
-        }
-    }
+        .context("running curl")?;
+    ensure!(
+        out.status.success(),
+        "download of {url} failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    Ok(())
 }
 
 fn verify_file(name: &str, row: &Row, pin: &Pin, path: &Path) -> Result<()> {

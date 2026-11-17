@@ -17,6 +17,8 @@ crate-type = ["cdylib"]
 atl-platform-ui-api = { path = "../atl-platform-ui-api" }
 tracing.workspace = true
 webkit6.workspace = true
+# Manifest-only: no gtk4 path in this crate (GTK types come through webkit6). Sets gtk4's feature floor (v4_14) for a build of this crate alone, as the harness stages it (xtask-harness ui_module.rs), where webkit6's gtk::Accessible impl needs gtk4 >= v4_10. deny.toml lists this crate as a gtk4 wrapper for that reason
+gtk4.workspace = true
 
 [lints]
 workspace = true

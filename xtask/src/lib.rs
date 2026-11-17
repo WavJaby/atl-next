@@ -35,6 +35,8 @@ pub mod flock;
 pub mod gate_goals;
 pub mod git;
 pub mod git_dirs;
+pub mod gtk_baseline;
+pub mod gtk_imports;
 pub mod harness;
 pub mod host_art;
 pub mod host_disk;

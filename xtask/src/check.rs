@@ -13,8 +13,9 @@ use crate::timing::{self, Timings};
 use crate::unit_use::{self, Echo, Units};
 use crate::verdict::{self, Failure, Verdict};
 use crate::{
-    aosp, app_ops_table, arches, converter, cts_table, deps, libcxx_gate, licenses, modules, out,
-    packages, patch, providers, prune, service_mirrors, sources, spdx, test_apks, workspace,
+    aosp, app_ops_table, arches, converter, cts_table, deps, gtk_baseline, libcxx_gate, licenses,
+    modules, out, packages, patch, providers, prune, service_mirrors, sources, spdx, test_apks,
+    workspace,
 };
 use atl_layout::Layout;
 
@@ -34,7 +35,7 @@ enum Step {
     Fmt,
     /// SPDX header on every tracked or new, non-ignored file
     Spdx,
-    /// repo tables (arches, sources, deps, providers, licenses, prune, cts, test-apks, isa-tiers) parse with their schema and invariants
+    /// repo tables (arches, sources, deps, providers, licenses, prune, cts, test-apks, isa-tiers, gtk-baseline) parse with their schema and invariants
     Tables,
     /// deps.toml rows against this host: installed at the required version (`deps --check`)
     Deps,
@@ -76,11 +77,13 @@ enum Step {
     GlProxies,
     /// the widgets fixture on the native out dir under the nested compositor: first screenshot non-uniform + one tap that changes pixels (xtask-harness drive_gate.rs `quick`); skipped without a native out dir
     DriveTap,
+    /// the UI module cdylibs (release builds from this checkout's sources) import no GTK/GDK/GSK name outside the GTK 4.14 baseline (gtk-baseline.toml; gtk_imports.rs)
+    GtkImports,
     /// atl-bionic's generation (its build script, `cargo check --target`) for every cross host whose sysroot and rust std are present, so a cross-only refusal shows before a cross build; a host without them is skipped and named
     CrossBionic,
 }
 
-const ALL: [Step; 24] = [
+const ALL: [Step; 25] = [
     Step::Fmt,
     Step::Spdx,
     Step::Tables,
@@ -104,6 +107,7 @@ const ALL: [Step; 24] = [
     Step::ConverterPackages,
     Step::GlProxies,
     Step::DriveTap,
+    Step::GtkImports,
     Step::CrossBionic,
 ];
 
@@ -133,6 +137,7 @@ impl Step {
             Step::ConverterPackages => "converter-packages",
             Step::GlProxies => "gl-proxies",
             Step::DriveTap => "drive-tap",
+            Step::GtkImports => "gtk-imports",
             Step::CrossBionic => "cross-bionic",
         }
     }
@@ -145,6 +150,7 @@ impl Step {
             | Step::Bootstrap
             | Step::Converter
             | Step::ConverterPackages
+            | Step::GtkImports
             | Step::CrossBionic => Class::Cargo,
             Step::GlProxies | Step::DriveTap => Class::Harness,
             _ => Class::Light,
@@ -198,6 +204,10 @@ impl Step {
             crate::build_state::ensure_current(root, out)?;
             return crate::harness::check_step(root, "drive-tap", out);
         }
+        if self == Step::GtkImports {
+            // builds the module cdylibs from this checkout's sources, so it reads current binaries and needs no native build dir
+            return crate::gtk_imports::check(root, out).map(|()| None);
+        }
         if self == Step::CrossBionic {
             return cross_bionic(root);
         }
@@ -230,6 +240,11 @@ impl Step {
                 let consumers = deps::Consumers::new(&workspace, &sources, &arches);
                 let deps = deps::load(root, &consumers)?;
                 eprintln!("tables: {} ok ({} rows)", deps::FILE, deps.len());
+                gtk_baseline::check(root, &deps)?;
+                eprintln!(
+                    "tables: {} ok (row checked against [gtk4] min)",
+                    gtk_baseline::FILE
+                );
                 let providers = providers::load(
                     root,
                     &providers::Targets::new(&workspace.crates, &sources, &deps),
@@ -356,6 +371,7 @@ impl Step {
             Step::ConverterPackages => unreachable!("run handles converter-packages"),
             Step::GlProxies => unreachable!("run handles gl-proxies"),
             Step::DriveTap => unreachable!("run handles drive-tap"),
+            Step::GtkImports => unreachable!("run handles gtk-imports"),
             Step::CrossBionic => unreachable!("run handles cross-bionic"),
         }
     }

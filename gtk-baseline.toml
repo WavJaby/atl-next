@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: MIT
+# The GTK baseline's symbol source (plan Q10, re-decided 2026-11-17): the Ubuntu 24.04 (noble) riscv64 `libgtk-4-1` deb of GTK 4.14.5, the build sifive runs. Check step gtk-imports reads the deb's library dynamic symbol table as the GTK 4.14 export set (xtask/src/gtk_baseline.rs) and fails any built UI module that imports a gtk_/gdk_/gsk_ name outside it.
+# Row key: lowercase letters, digits, `-`. One row: the baseline. Fields, all required:
+#   package   deb package name. Checked against the deb's own control data (`dpkg-deb -f`) at download and at every use of the cache.
+#   version   deb version. Same check. Its upstream part's major.minor must equal the series of deps.toml [gtk4] min (checked by `cargo xtask check` step tables).
+#   arch      deb architecture. Same check. The library's ELF machine must match it.
+#   url       https. Its file name must be `<package>_<version>_<arch>.deb`. Launchpad's `+files` form: a stable name in the primary archive that redirects to the librarian.
+#   sha256    64 lowercase hex digits of the deb. Checked at download and at every use of the cache.
+#   size      bytes of the deb. Same.
+#   library   path of the shared library inside the deb (extracted with `dpkg-deb -x`). Its file name must start with `libgtk-4.so.`. Checked: present, and its ELF machine matches `arch`.
+# Arch independence is argued, not measured: the same source and configure options give the same export set on amd64, and the riscv64 set is the one that sifive and the riscv64 link use. Measured (2026-11-17): this deb's defined dynamic names equal sifive's installed libgtk-4.so.1 (`nm -D --defined-only`, 5265 names, out/rvgc-m/sifive-exports.txt).
+# Provenance (2026-11-17): sha256 and size equal the Ubuntu noble-updates binary-riscv64 Packages entry (ports.ubuntu.com); that Packages.xz's checksum is in its Release file. The Release file is not GPG-verified.
+
+[gtk-4-14]
+package = "libgtk-4-1"
+version = "4.14.5+ds-0ubuntu0.10"
+arch = "riscv64"
+url = "https://launchpad.net/ubuntu/+archive/primary/+files/libgtk-4-1_4.14.5+ds-0ubuntu0.10_riscv64.deb"
+sha256 = "13ba8cb35de6478e677e09903f4ff5d125857dfa3f241a8ce0a9c0576401e98d"
+size = 3531026
+library = "usr/lib/riscv64-linux-gnu/libgtk-4.so.1"
