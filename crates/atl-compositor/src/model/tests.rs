@@ -54,6 +54,7 @@ fn spec(handle: StrongBinder, id: i32, parent: Option<BinderKey>) -> LayerSpec {
         name: format!("layer{id}"),
         parent,
         fills_color: false,
+        flags: 0,
     }
 }
 
@@ -1035,6 +1036,22 @@ fn hidden_and_destroyed_layers_leave_the_scene() {
     );
     let scene = c.on_frame(4).scene.unwrap();
     assert!(scene.quads.is_empty(), "the orphaned child is not drawn");
+}
+
+/// A layer created hidden (`createSurface` eHidden, RequestedLayerState's constructor: a SurfaceView's layer) stays out of the scene with a buffer until a transaction shows it.
+#[test]
+fn layer_created_hidden_stays_out_until_shown() {
+    let layer = local(1);
+    let mut c = Compositor::new(CompositorConfig::default());
+    c.create_layer(LayerSpec {
+        flags: layer_flags::HIDDEN,
+        ..spec(layer, 1, None)
+    })
+    .unwrap();
+    show(&mut c, &layer, 11, 10, 10);
+    assert_eq!(c.on_frame(1).scene.unwrap().quads.len(), 0);
+    c.queue_transaction(tx(vec![flags_state(&layer, 0, layer_flags::HIDDEN)]));
+    assert_eq!(c.on_frame(2).scene.unwrap().quads.len(), 1);
 }
 
 /// A relative layer sorts among the children of the layer it is relative to, whatever its parent.

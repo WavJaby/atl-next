@@ -23,13 +23,15 @@ use atl_aidl::aidl::android::gui::IDisplayEventConnection::{
 use atl_aidl::aidl::android::gui::IScreenCaptureListener::IScreenCaptureListener;
 use atl_aidl::aidl::android::gui::ISurfaceComposer::{BnSurfaceComposer, ISurfaceComposer};
 use atl_aidl::aidl::android::gui::ISurfaceComposerClient::{
-    BnSurfaceComposerClient, ISurfaceComposerClient, eFXSurfaceEffect, eFXSurfaceMask, eNoColorFill,
+    BnSurfaceComposerClient, ISurfaceComposerClient, eFXSurfaceEffect, eFXSurfaceMask, eHidden,
+    eNoColorFill, eOpaque, eSecure, eSkipScreenshot,
 };
 use atl_aidl::aidl::android::gui::Rotation::Rotation;
 use atl_aidl::aidl::android::gui::Size::Size;
 use atl_aidl::aidl::android::gui::StaticDisplayInfo::StaticDisplayInfo;
 use atl_compositor::event::ConnectionId;
 use atl_libgui_parcel::parcel::WireParcel;
+use atl_libgui_parcel::state::layer_flags;
 use atl_services_types::display_model;
 use binder::{BinderFeatures, SpIBinder, Status, StatusCode, Strong};
 use gui_aidl_types_rs::{BitTube, LayerMetadata, VsyncEventData};
@@ -279,7 +281,7 @@ impl binder::Interface for Client {}
 
 impl ISurfaceComposerClient for Client {
     /// SurfaceFlinger::createLayer: a layer named `name` with a new handle. Of `flags`, the layer type decides whether it fills with colour (an effect layer without `eNoColorFill`; createLayer adds that flag to every other type);
-    /// hidden, opaque ... arrive again as layer state in the transactions, and `metadata` has no reader yet.
+    /// `eHidden`, `eOpaque`, `eSecure`, `eSkipScreenshot` are the layer's initial flags (RequestedLayerState's constructor); `metadata` has no reader yet.
     fn r#createSurface(
         &self,
         name: Option<&str>,
@@ -290,9 +292,18 @@ impl ISurfaceComposerClient for Client {
         let name = name.unwrap_or_default();
         let mut parent = parent.cloned();
         let fills_color = flags & eFXSurfaceMask == eFXSurfaceEffect && flags & eNoColorFill == 0;
+        let initial = [
+            (eHidden, layer_flags::HIDDEN),
+            (eOpaque, layer_flags::OPAQUE),
+            (eSecure, layer_flags::SECURE),
+            (eSkipScreenshot, layer_flags::SKIP_SCREENSHOT),
+        ]
+        .into_iter()
+        .filter(|(create, _)| flags & create != 0)
+        .fold(0, |acc, (_, state)| acc | state);
         let (handle, id) = self
             .composer
-            .create_layer(name, parent.as_mut(), fills_color)
+            .create_layer(name, parent.as_mut(), fills_color, initial)
             .map_err(Status::from)?;
         Ok(Some(CreateSurfaceResult {
             handle: Some(handle),

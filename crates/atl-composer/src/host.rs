@@ -559,12 +559,14 @@ impl Composer {
         }
     }
 
-    /// `createSurface`: a layer with a new handle. `parent` is the handle of the parent layer (null: a root); `fills_color` as [`LayerSpec::fills_color`]. Returns the handle and the layer id.
+    /// `createSurface`: a layer with a new handle. `parent` is the handle of the parent layer (null: a root); `fills_color`, `flags` as [`LayerSpec::fills_color`], [`LayerSpec::flags`].
+    /// Returns the handle and the layer id.
     pub fn create_layer(
         self: &Arc<Self>,
         name: &str,
         parent: Option<&mut SpIBinder>,
         fills_color: bool,
+        flags: u32,
     ) -> Result<(SpIBinder, i32), StatusCode> {
         let key_cell = Arc::new(AtomicU64::new(0));
         let handle = Handle {
@@ -584,6 +586,7 @@ impl Composer {
             name: name.to_owned(),
             parent,
             fills_color,
+            flags,
         });
         if created.is_err() {
             st.objects.remove(key);

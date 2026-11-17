@@ -55,7 +55,8 @@ impl IUiAgent for UiAgent {
     }
 
     fn window_surface(&self, layer_name: &str) -> Result<SurfaceControl, StatusCode> {
-        let (handle, layer_id) = self.composer.create_layer(layer_name, None, false)?;
+        // shown at creation: the window service shows and hides a window through its own state, not this layer's flags
+        let (handle, layer_id) = self.composer.create_layer(layer_name, None, false, 0)?;
         let display = self.composer.display();
         Ok(SurfaceControl {
             name: Some(layer_name.to_owned()),
@@ -160,9 +161,12 @@ impl IUiAgent for UiAgent {
         let dim_id = match dims.get(&layer_id) {
             Some((_, id)) => *id,
             None => {
-                let (handle, id) =
-                    self.composer
-                        .create_layer(&format!("Dim Layer for {layer_id}"), None, true)?;
+                let (handle, id) = self.composer.create_layer(
+                    &format!("Dim Layer for {layer_id}"),
+                    None,
+                    true,
+                    0,
+                )?;
                 dims.insert(layer_id, (handle, id));
                 id
             }

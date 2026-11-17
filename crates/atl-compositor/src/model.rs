@@ -73,6 +73,9 @@ pub struct LayerSpec {
     /// The layer fills its bounds with its colour while it has no buffer: created as an effect (colour) layer, `createSurface` flags `eFXSurfaceEffect` without `eNoColorFill`
     /// (SurfaceFlinger::createLayer gives every other kind `eNoColorFill`, RequestedLayerState then sets colour -1 = no fill). Its colour starts black.
     pub fills_color: bool,
+    /// The layer's initial [`layer_flags`]: RequestedLayerState sets them from the `createSurface` flags (`eHidden` -> HIDDEN, `eOpaque`, `eSecure`, `eSkipScreenshot`). A SurfaceView's layer
+    /// is created hidden and shown only once its RenderNode is drawn (SurfaceView positionChanged): a layer shown from its creation put a WebView kept under an INVISIBLE parent on screen.
+    pub flags: u32,
 }
 
 /// A colour layer's state as the window manager sets it ([`Compositor::set_color_layer`]).
@@ -557,7 +560,7 @@ impl Compositor {
                 scale_x: 1.0,
                 scale_y: 1.0,
                 layer_stack: None,
-                flags: 0,
+                flags: spec.flags,
                 alpha: 1.0,
                 crop: None,
                 buffer_crop: None,
