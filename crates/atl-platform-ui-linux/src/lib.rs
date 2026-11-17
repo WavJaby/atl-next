@@ -18,6 +18,7 @@ pub(crate) mod mirror;
 #[allow(unsafe_code)]
 mod module;
 mod outputs;
+mod paint_stats;
 mod scene;
 mod sideband;
 mod text_input;

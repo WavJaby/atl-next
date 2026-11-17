@@ -68,6 +68,8 @@ mod imp {
         pub allocated: Cell<(i32, i32)>,
         /// Receives the content's size in physical pixels when a layout gives it a new one ([`super::SceneView::connect_allocation`]).
         pub on_allocate: RefCell<Option<AllocateFn>>,
+        /// Time the last snapshot took (ns), until the window's paint counter takes it.
+        pub snapshot_ns: Cell<Option<i64>>,
     }
 
     #[glib::object_subclass]
@@ -126,6 +128,15 @@ mod imp {
         }
 
         fn snapshot(&self, snapshot: &gtk4::Snapshot) {
+            let start = crate::window::monotonic_ns();
+            self.snapshot_scene(snapshot);
+            self.snapshot_ns
+                .set(Some(crate::window::monotonic_ns() - start));
+        }
+    }
+
+    impl SceneView {
+        fn snapshot_scene(&self, snapshot: &gtk4::Snapshot) {
             let widget = self.obj();
             // an Android display shows black where no layer covers it
             snapshot.append_color(
@@ -262,6 +273,11 @@ impl SceneView {
             self.queue_allocate();
         }
         self.queue_draw();
+    }
+
+    /// The time of the snapshot since the last call (ns), None when the view did not snapshot.
+    pub fn take_snapshot_ns(&self) -> Option<i64> {
+        self.imp().snapshot_ns.take()
     }
 
     /// Allocates each placed child at its quad, in logical pixels (GTK picking follows the transform).

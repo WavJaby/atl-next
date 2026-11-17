@@ -18,6 +18,7 @@ use gtk4::{gdk, glib, graphene, gsk};
 use crate::input;
 use crate::mirror;
 use crate::outputs;
+use crate::paint_stats::PaintStats;
 use crate::scene;
 use crate::sideband;
 use crate::text_input::GtkTextInput;
@@ -81,6 +82,11 @@ struct Shared {
     retired: RefCell<Vec<scene::Shown>>,
     /// A present waits for its paint: the next after-paint reports.
     paint_pending: Cell<bool>,
+    /// The paint cost counters (one line a second).
+    stats: RefCell<PaintStats>,
+    /// This frame-clock cycle's before-paint end and paint end (ns), for `stats`.
+    paint_start: Cell<Option<i64>>,
+    paint_end: Cell<Option<i64>>,
 }
 
 impl Shared {
@@ -198,13 +204,37 @@ impl GtkWindow {
         Some((shadow_x + f64::from(at.x()), shadow_y + f64::from(at.y())))
     }
 
-    fn wire_frame_clock(window: &gtk4::Window, shared: &Rc<Shared>) {
+    /// Ticks, paint-cost counters and after-paint reports on the window's frame clock. Connected at realise, after GDK's own surface handlers, so our `paint` handler runs after the render.
+    fn wire_frame_clock(window: &gtk4::Window, view: &SceneView, shared: &Rc<Shared>) {
         let shared = Rc::clone(shared);
+        let view = view.downgrade();
         window.connect_realize(move |window| {
             let Some(clock) = window.frame_clock() else {
                 tracing::warn!("realised window has no frame clock");
                 return;
             };
+            if let Some(renderer) = window.renderer() {
+                tracing::info!("atl-platform-ui: renderer {}", renderer.type_().name());
+            }
+            let on_before_paint = Rc::clone(&shared);
+            clock.connect_before_paint(move |_| {
+                on_before_paint.paint_start.set(Some(monotonic_ns()));
+                on_before_paint.paint_end.set(None);
+            });
+            let on_paint = Rc::clone(&shared);
+            let painted_view = view.clone();
+            clock.connect_paint(move |_| {
+                let now = monotonic_ns();
+                on_paint.paint_end.set(Some(now));
+                let snapshot = painted_view.upgrade().and_then(|v| v.take_snapshot_ns());
+                if let Some(start) = on_paint.paint_start.get() {
+                    let stale = !on_paint.paint_pending.get();
+                    on_paint
+                        .stats
+                        .borrow_mut()
+                        .painted(now - start, snapshot, stale);
+                }
+            });
             let on_update = Rc::clone(&shared);
             clock.connect_update(move |clock| {
                 if on_update.frame_requested.get() {
@@ -215,6 +245,9 @@ impl GtkWindow {
             clock.connect_after_paint(move |clock| {
                 on_after_paint.painted();
                 on_after_paint.report_presented(clock);
+                let now = monotonic_ns();
+                let after = on_after_paint.paint_end.take().map(|end| now - end);
+                on_after_paint.stats.borrow_mut().cycle_done(now, after);
             });
             // a frame asked for before the window had a clock
             if shared.frame_requested.get() {
@@ -541,6 +574,9 @@ impl Window for GtkWindow {
             shown: RefCell::default(),
             retired: RefCell::default(),
             paint_pending: Cell::new(false),
+            stats: RefCell::default(),
+            paint_start: Cell::new(None),
+            paint_end: Cell::new(None),
         });
         // the output transform is not GDK's (outputs.rs): its change re-reports the window's monitor
         let rotated = Rc::downgrade(&shared);
@@ -555,7 +591,7 @@ impl Window for GtkWindow {
         });
         let window = gtk4::Window::new();
         let view = SceneView::new();
-        Self::wire_frame_clock(&window, &shared);
+        Self::wire_frame_clock(&window, &view, &shared);
         Self::wire_pointer(&view, &shared);
         Self::wire_scroll(&view, &shared);
         Self::wire_touch(&view, &shared);
@@ -694,12 +730,25 @@ impl Window for GtkWindow {
     }
 
     fn present(&self, scene: &Scene) -> Result<(), PresentError> {
+        let start = monotonic_ns();
         let (pieces, shown) = scene::build(
             &WidgetExt::display(&self.window),
             scene,
             self.buffer_device,
             &self.shared.shown.borrow(),
         )?;
+        let reused = shown
+            .iter()
+            .filter(|s| {
+                let previous = self.shared.shown.borrow();
+                previous.iter().any(|p| p.texture == s.texture)
+            })
+            .count() as u64;
+        self.shared.stats.borrow_mut().presented(
+            monotonic_ns() - start,
+            shown.len() as u64 - reused,
+            reused,
+        );
         self.view.show_pieces(pieces);
         // a buffer still in the new scene stays shown; the rest is retired until the paint that stops drawing it
         let old = std::mem::replace(&mut *self.shared.shown.borrow_mut(), shown);
