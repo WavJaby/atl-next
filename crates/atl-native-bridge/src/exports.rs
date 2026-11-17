@@ -99,9 +99,19 @@ pub unsafe fn initialize(
         fail(msg);
         return false;
     }
-    // ART calls this after FaultManager::Init: its claimed signals get the host-FS entry before any guest code runs
+    // ART calls this after FaultManager::Init: its claimed signals get the host-FS entry before any guest code runs, and every later host install is wrapped as it happens
     #[cfg(atl_nb_identity)]
-    engine::signal::rewrap_all();
+    if !engine::signal::hook_installs() {
+        #[allow(
+            clippy::print_stderr,
+            reason = "the bridge has no logger; the launcher's stderr is the app process's log"
+        )]
+        {
+            eprintln!(
+                "atl-native-bridge: no sigaction interposer in the executable: host signal handlers installed from now on stay unwrapped"
+            );
+        }
+    }
     true
 }
 
@@ -114,9 +124,6 @@ pub unsafe fn loadLibrary(libpath: *const c_char, _flag: i32) -> *mut c_void {
         return std::ptr::null_mut();
     };
     let path = Path::new(OsStr::from_bytes(path.to_bytes()));
-    // a rewrap point (engine/signal.rs): host handlers installed since the last one
-    #[cfg(atl_nb_identity)]
-    crate::engine::signal::rewrap_all();
     // an `<apk>!/<entry>` the guest linker would refuse: refused here by name
     if let Err(e) = path.to_str().map_or(Ok(()), |p| {
         apk::check_mappable(p, engine::image::page() as u64)
@@ -330,7 +337,7 @@ mod tests {
         unsafe {
             assert!(itf.isCompatibleWith.unwrap()(3));
             assert!(!itf.isCompatibleWith.unwrap()(VERSION + 1));
-            // identity takes the kernel-level rewrap, no sigchain special
+            // identity wraps host handlers at install, no sigchain special
             assert!(itf.getSignalHandler.unwrap()(libc::SIGSEGV).is_none());
             // no guest installed on a build host: the start fails and says why
             assert!(itf.loadLibrary.unwrap()(path.as_ptr(), 2).is_null());

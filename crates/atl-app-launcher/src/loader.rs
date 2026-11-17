@@ -25,12 +25,19 @@ use generated::{dlfcn, signal, unistd};
 // libsigchain, the loader's one non-glibc library: this crate's own native library, so it precedes std's -lc on the link line and leads DT_NEEDED (cargo gives build.rs `rustc-link-lib` lines to the library target only).
 #[link(name = "sigchain", kind = "dylib")]
 unsafe extern "C" {
-    fn sigaction(sig: c_int, act: *const signal::sigaction, old: *mut signal::sigaction) -> c_int;
+    fn sigprocmask(
+        how: c_int,
+        set: *const signal::__sigset_t,
+        old: *mut signal::__sigset_t,
+    ) -> c_int;
 }
-const _: signal::sigaction_fn = sigaction;
-/// A reference from the loader's own object: std's signal calls come from rlibs after -lsigchain on the line, too late for ld.bfd's --as-needed, which would drop libsigchain (`-u` does not count; the `as-needed` link modifier is nightly-only).
+const _: signal::sigprocmask = sigprocmask;
+/// A reference from the loader's own object: std's signal calls come from rlibs after -lsigchain on the line, too late for ld.bfd's --as-needed, which would drop libsigchain (`-u` does not count; the `as-needed` link modifier is nightly-only). Not `sigaction`: the interposer below defines that one here.
 #[used]
-static SIGCHAIN: signal::sigaction_fn = sigaction;
+static SIGCHAIN: signal::sigprocmask = sigprocmask;
+
+// `sigaction`, `signal` & co. defined here and exported (build.rs), ahead of libsigchain: each forwards to sigchain's, then calls the hook the native bridge registers, which wraps the new handler at install (atl-sigaction-hook)
+atl_sigaction_hook::interpose!();
 
 unsafe extern "C" {
     fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;

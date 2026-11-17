@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Signals under one process-wide kernel action table shared by host and guest.
-//! Host handlers (ART's sigchain `SignalChain::Handler` above all) assume the host thread pointer, but a signal hitting guest code arrives on the guest's: x86_64 `rt_sigreturn` restores no FS base, and nothing between kernel and handler switches it. So every installed kernel handler is re-wrapped at kernel level (`rewrap_all`): raw `rt_sigaction` reads each action, a handler that is not the arch's signal entry moves into the entry's table and the entry takes its place; the entry switches to host FS, calls it, restores the interrupted FS. Rewrap points: NB `initialize` (after ART's `FaultManager::Init`), each guest library load, and the host side of guest `sigaction`. Gap: a host library calling `sigaction` after the last point leaves its handler unwrapped (plan D6 (a)).
+//! Host handlers (ART's sigchain `SignalChain::Handler` above all) assume the host thread pointer, but a signal hitting guest code arrives on the guest's: x86_64 `rt_sigreturn` restores no FS base, and nothing between kernel and handler switches it. So every kernel handler is wrapped at install (`wrap`): raw `rt_sigaction` reads the action, a handler that is not the arch's signal entry moves into the entry's table and the entry takes its place; the entry switches to host FS, calls it, restores the interrupted FS. Install sites: every host `sigaction` / `signal` through the launcher executable's interposer (atl-sigaction-hook; `hook_installs` at NB `initialize` registers `on_install`, then one sweep over what ART's `FaultManager::Init` and earlier code installed), the host side of guest `sigaction`, `install_signal`. Not seen: libsigchain's own `linked_sigaction` writes after `initialize` -- `EnsureFrontOfChain` (targetSdk <= 21) re-registers `SignalChain::Handler` raw over the entry and chains the entry behind it.
+//! Why at install, not at points (Alto's Odyssey 2026-11-17): WebKitGTK's JavaScriptCore, loaded late for an ad SDK's WebView, installed SIGXCPU (Boehm GC's restart signal), SIGUSR1, SIGBUS after the last point; the GC's restart ran JSC's handler on guest FS -> glibc fault, exit 139.
 //! The entry decides from the interrupted FS alone (identity/mod.rs `atl_nb_signal_entry`): host TCB -> as is; guest TCB -> its record's host FS. GS is ART's `Thread*`, never read or written.
 //! Guest `sigaction` / `sigaction64` (bionic's own is a raw syscall): NBS stubs (patch 0003) -- bionic's `sigaction.o` defines only these two, so the guest libc's archive link never pulls it and bionic needs no patch (measured: shipped libc's `sigaction` = `jmp sigaction_stub`). The guest handler is registered with sigchain's `sigaction`, so ART keeps its claimed signals first; the host side runs it on the guest thread pointer through `guest_handler`. Old actions are answered with what the guest can call (`guest_view`): `guest_handler` -> the guest handler it stands for (as Berberis `guest_signal_action.cc` does), a host handler -> a thunk up to it, never a raw host address.
 
@@ -64,36 +65,63 @@ fn raw_sigaction(
     unsafe { libc::syscall(libc::SYS_rt_sigaction, sig, new, old, size_of::<u64>()) == 0 }
 }
 
-/// Wraps every kernel handler not yet wrapped (see module docs); returns how many it wrapped.
-pub fn rewrap_all() -> usize {
-    let entry = identity::signal_entry();
-    let mut n = 0;
-    for sig in 1..=NSIG {
-        if sig == libc::SIGKILL as usize || sig == libc::SIGSTOP as usize {
-            continue;
-        }
-        let mut k = KernelSigaction {
-            handler: 0,
-            flags: 0,
-            restorer: 0,
-            mask: 0,
-        };
-        if !raw_sigaction(sig, None, Some(&mut k))
-            || k.handler <= NOT_A_FUNCTION
-            || k.handler == entry
-        {
-            continue;
-        }
-        identity::set_signal_handler(sig, k.handler);
-        let wrapped = KernelSigaction {
-            handler: entry,
-            ..k
-        };
-        if raw_sigaction(sig, Some(&wrapped), None) {
-            n += 1;
-        }
+/// Wraps `sig`'s kernel handler unless it is no function or already the entry (see module docs); true when it wrapped. Raw syscalls only: async-signal-safe, as the install hook must be.
+pub fn wrap(sig: usize) -> bool {
+    if sig == 0 || sig > NSIG || sig == libc::SIGKILL as usize || sig == libc::SIGSTOP as usize {
+        return false;
     }
-    n
+    let entry = identity::signal_entry();
+    let mut k = KernelSigaction {
+        handler: 0,
+        flags: 0,
+        restorer: 0,
+        mask: 0,
+    };
+    if !raw_sigaction(sig, None, Some(&mut k)) || k.handler <= NOT_A_FUNCTION || k.handler == entry
+    {
+        return false;
+    }
+    identity::set_signal_handler(sig, k.handler);
+    let wrapped = KernelSigaction {
+        handler: entry,
+        ..k
+    };
+    raw_sigaction(sig, Some(&wrapped), None)
+}
+
+/// Wraps every kernel handler not yet wrapped: the sweep over what was installed before the install hook took over (`hook_installs`); returns how many it wrapped.
+pub fn wrap_all() -> usize {
+    (1..=NSIG).filter(|&s| wrap(s)).count()
+}
+
+/// Handlers the install hook wrapped (`on_install`): the evidence that a late host `sigaction` was caught at install.
+static WRAPPED_AT_INSTALL: AtomicUsize = AtomicUsize::new(0);
+
+/// How many handlers the install hook has wrapped in this process.
+pub fn wrapped_at_install() -> usize {
+    WRAPPED_AT_INSTALL.load(Ordering::Relaxed)
+}
+
+extern "C" fn on_install(sig: c_int) {
+    if usize::try_from(sig).is_ok_and(wrap) {
+        WRAPPED_AT_INSTALL.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Registers `on_install` with the executable's interposer (atl-sigaction-hook), then sweeps what was installed before; false when the executable has none (a process not started by the launcher: then only the sweep, the guest's own `sigaction` and `install_signal` wrap).
+pub fn hook_installs() -> bool {
+    // SAFETY: dlsym of a NUL-terminated name in the global scope.
+    let setter = unsafe { libc::dlsym(libc::RTLD_DEFAULT, atl_sigaction_hook::SETTER.as_ptr()) };
+    let hooked = !setter.is_null();
+    if hooked {
+        // SAFETY: the symbol is the interposer's setter (atl-sigaction-hook `Setter`).
+        unsafe {
+            std::mem::transmute::<*mut c_void, atl_sigaction_hook::Setter>(setter)(on_install)
+        };
+    }
+    // after the registration: an install between sweep and registration would stay unwrapped the other way round
+    wrap_all();
+    hooked
 }
 
 /// Host `sigaction` the guest's goes through: the one that owns the process's handler table -- ART's sigchain (`libsigchain.so`, loaded in every ART process), so a guest handler is chained behind ART's claims instead of replacing them; libc's in a process without sigchain (the engine gates g1-g3), where nothing claims signals ahead of the guest.
@@ -163,7 +191,7 @@ extern "C" fn guest_handler(sig: c_int, info: *mut libc::siginfo_t, uc: *mut c_v
     }
 }
 
-/// The handler a guest old action names for host handler `h` of `sig`: SIG_DFL / SIG_IGN as they are; `guest_handler` -> the guest handler it stood for (`prev_guest`); the arch's signal entry -> what it wraps (rewrap_all moved it); any other host function -> a thunk crossing up to it (proc.rs `guest_address`).
+/// The handler a guest old action names for host handler `h` of `sig`: SIG_DFL / SIG_IGN as they are; `guest_handler` -> the guest handler it stood for (`prev_guest`); the arch's signal entry -> what it wraps (`wrap` moved it); any other host function -> a thunk crossing up to it (proc.rs `guest_address`).
 /// Why: guest crash reporters chain to the old action by calling it from their handler; a raw host address runs host code on the guest thread pointer, and glibc's first `%fs:` read faults inside the handler with the signal blocked (Alto's Odyssey 2026-11-17: SIGSEGV's old action was the host chain's, the others' the entry; exit 139 with no report).
 fn guest_view(sig: usize, h: usize, prev_guest: usize) -> usize {
     let h = if h == identity::signal_entry() {
@@ -232,6 +260,7 @@ pub(super) extern "C" fn sigaction(
             o.restorer = 0;
         }
     }
-    rewrap_all();
+    // sigchain's `sigaction` reached directly (not through the executable's interposer): wrap here
+    wrap(slot);
     0
 }

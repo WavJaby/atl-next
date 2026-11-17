@@ -6,6 +6,7 @@
 //! - Control (the probe responds), always: the same fault with the handler installed by plain `sigaction`, no engine entry -> the handler must see the guest FS.
 //! - B, with a native-bridge build: guest bionic `strlen(NULL)`; the handler emulates a return (RIP = [RSP], RSP += 8, RAX = 7), valid while the fault is before strlen's first push (bionic x86_64 SSE2 strlen pushes nothing). Want: handler FS = host, 7, the guest FS the crossing saw at return = the guest TCB, host intact.
 //! - C, with a native-bridge build: guest `sigaction(SIGSEGV, NULL, &old)`, then guest code calls `old.sa_sigaction` (a guest crash reporter chaining to the action it replaced), with the host handler unwrapped and then wrapped. Want: never the raw host address; one address both times; the handler runs once, on the host FS.
+//! - D, with a native-bridge build: the install hook registered, a host handler installed late by plain `sigaction`, delivered by guest `raise`. Want: handler on host FS, install counter +1.
 //!
 //! The handler touches no TLS (atomics, `rdfsbase`, the ucontext), so the control is safe on the guest FS.
 #![allow(
@@ -309,12 +310,74 @@ fn stage_c(g: &mut Guest, self0: libc::pthread_t, host: usize) -> Result<(), Str
     Ok(())
 }
 
+// this executable's `sigaction` & co. (exported, build.rs), as the launcher's loader defines them: the late install of stage D binds here
+atl_sigaction_hook::interpose!();
+
+/// Stage D's handler: records its FS only (no TLS).
+extern "C" fn on_usr1(_: i32, _: *mut libc::siginfo_t, _: *mut c_void) {
+    HANDLER_FS.store(identity::fs_base(), Ordering::SeqCst);
+    HITS.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Stage D: the install hook registered (`hook_installs`, as NB `initialize` does), then a host library installs a SIGUSR1 handler late with plain `sigaction` (bound to this executable's interposer), then guest bionic `raise(SIGUSR1)` delivers it while the guest FS is loaded.
+/// Want: the handler runs once on the host FS, and the install counter says the hook wrapped it. Without the hook the handler runs on the guest FS (Alto's Odyssey: JavaScriptCore's SIGXCPU handler, installed after `initialize`).
+fn stage_d(g: &mut Guest, self0: libc::pthread_t, host: usize) -> Result<(), String> {
+    let raise = guest_libc(g, c"raise")?;
+    if raise == 0 {
+        return Err("stage D: guest dlsym(raise) = NULL".into());
+    }
+    if !engine::signal::hook_installs() {
+        return Err("stage D: no interposer setter in this executable".into());
+    }
+    let before = engine::signal::wrapped_at_install();
+    // SAFETY: zeroed sigaction is empty; on_usr1 has the SA_SIGINFO signature.
+    let rc = unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_usr1 as *const () as usize;
+        sa.sa_flags = libc::SA_SIGINFO;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut())
+    };
+    if rc != 0 {
+        return Err("stage D: sigaction(SIGUSR1) failed".into());
+    }
+    let tp = g.thread().guest_tp();
+    reset();
+    let hits = HITS.load(Ordering::SeqCst);
+    // SAFETY: bionic `int raise(int)`.
+    let ret = unsafe { g.call(raise, libc::SIGUSR1 as usize, 0, 0) };
+    host_intact(g, self0, host, "guest raise")?;
+    if ret as u32 != 0 || HITS.load(Ordering::SeqCst) != hits + 1 {
+        return Err(format!(
+            "stage D: raise returned {ret}, handler ran {} times, want once",
+            HITS.load(Ordering::SeqCst) - hits
+        ));
+    }
+    let hfs = HANDLER_FS.load(Ordering::SeqCst);
+    if hfs != host {
+        return Err(format!(
+            "stage D: late-installed host handler ran on FS {hfs:#x}, host {host:#x} (guest {tp:#x})"
+        ));
+    }
+    let wrapped = engine::signal::wrapped_at_install() - before;
+    if wrapped != 1 {
+        return Err(format!(
+            "stage D: install hook wrapped {wrapped} handlers, want 1"
+        ));
+    }
+    println!(
+        "g3: stage D ok: late host sigaction(SIGUSR1) wrapped at install ({wrapped}), guest raise ran it on host FS {host:#x}"
+    );
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let mut v = common::Verdict::new("g3");
     v.stage(Some(stage_a()));
     v.stage(Some(control()));
     let Some(env) = common::nb_env() else {
-        println!("g3: stage B, C SKIP (ATL_NB / ATL_NB_LIBCXX unset)");
+        println!("g3: stage B, C, D SKIP (ATL_NB / ATL_NB_LIBCXX unset)");
+        v.stage(None);
         v.stage(None);
         v.stage(None);
         return v.finish();
@@ -329,8 +392,11 @@ fn main() -> ExitCode {
         Ok(mut g) => {
             v.stage(Some(stage_b(&mut g, self0, host)));
             v.stage(Some(stage_c(&mut g, self0, host)));
+            // last: once the hook is registered, every later install in this process is wrapped (stage C's unwrapped case and the control need none)
+            v.stage(Some(stage_d(&mut g, self0, host)));
         }
         Err(e) => {
+            v.stage(Some(Err(e.clone())));
             v.stage(Some(Err(e.clone())));
             v.stage(Some(Err(e)));
         }

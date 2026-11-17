@@ -116,6 +116,7 @@ dependencies = [
  "atl-resource-manager",
  "atl-service-view",
  "atl-services-types",
+ "atl-sigaction-hook",
  "rustix",
  "tracing-subscriber",
 ]
@@ -490,6 +491,7 @@ dependencies = [
  "atl-cpu-pressure",
  "atl-diag",
  "atl-engine-api",
+ "atl-sigaction-hook",
  "libc",
  "object",
  "zip",
@@ -731,6 +733,13 @@ dependencies = [
  "anyhow",
  "atl-bridgegen",
  "rustix",
+]
+
+[[package]]
+name = "atl-sigaction-hook"
+version = "0.0.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

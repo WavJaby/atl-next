@@ -1368,6 +1368,11 @@ fn selected_breaks() -> Result<Vec<&'static str>> {
 }
 
 fn main() -> Result<()> {
+    // g3 stage D invokes the sigaction interposer: its setter must be found with dlsym(RTLD_DEFAULT); a test that defines none exports nothing
+    println!(
+        "cargo::rustc-link-arg-tests={}",
+        atl_sigaction_hook::link_arg()
+    );
     // every break's cfg is declared, so an unselected one is no unexpected-cfg warning
     for &(_, cfg) in BREAKS {
         println!("cargo::rustc-check-cfg=cfg({cfg})");

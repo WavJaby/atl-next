@@ -47,10 +47,10 @@ uses = ["binder", "broker", "diag", "gralloc", "platform-host", "platform-ui", "
 [launch]
 crates = ["atl-launch"]
 
-# the app process's entry: JNI invocation of the converter's ART, liblog's logger, bionic's property and target-SDK API, all resolved at run time by name in libatl_bionic.so (no link to atl-bionic: one copy of its state); the process's SurfaceFlinger (composer), started in app mode; UI mode's GTK session (platform-ui), attached before Java; the installer's output frames (services-types)
+# the app process's entry: JNI invocation of the converter's ART, liblog's logger, bionic's property and target-SDK API, all resolved at run time by name in libatl_bionic.so (no link to atl-bionic: one copy of its state); the process's SurfaceFlinger (composer), started in app mode; UI mode's GTK session (platform-ui), attached before Java; the installer's output frames (services-types); native-bridge: the executables' `sigaction` interposer, whose hook the bridge registers (atl-sigaction-hook)
 [launcher]
 crates = ["atl-app-launcher"]
-uses = ["generators", "android-paths", "composer", "gralloc", "platform-ui", "service-view", "audioflinger", "codec-store", "resource-manager", "media-player", "media-extractors", "services-types"]
+uses = ["generators", "android-paths", "composer", "gralloc", "platform-ui", "service-view", "audioflinger", "codec-store", "resource-manager", "media-player", "media-extractors", "services-types", "native-bridge"]
 
 # the process's own view of servicemanager: names the app process serves itself (its SurfaceFlinger, the Codec2 store, the media resource manager, the media extractor service, media.player) answered in-process, the rest forwarded; libbinder reached through cxx adapters (wrap/view.cpp)
 [service-view]
@@ -212,8 +212,9 @@ uses = ["generators"]
 
 # the NativeBridge core ART loads (`-XX:NativeBridge=`, plan S11 NB): which app libraries are bridged (`elf`) and the NativeBridgeCallbacks shells generated from native_bridge.h; bridge 1's identity engine loads them into its guest (Android paths: the installed guest)
 [native-bridge]
-crates = ["atl-native-bridge", "atl-guest-dlsym"]
-exports = ["atl-native-bridge"]
+# atl-sigaction-hook: the install seam host signal handlers are wrapped at (an executable invokes its interposer; the bridge registers the hook)
+crates = ["atl-native-bridge", "atl-guest-dlsym", "atl-sigaction-hook"]
+exports = ["atl-native-bridge", "atl-sigaction-hook"]
 # cpu-pressure: g4's starvation share over its run (test-only dev-dependency); engine-api: the engine C ABI the QEMU crossing calls the engine `.so` through (plain dependency, no code; the engine is a dlopen, not a cargo edge); diag: OpenSL ES refusals counted as `unimplemented` (the app process links no converter libatl_diag)
 uses = ["generators", "android-paths", "cpu-pressure", "engine-api", "diag"]
 

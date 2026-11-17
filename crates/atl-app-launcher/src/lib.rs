@@ -21,7 +21,7 @@
 //!
 //! The library holds all of it, built as cdylib `libatl_app_runtime.so` with one C entry (`ffi::atl_app_main`); the executable (`src/main.rs`, feature `converter`) is its loader, `dlopen`ing it `RTLD_LOCAL`, so no AOSP object enters global scope and host objects loaded later
 //! (the UI module) resolve among themselves. The executable needs a link no plain cargo build can make: DT_NEEDED on the converter's libsigchain ahead of libc, as the converter links dalvikvm's device variant, so `sigaction` / `signal` of every library loaded later, in either group,
-//! bind to libsigchain and a game engine's or crash reporter's own SIGSEGV handler is chained behind ART's fault handler instead of replacing it. `xtask native` builds both (build.rs says how) and installs the library on the runtime library path (xtask packages.rs).
+//! bind to the loader's interposer, which forwards to libsigchain (then lets the native bridge wrap the new handler, loader.rs), and a game engine's or crash reporter's own SIGSEGV handler is chained behind ART's fault handler instead of replacing it. `xtask native` builds both (build.rs says how) and installs the library on the runtime library path (xtask packages.rs).
 //! Boundary crate (JNI, `dlopen`): `unsafe` only in `ffi`.
 #![deny(unsafe_code)]
 

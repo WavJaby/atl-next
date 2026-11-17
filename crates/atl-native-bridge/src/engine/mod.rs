@@ -23,7 +23,7 @@ pub mod proc;
 mod provider;
 pub mod qemu;
 mod record;
-/// The kernel-level signal rewrap onto the identity crossing's signal entry; QEMU never moves the host thread pointer, so it needs none.
+/// Host signal handlers wrapped at install onto the identity crossing's signal entry; QEMU never moves the host thread pointer, so it needs none.
 #[cfg(atl_nb_identity)]
 pub mod signal;
 pub mod sles;
@@ -195,7 +195,7 @@ impl Active {
         }
     }
 
-    /// The special handler ART registers for `sig` (NativeBridge `getSignalHandler`). Identity: none, its signals take the kernel-level rewrap (signal.rs). QEMU: the engine's guest-fault route for SIGSEGV and SIGBUS.
+    /// The special handler ART registers for `sig` (NativeBridge `getSignalHandler`). Identity: none, its signals are wrapped at install (signal.rs). QEMU: the engine's guest-fault route for SIGSEGV and SIGBUS.
     pub fn signal_handler(self, sig: i32) -> Option<SignalHandler> {
         match self {
             #[cfg(atl_nb_identity)]
@@ -372,7 +372,7 @@ impl Active {
     }
 }
 
-/// Host `sigaction(sig)`, then `signal::rewrap_all`: `handler(sig, info, ucontext)` runs on the host thread pointer even when the signal hit guest code (spike gate g3) -- the path every host handler takes, ART's sigchain included.
+/// Host `sigaction(sig)`, then `signal::wrap(sig)` (already done where the launcher's interposer hooked the call; idempotent): `handler(sig, info, ucontext)` runs on the host thread pointer even when the signal hit guest code (spike gate g3) -- the path every host handler takes, ART's sigchain included.
 pub fn install_signal(
     sig: i32,
     handler: extern "C" fn(i32, *mut libc::siginfo_t, *mut libc::c_void),
@@ -392,7 +392,7 @@ pub fn install_signal(
         ));
     }
     #[cfg(atl_nb_identity)]
-    signal::rewrap_all();
+    signal::wrap(sig as usize);
     Ok(())
 }
 

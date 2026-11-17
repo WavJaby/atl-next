@@ -3,8 +3,8 @@
 //! the records and constants the launcher uses with clang's layout asserted, and per function it calls the header's fn-pointer type (`import_module`), so a header change fails the build, not a run.
 //! The functions are looked up at run time (`crate::ffi`): the ART libraries are the converter's build output, not inputs of a cargo build.
 //! Host headers (glibc's dlfcn.h, the JNI and liblog headers the converter compiles against) are parsed for the host triple; bionic's API in bionic's view, as atl-bionic's build.rs parses it.
-//! With feature `converter` (`xtask native` builds it so) it also links the converter's modules (Cargo.toml `[package.metadata.atl] converter`, atl-bridgegen converter.rs) into both targets; `--as-needed` keeps in the loader executable only libsigchain (std's `sigaction` binds it), as the converter links dalvikvm's device variant (art/dalvikvm Android.bp `target.android.shared_libs`), and every other module in the runtime cdylib.
-//! `rustc-link-lib` of this package goes before std's `-lc` on the link line, so libsigchain precedes libc in DT_NEEDED and wins the global lookup of `sigaction` / `signal`; a `link-arg` would land after `-lc` and lose it.
+//! With feature `converter` (`xtask native` builds it so) it also links the converter's modules (Cargo.toml `[package.metadata.atl] converter`, atl-bridgegen converter.rs) into both targets; `--as-needed` keeps in the loader executable only libsigchain (the loader's `SIGCHAIN` reference binds it), as the converter links dalvikvm's device variant (art/dalvikvm Android.bp `target.android.shared_libs`), and every other module in the runtime cdylib.
+//! `rustc-link-lib` of this package goes before std's `-lc` on the link line, so libsigchain precedes libc in DT_NEEDED and is the next `sigaction` / `signal` after the executable's interposer (loader.rs); a `link-arg` would land after `-lc` and lose it.
 
 use std::path::PathBuf;
 
@@ -76,7 +76,8 @@ const IMPORTS: &[Import] = &[
         ],
         lang: Lang::C,
         view: View::Host,
-        functions: &["sigaction", "sigfillset", "sigaltstack"],
+        // sigprocmask: the loader's reference keeping libsigchain NEEDed (loader.rs `SIGCHAIN`)
+        functions: &["sigaction", "sigfillset", "sigaltstack", "sigprocmask"],
         types: &[],
         macros: &[
             "SIGABRT",
@@ -324,6 +325,11 @@ fn main() -> Result<()> {
     // The runtime's ABI is `atl_app_main` only, defined in this crate's own objects; every symbol from an archive (each dependency's rlib: cxx's `cxxbridge1$*`, std) stays local.
     // Its NEEDed libraries resolve in its group with it first: an exported copy would interpose theirs (libinput.so's own cxx runtime; AOSP libraries' libatl_bionic.so, the process's one bionic).
     println!("cargo::rustc-link-arg-cdylib=-Wl,--exclude-libs,ALL");
+    // the executables' `sigaction` interposer (loader.rs) is what every library binds: exported
+    println!(
+        "cargo::rustc-link-arg-bins={}",
+        atl_sigaction_hook::link_arg()
+    );
     if std::env::var_os("CARGO_FEATURE_CONVERTER").is_some() {
         let lines = atl_bridgegen::converter::link_package(&manifest)?;
         for l in lines {

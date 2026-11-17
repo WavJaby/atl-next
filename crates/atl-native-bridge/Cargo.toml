@@ -122,12 +122,16 @@ atl-diag = { path = "../atl-diag" }
 atl-engine-api = { path = "../atl-engine-api" }
 libc.workspace = true
 object.workspace = true
+# the executable's install hook setter (engine/signal.rs `hook_installs`); g3 stage D invokes its interposer
+atl-sigaction-hook = { path = "../atl-sigaction-hook" }
 # `<apk>!/<entry>` libraries (extractNativeLibs=false): classify the entry, check bionic's stored + page-aligned conditions (apk.rs)
 zip.workspace = true
 
 [build-dependencies]
 anyhow.workspace = true
 atl-bridgegen = { path = "../atl-bridgegen" }
+# g3's export argument for the interposer it invokes
+atl-sigaction-hook = { path = "../atl-sigaction-hook" }
 
 [dev-dependencies]
 # g4's starvation share over its run: the measure xtask's cadence window is judged with (atl-cpu-pressure)

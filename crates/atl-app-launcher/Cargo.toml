@@ -59,10 +59,14 @@ atl-gralloc = { path = "../atl-gralloc" }
 atl-services-types = { path = "../atl-services-types" }
 rustix.workspace = true
 tracing-subscriber.workspace = true
+# the loader's `sigaction` interposer (loader.rs), whose hook the native bridge registers
+atl-sigaction-hook = { path = "../atl-sigaction-hook" }
 
 [build-dependencies]
 anyhow.workspace = true
 atl-bridgegen = { path = "../atl-bridgegen" }
+# the interposer's export argument for the executables
+atl-sigaction-hook = { path = "../atl-sigaction-hook" }
 
 [lints]
 workspace = true
