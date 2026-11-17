@@ -203,7 +203,16 @@ fn make(root: &Path, restore: bool) -> Result<(String, PathBuf)> {
             } else {
                 "mtimes kept: outputs carried in".to_owned()
             };
-            format!("out: ws/{id} from base/{c} ({}); {stamps}", tier.name())
+            // land's own dir keeps its units: their paths are its own
+            let forgot = if id == LAND_ID {
+                0
+            } else {
+                forget_runs_reading(&dir, &ws.join(crate::land::LAND_WT))?
+            };
+            format!(
+                "out: ws/{id} from base/{c} ({}); {stamps}; {forgot} test/bin unit(s) reading the land checkout forgotten",
+                tier.name()
+            )
         }
         None => {
             std::fs::create_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -215,6 +224,87 @@ fn make(root: &Path, restore: bool) -> Result<(String, PathBuf)> {
     };
     println!("{line}");
     Ok((id, dir))
+}
+
+/// Deletes, in the cargo roots of build dir `dir` (out_prune::DIR_ROOTS), the fingerprint of every test or bin unit whose rustc dep-info records an `env!` value under `builder` (the checkout the base was built in), so cargo rebuilds it. Returns how many.
+/// Why: a unit's key leaves out the checkout path, so a base's units are fresh in any checkout; an executable reading `env!("CARGO_MANIFEST_DIR" | "OUT_DIR" | "CARGO_TARGET_TMPDIR")` at run time then reads the land checkout and `ws/land` (2026-11-17: atl-bionic tests/shape.rs failed 3 tests while ws/land was remade).
+/// Executables only: they are leaves (rebuilding one rebuilds nothing else); libs take those values at compile time (`include!`) from outputs equal to the copy's. A lib reading one at run time would need adding here.
+/// Retired when cargo runs at one canonical checkout and target path, as native's out dir already does ([`CANONICAL`]): base units are then valid as they are.
+fn forget_runs_reading(dir: &Path, builder: &Path) -> Result<usize> {
+    let needle = format!("={}/", builder.display());
+    let mut n = 0;
+    for root in out_prune::DIR_ROOTS {
+        for fp in fingerprint_dirs(&dir.join(root))? {
+            if reads_builder(&fp, &needle)? {
+                std::fs::remove_dir_all(&fp)
+                    .with_context(|| format!("removing {}", fp.display()))?;
+                n += 1;
+            }
+        }
+    }
+    Ok(n)
+}
+
+/// Whether cargo unit dir `fp` (`<profile>/.fingerprint/<pkg>-<hash>`) is a test or bin whose dep-info (`<profile>/deps/<target>-<hash>.d`) has an `# env-dep:` line containing `needle`.
+fn reads_builder(fp: &Path, needle: &str) -> Result<bool> {
+    let Some(hash) = fp
+        .file_name()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.rsplit_once('-'))
+        .map(|(_, h)| format!("-{h}"))
+    else {
+        return Ok(false);
+    };
+    let executable = std::fs::read_dir(fp)?.flatten().any(|e| {
+        e.file_name()
+            .to_str()
+            .is_some_and(|s| s.starts_with("test-") || s.starts_with("bin-"))
+    });
+    let Some(deps) = fp.parent().and_then(Path::parent).map(|p| p.join("deps")) else {
+        return Ok(false);
+    };
+    if !executable || !deps.is_dir() {
+        return Ok(false);
+    }
+    for e in std::fs::read_dir(&deps)?.flatten() {
+        let p = e.path();
+        let ours = p.extension().is_some_and(|x| x == "d")
+            && p.file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.ends_with(&hash));
+        if ours
+            && std::fs::read_to_string(&p).is_ok_and(|t| {
+                t.lines()
+                    .any(|l| l.starts_with("# env-dep:") && l.contains(needle))
+            })
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The unit dirs of every `.fingerprint` under cargo target dir `target`: `<profile>/.fingerprint/*` and `<triple>/<profile>/.fingerprint/*`.
+fn fingerprint_dirs(target: &Path) -> Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    let mut walk = vec![(target.to_owned(), 0)];
+    while let Some((d, depth)) = walk.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            if !e.file_type()?.is_dir() {
+                continue;
+            }
+            let p = e.path();
+            if e.file_name() == ".fingerprint" {
+                found.extend(std::fs::read_dir(&p)?.flatten().map(|u| u.path()));
+            } else if depth < 2 {
+                walk.push((p, depth + 1));
+            }
+        }
+    }
+    Ok(found)
 }
 
 /// The checkout at `root` gets `base`'s recorded mtimes where its content is the recorded one, now elsewhere. Returns the line part. A base published before stamps existed restores nothing: every path gets now.
@@ -1202,6 +1292,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).expect("scratch");
         d
+    }
+
+    /// Only a test or bin unit whose dep-info names the builder checkout loses its fingerprint: a lib naming it, a test naming another path, and the cross-target layout's units stay or go by the same rule.
+    #[test]
+    fn copied_executables_reading_the_builder_are_forgotten() {
+        let dir = scratch("forget-runs");
+        let builder = Path::new("/w/wt/land");
+        let unit = |profile: &str, pkg: &str, hash: &str, kind: &str, env: &str| {
+            let fp = dir
+                .join(profile)
+                .join(".fingerprint")
+                .join(format!("{pkg}-{hash}"));
+            std::fs::create_dir_all(&fp).unwrap();
+            std::fs::write(fp.join(format!("{kind}-{pkg}")), "").unwrap();
+            let deps = dir.join(profile).join("deps");
+            std::fs::create_dir_all(&deps).unwrap();
+            std::fs::write(
+                deps.join(format!("{}-{hash}.d", pkg.replace('-', "_"))),
+                format!("x: a.rs\n\n# env-dep:{env}\n"),
+            )
+            .unwrap();
+            fp
+        };
+        let land_dir = "OUT_DIR=/w/wt/land/target/debug/build/b-1/out";
+        let test = unit(
+            "target/debug",
+            "atl-bionic",
+            "aa",
+            "test-integration-test",
+            land_dir,
+        );
+        let bin = unit(
+            "target/x86_64-unknown-linux-gnu/debug",
+            "tool",
+            "bb",
+            "bin",
+            "CARGO_MANIFEST_DIR=/w/wt/land/crates/tool",
+        );
+        let lib = unit("target/debug", "atl-layout", "cc", "lib", land_dir);
+        let own = unit(
+            "target/debug",
+            "atl-bionic",
+            "dd",
+            "test-integration-test",
+            "CARGO_MANIFEST_DIR=/w/wt/child/crates/atl-bionic",
+        );
+        // `/w/wt/landing` shares the prefix but is another checkout
+        let near = unit(
+            "target/debug",
+            "x",
+            "ee",
+            "test-lib",
+            "CARGO_MANIFEST_DIR=/w/wt/landing/crates/x",
+        );
+        assert_eq!(forget_runs_reading(&dir, builder).unwrap(), 2);
+        assert!(!test.exists() && !bin.exists());
+        assert!(lib.exists() && own.exists() && near.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn put(path: &Path) {
