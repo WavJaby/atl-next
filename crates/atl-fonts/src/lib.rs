@@ -26,6 +26,9 @@ pub enum Error {
     Source(#[from] atl_platform_host::FontError),
     #[error("font table: {0}")]
     Face(String),
+    /// Not a TrueType/OpenType file or collection (a desktop also lists Type 1 faces): minikin loads none of it, so the face is skipped like an unnameable one.
+    #[error("not an sfnt font file")]
+    NotSfnt,
     #[error("{0}: {1}")]
     Io(PathBuf, std::io::Error),
     #[error("the desktop has no font for `{0}` (fontconfig answers no face for `{1}`)")]
@@ -112,19 +115,34 @@ struct Builder<'a, S, R> {
 }
 
 impl<S: FontSource, R: FaceReader> Builder<'_, S, R> {
-    /// The faces of `head`'s family at its width, head first, nameable ones only.
+    /// `f`'s tables when Android can load it: FontListParser keeps its name and it is an sfnt file; None otherwise.
+    fn loadable(&self, f: &Face) -> Result<Option<FaceInfo>, Error> {
+        if !nameable(f) {
+            return Ok(None);
+        }
+        match self.read.info(f) {
+            Ok(info) => Ok(Some(info)),
+            Err(Error::NotSfnt) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The faces of `head`'s family at its width, head first, loadable ones only.
     fn family_faces(&self, head: &Face) -> Result<Vec<(Face, FaceInfo)>, Error> {
         let mut faces = self.src.list(&FontQuery {
             family: head.family.clone(),
             lang: None,
             width: Some(head.width),
         })?;
-        faces.retain(|f| f != head && nameable(f));
+        faces.retain(|f| f != head);
         faces.insert(0, head.clone());
-        faces
-            .into_iter()
-            .map(|f| Ok((f.clone(), self.read.info(&f)?)))
-            .collect()
+        let mut out = Vec::new();
+        for f in faces {
+            if let Some(info) = self.loadable(&f)? {
+                out.push((f, info));
+            }
+        }
+        Ok(out)
     }
 
     fn head(
@@ -138,7 +156,11 @@ impl<S: FontSource, R: FaceReader> Builder<'_, S, R> {
             lang: lang.map(str::to_owned),
             width,
         };
-        Ok(self.src.sorted(&q)?.into_iter().next())
+        // an unloadable head (unnameable, not sfnt) is no answer: the row emits nothing, as on a device lacking the family
+        match self.src.sorted(&q)?.into_iter().next() {
+            Some(f) if self.loadable(&f)?.is_some() => Ok(Some(f)),
+            _ => Ok(None),
+        }
     }
 }
 
@@ -162,7 +184,7 @@ pub fn build(
         let (Some(query), Some(accept)) = (&row.query, row.accept) else {
             continue;
         };
-        let Some(head) = b.head(query, None, row.width)?.filter(nameable) else {
+        let Some(head) = b.head(query, None, row.width)? else {
             if accept == Accept::Required {
                 return Err(Error::Required(name.clone(), query.clone()));
             }
@@ -320,11 +342,10 @@ fn lang_head<S: FontSource, R: FaceReader>(
                 lang: Some(fl),
                 width: None,
             })?;
-            if let Some(f) = sorted
-                .into_iter()
-                .find(|f| members.contains(&(f.path.clone(), f.index)) && nameable(f))
-            {
-                return Ok(Some(f));
+            for f in sorted {
+                if members.contains(&(f.path.clone(), f.index)) && b.loadable(&f)?.is_some() {
+                    return Ok(Some(f));
+                }
             }
         }
     }

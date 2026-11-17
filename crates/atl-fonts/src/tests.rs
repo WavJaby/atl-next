@@ -66,6 +66,10 @@ impl FontSource for Desktop {
 
 impl FaceReader for Desktop {
     fn info(&self, face: &Face) -> Result<FaceInfo, Error> {
+        // the fixture's Type 1 faces: what FileReader answers for a `.t1` / `.pfb` file (face::read's magic check)
+        if face.path.extension().is_some_and(|e| e == "t1") {
+            return Err(Error::NotSfnt);
+        }
         Ok(self
             .faces
             .iter()
@@ -203,6 +207,49 @@ fn rejected_rows_emit_nothing_and_sans_serif_comes_first() {
 #[test]
 fn no_sans_serif_fails_the_start() {
     let d = Desktop::default();
+    assert!(matches!(
+        build(&d, &d, &table(MINI), vec![], &[]),
+        Err(Error::Required(..))
+    ));
+}
+
+/// Type 1 headers (PFB segment marker 0x80 0x01; PFA/`.t1` text `%!PS`) are no sfnt: the error the builder skips, not a parse failure that stops atld.
+#[test]
+fn type1_files_read_as_not_sfnt() {
+    for header in [&b"\x80\x01\x84\x03\0\0"[..], b"%!PS-AdobeFont-1.0"] {
+        assert!(matches!(crate::face::read(header, 0), Err(Error::NotSfnt)));
+    }
+}
+
+/// A desktop lists Type 1 faces too (Debian/Arch urw-base35: `.t1`, `.pfb`): a family's Type 1 member is skipped and the build goes on; a Type 1 head is no answer, like an unnameable one.
+#[test]
+fn type1_faces_are_skipped_not_fatal() {
+    let mut d = Desktop::default();
+    let sans = d.face(
+        "/f/a/Sans.ttf",
+        0,
+        "Sans",
+        100,
+        &["en"],
+        stat(400, false, false),
+    );
+    let t1 = d.face(
+        "/f/b/Sans-Bold.t1",
+        0,
+        "Sans",
+        100,
+        &["en"],
+        stat(700, false, false),
+    );
+    d.prefer("sans-serif", None, &[sans, t1]);
+    let m = build(&d, &d, &table(MINI), vec![], &[]).expect("a Type 1 member is skipped");
+    let files: Vec<&str> = m.families[0]
+        .fonts
+        .iter()
+        .map(|f| f.file.as_str())
+        .collect();
+    assert_eq!(files, ["Sans.ttf"]);
+    d.prefer("sans-serif", None, &[t1, sans]);
     assert!(matches!(
         build(&d, &d, &table(MINI), vec![], &[]),
         Err(Error::Required(..))

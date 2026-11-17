@@ -33,6 +33,11 @@ impl FaceInfo {
 pub fn read(data: &[u8], index: u32) -> Result<FaceInfo, Error> {
     use read_fonts::TableProvider;
     use read_fonts::tables::os2::SelectionFlags;
+    // sfnt magics: TrueType 1.0, OpenType CFF, a collection, Apple's `true`
+    const SFNT: [[u8; 4]; 4] = [[0, 1, 0, 0], *b"OTTO", *b"ttcf", *b"true"];
+    if !data.get(..4).is_some_and(|m| SFNT.iter().any(|s| s == m)) {
+        return Err(Error::NotSfnt);
+    }
     let bad = |e: read_fonts::ReadError| Error::Face(e.to_string());
     let f = read_fonts::FontRef::from_index(data, index).map_err(bad)?;
     let postscript = f.name().ok().and_then(|n| {

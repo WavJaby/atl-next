@@ -223,7 +223,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
     };
     println!("run-apk: device {}", device.display());
-    let rt = rt.with_device(&device);
+    // the desktop's fonts, as a user's run sees them (the pinned test set has no CJK or emoji face)
+    let rt = rt.with_device(&device).with_desktop_fonts();
     run_on(&rt, args, foreign.as_ref(), pin.as_ref(), files, steps)
 }
 

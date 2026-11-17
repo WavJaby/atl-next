@@ -254,6 +254,8 @@ pub struct Runtime {
     framework_res: PathBuf,
     /// The pinned test fonts atld reads as the desktop's (test_fonts.rs): its FONTCONFIG_FILE and `--font-data`.
     fonts: crate::test_fonts::TestFonts,
+    /// [`Runtime::with_desktop_fonts`]: atld reads the desktop's own fontconfig, not the pinned set (`--font-data` stays AOSP's).
+    desktop_fonts: bool,
     /// AOSP's keyboards dir: its [`tree::KEYBOARD_FILES`] are linked into /system (the input service loads the maps, the app's input thread the layout).
     keychars: PathBuf,
     /// The graphics allocator HAL and the directory of `mapper.atl.so`, when [`Runtime::with_gralloc`] asked for them.
@@ -787,6 +789,7 @@ impl Runtime {
             api_impl,
             framework_res,
             fonts,
+            desktop_fonts: false,
             keychars,
             gralloc: None,
             gpu_probe: None,
@@ -889,6 +892,17 @@ impl Runtime {
     pub fn with_sans_serif(mut self, layout: &Layout, family: &str) -> Result<Self> {
         self.fonts = crate::test_fonts::stage(layout, &self.out.join("fonts"), family)?;
         Ok(self)
+    }
+
+    /// atld reads the desktop's fonts through its own fontconfig config, as an installed atld does (run-apk: the owner plays with what a user sees; the pinned set has no CJK, emoji or other script face, so that text was boxes). Gates keep the pinned set: their text must not depend on the host.
+    pub fn with_desktop_fonts(mut self) -> Self {
+        self.desktop_fonts = true;
+        self
+    }
+
+    /// The pinned set's FONTCONFIG_FILE and font files, unless [`Runtime::with_desktop_fonts`]: (conf, files).
+    fn pinned_fonts(&self) -> Option<(&Path, &[PathBuf])> {
+        (!self.desktop_fonts).then_some((self.fonts.conf.as_path(), self.fonts.files.as_slice()))
     }
 
     /// Also places the guest `xtask native --native-bridge <isa>` built where the NativeBridge core starts it (atl-native-bridge `Config::installed`): linker64 + app_process64 under `native_bridge_bin`, the guest libraries under `native_bridge_lib`.
@@ -1495,11 +1509,13 @@ impl Runtime {
             self.installer.clone(),
             self.api_impl.clone(),
             self.framework_res.clone(),
-            self.fonts.conf.clone(),
         ]);
         // a directory (atld's `--font-data`): the record takes its tree whole
         inputs.dirs.push(self.fonts.font_data.clone());
-        inputs.files.extend(self.fonts.files.iter().cloned());
+        if let Some((conf, files)) = self.pinned_fonts() {
+            inputs.files.push(conf.to_path_buf());
+            inputs.files.extend(files.iter().cloned());
+        }
         inputs.files.extend(
             tree::KEYBOARD_FILES
                 .iter()
@@ -1574,11 +1590,13 @@ impl Runtime {
                 run.root.display()
             );
             // fontconfig's `<dir>` and `<cachedir>` name this host's paths: the run reads a copy that the script relocates
-            let conf = run.scratch.join("fonts.conf");
-            std::fs::copy(&self.fonts.conf, &conf)
-                .with_context(|| format!("copying {}", self.fonts.conf.display()))?;
-            cmd.env("FONTCONFIG_FILE", &conf);
-            written.push(conf);
+            if let Some((pinned, _)) = self.pinned_fonts() {
+                let conf = run.scratch.join("fonts.conf");
+                std::fs::copy(pinned, &conf)
+                    .with_context(|| format!("copying {}", pinned.display()))?;
+                cmd.env("FONTCONFIG_FILE", &conf);
+                written.push(conf);
+            }
             let roots = remote::Roots::of(&self.out, &self.java_out, &self.tree, &self.llvm_lib);
             return target.spawn(&roots, &cmd, &run.root, &run.scratch, &written);
         }
@@ -1612,7 +1630,11 @@ impl Runtime {
             &self.platform_module,
             &self.framework_res,
         ];
-        staged.extend(self.fonts.files.iter().map(PathBuf::as_path));
+        staged.extend(
+            self.pinned_fonts()
+                .into_iter()
+                .flat_map(|(_, files)| files.iter().map(PathBuf::as_path)),
+        );
         staged.extend(keychars.iter().map(PathBuf::as_path));
         staged.extend(self.gralloc.iter().map(|(_, dir)| dir.as_path()));
         staged.extend(self.gl_driver.iter().map(|(f, _)| f.as_path()));
@@ -1726,8 +1748,8 @@ impl Runtime {
             .arg(&self.framework_res)
             .arg("--font-data")
             .arg(&self.fonts.font_data)
-            // atld asks fontconfig for the desktop's fonts: here the pinned set (test_fonts.rs)
-            .env("FONTCONFIG_FILE", &self.fonts.conf)
+            // atld asks fontconfig for the desktop's fonts: the pinned set (test_fonts.rs), or with_desktop_fonts the desktop's own config
+            .envs(self.pinned_fonts().map(|(conf, _)| ("FONTCONFIG_FILE", conf)))
             .args(tree::KEYBOARD_FILES.iter().flat_map(|(file, dir)| {
                 [
                     "--file".to_owned(),
