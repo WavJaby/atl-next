@@ -379,6 +379,7 @@ public class Main extends Activity {
         bindMissing();
         Log.i("AtlTest", "pendingintent: " + pendingIntent());
         Log.i("AtlTest", "processes: " + processes());
+        Log.i("AtlTest", "sysanswers: " + sysAnswers());
         Log.i("AtlTest", "settings: " + settings());
         Log.i("AtlTest", "features: " + features());
         Log.i("AtlTest", "sdkext: r=" + android.os.ext.SdkExtensions.getExtensionVersion(android.os.Build.VERSION_CODES.R)
@@ -665,6 +666,27 @@ public class Main extends Activity {
                     + " rotation=" + android.provider.Settings.System.getString(r, android.provider.Settings.System.ACCELEROMETER_ROTATION);
         } catch (Throwable t) {
             return t.getClass().getSimpleName() + ": " + t.getMessage();
+        }
+    }
+
+    /** Small system-service answers games read, one field each: what the call returned, or the throwable's simple name. */
+    private String sysAnswers() {
+        return "checksums=" + checksums();
+    }
+
+    /** PackageManager.requestChecksums on the fixture itself (TRUST_ALL, SHA256 required): the number of checksums the listener got within 5 s, "timeout", or the throwable's simple name. */
+    private String checksums() {
+        try {
+            java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(1);
+            int[] got = {-1};
+            getPackageManager().requestChecksums(getPackageName(), false, android.content.pm.Checksum.TYPE_WHOLE_SHA256,
+                    android.content.pm.PackageManager.TRUST_ALL, checksums -> {
+                        got[0] = checksums.size();
+                        done.countDown();
+                    });
+            return done.await(5, java.util.concurrent.TimeUnit.SECONDS) ? Integer.toString(got[0]) : "timeout";
+        } catch (Throwable t) {
+            return t.getClass().getSimpleName();
         }
     }
 

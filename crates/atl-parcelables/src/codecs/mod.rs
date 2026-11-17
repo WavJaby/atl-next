@@ -112,6 +112,7 @@ pub mod java {
         pub mod CharSequence;
     }
     pub mod util {
+        pub mod List;
         pub mod Map;
     }
 }

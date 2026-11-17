@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Derived from the Android Open Source Project: frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java, frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java, frameworks/base/services/core/java/com/android/server/pm/IPackageManagerBase.java, frameworks/base/services/core/java/com/android/server/pm/parsing/PackageInfoUtils.java
 //! IPackageManager, subset: getApplicationInfo, getPackageInfo, getActivityInfo, getServiceInfo, getProviderInfo, resolveContentProvider, hasSystemFeature, getSystemAvailableFeatures, getPackagesForUid, notifyDexLoad,
-//! getInstrumentationInfoAsUser, queryInstrumentationAsUser, checkSignatures, queryIntentServices, queryIntentActivities, resolveIntent. Every other method is counted unimplemented (counters).
+//! getInstrumentationInfoAsUser, queryInstrumentationAsUser, checkSignatures, queryIntentServices, queryIntentActivities, resolveIntent, requestPackageChecksums. Every other method is counted unimplemented (counters).
 //! Every answer is a clone of the installer's PackageInfo (crate::packages) cut to the caller's flags: GET_META_DATA, MATCH_DISABLED_COMPONENTS, and getPackageInfo's GET_<component> / GET_PERMISSIONS.
 //! One user (0): a userId other than 0 is a user that does not exist. `sharedLibraryFiles` is always filled (ActivityManagerService's STOCK_PM_FLAGS asks for it on every app path).
 
 use std::io::Write;
 use std::sync::Arc;
 
+use atl_aidl::aidl::android::content::pm::IOnChecksumsReadyListener::IOnChecksumsReadyListener;
 use atl_aidl::aidl::android::content::pm::IPackageManager::{EnforcePermission, IPackageManager};
 use atl_parcelables::android::content::pm::{
     ActivityInfo, ApplicationInfo, FeatureInfo, InstrumentationInfo, PackageInfo,
@@ -892,6 +893,52 @@ impl IPackageManager for PackageManager {
             p1.info.signing_info.as_ref(),
             p2.info.signing_info.as_ref(),
         ))
+    }
+
+    /// PMS.requestChecksumsInternal:1372: NameNotFound for a package the caller may not see, else ApkChecksums.getChecksums over the APK files delivers through the (oneway) listener. Answered
+    /// here with an empty list: the services cannot read app files (no device -> host path in this process), which is ApkChecksums' own answer when each file read fails (getAvailableApkChecksums
+    /// and calculateChecksumIfRequested log and skip). Counted as a divergence while `required` asks for checksums AOSP would compute. trustedInstallers only filters installer checksums: none here.
+    fn r#requestPackageChecksums(
+        &self,
+        name: Option<&str>,
+        _include_splits: bool,
+        _optional: i32,
+        required: i32,
+        _trusted_installers: Option<&atl_parcelables::java::util::List>,
+        listener: Option<&binder::Strong<dyn IOnChecksumsReadyListener>>,
+        user: i32,
+    ) -> binder::Result<()> {
+        let Some(listener) = listener else {
+            return Err(Status::new_exception_str(
+                ExceptionCode::NULL_POINTER,
+                Some("requestPackageChecksums: null listener".to_owned()),
+            ));
+        };
+        if self.visible(name, user).is_none() {
+            // AOSP: ParcelableException(NameNotFoundException), rethrown as NameNotFoundException by ApplicationPackageManager; no EX_PARCELABLE writer here, so the nearest checked failure
+            atl_diag::count(
+                atl_diag::DIVERGENCE,
+                "IPackageManager.requestPackageChecksums",
+                Some("NameNotFound as IllegalArgumentException"),
+            );
+            return Err(Status::new_exception_str(
+                ExceptionCode::ILLEGAL_ARGUMENT,
+                Some(format!("{name:?} not found")),
+            ));
+        }
+        if required != 0 {
+            atl_diag::count(
+                atl_diag::DIVERGENCE,
+                "IPackageManager.requestPackageChecksums",
+                Some("required checksums not computed"),
+            );
+        }
+        atl_diag::answered("IPackageManager", "requestPackageChecksums");
+        // oneway: no reply to wait for; a dead listener is the caller's loss, as in AOSP (ApkChecksums logs the RemoteException)
+        if let Err(e) = listener.onChecksumsReady(Some(&[])) {
+            crate::activity::log(format_args!("requestPackageChecksums: listener: {e:?}"));
+        }
+        Ok(())
     }
 }
 

@@ -347,6 +347,11 @@ const SIGNATURES: &str = "AtlTest: signatures: ";
 /// package, and IMPORTANCE_FOREGROUND (100: ATL answers every app process as PROCESS_STATE_TOP). `null` = the list AOSP gives a caller with no attached process.
 const PROCESSES: &str = "AtlTest: processes: ";
 const PROCESSES_WANT: &str = "count=1 own=1 uid=true name=true pkg=true importance=100";
+/// Main.sysAnswers' line: small system-service answers, one field each.
+/// - `checksums=0`: requestChecksums reaches the listener with an empty list, ApkChecksums' answer when no APK file can be read (getAvailableApkChecksums / calculateChecksumIfRequested skip on
+///   IOException). A device would list the required SHA256; the services cannot read app files yet (counted divergence). Before: the List argument was refused -> IllegalArgumentException.
+const SYSANSWERS: &str = "AtlTest: sysanswers: ";
+const SYSANSWERS_WANT: &str = "checksums=0";
 /// Main.settings' line, answered by AOSP SettingsProvider in its own process (`id=<s> again=<b> screen_off=<s> auto_time=<s> rotation=<s>`, [`settings_why`]).
 const SETTINGS: &str = "AtlTest: settings: ";
 /// The line after `id=`: the defaults DatabaseHelper loads from SettingsProvider's res/values/defaults.xml -- def_screen_off_timeout 60000, def_auto_time true (loadBooleanSetting writes "1"),
@@ -2134,6 +2139,15 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
             "processes: want {PROCESSES_WANT:?}, got {processes:?}"
         ));
     }
+    let sysanswers = app.lines().find_map(|l| {
+        l.split_once(SYSANSWERS)
+            .map(|(_, r)| r.trim_end().to_owned())
+    });
+    if passed && sysanswers.as_deref() != Some(SYSANSWERS_WANT) {
+        whys.push(format!(
+            "sysanswers: want {SYSANSWERS_WANT:?}, got {sysanswers:?}"
+        ));
+    }
     let after = |prefix: &str| {
         app.lines()
             .find_map(|l| l.split_once(prefix).map(|(_, r)| r.trim_end().to_owned()))
@@ -2312,6 +2326,7 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
             println!("app: pass {service} {}", service_want(*want));
         }
         println!("app: pass processes {PROCESSES_WANT}");
+        println!("app: pass sysanswers {SYSANSWERS_WANT}");
         println!(
             "app: pass webview-ua {}",
             webview_ua.as_deref().unwrap_or_default()

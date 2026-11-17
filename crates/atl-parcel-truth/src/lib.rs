@@ -60,7 +60,7 @@ use atl_parcelables::com::android::internal::inputmethod::{
 };
 use atl_parcelables::java::io::FileDescriptor;
 use atl_parcelables::java::lang::CharSequence;
-use atl_parcelables::java::util::Map;
+use atl_parcelables::java::util::{List, Map};
 use atl_parcelables::parts::{ParsedIntentInfo, Part};
 use binder::binder_impl::{BorrowedParcel, Parcel, UnstructuredParcelable};
 use binder::unstable_api::{AParcel, AsNative};
@@ -143,10 +143,13 @@ fn round_trip_part<T: Part>(input: &[u8], mode: i32) -> Result<Vec<u8>, String> 
     finish(&out, mode)
 }
 
-/// java.util.Map as AIDL's typed `in Map<String, String>` carries it (no parcelable null flag: null is size -1), so through its Option form.
-fn round_trip_map(input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
+/// java.util.Map (typed `in Map<String, String>`) and java.util.List (raw `in List`, Parcel.writeList) as AIDL carries them: no parcelable null flag (null is size -1), so through their Option form.
+fn round_trip_sized<T>(input: &[u8], mode: i32) -> Result<Vec<u8>, String>
+where
+    Option<T>: binder::binder_impl::Serialize + binder::binder_impl::Deserialize,
+{
     let p = unmarshal(input)?;
-    let v: Option<Map> = p.read().map_err(|e| format!("decode refused: {e:?}"))?;
+    let v: Option<T> = p.read().map_err(|e| format!("decode refused: {e:?}"))?;
     if p.get_data_position() != p.get_data_size() {
         return Err(format!(
             "decode stopped at byte {} of {}",
@@ -378,7 +381,8 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
         "android.view.InputDevice" => round_trip_as::<InputDevice>(input, mode),
         "android.view.PointerIcon" => round_trip_as::<PointerIcon>(input, mode),
         "android.view.inputmethod.EditorInfo" => round_trip_as::<EditorInfo>(input, mode),
-        "java.util.Map" => round_trip_map(input, mode),
+        "java.util.Map" => round_trip_sized::<Map>(input, mode),
+        "java.util.List" => round_trip_sized::<List>(input, mode),
         _ => Err(format!("no codec for {class}")),
     }
 }

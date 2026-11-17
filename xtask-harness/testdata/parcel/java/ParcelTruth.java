@@ -299,6 +299,10 @@ public class ParcelTruth {
         contexts.put("/data/app/com.example.app/split.apk", null);
         checkMap("Map", contexts);
         checkMap("Map:null", null);
+        // IPackageManager.requestPackageChecksums' trustedInstallers: two encoded certificates (odd length: the 4-byte padding) and a null element; null = TRUST_ALL; empty = TRUST_NONE
+        checkList("List", Arrays.asList(new byte[] {0x30, (byte) 0x82, 0x01}, null, new byte[] {1, 2, 3, 4, 5}));
+        checkList("List:null", null);
+        checkList("List:empty", new java.util.ArrayList<>());
         // IApplicationThread.bindApplication's coreSettings: the empty Bundle M2 sends
         check("Bundle", new Bundle(), Bundle.CREATOR);
         // a non-empty Bundle: the codec copies its body verbatim
@@ -1664,6 +1668,58 @@ public class ParcelTruth {
         in.recycle();
         boolean ok = consumed && Objects.equals(m, back);
         result(ok, name, ok ? java.length + " bytes, java -> rust byte-equal, java reads rust's map back equal" : "java reads rust's bytes as " + back + " (consumed " + consumed + ")");
+    }
+
+    /// Captures the `in List trustedInstallers` bytes of a requestPackageChecksums transaction (the arguments before it: String, boolean, int, int).
+    static class ChecksumsCapture extends Binder {
+        byte[] list;
+
+        @Override
+        protected boolean onTransact(int code, Parcel data, Parcel reply, int flags) {
+            data.enforceInterface("android.content.pm.IPackageManager");
+            data.readString();
+            data.readBoolean();
+            data.readInt();
+            data.readInt();
+            int start = data.dataPosition();
+            data.readArrayList(null, Object.class);
+            list = Arrays.copyOfRange(data.marshall(), start, data.dataPosition());
+            return true;
+        }
+    }
+
+    /// java.util.List as AIDL's raw `in List` carries it (Parcel.writeList): bytes from the real generated IPackageManager Proxy (requestPackageChecksums, the encoded certificates
+    /// ApplicationPackageManager.encodeCertificates sends: byte[] elements, null for TRUST_ALL); Java reads Rust's bytes back with readArrayList, as the Stub does.
+    static void checkList(String name, List<byte[]> l) {
+        ChecksumsCapture capture = new ChecksumsCapture();
+        try {
+            IPackageManager.Stub.asInterface(capture).requestPackageChecksums("com.example.app", false, 0, 0, l, null, 0);
+        } catch (Exception e) {
+            result(false, name, "generated proxy: " + e);
+            return;
+        }
+        byte[] java = capture.list;
+        byte[] rust = roundTrip("java.util.List", java, MODE_PLAIN);
+        if (rust == null) {
+            result(false, name, "rust: " + lastError());
+            return;
+        }
+        if (!Arrays.equals(java, rust)) {
+            result(false, name, "rust bytes differ from java's at byte " + firstDiff(java, rust) + " (" + rust.length + " vs " + java.length + ")");
+            return;
+        }
+        Parcel in = Parcel.obtain();
+        in.unmarshall(rust, 0, rust.length);
+        in.setDataPosition(0);
+        List<?> back = in.readArrayList(null, Object.class);
+        boolean consumed = in.dataPosition() == rust.length;
+        in.recycle();
+        boolean same = (l == null) == (back == null);
+        for (int i = 0; same && l != null && i < l.size(); i++) {
+            same = back.size() == l.size() && (l.get(i) == null ? back.get(i) == null : back.get(i) instanceof byte[] && Arrays.equals(l.get(i), (byte[]) back.get(i)));
+        }
+        boolean ok = consumed && same;
+        result(ok, name, ok ? java.length + " bytes, java -> rust byte-equal, java reads rust's list back equal" : "java reads rust's bytes as " + back + " (consumed " + consumed + ")");
     }
 
     static void selfTests(Configuration config, Intent intent, Bundle entries) {
