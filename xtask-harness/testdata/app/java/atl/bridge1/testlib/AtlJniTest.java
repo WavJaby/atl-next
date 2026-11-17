@@ -158,6 +158,9 @@ public final class AtlJniTest {
     /** aaudio-guest-route: an AAudio output stream with a data callback, opened through dlopen("libaaudio.so") as Unity FMOD does (atl_jni_test.c aaudioProbe). */
     public static native String aaudioProbe();
 
+    /** aaudio-guest-route: the same stream in Angry Birds 2's FMOD shape, float at 24000 Hz (atl_jni_test.c aaudioFloatProbe). */
+    public static native String aaudioFloatProbe();
+
     /** ab2-load: the CPU count by every native route plus the caller's Runtime.availableProcessors, and the /proc/cpuinfo features word (atl_jni_test.c cpuProbe). */
     public static native String cpuProbe(int java);
 

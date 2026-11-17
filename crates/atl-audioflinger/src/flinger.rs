@@ -30,8 +30,6 @@ const INTERFACE: &str = "IAudioFlingerService";
 const AUDIO_OUTPUT_FLAG_FAST: i32 = 0x4;
 /// `AUDIO_CHANNEL_OUT_MONO` (audio-hal-enums.h): front left only.
 const CHANNEL_OUT_MONO: i32 = 0x1;
-/// Bytes per sample of the only track format served, PCM 16-bit.
-const BYTES_PER_SAMPLE: usize = 2;
 
 /// The audio_io_handle_t of the one output: a unique id of use OUTPUT, made at first use and kept.
 pub(crate) fn output_handle() -> i32 {
@@ -55,19 +53,44 @@ pub(crate) fn output_layout() -> AudioChannelLayout {
     AudioChannelLayout::LayoutMask(OUTPUT_CHANNEL_MASK)
 }
 
-/// The channel count and mask of a PCM 16-bit mono or stereo config; None for any other format or layout (served later, or refused).
-fn pcm16_layout(config: &AudioConfig) -> Option<(usize, u32)> {
-    let base = &config.base;
-    if base.format.r#type != AudioFormatType::PCM || base.format.r#pcm != PcmType::INT_16_BIT {
+/// A served track layout: its sample format, channel count and mask.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Layout {
+    format: track::PcmFormat,
+    channels: usize,
+    channel_mask: u32,
+}
+
+/// The linear PCM format of an AIDL description, as AOSP converts it to audio_format_t (AidlConversionCppNdk.cpp getAudioFormatPairs), when the mixer takes it (AudioMixerBase::isValidFormat, checked by MixerThread::isTrackAllowed_l):
+/// 8-bit, 16-bit, packed 24-bit, 32-bit and float. Q8.24 (AUDIO_FORMAT_PCM_8_24_BIT) is linear PCM but not a mixer format, so AOSP refuses it on a mixer thread as here; anything not PCM is BAD_VALUE (createTrack_l: !audio_is_linear_pcm).
+fn mixer_format(format: &AudioFormatDescription) -> Option<track::PcmFormat> {
+    if format.r#type != AudioFormatType::PCM || !format.r#encoding.is_empty() {
         return None;
     }
-    match base.channelMask {
-        AudioChannelLayout::LayoutMask(CHANNEL_OUT_MONO) => Some((1, CHANNEL_OUT_MONO as u32)),
-        AudioChannelLayout::LayoutMask(OUTPUT_CHANNEL_MASK) => {
-            Some((2, OUTPUT_CHANNEL_MASK as u32))
-        }
+    match format.r#pcm {
+        PcmType::UINT_8_BIT => Some(track::PcmFormat::U8),
+        PcmType::INT_16_BIT => Some(track::PcmFormat::I16),
+        PcmType::INT_24_BIT => Some(track::PcmFormat::I24Packed),
+        PcmType::INT_32_BIT => Some(track::PcmFormat::I32),
+        PcmType::FLOAT_32_BIT => Some(track::PcmFormat::Float),
         _ => None,
     }
+}
+
+/// The layout of a track config the mixer serves, or the refusal's counter name. Channels: mono and stereo; AOSP's mixer takes up to 8 (isValidChannelMask) and downmixes more than 2 through AudioMixer's DownmixerBufferProvider, which the bridge does not build (wrap/mix.h).
+fn track_layout(config: &AudioConfig) -> Result<Layout, &'static str> {
+    let base = &config.base;
+    let format = mixer_format(&base.format).ok_or("createTrack.format")?;
+    let (channels, channel_mask) = match base.channelMask {
+        AudioChannelLayout::LayoutMask(CHANNEL_OUT_MONO) => (1, CHANNEL_OUT_MONO as u32),
+        AudioChannelLayout::LayoutMask(OUTPUT_CHANNEL_MASK) => (2, OUTPUT_CHANNEL_MASK as u32),
+        _ => return Err("createTrack.channelMask"),
+    };
+    Ok(Layout {
+        format,
+        channels,
+        channel_mask,
+    })
 }
 
 struct AudioFlinger {
@@ -173,7 +196,7 @@ impl IAudioFlingerService for AudioFlinger {
         Ok(())
     }
 
-    /// AudioFlinger::createTrack (Tracks.cpp): a PCM 16-bit mono or stereo track with its region, its server side in the output's mixer, and an IAudioTrack. A streaming track gets its own buffer after the control block; a shared-buffer (static) track takes the client's (SoundPool's streams).
+    /// AudioFlinger::createTrack (Tracks.cpp): a linear PCM mono or stereo track in a mixer format (`mixer_format`) with its region, its server side in the output's mixer, and an IAudioTrack. A streaming track gets its own buffer after the control block; a shared-buffer (static) track takes the client's (SoundPool's streams).
     /// FAST is refused and cleared from the response flags, so the client keeps the track on the normal path (AudioTrack.cpp createTrack_l takes the flags the server returns).
     fn r#createTrack(
         &self,
@@ -189,9 +212,17 @@ impl IAudioFlingerService for AudioFlinger {
         let Some(config) = request.config.as_ref() else {
             return refused();
         };
-        let Some((channels, channel_mask)) = pcm16_layout(config) else {
-            tracing::warn!("createTrack: format or layout not served");
-            return refused();
+        let Layout {
+            format,
+            channels,
+            channel_mask,
+        } = match track_layout(config) {
+            Ok(layout) => layout,
+            Err(what) => {
+                tracing::warn!(format = ?config.base.format, mask = ?config.base.channelMask, "{what}: not served");
+                atl_diag::refused(INTERFACE, what);
+                return refused();
+            }
         };
         let Ok(requested_rate) = u32::try_from(config.base.sampleRate) else {
             return refused();
@@ -215,7 +246,7 @@ impl IAudioFlingerService for AudioFlinger {
             0 => out.profile.rate_hz,
             r => r,
         };
-        let frame_bytes = channels * BYTES_PER_SAMPLE;
+        let frame_bytes = channels * format.sample_bytes();
         let fast_denied = request.flags & AUDIO_OUTPUT_FLAG_FAST != 0;
         let sizing = track::Sizing {
             quantum: out.profile.quantum,
@@ -251,6 +282,7 @@ impl IAudioFlingerService for AudioFlinger {
                 match track::server_shared(
                     &region,
                     shared,
+                    format,
                     channels,
                     frames,
                     frame_bytes,
@@ -285,7 +317,7 @@ impl IAudioFlingerService for AudioFlinger {
                         return Err(status.into());
                     }
                 };
-                match track::server_streaming(&region, frames, frame_bytes, track_rate) {
+                match track::server_streaming(&region, format, frames, frame_bytes, track_rate) {
                     Ok(server) => (frames, region, server),
                     Err(status) => {
                         atl_diag::refused(INTERFACE, "createTrack.region");
@@ -328,4 +360,49 @@ impl IAudioFlingerService for AudioFlinger {
 pub(crate) fn new_binder(opts: Options, output: Opener) -> SpIBinder {
     BnAudioFlingerService::new_binder(AudioFlinger { opts, output }, BinderFeatures::default())
         .as_binder()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pcm(pcm: PcmType) -> AudioFormatDescription {
+        AudioFormatDescription {
+            r#type: AudioFormatType::PCM,
+            r#pcm: pcm,
+            r#encoding: String::new(),
+        }
+    }
+
+    // AudioMixerBase::isValidFormat's five formats are served; Q8.24 (linear, not a mixer format) and a non-PCM encoding are refused.
+    #[test]
+    fn mixer_formats_as_aosp() {
+        assert_eq!(
+            mixer_format(&pcm(PcmType::INT_16_BIT)),
+            Some(track::PcmFormat::I16)
+        );
+        assert_eq!(
+            mixer_format(&pcm(PcmType::FLOAT_32_BIT)),
+            Some(track::PcmFormat::Float)
+        );
+        assert_eq!(
+            mixer_format(&pcm(PcmType::UINT_8_BIT)),
+            Some(track::PcmFormat::U8)
+        );
+        assert_eq!(
+            mixer_format(&pcm(PcmType::INT_24_BIT)),
+            Some(track::PcmFormat::I24Packed)
+        );
+        assert_eq!(
+            mixer_format(&pcm(PcmType::INT_32_BIT)),
+            Some(track::PcmFormat::I32)
+        );
+        assert_eq!(mixer_format(&pcm(PcmType::FIXED_Q_8_24)), None);
+        let mp3 = AudioFormatDescription {
+            r#type: AudioFormatType::NON_PCM,
+            r#pcm: PcmType::DEFAULT,
+            r#encoding: "audio/mpeg".to_owned(),
+        };
+        assert_eq!(mixer_format(&mp3), None);
+    }
 }

@@ -237,7 +237,7 @@ fn lock(mixer: &Shared) -> Option<MixGuard<'_>> {
     mixer.hold()
 }
 
-/// Adds a track's server side to the mix (disabled) as PCM 16-bit in `channel_mask`; its name, or None.
+/// Adds a track's server side to the mix (disabled) in its format and `channel_mask`; its name, or None.
 pub(crate) fn add_track(
     mixer: &Shared,
     track: Server,

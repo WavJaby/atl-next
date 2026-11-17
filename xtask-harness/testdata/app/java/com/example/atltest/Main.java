@@ -1241,6 +1241,7 @@ public class Main extends Activity {
         bridge1Call(jni, "windowProbe", "windowProbe", probeSurface());
         bridge1Call(jni, "mediandkLinked", "mediandkLinked");
         bridge1Call(jni, "aaudioProbe", "aaudioProbe");
+        bridge1Call(jni, "aaudioFloatProbe", "aaudioFloatProbe");
         bridge1Call(jni, "resolverProbe", "resolverProbe");
         bridge1Call(jni, "cpuProbe", "cpuProbe", Runtime.getRuntime().availableProcessors());
         bridge1Call(jni, "cpuinfoView", "cpuinfoView", procCpuinfo());

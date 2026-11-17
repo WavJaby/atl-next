@@ -665,6 +665,7 @@ static struct {
     volatile int64_t frames_at_n;
     AAudioStream *stream;
     pid_t caller;
+    size_t frame_bytes;
 } g_aaudio;
 
 static aaudio_data_callback_result_t aaudio_probe_cb(AAudioStream *stream, void *user, void *audio, int32_t frames)
@@ -672,16 +673,16 @@ static aaudio_data_callback_result_t aaudio_probe_cb(AAudioStream *stream, void 
     if (user != &g_aaudio || stream != g_aaudio.stream || gettid() == g_aaudio.caller || frames <= 0)
         g_aaudio.bad++;
     else
-        memset(audio, 0, (size_t)frames * 2 * sizeof(int16_t)); // silence into the track's buffer: a guest store to host memory
+        memset(audio, 0, (size_t)frames * g_aaudio.frame_bytes); // silence (0 in both I16 and float) into the track's buffer: a guest store to host memory
     g_aaudio.frames += frames;
     if (++g_aaudio.calls == AAUDIO_PROBE_CALLS)
         g_aaudio.frames_at_n = g_aaudio.frames;
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
-// AtlJniTest.aaudioProbe: Unity FMOD's route -- dlopen libaaudio.so by name (no DT_NEEDED), a PCM 16 stereo output stream with a data callback, started until the callback ran AAUDIO_PROBE_CALLS times (2 s limit), stopped, closed.
+// Unity FMOD's route -- dlopen libaaudio.so by name (no DT_NEEDED), a stereo output stream of `format` at `rate` (0 = unspecified) with a data callback, started until the callback ran AAUDIO_PROBE_CALLS times (2 s limit), stopped, closed.
 // "aaudio open <rc> start <rc> calls <1: reached N> frames <1: getFramesWritten after stop >= the frames handed out by the Nth call> bad <wrong stream / user data / on the caller's thread> stop <rc> close <rc>"; "aaudio dlopen null" when the guest finds no libaaudio.
-JNI_FN(jstring, aaudioProbe)(JNIEnv *env, jclass cls)
+static jstring aaudio_probe(JNIEnv *env, aaudio_format_t format, size_t sample_bytes, int32_t rate)
 {
     char line[128];
     void *lib = dlopen("libaaudio.so", RTLD_NOW);
@@ -691,6 +692,7 @@ JNI_FN(jstring, aaudioProbe)(JNIEnv *env, jclass cls)
     aaudio_result_t (*create)(AAudioStreamBuilder **) = dlsym(lib, "AAudio_createStreamBuilder");
     void (*set_format)(AAudioStreamBuilder *, aaudio_format_t) = dlsym(lib, "AAudioStreamBuilder_setFormat");
     void (*set_channels)(AAudioStreamBuilder *, int32_t) = dlsym(lib, "AAudioStreamBuilder_setChannelCount");
+    void (*set_rate)(AAudioStreamBuilder *, int32_t) = dlsym(lib, "AAudioStreamBuilder_setSampleRate");
     void (*set_cb)(AAudioStreamBuilder *, AAudioStream_dataCallback, void *) = dlsym(lib, "AAudioStreamBuilder_setDataCallback");
     aaudio_result_t (*open_stream)(AAudioStreamBuilder *, AAudioStream **) = dlsym(lib, "AAudioStreamBuilder_openStream");
     aaudio_result_t (*delete_builder)(AAudioStreamBuilder *) = dlsym(lib, "AAudioStreamBuilder_delete");
@@ -698,15 +700,17 @@ JNI_FN(jstring, aaudioProbe)(JNIEnv *env, jclass cls)
     aaudio_result_t (*stop)(AAudioStream *) = dlsym(lib, "AAudioStream_requestStop");
     int64_t (*written)(AAudioStream *) = dlsym(lib, "AAudioStream_getFramesWritten");
     aaudio_result_t (*close_stream)(AAudioStream *) = dlsym(lib, "AAudioStream_close");
-    if (!create || !set_format || !set_channels || !set_cb || !open_stream || !delete_builder || !start || !stop || !written || !close_stream)
+    if (!create || !set_format || !set_channels || !set_rate || !set_cb || !open_stream || !delete_builder || !start || !stop || !written || !close_stream)
         return (*env)->NewStringUTF(env, "aaudio dlsym null");
     memset((void *)&g_aaudio, 0, sizeof g_aaudio);
     g_aaudio.caller = gettid();
+    g_aaudio.frame_bytes = 2 * sample_bytes;
     AAudioStreamBuilder *b = NULL;
     if (create(&b) != AAUDIO_OK)
         return (*env)->NewStringUTF(env, "aaudio builder failed");
-    set_format(b, AAUDIO_FORMAT_PCM_I16);
+    set_format(b, format);
     set_channels(b, 2);
+    set_rate(b, rate);
     set_cb(b, aaudio_probe_cb, &g_aaudio);
     AAudioStream *s = NULL;
     aaudio_result_t open_rc = open_stream(b, &s);
@@ -725,6 +729,18 @@ JNI_FN(jstring, aaudioProbe)(JNIEnv *env, jclass cls)
     snprintf(line, sizeof line, "aaudio open %d start %d calls %d frames %d bad %d stop %d close %d", open_rc, start_rc, reached,
              reached && w >= g_aaudio.frames_at_n, g_aaudio.bad, stop_rc, close_stream(s));
     return (*env)->NewStringUTF(env, line);
+}
+
+// AtlJniTest.aaudioProbe: PCM 16-bit, rate unspecified (the output's, createTrack_l's rate 0).
+JNI_FN(jstring, aaudioProbe)(JNIEnv *env, jclass cls)
+{
+    return aaudio_probe(env, AAUDIO_FORMAT_PCM_I16, sizeof(int16_t), AAUDIO_UNSPECIFIED);
+}
+
+// AtlJniTest.aaudioFloatProbe: Angry Birds 2's FMOD stream -- float, 24000 Hz (resampled to the output's rate by the mixer).
+JNI_FN(jstring, aaudioFloatProbe)(JNIEnv *env, jclass cls)
+{
+    return aaudio_probe(env, AAUDIO_FORMAT_PCM_FLOAT, sizeof(float), 24000);
 }
 
 // AtlJniTest.cpuProbe (ab2-load): every route app code counts CPUs by, as bionic answers it in this process. sysconf CONF/ONLN = get_nprocs_conf/get_nprocs (bionic sysconf.cpp; those two are API 23, above the fixture's level), which read /sys/devices/system/cpu/{possible,online} (bionic sysinfo.cpp: 1 when the file is missing); affinity = CPU_COUNT of sched_getaffinity; cpuinfo = the `processor` lines of /proc/cpuinfo;

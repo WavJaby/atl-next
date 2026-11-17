@@ -115,9 +115,10 @@ pub struct Track {
 }
 
 impl Track {
-    /// A streaming track: the client writes `frames` frames of `frame_bytes` after the control block, which `cblk` maps.
+    /// A streaming track: the client writes `frames` frames of `frame_bytes` in linear PCM `format` (an audio_format_t AudioMixerBase::isValidFormat takes; the mixer refuses others at [`Mix::add`]) after the control block, which `cblk` maps.
     pub fn streaming(
         cblk: Mapping,
+        format: u32,
         frames: usize,
         frame_bytes: usize,
         rate: u32,
@@ -135,7 +136,15 @@ impl Track {
         let buffer = cblk.as_ptr().wrapping_add(cblk_bytes());
         // SAFETY: `cblk` maps `need` bytes (checked above), and the track owns the mapping, so the control block and the frames after it stay mapped while the proxy lives.
         let proxy = unsafe {
-            bridge::ffi::new_track(cblk.as_ptr(), buffer, frames, frame_bytes, false, rate)
+            bridge::ffi::new_track(
+                cblk.as_ptr(),
+                buffer,
+                format,
+                frames,
+                frame_bytes,
+                false,
+                rate,
+            )
         };
         Ok(Self {
             proxy,
@@ -146,10 +155,11 @@ impl Track {
         })
     }
 
-    /// A static (shared-buffer) track: `buffer` holds the client's `frames` frames, read in place and never written.
+    /// A static (shared-buffer) track: `buffer` holds the client's `frames` frames in `format` (as [`Track::streaming`]), read in place and never written.
     pub fn shared(
         cblk: Mapping,
         buffer: Mapping,
+        format: u32,
         frames: usize,
         frame_bytes: usize,
         rate: u32,
@@ -175,6 +185,7 @@ impl Track {
             bridge::ffi::new_track(
                 cblk.as_ptr(),
                 buffer.as_ptr(),
+                format,
                 frames,
                 frame_bytes,
                 true,
@@ -211,7 +222,7 @@ impl Mix {
         }
     }
 
-    /// Adds `track`, disabled, as PCM 16-bit in `channel_mask` (mono or stereo) of `session`. Returns its name, or None when AOSP refuses the format (then `track` is dropped).
+    /// Adds `track`, disabled, in its format and `channel_mask` (mono or stereo) of `session`. Returns its name, or None when AOSP refuses the format (then `track` is dropped).
     pub fn add(&mut self, mut track: Track, session: i32, channel_mask: u32) -> Option<i32> {
         let name = self.next_name;
         let added = bridge::ffi::mix_add(

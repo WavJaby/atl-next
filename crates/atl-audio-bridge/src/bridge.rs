@@ -15,9 +15,11 @@ pub(crate) mod ffi {
         fn cblk_bytes() -> usize;
         /// # Safety
         /// `cblk` addresses `cblk_bytes()` bytes and `buffer` `frames * frame_bytes` bytes, both mapped read-write (static: read-only is enough for the buffer) and kept mapped for the life of the returned track.
+        /// `format` (audio_format_t) is the frames' format; `frame_bytes` a whole number of its samples.
         unsafe fn new_track(
             cblk: *mut u8,
             buffer: *mut u8,
+            format: u32,
             frames: usize,
             frame_bytes: usize,
             is_static: bool,

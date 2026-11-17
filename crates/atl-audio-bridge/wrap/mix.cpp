@@ -41,10 +41,11 @@ bool apply_volume(Mix& mix, Track& track, int32_t name) {
 
 }  // namespace
 
-Track::Track(android::sp<android::AudioTrackServerProxy> server, size_t channels_per_frame)
-    : proxy(std::move(server)), channels(channels_per_frame) {}
+Track::Track(android::sp<android::AudioTrackServerProxy> server, audio_format_t track_format, size_t channels_per_frame)
+    : proxy(std::move(server)), format(track_format), channels(channels_per_frame) {}
 
-// Track::getNextBuffer (Tracks.cpp:1252): the proxy hands out what the client has written, PCM 16-bit. The mixer reads float (AudioMixerBase::create sets mMixerInFormat to PCM_FLOAT; nothing changes it), so the frames go through AOSP's conversion: the copy ReformatBufferProvider::copyFrames makes (BufferProviders.cpp:412). That class is not linked: its object needs libaudiohal (EffectsFactoryHalInterface) and libsonic.
+// Track::getNextBuffer (Tracks.cpp:1252): the proxy hands out what the client has written, in the track's format. The mixer reads float (AudioMixerBase::create sets mMixerInFormat to PCM_FLOAT; nothing changes it), so the frames go through AOSP's conversion: the copy ReformatBufferProvider::copyFrames makes (BufferProviders.cpp:412), which AudioMixer inserts for any track format other than the mixer's. That class is not linked: its object needs libaudiohal (EffectsFactoryHalInterface) and libsonic.
+// A float track is copied as is (memcpy_by_audio_format of equal formats is a memcpy), still into `floats`: one buffer shape for every format.
 android::status_t Track::getNextBuffer(Buffer* buffer) {
     android::ServerProxy::Buffer buf;
     buf.mFrameCount = buffer->frameCount;
@@ -59,7 +60,7 @@ android::status_t Track::getNextBuffer(Buffer* buffer) {
         return status;
     }
     g_track_frames.fetch_add(frames, std::memory_order_relaxed);
-    memcpy_by_audio_format(floats.data(), AUDIO_FORMAT_PCM_FLOAT, server_raw, AUDIO_FORMAT_PCM_16_BIT, frames * channels);
+    memcpy_by_audio_format(floats.data(), AUDIO_FORMAT_PCM_FLOAT, server_raw, format, frames * channels);
     buffer->raw = floats.data();
     return status;
 }
@@ -88,8 +89,9 @@ size_t cblk_bytes() {
 }
 
 // TrackBase's placement construction (Tracks.cpp:209), then the proxy the server reads the track through (Tracks.cpp:943-946).
-std::unique_ptr<Track> new_track(uint8_t* cblk_mem, uint8_t* buffer, size_t frames, size_t frame_bytes,
+std::unique_ptr<Track> new_track(uint8_t* cblk_mem, uint8_t* buffer, uint32_t format, size_t frames, size_t frame_bytes,
                                  bool is_static, uint32_t rate) {
+    const auto track_format = static_cast<audio_format_t>(format);
     auto* cblk = new (cblk_mem) android::audio_track_cblk_t();
     android::sp<android::AudioTrackServerProxy> server;
     if (is_static) {
@@ -99,8 +101,8 @@ std::unique_ptr<Track> new_track(uint8_t* cblk_mem, uint8_t* buffer, size_t fram
         server = new android::AudioTrackServerProxy(cblk, buffer, frames, frame_bytes,
                                                     /*clientInServer=*/false, rate);
     }
-    // PCM 16-bit frames: one int16 per channel (frame_bytes is channels x 2)
-    return std::make_unique<Track>(std::move(server), frame_bytes / sizeof(int16_t));
+    // one sample per channel: frame_bytes is channels x audio_bytes_per_sample(format) (createTrack_l's frameSize)
+    return std::make_unique<Track>(std::move(server), track_format, frame_bytes / audio_bytes_per_sample(track_format));
 }
 
 std::unique_ptr<Mix> new_mix(size_t quantum_frames, uint32_t rate) {
@@ -112,7 +114,7 @@ bool mix_add(Mix& mix, Track& track, int32_t name, int32_t session, uint32_t cha
     if (mix.exists(name)) {
         return false;
     }
-    if (mix.create(name, static_cast<audio_channel_mask_t>(channel_mask), AUDIO_FORMAT_PCM_16_BIT, session) != android::OK) {
+    if (mix.create(name, static_cast<audio_channel_mask_t>(channel_mask), track.format, session) != android::OK) {
         return false;
     }
     // the conversion target for one quantum of frames (control call: outside the realtime fill)

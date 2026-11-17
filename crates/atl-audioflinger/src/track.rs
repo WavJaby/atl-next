@@ -19,8 +19,33 @@ const INTERFACE: &str = "IAudioTrack";
 const NO_ERROR: i32 = 0;
 /// status_t BAD_VALUE (-EINVAL).
 const BAD_VALUE: i32 = -22;
-/// `sizeof(sample)` of PCM 16-bit, the only track format served.
-const PCM16_BYTES: usize = 2;
+/// A linear PCM track format the mixer takes (AudioMixerBase::isValidFormat); the value is its audio_format_t (audio-hal-enums.h).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub(crate) enum PcmFormat {
+    I16 = 0x1,
+    U8 = 0x2,
+    I32 = 0x3,
+    Float = 0x5,
+    I24Packed = 0x6,
+}
+
+impl PcmFormat {
+    /// audio_bytes_per_sample (audio.h).
+    pub(crate) fn sample_bytes(self) -> usize {
+        match self {
+            Self::U8 => 1,
+            Self::I16 => 2,
+            Self::I24Packed => 3,
+            Self::I32 | Self::Float => 4,
+        }
+    }
+
+    /// The audio_format_t the server side and mixer are created with.
+    pub(crate) fn audio_format(self) -> u32 {
+        self as u32
+    }
+}
 /// Largest track in frames: 2^22 frames of 4 bytes is a 16 MiB region. AOSP only checks size overflow (Tracks.cpp:167, :183); this bound keeps a bad request from allocating the address space.
 const MAX_FRAMES: usize = 1 << 22;
 
@@ -114,6 +139,7 @@ pub(crate) fn allocate(buffer_bytes: usize, break_cblk: bool) -> Result<Region, 
 /// The server side of a streaming track: its region mapped read-write, the frames after the control block.
 pub(crate) fn server_streaming(
     region: &Region,
+    format: PcmFormat,
     frames: usize,
     frame_bytes: usize,
     rate: u32,
@@ -122,16 +148,17 @@ pub(crate) fn server_streaming(
         tracing::error!(%e, "track region mapping");
         StatusCode::NO_MEMORY
     })?;
-    Server::streaming(cblk, frames, frame_bytes, rate).map_err(|e| {
+    Server::streaming(cblk, format.audio_format(), frames, frame_bytes, rate).map_err(|e| {
         tracing::error!(%e, "streaming track layout");
         StatusCode::NO_MEMORY
     })
 }
 
-/// The server side of a static track: the client's shared buffer, mapped read-only, and the control block of `region`. The buffer's address must meet AudioFlinger's alignment (Threads.cpp:2558): the sample size, doubled for more than one channel.
+/// The server side of a static track: the client's shared buffer, mapped read-only, and the control block of `region`. The buffer's address must meet AudioFlinger's alignment (Threads.cpp:2547-2558): the sample size (1 for packed 24-bit), doubled for more than one channel.
 pub(crate) fn server_shared(
     region: &Region,
     shared: &SharedFileRegion,
+    format: PcmFormat,
     channels: usize,
     frames: usize,
     frame_bytes: usize,
@@ -144,11 +171,11 @@ pub(crate) fn server_shared(
         tracing::error!(%e, "static buffer mapping");
         StatusCode::NO_MEMORY
     })?;
-    let alignment = if channels > 1 {
-        PCM16_BYTES << 1
-    } else {
-        PCM16_BYTES
+    let sample = match format.sample_bytes() {
+        odd if odd & 1 == 1 => 1,
+        even => even,
     };
+    let alignment = if channels > 1 { sample << 1 } else { sample };
     if buffer.address() % alignment != 0 {
         tracing::error!(
             address = buffer.address(),
@@ -161,7 +188,15 @@ pub(crate) fn server_shared(
         tracing::error!(%e, "track region mapping");
         StatusCode::NO_MEMORY
     })?;
-    Server::shared(cblk, buffer, frames, frame_bytes, rate).map_err(|e| {
+    Server::shared(
+        cblk,
+        buffer,
+        format.audio_format(),
+        frames,
+        frame_bytes,
+        rate,
+    )
+    .map_err(|e| {
         tracing::error!(%e, "static track layout");
         StatusCode::NO_MEMORY
     })

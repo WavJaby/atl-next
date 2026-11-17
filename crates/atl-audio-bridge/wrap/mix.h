@@ -18,13 +18,15 @@
 
 namespace atl::audio {
 
-/// One track's server side: the proxy over its control block and buffer, read as PCM 16-bit and handed to the mixer as float (Track::getNextBuffer).
+/// One track's server side: the proxy over its control block and buffer, read in the track's format and handed to the mixer as float (Track::getNextBuffer).
 struct Track final : public android::AudioBufferProvider {
-    Track(android::sp<android::AudioTrackServerProxy> server, size_t channels_per_frame);
+    Track(android::sp<android::AudioTrackServerProxy> server, audio_format_t track_format, size_t channels_per_frame);
     android::status_t getNextBuffer(Buffer* buffer) override;
     void releaseBuffer(Buffer* buffer) override;
 
     android::sp<android::AudioTrackServerProxy> proxy;
+    /// The client's sample format (linear PCM, one AudioMixerBase::isValidFormat takes).
+    audio_format_t format;
     /// Interleaved channels of the server buffer (1 or 2).
     size_t channels;
     /// The float frames the mixer reads: one quantum, sized by mix_add outside the realtime fill.
@@ -49,10 +51,11 @@ struct Mix final : public android::AudioMixerBase {
 
 /// sizeof(audio_track_cblk_t) on x86_64 (LP64), the layout the Rust side maps: checked against AudioTrackShared.h at compile time (the static_assert in mix.cpp).
 size_t cblk_bytes();
-/// `cblk` addresses cblk_bytes() bytes; `buffer` the track's frames (`frames` of `frame_bytes`): cblk + cblk_bytes() for a streaming track, the client's buffer for a static one.
-std::unique_ptr<Track> new_track(uint8_t* cblk, uint8_t* buffer, size_t frames, size_t frame_bytes, bool is_static, uint32_t rate);
+/// `cblk` addresses cblk_bytes() bytes; `buffer` the track's frames (`frames` of `frame_bytes`, samples in audio_format_t `format`): cblk + cblk_bytes() for a streaming track, the client's buffer for a static one.
+std::unique_ptr<Track> new_track(uint8_t* cblk, uint8_t* buffer, uint32_t format, size_t frames, size_t frame_bytes, bool is_static,
+                                 uint32_t rate);
 std::unique_ptr<Mix> new_mix(size_t quantum_frames, uint32_t rate);
-/// AudioMixerBase::create (PCM 16-bit, `channel_mask`, `session`) under track name `name`, with the track's buffer provider and float mixing; the track starts disabled. False when AOSP refuses it.
+/// AudioMixerBase::create (the track's format, `channel_mask`, `session`) under track name `name`, with the track's buffer provider and float mixing; the track starts disabled. False when AOSP refuses it.
 bool mix_add(Mix& mix, Track& track, int32_t name, int32_t session, uint32_t channel_mask, uint32_t rate);
 void mix_remove(Mix& mix, int32_t name);
 /// On: starts the server side (AudioTrackServerProxy::start), follows the client's volume and enables the track. Off: disables it.

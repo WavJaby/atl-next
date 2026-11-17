@@ -881,6 +881,11 @@ const BRIDGE1_CALLS: &[(&str, &str)] = &[
         "aaudioProbe",
         "aaudio open 0 start 0 calls 1 frames 1 bad 0 stop 0 close 0",
     ),
+    // the same in Angry Birds 2's FMOD shape (aaudioFloatProbe): AAUDIO_FORMAT_PCM_FLOAT stereo at 24000 Hz, a float track the flinger serves (flinger.rs mixer_format). Red with float refused: "aaudio open <negative AAudio error>"
+    (
+        "aaudioFloatProbe",
+        "aaudio open 0 start 0 calls 1 frames 1 bad 0 stop 0 close 0",
+    ),
     // net-bp (engine/netdb.rs; atl_jni_test.c resolverProbe): getaddrinfo / freeaddrinfo / getnameinfo / gai_strerror through the bridge on both engines; the failures carry bionic's EAI_* codes (service 9, numerichost 8), the loop is 1000 lookups with every node freed; herr 1 = a failed gethostbyname left HOST_NOT_FOUND or TRY_AGAIN in the guest's h_errno
     (
         "resolverProbe",
