@@ -81,13 +81,15 @@ enum Step {
     GlProxies,
     /// the widgets fixture on the native out dir under the nested compositor: first screenshot non-uniform + one tap that changes pixels (xtask-harness drive_gate.rs `quick`); skipped without a native out dir
     DriveTap,
+    /// a CJK and an emoji code point each resolve to a real font file through the product's font list over this desktop's own fontconfig (xtask-harness host_fonts.rs); a host with no such face is skipped and named (`host lacks a CJK font`)
+    HostFonts,
     /// the UI module cdylibs (release builds from this checkout's sources) import no GTK/GDK/GSK name outside the GTK 4.14 baseline (gtk-baseline.toml; gtk_imports.rs)
     GtkImports,
     /// atl-bionic's generation (its build script, `cargo check --target`) for every cross host whose sysroot and rust std are present, so a cross-only refusal shows before a cross build; a host without them is skipped and named
     CrossBionic,
 }
 
-const ALL: [Step; 27] = [
+const ALL: [Step; 28] = [
     Step::Fmt,
     Step::Spdx,
     Step::Tables,
@@ -113,6 +115,7 @@ const ALL: [Step; 27] = [
     Step::ConverterPackages,
     Step::GlProxies,
     Step::DriveTap,
+    Step::HostFonts,
     Step::GtkImports,
     Step::CrossBionic,
 ];
@@ -145,6 +148,7 @@ impl Step {
             Step::ConverterPackages => "converter-packages",
             Step::GlProxies => "gl-proxies",
             Step::DriveTap => "drive-tap",
+            Step::HostFonts => "host-fonts",
             Step::GtkImports => "gtk-imports",
             Step::CrossBionic => "cross-bionic",
         }
@@ -160,7 +164,7 @@ impl Step {
             | Step::ConverterPackages
             | Step::GtkImports
             | Step::CrossBionic => Class::Cargo,
-            Step::GlProxies | Step::DriveTap => Class::Harness,
+            Step::GlProxies | Step::DriveTap | Step::HostFonts => Class::Harness,
             _ => Class::Light,
         }
     }
@@ -211,6 +215,10 @@ impl Step {
             // runs the built runtime: a build from another source state would test stale binaries
             crate::build_state::ensure_current(root, out)?;
             return crate::harness::check_step(root, "drive-tap", out);
+        }
+        if self == Step::HostFonts {
+            // product logic (atl-fonts over fontconfig) the definition-only xtask cannot link: a harness step; reads the desktop and the pinned tree, no build dir
+            return crate::harness::check_step(root, "host-fonts", out);
         }
         if self == Step::GtkImports {
             // builds the module cdylibs from this checkout's sources, so it reads current binaries and needs no native build dir
@@ -381,6 +389,7 @@ impl Step {
             Step::ConverterPackages => unreachable!("run handles converter-packages"),
             Step::GlProxies => unreachable!("run handles gl-proxies"),
             Step::DriveTap => unreachable!("run handles drive-tap"),
+            Step::HostFonts => unreachable!("run handles host-fonts"),
             Step::GtkImports => unreachable!("run handles gtk-imports"),
             Step::CrossBionic => unreachable!("run handles cross-bionic"),
         }

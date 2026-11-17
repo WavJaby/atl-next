@@ -36,6 +36,7 @@ mod gl_proxies;
 mod gl_scene;
 mod gles2_fixture;
 mod gralloc;
+mod host_fonts;
 mod installer;
 mod installer_parse;
 mod instrument;
@@ -128,6 +129,7 @@ enum Command {
 enum CheckStep {
     GlProxies,
     DriveTap,
+    HostFonts,
 }
 
 #[derive(Subcommand)]
@@ -282,6 +284,8 @@ enum Test {
     SlesBridge(sles_bridge::Args),
     /// eglGetProcAddress through the identity engine (GS2.2 G1): an imported GL name equals the answer and the answer's call reaches a host recorder; a table-only name is callable; an unknown name is NULL; two answers for a described name are one address; a name no prototype describes traps by name (its own run). Needs what `nb-identity` needs (the x86_64 NB build incl. the guest `libEGL` and `libGLESv2` proxies, `xtask test app`). Logs in `<out>/egl-bridge/`.
     EglBridge(egl_bridge::Args),
+    /// A CJK and an emoji code point each resolve to a real font file through the product's font list over the desktop's own fontconfig (host_fonts.rs); prints family + file per code point. A host without such a face is its own verdict (`host lacks a CJK font`), not a failure. `--break empty-dir` / `no-fallback` must leave the ok verdict.
+    HostFonts(host_fonts::Args),
 }
 
 fn main() -> Result<ExitCode> {
@@ -429,6 +433,9 @@ fn main() -> Result<ExitCode> {
         Command::Test {
             test: Test::EglBridge(args),
         } => egl_bridge::run(&root, &args),
+        Command::Test {
+            test: Test::HostFonts(args),
+        } => host_fonts::run(&root, &args),
         Command::CheckStep { step, out } => check_step(&root, step, &out),
     };
     // a run that ends in an error (`?`, bail!) still ends with its verdict line; main prints the error after it
@@ -452,6 +459,7 @@ fn check_step(root: &std::path::Path, step: CheckStep, out: &std::path::Path) ->
             drive_gate::quick(root, arch, out)?;
             None
         }
+        CheckStep::HostFonts => host_fonts::check(root, false)?,
     };
     if let Some(why) = skipped {
         println!("{}{why}", xtask::harness::SKIP_PREFIX);
@@ -511,6 +519,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::NbIdentity(_) => "nb-identity",
             Test::SlesBridge(_) => "sles-bridge",
             Test::EglBridge(_) => "egl-bridge",
+            Test::HostFonts(_) => "host-fonts",
         },
         Command::CheckStep { .. } => return None,
     })

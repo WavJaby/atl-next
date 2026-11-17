@@ -2955,6 +2955,8 @@ dependencies = [
  "atl-bwrap",
  "atl-cpu-pressure",
  "atl-diag",
+ "atl-fonts",
+ "atl-fonts-table",
  "atl-gralloc",
  "atl-layout",
  "atl-native-bridge",
