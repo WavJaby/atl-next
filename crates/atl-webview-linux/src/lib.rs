@@ -56,7 +56,7 @@ pub extern "C" fn atl_webview_entry() -> *const WebViewVtable {
 /// The first view's engine line, then `<major>.<minor>.<micro>` (the window gate's webview `module-log` sub-gate reads this text).
 const ENGINE_LINE_PREFIX: &str = "webview: engine WebKitGTK ";
 
-const NO_DISPLAY: &[u8] =b"no display: the process has no GTK display (no-UI mode)";
+const NO_DISPLAY: &[u8] = b"no display: the process has no GTK display (no-UI mode)";
 
 unsafe extern "C" fn default_user_agent(out: *mut BytesOut) -> bool {
     let (ok, bytes) = match user_agent() {
@@ -237,9 +237,9 @@ unsafe extern "C" fn view_create(
     ENGINE_LINE.call_once(|| {
         tracing::info!(
             "{ENGINE_LINE_PREFIX}{}.{}.{}",
-            webkit6::major_version(),
-            webkit6::minor_version(),
-            webkit6::micro_version()
+            webkit6::functions::major_version(),
+            webkit6::functions::minor_version(),
+            webkit6::functions::micro_version()
         );
     });
     let web = webkit6::WebView::new();

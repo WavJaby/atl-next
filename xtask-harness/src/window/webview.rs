@@ -263,7 +263,9 @@ pub fn checks(
             app.lines()
                 .find_map(|l| l.split_once("webview: engine WebKitGTK ").map(|(_, v)| v))
                 .map(|v| format!("engine module line: WebKitGTK {v}"))
-                .ok_or_else(|| "no `webview: engine WebKitGTK` line from the engine module".to_owned()),
+                .ok_or_else(|| {
+                    "no `webview: engine WebKitGTK` line from the engine module".to_owned()
+                }),
         ),
         ("provider-api", provider_api(app)),
         ("controls", controls(app)),

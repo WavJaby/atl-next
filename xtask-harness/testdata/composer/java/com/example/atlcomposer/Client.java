@@ -40,6 +40,8 @@ public class Client {
     static final long CALLBACK_TIMEOUT_MS = 5_000;
     /** Let the compositor's clock thread apply, release and close what it holds before looking, ms. */
     static final long SETTLE_MS = 500;
+    /** After teardown, before exit: SETTLE_MS plus the compositor's 1 s counters period (atl-composer host.rs COUNTERS_PERIOD_NS), so the held-back last counters line (the state the gate judges) is logged before the process ends, ms. */
+    static final long TEARDOWN_SETTLE_MS = SETTLE_MS + 1_000;
 
     static void log(String text) {
         Log.i(TAG, text);
@@ -206,7 +208,7 @@ public class Client {
         }
         child.release();
         parent.release();
-        Thread.sleep(SETTLE_MS);
+        Thread.sleep(TEARDOWN_SETTLE_MS);
         log("fds after=" + fdCount());
         log("done");
         thread.quitSafely();
