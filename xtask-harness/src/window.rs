@@ -46,6 +46,7 @@ mod surface_view;
 mod suspended;
 mod ui_block;
 mod webview;
+mod webview_overlay;
 mod widgets;
 
 #[derive(clap::Args)]
@@ -192,6 +193,9 @@ enum Stage {
     /// UI mode: a WebView (the provider placed, FEATURE_WEBVIEW's test file) with a native View over it; the readback against the picture worked out from the fixture's spec (xtask-harness/src/window/webview.rs; webview plan W3a).
     #[value(name = "webview")]
     WebView,
+    /// UI mode: an in-game survey's arrangement, a full-window WebView added at runtime over an animating focused GLSurfaceView; resize, click and three Escs on the real GTK path (xtask-harness/src/window/webview_overlay.rs).
+    #[value(name = "webview-overlay")]
+    WebViewOverlay,
     /// UI mode: a SurfaceView's thread keeps posting while the UI thread sleeps 2 s; the compositor's clock must keep releasing its buffers (xtask-harness/src/window/ui_block.rs; composer threading S2).
     UiBlock,
     /// The gtk stage on window-hwui (hardware accelerated): onDraw gets hwui's RecordingCanvas, and the frame hwui's RenderThread draws through EGL reaches the window's picture as the quadrants.
@@ -233,6 +237,7 @@ impl Stage {
             Stage::Move => "move",
             Stage::SurfaceView => "surface-view",
             Stage::WebView => "webview",
+            Stage::WebViewOverlay => "webview-overlay",
             Stage::UiBlock => "ui-block",
             Stage::Hwui => "hwui",
             Stage::Dialog => "dialog",
@@ -265,7 +270,11 @@ impl Stage {
             Stage::Dialog => DIALOG_WINDOW_MS,
             Stage::Capture => capture::CAPTURE_WINDOW_MS,
             // the webview stage's picture, then four inputs each waiting for the page's answer
-            Stage::Widgets | Stage::Ime | Stage::MouseTouch | Stage::WebView => WIDGETS_WINDOW_MS,
+            Stage::Widgets
+            | Stage::Ime
+            | Stage::MouseTouch
+            | Stage::WebView => WIDGETS_WINDOW_MS,
+            Stage::WebViewOverlay => WEBVIEW_OVERLAY_WINDOW_MS,
             Stage::Resize
             | Stage::Relaunch
             | Stage::Declared
@@ -332,6 +341,9 @@ const GTK_WINDOW_MS: u64 = 10_000;
 const DIALOG_WINDOW_MS: u64 = 30_000;
 /// The widgets stage's watch after the marker: the first draw and the readback, then three injections, each waiting up to LINE_WAIT for its fixture line.
 const WIDGETS_WINDOW_MS: u64 = 12_000;
+/// The webview-overlay stage's watch after the marker: the WebView's late add and load (~5 s measured on a quiet host), paint settle 2 s, resize settle 2 s, then a click and three Escs, each up to its 5 s
+/// INPUT_WAIT (webview_overlay.rs): ~29 s at worst.
+const WEBVIEW_OVERLAY_WINDOW_MS: u64 = 30_000;
 /// The resize stage's watch after the marker: the first draw, then each configure (acked within PONG_WAIT) with RESIZE_SETTLE for the relayout, the presents and the readback.
 const RESIZE_WINDOW_MS: u64 = 18_000;
 const RESIZE_SETTLE: Duration = Duration::from_millis(2_000);
@@ -431,6 +443,7 @@ fn marker(stage: Stage) -> &'static str {
         | Stage::MouseTouch => "AtlWindow: onResume reached",
         Stage::SurfaceView => surface_view::MARKER,
         Stage::WebView => webview::MARKER,
+        Stage::WebViewOverlay => webview_overlay::MARKER,
         Stage::Dialog => dialog::MARKER,
         Stage::Gles2 => gles2::MARKER,
         Stage::Gles1 => gles1::MARKER,
@@ -1896,6 +1909,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         | Stage::Move
         | Stage::SurfaceView
         | Stage::WebView
+        | Stage::WebViewOverlay
         | Stage::UiBlock
         | Stage::Dialog
         | Stage::Gles2
@@ -2022,6 +2036,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Stage::StartFinish => START_FIXTURE,
         Stage::SurfaceView => surface_view::FIXTURE,
         Stage::WebView => webview::FIXTURE,
+        Stage::WebViewOverlay => webview_overlay::FIXTURE,
         Stage::UiBlock => ui_block::FIXTURE,
         Stage::Hwui => HWUI_FIXTURE,
         Stage::Dialog => dialog::FIXTURE,
@@ -2137,6 +2152,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 Some(capture_probe) => webview::drive(p, &log, capture_probe),
                 None => Err("no capture probe".to_owned()),
             },
+            (Stage::WebViewOverlay, _, _) => webview_overlay::drive(p, &log),
             (Stage::UiBlock, _, _) => ui_block::drive(p, &log),
             (Stage::MouseTouch, _, _) => widgets::drive_mouse_touch(p, &log),
             (Stage::Dialog, _, _) => match &capture_probe {
@@ -2251,6 +2267,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         ],
         (Stage::SurfaceView, Some(_)) => surface_view::checks(&app, &liveness, &captured),
         (Stage::WebView, Some(_)) => webview::checks(&app, &liveness, &captured, args.esc_back),
+        (Stage::WebViewOverlay, Some(_)) => webview_overlay::checks(&app, args.esc_back),
         (Stage::UiBlock, Some(_)) => ui_block::checks(&app),
         (Stage::MouseTouch, Some(_)) => widgets::mouse_touch_checks(&app, &liveness),
         (Stage::Dialog, Some(_)) => {

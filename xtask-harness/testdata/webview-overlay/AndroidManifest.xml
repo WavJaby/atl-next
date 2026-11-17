@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- `xtask test window`, stage webview-overlay: a game's arrangement (one activity, an animating GLSurfaceView) with a full-window WebView added over it at runtime, as an in-game survey SDK does. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.atlwebviewoverlay"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <!-- targetSdk 34: predictive back off by default (enableOnBackInvokedCallback defaults on only from 36), so BACK reaches Activity.onBackPressed, the path an SDK of a game this age overrides -->
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="34" />
+
+    <application android:label="ATL WebView overlay test" android:hardwareAccelerated="true">
+        <!-- configChanges as a Unity game's activity declares them: a resize keeps the activity (and its WebView) instead of relaunching it -->
+        <activity android:name=".Main" android:exported="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|density|uiMode"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
