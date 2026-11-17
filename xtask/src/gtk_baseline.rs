@@ -110,19 +110,28 @@ fn series(version: &str) -> &str {
     }
 }
 
-/// The names the baseline library exports (defined, global, dynamic): the GTK 4.14 set. The deb is extracted into a fresh directory of the cache; nothing in it is run.
+/// The names the baseline library exports (defined, global, dynamic): the GTK 4.14 set. The deb is extracted into a fresh per-process directory of the cache (check and a runtime run's staging may read it at once), removed after reading; nothing in it is run.
 pub fn symbols(root: &Path) -> Result<BTreeSet<String>> {
     let row = load(root)?;
     let deb = deb(root)?;
-    let dir = cache_dir(root)?.join(format!("x-{}", row.sha256));
+    let dir = cache_dir(root)?.join(format!("x-{}-{}", row.sha256, std::process::id()));
+    let names = extracted_symbols(&row, &deb, &dir);
     if dir.exists() {
         std::fs::remove_dir_all(&dir).with_context(|| dir.display().to_string())?;
     }
-    std::fs::create_dir_all(&dir).with_context(|| dir.display().to_string())?;
+    names
+}
+
+/// [`symbols`] of `deb` extracted into `dir`.
+fn extracted_symbols(row: &Row, deb: &Path, dir: &Path) -> Result<BTreeSet<String>> {
+    if dir.exists() {
+        std::fs::remove_dir_all(dir).with_context(|| dir.display().to_string())?;
+    }
+    std::fs::create_dir_all(dir).with_context(|| dir.display().to_string())?;
     let status = Command::new("dpkg-deb")
         .arg("-x")
-        .arg(&deb)
-        .arg(&dir)
+        .arg(deb)
+        .arg(dir)
         .status()
         .context("running dpkg-deb -x")?;
     ensure!(status.success(), "dpkg-deb -x {}: {status}", deb.display());

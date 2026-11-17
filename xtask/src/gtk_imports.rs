@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT
-//! `xtask check` step gtk-imports: the UI module cdylibs import no GTK/GDK/GSK name outside the GTK 4.14 baseline (gtk-baseline.toml). Each cdylib is built in release from this checkout's sources, as the harness stages it, so the step reads current binaries and a runtime gate's build is reused.
+//! The UI module cdylibs import no GTK/GDK/GSK name outside the GTK 4.14 baseline (gtk-baseline.toml). Two callers, one check ([`Baseline::check_lib`]):
+//! `xtask check` step gtk-imports builds each cdylib in release for this out dir's host (x86_64 in check), as the harness stages it, so a runtime gate's build is reused;
+//! a runtime run's staging (atld_run.rs, `stage_module` + `stage_webview`) checks the staged files, so a cross host's modules (riscv64, built only when a remote run stages them) are gated too and the run refuses a module importing a newer name.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -13,28 +15,64 @@ use crate::{cdylib, gtk_baseline, timing, unit_use};
 /// The UI module cdylibs: the platform module the facade loads, and the web engine it dlopens on the first WebView call.
 pub const MODULES: [&str; 2] = ["atl-platform-ui-linux", "atl-webview-linux"];
 
-/// Builds each module and fails on the first one that imports a name the baseline does not export.
-pub fn check(root: &Path, out: &Path) -> Result<()> {
-    let baseline = gtk_baseline::symbols(root)?;
-    let version = gtk_baseline::load(root)?.version;
-    for package in MODULES {
-        let (mut cmd, release) = cdylib::release_build(root, out, package)?;
-        let status = timing::phase("cdylib build", || unit_use::status(&mut cmd))?;
-        ensure!(status.success(), "building {package} failed");
-        let lib = release.join(format!("lib{}.so", package.replace('-', "_")));
-        let imports = gtk_imports(&lib)?;
-        let outside = outside_baseline(&imports, &baseline);
+/// The cdylib file cargo writes (and the harness stages) for `package`.
+pub fn lib_file(package: &str) -> String {
+    format!("lib{}.so", package.replace('-', "_"))
+}
+
+/// The baseline's exported names and its version, loaded once per caller.
+pub struct Baseline {
+    names: BTreeSet<String>,
+    version: String,
+}
+
+impl Baseline {
+    pub fn load(root: &Path) -> Result<Self> {
+        Ok(Self {
+            names: gtk_baseline::symbols(root)?,
+            version: gtk_baseline::load(root)?.version,
+        })
+    }
+
+    /// Fails naming every GTK/GDK/GSK import of `lib` (cdylib of `package`) the baseline does not export; logs the count on a pass.
+    pub fn check_lib(&self, package: &str, lib: &Path) -> Result<()> {
+        let imports = gtk_imports(lib)?;
+        let outside = outside_baseline(&imports, &self.names);
         ensure!(
             outside.is_empty(),
-            "{package} imports outside GTK {version} ({}): {}",
+            "{package} imports outside GTK {} ({}): {}",
+            self.version,
             gtk_baseline::FILE,
             outside.join(", ")
         );
         eprintln!(
-            "gtk-imports: {package}: {} GTK/GDK/GSK imports, all in the GTK {version} set ({} names)",
+            "gtk-imports: {package} ({}): {} GTK/GDK/GSK imports, all in the GTK {} set ({} names)",
+            lib.display(),
             imports.len(),
-            baseline.len()
+            self.version,
+            self.names.len()
         );
+        Ok(())
+    }
+}
+
+/// Builds each module and fails on the first one that imports a name the baseline does not export.
+pub fn check(root: &Path, out: &Path) -> Result<()> {
+    let baseline = Baseline::load(root)?;
+    for package in MODULES {
+        let (mut cmd, release) = cdylib::release_build(root, out, package)?;
+        let status = timing::phase("cdylib build", || unit_use::status(&mut cmd))?;
+        ensure!(status.success(), "building {package} failed");
+        baseline.check_lib(package, &release.join(lib_file(package)))?;
+    }
+    Ok(())
+}
+
+/// Checks each module as staged in `dir` (file [`lib_file`]); a module missing there is an error, the staging put both.
+pub fn check_staged(root: &Path, dir: &Path) -> Result<()> {
+    let baseline = Baseline::load(root)?;
+    for package in MODULES {
+        baseline.check_lib(package, &dir.join(lib_file(package)))?;
     }
     Ok(())
 }
@@ -85,6 +123,45 @@ mod tests {
             outside_baseline(&imports, &baseline),
             ["gtk_graphics_offload_set_black_background"]
         );
+    }
+
+    /// check_lib on real ELF files (the build machine's clang, as selfbind_gate.rs's test): a cdylib importing the 4.16 name is refused naming it; one importing only a baseline name passes.
+    #[test]
+    fn check_lib_refuses_a_built_library_importing_a_newer_name() {
+        let dir = std::env::temp_dir().join(format!("gtk-imports-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let build = |name: &str, import: &str| {
+            let src = dir.join(format!("{name}.c"));
+            std::fs::write(
+                &src,
+                format!("void {import}(void); void call(void) {{ {import}(); }}\n"),
+            )
+            .unwrap();
+            let so = dir.join(format!("{name}.so"));
+            let status = std::process::Command::new("clang-19")
+                .args(["-fuse-ld=lld", "-fPIC", "-shared"])
+                .arg(&src)
+                .arg("-o")
+                .arg(&so)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            so
+        };
+        let newer = build("newer", "gtk_graphics_offload_set_black_background");
+        let ok = build("ok", "gtk_widget_show");
+        let baseline = Baseline {
+            names: set(&["gtk_graphics_offload_new", "gtk_widget_show"]),
+            version: "4.14-test".to_owned(),
+        };
+        let refused = baseline.check_lib("newer", &newer).unwrap_err().to_string();
+        let passed = baseline.check_lib("ok", &ok);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            refused.ends_with(": gtk_graphics_offload_set_black_background"),
+            "{refused}"
+        );
+        assert!(passed.is_ok());
     }
 
     #[test]

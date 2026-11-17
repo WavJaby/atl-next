@@ -757,6 +757,8 @@ impl Runtime {
         )?;
         let platform_module = crate::ui_module::stage_module(root, &out)?;
         crate::ui_module::stage_webview(root, &out)?;
+        // the staged files, for this out's host: the only gate on a cross host's (riscv64) UI modules, which `xtask check` does not build
+        xtask::gtk_imports::check_staged(root, &platform_module)?;
         let arches = crate::arches::load(root)?;
         let abis = device_abis(&arches, host)?;
         let licenses = crate::licenses::load(root, &crate::sources::load(root)?.upstream_names())?;
