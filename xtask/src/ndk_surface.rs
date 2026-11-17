@@ -103,11 +103,13 @@ pub fn script(map: &str) -> Result<Surface> {
 }
 
 /// NDK libraries built from AOSP source as-is (gate_goals.rs `NDK_FRONTS`) and the version script their Android.bp names, relative to the AOSP tree; the fronts gate compares each built library's exports with it.
-pub const FRONT_SCRIPTS: &[(&str, &str)] =
-    &[
-        ("libOpenSLES", "frameworks/wilhelm/src/libOpenSLES.map.txt"),
-        ("libaaudio", "frameworks/av/media/libaaudio/src/libaaudio.map.txt"),
-    ];
+pub const FRONT_SCRIPTS: &[(&str, &str)] = &[
+    ("libOpenSLES", "frameworks/wilhelm/src/libOpenSLES.map.txt"),
+    (
+        "libaaudio",
+        "frameworks/av/media/libaaudio/src/libaaudio.map.txt",
+    ),
+];
 
 /// The (version node, symbol) pairs `lib` defines and exports dynamically; an unversioned one has node "". The version definitions' own symbols are not exports.
 pub fn exports(lib: &Path) -> Result<Surface> {

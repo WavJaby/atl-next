@@ -11,6 +11,7 @@
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
 #include <media/NdkMediaFormat.h>
+#include <aaudio/AAudio.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 #include <arpa/inet.h>
@@ -653,6 +654,77 @@ JNI_FN(jint, mediandkLinked)(JNIEnv *env, jclass cls)
 {
     AMediaFormat *(*volatile f)(void) = AMediaFormat_new;
     return f != NULL;
+}
+
+// aaudio-guest-route: what the AAudio data callback saw; written on libaudioclient's callback thread, read after requestStop returned
+#define AAUDIO_PROBE_CALLS 8
+static struct {
+    volatile int calls;
+    volatile int bad;
+    volatile int64_t frames;
+    volatile int64_t frames_at_n;
+    AAudioStream *stream;
+    pid_t caller;
+} g_aaudio;
+
+static aaudio_data_callback_result_t aaudio_probe_cb(AAudioStream *stream, void *user, void *audio, int32_t frames)
+{
+    if (user != &g_aaudio || stream != g_aaudio.stream || gettid() == g_aaudio.caller || frames <= 0)
+        g_aaudio.bad++;
+    else
+        memset(audio, 0, (size_t)frames * 2 * sizeof(int16_t)); // silence into the track's buffer: a guest store to host memory
+    g_aaudio.frames += frames;
+    if (++g_aaudio.calls == AAUDIO_PROBE_CALLS)
+        g_aaudio.frames_at_n = g_aaudio.frames;
+    return AAUDIO_CALLBACK_RESULT_CONTINUE;
+}
+
+// AtlJniTest.aaudioProbe: Unity FMOD's route -- dlopen libaaudio.so by name (no DT_NEEDED), a PCM 16 stereo output stream with a data callback, started until the callback ran AAUDIO_PROBE_CALLS times (2 s limit), stopped, closed.
+// "aaudio open <rc> start <rc> calls <1: reached N> frames <1: getFramesWritten after stop >= the frames handed out by the Nth call> bad <wrong stream / user data / on the caller's thread> stop <rc> close <rc>"; "aaudio dlopen null" when the guest finds no libaaudio.
+JNI_FN(jstring, aaudioProbe)(JNIEnv *env, jclass cls)
+{
+    char line[128];
+    void *lib = dlopen("libaaudio.so", RTLD_NOW);
+    if (lib == NULL)
+        return (*env)->NewStringUTF(env, "aaudio dlopen null");
+    // AAudio.h's prototypes, typed here: the fixture's minSdk is below their __INTRODUCED_IN(26), as for an app that probes AAudio at run time
+    aaudio_result_t (*create)(AAudioStreamBuilder **) = dlsym(lib, "AAudio_createStreamBuilder");
+    void (*set_format)(AAudioStreamBuilder *, aaudio_format_t) = dlsym(lib, "AAudioStreamBuilder_setFormat");
+    void (*set_channels)(AAudioStreamBuilder *, int32_t) = dlsym(lib, "AAudioStreamBuilder_setChannelCount");
+    void (*set_cb)(AAudioStreamBuilder *, AAudioStream_dataCallback, void *) = dlsym(lib, "AAudioStreamBuilder_setDataCallback");
+    aaudio_result_t (*open_stream)(AAudioStreamBuilder *, AAudioStream **) = dlsym(lib, "AAudioStreamBuilder_openStream");
+    aaudio_result_t (*delete_builder)(AAudioStreamBuilder *) = dlsym(lib, "AAudioStreamBuilder_delete");
+    aaudio_result_t (*start)(AAudioStream *) = dlsym(lib, "AAudioStream_requestStart");
+    aaudio_result_t (*stop)(AAudioStream *) = dlsym(lib, "AAudioStream_requestStop");
+    int64_t (*written)(AAudioStream *) = dlsym(lib, "AAudioStream_getFramesWritten");
+    aaudio_result_t (*close_stream)(AAudioStream *) = dlsym(lib, "AAudioStream_close");
+    if (!create || !set_format || !set_channels || !set_cb || !open_stream || !delete_builder || !start || !stop || !written || !close_stream)
+        return (*env)->NewStringUTF(env, "aaudio dlsym null");
+    memset((void *)&g_aaudio, 0, sizeof g_aaudio);
+    g_aaudio.caller = gettid();
+    AAudioStreamBuilder *b = NULL;
+    if (create(&b) != AAUDIO_OK)
+        return (*env)->NewStringUTF(env, "aaudio builder failed");
+    set_format(b, AAUDIO_FORMAT_PCM_I16);
+    set_channels(b, 2);
+    set_cb(b, aaudio_probe_cb, &g_aaudio);
+    AAudioStream *s = NULL;
+    aaudio_result_t open_rc = open_stream(b, &s);
+    delete_builder(b);
+    if (open_rc != AAUDIO_OK) {
+        snprintf(line, sizeof line, "aaudio open %d", open_rc);
+        return (*env)->NewStringUTF(env, line);
+    }
+    g_aaudio.stream = s;
+    aaudio_result_t start_rc = start(s);
+    for (int i = 0; i < 200 && g_aaudio.calls < AAUDIO_PROBE_CALLS; i++)
+        usleep(10000);
+    aaudio_result_t stop_rc = stop(s);
+    int64_t w = written(s);
+    int reached = g_aaudio.calls >= AAUDIO_PROBE_CALLS;
+    snprintf(line, sizeof line, "aaudio open %d start %d calls %d frames %d bad %d stop %d close %d", open_rc, start_rc, reached,
+             reached && w >= g_aaudio.frames_at_n, g_aaudio.bad, stop_rc, close_stream(s));
+    return (*env)->NewStringUTF(env, line);
 }
 
 // AtlJniTest.cpuProbe (ab2-load): every route app code counts CPUs by, as bionic answers it in this process. sysconf CONF/ONLN = get_nprocs_conf/get_nprocs (bionic sysconf.cpp; those two are API 23, above the fixture's level), which read /sys/devices/system/cpu/{possible,online} (bionic sysinfo.cpp: 1 when the file is missing); affinity = CPU_COUNT of sched_getaffinity; cpuinfo = the `processor` lines of /proc/cpuinfo;

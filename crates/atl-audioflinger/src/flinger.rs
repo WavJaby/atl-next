@@ -193,12 +193,9 @@ impl IAudioFlingerService for AudioFlinger {
             tracing::warn!("createTrack: format or layout not served");
             return refused();
         };
-        let Ok(track_rate) = u32::try_from(config.base.sampleRate) else {
+        let Ok(requested_rate) = u32::try_from(config.base.sampleRate) else {
             return refused();
         };
-        if track_rate == 0 {
-            return refused();
-        }
         let session = match request.sessionId {
             0 => ids::next(ids::USE_SESSION).expect("USE_SESSION is below AUDIO_UNIQUE_ID_USE_MAX"),
             s if s > 0 => s,
@@ -212,6 +209,11 @@ impl IAudioFlingerService for AudioFlinger {
                 atl_diag::refused(INTERFACE, "createTrack.output");
                 return refused();
             }
+        };
+        // rate 0 = the output's (PlaybackThread::createTrack_l, Threads.cpp:2431): AAudio's legacy path asks it when the app sets no rate
+        let track_rate = match requested_rate {
+            0 => out.profile.rate_hz,
+            r => r,
         };
         let frame_bytes = channels * BYTES_PER_SAMPLE;
         let fast_denied = request.flags & AUDIO_OUTPUT_FLAG_FAST != 0;
@@ -306,7 +308,7 @@ impl IAudioFlingerService for AudioFlinger {
             r#notificationFrameCount: notification,
             r#selectedDeviceIds: Some(Vec::new()),
             r#sessionId: session,
-            r#sampleRate: config.base.sampleRate,
+            r#sampleRate: track_rate as i32,
             r#streamType: AudioStreamType::MUSIC,
             r#afFrameCount: i64::from(out.profile.quantum),
             r#afSampleRate: out.profile.rate_hz as i32,

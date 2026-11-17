@@ -310,6 +310,15 @@ mod tests {
         assert_eq!(streaming_frames(0, &out(44_100)), 1888);
     }
 
+    // 24 kHz (FMOD's AAudio stream in Angry Birds 2): 1024 * 24000 / 48000 = 512 + 2 = 514, + 2 = 516; min = 1032.
+    // Notification: ratio 1032 * 48000 / (1024 * 24000) = 2 (truncated) -> halves, 516.
+    #[test]
+    fn half_rate_track() {
+        let s = out(24_000);
+        assert_eq!(streaming_frames(0, &s), 1032);
+        assert_eq!(notification_frames(0, 1032, &s, false), 516);
+    }
+
     // 2052 frames: ratio 2052 * 48000 / (1024 * 48000) = 2 -> double buffering, max 1026; FAST denied caps at 20 ms = 960.
     #[test]
     fn zero_notification_becomes_the_period() {

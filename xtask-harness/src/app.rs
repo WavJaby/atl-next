@@ -876,6 +876,11 @@ const BRIDGE1_CALLS: &[(&str, &str)] = &[
     ("windowProbe", "window 48 32 1"),
     // G6b: the fixture library (DT_NEEDED libmediandk.so) loaded, so the guest found the libmediandk proxy; 1 = C's `f != NULL` for AMediaFormat_new (atl_jni_test.c mediandkLinked)
     ("mediandkLinked", "1"),
+    // aaudio-guest-route (atl_jni_test.c aaudioProbe): the guest's dlopen finds the libaaudio proxy; open, start, stop, close answer AAUDIO_OK (0, AAudio.h); the data callback ran AAUDIO_PROBE_CALLS times through its down shell, never on the caller's thread and with its own stream and user data (bad 0); getFramesWritten covers what the callbacks produced (frames 1). Red before the proxy: "aaudio dlopen null"
+    (
+        "aaudioProbe",
+        "aaudio open 0 start 0 calls 1 frames 1 bad 0 stop 0 close 0",
+    ),
     // net-bp (engine/netdb.rs; atl_jni_test.c resolverProbe): getaddrinfo / freeaddrinfo / getnameinfo / gai_strerror through the bridge on both engines; the failures carry bionic's EAI_* codes (service 9, numerichost 8), the loop is 1000 lookups with every node freed; herr 1 = a failed gethostbyname left HOST_NOT_FOUND or TRY_AGAIN in the guest's h_errno
     (
         "resolverProbe",
