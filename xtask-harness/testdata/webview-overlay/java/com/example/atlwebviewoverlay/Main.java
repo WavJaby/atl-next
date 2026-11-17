@@ -10,10 +10,12 @@ import android.os.Looper;
 import android.util.Log;
 import android.view.KeyEvent;
 import android.view.View;
+import android.view.ViewGroup;
 import android.webkit.WebChromeClient;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
+import android.widget.RelativeLayout;
 
 import javax.microedition.khronos.egl.EGLConfig;
 import javax.microedition.khronos.opengles.GL10;
@@ -26,6 +28,7 @@ import javax.microedition.khronos.opengles.GL10;
  * Back (Activity.onBackPressed, as an SDK of this age overrides it): WebView can go back -> goBack, logs `wvo back page`; else the WebView is removed and destroyed, logs `wvo back dismissed`;
  * with no WebView logs `wvo back game`. The activity never finishes, so every row runs in one process.
  * The WebView gets one child of the app's (a consent SDK's loading indicator), removed with removeViewAt(0) at the first onPageFinished; `wvo web children <n>` logs the count just before.
+ * Right after it, a second WebView is preloaded under an INVISIBLE parent and never shown (addPreload: Angry Birds 2's survey SDK).
  * Logs: `wvo gl frame` once, `wvo web added`, `wvo page finished`, `wvo title <t>`, `wvo layout window=<w>x<h> web=<l,t,r,b>` at every layout change, `wvo gl key <code>` for a key the GL view gets.
  */
 public class Main extends Activity {
@@ -39,6 +42,8 @@ public class Main extends Activity {
             + "<script>document.onkeydown=function(e){window.k=(window.k||0)+1;document.title='key'+window.k+e.key};"
             + "window.onscroll=function(){if(!window.s){window.s=1;document.title='scrolled'}};"
             + "window.onresize=function(){document.title='viewport'+innerWidth+'x'+innerHeight}</script></body></html>";
+    /** The hidden preload's page ({@link #addPreload}): a full-page button whose click sets the title `ptap`. */
+    static final String PRELOAD_HTML = "<html><body style=\"margin:0\"><button style=\"width:100vw;height:100vh\" onclick=\"document.title='ptap'\">preload</button></body></html>";
     /** After the GL view's first frame, before the WebView comes: the game is running when the survey opens. */
     static final long WEB_DELAY_MS = 500;
 
@@ -138,6 +143,38 @@ public class Main extends Activity {
         root.addView(w, new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
         web = w;
         Log.i(TAG, "wvo web added");
+        addPreload();
+    }
+
+    /**
+     * A survey preloaded hidden, as Angry Birds 2's ad SDK does (Rovio Beacon WebViewAd.createUI, read from the APK 2026-11-18): Activity.addContentView(RelativeLayout) holds a FrameLayout set
+     * INVISIBLE, the WebView inside it loads by loadDataWithBaseURL and waits for a show() that this fixture never makes. AOSP: an INVISIBLE parent is not drawn, so the WebView's SurfaceView layer
+     * (created hidden, shown once its RenderNode is drawn) never shows, and its window area takes no touch (ViewGroup skips INVISIBLE children): the page under it gets the click.
+     * Logs `wvo preload finished`, `wvo preload title <t>`; a click on the preload page sets `ptap`.
+     */
+    private void addPreload() {
+        RelativeLayout holder = new RelativeLayout(this);
+        addContentView(holder, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        FrameLayout hidden = new FrameLayout(this);
+        hidden.setLayoutParams(new RelativeLayout.LayoutParams(RelativeLayout.LayoutParams.MATCH_PARENT, RelativeLayout.LayoutParams.MATCH_PARENT));
+        hidden.setVisibility(View.INVISIBLE);
+        WebView pre = new WebView(this);
+        pre.getSettings().setJavaScriptEnabled(true);
+        pre.setWebViewClient(new WebViewClient() {
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                Log.i(TAG, "wvo preload finished");
+            }
+        });
+        pre.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public void onReceivedTitle(WebView view, String title) {
+                Log.i(TAG, "wvo preload title " + title);
+            }
+        });
+        pre.loadDataWithBaseURL(null, PRELOAD_HTML, "text/html", null, null);
+        hidden.addView(pre, new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        holder.addView(hidden);
     }
 
     private void logLayout() {

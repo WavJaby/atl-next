@@ -6,7 +6,7 @@
 //! does: a provider View among the children would be the one removed, taking the page off the screen), resize (after a configure, the WebView's last placement is the window: sideband dst == the fixture's window size), page-tap (a click on the
 //! page's button reaches the page: title tap1), then three Escs (AOSP BACK semantics through the Esc -> Back adaptation; `--esc-back`): esc-page-back (WebView.canGoBack -> goBack),
 //! esc-dismiss (no history left -> the SDK's onBackPressed removes the WebView), esc-game (the WebView gone -> the activity's back). Android focus stays on the GL view throughout (the click does
-//! not move it), so each Esc goes there first and BACK is its fallback. Without `--esc-back` (AOSP's map: Esc has no fallback) the Escs reach the GL view as KEYCODE_ESCAPE and no back follows.
+//! not move it), so each Esc goes there first and BACK is its fallback. hidden-preload: a second WebView loaded under an INVISIBLE parent (Angry Birds 2's survey SDK) is never placed and takes no click. Without `--esc-back` (AOSP's map: Esc has no fallback) the Escs reach the GL view as KEYCODE_ESCAPE and no back follows.
 
 use std::path::Path;
 use std::time::Duration;
@@ -29,6 +29,9 @@ const BACK_GAME: &str = "AtlWindow: wvo back game";
 const GL_KEY: &str = "AtlWindow: wvo gl key ";
 /// Main.java's count of the WebView's children before it removes its indicator: 1 = the app's own child only (AOSP: the WebView's rendering adds no View child).
 const WEB_CHILDREN: &str = "AtlWindow: wvo web children ";
+/// Main.java's hidden preload (addPreload): its load, and the title its page sets on a click.
+const PRELOAD_LOADED: &str = "AtlWindow: wvo preload finished";
+const PRELOAD_TAP: &str = "AtlWindow: wvo preload title ptap";
 /// The platform's placement line of a sideband widget (atl-platform-ui-linux view.rs): `dst=l,t,r,b` in physical pixels.
 const PLACED: &str = "atl-platform-ui: sideband ";
 /// input-event-codes.h KEY_ESC.
@@ -64,6 +67,30 @@ fn last_placed(app: &str) -> Option<[i64; 4]> {
         .filter_map(|n| n.parse().ok())
         .collect();
     v.try_into().ok()
+}
+
+/// Sub-gate hidden-preload: the WebView under an INVISIBLE parent loaded but was never placed (one sideband stream placed: the visible WebView's) and its page got no click
+/// (AOSP: its SurfaceView layer is created hidden and shown only when drawn; the click goes to the visible page).
+fn preload_check(app: &str) -> Result<String, String> {
+    if !app.contains(PRELOAD_LOADED) {
+        return Err(format!("no `{PRELOAD_LOADED}` line"));
+    }
+    let mut streams: Vec<&str> = app
+        .lines()
+        .filter(|l| l.contains(PLACED) && l.contains(" placed dst="))
+        .filter_map(|l| l.split(PLACED).nth(1)?.split(" placed").next())
+        .collect();
+    streams.sort_unstable();
+    streams.dedup();
+    if streams.len() != 1 {
+        return Err(format!(
+            "sideband streams placed {streams:?}: the hidden preload's layer was shown"
+        ));
+    }
+    if app.contains(PRELOAD_TAP) {
+        return Err("the click reached the hidden preload's page".to_owned());
+    }
+    Ok("the hidden preload stayed off screen and got no click".to_owned())
 }
 
 /// The sub-gates.
@@ -142,6 +169,7 @@ pub fn checks(app: &str, esc_back: bool) -> Vec<Sub> {
         ("esc-page-back", page_back),
         ("esc-dismiss", dismiss),
         ("esc-game", game),
+        ("hidden-preload", preload_check(app)),
     ]
 }
 
@@ -194,6 +222,8 @@ pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
     wait_for_line(app_log, LOADED, ACK_WAIT)
         .then_some(())
         .ok_or("the page never finished loading")?;
+    // the hidden preload loads too before any input: shown by mistake, it is the topmost widget and takes the click (its sub-gate reports a missing load)
+    let _ = wait_for_line(app_log, PRELOAD_LOADED, ACK_WAIT);
     std::thread::sleep(PAINT_SETTLE);
     for (w, h, serial) in RESIZES {
         proxy
@@ -257,8 +287,17 @@ mod tests {
     fn sub_gates_by_hand() {
         let ok = "x AtlWindow: wvo web children 1\nx AtlWindow: wvo page finished\nx AtlWindow: wvo layout window=720x520 web=0,0,720,520\n\
                   y atl-platform-ui: sideband [1, 5] placed dst=0,0,720,520 clip=0,0,720,520 alpha=1\n\
-                  x AtlWindow: wvo title viewport360x260\nx AtlWindow: wvo title tap1\nx AtlWindow: wvo title scrolled\nx AtlWindow: wvo back page\nx AtlWindow: wvo back dismissed\nx AtlWindow: wvo back game\n";
+                  x AtlWindow: wvo title viewport360x260\nx AtlWindow: wvo title tap1\nx AtlWindow: wvo title scrolled\nx AtlWindow: wvo back page\nx AtlWindow: wvo back dismissed\nx AtlWindow: wvo back game\n\
+                  x AtlWindow: wvo preload finished\n";
         assert!(checks(ok, true).iter().all(|(_, r)| r.is_ok()));
+        // the Angry Birds 2 case: the hidden preload's layer shown (a second stream placed) and taking the click
+        let shown = ok.replace(
+            "x AtlWindow: wvo preload finished\n",
+            "x AtlWindow: wvo preload finished\ny atl-platform-ui: sideband [1, 6] placed dst=0,0,720,520 clip=0,0,720,520 alpha=1\n",
+        );
+        assert!(preload_check(&shown).is_err());
+        let tapped = format!("{ok}x AtlWindow: wvo preload title ptap\n");
+        assert!(preload_check(&tapped).is_err());
         let stale = ok.replace("dst=0,0,720,520", "dst=0,0,960,600");
         assert!(resize_check(&stale).is_err());
         // the owner's case: placed right, page kept its old height
