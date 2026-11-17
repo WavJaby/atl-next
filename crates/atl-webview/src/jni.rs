@@ -731,10 +731,10 @@ fn on_event(shared: &Shared, ev: WebEvent) {
         WebEvent::LoadFailed { uri, message, kind } if !client.is_null() => {
             // WebViewClient.ERROR_* (WebViewClient.java)
             let code = match kind {
-                LoadError::NotFound => -14, // ERROR_FILE_NOT_FOUND
-                LoadError::Network => -6,   // ERROR_CONNECT
+                LoadError::NotFound => -14,          // ERROR_FILE_NOT_FOUND
+                LoadError::Network => -6,            // ERROR_CONNECT
                 LoadError::UnsupportedScheme => -10, // ERROR_UNSUPPORTED_SCHEME
-                _ => -1,                    // ERROR_UNKNOWN
+                _ => -1,                             // ERROR_UNKNOWN
             };
             // the main frame's load (the engine reports no subframe failure); WebViewClient's default forwards it to the deprecated (code, description, url) overload for the main frame
             let request = new_request(
@@ -896,8 +896,14 @@ static ERROR_CLASS: OnceLock<usize> = OnceLock::new();
 
 fn find_provider_classes(env: Env) {
     for (cell, name) in [
-        (&REQUEST_CLASS, c"com/android/webview/chromium/WebResourceRequestImpl"),
-        (&ERROR_CLASS, c"com/android/webview/chromium/WebResourceErrorImpl"),
+        (
+            &REQUEST_CLASS,
+            c"com/android/webview/chromium/WebResourceRequestImpl",
+        ),
+        (
+            &ERROR_CLASS,
+            c"com/android/webview/chromium/WebResourceErrorImpl",
+        ),
     ] {
         if cell.get().is_some() {
             continue;
@@ -905,7 +911,9 @@ fn find_provider_classes(env: Env) {
         let c = jni_call!(env, FindClass, name.as_ptr());
         if c.is_null() {
             jni_call!(env, ExceptionClear);
-            tracing::error!("webview: provider class {name:?} missing: its client callbacks are not made");
+            tracing::error!(
+                "webview: provider class {name:?} missing: its client callbacks are not made"
+            );
             continue;
         }
         let _ = cell.set(jni_call!(env, NewGlobalRef, c) as usize);

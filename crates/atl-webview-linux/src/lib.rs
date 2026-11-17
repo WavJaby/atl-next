@@ -252,24 +252,9 @@ const ENGINE_SCHEMES: [&str; 6] = ["http", "https", "file", "data", "blob", "abo
 fn scheme(uri: &str) -> Option<String> {
     let (s, _) = uri.split_once(':')?;
     let ok = s.starts_with(|c: char| c.is_ascii_alphabetic())
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c));
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c));
     ok.then(|| s.to_ascii_lowercase())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// RFC 3986 3.1: scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ), case-insensitive.
-    #[test]
-    fn scheme_by_rfc3986() {
-        assert_eq!(scheme("ponos-api://function?x=1").as_deref(), Some("ponos-api"));
-        assert_eq!(scheme("HTTPS://a.example/").as_deref(), Some("https"));
-        assert_eq!(scheme("intent:#Intent;end").as_deref(), Some("intent"));
-        assert_eq!(scheme("1abc:x"), None);
-        assert_eq!(scheme("a b:x"), None);
-        assert_eq!(scheme("no-colon"), None);
-    }
 }
 
 /// A navigation-action decision: held (WebKit waits on a decision whose ref is held and neither `use` nor `ignore` was called) and reported as NAVIGATION, unless it is not the app's to decide
@@ -522,13 +507,7 @@ unsafe extern "C" fn view_create(
         true
     });
     // SAFETY: `out` is the caller's out-parameter.
-    unsafe {
-        *out = Box::into_raw(Box::new(View {
-            web,
-            events,
-        }))
-        .cast()
-    };
+    unsafe { *out = Box::into_raw(Box::new(View { web, events })).cast() };
     abi::OK
 }
 
@@ -915,4 +894,23 @@ unsafe extern "C" fn view_widget(h: *mut WebViewHandle) -> *mut std::ffi::c_void
         .to_glib_none()
         .0;
     w.cast()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RFC 3986 3.1: scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ), case-insensitive.
+    #[test]
+    fn scheme_by_rfc3986() {
+        assert_eq!(
+            scheme("ponos-api://function?x=1").as_deref(),
+            Some("ponos-api")
+        );
+        assert_eq!(scheme("HTTPS://a.example/").as_deref(), Some("https"));
+        assert_eq!(scheme("intent:#Intent;end").as_deref(), Some("intent"));
+        assert_eq!(scheme("1abc:x"), None);
+        assert_eq!(scheme("a b:x"), None);
+        assert_eq!(scheme("no-colon"), None);
+    }
 }
