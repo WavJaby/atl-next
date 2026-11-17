@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Derived from the Android Open Source Project: frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java, frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java, frameworks/base/services/core/java/com/android/server/pm/IPackageManagerBase.java, frameworks/base/services/core/java/com/android/server/pm/parsing/PackageInfoUtils.java
 //! IPackageManager, subset: getApplicationInfo, getPackageInfo, getActivityInfo, getServiceInfo, getProviderInfo, resolveContentProvider, hasSystemFeature, getSystemAvailableFeatures, getPackagesForUid, notifyDexLoad,
-//! getInstrumentationInfoAsUser, queryInstrumentationAsUser, checkSignatures, queryIntentServices. Every other method is counted unimplemented (counters).
+//! getInstrumentationInfoAsUser, queryInstrumentationAsUser, checkSignatures, queryIntentServices, queryIntentActivities, resolveIntent. Every other method is counted unimplemented (counters).
 //! Every answer is a clone of the installer's PackageInfo (crate::packages) cut to the caller's flags: GET_META_DATA, MATCH_DISABLED_COMPONENTS, and getPackageInfo's GET_<component> / GET_PERMISSIONS.
 //! One user (0): a userId other than 0 is a user that does not exist. `sharedLibraryFiles` is always filled (ActivityManagerService's STOCK_PM_FLAGS asks for it on every app path).
 
@@ -165,9 +165,10 @@ pub fn process_providers(
     list
 }
 
-/// The package name of a service result (RESOLVE_PRIORITY_SORTER's last key).
-fn service_package(r: &ResolveInfo) -> &str {
+/// The package name of a result (RESOLVE_PRIORITY_SORTER's last key).
+fn result_package(r: &ResolveInfo) -> &str {
     match &r.info {
+        Resolved::Activity(a) => a.component.item.package_name.as_deref().unwrap_or_default(),
         Resolved::Service(s) => s.component.item.package_name.as_deref().unwrap_or_default(),
         _ => "",
     }
@@ -187,6 +188,77 @@ pub(crate) fn query_intent_services(
     flags: i64,
     user: i32,
 ) -> Vec<ResolveInfo> {
+    query_intent(
+        packages,
+        caller,
+        intent,
+        resolved_type,
+        flags,
+        user,
+        Component::Service,
+    )
+    .into_iter()
+    .map(|(_, r)| r)
+    .collect()
+}
+
+/// Which component table a query reads (ComputerEngine's per-kind IntentResolver).
+#[derive(Clone, Copy)]
+enum Component {
+    Activity,
+    Service,
+}
+
+impl Component {
+    fn kind(self) -> Kind {
+        match self {
+            Component::Activity => Kind::ActivityIntents,
+            Component::Service => Kind::ServiceIntents,
+        }
+    }
+
+    fn classes(self, p: &PackageRecord) -> Vec<&str> {
+        fn name(c: &ComponentInfo) -> &str {
+            c.item.name.as_deref().unwrap_or_default()
+        }
+        match self {
+            Component::Activity => p.activities().map(|a| name(&a.component)).collect(),
+            Component::Service => p.services().map(|s| name(&s.component)).collect(),
+        }
+    }
+
+    /// get{Activity,Service}Info of `class` in `p` for `flags`, ApplicationInfo filled; None when undeclared or filtered out.
+    fn info(
+        self,
+        p: &PackageRecord,
+        packages: &Packages,
+        class: &str,
+        flags: i64,
+    ) -> Option<Resolved> {
+        match self {
+            Component::Activity => {
+                find_activity_info(p, packages, class, flags).map(Resolved::Activity)
+            }
+            Component::Service => {
+                let mut s = p.service_info(class, flags)?;
+                s.component.application_info = application_info(p, packages, flags);
+                Some(Resolved::Service(s))
+            }
+        }
+    }
+}
+
+/// queryIntent{Activities,Services}InternalBody for one component kind, sorted by RESOLVE_PRIORITY_SORTER; each result paired with ResolveInfo.isDefault (not parcelled; the sort and
+/// chooseBestActivity read it). The rules: [`query_intent_services`].
+fn query_intent(
+    packages: &Packages,
+    caller: u32,
+    intent: &Intent,
+    resolved_type: Option<&str>,
+    flags: i64,
+    user: i32,
+    kind: Component,
+) -> Vec<(bool, ResolveInfo)> {
     if user != USER_SYSTEM {
         return Vec::new();
     }
@@ -197,13 +269,15 @@ pub(crate) fn query_intent_services(
     if let Some(c) = &intent.component {
         return packages
             .visible(caller, &c.package)
-            .and_then(|p| {
-                let mut s = p.service_info(&c.class, flags)?;
-                s.component.application_info = application_info(p, packages, flags);
-                Some(ResolveInfo {
-                    info: Resolved::Service(s),
-                    ..ResolveInfo::default()
-                })
+            .and_then(|p| kind.info(p, packages, &c.class, flags))
+            .map(|info| {
+                (
+                    false,
+                    ResolveInfo {
+                        info,
+                        ..ResolveInfo::default()
+                    },
+                )
             })
             .into_iter()
             .collect();
@@ -217,9 +291,8 @@ pub(crate) fn query_intent_services(
         {
             continue;
         }
-        for s in p.services() {
-            let class = s.component.item.name.as_deref().unwrap_or_default();
-            for ii in p.intents(Kind::ServiceIntents, class) {
+        for class in kind.classes(p) {
+            for ii in p.intents(kind.kind(), class) {
                 let Some(f) = &ii.intent_filter else { continue };
                 if default_only
                     && !f
@@ -234,15 +307,19 @@ pub(crate) fn query_intent_services(
                 let Some(m) = broadcast::match_value(&filter_of(f), &key) else {
                     continue;
                 };
-                let Some(mut si) = p.service_info(class, flags) else {
+                let Some(info) = kind.info(p, packages, class, flags) else {
                     continue;
                 };
-                si.component.application_info = application_info(p, packages, flags);
-                let system = si.component.application_info.flags & FLAG_SYSTEM != 0;
+                let app_flags = match &info {
+                    Resolved::Activity(a) => a.component.application_info.flags,
+                    Resolved::Service(s) => s.component.application_info.flags,
+                    _ => 0,
+                };
+                let system = app_flags & FLAG_SYSTEM != 0;
                 found.push((
                     ii.has_default,
                     ResolveInfo {
-                        info: Resolved::Service(si),
+                        info,
                         filter: (flags & GET_RESOLVED_FILTER != 0).then(|| f.clone()),
                         priority: f.priority,
                         r#match: m,
@@ -262,9 +339,42 @@ pub(crate) fn query_intent_services(
     found.sort_by(|(da, a), (db, b)| {
         (b.priority, b.preferred_order, *db, b.r#match, b.system)
             .cmp(&(a.priority, a.preferred_order, *da, a.r#match, a.system))
-            .then_with(|| service_package(a).cmp(service_package(b)))
+            .then_with(|| result_package(a).cmp(result_package(b)))
     });
-    found.into_iter().map(|(_, r)| r).collect()
+    found
+}
+
+/// ResolveIntentHelper.resolveIntentInternal + chooseBestActivity:153 over queryIntentActivities: none -> null; one -> it; several -> the first when it differs from the second in priority,
+/// preferredOrder or isDefault. A tie is AOSP's ResolverActivity (the chooser), with no preferred activity stored: not modelled, answered null (the caller sees "no activity", never a wrong
+/// app) and counted. Not modelled: instant apps, RESOLVE_NON_BROWSER_ONLY (private flag, system callers only), the start path's SaferIntentUtils filter.
+pub(crate) fn resolve_activity(
+    packages: &Packages,
+    caller: u32,
+    intent: &Intent,
+    resolved_type: Option<&str>,
+    flags: i64,
+    user: i32,
+) -> Option<ResolveInfo> {
+    let mut query = query_intent(
+        packages,
+        caller,
+        intent,
+        resolved_type,
+        flags,
+        user,
+        Component::Activity,
+    );
+    if query.len() > 1 {
+        let ((d0, r0), (d1, r1)) = (&query[0], &query[1]);
+        if (r0.priority, r0.preferred_order, d0) == (r1.priority, r1.preferred_order, d1) {
+            atl_diag::refused(
+                "android.content.pm.IPackageManager",
+                "resolveIntent (chooser tie)",
+            );
+            return None;
+        }
+    }
+    (!query.is_empty()).then(|| query.swap_remove(0).1)
 }
 
 /// getActivityInfo after the visibility check: `class` of `p` for `flags`; None for a class `p` does not declare or a disabled one without MATCH_DISABLED_COMPONENTS.
@@ -603,6 +713,60 @@ impl IPackageManager for PackageManager {
             flags,
             user,
         ))))
+    }
+
+    /// IPackageManagerBase.queryIntentActivities: queryIntentActivitiesInternal for the calling uid (query_intent), never null. A null Intent is Java's NullPointerException.
+    fn r#queryIntentActivities(
+        &self,
+        intent: Option<&Intent>,
+        resolved_type: Option<&str>,
+        flags: i64,
+        user: i32,
+    ) -> binder::Result<Option<ParceledListSlice>> {
+        let Some(intent) = intent else {
+            return Err(Status::new_exception_str(
+                ExceptionCode::NULL_POINTER,
+                Some("queryIntentActivities: null intent"),
+            ));
+        };
+        let caller = ThreadState::get_calling_uid();
+        let found = query_intent(
+            &self.packages,
+            caller,
+            intent,
+            resolved_type,
+            flags,
+            user,
+            Component::Activity,
+        );
+        Ok(Some(ParceledListSlice::new(
+            found.into_iter().map(|(_, r)| r).collect::<Vec<_>>(),
+        )))
+    }
+
+    /// PackageManagerService.resolveIntent -> ResolveIntentHelper.resolveIntentInternal for the calling uid (resolve_activity). A null Intent is Java's NullPointerException.
+    fn r#resolveIntent(
+        &self,
+        intent: Option<&Intent>,
+        resolved_type: Option<&str>,
+        flags: i64,
+        user: i32,
+    ) -> binder::Result<Option<ResolveInfo>> {
+        let Some(intent) = intent else {
+            return Err(Status::new_exception_str(
+                ExceptionCode::NULL_POINTER,
+                Some("resolveIntent: null intent"),
+            ));
+        };
+        let caller = ThreadState::get_calling_uid();
+        Ok(resolve_activity(
+            &self.packages,
+            caller,
+            intent,
+            resolved_type,
+            flags,
+            user,
+        ))
     }
 
     /// ComputerEngine.getPackagesForUid:1987: the packages of the uid's app id; null when none, or when the caller may not see them (an app sees its own uid only).
@@ -1002,6 +1166,61 @@ mod tests {
                 ("a.Low".to_owned(), 0x10_8000)
             ]
         );
+    }
+
+    /// resolveIntent (ResolveIntentHelper.chooseBestActivity): the Facebook SDK's LoginManager.resolveIntent shape -- explicit own component + an action no filter declares, flags 0 -- resolves to
+    /// that activity (an unimplemented resolveIntent answered null and the SDK threw "FacebookActivity could not be started"); an undeclared class -> null; implicit: a higher priority wins, an
+    /// equal pair is the chooser -> null.
+    #[test]
+    fn resolve_intent_explicit_and_best_activity() {
+        const VIEW: &str = "a.VIEW";
+        let mut a = record("a");
+        a.info.activities = Some(vec![
+            Some(activity("a", "com.facebook.FacebookActivity")),
+            Some(activity("a", "a.Low")),
+            Some(activity("a", "a.High")),
+        ]);
+        let intents = |class: &str, priority: i32| {
+            let mut f = filter(&[VIEW], &[]);
+            if let Some(f) = f.intent_filter.as_mut() {
+                f.priority = priority;
+            }
+            crate::installed::ComponentIntents {
+                kind: Kind::ActivityIntents,
+                name: class.to_owned(),
+                intents: vec![f],
+            }
+        };
+        a.intents = vec![intents("a.Low", 0), intents("a.High", 5)];
+        let mut packages = Packages::new(vec![a.clone()], BTreeMap::new());
+        let name = |r: Option<ResolveInfo>| match r.map(|r| r.info) {
+            Some(Resolved::Activity(x)) => x.component.item.name,
+            _ => None,
+        };
+        let resolve = |p: &Packages, intent: &Intent| {
+            name(resolve_activity(p, 10_001, intent, None, 0, USER_SYSTEM))
+        };
+        let explicit = |class: &str| Intent {
+            action: Some("NATIVE_WITH_FALLBACK".to_owned()),
+            component: Some(ComponentName {
+                package: "a".to_owned(),
+                class: class.to_owned(),
+            }),
+            ..Intent::default()
+        };
+        assert_eq!(
+            resolve(&packages, &explicit("com.facebook.FacebookActivity")).as_deref(),
+            Some("com.facebook.FacebookActivity")
+        );
+        assert_eq!(resolve(&packages, &explicit("a.Missing")), None);
+        let implicit = Intent {
+            action: Some(VIEW.to_owned()),
+            ..Intent::default()
+        };
+        assert_eq!(resolve(&packages, &implicit).as_deref(), Some("a.High"));
+        a.intents = vec![intents("a.Low", 5), intents("a.High", 5)];
+        packages = Packages::new(vec![a], BTreeMap::new());
+        assert_eq!(resolve(&packages, &implicit), None);
     }
 
     /// PackageInfoCommonUtils.generate: activities only with GET_ACTIVITIES, disabled ones dropped without MATCH_DISABLED_COMPONENTS.
