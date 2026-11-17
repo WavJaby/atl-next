@@ -95,6 +95,10 @@ pub struct Args {
     /// on; `false` keeps atld until the hold ends.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     exit_with_last_app: bool,
+    /// The billing-unavailable desktop adaptation: the run places the responder package `com.android.vending` (repo `java/vending`), so a Play Billing client connects and reads
+    /// BILLING_UNAVAILABLE instead of finding no service. On by default; `false` places no vending package = exact AOSP without Play.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    billing_unavailable: bool,
     /// A variable in every app process's environment (repeat), atld `--app-env`: test-environment setup such as `LD_DEBUG=bindings` (the launcher-closure measurement; glibc's lines land in the app log). The product reads none of these.
     #[arg(long = "app-env", value_name = "KEY=VALUE")]
     app_env: Vec<String>,
@@ -138,6 +142,9 @@ pub struct RemoteArgs {
     /// atld `--exit-with-last-app`, as for `run-apk`.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     exit_with_last_app: bool,
+    /// The billing-unavailable responder, as for `run-apk`.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    billing_unavailable: bool,
     /// A pointer script atld injects from the app's first present (`run-apk --pointer`).
     #[arg(long, value_name = "SCRIPT")]
     pointer: Option<String>,
@@ -189,6 +196,7 @@ impl Args {
             mouse_touch: false,
             esc_back: false,
             exit_with_last_app: false,
+            billing_unavailable: false,
             app_env: Vec::new(),
             clear_data: false,
             data_root: None,
@@ -503,6 +511,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         mouse_touch: a.mouse_touch,
         esc_back: a.esc_back,
         exit_with_last_app: a.exit_with_last_app,
+        billing_unavailable: a.billing_unavailable,
         app_env: Vec::new(),
         clear_data: false,
         data_root: None,
@@ -776,6 +785,11 @@ pub(crate) fn configure(
     };
     let rt = if args.esc_back {
         rt.with_esc_back()
+    } else {
+        rt
+    };
+    let rt = if args.billing_unavailable {
+        rt.with_billing_unavailable()?
     } else {
         rt
     };

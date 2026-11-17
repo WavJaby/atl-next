@@ -1,0 +1,9 @@
+// SPDX-License-Identifier: MIT
+// The billing-unavailable responder com.android.vending (M62 D1): converted from src/aosp/vendor/atl, signed with the default certificate role (testkey), installed at product/app/Vending/Vending.apk
+// (AOSP has no vending module; product partition as GMS images place the store). Placed only when the desktop adaptation is on (xtask-harness atld_run `with_billing_unavailable`); off = no package, exact AOSP.
+android_app {
+    name: "Vending",
+    srcs: ["java/**/*.java"],
+    platform_apis: true,
+    product_specific: true,
+}

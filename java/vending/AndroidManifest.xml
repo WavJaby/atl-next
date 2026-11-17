@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- One component: the billing service Play Billing clients bind (implicit Intent with this action + setPackage com.android.vending). No forceQueryable: a client sees it through its own
+     <queries><intent> for the action (AppsFilter canQueryViaComponents). No permissions, no other component: it answers "billing unavailable" and nothing else. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.android.vending"
+    android:versionCode="1" android:versionName="atl">
+    <application android:label="Billing unavailable" android:hasCode="true">
+        <service android:name="com.android.vending.billing.InAppBillingService" android:exported="true">
+            <intent-filter>
+                <action android:name="com.android.vending.billing.InAppBillingService.BIND" />
+            </intent-filter>
+        </service>
+    </application>
+</manifest>

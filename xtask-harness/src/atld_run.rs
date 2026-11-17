@@ -197,6 +197,20 @@ fn webview_provider_row(out: &Path) -> Result<(PathBuf, String)> {
     ))
 }
 
+/// The billing-unavailable responder (repo `java/vending`, module `Vending`) at its product install path (`<partition>/app/<module>/<module>.apk`, build/soong/java/app.go installPath).
+const VENDING: &str = "app/Vending/Vending.apk";
+
+/// [`VENDING`]'s row: placed only by [`Runtime::with_billing_unavailable`].
+fn vending_row(out: &Path) -> Result<(PathBuf, String)> {
+    let built = out.join("partitions/product").join(VENDING);
+    ensure!(
+        built.is_file(),
+        "missing input {} (xtask native builds goal Vending)",
+        built.display()
+    );
+    Ok((built, format!("{}/{VENDING}", atl_android_paths::PRODUCT)))
+}
+
 /// The namespace script of [`Runtime::atld_command`]: `$0` fake `/sys/bus`, `$1` fake udev database, `$2` a directory for the host's `/dev`, then `name host` pairs (char devices), `--`, atld's command.
 /// `/dev` is rebuilt, not bound over: a mount point cannot be made in the host's devtmpfs from a user namespace, so a tmpfs takes `/dev`'s place and every host entry is bound back into it.
 const FAKE_KERNEL: &str = r#"set -eu
@@ -1177,6 +1191,13 @@ impl Runtime {
             .join("ui-module-lib")
             .join(crate::ui_module::WEBVIEW_MODULE_FILE);
         std::fs::remove_file(&module).with_context(|| format!("removing {}", module.display()))?;
+        Ok(self)
+    }
+
+    /// The billing-unavailable desktop adaptation (M62 D1; `run-apk --billing-unavailable`): the run places the responder `com.android.vending` ([`vending_row`]), so a Play Billing client binds it
+    /// and reads "billing unavailable". Off unless a run asks: without it the run holds no vending package, exact AOSP without Play.
+    pub fn with_billing_unavailable(mut self) -> Result<Self> {
+        self.platform_files.push(vending_row(&self.out)?);
         Ok(self)
     }
 

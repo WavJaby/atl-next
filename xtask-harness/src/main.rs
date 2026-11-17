@@ -16,6 +16,7 @@ mod app_imports;
 mod atld_run;
 mod audio_app;
 mod audio_pcm;
+mod billing;
 mod binder;
 mod broadcast;
 mod composer;
@@ -174,6 +175,8 @@ enum Test {
     AppData(app_data::Args),
     /// A preinstalled package (xtask-harness/testdata/system-scan) placed in /product under atld: scanned at start, FLAG_SYSTEM and its /product sourceDir via PackageManager, readable from its sandbox, a write there EROFS.
     SystemScan(system_scan::Args),
+    /// The billing-unavailable adaptation (xtask-harness/testdata/billing): a Play Billing client sees, binds and asks the responder com.android.vending (answer 3); `--off` = no package, AOSP without Play.
+    Billing(billing::Args),
     /// The CTS instrumentation path: AOSP's `am instrument` runs a JUnit3 test APK (xtask-harness/testdata/instrument) through the services; its INSTRUMENTATION_* text is parsed and checked.
     ///
     /// Run 1: a passing, a failing and an erroring test: status codes 1/0, 1/-2, 1/-1, the final code -1, and the instrumented process killed once the run finished.
@@ -337,6 +340,9 @@ fn main() -> Result<ExitCode> {
             test: Test::SystemScan(args),
         } => system_scan::run(&root, &args),
         Command::Test {
+            test: Test::Billing(args),
+        } => billing::run(&root, &args),
+        Command::Test {
             test: Test::Instrument(args),
         } => instrument::run(&root, &args),
         Command::Test {
@@ -467,6 +473,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::Provider(_) => "provider",
             Test::AppData(_) => "app-data",
             Test::SystemScan(_) => "system-scan",
+            Test::Billing(_) => "billing",
             Test::Compositor(_) => "compositor",
             Test::Gralloc(_) => "gralloc",
             Test::Binder(_) => "binder",

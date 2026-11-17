@@ -131,13 +131,14 @@ pub const NB_GUEST_LIBS: [&str; 24] = [
 pub const APK_SIGNER: &str = "apksigner";
 
 /// What every atld run (atld_run `Runtime`) reads: ART and its boot jars' JNI libraries, servicemanager, framework-res, AOSP's SettingsProvider (placed in /system/priv-app by every run), the WebView
-/// provider `webview` (repo `java/webview-provider`, placed in /product by every run), the converter crates the service packages link (packages.rs), and the Codec2 store's libraries (codec2_store.rs: its constructor dlopens each one in every app process that decodes).
+/// provider `webview` (repo `java/webview-provider`, placed in /product by every run), the billing-unavailable responder `Vending` (repo `java/vending`, placed when a run asks: run-apk's default), the converter crates the service packages link (packages.rs), and the Codec2 store's libraries (codec2_store.rs: its constructor dlopens each one in every app process that decodes).
 pub fn runtime() -> Goals {
     Goals::host(&[
         "servicemanager",
         "framework-res",
         "SettingsProvider",
         "webview",
+        "Vending",
         "platform-bootclasspath",
         // the APEX jars' JNI libraries (libframework-connectivity-tiramisu-jni: TrafficStats' static init aborts ZygoteInit without it)
         "platform-bootclasspath-jni",
@@ -291,6 +292,7 @@ pub const GATES: &[(&str, GoalsOf)] = &[
     ("broadcast", runtime),
     ("provider", runtime),
     ("system-scan", runtime),
+    ("billing", runtime),
     ("composer", runtime_gralloc),
     ("compositor", || {
         Goals::host(&["servicemanager", "service", "libgui"]).with(native_load())

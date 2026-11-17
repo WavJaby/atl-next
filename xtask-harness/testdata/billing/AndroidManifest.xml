@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- `xtask test billing`: a Play Billing client's view of com.android.vending. The <queries> intent is the shape the Play Billing library's manifest merges into every client: the only route by which
+     a targetSdk 30+ app sees the store package (the responder declares no forceQueryable). -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.atlbilling"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
+
+    <queries>
+        <intent>
+            <action android:name="com.android.vending.billing.InAppBillingService.BIND" />
+        </intent>
+    </queries>
+
+    <application android:label="ATL billing">
+        <!-- no window, no hardware rendering: this gate stages no EGL driver -->
+        <activity android:name=".Main" android:exported="true"
+            android:hardwareAccelerated="false"
+            android:theme="@android:style/Theme.NoDisplay">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
