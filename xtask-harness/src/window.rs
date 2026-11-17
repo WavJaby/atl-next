@@ -403,6 +403,8 @@ const TASK_LINE: &str = "AtlWindow: task description set";
 const CADENCE_TOLERANCE: f64 = 0.10;
 /// No single interval may exceed this many periods: a missed vsync shows as two.
 const CADENCE_MAX_PERIODS: f64 = 1.5;
+/// No interval may be a period less this or shorter: SurfaceFlinger's `kSnapToSameVsyncWithin` (VsyncSchedule.cpp), the closest VSyncDispatch lets two app vsyncs be (`nextVsyncTooClose`).
+const CADENCE_SNAP_NS: f64 = 3e6;
 /// The input stage's pointer script (atld `--headless-pointer`): a down at (200, 300), then a move and an up at (260, 340), one pointer, identity transform.
 const POINTER_SCRIPT: &str = "down:200,300 move:260,340 up:260,340";
 /// The resize stage's configures, grow then shrink: xdg_toplevel size (logical px) and the serial of the injected configure, far from the compositor's sequential serials (the proxy absorbs the client's acks of these). The content is the configured size less the client-side decorations (a header bar, far under 200 px), so grow is over the opening size (opening_size below, 960x600 on the gates' 1280x800 display) and shrink under it in both dimensions.
@@ -1627,11 +1629,20 @@ fn cadence_judge(times: &[u64], refresh_hz: f32) -> Result<String, String> {
     }
     let period = 1e9 / f64::from(refresh_hz);
     let mut longest = 0.0_f64;
+    let mut shortest = f64::MAX;
     for pair in times.windows(2) {
         let gap = pair[1]
             .checked_sub(pair[0])
             .ok_or_else(|| format!("frame time goes back: {} then {}", pair[0], pair[1]))?;
         longest = longest.max(gap as f64);
+        shortest = shortest.min(gap as f64);
+    }
+    if shortest + CADENCE_SNAP_NS <= period {
+        return Err(format!(
+            "shortest interval {:.3} ms, under a period of {:.3} ms less SurfaceFlinger's 3 ms snap",
+            shortest / 1e6,
+            period / 1e6
+        ));
     }
     let span = times[times.len() - 1] - times[0];
     let mean = span as f64 / (times.len() - 1) as f64;
@@ -2964,7 +2975,7 @@ mod tests {
         assert!(picture_check(&unreadable, display, t).is_err());
     }
 
-    /// Callbacks one display period apart pass. A mean off by a fifth, too few callbacks, and one missed vsync (one interval of two periods, the mean still within tolerance) fail.
+    /// Callbacks one display period apart pass. A mean off by a fifth, too few callbacks, one missed vsync (one interval of two periods, the mean still within tolerance) and one interval closer than SurfaceFlinger dispatches fail.
     #[test]
     fn cadence_check_reads_the_callbacks() {
         const STEP: u64 = 16_666_667;
@@ -2997,6 +3008,11 @@ mod tests {
             t += if i == 15 { 2 * STEP } else { STEP };
         }
         assert!(check(&missed, 60.0).is_err(), "one interval of two periods");
+        // the grid moved 6 ms back once: one interval of 10.67 ms (< 16.67 - 3), the mean still within tolerance
+        let rephased: Vec<u64> = (0..31)
+            .map(|i| 5_000_000_000 + i * STEP - if i >= 15 { 6_000_000 } else { 0 })
+            .collect();
+        assert!(check(&rephased, 60.0).is_err(), "one interval of 10.67 ms");
         assert!(frame_time("1000.000 1 2 I AtlWindow: onDraw reached").is_none());
     }
 

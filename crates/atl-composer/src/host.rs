@@ -156,6 +156,10 @@ pub struct Stats {
     /// Post-draw Transactions forwarded by the window service (finishDrawing), and of those the ones queued for the core.
     pub post_draw_received: u64,
     pub post_draw_applied: u64,
+    /// Ticks that came less than 3/4 of an interval after the previous one: AOSP's VSyncDispatch spaces app vsyncs by whole periods, so any count here is a vsync timeline the app cannot model.
+    pub ticks_short: u64,
+    /// The largest delay between a tick's vsync time and the clock thread running it, us: the age of `frameTimeNanos` when the event is written.
+    pub tick_late_max_us: u64,
 }
 
 struct State {
@@ -176,6 +180,8 @@ struct State {
     pending_calls: Vec<ClientCall>,
     next_layer_id: i32,
     next_vsync_id: i64,
+    /// The vsync time of the last tick (monotonic ns).
+    last_tick_ns: Option<i64>,
     /// The last counters line logged, without its `ticks=` field (see `deliver_frame`).
     counters_logged: String,
     /// When that line was logged (monotonic ns), and whether a newer state waits for [`COUNTERS_PERIOD_NS`] to pass.
@@ -241,7 +247,7 @@ impl State {
         let ignored: Vec<String> = c.ignored.iter().map(|(k, n)| format!("{k}:{n}")).collect();
         let m = self.mailbox.as_ref().map(|m| m.stats()).unwrap_or_default();
         format!(
-            "composer: counters ticks={} transactions={} layers_created={} layers_alive={} transactions_applied={} layer_states={} unknown_layer={} buffers_acquired={} buffers_released={} completions={} scenes={} scenes_taken={} scenes_dropped={} presents_refused={} release_reports={} max_held_per_layer={} vsync_sent={} vsync_dropped={} callbacks_sent={} callbacks_failed={} releases_on_channel={} releases_peer_gone={} releases_fenced={} releases_fenced_unmatched={} releases_carried={} releases_held={} completions_held={} fence_waits={} fds_held={} fds_taken={} fds_closed={} post_draw_received={} post_draw_applied={} ignored={}",
+            "composer: counters ticks={} transactions={} layers_created={} layers_alive={} transactions_applied={} layer_states={} unknown_layer={} buffers_acquired={} buffers_released={} completions={} scenes={} scenes_taken={} scenes_dropped={} presents_refused={} release_reports={} max_held_per_layer={} vsync_sent={} vsync_dropped={} callbacks_sent={} callbacks_failed={} releases_on_channel={} releases_peer_gone={} releases_fenced={} releases_fenced_unmatched={} releases_carried={} releases_held={} completions_held={} fence_waits={} fds_held={} fds_taken={} fds_closed={} post_draw_received={} post_draw_applied={} ticks_short={} tick_late_max_us={} ignored={}",
             s.ticks,
             s.transactions,
             s.layers_created,
@@ -275,6 +281,8 @@ impl State {
             s.fds_closed,
             s.post_draw_received,
             s.post_draw_applied,
+            s.ticks_short,
+            s.tick_late_max_us,
             ignored.join(","),
         )
     }
@@ -374,6 +382,7 @@ impl Composer {
                 pending_calls: Vec::new(),
                 next_layer_id: 1,
                 next_vsync_id: 0,
+                last_tick_ns: None,
                 counters_logged: String::new(),
                 counters_logged_ns: None,
                 counters_pending: false,
@@ -806,7 +815,8 @@ impl Composer {
             }
             let now = monotonic_ns();
             let (origin, interval) = self.grid(start);
-            let at = clock::next_tick(origin, interval, now);
+            let last = self.lock().last_tick_ns;
+            let at = clock::next_dispatch(origin, interval, now, last);
             std::thread::sleep(Duration::from_nanos(u64::try_from(at - now).unwrap_or(0)));
             let (frame, published) = self.tick(at, interval);
             let _ = frames.send(frame);
@@ -841,6 +851,15 @@ impl Composer {
     fn tick(&self, at_ns: i64, interval_ns: i64) -> (Frame, bool) {
         let mut st = self.lock();
         st.stats.ticks += 1;
+        if st
+            .last_tick_ns
+            .is_some_and(|last| (at_ns - last) * 4 < interval_ns * 3)
+        {
+            st.stats.ticks_short += 1;
+        }
+        st.last_tick_ns = Some(at_ns);
+        let late_us = u64::try_from((monotonic_ns() - at_ns) / 1000).unwrap_or(0);
+        st.stats.tick_late_max_us = st.stats.tick_late_max_us.max(late_us);
         let mailbox = st.mailbox.clone();
         let mut latch = mailbox.as_deref().map(Mailbox::latch);
         let mut all = std::mem::take(&mut st.pending_calls);

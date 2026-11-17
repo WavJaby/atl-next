@@ -59,6 +59,23 @@ pub fn next_tick(origin_ns: i64, interval_ns: i64, now_ns: i64) -> i64 {
     origin_ns + (behind + interval_ns - 1) / interval_ns * interval_ns
 }
 
+/// SurfaceFlinger's `kSnapToSameVsyncWithin` (VsyncSchedule.cpp `createDispatch`): two vsync times this close are the same vsync.
+pub const SNAP_TO_SAME_VSYNC_NS: i64 = 3_000_000;
+
+/// The next tick at or after `now` on the grid, never closer to the last one dispatched than a period allows: AOSP `VSyncDispatchTimerQueueEntry::adjustVsyncIfNeeded`'s `nextVsyncTooClose`
+/// (`next - last + snap <= period` -> the first grid point a period after `last`). That test also covers AOSP's `alreadyDispatchedForVsync` (within the snap of `last`): AOSP retries from `last + snap` on its
+/// stable model, which lands a period on; our grid can move its phase between ticks, so the retry is the too-close one, which cannot land closer. Without it a grid that moves onto a new presented sample
+/// dispatches two vsyncs a few ms apart, a timeline no display has.
+pub fn next_dispatch(origin_ns: i64, interval_ns: i64, now_ns: i64, last_ns: Option<i64>) -> i64 {
+    let at = next_tick(origin_ns, interval_ns, now_ns);
+    match last_ns {
+        Some(last) if at - last + SNAP_TO_SAME_VSYNC_NS <= interval_ns => {
+            next_tick(origin_ns, interval_ns, last + interval_ns)
+        }
+        _ => at,
+    }
+}
+
 /// The grid `(origin_ns, interval_ns)` of the ticks: the last presented frame's time and period, else the start time on the monitor's rate (`refresh_hz`).
 pub fn tick_grid(presented: Option<PresentTiming>, start_ns: i64, refresh_hz: f32) -> (i64, i64) {
     match presented {
@@ -144,6 +161,20 @@ mod tests {
         assert_eq!(next_tick(100, 10, 110), 110);
         assert_eq!(next_tick(100, 10, 95), 100);
         assert_eq!(next_tick(100, 10, 1_000_001), 1_000_010);
+    }
+
+    /// On a 16.67 ms grid: last tick at 0, the grid moved its phase 5 ms back (origin 11.67 ms). The plain next point after now = 1 ms is
+    /// 11.67 ms, 11.67 ms after the last (< period - 3 ms = 13.67 ms): too close, so the first point at or after 16.67 ms is taken, 28.33 ms. A point 14 ms after (> 13.67 ms) stays; no last tick, no change.
+    #[test]
+    fn dispatch_not_too_close() {
+        let p = 16_666_667;
+        let origin = p - 5_000_000;
+        assert_eq!(next_dispatch(origin, p, 1_000_000, Some(0)), origin + p);
+        assert_eq!(next_dispatch(origin, p, 1_000_000, None), origin);
+        let origin14 = 14_000_000;
+        assert_eq!(next_dispatch(origin14, p, 1_000_000, Some(0)), origin14);
+        // same vsync again (now == last on an unchanged grid): one period on
+        assert_eq!(next_dispatch(0, p, 0, Some(0)), p);
     }
 
     /// A kick between reading the generation and parking is not lost: park returns at once.
