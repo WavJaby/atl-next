@@ -11,21 +11,18 @@ pub fn stage(root: &Path, out: &Path, package: &str, dir: &str, name: &str) -> R
     stage_with(root, out, package, dir, name, &[])
 }
 
-/// [`stage`] with each `env` name's inherited value replaced (`None` removes it): a build script's selector (e.g. atl-egl-driver's `ATL_EGL_TIER`).
+/// [`stage`] with cargo `features` of `package` on (a gate's deliberate breaks or forced tiers, e.g. atl-egl-driver's `tier-blit`); `dir` must then differ from the shipped staging dir.
 pub fn stage_with(
     root: &Path,
     out: &Path,
     package: &str,
     dir: &str,
     name: &str,
-    env: &[(&str, Option<&str>)],
+    features: &[&str],
 ) -> Result<PathBuf> {
     let (mut cmd, release) = release_build(root, out, package)?;
-    for &(k, v) in env {
-        match v {
-            Some(v) => cmd.env(k, v),
-            None => cmd.env_remove(k),
-        };
+    if !features.is_empty() {
+        cmd.args(["--features", &features.join(",")]);
     }
     let status = crate::timing::phase("cdylib stage", || crate::unit_use::status(&mut cmd))?;
     ensure!(status.success(), "building {package} failed");

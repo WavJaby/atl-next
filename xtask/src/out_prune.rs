@@ -28,11 +28,12 @@ const SECS_PER_DAY: u64 = 86_400;
 const MIB: f64 = 1_048_576.0;
 const GIB: f64 = 1_073_741_824.0;
 /// Target roots directly under a build dir: xtask's `--target-dir` names, and `target`, what a checkout's `target/` links to (out.rs). Cargo units key on the checkout path, so `out::refresh` keeps these from the checkout's own dir.
-pub const DIR_ROOTS: [&str; 6] = [
+pub const DIR_ROOTS: [&str; 7] = [
     "cargo",
     crate::packages::TARGET_DIR,
     crate::packages::TEST_TARGET_DIR,
     crate::packages::LINT_TARGET_DIR,
+    crate::packages::FAULT_TARGET_DIR,
     "target",
     crate::out::BOOTSTRAP_DIR,
 ];

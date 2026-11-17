@@ -112,9 +112,7 @@ const IMPORTS: &[HeaderImport] = &[
     },
 ];
 
-/// `ATL_EGL_BREAK=<name>[,<name>]` selects [`BREAKS`] (atl-native-bridge's pattern). Read here, so the cfg reaches this package only; the run that stages the driver sets it (`xtask test app`).
-const BREAK_ENV: &str = "ATL_EGL_BREAK";
-/// The deliberate breaks: name -> the cfg it turns on. A break is a gate failing on purpose: red with it, green without.
+/// The deliberate breaks: name -> the cfg it turns on, selected by cargo feature `break-<name>` (Cargo.toml), which only the harness's staging enables (xtask-harness egl_driver.rs). A break is a gate failing on purpose: red with it, green without.
 const BREAKS: &[(&str, &str)] = &[
     // the app gate's firstConfig row (exports.rs `handed_out`): every host config is handed out again, the 16-bit ones first
     ("no_config_filter", "atl_egl_no_config_filter"),
@@ -130,48 +128,21 @@ const BREAKS: &[(&str, &str)] = &[
     ("force_import", "atl_egl_force_import"),
 ];
 
-/// `ATL_EGL_TIER=<name>` selects a [`TIERS`] row: the orientation probe (driver.rs `Orientation::probe`) then reads its capability as absent, so a gate runs the baseline tier on a host that has the fast one. Not a break: green either way.
-const TIER_ENV: &str = "ATL_EGL_TIER";
+/// Forced tiers: name -> cfg, selected by cargo feature `tier-<name>`. The orientation probe (driver.rs `Orientation::probe`) then reads its capability as absent, so a gate runs the baseline tier on a host that has the fast one. Not a break: green either way.
 const TIERS: &[(&str, &str)] = &[("blit", "atl_egl_tier_blit")];
 
-/// The cfg `ATL_EGL_TIER` names, if set; an unknown name fails the build.
-fn selected_tier() -> anyhow::Result<Option<&'static str>> {
-    let Ok(value) = std::env::var(TIER_ENV) else {
-        return Ok(None);
-    };
-    let value = value.trim();
-    if value.is_empty() {
-        return Ok(None);
-    }
-    TIERS
-        .iter()
-        .find(|(n, _)| *n == value)
-        .map(|&(_, cfg)| Some(cfg))
-        .ok_or_else(|| anyhow::anyhow!("{TIER_ENV}={value}: no such tier (known: blit)"))
-}
-
-/// The cfgs `ATL_EGL_BREAK` names; an unknown name fails the build, naming it and the known ones.
-fn selected_breaks() -> anyhow::Result<Vec<&'static str>> {
-    let Ok(value) = std::env::var(BREAK_ENV) else {
-        return Ok(Vec::new());
-    };
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(|name| {
-            BREAKS
-                .iter()
-                .find(|(n, _)| *n == name)
-                .map(|&(_, cfg)| cfg)
-                .ok_or_else(|| {
-                    let known: Vec<&str> = BREAKS.iter().map(|&(n, _)| n).collect();
-                    anyhow::anyhow!(
-                        "{BREAK_ENV}={name}: no such break (known: {})",
-                        known.join(", ")
-                    )
-                })
+/// The cfgs of `rows` whose cargo feature `<prefix>-<name>` is on (`CARGO_FEATURE_<PREFIX>_<NAME>`, `-` -> `_`). A row needs its feature in Cargo.toml, else the harness's `--features` fails the build.
+fn selected(prefix: &str, rows: &'static [(&str, &str)]) -> Vec<&'static str> {
+    rows.iter()
+        .filter(|(name, _)| {
+            std::env::var_os(
+                format!("CARGO_FEATURE_{prefix}_{name}")
+                    .to_uppercase()
+                    .replace('-', "_"),
+            )
+            .is_some()
         })
+        .map(|&(_, cfg)| cfg)
         .collect()
 }
 
@@ -186,9 +157,10 @@ fn main() -> anyhow::Result<()> {
     for &(_, cfg) in BREAKS.iter().chain(TIERS) {
         println!("cargo::rustc-check-cfg=cfg({cfg})");
     }
-    println!("cargo::rerun-if-env-changed={BREAK_ENV}");
-    println!("cargo::rerun-if-env-changed={TIER_ENV}");
-    for cfg in selected_breaks()?.into_iter().chain(selected_tier()?) {
+    for cfg in selected("break", BREAKS)
+        .into_iter()
+        .chain(selected("tier", TIERS))
+    {
         println!("cargo::rustc-cfg={cfg}");
     }
     import_headers(IMPORTS)?;

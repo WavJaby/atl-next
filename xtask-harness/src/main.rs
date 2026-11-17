@@ -79,9 +79,9 @@ use clap::{Parser, Subcommand};
 
 use xtask::{
     arches, build_state, cargo_command, cdylib, checkout_root, codec2_store, cross, cts_table,
-    deps, gate_goals, git, host_art, keys, licenses, native, ndk, ndk_surface, out, packages,
-    provided_gate, qemu, runtimes, sources, stage_env, test_apks, tree, triage, unit_use, verdict,
-    ws_config,
+    deps, gate_goals, git, host_art, keys, launcher_closure, licenses, native, ndk, ndk_surface,
+    out, packages, provided_gate, qemu, runtimes, sources, stage_env, test_apks, tree, triage,
+    unit_use, verdict, ws_config,
 };
 
 /// Runtime gates of the ATL-next repo, run as `cargo xtask test|run-apk|remote ...`.
@@ -159,7 +159,7 @@ enum Test {
     ///
     /// Failure prints the app log's last lines; the services' unimplemented-call counters are printed either way.
     /// NativeBridge breaks: `ATL_NB_BREAK=<name>[,<name>]` in this run's environment; the run stages the core with it (names: atl-native-bridge build.rs `BREAKS`).
-    /// GL driver breaks: `ATL_EGL_BREAK=<name>[,<name>]` in this run's environment; the run stages libEGL_atl.so with it (names: atl-egl-driver build.rs `BREAKS`). `ATL_EGL_TIER=blit` the same way stages the baseline orientation tier (build.rs `TIERS`).
+    /// GL driver breaks: `--egl-break <name>` (repeat; names: atl-egl-driver build.rs `BREAKS`).
     App(app::Args),
     /// The A1a audio gate (xtask-harness/testdata/audio): AudioSystem's session ids, AudioTrack's minimum buffer and a track's player id, served by atl-audioflinger in the app process (audio_app.rs).
     AudioApp(audio_app::Args),

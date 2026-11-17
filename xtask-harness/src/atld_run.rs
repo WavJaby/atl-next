@@ -284,8 +284,6 @@ pub struct Runtime {
     display: Option<String>,
     /// The app processes' UI mode (atld `--ui`), when [`Runtime::with_ui`] set it.
     ui: Option<String>,
-    /// A composer rule a gate breaks on purpose (`ATL_UI_BREAK`, atl-composer start.rs), when [`Runtime::with_ui_break`] set it.
-    ui_break: Option<&'static str>,
     /// Variables the desktop would set for this launch, in atld's environment ([`Runtime::with_desktop_env`]).
     desktop_env: Vec<(String, String)>,
     /// `KEY=VALUE`s for every app process (atld `--app-env`, [`Runtime::with_app_env`]).
@@ -803,7 +801,6 @@ impl Runtime {
             headless_pointer: None,
             display: None,
             ui: None,
-            ui_break: None,
             desktop_env: Vec::new(),
             app_env: Vec::new(),
             audio_service: true,
@@ -866,8 +863,13 @@ impl Runtime {
 
     /// Also builds and places the GL driver (`libEGL_atl.so` + `libGLESv2_atl.so` over the host's EGL, egl_driver.rs `placement`) where AOSP's libEGL loader finds it: /vendor/lib64/egl and `ro.hardware.egl` in /vendor/build.prop; ANGLE's ES1 library there as `libGLESv1_CM_atl.so` (the driver's ES1 contexts, atl-egl-driver es1.rs).
     /// Also the fronts at Loader.cpp's `SYSTEM_LIB_PATH` (`/system/lib64` in LP64): it dlopens them there as the "wrapper" libraries (`load_wrapper`) and aborts without them; the links name the files already loaded, so glibc returns the loaded copy (same inode).
-    pub fn with_gl_driver(mut self, root: &Path) -> Result<Self> {
-        let mut files = crate::egl_driver::placement(root, &self.out)?;
+    pub fn with_gl_driver(self, root: &Path) -> Result<Self> {
+        self.with_gl_driver_breaks(root, &[])
+    }
+
+    /// [`Self::with_gl_driver`] with the driver built with deliberate breaks `breaks` (atl-egl-driver build.rs `BREAKS`; a gate's red run).
+    pub fn with_gl_driver_breaks(mut self, root: &Path, breaks: &[String]) -> Result<Self> {
+        let mut files = crate::egl_driver::placement(root, &self.out, breaks)?;
         let system_lib = atl_android_paths::SYSTEM_LIB;
         for &m in GL_FRONTS.iter().chain(ANGLE_FRONTS.iter()) {
             let lib = gl_front(&self.out, m);
@@ -1071,10 +1073,26 @@ impl Runtime {
         self
     }
 
-    /// The app processes' composer breaks `rule` (a deliberate-failure run): `ATL_UI_BREAK` in their environment.
-    pub fn with_ui_break(mut self, rule: &'static str) -> Self {
-        self.ui_break = Some(rule);
-        self
+    /// The app processes' composer breaks `rule` (a deliberate-failure run): the staged ART lib dir's app runtime (the launcher's cdylib, which holds the composer) is replaced by one built with atl-composer feature `break-<rule>` (packages.rs `build_with_breaks`).
+    /// stage_art restages that dir on every run (as [`Self::without_art_lib`]), so the break lasts one run; the shipped library is never touched.
+    pub fn with_ui_break(self, root: &Path, rule: &str) -> Result<Self> {
+        let launcher = self
+            .art
+            .launcher
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("the launcher's file name")?;
+        let release = packages::build_with_breaks(
+            root,
+            &self.out,
+            launcher,
+            &[format!("atl-composer/break-{rule}")],
+        )?;
+        let at = self.art.lib_path.join(crate::launcher_closure::RUNTIME);
+        std::fs::remove_file(&at).with_context(|| format!("unlinking {}", at.display()))?;
+        std::fs::copy(release.join(crate::launcher_closure::RUNTIME), &at)
+            .with_context(|| format!("placing the faulted {}", at.display()))?;
+        Ok(self)
     }
 
     /// Apps start with `--no-audio-service`: they serve neither AudioFlinger nor AudioPolicyService (audio_app.rs `--break-serve`, test only).
@@ -1776,9 +1794,6 @@ impl Runtime {
                 .arg("RUST_LOG=info,atl_composer=debug")
                 .arg("--app-env")
                 .arg(format!("GDK_DEBUG={}", crate::gdk_dmabuf::GDK_DEBUG));
-        }
-        if let Some(rule) = self.ui_break {
-            cmd.arg("--app-env").arg(format!("ATL_UI_BREAK={rule}"));
         }
         for var in &self.app_env {
             cmd.arg("--app-env").arg(var);

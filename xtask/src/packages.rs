@@ -453,6 +453,8 @@ pub const TARGET_DIR: &str = "cargo-converter";
 pub const TEST_TARGET_DIR: &str = "cargo-converter-test";
 /// [`lint_target_dir`]'s name under the out dir (out_prune's roots).
 pub const LINT_TARGET_DIR: &str = "cargo-converter-lint";
+/// The cargo target dir of [`bin_with_breaks`] (out_prune's roots): apart from [`target_dir`], whose `release/` executables are the shipped ones a faulted build would overwrite.
+pub const FAULT_TARGET_DIR: &str = "cargo-converter-fault";
 
 /// The cargo target dir of the converter packages' clippy (`Selection::lint`), apart from [`target_dir`]: clippy's workspace wrapper changes no unit hash, so in one dir `xtask native`'s build and `xtask check`'s lint
 /// rebuilt each other's build scripts and every lib behind them (measured: 36 units in native, 20 in check, on every native -> check alternation of an unchanged tree).
@@ -772,6 +774,41 @@ pub fn bin(root: &Path, out: &Path, package: &str, bin: &str) -> Result<PathBuf>
         .into_iter()
         .find(|b| b.file_name().is_some_and(|f| f == bin))
         .with_context(|| format!("{package} has no executable {bin}"))
+}
+
+/// `package` built as [`build`] builds it plus cargo `features` (deliberate breaks, `<dep>/break-<name>`), into [`FAULT_TARGET_DIR`]: a gate's red run. Returns cargo's output dir (its executables and `lib<name>.so`); nothing is installed, so nothing faulted ships.
+pub fn build_with_breaks(
+    root: &Path,
+    out: &Path,
+    package: &str,
+    features: &[String],
+) -> Result<PathBuf> {
+    ensure!(
+        !features.is_empty(),
+        "a faulted build names its breaks: use `bin` for the shipped one"
+    );
+    let packages = workspace_packages(root)?;
+    let mut sel = Selection::new(root, out, &packages)?;
+    sel.selected.retain(|p| p.name == package);
+    ensure!(
+        !sel.selected.is_empty(),
+        "{package} not built: its converter modules are not in {}",
+        out.display()
+    );
+    let target = out.join(FAULT_TARGET_DIR);
+    let mut cmd = sel.cargo("build", &target)?;
+    for f in features {
+        cmd.args(["--features", f]);
+    }
+    let status = crate::timing::phase("packages::cargo build (faulted)", || {
+        crate::unit_use::status(&mut cmd).context("running cargo build (faulted)")
+    })?;
+    ensure!(
+        status.success(),
+        "building {package} with {} failed",
+        features.join(", ")
+    );
+    Ok(sel.release(&target))
 }
 
 #[cfg(test)]

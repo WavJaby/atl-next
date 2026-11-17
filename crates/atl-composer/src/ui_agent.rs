@@ -91,8 +91,8 @@ impl IUiAgent for UiAgent {
         token: SpIBinder,
         [left, top, right, bottom]: [i32; 4],
     ) -> Result<(), StatusCode> {
-        if std::env::var(crate::start::BREAK_ENV).as_deref() == Ok(crate::start::BREAK_INPUT_FRAMES)
-        {
+        // break `input-frames` (Cargo.toml): the windows' frames never reach the input thread, so pointer events stay in Task coordinates
+        if cfg!(feature = "break-input-frames") {
             return Ok(());
         }
         let frame = crate::input::Frame {

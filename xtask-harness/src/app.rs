@@ -4,7 +4,7 @@
 //! The APK is built here as an app is built (atld_run.rs); the package record atld installs is read back from it (`aapt2 dump xmltree`, manifest.rs), not restated.
 //! Every run has the graphics allocator HAL (it must register with servicemanager, the VINTF-declared way) and the GL driver (`Runtime::with_gl_driver`).
 //! Fonts sub-gate ([`FONTS`]): the app's text advances equal the pinned test fonts' hmtx sums, i.e. atld's font list (atl-fonts via fontconfig) reached Typeface; `--font-break` must fail it.
-//! Config row ([`FIRST_CONFIG`]): the first config eglChooseConfig lists for RGB 8 minimum on pbuffer surfaces reports a FIXED Android pixel format (no float config for a request that omits the component type). The GL driver's break `ATL_EGL_BREAK=no_config_filter` (set in this run's environment, staged with the driver) must fail it.
+//! Config row ([`FIRST_CONFIG`]): the first config eglChooseConfig lists for RGB 8 minimum on pbuffer surfaces reports a FIXED Android pixel format (no float config for a request that omits the component type). The GL driver's break `--egl-break no_config_filter` must fail it.
 //! Pass: [`MARKER`] in the app's log within [`LIMIT`], then the startActivityForResult round trip after it ([`result_failures`]; `--result-break` must fail it). Always printed: the services' counters (unimplemented calls and refused parcelables, atld_run.rs `counter_lines`); on failure also the atld, app and services log tails.
 
 use std::collections::BTreeMap;
@@ -101,6 +101,9 @@ pub struct Args {
     /// Landlock forbids, and aborts the app at the first load (`Connection: failed to receive credentials`): the webview-page line must go red.
     #[arg(long)]
     webview_sandbox_break: bool,
+    /// A GL driver break (repeat; atl-egl-driver build.rs `BREAKS`, e.g. `no_config_filter`, which must fail the config row): the run places a driver built with feature `break-<name>`.
+    #[arg(long = "egl-break", value_name = "NAME")]
+    egl_break: Vec<String>,
     /// Set by `remote test app` ([`remote`]): the run goes to this target, headless.
     #[arg(skip)]
     remote: Option<RemoteTest>,
@@ -165,6 +168,7 @@ pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
         settings_provider_break: false,
         webview_engine_break: false,
         webview_sandbox_break: false,
+        egl_break: Vec::new(),
         remote: Some(RemoteTest {
             host: a.host.clone(),
             brk: a.brk,
@@ -1524,7 +1528,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     )?
     // the activity's window renders through hwui, which needs EGL: the allocator and the GL driver are part of every run (needs a DRM device that allocates, WSL: vgem)
     .with_gralloc(root)?
-    .with_gl_driver(root)?;
+    .with_gl_driver_breaks(root, &args.egl_break)?;
     // the host ISA's guest exists only where its identity engine does (arches.toml `identity`); elsewhere every fixture is foreign
     let identity = crate::arches::identity(root, &args.host)?;
     let rt = if identity {

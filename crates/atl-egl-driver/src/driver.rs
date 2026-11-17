@@ -120,10 +120,10 @@ pub enum Orientation {
 
 impl Orientation {
     /// The tier for a host whose GL extension string is `ext`: `FlipY` when it lists [`FLIP_Y`] and its entry resolves, else `Blit`.
-    /// cfg `atl_egl_tier_blit` (build.rs `TIERS`, `ATL_EGL_TIER=blit`) reads the extension as absent, so a gate runs the baseline on a flip-y host through this same probe.
+    /// cfg `atl_egl_tier_blit` (build.rs `TIERS`, feature `tier-blit`) reads the extension as absent, so a gate runs the baseline on a flip-y host through this same probe.
     fn probe(host: &Host, ext: &str) -> (Self, &'static str) {
         if cfg!(atl_egl_tier_blit) {
-            return (Self::Blit, "blit (build ATL_EGL_TIER=blit)");
+            return (Self::Blit, "blit (build feature tier-blit)");
         }
         if !ext.split_whitespace().any(|x| x == FLIP_Y) {
             return (Self::Blit, "blit (host lacks GL_MESA_framebuffer_flip_y)");

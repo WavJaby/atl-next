@@ -27,21 +27,7 @@ use crate::{service, surface_flinger, ui_agent, ui_window};
 
 /// How long the registry may be missing. atld starts an app process only after the services printed `services: ready`, which follows the registry's addService, so this covers a slow machine, not a race.
 const REGISTRY_WAIT: Duration = Duration::from_secs(5);
-/// A deliberate-failure run's broken rule (set by xtask's window gate only): with [`BREAK_Z_ORDER`] siblings ignore their z (CompositorConfig::z_order).
-pub(crate) const BREAK_ENV: &str = "ATL_UI_BREAK";
-/// With it the windows' frames never reach the input thread (ui_agent input_frame): pointer events stay in Task coordinates.
-pub(crate) const BREAK_INPUT_FRAMES: &str = "input-frames";
-const BREAK_Z_ORDER: &str = "z-order";
-/// With it the window service's forwarded post-draw Transactions are dropped (ComposerConfig::post_draw).
-const BREAK_POST_DRAW: &str = "post-draw";
-/// With it no queued buffer is latched (CompositorConfig::latch_buffers).
-const BREAK_QUEUE: &str = "queue";
-/// With it the core ignores the window's hold set: a shown buffer is released at the latch that replaces it (ComposerConfig::hold_shown).
-const BREAK_IGNORE_HOLD: &str = "ignore-hold";
-/// With it the compositor is not served by the service view (xtask composer `--break-view`): libgui's lookup must then fail the gate.
-const BREAK_NO_SERVE: &str = "no-serve";
-/// With it the input loop is never woken by a send (input::spawn): messages queue, and the loop sleeps through them.
-const BREAK_INPUT_NO_WAKE: &str = "input-no-wake";
+// Deliberate breaks (a gate failing on purpose) are cargo features `break-<name>` (Cargo.toml), compiled in only by the harness's faulted launcher build (xtask packages.rs `bin_with_breaks`); shipped builds enable none (check step env-reads).
 /// How often the registry is looked up while it is missing.
 const REGISTRY_POLL: Duration = Duration::from_millis(50);
 
@@ -174,7 +160,8 @@ pub fn start(host: Arc<dyn VmHost>, window: Option<OpenWindow>) -> Result<Arc<Co
         Some(script) => input::parse_script(&script)?,
         None => Vec::new(),
     };
-    let wake_enabled = std::env::var(BREAK_ENV).as_deref() != Ok(BREAK_INPUT_NO_WAKE);
+    // break `input-no-wake`: the input loop is never woken by a send (input::spawn): messages queue, and the loop sleeps through them
+    let wake_enabled = !cfg!(feature = "break-input-no-wake");
     let desktop_input = match optional_property(DESKTOP_INPUT_PROPERTY)? {
         Some(arg) => DesktopInput::parse_arg(&arg)?,
         None => DesktopInput::default(),
@@ -191,12 +178,14 @@ pub fn start(host: Arc<dyn VmHost>, window: Option<OpenWindow>) -> Result<Arc<Co
     let composer = Composer::new(ComposerConfig {
         display,
         compositor: CompositorConfig {
-            z_order: std::env::var(BREAK_ENV).as_deref() != Ok(BREAK_Z_ORDER),
-            latch_buffers: std::env::var(BREAK_ENV).as_deref() != Ok(BREAK_QUEUE),
+            // break `z-order`: siblings ignore their z; break `queue`: no queued buffer is latched
+            z_order: !cfg!(feature = "break-z-order"),
+            latch_buffers: !cfg!(feature = "break-queue"),
             ..Default::default()
         },
-        post_draw: std::env::var(BREAK_ENV).as_deref() != Ok(BREAK_POST_DRAW),
-        hold_shown: std::env::var(BREAK_ENV).as_deref() != Ok(BREAK_IGNORE_HOLD),
+        // break `post-draw`: the window service's forwarded post-draw Transactions are dropped; break `ignore-hold`: a shown buffer is released at the latch that replaces it
+        post_draw: !cfg!(feature = "break-post-draw"),
+        hold_shown: !cfg!(feature = "break-ignore-hold"),
     });
     // the in-app input method exists only with a window: its desktop side is the window's TextInput (headless: none, IMMS-lite answers NO_IME)
     let mut input_method = None;
@@ -242,8 +231,8 @@ pub fn start(host: Arc<dyn VmHost>, window: Option<OpenWindow>) -> Result<Arc<Co
         input_method,
         Arc::clone(&host),
     );
-    if std::env::var(BREAK_ENV).as_deref() == Ok(BREAK_NO_SERVE) {
-        // the deliberate failure: the binders die with this frame, nothing serves the names
+    if cfg!(feature = "break-no-serve") {
+        // break `no-serve` (xtask composer `--break-view`): the binders die with this frame, nothing serves the names, so libgui's lookup must fail the gate
         drop((surface_flinger, surface_flinger_aidl));
     } else {
         atl_service_view::serve(SURFACE_FLINGER, surface_flinger)?;

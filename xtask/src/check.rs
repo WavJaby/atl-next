@@ -59,6 +59,8 @@ enum Step {
     Soong,
     /// no crate logs a free-text `refused` / `unimplemented` line: API outcomes go through atl-diag; lines of another subject listed with a reason (diag_shape.rs)
     DiagShape,
+    /// product code reads no environment-variable switch: each read is cargo's, or listed with its class and reason (env_reads.rs); no Cargo.toml enables a `break-*` / `tier-*` feature
+    EnvReads,
     /// clippy on all targets, warnings denied
     Clippy,
     /// cargo-deny: advisories, bans, licences, sources
@@ -83,7 +85,7 @@ enum Step {
     CrossBionic,
 }
 
-const ALL: [Step; 25] = [
+const ALL: [Step; 26] = [
     Step::Fmt,
     Step::Spdx,
     Step::Tables,
@@ -98,6 +100,7 @@ const ALL: [Step; 25] = [
     Step::BwrapFlags,
     Step::Soong,
     Step::DiagShape,
+    Step::EnvReads,
     Step::Clippy,
     Step::Deny,
     Step::Test,
@@ -128,6 +131,7 @@ impl Step {
             Step::BwrapFlags => "bwrap-flags",
             Step::Soong => "soong",
             Step::DiagShape => "diag-shape",
+            Step::EnvReads => "env-reads",
             Step::Clippy => "clippy",
             Step::Deny => "deny",
             Step::Test => "test",
@@ -343,6 +347,7 @@ impl Step {
             Step::BwrapFlags => crate::bwrap_flags::check(root),
             Step::Soong => crate::soong::check(root),
             Step::DiagShape => crate::diag_shape::check(root),
+            Step::EnvReads => crate::env_reads::check(root),
             Step::Clippy => cargo(
                 root,
                 &[

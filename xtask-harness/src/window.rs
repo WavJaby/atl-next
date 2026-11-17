@@ -93,7 +93,7 @@ pub struct Args {
     /// Deliberate break (stage dialog): the composer ignores window frames, so the dialog's touches arrive in Task coordinates and the touch check must fail.
     #[arg(long)]
     break_input_frames: bool,
-    /// Deliberate break (stages widgets, dialog and the other nested-compositor UI stages): the composer's input loop is never woken by a send (atl-composer start.rs BREAK_INPUT_NO_WAKE), so its messages wait and the input checks must fail.
+    /// Deliberate break (stages widgets, dialog and the other nested-compositor UI stages): the composer's input loop is never woken by a send (atl-composer feature `break-input-no-wake`), so its messages wait and the input checks must fail.
     #[arg(long)]
     break_input_no_wake: bool,
     /// Deliberate break (any UI stage that replaces buffers): the composer ignores the window's hold set and releases a shown buffer at the latch that replaces it, before the window's paint, so the release check must fail.
@@ -1935,20 +1935,19 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 }
                 let p = start_proxy(&n.socket)?;
                 let rt = rt.with_ui("gtk").with_wayland(&p.listen);
-                let rt = if args.break_z_order {
-                    rt.with_ui_break("z-order")
-                } else if args.break_post_draw {
-                    rt.with_ui_break("post-draw")
-                } else if args.break_queue {
-                    rt.with_ui_break("queue")
-                } else if args.break_ignore_hold {
-                    rt.with_ui_break("ignore-hold")
-                } else if args.break_input_frames {
-                    rt.with_ui_break("input-frames")
-                } else if args.break_input_no_wake {
-                    rt.with_ui_break("input-no-wake")
-                } else {
-                    rt
+                let rule = [
+                    (args.break_z_order, "z-order"),
+                    (args.break_post_draw, "post-draw"),
+                    (args.break_queue, "queue"),
+                    (args.break_ignore_hold, "ignore-hold"),
+                    (args.break_input_frames, "input-frames"),
+                    (args.break_input_no_wake, "input-no-wake"),
+                ]
+                .into_iter()
+                .find_map(|(on, rule)| on.then_some(rule));
+                let rt = match rule {
+                    Some(rule) => rt.with_ui_break(root, rule)?,
+                    None => rt,
                 };
                 proxy = Some(p);
                 nested = Some(n);

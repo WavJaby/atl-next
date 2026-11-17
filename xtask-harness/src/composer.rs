@@ -674,7 +674,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // the display this gate judges against: atld takes it as given and never asks the desktop
     let rt = rt.with_display(display.to_arg());
     let rt = if args.break_view {
-        rt.with_ui_break("no-serve")
+        rt.with_ui_break(root, "no-serve")?
     } else {
         rt
     };

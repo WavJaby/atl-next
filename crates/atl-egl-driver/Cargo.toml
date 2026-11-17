@@ -13,6 +13,16 @@ publish.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+# Deliberate breaks and forced tiers (build.rs `BREAKS`, `TIERS`): only the harness's staging enables one (xtask-harness egl_driver.rs); no other feature may (xtask check step env-reads)
+[features]
+break-no_config_filter = []
+break-no_window_connect = []
+break-no_blit_flip = []
+break-no_device_check = []
+break-no_readback = []
+break-force_import = []
+tier-blit = []
+
 [dependencies]
 anyhow.workspace = true
 atl-android-paths = { path = "../atl-android-paths" }
