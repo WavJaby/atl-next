@@ -26,7 +26,7 @@ use atl_parcelables::android::view::{
     InputChannel, InsetsSourceControl_Array, InsetsState, SurfaceControl,
     SurfaceControl_Transaction, WindowManager_LayoutParams, WindowRelayoutResult,
 };
-use atl_parcelables::android::window::ClientWindowFrames;
+use atl_parcelables::android::window::{ClientWindowFrames, OnBackInvokedCallbackInfo};
 use atl_parcelables::codecs::android::view::InputChannel::InputChannelCore;
 use atl_parcelables::codecs::android::view::SurfaceControl_Transaction as SurfaceControl_Transaction_codec;
 use binder::{
@@ -711,6 +711,17 @@ impl IWindowSession for Session {
             &mut None,
         )
         .map(|_| ())
+    }
+
+    /// Session.setOnBackInvokedCallbackInfo -> WindowState.setOnBackInvokedCallbackInfo: the system's copy of the window's top back callback, which serves the system's back gesture and
+    /// predictive-back animation. ATL shows neither: BACK reaches the app as a key, and ViewRootImpl's NativePreImeInputStage calls the top callback in-process. Accepted and counted (`answered`).
+    fn r#setOnBackInvokedCallbackInfo(
+        &self,
+        _window: Option<&Strong<dyn atl_aidl::mangled::_7_android_4_view_7_IWindow>>,
+        _info: Option<&OnBackInvokedCallbackInfo>,
+    ) -> binder::Result<()> {
+        atl_diag::answered(WINDOW_SESSION, "setOnBackInvokedCallbackInfo");
+        Ok(())
     }
 
     /// WindowManagerService.removeWindow: the window leaves the session, and its input channel leaves the app's dispatcher (WindowState.removeImmediately -> disposeInputChannel -> InputDispatcher::removeInputChannel), asked

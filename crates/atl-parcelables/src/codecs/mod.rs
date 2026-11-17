@@ -101,6 +101,7 @@ pub mod android {
     pub mod window {
         pub mod ClientWindowFrames;
         pub mod ImeOnBackInvokedDispatcher;
+        pub mod OnBackInvokedCallbackInfo;
         pub mod SizeConfigurationBuckets;
     }
 }

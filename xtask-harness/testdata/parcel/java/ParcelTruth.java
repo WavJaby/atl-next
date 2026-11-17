@@ -71,7 +71,10 @@ import android.view.inputmethod.InputBinding;
 import android.view.inputmethod.SurroundingText;
 import android.webkit.WebViewFactory;
 import android.webkit.WebViewProviderResponse;
+import android.window.IOnBackInvokedCallback;
 import android.window.ImeOnBackInvokedDispatcher;
+import android.window.OnBackInvokedCallbackInfo;
+import android.window.OnBackInvokedDispatcher;
 import com.android.internal.infra.AndroidFuture;
 import com.android.internal.inputmethod.InputBindResult;
 import com.android.internal.inputmethod.InputConnectionCommandHeader;
@@ -378,6 +381,8 @@ public class ParcelTruth {
         none.complete(null);
         check("AndroidFuture:null", none, AndroidFuture.CREATOR);
         checkImeDispatcher("ImeOnBackInvokedDispatcher");
+        // IWindowSession.setOnBackInvokedCallbackInfo's argument (atl-services window.rs)
+        checkBackCallbackInfo("OnBackInvokedCallbackInfo");
         // show/hideSoftInput's token and getInputMethodList's empty answer (atl-services input_method.rs)
         checkImeToken("ImeTracker_Token");
         check("InputMethodInfoSafeList:empty", InputMethodInfoSafeList.empty(), InputMethodInfoSafeList.CREATOR);
@@ -462,6 +467,28 @@ public class ParcelTruth {
         in.recycle();
         out.recycle();
         again.recycle();
+    }
+
+    /// OnBackInvokedCallbackInfo as ViewRootImpl's dispatcher sends it (WindowOnBackInvokedDispatcher.setTopOnBackInvokedCallback): a callback binder and three ints with non-default values,
+    /// through the parcel-copy path; the binder must come back the same object and every field equal.
+    static void checkBackCallbackInfo(String name) {
+        Binder binder = new Binder();
+        // OnBackInvokedDispatcher.PRIORITY_OVERLAY, SystemOverrideOnBackInvokedCallback.OVERRIDE_MOVE_TASK_TO_BACK (1): values a default-zero codec would lose
+        OnBackInvokedCallbackInfo info = new OnBackInvokedCallbackInfo(IOnBackInvokedCallback.Stub.asInterface(binder), OnBackInvokedDispatcher.PRIORITY_OVERLAY, true, 1);
+        Parcel in = written(info);
+        in.setDataPosition(0);
+        Parcel out = Parcel.obtain();
+        if (roundTripParcel("android.window.OnBackInvokedCallbackInfo", in, out) != 0) {
+            result(false, name, "rust: " + lastError());
+            return;
+        }
+        boolean consumed = out.dataSize() == in.dataSize();
+        out.setDataPosition(0);
+        OnBackInvokedCallbackInfo back = OnBackInvokedCallbackInfo.CREATOR.createFromParcel(out);
+        boolean ok = consumed && back.getCallback().asBinder() == binder && back.getPriority() == OnBackInvokedDispatcher.PRIORITY_OVERLAY && back.isAnimationCallback() && back.getOverrideBehavior() == 1;
+        result(ok, name, ok ? "callback binder and fields survived java -> rust -> java" : "sizes " + in.dataSize() + "/" + out.dataSize() + ", " + back);
+        in.recycle();
+        out.recycle();
     }
 
     /// A system icon as a receiver gets one: getSystemIcon(int) is private, and the public overload loads resources through a Context.

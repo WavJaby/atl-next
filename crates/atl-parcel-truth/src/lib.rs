@@ -52,7 +52,8 @@ use atl_parcelables::android::view::{
 };
 use atl_parcelables::android::webkit::WebViewProviderResponse;
 use atl_parcelables::android::window::{
-    ClientWindowFrames, ImeOnBackInvokedDispatcher, SizeConfigurationBuckets,
+    ClientWindowFrames, ImeOnBackInvokedDispatcher, OnBackInvokedCallbackInfo,
+    SizeConfigurationBuckets,
 };
 use atl_parcelables::com::android::internal::app::MessageSamplingConfig;
 use atl_parcelables::com::android::internal::infra::AndroidFuture;
@@ -198,6 +199,9 @@ fn copy_class(
         "android.app.servertransaction.ClientTransaction" => copy_as::<ClientTransaction>(src, dst),
         "android.window.ImeOnBackInvokedDispatcher" => {
             copy_as::<ImeOnBackInvokedDispatcher>(src, dst)
+        }
+        "android.window.OnBackInvokedCallbackInfo" => {
+            copy_as::<OnBackInvokedCallbackInfo>(src, dst)
         }
         "android.view.inputmethod.ImeTracker$Token" => copy_as::<ImeTracker_Token>(src, dst),
         "android.media.PlayerBase$PlayerIdCard" => copy_as::<PlayerBase_PlayerIdCard>(src, dst),
