@@ -38,7 +38,6 @@ use gui_aidl_types_rs::{BitTube, LayerMetadata, VsyncEventData};
 
 use crate::capture::Args;
 use crate::capture_reply;
-use crate::clock;
 use crate::host::{Composer, DISPLAY_ID};
 
 /// `ui::ColorMode::NATIVE`: the one color mode the display reports.
@@ -194,7 +193,7 @@ impl ISurfaceComposer for SurfaceComposer {
     ) -> binder::Result<Option<DisplayStatInfo>> {
         Ok(Some(DisplayStatInfo {
             vsyncTime: 0,
-            vsyncPeriod: clock::interval_ns(self.composer.display().refresh_hz),
+            vsyncPeriod: self.composer.display().vsync_period_ns(),
         }))
     }
 
@@ -247,9 +246,9 @@ fn dynamic_info(c: &Composer) -> DynamicDisplayInfo {
             supportedHdrTypes: Some(Vec::new()),
             peakRefreshRate: hz,
             vsyncRate: hz,
-            appVsyncOffset: 0,
-            sfVsyncOffset: 0,
-            presentationDeadline: clock::interval_ns(hz),
+            appVsyncOffset: display_model::APP_VSYNC_OFFSET_NS,
+            sfVsyncOffset: display_model::SF_VSYNC_OFFSET_NS,
+            presentationDeadline: d.presentation_deadline_ns(),
             group: 0,
         })]),
         activeDisplayModeId: MODE_ID,

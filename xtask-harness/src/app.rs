@@ -571,7 +571,15 @@ struct Line {
 /// sdkext.go derives as derive_sdk.cpp SetSdkLevels computes them: r stops at 8, the last db version that does not require EXT_SERVICES (not installed in ATL; version 9 is the first that does).
 /// ad_services is AD_SERVICES' module version, 17.
 /// timezone: Main.onCreate's TimeZone.getDefault(), from persist.sys.timezone (RuntimeInit.java:252 reads it; atld sets it to the host zone). None = the run host's zone ([`HostFacts::zone_want`]: the target's on a remote run, never the build host's).
-const LOG_LINES: [Line; 19] = [
+/// display: Main.onCreate's Display.getAppVsyncOffsetNanos and getPresentationDeadlineNanos less the period of getRefreshRate: SurfaceFlinger.cpp getDynamicDisplayInfoInternal's appVsyncOffset
+/// and `period - sfVsyncOffset + 1 ms`, with both offsets 0 (the compositor sends app vsync and latches at the tick itself), so 0 and 1 000 000 at any refresh rate.
+const LOG_LINES: [Line; 20] = [
+    Line {
+        row: "display",
+        prefix: "AtlTest: display: ",
+        want: Want::Exact("offset=0 deadline_less_period=1000000"),
+        timing: Timing::Create,
+    },
     Line {
         row: "bindservice",
         prefix: "AtlTest: bindservice: ",

@@ -725,13 +725,13 @@ impl Composer {
         probe.on_frame_tick(FrameTick {
             vsync_id: st.next_vsync_id + 1,
             timestamp: monotonic_ns(),
-            interval: clock::interval_ns(self.display().refresh_hz),
+            interval: self.display().vsync_period_ns(),
         });
         probe
             .latest_vsync_event_data()
             .cloned()
             .unwrap_or_else(|| VsyncEventData {
-                frame_interval: clock::interval_ns(self.display().refresh_hz),
+                frame_interval: self.display().vsync_period_ns(),
                 preferred_frame_timeline_index: 0,
                 frame_timelines: Vec::new(),
                 number_queued_buffers: 0,

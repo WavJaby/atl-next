@@ -6,6 +6,7 @@
 use std::sync::{Condvar, Mutex};
 
 use atl_platform_ui::PresentTiming;
+use atl_services_types::display_model::period_ns;
 
 /// What wakes the parked clock: a generation counter under its own mutex, bumped by every waker. The clock reads the generation before it checks its conditions (under other locks) and parks only while
 /// it is unchanged, so a wake between check and park is never lost, and a waker (the toolkit thread) takes no lock but this one, held for an increment.
@@ -45,11 +46,6 @@ impl Wake {
     }
 }
 
-/// The interval of `refresh_hz`, in ns, rounded to the nearest.
-pub fn interval_ns(refresh_hz: f32) -> i64 {
-    (1e9 / f64::from(refresh_hz)).round() as i64
-}
-
 /// The first grid point `origin + k * interval` (k >= 0) at or after `now`.
 pub fn next_tick(origin_ns: i64, interval_ns: i64, now_ns: i64) -> i64 {
     if now_ns <= origin_ns {
@@ -80,7 +76,7 @@ pub fn next_dispatch(origin_ns: i64, interval_ns: i64, now_ns: i64, last_ns: Opt
 pub fn tick_grid(presented: Option<PresentTiming>, start_ns: i64, refresh_hz: f32) -> (i64, i64) {
     match presented {
         Some(p) => (p.time_ns, p.refresh_ns),
-        None => (start_ns, interval_ns(refresh_hz)),
+        None => (start_ns, period_ns(refresh_hz)),
     }
 }
 
@@ -144,13 +140,6 @@ mod tests {
     fn ticks_follow_presentation_phase() {
         assert!(worst_phase_error(true) <= TOLERANCE);
         assert!(worst_phase_error(false) > TOLERANCE);
-    }
-
-    /// 1e9 / 60 = 16 666 666.67 ns, which rounds up; 1e9 / 50 is exact.
-    #[test]
-    fn intervals() {
-        assert_eq!(interval_ns(60.0), 16_666_667);
-        assert_eq!(interval_ns(50.0), 20_000_000);
     }
 
     /// On the grid 100, 110, 120 ...: a time on a point stays, between two points goes up, before the origin goes to the origin.

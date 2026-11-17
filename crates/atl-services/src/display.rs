@@ -205,8 +205,8 @@ impl DisplayManager {
 }
 
 /// The DisplayInfo of the model's display: its shown size as the app area and the logical size (no insets), its rotation, its one mode (the panel's natural size; refresh rate as both peak and vsync rate), its density
-/// (logicalDensityDpi, and physical dpi equal to it: no physical size is known), the state ON, the panel's kind TYPE_INTERNAL. Values with no source in the model (unique id, brightness,
-/// vsync offset and presentation deadline, owner) are test values until the platform layer supplies them; nested parcelables the codec does not model stay null.
+/// (logicalDensityDpi, and physical dpi equal to it: no physical size is known), the state ON, the panel's kind TYPE_INTERNAL, the app vsync offset and presentation deadline the compositor's mode reports
+/// (LocalDisplayAdapter copies them from SurfaceFlinger's mode). Values with no source in the model (unique id, brightness, owner) are test values until the platform layer supplies them; nested parcelables the codec does not model stay null.
 pub fn display_info(m: &DisplayModel) -> DisplayInfo {
     let (natural_width, natural_height) = m.natural_size();
     let mode = DisplayMode {
@@ -255,6 +255,8 @@ pub fn display_info(m: &DisplayModel) -> DisplayInfo {
         brightness_default: 1.0,
         brightness_dim: 0.5,
         hdr_sdr_ratio: f32::NAN,
+        app_vsync_offset_nanos: display_model::APP_VSYNC_OFFSET_NS,
+        presentation_deadline_nanos: m.presentation_deadline_ns(),
         can_host_tasks: true,
         ..Default::default()
     }

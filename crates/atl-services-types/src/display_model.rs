@@ -20,6 +20,18 @@ pub const COMPOSITION_DATASPACE: i32 =
 pub const ROTATION_0: i32 = 0;
 const ROTATION_270: i32 = 3;
 
+/// The compositor's latch offset from vsync (DisplayMode.sfVsyncOffset): it latches at the vsync tick itself.
+pub const SF_VSYNC_OFFSET_NS: i64 = 0;
+/// The app vsync's offset from the display's (DisplayMode.appVsyncOffset, Display.getAppVsyncOffsetNanos): app events go out at the tick itself.
+pub const APP_VSYNC_OFFSET_NS: i64 = 0;
+/// SurfaceFlinger's processing slack in presentationDeadline (SurfaceFlinger.cpp `getDynamicDisplayInfoInternal`: "an additional 1ms").
+const PRESENTATION_DEADLINE_SLACK_NS: i64 = 1_000_000;
+
+/// The period of `refresh_hz`, ns, rounded to the nearest.
+pub fn period_ns(refresh_hz: f32) -> i64 {
+    (1e9 / f64::from(refresh_hz)).round() as i64
+}
+
 /// The default display: size in pixels as shown now (a quarter-turned panel's sides swapped: DisplayInfo.logicalWidth/Height), refresh rate in Hz, density in dots per inch (DisplayMetrics.densityDpi),
 /// rotation (Surface.ROTATION_*, the compositor's output transform: platform layer `Monitor::rotation`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -62,6 +74,17 @@ impl DisplayModel {
             dpi: (f64::from(DENSITY_DEFAULT) * scale).round().max(1.0) as i32,
             rotation: i32::from(quarter_turns % 4),
         }
+    }
+
+    /// The vsync period, ns: [`period_ns`] of the refresh rate.
+    pub fn vsync_period_ns(&self) -> i64 {
+        period_ns(self.refresh_hz)
+    }
+
+    /// How far before a vsync a buffer must be queued to be shown at it (DisplayMode.presentationDeadline, Display.getPresentationDeadlineNanos): SurfaceFlinger.cpp `getDynamicDisplayInfoInternal`,
+    /// period - sfVsyncOffset + 1 ms.
+    pub fn presentation_deadline_ns(&self) -> i64 {
+        self.vsync_period_ns() - SF_VSYNC_OFFSET_NS + PRESENTATION_DEADLINE_SLACK_NS
     }
 
     /// The panel's size in its natural orientation (DisplayInfo.getNaturalWidth/Height: the sides swap back for ROTATION_90 / 270): what a display mode reports (DisplayMode is the panel's, not the rotated view's).
@@ -112,6 +135,17 @@ impl DisplayModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 1e9 / 60 = 16 666 666.67 ns, which rounds up; 1e9 / 50 is exact. The deadline at 60 Hz is SurfaceFlinger's period - 0 + 1 ms = 17 666 667 ns.
+    #[test]
+    fn period_and_deadline() {
+        assert_eq!(period_ns(60.0), 16_666_667);
+        assert_eq!(period_ns(50.0), 20_000_000);
+        assert_eq!(
+            DisplayModel::default().presentation_deadline_ns(),
+            17_666_667
+        );
+    }
 
     /// The default is the stated test value; the flag form of it is what atld forwards.
     #[test]
