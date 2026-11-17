@@ -390,7 +390,6 @@ pub(crate) fn run_on(
                     proxy,
                     nested,
                     app_log: &app_log,
-                    present_line: PRESENT_LINE,
                     alive: &|| !run.app_ended(),
                     break_blank: args.break_blank_capture,
                 };
@@ -1203,11 +1202,37 @@ fn script_wait_ms(script: &str) -> u64 {
         .sum()
 }
 
-/// Frames the app presented at or after `from_ms`: its present lines stamped no earlier (a line's stamp is its first field).
+/// The per-second summary of presented frames (atl-composer frame_rate.rs): a line only for a second with at least one frame presented.
+pub(crate) const FPS_LINE: &str = "composer: fps presented=";
+
+/// Whether `line` reports a presented frame: a present line (first and power-of-two counts) or an fps line.
+fn reports_present(line: &str) -> bool {
+    line.contains(PRESENT_LINE) || line.contains(FPS_LINE)
+}
+
+/// Frames presented so far, a lower bound: the larger of the last present line's `n=` and the sum of the fps lines' `presented=` (the compositor logs neither per frame).
+pub(crate) fn presented_total(app_log: &str) -> u64 {
+    let field = |l: &str, key: &str| -> Option<u64> {
+        let (_, rest) = l.split_once(key)?;
+        rest.split_whitespace().next()?.parse().ok()
+    };
+    let mut pow2 = 0;
+    let mut fps = 0;
+    for l in app_log.lines() {
+        if l.contains(PRESENT_LINE) {
+            pow2 = pow2.max(field(l, " n=").unwrap_or(0));
+        } else if l.contains(FPS_LINE) {
+            fps += field(l, "presented=").unwrap_or(0);
+        }
+    }
+    pow2.max(fps)
+}
+
+/// Lines reporting presented frames at or after `from_ms` (a line's stamp is its first field): nonzero once a frame was presented then.
 fn presented_since(app_log: &str, from_ms: u64) -> usize {
     app_log
         .lines()
-        .filter(|l| l.contains(PRESENT_LINE))
+        .filter(|l| reports_present(l))
         .filter(|l| {
             l.split_whitespace()
                 .next()
@@ -1487,6 +1512,18 @@ mod tests {
     const RESUME: &str =
         "services: activity resumed org.x.Main at=100.000\nservices: activity settled at=100.001\n";
     const PRESENT: &str = "100.900 D atl-composer: ui: present n=1 time_ns=1\n";
+
+    /// Present lines at 1, 2, 4, 8 and fps lines of 5 + 6 frames: the total is the larger bound, 11; before the fps lines, the last power of two.
+    #[test]
+    fn presented_total_takes_the_larger_bound() {
+        let pow2 = "1 D atl-composer: ui: present n=1 time_ns=1\n2 D atl-composer: ui: present n=2 time_ns=2\n\
+                    3 D atl-composer: ui: present n=4 time_ns=4\n4 D atl-composer: ui: present n=8 time_ns=8\n";
+        assert_eq!(presented_total(pow2), 8);
+        let fps = "5 I composer: fps presented=5 taken=5 buffer=1x1 window=1x1\n\
+                   6 I composer: fps presented=6 taken=6 buffer=1x1 window=1x1\n";
+        assert_eq!(presented_total(&format!("{pow2}{fps}")), 11);
+        assert_eq!(presented_total(""), 0);
+    }
 
     #[test]
     fn judge_passes_a_resumed_presenting_app() {

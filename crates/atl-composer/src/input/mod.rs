@@ -625,9 +625,19 @@ mod publish {
     }
 
     /// One DEBUG line per published MotionEvent: what the app's InputConsumer receives. No history field: an InputMessage carries one sample; the consumer's batching (consumeBatch -> MotionEvent.addSample) builds the history the app sees from consecutive MOVEs.
+    /// MOVE and HOVER_MOVE come once per frame while a pointer moves: those log at the first and each power-of-two count (`moves <n>` line, M60 R2), every other action always.
     fn log_motion(e: &MotionEvent) {
+        static MOVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if !tracing::enabled!(tracing::Level::DEBUG) {
             return;
+        }
+        let masked = e.action & 0xff;
+        if masked == pointer::ACTION_MOVE || masked == pointer::ACTION_HOVER_MOVE {
+            let n = MOVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if !n.is_power_of_two() {
+                return;
+            }
+            tracing::debug!("input: motion moves {n}");
         }
         let pointers: Vec<String> = e
             .pointers

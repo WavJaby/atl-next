@@ -275,10 +275,11 @@ fn wire(window: Rc<PlatformWindow>, splash_started: Option<Instant>) {
         window.on_tick(move |tick| {
             let time_ns = tick.time_ns;
             if let Some(taken) = mailbox.take() {
-                tracing::debug!(
-                    "atl-composer: ui: present n={} time_ns={time_ns}",
-                    rate.total() + 1
-                );
+                // per frame: the first and each power-of-two count (M60 R2); the `composer: fps` line is the per-second summary
+                let n = rate.total() + 1;
+                if n.is_power_of_two() {
+                    tracing::debug!("atl-composer: ui: present n={n} time_ns={time_ns}");
+                }
                 let buffer = largest_buffer(&taken.scene);
                 let sizes = match shown.present(&taken.scene) {
                     Ok(()) => {

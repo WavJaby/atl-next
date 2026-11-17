@@ -178,6 +178,9 @@ struct State {
     next_vsync_id: i64,
     /// The last counters line logged, without its `ticks=` field (see `deliver_frame`).
     counters_logged: String,
+    /// When that line was logged (monotonic ns), and whether a newer state waits for [`COUNTERS_PERIOD_NS`] to pass.
+    counters_logged_ns: Option<i64>,
+    counters_pending: bool,
     stats: Stats,
     /// UI mode's window mailbox (lock order: this state, then the mailbox); None headless.
     mailbox: Option<Arc<Mailbox>>,
@@ -199,6 +202,36 @@ impl State {
         let before = self.fds.len();
         self.fds.retain(|number, _| keep.contains(number));
         self.stats.fds_closed += (before - self.fds.len()) as u64;
+    }
+
+    /// The counters line when anything but `ticks` moved since the last one (an idle clock moves only `ticks`), at most once per [`COUNTERS_PERIOD_NS`]: during play every frame moves them,
+    /// and a per-frame line is a flood (M60). A newer state inside the period stays pending; the parked clock wakes for it ([`Composer::run`]), so the last line is the state after the last work.
+    fn log_counters(&mut self, now_ns: i64) {
+        let line = self.counters_line();
+        let key = line.replacen(&format!("ticks={} ", self.stats.ticks), "", 1);
+        if key == self.counters_logged {
+            self.counters_pending = false;
+            return;
+        }
+        if self
+            .counters_logged_ns
+            .is_some_and(|t| now_ns - t < COUNTERS_PERIOD_NS)
+        {
+            self.counters_pending = true;
+            return;
+        }
+        self.counters_logged = key;
+        self.counters_logged_ns = Some(now_ns);
+        self.counters_pending = false;
+        tracing::info!("{line}");
+    }
+
+    /// How long a pending counters line still waits; None when none is pending.
+    fn counters_wait(&self, now_ns: i64) -> Option<Duration> {
+        let t = self.counters_logged_ns.filter(|_| self.counters_pending)?;
+        Some(Duration::from_nanos(
+            u64::try_from(t + COUNTERS_PERIOD_NS - now_ns).unwrap_or(0),
+        ))
     }
 
     /// `composer: counters <key>=<value> ...`: what the gate (`xtask test composer`) reads. `ignored` lists the layer-state bits the core counted instead of applying.
@@ -310,6 +343,10 @@ impl Drop for Handle {
     }
 }
 
+/// Shortest gap between two `composer: counters` lines [est]: 1 s, the `composer: fps` line's period (frame_rate.rs): a 60 Hz game logs one line a second instead of 60, and a gate that reads
+/// the last line after its work waits at most this long for it.
+const COUNTERS_PERIOD_NS: i64 = 1_000_000_000;
+
 fn monotonic_ns() -> i64 {
     let t = clock_gettime(ClockId::Monotonic);
     // hosts are 64-bit (arches.toml): tv_sec and tv_nsec are i64
@@ -338,6 +375,8 @@ impl Composer {
                 next_layer_id: 1,
                 next_vsync_id: 0,
                 counters_logged: String::new(),
+                counters_logged_ns: None,
+                counters_pending: false,
                 stats: Stats::default(),
                 mailbox: None,
             }),
@@ -747,7 +786,18 @@ impl Composer {
                     // an error means the present thread is gone: the process is ending
                     let _ = frames.send(self.release_frame());
                 } else {
-                    self.wake.park(seen);
+                    // a counters line held back by its period is logged when the period ends, unless work wakes the clock first
+                    let pending = self.lock().counters_wait(monotonic_ns());
+                    match pending {
+                        Some(wait) => {
+                            self.wake.park_for(seen, wait);
+                            let mut st = self.lock();
+                            if st.in_flight.is_empty() && !st.wants_frame() {
+                                st.log_counters(monotonic_ns());
+                            }
+                        }
+                        None => self.wake.park(seen),
+                    }
                 }
                 continue;
             }
@@ -853,14 +903,8 @@ impl Composer {
         // the calls are delivered (a release channel is written): what the core names no longer can be closed
         st.close_unreferenced();
         // the clock is about to park: nothing is left to count, so this is the line the gate reads
-        // an idle clock parks on every tick and moves only `ticks`: log the line when anything else moved, so the last one is the state after the last work
         if st.in_flight.is_empty() && !st.wants_frame() {
-            let line = st.counters_line();
-            let key = line.replacen(&format!("ticks={} ", st.stats.ticks), "", 1);
-            if key != st.counters_logged {
-                st.counters_logged = key;
-                tracing::info!("{line}");
-            }
+            st.log_counters(monotonic_ns());
         }
     }
 

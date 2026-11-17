@@ -1755,7 +1755,7 @@ fn post_draw_check(app: &str, services: &str) -> Result<String, String> {
     }
 }
 
-/// GTK's own debug output in the app log (GDK_DEBUG=dmabuf, set for every UI run): every scene buffer imported as a dmabuf texture, none downloaded through mmap (`gdk_dmabuf`), except on a tier whose own lines allow it (`Verdict::tier`); the tier is logged.
+/// GTK's own debug output in the app log (GDK_DEBUG=dmabuf, set by this gate's runs): every scene buffer imported as a dmabuf texture, none downloaded through mmap (`gdk_dmabuf`), except on a tier whose own lines allow it (`Verdict::tier`); the tier is logged.
 fn dmabuf_check(app: &str) -> Result<String, String> {
     let v = crate::gdk_dmabuf::Verdict::of(app);
     if let Some(tier) = v.tier() {
@@ -1967,6 +1967,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     };
     // the bindings sub-gate reads glibc's records from the app log (test-environment setup: the product reads neither variable)
     let mut env = args.app_env.clone();
+    // GTK's dmabuf lines: the import verdict and its tier (dmabuf_check, gdk_dmabuf.rs); only this gate reads them, and on a download tier GDK writes one per frame, so other runs go without
+    env.push(format!("GDK_DEBUG={}", crate::gdk_dmabuf::GDK_DEBUG));
     if matches!(args.stage, Stage::Hwui) {
         env.push("LD_DEBUG=bindings".to_owned());
         if args.break_global_module {

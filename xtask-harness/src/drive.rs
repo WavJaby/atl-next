@@ -162,8 +162,6 @@ pub struct Target<'a> {
     pub proxy: &'a Proxy,
     pub nested: &'a NestedCompositor,
     pub app_log: &'a Path,
-    /// The line of a presented frame in the app log.
-    pub present_line: &'a str,
     /// False once the app died: a wait ends with it.
     pub alive: &'a dyn Fn() -> bool,
     /// Deliberate failure: each shot is blanked before its check, which must then fail the run.
@@ -278,11 +276,9 @@ impl Driver<'_> {
         Ok(())
     }
 
+    /// Frames presented so far (a lower bound: run_apk::presented_total), so `wait-frames` may wait up to the fps line's second longer.
     fn presents(&self) -> usize {
-        atl_diag::logfiles::read(self.t.app_log)
-            .lines()
-            .filter(|l| l.contains(self.t.present_line))
-            .count()
+        crate::run_apk::presented_total(&atl_diag::logfiles::read(self.t.app_log)) as usize
     }
 
     fn step(&mut self, step: &Step) -> Result<()> {

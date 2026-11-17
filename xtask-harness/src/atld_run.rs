@@ -1803,13 +1803,11 @@ impl Runtime {
             cmd.args(["--display", display]);
         }
         if let Some(mode) = &self.ui {
-            // the compositor logs each frame's `present` line at debug (atl-composer ui_window.rs): the UI runs that read them enable it
-            // GTK's dmabuf debug lines: the window gate's import verdict (gdk_dmabuf.rs); both read in the app processes, so they go as --app-env (atld forwards nothing else of its own)
+            // the compositor logs its `present` lines (first and power-of-two counts) at debug (atl-composer ui_window.rs): the UI runs that read them enable it; read in the app processes, so
+            // it goes as --app-env (atld forwards nothing else of its own). GTK's dmabuf lines are the window gate's own (window.rs).
             cmd.args(["--ui", mode])
                 .arg("--app-env")
-                .arg("RUST_LOG=info,atl_composer=debug")
-                .arg("--app-env")
-                .arg(format!("GDK_DEBUG={}", crate::gdk_dmabuf::GDK_DEBUG));
+                .arg("RUST_LOG=info,atl_composer=debug");
         }
         for var in &self.app_env {
             cmd.arg("--app-env").arg(var);

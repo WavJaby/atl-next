@@ -797,22 +797,29 @@ fn touch_check(app: &str) -> Result<String, String> {
     ))
 }
 
+/// More than 2 scenes presented (run_apk::presented_total); the mean interval from the first and last present lines, which log at counts 1, 2, 4, ... (`n=` and `time_ns=`).
 fn presents_check(app: &str) -> Result<String, String> {
-    let scenes: Vec<i64> = app
+    let scenes: Vec<(i64, i64)> = app
         .lines()
         .filter_map(|l| {
             let (_, rest) = l.split_once("atl-composer: ui: present ")?;
-            word(rest, "time_ns")?.parse().ok()
+            Some((
+                word(rest, "n")?.parse().ok()?,
+                word(rest, "time_ns")?.parse().ok()?,
+            ))
         })
         .collect();
-    let n = scenes.len();
+    let n = crate::run_apk::presented_total(app);
     if n <= 2 {
         return Err(format!("{n} scenes presented, want more than 2"));
     }
-    let mean_ms = (scenes[n - 1] - scenes[0]) as f64 / (n - 1) as f64 / 1e6;
-    Ok(format!(
-        "{n} scenes presented; mean interval {mean_ms:.3} ms"
-    ))
+    let mean = match (scenes.first(), scenes.last()) {
+        (Some(&(n0, t0)), Some(&(n1, t1))) if n1 > n0 => {
+            format!("{:.3} ms", (t1 - t0) as f64 / (n1 - n0) as f64 / 1e6)
+        }
+        _ => "unknown".to_owned(),
+    };
+    Ok(format!("{n} scenes presented; mean interval {mean}"))
 }
 
 /// The widgets stage's sub-gates, in print order, from the probe's result, the app log and the frame callbacks after the marker; `esc_back`: the run had atld `--esc-back true`.

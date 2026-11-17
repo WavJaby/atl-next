@@ -34,6 +34,15 @@ impl Wake {
             g = self.changed.wait(g).unwrap_or_else(|e| e.into_inner());
         }
     }
+
+    /// [`Wake::park`] for at most `limit`.
+    pub fn park_for(&self, seen: u64, limit: std::time::Duration) {
+        let g = self.generation.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = self
+            .changed
+            .wait_timeout_while(g, limit, |g| *g == seen)
+            .unwrap_or_else(|e| e.into_inner());
+    }
 }
 
 /// The interval of `refresh_hz`, in ns, rounded to the nearest.
