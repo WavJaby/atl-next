@@ -53,6 +53,27 @@ public class Main extends Activity {
     private View web;
     private View over;
     private boolean laidOut;
+    private boolean apiChecked;
+
+    /**
+     * The calls ad / consent SDKs make on the main thread (Temple Run's Pangle ad: resumeTimers; Battle Cats' consent view: onPause): AOSP throws none of them.
+     * One line: `wv api ok ...` with the answers, or `wv api threw <exception>`.
+     */
+    private static void callApis(WebView w) {
+        try {
+            w.pauseTimers();
+            w.resumeTimers();
+            w.onPause();
+            w.onResume();
+            w.clearCache(true);
+            w.clearHistory();
+            w.clearFormData();
+            Log.i(TAG, "wv api ok progress=" + w.getProgress() + " url=" + w.getUrl() + " original=" + w.getOriginalUrl() + " js=" + w.getSettings().getJavaScriptEnabled()
+                    + " hit=" + w.getHitTestResult().getType() + " state=" + w.saveState(new Bundle()));
+        } catch (Throwable t) {
+            Log.i(TAG, "wv api threw " + t);
+        }
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -70,6 +91,10 @@ public class Main extends Activity {
                 @Override
                 public void onPageFinished(WebView view, String url) {
                     Log.i(TAG, "wv page finished");
+                    if (!apiChecked) {
+                        apiChecked = true;
+                        callApis(view);
+                    }
                 }
             });
             w.setWebChromeClient(new android.webkit.WebChromeClient() {

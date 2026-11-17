@@ -79,6 +79,8 @@ pub trait WebView {
     fn set_user_scripts(&self, sources: &[String]);
     /// The current URL, if any.
     fn uri(&self) -> Option<String>;
+    /// The URL the current history entry was first requested as (before redirects), if any.
+    fn original_uri(&self) -> Option<String>;
     /// The current title, if any.
     fn title(&self) -> Option<String>;
     /// The estimated progress of the current load, 0..=100.

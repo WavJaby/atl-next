@@ -59,6 +59,8 @@ enum Step {
     Soong,
     /// no crate logs a free-text `refused` / `unimplemented` line: API outcomes go through atl-diag; lines of another subject listed with a reason (diag_shape.rs)
     DiagShape,
+    /// the WebView provider throws UnsupportedOperationException only for the class-C methods listed with a reason (provider_refusals.rs)
+    ProviderRefusals,
     /// product code reads no environment-variable switch: each read is cargo's, or listed with its class and reason (env_reads.rs); no Cargo.toml enables a `break-*` / `tier-*` feature
     EnvReads,
     /// clippy on all targets, warnings denied
@@ -85,7 +87,7 @@ enum Step {
     CrossBionic,
 }
 
-const ALL: [Step; 26] = [
+const ALL: [Step; 27] = [
     Step::Fmt,
     Step::Spdx,
     Step::Tables,
@@ -100,6 +102,7 @@ const ALL: [Step; 26] = [
     Step::BwrapFlags,
     Step::Soong,
     Step::DiagShape,
+    Step::ProviderRefusals,
     Step::EnvReads,
     Step::Clippy,
     Step::Deny,
@@ -131,6 +134,7 @@ impl Step {
             Step::BwrapFlags => "bwrap-flags",
             Step::Soong => "soong",
             Step::DiagShape => "diag-shape",
+            Step::ProviderRefusals => "provider-refusals",
             Step::EnvReads => "env-reads",
             Step::Clippy => "clippy",
             Step::Deny => "deny",
@@ -347,6 +351,7 @@ impl Step {
             Step::BwrapFlags => crate::bwrap_flags::check(root),
             Step::Soong => crate::soong::check(root),
             Step::DiagShape => crate::diag_shape::check(root),
+            Step::ProviderRefusals => crate::provider_refusals::check(root),
             Step::EnvReads => crate::env_reads::check(root),
             Step::Clippy => cargo(
                 root,

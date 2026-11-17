@@ -47,7 +47,8 @@ import java.util.concurrent.Executor;
 
 /**
  * The provider of one WebView (WebViewFactoryProvider.createWebView, webview plan S4.1), also its ViewDelegate and ScrollDelegate. A forwarder (AGENTS Languages): every method is one
- * native call into libatl_webview.so, which keeps the page view behind {@link #mNative}; unimplemented methods throw Unimplemented.refuse("<Interface>.<method>").
+ * native call into libatl_webview.so, which keeps the page view behind {@link #mNative}; an unimplemented method answers its WebView contract's default, failure value or no-op, counted (Unimplemented.accept / answer); only the class-C methods
+ * (xtask provider-refusals table: no contract-legal answer) throw Unimplemented.refuse("<Interface>.<method>").
  * The clients are stored here as handed in (the natives read them for each callback); getWebViewClient's default instance is WebView's documented "default client if not yet set".
  */
 final class WebViewProviderImpl implements WebViewProvider, WebViewProvider.ViewDelegate, WebViewProvider.ScrollDelegate {
@@ -100,86 +101,106 @@ final class WebViewProviderImpl implements WebViewProvider, WebViewProvider.View
     @Override public void setOverScrollMode(int mode) {}
     @Override public void setScrollBarStyle(int style) { Unimplemented.accept("WebViewProvider.ViewDelegate.setScrollBarStyle"); }
 
-    // ---- WebViewProvider, not yet ----
-    @Override public void setHorizontalScrollbarOverlay(boolean overlay) { throw Unimplemented.refuse("WebViewProvider.setHorizontalScrollbarOverlay"); }
-    @Override public void setVerticalScrollbarOverlay(boolean overlay) { throw Unimplemented.refuse("WebViewProvider.setVerticalScrollbarOverlay"); }
-    @Override public boolean overlayHorizontalScrollbar() { throw Unimplemented.refuse("WebViewProvider.overlayHorizontalScrollbar"); }
-    @Override public boolean overlayVerticalScrollbar() { throw Unimplemented.refuse("WebViewProvider.overlayVerticalScrollbar"); }
-    @Override public int getVisibleTitleHeight() { throw Unimplemented.refuse("WebViewProvider.getVisibleTitleHeight"); }
-    @Override public SslCertificate getCertificate() { throw Unimplemented.refuse("WebViewProvider.getCertificate"); }
-    @Override public void setCertificate(SslCertificate certificate) { throw Unimplemented.refuse("WebViewProvider.setCertificate"); }
-    @Override public void savePassword(String host, String username, String password) { throw Unimplemented.refuse("WebViewProvider.savePassword"); }
-    @Override public void setHttpAuthUsernamePassword(String host, String realm, String username, String password) { throw Unimplemented.refuse("WebViewProvider.setHttpAuthUsernamePassword"); }
-    @Override public String[] getHttpAuthUsernamePassword(String host, String realm) { throw Unimplemented.refuse("WebViewProvider.getHttpAuthUsernamePassword"); }
-    @Override public void setNetworkAvailable(boolean networkUp) { throw Unimplemented.refuse("WebViewProvider.setNetworkAvailable"); }
-    @Override public WebBackForwardList saveState(Bundle outState) { throw Unimplemented.refuse("WebViewProvider.saveState"); }
-    @Override public boolean savePicture(Bundle b, File dest) { throw Unimplemented.refuse("WebViewProvider.savePicture"); }
-    @Override public boolean restorePicture(Bundle b, File src) { throw Unimplemented.refuse("WebViewProvider.restorePicture"); }
-    @Override public WebBackForwardList restoreState(Bundle inState) { throw Unimplemented.refuse("WebViewProvider.restoreState"); }
+    // ---- engine-backed beyond W2 ----
+    @Override public native String getOriginalUrl();
+    // isPaused answers; the engine is not paused (no WebKitGTK per-view pause), counted natively
+    @Override public native void onPause();
+    @Override public native void onResume();
+    @Override public native boolean isPaused();
+
+    // ---- class C (xtask provider-refusals table): no engine capability and no answer the WebView contract allows without misleading the app; throw ----
+    // a no-op drops the POST navigation (login forms): WebKitGTK's URIRequest carries no body
     @Override public void postUrl(String url, byte[] postData) { throw Unimplemented.refuse("WebViewProvider.postUrl"); }
-    @Override public void saveWebArchive(String filename) { throw Unimplemented.refuse("WebViewProvider.saveWebArchive"); }
-    @Override public void saveWebArchive(String basename, boolean autoname, ValueCallback<String> callback) { throw Unimplemented.refuse("WebViewProvider.saveWebArchive"); }
+    // a never-called callback stalls the app's reveal
+    @Override public void insertVisualStateCallback(long requestId, VisualStateCallback callback) { throw Unimplemented.refuse("WebViewProvider.insertVisualStateCallback"); }
+    @Override public PrintDocumentAdapter createPrintDocumentAdapter(String documentName) { throw Unimplemented.refuse("WebViewProvider.createPrintDocumentAdapter"); }
+    @Override public WebBackForwardList copyBackForwardList() { throw Unimplemented.refuse("WebViewProvider.copyBackForwardList"); }
+    @Override public WebMessagePort[] createWebMessageChannel() { throw Unimplemented.refuse("WebViewProvider.createWebMessageChannel"); }
+    @Override public void postMessageToMainFrame(WebMessage message, Uri targetOrigin) { throw Unimplemented.refuse("WebViewProvider.postMessageToMainFrame"); }
+
+    // ---- class B: no engine capability; the WebView contract's default / failure value / no-op, counted (Unimplemented.accept, Unimplemented.answer) ----
+    @Override public void setHorizontalScrollbarOverlay(boolean overlay) { Unimplemented.accept("WebViewProvider.setHorizontalScrollbarOverlay"); }
+    @Override public void setVerticalScrollbarOverlay(boolean overlay) { Unimplemented.accept("WebViewProvider.setVerticalScrollbarOverlay"); }
+    @Override public boolean overlayHorizontalScrollbar() { Unimplemented.accept("WebViewProvider.overlayHorizontalScrollbar"); return false; }
+    @Override public boolean overlayVerticalScrollbar() { Unimplemented.accept("WebViewProvider.overlayVerticalScrollbar"); return false; }
+    @Override public int getVisibleTitleHeight() { Unimplemented.accept("WebViewProvider.getVisibleTitleHeight"); return 0; }
+    // "null if there is no certificate (the site is not secure)"
+    @Override public SslCertificate getCertificate() { Unimplemented.accept("WebViewProvider.getCertificate"); return null; }
+    // deprecated: "has no useful effect"
+    @Override public void setCertificate(SslCertificate certificate) { Unimplemented.accept("WebViewProvider.setCertificate"); }
+    // deprecated: saving passwords "will not be supported"
+    @Override public void savePassword(String host, String username, String password) { Unimplemented.accept("WebViewProvider.savePassword"); }
+    // nothing stored -> get answers "null if no credentials"
+    @Override public void setHttpAuthUsernamePassword(String host, String realm, String username, String password) { Unimplemented.accept("WebViewProvider.setHttpAuthUsernamePassword"); }
+    @Override public String[] getHttpAuthUsernamePassword(String host, String realm) { Unimplemented.accept("WebViewProvider.getHttpAuthUsernamePassword"); return null; }
+    @Override public void setNetworkAvailable(boolean networkUp) { Unimplemented.accept("WebViewProvider.setNetworkAvailable"); }
+    // "null if the method fails"
+    @Override public WebBackForwardList saveState(Bundle outState) { Unimplemented.accept("WebViewProvider.saveState"); return null; }
+    @Override public WebBackForwardList restoreState(Bundle inState) { Unimplemented.accept("WebViewProvider.restoreState"); return null; }
+    @Override public boolean savePicture(Bundle b, File dest) { Unimplemented.accept("WebViewProvider.savePicture"); return false; }
+    @Override public boolean restorePicture(Bundle b, File src) { Unimplemented.accept("WebViewProvider.restorePicture"); return false; }
+    @Override public void saveWebArchive(String filename) { Unimplemented.accept("WebViewProvider.saveWebArchive"); }
+    // callback gets "null if the file could not be saved"
+    @Override public void saveWebArchive(String basename, boolean autoname, ValueCallback<String> callback) { Unimplemented.answer("WebViewProvider.saveWebArchive", callback, null); }
+    @Override public boolean isPrivateBrowsingEnabled() { Unimplemented.accept("WebViewProvider.isPrivateBrowsingEnabled"); return false; }
+    @Override public boolean pageUp(boolean top) { Unimplemented.accept("WebViewProvider.pageUp"); return false; }
+    @Override public boolean pageDown(boolean bottom) { Unimplemented.accept("WebViewProvider.pageDown"); return false; }
+    @Override public void clearView() { Unimplemented.accept("WebViewProvider.clearView"); }
+    @Override public Picture capturePicture() { Unimplemented.accept("WebViewProvider.capturePicture"); return new Picture(); }
+    @Override public float getScale() { Unimplemented.accept("WebViewProvider.getScale"); return mWebView.getResources().getDisplayMetrics().density; }
+    @Override public void invokeZoomPicker() { Unimplemented.accept("WebViewProvider.invokeZoomPicker"); }
+    // @NonNull; the default result is UNKNOWN_TYPE
+    @Override public HitTestResult getHitTestResult() { Unimplemented.accept("WebViewProvider.getHitTestResult"); return new HitTestResult(); }
+    @Override public void requestFocusNodeHref(Message hrefMsg) { Unimplemented.accept("WebViewProvider.requestFocusNodeHref"); }
+    @Override public void requestImageRef(Message msg) { Unimplemented.accept("WebViewProvider.requestImageRef"); }
+    @Override public Bitmap getFavicon() { Unimplemented.accept("WebViewProvider.getFavicon"); return null; }
+    @Override public String getTouchIconUrl() { Unimplemented.accept("WebViewProvider.getTouchIconUrl"); return null; }
+    // the ScrollDelegate's answer: the page fits the view
+    @Override public int getContentHeight() { Unimplemented.accept("WebViewProvider.getContentHeight"); return mWebView.getHeight(); }
+    @Override public int getContentWidth() { Unimplemented.accept("WebViewProvider.getContentWidth"); return mWebView.getWidth(); }
+    // process-wide JavaScript timers: WebKitGTK has no control (page visibility would also hide the page); nothing is paused
+    @Override public void pauseTimers() { Unimplemented.accept("WebViewProvider.pauseTimers"); }
+    @Override public void resumeTimers() { Unimplemented.accept("WebViewProvider.resumeTimers"); }
+    @Override public void freeMemory() { Unimplemented.accept("WebViewProvider.freeMemory"); }
+    @Override public void clearCache(boolean includeDiskFiles) { Unimplemented.accept("WebViewProvider.clearCache"); }
+    // AOSP: only removes the autocomplete popup, which the engine does not show over the page
+    @Override public void clearFormData() { Unimplemented.accept("WebViewProvider.clearFormData"); }
+    // divergence: WebKitGTK cannot clear its back-forward list, canGoBack stays true
+    @Override public void clearHistory() { Unimplemented.accept("WebViewProvider.clearHistory"); }
+    @Override public void clearSslPreferences() { Unimplemented.accept("WebViewProvider.clearSslPreferences"); }
+    @Override public void setFindListener(WebView.FindListener listener) { Unimplemented.accept("WebViewProvider.setFindListener"); }
+    @Override public void findNext(boolean forward) { Unimplemented.accept("WebViewProvider.findNext"); }
+    @Override public int findAll(String find) { Unimplemented.accept("WebViewProvider.findAll"); return 0; }
+    @Override public void findAllAsync(String find) { Unimplemented.accept("WebViewProvider.findAllAsync"); }
+    @Override public boolean showFindDialog(String text, boolean showIme) { Unimplemented.accept("WebViewProvider.showFindDialog"); return false; }
+    @Override public void clearMatches() { Unimplemented.accept("WebViewProvider.clearMatches"); }
+    @Override public void notifyFindDialogDismissed() { Unimplemented.accept("WebViewProvider.notifyFindDialogDismissed"); }
+    @Override public void documentHasImages(Message response) { Unimplemented.accept("WebViewProvider.documentHasImages"); }
+    // "null if WebView is not running in multiprocess mode"
+    @Override public WebViewRenderProcess getWebViewRenderProcess() { Unimplemented.accept("WebViewProvider.getWebViewRenderProcess"); return null; }
+    @Override public void setWebViewRenderProcessClient(Executor executor, WebViewRenderProcessClient client) { Unimplemented.accept("WebViewProvider.setWebViewRenderProcessClient"); }
+    @Override public WebViewRenderProcessClient getWebViewRenderProcessClient() { Unimplemented.accept("WebViewProvider.getWebViewRenderProcessClient"); return null; }
+    @Override public void setPictureListener(PictureListener listener) { Unimplemented.accept("WebViewProvider.setPictureListener"); }
+    @Override public void setMapTrackballToArrowKeys(boolean setMap) { Unimplemented.accept("WebViewProvider.setMapTrackballToArrowKeys"); }
+    @Override public void flingScroll(int vx, int vy) { Unimplemented.accept("WebViewProvider.flingScroll"); }
+    @Override public View getZoomControls() { Unimplemented.accept("WebViewProvider.getZoomControls"); return null; }
+    @Override public boolean canZoomIn() { Unimplemented.accept("WebViewProvider.canZoomIn"); return false; }
+    @Override public boolean canZoomOut() { Unimplemented.accept("WebViewProvider.canZoomOut"); return false; }
+    @Override public boolean zoomBy(float zoomFactor) { Unimplemented.accept("WebViewProvider.zoomBy"); return false; }
+    @Override public boolean zoomIn() { Unimplemented.accept("WebViewProvider.zoomIn"); return false; }
+    @Override public boolean zoomOut() { Unimplemented.accept("WebViewProvider.zoomOut"); return false; }
+    @Override public void dumpViewHierarchyWithProperties(BufferedWriter out, int level) { Unimplemented.accept("WebViewProvider.dumpViewHierarchyWithProperties"); }
+    @Override public View findHierarchyView(String className, int hashCode) { Unimplemented.accept("WebViewProvider.findHierarchyView"); return null; }
+    @Override public void setRendererPriorityPolicy(int rendererRequestedPriority, boolean waivedWhenNotVisible) { Unimplemented.accept("WebViewProvider.setRendererPriorityPolicy"); }
+    // the documented defaults: RENDERER_PRIORITY_IMPORTANT, not waived
+    @Override public int getRendererRequestedPriority() { Unimplemented.accept("WebViewProvider.getRendererRequestedPriority"); return WebView.RENDERER_PRIORITY_IMPORTANT; }
+    @Override public boolean getRendererPriorityWaivedWhenNotVisible() { Unimplemented.accept("WebViewProvider.getRendererPriorityWaivedWhenNotVisible"); return false; }
     @Override public boolean canGoBack() { return canGoBackOrForward(-1); }
     @Override public void goBack() { goBackOrForward(-1); }
     @Override public boolean canGoForward() { return canGoBackOrForward(1); }
     @Override public void goForward() { goBackOrForward(1); }
     @Override public native boolean canGoBackOrForward(int steps);
     @Override public native void goBackOrForward(int steps);
-    @Override public boolean isPrivateBrowsingEnabled() { throw Unimplemented.refuse("WebViewProvider.isPrivateBrowsingEnabled"); }
-    @Override public boolean pageUp(boolean top) { throw Unimplemented.refuse("WebViewProvider.pageUp"); }
-    @Override public boolean pageDown(boolean bottom) { throw Unimplemented.refuse("WebViewProvider.pageDown"); }
-    @Override public void insertVisualStateCallback(long requestId, VisualStateCallback callback) { throw Unimplemented.refuse("WebViewProvider.insertVisualStateCallback"); }
-    @Override public void clearView() { throw Unimplemented.refuse("WebViewProvider.clearView"); }
-    @Override public Picture capturePicture() { throw Unimplemented.refuse("WebViewProvider.capturePicture"); }
-    @Override public PrintDocumentAdapter createPrintDocumentAdapter(String documentName) { throw Unimplemented.refuse("WebViewProvider.createPrintDocumentAdapter"); }
-    @Override public float getScale() { throw Unimplemented.refuse("WebViewProvider.getScale"); }
-    @Override public void invokeZoomPicker() { throw Unimplemented.refuse("WebViewProvider.invokeZoomPicker"); }
-    @Override public HitTestResult getHitTestResult() { throw Unimplemented.refuse("WebViewProvider.getHitTestResult"); }
-    @Override public void requestFocusNodeHref(Message hrefMsg) { throw Unimplemented.refuse("WebViewProvider.requestFocusNodeHref"); }
-    @Override public void requestImageRef(Message msg) { throw Unimplemented.refuse("WebViewProvider.requestImageRef"); }
-    @Override public String getOriginalUrl() { throw Unimplemented.refuse("WebViewProvider.getOriginalUrl"); }
-    @Override public Bitmap getFavicon() { throw Unimplemented.refuse("WebViewProvider.getFavicon"); }
-    @Override public String getTouchIconUrl() { throw Unimplemented.refuse("WebViewProvider.getTouchIconUrl"); }
-    @Override public int getContentHeight() { throw Unimplemented.refuse("WebViewProvider.getContentHeight"); }
-    @Override public int getContentWidth() { throw Unimplemented.refuse("WebViewProvider.getContentWidth"); }
-    @Override public void pauseTimers() { throw Unimplemented.refuse("WebViewProvider.pauseTimers"); }
-    @Override public void resumeTimers() { throw Unimplemented.refuse("WebViewProvider.resumeTimers"); }
-    @Override public void onPause() { throw Unimplemented.refuse("WebViewProvider.onPause"); }
-    @Override public void onResume() { throw Unimplemented.refuse("WebViewProvider.onResume"); }
-    @Override public boolean isPaused() { throw Unimplemented.refuse("WebViewProvider.isPaused"); }
-    @Override public void freeMemory() { throw Unimplemented.refuse("WebViewProvider.freeMemory"); }
-    @Override public void clearCache(boolean includeDiskFiles) { throw Unimplemented.refuse("WebViewProvider.clearCache"); }
-    @Override public void clearFormData() { throw Unimplemented.refuse("WebViewProvider.clearFormData"); }
-    @Override public void clearHistory() { throw Unimplemented.refuse("WebViewProvider.clearHistory"); }
-    @Override public void clearSslPreferences() { throw Unimplemented.refuse("WebViewProvider.clearSslPreferences"); }
-    @Override public WebBackForwardList copyBackForwardList() { throw Unimplemented.refuse("WebViewProvider.copyBackForwardList"); }
-    @Override public void setFindListener(WebView.FindListener listener) { throw Unimplemented.refuse("WebViewProvider.setFindListener"); }
-    @Override public void findNext(boolean forward) { throw Unimplemented.refuse("WebViewProvider.findNext"); }
-    @Override public int findAll(String find) { throw Unimplemented.refuse("WebViewProvider.findAll"); }
-    @Override public void findAllAsync(String find) { throw Unimplemented.refuse("WebViewProvider.findAllAsync"); }
-    @Override public boolean showFindDialog(String text, boolean showIme) { throw Unimplemented.refuse("WebViewProvider.showFindDialog"); }
-    @Override public void clearMatches() { throw Unimplemented.refuse("WebViewProvider.clearMatches"); }
-    @Override public void documentHasImages(Message response) { throw Unimplemented.refuse("WebViewProvider.documentHasImages"); }
-    @Override public WebViewRenderProcess getWebViewRenderProcess() { throw Unimplemented.refuse("WebViewProvider.getWebViewRenderProcess"); }
-    @Override public void setWebViewRenderProcessClient(Executor executor, WebViewRenderProcessClient client) { throw Unimplemented.refuse("WebViewProvider.setWebViewRenderProcessClient"); }
-    @Override public WebViewRenderProcessClient getWebViewRenderProcessClient() { throw Unimplemented.refuse("WebViewProvider.getWebViewRenderProcessClient"); }
-    @Override public void setPictureListener(PictureListener listener) { throw Unimplemented.refuse("WebViewProvider.setPictureListener"); }
-    @Override public WebMessagePort[] createWebMessageChannel() { throw Unimplemented.refuse("WebViewProvider.createWebMessageChannel"); }
-    @Override public void postMessageToMainFrame(WebMessage message, Uri targetOrigin) { throw Unimplemented.refuse("WebViewProvider.postMessageToMainFrame"); }
-    @Override public void setMapTrackballToArrowKeys(boolean setMap) { throw Unimplemented.refuse("WebViewProvider.setMapTrackballToArrowKeys"); }
-    @Override public void flingScroll(int vx, int vy) { throw Unimplemented.refuse("WebViewProvider.flingScroll"); }
-    @Override public View getZoomControls() { throw Unimplemented.refuse("WebViewProvider.getZoomControls"); }
-    @Override public boolean canZoomIn() { throw Unimplemented.refuse("WebViewProvider.canZoomIn"); }
-    @Override public boolean canZoomOut() { throw Unimplemented.refuse("WebViewProvider.canZoomOut"); }
-    @Override public boolean zoomBy(float zoomFactor) { throw Unimplemented.refuse("WebViewProvider.zoomBy"); }
-    @Override public boolean zoomIn() { throw Unimplemented.refuse("WebViewProvider.zoomIn"); }
-    @Override public boolean zoomOut() { throw Unimplemented.refuse("WebViewProvider.zoomOut"); }
-    @Override public void dumpViewHierarchyWithProperties(BufferedWriter out, int level) { throw Unimplemented.refuse("WebViewProvider.dumpViewHierarchyWithProperties"); }
-    @Override public View findHierarchyView(String className, int hashCode) { throw Unimplemented.refuse("WebViewProvider.findHierarchyView"); }
-    @Override public void setRendererPriorityPolicy(int rendererRequestedPriority, boolean waivedWhenNotVisible) { throw Unimplemented.refuse("WebViewProvider.setRendererPriorityPolicy"); }
-    @Override public int getRendererRequestedPriority() { throw Unimplemented.refuse("WebViewProvider.getRendererRequestedPriority"); }
-    @Override public boolean getRendererPriorityWaivedWhenNotVisible() { throw Unimplemented.refuse("WebViewProvider.getRendererPriorityWaivedWhenNotVisible"); }
-    @Override public void notifyFindDialogDismissed() { throw Unimplemented.refuse("WebViewProvider.notifyFindDialogDismissed"); }
 
     // ---- ViewDelegate, composition (W3a): the page is drawn by the platform in the hole of the carrier SurfaceView child (the native init adds it), so the View side keeps View's defaults ----
     // WebView.onMeasure ran AbsoluteLayout's measure (the carrier included) before this: kept (Chromium sizes wrap_content by page content, not yet)
@@ -210,17 +231,17 @@ final class WebViewProviderImpl implements WebViewProvider, WebViewProvider.View
     // no Android input connection: the page's text input goes through the engine's own input method context, the desktop's (Linux convention); View's answer
     @Override public InputConnection onCreateInputConnection(EditorInfo outAttrs) { return null; }
 
-    // ---- ViewDelegate, not yet ----
-    @Override public void onProvideVirtualStructure(android.view.ViewStructure structure) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onProvideVirtualStructure"); }
-    @Override public AccessibilityNodeProvider getAccessibilityNodeProvider() { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.getAccessibilityNodeProvider"); }
-    @Override public void onInitializeAccessibilityNodeInfo(AccessibilityNodeInfo info) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onInitializeAccessibilityNodeInfo"); }
-    @Override public void onInitializeAccessibilityEvent(AccessibilityEvent event) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onInitializeAccessibilityEvent"); }
-    @Override public boolean performAccessibilityAction(int action, Bundle arguments) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.performAccessibilityAction"); }
-    @Override public void onOverScrolled(int scrollX, int scrollY, boolean clampedX, boolean clampedY) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onOverScrolled"); }
-    @Override public boolean performLongClick() { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.performLongClick"); }
-    @Override public boolean onDragEvent(DragEvent event) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onDragEvent"); }
-    @Override public boolean onTrackballEvent(MotionEvent ev) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onTrackballEvent"); }
-    @Override public void onActivityResult(int requestCode, int resultCode, Intent data) { throw Unimplemented.refuse("WebViewProvider.ViewDelegate.onActivityResult"); }
+    // ---- ViewDelegate, class B: View's answer (the page's own accessibility tree, drag and trackball are not wired), counted ----
+    @Override public void onProvideVirtualStructure(android.view.ViewStructure structure) { Unimplemented.accept("WebViewProvider.ViewDelegate.onProvideVirtualStructure"); }
+    @Override public AccessibilityNodeProvider getAccessibilityNodeProvider() { Unimplemented.accept("WebViewProvider.ViewDelegate.getAccessibilityNodeProvider"); return null; }
+    @Override public void onInitializeAccessibilityNodeInfo(AccessibilityNodeInfo info) { Unimplemented.accept("WebViewProvider.ViewDelegate.onInitializeAccessibilityNodeInfo"); }
+    @Override public void onInitializeAccessibilityEvent(AccessibilityEvent event) { Unimplemented.accept("WebViewProvider.ViewDelegate.onInitializeAccessibilityEvent"); }
+    @Override public boolean performAccessibilityAction(int action, Bundle arguments) { Unimplemented.accept("WebViewProvider.ViewDelegate.performAccessibilityAction"); return mWebViewPrivate.super_performAccessibilityAction(action, arguments); }
+    @Override public void onOverScrolled(int scrollX, int scrollY, boolean clampedX, boolean clampedY) { Unimplemented.accept("WebViewProvider.ViewDelegate.onOverScrolled"); }
+    @Override public boolean performLongClick() { Unimplemented.accept("WebViewProvider.ViewDelegate.performLongClick"); return mWebViewPrivate.super_performLongClick(); }
+    @Override public boolean onDragEvent(DragEvent event) { Unimplemented.accept("WebViewProvider.ViewDelegate.onDragEvent"); return false; }
+    @Override public boolean onTrackballEvent(MotionEvent ev) { Unimplemented.accept("WebViewProvider.ViewDelegate.onTrackballEvent"); return false; }
+    @Override public void onActivityResult(int requestCode, int resultCode, Intent data) { Unimplemented.accept("WebViewProvider.ViewDelegate.onActivityResult"); }
 
     // ---- ViewDelegate on the View system's own paths (draw, focus search, post, detach): View's answer; the page-side meaning (Chromium's) counted until a slice needs it ----
     @Override public void onDrawVerticalScrollBar(Canvas canvas, android.graphics.drawable.Drawable scrollBar, int l, int t, int r, int b) { mWebViewPrivate.super_onDrawVerticalScrollBar(canvas, scrollBar, l, t, r, b); }

@@ -31,6 +31,7 @@ static VTABLE: WebViewVtable = WebViewVtable {
     view_evaluate,
     view_set_user_scripts,
     view_uri,
+    view_original_uri,
     view_title,
     view_progress,
     view_set_bool,
@@ -471,6 +472,22 @@ unsafe extern "C" fn view_set_user_scripts(h: *mut WebViewHandle, sources: *cons
 
 unsafe extern "C" fn view_uri(h: *mut WebViewHandle, out: *mut BytesOut) -> bool {
     view(h).web.uri().is_some_and(|u| {
+        // SAFETY: the sink the caller lent.
+        unsafe { BytesOut::put_to(out, u.as_bytes()) };
+        true
+    })
+}
+
+/// The current back-forward item's original URI (WebKitBackForwardListItem: the URI first requested, before redirects); a page without an item (load_bytes makes none) -> its URI, which nothing redirected.
+unsafe extern "C" fn view_original_uri(h: *mut WebViewHandle, out: *mut BytesOut) -> bool {
+    let item = view(h)
+        .web
+        .back_forward_list()
+        .and_then(|l| l.current_item());
+    let uri = item
+        .and_then(|i| i.original_uri())
+        .or_else(|| view(h).web.uri());
+    uri.is_some_and(|u| {
         // SAFETY: the sink the caller lent.
         unsafe { BytesOut::put_to(out, u.as_bytes()) };
         true

@@ -257,6 +257,7 @@ pub fn checks(
                 Err(e) => Err(e.clone()),
             },
         ),
+        ("provider-api", provider_api(app)),
         ("controls", controls(app)),
         ("page-tap", page_tap(app)),
         ("view-tap", view_tap(app)),
@@ -265,6 +266,41 @@ pub fn checks(
         ("esc-handled", esc_handled(app)),
         ("esc-back", esc_back_check(app, esc_back)),
     ]
+}
+
+/// Sub-gate provider-api: the fixture's SDK-style calls after the first onPageFinished threw nothing and answered AOSP's documented values: progress 100 (finished), the
+/// loadData `data:` URL as both URL and original URL (no redirect), JavaScript on as set, HitTestResult UNKNOWN_TYPE (0, nothing hit), saveState's failure value null.
+fn provider_api(app: &str) -> Result<String, String> {
+    const API: &str = "AtlWindow: wv api ";
+    let line = app
+        .lines()
+        .find_map(|l| l.find(API).map(|i| &l[i + API.len()..]))
+        .ok_or("no `wv api` line")?;
+    let Some(rest) = line.strip_prefix("ok ") else {
+        return Err(format!("a WebView call threw: {line}"));
+    };
+    let field = |k: &str| {
+        rest.split(' ')
+            .find_map(|f| f.strip_prefix(k))
+            .unwrap_or("")
+    };
+    let url = field("url=");
+    let want = [
+        ("progress=", "100"),
+        ("js=", "true"),
+        ("hit=", "0"),
+        ("state=", "null"),
+    ];
+    let bad: Vec<_> = want.iter().filter(|(k, v)| field(k) != *v).collect();
+    if !bad.is_empty() || !url.starts_with("data:") || field("original=") != url {
+        return Err(format!(
+            "answers {rest}; want {want:?}, url data:..., original = url"
+        ));
+    }
+    Ok(
+        "timers / onPause / onResume / clear* threw nothing; getters answered AOSP's values"
+            .to_owned(),
+    )
 }
 
 /// The page's key titles (`key<n>...`), in order.
@@ -547,6 +583,17 @@ mod tests {
             "{ok}x AtlWindow: wv title key1Escape-prevented\nx AtlWindow: wv title key2Escape\n"
         );
         assert!(after_intercept(&keys).is_ok());
+    }
+
+    /// provider-api on hand-written lines: the owner's crash shape (resumeTimers refused) fails, AOSP's answers pass, a wrong answer fails.
+    #[test]
+    fn provider_api_by_hand() {
+        let threw = "x AtlWindow: wv api threw java.lang.UnsupportedOperationException: WebViewProvider.resumeTimers\n";
+        assert!(provider_api(threw).is_err());
+        let ok = "x AtlWindow: wv api ok progress=100 url=data:text/html,x original=data:text/html,x js=true hit=0 state=null\n";
+        assert!(provider_api(ok).is_ok());
+        assert!(provider_api(&ok.replace("original=data:text/html,x", "original=null")).is_err());
+        assert!(provider_api("").is_err());
     }
 
     /// The Esc sub-gates on hand-written logs: handled Esc no back, left Esc one back after it (esc-back on) or none (off); a duplicate key, an early back or a missing back fail.

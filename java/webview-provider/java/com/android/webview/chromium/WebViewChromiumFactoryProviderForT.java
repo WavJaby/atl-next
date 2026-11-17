@@ -18,7 +18,7 @@ import android.webkit.WebViewProvider;
 /**
  * The provider WebViewFactory instantiates (WebViewFactoryProvider.getWebViewFactoryClassName without use_b_entry_point; static create(WebViewDelegate), WebViewFactory.java:355-360).
  * A forwarder (AGENTS Languages): WebViewFactory needs an object implementing WebViewFactoryProvider, which JNI cannot create. Every method forwards to libatl_webview.so (the manifest's
- * WebViewLibrary); what is not built yet throws Unimplemented.refuse("WebViewFactoryProvider.<method>"), counted natively. createWebView refuses the same way when the engine cannot start.
+ * WebViewLibrary); what is not built yet answers the contract's default, counted (Unimplemented.accept), or throws Unimplemented.refuse("WebViewFactoryProvider.<method>") (class C). createWebView refuses the same way when the engine cannot start.
  * getPacProcessor / createPacProcessor keep the interface's defaults (UnsupportedOperationException), as AOSP's own provider contract states.
  */
 public final class WebViewChromiumFactoryProviderForT implements WebViewFactoryProvider {
@@ -44,13 +44,15 @@ public final class WebViewChromiumFactoryProviderForT implements WebViewFactoryP
     @Override
     public native WebViewProvider createWebView(WebView webView, WebView.PrivateAccess privateAccess);
 
-    @Override public GeolocationPermissions getGeolocationPermissions() { throw Unimplemented.refuse("WebViewFactoryProvider.getGeolocationPermissions"); }
+    // the framework base classes: every method a no-op / empty answer by AOSP's design ("Must be a no-op for backward compatibility"), counted at the getter
+    @Override public GeolocationPermissions getGeolocationPermissions() { Unimplemented.accept("WebViewFactoryProvider.getGeolocationPermissions"); return new GeolocationPermissions(); }
+    @Override public WebStorage getWebStorage() { Unimplemented.accept("WebViewFactoryProvider.getWebStorage"); return new WebStorage(); }
     @Override public native CookieManager getCookieManager();
+    // class C until an implementation class exists: the base classes are abstract and the getters @NonNull
     @Override public TokenBindingService getTokenBindingService() { throw Unimplemented.refuse("WebViewFactoryProvider.getTokenBindingService"); }
     @Override public TracingController getTracingController() { throw Unimplemented.refuse("WebViewFactoryProvider.getTracingController"); }
     @Override public ServiceWorkerController getServiceWorkerController() { throw Unimplemented.refuse("WebViewFactoryProvider.getServiceWorkerController"); }
     @Override public WebIconDatabase getWebIconDatabase() { throw Unimplemented.refuse("WebViewFactoryProvider.getWebIconDatabase"); }
-    @Override public WebStorage getWebStorage() { throw Unimplemented.refuse("WebViewFactoryProvider.getWebStorage"); }
     @Override public WebViewDatabase getWebViewDatabase(Context context) { throw Unimplemented.refuse("WebViewFactoryProvider.getWebViewDatabase"); }
     // the loader WebViewFactory loaded this provider with (the provider APK's, WebView.getWebViewClassLoader); it holds no Chromium support-library glue, so androidx.webkit finds no extra features
     @Override public ClassLoader getWebViewClassLoader() { return WebViewChromiumFactoryProviderForT.class.getClassLoader(); }

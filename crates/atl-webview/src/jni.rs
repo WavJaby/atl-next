@@ -367,6 +367,28 @@ pub extern "C" fn Java_com_android_webview_chromium_Unimplemented_accept(
     crate::refuse(&api);
 }
 
+/// Counts `api` and hands `callback` (a `ValueCallback`, may be null) `value`, the contract's failure value, on the calling thread; an exception it throws stays pending for the Java caller.
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_android_webview_chromium_Unimplemented_answer(
+    env: Env,
+    _class: Obj,
+    api: Obj,
+    callback: Obj,
+    value: Obj,
+) {
+    let api = string(env, api).unwrap_or_default();
+    crate::refuse(&api);
+    if !callback.is_null() {
+        call_void(
+            env,
+            callback,
+            c"onReceiveValue",
+            c"(Ljava/lang/Object;)V",
+            &[l(value)],
+        );
+    }
+}
+
 // ---- one WebView ----
 
 /// The native side of one `WebViewProviderImpl` (its `mNative`).
@@ -382,6 +404,8 @@ struct Native {
     settings: RefCell<Settings>,
     /// CookieManager.setAcceptThirdPartyCookies(this view) (= WebSettings.setAcceptThirdPartyCookies); counted in [`crate::cookies::third_party`] while on.
     third_party: Cell<bool>,
+    /// WebView.onPause called and onResume not since (WebView.isPaused): the state only; the engine has no per-view pause (webview plan, provider refusals table).
+    paused: Cell<bool>,
 }
 
 impl Native {
@@ -560,6 +584,7 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProvid
         interfaces: RefCell::default(),
         settings: RefCell::new(settings),
         third_party: Cell::new(false),
+        paused: Cell::new(false),
     }));
     // SAFETY: just made; the only reference.
     unsafe { &*native }.set_third_party(third_party);
@@ -1354,6 +1379,27 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_getTitle,
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_getProgress, (env, n) -> i32 = 0, {
     let _ = env;
     n.view.progress()
+});
+
+provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_getOriginalUrl, (env, n) -> Obj = NULL, {
+    n.view.original_uri().map_or(NULL, |u| new_string(env, &u))
+});
+
+// WebView.onPause: "best-effort ... animations and geolocation", JavaScript not paused. WebKitGTK has no per-view pause (hiding the widget would hide a page Android still shows): isPaused answers, the engine runs on, counted
+provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_onPause, (env, n) -> () = (), {
+    let _ = env;
+    crate::refuse("WebViewProvider.onPause.engine");
+    n.paused.set(true);
+});
+
+provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_onResume, (env, n) -> () = (), {
+    let _ = env;
+    n.paused.set(false);
+});
+
+provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_isPaused, (env, n) -> u8 = 0, {
+    let _ = env;
+    u8::from(n.paused.get())
 });
 
 // WebView.setBackgroundColor hands the colour to the provider only (WebView.java:3072): the page's background is the one there is

@@ -280,6 +280,10 @@ impl WebView for PlatformWebView {
         self.text(self.m.view_uri)
     }
 
+    fn original_uri(&self) -> Option<String> {
+        self.text(self.m.view_original_uri)
+    }
+
     fn title(&self) -> Option<String> {
         self.text(self.m.view_title)
     }

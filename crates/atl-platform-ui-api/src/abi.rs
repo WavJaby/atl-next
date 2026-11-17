@@ -1307,6 +1307,9 @@ pub struct WebViewVtable {
         unsafe extern "C" fn(view: *mut WebViewHandle, sources: *const Str, len: usize),
     /// `WebView::uri` into `out`; false = none.
     pub view_uri: unsafe extern "C" fn(view: *mut WebViewHandle, out: *mut BytesOut) -> bool,
+    /// `WebView::original_uri` into `out`; false = none.
+    pub view_original_uri:
+        unsafe extern "C" fn(view: *mut WebViewHandle, out: *mut BytesOut) -> bool,
     /// `WebView::title` into `out`; false = none.
     pub view_title: unsafe extern "C" fn(view: *mut WebViewHandle, out: *mut BytesOut) -> bool,
     /// `WebView::progress`.
