@@ -143,26 +143,26 @@ pub fn gate_out(root: &Path, explicit: Option<&Path>, host: &str, gate: &str) ->
     Ok(out)
 }
 
-/// Run-time gate `gate`'s foreign native-bridge graph for guest `isa` (native.rs `graph_dir` under the host's out dir `out`): refused unless built from the checkout now with every nb goal the gate declares (gate_goals.rs `nb`), else naming the `native --native-bridge` command that builds them.
+/// The record keys gate `gate` needs in guest `isa`'s foreign graph: its declared nb goals as `nb:<isa>:<module>`. The one list both [`foreign_out`] checks and `native --native-bridge <isa> --for <gate>` builds.
+pub fn foreign_goals(root: &Path, gate: &str, isa: &str) -> Result<BTreeSet<String>> {
+    Ok(crate::gate_goals::of(root, gate)?
+        .nb
+        .iter()
+        .map(|m| crate::gate_goals::nb_key(isa, m))
+        .collect())
+}
+
+/// Run-time gate `gate`'s foreign native-bridge graph for guest `isa` (native.rs `graph_dir` under the host's out dir `out`): refused unless built from the checkout now with every goal of [`foreign_goals`], else naming the `native --native-bridge <isa> --for <gate>` command that builds them.
 pub fn foreign_out(root: &Path, out: &Path, host: &str, isa: &str, gate: &str) -> Result<PathBuf> {
     let dir = crate::native::graph_dir(out, host, isa);
-    let modules: Vec<String> = crate::gate_goals::of(root, gate)?.nb.into_iter().collect();
-    let goals: Vec<String> = modules
-        .iter()
-        .map(|m| format!("{}{m}", crate::native::NB_GOAL))
-        .collect();
-    let fix = format!(
-        "cargo xtask native --host {host} --native-bridge {isa} {}",
-        goals.join(" ")
-    );
+    let fix = format!("cargo xtask native --host {host} --native-bridge {isa} --for {gate}");
     ensure_current(root, &dir).with_context(|| {
         format!("gate `{gate}`: the {isa} native-bridge graph is not current: run `{fix}`")
     })?;
     let built = read(&dir).map(|r| r.goals).unwrap_or_default();
-    let missing: Vec<&str> = modules
-        .iter()
-        .filter(|m| !built.contains(&crate::gate_goals::nb_key(isa, m)))
-        .map(String::as_str)
+    let missing: Vec<String> = foreign_goals(root, gate, isa)?
+        .into_iter()
+        .filter(|g| !built.contains(g))
         .collect();
     ensure!(
         missing.is_empty(),

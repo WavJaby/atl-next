@@ -92,11 +92,7 @@ impl Args {
                     a.host,
                     self.for_gates.join(",")
                 ),
-                (Some(arch), true) if *arch != a.host => bail!(
-                    "--for {}: the gates need the native-bridge guest for --host {}, not --native-bridge {arch}",
-                    self.for_gates.join(","),
-                    a.host
-                ),
+                // a foreign --native-bridge on an identity host: the gates' guest for an app of that ABI (run-apk, build_state.rs `foreign_out`); the identity guest stays the host run's
                 (Some(arch), false) if *arch == a.host => bail!(
                     "--for {}: --host {} has no identity engine (arches.toml), so its own ISA is no native-bridge guest",
                     self.for_gates.join(","),
@@ -2105,6 +2101,42 @@ mod tests {
             nb_module_dir(&foreign, "arm64", "libc"),
             foreign.join("nb/arm64/libc")
         );
+    }
+
+    /// The command run-apk's refusal names builds what it gates on: `--native-bridge <isa> --for <gate>` records every goal `build_state::foreign_out` checks, for each foreign guest of the identity host.
+    #[test]
+    fn foreign_for_builds_the_gated_set() {
+        let root = crate::test_root();
+        let arches = arches::load(&root).unwrap();
+        let mut guests = 0;
+        for (isa, row) in &arches {
+            if row.guest.is_none() || isa == "x86_64" {
+                continue;
+            }
+            guests += 1;
+            let args = Args {
+                goals: Vec::new(),
+                for_gates: vec!["run-apk".to_owned()],
+                host: "x86_64".to_owned(),
+                native_bridge: Some(isa.clone()),
+                keys: None,
+                cc: None,
+                cxx: None,
+                ar: None,
+                compiler_cache: String::new(),
+                no_compiler_cache: false,
+                shell: false,
+                fetch_missing: false,
+                out: None,
+                verbose: false,
+            };
+            let built = args.resolved(&root).unwrap().recorded_goals();
+            let gated = crate::build_state::foreign_goals(&root, "run-apk", isa).unwrap();
+            assert!(!gated.is_empty(), "{isa}");
+            let lacking: Vec<_> = gated.difference(&built).collect();
+            assert!(lacking.is_empty(), "{isa}: {lacking:?}");
+        }
+        assert!(guests > 0, "arches.toml names no foreign guest");
     }
 
     /// A foreign graph takes every gate's nb goal once: the run's own `nb:libm` stays first, the missing `nb:libc` is added after it, and no goal repeats.
