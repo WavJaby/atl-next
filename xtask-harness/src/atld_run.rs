@@ -340,7 +340,7 @@ pub struct Runtime {
     llvm_lib: PathBuf,
     /// Where atld runs: this host, or a target running it from the bundle (`remote test`, remote.rs [`remote::Site`]).
     site: remote::Site,
-    /// The device's persistent storage (atld `--device`) when [`Runtime::with_device`] set it: kept across runs. Unset: atld's root holds a fresh device (the gates).
+    /// The device's persistent storage (atld `--device`) when [`Runtime::with_device`] set it: kept across runs. Unset: a fresh device beside the run's root ([`fresh_device`], the gates), never atld's default (the user's own device).
     device: Option<PathBuf>,
 }
 
@@ -833,7 +833,7 @@ impl Runtime {
         self
     }
 
-    /// atld's device is the persistent dir `dir` (`--device`): app data and system state survive the run, and the next run on `dir` sees them (run-apk). Gates keep the fresh device of their root.
+    /// atld's device is the persistent dir `dir` (`--device`): app data and system state survive the run, and the next run on `dir` sees them (run-apk). Gates keep a fresh device ([`fresh_device`]).
     pub fn with_device(mut self, dir: &Path) -> Self {
         self.device = Some(dir.to_path_buf());
         self
@@ -1238,6 +1238,13 @@ impl Runtime {
     }
 }
 
+/// A gate's throwaway device: `<root>.device` beside the run's root (atld refuses a device inside the root), removed with the root at each start. Keeps gates hermetic: atld's default is the user's own device.
+pub fn fresh_device(root: &Path) -> PathBuf {
+    let mut name = root.file_name().unwrap_or_default().to_os_string();
+    name.push(".device");
+    root.with_file_name(name)
+}
+
 /// `pm clear` of `package` on the persistent `device` (run-apk `--clear-data`): its user and device-protected data dirs (`data/user/0/<p>`, `data/user_de/0/<p>`) and its external dirs (`external/<p>`), the layout atld's Root gives them (crates/atld main.rs).
 /// Its code and every other package's state stay; the next launch makes the dirs again. Missing dirs are fine.
 /// A name that is no package name, or a dir not strictly below `device`, is refused before anything is removed.
@@ -1547,9 +1554,12 @@ impl Runtime {
         self.record_inputs(run)?;
         std::fs::create_dir_all(&run.scratch)?;
         // atld makes the root again itself, but only once it runs: a poll must not see the previous run's logs
-        if run.root.exists() {
-            std::fs::remove_dir_all(&run.root)
-                .with_context(|| format!("removing {}", run.root.display()))?;
+        let fresh = self.device.is_none().then(|| fresh_device(&run.root));
+        for dir in std::iter::once(&run.root).chain(fresh.as_ref()) {
+            if dir.exists() {
+                std::fs::remove_dir_all(dir)
+                    .with_context(|| format!("removing {}", dir.display()))?;
+            }
         }
         let (mut cmd, mut written) = self.atld_command(run)?;
         if let remote::Site::Remote(target) = &self.site {
@@ -1681,9 +1691,11 @@ impl Runtime {
             .arg(&self.binderd)
             .arg("--sandbox-stub")
             .arg(&self.sandbox_stub);
-        if let Some(device) = &self.device {
-            cmd.arg("--device").arg(device);
-        }
+        let device = self
+            .device
+            .clone()
+            .unwrap_or_else(|| fresh_device(&run.root));
+        cmd.arg("--device").arg(device);
         if self.webspawn {
             cmd.arg("--sandbox-join")
                 .arg(&self.sandbox_join)

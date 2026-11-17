@@ -5,11 +5,13 @@
 #![forbid(unsafe_code)]
 
 pub mod app_access;
+mod data_dir;
 mod fonts;
 mod iio;
 mod locale;
 mod network;
 mod timezone;
+pub use data_dir::user_device;
 pub use fonts::FcFonts;
 pub use iio::IioSensors;
 pub use locale::ui_locale;

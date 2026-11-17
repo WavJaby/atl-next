@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! atld, M2 wiring: starts the system the Android way, each process through the broker, then serves the services' process control until the run ends (step 7).
 //! 1. the runtime root `--root` (made fresh): `properties` (the default property area, atl-property-service; `properties.d/` one area per app process: the defaults plus the properties only that process has, [`Host::process_properties`]), `system/` (build.prop, `framework/` = the boot jars and shared libraries),
-//!    `install/` (the installer's frames of each session, read by the services), `log/<process>.log` (each process's stdout + stderr). The device (`--device`, kept across runs): `data/` (`app/<package>/{base.apk,split_<name>.apk,lib/<isa>/}`, `user/0/<package>/`, `dalvik-cache/`, `system/`) and `external/`.
+//!    `install/` (the installer's frames of each session, read by the services), `log/<process>.log` (each process's stdout + stderr). The device (`--device`, default the user's `$XDG_DATA_HOME/atl/device`, kept across runs): `data/` (`app/<package>/{base.apk,split_<name>.apk,lib/<isa>/}`, `user/0/<package>/`, `dalvik-cache/`, `system/`) and `external/`.
 //! 2. the install sessions: each `--package` (its APK files) is a session the services install at their start (owner option I, 2026-11-13): they own the package list; atld does installd's
 //!    file work on their request (control `Install`: stage under session names (hard links where possible) + run atl-installer in the broker's installer profile; `Commit`: rename each file by its
 //!    parsed split (`base.apk`, `split_<name>.apk`), then the dir to `/data/app/<package>`, create the data dirs).
@@ -65,7 +65,7 @@ struct Args {
     #[arg(long)]
     root: PathBuf,
     /// The device's persistent storage, kept across runs: `data/` (/data: app code and data, system state, dalvik-cache) and `external/<package>/` (the shared storage's Android/data and obb of a package).
-    /// Default: `<root>/device`, made fresh with the root. Must lie outside `--root`, which is removed at start.
+    /// Default: the user's device in the desktop's data dir (Linux: `$XDG_DATA_HOME/atl/device`, else `~/.local/share/atl/device`), as a native program keeps its data. A fresh device is a new or empty DIR. Must lie outside `--root`, which is removed at start.
     #[arg(long, value_name = "DIR")]
     device: Option<PathBuf>,
     /// atl-binderd executable.
@@ -1704,18 +1704,17 @@ fn run(a: &Args) -> Result<ExitCode> {
     let started_ms = wall_ms();
     let root = std::path::absolute(&a.root)?;
     let device = match &a.device {
-        Some(d) => {
-            let d = std::path::absolute(d)?;
-            ensure!(
-                !d.starts_with(&root),
-                "--device {}: inside --root {}, which is removed at start",
-                d.display(),
-                root.display()
-            );
-            d
-        }
-        None => root.join("device"),
+        Some(d) => std::path::absolute(d)?,
+        None => atl_platform_host::user_device()
+            .context("no default device: neither XDG_DATA_HOME nor HOME names an absolute dir; pass --device")?,
     };
+    ensure!(
+        !device.starts_with(&root),
+        "--device {}: inside --root {}, which is removed at start",
+        device.display(),
+        root.display()
+    );
+    log(format_args!("device {}", device.display()));
     if a.root.exists() {
         std::fs::remove_dir_all(&a.root)?;
     }

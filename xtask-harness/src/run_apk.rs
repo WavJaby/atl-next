@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! `xtask run-apk <ROW|PATH>`: a test APK row of test-apks.toml, or an APK file given by path (unpinned), started by atld the way an app is (its launcher activity), in UI mode: the app's window is a GTK window of this desktop with --hold, else of the gate's headless compositor (nested_wayland.rs).
 //! Staging is the window gate's: the runtime (Runtime::new, gralloc, the display), the APK copied into the run's work dir, the package file from the APK's real manifest (manifest::read).
-//! The device is kept across launches ([`device_dir`]): an app's data survives them, as on a device, until `--clear-data` (`pm clear` of the package) or the dir is removed.
+//! The device is atld's default, the user's device in the XDG data dir (`--device` another): an app's data survives launches and build dirs, as on a device, until `--clear-data` (`pm clear` of the package) or the dir is removed.
 //! No probe; injected input only with `--pointer` (a scripted tap sequence the app runs from its first present). The verdict is about the last activity the app resumed (`services: activity resumed <class>`, sent after onResume returns). The run waits until the services
 //! are settled (`services: activity settled`: no launch, start or lifecycle step unacknowledged), so a Splash that starts Main is judged on Main. Pass: that resume is the last one, a frame is
 //! presented after it (`atl-composer: ui: present`), and no fault in the app log within the watch after it (window::fault_after). The run ends once all of that holds and the watch is over
@@ -95,9 +95,13 @@ pub struct Args {
     #[arg(long = "app-env", value_name = "KEY=VALUE")]
     app_env: Vec<String>,
     /// `pm clear` of the package before the launch: its data (user and device-protected user dirs, its external dirs) left by earlier launches is removed, so the app starts from empty data.
-    /// Other packages' data and the device's own state stay. The device is `<out>/run-apk/device`, kept across launches: without this flag the app keeps its data.
+    /// Other packages' data and the device's own state stay. The device is kept across launches: without this flag the app keeps its data.
     #[arg(long)]
     clear_data: bool,
+    /// The device (atld `--device`): `data/` and `external/`, kept across launches. Default: atld's, the user's device in the XDG data dir (`$XDG_DATA_HOME/atl/device`, else `~/.local/share/atl/device`), shared by every checkout and build dir.
+    /// A fresh device is a new or empty DIR.
+    #[arg(long, value_name = "DIR")]
+    device: Option<PathBuf>,
 }
 
 /// `xtask remote run-apk` (remote.rs `Remote::RunApk`): the same run on a target's desktop. `--hold` is required: the window is the target's, on its Wayland session, not a headless one.
@@ -179,12 +183,19 @@ impl Args {
             esc_back: false,
             app_env: Vec::new(),
             clear_data: false,
+            device: None,
         }
     }
 
     /// The same run with `--clear-data` set to `clear` (the gates that launch an app twice and check its data).
     pub(crate) fn with_clear_data(mut self, clear: bool) -> Self {
         self.clear_data = clear;
+        self
+    }
+
+    /// The same run on the device `dir` (`--device`): a gate's own, never the user's.
+    pub(crate) fn with_device(mut self, dir: &Path) -> Self {
+        self.device = Some(dir.to_path_buf());
         self
     }
 }
@@ -201,16 +212,80 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         None => None,
     };
     let (rt, foreign) = runtime(root, args, &files)?;
-    // the device outlives the launch: the app's data is still there at the next one (`--clear-data` clears one package of it)
-    let device = device_dir(&rt.out);
+    // the device outlives the launch and the build dir: the app's data is still there at the next one (`--clear-data` clears one package of it)
+    let device = match &args.device {
+        Some(d) => d.clone(),
+        None => {
+            let user = atl_platform_host::user_device()
+                .context("no default device: neither XDG_DATA_HOME nor HOME names an absolute dir; pass --device")?;
+            migrate_build_dir_device(&legacy_device_dir(&rt.out), &user)?;
+            user
+        }
+    };
     println!("run-apk: device {}", device.display());
     let rt = rt.with_device(&device);
     run_on(&rt, args, foreign.as_ref(), pin.as_ref(), files, steps)
 }
 
-/// The device of run-apk's launches under the native out dir `out`: kept across launches (atld `--device`), so an app's data survives them.
-pub(crate) fn device_dir(out: &Path) -> PathBuf {
+/// Where run-apk kept the device before it moved to the user's data dir (b7c61763): under the build dir `out`, so a pruned or other build dir lost it.
+fn legacy_device_dir(out: &Path) -> PathBuf {
     out.join("run-apk").join("device")
+}
+
+/// One-time move of the build dir's device `old` to the user's device `new`: only when `old` exists and `new` does not. Both present: `old` is left, named, never merged or deleted.
+/// Across filesystems (build pool vs home): copied to `<new>.migrating`, renamed into place, then `old` removed, so an interrupted copy never shows as the device.
+/// Delete this (and [`legacy_device_dir`]) once no build dir from before b7c61763's successor holds a `run-apk/device`.
+fn migrate_build_dir_device(old: &Path, new: &Path) -> Result<()> {
+    if !old.is_dir() {
+        return Ok(());
+    }
+    if new.exists() {
+        println!(
+            "run-apk: old device {} left in place: {} exists (not merged)",
+            old.display(),
+            new.display()
+        );
+        return Ok(());
+    }
+    let parent = new.parent().context("device dir has no parent")?;
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    match std::fs::rename(old, new) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+            let mut tmp = new.as_os_str().to_os_string();
+            tmp.push(".migrating");
+            let tmp = PathBuf::from(tmp);
+            if tmp.exists() {
+                std::fs::remove_dir_all(&tmp)
+                    .with_context(|| format!("removing {}", tmp.display()))?;
+            }
+            let ok = std::process::Command::new("cp")
+                .arg("-a")
+                .arg("--reflink=auto")
+                .arg(old)
+                .arg(&tmp)
+                .status()
+                .context("running cp")?
+                .success();
+            ensure!(
+                ok,
+                "copying {} to {}: cp failed, old device kept",
+                old.display(),
+                tmp.display()
+            );
+            std::fs::rename(&tmp, new).with_context(|| format!("renaming {}", tmp.display()))?;
+            std::fs::remove_dir_all(old).with_context(|| format!("removing {}", old.display()))?;
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("moving {} to {}", old.display(), new.display()));
+        }
+    }
+    println!(
+        "run-apk: moved device {} -> {}",
+        old.display(),
+        new.display()
+    );
+    Ok(())
 }
 
 /// One run of `args` on the staged runtime `rt` ([`configure`]d for `foreign`) of the package `files` (`pin`: its row). A drive gate's runs all share `rt`: each run's wiring goes on a copy, so none carries over to the next.
@@ -418,6 +493,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         esc_back: a.esc_back,
         app_env: Vec::new(),
         clear_data: false,
+        device: None,
     };
     // no `--display`: atld reads the target's own monitor, as on the product's host (host_display); this host's monitor is not the target's
     let (rt, foreign) = runtime(root, &args, &files)?;
@@ -1148,6 +1224,54 @@ fn judge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("atl-migrate-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    /// Old build-dir device, no user device yet: moved whole, old gone.
+    #[test]
+    fn build_dir_device_moves_to_an_absent_user_device() {
+        let base = scratch("move");
+        let old = base.join("out/run-apk/device");
+        let new = base.join("share/atl/device");
+        std::fs::create_dir_all(old.join("data/user/0/p/files")).unwrap();
+        std::fs::write(old.join("data/user/0/p/files/save.txt"), "s").unwrap();
+        migrate_build_dir_device(&old, &new).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(new.join("data/user/0/p/files/save.txt")).unwrap(),
+            "s"
+        );
+        assert!(!old.exists());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Both exist: nothing moved, merged or deleted.
+    #[test]
+    fn existing_user_device_leaves_both_untouched() {
+        let base = scratch("keep");
+        let old = base.join("old");
+        let new = base.join("new");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(old.join("a"), "old").unwrap();
+        std::fs::write(new.join("b"), "new").unwrap();
+        migrate_build_dir_device(&old, &new).unwrap();
+        assert_eq!(std::fs::read_to_string(old.join("a")).unwrap(), "old");
+        assert!(!new.join("a").exists());
+        assert_eq!(std::fs::read_to_string(new.join("b")).unwrap(), "new");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// No old device: nothing created.
+    #[test]
+    fn no_build_dir_device_is_a_no_op() {
+        let base = scratch("none");
+        migrate_build_dir_device(&base.join("old"), &base.join("new")).unwrap();
+        assert!(!base.exists());
+    }
 
     /// Every print_summary block is forwarded (API, prop, a future family); other atld lines are not.
     #[test]

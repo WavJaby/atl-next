@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test app-data`: an app's data outlives a run-apk launch (AOSP: until uninstall or `pm clear`). Three `run-apk` launches of the fixture (xtask-harness/testdata/app-data) on one device (`<out>/run-apk/device`):
+//! `xtask test app-data`: an app's data outlives a run-apk launch (AOSP: until uninstall or `pm clear`). Three `run-apk` launches of the fixture (xtask-harness/testdata/app-data) on the gate's own device (`<out>/app-data/device`, never the user's):
 //! 1. on empty data the app writes `save.txt` under its files dir: `AtlData: data: wrote`;
 //! 2. the next launch reads it back: `AtlData: data: read save-v1`, and the file is on the host under the device dir;
 //! 3. `--clear-data` (`pm clear`) empties the package's data first, so the app writes again: `AtlData: data: wrote`.
@@ -57,7 +57,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         None,
     )?;
     let package = manifest::read(&rt.apk.aapt2, &apk)?.name;
-    let device = run_apk::device_dir(&out);
+    let device = out.join("app-data").join("device");
     let log = out
         .join("run-apk")
         .join("root")
@@ -85,7 +85,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             args.java_out.clone(),
             false,
         )
-        .with_clear_data(clear);
+        .with_clear_data(clear)
+        .with_device(&device);
         let code = run_apk::run(root, &launch)?;
         let state = data_state(
             &std::fs::read_to_string(&log).unwrap_or_default(),
