@@ -8,12 +8,10 @@ use std::sync::Arc;
 
 use atl_aidl::aidl::android::os::ISystemConfig::{BnSystemConfig, ISystemConfig};
 use atl_parcelables::android::content::ComponentName;
+use atl_services_types::permission::QUERY_ALL_PACKAGES;
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, ThreadState};
 
 use crate::packages::Permissions;
-
-/// Manifest.permission.QUERY_ALL_PACKAGES.
-const QUERY_ALL_PACKAGES: &str = "android.permission.QUERY_ALL_PACKAGES";
 
 struct SystemConfigService {
     permissions: Arc<Permissions>,

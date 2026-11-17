@@ -185,6 +185,7 @@ impl Parsed {
             intents: installed.intents,
             libraries: crate::installed::with_implicit_libraries(installed.libraries, target_sdk),
             force_queryable: installed.force_queryable,
+            queries: installed.queries,
             uid,
             instruction_set: isa,
         }

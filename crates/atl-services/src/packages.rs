@@ -15,9 +15,11 @@ use atl_services_types::installer_output::Kind;
 use atl_services_types::packages::{Library, LibraryNode, PermissionDecl, used_libraries};
 use atl_services_types::permission::{self, PermissionState};
 
+use crate::activity::{filter_of, intent_key};
 use crate::activity_start::Declared;
+use crate::broadcast;
 use crate::desktop_bounds::{ActivityInput, ActivityOrientation};
-use crate::installed::{ComponentIntents, UsesLibrary};
+use crate::installed::{ComponentIntents, Queries, UsesLibrary};
 
 /// PackageManager.GET_META_DATA and MATCH_DISABLED_COMPONENTS (PackageManager.java).
 pub const GET_META_DATA: i64 = 0x80;
@@ -26,6 +28,8 @@ const ACTION_MAIN: &str = "android.intent.action.MAIN";
 const CATEGORY_LAUNCHER: &str = "android.intent.category.LAUNCHER";
 const ACTION_MANAGE_PERMISSIONS: &str = "android.intent.action.MANAGE_PERMISSIONS";
 const CATEGORY_DEFAULT: &str = "android.intent.category.DEFAULT";
+/// Build.VERSION_CODES.R: FILTER_APPLICATION_QUERY is enabled from R on (PackageManager.java:5684-5686), so an app below it sees every package.
+const VERSION_CODES_R: i32 = 30;
 pub(crate) use atl_services_types::system_packages::{FLAG_SYSTEM, PRIVATE_FLAG_PRIVILEGED};
 
 /// One installed package.
@@ -37,6 +41,8 @@ pub struct PackageRecord {
     pub libraries: Vec<UsesLibrary>,
     /// manifest `forceQueryable` (AndroidPackage.isForceQueryable); honoured for system packages only (`Packages::visible`)
     pub force_queryable: bool,
+    /// manifest `<queries>`: what this package may see of others (`Packages::visible`)
+    pub queries: Queries,
     pub uid: u32,
     /// The instruction set the process runs (arches.toml row key): primaryCpuAbi's, else the device's first (InstructionSets.getPrimaryInstructionSet); zygote's `--instruction-set`.
     pub instruction_set: String,
@@ -226,15 +232,81 @@ impl Packages {
         used_libraries(&self.libraries, p.libraries.iter().map(|l| l.name.as_str()))
     }
 
-    /// What `caller` may see of `package` (ComputerEngine shouldFilterApplication): a uid below the first application uid everything (AppsFilterImpl.shouldFilterApplication does not filter
-    /// them), an app its own package and every force-queryable one (no <queries> yet). Force-queryable = a system package whose manifest sets `forceQueryable` (AppsFilterImpl.addPackageInternal
-    /// :602-610; config_forceSystemPackagesQueryable and the device list are AOSP's defaults: false, empty).
+    /// What `caller` may see of `package` (ComputerEngine shouldFilterApplication, AppsFilterBase.shouldFilterApplicationInternal in AOSP's order): a caller below the first application uid, an app its own package, a target below it (AppsFilterBase:420-427), a force-queryable system package (AppsFilterImpl.addPackageInternal:602-610; config_forceSystemPackagesQueryable and the device list are AOSP's defaults: false, empty), and any package of the caller's app id that `grants` it (a shared uid pools its members' rules, :433-451).
     pub fn visible(&self, caller: u32, package: &str) -> Option<&PackageRecord> {
         let p = self.by_name(package)?;
         let own = permission::app_id(p.uid) == permission::app_id(caller);
+        let below_app_uids = permission::app_id(p.uid) < permission::FIRST_APPLICATION_UID;
         let force_queryable = p.force_queryable && p.app().flags & FLAG_SYSTEM != 0;
-        (permission::sees_all_packages(caller) || own || force_queryable).then_some(p)
+        let granted = self
+            .by_app_id(permission::app_id(caller))
+            .any(|c| grants(c, p));
+        (permission::sees_all_packages(caller)
+            || own
+            || below_app_uids
+            || force_queryable
+            || granted)
+            .then_some(p)
     }
+}
+
+/// Whether caller package `c` may see `p`: AppsFilterBase.shouldFilterApplicationInternal's grants in AOSP's order. A target-SDK below R (FILTER_APPLICATION_QUERY off), QUERY_ALL_PACKAGES, `<queries><package>`,
+/// `<queries>` intents and providers, instrumentation either way (AppsFilterImpl.pkgInstruments), a permission `c` requests that `p` declares (mQueryableViaUsesPermission, AppsFilterImpl.addPackageInternal:618-670).
+/// Not modelled: installer and update-owner (no install source kept), implicit grants, overlays, static libraries, `<library>` providers, protected broadcasts (no list kept).
+fn grants(c: &PackageRecord, p: &PackageRecord) -> bool {
+    c.app().target_sdk_version < VERSION_CODES_R
+        || c.requested_permissions()
+            .any(|r| r == permission::QUERY_ALL_PACKAGES)
+        || c.queries.packages.iter().any(|n| n == p.name())
+        || queries_component(c, p)
+        || instruments(c, p)
+        || instruments(p, c)
+        || c.requested_permissions().any(|r| {
+            p.permission_decls()
+                .any(|d| d.item.name.as_deref() == Some(r))
+        })
+}
+
+/// AppsFilterUtils.canQueryViaComponents: a `<queries>` intent matches an intent filter of an exported component of `p` (matchesAnyComponents; IntentFilter.match, no default-category
+/// requirement), or a `<queries>` provider authority is a `;` token of an exported provider's authority (matchesProviders). Receivers match without the protected-broadcast exclusion.
+fn queries_component(c: &PackageRecord, p: &PackageRecord) -> bool {
+    let by_intent = c.queries.intents.iter().any(|q| {
+        let key = intent_key(q, None);
+        p.intents.iter().any(|ci| {
+            exported(p, ci.kind, &ci.name)
+                && ci.intents.iter().any(|ii| {
+                    ii.intent_filter
+                        .as_ref()
+                        .is_some_and(|f| broadcast::match_value(&filter_of(f), &key).is_some())
+                })
+        })
+    });
+    let by_provider =
+        p.providers().any(|pr| {
+            pr.component.exported
+                && pr.authority.iter().flat_map(|a| a.split(';')).any(|token| {
+                    !token.is_empty() && c.queries.providers.iter().any(|q| q == token)
+                })
+        });
+    by_intent || by_provider
+}
+
+/// The component `name` of `kind` in `p` is exported (ParsedMainComponent.isExported).
+fn exported(p: &PackageRecord, kind: Kind, name: &str) -> bool {
+    match kind {
+        Kind::ActivityIntents => p.activity(name).is_some_and(|a| a.component.exported),
+        Kind::ReceiverIntents => p.receiver(name).is_some_and(|a| a.component.exported),
+        Kind::ServiceIntents => p.service(name).is_some_and(|s| s.component.exported),
+        Kind::ProviderIntents => p.provider(name).is_some_and(|x| x.component.exported),
+        Kind::Package | Kind::PackageFields => false,
+    }
+}
+
+/// AppsFilterImpl.pkgInstruments: `source` declares an instrumentation whose target package is `target`.
+fn instruments(source: &PackageRecord, target: &PackageRecord) -> bool {
+    source
+        .instrumentation()
+        .any(|i| i.target_package.as_deref() == Some(target.name()))
 }
 
 /// Why grantRuntimePermission refuses (PermissionManagerServiceImpl.grantRuntimePermissionInternal): `UnknownPermission` is its IllegalArgumentException, the other two its SecurityExceptions.
@@ -649,6 +721,7 @@ pub mod fixture {
             intents: Vec::new(),
             libraries: Vec::new(),
             force_queryable: false,
+            queries: Queries::default(),
             uid: 10_001,
             instruction_set: "x86_64".to_owned(),
         }
@@ -659,8 +732,197 @@ pub mod fixture {
 mod tests {
     use super::fixture::*;
     use super::*;
+    use atl_parcelables::android::content::Intent;
     use atl_parcelables::android::os::Bundle;
+    use atl_parcelables::parts::PackageItemInfo;
     use std::sync::Arc;
+
+    /// `org.caller` (uid 10_002, targetSdk 34) with `edit` applied, against `target`: does the caller see it?
+    fn caller_sees_target(edit: impl FnOnce(&mut PackageRecord), target: PackageRecord) -> bool {
+        let mut caller = record("org.caller");
+        caller.uid = 10_002;
+        edit(&mut caller);
+        Packages::new(vec![caller, target], BTreeMap::new())
+            .visible(10_002, "org.target")
+            .is_some()
+    }
+
+    /// `org.target` (uid 10_001, not force-queryable) with `edit` applied: its exported components, providers, permissions and instrumentation.
+    fn target(edit: impl FnOnce(&mut PackageRecord)) -> PackageRecord {
+        let mut r = record("org.target");
+        edit(&mut r);
+        r
+    }
+
+    /// AppsFilterUtils.canQueryViaPackage: `<queries><package>` names the package it may see; another name grants nothing.
+    #[test]
+    fn queries_package_names_a_visible_package() {
+        let names = |n: &str| {
+            caller_sees_target(|c| c.queries.packages = vec![n.to_owned()], target(|_| {}))
+        };
+        assert!(names("org.target"));
+        assert!(!names("org.other"));
+    }
+
+    /// The billing shape (AppsFilterUtils.matchesAnyComponents): a `<queries><intent>` with the BIND action sees the target whose exported service filters that action. A non-exported service,
+    /// or no query, does not.
+    #[test]
+    fn queries_intent_sees_the_exported_service_that_filters_its_action() {
+        const BIND: &str = "com.android.vending.billing.InAppBillingService.BIND";
+        let service = |exported: bool| {
+            target(|t| {
+                t.info.services = Some(vec![Some(ServiceInfo {
+                    component: ComponentInfo {
+                        exported,
+                        ..component("org.target", "org.target.Billing")
+                    },
+                    ..Default::default()
+                })]);
+                t.intents.push(ComponentIntents {
+                    kind: Kind::ServiceIntents,
+                    name: "org.target.Billing".into(),
+                    intents: vec![filter(&[BIND], &[])],
+                });
+            })
+        };
+        let bind = Queries {
+            intents: vec![Intent {
+                action: Some(BIND.into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(caller_sees_target(
+            |c| c.queries = bind.clone(),
+            service(true)
+        ));
+        assert!(!caller_sees_target(|_| {}, service(true)));
+        assert!(!caller_sees_target(|c| c.queries = bind, service(false)));
+    }
+
+    /// AppsFilterUtils.matchesProviders: an exported provider's `;` authorities count one by one; a non-exported provider does not.
+    #[test]
+    fn queries_provider_names_an_exported_authority() {
+        let provider = |exported: bool| {
+            target(|t| {
+                t.info.providers = Some(vec![Some(ProviderInfo {
+                    component: ComponentInfo {
+                        exported,
+                        ..component("org.target", "org.target.P")
+                    },
+                    authority: Some("auth.one;auth.two".into()),
+                    ..Default::default()
+                })]);
+            })
+        };
+        let asks = |authority: &str, exported: bool| {
+            caller_sees_target(
+                |c| c.queries.providers = vec![authority.to_owned()],
+                provider(exported),
+            )
+        };
+        assert!(asks("auth.two", true));
+        assert!(!asks("auth.three", true));
+        assert!(!asks("auth.two", false));
+    }
+
+    /// AppsFilterBase.shouldFilterApplicationInternal, the FILTER_APPLICATION_QUERY check (AppsFilterImpl.java:5684-5686, EnabledSince R): a caller targeting 29 sees every package, one targeting R does not.
+    #[test]
+    fn caller_below_r_sees_every_package() {
+        let sees_with_target_sdk = |sdk: i32| {
+            caller_sees_target(
+                |c| {
+                    c.info
+                        .application_info
+                        .as_mut()
+                        .expect("app")
+                        .target_sdk_version = sdk
+                },
+                target(|_| {}),
+            )
+        };
+        assert!(sees_with_target_sdk(29));
+        assert!(!sees_with_target_sdk(VERSION_CODES_R));
+    }
+
+    /// AppsFilterUtils.requestsQueryAllPackages: a caller requesting QUERY_ALL_PACKAGES sees every package.
+    #[test]
+    fn query_all_packages_sees_every_package() {
+        let requests = Some(vec![Some(permission::QUERY_ALL_PACKAGES.to_owned())]);
+        assert!(caller_sees_target(
+            |c| c.info.requested_permissions = requests.clone(),
+            target(|_| {})
+        ));
+        assert!(!caller_sees_target(|_| {}, target(|_| {})));
+    }
+
+    /// AppsFilterImpl.addPackageInternal:618-670 (mQueryableViaUsesPermission): a permission the caller requests and the target declares makes it visible; an undeclared one does not.
+    #[test]
+    fn requested_permission_the_target_declares_is_visible() {
+        let declares = || {
+            target(|t| {
+                t.info.permissions = Some(vec![Some(PermissionInfo {
+                    item: PackageItemInfo {
+                        name: Some(CAMERA.into()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })]);
+            })
+        };
+        let requests = |name: &str| {
+            caller_sees_target(
+                |c| c.info.requested_permissions = Some(vec![Some(name.into())]),
+                declares(),
+            )
+        };
+        assert!(requests(CAMERA));
+        assert!(!requests(INTERNET));
+    }
+
+    /// AppsFilterImpl.pkgInstruments: an instrumentation that targets the other package makes the two visible to each other, from either side.
+    #[test]
+    fn instrumentation_makes_both_packages_visible() {
+        let instrumenting = |package: &str| {
+            Some(vec![Some(InstrumentationInfo {
+                target_package: Some(package.into()),
+                ..Default::default()
+            })])
+        };
+        assert!(caller_sees_target(
+            |_| {},
+            target(|t| t.info.instrumentation = instrumenting("org.caller"))
+        ));
+        assert!(caller_sees_target(
+            |c| c.info.instrumentation = instrumenting("org.target"),
+            target(|_| {})
+        ));
+        assert!(!caller_sees_target(
+            |_| {},
+            target(|t| t.info.instrumentation = instrumenting("org.other"))
+        ));
+    }
+
+    /// A shared uid pools its members' rules (AppsFilterBase.shouldFilterApplicationInternal, callingSharedPkgSettings): one member's `<queries>` is the uid's, another uid gets nothing.
+    #[test]
+    fn shared_uid_member_query_covers_the_uid() {
+        let mut member = record("org.member");
+        member.uid = 10_002;
+        member.queries.packages = vec!["org.target".into()];
+        let mut sibling = record("org.sibling");
+        sibling.uid = 10_002;
+        let packages = Packages::new(vec![sibling, member, target(|_| {})], BTreeMap::new());
+        assert!(packages.visible(10_002, "org.target").is_some());
+        assert!(packages.visible(10_003, "org.target").is_none());
+    }
+
+    /// AppsFilterBase.shouldFilterApplicationInternal:420-427: a target below the first application uid is never filtered, whoever asks.
+    #[test]
+    fn package_below_the_application_uids_is_visible() {
+        let mut system = target(|_| {});
+        system.uid = 1_000;
+        assert!(caller_sees_target(|_| {}, system));
+    }
 
     /// An app sees another package only when it is system and force-queryable (AppsFilterImpl:607-608): both conditions, each alone is not enough.
     #[test]

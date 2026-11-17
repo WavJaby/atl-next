@@ -4,6 +4,7 @@
 
 use std::fmt;
 
+use atl_parcelables::android::content::Intent;
 use atl_parcelables::android::content::pm::PackageInfo;
 use atl_parcelables::parts::{ParsedIntentInfo, r_typed_list};
 use atl_services_types::installer_output::{FrameError, Kind, frames};
@@ -25,6 +26,17 @@ pub struct ComponentIntents {
 pub struct UsesLibrary {
     pub name: String,
     pub required: bool,
+}
+
+/// The manifest's `<queries>` (AndroidPackage.getQueriesPackages / getQueriesIntents / getQueriesProviders; ParsingPackageUtils:1961 adds each `;` token of an authority alone).
+#[derive(Debug, Clone, Default)]
+pub struct Queries {
+    /// `<package android:name>`
+    pub packages: Vec<String>,
+    /// `<intent>`: the Intent it parses to (action, categories, data, type)
+    pub intents: Vec<Intent>,
+    /// `<provider android:authorities>`, one per `;` token
+    pub providers: Vec<String>,
 }
 
 /// SharedLibraryNames.ORG_APACHE_HTTP_LEGACY (services/core/java/com/android/server/pm/parsing/library/SharedLibraryNames.java:35).
@@ -123,6 +135,7 @@ pub struct Installed {
     pub libraries: Vec<UsesLibrary>,
     /// manifest `forceQueryable` (AndroidPackage.isForceQueryable)
     pub force_queryable: bool,
+    pub queries: Queries,
 }
 
 /// Why an output does not decode; `frame` is the frame's index.
@@ -153,6 +166,10 @@ pub enum DecodeError {
     },
     /// a uses-library list that is null or holds a null name
     NullInLibraries {
+        frame: usize,
+    },
+    /// a `<queries>` list that is null or holds a null entry
+    NullInQueries {
         frame: usize,
     },
     /// an intents frame without a class name, with a null list or a null element
@@ -211,6 +228,10 @@ impl fmt::Display for DecodeError {
                 f,
                 "installer output: frame {frame}: null class name or intent"
             ),
+            DecodeError::NullInQueries { frame } => write!(
+                f,
+                "installer output: frame {frame}: null <queries> list or entry"
+            ),
             DecodeError::UnknownComponent { frame, kind, name } => {
                 write!(
                     f,
@@ -250,15 +271,26 @@ pub fn decode(data: &[u8]) -> Result<Installed, DecodeError> {
                     return Err(DecodeError::SecondPackage { frame });
                 }
             }
-            Value::Fields(required, optional, force_queryable) => {
+            Value::Fields(f) => {
                 let mut list = Vec::new();
-                for (names, required) in [(required, true), (optional, false)] {
+                for (names, required) in [(f.required, true), (f.optional, false)] {
                     for name in names.ok_or(DecodeError::NullInLibraries { frame })? {
                         let name = name.ok_or(DecodeError::NullInLibraries { frame })?;
                         list.push(UsesLibrary { name, required });
                     }
                 }
-                if fields.replace((list, force_queryable)).is_some() {
+                let intents = f
+                    .query_intents
+                    .ok_or(DecodeError::NullInQueries { frame })?
+                    .into_iter()
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or(DecodeError::NullInQueries { frame })?;
+                let queries = Queries {
+                    packages: strings(f.query_packages, frame)?,
+                    intents,
+                    providers: strings(f.query_providers, frame)?,
+                };
+                if fields.replace((list, f.force_queryable, queries)).is_some() {
                     return Err(DecodeError::SecondPackageFields { frame });
                 }
             }
@@ -280,7 +312,7 @@ pub fn decode(data: &[u8]) -> Result<Installed, DecodeError> {
         }
     }
     let package = package.ok_or(DecodeError::NoPackage)?;
-    let (libraries, force_queryable) = fields.ok_or(DecodeError::NoPackageFields)?;
+    let (libraries, force_queryable, queries) = fields.ok_or(DecodeError::NoPackageFields)?;
     let intents = intents
         .into_iter()
         .map(|(frame, c)| {
@@ -300,15 +332,26 @@ pub fn decode(data: &[u8]) -> Result<Installed, DecodeError> {
         intents,
         libraries,
         force_queryable,
+        queries,
     })
 }
 
 type StringList = Option<Vec<Option<String>>>;
 
+/// The PackageFields parcel's lists and flag, as written.
+struct Fields {
+    required: StringList,
+    optional: StringList,
+    force_queryable: bool,
+    query_packages: StringList,
+    query_providers: StringList,
+    query_intents: Option<Vec<Option<Intent>>>,
+}
+
 enum Value {
     Package(Box<PackageInfo>),
     Intents(Option<String>, Vec<Option<ParsedIntentInfo>>),
-    Fields(StringList, StringList, bool),
+    Fields(Fields),
 }
 
 fn read(p: &Parcel, kind: Kind) -> Result<Value, StatusCode> {
@@ -316,13 +359,28 @@ fn read(p: &Parcel, kind: Kind) -> Result<Value, StatusCode> {
     Ok(match kind {
         Kind::Package => Value::Package(Box::new(PackageInfo::from_parcel(b)?)),
         // Parcel.writeStringList: the count (-1 for null), then writeString per element -- the binder crate's Option<Vec<Option<String>>> layout
-        Kind::PackageFields => Value::Fields(b.read()?, b.read()?, b.read()?),
+        Kind::PackageFields => Value::Fields(Fields {
+            required: b.read()?,
+            optional: b.read()?,
+            force_queryable: b.read()?,
+            query_packages: b.read()?,
+            query_providers: b.read()?,
+            query_intents: r_typed_list(b)?,
+        }),
         _ => {
             let name: Option<String> = b.read()?;
             let list = r_typed_list(b)?.ok_or(StatusCode::UNEXPECTED_NULL)?;
             Value::Intents(name, list)
         }
     })
+}
+
+/// A `<queries>` string list: null, or a null entry, is refused.
+fn strings(list: StringList, frame: usize) -> Result<Vec<String>, DecodeError> {
+    list.ok_or(DecodeError::NullInQueries { frame })?
+        .into_iter()
+        .map(|s| s.ok_or(DecodeError::NullInQueries { frame }))
+        .collect()
 }
 
 fn parcel_error(frame: usize, kind: Kind, status: StatusCode, refused: Vec<String>) -> DecodeError {
@@ -383,7 +441,7 @@ pub fn component_names(package: &PackageInfo, kind: Kind) -> Box<dyn Iterator<It
 mod tests {
     use super::*;
     use atl_parcelables::android::content::pm::ApplicationInfo;
-    use atl_parcelables::parts::Part;
+    use atl_parcelables::parts::{Part, w_typed_list};
     use atl_services_types::installer_output::write_frame;
 
     fn app() -> ApplicationInfo {
@@ -409,14 +467,30 @@ mod tests {
         p.marshal().expect("marshal")
     }
 
-    /// A package-fields frame as the installer writes it: two string lists, then forceQueryable.
-    fn fields_bytes(required: &[&str], optional: &[&str], force_queryable: bool) -> Vec<u8> {
+    /// A package-fields frame as the installer writes it: two string lists, forceQueryable, then the `<queries>` packages, providers and intents.
+    fn fields_bytes_with(
+        required: &[&str],
+        optional: &[&str],
+        force_queryable: bool,
+        queries: &Queries,
+    ) -> Vec<u8> {
         let list = |v: &[&str]| Some(v.iter().map(|s| Some((*s).to_owned())).collect::<Vec<_>>());
+        let strings = |v: &[String]| Some(v.iter().map(|s| Some(s.clone())).collect::<Vec<_>>());
+        let intents: Vec<Option<Intent>> = queries.intents.iter().cloned().map(Some).collect();
         let mut p = Parcel::new();
         p.write(&list(required)).expect("required");
         p.write(&list(optional)).expect("optional");
         p.write(&force_queryable).expect("forceQueryable");
+        p.write(&strings(&queries.packages))
+            .expect("query packages");
+        p.write(&strings(&queries.providers))
+            .expect("query providers");
+        w_typed_list(&mut p.borrowed(), &Some(intents)).expect("query intents");
         p.marshal().expect("marshal")
+    }
+
+    fn fields_bytes(required: &[&str], optional: &[&str], force_queryable: bool) -> Vec<u8> {
+        fields_bytes_with(required, optional, force_queryable, &Queries::default())
     }
 
     fn libraries_bytes(required: &[&str], optional: &[&str]) -> Vec<u8> {
@@ -432,6 +506,58 @@ mod tests {
                 .expect("frame");
             assert_eq!(decode(&out).expect("decode").force_queryable, want);
         }
+    }
+
+    /// `<queries>` come back as the installer wrote them: the package name, the intent's Intent parcel, the provider authority.
+    #[test]
+    fn decodes_queries() {
+        let queries = Queries {
+            packages: vec!["org.a".into()],
+            intents: vec![Intent {
+                action: Some("com.example.BIND".into()),
+                ..Default::default()
+            }],
+            providers: vec!["auth.one".into()],
+        };
+        let mut out = Vec::new();
+        write_frame(&mut out, Kind::Package, &package_bytes()).expect("frame");
+        write_frame(
+            &mut out,
+            Kind::PackageFields,
+            &fields_bytes_with(&[], &[], false, &queries),
+        )
+        .expect("frame");
+        let got = decode(&out).expect("decode").queries;
+        assert_eq!(got.packages, ["org.a"]);
+        assert_eq!(got.providers, ["auth.one"]);
+        assert_eq!(got.intents.len(), 1);
+        assert_eq!(got.intents[0].action.as_deref(), Some("com.example.BIND"));
+    }
+
+    /// A null `<queries>` package list is refused by name (frame 1), not read as no queries.
+    #[test]
+    fn null_queries_list_is_refused() {
+        let none: Option<Vec<Option<String>>> = None;
+        let empty: Option<Vec<Option<String>>> = Some(Vec::new());
+        let mut p = Parcel::new();
+        p.write(&empty).expect("required");
+        p.write(&empty).expect("optional");
+        p.write(&false).expect("forceQueryable");
+        p.write(&none).expect("query packages");
+        p.write(&none).expect("query providers");
+        w_typed_list::<Intent>(&mut p.borrowed(), &Some(Vec::new())).expect("query intents");
+        let mut out = Vec::new();
+        write_frame(&mut out, Kind::Package, &package_bytes()).expect("frame");
+        write_frame(
+            &mut out,
+            Kind::PackageFields,
+            &p.marshal().expect("marshal"),
+        )
+        .expect("frame");
+        assert!(matches!(
+            decode(&out),
+            Err(DecodeError::NullInQueries { frame: 1 })
+        ));
     }
 
     fn output(package: &[u8]) -> Vec<u8> {

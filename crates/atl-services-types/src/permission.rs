@@ -157,6 +157,9 @@ pub fn initial_states<'a>(
 /// Manifest.permission.BROADCAST_STICKY: protectionLevel `normal` (core/res/AndroidManifest.xml:4917-4920) -> install-granted on request (`initial_states`).
 pub const BROADCAST_STICKY: &str = "android.permission.BROADCAST_STICKY";
 
+/// Manifest.permission.QUERY_ALL_PACKAGES: a holder sees every package (AppsFilterUtils.requestsQueryAllPackages, AppsFilterBase.shouldFilterApplicationInternal).
+pub const QUERY_ALL_PACKAGES: &str = "android.permission.QUERY_ALL_PACKAGES";
+
 #[cfg(test)]
 mod tests {
     use super::*;

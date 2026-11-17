@@ -238,17 +238,23 @@ impl Parsed {
         ] {
             vm.frame(|| self.intents(vm, kind, getter, &mut out))?;
         }
-        vm.frame(|| self.libraries(vm, &mut out))?;
+        vm.frame(|| self.package_fields(vm, &mut out))?;
         Ok(out)
     }
 
-    /// The package-fields frame (installer_output documents it): the two `<uses-library>` lists, then isForceQueryable.
-    fn libraries(&self, vm: &Vm, out: &mut Vec<u8>) -> Result<()> {
+    /// The package-fields frame (installer_output documents it): the two `<uses-library>` lists, isForceQueryable, then the `<queries>` packages, providers and intents.
+    fn package_fields(&self, vm: &Vm, out: &mut Vec<u8>) -> Result<()> {
         let android_package = vm.find_class(c"com/android/server/pm/pkg/AndroidPackage")?;
         let parcel_class = vm.find_class(c"android/os/Parcel")?;
         let write = vm.method(
             parcel_class,
             c"writeStringList",
+            c"(Ljava/util/List;)V",
+            false,
+        )?;
+        let write_typed = vm.method(
+            parcel_class,
+            c"writeTypedList",
             c"(Ljava/util/List;)V",
             false,
         )?;
@@ -261,6 +267,38 @@ impl Parsed {
         let force_queryable = vm.method(android_package, c"isForceQueryable", c"()Z", false)?;
         let force_queryable =
             vm.call_bool(self.pkg, force_queryable, "AndroidPackage.isForceQueryable")?;
+        let get = vm.method(
+            android_package,
+            c"getQueriesPackages",
+            c"()Ljava/util/List;",
+            false,
+        )?;
+        let query_packages =
+            vm.call_object(self.pkg, get, &[], "AndroidPackage.getQueriesPackages")?;
+        // getQueriesProviders is a Set: copied to an ArrayList, the List writeStringList takes
+        let get = vm.method(
+            android_package,
+            c"getQueriesProviders",
+            c"()Ljava/util/Set;",
+            false,
+        )?;
+        let providers = vm.call_object(self.pkg, get, &[], "AndroidPackage.getQueriesProviders")?;
+        let array_list = vm.find_class(c"java/util/ArrayList")?;
+        let init = vm.method(array_list, c"<init>", c"(Ljava/util/Collection;)V", false)?;
+        let query_providers = vm.new_object(
+            array_list,
+            init,
+            &[JValue { l: providers }],
+            "new ArrayList(queries providers)",
+        )?;
+        let get = vm.method(
+            android_package,
+            c"getQueriesIntents",
+            c"()Ljava/util/List;",
+            false,
+        )?;
+        let query_intents =
+            vm.call_object(self.pkg, get, &[], "AndroidPackage.getQueriesIntents")?;
         let bytes = marshal(vm, |parcel| {
             for list in &lists {
                 vm.call_void_with(
@@ -277,6 +315,20 @@ impl Parsed {
                     z: force_queryable as u8,
                 }],
                 "Parcel.writeBoolean",
+            )?;
+            for list in [query_packages, query_providers] {
+                vm.call_void_with(
+                    parcel,
+                    write,
+                    &[JValue { l: list }],
+                    "Parcel.writeStringList",
+                )?;
+            }
+            vm.call_void_with(
+                parcel,
+                write_typed,
+                &[JValue { l: query_intents }],
+                "Parcel.writeTypedList",
             )
         })?;
         write_frame(out, Kind::PackageFields, &bytes).context("frame")
