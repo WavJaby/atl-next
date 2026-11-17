@@ -208,6 +208,8 @@ fn main() -> Result<()> {
     let a = Args::parse();
     let display = a.display.unwrap_or_default();
     let control = Arc::new(ControlSocket::from_stdin().context("the process control on stdin")?);
+    // the notification service's display half shares the connection (notifications plan N2)
+    let desktop: Arc<dyn atl_services::notification::DesktopNotifications> = control.clone();
     // the package list: installed now through the host's file work (atl_services::install), before any service answers
     let config = install::Config {
         abis: a.abis.clone(),
@@ -435,6 +437,7 @@ fn main() -> Result<()> {
             Arc::clone(&tasks),
             Arc::clone(&permissions),
             Arc::clone(&packages),
+            desktop,
         ),
     )
     .context("addService notification")?;

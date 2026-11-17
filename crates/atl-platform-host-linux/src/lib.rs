@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Linux, the host side's implementation of atl-platform-host-api: the desktop's monitors through gtk4-rs (GDK), the accelerometers through IIO (iio/: the kernel buffer or sysfs), the fonts through fontconfig (fonts.rs),
-//! the network through the kernel's route tables, resolv.conf and GIO's network monitor (network.rs), the UI language from the locale variables (locale.rs), the time zone from `TZ` and `/etc/localtime` (timezone.rs).
+//! the network through the kernel's route tables, resolv.conf and GIO's network monitor (network.rs), the UI language from the locale variables (locale.rs), the time zone from `TZ` and `/etc/localtime` (timezone.rs), notifications through the session bus's freedesktop notification service (notifications.rs, zbus).
 //! GDK reports logical geometry and the refresh rate in milli-Hz (0: unknown); `Monitor::from_desktop` (atl-platform-types) converts both.
 #![forbid(unsafe_code)]
 
@@ -10,12 +10,14 @@ mod fonts;
 mod iio;
 mod locale;
 mod network;
+mod notifications;
 mod timezone;
 pub use data_dir::user_device;
 pub use fonts::FcFonts;
 pub use iio::IioSensors;
 pub use locale::ui_locale;
 pub use network::HostNetwork;
+pub use notifications::FdoNotifications;
 pub use timezone::time_zone;
 
 use std::marker::PhantomData;

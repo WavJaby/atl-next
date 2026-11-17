@@ -256,18 +256,56 @@ const SERVICE_LINES: [(&str, &str, Option<&str>); 9] = [
         Some("post=1 coarse=0 noted=0 noted-foreign=2 own=ok foreign=SecurityException"),
     ),
 ];
+/// The fixture's package and its desktop id (atl-launch `app_id`: `atl.<package>`): the freedesktop `Notify` arguments name both.
+const FIXTURE_PACKAGE: &str = "com.example.atltest";
+const FIXTURE_APP_ID: &str = "atl.com.example.atltest";
+/// Main.channels' notifications as the fake desktop service must receive them (notifications plan S1 gate), local runs only (a remote run has no private bus):
+/// id 8 posted ("ATL test" / "posted") -> `Notify` with replaces_id 0, answered id 1 (the fake's first); re-posted ("updated") -> `Notify` replacing 1; cancelled -> `CloseNotification(1)`, after which the
+/// fake leaves the bus, so id 9's post sends nothing. Hints per N4's baseline column for channel `atl.test` at IMPORTANCE_LOW (2, kept when raised: SERVICE_LINES): urgency 0, suppress-sound;
+/// `desktop-entry` the app id; not ongoing, so no `resident` and expire_timeout -1 (the server's default). app_name: the package (no label reaches atld yet).
+fn notify_calls() -> Vec<crate::session_bus::Call> {
+    use crate::session_bus::Call;
+    let hints: std::collections::BTreeMap<String, String> = [
+        ("desktop-entry", FIXTURE_APP_ID),
+        ("suppress-sound", "true"),
+        ("urgency", "0"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .collect();
+    let notify = |replaces_id, body: &str| Call::Notify {
+        app_name: FIXTURE_PACKAGE.to_owned(),
+        replaces_id,
+        summary: "ATL test".to_owned(),
+        body: body.to_owned(),
+        hints: hints.clone(),
+        expire_timeout: -1,
+        id: 1,
+    };
+    vec![notify(0, "posted"), notify(1, "updated"), Call::Close(1)]
+}
+/// The services' counts of those posts (local runs): shown, updated in place, withdrawn by the app's cancel, and id 9 found no service (the app saw success).
+const NOTIFY_COUNTS: [&str; 4] = [
+    "INotificationManager.notification.shown",
+    "INotificationManager.notification.updated",
+    "INotificationManager.notification.withdrawn reason=app",
+    "INotificationManager.notification.not_shown reason=no-service",
+];
+/// atld's tier lines of a local run: the fake service at start, none once it left; and the one log line for the package's unshown post.
+const NOTIFY_ATLD_LINES: [&str; 3] = [
+    "notification: tier fdo",
+    "notification: tier none",
+    "notification: not shown: no notification service (com.example.atltest)",
+];
 /// Calls a [`SERVICE_LINES`] row makes that the app cannot see refused (a method a service lacks reads back as no error and zeros), so the services' own `answered` count must show each:
-/// (service, counter key). notification: Main.channels' NotificationManager.cancel of a never-posted id, then notify of id 8 (kept, not shown) and its cancel, which finds the record.
+/// (service, counter key). notification: Main.channels' NotificationManager.cancel of a never-posted id, then notify of id 8 (recorded) and its cancel, which finds the record.
 /// appops: Main.appOps' first noted COARSE_LOCATION (runtime permission -> notes collected) reports its stack trace, AppOpsManager's sConfig starting expired.
 const SERVICE_CALLS: [(&str, &str); 8] = [
     (
         "notification",
         "INotificationManager.cancelNotificationWithTag (nothing posted)",
     ),
-    (
-        "notification",
-        "INotificationManager.notification: posted com.example.atltest id=8 (not shown: no host backend yet)",
-    ),
+    ("notification", "INotificationManager.notification.posted"),
     (
         "notification",
         "INotificationManager.cancelNotificationWithTag (cancelled)",
@@ -1757,6 +1795,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 atld_exited,
                 no_marker: format!("no {MARKER:?} line (atld rc {rc})"),
                 local: None,
+                desktop: None,
             })?;
             println!("remote test app: transcript {}", log.display());
             return Ok(code);
@@ -1774,6 +1813,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         println!("remote test app: transcript {}", log.display());
         return Ok(code);
     }
+    // the notification rows' desktop: a private bus with the fake freedesktop service (session_bus.rs); atld finds it through its environment only
+    let bus = crate::session_bus::PrivateBus::start(&work.join("bus"))?;
+    let fake = crate::session_bus::FakeNotifications::serve(&bus)?;
+    let rt = rt.with_desktop_env(&[("DBUS_SESSION_BUS_ADDRESS".to_owned(), bus.address.clone())]);
     let mut atld_child = rt.start_atld(&run)?;
     let app_log = run.log(&m.name);
     let start = Instant::now();
@@ -1849,6 +1892,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         atld_exited: ended.is_some(),
         no_marker,
         local: Some(outside),
+        desktop: Some(fake.calls()),
     })
 }
 
@@ -1876,6 +1920,8 @@ struct AppJudge<'a> {
     /// A run on this host: the children-outside-broker snapshot (None = atld had ended first). None here = a remote UI run, whose checks that read this host
     /// (its /proc, its nice limit, its network) or need the gate's own stop (exit totals) are skipped and named ([`REMOTE_UI_SKIPPED`]).
     local: Option<Option<Vec<String>>>,
+    /// What the fake notification service on the run's private bus received ([`NOTIFY_CALLS`]); None = a remote run (no private bus there: atld's tier is none).
+    desktop: Option<Vec<crate::session_bus::Call>>,
 }
 
 /// The checks a remote UI run (app.rs `remote` with a target display) does not claim, each with why (printed as `app: SKIP`); every other row of the local gate is judged from the logs that came back.
@@ -1911,6 +1957,7 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
         atld_exited,
         ref no_marker,
         ref local,
+        ref desktop,
     } = *j;
     let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
     let app = read(&run.log(app_name));
@@ -2020,6 +2067,28 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
                 .any(|c| c.outcome == "answered" && c.api == key && c.count > 0)
             {
                 whys.push(format!("{service}: the services did not answer {key}"));
+            }
+        }
+        if let Some(calls) = desktop {
+            let want = notify_calls();
+            if *calls != want {
+                whys.push(format!(
+                    "notification desktop: want {want:?}, got {calls:?}"
+                ));
+            }
+            for key in NOTIFY_COUNTS {
+                if !served
+                    .iter()
+                    .any(|c| c.outcome == "answered" && c.api == key && c.count > 0)
+                {
+                    whys.push(format!("notification: the services did not count {key}"));
+                }
+            }
+            let atld_log = read(&run.atld_log());
+            for line in NOTIFY_ATLD_LINES {
+                if !atld_log.contains(line) {
+                    whys.push(format!("notification: atld logged no {line:?}"));
+                }
             }
         }
     }

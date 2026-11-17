@@ -61,6 +61,7 @@ mod sandbox;
 mod screencopy;
 mod sensors;
 mod services;
+mod session_bus;
 mod signing;
 mod sles_bridge;
 mod system_scan;

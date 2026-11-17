@@ -65,7 +65,8 @@ deny = [
     { crate = "javascriptcore6-sys", reason = "platform layer only", wrappers = ["javascriptcore6", "webkit6-sys"] },
     { crate = "soup3", reason = "platform layer only", wrappers = ["webkit6"] },
     { crate = "soup3-sys", reason = "platform layer only", wrappers = ["soup3", "webkit6-sys"] },
-    { crate = "zbus", reason = "platform layer only" },
+    # xtask-harness: the notification gate's fake desktop server on a private bus (test code, never shipped; notifications plan Gates)
+    { crate = "zbus", reason = "platform layer only", wrappers = ["atl-platform-host-linux", "xtask-harness"] },
     { crate = "ashpd", reason = "platform layer only" },
     { crate = "windows", reason = "platform layer only" },
 ]

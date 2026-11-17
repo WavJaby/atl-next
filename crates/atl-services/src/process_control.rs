@@ -75,6 +75,37 @@ impl ControlSocket {
     }
 }
 
+/// The control socket's display half: the notification service's requests, shown by atld (notifications plan N2).
+#[cfg(feature = "converter")]
+impl crate::notification::DesktopNotifications for ControlSocket {
+    fn notify(
+        &self,
+        package: &str,
+        key: &str,
+        content: control::NotificationContent,
+    ) -> io::Result<control::NotifyOutcome> {
+        match self.call(&Request::Notify {
+            package: package.to_owned(),
+            key: key.to_owned(),
+            content,
+        })? {
+            Response::Notified { outcome } => Ok(outcome),
+            Response::Error { message } => Err(io::Error::other(message)),
+            other => Err(io::Error::other(format!("notify answered {other:?}"))),
+        }
+    }
+
+    fn withdraw(&self, key: &str) -> io::Result<bool> {
+        match self.call(&Request::Withdraw {
+            key: key.to_owned(),
+        })? {
+            Response::Withdrawn { shown } => Ok(shown),
+            Response::Error { message } => Err(io::Error::other(message)),
+            other => Err(io::Error::other(format!("withdraw answered {other:?}"))),
+        }
+    }
+}
+
 /// The control socket to atld. One request is in flight at a time: the protocol is request then reply on one connection.
 pub struct ControlSocket {
     fd: Mutex<OwnedFd>,

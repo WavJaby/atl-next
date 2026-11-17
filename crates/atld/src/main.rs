@@ -43,6 +43,9 @@ use atl_broker::{
 };
 use atl_gralloc::node::{self, NodeSource};
 use atl_gralloc::vintf;
+use atl_platform_host::{
+    DesktopNotification, Notifications, PlatformNotifications, Posted, Urgency,
+};
 use atl_property_service::{LinearTier, Property};
 use atl_services_types::compositor_registry;
 use atl_services_types::display_model::DisplayModel;
@@ -1082,6 +1085,10 @@ struct Host {
     log_limits: applog::Limits,
     /// The app processes' log copiers: joined at the run's end, before the summary reads the logs.
     app_logs: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// The desktop's notification service: the services' `Notify` / `Withdraw` requests land here (notifications plan N2: the sandboxed services have no session bus).
+    notifications: PlatformNotifications,
+    /// Packages whose post found no notification service, logged once each.
+    unshown: Mutex<BTreeSet<String>>,
 }
 
 /// `package`'s credential-encrypted data dir of user 0 as the app sees it (ApplicationInfo.dataDir, `/data/user/0/<package>`): writable in its sandbox ([`Host::package_mounts`]).
@@ -1626,6 +1633,54 @@ fn serve_run_control(host: Arc<Host>, listener: UnixListener) {
     }
 }
 
+impl Host {
+    /// Shows `package`'s notification `key` through the desktop's service. A tier change is logged as it is seen; a post with no service is logged once per package (the services count each).
+    fn notify(
+        &self,
+        package: &str,
+        key: &str,
+        content: control::NotificationContent,
+    ) -> Result<control::NotifyOutcome> {
+        let before = self.notifications.tier();
+        let n = DesktopNotification {
+            // no package label reaches atld yet: the package names the source (notifications plan N3 wants the label)
+            app_name: package.to_owned(),
+            app_id: atl_launch::app_id(package)?,
+            summary: content.summary,
+            body: content.body,
+            urgency: match content.urgency {
+                control::NotificationUrgency::Low => Urgency::Low,
+                control::NotificationUrgency::Normal => Urgency::Normal,
+            },
+            resident: content.resident,
+            silent: content.silent,
+        };
+        let posted = self.notifications.post(key, &n)?;
+        let after = self.notifications.tier();
+        if after != before {
+            log(format_args!("notification: tier {}", after.label()));
+        }
+        Ok(match posted {
+            Posted::Shown => control::NotifyOutcome::Shown,
+            Posted::Updated => control::NotifyOutcome::Updated,
+            Posted::NoService => {
+                let mut unshown = self.unshown.lock().unwrap_or_else(|e| e.into_inner());
+                if unshown.insert(package.to_owned()) {
+                    log(format_args!(
+                        "notification: not shown: no notification service ({package})"
+                    ));
+                }
+                control::NotifyOutcome::NoService
+            }
+        })
+    }
+
+    /// Withdraws notification `key`; whether one of it was shown.
+    fn withdraw(&self, key: &str) -> Result<bool> {
+        Ok(self.notifications.withdraw(key)?)
+    }
+}
+
 /// The control connection's server: answers the services' requests until they end it.
 fn serve_control(host: Arc<Host>, fd: std::os::fd::OwnedFd) {
     let result = control::serve(&fd, |request| {
@@ -1650,6 +1705,16 @@ fn serve_control(host: Arc<Host>, fd: std::os::fd::OwnedFd) {
             Request::ScanCommit { dir, package, uid } => host
                 .scan_commit(&dir, &package, uid)
                 .map(|()| Response::Committed),
+            Request::Notify {
+                package,
+                key,
+                content,
+            } => host
+                .notify(&package, &key, content)
+                .map(|outcome| Response::Notified { outcome }),
+            Request::Withdraw { key } => host
+                .withdraw(&key)
+                .map(|shown| Response::Withdrawn { shown }),
         };
         outcome.unwrap_or_else(|e| {
             log(format_args!("control request failed: {e:#}"));
@@ -2193,6 +2258,12 @@ fn run(a: &Args) -> Result<ExitCode> {
             max_bytes: (a.log_max_bytes > 0).then_some(a.log_max_bytes),
         },
         app_logs: Mutex::new(Vec::new()),
+        notifications: {
+            let n = PlatformNotifications::connect();
+            log(format_args!("notification: tier {}", n.tier().label()));
+            n
+        },
+        unshown: Mutex::new(BTreeSet::new()),
         installd: Installd {
             sessions,
             installer: a.installer.clone(),

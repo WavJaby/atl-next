@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# The Linux implementation of atl-platform-host-api on GDK (gtk4-rs): with atl-platform-ui-linux, the only crates deny.toml lets depend on GTK. It initialises GTK and reads the monitors; no main loop runs. GDK keeps the display open for the process (GTK has no teardown). The desktop's fonts through the safe `fontconfig` crate.
+# The Linux implementation of atl-platform-host-api on GDK (gtk4-rs): with atl-platform-ui-linux, the only crates deny.toml lets depend on GTK. It initialises GTK and reads the monitors; no main loop runs. GDK keeps the display open for the process (GTK has no teardown). The desktop's fonts through the safe `fontconfig` crate. The session bus through `zbus` (notifications).
 # No `unsafe` of its own: the safe gtk4-rs bindings only.
 
 [dependencies]
@@ -16,6 +16,7 @@ fontconfig.workspace = true
 gtk4.workspace = true
 rustix.workspace = true
 tracing.workspace = true
+zbus.workspace = true
 
 [lints]
 workspace = true

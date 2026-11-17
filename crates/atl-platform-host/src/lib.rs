@@ -8,6 +8,8 @@ pub use atl_platform_host_api::*;
 #[cfg(target_os = "linux")]
 pub use atl_platform_host_linux::FcFonts as PlatformFonts;
 #[cfg(target_os = "linux")]
+pub use atl_platform_host_linux::FdoNotifications as PlatformNotifications;
+#[cfg(target_os = "linux")]
 pub use atl_platform_host_linux::GdkDesktop as PlatformDesktop;
 #[cfg(target_os = "linux")]
 pub use atl_platform_host_linux::HostNetwork as PlatformNetwork;
@@ -41,6 +43,8 @@ fn implements_the_api() {
     fonts::<PlatformFonts>();
     fn network<T: NetworkSource + Default>() {}
     network::<PlatformNetwork>();
+    fn notifications<T: Notifications>() {}
+    notifications::<PlatformNotifications>();
 }
 
 /// The first monitor, from a connection let go at once; `None` where the desktop lists none. `Err`: no desktop answers.

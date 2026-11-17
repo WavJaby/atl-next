@@ -575,7 +575,7 @@ public class Main extends Activity {
 
     /**
      * "importance=<int> name=<name> visibility=<int> count=<n> absent=<channel> raised=<int>": a channel created at IMPORTANCE_LOW and read back, the channel count, an unknown id, and the importance
-     * after re-creating it at IMPORTANCE_HIGH (Unity's registerNotificationChannel path), then " notify=ok" when a notification on that channel posts and cancels, else the exception's class;
+     * after re-creating it at IMPORTANCE_HIGH (Unity's registerNotificationChannel path), then " notify=ok" when notifications on that channel post, update and cancel, else the exception's class;
      * "absent" when getSystemService returns null; else what it threw.
      */
     private String channels() {
@@ -597,7 +597,8 @@ public class Main extends Activity {
             android.app.NotificationChannel again = nm.getNotificationChannel("atl.test");
             // nothing was posted, so AOSP's cancel finds no record and returns; the services' count shows it was served (app.rs SERVICE_CALLS)
             nm.cancel("atl.tag", 7);
-            // a posted notification (GMS's availability notification in Doodle Jump): accepted without an exception, then cancelled (app.rs SERVICE_CALLS)
+            // a posted notification (GMS's availability notification in Doodle Jump): shown, updated in place, then cancelled; then one more after the desktop's service went away, which the app
+            // sees succeed as any post (app.rs NOTIFY_CALLS: the gate's fake service leaves the bus when it closes id 8's notification)
             String posted;
             try {
                 nm.notify("atl.tag", 8, new android.app.Notification.Builder(this, "atl.test")
@@ -605,7 +606,18 @@ public class Main extends Activity {
                         .setContentTitle("ATL test")
                         .setContentText("posted")
                         .build());
+                nm.notify("atl.tag", 8, new android.app.Notification.Builder(this, "atl.test")
+                        .setSmallIcon(android.R.drawable.ic_dialog_info)
+                        .setContentTitle("ATL test")
+                        .setContentText("updated")
+                        .build());
                 nm.cancel("atl.tag", 8);
+                nm.notify("atl.tag", 9, new android.app.Notification.Builder(this, "atl.test")
+                        .setSmallIcon(android.R.drawable.ic_dialog_info)
+                        .setContentTitle("ATL test")
+                        .setContentText("no service")
+                        .build());
+                nm.cancel("atl.tag", 9);
                 posted = "ok";
             } catch (Throwable t) {
                 posted = t.getClass().getSimpleName();

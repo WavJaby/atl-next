@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The process-control protocol (owner D1, 2026-11-03): the system services start and kill app processes through the host (atld, which owns the broker) over one SEQPACKET connection, one JSON message per packet, strictly request then reply.
 //! `Start` is where ProcessList.startProcessLocked ends (Process.start's arguments reduced to what the broker's sandbox needs); `Kill` is Process.killProcess of a process it started. The server refuses to kill pids it did not start.
+//! `Notify` / `Withdraw` carry the notification service's display requests: the services have no session bus, so atld shows them on the desktop.
 //! Only the services hold the client end (the broker passes it as their stdin, [`crate::Spawn::stdin`]): an app has no way to ask for a start or a kill.
 
 use std::io;
@@ -73,6 +74,49 @@ pub enum Request {
         package: String,
         uid: u32,
     },
+    /// Show `package`'s notification `key` (the StatusBarNotification key) on the desktop, replacing the key's earlier one (notifications plan N2: the sandboxed services have no session bus,
+    /// atld posts on the app's behalf). Answered [`Response::Notified`].
+    Notify {
+        package: String,
+        key: String,
+        content: NotificationContent,
+    },
+    /// Remove notification `key` from the desktop. Answered [`Response::Withdrawn`].
+    Withdraw {
+        key: String,
+    },
+}
+
+/// A notification's desktop form, mapped from Android's by the services (notifications plan N4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationContent {
+    pub summary: String,
+    pub body: String,
+    pub urgency: NotificationUrgency,
+    /// stays until withdrawn (ongoing / no-clear)
+    pub resident: bool,
+    /// no sound for this post
+    pub silent: bool,
+}
+
+/// The urgencies Android's importances map to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationUrgency {
+    Low,
+    Normal,
+}
+
+/// What became of a [`Request::Notify`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyOutcome {
+    /// a new notification is on the desktop
+    Shown,
+    /// the key's earlier one was replaced
+    Updated,
+    /// no notification service: nothing was shown
+    NoService,
 }
 
 /// One staged file's rename at commit: `staged` (its session name) -> `name` (`base.apk` or `split_<split name>.apk`).
@@ -101,6 +145,14 @@ pub enum Response {
     },
     /// The package is in place.
     Committed,
+    /// The notification's fate.
+    Notified {
+        outcome: NotifyOutcome,
+    },
+    /// The notification is gone; `shown`: one of it was on the desktop.
+    Withdrawn {
+        shown: bool,
+    },
     Error {
         message: String,
     },

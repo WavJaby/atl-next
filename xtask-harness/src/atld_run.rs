@@ -1798,6 +1798,11 @@ impl Runtime {
         for var in &self.app_env {
             cmd.arg("--app-env").arg(var);
         }
+        // never the user's session bus: a gate's own private bus (with_desktop_env, after this), else an address with no socket (atld's notification tier none)
+        cmd.env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            crate::session_bus::no_bus(&run.scratch),
+        );
         cmd.envs(self.desktop_env.iter().map(|(k, v)| (k, v)));
         if !self.audio_service {
             cmd.arg("--no-audio-service");

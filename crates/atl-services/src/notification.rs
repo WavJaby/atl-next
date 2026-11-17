@@ -5,9 +5,11 @@
 //! The app draws the toast: text toasts take the pre-R TN path (activity.rs DISABLED_COMPAT_CHANGES), so ITransientNotification.show(windowToken) makes the app's ToastPresenter add a
 //! TYPE_TOAST window with that token; the token is bound to the caller's newest Task here (WindowManagerInternal.addWindowToken), which is where window.rs places the window.
 //! Channels: apps create and read back their own (notification_channels.rs), as a device answers (behaviour decision 1); nothing is displayed for them.
-//! Posting: enqueueNotificationWithTag keeps a record per (pkg, tag, id, user) and cancelNotificationWithTag removes it, both checking the caller as AOSP does; nothing is shown (no host notification
-//! backend yet: the log line `notification: posted <pkg> id=<n> (not shown: no host backend yet)` counts each).
-//! Not modelled: rate limiting, per-user visibility, suspended/blocked packages, POST_NOTIFICATIONS, accessibility timeouts, enqueueTextToast (no system UI: answered false), channel groups,
+//! Posting: enqueueNotificationWithTag keeps a record per (pkg, tag, id, user) and cancelNotificationWithTag removes it, both checking the caller as AOSP does. Each post goes to the desktop through
+//! [`DesktopNotifications`] (atld over the control socket, notifications plan N2) in its desktop form (notification_display.rs); a cancel withdraws it. The app observes AOSP's answers whatever
+//! the desktop does: no notification service, or a failed call, is counted (`notification.not_shown reason=...`), never thrown.
+//! Counters (atl_diag answered): `notification.posted`, `.shown`, `.updated`, `.withdrawn reason=app`, `.not_shown reason=<no-service|blocked|error>`, `.dropped_field <name>`.
+//! Not modelled: rate limiting, per-user visibility, suspended packages, POST_NOTIFICATIONS, accessibility timeouts, enqueueTextToast (no system UI: answered false), channel groups,
 //! getAppActiveNotifications (StatusBarNotification has no codec) (counted UNKNOWN).
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,9 +25,11 @@ use atl_parcelables::android::content::pm::ParceledListSlice;
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, Strong, ThreadState};
 
 use crate::notification_channels::{ChannelError, Channels};
+use crate::notification_display;
 use crate::packages::Packages;
 use crate::packages::Permissions;
 use crate::tasks::Tasks;
+use atl_broker::control::{NotificationContent, NotifyOutcome};
 use atl_services_types::permission;
 
 /// The interface name counters use.
@@ -62,18 +66,47 @@ struct State {
     posted: Vec<Posted>,
 }
 
-/// A posted notification's key. The Notification itself is not kept until a reader exists (getAppActiveNotifications, a host backend).
+/// A posted notification's key. The Notification itself is not kept until a reader exists (getAppActiveNotifications).
 struct Posted {
     pkg: String,
     tag: Option<String>,
     id: i32,
     user: u32,
+    uid: u32,
+}
+
+impl Posted {
+    /// StatusBarNotification.key (groupKey's sibling, StatusBarNotification.java key()): `user|pkg|id|tag|uid`; the desktop's key for this notification.
+    fn key(&self) -> String {
+        format!(
+            "{}|{}|{}|{}|{}",
+            self.user,
+            self.pkg,
+            self.id,
+            self.tag.as_deref().unwrap_or("null"),
+            self.uid
+        )
+    }
+}
+
+/// Where posted notifications are shown: the desktop, through atld (the control socket, notifications plan N2). Shaped by that one implementation.
+pub trait DesktopNotifications: Send + Sync {
+    /// Shows `package`'s notification `key` in `content`'s form, replacing the key's earlier one.
+    fn notify(
+        &self,
+        package: &str,
+        key: &str,
+        content: NotificationContent,
+    ) -> std::io::Result<NotifyOutcome>;
+    /// Removes notification `key`; whether one of it was shown.
+    fn withdraw(&self, key: &str) -> std::io::Result<bool>;
 }
 
 struct Inner {
     tasks: Arc<Tasks<SpIBinder>>,
     permissions: Arc<Permissions>,
     packages: Arc<Packages>,
+    desktop: Arc<dyn DesktopNotifications>,
     state: Mutex<State>,
     next_id: AtomicU64,
 }
@@ -389,8 +422,7 @@ impl INotificationManager for NotificationManager {
     }
 
     /// cancelNotificationWithTag (:4219 -> cancelNotificationInternal:8282): handleIncomingUser (another user needs INTERACT_ACROSS_USERS), resolveNotificationUid (pkg and opPkg must be the
-    /// caller's: no delegates exist, else SecurityException), then cancel the (pkg, tag, id, user) record. Nothing is ever posted here, so no record matches and the cancel is a no-op, as AOSP's
-    /// cancelNotification is for an id never posted.
+    /// caller's: no delegates exist, else SecurityException), then cancel the (pkg, tag, id, user) record and withdraw it from the desktop. An id never posted is a no-op, as AOSP's cancelNotification is.
     fn r#cancelNotificationWithTag(
         &self,
         pkg: Option<&str>,
@@ -404,24 +436,31 @@ impl INotificationManager for NotificationManager {
             .0
             .resolve_caller("cancelNotificationWithTag", pkg, op_pkg, user_id)?;
         let mut st = self.0.lock();
-        let before = st.posted.len();
-        st.posted
-            .retain(|p| !(p.pkg == pkg && p.tag.as_deref() == tag && p.id == id && p.user == user));
-        let removed = before - st.posted.len();
+        let removed = st
+            .posted
+            .iter()
+            .position(|p| p.pkg == pkg && p.tag.as_deref() == tag && p.id == id && p.user == user)
+            .map(|i| st.posted.remove(i));
         drop(st);
-        atl_diag::answered(
-            INTERFACE,
-            if removed > 0 {
-                "cancelNotificationWithTag (cancelled)"
-            } else {
-                "cancelNotificationWithTag (nothing posted)"
-            },
-        );
+        let Some(removed) = removed else {
+            atl_diag::answered(INTERFACE, "cancelNotificationWithTag (nothing posted)");
+            return Ok(());
+        };
+        atl_diag::answered(INTERFACE, "cancelNotificationWithTag (cancelled)");
+        match self.0.desktop.withdraw(&removed.key()) {
+            Ok(true) => {
+                atl_diag::answered(INTERFACE, "notification.withdrawn reason=app");
+            }
+            Ok(false) => {}
+            Err(e) => {
+                atl_diag::answered(INTERFACE, &format!("notification.withdraw failed: {e}"));
+            }
+        }
         Ok(())
     }
 
     /// enqueueNotificationWithTag (:4141 -> enqueueNotificationInternal): null pkg or notification is IllegalArgumentException; the caller checks of cancelNotificationWithTag; a channel the app
-    /// never created drops the notification with a log (AOSP "No Channel found", no exception); else the (pkg, tag, id, user) record is replaced or added. Nothing is displayed: no host backend yet.
+    /// never created drops the notification with a log (AOSP "No Channel found", no exception); else the (pkg, tag, id, user) record is replaced or added and shown on the desktop (a blocked channel's is not).
     fn r#enqueueNotificationWithTag(
         &self,
         pkg: Option<&str>,
@@ -441,31 +480,52 @@ impl INotificationManager for NotificationManager {
             self.0
                 .resolve_caller("enqueueNotificationWithTag", pkg, op_pkg, user_id)?;
         let mut st = self.0.lock();
-        let channel = notification.channel_id.as_deref();
-        if st.channels.get(uid, pkg, channel).is_none() {
+        let channel_id = notification.channel_id.as_deref();
+        let Some(channel) = st.channels.get(uid, pkg, channel_id) else {
             drop(st);
             atl_diag::answered(
                 INTERFACE,
                 &format!(
                     "notification: No Channel found for pkg={pkg}, channelId={}: dropped",
-                    channel.unwrap_or("null")
+                    channel_id.unwrap_or("null")
                 ),
             );
             return Ok(());
-        }
+        };
+        let before = st.posted.len();
         st.posted
             .retain(|p| !(p.pkg == pkg && p.tag.as_deref() == tag && p.id == id && p.user == user));
-        st.posted.push(Posted {
+        let update = st.posted.len() != before;
+        let posted = Posted {
             pkg: pkg.to_owned(),
             tag: tag.map(str::to_owned),
             id,
             user,
-        });
+            uid,
+        };
+        let key = posted.key();
+        st.posted.push(posted);
         drop(st);
-        atl_diag::answered(
-            INTERFACE,
-            &format!("notification: posted {pkg} id={id} (not shown: no host backend yet)"),
-        );
+        atl_diag::answered(INTERFACE, "notification.posted");
+        // checkDisqualifyingFeatures (:9144): a blocked channel's post is recorded by the app's call and never shown
+        if channel.importance == notification_display::IMPORTANCE_NONE {
+            atl_diag::answered(INTERFACE, "notification.not_shown reason=blocked");
+            return Ok(());
+        }
+        let (content, left_out) = notification_display::content(notification, &channel, update);
+        for name in left_out {
+            atl_diag::answered(INTERFACE, &format!("notification.dropped_field {name}"));
+        }
+        let outcome = match self.0.desktop.notify(pkg, &key, content) {
+            Ok(NotifyOutcome::Shown) => "notification.shown",
+            Ok(NotifyOutcome::Updated) => "notification.updated",
+            Ok(NotifyOutcome::NoService) => "notification.not_shown reason=no-service",
+            Err(e) => {
+                atl_diag::answered(INTERFACE, &format!("notification.notify failed: {e}"));
+                "notification.not_shown reason=error"
+            }
+        };
+        atl_diag::answered(INTERFACE, outcome);
         Ok(())
     }
 
@@ -521,17 +581,19 @@ impl INotificationManager for NotificationManager {
     }
 }
 
-/// The service's binder, for `addService`; toast windows are bound into `tasks`.
+/// The service's binder, for `addService`; toast windows are bound into `tasks`, posted notifications shown on `desktop`.
 pub fn new_binder(
     tasks: Arc<Tasks<SpIBinder>>,
     permissions: Arc<Permissions>,
     packages: Arc<Packages>,
+    desktop: Arc<dyn DesktopNotifications>,
 ) -> SpIBinder {
     BnNotificationManager::new_binder(
         NotificationManager(Arc::new(Inner {
             tasks,
             permissions,
             packages,
+            desktop,
             state: Mutex::new(State::default()),
             next_id: AtomicU64::new(0),
         })),

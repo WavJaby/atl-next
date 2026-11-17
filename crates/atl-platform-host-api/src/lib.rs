@@ -4,6 +4,7 @@
 //! The machine's motion sensors ([`Sensors`]): shaped by the one implementation, Linux IIO. A stream per open, served by the kernel buffer where the environment enabled it and by sysfs reads otherwise ([`Tier`]); the caller paces its reads.
 //! The desktop's fonts ([`FontSource`]): which faces, in what order, for which language; read when atld starts.
 //! The host's network ([`NetworkSource`]): the link its default route leaves through, its resolver, and the system's own verdict on reaching the Internet; read when the services start.
+//! The desktop's notification service ([`Notifications`]): shows, replaces and withdraws notifications atld posts on the apps' behalf; tiers probed per session ([`NotificationTier`]).
 //! No OS or toolkit dependency, no unsafe; core crates use the `atl-platform-host` facade, not this crate or the implementation directly.
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -234,6 +235,90 @@ pub trait SampleStream: Send {
 
     /// The newest sample not returned before. Returns as soon as one is ready, or `Ok(None)` after `timeout` with none; the polled tier returns after one read (its span is its interval). The caller paces one call per period and repeats its last sample on `None`.
     fn next(&mut self, timeout: std::time::Duration) -> Result<Option<Sample>, SensorError>;
+}
+
+/// One notification as the desktop shows it, already mapped from Android's (the system services own that mapping, notifications plan N4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopNotification {
+    /// The source the desktop names (the app's label, else its package).
+    pub app_name: String,
+    /// The app's desktop file id without `.desktop` (`atl.<package>`): the desktop's per-app identity.
+    pub app_id: String,
+    /// The headline.
+    pub summary: String,
+    /// The text below it, plain (no markup).
+    pub body: String,
+    /// How insistently the desktop presents it.
+    pub urgency: Urgency,
+    /// It stays until withdrawn (Android ongoing / no-clear): the desktop never expires it.
+    pub resident: bool,
+    /// No sound for this post.
+    pub silent: bool,
+}
+
+/// The desktop's urgency levels Android's importances map to (freedesktop Desktop Notifications 1.3 hint `urgency`; critical comes with full-screen intents, notifications plan S4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Urgency {
+    /// Shade-only content.
+    Low,
+    /// The ordinary banner.
+    Normal,
+}
+
+/// Which desktop service shows notifications: the capability tier the implementation probed, named by the tier log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationTier {
+    /// The freedesktop notification service (`org.freedesktop.Notifications`): the baseline every desktop with a notification daemon has.
+    Fdo,
+    /// No service: nothing is shown, every post is counted.
+    None,
+}
+
+impl NotificationTier {
+    /// The tier's name in log lines and counters.
+    pub fn label(self) -> &'static str {
+        match self {
+            NotificationTier::Fdo => "fdo",
+            NotificationTier::None => "none",
+        }
+    }
+}
+
+/// What became of one post.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Posted {
+    /// A new notification is on the desktop.
+    Shown,
+    /// The key's earlier notification was replaced in place.
+    Updated,
+    /// No desktop service shows notifications now: nothing was sent.
+    NoService,
+}
+
+/// The desktop's notification service failed a call it answered.
+#[derive(Debug, thiserror::Error)]
+#[error("notification service: {0}")]
+pub struct NotificationError(
+    /// The service's reason.
+    pub String,
+);
+
+/// The desktop's notification service. Shaped by its one implementation, the freedesktop service over the session bus: the implementation keeps each key's desktop id, so an update replaces in place.
+/// A key is the caller's stable name for one notification (Android's StatusBarNotification key); keys of all apps share one space.
+pub trait Notifications: Send + Sync {
+    /// Connects to the user's session and probes which tier serves; never fails: no session or no service is tier [`NotificationTier::None`].
+    fn connect() -> Self
+    where
+        Self: Sized;
+
+    /// The tier the last probe or call found.
+    fn tier(&self) -> NotificationTier;
+
+    /// Shows `n` under `key`, replacing the key's earlier one.
+    fn post(&self, key: &str, n: &DesktopNotification) -> Result<Posted, NotificationError>;
+
+    /// Removes `key`'s notification; false when none of it is shown.
+    fn withdraw(&self, key: &str) -> Result<bool, NotificationError>;
 }
 
 /// The UI language of a native program: glibc's `LC_MESSAGES` (POSIX XBD 8.2), the first non-empty of `LC_ALL`, `LC_MESSAGES`, `LANG`, as one BCP-47 tag.

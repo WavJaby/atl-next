@@ -137,10 +137,15 @@ pub struct DesktopApp<'a> {
     pub gpu: Gpu,
 }
 
-/// Desktop file ID: `atl.<package>.desktop` (spec "Desktop File ID": reverse-DNS, no clash with a native app's own ID).
-pub fn desktop_file_name(package: &str) -> Result<String, DesktopError> {
+/// The app's desktop identity `atl.<package>`: the desktop file ID without `.desktop` (spec "Desktop File ID": reverse-DNS, no clash with a native app's own ID), also its notification `desktop-entry`.
+pub fn app_id(package: &str) -> Result<String, DesktopError> {
     check_package(package)?;
-    Ok(format!("atl.{package}.desktop"))
+    Ok(format!("atl.{package}"))
+}
+
+/// Desktop file ID: [`app_id`] + `.desktop`.
+pub fn desktop_file_name(package: &str) -> Result<String, DesktopError> {
+    Ok(format!("{}.desktop", app_id(package)?))
 }
 
 fn check_package(package: &str) -> Result<(), DesktopError> {

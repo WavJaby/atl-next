@@ -132,6 +132,16 @@ min_reason = "observed 2026-11-06; older is untested"
 scope = ["test"]
 used_by = ["xtask:fetch", "xtask:run-apk"]
 
+# the app gate's private session bus (session_bus.rs): the fake freedesktop notification service runs on it, so no gate reaches the user's own bus
+[dbus-daemon]
+debian = "dbus-daemon"
+arch = "dbus"
+binary = "dbus-daemon"
+min = "1.16.2"
+min_reason = "observed 2026-11-17; older is untested"
+scope = ["test"]
+used_by = ["xtask:test"]
+
 # the Java pipeline's d8: a bash script that runs r8.jar with `java` on PATH, so it runs with the `jdk` row's JDK first on PATH (atld_run.rs)
 [d8]
 aosp = "prebuilts/r8"
