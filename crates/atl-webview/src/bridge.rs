@@ -139,9 +139,35 @@ pub fn data_url(data: &str, mime: Option<&str>, encoding: Option<&str>) -> Strin
     format!("data:{mime}{b64},{data}")
 }
 
+/// The part of `url` safe to log: `scheme://host[:port]` for a hierarchical URL, `scheme:` otherwise (data:, about:, javascript:). Path, query, fragment and userinfo are left out: they can carry user identifiers.
+pub fn log_origin(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once(':') else {
+        return "<no scheme>".to_owned();
+    };
+    let Some(after) = rest.strip_prefix("//") else {
+        return format!("{scheme}:");
+    };
+    let authority = after.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    format!("{scheme}://{host}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spec: RFC 3986 section 3 (scheme ":" ["//" [userinfo "@"] host [":" port]] path ["?" query] ["#" fragment]).
+    #[test]
+    fn log_origin_keeps_scheme_and_host_only() {
+        assert_eq!(
+            log_origin("https://u:p@survey.example.com:8443/s/123?uid=42#x"),
+            "https://survey.example.com:8443"
+        );
+        assert_eq!(log_origin("https://a.example?uid=1"), "https://a.example");
+        assert_eq!(log_origin("data:text/html,<p>"), "data:");
+        assert_eq!(log_origin("about:blank"), "about:");
+        assert_eq!(log_origin("nothing"), "<no scheme>");
+    }
 
     #[test]
     fn parse_reads_the_injected_call() {

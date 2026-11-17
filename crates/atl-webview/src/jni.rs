@@ -612,6 +612,11 @@ fn on_event(shared: &Shared, ev: WebEvent) {
     if let WebEvent::UnhandledKey(t) = ev {
         return on_unhandled_key(env, shared, t);
     }
+    match &ev {
+        WebEvent::LoadStarted(url) => tracing::info!("webview: page started {}", bridge::log_origin(url)),
+        WebEvent::LoadFinished(url) => tracing::info!("webview: page finished {}", bridge::log_origin(url)),
+        _ => {}
+    }
     let provider = jni_call!(env, NewLocalRef, shared.provider.get() as Obj);
     if provider.is_null() {
         return; // the app's WebView was collected
@@ -1264,7 +1269,10 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_loadUrl, 
         return throw_uoe(env, "WebViewProvider.loadUrl(additionalHttpHeaders)");
     }
     match string(env, url) {
-        Some(u) => n.view.load_uri(&u),
+        Some(u) => {
+            tracing::info!("webview: loadUrl {}", bridge::log_origin(&u));
+            n.view.load_uri(&u)
+        }
         None => tracing::warn!("webview: loadUrl(null) ignored"),
     }
 });
@@ -1279,6 +1287,7 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_loadDataW
     let mime = string(env, mime);
     let encoding = string(env, encoding);
     let base = string(env, base).filter(|b| !b.is_empty());
+    tracing::info!("webview: loadDataWithBaseURL base {}", base.as_deref().map_or("<none>".to_owned(), bridge::log_origin));
     if !history.is_null() {
         crate::refuse("WebViewProvider.loadDataWithBaseURL(historyUrl)");
     }

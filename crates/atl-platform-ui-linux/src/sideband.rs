@@ -30,6 +30,18 @@ pub struct Held<E> {
     pub release: bool,
 }
 
+impl<E> Held<E> {
+    /// The counter class of this event: `key`, `press`, `release` or `motion`.
+    pub fn class(&self) -> &'static str {
+        match (self.key, self.press, self.release) {
+            (true, ..) => "key",
+            (_, true, _) => "press",
+            (_, _, true) => "release",
+            _ => "motion",
+        }
+    }
+}
+
 /// The hold and claim rules over events of type `E` (pure: unit-tested; [`Entry`] runs it on GdkEvents).
 #[derive(Debug)]
 pub struct Gate<E> {
@@ -53,34 +65,45 @@ impl<E> Default for Gate<E> {
 /// What a claim did: the events to put back, in order, and whether the page was left mid-press (Android cancelled a gesture whose press reached the page: no cancel can be sent, webview plan S2.2).
 pub struct Claimed<E> {
     pub replay: Vec<E>,
+    /// [`Held::class`] of each `replay` event, in order.
+    pub classes: Vec<&'static str>,
     pub left_pressed: bool,
+    /// Classes of the held events the claim dropped unclaimed (before a Down, or a cancelled gesture's).
+    pub dropped: Vec<&'static str>,
 }
 
 impl<E> Gate<E> {
     /// Holds `h`. A pointer event of a cancelled gesture is dropped (its release ends the cancel). A press while an unclaimed press or release is still held: that gesture went elsewhere,
     /// its pointer events are dropped.
-    pub fn hold(&mut self, h: Held<E>) {
+    /// Returns the classes ([`Held::class`]) of the events dropped unclaimed, `h` itself included when it is dropped.
+    pub fn hold(&mut self, h: Held<E>) -> Vec<&'static str> {
+        let mut dropped = Vec::new();
         if !h.key && self.cancelled {
             if h.release {
                 self.cancelled = false;
             }
-            return;
+            dropped.push(h.class());
+            return dropped;
         }
         if h.press && self.held.iter().any(|o| !o.key && (o.press || o.release)) {
+            dropped.extend(self.held.iter().filter(|o| !o.key).map(Held::class));
             self.held.retain(|o| o.key);
         }
         if self.held.len() == MAX_HELD {
-            self.held.pop_front();
+            dropped.extend(self.held.pop_front().as_ref().map(Held::class));
         }
         self.held.push_back(h);
+        dropped
     }
 
     /// Android delivered `claim` stamped `t` (ns) to the View.
     pub fn claim(&mut self, claim: InputClaim, t: i64) -> Claimed<E> {
         let mut left_pressed = false;
+        let mut dropped = Vec::new();
         match claim {
             InputClaim::Down => {
                 // what came before the press went elsewhere (or was hover nobody claimed)
+                dropped.extend(self.held.iter().filter(|h| !h.key && h.ns < t).map(Held::class));
                 self.held.retain(|h| h.key || h.ns >= t);
                 self.pressed = true;
                 self.cancelled = false;
@@ -88,13 +111,16 @@ impl<E> Gate<E> {
             InputClaim::Up => self.pressed = false,
             InputClaim::Cancel => {
                 let released = self.held.iter().any(|h| !h.key && h.release && h.ns <= t);
+                dropped.extend(self.held.iter().filter(|h| !h.key && h.ns <= t).map(Held::class));
                 self.held.retain(|h| h.key || h.ns > t);
                 left_pressed = self.pressed;
                 self.pressed = false;
                 self.cancelled = !released;
                 return Claimed {
                     replay: Vec::new(),
+                    classes: Vec::new(),
                     left_pressed,
+                    dropped,
                 };
             }
             InputClaim::Move | InputClaim::Hover | InputClaim::Key => {}
@@ -108,9 +134,11 @@ impl<E> Gate<E> {
             _ => !h.key && !h.press && !h.release,
         };
         let mut replay = Vec::new();
+        let mut classes = Vec::new();
         let mut rest = VecDeque::with_capacity(self.held.len());
         for h in self.held.drain(..) {
             if h.ns <= t && takes(&h) {
+                classes.push(h.class());
                 replay.push(h.event);
             } else {
                 rest.push_back(h);
@@ -119,7 +147,9 @@ impl<E> Gate<E> {
         self.held = rest;
         Claimed {
             replay,
+            classes,
             left_pressed,
+            dropped,
         }
     }
 
@@ -320,20 +350,37 @@ fn on_gate(key: i32, event: &gdk::Event) -> glib::Propagation {
         return glib::Propagation::Proceed;
     };
     let ns = stamp_of(a);
-    e.gate.borrow_mut().hold(Held {
+    let h = Held {
         event: event.clone(),
         ns,
         key: key_event,
         press,
         release,
-    });
+    };
+    crate::count::hit(&format!("sideband.held.{}", h.class()));
+    let dropped = e.gate.borrow_mut().hold(h);
+    count_dropped(&dropped);
     glib::Propagation::Stop
+}
+
+/// Counts held events dropped unclaimed (Android sent them elsewhere, or the bound evicted them), by class.
+fn count_dropped(classes: &[&'static str]) {
+    for c in classes {
+        crate::count::hit(&format!("sideband.dropped.{c}"));
+    }
 }
 
 /// The provider's View received `claim` stamped `t` (ns): `key`'s held events up to `t` go back on the queue. True when the page was left mid-press (a cancel it cannot be told of).
 pub fn claim(key: i32, claim: InputClaim, t: i64) -> bool {
-    let Some(e) = entry(key) else { return false };
+    let Some(e) = entry(key) else {
+        crate::count::hit("sideband.claim.no-widget");
+        return false;
+    };
     let claimed = e.gate.borrow_mut().claim(claim, t);
+    count_dropped(&claimed.dropped);
+    for c in &claimed.classes {
+        crate::count::hit(&format!("sideband.replayed.{c}"));
+    }
     for ev in claimed.replay {
         let evicted = {
             let mut r = lock(&REPLAYING);
@@ -359,8 +406,10 @@ pub fn claim(key: i32, claim: InputClaim, t: i64) -> bool {
 /// Android focus on `key`'s View: its widget takes the toolkit's keyboard focus (WebKit's own input method context follows it), or gives it back to the window.
 pub fn focus(key: i32, on: bool) {
     let Some(e) = entry(key) else { return };
+    tracing::info!("atl-platform-ui: sideband {key} android focus {on}");
     if on {
-        e.widget.grab_focus();
+        let took = e.widget.grab_focus();
+        tracing::info!("atl-platform-ui: sideband {key} took toolkit focus {took}");
     } else if let Some(root) = e.widget.root()
         && root
             .focus()
@@ -415,7 +464,8 @@ mod tests {
         let mut g = Gate::default();
         g.hold(ptr(10, true, false));
         g.hold(ptr(20, false, true));
-        g.hold(ptr(30, true, false));
+        // the counters see the unclaimed tap as dropped
+        assert_eq!(g.hold(ptr(30, true, false)), vec!["press", "release"]);
         assert_eq!(g.len(), 1);
         assert_eq!(g.claim(InputClaim::Down, 30).replay, vec![30]);
     }

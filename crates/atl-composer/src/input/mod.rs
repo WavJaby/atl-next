@@ -462,6 +462,9 @@ mod publish {
             .fallback_action(key_code, meta_state)
     }
 
+    /// The diag api key of key events published to a window's channel (the platform side counts what reached it: `atl-platform-ui: count key.*`).
+    const KEY_API: &str = "InputChannel.publishKeyEvent";
+
     /// Publishes `k` to `publisher` (window `token`) as the next seq, recorded for its fallback. False when publishing failed.
     fn publish_key(state: &State, token: &SpIBinder, publisher: &mut Publisher, k: &Key) -> bool {
         let seq = next_seq(state.seq.get());
@@ -479,6 +482,7 @@ mod publish {
             );
         }
         state.fallbacks.borrow_mut().published(token, seq, *k);
+        atl_diag::count(atl_diag::SENT, KEY_API, None);
         true
     }
 
@@ -496,6 +500,7 @@ mod publish {
         }
         let mut windows = state.windows.borrow_mut();
         let Some((token, publisher)) = windows.focused_channel() else {
+            atl_diag::count(atl_diag::REFUSED, KEY_API, Some("no focused window"));
             tracing::warn!(
                 "input: no focused window takes {} key(s), dropped",
                 keys.len()
@@ -527,6 +532,7 @@ mod publish {
         }
         if let InputEvent::Key(e) = event {
             let Some(layout) = &state.layout else {
+                atl_diag::count(atl_diag::REFUSED, KEY_API, Some("no key layout"));
                 return;
             };
             let map = |scan: u32| {

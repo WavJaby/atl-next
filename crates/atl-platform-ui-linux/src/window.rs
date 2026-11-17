@@ -391,11 +391,23 @@ impl GtkWindow {
         let keys = gtk4::EventControllerKey::new();
         keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let send = |s: &Rc<Shared>, c: &gtk4::EventControllerKey, down: bool, keycode: u32| {
+            let focus = c.widget().and_then(|w| w.root()).and_then(|r| r.focus());
+            let to_gate = sideband::routes_to_gate(focus.clone());
+            // which widget had the keyboard focus: a key that never shows here was lost before the window (toolkit focus elsewhere)
+            let held_by = match &focus {
+                None => "none",
+                Some(_) if to_gate => "sideband",
+                Some(w) if w.is::<SceneView>() => "view",
+                Some(_) => "other",
+            };
+            crate::count::hit(&format!("key.received.focus-{held_by}"));
             if sideband::replayed(c.current_event().as_ref()) {
+                crate::count::hit("key.replay-passed");
                 return glib::Propagation::Proceed;
             }
             // a page's unhandled press, put back by WebKit: reported to Android as unhandled, not published a second time
             if sideband::unhandled_key(c.current_event().as_ref()) {
+                crate::count::hit("key.unhandled-reported");
                 return glib::Propagation::Stop;
             }
             let locks = c
@@ -408,11 +420,13 @@ impl GtkWindow {
                 .unwrap_or_default();
             let at = s.stamp("key", c.current_event_time());
             if let Some(event) = input::key(down, keycode, locks, at) {
+                crate::count::hit("key.published");
                 s.on_event.call(|f| f(event));
                 sideband::stamp(c.current_event(), at);
+            } else {
+                crate::count::hit("key.no-scancode");
             }
-            let focus = c.widget().and_then(|w| w.root()).and_then(|r| r.focus());
-            if sideband::routes_to_gate(focus) {
+            if to_gate {
                 glib::Propagation::Proceed
             } else {
                 glib::Propagation::Stop
