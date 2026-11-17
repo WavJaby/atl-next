@@ -75,9 +75,11 @@ fn log_counters() {
     let audible = AUDIBLE.swap(0, Ordering::Relaxed);
     let peak = f32::from_bits(PEAK_BITS.swap(0, Ordering::Relaxed));
     let active = ACTIVE.load(Ordering::Relaxed);
+    let from_tracks = atl_audio_bridge::take_track_frames();
+    let muted = atl_audio_bridge::muted_tracks();
     let _ = writeln!(
         std::io::stderr(),
-        "audio-mix: requested={requested} mixed={mixed} audible={audible} peak={peak:.4} active={active}"
+        "audio-mix: requested={requested} mixed={mixed} from_tracks={from_tracks} audible={audible} peak={peak:.4} active={active} muted={muted}"
     );
 }
 

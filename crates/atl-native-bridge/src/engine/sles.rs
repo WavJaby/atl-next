@@ -171,6 +171,8 @@ mod flow {
     pub(super) static ENQUEUE_BYTES: AtomicU64 = AtomicU64::new(0);
     /// Enqueue answers other than SL_RESULT_SUCCESS (BUFFER_INSUFFICIENT: queue full).
     pub(super) static ENQUEUE_FAILED: AtomicU64 = AtomicU64::new(0);
+    /// Buffer-queue RegisterCallback calls with a non-null callback.
+    pub(super) static QUEUE_REGISTERS: AtomicU64 = AtomicU64::new(0);
     pub(super) static QUEUE_CALLBACKS: AtomicU64 = AtomicU64::new(0);
     pub(super) static OTHER_CALLBACKS: AtomicU64 = AtomicU64::new(0);
     static LAST_MS: AtomicU64 = AtomicU64::new(0);
@@ -188,10 +190,11 @@ mod flow {
         }
         let _ = writeln!(
             std::io::stderr(),
-            "sles-flow: enqueues={} bytes={} enqueue_failed={} queue_callbacks={} other_callbacks={}",
+            "sles-flow: enqueues={} bytes={} enqueue_failed={} queue_registers={} queue_callbacks={} other_callbacks={}",
             ENQUEUES.load(Relaxed),
             ENQUEUE_BYTES.load(Relaxed),
             ENQUEUE_FAILED.load(Relaxed),
+            QUEUE_REGISTERS.load(Relaxed),
             QUEUE_CALLBACKS.load(Relaxed),
             OTHER_CALLBACKS.load(Relaxed),
         );
@@ -360,6 +363,10 @@ fn shell(cb: usize, t: TableId, shorty: &[u8]) -> Option<usize> {
 /// `RegisterCallback(self, callback, context)` of table `t` at `slot`: the callback through a down shell, the context as it is.
 fn register(itf: usize, t: TableId, slot: usize, shorty: &[u8], cb: usize, ctx: usize) -> u32 {
     let host = host_itf(itf, "RegisterCallback");
+    if cb != 0 && (t == sl_buffer_queue::TABLE || t == sl_android_simple_buffer_queue::TABLE) {
+        flow::QUEUE_REGISTERS.fetch_add(1, Ordering::Relaxed);
+        flow::tick();
+    }
     let Some(cb) = shell(cb, t, shorty) else {
         return refuse(&format!(
             "{}.RegisterCallback.no-down-shell",

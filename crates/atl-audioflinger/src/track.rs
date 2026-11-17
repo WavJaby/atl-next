@@ -31,6 +31,49 @@ pub(crate) fn round_frames(requested: i64) -> Option<usize> {
     (frames <= MAX_FRAMES).then_some(frames)
 }
 
+/// What PlaybackThread::createTrack_l sizes a streaming PCM track by: the output's quantum (mNormalFrameCount), rate and latency, and the track's rate and speed.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Sizing {
+    pub(crate) quantum: u32,
+    pub(crate) out_rate: u32,
+    pub(crate) latency_ms: u32,
+    pub(crate) track_rate: u32,
+    pub(crate) speed: f32,
+}
+
+/// `FMS_20` (Threads.cpp): a denied FAST track's notification period, in ms.
+const FAST_DENIED_NOTIFY_MS: u64 = 20;
+
+/// AudioResamplerPublic.h sourceFramesNeededWithTimestretch: track frames the resampler and time stretcher need for `dst` output frames.
+fn source_frames(s: &Sizing, dst: u64) -> u64 {
+    let (src, out) = (u64::from(s.track_rate), u64::from(s.out_rate));
+    let required = if src == out { dst } else { dst * src / out + 1 + 1 };
+    (required as f64 * f64::from(s.speed)) as u64 + 1 + 1
+}
+
+/// A normal streaming track's frame count (Threads.cpp createTrack_l, non-FAST branch): the request, raised to AudioSystem::calculateMinFrameCount (at least two quanta, enough to cover the output's latency). 0 asks for the minimum.
+pub(crate) fn streaming_frames(requested: i64, s: &Sizing) -> u64 {
+    let quantum_ms = (1000 * u64::from(s.quantum) / u64::from(s.out_rate)).max(1);
+    let buffers = (u64::from(s.latency_ms) / quantum_ms).max(2);
+    let min = buffers * source_frames(s, u64::from(s.quantum));
+    u64::try_from(requested).unwrap_or(0).max(min)
+}
+
+/// The notification period AudioFlinger grants a normal streaming PCM track of `frames` (Threads.cpp createTrack_l, "Make sure that application is notified"): 0 or more than `frames / nBuffering` becomes `frames / nBuffering` (nBuffering 3 for a triple-buffered mixer period, else 2), capped at 20 ms when the client asked FAST and was denied.
+/// The client's callback thread fills one notification period per wake (AudioTrack processAudioBuffer); a period of 0 makes it spin without ever asking for data.
+pub(crate) fn notification_frames(requested: i64, frames: u64, s: &Sizing, fast_denied: bool) -> u64 {
+    let ratio = frames * u64::from(s.out_rate) / (u64::from(s.quantum) * u64::from(s.track_rate));
+    let buffering = if ratio == 3 { 3 } else { 2 };
+    let mut max = frames / buffering;
+    if fast_denied {
+        max = max.min(FAST_DENIED_NOTIFY_MS * u64::from(s.track_rate) / 1000);
+    }
+    match u64::try_from(requested) {
+        Ok(n) if n != 0 && n <= max => n,
+        _ => max,
+    }
+}
+
 /// The track's region: a memfd of `len` bytes, the control block and the track's own buffer (none for a shared-buffer track).
 pub(crate) struct Region {
     pub(crate) fd: OwnedFd,
@@ -227,4 +270,50 @@ pub(crate) fn new_binder(region: Region, mixer: Shared, name: i32) -> Strong<dyn
         },
         BinderFeatures::default(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The served output: PipeWire's 1024-frame quantum at 48 kHz, latency two quanta = 42 ms (output.rs `latency_ms`).
+    fn out(track_rate: u32) -> Sizing {
+        Sizing {
+            quantum: 1024,
+            out_rate: 48_000,
+            latency_ms: 42,
+            track_rate,
+            speed: 1.0,
+        }
+    }
+
+    // Expected values by hand from the AOSP formulas: quantum ms = 1024000 / 48000 = 21; buffers = max(42 / 21, 2) = 2.
+    // Same rate: sourceFramesNeeded = 1024, timestretch 1024 * 1.0 + 2 = 1026; min = 2 * 1026 = 2052.
+    #[test]
+    fn zero_request_gets_the_minimum() {
+        assert_eq!(streaming_frames(0, &out(48_000)), 2052);
+        assert_eq!(streaming_frames(8192, &out(48_000)), 8192);
+    }
+
+    // 44.1 kHz: 1024 * 44100 / 48000 = 940 (truncated) + 2 = 942, + 2 = 944; min = 1888.
+    #[test]
+    fn resampled_minimum() {
+        assert_eq!(streaming_frames(0, &out(44_100)), 1888);
+    }
+
+    // 2052 frames: ratio 2052 * 48000 / (1024 * 48000) = 2 -> double buffering, max 1026; FAST denied caps at 20 ms = 960.
+    #[test]
+    fn zero_notification_becomes_the_period() {
+        let s = out(48_000);
+        assert_eq!(notification_frames(0, 2052, &s, false), 1026);
+        assert_eq!(notification_frames(0, 2052, &s, true), 960);
+        assert_eq!(notification_frames(500, 2052, &s, true), 500);
+        assert_eq!(notification_frames(5000, 2052, &s, false), 1026);
+    }
+
+    // 3072 frames = three quanta at the same rate -> triple buffering: 3072 / 3 = 1024.
+    #[test]
+    fn triple_buffered_period() {
+        assert_eq!(notification_frames(0, 3072, &out(48_000), false), 1024);
+    }
 }

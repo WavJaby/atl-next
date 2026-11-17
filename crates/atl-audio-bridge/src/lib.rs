@@ -21,6 +21,16 @@ pub fn cblk_bytes() -> usize {
     bridge::ffi::cblk_bytes()
 }
 
+/// Frames the mixer took from tracks since the last call (resets).
+pub fn take_track_frames() -> u64 {
+    bridge::ffi::take_track_frames()
+}
+
+/// Enabled tracks whose client volume was zero in the last mixed quantum.
+pub fn muted_tracks() -> u32 {
+    bridge::ffi::muted_tracks()
+}
+
 /// A shared mapping of a file range, unmapped on drop. Pointers into it are valid while it lives.
 pub struct Mapping {
     base: *mut c_void,

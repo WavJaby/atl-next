@@ -2,6 +2,7 @@
 #include "wrap/mix.h"
 
 #include <algorithm>
+#include <atomic>
 #include <new>
 
 #include "audio_utils/format.h"
@@ -24,6 +25,20 @@ void* as_value(uint32_t v) {
     return reinterpret_cast<void*>(static_cast<uintptr_t>(v));
 }
 
+/// Counters for the output's line (atl-audioflinger output.rs): written by the realtime fill, read by the output's thread.
+std::atomic<uint64_t> g_track_frames{0};
+std::atomic<uint32_t> g_muted{0};
+
+/// The client's volume (cblk mVolumeLR, gain_minifloat) applied to track `name`, as AudioFlinger's prepareTracks does every cycle. True when both sides are zero.
+bool apply_volume(Mix& mix, Track& track, int32_t name) {
+    const gain_minifloat_packed_t volume = track.proxy->getVolumeLR();
+    float left = float_from_gain(gain_minifloat_unpack_left(volume));
+    float right = float_from_gain(gain_minifloat_unpack_right(volume));
+    mix.setParameter(name, android::AudioMixerBase::VOLUME, android::AudioMixerBase::VOLUME0, &left);
+    mix.setParameter(name, android::AudioMixerBase::VOLUME, android::AudioMixerBase::VOLUME1, &right);
+    return left == 0.0f && right == 0.0f;
+}
+
 }  // namespace
 
 Track::Track(android::sp<android::AudioTrackServerProxy> server, size_t channels_per_frame)
@@ -43,6 +58,7 @@ android::status_t Track::getNextBuffer(Buffer* buffer) {
         buffer->raw = nullptr;
         return status;
     }
+    g_track_frames.fetch_add(frames, std::memory_order_relaxed);
     memcpy_by_audio_format(floats.data(), AUDIO_FORMAT_PCM_FLOAT, server_raw, AUDIO_FORMAT_PCM_16_BIT, frames * channels);
     buffer->raw = floats.data();
     return status;
@@ -116,21 +132,19 @@ void mix_remove(Mix& mix, int32_t name) {
         return;
     }
     mix.disable(name);
+    mix.enabled.erase(name);
     mix.destroy(name);
 }
 
 void mix_enable(Mix& mix, Track& track, int32_t name, bool on) {
     if (!on) {
         mix.disable(name);
+        mix.enabled.erase(name);
         return;
     }
     track.proxy->start();
-    // the client's volume (cblk mVolumeLR, gain_minifloat) as AudioFlinger reads it for a track
-    const gain_minifloat_packed_t volume = track.proxy->getVolumeLR();
-    float left = float_from_gain(gain_minifloat_unpack_left(volume));
-    float right = float_from_gain(gain_minifloat_unpack_right(volume));
-    mix.setParameter(name, android::AudioMixerBase::VOLUME, android::AudioMixerBase::VOLUME0, &left);
-    mix.setParameter(name, android::AudioMixerBase::VOLUME, android::AudioMixerBase::VOLUME1, &right);
+    apply_volume(mix, track, name);
+    mix.enabled[name] = &track;
     mix.enable(name);
 }
 
@@ -139,6 +153,11 @@ void mix_render(Mix& mix, rust::Slice<float> out) {
     const size_t frames = out.size() / kOutChannels;
     for (size_t done = 0; done < frames;) {
         if (mix.next == mix.quantum) {
+            uint32_t muted = 0;
+            for (auto& [name, track] : mix.enabled) {
+                muted += apply_volume(mix, *track, name) ? 1 : 0;
+            }
+            g_muted.store(muted, std::memory_order_relaxed);
             std::fill(mix.out.begin(), mix.out.end(), 0.0f);
             mix.process();
             mix.next = 0;
@@ -149,6 +168,14 @@ void mix_render(Mix& mix, rust::Slice<float> out) {
         mix.next += n;
         done += n;
     }
+}
+
+uint64_t take_track_frames() {
+    return g_track_frames.exchange(0, std::memory_order_relaxed);
+}
+
+uint32_t muted_tracks() {
+    return g_muted.load(std::memory_order_relaxed);
 }
 
 }  // namespace atl::audio

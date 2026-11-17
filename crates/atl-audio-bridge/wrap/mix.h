@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -42,6 +43,8 @@ struct Mix final : public android::AudioMixerBase {
     size_t quantum;
     std::vector<float> out;
     size_t next = 0;
+    /// The enabled tracks by name: each quantum reads their client volume, as AudioFlinger's prepareTracks does every cycle. Changed only by control calls, so the fill iterates it without allocating.
+    std::map<int32_t, Track*> enabled;
 };
 
 /// sizeof(audio_track_cblk_t) on x86_64 (LP64), the layout the Rust side maps: checked against AudioTrackShared.h at compile time (the static_assert in mix.cpp).
@@ -56,5 +59,9 @@ void mix_remove(Mix& mix, int32_t name);
 void mix_enable(Mix& mix, Track& track, int32_t name, bool on);
 /// Fills `out` (interleaved stereo) with the next frames of the mix, one quantum at a time.
 void mix_render(Mix& mix, rust::Slice<float> out);
+/// Frames the mixer took from tracks (getNextBuffer) since the last call; resets the count.
+uint64_t take_track_frames();
+/// Enabled tracks whose client volume was zero in the last quantum.
+uint32_t muted_tracks();
 
 }  // namespace atl::audio

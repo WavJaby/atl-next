@@ -214,6 +214,21 @@ impl IAudioFlingerService for AudioFlinger {
             }
         };
         let frame_bytes = channels * BYTES_PER_SAMPLE;
+        let fast_denied = request.flags & AUDIO_OUTPUT_FLAG_FAST != 0;
+        let sizing = track::Sizing {
+            quantum: out.profile.quantum,
+            out_rate: out.profile.rate_hz,
+            latency_ms: u32::try_from(out.profile.latency_ms()).unwrap_or(0),
+            track_rate,
+            // AudioTrack sends its playback rate's speed; a nonsensical one sizes as normal speed
+            speed: if request.speed.is_finite() && request.speed > 0.0 {
+                request.speed
+            } else {
+                1.0
+            },
+        };
+        // a static track notifies on its own frames (AOSP: the notification sizing is for sharedBuffer == 0)
+        let mut notification = request.notificationFrameCount;
         let (frames, region, server) = match request.sharedBuffer.as_ref() {
             // static: the client's buffer is the track's buffer, and the frames are the buffer's (Threads.cpp:2569: a PCM shared buffer ignores the request's frame count). No roundup (TrackBase:162).
             Some(shared) => {
@@ -247,7 +262,15 @@ impl IAudioFlingerService for AudioFlinger {
                 }
             }
             None => {
-                let Some(frames) = track::round_frames(request.frameCount) else {
+                let sized = track::streaming_frames(request.frameCount, &sizing);
+                notification = i64::try_from(track::notification_frames(
+                    request.notificationFrameCount,
+                    sized,
+                    &sizing,
+                    fast_denied,
+                ))
+                .unwrap_or(i64::MAX);
+                let Some(frames) = i64::try_from(sized).ok().and_then(track::round_frames) else {
                     return refused();
                 };
                 let Some(bytes) = frames.checked_mul(frame_bytes) else {
@@ -269,7 +292,7 @@ impl IAudioFlingerService for AudioFlinger {
                 }
             }
         };
-        if request.flags & AUDIO_OUTPUT_FLAG_FAST != 0 {
+        if fast_denied {
             atl_diag::refused(INTERFACE, "createTrack.FAST");
         }
         let Some(name) = output::add_track(&out.mixer, server, session, channel_mask) else {
@@ -280,7 +303,7 @@ impl IAudioFlingerService for AudioFlinger {
         Ok(Some(CreateTrackResponse {
             r#flags: request.flags & !AUDIO_OUTPUT_FLAG_FAST,
             r#frameCount: frames as i64,
-            r#notificationFrameCount: request.notificationFrameCount,
+            r#notificationFrameCount: notification,
             r#selectedDeviceIds: Some(Vec::new()),
             r#sessionId: session,
             r#sampleRate: config.base.sampleRate,
