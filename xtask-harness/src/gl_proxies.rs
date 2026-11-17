@@ -94,6 +94,7 @@ fn map_dir(lib: &str) -> &'static str {
         "libandroid" => "aosp/frameworks/base/native/android",
         "libjnigraphics" => "aosp/frameworks/base/native/graphics/jni",
         "libmediandk" => "aosp/frameworks/av/media/ndk",
+        "libOpenSLES" => "aosp/frameworks/wilhelm/src",
         _ => MAPS,
     }
 }

@@ -251,7 +251,7 @@ fn instrument() -> Goals {
 }
 
 /// The NDK libraries with guest proxies (C3): the NativeBridge core loads their host side from SYSTEM_LIB (bindings.rs `Host::System`), atld_run places it there, and the `gl-proxies` step checks them beside the GL fronts.
-pub const NDK_PROXIED: [&str; 3] = ["libandroid", "libjnigraphics", "libmediandk"];
+pub const NDK_PROXIED: [&str; 4] = ["libandroid", "libjnigraphics", "libmediandk", "libOpenSLES"];
 
 /// What the `gl-proxies` step checks: GL fronts then [`NDK_PROXIED`], each a host library at atld_run `gl_front`.
 pub fn gl_proxied() -> Vec<&'static str> {
