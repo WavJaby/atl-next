@@ -166,13 +166,13 @@ pkgconfig = "gbm"
 scope = ["build", "runtime"]
 used_by = ["crate:atl-gralloc-service"]
 
-# window chrome, input, IME and hole views (gtk4-rs: gtk4-sys's build script resolves gtk4 through pkg-config). min is the GTK baseline (plan Q10, 4.14): the check step gtk-imports fails any UI module importing a GTK/GDK/GSK name outside gtk-baseline.toml's 4.14 export set. The riscv64 sysroot pins libgtk-4-dev at 4.18.6 (a pin below min fails `check`); the UI crates link with `-z defs` (their build.rs), so a cross build fails on any symbol its pinned GTK lacks
+# window chrome, input, IME and hole views (gtk4-rs: gtk4-sys's build script resolves gtk4 through pkg-config). min is the GTK baseline (plan Q10, 4.14), enforced on the built UI modules against gtk-baseline.toml's 4.14 export set (gtk_imports.rs): check step gtk-imports on the x86_64 modules, and a runtime run's staging on each host's staged modules (riscv64 ones are built only there). The riscv64 sysroot pins libgtk-4-dev at 4.18.6: `check` fails a pin below min, but a pin above it proves nothing about 4.14; the UI crates' `-z defs` (their build.rs) fails a cross build only on a symbol 4.18.6 lacks
 [gtk4]
 debian = "libgtk-4-dev"
 arch = "gtk4"
 pkgconfig = "gtk4"
 min = "4.14.0"
-min_reason = "plan Q10 (re-decided 2026-11-17, owner): GTK baseline 4.14 (sifive and Ubuntu 24.04 ship 4.14.5); newer GTK API only as probed capability tiers, each gated; enforced by check step gtk-imports (gtk-baseline.toml)"
+min_reason = "plan Q10 (re-decided 2026-11-17, owner): GTK baseline 4.14 (sifive and Ubuntu 24.04 ship 4.14.5); newer GTK API only as probed capability tiers, each gated; enforced by gtk_imports.rs against gtk-baseline.toml (check step gtk-imports; a runtime run's staging, per host)"
 scope = ["build", "runtime"]
 used_by = ["crate:atl-platform-ui-linux", "crate:atl-platform-host-linux", "crate:atl-webview-linux"]
 
