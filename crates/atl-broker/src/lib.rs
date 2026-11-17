@@ -684,20 +684,22 @@ pub struct Broker {
     app_seccomp: bool,
     /// The sandbox stub every app process runs under (bwrap execs it, it restricts itself and execs the program).
     stub: PathBuf,
-    /// The web-process channel's programs ([`Broker::with_webspawn`]); None: app sandboxes get no channel, no shim and no `/.flatpak-info`.
-    webspawn: Option<WebSpawnBins>,
+    /// The web-process channel's host side ([`Broker::with_webspawn`]); None: app sandboxes get no channel, no shim and no `/.flatpak-info`.
+    webspawn: Option<WebSpawnHost>,
 }
 
-/// The programs behind [`webspawn`]: atl-sandbox-join (host side) and the `flatpak-spawn` shim (shown in every app sandbox at [`webspawn::SHIM_AT`]).
+/// What [`webspawn`] takes from the host: atl-sandbox-join (host side), the `flatpak-spawn` shim (shown in every app sandbox at [`webspawn::SHIM_AT`]), and the PulseAudio-protocol socket
+/// `share-sound` grants (atl_platform_host::app_access::pulse_socket; None = the host has none, the grant gives nothing and is counted so).
 #[derive(Debug, Clone)]
-pub struct WebSpawnBins {
+pub struct WebSpawnHost {
     pub join: PathBuf,
     pub shim: PathBuf,
+    pub pulse: Option<PathBuf>,
 }
 
 /// What a web-process channel's thread needs of the broker.
 struct WebSpawner {
-    bins: WebSpawnBins,
+    web: WebSpawnHost,
     app_seccomp: bool,
     spawning: Arc<Mutex<()>>,
 }
@@ -838,8 +840,8 @@ impl Broker {
 
     /// App sandboxes get the web-process channel ([`webspawn`]): the shim, `/.flatpak-info` and the channel together, never one without the others (with `/.flatpak-info` and a
     /// failing `flatpak-spawn` probe WebKit starts its web process unsandboxed: ProcessLauncherGLib's fallback branch).
-    pub fn with_webspawn(mut self, bins: WebSpawnBins) -> Self {
-        self.webspawn = Some(bins);
+    pub fn with_webspawn(mut self, web: WebSpawnHost) -> Self {
+        self.webspawn = Some(web);
         self
     }
 
@@ -853,12 +855,18 @@ impl Broker {
     pub fn spawn(&self, mut spawn: Spawn) -> io::Result<Process> {
         // a panic elsewhere leaves nothing half-done here: the guard only orders spawns
         let _one_at_a_time = self.spawning.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(bins) = &self.webspawn {
+        if let Some(web) = &self.webspawn {
             spawn.mounts.push(Mount {
-                host: bins.shim.clone(),
+                host: web.shim.clone(),
                 at: webspawn::SHIM_AT.into(),
                 writable: false,
             });
+            // share-sound's socket: the web sandbox is built from the app's view, so the app's view shows it too (at its own path, read-only as the PipeWire socket; connect needs no write to the mount)
+            spawn.mounts.extend(web.pulse.iter().map(|p| Mount {
+                host: p.clone(),
+                at: p.clone(),
+                writable: false,
+            }));
         }
         complete_mounts(&mut spawn)?;
         let (ours, theirs) = socketpair(
@@ -930,6 +938,7 @@ impl Broker {
                 .filter(|m| m.writable)
                 .cloned()
                 .collect(),
+            pulse: self.webspawn.as_ref().and_then(|w| w.pulse.clone()),
         };
         let Process { child, host_pid } = launch(
             Launch {
@@ -954,8 +963,8 @@ impl Broker {
             spawn.context_manager,
         )
         .map_err(|e| registration_error(host_pid, e))?;
-        if let (Some(channel), Some(bins)) = (broker_end, &self.webspawn) {
-            self.serve_webspawn(channel, view, host_pid, bins.clone())?;
+        if let (Some(channel), Some(web)) = (broker_end, &self.webspawn) {
+            self.serve_webspawn(channel, view, host_pid, web.clone())?;
         }
         Ok(Process { child, host_pid })
     }
@@ -967,12 +976,12 @@ impl Broker {
         channel: OwnedFd,
         app: webspawn::AppView,
         host_pid: i32,
-        bins: WebSpawnBins,
+        web: WebSpawnHost,
     ) -> io::Result<()> {
         let ns = |kind: &str| File::open(format!("/proc/{host_pid}/ns/{kind}")).map(OwnedFd::from);
         let (pidns, mntns) = (ns("pid")?, ns("mnt")?);
         let spawner = WebSpawner {
-            bins,
+            web,
             app_seccomp: self.app_seccomp,
             spawning: Arc::clone(&self.spawning),
         };
@@ -1019,7 +1028,16 @@ impl WebSpawner {
             uid: app.uid,
             context_manager: false,
             binder_pids: BinderPids::Sandbox,
-            mounts: plan.expose.clone(),
+            mounts: plan
+                .expose
+                .iter()
+                .cloned()
+                .chain(plan.pulse.iter().map(|p| Mount {
+                    host: p.clone(),
+                    at: p.clone(),
+                    writable: false,
+                }))
+                .collect(),
             links: vec![],
             devices: if plan.gpu {
                 app.devices.clone()
@@ -1062,7 +1080,7 @@ impl WebSpawner {
         // per-start copies: launch clears close-on-exec on what it inherits and closes it after the spawn, and the channel keeps the originals
         let (pidns, mntns) = (pidns.try_clone()?, mntns.try_clone()?);
         let via = vec![
-            self.bins.join.clone().into_os_string(),
+            self.web.join.clone().into_os_string(),
             "--pidns".into(),
             pidns.as_raw_fd().to_string().into(),
             "--mntns".into(),

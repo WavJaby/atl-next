@@ -1943,10 +1943,24 @@ fn run(a: &Args) -> Result<ExitCode> {
         broker
     };
     let broker = match (&a.sandbox_join, &a.flatpak_spawn) {
-        (Some(join), Some(shim)) => broker.with_webspawn(atl_broker::WebSpawnBins {
-            join: join.clone(),
-            shim: shim.clone(),
-        }),
+        (Some(join), Some(shim)) => {
+            // the web process's share-sound socket, found as libpulse finds its server (PULSE_SERVER, then the runtime dir's pulse/native)
+            let pulse = atl_platform_host::app_access::pulse_socket();
+            match &pulse {
+                Some(p) => log(format_args!(
+                    "web process sound: pulse socket {}",
+                    p.display()
+                )),
+                None => log(format_args!(
+                    "web process sound: no pulse socket (share-sound grants nothing)"
+                )),
+            }
+            broker.with_webspawn(atl_broker::WebSpawnHost {
+                join: join.clone(),
+                shim: shim.clone(),
+                pulse,
+            })
+        }
         _ => broker,
     };
     let lib = (OsString::from("LD_LIBRARY_PATH"), a.lib_path.clone());

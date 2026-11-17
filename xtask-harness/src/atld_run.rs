@@ -312,6 +312,8 @@ pub struct Runtime {
     audio_break_mix: bool,
     /// atld's `PIPEWIRE_REMOTE` (the desktop's server socket, which atld grants the apps) when set: a stale socket file makes an unreachable server (audio_app.rs `--unreachable`).
     pipewire_remote: Option<PathBuf>,
+    /// atld's `PULSE_SERVER` (where atld finds the pulse socket `share-sound` grants the web process) when set; unset = removed, see `atld_command`.
+    pulse_server: Option<std::ffi::OsString>,
     /// The Wayland socket atld's children connect to (the window gate's proxy); the environment's when unset.
     wayland: Option<PathBuf>,
     /// Apps run under atld's app seccomp filter (atl-broker seccomp.rs) unless this is cleared (`--no-app-seccomp`, the deliberate-failure check).
@@ -824,6 +826,7 @@ impl Runtime {
             media_player_service: true,
             audio_break_mix: false,
             pipewire_remote: None,
+            pulse_server: None,
             wayland: None,
             app_seccomp: true,
             break_render_path: false,
@@ -1182,6 +1185,17 @@ impl Runtime {
     pub fn without_webspawn(mut self) -> Self {
         self.webspawn = false;
         self
+    }
+
+    /// atld starts with `PULSE_SERVER` = `server` (libpulse's syntax, `unix:<path>`): the desktop's pulse server, whose socket `share-sound` grants the web process.
+    pub fn with_pulse_server(mut self, server: std::ffi::OsString) -> Self {
+        self.pulse_server = Some(server);
+        self
+    }
+
+    /// atld starts with `PULSE_SERVER` naming a socket that does not exist: the desktop has no pulse server, so `share-sound` grants the web process nothing (the window gate's webview sound break).
+    pub fn without_pulse_server(self) -> Self {
+        self.with_pulse_server("unix:/nonexistent/atl-test/pulse/native".into())
     }
 
     /// Removes the web engine module from the run's library dir (staged anew by every [`Runtime::new`]): a host without WebKit, for the app gate's engine break.
@@ -1854,6 +1868,12 @@ impl Runtime {
         if let Some(socket) = &self.pipewire_remote {
             cmd.env("PIPEWIRE_REMOTE", socket);
         }
+        // the gates' desktop is one audio server, PipeWire: a PULSE_SERVER of the session (WSLg sets unix:/mnt/wslg/PulseServer, its own PulseAudio, downstream of PipeWire) would send the web
+        // process's audio past the graph the app's own audio plays into. Removed = libpulse's default socket; a gate that judges the sound names its own server (with_pulse_server).
+        match &self.pulse_server {
+            Some(server) => cmd.env("PULSE_SERVER", server),
+            None => cmd.env_remove("PULSE_SERVER"),
+        };
         if let Some(socket) = &self.wayland {
             cmd.env("WAYLAND_DISPLAY", socket);
         }

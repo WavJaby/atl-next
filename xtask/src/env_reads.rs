@@ -63,6 +63,12 @@ const ALLOWED: &[(&str, &str, Class, &str)] = &[
         "fontconfig's config file override",
     ),
     (
+        "crates/atl-platform-host-linux/src/app_access.rs",
+        "PULSE_SERVER",
+        Class::Platform,
+        "libpulse's server, the web process's share-sound socket (libpulse's rule)",
+    ),
+    (
         "crates/atl-platform-host-linux/src/data_dir.rs",
         "XDG_DATA_HOME",
         Class::Platform,

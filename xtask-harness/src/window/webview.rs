@@ -8,7 +8,10 @@
 //! ACTION_CANCEL after the page's press, `webview.input.intercept-no-cancel` counted, no click), after-intercept (the next click reaches the page).
 //! Keys: esc-handled (two Escs reach the page once each, the first taken by its handler with no back), esc-back (the second, left unhandled, reaches the app as BACK through
 //! WebViewClient.onUnhandledKeyEvent -> SyntheticKeyboardHandler with `--esc-back`; none without).
+//! Sound (M68(b) as amended 2026-11-18): the page builds a tone and plays it through `<audio>` (no gesture required); the run's default sink is a null sink, and its monitor's peak must be the
+//! tone's, with atld's count of the `share-sound` grant ([`sound_check`]).
 //! Break `--break-webview-engine`: the run's library dir lacks the engine module, the fixture's WebView cannot be made, the readback must fail. Break `--esc-back --break-esc-back`: esc-back must fail.
+//! Break `--break-webview-sound`: atld finds no pulse server, `share-sound` grants nothing, sound must fail.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -232,14 +235,155 @@ fn controls(app: &str) -> Result<String, String> {
     }
 }
 
+/// The rate the monitor is recorded at: the null sink's (audio_pcm.rs Routing, `audio.rate=48000`).
+const MONITOR_RATE: u32 = 48_000;
+/// The peak of the page's tone as a fraction of full scale (Main.java TONE_PEAK, what the page writes into its WAV).
+const TONE_PEAK: f32 = 0.5;
+/// The lowest monitor peak that passes: the tone's peak less 6 dB (10^(-6/20) = 0.501), room for a stream volume the server restores below 1.0 and for resampling. Silence (no grant) is 0, and
+/// nothing else in the fixture plays.
+const TONE_MIN: f32 = TONE_PEAK * 0.501;
+/// atl_broker::webspawn's count when `share-sound` got the pulse socket (its `diag:` line in atld's log).
+const SOUND_GRANT: &str = "answered WebProcessSpawn.sound-pulse";
+
+/// How long the run's pipewire-pulse may take to make its socket.
+const PULSE_READY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The run's sound route: a null sink made the default sink for the run and `pw-record` of its monitor (audio_pcm.rs), and a pipewire-pulse of the run's own on the session's PipeWire
+/// (`PULSE_RUNTIME_PATH` = a scratch dir; its socket `<dir>/native` is atld's PULSE_SERVER). Its own: the session's default socket need not be PipeWire's (on WSLg each new session links
+/// `$XDG_RUNTIME_DIR/pulse/native` to WSLg's PulseAudio, past PipeWire's graph). All undone when dropped, on every exit path.
+pub struct Sound {
+    routing: crate::audio_pcm::Routing,
+    recorder: crate::audio_pcm::Recorder,
+    pulse: PulseServer,
+    wav: std::path::PathBuf,
+}
+
+/// A pipewire-pulse child; killed when dropped.
+struct PulseServer {
+    child: std::process::Child,
+    socket: std::path::PathBuf,
+}
+
+impl PulseServer {
+    fn start(dir: &Path) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir)?;
+        // libpulse refuses a runtime dir others can reach
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        let socket = dir.join("native");
+        let _ = std::fs::remove_file(&socket);
+        let log = std::fs::File::create(dir.with_extension("log"))?;
+        let child = std::process::Command::new("pipewire-pulse")
+            .env("PULSE_RUNTIME_PATH", dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(log.try_clone()?)
+            .stderr(log)
+            .spawn()
+            .context("starting pipewire-pulse")?;
+        let mut server = PulseServer { child, socket };
+        let deadline = std::time::Instant::now() + PULSE_READY;
+        while !server.socket.exists() {
+            if let Some(s) = server.child.try_wait()? {
+                anyhow::bail!(
+                    "pipewire-pulse exited ({s}); its log: {}",
+                    dir.with_extension("log").display()
+                );
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "pipewire-pulse made no socket within {PULSE_READY:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        Ok(server)
+    }
+}
+
+impl Drop for PulseServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Sound {
+    pub fn start(scratch: &Path) -> anyhow::Result<Self> {
+        std::fs::create_dir_all(scratch)?;
+        let sink = format!("atl-window-webview-{}", std::process::id());
+        let wav = scratch.join("monitor.wav");
+        let routing = crate::audio_pcm::Routing::setup(&sink)?;
+        let recorder = crate::audio_pcm::Recorder::start(&sink, &wav, MONITOR_RATE)?;
+        let pulse = PulseServer::start(&scratch.join("pulse"))?;
+        Ok(Sound {
+            routing,
+            recorder,
+            pulse,
+            wav,
+        })
+    }
+
+    /// The run's pulse server, as atld's PULSE_SERVER.
+    pub fn server(&self) -> std::ffi::OsString {
+        let mut s = std::ffi::OsString::from("unix:");
+        s.push(&self.pulse.socket);
+        s
+    }
+
+    /// Ends the recording, restores the routing, stops the run's pulse server; the largest |sample| over every channel.
+    pub fn stop(self) -> Result<f32, String> {
+        let Sound {
+            routing,
+            recorder,
+            pulse,
+            wav,
+        } = self;
+        let stopped = recorder.stop();
+        drop(pulse);
+        drop(routing);
+        stopped.map_err(|e| format!("{e:#}"))?;
+        let bytes = std::fs::read(&wav).map_err(|e| format!("reading {}: {e}", wav.display()))?;
+        let rec = crate::audio_pcm::read_wav(&bytes).map_err(|e| format!("{e:#}"))?;
+        Ok(rec.samples.iter().fold(0.0f32, |m, s| m.max(s.abs())))
+    }
+}
+
+/// The fixture's tone state line (Main.java soundState): printed with a failure, to say where playback stopped.
+const SOUND_STATE: &str = "AtlWindow: wv sound ";
+
+/// Sub-gate sound: the page's tone reached the null sink (`peak` in [`TONE_MIN`]..=1.0; past 1.0 = clipping or a mixing error) and atld counted the grant ([`SOUND_GRANT`]).
+fn sound_check(app: &str, peak: Result<f32, String>, atld_log: &str) -> Result<String, String> {
+    let peak = peak?;
+    if !(TONE_MIN..=1.0).contains(&peak) {
+        let state = app
+            .lines()
+            .find_map(|l| l.find(SOUND_STATE).map(|i| &l[i + SOUND_STATE.len()..]))
+            .unwrap_or("none logged");
+        return Err(format!(
+            "monitor peak {peak:.3}, want {TONE_MIN:.3}..=1.0 (the page's tone at {TONE_PEAK}); element state {state}"
+        ));
+    }
+    if !atld_log.contains(SOUND_GRANT) {
+        return Err(format!(
+            "monitor peak {peak:.3}, but no {SOUND_GRANT:?} count in atld's log"
+        ));
+    }
+    Ok(format!(
+        "monitor peak {peak:.3} (the page's tone at {TONE_PEAK}), {SOUND_GRANT}"
+    ))
+}
+
 /// The sub-gates.
 pub fn checks(
     app: &str,
     liveness: &Result<Liveness, String>,
     pictures: &Mutex<capture::Seen>,
     esc_back: bool,
+    sound_peak: Result<f32, String>,
+    atld_log: &str,
 ) -> Vec<Sub> {
     vec![
+        ("sound", sound_check(app, sound_peak, atld_log)),
         (
             "loaded",
             if app.contains(LOADED) {

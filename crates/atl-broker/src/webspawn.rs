@@ -38,7 +38,8 @@ pub const MAX_MESSAGE: usize = 256 * 1024;
 /// The programs a request may name: (directory name, file name) of WebKit's web process; a path qualifies only under `/usr` (host-installed, read-only in every sandbox).
 /// The network process is absent: WebKit spawns it directly, with the app's rights (ProcessLauncherGLib: only `--sandbox` processes go through flatpak-spawn).
 pub const PROGRAMS: &[(&str, &str)] = &[("webkitgtk-6.0", "WebKitWebProcess")];
-/// `--sandbox-flag` values WebKit passes (FlatpakLauncher.cpp); `share-gpu` gives the app's DRM nodes, the rest give nothing (no session bus, no display or sound socket is shown).
+/// `--sandbox-flag` values WebKit passes (FlatpakLauncher.cpp); `share-gpu` gives the app's DRM nodes, `share-sound` the host's PulseAudio-protocol socket ([`AppView::pulse`], the web process's only
+/// sound grant: WebKitGTK plays through GStreamer's autoaudiosink, which picks pulsesink), the rest give nothing (no session bus, no display socket is shown).
 pub const SANDBOX_FLAGS: &[&str] = &[
     "share-gpu",
     "share-display",
@@ -97,6 +98,8 @@ pub struct AppView {
     pub devices: Vec<PathBuf>,
     /// The app's writable mounts: the only dirs an expose path may lie in.
     pub writable: Vec<Mount>,
+    /// The PulseAudio-protocol socket the app's view shows at its own path (crate::WebSpawnHost::pulse), granted under `share-sound`; None: the host has none.
+    pub pulse: Option<PathBuf>,
 }
 
 /// An admitted request: what the broker starts.
@@ -111,7 +114,14 @@ pub struct Plan {
     /// Read-only expose paths (canonical) the sandbox already shows read-only: admitted, nothing bound ([`RO_EXPOSE_ALREADY_BOUND`]). WebKitGTK 2.52 asks for its injected-bundle dir under `/usr`.
     pub already_bound: Vec<PathBuf>,
     pub gpu: bool,
+    /// `share-sound` asked for.
+    pub sound: bool,
+    /// The pulse socket granted (bound at its own path; `env` names it as `PULSE_SERVER`, as Flatpak's `--socket=pulseaudio` does): `sound` and the app has one.
+    pub pulse: Option<PathBuf>,
 }
+
+/// The variable libpulse reads first for its server (Flatpak sets it for `--socket=pulseaudio`).
+pub const PULSE_SERVER: &str = "PULSE_SERVER";
 
 /// Why a request is refused: `what` keys the counter (a fixed word), `why` names the value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,9 +156,12 @@ pub fn program_allowed(p: &Path) -> bool {
             .any(|(dir, file)| name(Some(p)) == Some(*file) && name(p.parent()) == Some(*dir))
 }
 
-/// Variables the web process does not get: the loader's (the paths they name are not in its view) and the broker's own fds.
+/// Variables the web process does not get: the loader's (the paths they name are not in its view), the broker's own fds, and libpulse's (`share-sound` alone names its server).
 fn dropped(name: &str) -> bool {
-    name.starts_with("LD_") || name == FD_ENV || name == crate::CONTROL_ENV
+    name.starts_with("LD_")
+        || name.starts_with("PULSE_")
+        || name == FD_ENV
+        || name == crate::CONTROL_ENV
 }
 
 /// Whether the web sandbox shows `p` read-only from the host: under a [`crate::APP_ROOT_DIRS`] dir, bound at its own path in [`crate::Profile::WebProcess`] (`bwrap_args`). By text: pass plain or canonical paths.
@@ -229,23 +242,37 @@ pub fn check(
             writable: e.writable,
         });
     }
+    let sound = req.flags.iter().any(|f| f == "share-sound");
+    let pulse = app.pulse.clone().filter(|_| sound);
+    let mut env: Vec<(OsString, OsString)> = req
+        .env
+        .iter()
+        .filter(|(k, _)| !dropped(k))
+        .map(|(k, v)| (k.into(), v.into()))
+        .collect();
+    if let Some(p) = &pulse {
+        let mut v = OsString::from("unix:");
+        v.push(p);
+        env.push((PULSE_SERVER.into(), v));
+    }
     Ok(Plan {
         program,
         identifier,
-        env: req
-            .env
-            .iter()
-            .filter(|(k, _)| !dropped(k))
-            .map(|(k, v)| (k.into(), v.into()))
-            .collect(),
+        env,
         expose,
         already_bound,
         gpu: req.flags.iter().any(|f| f == "share-gpu"),
+        sound,
+        pulse,
     })
 }
 
 /// [`admit`]'s count (`answered WebProcessSpawn.<this>`) per read-only expose the web sandbox already shows.
 pub const RO_EXPOSE_ALREADY_BOUND: &str = "ro-expose-already-bound";
+/// [`admit`]'s count per `share-sound` granted the pulse socket.
+pub const SOUND_PULSE: &str = "sound-pulse";
+/// [`admit`]'s count per `share-sound` with no pulse socket on the host: admitted, nothing granted (the web process plays into no server).
+pub const SOUND_NO_SERVER: &str = "sound-no-server";
 
 /// [`check`] on the host's filesystem, a refusal counted (`refused WebProcessSpawn.<what>`) and answered.
 pub fn admit(req: &Request, app: &AppView) -> Result<Plan, Reply> {
@@ -253,6 +280,14 @@ pub fn admit(req: &Request, app: &AppView) -> Result<Plan, Reply> {
         .inspect(|plan| {
             for _ in &plan.already_bound {
                 atl_diag::answered(INTERFACE, RO_EXPOSE_ALREADY_BOUND);
+            }
+            if plan.sound {
+                let what = if plan.pulse.is_some() {
+                    SOUND_PULSE
+                } else {
+                    SOUND_NO_SERVER
+                };
+                atl_diag::answered(INTERFACE, what);
             }
         })
         .map_err(|r| {
@@ -385,6 +420,7 @@ mod tests {
                 at: PathBuf::from("/var/appdata/com.example"),
                 writable: true,
             }],
+            pulse: None,
         }
     }
 
@@ -514,6 +550,39 @@ mod tests {
         assert_eq!(plan.identifier, "7");
         assert!(plan.gpu);
         // the loader's variables and the broker's fds are dropped, the rest kept in order
+        assert_eq!(plan.env, vec![("HOME".into(), "/tmp".into())]);
+        // share-sound asked, the app has no pulse socket: nothing granted
+        assert!(plan.sound);
+        assert_eq!(plan.pulse, None);
+    }
+
+    /// share-sound with the app's pulse socket: the socket, and PULSE_SERVER naming it (Flatpak's --socket=pulseaudio), replacing any PULSE_* the request carried; without the flag, neither.
+    #[test]
+    fn share_sound_grants_the_pulse_socket() {
+        const SOCKET: &str = "/run/user/1000/pulse/native";
+        let app = AppView {
+            pulse: Some(SOCKET.into()),
+            ..app()
+        };
+        let mut req = web();
+        req.env
+            .push((PULSE_SERVER.into(), "unix:/mnt/other".into()));
+        req.env
+            .push(("PULSE_COOKIE".into(), "/home/user/cookie".into()));
+        let check = |req: &Request| check(req, &app, |p| Some(p.to_path_buf()), |_| true);
+        let plan = check(&req).expect("admitted");
+        assert_eq!(plan.pulse.as_deref(), Some(Path::new(SOCKET)));
+        assert_eq!(
+            plan.env,
+            vec![
+                ("HOME".into(), "/tmp".into()),
+                (PULSE_SERVER.into(), format!("unix:{SOCKET}").into())
+            ]
+        );
+        req.flags.retain(|f| f != "share-sound");
+        let plan = check(&req).expect("admitted");
+        assert!(!plan.sound);
+        assert_eq!(plan.pulse, None);
         assert_eq!(plan.env, vec![("HOME".into(), "/tmp".into())]);
     }
 

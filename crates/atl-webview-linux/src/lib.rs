@@ -374,7 +374,15 @@ unsafe extern "C" fn view_create(
             webkit6::functions::micro_version()
         );
     });
-    let web = webkit6::WebView::new();
+    // autoplay is the app's setting alone (WebSettings.setMediaPlaybackRequiresUserGesture -> media-playback-requires-user-gesture): WebKit's own policy, ALLOW_WITHOUT_SOUND by default,
+    // would refuse an audible play() the app allowed (NotAllowedError), which Android's WebView plays. Construct-only on the view, so set here once.
+    let web = webkit6::WebView::builder()
+        .website_policies(
+            &webkit6::WebsitePolicies::builder()
+                .autoplay(webkit6::AutoplayPolicy::Allow)
+                .build(),
+        )
+        .build();
     if let Some(s) = WebViewExt::settings(&web) {
         s.set_enable_javascript(false);
         s.set_enable_html5_local_storage(false);

@@ -31,7 +31,50 @@ public class Main extends Activity {
      * (WebView.loadData doc: escape it as %23); for the same reason no '%' or '?'.
      */
     static final String PAGE_HTML = "<html><body style=\"margin:0;height:100vh;background:rgb(48,112,192)\" onclick=\"window.n=(window.n||0)+1;document.title='tap'+window.n\""
-            + " onkeydown=\"window.k=(window.k||0)+1;if(event.key=='Escape'&&window.k==1)event.preventDefault();document.title='key'+window.k+event.key+(event.defaultPrevented?'-prevented':'')\"></body></html>";
+            + " onkeydown=\"window.k=(window.k||0)+1;if(event.key=='Escape'&&window.k==1)event.preventDefault();document.title='key'+window.k+event.key+(event.defaultPrevented?'-prevented':'')\">"
+            + soundScript() + "</body></html>";
+
+    /** The page's tone (webview.rs TONE_PEAK): TONE_HZ at TONE_PEAK of full scale for TONE_MS, 16-bit mono PCM at TONE_RATE. */
+    static final int TONE_HZ = 1000, TONE_RATE = 48000, TONE_MS = 1000;
+    static final double TONE_PEAK = 0.5;
+
+    /**
+     * The sound sub-gate's page part: builds the tone as a WAV and plays it through an `<audio>` (no controls: draws nothing) from a blob: URL, at load, without a gesture
+     * (setMediaPlaybackRequiresUserGesture(false) below); no network, no asset, no title change (the input sub-gates read the titles). Same character limits as PAGE_HTML.
+     */
+    static String soundScript() {
+        // in a closure: the page's own handlers keep their globals (window.n, window.k)
+        return "<audio id=\"tone\"></audio><script>(function() {"
+                + "var rate = " + TONE_RATE + ", n = rate * " + TONE_MS + " / 1000, v = new DataView(new ArrayBuffer(44 + 2 * n));"
+                + "function s(o, t) { for (var i = 0; i < 4; i++) v.setUint8(o + i, t.charCodeAt(i)); }"
+                + "s(0, 'RIFF'); v.setUint32(4, 36 + 2 * n, true); s(8, 'WAVE'); s(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);"
+                + "v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); s(36, 'data'); v.setUint32(40, 2 * n, true);"
+                + "for (var i = 0; i < n; i++) v.setInt16(44 + 2 * i, Math.round(" + TONE_PEAK + " * 32767 * Math.sin(2 * Math.PI * " + TONE_HZ + " * i / rate)), true);"
+                + "var a = document.getElementById('tone'); a.src = URL.createObjectURL(new Blob([v.buffer], {type: 'audio/wav'})); a.play();"
+                + "})();</script>";
+    }
+
+    /** How long after the first onPageFinished the tone's state is logged: its TONE_MS plus the web process's media start (seconds on a loaded host). */
+    static final int SOUND_STATE_MS = TONE_MS + 4000;
+
+    /**
+     * The `wv sound` line (webview.rs sound sub-gate prints it on failure): the tone element's readyState, networkState, paused, ended, currentTime and error code SOUND_STATE_MS after the
+     * first load; a played tone reads `4 1 true true 1 0`.
+     */
+    private void soundState(final WebView view) {
+        view.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                view.evaluateJavascript("(function(a){return [a.readyState,a.networkState,a.paused,a.ended,a.currentTime,a.error?a.error.code:0].join(' ')})(document.getElementById('tone'))",
+                        new android.webkit.ValueCallback<String>() {
+                            @Override
+                            public void onReceiveValue(String v) {
+                                Log.i(TAG, "wv sound " + v);
+                            }
+                        });
+            }
+        }, SOUND_STATE_MS);
+    }
 
     /** The WebView's parent: intercepts a gesture at its first move (as a scrolling parent does), so the WebView gets ACTION_CANCEL. */
     static final class Intercept extends FrameLayout {
@@ -87,6 +130,7 @@ public class Main extends Activity {
         try {
             WebView w = new WebView(this);
             w.getSettings().setJavaScriptEnabled(true);
+            w.getSettings().setMediaPlaybackRequiresUserGesture(false);
             w.setWebViewClient(new WebViewClient() {
                 @Override
                 public void onPageFinished(WebView view, String url) {
@@ -94,6 +138,7 @@ public class Main extends Activity {
                     if (!apiChecked) {
                         apiChecked = true;
                         callApis(view);
+                        soundState(view);
                     }
                 }
             });

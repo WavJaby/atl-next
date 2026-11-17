@@ -161,6 +161,10 @@ pub struct Args {
     /// Stage webview only: the run's library dir lacks the web engine module (a host without WebKit), the fixture's WebView cannot be made, so the readback sub-gate must fail (the gate's deliberate break, environment-side).
     #[arg(long)]
     break_webview_engine: bool,
+    /// Stage webview only: atld finds no pulse server (`PULSE_SERVER` names a missing socket, Runtime::without_pulse_server), so `share-sound` grants the web process nothing and the sound
+    /// sub-gate must fail (the monitor stays silent, atld counts `WebProcessSpawn.sound-no-server`; the gate's deliberate break, environment-side).
+    #[arg(long)]
+    break_webview_sound: bool,
     /// Stage splash only: `ro.atl.splash` is left unset, so the launcher shows no starting window and the order sub-gate must fail (the gate's deliberate break, environment-side).
     #[arg(long)]
     break_splash: bool,
@@ -2019,6 +2023,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         rt
     };
+    let rt = if matches!(args.stage, Stage::WebView) && args.break_webview_sound {
+        rt.without_pulse_server()
+    } else {
+        rt
+    };
     // the desktop's mouse-as-one-finger adaptation (atld `--mouse-touch`): this stage's drag is a touchscreen's; its break is the adaptation off, the AOSP mouse
     let rt = if matches!(args.stage, Stage::MouseTouch) && !args.break_mouse_touch {
         rt.with_mouse_touch()
@@ -2108,6 +2117,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let ime_breaks = ime::Breaks {
         commit: args.break_ime_commit,
         delete: args.break_ime_delete,
+    };
+    // the webview stage's page plays a tone (webview.rs sound): into a null sink the gate makes the default for the run, silent on the desktop, its monitor recorded (audio_pcm.rs)
+    let sound = match args.stage {
+        Stage::WebView => Some(webview::Sound::start(&run.scratch)?),
+        _ => None,
+    };
+    // atld finds the run's pulse server (the break keeps its missing one)
+    let rt = match &sound {
+        Some(s) if !args.break_webview_sound => rt.with_pulse_server(s.server()),
+        _ => rt,
     };
     let mut atld_child = rt.start_atld(&run)?;
     let atld_pid = atld_child.id();
@@ -2255,6 +2274,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         None => Err("no probe: only the gtk, widgets and resize stages run one".to_owned()),
     };
     let pressure = sampler.stop();
+    let sound_peak = sound.map(webview::Sound::stop);
     let app = read(&app_log);
     let services = read(&services_log);
     let all = events(&services);
@@ -2288,7 +2308,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             ("touch-mode", touch_mode_check(&services)),
         ],
         (Stage::SurfaceView, Some(_)) => surface_view::checks(&app, &liveness, &captured),
-        (Stage::WebView, Some(_)) => webview::checks(&app, &liveness, &captured, args.esc_back),
+        (Stage::WebView, Some(_)) => webview::checks(
+            &app,
+            &liveness,
+            &captured,
+            args.esc_back,
+            sound_peak.unwrap_or_else(|| Err("no recording".to_owned())),
+            &atld_log,
+        ),
         (Stage::WebViewOverlay, Some(_)) => webview_overlay::checks(&app, args.esc_back),
         (Stage::UiBlock, Some(_)) => ui_block::checks(&app),
         (Stage::MouseTouch, Some(_)) => widgets::mouse_touch_checks(&app, &liveness),

@@ -39,6 +39,29 @@ pub fn pipewire_socket_of(remote: Option<OsString>, runtime: Option<OsString>) -
     named_socket_of(remote, "pipewire-0", runtime)
 }
 
+/// The PulseAudio-protocol server's socket as libpulse's default connect finds a local one: the first `unix:` entry of `PULSE_SERVER` (a space-separated list; a bare absolute path is a unix one too),
+/// else `pulse/native` under `XDG_RUNTIME_DIR` (pa_runtime_path). Network entries (`tcp:`, a host name) are no socket to show: skipped, as Flatpak's `--socket=pulseaudio` skips them.
+/// client.conf's `default-server` is not read (a per-user file, not the environment). `None` when it does not exist. For the web process's `share-sound` (atl-broker webspawn).
+pub fn pulse_socket() -> Option<PathBuf> {
+    pulse_socket_of(
+        std::env::var_os("PULSE_SERVER"),
+        std::env::var_os("XDG_RUNTIME_DIR"),
+    )
+}
+
+/// [`pulse_socket`] for the values `server` (PULSE_SERVER) and `runtime` (XDG_RUNTIME_DIR).
+pub fn pulse_socket_of(server: Option<OsString>, runtime: Option<OsString>) -> Option<PathBuf> {
+    let p = match server {
+        // a PULSE_SERVER naming only network servers: libpulse never tries the local default either
+        Some(s) => s.into_string().ok()?.split_whitespace().find_map(|e| {
+            let path = e.strip_prefix("unix:").unwrap_or(e);
+            path.starts_with('/').then(|| PathBuf::from(path))
+        })?,
+        None => PathBuf::from(runtime?).join("pulse/native"),
+    };
+    p.exists().then_some(p)
+}
+
 /// The socket `name` (absolute, else under `runtime`; `default` when unset) if it exists.
 fn named_socket_of(
     name: Option<OsString>,
@@ -71,4 +94,28 @@ pub fn fontconfig_paths() -> Result<Vec<PathBuf>, FontError> {
         }
     }
     Ok(v.into_iter().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// libpulse's order on a made runtime dir: PULSE_SERVER's first unix entry wins over the default, network entries are skipped, a network-only value finds none, unset = `<runtime>/pulse/native`.
+    #[test]
+    fn pulse_socket_follows_libpulse_order() {
+        let dir = std::env::temp_dir().join(format!("atl-pulse-of-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("pulse")).unwrap();
+        let default = dir.join("pulse/native");
+        let other = dir.join("other");
+        std::fs::write(&default, "").unwrap();
+        std::fs::write(&other, "").unwrap();
+        let of = |s: Option<String>| pulse_socket_of(s.map(Into::into), Some(dir.clone().into()));
+        assert_eq!(of(None), Some(default.clone()));
+        let o = other.display();
+        assert_eq!(of(Some(format!("unix:{o}"))), Some(other.clone()));
+        assert_eq!(of(Some(format!("tcp:host:4713 {o}"))), Some(other.clone()));
+        assert_eq!(of(Some("tcp:host:4713".into())), None);
+        assert_eq!(of(Some(format!("unix:{}/missing", dir.display()))), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
