@@ -8,6 +8,7 @@
 // media <lib> <shim> <mime>...: NDK AMediaCodec_createDecoderByType per mime (libmediandk, NEEDED by lib), prints 1 = codec created, 0 = null, -100 = libmediandk not loaded; a Codec2 abort ends the process, the lines before it are the measurement.
 // decode <lib> <shim> <clip> <pcm out>: one clip through the NDK extractor and decoder (stage 9): `nlt decode` is the step that failed (`error=`), else frames, bytes, channels, rate, and the store the process sees (`store=`, `declared=`, `instances=`).
 // player <lib> <shim>: startReg, then player(): `nlt player <step> ok|<throwable>` per MediaPlayer step (stage 10).
+// sigquit <shim>: the process sends itself SIGQUIT while the main thread waits in the shim's blockForDump for ART's thread dump (stage 11); `nlt sigquit` is its report, `nlt after alive` that the process ran on.
 // overflow <rounds>: unbounded recursion in recurse, `rounds` times on the main thread (warms the JIT: compiled code checks the stack implicitly, a SIGSEGV on the guard page), then `rounds` times on a new thread; each catches StackOverflowError, prints its depth, and the process exits normally.
 
 import java.io.BufferedReader;
@@ -28,6 +29,7 @@ public class NativeLoad {
     static native void raiseAbort();
     static native int createDecoder(String mime);
     static native String decodeFile(String input, String output);
+    static native String blockForDump();
 
     static class Box {
         int v;
@@ -64,6 +66,11 @@ public class NativeLoad {
         }
         if (mode.equals("chain")) {
             chain(Integer.parseInt(a[2]), Integer.parseInt(a[3]));
+            return;
+        }
+        if (mode.equals("sigquit")) {
+            out("sigquit", blockForDump());
+            out("after", "alive");
             return;
         }
         if (mode.equals("crash")) {

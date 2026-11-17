@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Tue, 17 Nov 2026 16:41:56 +0800
+Subject: [PATCH] libunwindstack: refuse a thread that blocks the unwind signal
+
+ThreadUnwinder signals the target thread and waits 10 s for its
+ucontext. bionic never lets a thread block its reserved unwind
+signal; glibc lets any thread block SIGRTMIN, and glib/mesa threads
+block every signal. A whole-process dump (ART SIGQUIT) then spent
+10 s per such thread. Read SigBlk first and fail with
+ERROR_THREAD_SIGNAL_BLOCKED instead.
+
+Upstream-Status: Inappropriate [glibc host only]
+Patch-Reason: ART SIGQUIT thread dump on a glibc host stalls 10 s per toolkit thread
+---
+SPDX-License-Identifier: Apache-2.0
+ libunwindstack/ThreadUnwinder.cpp          | 27 ++++++++++++++++++++++
+ libunwindstack/include/unwindstack/Error.h |  3 +++
+ 2 files changed, 30 insertions(+)
+
+diff --git a/libunwindstack/ThreadUnwinder.cpp b/libunwindstack/ThreadUnwinder.cpp
+index a02b665af56873ace192a7292299fbe18ce4b548..604d084d789814b083861a4f239a28f16f4273be 100644
+--- a/libunwindstack/ThreadUnwinder.cpp
++++ b/libunwindstack/ThreadUnwinder.cpp
+@@ -16,6 +16,7 @@
+ 
+ #include <errno.h>
+ #include <signal.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <sys/types.h>
+ #include <unistd.h>
+@@ -26,6 +27,8 @@
+ #include <vector>
+ 
+ #include <android-base/errno_restorer.h>
++#include <android-base/file.h>
++#include <android-base/stringprintf.h>
+ #include <android-base/threads.h>
+ 
+ #include <unwindstack/Log.h>
+@@ -36,6 +39,25 @@
+ 
+ namespace unwindstack {
+ 
++// Whether thread `tid` of this process blocks `signal` (SigBlk of /proc/self/task/<tid>/status).
++// bionic never lets a thread block its reserved unwind signal; glibc lets any thread block
++// SIGRTMIN, and toolkit threads (glib, mesa) block every signal. Signalling such a thread
++// only ends in the 10 s ucontext timeout, once per thread of a whole-process dump.
++static bool ThreadBlocksSignal(pid_t tid, int signal) {
++  std::string status;
++  if (signal < 1 || signal > 64 ||
++      !android::base::ReadFileToString(
++          android::base::StringPrintf("/proc/self/task/%d/status", tid), &status)) {
++    return false;
++  }
++  size_t pos = status.find("\nSigBlk:");
++  if (pos == std::string::npos) {
++    return false;
++  }
++  unsigned long long blocked = strtoull(status.c_str() + pos + 8, nullptr, 16);
++  return (blocked >> (signal - 1)) & 1;
++}
++
+ static void SignalLogOnly(int, siginfo_t*, void*) {
+   android::base::ErrnoRestorer restore;
+ 
+@@ -87,6 +109,11 @@ ThreadEntry* ThreadUnwinder::SendSignalToThread(int signal, pid_t tid) {
+   static std::mutex action_mutex;
+   std::lock_guard<std::mutex> guard(action_mutex);
+ 
++  if (ThreadBlocksSignal(tid, signal)) {
++    last_error_.code = ERROR_THREAD_SIGNAL_BLOCKED;
++    return nullptr;
++  }
++
+   ThreadEntry* entry = ThreadEntry::Get(tid);
+   entry->Lock();
+   struct sigaction new_action = {.sa_sigaction = SignalHandler,
+diff --git a/libunwindstack/include/unwindstack/Error.h b/libunwindstack/include/unwindstack/Error.h
+index 878cff4d9c14143f6714972e3e4bed2155adddb3..e003a136ee2ee01f8424f838bdf218e79351ed19 100644
+--- a/libunwindstack/include/unwindstack/Error.h
++++ b/libunwindstack/include/unwindstack/Error.h
+@@ -44,6 +44,7 @@ enum ErrorCode : uint8_t {
+   ERROR_MAPS_PARSE,             // Failed to parse maps data.
+   ERROR_INVALID_PARAMETER,      // Invalid parameter passed to function.
+   ERROR_PTRACE_CALL,            // Ptrace call failed while unwinding.
++  ERROR_THREAD_SIGNAL_BLOCKED,  // The local thread blocks the unwind signal.
+   ERROR_MAX = ERROR_INVALID_PARAMETER,
+ };
+ 
+@@ -79,6 +80,8 @@ static inline const char* GetErrorCodeString(ErrorCode error) {
+       return "Invalid parameter";
+     case ERROR_PTRACE_CALL:
+       return "Ptrace Call Failed";
++    case ERROR_THREAD_SIGNAL_BLOCKED:
++      return "Thread blocks the unwind signal";
+   }
+ }
+ 

@@ -77,9 +77,20 @@ const IMPORTS: &[Import] = &[
         lang: Lang::C,
         view: View::Host,
         // sigprocmask: the loader's reference keeping libsigchain NEEDed (loader.rs `SIGCHAIN`)
-        functions: &["sigaction", "sigfillset", "sigaltstack", "sigprocmask"],
+        functions: &[
+            "sigaction",
+            "sigfillset",
+            "sigaltstack",
+            "sigprocmask",
+            "sigemptyset",
+            "sigaddset",
+        ],
         types: &[],
         macros: &[
+            "SIGPIPE",
+            "SIGQUIT",
+            "SIGUSR1",
+            "SIG_BLOCK",
             "SIGABRT",
             "SIGBUS",
             "SIGFPE",

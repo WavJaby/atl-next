@@ -98,6 +98,8 @@ enum Command {
     ///
     /// A row's file comes from `<workspace>/cache/test-apks`, downloaded and verified on first use; the package file is the APK's own manifest, which must match the row. A path runs unpinned: no row checks its bytes, signer or identity. The APK is copied to `<out>/run-apk`. Pass: the app reports its resume (onResume), no fault in its log for the watch after it, and a presented frame.
     /// Without `--hold` the window maps in the gate's headless compositor (nested_wayland.rs); `--hold SECS` maps it on the desktop and keeps the app up that long after its resume, the window open for drags. Staging is `xtask test window`'s. Hardware acceleration is the APK's own setting: the pinned official builds run with it on.
+    ///
+    /// A stalled or frozen app: `kill -QUIT $(pgrep -x <last 15 characters of the package>)` (the process names itself after its package; atld's `process <pid>` lines name the sandbox, not the app) makes ART dump every thread's Java and native stack into the app log, `<out>/run-apk/root/log/<package>.log` (`-v` prints it); the app runs on, as on Android.
     RunApk(run_apk::Args),
     /// Runs WSL-built outputs on a Linux desktop over ssh (the owner's laptop, plan L1): `push` bundles a gate's record and `lib/`, `test` runs the prerequisite check on the target.
     ///

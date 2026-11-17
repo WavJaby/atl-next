@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test native-load`: the converter-built libandroid_runtime on the converter's ART (`stage_art`), started as an app process starts: atl-app-launcher over the default property area atl-property-service writes (the broker's place), in ten stages.
+//! `xtask test native-load`: the converter-built libandroid_runtime on the converter's ART (`stage_art`), started as an app process starts: atl-app-launcher over the default property area atl-property-service writes (the broker's place), in eleven stages.
 //!
 //! 1. load: `System.load` with `LD_BIND_NOW=1`, so every undefined symbol of every object it pulls in must resolve at load time (lazy binding would fail only at the first call).
 //! 2. register: `AndroidRuntime::startReg` must return 0, then gRegJNI walked entry by entry (startReg's own loop, register_jni_procs) must register every entry.
@@ -23,6 +23,8 @@
 //! 9. decode: the clips of `audio.rs` (Ogg Vorbis, WAV PCM, from the game APKs) decoded one by one through the NDK extractor and codec, as stage 8 runs them. Frames, channels, rate and PCM bytes equal each container's; raw output equals the WAV data chunk; the process's Codec2 store is in-process (`store=local`, declared, instance `default`), and media.extractor is served in-process (`extractor=local`, the lookup MediaPlayerService's setDataSource makes).
 //! 10. player: after startReg, as stage 8 runs: MediaPlayer's class init must succeed (loads libmedia_jni, whose JNI_OnLoad registers every media class, then native_init). Then Happy Jump's sequence (GameShared.loadMusic): `new MediaPlayer`, `setLooping`, `setVolume`, `release`, no exception and no `media.player` lookup; `start()` in Idle throws IllegalStateException, as AOSP's MediaPlayer.cpp answers it.
 //!     The sequence is a warning here: construction resolves an AttributionSource, which needs ActivityThread or the package service (see `player_result`).
+//! 11. sigquit: the process sends itself SIGQUIT (as `kill -QUIT <pid>`) while its main thread waits in the shim and a shim thread blocks every signal (as glib's and mesa's do). ART's SignalCatcher must dump every thread to the log (`----- pid` .. `----- end`, the palette's LOG(INFO)) within the shim's limit:
+//!     `"main"` with the shim function's native and Java frames, the blocker without a stack (libunwindstack patch: a thread blocking the unwind signal is refused, not waited for 10 s), and the process runs on. No thread but the catcher may leave SIGQUIT unblocked (launcher `block_runtime_signals`).
 //!
 //! Fixture (xtask-harness/testdata/native-load): NativeLoad.java (driver), compiled against the boot class jars (framework's included) with the Java pipeline's JDK and d8; never shipped.
 //! shim/, a JNI cdylib (a cargo package of its own, for the `libc` crate's per-arch `struct sigaction`), calls the C++ entry points (hidden register_* by .symtab vaddr) and installs stage 5's handler; built into <out>/cargo.
@@ -318,7 +320,98 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Err(PlayerErr::Init(e)) => report.fail("player", e),
         Err(PlayerErr::Sequence(e)) => report.warn("player", e),
     }
+
+    // 11
+    let sigquit = env.art(&fixture, "sigquit", &[fixture.shim.display().to_string()])?;
+    match sigquit_result(&sigquit) {
+        Ok(s) => report.pass("sigquit", s),
+        Err(e) => report.fail("sigquit", e),
+    }
     Ok(report.finish())
+}
+
+/// Stage 11's main-thread function: the shim's JNI symbol, named by the dump's native frame, and its Java frame as ART prints it.
+const SIGQUIT_NATIVE: &str = "Java_NativeLoad_blockForDump";
+const SIGQUIT_JAVA: &str = "at NativeLoad.blockForDump(Native method)";
+/// The shim's all-signals-blocked thread (shim `SIGBLOCK_THREAD`): its dump header.
+const SIGQUIT_BLOCKER: &str = "\"nlt-sigblock\"";
+
+/// Stage 11: `nlt sigquit` reports no thread but the catcher leaving SIGQUIT unblocked and the dump over within the shim's limit; stderr holds the dump (`----- pid` .. `----- end`), its `"main"` block names [`SIGQUIT_NATIVE`] and [`SIGQUIT_JAVA`], the blocker thread is in it, and the process ran on (`nlt after alive`, exit 0).
+fn sigquit_result(run: &ArtRun) -> Result<String, String> {
+    let Some(report) = run.value("sigquit") else {
+        return Err(format!("no sigquit report: {}", run.failure()));
+    };
+    let field = |k: &str| {
+        report
+            .split(' ')
+            .find_map(|f| f.strip_prefix(k).and_then(|v| v.strip_prefix('=')))
+            .unwrap_or("")
+    };
+    if !field("unblocked").is_empty() {
+        return Err(format!(
+            "threads leave SIGQUIT unblocked ({}): the kernel may hand them `kill -QUIT`, whose default action ends the process; the launcher must block ART's BlockSignals set before it starts any thread",
+            field("unblocked")
+        ));
+    }
+    if field("catcher") != "true" {
+        return Err("no `Signal Catcher` thread in the process".to_owned());
+    }
+    let reacted = run.stderr.contains("reacting to signal 3");
+    if field("done") != "true" {
+        return Err(if reacted {
+            format!(
+                "the catcher took SIGQUIT but its dump was not over after {} ms: a thread it unwinds by signal does not answer (libunwindstack waits 10 s per thread)",
+                field("ms")
+            )
+        } else {
+            format!(
+                "the catcher never took SIGQUIT ({} ms): another thread took the delivery, or the catcher is not waiting for it",
+                field("ms")
+            )
+        });
+    }
+    if run.value("after") != Some("alive") || !run.ok {
+        return Err(format!(
+            "the process did not run on after its dump: {}",
+            run.failure()
+        ));
+    }
+    let lines: Vec<&str> = run.stderr.lines().collect();
+    let Some(start) = lines.iter().position(|l| l.contains("----- pid ")) else {
+        return Err("no `----- pid` dump header on stderr".to_owned());
+    };
+    let Some(end) = lines[start..].iter().position(|l| l.contains("----- end ")) else {
+        return Err("the dump has no `----- end` line".to_owned());
+    };
+    let dump = &lines[start..start + end];
+    let header = |l: &str| l.contains("\" prio=") || l.contains("\" sysTid=");
+    let Some(main) = dump.iter().position(|l| l.contains("\"main\" prio=")) else {
+        return Err("the dump has no `\"main\"` thread".to_owned());
+    };
+    let block: Vec<&str> = dump[main..]
+        .iter()
+        .enumerate()
+        .take_while(|(i, l)| *i == 0 || !header(l))
+        .map(|(_, l)| *l)
+        .collect();
+    for want in [SIGQUIT_NATIVE, SIGQUIT_JAVA] {
+        if !block.iter().any(|l| l.contains(want)) {
+            return Err(format!(
+                "the `\"main\"` block ({} lines) does not name `{want}`, where the main thread was blocked",
+                block.len()
+            ));
+        }
+    }
+    if !dump.iter().any(|l| l.contains(SIGQUIT_BLOCKER)) {
+        return Err(format!(
+            "the dump lacks the thread {SIGQUIT_BLOCKER}: unattached threads were not dumped"
+        ));
+    }
+    Ok(format!(
+        "kill -QUIT -> dump over in {} ms, {} lines; `\"main\"` in {SIGQUIT_NATIVE} (native + Java frame); the all-signals-blocked thread dumped without its stack; process ran on",
+        field("ms"),
+        dump.len()
+    ))
 }
 
 /// Stage 10's steps and what each must print (the app gate checks the same table, app.rs player_failures): Happy Jump's sequence, `start()` in Idle as AOSP answers it (MediaPlayer.cpp returns INVALID_OPERATION; _start's process_media_player_call throws nothing for it: exception NULL reports MEDIA_ERROR to the listener, android_media_MediaPlayer.cpp:193-199, 425-434).
@@ -1240,6 +1333,61 @@ mod tests {
             stdout: stdout.to_owned(),
             stderr: String::new(),
         }
+    }
+
+    /// A sigquit-mode run: the shim's report, stderr, the exit status.
+    fn sigquit_run(report: &str, stderr: &str, ok: bool) -> ArtRun {
+        ArtRun {
+            ok,
+            code: Some(if ok { 0 } else { 1 }),
+            signal: None,
+            status: format!("exit status: {}", if ok { 0 } else { 1 }),
+            stdout: format!("nlt sigquit {report}\nnlt after alive\n"),
+            stderr: stderr.to_owned(),
+        }
+    }
+
+    #[test]
+    fn sigquit_check() {
+        // the dump's shape as the palette's LOG(INFO) prints it (measured fossify-math run, 2026-11-17), trimmed to the lines the check reads
+        let dump = "I x: signal_catcher.cc:179] reacting to signal 3\n\
+            I x: palette_fake.cc:54] ----- pid 7 at 2026-11-17 -----\n\
+            I x: palette_fake.cc:54] \"main\" prio=5 tid=1 Native\n\
+            I x: palette_fake.cc:54]   native: #03 pc 0001 /x/libnlt_shim.so (Java_NativeLoad_blockForDump+40)\n\
+            I x: palette_fake.cc:54]   at NativeLoad.blockForDump(Native method)\n\
+            I x: palette_fake.cc:54] \"nlt-sigblock\" sysTid=9\n\
+            I x: palette_fake.cc:54]   native: (Unwind failed for thread 9: Thread blocks the unwind signal)\n\
+            I x: palette_fake.cc:54] ----- end 7 -----\n";
+        let good = "unblocked= catcher=true done=true ms=300";
+        assert!(sigquit_result(&sigquit_run(good, dump, true)).is_ok());
+        let unblocked = "unblocked=atl-pcm-output catcher=true done=true ms=300";
+        assert!(
+            sigquit_result(&sigquit_run(unblocked, dump, true))
+                .unwrap_err()
+                .contains("atl-pcm-output")
+        );
+        let late = "unblocked= catcher=true done=false ms=5000";
+        assert!(
+            sigquit_result(&sigquit_run(late, dump, true))
+                .unwrap_err()
+                .contains("not over")
+        );
+        assert!(
+            sigquit_result(&sigquit_run(late, "", true))
+                .unwrap_err()
+                .contains("never took")
+        );
+        // the native frame on another thread: "main" must name it itself
+        let moved = dump.replace(
+            "  native: #03 pc 0001 /x/libnlt_shim.so (Java_NativeLoad_blockForDump+40)\n",
+            "",
+        ) + "I x: \"other\" prio=5\nI x: Java_NativeLoad_blockForDump\n";
+        assert!(
+            sigquit_result(&sigquit_run(good, &moved, true))
+                .unwrap_err()
+                .contains("Java_NativeLoad_blockForDump")
+        );
+        assert!(sigquit_result(&sigquit_run(good, dump, false)).is_err());
     }
 
     #[test]

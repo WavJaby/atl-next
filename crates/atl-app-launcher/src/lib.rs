@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! atl-app-launcher: starts an app process's runtime -- the one launch path (the broker will run it inside the sandbox; xtask and test harnesses run it now).
 //! dalvikvm's start (art/dalvikvm/dalvikvm.cc) through the standard seams only: the JNI invocation API, liblog's logger API, bionic's API. Steps:
-//! 0. what bionic sets up on Android before any code runs: the main thread's alternate signal stack (`ffi::install_signal_stack`), and debuggerd_init's crash-signal disposition, so a crash ends the process with its own signal (`ffi::install_crash_handler`; no tombstone).
+//! 0. the signal mask a zygote child inherits: ART's `BlockSignals` set blocked before any thread exists, so `kill -QUIT` reaches the SignalCatcher, which dumps every thread's stack to the app log (`ffi::block_runtime_signals`).
+//!    Then what bionic sets up on Android before any code runs: the main thread's alternate signal stack (`ffi::install_signal_stack`), and debuggerd_init's crash-signal disposition, so a crash ends the process with its own signal (`ffi::install_crash_handler`; no tombstone).
 //! 1. refuse to start without a property area: bionic's `__system_properties_init` maps `$ATL_PROP_AREA` (atl-android-paths `PROPERTY_AREA_ENV`), else `/dev/__properties__`; without it every property reads unset and the runtime runs on defaults no Android process sees.
 //!    Then (step 1b) the process's view of servicemanager (atl-service-view, feature `converter`): libbinder's default service manager, answering the names this process serves itself (its SurfaceFlinger) and forwarding the rest; it must precede any `defaultServiceManager()`.
 //!    Then (step 1d, app mode, UI mode) the Task's window, opened before ART boots and showing the starting window (`ro.atl.splash`) until the app's first frame (`open_window`); its toolkit is step 5b''.
@@ -285,6 +286,7 @@ fn native_bridge_options(property: Option<String>, isa: Option<&str>) -> Vec<std
 
 /// Steps 0 and 1: the signal setup bionic makes, ART's functions, and the refusal to start without a property area. Every process this library runs (app, installer) starts so.
 fn load_runtime() -> Result<ffi::Runtime> {
+    ffi::block_runtime_signals()?;
     ffi::install_signal_stack()?;
     ffi::install_crash_handler()?;
     let rt = ffi::Runtime::load()?;

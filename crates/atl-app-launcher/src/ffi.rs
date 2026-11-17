@@ -26,6 +26,13 @@ unsafe extern "C" {
     fn syscall(number: c_long, ...) -> c_long;
     fn getpid() -> c_int;
     fn sigfillset(set: *mut signal::__sigset_t) -> c_int;
+    fn sigemptyset(set: *mut signal::__sigset_t) -> c_int;
+    fn sigaddset(set: *mut signal::__sigset_t, sig: c_int) -> c_int;
+    fn sigprocmask(
+        how: c_int,
+        set: *const signal::__sigset_t,
+        old: *mut signal::__sigset_t,
+    ) -> c_int;
     fn sigaltstack(stack: *const signal::stack_t, old: *mut signal::stack_t) -> c_int;
 }
 // the declarations above have the host headers' signatures
@@ -1426,6 +1433,29 @@ pub fn install_signal_stack() -> Result<()> {
     // SAFETY: the stack is mapped read-write for the process's life (never unmapped); the previous one is not asked for
     let rc = unsafe { sigaltstack(&stack, core::ptr::null_mut()) };
     ensure!(rc == 0, "sigaltstack failed");
+    Ok(())
+}
+
+/// The set ART's `Runtime::BlockSignals` (art/runtime/runtime.cc) blocks on the thread that creates the VM: SIGQUIT and SIGUSR1 belong to its SignalCatcher thread (`sigwait`: thread dump, GC), SIGPIPE is ignored by blocking.
+const RUNTIME_SIGNALS: [c_int; 3] = [signal::SIGPIPE, signal::SIGQUIT, signal::SIGUSR1];
+
+/// Blocks [`RUNTIME_SIGNALS`] on the calling thread before any other thread exists, so every thread inherits the mask, as every thread of an AOSP app process does (zygote ran `BlockSignals` before forking it, single-threaded).
+/// Why: the launcher starts threads before `JNI_CreateJavaVM` (audio output, the window's toolkit); with SIGQUIT unblocked there the kernel delivered `kill -QUIT` to one of them, whose default action ended the process instead of the SignalCatcher dumping every thread's stack (measured 2026-11-17).
+/// A thread that unblocks one of them later takes deliveries away from the catcher, as on Android.
+/// An inherited SIG_IGN (a shell's background job) needs no reset: Linux never discards a signal the target thread blocks (kernel `sig_ignored`), so it stays pending for `sigwait` (measured 2026-11-17, native-load stage 11 under `trap '' QUIT`).
+pub fn block_runtime_signals() -> Result<()> {
+    let mut set = signal::__sigset_t { __val: [0; _] };
+    // SAFETY: a valid set to initialise
+    let rc = unsafe { sigemptyset(&mut set) };
+    ensure!(rc == 0, "sigemptyset failed");
+    for sig in RUNTIME_SIGNALS {
+        // SAFETY: an initialised set and a valid signal number
+        let rc = unsafe { sigaddset(&mut set, sig) };
+        ensure!(rc == 0, "sigaddset({sig}) failed");
+    }
+    // SAFETY: an initialised set; the old mask is not asked for. libsigchain's sigprocmask passes signals it has not claimed through unchanged
+    let rc = unsafe { sigprocmask(signal::SIG_BLOCK, &set, core::ptr::null_mut()) };
+    ensure!(rc == 0, "sigprocmask failed");
     Ok(())
 }
 

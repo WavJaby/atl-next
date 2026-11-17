@@ -223,8 +223,11 @@ const PCM_16: i32 = 2;
 const PCM_FLOAT: i32 = 4;
 
 type NewStringUtf = unsafe extern "C" fn(JniEnv, *const c_char) -> *mut c_void;
-type ForEachDeclared =
-    unsafe extern "C" fn(*const c_char, *mut c_void, unsafe extern "C" fn(*const c_char, *mut c_void));
+type ForEachDeclared = unsafe extern "C" fn(
+    *const c_char,
+    *mut c_void,
+    unsafe extern "C" fn(*const c_char, *mut c_void),
+);
 type DeclaredFn = unsafe extern "C" fn(*const c_char) -> bool;
 type CheckService = unsafe extern "C" fn(*const c_char) -> *mut c_void;
 type IsRemote = unsafe extern "C" fn(*const c_void) -> bool;
@@ -243,7 +246,8 @@ type FormatString = unsafe extern "C" fn(*mut c_void, *const c_char, *mut *const
 type FormatInt = unsafe extern "C" fn(*mut c_void, *const c_char, *mut i32) -> bool;
 type FormatDelete = unsafe extern "C" fn(*mut c_void) -> c_int;
 type CodecCreate = unsafe extern "C" fn(*const c_char) -> *mut c_void;
-type CodecConfigure = unsafe extern "C" fn(*mut c_void, *const c_void, *mut c_void, *mut c_void, u32) -> c_int;
+type CodecConfigure =
+    unsafe extern "C" fn(*mut c_void, *const c_void, *mut c_void, *mut c_void, u32) -> c_int;
 type CodecStatus = unsafe extern "C" fn(*mut c_void) -> c_int;
 type CodecDequeueIn = unsafe extern "C" fn(*mut c_void, i64) -> isize;
 type CodecBuffer = unsafe extern "C" fn(*mut c_void, usize, *mut usize) -> *mut u8;
@@ -282,7 +286,8 @@ fn lib_sym<T: Copy>(lib: &[u8], name: &[u8]) -> Option<T> {
 /// An NDK function from libmediandk as `$ty`, or the decode step's error when the library lacks it.
 macro_rules! ndk {
     ($name:literal, $ty:ty) => {
-        lib_sym::<$ty>(MEDIANDK, concat!($name, "\0").as_bytes()).ok_or(concat!("error=symbol:", $name))?
+        lib_sym::<$ty>(MEDIANDK, concat!($name, "\0").as_bytes())
+            .ok_or(concat!("error=symbol:", $name))?
     };
 }
 
@@ -294,8 +299,10 @@ type AshmemSize = unsafe extern "C" fn(c_int) -> c_int;
 
 /// libcutils' shared memory as Codec2 uses it (FMQ, linear blocks): create a region, map it, write + read back, size from ashmem_get_size_region. `ashmem=<size>`, else `error=ashmem:<step>`.
 fn ashmem_probe(out: &mut Vec<String>) -> Result<(), String> {
-    let create = lib_sym::<AshmemCreate>(CUTILS, b"ashmem_create_region\0").ok_or("error=ashmem:symbol")?;
-    let size_of = lib_sym::<AshmemSize>(CUTILS, b"ashmem_get_size_region\0").ok_or("error=ashmem:symbol")?;
+    let create =
+        lib_sym::<AshmemCreate>(CUTILS, b"ashmem_create_region\0").ok_or("error=ashmem:symbol")?;
+    let size_of =
+        lib_sym::<AshmemSize>(CUTILS, b"ashmem_get_size_region\0").ok_or("error=ashmem:symbol")?;
     // SAFETY: NUL-terminated name; the libcutils functions have the signatures above; the mapping is private to this block and unmapped before the fd closes.
     unsafe {
         let fd = create(c"nlt-ashmem".as_ptr(), ASHMEM_PROBE_SIZE);
@@ -303,7 +310,14 @@ fn ashmem_probe(out: &mut Vec<String>) -> Result<(), String> {
             return Err("error=ashmem:create".into());
         }
         let size = size_of(fd);
-        let p = libc::mmap(std::ptr::null_mut(), ASHMEM_PROBE_SIZE, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0);
+        let p = libc::mmap(
+            std::ptr::null_mut(),
+            ASHMEM_PROBE_SIZE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        );
         let mapped = p != libc::MAP_FAILED && {
             let last = p.cast::<u8>().add(ASHMEM_PROBE_SIZE - 1);
             last.write_volatile(0x5a);
@@ -342,7 +356,13 @@ fn store_probe(out: &mut Vec<String>) {
     };
     let mut names: Vec<String> = Vec::new();
     // SAFETY: IFACE is NUL-terminated; `collect` gets &mut names as its context, used only during this call.
-    unsafe { for_each(IFACE.as_ptr().cast(), (&mut names as *mut Vec<String>).cast(), collect) };
+    unsafe {
+        for_each(
+            IFACE.as_ptr().cast(),
+            (&mut names as *mut Vec<String>).cast(),
+            collect,
+        )
+    };
     // SAFETY: STORE is NUL-terminated.
     let is_decl = unsafe { declared(STORE.as_ptr().cast()) };
     // SAFETY: STORE is NUL-terminated; a non-null result holds one strong reference, released below.
@@ -359,7 +379,11 @@ fn store_probe(out: &mut Vec<String>) {
     out.push(format!("declared={}", u8::from(is_decl)));
     out.push(format!(
         "instances={}",
-        if names.is_empty() { "-".to_owned() } else { names.join(",") }
+        if names.is_empty() {
+            "-".to_owned()
+        } else {
+            names.join(",")
+        }
     ));
     out.push(format!("store={store}"));
 }
@@ -401,7 +425,10 @@ unsafe extern "C" fn collect(instance: *const c_char, context: *mut c_void) {
 /// Decodes the clip `input` to raw PCM at `output`, pushing key=value pairs to `out`; an Err (`error=<step>...`) names the step that failed.
 fn decode(input: &str, output: &str, out: &mut Vec<String>) -> Result<(), String> {
     let file = File::open(input).map_err(|e| format!("error=open:{e}"))?;
-    let size = file.metadata().map_err(|e| format!("error=open:{e}"))?.len();
+    let size = file
+        .metadata()
+        .map_err(|e| format!("error=open:{e}"))?
+        .len();
     let mut pcm = File::create(output).map_err(|e| format!("error=output:{e}"))?;
     let new_extractor = ndk!("AMediaExtractor_new", ExtractorNew);
     let set_fd = ndk!("AMediaExtractor_setDataSourceFd", ExtractorSetFd);
@@ -503,7 +530,9 @@ fn decode(input: &str, output: &str, out: &mut Vec<String>) -> Result<(), String
                 -1 => {
                     idle += 1;
                     if idle > IDLE_POLLS {
-                        return Err(format!("error=output:no output for {IDLE_POLLS} polls, bytes={bytes}"));
+                        return Err(format!(
+                            "error=output:no output for {IDLE_POLLS} polls, bytes={bytes}"
+                        ));
                     }
                 }
                 -2 => {
@@ -524,12 +553,15 @@ fn decode(input: &str, output: &str, out: &mut Vec<String>) -> Result<(), String
                     let off = info.offset.max(0) as usize;
                     let len = info.size.max(0) as usize;
                     if buf.is_null() || off + len > cap {
-                        return Err(format!("error=output:buffer offset={off} size={len} cap={cap}"));
+                        return Err(format!(
+                            "error=output:buffer offset={off} size={len} cap={cap}"
+                        ));
                     }
                     if len > 0 {
                         // SAFETY: buf is the codec's output buffer of cap bytes; off + len <= cap was checked above.
                         let data = std::slice::from_raw_parts(buf.add(off), len);
-                        pcm.write_all(data).map_err(|e| format!("error=output:{e}"))?;
+                        pcm.write_all(data)
+                            .map_err(|e| format!("error=output:{e}"))?;
                     }
                     bytes += len as u64;
                     done = info.flags & FLAG_EOS != 0;
@@ -544,7 +576,9 @@ fn decode(input: &str, output: &str, out: &mut Vec<String>) -> Result<(), String
             other => return Err(format!("error=pcm-encoding:{other}")),
         };
         let frames = bytes / (channels.max(1) as u64 * bps);
-        out.push(format!("frames={frames} bytes={bytes} channels={channels} rate={rate} pcm={enc}"));
+        out.push(format!(
+            "frames={frames} bytes={bytes} channels={channels} rate={rate} pcm={enc}"
+        ));
     }
     Ok(())
 }
@@ -579,6 +613,103 @@ pub extern "C" fn Java_NativeLoad_decodeFile(
         out.push(e);
     }
     let text = CString::new(out.join(" ")).unwrap_or_default();
+    // SAFETY: env is the calling thread's JNIEnv; NewStringUTF copies the NUL-terminated text into a new local reference.
+    unsafe {
+        let table = *(env as *const *const *mut c_void);
+        let new_string: NewStringUtf = std::mem::transmute(*table.add(NEW_STRING_UTF));
+        new_string(env, text.as_ptr())
+    }
+}
+
+/// Stage 11's thread that blocks every signal, as glib's and mesa's threads do: on glibc it blocks the unwinder's SIGRTMIN too, so the dump cannot signal it.
+const SIGBLOCK_THREAD: &str = "nlt-sigblock";
+/// Upper bound of stage 11's wait for the dump: below libunwindstack's 10 s per-thread signal timeout (ThreadEntry::Wait), so a dump that signals [`SIGBLOCK_THREAD`] runs past it; a measured dump of 50 threads took 0.32 s (2026-11-17).
+const DUMP_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// One poll of the catcher's state.
+const POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// /proc/self/task/<tid>/<file>, trimmed; empty when unreadable.
+fn task_file(tid: &str, file: &str) -> String {
+    std::fs::read_to_string(format!("/proc/self/task/{tid}/{file}"))
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
+}
+
+/// The value of field `key` (with its colon) of the thread's status file.
+fn status_field(tid: &str, key: &str) -> Option<String> {
+    task_file(tid, "status")
+        .lines()
+        .find_map(|l| l.strip_prefix(key).map(|v| v.trim().to_owned()))
+}
+
+/// `static native String blockForDump()`: the process's own SIGQUIT, the main thread blocked in this function while ART's SignalCatcher dumps.
+/// Starts [`SIGBLOCK_THREAD`]; lists threads other than the catcher that leave SIGQUIT unblocked (the kernel may hand them a process-directed SIGQUIT: default action, the process ends); sends SIGQUIT to the process (`kill`, as a shell's `kill -QUIT <pid>`); waits until the catcher sleeps in `sigtimedwait` again after a context switch (dump over) or [`DUMP_LIMIT`].
+/// Returns `unblocked=<comm,...> done=<bool> ms=<wait>`.
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn Java_NativeLoad_blockForDump(env: JniEnv, _class: *mut c_void) -> *mut c_void {
+    let (ready, started) = std::sync::mpsc::channel::<()>();
+    let _ = std::thread::Builder::new()
+        .name(SIGBLOCK_THREAD.into())
+        .spawn(move || {
+            // SAFETY: a full set, applied to this thread only
+            unsafe {
+                let mut all: libc::sigset_t = std::mem::zeroed();
+                libc::sigfillset(&mut all);
+                libc::pthread_sigmask(libc::SIG_SETMASK, &all, std::ptr::null_mut());
+            }
+            let _ = ready.send(());
+            loop {
+                std::thread::park();
+            }
+        });
+    let _ = started.recv();
+    let tids: Vec<String> = std::fs::read_dir("/proc/self/task")
+        .map(|d| {
+            d.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    let quit_bit = 1u64 << (libc::SIGQUIT - 1);
+    let mut unblocked = Vec::new();
+    let mut catcher = None;
+    for tid in &tids {
+        let comm = task_file(tid, "comm");
+        if comm == "Signal Catcher" {
+            catcher = Some(tid.clone());
+            continue;
+        }
+        let blocked = status_field(tid, "SigBlk:").and_then(|v| u64::from_str_radix(&v, 16).ok());
+        if blocked.is_none_or(|b| b & quit_bit == 0) {
+            unblocked.push(comm);
+        }
+    }
+    let switches = |tid: &str| {
+        status_field(tid, "voluntary_ctxt_switches:").and_then(|v| v.parse::<u64>().ok())
+    };
+    let start = std::time::Instant::now();
+    let mut done = false;
+    if let Some(tid) = &catcher {
+        let before = switches(tid);
+        // SAFETY: a signal to this process
+        unsafe { libc::kill(libc::getpid(), libc::SIGQUIT) };
+        while start.elapsed() < DUMP_LIMIT {
+            std::thread::sleep(POLL);
+            if switches(tid) > before && task_file(tid, "wchan") == "do_sigtimedwait" {
+                done = true;
+                break;
+            }
+        }
+    }
+    let text = CString::new(format!(
+        "unblocked={} catcher={} done={done} ms={}",
+        unblocked.join(","),
+        catcher.is_some(),
+        start.elapsed().as_millis()
+    ))
+    .unwrap_or_default();
     // SAFETY: env is the calling thread's JNIEnv; NewStringUTF copies the NUL-terminated text into a new local reference.
     unsafe {
         let table = *(env as *const *const *mut c_void);
