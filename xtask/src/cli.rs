@@ -169,6 +169,10 @@ pub fn main() -> Result<ExitCode> {
             env.push(("CARGO_TARGET_DIR", target.into_os_string()));
         }
         if let Some(code) = tree::enter(&overlays, shell, &env)? {
+            // the outer process settles: the re-exec inside skips it (tree::ENV); without this a checkout that only builds never gets its link
+            if let Err(e) = crate::out::settle_target(&root) {
+                eprintln!("out: target: {e:#}");
+            }
             return Ok(code);
         }
     }
