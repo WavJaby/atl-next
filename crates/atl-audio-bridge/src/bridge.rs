@@ -34,10 +34,14 @@ pub(crate) mod ffi {
             channel_mask: u32,
             rate: u32,
         ) -> bool;
-        fn mix_remove(mix: Pin<&mut Mix>, name: i32);
-        fn mix_enable(mix: Pin<&mut Mix>, track: Pin<&mut Track>, name: i32, on: bool);
+        fn mix_remove(mix: Pin<&mut Mix>, track: Pin<&mut Track>, name: i32) -> u64;
+        fn mix_start(mix: Pin<&mut Mix>, track: Pin<&mut Track>, name: i32);
+        fn mix_pause(mix: Pin<&mut Mix>, name: i32);
+        fn mix_stop(mix: Pin<&mut Mix>, track: Pin<&mut Track>, name: i32);
+        fn mix_flush(mix: Pin<&mut Mix>, track: Pin<&mut Track>, name: i32);
         fn mix_render(mix: Pin<&mut Mix>, out: &mut [f32]);
         fn take_track_frames() -> u64;
         fn muted_tracks() -> u32;
+        fn active_tracks() -> u32;
     }
 }

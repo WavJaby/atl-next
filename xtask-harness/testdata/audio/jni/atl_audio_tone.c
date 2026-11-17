@@ -20,7 +20,7 @@
 #define SLES_BUFFERS 2
 // how long the caller waits for the last callback / the last frame, past the tone's own length
 #define DRAIN_MS 2000
-// after the last frame was handed out, how long the caller lets the track's buffer (a few thousand frames, under 0.1 s at 48 kHz) play before it stops the player
+// after the last frame was handed out, how long the caller lets the track's buffer (a few thousand frames, under 0.1 s at 48 kHz) play before it destroys the player: a stopped track drains, but a destroyed one is not mixed again (AOSP destroyTrack_l)
 #define PLAYOUT_MS 500
 
 #ifdef ATL_TONE_SILENT
@@ -136,7 +136,7 @@ JNIEXPORT jstring JNICALL Java_com_example_atlaudio_Main_slesTone(JNIEnv *env, j
     int64_t limit = now_ms() + (int64_t)frames * 1000 / rate + DRAIN_MS;
     while ((g_sles.tone.next < g_sles.tone.frames || g_sles.callbacks < g_sles.enqueued) && now_ms() < limit)
         usleep(10000);
-    // a buffer's callback means the track took it, not that it played: let the track's buffer play out before stopping (ATL's stop does not drain yet)
+    // a buffer's callback means the track took it, not that it played; wilhelm stops the track itself once its queue runs dry, and the stopped track drains: let it play out before Destroy
     usleep(PLAYOUT_MS * 1000);
     (*play)->SetPlayState(play, SL_PLAYSTATE_STOPPED);
     snprintf(msg, sizeof msg, "sles enqueued=%d callbacks=%d failed=%d", g_sles.enqueued, g_sles.callbacks, g_sles.failed);
@@ -156,12 +156,14 @@ static struct {
     volatile int done;
 } g_aaudio;
 
-// past the tone the callback hands out silence and continues; the caller stops the stream after PLAYOUT_MS. Not AAUDIO_CALLBACK_RESULT_STOP: that stops the track at once, and ATL's stop drops the frames still buffered (AOSP drains them)
+// the common app pattern: once the tone is out, the next callback returns AAUDIO_CALLBACK_RESULT_STOP and the stream stops itself; the stopped track plays out what was written. Not in the callback that writes the tail: AOSP discards the frames of a callback that returns STOP (AudioStreamLegacy processCallbackCommon)
 static aaudio_data_callback_result_t aaudio_cb(AAudioStream *stream, void *user, void *audio, int32_t frames)
 {
-    tone_fill(&g_aaudio.tone, audio, frames);
-    if (g_aaudio.tone.next >= g_aaudio.tone.frames)
+    if (g_aaudio.tone.next >= g_aaudio.tone.frames) {
         g_aaudio.done = 1;
+        return AAUDIO_CALLBACK_RESULT_STOP;
+    }
+    tone_fill(&g_aaudio.tone, audio, frames);
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
@@ -205,7 +207,7 @@ JNIEXPORT jstring JNICALL Java_com_example_atlaudio_Main_aaudioTone(JNIEnv *env,
         int64_t limit = now_ms() + (int64_t)frames * 1000 / rate + DRAIN_MS;
         while (rc_start == AAUDIO_OK && !g_aaudio.done && now_ms() < limit)
             usleep(10000);
-        // the last callback's frames are still in the track's buffer: let them play out before stopping
+        // the stream stopped itself; its track drains: let it play out before close destroys it
         usleep(PLAYOUT_MS * 1000);
         rc_stop = stop(s);
         rc_close = close(s);

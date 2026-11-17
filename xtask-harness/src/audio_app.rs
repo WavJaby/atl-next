@@ -2,7 +2,7 @@
 //! `xtask test audio-app`: the audio gate of A1a (AudioFlinger and AudioPolicyService served) and A1b (createTrack and IAudioTrack). The test APK (xtask-harness/testdata/audio) is started by atld as the app gate's is; its process asks the audio services for the session ids and the minimum buffer, builds a track and a low-latency track, and logs their state, piid and frame count.
 //! Expected values are AOSP's formulas worked here over the served output, not the code under test: AudioSystem::calculateMinFrameCount (AudioSystem.cpp:486) with sourceFramesNeededWithTimestretch (AudioResamplerPublic.h:84-110) at speed 1.0, and AudioFlinger's streaming-track roundup to a power of two (Tracks.cpp:162).
 //! The served profile is the PCM output's granted rate and quantum (game audio A2), which on this host are PipeWire's defaults: [`SPEC_RATE_HZ`] and the others copy them, so a different graph must change these too (a mismatch is a red gate).
-//! PCM (A2): the fixture plays a static track, a streaming track, a float streaming track, then from its NDK library (jni/atl_audio_tone.c) an OpenSL ES buffer-queue player and an AAudio callback stream, each a tone (Main.java `pcm`); the native two are also checked on their own counts and the `sles-flow:` counters (`native_verdicts`). `--break-tone` builds that library silent: the two native runs must be missing. The output's sink is a null sink the gate makes the default for the run, and its monitor is recorded with `pw-record` (audio_pcm.rs). The recording must hold three runs of tone with the frequency, length and level the fixture's input gives, and no sample beyond full scale. Expected values come from the constants below, never from the server.
+//! PCM (A2): the fixture plays a static track, a streaming track, a float streaming track, then from its NDK library (jni/atl_audio_tone.c) an OpenSL ES buffer-queue player and an AAudio callback stream, each a tone (Main.java `pcm`); the native two are also checked on their own counts and the `sles-flow:` counters (`native_verdicts`). `--break-tone` builds that library silent: the two native runs must be missing. The output's sink is a null sink the gate makes the default for the run, and its monitor is recorded with `pw-record` (audio_pcm.rs). The recording must hold five runs of tone with the frequency, length and level the fixture's input gives, and no sample beyond full scale. Expected values come from the constants below, never from the server.
 //! Checks: session ids nonzero and distinct; getMinBufferSize equals the expected bytes (stereo, 16-bit); AudioManager's output rate and frames-per-buffer properties are the served profile's; a track reaches STATE_INITIALIZED with a nonzero piid (AudioTrack calls baseRegisterPlayer only after native_setup succeeds, AudioTrack.java:912) and the expected frame count; the low-latency track initialises although the server refuses FAST (counted); AudioFlinger's and AudioPolicyService's calls were answered in-process.
 //! `--break-serve` starts the app with `--no-audio-service` (atld, then the launcher): it serves neither name, so the session line must go red. `--break-cblk` starts it with `--break-cblk`: each streaming track's region is one buffer short, createTrack refuses it, and both streaming tracks fail to initialise (a static track has no buffer of its own to be short of). `--break-mix` starts it with `--break-mix`: the mixer plays silence, so the PCM checks find no tone and must go red. `--unreachable` makes the desktop's server a stale socket file (`PIPEWIRE_REMOTE` for atld): the app must still reach `done` (the launch is not fatal), its track must fail with STATE_UNINITIALIZED and a counted refusal, and no tone may reach the sink.
 
@@ -208,6 +208,9 @@ const SLES_FLOW: &str = "sles-flow: ";
 /// The mixer's counter line (atl-audioflinger output.rs) and its field of frames above silence; the gate wants one line with audible > 0 (the tones went through the mix, not around it).
 const MIX_LINE: &str = "audio-mix: ";
 const MIX_AUDIBLE: &str = "audible";
+/// Its field of streaming frames written but never mixed (unread when the track was removed, or flushed), and the line output.rs writes at each such removal.
+const MIX_DROPPED: &str = "dropped";
+const MIX_DROPPED_LINE: &str = "track removed with frames it never played";
 const TONE_DBFS: f64 = -12.0;
 /// Silence that separates two tone runs in the recording (the gap is about 0.5 s).
 const GAP_SECONDS: f64 = 0.2;
@@ -617,6 +620,25 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         "mixer audible",
         audible.is_some_and(|a| a > 0),
         &format!("largest `{MIX_LINE}{MIX_AUDIBLE}=` {audible:?}, want > 0"),
+    );
+    // every tone is played out before its track goes: a stopped track drains, so nothing the fixture wrote may be dropped. The removal line is written at once; the counters line may not come again before the process ends
+    let removals: Vec<&str> = app
+        .lines()
+        .chain(services.lines())
+        .filter(|l| l.contains(MIX_DROPPED_LINE))
+        .collect();
+    let dropped: i64 = app
+        .lines()
+        .chain(services.lines())
+        .filter_map(|l| field(l.split(MIX_LINE).nth(1), MIX_DROPPED))
+        .sum();
+    ok &= verdict(
+        "mixer dropped",
+        removals.is_empty() && dropped == 0,
+        &format!(
+            "`{MIX_LINE}{MIX_DROPPED}=` sum {dropped}, {} `{MIX_DROPPED_LINE}` line(s) {removals:?}, want 0 and none",
+            removals.len()
+        ),
     );
     ok &= native_verdicts(&app, &services);
     let pcm = fs::read(&wav)

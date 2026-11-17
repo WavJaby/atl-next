@@ -31,6 +31,11 @@ pub fn muted_tracks() -> u32 {
     bridge::ffi::muted_tracks()
 }
 
+/// Tracks enabled in the mix, draining ones included.
+pub fn active_tracks() -> u32 {
+    bridge::ffi::active_tracks()
+}
+
 /// A shared mapping of a file range, unmapped on drop. Pointers into it are valid while it lives.
 pub struct Mapping {
     base: *mut c_void,
@@ -108,8 +113,6 @@ impl Drop for Mapping {
 pub struct Track {
     proxy: UniquePtr<bridge::ffi::Track>,
     rate: u32,
-    /// Enabled in its [`Mix`] (the last [`Mix::set_active`]).
-    enabled: bool,
     _cblk: Mapping,
     _buffer: Option<Mapping>,
 }
@@ -149,7 +152,6 @@ impl Track {
         Ok(Self {
             proxy,
             rate,
-            enabled: false,
             _cblk: cblk,
             _buffer: None,
         })
@@ -195,11 +197,23 @@ impl Track {
         Ok(Self {
             proxy,
             rate,
-            enabled: false,
             _cblk: cblk,
             _buffer: Some(buffer),
         })
     }
+}
+
+/// What an IAudioTrack playback call does to a track in the mix (AOSP Track::start / pause / stop / flush for a normal mixed track).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Control {
+    /// Starts the server side, follows the client's volume and enables the track; a draining track plays on.
+    Start,
+    /// Disables the track; its unread frames stay.
+    Pause,
+    /// A streaming track plays out what the client wrote before its stop, then leaves the mix; a static one leaves at once.
+    Stop,
+    /// Discards the unread frames of a track the mixer is not reading; a draining one ends at its next quantum.
+    Flush,
 }
 
 /// The output's mixer: AudioMixerBase at one quantum and the output's rate, with the tracks added to it by name.
@@ -241,27 +255,27 @@ impl Mix {
         Some(name)
     }
 
-    /// Removes track `name`: the mixer forgets it first, then the track and its mappings are dropped.
-    pub fn remove(&mut self, name: i32) {
-        if self.tracks.contains_key(&name) {
-            bridge::ffi::mix_remove(self.inner.pin_mut(), name);
-        }
-        self.tracks.remove(&name);
+    /// Removes track `name`: the mixer forgets it first, then the track and its mappings are dropped. Returns the frames it never played (unread or flushed); 0 for an unknown name.
+    pub fn remove(&mut self, name: i32) -> u64 {
+        let Some(mut track) = self.tracks.remove(&name) else {
+            return 0;
+        };
+        bridge::ffi::mix_remove(self.inner.pin_mut(), track.proxy.pin_mut(), name)
     }
 
-    /// Enables (`on`) or disables track `name` in the mix; enabling starts its server side and follows the client's volume. False for an unknown name.
-    pub fn set_active(&mut self, name: i32, on: bool) -> bool {
+    /// Applies an IAudioTrack playback call to track `name` (see [`Control`]). False for an unknown name.
+    pub fn control(&mut self, name: i32, call: Control) -> bool {
         let Some(track) = self.tracks.get_mut(&name) else {
             return false;
         };
-        bridge::ffi::mix_enable(self.inner.pin_mut(), track.proxy.pin_mut(), name, on);
-        track.enabled = on;
+        let (mix, proxy) = (self.inner.pin_mut(), track.proxy.pin_mut());
+        match call {
+            Control::Start => bridge::ffi::mix_start(mix, proxy, name),
+            Control::Pause => bridge::ffi::mix_pause(mix, name),
+            Control::Stop => bridge::ffi::mix_stop(mix, proxy, name),
+            Control::Flush => bridge::ffi::mix_flush(mix, proxy, name),
+        }
         true
-    }
-
-    /// Tracks enabled in the mix.
-    pub fn active(&self) -> usize {
-        self.tracks.values().filter(|t| t.enabled).count()
     }
 
     /// Fills `out` (interleaved stereo) with the next frames of the mix: one AudioMixerBase quantum at a time, any request size.

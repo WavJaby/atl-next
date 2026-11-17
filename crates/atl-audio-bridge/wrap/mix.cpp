@@ -28,6 +28,16 @@ void* as_value(uint32_t v) {
 /// Counters for the output's line (atl-audioflinger output.rs): written by the realtime fill, read by the output's thread.
 std::atomic<uint64_t> g_track_frames{0};
 std::atomic<uint32_t> g_muted{0};
+/// Enabled tracks: a drain ends in the fill, so the level is kept here, not by the control calls.
+std::atomic<uint32_t> g_active{0};
+
+/// Disables track `name` and forgets it as enabled (a pause, a static stop, a finished drain).
+void disable(Mix& mix, int32_t name) {
+    mix.disable(name);
+    mix.enabled.erase(name);
+    mix.draining.erase(name);
+    g_active.store(static_cast<uint32_t>(mix.enabled.size()), std::memory_order_relaxed);
+}
 
 /// The client's volume (cblk mVolumeLR, gain_minifloat) applied to track `name`, as AudioFlinger's prepareTracks does every cycle. True when both sides are zero.
 bool apply_volume(Mix& mix, Track& track, int32_t name) {
@@ -41,8 +51,9 @@ bool apply_volume(Mix& mix, Track& track, int32_t name) {
 
 }  // namespace
 
-Track::Track(android::sp<android::AudioTrackServerProxy> server, audio_format_t track_format, size_t channels_per_frame)
-    : proxy(std::move(server)), format(track_format), channels(channels_per_frame) {}
+Track::Track(android::sp<android::AudioTrackServerProxy> server, audio_format_t track_format, size_t channels_per_frame,
+             bool shared_buffer)
+    : proxy(std::move(server)), format(track_format), channels(channels_per_frame), is_static(shared_buffer) {}
 
 // Track::getNextBuffer (Tracks.cpp:1252): the proxy hands out what the client has written, in the track's format. The mixer reads float (AudioMixerBase::create sets mMixerInFormat to PCM_FLOAT; nothing changes it), so the frames go through AOSP's conversion: the copy ReformatBufferProvider::copyFrames makes (BufferProviders.cpp:412), which AudioMixer inserts for any track format other than the mixer's. That class is not linked: its object needs libaudiohal (EffectsFactoryHalInterface) and libsonic.
 // A float track is copied as is (memcpy_by_audio_format of equal formats is a memcpy), still into `floats`: one buffer shape for every format.
@@ -102,7 +113,8 @@ std::unique_ptr<Track> new_track(uint8_t* cblk_mem, uint8_t* buffer, uint32_t fo
                                                     /*clientInServer=*/false, rate);
     }
     // one sample per channel: frame_bytes is channels x audio_bytes_per_sample(format) (createTrack_l's frameSize)
-    return std::make_unique<Track>(std::move(server), track_format, frame_bytes / audio_bytes_per_sample(track_format));
+    return std::make_unique<Track>(std::move(server), track_format, frame_bytes / audio_bytes_per_sample(track_format),
+                                   is_static);
 }
 
 std::unique_ptr<Mix> new_mix(size_t quantum_frames, uint32_t rate) {
@@ -129,25 +141,50 @@ bool mix_add(Mix& mix, Track& track, int32_t name, int32_t session, uint32_t cha
     return true;
 }
 
-void mix_remove(Mix& mix, int32_t name) {
-    if (!mix.exists(name)) {
-        return;
+// A removed track is not mixed again, draining or not: AOSP's destroyTrack_l terminates it (Threads.cpp:3021-3026) and prepareTracks_l mixes no terminated track.
+// A static track's buffer stays the client's to replay, so it never counts as dropped (Tracks.cpp:1321-1325 gives it no frames once stopped).
+uint64_t mix_remove(Mix& mix, Track& track, int32_t name) {
+    uint64_t dropped = 0;
+    if (!track.is_static) {
+        const uint64_t unread = track.proxy->framesReady();
+        dropped = unread + static_cast<uint64_t>(std::max<int64_t>(track.proxy->framesFlushed(), 0));
     }
-    mix.disable(name);
-    mix.enabled.erase(name);
-    mix.destroy(name);
+    if (mix.exists(name)) {
+        disable(mix, name);
+        mix.destroy(name);
+    }
+    return dropped;
 }
 
-void mix_enable(Mix& mix, Track& track, int32_t name, bool on) {
-    if (!on) {
-        mix.disable(name);
-        mix.enabled.erase(name);
-        return;
-    }
+void mix_start(Mix& mix, Track& track, int32_t name) {
+    // a draining track resumes: start lifts the client's stop limit (AudioTrackServerProxy::start)
     track.proxy->start();
+    mix.draining.erase(name);
     apply_volume(mix, track, name);
     mix.enabled[name] = &track;
     mix.enable(name);
+    g_active.store(static_cast<uint32_t>(mix.enabled.size()), std::memory_order_relaxed);
+}
+
+void mix_pause(Mix& mix, int32_t name) {
+    disable(mix, name);
+}
+
+// Track::stop (Tracks.cpp:1550-1553): a normal mixed track goes to STOPPED and stays active; prepareTracks_l keeps mixing it with minFrames 1 (Threads.cpp:5976-5980) until framesReady, bounded by the client's stop position (AudioTrackServerProxy::getRear), is 0, then removes it (:6297-6309).
+// A static track has no frames once stopped (Tracks.cpp:1321-1325): it leaves the mix now.
+void mix_stop(Mix& mix, Track& track, int32_t name) {
+    if (track.is_static || mix.enabled.count(name) == 0) {
+        disable(mix, name);
+        return;
+    }
+    mix.draining.insert(name);
+}
+
+// Track::flush (Tracks.cpp:1646-1648): a track the mixer is not reading is flushed now, so the client can refill it while stopped or paused. A draining track's flush is applied by its next framesReady in the fill, which then ends the drain.
+void mix_flush(Mix& mix, Track& track, int32_t name) {
+    if (mix.enabled.count(name) == 0) {
+        track.proxy->flushBufferIfNeeded();
+    }
 }
 
 // AudioMixerBase::process() makes one quantum; the output takes it frame by frame, so a request of any size is served from it.
@@ -155,6 +192,13 @@ void mix_render(Mix& mix, rust::Slice<float> out) {
     const size_t frames = out.size() / kOutChannels;
     for (size_t done = 0; done < frames;) {
         if (mix.next == mix.quantum) {
+            // a stopped track whose frames up to its stop position are all mixed leaves the mix (prepareTracks_l, Threads.cpp:6297-6309)
+            for (auto it = mix.draining.begin(); it != mix.draining.end();) {
+                const int32_t name = *it++;
+                if (mix.enabled.at(name)->proxy->framesReady() == 0) {
+                    disable(mix, name);
+                }
+            }
             uint32_t muted = 0;
             for (auto& [name, track] : mix.enabled) {
                 muted += apply_volume(mix, *track, name) ? 1 : 0;
@@ -178,6 +222,10 @@ uint64_t take_track_frames() {
 
 uint32_t muted_tracks() {
     return g_muted.load(std::memory_order_relaxed);
+}
+
+uint32_t active_tracks() {
+    return g_active.load(std::memory_order_relaxed);
 }
 
 }  // namespace atl::audio

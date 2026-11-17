@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <set>
 #include <vector>
 
 #include "media/AudioBufferProvider.h"
@@ -20,7 +21,8 @@ namespace atl::audio {
 
 /// One track's server side: the proxy over its control block and buffer, read in the track's format and handed to the mixer as float (Track::getNextBuffer).
 struct Track final : public android::AudioBufferProvider {
-    Track(android::sp<android::AudioTrackServerProxy> server, audio_format_t track_format, size_t channels_per_frame);
+    Track(android::sp<android::AudioTrackServerProxy> server, audio_format_t track_format, size_t channels_per_frame,
+          bool shared_buffer);
     android::status_t getNextBuffer(Buffer* buffer) override;
     void releaseBuffer(Buffer* buffer) override;
 
@@ -31,6 +33,8 @@ struct Track final : public android::AudioBufferProvider {
     size_t channels;
     /// The float frames the mixer reads: one quantum, sized by mix_add outside the realtime fill.
     std::vector<float> floats;
+    /// A shared-buffer (static) track: StaticAudioTrackServerProxy over the client's buffer.
+    bool is_static;
     /// The server buffer the last getNextBuffer obtained; releaseBuffer gives it back.
     void* server_raw = nullptr;
 };
@@ -45,8 +49,10 @@ struct Mix final : public android::AudioMixerBase {
     size_t quantum;
     std::vector<float> out;
     size_t next = 0;
-    /// The enabled tracks by name: each quantum reads their client volume, as AudioFlinger's prepareTracks does every cycle. Changed only by control calls, so the fill iterates it without allocating.
+    /// The enabled tracks by name: each quantum reads their client volume, as AudioFlinger's prepareTracks does every cycle. Control calls add and remove; the fill only removes (a finished drain), which frees and never allocates.
     std::map<int32_t, Track*> enabled;
+    /// Stopped streaming tracks still enabled until their written frames are mixed (a subset of `enabled`); the fill ends each drain.
+    std::set<int32_t> draining;
 };
 
 /// sizeof(audio_track_cblk_t) on x86_64 (LP64), the layout the Rust side maps: checked against AudioTrackShared.h at compile time (the static_assert in mix.cpp).
@@ -57,14 +63,23 @@ std::unique_ptr<Track> new_track(uint8_t* cblk, uint8_t* buffer, uint32_t format
 std::unique_ptr<Mix> new_mix(size_t quantum_frames, uint32_t rate);
 /// AudioMixerBase::create (the track's format, `channel_mask`, `session`) under track name `name`, with the track's buffer provider and float mixing; the track starts disabled. False when AOSP refuses it.
 bool mix_add(Mix& mix, Track& track, int32_t name, int32_t session, uint32_t channel_mask, uint32_t rate);
-void mix_remove(Mix& mix, int32_t name);
-/// On: starts the server side (AudioTrackServerProxy::start), follows the client's volume and enables the track. Off: disables it.
-void mix_enable(Mix& mix, Track& track, int32_t name, bool on);
+/// Removes track `name` from the mixer. Returns the frames the track will never play: unread (AudioTrackServerProxy::framesReady, which first applies a pending client flush) plus discarded by flushes (ServerProxy::framesFlushed).
+uint64_t mix_remove(Mix& mix, Track& track, int32_t name);
+/// IAudioTrack.start: starts the server side (AudioTrackServerProxy::start), follows the client's volume and enables the track; a draining track plays on.
+void mix_start(Mix& mix, Track& track, int32_t name);
+/// IAudioTrack.pause: disables the track; its unread frames stay.
+void mix_pause(Mix& mix, int32_t name);
+/// IAudioTrack.stop: a streaming track plays out what the client wrote before its stop, then leaves the mix; a static one leaves at once.
+void mix_stop(Mix& mix, Track& track, int32_t name);
+/// IAudioTrack.flush: discards the unread frames of a track the mixer is not reading now; a draining one ends at its next quantum.
+void mix_flush(Mix& mix, Track& track, int32_t name);
 /// Fills `out` (interleaved stereo) with the next frames of the mix, one quantum at a time.
 void mix_render(Mix& mix, rust::Slice<float> out);
 /// Frames the mixer took from tracks (getNextBuffer) since the last call; resets the count.
 uint64_t take_track_frames();
 /// Enabled tracks whose client volume was zero in the last quantum.
 uint32_t muted_tracks();
+/// Tracks enabled in the mix, draining ones included.
+uint32_t active_tracks();
 
 }  // namespace atl::audio

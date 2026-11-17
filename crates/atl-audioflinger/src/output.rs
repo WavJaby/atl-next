@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use atl_audio_bridge::{Mix, MixCell, MixGuard, Track as Server};
+use atl_audio_bridge::{Control, Mix, MixCell, MixGuard, Track as Server};
 use atl_platform_ui::PlatformAudioHost;
 use atl_platform_ui::audio::{AudioHost, PcmOutput, PcmSpec};
 
@@ -63,23 +63,24 @@ static REQUESTED: AtomicU64 = AtomicU64::new(0);
 static MIXED: AtomicU64 = AtomicU64::new(0);
 static AUDIBLE: AtomicU64 = AtomicU64::new(0);
 static PEAK_BITS: AtomicU32 = AtomicU32::new(0);
-/// Tracks enabled in the mixer, stored by the control call that changed it.
-static ACTIVE: AtomicU32 = AtomicU32::new(0);
+/// Frames the client wrote that never reached the mix: unread when their track was removed, or discarded by a flush. Separates "dropped by the server" from "never written" when a recording comes up short.
+static DROPPED: AtomicU64 = AtomicU64::new(0);
 /// At most one counters line per this period (the diag lines' rate class: once per second at most).
 const COUNTERS_PERIOD: Duration = Duration::from_secs(1);
 
-/// One counters line `audio-mix: requested=N mixed=N audible=N peak=F active=N` with the deltas since the last; written while the output is open, zeros when silent.
+/// One counters line `audio-mix: requested=N mixed=N from_tracks=N audible=N peak=F active=N muted=N dropped=N` with the deltas since the last (active and muted are levels); written while the output is open, zeros when silent.
 fn log_counters() {
     let requested = REQUESTED.swap(0, Ordering::Relaxed);
     let mixed = MIXED.swap(0, Ordering::Relaxed);
     let audible = AUDIBLE.swap(0, Ordering::Relaxed);
     let peak = f32::from_bits(PEAK_BITS.swap(0, Ordering::Relaxed));
-    let active = ACTIVE.load(Ordering::Relaxed);
+    let active = atl_audio_bridge::active_tracks();
     let from_tracks = atl_audio_bridge::take_track_frames();
     let muted = atl_audio_bridge::muted_tracks();
+    let dropped = DROPPED.swap(0, Ordering::Relaxed);
     let _ = writeln!(
         std::io::stderr(),
-        "audio-mix: requested={requested} mixed={mixed} from_tracks={from_tracks} audible={audible} peak={peak:.4} active={active} muted={muted}"
+        "audio-mix: requested={requested} mixed={mixed} from_tracks={from_tracks} audible={audible} peak={peak:.4} active={active} muted={muted} dropped={dropped}"
     );
 }
 
@@ -224,14 +225,6 @@ fn render(mixer: &MixCell, out: &mut [f32], silent: bool) {
     PEAK_BITS.fetch_max(peak.to_bits(), Ordering::Relaxed);
 }
 
-/// Stores the mixer's enabled-track count for the counters line.
-fn note_active(mix: &Mix) {
-    ACTIVE.store(
-        u32::try_from(mix.active()).unwrap_or(u32::MAX),
-        Ordering::Relaxed,
-    );
-}
-
 /// The mixer, held by one control call. None before the output is open.
 fn lock(mixer: &Shared) -> Option<MixGuard<'_>> {
     mixer.hold()
@@ -247,20 +240,22 @@ pub(crate) fn add_track(
     lock(mixer)?.add(track, session, channel_mask)
 }
 
-/// Enables or disables track `name` in the mix.
-pub(crate) fn set_active(mixer: &Shared, name: i32, on: bool) {
-    if let Some(mut mix) = lock(mixer) {
-        if !mix.set_active(name, on) {
-            tracing::error!(name, "track unknown to the mixer");
-        }
-        note_active(&mix);
+/// Applies an IAudioTrack playback call to track `name` in the mix.
+pub(crate) fn control(mixer: &Shared, name: i32, call: Control) {
+    if let Some(mut mix) = lock(mixer)
+        && !mix.control(name, call)
+    {
+        tracing::error!(name, ?call, "track unknown to the mixer");
     }
 }
 
-/// Removes track `name` from the mix; its server side is dropped with it.
+/// Removes track `name` from the mix; its server side is dropped with it. Its streaming frames never played count as dropped.
 pub(crate) fn remove_track(mixer: &Shared, name: i32) {
     if let Some(mut mix) = lock(mixer) {
-        mix.remove(name);
-        note_active(&mix);
+        let dropped = mix.remove(name);
+        if dropped > 0 {
+            DROPPED.fetch_add(dropped, Ordering::Relaxed);
+            tracing::info!(name, dropped, "track removed with frames it never played");
+        }
     }
 }

@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
 //! A track's shared memory and its IAudioTrack (AOSP AudioFlinger's TrackBase and TrackHandle, Tracks.cpp / AudioFlinger.cpp).
 //! The region is a memfd: the control block (`audio_track_cblk_t`) followed by the streaming buffer, the layout AOSP's TrackBase allocates (Tracks.cpp, ALLOC_CBLK). The client maps it through getCblk and writes into it; the server maps the same region (atl-audio-bridge), and the output's mixer reads it. A static track's buffer is the client's own (its sharedBuffer fd), mapped by createTrack.
-//! start/stop/pause enable and disable the track in the mixer (output.rs). flush is not served yet: frames the mixer has not taken stay.
+//! start/pause/stop/flush drive the track in the mixer (output.rs, atl-audio-bridge `Control`) as AOSP's Track does for a normal mixed track: stop lets a streaming track play out what the client wrote before it, flush discards unread frames.
 
 use std::os::fd::OwnedFd;
 use std::sync::{Mutex, MutexGuard};
 
-use atl_audio_bridge::{Mapping, Track as Server};
+use atl_audio_bridge::{Control, Mapping, Track as Server};
 use atl_audioflinger_stubs::aidl::android::media::IAudioTrack::{BnAudioTrack, IAudioTrack};
 use binder::{BinderFeatures, Interface, StatusCode, Strong};
 use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
@@ -254,40 +254,47 @@ impl IAudioTrack for Track {
         }))
     }
 
-    /// Idle, stopped or paused -> active: enabled in the mixer. Starting an active track is a no-op (the client's own guard decides before it calls).
+    /// Idle, stopped (draining or not) or paused -> active: enabled in the mixer. Starting an active track is a no-op (the client's own guard decides before it calls).
     fn r#start(&self) -> binder::Result<i32> {
         atl_diag::answered(INTERFACE, "start");
         let mut state = self.state();
         if *state != State::Active {
             *state = State::Active;
-            output::set_active(&self.mixer, self.name, true);
+            output::control(&self.mixer, self.name, Control::Start);
         }
         Ok(NO_ERROR)
     }
 
+    /// Active or paused -> stopped (Tracks.cpp Track::stop). An active streaming track keeps playing what the client wrote before its stop (the client proxy's stop position bounds it), then leaves the mix.
     fn r#stop(&self) -> binder::Result<()> {
         atl_diag::answered(INTERFACE, "stop");
         let mut state = self.state();
         if matches!(*state, State::Active | State::Paused) {
             *state = State::Stopped;
-            output::set_active(&self.mixer, self.name, false);
+            output::control(&self.mixer, self.name, Control::Stop);
         }
         Ok(())
     }
 
+    /// Active -> paused: out of the mix, unread frames kept. A stopped track (draining or not) stays stopped (Track::pause acts on ACTIVE only for a non-offloaded track).
     fn r#pause(&self) -> binder::Result<()> {
         atl_diag::answered(INTERFACE, "pause");
         let mut state = self.state();
         if *state == State::Active {
             *state = State::Paused;
-            output::set_active(&self.mixer, self.name, false);
+            output::control(&self.mixer, self.name, Control::Pause);
         }
         Ok(())
     }
 
-    /// Discards the frames of a stopped or paused track (AOSP: no effect on a playing one). Not served yet: the mixer keeps what it has not taken.
+    /// Discards the unread frames of a stopped, paused or idle track and leaves it idle (Track::flush: FLUSHED, then reset to IDLE); no effect on an active one. The frames count as dropped when the track is removed.
     fn r#flush(&self) -> binder::Result<()> {
         atl_diag::answered(INTERFACE, "flush");
+        let mut state = self.state();
+        if *state != State::Active {
+            *state = State::Idle;
+            output::control(&self.mixer, self.name, Control::Flush);
+        }
         Ok(())
     }
 
