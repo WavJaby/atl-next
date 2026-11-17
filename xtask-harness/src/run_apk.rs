@@ -1069,10 +1069,7 @@ fn render_path_check(atld_log: &str, app: &str) -> Result<String, String> {
     if offered_not_taken {
         Err(format!("render path offered but not taken: {path}"))
     } else {
-        Ok(format!(
-            "render path {path}; buffer tier {tier}; {}",
-            crate::gdk_dmabuf::present_tier(app)
-        ))
+        Ok(format!("render path {path}; buffer tier {tier}"))
     }
 }
 

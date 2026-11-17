@@ -70,17 +70,6 @@ impl Verdict {
 /// GDK 4.18 `gdk_dmabuf_egl_import_dmabuf` (gdkdmabufegl.c): `Can't import dmabufs into GL, missing EGL or EGL_EXT_image_dma_buf_import_modifiers`, printed before each `Import of ... failed` when the GL context cannot import at all.
 const NO_IMPORT: &str = "Can't import dmabufs into GL";
 
-/// One run's present tier for its summary line: the [`Verdict::tier`] name, `not logged` when GTK printed no dmabuf line (no `GDK_DEBUG`), `none` otherwise; with the counts.
-pub fn present_tier(log: &str) -> String {
-    let v = Verdict::of(log);
-    let name = match v.tier() {
-        Some(t) => t,
-        None if v == Verdict::default() => "not logged",
-        None => "none",
-    };
-    format!("gdk present {name} ({v})")
-}
-
 impl std::fmt::Display for Verdict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -139,12 +128,6 @@ mod tests {
         // ... nor admits downloads GDK does not explain: the driver tier alone is red
         let mmap = "Gdk-DEBUG: Used mmap for downloading 562x900 dmabuf (format AB24:0)\n";
         assert_eq!(tier_of(&format!("{readback}{mmap}")), None);
-        assert_eq!(
-            present_tier(&three),
-            "gdk present gdk-no-import (imported=0 downloaded=3 failed=3 no_import=3)"
-        );
-        assert!(present_tier("").starts_with("gdk present not logged"));
-        assert!(present_tier(mmap).starts_with("gdk present none"));
         // a failure GDK does not explain by missing import: red
         let other = format!("{three}Import of 4x4 ZZ99:0 dmabuf failed\n");
         assert_eq!(tier_of(&other), None);
