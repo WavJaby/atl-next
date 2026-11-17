@@ -5,6 +5,7 @@
 //! Outside the proxy scope (plan section 3): refused with `SL_RESULT_FEATURE_UNSUPPORTED` and counted by name (atl-diag `unimplemented sles.<method>.<name>`), never a fake success.
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock};
 
 use super::Down;
@@ -143,6 +144,12 @@ fn release(object: usize) {
 
 /// The guest arguments of an SL callback (identity `Down::guest_args`): the caller interface of table `t` -> its proxy; an `slObjectCallback`'s 6th (`pInterface`, any table) -> its proxy when the guest has one, else 0 (the guest has not asked for that interface: plan section 3 refuses the dynamic interfaces that report it).
 pub(super) fn down_args(t: TableId, first: &mut usize, sixth: &mut usize) {
+    if t == sl_buffer_queue::TABLE || t == sl_android_simple_buffer_queue::TABLE {
+        flow::QUEUE_CALLBACKS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        flow::OTHER_CALLBACKS.fetch_add(1, Ordering::Relaxed);
+    }
+    flow::tick();
     *first = wrap(t, *first, None);
     if t == sl_object::TABLE && *sixth != 0 {
         let m = map();
@@ -152,6 +159,65 @@ pub(super) fn down_args(t: TableId, first: &mut usize, sixth: &mut usize) {
             .find(|((h, _), _)| *h == *sixth)
             .map_or(0, |(_, &p)| p);
     }
+}
+
+/// The buffer-queue data path's counters (where a player's audio stops): guest Enqueue calls and bytes, callbacks entering the guest. One `sles-flow:` line per period at most, written by whichever counting call crosses it; a failed guest entry aborts by name (dispatch.rs `unsupported`), so it needs no counter.
+mod flow {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    pub(super) static ENQUEUES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static ENQUEUE_BYTES: AtomicU64 = AtomicU64::new(0);
+    /// Enqueue answers other than SL_RESULT_SUCCESS (BUFFER_INSUFFICIENT: queue full).
+    pub(super) static ENQUEUE_FAILED: AtomicU64 = AtomicU64::new(0);
+    pub(super) static QUEUE_CALLBACKS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static OTHER_CALLBACKS: AtomicU64 = AtomicU64::new(0);
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    /// At most one line per this many ms (the counters' rate class: once per second).
+    const PERIOD_MS: u64 = 1000;
+
+    /// Writes the totals so far when the period has passed since the last line.
+    pub(super) fn tick() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        let last = LAST_MS.load(Relaxed);
+        if now < last + PERIOD_MS || LAST_MS.compare_exchange(last, now, Relaxed, Relaxed).is_err() {
+            return;
+        }
+        let _ = writeln!(
+            std::io::stderr(),
+            "sles-flow: enqueues={} bytes={} enqueue_failed={} queue_callbacks={} other_callbacks={}",
+            ENQUEUES.load(Relaxed),
+            ENQUEUE_BYTES.load(Relaxed),
+            ENQUEUE_FAILED.load(Relaxed),
+            QUEUE_CALLBACKS.load(Relaxed),
+            OTHER_CALLBACKS.load(Relaxed),
+        );
+    }
+}
+
+/// `Enqueue(self, pBuffer, size)` of BufferQueue (slot `slot`) and AndroidSimpleBufferQueue: forwarded, counted in [`flow`].
+fn enqueue(itf: usize, slot: usize, buf: usize, size: u32) -> u32 {
+    let host = host_itf(itf, "Enqueue");
+    type F = unsafe extern "C" fn(usize, usize, u32) -> u32;
+    // SAFETY: the table's Enqueue(self, pBuffer, size); the guest buffer is in the shared address space.
+    let rc = unsafe { host_fn::<F>(host, slot)(host, buf, size) };
+    flow::ENQUEUES.fetch_add(1, Ordering::Relaxed);
+    if rc == SL_RESULT_SUCCESS {
+        flow::ENQUEUE_BYTES.fetch_add(u64::from(size), Ordering::Relaxed);
+    } else {
+        flow::ENQUEUE_FAILED.fetch_add(1, Ordering::Relaxed);
+    }
+    flow::tick();
+    rc
+}
+extern "C" fn buffer_queue_enqueue(itf: usize, buf: usize, size: u32) -> u32 {
+    enqueue(itf, sl_buffer_queue::Enqueue, buf, size)
+}
+extern "C" fn simple_buffer_queue_enqueue(itf: usize, buf: usize, size: u32) -> u32 {
+    enqueue(itf, sl_android_simple_buffer_queue::Enqueue, buf, size)
 }
 
 /// Live proxies owned by no object (first met as a callback's caller): never freed, so this is the leak, for the gates.
@@ -503,14 +569,23 @@ fn specials(t: TableId) -> Vec<(usize, usize)> {
                 f(create_extension as *const ()),
             ),
         ],
-        sl_buffer_queue::TABLE => vec![(
-            sl_buffer_queue::RegisterCallback,
-            f(buffer_queue_register as *const ()),
-        )],
-        sl_android_simple_buffer_queue::TABLE => vec![(
-            sl_android_simple_buffer_queue::RegisterCallback,
-            f(simple_buffer_queue_register as *const ()),
-        )],
+        sl_buffer_queue::TABLE => vec![
+            (
+                sl_buffer_queue::RegisterCallback,
+                f(buffer_queue_register as *const ()),
+            ),
+            (sl_buffer_queue::Enqueue, f(buffer_queue_enqueue as *const ())),
+        ],
+        sl_android_simple_buffer_queue::TABLE => vec![
+            (
+                sl_android_simple_buffer_queue::RegisterCallback,
+                f(simple_buffer_queue_register as *const ()),
+            ),
+            (
+                sl_android_simple_buffer_queue::Enqueue,
+                f(simple_buffer_queue_enqueue as *const ()),
+            ),
+        ],
         sl_play::TABLE => vec![(sl_play::RegisterCallback, f(play_register as *const ()))],
         sl_prefetch_status::TABLE => vec![(
             sl_prefetch_status::RegisterCallback,

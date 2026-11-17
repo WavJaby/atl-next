@@ -98,6 +98,8 @@ impl Drop for Mapping {
 pub struct Track {
     proxy: UniquePtr<bridge::ffi::Track>,
     rate: u32,
+    /// Enabled in its [`Mix`] (the last [`Mix::set_active`]).
+    enabled: bool,
     _cblk: Mapping,
     _buffer: Option<Mapping>,
 }
@@ -128,6 +130,7 @@ impl Track {
         Ok(Self {
             proxy,
             rate,
+            enabled: false,
             _cblk: cblk,
             _buffer: None,
         })
@@ -171,6 +174,7 @@ impl Track {
         Ok(Self {
             proxy,
             rate,
+            enabled: false,
             _cblk: cblk,
             _buffer: Some(buffer),
         })
@@ -230,7 +234,13 @@ impl Mix {
             return false;
         };
         bridge::ffi::mix_enable(self.inner.pin_mut(), track.proxy.pin_mut(), name, on);
+        track.enabled = on;
         true
+    }
+
+    /// Tracks enabled in the mix.
+    pub fn active(&self) -> usize {
+        self.tracks.values().filter(|t| t.enabled).count()
     }
 
     /// Fills `out` (interleaved stereo) with the next frames of the mix: one AudioMixerBase quantum at a time, any request size.

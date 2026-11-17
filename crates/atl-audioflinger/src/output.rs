@@ -7,9 +7,11 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::io::Write;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use atl_audio_bridge::{Mix, MixCell, MixGuard, Track as Server};
 use atl_platform_ui::PlatformAudioHost;
@@ -55,6 +57,30 @@ struct Output {
 /// Realtime cycles that played silence because a control call held the mixer, or it was not installed yet. Logged when the output stops.
 static SILENT_CYCLES: AtomicU64 = AtomicU64::new(0);
 
+/// Mix evidence since the last counters line, written by the realtime fill (relaxed adds only) and taken by the output's thread.
+/// requested = frames the output asked for; mixed = frames the mixer rendered; audible = mixed frames with a nonzero sample; peak = largest |sample| as f32 bits (fetch_max on bits orders non-negative floats).
+static REQUESTED: AtomicU64 = AtomicU64::new(0);
+static MIXED: AtomicU64 = AtomicU64::new(0);
+static AUDIBLE: AtomicU64 = AtomicU64::new(0);
+static PEAK_BITS: AtomicU32 = AtomicU32::new(0);
+/// Tracks enabled in the mixer, stored by the control call that changed it.
+static ACTIVE: AtomicU32 = AtomicU32::new(0);
+/// At most one counters line per this period (the diag lines' rate class: once per second at most).
+const COUNTERS_PERIOD: Duration = Duration::from_secs(1);
+
+/// One counters line `audio-mix: requested=N mixed=N audible=N peak=F active=N` with the deltas since the last; written while the output is open, zeros when silent.
+fn log_counters() {
+    let requested = REQUESTED.swap(0, Ordering::Relaxed);
+    let mixed = MIXED.swap(0, Ordering::Relaxed);
+    let audible = AUDIBLE.swap(0, Ordering::Relaxed);
+    let peak = f32::from_bits(PEAK_BITS.swap(0, Ordering::Relaxed));
+    let active = ACTIVE.load(Ordering::Relaxed);
+    let _ = writeln!(
+        std::io::stderr(),
+        "audio-mix: requested={requested} mixed={mixed} audible={audible} peak={peak:.4} active={active}"
+    );
+}
+
 impl Drop for Output {
     fn drop(&mut self) {
         tracing::info!(
@@ -95,7 +121,26 @@ impl Opener {
 /// The output's thread: opens the output on the first request, holds it until the process ends, and answers every request. It ends when no [`Opener`] is left.
 fn owner(inbox: Receiver<Sender<Result<Opened, String>>>, remote: Option<PathBuf>, opts: Options) {
     let mut open: Option<(Output, Opened)> = None;
-    for reply in inbox {
+    let mut logged = Instant::now();
+    loop {
+        // while open the thread writes the counters line once per period, however often requests come; closed, it only waits for requests
+        let reply = if open.is_some() {
+            let wait = COUNTERS_PERIOD.saturating_sub(logged.elapsed());
+            match inbox.recv_timeout(wait) {
+                Ok(reply) => reply,
+                Err(RecvTimeoutError::Timeout) => {
+                    log_counters();
+                    logged = Instant::now();
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match inbox.recv() {
+                Ok(reply) => reply,
+                Err(_) => break,
+            }
+        };
         let answer = match open.as_ref() {
             Some((_, opened)) => Ok(opened.clone()),
             None => match start(remote.as_deref(), opts) {
@@ -154,6 +199,8 @@ fn start(remote: Option<&Path>, opts: Options) -> Result<(Output, Opened), Strin
 
 /// The realtime fill: one slice of interleaved stereo frames from the mixer, or silence (break, a control call holding the mixer, or no mixer yet).
 fn render(mixer: &MixCell, out: &mut [f32], silent: bool) {
+    let frames = (out.len() / usize::from(CHANNELS)) as u64;
+    REQUESTED.fetch_add(frames, Ordering::Relaxed);
     if silent {
         out.fill(0.0);
         return;
@@ -161,7 +208,26 @@ fn render(mixer: &MixCell, out: &mut [f32], silent: bool) {
     if !mixer.fill(out) {
         SILENT_CYCLES.fetch_add(1, Ordering::Relaxed);
         out.fill(0.0);
+        return;
     }
+    MIXED.fetch_add(frames, Ordering::Relaxed);
+    let mut audible = 0u64;
+    let mut peak = 0f32;
+    for frame in out.chunks_exact(usize::from(CHANNELS)) {
+        let loudest = frame.iter().fold(0f32, |m, s| m.max(s.abs()));
+        audible += u64::from(loudest > 0.0);
+        peak = peak.max(loudest);
+    }
+    AUDIBLE.fetch_add(audible, Ordering::Relaxed);
+    PEAK_BITS.fetch_max(peak.to_bits(), Ordering::Relaxed);
+}
+
+/// Stores the mixer's enabled-track count for the counters line.
+fn note_active(mix: &Mix) {
+    ACTIVE.store(
+        u32::try_from(mix.active()).unwrap_or(u32::MAX),
+        Ordering::Relaxed,
+    );
 }
 
 /// The mixer, held by one control call. None before the output is open.
@@ -181,10 +247,11 @@ pub(crate) fn add_track(
 
 /// Enables or disables track `name` in the mix.
 pub(crate) fn set_active(mixer: &Shared, name: i32, on: bool) {
-    if let Some(mut mix) = lock(mixer)
-        && !mix.set_active(name, on)
-    {
-        tracing::error!(name, "track unknown to the mixer");
+    if let Some(mut mix) = lock(mixer) {
+        if !mix.set_active(name, on) {
+            tracing::error!(name, "track unknown to the mixer");
+        }
+        note_active(&mix);
     }
 }
 
@@ -192,5 +259,6 @@ pub(crate) fn set_active(mixer: &Shared, name: i32, on: bool) {
 pub(crate) fn remove_track(mixer: &Shared, name: i32) {
     if let Some(mut mix) = lock(mixer) {
         mix.remove(name);
+        note_active(&mix);
     }
 }
