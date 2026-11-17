@@ -848,7 +848,10 @@ impl ActivityManager {
                 }
             });
         if let Err(e) = spawned {
-            log(format_args!("remove task {}: no timer thread: {e}", task.raw()));
+            log(format_args!(
+                "remove task {}: no timer thread: {e}",
+                task.raw()
+            ));
             self.inner.kill_task_processes(task);
         }
     }

@@ -327,9 +327,13 @@ impl<K: Clone + PartialEq, O: Clone, L, I, R> Machine<K, O, L, I, R> {
     /// The top of `task` is shown and not stopped (ActivityTaskSupervisor.cleanUpRemovedTask: `!top.mAppStopped && top.lastVisibleTime > 0`): a removal then waits for its destroy before the kill.
     pub fn top_visible(&self, task: TaskId) -> bool {
         self.is_visible(task)
-            && self.tasks.get(&task).and_then(|r| r.last()).is_some_and(|r| {
-                !matches!(r.phase, Phase::Created | Phase::Stopping | Phase::Stopped)
-            })
+            && self
+                .tasks
+                .get(&task)
+                .and_then(|r| r.last())
+                .is_some_and(|r| {
+                    !matches!(r.phase, Phase::Created | Phase::Stopping | Phase::Stopped)
+                })
     }
 
     /// activityDestroyed of `token`: the destroying record goes. Its Task, and true when the Task has nothing left, in the stack or destroying: the Task's processes may end
@@ -862,7 +866,11 @@ mod tests {
             sent(&m.stopped(&OTHER)),
             vec![(OTHER, vec![Step::Destroy { finished: true }])]
         );
-        assert_eq!(m.destroyed(&OTHER), Some((t, false)), "MAIN is still destroying");
+        assert_eq!(
+            m.destroyed(&OTHER),
+            Some((t, false)),
+            "MAIN is still destroying"
+        );
         assert_eq!(m.destroyed(&MAIN), Some((t, true)));
         assert_eq!(m.destroyed(&MAIN), None, "a second ack names no record");
     }

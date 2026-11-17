@@ -342,16 +342,23 @@ fn ended_judged(services: &str, still: Option<Vec<i32>>) -> Result<String, Strin
         return Err("the kill line names no pid".to_owned());
     }
     if let Some(l) = services.lines().find(|l| l.contains(TIMED_OUT)) {
-        return Err(format!("killed by the timeout, not after onDestroy: {}", l.trim()));
+        return Err(format!(
+            "killed by the timeout, not after onDestroy: {}",
+            l.trim()
+        ));
     }
     if !still.is_empty() {
-        return Err(format!("pids {still:?} still alive {GONE_WAIT:?} after the kill"));
+        return Err(format!(
+            "pids {still:?} still alive {GONE_WAIT:?} after the kill"
+        ));
     }
     let latency = match (stamp(services, REMOVE_LINE), stamp(services, KILLED_LINE)) {
         (Some(a), Some(b)) => format!("{:.0} ms", (b - a) * 1000.0),
         _ => "unknown".to_owned(),
     };
-    Ok(format!("pids {pids:?} killed after onDestroy and gone; remove -> kill {latency}"))
+    Ok(format!(
+        "pids {pids:?} killed after onDestroy and gone; remove -> kill {latency}"
+    ))
 }
 
 /// Sub-gate (c) foreign: the fixture's REMOVE_TASK naming a Task its uid does not own (Main.java FOREIGN_TASK) was refused and counted, its cause naming that Task.
