@@ -277,7 +277,8 @@ fn migrate_build_dir_device(old: &Path, new: &Path) -> Result<()> {
             std::fs::remove_dir_all(old).with_context(|| format!("removing {}", old.display()))?;
         }
         Err(e) => {
-            return Err(e).with_context(|| format!("moving {} to {}", old.display(), new.display()));
+            return Err(e)
+                .with_context(|| format!("moving {} to {}", old.display(), new.display()));
         }
     }
     println!(
