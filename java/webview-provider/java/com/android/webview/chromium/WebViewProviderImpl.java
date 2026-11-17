@@ -119,12 +119,12 @@ final class WebViewProviderImpl implements WebViewProvider, WebViewProvider.View
     @Override public void postUrl(String url, byte[] postData) { throw Unimplemented.refuse("WebViewProvider.postUrl"); }
     @Override public void saveWebArchive(String filename) { throw Unimplemented.refuse("WebViewProvider.saveWebArchive"); }
     @Override public void saveWebArchive(String basename, boolean autoname, ValueCallback<String> callback) { throw Unimplemented.refuse("WebViewProvider.saveWebArchive"); }
-    @Override public boolean canGoBack() { throw Unimplemented.refuse("WebViewProvider.canGoBack"); }
-    @Override public void goBack() { throw Unimplemented.refuse("WebViewProvider.goBack"); }
-    @Override public boolean canGoForward() { throw Unimplemented.refuse("WebViewProvider.canGoForward"); }
-    @Override public void goForward() { throw Unimplemented.refuse("WebViewProvider.goForward"); }
-    @Override public boolean canGoBackOrForward(int steps) { throw Unimplemented.refuse("WebViewProvider.canGoBackOrForward"); }
-    @Override public void goBackOrForward(int steps) { throw Unimplemented.refuse("WebViewProvider.goBackOrForward"); }
+    @Override public boolean canGoBack() { return canGoBackOrForward(-1); }
+    @Override public void goBack() { goBackOrForward(-1); }
+    @Override public boolean canGoForward() { return canGoBackOrForward(1); }
+    @Override public void goForward() { goBackOrForward(1); }
+    @Override public native boolean canGoBackOrForward(int steps);
+    @Override public native void goBackOrForward(int steps);
     @Override public boolean isPrivateBrowsingEnabled() { throw Unimplemented.refuse("WebViewProvider.isPrivateBrowsingEnabled"); }
     @Override public boolean pageUp(boolean top) { throw Unimplemented.refuse("WebViewProvider.pageUp"); }
     @Override public boolean pageDown(boolean bottom) { throw Unimplemented.refuse("WebViewProvider.pageDown"); }

@@ -1329,6 +1329,16 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_reload, (
     n.view.reload();
 });
 
+provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_canGoBackOrForward, (env, n, steps: i32) -> u8 = 0, {
+    let _ = env;
+    u8::from(n.view.can_go_back_or_forward(steps))
+});
+
+provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_goBackOrForward, (env, n, steps: i32) -> () = (), {
+    let _ = env;
+    n.view.go_back_or_forward(steps);
+});
+
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_getUrl, (env, n) -> Obj = NULL, {
     n.view.uri().map_or(NULL, |u| new_string(env, &u))
 });

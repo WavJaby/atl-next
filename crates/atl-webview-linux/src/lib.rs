@@ -26,6 +26,8 @@ static VTABLE: WebViewVtable = WebViewVtable {
     view_load_bytes,
     view_stop,
     view_reload,
+    view_can_go,
+    view_go,
     view_evaluate,
     view_set_user_scripts,
     view_uri,
@@ -394,6 +396,24 @@ unsafe extern "C" fn view_stop(h: *mut WebViewHandle) {
 
 unsafe extern "C" fn view_reload(h: *mut WebViewHandle) {
     view(h).web.reload();
+}
+
+/// The back-forward list's item `steps` from the current one (WebKitBackForwardList.get_nth_item: 0 current, negative back), as Chromium's NavigationController offsets count.
+fn history_item(h: *mut WebViewHandle, steps: i32) -> Option<webkit6::BackForwardListItem> {
+    if steps == 0 {
+        return None;
+    }
+    view(h).web.back_forward_list()?.nth_item(steps)
+}
+
+unsafe extern "C" fn view_can_go(h: *mut WebViewHandle, steps: i32) -> bool {
+    history_item(h, steps).is_some()
+}
+
+unsafe extern "C" fn view_go(h: *mut WebViewHandle, steps: i32) {
+    if let Some(item) = history_item(h, steps) {
+        view(h).web.go_to_back_forward_list_item(&item);
+    }
 }
 
 unsafe extern "C" fn view_evaluate(

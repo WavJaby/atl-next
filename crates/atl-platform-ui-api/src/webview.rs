@@ -69,6 +69,10 @@ pub trait WebView {
     fn stop_loading(&self);
     /// Reloads the current page.
     fn reload(&self);
+    /// Whether session history has an entry `steps` away from the current one (negative = back).
+    fn can_go_back_or_forward(&self, steps: i32) -> bool;
+    /// Goes to the session-history entry `steps` away; none there = nothing happens.
+    fn go_back_or_forward(&self, steps: i32);
     /// Runs `script` in the main frame; `done` gets the result as JSON (`null` for undefined, a function or a non-serialisable value), or the exception's text.
     fn evaluate_javascript(&self, script: &str, done: Box<dyn FnOnce(Result<String, String>)>);
     /// Replaces the scripts injected at document start into every frame of every later load (an already loaded document keeps what it got).

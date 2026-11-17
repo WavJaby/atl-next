@@ -247,6 +247,16 @@ impl WebView for PlatformWebView {
         unsafe { (self.m.view_reload)(self.h) }
     }
 
+    fn can_go_back_or_forward(&self, steps: i32) -> bool {
+        // SAFETY: see the impl comment.
+        unsafe { (self.m.view_can_go)(self.h, steps) }
+    }
+
+    fn go_back_or_forward(&self, steps: i32) {
+        // SAFETY: see the impl comment.
+        unsafe { (self.m.view_go)(self.h, steps) }
+    }
+
     fn evaluate_javascript(&self, script: &str, done: Box<dyn FnOnce(Result<String, String>)>) {
         let mut done = Some(done);
         let cb = Callback::new(move |r: &EvalResultView| {

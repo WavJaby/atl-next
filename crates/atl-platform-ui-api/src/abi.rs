@@ -1295,6 +1295,10 @@ pub struct WebViewVtable {
     pub view_stop: unsafe extern "C" fn(view: *mut WebViewHandle),
     /// `WebView::reload`.
     pub view_reload: unsafe extern "C" fn(view: *mut WebViewHandle),
+    /// `WebView::can_go_back_or_forward`.
+    pub view_can_go: unsafe extern "C" fn(view: *mut WebViewHandle, steps: i32) -> bool,
+    /// `WebView::go_back_or_forward`.
+    pub view_go: unsafe extern "C" fn(view: *mut WebViewHandle, steps: i32),
     /// `WebView::evaluate_javascript`; `done` is called once.
     pub view_evaluate:
         unsafe extern "C" fn(view: *mut WebViewHandle, script: Str, done: Callback<EvalResultView>),
