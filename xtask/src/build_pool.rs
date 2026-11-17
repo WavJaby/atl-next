@@ -3,6 +3,7 @@
 //! A slot is an exclusive `flock` on `<workspace>/cache/build-pool/cpu-<i>` or `mem-<i>`: the kernel drops it when the holder's file closes, so exit, error, panic and SIGKILL all free it -- no stale-lock cleanup exists or is needed.
 //! Waiters queue as tickets in `cache/build-pool/queue/`, served in (tier, arrival) order ([`Tier`]: the owner's main checkout, then land, then agents), so a large request is not starved by small ones behind it; a ticket waiting past `starve_after_s` joins the top tier at its arrival. No grant is preempted: priority decides only who is admitted next.
 //! Light work takes a free CPU slot at once when the queue head could not use it (`bypass_allowed`); otherwise it queues like heavy work.
+//! Reserved slot (owner 2026-11-18, option B): one CPU slot beyond `cpu_slots` plus the `light` class's memory carved out of `mem_gib`, taken only by interactive-tier light work ([`try_reserved`]), so the owner's play launch never waits behind agents' full natives. Its grant prints `granted the reserved slot` and counts in [`RESERVED_GRANTS`].
 //! A grant takes CPU elastically (the free slots up to the class max, at least its min); the count is the tool's job count (ninja `-j`, cargo `CARGO_BUILD_JOBS`).
 //! Nested admission is refused: a thread holding a grant, or a process with a holder among its ancestors, would wait for slots its own holder keeps.
 //! Sizes and weights: `[pool]` in `workspace.toml` (ws_config.rs); the defaults and their derivation are on [`Class::default_weight`].
@@ -195,6 +196,8 @@ impl Tier {
 /// Grants admitted ahead of an earlier-arrived live ticket (by tier or by promotion), and tickets promoted for waiting past `starve_after_s`, in this process: the counters the log lines carry.
 pub static ADMITTED_AHEAD: AtomicU64 = AtomicU64::new(0);
 pub static PROMOTED: AtomicU64 = AtomicU64::new(0);
+/// Grants of the reserved interactive slot in this process ([`try_reserved`]).
+pub static RESERVED_GRANTS: AtomicU64 = AtomicU64::new(0);
 
 /// Takes `class` for checkout `who` in workspace `ws`, waiting its turn ([`Tier::of`] `who`). Prints the wait once (`pool: ...`) and the grant when it waited.
 pub fn acquire(ws: &Path, who: &Path, class: Class) -> Result<Grant> {
@@ -227,7 +230,35 @@ fn acquire_with(
     let started = Instant::now();
     let starve_after = Duration::from_secs(pool.starve_after_s.value.into());
     let mut waited = false;
+    let grant = |cpu: u32, mem_gib: u32, waited: Duration, files: Vec<Flock>, record: String| {
+        HELD.with(|h| *h.borrow_mut() = Some((record, cpu)));
+        Grant {
+            class: class.name(),
+            cpu,
+            cpu_of: pool.cpu_slots.value,
+            mem_gib,
+            waited,
+            _files: files,
+            _thread: PhantomData,
+        }
+    };
     loop {
+        // the reserved slot first: it exists for this request, and taking it leaves the shared slots to the queue
+        if class == Class::Light
+            && tier == Tier::Interactive
+            && let Some(files) = try_reserved(&dir, &pool, &record)?
+        {
+            let n = RESERVED_GRANTS.fetch_add(1, Ordering::Relaxed) + 1;
+            let took = started.elapsed();
+            report(&format!(
+                "pool: light tier interactive granted the reserved slot cpu 1 mem {} after {:.1} s (reserved_grants={n})",
+                w.mem_gib,
+                took.as_secs_f64()
+            ));
+            drop(ticket);
+            let waited = if waited { took } else { Duration::ZERO };
+            return Ok(grant(1, w.mem_gib, waited, files, record));
+        }
         // starvation bound: a ticket waiting past it joins the top tier at its arrival, so later interactive tickets queue behind it
         if let Some(t) = &mut ticket
             && t.tier != Tier::Interactive
@@ -280,16 +311,7 @@ fn acquire_with(
                 Duration::ZERO
             };
             drop(ticket);
-            HELD.with(|h| *h.borrow_mut() = Some((record, cpu)));
-            return Ok(Grant {
-                class: class.name(),
-                cpu,
-                cpu_of: pool.cpu_slots.value,
-                mem_gib: w.mem_gib,
-                waited,
-                _files: files,
-                _thread: PhantomData,
-            });
+            return Ok(grant(cpu, w.mem_gib, waited, files, record));
         }
         if !waited {
             waited = true;
@@ -342,11 +364,41 @@ fn slot(dir: &Path, kind: &str, index: u32) -> PathBuf {
     dir.join(format!("{kind}-{index}"))
 }
 
+/// Every slot file, the reserved ones included (nesting check, quiet window).
 fn all_slots(dir: &Path, pool: &PoolConfig) -> Vec<PathBuf> {
     (1..=pool.cpu_slots.value)
         .map(|i| slot(dir, "cpu", i))
-        .chain((1..=pool.mem_gib.value).map(|i| slot(dir, "mem", i)))
+        .chain((1..=shared_mem(pool)).map(|i| slot(dir, "mem", i)))
+        .chain(reserved_slots(dir, pool))
         .collect()
+}
+
+/// The reserved interactive slot's files: one CPU slot beyond `cpu_slots`, and the `light` class's `mem_gib` memory slots, carved out of `mem_gib` (the memory budget is the WSL cap, so it is not raised).
+fn reserved_slots(dir: &Path, pool: &PoolConfig) -> Vec<PathBuf> {
+    std::iter::once(slot(dir, "cpu-interactive", 1))
+        .chain((1..=reserved_mem(pool)).map(|i| slot(dir, "mem-interactive", i)))
+        .collect()
+}
+
+fn reserved_mem(pool: &PoolConfig) -> u32 {
+    pool.classes[&Class::Light].mem_gib
+}
+
+/// Memory slots every class shares: `mem_gib` less the reserved slot's.
+fn shared_mem(pool: &PoolConfig) -> u32 {
+    pool.mem_gib.value.saturating_sub(reserved_mem(pool))
+}
+
+/// Every reserved file at once, or none; only interactive light asks (`acquire_with`).
+fn try_reserved(dir: &Path, pool: &PoolConfig, record: &str) -> Result<Option<Vec<Flock>>> {
+    let mut files = Vec::new();
+    for path in reserved_slots(dir, pool) {
+        match try_take(&path, record)? {
+            Some(f) => files.push(f),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(files))
 }
 
 fn holder_record(who: &Path, class: &str) -> String {
@@ -373,11 +425,11 @@ fn fits(pool: &PoolConfig, class: Class, w: ClassWeight) -> Result<()> {
         pool.cpu_slots.value
     );
     ensure!(
-        w.mem_gib <= pool.mem_gib.value,
-        "pool: class {} reserves {} GiB but the pool holds {} ([pool] mem_gib)",
+        w.mem_gib <= shared_mem(pool),
+        "pool: class {} reserves {} GiB but the pool shares {} ([pool] mem_gib less the reserved slot's light mem_gib)",
         class.name(),
         w.mem_gib,
-        pool.mem_gib.value
+        shared_mem(pool)
     );
     Ok(())
 }
@@ -593,7 +645,7 @@ fn try_grant(
 ) -> Result<Option<(u32, Vec<Flock>)>> {
     let mut files = Vec::new();
     let mut mem = 0;
-    for i in 1..=pool.mem_gib.value {
+    for i in 1..=shared_mem(pool) {
         if mem == w.mem_gib {
             break;
         }
@@ -680,10 +732,19 @@ fn snapshot(dir: &Path, pool: &PoolConfig) -> Result<Snapshot> {
             Some(rec) => s.held.entry(rec).or_default().0 += 1,
         }
     }
-    for i in 1..=pool.mem_gib.value {
+    for i in 1..=shared_mem(pool) {
         match probe(&slot(dir, "mem", i))? {
             None => s.free_mem += 1,
             Some(rec) => s.held.entry(rec).or_default().1 += 1,
+        }
+    }
+    // the reserved slot's holder is listed (`reserved`), its files never counted free: no shared request can use them
+    if let Some(rec) = probe(&slot(dir, "cpu-interactive", 1))? {
+        s.held.entry(format!("{rec} reserved")).or_default().0 += 1;
+    }
+    for i in 1..=reserved_mem(pool) {
+        if let Some(rec) = probe(&slot(dir, "mem-interactive", i))? {
+            s.held.entry(format!("{rec} reserved")).or_default().1 += 1;
         }
     }
     Ok(s)
@@ -708,7 +769,7 @@ fn wait_line(
         snap.free_cpu,
         pool.cpu_slots.value,
         snap.free_mem,
-        pool.mem_gib.value,
+        shared_mem(pool),
         snap.held_list()
     )
 }
@@ -969,6 +1030,97 @@ mod tests {
         holder.release.send(()).unwrap();
         assert_eq!(heavy.granted.recv_timeout(WAIT).unwrap(), "cpu 1 mem 1");
         heavy.release.send(()).unwrap();
+    }
+
+    /// Pool of 1 CPU + 2 GiB, light weighted 1 GiB: an agent's cargo holds the only shared CPU and the 1 shared GiB, an agent cargo queues. Interactive light is still granted at once, from the reserved slot (cpu 1 + light's 1 GiB); a second interactive light finds it held and waits.
+    #[test]
+    fn interactive_light_takes_the_reserved_slot_on_a_full_pool() {
+        let ws = scratch_ws(
+            "reserved-fires",
+            Some(
+                "[pool]\ncpu_slots = 1\nmem_gib = 2\n[pool.cargo]\ncpu_min = 1\ncpu_max = 1\nmem_gib = 1\n[pool.light]\nmem_gib = 1\n",
+            ),
+        );
+        let holder = contender(&ws, "holder", Class::Cargo);
+        assert_eq!(holder.granted.recv_timeout(WAIT).unwrap(), "cpu 1 mem 1");
+        let heavy = contender(&ws, "heavy", Class::Cargo);
+        heavy.waits.recv_timeout(WAIT).expect("heavy did not queue");
+        let before = RESERVED_GRANTS.load(Ordering::Relaxed);
+        let play = contender_at(&ws, "play", Class::Light, Tier::Interactive);
+        assert_eq!(play.granted.recv_timeout(WAIT).unwrap(), "cpu 1 mem 1");
+        let line = play.waits.recv_timeout(WAIT).expect("no slot-kind line");
+        assert!(
+            line.contains("granted the reserved slot cpu 1 mem 1"),
+            "{line}"
+        );
+        assert!(RESERVED_GRANTS.load(Ordering::Relaxed) > before);
+        let play2 = contender_at(&ws, "play2", Class::Light, Tier::Interactive);
+        let line = play2.waits.recv_timeout(WAIT).expect("play2 did not wait");
+        assert!(
+            line.contains("light wants cpu >=1") && line.contains("play pid"),
+            "{line}"
+        );
+        play.release.send(()).unwrap();
+        assert_eq!(play2.granted.recv_timeout(WAIT).unwrap(), "cpu 1 mem 1");
+        for c in [play2, holder, heavy] {
+            c.release.send(()).unwrap();
+        }
+    }
+
+    /// The reserved slot is free and the shared CPU held: agent-tier light and interactive-tier cargo both wait (neither takes the reserved slot), and both run once the holder releases.
+    #[test]
+    fn only_interactive_light_may_take_the_reserved_slot() {
+        let ws = scratch_ws(
+            "reserved-refused",
+            Some(
+                "[pool]\ncpu_slots = 1\nmem_gib = 1\n[pool.cargo]\ncpu_min = 1\ncpu_max = 1\nmem_gib = 0\n",
+            ),
+        );
+        let holder = contender(&ws, "holder", Class::Cargo);
+        assert_eq!(holder.granted.recv_timeout(WAIT).unwrap(), "cpu 1 mem 0");
+        let agent_light = contender(&ws, "agent-light", Class::Light);
+        let line = agent_light
+            .waits
+            .recv_timeout(WAIT)
+            .expect("agent light did not wait");
+        assert!(line.contains("light wants"), "{line}");
+        let owner_cargo = contender_at(&ws, "owner-cargo", Class::Cargo, Tier::Interactive);
+        let line = owner_cargo
+            .waits
+            .recv_timeout(WAIT)
+            .expect("interactive cargo did not wait");
+        assert!(line.contains("cargo wants"), "{line}");
+        std::thread::sleep(STILL_WAITING);
+        assert!(
+            agent_light.granted.try_recv().is_err(),
+            "agent light took the reserved slot"
+        );
+        assert!(
+            owner_cargo.granted.try_recv().is_err(),
+            "interactive cargo took the reserved slot"
+        );
+        assert!(
+            probe(&slot(&dir(&ws), "cpu-interactive", 1))
+                .unwrap()
+                .is_none(),
+            "reserved slot held"
+        );
+        holder.release.send(()).unwrap();
+        // one CPU: the two run one after the other
+        let first = [&agent_light, &owner_cargo]
+            .into_iter()
+            .position(|c| c.granted.recv_timeout(STILL_WAITING).is_ok());
+        let first = first.expect("neither ran after the release");
+        let (done, next) = if first == 0 {
+            (agent_light, owner_cargo)
+        } else {
+            (owner_cargo, agent_light)
+        };
+        done.release.send(()).unwrap();
+        next.granted
+            .recv_timeout(WAIT)
+            .expect("the second did not run");
+        next.release.send(()).unwrap();
     }
 
     /// Three light streams keep churning while a heavy head needs both CPU slots: the head must be granted within HEAD_BOUND.
