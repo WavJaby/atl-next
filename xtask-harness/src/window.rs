@@ -1218,7 +1218,7 @@ fn drive_resize(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<
 fn wait_for_line(file: &Path, needle: &str, within: Duration) -> bool {
     let deadline = Instant::now() + within;
     while Instant::now() < deadline {
-        if std::fs::read_to_string(file).is_ok_and(|text| text.contains(needle)) {
+        if atl_diag::logfiles::read(file).contains(needle) {
             return true;
         }
         std::thread::sleep(POLL);
@@ -1839,7 +1839,7 @@ fn track_check(after: &[&str], script: &str, origin: (f32, f32)) -> Result<Strin
 
 /// The hold's result: the app logged its resume and atld stayed up for the whole hold. The app log stays where it is; its size lines are echoed.
 fn hold_report(app_log: &Path, marker: &str, secs: u64, atld_exited: bool) -> ExitCode {
-    let app = std::fs::read_to_string(app_log).unwrap_or_default();
+    let app = atl_diag::logfiles::read(app_log);
     println!("window: hold log {}", app_log.display());
     for line in app.lines().filter(|l| l.contains(LAYOUT_LINE)) {
         println!("window: {line}");
@@ -2192,7 +2192,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let services_log = run.log("services");
     let marker = marker(args.stage);
     let window_ms = args.hold.map_or(args.stage.window_ms(), |s| s * 1_000);
-    let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+    let read = atl_diag::logfiles::read;
     let mut ended = None;
     // the splash stage's picture, taken by this loop while the starting window shows
     let mut splash_shot = None;

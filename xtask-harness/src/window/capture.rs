@@ -268,7 +268,7 @@ pub(super) fn drive(
     // the line, not its arguments: a removal the registry refused never writes it, and close_judged names what is missing
     wait_for_line(services_log, REMOVED_LINE, CLOSE_WAIT);
     wait_for_line(services_log, KILLED_LINE, CLOSE_WAIT);
-    let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+    let read = atl_diag::logfiles::read;
     let services = read(services_log);
     let still = killed_pids(&services).map(|pids| {
         let alive = |pid: &i32| Path::new(&format!("/proc/{pid}")).exists();

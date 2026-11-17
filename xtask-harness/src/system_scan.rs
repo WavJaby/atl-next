@@ -84,7 +84,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         log_tags: "*:i".into(),
     };
     let mut atld = rt.start_atld(&run)?;
-    let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+    let read = atl_diag::logfiles::read;
     let log = run.log(PACKAGE);
     let start = Instant::now();
     let ended = loop {

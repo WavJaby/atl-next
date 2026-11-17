@@ -353,7 +353,7 @@ pub(crate) fn run_on(
     let run = run_of(&work, files, &m, &args.log_tags);
     let app_log = run.log(&m.name);
     let services_log = run.log("services");
-    let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+    let read = atl_diag::logfiles::read;
     let hold_ms = args.hold.map(|s| s * MS_PER_S);
     let watch_ms = hold_ms.unwrap_or(window::WINDOW_MS);
     // a pointer script runs from the first present: the run lasts at least its waits plus the watch, and faults count from the last resume to the run's end
@@ -618,7 +618,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
     let watch_ms = a.hold * MS_PER_S;
     let app_log = run.log(&m.name);
     let services_log = run.log("services");
-    let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+    let read = atl_diag::logfiles::read;
     let app = read(&app_log);
     let services = read(&services_log);
     let outcome = transfer.and_then(|()| {

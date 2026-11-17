@@ -404,7 +404,7 @@ pub fn am_instrument(rt: &Runtime, run: &Run, limit: Duration, verbose: bool) ->
         }
         std::thread::sleep(Duration::from_millis(200));
     };
-    let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+    let read = atl_diag::logfiles::read;
     let am_log = read(&run.log("am"));
     let lines: Vec<String> = stdout_lines(&am_log)
         .into_iter()
@@ -623,10 +623,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             }
         }
         if matches!(expect, Expect::Sample) {
-            let app_log = std::fs::read_to_string(run.log(&m.name)).unwrap_or_default();
+            let app_log = atl_diag::logfiles::read(&run.log(&m.name));
             fails.extend(prop_miss_missing(&app_log));
         }
-        let services_log = std::fs::read_to_string(run.log("services")).unwrap_or_default();
+        let services_log = atl_diag::logfiles::read(&run.log("services"));
         for l in counter_lines(&services_log) {
             println!("instrument: {label}: counter {l}");
         }
@@ -656,10 +656,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             println!("---- services log ({label})\n{}", tail(&services_log, TAIL));
             println!(
                 "---- app log ({label})\n{}",
-                tail(
-                    &std::fs::read_to_string(run.log(&m.name)).unwrap_or_default(),
-                    TAIL
-                )
+                tail(&atl_diag::logfiles::read(&run.log(&m.name)), TAIL)
             );
         }
         all_fails.extend(fails.into_iter().map(|f| Failure::step(label, f)));

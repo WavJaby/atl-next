@@ -180,7 +180,7 @@ struct Driver<'a> {
 
 /// Runs `steps`, stopping at the first failure.
 pub fn run(steps: &[Step], target: Target<'_>) -> Result<()> {
-    let log = std::fs::read_to_string(target.app_log).unwrap_or_default();
+    let log = atl_diag::logfiles::read(target.app_log);
     let (x, y) = window::content_origin(&log).map_err(anyhow::Error::msg)?;
     let mut d = Driver {
         t: target,
@@ -279,8 +279,7 @@ impl Driver<'_> {
     }
 
     fn presents(&self) -> usize {
-        std::fs::read_to_string(self.t.app_log)
-            .unwrap_or_default()
+        atl_diag::logfiles::read(self.t.app_log)
             .lines()
             .filter(|l| l.contains(self.t.present_line))
             .count()

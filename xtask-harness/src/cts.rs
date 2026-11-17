@@ -284,7 +284,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         println!("cts: {module}: running {component}");
         let o = instrument::am_instrument(&rt, &run, limit, args.verbose)?;
         let result = cts_report::classify(module, &o.session, o.timed_out, args.limit_secs);
-        let services_log = std::fs::read_to_string(run.log("services")).unwrap_or_default();
+        let services_log = atl_diag::logfiles::read(&run.log("services"));
         all_counters.push(counters(&services_log));
         println!(
             "cts: {module}: {} in {:.1?}: {} pass, {} fail, {} error, {} ignored of {}{}",

@@ -16,6 +16,7 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
 
+pub mod logfiles;
 pub mod summary;
 
 /// `binder_exception_t` EX_TRANSACTION_FAILED (frameworks/native libs/binder/ndk/include_ndk/android/binder_status.h): the Status carries a transport status code instead of an exception.

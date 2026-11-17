@@ -373,7 +373,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let recorder = Recorder::start(&sink, &wav, u32::try_from(SPEC_RATE_HZ)?)?;
     let mut atld_child = rt.start_atld(&run)?;
     let app_log = run.log(&m.name);
-    let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+    let read = atl_diag::logfiles::read;
     let start = Instant::now();
     loop {
         if read(&app_log).lines().any(|l| l.contains(DONE)) {

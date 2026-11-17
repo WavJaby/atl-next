@@ -1827,8 +1827,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 scene: &scene,
                 activity: &activity,
                 elapsed,
-                passed: std::fs::read_to_string(run.log(&m.name))
-                    .unwrap_or_default()
+                passed: atl_diag::logfiles::read(&run.log(&m.name))
                     .lines()
                     .any(|l| l.contains(MARKER)),
                 atld_exited,
@@ -1859,7 +1858,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let mut atld_child = rt.start_atld(&run)?;
     let app_log = run.log(&m.name);
     let start = Instant::now();
-    let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+    let read = atl_diag::logfiles::read;
     let (passed, ended) = loop {
         if read(&app_log).lines().any(|l| l.contains(MARKER)) {
             break (true, None);
@@ -1998,7 +1997,7 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
         ref local,
         ref desktop,
     } = *j;
-    let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+    let read = atl_diag::logfiles::read;
     let app = read(&run.log(app_name));
     let fault = fault(&app, atld_exited);
     let services_log = read(&run.log("services"));
@@ -2454,7 +2453,7 @@ fn remote_verdict(
     scene: &Scene,
 ) -> Result<ExitCode> {
     let (rc, atld_exited, _) = remote_end(rt, run, child)?;
-    let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+    let read = atl_diag::logfiles::read;
     let app = read(&run.log(app_name));
     let mut whys = jni_fixture::legacy_failures(libs)?;
     whys.extend(jni_fixture::ndk_failures(libs)?);

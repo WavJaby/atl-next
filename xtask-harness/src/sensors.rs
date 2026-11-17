@@ -667,7 +667,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     };
     let mut child = rt.start_atld(&run)?;
     let app_log = run.log(&m.name);
-    let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+    let read = atl_diag::logfiles::read;
     let start = Instant::now();
     let mut started_at: Option<Instant> = None;
     let mut lookup_at: Option<Instant> = None;

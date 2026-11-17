@@ -717,7 +717,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
         std::thread::sleep(POLL);
     };
-    let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+    let read = atl_diag::logfiles::read;
     let app = read(&run.log(CLIENT_NAME));
     let services = read(&run.log("services"));
     if args.verbose {

@@ -102,7 +102,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         log_tags: "*:i".into(),
     };
     let mut atld = rt.start_atld(&run)?;
-    let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+    let read = atl_diag::logfiles::read;
     let (sender_log, receiver_log) = (run.log(&sender), run.log(&receiver));
     let start = Instant::now();
     let mut ping_seen: Option<Instant> = None;

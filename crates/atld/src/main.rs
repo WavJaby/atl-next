@@ -281,7 +281,8 @@ struct Args {
     /// App log capture (journald's `RateLimitBurst=`): lines an app process may log per window; the rest is dropped and counted. 0: no rate limit.
     #[arg(long, default_value_t = applog::RATE_BURST_DEFAULT)]
     log_rate_burst: u64,
-    /// App log capture (journald's `SystemMaxFileSize=`): bytes an app process's log may grow by in this run; the rest is dropped and counted. 0: no cap.
+    /// App log capture (journald's `SystemMaxUse=`): bytes an app process's log may hold: 1/4 head (`<name>.log`), the rest a tail ring (`<name>.log.1` newest .. `.4`) whose oldest segment is
+    /// retired and counted when a new one starts. 0: no bound.
     #[arg(long, default_value_t = applog::MAX_BYTES_DEFAULT)]
     log_max_bytes: u64,
 }
@@ -1187,13 +1188,11 @@ fn art_env(
 }
 
 impl Host {
-    /// stdout + stderr of an app process: one pipe atld copies into `log/<name>.log` (appended) under [`Host::log_limits`] ([`applog`]); a drop also gives one atld line when the pipe ends.
+    /// stdout + stderr of an app process: one pipe atld copies into `log/<name>.log` + its tail ring (appended) under [`Host::log_limits`] ([`applog`]); a drop also gives one atld line when the
+    /// pipe ends.
     fn bounded_log(&self, name: &str) -> Result<(std::process::Stdio, std::process::Stdio)> {
         let (reader, writer) = std::io::pipe().context("app log pipe")?;
-        let mut out = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.root.log(name))?;
+        let mut out = applog::Files::open(&self.root.log(name))?;
         let limits = self.log_limits;
         let name = name.to_owned();
         let copier = std::thread::Builder::new()
@@ -2365,7 +2364,7 @@ fn run(a: &Args) -> Result<ExitCode> {
                     a.log_rate_burst,
                 )
             }),
-            max_bytes: (a.log_max_bytes > 0).then_some(a.log_max_bytes),
+            size: (a.log_max_bytes > 0).then(|| applog::Size::of_budget(a.log_max_bytes)),
         },
         app_logs: Mutex::new(Vec::new()),
         notifications: {
@@ -2706,10 +2705,8 @@ fn print_summary(log_dir: &Path, since_ms: u64, rows_of: impl Fn(&str) -> usize)
         .unwrap_or_default();
     paths.retain(|p| p.extension().is_some_and(|x| x == "log"));
     paths.sort();
-    let logs: Vec<String> = paths
-        .iter()
-        .filter_map(|p| std::fs::read_to_string(p).ok())
-        .collect();
+    // head + tail ring: a process's exit totals sit in its newest tail segment
+    let logs: Vec<String> = paths.iter().map(|p| atl_diag::logfiles::read(p)).collect();
     let rows = atl_diag::summary::summary(&logs, since_ms, None);
     log(format_args!("summary {} keys", rows.len()));
     for row in rows {
