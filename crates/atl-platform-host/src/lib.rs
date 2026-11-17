@@ -12,6 +12,8 @@ pub use atl_platform_host_linux::FdoNotifications as PlatformNotifications;
 #[cfg(target_os = "linux")]
 pub use atl_platform_host_linux::GdkDesktop as PlatformDesktop;
 #[cfg(target_os = "linux")]
+pub use atl_platform_host_linux::HostMemoryInfo as PlatformMemory;
+#[cfg(target_os = "linux")]
 pub use atl_platform_host_linux::HostNetwork as PlatformNetwork;
 #[cfg(target_os = "linux")]
 pub use atl_platform_host_linux::IioSensors as PlatformSensors;
@@ -43,6 +45,8 @@ fn implements_the_api() {
     fonts::<PlatformFonts>();
     fn network<T: NetworkSource + Default>() {}
     network::<PlatformNetwork>();
+    fn memory<T: MemorySource + Default>() {}
+    memory::<PlatformMemory>();
     fn notifications<T: Notifications>() {}
     notifications::<PlatformNotifications>();
 }

@@ -4,6 +4,7 @@
 //! The machine's motion sensors ([`Sensors`]): shaped by the one implementation, Linux IIO. A stream per open, served by the kernel buffer where the environment enabled it and by sysfs reads otherwise ([`Tier`]); the caller paces its reads.
 //! The desktop's fonts ([`FontSource`]): which faces, in what order, for which language; read when atld starts.
 //! The host's network ([`NetworkSource`]): the link its default route leaves through, its resolver, and the system's own verdict on reaching the Internet; read when the services start.
+//! The host's memory ([`MemorySource`]): total and available RAM, read afresh per call.
 //! The desktop's notification service ([`Notifications`]): shows, replaces and withdraws notifications atld posts on the apps' behalf; tiers probed per session ([`NotificationTier`]).
 //! No OS or toolkit dependency, no unsafe; core crates use the `atl-platform-host` facade, not this crate or the implementation directly.
 #![forbid(unsafe_code)]
@@ -143,6 +144,29 @@ pub struct DefaultNetwork {
 pub trait NetworkSource: Send + Sync {
     /// The default network now; `None` when the host has no default route (offline).
     fn default_network(&self) -> Result<Option<DefaultNetwork>, NetworkError>;
+}
+
+/// The host's memory could not be read (the kernel's report was missing or unparsable).
+#[derive(Debug, thiserror::Error)]
+#[error("memory state unavailable: {0}")]
+pub struct MemoryError(
+    /// The source's reason.
+    pub String,
+);
+
+/// The host's memory now, in bytes, as the kernel accounts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostMemory {
+    /// Usable RAM: physical memory less what the kernel reserved at boot.
+    pub total: u64,
+    /// The kernel's estimate of memory available to start new programs without swapping (free + reclaimable caches).
+    pub available: u64,
+}
+
+/// The host's memory, as a native program reads it. Shaped by its one implementation: the kernel's /proc/meminfo.
+pub trait MemorySource: Send + Sync {
+    /// The memory figures now; each call reads afresh.
+    fn memory(&self) -> Result<HostMemory, MemoryError>;
 }
 
 /// The desktop's font configuration (plan C7: Android's font list follows the desktop). Shaped by its one implementation, fontconfig: a sorted preference list per query and a plain listing; named instances of a variable font are not separate faces.

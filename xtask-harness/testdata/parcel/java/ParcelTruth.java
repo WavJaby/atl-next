@@ -190,6 +190,18 @@ public class ParcelTruth {
         check("ActivityManager.RunningAppProcessInfo", runningAppProcess(), ActivityManager.RunningAppProcessInfo.CREATOR);
         ActivityManager.RunningAppProcessInfo bare = new ActivityManager.RunningAppProcessInfo("com.example.atltest", 2, new String[] {"com.example.atltest"});
         check("ActivityManager.RunningAppProcessInfo:bare", bare, ActivityManager.RunningAppProcessInfo.CREATOR);
+        // getMemoryInfo's out parameter: every long distinct (a swapped pair shows), lowMemory set
+        ActivityManager.MemoryInfo mem = new ActivityManager.MemoryInfo();
+        mem.advertisedMem = 17179869184L;
+        mem.availMem = 9876543210L;
+        mem.totalMem = 16694829056L;
+        mem.threshold = 226492416L;
+        mem.lowMemory = true;
+        mem.hiddenAppThreshold = 226492417L;
+        mem.secondaryServerThreshold = 226492418L;
+        mem.visibleAppThreshold = 94371840L;
+        mem.foregroundAppThreshold = 75497472L;
+        check("ActivityManager.MemoryInfo", mem, ActivityManager.MemoryInfo.CREATOR);
         // the crash report an app's process sends as it dies (RuntimeInit's uncaught-exception handler): nine strings and one int, nulls where unset
         check("ApplicationErrorReport.ParcelableCrashInfo", crashInfo(), ApplicationErrorReport.ParcelableCrashInfo.CREATOR);
         // IDisplayManager.getDisplayInfo's record (DisplayInfo.writeToParcel): every field set off its default, its Mode arrays in use

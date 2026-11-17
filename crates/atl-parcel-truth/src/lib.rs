@@ -21,6 +21,7 @@ extern crate gui_aidl_types_rs;
 mod capture;
 mod compositor;
 
+use atl_parcelables::android::app::ActivityManager_MemoryInfo;
 use atl_parcelables::android::app::ActivityManager_PendingIntentInfo;
 use atl_parcelables::android::app::ActivityManager_RunningAppProcessInfo;
 use atl_parcelables::android::app::ActivityManager_TaskDescription;
@@ -336,6 +337,9 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
         "android.app.SyncNotedAppOp" => round_trip_as::<SyncNotedAppOp>(input, mode),
         "android.app.ActivityManager$PendingIntentInfo" => {
             round_trip_as::<ActivityManager_PendingIntentInfo>(input, mode)
+        }
+        "android.app.ActivityManager$MemoryInfo" => {
+            round_trip_as::<ActivityManager_MemoryInfo>(input, mode)
         }
         "android.app.ActivityManager$RunningAppProcessInfo" => {
             round_trip_as::<ActivityManager_RunningAppProcessInfo>(input, mode)

@@ -757,7 +757,30 @@ public class Main extends Activity {
         } catch (Throwable t) {
             errors = t.getClass().getSimpleName();
         }
-        return "checksums=" + checksums() + " " + audio() + " " + installer() + " errors=" + errors;
+        return "checksums=" + checksums() + " " + audio() + " " + installer() + " errors=" + errors + " " + memory() + " " + insets();
+    }
+
+    /** ActivityManager.getMemoryInfo: the threshold, and whether the host figures are consistent (total > 0, avail <= total, advertised >= total). */
+    private String memory() {
+        try {
+            android.app.ActivityManager.MemoryInfo m = new android.app.ActivityManager.MemoryInfo();
+            ((android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE)).getMemoryInfo(m);
+            boolean sized = m.totalMem > 0 && m.availMem <= m.totalMem && m.advertisedMem >= m.totalMem;
+            return "memthreshold=" + m.threshold + " memsized=" + sized;
+        } catch (Throwable t) {
+            return "mem=" + t.getClass().getSimpleName();
+        }
+    }
+
+    /** WindowManager.getMaximumWindowMetrics' system-bar + cutout insets (IWindowManager.getWindowInsets), left,top,right,bottom. */
+    private String insets() {
+        try {
+            android.view.WindowMetrics wm = getSystemService(android.view.WindowManager.class).getMaximumWindowMetrics();
+            android.graphics.Insets i = wm.getWindowInsets().getInsets(android.view.WindowInsets.Type.systemBars() | android.view.WindowInsets.Type.displayCutout());
+            return "insets=" + i.left + "," + i.top + "," + i.right + "," + i.bottom;
+        } catch (Throwable t) {
+            return "insets=" + t.getClass().getSimpleName();
+        }
     }
 
     /** The fixture's own installer of record: getInstallerPackageName, then getInstallSourceInfo's installing / initiating package ("nosource" for a null InstallSourceInfo). */

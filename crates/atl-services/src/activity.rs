@@ -28,9 +28,10 @@ use atl_aidl::aidl::android::content::IIntentSender::IIntentSender;
 use atl_broker::control::StartRequest;
 use atl_parcelables::android::app::servertransaction::ClientTransaction;
 use atl_parcelables::android::app::{
-    ActivityManager_PendingIntentInfo, ActivityManager_ProcessErrorStateInfo,
-    ActivityManager_RunningAppProcessInfo, ActivityManager_TaskDescription,
-    ApplicationErrorReport_ParcelableCrashInfo, ContentProviderHolder,
+    ActivityManager_MemoryInfo, ActivityManager_PendingIntentInfo,
+    ActivityManager_ProcessErrorStateInfo, ActivityManager_RunningAppProcessInfo,
+    ActivityManager_TaskDescription, ApplicationErrorReport_ParcelableCrashInfo,
+    ContentProviderHolder,
 };
 use atl_parcelables::android::content::pm::{ActivityInfo, ProviderInfo, ProviderInfoList};
 use atl_parcelables::android::content::res::{CompatibilityInfo, Configuration};
@@ -55,6 +56,7 @@ use crate::activity_task::{ActivityTasks, Back};
 use crate::broadcast::{self, BroadcastFilter, Broadcasts, IntentKey, StickyRefusal};
 use crate::broadcast_queue::{self, Job};
 use crate::config_diff::{self, Config, Delivery};
+use crate::memory_levels;
 use crate::package;
 use crate::packages::{PackageRecord, Packages, Permissions};
 use crate::pattern_matcher;
@@ -1594,6 +1596,35 @@ impl IActivityManager for ActivityManager {
     /// ActivityManagerService.addPackageDependency (WebViewFactory registers on its provider package): AMS records the package so the caller dies when it is updated or removed.
     /// Packages here change only at atld start (install sessions), never under a running process, so the record would have no reader: accepted and dropped, as AOSP also returns void.
     fn r#addPackageDependency(&self, _package_name: Option<&str>) -> binder::Result<()> {
+        Ok(())
+    }
+
+    /// ActivityManagerService.getMemoryInfo:6833 -> ProcessList.getMemoryInfo: the host's MemTotal / MemAvailable through AOSP's thresholds (memory_levels.rs), the display the OOM levels scale
+    /// with being the services' one display. An unreadable /proc/meminfo is refused and counted (AOSP's getFreeMemory throws there too).
+    fn r#getMemoryInfo(
+        &self,
+        out_info: &mut Option<ActivityManager_MemoryInfo>,
+    ) -> binder::Result<()> {
+        use atl_platform_host::MemorySource;
+        let host = atl_platform_host::PlatformMemory.memory().map_err(|e| {
+            atl_diag::refused(AM, &format!("getMemoryInfo: {e}"));
+            Status::new_exception_str(ExceptionCode::ILLEGAL_STATE, Some(e.to_string()))
+        })?;
+        let display = self.inner.tasks.display();
+        let m =
+            memory_levels::memory_info(host.total, host.available, display.width, display.height);
+        atl_diag::answered(AM, "getMemoryInfo");
+        *out_info = Some(ActivityManager_MemoryInfo {
+            advertised_mem: m.advertised_mem,
+            avail_mem: m.avail_mem,
+            total_mem: m.total_mem,
+            threshold: m.threshold,
+            low_memory: m.low_memory,
+            hidden_app_threshold: m.hidden_app_threshold,
+            secondary_server_threshold: m.secondary_server_threshold,
+            visible_app_threshold: m.visible_app_threshold,
+            foreground_app_threshold: m.foreground_app_threshold,
+        });
         Ok(())
     }
 

@@ -356,8 +356,10 @@ const SYSANSWERS: &str = "AtlTest: sysanswers: ";
 /// - `installer=null source=null/null`: an install with no installer of record (the `adb install` case, ComputerEngine.getInstallerPackageName / getInstallSourceInfo): no installer, and an
 ///   InstallSourceInfo whose installing and initiating packages are null. Before: the same null installer, but a null InstallSourceInfo (`nosource`), which AOSP gives only for an unknown package.
 /// - `errors=null`: getProcessesInErrorState with no crashing or ANR process (AMS returns its lazily created list, still null). The unanswered call read the same; the run's diag counters tell them apart.
-const SYSANSWERS_WANT: &str =
-    "checksums=0 volume=5 max=15 ringer=2 mode=0 installer=null source=null/null errors=null";
+/// - `memthreshold=226492416 memsized=true`: ProcessList.getMemoryInfo on any host of >= 700 MB (updateOomLevels scale 1): threshold = getMemLevel(HOME_APP_ADJ 600) = the 64-bit-raised
+///   mOomMinFreeHigh[4], 147456 * 3 / 2 = 221184 KB = 226492416 bytes; total > 0, avail <= total, advertised (roundStorageSize) >= total. Before: the out param untouched, threshold 0, sized false.
+/// - `insets=0,0,0,0`: the desktop display has no system bars or cutout. The unanswered call left an empty InsetsState, the same zeros; the diag counters tell them apart.
+const SYSANSWERS_WANT: &str = "checksums=0 volume=5 max=15 ringer=2 mode=0 installer=null source=null/null errors=null memthreshold=226492416 memsized=true insets=0,0,0,0";
 /// Main.settings' line, answered by AOSP SettingsProvider in its own process (`id=<s> again=<b> screen_off=<s> auto_time=<s> rotation=<s>`, [`settings_why`]).
 const SETTINGS: &str = "AtlTest: settings: ";
 /// The line after `id=`: the defaults DatabaseHelper loads from SettingsProvider's res/values/defaults.xml -- def_screen_off_timeout 60000, def_auto_time true (loadBooleanSetting writes "1"),

@@ -3,6 +3,7 @@
 //! any window exists: hasNavigationBar: false. WindowManagerService.hasNavigationBar (WindowManagerService.java:6669-6677) asks the display policy, which reads
 //! config_showNavigationBar (frameworks/base/core/res/res/values/config.xml:2743, false); the desktop has no software navigation bar.
 //! getCurrentAnimatorScale: 1.0. WindowManagerService.getCurrentAnimatorScale (:3687-3691) returns mAnimatorDurationScaleSetting, whose default is 1.0f (:1052), or 0 with animations disabled.
+//! getWindowInsets (WindowMetrics' insets, asked before or without a window): the display's insets, none (no system bars, no cutout), and false.
 //! openSession: a session for the caller's callback (WindowManagerService.openSession:6004-6005); the session's window methods are below.
 //! Session, the window path: addToDisplayAsUser (WindowManagerService.addWindow: ADD_OKAY, the client end of the window's input channel (its server end goes to the app's UI agent), the insets, the frame, scale 1),
 //! relayout (WindowManagerService.relayoutWindow: the client frames, the merged configuration, the SurfaceControl the window's UI agent gives, the insets), remove (the window goes:
@@ -287,6 +288,30 @@ impl IWindowManager for WindowManager {
     /// WindowManagerService.getCurrentAnimatorScale:3687-3691 with the default setting 1.0f (:1052) and animations enabled.
     fn r#getCurrentAnimatorScale(&self) -> binder::Result<f32> {
         Ok(1.0)
+    }
+
+    /// WindowManagerService.getWindowInsets:9749: the display's insets for window metrics (InsetsPolicy.getInsetsForWindowMetrics: the display's raw InsetsState, here [`display_insets`], what
+    /// addToDisplayAsUser and relayout also give), and DisplayPolicy.areSystemBarsForcedConsumedLw: false (no system bars to force). Another display id has no DisplayContent: AOSP throws
+    /// InvalidDisplayException there; refused and counted as IllegalArgumentException.
+    fn r#getWindowInsets(
+        &self,
+        display_id: i32,
+        _token: Option<&SpIBinder>,
+        out_insets_state: &mut Option<InsetsState>,
+    ) -> binder::Result<bool> {
+        if display_id != activity::DEFAULT_DISPLAY {
+            atl_diag::refused(
+                WINDOW_MANAGER,
+                &format!("getWindowInsets: no display {display_id}"),
+            );
+            return Err(Status::new_exception_str(
+                ExceptionCode::ILLEGAL_ARGUMENT,
+                Some(format!("Display#{display_id}could not be found!")),
+            ));
+        }
+        atl_diag::answered(WINDOW_MANAGER, "getWindowInsets");
+        *out_insets_state = Some(display_insets(&self.tasks));
+        Ok(false)
     }
 
     /// WindowManagerService.openSession:6004-6005: a session for the caller's callback; the callback is not kept (no window event reaches the app yet).
