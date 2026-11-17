@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! The real-desktop font gate (check step `host-fonts`, `xtask test host-fonts`): a CJK and an emoji code point each resolve to a real font file through the product's own font list, built as atld builds it (atl_fonts::build over the platform layer's fontconfig, the desktop's own config, AOSP's alias/fallback data at the pin).
-//! Resolution = minikin's fallback walk over font_fallback.xml: families in document order, the first face whose cmap maps the code point (FontCollection::getFamilyForChar without locale/variant scoring). The cmap is read here with read-fonts, not through atl-fonts.
-//! Three verdicts: ok (family + file per code point); FAIL = the desktop has a face covering the code point (any face fontconfig lists, cmap read here) but the product's list resolves none; "host lacks a <group> font" = no listed face covers it: a skip check names, not a product failure and not a pass.
-//! Breaks (each must leave the ok verdict): `empty-dir` re-runs the gate under a fontconfig config whose only dir is empty (this harness's fixture, FONTCONFIG_FILE on the child) -> host lacks both; `no-fallback` builds the list with an empty fallback order -> FAIL on both (the host still has the faces).
+//! Resolution = minikin's fallback walk over font_fallback.xml: families in document order, the first face whose cmap maps the code point; for an Emoji_Presentation code point a family whose lang has script Zsye first (FontCollection's emoji-style score), so a text font's monochrome glyph (DejaVu Sans maps U+1F431) does not answer for the emoji font. Other locale scoring is not modelled. The cmap is read here with read-fonts, not through atl-fonts.
+//! Three verdicts: ok (family + file per code point); FAIL = the desktop has a face for the code point (fontconfig lists it, for emoji under lang `und-zsye`; cmap read here) but the product's list resolves none; "host lacks a <group> font" = no listed face: a skip check names, not a product failure and not a pass.
+//! Breaks (each must leave the ok verdict): `empty-dir` re-runs the gate under a fontconfig config whose only dir is empty (this harness's fixture, FONTCONFIG_FILE on the child) -> host lacks both; `no-fallback` builds the list with an empty fallback order -> FAIL (the host still has the faces).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -13,10 +13,30 @@ use atl_platform_host::{FontQuery, FontSource, PlatformFonts};
 
 use crate::tree;
 
-/// The code points checked, with the group name the "host lacks" verdict uses.
-/// U+8C93 貓 (cat): the Traditional-only form (Simplified 猫) in Battle Cats TW's title 貓咪大戰爭, whose CJK text went missing until the desktop's CJK faces resolved (state bctw-freeze-fonts); only a CJK font maps it.
-/// U+1F431 🐱 (cat face): Unicode 6.0, Emoji_Presentation=Yes (emoji-data.txt), so an emoji font maps it and text fonts usually do not.
-pub const POINTS: [(char, &str); 2] = [('\u{8C93}', "CJK"), ('\u{1F431}', "emoji")];
+/// One checked code point: the group the "host lacks" verdict names (with its article), and for an emoji-presentation point the AOSP script its family's lang must carry + fontconfig's lang id for the desktop probe.
+pub struct Point {
+    pub c: char,
+    pub group: &'static str,
+    pub article: &'static str,
+    pub style: Option<(&'static str, &'static str)>,
+}
+
+/// U+8C93 貓 (cat): the Traditional-only form (Simplified 猫) of Battle Cats TW's title 貓咪大戰爭, a CJK app whose text rendered as boxes when the desktop's CJK faces did not reach the font list; only a CJK font maps it.
+/// U+1F431 🐱 (cat face): Unicode 6.0, Emoji_Presentation=Yes (emoji-data.txt); AOSP's emoji fallback is lang `und-Zsye` (fallback_order.json), fontconfig's id for it `und-zsye` (fc-lang und_zsye.orth).
+pub const POINTS: [Point; 2] = [
+    Point {
+        c: '\u{8C93}',
+        group: "CJK",
+        article: "a",
+        style: None,
+    },
+    Point {
+        c: '\u{1F431}',
+        group: "emoji",
+        article: "an",
+        style: Some(("Zsye", "und-zsye")),
+    },
+];
 
 /// AOSP's font data at the pin, as atld's `--font-data`.
 const FONT_DATA: &str = "frameworks/base/data/fonts";
@@ -107,9 +127,10 @@ pub fn check(root: &Path, no_fallback: bool) -> Result<Option<String>> {
     let mut ok = Vec::new();
     let mut fails = Vec::new();
     let mut lacks = Vec::new();
-    for (c, group) in POINTS {
+    for p in &POINTS {
+        let (c, group) = (p.c, p.group);
         let cp = format!("{group} U+{:04X}", u32::from(c));
-        match resolve(&model, &src, c)? {
+        match resolve(&model, &src, p)? {
             Outcome::Resolved(fam, file, index) => {
                 ok.push(format!("{cp} -> {fam} {}#{index}", file.display()));
             }
@@ -118,7 +139,11 @@ pub fn check(root: &Path, no_fallback: bool) -> Result<Option<String>> {
                 file.display()
             )),
             Outcome::HostLacks => lacks.push(format!(
-                "host lacks a {group} font (no face fontconfig lists maps U+{:04X})",
+                "host lacks {} {group} font (no face fontconfig lists{} maps U+{:04X})",
+                p.article,
+                p.style
+                    .map(|(_, l)| format!(" for lang {l}"))
+                    .unwrap_or_default(),
                 u32::from(c)
             )),
         }
@@ -132,9 +157,17 @@ pub fn check(root: &Path, no_fallback: bool) -> Result<Option<String>> {
     Ok((!lacks.is_empty()).then(|| lacks.join("; ")))
 }
 
-/// minikin's walk over the product's list; on a miss, whether any desktop face maps `c`.
-fn resolve(model: &atl_fonts::Model, src: &PlatformFonts, c: char) -> Result<Outcome> {
-    for fam in &model.families {
+/// minikin's walk over the product's list (an emoji-style point: its script's families only); on a miss, whether a desktop face (for emoji: one fontconfig lists for its lang) maps the point.
+fn resolve(model: &atl_fonts::Model, src: &PlatformFonts, p: &Point) -> Result<Outcome> {
+    let c = p.c;
+    let styled = |fam: &atl_fonts::Family| match p.style {
+        None => true,
+        Some((script, _)) => fam.lang.as_deref().is_some_and(|l| {
+            l.split(',')
+                .any(|t| t.trim().split('-').any(|s| s == script))
+        }),
+    };
+    for fam in model.families.iter().filter(|f| styled(f)) {
         for f in &fam.fonts {
             let file = model.dirs[f.dir].join(&f.file);
             if maps(&file, f.index, c)? {
@@ -149,7 +182,7 @@ fn resolve(model: &atl_fonts::Model, src: &PlatformFonts, c: char) -> Result<Out
     }
     let all = src.list(&FontQuery {
         family: String::new(),
-        lang: None,
+        lang: p.style.map(|(_, l)| l.to_owned()),
         width: None,
     })?;
     for f in all {
