@@ -321,6 +321,9 @@ public class ParcelTruth {
         checkIntentBinder("Intent:binder-extras", echo);
         // the alarm path (atl-services alarm.rs): the operation a set alarm is matched by, its IIntentSender's binder
         checkPendingIntent("PendingIntent", echo);
+        // INotificationManager.enqueueNotificationWithTag (atl-services notification.rs): a notification without binders byte-equal, and one with a contentIntent and an Action through Java Parcels
+        check("Notification", notification(null), Notification.CREATOR);
+        checkNotificationIntents("Notification:pending-intents", echo);
 
         // the window path (M3 slice 5): the LayoutParams IWindowSession receives, and the replies it sends (addToDisplayAsUser, relayout), each field off its default
         check("WindowManager.LayoutParams", layoutParams(), WindowManager.LayoutParams.CREATOR);
@@ -590,6 +593,50 @@ public class ParcelTruth {
         PendingIntent back = PendingIntent.CREATOR.createFromParcel(out);
         boolean ok = consumed && back != null && back.equals(sent) && usable(back.getTarget().asBinder());
         result(ok, name, ok ? "binder survived java -> rust -> java: equal to the sent PendingIntent, answers a transaction" : "consumed " + consumed + ", back " + back);
+        in.recycle();
+        out.recycle();
+    }
+
+    /// A notification as an app posts one, built field by field (Notification.Builder needs a Context): resource small icon, ticker, extras, category, colour, channel; `intent` non-null adds it as
+    /// contentIntent and as an Action's intent, so writeToParcel also writes the allPendingIntents ArraySet.
+    static Notification notification(PendingIntent intent) {
+        Notification n = new Notification();
+        n.icon = 0x7f020001;
+        n.when = 1700000000000L;
+        n.number = 3;
+        n.tickerText = "ticker";
+        n.category = Notification.CATEGORY_STATUS;
+        n.color = 0xff336699;
+        n.flags = Notification.FLAG_AUTO_CANCEL;
+        n.extras.putString(Notification.EXTRA_TITLE, "Install");
+        n.extras.putString(Notification.EXTRA_TEXT, "Get Google Play services");
+        n.contentIntent = intent;
+        n.actions = new Notification.Action[] {new Notification.Action(0x7f020002, "Open", intent)};
+        try {
+            Field f = Notification.class.getDeclaredField("mChannelId");
+            f.setAccessible(true);
+            f.set(n, "atl.test");
+        } catch (ReflectiveOperationException e) {
+            throw new RuntimeException(e);
+        }
+        return n;
+    }
+
+    /// Notification with PendingIntents: Java Parcel -> codec -> Java Parcel, every byte consumed and written back, the same binders (PendingIntent.equals), the channel kept.
+    static void checkNotificationIntents(String name, Binder echo) {
+        PendingIntent sent = new PendingIntent(IIntentSender.Stub.asInterface(echo));
+        Parcel in = written(notification(sent));
+        Parcel out = Parcel.obtain();
+        if (roundTripParcel("android.app.Notification", in, out) != 0) {
+            result(false, name, "rust: " + lastError());
+            return;
+        }
+        boolean consumed = out.dataSize() == in.dataSize();
+        out.setDataPosition(0);
+        Notification back = Notification.CREATOR.createFromParcel(out);
+        boolean ok = consumed && sent.equals(back.contentIntent) && back.actions != null && back.actions.length == 1 && sent.equals(back.actions[0].actionIntent)
+                && "atl.test".equals(back.getChannelId()) && usable(back.contentIntent.getTarget().asBinder());
+        result(ok, name, ok ? "contentIntent and Action intent survived java -> rust -> java: equal PendingIntents, channel kept, binder answers" : "consumed " + consumed + ", back " + back);
         in.recycle();
         out.recycle();
     }

@@ -30,16 +30,16 @@ pub struct Bundle {
 }
 
 /// A body Parcel behind a lock: a Parcel is `Send` but not `Sync` (its cursor is mutable state), and the generated AIDL stubs' async traits need every `&` argument to be `Sync`.
-/// The codec only reads a body (`get_data_size`, `marshal`, `append_from` out of it); the lock serialises those.
+/// The codec only reads a body (`get_data_size`, `marshal`, `append_from` out of it); the lock serialises those. Notification keeps its whole parcelled range the same way.
 #[derive(Debug, Default)]
-struct Body(Mutex<Parcel>);
+pub(crate) struct Body(Mutex<Parcel>);
 
 impl Body {
-    fn new(parcel: Parcel) -> Self {
+    pub(crate) fn new(parcel: Parcel) -> Self {
         Body(Mutex::new(parcel))
     }
 
-    fn lock(&self) -> MutexGuard<'_, Parcel> {
+    pub(crate) fn lock(&self) -> MutexGuard<'_, Parcel> {
         // a poisoned lock still guards a whole Parcel: no body code panics half-way through a call
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }

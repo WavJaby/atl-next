@@ -26,10 +26,10 @@ use atl_parcelables::android::app::ActivityManager_RunningAppProcessInfo;
 use atl_parcelables::android::app::ActivityManager_TaskDescription;
 use atl_parcelables::android::app::ApplicationErrorReport_ParcelableCrashInfo;
 use atl_parcelables::android::app::ContentProviderHolder;
-use atl_parcelables::android::app::NotificationChannel;
 use atl_parcelables::android::app::PendingIntent;
 use atl_parcelables::android::app::SyncNotedAppOp;
 use atl_parcelables::android::app::servertransaction::ClientTransaction;
+use atl_parcelables::android::app::{Notification, NotificationChannel};
 use atl_parcelables::android::content::pm::{
     ActivityInfo, ApplicationInfo, ConfigurationInfo, InstrumentationInfo, PackageInfo,
     ParceledListSlice, PermissionInfo, ProviderInfo, ProviderInfoList, ServiceInfo, UserInfo,
@@ -187,6 +187,7 @@ fn copy_class(
         "android.os.Bundle" => copy_as::<Bundle>(src, dst),
         "android.content.Intent" => copy_as::<Intent>(src, dst),
         "android.app.PendingIntent" => copy_as::<PendingIntent>(src, dst),
+        "android.app.Notification" => copy_as::<Notification>(src, dst),
         "android.view.InputChannel" => copy_as::<InputChannel>(src, dst),
         "android.view.PointerIcon" => copy_as::<PointerIcon>(src, dst),
         "android.view.SurfaceControl" => copy_as::<SurfaceControl>(src, dst),
@@ -322,6 +323,7 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
         }
         "android.app.ContentProviderHolder" => round_trip_as::<ContentProviderHolder>(input, mode),
         "android.app.PendingIntent" => round_trip_as::<PendingIntent>(input, mode),
+        "android.app.Notification" => round_trip_as::<Notification>(input, mode),
         "android.app.SyncNotedAppOp" => round_trip_as::<SyncNotedAppOp>(input, mode),
         "android.app.ActivityManager$PendingIntentInfo" => {
             round_trip_as::<ActivityManager_PendingIntentInfo>(input, mode)

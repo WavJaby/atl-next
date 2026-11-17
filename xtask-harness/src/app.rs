@@ -229,7 +229,7 @@ const SERVICE_LINES: [(&str, &str, Option<&str>); 9] = [
     (
         "notification",
         "AtlTest: notification: ",
-        Some("importance=2 name=ATL test visibility=-1000 count=1 absent=null raised=2"),
+        Some("importance=2 name=ATL test visibility=-1000 count=1 absent=null raised=2 notify=ok"),
     ),
     (
         "power",
@@ -253,12 +253,20 @@ const SERVICE_LINES: [(&str, &str, Option<&str>); 9] = [
     ),
 ];
 /// Calls a [`SERVICE_LINES`] row makes that the app cannot see refused (a method a service lacks reads back as no error and zeros), so the services' own `answered` count must show each:
-/// (service, counter key). notification: Main.channels' NotificationManager.cancel of a never-posted id. appops: Main.appOps' first noted COARSE_LOCATION (runtime permission -> notes collected)
-/// reports its stack trace, AppOpsManager's sConfig starting expired.
-const SERVICE_CALLS: [(&str, &str); 6] = [
+/// (service, counter key). notification: Main.channels' NotificationManager.cancel of a never-posted id, then notify of id 8 (kept, not shown) and its cancel, which finds the record.
+/// appops: Main.appOps' first noted COARSE_LOCATION (runtime permission -> notes collected) reports its stack trace, AppOpsManager's sConfig starting expired.
+const SERVICE_CALLS: [(&str, &str); 8] = [
     (
         "notification",
         "INotificationManager.cancelNotificationWithTag (nothing posted)",
+    ),
+    (
+        "notification",
+        "INotificationManager.notification: posted com.example.atltest id=8 (not shown: no host backend yet)",
+    ),
+    (
+        "notification",
+        "INotificationManager.cancelNotificationWithTag (cancelled)",
     ),
     (
         "appops",

@@ -5,8 +5,10 @@
 //! The app draws the toast: text toasts take the pre-R TN path (activity.rs DISABLED_COMPAT_CHANGES), so ITransientNotification.show(windowToken) makes the app's ToastPresenter add a
 //! TYPE_TOAST window with that token; the token is bound to the caller's newest Task here (WindowManagerInternal.addWindowToken), which is where window.rs places the window.
 //! Channels: apps create and read back their own (notification_channels.rs), as a device answers (behaviour decision 1); nothing is displayed for them.
-//! Not modelled: rate limiting, per-user visibility, suspended/blocked packages, accessibility timeouts, enqueueTextToast (no system UI: answered false), channel groups and posting (counted UNKNOWN).
-//! Cancelling a notification checks the caller as AOSP does and finds nothing, since nothing is posted.
+//! Posting: enqueueNotificationWithTag keeps a record per (pkg, tag, id, user) and cancelNotificationWithTag removes it, both checking the caller as AOSP does; nothing is shown (no host notification
+//! backend yet: the log line `notification: posted <pkg> id=<n> (not shown: no host backend yet)` counts each).
+//! Not modelled: rate limiting, per-user visibility, suspended/blocked packages, POST_NOTIFICATIONS, accessibility timeouts, enqueueTextToast (no system UI: answered false), channel groups,
+//! getAppActiveNotifications (StatusBarNotification has no codec) (counted UNKNOWN).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -16,7 +18,7 @@ use atl_aidl::aidl::android::app::INotificationManager::{
     BnNotificationManager, EnforcePermission, INotificationManager,
 };
 use atl_aidl::mangled::_7_android_3_app_22_ITransientNotification as ITransientNotification;
-use atl_parcelables::android::app::NotificationChannel;
+use atl_parcelables::android::app::{Notification, NotificationChannel};
 use atl_parcelables::android::content::pm::ParceledListSlice;
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, Strong, ThreadState};
 
@@ -56,6 +58,16 @@ struct State {
     /// hidden toasts whose window token waits for finishToken (or the timeout): (pkg, token, window token)
     finishing: Vec<(String, SpIBinder, SpIBinder)>,
     channels: Channels,
+    /// posted notifications (NotificationRecord), keyed (pkg, tag, id, user)
+    posted: Vec<Posted>,
+}
+
+/// A posted notification's key. The Notification itself is not kept until a reader exists (getAppActiveNotifications, a host backend).
+struct Posted {
+    pkg: String,
+    tag: Option<String>,
+    id: i32,
+    user: u32,
 }
 
 struct Inner {
@@ -86,6 +98,39 @@ impl Inner {
             ExceptionCode::SECURITY,
             Some(format!("{method}: package {pkg} is not uid {uid}'s")),
         ))
+    }
+
+    /// The caller checks enqueue and cancel share: resolveNotificationUid (pkg and opPkg must be the caller's: no delegates exist, else SecurityException), then handleIncomingUser (USER_CURRENT is
+    /// the caller's own user; another user needs INTERACT_ACROSS_USERS). Returns (calling uid, resolved user).
+    fn resolve_caller(
+        &self,
+        method: &str,
+        pkg: &str,
+        op_pkg: Option<&str>,
+        user_id: i32,
+    ) -> binder::Result<(u32, u32)> {
+        let uid = self.check_same_app(method, pkg)?;
+        if let Some(op_pkg) = op_pkg.filter(|o| *o != pkg) {
+            self.check_same_app(method, op_pkg)?;
+        }
+        let own = permission::user_id(uid);
+        if user_id == USER_CURRENT || i64::from(own) == i64::from(user_id) {
+            return Ok((uid, own));
+        }
+        if !self.permissions.holds(uid, &[INTERACT_ACROSS_USERS], false) {
+            return Err(Status::new_exception_str(
+                ExceptionCode::SECURITY,
+                Some(format!(
+                    "{method} for user {user_id}: caller lacks {INTERACT_ACROSS_USERS}"
+                )),
+            ));
+        }
+        u32::try_from(user_id).map(|u| (uid, u)).map_err(|_| {
+            Status::new_exception_str(
+                ExceptionCode::ILLEGAL_ARGUMENT,
+                Some(format!("{method}: user {user_id}")),
+            )
+        })
     }
 
     /// canNotifyAsPackage (NotificationManagerService): the calling package is the caller's, another user needs INTERACT_ACROSS_USERS, and the target is the calling package itself (no delegates
@@ -350,30 +395,77 @@ impl INotificationManager for NotificationManager {
         &self,
         pkg: Option<&str>,
         op_pkg: Option<&str>,
-        _tag: Option<&str>,
-        _id: i32,
+        tag: Option<&str>,
+        id: i32,
         user_id: i32,
     ) -> binder::Result<()> {
         let pkg = pkg.ok_or_else(|| Status::new_exception(ExceptionCode::NULL_POINTER, None))?;
-        let uid = self.0.check_same_app("cancelNotificationWithTag", pkg)?;
-        if let Some(op_pkg) = op_pkg.filter(|o| *o != pkg) {
-            self.0.check_same_app("cancelNotificationWithTag", op_pkg)?;
-        }
-        if user_id != USER_CURRENT
-            && i64::from(permission::user_id(uid)) != i64::from(user_id)
-            && !self
-                .0
-                .permissions
-                .holds(uid, &[INTERACT_ACROSS_USERS], false)
-        {
+        let (_, user) = self
+            .0
+            .resolve_caller("cancelNotificationWithTag", pkg, op_pkg, user_id)?;
+        let mut st = self.0.lock();
+        let before = st.posted.len();
+        st.posted
+            .retain(|p| !(p.pkg == pkg && p.tag.as_deref() == tag && p.id == id && p.user == user));
+        let removed = before - st.posted.len();
+        drop(st);
+        atl_diag::answered(
+            INTERFACE,
+            if removed > 0 {
+                "cancelNotificationWithTag (cancelled)"
+            } else {
+                "cancelNotificationWithTag (nothing posted)"
+            },
+        );
+        Ok(())
+    }
+
+    /// enqueueNotificationWithTag (:4141 -> enqueueNotificationInternal): null pkg or notification is IllegalArgumentException; the caller checks of cancelNotificationWithTag; a channel the app
+    /// never created drops the notification with a log (AOSP "No Channel found", no exception); else the (pkg, tag, id, user) record is replaced or added. Nothing is displayed: no host backend yet.
+    fn r#enqueueNotificationWithTag(
+        &self,
+        pkg: Option<&str>,
+        op_pkg: Option<&str>,
+        tag: Option<&str>,
+        id: i32,
+        notification: Option<&Notification>,
+        user_id: i32,
+    ) -> binder::Result<()> {
+        let (Some(pkg), Some(notification)) = (pkg, notification) else {
             return Err(Status::new_exception_str(
-                ExceptionCode::SECURITY,
-                Some(format!(
-                    "cancelNotificationWithTag for user {user_id}: caller lacks {INTERACT_ACROSS_USERS}"
-                )),
+                ExceptionCode::ILLEGAL_ARGUMENT,
+                Some("null not allowed"),
             ));
+        };
+        let (uid, user) =
+            self.0
+                .resolve_caller("enqueueNotificationWithTag", pkg, op_pkg, user_id)?;
+        let mut st = self.0.lock();
+        let channel = notification.channel_id.as_deref();
+        if st.channels.get(uid, pkg, channel).is_none() {
+            drop(st);
+            atl_diag::answered(
+                INTERFACE,
+                &format!(
+                    "notification: No Channel found for pkg={pkg}, channelId={}: dropped",
+                    channel.unwrap_or("null")
+                ),
+            );
+            return Ok(());
         }
-        atl_diag::answered(INTERFACE, "cancelNotificationWithTag (nothing posted)");
+        st.posted
+            .retain(|p| !(p.pkg == pkg && p.tag.as_deref() == tag && p.id == id && p.user == user));
+        st.posted.push(Posted {
+            pkg: pkg.to_owned(),
+            tag: tag.map(str::to_owned),
+            id,
+            user,
+        });
+        drop(st);
+        atl_diag::answered(
+            INTERFACE,
+            &format!("notification: posted {pkg} id={id} (not shown: no host backend yet)"),
+        );
         Ok(())
     }
 

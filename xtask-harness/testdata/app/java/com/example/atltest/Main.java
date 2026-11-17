@@ -575,7 +575,8 @@ public class Main extends Activity {
 
     /**
      * "importance=<int> name=<name> visibility=<int> count=<n> absent=<channel> raised=<int>": a channel created at IMPORTANCE_LOW and read back, the channel count, an unknown id, and the importance
-     * after re-creating it at IMPORTANCE_HIGH (Unity's registerNotificationChannel path); "absent" when getSystemService returns null; else what it threw.
+     * after re-creating it at IMPORTANCE_HIGH (Unity's registerNotificationChannel path), then " notify=ok" when a notification on that channel posts and cancels, else the exception's class;
+     * "absent" when getSystemService returns null; else what it threw.
      */
     private String channels() {
         try {
@@ -596,7 +597,20 @@ public class Main extends Activity {
             android.app.NotificationChannel again = nm.getNotificationChannel("atl.test");
             // nothing was posted, so AOSP's cancel finds no record and returns; the services' count shows it was served (app.rs SERVICE_CALLS)
             nm.cancel("atl.tag", 7);
-            return read + " count=" + count + " absent=" + absent + " raised=" + (again == null ? "none" : again.getImportance());
+            // a posted notification (GMS's availability notification in Doodle Jump): accepted without an exception, then cancelled (app.rs SERVICE_CALLS)
+            String posted;
+            try {
+                nm.notify("atl.tag", 8, new android.app.Notification.Builder(this, "atl.test")
+                        .setSmallIcon(android.R.drawable.ic_dialog_info)
+                        .setContentTitle("ATL test")
+                        .setContentText("posted")
+                        .build());
+                nm.cancel("atl.tag", 8);
+                posted = "ok";
+            } catch (Throwable t) {
+                posted = t.getClass().getSimpleName();
+            }
+            return read + " count=" + count + " absent=" + absent + " raised=" + (again == null ? "none" : again.getImportance()) + " notify=" + posted;
         } catch (Throwable t) {
             return "threw " + t;
         }
