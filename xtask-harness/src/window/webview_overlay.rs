@@ -74,7 +74,10 @@ pub fn checks(app: &str, esc_back: bool) -> Vec<Sub> {
         }
     };
     let no_back = || {
-        if [BACK_PAGE, BACK_DISMISSED, BACK_GAME].iter().any(|b| has(b)) {
+        if [BACK_PAGE, BACK_DISMISSED, BACK_GAME]
+            .iter()
+            .any(|b| has(b))
+        {
             Err("a back without the Esc -> Back adaptation (AOSP: Esc has no fallback)".to_owned())
         } else {
             Ok("no back (AOSP map)".to_owned())
@@ -83,7 +86,10 @@ pub fn checks(app: &str, esc_back: bool) -> Vec<Sub> {
     let (page_back, dismiss, game) = if esc_back {
         (
             line("Esc on the page -> BACK -> WebView.goBack", BACK_PAGE),
-            line("Esc, no history -> BACK -> the SDK removed its WebView", BACK_DISMISSED),
+            line(
+                "Esc, no history -> BACK -> the SDK removed its WebView",
+                BACK_DISMISSED,
+            ),
             line("Esc on the GL view -> BACK -> the activity", BACK_GAME),
         )
     } else {
@@ -102,8 +108,20 @@ pub fn checks(app: &str, esc_back: bool) -> Vec<Sub> {
     vec![
         ("loaded", line("onPageFinished", LOADED)),
         ("resize", resize_check(app)),
-        ("page-tap", line("the click reached the page (title tap1)", &format!("{TITLE}tap1"))),
-        ("page-scroll", line("the wheel scrolled the page (title scrolled)", &format!("{TITLE}scrolled"))),
+        (
+            "page-tap",
+            line(
+                "the click reached the page (title tap1)",
+                &format!("{TITLE}tap1"),
+            ),
+        ),
+        (
+            "page-scroll",
+            line(
+                "the wheel scrolled the page (title scrolled)",
+                &format!("{TITLE}scrolled"),
+            ),
+        ),
         ("esc-page-back", page_back),
         ("esc-dismiss", dismiss),
         ("esc-game", game),
@@ -115,7 +133,10 @@ pub fn checks(app: &str, esc_back: bool) -> Vec<Sub> {
 fn resize_check(app: &str) -> Result<String, String> {
     let (w, h) = window_size(app).ok_or("no layout line from the fixture")?;
     if i64::from(w) != i64::from(RESIZE.0) {
-        return Err(format!("fixture window {w}x{h} after the resize, configured width {}", RESIZE.0));
+        return Err(format!(
+            "fixture window {w}x{h} after the resize, configured width {}",
+            RESIZE.0
+        ));
     }
     let dst = last_placed(app).ok_or("no sideband placement line")?;
     if dst != [0, 0, i64::from(w), i64::from(h)] {
@@ -133,9 +154,13 @@ fn resize_check(app: &str) -> Result<String, String> {
     let (iw, ih) = vp;
     let (w, h) = (i64::from(w), i64::from(h));
     if (iw * h - ih * w).abs() > w.max(h) {
-        return Err(format!("page viewport {iw}x{ih} CSS px does not match the view {w}x{h}"));
+        return Err(format!(
+            "page viewport {iw}x{ih} CSS px does not match the view {w}x{h}"
+        ));
     }
-    Ok(format!("placement and page viewport follow the window: dst 0,0,{w},{h}, viewport {iw}x{ih} CSS px"))
+    Ok(format!(
+        "placement and page viewport follow the window: dst 0,0,{w},{h}, viewport {iw}x{ih} CSS px"
+    ))
 }
 
 fn esc(proxy: &Proxy) -> Result<(), String> {
@@ -145,8 +170,10 @@ fn esc(proxy: &Proxy) -> Result<(), String> {
 
 /// The probe: configure acked, page loaded and painted; resize; click the page's button; three Escs, each waiting for its answer (a missing answer is its sub-gate's failure, not the probe's).
 pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
-    await_event(&proxy.events, ACK_WAIT, |e| matches!(e, ProxyEvent::Acked { .. }))
-        .ok_or("the window never acked a configure")?;
+    await_event(&proxy.events, ACK_WAIT, |e| {
+        matches!(e, ProxyEvent::Acked { .. })
+    })
+    .ok_or("the window never acked a configure")?;
     wait_for_line(app_log, LOADED, ACK_WAIT)
         .then_some(())
         .ok_or("the page never finished loading")?;
@@ -155,29 +182,49 @@ pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
         proxy
             .inject_configure(w, h, serial, &[])
             .map_err(|e| e.to_string())?;
-        let _ = await_event(&proxy.events, ACK_WAIT, |e| *e == ProxyEvent::Acked { serial });
+        let _ = await_event(&proxy.events, ACK_WAIT, |e| {
+            *e == ProxyEvent::Acked { serial }
+        });
         std::thread::sleep(RESIZE_SETTLE);
     }
     let text = std::fs::read_to_string(app_log).map_err(|e| e.to_string())?;
     let (ox, oy) = super::content_origin(&text)?;
     let (cw, ch) = window_size(&text).ok_or("no layout line from the fixture")?;
-    let centre = (f64::from(cw / 2) + f64::from(ox), f64::from(ch / 2) + f64::from(oy));
+    let centre = (
+        f64::from(cw / 2) + f64::from(ox),
+        f64::from(ch / 2) + f64::from(oy),
+    );
     widgets::inject(
         &proxy,
         vec![
-            PointerAction::Enter { x: centre.0, y: centre.1 },
-            PointerAction::Motion { x: centre.0, y: centre.1 },
+            PointerAction::Enter {
+                x: centre.0,
+                y: centre.1,
+            },
+            PointerAction::Motion {
+                x: centre.0,
+                y: centre.1,
+            },
             widgets::press(true),
             widgets::press(false),
         ],
     )?;
     let _ = widgets::wait_until(app_log, INPUT_WAIT, |t| t.contains(&format!("{TITLE}tap1")));
-    widgets::inject(&proxy, vec![PointerAction::Wheel { notches: WHEEL_NOTCHES }])?;
-    let _ = widgets::wait_until(app_log, INPUT_WAIT, |t| t.contains(&format!("{TITLE}scrolled")));
+    widgets::inject(
+        &proxy,
+        vec![PointerAction::Wheel {
+            notches: WHEEL_NOTCHES,
+        }],
+    )?;
+    let _ = widgets::wait_until(app_log, INPUT_WAIT, |t| {
+        t.contains(&format!("{TITLE}scrolled"))
+    });
     // each Esc waits for one more back line of any kind, so a wrong answer does not cost the next Esc its time
     let backs = |t: &str| t.matches("AtlWindow: wvo back ").count();
     for _ in 0..3 {
-        let before = std::fs::read_to_string(app_log).map(|t| backs(&t)).unwrap_or(0);
+        let before = std::fs::read_to_string(app_log)
+            .map(|t| backs(&t))
+            .unwrap_or(0);
         esc(&proxy)?;
         let _ = widgets::wait_until(app_log, INPUT_WAIT, |t| backs(t) > before);
     }

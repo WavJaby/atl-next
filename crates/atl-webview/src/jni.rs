@@ -613,8 +613,12 @@ fn on_event(shared: &Shared, ev: WebEvent) {
         return on_unhandled_key(env, shared, t);
     }
     match &ev {
-        WebEvent::LoadStarted(url) => tracing::info!("webview: page started {}", bridge::log_origin(url)),
-        WebEvent::LoadFinished(url) => tracing::info!("webview: page finished {}", bridge::log_origin(url)),
+        WebEvent::LoadStarted(url) => {
+            tracing::info!("webview: page started {}", bridge::log_origin(url))
+        }
+        WebEvent::LoadFinished(url) => {
+            tracing::info!("webview: page finished {}", bridge::log_origin(url))
+        }
         _ => {}
     }
     let provider = jni_call!(env, NewLocalRef, shared.provider.get() as Obj);

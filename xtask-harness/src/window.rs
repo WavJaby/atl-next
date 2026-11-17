@@ -270,10 +270,7 @@ impl Stage {
             Stage::Dialog => DIALOG_WINDOW_MS,
             Stage::Capture => capture::CAPTURE_WINDOW_MS,
             // the webview stage's picture, then four inputs each waiting for the page's answer
-            Stage::Widgets
-            | Stage::Ime
-            | Stage::MouseTouch
-            | Stage::WebView => WIDGETS_WINDOW_MS,
+            Stage::Widgets | Stage::Ime | Stage::MouseTouch | Stage::WebView => WIDGETS_WINDOW_MS,
             Stage::WebViewOverlay => WEBVIEW_OVERLAY_WINDOW_MS,
             Stage::Resize
             | Stage::Relaunch

@@ -12,7 +12,10 @@ static COUNTS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 pub fn hit(what: &str) {
     let n = {
         let mut m = COUNTS.lock().unwrap_or_else(|p| p.into_inner());
-        let n = m.get_or_insert_with(HashMap::new).entry(what.to_owned()).or_insert(0);
+        let n = m
+            .get_or_insert_with(HashMap::new)
+            .entry(what.to_owned())
+            .or_insert(0);
         *n += 1;
         *n
     };

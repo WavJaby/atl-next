@@ -103,7 +103,12 @@ impl<E> Gate<E> {
         match claim {
             InputClaim::Down => {
                 // what came before the press went elsewhere (or was hover nobody claimed)
-                dropped.extend(self.held.iter().filter(|h| !h.key && h.ns < t).map(Held::class));
+                dropped.extend(
+                    self.held
+                        .iter()
+                        .filter(|h| !h.key && h.ns < t)
+                        .map(Held::class),
+                );
                 self.held.retain(|h| h.key || h.ns >= t);
                 self.pressed = true;
                 self.cancelled = false;
@@ -111,7 +116,12 @@ impl<E> Gate<E> {
             InputClaim::Up => self.pressed = false,
             InputClaim::Cancel => {
                 let released = self.held.iter().any(|h| !h.key && h.release && h.ns <= t);
-                dropped.extend(self.held.iter().filter(|h| !h.key && h.ns <= t).map(Held::class));
+                dropped.extend(
+                    self.held
+                        .iter()
+                        .filter(|h| !h.key && h.ns <= t)
+                        .map(Held::class),
+                );
                 self.held.retain(|h| h.key || h.ns > t);
                 left_pressed = self.pressed;
                 self.pressed = false;
