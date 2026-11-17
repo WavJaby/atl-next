@@ -329,7 +329,7 @@ const PORTRAIT_FIXTURE: &str = "xtask-harness/testdata/window-portrait";
 /// The fixture's first onDraw on hwui's RecordingCanvas (Canvas.isHardwareAccelerated).
 const HARDWARE_DRAW_LINE: &str = "onDraw reached hardware=true";
 /// Scenes the compositor must present into the window before its readback (the fixture's first frame and a repaint).
-const GTK_PRESENTED: u32 = 2;
+const GTK_PRESENTED: u64 = 2;
 /// The test app's uid: the run's only package's, as the allocator hands it out.
 pub(crate) const APP_UID: u32 = crate::atld_run::FIRST_APP_UID;
 /// How long a cold start may take to reach the marker (as `xtask test app`).
@@ -784,7 +784,7 @@ fn picture_check(app: &str, display: DisplayModel, title: &str) -> Result<String
     ))
 }
 
-/// Stage `gtk` sub-gate (a): the window mapped at its first frame-clock tick, and the compositor presented at least [`GTK_PRESENTED`] scenes into it (the `present n=` lines).
+/// Stage `gtk` sub-gate (a): the window mapped at its first frame-clock tick, and the compositor presented at least [`GTK_PRESENTED`] scenes into it (run_apk::presented_total).
 fn gtk_window_check(app: &str) -> Result<String, String> {
     if !app
         .lines()
@@ -792,12 +792,7 @@ fn gtk_window_check(app: &str) -> Result<String, String> {
     {
         return Err("the window never mapped at its first frame-clock tick".to_owned());
     }
-    let presented = app
-        .lines()
-        .filter(|l| l.contains("atl-composer: ui: present n="))
-        .filter_map(|l| word(l, "n")?.parse::<u32>().ok())
-        .max()
-        .unwrap_or(0);
+    let presented = crate::run_apk::presented_total(app);
     if presented < GTK_PRESENTED {
         return Err(format!(
             "{presented} scenes presented, {GTK_PRESENTED} wanted"
