@@ -8,8 +8,8 @@ use std::sync::Mutex;
 
 static COUNTS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
-/// Counts one hit of `what` (a short space-free key, e.g. `sideband.held.press`); logs at 1, 2, 4, ...
-pub fn hit(what: &str) {
+/// Counts one hit of `what` (a short space-free key, e.g. `sideband.held.press`); logs at 1, 2, 4, ...; returns the count so far.
+pub fn hit(what: &str) -> u64 {
     let n = {
         let mut m = COUNTS.lock().unwrap_or_else(|p| p.into_inner());
         let n = m
@@ -22,6 +22,7 @@ pub fn hit(what: &str) {
     if n.is_power_of_two() {
         tracing::info!("atl-platform-ui: count {what} {n}");
     }
+    n
 }
 
 /// The count of `what` so far.

@@ -17,6 +17,9 @@ use crate::sideband::resolve;
 /// Sideband quads drawn as nothing: a tag other than `SIDEBAND_WEB_VIEW` or a key with no widget (logged on the first of each).
 static SIDEBAND_UNRESOLVED: AtomicU64 = AtomicU64::new(0);
 
+/// Sideband show/hide transitions logged with their time, per direction; later ones only counted (`count sideband.shown|hidden`). 16: a dialog opened and closed a few times, not a flapping layer.
+const TRANSITIONS_LOGGED: u64 = 16;
+
 fn logical_rect(r: &FloatRect, to_logical: f32) -> graphene::Rect {
     graphene::Rect::new(
         r.left * to_logical,
@@ -206,7 +209,27 @@ impl SceneView {
         }
         let mut next = self.first_child();
         while let Some(child) = next {
-            child.set_child_visible(placed.iter().any(|(p, _)| *p == child));
+            let shown = placed.iter().any(|(p, _)| *p == child);
+            if child.is_child_visible() != shown {
+                // a transition, not a frame: the scene gained or lost the stream's quad (layer hidden, alpha 0, clipped out, removed); the first lines carry the time, then counts only
+                let what = if shown {
+                    "sideband.shown"
+                } else {
+                    "sideband.hidden"
+                };
+                if crate::count::hit(what) <= TRANSITIONS_LOGGED {
+                    tracing::info!(
+                        "atl-platform-ui: sideband key {:?} {}",
+                        crate::sideband::key_of(&child),
+                        if shown {
+                            "shown"
+                        } else {
+                            "hidden: no quad names it"
+                        }
+                    );
+                }
+            }
+            child.set_child_visible(shown);
             next = child.next_sibling();
         }
         let moved = *self.imp().placed.borrow() != placed;

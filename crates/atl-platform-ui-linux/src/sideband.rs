@@ -238,12 +238,24 @@ pub fn detach(key: i32) {
             .position(|(k, _)| *k == key)
             .map(|i| list.remove(i).1.into_inner())
     };
+    tracing::info!(
+        "atl-platform-ui: sideband key {key} detached (registered {})",
+        gone.is_some()
+    );
     if let Some(e) = gone
         && let Some(parent) = e.widget.parent()
     {
         e.widget.unparent();
         parent.queue_draw();
     }
+}
+
+/// The key `w` is registered under, if any (log lines name a widget by it).
+pub fn key_of(w: &gtk4::Widget) -> Option<i32> {
+    lock(&SIDEBANDS)
+        .iter()
+        .find(|(_, e)| e.get_ref().widget == *w)
+        .map(|(k, _)| *k)
 }
 
 /// The widget of a sideband stream, if it names a registered one.
