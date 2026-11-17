@@ -62,6 +62,9 @@ pub struct ResultTo<K> {
     pub token: K,
     pub who: Option<String>,
     pub request_code: i32,
+    /// resultTo's (package, class) at the start (`r.resultTo.intent.getComponent()`): what getCallingActivity / getCallingPackage answer. Kept, not looked up: AOSP holds the record, so the
+    /// answer outlives the caller's finish.
+    pub caller: (String, String),
 }
 
 struct Record<K, O, L, I, R> {
@@ -282,6 +285,11 @@ impl<K: Clone + PartialEq, O: Clone, L, I, R> Machine<K, O, L, I, R> {
 
     pub fn owner(&self, token: &K) -> Option<&O> {
         self.find(token).map(|(_, r)| &r.owner)
+    }
+
+    /// The result `token`'s record still owes (ActivityRecord.resultTo): None once it finished, when none was asked, or when the token names no record.
+    pub fn owed(&self, token: &K) -> Option<&ResultTo<K>> {
+        self.find(token).and_then(|(_, r)| r.owed.as_ref())
     }
 
     pub fn task_of(&self, token: &K) -> Option<TaskId> {
@@ -1064,7 +1072,29 @@ mod tests {
             token: to,
             who: None,
             request_code,
+            caller: ("app".into(), format!("Caller{to}")),
         }
+    }
+
+    /// getCallingRecord: the owed record names the caller while the child lives, also after the caller finished (AOSP keeps the reference); none once the child finished, none without a result.
+    #[test]
+    fn the_owed_record_names_the_caller_until_the_child_finishes() {
+        let mut m = Machine::new();
+        let t = task(1);
+        m.push(t, MAIN, APP, "main");
+        m.push_owed(t, OTHER, APP, "other", Some(owed(MAIN, 7)));
+        m.push(t, SPLASH, APP, "splash");
+        let main = Some(("app".to_owned(), format!("Caller{MAIN}")));
+        assert_eq!(m.owed(&OTHER).map(|o| o.caller.clone()), main);
+        assert_eq!(m.owed(&SPLASH), None, "started without a result");
+        m.finish(&MAIN, |_| "r");
+        assert_eq!(
+            m.owed(&OTHER).map(|o| o.caller.clone()),
+            main,
+            "after the caller finished"
+        );
+        m.finish(&OTHER, |_| "r");
+        assert_eq!(m.owed(&OTHER), None, "after the child finished");
     }
 
     /// The child finishes while its caller is resumed in another Task: the result is sent at once (ActivityRecord.java:4873-4887), before the child pauses.

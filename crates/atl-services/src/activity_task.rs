@@ -448,10 +448,11 @@ impl ActivityTasks {
         };
         // the result the start owes its caller: the source's record, when a result was asked and the source is not finishing (Call::result_requested); none with `results` off
         let mut owed = match (call.result_requested(), &source) {
-            (true, Some((to, _))) if results => Some(ResultTo {
+            (true, Some((to, o))) if results => Some(ResultTo {
                 token: to.clone(),
                 who: result_who.map(str::to_owned),
                 request_code,
+                caller: (o.package.clone(), o.component.clone()),
             }),
             _ => None,
         };
@@ -597,6 +598,11 @@ impl ActivityTasks {
                 Back::Finish
             },
         )
+    }
+
+    /// ActivityClientController.getCallingRecord:707-710: the (package, class) of the record `token` owes its result to; None when it was not started for a result, already finished, or unknown.
+    pub(crate) fn calling(&self, token: &SpIBinder) -> Option<(String, String)> {
+        self.machine().owed(token).map(|o| o.caller.clone())
     }
 
     /// ActivityClientController.activityResumed: the resume ack, logged as `activity resumed <class> at=<stamp>` before the settled change it may cause. False when no record has the token (nothing logged).

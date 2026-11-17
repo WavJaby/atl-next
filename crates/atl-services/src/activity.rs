@@ -2762,6 +2762,13 @@ impl ActivityClientController {
     }
 }
 
+impl ActivityClientController {
+    /// getCallingRecord's (package, class) for `token`; None for no token, no services, or no owed result.
+    fn calling(&self, token: Option<&SpIBinder>) -> Option<(String, String)> {
+        self.inner.upgrade()?.atm.calling(token?)
+    }
+}
+
 impl Interface for ActivityClientController {}
 
 impl IActivityClientController for ActivityClientController {
@@ -2874,6 +2881,21 @@ impl IActivityClientController for ActivityClientController {
     /// ActivityClientController.getDisplayId:626-635: the root task's display, DEFAULT_DISPLAY when invalid or when the token has no task. M2 has one display.
     fn r#getDisplayId(&self, _token: Option<&SpIBinder>) -> binder::Result<i32> {
         Ok(DEFAULT_DISPLAY)
+    }
+
+    /// ActivityClientController.getCallingActivity:692-697: the component of the record the activity owes its result to (getCallingRecord), null when not started for a result.
+    fn r#getCallingActivity(
+        &self,
+        token: Option<&SpIBinder>,
+    ) -> binder::Result<Option<ComponentName>> {
+        Ok(self
+            .calling(token)
+            .map(|(package, class)| ComponentName { package, class }))
+    }
+
+    /// ActivityClientController.getCallingPackage:699-704: that record's package, null when not started for a result.
+    fn r#getCallingPackage(&self, token: Option<&SpIBinder>) -> binder::Result<Option<String>> {
+        Ok(self.calling(token).map(|(package, _)| package))
     }
 
     /// ActivityClientController.activityRelaunched (ActivityThread.reportRelaunch): the relaunch ended. Oneway, so a token-less call is only counted.
