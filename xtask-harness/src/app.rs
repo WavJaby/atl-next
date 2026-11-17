@@ -355,8 +355,9 @@ const SYSANSWERS: &str = "AtlTest: sysanswers: ";
 ///   MODE_NORMAL (0). Before: all four 0 (UNKNOWN_TRANSACTION's empty reply), i.e. muted and RINGER_MODE_SILENT.
 /// - `installer=null source=null/null`: an install with no installer of record (the `adb install` case, ComputerEngine.getInstallerPackageName / getInstallSourceInfo): no installer, and an
 ///   InstallSourceInfo whose installing and initiating packages are null. Before: the same null installer, but a null InstallSourceInfo (`nosource`), which AOSP gives only for an unknown package.
+/// - `errors=null`: getProcessesInErrorState with no crashing or ANR process (AMS returns its lazily created list, still null). The unanswered call read the same; the run's diag counters tell them apart.
 const SYSANSWERS_WANT: &str =
-    "checksums=0 volume=5 max=15 ringer=2 mode=0 installer=null source=null/null";
+    "checksums=0 volume=5 max=15 ringer=2 mode=0 installer=null source=null/null errors=null";
 /// Main.settings' line, answered by AOSP SettingsProvider in its own process (`id=<s> again=<b> screen_off=<s> auto_time=<s> rotation=<s>`, [`settings_why`]).
 const SETTINGS: &str = "AtlTest: settings: ";
 /// The line after `id=`: the defaults DatabaseHelper loads from SettingsProvider's res/values/defaults.xml -- def_screen_off_timeout 60000, def_auto_time true (loadBooleanSetting writes "1"),

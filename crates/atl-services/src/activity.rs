@@ -28,9 +28,9 @@ use atl_aidl::aidl::android::content::IIntentSender::IIntentSender;
 use atl_broker::control::StartRequest;
 use atl_parcelables::android::app::servertransaction::ClientTransaction;
 use atl_parcelables::android::app::{
-    ActivityManager_PendingIntentInfo, ActivityManager_RunningAppProcessInfo,
-    ActivityManager_TaskDescription, ApplicationErrorReport_ParcelableCrashInfo,
-    ContentProviderHolder,
+    ActivityManager_PendingIntentInfo, ActivityManager_ProcessErrorStateInfo,
+    ActivityManager_RunningAppProcessInfo, ActivityManager_TaskDescription,
+    ApplicationErrorReport_ParcelableCrashInfo, ContentProviderHolder,
 };
 use atl_parcelables::android::content::pm::{ActivityInfo, ProviderInfo, ProviderInfoList};
 use atl_parcelables::android::content::res::{CompatibilityInfo, Configuration};
@@ -1578,6 +1578,28 @@ impl IActivityManager for ActivityManager {
     /// ActivityManagerService.addPackageDependency (WebViewFactory registers on its provider package): AMS records the package so the caller dies when it is updated or removed.
     /// Packages here change only at atld start (install sessions), never under a running process, so the record would have no reader: accepted and dropped, as AOSP also returns void.
     fn r#addPackageDependency(&self, _package_name: Option<&str>) -> binder::Result<()> {
+        Ok(())
+    }
+
+    /// ActivityManagerService.getProcessesInErrorState:10004: the processes that are crashing or not responding, null ("lazy create the list") when none is. ATL keeps no crash / ANR state:
+    /// a crashing app process exits, and no ANR is detected, so the list is always null.
+    fn r#getProcessesInErrorState(
+        &self,
+    ) -> binder::Result<Option<Vec<Option<ActivityManager_ProcessErrorStateInfo>>>> {
+        Ok(None)
+    }
+
+    /// ActivityManagerService.frozenBinderTransactionDetected:19262: an app's report that a binder call failed (ActivityThread's Binder.transactionCallback, for every non-OK transact).
+    /// AOSP logs it and acts only with the freezer on (CachedAppOptimizer.binderError); there is no freezer here, so it is only counted (power-of-two log points, not AOSP's line per call:
+    /// apps repeat it for every unanswered call).
+    fn r#frozenBinderTransactionDetected(
+        &self,
+        _debug_pid: i32,
+        _code: i32,
+        _flags: i32,
+        _err: i32,
+    ) -> binder::Result<()> {
+        atl_diag::answered("IActivityManager", "frozenBinderTransactionDetected");
         Ok(())
     }
 

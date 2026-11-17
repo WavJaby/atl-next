@@ -671,7 +671,14 @@ public class Main extends Activity {
 
     /** Small system-service answers games read, one field each: what the call returned, or the throwable's simple name. */
     private String sysAnswers() {
-        return "checksums=" + checksums() + " " + audio() + " " + installer();
+        String errors;
+        try {
+            java.util.List<android.app.ActivityManager.ProcessErrorStateInfo> l = ((android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE)).getProcessesInErrorState();
+            errors = l == null ? "null" : Integer.toString(l.size());
+        } catch (Throwable t) {
+            errors = t.getClass().getSimpleName();
+        }
+        return "checksums=" + checksums() + " " + audio() + " " + installer() + " errors=" + errors;
     }
 
     /** The fixture's own installer of record: getInstallerPackageName, then getInstallSourceInfo's installing / initiating package ("nosource" for a null InstallSourceInfo). */
