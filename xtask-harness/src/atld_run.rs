@@ -340,8 +340,8 @@ pub struct Runtime {
     llvm_lib: PathBuf,
     /// Where atld runs: this host, or a target running it from the bundle (`remote test`, remote.rs [`remote::Site`]).
     site: remote::Site,
-    /// The device's persistent storage (atld `--device`) when [`Runtime::with_device`] set it: kept across runs. Unset: a fresh device beside the run's root ([`fresh_device`], the gates), never atld's default (the user's own device).
-    device: Option<PathBuf>,
+    /// The persistent data root (atld `--data-root`) when [`Runtime::with_data_root`] set it: kept across runs. Unset: a fresh one beside the run's root ([`fresh_data_root`], the gates), never atld's default (the user's own).
+    data_root: Option<PathBuf>,
 }
 
 /// A command the shell runs once the system is up (`am instrument ...`).
@@ -825,7 +825,7 @@ impl Runtime {
             esc_back: false,
             fake_devices: None,
             site: remote::Site::Host,
-            device: None,
+            data_root: None,
         })
     }
 
@@ -835,15 +835,15 @@ impl Runtime {
         self
     }
 
-    /// atld's device is the persistent dir `dir` (`--device`): app data and system state survive the run, and the next run on `dir` sees them (run-apk). Gates keep a fresh device ([`fresh_device`]).
-    pub fn with_device(mut self, dir: &Path) -> Self {
-        self.device = Some(dir.to_path_buf());
+    /// atld's data root is the persistent dir `dir` (`--data-root`): app data and system state survive the run, and the next run on `dir` sees them (run-apk). Gates keep a fresh one ([`fresh_data_root`]).
+    pub fn with_data_root(mut self, dir: &Path) -> Self {
+        self.data_root = Some(dir.to_path_buf());
         self
     }
 
-    /// The persistent device set by [`Runtime::with_device`], if any.
-    pub fn device(&self) -> Option<&Path> {
-        self.device.as_deref()
+    /// The persistent data root set by [`Runtime::with_data_root`], if any.
+    pub fn data_root(&self) -> Option<&Path> {
+        self.data_root.as_deref()
     }
 
     /// Also starts the graphics allocator HAL under atld (`--gralloc`): the allocator `xtask native` built, and `mapper.atl.so` installed in `<out>/gralloc/lib`, which joins every process's library path.
@@ -1272,31 +1272,32 @@ impl Runtime {
     }
 }
 
-/// A gate's throwaway device: `<root>.device` beside the run's root (atld refuses a device inside the root), removed with the root at each start. Keeps gates hermetic: atld's default is the user's own device.
-pub fn fresh_device(root: &Path) -> PathBuf {
+/// A gate's throwaway data root: `<root>.data` beside the run's root (atld refuses a data root inside the root), removed with the root at each start. Keeps gates hermetic: atld's default is the user's own.
+pub fn fresh_data_root(root: &Path) -> PathBuf {
     let mut name = root.file_name().unwrap_or_default().to_os_string();
-    name.push(".device");
+    name.push(".data");
     root.with_file_name(name)
 }
 
-/// `pm clear` of `package` on the persistent `device` (run-apk `--clear-data`): its user and device-protected data dirs (`data/user/0/<p>`, `data/user_de/0/<p>`) and its external dirs (`external/<p>`), the layout atld's Root gives them (crates/atld main.rs).
+/// `package`'s data dirs under `data_root` as atld lays them out (crates/atld host_layout.rs): `apps/<p>/{data,data_de,external}`. Its code is `apps/<p>/apk`.
+pub fn package_data_dirs(data_root: &Path, package: &str) -> [PathBuf; 3] {
+    let app = data_root.join("apps").join(package);
+    [app.join("data"), app.join("data_de"), app.join("external")]
+}
+
+/// `pm clear` of `package` on the persistent `data_root` (run-apk `--clear-data`): its user and device-protected data dirs and its external dirs ([`package_data_dirs`]).
 /// Its code and every other package's state stay; the next launch makes the dirs again. Missing dirs are fine.
-/// A name that is no package name, or a dir not strictly below `device`, is refused before anything is removed.
-pub fn clear_package_data(device: &Path, package: &str) -> Result<()> {
+/// A name that is no package name, or a dir not strictly below `data_root`, is refused before anything is removed.
+pub fn clear_package_data(data_root: &Path, package: &str) -> Result<()> {
     ensure!(
         atl_android_paths::valid_package_name(package),
         "--clear-data: {package:?} is no package name: nothing cleared"
     );
-    let data = device.join("data");
-    let dirs = [
-        data.join("user/0").join(package),
-        data.join("user_de/0").join(package),
-        device.join("external").join(package),
-    ];
+    let dirs = package_data_dirs(data_root, package);
     for dir in &dirs {
         ensure!(
-            strictly_inside(device, dir),
-            "--clear-data: {} is not below the device: nothing cleared",
+            strictly_inside(data_root, dir),
+            "--clear-data: {} is not below the data root: nothing cleared",
             dir.display()
         );
     }
@@ -1590,7 +1591,7 @@ impl Runtime {
         self.record_inputs(run)?;
         std::fs::create_dir_all(&run.scratch)?;
         // atld makes the root again itself, but only once it runs: a poll must not see the previous run's logs
-        let fresh = self.device.is_none().then(|| fresh_device(&run.root));
+        let fresh = self.data_root.is_none().then(|| fresh_data_root(&run.root));
         for dir in std::iter::once(&run.root).chain(fresh.as_ref()) {
             if dir.exists() {
                 std::fs::remove_dir_all(dir)
@@ -1604,9 +1605,9 @@ impl Runtime {
                 self.fake_devices.is_none()
                     && self.wayland.is_none()
                     && run.libraries.is_empty()
-                    && self.device.is_none()
+                    && self.data_root.is_none()
                     && (self.ui.is_none() || target.has_display()),
-                "remote run {}: not remotable yet (sensor injection, a gate's own Wayland socket, shared libraries, a persistent device, and a UI without a target display need a target runner)",
+                "remote run {}: not remotable yet (sensor injection, a gate's own Wayland socket, shared libraries, a persistent data root, and a UI without a target display need a target runner)",
                 run.root.display()
             );
             // fontconfig's `<dir>` and `<cachedir>` name this host's paths: the run reads a copy that the script relocates
@@ -1733,11 +1734,11 @@ impl Runtime {
             .arg(&self.binderd)
             .arg("--sandbox-stub")
             .arg(&self.sandbox_stub);
-        let device = self
-            .device
+        let data_root = self
+            .data_root
             .clone()
-            .unwrap_or_else(|| fresh_device(&run.root));
-        cmd.arg("--device").arg(device);
+            .unwrap_or_else(|| fresh_data_root(&run.root));
+        cmd.arg("--data-root").arg(data_root);
         if self.webspawn {
             cmd.arg("--sandbox-join")
                 .arg(&self.sandbox_join)
@@ -1968,11 +1969,11 @@ mod tests {
         let device = std::env::temp_dir().join(format!("atl-clear-data-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&device);
         let made = [
-            "data/user/0/a/files/save.txt",
-            "data/user_de/0/a/cache/x",
-            "external/a/data/y",
-            "data/app/a/base.apk",
-            "data/user/0/b/files/keep.txt",
+            "apps/a/data/files/save.txt",
+            "apps/a/data_de/cache/x",
+            "apps/a/external/data/y",
+            "apps/a/apk/base.apk",
+            "apps/b/data/files/keep.txt",
         ];
         for f in made {
             let p = device.join(f);
@@ -1980,10 +1981,10 @@ mod tests {
             std::fs::write(&p, b"x").unwrap();
         }
         clear_package_data(&device, "a").unwrap();
-        for gone in ["data/user/0/a", "data/user_de/0/a", "external/a"] {
+        for gone in ["apps/a/data", "apps/a/data_de", "apps/a/external"] {
             assert!(!device.join(gone).exists(), "{gone} should be cleared");
         }
-        for kept in ["data/app/a/base.apk", "data/user/0/b/files/keep.txt"] {
+        for kept in ["apps/a/apk/base.apk", "apps/b/data/files/keep.txt"] {
             assert!(device.join(kept).is_file(), "{kept} should stay");
         }
         std::fs::remove_dir_all(&device).unwrap();
@@ -1996,10 +1997,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let device = base.join("device");
         let victim = base.join("outside").join("victim");
-        let keep = device.join("data/user/0/a/keep.txt");
+        let keep = device.join("apps/a/data/keep.txt");
         for f in [
             keep.clone(),
-            device.join("external/a/keep.txt"),
+            device.join("apps/a/external/keep.txt"),
             victim.join("f"),
         ] {
             std::fs::create_dir_all(f.parent().unwrap()).unwrap();

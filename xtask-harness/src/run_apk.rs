@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! `xtask run-apk <ROW|PATH>`: a test APK row of test-apks.toml, or an APK file given by path (unpinned), started by atld the way an app is (its launcher activity), in UI mode: the app's window is a GTK window of this desktop with --hold, else of the gate's headless compositor (nested_wayland.rs).
 //! Staging is the window gate's: the runtime (Runtime::new, gralloc, the display), the APK copied into the run's work dir, the package file from the APK's real manifest (manifest::read).
-//! The device is atld's default, the user's device in the XDG data dir (`--device` another): an app's data survives launches and build dirs, as on a device, until `--clear-data` (`pm clear` of the package) or the dir is removed.
+//! The data root is atld's default, the user's in the XDG data dir (`--data-root` another): an app's data survives launches and build dirs, as on a device, until `--clear-data` (`pm clear` of the package) or the dir is removed.
 //! No probe; injected input only with `--pointer` (a scripted tap sequence the app runs from its first present). The verdict is about the last activity the app resumed (`services: activity resumed <class>`, sent after onResume returns). The run waits until the services
 //! are settled (`services: activity settled`: no launch, start or lifecycle step unacknowledged), so a Splash that starts Main is judged on Main. Pass: that resume is the last one, a frame is
 //! presented after it (`atl-composer: ui: present`), and no fault in the app log within the watch after it (window::fault_after). The run ends once all of that holds and the watch is over
@@ -95,13 +95,13 @@ pub struct Args {
     #[arg(long = "app-env", value_name = "KEY=VALUE")]
     app_env: Vec<String>,
     /// `pm clear` of the package before the launch: its data (user and device-protected user dirs, its external dirs) left by earlier launches is removed, so the app starts from empty data.
-    /// Other packages' data and the device's own state stay. The device is kept across launches: without this flag the app keeps its data.
+    /// Other packages' data and the system state stay. The data root is kept across launches: without this flag the app keeps its data.
     #[arg(long)]
     clear_data: bool,
-    /// The device (atld `--device`): `data/` and `external/`, kept across launches. Default: atld's, the user's device in the XDG data dir (`$XDG_DATA_HOME/atl/device`, else `~/.local/share/atl/device`), shared by every checkout and build dir.
+    /// The data root (atld `--data-root`): `apps/<package>/` and `device/`, kept across launches. Default: atld's, the user's in the XDG data dir (`$XDG_DATA_HOME/atl`, else `~/.local/share/atl`), shared by every checkout and build dir.
     /// A fresh device is a new or empty DIR.
     #[arg(long, value_name = "DIR")]
-    device: Option<PathBuf>,
+    data_root: Option<PathBuf>,
 }
 
 /// `xtask remote run-apk` (remote.rs `Remote::RunApk`): the same run on a target's desktop. `--hold` is required: the window is the target's, on its Wayland session, not a headless one.
@@ -183,7 +183,7 @@ impl Args {
             esc_back: false,
             app_env: Vec::new(),
             clear_data: false,
-            device: None,
+            data_root: None,
         }
     }
 
@@ -193,9 +193,9 @@ impl Args {
         self
     }
 
-    /// The same run on the device `dir` (`--device`): a gate's own, never the user's.
-    pub(crate) fn with_device(mut self, dir: &Path) -> Self {
-        self.device = Some(dir.to_path_buf());
+    /// The same run on the data root `dir` (`--data-root`): a gate's own, never the user's.
+    pub(crate) fn with_data_root(mut self, dir: &Path) -> Self {
+        self.data_root = Some(dir.to_path_buf());
         self
     }
 }
@@ -212,19 +212,20 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         None => None,
     };
     let (rt, foreign) = runtime(root, args, &files)?;
-    // the device outlives the launch and the build dir: the app's data is still there at the next one (`--clear-data` clears one package of it)
-    let device = match &args.device {
+    // the data root outlives the launch and the build dir: the app's data is still there at the next one (`--clear-data` clears one package of it)
+    let data_root = match &args.data_root {
         Some(d) => d.clone(),
         None => {
-            let user = atl_platform_host::user_device()
-                .context("no default device: neither XDG_DATA_HOME nor HOME names an absolute dir; pass --device")?;
-            migrate_build_dir_device(&legacy_device_dir(&rt.out), &user)?;
+            let user = atl_platform_host::user_data_root()
+                .context("no default data root: neither XDG_DATA_HOME nor HOME names an absolute dir; pass --data-root")?;
+            // into the old single tree's place: atld then moves its packages into apps/<package>/ (crates/atld host_layout.rs)
+            migrate_build_dir_device(&legacy_device_dir(&rt.out), &user.join("device"))?;
             user
         }
     };
-    println!("run-apk: device {}", device.display());
+    println!("run-apk: data root {}", data_root.display());
     // the desktop's fonts, as a user's run sees them (the pinned test set has no CJK or emoji face)
-    let rt = rt.with_device(&device).with_desktop_fonts();
+    let rt = rt.with_data_root(&data_root).with_desktop_fonts();
     run_on(&rt, args, foreign.as_ref(), pin.as_ref(), files, steps)
 }
 
@@ -335,10 +336,10 @@ pub(crate) fn run_on(
         m.name
     );
     if args.clear_data {
-        let device = rt
-            .device()
-            .context("--clear-data: no persistent device (run() sets one)")?;
-        crate::atld_run::clear_package_data(device, &m.name)?;
+        let data_root = rt
+            .data_root()
+            .context("--clear-data: no persistent data root (run() sets one)")?;
+        crate::atld_run::clear_package_data(data_root, &m.name)?;
         println!("run-apk: --clear-data: {} starts from empty data", m.name);
     }
     let run = run_of(&work, files, &m, &args.log_tags);
@@ -495,7 +496,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         esc_back: a.esc_back,
         app_env: Vec::new(),
         clear_data: false,
-        device: None,
+        data_root: None,
     };
     // no `--display`: atld reads the target's own monitor, as on the product's host (host_display); this host's monitor is not the target's
     let (rt, foreign) = runtime(root, &args, &files)?;

@@ -12,7 +12,10 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 
-/** `xtask test app-data` (xtask-harness/src/app_data.rs reads the AtlData line): the first launch writes one file under the files dir, the next one reads it back. */
+/**
+ * `xtask test app-data` (xtask-harness/src/app_data.rs reads the AtlData lines): the first launch writes one file under the files dir (and the same file under the device-protected and external
+ * files dirs, so the gate finds each on the host), the next one reads it back. The `paths` line names the dirs as the app sees them.
+ */
 public class DataMain extends Activity {
     static final String FILE = "save.txt";
     static final String VALUE = "save-v1";
@@ -20,19 +23,27 @@ public class DataMain extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        File file = new File(getFilesDir(), FILE);
+        File files = getFilesDir();
+        File de = createDeviceProtectedStorageContext().getFilesDir();
+        File external = getExternalFilesDir(null);
+        Log.i("AtlData", "paths files=" + files + " de=" + de + " external=" + external + " source=" + getApplicationInfo().sourceDir);
+        File file = new File(files, FILE);
         String state;
         try {
             if (file.exists()) {
                 state = "read " + readText(file);
             } else {
                 writeText(file, VALUE);
+                writeText(new File(de, FILE), VALUE);
+                if (external != null) {
+                    writeText(new File(external, FILE), VALUE);
+                }
                 state = "wrote";
             }
         } catch (IOException e) {
             state = "failed " + e;
         }
-        Log.i("AtlData", "data: " + state + " dir=" + getFilesDir().getAbsolutePath());
+        Log.i("AtlData", "data: " + state + " dir=" + files.getAbsolutePath());
         TextView view = new TextView(this);
         view.setText(state);
         setContentView(view);

@@ -24,9 +24,9 @@ pub use atl_platform_host_linux::time_zone;
 /// The desktop's UI language as one BCP-47 tag, from the process's locale variables (`LC_ALL`, `LC_MESSAGES`, `LANG`); `None` for C/POSIX, none set, or a malformed name.
 #[cfg(target_os = "linux")]
 pub use atl_platform_host_linux::ui_locale;
-/// The user's persistent device (atld `--device` default) in the desktop's per-user data dir (Linux: `$XDG_DATA_HOME/atl/device`, else `~/.local/share/atl/device`); `None` where the OS names no such dir.
+/// The user's persistent data root (atld `--data-root` default) in the desktop's per-user data dir (Linux: `$XDG_DATA_HOME/atl`, else `~/.local/share/atl`); `None` where the OS names no such dir.
 #[cfg(target_os = "linux")]
-pub use atl_platform_host_linux::user_device;
+pub use atl_platform_host_linux::user_data_root;
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("atl-platform-host has no implementation for this target OS");

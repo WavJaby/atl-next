@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! atld, M2 wiring: starts the system the Android way, each process through the broker, then serves the services' process control until the run ends (step 7).
 //! 1. the runtime root `--root` (made fresh): `properties` (the default property area, atl-property-service; `properties.d/` one area per app process: the defaults plus the properties only that process has, [`Host::process_properties`]), `system/` (build.prop, `framework/` = the boot jars and shared libraries),
-//!    `install/` (the installer's frames of each session, read by the services), `log/<process>.log` (each process's stdout + stderr). The device (`--device`, default the user's `$XDG_DATA_HOME/atl/device`, kept across runs): `data/` (`app/<package>/{base.apk,split_<name>.apk,lib/<isa>/}`, `user/0/<package>/`, `dalvik-cache/`, `system/`) and `external/`.
+//!    `install/` (the installer's frames of each session, read by the services), `log/<process>.log` (each process's stdout + stderr). The data root (`--data-root`, default the user's `$XDG_DATA_HOME/atl`, kept across runs): `apps/<package>/{apk,data,data_de,external}` and `device/data/{system,dalvik-cache}` ([`host_layout`]).
 //! 2. the install sessions: each `--package` (its APK files) is a session the services install at their start (owner option I, 2026-11-13): they own the package list; atld does installd's
 //!    file work on their request (control `Install`: stage under session names (hard links where possible) + run atl-installer in the broker's installer profile; `Commit`: rename each file by its
 //!    parsed split (`base.apk`, `split_<name>.apk`), then the dir to `/data/app/<package>`, create the data dirs).
@@ -59,6 +59,7 @@ use signal_hook::iterator::Signals;
 
 mod applog;
 mod cacerts;
+mod host_layout;
 use serde::Deserialize;
 
 #[derive(Parser)]
@@ -67,10 +68,11 @@ struct Args {
     /// Runtime root (removed and made again).
     #[arg(long)]
     root: PathBuf,
-    /// The device's persistent storage, kept across runs: `data/` (/data: app code and data, system state, dalvik-cache) and `external/<package>/` (the shared storage's Android/data and obb of a package).
-    /// Default: the user's device in the desktop's data dir (Linux: `$XDG_DATA_HOME/atl/device`, else `~/.local/share/atl/device`), as a native program keeps its data. A fresh device is a new or empty DIR. Must lie outside `--root`, which is removed at start.
+    /// The persistent data root, kept across runs: `apps/<package>/{apk,data,data_de,external}` (each package's code, data, device-protected data, Android/data + obb) and `device/data/` (system state, dalvik-cache).
+    /// Default: the user's in the desktop's data dir (Linux: `$XDG_DATA_HOME/atl`, else `~/.local/share/atl`), as a native program keeps its data. A fresh device is a new or empty DIR. Must lie outside `--root`, which is removed at start.
+    /// At start, package dirs of the old single tree (`device/data/{app,user/0,user_de/0}/<package>`, `device/external/<package>`) are renamed into `apps/<package>/`; a package present in both is not started.
     #[arg(long, value_name = "DIR")]
-    device: Option<PathBuf>,
+    data_root: Option<PathBuf>,
     /// atl-binderd executable.
     #[arg(long)]
     binderd: PathBuf,
@@ -447,10 +449,10 @@ fn kernel_line(line: &str) -> String {
     })
 }
 
-/// The runtime root's layout: `root` is removed and made again at start; `device` (`--device`) is kept across runs.
+/// The runtime root's layout: `root` is removed and made again at start; `data_root` (`--data-root`, [`host_layout`]) is kept across runs.
 struct Root {
     root: PathBuf,
-    device: PathBuf,
+    data_root: PathBuf,
 }
 
 impl Root {
@@ -467,8 +469,13 @@ impl Root {
             (self.root.join("system_ext"), SYSTEM_EXT),
         ]
     }
+    /// /data's state not kept per package: `system/`, `dalvik-cache/`, install staging.
     fn data(&self) -> PathBuf {
-        self.device.join("data")
+        host_layout::device_data(&self.data_root)
+    }
+    /// `package`'s dir `item` (`apps/<package>/<item>`).
+    fn package(&self, package: &str, item: host_layout::Item) -> PathBuf {
+        host_layout::package_dir(&self.data_root, package, item)
     }
     fn properties(&self) -> PathBuf {
         self.root.join("properties")
@@ -481,10 +488,6 @@ impl Root {
     }
     fn log(&self, name: &str) -> PathBuf {
         self.root.join("log").join(format!("{name}.log"))
-    }
-    /// The app's external root (`external/<package>`): `data` is its Android/data/<package>, `obb` its Android/obb/<package> (the broker mounts both, app_spawn).
-    fn external(&self, package: &str) -> PathBuf {
-        self.device.join("external").join(package)
     }
 }
 
@@ -888,14 +891,15 @@ impl Host {
             !committed.contains_key(package),
             "{package}: already installed"
         );
-        let app = self.root.data().join("app");
-        let code = app.join(package);
-        let staged_dir = app.join(staging_name(session));
+        let code = self.root.package(package, host_layout::Item::Apk);
+        let staged_dir = self.root.data().join("app").join(staging_name(session));
         rename_staged(&staged_dir, names)?;
-        // the device keeps /data/app across runs: the new code replaces an earlier install's, as an update does (the data dirs are elsewhere and stay)
+        // the data root keeps the code across runs: the new code replaces an earlier install's, as an update does (the data dirs are its siblings and stay)
         if code.exists() {
             std::fs::remove_dir_all(&code)?;
         }
+        let parent = code.parent().context("package dir has no parent")?;
+        std::fs::create_dir_all(parent)?;
         std::fs::rename(&staged_dir, &code)
             .with_context(|| format!("moving session {session} to {}", code.display()))?;
         self.create_app_data(package)?;
@@ -994,11 +998,12 @@ impl Host {
 
     /// installd createAppData: the package's data dirs and its external dirs.
     fn create_app_data(&self, package: &str) -> Result<()> {
-        for d in [format!("user/0/{package}"), format!("user_de/0/{package}")] {
-            std::fs::create_dir_all(self.root.data().join(d))?;
+        use host_layout::Item;
+        for item in [Item::Data, Item::DataDe] {
+            std::fs::create_dir_all(self.root.package(package, item))?;
         }
         for d in ["data", "obb"] {
-            std::fs::create_dir_all(self.root.external(package).join(d))?;
+            std::fs::create_dir_all(self.root.package(package, Item::External).join(d))?;
         }
         Ok(())
     }
@@ -1089,6 +1094,8 @@ struct Host {
     notifications: PlatformNotifications,
     /// Packages whose post found no notification service, logged once each.
     unshown: Mutex<BTreeSet<String>>,
+    /// Packages [`host_layout::migrate`] refused (data in both trees): never started this run.
+    unmigrated: BTreeSet<String>,
 }
 
 /// `package`'s credential-encrypted data dir of user 0 as the app sees it (ApplicationInfo.dataDir, `/data/user/0/<package>`): writable in its sandbox ([`Host::package_mounts`]).
@@ -1338,30 +1345,27 @@ impl Host {
     }
 
     /// A package's own directories (as commit made them): its APKs and native libraries read-only at /data/app/<package> (a `system` package's code is in its partition, bound for every app),
-    /// its data and device-protected data read-write. Never the whole /data.
-    fn package_mounts(&self, package: &str, system: bool) -> Result<Vec<Mount>> {
-        let code = (!system).then(|| (format!("{DATA_APP}/{package}"), false));
+    /// its data and device-protected data read-write. Never the whole /data. Host side: the package's `apps/<package>/{apk,data,data_de}` ([`host_layout`]).
+    fn package_mounts(&self, package: &str, system: bool) -> Vec<Mount> {
+        use host_layout::Item;
+        let code = (!system).then(|| (Item::Apk, format!("{DATA_APP}/{package}"), false));
         code.into_iter()
             .chain([
-                (app_data_dir(package), true),
-                (format!("{DATA_USER_DE}/0/{package}"), true),
+                (Item::Data, app_data_dir(package), true),
+                (Item::DataDe, format!("{DATA_USER_DE}/0/{package}"), true),
             ])
-            .map(|(at, writable)| {
-                let rel = Path::new(&at)
-                    .strip_prefix(DATA)
-                    .with_context(|| format!("{at}: not below {DATA}"))?;
-                Ok(Mount {
-                    host: self.root.data().join(rel),
-                    at: PathBuf::from(&at),
-                    writable,
-                })
+            .map(|(item, at, writable)| Mount {
+                host: self.root.package(package, item),
+                at: PathBuf::from(at),
+                writable,
             })
             .collect()
     }
 
-    /// A package's own external dirs, bound at Android/{data,obb}/<package> under the shared storage root, with /sdcard linked to that root: no permission needed, never the root itself (plan Storage/SAF).
+    /// A package's own external dirs (`apps/<package>/external/{data,obb}`), bound at Android/{data,obb}/<package> under the shared storage root, with /sdcard linked to that root: no permission needed,
+    /// never the root itself (plan Storage/SAF).
     fn external_storage(&self, spawn: &mut Spawn, package: &str) {
-        let external = self.root.external(package);
+        let external = self.root.package(package, host_layout::Item::External);
         let shared = PathBuf::from(SHARED_STORAGE);
         spawn.mounts.push(Mount {
             host: external.join("data"),
@@ -1436,6 +1440,13 @@ impl Host {
             req.package,
             req.uid
         );
+        ensure!(
+            !self.unmigrated.contains(&req.package),
+            "{}: not started: its data is in both the old device tree and apps/{} under {} (not merged); move or remove one copy",
+            req.package,
+            req.package,
+            self.root.data_root.display()
+        );
         let mut spawn = self.app_spawn(
             req.uid,
             &req.process_name,
@@ -1449,7 +1460,7 @@ impl Host {
         self.external_storage(&mut spawn, &req.package);
         spawn
             .mounts
-            .extend(self.package_mounts(&req.package, system)?);
+            .extend(self.package_mounts(&req.package, system));
         // /data/system is the system uid's (init.rc `mkdir /data/system 0775 system system`): a process of that uid (SettingsProvider, shared user android.uid.system) writes its state
         // there (Environment.getUserSystemDirectory: /data/system/users/<user>); no other uid sees it
         if atl_services_types::permission::app_id(req.uid) == AID_SYSTEM {
@@ -1768,22 +1779,42 @@ fn wait_ready(
 fn run(a: &Args) -> Result<ExitCode> {
     let started_ms = wall_ms();
     let root = std::path::absolute(&a.root)?;
-    let device = match &a.device {
+    let data_root = match &a.data_root {
         Some(d) => std::path::absolute(d)?,
-        None => atl_platform_host::user_device()
-            .context("no default device: neither XDG_DATA_HOME nor HOME names an absolute dir; pass --device")?,
+        None => atl_platform_host::user_data_root()
+            .context("no default data root: neither XDG_DATA_HOME nor HOME names an absolute dir; pass --data-root")?,
     };
     ensure!(
-        !device.starts_with(&root),
-        "--device {}: inside --root {}, which is removed at start",
-        device.display(),
+        !data_root.starts_with(&root),
+        "--data-root {}: inside --root {}, which is removed at start",
+        data_root.display(),
         root.display()
     );
-    log(format_args!("device {}", device.display()));
+    log(format_args!("data root {}", data_root.display()));
+    // before anything installs or creates package dirs: the old tree's package dirs move into apps/<package>/
+    let migration = host_layout::migrate(&data_root)?;
+    for (package, items) in &migration.moved {
+        log(format_args!(
+            "migrate {package}: {items:?} -> apps/{package}"
+        ));
+    }
+    for (package, items) in &migration.refused {
+        log(format_args!(
+            "migrate {package}: refused, {items:?} in both device/ and apps/{package} (not merged; the package will not start)"
+        ));
+    }
+    if !migration.moved.is_empty() || !migration.refused.is_empty() {
+        log(format_args!(
+            "migrate: {} packages moved, {} refused",
+            migration.moved.len(),
+            migration.refused.len()
+        ));
+    }
+    let unmigrated: BTreeSet<String> = migration.refused.into_iter().map(|(p, _)| p).collect();
     if a.root.exists() {
         std::fs::remove_dir_all(&a.root)?;
     }
-    let r = Root { root, device };
+    let r = Root { root, data_root };
     std::fs::create_dir_all(r.root.join("log"))?;
     let tier = LinearTier::probe();
     log(format_args!("linear allocator tier {}", tier.name()));
@@ -2264,6 +2295,7 @@ fn run(a: &Args) -> Result<ExitCode> {
             n
         },
         unshown: Mutex::new(BTreeSet::new()),
+        unmigrated,
         installd: Installd {
             sessions,
             installer: a.installer.clone(),
@@ -2321,7 +2353,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         },
         root: Root {
             root: r.root.clone(),
-            device: r.device.clone(),
+            data_root: r.data_root.clone(),
         },
     });
     // the control server answers from the moment the services exist: a start request may come with their first breath (--launch)

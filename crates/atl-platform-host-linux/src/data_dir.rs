@@ -5,37 +5,37 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-/// The default device (atld `--device`): `<data home>/atl/device`, one per user, kept across runs. `None` when neither variable names an absolute dir.
-pub fn user_device() -> Option<PathBuf> {
-    device_in(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
+/// The default data root (atld `--data-root`): `<data home>/atl`, one per user, kept across runs. `None` when neither variable names an absolute dir.
+pub fn user_data_root() -> Option<PathBuf> {
+    data_root_in(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
 }
 
-/// [`user_device`] for the values `xdg_data_home` and `home`.
-fn device_in(xdg_data_home: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+/// [`user_data_root`] for the values `xdg_data_home` and `home`.
+fn data_root_in(xdg_data_home: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
     let absolute = |v: Option<OsString>| v.map(PathBuf::from).filter(|p| p.is_absolute());
     let data_home =
         absolute(xdg_data_home).or_else(|| absolute(home).map(|h| h.join(".local/share")))?;
-    Some(data_home.join("atl").join("device"))
+    Some(data_home.join("atl"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn dev(xdg: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
-        device_in(xdg.map(OsString::from), home.map(OsString::from))
+    fn root(xdg: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+        data_root_in(xdg.map(OsString::from), home.map(OsString::from))
     }
 
     /// XDG spec: an absolute XDG_DATA_HOME wins; else $HOME/.local/share.
     #[test]
     fn data_home_then_home() {
         assert_eq!(
-            dev(Some("/x/data"), Some("/home/u")),
-            Some(PathBuf::from("/x/data/atl/device"))
+            root(Some("/x/data"), Some("/home/u")),
+            Some(PathBuf::from("/x/data/atl"))
         );
         assert_eq!(
-            dev(None, Some("/home/u")),
-            Some(PathBuf::from("/home/u/.local/share/atl/device"))
+            root(None, Some("/home/u")),
+            Some(PathBuf::from("/home/u/.local/share/atl"))
         );
     }
 
@@ -43,14 +43,14 @@ mod tests {
     #[test]
     fn relative_or_empty_is_ignored() {
         assert_eq!(
-            dev(Some("rel"), Some("/home/u")),
-            Some(PathBuf::from("/home/u/.local/share/atl/device"))
+            root(Some("rel"), Some("/home/u")),
+            Some(PathBuf::from("/home/u/.local/share/atl"))
         );
         assert_eq!(
-            dev(Some(""), Some("/home/u")),
-            Some(PathBuf::from("/home/u/.local/share/atl/device"))
+            root(Some(""), Some("/home/u")),
+            Some(PathBuf::from("/home/u/.local/share/atl"))
         );
-        assert_eq!(dev(None, Some("")), None);
-        assert_eq!(dev(None, None), None);
+        assert_eq!(root(None, Some("")), None);
+        assert_eq!(root(None, None), None);
     }
 }

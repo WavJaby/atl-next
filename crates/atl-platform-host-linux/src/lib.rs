@@ -12,7 +12,7 @@ mod locale;
 mod network;
 mod notifications;
 mod timezone;
-pub use data_dir::user_device;
+pub use data_dir::user_data_root;
 pub use fonts::FcFonts;
 pub use iio::IioSensors;
 pub use locale::ui_locale;
