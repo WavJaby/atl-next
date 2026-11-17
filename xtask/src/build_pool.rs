@@ -246,7 +246,7 @@ fn acquire_with(
         let tickets = live_tickets(&queue)?;
         let queue_state = if let Some(t) = &ticket {
             Some(queue_position(&tickets, &t.name))
-        } else if bypass_allowed(&dir, &pool, &tickets)? {
+        } else if bypass_allowed(&dir, &pool, &tickets, report)? {
             None
         } else {
             ticket = Some(Ticket::new(&queue, std::process::id(), class, tier)?);
@@ -648,19 +648,28 @@ fn may_bypass(head: ClassWeight, snap: &Snapshot) -> bool {
     head.mem_gib > snap.free_mem || snap.free_cpu > head.cpu_min
 }
 
-/// Light may bypass the queue with no queue, or when `may_bypass` holds against the head's class. An unknown head class makes light queue: FIFO is always safe.
+/// Times this process queued light behind a head ticket whose class it could not read (`bypass_allowed`); printed in that line.
+static UNKNOWN_HEAD_FIFO: AtomicU64 = AtomicU64::new(0);
+
+/// Light may bypass the queue with no queue, or when `may_bypass` holds against the head's class.
+/// An unknown head class makes light queue (FIFO is always safe), logged and counted. Not unrepresentable: tickets are files shared by every checkout's xtask, so a head written by another version may name a class this one lacks.
 fn bypass_allowed(
     dir: &Path,
     pool: &PoolConfig,
     tickets: &[(String, Option<Class>)],
+    report: &mut dyn FnMut(&str),
 ) -> Result<bool> {
-    let Some(&(_, head)) = tickets.first() else {
+    let Some((name, head)) = tickets.first() else {
         return Ok(true);
     };
-    let Some(weight) = head.and_then(|class| pool.classes.get(&class).copied()) else {
+    let Some(class) = head else {
+        let n = UNKNOWN_HEAD_FIFO.fetch_add(1, Ordering::Relaxed) + 1;
+        report(&format!(
+            "pool: light queues FIFO: head ticket {name} has a class this xtask cannot read (unknown_head_fifo={n})"
+        ));
         return Ok(false);
     };
-    Ok(may_bypass(weight, &snapshot(dir, pool)?))
+    Ok(may_bypass(pool.classes[class], &snapshot(dir, pool)?))
 }
 
 fn snapshot(dir: &Path, pool: &PoolConfig) -> Result<Snapshot> {
@@ -1138,6 +1147,33 @@ mod tests {
             .recv_timeout(WAIT)
             .expect("promoted ticket not granted");
         drop(stuck);
+    }
+
+    /// A live head ticket naming a class this xtask lacks (another version's): light queues FIFO, and the fallback logs and counts.
+    #[test]
+    fn unknown_head_class_queues_light_and_is_counted() {
+        let ws = scratch_ws("unknown-head", Some("[pool]\ncpu_slots = 2\nmem_gib = 2\n"));
+        let pool = ws_config::load(&ws).expect("config").pool;
+        let dir = dir(&ws);
+        let queue = dir.join("queue");
+        std::fs::create_dir_all(&queue).expect("queue dir");
+        let path = queue.join("00000000000000000001-0000000001-0000000000");
+        std::fs::write(&path, "retired-class").expect("ticket");
+        let file = OpenOptions::new().read(true).open(&path).expect("open");
+        let _waiter = Flock::try_take(file, Mode::Exclusive)
+            .expect("flock")
+            .expect("free");
+        let tickets = live_tickets(&queue).expect("tickets");
+        assert_eq!(tickets.len(), 1);
+        assert_eq!(tickets[0].1, None);
+        let before = UNKNOWN_HEAD_FIFO.load(Ordering::Relaxed);
+        let mut lines = Vec::new();
+        let allowed = bypass_allowed(&dir, &pool, &tickets, &mut |l| lines.push(l.to_owned()))
+            .expect("bypass_allowed");
+        assert!(!allowed, "light bypassed an unknown head");
+        assert_eq!(UNKNOWN_HEAD_FIFO.load(Ordering::Relaxed), before + 1);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("light queues FIFO"), "{}", lines[0]);
     }
 
     /// Memory admits two full natives (7 GiB each of 20) and not a third; the third's wait line names the memory.
