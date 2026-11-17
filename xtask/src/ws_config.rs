@@ -7,9 +7,9 @@
 //! cpu_slots = 16          # concurrent jobs machine-wide (default: the CPU count)
 //! mem_gib = 20            # memory reservable by admitted work
 //! starve_after_s = 7200   # a ticket waiting this long joins the top tier (build_pool.rs Tier)
-//! [pool.native-full]      # per class: CPU min..max (elastic) and GiB reserved
+//! [pool.native-full]      # per class: CPU min..max (elastic) and GiB reserved; defaults derive from cpu_slots (`Class::default_weight`)
 //! cpu_min = 8
-//! cpu_max = 16
+//! cpu_max = 8
 //! mem_gib = 7
 //! [cache]
 //! sccache_size = "5G"  # shared C/C++ compiler cache
@@ -240,10 +240,7 @@ fn defaults(path: PathBuf) -> WsConfig {
             cpu_slots: Setting::default(default_cpu_slots()),
             mem_gib: Setting::default(DEFAULT_POOL_MEM_GIB),
             starve_after_s: Setting::default(DEFAULT_POOL_STARVE_AFTER_S),
-            classes: Class::ALL
-                .into_iter()
-                .map(|c| (c, c.default_weight()))
-                .collect(),
+            classes: class_defaults(default_cpu_slots()),
         },
         refresh_min_upstream_files: Setting::default(DEFAULT_REFRESH_MIN_UPSTREAM_FILES),
         sccache_size: Setting::default(DEFAULT_SCCACHE_SIZE.to_owned()),
@@ -265,6 +262,8 @@ pub fn parse(text: &str, path: &Path) -> Result<WsConfig> {
         .parse()
         .with_context(|| format!("{shown}: not valid TOML"))?;
     let mut cfg = defaults(path.to_owned());
+    // class tables apply after the loop: their defaults derive from `pool.cpu_slots`, which may come later in the table
+    let mut class_tables = Vec::new();
     for (name, section) in &table {
         let toml::Value::Table(section) = section else {
             bail!(
@@ -280,7 +279,12 @@ pub fn parse(text: &str, path: &Path) -> Result<WsConfig> {
                 bail!("{at} is retired: {why}; delete the key from {shown}");
             }
             match (name.as_str(), key.as_str()) {
-                ("pool", k) => pool_key(&mut cfg.pool, k, value, &at)?,
+                ("pool", "cpu_slots") => cfg.pool.cpu_slots = Setting::file(count(value, &at)?),
+                ("pool", "mem_gib") => cfg.pool.mem_gib = Setting::file(whole(value, &at)?),
+                ("pool", "starve_after_s") => {
+                    cfg.pool.starve_after_s = Setting::file(count(value, &at)?);
+                }
+                ("pool", k) => class_tables.push((k, value, at)),
                 ("build", "refresh_min_upstream_files") => {
                     cfg.refresh_min_upstream_files = Setting::file(count(value, &at)?);
                 }
@@ -307,44 +311,49 @@ pub fn parse(text: &str, path: &Path) -> Result<WsConfig> {
             }
         }
     }
+    cfg.pool.classes = class_defaults(cfg.pool.cpu_slots.value);
+    for (key, value, at) in class_tables {
+        class_table(&mut cfg.pool, key, value, &at)?;
+    }
     Ok(cfg)
 }
 
-/// One `[pool]` entry: `cpu_slots`, `mem_gib`, `starve_after_s`, or a class table (`[pool.<class>]`: `cpu_min`, `cpu_max`, `mem_gib`; absent keys keep the class default).
-fn pool_key(pool: &mut PoolConfig, key: &str, value: &toml::Value, at: &str) -> Result<()> {
-    match key {
-        "cpu_slots" => pool.cpu_slots = Setting::file(count(value, at)?),
-        "mem_gib" => pool.mem_gib = Setting::file(whole(value, at)?),
-        "starve_after_s" => pool.starve_after_s = Setting::file(count(value, at)?),
-        _ => {
-            let Some(class) = Class::from_name(key) else {
-                bail!(
-                    "{at} is not a known key (known: pool.cpu_slots, pool.mem_gib, pool.starve_after_s, pool.<class> with {})",
-                    Class::ALL.map(Class::name).join(", ")
-                );
-            };
-            let toml::Value::Table(fields) = value else {
-                bail!("{at} must be a table with cpu_min, cpu_max and mem_gib");
-            };
-            let mut w = pool.classes[&class];
-            for (field, v) in fields {
-                let fat = format!("{}.{field}`", at.trim_end_matches('`'));
-                match field.as_str() {
-                    "cpu_min" => w.cpu_min = count(v, &fat)?,
-                    "cpu_max" => w.cpu_max = count(v, &fat)?,
-                    "mem_gib" => w.mem_gib = whole(v, &fat)?,
-                    _ => bail!("{fat} is not a known key (known: cpu_min, cpu_max, mem_gib)"),
-                }
-            }
-            ensure!(
-                w.cpu_min <= w.cpu_max,
-                "{at}: cpu_min {} is above cpu_max {}",
-                w.cpu_min,
-                w.cpu_max
-            );
-            pool.classes.insert(class, w);
+/// Every class at its default weight on a pool of `cpu_slots` (`Class::default_weight`).
+fn class_defaults(cpu_slots: u32) -> BTreeMap<Class, ClassWeight> {
+    Class::ALL
+        .into_iter()
+        .map(|c| (c, c.default_weight(cpu_slots)))
+        .collect()
+}
+
+/// One `[pool.<class>]` table (`cpu_min`, `cpu_max`, `mem_gib`; absent keys keep the class default).
+fn class_table(pool: &mut PoolConfig, key: &str, value: &toml::Value, at: &str) -> Result<()> {
+    let Some(class) = Class::from_name(key) else {
+        bail!(
+            "{at} is not a known key (known: pool.cpu_slots, pool.mem_gib, pool.starve_after_s, pool.<class> with {})",
+            Class::ALL.map(Class::name).join(", ")
+        );
+    };
+    let toml::Value::Table(fields) = value else {
+        bail!("{at} must be a table with cpu_min, cpu_max and mem_gib");
+    };
+    let mut w = pool.classes[&class];
+    for (field, v) in fields {
+        let fat = format!("{}.{field}`", at.trim_end_matches('`'));
+        match field.as_str() {
+            "cpu_min" => w.cpu_min = count(v, &fat)?,
+            "cpu_max" => w.cpu_max = count(v, &fat)?,
+            "mem_gib" => w.mem_gib = whole(v, &fat)?,
+            _ => bail!("{fat} is not a known key (known: cpu_min, cpu_max, mem_gib)"),
         }
     }
+    ensure!(
+        w.cpu_min <= w.cpu_max,
+        "{at}: cpu_min {} is above cpu_max {}",
+        w.cpu_min,
+        w.cpu_max
+    );
+    pool.classes.insert(class, w);
     Ok(())
 }
 
@@ -431,7 +440,7 @@ mod tests {
         assert_eq!(cfg.pool.cpu_slots.origin, Origin::Default);
         assert_eq!(
             cfg.pool.classes[&Class::NativeFull],
-            Class::NativeFull.default_weight()
+            Class::NativeFull.default_weight(cfg.pool.cpu_slots.value)
         );
         assert_eq!(cfg.sccache_size, Setting::default("5G".to_owned()));
         let dir = std::env::temp_dir().join(format!("xtask-wscfg-{}-absent", std::process::id()));
@@ -441,6 +450,31 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("cleanup");
         assert_eq!(absent.pool.mem_gib, Setting::default(20));
         assert_eq!(absent.sccache_size.origin, Origin::Default);
+    }
+
+    /// Defaults follow cpu_slots (check-admission D2): native-full = half the slots, both ends; native-incr and cargo = 4 ..= cpu_slots - 1, min clamped to the max on a tiny pool. Values by hand per slot count.
+    #[test]
+    fn class_defaults_derive_from_cpu_slots() {
+        // (cpu_slots, native-full, native-incr, cargo)
+        let cases = [
+            (16, w(8, 8, 7), w(4, 15, 2), w(4, 15, 6)),
+            (6, w(3, 3, 7), w(4, 5, 2), w(4, 5, 6)),
+            (3, w(1, 1, 7), w(2, 2, 2), w(2, 2, 6)),
+            (1, w(1, 1, 7), w(1, 1, 2), w(1, 1, 6)),
+        ];
+        for (slots, full, incr, cargo) in cases {
+            let cfg = parse(&format!("[pool]\ncpu_slots = {slots}\n"), path()).expect("valid");
+            let c = &cfg.pool.classes;
+            assert_eq!(
+                (
+                    c[&Class::NativeFull],
+                    c[&Class::NativeIncr],
+                    c[&Class::Cargo]
+                ),
+                (full, incr, cargo),
+                "cpu_slots {slots}"
+            );
+        }
     }
 
     #[test]
@@ -460,19 +494,22 @@ mod tests {
         assert_eq!(all.pool.starve_after_s, Setting::file(60));
     }
 
-    /// Class tables override only the keys they name; the others keep the class default.
+    fn w(cpu_min: u32, cpu_max: u32, mem_gib: u32) -> ClassWeight {
+        ClassWeight {
+            cpu_min,
+            cpu_max,
+            mem_gib,
+        }
+    }
+
+    /// Class tables override only the keys they name; the others keep the class default on the file's cpu_slots, whichever order the keys come in.
+    /// Expected by hand from check-admission D2 on 16 slots: native-full 8..8 (half), cargo 4..15 (cpu_slots - 1).
     #[test]
     fn class_tables_override_per_key() {
-        let cfg = parse("[pool.native-full]\ncpu_max = 8\n", path()).expect("valid");
-        let d = Class::NativeFull.default_weight();
-        assert_eq!(
-            cfg.pool.classes[&Class::NativeFull],
-            ClassWeight { cpu_max: 8, ..d }
-        );
-        assert_eq!(
-            cfg.pool.classes[&Class::Cargo],
-            Class::Cargo.default_weight()
-        );
+        let text = "[pool.native-full]\nmem_gib = 3\n[pool]\ncpu_slots = 16\n";
+        let cfg = parse(text, path()).expect("valid");
+        assert_eq!(cfg.pool.classes[&Class::NativeFull], w(8, 8, 3));
+        assert_eq!(cfg.pool.classes[&Class::Cargo], w(4, 15, 6));
         let e = err("[pool.native-full]\ncpu_min = 9\ncpu_max = 8\n");
         assert!(
             e.contains("`pool.native-full`: cpu_min 9 is above cpu_max 8"),

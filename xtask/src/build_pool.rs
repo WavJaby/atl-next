@@ -66,25 +66,31 @@ impl Class {
         Class::ALL.into_iter().find(|c| c.name() == name)
     }
 
-    /// Default weight; each value says what it is based on. Overridden per machine by `[pool.<name>]`.
-    pub fn default_weight(self) -> ClassWeight {
+    /// Default weight on a pool of `cpu_slots`; each value says what it is based on. Overridden per machine by `[pool.<name>]`.
+    pub fn default_weight(self, cpu_slots: u32) -> ClassWeight {
+        // half the pool, fixed: two full natives run side by side (memory fits two at 7 GiB); a cold build (25-40 min) never holds the whole pool while near-no-op natives queue behind it
+        let half = (cpu_slots / 2).max(1);
+        // cpu_slots - 1: one slot stays free, so a queued light check is never stuck behind a whole-pool grant (`may_bypass`)
+        let all_but_one = cpu_slots.saturating_sub(1).max(1);
+        // elastic classes start at 4 slots, or the whole elastic range on a pool smaller than that
+        let elastic_min = 4.min(all_but_one);
         match self {
-            // ninja on a cold graph: job RSS max 7.0 GB (2026-11-16, filter-data-g1). cpu 8..16: one build takes every free slot, so a second one waits for cpu
+            // ninja on a cold graph: job RSS max 7.0 GB (2026-11-16, filter-data-g1)
             Class::NativeFull => ClassWeight {
-                cpu_min: 8,
-                cpu_max: 16,
+                cpu_min: half,
+                cpu_max: half,
                 mem_gib: 7,
             },
             // ninja on a warm graph: RSS max 1.8 GB, rounded up
             Class::NativeIncr => ClassWeight {
-                cpu_min: 4,
-                cpu_max: 16,
+                cpu_min: elastic_min,
+                cpu_max: all_but_one,
                 mem_gib: 2,
             },
             // one cargo run: check's RSS max 5.4 GB over the whole check (an upper bound per step), rounded up
             Class::Cargo => ClassWeight {
-                cpu_min: 4,
-                cpu_max: 16,
+                cpu_min: elastic_min,
+                cpu_max: all_but_one,
                 mem_gib: 6,
             },
             // a runtime gate: not measured yet, placeholder
@@ -1137,7 +1143,7 @@ mod tests {
     /// Memory admits two full natives (7 GiB each of 20) and not a third; the third's wait line names the memory.
     #[test]
     fn memory_admits_two_full_natives_and_the_third_waits() {
-        // cpu_max 8 so that CPU is not the limit: the shipped weights give one full native the whole pool
+        // 32 slots, native-full pinned at 8 so that CPU is not the limit (the default would be 16 each)
         let ws = scratch_ws(
             "mem-two",
             Some(
@@ -1172,33 +1178,35 @@ mod tests {
         c.release.send(()).unwrap();
     }
 
-    /// The shipped weights (cpu 8..16, mem 7): one full native takes all 16 CPU slots, so a second waits on CPU although memory fits two.
+    /// Default weights on 16 slots: native-full is 8..8 (half), so two full natives run side by side and a third waits on CPU with every slot held.
     #[test]
-    fn elastic_cpu_lets_one_full_native_take_the_pool() {
-        let ws = scratch_ws("elastic", Some("[pool]\ncpu_slots = 16\nmem_gib = 20\n"));
+    fn default_weights_run_two_full_natives_side_by_side() {
+        let ws = scratch_ws("halves", Some("[pool]\ncpu_slots = 16\nmem_gib = 20\n"));
         let a = contender(&ws, "a", Class::NativeFull);
-        assert_eq!(a.granted.recv_timeout(WAIT).unwrap(), "cpu 16 mem 7");
+        assert_eq!(a.granted.recv_timeout(WAIT).unwrap(), "cpu 8 mem 7");
         let b = contender(&ws, "b", Class::NativeFull);
-        let line = b
+        assert_eq!(b.granted.recv_timeout(WAIT).unwrap(), "cpu 8 mem 7");
+        let c = contender(&ws, "c", Class::NativeFull);
+        let line = c
             .waits
             .recv_timeout(WAIT)
-            .expect("the second native did not wait");
-        // CPU is the limit: a holds all 16 slots (the memory count is left out, as in the memory test)
+            .expect("the third native did not wait");
         assert!(line.contains("free cpu 0/16"), "{line}");
         a.release.send(()).unwrap();
         assert!(
-            b.granted.recv_timeout(WAIT).is_ok(),
-            "second native never ran"
+            c.granted.recv_timeout(WAIT).is_ok(),
+            "third native never ran"
         );
         b.release.send(()).unwrap();
+        c.release.send(()).unwrap();
     }
 
-    /// Each class takes its weight: cargo gets every free slot up to its max (16) and 6 GiB; harness is capped at its max of 6 CPU slots.
+    /// Each class takes its weight: cargo gets every free slot up to its default max (16 - 1 = 15) and 6 GiB; harness is capped at its max of 6 CPU slots.
     #[test]
     fn class_weights_size_the_grant() {
         let ws = scratch_ws("weights", Some("[pool]\ncpu_slots = 16\nmem_gib = 20\n"));
         let cargo = contender(&ws, "cargo", Class::Cargo);
-        assert_eq!(cargo.granted.recv_timeout(WAIT).unwrap(), "cpu 16 mem 6");
+        assert_eq!(cargo.granted.recv_timeout(WAIT).unwrap(), "cpu 15 mem 6");
         cargo.release.send(()).unwrap();
         let harness = contender(&ws, "harness", Class::Harness);
         assert_eq!(harness.granted.recv_timeout(WAIT).unwrap(), "cpu 6 mem 2");
@@ -1320,7 +1328,13 @@ mod tests {
 
     #[test]
     fn class_larger_than_the_pool_is_refused_not_waited_for() {
-        let ws = scratch_ws("fits", Some("[pool]\ncpu_slots = 4\nmem_gib = 20\n"));
+        // defaults always fit cpu_slots (half the slots): an override asks for more than the pool has
+        let ws = scratch_ws(
+            "fits",
+            Some(
+                "[pool]\ncpu_slots = 4\nmem_gib = 20\n[pool.native-full]\ncpu_min = 8\ncpu_max = 8\n",
+            ),
+        );
         let e = acquire_with(
             &ws,
             Path::new("big"),
