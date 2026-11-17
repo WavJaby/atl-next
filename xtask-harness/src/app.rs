@@ -756,6 +756,11 @@ const BRIDGE1_CALLS: &[(&str, &str)] = &[
     // atl_jni_test.c keyDtorDetach: destructor ran once; DetachCurrentThread and AttachCurrentThread both JNI_OK (0); return and pthread_exit endings
     ("keyDtorDetachReturn", "ran 1 rc 0 attach 0"),
     ("keyDtorDetachExit", "ran 1 rc 0 attach 0"),
+    // mode 2: the destructor's own AttachCurrentThread JNI_OK (0, already attached) and GetVersion = JNI_VERSION_1_6 (0x10006 = 65542, ART's answer)
+    (
+        "keyDtorAttach",
+        "ran 1 rc 0 attach 0 dtor-attach 0 version 65542",
+    ),
     ("errnoRoundTrip", "2"),
     ("cppThrowCatch", "1"),
     ("dlopenSibling", "42"),

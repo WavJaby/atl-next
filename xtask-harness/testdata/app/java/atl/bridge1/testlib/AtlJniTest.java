@@ -161,8 +161,8 @@ public final class AtlJniTest {
     /** fid-nbridge: the caller's whole /proc/cpuinfo against the one native code reads (atl_jni_test.c cpuinfoView). */
     public static native String cpuinfoView(String java);
 
-    /** bridge-keydtor: a native thread that attaches and detaches only from a pthread key destructor, ending by return (0) or pthread_exit (1) (atl_jni_test.c keyDtorDetach). */
-    public static native String keyDtorDetach(int viaExit);
+    /** bridge-keydtor: a native thread that attaches and detaches only from a pthread key destructor, ending by return (0) or pthread_exit (1), or by return with a destructor that attaches first (2) (atl_jni_test.c keyDtorDetach). */
+    public static native String keyDtorDetach(int mode);
 
     /** net-bp: the libc resolver family through the bridge, one line of checks (atl_jni_test.c resolverProbe). */
     public static native String resolverProbe();

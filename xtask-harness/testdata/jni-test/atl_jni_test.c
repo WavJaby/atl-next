@@ -749,14 +749,22 @@ JNI_FN(jstring, cpuinfoView)(JNIEnv *env, jclass cls, jstring java)
 }
 
 // AtlJniTest.keyDtorDetach (bridge-keydtor): Android's documented JNI thread pattern (developer.android.com JNI tips "Threads"): a native thread attaches, stores its JNIEnv under a pthread key whose destructor calls DetachCurrentThread, then ends without detaching -- by returning (exit 0) or by pthread_exit (exit 1). ART's ThreadExitCallback re-arms once for exactly this (thread.cc) and aborts only if the thread is still attached on its second call.
-// Answer "ran R rc C attach A": R = destructor runs (1), C = its DetachCurrentThread result (JNI_OK 0), A = the thread's AttachCurrentThread result (0). A process abort instead of an answer is the failure this row guards.
+// Mode 2: the destructor first calls AttachCurrentThread and GetVersion through the env it answers, as a game's exit hook does. thread_local destructors have already run there (bionic pthread_exit: __cxa_thread_finalize before pthread_key_clean_all; glibc alike), so the bridge's guest env must not live in one.
+// Answer "ran R rc C attach A": R = destructor runs (1), C = its DetachCurrentThread result (JNI_OK 0), A = the thread's AttachCurrentThread result (0); mode 2 appends " dtor-attach D version V": D = the destructor's AttachCurrentThread result (JNI_OK 0: already attached), V = GetVersion (ART answers JNI_VERSION_1_6 = 0x10006 = 65542). A process abort instead of an answer is the failure this row guards.
 static JavaVM *kd_vm;
 static pthread_key_t kd_key;
-static volatile int kd_ran, kd_rc = -100, kd_attach = -100;
+static int kd_mode;
+static volatile int kd_ran, kd_rc = -100, kd_attach = -100, kd_dtor_attach = -100, kd_version = -100;
 
 static void kd_dtor(void *value)
 {
     kd_ran++;
+    if (kd_mode == 2) {
+        JNIEnv *env = NULL;
+        kd_dtor_attach = (*kd_vm)->AttachCurrentThread(kd_vm, &env, NULL);
+        if (kd_dtor_attach == JNI_OK)
+            kd_version = (*env)->GetVersion(env);
+    }
     kd_rc = (*kd_vm)->DetachCurrentThread(kd_vm);
 }
 
@@ -765,23 +773,27 @@ static void *kd_thread(void *arg)
     JNIEnv *env = NULL;
     kd_attach = (*kd_vm)->AttachCurrentThread(kd_vm, &env, NULL);
     pthread_setspecific(kd_key, env);
-    if ((intptr_t)arg)
+    if (kd_mode == 1)
         pthread_exit(NULL);
     return NULL;
 }
 
-JNI_FN(jstring, keyDtorDetach)(JNIEnv *env, jclass cls, jint via_exit)
+// mode: 0 return, 1 pthread_exit, 2 return with a destructor that attaches (above)
+JNI_FN(jstring, keyDtorDetach)(JNIEnv *env, jclass cls, jint mode)
 {
-    char out[64];
+    char out[96];
     pthread_t t;
     (*env)->GetJavaVM(env, &kd_vm);
+    kd_mode = mode;
     kd_ran = 0;
-    kd_rc = kd_attach = -100;
-    if (pthread_key_create(&kd_key, kd_dtor) != 0 || pthread_create(&t, NULL, kd_thread, (void *)(intptr_t)via_exit) != 0)
+    kd_rc = kd_attach = kd_dtor_attach = kd_version = -100;
+    if (pthread_key_create(&kd_key, kd_dtor) != 0 || pthread_create(&t, NULL, kd_thread, NULL) != 0)
         return (*env)->NewStringUTF(env, "setup failed");
     pthread_join(t, NULL);
     pthread_key_delete(kd_key);
-    snprintf(out, sizeof out, "ran %d rc %d attach %d", kd_ran, kd_rc, kd_attach);
+    int n = snprintf(out, sizeof out, "ran %d rc %d attach %d", kd_ran, kd_rc, kd_attach);
+    if (mode == 2)
+        snprintf(out + n, sizeof out - n, " dtor-attach %d version %d", kd_dtor_attach, kd_version);
     return (*env)->NewStringUTF(env, out);
 }
 

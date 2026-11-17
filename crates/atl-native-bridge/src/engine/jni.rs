@@ -4,7 +4,6 @@
 //! Specials, whose results hand an env/vm back to the guest, are host functions instead (the set Berberis `jni/jni_trampolines.cc` special-cases, minus `RegisterNatives`: ART asks `isNativeBridgeFunctionPointer`): `GetJavaVM`, `GetEnv`, `AttachCurrentThread`, `AttachCurrentThreadAsDaemon`.
 //! Down calls rewrite the other way (arch `Down`): host env -> this thread's guest env, host vm -> the guest vm.
 
-use std::cell::Cell;
 use std::sync::OnceLock;
 
 use super::objects::{self, ENV as ENV_TABLE, GuestObj, VM as VM_TABLE, env, vm};
@@ -19,41 +18,24 @@ pub(super) const CALL_STATIC_INT_METHOD: usize = env::CallStaticIntMethod;
 
 static VM: OnceLock<usize> = OnceLock::new();
 
-/// This thread's guest env object, freed at thread exit.
-struct ThreadEnv(Cell<*mut GuestObj>);
-impl Drop for ThreadEnv {
-    fn drop(&mut self) {
-        let p = self.0.get();
-        if !p.is_null() {
-            // SAFETY: made by `guest_env` with Box::into_raw on this thread; the thread runs no guest code after its TLS destructors.
-            drop(unsafe { Box::from_raw(p) });
-        }
-    }
-}
-thread_local! {
-    static ENV: ThreadEnv = const { ThreadEnv(Cell::new(std::ptr::null_mut())) };
-}
-
-/// The guest env standing for host env `host` on this thread (one per thread, as ART's).
+/// The guest env standing for host env `host` on this thread (one per thread, as ART's, which keeps it in its `Thread`): held by the thread's crossing record (record.rs `HostThread::env`), so it stays valid in pthread key destructors and is freed with the record at `detach`.
 pub fn guest_env(host: usize) -> usize {
     if host == 0 {
         return 0;
     }
-    let functions = objects::functions(
-        ENV_TABLE,
-        &[(env::GetJavaVM, get_java_vm as *const () as usize)],
-        host,
-    );
-    ENV.with(|e| {
-        let mut p = e.0.get();
-        if p.is_null() {
-            p = Box::into_raw(Box::new(GuestObj { functions, host }));
-            e.0.set(p);
-        }
-        // SAFETY: this thread's object.
-        unsafe { (*p).host = host };
-        p as usize
-    })
+    let ht = super::thread::attach_current();
+    // SAFETY: this thread's record, leaked until its detach; no other borrow of it is live here.
+    let slot = unsafe { &mut (*ht).env };
+    let obj = slot.get_or_insert_with(|| {
+        let functions = objects::functions(
+            ENV_TABLE,
+            &[(env::GetJavaVM, get_java_vm as *const () as usize)],
+            host,
+        );
+        Box::new(GuestObj { functions, host })
+    });
+    obj.host = host;
+    &raw const **obj as usize
 }
 
 /// The guest vm standing for host vm `host` (ART has one per process).
