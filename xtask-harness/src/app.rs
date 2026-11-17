@@ -506,12 +506,13 @@ const WEBVIEW_SCHEME: Line = Line {
     ),
     timing: Timing::Async,
 };
-/// http: the client returns false for an http URL -> it loads as usual (onPageStarted for it). Its error and the page after it (the port refuses: an error page) are printed, not judged.
+/// http: the client returns false for an http URL -> it loads as usual (onPageStarted for it). What follows the refused connection is printed, not judged: the engine's error page (WebKit loads one
+/// for the failing URL: a second `http` start), the error code and the page.
 const WEBVIEW_HTTP: Line = Line {
     row: "webview-http",
     prefix: "AtlTest: webview-http: ",
     want: Want::Prefix(
-        "calls=1 request=http://127.0.0.1:9/next main=true redirect=false gesture=false method=GET started=https,http, ",
+        "calls=1 request=http://127.0.0.1:9/next main=true redirect=false gesture=false method=GET started=https,http,",
     ),
     timing: Timing::Async,
 };

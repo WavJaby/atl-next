@@ -736,14 +736,29 @@ fn on_event(shared: &Shared, ev: WebEvent) {
                 LoadError::UnsupportedScheme => -10, // ERROR_UNSUPPORTED_SCHEME
                 _ => -1,                    // ERROR_UNKNOWN
             };
-            let (d, u) = (new_string(env, &message), new_string(env, &uri));
-            call_void(
+            // the main frame's load (the engine reports no subframe failure); WebViewClient's default forwards it to the deprecated (code, description, url) overload for the main frame
+            let request = new_request(
                 env,
-                client,
-                c"onReceivedError",
-                c"(Landroid/webkit/WebView;ILjava/lang/String;Ljava/lang/String;)V",
-                &[l(web_view), jvalue { i: code }, l(d), l(u)],
+                &NavigationRequest {
+                    uri,
+                    method: "GET".into(),
+                    main_frame: true,
+                    redirect: false,
+                    gesture: false,
+                },
             );
+            let error = new_error(env, code, &message);
+            if !request.is_null() && !error.is_null() {
+                call_void(
+                    env,
+                    client,
+                    c"onReceivedError",
+                    c"(Landroid/webkit/WebView;Landroid/webkit/WebResourceRequest;Landroid/webkit/WebResourceError;)V",
+                    &[l(web_view), l(request), l(error)],
+                );
+            }
+            delete_local(env, request);
+            delete_local(env, error);
         }
         WebEvent::Title(t) if !chrome.is_null() => {
             let s = new_string(env, &t);
@@ -846,26 +861,56 @@ fn new_request(env: Env, r: &NavigationRequest) -> Obj {
     obj
 }
 
-/// WebResourceRequestImpl as a global ref, found at the first createWebView: a native called from the provider's Java finds the provider's classes; an engine event on the GLib loop has no such
-/// caller frame, so FindClass there would search the boot class loader.
+/// The provider's WebResourceError for an onReceivedError (WebResourceErrorImpl: a value holder).
+fn new_error(env: Env, code: i32, description: &str) -> Obj {
+    let Some(&c) = ERROR_CLASS.get() else {
+        return NULL;
+    };
+    let c = c as Obj;
+    let init = jni_call!(
+        env,
+        GetMethodID,
+        c,
+        c"<init>".as_ptr(),
+        c"(ILjava/lang/String;)V".as_ptr()
+    );
+    if init.is_null() {
+        return NULL;
+    }
+    let d = new_string(env, description);
+    let obj = jni_call!(
+        env,
+        NewObjectA,
+        c,
+        init,
+        [jvalue { i: code }, l(d)].as_ptr()
+    );
+    delete_local(env, d);
+    obj
+}
+
+/// WebResourceRequestImpl / WebResourceErrorImpl as global refs, found at the first createWebView: a native called from the provider's Java finds the provider's classes; an engine event on the
+/// GLib loop has no such caller frame, so FindClass there would search the boot class loader.
 static REQUEST_CLASS: OnceLock<usize> = OnceLock::new();
+static ERROR_CLASS: OnceLock<usize> = OnceLock::new();
 
 fn find_provider_classes(env: Env) {
-    if REQUEST_CLASS.get().is_some() {
-        return;
+    for (cell, name) in [
+        (&REQUEST_CLASS, c"com/android/webview/chromium/WebResourceRequestImpl"),
+        (&ERROR_CLASS, c"com/android/webview/chromium/WebResourceErrorImpl"),
+    ] {
+        if cell.get().is_some() {
+            continue;
+        }
+        let c = jni_call!(env, FindClass, name.as_ptr());
+        if c.is_null() {
+            jni_call!(env, ExceptionClear);
+            tracing::error!("webview: provider class {name:?} missing: its client callbacks are not made");
+            continue;
+        }
+        let _ = cell.set(jni_call!(env, NewGlobalRef, c) as usize);
+        delete_local(env, c);
     }
-    let c = jni_call!(
-        env,
-        FindClass,
-        c"com/android/webview/chromium/WebResourceRequestImpl".as_ptr()
-    );
-    if c.is_null() {
-        jni_call!(env, ExceptionClear);
-        tracing::error!("webview: no WebResourceRequestImpl in the provider: shouldOverrideUrlLoading is not called");
-        return;
-    }
-    let _ = REQUEST_CLASS.set(jni_call!(env, NewGlobalRef, c) as usize);
-    delete_local(env, c);
 }
 
 /// A navigation the engine handed over as a download: DownloadListener.onDownloadStart(url, userAgent, contentDisposition, mimetype, contentLength), the user agent being the view's
