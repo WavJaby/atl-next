@@ -84,6 +84,8 @@ pub struct Spawn {
     pub property_area: Option<PathBuf>,
     /// What the app's manifest permissions give beyond its mounts ([`rights_of`]): [`Right::Net`] leaves TCP unrestricted; without it TCP is refused (Landlock ABI >= 4).
     pub rights: Vec<Right>,
+    /// The app's desktop identity (`atl.<package>`, atl_launch::app_id) the host gives the web processes it spawns for this process ([`webspawn::AppView::app_id`]); None: a process of no package.
+    pub app_id: Option<String>,
     pub program: PathBuf,
     pub args: Vec<OsString>,
     pub env: Vec<(OsString, OsString)>,
@@ -939,6 +941,7 @@ impl Broker {
                 .cloned()
                 .collect(),
             pulse: self.webspawn.as_ref().and_then(|w| w.pulse.clone()),
+            app_id: spawn.app_id.clone(),
         };
         let Process { child, host_pid } = launch(
             Launch {
@@ -1046,6 +1049,7 @@ impl WebSpawner {
             },
             property_area: None,
             rights: vec![],
+            app_id: None,
             program: plan.program.clone(),
             args: vec![],
             env: plan.env.clone(),
@@ -1434,6 +1438,7 @@ mod tests {
             devices: vec!["/dev/dri".into()],
             property_area: Some("/r/properties".into()),
             rights: vec![],
+            app_id: None,
             program: "/bin/true".into(),
             args: vec![],
             env: vec![],

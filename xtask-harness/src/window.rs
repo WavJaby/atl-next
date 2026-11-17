@@ -2274,7 +2274,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         None => Err("no probe: only the gtk, widgets and resize stages run one".to_owned()),
     };
     let pressure = sampler.stop();
-    let sound_peak = sound.map(webview::Sound::stop);
+    let heard = sound.map(webview::Sound::stop);
     let app = read(&app_log);
     let services = read(&services_log);
     let all = events(&services);
@@ -2313,7 +2313,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             &liveness,
             &captured,
             args.esc_back,
-            sound_peak.unwrap_or_else(|| Err("no recording".to_owned())),
+            heard.unwrap_or_else(|| webview::Heard {
+                peak: Err("no recording".to_owned()),
+                streams: Err("no recording".to_owned()),
+            }),
+            // the desktop file ID rule `atl.<package>`, as the app_id sub-gate expects of the window
+            &format!("atl.{}", m.name),
             &atld_log,
         ),
         (Stage::WebViewOverlay, Some(_)) => webview_overlay::checks(&app, args.esc_back),

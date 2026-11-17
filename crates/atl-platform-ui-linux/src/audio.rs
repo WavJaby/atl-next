@@ -13,7 +13,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use atl_platform_ui_api::audio::{AudioError, AudioHost, PcmOutput, PcmSpec};
+use atl_platform_ui_api::audio::{AudioError, AudioHost, PcmOutput, PcmSpec, StreamIdentity};
 use pipewire::context::ContextRc;
 use pipewire::core::CoreRc;
 use pipewire::keys;
@@ -56,12 +56,23 @@ impl Drop for Connection {
 /// A connection to the PipeWire server (the default sink is the server's choice; no device parameter).
 pub struct PipeWireHost {
     connection: Rc<Connection>,
+    /// `application.id` / `application.name` of the client and of every stream; None: libpipewire's defaults (the program name).
+    identity: Option<(String, String)>,
+}
+
+/// Adds the identity keys. No `media.role`: most Linux players set none, and WirePlumber 0.5.8 keys a stream's saved volume by role before `application.id`, so one role shared every app's volume.
+fn identify(props: &mut pipewire::properties::PropertiesBox, identity: Option<&(String, String)>) {
+    if let Some((id, name)) = identity {
+        props.insert(*keys::APP_ID, id.as_str());
+        props.insert(*keys::APP_NAME, name.as_str());
+    }
 }
 
 impl AudioHost for PipeWireHost {
     type Output = PipeWireOutput;
 
-    fn connect(remote: &Path) -> Result<Self, AudioError> {
+    fn connect(remote: &Path, identity: Option<StreamIdentity<'_>>) -> Result<Self, AudioError> {
+        let identity = identity.map(|i| (i.id.to_owned(), i.name.to_owned()));
         let name = remote
             .to_str()
             .ok_or_else(|| AudioError::Unavailable(format!("{}: not UTF-8", remote.display())))?;
@@ -75,7 +86,9 @@ impl AudioHost for PipeWireHost {
         let core = {
             let _lock = loop_.lock();
             // an absolute remote.name is the socket path as given (`pw-cli -r` does the same)
-            context.connect_rc(Some(properties! { *keys::REMOTE_NAME => name }))
+            let mut props = properties! { *keys::REMOTE_NAME => name };
+            identify(&mut props, identity.as_ref());
+            context.connect_rc(Some(props))
         };
         match core {
             Ok(core) => Ok(Self {
@@ -83,6 +96,7 @@ impl AudioHost for PipeWireHost {
                     core: Some(core),
                     loop_,
                 }),
+                identity,
             }),
             Err(e) => {
                 loop_.stop();
@@ -111,18 +125,14 @@ impl AudioHost for PipeWireHost {
                 .core
                 .as_ref()
                 .ok_or_else(|| AudioError::Stream("connection closed".to_owned()))?;
-            let stream = StreamRc::new(
-                core.clone(),
-                "atl-pcm-output",
-                properties! {
-                    *keys::MEDIA_TYPE => "Audio",
-                    *keys::MEDIA_CATEGORY => "Playback",
-                    // one role until A1 maps AudioAttributes usages to roles (plan section 3)
-                    *keys::MEDIA_ROLE => "Game",
-                    *keys::NODE_NAME => "atl-pcm-output",
-                },
-            )
-            .map_err(|e| stream_error("new", &e))?;
+            let mut props = properties! {
+                *keys::MEDIA_TYPE => "Audio",
+                *keys::MEDIA_CATEGORY => "Playback",
+                *keys::NODE_NAME => "atl-pcm-output",
+            };
+            identify(&mut props, self.identity.as_ref());
+            let stream = StreamRc::new(core.clone(), "atl-pcm-output", props)
+                .map_err(|e| stream_error("new", &e))?;
             let data = UserData {
                 fill: Box::new(fill),
                 scratch: vec![0.0; SCRATCH_FRAMES * channels],

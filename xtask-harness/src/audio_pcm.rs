@@ -340,9 +340,11 @@ impl Routing {
             sink: None,
             previous: default_sink()?,
         };
+        // state.restore-props=false: WirePlumber's state-stream neither restores nor saves this node's volume, so a run leaves no `Audio/Sink:node.name:<sink>` key in the user's state file
         let props = format!(
             "{{ factory.name=support.null-audio-sink node.name={name} media.class=Audio/Sink \
-             audio.rate=48000 audio.channels={CHANNELS} audio.position=[ FL FR ] object.linger=true }}"
+             audio.rate=48000 audio.channels={CHANNELS} audio.position=[ FL FR ] object.linger=true \
+             state.restore-props=false }}"
         );
         let created = pw_command(&["create-node", "adapter", &props])?;
         ensure!(created.status.success(), "pw-cli create-node failed");
@@ -491,6 +493,115 @@ impl Drop for PrivateServer {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// The properties of every node seen linked into a sink, keyed by node id.
+pub(crate) type Streams =
+    std::collections::BTreeMap<u64, serde_json::Map<String, serde_json::Value>>;
+
+/// Samples `pw-dump` while a run plays: every node linked into the sink, with its properties as the server shows them (a stream may come and go, so one look at the end could miss it).
+pub(crate) struct StreamWatch {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: thread::JoinHandle<Result<Streams, String>>,
+}
+
+/// How often [`StreamWatch`] samples: shorter than the shortest stream a gate plays (the WebView tone, about a second).
+const WATCH_PERIOD: Duration = Duration::from_millis(200);
+
+impl StreamWatch {
+    pub(crate) fn start(sink: &str) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&stop);
+        let sink = sink.to_owned();
+        let thread = thread::spawn(move || {
+            let mut seen = Streams::new();
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                let out = Command::new("pw-dump")
+                    .output()
+                    .map_err(|e| format!("running pw-dump: {e}"))?;
+                let dump: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout)
+                    .map_err(|e| format!("pw-dump: not a JSON array: {e}"))?;
+                seen.extend(linked_into(&dump, &sink));
+                thread::sleep(WATCH_PERIOD);
+            }
+            Ok(seen)
+        });
+        StreamWatch { stop, thread }
+    }
+
+    /// Every node seen linked into the sink.
+    pub(crate) fn stop(self) -> Result<Streams, String> {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.thread
+            .join()
+            .unwrap_or_else(|_| Err("the pw-dump thread panicked".to_owned()))
+    }
+}
+
+/// Nodes of `dump` with a link into the node named `sink`.
+fn linked_into(dump: &[serde_json::Value], sink: &str) -> Streams {
+    let props = |o: &serde_json::Value| {
+        o.pointer("/info/props")
+            .and_then(|p| p.as_object())
+            .cloned()
+    };
+    let of_type = |t: &'static str| dump.iter().filter(move |o| o["type"] == t);
+    let Some(sink_id) = of_type("PipeWire:Interface:Node")
+        .find(|o| o.pointer("/info/props/node.name").and_then(|v| v.as_str()) == Some(sink))
+        .and_then(|o| o["id"].as_u64())
+    else {
+        return Streams::new();
+    };
+    let sources: Vec<u64> = of_type("PipeWire:Interface:Link")
+        .filter(|l| l.pointer("/info/input-node-id").and_then(|v| v.as_u64()) == Some(sink_id))
+        .filter_map(|l| l.pointer("/info/output-node-id").and_then(|v| v.as_u64()))
+        .collect();
+    of_type("PipeWire:Interface:Node")
+        .filter_map(|o| Some((o["id"].as_u64()?, o)))
+        .filter(|(id, _)| sources.contains(id))
+        .filter_map(|(id, o)| Some((id, props(o)?)))
+        .collect()
+}
+
+/// One stream's identity keys as a log fragment.
+pub(crate) fn describe(props: &serde_json::Map<String, serde_json::Value>) -> String {
+    let key = |k: &str| {
+        props
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("-")
+            .to_owned()
+    };
+    format!(
+        "node.name={} application.id={} application.name={} media.role={}",
+        key("node.name"),
+        key("application.id"),
+        key("application.name"),
+        key("media.role")
+    )
+}
+
+/// Every stream seen carries `application.id` = `want`; with `role_free`, none carries a `media.role` (ATL's own stream sets none: the Linux convention, and WirePlumber 0.5.8 keys saved volume by role first).
+pub(crate) fn identity_check(
+    streams: &Streams,
+    want: &str,
+    role_free: bool,
+) -> Result<String, String> {
+    if streams.is_empty() {
+        return Err("no stream was seen linked into the null sink".to_owned());
+    }
+    let lines: Vec<String> = streams.values().map(describe).collect();
+    let wrong = streams.values().any(|p| {
+        p.get("application.id").and_then(|v| v.as_str()) != Some(want)
+            || (role_free && p.contains_key("media.role"))
+    });
+    let detail = format!(
+        "{} stream(s): {}; want application.id={want}{}",
+        lines.len(),
+        lines.join(" | "),
+        if role_free { ", no media.role" } else { "" }
+    );
+    if wrong { Err(detail) } else { Ok(detail) }
 }
 
 /// Reports a failed cleanup step on stderr; the run's verdict is already decided by then.

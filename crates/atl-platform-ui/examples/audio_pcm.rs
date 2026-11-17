@@ -116,7 +116,7 @@ fn run(args: &Args) -> Result<()> {
         quantum: Arc::clone(&quantum),
     };
 
-    let host = PlatformAudioHost::connect(&args.remote)?;
+    let host = PlatformAudioHost::connect(&args.remote, None)?;
     say("connected");
     let output = host.open_output(
         PcmSpec {

@@ -39,9 +39,18 @@ pub struct Options {
 }
 
 /// Serves [`FLINGER_NAME`] and [`POLICY_NAME`] to this process, with the PCM output connecting to the audio server socket `remote` (granted by atld; None: none granted) on its first use. Refused before `atl_service_view::install`. The launcher skips the call under `--no-audio-service` (the audio gate's break).
+/// `identity`: the app the output's stream belongs to (the desktop's mixer row and saved-volume key); None: a process of no app.
 /// Fails only when the services cannot be served: a server that is unreachable is not an error here, and its tracks fail when made (output.rs).
-pub fn serve(remote: Option<&Path>, opts: Options) -> Result<(), String> {
-    let output = output::Opener::spawn(remote.map(PathBuf::from), opts)?;
+pub fn serve(
+    remote: Option<&Path>,
+    identity: Option<atl_platform_ui::audio::StreamIdentity<'_>>,
+    opts: Options,
+) -> Result<(), String> {
+    let target = output::Target {
+        remote: remote.map(PathBuf::from),
+        identity: identity.map(|i| (i.id.to_owned(), i.name.to_owned())),
+    };
+    let output = output::Opener::spawn(target, opts)?;
     atl_service_view::serve(FLINGER_NAME, flinger::new_binder(opts, output))?;
     atl_service_view::serve(POLICY_NAME, policy::new_binder())?;
     Ok(())

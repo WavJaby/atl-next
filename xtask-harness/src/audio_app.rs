@@ -17,7 +17,8 @@ use anyhow::{Context, Result};
 
 use crate::atld_run::{NativeLibs, Package, Run, Runtime, counter_lines};
 use crate::audio_pcm::{
-    FULL_SCALE, Recorder, Recording, Routing, frequency_hz, out_of_range, read_wav, rms,
+    FULL_SCALE, Recorder, Recording, Routing, StreamWatch, frequency_hz, identity_check,
+    out_of_range, read_wav, rms,
 };
 use crate::ndk::{NdkTarget, default_ndk};
 use crate::{host_art, jni_fixture, manifest};
@@ -485,6 +486,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let wav = work.join("recording.wav");
     let routing = Routing::setup(&sink)?;
     let recorder = Recorder::start(&sink, &wav, u32::try_from(SPEC_RATE_HZ)?)?;
+    let watch = StreamWatch::start(&sink);
     let mut atld_child = rt.start_atld(&run)?;
     let app_log = run.log(&m.name);
     let read = atl_diag::logfiles::read;
@@ -498,6 +500,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+    let streams = watch.stop();
     recorder.stop()?;
     drop(routing);
     if atld_child.try_wait()?.is_none() {
@@ -641,6 +644,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         ),
     );
     ok &= native_verdicts(&app, &services);
+    // the app's desktop identity: the desktop file ID rule `atl.<package>` (the window's app_id too), from the fixture's manifest
+    let want_id = format!("atl.{}", m.name);
+    let identity = streams.and_then(|s| identity_check(&s, &want_id, true));
+    ok &= verdict(
+        "stream identity",
+        identity.is_ok(),
+        identity.as_ref().unwrap_or_else(|e| e),
+    );
     let pcm = fs::read(&wav)
         .map_err(anyhow::Error::from)
         .and_then(|bytes| read_wav(&bytes));

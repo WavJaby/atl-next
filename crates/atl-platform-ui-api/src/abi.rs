@@ -568,6 +568,35 @@ pub fn audio_error(kind: Status, text: Vec<u8>) -> AudioError {
     }
 }
 
+/// An optional [`StreamIdentity`](crate::audio::StreamIdentity) for one call.
+#[repr(C)]
+pub struct StreamIdentityView {
+    id: Str,
+    name: Str,
+    has_identity: bool,
+}
+
+impl StreamIdentityView {
+    /// Borrows `i`.
+    pub fn of(i: Option<crate::audio::StreamIdentity<'_>>) -> Self {
+        Self {
+            id: Str::of(i.map_or("", |i| i.id)),
+            name: Str::of(i.map_or("", |i| i.name)),
+            has_identity: i.is_some(),
+        }
+    }
+
+    /// The identity as (id, name).
+    ///
+    /// # Safety
+    /// The identity this view was made from is still alive.
+    pub unsafe fn get(&self) -> Option<(String, String)> {
+        // SAFETY: the caller's contract.
+        self.has_identity
+            .then(|| unsafe { (self.id.get().into_owned(), self.name.get().into_owned()) })
+    }
+}
+
 /// [`WindowAttributes`](crate::WindowAttributes) for one call.
 #[repr(C)]
 pub struct WindowAttributesView {
@@ -1131,9 +1160,13 @@ pub struct UiVtable {
     /// `TextInput::on_events`.
     pub text_on_events:
         unsafe extern "C" fn(text: *mut TextInputHandle, f: Callback<TextInputEventView>),
-    /// `AudioHost::connect` to the socket `remote` (a path).
-    pub audio_connect:
-        unsafe extern "C" fn(remote: Str, out: *mut *mut AudioHandle, err: *mut BytesOut) -> Status,
+    /// `AudioHost::connect` to the socket `remote` (a path); `identity` None when `has_identity` is false.
+    pub audio_connect: unsafe extern "C" fn(
+        remote: Str,
+        identity: StreamIdentityView,
+        out: *mut *mut AudioHandle,
+        err: *mut BytesOut,
+    ) -> Status,
     /// Ends a connection.
     pub audio_drop: unsafe extern "C" fn(audio: *mut AudioHandle),
     /// `AudioHost::open_output`.

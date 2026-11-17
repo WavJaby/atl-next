@@ -125,6 +125,7 @@ pub(crate) fn spawn_of(cmd: &Command, uid: u32) -> Result<Spawn> {
         devices: vec![],
         property_area: None,
         rights: vec![],
+        app_id: None,
         program: cmd.get_program().into(),
         args: cmd.get_args().map(OsStr::to_owned).collect(),
         env,

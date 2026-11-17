@@ -835,6 +835,7 @@ impl Host {
                 devices: vec![],
                 property_area: Some(self.root.properties()),
                 rights: vec![],
+                app_id: None,
                 program: i.installer.clone(),
                 args: i
                     .vm
@@ -941,6 +942,7 @@ impl Host {
             devices: vec![],
             property_area: Some(self.root.properties()),
             rights: vec![],
+            app_id: None,
             program: i.installer.clone(),
             args: i.vm.iter().cloned().chain([OsString::from(dir)]).collect(),
             env: i.env.clone(),
@@ -1274,6 +1276,7 @@ impl Host {
             [format!("--target-sdk={target_sdk}"), "--app".to_owned()]
                 .into_iter()
                 .chain(instruction_set.map(|isa| format!("--instruction-set={isa}")))
+                .chain(package.map(|p| format!("--package={p}")))
                 .chain(
                     self.pipewire
                         .iter()
@@ -1341,6 +1344,7 @@ impl Host {
             devices: self.app_devices.clone(),
             property_area: Some(self.process_properties(uid, name)?),
             rights: vec![],
+            app_id: package.map(atl_launch::app_id).transpose()?,
             program: self.launcher.clone(),
             args: launcher_args,
             env: self
@@ -1605,6 +1609,7 @@ impl Host {
                 devices: vec![],
                 property_area: Some(self.root.properties()),
                 rights: vec![],
+                app_id: None,
                 program: am.clone(),
                 args: vec!["start".into(), component.into()],
                 env: vec![self.lib.clone()],
@@ -1661,6 +1666,7 @@ impl Host {
                 devices: vec![],
                 property_area: Some(self.root.properties()),
                 rights: vec![],
+                app_id: None,
                 program: screencap.clone(),
                 args: vec![package.into()],
                 env: vec![self.lib.clone()],
@@ -2014,6 +2020,7 @@ fn run(a: &Args) -> Result<ExitCode> {
             devices: vec![],
             property_area: Some(r.properties()),
             rights: vec![],
+            app_id: None,
             program: program.to_owned(),
             args,
             env: vec![lib.clone()],

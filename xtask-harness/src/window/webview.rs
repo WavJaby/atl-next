@@ -250,12 +250,19 @@ const PULSE_READY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The run's sound route: a null sink made the default sink for the run and `pw-record` of its monitor (audio_pcm.rs), and a pipewire-pulse of the run's own on the session's PipeWire
 /// (`PULSE_RUNTIME_PATH` = a scratch dir; its socket `<dir>/native` is atld's PULSE_SERVER). Its own: the session's default socket need not be PipeWire's (on WSLg each new session links
-/// `$XDG_RUNTIME_DIR/pulse/native` to WSLg's PulseAudio, past PipeWire's graph). All undone when dropped, on every exit path.
+/// `$XDG_RUNTIME_DIR/pulse/native` to WSLg's PulseAudio, past PipeWire's graph). All undone when dropped, on every exit path. `watch` samples the streams linked into the sink.
 pub struct Sound {
     routing: crate::audio_pcm::Routing,
     recorder: crate::audio_pcm::Recorder,
+    watch: crate::audio_pcm::StreamWatch,
     pulse: PulseServer,
     wav: std::path::PathBuf,
+}
+
+/// What the sound route saw: the monitor's largest |sample| and the streams linked into the sink.
+pub struct Heard {
+    pub peak: Result<f32, String>,
+    pub streams: Result<crate::audio_pcm::Streams, String>,
 }
 
 /// A pipewire-pulse child; killed when dropped.
@@ -314,10 +321,12 @@ impl Sound {
         let wav = scratch.join("monitor.wav");
         let routing = crate::audio_pcm::Routing::setup(&sink)?;
         let recorder = crate::audio_pcm::Recorder::start(&sink, &wav, MONITOR_RATE)?;
+        let watch = crate::audio_pcm::StreamWatch::start(&sink);
         let pulse = PulseServer::start(&scratch.join("pulse"))?;
         Ok(Sound {
             routing,
             recorder,
+            watch,
             pulse,
             wav,
         })
@@ -330,22 +339,36 @@ impl Sound {
         s
     }
 
-    /// Ends the recording, restores the routing, stops the run's pulse server; the largest |sample| over every channel.
-    pub fn stop(self) -> Result<f32, String> {
+    /// Ends the watch and the recording, restores the routing, stops the run's pulse server.
+    pub fn stop(self) -> Heard {
         let Sound {
             routing,
             recorder,
+            watch,
             pulse,
             wav,
         } = self;
+        let streams = watch.stop();
         let stopped = recorder.stop();
         drop(pulse);
         drop(routing);
-        stopped.map_err(|e| format!("{e:#}"))?;
-        let bytes = std::fs::read(&wav).map_err(|e| format!("reading {}: {e}", wav.display()))?;
-        let rec = crate::audio_pcm::read_wav(&bytes).map_err(|e| format!("{e:#}"))?;
-        Ok(rec.samples.iter().fold(0.0f32, |m, s| m.max(s.abs())))
+        let peak = stopped.map_err(|e| format!("{e:#}")).and_then(|()| {
+            let bytes =
+                std::fs::read(&wav).map_err(|e| format!("reading {}: {e}", wav.display()))?;
+            let rec = crate::audio_pcm::read_wav(&bytes).map_err(|e| format!("{e:#}"))?;
+            Ok(rec.samples.iter().fold(0.0f32, |m, s| m.max(s.abs())))
+        });
+        Heard { peak, streams }
     }
+}
+
+/// Sub-gate sound-identity: the web process's stream carries the app's `application.id` (`want`, the fixture's `atl.<package>`), the id ATL's own stream carries (audio gate `stream identity`).
+/// Its role and name are WebKit's own (pulsesink `stream-properties` / `client-name`), not checked; the detail shows them.
+fn sound_identity(
+    streams: Result<crate::audio_pcm::Streams, String>,
+    want: &str,
+) -> Result<String, String> {
+    crate::audio_pcm::identity_check(&streams?, want, false)
 }
 
 /// The fixture's tone state line (Main.java soundState): printed with a failure, to say where playback stopped.
@@ -379,11 +402,13 @@ pub fn checks(
     liveness: &Result<Liveness, String>,
     pictures: &Mutex<capture::Seen>,
     esc_back: bool,
-    sound_peak: Result<f32, String>,
+    heard: Heard,
+    app_id: &str,
     atld_log: &str,
 ) -> Vec<Sub> {
     vec![
-        ("sound", sound_check(app, sound_peak, atld_log)),
+        ("sound", sound_check(app, heard.peak, atld_log)),
+        ("sound-identity", sound_identity(heard.streams, app_id)),
         (
             "loaded",
             if app.contains(LOADED) {

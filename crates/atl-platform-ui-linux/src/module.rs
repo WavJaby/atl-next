@@ -7,10 +7,10 @@ use std::path::Path;
 
 use atl_platform_ui_api::abi::{
     self, AudioHandle, BytesOut, Callback, FillCallback, InvokerHandle, LooperAbi, MonitorView,
-    PaintedView, PcmHandle, RequesterHandle, SceneView, Status, Str, Task, TextInputEventView,
-    TextInputHandle, UiHandle, UiVtable, WindowAttributesView, WindowHandle,
+    PaintedView, PcmHandle, RequesterHandle, SceneView, Status, Str, StreamIdentityView, Task,
+    TextInputEventView, TextInputHandle, UiHandle, UiVtable, WindowAttributesView, WindowHandle,
 };
-use atl_platform_ui_api::audio::{AudioHost, PcmOutput, PcmSpec};
+use atl_platform_ui_api::audio::{AudioHost, PcmOutput, PcmSpec, StreamIdentity};
 use atl_platform_ui_api::{
     ContentHints, ContentPurpose, CursorShape, DeviceNumber, FrameClock, FrameRequester, FrameTick,
     InputEvent, InputSource, PhysRect, PhysSize, PresentError, PresentTiming, Surrounding,
@@ -416,12 +416,18 @@ unsafe extern "C" fn text_on_events(t: *mut TextInputHandle, mut f: Callback<Tex
 
 unsafe extern "C" fn audio_connect(
     remote: Str,
+    identity: StreamIdentityView,
     out: *mut *mut AudioHandle,
     err: *mut BytesOut,
 ) -> Status {
     // SAFETY: borrowed for this call.
     let remote = unsafe { remote.get() }.into_owned();
-    match PipeWireHost::connect(Path::new(&remote)) {
+    // SAFETY: borrowed for this call.
+    let identity = unsafe { identity.get() };
+    let identity = identity
+        .as_ref()
+        .map(|(id, name)| StreamIdentity { id, name });
+    match PipeWireHost::connect(Path::new(&remote), identity) {
         Ok(h) => {
             // SAFETY: the caller's out-parameter.
             unsafe { *out = into_handle(h) };

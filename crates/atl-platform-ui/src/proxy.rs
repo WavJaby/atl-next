@@ -7,10 +7,10 @@ use std::path::Path;
 
 use atl_platform_ui_api::abi::{
     self, AudioHandle, BytesOut, Callback, FillCallback, InvokerHandle, LooperAbi, MonitorView,
-    PaintedView, PcmHandle, QuadView, RequesterHandle, SceneView, Str, Task, TextInputEventView,
-    TextInputHandle, UiHandle, UiVtable, WindowAttributesView, WindowHandle,
+    PaintedView, PcmHandle, QuadView, RequesterHandle, SceneView, Str, StreamIdentityView, Task,
+    TextInputEventView, TextInputHandle, UiHandle, UiVtable, WindowAttributesView, WindowHandle,
 };
-use atl_platform_ui_api::audio::{AudioError, AudioHost, PcmOutput, PcmSpec};
+use atl_platform_ui_api::audio::{AudioError, AudioHost, PcmOutput, PcmSpec, StreamIdentity};
 use atl_platform_ui_api::{
     Capture, ContentHints, ContentPurpose, CursorShape, DeviceNumber, FrameClock, FrameRequester,
     FrameTick, InputEvent, InputSource, Looper, Monitor, Painted, PhysRect, PhysSize, PresentError,
@@ -373,15 +373,21 @@ pub struct PlatformAudioHost {
 impl AudioHost for PlatformAudioHost {
     type Output = PlatformPcmOutput;
 
-    fn connect(remote: &Path) -> Result<Self, AudioError> {
+    fn connect(remote: &Path, identity: Option<StreamIdentity<'_>>) -> Result<Self, AudioError> {
         let vt = module().map_err(AudioError::Unavailable)?;
         let remote = remote
             .to_str()
             .ok_or_else(|| AudioError::Unavailable(format!("{}: not UTF-8", remote.display())))?;
         let mut h = std::ptr::null_mut();
-        // SAFETY: the vtable's contract; the path borrowed for this call.
-        let (status, err) =
-            BytesOut::collect(|err| unsafe { (vt.audio_connect)(Str::of(remote), &mut h, err) });
+        // SAFETY: the vtable's contract; the path and identity borrowed for this call.
+        let (status, err) = BytesOut::collect(|err| unsafe {
+            (vt.audio_connect)(
+                Str::of(remote),
+                StreamIdentityView::of(identity),
+                &mut h,
+                err,
+            )
+        });
         if status != abi::OK {
             return Err(abi::audio_error(status, err));
         }

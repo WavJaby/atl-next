@@ -202,7 +202,7 @@ fn install_service_view() -> Result<()> {
 }
 
 /// Step 1c. The media services this process serves through the view, right after it is installed, found by name in-process: AudioFlinger and AudioPolicyService (atl-audioflinger, `media.audio_flinger` / `media.audio_policy`), the Codec2 store (atl-codec-store, `IComponentStore/default`, which AOSP's Codec2 client walks to) and the resource manager (atl-resource-manager, `media.resource_manager`, which MediaCodec waits for), the extractor service (atl-media-extractors, `media.extractor`, which MediaPlayer's setDataSource waits for; made here at launch, since its constructor loads the plugins that the in-process MediaExtractorFactory reads; skipped under `--no-media-extractor-service`, the extractor gate's break), and the media player service (atl-media-player, `media.player`, which MediaPlayer's native calls wait for; skipped under `--no-media-player-service`, the media player gate's break).
-/// The PCM output opens on its first use (atl-audioflinger), so the audio server is named here only: an unreachable server does not fail the launch. `pipewire` is atld's grant (`--pipewire-socket`).
+/// The PCM output opens on its first use (atl-audioflinger), so the audio server is named here only: an unreachable server does not fail the launch. `pipewire` is atld's grant (`--pipewire-socket`), `package` atld's `--package`.
 #[cfg(feature = "converter")]
 fn serve_media_services(
     no_audio_service: bool,
@@ -211,10 +211,17 @@ fn serve_media_services(
     no_media_player_service: bool,
     break_mix: bool,
     pipewire: Option<&Path>,
+    package: Option<&str>,
 ) -> Result<()> {
     if !no_audio_service {
+        // the stream carries the app's desktop identity (its window's app_id), named by the package until a label reaches the process
+        let id = package.map(atl_launch::app_id).transpose()?;
+        let identity = package
+            .zip(id.as_deref())
+            .map(|(name, id)| atl_platform_ui::audio::StreamIdentity { id, name });
         atl_audioflinger::serve(
             pipewire,
+            identity,
             atl_audioflinger::Options {
                 break_cblk,
                 break_mix,
@@ -241,6 +248,7 @@ fn serve_media_services(
     _no_media_player_service: bool,
     _break_mix: bool,
     _pipewire: Option<&Path>,
+    _package: Option<&str>,
 ) -> Result<()> {
     Ok(())
 }
@@ -311,6 +319,7 @@ fn run(argv: Vec<std::ffi::OsString>) -> Result<i32> {
         launch.no_media_player_service,
         launch.break_mix,
         launch.pipewire_socket.as_deref(),
+        launch.package.as_deref(),
     )?;
     let window = if launch.app && rt.property(c"ro.atl.ui").as_deref() == Some("gtk") {
         open_window(&rt, started)

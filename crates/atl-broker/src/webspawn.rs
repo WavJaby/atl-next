@@ -100,6 +100,8 @@ pub struct AppView {
     pub writable: Vec<Mount>,
     /// The PulseAudio-protocol socket the app's view shows at its own path (crate::WebSpawnHost::pulse), granted under `share-sound`; None: the host has none.
     pub pulse: Option<PathBuf>,
+    /// The app's desktop identity (crate::Spawn::app_id): the web process's sound carries it ([`PULSE_APP_ID`]), so the desktop shows it, and keeps its saved volume, as the app's. None: a process of no package.
+    pub app_id: Option<String>,
 }
 
 /// An admitted request: what the broker starts.
@@ -122,6 +124,8 @@ pub struct Plan {
 
 /// The variable libpulse reads first for its server (Flatpak sets it for `--socket=pulseaudio`).
 pub const PULSE_SERVER: &str = "PULSE_SERVER";
+/// libpulse merges `PULSE_PROP_<key>` into every client's proplist; `application.id` reaches the stream's node (measured on PipeWire 1.4 and 1.6). `application.name` and the icon do not: the client's own name wins.
+pub const PULSE_APP_ID: &str = "PULSE_PROP_application.id";
 
 /// Why a request is refused: `what` keys the counter (a fixed word), `why` names the value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,6 +258,10 @@ pub fn check(
         let mut v = OsString::from("unix:");
         v.push(p);
         env.push((PULSE_SERVER.into(), v));
+        // host-decided, as the server is: a request-carried PULSE_* was dropped above
+        if let Some(id) = &app.app_id {
+            env.push((PULSE_APP_ID.into(), id.into()));
+        }
     }
     Ok(Plan {
         program,
@@ -421,6 +429,7 @@ mod tests {
                 writable: true,
             }],
             pulse: None,
+            app_id: Some("atl.com.example".into()),
         }
     }
 
@@ -556,7 +565,7 @@ mod tests {
         assert_eq!(plan.pulse, None);
     }
 
-    /// share-sound with the app's pulse socket: the socket, and PULSE_SERVER naming it (Flatpak's --socket=pulseaudio), replacing any PULSE_* the request carried; without the flag, neither.
+    /// share-sound with the app's pulse socket: the socket, PULSE_SERVER naming it (Flatpak's --socket=pulseaudio) and the app's own id, replacing any PULSE_* the request carried; without the flag, neither.
     #[test]
     fn share_sound_grants_the_pulse_socket() {
         const SOCKET: &str = "/run/user/1000/pulse/native";
@@ -569,6 +578,7 @@ mod tests {
             .push((PULSE_SERVER.into(), "unix:/mnt/other".into()));
         req.env
             .push(("PULSE_COOKIE".into(), "/home/user/cookie".into()));
+        req.env.push((PULSE_APP_ID.into(), "atl.com.other".into()));
         let check = |req: &Request| check(req, &app, |p| Some(p.to_path_buf()), |_| true);
         let plan = check(&req).expect("admitted");
         assert_eq!(plan.pulse.as_deref(), Some(Path::new(SOCKET)));
@@ -576,7 +586,9 @@ mod tests {
             plan.env,
             vec![
                 ("HOME".into(), "/tmp".into()),
-                (PULSE_SERVER.into(), format!("unix:{SOCKET}").into())
+                (PULSE_SERVER.into(), format!("unix:{SOCKET}").into()),
+                // the fixture app's id (fn app), not the request's
+                (PULSE_APP_ID.into(), "atl.com.example".into()),
             ]
         );
         req.flags.retain(|f| f != "share-sound");

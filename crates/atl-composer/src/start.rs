@@ -144,7 +144,7 @@ pub fn open_window(ui: PlatformUi, started: Instant) -> Result<Option<OpenWindow
     // Titled by the package until the first activity's setTaskDescription (onApplyThemeResource, in its create) brings the task label (UI agent TASK_TITLE): resolving that needs the app's Java side.
     let attributes = WindowAttributes {
         title: package.clone(),
-        app_id: Some(format!("atl.{package}")),
+        app_id: Some(atl_launch::app_id(&package).map_err(|e| e.to_string())?),
         size,
     };
     ui_window::open(ui, &attributes, splash, started).map(Some)

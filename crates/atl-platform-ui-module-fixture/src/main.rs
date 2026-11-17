@@ -306,7 +306,7 @@ fn main() -> Result<()> {
         Err(e) => result("attach_error", e),
     }
     if let Some(socket) = &args.audio {
-        match PlatformAudioHost::connect(socket) {
+        match PlatformAudioHost::connect(socket, None) {
             Ok(_) => result("audio_connect", 1),
             Err(e) => {
                 result("audio_connect", 0);

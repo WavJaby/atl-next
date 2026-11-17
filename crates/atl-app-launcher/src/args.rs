@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The command line: `atl-app-launcher [--target-sdk=<n>] [--app] [--instruction-set=<isa>] [--pipewire-socket=<path>] [--no-audio-service] [--break-cblk] [--no-media-extractor-service] [--no-media-player-service] [--break-mix] <VM option>... <class> [<arg>...]`.
+//! The command line: `atl-app-launcher [--target-sdk=<n>] [--app] [--instruction-set=<isa>] [--package=<name>] [--pipewire-socket=<path>] [--no-audio-service] [--break-cblk] [--no-media-extractor-service] [--no-media-player-service] [--break-mix] <VM option>... <class> [<arg>...]`.
 //! VM options are dalvikvm's (art/dalvikvm/dalvikvm.cc): every argument up to the first not starting with `-` goes to `JNI_CreateJavaVM`, `-cp` / `-classpath` taking the next one with it; the class follows, then main's arguments.
 //! Launcher options start with `--` and come first; ART takes no option of that form.
 
@@ -17,6 +17,8 @@ pub struct Launch {
     /// The app's instruction set (arches.toml row key), as zygote's `--instruction-set` carries it from the package's `primaryCpuAbi`; the broker passes it for every app process, the bridge's
     /// ISA (lib.rs `native_bridge_options`). None: a process of no package; ART runs its own ISA.
     pub instruction_set: Option<String>,
+    /// The package the process runs, as atld started it: names the process's audio stream to the desktop (`atl_launch::app_id`). None: a process of no package.
+    pub package: Option<String>,
     /// The audio server's socket atld grants (read-only at this path in the sandbox): the PCM output connects there, and nothing else is looked up. None: none granted; the process starts without audio and its tracks fail.
     pub pipewire_socket: Option<PathBuf>,
     /// Test only: the process serves neither AudioFlinger nor AudioPolicyService (lib.rs serve_media_services), the audio gate's deliberate break.
@@ -38,6 +40,7 @@ pub struct Launch {
 const TARGET_SDK: &str = "--target-sdk=";
 const APP: &str = "--app";
 const INSTRUCTION_SET: &str = "--instruction-set=";
+const PACKAGE: &str = "--package=";
 const PIPEWIRE_SOCKET: &str = "--pipewire-socket=";
 const NO_AUDIO_SERVICE: &str = "--no-audio-service";
 const BREAK_CBLK: &str = "--break-cblk";
@@ -54,6 +57,7 @@ pub fn parse(argv: impl IntoIterator<Item = OsString>) -> Result<Launch, String>
         target_sdk: 0,
         app: false,
         instruction_set: None,
+        package: None,
         pipewire_socket: None,
         no_audio_service: false,
         break_cblk: false,
@@ -77,6 +81,14 @@ pub fn parse(argv: impl IntoIterator<Item = OsString>) -> Result<Launch, String>
                 return Err(format!("{INSTRUCTION_SET}: empty"));
             }
             launch.instruction_set = Some(isa.to_owned());
+            pending = it.next().transpose()?;
+            continue;
+        }
+        if let Some(package) = text.strip_prefix(PACKAGE) {
+            if package.is_empty() {
+                return Err(format!("{PACKAGE}: empty"));
+            }
+            launch.package = Some(package.to_owned());
             pending = it.next().transpose()?;
             continue;
         }

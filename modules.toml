@@ -43,7 +43,7 @@ exports = ["atl-android-paths"]
 crates = ["atld"]
 uses = ["binder", "broker", "diag", "gralloc", "launch", "platform-host", "platform-ui", "property-service", "services", "services-types", "services-wire", "android-paths", "fonts", "fonts-table"]
 
-# the user's launch surface (plan gpu-selection S2.5): `run --gpu`, the per-app GPU preference, the `.desktop` writer; it execs the ATL command (or switcherooctl) and links no ATL crate; exports the app's desktop id (`app_id`), which atld's notifications name
+# the user's launch surface (plan gpu-selection S2.5): `run --gpu`, the per-app GPU preference, the `.desktop` writer; it execs the ATL command (or switcherooctl) and links no ATL crate; exports the app's desktop id (`app_id`), which atld's notifications, the app's window (composer) and its audio streams (launcher) carry
 [launch]
 crates = ["atl-launch"]
 exports = ["atl-launch"]
@@ -51,7 +51,7 @@ exports = ["atl-launch"]
 # the app process's entry: JNI invocation of the converter's ART, liblog's logger, bionic's property and target-SDK API, all resolved at run time by name in libatl_bionic.so (no link to atl-bionic: one copy of its state); the process's SurfaceFlinger (composer), started in app mode; UI mode's GTK session (platform-ui), attached before Java; the installer's output frames (services-types); native-bridge: the executables' `sigaction` interposer, whose hook the bridge registers (atl-sigaction-hook)
 [launcher]
 crates = ["atl-app-launcher"]
-uses = ["generators", "android-paths", "composer", "gralloc", "platform-ui", "service-view", "audioflinger", "codec-store", "resource-manager", "media-player", "media-extractors", "services-types", "native-bridge"]
+uses = ["generators", "android-paths", "composer", "gralloc", "platform-ui", "service-view", "audioflinger", "codec-store", "resource-manager", "media-player", "media-extractors", "services-types", "native-bridge", "launch"]
 
 # the process's own view of servicemanager: names the app process serves itself (its SurfaceFlinger, the Codec2 store, the media resource manager, the media extractor service, media.player) answered in-process, the rest forwarded; libbinder reached through cxx adapters (wrap/view.cpp)
 [service-view]
@@ -99,7 +99,7 @@ uses = ["generators"]
 [composer]
 crates = ["atl-composer"]
 exports = ["atl-composer"]
-uses = ["aidl", "compositor", "libgui-parcel", "ime", "libinput", "platform-ui", "scene-buffer", "services-wire", "services-types", "generators", "android-paths", "service-view", "gralloc", "diag"]
+uses = ["aidl", "compositor", "libgui-parcel", "ime", "libinput", "platform-ui", "scene-buffer", "services-wire", "services-types", "generators", "android-paths", "service-view", "gralloc", "diag", "launch"]
 
 # framework natives (libandroid_runtime) ATL implements itself instead of building their AOSP sources
 [android-runtime]

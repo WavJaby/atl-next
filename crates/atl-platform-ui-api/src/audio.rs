@@ -1,9 +1,19 @@
 // SPDX-License-Identifier: MIT
 //! The PCM output of the platform layer (plan A0): one stream of interleaved F32 samples that the audio server pulls from a callback on its realtime thread.
 //! [`AudioHost`] is the connection to the server, [`PcmOutput`] one stream on it. One implementation (PipeWire, atl-platform-ui-linux), so the shape is that implementation's call sites: open, spec, set_active, rt_fallbacks, underruns.
-//! No server type appears here. The server is named by its socket path, the one parameter of [`AudioHost::connect`]; device choice is the server's (the default sink), not a parameter.
+//! No server type appears here. The server is named by its socket path, [`AudioHost::connect`]'s first parameter; device choice is the server's (the default sink), not a parameter.
 
 use std::path::Path;
+
+/// Who plays: the app's desktop identity, which the server shows on every stream of the connection (the desktop mixer's row name, the key its saved volume is kept under).
+/// The same identity names the app's window (Wayland `app_id`) and its desktop file, so desktop tools can join them. No stream role is carried: the Linux convention for a player is none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamIdentity<'a> {
+    /// Reverse-DNS application id: the desktop file ID without `.desktop` (`atl.<package>`).
+    pub id: &'a str,
+    /// Human-readable name shown in a mixer.
+    pub name: &'a str,
+}
 
 /// Frames per second and interleaved channels of a PCM stream. Samples are F32 in the server's native byte order.
 #[repr(C)]
@@ -32,7 +42,8 @@ pub trait AudioHost: Sized {
     type Output: PcmOutput;
 
     /// Connects to the server listening on the socket `remote` (an absolute path; the caller names it, nothing is looked up). Fails when nothing listens there.
-    fn connect(remote: &Path) -> Result<Self, AudioError>;
+    /// `identity`: who the connection's streams belong to; None (a process of no app): the server's defaults (the program name).
+    fn connect(remote: &Path, identity: Option<StreamIdentity<'_>>) -> Result<Self, AudioError>;
 
     /// Opens an output that pulls samples from `fill` on the server's realtime thread, in the rate and channels the server grants ([`PcmOutput::spec`]; `want` is the request).
     /// `fill` writes every sample of each slice it is given, in calls of one server quantum (at most 8192 frames), and keeps its state between calls.
