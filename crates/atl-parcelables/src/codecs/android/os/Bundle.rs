@@ -134,16 +134,34 @@ impl Value {
     }
 }
 
-/// Parcel.java VAL_* type codes (Parcel.java:317-327).
+/// Parcel.java VAL_* type codes (Parcel.java:317-350).
 const VAL_NULL: i32 = -1;
 const VAL_STRING: i32 = 0;
 const VAL_INTEGER: i32 = 1;
+const VAL_MAP: i32 = 2;
+const VAL_BUNDLE: i32 = 3;
 const VAL_PARCELABLE: i32 = 4;
+const VAL_SHORT: i32 = 5;
 const VAL_LONG: i32 = 6;
 const VAL_FLOAT: i32 = 7;
+const VAL_DOUBLE: i32 = 8;
 const VAL_BOOLEAN: i32 = 9;
+const VAL_CHARSEQUENCE: i32 = 10;
+const VAL_LIST: i32 = 11;
+const VAL_SPARSEARRAY: i32 = 12;
+const VAL_BYTEARRAY: i32 = 13;
 const VAL_STRINGARRAY: i32 = 14;
+const VAL_PARCELABLEARRAY: i32 = 16;
+const VAL_OBJECTARRAY: i32 = 17;
 const VAL_INTARRAY: i32 = 18;
+const VAL_LONGARRAY: i32 = 19;
+const VAL_BYTE: i32 = 20;
+const VAL_SERIALIZABLE: i32 = 21;
+const VAL_BOOLEANARRAY: i32 = 23;
+const VAL_CHARSEQUENCEARRAY: i32 = 24;
+const VAL_DOUBLEARRAY: i32 = 28;
+const VAL_CHAR: i32 = 29;
+const VAL_FLOATARRAY: i32 = 32;
 
 /// String.hashCode: the order of an ArrayMap's entries, which Parcel.readArrayMap appends in the order written (Parcel.java:5688-5689, `sorted`).
 fn java_hash(s: &str) -> i32 {
@@ -432,6 +450,190 @@ impl Bundle {
         *self = merged;
         Ok(())
     }
+
+    /// The text entries in map order: VAL_STRING and plain VAL_CHARSEQUENCE values as text, every other key with `None` (Notification extras: title and text among app info, flags and arrays).
+    /// Other values are walked past by their wire form (Parcel.writeValue), length-prefixed kinds by their prefix; a kind whose form is not modelled (binder, Size, a span-carrying CharSequence...) ends
+    /// the walk: refused and counted. A body with binder or file descriptor objects has no bytes: refused as [`Bundle::entries`] refuses it.
+    pub fn texts(&self) -> Result<Vec<(String, Option<String>)>> {
+        if self.body.lock().get_data_size() == 0 {
+            return Ok(Vec::new());
+        }
+        let bytes = self.body_bytes()?;
+        let mut w = Words(&bytes);
+        let n = w.i32()?;
+        let mut out = Vec::new();
+        for _ in 0..n.max(0) {
+            let key = w
+                .string()?
+                .ok_or_else(|| crate::refuse("android.os.Bundle (null key)"))?;
+            let text = match w.i32()? {
+                VAL_STRING => w.string()?,
+                VAL_CHARSEQUENCE => Some(w.char_sequence()?).flatten(),
+                kind => {
+                    w.skip_value(kind)?;
+                    None
+                }
+            };
+            out.push((key, text));
+        }
+        Ok(out)
+    }
+}
+
+impl Words<'_> {
+    /// Moves past `n` bytes.
+    fn skip(&mut self, n: usize) -> Result<()> {
+        self.0 = self.0.get(n..).ok_or(StatusCode::NOT_ENOUGH_DATA)?;
+        Ok(())
+    }
+
+    /// Parcel.writeString8: int32 byte count (-1 = null), the UTF-8 bytes and a NUL, padded to 4 bytes.
+    fn string8(&mut self) -> Result<Option<String>> {
+        let Some(n) = self.count()? else {
+            return Ok(None);
+        };
+        let padded = (n + 1).next_multiple_of(4);
+        let text = self.0.get(..n).ok_or(StatusCode::NOT_ENOUGH_DATA)?;
+        let text = String::from_utf8(text.to_vec())
+            .map_err(|_| crate::refuse("android.os.Bundle (string8 encoding)"))?;
+        self.skip(padded)?;
+        Ok(Some(text))
+    }
+
+    /// TextUtils.writeToParcel (TextUtils.java:805-845): kind 1 + String8 for plain text; kind 0 + String8 + spans + a 0 terminator for Spanned text. Spans are refused, as `r_char_sequence` refuses them.
+    fn char_sequence(&mut self) -> Result<Option<String>> {
+        let kind = self.i32()?;
+        let s = self.string8()?;
+        match kind {
+            1 => Ok(s),
+            0 if self.i32()? == 0 => Ok(s),
+            _ => Err(crate::refuse(
+                "android.text.Spanned (with a ParcelableSpan)",
+            )),
+        }
+    }
+
+    /// An array's elements of `size` bytes each after its count (-1 = null).
+    fn skip_array(&mut self, size: usize) -> Result<()> {
+        let n = self.count()?.unwrap_or(0);
+        self.skip(n * size)
+    }
+
+    /// One value of `kind` (Parcel.writeValue :2167-2260, VAL_* :317-350) that is not text, by its wire form.
+    fn skip_value(&mut self, kind: i32) -> Result<()> {
+        match kind {
+            VAL_NULL => Ok(()),
+            VAL_INTEGER | VAL_FLOAT | VAL_BOOLEAN | VAL_SHORT | VAL_BYTE | VAL_CHAR => self.skip(4),
+            VAL_LONG | VAL_DOUBLE => self.skip(8),
+            // isLengthPrefixed (Parcel.java:5107-5120): an int32 byte length, then the value
+            VAL_MAP | VAL_PARCELABLE | VAL_LIST | VAL_SPARSEARRAY | VAL_PARCELABLEARRAY
+            | VAL_OBJECTARRAY | VAL_SERIALIZABLE => {
+                let n = usize::try_from(self.i32()?)
+                    .map_err(|_| crate::refuse("android.os.Bundle (value length)"))?;
+                self.skip(n)
+            }
+            // writeBundle: length (-1 null, 0 empty), then magic, the body and mHasIntent
+            VAL_BUNDLE => match self.i32()? {
+                n if n > 0 => self.skip(4 + n as usize + 4),
+                _ => Ok(()),
+            },
+            VAL_STRINGARRAY => {
+                for _ in 0..self.count()?.unwrap_or(0) {
+                    self.string()?;
+                }
+                Ok(())
+            }
+            VAL_CHARSEQUENCEARRAY => {
+                for _ in 0..self.count()?.unwrap_or(0) {
+                    self.char_sequence()?;
+                }
+                Ok(())
+            }
+            // writeByteArray: count, the bytes padded to 4
+            VAL_BYTEARRAY => {
+                let n = self.count()?.unwrap_or(0);
+                self.skip(n.next_multiple_of(4))
+            }
+            VAL_INTARRAY | VAL_BOOLEANARRAY | VAL_FLOATARRAY => self.skip_array(4),
+            VAL_LONGARRAY | VAL_DOUBLEARRAY => self.skip_array(8),
+            _ => Err(crate::refuse("android.os.Bundle (value type)")),
+        }
+    }
 }
 
 crate::codec!(Bundle);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn word(out: &mut Vec<u8>, w: i32) {
+        out.extend_from_slice(&w.to_ne_bytes());
+    }
+
+    /// writeString8 per Parcel.cpp: byte count, the bytes, a NUL, padded to 4.
+    fn string8(out: &mut Vec<u8>, s: &str) {
+        word(out, s.len() as i32);
+        out.extend_from_slice(s.as_bytes());
+        out.push(0);
+        out.resize(out.len().next_multiple_of(4), 0);
+    }
+
+    /// A Notification.Builder-shaped extras map, written by hand from Parcel.writeValue's forms: a plain CharSequence (kind 1), a boolean, a length-prefixed Parcelable (8 opaque bytes),
+    /// a Spanned text without spans (kind 0, terminator 0), a String. Only the two texts and the String come back as text; the walk keeps every key in order.
+    #[test]
+    fn texts_walks_past_other_values() {
+        let mut body = Vec::new();
+        word(&mut body, 5);
+        put_string(&mut body, &Some("android.title".into()));
+        word(&mut body, VAL_CHARSEQUENCE);
+        word(&mut body, 1);
+        string8(&mut body, "ATL test");
+        put_string(&mut body, &Some("android.showWhen".into()));
+        word(&mut body, VAL_BOOLEAN);
+        word(&mut body, 1);
+        put_string(&mut body, &Some("android.appInfo".into()));
+        word(&mut body, VAL_PARCELABLE);
+        word(&mut body, 8);
+        body.extend_from_slice(&[7; 8]);
+        put_string(&mut body, &Some("android.text".into()));
+        word(&mut body, VAL_CHARSEQUENCE);
+        word(&mut body, 0);
+        string8(&mut body, "posted");
+        word(&mut body, 0);
+        put_string(&mut body, &Some("android.template".into()));
+        word(&mut body, VAL_STRING);
+        put_string(&mut body, &Some("T".into()));
+        let b = Bundle {
+            magic: BUNDLE_MAGIC,
+            body: Body::new(Bundle::parcel_of(&body)),
+            has_intent: false,
+        };
+        let some = |s: &str| Some(s.to_owned());
+        assert_eq!(
+            b.texts().expect("texts"),
+            vec![
+                ("android.title".to_owned(), some("ATL test")),
+                ("android.showWhen".to_owned(), None),
+                ("android.appInfo".to_owned(), None),
+                ("android.text".to_owned(), some("posted")),
+                ("android.template".to_owned(), some("T")),
+            ]
+        );
+    }
+
+    /// A value kind with no modelled form (VAL_IBINDER 15) ends the walk: refused, not guessed.
+    #[test]
+    fn texts_refuses_an_unmodelled_kind() {
+        let mut body = Vec::new();
+        word(&mut body, 1);
+        put_string(&mut body, &Some("k".into()));
+        word(&mut body, 15);
+        let b = Bundle {
+            magic: BUNDLE_MAGIC,
+            body: Body::new(Bundle::parcel_of(&body)),
+            has_intent: false,
+        };
+        assert!(b.texts().is_err());
+    }
+}

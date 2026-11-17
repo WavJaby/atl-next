@@ -12,7 +12,7 @@ use binder::binder_impl::Parcel;
 use crate::codecs::android::app::PendingIntent::PendingIntent;
 use crate::codecs::android::media::AudioAttributes::AudioAttributes;
 use crate::codecs::android::net::Uri::Uri;
-use crate::codecs::android::os::Bundle::{Body, r_bundle};
+use crate::codecs::android::os::Bundle::{Body, Bundle, r_bundle};
 use crate::parcel::*;
 use crate::parts::*;
 
@@ -29,6 +29,10 @@ pub struct Notification {
     pub has_content_intent: bool,
     /// actions.length (0 for null)
     pub actions: usize,
+    /// extras (title, text, style fields: Notification.EXTRA_*)
+    pub extras: Option<Bundle>,
+    /// mLargeIcon is set
+    pub has_large_icon: bool,
     /// the parcelled range as read
     raw: Body,
 }
@@ -146,6 +150,7 @@ fn read_fields(p: &In<'_>) -> Result<Notification> {
     no_remote_views(p)?; // contentView
     if present(p)? {
         skip_icon(p)?; // mLargeIcon
+        n.has_large_icon = true;
     }
     r_i32(p)?; // defaults
     n.flags = r_i32(p)?;
@@ -167,7 +172,7 @@ fn read_fields(p: &In<'_>) -> Result<Notification> {
     n.category = r_str8(p)?;
     n.group_key = r_str8(p)?;
     r_str8(p)?; // mSortKey
-    r_bundle(p)?; // extras
+    n.extras = r_bundle(p)?;
     let actions = r_i32(p)?;
     for _ in 0..actions.max(0) {
         if present(p)? {
