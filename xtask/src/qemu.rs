@@ -291,18 +291,75 @@ fn pinned(root: &Path) -> Result<(PathBuf, String)> {
     Ok((src, version.to_owned()))
 }
 
+/// The stamp text of this configuration. It names the source dir too: build.ninja holds the source paths, so a task copy's build dir must not be reused from `src/qemu`.
+fn stamp_text(b: &Build) -> String {
+    format!(
+        "{} source={}",
+        b.configure_args().join(" "),
+        b.src.display()
+    )
+}
+
+/// Whether `build/` already holds this configuration (configure would do nothing).
+fn configured(b: &Build) -> bool {
+    std::fs::read_to_string(b.dir.join(STAMP)).ok().as_deref() == Some(stamp_text(b).as_str())
+        && b.build_dir().join("build.ninja").is_file()
+}
+
+/// What ninja would do for a target, read from a dry run without a grant.
+#[derive(Debug, PartialEq, Eq)]
+enum Work {
+    /// "no work to do".
+    None,
+    /// Every dirty root is an always-stale edge (meson `build_always_stale`: QEMU's `qemu-version.h` hangs off `PHONY`, a phony edge with no inputs). The real run regenerates it and restat stops the rebuild there; a dry run cannot simulate restat, so it lists the dependents too.
+    AlwaysStale,
+    /// Any other dirty root, a failing dry run, or an explain line not recognised: real compile work.
+    Real,
+}
+
+/// The explain line ninja prints for an always-stale root (ninja `src/graph.cc`, `RecomputeOutputDirty`).
+const ALWAYS_STALE: &str = "of phony edge with no inputs doesn't exist";
+
+/// Classifies `target` in `dir` by `ninja -n -d explain` (stats only). Only root causes count: `<x> is dirty` lines are propagation, every other explain line names a root. A doubtful case is `Real`, so it takes the build grant.
+/// Bound: ninja stops explaining an edge at its first dirty input, so a changed source of an edge downstream of the always-stale one is hidden and that edge runs under `light` at `-j 1` (QEMU: `linux-user/main.c` + the link; 1 job = the 1 slot light holds). Every edge off the version header is seen.
+fn ninja_work(ninja: &str, dir: &Path, target: &str) -> Result<Work> {
+    let out = Command::new(ninja)
+        .args(["-n", "-d", "explain", "-C"])
+        .arg(dir)
+        .arg(target)
+        .output()
+        .context("running ninja -n -d explain")?;
+    if !out.status.success() {
+        return Ok(Work::Real);
+    }
+    if String::from_utf8_lossy(&out.stdout).contains("ninja: no work to do.") {
+        return Ok(Work::None);
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let mut roots = stderr
+        .lines()
+        .filter_map(|l| l.strip_prefix("ninja explain: "))
+        .filter(|l| !l.ends_with(" is dirty"))
+        .peekable();
+    if roots.peek().is_none() {
+        return Ok(Work::Real);
+    }
+    Ok(if roots.all(|l| l.contains(ALWAYS_STALE)) {
+        Work::AlwaysStale
+    } else {
+        Work::Real
+    })
+}
+
 /// Configures `build/` unless it already holds this configuration. A different or interrupted configuration starts from nothing.
-/// The stamp names the source dir too: build.ninja holds the source paths, so a task copy's build dir must not be reused from `src/qemu`.
 fn configure(b: &Build) -> Result<()> {
-    let args = b.configure_args();
-    let text = format!("{} source={}", args.join(" "), b.src.display());
-    let stamp = b.dir.join(STAMP);
-    let build = b.build_dir();
-    if std::fs::read_to_string(&stamp).ok().as_deref() == Some(text.as_str())
-        && build.join("build.ninja").is_file()
-    {
+    if configured(b) {
         return Ok(());
     }
+    let args = b.configure_args();
+    let text = stamp_text(b);
+    let stamp = b.dir.join(STAMP);
+    let build = b.build_dir();
     remove_if_present(&stamp)?;
     if build.exists() {
         std::fs::remove_dir_all(&build).with_context(|| format!("removing {}", build.display()))?;
@@ -383,13 +440,33 @@ fn check_version(b: &Build) -> Result<()> {
     Ok(())
 }
 
-/// Configures and builds under one grant, then checks the version. Returns the executable.
+/// Configures and builds under one grant when there is work, then checks the version. Returns the executable.
+/// Freshness is checked first without a grant (`ninja_work`), so an up-to-date engine (every run-apk launch of a built tree) never queues behind other checkouts' heavy builds: nothing to do takes no class; only always-stale edges (the version header, restat stops there) take `light`, which bypasses the queue for one free slot; real work in a configured graph is warm (native-incr), a (re)configure cold (native-full), as native.rs picks its class.
 pub fn execute(root: &Path, b: &Build) -> Result<PathBuf> {
     let ws = Layout::of(root)?.workspace().to_owned();
-    // configure runs on every build, so this is a cold-class ninja graph
-    let grant = build_pool::acquire(&ws, root, build_pool::Class::NativeFull)?;
-    configure(b)?;
-    ninja(b, grant.cpu)?;
+    let class = if !configured(b) {
+        Some(build_pool::Class::NativeFull)
+    } else {
+        match ninja_work(&b.ninja, &b.build_dir(), &b.exe_name())? {
+            Work::None => None,
+            Work::AlwaysStale => Some(build_pool::Class::Light),
+            Work::Real => Some(build_pool::Class::NativeIncr),
+        }
+    };
+    match class {
+        None => println!("qemu: {} up to date: no pool grant", b.exe_name()),
+        Some(class) => {
+            let grant = build_pool::acquire(&ws, root, class)?;
+            println!(
+                "qemu: {} pool {} cpu {}",
+                b.exe_name(),
+                class.name(),
+                grant.cpu
+            );
+            configure(b)?;
+            ninja(b, grant.cpu)?;
+        }
+    }
     match &b.cross {
         None => check_version(b)?,
         Some(c) => isa_gate_cross(root, c, &b.exe(), "qemu")?,
@@ -520,6 +597,75 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The grant-free probe on two graphs: plain (`out` from `in`) and QEMU's shape (`ver` always-stale off `PHONY`, restat, `bin` depends on it). Not built and a newer input are real work; built is none for the plain graph and always-stale for QEMU's (a dry run cannot restat).
+    #[test]
+    fn ninja_dry_run_classifies_work() {
+        let tmp = std::env::temp_dir().join(format!("xtask-qemu-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("in"), "a").unwrap();
+        std::fs::write(
+            tmp.join("build.ninja"),
+            concat!(
+                "rule cp\n  command = cp $in $out\n",
+                "rule gen\n  command = echo v > $out.t && (cmp -s $out.t $out || mv $out.t $out)\n  restat = 1\n",
+                "build out: cp in\n",
+                "build PHONY: phony\n",
+                "build ver: gen PHONY\n",
+                "build bin: cp in | ver\n",
+                "build all: phony out bin\n",
+            ),
+        )
+        .unwrap();
+        let work = |t: &str| ninja_work("ninja", &tmp, t).unwrap();
+        let build = || {
+            let o = Command::new("ninja")
+                .arg("-C")
+                .arg(&tmp)
+                .args(["out", "bin"])
+                .output()
+                .unwrap();
+            assert!(o.status.success());
+        };
+        assert_eq!(work("out"), Work::Real, "never built");
+        assert_eq!(work("all"), Work::Real, "never built");
+        build();
+        assert_eq!(work("out"), Work::None);
+        assert_eq!(work("bin"), Work::AlwaysStale);
+        // a newer input: ninja compares mtimes, so step past the filesystem's resolution
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        File::options()
+            .write(true)
+            .open(tmp.join("in"))
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert_eq!(work("out"), Work::Real, "input changed");
+        // the known bound: ninja stops explaining an edge at its first dirty input, so a root behind the always-stale one is hidden (`ninja_work`)
+        assert_eq!(work("bin"), Work::AlwaysStale, "hidden behind ver");
+        assert_eq!(work("all"), Work::Real, "seen on an edge off ver");
+        // the real run of the always-stale case: restat stops at `ver`, so `bin` is not rebuilt (`in` back in the past first: a future mtime keeps every output older)
+        let earlier = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        File::options()
+            .write(true)
+            .open(tmp.join("in"))
+            .unwrap()
+            .set_modified(earlier)
+            .unwrap();
+        build();
+        let mtime = || {
+            std::fs::metadata(tmp.join("bin"))
+                .unwrap()
+                .modified()
+                .unwrap()
+        };
+        let before = mtime();
+        build();
+        assert_eq!(mtime(), before, "restat kept bin");
+        assert_eq!(work("bin"), Work::AlwaysStale);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
 
     /// The boot crate's build.rs declares every cfg xtask passes, so its host lint build knows them.
     #[test]
