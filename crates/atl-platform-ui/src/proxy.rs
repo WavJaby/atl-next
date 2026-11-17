@@ -7,10 +7,13 @@ use std::path::Path;
 
 use atl_platform_ui_api::abi::{
     self, AudioHandle, BytesOut, Callback, FillCallback, InvokerHandle, LooperAbi, MonitorView,
-    PaintedView, PcmHandle, QuadView, RequesterHandle, SceneView, Str, StreamIdentityView, Task,
-    TextInputEventView, TextInputHandle, UiHandle, UiVtable, WindowAttributesView, WindowHandle,
+    PaintedView, PcmHandle, QuadView, RequesterHandle, SceneView, SendCallback, Str,
+    StreamIdentityView, Task, TextInputEventView, TextInputHandle, UiHandle, UiVtable,
+    WindowAttributesView, WindowHandle,
 };
-use atl_platform_ui_api::audio::{AudioError, AudioHost, PcmOutput, PcmSpec, StreamIdentity};
+use atl_platform_ui_api::audio::{
+    AudioError, AudioHost, PcmOutput, PcmSpec, StreamIdentity, StreamVolume,
+};
 use atl_platform_ui_api::{
     Capture, ContentHints, ContentPurpose, CursorShape, DeviceNumber, FrameClock, FrameRequester,
     FrameTick, InputEvent, InputSource, Looper, Monitor, Painted, PhysRect, PhysSize, PresentError,
@@ -398,11 +401,20 @@ impl AudioHost for PlatformAudioHost {
         &self,
         want: PcmSpec,
         fill: impl FnMut(&mut [f32]) + Send + 'static,
+        mut on_volume: impl FnMut(StreamVolume) + Send + 'static,
     ) -> Result<PlatformPcmOutput, AudioError> {
         let mut h = std::ptr::null_mut();
-        // SAFETY: a live connection; `fill`'s ownership passes to the module.
+        let on_volume = SendCallback::new(move |v: &StreamVolume| on_volume(*v));
+        // SAFETY: a live connection; the callbacks' ownership passes to the module.
         let (status, err) = BytesOut::collect(|err| unsafe {
-            (self.vt.audio_open_output)(self.h, want, FillCallback::new(fill), &mut h, err)
+            (self.vt.audio_open_output)(
+                self.h,
+                want,
+                FillCallback::new(fill),
+                on_volume,
+                &mut h,
+                err,
+            )
         });
         if status != abi::OK {
             return Err(abi::audio_error(status, err));
@@ -439,6 +451,17 @@ impl PcmOutput for PlatformPcmOutput {
         // SAFETY: a live output; the sink lives for the call.
         let (status, err) =
             BytesOut::collect(|err| unsafe { (self.vt.pcm_set_active)(self.h, on, err) });
+        if status == abi::OK {
+            Ok(())
+        } else {
+            Err(abi::audio_error(status, err))
+        }
+    }
+
+    fn set_volume(&self, volume: StreamVolume) -> Result<(), AudioError> {
+        // SAFETY: a live output; the sink lives for the call.
+        let (status, err) =
+            BytesOut::collect(|err| unsafe { (self.vt.pcm_set_volume)(self.h, volume, err) });
         if status == abi::OK {
             Ok(())
         } else {

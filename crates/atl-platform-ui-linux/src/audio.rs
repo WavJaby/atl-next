@@ -13,15 +13,18 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use atl_platform_ui_api::audio::{AudioError, AudioHost, PcmOutput, PcmSpec, StreamIdentity};
+use atl_platform_ui_api::audio::{
+    AudioError, AudioHost, PcmOutput, PcmSpec, StreamIdentity, StreamVolume,
+};
 use pipewire::context::ContextRc;
 use pipewire::core::CoreRc;
 use pipewire::keys;
 use pipewire::properties::properties;
 use pipewire::registry::{Listener as RegistryListener, RegistryRc};
 use pipewire::spa::param::audio::{AudioFormat, AudioInfoRaw};
+use pipewire::spa::pod::deserialize::PodDeserializer;
 use pipewire::spa::pod::serialize::PodSerializer;
-use pipewire::spa::pod::{Object, Pod, Value};
+use pipewire::spa::pod::{Object, Pod, Value, ValueArray};
 use pipewire::spa::sys as spa_sys;
 use pipewire::spa::utils::Direction;
 use pipewire::stream::{Stream, StreamFlags, StreamListener, StreamRc, StreamState};
@@ -56,15 +59,16 @@ impl Drop for Connection {
 /// A connection to the PipeWire server (the default sink is the server's choice; no device parameter).
 pub struct PipeWireHost {
     connection: Rc<Connection>,
-    /// `application.id` / `application.name` of the client and of every stream; None: libpipewire's defaults (the program name).
-    identity: Option<(String, String)>,
+    /// `application.id` of the client and of every stream; None: libpipewire's defaults (the program name).
+    identity: Option<String>,
 }
 
-/// Adds the identity keys. No `media.role`: most Linux players set none, and WirePlumber 0.5.8 keys a stream's saved volume by role before `application.id`, so one role shared every app's volume.
-fn identify(props: &mut pipewire::properties::PropertiesBox, identity: Option<&(String, String)>) {
-    if let Some((id, name)) = identity {
+/// Adds the identity keys: `application.id` and `application.name` both the id, the name WebKit gives the app's web stream (its UI process prgname = the window's app_id), so both mixer rows read the same.
+/// No `media.role`: most Linux players set none, and WirePlumber 0.5.8 keys a stream's saved volume by role before `application.id`, so one role shared every app's volume.
+fn identify(props: &mut pipewire::properties::PropertiesBox, identity: Option<&String>) {
+    if let Some(id) = identity {
         props.insert(*keys::APP_ID, id.as_str());
-        props.insert(*keys::APP_NAME, name.as_str());
+        props.insert(*keys::APP_NAME, id.as_str());
     }
 }
 
@@ -72,7 +76,7 @@ impl AudioHost for PipeWireHost {
     type Output = PipeWireOutput;
 
     fn connect(remote: &Path, identity: Option<StreamIdentity<'_>>) -> Result<Self, AudioError> {
-        let identity = identity.map(|i| (i.id.to_owned(), i.name.to_owned()));
+        let identity = identity.map(|i| i.id.to_owned());
         let name = remote
             .to_str()
             .ok_or_else(|| AudioError::Unavailable(format!("{}: not UTF-8", remote.display())))?;
@@ -112,6 +116,7 @@ impl AudioHost for PipeWireHost {
         &self,
         want: PcmSpec,
         fill: impl FnMut(&mut [f32]) + Send + 'static,
+        on_volume: impl FnMut(StreamVolume) + Send + 'static,
     ) -> Result<PipeWireOutput, AudioError> {
         let channels = usize::from(want.channels);
         if channels == 0 {
@@ -139,11 +144,18 @@ impl AudioHost for PipeWireHost {
                 channels,
                 checked: false,
                 shared: Arc::clone(&shared),
+                volume: UNATTENUATED,
+                on_volume: Box::new(on_volume),
             };
             let listener = stream
                 .add_local_listener_with_user_data(data)
                 .state_changed(|_, ud, _old, new| ud.shared.update(|s| s.phase = phase_of(new)))
-                .param_changed(|_, ud, id, param| ud.negotiated(id, param))
+                .param_changed(|_, ud, id, param| match id {
+                    spa_sys::SPA_PARAM_Format => ud.negotiated(param),
+                    // a set_param on the stream's node (a mixer, the session manager's restore, our own set_control) reaches its client as Props
+                    spa_sys::SPA_PARAM_Props => ud.props_changed(param),
+                    _ => {}
+                })
                 .process(|stream, ud| ud.process(stream))
                 .register()
                 .map_err(|e| stream_error("listener", &e))?;
@@ -311,6 +323,22 @@ impl PcmOutput for PipeWireOutput {
         Ok(())
     }
 
+    fn set_volume(&self, volume: StreamVolume) -> Result<(), AudioError> {
+        let channels = usize::from(self.shared.lock().spec.channels);
+        let linear = [volume.linear.clamp(0.0, 1.0); spa_sys::SPA_AUDIO_MAX_CHANNELS as usize];
+        let _lock = self.connection.loop_.lock();
+        let stream = self.stream()?;
+        stream
+            .set_control(spa_sys::SPA_PROP_channelVolumes, &linear[..channels])
+            .map_err(|e| stream_error("channelVolumes", &e))?;
+        stream
+            .set_control(
+                spa_sys::SPA_PROP_mute,
+                &[if volume.mute { 1.0 } else { 0.0 }],
+            )
+            .map_err(|e| stream_error("mute", &e))
+    }
+
     fn rt_fallbacks(&self) -> u64 {
         self.shared.rt_fallbacks.load(Ordering::Relaxed)
     }
@@ -338,14 +366,53 @@ struct UserData {
     /// The realtime check ran (first callback).
     checked: bool,
     shared: Arc<Shared>,
+    /// The stream's volume as last reported, so a Props change carrying only one of its fields still reports both.
+    volume: StreamVolume,
+    on_volume: Box<dyn FnMut(StreamVolume) + Send>,
 }
 
+/// A new stream's volume until the server reports one: PipeWire's stream default (every channel 1.0, unmuted).
+const UNATTENUATED: StreamVolume = StreamVolume {
+    linear: 1.0,
+    mute: false,
+};
+
 impl UserData {
-    /// The server's format reply: the granted spec, or a failure when the server granted something other than F32.
-    fn negotiated(&mut self, id: u32, param: Option<&Pod>) {
-        if id != spa_sys::SPA_PARAM_Format {
+    /// A Props change on the stream's node: its `channelVolumes` (loudest channel) and `mute`, whichever it carries, reported whole to `on_volume`. Other props (soft volumes, monitor) are not the stream's volume.
+    fn props_changed(&mut self, param: Option<&Pod>) {
+        let Some(param) = param else {
             return;
+        };
+        let Ok((_, Value::Object(object))) =
+            PodDeserializer::deserialize_any_from(param.as_bytes())
+        else {
+            return;
+        };
+        let mut volume = self.volume;
+        let mut seen = false;
+        for prop in object.properties {
+            match (prop.key, prop.value) {
+                (spa_sys::SPA_PROP_channelVolumes, Value::ValueArray(ValueArray::Float(v)))
+                    if !v.is_empty() =>
+                {
+                    volume.linear = v.iter().fold(0f32, |m, x| m.max(*x));
+                    seen = true;
+                }
+                (spa_sys::SPA_PROP_mute, Value::Bool(m)) => {
+                    volume.mute = m;
+                    seen = true;
+                }
+                _ => {}
+            }
         }
+        if seen {
+            self.volume = volume;
+            (self.on_volume)(volume);
+        }
+    }
+
+    /// The server's format reply: the granted spec, or a failure when the server granted something other than F32.
+    fn negotiated(&mut self, param: Option<&Pod>) {
         let Some(param) = param else {
             return;
         };

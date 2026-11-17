@@ -5,6 +5,7 @@
 //! PCM (A2): the fixture plays a static track, a streaming track, a float streaming track, then from its NDK library (jni/atl_audio_tone.c) an OpenSL ES buffer-queue player and an AAudio callback stream, each a tone (Main.java `pcm`); the native two are also checked on their own counts and the `sles-flow:` counters (`native_verdicts`). `--break-tone` builds that library silent: the two native runs must be missing. The output's sink is a null sink the gate makes the default for the run, and its monitor is recorded with `pw-record` (audio_pcm.rs). The recording must hold five runs of tone with the frequency, length and level the fixture's input gives, and no sample beyond full scale. Expected values come from the constants below, never from the server.
 //! Checks: session ids nonzero and distinct; getMinBufferSize equals the expected bytes (stereo, 16-bit); AudioManager's output rate and frames-per-buffer properties are the served profile's; a track reaches STATE_INITIALIZED with a nonzero piid (AudioTrack calls baseRegisterPlayer only after native_setup succeeds, AudioTrack.java:912) and the expected frame count; the low-latency track initialises although the server refuses FAST (counted); AudioFlinger's and AudioPolicyService's calls were answered in-process.
 //! `--break-serve` starts the app with `--no-audio-service` (atld, then the launcher): it serves neither name, so the session line must go red. `--break-cblk` starts it with `--break-cblk`: each streaming track's region is one buffer short, createTrack refuses it, and both streaming tracks fail to initialise (a static track has no buffer of its own to be short of). `--break-mix` starts it with `--break-mix`: the mixer plays silence, so the PCM checks find no tone and must go red. `--unreachable` makes the desktop's server a stale socket file (`PIPEWIRE_REMOTE` for atld): the app must still reach `done` (the launch is not fatal), its track must fail with STATE_UNINITIALIZED and a counted refusal, and no tone may reach the sink.
+//! `--volume`: the app volume on the app's host stream instead of the PCM checks (app_volume.rs).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -55,6 +56,9 @@ pub struct Args {
     /// The native tones' break: the fixture library is built with ATL_TONE_SILENT (zero amplitude), so the OpenSL ES and AAudio runs are absent from the recording and the PCM checks must go red.
     #[arg(long)]
     break_tone: bool,
+    /// The app-volume run (app_volume.rs): the app starts with `--app-volume-index`, the gate reads the node's volume back and changes it from outside; only those checks are judged (the attenuated recording is not).
+    #[arg(long)]
+    volume: bool,
 }
 
 /// The native tone library for the host arch (`silent`: TONE_SILENT), built into `dir`: the APK's `lib/<abi>/` entry.
@@ -456,6 +460,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         rt
     };
+    let rt = if args.volume {
+        rt.with_app_volume_index(crate::app_volume::WRITE_INDEX)
+    } else {
+        rt
+    };
     let work = rt.out.join("audio");
     let rt = if args.unreachable {
         rt.with_pipewire_remote(stale_socket(&work)?)
@@ -491,6 +500,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let app_log = run.log(&m.name);
     let read = atl_diag::logfiles::read;
     let start = Instant::now();
+    // while the fixture plays: its stream exists only until the process ends
+    let volume = args
+        .volume
+        .then(|| crate::app_volume::steps(&format!("atl.{}", m.name), || read(&app_log)));
     loop {
         if read(&app_log).lines().any(|l| l.contains(DONE)) {
             break;
@@ -513,6 +526,22 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     for l in counter_lines(&services) {
         println!("audio-app: counter {l}");
+    }
+    if let Some(steps) = volume {
+        let mut ok = true;
+        for (name, pass, detail) in &steps {
+            ok &= verdict(name, *pass, detail);
+        }
+        if !ok {
+            for l in app.lines().filter(|l| l.contains("app-volume:")) {
+                println!("{l}");
+            }
+        }
+        return Ok(if ok {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        });
     }
     if args.unreachable {
         let ok = unreachable_verdicts(&app, &services, &wav);

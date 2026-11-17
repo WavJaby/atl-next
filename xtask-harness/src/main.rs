@@ -13,6 +13,7 @@ mod adb;
 mod app;
 mod app_data;
 mod app_imports;
+mod app_volume;
 mod atld_run;
 mod audio_app;
 mod audio_pcm;

@@ -18,6 +18,7 @@ use atl_platform_ui::PlatformAudioHost;
 use atl_platform_ui::audio::{AudioHost, PcmOutput, PcmSpec, StreamIdentity};
 
 use crate::Options;
+use crate::volume::AppVolume;
 
 /// The rate the output asks for: PipeWire's default graph rate (`default.clock.rate`). The server serves the rate the graph grants.
 const REQUEST_RATE_HZ: u32 = 48_000;
@@ -51,7 +52,7 @@ pub(crate) struct Opened {
 
 /// The open output, held by [`Opener`]'s thread. Dropping it stops the stream.
 struct Output {
-    _pcm: atl_platform_ui::PlatformPcmOutput,
+    pcm: atl_platform_ui::PlatformPcmOutput,
 }
 
 /// Realtime cycles that played silence because a control call held the mixer, or it was not installed yet. Logged when the output stops.
@@ -95,50 +96,82 @@ impl Drop for Output {
 
 /// Asks the output's thread for [`Opened`]. A request opens the output if it is not open yet; a failed open answers that request with its reason, and the next request tries again.
 pub(crate) struct Opener {
-    requests: Sender<Sender<Result<Opened, String>>>,
+    requests: Sender<Ask>,
+    volume: Arc<AppVolume>,
+}
+
+/// What the output's thread is asked.
+enum Ask {
+    /// The open output (opened now if needed).
+    Open(Sender<Result<Opened, String>>),
+    /// Write the app volume's pending value to the output, if it is open (else it waits for the open).
+    Volume,
 }
 
 /// Where the output plays and as whom.
 pub(crate) struct Target {
     /// The server's socket; None: none granted.
     pub(crate) remote: Option<PathBuf>,
-    /// The app's (id, name) the stream carries ([`StreamIdentity`]); None: a process of no app.
-    pub(crate) identity: Option<(String, String)>,
+    /// The app's id the stream carries ([`StreamIdentity`]); None: a process of no app.
+    pub(crate) identity: Option<String>,
 }
 
 impl Opener {
-    /// Starts the output's thread for `target`. Opens nothing: the first [`Opener::get`] does.
-    pub(crate) fn spawn(target: Target, opts: Options) -> Result<Self, String> {
+    /// Starts the output's thread for `target`, whose stream's volume `volume` controls. Opens nothing: the first [`Opener::get`] does.
+    pub(crate) fn spawn(
+        target: Target,
+        opts: Options,
+        volume: Arc<AppVolume>,
+    ) -> Result<Self, String> {
         let (requests, inbox) = mpsc::channel();
+        let owned = Arc::clone(&volume);
         thread::Builder::new()
             .name("atl-pcm-output".to_owned())
-            .spawn(move || owner(inbox, target, opts))
+            .spawn(move || owner(inbox, target, opts, owned))
             .map_err(|e| format!("starting the PCM output's thread: {e}"))?;
-        Ok(Self { requests })
+        Ok(Self { requests, volume })
     }
 
     /// The open output, opened by this call if it is not open yet. Err: why it cannot be opened.
     pub(crate) fn get(&self) -> Result<Opened, String> {
         let (reply, answer) = mpsc::channel();
         self.requests
-            .send(reply)
+            .send(Ask::Open(reply))
             .map_err(|_| "the PCM output's thread has ended".to_owned())?;
         answer
             .recv()
             .map_err(|_| "the PCM output's thread has ended".to_owned())?
     }
+
+    /// Sets the app volume (music index, mute) and has the output's thread write it to the stream: now if open, else when the stream appears.
+    pub(crate) fn set_volume(&self, index: u32, mute: bool) -> Result<(), String> {
+        self.volume.set(index, mute);
+        self.requests
+            .send(Ask::Volume)
+            .map_err(|_| "the PCM output's thread has ended".to_owned())
+    }
+}
+
+/// Writes the app volume's pending value to `pcm`; a write the server refuses is counted (`refused AppVolume.apply`) and dropped.
+fn apply_volume(pcm: &atl_platform_ui::PlatformPcmOutput, volume: &AppVolume) {
+    if let Some(v) = volume.take_pending()
+        && let Err(e) = pcm.set_volume(v)
+    {
+        atl_diag::refused("AppVolume", "apply");
+        tracing::warn!(error = %e, "app volume not applied");
+    }
 }
 
 /// The output's thread: opens the output on the first request, holds it until the process ends, and answers every request. It ends when no [`Opener`] is left.
-fn owner(inbox: Receiver<Sender<Result<Opened, String>>>, target: Target, opts: Options) {
+fn owner(inbox: Receiver<Ask>, target: Target, opts: Options, volume: Arc<AppVolume>) {
     let mut open: Option<(Output, Opened)> = None;
     let mut logged = Instant::now();
     loop {
         // while open the thread writes the counters line once per period, however often requests come; closed, it only waits for requests
-        let reply = if open.is_some() {
+        let ask = if open.is_some() {
             let wait = COUNTERS_PERIOD.saturating_sub(logged.elapsed());
             match inbox.recv_timeout(wait) {
-                Ok(reply) => reply,
+                Ok(ask) => ask,
                 Err(RecvTimeoutError::Timeout) => {
                     log_counters();
                     logged = Instant::now();
@@ -148,13 +181,22 @@ fn owner(inbox: Receiver<Sender<Result<Opened, String>>>, target: Target, opts: 
             }
         } else {
             match inbox.recv() {
-                Ok(reply) => reply,
+                Ok(ask) => ask,
                 Err(_) => break,
+            }
+        };
+        let reply = match ask {
+            Ask::Open(reply) => reply,
+            Ask::Volume => {
+                if let Some((output, _)) = open.as_ref() {
+                    apply_volume(&output.pcm, &volume);
+                }
+                continue;
             }
         };
         let answer = match open.as_ref() {
             Some((_, opened)) => Ok(opened.clone()),
-            None => match start(&target, opts) {
+            None => match start(&target, opts, &volume) {
                 Ok((output, opened)) => {
                     open = Some((output, opened.clone()));
                     Ok(opened)
@@ -171,19 +213,21 @@ fn owner(inbox: Receiver<Sender<Result<Opened, String>>>, target: Target, opts: 
     }
 }
 
-/// Connects to `target`'s server, opens and starts the output, and installs the mixer for the quantum the server ran.
-fn start(target: &Target, opts: Options) -> Result<(Output, Opened), String> {
+/// Connects to `target`'s server, opens and starts the output, and installs the mixer for the quantum the server ran. The stream's volume reports go to `volume`, and its pending value is written once the stream runs.
+fn start(
+    target: &Target,
+    opts: Options,
+    volume: &Arc<AppVolume>,
+) -> Result<(Output, Opened), String> {
     let remote = target.remote.as_deref().ok_or_else(|| {
         "no audio server socket granted: atld found no PipeWire socket on the desktop".to_owned()
     })?;
-    let identity = target
-        .identity
-        .as_ref()
-        .map(|(id, name)| StreamIdentity { id, name });
+    let identity = target.identity.as_deref().map(|id| StreamIdentity { id });
     let host = PlatformAudioHost::connect(remote, identity).map_err(|e| e.to_string())?;
     let mixer: Shared = Arc::new(MixCell::default());
     let fill_mixer = Arc::clone(&mixer);
     let silent = opts.break_mix;
+    let observer = Arc::clone(volume);
     let pcm = host
         .open_output(
             PcmSpec {
@@ -191,6 +235,9 @@ fn start(target: &Target, opts: Options) -> Result<(Output, Opened), String> {
                 channels: CHANNELS,
             },
             move |out| render(&fill_mixer, out, silent),
+            move |v| {
+                observer.observed(v);
+            },
         )
         .map_err(|e| e.to_string())?;
     let spec = pcm.spec();
@@ -209,7 +256,8 @@ fn start(target: &Target, opts: Options) -> Result<(Output, Opened), String> {
     }
     pcm.set_active(true).map_err(|e| e.to_string())?;
     tracing::info!(rate = profile.rate_hz, quantum, "PCM output running");
-    Ok((Output { _pcm: pcm }, Opened { profile, mixer }))
+    apply_volume(&pcm, volume);
+    Ok((Output { pcm }, Opened { profile, mixer }))
 }
 
 /// The realtime fill: one slice of interleaved stereo frames from the mixer, or silence (break, a control call holding the mixer, or no mixer yet).

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The command line: `atl-app-launcher [--target-sdk=<n>] [--app] [--instruction-set=<isa>] [--package=<name>] [--pipewire-socket=<path>] [--no-audio-service] [--break-cblk] [--no-media-extractor-service] [--no-media-player-service] [--break-mix] <VM option>... <class> [<arg>...]`.
+//! The command line: `atl-app-launcher [--target-sdk=<n>] [--app] [--instruction-set=<isa>] [--package=<name>] [--pipewire-socket=<path>] [--no-audio-service] [--break-cblk] [--no-media-extractor-service] [--no-media-player-service] [--break-mix] [--app-volume-index=<n>] <VM option>... <class> [<arg>...]`.
 //! VM options are dalvikvm's (art/dalvikvm/dalvikvm.cc): every argument up to the first not starting with `-` goes to `JNI_CreateJavaVM`, `-cp` / `-classpath` taking the next one with it; the class follows, then main's arguments.
 //! Launcher options start with `--` and come first; ART takes no option of that form.
 
@@ -31,6 +31,8 @@ pub struct Launch {
     pub no_media_player_service: bool,
     /// Test only: AudioFlinger's mixer plays silence (`atl_audioflinger::Options`), the audio gate's deliberate break.
     pub break_mix: bool,
+    /// Test only: the app volume starts at this music index (`atl_audioflinger::Options::volume_index`), the app-volume gate's write.
+    pub app_volume_index: Option<u32>,
     pub vm_options: Vec<CString>,
     /// None: none given; dalvikvm reports that after creating the VM (so `-help` and the like run).
     pub class: Option<String>,
@@ -47,6 +49,7 @@ const BREAK_CBLK: &str = "--break-cblk";
 const NO_MEDIA_EXTRACTOR_SERVICE: &str = "--no-media-extractor-service";
 const NO_MEDIA_PLAYER_SERVICE: &str = "--no-media-player-service";
 const BREAK_MIX: &str = "--break-mix";
+const APP_VOLUME_INDEX: &str = "--app-volume-index=";
 
 pub fn parse(argv: impl IntoIterator<Item = OsString>) -> Result<Launch, String> {
     let mut it = argv
@@ -64,6 +67,7 @@ pub fn parse(argv: impl IntoIterator<Item = OsString>) -> Result<Launch, String>
         no_media_extractor_service: false,
         no_media_player_service: false,
         break_mix: false,
+        app_volume_index: None,
         vm_options: Vec::new(),
         class: None,
         args: Vec::new(),
@@ -119,6 +123,15 @@ pub fn parse(argv: impl IntoIterator<Item = OsString>) -> Result<Launch, String>
         }
         if text == BREAK_MIX {
             launch.break_mix = true;
+            pending = it.next().transpose()?;
+            continue;
+        }
+        if let Some(index) = text.strip_prefix(APP_VOLUME_INDEX) {
+            launch.app_volume_index = Some(
+                index
+                    .parse()
+                    .map_err(|_| format!("{APP_VOLUME_INDEX}{index}: not an index"))?,
+            );
             pending = it.next().transpose()?;
             continue;
         }

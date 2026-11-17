@@ -6,18 +6,10 @@
 //! mixer -- an app setting STREAM_MUSIC to 0 must not mute the user's desktop, and the desktop volume keys are the mixer's, not an Android stream's. The start values are AOSP's defaults on a
 //! device with no saved settings: AudioSystem.DEFAULT_STREAM_VOLUME, so an app reads a non-zero, unmuted media volume as on a fresh device.
 
-/// AudioSystem.NUM_STREAM_TYPES (getNumStreamTypes): STREAM_VOICE_CALL 0 .. STREAM_ASSISTANT 11; ensureValidStreamType rejects anything outside.
-pub const NUM_STREAM_TYPES: usize = 12;
-pub const STREAM_RING: i32 = 2;
-pub const STREAM_MUSIC: i32 = 3;
-/// AudioSystem.DEFAULT_STREAM_VOLUME, per stream (the ro.config.*_vol_default overrides unset).
-const DEFAULT_STREAM_VOLUME: [i32; NUM_STREAM_TYPES] = [4, 7, 5, 5, 6, 5, 7, 7, 5, 5, 5, 5];
-/// AudioService.MAX_STREAM_VOLUME (the ro.config.*_vol_steps overrides unset).
-const MAX_STREAM_VOLUME: [i32; NUM_STREAM_TYPES] = [5, 7, 7, 15, 7, 7, 15, 7, 15, 15, 15, 15];
-/// AudioService.MIN_STREAM_VOLUME: the unprivileged minimum (getMinIndex(false)).
-const MIN_STREAM_VOLUME: [i32; NUM_STREAM_TYPES] = [1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0];
-/// AudioService.STREAM_VOLUME_ALIAS_DEFAULT: a platform that is neither voice-capable nor single-volume (a desktop has no telephony: AudioSystem.getPlatformType -> PLATFORM_DEFAULT).
-const ALIAS: [usize; NUM_STREAM_TYPES] = [0, 2, 2, 3, 4, 2, 6, 2, 2, 3, 3, 3];
+use atl_services_wire::audio_volume::{
+    ALIAS, DEFAULT_STREAM_VOLUME, MAX_STREAM_VOLUME, MIN_STREAM_VOLUME,
+};
+pub use atl_services_wire::audio_volume::{NUM_STREAM_TYPES, STREAM_MUSIC, STREAM_RING};
 /// AudioManager ADJUST_*.
 pub const ADJUST_RAISE: i32 = 1;
 pub const ADJUST_LOWER: i32 = -1;

@@ -19,8 +19,12 @@ mod ids;
 mod output;
 mod policy;
 mod track;
+mod volume;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use atl_services_wire::audio_volume::{MAX_STREAM_VOLUME, STREAM_MUSIC};
 
 /// The name AudioSystem looks AudioFlinger up by (`checkService`).
 pub const FLINGER_NAME: &str = "media.audio_flinger";
@@ -36,10 +40,12 @@ pub struct Options {
     pub break_cblk: bool,
     /// The audio gate's break (`--break-mix`): the output plays silence and the mixer does not run, so no track's sound reaches the sink.
     pub break_mix: bool,
+    /// The app-volume gate's hook (`--app-volume-index`): the app volume is set to this music index at launch, written when the stream appears. Until AudioService drives the controller, this is its only app-side caller.
+    pub volume_index: Option<u32>,
 }
 
 /// Serves [`FLINGER_NAME`] and [`POLICY_NAME`] to this process, with the PCM output connecting to the audio server socket `remote` (granted by atld; None: none granted) on its first use. Refused before `atl_service_view::install`. The launcher skips the call under `--no-audio-service` (the audio gate's break).
-/// `identity`: the app the output's stream belongs to (the desktop's mixer row and saved-volume key); None: a process of no app.
+/// `identity`: the app the output's stream belongs to (the desktop's mixer row and saved-volume key); None: a process of no app. The stream's host volume is the app volume (volume.rs), counted in AOSP's music steps.
 /// Fails only when the services cannot be served: a server that is unreachable is not an error here, and its tracks fail when made (output.rs).
 pub fn serve(
     remote: Option<&Path>,
@@ -48,9 +54,14 @@ pub fn serve(
 ) -> Result<(), String> {
     let target = output::Target {
         remote: remote.map(PathBuf::from),
-        identity: identity.map(|i| (i.id.to_owned(), i.name.to_owned())),
+        identity: identity.map(|i| i.id.to_owned()),
     };
-    let output = output::Opener::spawn(target, opts)?;
+    let music = usize::try_from(STREAM_MUSIC).map_err(|e| e.to_string())?;
+    let max = u32::try_from(MAX_STREAM_VOLUME[music]).map_err(|e| e.to_string())?;
+    let output = output::Opener::spawn(target, opts, Arc::new(volume::AppVolume::new(max)))?;
+    if let Some(index) = opts.volume_index {
+        output.set_volume(index, false)?;
+    }
     atl_service_view::serve(FLINGER_NAME, flinger::new_binder(opts, output))?;
     atl_service_view::serve(POLICY_NAME, policy::new_binder())?;
     Ok(())

@@ -124,6 +124,7 @@ fn run(args: &Args) -> Result<()> {
             channels: args.channels,
         },
         move |samples| tone.fill(samples),
+        |_| {},
     )?;
     let spec = output.spec();
     say(&format!(

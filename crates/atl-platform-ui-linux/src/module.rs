@@ -7,10 +7,11 @@ use std::path::Path;
 
 use atl_platform_ui_api::abi::{
     self, AudioHandle, BytesOut, Callback, FillCallback, InvokerHandle, LooperAbi, MonitorView,
-    PaintedView, PcmHandle, RequesterHandle, SceneView, Status, Str, StreamIdentityView, Task,
-    TextInputEventView, TextInputHandle, UiHandle, UiVtable, WindowAttributesView, WindowHandle,
+    PaintedView, PcmHandle, RequesterHandle, SceneView, SendCallback, Status, Str,
+    StreamIdentityView, Task, TextInputEventView, TextInputHandle, UiHandle, UiVtable,
+    WindowAttributesView, WindowHandle,
 };
-use atl_platform_ui_api::audio::{AudioHost, PcmOutput, PcmSpec, StreamIdentity};
+use atl_platform_ui_api::audio::{AudioHost, PcmOutput, PcmSpec, StreamIdentity, StreamVolume};
 use atl_platform_ui_api::{
     ContentHints, ContentPurpose, CursorShape, DeviceNumber, FrameClock, FrameRequester, FrameTick,
     InputEvent, InputSource, PhysRect, PhysSize, PresentError, PresentTiming, Surrounding,
@@ -68,6 +69,7 @@ static VTABLE: UiVtable = UiVtable {
     pcm_spec,
     pcm_quantum,
     pcm_set_active,
+    pcm_set_volume,
     pcm_rt_fallbacks,
     pcm_underruns,
     sideband_attach,
@@ -424,9 +426,7 @@ unsafe extern "C" fn audio_connect(
     let remote = unsafe { remote.get() }.into_owned();
     // SAFETY: borrowed for this call.
     let identity = unsafe { identity.get() };
-    let identity = identity
-        .as_ref()
-        .map(|(id, name)| StreamIdentity { id, name });
+    let identity = identity.as_deref().map(|id| StreamIdentity { id });
     match PipeWireHost::connect(Path::new(&remote), identity) {
         Ok(h) => {
             // SAFETY: the caller's out-parameter.
@@ -447,11 +447,16 @@ unsafe extern "C" fn audio_open_output(
     a: *mut AudioHandle,
     want: PcmSpec,
     mut fill: FillCallback,
+    mut on_volume: SendCallback<StreamVolume>,
     out: *mut *mut PcmHandle,
     err: *mut BytesOut,
 ) -> Status {
     // SAFETY: a live connection.
-    match unsafe { obj::<_, PipeWireHost>(a) }.open_output(want, move |buf| fill.fill(buf)) {
+    match unsafe { obj::<_, PipeWireHost>(a) }.open_output(
+        want,
+        move |buf| fill.fill(buf),
+        move |v| on_volume.call(&v),
+    ) {
         Ok(o) => {
             // SAFETY: the caller's out-parameter.
             unsafe { *out = into_handle(o) };
@@ -487,6 +492,19 @@ unsafe extern "C" fn pcm_quantum(p: *mut PcmHandle) -> u32 {
 unsafe extern "C" fn pcm_set_active(p: *mut PcmHandle, on: bool, err: *mut BytesOut) -> Status {
     // SAFETY: a live output.
     match unsafe { pcm(p) }.set_active(on) {
+        Ok(()) => abi::OK,
+        // SAFETY: the caller's sink.
+        Err(e) => unsafe { fail(err, abi::audio_error_parts(&e)) },
+    }
+}
+
+unsafe extern "C" fn pcm_set_volume(
+    p: *mut PcmHandle,
+    volume: StreamVolume,
+    err: *mut BytesOut,
+) -> Status {
+    // SAFETY: a live output.
+    match unsafe { pcm(p) }.set_volume(volume) {
         Ok(()) => abi::OK,
         // SAFETY: the caller's sink.
         Err(e) => unsafe { fail(err, abi::audio_error_parts(&e)) },

@@ -7,12 +7,21 @@ use std::path::Path;
 
 /// Who plays: the app's desktop identity, which the server shows on every stream of the connection (the desktop mixer's row name, the key its saved volume is kept under).
 /// The same identity names the app's window (Wayland `app_id`) and its desktop file, so desktop tools can join them. No stream role is carried: the Linux convention for a player is none.
+/// The id is also the row's name: the app's other streams (the WebView's, named by the toolkit after the window's app_id) show the same string, so all of one app's rows read alike.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamIdentity<'a> {
     /// Reverse-DNS application id: the desktop file ID without `.desktop` (`atl.<package>`).
     pub id: &'a str,
-    /// Human-readable name shown in a mixer.
-    pub name: &'a str,
+}
+
+/// A stream's own volume as the server holds it: what a desktop mixer's row for the stream shows and sets.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StreamVolume {
+    /// Linear amplitude, 0.0 (silent) ..= 1.0 (unattenuated), the same on every channel; a stream whose channels differ reports its loudest.
+    pub linear: f32,
+    /// Muted, independent of `linear`.
+    pub mute: bool,
 }
 
 /// Frames per second and interleaved channels of a PCM stream. Samples are F32 in the server's native byte order.
@@ -49,10 +58,12 @@ pub trait AudioHost: Sized {
     /// `fill` writes every sample of each slice it is given, in calls of one server quantum (at most 8192 frames), and keeps its state between calls.
     /// It runs on the realtime thread: it must not allocate, lock or block.
     /// The output starts inactive; [`PcmOutput::set_active`] starts it.
+    /// `on_volume` is called (on the connection's thread, not realtime; it must not call into this output) with the stream's whole volume each time the server reports a change of it: from outside (a desktop mixer, the session manager restoring a saved value) or an echo of [`PcmOutput::set_volume`].
     fn open_output(
         &self,
         want: PcmSpec,
         fill: impl FnMut(&mut [f32]) + Send + 'static,
+        on_volume: impl FnMut(StreamVolume) + Send + 'static,
     ) -> Result<Self::Output, AudioError>;
 }
 
@@ -67,6 +78,9 @@ pub trait PcmOutput {
     /// Starts (`true`) or stops (`false`) the stream.
     /// `true` returns once the server runs the stream; a stream that fails or does not start in time is an error.
     fn set_active(&self, on: bool) -> Result<(), AudioError>;
+
+    /// Sets the stream's own volume on the server (every channel to `volume.linear`, and its mute), as a desktop mixer would. Returns once requested, not once applied.
+    fn set_volume(&self, volume: StreamVolume) -> Result<(), AudioError>;
 
     /// 1 when the stream's first realtime callback ran without SCHED_FIFO or SCHED_RR: the server's realtime request was refused (no rtkit, RLIMIT_RTPRIO 0), so callbacks run at normal priority and can underrun under load.
     /// Counted, not an error. 0 until that first callback ran.

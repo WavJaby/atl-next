@@ -572,7 +572,6 @@ pub fn audio_error(kind: Status, text: Vec<u8>) -> AudioError {
 #[repr(C)]
 pub struct StreamIdentityView {
     id: Str,
-    name: Str,
     has_identity: bool,
 }
 
@@ -581,19 +580,18 @@ impl StreamIdentityView {
     pub fn of(i: Option<crate::audio::StreamIdentity<'_>>) -> Self {
         Self {
             id: Str::of(i.map_or("", |i| i.id)),
-            name: Str::of(i.map_or("", |i| i.name)),
             has_identity: i.is_some(),
         }
     }
 
-    /// The identity as (id, name).
+    /// The identity's id.
     ///
     /// # Safety
     /// The identity this view was made from is still alive.
-    pub unsafe fn get(&self) -> Option<(String, String)> {
+    pub unsafe fn get(&self) -> Option<String> {
         // SAFETY: the caller's contract.
         self.has_identity
-            .then(|| unsafe { (self.id.get().into_owned(), self.name.get().into_owned()) })
+            .then(|| unsafe { self.id.get().into_owned() })
     }
 }
 
@@ -1169,11 +1167,12 @@ pub struct UiVtable {
     ) -> Status,
     /// Ends a connection.
     pub audio_drop: unsafe extern "C" fn(audio: *mut AudioHandle),
-    /// `AudioHost::open_output`.
+    /// `AudioHost::open_output`; `on_volume` is called on the module's audio connection thread.
     pub audio_open_output: unsafe extern "C" fn(
         audio: *mut AudioHandle,
         want: crate::audio::PcmSpec,
         fill: FillCallback,
+        on_volume: SendCallback<crate::audio::StreamVolume>,
         out: *mut *mut PcmHandle,
         err: *mut BytesOut,
     ) -> Status,
@@ -1186,6 +1185,12 @@ pub struct UiVtable {
     /// `PcmOutput::set_active`.
     pub pcm_set_active:
         unsafe extern "C" fn(pcm: *mut PcmHandle, on: bool, err: *mut BytesOut) -> Status,
+    /// `PcmOutput::set_volume`.
+    pub pcm_set_volume: unsafe extern "C" fn(
+        pcm: *mut PcmHandle,
+        volume: crate::audio::StreamVolume,
+        err: *mut BytesOut,
+    ) -> Status,
     /// `PcmOutput::rt_fallbacks`.
     pub pcm_rt_fallbacks: unsafe extern "C" fn(pcm: *mut PcmHandle) -> u64,
     /// `PcmOutput::underruns`.
