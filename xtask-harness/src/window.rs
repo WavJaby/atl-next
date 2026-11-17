@@ -126,6 +126,13 @@ pub struct Args {
     /// Stages widgets and webview, with `--esc-back` only: atld runs with the adaptation off (atld `--esc-back false`) while the checks expect it on, so no BACK follows the unhandled Esc and the esc-back sub-gate must fail (the gate's deliberate break).
     #[arg(long, requires = "esc_back")]
     break_esc_back: bool,
+    /// Stage capture: atld runs with `--exit-with-last-app true` and the atld-end sub-gate expects the run to end with status 0 after the close's kill, every process atld ran gone; without it,
+    /// atld `false` and the sub-gate expects atld still running after the kill. Run the stage both ways.
+    #[arg(long)]
+    exit_with_last_app: bool,
+    /// Stage capture, with `--exit-with-last-app` only: atld runs with the adaptation off while the check expects the end, so the atld-end sub-gate must fail (the gate's deliberate break).
+    #[arg(long, requires = "exit_with_last_app")]
+    break_exit_with_last_app: bool,
     /// Stage dialog only: the services send no requestFinish on an unhandled Back (atld `--no-back-finish`), so the back sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     break_back_finish: bool,
@@ -2019,6 +2026,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         rt
     };
+    let rt = if args.exit_with_last_app && !args.break_exit_with_last_app {
+        rt.with_exit_with_last_app()
+    } else {
+        rt
+    };
     let outputs = nested.as_ref().map(NestedCompositor::control);
     // the move stage's second output, as Android's display
     let moved = nested
@@ -2128,7 +2140,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 None => Err("no capture probe".to_owned()),
             },
             (Stage::Capture, _, _) => match &capture_probe {
-                Some(capture_probe) => capture::drive(p, &log, &services_log, capture_probe),
+                Some(capture_probe) => {
+                    capture::drive(p, &log, &services_log, capture_probe, atld_pid)
+                }
                 None => Err("no capture probe".to_owned()),
             },
             (Stage::Ime, _, Some(ime)) => {
@@ -2239,7 +2253,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let app = read(&app_log);
     let services = read(&services_log);
     let all = events(&services);
-    let v = verdict(&app, marker, ended.is_some(), window_ms);
+    let atld_log = read(&run.atld_log());
+    // atld's end with the last app (--exit-with-last-app) is the run's normal end, not a fault
+    let v = verdict(
+        &app,
+        marker,
+        ended.is_some() && !capture::ended_with_last_app(&atld_log),
+        window_ms,
+    );
     if args.verbose {
         println!("---- app log\n{app}");
     }
@@ -2344,7 +2365,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 title_check(&seen, FIXTURE_LABEL, TASK_LABEL, &liveness),
             )]
         }
-        (Stage::Capture, Some(_)) => capture::checks(&captured, opening_size(display), &liveness),
+        (Stage::Capture, Some(_)) => {
+            let mut sub = capture::checks(&captured, opening_size(display), &liveness);
+            sub.push((
+                "atld-end",
+                capture::atld_end_judged(&captured, &atld_log, ended, args.exit_with_last_app),
+            ));
+            sub
+        }
         (Stage::Splash, Some(_)) => {
             let mut sub = splash::checks(&app, splash_shot.take(), opening_size(display));
             sub.push((

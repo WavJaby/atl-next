@@ -330,6 +330,8 @@ pub struct Runtime {
     mouse_touch: bool,
     /// atld `--esc-back`: an unhandled Esc falls back to Back (the keyboard map's overlay). Off unless a run asks, as `mouse_touch`.
     esc_back: bool,
+    /// atld `--exit-with-last-app`: the run ends with the last app. Off unless a run asks: a gate ends its run itself (`stop`), and an app's death mid-gate is an event, not the end.
+    exit_with_last_app: bool,
     /// Sensors gate kernel fakes: atld runs in a private user + mount namespace (`unshare -Urm`) that shows these as the fixed paths the product reads.
     fake_devices: Option<FakeDevices>,
     /// The gate this runtime was staged for: each run writes its record (remote.rs `record_path`) under `out`.
@@ -823,6 +825,7 @@ impl Runtime {
             tilt_keys: None,
             mouse_touch: false,
             esc_back: false,
+            exit_with_last_app: false,
             fake_devices: None,
             site: remote::Site::Host,
             data_root: None,
@@ -1247,6 +1250,12 @@ impl Runtime {
     /// atld `--esc-back true`: the keyboard's map gains the Esc -> Back fallback (atld's default; a run without this asserts AOSP's map).
     pub fn with_esc_back(mut self) -> Self {
         self.esc_back = true;
+        self
+    }
+
+    /// atld `--exit-with-last-app true`: the run ends once the last app ended (atld's default with `--ui`; a run without this keeps atld until `stop`).
+    pub fn with_exit_with_last_app(mut self) -> Self {
+        self.exit_with_last_app = true;
         self
     }
 
@@ -1703,6 +1712,12 @@ impl Runtime {
             if self.mouse_touch { "true" } else { "false" },
             "--esc-back",
             if self.esc_back { "true" } else { "false" },
+            "--exit-with-last-app",
+            if self.exit_with_last_app {
+                "true"
+            } else {
+                "false"
+            },
         ]);
         if !self.sensor_service {
             cmd.arg("--no-sensor-service");

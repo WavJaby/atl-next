@@ -85,6 +85,13 @@ pub enum Request {
     Withdraw {
         key: String,
     },
+    /// The death of app process `pid` left no activity in any Task, and the process had a Task (a launched app; system packages' processes have none). `finished`: it held no activity
+    /// that was not finishing (its Task was removed or it finished its last activity); false: it died with a live one (a crash, or its own exit). The host decides whether the run ends
+    /// (atld `--exit-with-last-app`). Answered [`Response::Noted`].
+    LastAppEnded {
+        pid: i32,
+        finished: bool,
+    },
 }
 
 /// A notification's desktop form, mapped from Android's by the services (notifications plan N4).
@@ -153,6 +160,8 @@ pub enum Response {
     Withdrawn {
         shown: bool,
     },
+    /// A report the host took (no answer of its own).
+    Noted,
     Error {
         message: String,
     },

@@ -361,6 +361,19 @@ impl<K: Clone + PartialEq, O: Clone, L, I, R> Machine<K, O, L, I, R> {
             .any(|(t, records)| *t != task && records.iter().any(|r| of(&r.owner)))
     }
 
+    /// An owner `of` matches holds a record that is not finishing: an activity the app did not end (a destroying record has finished).
+    pub fn holds_live(&self, of: impl Fn(&O) -> bool) -> bool {
+        self.tasks
+            .values()
+            .flatten()
+            .any(|r| !r.finishing && of(&r.owner))
+    }
+
+    /// No record anywhere, in a Task or destroying: no app has an activity.
+    pub fn is_empty(&self) -> bool {
+        self.tasks.is_empty() && self.destroying.is_empty()
+    }
+
     pub fn is_finishing(&self, token: &K) -> Option<bool> {
         self.find(token).map(|(_, r)| r.finishing)
     }
@@ -1236,5 +1249,31 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// The last-app rule's inputs (ActivityTasks::process_died): a resumed record is live; once its Task is removed every record is finishing, so the owner holds none live,
+    /// and the stack is empty only after the death drops the records, destroying ones included.
+    #[test]
+    fn a_removed_task_holds_no_live_record_and_empties_on_death() {
+        let mut m = Machine::new();
+        m.push(task(1), MAIN, APP, "main");
+        m.resumed(&MAIN);
+        assert!(m.holds_live(|o| *o == APP));
+        m.remove_task(task(1));
+        assert!(!m.holds_live(|o| *o == APP));
+        assert!(!m.is_empty());
+        m.drop_owned(|o| *o == APP);
+        assert!(m.is_empty());
+    }
+
+    /// Two apps: the first one's death leaves the other's Task, so the stack is not empty (only the last app's end counts).
+    #[test]
+    fn another_apps_task_keeps_the_stack_non_empty() {
+        let mut m = Machine::new();
+        m.push(task(1), MAIN, APP, "main");
+        m.push(task(2), OTHER, "other", "other");
+        m.drop_owned(|o| *o == APP);
+        assert!(!m.is_empty());
+        assert!(m.holds_live(|o| *o == "other"));
     }
 }

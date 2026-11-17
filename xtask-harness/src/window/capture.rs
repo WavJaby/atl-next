@@ -8,6 +8,7 @@
 //! (c) the probe sends `xdg_toplevel.close`: the services must receive the composer's REMOVE_TASK for the fixture's Task (`close`), and must have refused and counted the fixture's own REMOVE_TASK
 //! naming a Task its uid does not own (`foreign`, Main.java `removeForeignTask`): the ownership refusal is the row's break, built into the run. Then AOSP's removeTask: the fixture runs
 //! onPause, onStop, onDestroy in that order (`destroy`), and the services kill its process once it reported the destroy, not by the 1000 ms timeout, and every pid they killed is gone (`ended`).
+//! Last, `atld-end`: with `--exit-with-last-app` atld ends the run with status 0 and every process it ran is gone; without, the run goes on until the harness's stop ([`atld_end_judged`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -36,6 +37,10 @@ const KILLED_LINE: &str = " removed: killing ";
 const TIMED_OUT: &str = ": no destroy within ";
 /// How long a killed pid may take to disappear: atld SIGKILLs the sandbox and its reaper thread waits on it; generous for a loaded host.
 const GONE_WAIT: Duration = Duration::from_secs(5);
+/// atld's line when the services' `LastAppEnded` ends the run (atld main.rs `last_app_ended`), and when it does not because the adaptation is off.
+const RUN_ENDS: &str = "the run ends";
+const RUN_GOES_ON: &str = "the run goes on (--exit-with-last-app false)";
+const LAST_APP: &str = "last app ended (";
 /// The reply hook's count of a refused REMOVE_TASK, and the cause naming the fixture's foreign Task (Main.java FOREIGN_TASK = i32::MAX).
 const FOREIGN_REFUSAL: &str = "status:PERMISSION_DENIED ICompositorRegistry.REMOVE_TASK";
 const FOREIGN_CAUSE: &str = "does not own task 2147483647";
@@ -70,6 +75,8 @@ pub(super) struct Seen {
     /// Capture (c) after the removal: the lifecycle order, and the kill with its pids gone.
     pub(super) destroy: Option<Result<String, String>>,
     pub(super) ended: Option<Result<String, String>>,
+    /// Every process under atld just before the close (services, binderd, gralloc, the app, sandbox helpers): none may outlive the run's end (atld-end).
+    pub(super) ran: Vec<u32>,
 }
 
 /// What a probe needs from the run: atld's root and the app's package (the capture route), where atld writes the bytes, and where its pictures go.
@@ -234,6 +241,7 @@ pub(super) fn drive(
     app_log: &Path,
     services_log: &Path,
     probe: &Probe,
+    atld: u32,
 ) -> Result<Liveness, String> {
     probe.record_after_draw(app_log);
     let refusal = refused(app_log, probe);
@@ -252,6 +260,10 @@ pub(super) fn drive(
             .map_err(|e| e.to_string())?;
     }
     wait_for_line(services_log, FOREIGN_CAUSE, CLOSE_WAIT);
+    let ran = descendants(atld);
+    if let Ok(mut seen) = probe.seen.lock() {
+        seen.ran = ran;
+    }
     proxy.inject_toplevel_close().map_err(|e| e.to_string())?;
     // the line, not its arguments: a removal the registry refused never writes it, and close_judged names what is missing
     wait_for_line(services_log, REMOVED_LINE, CLOSE_WAIT);
@@ -358,6 +370,73 @@ fn ended_judged(services: &str, still: Option<Vec<i32>>) -> Result<String, Strin
     };
     Ok(format!(
         "pids {pids:?} killed after onDestroy and gone; remove -> kill {latency}"
+    ))
+}
+
+/// Every live process under `atld` (its /proc ppid chain reaches it).
+fn descendants(atld: u32) -> Vec<u32> {
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|&pid| super::descends_from(pid, atld))
+        .collect()
+}
+
+/// atld logged that the last app's end ends the run (`--exit-with-last-app` on).
+pub(super) fn ended_with_last_app(atld_log: &str) -> bool {
+    atld_log
+        .lines()
+        .any(|l| l.contains(LAST_APP) && l.trim_end().ends_with(RUN_ENDS))
+}
+
+/// Sub-gate (c) atld-end: with `expect_end` (atld `--exit-with-last-app true`) the close's end of the last app ended the run: atld logged it, exited 0 by itself (`ended`), and none of the
+/// processes it ran before the close is left. Without it atld logged that the run goes on and was still running for the harness's `stop` (`ended` None): today's rule.
+pub(super) fn atld_end_judged(
+    seen: &Mutex<Seen>,
+    atld_log: &str,
+    ended: Option<std::process::ExitStatus>,
+    expect_end: bool,
+) -> Result<String, String> {
+    if !expect_end {
+        if !atld_log.contains(RUN_GOES_ON) {
+            return Err(format!(
+                "atld never logged `{RUN_GOES_ON}` after the last app ended"
+            ));
+        }
+        return match ended {
+            None => Ok(
+                "adaptation off: atld still ran after the last app ended, until stop".to_owned(),
+            ),
+            Some(s) => Err(format!("adaptation off, yet atld exited by itself: {s}")),
+        };
+    }
+    if !ended_with_last_app(atld_log) {
+        return Err(format!("atld never logged `{LAST_APP}..: {RUN_ENDS}`"));
+    }
+    let status = ended.ok_or("atld logged the end but was still running at the window's end")?;
+    if !status.success() {
+        return Err(format!("atld ended the run with {status}, want status 0"));
+    }
+    let ran = seen.lock().map(|s| s.ran.clone()).unwrap_or_default();
+    if ran.is_empty() {
+        return Err("no process under atld was recorded before the close".to_owned());
+    }
+    let alive = |pid: &u32| Path::new(&format!("/proc/{pid}")).exists();
+    let deadline = Instant::now() + GONE_WAIT;
+    while ran.iter().any(alive) && Instant::now() < deadline {
+        std::thread::sleep(ATTEMPT_GAP);
+    }
+    let left: Vec<u32> = ran.iter().copied().filter(alive).collect();
+    if !left.is_empty() {
+        return Err(format!(
+            "pids {left:?} atld ran outlived it by {GONE_WAIT:?}"
+        ));
+    }
+    Ok(format!(
+        "atld exited 0 after the last app ended; the {} processes it ran are gone",
+        ran.len()
     ))
 }
 
@@ -500,5 +579,29 @@ mod tests {
         assert!(ended_judged(&killed.replace("[4242]", "[]"), Some(vec![])).is_err());
         let timed = format!("{killed}services: remove task 1: no destroy within 1s\n");
         assert!(ended_judged(&timed, Some(vec![])).is_err());
+    }
+
+    /// atld-end both ways, with atld's lines as main.rs `last_app_ended` writes them. The recorded pid is above pid_max (2^22), so it is gone; an empty record fails.
+    #[test]
+    fn atld_end_needs_status_0_and_no_survivor_or_the_run_going_on() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let exit = |code: i32| Some(std::process::ExitStatus::from_raw(code << 8));
+        let gone = Mutex::new(Seen {
+            ran: vec![u32::MAX],
+            ..Seen::default()
+        });
+        let ends = "atld: last app ended (pid 77, finished): the run ends\n";
+        assert!(atld_end_judged(&gone, ends, exit(0), true).is_ok());
+        assert!(atld_end_judged(&gone, ends, exit(1), true).is_err());
+        assert!(atld_end_judged(&gone, ends, None, true).is_err());
+        assert!(atld_end_judged(&gone, "", exit(0), true).is_err());
+        assert!(atld_end_judged(&Mutex::new(Seen::default()), ends, exit(0), true).is_err());
+        let goes_on =
+            "atld: last app ended (pid 77): the run goes on (--exit-with-last-app false)\n";
+        assert!(atld_end_judged(&gone, goes_on, None, false).is_ok());
+        assert!(atld_end_judged(&gone, goes_on, exit(0), false).is_err());
+        // the break: atld ran with the adaptation off while the check expects the end
+        assert!(atld_end_judged(&gone, goes_on, None, true).is_err());
+        assert!(ended_with_last_app(ends) && !ended_with_last_app(goes_on));
     }
 }

@@ -834,11 +834,15 @@ impl ActivityTasks {
             .holds_other_task(task, |o| o.thread.as_binder() == *thread)
     }
 
-    /// The process of `thread` died: its records leave the stack (Machine::drop_owned).
-    pub(crate) fn process_died(&self, thread: &SpIBinder) {
+    /// The process of `thread` died: its records leave the stack (Machine::drop_owned). Some when that left no record anywhere: true when it held none that was not finishing
+    /// (Machine::holds_live), the app ended itself or its Task was removed; false when it died with a live activity.
+    pub(crate) fn process_died(&self, thread: &SpIBinder) -> Option<bool> {
         let mut m = self.machine();
-        m.drop_owned(|o| o.thread.as_binder() == *thread);
+        let of = |o: &Owner| o.thread.as_binder() == *thread;
+        let finished = !m.holds_live(of);
+        m.drop_owned(of);
         self.note_settle(&m);
+        m.is_empty().then_some(finished)
     }
 }
 

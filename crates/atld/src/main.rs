@@ -11,11 +11,12 @@
 //!    the broker's sandbox. atld waits for its `services: ready`.
 //! 6. `--run-class`: a command as uid `--run-uid` (the shell), `am instrument` for example; its exit ends the run.
 //! 7. the control socket `<root>/control.sock` (serve_run_control): `stop` ends the run, `start <package>/<class>` is `am start`. An app process ending does not end the run: the services see its death.
+//!    Except with `--exit-with-last-app` (default with `--ui`): the services' `LastAppEnded` after the last app's window closed or it finished / exited 0 ends it ([`Host::last_app_ended`]).
 //!
-//! 8. the end (`stop`, the command's exit, SIGINT/SIGTERM): app processes SIGKILLed; the services, gralloc, servicemanager SIGTERMed (then SIGKILLed after `--stop-grace-ms`); binderd by its admin
+//! 8. the end (`stop`, the last app's end, the command's exit, SIGINT/SIGTERM): app processes SIGKILLed; the services, gralloc, servicemanager SIGTERMed (then SIGKILLed after `--stop-grace-ms`); binderd by its admin
 //!    connection; then the ranked summary of every process's `diag:` lines on stderr (`atld: summary ...`, print_summary).
 //!
-//! Exit status: the command's (bwrap passes it on); 0 after `stop`; 128 + n after signal n; failure when the services exited. Plan: binderd, servicemanager and the services move into this process later; here each is a process, as `xtask test binder` runs them.
+//! Exit status: the command's (bwrap passes it on); 0 after `stop` and after the last app's end; 128 + n after signal n; failure when the services exited. Plan: binderd, servicemanager and the services move into this process later; here each is a process, as `xtask test binder` runs them.
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -231,6 +232,11 @@ struct Args {
     /// On by default; `--esc-back false` is exact AOSP's map. Passed to the services, which serve the map.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     esc_back: bool,
+    /// Desktop adaptation: the run ends (status 0) once the last app process ends after its window was closed or it finished its last activity, or exited 0 by itself (the services'
+    /// control `LastAppEnded`), so nothing stays running after the window is gone. AOSP's system_server outlives its apps. Default: on with `--ui`, off headless; `false` = the run ends only
+    /// on `stop`, the `--run-class` command's exit or the services' exit.
+    #[arg(long, action = clap::ArgAction::Set)]
+    exit_with_last_app: Option<bool>,
     /// With `--tilt-keys`: the angle a held key reaches, degrees (default: atl-services `TiltConfig::default`).
     #[arg(long, requires = "tilt_keys")]
     tilt_max_deg: Option<f32>,
@@ -1062,6 +1068,10 @@ struct Host {
     break_mix: bool,
     /// the processes the services started and may kill: the host pids binderd tags them with
     controlled: Mutex<BTreeSet<i32>>,
+    /// each reaped process's exit status, by host pid: a `LastAppEnded` of a live app ends the run only when its process exited 0
+    exits: Mutex<BTreeMap<i32, ExitStatus>>,
+    /// `--exit-with-last-app`, resolved
+    exit_with_last_app: bool,
     /// why the run ends: the `--run-class` command's exit or an explicit stop
     done: Sender<End>,
     /// atl-am (`--am`): what the control command `start` runs
@@ -1150,6 +1160,8 @@ enum End {
     Stop,
     /// the services exited: nothing can run any more
     Services(ExitStatus),
+    /// the last app ended (`--exit-with-last-app`): a normal end, as `stop`
+    LastApp,
     /// atld got SIGINT or SIGTERM (its number): the run stops as after `stop`
     Signal(i32),
 }
@@ -1414,6 +1426,10 @@ impl Host {
                             )),
                             None => log(format_args!("process {host_pid} ended: {status}")),
                         }
+                        host.exits
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(host_pid, status);
                         if main {
                             let _ = host.done.send(End::Command(status));
                         }
@@ -1512,7 +1528,64 @@ impl Host {
         );
         Ok(atl_broker::program_pid(pid)?)
     }
+
+    /// The services' `LastAppEnded`: with `--exit-with-last-app` the run ends when the app finished (window closed, or its last activity finished), or when it died with a live activity
+    /// and its process exited 0 (its own exit; a crash or a signal is not a normal end, and the run goes on as without the setting). The status is waited for off the control thread.
+    fn last_app_ended(self: &Arc<Self>, pid: i32, finished: bool) {
+        if !self.exit_with_last_app {
+            log(format_args!(
+                "last app ended (pid {pid}): the run goes on (--exit-with-last-app false)"
+            ));
+            return;
+        }
+        if finished {
+            log(format_args!(
+                "last app ended (pid {pid}, finished): the run ends"
+            ));
+            let _ = self.done.send(End::LastApp);
+            return;
+        }
+        let host = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name(format!("last-app-{pid}"))
+            .spawn(move || {
+                let deadline = Instant::now() + LAST_APP_EXIT_WAIT;
+                let status = loop {
+                    let seen = host
+                        .exits
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&pid)
+                        .copied();
+                    if seen.is_some() || Instant::now() >= deadline {
+                        break seen;
+                    }
+                    std::thread::sleep(STOP_POLL);
+                };
+                match status {
+                    Some(s) if s.success() => {
+                        log(format_args!(
+                            "last app ended (pid {pid}, exited 0): the run ends"
+                        ));
+                        let _ = host.done.send(End::LastApp);
+                    }
+                    Some(s) => log(format_args!(
+                        "last app ended (pid {pid}, {s}): not a normal end, the run goes on"
+                    )),
+                    None => log(format_args!(
+                        "last app ended (pid {pid}): no exit status within {LAST_APP_EXIT_WAIT:?}, the run goes on"
+                    )),
+                }
+            });
+        if let Err(e) = spawned {
+            log(format_args!("last app ended (pid {pid}): no thread: {e}"));
+        }
+    }
 }
+
+/// How long a `LastAppEnded` of a live app waits for its process's exit status: the services see the death when its binder fd closes, at its exit; bwrap reports the status a moment
+/// later. 2 s is a loaded machine's margin.
+const LAST_APP_EXIT_WAIT: Duration = Duration::from_secs(2);
 
 impl Host {
     /// The control command `start <package>/<class>`: atl-am as the shell uid (AID_SHELL), a startActivity with no caller app; waits for it. Its reply line, `ok <am line>` or `error <why>`.
@@ -1726,6 +1799,10 @@ fn serve_control(host: Arc<Host>, fd: std::os::fd::OwnedFd) {
             Request::Withdraw { key } => host
                 .withdraw(&key)
                 .map(|shown| Response::Withdrawn { shown }),
+            Request::LastAppEnded { pid, finished } => {
+                host.last_app_ended(pid, finished);
+                Ok(Response::Noted)
+            }
         };
         outcome.unwrap_or_else(|e| {
             log(format_args!("control request failed: {e:#}"));
@@ -2268,6 +2345,8 @@ fn run(a: &Args) -> Result<ExitCode> {
         no_media_player_service: a.no_media_player_service,
         break_mix: a.break_mix,
         controlled: Mutex::new(BTreeSet::new()),
+        exits: Mutex::new(BTreeMap::new()),
+        exit_with_last_app: a.exit_with_last_app.unwrap_or(a.ui.is_some()),
         done: done_tx,
         am: a.am.clone(),
         screencap: a.screencap.clone(),
@@ -2511,7 +2590,7 @@ fn run(a: &Args) -> Result<ExitCode> {
             log(format_args!("command ended: {status}"));
             status.code()
         }
-        End::Stop => Some(0),
+        End::Stop | End::LastApp => Some(0),
         End::Services(status) => {
             log(format_args!("services ended: {status}"));
             None

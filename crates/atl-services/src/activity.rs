@@ -1277,6 +1277,8 @@ impl Inner {
     /// AppDeathRecipient.binderDied -> appDiedLocked -> handleAppDiedLocked (:3347-3367): the record leaves the table, and an instrumentation it ran ends CANCELED with "Process crashed.".
     fn app_died(&self, pid: i32) {
         let lost;
+        // Some(finished): this death left no activity anywhere and the process had a Task (a launched app; SettingsProvider, WebView and other no-Task processes never count)
+        let mut last_app = None;
         let pids = {
             let mut st = self.state();
             let Some(i) = st
@@ -1288,7 +1290,10 @@ impl Inner {
             };
             let mut rec = st.processes.remove(i);
             if let Some(a) = &rec.attached {
-                self.atm.process_died(&a.thread.as_binder());
+                last_app = self
+                    .atm
+                    .process_died(&a.thread.as_binder())
+                    .filter(|_| rec.task.is_some());
             }
             Self::broadcasts_died(&mut st, pid);
             self.services_died(&mut st, pid);
@@ -1324,6 +1329,17 @@ impl Inner {
             }
         }
         self.kill(&pids);
+        if let Some(finished) = last_app {
+            // read by the harness's run-apk verdict (`finished` / `live`); the host decides whether the run ends (atld --exit-with-last-app)
+            log(format_args!(
+                "last app process ended: pid {pid} {} at={}",
+                if finished { "finished" } else { "live" },
+                atl_diag::wall_stamp()
+            ));
+            if let Err(e) = self.control.last_app_ended(pid, finished) {
+                log(format_args!("last app ended: reporting pid {pid}: {e}"));
+            }
+        }
     }
 
     /// ContentProviderHelper.removeDyingProviderLocked for the providers the dead process hosted: their records go; callers still waiting get publish status false (:1546-1556), sent by the caller after the lock.

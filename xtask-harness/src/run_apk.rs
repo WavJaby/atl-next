@@ -91,6 +91,10 @@ pub struct Args {
     /// atld `--esc-back`: an Esc the app leaves unhandled falls back to Back. atld's default, on; `false` is AOSP's key map.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     esc_back: bool,
+    /// atld `--exit-with-last-app`: the run ends once the app ended after its window was closed, or it finished its last activity or exited 0 (the verdict names which). atld's UI default,
+    /// on; `false` keeps atld until the hold ends.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    exit_with_last_app: bool,
     /// A variable in every app process's environment (repeat), atld `--app-env`: test-environment setup such as `LD_DEBUG=bindings` (the launcher-closure measurement; glibc's lines land in the app log). The product reads none of these.
     #[arg(long = "app-env", value_name = "KEY=VALUE")]
     app_env: Vec<String>,
@@ -131,6 +135,9 @@ pub struct RemoteArgs {
     /// atld `--esc-back`, as for `run-apk`.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     esc_back: bool,
+    /// atld `--exit-with-last-app`, as for `run-apk`.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    exit_with_last_app: bool,
     /// A pointer script atld injects from the app's first present (`run-apk --pointer`).
     #[arg(long, value_name = "SCRIPT")]
     pointer: Option<String>,
@@ -181,6 +188,7 @@ impl Args {
             tilt_keys: false,
             mouse_touch: false,
             esc_back: false,
+            exit_with_last_app: false,
             app_env: Vec::new(),
             clear_data: false,
             data_root: None,
@@ -441,6 +449,7 @@ pub(crate) fn run_on(
         complete,
         atld_exited: ended.is_some(),
         end_ms: window::now_ms(),
+        app_end: app_end(&services, &read(&run.atld_log())),
     };
     let scripted = args.pointer.is_some() || steps.is_some();
     let outcome = check_delivery(foreign, &m.name, &app)
@@ -494,6 +503,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         tilt_keys: a.tilt_keys,
         mouse_touch: a.mouse_touch,
         esc_back: a.esc_back,
+        exit_with_last_app: a.exit_with_last_app,
         app_env: Vec::new(),
         clear_data: false,
         data_root: None,
@@ -617,6 +627,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
             complete: watch_complete(&services, watch_ms, end_ms),
             atld_exited: !stopped_at_limit(rc),
             end_ms,
+            app_end: app_end(&services, &read(&run.scratch.join("atld.log"))),
         };
         check_delivery(foreign.as_ref(), &m.name, &app)?;
         judge_ending(&services, &app, &ending, watch_ms, a.pointer.is_some())
@@ -766,6 +777,11 @@ pub(crate) fn configure(
     };
     let rt = if args.esc_back {
         rt.with_esc_back()
+    } else {
+        rt
+    };
+    let rt = if args.exit_with_last_app {
+        rt.with_exit_with_last_app()
     } else {
         rt
     };
@@ -934,11 +950,41 @@ fn watch_complete(services: &str, watch_ms: u64, end_ms: u64) -> bool {
     last_resumed(services).is_some_and(|r| end_ms >= r.ms + watch_ms)
 }
 
-/// How a run ended, as the judge reads it: the watch ran to its end, atld ended before its end by itself, and the end's time on the clock the logs carry (this host's, or the target's).
+/// How a run ended, as the judge reads it: the watch ran to its end, atld ended before its end by itself, the end's time on the clock the logs carry (this host's, or the target's), and
+/// the app's own normal end when it had one ([`app_end`]).
 struct Ending {
     complete: bool,
     atld_exited: bool,
     end_ms: u64,
+    app_end: Option<&'static str>,
+}
+
+/// The services' line when an app process's death left no activity anywhere (atl-services activity.rs `app_died`): `pid <n> finished|live`.
+const LAST_APP_LINE: &str = "services: last app process ended: pid ";
+/// The services' line for a desktop close they took (registry_service.rs `remove_task`).
+const REMOVE_TASK_LINE: &str = "services: removeTask task ";
+
+/// The app's normal end, from the services' last-app line: `finished` (no live activity at its death) is the window's close when the services took a removeTask, else the app
+/// finishing its last activity; `live` is normal only when atld saw its process exit 0 (its own exit after a quit dialog). A crash, or a signal while an activity was live, is None.
+/// AOSP reports a crash only from handleApplicationCrash or a native crash; a self-kill (Process.killProcess) after the last activity finished is no crash.
+fn app_end(services: &str, atld_log: &str) -> Option<&'static str> {
+    let rest = services
+        .lines()
+        .find_map(|l| l.split_once(LAST_APP_LINE).map(|(_, r)| r))?;
+    let mut words = rest.split_whitespace();
+    let pid = words.next()?;
+    match words.next()? {
+        "finished" if services.contains(REMOVE_TASK_LINE) => Some("window closed"),
+        "finished" => Some("app finished its last activity"),
+        "live" => {
+            let exited_0 = format!("process {pid} ended: exit status: 0");
+            atld_log
+                .lines()
+                .any(|l| l.trim_end().ends_with(&exited_0))
+                .then_some("app exited 0")
+        }
+        _ => None,
+    }
 }
 
 /// The verdict of a run that ended: [`judge`], with the fault window widened to the run's end when the run was scripted.
@@ -953,7 +999,14 @@ fn judge_ending(
         (true, Some(r)) => watch_ms.max(ending.end_ms.saturating_sub(r.ms)),
         _ => watch_ms,
     };
-    judge(services, app, ending.complete, ending.atld_exited, fault_ms)
+    judge(
+        services,
+        app,
+        ending.complete,
+        ending.atld_exited,
+        fault_ms,
+        ending.app_end,
+    )
 }
 
 /// Copies a run's logs to `to`: the app's and the services' logs (`root/log`), and atld's log and end record (`END_FILES`). Files the run did not write are skipped.
@@ -1180,14 +1233,27 @@ fn scene_counts(app: &str) -> String {
 
 /// The run's verdict over its two logs, about the last activity the app resumed: the services are settled (nothing pending after that resume), no fault in the app log within
 /// `watch_ms` after it (`atld_exited` is a fault at the window's end), the watch was run to its end (`complete`), and a frame was presented after it.
-/// Ok: the pass line; Err: the first failed part.
+/// `app_end` ([`app_end`]): the app ended normally, so the run may end early, atld's exit is that end, and a self-kill line is no fault (a FATAL still is). Ok: the pass line, naming that end; Err: the first failed part.
 fn judge(
     services: &str,
     app: &str,
     complete: bool,
     atld_exited: bool,
     watch_ms: u64,
+    app_end: Option<&str>,
 ) -> Result<String, String> {
+    let no_self_kill;
+    let (app, atld_exited) = match app_end {
+        Some(_) => {
+            no_self_kill = app
+                .lines()
+                .filter(|l| !l.contains("Sending signal"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            (no_self_kill.as_str(), false)
+        }
+        None => (app, atld_exited),
+    };
     let Some(last) = last_resumed(services) else {
         return Err(
             "no activity resumed: the services log has no `services: activity resumed` line"
@@ -1203,7 +1269,7 @@ fn judge(
     if let Some(fault) = window::fault_after(app, last.ms, watch_ms, last.ms, atld_exited) {
         return Err(format!("{fault} (last resumed: {})", last.class));
     }
-    if !complete {
+    if !complete && app_end.is_none() {
         return Err(format!(
             "the run ended before the {watch_ms} ms watch after {} was over",
             last.class
@@ -1217,8 +1283,9 @@ fn judge(
             scene_counts(app)
         ));
     }
+    let ended = app_end.map_or_else(String::new, |e| format!("; ended: {e}"));
     Ok(format!(
-        "onResume of {} at {}, {frames} frame(s) presented after it, settled, no fault in the {watch_ms} ms after it",
+        "onResume of {} at {}, {frames} frame(s) presented after it, settled, no fault in the {watch_ms} ms after it{ended}",
         last.class,
         window::stamp_text(last.ms)
     ))
@@ -1421,13 +1488,13 @@ mod tests {
     #[test]
     fn judge_passes_a_resumed_presenting_app() {
         let app = format!("100.500 I tag: onCreate\n{PRESENT}");
-        assert!(judge(RESUME, &app, true, false, 2_000).is_ok());
+        assert!(judge(RESUME, &app, true, false, 2_000, None).is_ok());
     }
 
     #[test]
     fn judge_fails_each_missing_or_broken_part() {
         let err = |services: &str, app: &str, complete: bool, atld_exited: bool| {
-            judge(services, app, complete, atld_exited, 2_000).unwrap_err()
+            judge(services, app, complete, atld_exited, 2_000, None).unwrap_err()
         };
         assert!(err("", PRESENT, true, false).contains("no activity resumed"));
         assert!(err(RESUME, "100.500 I tag: x\n", true, false).contains("no frame presented"));
@@ -1448,7 +1515,7 @@ mod tests {
                         services: activity settled at=1793887598.644\n";
         let app = "1793887559.900 D atl-composer: ui: present n=1 time_ns=1\n\
                    1793887598.710 E AndroidRuntime: FATAL EXCEPTION: main\n";
-        let err = judge(services, app, true, false, 2_000).unwrap_err();
+        let err = judge(services, app, true, false, 2_000, None).unwrap_err();
         assert!(
             err.contains("FATAL EXCEPTION") && err.contains("MainActivity"),
             "{err}"
@@ -1462,7 +1529,7 @@ mod tests {
                         services: activity unsettled at=103.000\n\
                         services: activity resumed org.x.Main at=103.500\n\
                         services: activity settled at=103.501\n";
-        let err = judge(services, PRESENT, true, false, 2_000).unwrap_err();
+        let err = judge(services, PRESENT, true, false, 2_000, None).unwrap_err();
         assert!(err.contains("no frame presented after org.x.Main"), "{err}");
     }
 
@@ -1470,12 +1537,12 @@ mod tests {
     #[test]
     fn no_frame_failure_names_the_composer_scene_counts() {
         let app = "100.900  INFO composer: counters ticks=9 buffers_acquired=90159 scenes=90163 scenes_taken=0 scenes_dropped=90161 presents_refused=0\n";
-        let err = judge(RESUME, app, true, false, 2_000).unwrap_err();
+        let err = judge(RESUME, app, true, false, 2_000, None).unwrap_err();
         assert!(
             err.contains("buffers_acquired=90159 scenes=90163 scenes_taken=0 scenes_dropped=90161"),
             "{err}"
         );
-        let err = judge(RESUME, "100.500 I tag: x\n", true, false, 2_000).unwrap_err();
+        let err = judge(RESUME, "100.500 I tag: x\n", true, false, 2_000, None).unwrap_err();
         assert!(err.contains("no `composer: counters` line"), "{err}");
     }
 
@@ -1488,7 +1555,7 @@ mod tests {
     #[test]
     fn judge_ignores_a_fault_after_the_watch() {
         let app = format!("{PRESENT}102.500 E AndroidRuntime: FATAL EXCEPTION: main\n");
-        assert!(judge(RESUME, &app, true, false, 2_000).is_ok());
+        assert!(judge(RESUME, &app, true, false, 2_000, None).is_ok());
     }
 
     /// A remote run's watch is complete when the target's end came `watch_ms` after the resume (both on the target's clock): RESUME's resume is at 100 000 ms, so a 2 s watch is over at 102 000 ms.
@@ -1515,9 +1582,131 @@ mod tests {
             complete: watch_complete(RESUME, 2_000, end_ms),
             atld_exited: false,
             end_ms,
+            app_end: None,
         };
         assert!(judge_ending(RESUME, PRESENT, &ending(102_000), 2_000, false).is_ok());
         let err = judge_ending(RESUME, PRESENT, &ending(101_000), 2_000, false).unwrap_err();
         assert!(err.contains("ended before"), "{err}");
+    }
+
+    /// A run that ended early, atld gone by itself (the play sessions' shapes, play-session.md sessions 3-4), judged as run-apk judges it: the watch is the --hold's 14400 s.
+    fn ended_run(services: &str, app: &str, atld_log: &str) -> Result<String, String> {
+        let ending = Ending {
+            complete: false,
+            atld_exited: true,
+            end_ms: 0,
+            app_end: app_end(services, atld_log),
+        };
+        judge_ending(services, app, &ending, 14_400_000, false)
+    }
+
+    const AB2_UP: &str = "services: activity resumed com.rovio.abba.vkquality.VkQualityActivity at=1794924856.299\n\
+                          services: activity settled at=1794924856.299\n";
+    const AB2_PRESENT: &str = "1794924857.000 D atl-composer: ui: present n=1 time_ns=1\n";
+
+    /// AB2 (session 4, s4-ab2b): the owner closed the window, the services killed the app after the removal; FAILED `atld exited inside the window` before, now ok.
+    #[test]
+    fn a_closed_window_is_a_normal_end() {
+        let services = format!(
+            "{AB2_UP}services: removeTask task 1 of uid 10002\n\
+             services: activity remove task 1 wait=true at=1794925013.410\n\
+             services: task 1 removed: killing com.rovio.baba pids [89975] at=1794925014.411\n\
+             services: activity settled at=1794925014.540\n\
+             services: process com.rovio.baba (pid 89975) died\n\
+             services: last app process ended: pid 89975 finished at=1794925014.600\n"
+        );
+        let atld = "atld: process 89975 ended: exit status: 137 (signal 9)\n";
+        let ok = ended_run(&services, AB2_PRESENT, atld).expect("a close is a normal end");
+        assert!(ok.ends_with("ended: window closed"), "{ok}");
+    }
+
+    /// Battle Cats TW (session 4, s4-bctw2): after the close the app's onDestroy kills its own process (`Sending signal ... SIG: 9`); FAILED `the process was killed` before, now ok.
+    #[test]
+    fn a_self_kill_after_the_close_is_no_fault() {
+        let services = "services: activity resumed jp.co.ponos.battlecats.MyActivity at=1794927342.607\n\
+                        services: activity settled at=1794927342.607\n\
+                        services: removeTask task 1 of uid 10002\n\
+                        services: activity settled at=1794927510.346\n\
+                        services: process jp.co.ponos.battlecatstw (pid 89339) died\n\
+                        services: last app process ended: pid 89339 finished at=1794927510.450\n";
+        let app = "1794927343.000 D atl-composer: ui: present n=1 time_ns=1\n\
+                   1794927510.398 I liblog/Process: Sending signal. PID: 2 SIG: 9\n";
+        let atld = "atld: process 89339 ended: exit status: 137 (signal 9)\n";
+        let ok = ended_run(services, app, atld).expect("a self-kill after finish is no crash");
+        assert!(ok.ends_with("ended: window closed"), "{ok}");
+        // without the services' line (the old log), the same app log is the old FAILED
+        let old = services.replace(
+            "services: last app process ended: pid 89339 finished at=1794927510.450\n",
+            "",
+        );
+        assert!(
+            ended_run(&old, app, atld)
+                .unwrap_err()
+                .contains("the process was killed")
+        );
+    }
+
+    /// An app that finishes its last activity itself (no removeTask): the same normal end, named so.
+    #[test]
+    fn finishing_the_last_activity_is_a_normal_end() {
+        let services = format!(
+            "{AB2_UP}services: process com.rovio.baba (pid 89975) died\n\
+             services: last app process ended: pid 89975 finished at=1794925014.600\n"
+        );
+        let atld = "atld: process 89975 ended: exit status: 137 (signal 9)\n";
+        let ok = ended_run(&services, AB2_PRESENT, atld).expect("normal end");
+        assert!(
+            ok.ends_with("ended: app finished its last activity"),
+            "{ok}"
+        );
+    }
+
+    /// Cut the Rope 3's quit dialog: the process exits 0 with its activity live. Exit 0 is the app's own end; any other status of a live death is not.
+    #[test]
+    fn an_exit_0_with_a_live_activity_is_a_normal_end() {
+        let services = format!(
+            "{AB2_UP}services: process com.zeptolab.ctr.ads (pid 5150) died\n\
+             services: last app process ended: pid 5150 live at=1794925014.600\n"
+        );
+        let ok = ended_run(
+            &services,
+            AB2_PRESENT,
+            "atld: process 5150 ended: exit status: 0\n",
+        )
+        .expect("exit 0 is a normal end");
+        assert!(ok.ends_with("ended: app exited 0"), "{ok}");
+        let err = ended_run(
+            &services,
+            AB2_PRESENT,
+            "atld: process 5150 ended: exit status: 1\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("atld exited"), "{err}");
+    }
+
+    /// Temple Run (session 4, s4-tr): a FATAL EXCEPTION then the runtime's self-kill, with the activity live: still FAILED, naming the FATAL.
+    #[test]
+    fn a_crash_stays_failed() {
+        let services = "services: activity resumed com.bytedance.sdk.openadsdk.activity.single.TTRewardVideoActivity at=1794924375.857\n\
+                        services: activity settled at=1794924375.857\n\
+                        services: process com.imangi.templerun (pid 700) died\n\
+                        services: last app process ended: pid 700 live at=1794924377.600\n";
+        let app = "1794924375.900 D atl-composer: ui: present n=1 time_ns=1\n\
+                   1794924376.129 E AndroidRuntime: FATAL EXCEPTION: main\n\
+                   1794924377.577 I liblog/Process: Sending signal. PID: 2 SIG: 9\n";
+        let atld = "atld: process 700 ended: exit status: 137 (signal 9)\n";
+        assert!(app_end(services, atld).is_none());
+        let err = ended_run(services, app, atld).unwrap_err();
+        assert!(err.starts_with("FATAL EXCEPTION at +272 ms"), "{err}");
+        // a signal while the activity is live, no FATAL: still the kill
+        let killed = app.replace(
+            "1794924376.129 E AndroidRuntime: FATAL EXCEPTION: main\n",
+            "",
+        );
+        assert!(
+            ended_run(services, &killed, atld)
+                .unwrap_err()
+                .contains("the process was killed")
+        );
     }
 }

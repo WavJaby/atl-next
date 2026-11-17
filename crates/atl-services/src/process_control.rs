@@ -17,6 +17,8 @@ pub trait ProcessControl: Send + Sync {
     fn kill(&self, pid: i32) -> io::Result<()>;
     /// The pid a process this control started has in its own sandbox: what it reads as Process.myPid().
     fn program_pid(&self, pid: i32) -> io::Result<i32>;
+    /// The death of `pid` ended the last app (control `LastAppEnded`); the host decides whether the run ends.
+    fn last_app_ended(&self, pid: i32, finished: bool) -> io::Result<()>;
 }
 
 /// The control socket's install half (installd's role): staging + the installer run, then the commit (the services' boot-time install, system_services.rs).
@@ -153,6 +155,16 @@ impl ProcessControl for ControlSocket {
             Response::ProgramPid { pid } => Ok(pid),
             Response::Error { message } => Err(io::Error::other(message)),
             other => Err(io::Error::other(format!("program pid answered {other:?}"))),
+        }
+    }
+
+    fn last_app_ended(&self, pid: i32, finished: bool) -> io::Result<()> {
+        match self.call(&Request::LastAppEnded { pid, finished })? {
+            Response::Noted => Ok(()),
+            Response::Error { message } => Err(io::Error::other(message)),
+            other => Err(io::Error::other(format!(
+                "last app ended answered {other:?}"
+            ))),
         }
     }
 }
