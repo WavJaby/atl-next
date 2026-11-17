@@ -5,8 +5,8 @@
 //! the zip itself through `unzip` (the `lib/<abi>/` entries, their names and sha256); the device's ABI list and SDK from the property set the installer maps (`ro.product.cpu.abilist`, `ro.build.version.sdk`).
 //!
 //! Checks:
-//! 1. `alto`: the altos-odyssey row (google-play: base + config.x86_64, both already in the test-APK cache and verified here by sha256) -> package, versionCode and split names equal aapt2's; the full parse equals its oracle; primary ABI = the first device ABI the row's zip carries (x86_64);
-//!    the lib dir `<root>/<isa>` holds exactly the zip's `lib/x86_64/` files, same sha256.
+//! 1. `alto`: the altos-odyssey row (google-play: base + config.arm64_v8a, both already in the test-APK cache and verified here by sha256) -> package, versionCode and split names equal aapt2's; the full parse equals its oracle; primary ABI = the first device ABI the row's zip carries (arm64-v8a, a native-bridge ABI of the device list);
+//!    the lib dir `<root>/<isa>` holds exactly the zip's `lib/arm64-v8a/` files, same sha256.
 //! 2. `single`: the fossify-notes row (one APK, downloaded on first use) -> as check 1, no split; its manifest says extractNativeLibs=false, so the primary ABI is the first device ABI its zip carries (x86_64) and nothing is copied (lib-dir none, the libraries stay in the APK).
 //! 3. `rich`: the material-catalog row (services, receivers, providers, permissions) -> as check 2.
 //! 4. `refuse-version`, `refuse-package`: fossify-notes' base + a split linked here by aapt2 whose versionCode (base + 1) or package (base + `.other`) differs -> AOSP's own check refuses (`Inconsistent version` / `Inconsistent package`, PackageManager INSTALL_PARSE_FAILED_BAD_MANIFEST -101), the installer exits non-zero.
@@ -19,7 +19,7 @@
 //! 7. `alto-corrupt-length`, `alto-truncated-parcel`: check 1's output with its first frame length past the end, and with the PackageInfo parcel cut by 8 bytes -> the decode refuses each by name, decoding nothing.
 //!
 //! Measured: the installer's VM start, lite parse, full parse and natives times (its stderr `time-ms` line) and the process wall time of each run.
-//! Breaks: `--break drop-split` (check 1's dir without its split: splits, primary ABI and libraries must turn red); `--break abi-arm64` (the device's ABI lists are arm64-v8a only: AOSP's no-match, `native error -113`, must turn check 1 red);
+//! Breaks: `--break drop-split` (check 1's dir without its split: splits, primary ABI and libraries must turn red); `--break abi-x86_64` (the device's ABI lists are x86_64 only, so the row's arm64 libraries match nothing: AOSP's no-match, `native error -113`, must turn check 1 red);
 //! `--break feature` (check 6's installer is told the device has android.hardware.camera: the forwarder's hasFeature answers true, uses-permission must turn red);
 //! `--break libraries` (check 8's installer parses a variant with the optional library required and no instrumentation, against the original's oracle: uses-library and instrumentation must both turn red).
 //! Every installer run is spawned through the broker's installer profile (atl-broker `spawn_installer`, plan 4b M5): the runtime, framework-res, the api-impl dex and the package dir read-only at their own paths, one output dir read-write,
@@ -90,9 +90,9 @@ const BAD_MANIFEST: i32 = -101;
 const ABILIST: &str = "ro.product.cpu.abilist";
 const ABILIST32: &str = "ro.product.cpu.abilist32";
 const ABILIST64: &str = "ro.product.cpu.abilist64";
-/// Break `abi-arm64`: the device's only ABI, so Alto's x86_64 libraries match nothing (AOSP: INSTALL_FAILED_NO_MATCHING_ABIS, -113).
-const BREAK_ABI: &str = "abi-arm64";
-const BROKEN_DEVICE_ABI: &str = "arm64-v8a";
+/// Break `abi-x86_64`: the device's only ABI, so Alto's arm64 libraries match nothing (AOSP: INSTALL_FAILED_NO_MATCHING_ABIS, -113).
+const BREAK_ABI: &str = "abi-x86_64";
+const BROKEN_DEVICE_ABI: &str = "x86_64";
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -105,10 +105,10 @@ pub struct Args {
     /// Native build directory (default: this checkout's build dir; else <workspace>/out/native/<host>).
     #[arg(long)]
     out: Option<PathBuf>,
-    /// Deliberate break that must turn the gate red with the refusal named (module doc): `drop-split`, `abi-arm64` (check 1: no config split in the dir; the device's ABI lists are arm64-v8a only), `feature` (check 6: the installer is told the device has android.hardware.camera),
+    /// Deliberate break that must turn the gate red with the refusal named (module doc): `drop-split` (check 1: no config split in the dir), `abi-x86_64` (check 1: the device's ABI lists are x86_64 only, so the row's arm64 libraries match nothing), `feature` (check 6: the installer is told the device has android.hardware.camera),
     /// `read-outside`, `write-outside`, `no-framework-res` (check 1's view lacks its package dir / its output dir is read-only / framework-res), `net` (the probe in the profile reaches for TCP).
     /// `libraries` (check 8's installer parses an APK whose optional library is required and which has no instrumentation; the oracle stays the original's).
-    #[arg(long, value_parser = ["drop-split", "abi-arm64", "feature", BREAK_LIBRARIES, BREAK_READ_OUTSIDE, BREAK_WRITE_OUTSIDE, BREAK_NO_FRAMEWORK, BREAK_NET])]
+    #[arg(long, value_parser = ["drop-split", "abi-x86_64", "feature", BREAK_LIBRARIES, BREAK_READ_OUTSIDE, BREAK_WRITE_OUTSIDE, BREAK_NO_FRAMEWORK, BREAK_NET])]
     r#break: Option<String>,
     /// Print each installer command and its output.
     #[arg(long)]
