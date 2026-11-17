@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Machine-wide admission: a weighted pool of CPU slots and memory (GiB). Heavy work holds a [`Grant`] around one leaf (a ninja build, a cargo run) and releases it after.
 //! A slot is an exclusive `flock` on `<workspace>/cache/build-pool/cpu-<i>` or `mem-<i>`: the kernel drops it when the holder's file closes, so exit, error, panic and SIGKILL all free it -- no stale-lock cleanup exists or is needed.
-//! Waiters queue as tickets in `cache/build-pool/queue/`; the oldest live ticket is served first, so a large request is not starved by small ones behind it.
+//! Waiters queue as tickets in `cache/build-pool/queue/`, served in (tier, arrival) order ([`Tier`]: the owner's main checkout, then land, then agents), so a large request is not starved by small ones behind it; a ticket waiting past `starve_after_s` joins the top tier at its arrival. No grant is preempted: priority decides only who is admitted next.
 //! Light work takes a free CPU slot at once when the queue head could not use it (`bypass_allowed`); otherwise it queues like heavy work.
 //! A grant takes CPU elastically (the free slots up to the class max, at least its min); the count is the tool's job count (ninja `-j`, cargo `CARGO_BUILD_JOBS`).
 //! Nested admission is refused: a thread holding a grant, or a process with a holder among its ancestors, would wait for slots its own holder keeps.
@@ -147,15 +147,61 @@ pub fn held_jobs() -> Option<u32> {
     HELD.with(|h| h.borrow().as_ref().map(|(_, cpu)| *cpu))
 }
 
-/// Takes `class` for checkout `who` in workspace `ws`, waiting its turn. Prints the wait once (`pool: ...`) and the grant when it waited.
+/// Admission tier of a queue ticket: served in (tier, arrival) order. Like a scheduler's nice level, but at admission: the pool admits by slots, so priority decides who is admitted next, never what a running grant gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Tier {
+    /// The owner at the main checkout (a game launch, a native the owner waits on).
+    Interactive,
+    /// The land worktree: its verify gates main for everyone.
+    Land,
+    /// Every other worktree: agents' builds and checks.
+    Agent,
+}
+
+impl Tier {
+    /// Derived from the checkout, no flag or environment: the main checkout is the owner's (agents never build there, project rule), the land worktree is land's, every other checkout an agent's. A path that is no checkout (tests, a broken git dir) is an agent's: no tier is gained by failing.
+    pub fn of(who: &Path) -> Tier {
+        match crate::out::checkout_id(who).as_deref() {
+            Ok(crate::out::MAIN_ID) => Tier::Interactive,
+            Ok(crate::out::LAND_ID) => Tier::Land,
+            _ => Tier::Agent,
+        }
+    }
+
+    /// The ticket name's first byte: names sort as (tier, arrival) for every reader, old binaries included (a pre-tier name starts with a digit then a digit, which sorts after `0-` and before `1-`).
+    fn digit(self) -> char {
+        match self {
+            Tier::Interactive => '0',
+            Tier::Land => '1',
+            Tier::Agent => '2',
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Tier::Interactive => "interactive",
+            Tier::Land => "land",
+            Tier::Agent => "agent",
+        }
+    }
+}
+
+/// Grants admitted ahead of an earlier-arrived live ticket (by tier or by promotion), and tickets promoted for waiting past `starve_after_s`, in this process: the counters the log lines carry.
+pub static ADMITTED_AHEAD: AtomicU64 = AtomicU64::new(0);
+pub static PROMOTED: AtomicU64 = AtomicU64::new(0);
+
+/// Takes `class` for checkout `who` in workspace `ws`, waiting its turn ([`Tier::of`] `who`). Prints the wait once (`pool: ...`) and the grant when it waited.
 pub fn acquire(ws: &Path, who: &Path, class: Class) -> Result<Grant> {
-    acquire_with(ws, who, class, POLL, &mut |line| println!("{line}"))
+    acquire_with(ws, who, class, Tier::of(who), POLL, &mut |line| {
+        println!("{line}")
+    })
 }
 
 fn acquire_with(
     ws: &Path,
     who: &Path,
     class: Class,
+    tier: Tier,
     poll: Duration,
     report: &mut dyn FnMut(&str),
 ) -> Result<Grant> {
@@ -170,24 +216,51 @@ fn acquire_with(
     // heavy work queues at once; light queues only when it would take a slot the head needs (`bypass_allowed`)
     let mut ticket = match class {
         Class::Light => None,
-        _ => Some(Ticket::new(&queue, std::process::id(), class)?),
+        _ => Some(Ticket::new(&queue, std::process::id(), class, tier)?),
     };
     let started = Instant::now();
+    let starve_after = Duration::from_secs(pool.starve_after_s.value.into());
     let mut waited = false;
     loop {
+        // starvation bound: a ticket waiting past it joins the top tier at its arrival, so later interactive tickets queue behind it
+        if let Some(t) = &mut ticket
+            && t.tier != Tier::Interactive
+            && started.elapsed() >= starve_after
+        {
+            t.promote(&queue)?;
+            PROMOTED.fetch_add(1, Ordering::Relaxed);
+            report(&format!(
+                "pool: {} ticket promoted from tier {} after {:.1} s (starve_after_s {})",
+                class.name(),
+                tier.name(),
+                started.elapsed().as_secs_f64(),
+                pool.starve_after_s.value
+            ));
+        }
         let tickets = live_tickets(&queue)?;
         let queue_state = if let Some(t) = &ticket {
             Some(queue_position(&tickets, &t.name))
         } else if bypass_allowed(&dir, &pool, &tickets)? {
             None
         } else {
-            ticket = Some(Ticket::new(&queue, std::process::id(), class)?);
+            ticket = Some(Ticket::new(&queue, std::process::id(), class, tier)?);
             continue;
         };
         // the head of the queue gathers; nobody behind it is served
         if queue_state.is_none_or(|(ahead, _)| ahead == 0)
             && let Some((cpu, files)) = try_grant(&dir, &pool, w, &record)?
         {
+            if let Some(t) = &ticket {
+                let passed = passed_earlier(&tickets, &t.name);
+                if passed > 0 {
+                    ADMITTED_AHEAD.fetch_add(1, Ordering::Relaxed);
+                    report(&format!(
+                        "pool: {} tier {} admitted ahead of {passed} earlier ticket(s)",
+                        class.name(),
+                        t.tier.name()
+                    ));
+                }
+            }
             let waited = if waited {
                 let took = started.elapsed();
                 report(&format!(
@@ -352,17 +425,18 @@ fn parent_pid(stat: &str) -> Option<u32> {
 struct Ticket {
     path: PathBuf,
     name: String,
+    tier: Tier,
     _lock: Flock,
 }
 
 impl Ticket {
-    /// Named by arrival time, pid and a counter, so names sort in arrival order. Written under `tmp-` with the class name, locked, then renamed.
-    fn new(queue: &Path, pid: u32, class: Class) -> Result<Ticket> {
+    /// Named by tier, arrival time, pid and a counter, so names sort in (tier, arrival) order. Written under `tmp-` with the class name, locked, then renamed.
+    fn new(queue: &Path, pid: u32, class: Class, tier: Tier) -> Result<Ticket> {
         let seq = TICKETS.fetch_add(1, Ordering::Relaxed);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
-        let name = format!("{nanos:020}-{pid:010}-{seq:010}");
+        let name = format!("{}-{nanos:020}-{pid:010}-{seq:010}", tier.digit());
         let tmp = queue.join(format!("tmp-{name}"));
         let lock = OpenOptions::new()
             .read(true)
@@ -381,9 +455,38 @@ impl Ticket {
         Ok(Ticket {
             path,
             name,
+            tier,
             _lock: lock,
         })
     }
+
+    /// Moves the ticket into the top tier, keeping its arrival: a rename, so the waiter's lock (on the open file) stays and readers see one name or the other.
+    fn promote(&mut self, queue: &Path) -> Result<()> {
+        let name = format!("{}-{}", Tier::Interactive.digit(), arrival(&self.name));
+        let path = queue.join(&name);
+        std::fs::rename(&self.path, &path)
+            .with_context(|| format!("promoting {}", self.path.display()))?;
+        self.path = path;
+        self.name = name;
+        self.tier = Tier::Interactive;
+        Ok(())
+    }
+}
+
+/// A ticket name without its tier: `<nanos>-<pid>-<seq>`, the arrival order. A pre-tier name is all arrival.
+fn arrival(name: &str) -> &str {
+    match name.split_once('-') {
+        Some((tier, rest)) if tier.len() == 1 => rest,
+        _ => name,
+    }
+}
+
+/// Live tickets that arrived before `me` but sort after it: the ones a grant to `me` passes.
+fn passed_earlier(tickets: &[(String, Option<Class>)], me: &str) -> usize {
+    tickets
+        .iter()
+        .filter(|(name, _)| name.as_str() > me && arrival(name) < arrival(me))
+        .count()
 }
 
 impl Drop for Ticket {
@@ -694,12 +797,16 @@ mod tests {
     }
 
     fn contender(ws: &Path, who: &'static str, class: Class) -> Contender {
+        contender_at(ws, who, class, Tier::Agent)
+    }
+
+    fn contender_at(ws: &Path, who: &'static str, class: Class, tier: Tier) -> Contender {
         let (wtx, waits) = mpsc::channel();
         let (gtx, granted) = mpsc::channel();
         let (release, rrx) = mpsc::channel::<()>();
         let ws = ws.to_owned();
         std::thread::spawn(move || {
-            let grant = acquire_with(&ws, Path::new(who), class, FAST, &mut |line| {
+            let grant = acquire_with(&ws, Path::new(who), class, tier, FAST, &mut |line| {
                 let _ = wtx.send(line.to_owned());
             })
             .expect("acquire");
@@ -776,9 +883,14 @@ mod tests {
                 "[pool]\ncpu_slots = 1\nmem_gib = 1\n[pool.cargo]\ncpu_min = 1\ncpu_max = 1\nmem_gib = 0\n",
             ),
         );
-        let holder = acquire_with(&ws, Path::new("holder"), Class::Cargo, FAST, &mut |_| {
-            panic!("holder waited")
-        })
+        let holder = acquire_with(
+            &ws,
+            Path::new("holder"),
+            Class::Cargo,
+            Tier::Agent,
+            FAST,
+            &mut |_| panic!("holder waited"),
+        )
         .unwrap();
         let mut queued = Vec::new();
         for who in ["a", "b", "c"] {
@@ -866,9 +978,15 @@ mod tests {
                 let who = format!("stream-{i}");
                 std::thread::spawn(move || {
                     while !stop.load(Ordering::Relaxed) {
-                        let grant =
-                            acquire_with(&ws, Path::new(&who), Class::Light, FAST, &mut |_| {})
-                                .expect("light acquire");
+                        let grant = acquire_with(
+                            &ws,
+                            Path::new(&who),
+                            Class::Light,
+                            Tier::Agent,
+                            FAST,
+                            &mut |_| {},
+                        )
+                        .expect("light acquire");
                         std::thread::sleep(HOLD);
                         drop(grant);
                     }
@@ -908,6 +1026,109 @@ mod tests {
         assert!(!may_bypass(head, &snap(4, 7)));
         // memory short: the head cannot be granted anyway
         assert!(may_bypass(head, &snap(1, 6)));
+    }
+
+    /// Ticket names sort as (tier, arrival): a later interactive ticket before an earlier land and agent one, a later land before an earlier agent; a pre-tier name (all digits) sorts after interactive and before land.
+    #[test]
+    fn tickets_order_by_tier_then_arrival() {
+        let agent_early = "2-01794900000000000001-0000000001-0000000000";
+        let land_mid = "1-01794900000000000002-0000000002-0000000000";
+        let interactive_late = "0-01794900000000000003-0000000003-0000000000";
+        let pre_tier = "01794900000000000000-0000000004-0000000000";
+        let mut names = vec![agent_early, land_mid, interactive_late, pre_tier];
+        names.sort();
+        assert_eq!(names, [interactive_late, pre_tier, land_mid, agent_early]);
+        let tickets: Vec<(String, Option<Class>)> =
+            names.iter().map(|n| ((*n).to_owned(), None)).collect();
+        assert_eq!(queue_position(&tickets, interactive_late), (0, 4));
+        // the interactive ticket passes the three that arrived before it; the agent passes none
+        assert_eq!(passed_earlier(&tickets, interactive_late), 3);
+        assert_eq!(passed_earlier(&tickets, agent_early), 0);
+        assert_eq!(
+            arrival(interactive_late),
+            "01794900000000000003-0000000003-0000000000"
+        );
+        assert_eq!(arrival(pre_tier), pre_tier);
+    }
+
+    /// Mixed classes: an interactive cargo request that arrives after an agent's native-full ticket is admitted first once slots free, says so, and the agent's full native waits on.
+    #[test]
+    fn interactive_ticket_is_admitted_ahead_of_an_earlier_agent() {
+        let ws = scratch_ws(
+            "tier-ahead",
+            Some(
+                "[pool]\ncpu_slots = 8\nmem_gib = 8\n[pool.native-full]\ncpu_min = 8\ncpu_max = 8\nmem_gib = 7\n[pool.cargo]\ncpu_min = 4\ncpu_max = 4\nmem_gib = 1\n",
+            ),
+        );
+        let blocker = contender(&ws, "blocker", Class::NativeFull);
+        assert_eq!(blocker.granted.recv_timeout(WAIT).unwrap(), "cpu 8 mem 7");
+        let agent = contender(&ws, "agent", Class::NativeFull);
+        agent
+            .waits
+            .recv_timeout(WAIT)
+            .expect("the agent did not queue");
+        let owner = contender_at(&ws, "owner", Class::Cargo, Tier::Interactive);
+        owner
+            .waits
+            .recv_timeout(WAIT)
+            .expect("the owner did not wait for the blocker");
+        blocker.release.send(()).unwrap();
+        assert_eq!(owner.granted.recv_timeout(WAIT).unwrap(), "cpu 4 mem 1");
+        let lines: Vec<String> = owner.waits.try_iter().collect();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "pool: cargo tier interactive admitted ahead of 1 earlier ticket(s)"),
+            "{lines:?}"
+        );
+        assert!(
+            agent.granted.recv_timeout(STILL_WAITING).is_err(),
+            "the agent took cpu the owner holds"
+        );
+        owner.release.send(()).unwrap();
+        assert_eq!(agent.granted.recv_timeout(WAIT).unwrap(), "cpu 8 mem 7");
+    }
+
+    /// Starvation bound: an agent ticket stuck behind an interactive ticket that never leaves (a waiter that gathers nothing) is promoted after `starve_after_s`, then heads the queue by its earlier arrival and is granted.
+    #[test]
+    fn a_starved_agent_ticket_is_promoted_and_granted() {
+        let ws = scratch_ws(
+            "tier-starve",
+            Some(
+                "[pool]\ncpu_slots = 4\nmem_gib = 4\nstarve_after_s = 1\n[pool.cargo]\ncpu_min = 1\ncpu_max = 4\nmem_gib = 1\n",
+            ),
+        );
+        let queue = dir(&ws).join("queue");
+        // all slots held so the agent queues first, then a later interactive ticket heads the queue
+        let pool = ws_config::load(&ws).unwrap().pool;
+        let all = ClassWeight {
+            cpu_min: 4,
+            cpu_max: 4,
+            mem_gib: 4,
+        };
+        std::fs::create_dir_all(&queue).unwrap();
+        let (_, held) = try_grant(&dir(&ws), &pool, all, "holder pid 1 class test")
+            .unwrap()
+            .expect("empty pool");
+        let agent = contender(&ws, "agent", Class::Cargo);
+        agent
+            .waits
+            .recv_timeout(WAIT)
+            .expect("the agent did not queue");
+        let stuck = Ticket::new(&queue, 1, Class::NativeFull, Tier::Interactive).unwrap();
+        drop(held);
+        let lines: Vec<String> = std::iter::from_fn(|| agent.waits.recv_timeout(WAIT).ok())
+            .take_while(|l| !l.contains("promoted"))
+            .collect();
+        assert!(
+            !lines.iter().any(|l| l.contains("granted")),
+            "granted before promotion: {lines:?}"
+        );
+        agent
+            .granted
+            .recv_timeout(WAIT)
+            .expect("promoted ticket not granted");
+        drop(stuck);
     }
 
     /// Memory admits two full natives (7 GiB each of 20) and not a third; the third's wait line names the memory.
@@ -985,18 +1206,25 @@ mod tests {
     fn same_thread_acquire_under_a_grant_is_refused() {
         let ws = scratch_ws("nest-thread", Some(CONFIG_ONE_CPU));
         let who = Path::new("nest");
-        let grant = acquire_with(&ws, who, Class::Light, FAST, &mut |_| panic!("waited")).unwrap();
+        let grant = acquire_with(&ws, who, Class::Light, Tier::Agent, FAST, &mut |_| {
+            panic!("waited")
+        })
+        .unwrap();
         assert_eq!(held_jobs(), Some(1));
-        let e = acquire_with(&ws, who, Class::Light, FAST, &mut |_| panic!("waited"))
-            .expect_err("a nested acquire must be refused");
+        let e = acquire_with(&ws, who, Class::Light, Tier::Agent, FAST, &mut |_| {
+            panic!("waited")
+        })
+        .expect_err("a nested acquire must be refused");
         assert!(
             format!("{e:#}").contains("nested admission refused"),
             "{e:#}"
         );
         drop(grant);
         assert_eq!(held_jobs(), None);
-        acquire_with(&ws, who, Class::Light, FAST, &mut |_| panic!("waited"))
-            .expect("admitted again after the release");
+        acquire_with(&ws, who, Class::Light, Tier::Agent, FAST, &mut |_| {
+            panic!("waited")
+        })
+        .expect("admitted again after the release");
     }
 
     const CONFIG_ONE_CPU: &str = "[pool]\ncpu_slots = 1\nmem_gib = 20\n";
@@ -1006,9 +1234,14 @@ mod tests {
     #[ignore = "run by ancestor_holder_refuses_a_nested_acquire"]
     fn helper_holder() {
         let ws = PathBuf::from(std::env::var_os("POOL_TEST_WS").expect("set by the test"));
-        let _grant = acquire_with(&ws, Path::new("holder"), Class::Light, FAST, &mut |_| {
-            panic!("holder waited")
-        })
+        let _grant = acquire_with(
+            &ws,
+            Path::new("holder"),
+            Class::Light,
+            Tier::Agent,
+            FAST,
+            &mut |_| panic!("holder waited"),
+        )
         .unwrap();
         let status = Command::new(std::env::current_exe().unwrap())
             .args([
@@ -1028,9 +1261,14 @@ mod tests {
     #[ignore = "run by helper_holder"]
     fn helper_nested() {
         let ws = PathBuf::from(std::env::var_os("POOL_TEST_WS").expect("set by the test"));
-        let e = acquire_with(&ws, Path::new("nested"), Class::Light, FAST, &mut |_| {
-            panic!("nested waited")
-        })
+        let e = acquire_with(
+            &ws,
+            Path::new("nested"),
+            Class::Light,
+            Tier::Agent,
+            FAST,
+            &mut |_| panic!("nested waited"),
+        )
         .expect_err("a child of the holder must be refused");
         assert!(
             format!("{e:#}").contains("nested admission refused"),
@@ -1080,9 +1318,14 @@ mod tests {
     #[test]
     fn class_larger_than_the_pool_is_refused_not_waited_for() {
         let ws = scratch_ws("fits", Some("[pool]\ncpu_slots = 4\nmem_gib = 20\n"));
-        let e = acquire_with(&ws, Path::new("big"), Class::NativeFull, FAST, &mut |_| {
-            panic!("waited")
-        })
+        let e = acquire_with(
+            &ws,
+            Path::new("big"),
+            Class::NativeFull,
+            Tier::Agent,
+            FAST,
+            &mut |_| panic!("waited"),
+        )
         .expect_err("must refuse");
         assert!(
             format!("{e:#}").contains("needs cpu_min 8 but the pool has 4"),

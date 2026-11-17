@@ -6,6 +6,7 @@
 //! [pool]                   # machine-wide admission (build_pool.rs)
 //! cpu_slots = 16          # concurrent jobs machine-wide (default: the CPU count)
 //! mem_gib = 20            # memory reservable by admitted work
+//! starve_after_s = 7200   # a ticket waiting this long joins the top tier (build_pool.rs Tier)
 //! [pool.native-full]      # per class: CPU min..max (elastic) and GiB reserved
 //! cpu_min = 8
 //! cpu_max = 16
@@ -69,6 +70,10 @@ pub const DEFAULT_REFRESH_MIN_UPSTREAM_FILES: u32 = 1;
 /// `pool.mem_gib` (GiB): memory reservable by admitted work. 20 = the 24 GB WSL cap (owner 2026-11-14) minus a 4 GB floor for the kernel, page cache, WSLg and editors [est, re-measure under load].
 pub const DEFAULT_POOL_MEM_GIB: u32 = 20;
 
+/// `pool.starve_after_s`: a ticket waiting this long joins the top tier at its arrival (build_pool.rs `Tier`), so a stream of owner/land tickets cannot hold an agent's back forever.
+/// It must exceed the waits FIFO alone produces under load, else every ticket is promoted when the pool is busy and priority vanishes exactly then: the longest measured wait was 2250.8 s (2026-11-18, job s3-ab2, 6 tickets ahead behind two cold natives); 7200 s = ~3.2x that.
+pub const DEFAULT_POOL_STARVE_AFTER_S: u32 = 7200;
+
 /// `pool.cpu_slots` default: the host's CPU count (`available_parallelism`), 1 when unknown.
 fn default_cpu_slots() -> u32 {
     std::thread::available_parallelism().map_or(1, |n| u32::try_from(n.get()).unwrap_or(u32::MAX))
@@ -103,6 +108,8 @@ pub struct PoolConfig {
     pub cpu_slots: Setting<u32>,
     /// `pool.mem_gib`: memory reservable by admitted work.
     pub mem_gib: Setting<u32>,
+    /// `pool.starve_after_s`: the starvation bound of a lower-tier ticket, seconds.
+    pub starve_after_s: Setting<u32>,
     /// `pool.<class>`: every class, its default or the file's values.
     pub classes: BTreeMap<Class, ClassWeight>,
 }
@@ -232,6 +239,7 @@ fn defaults(path: PathBuf) -> WsConfig {
         pool: PoolConfig {
             cpu_slots: Setting::default(default_cpu_slots()),
             mem_gib: Setting::default(DEFAULT_POOL_MEM_GIB),
+            starve_after_s: Setting::default(DEFAULT_POOL_STARVE_AFTER_S),
             classes: Class::ALL
                 .into_iter()
                 .map(|c| (c, c.default_weight()))
@@ -294,7 +302,7 @@ pub fn parse(text: &str, path: &Path) -> Result<WsConfig> {
                     cfg.disk.pool_metadata_min_free = Setting::file(gib(value, &at)?);
                 }
                 _ => bail!(
-                    "{at} is not a known key (known: build.refresh_min_upstream_files, cache.sccache_size, fetch.for, disk.host_min_free, disk.host_compact_below, disk.workspace_min_free, disk.pool_min_free, disk.pool_metadata_min_free, pool.cpu_slots, pool.mem_gib, pool.<class>)"
+                    "{at} is not a known key (known: build.refresh_min_upstream_files, cache.sccache_size, fetch.for, disk.host_min_free, disk.host_compact_below, disk.workspace_min_free, disk.pool_min_free, disk.pool_metadata_min_free, pool.cpu_slots, pool.mem_gib, pool.starve_after_s, pool.<class>)"
                 ),
             }
         }
@@ -302,15 +310,16 @@ pub fn parse(text: &str, path: &Path) -> Result<WsConfig> {
     Ok(cfg)
 }
 
-/// One `[pool]` entry: `cpu_slots`, `mem_gib`, or a class table (`[pool.<class>]`: `cpu_min`, `cpu_max`, `mem_gib`; absent keys keep the class default).
+/// One `[pool]` entry: `cpu_slots`, `mem_gib`, `starve_after_s`, or a class table (`[pool.<class>]`: `cpu_min`, `cpu_max`, `mem_gib`; absent keys keep the class default).
 fn pool_key(pool: &mut PoolConfig, key: &str, value: &toml::Value, at: &str) -> Result<()> {
     match key {
         "cpu_slots" => pool.cpu_slots = Setting::file(count(value, at)?),
         "mem_gib" => pool.mem_gib = Setting::file(whole(value, at)?),
+        "starve_after_s" => pool.starve_after_s = Setting::file(count(value, at)?),
         _ => {
             let Some(class) = Class::from_name(key) else {
                 bail!(
-                    "{at} is not a known key (known: pool.cpu_slots, pool.mem_gib, pool.<class> with {})",
+                    "{at} is not a known key (known: pool.cpu_slots, pool.mem_gib, pool.starve_after_s, pool.<class> with {})",
                     Class::ALL.map(Class::name).join(", ")
                 );
             };
@@ -439,9 +448,16 @@ mod tests {
         let cfg = parse("[cache]\nsccache_size = \"8G\"\n", path()).expect("valid");
         assert_eq!(cfg.pool.mem_gib, Setting::default(20));
         assert_eq!(cfg.sccache_size, Setting::file("8G".to_owned()));
-        let all = parse("[pool]\ncpu_slots = 4\nmem_gib = 12\n", path()).expect("valid");
+        // 7200 s: the derivation on DEFAULT_POOL_STARVE_AFTER_S (3.2x the longest measured wait, 2250.8 s)
+        assert_eq!(cfg.pool.starve_after_s, Setting::default(7200));
+        let all = parse(
+            "[pool]\ncpu_slots = 4\nmem_gib = 12\nstarve_after_s = 60\n",
+            path(),
+        )
+        .expect("valid");
         assert_eq!(all.pool.cpu_slots, Setting::file(4));
         assert_eq!(all.pool.mem_gib, Setting::file(12));
+        assert_eq!(all.pool.starve_after_s, Setting::file(60));
     }
 
     /// Class tables override only the keys they name; the others keep the class default.
