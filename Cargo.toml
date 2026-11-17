@@ -38,7 +38,7 @@ glib-unix = "0.22"
 gtk4 = { version = "0.11", features = ["v4_14"] }
 gdk4-wayland = "0.11"
 # WebKitGTK 6.0 bindings (MIT; webview plan M68): only atl-webview-linux depends on it (deny.toml bans); same gtk-rs train as gtk4 0.11
-# gtk_v4_18: webkit6's WebView implements gtk::Accessible, which gtk4-rs gates behind a version feature; 4.18 = the GTK floor (plan Q10)
+# gtk_v4_18: webkit6's only gtk feature. Its WebView implements gtk::Accessible (gtk4-rs gates that at v4_10, not 4.18), and atl-webview-linux, built alone by the harness, gets gtk4 >= v4_10 only through this feature (a direct gtk4 edge is denied by deny.toml). It unifies gtk4 to v4_18 workspace-wide, so 4.16/4.18 bindings are callable and the GTK 4.14 baseline (plan Q10, 2026-11-17) is not enforced by features
 # v2_42: webkit_cookie_manager_get_all_cookies, the CookieManager copy's source (webview plan D5) -> WebKitGTK floor 2.42 (Debian trixie 2.54, Arch current)
 webkit6 = { version = "0.6", features = ["gtk_v4_18", "v2_42"] }
 object ={ version = "0.40", default-features = false, features = ["read_core", "elf", "std"] }
