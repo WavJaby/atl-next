@@ -1259,7 +1259,7 @@ mod tests {
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 
-    /// The root names of a build dir: the target names xtask gives cargo (build, converter build, test, lint and the bootstrap gate), the checkout's `target`, and the `cargo*` probes under `gl/`.
+    /// The root names of a build dir: the target names xtask gives cargo (build, converter build, its faulted build, test, lint and the bootstrap gate), the checkout's `target`, and the `cargo*` probes under `gl/`.
     #[test]
     fn dir_roots_are_the_target_names_and_the_gl_cargo_probes() {
         let ws = scratch("roots");
@@ -1279,6 +1279,7 @@ mod tests {
                 "bootstrap",
                 "cargo",
                 "cargo-converter",
+                "cargo-converter-fault",
                 "cargo-converter-lint",
                 "cargo-converter-test",
                 "gl/cargo",
