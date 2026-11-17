@@ -587,6 +587,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if let Some(first) = runpath_gate(&graph_out)? {
         failed.push(Failure::step("runpath gate", first));
     }
+    if let Some(first) = selfbind_gate(&graph_out)? {
+        failed.push(Failure::step("selfbind gate", first));
+    }
     // a foreign guest graph holds only guest-arch ELFs under nb/<arch> (no host-ISA product to check): the gate would fail on "nothing checked"
     if foreign {
         println!("native: isa gate: foreign guest graph holds no host-ISA products: not checked");
@@ -1648,6 +1651,21 @@ fn runpath_gate(out: &Path) -> Result<Option<String>> {
     );
     for v in violations.iter().take(5) {
         println!("native:   runpath: {v}");
+    }
+    Ok(violations.first().cloned())
+}
+
+/// The selfbind gate (selfbind_gate.rs) over this graph's fresh link outputs under `<out>/device`, the libraries app processes load from glibc's scope; its first violation, None when it passes.
+fn selfbind_gate(out: &Path) -> Result<Option<String>> {
+    let all = crate::runpath_gate::link_outputs(out, &[out.join("device")])?;
+    let (artifacts, _) = crate::runpath_gate::fresh(out, all);
+    let (read, violations) = crate::selfbind_gate::check(out, &artifacts)?;
+    println!(
+        "native: selfbind gate: {read} shared objects, {} preemptible self-references",
+        violations.len()
+    );
+    for v in violations.iter().take(5) {
+        println!("native:   selfbind: {v}");
     }
     Ok(violations.first().cloned())
 }

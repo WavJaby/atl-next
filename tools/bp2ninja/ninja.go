@@ -544,6 +544,19 @@ func (g *Graph) outName(n *Node) string {
 	return stem + n.props.str("suffix")
 }
 
+// selfBind: a glibc-side shared library's references to its own strong definitions (data and functions) bind inside it at link time, as a device's linker namespaces make sure no foreign library can take them over.
+// Not in Soong (no -Bsymbolic* in build/soong/cc): on a device no foreign library sits in the lookup scope.
+// Placed after the module's ldflags (lld keeps the last -Bsymbolic* flag): a module's -Bsymbolic-functions (libEGL) alone leaves its strong data preemptible; a module's full -Bsymbolic (codec2, boringssl) already covers this and is kept alone. Here glibc searches the global scope first, and host libraries loaded before the AOSP group (GTK's GL renderer -> Mesa dri RTLD_GLOBAL -> libLLVM, which defines its own __jit_debug_descriptor) took libart's references over.
+// -non-weak, not -Bsymbolic: weak definitions stay preemptible, so a provided library's strong definition still beats a weak fallback (linkLibs: libbase's / libcutils' __system_property_*) and libc++'s weak operator new stays replaceable.
+// Residual: a strong typeinfo/vtable that two loaded libraries both define is now per library (one copy each), where interposition unified it; RTTI identity across those two then differs (libc++ compares typeinfo by address). xtask's selfbind gate checks the built libraries.
+// Bionic sides: none; the guest linker's namespace holds only guest libraries.
+const selfBind = "-Wl,-Bsymbolic-non-weak"
+
+// isFullBsymbolic: f is the driver's form of lld's -Bsymbolic (one or two dashes), which binds every definition locally, selfBind's included.
+func isFullBsymbolic(f string) bool {
+	return f == "-Wl,-Bsymbolic" || f == "-Wl,--Bsymbolic"
+}
+
 // linkFlags: a shared library's or binary's link flags ahead of its inputs, in Soong's order: the kind's (cc/library.go sharedLinkerFlags, cc/binary.go linkerFlags) and the toolchain's global ones (Flags.Global.LdFlags: DeviceLink on the device side, Lldflags, --no-undefined from CommonLinkerFlags), then the module's own (Flags.Local.LdFlags, cc/linker.go linkerFlags: its ldflags, after target / arch blocks, then version_script, which it makes a dependency of the link too).
 // Not taken: linkerFlags' device-side --pack-dyn-relocs=android+relr. The loader is glibc's ld.so, not bionic's linker (measured, glibc 2.41 + lld 19): `android` packing moves relocations to DT_ANDROID_RELA, which glibc ignores -> pointers left unrelocated, segfault; `relr` -> "DT_RELR without GLIBC_ABI_DT_RELR dependency", a version need lld adds only for -z pack-relative-relocs. Unpacked relocations are what Soong's own pack_relocations: false gives (--pack-dyn-relocs=none): bigger, same behaviour.
 func (g *Graph) linkFlags(n *Node) []string {
@@ -565,7 +578,11 @@ func (g *Graph) linkFlags(n *Node) []string {
 	}
 	out = append(out, g.soong.Lldflags...)
 	out = append(out, "-Wl,--no-undefined")
-	out = append(out, moduleFlags(n.props, "ldflags")...)
+	local := moduleFlags(n.props, "ldflags")
+	out = append(out, local...)
+	if n.kind == Shared && n.side.glibc() && !slices.ContainsFunc(local, isFullBsymbolic) {
+		out = append(out, selfBind)
+	}
 	if n.versionScript != "" {
 		out = append(out, "-Wl,--version-script,"+n.versionScript)
 	}

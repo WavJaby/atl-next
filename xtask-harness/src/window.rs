@@ -156,6 +156,9 @@ pub struct Args {
     /// Stage splash only: `ro.atl.splash` is left unset, so the launcher shows no starting window and the order sub-gate must fail (the gate's deliberate break, environment-side).
     #[arg(long)]
     break_splash: bool,
+    /// A variable in every app process's environment (repeat), atld `--app-env`: test-environment setup, e.g. `GSK_RENDERER=ngl` so GTK renders with GL and Mesa's driver (with libLLVM) sits in the global scope before ART loads. The product reads none of these.
+    #[arg(long = "app-env", value_name = "KEY=VALUE")]
+    app_env: Vec<String>,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -1949,18 +1952,17 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         rt
     };
     // the bindings sub-gate reads glibc's records from the app log (test-environment setup: the product reads neither variable)
-    let rt = if matches!(args.stage, Stage::Hwui) {
-        let mut env = vec!["LD_DEBUG=bindings".to_owned()];
+    let mut env = args.app_env.clone();
+    if matches!(args.stage, Stage::Hwui) {
+        env.push("LD_DEBUG=bindings".to_owned());
         if args.break_global_module {
             env.push(format!("LD_PRELOAD={}", crate::ui_module::MODULE_FILE));
         }
         if args.break_global_runtime {
             env.push(format!("LD_PRELOAD={}", xtask::launcher_closure::RUNTIME));
         }
-        rt.with_app_env(&env)
-    } else {
-        rt
-    };
+    }
+    let rt = rt.with_app_env(&env);
     // the refresh rate atld answers with and the cadence checks judge against: the gate's own compositor's; headless stages (no window) take the same gate output's; only a hold asks the desktop
     let display = match &nested {
         Some(n) => n.display(),

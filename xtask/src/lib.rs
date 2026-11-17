@@ -68,6 +68,7 @@ pub mod qemu;
 pub mod runpath_gate;
 pub mod runtimes;
 pub mod seam_gate;
+pub mod selfbind_gate;
 pub mod service_mirrors;
 pub mod soong;
 pub mod sources;

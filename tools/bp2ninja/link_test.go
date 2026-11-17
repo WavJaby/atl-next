@@ -133,6 +133,10 @@ genrule { name: "gen_map", cmd: "echo '{ local: *; };' > $(out)", out: ["gen.map
 				t.Errorf("%s: %q lacks %s", c.out, args, f)
 			}
 		}
+		// glibc-side shared libraries bind their own strong definitions; an executable binds them anyway
+		if want := strings.HasSuffix(c.out, ".so"); slices.Contains(args, selfBind) != want {
+			t.Errorf("%s: %q: %s present = %v, want %v", c.out, args, selfBind, !want, want)
+		}
 	}
 	// an archive has no linker, so neither the property nor the flags
 	if n := g.nodes[key{"libv", Device, Static}]; n.versionScript != "" {
@@ -195,6 +199,29 @@ cc_library {
 		if g, m := slices.Index(args, "-Wl,--icf=safe"), slices.Index(args, "-Wl,-icf=all"); g < 0 || g > m {
 			t.Errorf("%s: %q: want the global --icf=safe before the module's -icf=all", c.side, args)
 		}
+		// the module's full -Bsymbolic already binds every definition locally: selfBind would narrow it (lld takes the last)
+		if slices.Contains(args, selfBind) {
+			t.Errorf("%s: %q: %s next to the module's -Bsymbolic", c.side, args, selfBind)
+		}
+	}
+}
+
+// lld keeps the last -Bsymbolic* flag: a module's -Bsymbolic-functions (libEGL's) alone leaves its strong data preemptible, so selfBind follows the module's ldflags.
+func TestSelfBindFollowsModuleBsymbolicFunctions(t *testing.T) {
+	g := graphFor(t, map[string]string{"p/Android.bp": `
+cc_library_shared {
+    name: "libf",
+    srcs: ["f.cc"],
+    ldflags: ["-Wl,--Bsymbolic-functions"],
+}
+`})
+	if g.node("libf", Device, Shared, "goal") == nil {
+		t.Fatal(g.problems)
+	}
+	mode, _ := linkEdge(t, g.emit(Tools{CC: "cc", CXX: "c++", AR: "ar"}), filepath.Join(g.out, "device/libf/libf.so"))
+	args := shWords(t, mode)
+	if m, s := slices.Index(args, "-Wl,--Bsymbolic-functions"), slices.Index(args, selfBind); m < 0 || s < m {
+		t.Errorf("%q: want %s after the module's -Wl,--Bsymbolic-functions", args, selfBind)
 	}
 }
 
