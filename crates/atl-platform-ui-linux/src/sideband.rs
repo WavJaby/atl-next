@@ -207,6 +207,9 @@ pub fn attach(key: i32, widget: gtk4::Widget, unhandled_key: Callback<i64>) {
     gate.set_propagation_phase(gtk4::PropagationPhase::Capture);
     gate.connect_event(move |_, event| on_gate(key, event));
     widget.add_controller(gate);
+    // the toolkit's keyboard focus follows Android's ([`focus`]) and nothing else: WebKit grabs it on a click, which left the page holding every key while Android sent them to the focused View
+    // (a game's GL view: the keys stayed held in the gate, never claimed)
+    widget.set_can_focus(false);
     let e = std::rc::Rc::new(Entry {
         widget,
         gate: std::cell::RefCell::default(),
@@ -408,14 +411,18 @@ pub fn focus(key: i32, on: bool) {
     let Some(e) = entry(key) else { return };
     tracing::info!("atl-platform-ui: sideband {key} android focus {on}");
     if on {
+        e.widget.set_can_focus(true);
         let took = e.widget.grab_focus();
         tracing::info!("atl-platform-ui: sideband {key} took toolkit focus {took}");
-    } else if let Some(root) = e.widget.root()
-        && root
-            .focus()
-            .is_some_and(|f| f == e.widget || f.is_ancestor(&e.widget))
-    {
-        root.set_focus(None::<&gtk4::Widget>);
+    } else {
+        if let Some(root) = e.widget.root()
+            && root
+                .focus()
+                .is_some_and(|f| f == e.widget || f.is_ancestor(&e.widget))
+        {
+            root.set_focus(None::<&gtk4::Widget>);
+        }
+        e.widget.set_can_focus(false);
     }
     crate::mirror::resync();
 }
