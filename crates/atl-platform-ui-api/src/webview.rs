@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! The web engine behind `android.webkit.WebView` (webview plan S4.1, M68): shaped by its first implementation, WebKitGTK (atl-webview-linux), and by what the provider needs so far (W1 default UA; W2 views: load, JS, script dialogs, load events).
-//! Threads: [`WebView`] and [`WebEngine::create_view`] run on the UI thread (= the GTK main thread, plan README Q6), as Android's WebView methods do; events arrive there too. [`PromptReply`] alone is Send.
+//! Threads: [`WebView`] and [`WebEngine::create_view`] run on the UI thread (= the GTK main thread, plan README Q6), as Android's WebView methods do; events arrive there too. [`PromptReply`] and [`NavigationReply`] alone are Send.
 
 /// The process's web engine, reached through its module.
 pub trait WebEngine {
@@ -179,6 +179,38 @@ pub enum WebEvent {
         /// The body length, -1 when unknown.
         content_length: i64,
     },
+    /// A navigation the page, the user or a redirect started is about to start; it waits until `reply` finishes (no `LoadStarted` before). Not reported: navigations the provider asked for
+    /// ([`WebView::load_uri`], [`WebView::load_bytes`], [`WebView::reload`], [`WebView::go_back_or_forward`]; a redirect of one is reported), POST navigations, and http(s) loads the engine
+    /// takes for a subframe's first load ([`NavigationRequest::main_frame`]).
+    Navigation {
+        /// What is about to load.
+        request: NavigationRequest,
+        /// The answer channel.
+        reply: Box<dyn NavigationReply>,
+    },
+}
+
+/// A [`WebEvent::Navigation`]'s request (WebResourceRequest's fields).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NavigationRequest {
+    /// The URL to load.
+    pub uri: String,
+    /// The HTTP method (`GET`).
+    pub method: String,
+    /// For the main frame. WebKitGTK's UI-process API names no target frame: an http(s) load with no gesture, not a redirect, of navigation type "other", while the main frame is loading, is taken for
+    /// a subframe's first load (an `<iframe src>` of the page) and not reported; every other navigation is reported as the main frame's.
+    pub main_frame: bool,
+    /// A server redirect of a navigation.
+    pub redirect: bool,
+    /// Started by a user gesture (a click, a key).
+    pub gesture: bool,
+}
+
+/// The answer to a [`WebEvent::Navigation`]; any thread.
+pub trait NavigationReply: Send {
+    /// `true`: the app took the URL, the engine does not load it (the page stays). `false`: the engine loads it; a scheme the engine cannot load ends in
+    /// [`WebEvent::LoadFailed`] of kind [`LoadError::UnsupportedScheme`], the page stays. Dropping `reply` unfinished = `false`.
+    fn finish(self: Box<Self>, take: bool);
 }
 
 /// A load failure's kind, coarse: what Android's WebViewClient error codes need.
@@ -193,6 +225,21 @@ pub enum LoadError {
     NotFound = 3,
     /// Any other failure.
     Other = 4,
+    /// A URL whose scheme the engine has no loader for (a custom scheme, `intent:`, `market:`): nothing was loaded, the page stays.
+    UnsupportedScheme = 5,
+}
+
+impl LoadError {
+    /// The kind of its `repr` number; an unknown number = [`Self::Other`].
+    pub fn of(n: u32) -> Self {
+        match n {
+            1 => Self::Cancelled,
+            2 => Self::Network,
+            3 => Self::NotFound,
+            5 => Self::UnsupportedScheme,
+            _ => Self::Other,
+        }
+    }
 }
 
 /// The answer to a [`WebEvent::Prompt`]; any thread.

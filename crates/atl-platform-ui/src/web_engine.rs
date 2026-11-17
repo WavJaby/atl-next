@@ -11,8 +11,8 @@ use atl_platform_ui_api::abi::{
     WebEventView, WebViewEntry, WebViewHandle, WebViewVtable, web_event,
 };
 use atl_platform_ui_api::webview::{
-    Cookie, CookiePolicy, InputClaim, LoadError, PromptReply, SIDEBAND_WEB_VIEW, SettingValue,
-    WebEngine, WebEvent, WebSetting, WebView, WebViewError,
+    Cookie, CookiePolicy, InputClaim, LoadError, NavigationReply, NavigationRequest, PromptReply,
+    SIDEBAND_WEB_VIEW, SettingValue, WebEngine, WebEvent, WebSetting, WebView, WebViewError,
 };
 
 static MODULE: OnceLock<Result<&'static WebViewVtable, String>> = OnceLock::new();
@@ -92,12 +92,20 @@ impl WebEngine for PlatformWebEngine {
                 web_event::LOAD_FAILED => WebEvent::LoadFailed {
                     uri: text,
                     message: detail,
-                    kind: match e.error {
-                        1 => LoadError::Cancelled,
-                        2 => LoadError::Network,
-                        3 => LoadError::NotFound,
-                        _ => LoadError::Other,
+                    kind: LoadError::of(e.error),
+                },
+                web_event::NAVIGATION => WebEvent::Navigation {
+                    request: NavigationRequest {
+                        uri: text,
+                        method: detail,
+                        main_frame: e.flags & web_event::FLAG_MAIN_FRAME != 0,
+                        redirect: e.flags & web_event::FLAG_REDIRECT != 0,
+                        gesture: e.flags & web_event::FLAG_GESTURE != 0,
                     },
+                    // SAFETY: a NAVIGATION event hands its reply to the receiver; this is its one take.
+                    reply: Box::new(ManuallyDrop::into_inner(unsafe {
+                        std::ptr::read(&e.reply)
+                    })) as Box<dyn NavigationReply>,
                 },
                 web_event::TITLE => WebEvent::Title(text),
                 web_event::PROGRESS => WebEvent::Progress(e.progress),

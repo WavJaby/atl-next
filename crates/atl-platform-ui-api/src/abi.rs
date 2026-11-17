@@ -1185,29 +1185,30 @@ pub struct WebViewHandle {
     _opaque: [u8; 0],
 }
 
-/// [`PromptReply`](crate::webview::PromptReply) across the boundary: made by the module, finished or dropped once by the process, from any thread.
+/// An event's answer across the boundary ([`PromptReply`](crate::webview::PromptReply), [`NavigationReply`](crate::webview::NavigationReply)): made by the module, finished or dropped once by the
+/// process, from any thread. Text or none: a prompt's answer; a navigation's text present = the app took the URL, none = load it.
 #[repr(C)]
-pub struct PromptReplyAbi {
+pub struct ReplyAbi {
     data: *mut c_void,
     finish: unsafe extern "C" fn(*mut c_void, Str, bool),
     drop: unsafe extern "C" fn(*mut c_void),
 }
 
 // SAFETY: `new` takes only Send closures.
-unsafe impl Send for PromptReplyAbi {}
+unsafe impl Send for ReplyAbi {}
 
 unsafe extern "C" fn finish_box<F: FnOnce(Option<String>)>(
     data: *mut c_void,
     text: Str,
     has: bool,
 ) {
-    // SAFETY: `data` is the Box<F> `PromptReplyAbi::new` leaked; `finish` consumes it once (the owner's Drop does not run after it); `text` is alive for this call.
+    // SAFETY: `data` is the Box<F> `ReplyAbi::new` leaked; `finish` consumes it once (the owner's Drop does not run after it); `text` is alive for this call.
     let f = unsafe { Box::from_raw(data.cast::<F>()) };
     // SAFETY: as above.
     f(has.then(|| unsafe { text.get() }.into_owned()))
 }
 
-impl PromptReplyAbi {
+impl ReplyAbi {
     /// Carries `f` (the module side); dropping unfinished runs `f(None)` too, so the page never stays blocked.
     pub fn new<F: FnOnce(Option<String>) + Send + 'static>(f: F) -> Self {
         Self {
@@ -1223,7 +1224,7 @@ unsafe extern "C" fn drop_unfinished<F: FnOnce(Option<String>)>(data: *mut c_voi
     (unsafe { Box::from_raw(data.cast::<F>()) })(None)
 }
 
-impl crate::webview::PromptReply for PromptReplyAbi {
+impl crate::webview::PromptReply for ReplyAbi {
     fn finish(self: Box<Self>, text: Option<String>) {
         let me = ManuallyDrop::new(*self);
         let s = text.as_deref().unwrap_or("");
@@ -1232,7 +1233,13 @@ impl crate::webview::PromptReply for PromptReplyAbi {
     }
 }
 
-impl Drop for PromptReplyAbi {
+impl crate::webview::NavigationReply for ReplyAbi {
+    fn finish(self: Box<Self>, take: bool) {
+        crate::webview::PromptReply::finish(self, take.then(String::new));
+    }
+}
+
+impl Drop for ReplyAbi {
     fn drop(&mut self) {
         // SAFETY: paired by `new`; reached only for a reply never finished.
         unsafe { (self.drop)(self.data) }
@@ -1255,6 +1262,14 @@ pub mod web_event {
     pub const PROMPT: u32 = 7;
     /// `Download { url = text, content_disposition = detail, mime_type = extra, content_length = length }`.
     pub const DOWNLOAD: u32 = 8;
+    /// `Navigation { request: { uri = text, method = detail, main_frame / redirect / gesture = flags }, reply }`.
+    pub const NAVIGATION: u32 = 9;
+    /// `NAVIGATION` flag bits.
+    pub const FLAG_MAIN_FRAME: u32 = 1;
+    /// See [`FLAG_MAIN_FRAME`].
+    pub const FLAG_REDIRECT: u32 = 2;
+    /// See [`FLAG_MAIN_FRAME`].
+    pub const FLAG_GESTURE: u32 = 4;
 }
 
 /// One [`Cookie`](crate::webview::Cookie) for one call.
@@ -1321,7 +1336,7 @@ pub struct CookieList {
     pub len: usize,
 }
 
-/// One [`WebEvent`](crate::webview::WebEvent) for one call; a `PROMPT` event's `reply` passes to the receiver, which `take`s it once.
+/// One [`WebEvent`](crate::webview::WebEvent) for one call; a `PROMPT` or `NAVIGATION` event's `reply` passes to the receiver, which `take`s it once.
 #[repr(C)]
 pub struct WebEventView {
     /// A [`web_event`] constant.
@@ -1338,8 +1353,10 @@ pub struct WebEventView {
     pub extra: Str,
     /// `DOWNLOAD`: the content length, -1 unknown.
     pub length: i64,
-    /// `PROMPT`: the reply, owned by the receiver.
-    pub reply: ManuallyDrop<PromptReplyAbi>,
+    /// `NAVIGATION`: [`web_event`] `FLAG_*` bits.
+    pub flags: u32,
+    /// `PROMPT`, `NAVIGATION`: the reply, owned by the receiver.
+    pub reply: ManuallyDrop<ReplyAbi>,
 }
 
 /// An `evaluate_javascript` result for one call.

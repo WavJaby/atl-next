@@ -10,7 +10,7 @@ use std::mem::ManuallyDrop;
 use std::rc::Rc;
 
 use atl_platform_ui_api::abi::{
-    self, BytesOut, Callback, CookieList, CookieView, EvalResultView, PromptReplyAbi, SendCallback,
+    self, BytesOut, Callback, CookieList, CookieView, EvalResultView, ReplyAbi, SendCallback,
     Status, Str, WebEventView, WebViewHandle, WebViewVtable, web_event,
 };
 use atl_platform_ui_api::webview::{Cookie, CookiePolicy, LoadError, WebSetting};
@@ -113,8 +113,16 @@ fn ui_user_agent() -> Result<String, &'static [u8]> {
 /// A view and its event sink (shared with the signal closures).
 struct View {
     web: webkit6::WebView,
-    /// Kept so the sink drops with the view (the signal closures' clones drop with the WebKit object).
-    _events: Rc<Events>,
+    /// The sink, dropped with the view (the signal closures' clones drop with the WebKit object).
+    events: Rc<Events>,
+}
+
+impl View {
+    /// The provider asked for the next navigation (load_uri, load_bytes): its policy decision is not reported (WebViewClient.shouldOverrideUrlLoading javadoc: "not called for navigations
+    /// which the app initiated with loadUrl()"). Cleared by that decision or by the next main-frame load start, so a load that makes no decision cannot hide a later page navigation.
+    fn provider_load(&self) {
+        self.events.provider_load.set(true);
+    }
 }
 
 fn view<'a>(h: *mut WebViewHandle) -> &'a View {
@@ -129,9 +137,10 @@ struct Pending {
     detail: String,
     error: u32,
     progress: i32,
-    reply: Option<PromptReplyAbi>,
+    reply: Option<ReplyAbi>,
     extra: String,
     length: i64,
+    flags: u32,
 }
 
 /// The sink plus a queue: a callback may call back into the view (loadUrl from onPageFinished) and WebKit may signal synchronously inside it; such a nested event waits until the running one returns, so order is kept and nothing is dropped.
@@ -141,6 +150,15 @@ struct Events {
     busy: std::cell::Cell<bool>,
     /// The title last reported for the current load.
     title: RefCell<Option<String>>,
+    /// [`View::provider_load`].
+    provider_load: std::cell::Cell<bool>,
+    /// The main frame is loading (load-changed Started .. Finished): an http(s) navigation decision of type "other" without gesture in this window is taken for a subframe's first load.
+    main_loading: std::cell::Cell<bool>,
+    /// The URL of the main-frame navigation last let through, reported by the next load start: after a cross-site navigation (WebKit swaps the web process) the view's URI still names the old
+    /// page at load-changed Started (measured: test app row webview-http). Taken by the next load start, cleared by every decision.
+    navigating: RefCell<Option<String>>,
+    /// The current main-frame load's URL for its LOAD_FINISHED: the started one, then the view's from redirect / commit on; a load that failed before commit keeps the URL it was started for.
+    load_uri: RefCell<String>,
 }
 
 impl Events {
@@ -163,7 +181,7 @@ impl Events {
         detail: &str,
         error: u32,
         progress: i32,
-        reply: Option<PromptReplyAbi>,
+        reply: Option<ReplyAbi>,
     ) {
         self.push(Pending {
             kind,
@@ -174,6 +192,7 @@ impl Events {
             reply,
             extra: String::new(),
             length: 0,
+            flags: 0,
         });
     }
 
@@ -195,8 +214,9 @@ impl Events {
                 progress: p.progress,
                 extra: Str::of(&p.extra),
                 length: p.length,
-                // the receiver takes `reply` only for PROMPT; any other event carries a placeholder this side drops
-                reply: ManuallyDrop::new(p.reply.unwrap_or_else(|| PromptReplyAbi::new(|_| {}))),
+                flags: p.flags,
+                // the receiver takes `reply` only for PROMPT and NAVIGATION; any other event carries a placeholder this side drops
+                reply: ManuallyDrop::new(p.reply.unwrap_or_else(|| ReplyAbi::new(|_| {}))),
             };
             self.sink.borrow_mut().call(&ev);
             if !handed {
@@ -215,11 +235,137 @@ fn load_error(e: &glib::Error) -> LoadError {
         LoadError::Cancelled
     } else if e.matches(NetworkError::FileDoesNotExist) {
         LoadError::NotFound
+    } else if e.matches(NetworkError::UnknownProtocol) {
+        LoadError::UnsupportedScheme
     } else if e.domain() == NetworkError::domain() {
         LoadError::Network
     } else {
         LoadError::Other
     }
+}
+
+/// The schemes WebKitGTK loads in a frame with no scheme registered by the embedder (we register none): its network loaders (http, https, file, data, blob) and about:. Anything else
+/// (`ponos-api:`, `intent:`, `market:`, `tel:`) fails as an unknown protocol after a load started, leaving an error page.
+const ENGINE_SCHEMES: [&str; 6] = ["http", "https", "file", "data", "blob", "about"];
+
+/// `uri`'s scheme, lower case; None without one.
+fn scheme(uri: &str) -> Option<String> {
+    let (s, _) = uri.split_once(':')?;
+    let ok = s.starts_with(|c: char| c.is_ascii_alphabetic())
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c));
+    ok.then(|| s.to_ascii_lowercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RFC 3986 3.1: scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ), case-insensitive.
+    #[test]
+    fn scheme_by_rfc3986() {
+        assert_eq!(scheme("ponos-api://function?x=1").as_deref(), Some("ponos-api"));
+        assert_eq!(scheme("HTTPS://a.example/").as_deref(), Some("https"));
+        assert_eq!(scheme("intent:#Intent;end").as_deref(), Some("intent"));
+        assert_eq!(scheme("1abc:x"), None);
+        assert_eq!(scheme("a b:x"), None);
+        assert_eq!(scheme("no-colon"), None);
+    }
+}
+
+/// A navigation-action decision: held (WebKit waits on a decision whose ref is held and neither `use` nor `ignore` was called) and reported as NAVIGATION, unless it is not the app's to decide
+/// ([`WebEvent::Navigation`](atl_platform_ui_api::webview::WebEvent::Navigation) lists them) -> WebKit's default. The reply ignores it (taken), or uses it; a scheme no engine loader takes is
+/// ignored and reported as a LOAD_FAILED of kind UnsupportedScheme instead, so the page stays (Chromium shows an error for it; WebKit would start a load and show its error page).
+fn navigation_policy(ev: &Rc<Events>, decision: &webkit6::PolicyDecision) -> bool {
+    let Some(d) = decision.downcast_ref::<webkit6::NavigationPolicyDecision>() else {
+        return false;
+    };
+    let Some(action) = d.navigation_action() else {
+        return false;
+    };
+    let Some(request) = action.request() else {
+        return false;
+    };
+    let uri = request.uri().map(|u| u.to_string()).unwrap_or_default();
+    let method = request
+        .http_method()
+        .map(|m| m.to_string())
+        .unwrap_or_else(|| "GET".into());
+    let (redirect, gesture, kind) = (
+        action.is_redirect(),
+        action.is_user_gesture(),
+        action.navigation_type(),
+    );
+    ev.navigating.take();
+    if !redirect && ev.provider_load.replace(false) {
+        ev.navigating.replace(Some(uri));
+        return false;
+    }
+    let scheme = scheme(&uri).unwrap_or_default();
+    let engine_loads = ENGINE_SCHEMES.contains(&scheme.as_str());
+    let http = scheme == "http" || scheme == "https";
+    let subframe_load = http
+        && !gesture
+        && !redirect
+        && kind == webkit6::NavigationType::Other
+        && ev.main_loading.get();
+    // history and reload: the provider's own (goBack, reload) or the page's history.back(), not a new URL; POST: WebViewClient javadoc "not called for POST requests"
+    if matches!(
+        kind,
+        webkit6::NavigationType::BackForward
+            | webkit6::NavigationType::Reload
+            | webkit6::NavigationType::FormResubmitted
+    ) || method.eq_ignore_ascii_case("POST")
+        || subframe_load
+    {
+        return false;
+    }
+    let held = glib::thread_guard::ThreadGuard::new((decision.clone(), Rc::downgrade(ev)));
+    let nav_uri = uri.clone();
+    let reply = ReplyAbi::new(move |taken: Option<String>| {
+        glib::MainContext::default().invoke(move || {
+            let (d, ev) = held.into_inner();
+            if taken.is_some() {
+                d.ignore();
+            } else if engine_loads {
+                if let Some(ev) = ev.upgrade() {
+                    ev.navigating.replace(Some(nav_uri));
+                }
+                d.use_();
+            } else {
+                d.ignore();
+                if let Some(ev) = ev.upgrade() {
+                    // Chromium's net error text for the case (net_error_list.h UNKNOWN_URL_SCHEME), which WebResourceError.getDescription shows
+                    ev.emit(
+                        web_event::LOAD_FAILED,
+                        &nav_uri,
+                        "net::ERR_UNKNOWN_URL_SCHEME",
+                        LoadError::UnsupportedScheme as u32,
+                        0,
+                        None,
+                    );
+                }
+            }
+        });
+    });
+    let mut flags = web_event::FLAG_MAIN_FRAME;
+    if redirect {
+        flags |= web_event::FLAG_REDIRECT;
+    }
+    if gesture {
+        flags |= web_event::FLAG_GESTURE;
+    }
+    ev.push(Pending {
+        kind: web_event::NAVIGATION,
+        text: uri,
+        detail: method,
+        error: 0,
+        progress: 0,
+        reply: Some(reply),
+        extra: String::new(),
+        length: 0,
+        flags,
+    });
+    true
 }
 
 unsafe extern "C" fn view_create(
@@ -252,17 +398,31 @@ unsafe extern "C" fn view_create(
         queue: RefCell::default(),
         busy: std::cell::Cell::new(false),
         title: RefCell::default(),
+        provider_load: std::cell::Cell::new(false),
+        main_loading: std::cell::Cell::new(false),
+        navigating: RefCell::default(),
+        load_uri: RefCell::default(),
     });
     let ev = events.clone();
     web.connect_load_changed(move |w, e| {
         let uri = w.uri().map(|u| u.to_string()).unwrap_or_default();
         match e {
             webkit6::LoadEvent::Started => {
+                let uri = ev.navigating.take().unwrap_or(uri);
                 // a new load reports its title again, even an equal one
                 ev.title.replace(None);
+                ev.provider_load.set(false);
+                ev.main_loading.set(true);
+                ev.load_uri.replace(uri.clone());
                 ev.emit(web_event::LOAD_STARTED, &uri, "", 0, 0, None);
             }
+            // from here the view's URI is the load's
+            webkit6::LoadEvent::Redirected | webkit6::LoadEvent::Committed => {
+                ev.load_uri.replace(uri);
+            }
             webkit6::LoadEvent::Finished => {
+                ev.main_loading.set(false);
+                let uri = ev.load_uri.take();
                 ev.emit(web_event::LOAD_FINISHED, &uri, "", 0, 0, None);
             }
             _ => {}
@@ -295,6 +455,9 @@ unsafe extern "C" fn view_create(
     });
     let ev = events.clone();
     web.connect_decide_policy(move |_, decision, kind| {
+        if kind == webkit6::PolicyDecisionType::NavigationAction {
+            return navigation_policy(&ev, decision);
+        }
         if kind != webkit6::PolicyDecisionType::Response {
             return false;
         }
@@ -330,6 +493,7 @@ unsafe extern "C" fn view_create(
             extra: r.mime_type().map(|m| m.to_string()).unwrap_or_default(),
             // WebKit reports 0 for an unknown length (no Content-Length) -> -1, the API's "unknown"
             length: if length == 0 { -1 } else { length as i64 },
+            flags: 0,
         });
         true
     });
@@ -345,7 +509,7 @@ unsafe extern "C" fn view_create(
             .unwrap_or_default();
         // answered asynchronously (WebKit keeps the dialog pending while a ref is held and close is not called); the answer may come from any thread, so it hops back to the main context
         let held = glib::thread_guard::ThreadGuard::new(dialog.clone());
-        let reply = PromptReplyAbi::new(move |text: Option<String>| {
+        let reply = ReplyAbi::new(move |text: Option<String>| {
             glib::MainContext::default().invoke(move || {
                 let d = held.into_inner();
                 if let Some(t) = text {
@@ -361,7 +525,7 @@ unsafe extern "C" fn view_create(
     unsafe {
         *out = Box::into_raw(Box::new(View {
             web,
-            _events: events,
+            events,
         }))
         .cast()
     };
@@ -376,6 +540,7 @@ unsafe extern "C" fn view_drop(h: *mut WebViewHandle) {
 }
 
 unsafe extern "C" fn view_load_uri(h: *mut WebViewHandle, uri: Str) {
+    view(h).provider_load();
     // SAFETY: `uri` is alive for this call.
     view(h).web.load_uri(&unsafe { uri.get() });
 }
@@ -397,6 +562,7 @@ unsafe extern "C" fn view_load_bytes(
             base.get(),
         )
     };
+    view(h).provider_load();
     view(h).web.load_bytes(
         &glib::Bytes::from(bytes),
         Some(&mime),

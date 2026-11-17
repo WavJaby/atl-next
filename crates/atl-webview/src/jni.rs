@@ -11,7 +11,8 @@ use std::sync::OnceLock;
 use std::sync::mpsc;
 
 use atl_platform_ui::webview::{
-    InputClaim, LoadError, PromptReply, SettingValue, WebEngine as _, WebEvent, WebView as _,
+    InputClaim, LoadError, NavigationRequest, PromptReply, SettingValue, WebEngine as _, WebEvent,
+    WebView as _,
 };
 use atl_platform_ui::{PlatformWebEngine, PlatformWebView};
 
@@ -596,6 +597,7 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProvid
     }));
     // SAFETY: just made; the only reference.
     unsafe { &*native }.set_third_party(third_party);
+    find_provider_classes(env);
     let c = jni_call!(
         env,
         FindClass,
@@ -644,6 +646,16 @@ fn on_event(shared: &Shared, ev: WebEvent) {
     }
     if let WebEvent::UnhandledKey(t) = ev {
         return on_unhandled_key(env, shared, t);
+    }
+    if let WebEvent::Navigation { request, reply } = ev {
+        let take = on_navigation(env, shared, &request);
+        tracing::info!(
+            "webview[{}]: override {} -> {}",
+            shared.id.get(),
+            bridge::log_origin(&request.uri),
+            if take { "cancelled" } else { "allowed" }
+        );
+        return reply.finish(take);
     }
     match &ev {
         WebEvent::LoadStarted(url) => {
@@ -721,6 +733,7 @@ fn on_event(shared: &Shared, ev: WebEvent) {
             let code = match kind {
                 LoadError::NotFound => -14, // ERROR_FILE_NOT_FOUND
                 LoadError::Network => -6,   // ERROR_CONNECT
+                LoadError::UnsupportedScheme => -10, // ERROR_UNSUPPORTED_SCHEME
                 _ => -1,                    // ERROR_UNKNOWN
             };
             let (d, u) = (new_string(env, &message), new_string(env, &uri));
@@ -757,6 +770,102 @@ fn on_event(shared: &Shared, ev: WebEvent) {
     for o in [provider, web_view, client, chrome] {
         delete_local(env, o);
     }
+}
+
+/// WebViewClient.shouldOverrideUrlLoading(WebView, WebResourceRequest) for a navigation the page, the user or a redirect started: true = the app took the URL. The app's client, or the provider's
+/// default instance (WebView.getWebViewClient's "default client if not yet set", whose answer is false). An exception the client throws is raised on the UI thread after the answer: false.
+fn on_navigation(env: Env, shared: &Shared, r: &NavigationRequest) -> bool {
+    let provider = jni_call!(env, NewLocalRef, shared.provider.get() as Obj);
+    if provider.is_null() {
+        return false; // the app's WebView was collected
+    }
+    let web_view = object_field(env, provider, c"mWebView", c"Landroid/webkit/WebView;");
+    let client = object_field(
+        env,
+        provider,
+        c"mWebViewClient",
+        c"Landroid/webkit/WebViewClient;",
+    );
+    let request = if client.is_null() {
+        NULL
+    } else {
+        new_request(env, r)
+    };
+    let take = !request.is_null()
+        && call_bool(
+            env,
+            client,
+            c"shouldOverrideUrlLoading",
+            c"(Landroid/webkit/WebView;Landroid/webkit/WebResourceRequest;)Z",
+            &[l(web_view), l(request)],
+        );
+    let threw = pending(env);
+    raise_uncaught(env);
+    for o in [provider, web_view, client, request] {
+        delete_local(env, o);
+    }
+    take && !threw
+}
+
+/// The provider's WebResourceRequest for `r` (WebResourceRequestImpl: a value holder; no request headers: the engine's navigation request exposes none before it is sent).
+fn new_request(env: Env, r: &NavigationRequest) -> Obj {
+    let Some(&c) = REQUEST_CLASS.get() else {
+        return NULL;
+    };
+    let c = c as Obj;
+    let init = jni_call!(
+        env,
+        GetMethodID,
+        c,
+        c"<init>".as_ptr(),
+        c"(Ljava/lang/String;ZZZLjava/lang/String;)V".as_ptr()
+    );
+    let (url, method) = (new_string(env, &r.uri), new_string(env, &r.method));
+    let z = |b: bool| jvalue { z: u8::from(b) };
+    let obj = if init.is_null() {
+        NULL
+    } else {
+        jni_call!(
+            env,
+            NewObjectA,
+            c,
+            init,
+            [
+                l(url),
+                z(r.main_frame),
+                z(r.redirect),
+                z(r.gesture),
+                l(method)
+            ]
+            .as_ptr()
+        )
+    };
+    for o in [url, method] {
+        delete_local(env, o);
+    }
+    obj
+}
+
+/// WebResourceRequestImpl as a global ref, found at the first createWebView: a native called from the provider's Java finds the provider's classes; an engine event on the GLib loop has no such
+/// caller frame, so FindClass there would search the boot class loader.
+static REQUEST_CLASS: OnceLock<usize> = OnceLock::new();
+
+fn find_provider_classes(env: Env) {
+    if REQUEST_CLASS.get().is_some() {
+        return;
+    }
+    let c = jni_call!(
+        env,
+        FindClass,
+        c"com/android/webview/chromium/WebResourceRequestImpl".as_ptr()
+    );
+    if c.is_null() {
+        jni_call!(env, ExceptionClear);
+        tracing::error!("webview: no WebResourceRequestImpl in the provider: shouldOverrideUrlLoading is not called");
+        return;
+    }
+    let _ = REQUEST_CLASS.set(jni_call!(env, NewGlobalRef, c) as usize);
+    delete_local(env, c);
 }
 
 /// A navigation the engine handed over as a download: DownloadListener.onDownloadStart(url, userAgent, contentDisposition, mimetype, contentLength), the user agent being the view's
