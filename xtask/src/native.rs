@@ -583,7 +583,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if let Some(first) = runpath_gate(&graph_out)? {
         failed.push(Failure::step("runpath gate", first));
     }
-    if let Some(first) = selfbind_gate(&graph_out)? {
+    if let Some(first) = selfbind_gate(&graph_out, &graph)? {
         failed.push(Failure::step("selfbind gate", first));
     }
     // a foreign guest graph holds only guest-arch ELFs under nb/<arch> (no host-ISA product to check): the gate would fail on "nothing checked"
@@ -1651,17 +1651,37 @@ fn runpath_gate(out: &Path) -> Result<Option<String>> {
     Ok(violations.first().cloned())
 }
 
-/// The selfbind gate (selfbind_gate.rs) over this graph's fresh link outputs under `<out>/device`, the libraries app processes load from glibc's scope; its first violation, None when it passes.
-fn selfbind_gate(out: &Path) -> Result<Option<String>> {
+/// The selfbind gate (selfbind_gate.rs) over this graph's fresh link outputs under `<out>/device`, the glibc-side libraries app processes load from glibc's scope; its first violation, None when it passes.
+/// Expected = graph.json's glibc-side shared artifacts (selfbind_gate.rs [`crate::selfbind_gate::expected`]), so the set comes from the goal set, not from the probe: each one not read as a shared object (and not a failed build's stale output, which fails elsewhere) fails the gate.
+/// A graph with none (a foreign guest graph: nb/<arch> bionic guests only) says so with its guest count, not a silent 0.
+fn selfbind_gate(out: &Path, graph: &triage::Graph) -> Result<Option<String>> {
+    let (expected, guests) = crate::selfbind_gate::expected(graph, out);
+    if expected.is_empty() {
+        println!(
+            "native: selfbind gate: no glibc-side shared library in this graph's goals ({guests} bionic guest artifacts, not in the class): nothing to check"
+        );
+        return Ok(None);
+    }
     let all = crate::runpath_gate::link_outputs(out, &[out.join("device")])?;
-    let (artifacts, _) = crate::runpath_gate::fresh(out, all);
+    let (artifacts, stale) = crate::runpath_gate::fresh(out, all);
     let (read, violations) = crate::selfbind_gate::check(out, &artifacts)?;
+    let unread = crate::selfbind_gate::unread(&expected, &read, &stale);
     println!(
-        "native: selfbind gate: {read} shared objects, {} preemptible self-references",
+        "native: selfbind gate: {} of {} expected glibc-side shared objects read ({} stale), {} preemptible self-references",
+        read.len(),
+        expected.len(),
+        stale.len(),
         violations.len()
     );
     for v in violations.iter().take(5) {
         println!("native:   selfbind: {v}");
+    }
+    if let Some(first) = unread.first() {
+        return Ok(Some(format!(
+            "{} expected glibc-side shared libraries not read as shared objects, first {}",
+            unread.len(),
+            first.display()
+        )));
     }
     Ok(violations.first().cloned())
 }
