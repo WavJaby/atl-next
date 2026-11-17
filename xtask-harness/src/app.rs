@@ -1948,9 +1948,11 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
     {
         println!("app: prop-summary {l}");
     }
+    // rows about what the app did need an app that got past onCreate's marker: without it they would fail first and hide the no-marker verdict and its log tails (an ART abort at start showed only as missing-services)
     if passed {
         whys.extend(prop_block_failures(&atld_log));
         whys.extend(device_set_failures(&app));
+        whys.extend(missing_service_failures(&app));
     }
     if !remote {
         whys.extend(exit_failures(
@@ -1960,7 +1962,6 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
             &read(&run.log("binderd")),
         ));
     }
-    whys.extend(missing_service_failures(&app));
     match local {
         Some(Some(o)) => {
             println!("app: counter children_outside_broker {}", o.len());
