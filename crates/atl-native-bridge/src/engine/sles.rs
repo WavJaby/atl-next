@@ -185,7 +185,11 @@ mod flow {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as u64);
         let last = LAST_MS.load(Relaxed);
-        if now < last + PERIOD_MS || LAST_MS.compare_exchange(last, now, Relaxed, Relaxed).is_err() {
+        if now < last + PERIOD_MS
+            || LAST_MS
+                .compare_exchange(last, now, Relaxed, Relaxed)
+                .is_err()
+        {
             return;
         }
         let _ = writeln!(
@@ -581,7 +585,10 @@ fn specials(t: TableId) -> Vec<(usize, usize)> {
                 sl_buffer_queue::RegisterCallback,
                 f(buffer_queue_register as *const ()),
             ),
-            (sl_buffer_queue::Enqueue, f(buffer_queue_enqueue as *const ())),
+            (
+                sl_buffer_queue::Enqueue,
+                f(buffer_queue_enqueue as *const ()),
+            ),
         ],
         sl_android_simple_buffer_queue::TABLE => vec![
             (

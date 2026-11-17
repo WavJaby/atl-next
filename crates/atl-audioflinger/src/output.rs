@@ -5,9 +5,9 @@
 //! The platform output is not Send (its PipeWire wrappers hold Rc): [`Opener`]'s thread owns it, and the binder threads ask that thread over a channel.
 //! The mixer passes between the realtime fill and the control calls through [`MixCell`] (one atomic swap each way): the fill never locks or allocates, and a control call that finds the fill mixing waits for its return, one quantum at most.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::io::Write;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;

@@ -47,7 +47,11 @@ const FAST_DENIED_NOTIFY_MS: u64 = 20;
 /// AudioResamplerPublic.h sourceFramesNeededWithTimestretch: track frames the resampler and time stretcher need for `dst` output frames.
 fn source_frames(s: &Sizing, dst: u64) -> u64 {
     let (src, out) = (u64::from(s.track_rate), u64::from(s.out_rate));
-    let required = if src == out { dst } else { dst * src / out + 1 + 1 };
+    let required = if src == out {
+        dst
+    } else {
+        dst * src / out + 1 + 1
+    };
     (required as f64 * f64::from(s.speed)) as u64 + 1 + 1
 }
 
@@ -61,7 +65,12 @@ pub(crate) fn streaming_frames(requested: i64, s: &Sizing) -> u64 {
 
 /// The notification period AudioFlinger grants a normal streaming PCM track of `frames` (Threads.cpp createTrack_l, "Make sure that application is notified"): 0 or more than `frames / nBuffering` becomes `frames / nBuffering` (nBuffering 3 for a triple-buffered mixer period, else 2), capped at 20 ms when the client asked FAST and was denied.
 /// The client's callback thread fills one notification period per wake (AudioTrack processAudioBuffer); a period of 0 makes it spin without ever asking for data.
-pub(crate) fn notification_frames(requested: i64, frames: u64, s: &Sizing, fast_denied: bool) -> u64 {
+pub(crate) fn notification_frames(
+    requested: i64,
+    frames: u64,
+    s: &Sizing,
+    fast_denied: bool,
+) -> u64 {
     let ratio = frames * u64::from(s.out_rate) / (u64::from(s.quantum) * u64::from(s.track_rate));
     let buffering = if ratio == 3 { 3 } else { 2 };
     let mut max = frames / buffering;
