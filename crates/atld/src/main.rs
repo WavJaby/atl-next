@@ -1952,13 +1952,14 @@ fn run(a: &Args) -> Result<ExitCode> {
         (Some(join), Some(shim)) => {
             // the web process's share-sound socket, found as libpulse finds its server (PULSE_SERVER, then the runtime dir's pulse/native)
             let pulse = atl_platform_host::app_access::pulse_socket();
+            let from = atl_platform_host::app_access::pulse_socket_source();
             match &pulse {
                 Some(p) => log(format_args!(
-                    "web process sound: pulse socket {}",
+                    "web process sound: pulse socket {} (from {from})",
                     p.display()
                 )),
                 None => log(format_args!(
-                    "web process sound: no pulse socket (share-sound grants nothing)"
+                    "web process sound: no pulse socket (from {from}; share-sound grants nothing)"
                 )),
             }
             broker.with_webspawn(atl_broker::WebSpawnHost {

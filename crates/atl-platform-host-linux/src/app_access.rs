@@ -49,6 +49,15 @@ pub fn pulse_socket() -> Option<PathBuf> {
     )
 }
 
+/// Where [`pulse_socket`] looks: `PULSE_SERVER` when set, else the runtime dir's default.
+pub fn pulse_socket_source() -> &'static str {
+    if std::env::var_os("PULSE_SERVER").is_some() {
+        "PULSE_SERVER"
+    } else {
+        "XDG_RUNTIME_DIR default"
+    }
+}
+
 /// [`pulse_socket`] for the values `server` (PULSE_SERVER) and `runtime` (XDG_RUNTIME_DIR).
 pub fn pulse_socket_of(server: Option<OsString>, runtime: Option<OsString>) -> Option<PathBuf> {
     let p = match server {

@@ -240,8 +240,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
     };
     println!("run-apk: data root {}", data_root.display());
-    // the desktop's fonts, as a user's run sees them (the pinned test set has no CJK or emoji face)
-    let rt = rt.with_data_root(&data_root).with_desktop_fonts();
+    // the desktop's fonts and the session's pulse server, as a user's run sees them (the pinned test set has no CJK or emoji face)
+    let rt = rt
+        .with_data_root(&data_root)
+        .with_desktop_fonts()
+        .with_session_pulse_server();
     run_on(&rt, args, foreign.as_ref(), pin.as_ref(), files, steps)
 }
 
