@@ -130,6 +130,12 @@ struct Passthrough {
 pub fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
     let root = checkout_root()?;
+    // every command: the next `git worktree add` then links target/ into the pool before cargo's first build there
+    if std::env::var_os(tree::ENV).is_none()
+        && let Some(line) = crate::out::install_hook(&root)?
+    {
+        println!("{line}");
+    }
     let name = verdict_name(&cli.command);
     // every command that builds or runs from the out dir sees the task copies, the repo bind and its build dir at the canonical build path (tree.rs, out::CANONICAL).
     // Outside stay the ones that change what the namespace binds or that orchestrate other checkouts: fetch and patch write src/ (a bind would redirect the write into a task copy), out copies and deletes build dirs, land's children enter their own.

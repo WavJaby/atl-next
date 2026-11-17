@@ -6,7 +6,8 @@
 //! The copy is one interface with two capability tiers (probed per copy, never by host name): `reflink` (`cp --reflink=always`, extents shared, ~2-3 s for main's 100k-entry build on btrfs) and the baseline `copy` (`cp -a`, any filesystem). The create line names the tier; `pool/tier-<name>.count` counts each.
 //! Every build sees its dir at [`CANONICAL`] (the build namespace binds it there), so a base copy stays valid at its new real path.
 //! A process that resolves the dir holds its lock shared until it exits (`build_pool::hold_dir`); create, delete and prune take it exclusive, so a dir is never deleted under a build.
-//! The checkout's `target/` is a symlink to its dir's `target/` (the only per-checkout switch cargo reads with no tracked file or env var), settled when the outermost process ends ([`settle_target`]): the xtask binary running from a real `target/` must outlive the swap.
+//! The checkout's `target/` is a symlink to its dir's `target/` (the only per-checkout switch cargo reads with no tracked file or env var), settled when the outermost process ends ([`settle_target`]): the xtask binary running from the previous `target/` must outlive the swap.
+//! Before that, from `git worktree add` on, it links to `<pool>/boot/<id>` (the post-checkout hook [`install_hook`] writes on every xtask run), so cargo's bootstrap build of xtask lands on the pool; settle moves or removes it. A real `target/` happens only for a worktree made before the hook; settle removes it and counts it (`pool/target-real.count`, else `target-boot.count`).
 //! A dir leaves with its checkout (land `Cleanup`, [`leave`]); `out prune` deletes the dirs of checkouts removed outside xtask and every base but the newest [`KEEP_BASES`].
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -197,7 +198,7 @@ fn make(root: &Path, restore: bool) -> Result<(String, PathBuf)> {
     let line = match pick {
         Some(c) => {
             let tier = copy_tree(&base_of(&ws, c), &dir, Some(c), &[])?;
-            count(&ws, tier);
+            count_tier(&ws, tier);
             let stamps = if restore {
                 restore_stamps(root, &base_of(&ws, c))?
             } else {
@@ -460,14 +461,19 @@ pub fn copy_tree(src: &Path, dst: &Path, base: Option<&str>, skip: &[&str]) -> R
 }
 
 /// Adds one to `pool/tier-<name>.count`. Read-modify-write without a lock: two copies ending at once may count one; the count is a tier-usage signal, not an invariant.
-fn count(ws: &Path, tier: Tier) {
-    let file = pool(ws).join(format!("tier-{}.count", tier.name()));
+fn count_tier(ws: &Path, tier: Tier) {
+    count(ws, &format!("tier-{}", tier.name()));
+}
+
+/// Adds one to counter `<pool>/<name>.count`.
+fn count(ws: &Path, name: &str) {
+    let file = pool(ws).join(format!("{name}.count"));
     let n: u64 = std::fs::read_to_string(&file)
         .ok()
         .and_then(|t| t.trim().parse().ok())
         .unwrap_or(0);
     if let Err(e) = std::fs::write(&file, format!("{}\n", n + 1)) {
-        eprintln!("out: tier count {}: {e}", file.display());
+        eprintln!("out: count {}: {e}", file.display());
     }
 }
 
@@ -643,7 +649,13 @@ fn target_of(dir: &Path) -> PathBuf {
         .join(TARGET)
 }
 
-/// Steps that make `link` (`<checkout>/target`) a link to `want`: none when it is one already (a missing `want` is created), else a link, after a real dir is moved into an absent `want` or removed.
+/// The boot target of build-dir target `want` (`<pool>/ws/<id>/target` -> `<pool>/boot/<id>`): where the [`HOOK`] links a new worktree's `target/` until its build dir exists, so the first `cargo xtask` builds xtask on the pool, never in the checkout.
+fn boot_of(want: &Path) -> Option<PathBuf> {
+    let id = want.parent()?.file_name()?;
+    Some(want.ancestors().nth(3)?.join(BOOT).join(id))
+}
+
+/// Steps that make `link` (`<checkout>/target`) a link to `want`: none when it is one already (a missing `want` is created), else a link, after a real dir or the boot target ([`boot_of`]) is moved into an absent `want` or removed.
 pub fn link_steps(link: &Path, want: &Path) -> Result<Vec<Step>> {
     let relink = Step::Link {
         at: link.to_owned(),
@@ -655,6 +667,20 @@ pub fn link_steps(link: &Path, want: &Path) -> Result<Vec<Step>> {
                 Vec::new()
             } else {
                 vec![Step::Mkdir(want.to_owned())]
+            }
+        }
+        // the boot dir is on the pool like `want`: rename works
+        Entry::Link(to) if Some(&to) == boot_of(want).as_ref() && to.is_dir() => {
+            if want.exists() {
+                vec![Step::Remove(to), relink]
+            } else {
+                vec![
+                    Step::Adopt {
+                        from: to,
+                        to: want.to_owned(),
+                    },
+                    relink,
+                ]
             }
         }
         Entry::Absent | Entry::Link(_) => vec![relink],
@@ -778,7 +804,84 @@ pub fn settle_target(root: &Path) -> Result<()> {
     for step in &steps {
         println!("out: target: {}", describe_step(step));
     }
+    // which route the first build took: `boot` = on the pool via the hook; `real` = a real dir in the checkout (worktree made before the hook was installed, or its `target` removed by hand)
+    let link = root.join(TARGET);
+    let real = steps.iter().any(|s| match s {
+        Step::Remove(p) | Step::Discard(p) => *p == link,
+        Step::Adopt { from, .. } => *from == link,
+        _ => false,
+    });
+    let boot = steps.iter().any(|s| match s {
+        Step::Remove(p) => *p != link,
+        Step::Adopt { from, .. } => *from != link,
+        _ => false,
+    });
+    if real {
+        count(&ws, "target-real");
+        println!(
+            "out: target: the first build wrote a real {} (not via the post-checkout hook)",
+            link.display()
+        );
+    } else if boot {
+        count(&ws, "target-boot");
+    }
     apply_steps(&steps)
+}
+
+/// A boot target's dir under the pool ([`boot_of`]).
+const BOOT: &str = "boot";
+/// The first line after the shebang of the post-checkout hook [`install_hook`] writes: marks a hook as ours (rewritten when its text changes).
+const HOOK_MARK: &str =
+    "# atl-next: generated by cargo xtask (out::install_hook); links target/ into the build pool";
+
+/// The post-checkout hook text for pool `pool` (absolute): on `git worktree add` (previous HEAD all zeros), a checkout without `target` gets `target -> <pool>/boot/<worktree name>`.
+/// Why a hook: cargo builds xtask before xtask runs, and the only per-checkout switch cargo reads with no tracked file or env var is `target` itself (`build.target-dir` takes no templates; a relative one resolves per checkout depth). Without it every new worktree's bootstrap writes ~0.6 GB on the checkout's disk.
+/// Shell because git runs hooks as executables before any of our binaries exist; generated like the host/bin wrappers, never tracked.
+pub fn hook_text(pool: &Path) -> String {
+    let boot = pool.join(BOOT);
+    format!(
+        "#!/bin/sh\n{HOOK_MARK}\n[ \"$1\" = 0000000000000000000000000000000000000000 ] || exit 0\n[ -e target ] || [ -L target ] && exit 0\nid=$(basename \"$(git rev-parse --absolute-git-dir)\")\nmkdir -p '{b}'/\"$id\" && ln -s '{b}'/\"$id\" target\n",
+        b = boot.display()
+    )
+}
+
+/// Writes the post-checkout hook ([`hook_text`]) of the repository at `root` when missing or ours and outdated; returns the line when it writes. A foreign hook is refused: chaining an unknown script is not ours to decide.
+pub fn install_hook(root: &Path) -> Result<Option<String>> {
+    let ws = Layout::of(root)?.workspace().to_owned();
+    let pool = pool(&ws);
+    let pool = std::fs::canonicalize(&pool).unwrap_or(pool);
+    let path = PathBuf::from(git(
+        Some(root),
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "hooks/post-checkout",
+        ],
+    )?);
+    write_hook(&path, &hook_text(&pool))
+}
+
+fn write_hook(path: &Path, text: &str) -> Result<Option<String>> {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::read_to_string(path) {
+        Ok(old) if old == text => return Ok(None),
+        Ok(old) if !old.lines().any(|l| l == HOOK_MARK) => bail!(
+            "{} is not the hook xtask writes (it links a new worktree's target/ into the build pool, so the first build stays off the checkout's disk): move it aside (`mv {0} {0}.local`) and rerun (xtask then writes its own; call {0}.local from it by hand if still needed)",
+            path.display()
+        ),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("chmod {}", path.display()))?;
+    Ok(Some(format!("out: hook: wrote {}", path.display())))
 }
 
 /// The `target/` line of `out show`.
@@ -879,7 +982,7 @@ pub fn publish(land: &Path) -> Result<String> {
     std::fs::write(&stamps, crate::checkout_stamps::record(land)?)
         .with_context(|| format!("writing {}", stamps.display()))?;
     let tier = copy_base(&src, &dst)?;
-    count(&ws, tier);
+    count_tier(&ws, tier);
     Ok(format!("out: base/{head} from ws/{id} ({})", tier.name()))
 }
 
@@ -991,7 +1094,7 @@ pub fn refresh(root: &Path) -> Result<Option<String>> {
             return Err(e);
         }
     };
-    count(&ws, tier);
+    count_tier(&ws, tier);
     let mut kept = Vec::new();
     for root_name in out_prune::DIR_ROOTS {
         let (own, fresh) = (old.join(root_name), dir.join(root_name));
@@ -1739,6 +1842,134 @@ mod tests {
         apply_steps(&steps).expect("apply");
         assert!(want.is_dir());
         std::fs::remove_dir_all(&disk).expect("cleanup disk");
+        std::fs::remove_dir_all(&d).expect("cleanup");
+    }
+
+    /// The hook's boot target, the build dir made without a target: the bootstrap build moves in (same pool filesystem), the checkout keeps no dir.
+    #[test]
+    fn a_boot_target_is_moved_into_an_absent_build_dir_target() {
+        let d = scratch("link-boot-adopt");
+        let root = d.join("wt/this");
+        let boot = d.join("pool/boot/this");
+        put(&boot.join("debug/xtask"));
+        std::fs::create_dir_all(&root).expect("checkout");
+        std::os::unix::fs::symlink(&boot, root.join(TARGET)).expect("hook link");
+        let want = d.join("pool/ws/this/target");
+        let steps = link_steps(&root.join(TARGET), &want).expect("steps");
+        assert_eq!(
+            steps[0],
+            Step::Adopt {
+                from: boot.clone(),
+                to: want.clone(),
+            }
+        );
+        apply_steps(&steps).expect("apply");
+        assert!(want.join("debug/xtask").is_file());
+        assert!(!boot.exists());
+        assert_eq!(entry(&root.join(TARGET)).expect("entry"), Entry::Link(want));
+        std::fs::remove_dir_all(&d).expect("cleanup");
+    }
+
+    /// The build dir copied from a base has a target: the boot target goes, the link moves to the build dir's.
+    #[test]
+    fn a_boot_target_is_removed_when_the_build_dir_has_one() {
+        let d = scratch("link-boot-remove");
+        let root = d.join("wt/this");
+        let boot = d.join("pool/boot/this");
+        put(&boot.join("debug/xtask"));
+        std::fs::create_dir_all(&root).expect("checkout");
+        std::os::unix::fs::symlink(&boot, root.join(TARGET)).expect("hook link");
+        let want = d.join("pool/ws/this/target");
+        put(&want.join("kept.txt"));
+        let steps = link_steps(&root.join(TARGET), &want).expect("steps");
+        assert_eq!(steps[0], Step::Remove(boot.clone()));
+        apply_steps(&steps).expect("apply");
+        assert!(!boot.exists() && want.join("kept.txt").is_file());
+        assert_eq!(entry(&root.join(TARGET)).expect("entry"), Entry::Link(want));
+        std::fs::remove_dir_all(&d).expect("cleanup");
+    }
+
+    /// Another checkout's boot dir is not ours to move: only relinked.
+    #[test]
+    fn a_link_to_another_boot_dir_is_only_relinked() {
+        let d = scratch("link-boot-other");
+        let root = d.join("wt/this");
+        let other = d.join("pool/boot/other");
+        put(&other.join("x"));
+        std::fs::create_dir_all(&root).expect("checkout");
+        std::os::unix::fs::symlink(&other, root.join(TARGET)).expect("link");
+        let want = d.join("pool/ws/this/target");
+        let steps = link_steps(&root.join(TARGET), &want).expect("steps");
+        assert_eq!(
+            steps,
+            vec![Step::Link {
+                at: root.join(TARGET),
+                to: want,
+            }]
+        );
+        std::fs::remove_dir_all(&d).expect("cleanup");
+    }
+
+    /// The generated hook, run as git runs it on `git worktree add` (previous HEAD all zeros) in a fresh repo: `target` links to `<pool>/boot/<git dir name>`, which exists; a checkout switch (non-zero previous HEAD) does nothing.
+    #[test]
+    fn the_hook_links_a_new_checkouts_target_into_the_pool() {
+        let d = scratch("hook-run");
+        let repo = d.join("wt/new");
+        std::fs::create_dir_all(&repo).expect("repo");
+        git(Some(&repo), &["init", "-q"]).expect("git init");
+        let hook = d.join("post-checkout");
+        assert!(
+            write_hook(&hook, &hook_text(&d.join("pool")))
+                .expect("write")
+                .is_some()
+        );
+        let run = |prev: &str| {
+            let st = Command::new(&hook)
+                .args([prev, "1111111111111111111111111111111111111111", "1"])
+                .current_dir(&repo)
+                .status()
+                .expect("run hook");
+            assert!(st.success());
+        };
+        run("2222222222222222222222222222222222222222");
+        assert_eq!(entry(&repo.join(TARGET)).expect("entry"), Entry::Absent);
+        run("0000000000000000000000000000000000000000");
+        let boot = d.join("pool").join(BOOT).join(".git");
+        assert_eq!(
+            entry(&repo.join(TARGET)).expect("entry"),
+            Entry::Link(boot.clone())
+        );
+        assert!(boot.is_dir());
+        std::fs::remove_dir_all(&d).expect("cleanup");
+    }
+
+    /// Ours is rewritten when its text changes and left alone when equal; a foreign hook is refused with the move-aside command.
+    #[test]
+    fn a_foreign_hook_is_refused_and_ours_is_kept_current() {
+        let d = scratch("hook-write");
+        let hook = d.join("hooks/post-checkout");
+        assert!(
+            write_hook(&hook, &hook_text(Path::new("/p1")))
+                .expect("new")
+                .is_some()
+        );
+        assert!(
+            write_hook(&hook, &hook_text(Path::new("/p1")))
+                .expect("same")
+                .is_none()
+        );
+        assert!(
+            write_hook(&hook, &hook_text(Path::new("/p2")))
+                .expect("changed")
+                .is_some()
+        );
+        std::fs::write(&hook, "#!/bin/sh\necho mine\n").expect("foreign");
+        let err = write_hook(&hook, &hook_text(Path::new("/p2"))).expect_err("refused");
+        assert!(format!("{err:#}").contains(".local"), "{err:#}");
+        assert_eq!(
+            std::fs::read_to_string(&hook).expect("kept"),
+            "#!/bin/sh\necho mine\n"
+        );
         std::fs::remove_dir_all(&d).expect("cleanup");
     }
 
