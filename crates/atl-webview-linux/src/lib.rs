@@ -152,7 +152,7 @@ struct Events {
     title: RefCell<Option<String>>,
     /// [`View::provider_load`].
     provider_load: std::cell::Cell<bool>,
-    /// The main frame is loading (load-changed Started .. Finished): an http(s) navigation decision of type "other" without gesture in this window is taken for a subframe's first load.
+    /// The main frame is loading (load-changed Started .. Finished): a navigation decision for an engine-loaded scheme, of type "other", without gesture or redirect, in this window is taken for a subframe's first load.
     main_loading: std::cell::Cell<bool>,
     /// The URL of the main-frame navigation last let through, reported by the next load start: after a cross-site navigation (WebKit swaps the web process) the view's URI still names the old
     /// page at load-changed Started (measured: test app row webview-http). Taken by the next load start, cleared by every decision.
@@ -287,8 +287,9 @@ fn navigation_policy(ev: &Rc<Events>, decision: &webkit6::PolicyDecision) -> boo
     }
     let scheme = scheme(&uri).unwrap_or_default();
     let engine_loads = ENGINE_SCHEMES.contains(&scheme.as_str());
-    let http = scheme == "http" || scheme == "https";
-    let subframe_load = http
+    // an engine-loaded document (http(s), and the about:blank / data: iframes ad pages make: Battle Cats TW's AdMob client cancelled two `about:` ones, 2026-11-18) while the page loads;
+    // a custom scheme is always the app's to decide (WebViewClient javadoc: "may be called for subframes and with non-HTTP(S) schemes")
+    let subframe_load = engine_loads
         && !gesture
         && !redirect
         && kind == webkit6::NavigationType::Other

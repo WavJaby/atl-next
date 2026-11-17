@@ -180,8 +180,8 @@ pub enum WebEvent {
         content_length: i64,
     },
     /// A navigation the page, the user or a redirect started is about to start; it waits until `reply` finishes (no `LoadStarted` before). Not reported: navigations the provider asked for
-    /// ([`WebView::load_uri`], [`WebView::load_bytes`], [`WebView::reload`], [`WebView::go_back_or_forward`]; a redirect of one is reported), POST navigations, and http(s) loads the engine
-    /// takes for a subframe's first load ([`NavigationRequest::main_frame`]).
+    /// ([`WebView::load_uri`], [`WebView::load_bytes`], [`WebView::reload`], [`WebView::go_back_or_forward`]; a redirect of one is reported), POST navigations, and loads the engine takes for
+    /// a subframe's first load ([`NavigationRequest::main_frame`]).
     Navigation {
         /// What is about to load.
         request: NavigationRequest,
@@ -197,8 +197,8 @@ pub struct NavigationRequest {
     pub uri: String,
     /// The HTTP method (`GET`).
     pub method: String,
-    /// For the main frame. WebKitGTK's UI-process API names no target frame: an http(s) load with no gesture, not a redirect, of navigation type "other", while the main frame is loading, is taken for
-    /// a subframe's first load (an `<iframe src>` of the page) and not reported; every other navigation is reported as the main frame's.
+    /// For the main frame. WebKitGTK's UI-process API names no target frame: a load of a scheme the engine loads itself (http(s), about:, data:, ...) with no gesture, not a redirect, of navigation
+    /// type "other", while the main frame is loading, is taken for a subframe's first load (an `<iframe>` of the page) and not reported; every other navigation is reported as the main frame's.
     pub main_frame: bool,
     /// A server redirect of a navigation.
     pub redirect: bool,
