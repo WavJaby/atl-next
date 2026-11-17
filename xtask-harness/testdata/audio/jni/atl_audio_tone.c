@@ -20,6 +20,8 @@
 #define SLES_BUFFERS 2
 // how long the caller waits for the last callback / the last frame, past the tone's own length
 #define DRAIN_MS 2000
+// after the last frame was handed out, how long the caller lets the track's buffer (a few thousand frames, under 0.1 s at 48 kHz) play before it stops the player
+#define PLAYOUT_MS 500
 
 #ifdef ATL_TONE_SILENT
 #define AMPLITUDE_SCALE 0.0
@@ -134,6 +136,8 @@ JNIEXPORT jstring JNICALL Java_com_example_atlaudio_Main_slesTone(JNIEnv *env, j
     int64_t limit = now_ms() + (int64_t)frames * 1000 / rate + DRAIN_MS;
     while ((g_sles.tone.next < g_sles.tone.frames || g_sles.callbacks < g_sles.enqueued) && now_ms() < limit)
         usleep(10000);
+    // a buffer's callback means the track took it, not that it played: let the track's buffer play out before stopping (ATL's stop does not drain yet)
+    usleep(PLAYOUT_MS * 1000);
     (*play)->SetPlayState(play, SL_PLAYSTATE_STOPPED);
     snprintf(msg, sizeof msg, "sles enqueued=%d callbacks=%d failed=%d", g_sles.enqueued, g_sles.callbacks, g_sles.failed);
 out:
@@ -152,13 +156,13 @@ static struct {
     volatile int done;
 } g_aaudio;
 
+// past the tone the callback hands out silence and continues; the caller stops the stream after PLAYOUT_MS. Not AAUDIO_CALLBACK_RESULT_STOP: that stops the track at once, and ATL's stop drops the frames still buffered (AOSP drains them)
 static aaudio_data_callback_result_t aaudio_cb(AAudioStream *stream, void *user, void *audio, int32_t frames)
 {
     tone_fill(&g_aaudio.tone, audio, frames);
-    if (g_aaudio.tone.next < g_aaudio.tone.frames)
-        return AAUDIO_CALLBACK_RESULT_CONTINUE;
-    g_aaudio.done = 1;
-    return AAUDIO_CALLBACK_RESULT_STOP;
+    if (g_aaudio.tone.next >= g_aaudio.tone.frames)
+        g_aaudio.done = 1;
+    return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
 // "aaudio open=<rc> start=<rc> written=<tone frames handed out> stop=<rc> close=<rc>"; "aaudio dlopen null" without libaaudio
@@ -202,7 +206,7 @@ JNIEXPORT jstring JNICALL Java_com_example_atlaudio_Main_aaudioTone(JNIEnv *env,
         while (rc_start == AAUDIO_OK && !g_aaudio.done && now_ms() < limit)
             usleep(10000);
         // the last callback's frames are still in the track's buffer: let them play out before stopping
-        usleep(DRAIN_MS / 4 * 1000);
+        usleep(PLAYOUT_MS * 1000);
         rc_stop = stop(s);
         rc_close = close(s);
     }
