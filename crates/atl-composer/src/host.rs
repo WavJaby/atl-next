@@ -905,6 +905,11 @@ impl Composer {
         // the clock is about to park: nothing is left to count, so this is the line the gate reads
         if st.in_flight.is_empty() && !st.wants_frame() {
             st.log_counters(monotonic_ns());
+            // held back: the clock thread may already be parked without a deadline (it saw nothing pending); wake it so it parks until the period ends and logs the line
+            if st.counters_pending {
+                drop(st);
+                self.notify();
+            }
         }
     }
 
