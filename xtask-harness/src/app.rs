@@ -351,7 +351,9 @@ const PROCESSES_WANT: &str = "count=1 own=1 uid=true name=true pkg=true importan
 /// - `checksums=0`: requestChecksums reaches the listener with an empty list, ApkChecksums' answer when no APK file can be read (getAvailableApkChecksums / calculateChecksumIfRequested skip on
 ///   IOException). A device would list the required SHA256; the services cannot read app files yet (counted divergence). Before: the List argument was refused -> IllegalArgumentException.
 const SYSANSWERS: &str = "AtlTest: sysanswers: ";
-const SYSANSWERS_WANT: &str = "checksums=0";
+/// - `volume=5 max=15 ringer=2 mode=0`: a fresh device's STREAM_MUSIC (AudioSystem.DEFAULT_STREAM_VOLUME[3] = 5, AudioService.MAX_STREAM_VOLUME[3] = 15), RINGER_MODE_NORMAL (2),
+///   MODE_NORMAL (0). Before: all four 0 (UNKNOWN_TRANSACTION's empty reply), i.e. muted and RINGER_MODE_SILENT.
+const SYSANSWERS_WANT: &str = "checksums=0 volume=5 max=15 ringer=2 mode=0";
 /// Main.settings' line, answered by AOSP SettingsProvider in its own process (`id=<s> again=<b> screen_off=<s> auto_time=<s> rotation=<s>`, [`settings_why`]).
 const SETTINGS: &str = "AtlTest: settings: ";
 /// The line after `id=`: the defaults DatabaseHelper loads from SettingsProvider's res/values/defaults.xml -- def_screen_off_timeout 60000, def_auto_time true (loadBooleanSetting writes "1"),

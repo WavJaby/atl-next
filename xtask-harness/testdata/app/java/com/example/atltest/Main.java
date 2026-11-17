@@ -671,7 +671,18 @@ public class Main extends Activity {
 
     /** Small system-service answers games read, one field each: what the call returned, or the throwable's simple name. */
     private String sysAnswers() {
-        return "checksums=" + checksums();
+        return "checksums=" + checksums() + " " + audio();
+    }
+
+    /** AudioManager as games read it before playing: STREAM_MUSIC volume / max, ringer mode, audio mode. */
+    private String audio() {
+        try {
+            android.media.AudioManager am = (android.media.AudioManager) getSystemService(AUDIO_SERVICE);
+            return "volume=" + am.getStreamVolume(android.media.AudioManager.STREAM_MUSIC) + " max=" + am.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC)
+                    + " ringer=" + am.getRingerMode() + " mode=" + am.getMode();
+        } catch (Throwable t) {
+            return "audio=" + t.getClass().getSimpleName();
+        }
     }
 
     /** PackageManager.requestChecksums on the fixture itself (TRUST_ALL, SHA256 required): the number of checksums the listener got within 5 s, "timeout", or the throwable's simple name. */
@@ -680,9 +691,12 @@ public class Main extends Activity {
             java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(1);
             int[] got = {-1};
             getPackageManager().requestChecksums(getPackageName(), false, android.content.pm.Checksum.TYPE_WHOLE_SHA256,
-                    android.content.pm.PackageManager.TRUST_ALL, checksums -> {
-                        got[0] = checksums.size();
-                        done.countDown();
+                    android.content.pm.PackageManager.TRUST_ALL, new android.content.pm.PackageManager.OnChecksumsReadyListener() {
+                        @Override
+                        public void onChecksumsReady(java.util.List<android.content.pm.ApkChecksum> checksums) {
+                            got[0] = checksums.size();
+                            done.countDown();
+                        }
                     });
             return done.await(5, java.util.concurrent.TimeUnit.SECONDS) ? Integer.toString(got[0]) : "timeout";
         } catch (Throwable t) {

@@ -35,6 +35,7 @@ pub mod running_processes;
 pub mod sensor;
 pub mod shared_memory;
 pub mod tasks;
+pub mod volume;
 pub mod window_layout;
 
 #[cfg(feature = "converter")]
