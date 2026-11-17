@@ -168,12 +168,12 @@ impl Tier {
         }
     }
 
-    /// The ticket name's first byte: names sort as (tier, arrival) for every reader, old binaries included (a pre-tier name starts with a digit then a digit, which sorts after `0-` and before `1-`).
-    fn digit(self) -> char {
+    /// The ticket name's prefix: names sort as (tier, arrival) for every reader. An agent's name is the pre-tier format (`<nanos:020>-...`, today `01...`) unchanged, so agent tickets of xtask binaries older than tiers interleave with new ones by arrival; `0-` and `0.` sort before any `01...`. ! Never give agents a prefix that sorts after digits: old binaries' later tickets would then pass every new agent ticket until promotion.
+    fn prefix(self) -> &'static str {
         match self {
-            Tier::Interactive => '0',
-            Tier::Land => '1',
-            Tier::Agent => '2',
+            Tier::Interactive => "0-",
+            Tier::Land => "0.",
+            Tier::Agent => "",
         }
     }
 
@@ -436,7 +436,7 @@ impl Ticket {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
-        let name = format!("{}-{nanos:020}-{pid:010}-{seq:010}", tier.digit());
+        let name = format!("{}{nanos:020}-{pid:010}-{seq:010}", tier.prefix());
         let tmp = queue.join(format!("tmp-{name}"));
         let lock = OpenOptions::new()
             .read(true)
@@ -462,7 +462,7 @@ impl Ticket {
 
     /// Moves the ticket into the top tier, keeping its arrival: a rename, so the waiter's lock (on the open file) stays and readers see one name or the other.
     fn promote(&mut self, queue: &Path) -> Result<()> {
-        let name = format!("{}-{}", Tier::Interactive.digit(), arrival(&self.name));
+        let name = format!("{}{}", Tier::Interactive.prefix(), arrival(&self.name));
         let path = queue.join(&name);
         std::fs::rename(&self.path, &path)
             .with_context(|| format!("promoting {}", self.path.display()))?;
@@ -473,12 +473,12 @@ impl Ticket {
     }
 }
 
-/// A ticket name without its tier: `<nanos>-<pid>-<seq>`, the arrival order. A pre-tier name is all arrival.
+/// A ticket name without its tier prefix: `<nanos>-<pid>-<seq>`, the arrival order. An agent's name is all arrival.
 fn arrival(name: &str) -> &str {
-    match name.split_once('-') {
-        Some((tier, rest)) if tier.len() == 1 => rest,
-        _ => name,
-    }
+    [Tier::Interactive, Tier::Land]
+        .into_iter()
+        .find_map(|t| name.strip_prefix(t.prefix()))
+        .unwrap_or(name)
 }
 
 /// Live tickets that arrived before `me` but sort after it: the ones a grant to `me` passes.
@@ -1028,27 +1028,30 @@ mod tests {
         assert!(may_bypass(head, &snap(1, 6)));
     }
 
-    /// Ticket names sort as (tier, arrival): a later interactive ticket before an earlier land and agent one, a later land before an earlier agent; a pre-tier name (all digits) sorts after interactive and before land.
+    /// Ticket names sort as (tier, arrival): a later interactive ticket before an earlier land one, both before agents; agent tickets (the pre-tier format, which old binaries still write) interleave by arrival whichever binary wrote them.
     #[test]
     fn tickets_order_by_tier_then_arrival() {
-        let agent_early = "2-01794900000000000001-0000000001-0000000000";
-        let land_mid = "1-01794900000000000002-0000000002-0000000000";
+        let agent_new_early = "01794900000000000001-0000000001-0000000000";
+        let land_mid = "0.01794900000000000002-0000000002-0000000000";
         let interactive_late = "0-01794900000000000003-0000000003-0000000000";
-        let pre_tier = "01794900000000000000-0000000004-0000000000";
-        let mut names = vec![agent_early, land_mid, interactive_late, pre_tier];
+        let agent_old_later = "01794900000000000004-0000000004-0000000000";
+        let mut names = vec![agent_old_later, agent_new_early, land_mid, interactive_late];
         names.sort();
-        assert_eq!(names, [interactive_late, pre_tier, land_mid, agent_early]);
+        assert_eq!(
+            names,
+            [interactive_late, land_mid, agent_new_early, agent_old_later]
+        );
         let tickets: Vec<(String, Option<Class>)> =
             names.iter().map(|n| ((*n).to_owned(), None)).collect();
         assert_eq!(queue_position(&tickets, interactive_late), (0, 4));
-        // the interactive ticket passes the three that arrived before it; the agent passes none
-        assert_eq!(passed_earlier(&tickets, interactive_late), 3);
-        assert_eq!(passed_earlier(&tickets, agent_early), 0);
-        assert_eq!(
-            arrival(interactive_late),
-            "01794900000000000003-0000000003-0000000000"
-        );
-        assert_eq!(arrival(pre_tier), pre_tier);
+        assert_eq!(queue_position(&tickets, agent_old_later), (3, 4));
+        // interactive passes the two that arrived before it (land, early agent); land passes the early agent; agents pass none
+        assert_eq!(passed_earlier(&tickets, interactive_late), 2);
+        assert_eq!(passed_earlier(&tickets, land_mid), 1);
+        assert_eq!(passed_earlier(&tickets, agent_new_early), 0);
+        assert_eq!(arrival(interactive_late), &interactive_late[2..]);
+        assert_eq!(arrival(land_mid), &land_mid[2..]);
+        assert_eq!(arrival(agent_new_early), agent_new_early);
     }
 
     /// Mixed classes: an interactive cargo request that arrives after an agent's native-full ticket is admitted first once slots free, says so, and the agent's full native waits on.
