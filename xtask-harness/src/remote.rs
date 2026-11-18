@@ -1868,18 +1868,34 @@ fn prune(root: &Path, a: &PruneArgs) -> Result<ExitCode> {
     host.reach()?;
     let live = out::live_ids_of(root)?;
     let host_arches = host_arch_names(root)?;
+    let failed = prune_dirs(&host, REMOTE_ROOT, &live, &host_arches, a.execute)?;
+    Ok(if failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// [`prune`] on run dir `base` of `host`: the same code the tests run on a throwaway dir. Returns the number of failed removals.
+fn prune_dirs(
+    host: &Host,
+    base: &str,
+    live: &BTreeSet<String>,
+    host_arches: &BTreeSet<String>,
+    execute: bool,
+) -> Result<usize> {
     let mut rows = Vec::new();
-    for entry in parse_listing(&host.run_script(&list_script(REMOTE_ROOT))?) {
+    for entry in parse_listing(&host.run_script(&list_script(base))?) {
         match entry {
             Listed::Dir { name, kib, busy } => {
-                let class = classify(&name, &live, &host_arches);
+                let class = classify(&name, live, host_arches);
                 rows.push((name, kib, class, busy));
             }
             Listed::Other(text) => println!("unknown {text}: not a directory, never touched"),
         }
     }
     println!(
-        "remote prune {}: {} run dir(s) under ~/{REMOTE_ROOT}",
+        "remote prune {}: {} run dir(s) under {base}",
         host.label(),
         rows.len()
     );
@@ -1905,7 +1921,7 @@ fn prune(root: &Path, a: &PruneArgs) -> Result<ExitCode> {
         .filter(|(_, _, class, busy)| *class == Class::Orphan && *busy)
         .count();
     let planned_kib: u64 = removable.iter().filter_map(|(_, kib, _, _)| *kib).sum();
-    if !a.execute {
+    if !execute {
         let note = if held > 0 {
             format!("; {held} held orphan(s) skipped")
         } else {
@@ -1916,13 +1932,13 @@ fn prune(root: &Path, a: &PruneArgs) -> Result<ExitCode> {
             removable.len(),
             planned_kib as f64 / 1024.0
         );
-        return Ok(ExitCode::SUCCESS);
+        return Ok(0);
     }
     let outcomes = if removable.is_empty() {
         BTreeMap::new()
     } else {
         let names: Vec<String> = removable.iter().map(|(name, ..)| name.clone()).collect();
-        parse_removal(&host.run_script(&remove_script(REMOTE_ROOT, &names)?)?)
+        parse_removal(&host.run_script(&remove_script(base, &names)?)?)
     };
     let (mut removed, mut gone_kib, mut busy, mut failed) = (0usize, 0u64, held, 0usize);
     for (name, kib, _, _) in &removable {
@@ -1950,11 +1966,7 @@ fn prune(root: &Path, a: &PruneArgs) -> Result<ExitCode> {
         "remote prune: removed {removed} tree(s), {:.1} MiB; {busy} busy skipped; {failed} failed",
         gone_kib as f64 / 1024.0
     );
-    Ok(if failed == 0 {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    })
+    Ok(failed)
 }
 
 #[cfg(test)]
@@ -2894,6 +2906,33 @@ mod tests {
             run_root.join("keep").is_file(),
             "a refused run removes nothing"
         );
+        holder.kill().expect("release the lock");
+        holder.wait().expect("reap the holder");
+    }
+
+    #[test]
+    fn prune_dirs_executes_on_a_throwaway_dir() {
+        let scratch = Scratch::new("exec");
+        let root = scratch.0.clone();
+        let base = root.display().to_string();
+        for name in ["repo", "slot-1", "slot-2"] {
+            std::fs::create_dir_all(root.join(name)).expect("run dir");
+            std::fs::write(root.join(name).join("file"), [0u8; 4096]).expect("file");
+        }
+        let mut holder = hold_lock(&root.join("slot-1"));
+        let host = Host::Local(root.clone());
+        let live = BTreeSet::from(["repo".to_owned()]);
+        let no_arches = BTreeSet::new();
+
+        let dry = prune_dirs(&host, &base, &live, &no_arches, false).expect("dry run");
+        assert_eq!(dry, 0, "a dry run has no failures");
+        assert!(root.join("slot-2").is_dir(), "a dry run removes nothing");
+
+        let failed = prune_dirs(&host, &base, &live, &no_arches, true).expect("execute");
+        assert_eq!(failed, 0, "a held orphan is a skip, not a failure");
+        assert!(!root.join("slot-2").exists(), "a free orphan is removed");
+        assert!(root.join("slot-1").is_dir(), "a held orphan is skipped");
+        assert!(root.join("repo").is_dir(), "a live dir stays");
         holder.kill().expect("release the lock");
         holder.wait().expect("reap the holder");
     }
