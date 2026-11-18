@@ -503,6 +503,8 @@ struct Plan {
     root: String,
     scratch: String,
     env: Vec<(String, String)>,
+    /// Variables whose value is the target's desktop session's ([`session_env_script`]), set only when the session sets them.
+    session_env: Vec<String>,
     program: String,
     args: Vec<String>,
     /// (bundle path, content): the package and permission files, the fontconfig copy.
@@ -515,6 +517,37 @@ struct Plan {
 
 fn out_path(rel: &str) -> String {
     format!("{BASE_MARK}/out/{rel}")
+}
+
+/// `cmd`'s explicit variables for the target, paths relocated: the target starts atld under `env -i`, so a variable `cmd` removes is simply absent there and is skipped.
+fn command_env(cmd: &Command, roots: &Roots) -> Result<Vec<(String, String)>> {
+    cmd.get_envs()
+        .filter_map(|(key, value)| value.map(|v| (key, v)))
+        .map(|(key, value)| Ok((utf8(key)?, relocate(&utf8(value)?, roots))))
+        .collect()
+}
+
+/// Of `session_env`, the variables `env` does not set: an explicit value (`--env`) wins over the target session's.
+fn from_session(session_env: &[&str], env: &[(String, String)]) -> Vec<String> {
+    session_env
+        .iter()
+        .filter(|&&n| !env.iter().any(|(k, _)| k == n))
+        .map(|&n| n.to_owned())
+        .collect()
+}
+
+/// The shell variable holding the target session's value of `name`.
+fn session_var(name: &str) -> String {
+    format!("ATL_SESSION_{name}")
+}
+
+/// Reads `name` from the target user's session manager (`systemctl --user show-environment`: what an app the desktop starts inherits; the ssh shell's own env is not the desktop's) into
+/// [`session_var`]; empty when the session does not set it or has no systemd user manager.
+fn session_env_script(name: &str) -> String {
+    format!(
+        "{}=$(systemctl --user show-environment 2>/dev/null | sed -n 's/^{name}=//p' | head -n 1)\n",
+        session_var(name)
+    )
 }
 
 impl Plan {
@@ -554,6 +587,9 @@ impl Plan {
                 &word(&out_path(&labwc_log)),
             )),
         }
+        for name in &self.session_env {
+            s.push_str(&session_env_script(name));
+        }
         let lib_path: Vec<String> = self
             .lib_dirs
             .iter()
@@ -563,6 +599,13 @@ impl Plan {
             "env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=\"$HOME\" XDG_RUNTIME_DIR=\"/run/user/$(id -u)\" LD_LIBRARY_PATH={}",
             word(&lib_path.join(":"))
         ));
+        // `${V:+"N=$V"}`: one word when the session sets it, nothing when it does not (env -i then leaves it unset, libpulse's default)
+        for name in &self.session_env {
+            s.push_str(&format!(
+                " ${{{v}:+\"{name}=${v}\"}}",
+                v = session_var(name)
+            ));
+        }
         if self.display != Display::Headless {
             s.push_str(" WAYLAND_DISPLAY=\"$WL\"");
         }
@@ -635,6 +678,7 @@ impl RemoteRun {
     }
 
     /// Starts `cmd` (atld's command, host paths) on the target as one run. The child is the transfer, `<transport> < plan | tar -x` (`sh -s` for `local:`), and its end is the run's. `root` and `scratch` lie under the out dir, where the logs return. `written` are the files the command reads that this host wrote: their content goes into the plan.
+    /// `session_env`: variables atld takes from the target's desktop session ([`session_env_script`]), never from this host.
     pub fn spawn(
         &self,
         roots: &Roots,
@@ -642,6 +686,7 @@ impl RemoteRun {
         root: &Path,
         scratch: &Path,
         written: &[PathBuf],
+        session_env: &[&str],
     ) -> Result<Child> {
         ensure!(
             cmd.get_current_dir().is_none(),
@@ -652,13 +697,8 @@ impl RemoteRun {
             .strip_suffix("/root")
             .unwrap_or(&root_rel)
             .to_owned();
-        let env = cmd
-            .get_envs()
-            .map(|(key, value)| -> Result<(String, String)> {
-                let value = value.with_context(|| format!("{key:?} is unset, not set"))?;
-                Ok((utf8(key)?, relocate(&utf8(value)?, roots)))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let env = command_env(cmd, roots)?;
+        let session_env = from_session(session_env, &env);
         let args = cmd
             .get_args()
             .map(|a| Ok(relocate(&utf8(a)?, roots)))
@@ -679,6 +719,7 @@ impl RemoteRun {
             root: root_rel,
             scratch: rel_out(&roots.out, scratch)?,
             env,
+            session_env,
             program: relocate(&utf8(cmd.get_program())?, roots),
             args,
             files,
@@ -1902,6 +1943,73 @@ mod tests {
         )
     }
 
+    /// A removed variable (atld_run's gate default for PULSE_SERVER) is absent on the target, not an error (the 2026-11-18 `"PULSE_SERVER" is unset, not set` refusal); a session variable is
+    /// read on the target and passed only when set there; an explicit value wins over the session's.
+    #[test]
+    fn removed_vars_are_absent_and_session_vars_resolve_on_the_target() {
+        let r = host_roots();
+        let mut cmd = Command::new("atld");
+        cmd.env_remove("PULSE_SERVER")
+            .env("RUST_LOG", "info")
+            .env("FONTCONFIG_FILE", "/w/out/pool/ws/x9/f.conf");
+        let env = command_env(&cmd, &r).expect("removal is no error");
+        let mut keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["FONTCONFIG_FILE", "RUST_LOG"]);
+        assert!(env.contains(&("FONTCONFIG_FILE".into(), "@BASE@/out/f.conf".into())));
+        assert_eq!(from_session(&["PULSE_SERVER"], &env), ["PULSE_SERVER"]);
+        let explicit = [("PULSE_SERVER".to_owned(), "unix:/p".to_owned())];
+        assert!(from_session(&["PULSE_SERVER"], &explicit).is_empty());
+
+        let plan = Plan {
+            tag: "run-apk/x".into(),
+            root: "run-apk/x/root".into(),
+            scratch: "run-apk/x/scratch".into(),
+            env,
+            session_env: vec!["PULSE_SERVER".into()],
+            program: "@BASE@/out/cargo/release/atld".into(),
+            args: Vec::new(),
+            files: Vec::new(),
+            lib_dirs: Vec::new(),
+            limit: 60,
+            display: Display::Headless,
+        };
+        let s = plan.script("b");
+        let read = s
+            .find("ATL_SESSION_PULSE_SERVER=$(systemctl --user show-environment")
+            .expect("the session read");
+        let env_line = s.find("env -i ").expect("env line");
+        assert!(read < env_line, "{s}");
+        assert!(
+            s[env_line..].contains(
+                " ${ATL_SESSION_PULSE_SERVER:+\"PULSE_SERVER=$ATL_SESSION_PULSE_SERVER\"}"
+            ),
+            "{s}"
+        );
+    }
+
+    /// The `${V:+"N=$V"}` word under sh: nothing when the session has no value, one `N=value` word (spaces kept) when it has one.
+    #[test]
+    fn session_var_word_expands_to_nothing_or_one_word() {
+        let word = format!(
+            "${{{v}:+\"PULSE_SERVER=${v}\"}}",
+            v = session_var("PULSE_SERVER")
+        );
+        let run = |value: Option<&str>| {
+            let mut c = Command::new("sh");
+            c.arg("-c")
+                .arg(format!("set -- {word}; echo \"$#:$*\""))
+                .env_remove(session_var("PULSE_SERVER"));
+            if let Some(v) = value {
+                c.env(session_var("PULSE_SERVER"), v);
+            }
+            String::from_utf8(c.output().expect("sh").stdout).expect("utf8")
+        };
+        assert_eq!(run(None), "0:\n");
+        assert_eq!(run(Some("")), "0:\n");
+        assert_eq!(run(Some("unix:/a b")), "1:PULSE_SERVER=unix:/a b\n");
+    }
+
     #[test]
     fn relocate_maps_each_root_at_a_token_start_only() {
         let r = host_roots();
@@ -1974,6 +2082,7 @@ mod tests {
                 "FONTCONFIG_FILE".to_owned(),
                 "@BASE@/out/gl/run/scratch/fonts.conf".to_owned(),
             )],
+            session_env: Vec::new(),
             program: "@BASE@/out/cargo/release/atld".to_owned(),
             args: vec!["--root".to_owned(), "@BASE@/out/gl/run/root".to_owned()],
             files: vec![(
@@ -2022,6 +2131,7 @@ mod tests {
             root: "run-apk/root".to_owned(),
             scratch: "run-apk/scratch".to_owned(),
             env: vec![("RUST_LOG".to_owned(), "info".to_owned())],
+            session_env: Vec::new(),
             program: "@BASE@/out/cargo/release/atld".to_owned(),
             args: vec!["--ui".to_owned(), "gtk".to_owned()],
             files: Vec::new(),
@@ -2057,6 +2167,7 @@ mod tests {
             root: "app/root".to_owned(),
             scratch: "app/scratch".to_owned(),
             env: Vec::new(),
+            session_env: Vec::new(),
             program: "@BASE@/out/cargo/release/atld".to_owned(),
             args: vec!["--ui".to_owned(), "gtk".to_owned()],
             files: Vec::new(),
@@ -2122,6 +2233,7 @@ mod tests {
             root: "gl/run/root".to_owned(),
             scratch: "gl/run/scratch".to_owned(),
             env: Vec::new(),
+            session_env: Vec::new(),
             program: "@BASE@/out/cargo/release/atld".to_owned(),
             args: Vec::new(),
             files: Vec::new(),

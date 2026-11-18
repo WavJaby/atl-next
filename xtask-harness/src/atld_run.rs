@@ -1678,7 +1678,14 @@ impl Runtime {
                 written.push(conf);
             }
             let roots = remote::Roots::of(&self.out, &self.java_out, &self.tree, &self.llvm_lib);
-            return target.spawn(&roots, &cmd, &run.root, &run.scratch, &written);
+            return target.spawn(
+                &roots,
+                &cmd,
+                &run.root,
+                &run.scratch,
+                &written,
+                self.pulse_server.remote_session_env(),
+            );
         }
         let log_file = std::fs::File::create(run.atld_log())?;
         cmd.stdin(Stdio::null())
@@ -2048,6 +2055,15 @@ impl PulseServer {
                 cmd.env("PULSE_SERVER", server);
             }
             PulseServer::Session => {}
+        }
+    }
+
+    /// The variables a remote run takes from the target's desktop session (remote.rs `session_env_script`): Session's PULSE_SERVER, as a desktop launch there inherits it. GateDefault needs no
+    /// entry (the target's `env -i` leaves a removed variable absent), Named is an explicit value.
+    fn remote_session_env(&self) -> &'static [&'static str] {
+        match self {
+            PulseServer::Session => &["PULSE_SERVER"],
+            PulseServer::GateDefault | PulseServer::Named(_) => &[],
         }
     }
 }

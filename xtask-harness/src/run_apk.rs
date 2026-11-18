@@ -527,7 +527,9 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         Some(display) => rt.with_display(display.clone()),
         None => rt,
     }
-    .with_desktop_env(&a.env);
+    .with_desktop_env(&a.env)
+    // a real launch on the target's desktop, as the local run-apk: the pulse server is that session's (resolved there, remote.rs session_env_script)
+    .with_session_pulse_server();
     let work = rt.out.join("run-apk");
     std::fs::create_dir_all(&work)?;
     let m = package(&rt, &files, pin.as_ref(), &a.target)?;
