@@ -11,18 +11,51 @@ Upstream-Status: Pending [unchanged on bionic main; LLVM main parseDirectiveArch
 Patch-Reason: the converter builds bionic with the distro clang-19, whose assembler rejects vld1/vadd after .arch armv7-a with no command-line flag surviving the reset (probed -mthumb, -mcpu=cortex-a7, llvm-mc-19)
 ---
 SPDX-License-Identifier: BSD-2-Clause AND BSD-3-Clause
- libc/arch-arm/cortex-a15/bionic/memcpy.S      | 1 +
- libc/arch-arm/cortex-a15/bionic/memset.S      | 1 +
- libc/arch-arm/cortex-a53/bionic/memcpy.S      | 1 +
- libc/arch-arm/cortex-a55/bionic/memcpy.S      | 1 +
- libc/arch-arm/cortex-a7/bionic/memcpy.S       | 1 +
- libc/arch-arm/cortex-a7/bionic/memset.S       | 1 +
- libc/arch-arm/cortex-a9/bionic/__strcat_chk.S | 1 +
- libc/arch-arm/cortex-a9/bionic/__strcpy_chk.S | 1 +
- libc/arch-arm/cortex-a9/bionic/memcpy_base.S  | 1 +
- libc/arch-arm/krait/bionic/memcpy_base.S      | 1 +
- 10 files changed, 10 insertions(+)
+ libc/arch-arm/cortex-a15/bionic/__strcat_chk.S | 1 +
+ libc/arch-arm/cortex-a15/bionic/__strcpy_chk.S | 1 +
+ libc/arch-arm/cortex-a15/bionic/memcpy.S       | 1 +
+ libc/arch-arm/cortex-a15/bionic/memset.S       | 1 +
+ libc/arch-arm/cortex-a53/bionic/__strcat_chk.S | 1 +
+ libc/arch-arm/cortex-a53/bionic/__strcpy_chk.S | 1 +
+ libc/arch-arm/cortex-a53/bionic/memcpy.S       | 1 +
+ libc/arch-arm/cortex-a55/bionic/__strcat_chk.S | 1 +
+ libc/arch-arm/cortex-a55/bionic/__strcpy_chk.S | 1 +
+ libc/arch-arm/cortex-a55/bionic/memcpy.S       | 1 +
+ libc/arch-arm/cortex-a7/bionic/__strcat_chk.S  | 1 +
+ libc/arch-arm/cortex-a7/bionic/__strcpy_chk.S  | 1 +
+ libc/arch-arm/cortex-a7/bionic/memcpy.S        | 1 +
+ libc/arch-arm/cortex-a7/bionic/memset.S        | 1 +
+ libc/arch-arm/cortex-a9/bionic/__strcat_chk.S  | 1 +
+ libc/arch-arm/cortex-a9/bionic/__strcpy_chk.S  | 1 +
+ libc/arch-arm/cortex-a9/bionic/memcpy_base.S   | 1 +
+ libc/arch-arm/krait/bionic/memcpy_base.S       | 1 +
+ libc/arch-arm/kryo/bionic/memcpy.S             | 1 +
+ 19 files changed, 19 insertions(+)
 
+diff --git a/libc/arch-arm/cortex-a15/bionic/__strcat_chk.S b/libc/arch-arm/cortex-a15/bionic/__strcat_chk.S
+index 69e405fc93f8923f395653ee099c626b09232fc3..b7f5414580f80f00b22e0393936eb5bf156e817c 100644
+--- a/libc/arch-arm/cortex-a15/bionic/__strcat_chk.S
++++ b/libc/arch-arm/cortex-a15/bionic/__strcat_chk.S
+@@ -36,6 +36,7 @@
+     // To avoid warning about deprecated instructions, add an explicit
+     // arch. The code generated is exactly the same.
+     .arch armv7-a
++    .fpu    neon
+ 
+ // Get the length of src string, then get the source of the dst string.
+ // Check that the two lengths together don't exceed the threshold, then
+diff --git a/libc/arch-arm/cortex-a15/bionic/__strcpy_chk.S b/libc/arch-arm/cortex-a15/bionic/__strcpy_chk.S
+index ddde30e985d97958a0561f5e14a4509e6af23942..2713753943f4a29d606fdba53ab2155002cef8d2 100644
+--- a/libc/arch-arm/cortex-a15/bionic/__strcpy_chk.S
++++ b/libc/arch-arm/cortex-a15/bionic/__strcpy_chk.S
+@@ -36,6 +36,7 @@
+     // To avoid warning about deprecated instructions, add an explicit
+     // arch. The code generated is exactly the same.
+     .arch armv7-a
++    .fpu    neon
+ 
+ // Get the length of the source string first, then do a memcpy of the data
+ // instead of a strcpy.
 diff --git a/libc/arch-arm/cortex-a15/bionic/memcpy.S b/libc/arch-arm/cortex-a15/bionic/memcpy.S
 index a9dfaff0f2e2fbdb4f2b214ccc2dd7a45438b0d3..bf53c0e358e24dcf192a60429f97308b183a59c4 100644
 --- a/libc/arch-arm/cortex-a15/bionic/memcpy.S
@@ -47,6 +80,30 @@ index ead881e496f04427ccf69c493221f38de8809831..530cfcc7a06dfac3959bd201232e05e7
  
  ENTRY(__memset_chk_a15)
          cmp         r2, r3
+diff --git a/libc/arch-arm/cortex-a53/bionic/__strcat_chk.S b/libc/arch-arm/cortex-a53/bionic/__strcat_chk.S
+index 72be243cedad77a3581cd2df8f0fe9bc83737caf..f8a3a7f66ee9c7a09b9a287acedc0aa95392d9e5 100644
+--- a/libc/arch-arm/cortex-a53/bionic/__strcat_chk.S
++++ b/libc/arch-arm/cortex-a53/bionic/__strcat_chk.S
+@@ -36,6 +36,7 @@
+     // To avoid warning about deprecated instructions, add an explicit
+     // arch. The code generated is exactly the same.
+     .arch armv7-a
++    .fpu    neon
+ 
+ // Get the length of src string, then get the source of the dst string.
+ // Check that the two lengths together don't exceed the threshold, then
+diff --git a/libc/arch-arm/cortex-a53/bionic/__strcpy_chk.S b/libc/arch-arm/cortex-a53/bionic/__strcpy_chk.S
+index 49228842b65b0d5424be63eebf1378a5bfff4b7d..dcaec4da699073836b935b61830b523057c17efd 100644
+--- a/libc/arch-arm/cortex-a53/bionic/__strcpy_chk.S
++++ b/libc/arch-arm/cortex-a53/bionic/__strcpy_chk.S
+@@ -36,6 +36,7 @@
+     // To avoid warning about deprecated instructions, add an explicit
+     // arch. The code generated is exactly the same.
+     .arch armv7-a
++    .fpu    neon
+ 
+ // Get the length of the source string first, then do a memcpy of the data
+ // instead of a strcpy.
 diff --git a/libc/arch-arm/cortex-a53/bionic/memcpy.S b/libc/arch-arm/cortex-a53/bionic/memcpy.S
 index ea748bd00644c9fad16498226e6f39433b84ed11..e07b60868f09d889cd1abaaae41ed9faf9b3aa55 100644
 --- a/libc/arch-arm/cortex-a53/bionic/memcpy.S
@@ -59,6 +116,30 @@ index ea748bd00644c9fad16498226e6f39433b84ed11..e07b60868f09d889cd1abaaae41ed9fa
  
  // Prototype: void *memcpy (void *dst, const void *src, size_t count).
  ENTRY(__memcpy_a53)
+diff --git a/libc/arch-arm/cortex-a55/bionic/__strcat_chk.S b/libc/arch-arm/cortex-a55/bionic/__strcat_chk.S
+index eec1005df29159ac03cf90e47e2bcf3b300f59b4..f7a2813f6423c565b9e84a28b61ccc386e849739 100644
+--- a/libc/arch-arm/cortex-a55/bionic/__strcat_chk.S
++++ b/libc/arch-arm/cortex-a55/bionic/__strcat_chk.S
+@@ -36,6 +36,7 @@
+     // To avoid warning about deprecated instructions, add an explicit
+     // arch. The code generated is exactly the same.
+     .arch armv7-a
++    .fpu    neon
+ 
+ // Get the length of src string, then get the source of the dst string.
+ // Check that the two lengths together don't exceed the threshold, then
+diff --git a/libc/arch-arm/cortex-a55/bionic/__strcpy_chk.S b/libc/arch-arm/cortex-a55/bionic/__strcpy_chk.S
+index dfcc5898308759c6b5e238eb3f650f4756363852..72200e53add07130ef1a1ebcfbb61931a14518e8 100644
+--- a/libc/arch-arm/cortex-a55/bionic/__strcpy_chk.S
++++ b/libc/arch-arm/cortex-a55/bionic/__strcpy_chk.S
+@@ -36,6 +36,7 @@
+     // To avoid warning about deprecated instructions, add an explicit
+     // arch. The code generated is exactly the same.
+     .arch armv7-a
++    .fpu    neon
+ 
+ // Get the length of the source string first, then do a memcpy of the data
+ // instead of a strcpy.
 diff --git a/libc/arch-arm/cortex-a55/bionic/memcpy.S b/libc/arch-arm/cortex-a55/bionic/memcpy.S
 index ac9675f7b1f411b93595576b82b524663c818dec..0e71b5465cf94a4173b7924b227474c50454199e 100644
 --- a/libc/arch-arm/cortex-a55/bionic/memcpy.S
@@ -71,6 +152,30 @@ index ac9675f7b1f411b93595576b82b524663c818dec..0e71b5465cf94a4173b7924b227474c5
  
  ENTRY(__memcpy_a55)
          pld     [r1, #64]
+diff --git a/libc/arch-arm/cortex-a7/bionic/__strcat_chk.S b/libc/arch-arm/cortex-a7/bionic/__strcat_chk.S
+index 36bda6b0e47987ba53860ae5204e3d026479f456..7fc1e35b36a31dfacba3e3b8920dbdc4056559d8 100644
+--- a/libc/arch-arm/cortex-a7/bionic/__strcat_chk.S
++++ b/libc/arch-arm/cortex-a7/bionic/__strcat_chk.S
+@@ -36,6 +36,7 @@
+     // To avoid warning about deprecated instructions, add an explicit
+     // arch. The code generated is exactly the same.
+     .arch armv7-a
++    .fpu    neon
+ 
+ // Get the length of src string, then get the source of the dst string.
+ // Check that the two lengths together don't exceed the threshold, then
+diff --git a/libc/arch-arm/cortex-a7/bionic/__strcpy_chk.S b/libc/arch-arm/cortex-a7/bionic/__strcpy_chk.S
+index edbabc77642254c8d587cfd7271febfef6b26e13..d6e24ddedd1343f6a0b9d720857d30026789ed63 100644
+--- a/libc/arch-arm/cortex-a7/bionic/__strcpy_chk.S
++++ b/libc/arch-arm/cortex-a7/bionic/__strcpy_chk.S
+@@ -36,6 +36,7 @@
+     // To avoid warning about deprecated instructions, add an explicit
+     // arch. The code generated is exactly the same.
+     .arch armv7-a
++    .fpu    neon
+ 
+ // Get the length of the source string first, then do a memcpy of the data
+ // instead of a strcpy.
 diff --git a/libc/arch-arm/cortex-a7/bionic/memcpy.S b/libc/arch-arm/cortex-a7/bionic/memcpy.S
 index 2f32d2e7e03a7f261ee04bbe565fa0def2b2b889..87075a66f7356a3808e20ffe1108d9a98c6f08c4 100644
 --- a/libc/arch-arm/cortex-a7/bionic/memcpy.S
@@ -143,3 +248,15 @@ index 5b4b70d5c903505500045073843242f04d1efa69..a0392d361be42234b3009abd8c209d0a
  
  .L_memcpy_base:
  	cmp	r2, #4
+diff --git a/libc/arch-arm/kryo/bionic/memcpy.S b/libc/arch-arm/kryo/bionic/memcpy.S
+index 250f7bc6115388d35a8c698b7821e1432eed3a5f..d9a974545304d78b3e70cad3cb041d8ff6aac644 100644
+--- a/libc/arch-arm/kryo/bionic/memcpy.S
++++ b/libc/arch-arm/kryo/bionic/memcpy.S
+@@ -38,6 +38,7 @@
+         // To avoid warning about deprecated instructions, add an explicit
+         // arch. The code generated is exactly the same.
+         .arch armv7-a
++        .fpu    neon
+ 
+         .code 32
+ ENTRY(__memcpy_kryo)
