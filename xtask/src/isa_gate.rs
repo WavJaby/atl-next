@@ -665,11 +665,21 @@ struct GuestAbi {
 
 /// The rule of guest arch `arch` (its arches.toml `[<arch>.guest]` row); an arch without one fails the gate.
 fn guest_abi(arch: &str) -> Result<GuestAbi> {
+    let plain = |machine: u16| {
+        Ok(GuestAbi {
+            machine,
+            softfp: false,
+        })
+    };
     match arch {
         "arm" => Ok(GuestAbi {
             machine: elf::EM_ARM.0,
             softfp: true,
         }),
+        "arm64" => plain(elf::EM_AARCH64.0),
+        "x86" => plain(elf::EM_386.0),
+        "x86_64" => plain(elf::EM_X86_64.0),
+        "riscv64" => plain(elf::EM_RISCV.0),
         other => bail!(
             "{}: no guest ABI rule for `{other}` (isa_gate.rs guest_abi)",
             arches::FILE
@@ -888,6 +898,17 @@ fn dotted(version: &[u32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every arches.toml guest row has a guest ABI rule: the gate fails a foreign run for a row without one.
+    #[test]
+    fn every_guest_row_has_an_abi_rule() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        for (arch, row) in arches::load(root).unwrap().iter() {
+            if row.guest.is_some() {
+                guest_abi(arch).unwrap();
+            }
+        }
+    }
 
     /// An rv64gc_zba_zbb claim with the psABI `<name><major>p<minor>` version form; the versions are not what the gate checks.
     const RV64GC_ZBA_ZBB: &str = "rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0_zba1p0_zbb1p0";
