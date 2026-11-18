@@ -264,6 +264,15 @@ pub fn shared_libcxx(out: &Path, arch: &str) -> PathBuf {
         .join("build/lib/libc++.so")
 }
 
+/// clang's multiarch dir name for an Android triple (Driver/ToolChains/Linux.cpp getMultiarchTriple): every arm sub-arch searches `arm-linux-androideabi` (the NDK layout); the other guests' triples are their own dir.
+fn android_multiarch(clang: &str) -> &str {
+    if clang.starts_with("arm") && clang.ends_with("-linux-androideabi") {
+        "arm-linux-androideabi"
+    } else {
+        clang
+    }
+}
+
 /// Pass 2: `libc++.so` for guest `arch`, linked against `libs` (the SYSROOT_MODULES outputs) and pass 1's compiler-rt `builtins` archive; licence gate over what it compiled.
 pub fn build_shared(
     root: &Path,
@@ -281,9 +290,11 @@ pub fn build_shared(
         .with_context(|| format!("{arch}: no [guest] row in {}", arches::FILE))?;
     let src = llvm_src(root)?;
     let base = out.join("upstream").join(UPSTREAM).join(arch);
-    // the sysroot layout clang's Android toolchain searches for libraries and crt objects: <sysroot>/usr/lib/<triple>
+    // the sysroot layout clang's Android toolchain searches for libraries and crt objects: <sysroot>/usr/lib/<multiarch>
     let sysroot = base.join("sysroot");
-    let lib_dir = sysroot.join("usr/lib").join(&guest.clang);
+    let lib_dir = sysroot
+        .join("usr/lib")
+        .join(android_multiarch(&guest.clang));
     if sysroot.exists() {
         std::fs::remove_dir_all(&sysroot)?;
     }
@@ -636,6 +647,23 @@ mod drift_tests {
 
     // builders.py's shape: a class with literal and conditional defines, a second class, a column-0 def
     const SAMPLE: &str = "class Other(base):\n    defines['OTHER_ONLY'] = 'ON'\n\nclass DeviceLibcxxBuilder(base):\n    def f(self):\n        defines['LIBCXX_ENABLE_SHARED'] = 'ON'\n        defines['LIBCXXABI_ENABLE_SHARED'] = 'OFF'\n        if self.p:\n            defines['LIBCXX_ENABLE_SHARED'] = 'OFF'\n        defines['LIBUNWIND_HIDE_SYMBOLS'] = 'TRUE' if x else 'FALSE'\n\ndef top():\n    defines['TOP_ONLY'] = 'ON'\n";
+
+    // expected: clang 19 Driver/ToolChains/Linux.cpp getMultiarchTriple, Android cases (arm/thumb -> arm-linux-androideabi, x86 -> i686-linux-android, ...)
+    #[test]
+    fn android_multiarch_dirs() {
+        assert_eq!(
+            android_multiarch("armv7a-linux-androideabi"),
+            "arm-linux-androideabi"
+        );
+        for t in [
+            "aarch64-linux-android",
+            "i686-linux-android",
+            "x86_64-linux-android",
+            "riscv64-linux-android",
+        ] {
+            assert_eq!(android_multiarch(t), t);
+        }
+    }
 
     #[test]
     fn literal_defines_of_one_class() {
