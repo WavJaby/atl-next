@@ -1025,7 +1025,7 @@ pub(crate) fn start_proxy(upstream: &Path) -> Result<Proxy> {
 }
 
 /// What the probe saw of the client: its liveness (gtk, widgets), or the acks of the injected configures (resize, where the liveness fields stay at their defaults).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct Liveness {
     /// The pong to the first ping came within [`PONG_WAIT`].
     answered: bool,
@@ -1611,6 +1611,7 @@ fn frame_time(line: &str) -> Option<u64> {
 pub(crate) fn cadence_check(
     after: &[&str],
     refresh_hz: f32,
+    rate: Rate,
     pressure: &Samples,
 ) -> Result<String, String> {
     let times: Vec<u64> = after
@@ -1622,10 +1623,20 @@ pub(crate) fn cadence_check(
         (Some(&a), Some(&b)) => pressure.stall_share(a as i64, b as i64),
         _ => None,
     };
-    judge_window(cadence_judge(&times, refresh_hz), share, "the window")
+    judge_window(cadence_judge(&times, refresh_hz, rate), share, "the window")
 }
 
-fn cadence_judge(times: &[u64], refresh_hz: f32) -> Result<String, String> {
+/// What the run's display rate promises the cadence sub-gates.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Rate {
+    /// A fixed-rate output (the gate's headless labwc, the 60 Hz free-running grid): mean and longest interval are asserted.
+    Fixed,
+    /// A real session display (remote gates): VRR stretches intervals and Wayland has no portable VRR query (`wp_presentation.refresh` may stay the max rate), so mean and longest are printed
+    /// `host-stated`, never failed; count, monotonic times and the shortest bound (VRR never runs faster than the max rate) still are.
+    Session,
+}
+
+fn cadence_judge(times: &[u64], refresh_hz: f32, rate: Rate) -> Result<String, String> {
     if times.len() < FRAME_CALLBACKS {
         return Err(format!(
             "{} frame callbacks after the marker, want {FRAME_CALLBACKS}",
@@ -1651,6 +1662,15 @@ fn cadence_judge(times: &[u64], refresh_hz: f32) -> Result<String, String> {
     }
     let span = times[times.len() - 1] - times[0];
     let mean = span as f64 / (times.len() - 1) as f64;
+    if rate == Rate::Session {
+        return Ok(format!(
+            "{FRAME_CALLBACKS} callbacks, shortest {:.3} ms >= P - 3 ms; host-stated mean={:.3} ms longest={:.3} ms P={:.3} ms",
+            shortest / 1e6,
+            mean / 1e6,
+            longest / 1e6,
+            period / 1e6
+        ));
+    }
     if (mean - period).abs() > CADENCE_TOLERANCE * period {
         return Err(format!(
             "mean interval {:.3} ms, display period {:.3} ms",
@@ -2047,28 +2067,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         rt
     };
-    let outputs = nested.as_ref().map(NestedCompositor::control);
     // the move stage's second output, as Android's display
     let moved = nested
         .as_ref()
         .filter(|_| matches!(args.stage, Stage::Move))
         .map(|n| n.output_display(1));
-    let fixture = match args.stage {
-        Stage::Widgets | Stage::Ime | Stage::MouseTouch => widgets::FIXTURE,
-        Stage::Relaunch => SIZED_FIXTURE,
-        Stage::Declared => DECLARED_FIXTURE,
-        Stage::StartFinish => START_FIXTURE,
-        Stage::SurfaceView => surface_view::FIXTURE,
-        Stage::WebView => webview::FIXTURE,
-        Stage::WebViewOverlay => webview_overlay::FIXTURE,
-        Stage::UiBlock => ui_block::FIXTURE,
-        Stage::Hwui => HWUI_FIXTURE,
-        Stage::Dialog => dialog::FIXTURE,
-        Stage::Gles2 => gles2_fixture::FIXTURE,
-        Stage::Gles1 => gles1::FIXTURE,
-        Stage::Portrait => PORTRAIT_FIXTURE,
-        _ => FIXTURE,
-    };
+    let fixture = fixture(args.stage);
     // the GLES2 fixture's library is built for the host arch (the identity guest), as its static gate builds it
     let native = match args.stage {
         Stage::Gles2 => Some(gles2_fixture::apk_libs(
@@ -2114,7 +2118,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let start_ms = now_ms();
     let started = Instant::now();
     // the ime stage's fake desktop input method holds the seat before the app's window exists
-    let mut fake_ime = match (args.stage, &nested) {
+    let fake_ime = match (args.stage, &nested) {
         (Stage::Ime, Some(n)) => Some(crate::nested_wayland::Ime::bind(n)?),
         _ => None,
     };
@@ -2132,8 +2136,178 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Some(s) if !args.break_webview_sound => rt.with_pulse_server(s.server()),
         _ => rt,
     };
-    let mut atld_child = rt.start_atld(&run)?;
-    let atld_pid = atld_child.id();
+    let mut atld = Atld::Child(rt.start_atld(&run)?);
+    let out = live(
+        LiveIn {
+            args,
+            run: &run,
+            package: &m.name,
+            activity: &activity,
+            work: &work,
+            proxy,
+            nested: nested.as_ref(),
+            fake_ime,
+            ime_breaks,
+            started,
+        },
+        &mut atld,
+        sampler,
+    )?;
+    if let Some(secs) = args.hold {
+        return Ok(hold_report(
+            &run.log(&m.name),
+            marker(args.stage),
+            secs,
+            out.ended.is_some(),
+        ));
+    }
+    let heard = sound.map(webview::Sound::stop);
+    judge(
+        &Judged {
+            root,
+            args,
+            run: &run,
+            package: &m.name,
+            display,
+            rate: Rate::Fixed,
+            moved,
+            app_uid,
+            start_ms,
+        },
+        out,
+        heard,
+    )
+}
+
+/// atld as the live half sees it: its own child (a local gate), or a process the target's run script started (the agent, [`agent`]), known by pid only.
+enum Atld {
+    Child(std::process::Child),
+    Pid(u32),
+}
+
+impl Atld {
+    fn id(&self) -> u32 {
+        match self {
+            Atld::Child(c) => c.id(),
+            Atld::Pid(p) => *p,
+        }
+    }
+
+    /// Its end, if it ended. A `Pid` has no status of its own (not this process's child): a placeholder 0, which the agent records only as "ended"; the build host reads the run script's `atld.rc`.
+    fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
+        use std::os::unix::process::ExitStatusExt;
+        match self {
+            Atld::Child(c) => Ok(c.try_wait()?),
+            Atld::Pid(p) => Ok((!pid_alive(*p)).then(|| std::process::ExitStatus::from_raw(0))),
+        }
+    }
+
+    /// [`Run::stop`] for either kind: `stop` on the control socket, SIGKILL after [`STOP_WAIT`].
+    fn stop(&mut self, run: &Run) -> Result<std::process::ExitStatus> {
+        match self {
+            Atld::Child(c) => run.stop(c),
+            Atld::Pid(p) => {
+                let pid = *p;
+                if let Some(s) = self.try_wait()? {
+                    return Ok(s);
+                }
+                let asked = run.control("stop");
+                let deadline = Instant::now() + STOP_WAIT;
+                while Instant::now() < deadline {
+                    if let Some(s) = self.try_wait()? {
+                        return Ok(s);
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                println!("atld: no exit {STOP_WAIT:?} after stop ({asked:?}): killed");
+                self.kill()
+            }
+        }
+    }
+
+    /// SIGKILL, then its end.
+    fn kill(&mut self) -> Result<std::process::ExitStatus> {
+        use std::os::unix::process::ExitStatusExt;
+        match self {
+            Atld::Child(c) => {
+                let _ = c.kill();
+                Ok(c.wait()?)
+            }
+            Atld::Pid(p) => {
+                let _ = rustix::process::kill_process(
+                    rustix::process::Pid::from_raw(*p as i32).context("pid 0")?,
+                    rustix::process::Signal::KILL,
+                );
+                let deadline = Instant::now() + STOP_WAIT;
+                while pid_alive(*p) && Instant::now() < deadline {
+                    std::thread::sleep(POLL);
+                }
+                Ok(std::process::ExitStatus::from_raw(libc_sigkill_status()))
+            }
+        }
+    }
+}
+
+/// The wait status of a SIGKILL death (signal number in the low bits).
+fn libc_sigkill_status() -> i32 {
+    rustix::process::Signal::KILL.as_raw()
+}
+
+/// Whether `pid` runs: its /proc entry exists and is not a zombie (the run script reaps it).
+fn pid_alive(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit_once(") ")
+            .is_some_and(|(_, rest)| !rest.starts_with('Z'))
+    })
+}
+
+/// What the live half needs from the prepared run.
+struct LiveIn<'a> {
+    args: &'a Args,
+    run: &'a Run,
+    package: &'a str,
+    activity: &'a str,
+    /// The stage's work dir (`run.root`'s parent): pictures go under it.
+    work: &'a Path,
+    proxy: Option<Proxy>,
+    nested: Option<&'a NestedCompositor>,
+    fake_ime: Option<crate::nested_wayland::Ime>,
+    ime_breaks: ime::Breaks,
+    /// atld's start: the run's [`LIMIT`] counts from here.
+    started: Instant,
+}
+
+/// What the live half saw: the judge's inputs besides the logs.
+struct LiveOut {
+    liveness: Result<Liveness, String>,
+    captured: Arc<Mutex<capture::Seen>>,
+    app_ids: Arc<Mutex<AppIdsSeen>>,
+    titles: Arc<Mutex<Vec<String>>>,
+    splash_shot: Option<Result<capture::Shot, String>>,
+    /// atld ended before the window closed (by itself, or stopped with the app's end).
+    ended: Option<std::process::ExitStatus>,
+    /// atld ended because the gate stopped it at the window's end.
+    stopped: Option<std::process::ExitStatus>,
+    pressure: Samples,
+}
+
+/// The live half of a window stage, next to atld and the compositor: the probe thread drives the client through the proxy, the poll loop watches the marker's window, the app's end and [`LIMIT`], then
+/// atld is stopped. One implementation for `test window` (this host) and the target agent ([`agent`]).
+fn live(l: LiveIn, atld: &mut Atld, sampler: Sampler) -> Result<LiveOut> {
+    let LiveIn {
+        args,
+        run,
+        package,
+        activity,
+        work,
+        proxy,
+        nested,
+        fake_ime,
+        ime_breaks,
+        started,
+    } = l;
+    let atld_pid = atld.id();
+    let outputs = nested.map(NestedCompositor::control);
     // the probe drives the client through its proxy from here on
     let stage = args.stage;
     let break_mouse_back = args.break_mouse_back;
@@ -2147,18 +2321,17 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let captured: Arc<Mutex<capture::Seen>> = Arc::default();
     let capture_probe = takes_pictures(args.stage).then(|| capture::Probe {
         root: run.root.clone(),
-        package: m.name.clone(),
+        package: package.to_owned(),
         out_dir: work.join("capture"),
         break_caller: args.break_capture_caller,
         seen: Arc::clone(&captured),
     });
     let probe = proxy.map(|p| {
-        let log = run.log(&m.name);
+        let log = run.log(package);
         let services_log = run.log("services");
         let seen = Arc::clone(&app_ids);
         let titles_seen = Arc::clone(&titles);
-        let fake_ime = fake_ime.take();
-        let relaunch = (run.root.clone(), format!("{}/{activity}", m.name));
+        let relaunch = (run.root.clone(), format!("{package}/{activity}"));
         std::thread::spawn(move || match (stage, outputs, fake_ime) {
             (Stage::Gtk | Stage::Hwui | Stage::Portrait, _, _) => match &capture_probe {
                 Some(capture_probe) => {
@@ -2219,8 +2392,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             _ => drive(p, &log),
         })
     });
-    let app_log = run.log(&m.name);
-    let services_log = run.log("services");
+    let app_log = run.log(package);
     let marker = marker(args.stage);
     let window_ms = args.hold.map_or(args.stage.window_ms(), |s| s * 1_000);
     let read = atl_diag::logfiles::read;
@@ -2235,7 +2407,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 &mut splash_shot,
                 &app,
                 &app_log,
-                nested.as_ref(),
+                nested,
                 &splash_png,
             );
         }
@@ -2243,14 +2415,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         if marker_stamp(&app, marker).is_some_and(|t| now_ms() >= t + window_ms) {
             break;
         }
-        if let Some(s) = atld_child.try_wait()? {
+        if let Some(s) = atld.try_wait()? {
             ended = Some(s);
             break;
         }
         // the app's end is the run's end for a gate, as when atld ended with it; not in the ime stage, whose probe kills the app and relaunches it (its death sub-gate), nor in the capture
         // stage, whose close ends the app (its `ended` sub-gate)
         if !matches!(args.stage, Stage::Ime | Stage::Capture) && run.app_ended() {
-            ended = Some(run.stop(&mut atld_child)?);
+            ended = Some(atld.stop(run)?);
             break;
         }
         if started.elapsed() > LIMIT + Duration::from_secs(args.hold.unwrap_or(0)) {
@@ -2260,16 +2432,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     let mut stopped = None;
     if ended.is_none() {
-        stop_apps(atld_child.id());
+        stop_apps(atld_pid);
         stopped = Some(if args.break_atld_stop {
-            let _ = atld_child.kill();
-            atld_child.wait()?
+            atld.kill()?
         } else {
-            run.stop(&mut atld_child)?
+            atld.stop(run)?
         });
-    }
-    if let Some(secs) = args.hold {
-        return Ok(hold_report(&app_log, marker, secs, ended.is_some()));
     }
     let liveness = match probe {
         Some(handle) => handle
@@ -2277,8 +2445,62 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .unwrap_or_else(|_| Err("the probe thread panicked".to_owned())),
         None => Err("no probe: only the gtk, widgets and resize stages run one".to_owned()),
     };
-    let pressure = sampler.stop();
-    let heard = sound.map(webview::Sound::stop);
+    Ok(LiveOut {
+        liveness,
+        captured,
+        app_ids,
+        titles,
+        splash_shot,
+        ended,
+        stopped,
+        pressure: sampler.stop(),
+    })
+}
+
+/// What the judge needs from the prepared run besides [`LiveOut`].
+struct Judged<'a> {
+    root: &'a Path,
+    args: &'a Args,
+    run: &'a Run,
+    package: &'a str,
+    /// The display atld answered with and the cadence is judged against.
+    display: DisplayModel,
+    rate: Rate,
+    /// The move stage's second output.
+    moved: Option<DisplayModel>,
+    app_uid: u32,
+    /// The run's start on the build host's clock, ms: the marker's offset is printed from it.
+    start_ms: u64,
+}
+
+/// The judge of a window stage: the verdict and the stage's sub-gates over the run's logs and what the live half saw; prints them and the verdict line.
+fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<ExitCode> {
+    let Judged {
+        root,
+        args,
+        run,
+        package,
+        display,
+        rate,
+        moved,
+        app_uid,
+        start_ms,
+    } = *j;
+    let LiveOut {
+        liveness,
+        captured,
+        app_ids,
+        titles,
+        mut splash_shot,
+        ended,
+        stopped,
+        pressure,
+    } = out;
+    let read = atl_diag::logfiles::read;
+    let app_log = run.log(package);
+    let services_log = run.log("services");
+    let marker = marker(args.stage);
+    let window_ms = args.stage.window_ms();
     let app = read(&app_log);
     let services = read(&services_log);
     let all = events(&services);
@@ -2300,7 +2522,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 ("picture", picture_check(&app, display, WINDOW_TITLE)),
                 (
                     "cadence",
-                    cadence_check(&after_marker(&app, marker), display.refresh_hz, &pressure),
+                    cadence_check(
+                        &after_marker(&app, marker),
+                        display.refresh_hz,
+                        rate,
+                        &pressure,
+                    ),
                 ),
             ]
         }
@@ -2322,11 +2549,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 streams: Err("no recording".to_owned()),
             }),
             // the desktop file ID rule `atl.<package>`, as the app_id sub-gate expects of the window
-            &format!("atl.{}", m.name),
+            &format!("atl.{package}"),
             &atld_log,
         ),
         (Stage::WebViewOverlay, Some(_)) => webview_overlay::checks(&app, args.esc_back),
-        (Stage::UiBlock, Some(_)) => ui_block::checks(&app),
+        (Stage::UiBlock, Some(_)) => ui_block::checks(&app, display.refresh_hz),
         (Stage::MouseTouch, Some(_)) => widgets::mouse_touch_checks(&app, &liveness),
         (Stage::Dialog, Some(_)) => {
             dialog::checks(&app, &services, &liveness, &captured, ended.is_some())
@@ -2344,6 +2571,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             &after_marker(&app, marker),
             &liveness,
             display,
+            rate,
             &pressure,
             &captured,
             args.esc_back,
@@ -2396,7 +2624,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             let seen = app_ids.lock().map(|seen| seen.clone()).unwrap_or_default();
             vec![(
                 "app-id",
-                app_id_check(&seen, &format!("atl.{}", m.name), &liveness),
+                app_id_check(&seen, &format!("atl.{package}"), &liveness),
             )]
         }
         (Stage::Title, Some(_)) => {
@@ -2520,6 +2748,367 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     };
     println!("{}", verdict.line());
     Ok(ExitCode::FAILURE)
+}
+
+/// The stage's fixture dir.
+fn fixture(stage: Stage) -> &'static str {
+    match stage {
+        Stage::Widgets | Stage::Ime | Stage::MouseTouch => widgets::FIXTURE,
+        Stage::Relaunch => SIZED_FIXTURE,
+        Stage::Declared => DECLARED_FIXTURE,
+        Stage::StartFinish => START_FIXTURE,
+        Stage::SurfaceView => surface_view::FIXTURE,
+        Stage::WebView => webview::FIXTURE,
+        Stage::WebViewOverlay => webview_overlay::FIXTURE,
+        Stage::UiBlock => ui_block::FIXTURE,
+        Stage::Hwui => HWUI_FIXTURE,
+        Stage::Dialog => dialog::FIXTURE,
+        Stage::Gles2 => gles2_fixture::FIXTURE,
+        Stage::Gles1 => gles1::FIXTURE,
+        Stage::Portrait => PORTRAIT_FIXTURE,
+        _ => FIXTURE,
+    }
+}
+
+/// `window` args from words, parsed as `test window` parses its own: the target agent and `remote test window` get every default of the local gate.
+fn args_of(words: &[String]) -> Result<Args> {
+    use clap::Parser;
+    #[derive(clap::Parser)]
+    struct Words {
+        #[command(flatten)]
+        args: Args,
+    }
+    let argv = std::iter::once("window".to_owned()).chain(words.iter().cloned());
+    Ok(Words::try_parse_from(argv)?.args)
+}
+
+/// The stages `remote test window` runs: the agent serves them (no nested compositor, fake input method, pulse sink or full picture bytes on the target).
+const REMOTE_STAGES: [Stage; 3] = [Stage::Frames, Stage::Widgets, Stage::UiBlock];
+/// atld's limit on the target: the live half's [`LIMIT`] and a margin for the stop.
+const REMOTE_LIMIT: Duration = Duration::from_secs(LIMIT.as_secs() + 60);
+/// How long the agent waits for the run script to start atld (its pid file).
+const PID_WAIT: Duration = Duration::from_secs(30);
+
+/// What the agent hands the judge on the build host (`live.json`): the [`LiveOut`] fields the remote stages read. `ended`/`stopped` are flags: the agent is not atld's parent, so the status is the run
+/// script's `atld.rc`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LiveRecord {
+    liveness: Result<Liveness, String>,
+    captured: capture::Seen,
+    ended: bool,
+    stopped: bool,
+    pressure: Samples,
+}
+
+/// Hidden `window-live`: the window gate's live half on a remote target, started by the run script (remote.rs `Plan::script`) before atld.
+#[derive(clap::Args)]
+pub struct AgentArgs {
+    /// The stage's work dir (`<bundle>/out/window`): atld's root and scratch below it.
+    #[arg(long)]
+    work: PathBuf,
+    /// The fixture's package and launcher activity.
+    #[arg(long)]
+    package: String,
+    #[arg(long)]
+    activity: String,
+    /// The compositor's Wayland socket the proxy connects to (UI stages); absent: no proxy.
+    #[arg(long, requires = "listen")]
+    upstream: Option<PathBuf>,
+    /// The proxy's socket, atld's `WAYLAND_DISPLAY`.
+    #[arg(long, requires = "upstream")]
+    listen: Option<PathBuf>,
+    /// After `--`: the run's `test window` args (stage and flags).
+    #[arg(last = true)]
+    window: Vec<String>,
+}
+
+/// The agent: binds the proxy (the run script waits for its socket, then starts atld with it), reads atld's pid from the script, runs [`live`] as `test window` does, writes `live.json`.
+pub fn agent(a: &AgentArgs) -> Result<ExitCode> {
+    let args = args_of(&a.window)?;
+    let run = Run {
+        root: a.work.join("root"),
+        scratch: a.work.join("scratch"),
+        launch: None,
+        packages: vec![],
+        libraries: vec![],
+        shell: None,
+        log_tags: String::new(),
+    };
+    let proxy = match (&a.upstream, &a.listen) {
+        (Some(upstream), Some(listen)) => Some(Proxy::start(upstream, listen)?),
+        _ => None,
+    };
+    let pid_file = run.scratch.join(crate::remote::ATLD_PID);
+    let deadline = Instant::now() + PID_WAIT;
+    let pid = loop {
+        if let Some(pid) = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|t| t.trim().parse::<u32>().ok())
+        {
+            break pid;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "no atld pid in {} within {PID_WAIT:?}",
+            pid_file.display()
+        );
+        std::thread::sleep(POLL);
+    };
+    println!("window-live: atld pid {pid}, stage {}", args.stage.name());
+    let sampler = Sampler::start();
+    let mut atld = Atld::Pid(pid);
+    let out = live(
+        LiveIn {
+            args: &args,
+            run: &run,
+            package: &a.package,
+            activity: &a.activity,
+            work: &a.work,
+            proxy,
+            nested: None,
+            fake_ime: None,
+            ime_breaks: ime::Breaks::default(),
+            started: Instant::now(),
+        },
+        &mut atld,
+        sampler,
+    )?;
+    let record = LiveRecord {
+        liveness: out.liveness,
+        captured: std::mem::take(&mut *out.captured.lock().map_err(|_| anyhow::anyhow!("pictures poisoned"))?),
+        ended: out.ended.is_some(),
+        stopped: out.stopped.is_some(),
+        pressure: out.pressure,
+    };
+    let path = run.scratch.join(crate::remote::LIVE_JSON);
+    std::fs::write(&path, serde_json::to_vec(&record)?)
+        .with_context(|| format!("writing {}", path.display()))?;
+    println!("window-live: wrote {}", path.display());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Hidden `display-probe`: this host's first monitor as atld's `--display` value ([`run_display`]), on the line remote.rs `Target::display_model` reads.
+pub fn display_probe() -> Result<ExitCode> {
+    println!(
+        "{}{}",
+        crate::remote::DISPLAY_PROBE_LINE,
+        run_display().to_arg()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `xtask remote test window --stage <s>` (remote.rs `test`): the stage built and recorded here, pushed and checked on the target, its live half run there by the agent ([`agent`]) beside atld, its
+/// logs and `live.json` judged here by the same [`judge`] as `test window`. UI stages open the window on the target's session display (owner decision D1, 2026-11-18: on an empty workspace, remote.rs
+/// `workspace_script`) and are judged against that display ([`Rate::Session`]); frames runs headless on the 60 Hz grid as locally.
+pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
+    use crate::remote::{AGENT_LOG, AGENT_RC, Agent, Display, LIVE_JSON, REMOTE_DIR, Target};
+    use std::os::unix::process::ExitStatusExt;
+    anyhow::ensure!(
+        a.target_arch.arch.is_none() && a.fixture_arch.is_none(),
+        "--arch and --fixture-arch are `app` options"
+    );
+    let stage_name = a
+        .stage
+        .as_deref()
+        .context("remote test window needs --stage (frames, widgets or ui-block)")?;
+    let arches = crate::arches::load(root)?;
+    let (arch, _) = crate::arches::build_machine(root, &arches)?;
+    let mut words: Vec<String> = ["--host", arch, "--stage", stage_name]
+        .map(str::to_owned)
+        .to_vec();
+    if let Some(out) = &a.out {
+        words.extend(["--out".to_owned(), out.display().to_string()]);
+    }
+    let args = args_of(&words)?;
+    anyhow::ensure!(
+        REMOTE_STAGES.iter().any(|s| s.name() == args.stage.name()),
+        "remote test window: stage {stage_name} is not remotable (frames, widgets, ui-block)"
+    );
+    let ui = !matches!(args.stage, Stage::Frames);
+    let kind = if ui {
+        let (kind, why) = crate::remote::probe_display(&a.host)?;
+        match kind {
+            Display::Session => kind,
+            Display::NestedX11 => anyhow::bail!(
+                "remote test window --stage {stage_name}: the target has {why}; the window gate runs only on a session display"
+            ),
+            Display::Headless => {
+                anyhow::bail!("remote test window --stage {stage_name}: no display on the target: {why}")
+            }
+        }
+    } else {
+        Display::Headless
+    };
+    let rt = Runtime::new(
+        root,
+        "window",
+        &args.host,
+        args.out.as_deref(),
+        args.java_out.as_deref(),
+        "window-art",
+        args.verbose,
+    )?
+    .with_gralloc(root)?
+    .with_gl_driver(root)?
+    .with_native_bridge_guest(&args.host)?;
+    anyhow::ensure!(
+        xtask::native::cross_host_of(root, &rt.out)?.is_none(),
+        "remote test window: a cross host's out dir; the agent is the build machine's harness binary (its ISA)"
+    );
+    let rt = if ui { rt.with_ui("gtk") } else { rt };
+    let rt = match &a.ui_break {
+        Some(rule) => rt.with_ui_break(root, rule)?,
+        None => rt,
+    };
+    let rt = rt.with_app_env(&[format!("GDK_DEBUG={}", crate::gdk_dmabuf::GDK_DEBUG)]);
+    let work = rt.out.join("window");
+    let apk = rt.apk.build(
+        &root.join(fixture(args.stage)),
+        &work.join("apk"),
+        &[],
+        None,
+        None,
+    )?;
+    let m = manifest::read(&rt.apk.aapt2, &apk)?;
+    let activity = m
+        .launch_activity()
+        .map(|a| a.name.clone())
+        .context("the fixture has no launcher activity")?;
+    let app_uid = rt.first_app_uid();
+    let run = Run {
+        root: work.join("root"),
+        scratch: work.join("scratch"),
+        launch: Some(m.name.clone()),
+        packages: vec![Package::base(apk)],
+        libraries: vec![],
+        shell: None,
+        log_tags: args.log_tags.clone(),
+    };
+    rt.record_inputs(&run)?;
+    let target = Target::of(root, &rt.out, "window", &a.host, a.brk)?;
+    if !a.apply {
+        println!("{}", target.summary());
+        println!(
+            "dry run: pushes the bundle to {}, checks {} ELF files there, then runs stage {stage_name} {} with its live half on the target; --apply runs it",
+            target.target(),
+            target.elf_count(),
+            if ui {
+                "on the session display (an empty workspace where the compositor has them)"
+            } else {
+                "headless"
+            }
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    let problems = target.deliver("window")?;
+    if !problems.is_empty() {
+        println!("{}", crate::verdict::gate("remote test window", &problems));
+        return Ok(ExitCode::FAILURE);
+    }
+    let harness = std::env::current_exe().context("the harness binary's path")?;
+    let display = if ui {
+        let arg = target.display_model(&rt.roots(), &harness)?;
+        println!("remote test window: target display {arg}");
+        DisplayModel::parse_arg(&arg).map_err(anyhow::Error::msg)?
+    } else {
+        GATE_OUTPUT.display()
+    };
+    let dir = rt.out.join(REMOTE_DIR).join(target.log_dir());
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let log = dir.join("window.log");
+    std::fs::write(&log, "").with_context(|| format!("writing {}", log.display()))?;
+    let stage_word = |s: Stage| {
+        clap::ValueEnum::to_possible_value(&s).map(|v| v.get_name().to_owned())
+    };
+    let agent = Agent {
+        program: harness,
+        args: vec![
+            "window-live".to_owned(),
+            "--work".to_owned(),
+            work.display().to_string(),
+            "--package".to_owned(),
+            m.name.clone(),
+            "--activity".to_owned(),
+            activity.clone(),
+        ],
+        window: vec![
+            "--host".to_owned(),
+            args.host.clone(),
+            "--stage".to_owned(),
+            stage_word(args.stage).context("stage name")?,
+        ],
+        proxy: ui,
+    };
+    let rt = rt
+        .with_display(display.to_arg())
+        .with_site(target.run_site(REMOTE_LIMIT, log.clone(), kind).with_agent(agent));
+    for f in [LIVE_JSON, AGENT_RC, AGENT_LOG] {
+        let _ = std::fs::remove_file(run.scratch.join(f));
+    }
+    let start_ms = now_ms();
+    let mut child = rt.start_atld(&run)?;
+    // the transfer ends with the run: atld's limit, the agent's margin, the tar
+    let deadline = Instant::now() + REMOTE_LIMIT + Duration::from_secs(180);
+    let end = loop {
+        if let Some(end) = child.try_wait()? {
+            break end;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            break child.wait()?;
+        }
+        std::thread::sleep(POLL);
+    };
+    let transcript = std::fs::read_to_string(&log).unwrap_or_default();
+    for line in transcript.lines().filter(|l| l.starts_with("workspace: ")) {
+        println!("remote test window: {line}");
+    }
+    println!("remote test window: transcript {}", log.display());
+    rt.check_end(end, &run)?;
+    let read_trim = |name: &str| std::fs::read_to_string(run.scratch.join(name)).map(|t| t.trim().to_owned());
+    let agent_rc = read_trim(AGENT_RC).map_err(|_| {
+        anyhow::anyhow!(
+            "lost: no {AGENT_RC} came back (the transfer ended {end}); rerun, see {}",
+            log.display()
+        )
+    })?;
+    if agent_rc != "0" {
+        println!(
+            "---- agent log\n{}",
+            tail(&read_trim(AGENT_LOG).unwrap_or_default(), TAIL)
+        );
+        anyhow::bail!("the window agent on the target exited {agent_rc}");
+    }
+    let record: LiveRecord = serde_json::from_str(&read_trim(LIVE_JSON)?)
+        .with_context(|| format!("reading {}", run.scratch.join(LIVE_JSON).display()))?;
+    // atld's own status: the run script's record (the agent is not its parent)
+    let rc: i32 = read_trim("atld.rc")?.parse().context("atld.rc")?;
+    let status = std::process::ExitStatus::from_raw((rc & 0xff) << 8);
+    let out = LiveOut {
+        liveness: record.liveness,
+        captured: Arc::new(Mutex::new(record.captured)),
+        app_ids: Arc::default(),
+        titles: Arc::default(),
+        splash_shot: None,
+        ended: record.ended.then_some(status),
+        stopped: record.stopped.then_some(status),
+        pressure: record.pressure,
+    };
+    judge(
+        &Judged {
+            root,
+            args: &args,
+            run: &run,
+            package: &m.name,
+            display,
+            rate: if ui { Rate::Session } else { Rate::Fixed },
+            moved: None,
+            app_uid,
+            start_ms,
+        },
+        out,
+        None,
+    )
 }
 
 /// Stage hwui: the run's `LD_DEBUG=bindings` records against launcher-closure.toml (xtask launcher_closure.rs `judge_bindings`): app/AOSP/ours objects bind host only to glibc, the C++ runtime and the declared system bindings; host objects bind only listed AOSP sonames, never a forbidden one.
@@ -3039,7 +3628,12 @@ mod tests {
         let check = |times: &[u64], hz: f32| {
             let owned = lines(times);
             let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
-            cadence_check(&refs, hz, &Samples::default())
+            cadence_check(&refs, hz, Rate::Fixed, &Samples::default())
+        };
+        let session = |times: &[u64], hz: f32| {
+            let owned = lines(times);
+            let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+            cadence_check(&refs, hz, Rate::Session, &Samples::default())
         };
         let steady: Vec<u64> = (0..31).map(|i| 5_000_000_000 + i * STEP).collect();
         let ok = check(&steady, 60.0);
@@ -3063,6 +3657,12 @@ mod tests {
             .map(|i| 5_000_000_000 + i * STEP - if i >= 15 { 6_000_000 } else { 0 })
             .collect();
         assert!(check(&rephased, 60.0).is_err(), "one interval of 10.67 ms");
+        // a session display: a missed vsync and a slow mean are host-stated (VRR stretches intervals); too few callbacks and an interval under P - 3 ms still fail
+        let stated = session(&missed, 60.0).expect("host-stated on a session display");
+        assert!(stated.contains("host-stated mean="), "{stated}");
+        assert!(session(&fast, 60.0).is_ok(), "20 ms intervals, slower than a 60 Hz max");
+        assert!(session(&short, 60.0).is_err());
+        assert!(session(&rephased, 60.0).is_err());
         assert!(frame_time("1000.000 1 2 I AtlWindow: onDraw reached").is_none());
     }
 
@@ -3092,7 +3692,7 @@ mod tests {
                 .map(|t| format!("1000.000 1 2 I AtlWindow: frame 1 time={t}"))
                 .collect();
             let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
-            cadence_check(&refs, 60.0, p)
+            cadence_check(&refs, 60.0, Rate::Fixed, p)
         };
         let quiet = pressure(STARVED_STALL_SHARE / 2.0);
         let starved = pressure(STARVED_STALL_SHARE * 2.0);

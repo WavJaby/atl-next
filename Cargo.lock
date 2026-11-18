@@ -283,6 +283,7 @@ name = "atl-cpu-pressure"
 version = "0.0.0"
 dependencies = [
  "rustix",
+ "serde",
 ]
 
 [[package]]

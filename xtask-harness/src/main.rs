@@ -125,6 +125,12 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// The window gate's live half on a remote target (window.rs `agent`), started by `remote test window`'s run script; needs no checkout.
+    #[command(hide = true)]
+    WindowLive(window::AgentArgs),
+    /// This host's first monitor as atld's `--display` value (window.rs `display_probe`), run on a remote target before a UI stage; needs no checkout.
+    #[command(hide = true)]
+    DisplayProbe,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -293,6 +299,12 @@ enum Test {
 
 fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
+    // the target-side commands run from a bundle, where no checkout exists
+    match &cli.command {
+        Command::WindowLive(args) => return window::agent(args),
+        Command::DisplayProbe => return window::display_probe(),
+        _ => {}
+    }
     let root = checkout_root()?;
     let name = verdict_name(&cli.command);
     let result = match cli.command {
@@ -440,6 +452,7 @@ fn main() -> Result<ExitCode> {
             test: Test::HostFonts(args),
         } => host_fonts::run(&root, &args),
         Command::CheckStep { step, out } => check_step(&root, step, &out),
+        Command::WindowLive(_) | Command::DisplayProbe => unreachable!("dispatched above"),
     };
     // a run that ends in an error (`?`, bail!) still ends with its verdict line; main prints the error after it
     if let (Err(e), Some(name)) = (&result, name) {
@@ -530,6 +543,6 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::EglBridge(_) => "egl-bridge",
             Test::HostFonts(_) => "host-fonts",
         },
-        Command::CheckStep { .. } => return None,
+        Command::CheckStep { .. } | Command::WindowLive(_) | Command::DisplayProbe => return None,
     })
 }

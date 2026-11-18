@@ -162,6 +162,12 @@ pub struct TestArgs {
     /// `app` only: the fixture's ISA (`test app --fixture-arch`); needed where `--arch` has no identity engine.
     #[arg(long)]
     pub(crate) fixture_arch: Option<String>,
+    /// `window` only: the stage (`frames`, `widgets` or `ui-block`; window.rs `REMOTE_STAGES`). Its live half runs on the target next to atld (the harness's hidden `window-live`); UI stages open their window on the target's session display.
+    #[arg(long)]
+    pub(crate) stage: Option<String>,
+    /// `window` only: the composer's deliberate break rule (`test window --break-<rule>`, e.g. `no-backpressure` for ui-block).
+    #[arg(long, value_name = "RULE")]
+    pub(crate) ui_break: Option<String>,
 }
 
 /// `--arch` of a remote run (`remote test app`, `remote run-apk`): one declaration, one selection ([`TargetArch::resolve`]).
@@ -245,9 +251,17 @@ fn test(root: &Path, a: &TestArgs) -> Result<ExitCode> {
     if a.gate == "app" {
         return crate::app::remote(root, a);
     }
+    // `window` too: its record is the stage's run, written before the push (window.rs `remote`)
+    if a.gate == "window" {
+        return crate::window::remote(root, a);
+    }
     ensure!(
         a.target_arch.arch.is_none() && a.fixture_arch.is_none(),
         "--arch and --fixture-arch are `app` options"
+    );
+    ensure!(
+        a.stage.is_none() && a.ui_break.is_none(),
+        "--stage and --ui-break are `window` options"
     );
     let out = out_of(root, a.out.as_deref())?;
     let target = Target::of(root, &out, &a.gate, &a.host, a.brk)?;
@@ -305,7 +319,7 @@ fn test(root: &Path, a: &TestArgs) -> Result<ExitCode> {
 fn runtime_half(root: &Path, a: &TestArgs, target: &Target, out: &Path) -> Result<bool> {
     ensure!(
         a.gate == "gl",
-        "gate `{}`: its runtime half is not remotable yet (`gl`: one-shot runs; `app`: its headless subset; the others drive a live runtime)",
+        "gate `{}`: its runtime half is not remotable yet (`gl`: one-shot runs; `app`: its headless subset; `window`: stages frames, widgets, ui-block through the target agent; the others drive a live runtime)",
         a.gate
     );
     let arches = arches::load(root)?;
@@ -342,6 +356,87 @@ pub struct RemoteRun {
     log: PathBuf,
     /// Where the run's `WAYLAND_DISPLAY` comes from, if anywhere.
     display: Display,
+    /// The window gate's live half, run on the target beside atld ([`Agent`]).
+    agent: Option<Agent>,
+}
+
+/// The window gate's live half on the target (window.rs `agent`, the harness's hidden `window-live`): started before atld, it proxies atld's window to the target's compositor, drives the stage and stops
+/// atld through its control socket; it writes `live.json` for the judge here. Host paths, relocated by [`RemoteRun::spawn`].
+#[derive(Clone)]
+pub struct Agent {
+    /// The harness binary (a bundle entry: atld_run.rs `runtime_inputs` lists it for the window gate).
+    pub program: PathBuf,
+    /// Its arguments before the proxy's sockets.
+    pub args: Vec<String>,
+    /// After `--`: the window args of the run (stage and flags).
+    pub window: Vec<String>,
+    /// Whether atld's window goes through the agent's proxy to the run's display (the UI stages): the script then gives the agent `--upstream`/`--listen` and atld the proxy's socket.
+    pub proxy: bool,
+}
+
+impl Site {
+    /// This site with the window gate's agent ([`Agent`]); a host site is returned as it is.
+    pub fn with_agent(self, agent: Agent) -> Site {
+        match self {
+            Site::Remote(mut r) => {
+                r.agent = Some(agent);
+                Site::Remote(r)
+            }
+            host => host,
+        }
+    }
+}
+
+/// How long the run waits for the agent's proxy socket, in 1 s polls: the harness binds it before anything else.
+const AGENT_WAIT_S: u32 = 10;
+/// The agent's margin over atld's limit (`timeout`): it stops atld, then joins its probe.
+const AGENT_MARGIN_S: u64 = 60;
+/// Files the agent run adds to the run's scratch dir: atld's pid for the agent, the agent's exit, log and record.
+pub const ATLD_PID: &str = "atld.pid";
+pub const AGENT_RC: &str = "agent.rc";
+pub const AGENT_LOG: &str = "agent.log";
+pub const LIVE_JSON: &str = "live.json";
+/// The hidden `display-probe`'s answer line: atld's `--display` value.
+pub const DISPLAY_PROBE_LINE: &str = "display-probe: ";
+/// The display probe's bound: one Wayland roundtrip after the binary loads.
+const DISPLAY_PROBE_LIMIT: Duration = Duration::from_secs(30);
+
+/// Moves the target's Hyprland session to an empty workspace for the run and back after it (owner decision D1, 2026-11-18: a remote window gate may open its window on the live desktop, on an empty
+/// workspace, and the workspace that was active before comes back also on failure or interruption). Probed, never named by host: `hyprctl` on PATH and exactly one instance under `$WL_DIR/hypr`;
+/// anything else logs why and runs in place. Empty = the lowest id no workspace has (Hyprland keeps only workspaces with windows or focus). Lines go to stderr (the transcript): `workspace: ...`.
+fn workspace_script() -> String {
+    const SCRIPT: &str = r#"WS_PREV=""
+WS_N=$(ls "$WL_DIR/hypr" 2>/dev/null | wc -l)
+if ! command -v hyprctl >/dev/null 2>&1; then
+  echo "workspace: no hyprctl, no workspace switch: running in place" >&2
+elif [ "$WS_N" -ne 1 ]; then
+  echo "workspace: $WS_N Hyprland instances in $WL_DIR/hypr, want 1: running in place" >&2
+else
+  export XDG_RUNTIME_DIR="$WL_DIR"
+  export HYPRLAND_INSTANCE_SIGNATURE="$(ls "$WL_DIR/hypr")"
+  WS_PREV=$(hyprctl activeworkspace | @ID@ | head -n 1)
+  [ -n "$WS_PREV" ] || echo "workspace: hyprctl named no active workspace: running in place" >&2
+fi
+if [ -n "$WS_PREV" ]; then
+  WS_USED=$(hyprctl workspaces | @ID@)
+  WS_RUN=1
+  while printf '%s\n' $WS_USED | grep -qx "$WS_RUN"; do WS_RUN=$((WS_RUN + 1)); done
+  ws_back() {
+    [ -n "$WS_PREV" ] || return 0
+    hyprctl dispatch workspace "$WS_PREV" >/dev/null 2>&1
+    echo "workspace: after=$(hyprctl activeworkspace | @ID@ | head -n 1) (restored $WS_PREV)" >&2
+    WS_PREV=""
+  }
+  trap ws_back EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  hyprctl dispatch workspace "$WS_RUN" >/dev/null 2>&1
+  echo "workspace: before=$WS_PREV during=$(hyprctl activeworkspace | @ID@ | head -n 1) (empty $WS_RUN)" >&2
+fi
+"#;
+    // `hyprctl activeworkspace` / `workspaces` text: `workspace ID <n> (<name>) on monitor ...`
+    SCRIPT.replace("@ID@", r"sed -n 's/^workspace ID \(-\{0,1\}[0-9]*\) .*/\1/p'")
 }
 
 /// Where a remote run's Wayland display comes from: the capability the target has, probed before the run ([`Target::probe_display`]), never named by host.
@@ -528,6 +623,8 @@ struct Plan {
     limit: u64,
     /// Where `WAYLAND_DISPLAY` comes from ([`Display`]).
     display: Display,
+    /// The window gate's agent ([`Agent`]), bundle paths.
+    agent: Option<Agent>,
 }
 
 fn out_path(rel: &str) -> String {
@@ -611,6 +708,37 @@ impl Plan {
             .iter()
             .map(|d| format!("{BASE_MARK}/{d}"))
             .collect();
+        let scratch_file = |name: &str| word(&out_path(&format!("{}/{name}", self.scratch)));
+        // the agent first: its proxy socket must exist before atld connects to it
+        let proxied = self.agent.as_ref().is_some_and(|a| a.proxy);
+        if let Some(agent) = &self.agent {
+            if proxied && self.display == Display::Session {
+                s.push_str(&workspace_script());
+            }
+            s.push_str("GATE_SOCK=\"/run/user/$(id -u)/atl-gate-$$.sock\"\n");
+            let args: Vec<String> = agent.args.iter().map(|a| word(a)).collect();
+            let window: Vec<String> = agent.window.iter().map(|a| word(a)).collect();
+            let sockets = if proxied {
+                " --upstream \"$WL_DIR/$WL\" --listen \"$GATE_SOCK\""
+            } else {
+                ""
+            };
+            s.push_str(&format!(
+                "env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=\"$HOME\" XDG_RUNTIME_DIR=\"/run/user/$(id -u)\" LD_LIBRARY_PATH={} timeout -k {KILL_GRACE} {} {} {}{sockets} -- {} < /dev/null > {} 2>&1 &\nAG=$!\n",
+                word(&lib_path.join(":")),
+                self.limit + AGENT_MARGIN_S,
+                word(&agent.program.display().to_string()),
+                args.join(" "),
+                window.join(" "),
+                scratch_file(AGENT_LOG)
+            ));
+            if proxied {
+                s.push_str(&format!(
+                    "i=0\nwhile [ ! -S \"$GATE_SOCK\" ] && [ \"$i\" -lt {AGENT_WAIT_S} ]; do\n  kill -0 \"$AG\" 2>/dev/null || break\n  sleep 1\n  i=$((i + 1))\ndone\n[ -S \"$GATE_SOCK\" ] || {{ echo \"remote run {}: the window agent made no proxy socket within {AGENT_WAIT_S} s (see {AGENT_LOG})\" >&2; kill \"$AG\" 2>/dev/null; exit 5; }}\n",
+                    self.tag
+                ));
+            }
+        }
         s.push_str(&format!(
             "env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=\"$HOME\" XDG_RUNTIME_DIR=\"/run/user/$(id -u)\" LD_LIBRARY_PATH={}",
             word(&lib_path.join(":"))
@@ -622,7 +750,9 @@ impl Plan {
                 v = session_var(name)
             ));
         }
-        if self.display != Display::Headless {
+        if proxied {
+            s.push_str(" WAYLAND_DISPLAY=\"$GATE_SOCK\"");
+        } else if self.display != Display::Headless {
             s.push_str(" WAYLAND_DISPLAY=\"$WL\"");
         }
         for (key, value) in &self.env {
@@ -637,7 +767,21 @@ impl Plan {
             args.join(" "),
             word(&out_path(&format!("{}/atld.log", self.scratch)))
         ));
-        s.push_str("pid=$!\nwait \"$pid\"\nrc=$?\n");
+        s.push_str("pid=$!\n");
+        if self.agent.is_some() {
+            s.push_str(&format!(
+                "printf '%s\\n' \"$pid\" > {}\n",
+                scratch_file(ATLD_PID)
+            ));
+        }
+        s.push_str("wait \"$pid\"\nrc=$?\n");
+        // the agent stopped atld (or saw it end); it ends after joining its probe, bounded by its own timeout
+        if self.agent.is_some() {
+            s.push_str(&format!(
+                "wait \"$AG\"\nprintf '%s\\n' \"$?\" > {}\nrm -f \"$GATE_SOCK\"\n",
+                scratch_file(AGENT_RC)
+            ));
+        }
         s.push_str("kill -KILL -- \"-$pid\" 2>/dev/null || true\n");
         // the nested compositor lives for the run only: its window leaves the target's desktop with it
         if self.display == Display::NestedX11 {
@@ -678,10 +822,22 @@ impl Plan {
             sh_quote(&format!("{}/{HOST_FACTS}", self.scratch)),
             sh_quote(&format!("{}/{CPU_INFO}", self.scratch))
         ));
+        // the tar line ends with its last path: labwc's log and the agent's files ride along
+        let mut extra = Vec::new();
         if self.display == Display::NestedX11 {
-            // the tar line ends with its last path: labwc's log rides along
+            extra.push(labwc_log);
+        }
+        if self.agent.is_some() {
+            extra.extend(
+                [LIVE_JSON, AGENT_RC, AGENT_LOG].map(|f| format!("{}/{f}", self.scratch)),
+            );
+        }
+        if !extra.is_empty() {
             s.pop();
-            s.push_str(&format!(" {}\n", sh_quote(&labwc_log)));
+            for path in &extra {
+                s.push_str(&format!(" {}", sh_quote(path)));
+            }
+            s.push('\n');
         }
         s
     }
@@ -742,6 +898,19 @@ impl RemoteRun {
             lib_dirs: self.lib_dirs.clone(),
             limit: self.limit.as_secs(),
             display: self.display,
+            agent: self
+                .agent
+                .as_ref()
+                .map(|a| -> Result<Agent> {
+                    let rel = |s: &str| relocate(s, roots);
+                    Ok(Agent {
+                        program: PathBuf::from(rel(&utf8(a.program.as_os_str())?)),
+                        args: a.args.iter().map(|s| rel(s)).collect(),
+                        window: a.window.iter().map(|s| rel(s)).collect(),
+                        proxy: a.proxy,
+                    })
+                })
+                .transpose()?,
         };
         let script = scratch.join(REMOTE_SCRIPT);
         std::fs::write(&script, plan.script(&self.base))
@@ -1120,7 +1289,31 @@ impl Target {
             limit,
             log,
             display,
+            agent: None,
         })
+    }
+
+    /// atld's `--display` value from the target's own display (the harness's hidden `display-probe`, window.rs `display_probe`, under the session's `WAYLAND_DISPLAY`): what a remote UI stage
+    /// tells atld and judges with. `harness` and the bundle's lib dirs are host paths, relocated. Only the session's socket: a nested labwc lives for one run only.
+    pub fn display_model(&self, roots: &Roots, harness: &Path) -> Result<String> {
+        let lib_path: Vec<String> = self
+            .lib_dirs
+            .iter()
+            .map(|d| format!("{BASE_MARK}/{d}"))
+            .collect();
+        let script = format!(
+            "cd {} || exit 2\nBASE=$(pwd)\n{}env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=\"$HOME\" XDG_RUNTIME_DIR=\"$WL_DIR\" WAYLAND_DISPLAY=\"$WL\" LD_LIBRARY_PATH={} {} display-probe < /dev/null\n",
+            sh_quote(&self.base()),
+            session_script("display-probe"),
+            word(&lib_path.join(":")),
+            word(&relocate(&utf8(harness.as_os_str())?, roots))
+        );
+        let out = String::from_utf8(self.run_bounded(&script, DISPLAY_PROBE_LIMIT)?)
+            .context("display-probe: output is not UTF-8")?;
+        out.lines()
+            .find_map(|l| l.strip_prefix(DISPLAY_PROBE_LINE))
+            .map(str::to_owned)
+            .with_context(|| format!("display-probe: no `{DISPLAY_PROBE_LINE}` line in {out:?}"))
     }
 
     /// The bundle dir on the target, where a run's `out/` lives: `~/atl-next-run/<name>` relative to home, or the local dir.
@@ -2226,6 +2419,7 @@ mod tests {
             limit: Duration::from_secs(1),
             log: log.clone(),
             display: Display::Headless,
+            agent: None,
         };
         // a wait status: exit code 2 is `2 << 8`
         let end = std::os::unix::process::ExitStatusExt::from_raw(2 << 8);
@@ -2276,6 +2470,7 @@ mod tests {
             lib_dirs: Vec::new(),
             limit: 60,
             display: Display::Headless,
+            agent: None,
         };
         let s = plan.script("b");
         let read = s
@@ -2395,6 +2590,7 @@ mod tests {
             lib_dirs: vec!["lib".to_owned()],
             limit: 120,
             display: Display::Headless,
+            agent: None,
         };
         let want = concat!(
             "# xtask remote run gl/run: written by remote.rs, do not edit\n",
@@ -2443,6 +2639,7 @@ mod tests {
             lib_dirs: vec!["lib".to_owned()],
             limit: 300,
             display: Display::Session,
+            agent: None,
         };
         let s = plan.script("atl-next-run/x3");
         let launcher = s.find("is not an executable").expect("launcher check");
@@ -2479,6 +2676,7 @@ mod tests {
             lib_dirs: vec!["lib".to_owned()],
             limit: 60,
             display: Display::NestedX11,
+            agent: None,
         };
         let s = plan.script("atl-next-run/x4-riscv64");
         let at = |needle: &str| {
@@ -2507,6 +2705,72 @@ mod tests {
         };
         let s = session.script("b");
         assert!(!s.contains("labwc") && !s.contains("/proc/[0-9]"), "{s}");
+    }
+
+    /// A window agent run on the session display: the workspace switch (its restore trapped on exit) and the agent come before atld, the run waits for the agent's socket, atld's display is that
+    /// socket (never the session's), its pid goes to the agent, the agent's exit is recorded after atld's, and its files ride in the tar. Headless agent (frames): no proxy, no switch, no socket wait.
+    #[test]
+    fn agent_run_switches_workspace_and_proxies_atld() {
+        let plan = Plan {
+            tag: "window".to_owned(),
+            root: "window/root".to_owned(),
+            scratch: "window/scratch".to_owned(),
+            env: Vec::new(),
+            session_env: Vec::new(),
+            program: "@BASE@/out/cargo/release/atld".to_owned(),
+            args: vec!["--ui".to_owned(), "gtk".to_owned()],
+            files: Vec::new(),
+            lib_dirs: vec!["lib".to_owned()],
+            limit: 240,
+            display: Display::Session,
+            agent: Some(Agent {
+                program: PathBuf::from("@BASE@/out/cargo/debug/xtask-harness"),
+                args: vec!["window-live".to_owned()],
+                window: vec!["--stage".to_owned(), "widgets".to_owned()],
+                proxy: true,
+            }),
+        };
+        let s = plan.script("atl-next-run/x5");
+        let at = |needle: &str| {
+            s.find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} in\n{s}"))
+        };
+        let session = at("[ \"$WL_N\" -eq 1 ] ||");
+        let trap = at("trap ws_back EXIT\n");
+        let switch = at("hyprctl dispatch workspace \"$WS_RUN\"");
+        let agent = at(
+            " timeout -k 10 300 \"$BASE/out/cargo/debug/xtask-harness\" \"window-live\" --upstream \"$WL_DIR/$WL\" --listen \"$GATE_SOCK\" -- \"--stage\" \"widgets\" < /dev/null > \"$BASE/out/window/scratch/agent.log\" 2>&1 &\nAG=$!\n",
+        );
+        let wait = at("while [ ! -S \"$GATE_SOCK\" ]");
+        let atld = at(" WAYLAND_DISPLAY=\"$GATE_SOCK\" timeout -k 10 240 ");
+        let pid = at("printf '%s\\n' \"$pid\" > \"$BASE/out/window/scratch/atld.pid\"\n");
+        let agent_rc = at("wait \"$AG\"\nprintf '%s\\n' \"$?\" > \"$BASE/out/window/scratch/agent.rc\"\n");
+        assert!(
+            session < trap
+                && trap < switch
+                && switch < agent
+                && agent < wait
+                && wait < atld
+                && atld < pid
+                && pid < agent_rc,
+            "{s}"
+        );
+        assert!(!s.contains("WAYLAND_DISPLAY=\"$WL\""), "{s}");
+        assert!(
+            s.ends_with(" 'window/scratch/live.json' 'window/scratch/agent.rc' 'window/scratch/agent.log'\n"),
+            "{s}"
+        );
+        let headless = Plan {
+            display: Display::Headless,
+            agent: plan.agent.clone().map(|a| Agent { proxy: false, ..a }),
+            ..plan
+        };
+        let s = headless.script("b");
+        assert!(
+            !s.contains("hyprctl") && !s.contains("--upstream") && !s.contains("WAYLAND_DISPLAY"),
+            "{s}"
+        );
+        assert!(s.contains("AG=$!\n") && s.contains("agent.rc"), "{s}");
     }
 
     /// The probe's three answers; anything else is an error, not a mode.
@@ -2545,6 +2809,7 @@ mod tests {
             lib_dirs: Vec::new(),
             limit: 120,
             display: Display::Headless,
+            agent: None,
         };
         let s = plan.script("b");
         assert!(!s.contains("WL_DIR"), "{s}");
@@ -2958,6 +3223,7 @@ mod tests {
             lib_dirs: Vec::new(),
             limit: 120,
             display: Display::Headless,
+            agent: None,
         };
         let err = host
             .run_script(&plan.script(&base))

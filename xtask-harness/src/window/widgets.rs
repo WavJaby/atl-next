@@ -18,8 +18,8 @@ use atl_services_types::input_devices;
 
 use super::capture;
 use super::{
-    ACK_WAIT, BTN_LEFT, CONTENT_ORIGIN_LINE, Liveness, POLL, Sub, await_event, cadence_check,
-    content_origin, wait_for_line,
+    ACK_WAIT, BTN_LEFT, CONTENT_ORIGIN_LINE, Liveness, POLL, Rate, Sub, await_event,
+    cadence_check, content_origin, wait_for_line,
 };
 use crate::composer::word;
 use crate::nested_wayland::{GATE_OUTPUT, Output};
@@ -75,7 +75,7 @@ const RESUME_LINE: &str = "AtlWindow: frame resume";
 const FRAME_PREFIX: &str = "AtlWindow: frame ";
 
 /// The idle window's log offsets (bytes): `from` after the settle, `to` at the resume tap.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub(super) struct Idle {
     pub from: usize,
     pub to: usize,
@@ -822,12 +822,14 @@ fn presents_check(app: &str) -> Result<String, String> {
     Ok(format!("{n} scenes presented; mean interval {mean}"))
 }
 
-/// The widgets stage's sub-gates, in print order, from the probe's result, the app log and the frame callbacks after the marker; `esc_back`: the run had atld `--esc-back true`.
+/// The widgets stage's sub-gates, in print order, from the probe's result, the app log and the frame callbacks after the marker; `esc_back`: the run had atld `--esc-back true`; `rate`: what the display's rate promises the cadence.
+#[allow(clippy::too_many_arguments)]
 pub fn checks(
     app: &str,
     after: &[&str],
     probe: &Result<Liveness, String>,
     display: DisplayModel,
+    rate: Rate,
     pressure: &Samples,
     pictures: &Mutex<capture::Seen>,
     esc_back: bool,
@@ -862,7 +864,7 @@ pub fn checks(
         ("presents", presents_check(app)),
         (
             "cadence",
-            cadence_check(after, display.refresh_hz, pressure),
+            cadence_check(after, display.refresh_hz, rate, pressure),
         ),
         ("idle", idle_check(idle, app, display.refresh_hz)),
         ("resume", resume_check(idle, app)),

@@ -23,6 +23,7 @@ pub const STARVED_STALL_SHARE: f64 = 0.10;
 
 /// One sample: CLOCK_MONOTONIC ns, cumulative `some` stall us.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Sample {
     pub at_ns: i64,
     pub stall_us: u64,
@@ -44,6 +45,7 @@ fn now_ns() -> i64 {
 
 /// Samples in time order.
 #[derive(Default, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Samples(pub Vec<Sample>);
 
 impl Samples {

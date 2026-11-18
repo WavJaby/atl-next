@@ -57,15 +57,17 @@ const ATTEMPT_GAP: Duration = Duration::from_millis(250);
 pub(super) const CAPTURE_WINDOW_MS: u64 = 40_000;
 
 /// One picture of the window: the size and RGBA rows of atld's reply and file, which [`Probe::shoot`] checks against each other. `digest` is FNV-1a 64 over `rgba`.
-#[derive(Clone, Debug)]
+/// Serialized for the target agent's `live.json` without `rgba`: the remote stages (window.rs `REMOTE_STAGES`) judge size and digest only.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(super) struct Shot {
     pub size: (u32, u32),
     pub digest: u64,
+    #[serde(skip)]
     pub rgba: Vec<u8>,
 }
 
 /// What a probe recorded, read by the sub-gates once it is joined: each picture in order (Ok, or why none settled), and the refused caller (capture (b)).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct Seen {
     pub(super) pictures: Vec<Result<Shot, String>>,
     pub(super) refusal: Option<Result<String, String>>,

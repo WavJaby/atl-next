@@ -10,6 +10,11 @@ publish.workspace = true
 # Host CPU starvation (PSI `some` share) over a window, and the judgement made over it: the one measure xtask's cadence window and the g4 gate share. Core crate: no unsafe.
 [dependencies]
 rustix.workspace = true
+serde = { workspace = true, optional = true }
+
+# `serde`: the window gate's target agent (xtask-harness `window-live`) returns its samples as JSON.
+[features]
+serde = ["dep:serde"]
 
 [lints]
 workspace = true

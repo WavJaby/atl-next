@@ -1639,7 +1639,18 @@ impl Runtime {
         inputs
             .files
             .extend(remote::lib_files(&self.platform_module)?);
+        // the window gate's live half runs on a remote target as this binary (window.rs `agent`); a build-dir file, so the bundle maps it under `out/`
+        if self.gate == "window" {
+            inputs
+                .files
+                .push(std::env::current_exe().context("the harness binary's path")?);
+        }
         Ok(inputs)
+    }
+
+    /// The host roots a remote run relocates (remote.rs `Roots`).
+    pub fn roots(&self) -> remote::Roots {
+        remote::Roots::of(&self.out, &self.java_out, &self.tree, &self.llvm_lib)
     }
 
     /// Records what `run` reads for `xtask remote push` (remote.rs `write_record`): the runtime's inputs, the run's packages and boot jars. Written before atld starts, so a run that fails still leaves its record.
@@ -1693,7 +1704,7 @@ impl Runtime {
                 cmd.env("FONTCONFIG_FILE", &conf);
                 written.push(conf);
             }
-            let roots = remote::Roots::of(&self.out, &self.java_out, &self.tree, &self.llvm_lib);
+            let roots = self.roots();
             return target.spawn(
                 &roots,
                 &cmd,

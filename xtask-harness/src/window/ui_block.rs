@@ -10,7 +10,6 @@
 
 use super::{ACK_WAIT, Liveness, Sub, await_event, line_stamp, wait_for_line};
 use crate::composer::word;
-use crate::nested_wayland::GATE_OUTPUT;
 use crate::wayland_proxy::{Event as ProxyEvent, Proxy};
 use std::path::Path;
 use std::time::Duration;
@@ -40,9 +39,9 @@ const RESULT_WAIT: Duration = Duration::from_secs(25);
 /// A dequeue that timed out (HWUI / libgui log `dequeueBuffer failed ... -110`, TIMED_OUT).
 const TIMED_OUT: &str = "-110";
 
-/// The frame period of the gate's output, ms.
-fn period_ms() -> f64 {
-    1_000_000.0 / f64::from(GATE_OUTPUT.refresh_mhz)
+/// The frame period of the run's display (the gate's output locally, the target's display remotely), ms.
+fn period_ms(refresh_hz: f32) -> f64 {
+    1_000.0 / f64::from(refresh_hz)
 }
 
 fn result_line(app: &str) -> Result<&str, String> {
@@ -70,7 +69,7 @@ fn bound_ms(app: &str) -> Result<u64, String> {
 }
 
 /// The frames the producer posted inside the block against the vsync grid, less the composer's bound.
-fn posts_check(app: &str) -> Result<String, String> {
+fn posts_check(app: &str, refresh_hz: f32) -> Result<String, String> {
     let line = result_line(app)?;
     let (during, gap, block) = (
         number(line, "posts_during")?,
@@ -79,7 +78,7 @@ fn posts_check(app: &str) -> Result<String, String> {
     );
     let bound = bound_ms(app)?;
     let want =
-        ((block.saturating_sub(bound) as f64 / period_ms()).floor() as u64).saturating_sub(SLACK);
+        ((block.saturating_sub(bound) as f64 / period_ms(refresh_hz)).floor() as u64).saturating_sub(SLACK);
     let summary = format!(
         "{during} frames posted during the {block} ms block (want >= {want}: bound {bound} ms), longest gap {gap} ms"
     );
@@ -164,12 +163,12 @@ fn timeouts_check(app: &str) -> Result<String, String> {
     }
 }
 
-/// The sub-gates.
-pub fn checks(app: &str) -> Vec<Sub> {
+/// The sub-gates; `refresh_hz`: the run's display (the block's grid).
+pub fn checks(app: &str, refresh_hz: f32) -> Vec<Sub> {
     vec![
         ("held", held_check(app)),
         ("replaced", replaced_check(app)),
-        ("posts", posts_check(app)),
+        ("posts", posts_check(app, refresh_hz)),
         ("timeouts", timeouts_check(app)),
     ]
 }
@@ -200,15 +199,18 @@ mod tests {
 
     /// At 60 Hz (period 16.666...67 ms in f64) with a 100 ms bound a 2000 ms block holds floor(113.99...) = 113 grid points, minus SLACK 2: 111 posts pass, 110 fail. Backpressure off (bound 0): floor(119.99...)
     /// = 119, minus 2: 117. No start line or no result line fails.
+    /// A 120 Hz target display (period 8.333...34 ms in f64): 1900 ms holds floor(227.99...) = 227 grid points, minus 2: 225 pass, 224 fail.
     #[test]
     fn posts_against_the_grid_less_the_bound() {
-        assert!(posts_check(&format!("{ON}{}", result(111, 0))).is_ok());
-        assert!(posts_check(&format!("{ON}{}", result(110, 0))).is_err());
+        assert!(posts_check(&format!("{ON}{}", result(111, 0)), 60.0).is_ok());
+        assert!(posts_check(&format!("{ON}{}", result(110, 0)), 60.0).is_err());
         let off = "0.5 INFO atl-composer: ui: backpressure=false bound_ms=100\n";
-        assert!(posts_check(&format!("{off}{}", result(117, 0))).is_ok());
-        assert!(posts_check(&format!("{off}{}", result(116, 0))).is_err());
-        assert!(posts_check(&result(117, 0)).is_err());
-        assert!(posts_check(ON).is_err());
+        assert!(posts_check(&format!("{off}{}", result(117, 0)), 60.0).is_ok());
+        assert!(posts_check(&format!("{off}{}", result(116, 0)), 60.0).is_err());
+        assert!(posts_check(&result(117, 0), 60.0).is_err());
+        assert!(posts_check(ON, 60.0).is_err());
+        assert!(posts_check(&format!("{ON}{}", result(225, 0)), 120.0).is_ok());
+        assert!(posts_check(&format!("{ON}{}", result(224, 0)), 120.0).is_err());
     }
 
     /// 80 busy cycles: at most 2 x 81 = 162 takes, plus 3 queued slots = 165 posts pass, 166 fail.
