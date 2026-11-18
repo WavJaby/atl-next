@@ -2923,21 +2923,17 @@ pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
         "remote test window: stage {stage_name} is not remotable (frames, widgets, ui-block)"
     );
     let ui = !matches!(args.stage, Stage::Frames);
-    let kind = if ui {
-        let (kind, why) = crate::remote::probe_display(&a.host)?;
-        match kind {
-            Display::Session => kind,
-            Display::NestedX11 => anyhow::bail!(
-                "remote test window --stage {stage_name}: the target has {why}; the window gate runs only on a session display"
-            ),
-            Display::Headless => {
-                anyhow::bail!(
-                    "remote test window --stage {stage_name}: no display on the target: {why}"
-                )
-            }
-        }
-    } else {
-        Display::Headless
+    // frames too takes the session's socket when there is one, without `--ui` (no window): atld's renderer probe mounts the compositor socket even headless, and a local run inherits the desktop's
+    let (kind, why) = crate::remote::probe_display(&a.host)?;
+    let kind = match kind {
+        Display::Session => kind,
+        Display::NestedX11 if ui => anyhow::bail!(
+            "remote test window --stage {stage_name}: the target has {why}; the window gate runs only on a session display"
+        ),
+        Display::Headless if ui => anyhow::bail!(
+            "remote test window --stage {stage_name}: no display on the target: {why}"
+        ),
+        Display::NestedX11 | Display::Headless => Display::Headless,
     };
     let rt = Runtime::new(
         root,
