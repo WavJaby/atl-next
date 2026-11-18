@@ -99,6 +99,9 @@ pub struct Args {
     /// Deliberate break (any UI stage that replaces buffers): the composer ignores the window's hold set and releases a shown buffer at the latch that replaces it, before the window's paint, so the release check must fail.
     #[arg(long)]
     break_ignore_hold: bool,
+    /// Deliberate break (stage ui-block): the composer latches every tick whether the window took the last scene or not (atl-composer feature `break-no-backpressure`), so the held and replaced checks must fail.
+    #[arg(long)]
+    break_no_backpressure: bool,
     /// Stage ime only: the fake input method leaves its commit_string out, so the commit sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     break_ime_commit: bool,
@@ -1954,6 +1957,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                     (args.break_post_draw, "post-draw"),
                     (args.break_queue, "queue"),
                     (args.break_ignore_hold, "ignore-hold"),
+                    (args.break_no_backpressure, "no-backpressure"),
                     (args.break_input_frames, "input-frames"),
                     (args.break_input_no_wake, "input-no-wake"),
                 ]

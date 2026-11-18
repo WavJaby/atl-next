@@ -183,9 +183,11 @@ pub fn start(host: Arc<dyn VmHost>, window: Option<OpenWindow>) -> Result<Arc<Co
             latch_buffers: !cfg!(feature = "break-queue"),
             ..Default::default()
         },
-        // break `post-draw`: the window service's forwarded post-draw Transactions are dropped; break `ignore-hold`: a shown buffer is released at the latch that replaces it
+        // break `post-draw`: the window service's forwarded post-draw Transactions are dropped; break `ignore-hold`: a shown buffer is released at the latch that replaces it;
+        // break `no-backpressure`: every tick latches, whether the window took the last scene or not
         post_draw: !cfg!(feature = "break-post-draw"),
         hold_shown: !cfg!(feature = "break-ignore-hold"),
+        backpressure: !cfg!(feature = "break-no-backpressure"),
     });
     // the in-app input method exists only with a window: its desktop side is the window's TextInput (headless: none, IMMS-lite answers NO_IME)
     let mut input_method = None;

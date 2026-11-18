@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! The compositor of one app process: the core ([`Compositor`], [`EventThread`]) behind one lock, the binders it knows, the vsync channels, the frame clock thread, and the calls into libgui that the core's callbacks become.
 //! Binder threads call in (a transaction arrived, a connection asked for vsync); the clock thread ticks in both modes (SurfaceFlinger `commit`): it applies what is due, writes the vsync events and hands the
-//! new scene on: headless to the present thread's [`SceneSink`], UI mode to the window's [`Mailbox`] (latest wins). The present thread delivers the core's calls to the clients. Nothing here waits for the
-//! window's thread: it only takes scenes from the mailbox and reports releases into it (owner D1/D3, 2026-11-08).
+//! new scene on: headless to the present thread's [`SceneSink`], UI mode to the window's [`Mailbox`]. The present thread delivers the core's calls to the clients. Nothing here waits for the window's
+//! thread: it only takes scenes from the mailbox and reports releases into it (owner D1/D3, 2026-11-08). A UI-mode tick does not latch while the window has not taken the last scene, as SurfaceFlinger does
+//! not while the last present is pending (bounded: [`BACKPRESSURE_BOUND_NS`]); the clock still ticks and sends vsync.
 //! Calls into libgui are never made with the lock held, and the end of a layer handle only queues its destruction for the next tick: libgui may release a handle from inside its own locks.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -120,6 +121,37 @@ pub struct ComposerConfig {
     /// UI mode: the core keeps a buffer the window holds (mailbox hold set) until the window reports it released. false = a gate's deliberate break only (`xtask test window --break-ignore-hold`): the hold
     /// set reads empty, so a shown buffer is released at the latch that replaces it, while the window may still draw it, and the read fence its paint exports finds no release to ride (`releases_fenced_unmatched`).
     pub hold_shown: bool,
+    /// UI mode: no latch while the window has not taken the published scene ([`latch_rule`]). false = a gate's deliberate break only (`xtask test window --break-no-backpressure`): every tick latches and
+    /// the window's slot is latest wins, so a producer faster than the window has its frames replaced.
+    pub backpressure: bool,
+}
+
+/// How long a published scene may wait untaken before the window counts as not presenting, ns [est]. SurfaceFlinger has no such bound (SurfaceFlinger.cpp commit: `wouldBackpressureHwc` ->
+/// `scheduleCommit`, return; FrameTargeter.cpp `beginFrame`: pending = the previous present fence still unsignalled after a 0-1 ms grace): a device's present fence signals at the next scanout, since the
+/// display never stops presenting. A GTK window can stop taking for good (minimised or occluded: the desktop stops its frame callbacks; the app's own UI thread blocked, it is the window's thread), so
+/// past the bound the clock latches every tick, as a display that presents. 100 ms: above a presenting window's slowest paint cycle measured, 65 ms (GTK4 GL on WSLg's desktop, 960x600: the commit to
+/// frame-done wait grows with surface area), and short enough that a stalled window costs the app 6 vsyncs, not a blocked dequeueBuffer.
+pub const BACKPRESSURE_BOUND_NS: i64 = 100_000_000;
+
+/// What a UI-mode tick does with the core.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Latching {
+    /// The slot is empty: the tick latches (SurfaceFlinger: no present fence pending, or none yet at the first frame).
+    Latch,
+    /// The window has not taken the published scene: the tick sends vsync and applies nothing; transactions stay queued, so the producer's dequeueBuffer waits for a release (SurfaceFlinger
+    /// `wouldBackpressureHwc`: `scheduleCommit` and return before any transaction is applied).
+    Hold,
+    /// Untaken for [`BACKPRESSURE_BOUND_NS`] or more: the window is not presenting; the tick latches and its scene replaces the untaken one.
+    LatchUnpainted,
+}
+
+/// The backpressure rule for a tick at vsync time `at_ns`, given since when the slot has held an untaken scene.
+fn latch_rule(pending_since: Option<i64>, at_ns: i64) -> Latching {
+    match pending_since {
+        None => Latching::Latch,
+        Some(since) if at_ns - since < BACKPRESSURE_BOUND_NS => Latching::Hold,
+        Some(_) => Latching::LatchUnpainted,
+    }
 }
 
 /// What happened, for the log line and the tests: the visible record that the compositor ran.
@@ -127,6 +159,12 @@ pub struct ComposerConfig {
 pub struct Stats {
     /// Frame clock ticks.
     pub ticks: u64,
+    /// Ticks that ran the core's latch (the rest held for backpressure).
+    pub latches: u64,
+    /// UI mode: ticks that applied nothing because the window had not taken the published scene ([`Latching::Hold`]).
+    pub backpressure_holds: u64,
+    /// UI mode: latches over a scene untaken for [`BACKPRESSURE_BOUND_NS`] ([`Latching::LatchUnpainted`]).
+    pub latches_unpainted: u64,
     /// Transactions received.
     pub transactions: u64,
     /// Layers created.
@@ -247,8 +285,11 @@ impl State {
         let ignored: Vec<String> = c.ignored.iter().map(|(k, n)| format!("{k}:{n}")).collect();
         let m = self.mailbox.as_ref().map(|m| m.stats()).unwrap_or_default();
         format!(
-            "composer: counters ticks={} transactions={} layers_created={} layers_alive={} transactions_applied={} layer_states={} unknown_layer={} buffers_acquired={} buffers_released={} completions={} scenes={} scenes_taken={} scenes_dropped={} presents_refused={} release_reports={} max_held_per_layer={} vsync_sent={} vsync_dropped={} callbacks_sent={} callbacks_failed={} releases_on_channel={} releases_peer_gone={} releases_fenced={} releases_fenced_unmatched={} releases_carried={} releases_held={} completions_held={} fence_waits={} fds_held={} fds_taken={} fds_closed={} post_draw_received={} post_draw_applied={} ticks_short={} tick_late_max_us={} ignored={}",
+            "composer: counters ticks={} latches={} backpressure_holds={} latches_unpainted={} transactions={} layers_created={} layers_alive={} transactions_applied={} layer_states={} unknown_layer={} buffers_acquired={} buffers_released={} completions={} scenes={} scenes_taken={} scenes_dropped={} presents_refused={} release_reports={} max_held_per_layer={} vsync_sent={} vsync_dropped={} callbacks_sent={} callbacks_failed={} releases_on_channel={} releases_peer_gone={} releases_fenced={} releases_fenced_unmatched={} releases_carried={} releases_held={} completions_held={} fence_waits={} fds_held={} fds_taken={} fds_closed={} post_draw_received={} post_draw_applied={} ticks_short={} tick_late_max_us={} ignored={}",
             s.ticks,
+            s.latches,
+            s.backpressure_holds,
+            s.latches_unpainted,
             s.transactions,
             s.layers_created,
             self.compositor.layer_count(),
@@ -306,6 +347,8 @@ pub struct Composer {
     post_draw: bool,
     /// ComposerConfig::hold_shown.
     hold_shown: bool,
+    /// ComposerConfig::backpressure.
+    backpressure: bool,
 }
 
 pub trait ILayerHandle: Interface {}
@@ -396,6 +439,7 @@ impl Composer {
             display: Mutex::new(config.display),
             post_draw: config.post_draw,
             hold_shown: config.hold_shown,
+            backpressure: config.backpressure,
             display_token,
         })
     }
@@ -758,6 +802,12 @@ impl Composer {
             Presenter::Sink(sink) => Some(sink),
             Presenter::Window(mailbox) => {
                 self.lock().mailbox = Some(mailbox);
+                // the gate's no-deadlock row reads the bound from here
+                tracing::info!(
+                    "atl-composer: ui: backpressure={} bound_ms={}",
+                    self.backpressure,
+                    BACKPRESSURE_BOUND_NS / 1_000_000
+                );
                 None
             }
         };
@@ -846,8 +896,8 @@ impl Composer {
     }
 
     /// One frame clock tick at `at_ns`: the core applies what is due, vsync goes out, and the frame is returned for the present thread to show (headless) and deliver; UI mode publishes the scene
-    /// into the mailbox under the same hold of both locks, so the window never takes a scene whose buffers this latch released. True when a scene was published. Nothing here waits on pixels or on the window:
-    /// a tick that did would miss the next grid point, and every client's vsync with it.
+    /// into the mailbox under the same hold of both locks, so the window never takes a scene whose buffers this latch released. While the window has not taken the last one the tick holds instead ([`latch_rule`]).
+    /// True when a scene was published. Nothing here waits on pixels or on the window: a tick that did would miss the next grid point, and every client's vsync with it.
     fn tick(&self, at_ns: i64, interval_ns: i64) -> (Frame, bool) {
         let mut st = self.lock();
         st.stats.ticks += 1;
@@ -867,7 +917,23 @@ impl Composer {
         if let Some(l) = latch.as_mut() {
             all.extend(self.presenter_releases(&mut st, l, &mut fences));
         }
-        let FrameOutput { scene, calls } = st.compositor.on_frame(at_ns);
+        let latching = match latch.as_ref() {
+            Some(l) if self.backpressure => latch_rule(l.pending_since(), at_ns),
+            _ => Latching::Latch,
+        };
+        let FrameOutput { scene, calls } = match latching {
+            Latching::Hold => {
+                st.stats.backpressure_holds += 1;
+                FrameOutput::default()
+            }
+            Latching::Latch | Latching::LatchUnpainted => {
+                st.stats.latches += 1;
+                if latching == Latching::LatchUnpainted {
+                    st.stats.latches_unpainted += 1;
+                }
+                st.compositor.on_frame(at_ns)
+            }
+        };
         st.next_vsync_id += 1;
         let tick = FrameTick {
             vsync_id: st.next_vsync_id,
@@ -891,7 +957,7 @@ impl Composer {
         all.extend(calls);
         let (scene, published) = match (latch.as_mut(), scene) {
             (Some(l), Some(scene)) => {
-                l.publish(scene);
+                l.publish(scene, at_ns);
                 (None, true)
             }
             (_, scene) => (scene, false),
@@ -903,6 +969,8 @@ impl Composer {
             fences,
         };
         st.in_flight.push_back(frame.fds());
+        // a producer that always has a transaction queued (held by backpressure) keeps the clock from ever idling, where deliver_frame logs: the line comes from here then, once per period
+        st.log_counters(monotonic_ns());
         (frame, published)
     }
 
@@ -1017,5 +1085,26 @@ impl Composer {
             BinderKey::Local(key) => self.resolve(key),
             BinderKey::Handle(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod latch_tests {
+    use super::*;
+
+    /// Empty slot -> latch (the first frame included); untaken for less than the bound -> hold; at or past it -> latch over it. The bound is the spec here, not a number the rule computes.
+    #[test]
+    fn holds_only_while_a_present_is_pending_and_within_the_bound() {
+        let since = 1_000;
+        assert_eq!(latch_rule(None, since), Latching::Latch);
+        assert_eq!(latch_rule(Some(since), since), Latching::Hold);
+        assert_eq!(
+            latch_rule(Some(since), since + BACKPRESSURE_BOUND_NS - 1),
+            Latching::Hold
+        );
+        assert_eq!(
+            latch_rule(Some(since), since + BACKPRESSURE_BOUND_NS),
+            Latching::LatchUnpainted
+        );
     }
 }
