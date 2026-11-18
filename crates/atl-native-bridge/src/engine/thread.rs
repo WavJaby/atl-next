@@ -75,7 +75,7 @@ fn abi() -> Abi {
     match active() {
         #[cfg(atl_nb_identity)]
         Active::Identity => abi!(identity),
-        Active::Qemu => abi!(qemu),
+        Active::Qemu(_) => abi!(qemu),
     }
 }
 

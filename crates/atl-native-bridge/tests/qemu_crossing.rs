@@ -423,7 +423,7 @@ fn main() -> ExitCode {
         println!("crossing: FAIL {e}");
         return ExitCode::from(2);
     }
-    let r = qemu::run(&so, &boot, cfg, started);
+    let r = qemu::run(qemu::Arch::Aarch64, &so, &boot, cfg, started);
     println!("crossing: FAIL QEMU main returned {r:?}");
     ExitCode::from(2)
 }

@@ -71,8 +71,8 @@ pub enum Active {
     /// the host ISA: guest bionic built for the host arch, the thread-pointer switch (cores built with `atl_nb_identity` only)
     #[cfg(atl_nb_identity)]
     Identity,
-    /// a foreign ISA (arm64): the engine `.so` (atl-android-paths `engine_library`)
-    Qemu,
+    /// a foreign ISA, the guest architecture's engine `.so` (atl-android-paths `engine_library`)
+    Qemu(qemu::Arch),
 }
 
 static ACTIVE: OnceLock<Active> = OnceLock::new();
@@ -93,7 +93,7 @@ pub type SignalHandler =
 pub const DEFAULT: Active = Active::Identity;
 /// The engine a process runs when [`select`] made no choice: the host ISA's (identity) where the core has it, else QEMU, the one every core has.
 #[cfg(not(atl_nb_identity))]
-pub const DEFAULT: Active = Active::Qemu;
+pub const DEFAULT: Active = Active::Qemu(qemu::Arch::Aarch64);
 
 /// The process's engine: [`select`]'s choice, [`DEFAULT`] when none was made (fixed from the first call on).
 pub fn active() -> Active {
@@ -101,7 +101,14 @@ pub fn active() -> Active {
 }
 
 /// Chooses the process's engine for app ISA `isa` (`None`: ART named none) and starts it ([`Engine::start`]). A second call must name the same engine: one bridge per process, one ABI per app (plan README "only one process width"), so a second foreign ISA is refused.
+/// An arm app is refused here, before the claim, until the arm guest's linker run and tables exist (phase4-32bit P4a / P4b): its engine boots (the QEMU gates do it through `qemu::boot`), but the app's libraries would bind through the arm64 tables. Delete with P4b's arm tables.
 pub fn select(isa: Option<&str>) -> Result<Active, String> {
+    if isa.and_then(qemu::Arch::of_isa) == Some(qemu::Arch::Arm) {
+        return Err(
+            "ISA arm: the arm guest has no linker run or tables yet (phase4-32bit P4a/P4b)"
+                .to_owned(),
+        );
+    }
     let engine = claim(isa)?;
     engine.start()?;
     Ok(engine)
@@ -119,12 +126,14 @@ pub fn claim(isa: Option<&str>) -> Result<Active, String> {
     Ok(got)
 }
 
-/// The engine for ISA `isa` in a process already running `current`: none or the host ISA -> identity (refused in a core without it), QEMU's guest ISA -> QEMU, anything else refused; a choice other than `current` is refused.
+/// The engine for ISA `isa` in a process already running `current`: none or the host ISA -> identity (refused in a core without it), a QEMU guest architecture's ISA (qemu/arch.rs) -> QEMU running it, anything else refused; a choice other than `current` is refused.
 fn decide(current: Option<Active>, isa: Option<&str>) -> Result<Active, String> {
     let want = match isa {
         // deliberate break (`ATL_NB_BREAK=host_qemu`): the host ISA routed to QEMU (unit test `selection`)
         #[cfg(atl_nb_identity)]
-        None | Some(identity::GUEST_ISA) if cfg!(atl_nb_host_qemu) => Active::Qemu,
+        None | Some(identity::GUEST_ISA) if cfg!(atl_nb_host_qemu) => {
+            Active::Qemu(qemu::Arch::Aarch64)
+        }
         #[cfg(atl_nb_identity)]
         None | Some(identity::GUEST_ISA) => Active::Identity,
         #[cfg(not(atl_nb_identity))]
@@ -134,8 +143,10 @@ fn decide(current: Option<Active>, isa: Option<&str>) -> Result<Active, String> 
                 isa.unwrap_or(HOST_ISA)
             ));
         }
-        Some(qemu::GUEST_ISA) => Active::Qemu,
-        Some(other) => return Err(format!("ISA {other}: no engine runs it")),
+        Some(other) => match qemu::Arch::of_isa(other) {
+            Some(arch) => Active::Qemu(arch),
+            None => return Err(format!("ISA {other}: no engine runs it")),
+        },
     };
     match current {
         // deliberate break (`ATL_NB_BREAK=second_isa`): a second ISA accepted (unit test `selection`)
@@ -152,7 +163,7 @@ impl Active {
         match self {
             #[cfg(atl_nb_identity)]
             Active::Identity => identity::GUEST_ISA,
-            Active::Qemu => qemu::GUEST_ISA,
+            Active::Qemu(arch) => arch.isa(),
         }
     }
 
@@ -161,7 +172,7 @@ impl Active {
         match self {
             #[cfg(atl_nb_identity)]
             Active::Identity => identity::GUEST_POINTER_BITS,
-            Active::Qemu => qemu::GUEST_POINTER_BITS,
+            Active::Qemu(arch) => arch.pointer_bits(),
         }
     }
 
@@ -170,7 +181,7 @@ impl Active {
         match self {
             #[cfg(atl_nb_identity)]
             Active::Identity => crate::elf::host_machine(),
-            Active::Qemu => Ok(qemu::GUEST_MACHINE),
+            Active::Qemu(arch) => Ok(arch.machine()),
         }
     }
 
@@ -181,7 +192,7 @@ impl Active {
             .get_or_init(|| match self {
                 #[cfg(atl_nb_identity)]
                 Active::Identity => identity::CROSSING.start(),
-                Active::Qemu => qemu::CROSSING.start(),
+                Active::Qemu(_) => qemu::CROSSING.start(),
             })
             .clone()
     }
@@ -191,7 +202,7 @@ impl Active {
         match self {
             #[cfg(atl_nb_identity)]
             Active::Identity => identity::CROSSING.attach(req),
-            Active::Qemu => qemu::CROSSING.attach(req),
+            Active::Qemu(_) => qemu::CROSSING.attach(req),
         }
     }
 
@@ -200,7 +211,7 @@ impl Active {
         match self {
             #[cfg(atl_nb_identity)]
             Active::Identity => identity::CROSSING.detach(),
-            Active::Qemu => qemu::CROSSING.detach(),
+            Active::Qemu(_) => qemu::CROSSING.detach(),
         }
     }
 
@@ -209,7 +220,7 @@ impl Active {
         match self {
             #[cfg(atl_nb_identity)]
             Active::Identity => None,
-            Active::Qemu => qemu::signal_handler(sig),
+            Active::Qemu(_) => qemu::signal_handler(sig),
         }
     }
 
@@ -218,7 +229,7 @@ impl Active {
         match self {
             #[cfg(atl_nb_identity)]
             Active::Identity => identity::supported(),
-            Active::Qemu => qemu::supported(),
+            Active::Qemu(_) => qemu::supported(),
         }
     }
 
@@ -227,7 +238,7 @@ impl Active {
         match self {
             #[cfg(atl_nb_identity)]
             Active::Identity => identity::kernel_auxv(),
-            Active::Qemu => qemu::kernel_auxv(),
+            Active::Qemu(_) => qemu::kernel_auxv(),
         }
     }
 
@@ -236,7 +247,7 @@ impl Active {
         match self {
             #[cfg(atl_nb_identity)]
             Active::Identity => identity::map_guest(images),
-            Active::Qemu => qemu::map_guest(images),
+            Active::Qemu(_) => qemu::map_guest(images),
         }
     }
 
@@ -250,7 +261,7 @@ impl Active {
             match self {
                 #[cfg(atl_nb_identity)]
                 Active::Identity => identity::init_tcb(tp, ht),
-                Active::Qemu => qemu::init_tcb(tp, ht),
+                Active::Qemu(_) => qemu::init_tcb(tp, ht),
             }
         }
     }
@@ -265,7 +276,7 @@ impl Active {
         match self {
             #[cfg(atl_nb_identity)]
             Active::Identity => identity::bind(target),
-            Active::Qemu => qemu::bind_result(target, sig),
+            Active::Qemu(_) => qemu::bind_result(target, sig),
         }
     }
 
@@ -274,7 +285,7 @@ impl Active {
         match self {
             #[cfg(atl_nb_identity)]
             Active::Identity => identity::is_stub(addr),
-            Active::Qemu => qemu::is_stub(addr),
+            Active::Qemu(_) => qemu::is_stub(addr),
         }
     }
 
@@ -283,7 +294,7 @@ impl Active {
         match self {
             #[cfg(atl_nb_identity)]
             Active::Identity => identity::patch_site(addr, thunk),
-            Active::Qemu => qemu::patch_site(addr, thunk),
+            Active::Qemu(_) => qemu::patch_site(addr, thunk),
         }
     }
 
@@ -292,7 +303,7 @@ impl Active {
         match self {
             #[cfg(atl_nb_identity)]
             Active::Identity => identity::patch_hook(at, host),
-            Active::Qemu => qemu::patch_hook(at, host),
+            Active::Qemu(_) => qemu::patch_hook(at, host),
         }
     }
 
@@ -306,7 +317,7 @@ impl Active {
         match self {
             #[cfg(atl_nb_identity)]
             Active::Identity => identity::patch_entry(vdso, value_at, host),
-            Active::Qemu => qemu::patch_entry(vdso, value_at, host),
+            Active::Qemu(_) => qemu::patch_entry(vdso, value_at, host),
         }
     }
 
@@ -315,7 +326,7 @@ impl Active {
         match self {
             #[cfg(atl_nb_identity)]
             Active::Identity => identity::object_stub(slot),
-            Active::Qemu => qemu::object_stub(slot),
+            Active::Qemu(_) => qemu::object_stub(slot),
         }
     }
 
@@ -333,7 +344,7 @@ impl Active {
         let at = match self {
             #[cfg(atl_nb_identity)]
             Active::Identity => identity::down(target, kind)?,
-            Active::Qemu => qemu::down(target, kind, shorty)?,
+            Active::Qemu(_) => qemu::down(target, kind, shorty)?,
         };
         #[cfg(atl_nb_sles_no_dedup)]
         let key = (key.0, key.1, Some(at.to_ne_bytes().to_vec()));
@@ -356,7 +367,7 @@ impl Active {
             match self {
                 #[cfg(atl_nb_identity)]
                 Active::Identity => identity::CROSSING.call(cpu, tp, f, args),
-                Active::Qemu => qemu::CROSSING.call(cpu, tp, f, args),
+                Active::Qemu(_) => qemu::CROSSING.call(cpu, tp, f, args),
             }
         }
     }
@@ -375,7 +386,7 @@ impl Active {
             match self {
                 #[cfg(atl_nb_identity)]
                 Active::Identity => identity::CROSSING.end_call(cpu, value),
-                Active::Qemu => qemu::CROSSING.end_call(cpu, value),
+                Active::Qemu(_) => qemu::CROSSING.end_call(cpu, value),
             }
         }
     }
@@ -620,9 +631,28 @@ mod tests {
     fn selection() {
         assert!(decide(None, None).is_err());
         assert!(decide(None, Some(HOST_ISA)).is_err());
-        assert_eq!(decide(None, Some("arm64")), Ok(Active::Qemu));
+        assert_eq!(decide(None, Some("arm64")), Ok(QEMU64));
+        assert_eq!(decide(None, Some("arm")), Ok(QEMU32));
         assert!(decide(None, Some("mips")).is_err());
-        assert_eq!(DEFAULT, Active::Qemu);
+        assert_eq!(DEFAULT, QEMU64);
+    }
+
+    const QEMU64: Active = Active::Qemu(qemu::Arch::Aarch64);
+    const QEMU32: Active = Active::Qemu(qemu::Arch::Arm);
+
+    /// Each QEMU guest's facts come from its one row (qemu/arch.rs): ISA name = arches.toml row, pointer width = its `pointer_bits`, ELF machine; an arm app is refused before any claim until P4a/P4b.
+    #[test]
+    fn qemu_guests() {
+        assert_eq!(
+            (QEMU64.guest_isa(), QEMU64.guest_pointer_bits()),
+            ("arm64", 64)
+        );
+        assert_eq!(
+            (QEMU32.guest_isa(), QEMU32.guest_pointer_bits()),
+            ("arm", 32)
+        );
+        assert_eq!(QEMU32.machine(), Ok(object::elf::EM_ARM));
+        assert!(select(Some("arm")).is_err());
     }
 
     /// D-3: host ISA (or none) -> identity, QEMU's ISA -> QEMU, an unknown ISA and a second, different engine refused. Red under breaks `host_qemu` and `second_isa`.
@@ -634,10 +664,12 @@ mod tests {
             decide(None, Some(std::env::consts::ARCH)),
             Ok(Active::Identity)
         );
-        assert_eq!(decide(None, Some("arm64")), Ok(Active::Qemu));
+        assert_eq!(decide(None, Some("arm64")), Ok(QEMU64));
+        assert_eq!(decide(None, Some("arm")), Ok(QEMU32));
         assert!(decide(None, Some("mips")).is_err());
-        assert_eq!(decide(Some(Active::Qemu), Some("arm64")), Ok(Active::Qemu));
-        assert!(decide(Some(Active::Qemu), Some(std::env::consts::ARCH)).is_err());
+        assert_eq!(decide(Some(QEMU64), Some("arm64")), Ok(QEMU64));
+        assert!(decide(Some(QEMU64), Some("arm")).is_err());
+        assert!(decide(Some(QEMU64), Some(std::env::consts::ARCH)).is_err());
         assert!(decide(Some(Active::Identity), Some("arm64")).is_err());
     }
 }

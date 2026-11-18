@@ -571,7 +571,7 @@ fn libc_stubs(qemu: bool) -> &'static str {
     }
 }
 
-/// The QEMU guest's arches.toml row (engine/qemu/mod.rs `GUEST_ISA`).
+/// The arches.toml row of the QEMU guest the tables are generated for (engine/qemu/arch.rs `Arch::Aarch64`). The arm guest's tables (ILP32 classes from its own view) are phase4-32bit P4b; until then `engine::select` refuses arm apps.
 const QEMU_GUEST_ARCH: &str = "arm64";
 /// The prototypes of the proxy libraries: EGL and the GLES 1.x / 2.x / 3.x headers with their extensions (AOSP's Khronos headers), parsed once per view.
 const PROTOTYPE_HEADERS: &[&str] = &[
@@ -1407,7 +1407,7 @@ fn main() -> Result<()> {
     if identity {
         println!("cargo::rustc-cfg={IDENTITY_CFG}");
     }
-    // one guest bionic view per engine compiled into the core (runtime selection, engine/mod.rs `Active`): identity = the host arch, QEMU = arm64 (engine/qemu/mod.rs GUEST_ISA)
+    // one guest bionic view per engine compiled into the core (runtime selection, engine/mod.rs `Active`): identity = the host arch, QEMU = arm64 ([`QEMU_GUEST_ARCH`])
     let qemu_guest = buildscript::guest_arch(&arches_text, QEMU_GUEST_ARCH)?;
     let path = up.file(&format!("aosp/{HEADER}"))?;
     let target = Target {

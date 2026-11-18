@@ -60,7 +60,7 @@ fn table() -> Table {
             provider_soname: identity::PROVIDER_SONAME,
             prototypes: identity::PROTOTYPES,
         },
-        Active::Qemu => qemu_table(),
+        Active::Qemu(_) => qemu_table(),
     }
 }
 

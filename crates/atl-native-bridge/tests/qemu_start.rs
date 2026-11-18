@@ -252,7 +252,7 @@ fn main() -> ExitCode {
         exe,
         library_path: vec![lib_dir],
     };
-    let r = qemu::run(&so, &boot, cfg, started);
+    let r = qemu::run(qemu::Arch::Aarch64, &so, &boot, cfg, started);
     println!("qemu-start: FAIL QEMU main returned {r:?}");
     ExitCode::from(2)
 }

@@ -13,7 +13,7 @@ use crate::engine::Down;
 use crate::engine::bindings::OBJECT_STUBS;
 use crate::engine::bindings::qemu::THUNKS;
 
-/// A trap from the engine, decoded from `atl_trap_kind`. `Boot` x0 = the auxv QEMU built for the boot executable (x1, its return stub, the engine keeps); `Call` and `Bind` carry their lanes (`atl_lanes`, AAPCS64: x0..x7 in `regs[0..8]`, v0..v7 in `fp[0..8]`, eight stack words); `Report` x0.
+/// A trap from the engine, decoded from `atl_trap_kind`. `Boot` x0 = the auxv QEMU built for the boot executable (x1, its return stub, the engine keeps); `Call` and `Bind` carry their lanes (`atl_lanes`, filled by the guest's convention, qemu/arch.rs `Arch::rules`: AAPCS64 x0..x7 in `regs[0..8]`, v0..v7 in `fp[0..8]`, eight stack words; AAPCS32 r0..r3 in `regs[0..4]`, sixteen stack words); `Report` x0.
 #[derive(Clone, Copy, Debug)]
 pub enum Trap {
     /// BOOT: the boot executable's auxv (x0).
@@ -26,11 +26,13 @@ pub enum Trap {
     Report(u64),
 }
 
-/// What a trap answers: x0 (every trap; BOOT's exit status) and v0 (CALL and BIND: the FP result lane, 0 when the callee returns an integer).
+/// What a trap answers, the guest's result registers: x0 (every trap; BOOT's exit status), x1 (a 32-bit guest's r1: the high word of a double-word result, [`guest_ret32`]; 0 on aarch64) and v0 (CALL and BIND: the FP result lane, 0 when the callee returns an integer).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Answer {
-    /// The guest's x0.
+    /// The guest's x0 (r0).
     pub x0: u64,
+    /// The guest's x1 (r1).
+    pub x1: u64,
     /// The guest's v0, low 64 bits.
     pub v0: u64,
 }
@@ -41,11 +43,13 @@ pub type OnTrap = fn(Trap) -> Answer;
 /// The host function and lanes of each pool slot, read by the binding trap ([`call_binding`]). The QEMU placement sets a slot once (`place::bind_result`), so a slot is bound before any trap reads it.
 pub(super) static TARGETS: [OnceLock<(usize, Sig)>; THUNKS] = [const { OnceLock::new() }; THUNKS];
 
-/// The default trap callback: a JNI trap calls the host object's table (`call_object`), a binding trap its host target (`call_binding`), and each answers with x0 and v0 from the host result. Other kinds abort until a route is built; BOOT is the start, answered by `qemu::run` or by the gate's own callback.
+/// The default trap callback: a JNI trap calls the host object's table (`call_object`), a binding trap its host target (`call_binding`), each with the lanes read by the process guest's convention (qemu/arch.rs `Arch::rules`) and answered in its result registers. Other kinds abort until a route is built; BOOT is the start, answered by `qemu::run` or by the gate's own callback.
 pub fn on_trap(trap: Trap) -> Answer {
     match trap {
-        Trap::Bind { id, lanes } if (id as usize) < OBJECT_STUBS => call_object(id, &lanes),
-        Trap::Bind { id, lanes } => call_binding(id, &lanes),
+        Trap::Bind { id, lanes } if (id as usize) < OBJECT_STUBS => {
+            call_object(super::qemu::arch().rules(), id, &lanes)
+        }
+        Trap::Bind { id, lanes } => call_binding(super::qemu::arch().rules(), id, &lanes),
         other => unsupported(&format!("qemu crossing: {other:?} is not routed yet")),
     }
 }
@@ -56,8 +60,8 @@ const ID_SKEW: usize = 0;
 #[cfg(atl_nb_qe_id)]
 const ID_SKEW: usize = 1;
 
-/// Calls the host function of the slot `id + ID_SKEW` with the guest's lanes ([`call_host`], placed and answered by the slot's lanes). Every argument lane is forwarded, fp included. The counter sees the slot that ran, so a skewed dispatch shows up as a wrong count.
-pub(super) fn call_binding(id: u32, lanes: &AtlLanes) -> Answer {
+/// Calls the host function of the slot `id + ID_SKEW` with the guest's lanes (convention `guest`; [`call_host`], placed and answered by the slot's lanes). Every argument lane is forwarded, fp included. The counter sees the slot that ran, so a skewed dispatch shows up as a wrong count.
+pub(super) fn call_binding(guest: HostRules, id: u32, lanes: &AtlLanes) -> Answer {
     let Some(slot) = usize::try_from(id)
         .ok()
         .map(|i| i + ID_SKEW)
@@ -70,7 +74,7 @@ pub(super) fn call_binding(id: u32, lanes: &AtlLanes) -> Answer {
     };
     #[cfg(feature = "crossing-count")]
     crate::counters::count_binding(slot, target);
-    call_host(target, lanes, sig)
+    call_host(guest, target, lanes, sig)
 }
 
 /// The object crossing counter's one entry (QEMU bridge plan section 5, per proxy table + slot): a guest->host call of slot `slot` of table `table` to host `target`. QEMU's [`call_object`] calls it with the table `lane_of` found; the identity object shell reaches it through [`count_object_shell`]. Break `qe_jni_count`: [`call_object`] skips it, so only identity counts.
@@ -93,7 +97,7 @@ pub unsafe extern "C" fn count_object_shell(slot: usize, target: usize, guest: u
 
 /// A guest JNI call (pool id `id` < `OBJECT_STUBS`, Q6-2): x0 is the guest's JNIEnv or JavaVM, and the call runs on the host object it stands for. That object's own table slot `id` runs with x0 replaced by the host object and the other lanes forwarded; its result is the answer. The descriptor (`jni::lane_of`, from the guest object's table) gives the result class; a refused call aborts by name ([`refuse`]).
 /// Deliberate breaks: `jni_swap` exchanges x3 and x4 of CallStaticIntMethod only; `jni_guest_env` passes the guest's env through unmapped.
-fn call_object(id: u32, lanes: &AtlLanes) -> Answer {
+fn call_object(rules: HostRules, id: u32, lanes: &AtlLanes) -> Answer {
     let guest = lanes.regs[0] as usize;
     // SAFETY: x0 is the object pointer the guest called through.
     let (table, lane) =
@@ -138,7 +142,7 @@ fn call_object(id: u32, lanes: &AtlLanes) -> Answer {
         ret: lane.ret,
         params: (!lane.variadic).then_some(lane.params),
     };
-    call_host(target, &lanes, sig)
+    call_host(rules, target, &lanes, sig)
 }
 
 /// The up call per host ISA (`cfg(target_arch)` only here): `call(target, lanes, fp, sig) -> (x result, fp result bits)`, same interface on each. riscv64 places the lanes by the prototype into LP64D and calls from asm; every other host takes them as one variadic call (x86_64 SysV the reference).
@@ -151,11 +155,12 @@ mod variadic;
 #[cfg(not(target_arch = "riscv64"))]
 use variadic as host_call;
 
-/// Calls `target` with the guest lanes `lanes` and answers its result by `sig.ret`: a double from the fp result register (its bits in v0), a float as its low 32 bits with the upper ones clear (AArch64 reads s0; LP64D's fa0 holds it NaN-boxed), a void as x0 = 0, anything else from x0.
+/// Calls `target` with the guest lanes `lanes` and answers its result by `sig.ret`: a double from the fp result register (its bits in v0), a float as its low 32 bits with the upper ones clear (AArch64 reads s0; LP64D's fa0 holds it NaN-boxed), a void as x0 = 0, anything else from x0; then shaped into the guest's result registers ([`guest_answer`]).
+/// The lanes enter in the guest's convention `guest` and are first brought into AAPCS64's image ([`up_lanes`]), the one every host call reads.
 /// Breaks: `v_drop` zeroes the fp lanes; `drop_stack` moves the stack words down one; `ret_int` reads an fp result from x0; per host, `al_zero` (variadic.rs) and `up_no_nanbox` (riscv64.rs).
-fn call_host(target: usize, lanes: &AtlLanes, sig: Sig) -> Answer {
+fn call_host(guest: HostRules, target: usize, lanes: &AtlLanes, sig: Sig) -> Answer {
     #[allow(unused_mut, reason = "only the breaks below change the lanes")]
-    let mut lanes = *lanes;
+    let mut lanes = up_lanes(guest, lanes, sig.params).unwrap_or_else(|| refuse_up(target));
     #[cfg(atl_nb_v_drop)]
     {
         lanes.fp = [0; atl_engine_api::LANE_FP];
@@ -167,15 +172,45 @@ fn call_host(target: usize, lanes: &AtlLanes, sig: Sig) -> Answer {
     }
     let ret = fp_result(sig.ret);
     let (x, v) = host_call::call(target, &lanes, ret.is_fp(), sig);
-    match ret {
+    let answer = match ret {
         Class::F32 => Answer {
-            x0: 0,
             v0: v & 0xFFFF_FFFF,
+            ..Answer::default()
         },
-        Class::F64 => Answer { x0: 0, v0: v },
-        Class::Void => Answer { x0: 0, v0: 0 },
-        _ => Answer { x0: x, v0: 0 },
+        Class::F64 => Answer {
+            v0: v,
+            ..Answer::default()
+        },
+        Class::Void => Answer::default(),
+        _ => Answer {
+            x0: x,
+            ..Answer::default()
+        },
+    };
+    guest_answer(guest, sig.ret, answer)
+}
+
+/// Integer words read from a 32-bit guest for a call with no prototype: r0..r3 and twelve stack words, which AAPCS64's image holds whole (eight registers, eight stack words).
+const RAW_WORDS: [Class; 16] = [Class::Int {
+    bits: 32,
+    signed: false,
+}; 16];
+
+/// The guest lanes `lanes` (convention `guest`) as AAPCS64's image, which the host call reads ([`call_host`]): aarch64's own lanes as they are; a 32-bit guest's placed by the parameters' classes ([`place`], words widened by signedness, a pair joined), a call without a prototype as zero-extended words ([`RAW_WORDS`]). None when the image cannot carry them (R-1).
+fn up_lanes(guest: HostRules, lanes: &AtlLanes, params: Option<&[Class]>) -> Option<AtlLanes> {
+    if guest.word_bits == AAPCS64.word_bits {
+        return Some(*lanes);
     }
+    place(params.unwrap_or(&RAW_WORDS), lanes, guest, AAPCS64)
+}
+
+/// The guest's result registers for the host answer `answer` of class `ret`: aarch64 takes it as it is; a 32-bit guest r0 / r0:r1 ([`guest_ret32`]).
+fn guest_answer(guest: HostRules, ret: Class, answer: Answer) -> Answer {
+    if guest.word_bits == AAPCS64.word_bits {
+        return answer;
+    }
+    let [x0, x1] = guest_ret32(ret, answer);
+    Answer { x0, x1, v0: 0 }
 }
 
 /// The result class the call is made with: an fp result in x0 is the break `ret_int`.
@@ -193,10 +228,6 @@ fn fp_result(_ret: Class) -> Class {
 }
 
 /// Refuses an up call whose arguments do not fit the lane image on one side (R-1): with fp-to-int on the host, a prototype's ninth fp argument is a guest stack word but a host register, so the counts differ. Named and counted, as [`refuse_down`].
-#[cfg_attr(
-    not(target_arch = "riscv64"),
-    allow(dead_code, reason = "only the placing host call refuses")
-)]
 fn refuse_up(target: usize) -> ! {
     static REFUSED: AtomicUsize = AtomicUsize::new(0);
     let n = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -256,7 +287,8 @@ fn down_body(slot: usize, host: &mut AtlLanes) {
     let Some(d) = super::qemu::down_slot(slot) else {
         unsupported("qemu crossing: down shell without a binding")
     };
-    let Some(mut guest) = place(&d.params, host, HOST, AAPCS64) else {
+    let rules = super::qemu::arch().rules();
+    let Some(mut guest) = place(&d.params, host, HOST, rules) else {
         refuse_down(d.target)
     };
     // the first argument of a JNI method, of JNI_OnLoad or of an SL callback is a host env, vm or interface: the guest's own object stands for it (jni.rs, sles.rs), and it is the first integer, in x0; an slObjectCallback's 6th is the 6th integer, in x5
@@ -270,7 +302,23 @@ fn down_body(slot: usize, host: &mut AtlLanes) {
     #[cfg(atl_nb_down_noenv)]
     let _ = d.kind;
     super::qemu::call_down(d.target, &mut guest);
-    (host.ret[0], host.fp[0]) = host_result(d.ret, guest.ret[0], guest.fp[0], HOST);
+    // a 32-bit guest's r0 / r0:r1 joined and widened first (`host_ret32`); aarch64's x0 and v0 are already the host's lanes
+    let (x, v) = if rules.word_bits == AAPCS64.word_bits {
+        (guest.ret[0], guest.fp[0])
+    } else {
+        let class = match d.ret {
+            b'V' => Class::Void,
+            c => shorty_class(c).unwrap_or_else(|| {
+                unsupported(&format!(
+                    "qemu crossing: down result shorty {:?} has no class",
+                    c as char
+                ))
+            }),
+        };
+        let a = host_ret32(class, [guest.ret[0], guest.ret[1]]);
+        (a.x0, a.v0)
+    };
+    (host.ret[0], host.fp[0]) = host_result(d.ret, x, v, HOST);
 }
 
 // The shells' frame is an `atl_lanes`: bridgegen's offsets (down.rs, written into the shells' asm) must be the struct's.
@@ -303,8 +351,8 @@ pub(in crate::engine) struct HostRules {
     word_bits: u32,
 }
 
-/// The guest's rules, AAPCS64: eight integer registers, an fp argument past v7 goes to the stack, results and floats unshaped (a narrow value's upper bits are unspecified, s-registers are read low); eight stack words (the aarch64 engine's window, atl-qemu-engine engine/aarch64.rs `STACK_SLOTS`).
-const AAPCS64: HostRules = HostRules {
+/// The aarch64 guest's rules (qemu/arch.rs `Arch::Aarch64`), AAPCS64: eight integer registers, an fp argument past v7 goes to the stack, results and floats unshaped (a narrow value's upper bits are unspecified, s-registers are read low); eight stack words (the aarch64 engine's window, atl-qemu-engine engine/aarch64.rs `STACK_SLOTS`). Also the image every host call reads ([`up_lanes`]).
+pub(in crate::engine) const AAPCS64: HostRules = HostRules {
     int_lanes: 8,
     fp_lanes: 8,
     fp_to_int: false,
@@ -314,8 +362,8 @@ const AAPCS64: HostRules = HostRules {
     word_bits: 64,
 };
 
-/// The arm guest's rules, AAPCS32 base standard (Android armeabi-v7a is softfp: no `Tag_ABI_VFP_args`, the P2 guest ABI gate): r0..r3, no fp argument register, so a float or double travels in core registers or on the stack as an integer of its size would; 4-byte words; the arm engine's whole 16-word window (atl-qemu-engine engine/arm.rs `STACK_SLOTS`). Rule numbers: AAPCS32 2026Q3, Parameter Passing (base PCS). The arm bridge core places by it (phase4-32bit P3 slice 3); until then the unit tests and the lane assert below read it.
-const AAPCS32: HostRules = HostRules {
+/// The arm guest's rules, AAPCS32 base standard (Android armeabi-v7a is softfp: no `Tag_ABI_VFP_args`, the P2 guest ABI gate): r0..r3, no fp argument register, so a float or double travels in core registers or on the stack as an integer of its size would; 4-byte words; the arm engine's whole 16-word window (atl-qemu-engine engine/arm.rs `STACK_SLOTS`). Rule numbers: AAPCS32 2026Q3, Parameter Passing (base PCS). qemu/arch.rs `Arch::Arm`.
+pub(in crate::engine) const AAPCS32: HostRules = HostRules {
     int_lanes: 4,
     fp_lanes: 0,
     fp_to_int: true,
@@ -559,13 +607,6 @@ fn place(
 }
 
 /// A 32-bit guest's result lanes `[r0, r1]` for a host answer of class `ret` (AAPCS32 2026Q3, Result Return (base PCS)): a double-word (`long long`, softfp `double`) in r0 (low word) and r1; a word (`int`, pointer, softfp `float`) in r0; an integer narrower than a word zero- or sign-extended to it (SysV returns `bool`/`char`/`short` in the low bits of %rax with the rest unspecified, so the extension is made here); void none.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the arm bridge core answers by it (phase4-32bit P3 slice 3)"
-    )
-)]
 fn guest_ret32(ret: Class, answer: Answer) -> [u64; 2] {
     let pair = |v: u64| [v & WORD, v >> 32];
     match ret {
@@ -587,28 +628,16 @@ fn guest_ret32(ret: Class, answer: Answer) -> [u64; 2] {
 }
 
 /// The host answer (x0 lane, fp lane) of a 32-bit guest's result `[r0, r1]` of class `ret`: [`guest_ret32`] read the other way, an integer of a word or less extended to the host's 64 bits by its signedness ([`convert`]), a pointer zero-extended. A host that shapes narrow results further (LP64D, `host_result`) does so after.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the arm bridge core answers by it (phase4-32bit P3 slice 3)"
-    )
-)]
 fn host_ret32(ret: Class, r: [u64; 2]) -> Answer {
     let joined = (r[0] & WORD) | (r[1] << 32);
-    match ret {
-        Class::Void => Answer::default(),
-        Class::F64 => Answer { x0: 0, v0: joined },
-        Class::F32 => Answer {
-            x0: 0,
-            v0: r[0] & WORD,
-        },
-        Class::Int { bits: 64, .. } => Answer { x0: joined, v0: 0 },
-        _ => Answer {
-            x0: convert(ret, r[0], 32, 64),
-            v0: 0,
-        },
-    }
+    let (x0, v0) = match ret {
+        Class::Void => (0, 0),
+        Class::F64 => (0, joined),
+        Class::F32 => (0, r[0] & WORD),
+        Class::Int { bits: 64, .. } => (joined, 0),
+        _ => (convert(ret, r[0], 32, 64), 0),
+    };
+    Answer { x0, x1: 0, v0 }
 }
 
 /// Refuses a down call whose host arguments need more than eight stack words (R-1, Q6-4): the lane image cannot carry them. Named and counted: a shorty this size fails on every call, so the count says how often it was asked.
@@ -981,7 +1010,7 @@ mod aapcs32_tests {
     #[test]
     fn results_to_the_guest() {
         let junk = 0xDEAD_BEEF_0000_0000;
-        let ans = |x0, v0| Answer { x0, v0 };
+        let ans = |x0, v0| Answer { x0, x1: 0, v0 };
         assert_eq!(
             guest_ret32(I64, ans(0x1122_3344_5566_7788, 0)),
             [0x5566_7788, 0x1122_3344]
@@ -1012,30 +1041,57 @@ mod aapcs32_tests {
     /// The guest's result read back for the host: r0:r1 joined for a double-word, r0 extended by signedness for a word (r0 = 0xFFFF_FFFE as `int` = -2), a softfp double from r0:r1 into the fp lane.
     #[test]
     fn results_to_the_host() {
+        let ans = |x0, v0| Answer { x0, x1: 0, v0 };
         assert_eq!(
             host_ret32(I64, [0x5566_7788, 0x1122_3344]),
-            Answer {
-                x0: 0x1122_3344_5566_7788,
-                v0: 0
-            }
+            ans(0x1122_3344_5566_7788, 0)
         );
         assert_eq!(
             host_ret32(I32, [0xFFFF_FFFE, 0]),
-            Answer {
-                x0: 0xFFFF_FFFF_FFFF_FFFE,
-                v0: 0
-            }
+            ans(0xFFFF_FFFF_FFFF_FFFE, 0)
         );
-        assert_eq!(
-            host_ret32(U32, [0xFFFF_FFFE, 0]),
-            Answer {
-                x0: 0xFFFF_FFFE,
-                v0: 0
-            }
-        );
+        assert_eq!(host_ret32(U32, [0xFFFF_FFFE, 0]), ans(0xFFFF_FFFE, 0));
         assert_eq!(
             host_ret32(Class::F64, [D2_5 & WORD, D2_5 >> 32]),
-            Answer { x0: 0, v0: D2_5 }
+            ans(0, D2_5)
         );
+    }
+
+    /// The up call's image (`up_lanes`): `f(int a, long long b, float c)` from AAPCS32 -- a in r0, b in the even pair r2:r3 (C.3), c in the first stack word (C.5 closed the registers at r3, C.6) -- into AAPCS64: a x0 (sign-extended), b x1, c v0. Without a prototype: r0..r3 then the stack words as zero-extended integers, x0..x7 then AAPCS64's stack. aarch64 lanes pass through.
+    #[test]
+    fn up_lanes_bring_a_32_bit_guest_into_aapcs64() {
+        let guest = img(
+            &[0xFFFF_FFFF, 0xAAAA, 0x5566_7788, 0x1122_3344],
+            &[],
+            &[F1_5],
+        );
+        let a64 = up_lanes(AAPCS32, &guest, Some(&[I32, I64, Class::F32])).expect("fits");
+        assert_eq!(a64.regs[..2], [u64::MAX, 0x1122_3344_5566_7788]);
+        assert_eq!(a64.fp[0], F1_5);
+        let words: Vec<u64> = (1..=12).collect();
+        let raw = up_lanes(AAPCS32, &img(&[0x8000_0000, 2, 3, 4], &[], &words), None)
+            .expect("sixteen words fit");
+        assert_eq!(raw.regs[..8], [0x8000_0000, 2, 3, 4, 1, 2, 3, 4]);
+        assert_eq!(raw.stack[..8], [5, 6, 7, 8, 9, 10, 11, 12]);
+        assert_eq!(up_lanes(AAPCS64, &guest, None), Some(guest));
+    }
+
+    /// The trap's answer to the guest (`guest_answer`): a 32-bit guest's double-word result split into r0 (x0) and r1 (x1), no fp lane; aarch64's untouched.
+    #[test]
+    fn guest_answer_fills_r1() {
+        let a = Answer {
+            x0: 0x1122_3344_5566_7788,
+            x1: 0,
+            v0: 0,
+        };
+        assert_eq!(
+            guest_answer(AAPCS32, I64, a),
+            Answer {
+                x0: 0x5566_7788,
+                x1: 0x1122_3344,
+                v0: 0
+            }
+        );
+        assert_eq!(guest_answer(AAPCS64, I64, a), a);
     }
 }

@@ -475,7 +475,7 @@ fn main() -> ExitCode {
         println!("qemu-thread: FAIL {e}");
         return ExitCode::from(2);
     }
-    let r = qemu::run(&so, &boot, cfg, started);
+    let r = qemu::run(qemu::Arch::Aarch64, &so, &boot, cfg, started);
     println!("qemu-thread: FAIL QEMU main returned {r:?}");
     ExitCode::from(2)
 }

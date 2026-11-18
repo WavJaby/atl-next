@@ -211,7 +211,7 @@ fn on_trap(trap: qemu::Trap) -> qemu::Answer {
                 Some(plan) if id == plan.ids[POST_INIT] => qemu::Answer::default(),
                 Some(plan) if id == plan.ids[CALL_GUEST] => qemu::Answer {
                     x0: CALL_GUEST_ANSWER,
-                    v0: 0,
+                    ..qemu::Answer::default()
                 },
                 _ => qemu::on_trap(trap),
             }
@@ -320,7 +320,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     };
     // placement below follows the process's engine: QEMU, before `boot` claims it again
-    if let Err(e) = engine::claim(Some(qemu::GUEST_ISA)) {
+    if let Err(e) = engine::claim(Some(qemu::Arch::Aarch64.isa())) {
         println!("qemu-linker: FAIL engine: {e}");
         return ExitCode::from(2);
     }
@@ -341,7 +341,12 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     // BOOT answers at once; the engine is then up, and the checks run on this thread
-    if let Err(e) = qemu::boot(Path::new(&so), Path::new(&fixture), on_trap) {
+    if let Err(e) = qemu::boot(
+        qemu::Arch::Aarch64,
+        Path::new(&so),
+        Path::new(&fixture),
+        on_trap,
+    ) {
         println!("qemu-linker: FAIL boot: {e}");
         return ExitCode::from(2);
     }

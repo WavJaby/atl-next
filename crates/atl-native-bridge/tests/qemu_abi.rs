@@ -84,8 +84,8 @@ fn on_trap(trap: qemu::Trap) -> qemu::Answer {
         qemu::Trap::Call(lanes) => {
             *LAST.lock().expect("last") = Some(lanes);
             qemu::Answer {
-                x0: 0,
                 v0: ANSWER.to_bits(),
+                ..qemu::Answer::default()
             }
         }
         other => qemu::on_trap(other),
@@ -254,12 +254,17 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     };
     // the process's engine is QEMU before `boot` claims it
-    if let Err(e) = engine::claim(Some(qemu::GUEST_ISA)) {
+    if let Err(e) = engine::claim(Some(qemu::Arch::Aarch64.isa())) {
         println!("qemu-abi: (s) FAIL engine: {e}");
         return ExitCode::from(2);
     }
     // BOOT answers at once, so the engine is up when this returns
-    if let Err(e) = qemu::boot(Path::new(&so), Path::new(&fixture), on_trap) {
+    if let Err(e) = qemu::boot(
+        qemu::Arch::Aarch64,
+        Path::new(&so),
+        Path::new(&fixture),
+        on_trap,
+    ) {
         println!("qemu-abi: (s) FAIL boot: {e}");
         return ExitCode::from(2);
     }

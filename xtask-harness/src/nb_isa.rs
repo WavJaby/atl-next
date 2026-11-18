@@ -20,7 +20,7 @@ use crate::verdict;
 
 const CMD: &str = "nb-isa";
 const FIXTURE: &str = "xtask-harness/testdata/nb-isa/java";
-/// A foreign ISA no engine is staged for in this gate's ART root: the QEMU engine's guest ISA (atl-native-bridge engine/qemu `GUEST_ISA`).
+/// A foreign ISA no engine is staged for in this gate's ART root: the QEMU engine's guest ISA (atl-native-bridge engine/qemu/arch.rs `Arch::Aarch64`).
 const FOREIGN: &str = "arm64";
 /// Not an ART instruction set (art/libartbase/arch/instruction_set.cc `GetInstructionSetFromString`).
 const NOT_AN_ISA: &str = "notanisa";
