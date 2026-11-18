@@ -19,7 +19,7 @@ use crate::verdict::{Failure, Verdict};
 /// The arm fixture (fixture_arm.c), beside the aarch64 one.
 const FIXTURE: &str = "fixture_arm.c";
 /// Gates the plain run must print ok (spike_arm.rs).
-const GATES: [char; 8] = ['B', 'a', 'b', 'c', 'd', 'e', 'w', 'f'];
+const GATES: [char; 9] = ['B', 'a', 'b', 'c', 'd', 'e', 'w', 'p', 'f'];
 
 /// A break: one file of the build, `from` replaced by `to` (exactly once) before it is compiled.
 struct Edit {

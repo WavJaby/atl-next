@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Always: `OUT_DIR/aarch64_constants.rs`, atl-bridgegen's aarch64 thunk constants (`lib.rs` `thunk`).
+//! Always: `OUT_DIR/thunk_constants.rs`, atl-bridgegen's aarch64 and arm thunk constants (`lib.rs` `thunk`).
 //! With feature `qemu`: `OUT_DIR/qemu_layout.rs`, atl-bridgegen's `layout_module` of QEMU's `target/arm/cpu.h` (`CPUArchState` and the records it holds), parsed with the exact flags the PIC build compiles its target's `linux-user/<target>/cpu_loop.c` with -- the file P1's hook is called from ([`TARGETS`]: aarch64 or arm); cfg `atl_qe_guest = "<target>"` names it for the engine's per-target code.
 //! With feature `qemu`: `OUT_DIR/engine_abi_layout.rs`, the engine C ABI's sizes, offsets and values from atl-engine-api's `atl_engine.h` (atl-bridgegen `engine_abi`); lib.rs checks the Rust mirror against them.
 //! With feature `qemu`: `libatl_host_signal.a`, `src/host_signal.c` (QEMU's host fault decode, `linux-user/include/host/<host>/host-signal.h`, for signal.rs) compiled by the unit's own compile command and archived by the build's own `STATIC_LINKER` (build.ninja): the host arch's decode is QEMU's, not a second copy.
@@ -428,8 +428,12 @@ fn main() -> Result<()> {
     let out = PathBuf::from(std::env::var("OUT_DIR")?);
     // the thunk ABI's constants (BIND, the trap decode's bit): atl-bridgegen's emitter is the one source, so they cannot drift from the pool
     std::fs::write(
-        out.join("aarch64_constants.rs"),
-        atl_bridgegen::aarch64::constants_rust(),
+        out.join("thunk_constants.rs"),
+        format!(
+            "{}{}",
+            atl_bridgegen::aarch64::constants_rust(),
+            atl_bridgegen::arm::constants_rust()
+        ),
     )?;
     if std::env::var_os("CARGO_FEATURE_QEMU").is_none() {
         return Ok(());

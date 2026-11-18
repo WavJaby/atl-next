@@ -1128,15 +1128,17 @@ fn bindings_table(
         ));
     }
     code.push_str("];\n\n");
-    // one pool slot per binding plus the JNI slots (QEMU's JNI stubs are binding ids too), rounded to a power of two; the QEMU pool (engine/qemu/place.rs) is generated at the QEMU table's size (aarch64_pool.rs)
+    // one pool slot per binding plus the JNI slots (QEMU's JNI stubs are binding ids too), rounded to a power of two; the QEMU pool (engine/qemu/place.rs) is generated at the QEMU table's size, one pool per guest arch (qemu_pool.rs: aarch64's static, arm's words for a window)
     let thunks = (total + FIXED_BINDINGS + OBJECT_STUBS).next_power_of_two();
     if qemu {
         std::fs::write(
-            out.join("aarch64_pool.rs"),
+            out.join("qemu_pool.rs"),
             format!(
-                "{}{}",
+                "{}{}{}{}",
                 atl_bridgegen::aarch64::constants_rust(),
-                atl_bridgegen::aarch64::pool_rust(u32::try_from(thunks)?)
+                atl_bridgegen::aarch64::pool_rust(u32::try_from(thunks)?),
+                atl_bridgegen::arm::constants_rust(),
+                atl_bridgegen::arm::pool_rust(u32::try_from(thunks)?)
             ),
         )?;
     }

@@ -2,7 +2,7 @@
 //! arm32 engine spike gates (phase 4 P1), harness-less, on an arm-linux-user PIC build: `start` boots QEMU on its helper thread, whose BOOT trap runs gates (a)-(e) there and parks; the main thread then runs (f). Exit 0 when every gate is ok.
 //! Env (xtask qemu_spike.rs `--arch arm` sets it; without it the run prints SKIP): `ATL_QEMU_SPIKE_SO` = the spike library, `ATL_QEMU_SPIKE_FIXTURE` = the static armv7 guest program (fixture_arm.c), `ATL_QEMU_SIGCHAIN_OBJ` = AOSP libsigchain's object (build.rs links it, cfg `atl_qe_sigchain`).
 //! Expected values come from the fixture's table (fixture_arm.c), never from the engine. One line per gate: `spike-arm: (x) ok` or `spike-arm: (x) FAIL <why>`.
-//! Gates: (B) the boot reaches BOOT with the ART stand-in mapped; (a) a CALL trap from a Thumb and from an Arm caller sees r0..r3 and four stack words; (b) host -> guest -> host -> guest nesting sums right; (c) a host pointer below 4 GiB is read and written raw (plain + exclusive); (d) a guest store fault goes through the engine's special handler to the guest's SIGSEGV handler; (e) a mapping made before QEMU at [`STANDIN`] (ART's low-4G heap stand-in) survives the boot and guest `mmap` (any address, and hinted at it) avoids it; (w) the window allocator (`gate_w`); (f) a host thread attaches a CPU, calls, detaches, then the process forks and the child exits (QEMU's RCU prefork handler would block on a broken registry).
+//! Gates: (B) the boot reaches BOOT with the ART stand-in mapped; (a) a CALL trap from a Thumb and from an Arm caller sees r0..r3 and four stack words; (b) host -> guest -> host -> guest nesting sums right; (c) a host pointer below 4 GiB is read and written raw (plain + exclusive); (d) a guest store fault goes through the engine's special handler to the guest's SIGSEGV handler; (e) a mapping made before QEMU at [`STANDIN`] (ART's low-4G heap stand-in) survives the boot and guest `mmap` (any address, and hinted at it) avoids it; (w) the window allocator (`gate_w`); (p) an arm pool thunk traps as its binding id (`gate_p`); (f) a host thread attaches a CPU, calls, detaches, then the process forks and the child exits (QEMU's RCU prefork handler would block on a broken registry).
 #![allow(clippy::print_stdout, reason = "test harness output is its verdict")]
 
 #[cfg(all(feature = "qemu", atl_qe_guest = "arm"))]
@@ -27,6 +27,21 @@ mod spike {
     const W_LATE_LEN: usize = 1 << 20;
     /// Seconds the parent of (f)'s fork waits for the child before calling it hung.
     const F_DEADLINE_SECS: u64 = 20;
+    /// Gate (p): the binding id of the one thunk (any id below BIND; not 0, so a decode that drops the id shows), its argument, and the host's answer (any value the guest cannot produce itself).
+    const P_ID: u32 = 0x1234;
+    const P_ARG: u64 = 0x77;
+    const P_ANSWER: u64 = 0x6b6b;
+
+    /// atl-bridgegen's thunk constants as the engine's build script wrote them (the decode reads the same file): `ARM_SVC`, `ARM_RET`, `ARM_BIND`.
+    #[allow(
+        dead_code,
+        reason = "generated: aarch64's constants and the placeholders are unused here"
+    )]
+    mod thunk {
+        include!(concat!(env!("OUT_DIR"), "/thunk_constants.rs"));
+    }
+    /// Gate (p)'s binding traps seen: (id, r0).
+    static P_SEEN: Mutex<Vec<(u32, u64)>> = Mutex::new(Vec::new());
 
     /// The fixture's table words (fixture_arm.c `table`).
     mod t {
@@ -104,7 +119,13 @@ mod spike {
                     .push(v);
                 0
             }
-            Trap::Bind { .. } => panic!("no binding thunks on arm"),
+            Trap::Bind { id, args } => {
+                P_SEEN
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((id, args[0]));
+                P_ANSWER
+            }
         }
     }
 
@@ -297,15 +318,39 @@ mod spike {
         Ok(())
     }
 
-    /// Gates (a)-(e) and (w) on the boot CPU, inside BOOT. Each prints `(x) run` first: a gate the process dies in (QEMU's fatal guest signal) leaves it as the last line.
+    /// Gate (p), the arm pool thunk (bridgegen arm.rs): its two words `svc #(BIND | P_ID); bx lr` in a window, called from the host as a guest function, reach the trap callback as binding `P_ID` with r0, and the host's answer comes back.
+    fn gate_p(g: Guest) -> Result<(), String> {
+        let at = map_window(8, page::READ | page::WRITE | page::EXEC)?;
+        let words = [thunk::ARM_SVC | thunk::ARM_BIND | P_ID, thunk::ARM_RET];
+        // SAFETY: a fresh RW window of at least 8 bytes.
+        unsafe { (at as *mut [u32; 2]).write(words) };
+        P_SEEN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        let got = g.call(at as u64, &[P_ARG]);
+        let seen = P_SEEN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if seen != [(P_ID, P_ARG)] || got != P_ANSWER {
+            return Err(format!(
+                "binding traps {seen:?} (want [({P_ID:#x}, {P_ARG:#x})]), returned {got:#x} (want {P_ANSWER:#x})"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Gates (a)-(e), (w) and (p) on the boot CPU, inside BOOT. Each prints `(x) run` first: a gate the process dies in (QEMU's fatal guest signal) leaves it as the last line.
     fn boot_gates(g: Guest) {
-        let gates: [(char, fn(Guest) -> Result<(), String>); 6] = [
+        let gates: [(char, fn(Guest) -> Result<(), String>); 7] = [
             ('a', gate_a),
             ('b', gate_b),
             ('c', gate_c),
             ('d', gate_d),
             ('e', gate_e),
             ('w', gate_w),
+            ('p', gate_p),
         ];
         for (name, gate) in gates {
             println!("spike-arm: ({name}) run");
@@ -437,7 +482,7 @@ mod spike {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let gates: String = results.iter().map(|(g, _)| *g).collect();
-        if gates != "abcdewf" || results.iter().any(|(_, r)| r.is_err()) {
+        if gates != "abcdewpf" || results.iter().any(|(_, r)| r.is_err()) {
             println!("spike-arm: FAIL gates run {gates:?}");
             return 1;
         }
