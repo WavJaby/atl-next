@@ -53,12 +53,16 @@ impl Row {
 pub const ROWS: &[Row] = &[
     Row::new(&["sandbox"], true, true),
     Row::new(&["gl-dispatch"], false, true),
+    Row::new(&["nb-isa"], true, true),
     Row::new(&["ui-module"], false, true),
     Row::new(&["platform-ui"], false, false),
     Row::new(&["compositor"], true, true),
     Row::new(&["parcel"], true, true),
     Row::new(&["provider"], true, true),
+    Row::new(&["system-scan"], true, true),
+    Row::new(&["broadcast"], true, true),
     Row::new(&["composer"], true, true),
+    Row::new(&["instrument"], true, true),
     Row::new(&["app"], true, true),
     // reads the `app/` tree the app gate stages (its refusal otherwise: "missing <out>/app/root/system/lib64/x86_64 ... run `xtask test app`")
     Row::new(&["nb-identity"], false, true),
