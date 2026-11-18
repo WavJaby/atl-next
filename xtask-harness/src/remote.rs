@@ -402,18 +402,21 @@ pub const DISPLAY_PROBE_LINE: &str = "display-probe: ";
 const DISPLAY_PROBE_LIMIT: Duration = Duration::from_secs(30);
 
 /// Moves the target's Hyprland session to an empty workspace for the run and back after it (owner decision D1, 2026-11-18: a remote window gate may open its window on the live desktop, on an empty
-/// workspace, and the workspace that was active before comes back also on failure or interruption). Probed, never named by host: `hyprctl` on PATH and exactly one instance under `$WL_DIR/hypr`;
-/// anything else logs why and runs in place. Empty = the lowest id no workspace has (Hyprland keeps only workspaces with windows or focus). Lines go to stderr (the transcript): `workspace: ...`.
+/// workspace, and the workspace that was active before comes back also on failure or interruption). Probed, never named by host: `hyprctl` on PATH and exactly one running instance (`hyprctl
+/// instances`) whose Wayland socket is the run's `$WL` -- `$WL_DIR/hypr` keeps dirs of ended sessions (7 on the laptop, 2026-11-18), so a dir count is no answer; anything else logs why and runs in
+/// place. Empty = the lowest id no workspace has (Hyprland keeps only workspaces with windows or focus). Lines go to stderr (the transcript): `workspace: ...`.
 fn workspace_script() -> String {
     const SCRIPT: &str = r#"WS_PREV=""
-WS_N=$(ls "$WL_DIR/hypr" 2>/dev/null | wc -l)
+WS_SIG=""
+command -v hyprctl >/dev/null 2>&1 && WS_SIG=$(XDG_RUNTIME_DIR="$WL_DIR" hyprctl instances 2>/dev/null | awk -v wl="$WL" '/^instance /{sig=$2; sub(/:$/, "", sig)} $1 == "wl" && $2 == "socket:" && $3 == wl {print sig}')
+WS_N=$(printf '%s' "$WS_SIG" | grep -c .)
 if ! command -v hyprctl >/dev/null 2>&1; then
   echo "workspace: no hyprctl, no workspace switch: running in place" >&2
 elif [ "$WS_N" -ne 1 ]; then
-  echo "workspace: $WS_N Hyprland instances in $WL_DIR/hypr, want 1: running in place" >&2
+  echo "workspace: $WS_N Hyprland instances on $WL, want 1: running in place" >&2
 else
   export XDG_RUNTIME_DIR="$WL_DIR"
-  export HYPRLAND_INSTANCE_SIGNATURE="$(ls "$WL_DIR/hypr")"
+  export HYPRLAND_INSTANCE_SIGNATURE="$WS_SIG"
   WS_PREV=$(hyprctl activeworkspace | @ID@ | head -n 1)
   [ -n "$WS_PREV" ] || echo "workspace: hyprctl named no active workspace: running in place" >&2
 fi
@@ -435,10 +438,10 @@ if [ -n "$WS_PREV" ]; then
   echo "workspace: before=$WS_PREV during=$(hyprctl activeworkspace | @ID@ | head -n 1) (empty $WS_RUN)" >&2
 fi
 "#;
-    // `hyprctl activeworkspace` / `workspaces` text: `workspace ID <n> (<name>) on monitor ...`
+    // `hyprctl activeworkspace` / `workspaces` text: `workspace <n> (<name>) on monitor ...` (the laptop's 2026-11-18 build), `workspace ID <n> (<name>) ...` in other releases
     SCRIPT.replace(
         "@ID@",
-        r"sed -n 's/^workspace ID \(-\{0,1\}[0-9]*\) .*/\1/p'",
+        r"sed -n 's/^workspace \(ID \)\{0,1\}\(-\{0,1\}[0-9][0-9]*\) (.*/\2/p'",
     )
 }
 
