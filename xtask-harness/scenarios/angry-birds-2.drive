@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: MIT
+# angry-birds-2 (Google Play, Unity, arm64 only -> native bridge). Positions read at 1440x900 content.
+# Fresh root: Rovio logo -> red "2" splash -> "FIRST THINGS FIRST!" Terms of Service consent (free, no personal data) -> forced tutorial level: an animated hand shows the slingshot drag.
+size 1440 900
+needs arm64
+control break-input
+unreachable account panel: network content, drawn in a WebView (WebView defect 3)
+unreachable Facebook sign-in: needs credentials
+unreachable purchases: cost money
+unreachable seasonal popups' content: network content, not shown on fresh roots
+unreachable tutorial level won: the bird's flight is physics over a moving picture; no log line marks a hit
+# the tutorial level is loaded behind the splash; the consent slides in over it
+wait-log app "Scene loaded: (Terrain_Cobalt_Tutorial_RedX)" 300000
+wait-changed 420 700 600 100 120000
+# the dialog slides in: an Accept touched while it moves was ignored (S4 probe p3), so the hold is long; judged on the title band (the birds and the button animate)
+wait-stable 340 140 800 100 60000 3000
+mark consent 280 120 900 680
+touch 720 748 150
+# Unity Ads starts only after the consent (absent while the dialog stays, S4 probe p3)
+wait-log app "UnityAds: Initializing SDK" 60000
+# the level's HUD: the bird card bottom left appears with the hand, after the dialog has slid out (the level animates, so no stable wait here: probe s4-ab-b3)
+wait-changed 40 740 160 140 90000
+wait 2000
+expect-changed consent 280 120 900 680
+# floor = half the lowest of 3 means over this window, WSL x86_64 readback, job s4-ab-b4: 5.0 / 7.2 / 26.9
+expect-fps 2.5 tier=readback over 4000
+# the sky right of the slingshot: neither the hand nor the HUD reach it; the launched bird's trajectory dots do
+mark sky 400 380 500 140
+touch-swipe 300 520 120 600 800
+wait-changed 400 380 500 140 5000
+expect-changed sky 400 380 500 140
+expect-audio 5000
+expect-no-log services "refused IActivityTaskManager"
