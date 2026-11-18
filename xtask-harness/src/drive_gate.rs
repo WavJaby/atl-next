@@ -19,6 +19,9 @@ use crate::{drive, run_apk, window};
 const RESIZED: (u32, u32) = (640, 400);
 /// The Button's centre in content pixels (`AtlWindow: layout button left=16 top=49 width=88 height=48`, the fixture's layout).
 const BUTTON: (u32, u32) = (60, 73);
+/// The label the click retitles, as a drive region `X Y W H` (`AtlWindow: layout label left=16 top=16 width=1408 height=33`): the tap's lasting change (onButton), judged there, since in touch mode
+/// it is 0.112 % of the content, under CHANGED_FRACTION of the whole.
+const LABEL: &str = "16 16 1408 33";
 /// How long the picture gets to settle: the button's press ripple is over well within it.
 const SETTLE_MS: u32 = 3000;
 
@@ -192,7 +195,7 @@ fn quick_run(root: &Path, host: &str, out: &Path) -> Result<()> {
 /// The Button's tap and its checkpoint against the mark `before`. No `wait-frames` between: under `--break-input` nothing redraws, and the red must come at `expect-changed`, not at a frame wait.
 fn tap_script() -> String {
     let (x, y) = BUTTON;
-    format!("tap {x} {y}\nwait {SETTLE_MS}\nexpect-changed before\n")
+    format!("tap {x} {y}\nwait {SETTLE_MS}\nexpect-changed before {LABEL}\n")
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {

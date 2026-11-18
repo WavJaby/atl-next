@@ -40,8 +40,9 @@ const VISUAL_POLL: Duration = Duration::from_millis(100);
 /// Per-channel difference above which a pixel counts as changed. Derivation (widgets fixture, `xtask test drive`, WSL readback 2026-11-20): two still captures 3 s apart differ by 0 in every channel,
 /// the Button's press by up to 145; 16 (1/16 of the range) sits above any rounding a scaled or dithered path adds (a few units) and far below the press.
 const CHANGE_DELTA: u8 = 16;
-/// Share of a region's pixels that must change for `changed`. Derivation (same run): the tap on the Button changes 3972 of the 1440x900 = 1296000 content px (0.306 %, inside the 88x48 = 4224 px button);
-/// half that share, 0.15 %, leaves room for a smaller widget while a few stray pixels (a caret, a cursor) stay below it.
+/// Share of a region's pixels that must change for `changed`. Derivation: the widgets Button's tap once changed 3972 of the 1440x900 = 1296000 content px (0.306 %), half that = 0.15 %, which leaves
+/// room for a smaller widget while a few stray pixels (a caret, a cursor) stay below it. That 3972 counted the window leaving touch mode (windows were added out of touch mode then); in touch mode
+/// the tap changes only the label "Clicked 1": 1448 px (0.112 % of the content, 3.1 % of the label's 1408x33), so a check of a small change names its region.
 const CHANGED_FRACTION: f64 = 0.0015;
 /// Injected configure serials: far above what the compositor sends one window in a run.
 const FIRST_SERIAL: u32 = 0x10_0000;
