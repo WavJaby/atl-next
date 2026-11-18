@@ -366,7 +366,7 @@ impl Display {
                     .to_ne_bytes(),
             )
         };
-        let attribs = [
+        let mut attribs = vec![
             EGL_WIDTH,
             i(p.width),
             EGL_HEIGHT,
@@ -379,12 +379,17 @@ impl Display {
             i(p.offset),
             EGL_DMA_BUF_PLANE0_PITCH_EXT,
             i(p.pitch),
-            EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
-            m(p.modifier),
-            EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
-            m(p.modifier >> 32),
-            EGL_NONE,
         ];
+        // INVALID (gralloc's implicit tier): no modifier attributes -- the spec reads INVALID as "none given", GDK's import omits them the same way (gdkdmabufegl.c)
+        if p.modifier != atl_gralloc::format::DRM_FORMAT_MOD_INVALID {
+            attribs.extend([
+                EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
+                m(p.modifier),
+                EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
+                m(p.modifier >> 32),
+            ]);
+        }
+        attribs.push(EGL_NONE);
         // SAFETY: EGL_LINUX_DMA_BUF_EXT takes no context and a null client buffer; the fd is open for the call (borrowed), the list is NONE-terminated.
         let raw = unsafe {
             (self.host.fns.eglCreateImageKHR)(

@@ -6,7 +6,7 @@
 //! Clear colours are c / 255, which GL's float -> unorm8 conversion (ES 3.2 §2.3.5.2, round(f x 255)) maps back to c, so the expected bytes are exact.
 //! `--matrix` runs every pair, each in a child process of its own so one driver crash names its pair and the rest still run. Output: one `p0a:` line per pair.
 //! `--display-node`: the GPU selector atld runs once per UI run (gpu-selection G1): the Wayland display's device render node + renderer, one `gpu-probe:` line;
-//! where the display names a node, one `gpu-modifiers:` line per gralloc fourcc: renderable on that node's EGL device (`external_only` false) ∩ imported by the Wayland display, 1-plane layouts.
+//! where the display names a node, one `gpu-modifiers:` line per gralloc fourcc: renderable on that node's EGL device (`external_only` false) ∩ imported by the Wayland display, 1-plane layouts; where none qualifies, `[INVALID]` (the implicit tier) if a modifier-less buffer imports on both.
 
 // one unsafe: `renderer`'s set_var of the render path's variables, single-threaded, before EGL loads
 #![deny(unsafe_code)]
@@ -25,7 +25,9 @@ use anyhow::{Context as _, Result, anyhow, ensure};
 use atl_egl_host::ffi::{GL_EXTENSIONS, GL_RENDERER, GL_VERSION};
 use atl_egl_host::{Device, Display, DmabufPlane, Host};
 use atl_gralloc::descriptor::Descriptor;
-use atl_gralloc::format::{DRM_FORMAT_ABGR8888, DRM_FORMAT_MOD_LINEAR, RGBA_8888};
+use atl_gralloc::format::{
+    DRM_FORMAT_ABGR8888, DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR, RGBA_8888,
+};
 use atl_gralloc::{node, usage};
 use atl_gralloc_dmabuf::{Mapping, SYNC_READ, SYNC_WRITE, begin_cpu_access, end_cpu_access};
 use atl_gralloc_service::backend::{Backend, DRM_DIR};
@@ -198,7 +200,7 @@ fn import_lines(
 ) {
     let on = |display: &Display, fbo: bool| -> std::result::Result<(), String> {
         let b = buf.as_ref().map_err(Clone::clone)?;
-        import_once(display, b, fbo).map_err(|e| format!("{e:#}"))
+        import_once(display, b, DRM_FORMAT_ABGR8888, fbo).map_err(|e| format!("{e:#}"))
     };
     let dev = on(device, true);
     let disp = host
@@ -210,12 +212,12 @@ fn import_lines(
 }
 
 /// Imports `b` on `display` as an EGLImage bound to a texture (a renderbuffer where the driver refuses that) and, with `fbo`, as a complete framebuffer.
-fn import_once(display: &Display, b: &Buffer, fbo: bool) -> Result<()> {
+fn import_once(display: &Display, b: &Buffer, fourcc: u32, fbo: bool) -> Result<()> {
     let ctx = display.create_context()?;
     let gl = ctx.make_current()?;
     let image = display.import_dmabuf(&DmabufPlane {
         fd: b.fd.as_fd(),
-        fourcc: DRM_FORMAT_ABGR8888,
+        fourcc,
         width: EDGE.unsigned_abs(),
         height: EDGE.unsigned_abs(),
         offset: b.offset,
@@ -232,7 +234,8 @@ fn import_once(display: &Display, b: &Buffer, fbo: bool) -> Result<()> {
     Ok(())
 }
 
-/// One [`node::MODIFIERS_LINE`] per gralloc fourcc: renderable on `render_node`'s EGL device display ∩ imported by the Wayland display, 1-plane layouts (atl_gralloc::node::modifier_set).
+/// One [`node::MODIFIERS_LINE`] per gralloc fourcc: renderable on `render_node`'s EGL device display ∩ imported by the Wayland display, 1-plane layouts (atl_gralloc::node::modifier_set);
+/// where that set is empty, the implicit tier when [`implicit_trial`] passes (node::with_implicit), with a [`node::IMPLICIT_LINE`] saying how the trial went.
 fn modifier_lines(
     host: &std::sync::Arc<Host>,
     render_node: &str,
@@ -255,9 +258,61 @@ fn modifier_lines(
             &presenter.modifiers(fourcc)?,
             |m| gbm.format_modifier_plane_count(format, gbm::Modifier::from(m)),
         );
+        let set = if set.is_empty() {
+            let trial = implicit_trial(Path::new(render_node), fourcc, &device, presenter);
+            out(&node::implicit_line(fourcc, &trial));
+            node::with_implicit(set, &trial)
+        } else {
+            set
+        };
         out(&node::modifiers_line(fourcc, &set));
     }
     Ok(())
+}
+
+/// Does gralloc's implicit tier serve `fourcc` on `node`: a GPU-only window buffer allocated as the allocator would (its backend, set `[INVALID]`: no modifier), imported without a modifier as a complete FBO on `device` (the app's EGL device) and as a texture on the Wayland display (GDK's GL import)?
+fn implicit_trial(
+    node: &Path,
+    fourcc: u32,
+    device: &Display,
+    presenter: &Display,
+) -> std::result::Result<(), String> {
+    let run = || -> Result<()> {
+        let format = atl_gralloc::format::all()
+            .iter()
+            .find(|f| f.fourcc == fourcc)
+            .with_context(|| format!("no gralloc format for {}", node::fourcc_name(fourcc)))?;
+        let backend = Backend::start(Path::new(DRM_DIR), Some(node))
+            .map_err(|e| anyhow!("gralloc backend on {}: {e}", node.display()))?;
+        let checked = Descriptor {
+            name: b"implicit".to_vec(),
+            width: EDGE,
+            height: EDGE,
+            layer_count: 1,
+            format: format.pixel_format,
+            // HWUI's window buffer usage (the request the empty set refused)
+            usage: usage::GPU_RENDER_TARGET | usage::GPU_TEXTURE | usage::COMPOSER_OVERLAY,
+            reserved_size: 0,
+            option_names: vec![],
+            modifiers: vec![DRM_FORMAT_MOD_INVALID],
+        }
+        .check()
+        .map_err(|e| anyhow!("descriptor refused: {e}"))?;
+        let buf = backend
+            .allocate(&checked)
+            .map_err(|e| anyhow!("allocate: {e}"))?;
+        let b = Buffer {
+            fd: buf.fd,
+            offset: 0,
+            pitch: buf.pitch,
+            size: buf.size,
+            modifier: buf.modifier,
+        };
+        import_once(device, &b, fourcc, true).context("device")?;
+        import_once(presenter, &b, fourcc, false).context("display")?;
+        Ok(())
+    };
+    run().map_err(|e| format!("{e:#}"))
 }
 
 fn out(line: &str) {

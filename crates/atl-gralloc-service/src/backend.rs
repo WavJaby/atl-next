@@ -74,6 +74,8 @@ pub struct Counters {
     pub modifier_invalid_linear: AtomicU64,
     /// Buffers allocated from a probed modifier set (`gbm_bo_create_with_modifiers2`): the modifier tier.
     pub alloc_modifier: AtomicU64,
+    /// Buffers allocated with set `[INVALID]` (`gbm_bo_create`, usage flags, no modifier): the implicit tier (node::with_implicit).
+    pub alloc_implicit: AtomicU64,
     /// Buffers allocated with set `[LINEAR]` (GBM LINEAR flag): CPU usage, or the linear tier (no probe list). The node probe's own buffer included.
     pub alloc_linear: AtomicU64,
     /// Buffers of the udmabuf allocator tier (memfd pages), its probe buffer included.
@@ -189,7 +191,7 @@ fn gbm_format(fourcc: u32) -> Result<Format, BackendError> {
         .map_err(|_| BackendError::Alloc(format!("fourcc {fourcc:#x} is not a DRM format")))
 }
 
-/// The one allocation entry. Set `[LINEAR]`: plain create with the LINEAR flag (the CPU path maps the dma-buf and indexes it by pitch). Any other set: GBM picks inside it (`with_modifiers2`); the result must be one plane, the only layout the handle carries.
+/// The one allocation entry. Set `[LINEAR]`: plain create with the LINEAR flag (the CPU path maps the dma-buf and indexes it by pitch). Set `[INVALID]`: plain create with the usage flags, modifier INVALID (the implicit tier). Any other set: GBM picks inside it (`with_modifiers2`); the result must be one plane, the only layout the handle carries.
 fn alloc(
     dev: &Device<std::fs::File>,
     c: &Checked,
@@ -204,8 +206,10 @@ fn alloc(
         (c.width, c.height)
     };
     let linear = c.modifiers == [DRM_FORMAT_MOD_LINEAR];
+    // the implicit tier (node::with_implicit): no modifier passed, the driver lays the buffer out its own way, as a client without modifier support allocates
+    let implicit = c.modifiers == [DRM_FORMAT_MOD_INVALID];
     let flags = flags_for(c.usage, &c.modifiers);
-    let bo = if linear {
+    let bo = if linear || implicit {
         dev.create_buffer_object::<()>(width, height, format, flags)
     } else {
         dev.create_buffer_object_with_modifiers2::<()>(
@@ -237,7 +241,12 @@ fn alloc(
     // a dma-buf reports its size by seeking to its end
     let size = seek(&fd, SeekFrom::End(0))
         .map_err(|e| BackendError::Alloc(format!("sizing the dma-buf: {e}")))?;
-    let mut modifier = u64::from(bo.modifier());
+    // implicit: INVALID whatever GBM reports -- the importers on this device import without a modifier (they listed none explicit, and EXT_image_dma_buf_import_modifiers rejects a modifier the device does not list)
+    let mut modifier = if implicit {
+        DRM_FORMAT_MOD_INVALID
+    } else {
+        u64::from(bo.modifier())
+    };
     // vgem answers INVALID for the LINEAR buffer it was asked for; only then is INVALID read as LINEAR
     if modifier == DRM_FORMAT_MOD_INVALID && linear {
         counters
@@ -253,6 +262,8 @@ fn alloc(
     }
     let tier = if linear {
         &counters.alloc_linear
+    } else if implicit {
+        &counters.alloc_implicit
     } else {
         &counters.alloc_modifier
     };
@@ -473,6 +484,11 @@ mod tests {
         assert_eq!(
             flags_for(usage::COMPOSER_OVERLAY, &[1]),
             BufferObjectFlags::empty()
+        );
+        // the implicit tier's window buffer: RENDERING, never LINEAR (the driver's own layout)
+        assert_eq!(
+            flags_for(gpu | usage::COMPOSER_OVERLAY, &[DRM_FORMAT_MOD_INVALID]),
+            BufferObjectFlags::RENDERING
         );
     }
 

@@ -6,7 +6,7 @@ use atl_gralloc::usage::{CPU_MASK, GPU_RENDER_TARGET};
 
 /// The modifier set for a buffer of `usage` in `pixel_format`, from the probe's lists (`probe`: per fourcc, atld's `--modifiers` = renderable on the device ∩ imported by the presenter; a fourcc absent = linear tier). Empty = no modifier serves it (refused).
 /// - any CPU bit, or BLOB / an unknown format: `[LINEAR]` (the CPU indexes rows); empty when GPU_RENDER_TARGET is also set and the probed set lacks LINEAR, i.e. LINEAR is not renderable on the device (NVIDIA: external-only) -- owner D2 (a)
-/// - GPU-only: the probed set as is, GBM picks inside it (owner D1 (a): no "prefer LINEAR"); empty when the probe found none
+/// - GPU-only: the probed set as is, GBM picks inside it (owner D1 (a): no "prefer LINEAR"); `[INVALID]` on the implicit tier (node::with_implicit: the driver's own layout); empty when the probe found neither
 /// - no probe list for the fourcc (WSL, headless): `[LINEAR]`, the baseline tier
 pub fn modifiers_for(usage: u64, pixel_format: i32, probe: &[(u32, Vec<u64>)]) -> Vec<u64> {
     let linear = vec![DRM_FORMAT_MOD_LINEAR];
@@ -84,6 +84,24 @@ mod tests {
         let e = d.check().expect_err("refused");
         assert_eq!(e, Refusal::NoModifierForUsage(CPU_MASK | WINDOW));
         assert!(e.to_string().contains("no supported modifier for usage"));
+    }
+
+    /// The implicit tier (`[INVALID]`, rvvm virgl): GPU-only window buffers (usage 0xb00, the refused HWUI request) take it; CPU + render stays refused (LINEAR not known renderable: the set names no explicit modifier), CPU + sample stays LINEAR.
+    #[test]
+    fn implicit_tier_serves_gpu_only() {
+        use atl_gralloc::format::DRM_FORMAT_MOD_INVALID;
+        let implicit = probe(&[DRM_FORMAT_MOD_INVALID]);
+        let hwui = 0xb00; // GPU_RENDER_TARGET 0x200 | GPU_TEXTURE 0x100 | COMPOSER_OVERLAY 0x800
+        assert_eq!(hwui, WINDOW | atl_gralloc::usage::COMPOSER_OVERLAY);
+        assert_eq!(
+            modifiers_for(hwui, RGBA_8888, &implicit),
+            [DRM_FORMAT_MOD_INVALID]
+        );
+        assert!(modifiers_for(CPU_MASK | WINDOW, RGBA_8888, &implicit).is_empty());
+        assert_eq!(
+            modifiers_for(CPU_MASK | GPU_TEXTURE, RGBA_8888, &implicit),
+            LIN
+        );
     }
 
     /// No list for the fourcc (WSL, headless), or BLOB: `[LINEAR]` whatever the usage -- the pre-modifier allocation.

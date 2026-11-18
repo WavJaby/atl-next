@@ -323,6 +323,39 @@ pub fn modifier_set(
         .collect()
 }
 
+/// The set for a fourcc whose explicit set ([`modifier_set`]) is `explicit`: that set where it is non-empty; else `[DRM_FORMAT_MOD_INVALID]` (the implicit tier: the driver's own layout, no modifier named) when `implicit` -- the probe's trial of a modifier-less GBM buffer imported on the device (as an FBO) and on the presenter -- succeeded; else empty (refused).
+/// INVALID as a set member is the Linux convention: linux-dmabuf's format table and GDK's `GdkDmabufFormats` list it for "implicit modifier", and EXT_image_dma_buf_import_modifiers treats it as no modifier given. Only meaningful on the device that allocated it: the probe allocates on the display's node, the node the app renders on.
+/// Explicit wins: a host that lists modifiers keeps exactly its explicit set (EGL lists none on implicit-only drivers: radeonsi before GFX9, virgl).
+pub fn with_implicit(explicit: Vec<u64>, implicit: &Result<(), String>) -> Vec<u64> {
+    if !explicit.is_empty() {
+        return explicit;
+    }
+    match implicit {
+        Ok(()) => vec![crate::format::DRM_FORMAT_MOD_INVALID],
+        Err(_) => explicit,
+    }
+}
+
+/// The modifier tier a probed set names, for atld's `modifier tier <FOURCC> <name>` line: `implicit` (`[INVALID]`), `explicit` (named modifiers), `none` (empty: GPU-only buffers refused).
+pub fn modifier_tier_name(mods: &[u64]) -> &'static str {
+    match mods {
+        [] => "none",
+        [crate::format::DRM_FORMAT_MOD_INVALID] => "implicit",
+        _ => "explicit",
+    }
+}
+
+/// The probe's line when a fourcc's explicit set is empty: `<prefix> <FOURCC> ok|<why>`, the implicit trial's result (informational; the set on the [`MODIFIERS_LINE`] carries the decision).
+pub const IMPLICIT_LINE: &str = "gpu-implicit:";
+
+pub fn implicit_line(fourcc: u32, r: &Result<(), String>) -> String {
+    let fourcc = fourcc_name(fourcc);
+    match r {
+        Ok(()) => format!("{IMPLICIT_LINE} {fourcc} {IMPORT_OK}"),
+        Err(why) => format!("{IMPLICIT_LINE} {fourcc} {}", why.replace('\n', " ")),
+    }
+}
+
 /// `AB24` from 0x34324241 (drm_fourcc.h: first character in the least significant byte).
 pub fn fourcc_name(fourcc: u32) -> String {
     String::from_utf8_lossy(&fourcc.to_le_bytes()).into_owned()
@@ -430,6 +463,32 @@ mod tests {
         );
         assert_eq!(parse_modifier_arg("AB2=0x0"), None);
         assert_eq!(parse_modifier_arg("AB24=12"), None);
+    }
+
+    /// The implicit tier: only an empty explicit set with a working implicit trial gives `[INVALID]` (rvvm virgl and sifive radeonsi GFX8 probed `XB24=` empty); a non-empty explicit set is kept whatever the trial says; a failed trial stays empty.
+    #[test]
+    fn implicit_tier_only_when_nothing_explicit_and_the_trial_imports() {
+        const INVALID: u64 = crate::format::DRM_FORMAT_MOD_INVALID;
+        let ok = Ok(());
+        let fail = Err("EGL error 0x3003".to_owned());
+        assert_eq!(with_implicit(vec![], &ok), [INVALID]);
+        assert_eq!(with_implicit(vec![], &fail), Vec::<u64>::new());
+        assert_eq!(with_implicit(vec![NV_BL2, NV_BL], &ok), [NV_BL2, NV_BL]);
+        assert_eq!(with_implicit(vec![0], &fail), [0]);
+        assert_eq!(modifier_tier_name(&[INVALID]), "implicit");
+        assert_eq!(modifier_tier_name(&[]), "none");
+        assert_eq!(modifier_tier_name(&[0]), "explicit");
+        assert_eq!(modifier_tier_name(&[0, INVALID]), "explicit");
+        // INVALID = 0x00ff_ffff_ffff_ffff (drm_fourcc.h) survives the --modifiers round trip
+        let xb24 = u32::from_le_bytes(*b"XB24");
+        let arg = modifier_arg(xb24, &[INVALID]);
+        assert_eq!(arg, "XB24=0xffffffffffffff");
+        assert_eq!(parse_modifier_arg(&arg), Some((xb24, vec![INVALID])));
+        assert_eq!(
+            implicit_line(xb24, &fail),
+            "gpu-implicit: XB24 EGL error 0x3003"
+        );
+        assert_eq!(implicit_line(xb24, &ok), "gpu-implicit: XB24 ok");
     }
 
     #[test]

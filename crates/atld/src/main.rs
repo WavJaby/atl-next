@@ -2338,6 +2338,12 @@ fn run(a: &Args) -> Result<ExitCode> {
             let arg = node::modifier_arg(*fourcc, mods);
             // own prefix: `gpu:` is the one node line the run-apk gate reads
             log(format_args!("gpu-modifiers: {arg} (probe)"));
+            // which modifier tier GPU-only buffers of this fourcc take: explicit, implicit (node::with_implicit) or none (refused)
+            log(format_args!(
+                "modifier tier {} {}",
+                node::fourcc_name(*fourcc),
+                node::modifier_tier_name(mods)
+            ));
             spawn.args.push("--modifiers".into());
             spawn.args.push(arg.into());
         }
