@@ -1832,6 +1832,20 @@ pub(crate) fn content_origin(app: &str) -> Result<(f32, f32), String> {
     Ok((coord("x")?, coord("y")?))
 }
 
+/// The surface point of content pixel `(x, y)`: the content origin (logical surface units) plus the pixel over the window's scale, both from the platform's origin line. At scale 1 the pixel itself.
+pub(crate) fn content_to_surface(app: &str, (x, y): (f64, f64)) -> Result<(f64, f64), String> {
+    let (ox, oy) = content_origin(app)?;
+    let line = app
+        .lines()
+        .find(|l| l.contains(CONTENT_ORIGIN_LINE))
+        .ok_or_else(|| "no content origin line: the window never presented".to_owned())?;
+    let scale: f64 = word(line, "scale")
+        .and_then(|v| v.parse().ok())
+        .filter(|s: &f64| *s > 0.0)
+        .ok_or_else(|| format!("no positive scale in {line:?}"))?;
+    Ok((f64::from(ox) + x / scale, f64::from(oy) + y / scale))
+}
+
 /// The pointer script's touches against the fixture's log: the action and pointer count of each, in order, and each position at the script's point minus `origin`
 /// (the content's origin in the surface, where the injected points land; (0, 0) for the headless pointer). The offset must round to (0, 0): no measured allowance. Touches past BLOCK_MIN_X are the probe's block, not the script.
 fn track_check(after: &[&str], script: &str, origin: (f32, f32)) -> Result<String, String> {

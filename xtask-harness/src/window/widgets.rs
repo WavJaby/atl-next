@@ -19,7 +19,7 @@ use atl_services_types::input_devices;
 use super::capture;
 use super::{
     ACK_WAIT, BTN_LEFT, CONTENT_ORIGIN_LINE, Liveness, POLL, Rate, Sub, await_event, cadence_check,
-    content_origin, wait_for_line,
+    content_to_surface, wait_for_line,
 };
 use crate::composer::word;
 use crate::nested_wayland::{GATE_OUTPUT, Output};
@@ -622,27 +622,24 @@ fn text_check(pictures: &Mutex<capture::Seen>, app: &str) -> Result<String, Stri
     ))
 }
 
-/// `drive` saw the proxy report the header press before the first tap. GTK keeps a header press, so the first touch Android gets must be the Button's tap.
+/// `drive` saw the proxy report the header press before the first tap. GTK keeps a header press, so the first touch Android gets must be the Button's tap: inside the Button's rectangle (the tap
+/// aims at its centre; at a fractional scale the surface point's wl_fixed 1/256 steps move it off the exact centre pixel, never out of the Button).
 fn header_check(app: &str) -> Result<String, String> {
-    let (ox, oy) = button_centre(app)?;
+    let r = widget(app, "button")?;
     let line = app
         .lines()
         .find_map(|l| l.split_once("AtlWindow: touch ").map(|(_, rest)| rest))
         .ok_or("no touch line at all")?;
     let x: f64 = number(word(line, "x"), "touch x")?;
     let y: f64 = number(word(line, "y"), "touch y")?;
-    if (x, y) != (ox, oy) {
+    let inside = |v: f64, from: i64, len: i64| v >= from as f64 && v < (from + len) as f64;
+    if !(inside(x, r.left, r.width) && inside(y, r.top, r.height)) {
         return Err(format!(
-            "first touch at ({x}, {y}), the Button's centre is ({ox}, {oy}): the header press reached Android"
+            "first touch at ({x}, {y}), outside the Button {}x{} at ({}, {}): the header press reached Android",
+            r.width, r.height, r.left, r.top
         ));
     }
     Ok("proxy injected the press; the first touch Android got is the Button's tap".to_owned())
-}
-
-/// The centre of the Button in the content, where the probe taps.
-fn button_centre(app: &str) -> Result<(f64, f64), String> {
-    let r = widget(app, "button")?;
-    Ok(((r.left + r.width / 2) as f64, (r.top + r.height / 2) as f64))
 }
 
 /// After the taps and the drag: the last settled picture is the fixture's final frame, and not the first picture.
@@ -1000,13 +997,12 @@ pub fn drive(
         .ok_or("the window never presented")?;
     probe.record_settled();
     let text = std::fs::read_to_string(app_log).map_err(|e| e.to_string())?;
-    let (ox, oy) = content_origin(&text)?;
     let centre = |name: &str| -> Result<(f64, f64), String> {
         let r = widget(&text, name)?;
-        Ok((
-            (r.left + r.width / 2) as f64 + f64::from(ox),
-            (r.top + r.height / 2) as f64 + f64::from(oy),
-        ))
+        content_to_surface(
+            &text,
+            ((r.left + r.width / 2) as f64, (r.top + r.height / 2) as f64),
+        )
     };
     let tap = |(x, y): (f64, f64)| {
         inject(
@@ -1204,12 +1200,11 @@ pub fn drive_mouse_touch(proxy: Proxy, app_log: &Path) -> Result<Liveness, Strin
         .then_some(())
         .ok_or("the window never presented")?;
     let text = std::fs::read_to_string(app_log).map_err(|e| e.to_string())?;
-    let (ox, oy) = content_origin(&text)?;
     let r = widget(&text, "list")?;
-    let (x, y) = (
-        (r.left + r.width / 2) as f64 + f64::from(ox),
-        (r.top + r.height / 2) as f64 + f64::from(oy),
-    );
+    let (x, y) = content_to_surface(
+        &text,
+        ((r.left + r.width / 2) as f64, (r.top + r.height / 2) as f64),
+    )?;
     let drag_from = text.len();
     let mut drag = vec![PointerAction::Enter { x, y }, press(true)];
     for step in 1..=SCROLL_STEPS {
@@ -1455,6 +1450,29 @@ mod tests {
         let leak = format!("{BUTTON}AtlWindow: touch action=0 x=86.0 y=-31.0\n{tap}");
         assert!(header_check(&leak).is_err());
         assert!(header_check(BUTTON).is_err());
+        // the laptop run (scale 1.6): the Button 141x77 at (26, 78), the tap at its centre (96, 116) over 1.6 as a wl_fixed surface point lands at (95.59961, 115.59961) -- inside
+        let laptop = "AtlWindow: layout button left=26 top=78 width=141 height=77\nAtlWindow: touch action=0 x=95.59961 y=115.59961\n";
+        assert!(header_check(laptop).is_ok());
+        // that run's header press, (100, 20) logical = (160, 32) px: above the Button
+        let leaked = "AtlWindow: layout button left=26 top=78 width=141 height=77\nAtlWindow: touch action=0 x=160.0 y=32.0\n";
+        assert!(header_check(leaked).is_err());
+    }
+
+    /// The probe's tap point: content origin plus the pixel over the logged scale; the laptop run's line (origin 0,0, scale 1.6) puts the Button's centre pixel (96, 116) at (60, 72.5).
+    #[test]
+    fn content_to_surface_divides_by_the_scale() {
+        let line = "atl-platform-ui: content origin x=0 y=0 scale=1.6\n";
+        let (x, y) = content_to_surface(line, (96.0, 116.0)).expect("mapped");
+        // 1.6 has no exact binary form: the quotient is within an ulp-sized step of the decimal one
+        assert!(
+            (x - 60.0).abs() < 1e-9 && (y - 72.5).abs() < 1e-9,
+            "({x}, {y})"
+        );
+        let unit = "atl-platform-ui: content origin x=4 y=46 scale=1\n";
+        assert_eq!(content_to_surface(unit, (60.0, 73.0)), Ok((64.0, 119.0)));
+        assert!(
+            content_to_surface("atl-platform-ui: content origin x=0 y=0\n", (1.0, 1.0)).is_err()
+        );
     }
 
     /// Hover needs 9, 7, 10 with no touch between: a tap's 9, 10 alone fails, a touch between fails.

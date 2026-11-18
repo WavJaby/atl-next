@@ -775,7 +775,11 @@ impl Window for GtkWindow {
             .flatten();
         if let Some((x, y)) = origin {
             self.origin_logged.set(true);
-            tracing::info!("atl-platform-ui: content origin x={x} y={y}");
+            // with the scale: a content pixel p is the surface point origin + p / scale
+            tracing::info!(
+                "atl-platform-ui: content origin x={x} y={y} scale={}",
+                self.view.scale().get()
+            );
         }
         mirror::resync();
         Ok(())
