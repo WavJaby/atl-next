@@ -215,6 +215,13 @@ unsafe extern "C" fn host_trap_ex(_ctx: *mut c_void, kind: u32, id: u32, lanes: 
         stack: std::array::from_fn(|i| if i < 8 { l.stack[(i + 1) % 8] } else { 0 }),
         ..l
     };
+    // break `qa_x_lane` (qemu-abi gate, `x`): integer lanes 0 and 1 arrive swapped
+    #[cfg(atl_qa_x_lane)]
+    let l = {
+        let mut l = l;
+        l.regs.swap(0, 1);
+        l
+    };
     let trap = match kind {
         CALL => Trap::Call(l),
         BIND => Trap::Bind { id, lanes: l },
