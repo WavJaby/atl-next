@@ -4,7 +4,8 @@ size 1440 900
 control break-input
 wait-stable 0 0 1440 900 20000 1000
 expect-varied 0 64 1440 296
-# the first input of the run redraws the whole picture in another palette: one harmless tap on the display first, so the mark is taken after it
+# until the first touch the content below the toolbar is drawn ~7.5 % darker and fades after it (the window starts out of touch mode: addToDisplayAsUser answers no ADD_FLAG_IN_TOUCH_MODE):
+# one harmless touch on the display first, so the mark is taken after it
 tap 720 200
 wait-stable 0 0 1440 900 5000 1000
 mark display 0 64 1440 296
