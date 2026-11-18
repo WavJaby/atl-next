@@ -40,7 +40,9 @@ use atl_parcelables::android::content::res::{CompatibilityInfo, Configuration};
 use atl_parcelables::android::content::{ComponentName, Intent, IntentFilter};
 use atl_parcelables::android::graphics::Rect;
 use atl_parcelables::android::hardware::OverlayProperties;
-use atl_parcelables::android::media::{AudioAttributes, PlayerBase_PlayerIdCard};
+use atl_parcelables::android::media::{
+    AudioAttributes, AudioDeviceAttributes, PlayerBase_PlayerIdCard, VolumeInfo,
+};
 use atl_parcelables::android::os::Bundle;
 use atl_parcelables::android::os::storage::StorageVolume;
 use atl_parcelables::android::util::MergedConfiguration;
@@ -354,6 +356,10 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
         "android.graphics.Rect" => round_trip_as::<Rect>(input, mode),
         "android.hardware.OverlayProperties" => round_trip_as::<OverlayProperties>(input, mode),
         "android.media.AudioAttributes" => round_trip_as::<AudioAttributes>(input, mode),
+        "android.media.AudioDeviceAttributes" => {
+            round_trip_as::<AudioDeviceAttributes>(input, mode)
+        }
+        "android.media.VolumeInfo" => round_trip_as::<VolumeInfo>(input, mode),
         "android.media.PlayerBase$PlayerIdCard" => {
             round_trip_as::<PlayerBase_PlayerIdCard>(input, mode)
         }

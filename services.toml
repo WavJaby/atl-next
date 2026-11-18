@@ -288,6 +288,8 @@ mirrors = [
     "frameworks/base/services/core/java/com/android/server/audio/PlaybackActivityMonitor.java#releasePlayer",
     "frameworks/base/media/java/android/media/PlayerBase.java#PlayerIdCard",
     "frameworks/base/media/java/android/media/AudioAttributes.java#writeToParcel",
+    "frameworks/base/media/java/android/media/AudioDeviceAttributes.java#writeToParcel",
+    "frameworks/base/media/java/android/media/VolumeInfo.java#writeToParcel",
 ]
 
 [processinfo]

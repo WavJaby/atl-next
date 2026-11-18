@@ -57,7 +57,9 @@ pub mod android {
     }
     pub mod media {
         pub mod AudioAttributes;
+        pub mod AudioDeviceAttributes;
         pub mod PlayerBase_PlayerIdCard;
+        pub mod VolumeInfo;
     }
     pub mod net {
         pub mod LinkProperties;

@@ -100,7 +100,11 @@ import android.os.storage.StorageVolume;
 import android.window.ActivityWindowInfo;
 import android.window.SizeConfigurationBuckets;
 import android.media.AudioAttributes;
+import android.media.AudioDeviceAttributes;
+import android.media.AudioDeviceInfo;
+import android.media.AudioManager;
 import android.media.AudioPlaybackConfiguration;
+import android.media.VolumeInfo;
 import android.media.IPlayer;
 import android.media.PlayerBase;
 import android.media.VolumeShaperConfiguration;
@@ -110,6 +114,7 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
@@ -403,6 +408,11 @@ public class ParcelTruth {
         check("PlayerBase.PlayerIdCard", playerIdCard(null), PlayerBase.PlayerIdCard.CREATOR, breakCard ? MODE_CORRUPT : MODE_PLAIN);
         checkPlayerIdCardBinder("PlayerBase.PlayerIdCard:binder");
         checkFlattenedAttributes("AudioAttributes:flattened");
+        // the absolute-volume seam (IAudioService.registerDeviceVolumeDispatcherForAbsoluteVolume, IAudioDeviceVolumeDispatcher): the device with and without a name, the stream volume set and unset
+        check("AudioDeviceAttributes", new AudioDeviceAttributes(AudioDeviceAttributes.ROLE_OUTPUT, AudioDeviceInfo.TYPE_BUILTIN_SPEAKER, "atl:app", "atl app", new ArrayList<>(), new ArrayList<>()), AudioDeviceAttributes.CREATOR);
+        check("AudioDeviceAttributes:short", new AudioDeviceAttributes(AudioDeviceAttributes.ROLE_OUTPUT, AudioDeviceInfo.TYPE_BUILTIN_SPEAKER, ""), AudioDeviceAttributes.CREATOR);
+        check("VolumeInfo", new VolumeInfo.Builder(AudioManager.STREAM_MUSIC).setMuted(true).setVolumeIndex(9).setMinVolumeIndex(0).setMaxVolumeIndex(15).build(), VolumeInfo.CREATOR);
+        check("VolumeInfo:unset", new VolumeInfo.Builder(AudioManager.STREAM_MUSIC).build(), VolumeInfo.CREATOR);
 
         selfTests(config, intent, entries);
         System.out.println("pt summary " + failures + " failed");
