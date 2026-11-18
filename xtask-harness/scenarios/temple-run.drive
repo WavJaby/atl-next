@@ -28,8 +28,8 @@ wait 1500
 expect-changed menu
 # the run's first seconds; swipes before them were not logged (S4 probes s4, s5). Floor = half the lowest of 3 means over this window, WSL x86_64 readback, job s4-tr-b1: 44.0 / 29.5 / 13.7
 expect-fps 6.8 tier=readback over 4000
-touch-swipe 200 600 480 600 120
-# a right swipe away from a corner: DirectSwipeDetector logs it
-wait-log app "RIGHT: turn element was null" 5000
+# a left swipe: the first corner turns right, so it never turns and DirectSwipeDetector always logs it (a right swipe inside the corner window turns and logs nothing: gate s4-gate1)
+touch-swipe 480 600 200 600 120
+wait-log app "LEFT: turn element was null" 5000
 expect-audio 5000
 expect-no-log services "refused IActivityTaskManager"
