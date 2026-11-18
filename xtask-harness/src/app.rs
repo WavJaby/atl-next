@@ -511,7 +511,8 @@ const WEBVIEW_SCHEME: Line = Line {
     timing: Timing::Async,
 };
 /// http: the client returns false for an http URL -> it loads as usual (onPageStarted for it). What follows the refused connection is printed, not judged: the engine's error page (WebKit loads one
-/// for the failing URL: a second `http` start), the error code and the page.
+/// for the failing URL: a second `http` start), the error code and the page. The app reads at the load's onPageFinished, not after a fixed delay: the start of this cross-site load waits for a new
+/// web process (0.3 s to over 1 s on a loaded host), and a read before it judged a load that had not begun. A dropped start still fails (`started=https,`), a load that never ends leaves no line.
 const WEBVIEW_HTTP: Line = Line {
     row: "webview-http",
     prefix: "AtlTest: webview-http: ",
