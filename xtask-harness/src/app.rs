@@ -3165,9 +3165,17 @@ mod tests {
     /// 1440 x 900 x 4 bytes = 5184000 (ARGB_8888); the pre-fix run logged `app=0` (empty maxBounds).
     #[test]
     fn drawing_cache_is_four_bytes_per_display_pixel() {
-        assert!(drawing_cache_failures("AtlTest: drawing-cache app=5184000 real=1440x900\n").is_empty());
-        assert!(drawing_cache_failures("AtlTest: drawing-cache app=0 real=1440x900\n")[0].contains("limit 0"));
-        assert!(drawing_cache_failures("AtlTest: drawing-cache app=0 real=0x0\n")[0].contains("limit 0"));
+        assert!(
+            drawing_cache_failures("AtlTest: drawing-cache app=5184000 real=1440x900\n").is_empty()
+        );
+        assert!(
+            drawing_cache_failures("AtlTest: drawing-cache app=0 real=1440x900\n")[0]
+                .contains("limit 0")
+        );
+        assert!(
+            drawing_cache_failures("AtlTest: drawing-cache app=0 real=0x0\n")[0]
+                .contains("limit 0")
+        );
         assert!(drawing_cache_failures("AtlTest: onCreate reached\n")[0].contains("no "));
     }
 

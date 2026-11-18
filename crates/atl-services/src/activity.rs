@@ -157,13 +157,28 @@ pub(crate) fn global_configuration(display: &DisplayModel, locale: Option<&str>)
             ORIENTATION_LANDSCAPE
         },
         ui_mode: GLOBAL_UI_MODE,
-        // DisplayContent.computeScreenConfiguration:2460/2475: the display's rotation as both
+        // DisplayContent.computeScreenConfiguration:2486-2488: bounds = maxBounds = the display; computeScreenAppConfiguration:2458-2460: appBounds = the non-decor frame (no decor here
+        // = the display) and the display's rotation as both. A process's resources (application context) carry this: ViewConfiguration's drawing-cache limit is 4 x maxBounds area
+        // (ViewConfiguration.java:485), so empty maxBounds -> limit 0 -> every software-layer view "not displayed" (AB2's settings WebView).
         window_configuration: atl_parcelables::parts::WindowConfiguration {
+            bounds: display_rect(display),
+            app_bounds: Some(display_rect(display)),
+            max_bounds: display_rect(display),
             rotation: display.rotation,
             display_rotation: display.rotation,
             ..Default::default()
         },
         ..Configuration::default()
+    }
+}
+
+/// The display's logical rect from the origin (DisplayContent.computeScreenConfiguration's mTmpRect).
+fn display_rect(display: &DisplayModel) -> Rect {
+    Rect {
+        left: 0,
+        top: 0,
+        right: display.width,
+        bottom: display.height,
     }
 }
 
@@ -3082,6 +3097,27 @@ mod tests {
         assert_eq!(config.locale_list.as_deref(), Some("zh-TW"));
         let config = global_configuration(&display, None);
         assert_eq!(config.locale_list.as_deref(), Some("en-US"));
+    }
+
+    /// DisplayContent.computeScreenConfiguration:2486-2488 + computeScreenAppConfiguration:2458: bounds, appBounds and maxBounds of the global configuration are the display from the origin.
+    #[test]
+    fn global_configuration_bounds_are_the_display() {
+        let display = DisplayModel {
+            width: 1440,
+            height: 900,
+            ..DisplayModel::default()
+        };
+        let w = global_configuration(&display, None).window_configuration;
+        let want = Rect {
+            left: 0,
+            top: 0,
+            right: 1440,
+            bottom: 900,
+        };
+        assert_eq!(
+            (w.bounds, w.app_bounds, w.max_bounds),
+            (want.clone(), Some(want.clone()), want)
+        );
     }
 
     /// Counts requestFinish calls; `fail` answers each with DEAD_OBJECT (the app died before the oneway call landed).
