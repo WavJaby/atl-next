@@ -132,3 +132,16 @@ files = [
   { name = "base", sha256 = "422c91d53ebf6d4bf2359fb4eb15ac847d8079df94fb9a17e5dbeefec690f1c3", size = 157199574 },
   { name = "config.arm64_v8a", sha256 = "99371e4e034761872eb0c33ae96b60230dc29d572f2b68dd00b5dc5cf6ea0fe7", size = 23779658 },
 ]
+
+# google-play row: Temple Run 2 1.137.0, arm64. Values read from the local copy in ~/atl-next/apk/temple-run-2/play-split (2026-11-19); device px_9a inferred as for temple-run (Play served config.arm64_v8a only).
+[temple-run-2]
+package = "com.imangi.templerun2"
+version_name = "1.137.0"
+version_code = 29853048
+signer_sha256 = "f5f6531cbd8853165e64814f8fd8c92872cedb85abaf2985ee54936817219ea6"
+source = "google-play"
+device = "px_9a"
+files = [
+  { name = "base", sha256 = "e03b07d906239b83b39d12ad30007b409a2bdd0dde6c9323d180cb9efbde6baf", size = 160297170 },
+  { name = "config.arm64_v8a", sha256 = "470b5fa27ad21fd479948788672ed3745cb66acf94c8c63a9d545740053f3c36", size = 26798410 },
+]

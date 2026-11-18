@@ -833,7 +833,8 @@ mod tests {
                 "fossify-math",
                 "fossify-notes",
                 "material-catalog",
-                "temple-run"
+                "temple-run",
+                "temple-run-2"
             ]
         );
     }
