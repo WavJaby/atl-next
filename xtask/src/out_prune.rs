@@ -40,7 +40,7 @@ pub const DIR_ROOTS: [&str; 7] = [
 /// `<build dir>/gl/cargo*`: the GL probes' target roots.
 const GL_DIR: &str = "gl";
 /// `<ws>/out/egl-driver/<checkout>/cargo*`: EGL driver probes, not under a build dir.
-const EGL_DIR: &str = "egl-driver";
+const EGL_DIR: &str = out::FAMILIES[1];
 /// Prefix of the root names under `gl/` and `egl-driver/<checkout>/`.
 const CARGO_ROOT: &str = "cargo";
 /// cargo's lock on a build dir; a build holds it for its whole run.
@@ -705,7 +705,7 @@ fn remove_session(tree: &Path, session: &Session) -> Result<()> {
 }
 
 /// Apparent bytes under `paths`, each inode once: an uplifted link and its deps file are one copy on disk.
-fn unique_bytes(paths: &[PathBuf]) -> Result<u64> {
+pub(crate) fn unique_bytes(paths: &[PathBuf]) -> Result<u64> {
     let mut seen = HashSet::new();
     let mut total = 0;
     for path in paths {
@@ -799,7 +799,7 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-fn human(bytes: u64) -> String {
+pub(crate) fn human(bytes: u64) -> String {
     let b = bytes as f64;
     if b >= GIB {
         format!("{:.2} GiB", b / GIB)

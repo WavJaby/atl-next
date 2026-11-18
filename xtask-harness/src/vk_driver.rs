@@ -35,7 +35,7 @@ pub struct Args {
     /// How `--node` was chosen: display or trial.
     #[arg(long, default_value = "trial")]
     node_source: String,
-    /// Output directory (default: <workspace>/out/vk-driver/<checkout dir name>; never inside the checkout, whose files the static checks read).
+    /// Output directory (default: <workspace>/out/vk-driver/<checkout id>, swept by `out prune` once the checkout is gone; never inside the checkout, whose files the static checks read).
     #[arg(long)]
     out: Option<PathBuf>,
 }
@@ -49,13 +49,7 @@ struct Run {
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let out = match &args.out {
         Some(o) => o.clone(),
-        None => {
-            let checkout = root.file_name().context("checkout dir name")?;
-            atl_layout::Layout::of(root)?
-                .workspace()
-                .join("out/vk-driver")
-                .join(checkout)
-        }
+        None => xtask::out::family_dir(root, xtask::out::FAMILIES[0])?,
     };
     let driver = crate::cdylib::stage(root, &out, PACKAGE, "vk", DRIVER_FILE)?.join(DRIVER_FILE);
     let probe = build_probe(root, &out.join("cargo"))?;

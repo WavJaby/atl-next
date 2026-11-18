@@ -17,7 +17,7 @@ const PROBE_BIN: &str = "atl-egl-driver-probe";
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// Output directory (default: <workspace>/out/egl-driver/<checkout dir name>; never inside the checkout, whose files the static checks read).
+    /// Output directory (default: <workspace>/out/egl-driver/<checkout id>, swept by `out prune` once the checkout is gone; never inside the checkout, whose files the static checks read).
     #[arg(long)]
     out: Option<PathBuf>,
     /// DRM node gralloc allocates on (default: gralloc's own trial, the node the driver renders on).
@@ -31,13 +31,7 @@ pub struct Args {
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let out = match &args.out {
         Some(o) => o.clone(),
-        None => {
-            let checkout = root.file_name().context("checkout dir name")?;
-            atl_layout::Layout::of(root)?
-                .workspace()
-                .join("out/egl-driver")
-                .join(checkout)
-        }
+        None => xtask::out::family_dir(root, xtask::out::FAMILIES[1])?,
     };
     let probe = build_probe(root, &out.join("cargo"))?;
     let stage = |sub: &str, tier: Option<&str>, brk: Option<&str>| -> Result<PathBuf> {

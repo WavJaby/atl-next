@@ -59,6 +59,7 @@ pub mod none_gate;
 pub mod notice;
 pub mod out;
 pub mod out_prune;
+pub mod out_tasks;
 pub mod packages;
 pub mod par;
 pub mod patch;
