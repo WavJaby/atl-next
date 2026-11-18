@@ -37,7 +37,7 @@ pub struct Args {
     /// `xtask native --for instrument`.
     #[arg(long)]
     java_out: Option<PathBuf>,
-    /// Which test APKs to run: the hand-built fixture (two runs), the converter-built `libcore-sdk-current-test` (build it with the Java pipeline too; its `androidx.test` runner broadcasts a Bundle holding a binder and registers a receiver), or both.
+    /// Which test APKs to run: the hand-built fixture (two runs), the converter-built `libcore-sdk-current-test` (`xtask native --for instrument` builds it; its `androidx.test` runner broadcasts a Bundle holding a binder and registers a receiver), or both.
     #[arg(long, value_enum, default_value = "all")]
     case: CaseSet,
     /// Print every run's whole `am` output.
@@ -75,8 +75,8 @@ const LIMIT: Duration = Duration::from_secs(300);
 /// Lines of a log shown on failure.
 const TAIL: usize = 40;
 
-/// The converter-built test APK (bp2ninja app.go `android_test`): libcore's JUnit4 test of LinkedHashMap, run by androidx's AndroidJUnitRunner (libcore/luni/src/test/androidsdkcurrent).
-const CONVERTER_MODULE: &str = "libcore-sdk-current-test";
+/// The converter-built test APK (bp2ninja app.go `android_test`): libcore's JUnit4 test of LinkedHashMap, run by androidx's AndroidJUnitRunner (libcore/luni/src/test/androidsdkcurrent). A goal of this gate.
+const CONVERTER_MODULE: &str = crate::gate_goals::INSTRUMENT_CONVERTER_APK;
 const CONVERTER_RUNNER: &str = "androidx.test.runner.AndroidJUnitRunner";
 const CONVERTER_CLASS: &str = "libcore.sdkcurrent.java.util.LinkedHashMapTest";
 const CONVERTER_TEST: &str = "test_entryCompatibility_compiletime";

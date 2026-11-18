@@ -243,6 +243,7 @@ fn native_load() -> Goals {
         .with(Goals::codec_store())
 }
 
+/// What `am instrument` runs need (gate cts builds its rows' APKs itself).
 fn instrument() -> Goals {
     runtime().with(Goals::host(&[
         "am",
@@ -250,6 +251,13 @@ fn instrument() -> Goals {
         "android.test.base.impl",
         "android.test.mock.impl",
     ]))
+}
+
+/// The converter-built test APK the instrument gate runs beside its own fixture (xtask-harness instrument.rs, case `libcore`): an `android_test` of libcore, 79 ninja edges.
+pub const INSTRUMENT_CONVERTER_APK: &str = "libcore-sdk-current-test";
+
+fn instrument_gate() -> Goals {
+    instrument().with(Goals::host(&[INSTRUMENT_CONVERTER_APK]))
 }
 
 /// The NDK libraries with guest proxies (C3): the NativeBridge core loads their host side from SYSTEM_LIB (bindings.rs `Host::System`), atld_run places it there, and the `gl-proxies` step checks them beside the GL fronts.
@@ -317,7 +325,7 @@ pub const GATES: &[(&str, GoalsOf)] = &[
     ("installer", || {
         Goals::host(&HOST_ART).with(Goals::host(&[APK_SIGNER]))
     }),
-    ("instrument", instrument),
+    ("instrument", instrument_gate),
     ("native-load", native_load),
     ("nb-isa", || Goals::host(&HOST_ART)),
     ("parcel", || {
