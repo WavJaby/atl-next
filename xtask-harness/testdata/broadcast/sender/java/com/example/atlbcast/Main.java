@@ -8,7 +8,11 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.HandlerThread;
 import android.util.Log;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 /**
  * `xtask test broadcast` (xtask-harness/src/broadcast.rs reads the AtlBcast lines): a runtime receiver gets a broadcast of its own package; a sticky is stored, returned by registerReceiver(null, ..)
@@ -19,11 +23,15 @@ public class Main extends Activity {
     static final String PING = "com.example.atlbcast.PING";
     static final String STICKY = "com.example.atlbcast.STICKY";
     static final String EXPLICIT = "com.example.atlbcast.EXPLICIT";
+    /** The receiver app's answer, sent after its PING: the PING's skip is decided by then (both are its synchronous broadcastIntent calls, in order). */
+    static final String DONE = "com.example.atlbcast.DONE";
+    /** How long onCreate waits for DONE: under the gate's 180 s LIMIT; a cold start of the receiver app takes ~1 s. */
+    static final long DONE_WAIT_S = 60;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        // the application's context: the receivers outlive this window-less activity (an activity's own registrations are dropped as leaked when it finishes)
+        // the application's context: the receivers are the process's, not this activity's (an activity's own registrations are dropped as leaked when it finishes)
         Context app = getApplicationContext();
         app.registerReceiver(new BroadcastReceiver() {
             @Override
@@ -43,9 +51,26 @@ public class Main extends Activity {
             }
         }, new IntentFilter(STICKY), Context.RECEIVER_EXPORTED);
 
+        // DONE on a thread of its own: the main thread waits for it below
+        CountDownLatch done = new CountDownLatch(1);
+        HandlerThread doneThread = new HandlerThread("done");
+        doneThread.start();
+        app.registerReceiver(new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context c, Intent i) {
+                done.countDown();
+            }
+        }, new IntentFilter(DONE), null, new Handler(doneThread.getLooper()), Context.RECEIVER_EXPORTED);
+
         sendBroadcast(new Intent(EXPLICIT).setComponent(new ComponentName("com.example.atlbcastrecv", "com.example.atlbcastrecv.Recv")));
         Log.i(TAG, "onCreate done");
-        // Theme.NoDisplay requires it before onResume
+        // the not-exported receiver must still be registered when the PING comes: since 3be29e97 a finished last activity ends this process (window-close-esc plan, point 4), and Theme.NoDisplay
+        // needs finish() before onResume, so the wait is here
+        try {
+            Log.i(TAG, "done " + done.await(DONE_WAIT_S, TimeUnit.SECONDS));
+        } catch (InterruptedException e) {
+            Log.i(TAG, "done interrupted");
+        }
         finish();
     }
 }

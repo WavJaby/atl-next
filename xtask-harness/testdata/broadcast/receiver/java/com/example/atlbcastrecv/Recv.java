@@ -24,5 +24,7 @@ public class Recv extends BroadcastReceiver {
         }
         c.sendBroadcast(new Intent("com.example.atlbcast.PING"));
         Log.i(TAG, "foreign ping sent");
+        // the sender keeps its process (and the not-exported receiver) until this arrives
+        c.sendBroadcast(new Intent("com.example.atlbcast.DONE").setPackage("com.example.atlbcast"));
     }
 }
