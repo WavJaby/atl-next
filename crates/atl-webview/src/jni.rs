@@ -672,6 +672,14 @@ fn on_event(shared: &Shared, ev: WebEvent) {
                 bridge::log_origin(url)
             )
         }
+        // the engine's reason, else a failed main-frame load is indistinguishable from a finished one in the log (both end in page finished)
+        WebEvent::LoadFailed { uri, message, kind } => {
+            tracing::info!(
+                "webview[{}]: load failed {} {kind:?}: {message}",
+                shared.id.get(),
+                bridge::log_origin(uri)
+            )
+        }
         _ => {}
     }
     let provider = jni_call!(env, NewLocalRef, shared.provider.get() as Obj);
