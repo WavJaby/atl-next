@@ -3,6 +3,8 @@
 //! BinderDaemon: a measured allow-list, everything else kills ([`binderd_program`]; derivation in arch.rs).
 //! App: the first rule of the planned per-app filter (seccompiler 0.5); every other syscall is allowed, so this is not yet the allow-list.
 //! Installer: a measured allow-list like BinderDaemon's ([`arch::INSTALLER_SYSCALLS`]), socket only for AF_UNIX; anything else kills the process.
+//! Both allow-lists add newer.rs's rows (calls newer glibc / Rust std / kernels substitute), each answered Allow or ENOSYS per profile: a hand-written prefix returns ENOSYS before seccompiler's
+//! program runs (seccompiler 0.5 has one match action per filter). A kill is reported by [`death`]: the parent's error names SIGSYS and the audit record, and counts it per profile.
 //! App rule (thread priority, two capability tiers chosen by the host's RLIMIT_NICE hard limit H, [`granted_nice`]): the stub raises the soft limit to H ([`NiceTiers`]), so a nice the kernel then accepts from any
 //! current value (n >= 20 - H, kernel `can_nice`) reaches it and takes effect ("host-nice"); a lower one is answered 0 and changes nothing ("baseline"). getpriority keeps reporting the kernel's real value.
 //! Condition defended: Android grants every app RLIMIT_NICE 40/40 (init.rc `setrlimit nice 40 40`), so its apps never see setpriority fail on their own threads; Process.setThreadPriority turns EACCES into
@@ -11,9 +13,11 @@
 //! seccomp cannot count: the per-process evidence is the stub's `sandbox-stub: nice` line, the test below, and `xtask test app`'s priority row with and without `--no-app-seccomp`.
 
 mod arch;
+pub mod newer;
 
 use std::collections::BTreeMap;
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::Profile;
 
@@ -113,17 +117,59 @@ const DOMAIN_ARG: u8 = 0;
 /// binderd's filter: an allow-list ([`arch::BINDERD_SYSCALLS`], measured), socketpair only for AF_UNIX, anything else kills the process (SECCOMP_RET_KILL_PROCESS: the run then fails on "binderd ended", never on a half-working daemon).
 /// Covers bwrap's pid 1 in the sandbox too (it waits for binderd), since bwrap installs the filter before it forks it.
 fn binderd_program() -> io::Result<BpfProgram> {
-    allow_list(arch::BINDERD_SYSCALLS, &[libc::SYS_socketpair])
+    allow_list(
+        arch::BINDERD_SYSCALLS,
+        |r| r.binderd,
+        &[libc::SYS_socketpair],
+    )
 }
 
 /// The installer's filter: an allow-list ([`arch::INSTALLER_SYSCALLS`], measured the same way), socket only for AF_UNIX (its namespace has no network to reach anyway), anything else kills the process.
 fn installer_program() -> io::Result<BpfProgram> {
-    allow_list(arch::INSTALLER_SYSCALLS, &[libc::SYS_socket])
+    allow_list(
+        arch::INSTALLER_SYSCALLS,
+        |r| r.installer,
+        &[libc::SYS_socket],
+    )
 }
 
-/// An allow-list program: `calls` are allowed with any arguments, each of `unix_only` only when its domain is AF_UNIX, every other call kills the process.
-fn allow_list(calls: &[i64], unix_only: &[i64]) -> io::Result<BpfProgram> {
-    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = calls.iter().map(|&n| (n, vec![])).collect();
+/// Classic BPF opcodes (uapi bpf_common.h): BPF_LD (0) | BPF_W (0) | BPF_ABS (0x20); BPF_JMP (5) | BPF_JEQ (0x10) | BPF_K (0); BPF_RET (6) | BPF_K (0). And `struct seccomp_data`'s offsets of nr and arch.
+const BPF_LD_W_ABS: u16 = 0x20;
+const BPF_JEQ_K: u16 = 0x15;
+const BPF_RET_K: u16 = 0x06;
+const DATA_NR: u32 = 0;
+const DATA_ARCH: u32 = 4;
+
+/// Instructions that answer each of `calls` with ENOSYS and fall through for every other call: arch check first (another arch's numbers mean other calls; kill, as seccompiler's own check does).
+fn enosys_prefix(calls: &[i64]) -> io::Result<BpfProgram> {
+    let ins = |code, jt, jf, k| seccompiler::sock_filter { code, jt, jf, k };
+    let mut p = vec![
+        ins(BPF_LD_W_ABS, 0, 0, DATA_ARCH),
+        ins(BPF_JEQ_K, 1, 0, arch::AUDIT_ARCH),
+        ins(BPF_RET_K, 0, 0, libc::SECCOMP_RET_KILL_PROCESS),
+        ins(BPF_LD_W_ABS, 0, 0, DATA_NR),
+    ];
+    let enosys = libc::SECCOMP_RET_ERRNO | u32::try_from(libc::ENOSYS).map_err(io::Error::other)?;
+    for &call in calls {
+        let nr = u32::try_from(call).map_err(io::Error::other)?;
+        p.push(ins(BPF_JEQ_K, 0, 1, nr));
+        p.push(ins(BPF_RET_K, 0, 0, enosys));
+    }
+    Ok(p)
+}
+
+/// An allow-list program: `calls` and the newer.rs rows `answer` allows run with any arguments, each of `unix_only` only when its domain is AF_UNIX, the rows it answers ENOSYS get ENOSYS, every other call kills the process.
+fn allow_list(
+    calls: &[i64],
+    answer: fn(&newer::Row) -> newer::Answer,
+    unix_only: &[i64],
+) -> io::Result<BpfProgram> {
+    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = calls
+        .iter()
+        .copied()
+        .chain(newer::calls(answer, newer::Answer::Allow))
+        .map(|n| (n, vec![]))
+        .collect();
     for &call in unix_only {
         let unix = SeccompCondition::new(
             DOMAIN_ARG,
@@ -144,7 +190,48 @@ fn allow_list(calls: &[i64], unix_only: &[i64]) -> io::Result<BpfProgram> {
         arch::HOST,
     )
     .map_err(io::Error::other)?;
-    filter.try_into().map_err(io::Error::other)
+    let program: BpfProgram = filter.try_into().map_err(io::Error::other)?;
+    let mut p = enosys_prefix(&newer::calls(answer, newer::Answer::Enosys))?;
+    p.extend(program);
+    Ok(p)
+}
+
+/// bwrap ends with 128 + the signal when its child dies by one (observed: the installer's SIGSYS as exit 159); a process killed outside bwrap reports the signal itself.
+const SIGNAL_EXIT_BASE: i32 = 128;
+
+/// Seccomp kills per profile this process saw ([`death`]), indexed by [`profile_index`].
+static DEATHS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+fn profile_index(profile: Profile) -> usize {
+    match profile {
+        Profile::App => 0,
+        Profile::BinderDaemon => 1,
+        Profile::Installer => 2,
+        Profile::Adb => 3,
+        Profile::WebProcess => 4,
+    }
+}
+
+/// Whether `status` of a process sandboxed in `profile` is a seccomp kill (SIGSYS, directly or as bwrap's 128 + SIGSYS): then counts it and returns the line naming it and where the denied call is recorded.
+/// The filter's action is SECCOMP_RET_KILL_PROCESS, which the kernel logs by default (`/proc/sys/kernel/seccomp/actions_logged` holds kill_process) as an audit record naming the call; the parent cannot
+/// learn the number otherwise (the kill leaves no handler to run, and bwrap execs the program, so no handler of ours survives).
+pub fn death(profile: Profile, status: &std::process::ExitStatus) -> Option<String> {
+    use std::os::unix::process::ExitStatusExt;
+    let sys = status.signal() == Some(libc::SIGSYS)
+        || status.code() == Some(SIGNAL_EXIT_BASE + libc::SIGSYS);
+    if !sys {
+        return None;
+    }
+    let n = DEATHS[profile_index(profile)].fetch_add(1, Ordering::Relaxed) + 1;
+    Some(format!(
+        "seccomp: {profile:?} sandbox killed by its seccomp filter (SIGSYS, {status}; seccomp deaths {profile:?}={n}): the denied call is the kernel audit record \
+         `type=1326 ... sig=31 ... syscall=<nr>` for this program (`journalctl -k` or dmesg); allow-lists and their answers: atl-broker seccomp/arch.rs, seccomp/newer.rs"
+    ))
+}
+
+/// Seccomp kills counted for `profile` so far ([`death`]).
+pub fn deaths(profile: Profile) -> u64 {
+    DEATHS[profile_index(profile)].load(Ordering::Relaxed)
 }
 
 /// The app filter as seccompiler's program: setpriority below `tiers`' floor returns 0 (`SECCOMP_RET_ERRNO` with errno 0, the kernel's return value -0), every other call is allowed.

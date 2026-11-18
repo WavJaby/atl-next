@@ -39,8 +39,8 @@ use atl_android_paths::{
 };
 use atl_broker::control::{self, Request, Response, StagedName, StartRequest};
 use atl_broker::{
-    BinderPids, Broker, INSTALLER_UID, Link, Mount, Process, Spawn, gpu, kill_sandbox,
-    terminate_sandbox, to_log, tree_mounts,
+    BinderPids, Broker, INSTALLER_UID, Link, Mount, Process, Profile, Spawn, gpu, kill_sandbox,
+    seccomp_death, terminate_sandbox, to_log, tree_mounts,
 };
 use atl_gralloc::node::{self, NodeSource};
 use atl_gralloc::vintf;
@@ -861,8 +861,8 @@ impl Host {
             let stderr = std::fs::read_to_string(&log_path).unwrap_or_default();
             ensure!(
                 status.success(),
-                "session {session}: atl-installer exited {status}: {}",
-                stderr.trim()
+                "session {session}: {}",
+                installer_failure(&status, &stderr)
             );
             log(format_args!(
                 "install session {session}: installer {} ms",
@@ -963,8 +963,8 @@ impl Host {
         let stderr = std::fs::read_to_string(&log_path).unwrap_or_default();
         ensure!(
             status.success(),
-            "scan {dir}: atl-installer exited {status}: {}",
-            stderr.trim()
+            "scan {dir}: {}",
+            installer_failure(&status, &stderr)
         );
         log(format_args!(
             "scan {dir}: installer {} ms",
@@ -1837,6 +1837,14 @@ fn gralloc_node(log: &str) -> Option<String> {
         .find_map(|l| l.strip_prefix(GRALLOC_READY_LINE))?;
     let node = rest.trim().strip_prefix('(')?.strip_suffix(')')?;
     Some(node.to_owned())
+}
+
+/// The error text of a failed installer run: its exit, the seccomp line when the filter killed it (atl_broker::seccomp_death, which also counts it), its stderr.
+fn installer_failure(status: &std::process::ExitStatus, stderr: &str) -> String {
+    match seccomp_death(Profile::Installer, status) {
+        Some(sys) => format!("atl-installer exited {status}: {sys}\n{}", stderr.trim()),
+        None => format!("atl-installer exited {status}: {}", stderr.trim()),
+    }
 }
 
 /// Waits until `child`'s `log` holds `line`; fails when it exits first (naming its log, which says why) or after `limit`.

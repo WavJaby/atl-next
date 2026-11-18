@@ -15,7 +15,10 @@ pub mod control;
 pub mod gpu;
 mod seccomp;
 pub mod webspawn;
-pub use seccomp::{NiceTiers, granted_nice};
+pub use seccomp::{
+    NiceTiers, death as seccomp_death, deaths as seccomp_deaths, filter as seccomp_filter,
+    granted_nice, newer as seccomp_newer,
+};
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};

@@ -19,6 +19,11 @@ use seccompiler::TargetArch;
 pub const HOST: TargetArch = TargetArch::x86_64;
 #[cfg(target_arch = "riscv64")]
 pub const HOST: TargetArch = TargetArch::riscv64;
+/// HOST's `seccomp_data.arch` (uapi audit.h: EM_* | __AUDIT_ARCH_64BIT 0x8000_0000 | __AUDIT_ARCH_LE 0x4000_0000; EM_X86_64 62, EM_RISCV 243), for the hand-written ENOSYS prefix (seccomp.rs).
+#[cfg(target_arch = "x86_64")]
+pub const AUDIT_ARCH: u32 = 62 | 0x8000_0000 | 0x4000_0000;
+#[cfg(target_arch = "riscv64")]
+pub const AUDIT_ARCH: u32 = 243 | 0x8000_0000 | 0x4000_0000;
 #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
 compile_error!(
     "atl-broker's seccomp allow-lists exist for x86_64 (measured) and riscv64 (derived) only: measure this arch (BINDERD_SYSCALLS derivation) before building the broker here"
@@ -55,8 +60,7 @@ pub const BINDERD_SYSCALLS: &[i64] = &[
     #[cfg(target_arch = "x86_64")]
     libc::SYS_arch_prctl,
     libc::SYS_set_tid_address,
-    libc::SYS_set_robust_list,
-    libc::SYS_rseq,
+    // set_robust_list, rseq (measured here): newer.rs rows, with their answer per profile
     libc::SYS_prlimit64,
     libc::SYS_getrandom,
     libc::SYS_rt_sigaction,
@@ -81,7 +85,7 @@ const SYS_RISCV_FLUSH_ICACHE: i64 = 244 + 15;
 /// 3. The sandbox's own start-up (bwrap's pid 1 and atl-sandbox-stub run under this filter too): execve (59), wait4 (61), the Landlock calls (444-446), from binderd's measured list.
 /// 4. Kill-mode app-gate run after the install path gained certificate collection (ParsingPackageUtils.getSigningDetails -> ApkSignatureVerifier.verify): getsockopt (55), named by dmesg `type=1326`.
 ///
-/// The list gives 68 numbers. socket(2) is absent from it: seccomp.rs allows it for AF_UNIX only. setpriority(2) is measured (ART's thread priorities); no EACCES from it reached the gate's stderr.
+/// The measurement gave 68 numbers; four of them (clone3, set_robust_list, rseq, membarrier) are newer.rs rows, which add statx and faccessat2 as Allow. socket(2) is absent from it: seccomp.rs allows it for AF_UNIX only. setpriority(2) is measured (ART's thread priorities); no EACCES from it reached the gate's stderr.
 ///
 /// Final evidence: the installer gate green in kill mode with 0 denials in dmesg on three runs. Re-measure after installer, ART or glibc start-up code changes: a new call ends the run with SIGSYS, and dmesg names it.
 pub const INSTALLER_SYSCALLS: &[i64] = &[
@@ -95,9 +99,7 @@ pub const INSTALLER_SYSCALLS: &[i64] = &[
     libc::SYS_close,
     libc::SYS_fstat,
     libc::SYS_newfstatat,
-    // riscv64 measured (sifive, Ubuntu glibc 2.39, kernel kill + strace 2026-11-15): atl-installer's first call after exec is statx(openat("/", O_PATH), ".", TYPE|INO|MNT_ID)
-    #[cfg(target_arch = "riscv64")]
-    libc::SYS_statx,
+    // statx (riscv64 measured 2026-11-15: the first call after exec, statx(openat("/", O_PATH), ".", TYPE|INO|MNT_ID); x86_64 laptop 2026-11-18): a newer.rs row
     libc::SYS_lseek,
     libc::SYS_pread64,
     #[cfg(target_arch = "x86_64")]
@@ -150,15 +152,12 @@ pub const INSTALLER_SYSCALLS: &[i64] = &[
     libc::SYS_memfd_create,
     libc::SYS_userfaultfd,
     // threads, signals, ids, priority
-    libc::SYS_clone3,
+    // clone3, set_robust_list, rseq, membarrier (measured here): newer.rs rows
     libc::SYS_futex,
     libc::SYS_sched_yield,
     libc::SYS_sched_getaffinity,
     libc::SYS_setpriority,
     libc::SYS_set_tid_address,
-    libc::SYS_set_robust_list,
-    libc::SYS_rseq,
-    libc::SYS_membarrier,
     // riscv64 measured (sifive 2026-11-15, the run after statx): ART's code writes flush the icache by syscall; x86 icache is coherent, no counterpart
     #[cfg(target_arch = "riscv64")]
     SYS_RISCV_FLUSH_ICACHE,
