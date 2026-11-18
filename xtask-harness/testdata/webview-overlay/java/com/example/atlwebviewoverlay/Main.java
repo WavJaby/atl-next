@@ -144,6 +144,38 @@ public class Main extends Activity {
         web = w;
         Log.i(TAG, "wvo web added");
         addPreload();
+        addSoftwareLayer();
+    }
+
+    /** The software-layer WebView's place in its holder: a corner, clear of the centre the gate clicks; px. */
+    static final int SW_LEFT = 40, SW_TOP = 40, SW_WIDTH = 160, SW_HEIGHT = 120;
+
+    /**
+     * A WebView under an ancestor with a software layer, as Angry Birds 2's account panel (Rovio AdsWebView, layer type software): AOSP draws the whole subtree into the layer's bitmap, so the
+     * page must still show where the WebView is. Logs `wvo swlayer web=<l,t,r,b>` (window coordinates) at each layout change.
+     */
+    private void addSoftwareLayer() {
+        FrameLayout holder = new FrameLayout(this);
+        holder.setLayerType(View.LAYER_TYPE_SOFTWARE, null);
+        addContentView(holder, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        WebView sw = new WebView(this);
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(SW_WIDTH, SW_HEIGHT);
+        lp.leftMargin = SW_LEFT;
+        lp.topMargin = SW_TOP;
+        sw.loadData("<html><body style=\"background:#3060c0\">sw</body></html>", "text/html", null);
+        sw.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
+            private String last = "";
+
+            @Override
+            public void onLayoutChange(View v, int l, int t, int r, int b, int ol, int ot, int or, int ob) {
+                String line = "wvo swlayer web=" + rect(v);
+                if (!line.equals(last)) {
+                    last = line;
+                    Log.i(TAG, line);
+                }
+            }
+        });
+        holder.addView(sw, lp);
     }
 
     /**

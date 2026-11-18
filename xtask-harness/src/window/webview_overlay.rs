@@ -6,7 +6,7 @@
 //! does: a provider View among the children would be the one removed, taking the page off the screen), resize (after a configure, the WebView's last placement is the window: sideband dst == the fixture's window size), page-tap (a click on the
 //! page's button reaches the page: title tap1), then three Escs (AOSP BACK semantics through the Esc -> Back adaptation; `--esc-back`): esc-page-back (WebView.canGoBack -> goBack),
 //! esc-dismiss (no history left -> the SDK's onBackPressed removes the WebView), esc-game (the WebView gone -> the activity's back). Android focus stays on the GL view throughout (the click does
-//! not move it), so each Esc goes there first and BACK is its fallback. hidden-preload: a second WebView loaded under an INVISIBLE parent (Angry Birds 2's survey SDK) is never placed and takes no click. Without `--esc-back` (AOSP's map: Esc has no fallback) the Escs reach the GL view as KEYCODE_ESCAPE and no back follows.
+//! not move it), so each Esc goes there first and BACK is its fallback. hidden-preload: a second WebView loaded under an INVISIBLE parent (Angry Birds 2's survey SDK) is never placed and takes no click. software-layer: a third WebView under a software-layer ancestor (Angry Birds 2's account panel) is placed at its View's rectangle. Without `--esc-back` (AOSP's map: Esc has no fallback) the Escs reach the GL view as KEYCODE_ESCAPE and no back follows.
 
 use std::path::Path;
 use std::time::Duration;
@@ -32,6 +32,8 @@ const WEB_CHILDREN: &str = "AtlWindow: wvo web children ";
 /// Main.java's hidden preload (addPreload): its load, and the title its page sets on a click.
 const PRELOAD_LOADED: &str = "AtlWindow: wvo preload finished";
 const PRELOAD_TAP: &str = "AtlWindow: wvo preload title ptap";
+/// Main.java's software-layer WebView (addSoftwareLayer): its rectangle `l,t,r,b` in the window.
+const SOFTWARE_LAYER: &str = "AtlWindow: wvo swlayer web=";
 /// The platform's placement line of a sideband widget (atl-platform-ui-linux view.rs): `dst=l,t,r,b` in physical pixels.
 const PLACED: &str = "atl-platform-ui: sideband ";
 /// input-event-codes.h KEY_ESC.
@@ -69,16 +71,65 @@ fn last_placed(app: &str) -> Option<[i64; 4]> {
     v.try_into().ok()
 }
 
-/// Sub-gate hidden-preload: the WebView under an INVISIBLE parent loaded but was never placed (one sideband stream placed: the visible WebView's) and its page got no click
-/// (AOSP: its SurfaceView layer is created hidden and shown only when drawn; the click goes to the visible page).
+/// Every sideband placement: stream, `dst`.
+fn placements(app: &str) -> Vec<(&str, [i64; 4])> {
+    app.lines()
+        .filter(|l| l.contains(PLACED) && l.contains(" placed dst="))
+        .filter_map(|l| {
+            let stream = l.split(PLACED).nth(1)?.split(" placed").next()?;
+            let v: Vec<i64> = word(l, "dst")?
+                .split(',')
+                .filter_map(|n| n.parse().ok())
+                .collect();
+            Some((stream, v.try_into().ok()?))
+        })
+        .collect()
+}
+
+/// The software-layer WebView's last rectangle the fixture logged (window coordinates).
+fn software_rect(app: &str) -> Option<[i64; 4]> {
+    let v: Vec<i64> = app
+        .lines()
+        .rev()
+        .find_map(|l| l.split(SOFTWARE_LAYER).nth(1))?
+        .trim()
+        .split(',')
+        .filter_map(|n| n.parse().ok())
+        .collect();
+    v.try_into().ok()
+}
+
+/// Sub-gate software-layer: the WebView under a software-layer ancestor (Angry Birds 2's account panel) is placed where the View is: some stream's placement `dst` is the fixture's rectangle.
+/// AOSP: its page shows at the View's place; on ATL nothing places the carrier's layer unless the provider does (RenderThread never sees a RenderNode under a software layer).
+fn software_layer_check(app: &str) -> Result<String, String> {
+    let rect = software_rect(app).ok_or(format!("no `{SOFTWARE_LAYER}` line"))?;
+    match placements(app).into_iter().find(|(_, dst)| *dst == rect) {
+        Some((stream, _)) => Ok(format!(
+            "stream {stream} placed at the View's rectangle {rect:?}"
+        )),
+        None => Err(format!(
+            "no sideband placement at the View's rectangle {rect:?}: the carrier under a software layer was not placed"
+        )),
+    }
+}
+
+/// Sub-gate hidden-preload: the WebView under an INVISIBLE parent loaded but was never placed (one full-window sideband stream placed: the visible WebView's; the software-layer one is told apart by
+/// its rectangle) and its page got no click (AOSP: its SurfaceView layer is created hidden and shown only when drawn; the click goes to the visible page).
 fn preload_check(app: &str) -> Result<String, String> {
     if !app.contains(PRELOAD_LOADED) {
         return Err(format!("no `{PRELOAD_LOADED}` line"));
     }
-    let mut streams: Vec<&str> = app
-        .lines()
-        .filter(|l| l.contains(PLACED) && l.contains(" placed dst="))
-        .filter_map(|l| l.split(PLACED).nth(1)?.split(" placed").next())
+    let all = placements(app);
+    let sw = software_rect(app);
+    let software: Vec<&str> = all
+        .iter()
+        .filter(|(_, dst)| Some(*dst) == sw)
+        .map(|(s, _)| *s)
+        .collect();
+    let mut streams: Vec<&str> = all
+        .iter()
+        .map(|(s, _)| *s)
+        .filter(|s| !software.contains(s))
         .collect();
     streams.sort_unstable();
     streams.dedup();
@@ -170,6 +221,7 @@ pub fn checks(app: &str, esc_back: bool) -> Vec<Sub> {
         ("esc-dismiss", dismiss),
         ("esc-game", game),
         ("hidden-preload", preload_check(app)),
+        ("software-layer", software_layer_check(app)),
     ]
 }
 
@@ -288,8 +340,16 @@ mod tests {
         let ok = "x AtlWindow: wvo web children 1\nx AtlWindow: wvo page finished\nx AtlWindow: wvo layout window=720x520 web=0,0,720,520\n\
                   y atl-platform-ui: sideband [1, 5] placed dst=0,0,720,520 clip=0,0,720,520 alpha=1\n\
                   x AtlWindow: wvo title viewport360x260\nx AtlWindow: wvo title tap1\nx AtlWindow: wvo title scrolled\nx AtlWindow: wvo back page\nx AtlWindow: wvo back dismissed\nx AtlWindow: wvo back game\n\
-                  x AtlWindow: wvo preload finished\n";
+                  x AtlWindow: wvo preload finished\nx AtlWindow: wvo swlayer web=40,40,200,160\n\
+                  y atl-platform-ui: sideband [1, 7] placed dst=40,40,200,160 clip=40,40,200,160 alpha=1\n";
         assert!(checks(ok, true).iter().all(|(_, r)| r.is_ok()));
+        // the Angry Birds 2 account panel: the software-layer WebView's carrier never placed, or left at the layer's origin
+        let unplaced = ok.replace(
+            "[1, 7] placed dst=40,40,200,160",
+            "[1, 7] placed dst=0,0,160,120",
+        );
+        assert!(software_layer_check(&unplaced).is_err());
+        assert!(software_layer_check(&ok.replace("wvo swlayer", "wvo other")).is_err());
         // the Angry Birds 2 case: the hidden preload's layer shown (a second stream placed) and taking the click
         let shown = ok.replace(
             "x AtlWindow: wvo preload finished\n",
