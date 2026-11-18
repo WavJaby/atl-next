@@ -32,8 +32,10 @@ pub const ROTATED_TRANSFORM: i32 = 2;
 const RELAUNCH_WAIT: Duration = Duration::from_secs(60);
 /// The fixture's density line (Main.java logDensity): `AtlWindow: density <created|changed> config=N metrics=N`.
 const DENSITY_LINE: &str = "AtlWindow: density ";
-/// The services' display line (registry_service.rs set_display): `services: display WxH@hz,dpi from uid U`.
+/// The services' display line (registry_service.rs set_display): `services: display WxH@hz,dpi from uid U`, ending [`UNCHANGED`] when the report equalled the display.
 const DISPLAY_LINE: &str = "services: display ";
+/// The suffix of a display report that changed nothing.
+const UNCHANGED: &str = " unchanged";
 /// Main.java's last frame callback line prefix (FRAME_CALLBACKS = 31): each instance's resume runs the whole series.
 const LAST_FRAME: &str = "AtlWindow: frame 31 ";
 
@@ -103,12 +105,23 @@ pub fn checks(
     ]
 }
 
-/// The displays the services took, in order.
+/// The displays the services took, in order: the reports that changed the display.
 fn displays(services: &str) -> Vec<DisplayModel> {
+    display_reports(services)
+        .into_iter()
+        .filter_map(|(d, changed)| changed.then_some(d))
+        .collect()
+}
+
+/// Every display report of the app's window, in order: the display and whether it changed the services' one.
+pub(super) fn display_reports(services: &str) -> Vec<(DisplayModel, bool)> {
     services
         .lines()
-        .filter_map(|l| l.strip_prefix(DISPLAY_LINE))
-        .filter_map(|rest| DisplayModel::parse_arg(rest.split_whitespace().next()?).ok())
+        .filter_map(|l| {
+            let rest = l.strip_prefix(DISPLAY_LINE)?;
+            let d = DisplayModel::parse_arg(rest.split_whitespace().next()?).ok()?;
+            Some((d, !l.ends_with(UNCHANGED)))
+        })
         .collect()
 }
 

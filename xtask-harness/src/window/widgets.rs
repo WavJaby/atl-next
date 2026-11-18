@@ -521,6 +521,29 @@ fn swipe_check(app: &str) -> Result<String, String> {
     ))
 }
 
+/// The app's first configuration was already its window's monitor: the window reported its monitor (registry SET_DISPLAY) and every report equalled the display the run started with (`display`, atld
+/// `--display`). A changed report means the first layout ran at the start display's density and the activity ran again at the monitor's; AOSP's configuration is final before the first traversal.
+fn display_check(services: &str, display: DisplayModel) -> Result<String, String> {
+    let reports = super::move_output::display_reports(services);
+    if let Some((d, _)) = reports.iter().find(|(_, changed)| *changed) {
+        return Err(format!(
+            "the window's monitor {} replaced the start display {}: the first layout ran at {} dpi",
+            d.to_arg(),
+            display.to_arg(),
+            display.dpi
+        ));
+    }
+    if reports.is_empty() {
+        return Err(
+            "the window never reported its monitor (no `services: display` line)".to_owned(),
+        );
+    }
+    Ok(format!(
+        "the window's monitor is the start display {}",
+        display.to_arg()
+    ))
+}
+
 fn layout_check(app: &str) -> Result<String, String> {
     let density: f32 = number(field(app, "AtlWindow: density=", "density"), "density")?;
     let size = field(app, "AtlWindow: software frame", "size")
@@ -822,10 +845,11 @@ fn presents_check(app: &str) -> Result<String, String> {
     Ok(format!("{n} scenes presented; mean interval {mean}"))
 }
 
-/// The widgets stage's sub-gates, in print order, from the probe's result, the app log and the frame callbacks after the marker; `esc_back`: the run had atld `--esc-back true`; `rate`: what the display's rate promises the cadence.
+/// The widgets stage's sub-gates, in print order, from the probe's result, the app and services logs and the frame callbacks after the marker; `esc_back`: the run had atld `--esc-back true`; `rate`: what the display's rate promises the cadence.
 #[allow(clippy::too_many_arguments)]
 pub fn checks(
     app: &str,
+    services: &str,
     after: &[&str],
     probe: &Result<Liveness, String>,
     display: DisplayModel,
@@ -843,6 +867,7 @@ pub fn checks(
                 .map(|_| "every injection got its answer".to_owned())
                 .map_err(Clone::clone),
         ),
+        ("display", display_check(services, display)),
         ("layout", layout_check(app)),
         ("text", text_check(pictures, app)),
         ("header", header_check(app)),
@@ -1288,6 +1313,20 @@ pub fn mouse_touch_checks(app: &str, probe: &Result<Liveness, String>) -> Vec<Su
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The laptop run's services lines (2880x1800 at scale 1.6, 120 Hz; the run started at the gates' fixed 1280x800 at 160 dpi): the window's report changed the display, so `display` fails; the same
+    /// report equal to the start display passes; no report at all fails (the probe never answered).
+    #[test]
+    fn display_check_wants_the_monitor_as_the_start_display() {
+        let fixed = DisplayModel::parse_arg("1280x800@120,160,0").expect("parse");
+        let monitor = DisplayModel::parse_arg("2880x1800@120,256,0").expect("parse");
+        let changed = "services: display 2880x1800@120,256,0 from uid 10002\nservices: display change told 0 display callbacks, 2 processes\n";
+        let e = display_check(changed, fixed).expect_err("a changed display");
+        assert!(e.contains("2880x1800@120,256,0"), "{e}");
+        let unchanged = "services: display 2880x1800@120,256,0 from uid 10002 unchanged\n";
+        assert!(display_check(unchanged, monitor).is_ok());
+        assert!(display_check("services: window relayout x\n", monitor).is_err());
+    }
 
     /// A log with one line before the idle window, the window's text, then the resume tap's lines.
     fn idle_log(window: &str) -> (String, Idle) {

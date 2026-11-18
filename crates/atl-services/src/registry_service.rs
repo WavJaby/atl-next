@@ -351,6 +351,11 @@ impl ICompositorRegistry for Registry {
         })?;
         let tasks = self.tasks.set_display(model);
         if tasks.is_empty() {
+            // logged too: a window gate tells "the window's monitor was the start display" from "no report reached the services"
+            let _ = writeln!(
+                std::io::stderr(),
+                "services: display {display} from uid {caller_uid} unchanged"
+            );
             return Ok(());
         }
         let _ = writeln!(

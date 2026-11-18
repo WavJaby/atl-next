@@ -2561,6 +2561,7 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
         }
         (Stage::Widgets, Some(_)) => widgets::checks(
             &app,
+            &services,
             &after_marker(&app, marker),
             &liveness,
             display,
@@ -2885,13 +2886,22 @@ pub fn agent(a: &AgentArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Hidden `display-probe`: this host's first monitor as atld's `--display` value ([`run_display`]), on the line remote.rs `Target::display_model` reads.
+/// Hidden `display-probe`: this host's first monitor as atld's `--display` value, on the line remote.rs `Target::display_model` reads. The monitor's own model (DisplayModel::from_monitor: size, rate,
+/// density 160 x scale), as atld takes it without `--display` (atld main.rs `host_display`) and as the app's window reports it on entry (atl-composer ui_window.rs `on_monitor`, registry SET_DISPLAY).
+/// Never the gates' fixed display ([`run_display`]): the window opens on this monitor, so a fixed value would be the app's first configuration only until the window's report replaced it -- the first
+/// layout at the fixed density, then a relaunch at the monitor's (measured on a scale-1.6 laptop: label left=16, then 26). No desktop or no monitor: an error, no default.
 pub fn display_probe() -> Result<ExitCode> {
-    println!(
-        "{}{}",
-        crate::remote::DISPLAY_PROBE_LINE,
-        run_display().to_arg()
+    let m = atl_platform_host::first_monitor()
+        .map_err(|e| anyhow::anyhow!("display-probe: {}", e.0))?
+        .context("display-probe: the desktop lists no monitor")?;
+    let model = DisplayModel::from_monitor(
+        m.size.width,
+        m.size.height,
+        m.refresh_hz,
+        m.scale.get(),
+        m.rotation.quarter_turns(),
     );
+    println!("{}{}", crate::remote::DISPLAY_PROBE_LINE, model.to_arg());
     Ok(ExitCode::SUCCESS)
 }
 
