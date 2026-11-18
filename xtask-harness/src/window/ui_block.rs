@@ -32,6 +32,8 @@ const IN_FLIGHT: u64 = 3;
 /// Frame-clock ticks (takes) one idle gap shorter than two periods can hold: the one for the frame callback that arrived during the busy part, at the gap's start, and the next output frame's.
 /// One per gap was measured too tight: 90 posts against 74 cycles (the Looper's 10 ms delay runs late under load, and a gap past one period fits a second callback).
 const TAKES_PER_GAP: u64 = 2;
+/// The slow phase's idle part, ms (Main.java slow: busy 40 / idle 10): the gap [`takes_per_gap`] counts grid points in.
+const IDLE_GAP_MS: f64 = 10.0;
 /// Frames the composer may replace in the slow phase: none while the window takes within the bound; two allow for a take that host load delayed past it.
 const REPLACED_SLACK: u64 = 2;
 /// Warm-up (60 frames, 1 s at 60 Hz) + slow phase 4 s + block 2 s + tail 1 s, with room for a slow start.
@@ -89,17 +91,24 @@ fn posts_check(app: &str, refresh_hz: f32) -> Result<String, String> {
     }
 }
 
+/// Frame-clock ticks (takes) one idle gap can hold on a display of period `period_ms`: the callback that arrived during the busy part, at the gap's start, plus the output frames inside the gap
+/// (ceil([`IDLE_GAP_MS`] / period)). 60 Hz: 1 + 1 = 2, the measured [`TAKES_PER_GAP`]; 120 Hz (the laptop, 2026-11-18): 1 + 2 = 3 (173 posts in 80 cycles measured, over 2 x 81 + 3).
+fn takes_per_gap(period_ms: f64) -> u64 {
+    (TAKES_PER_GAP - 1) + (IDLE_GAP_MS / period_ms).ceil() as u64
+}
+
 /// The producer is held to the window's takes in the slow phase.
-fn held_check(app: &str) -> Result<String, String> {
+fn held_check(app: &str, refresh_hz: f32) -> Result<String, String> {
     let line = result_line(app)?;
     let (posts, cycles, ms) = (
         number(line, "slow_posts")?,
         number(line, "slow_cycles")?,
         number(line, "slow_ms")?,
     );
-    let most = TAKES_PER_GAP * (cycles + 1) + IN_FLIGHT;
+    let takes = takes_per_gap(period_ms(refresh_hz));
+    let most = takes * (cycles + 1) + IN_FLIGHT;
     let summary = format!(
-        "{posts} frames posted in the {ms} ms slow phase, {cycles} busy cycles (want <= {most}: {TAKES_PER_GAP} takes per idle gap)"
+        "{posts} frames posted in the {ms} ms slow phase, {cycles} busy cycles (want <= {most}: {takes} takes per idle gap at {refresh_hz} Hz)"
     );
     if posts <= most {
         Ok(summary)
@@ -166,7 +175,7 @@ fn timeouts_check(app: &str) -> Result<String, String> {
 /// The sub-gates; `refresh_hz`: the run's display (the block's grid).
 pub fn checks(app: &str, refresh_hz: f32) -> Vec<Sub> {
     vec![
-        ("held", held_check(app)),
+        ("held", held_check(app, refresh_hz)),
         ("replaced", replaced_check(app)),
         ("posts", posts_check(app, refresh_hz)),
         ("timeouts", timeouts_check(app)),
@@ -216,8 +225,11 @@ mod tests {
     /// 80 busy cycles: at most 2 x 81 = 162 takes, plus 3 queued slots = 165 posts pass, 166 fail.
     #[test]
     fn held_to_the_takes() {
-        assert!(held_check(&result(0, 165)).is_ok());
-        assert!(held_check(&result(0, 166)).is_err());
+        assert!(held_check(&result(0, 165), 60.0).is_ok());
+        assert!(held_check(&result(0, 166), 60.0).is_err());
+        // 120 Hz: the 10 ms gap spans two grid points, 3 takes: 3 x 81 + 3 = 246
+        assert!(held_check(&result(0, 246), 120.0).is_ok());
+        assert!(held_check(&result(0, 247), 120.0).is_err());
     }
 
     /// Two counters lines inside the phase: their scenes_dropped delta is judged; lines outside the phase do not count, and one line alone is no interval.
