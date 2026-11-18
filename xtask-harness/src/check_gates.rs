@@ -133,7 +133,10 @@ fn verdict_line<'a>(text: &'a str, cmd: &str) -> Option<&'a str> {
     named().find(|l| l.contains("FAILED")).or_else(|| {
         named().rev().find(|l| {
             let rest = &l[prefix.len()..];
-            rest.starts_with("ok") || rest.starts_with("pass") || rest.starts_with("all checks")
+            // `PASS`: signing and task-bind print one per check, no summary line
+            ["ok", "pass", "PASS", "all checks"]
+                .iter()
+                .any(|p| rest.starts_with(p))
         })
     })
 }
@@ -157,6 +160,11 @@ mod tests {
             Some("composer: FAILED: quads readable; first error")
         );
         assert_eq!(verdict_line("other: ok\n", "composer"), None);
+        let signing = "signing: PASS framework-res: platform role\nsigning: PASS AtlSigningFixture: testkey role\n";
+        assert_eq!(
+            verdict_line(signing, "signing"),
+            Some("signing: PASS AtlSigningFixture: testkey role")
+        );
     }
 
     /// Every row is a command line `xtask test` accepts, as `run` builds it: a renamed gate, stage or flag, or a host/out the gate does not take, fails here rather than in a check run.
