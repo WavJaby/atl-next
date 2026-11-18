@@ -55,7 +55,8 @@ impl<T: ?Sized> Slot<T> {
 /// State shared between the window handle and the toolkit's signal closures.
 struct Shared {
     on_tick: Slot<dyn FnMut(FrameTick)>,
-    frame_requested: Cell<bool>,
+    /// When the pending frame request was made (CLOCK_MONOTONIC ns); None: no request pending.
+    frame_requested: Cell<Option<i64>>,
     on_event: Slot<dyn FnMut(InputEvent)>,
     on_resize: Slot<dyn FnMut(PhysSize)>,
     on_monitor: Slot<dyn FnMut(Monitor)>,
@@ -171,7 +172,9 @@ impl Shared {
 
     /// One requested tick at `time_us`: the request is spent and the callback runs. No request, no tick: the clock is on demand.
     fn tick(&self, time_us: i64) {
-        self.frame_requested.set(false);
+        if let Some(at) = self.frame_requested.take() {
+            self.stats.borrow_mut().requested(monotonic_ns() - at);
+        }
         let time_ns = u64::try_from(time_us * NS_PER_US).unwrap_or(0);
         self.on_tick.call(|f| f(FrameTick { time_ns }));
     }
@@ -232,12 +235,12 @@ impl GtkWindow {
                     on_paint
                         .stats
                         .borrow_mut()
-                        .painted(now - start, snapshot, stale);
+                        .painted(now, now - start, snapshot, stale);
                 }
             });
             let on_update = Rc::clone(&shared);
             clock.connect_update(move |clock| {
-                if on_update.frame_requested.get() {
+                if on_update.frame_requested.get().is_some() {
                     on_update.tick(clock.frame_time());
                 }
             });
@@ -250,7 +253,7 @@ impl GtkWindow {
                 on_after_paint.stats.borrow_mut().cycle_done(now, after);
             });
             // a frame asked for before the window had a clock
-            if shared.frame_requested.get() {
+            if shared.frame_requested.get().is_some() {
                 clock.request_phase(gdk::FrameClockPhase::UPDATE);
             }
         });
@@ -557,7 +560,7 @@ impl Window for GtkWindow {
         }
         let shared = Rc::new(Shared {
             on_tick: Slot::new(),
-            frame_requested: Cell::new(false),
+            frame_requested: Cell::new(None),
             on_event: Slot::new(),
             on_resize: Slot::new(),
             pointer_at: Cell::new((0.0, 0.0)),
@@ -891,10 +894,11 @@ fn report_monitor(shared: &Shared, m: &gdk::Monitor) {
 /// One requested tick of `window`: GDK runs the frame clock's update phase, which the compositor's frame callback paces once a frame was committed. The composer's clock does not wait for it:
 /// a tick is requested only when a published scene asks for one (`FrameRequester`).
 fn request_frame(window: &gtk4::Window, shared: &Rc<Shared>) {
-    if shared.frame_requested.replace(true) {
+    if shared.frame_requested.get().is_some() {
         // one tick is already on its way: a second request is the same tick (Choreographer.scheduleVsyncLocked asks once per frame)
         return;
     }
+    shared.frame_requested.set(Some(monotonic_ns()));
     if let Some(clock) = window.frame_clock() {
         clock.request_phase(gdk::FrameClockPhase::UPDATE);
     }
