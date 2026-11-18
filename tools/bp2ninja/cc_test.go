@@ -107,6 +107,31 @@ cc_library {
 	}
 }
 
+// The native bridge guest's arch block takes its variant sub-block as the device's does (android/arch.go archPropertiesValues per target): bionic libm's arm `armv7_a_neon` srcs carry ceil/floor/rint/trunc, which libm.arm.map exports.
+func TestFlattenNativeBridgeVariant(t *testing.T) {
+	g := graphForCfg(t, Config{Arch: "x86_64", PointerBits: 64, NativeBridge: "arm", NativeBridgeBits: 32}, map[string]string{"p/Android.bp": `
+cc_library {
+    name: "libm",
+    native_bridge_supported: true,
+    srcs: ["base.c"],
+    arch: { arm: { srcs: ["fenv-arm.c"], armv7_a_neon: { srcs: ["s_ceil.c"] } } },
+}
+`})
+	nb := NativeBridge("arm")
+	for _, c := range []struct {
+		variant string
+		want    []string
+	}{
+		{"armv7-a-neon", []string{"base.c", "fenv-arm.c", "s_ceil.c"}},
+		{"armv7-a", []string{"base.c", "fenv-arm.c"}},
+	} {
+		g.cfg.NativeBridgeArchVariant = c.variant
+		if got := g.flatten(g.lookup("libm", nb), nb, Shared).strs("srcs"); !slices.Equal(got, c.want) {
+			t.Errorf("%s: srcs %q, want %q", c.variant, got, c.want)
+		}
+	}
+}
+
 // export_shared_lib_headers names a dependency as shared_libs does, variant tag included (ART libart-runtime_deps: `libdexfile#impl` in both): its exports reach dependents.
 func TestReexportTaggedSharedLib(t *testing.T) {
 	g := graphFor(t, map[string]string{"p/Android.bp": `

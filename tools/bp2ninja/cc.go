@@ -439,12 +439,10 @@ func (g *Graph) flatten(m *Module, side Side, kind Kind) *Obj {
 	if a := p.obj("arch"); a != nil {
 		if o := a.obj(arch); o != nil {
 			base = merge(base, o)
-			// variant and feature sub-blocks: only the device toolchain has a variant and features
-			if side == Device {
-				for _, b := range g.soong.Device.blocks() {
-					if s := o.obj(b); s != nil {
-						base = merge(base, s)
-					}
+			// variant and feature sub-blocks of the side's android.Arch (soongArches): libm's arm `armv7_a_neon` srcs reach the guest too
+			for _, b := range g.archBlocks(side) {
+				if s := o.obj(b); s != nil {
+					base = merge(base, s)
 				}
 			}
 		}

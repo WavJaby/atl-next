@@ -116,6 +116,17 @@ func (d DeviceArch) blocks() []string {
 	return append(out, d.Features...)
 }
 
+// archBlocks: the arch sub-blocks of one side, from the same per-side android.Arch soongArches builds: device = its variant and features, native bridge guest = its row's variant (features: soongArches' known gap), host = none.
+func (g *Graph) archBlocks(side Side) []string {
+	switch {
+	case side == Device:
+		return g.soong.Device.blocks()
+	case side.kind == nativeBridgeSide:
+		return DeviceArch{Variant: g.cfg.NativeBridgeArchVariant}.blocks()
+	}
+	return nil
+}
+
 // readDeviceArch: DeviceArch for cfg from the pinned Soong. An unknown variant fails in readGlobalFlags, where Soong's toolchain factory panics.
 func readDeviceArch(tree string, cfg Config) (DeviceArch, error) {
 	d := DeviceArch{Variant: cfg.ArchVariant}
