@@ -705,7 +705,7 @@ fn remove_session(tree: &Path, session: &Session) -> Result<()> {
 }
 
 /// Apparent bytes under `paths`, each inode once: an uplifted link and its deps file are one copy on disk.
-pub(crate) fn unique_bytes(paths: &[PathBuf]) -> Result<u64> {
+fn unique_bytes(paths: &[PathBuf]) -> Result<u64> {
     let mut seen = HashSet::new();
     let mut total = 0;
     for path in paths {

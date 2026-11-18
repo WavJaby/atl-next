@@ -4,7 +4,7 @@
 //! A deletion tool removes only what it can prove belongs to a retired task: a dir whose branch was deleted and that no build dir names is unknown, not orphan.
 //! The process probe reads `/proc/<pid>/{cwd,fd/*,maps}` of the caller's uid only (other users' processes cannot hold this user's `out/`); a same-uid process whose entries cannot be read makes `--execute` refuse. `--execute` repeats the probe right before each removal.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::os::unix::fs::MetadataExt;
@@ -243,6 +243,21 @@ fn class_of(path: &Path, name: Option<&str>, facts: &Facts) -> Result<Class> {
     Ok(Class::Unknown("names no task id"))
 }
 
+/// Apparent bytes under `path`, each inode once; symlinks counted as links, never followed (run trees hold links into the build); unreadable entries count 0.
+fn bytes_under(path: &Path, seen: &mut HashSet<(u64, u64)>) -> u64 {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if meta.is_dir() {
+        let Ok(rd) = fs::read_dir(path) else { return 0 };
+        rd.flatten().map(|e| bytes_under(&e.path(), seen)).sum()
+    } else if seen.insert((meta.dev(), meta.ino())) {
+        meta.len()
+    } else {
+        0
+    }
+}
+
 /// One entry per top-level child of `out`, sorted by name.
 pub fn classify(out: &Path, facts: &Facts) -> Result<Vec<Entry>> {
     let mut entries = Vec::new();
@@ -253,7 +268,7 @@ pub fn classify(out: &Path, facts: &Facts) -> Result<Vec<Entry>> {
         let class = class_of(&path, os.to_str(), facts)?;
         let bytes = match class {
             Class::Keep(_) => None,
-            _ => Some(out_prune::unique_bytes(std::slice::from_ref(&path))?),
+            _ => Some(bytes_under(&path, &mut HashSet::new())),
         };
         entries.push(Entry {
             name: os.to_string_lossy().into_owned(),
