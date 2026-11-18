@@ -1204,7 +1204,6 @@ expect-log services resumed\nexpect-no-log app \"diag: refused\"\nexpect-frames 
             "expect-fps 20 readback over 100",
             "expect-counter k ~ 1",
             "end",
-            "if-log app x 10\nif-log app y 10",
         ] {
             let err = format!("{:#}", parse(&format!("wait 1\n{bad}\nend\n")).unwrap_err());
             assert!(err.contains("script line 2"), "{bad}: {err}");
@@ -1215,6 +1214,14 @@ expect-log services resumed\nexpect-no-log app \"diag: refused\"\nexpect-frames 
         );
         assert!(
             err.contains("script line 2") && err.contains("no `end`"),
+            "{err}"
+        );
+        let err = format!(
+            "{:#}",
+            parse("wait 1\nif-log app x 10\nif-log app y 10\nend\n").unwrap_err()
+        );
+        assert!(
+            err.contains("script line 3") && err.contains("one level"),
             "{err}"
         );
     }
