@@ -78,6 +78,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "atl-bridgegen",
+ "atl-gralloc",
  "libloading",
 ]
 
@@ -87,6 +88,10 @@ version = "0.0.0"
 dependencies = [
  "atl-egl-host",
 ]
+
+[[package]]
+name = "atl-gralloc"
+version = "0.0.0"
 
 [[package]]
 name = "atl-layout"
