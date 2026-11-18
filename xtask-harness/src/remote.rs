@@ -404,7 +404,8 @@ const DISPLAY_PROBE_LIMIT: Duration = Duration::from_secs(30);
 /// Moves the target's Hyprland session to an empty workspace for the run and back after it (owner decision D1, 2026-11-18: a remote window gate may open its window on the live desktop, on an empty
 /// workspace, and the workspace that was active before comes back also on failure or interruption). Probed, never named by host: `hyprctl` on PATH and exactly one running instance (`hyprctl
 /// instances`) whose Wayland socket is the run's `$WL` -- `$WL_DIR/hypr` keeps dirs of ended sessions (7 on the laptop, 2026-11-18), so a dir count is no answer; anything else logs why and runs in
-/// place. Empty = the lowest id no workspace has (Hyprland keeps only workspaces with windows or focus). Lines go to stderr (the transcript): `workspace: ...`.
+/// place. Empty = the lowest id no workspace has (Hyprland keeps only workspaces with windows or focus). The switch: the classic dispatcher (`workspace N`), and where the session did not move,
+/// the Lua one Hyprland 0.57's Lua config takes (`hl.dsp.focus({ workspace = N })`; the classic form is a Lua syntax error there). Lines go to stderr (the transcript): `workspace: ...`.
 fn workspace_script() -> String {
     const SCRIPT: &str = r#"WS_PREV=""
 WS_SIG=""
@@ -424,18 +425,23 @@ if [ -n "$WS_PREV" ]; then
   WS_USED=$(hyprctl workspaces | @ID@)
   WS_RUN=1
   while printf '%s\n' $WS_USED | grep -qx "$WS_RUN"; do WS_RUN=$((WS_RUN + 1)); done
+  ws_id() { hyprctl activeworkspace | @ID@ | head -n 1; }
+  ws_go() {
+    hyprctl dispatch workspace "$1" >/dev/null 2>&1
+    [ "$(ws_id)" = "$1" ] || hyprctl dispatch "hl.dsp.focus({ workspace = $1 })" >/dev/null 2>&1
+  }
   ws_back() {
     [ -n "$WS_PREV" ] || return 0
-    hyprctl dispatch workspace "$WS_PREV" >/dev/null 2>&1
-    echo "workspace: after=$(hyprctl activeworkspace | @ID@ | head -n 1) (restored $WS_PREV)" >&2
+    ws_go "$WS_PREV"
+    echo "workspace: after=$(ws_id) (restored $WS_PREV)" >&2
     WS_PREV=""
   }
   trap ws_back EXIT
   trap 'exit 129' HUP
   trap 'exit 130' INT
   trap 'exit 143' TERM
-  hyprctl dispatch workspace "$WS_RUN" >/dev/null 2>&1
-  echo "workspace: before=$WS_PREV during=$(hyprctl activeworkspace | @ID@ | head -n 1) (empty $WS_RUN)" >&2
+  ws_go "$WS_RUN"
+  echo "workspace: before=$WS_PREV during=$(ws_id) (empty $WS_RUN)" >&2
 fi
 "#;
     // `hyprctl activeworkspace` / `workspaces` text: `workspace <n> (<name>) on monitor ...` (the laptop's 2026-11-18 build), `workspace ID <n> (<name>) ...` in other releases
@@ -2741,7 +2747,7 @@ mod tests {
         };
         let session = at("[ \"$WL_N\" -eq 1 ] ||");
         let trap = at("trap ws_back EXIT\n");
-        let switch = at("hyprctl dispatch workspace \"$WS_RUN\"");
+        let switch = at("  ws_go \"$WS_RUN\"\n");
         let agent = at(
             " timeout -k 10 300 \"$BASE/out/cargo/debug/xtask-harness\" \"window-live\" --upstream \"$WL_DIR/$WL\" --listen \"$GATE_SOCK\" -- \"--stage\" \"widgets\" < /dev/null > \"$BASE/out/window/scratch/agent.log\" 2>&1 &\nAG=$!\n",
         );

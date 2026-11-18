@@ -1597,6 +1597,7 @@ impl Runtime {
             self.servicemanager.clone(),
             self.services.clone(),
             self.am.clone(),
+            self.screencap.clone(),
             self.binderd.clone(),
             self.sandbox_stub.clone(),
             self.sandbox_join.clone(),
