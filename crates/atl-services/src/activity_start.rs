@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: MIT
 //! Whether the services start an activity for a startActivity call: the accepted subset of ActivityStarter, pure (no binder), so the tests build without the converter feature.
 //! An implicit intent arrives here already resolved by the package manager (activity_task: ActivityTaskSupervisor.resolveIntent), so `component` is None only when nothing matched.
-//! Accepted: an explicit component of the caller's own package, started from one of the caller's activities, in the caller's task and process: standard (a new
+//! Accepted: an explicit component of the caller's own package, in the caller's process, started from one of the caller's activities into its task, or with no source activity (resultTo null
+//! or naming no record: NEW_TASK forced) into the caller's Task of the activity's affinity: standard (a new
 //! instance), singleTop (onNewIntent to the top when it is that class, else new), singleTask (onNewIntent to its instance in the task after clearing what is above, else new; a new instance while a result is owed).
 //! A start for a result (startActivityForResult) is accepted too: the result it owes its caller is answered by the services (see [`Call::result_requested`]).
 //! And a start with no caller app (shell / home) of a package's launcher whose process is not running ([`check_shell`]).
 //! Every other call is refused: a SecurityException when the caller does not own the activity it names (fail-closed; counted `exception:SECURITY` by the reply hook, not here), otherwise the START code
 //! AOSP returns for the case (ActivityManager.java:162 FIRST_START_FATAL = -100), counted by `atl_diag::refused` under its reason. Refusals are never silent: the app sees the code, the log sees the count.
 //! Refused, not modelled: implicit intents of the shell path ([`check_shell`]), a chooser tie (no ResolverActivity), other packages, singleInstance, other processes, intent flags except NEW_TASK, task affinity
-//! across tasks (NEW_TASK into another affinity), more than one task per package, bringing a running app's task to front.
+//! across tasks (NEW_TASK into another affinity, or no source and no Task of the affinity), more than one task per package, bringing a running app's task to front.
 
 use atl_services_types::permission::{SHELL_UID, SYSTEM_UID};
 
@@ -70,7 +71,8 @@ pub struct Call<'a> {
     pub flags: i32,
     /// The intent's explicit component: (package, class name). None for an implicit intent.
     pub component: Option<(&'a str, &'a str)>,
-    /// resultTo's activity, when the caller's thread runs it. None: resultTo names no activity.
+    /// resultTo's activity, when the caller's thread runs it. None: resultTo is null (a start from a non-activity Context) or names no record, e.g. a finished activity's token
+    /// (ActivityRecord.isInAnyTask null, ActivityStarter.java:1106-1107): not an error, the start has no source and owes no result.
     pub source: Option<Source<'a>>,
 }
 
@@ -100,6 +102,8 @@ pub struct Target<'a> {
     pub in_task: bool,
     /// The source task's top non-finishing activity is of the component's class: what a singleTop start reuses.
     pub top_is_class: bool,
+    /// With no source: the caller's process has a Task whose root has the started activity's affinity (findTask); `in_task` / `top_is_class` then read that Task. Unused with a source.
+    pub affinity_task: bool,
 }
 
 fn refused(code: i32, reason: &'static str) -> Refusal {
@@ -107,12 +111,11 @@ fn refused(code: i32, reason: &'static str) -> Refusal {
     Refusal::Code { code, reason }
 }
 
-/// Validates one start. Ok: the declaration of the activity to start; the caller starts it in the source's task.
+/// Validates one start. Ok: the declaration of the activity to start; the caller starts it in the source's task, or with no source in the Task of the activity's affinity.
 pub fn check<'a>(call: &Call<'_>, target: Target<'a>) -> Result<(&'a Declared, Start), Refusal> {
-    let Some(source) = call.source else {
-        return Err(refused(START_CANCELED, "resultTo names no activity"));
-    };
-    if source.uid != call.calling_uid || source.package != call.calling_package {
+    if let Some(source) = call.source
+        && (source.uid != call.calling_uid || source.package != call.calling_package)
+    {
         return Err(Refusal::Security("resultTo is not the caller's activity"));
     }
     let Some((package, class)) = call.component else {
@@ -149,7 +152,8 @@ pub fn check<'a>(call: &Call<'_>, target: Target<'a>) -> Result<(&'a Declared, S
             ));
         }
     };
-    let flags = if decl.launch_mode == LAUNCH_SINGLE_TASK {
+    // computeLaunchingTaskFlags (ActivityStarter.java:2885-2903): no source -> NEW_TASK is forced ("startActivity called from non-Activity context"); singleTask implies it
+    let flags = if decl.launch_mode == LAUNCH_SINGLE_TASK || call.source.is_none() {
         call.flags | FLAG_ACTIVITY_NEW_TASK
     } else {
         call.flags
@@ -165,11 +169,28 @@ pub fn check<'a>(call: &Call<'_>, target: Target<'a>) -> Result<(&'a Declared, S
             .task_affinity
             .as_deref()
             .unwrap_or(call.calling_package);
-        if affinity != source.affinity {
-            return Err(refused(
-                START_CANCELED,
-                "NEW_TASK into another task affinity",
-            ));
+        match call.source {
+            Some(source) if affinity != source.affinity => {
+                return Err(refused(
+                    START_CANCELED,
+                    "NEW_TASK into another task affinity",
+                ));
+            }
+            Some(_) => {}
+            // getReusableIntentActivity (:2972-3000): NEW_TASK with no result record looks for the Task of the activity's affinity (findTask); a standard activity of another class is added
+            // on top of it (complyActivityFlags, :2595-2602 -> recycleTask :2398-2402: START_SUCCESS). No such Task: AOSP makes a new one, which is not modelled.
+            None if !target.affinity_task => {
+                return Err(refused(
+                    START_CANCELED,
+                    "no source and no task of the activity's affinity (a new task is not modelled)",
+                ));
+            }
+            None => {
+                atl_diag::answered(
+                    INTERFACE,
+                    "startActivity with no source activity (into its affinity's task)",
+                );
+            }
         }
     }
     Ok((decl, start))
@@ -275,6 +296,7 @@ mod tests {
             decl: Some(main),
             in_task: false,
             top_is_class: false,
+            affinity_task: false,
         }
     }
 
@@ -368,8 +390,29 @@ mod tests {
         assert!(check(&c, target(&main)).is_ok());
     }
 
+    /// resultTo null or naming no record (a stale token), with a request code and no NEW_TASK in the intent: ActivityStarter.executeRequest leaves sourceRecord and resultRecord null
+    /// (:1104-1120, no error), computeLaunchingTaskFlags forces NEW_TASK (:2885-2891), findTask finds the caller's Task of the package affinity and a standard activity of another class is added
+    /// on top (:2595-2602, recycleTask :2398-2402 START_SUCCESS): accepted as a new record, no result owed.
     #[test]
-    fn refuses_a_call_with_no_source_activity() {
+    fn a_start_with_no_source_goes_into_its_affinitys_task() {
+        let main = decl(MAIN);
+        let c = Call {
+            source: None,
+            request_code: 7,
+            ..call()
+        };
+        let found = Target {
+            affinity_task: true,
+            ..target(&main)
+        };
+        assert!(!c.result_requested());
+        assert!(!c.new_task_cancels_result());
+        assert_eq!(start_of(check(&c, found)), Start::New);
+    }
+
+    /// No source and no Task of the activity's affinity: AOSP starts a new Task, which is not modelled -> refused, counted.
+    #[test]
+    fn a_start_with_no_source_and_no_affinity_task_is_refused() {
         let main = decl(MAIN);
         let c = Call {
             source: None,
@@ -379,7 +422,29 @@ mod tests {
             code_of(check(&c, target(&main))),
             Refusal::Code {
                 code: START_CANCELED,
-                reason: "resultTo names no activity"
+                reason: "no source and no task of the activity's affinity (a new task is not modelled)"
+            }
+        );
+    }
+
+    /// The forced NEW_TASK does not widen the flags accepted: another flag is still refused with no source.
+    #[test]
+    fn a_start_with_no_source_still_refuses_other_flags() {
+        let main = decl(MAIN);
+        let c = Call {
+            source: None,
+            flags: 0x0400_0000,
+            ..call()
+        };
+        let found = Target {
+            affinity_task: true,
+            ..target(&main)
+        };
+        assert_eq!(
+            code_of(check(&c, found)),
+            Refusal::Code {
+                code: START_CANCELED,
+                reason: "intent flags other than NEW_TASK"
             }
         );
     }
@@ -581,6 +646,7 @@ mod tests {
             decl: None,
             in_task: false,
             top_is_class: false,
+            affinity_task: false,
         };
         assert_eq!(
             code_of(check(&c, none)),

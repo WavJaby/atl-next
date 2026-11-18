@@ -406,7 +406,7 @@ impl ActivityTasks {
     }
 
     /// startActivity: validate, then the new record goes on top of the caller's activity's Task and is sent its launch. Ok: the START code (0 started, else refused).
-    /// A foreign resultTo (not one of this caller's records) is a SecurityException; a call with no resultTo record is refused as CANCELED.
+    /// A foreign resultTo (not one of this caller's records) is a SecurityException; with no resultTo record the start goes into the caller's Task of the activity's affinity (activity_start::check).
     pub(crate) fn start(
         &self,
         caller: &Strong<dyn IApplicationThread>,
@@ -499,7 +499,13 @@ impl ActivityTasks {
             self.send(commands);
             return Ok(activity_start::START_SUCCESS);
         }
-        let source_task = source.as_ref().and_then(|(t, _)| m.task_of(t));
+        // the Task the start goes into: the source's; with no source record, the caller's Task whose root has the activity's affinity (ActivityStarter.getReusableIntentActivity -> findTask)
+        let source_task = match &source {
+            Some((t, _)) => m.task_of(t),
+            None => info.map(|d| affinity_of(d, calling_package)).and_then(|a| {
+                m.task_by_root(|o| o.thread.as_binder() == caller.as_binder() && o.affinity == a)
+            }),
+        };
         let class = component.map(|(_, class)| class);
         let instance = source_task
             .zip(class)
@@ -512,13 +518,23 @@ impl ActivityTasks {
             decl: declared.as_ref(),
             in_task: instance.is_some(),
             top_is_class,
+            affinity_task: source.is_none() && source_task.is_some(),
         };
         let (decl, start) = match activity_start::check(&call, target) {
             Ok((_, start)) => (
                 info.expect("check accepts only a class the package declares"),
                 start,
             ),
-            Err(Refusal::Code { code, .. }) => {
+            Err(Refusal::Code { code, reason }) => {
+                log(format_args!(
+                    "activity start refused code={code} ({reason}): component={component:?} flags=0x{flags:x} result_to={} request_code={request_code} caller={calling_package} at={}",
+                    match (result_to, &source) {
+                        (None, _) => "null",
+                        (Some(_), None) => "no record",
+                        (Some(_), Some(_)) => "record",
+                    },
+                    atl_diag::wall_stamp()
+                ));
                 // a refused start answers the result it owes as cancelled (ActivityStarter.java:1220-1222)
                 let cancelled = cancel_owed(&mut m, owed.as_ref());
                 self.note_settle(&m);
@@ -1493,5 +1509,35 @@ mod tests {
         );
         atm.finish(&child, RESULT_CANCELED, None);
         assert_eq!(atm.calling(&child), None, "the child finished");
+    }
+
+    /// A resultTo naming no record (an ad SDK's start from a token that is not an activity of this run) with a request code: ActivityStarter.executeRequest leaves sourceRecord and
+    /// resultRecord null (:1104-1120), NEW_TASK is forced (:2885-2891) and findTask puts the activity on the caller's Task of the package affinity (:2972-3000, :2595-2602): START_SUCCESS,
+    /// launched in the launcher's Task, owing no result (getCallingActivity null). Before this, ATL refused it START_CANCELED ("resultTo names no activity").
+    #[test]
+    fn a_start_with_a_stale_result_to_goes_into_the_callers_task() {
+        let atm = fixture_atm();
+        let (thread, scheduled) = app_thread();
+        let launcher = attach_launcher(&atm, &thread);
+        let video = Intent {
+            component: Some(ComponentName {
+                package: PACKAGE.to_owned(),
+                class: VIDEO.to_owned(),
+            }),
+            ..Default::default()
+        };
+        let stale = token::new();
+        assert_eq!(
+            start_of(&atm, &thread, &stale, &video, REQUEST_CODE),
+            activity_start::START_SUCCESS
+        );
+        let child = token_of(&scheduled, VIDEO);
+        assert_eq!(atm.calling(&child), None, "no result is owed");
+        let m = atm.machine();
+        assert_eq!(
+            m.task_of(&child),
+            m.task_of(&launcher),
+            "the launcher's Task"
+        );
     }
 }

@@ -361,6 +361,15 @@ impl<K: Clone + PartialEq, O: Clone, L, I, R> Machine<K, O, L, I, R> {
             .any(|(t, records)| *t != task && records.iter().any(|r| of(&r.owner)))
     }
 
+    /// The newest Task whose root (bottom) record `matches` (RootWindowContainer.findTask matches Task.rootAffinity, its root's affinity): where a start with no source record goes.
+    pub fn task_by_root(&self, matches: impl Fn(&O) -> bool) -> Option<TaskId> {
+        self.tasks
+            .iter()
+            .rev()
+            .find(|(_, records)| records.first().is_some_and(|r| matches(&r.owner)))
+            .map(|(t, _)| *t)
+    }
+
     /// An owner `of` matches holds a record that is not finishing: an activity the app did not end (a destroying record has finished).
     pub fn holds_live(&self, of: impl Fn(&O) -> bool) -> bool {
         self.tasks
