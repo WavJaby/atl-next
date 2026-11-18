@@ -29,6 +29,8 @@ const TAG_RISCV_ARCH: u64 = 5;
 const TAG_ABI_VFP_ARGS: u64 = 28;
 /// aeabi build attribute `Tag_compatibility`: an integer, then a NUL-terminated string.
 const TAG_COMPATIBILITY: u64 = 32;
+/// aeabi build attributes `Tag_CPU_raw_name` and `Tag_CPU_name`: the only string tags below 32 (ARM IHI 0045 2.2.6: below 32 each tag's type is defined, from 32 up odd = string, even = integer).
+const ARM_STRING_TAGS_BELOW_32: [u64; 2] = [4, 5];
 /// `e_ident` indexes of the class and data-encoding bytes (ELF gABI).
 const EI_CLASS: usize = 4;
 const EI_DATA: usize = 5;
@@ -766,13 +768,14 @@ fn arm_vfp_args<'data>(f: &ElfFile32<'data, Endianness>, data: &'data [u8]) -> R
                     if tag == TAG_ABI_VFP_ARGS {
                         return Ok(Some(reader.read_integer()?));
                     }
-                    // aeabi: odd tags carry a string, Tag_compatibility an integer then a string, the rest an integer
                     match tag {
                         TAG_COMPATIBILITY => {
                             reader.read_integer()?;
                             reader.read_string()?;
                         }
-                        _ if tag % 2 == 1 => {
+                        _ if ARM_STRING_TAGS_BELOW_32.contains(&tag)
+                            || (tag > TAG_COMPATIBILITY && tag % 2 == 1) =>
+                        {
                             reader.read_string()?;
                         }
                         _ => {
