@@ -21,7 +21,7 @@ pub struct Launch {
     pub package: Option<String>,
     /// The audio server's socket atld grants (read-only at this path in the sandbox): the PCM output connects there, and nothing else is looked up. None: none granted; the process starts without audio and its tracks fail.
     pub pipewire_socket: Option<PathBuf>,
-    /// Test only: the process serves neither AudioFlinger nor AudioPolicyService (lib.rs serve_media_services), the audio gate's deliberate break.
+    /// Test only: the process serves neither AudioFlinger nor AudioPolicyService (lib.rs serve_media_services): the audio gate's deliberate break, and every gate run with no binder driver (xtask host_art `HostArt::launch`), since serving AudioFlinger registers with AudioService over binder and libbinder aborts a process without a driver, as on Android.
     pub no_audio_service: bool,
     /// Test only: AudioFlinger's tracks get a control block one buffer short (`atl_audioflinger::Options`), the audio gate's deliberate break.
     pub break_cblk: bool,

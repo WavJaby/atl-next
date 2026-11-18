@@ -24,6 +24,8 @@ const JAVAC_BOOT: [&str; 3] = [
 const PROPERTY_SERVICE: &str = "atl-property-service";
 /// The launcher package and its executable.
 const LAUNCHER: &str = "atl-app-launcher";
+/// The launcher's options for a process with no binder driver ([`HostArt::launch`]): no AudioFlinger (atl-app-launcher args.rs `--no-audio-service`), the one service it serves at start that talks to the real servicemanager.
+const NO_BINDER: &[&str] = &["--no-audio-service"];
 /// Written by the converter (bp2ninja buildprop.go) when it builds with a release config.
 pub const BUILD_PROP: &str = "gen/build.prop";
 /// Where Android installs the ICU data ART's ICU opens (external/icu/icu4c/source/stubdata/Android.bp apex_icu.dat: prebuilt_etc of `icu*.dat`, sub_dir icu, in the com.android.i18n APEX).
@@ -212,7 +214,8 @@ impl HostArt {
             .with_context(|| format!("atl-property-service printed {printed:?}, not NAME=path"))
     }
 
-    /// `class args` from `fixture`'s dex, started by the launcher with the property-area variable set to `area` and the extra VM options `vm`.
+    /// `class args` from `fixture`'s dex, started by the launcher with the property-area variable set to `area` and the extra VM options `vm`, as a process with no binder driver (no binderd: a caller that has one spawns [`Self::command`] itself).
+    /// So with [`NO_BINDER`]: the launcher's AudioFlinger registers with AudioService over binder at start (atl-audioflinger dispatcher.rs), and libbinder's ProcessState aborts a process whose driver does not open (ProcessState.cpp `EXPECT_BINDER_OPEN_SUCCESS`, as on Android).
     pub fn launch(
         &self,
         fixture: &JavaFixture,
@@ -221,7 +224,7 @@ impl HostArt {
         class: &str,
         args: &[String],
     ) -> Result<ArtRun> {
-        self.run(&mut self.command(fixture, area, vm, class, args))
+        self.run(&mut self.command_with(NO_BINDER, fixture, area, vm, class, args))
     }
 
     /// Runs `cmd` (an `art_command`) to its end.
