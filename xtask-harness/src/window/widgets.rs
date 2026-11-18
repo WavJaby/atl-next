@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Stage `widgets` of `xtask test window`: the widget fixture (xtask-harness/testdata/widgets, real resources under the Material theme) in UI mode, checked from the fixture's log lines.
-//! The probe presses the header bar, then taps the Button and the EditText, hovers, turns the wheel and swipes the touchpad over the ListView, and drags it, at the fixture's own rectangles shifted by the content origin the platform logs (the proxy injects surface points).
+//! The probe presses the header bar (where GTK draws one: not on a tiling or decorating compositor), then taps the Button and the EditText, hovers, turns the wheel and swipes the touchpad over the ListView, and drags it, at the fixture's own rectangles shifted by the content origin the platform logs (the proxy injects surface points).
 //! Sub-gates ([`checks`]): probe (every injection got its answer), layout (geometry from the XML), text (the fixture's settled software frame is the first picture's digest, so the text is in the capture),
 //! header (the press reached the client, no touch reached Android), click, focus, window (the second activity the focus starts and finishes leaves input on Main), hover, wheel, swipe (fake finger + fling), list (the drag), readback (the last picture is the fixture's final frame and differs from the first),
 //! presents (more than 2 scenes), cadence (the frame callbacks while the list redraws, as the frames stage),
@@ -19,7 +19,7 @@ use atl_services_types::input_devices;
 use super::capture;
 use super::{
     ACK_WAIT, BTN_LEFT, CONTENT_ORIGIN_LINE, Liveness, POLL, Rate, Sub, await_event, cadence_check,
-    content_to_surface, wait_for_line,
+    content_origin, content_to_surface, wait_for_line,
 };
 use crate::composer::word;
 use crate::nested_wayland::{GATE_OUTPUT, Output};
@@ -622,9 +622,26 @@ fn text_check(pictures: &Mutex<capture::Seen>, app: &str) -> Result<String, Stri
     ))
 }
 
-/// `drive` saw the proxy report the header press before the first tap. GTK keeps a header press, so the first touch Android gets must be the Button's tap: inside the Button's rectangle (the tap
-/// aims at its centre; at a fractional scale the surface point's wl_fixed 1/256 steps move it off the exact centre pixel, never out of the Button).
+/// Whether the window has a header bar to press, from the content origin the platform logs: GTK draws its client-side header (origin below [`HEADER_POINT`]) unless the compositor decorates or
+/// tiles the window, where GTK draws none and the content starts at the surface's origin (Hyprland tiling: `content origin x=0 y=0`). The window follows the host's decoration rule, as a native GTK
+/// program does (behaviour decision 3), so the gate reads it from the run. Any other origin leaves the press point inside the content: red.
+fn header_bar(origin: (f32, f32)) -> Result<bool, String> {
+    if f64::from(origin.1) > HEADER_POINT.1 {
+        Ok(true)
+    } else if origin == (0.0, 0.0) {
+        Ok(false)
+    } else {
+        Err(format!(
+            "content origin {origin:?}: chrome without room for the header press at {HEADER_POINT:?}"
+        ))
+    }
+}
+
+/// With a header bar, `drive` saw the proxy report the header press before the first tap; GTK keeps a header press, so the first touch Android gets must be the Button's tap. Without one (content
+/// at 0,0) nothing is pressed there and the first touch is still the Button's tap. Either way it lies inside the Button's rectangle (the tap aims at its centre; at a fractional scale the surface
+/// point's wl_fixed 1/256 steps move it off the exact centre pixel, never out of the Button).
 fn header_check(app: &str) -> Result<String, String> {
+    let has_header = header_bar(content_origin(app)?)?;
     let r = widget(app, "button")?;
     let line = app
         .lines()
@@ -635,11 +652,24 @@ fn header_check(app: &str) -> Result<String, String> {
     let inside = |v: f64, from: i64, len: i64| v >= from as f64 && v < (from + len) as f64;
     if !(inside(x, r.left, r.width) && inside(y, r.top, r.height)) {
         return Err(format!(
-            "first touch at ({x}, {y}), outside the Button {}x{} at ({}, {}): the header press reached Android",
-            r.width, r.height, r.left, r.top
+            "first touch at ({x}, {y}), outside the Button {}x{} at ({}, {}): {}",
+            r.width,
+            r.height,
+            r.left,
+            r.top,
+            if has_header {
+                "the header press reached Android"
+            } else {
+                "no header bar, and the tap did not land in the Button"
+            }
         ));
     }
-    Ok("proxy injected the press; the first touch Android got is the Button's tap".to_owned())
+    Ok(if has_header {
+        "proxy injected the press; the first touch Android got is the Button's tap"
+    } else {
+        "no header bar (content origin 0,0: the compositor tiles or decorates); the first touch Android got is the Button's tap"
+    }
+    .to_owned())
 }
 
 /// After the taps and the drag: the last settled picture is the fixture's final frame, and not the first picture.
@@ -1010,8 +1040,12 @@ pub fn drive(
             vec![PointerAction::Enter { x, y }, press(true), press(false)],
         )
     };
-    tap(HEADER_POINT)?;
-    for n in 1..=HEADER_ACTIONS {
+    // no header bar (tiled or server-decorated): the press point is content, nothing to press
+    let has_header = header_bar(content_origin(&text)?)?;
+    if has_header {
+        tap(HEADER_POINT)?;
+    }
+    for n in (1..=HEADER_ACTIONS).filter(|_| has_header) {
         await_event(&proxy.events, LINE_WAIT, |e| {
             *e == ProxyEvent::PointerInjected
         })
@@ -1444,18 +1478,29 @@ mod tests {
 
     #[test]
     fn header_check_wants_the_buttons_tap_first() {
-        let tap = format!("{BUTTON}AtlWindow: touch action=0 x=60.0 y=73.0\n");
-        assert!(header_check(&tap).is_ok());
+        // CSD origin as labwc gives it: 12 px shadow + header (> HEADER_POINT.y = 20)
+        let csd = "atl-platform-ui: content origin x=12 y=51 scale=1\n";
+        let tap = format!("{csd}{BUTTON}AtlWindow: touch action=0 x=60.0 y=73.0\n");
+        assert!(header_check(&tap).is_ok_and(|s| s.starts_with("proxy injected")));
         // a header press that leaked: content y is above the content's origin
-        let leak = format!("{BUTTON}AtlWindow: touch action=0 x=86.0 y=-31.0\n{tap}");
+        let leak = format!("{csd}{BUTTON}AtlWindow: touch action=0 x=86.0 y=-31.0\n{tap}");
         assert!(header_check(&leak).is_err());
-        assert!(header_check(BUTTON).is_err());
-        // the laptop run (scale 1.6): the Button 141x77 at (26, 78), the tap at its centre (96, 116) over 1.6 as a wl_fixed surface point lands at (95.59961, 115.59961) -- inside
-        let laptop = "AtlWindow: layout button left=26 top=78 width=141 height=77\nAtlWindow: touch action=0 x=95.59961 y=115.59961\n";
-        assert!(header_check(laptop).is_ok());
-        // that run's header press, (100, 20) logical = (160, 32) px: above the Button
-        let leaked = "AtlWindow: layout button left=26 top=78 width=141 height=77\nAtlWindow: touch action=0 x=160.0 y=32.0\n";
-        assert!(header_check(leaked).is_err());
+        assert!(header_check(&format!("{csd}{BUTTON}")).is_err());
+        assert!(header_check(BUTTON).is_err(), "no origin line");
+    }
+
+    /// Tiled (Hyprland, laptop run 2026-11-18, scale 1.6): content at 0,0, no header press. The Button 141x77 at (26, 78), the tap at its centre (96, 116) over 1.6 as a wl_fixed surface point
+    /// lands at (95.59961, 115.59961) -- inside. A header press there, (100, 20) logical = (160, 32) px, is above the Button. An origin with chrome too thin to press is red.
+    #[test]
+    fn header_check_without_a_header_bar() {
+        let tiled = "atl-platform-ui: content origin x=0 y=0 scale=1.6\nAtlWindow: layout button left=26 top=78 width=141 height=77\n";
+        let tap = format!("{tiled}AtlWindow: touch action=0 x=95.59961 y=115.59961\n");
+        assert!(header_check(&tap).is_ok_and(|s| s.starts_with("no header bar")));
+        let pressed = format!("{tiled}AtlWindow: touch action=0 x=160.0 y=32.0\n{tap}");
+        assert!(header_check(&pressed).is_err());
+        assert!(header_bar((12.0, 12.0)).is_err());
+        assert_eq!(header_bar((0.0, 0.0)), Ok(false));
+        assert_eq!(header_bar((12.0, 51.0)), Ok(true));
     }
 
     /// The probe's tap point: content origin plus the pixel over the logged scale; the laptop run's line (origin 0,0, scale 1.6) puts the Button's centre pixel (96, 116) at (60, 72.5).

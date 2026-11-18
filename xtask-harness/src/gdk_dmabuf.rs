@@ -1,37 +1,60 @@
 // SPDX-License-Identifier: MIT
-//! The dmabuf present verdict from GTK's own debug output (`GDK_DEBUG=dmabuf`, GTK 4.18 message texts in `gdk/gdkdmabuf*.c` / `gdkgl*.c`): every buffer is imported by the renderer (GL: an EGLImage), none is downloaded on the CPU (owner decision O3: no CPU fallback).
-//! GDK advertises the formats its mmap downloader handles alongside the GPU ones (`mmap advertises dmabuf format`), so a format check before the import cannot tell the paths apart; this log can.
+//! The dmabuf present verdict from GTK's own debug output (`GDK_DEBUG=dmabuf`; message texts of GTK 4.18 and 4.24 in `gdk/gdkdmabuf*.c`, `gdkgl*.c`, `gsk/gpu/gskvulkanimage.c`,
+//! `gskgpurenderer.c`): every buffer is imported by the renderer (GskGLRenderer: an EGLImage; GskVulkanRenderer: a Vulkan image on the dma-buf's memory), none is downloaded on the CPU
+//! (owner decision O3: no CPU fallback). GDK advertises the formats its mmap downloader handles alongside the GPU ones (`mmap advertises dmabuf format`), so a format check before the import
+//! cannot tell the paths apart; this log can.
 
 /// What the gated client runs with.
 pub const GDK_DEBUG: &str = "dmabuf";
 
-/// `Imported %dx%d %.4s:%#lx dmabuf as %s texture`.
+/// `Imported %dx%d %.4s:%#lx dmabuf as %s texture` (gdkdmabufegl.c): an EGL import, by GskGLRenderer or by GDK's EGL downloader.
 const IMPORTED: (&str, &str) = ("Imported ", " dmabuf as ");
+/// `Vulkan uploaded %zux%zu %.4s:%016llx %sdmabuf` (gskvulkanimage.c `gsk_vulkan_image_new_for_dmabuf`): GskVulkanRenderer imported the dma-buf's memory as a Vulkan image (despite the word, no copy).
+const VULKAN_IMPORTED: &str = "Vulkan uploaded ";
 /// `Used mmap for downloading ...` and `Used %s for downloading ...`: a CPU download of the dma-buf.
 const DOWNLOADED: &str = " for downloading ";
-/// Import failures: `Import of %dx%d %.4s:%#lx dmabuf failed`, `Creating EGLImage for dmabuf failed`, `Failed to create dmabuf texture`.
-const FAILED: [&str; 3] = [
+/// Import failures: EGL `Import of %dx%d %.4s:%#lx dmabuf failed`, `Creating EGLImage for dmabuf failed`, `Failed to create dmabuf texture`; Vulkan (gskvulkanimage.c, GTK 4.24) the
+/// `gsk_vulkan_image_new_for_dmabuf` refusals and failures.
+const FAILED: [&str; 9] = [
     " dmabuf failed",
     "Creating EGLImage for dmabuf failed",
     "Failed to create dmabuf texture",
+    "Vulkan does not support dmabufs",
+    "GTK's Vulkan doesn't support fourcc",
+    "Vulkan driver does not support format",
+    "vkCreateImage() failed",
+    "vkAllocateMemory() failed",
+    "Vulkan failed to dup() fd",
 ];
 
 /// `Exported GL texture to dmabuf (format: ...)` (gdkgltexture.c): GDK made a dma-buf of a GL texture it rendered itself. Under GTK 4.18 a `render_texture` result read with a
 /// TextureDownloader (the window's capture) goes export -> one import -> one `Used GskGLRenderer for downloading`: the readback of GDK's own picture, never a scene buffer.
 const EXPORTED: &str = "Exported GL texture to dmabuf";
 
+/// `Creating dmabuf texture, format %.4s:%#lx, ...` (gdkdmabuftexture.c): any GdkDmabufTexture is built, a scene buffer or GDK's own render. GskVulkanRenderer's `render_texture` exports its
+/// image this way only (gskvulkanimage.c `gsk_vulkan_image_to_dmabuf_texture` logs no export line); its readback is then create -> the EGL downloader's import -> download of that same
+/// format, with no renderer import between (laptop, GTK 4.24.1: 4 captures as `AB24:0x100000000000009`, scene buffers `XB24:0` each `Vulkan uploaded`).
+const CREATING: &str = "Creating dmabuf texture, format ";
+
 /// Counts of each path in one GTK log.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Verdict {
-    /// Scene buffers imported (an export's own re-import not counted).
+    /// Scene buffers imported (an own render's re-import not counted).
     pub imported: usize,
-    /// Scene buffers downloaded (an export's own readback not counted).
+    /// Scene buffers downloaded (an own render's readback not counted).
     pub downloaded: usize,
     pub failed: usize,
     /// [`NO_IMPORT`] lines: the renderer has no dma-buf import.
     pub no_import: usize,
-    /// [`EXPORTED`] lines: GDK's own renders read back (captures); each excuses the one import and the one download after it.
-    pub exported: usize,
+    /// GDK's own renders read back (captures): each [`EXPORTED`] line (excusing the one import and the one download after it), and each texture created, imported and downloaded with
+    /// nothing between (a Vulkan [`CREATING`]).
+    pub own_readbacks: usize,
+}
+
+/// The `XB24:0` of `... format XB24:0, ...` / `... (format XB24:0)`.
+fn format_of(line: &str) -> Option<&str> {
+    let rest = line.split_once("format ")?.1;
+    rest.split([',', ')', ' ']).next()
 }
 
 impl Verdict {
@@ -39,25 +62,46 @@ impl Verdict {
         let mut v = Self::default();
         // an export's re-import and readback still to come
         let (mut own_import, mut own_download) = (0usize, 0usize);
+        // the texture just created, and whether the EGL import of it came next: a download of it next is the readback of an own render
+        let mut created: Option<(&str, bool)> = None;
+        // the renderer is GskVulkanRenderer: it has imported a scene buffer
+        let mut vulkan = false;
         for line in log.lines() {
             if line.contains(EXPORTED) {
-                v.exported += 1;
+                v.own_readbacks += 1;
                 own_import += 1;
                 own_download += 1;
+                created = None;
+            } else if line.contains(CREATING) {
+                created = format_of(line).map(|f| (f, false));
+            } else if line.contains(VULKAN_IMPORTED) {
+                v.imported += 1;
+                vulkan = true;
+                created = None;
             } else if line.contains(IMPORTED.0) && line.contains(IMPORTED.1) {
                 if own_import > 0 {
                     own_import -= 1;
                 } else {
                     v.imported += 1;
+                    // under GskVulkanRenderer an EGL import is only ever the downloader's
+                    created = created.filter(|_| vulkan).map(|(f, _)| (f, true));
                 }
             } else if line.contains(DOWNLOADED) {
                 if own_download > 0 && own_import == 0 {
                     own_download -= 1;
+                } else if let Some((f, true)) = created
+                    && format_of(line) == Some(f)
+                {
+                    // its import was the downloader's, not the renderer's
+                    v.imported -= 1;
+                    v.own_readbacks += 1;
                 } else {
                     v.downloaded += 1;
                 }
+                created = None;
             } else if FAILED.iter().any(|f| line.contains(f)) {
                 v.failed += 1;
+                created = None;
             } else if line.contains(NO_IMPORT) {
                 v.no_import += 1;
             }
@@ -96,8 +140,8 @@ impl std::fmt::Display for Verdict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "imported={} downloaded={} failed={} no_import={} exported={}",
-            self.imported, self.downloaded, self.failed, self.no_import, self.exported
+            "imported={} downloaded={} failed={} no_import={} own_readbacks={}",
+            self.imported, self.downloaded, self.failed, self.no_import, self.own_readbacks
         )
     }
 }
@@ -120,7 +164,7 @@ mod tests {
                 downloaded: 0,
                 failed: 0,
                 no_import: 0,
-                exported: 0
+                own_readbacks: 0
             }
         );
         assert!(v.ok());
@@ -142,7 +186,7 @@ mod tests {
                        Imported 320x240 AB24:0 dmabuf as GL_TEXTURE_2D texture\n\
                        Used GskGLRenderer for downloading 320x240 dmabuf (format AB24:0)\n";
         let v = Verdict::of(&format!("{scene}{capture}").repeat(3));
-        assert_eq!((v.imported, v.downloaded, v.exported), (3, 0, 3));
+        assert_eq!((v.imported, v.downloaded, v.own_readbacks), (3, 0, 3));
         assert!(v.ok());
         // a scene download beside captures still counts: one export excuses one readback only
         let mmap = "Used mmap for downloading 320x240 dmabuf (format XB24:0)\n";
@@ -151,6 +195,34 @@ mod tests {
         // a download before the export's re-import is not its readback
         let early = "Exported GL texture to dmabuf (format: AB24:0, planes: 1)\nUsed mmap for downloading 320x240 dmabuf (format XB24:0)\n";
         assert_eq!(Verdict::of(early).downloaded, 1);
+    }
+
+    /// GskVulkanRenderer as GTK 4.24.1 printed it on the laptop (job rwgb-lw3): scene buffers created then `Vulkan uploaded`; each capture's own render created, imported by the EGL
+    /// downloader and read back. 157 scene imports and 4 captures there; 2 + 2 here.
+    #[test]
+    fn vulkan_renderer_imports_and_its_captures() {
+        let scene = "Creating dmabuf texture, format XB24:0,  premultiplied, 1 planes, memory format RGBX8\n\
+                     Vulkan uploaded 960x600 XB24:0000000000000000 dmabuf\n";
+        let capture = "Creating dmabuf texture, format AB24:0x100000000000009,  premultiplied, 1 planes, memory format RGBA8p\n\
+                       Importing dmabuf (format: AB24:0x100000000000009, planes: 1) into GL\n\
+                       Imported 960x600 AB24:0x100000000000009 dmabuf as GL_TEXTURE_2D texture\n\
+                       Used GskGLRenderer for downloading 960x600 dmabuf (format AB24:0x100000000000009)\n";
+        let v = Verdict::of(&format!("{scene}{scene}{capture}{capture}"));
+        assert_eq!((v.imported, v.downloaded, v.own_readbacks), (2, 0, 2));
+        assert_eq!(v.tier(), Some("import"));
+        // a scene buffer the Vulkan renderer refused, then downloaded: red
+        let refused = "Creating dmabuf texture, format XB24:0,  premultiplied, 1 planes, memory format RGBX8\n\
+                       Vulkan driver does not support format XB24::0000000000000000 with 1 planes\n\
+                       Used mmap for downloading 960x600 dmabuf (format XB24:0)\n";
+        let v = Verdict::of(&format!("{scene}{refused}"));
+        assert_eq!((v.downloaded, v.failed, v.tier()), (1, 1, None));
+        // a download of another format than the texture just created is no readback of it
+        let other = "Creating dmabuf texture, format AB24:0x100000000000009,  premultiplied, 1 planes, memory format RGBA8p\n\
+                     Imported 960x600 AB24:0x100000000000009 dmabuf as GL_TEXTURE_2D texture\n\
+                     Used mmap for downloading 960x600 dmabuf (format XB24:0)\n";
+        assert_eq!(Verdict::of(&format!("{scene}{other}")).downloaded, 1);
+        // the same round trip under GskGLRenderer (no Vulkan import seen): the EGL import is the renderer's, the download a scene download
+        assert_eq!(Verdict::of(capture).downloaded, 1);
     }
 
     /// GDK's renderer without import (lines as the WSL dxgkrnl run printed them, on either driver buffer tier): downloads pass only when every failed import follows GDK's no-import line and nothing imported.

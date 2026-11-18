@@ -1796,6 +1796,72 @@ fn dmabuf_check(app: &str) -> Result<String, String> {
     }
 }
 
+/// Vsync-flagged presentation samples the composer needs before it trusts a hardware vsync source: AOSP's minimum before its model predicts (VsyncSchedule.cpp `createTracker`:
+/// `kMinSamplesForPrediction` 6). Spec value, not read from the composer.
+const VSYNC_TIER_SAMPLES: u64 = 6;
+/// The composer's tier line, `atl-composer: vsync source <tier> (<reason>) ...` (first at start, then once per change).
+const VSYNC_TIER_LINE: &str = "atl-composer: vsync source ";
+
+/// The vsync source tier the run chose matches what the host's presentation feedback stated, from the run's own lines, never from the host's name. Vsync-flagged samples on CLOCK_MONOTONIC
+/// (`vsync_samples`, wp_presentation kind vsync + clock_id 1) >= [`VSYNC_TIER_SAMPLES`] and no others -> `hardware-vsync`, reached by exactly one change (it starts free-running) and kept; fewer ->
+/// `free-running`, never changed. Mixed kinds are red: the tier would hinge on their order, which the counters do not show. The last tier line names the same tier as the counters.
+fn vsync_tier_check(app: &str) -> Result<String, String> {
+    let line = crate::composer::last_counters(app).ok_or("no `composer: counters` line")?;
+    let n = |k: &str| crate::composer::field(line, k).unwrap_or(0);
+    let tier = word(line, "vsync_source").ok_or("no vsync_source in the counters")?;
+    let (vsync, other, changes) = (
+        n("vsync_samples"),
+        n("vsync_samples_other"),
+        n("vsync_source_changes"),
+    );
+    let said = app
+        .lines()
+        .rev()
+        .find_map(|l| l.split_once(VSYNC_TIER_LINE).map(|(_, rest)| rest))
+        .ok_or("no `vsync source` tier line")?;
+    let reason = said
+        .split_once(" (")
+        .and_then(|(_, r)| r.split_once(')'))
+        .map_or("", |(r, _)| r);
+    if !said.starts_with(&format!("{tier} ")) {
+        return Err(format!(
+            "counters say {tier}, the last tier line says {said:?}"
+        ));
+    }
+    let clock = app
+        .lines()
+        .find_map(|l| {
+            l.split_once("wp_presentation clock_id=")
+                .map(|(_, c)| c.trim())
+        })
+        .map_or("none".to_owned(), |c| format!("clock_id={c}"));
+    let evidence =
+        format!("{reason}; vsync_samples={vsync} other={other} changes={changes} {clock}");
+    let want = if vsync >= VSYNC_TIER_SAMPLES {
+        if other > 0 {
+            return Err(format!(
+                "host feedback mixes vsync and other samples: {evidence}"
+            ));
+        }
+        // the counter is the composer's own reading of the flags; the platform's clock line checks it independently
+        if clock != "clock_id=1" {
+            return Err(format!(
+                "vsync samples counted on a host clock other than CLOCK_MONOTONIC: {evidence}"
+            ));
+        }
+        ("hardware-vsync", 1)
+    } else {
+        ("free-running", 0)
+    };
+    if (tier, changes) != want {
+        return Err(format!(
+            "tier {tier} after {changes} changes, the host's feedback asks {} after {}: {evidence}",
+            want.0, want.1
+        ));
+    }
+    Ok(format!("{tier} ({evidence})"))
+}
+
 /// The release of a replaced buffer waited for the window's paint: every read fence a paint exported rode a release (none unmatched), and when buffers went back at all, at least one carried its fence.
 /// A release sent before the paint (`--break-ignore-hold`) leaves the fence of that paint with no release to ride.
 fn release_check(app: &str) -> Result<String, String> {
@@ -2706,6 +2772,10 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
         sub.push(("dmabuf", dmabuf_check(&app)));
         sub.push(("release", release_check(&app)));
     }
+    // each vsync source tier's gate: local stages run free-running (headless labwc, clock_id=1 without the vsync flag), session displays that mark vsyncs run hardware-vsync
+    if !sub.is_empty() && matches!(args.stage, Stage::Frames | Stage::Widgets | Stage::UiBlock) {
+        sub.push(("vsync-tier", vsync_tier_check(&app)));
+    }
     let sub_fault = sub.iter().find_map(|(_, r)| r.as_ref().err().cloned());
     for (name, result) in &sub {
         match result {
@@ -3194,6 +3264,70 @@ fn opening_size_i32(display: DisplayModel) -> (i32, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A run's vsync lines: the platform's clock line, the tier lines (`start` at the clock's start, `switch` at a change), the last counters.
+    fn vsync_log(
+        clock: &str,
+        switch: &[&str],
+        tier: &str,
+        vsync: u64,
+        other: u64,
+        changes: u64,
+    ) -> String {
+        let mut log = format!(
+            "atl-platform-ui: wp_presentation clock_id={clock}\n\
+             atl-composer: vsync source free-running (no vsync presentation sample yet) period_ns=8333333\n"
+        );
+        for t in switch {
+            log += &format!("atl-composer: vsync source {t} (a reason) refresh_ns=8333333\n");
+        }
+        log += &format!(
+            "composer: counters ticks=9 vsync_source={tier} vsync_samples={vsync} vsync_samples_other={other} vsync_source_changes={changes} ignored=\n"
+        );
+        log
+    }
+
+    /// Both tiers green from their own lines; the reds: flip-flop, vsync samples without the switch, a switch without samples, mixed kinds, counters and tier line disagreeing, vsyncs on another clock.
+    /// Sample counts: 6 = AOSP kMinSamplesForPrediction; 14850 / 0 / 1 = the laptop's measured hardware run (state vsync-source-tier-laptop); 1519 other = the WSLg run (clock_id=4, no vsync flag).
+    #[test]
+    fn vsync_tier_follows_the_hosts_feedback() {
+        let hw = vsync_log("1", &["hardware-vsync"], "hardware-vsync", 14850, 0, 1);
+        assert!(vsync_tier_check(&hw).is_ok_and(|s| s.starts_with("hardware-vsync (")));
+        let free = vsync_log("4", &[], "free-running", 0, 1519, 0);
+        assert!(vsync_tier_check(&free).is_ok_and(|s| s.starts_with("free-running (")));
+        // the threshold itself: 6 vsyncs switch, 5 do not
+        assert!(
+            vsync_tier_check(&vsync_log(
+                "1",
+                &["hardware-vsync"],
+                "hardware-vsync",
+                6,
+                0,
+                1
+            ))
+            .is_ok()
+        );
+        assert!(vsync_tier_check(&vsync_log("1", &[], "free-running", 5, 0, 0)).is_ok());
+        let reds = [
+            vsync_log(
+                "1",
+                &["hardware-vsync", "free-running", "hardware-vsync"],
+                "hardware-vsync",
+                14850,
+                0,
+                3,
+            ),
+            vsync_log("1", &[], "free-running", 14850, 0, 0),
+            vsync_log("4", &["hardware-vsync"], "hardware-vsync", 0, 1519, 1),
+            vsync_log("1", &["hardware-vsync"], "hardware-vsync", 14850, 7, 1),
+            vsync_log("1", &[], "hardware-vsync", 14850, 0, 1),
+            vsync_log("4", &["hardware-vsync"], "hardware-vsync", 14850, 0, 1),
+        ];
+        for log in &reds {
+            assert!(vsync_tier_check(log).is_err(), "{log}");
+        }
+        assert!(vsync_tier_check("composer: counters ticks=1\n").is_err());
+    }
 
     /// The app's sandbox and launcher match by an argument's file name; the services' sandbox, binding the runtime's lib dir under `crates/atl-app-launcher`, does not.
     #[test]
