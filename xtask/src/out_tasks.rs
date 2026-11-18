@@ -297,8 +297,12 @@ pub fn held_inside(dir: &Path) -> Result<Option<u32>> {
     Ok(holder(&fs::canonicalize(dir)?, &held))
 }
 
-/// Removes orphan `e` after a fresh process probe; Ok(Some(pid)) when a process now holds it (skipped).
-pub fn remove_orphan(out: &Path, e: &Entry) -> Result<Option<u32>> {
+/// Removes orphan `e` after a fresh process probe (`probe`: [`held_inside`]; a test passes its own, since a sandbox's `/proc` is not the host's); Ok(Some(pid)) when a process now holds it (skipped).
+pub fn remove_orphan(
+    out: &Path,
+    e: &Entry,
+    probe: impl Fn(&Path) -> Result<Option<u32>>,
+) -> Result<Option<u32>> {
     ensure!(
         e.class == Class::Orphan,
         "refused: {} is not an orphan",
@@ -310,7 +314,7 @@ pub fn remove_orphan(out: &Path, e: &Entry) -> Result<Option<u32>> {
         e.path.display(),
         out.display()
     );
-    if let Some(pid) = held_inside(&e.path)? {
+    if let Some(pid) = probe(&e.path)? {
         return Ok(Some(pid));
     }
     fs::remove_dir_all(&e.path).with_context(|| format!("removing {}", e.path.display()))?;
@@ -378,7 +382,7 @@ pub fn run(root: &Path, ws: &Path, execute: bool) -> Result<ExitCode> {
             println!("orphan task {}: {size}", e.name);
             continue;
         }
-        match remove_orphan(&out, e) {
+        match remove_orphan(&out, e, held_inside) {
             Ok(None) => {
                 removed += 1;
                 freed += e.bytes.unwrap_or(0);
@@ -443,6 +447,11 @@ mod tests {
             .unwrap()
             .class
             .clone()
+    }
+
+    /// A probe that finds no holder.
+    fn free(_: &Path) -> Result<Option<u32>> {
+        Ok(None)
     }
 
     fn facts() -> Facts {
@@ -538,11 +547,18 @@ mod tests {
         fs::write(out.join("loose.log"), b"x").unwrap();
         let e = classify(&out, &facts()).unwrap();
         for x in e.iter().filter(|x| x.class == Class::Orphan) {
-            assert_eq!(remove_orphan(&out, x).unwrap(), None);
+            assert_eq!(remove_orphan(&out, x, free).unwrap(), None);
         }
         for x in e.iter().filter(|x| x.class != Class::Orphan) {
-            assert!(remove_orphan(&out, x).is_err(), "{} refused", x.name);
+            assert!(remove_orphan(&out, x, free).is_err(), "{} refused", x.name);
         }
+        // an orphan a process holds by the time of removal is skipped, not removed
+        dir_with(&out, "gone-co", 1);
+        let e = classify(&out, &facts()).unwrap();
+        let held = e.iter().find(|x| x.name == "gone-co").unwrap();
+        assert_eq!(remove_orphan(&out, held, |_| Ok(Some(7))).unwrap(), Some(7));
+        assert!(out.join("gone-co").is_dir());
+        fs::remove_dir_all(out.join("gone-co")).unwrap();
         let mut left = names(&out);
         left.sort();
         assert_eq!(left, ["br-open", "loose.log", "pool", "stray", "wt-live"]);
