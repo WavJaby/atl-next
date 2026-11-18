@@ -51,8 +51,14 @@ impl Row {
 
 /// The gates `check` runs, cheapest first, except where one reads what another stages.
 pub const ROWS: &[Row] = &[
+    Row::new(&["task-bind"], false, false),
     Row::new(&["sandbox"], true, true),
+    Row::new(&["signing"], true, true),
     Row::new(&["gl-dispatch"], false, true),
+    // reads the workspace's APK cache (default APKs); a missing APK is its own red verdict
+    Row::new(&["app-imports"], false, false),
+    // its --out is its own output dir (default under the workspace, never the build dir); runs on the host's ICD (lavapipe on WSL)
+    Row::new(&["vk-driver"], false, false),
     Row::new(&["nb-isa"], true, true),
     Row::new(&["ui-module"], false, true),
     Row::new(&["platform-ui"], false, false),
@@ -61,11 +67,15 @@ pub const ROWS: &[Row] = &[
     Row::new(&["provider"], true, true),
     Row::new(&["system-scan"], true, true),
     Row::new(&["broadcast"], true, true),
+    Row::new(&["billing"], true, true),
+    Row::new(&["gralloc"], true, true),
     Row::new(&["composer"], true, true),
     Row::new(&["instrument"], true, true),
     Row::new(&["app"], true, true),
     // reads the `app/` tree the app gate stages (its refusal otherwise: "missing <out>/app/root/system/lib64/x86_64 ... run `xtask test app`")
     Row::new(&["nb-identity"], false, true),
+    // needs what nb-identity needs (the staged `app/`)
+    Row::new(&["sles-bridge"], false, true),
     Row::new(&["window", "--stage", "surface-view"], true, true),
     Row::new(&["window", "--stage", "ime"], true, true),
 ];
