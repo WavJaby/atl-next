@@ -127,7 +127,7 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<()> {
 }
 
 /// The gate's verdict among its `<cmd>: ` lines (a gate also prints counters and log tails under its name): its `FAILED` line, else the last pass / ok line.
-fn verdict_line<'a>(text: &'a str, cmd: &str) -> Option<&'a str> {
+pub(crate) fn verdict_line<'a>(text: &'a str, cmd: &str) -> Option<&'a str> {
     let prefix = format!("{cmd}: ");
     let named = || text.lines().filter(|l| l.starts_with(&prefix));
     named().find(|l| l.contains("FAILED")).or_else(|| {

@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: MIT
+# fossify-math 1.4.0 (F-Droid, Java only, no network): 7 + 5 = changes the display. Positions read at 1440x900 content; display region = the result rows above the keypad.
+size 1440 900
+control break-input
+wait-stable 0 0 1440 900 20000 1000
+expect-varied 0 64 1440 296
+# the first input of the run redraws the whole picture in another palette: one harmless tap on the display first, so the mark is taken after it
+tap 720 200
+wait-stable 0 0 1440 900 5000 1000
+mark display 0 64 1440 296
+tap 144 434
+wait-stable 0 64 1440 296 5000 500
+tap 1008 834
+wait-stable 0 64 1440 296 5000 500
+tap 432 568
+wait-stable 0 64 1440 296 5000 500
+tap 720 834
+wait-stable 0 64 1440 296 10000 1000
+expect-changed display
+expect-varied 0 64 1440 296

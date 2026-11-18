@@ -35,7 +35,7 @@ enum Step {
     Fmt,
     /// SPDX header on every tracked or new, non-ignored file
     Spdx,
-    /// repo tables (arches, sources, deps, providers, licenses, prune, cts, test-apks, isa-tiers, gtk-baseline) parse with their schema and invariants
+    /// repo tables (arches, sources, deps, providers, licenses, prune, cts, test-apks, isa-tiers, gtk-baseline) parse with their schema and invariants; the tracked APK scenarios (xtask-harness scenarios.rs `check`) name a row and pass their static rules
     Tables,
     /// deps.toml rows against this host: installed at the required version (`deps --check`)
     Deps,
@@ -168,7 +168,10 @@ impl Step {
             | Step::ConverterPackages
             | Step::GtkImports
             | Step::CrossBionic => Class::Cargo,
-            Step::GlProxies | Step::DriveTap | Step::Gates | Step::HostFonts => Class::Harness,
+            // tables: its scenario half builds and runs the harness
+            Step::Tables | Step::GlProxies | Step::DriveTap | Step::Gates | Step::HostFonts => {
+                Class::Harness
+            }
             _ => Class::Light,
         }
     }
@@ -197,6 +200,11 @@ impl Step {
         }
         if self == Step::LauncherClosure {
             return crate::launcher_closure::check_own(root);
+        }
+        if self == Step::Tables {
+            self.run_whole(root)?;
+            // the scenario scripts' parser is the harness's (drive.rs), which this definition-only tool cannot link: its half runs as a harness step; reads no build dir
+            return crate::harness::check_step(root, "scenarios", out);
         }
         if self == Step::ConverterPackages {
             // the packages link the build dir's converter rlibs: a build from before a rebase fails late (E0432 on main's new parcelables), so refuse it by name, as the runtime gates do

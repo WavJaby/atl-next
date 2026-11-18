@@ -8,13 +8,14 @@
 //! (--hold: the hold); a run that ends before its watch is over fails.
 //! Sound: with --hold (the user's launch) the session's routing, as a desktop launch; headless, every stream plays into a null sink of the run's own (audio_pcm.rs Routing), never the session's sink.
 //! `--drive <script>`: once that wait is over, the script runs against the window (drive.rs for its grammar); a failed step fails the run, and the verdict covers the run up to the script's end.
+//! `--scenario`: the row's tracked script (scenarios.rs) the same way, on a fresh data root of its own, with a `scenario:` verdict; `--controls` adds a run under each declared break that must fail at a checkpoint.
 //! `remote run-apk` ([`remote`]): the same run on a target's desktop. The bundle goes there and is checked, atld runs there for `--hold`, and the logs come back when the run ends; the verdict is read from them, against the target's end record.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, ExitStatus};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 
 use crate::atld_run::{
     MS_PER_S, Package, PackageFile, Run, Runtime, last_resumed, parse_stamp, run_display, settled,
@@ -24,7 +25,7 @@ use crate::manifest::Manifest;
 use atl_services_types::native_libs::{LIB_DIR_NAME, SupportedAbi};
 
 use crate::nested_wayland::NestedCompositor;
-use crate::{drive, manifest, observe, remote, test_apks, verdict, window};
+use crate::{drive, manifest, observe, remote, scenarios, test_apks, verdict, window};
 use xtask::timing;
 
 /// The app process's log line for a presented frame (atl-composer ui_window.rs, debug level: UI mode enables it).
@@ -36,7 +37,7 @@ const END_FILES: [&str; 3] = ["atld.log", "atld.rc", "end.ms"];
 /// How long past the target's limit the transfer may run (its tar and ssh) before it is stopped and the run fails.
 pub(crate) const TRANSFER_MARGIN: Duration = Duration::from_secs(60);
 
-#[derive(clap::Args)]
+#[derive(clap::Args, Clone)]
 pub struct Args {
     /// A row of test-apks.toml (lowercase letters, digits, `-`): its pinned APK is downloaded and verified into `<workspace>/cache/test-apks` on first use.
     /// Any other argument is a file path (it holds `.`, `/` or `\`), relative to the current directory: that APK runs unpinned, no row checks it.
@@ -86,6 +87,16 @@ pub struct Args {
     /// Deliberate-failure check of --drive: the harness's window proxy drops every injected pointer, touch and key event (harness-side; no product path), so the script's first `expect-changed` after input must fail.
     #[arg(long, requires = "drive")]
     break_input: bool,
+    /// Runs the row's tracked scenario `xtask-harness/scenarios/<ROW>.drive` (scenarios.rs) on a fresh data root `<build dir>/scenario/<ROW>/data`, emptied first; shots stay in memory.
+    /// Prints `scenario: ok|FAILED <row> host= cpu= guest= <k>/<n> checkpoints fps= tier= <secs>s [unreachable: ..]`.
+    #[arg(long, conflicts_with_all = ["drive", "hold", "pointer", "data_root", "clear_data"])]
+    scenario: bool,
+    /// With --scenario: one more run under each of the scenario's `control` breaks, which must end FAILED at a checkpoint (`control:` line); one that passes, or fails elsewhere, turns the scenario red.
+    #[arg(long, requires = "scenario")]
+    controls: bool,
+    /// With --scenario: writes the scenario's shots as PNGs into DIR (by their file names) instead of judging them in memory only.
+    #[arg(long, value_name = "DIR", requires = "scenario")]
+    keep_shots: Option<PathBuf>,
     /// atld `--tilt-keys`: held left / right (or a / d) tilt the device for accelerometer games, at atld's default angle, ramp and rate.
     #[arg(long)]
     tilt_keys: bool,
@@ -206,7 +217,27 @@ impl Args {
             app_env: Vec::new(),
             clear_data: false,
             data_root: None,
+            scenario: false,
+            controls: false,
+            keep_shots: None,
         }
+    }
+
+    /// The same scenario run under control `name` (scenarios.rs `CONTROLS`): the break's own flag set.
+    fn under_control(&self, name: &str) -> Result<Self> {
+        let mut a = self.clone();
+        match name {
+            "break-input" => a.break_input = true,
+            "break-isa" => a.break_isa = true,
+            "break-render-path" => a.break_render_path = true,
+            "break-webview-engine" => a.break_webview_engine = true,
+            "no-app-seccomp" => a.no_app_seccomp = true,
+            other => bail!(
+                "control {other:?} is none of {}",
+                crate::scenarios::CONTROLS.join(", ")
+            ),
+        }
+        Ok(a)
     }
 
     /// The same run with `--clear-data` set to `clear` (the gates that launch an app twice and check its data).
@@ -223,6 +254,9 @@ impl Args {
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
+    if args.scenario {
+        return scenario(root, args);
+    }
     let (pin, files) = source(root, &args.target)?;
     // a bad script fails before anything starts
     let steps = match &args.drive {
@@ -247,7 +281,151 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     };
     println!("run-apk: data root {}", data_root.display());
     let rt = rt.with_data_root(&data_root).for_user_launch();
-    run_on(&rt, args, foreign.as_ref(), pin.as_ref(), files, steps)
+    Ok(run_on(&rt, args, foreign.as_ref(), pin.as_ref(), files, steps)?.code())
+}
+
+/// `--scenario` (`--controls`): the row's scenario, then one run under each control; the exit code is the `scenario:` verdict's.
+fn scenario(root: &Path, args: &Args) -> Result<ExitCode> {
+    ensure!(
+        test_apks::names_row(&args.target),
+        "--scenario takes a row of {}, not a path",
+        test_apks::FILE
+    );
+    // a bad script fails before anything starts
+    let script = scenarios::load(root, &args.target)?;
+    let main = scenario_run(root, args, &script, None)?;
+    let mut red = Vec::new();
+    if args.controls {
+        for control in &script.controls {
+            if !scenario_run(root, &args.under_control(control)?, &script, Some(control))?.ok {
+                red.push(control.as_str());
+            }
+        }
+    }
+    println!("{}", main.line);
+    if !red.is_empty() {
+        println!(
+            "scenario: FAILED {} control {} did not fail at a checkpoint",
+            args.target,
+            red.join(", ")
+        );
+    }
+    Ok(if main.ok && red.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// One scenario run's verdict line and whether it passed.
+struct ScenarioVerdict {
+    line: String,
+    ok: bool,
+}
+
+/// One run of `script` on a fresh data root; `control`: the break it runs under, printed as its `control:` line. Returns the main run's verdict, or for a control run whether it failed as required.
+fn scenario_run(
+    root: &Path,
+    args: &Args,
+    script: &drive::Script,
+    control: Option<&str>,
+) -> Result<ScenarioVerdict> {
+    let started = Instant::now();
+    let (pin, files) = source(root, &args.target)?;
+    let (rt, foreign) = runtime(root, args, &files)?;
+    let data_root = scenarios::data_root(&rt.out, &args.target);
+    if data_root.exists() {
+        std::fs::remove_dir_all(&data_root)
+            .with_context(|| format!("emptying {}", data_root.display()))?;
+    }
+    std::fs::create_dir_all(&data_root).with_context(|| data_root.display().to_string())?;
+    println!("run-apk: data root {} (fresh)", data_root.display());
+    let guest = match &foreign {
+        Some(a) => a.abi.clone(),
+        None => rt
+            .abis()
+            .first()
+            .map_or_else(|| "?".to_owned(), |a| a.abi.clone()),
+    };
+    let rt = rt.with_data_root(&data_root).for_user_launch();
+    let ran = run_on(
+        &rt,
+        args,
+        foreign.as_ref(),
+        pin.as_ref(),
+        files,
+        Some(script.clone()),
+    )?;
+    let (passed, failure, at_checkpoint) = match &ran.drive {
+        Some(o) => (
+            o.passed,
+            o.error.as_ref().map(|e| format!("{e:#}")),
+            o.at_checkpoint,
+        ),
+        None => (0, Some("the script never ran".to_owned()), false),
+    };
+    let failure = failure.or_else(|| (!ran.ok).then(|| "run-apk: FAILED (above)".to_owned()));
+    let verdict = scenarios::Verdict {
+        row: &args.target,
+        host: &args.host,
+        cpu: scenarios::native_cpu(),
+        guest,
+        passed,
+        total: script.checkpoints(),
+        fps: fps_mean(&ran.app),
+        tier: buffer_tier(&ran.app).unwrap_or("none").to_owned(),
+        secs: started.elapsed().as_secs(),
+        unreachable: script.unreachable.iter().map(|(s, _)| s.as_str()).collect(),
+        failure: failure.as_deref(),
+    };
+    let line = verdict.line();
+    Ok(match control {
+        None => ScenarioVerdict {
+            ok: failure.is_none(),
+            line,
+        },
+        Some(c) => {
+            // red as required: the drive stopped at a checkpoint (not at setup, input or the app's own end)
+            let ok = failure.is_some() && at_checkpoint;
+            println!(
+                "control: {} {c} ({})",
+                if ok {
+                    "red as required"
+                } else {
+                    "NOT red at a checkpoint"
+                },
+                line.trim_start_matches("scenario: ")
+            );
+            ScenarioVerdict { line, ok }
+        }
+    })
+}
+
+/// The mean of the composer's per-second `presented=` counts over the run; None: no fps line.
+fn fps_mean(app: &str) -> Option<f64> {
+    let counts: Vec<u64> = app
+        .lines()
+        .filter_map(|l| l.split_once(FPS_LINE))
+        .filter_map(|(_, rest)| rest.split_whitespace().next()?.parse().ok())
+        .collect();
+    (!counts.is_empty()).then(|| counts.iter().sum::<u64>() as f64 / counts.len() as f64)
+}
+
+/// What [`run_on`] got to: the run-apk verdict, the drive's outcome (a script run), the app log.
+pub(crate) struct Ran {
+    pub(crate) ok: bool,
+    pub(crate) drive: Option<drive::Outcome>,
+    pub(crate) app: String,
+}
+
+impl Ran {
+    pub(crate) fn code(&self) -> ExitCode {
+        if self.ok {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Where run-apk kept the device before it moved to the user's data dir (b7c61763): under the build dir `out`, so a pruned or other build dir lost it.
@@ -320,7 +498,7 @@ pub(crate) fn run_on(
     pin: Option<&test_apks::Row>,
     files: Vec<PackageFile>,
     steps: Option<drive::Script>,
-) -> Result<ExitCode> {
+) -> Result<Ran> {
     let work = rt.out.join("run-apk");
     std::fs::create_dir_all(&work)?;
     // without --hold nobody watches the window: it maps in the gate's own compositor, which outlives atld (declared before it)
@@ -432,6 +610,11 @@ pub(crate) fn run_on(
                     log_dir: &log_dir,
                     alive: &|| !run.app_ended(),
                     break_blank: args.break_blank_capture,
+                    shots: match (&args.keep_shots, args.scenario) {
+                        (Some(dir), _) => drive::Shots::Into(dir.clone()),
+                        (None, true) => drive::Shots::Memory,
+                        (None, false) => drive::Shots::AsNamed,
+                    },
                 };
                 driven = Some(timing::phase("run: script", || drive::run(steps, target)));
             }
@@ -497,18 +680,24 @@ pub(crate) fn run_on(
             render_path_check(&read(&run.atld_log()), &app).map(|p| format!("{ok}; {p}"))
         });
     // the drive's failure first: it says what the script could not do, the verdict only what the app did
-    let outcome = match (driven, steps.is_some()) {
-        (Some(Err(e)), _) => Err(format!("drive: {e:#}")),
+    let outcome = match (&driven, steps.is_some()) {
+        (Some(drive::Outcome { error: Some(e), .. }), _) => Err(format!("drive: {e:#}")),
         (None, true) => outcome.and(Err("the script never ran".to_owned())),
         _ => outcome,
     };
-    Ok(finish(
+    let ok = outcome.is_ok();
+    finish(
         outcome,
         &app,
         &services,
         &run.atld_log(),
         &run.root.join("log"),
-    ))
+    );
+    Ok(Ran {
+        ok,
+        drive: driven,
+        app,
+    })
 }
 
 /// `xtask remote run-apk` (see [`RemoteArgs`]): the run on a target's desktop. Dry run by default: prints the bundle and the plan. `--apply` records the run, pushes the bundle, runs the target's check, then runs atld there with its limit at `window::LIMIT` + the hold (+ a pointer script's waits). The logs come back when the run ends, and the verdict is `run-apk`'s, on the target's clock.
@@ -548,6 +737,9 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         app_env: Vec::new(),
         clear_data: false,
         data_root: None,
+        scenario: false,
+        controls: false,
+        keep_shots: None,
     };
     // no `--display`: atld reads the target's own monitor, as on the product's host (host_display); this host's monitor is not the target's
     let (rt, foreign) = runtime(root, &args, &files)?;

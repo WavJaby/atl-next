@@ -63,6 +63,7 @@ mod remote;
 mod run_apk;
 mod rv_qemu;
 mod sandbox;
+mod scenarios;
 mod screencopy;
 mod sensors;
 mod services;
@@ -140,6 +141,8 @@ enum CheckStep {
     DriveTap,
     HostFonts,
     Gates,
+    /// step `tables`' scenario half: the static rules over `xtask-harness/scenarios` (scenarios.rs `check`); needs no build dir
+    Scenarios,
 }
 
 #[derive(Subcommand)]
@@ -209,6 +212,8 @@ enum Test {
     Window(window::Args),
     /// `run-apk --drive` on fixtures, judged from its PNGs: a shot's pixels are the known quadrants (also after `resize`), and a tap visibly changes the frame. `--break-blank` and `--break-colour` must turn it red.
     Drive(drive_gate::Args),
+    /// Every tracked scenario (`xtask-harness/scenarios/<row>.drive`, scenarios.rs) as its own `run-apk <row> --scenario` process, sequentially; logs under `<out>/scenarios/`, one `scenarios:` summary line. On demand only: not a `check` gate.
+    Scenarios(scenarios::Args),
     /// The sensor service: a fixture (xtask-harness/testdata/sensors) uses SensorManager under atld with a fake `/sys/bus` (private mount namespace). `--stage empty`: no sensor, no stall; `--stage iio`: a fake IIO accelerometer's events with hand-derived values; `--stage buffer`: the same on its kernel buffer (a FIFO at `/dev/iio:device0`). `--break` must turn it red.
     Sensors(sensors::Args),
     /// The GTK platform layer (M3 slice 6) on a real Wayland compositor: a window maps, frame-clock ticks present scenes, GSK readback equals the pattern, a blocked UI thread answers no `xdg_wm_base` ping.
@@ -384,6 +389,9 @@ fn main() -> Result<ExitCode> {
             test: Test::Drive(args),
         } => drive_gate::run(&root, &args),
         Command::Test {
+            test: Test::Scenarios(args),
+        } => scenarios::run(&root, &args),
+        Command::Test {
             test: Test::Sensors(args),
         } => sensors::run(&root, &args),
         Command::Test {
@@ -489,6 +497,11 @@ fn check_step(root: &std::path::Path, step: CheckStep, out: &std::path::Path) ->
             check_gates::run(root, arch, out)?;
             None
         }
+        CheckStep::Scenarios => {
+            let n = scenarios::check(root)?;
+            eprintln!("tables: {} ok ({n} scenarios)", scenarios::DIR);
+            None
+        }
     };
     if let Some(why) = skipped {
         println!("{}{why}", xtask::harness::SKIP_PREFIX);
@@ -524,6 +537,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::Composer(_) => "composer",
             Test::Window(_) => "window",
             Test::Drive(_) => "drive",
+            Test::Scenarios(_) => "scenarios",
             Test::Sensors(_) => "sensors",
             Test::PlatformUi(_) => "platform-ui",
             Test::UiModule(_) => "ui-module",

@@ -142,6 +142,7 @@ impl<'a> Gate<'a> {
             }],
             Some(script),
         )
+        .map(|ran| ran.code())
     }
 }
 

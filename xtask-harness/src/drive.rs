@@ -17,6 +17,7 @@ use crate::window;
 /// The script grammar (`run-apk --drive`'s help text).
 pub const GRAMMAR: &str = "A script file run against the window on the headless compositor, one step a line; blank lines and `#` comments are skipped. Every wait names its timeout: nothing waits by default.
 Header (before the first step): `size W H` = the content size the script's coordinates were read at; points and regions scale per axis to the live content. Without it coordinates are live content pixels.
+Scenario headers (a tracked scenario, `run-apk --scenario`; a plain run ignores them): `control BREAK` (a deliberate break the scenario must fail under, at a checkpoint) | `unreachable STATE: REASON` (declared out of reach, printed in the verdict) | `needs ARCH` (the guest arch of the row's bridge).
 A region is `X Y W H` in the same pixels. Text arguments are one word or \"quoted\"; a source is `app`, `services` or `atld` (that process's log).
 Input: `tap X Y` / `swipe X1 Y1 X2 Y2 MS` (the mouse) | `touch X Y MS` / `touch-swipe X1 Y1 X2 Y2 MS` (one finger, wl_touch; Unity reads only this) | `leave` (mouse off the window) | `key NAME` / `key-down NAME` / `key-up NAME` (a letter, a digit, escape, backspace, tab, enter, space, home, end, up, down, left, right, pageup, pagedown, back) | `resize W H` (content size).
 Time: `wait MS` | `wait-frames N` (N presents from here, 120 s bound; only after something that redraws).
@@ -194,11 +195,43 @@ pub enum Step {
     },
 }
 
-/// A parsed script: the `size` header and the steps.
-#[derive(Debug, Clone, PartialEq)]
+/// A parsed script: its headers and the steps. `controls`, `unreachable` and `needs` are a tracked scenario's (scenarios.rs); a plain `--drive` run ignores them.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Script {
     pub size: Option<(f64, f64)>,
+    /// `control NAME`: a deliberate break under which the scenario must fail at a checkpoint.
+    pub controls: Vec<String>,
+    /// `unreachable STATE: REASON`: a state the scenario declares out of reach, printed in its verdict.
+    pub unreachable: Vec<(String, String)>,
+    /// `needs ARCH`: the guest arch the row runs under (its bridge).
+    pub needs: Option<String>,
     pub steps: Vec<Step>,
+}
+
+impl Script {
+    /// The top-level checkpoints, the `n` of a scenario's `k/n checkpoints` (an if-log counts as one: its body is optional).
+    pub fn checkpoints(&self) -> usize {
+        self.steps.iter().filter(|s| is_checkpoint(s)).count()
+    }
+}
+
+/// How a run's `shot` steps keep their pictures.
+#[derive(Debug, Clone)]
+pub enum Shots {
+    /// At the path the step names (`--drive`).
+    AsNamed,
+    /// Judged (one colour fails) and dropped: a scenario's default.
+    Memory,
+    /// Under this dir, by the step's file name (`--keep-shots`).
+    Into(PathBuf),
+}
+
+/// What a run got to: top-level checkpoints passed, and the failure if any (`at_checkpoint`: it failed in a checkpoint step, not in input, a wait or a shot).
+#[derive(Debug)]
+pub struct Outcome {
+    pub passed: usize,
+    pub error: Option<anyhow::Error>,
+    pub at_checkpoint: bool,
 }
 
 /// The linux input code of a script key name.
@@ -237,29 +270,57 @@ fn words(line: &str) -> Result<Vec<String>> {
 }
 
 /// The script; an error names the line.
-pub fn parse(script: &str) -> Result<Script> {
+pub fn parse(text: &str) -> Result<Script> {
+    let mut script = Script::default();
     let mut size = None;
     let mut steps = Vec::new();
     // an open `if-log`: its line and its step; the body collects until `end`
     let mut open: Option<(usize, Step)> = None;
-    for (index, line) in script.lines().enumerate() {
+    for (index, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         let at = || format!("script line {}", index + 1);
+        let header = |name: &str| -> Result<()> {
+            ensure!(
+                steps.is_empty() && open.is_none(),
+                "{}: `{name}` is a header: before the first step",
+                at()
+            );
+            Ok(())
+        };
+        // free text after the state's colon: not split into words
+        if let Some(rest) = line.strip_prefix("unreachable ") {
+            header("unreachable")?;
+            let (state, reason) = rest
+                .split_once(':')
+                .map(|(s, r)| (s.trim(), r.trim()))
+                .filter(|(s, r)| !s.is_empty() && !r.is_empty())
+                .with_context(|| format!("{}: unreachable needs `STATE: REASON`", at()))?;
+            script
+                .unreachable
+                .push((state.to_owned(), reason.to_owned()));
+            continue;
+        }
         let w = words(line).with_context(at)?;
         let w: Vec<&str> = w.iter().map(String::as_str).collect();
         match w.as_slice() {
             ["size", sw, sh] => {
-                ensure!(
-                    size.is_none() && steps.is_empty() && open.is_none(),
-                    "{}: `size` is a header: once, before the first step",
-                    at()
-                );
+                header("size")?;
+                ensure!(size.is_none(), "{}: `size` given twice", at());
                 let (sw, sh): (f64, f64) = (num(sw).with_context(at)?, num(sh).with_context(at)?);
                 ensure!(sw > 0.0 && sh > 0.0, "{}: size needs a positive size", at());
                 size = Some((sw, sh));
+            }
+            ["control", name] => {
+                header("control")?;
+                script.controls.push((*name).to_owned());
+            }
+            ["needs", arch] => {
+                header("needs")?;
+                ensure!(script.needs.is_none(), "{}: `needs` given twice", at());
+                script.needs = Some((*arch).to_owned());
             }
             ["end"] => {
                 let (_, step) = open
@@ -284,7 +345,9 @@ pub fn parse(script: &str) -> Result<Script> {
     if let Some((line, _)) = open {
         bail!("script line {line}: if-log has no `end`");
     }
-    Ok(Script { size, steps })
+    script.size = size;
+    script.steps = steps;
+    Ok(script)
 }
 
 fn num<T: std::str::FromStr>(word: &str) -> Result<T> {
@@ -466,9 +529,14 @@ pub struct Target<'a> {
     pub alive: &'a dyn Fn() -> bool,
     /// Deliberate failure: each shot is blanked before its check, which must then fail the run.
     pub break_blank: bool,
+    pub shots: Shots,
 }
 
 struct Driver<'a> {
+    /// Top-level checkpoints passed so far.
+    passed: usize,
+    /// Whether the step that failed is a checkpoint.
+    failed_checkpoint: bool,
     t: Target<'a>,
     size: Option<(f64, f64)>,
     /// The content's origin in the surface, from the platform's log line.
@@ -485,13 +553,26 @@ struct Driver<'a> {
 }
 
 /// Runs `script`, stopping at the first failure.
-pub fn run(script: &Script, target: Target<'_>) -> Result<()> {
+pub fn run(script: &Script, target: Target<'_>) -> Outcome {
     let log = atl_diag::logfiles::read(target.app_log);
-    let (x, y) = window::content_origin(&log).map_err(anyhow::Error::msg)?;
-    // the scale: one content pixel past the origin, in surface units
-    let one = window::content_to_surface(&log, (1.0, 0.0)).map_err(anyhow::Error::msg)?;
-    let scale = 1.0 / (one.0 - f64::from(x));
+    let placed = window::content_origin(&log).and_then(|(x, y)| {
+        // the scale: one content pixel past the origin, in surface units
+        let one = window::content_to_surface(&log, (1.0, 0.0))?;
+        Ok((x, y, 1.0 / (one.0 - f64::from(x))))
+    });
+    let (x, y, scale) = match placed {
+        Ok(p) => p,
+        Err(e) => {
+            return Outcome {
+                passed: 0,
+                error: Some(anyhow::Error::msg(e)),
+                at_checkpoint: false,
+            };
+        }
+    };
     let mut d = Driver {
+        passed: 0,
+        failed_checkpoint: false,
         t: target,
         size: script.size,
         origin: (x.round() as i32, y.round() as i32),
@@ -502,7 +583,12 @@ pub fn run(script: &Script, target: Target<'_>) -> Result<()> {
         marks: HashMap::new(),
         cursors: [0; 3],
     };
-    d.steps(&script.steps, "")
+    let error = d.steps(&script.steps, "").err();
+    Outcome {
+        passed: d.passed,
+        at_checkpoint: error.is_some() && d.failed_checkpoint,
+        error,
+    }
 }
 
 /// The phase a script step's time counts in: waits and shots on the app's own clock, input, resizes, checkpoints.
@@ -605,11 +691,17 @@ impl Driver<'_> {
         for (index, step) in steps.iter().enumerate() {
             let name = format!("{indent}{} {}", index + 1, show(step));
             println!("drive: step {name}");
+            // a failure inside an if-log's body leaves the body's own flag; the if-log itself is the top-level checkpoint
+            self.failed_checkpoint = is_checkpoint(step);
             xtask::timing::phase(step_phase(step), || self.step(step, indent))
                 .with_context(|| format!("step {name}"))?;
+            self.failed_checkpoint = false;
             ensure!((self.t.alive)(), "the app ended during step {name}");
             if is_checkpoint(step) {
                 self.checkpoint();
+                if indent.is_empty() {
+                    self.passed += 1;
+                }
             }
         }
         Ok(())
@@ -1044,10 +1136,17 @@ impl Driver<'_> {
             image.width,
             image.height
         );
-        image.write_png(file)?;
+        let path = match &self.t.shots {
+            Shots::AsNamed => Some(file.to_path_buf()),
+            Shots::Memory => None,
+            Shots::Into(dir) => Some(dir.join(file.file_name().context("shot names no file")?)),
+        };
+        if let Some(path) = &path {
+            image.write_png(path)?;
+        }
         println!(
             "drive: shot {} {}x{}",
-            file.display(),
+            path.as_deref().unwrap_or(file).display(),
             image.width,
             image.height
         );
