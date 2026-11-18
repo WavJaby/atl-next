@@ -161,12 +161,12 @@ fn harness(
     fixture: &Path,
     sigchain: &Path,
 ) -> Result<()> {
-    // a PID namespace of its own (qemu_gate::SMALL_PIDS), as cargo's runner for the test binary: unit_use appends cargo's own arguments, so cargo must stay the command
+    // a PID namespace of its own (qemu_gate::small_pids_argv), as cargo's runner for the test binary: unit_use appends cargo's own arguments, so cargo must stay the command
     let runner = format!(
         "target.'cfg(all())'.runner = [{}]",
-        crate::qemu_gate::SMALL_PIDS
+        crate::qemu_gate::small_pids_argv()
             .iter()
-            .map(|a| format!("{a:?}"))
+            .map(|a| format!("{:?}", a.to_string_lossy()))
             .collect::<Vec<_>>()
             .join(", ")
     );

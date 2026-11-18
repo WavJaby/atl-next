@@ -22,16 +22,12 @@ fn hello_expected(target: &str) -> String {
     format!("hello from static {target}: sum=5050\n")
 }
 
-/// Command prefix giving the guest a PID namespace of its own: LP32 bionic aborts at startup when its thread id is above 65535 ("32-bit pthread_mutex_t only supports pids <= 65535", measured with pids 133253 and 1042196), and a desktop's pid_max is far higher; an app process gets the same from its sandbox (atl-broker runs bwrap --unshare-pid). Used for every target: one path, harmless for LP64.
-pub(crate) const SMALL_PIDS: &[&str] = &[
-    "bwrap",
-    "--dev-bind",
-    "/",
-    "/",
-    "--unshare-pid",
-    "--die-with-parent",
-    "--",
-];
+/// bwrap argv (program first, closing `--` last) giving the guest a PID namespace of its own: LP32 bionic aborts at startup when its thread id is above 65535 ("32-bit pthread_mutex_t only supports pids <= 65535", measured with pids 133253 and 1042196), and a desktop's pid_max is far higher; an app process gets the same from its sandbox (atl-broker runs bwrap --unshare-pid). Used for every target: one path, harmless for LP64.
+pub(crate) fn small_pids_argv() -> Vec<std::ffi::OsString> {
+    let mut a = atl_bwrap::Args::new();
+    a.dev_bind("/", "/").unshare_pid().die_with_parent();
+    std::iter::once("bwrap".into()).chain(a.end()).collect()
+}
 
 /// Per `qemu_target`: QEMU's tests/tcg programs run here (each by its `run-<name>` rule; each passes on the pin with the NDK guest compiler), and those that fail on the pin, reported as skipped rather than run (each goes back into the run list when its condition clears).
 struct Tcg {
@@ -152,10 +148,11 @@ fn hello(root: &Path, b: &Build, exe: &Path, gate: &Path) -> Result<()> {
     Ok(())
 }
 
-/// A command running [`SMALL_PIDS`]; append the program and its arguments.
+/// A command running [`small_pids_argv`]; append the program and its arguments.
 fn small_pids() -> Command {
-    let mut cmd = Command::new(SMALL_PIDS[0]);
-    cmd.args(&SMALL_PIDS[1..]);
+    let argv = small_pids_argv();
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
     cmd
 }
 

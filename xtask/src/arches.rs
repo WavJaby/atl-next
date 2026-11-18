@@ -628,7 +628,9 @@ fn linux_prebuilt_os(config_go: &str) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{host_row, kernel_arch_matches, linux_prebuilt_os, parse, qemu_target};
+    use super::{
+        host_row, kernel_arch_matches, linux_prebuilt_os, parse, qemu_target, target_arch_of,
+    };
 
     #[test]
     fn host_row_by_rust_triple() {
