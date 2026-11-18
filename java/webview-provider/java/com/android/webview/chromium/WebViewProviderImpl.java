@@ -51,7 +51,7 @@ import java.util.concurrent.Executor;
  * (xtask provider-refusals table: no contract-legal answer) throw Unimplemented.refuse("<Interface>.<method>").
  * The clients are stored here as handed in (the natives read them for each callback); getWebViewClient's default instance is WebView's documented "default client if not yet set".
  */
-final class WebViewProviderImpl implements WebViewProvider, WebViewProvider.ViewDelegate, WebViewProvider.ScrollDelegate {
+final class WebViewProviderImpl implements WebViewProvider, WebViewProvider.ViewDelegate, WebViewProvider.ScrollDelegate, android.view.ViewTreeObserver.OnPreDrawListener {
     // read and cleared by the natives: the native view, 0 after destroy
     private long mNative;
     // read by the natives: the WebView passed to every client callback
@@ -213,8 +213,10 @@ final class WebViewProviderImpl implements WebViewProvider, WebViewProvider.View
     // nothing to draw: the carrier's hole shows the page
     @Override public void onDraw(Canvas canvas) {}
     // the View-side events that decide whether the carrier is on screen, logged per view by the natives; window visibility is forwarded to the carrier (transients get no visibility dispatch)
-    @Override public void onAttachedToWindow() { viewEvent("attached", 0); }
-    @Override public void onDetachedFromWindow() { viewEvent("detached", 0); }
+    @Override public void onAttachedToWindow() { viewEvent("attached", 0); mWebView.getViewTreeObserver().addOnPreDrawListener(this); }
+    @Override public void onDetachedFromWindow() { viewEvent("detached", 0); mWebView.getViewTreeObserver().removeOnPreDrawListener(this); }
+    // each frame: the natives place the carrier when a software layer keeps RenderThread from it (AB2's account panel); never cancels the draw
+    @Override public native boolean onPreDraw();
     @Override public void onVisibilityChanged(View changedView, int visibility) { viewEvent("visibility", visibility); }
     @Override public native void onWindowVisibilityChanged(int visibility);
     private native void viewEvent(String what, int value);

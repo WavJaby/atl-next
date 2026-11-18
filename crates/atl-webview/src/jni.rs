@@ -175,6 +175,14 @@ fn call_long(env: Env, obj: Obj, name: &CStr, sig: &CStr) -> i64 {
     jni_call!(env, CallLongMethodA, obj, m, std::ptr::null())
 }
 
+fn call_float(env: Env, obj: Obj, name: &CStr, sig: &CStr) -> f32 {
+    let m = method(env, obj, name, sig);
+    if m.is_null() {
+        return 0.0;
+    }
+    jni_call!(env, CallFloatMethodA, obj, m, std::ptr::null())
+}
+
 fn field(env: Env, obj: Obj, name: &CStr, sig: &CStr) -> *mut _jfieldID {
     let c = jni_call!(env, GetObjectClass, obj);
     let f = jni_call!(env, GetFieldID, c, name.as_ptr(), sig.as_ptr());
@@ -409,6 +417,17 @@ struct Native {
     paused: Cell<bool>,
     /// Global ref to the carrier SurfaceView (add_carrier), 0 before init; deleted at destroy.
     carrier: Cell<usize>,
+    /// The carrier's last placement from the UI thread ([`place_in_software_layer`]); None while RenderThread places it.
+    software: Cell<Option<Placement>>,
+}
+
+/// A carrier placement from the UI thread: position in the window surface, scale, shown.
+#[derive(Clone, Copy, PartialEq)]
+struct Placement {
+    x: i32,
+    y: i32,
+    scale: (f32, f32),
+    shown: bool,
 }
 
 impl Native {
@@ -594,6 +613,7 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProvid
         third_party: Cell::new(false),
         paused: Cell::new(false),
         carrier: Cell::new(0),
+        software: Cell::new(None),
     }));
     // SAFETY: just made; the only reference.
     unsafe { &*native }.set_third_party(third_party);
@@ -1641,6 +1661,142 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_onWindowV
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_viewEvent, (env, n, what: Obj, value: i32) -> () = (), {
     tracing::info!("webview[{}]: {} {value}", n.shared.id.get(), string(env, what).unwrap_or_default());
 });
+
+/// The divergence of a carrier placed from the UI thread (a software layer on the WebView or an ancestor): the layer's alpha, paint/colour filter and clip do not reach the page, a transform of that
+/// layer shows one frame late, `View.draw(Canvas)` captures show a transparent hole. Condition: the GTK-widget carrier (M68); the in-View drawing ideal (WPE) deletes this path.
+const SOFTWARE_LAYER: &str = "webview.carrier.software-layer";
+/// View.LAYER_TYPE_SOFTWARE.
+const LAYER_TYPE_SOFTWARE: i32 = 1;
+
+// every frame (ViewTreeObserver.OnPreDrawListener, registered while attached); never cancels the draw
+provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_onPreDraw, (env, n) -> u8 = 1, {
+    jni_call!(env, PushLocalFrame, 16);
+    place_in_software_layer(env, n);
+    jni_call!(env, PopLocalFrame, NULL);
+    1
+});
+
+/// The product of the scales of `view` and its View ancestors when one of them has a software layer, else None.
+/// AOSP: under a software layer every descendant is drawn into the layer's bitmap (View.buildDrawingCache), so no RenderNode of the subtree reaches RenderThread.
+fn software_layer_scale(env: Env, view: Obj) -> Option<(f32, f32)> {
+    let view_class = jni_call!(env, FindClass, c"android/view/View".as_ptr());
+    let (mut sx, mut sy, mut software) = (1.0, 1.0, false);
+    let mut v = jni_call!(env, NewLocalRef, view);
+    while !v.is_null() && jni_call!(env, IsInstanceOf, v, view_class) != 0 {
+        software |= call_int(env, v, c"getLayerType", c"()I", &[]) == LAYER_TYPE_SOFTWARE;
+        sx *= call_float(env, v, c"getScaleX", c"()F");
+        sy *= call_float(env, v, c"getScaleY", c"()F");
+        let p = call_obj(env, v, c"getParent", c"()Landroid/view/ViewParent;", &[]);
+        delete_local(env, v);
+        v = p;
+    }
+    delete_local(env, v);
+    delete_local(env, view_class);
+    software.then_some((sx, sy))
+}
+
+/// The carrier's layer is placed by RenderThread's position listener when its RenderNode is drawn (SurfaceView.java:1146-1149); under a software layer nothing places it, so the page never shows
+/// (Angry Birds 2's account panel: a Rovio WebView with layer type software). Here the provider places it from the UI thread with what SurfaceView's own software path sets (updateSurface:
+/// position in the surface, scale, shown), applied with the window's next frame; only when the placement changed. Counted once per entry into this path ([`SOFTWARE_LAYER`]).
+fn place_in_software_layer(env: Env, n: &Native) {
+    let c = carrier(env, n);
+    if c.is_null() || !call_bool(env, c, c"isHardwareAccelerated", c"()Z", &[]) {
+        return; // no carrier, or a software window: SurfaceView places its layer from the UI thread itself (updateSurface)
+    }
+    let provider = jni_call!(env, NewLocalRef, n.shared.provider.get() as Obj);
+    let web_view = object_field(env, provider, c"mWebView", c"Landroid/webkit/WebView;");
+    let Some(scale) = software_layer_scale(env, web_view) else {
+        if n.software.take().is_some() {
+            tracing::info!(
+                "webview[{}]: carrier placed by RenderThread again",
+                n.shared.id.get()
+            );
+        }
+        return;
+    };
+    let sc = call_obj(
+        env,
+        c,
+        c"getSurfaceControl",
+        c"()Landroid/view/SurfaceControl;",
+        &[],
+    );
+    if sc.is_null() || !call_bool(env, sc, c"isValid", c"()Z", &[]) {
+        return; // no layer yet: SurfaceView creates it in its own pre-draw
+    }
+    let at = jni_call!(env, NewIntArray, 2);
+    call_void(env, web_view, c"getLocationInSurface", c"([I)V", &[l(at)]);
+    let mut xy = [0i32; 2];
+    jni_call!(env, GetIntArrayRegion, at, 0, 2, xy.as_mut_ptr());
+    let p = Placement {
+        x: xy[0],
+        y: xy[1],
+        scale,
+        shown: call_bool(env, web_view, c"isShown", c"()Z", &[]),
+    };
+    if pending(env) || n.software.get() == Some(p) {
+        return;
+    }
+    let id = n.shared.id.get();
+    if n.software.get().is_none() {
+        atl_diag::count(atl_diag::DIVERGENCE, SOFTWARE_LAYER, None);
+        tracing::info!("webview[{id}]: carrier placed from the UI thread (software layer)");
+    }
+    n.software.set(Some(p));
+    tracing::debug!(
+        "webview[{id}]: carrier at {},{} scale {:?} shown {}",
+        p.x,
+        p.y,
+        p.scale,
+        p.shown
+    );
+    let t = new_object(env, c"android/view/SurfaceControl$Transaction", c"()V", &[]);
+    if t.is_null() {
+        return;
+    }
+    let f = |v: f32| jvalue { f: v };
+    let _ = call_obj(
+        env,
+        t,
+        c"setPosition",
+        c"(Landroid/view/SurfaceControl;FF)Landroid/view/SurfaceControl$Transaction;",
+        &[l(sc), f(p.x as f32), f(p.y as f32)],
+    );
+    let _ = call_obj(
+        env,
+        t,
+        c"setMatrix",
+        c"(Landroid/view/SurfaceControl;FFFF)Landroid/view/SurfaceControl$Transaction;",
+        &[l(sc), f(scale.0), f(0.0), f(0.0), f(scale.1)],
+    );
+    let show: &CStr = if p.shown { c"show" } else { c"hide" };
+    let _ = call_obj(
+        env,
+        t,
+        show,
+        c"(Landroid/view/SurfaceControl;)Landroid/view/SurfaceControl$Transaction;",
+        &[l(sc)],
+    );
+    // with the window's next frame, as SurfaceView.requestUpdateSurfacePositionAndScale (applyTransactionOnVriDraw)
+    let root = call_obj(
+        env,
+        web_view,
+        c"getRootSurfaceControl",
+        c"()Landroid/view/AttachedSurfaceControl;",
+        &[],
+    );
+    if root.is_null()
+        || !call_bool(
+            env,
+            root,
+            c"applyTransactionOnDraw",
+            c"(Landroid/view/SurfaceControl$Transaction;)Z",
+            &[l(t)],
+        )
+    {
+        call_void(env, t, c"apply", c"()V", &[]);
+    }
+}
 
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_setInitialScale, (env, n, percent: i32) -> () = (), {
     let _ = env;
