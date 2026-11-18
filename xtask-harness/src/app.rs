@@ -1575,6 +1575,31 @@ fn dex_load_failures(services: &str) -> Vec<String> {
     }
 }
 
+/// Main.drawingCache: `drawing-cache app=<bytes> real=<w>x<h>`. The application context's resources carry the global configuration, whose maxBounds is the display
+/// (DisplayContent.computeScreenConfiguration:2486-2488), and ViewConfiguration's limit is 4 x maxBounds area (ViewConfiguration.java:485, ARGB_8888 bytes): so 4 x w x h of the real size.
+const DRAWING_CACHE: &str = "AtlTest: drawing-cache ";
+
+fn drawing_cache_failures(app: &str) -> Vec<String> {
+    let Some(rest) = app
+        .lines()
+        .find_map(|l| l.split_once(DRAWING_CACHE).map(|(_, r)| r.trim_end()))
+    else {
+        return vec![format!("drawing-cache: no {DRAWING_CACHE:?} line")];
+    };
+    let parsed = rest.split_once(" real=").and_then(|(app, real)| {
+        let bytes: i64 = app.strip_prefix("app=")?.parse().ok()?;
+        let (w, h) = real.split_once('x')?;
+        Some((bytes, w.parse::<i64>().ok()?, h.parse::<i64>().ok()?))
+    });
+    match parsed {
+        Some((bytes, w, h)) if w > 0 && h > 0 && bytes == 4 * w * h => Vec::new(),
+        Some((bytes, w, h)) => vec![format!(
+            "drawing-cache: application context limit {bytes}, want 4 x {w} x {h} (maxBounds = the display)"
+        )],
+        None => vec![format!("drawing-cache: unreadable {rest:?}")],
+    }
+}
+
 /// The round trip's lines against what Main.java and ResultChild.java log, one reason per missing or wrong line. The child's result carries its code and extra. Main's first
 /// result or resume after the child finished is that result: a pending result goes out before the resume (ActivityResultItem, TaskFragment.java:1665-1693). The self-start's
 /// cancel comes before its new intent (ActivityStarter.java:2469).
@@ -2335,6 +2360,10 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
     }
     if passed {
         whys.extend(dex_load_failures(&services_log));
+    }
+    // the application context's software-layer limit (Main.drawingCache): 0 hides every software-layer view
+    if passed {
+        whys.extend(drawing_cache_failures(&app));
     }
     // startActivityForResult round trip (Main.java, ResultChild.java): the result, its order against Main's resume, and the singleTop self-start's cancel
     if passed {
@@ -3132,6 +3161,15 @@ mod tests {
         "AtlTest: main new intent\n",
         "AtlTest: permission-request request=11 names=[android.permission.POST_NOTIFICATIONS] results=[-1] self=-1\n",
     );
+
+    /// 1440 x 900 x 4 bytes = 5184000 (ARGB_8888); the pre-fix run logged `app=0` (empty maxBounds).
+    #[test]
+    fn drawing_cache_is_four_bytes_per_display_pixel() {
+        assert!(drawing_cache_failures("AtlTest: drawing-cache app=5184000 real=1440x900\n").is_empty());
+        assert!(drawing_cache_failures("AtlTest: drawing-cache app=0 real=1440x900\n")[0].contains("limit 0"));
+        assert!(drawing_cache_failures("AtlTest: drawing-cache app=0 real=0x0\n")[0].contains("limit 0"));
+        assert!(drawing_cache_failures("AtlTest: onCreate reached\n")[0].contains("no "));
+    }
 
     #[test]
     fn round_trip_as_logged_passes() {

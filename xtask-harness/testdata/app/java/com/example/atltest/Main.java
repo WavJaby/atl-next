@@ -429,8 +429,20 @@ public class Main extends Activity {
         return "name=" + p.packageName + " system=" + system;
     }
 
+    /**
+     * "drawing-cache app=<bytes> real=<w>x<h>" (app.rs DRAWING_CACHE): ViewConfiguration's software-layer limit from the application context, as an SDK view built on it gets it (AB2's
+     * settings WebView), next to the display's real size. Logged before anything else: ViewConfiguration caches its first instance per density for the whole process.
+     */
+    private void drawingCache() {
+        int bytes = android.view.ViewConfiguration.get(getApplicationContext()).getScaledMaximumDrawingCacheSize();
+        android.graphics.Point real = new android.graphics.Point();
+        getSystemService(android.hardware.display.DisplayManager.class).getDisplay(android.view.Display.DEFAULT_DISPLAY).getRealSize(real);
+        Log.i("AtlTest", "drawing-cache app=" + bytes + " real=" + real.x + "x" + real.y);
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        drawingCache();
         super.onCreate(savedInstanceState);
         Log.i("AtlTest", "cacerts: " + caCerts());
         Log.i("AtlTest", "fonts: default=" + advance(Typeface.DEFAULT) + " monospace=" + advance(Typeface.MONOSPACE));
