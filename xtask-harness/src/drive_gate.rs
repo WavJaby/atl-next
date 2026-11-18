@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test drive`: `run-apk --drive` on fixtures, judged from the PNGs it writes.
-//! Stage 1, xtask-harness/testdata/window: the shot's pixels are the fixture's quadrants at the opening size and after a `resize`. Stage 2, xtask-harness/testdata/widgets: two shots before a tap on the Button are equal (nothing else moves the picture), and the shot after it differs.
-//! Breaks must turn it red: `--break-blank` blanks every shot (the drive itself must fail), `--break-colour` swaps R and B of the expectation.
+//! `xtask test drive`: `run-apk --drive` on fixtures, the drive engine's own gate.
+//! Stage 1, xtask-harness/testdata/window: the PNG shots' pixels are the fixture's quadrants at the opening size and after a `resize` (pixel-exact, judged here). Stage 2, xtask-harness/testdata/widgets: the script's own checkpoints
+//! (`expect-same` before a tap on the Button: nothing else moves the picture; `expect-changed` after it).
+//! Breaks must turn it red: `--break-blank` blanks every shot (the drive itself must fail), `--break-colour` swaps R and B of the expectation, `--break-input` drops the injected input (stage 2 fails at its `expect-changed`).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -38,6 +39,9 @@ pub struct Args {
     /// Deliberate failure: the quadrants' expectation has R and B swapped, so the pixel check must fail.
     #[arg(long)]
     break_colour: bool,
+    /// Deliberate failure: `run-apk --break-input`, the proxy drops every injected event, so the widgets stage must fail at its `expect-changed`.
+    #[arg(long)]
+    break_input: bool,
 }
 
 /// The gate's work dir (emptied) and its one runtime: `new` stages it for the APK tools, `stage` configures it once, and every drive of the gate call runs on it.
@@ -51,6 +55,7 @@ struct Gate<'a> {
     out: Option<PathBuf>,
     java_out: Option<PathBuf>,
     break_blank: bool,
+    break_input: bool,
 }
 
 impl<'a> Gate<'a> {
@@ -59,7 +64,7 @@ impl<'a> Gate<'a> {
         host: &'a str,
         out: Option<PathBuf>,
         java_out: Option<PathBuf>,
-        break_blank: bool,
+        (break_blank, break_input): (bool, bool),
     ) -> Result<Self> {
         // staged as run-apk: the drives are run-apk runs, and their remote record (Runtime::record_inputs) is run-apk's
         let rt = Runtime::new(
@@ -85,6 +90,7 @@ impl<'a> Gate<'a> {
             out,
             java_out,
             break_blank,
+            break_input,
         })
     }
 
@@ -118,13 +124,14 @@ impl<'a> Gate<'a> {
             self.out.clone(),
             self.java_out.clone(),
             self.break_blank,
+            self.break_input,
         )
     }
 
     fn drive(&self, apk: &Path, name: &str, script: String) -> Result<ExitCode> {
         let file = self.work.join(name);
         std::fs::write(&file, &script)?;
-        let steps = drive::parse(&script).with_context(|| file.display().to_string())?;
+        let script = drive::parse(&script).with_context(|| file.display().to_string())?;
         run_apk::run_on(
             &self.rt,
             &self.args(apk),
@@ -133,7 +140,7 @@ impl<'a> Gate<'a> {
             vec![PackageFile {
                 path: apk.to_path_buf(),
             }],
-            Some(steps),
+            Some(script),
         )
     }
 }
@@ -159,37 +166,32 @@ fn load1() -> String {
 
 fn quick_run(root: &Path, host: &str, out: &Path) -> Result<()> {
     let gate = timing::phase("runtime: new", || {
-        Gate::new(root, host, Some(out.to_owned()), None, false)
+        Gate::new(root, host, Some(out.to_owned()), None, (false, false))
     })?;
     let widgets = timing::phase("apk: build and sign", || {
         gate.apk(window::WIDGETS_FIXTURE, "apk-widgets")
     })?;
     let gate = timing::phase("stage: configure", || gate.stage(&[&widgets]))?;
-    let (first, before, after) = (
-        gate.work.join("first.png"),
-        gate.work.join("before.png"),
-        gate.work.join("after.png"),
-    );
-    let (x, y) = BUTTON;
-    // the first shot is the blank check at first present; the tap and its comparison wait SETTLE_MS each side, as `run`'s tap stage:
+    // `expect-varied` is the blank check at first present; the tap and its comparison wait SETTLE_MS each side, as `run`'s tap stage:
     // 300 ms after the very first present failed 3/6 under load (dfs-loopL: tap delivered, a frame came, no pixel changed)
     let code = timing::phase("drive: run-apk", || {
         gate.drive(
             &widgets,
             "tap.drive",
             format!(
-                "shot {}\nwait {SETTLE_MS}\nshot {}\ntap {x} {y}\nwait-frames 1\nwait {SETTLE_MS}\nshot {}\n",
-                first.display(),
-                before.display(),
-                after.display()
+                "expect-varied\nwait {SETTLE_MS}\nmark before\n{}",
+                tap_script()
             ),
         )
     })?;
     ensure!(code == ExitCode::SUCCESS, "the tap drive failed");
-    let changed = changed_pixels(&Image::read_png(&before)?, &Image::read_png(&after)?);
-    ensure!(changed > 0, "the tap changed no pixel");
-    println!("drive-tap: the tap changed {changed} pixels");
     Ok(())
+}
+
+/// The Button's tap and its checkpoint against the mark `before`. No `wait-frames` between: under `--break-input` nothing redraws, and the red must come at `expect-changed`, not at a frame wait.
+fn tap_script() -> String {
+    let (x, y) = BUTTON;
+    format!("tap {x} {y}\nwait {SETTLE_MS}\nexpect-changed before\n")
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
@@ -198,7 +200,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         &args.host,
         args.out.clone(),
         args.java_out.clone(),
-        args.break_blank,
+        (args.break_blank, args.break_input),
     )?;
     let work = gate.work.clone();
     let quadrants = gate.apk(window::FIXTURE, "apk-window")?;
@@ -233,32 +235,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             image.width, image.height
         );
     }
-    let (before, still, after) = (
-        work.join("before.png"),
-        work.join("still.png"),
-        work.join("after.png"),
-    );
-    let (x, y) = BUTTON;
     let code = drive(
         &widgets,
         "tap.drive",
         format!(
-            "wait {SETTLE_MS}\nshot {}\nwait {SETTLE_MS}\nshot {}\ntap {x} {y}\nwait-frames 1\nwait {SETTLE_MS}\nshot {}\n",
-            before.display(),
-            still.display(),
-            after.display()
+            "wait {SETTLE_MS}\nmark before\nwait {SETTLE_MS}\nexpect-same before\n{}",
+            tap_script()
         ),
     )?;
     ensure!(code == ExitCode::SUCCESS, "the tap drive failed");
-    let (a, b, c) = (
-        Image::read_png(&before)?,
-        Image::read_png(&still)?,
-        Image::read_png(&after)?,
-    );
-    ensure!(a == b, "the picture moved with no input");
-    let changed = changed_pixels(&a, &c);
-    ensure!(changed > 0, "the tap changed no pixel");
-    println!("drive gate: the tap changed {changed} pixels");
     println!("drive gate: ok, shots in {}", work.display());
     Ok(ExitCode::SUCCESS)
 }
@@ -279,16 +264,6 @@ fn quadrant_mismatches(image: &Image, swap_rb: bool) -> usize {
         .iter()
         .zip(want.as_chunks::<4>().0)
         .filter(|(got, want)| got != want)
-        .count()
-}
-
-fn changed_pixels(a: &Image, b: &Image) -> usize {
-    a.rgba
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .zip(b.rgba.as_chunks::<4>().0)
-        .filter(|(x, y)| x != y)
         .count()
 }
 

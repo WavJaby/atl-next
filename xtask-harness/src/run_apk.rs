@@ -77,13 +77,15 @@ pub struct Args {
     /// e.g. `wait:6000 down:792,28 up:792,28` taps (792, 28) 6 s after the first frame. The verdict is still about the last resumed activity, so wait for each tap's answer to settle.
     #[arg(long, value_name = "SCRIPT", conflicts_with = "drive")]
     pointer: Option<String>,
-    /// A script file run against the window on the headless compositor, one step a line, coordinates in window content pixels: `wait <ms>`, `wait-frames <n>`, `tap <x> <y>`, `swipe <x1> <y1> <x2> <y2> <ms>`, `key <name>` (a letter, a digit, or escape, backspace, tab, enter, space, home, end, up, down, left, right, pageup, pagedown, back), `resize <w> <h>`, `shot <file.png>` (the window's content; a one-colour capture fails the run).
-    /// The app is stopped after the last step; a failed step exits non-zero.
-    #[arg(long, value_name = "FILE", conflicts_with = "hold")]
+    /// A drive script run against the window on the headless compositor (`--help` for its grammar).
+    #[arg(long, value_name = "FILE", conflicts_with = "hold", long_help = drive::GRAMMAR)]
     drive: Option<PathBuf>,
     /// Deliberate-failure check of --drive: every shot is blanked, so the first one must fail the run.
     #[arg(long, requires = "drive")]
     break_blank_capture: bool,
+    /// Deliberate-failure check of --drive: the harness's window proxy drops every injected pointer, touch and key event (harness-side; no product path), so the script's first `expect-changed` after input must fail.
+    #[arg(long, requires = "drive")]
+    break_input: bool,
     /// atld `--tilt-keys`: held left / right (or a / d) tilt the device for accelerometer games, at atld's default angle, ramp and rate.
     #[arg(long)]
     tilt_keys: bool,
@@ -178,6 +180,7 @@ impl Args {
         out: Option<PathBuf>,
         java_out: Option<PathBuf>,
         break_blank_capture: bool,
+        break_input: bool,
     ) -> Self {
         Self {
             target: apk.display().to_string(),
@@ -194,6 +197,7 @@ impl Args {
             pointer: None,
             drive: None,
             break_blank_capture,
+            break_input,
             tilt_keys: false,
             mouse_touch: false,
             esc_back: false,
@@ -315,7 +319,7 @@ pub(crate) fn run_on(
     foreign: Option<&SupportedAbi>,
     pin: Option<&test_apks::Row>,
     files: Vec<PackageFile>,
-    steps: Option<Vec<drive::Step>>,
+    steps: Option<drive::Script>,
 ) -> Result<ExitCode> {
     let work = rt.out.join("run-apk");
     std::fs::create_dir_all(&work)?;
@@ -331,6 +335,9 @@ pub(crate) fn run_on(
             (Some(n), Some(_)) => Some(window::start_proxy(&n.socket)?),
             _ => None,
         };
+        if let (Some(p), true) = (&proxy, args.break_input) {
+            p.drop_input();
+        }
         Ok((nested, proxy))
     })?;
     // the display at the rate of the compositor the window maps on; on a copy, so the shared runtime keeps no run's wiring
@@ -381,6 +388,8 @@ pub(crate) fn run_on(
     let run = run_of(&work, files, &m, &args.log_tags);
     let app_log = run.log(&m.name);
     let services_log = run.log("services");
+    let atld_log = run.atld_log();
+    let log_dir = run.root.join("log");
     let read = atl_diag::logfiles::read;
     let hold_ms = args.hold.map(|s| s * MS_PER_S);
     let watch_ms = hold_ms.unwrap_or(window::WINDOW_MS);
@@ -418,6 +427,9 @@ pub(crate) fn run_on(
                     proxy,
                     nested,
                     app_log: &app_log,
+                    services_log: &services_log,
+                    atld_log: &atld_log,
+                    log_dir: &log_dir,
                     alive: &|| !run.app_ended(),
                     break_blank: args.break_blank_capture,
                 };
@@ -527,6 +539,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         pointer: a.pointer.clone(),
         drive: None,
         break_blank_capture: false,
+        break_input: false,
         tilt_keys: a.tilt_keys,
         mouse_touch: a.mouse_touch,
         esc_back: a.esc_back,
@@ -1095,11 +1108,7 @@ fn render_path_check(atld_log: &str, app: &str) -> Result<String, String> {
     else {
         return Ok("render path: none probed".to_owned());
     };
-    let tier = app
-        .lines()
-        .rev()
-        .find_map(|l| l.split_once("libEGL_atl: buffer tier ").map(|(_, t)| t))
-        .unwrap_or("not logged");
+    let tier = buffer_tier_line(app).unwrap_or("not logged");
     let offered_not_taken = path.starts_with("baseline (")
         && !path.starts_with("baseline (no kernel render path offered");
     if offered_not_taken {
@@ -1107,6 +1116,18 @@ fn render_path_check(atld_log: &str, app: &str) -> Result<String, String> {
     } else {
         Ok(format!("render path {path}; buffer tier {tier}"))
     }
+}
+
+/// The driver's last `buffer tier` line after its prefix (`readback (this device cannot import ...)`).
+fn buffer_tier_line(app: &str) -> Option<&str> {
+    app.lines()
+        .rev()
+        .find_map(|l| l.split_once("libEGL_atl: buffer tier ").map(|(_, t)| t))
+}
+
+/// The run's buffer tier, the first word of that line (`import`, `readback`): a probed fact of the device, never a host name.
+pub(crate) fn buffer_tier(app: &str) -> Option<&str> {
+    buffer_tier_line(app)?.split_whitespace().next()
 }
 
 /// A line of one of atld's summary blocks (print_summary): `atld: summary ...` (the API block) or `atld: <family>-summary ...` (one per atl_diag family), so a new family is forwarded without a change here.

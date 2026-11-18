@@ -23,6 +23,7 @@ use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -417,6 +418,8 @@ pub struct Proxy {
     pub events: Receiver<(Instant, Event)>,
     injections: Arc<Mutex<Vec<Injection>>>,
     wakes: Arc<Mutex<Vec<OwnedFd>>>,
+    /// `run-apk --break-input`: pointer, touch and key injections are dropped (configures, pings and closes still go).
+    drop_input: AtomicBool,
 }
 
 /// An injected input event's timestamp: CLOCK_MONOTONIC in ms, truncated to u32 -- the base wlroots and weston stamp input with. The protocol leaves the base undefined, but clients that turn it into Android event times read it as uptimeMillis (CLOCK_MONOTONIC), so a private epoch dates every event hours in the past.
@@ -455,7 +458,13 @@ impl Proxy {
             events,
             injections,
             wakes,
+            drop_input: AtomicBool::new(false),
         })
+    }
+
+    /// Deliberate failure (`run-apk --break-input`): from now on every pointer, touch and key injection is dropped, so a script's input reaches no app.
+    pub fn drop_input(&self) {
+        self.drop_input.store(true, Ordering::Relaxed);
     }
 
     /// Queues a synthetic `xdg_wm_base.ping(serial)` for the connection that bound `xdg_wm_base`; it reaches the client between two forwarded messages.
@@ -512,6 +521,13 @@ impl Proxy {
     }
 
     fn queue(&self, item: Injection) -> Result<()> {
+        let input = matches!(
+            item,
+            Injection::Pointer { .. } | Injection::Touch { .. } | Injection::Key { .. }
+        );
+        if input && self.drop_input.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         self.injections
             .lock()
             .map_err(|_| anyhow::anyhow!("injection queue poisoned"))?

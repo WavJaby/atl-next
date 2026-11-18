@@ -1,21 +1,32 @@
 // SPDX-License-Identifier: MIT
 //! `xtask run-apk --drive <script>`: an agent's hands and eyes on a real APK, headless. A script runs against the app's window once run-apk's own wait is over (resumed, settled, a frame presented, the watch done).
-//! Input goes through the window proxy (wayland_proxy.rs), shots through the compositor (screencopy.rs). The compositor holds the window at output (0, 0) ([`NestedCompositor::start_placed`]), so content pixels map to the output by the window geometry the client declared.
-//! Script, one step a line; blank lines and `#` comments are skipped. Coordinates are window content pixels (the output has scale 1).
-//!   wait <ms> | wait-frames <n> | tap <x> <y> | touch <x> <y> <ms> | touch-swipe <x1> <y1> <x2> <y2> <ms> | swipe <x1> <y1> <x2> <y2> <ms> | leave | key <name> | key-down <name> | key-up <name> | resize <w> <h> | shot <file.png>
-//! `tap` and `swipe` are the mouse (SOURCE_MOUSE events); `touch` / `touch-swipe` are one finger on the touchscreen (wl_touch -> SOURCE_TOUCHSCREEN), what a phone game's touch input reads (Unity's Input.touches ignores the mouse). `leave` takes the mouse off the window (HOVER_EXIT).
-//! `wait-frames` counts the app's presents from that step on and fails if they do not come: an idle app presents nothing, so use it only after something that redraws. A present is logged before the compositor shows it: a shot straight after may be one frame old.
-//! `shot` paths are relative to the current directory; the image is the window's content (a dialog reaching past it is cut), and a one-colour image is an error, never a pass.
+//! Input goes through the window proxy (wayland_proxy.rs), captures through the compositor (screencopy.rs), compared in memory. The compositor holds the window at output (0, 0) ([`NestedCompositor::start_placed`]) at output scale 1.
+//! The grammar is [`GRAMMAR`], also `run-apk --help`'s text for `--drive`: one source.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::nested_wayland::NestedCompositor;
-use crate::screencopy;
+use crate::screencopy::{self, Diff, Image};
 use crate::wayland_proxy::{Event, PointerAction, Proxy, TouchAction};
 use crate::window;
+
+/// The script grammar (`run-apk --drive`'s help text).
+pub const GRAMMAR: &str = "A script file run against the window on the headless compositor, one step a line; blank lines and `#` comments are skipped. Every wait names its timeout: nothing waits by default.
+Header (before the first step): `size W H` = the content size the script's coordinates were read at; points and regions scale per axis to the live content. Without it coordinates are live content pixels.
+A region is `X Y W H` in the same pixels. Text arguments are one word or \"quoted\"; a source is `app`, `services` or `atld` (that process's log).
+Input: `tap X Y` / `swipe X1 Y1 X2 Y2 MS` (the mouse) | `touch X Y MS` / `touch-swipe X1 Y1 X2 Y2 MS` (one finger, wl_touch; Unity reads only this) | `leave` (mouse off the window) | `key NAME` / `key-down NAME` / `key-up NAME` (a letter, a digit, escape, backspace, tab, enter, space, home, end, up, down, left, right, pageup, pagedown, back) | `resize W H` (content size).
+Time: `wait MS` | `wait-frames N` (N presents from here, 120 s bound; only after something that redraws).
+Condition waits (checkpoints): `wait-log SOURCE TEXT MS` (a line holding TEXT since the last checkpoint) | `wait-changed REGION MS` (the region changes from its picture at this step) | `wait-stable REGION MS HOLD_MS` (no change for HOLD_MS).
+Checkpoints: `mark NAME [REGION]` (keeps the content's picture) | `expect-changed NAME [REGION]` / `expect-same NAME [REGION]` (now vs the mark; region default: the mark's, else the content) | `expect-varied [REGION]` (not one colour)
+ | `expect-log SOURCE TEXT` / `expect-no-log SOURCE TEXT` (since the last checkpoint) | `expect-frames N MS` (N presents within MS) | `expect-fps FLOOR tier=TIER over MS` (presents per second over MS >= FLOOR; judged only when the app logged buffer tier TIER, else skipped and printed)
+ | `expect-audio MS` (an `audio-mix` line with audible > 0 in the app log within MS) | `expect-counter KEY OP N` (KEY = `<outcome> <api>` of the diag counters summed over the run's logs, quoted; OP one of >= <= == > <).
+Branch: `if-log SOURCE TEXT MS` ... `end` = the steps inside run only when the line comes within MS (an optional first-run dialog); one level, no other control flow.
+`changed` = more than CHANGED_FRACTION of the region's pixels differ by more than CHANGE_DELTA in a channel; `same` = no pixel differs by more than CHANGE_DELTA.
+`shot FILE.png` writes the content (relative to the current directory; a one-colour image fails). The app is stopped after the last step; a failed step exits non-zero, naming it.";
 
 const BTN_LEFT: u32 = 0x110;
 /// One softpipe frame of a large window takes seconds under load, so a frame wait bounds a hang, not a pace.
@@ -23,8 +34,19 @@ const FRAME_WAIT: Duration = Duration::from_secs(120);
 /// A swipe's motion events come at about the display's 60 Hz.
 const SWIPE_STEP: Duration = Duration::from_millis(16);
 const POLL: Duration = Duration::from_millis(20);
+/// A visual wait's capture interval: ~6 frames at 60 Hz, so a capture (a shm copy of the output) stays a small share of the time.
+const VISUAL_POLL: Duration = Duration::from_millis(100);
+/// Per-channel difference above which a pixel counts as changed. Derivation (widgets fixture, `xtask test drive`): two still captures 3 s apart differ in no channel (max delta 0, readback is exact),
+/// while the Button's press state differs by MEASURED_TAP_DELTA; the threshold sits well above any rounding a scaled or dithered path might add (a few units) and well below the press.
+const CHANGE_DELTA: u8 = 16;
+/// Share of a region's pixels that must change for `changed`. Derivation: the widgets tap changes MEASURED_TAP_PIXELS of the 800x600 content (the Button's 88x48 = 4224 px = 0.88 % bounds it);
+/// half of that share leaves room for a smaller widget, and one stray pixel (a cursor, a caret) never reaches it.
+const CHANGED_FRACTION: f64 = 0.004;
 /// Injected configure serials: far above what the compositor sends one window in a run.
 const FIRST_SERIAL: u32 = 0x10_0000;
+/// The mixer's counter line (atl-audioflinger output.rs) and its field of frames above silence.
+const MIX_LINE: &str = "audio-mix: ";
+const MIX_AUDIBLE: &str = "audible=";
 /// Key rows of linux/input-event-codes.h: `1`..`0` are KEY_1 = 2.., the letter rows start at KEY_Q = 16, KEY_A = 30, KEY_Z = 44.
 const DIGITS: &str = "1234567890";
 const FIRST_DIGIT: u32 = 2;
@@ -45,6 +67,52 @@ const NAMED_KEYS: [(&str, u32); 14] = [
     ("pagedown", 109),
     ("back", 158),
 ];
+
+/// A log a step reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    App,
+    Services,
+    Atld,
+}
+
+const SOURCES: [Source; 3] = [Source::App, Source::Services, Source::Atld];
+
+impl Source {
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// `X Y W H` in script pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Region {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Op {
+    Ge,
+    Le,
+    Eq,
+    Gt,
+    Lt,
+}
+
+impl Op {
+    fn holds(self, got: u64, want: u64) -> bool {
+        match self {
+            Op::Ge => got >= want,
+            Op::Le => got <= want,
+            Op::Eq => got == want,
+            Op::Gt => got > want,
+            Op::Lt => got < want,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Step {
@@ -71,6 +139,66 @@ pub enum Step {
     KeyHalf(u32, bool),
     Resize(i32, i32),
     Shot(PathBuf),
+    WaitLog {
+        source: Source,
+        text: String,
+        ms: u64,
+    },
+    WaitChanged {
+        region: Region,
+        ms: u64,
+    },
+    WaitStable {
+        region: Region,
+        ms: u64,
+        hold: u64,
+    },
+    Mark {
+        name: String,
+        region: Option<Region>,
+    },
+    ExpectChanged {
+        name: String,
+        region: Option<Region>,
+    },
+    ExpectSame {
+        name: String,
+        region: Option<Region>,
+    },
+    ExpectVaried(Option<Region>),
+    ExpectLog {
+        source: Source,
+        text: String,
+        present: bool,
+    },
+    ExpectFrames {
+        n: u64,
+        ms: u64,
+    },
+    ExpectFps {
+        floor: f64,
+        tier: String,
+        ms: u64,
+    },
+    ExpectAudio(u64),
+    ExpectCounter {
+        key: String,
+        op: Op,
+        n: u64,
+    },
+    IfLog {
+        source: Source,
+        text: String,
+        ms: u64,
+        body: Vec<Step>,
+    },
+}
+
+/// A parsed script: the `size` header and the steps.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Script {
+    pub size: Option<(f64, f64)>,
+    pub steps: Vec<Step>,
 }
 
 /// The linux input code of a script key name.
@@ -90,17 +218,73 @@ fn key_code(name: &str) -> Option<u32> {
         .find_map(|(row, first)| Some(first + row.find(c)? as u32))
 }
 
-/// The script's steps; an error names the line.
-pub fn parse(script: &str) -> Result<Vec<Step>> {
+/// Words of a line; `"..."` is one word without its quotes (no escapes).
+fn words(line: &str) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut rest = line.trim_start();
+    while !rest.is_empty() {
+        if let Some(quoted) = rest.strip_prefix('"') {
+            let end = quoted.find('"').context("unclosed quote")?;
+            out.push(quoted[..end].to_owned());
+            rest = quoted[end + 1..].trim_start();
+        } else {
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            out.push(rest[..end].to_owned());
+            rest = rest[end..].trim_start();
+        }
+    }
+    Ok(out)
+}
+
+/// The script; an error names the line.
+pub fn parse(script: &str) -> Result<Script> {
+    let mut size = None;
     let mut steps = Vec::new();
+    // an open `if-log`: its line and its step; the body collects until `end`
+    let mut open: Option<(usize, Step)> = None;
     for (index, line) in script.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        steps.push(parse_step(line).with_context(|| format!("script line {}", index + 1))?);
+        let at = || format!("script line {}", index + 1);
+        let w = words(line).with_context(at)?;
+        let w: Vec<&str> = w.iter().map(String::as_str).collect();
+        match w.as_slice() {
+            ["size", sw, sh] => {
+                ensure!(
+                    size.is_none() && steps.is_empty() && open.is_none(),
+                    "{}: `size` is a header: once, before the first step",
+                    at()
+                );
+                let (sw, sh): (f64, f64) = (num(sw).with_context(at)?, num(sh).with_context(at)?);
+                ensure!(sw > 0.0 && sh > 0.0, "{}: size needs a positive size", at());
+                size = Some((sw, sh));
+            }
+            ["end"] => {
+                let (_, step) = open
+                    .take()
+                    .with_context(|| format!("{}: `end` with no open if-log", at()))?;
+                steps.push(step);
+            }
+            _ => {
+                let step = parse_step(&w).with_context(at)?;
+                match (&mut open, step) {
+                    (Some(_), Step::IfLog { .. }) => {
+                        bail!("{}: if-log inside if-log: one level only", at())
+                    }
+                    (None, step @ Step::IfLog { .. }) => open = Some((index + 1, step)),
+                    (Some((_, Step::IfLog { body, .. })), step) => body.push(step),
+                    (Some(_), _) => unreachable!("only an if-log is ever open"),
+                    (None, step) => steps.push(step),
+                }
+            }
+        }
     }
-    Ok(steps)
+    if let Some((line, _)) = open {
+        bail!("script line {line}: if-log has no `end`");
+    }
+    Ok(Script { size, steps })
 }
 
 fn num<T: std::str::FromStr>(word: &str) -> Result<T> {
@@ -108,9 +292,54 @@ fn num<T: std::str::FromStr>(word: &str) -> Result<T> {
         .map_err(|_| anyhow::anyhow!("{word:?} is not a valid number"))
 }
 
-fn parse_step(line: &str) -> Result<Step> {
-    let words: Vec<&str> = line.split_whitespace().collect();
-    Ok(match words.as_slice() {
+fn source(word: &str) -> Result<Source> {
+    Ok(match word {
+        "app" => Source::App,
+        "services" => Source::Services,
+        "atld" => Source::Atld,
+        _ => bail!("{word:?} is no source (app, services, atld)"),
+    })
+}
+
+fn region(w: &[&str]) -> Result<Region> {
+    let [x, y, rw, rh] = w else {
+        bail!("a region is X Y W H");
+    };
+    let r = Region {
+        x: num(x)?,
+        y: num(y)?,
+        w: num(rw)?,
+        h: num(rh)?,
+    };
+    ensure!(
+        r.x >= 0.0 && r.y >= 0.0 && r.w > 0.0 && r.h > 0.0,
+        "a region needs x, y >= 0 and a positive size"
+    );
+    Ok(r)
+}
+
+fn opt_region(w: &[&str]) -> Result<Option<Region>> {
+    if w.is_empty() {
+        Ok(None)
+    } else {
+        region(w).map(Some)
+    }
+}
+
+fn op(word: &str) -> Result<Op> {
+    Ok(match word {
+        ">=" => Op::Ge,
+        "<=" => Op::Le,
+        "==" => Op::Eq,
+        ">" => Op::Gt,
+        "<" => Op::Lt,
+        _ => bail!("{word:?} is no comparison (>= <= == > <)"),
+    })
+}
+
+fn parse_step(words: &[&str]) -> Result<Step> {
+    let key = |name: &str| key_code(name).with_context(|| format!("no key named {name:?}"));
+    Ok(match words {
         ["wait", ms] => Step::Wait(num(ms)?),
         ["wait-frames", n] => Step::WaitFrames(num(n)?),
         ["tap", x, y] => Step::Tap(num(x)?, num(y)?),
@@ -126,20 +355,79 @@ fn parse_step(line: &str) -> Result<Step> {
             to: (num(x2)?, num(y2)?),
             ms: num(ms)?,
         },
-        ["key", name] => {
-            Step::Key(key_code(name).with_context(|| format!("no key named {name:?}"))?)
-        }
-        [half @ ("key-down" | "key-up"), name] => Step::KeyHalf(
-            key_code(name).with_context(|| format!("no key named {name:?}"))?,
-            *half == "key-down",
-        ),
+        ["key", name] => Step::Key(key(name)?),
+        [half @ ("key-down" | "key-up"), name] => Step::KeyHalf(key(name)?, *half == "key-down"),
         ["resize", w, h] => {
             let (w, h) = (num(w)?, num(h)?);
             ensure!(w > 0 && h > 0, "resize needs a positive size");
             Step::Resize(w, h)
         }
         ["shot", file] => Step::Shot(PathBuf::from(file)),
-        _ => bail!("not a step: {line:?}"),
+        ["wait-log", s, text, ms] => Step::WaitLog {
+            source: source(s)?,
+            text: (*text).to_owned(),
+            ms: num(ms)?,
+        },
+        ["wait-changed", r @ .., ms] if r.len() == 4 => Step::WaitChanged {
+            region: region(r)?,
+            ms: num(ms)?,
+        },
+        ["wait-stable", r @ .., ms, hold] if r.len() == 4 => {
+            let (ms, hold) = (num(ms)?, num(hold)?);
+            ensure!(
+                hold < ms,
+                "wait-stable: the hold must be shorter than the timeout"
+            );
+            Step::WaitStable {
+                region: region(r)?,
+                ms,
+                hold,
+            }
+        }
+        ["mark", name, r @ ..] => Step::Mark {
+            name: (*name).to_owned(),
+            region: opt_region(r)?,
+        },
+        ["expect-changed", name, r @ ..] => Step::ExpectChanged {
+            name: (*name).to_owned(),
+            region: opt_region(r)?,
+        },
+        ["expect-same", name, r @ ..] => Step::ExpectSame {
+            name: (*name).to_owned(),
+            region: opt_region(r)?,
+        },
+        ["expect-varied", r @ ..] => Step::ExpectVaried(opt_region(r)?),
+        [which @ ("expect-log" | "expect-no-log"), s, text] => Step::ExpectLog {
+            source: source(s)?,
+            text: (*text).to_owned(),
+            present: *which == "expect-log",
+        },
+        ["expect-frames", n, ms] => Step::ExpectFrames {
+            n: num(n)?,
+            ms: num(ms)?,
+        },
+        ["expect-fps", floor, tier, "over", ms] => Step::ExpectFps {
+            floor: num(floor)?,
+            tier: tier
+                .strip_prefix("tier=")
+                .filter(|t| !t.is_empty())
+                .context("expect-fps needs tier=<tier>")?
+                .to_owned(),
+            ms: num(ms)?,
+        },
+        ["expect-audio", ms] => Step::ExpectAudio(num(ms)?),
+        ["expect-counter", k, o, n] => Step::ExpectCounter {
+            key: (*k).to_owned(),
+            op: op(o)?,
+            n: num(n)?,
+        },
+        ["if-log", s, text, ms] => Step::IfLog {
+            source: source(s)?,
+            text: (*text).to_owned(),
+            ms: num(ms)?,
+            body: Vec::new(),
+        },
+        _ => bail!("not a step: {:?}", words.join(" ")),
     })
 }
 
@@ -158,10 +446,22 @@ fn content_rect(geometry: Geometry, origin: (i32, i32)) -> (i32, i32, i32, i32) 
     (x, y, geometry.width - x, geometry.height - y)
 }
 
+/// A script point in live content pixels: scaled per axis from the reference `size` to the live `content` size (pixels); without `size` the point itself.
+fn scale_point(p: (f64, f64), size: Option<(f64, f64)>, content: (f64, f64)) -> (f64, f64) {
+    match size {
+        Some((rw, rh)) => (p.0 * content.0 / rw, p.1 * content.1 / rh),
+        None => p,
+    }
+}
+
 pub struct Target<'a> {
     pub proxy: &'a Proxy,
     pub nested: &'a NestedCompositor,
     pub app_log: &'a Path,
+    pub services_log: &'a Path,
+    pub atld_log: &'a Path,
+    /// The run's log dir: every process's log, which `expect-counter` sums.
+    pub log_dir: &'a Path,
     /// False once the app died: a wait ends with it.
     pub alive: &'a dyn Fn() -> bool,
     /// Deliberate failure: each shot is blanked before its check, which must then fail the run.
@@ -170,36 +470,42 @@ pub struct Target<'a> {
 
 struct Driver<'a> {
     t: Target<'a>,
+    size: Option<(f64, f64)>,
     /// The content's origin in the surface, from the platform's log line.
     origin: (i32, i32),
+    /// The app log as it was at the start: holds the origin line [`window::content_to_surface`] reads.
+    origin_log: String,
+    /// The window's scale (content pixels per surface unit), from the same line.
+    scale: f64,
     geometry: Option<Geometry>,
     serial: u32,
+    marks: HashMap<String, (Image, Option<Region>)>,
+    /// Per source: the log's length at the last checkpoint; `expect-log` and `wait-log` read from there.
+    cursors: [usize; 3],
 }
 
-/// Runs `steps`, stopping at the first failure.
-pub fn run(steps: &[Step], target: Target<'_>) -> Result<()> {
+/// Runs `script`, stopping at the first failure.
+pub fn run(script: &Script, target: Target<'_>) -> Result<()> {
     let log = atl_diag::logfiles::read(target.app_log);
     let (x, y) = window::content_origin(&log).map_err(anyhow::Error::msg)?;
+    // the scale: one content pixel past the origin, in surface units
+    let one = window::content_to_surface(&log, (1.0, 0.0)).map_err(anyhow::Error::msg)?;
+    let scale = 1.0 / (one.0 - f64::from(x));
     let mut d = Driver {
         t: target,
+        size: script.size,
         origin: (x.round() as i32, y.round() as i32),
+        origin_log: log,
+        scale,
         geometry: None,
         serial: FIRST_SERIAL,
+        marks: HashMap::new(),
+        cursors: [0; 3],
     };
-    for (index, step) in steps.iter().enumerate() {
-        println!("drive: step {}: {step:?}", index + 1);
-        xtask::timing::phase(step_phase(step), || d.step(step))
-            .with_context(|| format!("step {} {step:?}", index + 1))?;
-        ensure!(
-            (d.t.alive)(),
-            "the app ended during step {} {step:?}",
-            index + 1
-        );
-    }
-    Ok(())
+    d.steps(&script.steps, "")
 }
 
-/// The phase a script step's time counts in: waits and shots on the app's own clock, input, resizes.
+/// The phase a script step's time counts in: waits and shots on the app's own clock, input, resizes, checkpoints.
 fn step_phase(step: &Step) -> &'static str {
     match step {
         Step::Wait(_) => "script: wait",
@@ -213,10 +519,125 @@ fn step_phase(step: &Step) -> &'static str {
         | Step::Swipe { .. }
         | Step::Key(_)
         | Step::KeyHalf(..) => "script: input",
+        Step::WaitLog { .. }
+        | Step::WaitChanged { .. }
+        | Step::WaitStable { .. }
+        | Step::IfLog { .. } => "script: condition wait",
+        Step::Mark { .. }
+        | Step::ExpectChanged { .. }
+        | Step::ExpectSame { .. }
+        | Step::ExpectVaried(_)
+        | Step::ExpectLog { .. }
+        | Step::ExpectFrames { .. }
+        | Step::ExpectFps { .. }
+        | Step::ExpectAudio(_)
+        | Step::ExpectCounter { .. } => "script: checkpoint",
     }
 }
 
+/// Whether a step is a checkpoint: once it passes, `expect-log` reads only what comes after it.
+fn is_checkpoint(step: &Step) -> bool {
+    matches!(
+        step_phase(step),
+        "script: condition wait" | "script: checkpoint"
+    )
+}
+
+/// A short form of a step for the progress and error lines (an if-log's body left out).
+fn show(step: &Step) -> String {
+    match step {
+        Step::IfLog {
+            source, text, ms, ..
+        } => format!("IfLog {{ source: {source:?}, text: {text:?}, ms: {ms} }}"),
+        other => format!("{other:?}"),
+    }
+}
+
+/// The text of `log` from byte `from`; a log shorter than that (its tail segment rotated) is read whole.
+fn since(log: &str, from: usize) -> &str {
+    log.get(from..).unwrap_or(log)
+}
+
+/// The `audible=` count of an `audio-mix` line, if it is one.
+fn audible(line: &str) -> Option<u64> {
+    let (_, rest) = line.split_once(MIX_LINE)?;
+    rest.split_whitespace()
+        .find_map(|w| w.strip_prefix(MIX_AUDIBLE))?
+        .parse()
+        .ok()
+}
+
+/// The diag counter `key` (`<outcome> <api>`) summed over `logs` (atl_diag summary totals; one per process). None: no process counted it.
+fn counter(logs: &[String], key: &str) -> Option<u64> {
+    let mut sum = None;
+    for log in logs {
+        for c in atl_diag::summary::counters(log) {
+            if format!("{} {}", c.outcome, c.api) == key {
+                *sum.get_or_insert(0) += c.count;
+            }
+        }
+    }
+    sum
+}
+
+/// `changed` per [`CHANGE_DELTA`] / [`CHANGED_FRACTION`].
+fn is_changed(d: &Diff) -> bool {
+    d.fraction() > CHANGED_FRACTION
+}
+
+/// `same`: no pixel apart by more than [`CHANGE_DELTA`].
+fn is_same(d: &Diff) -> bool {
+    d.changed == 0
+}
+
+fn show_diff(d: &Diff) -> String {
+    format!(
+        "{} of {} px changed ({:.3} %), max channel delta {}",
+        d.changed,
+        d.total,
+        d.fraction() * 100.0,
+        d.max_delta
+    )
+}
+
 impl Driver<'_> {
+    fn steps(&mut self, steps: &[Step], indent: &str) -> Result<()> {
+        for (index, step) in steps.iter().enumerate() {
+            let name = format!("{indent}{} {}", index + 1, show(step));
+            println!("drive: step {name}");
+            xtask::timing::phase(step_phase(step), || self.step(step, indent))
+                .with_context(|| format!("step {name}"))?;
+            ensure!((self.t.alive)(), "the app ended during step {name}");
+            if is_checkpoint(step) {
+                self.checkpoint();
+            }
+        }
+        Ok(())
+    }
+
+    fn log_path(&self, source: Source) -> &Path {
+        match source {
+            Source::App => self.t.app_log,
+            Source::Services => self.t.services_log,
+            Source::Atld => self.t.atld_log,
+        }
+    }
+
+    fn read(&self, source: Source) -> String {
+        atl_diag::logfiles::read(self.log_path(source))
+    }
+
+    /// Whether `source` holds a line with `text` since the last checkpoint.
+    fn logged(&self, source: Source, text: &str) -> bool {
+        since(&self.read(source), self.cursors[source.index()]).contains(text)
+    }
+
+    fn checkpoint(&mut self) {
+        for s in SOURCES {
+            self.cursors[s.index()] = self.read(s).len();
+        }
+    }
+
     /// Takes the proxy's events: the geometry is kept; returns whether `serial`'s ack was among them.
     fn pump(&mut self, serial: Option<u32>) -> bool {
         let mut acked = false;
@@ -248,14 +669,51 @@ impl Driver<'_> {
             .context("the window declared no geometry (xdg_surface.set_window_geometry)")
     }
 
-    /// A content point as a surface point; a point outside the content is a script error (it would land on the chrome, or nowhere).
-    fn surface_point(&mut self, (x, y): (f64, f64)) -> Result<(f64, f64)> {
+    /// The live content size in content pixels: the content rect (surface units) times the window's scale.
+    fn content_px(&mut self) -> Result<(f64, f64)> {
         let (_, _, w, h) = content_rect(self.geometry()?, self.origin);
+        Ok((f64::from(w) * self.scale, f64::from(h) * self.scale))
+    }
+
+    /// A script point as a surface point (scaled from `size`, then [`window::content_to_surface`]); a point outside the content is a script error (it would land on the chrome, or nowhere).
+    fn surface_point(&mut self, p: (f64, f64)) -> Result<(f64, f64)> {
+        let (w, h) = self.content_px()?;
+        let (x, y) = scale_point(p, self.size, (w, h));
         ensure!(
-            x >= 0.0 && y >= 0.0 && x < f64::from(w) && y < f64::from(h),
-            "({x}, {y}) is outside the {w}x{h} content"
+            x >= 0.0 && y >= 0.0 && x < w && y < h,
+            "({}, {}) is outside the {w}x{h} content",
+            p.0,
+            p.1
         );
-        Ok((x + f64::from(self.origin.0), y + f64::from(self.origin.1)))
+        window::content_to_surface(&self.origin_log, (x, y)).map_err(anyhow::Error::msg)
+    }
+
+    /// The content's picture now (output pixels: the nested output has scale 1, so one per surface unit).
+    fn content(&mut self) -> Result<Image> {
+        let (x, y, w, h) = content_rect(self.geometry()?, self.origin);
+        let u = |v: i32| u32::try_from(v).context("the content rectangle is off the output");
+        screencopy::capture(self.t.nested)?.crop(u(x)?, u(y)?, u(w)?, u(h)?)
+    }
+
+    /// `image` (a content picture) cut to the script region `r`, scaled from `size` to the live content and to output pixels; the region must lie inside.
+    fn cut(&mut self, image: &Image, r: Option<Region>) -> Result<Image> {
+        let Some(r) = r else {
+            return Ok(image.clone());
+        };
+        let content = self.content_px()?;
+        let (x0, y0) = scale_point((r.x, r.y), self.size, content);
+        let (x1, y1) = scale_point((r.x + r.w, r.y + r.h), self.size, content);
+        let px = |v: f64| (v / self.scale).round().max(0.0) as u32;
+        let (x, y) = (px(x0), px(y0));
+        let (w, h) = (px(x1).saturating_sub(x), px(y1).saturating_sub(y));
+        image
+            .crop(x, y, w, h)
+            .with_context(|| format!("region {r:?} is not inside the content"))
+    }
+
+    fn region_now(&mut self, r: Option<Region>) -> Result<Image> {
+        let image = self.content()?;
+        self.cut(&image, r)
     }
 
     fn press(&self, pressed: bool) -> Result<()> {
@@ -265,28 +723,49 @@ impl Driver<'_> {
         })
     }
 
-    /// Polls `done` until it holds; the app's end or [`FRAME_WAIT`] fails.
-    fn wait_until(&mut self, what: &str, mut done: impl FnMut(&mut Self) -> bool) -> Result<()> {
-        let deadline = Instant::now() + FRAME_WAIT;
-        while !done(self) {
+    /// Polls `done` every `poll` until it holds; the app's end or `limit` fails.
+    fn wait_until(
+        &mut self,
+        what: &str,
+        limit: Duration,
+        poll: Duration,
+        mut done: impl FnMut(&mut Self) -> Result<bool>,
+    ) -> Result<()> {
+        let deadline = Instant::now() + limit;
+        while !done(self)? {
             ensure!((self.t.alive)(), "the app ended waiting for {what}");
-            ensure!(Instant::now() < deadline, "no {what} within {FRAME_WAIT:?}");
-            std::thread::sleep(POLL);
+            ensure!(Instant::now() < deadline, "no {what} within {limit:?}");
+            std::thread::sleep(poll);
         }
         Ok(())
     }
 
-    /// Frames presented so far (a lower bound: run_apk::presented_total), so `wait-frames` may wait up to the fps line's second longer.
-    fn presents(&self) -> usize {
-        crate::run_apk::presented_total(&atl_diag::logfiles::read(self.t.app_log)) as usize
+    /// Frames presented so far (a lower bound: run_apk::presented_total), so a frame count may lag up to the fps line's second.
+    fn presents(&self) -> u64 {
+        crate::run_apk::presented_total(&atl_diag::logfiles::read(self.t.app_log))
     }
 
-    fn step(&mut self, step: &Step) -> Result<()> {
+    fn mark(&self, name: &str) -> Result<&(Image, Option<Region>)> {
+        self.marks
+            .get(name)
+            .with_context(|| format!("no mark named {name:?} before this step"))
+    }
+
+    /// The mark `name` and now, both cut to `r` (default: the mark's region).
+    fn compare(&mut self, name: &str, r: Option<Region>) -> Result<Diff> {
+        let (then, marked) = self.mark(name)?.clone();
+        let r = r.or(marked);
+        let now = self.region_now(r)?;
+        let then = self.cut(&then, r)?;
+        then.diff(&now, CHANGE_DELTA)
+    }
+
+    fn step(&mut self, step: &Step, indent: &str) -> Result<()> {
         match step {
             Step::Wait(ms) => std::thread::sleep(Duration::from_millis(*ms)),
             Step::WaitFrames(n) => {
-                let want = self.presents() + n;
-                self.wait_until("frame", |d| d.presents() >= want)?;
+                let want = self.presents() + *n as u64;
+                self.wait_until("frame", FRAME_WAIT, POLL, |d| Ok(d.presents() >= want))?;
             }
             Step::Tap(x, y) => {
                 let (x, y) = self.surface_point((*x, *y))?;
@@ -312,7 +791,185 @@ impl Driver<'_> {
             Step::KeyHalf(code, down) => self.t.proxy.inject_key(*code, *down)?,
             Step::Resize(w, h) => self.resize(*w, *h)?,
             Step::Shot(file) => self.shot(file)?,
+            Step::WaitLog { source, text, ms } => {
+                let what = format!("{source:?} log line {text:?}");
+                self.wait_until(&what, Duration::from_millis(*ms), POLL, |d| {
+                    Ok(d.logged(*source, text))
+                })?;
+            }
+            Step::WaitChanged { region, ms } => {
+                let start = self.region_now(Some(*region))?;
+                let mut last = None;
+                let result =
+                    self.wait_until("change", Duration::from_millis(*ms), VISUAL_POLL, |d| {
+                        let diff = start.diff(&d.region_now(Some(*region))?, CHANGE_DELTA)?;
+                        last = Some(diff);
+                        Ok(is_changed(&diff))
+                    });
+                if let Some(diff) = last {
+                    println!("drive: wait-changed: {}", show_diff(&diff));
+                }
+                result?;
+            }
+            Step::WaitStable { region, ms, hold } => {
+                let hold = Duration::from_millis(*hold);
+                let mut prev = self.region_now(Some(*region))?;
+                let mut still_since = Instant::now();
+                self.wait_until(
+                    "stable picture",
+                    Duration::from_millis(*ms),
+                    VISUAL_POLL,
+                    |d| {
+                        let now = d.region_now(Some(*region))?;
+                        if !is_same(&prev.diff(&now, CHANGE_DELTA)?) {
+                            still_since = Instant::now();
+                        }
+                        prev = now;
+                        Ok(still_since.elapsed() >= hold)
+                    },
+                )?;
+            }
+            Step::Mark { name, region } => {
+                let image = self.content()?;
+                // a region outside the content fails here, not at the expect
+                self.cut(&image, *region)?;
+                self.marks.insert(name.clone(), (image, *region));
+            }
+            Step::ExpectChanged { name, region } => {
+                let diff = self.compare(name, *region)?;
+                println!("drive: expect-changed {name}: {}", show_diff(&diff));
+                ensure!(
+                    is_changed(&diff),
+                    "not changed since mark {name:?}: {} (changed needs more than {:.3} % apart by more than {CHANGE_DELTA})",
+                    show_diff(&diff),
+                    CHANGED_FRACTION * 100.0
+                );
+            }
+            Step::ExpectSame { name, region } => {
+                let diff = self.compare(name, *region)?;
+                println!("drive: expect-same {name}: {}", show_diff(&diff));
+                ensure!(
+                    is_same(&diff),
+                    "moved since mark {name:?}: {}",
+                    show_diff(&diff)
+                );
+            }
+            Step::ExpectVaried(region) => {
+                let image = self.region_now(*region)?;
+                ensure!(
+                    !image.is_blank(),
+                    "the {}x{} region is one colour",
+                    image.width,
+                    image.height
+                );
+            }
+            Step::ExpectLog {
+                source,
+                text,
+                present,
+            } => {
+                let found = self.logged(*source, text);
+                ensure!(
+                    found == *present,
+                    "{source:?} log {} {text:?} since the last checkpoint",
+                    if *present {
+                        "has no line with"
+                    } else {
+                        "has a line with"
+                    }
+                );
+            }
+            Step::ExpectFrames { n, ms } => {
+                let want = self.presents() + n;
+                self.wait_until(
+                    &format!("{n} frames"),
+                    Duration::from_millis(*ms),
+                    POLL,
+                    |d| Ok(d.presents() >= want),
+                )?;
+            }
+            Step::ExpectFps { floor, tier, ms } => self.fps(*floor, tier, *ms)?,
+            Step::ExpectAudio(ms) => {
+                self.wait_until(
+                    "audible audio-mix line",
+                    Duration::from_millis(*ms),
+                    POLL,
+                    |d| {
+                        let log = d.read(Source::App);
+                        Ok(since(&log, d.cursors[Source::App.index()])
+                            .lines()
+                            .filter_map(audible)
+                            .any(|n| n > 0))
+                    },
+                )?;
+            }
+            Step::ExpectCounter { key, op, n } => {
+                let logs = self.logs()?;
+                let got = counter(&logs, key).unwrap_or(0);
+                println!("drive: counter {key:?} = {got}");
+                ensure!(
+                    op.holds(got, *n),
+                    "counter {key:?} is {got}, wanted {op:?} {n}"
+                );
+            }
+            Step::IfLog {
+                source,
+                text,
+                ms,
+                body,
+            } => {
+                let deadline = Instant::now() + Duration::from_millis(*ms);
+                let mut found = self.logged(*source, text);
+                while !found && Instant::now() < deadline && (self.t.alive)() {
+                    std::thread::sleep(POLL);
+                    found = self.logged(*source, text);
+                }
+                if found {
+                    println!("drive: if-log: {text:?} came: its {} steps run", body.len());
+                    self.checkpoint();
+                    self.steps(body, &format!("{indent}  "))?;
+                } else {
+                    println!("drive: if-log: no {text:?} within {ms} ms: skipped");
+                }
+            }
         }
+        Ok(())
+    }
+
+    /// Every process's log in the run's log dir, as atld's summary reads them.
+    fn logs(&self) -> Result<Vec<String>> {
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(self.t.log_dir)
+            .with_context(|| format!("reading {}", self.t.log_dir.display()))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "log"))
+            .collect();
+        paths.sort();
+        Ok(paths.iter().map(|p| atl_diag::logfiles::read(p)).collect())
+    }
+
+    /// `expect-fps`: judged only when the app's buffer tier is `tier` (a probed fact of the run), else printed as skipped.
+    fn fps(&mut self, floor: f64, tier: &str, ms: u64) -> Result<()> {
+        let app = self.read(Source::App);
+        let got = crate::run_apk::buffer_tier(&app);
+        if got != Some(tier) {
+            println!(
+                "drive: expect-fps skipped: buffer tier {}, the floor is for {tier}",
+                got.unwrap_or("not logged")
+            );
+            return Ok(());
+        }
+        let first = self.presents();
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(ms) {
+            ensure!((self.t.alive)(), "the app ended measuring fps");
+            std::thread::sleep(POLL);
+        }
+        let fps = (self.presents() - first) as f64 / start.elapsed().as_secs_f64();
+        println!("drive: fps {fps:.1} over {ms} ms (tier {tier}, floor {floor})");
+        ensure!(
+            fps >= floor,
+            "fps {fps:.1} below the floor {floor} (tier {tier})"
+        );
         Ok(())
     }
 
@@ -366,29 +1023,34 @@ impl Driver<'_> {
         self.serial += 1;
         self.t.proxy.inject_configure(want.0, want.1, serial, &[])?;
         let mut acked = false;
-        self.wait_until("configure ack", |d| {
+        self.wait_until("configure ack", FRAME_WAIT, POLL, |d| {
             acked |= d.pump(Some(serial));
-            acked
+            Ok(acked)
         })?;
-        self.wait_until("window at the new size", |d| {
+        self.wait_until("window at the new size", FRAME_WAIT, POLL, |d| {
             d.pump(None);
-            d.geometry.is_some_and(|g| (g.width, g.height) == want)
+            Ok(d.geometry.is_some_and(|g| (g.width, g.height) == want))
         })
     }
 
     fn shot(&mut self, file: &Path) -> Result<()> {
-        let (x, y, w, h) = content_rect(self.geometry()?, self.origin);
-        let u = |v: i32| u32::try_from(v).context("the content rectangle is off the output");
-        let mut image = screencopy::capture(self.t.nested)?.crop(u(x)?, u(y)?, u(w)?, u(h)?)?;
+        let mut image = self.content()?;
         if self.t.break_blank {
             image.rgba.fill(0);
         }
         ensure!(
             !image.is_blank(),
-            "blank capture: all {w}x{h} pixels are one colour"
+            "blank capture: all {}x{} pixels are one colour",
+            image.width,
+            image.height
         );
         image.write_png(file)?;
-        println!("drive: shot {} {w}x{h}", file.display());
+        println!(
+            "drive: shot {} {}x{}",
+            file.display(),
+            image.width,
+            image.height
+        );
         Ok(())
     }
 }
@@ -397,12 +1059,32 @@ impl Driver<'_> {
 mod tests {
     use super::*;
 
+    fn steps(script: &str) -> Vec<Step> {
+        parse(script).unwrap().steps
+    }
+
     #[test]
     fn every_step_parses() {
-        let script = "# comment\n\nwait 10\nwait-frames 2\ntap 1 2.5\ntouch 3 4 80\ntouch-swipe 1 2 3 4 100\nleave\nswipe 1 2 3 4 100\nkey a\nkey 0\nkey enter\nresize 640 400\nshot out/a.png\n";
+        let script = "# comment\n\nsize 1440 900\nwait 10\nwait-frames 2\ntap 1 2.5\ntouch 3 4 80\ntouch-swipe 1 2 3 4 100\nleave\nswipe 1 2 3 4 100\nkey a\nkey 0\nkey enter\nresize 640 400\nshot out/a.png\n\
+wait-log app \"Scene loaded: (Main)\" 60000\nwait-changed 0 64 1440 296 5000\nwait-stable 0 0 10 10 9000 1500\nmark m\nmark d 0 64 1440 296\nexpect-changed d\nexpect-same m 1 2 3 4\nexpect-varied\nexpect-varied 1 2 3 4\n\
+expect-log services resumed\nexpect-no-log app \"diag: refused\"\nexpect-frames 5 2000\nexpect-fps 20 tier=readback over 5000\nexpect-audio 3000\nexpect-counter \"refused open\" <= 2\nif-log app \"FIRST THINGS\" 1000\ntouch 720 748 150\nend\n";
         // KEY_A = 30, KEY_0 = 11, KEY_ENTER = 28 (linux/input-event-codes.h)
+        let display = Region {
+            x: 0.0,
+            y: 64.0,
+            w: 1440.0,
+            h: 296.0,
+        };
+        let small = Region {
+            x: 1.0,
+            y: 2.0,
+            w: 3.0,
+            h: 4.0,
+        };
+        let got = parse(script).unwrap();
+        assert_eq!(got.size, Some((1440.0, 900.0)));
         assert_eq!(
-            parse(script).unwrap(),
+            got.steps,
             vec![
                 Step::Wait(10),
                 Step::WaitFrames(2),
@@ -424,6 +1106,71 @@ mod tests {
                 Step::Key(28),
                 Step::Resize(640, 400),
                 Step::Shot(PathBuf::from("out/a.png")),
+                Step::WaitLog {
+                    source: Source::App,
+                    text: "Scene loaded: (Main)".into(),
+                    ms: 60000
+                },
+                Step::WaitChanged {
+                    region: display,
+                    ms: 5000
+                },
+                Step::WaitStable {
+                    region: Region {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 10.0,
+                        h: 10.0
+                    },
+                    ms: 9000,
+                    hold: 1500
+                },
+                Step::Mark {
+                    name: "m".into(),
+                    region: None
+                },
+                Step::Mark {
+                    name: "d".into(),
+                    region: Some(display)
+                },
+                Step::ExpectChanged {
+                    name: "d".into(),
+                    region: None
+                },
+                Step::ExpectSame {
+                    name: "m".into(),
+                    region: Some(small)
+                },
+                Step::ExpectVaried(None),
+                Step::ExpectVaried(Some(small)),
+                Step::ExpectLog {
+                    source: Source::Services,
+                    text: "resumed".into(),
+                    present: true
+                },
+                Step::ExpectLog {
+                    source: Source::App,
+                    text: "diag: refused".into(),
+                    present: false
+                },
+                Step::ExpectFrames { n: 5, ms: 2000 },
+                Step::ExpectFps {
+                    floor: 20.0,
+                    tier: "readback".into(),
+                    ms: 5000
+                },
+                Step::ExpectAudio(3000),
+                Step::ExpectCounter {
+                    key: "refused open".into(),
+                    op: Op::Le,
+                    n: 2
+                },
+                Step::IfLog {
+                    source: Source::App,
+                    text: "FIRST THINGS".into(),
+                    ms: 1000,
+                    body: vec![Step::Touch(720.0, 748.0, 150)]
+                },
             ]
         );
     }
@@ -447,10 +1194,39 @@ mod tests {
             "fly 1",
             "key nosuch",
             "resize 0 1",
+            "size 10 10",
+            "wait-log nowhere x 10",
+            "wait-log app \"open 10",
+            "wait-changed 0 0 10 10",
+            "wait-stable 0 0 10 10 100 100",
+            "mark m 1 2 3",
+            "expect-changed m 0 0 0 5",
+            "expect-fps 20 readback over 100",
+            "expect-counter k ~ 1",
+            "end",
+            "if-log app x 10\nif-log app y 10",
         ] {
-            let err = format!("{:#}", parse(&format!("wait 1\n{bad}\n")).unwrap_err());
-            assert!(err.contains("script line 2"), "{err}");
+            let err = format!("{:#}", parse(&format!("wait 1\n{bad}\nend\n")).unwrap_err());
+            assert!(err.contains("script line 2"), "{bad}: {err}");
         }
+        let err = format!(
+            "{:#}",
+            parse("wait 1\nif-log app x 10\ntap 1 1\n").unwrap_err()
+        );
+        assert!(
+            err.contains("script line 2") && err.contains("no `end`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn size_is_a_header() {
+        assert_eq!(
+            parse("size 10 20\ntap 1 1\n").unwrap().size,
+            Some((10.0, 20.0))
+        );
+        assert!(parse("size 10 20\nsize 10 20\n").is_err());
+        assert_eq!(steps("tap 1 1\n").len(), 1);
     }
 
     /// GTK's shape: a 12 px shadow around the geometry, a 37 px header bar inside it.
@@ -463,5 +1239,87 @@ mod tests {
             height: 637,
         };
         assert_eq!(content_rect(geometry, (12, 49)), (0, 37, 800, 600));
+    }
+
+    /// Hand-computed: a point read at 1440x900 on a 720x450 live content halves on both axes; at 562x900 -> 1124x900 only x doubles; no `size` keeps the point.
+    #[test]
+    fn points_scale_per_axis() {
+        assert_eq!(
+            scale_point((720.0, 748.0), Some((1440.0, 900.0)), (720.0, 450.0)),
+            (360.0, 374.0)
+        );
+        assert_eq!(
+            scale_point((280.0, 625.0), Some((562.0, 900.0)), (1124.0, 900.0)),
+            (560.0, 625.0)
+        );
+        assert_eq!(scale_point((3.0, 4.0), None, (99.0, 99.0)), (3.0, 4.0));
+    }
+
+    /// The origin line's mapping, as [`run`] reads the scale: origin (14, 51) at scale 2 puts content pixel (100, 40) at surface (14 + 50, 51 + 20).
+    #[test]
+    fn surface_mapping_reads_the_origin_line() {
+        let log = "1.000 INFO atl-platform-ui: content origin x=14 y=51 scale=2\n";
+        assert_eq!(
+            window::content_to_surface(log, (100.0, 40.0)).unwrap(),
+            (64.0, 71.0)
+        );
+        let one = window::content_to_surface(log, (1.0, 0.0)).unwrap();
+        assert_eq!(1.0 / (one.0 - 14.0), 2.0);
+    }
+
+    fn image(w: u32, h: u32, rgb: [u8; 3]) -> Image {
+        let mut rgba = Vec::new();
+        for _ in 0..w * h {
+            rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+        }
+        Image {
+            width: w,
+            height: h,
+            rgba,
+        }
+    }
+
+    /// Set `n` pixels of `image` (from the first) to a colour `by` above the grey 100.
+    fn touch_pixels(image: &mut Image, n: usize, by: u8) {
+        for p in image.rgba.chunks_mut(4).take(n) {
+            p[1] = 100 + by;
+        }
+    }
+
+    /// 100x100 = 10000 px: the fraction threshold 0.4 % is 40 px. 41 px past the delta = changed; 40 = neither changed nor same; deltas at the threshold count as unchanged.
+    #[test]
+    fn change_thresholds_on_synthetic_images() {
+        let base = image(100, 100, [100, 100, 100]);
+        let mut over = base.clone();
+        touch_pixels(&mut over, 41, CHANGE_DELTA + 1);
+        let d = base.diff(&over, CHANGE_DELTA).unwrap();
+        assert_eq!(
+            (d.changed, d.total, d.max_delta),
+            (41, 10_000, CHANGE_DELTA + 1)
+        );
+        assert!(is_changed(&d) && !is_same(&d));
+        let mut at = base.clone();
+        touch_pixels(&mut at, 40, CHANGE_DELTA + 1);
+        let d = base.diff(&at, CHANGE_DELTA).unwrap();
+        assert!(!is_changed(&d) && !is_same(&d));
+        let mut faint = base.clone();
+        touch_pixels(&mut faint, 10_000, CHANGE_DELTA);
+        let d = base.diff(&faint, CHANGE_DELTA).unwrap();
+        assert!(is_same(&d) && !is_changed(&d));
+        assert!(base.diff(&image(10, 10, [0, 0, 0]), CHANGE_DELTA).is_err());
+    }
+
+    #[test]
+    fn audible_reads_the_mix_line() {
+        let line = "1.0 I atl-audioflinger: audio-mix: requested=960 mixed=960 from_tracks=1 audible=480 peak=0.2500 active=1 muted=0 dropped=0";
+        assert_eq!(audible(line), Some(480));
+        assert_eq!(audible("audio-mix: requested=1 audible=0"), Some(0));
+        assert_eq!(audible("nothing"), None);
+    }
+
+    #[test]
+    fn since_reads_from_the_cursor() {
+        assert_eq!(since("abcdef", 2), "cdef");
+        assert_eq!(since("abc", 10), "abc");
     }
 }

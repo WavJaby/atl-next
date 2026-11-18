@@ -35,6 +35,25 @@ const BYTES_PER_PIXEL: usize = 4;
 const CAPTURE_WAIT: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(10);
 
+/// [`Image::diff`]'s result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Diff {
+    pub changed: usize,
+    pub total: usize,
+    pub max_delta: u8,
+}
+
+impl Diff {
+    /// The changed pixels' share of all.
+    pub fn fraction(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            self.changed as f64 / self.total as f64
+        }
+    }
+}
+
 /// RGBA pixels, rows top down, alpha opaque.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Image {
@@ -68,6 +87,33 @@ impl Image {
     pub fn is_blank(&self) -> bool {
         let (pixels, _) = self.rgba.as_chunks::<BYTES_PER_PIXEL>();
         pixels.iter().all(|p| *p == pixels[0])
+    }
+
+    /// Pixel difference to `other` (same size): pixels with an R, G or B channel apart by more than `delta`, out of all, and the largest channel difference seen. Alpha is ignored (opaque).
+    pub fn diff(&self, other: &Image, delta: u8) -> Result<Diff> {
+        ensure!(
+            (self.width, self.height) == (other.width, other.height),
+            "images differ in size: {}x{} vs {}x{} (a resize between the two captures?)",
+            self.width,
+            self.height,
+            other.width,
+            other.height
+        );
+        let mut d = Diff {
+            changed: 0,
+            total: self.rgba.len() / BYTES_PER_PIXEL,
+            max_delta: 0,
+        };
+        let (a, _) = self.rgba.as_chunks::<BYTES_PER_PIXEL>();
+        let (b, _) = other.rgba.as_chunks::<BYTES_PER_PIXEL>();
+        for (p, q) in a.iter().zip(b) {
+            let most = (0..3).map(|c| p[c].abs_diff(q[c])).max().unwrap_or(0);
+            d.max_delta = d.max_delta.max(most);
+            if most > delta {
+                d.changed += 1;
+            }
+        }
+        Ok(d)
     }
 
     pub fn write_png(&self, file: &Path) -> Result<()> {

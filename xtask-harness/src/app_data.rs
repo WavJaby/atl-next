@@ -94,6 +94,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             Some(out.clone()),
             args.java_out.clone(),
             false,
+            false,
         )
         .with_clear_data(clear)
         .with_data_root(&data_root);
