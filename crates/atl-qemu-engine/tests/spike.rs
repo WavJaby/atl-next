@@ -1704,6 +1704,34 @@ mod engine_so {
     struct Page([u8; 4096]);
     static PAGE: Page = Page([0; 4096]);
 
+    /// The host page `map` marks: [`PAGE`] on a 64-bit guest. An arm guest addresses only the low 4 GiB, which the PIE's static is not in: a fresh page in a free low hole (MAP_FIXED_NOREPLACE at 256 MiB steps; the P4a window allocator will own this).
+    #[cfg(not(atl_qe_guest = "arm"))]
+    fn probe_page() -> Result<(u64, u64), String> {
+        Ok((PAGE.0.as_ptr() as u64, PAGE.0.len() as u64))
+    }
+    #[cfg(atl_qe_guest = "arm")]
+    fn probe_page() -> Result<(u64, u64), String> {
+        const STEP: usize = 0x1000_0000;
+        let len = PAGE.0.len();
+        for hint in (1..16).map(|i| i * STEP) {
+            // SAFETY: a fresh anonymous mapping; MAP_FIXED_NOREPLACE never replaces an existing one.
+            let p = unsafe {
+                libc::mmap(
+                    hint as *mut c_void,
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
+                    -1,
+                    0,
+                )
+            };
+            if p != libc::MAP_FAILED {
+                return Ok((p as u64, len as u64));
+            }
+        }
+        Err("no free page below 4 GiB at any 256 MiB step".to_owned())
+    }
+
     /// The host's trap: BOOT records x0 and runs the probe; nothing else is expected in this gate.
     unsafe extern "C" fn trap(ctx: *mut c_void, kind: u32, _id: u32, regs: *const u64) -> u64 {
         if kind == TrapKind::Boot as u32 {
@@ -1740,15 +1768,9 @@ mod engine_so {
         }
         let map = p.table.map.ok_or("engine table has no map")?;
         let attach_ex = p.table.attach_ex.ok_or("engine table has no attach_ex")?;
-        // SAFETY: engine is the handle create wrote; PAGE is a live host page of this process (the ABI's map).
-        let rc = unsafe {
-            map(
-                engine,
-                PAGE.0.as_ptr() as u64,
-                PAGE.0.len() as u64,
-                PROT_READ,
-            )
-        };
+        let (page, len) = probe_page()?;
+        // SAFETY: engine is the handle create wrote; page is a live host page of this process (the ABI's map).
+        let rc = unsafe { map(engine, page, len, PROT_READ) };
         if rc != 0 {
             return Err(format!("map inside BOOT: {rc}"));
         }
