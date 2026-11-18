@@ -351,15 +351,17 @@ const PROCESSES_WANT: &str = "count=1 own=1 uid=true name=true pkg=true importan
 /// - `checksums=0`: requestChecksums reaches the listener with an empty list, ApkChecksums' answer when no APK file can be read (getAvailableApkChecksums / calculateChecksumIfRequested skip on
 ///   IOException). A device would list the required SHA256; the services cannot read app files yet (counted divergence). Before: the List argument was refused -> IllegalArgumentException.
 const SYSANSWERS: &str = "AtlTest: sysanswers: ";
-/// - `volume=5 max=15 ringer=2 mode=0`: a fresh device's STREAM_MUSIC (AudioSystem.DEFAULT_STREAM_VOLUME[3] = 5, AudioService.MAX_STREAM_VOLUME[3] = 15), RINGER_MODE_NORMAL (2),
-///   MODE_NORMAL (0). Before: all four 0 (UNKNOWN_TRANSACTION's empty reply), i.e. muted and RINGER_MODE_SILENT.
+/// - `volume=15 max=15 ringer=2 mode=0`: STREAM_MUSIC of an app whose audio output registered as an absolute-volume device (registerDeviceVolumeDispatcherForAbsoluteVolume, done at the app's
+///   AudioFlinger serve, before any app code): AudioService sets the group to the device's index (AS:8240-8250), which starts at the host's new-stream default, WirePlumber
+///   `node.stream.default-playback-volume` 1.0 -> round(max * cbrt(1.0)) = max = AudioService.MAX_STREAM_VOLUME[3] = 15 (the output opens lazily: no restored value is seen yet).
+///   AOSP's DEFAULT_STREAM_VOLUME[3] = 5 is what a uid that never registers reads. RINGER_MODE_NORMAL (2), MODE_NORMAL (0). Before: all four 0 (UNKNOWN_TRANSACTION's empty reply).
 /// - `installer=null source=null/null`: an install with no installer of record (the `adb install` case, ComputerEngine.getInstallerPackageName / getInstallSourceInfo): no installer, and an
 ///   InstallSourceInfo whose installing and initiating packages are null. Before: the same null installer, but a null InstallSourceInfo (`nosource`), which AOSP gives only for an unknown package.
 /// - `errors=null`: getProcessesInErrorState with no crashing or ANR process (AMS returns its lazily created list, still null). The unanswered call read the same; the run's diag counters tell them apart.
 /// - `memthreshold=226492416 memsized=true`: ProcessList.getMemoryInfo on any host of >= 700 MB (updateOomLevels scale 1): threshold = getMemLevel(HOME_APP_ADJ 600) = the 64-bit-raised
 ///   mOomMinFreeHigh[4], 147456 * 3 / 2 = 221184 KB = 226492416 bytes; total > 0, avail <= total, advertised (roundStorageSize) >= total. Before: the out param untouched, threshold 0, sized false.
 /// - `insets=0,0,0,0`: the desktop display has no system bars or cutout. The unanswered call left an empty InsetsState, the same zeros; the diag counters tell them apart.
-const SYSANSWERS_WANT: &str = "checksums=0 volume=5 max=15 ringer=2 mode=0 installer=null source=null/null errors=null memthreshold=226492416 memsized=true insets=0,0,0,0";
+const SYSANSWERS_WANT: &str = "checksums=0 volume=15 max=15 ringer=2 mode=0 installer=null source=null/null errors=null memthreshold=226492416 memsized=true insets=0,0,0,0";
 /// Main.settings' line, answered by AOSP SettingsProvider in its own process (`id=<s> again=<b> screen_off=<s> auto_time=<s> rotation=<s>`, [`settings_why`]).
 const SETTINGS: &str = "AtlTest: settings: ";
 /// The line after `id=`: the defaults DatabaseHelper loads from SettingsProvider's res/values/defaults.xml -- def_screen_off_timeout 60000, def_auto_time true (loadBooleanSetting writes "1"),
