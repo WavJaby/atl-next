@@ -3005,7 +3005,7 @@ pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
         println!("{}", crate::verdict::gate("remote test window", &problems));
         return Ok(ExitCode::FAILURE);
     }
-    let harness = std::env::current_exe().context("the harness binary's path")?;
+    let harness = rt.harness_exe()?;
     let display = if ui {
         let arg = target.display_model(&rt.roots(), &harness)?;
         println!("remote test window: target display {arg}");

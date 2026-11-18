@@ -1641,11 +1641,18 @@ impl Runtime {
             .extend(remote::lib_files(&self.platform_module)?);
         // the window gate's live half runs on a remote target as this binary (window.rs `agent`); a build-dir file, so the bundle maps it under `out/`
         if self.gate == "window" {
-            inputs
-                .files
-                .push(std::env::current_exe().context("the harness binary's path")?);
+            inputs.files.push(self.harness_exe()?);
         }
         Ok(inputs)
+    }
+
+    /// This harness binary under the build dir's canonical path (`out/build`, as the record names every build-dir file): the process sees its real path (`out/pool/ws/<id>/...`, xtask out.rs `real`).
+    pub fn harness_exe(&self) -> Result<PathBuf> {
+        let exe = std::env::current_exe().context("the harness binary's path")?;
+        Ok(match exe.strip_prefix(xtask::out::real(&self.out)) {
+            Ok(rest) => self.out.join(rest),
+            Err(_) => exe,
+        })
     }
 
     /// The host roots a remote run relocates (remote.rs `Roots`).
