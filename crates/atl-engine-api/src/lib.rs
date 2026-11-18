@@ -8,7 +8,7 @@ use core::ffi::{c_char, c_int, c_void};
 /// Major version: a host refuses an engine with another major.
 pub const ABI_MAJOR: u32 = 4;
 /// Minor version: additions only, appended to a struct.
-pub const ABI_MINOR: u32 = 0;
+pub const ABI_MINOR: u32 = 1;
 
 /// `ATL_LANE_REGS`: lanes of [`AtlLanes::regs`].
 pub const LANE_REGS: usize = 16;
@@ -136,6 +136,9 @@ pub type FaultFn =
     unsafe extern "C" fn(sig: c_int, info: *mut c_void, ucontext: *mut c_void) -> bool;
 /// `atl_engine::end_call`: inside a CALL / BIND trap callback, makes the trap's return end the guest call it interrupted, with the trap's answer (header). 0, or `-EINVAL` outside a trap.
 pub type EndCallFn = unsafe extern "C" fn(engine: *mut AtlEngineHandle) -> c_int;
+/// `atl_engine::map_window` (4.1): `out` receives the window's address.
+pub type MapWindowFn =
+    unsafe extern "C" fn(engine: *mut AtlEngineHandle, len: u64, prot: u32, out: *mut u64) -> c_int;
 
 /// `atl_engine`: the table the engine `.so` exports as `atl_engine`.
 #[repr(C)]
@@ -163,6 +166,8 @@ pub struct AtlEngine {
     pub fault: Option<FaultFn>,
     /// Ends the guest call a trap interrupted when the trap returns (thread exit).
     pub end_call: Option<EndCallFn>,
+    /// 4.1: maps a fresh window the guest can address (below 4 GiB for a 32-bit guest).
+    pub map_window: Option<MapWindowFn>,
 }
 
 /// Admits an engine table this host can drive, or refuses it by name. Refuses another major, a size below this host's table size (minor versions only append, so this also refuses an older minor), and a table missing any entry. The core loader and the gate both call it.
@@ -190,6 +195,7 @@ pub fn check_engine_table(table: &AtlEngine) -> Result<(), String> {
         ("call_ex", table.call_ex.is_none()),
         ("fault", table.fault.is_none()),
         ("end_call", table.end_call.is_none()),
+        ("map_window", table.map_window.is_none()),
     ]
     .into_iter()
     .filter_map(|(name, none)| none.then_some(name))
@@ -243,6 +249,9 @@ mod tests {
     extern "C" fn end_call(_: *mut AtlEngineHandle) -> c_int {
         0
     }
+    extern "C" fn map_window(_: *mut AtlEngineHandle, _: u64, _: u32, _: *mut u64) -> c_int {
+        0
+    }
 
     /// Every entry set, at `major.minor`.
     fn full(major: u32, minor: u32) -> AtlEngine {
@@ -258,6 +267,7 @@ mod tests {
             call_ex: Some(call_ex),
             fault: Some(fault),
             end_call: Some(end_call),
+            map_window: Some(map_window),
         }
     }
 

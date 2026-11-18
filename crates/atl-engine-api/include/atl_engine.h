@@ -4,7 +4,7 @@
  * Host: refuses an engine whose major differs from its own, or whose size is below atl_engine's size as the host knows it, or whose minor or entries are older than the host's (host and engine are built together, so the host requires what it calls). Minor versions only append fields.
  * One engine per process: create once. The booted engine lives until the process ends (QEMU's main never returns), so destroy has nothing to free.
  * Threads: create runs on the thread that loaded the engine (-EINVAL elsewhere): QEMU's constructor registered that thread with its RCU, and create moves the registration to the engine's boot thread. map and destroy run on any thread. attach_ex gives the calling thread its CPU; call and detach take that CPU and must run on the thread that attached it.
- * Errors: 0 or -errno: -EINVAL (bad argument or state), -EEXIST (second create), -EIO (boot or mapping failed). A call on a bad engine or CPU aborts the process.
+ * Errors: 0 or -errno: -EINVAL (bad argument or state), -EEXIST (second create), -EIO (boot or mapping failed), -ENOMEM (no window). A call on a bad engine or CPU aborts the process.
  */
 #ifndef ATL_ENGINE_H
 #define ATL_ENGINE_H
@@ -13,7 +13,7 @@
 #include <stdint.h>
 
 #define ATL_ENGINE_ABI_MAJOR 4
-#define ATL_ENGINE_ABI_MINOR 0
+#define ATL_ENGINE_ABI_MINOR 1
 
 /* Lanes per bank of atl_lanes: the widest guest convention's registers (arm r0..r15 / aarch64 x0..x15 cover every argument register), and a stack window of 16 guest stack slots. */
 #define ATL_LANE_REGS 16
@@ -86,6 +86,8 @@ typedef struct atl_engine {
     bool (*fault)(int sig, void *info, void *ucontext);
     /* From inside a CALL or BIND trap callback, on the trapping thread: when the innermost trap of this thread returns, the guest call it interrupted (the innermost call_ex on this thread's CPU) ends at once with the trap's answer as its answer, instead of resuming the trapping guest code. For a thread-exit call that never returns to its guest caller (bionic pthread_exit). 0, or -EINVAL when no trap of this thread is running. */
     int (*end_call)(atl_engine_handle *engine);
+    /* 4.1: a fresh zeroed anonymous window of len bytes (rounded up to pages) that the guest can address, mapped and marked guest-mapped with prot; *out = its address (identity: guest = host). The window allocator for every host allocation a guest dereferences: a 32-bit guest's window lies below 4 GiB in a host hole (hint-less probe with MAP_FIXED_NOREPLACE, never MAP_32BIT), coexisting with low mappings the engine did not make. Any thread after create; freed with munmap. -EINVAL, or -ENOMEM when no hole fits. */
+    int (*map_window)(atl_engine_handle *engine, uint64_t len, uint32_t prot, uint64_t *out);
 } atl_engine;
 
 #endif /* ATL_ENGINE_H */

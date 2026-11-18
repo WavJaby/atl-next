@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! `xtask test qemu-spike --arch arm`: the arm32 engine spike (phase 4 P1) on the arm-linux-user PIC build: tests/spike_arm.rs against fixture_arm.c, then its breaks.
 //! Library and harness as for aarch64 (the parent module): the same link, the same libsigchain object, its own cargo target dir (`cargo-arm`: the layouts differ by target).
-//! Breaks, each a text edit of one patched file compiled by the build's own command (one variable each): `no-p6` restores the 4 GiB reservation under `-B 0` (patch 0006 removed): the boot ends "address space that is in use" against the ART stand-in, before gate (e); `arm-only-decode` reads every svc immediate as an Arm imm24 (patch 0005's Thumb branch removed): the Thumb caller of gate (a) misses the hook.
+//! Breaks, each a text edit of one patched file compiled by the build's own command (one variable each): `no-p6` restores the 4 GiB reservation under `-B 0` (patch 0006 removed): the boot ends "address space that is in use" against the ART stand-in, before gate (e); `arm-only-decode` reads every svc immediate as an Arm imm24 (patch 0005's Thumb branch removed): the Thumb caller of gate (a) misses the hook; `blind-probe` makes 0006's hole search ignore the host's map (MAP_FIXED, no maps read): a window lands on gate (w)'s late host mapping.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -19,7 +19,7 @@ use crate::verdict::{Failure, Verdict};
 /// The arm fixture (fixture_arm.c), beside the aarch64 one.
 const FIXTURE: &str = "fixture_arm.c";
 /// Gates the plain run must print ok (spike_arm.rs).
-const GATES: [char; 7] = ['B', 'a', 'b', 'c', 'd', 'e', 'f'];
+const GATES: [char; 8] = ['B', 'a', 'b', 'c', 'd', 'e', 'w', 'f'];
 
 /// A break: one file of the build, `from` replaced by `to` (exactly once) before it is compiled.
 struct Edit {
@@ -65,6 +65,16 @@ const RUNS: &[RunSpec] = &[
             to: "    if (0) {\n        if (get_user_u16(",
         }),
         red: Some(Red::Gate('a')),
+    },
+    // patch 0006's hole search made blind (one variable: the probe ignores what the host mapped): no read of the host's map, MAP_FIXED instead of MAP_FIXED_NOREPLACE, so a window lands on the late host mapping of gate (w)
+    RunSpec {
+        name: "blind-probe",
+        edit: Some(Edit {
+            file: "linux-user/mmap.c",
+            from: "n = maps ? interval_tree_iter_first(maps, host, host + size - 1)\n                     : NULL;\n            if (n) {\n                addr = ROUND_UP(n->last + 1 - guest_base, align);\n                continue;\n            }\n            p = mmap((void *)host, size, PROT_NONE,\n                     MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE |\n                     MAP_FIXED_NOREPLACE, -1, 0);",
+            to: "n = NULL;\n            if (n) {\n                addr = ROUND_UP(n->last + 1 - guest_base, align);\n                continue;\n            }\n            p = mmap((void *)host, size, PROT_NONE,\n                     MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE |\n                     MAP_FIXED, -1, 0);",
+        }),
+        red: Some(Red::Gate('w')),
     },
 ];
 

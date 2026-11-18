@@ -40,6 +40,8 @@ mod engine;
 pub mod signal;
 #[cfg(feature = "qemu")]
 pub mod trap;
+#[cfg(feature = "qemu")]
+mod window;
 
 #[cfg(feature = "qemu")]
 pub use attach::Cpu;
@@ -47,6 +49,8 @@ pub use attach::Cpu;
 pub use engine::{Booted, Guest, OnTrap, Trap, page};
 #[cfg(all(feature = "qemu", not(feature = "engine-so")))]
 pub use engine::{Booted, Guest, OnTrap, Trap, page, start};
+#[cfg(feature = "qemu")]
+pub use window::{map_window, windows};
 
 /// The engine C ABI's facts as clang reads them from `atl_engine.h` (build.rs): the Rust mirror in atl-engine-api must state the same values.
 #[cfg(feature = "qemu")]
@@ -104,6 +108,8 @@ mod abi_check {
         assert!(offset_of!(AtlEngine, attach_ex) as u64 == l::ATL_OFFSET_ENGINE_ATTACH_EX);
     const _: () = assert!(offset_of!(AtlEngine, fault) as u64 == l::ATL_OFFSET_ENGINE_FAULT);
     const _: () = assert!(offset_of!(AtlEngine, end_call) as u64 == l::ATL_OFFSET_ENGINE_END_CALL);
+    const _: () =
+        assert!(offset_of!(AtlEngine, map_window) as u64 == l::ATL_OFFSET_ENGINE_MAP_WINDOW);
     const _: () = assert!(size_of::<AtlStack>() as u64 == l::ATL_SIZEOF_STACK);
     const _: () = assert!(offset_of!(AtlStack, size) as u64 == l::ATL_OFFSET_STACK_SIZE);
     const _: () = assert!(offset_of!(AtlStack, guard) as u64 == l::ATL_OFFSET_STACK_GUARD);
@@ -266,6 +272,33 @@ mod capi {
         }
     }
 
+    /// 4.1: a fresh window the guest can address ([`crate::map_window`]).
+    unsafe extern "C" fn map_window(
+        engine: *mut AtlEngineHandle,
+        len: u64,
+        prot: u32,
+        out: *mut u64,
+    ) -> c_int {
+        let known = PROT_READ | PROT_WRITE | PROT_EXEC;
+        if !is_engine(engine) || boot_env().is_none() || out.is_null() || prot & !known != 0 {
+            return -libc::EINVAL;
+        }
+        let Ok(len) = usize::try_from(len) else {
+            return -libc::EINVAL;
+        };
+        match crate::map_window(len, prot as i32) {
+            Ok(p) => {
+                // SAFETY: out is non-null (checked) and writable (the ABI).
+                unsafe { *out = p as u64 };
+                0
+            }
+            Err(e) => {
+                note(&e);
+                -libc::ENOMEM
+            }
+        }
+    }
+
     unsafe extern "C" fn attach_ex(
         engine: *mut AtlEngineHandle,
         stack: *mut AtlStack,
@@ -360,5 +393,6 @@ mod capi {
         call_ex: Some(call_ex),
         fault: Some(fault),
         end_call: Some(end_call),
+        map_window: Some(map_window),
     };
 }

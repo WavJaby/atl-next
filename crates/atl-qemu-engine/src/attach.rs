@@ -17,15 +17,14 @@ type CflagsHasFn = unsafe extern "C" fn(*mut c_void, u32) -> bool;
 type CflagsSetFn = unsafe extern "C" fn(*mut c_void, u32);
 /// The target's `abi_ulong` / `abi_long` (include/user/abitypes.h): 64-bit for aarch64, 32-bit for arm.
 #[cfg(not(atl_qe_guest = "arm"))]
-type AbiUlong = u64;
+pub(crate) type AbiUlong = u64;
 #[cfg(not(atl_qe_guest = "arm"))]
 type AbiLong = i64;
 #[cfg(atl_qe_guest = "arm")]
-type AbiUlong = u32;
+pub(crate) type AbiUlong = u32;
 #[cfg(atl_qe_guest = "arm")]
 type AbiLong = i32;
 type SigaltstackFn = unsafe extern "C" fn(AbiUlong, AbiUlong, *mut c_void) -> AbiLong;
-#[cfg(atl_qe_guest = "arm")]
 type TargetMmapFn = unsafe extern "C" fn(AbiUlong, AbiUlong, i32, i32, i32, i64) -> AbiLong;
 
 /// linux-user's functions a host-attached CPU needs, resolved once with the library.
@@ -53,9 +52,8 @@ pub(crate) struct Api {
     process_queued_cpu_work: PtrFn,
     /// `abi_long do_sigaltstack(abi_ulong uss, abi_ulong uoss, CPUArchState *)` (linux-user/signal.c): the guest `sigaltstack` syscall; returns 0 or a negative target errno.
     do_sigaltstack: SigaltstackFn,
-    /// `abi_long target_mmap(abi_ulong start, abi_ulong len, int prot, int flags, int fd, off_t offset)` (include/user/mmap.h): the guest's own mmap, which a 32-bit guest's stacks go through so they land below 4 GiB in a host hole (patch 0006: no reservation, QEMU probes the host). Freed by host munmap after their page marks are cleared, as for 64-bit guests.
-    #[cfg(atl_qe_guest = "arm")]
-    target_mmap: TargetMmapFn,
+    /// `abi_long target_mmap(abi_ulong start, abi_ulong len, int prot, int flags, int fd, off_t offset)` (include/user/mmap.h): the guest's own mmap, the window allocator (window.rs).
+    pub(crate) target_mmap: TargetMmapFn,
 }
 
 /// dlsym `$name` and type it as `$ty`, the prototype the field doc names.
@@ -83,7 +81,6 @@ impl Api {
             tb_flush: func!(h, c"tb_flush__exclusive_or_serial", VoidFn),
             process_queued_cpu_work: func!(h, c"process_queued_cpu_work", PtrFn),
             do_sigaltstack: func!(h, c"do_sigaltstack", SigaltstackFn),
-            #[cfg(atl_qe_guest = "arm")]
             target_mmap: func!(h, c"target_mmap", TargetMmapFn),
         })
     }
@@ -465,24 +462,10 @@ fn reserve(len: usize) -> Result<*mut c_void, String> {
     Ok(p)
 }
 
-/// arm `MAP_PRIVATE` / `MAP_ANONYMOUS` (linux-user/generic/target_mman.h via arm's): target values, which `target_mmap` translates.
-#[cfg(atl_qe_guest = "arm")]
-const TARGET_MAP_PRIVATE: i32 = 0x02;
-#[cfg(atl_qe_guest = "arm")]
-const TARGET_MAP_ANONYMOUS: i32 = 0x20;
-
-/// [`reserve`] for a 32-bit guest: the mapping must lie below 4 GiB, in a hole of a host whose low 4 GiB other code also maps (patch 0006). QEMU's own guest `mmap` finds one (its host probe, linux-user/mmap.c `mmap_find_vma`) and marks the pages; their marks are cleared here, so the caller marks exactly what it opens.
+/// [`reserve`] for a 32-bit guest: the mapping must lie below 4 GiB, in a hole of a host whose low 4 GiB other code also maps: a PROT_NONE window (window.rs). Its marks are cleared here, so the caller marks exactly what it opens.
 #[cfg(atl_qe_guest = "arm")]
 fn reserve(len: usize) -> Result<*mut c_void, String> {
-    let api = &lib().thread;
-    let n = AbiUlong::try_from(len).map_err(|_| "attach: guest stack beyond 4 GiB".to_owned())?;
-    // SAFETY: QEMU's guest mmap of fresh anonymous PROT_NONE memory (no fd); it takes the mmap lock itself.
-    let r = unsafe { (api.target_mmap)(0, n, 0, TARGET_MAP_PRIVATE | TARGET_MAP_ANONYMOUS, -1, 0) };
-    // a negative target errno is in -4095..-1 (linux-user/mmap.c returns -TARGET_E*)
-    if (-4095..0).contains(&r) {
-        return Err(format!("attach: target_mmap of a guest stack: {r}"));
-    }
-    let p = r as u32 as usize;
+    let p = crate::window::map_window(len, 0).map_err(|e| format!("attach: guest stack: {e}"))?;
     set_pages(p, len, 0, page::VALID)?;
     Ok(p as *mut c_void)
 }

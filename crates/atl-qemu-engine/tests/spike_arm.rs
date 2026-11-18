@@ -2,7 +2,7 @@
 //! arm32 engine spike gates (phase 4 P1), harness-less, on an arm-linux-user PIC build: `start` boots QEMU on its helper thread, whose BOOT trap runs gates (a)-(e) there and parks; the main thread then runs (f). Exit 0 when every gate is ok.
 //! Env (xtask qemu_spike.rs `--arch arm` sets it; without it the run prints SKIP): `ATL_QEMU_SPIKE_SO` = the spike library, `ATL_QEMU_SPIKE_FIXTURE` = the static armv7 guest program (fixture_arm.c), `ATL_QEMU_SIGCHAIN_OBJ` = AOSP libsigchain's object (build.rs links it, cfg `atl_qe_sigchain`).
 //! Expected values come from the fixture's table (fixture_arm.c), never from the engine. One line per gate: `spike-arm: (x) ok` or `spike-arm: (x) FAIL <why>`.
-//! Gates: (B) the boot reaches BOOT with the ART stand-in mapped; (a) a CALL trap from a Thumb and from an Arm caller sees r0..r3 and four stack words; (b) host -> guest -> host -> guest nesting sums right; (c) a host pointer below 4 GiB is read and written raw (plain + exclusive); (d) a guest store fault goes through the engine's special handler to the guest's SIGSEGV handler; (e) a mapping made before QEMU at [`STANDIN`] (ART's low-4G heap stand-in) survives the boot and guest `mmap` (any address, and hinted at it) avoids it; (f) a host thread attaches a CPU, calls, detaches, then the process forks and the child exits (QEMU's RCU prefork handler would block on a broken registry).
+//! Gates: (B) the boot reaches BOOT with the ART stand-in mapped; (a) a CALL trap from a Thumb and from an Arm caller sees r0..r3 and four stack words; (b) host -> guest -> host -> guest nesting sums right; (c) a host pointer below 4 GiB is read and written raw (plain + exclusive); (d) a guest store fault goes through the engine's special handler to the guest's SIGSEGV handler; (e) a mapping made before QEMU at [`STANDIN`] (ART's low-4G heap stand-in) survives the boot and guest `mmap` (any address, and hinted at it) avoids it; (w) the window allocator (`gate_w`); (f) a host thread attaches a CPU, calls, detaches, then the process forks and the child exits (QEMU's RCU prefork handler would block on a broken registry).
 #![allow(clippy::print_stdout, reason = "test harness output is its verdict")]
 
 #[cfg(all(feature = "qemu", atl_qe_guest = "arm"))]
@@ -11,7 +11,7 @@ mod spike {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
-    use atl_qemu_engine::{Guest, Trap, page};
+    use atl_qemu_engine::{Guest, Trap, map_window, page};
 
     /// The ART heap stand-in of the phase 4 plan's gate (e): a mapping in the low 4 GiB made before QEMU's `main`, as ART's `low_4gb` heap spaces are when the bridge loads (art/runtime/gc/heap.cc). Any pre-existing low mapping serves; this is the address the plan names.
     const STANDIN: usize = 0x12c0_0000;
@@ -20,6 +20,11 @@ mod spike {
     const STANDIN_MAGIC: u32 = 0xa7_12c0;
     /// What the host answers gate (a)'s CALL: any value the guest cannot produce itself.
     const A_ANSWER: u32 = 0x5a5a;
+    /// Gate (w): windows made, each of `W_LEN` bytes (several, so one lands after the late mapping; any page multiple serves).
+    const W_COUNT: usize = 8;
+    const W_LEN: usize = 64 << 10;
+    /// Gate (w)'s late host mapping, made where the next window search starts.
+    const W_LATE_LEN: usize = 1 << 20;
     /// Seconds the parent of (f)'s fork waits for the child before calling it hung.
     const F_DEADLINE_SECS: u64 = 20;
 
@@ -149,36 +154,14 @@ mod spike {
         }
     }
 
-    /// A fresh RW host page below 4 GiB: hint + MAP_FIXED_NOREPLACE over candidate addresses (the window allocator's probe, D8 obstacle 2, in miniature).
-    fn low_page() -> Result<*mut u32, String> {
-        let page = 4096;
-        for hint in (0x2000_0000usize..0xf000_0000).step_by(0x0100_0000) {
-            // SAFETY: MAP_FIXED_NOREPLACE never replaces a mapping; a refusal is an error return.
-            let p = unsafe {
-                libc::mmap(
-                    hint as *mut c_void,
-                    page,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
-                    -1,
-                    0,
-                )
-            };
-            if p != libc::MAP_FAILED {
-                return Ok(p.cast());
-            }
-        }
-        Err("no free page below 4 GiB".to_owned())
-    }
-
+    /// Gate (c)'s host memory: a window (the engine's window allocator), which comes back marked for the guest, so no `map_pages`.
     fn gate_c(g: Guest) -> Result<(), String> {
-        let p = low_page()?;
-        // SAFETY: p is a fresh RW page of 1024 u32.
+        let p = map_window(4096, page::READ | page::WRITE)? as *mut u32;
+        // SAFETY: p is a fresh RW window of 1024 u32.
         let bx = unsafe { std::slice::from_raw_parts_mut(p, 4) };
         for (i, w) in bx.iter_mut().enumerate() {
             *w = word(t::C_BEFORE + i);
         }
-        g.map_pages(p as usize, 4096, page::READ | page::WRITE)?;
         g.call(u64::from(word(t::BOX)), &[p as u64]);
         let want: Vec<u32> = (0..4).map(|i| word(t::C_AFTER + i)).collect();
         if bx == want.as_slice() {
@@ -253,14 +236,76 @@ mod spike {
         Ok(())
     }
 
-    /// Gates (a)-(e) on the boot CPU, inside BOOT. Each prints `(x) run` first: a gate the process dies in (QEMU's fatal guest signal) leaves it as the last line.
+    /// The host mapping (w) makes between two windows, `[at, at + W_LATE_LEN)`, magic written; Err when the site is taken.
+    fn late_mapping(at: usize) -> Result<(), String> {
+        // SAFETY: MAP_FIXED_NOREPLACE never replaces a mapping; a refusal is an error return.
+        let p = unsafe {
+            libc::mmap(
+                at as *mut c_void,
+                W_LATE_LEN,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
+                -1,
+                0,
+            )
+        };
+        if p as usize != at {
+            return Err(format!("late host mapping at {at:#x}: mmap gave {p:?}"));
+        }
+        // SAFETY: the RW mapping just made.
+        unsafe { (at as *mut u32).write(STANDIN_MAGIC) };
+        Ok(())
+    }
+
+    /// Gate (w), the window allocator (plan D8 obstacle 2): [`W_COUNT`] windows, each below 4 GiB, overlapping neither the ART stand-in nor each other nor a host mapping made after QEMU booted (ART's heap grows later) right where the next window search starts (the end of the last window: linux-user's `mmap_next_start`); each comes back guest-mapped, and the engine counted every one. The host-side views stay intact (magic words).
+    fn gate_w(g: Guest) -> Result<(), String> {
+        let before = atl_qemu_engine::windows();
+        let mut taken: Vec<(usize, usize, &str)> = vec![(STANDIN, STANDIN_LEN, "stand-in")];
+        for i in 0..W_COUNT {
+            let a = map_window(W_LEN, page::READ | page::WRITE)?;
+            if a + W_LEN > 1 << 32 {
+                return Err(format!("window {i} at {a:#x}+{W_LEN:#x} not below 4 GiB"));
+            }
+            if let Some((s, l, what)) = taken.iter().find(|(s, l, _)| a < s + l && *s < a + W_LEN) {
+                return Err(format!(
+                    "window {i} at {a:#x}+{W_LEN:#x} overlaps the {what} {s:#x}+{l:#x}"
+                ));
+            }
+            if g.page_flags(a as u64) & page::VALID == 0 {
+                return Err(format!("window {i} at {a:#x} not marked for the guest"));
+            }
+            taken.push((a, W_LEN, "window"));
+            if i == W_COUNT / 2 {
+                late_mapping(a + W_LEN)?;
+                taken.push((a + W_LEN, W_LATE_LEN, "late host mapping"));
+            }
+        }
+        let made = atl_qemu_engine::windows() - before;
+        if made != W_COUNT as u64 {
+            return Err(format!("engine counted {made} windows, made {W_COUNT}"));
+        }
+        for (s, _, what) in taken.iter().filter(|(_, _, w)| *w != "window") {
+            // SAFETY: the stand-in and the late mapping, alive for the process.
+            let magic = unsafe { (*s as *const u32).read() };
+            if magic != STANDIN_MAGIC {
+                return Err(format!(
+                    "{what} word {magic:#x}, expected {STANDIN_MAGIC:#x}"
+                ));
+            }
+        }
+        println!("spike-arm: (w) {W_COUNT} windows below 4 GiB, none overlapping");
+        Ok(())
+    }
+
+    /// Gates (a)-(e) and (w) on the boot CPU, inside BOOT. Each prints `(x) run` first: a gate the process dies in (QEMU's fatal guest signal) leaves it as the last line.
     fn boot_gates(g: Guest) {
-        let gates: [(char, fn(Guest) -> Result<(), String>); 5] = [
+        let gates: [(char, fn(Guest) -> Result<(), String>); 6] = [
             ('a', gate_a),
             ('b', gate_b),
             ('c', gate_c),
             ('d', gate_d),
             ('e', gate_e),
+            ('w', gate_w),
         ];
         for (name, gate) in gates {
             println!("spike-arm: ({name}) run");
@@ -392,7 +437,7 @@ mod spike {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let gates: String = results.iter().map(|(g, _)| *g).collect();
-        if gates != "abcdef" || results.iter().any(|(_, r)| r.is_err()) {
+        if gates != "abcdewf" || results.iter().any(|(_, r)| r.is_err()) {
             println!("spike-arm: FAIL gates run {gates:?}");
             return 1;
         }
