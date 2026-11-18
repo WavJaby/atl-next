@@ -335,9 +335,16 @@ fn main() -> Result<()> {
         atl_services::content::new_binder(Arc::clone(&permissions)),
     )
     .context("addService content")?;
+    // the volume broadcasts reach the changed app's receivers through the activity manager's delivery
+    let volume_broadcasts = activity.clone();
     binder::add_service(
         AUDIO,
-        atl_services::audio::new_binder(Arc::clone(&permissions)),
+        atl_services::audio::new_binder(
+            Arc::clone(&permissions),
+            Arc::new(move |uid, intent| {
+                volume_broadcasts.broadcast_to_uid(intent, uid);
+            }),
+        ),
     )
     .context("addService audio")?;
     binder::add_service(USER, atl_services::user::new_binder()).context("addService user")?;

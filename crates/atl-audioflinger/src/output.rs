@@ -18,7 +18,7 @@ use atl_platform_ui::PlatformAudioHost;
 use atl_platform_ui::audio::{AudioHost, PcmOutput, PcmSpec, StreamIdentity};
 
 use crate::Options;
-use crate::volume::AppVolume;
+use crate::volume::{AppVolume, Report};
 
 /// The rate the output asks for: PipeWire's default graph rate (`default.clock.rate`). The server serves the rate the graph grants.
 const REQUEST_RATE_HZ: u32 = 48_000;
@@ -95,6 +95,7 @@ impl Drop for Output {
 }
 
 /// Asks the output's thread for [`Opened`]. A request opens the output if it is not open yet; a failed open answers that request with its reason, and the next request tries again.
+#[derive(Clone)]
 pub(crate) struct Opener {
     requests: Sender<Ask>,
     volume: Arc<AppVolume>,
@@ -117,17 +118,19 @@ pub(crate) struct Target {
 }
 
 impl Opener {
-    /// Starts the output's thread for `target`, whose stream's volume `volume` controls. Opens nothing: the first [`Opener::get`] does.
+    /// Starts the output's thread for `target`, whose stream's volume `volume` controls; the host's changes of it go to `reports` (sent from the PipeWire connection thread, which must not
+    /// block: the receiver makes the AudioService calls). Opens nothing: the first [`Opener::get`] does.
     pub(crate) fn spawn(
         target: Target,
         opts: Options,
         volume: Arc<AppVolume>,
+        reports: Sender<Report>,
     ) -> Result<Self, String> {
         let (requests, inbox) = mpsc::channel();
         let owned = Arc::clone(&volume);
         thread::Builder::new()
             .name("atl-pcm-output".to_owned())
-            .spawn(move || owner(inbox, target, opts, owned))
+            .spawn(move || owner(inbox, target, opts, owned, reports))
             .map_err(|e| format!("starting the PCM output's thread: {e}"))?;
         Ok(Self { requests, volume })
     }
@@ -163,7 +166,13 @@ fn apply_volume(pcm: &atl_platform_ui::PlatformPcmOutput, volume: &AppVolume) {
 }
 
 /// The output's thread: opens the output on the first request, holds it until the process ends, and answers every request. It ends when no [`Opener`] is left.
-fn owner(inbox: Receiver<Ask>, target: Target, opts: Options, volume: Arc<AppVolume>) {
+fn owner(
+    inbox: Receiver<Ask>,
+    target: Target,
+    opts: Options,
+    volume: Arc<AppVolume>,
+    reports: Sender<Report>,
+) {
     let mut open: Option<(Output, Opened)> = None;
     let mut logged = Instant::now();
     loop {
@@ -196,7 +205,7 @@ fn owner(inbox: Receiver<Ask>, target: Target, opts: Options, volume: Arc<AppVol
         };
         let answer = match open.as_ref() {
             Some((_, opened)) => Ok(opened.clone()),
-            None => match start(&target, opts, &volume) {
+            None => match start(&target, opts, &volume, &reports) {
                 Ok((output, opened)) => {
                     open = Some((output, opened.clone()));
                     Ok(opened)
@@ -213,11 +222,13 @@ fn owner(inbox: Receiver<Ask>, target: Target, opts: Options, volume: Arc<AppVol
     }
 }
 
-/// Connects to `target`'s server, opens and starts the output, and installs the mixer for the quantum the server ran. The stream's volume reports go to `volume`, and its pending value is written once the stream runs.
+/// Connects to `target`'s server, opens and starts the output, and installs the mixer for the quantum the server ran. The stream's volume reports go to `volume`, its changes on to `reports`,
+/// and its pending value is written once the stream runs.
 fn start(
     target: &Target,
     opts: Options,
     volume: &Arc<AppVolume>,
+    reports: &Sender<Report>,
 ) -> Result<(Output, Opened), String> {
     let remote = target.remote.as_deref().ok_or_else(|| {
         "no audio server socket granted: atld found no PipeWire socket on the desktop".to_owned()
@@ -228,6 +239,7 @@ fn start(
     let fill_mixer = Arc::clone(&mixer);
     let silent = opts.break_mix;
     let observer = Arc::clone(volume);
+    let reports = reports.clone();
     let pcm = host
         .open_output(
             PcmSpec {
@@ -235,8 +247,11 @@ fn start(
                 channels: CHANNELS,
             },
             move |out| render(&fill_mixer, out, silent),
+            // the connection thread only hands the change off; no receiver (no AudioService link) drops it
             move |v| {
-                observer.observed(v);
+                if let Some(report) = observer.observed(v) {
+                    let _ = reports.send(report);
+                }
             },
         )
         .map_err(|e| e.to_string())?;

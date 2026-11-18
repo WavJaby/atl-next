@@ -265,9 +265,6 @@ struct Args {
     /// Test only: apps start with `--break-mix` (their AudioFlinger's mixer plays silence), the audio gate's third break.
     #[arg(long)]
     break_mix: bool,
-    /// Test only: apps start with `--app-volume-index=<n>` (their app volume starts at music index n, written to their host stream), the app-volume gate's write.
-    #[arg(long)]
-    app_volume_index: Option<u32>,
     /// How long, ms, each system process (the services, gralloc, servicemanager, binderd) gets at the run's end between its stop request (SIGTERM; binderd: its admin connection closed) and
     /// SIGKILL: what it takes to write its exit totals (`diag: total`) and end. App processes are SIGKILLed, as AOSP kills them. The C4 config's CLI layer: no TOML layer exists yet.
     #[arg(long, default_value_t = STOP_GRACE_MS)]
@@ -1073,8 +1070,6 @@ struct Host {
     no_media_player_service: bool,
     /// test only: each app's launcher gets `--break-mix` (the audio gate's third break)
     break_mix: bool,
-    /// test only: each app's launcher gets `--app-volume-index=<n>` (the app-volume gate's write)
-    app_volume_index: Option<u32>,
     /// the processes the services started and may kill: the host pids binderd tags them with
     controlled: Mutex<BTreeSet<i32>>,
     /// each reaped process's exit status, by host pid: a `LastAppEnded` of a live app ends the run only when its process exited 0
@@ -1298,10 +1293,6 @@ impl Host {
                         .then(|| "--no-media-player-service".to_owned()),
                 )
                 .chain(self.break_mix.then(|| "--break-mix".to_owned()))
-                .chain(
-                    self.app_volume_index
-                        .map(|i| format!("--app-volume-index={i}")),
-                )
                 .chain([
                     format!("-Xbootclasspath:{boot}"),
                     format!("-Xbootclasspath-locations:{boot}"),
@@ -2449,7 +2440,6 @@ fn run(a: &Args) -> Result<ExitCode> {
         break_cblk: a.break_cblk,
         no_media_player_service: a.no_media_player_service,
         break_mix: a.break_mix,
-        app_volume_index: a.app_volume_index,
         controlled: Mutex::new(BTreeSet::new()),
         exits: Mutex::new(BTreeMap::new()),
         exit_with_last_app: a.exit_with_last_app.unwrap_or(a.ui.is_some()),

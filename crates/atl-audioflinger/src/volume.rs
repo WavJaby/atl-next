@@ -35,7 +35,7 @@ pub(crate) struct AppVolume {
 struct State {
     index: u32,
     mute: bool,
-    /// Set by the app side and not yet written to a stream: applied when the stream appears (or at once when it exists). Kept apart from index/mute so a host report arriving before the write does not lose it.
+    /// Set by the app side and not yet written to a stream: applied when the stream appears (or at once when it exists). Kept apart from index/mute: until it is written, host reports are dropped (the write replaces the host's value).
     pending: Option<(u32, bool)>,
 }
 
@@ -76,11 +76,19 @@ impl AppVolume {
         Some(StreamVolume { linear, mute })
     }
 
-    /// The host reported the stream's volume. Returns the new (index, mute) when either changed (an echo of our own write does not), and logs `app-volume: observed ...`.
-    pub(crate) fn observed(&self, volume: StreamVolume) -> Option<(u32, bool)> {
+    /// The current (index, mute): the last value written or observed.
+    pub(crate) fn current(&self) -> (u32, bool) {
+        let s = self.lock();
+        (s.index, s.mute)
+    }
+
+    /// The host reported the stream's volume. Returns the change when index or mute changed (an echo of our own write does not), and logs `app-volume: observed ...`.
+    /// While an app-side value is pending the report is dropped: AudioService already holds the app's value and the pending write puts it on the host.
+    pub(crate) fn observed(&self, volume: StreamVolume) -> Option<Report> {
         let index = linear_to_index(volume.linear, self.max);
         let mut s = self.lock();
-        if (s.index, s.mute) == (index, volume.mute) {
+        let before = (s.index, s.mute);
+        if s.pending.is_some() || before == (index, volume.mute) {
             return None;
         }
         s.index = index;
@@ -92,7 +100,32 @@ impl AppVolume {
             volume.mute,
             volume.linear
         );
-        Some((index, volume.mute))
+        Some(Report {
+            before,
+            now: (index, volume.mute),
+        })
+    }
+}
+
+/// A host-side change of the app volume, (index, mute) before and now; AudioService holds `before`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Report {
+    pub(crate) before: (u32, bool),
+    pub(crate) now: (u32, bool),
+}
+
+impl Report {
+    /// What AudioService is told, as (setStreamVolume index, adjustStreamVolume mute): the index when it changed; the mute when it differs from what AudioService then holds -- its own mute
+    /// unless setStreamVolume reset it (onSetStreamVolume: `muteAliasStreams(index == 0)`).
+    pub(crate) fn calls(&self) -> (Option<u32>, Option<bool>) {
+        let (index, mute) = self.now;
+        let set = (index != self.before.0).then_some(index);
+        let held = if set.is_some() {
+            index == 0
+        } else {
+            self.before.1
+        };
+        (set, (mute != held).then_some(mute))
     }
 }
 
@@ -124,20 +157,22 @@ mod tests {
     }
 
     #[test]
-    fn pending_survives_a_host_report_and_echo_is_silent() {
+    fn pending_wins_over_a_host_report_and_echo_is_silent() {
         let v = AppVolume::new(15);
+        assert_eq!(v.current(), (15, false));
         v.set(9, false);
-        // the host restores a value before our write: the index follows, the pending write stays
+        // the host restores a value before our write: not reported (AudioService already holds the app's value, which the write puts on the host), the pending write stays
         assert_eq!(
             v.observed(StreamVolume {
                 linear: 0.064,
                 mute: false
             }),
-            Some((6, false))
+            None
         );
         let w = v.take_pending().expect("pending");
         assert!((w.linear - 0.216).abs() < 1e-6 && !w.mute);
         assert_eq!(v.take_pending(), None);
+        assert_eq!(v.current(), (9, false));
         // the server echoes our own write: no change
         assert_eq!(
             v.observed(StreamVolume {
@@ -151,7 +186,42 @@ mod tests {
                 linear: 0.216,
                 mute: true
             }),
-            Some((9, true))
+            Some(Report {
+                before: (9, false),
+                now: (9, true)
+            })
         );
+    }
+
+    /// The host value at stream creation (the session manager's restore, measured as a Props event at connect) with nothing pending is a change like any other.
+    #[test]
+    fn a_restore_with_nothing_pending_is_reported() {
+        let v = AppVolume::new(15);
+        assert_eq!(
+            v.observed(StreamVolume {
+                linear: 0.216,
+                mute: false
+            }),
+            Some(Report {
+                before: (15, false),
+                now: (9, false)
+            })
+        );
+    }
+
+    /// The calls a report becomes (AudioService's own rules decide the mute a setStreamVolume implies: index 0 mutes, any other unmutes, onSetStreamVolume).
+    #[test]
+    fn reports_become_the_fewest_calls() {
+        let r = |before, now| Report { before, now }.calls();
+        // index only
+        assert_eq!(r((9, false), (6, false)), (Some(6), None));
+        // mute only: the index stays, so only the adjustment
+        assert_eq!(r((6, false), (6, true)), (None, Some(true)));
+        assert_eq!(r((6, true), (6, false)), (None, Some(false)));
+        // a new index while muted: setStreamVolume unmutes, so the mute is sent again
+        assert_eq!(r((6, true), (9, true)), (Some(9), Some(true)));
+        // to 0 unmuted: setStreamVolume(0) mutes, so unmute follows
+        assert_eq!(r((6, false), (0, false)), (Some(0), Some(false)));
+        assert_eq!(r((6, false), (0, true)), (Some(0), None));
     }
 }

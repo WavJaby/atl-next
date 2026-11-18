@@ -87,7 +87,7 @@ uses = ["service-view", "generators"]
 [audioflinger]
 crates = ["atl-audioflinger"]
 exports = ["atl-audioflinger"]
-uses = ["service-view", "services-wire", "generators", "audio-bridge", "platform-ui"]
+uses = ["service-view", "services-wire", "generators", "audio-bridge", "platform-ui", "aidl"]
 
 # AOSP's server side of a track (ServerProxy over the mapped control block and buffer) and its mixer (AudioMixerBase), through cxx (wrap/mix.cpp): the boundary crate for atl-audioflinger's data plane (audio A2); libaudioclient and libaudioprocessing_base from the converter
 [audio-bridge]

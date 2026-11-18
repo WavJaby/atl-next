@@ -2,12 +2,21 @@
 package com.example.atlaudio;
 
 import android.app.Activity;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.media.AudioAttributes;
 import android.media.AudioFormat;
 import android.media.AudioManager;
 import android.media.AudioTrack;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 
 /**
  * The audio gate (`xtask test audio-app`, xtask-harness/src/audio_app.rs). Tag AtlAudio, one line each, checked by the gate:
@@ -19,9 +28,22 @@ import android.util.Log;
  * `props: rate=<s> frames=<s>`: AudioManager's PROPERTY_OUTPUT_SAMPLE_RATE and PROPERTY_OUTPUT_FRAMES_PER_BUFFER (the primary output's rate and HAL frame count).
  * `pcm: ...`: the PCM tones (audio_app.rs TONE_*, STREAM_*): a static track of STATIC_TONE_HZ, then a streaming track of STREAM_TONE_HZ in FMOD's shape, then a float streaming track of FLOAT_TONE_HZ, then an OpenSL ES tone and an AAudio tone (native, `pcm: sles ...` / `pcm: aaudio ...`), one after the other; the gate checks the recording of the sink.
  * `done`: the end of the run.
+ * The volume run (asset `volume` present, audio_app.rs `--volume`) logs only `volume: ...` lines (volumeRun) and `done`.
  */
 public class Main extends Activity {
     private static final String TAG = "AtlAudio";
+    /** The volume run's asset: the music index to set, written by audio_app.rs `--volume`. */
+    private static final String VOLUME_ASSET = "volume";
+    /** How long the app's own mute lasts: long enough for the gate to read it on the node (app_volume.rs polls every 50 ms, within STEP_LIMIT). */
+    private static final long APP_MUTE_MS = 1500;
+    /** AudioManager's hidden broadcast actions and extras (AudioManager.java:204, :246, :288, :298, :306, :312, :338); the fixture compiles against the public SDK. */
+    private static final String VOLUME_CHANGED_ACTION = "android.media.VOLUME_CHANGED_ACTION";
+    private static final String STREAM_MUTE_CHANGED_ACTION = "android.media.STREAM_MUTE_CHANGED_ACTION";
+    private static final String EXTRA_VOLUME_STREAM_TYPE = "android.media.EXTRA_VOLUME_STREAM_TYPE";
+    private static final String EXTRA_VOLUME_STREAM_TYPE_ALIAS = "android.media.EXTRA_VOLUME_STREAM_TYPE_ALIAS";
+    private static final String EXTRA_VOLUME_STREAM_VALUE = "android.media.EXTRA_VOLUME_STREAM_VALUE";
+    private static final String EXTRA_PREV_VOLUME_STREAM_VALUE = "android.media.EXTRA_PREV_VOLUME_STREAM_VALUE";
+    private static final String EXTRA_STREAM_VOLUME_MUTED = "android.media.EXTRA_STREAM_VOLUME_MUTED";
     /** The rate the gate asks for; audio_app.rs works the expected minimum buffer for it. */
     private static final int RATE_HZ = 44100;
     /** The static track's buffer: 4096 bytes, 1024 stereo 16-bit frames (audio_app.rs STATIC_BYTES). */
@@ -62,10 +84,99 @@ public class Main extends Activity {
         return s;
     }
 
+    /** The volume run's index (audio_app.rs `--volume` puts it in asset VOLUME_ASSET); -1: the PCM run. */
+    private int volumeIndex() {
+        try (InputStream in = getAssets().open(VOLUME_ASSET)) {
+            return Integer.parseInt(new String(in.readAllBytes(), StandardCharsets.US_ASCII).trim());
+        } catch (IOException | NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    /**
+     * The volume run (app_volume.rs): AudioManager's own calls against the app's host stream, silent. Receivers log VOLUME_CHANGED_ACTION / STREAM_MUTE_CHANGED_ACTION of STREAM_MUSIC with their
+     * extras and AudioManager's reading; a silent track keeps the stream up; setStreamVolume(STREAM_MUSIC, index) is the app-side write. After the host's mute and unmute, the app mutes
+     * (adjustStreamVolume ADJUST_MUTE) and APP_MUTE_MS later unmutes, the app-side mute the gate reads on the node.
+     */
+    private void volumeRun(AudioManager audio, int index) {
+        Context app = getApplicationContext();
+        app.registerReceiver(new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context c, Intent i) {
+                int stream = i.getIntExtra(EXTRA_VOLUME_STREAM_TYPE, -1);
+                if (stream != AudioManager.STREAM_MUSIC) {
+                    return;
+                }
+                Log.i(TAG, "volume: changed stream=" + stream
+                        + " value=" + i.getIntExtra(EXTRA_VOLUME_STREAM_VALUE, -1)
+                        + " prev=" + i.getIntExtra(EXTRA_PREV_VOLUME_STREAM_VALUE, -1)
+                        + " alias=" + i.getIntExtra(EXTRA_VOLUME_STREAM_TYPE_ALIAS, -1)
+                        + " get=" + audio.getStreamVolume(stream));
+            }
+        }, new IntentFilter(VOLUME_CHANGED_ACTION), Context.RECEIVER_EXPORTED);
+        int[] seen = {0, 0};
+        Handler main = new Handler(Looper.getMainLooper());
+        app.registerReceiver(new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context c, Intent i) {
+                int stream = i.getIntExtra(EXTRA_VOLUME_STREAM_TYPE, -1);
+                if (stream != AudioManager.STREAM_MUSIC) {
+                    return;
+                }
+                boolean muted = i.getBooleanExtra(EXTRA_STREAM_VOLUME_MUTED, !audio.isStreamMute(stream));
+                Log.i(TAG, "volume: mute stream=" + stream + " muted=" + muted
+                        + " is=" + audio.isStreamMute(stream));
+                // seen[1] counts unmutes: the host's (1st) starts the app's own mute; the app's own unmute (2nd) ends the run
+                if (!muted && ++seen[1] == 1) {
+                    audio.adjustStreamVolume(stream, AudioManager.ADJUST_MUTE, 0);
+                    Log.i(TAG, "volume: app mute");
+                    main.postDelayed(new Runnable() {
+                        @Override
+                        public void run() {
+                            audio.adjustStreamVolume(stream, AudioManager.ADJUST_UNMUTE, 0);
+                            Log.i(TAG, "volume: app unmute");
+                        }
+                    }, APP_MUTE_MS);
+                } else if (!muted && seen[1] == 2) {
+                    Log.i(TAG, "done");
+                }
+            }
+        }, new IntentFilter(STREAM_MUTE_CHANGED_ACTION), Context.RECEIVER_EXPORTED);
+        Thread silence = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                AudioAttributes attributes = new AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_GAME).build();
+                AudioFormat format = new AudioFormat.Builder()
+                        .setSampleRate(RATE_HZ)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .build();
+                int min = AudioTrack.getMinBufferSize(
+                        RATE_HZ, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT);
+                AudioTrack track = new AudioTrack(attributes, format, min, AudioTrack.MODE_STREAM, 0);
+                track.play();
+                short[] zeros = new short[min / 2];
+                // the gate ends the run; until then the stream (and its host node) stays
+                while (track.write(zeros, 0, zeros.length) > 0) {
+                }
+            }
+        }, "silence");
+        silence.setDaemon(true);
+        silence.start();
+        audio.setStreamVolume(AudioManager.STREAM_MUSIC, index, 0);
+        Log.i(TAG, "volume: set index=" + index + " get=" + audio.getStreamVolume(AudioManager.STREAM_MUSIC));
+    }
+
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
         AudioManager audio = (AudioManager) getSystemService(AUDIO_SERVICE);
+        int volume = volumeIndex();
+        if (volume >= 0) {
+            volumeRun(audio, volume);
+            return;
+        }
         int a = audio.generateAudioSessionId();
         int b = audio.generateAudioSessionId();
         Log.i(TAG, "session: " + a + " " + b);

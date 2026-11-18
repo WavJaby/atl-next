@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test audio-app --volume`: the app volume on the app's own host stream (atl-audioflinger volume.rs), driven from both ends while the fixture plays into the gate's null sink.
-//! Write: the app starts with `--app-volume-index=`[`WRITE_INDEX`] (atld, then the launcher); the node's `channelVolumes` must read cube([`WRITE_INDEX`]). Observe: the gate sets the node's `channelVolumes` to cube([`OBSERVE_INDEX`]) with `pw-cli set-param`, then mute on, then mute off; each must show in the app log as an `app-volume: observed` line with that index and mute.
+//! `xtask test audio-app --volume`: STREAM_MUSIC on the app's own host stream through AudioManager (AudioService's absolute-volume device, atl-audioflinger dispatcher.rs), driven from both
+//! ends while the fixture plays silence into the gate's null sink.
+//! Write: the fixture calls setStreamVolume(STREAM_MUSIC, [`WRITE_INDEX`]) (the index reaches it as asset [`ASSET`]); the node's `channelVolumes` must read cube([`WRITE_INDEX`]). Observe: the
+//! gate sets the node's `channelVolumes` to cube([`OBSERVE_INDEX`]) with `pw-cli set-param`, then mute on, then mute off; each must reach the fixture as the broadcast with AOSP's extras and
+//! AudioManager's reading. App mute: after the host's unmute the fixture mutes and unmutes STREAM_MUSIC itself (adjustStreamVolume); the node's `mute` must follow both ways.
 //! cube(i) = (i / [`MUSIC_MAX`])^3: the desktop slider is the cube root of PipeWire's linear volume, and the app's index maps linearly onto the slider. The node is put back to 1.0, unmuted, on every exit path, so the session manager's saved volume for the fixture's app id stays what the PCM run expects.
 
 use std::process::Command;
@@ -10,6 +13,10 @@ use std::time::{Duration, Instant};
 const MUSIC_MAX: u32 = 15;
 /// The written index: (9/15)^3 = 0.6^3 = 0.216.
 pub(crate) const WRITE_INDEX: u32 = 9;
+/// The fixture's asset that selects its volume run and carries [`WRITE_INDEX`] (Main.java VOLUME_ASSET).
+pub(crate) const ASSET: &str = "volume";
+/// AudioManager.STREAM_MUSIC: the stream the fixture's broadcast lines name.
+const STREAM_MUSIC: u32 = 3;
 /// The observed index: (6/15)^3 = 0.4^3 = 0.064, a whole step (cbrt(0.064) * 15 = 6 exactly), not a half step that rounding could take either way.
 const OBSERVE_INDEX: u32 = 6;
 /// Volumes compared to this: pw-dump prints 6 decimals and the server stores f32 (error < 1e-7), while neighbouring steps of 15 differ by >= 0.0003 (0 -> 1/15^3); 1e-4 separates steps and absorbs printing.
@@ -131,20 +138,34 @@ pub(crate) fn steps(app_id: &str, read: impl Fn() -> String) -> Vec<(&'static st
         })
     });
     let last = find(app_id).map(|n| n.volumes).unwrap_or_default();
+    let set_line = format!("volume: set index={WRITE_INDEX} get={WRITE_INDEX}");
+    let logged = read().contains(&set_line);
     verdicts.push((
         "app volume write",
-        seen.is_some(),
-        format!("index {WRITE_INDEX} -> node {} channelVolumes {last:?}, want each {want:.6} +-{TOLERANCE}", node.id),
+        seen.is_some() && logged,
+        format!("setStreamVolume({STREAM_MUSIC}, {WRITE_INDEX}) -> node {} channelVolumes {last:?}, want each {want:.6} +-{TOLERANCE}; app log `{set_line}`: {logged}", node.id),
     ));
 
     let v = cube(OBSERVE_INDEX);
-    for (name, pod, mute) in [
-        ("app volume observe", volumes_pod(v, channels), false),
-        ("app volume mute on", "{ mute: true }".to_owned(), true),
-        ("app volume mute off", "{ mute: false }".to_owned(), false),
+    for (name, pod, line) in [
+        (
+            "app volume observe",
+            volumes_pod(v, channels),
+            format!(
+                "volume: changed stream={STREAM_MUSIC} value={OBSERVE_INDEX} prev={WRITE_INDEX} alias={STREAM_MUSIC} get={OBSERVE_INDEX}"
+            ),
+        ),
+        (
+            "app volume mute on",
+            "{ mute: true }".to_owned(),
+            format!("volume: mute stream={STREAM_MUSIC} muted=true is=true"),
+        ),
+        (
+            "app volume mute off",
+            "{ mute: false }".to_owned(),
+            format!("volume: mute stream={STREAM_MUSIC} muted=false is=false"),
+        ),
     ] {
-        let line =
-            format!("app-volume: observed index={OBSERVE_INDEX} max={MUSIC_MAX} mute={mute} ");
         let before = read().len();
         let sent = set(node.id, &pod);
         let found = sent.is_ok()
@@ -164,8 +185,30 @@ pub(crate) fn steps(app_id: &str, read: impl Fn() -> String) -> Vec<(&'static st
             format!(
                 "set {pod} ({}) -> want app log `{}`; node now {state}",
                 sent.err().unwrap_or_else(|| "ok".to_owned()),
-                line.trim_end()
+                line
             ),
+        ));
+    }
+
+    // the app's own mute (the fixture's adjustStreamVolume after the host's unmute), then its unmute APP_MUTE_MS later: the node's mute follows
+    for (name, line, mute) in [
+        ("app volume app mute on", "volume: app mute", true),
+        ("app volume app mute off", "volume: app unmute", false),
+    ] {
+        let seen = wait(STEP_LIMIT, || {
+            read()
+                .contains(line)
+                .then(|| find(app_id))
+                .flatten()
+                .filter(|n| n.mute == Some(mute))
+        });
+        let state = find(app_id)
+            .map(|n| format!("{:?} mute={:?}", n.volumes, n.mute))
+            .unwrap_or_default();
+        verdicts.push((
+            name,
+            seen.is_some(),
+            format!("app log `{line}` -> want node mute={mute}; node now {state}"),
         ));
     }
     verdicts

@@ -56,7 +56,7 @@ pub struct Args {
     /// The native tones' break: the fixture library is built with ATL_TONE_SILENT (zero amplitude), so the OpenSL ES and AAudio runs are absent from the recording and the PCM checks must go red.
     #[arg(long)]
     break_tone: bool,
-    /// The app-volume run (app_volume.rs): the app starts with `--app-volume-index`, the gate reads the node's volume back and changes it from outside; only those checks are judged (the attenuated recording is not).
+    /// The app-volume run (app_volume.rs): the fixture sets STREAM_MUSIC through AudioManager (its index as an asset), the gate reads the node's volume back and changes it from outside; only those checks are judged (the silent recording is not).
     #[arg(long)]
     volume: bool,
 }
@@ -460,12 +460,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         rt
     };
-    let rt = if args.volume {
-        rt.with_app_volume_index(crate::app_volume::WRITE_INDEX)
-    } else {
-        rt
-    };
     let work = rt.out.join("audio");
+    // the volume run's asset: its presence selects the fixture's volume run, its text the index the fixture sets
+    let assets = work.join("assets");
+    if args.volume {
+        std::fs::create_dir_all(&assets)?;
+        std::fs::write(
+            assets.join(crate::app_volume::ASSET),
+            crate::app_volume::WRITE_INDEX.to_string(),
+        )?;
+    }
     let rt = if args.unreachable {
         rt.with_pipewire_remote(stale_socket(&work)?)
     } else {
@@ -477,7 +481,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         &work.join("apk"),
         &[],
         Some(&native),
-        None,
+        args.volume.then_some(assets.as_path()),
     )?;
     let m = manifest::read(&rt.apk.aapt2, &apk)?;
     println!("audio-app: built {} ({})", apk.display(), m.name);
@@ -504,7 +508,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let volume = args
         .volume
         .then(|| crate::app_volume::steps(&format!("atl.{}", m.name), || read(&app_log)));
-    loop {
+    // the volume run is judged by its steps alone: no wait for the fixture's end
+    while volume.is_none() {
         if read(&app_log).lines().any(|l| l.contains(DONE)) {
             break;
         }
@@ -533,7 +538,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             ok &= verdict(name, *pass, detail);
         }
         if !ok {
-            for l in app.lines().filter(|l| l.contains("app-volume:")) {
+            for l in app
+                .lines()
+                .filter(|l| l.contains("app-volume:") || l.contains("AtlAudio: volume:"))
+            {
                 println!("{l}");
             }
         }

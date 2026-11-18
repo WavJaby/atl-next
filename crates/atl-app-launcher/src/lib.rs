@@ -219,7 +219,6 @@ fn serve_media_services(launch: &args::Launch) -> Result<()> {
             atl_audioflinger::Options {
                 break_cblk: launch.break_cblk,
                 break_mix: launch.break_mix,
-                volume_index: launch.app_volume_index,
             },
         )
         .map_err(|e| anyhow!(e))?;

@@ -807,6 +807,46 @@ impl ActivityManager {
         told
     }
 
+    /// A broadcast the services send as the system uid to the registered receivers of `uid` only (AudioService.sendBroadcastToAll's registered-receiver delivery, narrowed to one app by the
+    /// per-app volume deviation, audio.rs): each matching receiver of that uid passes BroadcastSkipPolicy as a system send and is queued for its process, as broadcastIntentWithFeature does
+    /// (result code Activity.RESULT_OK -1, ContextImpl.sendBroadcastAsUser). Returns the receivers queued.
+    pub fn broadcast_to_uid(&self, intent: &Intent, uid: u32) -> usize {
+        const RESULT_OK: i32 = -1;
+        let inner = &self.inner;
+        let user = i32::try_from(uid / permission::PER_USER_RANGE).unwrap_or(USER_SYSTEM);
+        let key = intent_key(intent, None);
+        let mut st = inner.state();
+        let mut queued = 0;
+        for (receiver, rpid, ruid, bf) in st.broadcasts.receivers(&key, user) {
+            if ruid != uid {
+                continue;
+            }
+            if let Some(why) = broadcast::skip_registered(
+                &bf,
+                SYSTEM_UID,
+                ruid,
+                &[],
+                |p| inner.holds(SYSTEM_UID, p),
+                |p| inner.holds(ruid, p),
+            ) {
+                atl_diag::answered(AM, why.split(':').next().unwrap_or("skipped"));
+                continue;
+            }
+            let job = Job::Registered {
+                receiver: receiver.0,
+                intent: intent.clone(),
+                result_code: RESULT_OK,
+                data: None,
+                extras: None,
+                initial_sticky: false,
+                user,
+            };
+            inner.deliver_locked(&mut st, rpid, job);
+            queued += 1;
+        }
+        queued
+    }
+
     /// Registry set_bounds changed `task`'s size.
     pub(crate) fn task_resized(&self, task: TaskId) {
         self.inner.task_resized(task);

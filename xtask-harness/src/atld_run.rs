@@ -310,8 +310,6 @@ pub struct Runtime {
     media_player_service: bool,
     /// Apps' AudioFlinger mixes silence when this is set (`--break-mix`, the audio gate's third break).
     audio_break_mix: bool,
-    /// Apps' app volume starts at this music index when set (`--app-volume-index`, audio_app.rs `--volume`).
-    app_volume_index: Option<u32>,
     /// atld's `PIPEWIRE_REMOTE` (the desktop's server socket, which atld grants the apps) when set: a stale socket file makes an unreachable server (audio_app.rs `--unreachable`).
     pipewire_remote: Option<PathBuf>,
     /// atld's `PULSE_SERVER` (where atld finds the pulse socket `share-sound` grants the web process).
@@ -827,7 +825,6 @@ impl Runtime {
             audio_break_cblk: false,
             media_player_service: true,
             audio_break_mix: false,
-            app_volume_index: None,
             pipewire_remote: None,
             pulse_server: PulseServer::GateDefault,
             wayland: None,
@@ -1148,12 +1145,6 @@ impl Runtime {
     /// Apps start with `--break-mix`: their AudioFlinger's mixer plays silence, so no track reaches the sink (audio_app.rs `--break-mix`, test only).
     pub fn with_broken_mix(mut self) -> Self {
         self.audio_break_mix = true;
-        self
-    }
-
-    /// Apps start with `--app-volume-index=<index>`: their app volume starts at that music index, written to their host stream (audio_app.rs `--volume`, test only).
-    pub fn with_app_volume_index(mut self, index: u32) -> Self {
-        self.app_volume_index = Some(index);
         self
     }
 
@@ -1886,9 +1877,6 @@ impl Runtime {
         }
         if self.audio_break_mix {
             cmd.arg("--break-mix");
-        }
-        if let Some(index) = self.app_volume_index {
-            cmd.arg(format!("--app-volume-index={index}"));
         }
         if let Some(socket) = &self.pipewire_remote {
             cmd.env("PIPEWIRE_REMOTE", socket);
