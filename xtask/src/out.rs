@@ -1232,8 +1232,8 @@ fn age(path: &Path) -> String {
         })
 }
 
-/// The ids of the live checkouts of `root`'s repository.
-fn live_of(root: &Path) -> Result<BTreeSet<String>> {
+/// The ids of the live checkouts of `root`'s repository: a build dir or remote run dir named otherwise is an orphan.
+pub fn live_ids_of(root: &Path) -> Result<BTreeSet<String>> {
     let common = PathBuf::from(git(
         Some(root),
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -1244,7 +1244,7 @@ fn live_of(root: &Path) -> Result<BTreeSet<String>> {
 /// The ids of the build dirs whose checkout is live (`root`'s repository).
 pub fn live_dirs(root: &Path) -> Result<Vec<String>> {
     let ws = Layout::of(root)?.workspace().to_owned();
-    let live = live_of(root)?;
+    let live = live_ids_of(root)?;
     Ok(build_dirs(&ws)?
         .into_iter()
         .map(|(id, _)| id)
@@ -1254,7 +1254,7 @@ pub fn live_dirs(root: &Path) -> Result<Vec<String>> {
 
 pub fn run(root: &Path, cmd: &Out) -> Result<ExitCode> {
     let ws = Layout::of(root)?.workspace().to_owned();
-    let live = live_of(root)?;
+    let live = live_ids_of(root)?;
     match cmd {
         Out::Show => {
             let id = checkout_id(root)?;

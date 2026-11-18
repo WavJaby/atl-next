@@ -112,6 +112,10 @@ pub enum Remote {
     ///
     /// Dry run by default: prints the bundle and the plan. `--apply` pushes, checks and runs. The window is the target's, on its Wayland session; the logs come back when the run ends.
     RunApk(crate::run_apk::RemoteArgs),
+    /// Lists the target's run dirs (`~/atl-next-run/`) and classifies each: `live` (a checkout of this repository, or `<id>-<arch>` for a host arch), `orphan` (its checkout is gone), `unknown` (not a checkout's name: never touched).
+    ///
+    /// Dry run by default: prints each dir with its size and the total `--execute` would remove. `--execute` removes the orphans no run or check holds (`.run.lock`), one dir at a time; a held one is skipped.
+    Prune(PruneArgs),
 }
 
 #[derive(clap::Args)]
@@ -190,11 +194,22 @@ pub enum Break {
     DropAtld,
 }
 
+#[derive(clap::Args)]
+pub struct PruneArgs {
+    /// ssh alias from WSL `~/.ssh/config` (its `Host` name). `local:` is refused: its dir is the caller's, not a run dir.
+    #[arg(long)]
+    host: String,
+    /// Removes the orphan dirs no run or check holds. Without it: prints what would be removed.
+    #[arg(long)]
+    execute: bool,
+}
+
 pub fn run(root: &Path, cmd: &Remote) -> Result<ExitCode> {
     match cmd {
         Remote::Push(a) => push(root, a),
         Remote::Test(a) => test(root, a),
         Remote::RunApk(a) => crate::run_apk::remote(root, a),
+        Remote::Prune(a) => prune(root, a),
     }
 }
 
@@ -558,6 +573,7 @@ impl Plan {
             self.tag,
             sh_quote(base)
         );
+        s.push_str(&lock_sh(&format!("remote run {}", self.tag)));
         s.push_str(&format!("rm -rf {}\n", word(&out_path(&self.root))));
         s.push_str(&format!("mkdir -p {}\n", word(&out_path(&self.scratch))));
         for (path, text) in &self.files {
@@ -1620,6 +1636,7 @@ pub fn prereq_script(base: &str, files: &[String], dirs: &[String]) -> Result<St
         .map(|d| format!("\"$PWD\"/{}", sh_quote(d)))
         .collect();
     let mut s = format!("cd {} || exit 2\n", sh_quote(base));
+    s.push_str(&lock_sh("remote check"));
     s.push_str(&format!(
         "LD_LIBRARY_PATH={}\nexport LD_LIBRARY_PATH\n",
         libpath.join(":")
@@ -1694,6 +1711,250 @@ pub fn parse_prereq(text: &str) -> Prereq {
         }
     }
     p
+}
+
+/// The lock a run or a check holds on its dir ([`lock_sh`]). `prune` tries the same lock before it removes a dir, so no dir is removed under a run or a check.
+const RUN_LOCK: &str = ".run.lock";
+
+/// The lock part of a script that runs in its dir: fd 9 holds [`RUN_LOCK`] until the script's processes end (children inherit fd 9, so an atld run keeps the lock while it runs). Exit 6 when another run, check or prune holds it; `what` names the caller.
+fn lock_sh(what: &str) -> String {
+    format!(
+        "exec 9>>{RUN_LOCK}\nflock -n 9 || {{ echo \"{what}: busy, another run, check or prune holds $(pwd)\" >&2; exit 6; }}\n"
+    )
+}
+
+/// `prune`'s host: an ssh alias. A `local:` dir is refused: it is the caller's, not a run dir.
+fn ssh_alias(text: &str) -> Result<String> {
+    match Host::parse(text)? {
+        Host::Ssh(alias) => Ok(alias),
+        Host::Local(dir) => bail!(
+            "remote prune: `local:{}` is refused: a local dir is the caller's, not a run dir (name an ssh alias)",
+            dir.display()
+        ),
+    }
+}
+
+/// What `prune` makes of a run dir's name. `Live`: a checkout of this repository, its id or `<id>-<arch>` for a host arch (a cross build dir, [`target_dir_name`]). `Orphan`: a checkout's name whose checkout is gone. `Unknown`: not a checkout's name; never touched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    Live,
+    Orphan,
+    Unknown,
+}
+
+/// The [`Class`] of run dir `name` against the repository's live ids and the arches with a `[host]` row. `vsync-source-tier-base` is live only as its own id: `base` is no arch.
+fn classify(name: &str, live: &BTreeSet<String>, host_arches: &BTreeSet<String>) -> Class {
+    if !id_form(name) {
+        return Class::Unknown;
+    }
+    let cross = |arch: &String| {
+        name.strip_suffix(arch.as_str())
+            .and_then(|rest| rest.strip_suffix('-'))
+            .is_some_and(|id| live.contains(id))
+    };
+    if live.contains(name) || host_arches.iter().any(cross) {
+        Class::Live
+    } else {
+        Class::Orphan
+    }
+}
+
+/// A name a checkout's build dir can have: `repo` or a worktree name (`out::checkout_id`), and a name the target path takes ([`valid_name`]). Dot-led names are not.
+fn id_form(name: &str) -> bool {
+    !name.starts_with('.') && valid_name(name)
+}
+
+/// The arches with a `[host]` row in arches.toml: the `<arch>` of a cross build dir's name.
+fn host_arch_names(root: &Path) -> Result<BTreeSet<String>> {
+    Ok(arches::load(root)?
+        .into_iter()
+        .filter(|(_, row)| row.host.is_some())
+        .map(|(name, _)| name)
+        .collect())
+}
+
+/// The target's run dirs: `dir<TAB>name<TAB>KiB<TAB>busy|free` per directory (KiB `?` when `du` fails), `other<TAB>name` for anything else. Read only: a lock file is tested, never created.
+fn list_script(base: &str) -> String {
+    format!(
+        "cd {} 2>/dev/null || exit 0\nfor n in * .[!.]*; do\n  [ -e \"$n\" ] || [ -L \"$n\" ] || continue\n  if [ -L \"$n\" ] || [ ! -d \"$n\" ]; then printf 'other\\t%s\\n' \"$n\"; continue; fi\n  kb=$(du -sk -- \"$n\" 2>/dev/null | cut -f1)\n  busy=free\n  if [ -e \"$n/{RUN_LOCK}\" ] && ! flock -n \"$n/{RUN_LOCK}\" true; then busy=busy; fi\n  printf 'dir\\t%s\\t%s\\t%s\\n' \"$n\" \"${{kb:-?}}\" \"$busy\"\ndone\n",
+        sh_quote(base)
+    )
+}
+
+/// One entry of [`list_script`]'s output.
+#[derive(Debug, PartialEq, Eq)]
+enum Listed {
+    /// A directory: its size in KiB (`None` when `du` failed), and whether a run or check holds its lock.
+    Dir {
+        name: String,
+        kib: Option<u64>,
+        busy: bool,
+    },
+    /// A file, a symlink, or a line in no shape [`list_script`] prints: never touched.
+    Other(String),
+}
+
+fn parse_listing(text: &str) -> Vec<Listed> {
+    text.lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let fields: Vec<&str> = line.split('\t').collect();
+            match fields.as_slice() {
+                ["dir", name, kib, busy] => Listed::Dir {
+                    name: (*name).to_owned(),
+                    kib: kib.parse().ok(),
+                    busy: *busy == "busy",
+                },
+                ["other", name] => Listed::Other((*name).to_owned()),
+                _ => Listed::Other(line.to_owned()),
+            }
+        })
+        .collect()
+}
+
+/// Removes orphan dirs `names` under `base` on the target, each under its own lock: `flock -E 75` exits 75 while the lock is held, and that dir is skipped. Names pass [`id_form`] first: no `/`, no `..`, nothing dot-led. Per name: `removed`, `busy` or `failed`, tab-separated.
+fn remove_script(base: &str, names: &[String]) -> Result<String> {
+    let mut s = format!("cd {} || exit 2\n", sh_quote(base));
+    for name in names {
+        ensure!(
+            id_form(name),
+            "remote prune: `{name}` is not a run dir name"
+        );
+        let (q, lock) = (sh_quote(name), sh_quote(&format!("{name}/{RUN_LOCK}")));
+        s.push_str(&format!(
+            "if flock -n -E 75 {lock} rm -rf -- {q}; then printf 'removed\\t%s\\n' {q}; else rc=$?; if [ \"$rc\" -eq 75 ]; then printf 'busy\\t%s\\n' {q}; else printf 'failed\\t%s\\t%s\\n' {q} \"$rc\"; fi; fi\n"
+        ));
+    }
+    s.push_str("exit 0\n");
+    Ok(s)
+}
+
+/// What [`remove_script`] did to one name.
+#[derive(Debug, PartialEq, Eq)]
+enum Removal {
+    Removed,
+    Busy,
+    Failed(String),
+}
+
+/// [`remove_script`]'s outcome per name. A name with no line has no outcome; the caller counts it failed.
+fn parse_removal(text: &str) -> BTreeMap<String, Removal> {
+    text.lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split('\t').collect();
+            match fields.as_slice() {
+                ["removed", name] => Some(((*name).to_owned(), Removal::Removed)),
+                ["busy", name] => Some(((*name).to_owned(), Removal::Busy)),
+                ["failed", name, rc] => {
+                    Some(((*name).to_owned(), Removal::Failed(format!("exit {rc}"))))
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// A run dir's size as `prune` prints it: `12.3 MiB`, `? MiB` when `du` failed.
+fn size_label(kib: Option<u64>) -> String {
+    kib.map_or_else(
+        || "? MiB".to_owned(),
+        |k| format!("{:.1} MiB", k as f64 / 1024.0),
+    )
+}
+
+/// `remote prune --host <alias> [--execute]`: classifies the target's run dirs ([`classify`]). Dry run by default; `--execute` removes the free orphans, the ones no run or check holds.
+fn prune(root: &Path, a: &PruneArgs) -> Result<ExitCode> {
+    let host = Host::Ssh(ssh_alias(&a.host)?);
+    host.reach()?;
+    let live = out::live_ids_of(root)?;
+    let host_arches = host_arch_names(root)?;
+    let mut rows = Vec::new();
+    for entry in parse_listing(&host.run_script(&list_script(REMOTE_ROOT))?) {
+        match entry {
+            Listed::Dir { name, kib, busy } => {
+                let class = classify(&name, &live, &host_arches);
+                rows.push((name, kib, class, busy));
+            }
+            Listed::Other(text) => println!("unknown {text}: not a directory, never touched"),
+        }
+    }
+    println!(
+        "remote prune {}: {} run dir(s) under ~/{REMOTE_ROOT}",
+        host.label(),
+        rows.len()
+    );
+    for (name, kib, class, busy) in &rows {
+        let label = match class {
+            Class::Live => "live",
+            Class::Orphan => "orphan",
+            Class::Unknown => "unknown",
+        };
+        let held = if *class == Class::Orphan && *busy {
+            ", busy: a run or check holds it, skipped"
+        } else {
+            ""
+        };
+        println!("{label} {name} {}{held}", size_label(*kib));
+    }
+    let removable: Vec<&(String, Option<u64>, Class, bool)> = rows
+        .iter()
+        .filter(|(_, _, class, busy)| *class == Class::Orphan && !*busy)
+        .collect();
+    let held = rows
+        .iter()
+        .filter(|(_, _, class, busy)| *class == Class::Orphan && *busy)
+        .count();
+    let planned_kib: u64 = removable.iter().filter_map(|(_, kib, _, _)| *kib).sum();
+    if !a.execute {
+        let note = if held > 0 {
+            format!("; {held} held orphan(s) skipped")
+        } else {
+            String::new()
+        };
+        println!(
+            "remote prune: dry run, would remove {} tree(s), {:.1} MiB (add --execute){note}",
+            removable.len(),
+            planned_kib as f64 / 1024.0
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    let outcomes = if removable.is_empty() {
+        BTreeMap::new()
+    } else {
+        let names: Vec<String> = removable.iter().map(|(name, ..)| name.clone()).collect();
+        parse_removal(&host.run_script(&remove_script(REMOTE_ROOT, &names)?)?)
+    };
+    let (mut removed, mut gone_kib, mut busy, mut failed) = (0usize, 0u64, held, 0usize);
+    for (name, kib, _, _) in &removable {
+        match outcomes.get(name) {
+            Some(Removal::Removed) => {
+                removed += 1;
+                gone_kib += kib.unwrap_or(0);
+                println!("removed {name} {}", size_label(*kib));
+            }
+            Some(Removal::Busy) => {
+                busy += 1;
+                println!("orphan {name}: busy, skipped");
+            }
+            Some(Removal::Failed(why)) => {
+                failed += 1;
+                println!("FAILED {name}: {why}");
+            }
+            None => {
+                failed += 1;
+                println!("FAILED {name}: no result from the target");
+            }
+        }
+    }
+    println!(
+        "remote prune: removed {removed} tree(s), {:.1} MiB; {busy} busy skipped; {failed} failed",
+        gone_kib as f64 / 1024.0
+    );
+    Ok(if failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }
 
 #[cfg(test)]
@@ -1807,6 +2068,8 @@ mod tests {
         .unwrap();
         let want = concat!(
             "cd 'atl-next-run/x9' || exit 2\n",
+            "exec 9>>.run.lock\n",
+            "flock -n 9 || { echo \"remote check: busy, another run, check or prune holds $(pwd)\" >&2; exit 6; }\n",
             "LD_LIBRARY_PATH=\"$PWD\"/'lib':\"$PWD\"/'out/device'\n",
             "export LD_LIBRARY_PATH\n",
             "for f in 'lib/libc++.so.1' 'out/device/x.so'; do\n",
@@ -2098,6 +2361,8 @@ mod tests {
             "cd 'atl-next-run/x9' || exit 2\n",
             "set -u\n",
             "BASE=$(pwd)\n",
+            "exec 9>>.run.lock\n",
+            "flock -n 9 || { echo \"remote run gl/run: busy, another run, check or prune holds $(pwd)\" >&2; exit 6; }\n",
             "rm -rf \"$BASE/out/gl/run/root\"\n",
             "mkdir -p \"$BASE/out/gl/run/scratch\"\n",
             "sed \"s|@BASE@|$BASE|g\" > \"$BASE/out/gl/run/scratch/package-0.json\" <<'ATL_EOF'\n",
@@ -2408,5 +2673,228 @@ mod tests {
         let ino = |name: &str| std::fs::metadata(target.join(name)).unwrap().ino();
         assert_eq!(ino("out/app-art/lib64/a.so"), ino("out/device/a/a.so"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn classify_follows_the_checkout_rule() {
+        let live = BTreeSet::from([
+            "repo".to_owned(),
+            "vsync-source-tier".to_owned(),
+            "vsync-source-tier-base".to_owned(),
+        ]);
+        let arches = BTreeSet::from(["riscv64".to_owned(), "x86_64".to_owned()]);
+        for (name, want) in [
+            ("repo", Class::Live),
+            ("repo-riscv64", Class::Live),
+            ("vsync-source-tier", Class::Live),
+            ("vsync-source-tier-base", Class::Live),
+            ("vsync-source-tier-x86_64", Class::Live),
+            ("vsync-source-tier-arm64", Class::Orphan),
+            ("slot-1", Class::Orphan),
+            ("slot-1-riscv64", Class::Orphan),
+            ("gl-honesty-h4-x86_64", Class::Orphan),
+            (".cache", Class::Unknown),
+            ("..", Class::Unknown),
+            ("a b", Class::Unknown),
+            ("a/b", Class::Unknown),
+        ] {
+            assert_eq!(classify(name, &live, &arches), want, "{name}");
+        }
+        // `base` is no arch: with only `vsync-source-tier` live, `vsync-source-tier-base` is an orphan
+        let only = BTreeSet::from(["vsync-source-tier".to_owned()]);
+        assert_eq!(
+            classify("vsync-source-tier-base", &only, &arches),
+            Class::Orphan
+        );
+    }
+
+    #[test]
+    fn listing_lines_parse_and_anything_else_stays_unknown() {
+        let text = "dir\tslot-1\t556\tbusy\ndir\tx\t?\tfree\nother\tREADME\ndir\tbroken line\n";
+        assert_eq!(
+            parse_listing(text),
+            [
+                Listed::Dir {
+                    name: "slot-1".to_owned(),
+                    kib: Some(556),
+                    busy: true
+                },
+                Listed::Dir {
+                    name: "x".to_owned(),
+                    kib: None,
+                    busy: false
+                },
+                Listed::Other("README".to_owned()),
+                Listed::Other("dir\tbroken line".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn remove_script_takes_run_dir_names_only() {
+        for bad in ["../x", "a/b", ".cache", "a b", ""] {
+            assert!(
+                remove_script("atl-next-run", &[bad.to_owned()]).is_err(),
+                "{bad:?} is refused"
+            );
+        }
+        let s = remove_script("atl-next-run", &["slot-2".to_owned()]).expect("script");
+        assert!(s.starts_with("cd 'atl-next-run' || exit 2\n"), "{s}");
+        assert!(
+            s.contains("if flock -n -E 75 'slot-2/.run.lock' rm -rf -- 'slot-2'; then"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn prune_takes_an_ssh_alias_not_a_local_dir() {
+        assert_eq!(ssh_alias("laptop_local").expect("alias"), "laptop_local");
+        assert!(ssh_alias("local:/tmp/run").is_err());
+    }
+
+    /// A throwaway dir under the temp dir, removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Scratch {
+            let dir = std::env::temp_dir().join(format!("atl-prune-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            Scratch(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Takes `dir/.run.lock` exclusively in a child process, as a run does, and returns once it holds it. Killing the child releases it.
+    fn hold_lock(dir: &Path) -> std::process::Child {
+        use std::io::{BufRead, BufReader};
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "exec 8>>\"$1\" && flock -x 8 && echo locked && exec sleep 60",
+                "sh",
+            ])
+            .arg(dir.join(RUN_LOCK))
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("sh");
+        let mut line = String::new();
+        BufReader::new(child.stdout.as_mut().expect("stdout"))
+            .read_line(&mut line)
+            .expect("read the lock holder");
+        assert_eq!(line.trim(), "locked", "the holder takes the lock");
+        child
+    }
+
+    #[test]
+    fn prune_removes_a_free_orphan_and_keeps_held_and_live_dirs() {
+        let scratch = Scratch::new("list");
+        let root = scratch.0.clone();
+        for name in ["vsync-source-tier", "slot-1", "slot-2"] {
+            std::fs::create_dir_all(root.join(name)).expect("run dir");
+            std::fs::write(root.join(name).join("file"), [0u8; 4096]).expect("file");
+        }
+        std::fs::write(root.join("slot-2").join(RUN_LOCK), "").expect("free lock file");
+        std::fs::write(root.join("README"), "not a dir").expect("file");
+        std::os::unix::fs::symlink(root.join("slot-2"), root.join("link")).expect("symlink");
+        std::fs::create_dir(root.join(".hidden")).expect("dot dir");
+        let mut holder = hold_lock(&root.join("slot-1"));
+
+        let host = Host::Local(root.clone());
+        let base = root.display().to_string();
+        let listed = parse_listing(&host.run_script(&list_script(&base)).expect("listing"));
+        let dirs: BTreeMap<String, bool> = listed
+            .iter()
+            .filter_map(|entry| match entry {
+                Listed::Dir { name, busy, .. } => Some((name.clone(), *busy)),
+                Listed::Other(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            dirs,
+            BTreeMap::from([
+                (".hidden".to_owned(), false),
+                ("slot-1".to_owned(), true),
+                ("slot-2".to_owned(), false),
+                ("vsync-source-tier".to_owned(), false),
+            ])
+        );
+        assert!(listed.contains(&Listed::Other("README".to_owned())));
+        assert!(listed.contains(&Listed::Other("link".to_owned())));
+
+        let live = BTreeSet::from(["vsync-source-tier".to_owned()]);
+        let no_arches = BTreeSet::new();
+        let free_orphans: Vec<String> = dirs
+            .iter()
+            .filter(|&(name, &busy)| classify(name, &live, &no_arches) == Class::Orphan && !busy)
+            .map(|(name, _)| name.clone())
+            .collect();
+        assert_eq!(free_orphans, vec!["slot-2".to_owned()]);
+
+        let removal =
+            remove_script(&base, &["slot-1".to_owned(), "slot-2".to_owned()]).expect("script");
+        let out = host.run_script(&removal).expect("removal");
+        assert_eq!(
+            parse_removal(&out),
+            BTreeMap::from([
+                ("slot-1".to_owned(), Removal::Busy),
+                ("slot-2".to_owned(), Removal::Removed),
+            ])
+        );
+        assert!(root.join("slot-1").is_dir(), "a held dir stays");
+        assert!(!root.join("slot-2").exists(), "a free orphan is removed");
+        assert!(
+            root.join("vsync-source-tier").is_dir(),
+            "a live dir is not in the removal set"
+        );
+        holder.kill().expect("release the lock");
+        holder.wait().expect("reap the holder");
+    }
+
+    #[test]
+    fn a_held_lock_refuses_a_check_and_a_run_before_they_touch_the_dir() {
+        let scratch = Scratch::new("busy");
+        let dir = scratch.0.join("x");
+        let run_root = dir.join("out/gl/run/root");
+        std::fs::create_dir_all(&run_root).expect("run root");
+        std::fs::write(run_root.join("keep"), "k").expect("file");
+        let mut holder = hold_lock(&dir);
+        let host = Host::Local(dir.clone());
+        let base = dir.display().to_string();
+
+        let check = prereq_script(&base, &[], &[]).expect("check script");
+        let err = host
+            .run_script(&check)
+            .expect_err("a held lock refuses the check");
+        assert!(format!("{err:#}").contains("busy"), "{err:#}");
+
+        let plan = Plan {
+            tag: "gl/run".to_owned(),
+            root: "gl/run/root".to_owned(),
+            scratch: "gl/run/scratch".to_owned(),
+            env: Vec::new(),
+            session_env: Vec::new(),
+            program: "@BASE@/out/cargo/release/atld".to_owned(),
+            args: Vec::new(),
+            files: Vec::new(),
+            lib_dirs: Vec::new(),
+            limit: 120,
+            display: Display::Headless,
+        };
+        let err = host
+            .run_script(&plan.script(&base))
+            .expect_err("a held lock refuses the run");
+        assert!(format!("{err:#}").contains("busy"), "{err:#}");
+        assert!(
+            run_root.join("keep").is_file(),
+            "a refused run removes nothing"
+        );
+        holder.kill().expect("release the lock");
+        holder.wait().expect("reap the holder");
     }
 }
