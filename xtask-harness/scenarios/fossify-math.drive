@@ -1,14 +1,12 @@
 # SPDX-License-Identifier: MIT
-# fossify-math 1.4.0 (F-Droid, Java only, no network): 7 + 5 = changes the display. Positions read at 1440x900 content; display region = the result rows above the keypad.
+# fossify-math 1.4.0 (F-Droid, Java only, no network): 7 + 5 = changes the display. Positions read at 1440x900 content; display region = the result rows above the keypad, keypad = the rows below it.
 size 1440 900
 control break-input
 wait-stable 0 0 1440 900 20000 1000
 expect-varied 0 64 1440 296
-# until the first touch the content below the toolbar is drawn ~7.5 % darker and fades after it (the window starts out of touch mode: addToDisplayAsUser answers no ADD_FLAG_IN_TOUCH_MODE):
-# one harmless touch on the display first, so the mark is taken after it
-tap 720 200
-wait-stable 0 0 1440 900 5000 1000
+# marks before any input: the window starts in touch mode (ADD_FLAG_IN_TOUCH_MODE), so no focus highlight fades after the first touch
 mark display 0 64 1440 296
+mark keypad 0 360 1440 540
 tap 144 434
 wait-stable 0 64 1440 296 5000 500
 tap 1008 834
@@ -16,6 +14,8 @@ wait-stable 0 64 1440 296 5000 500
 tap 432 568
 wait-stable 0 64 1440 296 5000 500
 tap 720 834
-wait-stable 0 64 1440 296 10000 1000
+wait-stable 0 0 1440 900 10000 1000
 expect-changed display
 expect-varied 0 64 1440 296
+# the keys' ripples have faded: the keypad is drawn as before the first touch
+expect-same keypad
