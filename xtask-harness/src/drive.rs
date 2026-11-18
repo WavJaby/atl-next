@@ -36,12 +36,12 @@ const SWIPE_STEP: Duration = Duration::from_millis(16);
 const POLL: Duration = Duration::from_millis(20);
 /// A visual wait's capture interval: ~6 frames at 60 Hz, so a capture (a shm copy of the output) stays a small share of the time.
 const VISUAL_POLL: Duration = Duration::from_millis(100);
-/// Per-channel difference above which a pixel counts as changed. Derivation (widgets fixture, `xtask test drive`): two still captures 3 s apart differ in no channel (max delta 0, readback is exact),
-/// while the Button's press state differs by MEASURED_TAP_DELTA; the threshold sits well above any rounding a scaled or dithered path might add (a few units) and well below the press.
+/// Per-channel difference above which a pixel counts as changed. Derivation (widgets fixture, `xtask test drive`, WSL readback 2026-11-20): two still captures 3 s apart differ by 0 in every channel,
+/// the Button's press by up to 145; 16 (1/16 of the range) sits above any rounding a scaled or dithered path adds (a few units) and far below the press.
 const CHANGE_DELTA: u8 = 16;
-/// Share of a region's pixels that must change for `changed`. Derivation: the widgets tap changes MEASURED_TAP_PIXELS of the 800x600 content (the Button's 88x48 = 4224 px = 0.88 % bounds it);
-/// half of that share leaves room for a smaller widget, and one stray pixel (a cursor, a caret) never reaches it.
-const CHANGED_FRACTION: f64 = 0.004;
+/// Share of a region's pixels that must change for `changed`. Derivation (same run): the tap on the Button changes 3972 of the 1440x900 = 1296000 content px (0.306 %, inside the 88x48 = 4224 px button);
+/// half that share, 0.15 %, leaves room for a smaller widget while a few stray pixels (a caret, a cursor) stay below it.
+const CHANGED_FRACTION: f64 = 0.0015;
 /// Injected configure serials: far above what the compositor sends one window in a run.
 const FIRST_SERIAL: u32 = 0x10_0000;
 /// The mixer's counter line (atl-audioflinger output.rs) and its field of frames above silence.
@@ -1293,20 +1293,20 @@ expect-log services resumed\nexpect-no-log app \"diag: refused\"\nexpect-frames 
         }
     }
 
-    /// 100x100 = 10000 px: the fraction threshold 0.4 % is 40 px. 41 px past the delta = changed; 40 = neither changed nor same; deltas at the threshold count as unchanged.
+    /// 100x100 = 10000 px: the fraction threshold 0.15 % is 15 px. 16 px past the delta = changed; 15 = neither changed nor same; deltas at the threshold count as unchanged.
     #[test]
     fn change_thresholds_on_synthetic_images() {
         let base = image(100, 100, [100, 100, 100]);
         let mut over = base.clone();
-        touch_pixels(&mut over, 41, CHANGE_DELTA + 1);
+        touch_pixels(&mut over, 16, CHANGE_DELTA + 1);
         let d = base.diff(&over, CHANGE_DELTA).unwrap();
         assert_eq!(
             (d.changed, d.total, d.max_delta),
-            (41, 10_000, CHANGE_DELTA + 1)
+            (16, 10_000, CHANGE_DELTA + 1)
         );
         assert!(is_changed(&d) && !is_same(&d));
         let mut at = base.clone();
-        touch_pixels(&mut at, 40, CHANGE_DELTA + 1);
+        touch_pixels(&mut at, 15, CHANGE_DELTA + 1);
         let d = base.diff(&at, CHANGE_DELTA).unwrap();
         assert!(!is_changed(&d) && !is_same(&d));
         let mut faint = base.clone();
