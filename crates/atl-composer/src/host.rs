@@ -3,7 +3,7 @@
 //! Binder threads call in (a transaction arrived, a connection asked for vsync); the clock thread ticks in both modes (SurfaceFlinger `commit`): it applies what is due, writes the vsync events and hands the
 //! new scene on: headless to the present thread's [`SceneSink`], UI mode to the window's [`Mailbox`]. The present thread delivers the core's calls to the clients. Nothing here waits for the window's
 //! thread: it only takes scenes from the mailbox and reports releases into it (owner D1/D3, 2026-11-08). A UI-mode tick does not latch while the window has not taken the last scene, as SurfaceFlinger does
-//! not while the last present is pending (bounded: [`BACKPRESSURE_BOUND_NS`]); the clock still ticks and sends vsync.
+//! not while the last present is pending (bounded: [`BACKPRESSURE_BOUND_NS`]; never for a producer on the window's own thread: [`Latching::LatchSameThread`]); the clock still ticks and sends vsync.
 //! Calls into libgui are never made with the lock held, and the end of a layer handle only queues its destruction for the next tick: libgui may release a handle from inside its own locks.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -143,13 +143,25 @@ enum Latching {
     Hold,
     /// Untaken for [`BACKPRESSURE_BOUND_NS`] or more: the window is not presenting; the tick latches and its scene replaces the untaken one.
     LatchUnpainted,
+    /// Untaken, but a queued transaction came from the window's take thread: the tick latches as without backpressure (latest wins). Precondition of the hold: the producer cannot block the consumer
+    /// (AOSP: SurfaceFlinger never runs on an app thread, so its present fence signals whatever the app does). Here the window takes on the app's UI thread (GLib on the UI Looper, plan Q6, owner
+    /// 2026-11-05); an app drawing on that thread (software canvas: lockCanvas -> dequeueBuffer) blocks in BufferReleaseReader waiting for a release only the take it is blocking would cause -> held
+    /// until the bound (83-100 ms gaps). Re-check: same thread = a `setTransactionState` arrived on the tid [`Latch::taker`] names (in-process binder runs on the caller's thread). Retired by a display stage
+    /// on its own thread (take + paint never on an app thread): then delete this variant, [`State::taker_queued`] and `backpressure_same_thread`.
+    LatchSameThread,
 }
 
-/// The backpressure rule for a tick at vsync time `at_ns`, given since when the slot has held an untaken scene.
-fn latch_rule(pending_since: Option<i64>, at_ns: i64) -> Latching {
+/// The backpressure rule for a tick at vsync time `at_ns`, given since when the slot has held an untaken scene and whether a queued transaction came from the window's take thread.
+fn latch_rule(pending_since: Option<i64>, at_ns: i64, same_thread: bool) -> Latching {
     match pending_since {
         None => Latching::Latch,
-        Some(since) if at_ns - since < BACKPRESSURE_BOUND_NS => Latching::Hold,
+        Some(since) if at_ns - since < BACKPRESSURE_BOUND_NS => {
+            if same_thread {
+                Latching::LatchSameThread
+            } else {
+                Latching::Hold
+            }
+        }
         Some(_) => Latching::LatchUnpainted,
     }
 }
@@ -165,6 +177,8 @@ pub struct Stats {
     pub backpressure_holds: u64,
     /// UI mode: latches over a scene untaken for [`BACKPRESSURE_BOUND_NS`] ([`Latching::LatchUnpainted`]).
     pub latches_unpainted: u64,
+    /// UI mode: latches over an untaken scene because a queued transaction came from the window's take thread ([`Latching::LatchSameThread`]).
+    pub backpressure_same_thread: u64,
     /// Transactions received.
     pub transactions: u64,
     /// Layers created.
@@ -233,6 +247,8 @@ struct State {
     stats: Stats,
     /// UI mode's window mailbox (lock order: this state, then the mailbox); None headless.
     mailbox: Option<Arc<Mailbox>>,
+    /// A transaction from the window's take thread is queued in the core ([`Latching::LatchSameThread`]); cleared by a latch that leaves the core's queue empty.
+    taker_queued: bool,
     /// The vsync source's counters (the window's thread writes them, [`Composer::on_presented`]).
     vsync: Arc<VsyncCounters>,
 }
@@ -302,11 +318,12 @@ impl State {
         let ignored: Vec<String> = c.ignored.iter().map(|(k, n)| format!("{k}:{n}")).collect();
         let m = self.mailbox.as_ref().map(|m| m.stats()).unwrap_or_default();
         format!(
-            "composer: counters ticks={} latches={} backpressure_holds={} latches_unpainted={} transactions={} layers_created={} layers_alive={} transactions_applied={} layer_states={} unknown_layer={} buffers_acquired={} buffers_released={} completions={} scenes={} scenes_taken={} scenes_dropped={} presents_refused={} release_reports={} max_held_per_layer={} vsync_sent={} vsync_dropped={} callbacks_sent={} callbacks_failed={} releases_on_channel={} releases_peer_gone={} releases_fenced={} releases_fenced_unmatched={} releases_carried={} releases_held={} completions_held={} fence_waits={} fds_held={} fds_taken={} fds_closed={} post_draw_received={} post_draw_applied={} ticks_short={} tick_late_max_us={} tick_intervals={} vsync_source={} vsync_samples={} vsync_samples_other={} vsync_source_changes={} ignored={}",
+            "composer: counters ticks={} latches={} backpressure_holds={} latches_unpainted={} backpressure_same_thread={} transactions={} layers_created={} layers_alive={} transactions_applied={} layer_states={} unknown_layer={} buffers_acquired={} buffers_released={} completions={} scenes={} scenes_taken={} scenes_dropped={} presents_refused={} release_reports={} max_held_per_layer={} vsync_sent={} vsync_dropped={} callbacks_sent={} callbacks_failed={} releases_on_channel={} releases_peer_gone={} releases_fenced={} releases_fenced_unmatched={} releases_carried={} releases_held={} completions_held={} fence_waits={} fds_held={} fds_taken={} fds_closed={} post_draw_received={} post_draw_applied={} ticks_short={} tick_late_max_us={} tick_intervals={} vsync_source={} vsync_samples={} vsync_samples_other={} vsync_source_changes={} ignored={}",
             s.ticks,
             s.latches,
             s.backpressure_holds,
             s.latches_unpainted,
+            s.backpressure_same_thread,
             s.transactions,
             s.layers_created,
             self.compositor.layer_count(),
@@ -460,6 +477,7 @@ impl Composer {
                 counters_pending: false,
                 stats: Stats::default(),
                 mailbox: None,
+                taker_queued: false,
                 vsync: Arc::clone(&vsync_counters),
             }),
             wake: clock::Wake::default(),
@@ -592,6 +610,10 @@ impl Composer {
         match decoded {
             Ok(t) => {
                 st.stats.transactions += 1;
+                let taker = st.mailbox.as_deref().and_then(|m| m.latch().taker());
+                if taker == Some(rustix::thread::gettid().as_raw_nonzero().get()) {
+                    st.taker_queued = true;
+                }
                 st.compositor.queue_transaction(t);
                 drop(st);
                 self.notify();
@@ -982,7 +1004,7 @@ impl Composer {
             all.extend(self.presenter_releases(&mut st, l, &mut fences));
         }
         let latching = match latch.as_ref() {
-            Some(l) if self.backpressure => latch_rule(l.pending_since(), at_ns),
+            Some(l) if self.backpressure => latch_rule(l.pending_since(), at_ns, st.taker_queued),
             _ => Latching::Latch,
         };
         let FrameOutput { scene, calls } = match latching {
@@ -990,12 +1012,18 @@ impl Composer {
                 st.stats.backpressure_holds += 1;
                 FrameOutput::default()
             }
-            Latching::Latch | Latching::LatchUnpainted => {
+            Latching::Latch | Latching::LatchUnpainted | Latching::LatchSameThread => {
                 st.stats.latches += 1;
-                if latching == Latching::LatchUnpainted {
-                    st.stats.latches_unpainted += 1;
+                match latching {
+                    Latching::LatchUnpainted => st.stats.latches_unpainted += 1,
+                    Latching::LatchSameThread => st.stats.backpressure_same_thread += 1,
+                    _ => {}
                 }
-                st.compositor.on_frame(at_ns)
+                let out = st.compositor.on_frame(at_ns);
+                if st.compositor.pending_transactions() == 0 {
+                    st.taker_queued = false;
+                }
+                out
             }
         };
         st.next_vsync_id += 1;
@@ -1160,14 +1188,29 @@ mod latch_tests {
     #[test]
     fn holds_only_while_a_present_is_pending_and_within_the_bound() {
         let since = 1_000;
-        assert_eq!(latch_rule(None, since), Latching::Latch);
-        assert_eq!(latch_rule(Some(since), since), Latching::Hold);
+        assert_eq!(latch_rule(None, since, false), Latching::Latch);
+        assert_eq!(latch_rule(Some(since), since, false), Latching::Hold);
         assert_eq!(
-            latch_rule(Some(since), since + BACKPRESSURE_BOUND_NS - 1),
+            latch_rule(Some(since), since + BACKPRESSURE_BOUND_NS - 1, false),
             Latching::Hold
         );
         assert_eq!(
-            latch_rule(Some(since), since + BACKPRESSURE_BOUND_NS),
+            latch_rule(Some(since), since + BACKPRESSURE_BOUND_NS, false),
+            Latching::LatchUnpainted
+        );
+    }
+
+    /// A transaction queued on the window's take thread: no hold (the producer would block the take that releases its buffer); empty slot and past-bound cases unchanged.
+    #[test]
+    fn never_holds_a_producer_on_the_take_thread() {
+        let since = 1_000;
+        assert_eq!(latch_rule(None, since, true), Latching::Latch);
+        assert_eq!(
+            latch_rule(Some(since), since, true),
+            Latching::LatchSameThread
+        );
+        assert_eq!(
+            latch_rule(Some(since), since + BACKPRESSURE_BOUND_NS, true),
             Latching::LatchUnpainted
         );
     }

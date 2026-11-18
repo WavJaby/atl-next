@@ -36,6 +36,8 @@ struct Inner {
     scene: Option<Scene>,
     /// The vsync time (monotonic ns) of the publish that filled the empty slot; replacements keep it, a take or a clear ends it.
     pending_since: Option<i64>,
+    /// The thread (tid) of the last take: the toolkit's thread, which may also be an app's producer thread (host.rs `Latching::LatchSameThread`).
+    taker: Option<i32>,
     /// Held buffer id -> its layer id.
     held: BTreeMap<u64, i32>,
     /// Read fences of the buffers reported released since the clock last looked, by buffer id.
@@ -82,6 +84,11 @@ impl Latch<'_> {
         self.inner.pending_since
     }
 
+    /// The toolkit's take thread (tid); None before the first take.
+    pub fn taker(&self) -> Option<i32> {
+        self.inner.taker
+    }
+
     /// `scene`, latched at vsync time `at_ns`, replaces the slot's.
     pub fn publish(&mut self, scene: Scene, at_ns: i64) {
         let s = &mut self.inner;
@@ -125,6 +132,7 @@ impl Mailbox {
     /// The toolkit takes the latest scene (None: nothing new); its buffers are held from now.
     pub fn take(&self) -> Option<Taken> {
         let mut s = self.lock();
+        s.taker = Some(rustix::thread::gettid().as_raw_nonzero().get());
         let scene = s.scene.take()?;
         s.pending_since = None;
         s.stats.taken += 1;
