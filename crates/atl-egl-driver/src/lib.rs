@@ -36,5 +36,6 @@ mod es1;
 mod es1_ext;
 mod exports;
 mod fbo0;
+mod readback_stats;
 mod surface;
 mod window;

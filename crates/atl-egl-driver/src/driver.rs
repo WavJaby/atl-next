@@ -6,7 +6,7 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_void};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -17,6 +17,7 @@ use atl_gralloc::node::{self, NodeSource};
 
 use crate::abi::egl as e;
 use crate::abi::gles as g;
+use crate::readback_stats::ReadbackStats;
 use crate::surface::WindowSurface;
 
 /// Declares a table of host entries typed by the generated header aliases, resolved through the host's eglGetProcAddress at load.
@@ -188,8 +189,8 @@ pub struct Driver {
     pub orientation: Orientation,
     /// The destination tier, set by the first window buffer's probe (`surface.rs` `probe_destination`).
     pub destination: OnceLock<Destination>,
-    /// Frames queued through the `Readback` tier: the counter of that tier.
-    pub readback_frames: AtomicU64,
+    /// Frames queued through the `Readback` tier and their copy cost: the counter of that tier.
+    pub readback_stats: Mutex<ReadbackStats>,
     extensions: CString,
     /// Window surfaces by handle (the boxed surface's address).
     pub surfaces: Mutex<HashMap<usize, Arc<Mutex<WindowSurface>>>>,
@@ -260,7 +261,7 @@ impl Driver {
             native_fence,
             orientation,
             destination: OnceLock::new(),
-            readback_frames: AtomicU64::new(0),
+            readback_stats: Mutex::new(ReadbackStats::default()),
             extensions: CString::new(ext.join(" "))?,
             surfaces: Mutex::new(HashMap::new()),
             seen_contexts: Mutex::new(HashSet::new()),

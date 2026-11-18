@@ -120,7 +120,7 @@ mod tests {
         let three = frame.repeat(3);
         assert_eq!(tier_of(&three), Some("gdk-no-import"));
         // the driver's readback tier does not change GDK's verdict (job tr-play-m1: every download beside GDK's no-import line)
-        let readback = "libEGL_atl: buffer tier readback (this device cannot import gralloc's buffer, EGL error 0x3003)\nlibEGL_atl: readback_frames=64\n";
+        let readback = "libEGL_atl: buffer tier readback (this device cannot import gralloc's buffer, EGL error 0x3003)\nlibEGL_atl: readback_frames=64 ms=1003 frames=40 sync_us=12/40 read_us=2100/3500\n";
         assert_eq!(
             tier_of(&format!("{readback}{three}")),
             Some("gdk-no-import")

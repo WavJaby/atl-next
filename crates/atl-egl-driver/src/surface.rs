@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use atl_egl_host::{DmabufPlane, Image};
 use atl_gralloc::format::{DRM_FORMAT_ABGR8888, DRM_FORMAT_XBGR8888};
@@ -289,12 +289,15 @@ impl WindowSurface {
         let ours = [(m.pitch / 4) as i32, 0, 0, 4];
         let mut saved = [0; 4];
         let mut pbo = 0;
+        let t0 = Instant::now();
         begin_cpu_access(m.fd.as_fd(), SYNC_WRITE).map_err(|err| {
             log(&format!(
                 "readback: dma-buf sync start failed ({err}), EGL_BAD_ALLOC"
             ));
             e::EGL_BAD_ALLOC
         })?;
+        let t1 = Instant::now();
+        let mut t2 = t1;
         // SAFETY: the current context; `read` is its complete FBO of size w x h; the mapping holds pitch x h bytes (map_buffer) and a row of w pixels fits in pitch (gralloc's layout), so the write stays inside it; every pack parameter and the pack buffer binding are restored.
         unsafe {
             (gl.glGetIntegerv)(g::GL_PIXEL_PACK_BUFFER_BINDING as u32, &mut pbo);
@@ -315,6 +318,7 @@ impl WindowSurface {
                     g::GL_UNSIGNED_BYTE as u32,
                     m.map.as_ptr().cast(),
                 );
+                t2 = Instant::now();
             }
             for (&p, s) in pack.iter().zip(saved) {
                 (gl.glPixelStorei)(p as u32, s);
@@ -327,10 +331,15 @@ impl WindowSurface {
             ));
             e::EGL_BAD_ALLOC
         })?;
-        // the counter's line at 1, 2, 4, ...: log2(frames) lines per process; the window gate lets GDK's mmap download through only next to it (gdk_dmabuf.rs)
-        let n = d.readback_frames.fetch_add(1, Ordering::Relaxed) + 1;
-        if n.is_power_of_two() {
-            log(&format!("{READBACK_FRAMES_LINE}{n}"));
+        let t3 = Instant::now();
+        // one line at the first frame, then one per second of readback (readback_stats.rs); the window gate lets GDK's mmap download through only next to it (gdk_dmabuf.rs)
+        let line = d.readback_stats.lock().expect("readback stats lock").frame(
+            t3,
+            t2 - t1,
+            (t1 - t0) + (t3 - t2),
+        );
+        if let Some(line) = line {
+            log(&line);
         }
         Ok(())
     }
