@@ -1750,15 +1750,21 @@ fn input_check(after: &[&str], script: &str) -> Result<String, String> {
     track_check(after, script, (0.0, 0.0))
 }
 
-/// The services' count line of an answered WMS setInTouchMode (atl-services window.rs). Unanswered, the same call counts as plain `setInTouchMode`.
-const TOUCH_MODE_LINE: &str = "IWindowManager.setInTouchMode (answered)";
+/// The fixture's line at its first draw (Main.java Quadrants.onDraw): the view's touch mode then.
+const TOUCH_MODE_LINE: &str = "AtlWindow: touch-mode first-draw=";
 
-/// Sub-gate: the script's first touch takes the window into touch mode (ViewRootImpl.ensureTouchMode -> IWindowManager.setInTouchMode), and the services answer it.
-fn touch_mode_check(services: &str) -> Result<String, String> {
-    if services.contains(TOUCH_MODE_LINE) {
-        Ok("touch-mode: WMS setInTouchMode answered".to_owned())
-    } else {
-        Err("touch-mode: no answered IWindowManager.setInTouchMode in the services log".to_owned())
+/// Sub-gate: the window was added in touch mode (WMS addWindow ADD_FLAG_IN_TOUCH_MODE while the display is, config_defaultInTouchMode true -> ViewRootImpl's first traversal), so the
+/// first frame draws no focus highlight. Out of touch mode a touch would call IWindowManager.setInTouchMode; in it, an all-touch script calls nothing.
+fn touch_mode_check(app: &str) -> Result<String, String> {
+    match app
+        .lines()
+        .find_map(|l| l.split_once(TOUCH_MODE_LINE).map(|(_, v)| v.trim()))
+    {
+        Some("true") => Ok("touch-mode: first draw in touch mode".to_owned()),
+        Some(v) => Err(format!(
+            "touch-mode: first draw touch mode {v}, AOSP starts in touch mode"
+        )),
+        None => Err("touch-mode: no first-draw touch-mode line".to_owned()),
     }
 }
 
@@ -2612,7 +2618,7 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
                 "touch",
                 input_check(&after_marker(&app, marker), POINTER_SCRIPT),
             ),
-            ("touch-mode", touch_mode_check(&services)),
+            ("touch-mode", touch_mode_check(&app)),
         ],
         (Stage::SurfaceView, Some(_)) => surface_view::checks(&app, &liveness, &captured),
         (Stage::WebView, Some(_)) => webview::checks(
@@ -3708,13 +3714,12 @@ mod tests {
         assert!(burst_check(&layout(last), &uncoalesced, &steps).is_err());
     }
 
-    /// An unanswered setInTouchMode counts `unimplemented` under its bare name (the reply hook, atl-diag `binder_reply`): only the answered line passes.
+    /// Only a first draw in touch mode passes; out of touch mode (the defect: addWindow without ADD_FLAG_IN_TOUCH_MODE) and a missing line fail.
     #[test]
-    fn touch_mode_check_needs_the_answered_line() {
-        let line =
-            |kind: &str, m: &str| format!("diag: first {kind} IWindowManager.{m} 1 at=1.000");
-        assert!(touch_mode_check(&line("answered", "setInTouchMode (answered)")).is_ok());
-        assert!(touch_mode_check(&line("unimplemented", "setInTouchMode")).is_err());
+    fn touch_mode_check_needs_touch_mode_at_first_draw() {
+        let line = |v: &str| format!("I AtlWindow: touch-mode first-draw={v}\n");
+        assert!(touch_mode_check(&line("true")).is_ok());
+        assert!(touch_mode_check(&line("false")).is_err());
         assert!(touch_mode_check("").is_err());
     }
 

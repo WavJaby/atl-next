@@ -209,6 +209,8 @@ public class Main extends Activity {
                 drawn = true;
                 // hardware=true: a RecordingCanvas, so hwui's RenderThread draws it (stage hwui checks this)
                 Log.i(TAG, "onDraw reached hardware=" + canvas.isHardwareAccelerated());
+                // the touch mode the window was added in (WMS ADD_FLAG_IN_TOUCH_MODE -> ViewRootImpl's first traversal): true on AOSP (config_defaultInTouchMode), so no focus highlight on the first frame
+                Log.i(TAG, "touch-mode first-draw=" + isInTouchMode());
                 // the title stage: the window was titled by the label (no TaskDescription label yet); a label set now retitles it
                 post(new Runnable() {
                     @Override
