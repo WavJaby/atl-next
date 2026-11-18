@@ -26,19 +26,22 @@ const CLASS_PREFIX: &str = "atl.";
 /// The first eight bytes of a PNG, which `grim` prints for a shot.
 const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
 
-/// The probe of one tick (sh on the target). `@BASE@`, `@APP@` and `@PRESENT@` are filled in by [`probe_script`]. The Hyprland instance is the one dir under the session's `hypr/`: any other count is no session.
+/// The probe of one tick (sh on the target). `@BASE@`, `@APP@` and `@PRESENT@` are filled in by [`probe_script`]. The Hyprland instance is the one dir under the session's `hypr/` whose socket
+/// answers `hyprctl version`: Hyprland leaves a dir behind per past session (the laptop had 7, one live, 2026-11-18), which we neither count nor delete. Any other count of live ones is no session.
 const PROBE: &str = r#"cd @BASE@ || exit 2
 RT=/run/user/$(id -u)
+command -v hyprctl >/dev/null 2>&1 || { echo "session no-hyprctl"; exit 0; }
 n=0
 sig=
 for d in "$RT"/hypr/*/; do
   [ -d "$d" ] || continue
+  s=${d%/}
+  s=${s##*/}
+  HYPRLAND_INSTANCE_SIGNATURE="$s" XDG_RUNTIME_DIR="$RT" timeout 5 hyprctl -j version >/dev/null 2>&1 || continue
   n=$((n + 1))
-  sig=${d%/}
-  sig=${sig##*/}
+  sig=$s
 done
 [ "$n" -eq 1 ] || { echo "session none $n"; exit 0; }
-command -v hyprctl >/dev/null 2>&1 || { echo "session no-hyprctl"; exit 0; }
 echo "session ok $sig"
 echo "t $(date +%s%3N)"
 stamp=$(grep -m1 '@PRESENT@' "$PWD/out/@APP@" 2>/dev/null)
@@ -233,8 +236,12 @@ fn field<'a>(line: Option<&'a str>, key: &str) -> Result<&'a str> {
 
 fn no_session(n: &str) -> String {
     match n {
-        "0" => "no Hyprland instance under /run/user/<uid>/hypr".to_owned(),
-        n => format!("{n} Hyprland instances under /run/user/<uid>/hypr, want 1"),
+        "0" => {
+            "no live Hyprland instance (none under /run/user/<uid>/hypr answers hyprctl)".to_owned()
+        }
+        n => format!(
+            "{n} live Hyprland instances (answering hyprctl) under /run/user/<uid>/hypr, want 1"
+        ),
     }
 }
 
@@ -764,12 +771,65 @@ clients-end
     fn a_missing_session_is_a_reason_not_an_error() {
         assert_eq!(
             parse_reply("session none 0\n").expect("reply"),
-            Reply::NoSession("no Hyprland instance under /run/user/<uid>/hypr".to_owned())
+            Reply::NoSession(
+                "no live Hyprland instance (none under /run/user/<uid>/hypr answers hyprctl)"
+                    .to_owned()
+            )
         );
         assert_eq!(
             parse_reply("session none 2\n").expect("reply"),
-            Reply::NoSession("2 Hyprland instances under /run/user/<uid>/hypr, want 1".to_owned())
+            Reply::NoSession(
+                "2 live Hyprland instances (answering hyprctl) under /run/user/<uid>/hypr, want 1"
+                    .to_owned()
+            )
         );
+    }
+
+    /// The probe picks the one instance dir whose socket answers among stale ones (the laptop's 7 dirs, 1 live), and leaves the stale dirs in place: run under sh with a fake `hyprctl` on PATH
+    /// that answers only for the signature `live`, and the runtime dir pointed at a temp tree.
+    #[test]
+    fn the_probe_picks_the_live_instance_among_stale_dirs() {
+        let tmp = std::env::temp_dir().join(format!("atl-observe-hypr-{}", std::process::id()));
+        let rt = tmp.join("rt");
+        let bin = tmp.join("bin");
+        for d in ["stale-a", "live", "stale-b"] {
+            std::fs::create_dir_all(rt.join("hypr").join(d)).expect("instance dir");
+        }
+        std::fs::create_dir_all(&bin).expect("bin");
+        let fake = bin.join("hyprctl");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\n[ \"$HYPRLAND_INSTANCE_SIGNATURE\" = live ] || exit 1\n[ \"$2\" = clients ] && echo '[]'\nexit 0\n",
+        )
+        .expect("fake hyprctl");
+        let mut perm = std::fs::metadata(&fake).expect("meta").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+        std::fs::set_permissions(&fake, perm).expect("chmod");
+        let plan = Plan {
+            base: tmp.to_string_lossy().into_owned(),
+            root: "r".into(),
+            app_log: "r/log/a.log".into(),
+            shots_ms: vec![],
+        };
+        let script = probe_script(&plan).replace("/run/user/$(id -u)", &rt.to_string_lossy());
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env("PATH", path)
+            .output()
+            .expect("sh");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stale_left = ["stale-a", "stale-b"]
+            .iter()
+            .all(|d| rt.join("hypr").join(d).is_dir());
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(text.starts_with("session ok live\n"), "{text}");
+        assert!(stale_left, "stale dirs are not ours to delete");
         assert_eq!(
             parse_reply("session no-hyprctl\n").expect("reply"),
             Reply::NoSession("hyprctl is not on the target's PATH".to_owned())
@@ -937,7 +997,7 @@ clients-end
         assert!(state.borrow().grabs.is_empty());
         let log = std::fs::read_to_string(dir.join("observe.log")).expect("log");
         assert!(
-            log.contains("observe: skipped: no Hyprland instance"),
+            log.contains("observe: skipped: no live Hyprland instance"),
             "{log}"
         );
         assert!(log.contains("observe shot 5000ms: not taken"), "{log}");
