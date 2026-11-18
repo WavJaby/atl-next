@@ -290,7 +290,9 @@ JNIEXPORT jstring JNICALL Java_com_example_atlaudio_Main_aaudioAdaptive(JNIEnv *
             }
         }
         stable = now - last_rise;
+        // a stopped track drains what was written: let it play out before close destroys it (the gate counts dropped frames)
         rc_stop = stop(s);
+        usleep(PLAYOUT_MS * 1000);
         rc_close = close(s);
     }
     snprintf(msg, sizeof msg, "aaudio-adaptive open=%d start=%d burst=%d capacity=%d first=%d final=%d xruns=%d stable=%lld frames=%lld stop=%d close=%d", rc_open, rc_start, burst, capacity, first, size, xruns,
