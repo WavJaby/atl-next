@@ -19,6 +19,7 @@ use crate::input;
 use crate::mirror;
 use crate::outputs;
 use crate::paint_stats::PaintStats;
+use crate::presentation::Presentation;
 use crate::scene;
 use crate::sideband;
 use crate::text_input::GtkTextInput;
@@ -75,8 +76,8 @@ struct Shared {
     touch_ids: RefCell<input::TouchIds>,
     on_painted: Slot<dyn FnMut(Painted)>,
     on_presented: Slot<dyn FnMut(PresentTiming)>,
-    /// The frame counter of the last frame reported to `on_presented`; None before the first report.
-    presented_upto: Cell<Option<i64>>,
+    /// The window's wp_presentation feedback, bound at realise; None before, or where there is none (said once at realise).
+    presentation: RefCell<Option<Presentation>>,
     /// The buffers the presented scene samples.
     shown: RefCell<Vec<scene::Shown>>,
     /// Buffers a present replaced: GSK may still draw them until the next paint; released at its after-paint.
@@ -144,28 +145,18 @@ impl Shared {
         self.on_painted.call(|f| f(Painted { releases }));
     }
 
-    /// Reports the frames GDK completed since the last report, in frame order, as presentation samples. A frame whose feedback has not come is skipped, not waited for: a frame that
-    /// committed nothing never gets feedback, so waiting would stall every later report. Samples with no presentation time or no period are not reported.
-    fn report_presented(&self, clock: &gdk::FrameClock) {
-        let first = self
-            .presented_upto
-            .get()
-            .map_or(clock.history_start(), |last| {
-                (last + 1).max(clock.history_start())
-            });
-        for frame in first..=clock.frame_counter() {
-            let Some(timings) = clock.timings(frame) else {
-                continue;
-            };
-            let (presented, period) = (timings.presentation_time(), timings.refresh_interval());
-            if !timings.is_complete() || presented <= 0 || period <= 0 {
-                continue;
-            }
-            self.presented_upto.set(Some(frame));
-            let sample = PresentTiming {
-                time_ns: presented * NS_PER_US,
-                refresh_ns: period * NS_PER_US,
-            };
+    /// Reports the presentation samples that came since the last report, in order (presentation.rs); their feedback totals go on the paint line.
+    fn report_presented(&self) {
+        let Some((samples, (presented, discarded))) = self
+            .presentation
+            .borrow_mut()
+            .as_mut()
+            .map(Presentation::take)
+        else {
+            return;
+        };
+        self.stats.borrow_mut().feedback(presented, discarded);
+        for sample in samples {
             self.on_presented.call(|f| f(sample));
         }
     }
@@ -219,10 +210,20 @@ impl GtkWindow {
             if let Some(renderer) = window.renderer() {
                 tracing::info!("atl-platform-ui: renderer {}", renderer.type_().name());
             }
+            match window.surface().map(|s| Presentation::bind(&s)) {
+                Some(Ok(p)) => *shared.presentation.borrow_mut() = Some(p),
+                Some(Err(why)) => {
+                    tracing::info!("atl-platform-ui: no presentation samples: {why}");
+                }
+                None => tracing::info!("atl-platform-ui: no presentation samples: no surface"),
+            }
             let on_before_paint = Rc::clone(&shared);
             clock.connect_before_paint(move |_| {
                 on_before_paint.paint_start.set(Some(monotonic_ns()));
                 on_before_paint.paint_end.set(None);
+                if let Some(p) = on_before_paint.presentation.borrow_mut().as_mut() {
+                    p.request();
+                }
             });
             let on_paint = Rc::clone(&shared);
             let painted_view = view.clone();
@@ -245,9 +246,9 @@ impl GtkWindow {
                 }
             });
             let on_after_paint = Rc::clone(&shared);
-            clock.connect_after_paint(move |clock| {
+            clock.connect_after_paint(move |_| {
                 on_after_paint.painted();
-                on_after_paint.report_presented(clock);
+                on_after_paint.report_presented();
                 let now = monotonic_ns();
                 let after = on_after_paint.paint_end.take().map(|end| now - end);
                 on_after_paint.stats.borrow_mut().cycle_done(now, after);
@@ -573,7 +574,7 @@ impl Window for GtkWindow {
             monitor: RefCell::new(None),
             on_painted: Slot::new(),
             on_presented: Slot::new(),
-            presented_upto: Cell::new(None),
+            presentation: RefCell::new(None),
             shown: RefCell::default(),
             retired: RefCell::default(),
             paint_pending: Cell::new(false),

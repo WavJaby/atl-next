@@ -265,14 +265,28 @@ pub struct FrameTick {
     pub time_ns: u64,
 }
 
-/// One frame the display showed, as the compositor's presentation feedback reports it: the sample the compositor's vsync grid is put on (UI mode).
+/// One frame the display showed, as the compositor's presentation feedback reports it (UI mode). The compositor's vsync model takes its phase only from [`PresentSource::Vsync`] samples.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PresentTiming {
-    /// When the frame reached the display, on the monotonic clock (`CLOCK_MONOTONIC`), in nanoseconds.
+    /// When the frame reached the display, on the monotonic clock (`CLOCK_MONOTONIC`), in nanoseconds; converted when the host stamps another clock ([`PresentSource::OtherClock`]).
     pub time_ns: i64,
-    /// The display's refresh period at that frame, in nanoseconds.
+    /// The display's refresh period at that frame, in nanoseconds; 0 when the host does not say (wp_presentation: "0 if unknown").
     pub refresh_ns: i64,
+    /// What `time_ns` is.
+    pub source: PresentSource,
+}
+
+/// What a presentation time stands for, as the host declares it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresentSource {
+    /// A display vsync, stamped on `CLOCK_MONOTONIC` (Wayland: `wp_presentation_feedback.presented` kind `vsync` and `wp_presentation.clock_id` = CLOCK_MONOTONIC): a phase the vsync grid may sit on.
+    Vsync,
+    /// The host does not say the time is a vsync (no `vsync` kind): when it composited, by its own timer or at the commit; not a display phase.
+    NotVsync,
+    /// A vsync on a clock other than `CLOCK_MONOTONIC`, converted at receipt: not exact enough to be the phase.
+    OtherClock,
 }
 
 /// [`FrameClock::request_frame`] from another thread.

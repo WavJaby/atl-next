@@ -320,7 +320,7 @@ fn wire(window: Rc<PlatformWindow>, splash_started: Option<Instant>) {
             );
             composer.presenter_reported();
         });
-        // the presented frames' timings (the display's feedback) are the clock's vsync grid: the clock moves onto each one
+        // the presented frames' timings (the display's feedback) choose the clock's vsync source tier; vsync-marked ones are its phase
         let presented = Arc::clone(&session.composer);
         window.on_presented(move |sample| presented.on_presented(sample));
         let sizes = Arc::clone(&session.sender);

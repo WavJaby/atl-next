@@ -6,6 +6,7 @@
 //! `textures_new` / `textures_reused` count the buffer quads of presented scenes: a new texture is an import (or, where GSK cannot import, a CPU download + upload at render).
 //! `interval_us` = `p50/p95/max` of paint end -> next paint end over the scene paints ending in this line (the first paint after an idle clock counts from the last paint before it); `request_us` = `mean/max`
 //! of a frame request -> the frame-clock tick that serves it (GDK's wait for the compositor's frame callback and its frame-time grid; our own scheduling adds nothing between them).
+//! `feedback_presented` / `feedback_discarded`: the window's wp_presentation feedback answered so far (running totals; presentation.rs keeps at most one outstanding).
 
 /// One stage's timings since the last line.
 #[derive(Default, Clone, Copy)]
@@ -51,6 +52,8 @@ pub struct PaintStats {
     intervals: Vec<i64>,
     /// The last scene paint's end: kept across lines, so a line's first interval is counted.
     last_paint_ns: Option<i64>,
+    /// The window's presentation feedback totals `(presented, discarded)` (presentation.rs), running: kept across lines.
+    feedback: (u64, u64),
 }
 
 /// `p50/p95/max` in us of `v` (nearest rank, lower index); `-` when empty.
@@ -78,6 +81,11 @@ impl PaintStats {
         self.textures_new += new;
         self.textures_reused += reused;
         self.build.add(build_ns);
+    }
+
+    /// The presentation feedback totals now.
+    pub fn feedback(&mut self, presented: u64, discarded: u64) {
+        self.feedback = (presented, discarded);
     }
 
     /// A frame request was served by a tick `wait_ns` after it was made.
@@ -112,7 +120,7 @@ impl PaintStats {
             return;
         }
         tracing::info!(
-            "atl-platform-ui: paint ms={} cycles={} paints={} stale={} presents={} textures_new={} textures_reused={} build_us={} snapshot_us={} render_us={} other_us={} after_us={} interval_us={} request_us={}",
+            "atl-platform-ui: paint ms={} cycles={} paints={} stale={} presents={} textures_new={} textures_reused={} build_us={} snapshot_us={} render_us={} other_us={} after_us={} interval_us={} request_us={} feedback_presented={} feedback_discarded={}",
             (now_ns - since) / 1_000_000,
             self.cycles,
             self.paints,
@@ -127,10 +135,13 @@ impl PaintStats {
             self.after.show(),
             percentiles(&mut self.intervals),
             self.request.show(),
+            self.feedback.0,
+            self.feedback.1,
         );
         *self = Self {
             since_ns: Some(now_ns),
             last_paint_ns: self.last_paint_ns,
+            feedback: self.feedback,
             ..Self::default()
         };
     }

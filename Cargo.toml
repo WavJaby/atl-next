@@ -36,7 +36,8 @@ gbm = { version = "0.18", default-features = false }
 glib-unix = "0.22"
 # GTK4 bindings (re-exporting gdk, gsk, glib, gio, graphene): only atl-platform-ui-linux, atl-platform-host-linux and atl-webview-linux depend on it (deny.toml bans). v4_14 = the GTK baseline feature floor (plan Q10, re-decided 2026-11-17: 4.14, enforced by check step gtk-imports against gtk-baseline.toml; newer API only as probed tiers) and the X8 memory formats (opaque layers) on top of v4_12's fractional surface scale
 gtk4 = { version = "0.11", features = ["v4_14"] }
-gdk4-wayland = "0.11"
+# GDK's own Wayland objects (`wl_display`, the window's `wl_surface`) as wayland-client proxies (`wayland_crate`): atl-platform-ui-linux binds wp_presentation on GDK's connection, the only one the window's surface exists on (presentation.rs)
+gdk4-wayland = { version = "0.11", features = ["wayland_crate"] }
 # WebKitGTK 6.0 bindings (MIT; webview plan M68): only atl-webview-linux depends on it (deny.toml bans); same gtk-rs train as gtk4 0.11. No gtk_v4_* feature: its WebView implements gtk::Accessible, which gtk4-rs gates at v4_10, and atl-webview-linux's own gtk4 edge (v4_14) supplies that in every build, including its staging alone
 # v2_42: webkit_cookie_manager_get_all_cookies, the CookieManager copy's source (webview plan D5) -> WebKitGTK floor 2.42 (Debian trixie 2.54, Arch current)
 webkit6 = { version = "0.6", features = ["v2_42"] }
@@ -60,8 +61,10 @@ spdx = "0.13"
 thiserror = "2"
 toml = "1"
 toml_edit = "0.25"
-# Wayland client on its pure-Rust backend (no libwayland, no `unsafe` in our crate): atl-platform-ui-linux's own connection for wl_output transforms, which GDK reads but does not expose (deny.toml bans)
+# Wayland client (deny.toml bans it outside atl-platform-ui-linux): its own connection for wl_output transforms, which GDK reads but does not expose, and GDK's connection for wp_presentation. On libwayland (wayland-backend `client_system`, enabled by gdk4-wayland's `wayland_crate`): a foreign `wl_display` exists only there; libwayland-client is already in the process with GTK. No `unsafe` in our crate: gdk4-wayland wraps the foreign pointers
 wayland-client = "0.31"
+# wp_presentation (presentation-time, stable) client bindings; the same crate gdk4-wayland's `wayland_crate` pulls in
+wayland-protocols = { version = "0.32", features = ["client"] }
 # APK reading for the install's native-library extraction (atl-services-types native_libs, temporary until the installer process runs AOSP's NativeLibraryHelper); inflate via flate2 + zlib-rs only (feature `deflate` would add the zopfli compressor)
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 # D-Bus client (MIT, pure Rust, no libdbus): atl-platform-host-linux's session-bus calls (notifications plan OD1, owner 2026-11-18: zbus directly). `default-rt` = zbus's own runtime (zruntime), driven by `zbus::block_on` from atld's sync threads: no tokio.

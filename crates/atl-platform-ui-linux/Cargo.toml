@@ -23,6 +23,7 @@ atl-gralloc-dmabuf = { path = "../atl-gralloc-dmabuf" }
 atl-libgui-parcel = { path = "../atl-libgui-parcel" }
 atl-platform-ui-api = { path = "../atl-platform-ui-api" }
 atl-scene-buffer = { path = "../atl-scene-buffer" }
+gdk4-wayland.workspace = true
 glib-unix.workspace = true
 gtk4.workspace = true
 libc.workspace = true
@@ -30,6 +31,7 @@ pipewire = { workspace = true, features = ["v0_3_49"] }
 rustix.workspace = true
 tracing.workspace = true
 wayland-client.workspace = true
+wayland-protocols.workspace = true
 
 [lints]
 workspace = true

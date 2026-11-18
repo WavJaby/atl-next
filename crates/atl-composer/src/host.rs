@@ -26,7 +26,7 @@ use atl_libgui_parcel::transaction::{Transaction, TransactionState};
 use atl_libgui_parcel::wire::set_binder_key;
 use atl_parcelables::android::view::SurfaceControl_Transaction;
 use atl_parcelables::codecs::android::view::SurfaceControl_Transaction::TransactionObject;
-use atl_platform_ui::PresentTiming;
+use atl_platform_ui::{PresentSource, PresentTiming};
 use atl_services_types::display_model::DisplayModel;
 use binder::binder_impl::{Binder, BorrowedParcel, TransactionCode};
 use binder::{
@@ -228,6 +228,18 @@ struct State {
     stats: Stats,
     /// UI mode's window mailbox (lock order: this state, then the mailbox); None headless.
     mailbox: Option<Arc<Mailbox>>,
+    /// The vsync source's counters (the window's thread writes them, [`Composer::on_presented`]).
+    vsync: Arc<VsyncCounters>,
+}
+
+/// The vsync source tier and its samples, for the counters line: `vsync_source` (the tier now), `vsync_samples` (presentation samples marked vsync), `vsync_samples_other` (the rest),
+/// `vsync_source_changes` (tier switches).
+#[derive(Debug, Default)]
+struct VsyncCounters {
+    hardware: AtomicBool,
+    samples_vsync: AtomicU64,
+    samples_other: AtomicU64,
+    changes: AtomicU64,
 }
 
 impl State {
@@ -285,7 +297,7 @@ impl State {
         let ignored: Vec<String> = c.ignored.iter().map(|(k, n)| format!("{k}:{n}")).collect();
         let m = self.mailbox.as_ref().map(|m| m.stats()).unwrap_or_default();
         format!(
-            "composer: counters ticks={} latches={} backpressure_holds={} latches_unpainted={} transactions={} layers_created={} layers_alive={} transactions_applied={} layer_states={} unknown_layer={} buffers_acquired={} buffers_released={} completions={} scenes={} scenes_taken={} scenes_dropped={} presents_refused={} release_reports={} max_held_per_layer={} vsync_sent={} vsync_dropped={} callbacks_sent={} callbacks_failed={} releases_on_channel={} releases_peer_gone={} releases_fenced={} releases_fenced_unmatched={} releases_carried={} releases_held={} completions_held={} fence_waits={} fds_held={} fds_taken={} fds_closed={} post_draw_received={} post_draw_applied={} ticks_short={} tick_late_max_us={} ignored={}",
+            "composer: counters ticks={} latches={} backpressure_holds={} latches_unpainted={} transactions={} layers_created={} layers_alive={} transactions_applied={} layer_states={} unknown_layer={} buffers_acquired={} buffers_released={} completions={} scenes={} scenes_taken={} scenes_dropped={} presents_refused={} release_reports={} max_held_per_layer={} vsync_sent={} vsync_dropped={} callbacks_sent={} callbacks_failed={} releases_on_channel={} releases_peer_gone={} releases_fenced={} releases_fenced_unmatched={} releases_carried={} releases_held={} completions_held={} fence_waits={} fds_held={} fds_taken={} fds_closed={} post_draw_received={} post_draw_applied={} ticks_short={} tick_late_max_us={} vsync_source={} vsync_samples={} vsync_samples_other={} vsync_source_changes={} ignored={}",
             s.ticks,
             s.latches,
             s.backpressure_holds,
@@ -324,6 +336,14 @@ impl State {
             s.post_draw_applied,
             s.ticks_short,
             s.tick_late_max_us,
+            if self.vsync.hardware.load(Ordering::Relaxed) {
+                clock::Tier::HardwareVsync.name()
+            } else {
+                clock::Tier::FreeRunning.name()
+            },
+            self.vsync.samples_vsync.load(Ordering::Relaxed),
+            self.vsync.samples_other.load(Ordering::Relaxed),
+            self.vsync.changes.load(Ordering::Relaxed),
             ignored.join(","),
         )
     }
@@ -336,8 +356,10 @@ pub struct Composer {
     wake: clock::Wake,
     /// UI mode: asks the window for a frame after a publish ([`Composer::set_frame_requester`]).
     frame_request: OnceLock<Box<dyn Fn() + Send + Sync>>,
-    /// UI mode: the window's last presented frame, which the clock's grid sits on ([`Composer::on_presented`]). A leaf lock: taken alone, never with the core's.
-    presented: Mutex<Option<PresentTiming>>,
+    /// The vsync source tier and the grid it gives ([`Composer::on_presented`], [`Composer::grid`]). A leaf lock: taken alone, never with the core's.
+    vsync: Mutex<clock::VsyncSource>,
+    /// Its counters, shared with the state's counters line.
+    vsync_counters: Arc<VsyncCounters>,
     stop: AtomicBool,
     /// the monitor the window is on (UI mode follows it: []); headless keeps the one it starts with
     display: Mutex<DisplayModel>,
@@ -413,6 +435,7 @@ impl Composer {
         };
         let display_token =
             BnLayerHandle::new_binder(handle, BinderFeatures::default()).as_binder();
+        let vsync_counters = Arc::new(VsyncCounters::default());
         Arc::new(Composer {
             state: Mutex::new(State {
                 compositor: Compositor::new(config.compositor).with_fence_probe(acquire_signalled),
@@ -431,10 +454,12 @@ impl Composer {
                 counters_pending: false,
                 stats: Stats::default(),
                 mailbox: None,
+                vsync: Arc::clone(&vsync_counters),
             }),
             wake: clock::Wake::default(),
             frame_request: OnceLock::new(),
-            presented: Mutex::new(None),
+            vsync: Mutex::new(clock::VsyncSource::default()),
+            vsync_counters,
             stop: AtomicBool::new(false),
             display: Mutex::new(config.display),
             post_draw: config.post_draw,
@@ -461,23 +486,41 @@ impl Composer {
         }
     }
 
-    /// UI mode: the window showed a frame at `sample.time_ns` on a `sample.refresh_ns` period (its presentation feedback). The clock's grid moves onto it from the next tick. Takes no core lock.
+    /// UI mode: the window showed a frame (its presentation feedback, in order). It feeds the vsync source tier: a vsync sample is the hardware tier's phase from the next tick; any sample's
+    /// refresh is the nominal period. A tier change is logged once: `atl-composer: vsync source <tier> (<reason>)`. Takes no core lock.
     pub fn on_presented(&self, sample: PresentTiming) {
-        let mut presented = self.presented.lock().unwrap_or_else(|e| e.into_inner());
-        if presented.is_none() {
+        let c = &self.vsync_counters;
+        if sample.source == PresentSource::Vsync {
+            c.samples_vsync.fetch_add(1, Ordering::Relaxed);
+        } else {
+            c.samples_other.fetch_add(1, Ordering::Relaxed);
+        }
+        let change = self
+            .vsync
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .on_sample(sample);
+        if let Some(change) = change {
+            c.hardware
+                .store(change.tier == clock::Tier::HardwareVsync, Ordering::Relaxed);
+            c.changes.fetch_add(1, Ordering::Relaxed);
             tracing::info!(
-                "atl-composer: ui: clock grid on presented frames: time_ns={} refresh_ns={}",
-                sample.time_ns,
+                "atl-composer: vsync source {} ({}) refresh_ns={}",
+                change.tier.name(),
+                change.reason,
                 sample.refresh_ns
             );
         }
-        *presented = Some(sample);
     }
 
-    /// The grid the next tick sits on: the window's last presented frame (UI mode), else the start time on the display's rate.
-    fn grid(&self, start_ns: i64) -> (i64, i64) {
-        let presented = *self.presented.lock().unwrap_or_else(|e| e.into_inner());
-        clock::tick_grid(presented, start_ns, self.display().refresh_hz)
+    /// The grid the next tick sits on, from the vsync source tier ([`clock::VsyncSource::grid`]); `last_tick_ns` anchors a free-running grid that (re)starts.
+    fn grid(&self, start_ns: i64, last_tick_ns: Option<i64>) -> (i64, i64) {
+        let refresh_hz = self.display().refresh_hz;
+        self.vsync.lock().unwrap_or_else(|e| e.into_inner()).grid(
+            start_ns,
+            last_tick_ns,
+            refresh_hz,
+        )
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -798,6 +841,16 @@ impl Composer {
         threads: &dyn VmHost,
         presenter: Presenter,
     ) -> std::io::Result<()> {
+        // the tier the clock starts in, once; a change is logged by on_presented
+        tracing::info!(
+            "atl-composer: vsync source {} ({}) period_ns={}",
+            clock::Tier::FreeRunning.name(),
+            match presenter {
+                Presenter::Sink(_) => "headless: no display presents",
+                Presenter::Window(_) => "no vsync presentation sample yet",
+            },
+            atl_services_types::display_model::period_ns(self.display().refresh_hz)
+        );
         let sink = match presenter {
             Presenter::Sink(sink) => Some(sink),
             Presenter::Window(mailbox) => {
@@ -864,8 +917,8 @@ impl Composer {
                 continue;
             }
             let now = monotonic_ns();
-            let (origin, interval) = self.grid(start);
             let last = self.lock().last_tick_ns;
+            let (origin, interval) = self.grid(start, last);
             let at = clock::next_dispatch(origin, interval, now, last);
             std::thread::sleep(Duration::from_nanos(u64::try_from(at - now).unwrap_or(0)));
             let (frame, published) = self.tick(at, interval);

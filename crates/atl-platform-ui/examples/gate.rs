@@ -783,8 +783,8 @@ fn main() -> Result<()> {
     ));
     for (p, seen_ns) in presents.borrow().iter() {
         emit(format_args!(
-            "PRESENT time_ns={} refresh_ns={} seen_ns={seen_ns}",
-            p.time_ns, p.refresh_ns
+            "PRESENT time_ns={} refresh_ns={} source={:?} seen_ns={seen_ns}",
+            p.time_ns, p.refresh_ns, p.source
         ));
     }
     emit(format_args!("DONE"));

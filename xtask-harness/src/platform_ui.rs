@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! `xtask test platform-ui` (M3 slice 6): the GTK platform layer on a real Wayland compositor (the gate's headless labwc, nested_wayland.rs; with --hold-blocked the desktop's $WAYLAND_DISPLAY), through the `atl-platform-ui` facade.
 //! The client is `crates/atl-platform-ui/examples/gate.rs`; this side builds and starts it, reads its stdout and captures, and checks them against its own implementation of the spec below. Gates 1-4 run in any compositor, gate 5 only in the gate's labwc. Gates:
-//! 1. **maps + frames**: the window maps (`is_mapped` at the first frame-clock tick) and `--frames` ticks of the window's frame clock each present one scene; ticks are strictly increasing in time. The presentation samples (`PRESENT`: the compositor's feedback for each presented frame, which the composer's clock grid is put on) are monotonic, on CLOCK_MONOTONIC, and have the monitor's period +-2%; no sample at all fails these.
+//! 1. **maps + frames**: the window maps (`is_mapped` at the first frame-clock tick) and `--frames` ticks of the window's frame clock each present one scene; ticks are strictly increasing in time. The presentation samples (`PRESENT`: the compositor's feedback for each presented frame, which choose the composer's vsync source tier) are monotonic, on CLOCK_MONOTONIC, and where they state a period it is the monitor's +-2%; no sample at all fails these.
 //! 2. **readback**: after each present the client renders the window content with GSK (`Window::capture`); every pixel must equal the frame's pattern, R = (x + 7f) mod 256, G = (3y + f) mod 256, B = ((x xor y) + 31f) mod 256, A = 255, computed here from that formula, not by the code under test. The buffers have padded rows and alternate the opaque (`X8`) texture path.
 //!    A composite scene (crop + FLIP_H, ROT_90 clockwise, scissor, alpha 0.5, an opaque and a half-transparent colour layer) is compared with a CPU composition worked out here from the HAL transform definitions; alpha pixels within `ALPHA_TOLERANCE`, the rest exact.
 //! 3. **refusals + release + loop**: a handle with a short pitch or an unknown fourcc is refused; a replaced buffer goes back at the paint after its replacement, with a read fence, and nothing before that paint; GTK's log shows every buffer imported as a dmabuf texture and none downloaded (`gdk_dmabuf`); a watched fd's callback ran on the UI thread inside the Looper's poll.
@@ -888,7 +888,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // shutdown
     client.command("quit")?;
     client.expect_line("DONE", EXIT_LIMIT)?;
-    // presentation samples, one per presented frame the display showed (gate.rs), printed before DONE: in order, each period the monitor's rate. The composer's clock grid is put on them.
+    // presentation samples, one per presented frame the display showed (gate.rs), printed before DONE: in order, each stated period the monitor's rate. They choose the composer's vsync source tier.
     // Zero samples fails every check here, the period one included: an empty set must not pass.
     let monitor_hz = client
         .lines_with("MONITOR ")
@@ -929,16 +929,17 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         "presentation times are on CLOCK_MONOTONIC: each report arrives at most 10 s after its frame was shown",
         &format!("{} samples", samples.len()),
     );
+    // a period of 0 is the host saying it does not know (wp_presentation `refresh`: "0 if unknown"; headless wlroots sends 0): only a stated period is checked
     let want_ns = monitor_hz.map(|hz| 1e9 / f64::from(hz));
-    let periods = samples.iter().map(|s| s.1);
+    let periods = samples.iter().map(|s| s.1).filter(|p| *p != 0);
     report.check(
         !samples.is_empty()
             && want_ns.is_some_and(|want| {
-                samples
-                    .iter()
-                    .all(|(_, period, _)| (*period as f64 - want).abs() <= want * REFRESH_TOLERANCE)
+                samples.iter().all(|(_, period, _)| {
+                    *period == 0 || (*period as f64 - want).abs() <= want * REFRESH_TOLERANCE
+                })
             }),
-        "presentation sample periods equal the monitor rate (+-2%)",
+        "presentation sample periods, where stated, equal the monitor rate (+-2%)",
         &format!(
             "monitor {monitor_hz:?} Hz, sample periods {:?}..{:?} ns",
             periods.clone().min(),

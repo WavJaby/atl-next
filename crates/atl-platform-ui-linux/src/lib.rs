@@ -19,6 +19,7 @@ pub(crate) mod mirror;
 mod module;
 mod outputs;
 mod paint_stats;
+mod presentation;
 mod scene;
 mod sideband;
 mod text_input;
