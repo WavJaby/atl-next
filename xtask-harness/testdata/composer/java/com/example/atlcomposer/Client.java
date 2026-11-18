@@ -115,7 +115,8 @@ public class Client {
         SurfaceControl warmChild = new SurfaceControl.Builder().setName("atl-warm-child").setParent(warmParent).setBufferSize(SIZE, SIZE).build();
         Object warmBbq = newQueue(warmChild);
         Surface warmSurface = surfaceOf(warmBbq);
-        new SurfaceControl.Transaction().setVisibility(warmChild, true).apply();
+        // SurfaceControl.Builder creates layers hidden (mFlags = HIDDEN): a hidden parent hides its child, so both are shown, as a window shows its layers
+        new SurfaceControl.Transaction().setVisibility(warmParent, true).setVisibility(warmChild, true).apply();
         post(warmSurface, 0);
         Thread.sleep(SETTLE_MS);
         warmSurface.release();
@@ -129,6 +130,8 @@ public class Client {
         SurfaceControl parent = new SurfaceControl.Builder().setName("atl-parent").setBufferSize(128, 128).build();
         final SurfaceControl child = new SurfaceControl.Builder().setName("atl-child").setParent(parent).setBufferSize(SIZE, SIZE).build();
         log("layers created valid=" + (parent.isValid() && child.isValid()));
+        // created hidden like the warm-up's: the parent is shown once, the child with each frame's transaction
+        new SurfaceControl.Transaction().setVisibility(parent, true).apply();
         Object bbq = null;
         Surface surface = null;
         try {
