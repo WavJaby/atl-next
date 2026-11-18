@@ -198,7 +198,12 @@ pub struct Stats {
     pub ticks_short: u64,
     /// The largest delay between a tick's vsync time and the clock thread running it, us: the age of `frameTimeNanos` when the event is written.
     pub tick_late_max_us: u64,
+    /// Tick-to-tick vsync times in periods, by [`TICK_INTERVAL_BOUNDS`]: the vsync timeline the apps see (`tick_intervals=a/b/c/d/e`).
+    pub tick_intervals: [u64; 5],
 }
+
+/// Upper bounds of the [`Stats::tick_intervals`] buckets, in quarter periods: < 0.75 (short), < 1.25 (one period), < 1.75 (a period and a half: off any grid), < 2.5 (two), the rest (longer).
+const TICK_INTERVAL_BOUNDS: [i64; 4] = [3, 5, 7, 10];
 
 struct State {
     compositor: Compositor,
@@ -297,7 +302,7 @@ impl State {
         let ignored: Vec<String> = c.ignored.iter().map(|(k, n)| format!("{k}:{n}")).collect();
         let m = self.mailbox.as_ref().map(|m| m.stats()).unwrap_or_default();
         format!(
-            "composer: counters ticks={} latches={} backpressure_holds={} latches_unpainted={} transactions={} layers_created={} layers_alive={} transactions_applied={} layer_states={} unknown_layer={} buffers_acquired={} buffers_released={} completions={} scenes={} scenes_taken={} scenes_dropped={} presents_refused={} release_reports={} max_held_per_layer={} vsync_sent={} vsync_dropped={} callbacks_sent={} callbacks_failed={} releases_on_channel={} releases_peer_gone={} releases_fenced={} releases_fenced_unmatched={} releases_carried={} releases_held={} completions_held={} fence_waits={} fds_held={} fds_taken={} fds_closed={} post_draw_received={} post_draw_applied={} ticks_short={} tick_late_max_us={} vsync_source={} vsync_samples={} vsync_samples_other={} vsync_source_changes={} ignored={}",
+            "composer: counters ticks={} latches={} backpressure_holds={} latches_unpainted={} transactions={} layers_created={} layers_alive={} transactions_applied={} layer_states={} unknown_layer={} buffers_acquired={} buffers_released={} completions={} scenes={} scenes_taken={} scenes_dropped={} presents_refused={} release_reports={} max_held_per_layer={} vsync_sent={} vsync_dropped={} callbacks_sent={} callbacks_failed={} releases_on_channel={} releases_peer_gone={} releases_fenced={} releases_fenced_unmatched={} releases_carried={} releases_held={} completions_held={} fence_waits={} fds_held={} fds_taken={} fds_closed={} post_draw_received={} post_draw_applied={} ticks_short={} tick_late_max_us={} tick_intervals={} vsync_source={} vsync_samples={} vsync_samples_other={} vsync_source_changes={} ignored={}",
             s.ticks,
             s.latches,
             s.backpressure_holds,
@@ -336,6 +341,7 @@ impl State {
             s.post_draw_applied,
             s.ticks_short,
             s.tick_late_max_us,
+            s.tick_intervals.map(|n| n.to_string()).join("/"),
             if self.vsync.hardware.load(Ordering::Relaxed) {
                 clock::Tier::HardwareVsync.name()
             } else {
@@ -954,11 +960,16 @@ impl Composer {
     fn tick(&self, at_ns: i64, interval_ns: i64) -> (Frame, bool) {
         let mut st = self.lock();
         st.stats.ticks += 1;
-        if st
-            .last_tick_ns
-            .is_some_and(|last| (at_ns - last) * 4 < interval_ns * 3)
-        {
-            st.stats.ticks_short += 1;
+        if let Some(last) = st.last_tick_ns {
+            let quarters = (at_ns - last) * 4;
+            if quarters < interval_ns * 3 {
+                st.stats.ticks_short += 1;
+            }
+            let bucket = TICK_INTERVAL_BOUNDS
+                .iter()
+                .position(|b| quarters < interval_ns * b)
+                .unwrap_or(TICK_INTERVAL_BOUNDS.len());
+            st.stats.tick_intervals[bucket] += 1;
         }
         st.last_tick_ns = Some(at_ns);
         let late_us = u64::try_from((monotonic_ns() - at_ns) / 1000).unwrap_or(0);
