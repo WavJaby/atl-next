@@ -6,6 +6,7 @@
 //! are settled (`services: activity settled`: no launch, start or lifecycle step unacknowledged), so a Splash that starts Main is judged on Main. Pass: that resume is the last one, a frame is
 //! presented after it (`atl-composer: ui: present`), and no fault in the app log within the watch after it (window::fault_after). The run ends once all of that holds and the watch is over
 //! (--hold: the hold); a run that ends before its watch is over fails.
+//! Sound: with --hold (the user's launch) the session's routing, as a desktop launch; headless, every stream plays into a null sink of the run's own (audio_pcm.rs Routing), never the session's sink.
 //! `--drive <script>`: once that wait is over, the script runs against the window (drive.rs for its grammar); a failed step fails the run, and the verdict covers the run up to the script's end.
 //! `remote run-apk` ([`remote`]): the same run on a target's desktop. The bundle goes there and is checked, atld runs there for `--hold`, and the logs come back when the run ends; the verdict is read from them, against the target's end record.
 
@@ -18,6 +19,7 @@ use anyhow::{Context, Result, ensure};
 use crate::atld_run::{
     MS_PER_S, Package, PackageFile, Run, Runtime, last_resumed, parse_stamp, run_display, settled,
 };
+use crate::audio_pcm::Routing;
 use crate::manifest::Manifest;
 use atl_services_types::native_libs::{LIB_DIR_NAME, SupportedAbi};
 
@@ -342,6 +344,25 @@ pub(crate) fn run_on(
             .with_wayland(&n.socket)
             .with_display(n.display().to_arg()),
         (None, _) => rt.clone().with_display(run_display().to_arg()),
+    };
+    // headless (no --hold): nobody listens either, so every stream the run makes plays into a null sink of its own, never the session's sink; --hold is the user's launch and keeps
+    // the session's routing. Declared before atld: the sink outlives it.
+    let audio = match &nested {
+        Some(_) => Some(
+            Routing::setup(&format!("atl-run-apk-{}", std::process::id()))?
+                .with_pulse(&work.join("audio"))?,
+        ),
+        None => None,
+    };
+    let rt = match &audio {
+        Some(routing) => {
+            println!(
+                "run-apk: audio into the run's own null sink {}",
+                routing.name()
+            );
+            rt.with_audio_routing(routing)
+        }
+        None => rt,
     };
     let m = timing::phase("run: package", || package(&rt, &files, pin, &args.target))?;
     // the name becomes the log and data paths below: refuse a name that is no package name before any is built

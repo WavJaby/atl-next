@@ -220,9 +220,10 @@ enum Test {
     ///
     /// Controls run every time: the module loaded RTLD_GLOBAL must leak, no log sink must drop the records. Needs `xtask native`, labwc, pipewire and the NDK.
     UiModule(ui_module::Args),
-    /// The PCM output of atl-platform-ui-linux (plan A0) on PipeWire: a 1 kHz tone played to a null sink the run makes the default, recorded from its monitor, checked for frequency, level and duration. `--break zeros` and `--break no-target` must turn it red.
+    /// The PCM output of atl-platform-ui-linux (plan A0) on PipeWire: a 1 kHz tone played to the run's own null sink (the stream targets it; the default sink is untouched), recorded from its monitor, checked for frequency, level and duration. `--break zeros`,
+    /// `--break no-target` and `--break off-target` must turn it red.
     ///
-    /// The client is crates/atl-platform-ui/examples/audio_pcm.rs; the module doc of xtask-harness/src/audio_pcm.rs lists the gates and the environment it changes (restored on every exit). Needs pipewire, pw-cli, pw-metadata and pw-record on PATH.
+    /// The client is crates/atl-platform-ui/examples/audio_pcm.rs; the module doc of xtask-harness/src/audio_pcm.rs lists the gates and the environment it changes (removed on every exit). Needs pipewire, pw-cli and pw-record on PATH.
     AudioPcm(audio_pcm::Args),
     /// The bridge-1 JNI fixture (xtask-harness/testdata/jni-test), NDK-built for minSdk 21 (emulated TLS) and 29 (ELF TLS): DT_NEEDED libc.so + libc++_shared.so, verneed libc.so/LIBC, the variant's TLS shape, and host glibc's loader refusing it on `LIBC`.
     ///

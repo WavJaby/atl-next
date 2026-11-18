@@ -316,6 +316,9 @@ pub struct Runtime {
     pipewire_remote: Option<PathBuf>,
     /// atld's `PULSE_SERVER` (where atld finds the pulse socket `share-sound` grants the web process).
     pulse_server: PulseServer,
+    /// atld's `PIPEWIRE_PROPS` (libpipewire's launcher variable, read by every `pw_stream_new`): a run's own sink as its streams' target ([`Runtime::with_audio_routing`]); unset = the
+    /// session's routing (WirePlumber's default sink).
+    stream_target: Option<String>,
     /// The Wayland socket atld's children connect to (the window gate's proxy); the environment's when unset.
     wayland: Option<PathBuf>,
     /// Apps run under atld's app seccomp filter (atl-broker seccomp.rs) unless this is cleared (`--no-app-seccomp`, the deliberate-failure check).
@@ -842,6 +845,7 @@ impl Runtime {
             audio_break_mix: false,
             pipewire_remote: None,
             pulse_server: PulseServer::GateDefault,
+            stream_target: None,
             wayland: None,
             app_seccomp: true,
             break_render_path: false,
@@ -1212,6 +1216,16 @@ impl Runtime {
     /// atld starts with `PULSE_SERVER` = `server` (libpulse's syntax, `unix:<path>`): the desktop's pulse server, whose socket `share-sound` grants the web process.
     pub fn with_pulse_server(mut self, server: std::ffi::OsString) -> Self {
         self.pulse_server = PulseServer::Named(server);
+        self
+    }
+
+    /// Every stream the run creates plays into `routing`'s sink, never the session's: atld's own PipeWire streams by target (`PIPEWIRE_PROPS`), the web process's pulse streams through the
+    /// run's pulse server when `routing` has one ([`crate::audio_pcm::Routing::with_pulse`]). For runs nobody listens to: gates and driven runs.
+    pub fn with_audio_routing(mut self, routing: &crate::audio_pcm::Routing) -> Self {
+        self.stream_target = Some(routing.stream_props());
+        if let Some(server) = routing.pulse_server() {
+            self.pulse_server = PulseServer::Named(server);
+        }
         self
     }
 
@@ -1938,6 +1952,9 @@ impl Runtime {
             cmd.env("PIPEWIRE_REMOTE", socket);
         }
         self.pulse_server.apply(&mut cmd);
+        if let Some(props) = &self.stream_target {
+            cmd.env("PIPEWIRE_PROPS", props);
+        }
         if let Some(socket) = &self.wayland {
             cmd.env("WAYLAND_DISPLAY", socket);
         }

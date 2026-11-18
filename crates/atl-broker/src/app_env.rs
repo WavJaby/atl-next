@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The environment a sandboxed process starts with: [`APP_ENV`] names copied verbatim from the launcher's (atld's) own environment, then the spawn's explicit entries; nothing else of the host's.
 //! Forwarding, not a switch: no code here reads a value. A variable the runtime itself decides (LD_LIBRARY_PATH, ANDROID_*, a harness's debug or break variable) is an explicit `Spawn::env` entry, never a name here.
-//! Left out on purpose: HOME, USER, PATH (the sandbox shows no home; glibc's exec falls back to its default path), DBUS_SESSION_BUS_ADDRESS (no bus socket is shown; desktop access is portals), PIPEWIRE_* (the launcher gets the socket as `--pipewire-socket`),
+//! Left out on purpose: HOME, USER, PATH (the sandbox shows no home; glibc's exec falls back to its default path), DBUS_SESSION_BUS_ADDRESS (no bus socket is shown; desktop access is portals), PIPEWIRE_REMOTE / PIPEWIRE_RUNTIME_DIR (the launcher gets the socket as `--pipewire-socket`),
 //! GTK_IM_MODULE (a desktop IM module such as ibus would bypass the app's text-input v3 path to the IME), GDK_BACKEND (GTK picks Wayland from the shown socket).
 
 use std::ffi::OsString;
@@ -43,6 +43,9 @@ pub const APP_ENV: &[&str] = &[
     "__EGL_VENDOR_LIBRARY_DIRS",
     // NVIDIA Vulkan layer: orders the Vulkan devices (GSK's Vulkan renderer on the offload GPU)
     "__VK_LAYER_NV_optimus",
+    // libpipewire pw_stream_new / pw_stream_connect (the app's PCM output, atl-platform-ui-linux): the launcher's stream properties and target node, e.g. `target.object` = a sink of its choice
+    "PIPEWIRE_PROPS",
+    "PIPEWIRE_NODE",
 ];
 
 /// The [`APP_ENV`] names `lookup` has, in list order, verbatim.

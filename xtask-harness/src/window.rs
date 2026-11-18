@@ -2206,15 +2206,18 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         commit: args.break_ime_commit,
         delete: args.break_ime_delete,
     };
-    // the webview stage's page plays a tone (webview.rs sound): into a null sink the gate makes the default for the run, silent on the desktop, its monitor recorded (audio_pcm.rs)
+    // the webview stage's page plays a tone (webview.rs sound): into the run's own null sink, silent on the desktop, its monitor recorded (audio_pcm.rs)
     let sound = match args.stage {
         Stage::WebView => Some(webview::Sound::start(&run.scratch)?),
         _ => None,
     };
-    // atld finds the run's pulse server (the break keeps its missing one)
+    // atld's streams and the run's pulse server target that sink (the break keeps the pulse server missing)
     let rt = match &sound {
-        Some(s) if !args.break_webview_sound => rt.with_pulse_server(s.server()),
-        _ => rt,
+        Some(s) if args.break_webview_sound => {
+            rt.with_audio_routing(s.routing()).without_pulse_server()
+        }
+        Some(s) => rt.with_audio_routing(s.routing()),
+        None => rt,
     };
     let mut atld = Atld::Child(rt.start_atld(&run)?);
     let out = live(

@@ -69,8 +69,14 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 /// At most one counters line per this period (the diag lines' rate class: once per second at most).
 const COUNTERS_PERIOD: Duration = Duration::from_secs(1);
 
-/// One counters line `audio-mix: requested=N mixed=N from_tracks=N audible=N peak=F active=N muted=N dropped=N` with the deltas since the last (active and muted are levels); written while the output is open, zeros when silent.
-fn log_counters() {
+/// One counters line `audio-mix: requested=N mixed=N from_tracks=N audible=N peak=F active=N muted=N dropped=N underruns=N rt_fallbacks=N` with the deltas since the last (active, muted and
+/// rt_fallbacks are levels); written while the output is open, zeros when silent. underruns = server cycles that found no buffer of `pcm`'s (the sound cut there; delta of [`PcmOutput::underruns`]
+/// against `underruns_seen`); rt_fallbacks = 1 when its callbacks run without a realtime grant.
+fn log_counters(pcm: &atl_platform_ui::PlatformPcmOutput, underruns_seen: &mut u64) {
+    let total = pcm.underruns();
+    let underruns = total.saturating_sub(*underruns_seen);
+    *underruns_seen = total;
+    let rt_fallbacks = pcm.rt_fallbacks();
     let requested = REQUESTED.swap(0, Ordering::Relaxed);
     let mixed = MIXED.swap(0, Ordering::Relaxed);
     let audible = AUDIBLE.swap(0, Ordering::Relaxed);
@@ -81,7 +87,7 @@ fn log_counters() {
     let dropped = DROPPED.swap(0, Ordering::Relaxed);
     let _ = writeln!(
         std::io::stderr(),
-        "audio-mix: requested={requested} mixed={mixed} from_tracks={from_tracks} audible={audible} peak={peak:.4} active={active} muted={muted} dropped={dropped}"
+        "audio-mix: requested={requested} mixed={mixed} from_tracks={from_tracks} audible={audible} peak={peak:.4} active={active} muted={muted} dropped={dropped} underruns={underruns} rt_fallbacks={rt_fallbacks}"
     );
 }
 
@@ -175,14 +181,15 @@ fn owner(
 ) {
     let mut open: Option<(Output, Opened)> = None;
     let mut logged = Instant::now();
+    let mut underruns_seen = 0;
     loop {
         // while open the thread writes the counters line once per period, however often requests come; closed, it only waits for requests
-        let ask = if open.is_some() {
+        let ask = if let Some((output, _)) = open.as_ref() {
             let wait = COUNTERS_PERIOD.saturating_sub(logged.elapsed());
             match inbox.recv_timeout(wait) {
                 Ok(ask) => ask,
                 Err(RecvTimeoutError::Timeout) => {
-                    log_counters();
+                    log_counters(&output.pcm, &mut underruns_seen);
                     logged = Instant::now();
                     continue;
                 }

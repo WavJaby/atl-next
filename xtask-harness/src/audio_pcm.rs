@@ -8,9 +8,12 @@
 //! 5. **rt**: counted, not judged: 1 when the stream's first callback had no SCHED_FIFO/SCHED_RR (rtkit absent on WSL, so 1 is expected there).
 //! 6. **underruns**: counted, not judged: server cycles that found no buffer queued, where the sound was cut (0 expected).
 //!
-//! Breaks (each must turn the run red): `--break zeros` (the client writes silence: gates 1-3 fail), `--break no-target` (a PipeWire server with no session manager, so nothing links the stream: gate 4 fails).
+//! Breaks (each must turn the run red): `--break zeros` (the client writes silence: gates 1-3 fail), `--break no-target` (a PipeWire server with no session manager, so nothing links the stream: gate 4 fails),
+//! `--break off-target` (the client's stream targets a second null sink, not the recorded one: gates 1-3 fail, so a stream that plays elsewhere is never taken for the gate's).
 //!
-//! Environment: the normal run makes a null sink the server's default sink for its duration (`pw-cli create-node`, `pw-metadata`; both restored and removed on every exit path) and records its monitor with `pw-record`. Needs pipewire, pw-cli, pw-metadata and pw-record on PATH. `no-target` runs its own server in a temporary runtime dir (`PIPEWIRE_RUNTIME_DIR`), so no real sink is reached in either mode.
+//! Environment: the normal run makes a null sink of its own ([`Routing`], `pw-cli create-node`, removed on every exit path), targets the client's stream at it (`PIPEWIRE_PROPS`
+//! `target.object` + `node.dont-fallback`) and records its monitor with `pw-record`. The session's default sink and other streams are never touched, so gates overlap and the user's
+//! audio keeps playing where it was. Needs pipewire, pw-cli and pw-record on PATH. `no-target` runs its own server in a temporary runtime dir (`PIPEWIRE_RUNTIME_DIR`), so no real sink is reached in either mode.
 //!
 //! Evidence tier: isolated runtime against the real PipeWire graph; the Arch laptop runs the same gate (it needs no WSLg path).
 
@@ -41,12 +44,10 @@ const RECORD_LEAD_SECONDS: f64 = 0.1;
 const WAV_HEADER_SLACK: u64 = 256;
 /// How long the recorder may take to produce its lead, and the server its first socket.
 const READY_LIMIT: Duration = Duration::from_secs(5);
-/// How long the default-sink change may take to show in the metadata.
+/// How long a new null sink may take to show in the graph.
 const ROUTE_LIMIT: Duration = Duration::from_secs(2);
 /// The sink's object name; the process id keeps two runs apart.
 const SINK_PREFIX: &str = "atl-audio-pcm";
-/// The default-sink metadata key (WirePlumber's default.audio.sink).
-const DEFAULT_SINK_KEY: &str = "default.audio.sink";
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -73,6 +74,8 @@ pub enum Break {
     Zeros,
     /// No session manager links the client's stream: a private server, not the desktop's.
     NoTarget,
+    /// The client's stream targets a second null sink, not the recorded one.
+    OffTarget,
 }
 
 /// The client's report: the lines it printed and its exit status.
@@ -133,17 +136,28 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     })
 }
 
-/// Records the default sink's monitor while the client plays into the null sink the gate made the default.
+/// Records the gate's null sink's monitor while the client plays into it (`off-target`: into a second one).
 fn normal(client: &Client, args: &Args, dir: &Path, report: &mut Report) -> Result<()> {
     let name = format!("{SINK_PREFIX}-{}", std::process::id());
     let wav = dir.join("recording.wav");
     let routing = Routing::setup(&name)?;
-    let recorder = Recorder::start(&routing.name, &wav, args.rate)?;
+    let decoy = match args.break_ {
+        Some(Break::OffTarget) => Some(Routing::setup(&format!("{name}-elsewhere"))?),
+        _ => None,
+    };
+    let target = decoy.as_ref().unwrap_or(&routing).stream_props();
+    let recorder = Recorder::start(routing.name(), &wav, args.rate)?;
     let remote = atl_platform_host::app_access::pipewire_socket().context(
         "no PipeWire socket on this desktop: the normal run plays into the desktop's server",
     )?;
-    let run = run_client(client, args, &[], &remote)?;
+    let run = run_client(
+        client,
+        args,
+        &[("PIPEWIRE_PROPS", std::ffi::OsStr::new(&target))],
+        &remote,
+    )?;
     recorder.stop()?;
+    drop(decoy);
     drop(routing);
     if let Some(error) = &run.error {
         report.check("refusal", false, || {
@@ -178,7 +192,7 @@ fn normal(client: &Client, args: &Args, dir: &Path, report: &mut Report) -> Resu
 fn no_target(client: &Client, args: &Args, dir: &Path, report: &mut Report) -> Result<()> {
     let runtime = dir.join("runtime");
     fs::create_dir_all(&runtime).with_context(|| format!("creating {}", runtime.display()))?;
-    let env = [("PIPEWIRE_RUNTIME_DIR", runtime.as_path())];
+    let env = [("PIPEWIRE_RUNTIME_DIR", runtime.as_os_str())];
     let mut server = PrivateServer::start(&runtime, dir)?;
     let run = run_client(client, args, &env, &runtime.join("pipewire-0"));
     server.stop();
@@ -278,7 +292,7 @@ fn check_recording(
 fn run_client(
     client: &Client,
     args: &Args,
-    env: &[(&str, &Path)],
+    env: &[(&str, &std::ffi::OsStr)],
     remote: &Path,
 ) -> Result<ClientRun> {
     let mut command = Command::new(&client.exe);
@@ -326,11 +340,14 @@ fn run_client(
     Ok(run)
 }
 
-/// The environment the normal run changes: a null sink and the default sink naming it. Dropping it restores the default and removes the sink, on every exit path.
+/// A run's own null sink, which the run's streams target by name; the session's default sink and every stream that is not the run's stay untouched, so two runs overlap freely.
+/// PipeWire clients get the target the way a launcher passes it, libpipewire's `PIPEWIRE_PROPS` (read by every `pw_stream_new`); pulse clients get a pipewire-pulse of the run's own
+/// ([`Routing::with_pulse`]) whose streams carry the same target. `node.dont-fallback`: a stream whose target is gone fails instead of falling back to the default sink.
+/// Dropping it stops that pulse server and removes the sink, on every exit path.
 pub(crate) struct Routing {
     name: String,
     sink: Option<String>,
-    previous: Option<String>,
+    pulse: Option<PulseServer>,
 }
 
 impl Routing {
@@ -338,7 +355,7 @@ impl Routing {
         let mut routing = Routing {
             name: name.to_owned(),
             sink: None,
-            previous: default_sink()?,
+            pulse: None,
         };
         // state.restore-props=false: WirePlumber's state-stream neither restores nor saves this node's volume, so a run leaves no `Audio/Sink:node.name:<sink>` key in the user's state file
         let props = format!(
@@ -348,36 +365,122 @@ impl Routing {
         );
         let created = pw_command(&["create-node", "adapter", &props])?;
         ensure!(created.status.success(), "pw-cli create-node failed");
-        let id = node_id(name)?.context("the null sink does not show in the graph")?;
-        routing.sink = Some(id);
-        let json = sink_json(name);
-        set_default_sink(&json)?;
         let deadline = Instant::now() + ROUTE_LIMIT;
-        while default_sink()?.as_deref() != Some(json.as_str()) {
+        let id = loop {
+            if let Some(id) = node_id(name)? {
+                break id;
+            }
             ensure!(
                 Instant::now() < deadline,
-                "the default sink did not change to {name}"
+                "the null sink {name} does not show in the graph"
             );
             thread::sleep(Duration::from_millis(20));
-        }
+        };
+        routing.sink = Some(id);
         Ok(routing)
     }
+
+    /// The sink's node name.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Stream properties that target this sink: `PIPEWIRE_PROPS`'s value for the run's PipeWire clients, and the run's pulse server's `stream.properties`.
+    pub(crate) fn stream_props(&self) -> String {
+        stream_props(&self.name)
+    }
+
+    /// Starts a pipewire-pulse of the run's own in `dir` whose streams target this sink: the run's pulse clients (the WebView's pulsesink) reach it, never the session's pulse server.
+    pub(crate) fn with_pulse(mut self, dir: &Path) -> Result<Self> {
+        self.pulse = Some(PulseServer::start(dir, &self.name)?);
+        Ok(self)
+    }
+
+    /// The run's pulse server in libpulse's syntax (`unix:<socket>`), when [`Routing::with_pulse`] started one.
+    pub(crate) fn pulse_server(&self) -> Option<std::ffi::OsString> {
+        self.pulse.as_ref().map(|p| {
+            let mut s = std::ffi::OsString::from("unix:");
+            s.push(&p.socket);
+            s
+        })
+    }
+}
+
+/// `{ target.object=<sink> node.dont-fallback=true }` in PipeWire's SPA-JSON.
+fn stream_props(sink: &str) -> String {
+    format!("{{ target.object=\"{sink}\" node.dont-fallback=true }}")
 }
 
 impl Drop for Routing {
     fn drop(&mut self) {
-        let restored = match &self.previous {
-            Some(value) => set_default_sink(value),
-            None => delete_default_sink(),
-        };
-        if let Err(err) = restored {
-            report_cleanup(&format!("restoring the default sink: {err:#}"));
-        }
+        // the pulse server first: its streams end before their sink goes
+        drop(self.pulse.take());
         if let Some(id) = &self.sink
             && !pw_command(&["destroy", id]).is_ok_and(|o| o.status.success())
         {
             report_cleanup(&format!("destroying null sink {} (object {id})", self.name));
         }
+    }
+}
+
+/// How long pipewire-pulse may take to make its socket.
+const PULSE_READY: Duration = Duration::from_secs(5);
+
+/// A pipewire-pulse child of the run's own; killed when dropped. Its config home is the run's: a `pipewire-pulse.conf.d` fragment sets `stream.properties` to the sink's target, so every
+/// pulse stream it creates targets the run's sink (and the user's own `~/.config/pipewire` is not read by it).
+struct PulseServer {
+    child: Child,
+    socket: PathBuf,
+}
+
+impl PulseServer {
+    fn start(dir: &Path, sink: &str) -> Result<Self> {
+        use std::os::unix::fs::PermissionsExt;
+        let runtime = dir.join("runtime");
+        let conf_d = dir.join("config/pipewire/pipewire-pulse.conf.d");
+        fs::create_dir_all(&runtime)?;
+        fs::create_dir_all(&conf_d)?;
+        // libpulse refuses a runtime dir others can reach
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))?;
+        fs::write(
+            conf_d.join("50-atl-target.conf"),
+            format!("stream.properties = {}\n", stream_props(sink)),
+        )?;
+        let socket = runtime.join("native");
+        let _ = fs::remove_file(&socket);
+        let log_path = dir.join("pipewire-pulse.log");
+        let log = fs::File::create(&log_path)?;
+        let child = Command::new("pipewire-pulse")
+            .env("PULSE_RUNTIME_PATH", &runtime)
+            .env("XDG_CONFIG_HOME", dir.join("config"))
+            .stdin(Stdio::null())
+            .stdout(log.try_clone()?)
+            .stderr(log)
+            .spawn()
+            .context("starting pipewire-pulse")?;
+        let mut server = PulseServer { child, socket };
+        let deadline = Instant::now() + PULSE_READY;
+        while !server.socket.exists() {
+            if let Some(s) = server.child.try_wait()? {
+                bail!(
+                    "pipewire-pulse exited ({s}); its log: {}",
+                    log_path.display()
+                );
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "pipewire-pulse made no socket within {PULSE_READY:?}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        Ok(server)
+    }
+}
+
+impl Drop for PulseServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -635,59 +738,6 @@ fn node_id(name: &str) -> Result<Option<String>> {
         }
     }
     Ok(None)
-}
-
-fn sink_json(name: &str) -> String {
-    format!("{{\"name\":\"{name}\"}}")
-}
-
-/// The default sink's current metadata value (the JSON `pw-metadata` prints), if the key is set.
-fn default_sink() -> Result<Option<String>> {
-    let out = Command::new("pw-metadata")
-        .args(["-n", "default"])
-        .output()
-        .context("reading the default metadata")?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let key = format!("key:'{DEFAULT_SINK_KEY}'");
-    let value = text
-        .lines()
-        .rev()
-        .find(|l| l.contains(&key))
-        .and_then(|l| l.split_once("value:'"))
-        .and_then(|(_, rest)| rest.split_once("' type:"))
-        .map(|(value, _)| value.to_owned());
-    Ok(value)
-}
-
-fn set_default_sink(json: &str) -> Result<()> {
-    let status = Command::new("pw-metadata")
-        .args([
-            "-n",
-            "default",
-            "0",
-            DEFAULT_SINK_KEY,
-            json,
-            "Spa:String:JSON",
-        ])
-        .status()
-        .context("setting the default sink")?;
-    ensure!(
-        status.success(),
-        "pw-metadata could not set the default sink"
-    );
-    Ok(())
-}
-
-fn delete_default_sink() -> Result<()> {
-    let status = Command::new("pw-metadata")
-        .args(["-n", "default", "-d", "0", DEFAULT_SINK_KEY])
-        .status()
-        .context("clearing the default sink")?;
-    ensure!(
-        status.success(),
-        "pw-metadata could not clear the default sink"
-    );
-    Ok(())
 }
 
 /// A recording: interleaved samples and their format.
