@@ -1,0 +1,145 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Wed, 18 Nov 2026 23:31:15 +0800
+Subject: [PATCH] Re-assert NEON after .arch armv7-a on arm
+
+A .arch directive resets the assembler feature set to the architecture
+defaults; in LLVM 19 MC that keeps VFP but drops NEON, so the NEON
+string routines fail to assemble after an earlier .fpu neon.
+
+Upstream-Status: Pending [unchanged on bionic main; LLVM main parseDirectiveArch still resets features; not checked against the AOSP prebuilt clang]
+Patch-Reason: the converter builds bionic with the distro clang-19, whose assembler rejects vld1/vadd after .arch armv7-a with no command-line flag surviving the reset (probed -mthumb, -mcpu=cortex-a7, llvm-mc-19)
+---
+SPDX-License-Identifier: BSD-2-Clause AND BSD-3-Clause
+ libc/arch-arm/cortex-a15/bionic/memcpy.S      | 1 +
+ libc/arch-arm/cortex-a15/bionic/memset.S      | 1 +
+ libc/arch-arm/cortex-a53/bionic/memcpy.S      | 1 +
+ libc/arch-arm/cortex-a55/bionic/memcpy.S      | 1 +
+ libc/arch-arm/cortex-a7/bionic/memcpy.S       | 1 +
+ libc/arch-arm/cortex-a7/bionic/memset.S       | 1 +
+ libc/arch-arm/cortex-a9/bionic/__strcat_chk.S | 1 +
+ libc/arch-arm/cortex-a9/bionic/__strcpy_chk.S | 1 +
+ libc/arch-arm/cortex-a9/bionic/memcpy_base.S  | 1 +
+ libc/arch-arm/krait/bionic/memcpy_base.S      | 1 +
+ 10 files changed, 10 insertions(+)
+
+diff --git a/libc/arch-arm/cortex-a15/bionic/memcpy.S b/libc/arch-arm/cortex-a15/bionic/memcpy.S
+index a9dfaff0f2e2fbdb4f2b214ccc2dd7a45438b0d3..bf53c0e358e24dcf192a60429f97308b183a59c4 100644
+--- a/libc/arch-arm/cortex-a15/bionic/memcpy.S
++++ b/libc/arch-arm/cortex-a15/bionic/memcpy.S
+@@ -62,6 +62,7 @@
+         // To avoid warning about deprecated instructions, add an explicit
+         // arch. The code generated is exactly the same.
+         .arch armv7-a
++        .fpu    neon
+ 
+ // Prototype: void *memcpy (void *dst, const void *src, size_t count).
+ ENTRY(__memcpy_a15)
+diff --git a/libc/arch-arm/cortex-a15/bionic/memset.S b/libc/arch-arm/cortex-a15/bionic/memset.S
+index ead881e496f04427ccf69c493221f38de8809831..530cfcc7a06dfac3959bd201232e05e7ea50250b 100644
+--- a/libc/arch-arm/cortex-a15/bionic/memset.S
++++ b/libc/arch-arm/cortex-a15/bionic/memset.S
+@@ -40,6 +40,7 @@
+         // To avoid warning about deprecated instructions, add an explicit
+         // arch. The code generated is exactly the same.
+         .arch armv7-a
++        .fpu        neon
+ 
+ ENTRY(__memset_chk_a15)
+         cmp         r2, r3
+diff --git a/libc/arch-arm/cortex-a53/bionic/memcpy.S b/libc/arch-arm/cortex-a53/bionic/memcpy.S
+index ea748bd00644c9fad16498226e6f39433b84ed11..e07b60868f09d889cd1abaaae41ed9faf9b3aa55 100644
+--- a/libc/arch-arm/cortex-a53/bionic/memcpy.S
++++ b/libc/arch-arm/cortex-a53/bionic/memcpy.S
+@@ -62,6 +62,7 @@
+         // To avoid warning about deprecated instructions, add an explicit
+         // arch. The code generated is exactly the same.
+         .arch armv7-a
++        .fpu    neon
+ 
+ // Prototype: void *memcpy (void *dst, const void *src, size_t count).
+ ENTRY(__memcpy_a53)
+diff --git a/libc/arch-arm/cortex-a55/bionic/memcpy.S b/libc/arch-arm/cortex-a55/bionic/memcpy.S
+index ac9675f7b1f411b93595576b82b524663c818dec..0e71b5465cf94a4173b7924b227474c50454199e 100644
+--- a/libc/arch-arm/cortex-a55/bionic/memcpy.S
++++ b/libc/arch-arm/cortex-a55/bionic/memcpy.S
+@@ -64,6 +64,7 @@
+         // To avoid warning about deprecated instructions, add an explicit
+         // arch. The code generated is exactly the same.
+         .arch armv7-a
++        .fpu    neon
+ 
+ ENTRY(__memcpy_a55)
+         pld     [r1, #64]
+diff --git a/libc/arch-arm/cortex-a7/bionic/memcpy.S b/libc/arch-arm/cortex-a7/bionic/memcpy.S
+index 2f32d2e7e03a7f261ee04bbe565fa0def2b2b889..87075a66f7356a3808e20ffe1108d9a98c6f08c4 100644
+--- a/libc/arch-arm/cortex-a7/bionic/memcpy.S
++++ b/libc/arch-arm/cortex-a7/bionic/memcpy.S
+@@ -62,6 +62,7 @@
+         // To avoid warning about deprecated instructions, add an explicit
+         // arch. The code generated is exactly the same.
+         .arch armv7-a
++        .fpu    neon
+ 
+ // Prototype: void *memcpy (void *dst, const void *src, size_t count).
+ ENTRY(__memcpy_a7)
+diff --git a/libc/arch-arm/cortex-a7/bionic/memset.S b/libc/arch-arm/cortex-a7/bionic/memset.S
+index d7d3b34e0d199cf1d7447707aa4192319f68bcae..256630a3f4efe54ba9c0e97af89d7fa126c41542 100644
+--- a/libc/arch-arm/cortex-a7/bionic/memset.S
++++ b/libc/arch-arm/cortex-a7/bionic/memset.S
+@@ -40,6 +40,7 @@
+         // To avoid warning about deprecated instructions, add an explicit
+         // arch. The code generated is exactly the same.
+         .arch armv7-a
++        .fpu        neon
+ 
+ ENTRY(__memset_chk_a7)
+         cmp         r2, r3
+diff --git a/libc/arch-arm/cortex-a9/bionic/__strcat_chk.S b/libc/arch-arm/cortex-a9/bionic/__strcat_chk.S
+index d20283e989f304ca221ccb25c7443e533dd59941..611c61e2a2b3a9d9f7f1cfb441e43e3933656c8f 100644
+--- a/libc/arch-arm/cortex-a9/bionic/__strcat_chk.S
++++ b/libc/arch-arm/cortex-a9/bionic/__strcat_chk.S
+@@ -36,6 +36,7 @@
+     // To avoid warning about deprecated instructions, add an explicit
+     // arch. The code generated is exactly the same.
+     .arch armv7-a
++    .fpu    neon
+ 
+ // Get the length of src string, then get the source of the dst string.
+ // Check that the two lengths together don't exceed the threshold, then
+diff --git a/libc/arch-arm/cortex-a9/bionic/__strcpy_chk.S b/libc/arch-arm/cortex-a9/bionic/__strcpy_chk.S
+index 1f0a774b88bc1a6cb5c4541925531c475bb681bb..56d7ee5267ee810be7e6bc9a64dfdf8708550568 100644
+--- a/libc/arch-arm/cortex-a9/bionic/__strcpy_chk.S
++++ b/libc/arch-arm/cortex-a9/bionic/__strcpy_chk.S
+@@ -36,6 +36,7 @@
+     // To avoid warning about deprecated instructions, add an explicit
+     // arch. The code generated is exactly the same.
+     .arch armv7-a
++    .fpu    neon
+ 
+ // Get the length of the source string first, then do a memcpy of the data
+ // instead of a strcpy.
+diff --git a/libc/arch-arm/cortex-a9/bionic/memcpy_base.S b/libc/arch-arm/cortex-a9/bionic/memcpy_base.S
+index 39da7ffcfe88c8d11f6f320a95f781ab88bc6dbd..a95669b4a9576b43b6fc323261721eb5082fbdc0 100644
+--- a/libc/arch-arm/cortex-a9/bionic/memcpy_base.S
++++ b/libc/arch-arm/cortex-a9/bionic/memcpy_base.S
+@@ -37,6 +37,7 @@
+         // To avoid warning about deprecated instructions, add an explicit
+         // arch. The code generated is exactly the same.
+         .arch armv7-a
++        .fpu    neon
+ 
+ ENTRY_PRIVATE(MEMCPY_BASE)
+         .cfi_def_cfa_offset 8
+diff --git a/libc/arch-arm/krait/bionic/memcpy_base.S b/libc/arch-arm/krait/bionic/memcpy_base.S
+index 5b4b70d5c903505500045073843242f04d1efa69..a0392d361be42234b3009abd8c209d0ac27dae9d 100644
+--- a/libc/arch-arm/krait/bionic/memcpy_base.S
++++ b/libc/arch-arm/krait/bionic/memcpy_base.S
+@@ -47,6 +47,7 @@
+ 	// To avoid warning about deprecated instructions, add an explicit
+ 	// arch. The code generated is exactly the same.
+ 	.arch armv7-a
++	.fpu    neon
+ 
+ .L_memcpy_base:
+ 	cmp	r2, #4
