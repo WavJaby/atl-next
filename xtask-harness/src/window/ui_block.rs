@@ -77,8 +77,8 @@ fn posts_check(app: &str, refresh_hz: f32) -> Result<String, String> {
         number(line, "block_ms")?,
     );
     let bound = bound_ms(app)?;
-    let want =
-        ((block.saturating_sub(bound) as f64 / period_ms(refresh_hz)).floor() as u64).saturating_sub(SLACK);
+    let want = ((block.saturating_sub(bound) as f64 / period_ms(refresh_hz)).floor() as u64)
+        .saturating_sub(SLACK);
     let summary = format!(
         "{during} frames posted during the {block} ms block (want >= {want}: bound {bound} ms), longest gap {gap} ms"
     );

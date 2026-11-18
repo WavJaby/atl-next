@@ -18,8 +18,8 @@ use atl_services_types::input_devices;
 
 use super::capture;
 use super::{
-    ACK_WAIT, BTN_LEFT, CONTENT_ORIGIN_LINE, Liveness, POLL, Rate, Sub, await_event,
-    cadence_check, content_origin, wait_for_line,
+    ACK_WAIT, BTN_LEFT, CONTENT_ORIGIN_LINE, Liveness, POLL, Rate, Sub, await_event, cadence_check,
+    content_origin, wait_for_line,
 };
 use crate::composer::word;
 use crate::nested_wayland::{GATE_OUTPUT, Output};

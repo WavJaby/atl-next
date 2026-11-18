@@ -2206,8 +2206,7 @@ impl Atld {
     fn stop(&mut self, run: &Run) -> Result<std::process::ExitStatus> {
         match self {
             Atld::Child(c) => run.stop(c),
-            Atld::Pid(p) => {
-                let pid = *p;
+            Atld::Pid(_) => {
                 if let Some(s) = self.try_wait()? {
                     return Ok(s);
                 }
@@ -2283,7 +2282,7 @@ struct LiveOut {
     captured: Arc<Mutex<capture::Seen>>,
     app_ids: Arc<Mutex<AppIdsSeen>>,
     titles: Arc<Mutex<Vec<String>>>,
-    splash_shot: Option<Result<capture::Shot, String>>,
+    splash_shot: Option<Result<splash::Shot, String>>,
     /// atld ended before the window closed (by itself, or stopped with the app's end).
     ended: Option<std::process::ExitStatus>,
     /// atld ended because the gate stopped it at the window's end.
@@ -2403,13 +2402,7 @@ fn live(l: LiveIn, atld: &mut Atld, sampler: Sampler) -> Result<LiveOut> {
     loop {
         let app = read(&app_log);
         if matches!(args.stage, Stage::Splash) {
-            splash::take(
-                &mut splash_shot,
-                &app,
-                &app_log,
-                nested,
-                &splash_png,
-            );
+            splash::take(&mut splash_shot, &app, &app_log, nested, &splash_png);
         }
         // the window runs from the marker's own stamp, not from when this loop saw the marker
         if marker_stamp(&app, marker).is_some_and(|t| now_ms() >= t + window_ms) {
@@ -2875,7 +2868,12 @@ pub fn agent(a: &AgentArgs) -> Result<ExitCode> {
     )?;
     let record = LiveRecord {
         liveness: out.liveness,
-        captured: std::mem::take(&mut *out.captured.lock().map_err(|_| anyhow::anyhow!("pictures poisoned"))?),
+        captured: std::mem::take(
+            &mut *out
+                .captured
+                .lock()
+                .map_err(|_| anyhow::anyhow!("pictures poisoned"))?,
+        ),
         ended: out.ended.is_some(),
         stopped: out.stopped.is_some(),
         pressure: out.pressure,
@@ -2933,7 +2931,9 @@ pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
                 "remote test window --stage {stage_name}: the target has {why}; the window gate runs only on a session display"
             ),
             Display::Headless => {
-                anyhow::bail!("remote test window --stage {stage_name}: no display on the target: {why}")
+                anyhow::bail!(
+                    "remote test window --stage {stage_name}: no display on the target: {why}"
+                )
             }
         }
     } else {
@@ -3017,9 +3017,8 @@ pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let log = dir.join("window.log");
     std::fs::write(&log, "").with_context(|| format!("writing {}", log.display()))?;
-    let stage_word = |s: Stage| {
-        clap::ValueEnum::to_possible_value(&s).map(|v| v.get_name().to_owned())
-    };
+    let stage_word =
+        |s: Stage| clap::ValueEnum::to_possible_value(&s).map(|v| v.get_name().to_owned());
     let agent = Agent {
         program: harness,
         args: vec![
@@ -3039,9 +3038,11 @@ pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
         ],
         proxy: ui,
     };
-    let rt = rt
-        .with_display(display.to_arg())
-        .with_site(target.run_site(REMOTE_LIMIT, log.clone(), kind).with_agent(agent));
+    let rt = rt.with_display(display.to_arg()).with_site(
+        target
+            .run_site(REMOTE_LIMIT, log.clone(), kind)
+            .with_agent(agent),
+    );
     for f in [LIVE_JSON, AGENT_RC, AGENT_LOG] {
         let _ = std::fs::remove_file(run.scratch.join(f));
     }
@@ -3065,7 +3066,8 @@ pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
     }
     println!("remote test window: transcript {}", log.display());
     rt.check_end(end, &run)?;
-    let read_trim = |name: &str| std::fs::read_to_string(run.scratch.join(name)).map(|t| t.trim().to_owned());
+    let read_trim =
+        |name: &str| std::fs::read_to_string(run.scratch.join(name)).map(|t| t.trim().to_owned());
     let agent_rc = read_trim(AGENT_RC).map_err(|_| {
         anyhow::anyhow!(
             "lost: no {AGENT_RC} came back (the transfer ended {end}); rerun, see {}",
@@ -3660,7 +3662,10 @@ mod tests {
         // a session display: a missed vsync and a slow mean are host-stated (VRR stretches intervals); too few callbacks and an interval under P - 3 ms still fail
         let stated = session(&missed, 60.0).expect("host-stated on a session display");
         assert!(stated.contains("host-stated mean="), "{stated}");
-        assert!(session(&fast, 60.0).is_ok(), "20 ms intervals, slower than a 60 Hz max");
+        assert!(
+            session(&fast, 60.0).is_ok(),
+            "20 ms intervals, slower than a 60 Hz max"
+        );
         assert!(session(&short, 60.0).is_err());
         assert!(session(&rephased, 60.0).is_err());
         assert!(frame_time("1000.000 1 2 I AtlWindow: onDraw reached").is_none());

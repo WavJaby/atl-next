@@ -356,8 +356,8 @@ pub struct RemoteRun {
     log: PathBuf,
     /// Where the run's `WAYLAND_DISPLAY` comes from, if anywhere.
     display: Display,
-    /// The window gate's live half, run on the target beside atld ([`Agent`]).
-    agent: Option<Agent>,
+    /// The window gate's live half, run on the target beside atld ([`Agent`]); boxed: most runs have none.
+    agent: Option<Box<Agent>>,
 }
 
 /// The window gate's live half on the target (window.rs `agent`, the harness's hidden `window-live`): started before atld, it proxies atld's window to the target's compositor, drives the stage and stops
@@ -379,7 +379,7 @@ impl Site {
     pub fn with_agent(self, agent: Agent) -> Site {
         match self {
             Site::Remote(mut r) => {
-                r.agent = Some(agent);
+                r.agent = Some(Box::new(agent));
                 Site::Remote(r)
             }
             host => host,
@@ -436,7 +436,10 @@ if [ -n "$WS_PREV" ]; then
 fi
 "#;
     // `hyprctl activeworkspace` / `workspaces` text: `workspace ID <n> (<name>) on monitor ...`
-    SCRIPT.replace("@ID@", r"sed -n 's/^workspace ID \(-\{0,1\}[0-9]*\) .*/\1/p'")
+    SCRIPT.replace(
+        "@ID@",
+        r"sed -n 's/^workspace ID \(-\{0,1\}[0-9]*\) .*/\1/p'",
+    )
 }
 
 /// Where a remote run's Wayland display comes from: the capability the target has, probed before the run ([`Target::probe_display`]), never named by host.
@@ -828,9 +831,7 @@ impl Plan {
             extra.push(labwc_log);
         }
         if self.agent.is_some() {
-            extra.extend(
-                [LIVE_JSON, AGENT_RC, AGENT_LOG].map(|f| format!("{}/{f}", self.scratch)),
-            );
+            extra.extend([LIVE_JSON, AGENT_RC, AGENT_LOG].map(|f| format!("{}/{f}", self.scratch)));
         }
         if !extra.is_empty() {
             s.pop();
@@ -2744,7 +2745,8 @@ mod tests {
         let wait = at("while [ ! -S \"$GATE_SOCK\" ]");
         let atld = at(" WAYLAND_DISPLAY=\"$GATE_SOCK\" timeout -k 10 240 ");
         let pid = at("printf '%s\\n' \"$pid\" > \"$BASE/out/window/scratch/atld.pid\"\n");
-        let agent_rc = at("wait \"$AG\"\nprintf '%s\\n' \"$?\" > \"$BASE/out/window/scratch/agent.rc\"\n");
+        let agent_rc =
+            at("wait \"$AG\"\nprintf '%s\\n' \"$?\" > \"$BASE/out/window/scratch/agent.rc\"\n");
         assert!(
             session < trap
                 && trap < switch
@@ -2757,7 +2759,9 @@ mod tests {
         );
         assert!(!s.contains("WAYLAND_DISPLAY=\"$WL\""), "{s}");
         assert!(
-            s.ends_with(" 'window/scratch/live.json' 'window/scratch/agent.rc' 'window/scratch/agent.log'\n"),
+            s.ends_with(
+                " 'window/scratch/live.json' 'window/scratch/agent.rc' 'window/scratch/agent.log'\n"
+            ),
             "{s}"
         );
         let headless = Plan {
