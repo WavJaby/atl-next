@@ -76,6 +76,10 @@ pub(super) fn run(root: &Path, b: &Build, no_breaks: bool) -> Result<bool> {
     let fixture = fixture(root, b, &dir)?;
     let sigchain = sigchain(root, &dir)?;
     let mut fails = Vec::new();
+    // the armv7 boot executables assemble and link (atl-qemu-boot's Arm-mode entries); booting them is the engine `.so`'s gate, which waits for ABI 4.0 lanes (P3)
+    if let Err(e) = boot_exes(root, b, &dir) {
+        fails.push(Failure::step("boot-exe", format!("{e:#}")));
+    }
     for spec in RUNS.iter().filter(|r| !no_breaks || r.red.is_none()) {
         let r = match &spec.edit {
             Some(e) => edited(b, &dir, spec.name, e)
@@ -89,16 +93,31 @@ pub(super) fn run(root: &Path, b: &Build, no_breaks: bool) -> Result<bool> {
     let verdict = Verdict {
         cmd: "qemu-spike",
         total: Some((
-            RUNS.iter()
+            1 + RUNS
+                .iter()
                 .filter(|r| !no_breaks || r.red.is_none())
                 .count(),
-            "arm runs",
+            "arm checks",
         )),
         skipped: Vec::new(),
         failures: fails,
     };
     println!("{}", verdict.line());
     Ok(verdict.failures.is_empty())
+}
+
+/// Builds the boot and cpuinfo executables for the arm guest and checks each has an ELF entry (llvm-readelf).
+fn boot_exes(root: &Path, b: &Build, dir: &Path) -> Result<()> {
+    let out = dir.join("boot");
+    std::fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
+    for exe in [
+        crate::qemu::boot_exe(root, b, &out)?,
+        crate::qemu::cpuinfo_exe(root, b, &out)?,
+    ] {
+        let entry = super::llvm_entry(&exe)?;
+        ensure!(entry != 0, "{}: e_entry 0", exe.display());
+    }
+    Ok(())
 }
 
 /// fixture_arm.c as a static bionic armv7 executable (NDK clang of the arm row).
@@ -142,8 +161,15 @@ fn harness(
     fixture: &Path,
     sigchain: &Path,
 ) -> Result<()> {
-    // a PID namespace of its own: LP32 bionic aborts at startup when its thread id is above 65535 ("32-bit pthread_mutex_t only supports pids <= 65535", measured with pid 133253), and a desktop's pid_max is far higher; an app process gets the same from its sandbox (atl-broker runs bwrap --unshare-pid)
-    // (cargo's runner for the test binary: unit_use appends cargo's own arguments, so cargo must stay the command)
+    // a PID namespace of its own (qemu_gate::SMALL_PIDS), as cargo's runner for the test binary: unit_use appends cargo's own arguments, so cargo must stay the command
+    let runner = format!(
+        "target.'cfg(all())'.runner = [{}]",
+        crate::qemu_gate::SMALL_PIDS
+            .iter()
+            .map(|a| format!("{a:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     let mut cmd = Command::new("timeout");
     cmd.args(["-s", "KILL"])
         .arg(RUN_TIMEOUT_SECS.to_string())
@@ -151,7 +177,7 @@ fn harness(
         .args([
             "test",
             "--config",
-            r#"target.'cfg(all())'.runner = ["bwrap", "--dev-bind", "/", "/", "--unshare-pid", "--die-with-parent", "--"]"#,
+            &runner,
             "--locked",
             "-p",
             PACKAGE,
