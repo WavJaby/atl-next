@@ -598,6 +598,55 @@ public class Main extends Activity {
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         Log.i("AtlTest", "permission-request request=" + requestCode + " names=" + java.util.Arrays.toString(permissions)
                 + " results=" + java.util.Arrays.toString(grantResults) + " self=" + checkSelfPermission(POST_NOTIFICATIONS));
+        noSourceStarts();
+    }
+
+    /**
+     * Starts with no source activity, as ad SDKs make them (Temple Run's rewarded ad, tr-ad-start-refused): NoSourceChild logs "<row>: started calling=null" for each; a start that fails logs its
+     * outcome under the same row instead. start-app-context: the application Context's startActivity with NEW_TASK (ContextImpl passes resultTo null). start-stale-result-to: a raw
+     * IActivityTaskManager.startActivity whose resultTo is a binder no activity has, with request code 5 and no NEW_TASK, parcelled as resultToSecurity does.
+     */
+    private void noSourceStarts() {
+        String row = "start-app-context";
+        try {
+            getApplicationContext().startActivity(new Intent(this, NoSourceChild.class)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK).putExtra(NoSourceChild.EXTRA, row));
+        } catch (RuntimeException e) {
+            Log.i("AtlTest", row + ": threw " + e.getClass().getName());
+        }
+        row = "start-stale-result-to";
+        android.os.Parcel data = android.os.Parcel.obtain();
+        android.os.Parcel reply = android.os.Parcel.obtain();
+        try {
+            android.os.IBinder atm = (android.os.IBinder) Class.forName("android.os.ServiceManager")
+                    .getMethod("getService", String.class).invoke(null, "activity_task");
+            Object thread = Class.forName("android.app.ActivityThread").getMethod("currentActivityThread").invoke(null);
+            Object appThread = thread.getClass().getMethod("getApplicationThread").invoke(thread);
+            data.writeInterfaceToken(ATM_DESCRIPTOR);
+            data.writeStrongBinder(((android.os.IInterface) appThread).asBinder());
+            data.writeString(getPackageName());
+            data.writeString(null);
+            data.writeInt(1);
+            new Intent(this, NoSourceChild.class).putExtra(NoSourceChild.EXTRA, row).writeToParcel(data, 0);
+            data.writeString(null);
+            data.writeStrongBinder(new android.os.Binder());
+            data.writeString(null);
+            data.writeInt(5);
+            data.writeInt(0);
+            data.writeInt(0);
+            data.writeInt(0);
+            atm.transact(START_ACTIVITY, data, reply, 0);
+            reply.readException();
+            int code = reply.readInt();
+            if (code != 0) {
+                Log.i("AtlTest", row + ": returned " + code);
+            }
+        } catch (Exception e) {
+            Log.i("AtlTest", row + ": failed " + e);
+        } finally {
+            data.recycle();
+            reply.recycle();
+        }
     }
 
     /**

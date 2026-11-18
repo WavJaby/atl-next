@@ -535,6 +535,22 @@ const WEBVIEW_CLASSLOADER: Line = Line {
     want: Want::Exact("provider=true glue=false"),
     timing: Timing::Create,
 };
+/// Main.noSourceStarts' rows (after the permission callback): starts with no source activity, the call shape of Temple Run's rewarded ad. AOSP: a null resultTo, or one naming no record, leaves
+/// sourceRecord and resultRecord null (ActivityStarter.executeRequest, ActivityStarter.java:1104-1120; no error), NEW_TASK is forced (computeLaunchingTaskFlags :2885-2891), findTask finds the
+/// fixture's Task (the package affinity) and the standard NoSourceChild is added on top (complyActivityFlags :2595-2602, recycleTask :2398-2402: START_SUCCESS). So NoSourceChild is created,
+/// and with no result record getCallingActivity is null even for the raw call's request code 5.
+const START_APP_CONTEXT: Line = Line {
+    row: "start-app-context",
+    prefix: "AtlTest: start-app-context: ",
+    want: Want::Exact("started calling=null"),
+    timing: Timing::Async,
+};
+const START_STALE_RESULT_TO: Line = Line {
+    row: "start-stale-result-to",
+    prefix: "AtlTest: start-stale-result-to: ",
+    want: Want::Exact("started calling=null"),
+    timing: Timing::Async,
+};
 
 /// When the fixture logs a judged line. `Async`: from a binder or WebView callback after onCreate; the watch waits for it, up to RESULT_WAIT once WINDOW_MS has passed.
 /// `Create`: in onCreate, or on a thread onCreate starts before any callback, so WINDOW_MS covers it.
@@ -577,7 +593,9 @@ struct Line {
 /// timezone: Main.onCreate's TimeZone.getDefault(), from persist.sys.timezone (RuntimeInit.java:252 reads it; atld sets it to the host zone). None = the run host's zone ([`HostFacts::zone_want`]: the target's on a remote run, never the build host's).
 /// display: Main.onCreate's Display.getAppVsyncOffsetNanos and getPresentationDeadlineNanos less the period of getRefreshRate: SurfaceFlinger.cpp getDynamicDisplayInfoInternal's appVsyncOffset
 /// and `period - sfVsyncOffset + 1 ms`, with both offsets 0 (the compositor sends app vsync and latches at the tick itself), so 0 and 1 000 000 at any refresh rate.
-const LOG_LINES: [Line; 20] = [
+const LOG_LINES: [Line; 22] = [
+    START_APP_CONTEXT,
+    START_STALE_RESULT_TO,
     Line {
         row: "display",
         prefix: "AtlTest: display: ",

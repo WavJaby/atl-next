@@ -29,6 +29,8 @@
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity>
+        <!-- Main.noSourceStarts' child: started with no source activity (app.rs LOG_LINES start-app-context, start-stale-result-to) -->
+        <activity android:name=".NoSourceChild" android:exported="false" />
         <!-- Main.jobs' and Main.jobRun's job service (app.rs SERVICE_LINES jobscheduler, ASYNC_LINES jobrun) -->
         <service android:name=".AtlJob" android:permission="android.permission.BIND_JOB_SERVICE" android:exported="false" />
         <!-- Main.bound's bound service (app.rs ASYNC_LINES bindservice, bound, unbind); its filter is what Main.queryServices resolves (app.rs SERVICE_LINES queryservices) -->
