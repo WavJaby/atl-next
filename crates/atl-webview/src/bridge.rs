@@ -152,9 +152,55 @@ pub fn log_origin(url: &str) -> String {
     format!("{scheme}://{host}")
 }
 
+/// The script of a `javascript:` URL (scheme case-insensitive, RFC 3986 3.1), percent-decoded as the URL spec's javascript: URL evaluation does; None for any other URL. Bytes that are not
+/// UTF-8 after decoding are replaced (U+FFFD). Chromium runs such a URL in the current document (no navigation, the page's load goes on); WebKit's load_uri cancels the load in progress.
+pub fn javascript_source(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once(':')?;
+    if !scheme.eq_ignore_ascii_case("javascript") {
+        return None;
+    }
+    let b = rest.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        match (
+            b[i],
+            b.get(i + 1).copied().and_then(hex),
+            b.get(i + 2).copied().and_then(hex),
+        ) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (c, ..) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Some(String::from_utf8_lossy(&out).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// URL spec: a javascript: URL's script is its percent-decoded remainder; a `%` not followed by two hex digits stays.
+    #[test]
+    fn javascript_source_decodes_the_script() {
+        assert_eq!(
+            javascript_source("javascript:a(%22x%20y%22)").as_deref(),
+            Some("a(\"x y\")")
+        );
+        assert_eq!(javascript_source("JavaScript:1%2").as_deref(), Some("1%2"));
+        assert_eq!(
+            javascript_source("javascript:%E4%B8%AD").as_deref(),
+            Some("中")
+        );
+        assert_eq!(javascript_source("https://a.example/javascript:x"), None);
+        assert_eq!(javascript_source("about:blank"), None);
+    }
 
     /// Spec: RFC 3986 section 3 (scheme ":" ["//" [userinfo "@"] host [":" port]] path ["?" query] ["#" fragment]).
     #[test]

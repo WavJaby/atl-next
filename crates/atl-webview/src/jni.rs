@@ -1499,7 +1499,12 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_loadUrl, 
     match string(env, url) {
         Some(u) => {
             tracing::info!("webview[{}]: loadUrl {}", n.shared.id.get(), bridge::log_origin(&u));
-            n.view.load_uri(&u)
+            // a javascript: URL runs in the current document and leaves the page's load going (Chromium); an SDK injecting from onPageStarted otherwise aborts the page it injects into
+            // (AB2's settings WebView, `load failed ... Cancelled`). A string result replacing the document (Chromium, targetSdk >= K) is not modelled.
+            match bridge::javascript_source(&u) {
+                Some(script) => n.view.evaluate_javascript(&script, Box::new(|_| {})),
+                None => n.view.load_uri(&u),
+            }
         }
         None => tracing::warn!("webview: loadUrl(null) ignored"),
     }
