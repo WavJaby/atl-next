@@ -737,10 +737,7 @@ impl Compositor {
     /// Whether applying `t` now would give a backpressured layer a second buffer this tick.
     fn blocked(&self, t: &TransactionState) -> bool {
         t.composer_states.iter().any(|s| {
-            s.what & what::E_BUFFER_CHANGED != 0
-                && s.buffer_data
-                    .as_ref()
-                    .is_some_and(|b| b.buffer.is_some() || b.cached_buffer_id != 0)
+            s.sets_buffer()
                 && s.surface
                     .key()
                     .and_then(|k| self.layers.get(&k))

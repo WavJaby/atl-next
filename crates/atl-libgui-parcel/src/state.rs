@@ -1253,6 +1253,15 @@ pub mod layer_flags {
 }
 
 impl LayerState {
+    /// Sets a buffer: `eBufferChanged` with a buffer or a cached buffer id (a producer's queueBuffer, not a geometry-only change).
+    pub fn sets_buffer(&self) -> bool {
+        self.what & what::E_BUFFER_CHANGED != 0
+            && self
+                .buffer_data
+                .as_ref()
+                .is_some_and(|b| b.buffer.is_some() || b.cached_buffer_id != 0)
+    }
+
     /// Every file descriptor this state refers to: the buffer's (a gralloc handle's dma-buf and metadata page) and its acquire fence, the sideband stream's, the buffer release channel's, the LUT file's.
     /// The front-end that converted the parcel owns them; this is how it learns which are still named once the core is done with the state.
     pub fn fds(&self) -> Vec<FdObject> {

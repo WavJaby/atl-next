@@ -146,7 +146,7 @@ enum Latching {
     /// Untaken, but a queued transaction came from the window's take thread: the tick latches as without backpressure (latest wins). Precondition of the hold: the producer cannot block the consumer
     /// (AOSP: SurfaceFlinger never runs on an app thread, so its present fence signals whatever the app does). Here the window takes on the app's UI thread (GLib on the UI Looper, plan Q6, owner
     /// 2026-11-05); an app drawing on that thread (software canvas: lockCanvas -> dequeueBuffer) blocks in BufferReleaseReader waiting for a release only the take it is blocking would cause -> held
-    /// until the bound (83-100 ms gaps). Re-check: same thread = a `setTransactionState` arrived on the tid [`Latch::taker`] names (in-process binder runs on the caller's thread). Retired by a display stage
+    /// until the bound (83-100 ms gaps). Re-check: same thread = a buffer-setting `setTransactionState` arrived on the tid [`Latch::taker`] names (in-process binder runs on the caller's thread). Retired by a display stage
     /// on its own thread (take + paint never on an app thread): then delete this variant, [`State::taker_queued`] and `backpressure_same_thread`.
     LatchSameThread,
 }
@@ -611,7 +611,10 @@ impl Composer {
             Ok(t) => {
                 st.stats.transactions += 1;
                 let taker = st.mailbox.as_deref().and_then(|m| m.latch().taker());
-                if taker == Some(rustix::thread::gettid().as_raw_nonzero().get()) {
+                // only a buffer can leave this thread waiting in dequeueBuffer; its geometry-only transactions (ViewRootImpl) block nothing
+                if taker == Some(rustix::thread::gettid().as_raw_nonzero().get())
+                    && t.composer_states.iter().any(|s| s.sets_buffer())
+                {
                     st.taker_queued = true;
                 }
                 st.compositor.queue_transaction(t);
