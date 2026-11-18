@@ -186,7 +186,10 @@ fn fp_result(ret: Class) -> Class {
 /// Break `ret_int`: an fp result is read from x0, as an integer's is.
 #[cfg(atl_nb_ret_int)]
 fn fp_result(_ret: Class) -> Class {
-    Class::Int
+    Class::Int {
+        bits: 64,
+        signed: true,
+    }
 }
 
 /// Refuses an up call whose arguments do not fit the lane image on one side (R-1): with fp-to-int on the host, a prototype's ninth fp argument is a guest stack word but a host register, so the counts differ. Named and counted, as [`refuse_down`].
@@ -281,11 +284,13 @@ const _: () = {
     assert!(size_of::<AtlLanes>() == p::LANES_SIZE);
 };
 
-/// How a calling convention fills and reads a call's lanes: the host's (bridgegen down.rs `HostAbi`, generated per host ISA) or the guest's ([`AAPCS64`]).
+/// How a calling convention fills and reads a call's lanes: the host's (bridgegen down.rs `HostAbi`, generated per host ISA) or the guest's ([`AAPCS64`], [`AAPCS32`]).
 #[derive(Clone, Copy, Debug)]
 pub(in crate::engine) struct HostRules {
     /// integer argument registers in the lanes' x bank
     int_lanes: usize,
+    /// fp argument registers in the lanes' v bank; 0 = core registers only (AAPCS32 base standard)
+    fp_lanes: usize,
     /// an fp argument past the fp registers takes a free integer register before the stack
     fp_to_int: bool,
     /// a narrow integer result is widened to 64 bits by its type
@@ -294,31 +299,49 @@ pub(in crate::engine) struct HostRules {
     nan_box_f32: bool,
     /// stack words of the lanes' window this side carries: the host shells copy [`HOST`]'s, the engine's target reads and writes the guest's
     stack_words: usize,
+    /// bits of one integer register and one stack word: 64, or 32 (a 64-bit value then takes an aligned pair of lanes, [`Assign::next`])
+    word_bits: u32,
 }
 
 /// The guest's rules, AAPCS64: eight integer registers, an fp argument past v7 goes to the stack, results and floats unshaped (a narrow value's upper bits are unspecified, s-registers are read low); eight stack words (the aarch64 engine's window, atl-qemu-engine engine/aarch64.rs `STACK_SLOTS`).
 const AAPCS64: HostRules = HostRules {
     int_lanes: 8,
+    fp_lanes: 8,
     fp_to_int: false,
     extend_int_ret: false,
     nan_box_f32: false,
     stack_words: 8,
+    word_bits: 64,
 };
 
-/// The build's host rules.
+/// The arm guest's rules, AAPCS32 base standard (Android armeabi-v7a is softfp: no `Tag_ABI_VFP_args`, the P2 guest ABI gate): r0..r3, no fp argument register, so a float or double travels in core registers or on the stack as an integer of its size would; 4-byte words; the arm engine's whole 16-word window (atl-qemu-engine engine/arm.rs `STACK_SLOTS`). Rule numbers: AAPCS32 2026Q3, Parameter Passing (base PCS). The arm bridge core places by it (phase4-32bit P3 slice 3); until then the unit tests and the lane assert below read it.
+const AAPCS32: HostRules = HostRules {
+    int_lanes: 4,
+    fp_lanes: 0,
+    fp_to_int: true,
+    extend_int_ret: false,
+    nan_box_f32: false,
+    stack_words: atl_engine_api::LANE_STACK,
+    word_bits: 32,
+};
+
+/// The build's host rules (64-bit hosts with eight fp argument registers: SysV xmm0..7, LP64D fa0..7).
 const HOST: HostRules = {
     use super::qemu::down_pool as p;
     HostRules {
         int_lanes: p::HOST_INT_LANES,
+        fp_lanes: 8,
         fp_to_int: p::HOST_FP_TO_INT,
         extend_int_ret: p::HOST_EXTEND_INT_RET,
         nan_box_f32: p::HOST_NAN_BOX_F32,
         stack_words: p::HOST_STACK_WORDS,
+        word_bits: 64,
     }
 };
 const _: () = assert!(HOST.int_lanes <= atl_engine_api::LANE_REGS);
 const _: () = assert!(HOST.stack_words <= atl_engine_api::LANE_STACK);
 const _: () = assert!(AAPCS64.stack_words <= atl_engine_api::LANE_STACK);
+const _: () = assert!(AAPCS32.int_lanes <= atl_engine_api::LANE_REGS);
 
 /// The result shorty type of a down call: the shorty's first byte; JNI_OnLoad / JNI_OnUnload (no shorty) answer a `jint` / nothing, so `I`.
 pub(in crate::engine) fn down_ret(shorty: Option<&[u8]>) -> u8 {
@@ -353,11 +376,11 @@ pub(in crate::engine) fn down_params(
     shorty: Option<&[u8]>,
 ) -> Result<Vec<Class>, String> {
     let (implicit, s): (&[Class], &[u8]) = match (kind, shorty) {
-        (Down::Vm, None) => return Ok(vec![Class::Int, Class::Int]),
-        (Down::Env, Some(s)) => (&[Class::Int, Class::Int], s),
+        (Down::Vm, None) => return Ok(vec![Class::Ptr, Class::Ptr]),
+        (Down::Env, Some(s)) => (&[Class::Ptr, Class::Ptr], s),
         (Down::Plain, Some(s)) => (&[], s),
         // an SL callback: the interface first, then the shorty's (sles.rs gives one per callback type)
-        (Down::Itf(_), Some(s)) => (&[Class::Int], s),
+        (Down::Itf(_), Some(s)) => (&[Class::Ptr], s),
         (kind, shorty) => {
             return Err(format!("down call of kind {kind:?} with shorty {shorty:?}"));
         }
@@ -370,37 +393,53 @@ pub(in crate::engine) fn down_params(
     }
     let mut params = implicit.to_vec();
     for &c in args {
-        params.push(match c {
-            b'F' => Class::F32,
-            b'D' => Class::F64,
-            b'Z' | b'B' | b'C' | b'S' | b'I' | b'J' | b'L' => Class::Int,
-            other => {
-                return Err(format!(
-                    "shorty parameter {:?}: no such type",
-                    other as char
-                ));
-            }
-        });
+        params.push(
+            shorty_class(c)
+                .ok_or_else(|| format!("shorty parameter {:?}: no such type", c as char))?,
+        );
     }
     // break `shorty_swap` (qemu-jni gate, checks m, x and R): the first shorty parameter's class is flipped, so the host's argument reads the other bank; the 15-integer R-1 call then fits in eight stack words and is not refused
     #[cfg(atl_nb_shorty_swap)]
     if let Some(p) = params.get_mut(2) {
-        *p = if *p == Class::Int {
+        *p = if p.is_int() {
             Class::F64
         } else {
-            Class::Int
+            Class::Int {
+                bits: 64,
+                signed: true,
+            }
         };
     }
     Ok(params)
 }
 
-/// Where one argument sits in an image: an integer register, an fp register, or a stack word (indices into the lanes' regs, fp, stack).
+/// The class of a JNI shorty parameter letter (jni.h: `jboolean` u8, `jbyte` i8, `jchar` u16, `jshort` i16, `jint` i32, `jlong` i64, a reference `L`), None for a letter jni has no parameter type for.
+fn shorty_class(c: u8) -> Option<Class> {
+    let int = |bits, signed| Some(Class::Int { bits, signed });
+    match c {
+        b'Z' => int(8, false),
+        b'B' => int(8, true),
+        b'C' => int(16, false),
+        b'S' => int(16, true),
+        b'I' => int(32, true),
+        b'J' => int(64, true),
+        b'L' => Some(Class::Ptr),
+        b'F' => Some(Class::F32),
+        b'D' => Some(Class::F64),
+        _ => None,
+    }
+}
+
+/// Where one argument sits in an image: integer registers, an fp register, or stack words (indices into the lanes' regs, fp, stack), with the lanes it takes there: 2 for a 64-bit value on a 32-bit side (low word first, little-endian), else 1.
 #[derive(Clone, Copy)]
 enum Slot {
-    X(usize),
+    X(usize, usize),
     V(usize),
-    Stack(usize),
+    Stack(usize, usize),
 }
+
+/// The low 32 bits of a lane: one word of a 32-bit side.
+const WORD: u64 = 0xFFFF_FFFF;
 
 /// Assigns argument slots under `rules`, in declaration order (one walk per side of [`place`]).
 struct Assign {
@@ -420,28 +459,78 @@ impl Assign {
         }
     }
 
-    /// The next slot of an argument of class `class`: an integer (a `va_list` lane holds a pointer) from the integer registers, a float or double from the eight fp registers; an fp argument past them takes a free integer register first where `fp_to_int` (RISC-V), else the stack; the rest the stack, one word each. None past the side's stack words (`stack_words`).
+    /// The next slot of an argument of class `class`: an integer (a `va_list` lane holds a pointer) from the integer registers, a float or double from the fp registers; an fp argument past them (or every one, with no fp registers) takes a free integer register first where `fp_to_int` (RISC-V, AAPCS32), else the stack; the rest the stack. None past the side's stack words (`stack_words`).
+    /// A 32-bit side (AAPCS32 2026Q3, Parameter Passing (base PCS)) gives a 64-bit value two words starting at an even lane: C.3 rounds the register number up to even, C.7 the stack offset to a double-word (the stack is 8-aligned at a call: The Stack, SP mod 8 = 0). So such a value is never split (after C.3 the register number is 0, 2 or 4, and C.5 needs one below 4 with words left over). An argument that does not fit the registers closes them (C.6): every later one goes to the stack, a word argument too. Narrow integers take one word (B.2).
     fn next(&mut self, class: Class) -> Option<Slot> {
-        let take = |n: &mut usize| {
-            *n += 1;
-            *n - 1
-        };
-        let slot = if class.is_fp() && self.v < 8 {
-            Slot::V(take(&mut self.v))
-        } else if self.x < self.rules.int_lanes && (!class.is_fp() || self.rules.fp_to_int) {
-            Slot::X(take(&mut self.x))
+        let words = if self.rules.word_bits == 32 && class.bytes(32) == 8 {
+            2
         } else {
-            Slot::Stack(take(&mut self.stack))
+            1
+        };
+        let slot = if class.is_fp() && self.v < self.rules.fp_lanes {
+            self.v += 1;
+            Slot::V(self.v - 1)
+        } else if !class.is_fp() || self.rules.fp_to_int {
+            // C.3
+            let x = self.x.next_multiple_of(words);
+            // C.4
+            if x + words <= self.rules.int_lanes {
+                self.x = x + words;
+                Slot::X(x, words)
+            } else {
+                // C.6
+                self.x = self.rules.int_lanes;
+                self.stack(words)
+            }
+        } else {
+            self.stack(words)
         };
         match slot {
-            Slot::Stack(s) if s >= self.rules.stack_words => None,
+            Slot::Stack(s, n) if s + n > self.rules.stack_words => None,
             s => Some(s),
         }
     }
+
+    /// The next `words` stack words, aligned to their count (C.7, C.8).
+    fn stack(&mut self, words: usize) -> Slot {
+        let s = self.stack.next_multiple_of(words);
+        self.stack = s + words;
+        Slot::Stack(s, words)
+    }
 }
 
-/// The `to` side's lanes for a call whose arguments have the classes `params`, read from `from`, the `from` side's image (x[0..int_lanes], v[0..8], the eight stack words). One placement for both directions: down = (host rules -> [`AAPCS64`]), up = (AAPCS64 -> host rules).
-/// Every ABI here takes integers and fp arguments by class in declaration order ([`Assign::next`]: SysV 6 integer registers, LP64D and AAPCS64 8, eight fp registers each). A float going into an fp register of a `nan_box_f32` side is NaN-boxed (RISC-V: upper 32 bits ones; AArch64 leaves them zero). `None` when either side needs more than eight stack words (R-1): with fp-to-int on one side, the other can need more stack words.
+/// The value of `n` lanes from `i`: one lane, or a 32-bit side's pair (low word first).
+fn read(lanes: &[u64], i: usize, n: usize) -> u64 {
+    if n == 2 {
+        (lanes[i] & WORD) | (lanes[i + 1] << 32)
+    } else {
+        lanes[i]
+    }
+}
+
+/// Stores `value` into `n` lanes from `i`, as [`read`] reads them.
+fn write(lanes: &mut [u64], i: usize, n: usize, value: u64) {
+    if n == 2 {
+        lanes[i] = value & WORD;
+        lanes[i + 1] = value >> 32;
+    } else {
+        lanes[i] = value;
+    }
+}
+
+/// A value of class `class` read from a side of `from` bits, as a side of `to` bits holds it. Between sides of one width it is unchanged (a 64-bit value on a 32-bit side was joined by [`read`]). Into 64 bits from 32: an integer is extended by its signedness (B.2 left a narrower one extended to the word; a 64-bit host's `long` parameter reads all 64 bits), a pointer zero-extended, a float's bits stay low. Into 32 bits from 64: the low word (SysV and LP64D leave the bits above a 32-bit argument to the callee; a host pointer at or above 4 GiB is the window's refusal, phase4-32bit P4b).
+fn convert(class: Class, value: u64, from: u32, to: u32) -> u64 {
+    if from == to || class.bytes(32) == 8 {
+        return value;
+    }
+    match (class, to) {
+        (Class::Int { signed: true, .. }, 64) => i64::from(value as u32 as i32) as u64,
+        _ => value & WORD,
+    }
+}
+
+/// The `to` side's lanes for a call whose arguments have the classes `params`, read from `from`, the `from` side's image (x[0..int_lanes], v[0..fp_lanes], its stack words). One placement for both directions: down = (host rules -> guest rules), up = (guest rules -> host rules), the guest's [`AAPCS64`] or [`AAPCS32`].
+/// Every ABI here takes integers and fp arguments by class in declaration order ([`Assign::next`]: SysV 6 integer registers, LP64D and AAPCS64 8, AAPCS32 4; eight fp registers, none on AAPCS32's base standard). A value crossing between word widths is [`convert`]ed. A float going into an fp register of a `nan_box_f32` side is NaN-boxed (RISC-V: upper 32 bits ones; AArch64 leaves them zero). `None` when either side needs more stack words than it carries (R-1): with fp-to-int on one side, the other can need more stack words.
 fn place(
     params: &[Class],
     from: &AtlLanes,
@@ -451,21 +540,75 @@ fn place(
     let mut to = AtlLanes::default();
     let (mut src, mut dst) = (Assign::new(from_rules), Assign::new(to_rules));
     for &class in params {
-        let word = match src.next(class)? {
-            Slot::X(i) => from.regs[i],
+        let value = match src.next(class)? {
+            Slot::X(i, n) => read(&from.regs, i, n),
             Slot::V(i) => from.fp[i],
-            Slot::Stack(i) => from.stack[i],
+            Slot::Stack(i, n) => read(&from.stack, i, n),
         };
+        let value = convert(class, value, from_rules.word_bits, to_rules.word_bits);
         match dst.next(class)? {
-            Slot::X(i) => to.regs[i] = word,
+            Slot::X(i, n) => write(&mut to.regs, i, n, value),
             Slot::V(i) if class == Class::F32 && to_rules.nan_box_f32 => {
-                to.fp[i] = word | 0xFFFF_FFFF_0000_0000;
+                to.fp[i] = value | 0xFFFF_FFFF_0000_0000;
             }
-            Slot::V(i) => to.fp[i] = word,
-            Slot::Stack(i) => to.stack[i] = word,
+            Slot::V(i) => to.fp[i] = value,
+            Slot::Stack(i, n) => write(&mut to.stack, i, n, value),
         }
     }
     Some(to)
+}
+
+/// A 32-bit guest's result lanes `[r0, r1]` for a host answer of class `ret` (AAPCS32 2026Q3, Result Return (base PCS)): a double-word (`long long`, softfp `double`) in r0 (low word) and r1; a word (`int`, pointer, softfp `float`) in r0; an integer narrower than a word zero- or sign-extended to it (SysV returns `bool`/`char`/`short` in the low bits of %rax with the rest unspecified, so the extension is made here); void none.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the arm bridge core answers by it (phase4-32bit P3 slice 3)"
+    )
+)]
+fn guest_ret32(ret: Class, answer: Answer) -> [u64; 2] {
+    let pair = |v: u64| [v & WORD, v >> 32];
+    match ret {
+        Class::Void => [0, 0],
+        Class::F64 => pair(answer.v0),
+        Class::F32 => [answer.v0 & WORD, 0],
+        Class::Int { bits: 64, .. } => pair(answer.x0),
+        Class::Int { bits, signed } if bits < 32 => {
+            let shift = 64 - u32::from(bits);
+            let v = if signed {
+                ((answer.x0 << shift) as i64 >> shift) as u64
+            } else {
+                answer.x0 << shift >> shift
+            };
+            [v & WORD, 0]
+        }
+        _ => [answer.x0 & WORD, 0],
+    }
+}
+
+/// The host answer (x0 lane, fp lane) of a 32-bit guest's result `[r0, r1]` of class `ret`: [`guest_ret32`] read the other way, an integer of a word or less extended to the host's 64 bits by its signedness ([`convert`]), a pointer zero-extended. A host that shapes narrow results further (LP64D, `host_result`) does so after.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the arm bridge core answers by it (phase4-32bit P3 slice 3)"
+    )
+)]
+fn host_ret32(ret: Class, r: [u64; 2]) -> Answer {
+    let joined = (r[0] & WORD) | (r[1] << 32);
+    match ret {
+        Class::Void => Answer::default(),
+        Class::F64 => Answer { x0: 0, v0: joined },
+        Class::F32 => Answer {
+            x0: 0,
+            v0: r[0] & WORD,
+        },
+        Class::Int { bits: 64, .. } => Answer { x0: joined, v0: 0 },
+        _ => Answer {
+            x0: convert(ret, r[0], 32, 64),
+            v0: 0,
+        },
+    }
 }
 
 /// Refuses a down call whose host arguments need more than eight stack words (R-1, Q6-4): the lane image cannot carry them. Named and counted: a shorty this size fails on every call, so the count says how often it was asked.
@@ -484,18 +627,32 @@ mod place_tests {
     /// x86_64 SysV (bridgegen x86.rs `DOWN`): six integer registers, fp overflow to the stack, results unshaped.
     const SYSV: HostRules = HostRules {
         int_lanes: 6,
+        fp_lanes: 8,
         fp_to_int: false,
         extend_int_ret: false,
         nan_box_f32: false,
         stack_words: 8,
+        word_bits: 64,
     };
     /// riscv64 LP64D (bridgegen riscv64.rs `DOWN`): eight integer registers, fp overflow to a free integer register, results shaped.
     const LP64D: HostRules = HostRules {
         int_lanes: 8,
+        fp_lanes: 8,
         fp_to_int: true,
         extend_int_ret: true,
         nan_box_f32: true,
         stack_words: 8,
+        word_bits: 64,
+    };
+    /// An integer lane on two 64-bit sides: every int class places alike there.
+    const INT: Class = Class::Int {
+        bits: 64,
+        signed: true,
+    };
+    /// jni.h `jint`.
+    const I32: Class = Class::Int {
+        bits: 32,
+        signed: true,
     };
 
     /// An image with `regs`, `fp` and `stack` as the banks' first lanes, the rest 0.
@@ -534,7 +691,7 @@ mod place_tests {
     #[test]
     fn up_nine_integers_on_lp64d() {
         let guest = img(&[1, 2, 3, 4, 5, 6, 7, 8], &[], &[9]);
-        let host = place(&[Class::Int; 9], &guest, AAPCS64, LP64D).expect("one stack word");
+        let host = place(&[INT; 9], &guest, AAPCS64, LP64D).expect("one stack word");
         assert_eq!(host, img(&[1, 2, 3, 4, 5, 6, 7, 8], &[], &[9]));
     }
 
@@ -543,7 +700,7 @@ mod place_tests {
     fn up_fp_overflow_takes_integer_registers_on_lp64d() {
         let guest = img(&[77], &[1, 2, 3, 4, 5, 6, 7, 8], &[9, 10]);
         let mut params = vec![Class::F64; 10];
-        params.push(Class::Int);
+        params.push(INT);
         let host = place(&params, &guest, AAPCS64, LP64D).expect("two guest stack words");
         assert_eq!(host, img(&[9, 10, 77], &[1, 2, 3, 4, 5, 6, 7, 8], &[]));
     }
@@ -556,7 +713,7 @@ mod place_tests {
             &[0x3F80_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000],
             &[],
         );
-        let mut params = vec![Class::Int];
+        let mut params = vec![INT];
         params.extend([Class::F32; 4]);
         let host = place(&params, &guest, AAPCS64, LP64D).expect("registers only");
         assert_eq!(host.regs[0], 5);
@@ -576,7 +733,7 @@ mod place_tests {
     fn lp64d_fp_overflow_takes_integer_registers() {
         let host = img(&[9, 10, 77], &[1, 2, 3, 4, 5, 6, 7, 8], &[]);
         let mut params = vec![Class::F64; 10];
-        params.push(Class::Int);
+        params.push(INT);
         let guest = place(&params, &host, LP64D, AAPCS64).expect("no host stack word");
         assert_eq!(guest, img(&[77], &[1, 2, 3, 4, 5, 6, 7, 8], &[9, 10]));
     }
@@ -585,7 +742,7 @@ mod place_tests {
     #[test]
     fn lp64d_nine_integers() {
         let host = img(&[1, 2, 3, 4, 5, 6, 7, 8], &[], &[9]);
-        let guest = place(&[Class::Int; 9], &host, LP64D, AAPCS64).expect("one stack word");
+        let guest = place(&[INT; 9], &host, LP64D, AAPCS64).expect("one stack word");
         assert_eq!(guest, img(&[1, 2, 3, 4, 5, 6, 7, 8], &[], &[9]));
     }
 
@@ -640,7 +797,7 @@ mod place_tests {
     #[test]
     fn nine_integers_split_across_both_banks() {
         let host = img(&[10, 11, 12, 13, 14, 15], &[], &[100, 101, 102]);
-        let guest = place(&[Class::Int; 9], &host, SYSV, AAPCS64).expect("three stack words fit");
+        let guest = place(&[INT; 9], &host, SYSV, AAPCS64).expect("three stack words fit");
         assert_eq!(guest, img(&[10, 11, 12, 13, 14, 15, 100, 101], &[], &[102]));
     }
 
@@ -649,7 +806,7 @@ mod place_tests {
     fn ninth_double_is_the_first_stack_word() {
         let host = img(&[77], &[1, 2, 3, 4, 5, 6, 7, 8], &[9]);
         let mut params = vec![Class::F64; 9];
-        params.push(Class::Int);
+        params.push(INT);
         let guest = place(&params, &host, SYSV, AAPCS64).expect("one stack word");
         assert_eq!(guest, img(&[77], &[1, 2, 3, 4, 5, 6, 7, 8], &[9]));
     }
@@ -658,7 +815,7 @@ mod place_tests {
     #[test]
     fn a_stack_integer_lands_in_a_guest_register() {
         let host = img(&[1, 2, 3, 4, 5, 6], &[8], &[7]);
-        let mut params = vec![Class::Int; 7];
+        let mut params = vec![INT; 7];
         params.push(Class::F64);
         let guest = place(&params, &host, SYSV, AAPCS64).expect("one stack word");
         assert_eq!(guest, img(&[1, 2, 3, 4, 5, 6, 7], &[8], &[]));
@@ -667,22 +824,16 @@ mod place_tests {
     /// Fourteen integers need eight stack words on SysV (six registers): the image holds them. Fifteen need nine: refused (R-1).
     #[test]
     fn nine_host_stack_words_are_refused() {
-        assert!(place(&[Class::Int; 14], &AtlLanes::default(), SYSV, AAPCS64).is_some());
-        assert!(place(&[Class::Int; 15], &AtlLanes::default(), SYSV, AAPCS64).is_none());
+        assert!(place(&[INT; 14], &AtlLanes::default(), SYSV, AAPCS64).is_some());
+        assert!(place(&[INT; 15], &AtlLanes::default(), SYSV, AAPCS64).is_none());
     }
 
-    /// The shorty `DIDJ` (result double; int, double, long) under a JNI method: env and class first, then the three. JNI_OnLoad (no shorty) is `(JavaVM*, void*)`; a shorty without a method's env is refused.
+    /// The shorty `DIDJ` (result double; int, double, long) under a JNI method: env and class first (pointers), then the three (jni.h: `jint` signed 32, `jlong` signed 64). JNI_OnLoad (no shorty) is `(JavaVM*, void*)`; a shorty without a method's env is refused.
     #[test]
     fn shorty_gives_the_classes() {
         assert_eq!(
             down_params(Down::Env, Some(&b"DIDJ"[..])),
-            Ok(vec![
-                Class::Int,
-                Class::Int,
-                Class::Int,
-                Class::F64,
-                Class::Int
-            ])
+            Ok(vec![Class::Ptr, Class::Ptr, I32, Class::F64, INT])
         );
         assert_eq!(
             down_params(Down::Plain, Some(&b"VF"[..])),
@@ -690,10 +841,201 @@ mod place_tests {
         );
         assert_eq!(
             down_params(Down::Vm, None),
-            Ok(vec![Class::Int, Class::Int])
+            Ok(vec![Class::Ptr, Class::Ptr])
         );
         assert!(down_params(Down::Env, None).is_err());
         assert!(down_params(Down::Vm, Some(&b"V"[..])).is_err());
         assert!(down_params(Down::Env, Some(&b"QI"[..])).is_err());
+    }
+}
+
+/// AAPCS32 placement (phase4-32bit P3 slice 2). Every expected image is written from the rules of AAPCS32 2026Q3 (github.com/ARM-software/abi-aa `aapcs32/aapcs32.rst`), Parameter Passing (base PCS) and Result Return (base PCS), each test naming the rules it walks; the host side from x86-64 SysV (rdi, rsi, rdx, rcx, r8, r9 = regs[0..6], xmm0..7 = fp[0..8], then the stack). Never from running `place`.
+/// The guest image is what the arm engine fills (atl-qemu-engine engine/arm.rs `trap_lanes`): r0..r3 in regs[0..4], the 4-byte words at sp in stack[0..16], each a 32-bit value in a u64 lane.
+#[cfg(test)]
+mod aapcs32_tests {
+    use super::*;
+
+    /// x86_64 SysV, as `place_tests::SYSV`.
+    const SYSV: HostRules = HostRules {
+        int_lanes: 6,
+        fp_lanes: 8,
+        fp_to_int: false,
+        extend_int_ret: false,
+        nan_box_f32: false,
+        stack_words: 8,
+        word_bits: 64,
+    };
+    const I32: Class = Class::Int {
+        bits: 32,
+        signed: true,
+    };
+    const U32: Class = Class::Int {
+        bits: 32,
+        signed: false,
+    };
+    const I64: Class = Class::Int {
+        bits: 64,
+        signed: true,
+    };
+    /// 1.5 = 0x3FF8_0000_0000_0000 (IEEE 754 binary64), 2.5 = 0x4004_0000_0000_0000, 3.5 = 0x400C_0000_0000_0000; 1.5f = 0x3FC0_0000 (binary32).
+    const D1_5: u64 = 0x3FF8_0000_0000_0000;
+    const D2_5: u64 = 0x4004_0000_0000_0000;
+    const D3_5: u64 = 0x400C_0000_0000_0000;
+    const F1_5: u64 = 0x3FC0_0000;
+
+    fn img(regs: &[u64], fp: &[u64], stack: &[u64]) -> AtlLanes {
+        let mut l = AtlLanes::default();
+        l.regs[..regs.len()].copy_from_slice(regs);
+        l.fp[..fp.len()].copy_from_slice(fp);
+        l.stack[..stack.len()].copy_from_slice(stack);
+        l
+    }
+
+    /// `f(int a, long long b, int c)`: a r0 (C.4); b: C.3 rounds NCRN 1 -> 2, so r2 (low word) and r3, r1 unused; c: NCRN 4, C.4 fails, C.5 needs NCRN < 4, C.6, C.8 -> the first stack word. SysV: rdi, rsi, rdx.
+    #[test]
+    fn up_long_long_skips_to_an_even_pair() {
+        let b = 0x1122_3344_5566_7788;
+        let guest = img(&[7, 0, 0x5566_7788, 0x1122_3344], &[], &[9]);
+        let host = place(&[I32, I64, I32], &guest, AAPCS32, SYSV).expect("fits");
+        assert_eq!(host, img(&[7, b, 9], &[], &[]));
+        // down, the same call read the other way: SysV leaves the bits above an int argument to the callee, so junk there must not reach r0 or the stack word
+        let junk = 0xDEAD_BEEF_0000_0000;
+        let from = img(&[junk | 7, b, junk | 9], &[], &[]);
+        assert_eq!(place(&[I32, I64, I32], &from, SYSV, AAPCS32), Some(guest));
+    }
+
+    /// `f(int a, int b, int c, long long d, int e)`: a..c r0..r2; d: C.3 NCRN 3 -> 4, C.4 fails, C.5 needs NCRN < 4, C.6, C.7 (NSAA 0, aligned), C.8 -> stack words 0 (low) and 1; e: stack word 2. Never split across r3 and the stack.
+    #[test]
+    fn up_long_long_after_three_words_goes_whole_to_the_stack() {
+        let d = 0x0102_0304_0506_0708;
+        let guest = img(&[1, 2, 3, 0], &[], &[0x0506_0708, 0x0102_0304, 5]);
+        let host = place(&[I32, I32, I32, I64, I32], &guest, AAPCS32, SYSV).expect("fits");
+        assert_eq!(host, img(&[1, 2, 3, d, 5], &[], &[]));
+    }
+
+    /// `f(int a, int b, int c, int x, int e, long long d)`: a..x r0..r3; e: stack word 0 (C.6, C.8, NSAA 4); d: C.7 rounds NSAA 4 -> 8, so stack words 2 (low) and 3, word 1 padding. SysV: six integers, rdi..r9.
+    #[test]
+    fn stacked_long_long_is_double_word_aligned() {
+        let d = 0x0A0B_0C0D_0E0F_1011;
+        let guest = img(&[1, 2, 3, 4], &[], &[5, 0, 0x0E0F_1011, 0x0A0B_0C0D]);
+        let params = [I32, I32, I32, I32, I32, I64];
+        assert_eq!(
+            place(&params, &guest, AAPCS32, SYSV),
+            Some(img(&[1, 2, 3, 4, 5, d], &[], &[]))
+        );
+        let host = img(&[1, 2, 3, 4, 5, d], &[], &[]);
+        assert_eq!(place(&params, &host, SYSV, AAPCS32), Some(guest));
+    }
+
+    /// softfp `f(float x, double y)`: the base standard has no CPRC (no co-processor argument registers), so both are core-register arguments; x a word in r0 (C.4); y double-word aligned (Fundamental Data Types: double precision, alignment 8): C.3 NCRN 1 -> 2, r2 (low) and r3. SysV: xmm0, xmm1; no fp lane on the guest side.
+    #[test]
+    fn softfp_floats_travel_in_core_registers() {
+        let guest = img(&[F1_5, 0, D2_5 & WORD, D2_5 >> 32], &[], &[]);
+        let host = place(&[Class::F32, Class::F64], &guest, AAPCS32, SYSV).expect("fits");
+        assert_eq!(host, img(&[], &[F1_5, D2_5], &[]));
+        assert_eq!(
+            place(&[Class::F32, Class::F64], &host, SYSV, AAPCS32),
+            Some(guest)
+        );
+    }
+
+    /// softfp `f(double a, double b, double c)`: a r0:r1, b r2:r3 (C.3, C.4), c: C.6, C.7, C.8 -> stack words 0 and 1. SysV: xmm0..2.
+    #[test]
+    fn softfp_third_double_is_two_stack_words() {
+        let guest = img(
+            &[D1_5 & WORD, D1_5 >> 32, D2_5 & WORD, D2_5 >> 32],
+            &[],
+            &[D3_5 & WORD, D3_5 >> 32],
+        );
+        let host = place(&[Class::F64; 3], &guest, AAPCS32, SYSV).expect("fits");
+        assert_eq!(host, img(&[], &[D1_5, D2_5, D3_5], &[]));
+    }
+
+    /// Into a 64-bit host: `f(int a, unsigned b, long c, void *p)` with a = -1, b = 0xFFFF_FFFF, c = -2 (`long` is a signed word on AAPCS32, Arm C and C++ Language Mappings), p = 0x8000_0000. A host `long` reads all 64 bits, so a signed word is sign-extended, an unsigned one and a pointer zero-extended.
+    #[test]
+    fn words_widen_by_signedness() {
+        let guest = img(
+            &[0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFE, 0x8000_0000],
+            &[],
+            &[],
+        );
+        let host = place(&[I32, U32, I32, Class::Ptr], &guest, AAPCS32, SYSV).expect("fits");
+        assert_eq!(
+            host,
+            img(
+                &[u64::MAX, 0xFFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFE, 0x8000_0000],
+                &[],
+                &[]
+            )
+        );
+    }
+
+    /// Down, eleven doubles from SysV (xmm0..7, then three stack words): the guest needs 2 doubles in r0..r3 and 9 x 2 = 18 stack words, past the arm engine's 16-word window -> refused. Ten need 16: placed.
+    #[test]
+    fn guest_window_overflow_is_refused() {
+        assert!(place(&[Class::F64; 10], &AtlLanes::default(), SYSV, AAPCS32).is_some());
+        assert!(place(&[Class::F64; 11], &AtlLanes::default(), SYSV, AAPCS32).is_none());
+    }
+
+    /// Result Return (base PCS): a double-word in r0 (low) and r1; a word in r0; a narrow integer extended to the word by its type (a bool's 0x80 junk-topped answer stays 0x80, a signed char 0x80 = -128 = 0xFFFF_FF80); softfp float in r0, double in r0:r1; void nothing.
+    #[test]
+    fn results_to_the_guest() {
+        let junk = 0xDEAD_BEEF_0000_0000;
+        let ans = |x0, v0| Answer { x0, v0 };
+        assert_eq!(
+            guest_ret32(I64, ans(0x1122_3344_5566_7788, 0)),
+            [0x5566_7788, 0x1122_3344]
+        );
+        assert_eq!(
+            guest_ret32(I32, ans(junk | 0x8000_0001, 0)),
+            [0x8000_0001, 0]
+        );
+        assert_eq!(guest_ret32(Class::Ptr, ans(0x1234, 0)), [0x1234, 0]);
+        let u8c = Class::Int {
+            bits: 8,
+            signed: false,
+        };
+        let i8c = Class::Int {
+            bits: 8,
+            signed: true,
+        };
+        assert_eq!(guest_ret32(u8c, ans(junk | 0xFF80, 0)), [0x80, 0]);
+        assert_eq!(guest_ret32(i8c, ans(junk | 0x80, 0)), [0xFFFF_FF80, 0]);
+        assert_eq!(guest_ret32(Class::F32, ans(0, F1_5)), [F1_5, 0]);
+        assert_eq!(
+            guest_ret32(Class::F64, ans(0, D2_5)),
+            [D2_5 & WORD, D2_5 >> 32]
+        );
+        assert_eq!(guest_ret32(Class::Void, ans(junk, junk)), [0, 0]);
+    }
+
+    /// The guest's result read back for the host: r0:r1 joined for a double-word, r0 extended by signedness for a word (r0 = 0xFFFF_FFFE as `int` = -2), a softfp double from r0:r1 into the fp lane.
+    #[test]
+    fn results_to_the_host() {
+        assert_eq!(
+            host_ret32(I64, [0x5566_7788, 0x1122_3344]),
+            Answer {
+                x0: 0x1122_3344_5566_7788,
+                v0: 0
+            }
+        );
+        assert_eq!(
+            host_ret32(I32, [0xFFFF_FFFE, 0]),
+            Answer {
+                x0: 0xFFFF_FFFF_FFFF_FFFE,
+                v0: 0
+            }
+        );
+        assert_eq!(
+            host_ret32(U32, [0xFFFF_FFFE, 0]),
+            Answer {
+                x0: 0xFFFF_FFFE,
+                v0: 0
+            }
+        );
+        assert_eq!(
+            host_ret32(Class::F64, [D2_5 & WORD, D2_5 >> 32]),
+            Answer { x0: 0, v0: D2_5 }
+        );
     }
 }

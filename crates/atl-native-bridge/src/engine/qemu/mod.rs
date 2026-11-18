@@ -565,7 +565,13 @@ mod tests {
         extern "C" fn half_plus(i: i32, v: f32) -> f32 {
             v * 0.5 + i as f32
         }
-        const PARAMS: &[Class] = &[Class::Int, Class::F32];
+        const PARAMS: &[Class] = &[
+            Class::Int {
+                bits: 32,
+                signed: true,
+            },
+            Class::F32,
+        ];
         let sig = Sig {
             ret: Class::F32,
             params: Some(PARAMS),

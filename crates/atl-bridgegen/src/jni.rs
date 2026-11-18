@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Lane descriptors of a JNI function table (Q6-3). Per slot: the lane class of each fixed parameter and of the result, and the variadic flag. A class is the bank that AAPCS64 (guest) and SysV (host) both assign the argument to: integers and pointers take an int lane, floats and doubles an fp lane, each bank counted in declaration order. The descriptors come from the IR that `jni_tables` reads (build.rs `jni_interface`), so a slot's lanes and its table position share one description.
+//! Lane descriptors of a JNI function table (Q6-3). Per slot: the lane class of each fixed parameter and of the result, and the variadic flag. A class is the argument as the guest's ABI sees it: its bank (integers and pointers the int bank, floats and doubles the fp bank, each counted in declaration order on 64-bit ABIs) and its width, which a 32-bit ABI places by (AAPCS32: a 64-bit value takes an even register pair) and which converts a value between a 32-bit guest and a 64-bit host (sign- or zero-extension by `signed`; a pointer by the window rules). One class set serves both, so placement and conversion read the same description. The descriptors come from the IR that `jni_tables` reads (build.rs `jni_interface`), so a slot's lanes and its table position share one description.
 //! A `va_list` parameter (the `...V` variants) has its own class: its argument is a pointer to a platform struct, not a lane value, so a route can refuse it by name.
 
 use anyhow::{Context, Result, bail, ensure};
@@ -9,8 +9,10 @@ use crate::ir::{ArchView, Signature, Ty};
 /// The lane class of one parameter or result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
-    /// Integer or pointer: an int lane.
-    Int,
+    /// An integer of `bits` (8, 16, 32 or 64; `bool` = unsigned 8) as the view's ABI types it: an int lane. `signed` says how a wider register holds it (sign- or zero-extension).
+    Int { bits: u8, signed: bool },
+    /// A data or function pointer (also an array parameter, a C++ reference): an int lane of the guest's pointer width.
+    Ptr,
     /// `float`: an fp lane, its bits as the register holds them. Its own class: a host whose fp registers hold a float NaN-boxed (RISC-V LP64D) shapes it on the way in.
     F32,
     /// `double`: an fp lane.
@@ -19,6 +21,18 @@ pub enum Class {
     Void,
     /// `va_list` (the `...V` variants).
     VaList,
+}
+
+impl Class {
+    /// An integer or a pointer: the int bank.
+    pub const fn is_int(self) -> bool {
+        matches!(self, Class::Int { .. } | Class::Ptr)
+    }
+
+    /// A float or a double: the fp bank.
+    pub const fn is_fp(self) -> bool {
+        matches!(self, Class::F32 | Class::F64)
+    }
 }
 
 /// One function slot.
@@ -55,8 +69,8 @@ pub fn rust(tables: &[(&str, Vec<Option<Lane>>)]) -> String {
         "/// Lane class of a JNI parameter or result (`atl_bridgegen::objects::Class`).\n\
          #[allow(dead_code)]\n\
          #[derive(Clone, Copy, Debug, PartialEq, Eq)]\n\
-         pub enum Class {\n    Int,\n    F32,\n    F64,\n    Void,\n    VaList,\n}\n\n\
-         impl Class {\n    /// An fp lane (`F32` or `F64`).\n    pub const fn is_fp(self) -> bool {\n        matches!(self, Class::F32 | Class::F64)\n    }\n}\n\n\
+         pub enum Class {\n    Int { bits: u8, signed: bool },\n    Ptr,\n    F32,\n    F64,\n    Void,\n    VaList,\n}\n\n\
+         impl Class {\n    /// An fp lane (`F32` or `F64`).\n    pub const fn is_fp(self) -> bool {\n        matches!(self, Class::F32 | Class::F64)\n    }\n\n    /// An int lane (an integer or a pointer).\n    pub const fn is_int(self) -> bool {\n        matches!(self, Class::Int { .. } | Class::Ptr)\n    }\n\n    /// Its size in bytes on a guest whose pointers are `pointer_bits` wide (a `va_list` is passed as a pointer on every guest here); 0 for `Void`.\n    pub const fn bytes(self, pointer_bits: u32) -> u32 {\n        match self {\n            Class::Int { bits, .. } => bits as u32 / 8,\n            Class::Ptr | Class::VaList => pointer_bits / 8,\n            Class::F32 => 4,\n            Class::F64 => 8,\n            Class::Void => 0,\n        }\n    }\n}\n\n\
          /// A function slot's lanes (`atl_bridgegen::jni::Lane`).\n\
          #[allow(dead_code)]\n\
          #[derive(Clone, Copy, Debug)]\n\
@@ -125,12 +139,12 @@ pub fn param_classes(sig: &Signature) -> Result<Vec<Class>> {
 
 /// Why a host call of parameter classes `params` cannot cross the QEMU binding route, else `None` (R-1, Q7-4). That route (atl-native-bridge dispatch.rs `call_host`) passes the guest's lanes as one SysV image: x0..x7, then v0..v7 in xmm0..7, then the eight guest stack words. SysV takes integers 1-6 from registers and the rest from the stack in declaration order, interleaved with any fp argument past the eighth; AAPCS64 does the same with eight integer registers. So with at most eight fp arguments the host's stack words are integers 7.. = x6, x7, then the guest's stack words: exactly the image. A ninth fp argument sits among them on both sides at a position the image does not keep. More than 16 integers need a ninth guest stack word, past the eight a trap delivers. A `va_list` is a pointer to a platform struct, not a lane value.
 pub fn lane_refusal(params: &[Class]) -> Option<&'static str> {
-    let count = |c| params.iter().filter(|&&p| p == c).count();
-    if count(Class::VaList) > 0 {
+    let count = |f: fn(Class) -> bool| params.iter().filter(|&&p| f(p)).count();
+    if count(|c| c == Class::VaList) > 0 {
         Some("refused: R-1, a va_list parameter has no lane")
-    } else if count(Class::F32) + count(Class::F64) > 8 {
+    } else if count(Class::is_fp) > 8 {
         Some("refused: R-1, a ninth fp argument interleaves with the stack integers")
-    } else if count(Class::Int) > 16 {
+    } else if count(Class::is_int) > 16 {
         Some("refused: R-1, more than 16 integers need a ninth stack word")
     } else {
         None
@@ -214,23 +228,28 @@ pub fn route(name: &str, sig: &Signature, env_listed: bool, callbacks: &[&str]) 
     );
     let params = param_classes(sig).with_context(|| format!("{name}: parameter classes"))?;
     ensure!(
-        params.len() <= MAPPED_LANES && params.iter().all(|&c| c == Class::Int),
+        params.len() <= MAPPED_LANES && params.iter().all(|&c| c.is_int()),
         "{name}: the lane-mapped class forwards at most {MAPPED_LANES} int lanes, the prototype has {params:?}"
     );
     let ret = result_class(&sig.ret).with_context(|| format!("{name}: result class"))?;
     ensure!(
-        matches!(ret, Class::Int | Class::Void),
+        ret.is_int() || ret == Class::Void,
         "{name}: the lane-mapped class answers in an int lane, the result is {ret:?}"
     );
     maps.sort_by_key(|&(i, _)| i);
     Ok(Route::Mapped(maps))
 }
 
-/// A callback signature's lanes as a shorty: the result's letter, then one per parameter. The down shell (atl-native-bridge dispatch.rs `down_params`) needs the bank and an fp lane's width, so every int lane is `J`, a float `F`, a double `D`.
+/// A callback signature's lanes as a JNI shorty: the result's letter, then one per parameter. The down shell (atl-native-bridge dispatch.rs `down_params`) places by bank and width, so an integer takes jni.h's type of its width (`Z` `B` `C` `S` by signedness, `I` 32 bits, `J` 64), a pointer `L`, a float `F`, a double `D`. Lossy only for unsigned 32/64 (`I`/`J`): a down call needs no extension into the guest, and the result shaping `I` asks for (LP64D, 32 bits sign-extended) applies to unsigned 32-bit values too.
 fn shorty(sig: &Signature) -> Result<String> {
     ensure!(!sig.variadic, "a variadic callback has no fixed lanes");
     let letter = |c: Class| match c {
-        Class::Int => Ok('J'),
+        Class::Int { bits: 8, signed } => Ok(if signed { 'B' } else { 'Z' }),
+        Class::Int { bits: 16, signed } => Ok(if signed { 'S' } else { 'C' }),
+        Class::Int { bits: 32, .. } => Ok('I'),
+        Class::Int { bits: 64, .. } => Ok('J'),
+        Class::Int { bits, .. } => bail!("a {bits}-bit integer has no shorty letter"),
+        Class::Ptr => Ok('L'),
         Class::F32 => Ok('F'),
         Class::F64 => Ok('D'),
         Class::Void => Ok('V'),
@@ -293,17 +312,29 @@ fn param(ty: &Ty) -> Result<Class> {
     match ty {
         Ty::Typedef { name, .. } if name == "va_list" => Ok(Class::VaList),
         // C: a parameter of array type is a pointer (NDK NdkMediaCrypto.h `const uint8_t uuid[16]`)
-        _ if matches!(ty.resolved(), Ty::Array { .. }) => Ok(Class::Int),
+        _ if matches!(ty.resolved(), Ty::Array { .. }) => Ok(Class::Ptr),
         _ => scalar(ty),
     }
 }
 
-/// An integer, pointer or floating type's class; anything else has no lane.
+/// An integer, pointer or floating type's class; anything else (a record by value, a 128-bit integer) has no lane.
 fn scalar(ty: &Ty) -> Result<Class> {
     match ty.resolved() {
         Ty::Float { bits: 32 } => Ok(Class::F32),
         Ty::Float { bits: 64 } => Ok(Class::F64),
-        Ty::Int { .. } | Ty::Bool | Ty::Pointer { .. } | Ty::Reference { .. } => Ok(Class::Int),
+        &Ty::Int {
+            bits: bits @ (8 | 16 | 32 | 64),
+            signed,
+            ..
+        } => Ok(Class::Int {
+            bits: bits as u8,
+            signed,
+        }),
+        Ty::Bool => Ok(Class::Int {
+            bits: 8,
+            signed: false,
+        }),
+        Ty::Pointer { .. } | Ty::Reference { .. } => Ok(Class::Ptr),
         other => bail!("no lane class for {other:?}"),
     }
 }
@@ -326,6 +357,11 @@ mod tests {
     }
 
     fn parse(name: &str, header: &str) -> crate::ir::Interface {
+        parse_for(name, header, "x86_64", "x86_64-unknown-linux-gnu")
+    }
+
+    /// `header` parsed for one target, its view keyed `arch`.
+    fn parse_for(name: &str, header: &str, arch: &str, triple: &str) -> crate::ir::Interface {
         let dir =
             Tmp(std::env::temp_dir()
                 .join(format!("atl-bridgegen-jni-{name}-{}", std::process::id())));
@@ -333,8 +369,8 @@ mod tests {
         let path = dir.0.join("jni.h");
         std::fs::write(&path, header).unwrap();
         let target = Target {
-            arch: "x86_64".into(),
-            triple: "x86_64-unknown-linux-gnu".into(),
+            arch: arch.into(),
+            triple: triple.into(),
             args: vec!["-nostdlibinc".into()],
         };
         interface(
@@ -346,6 +382,23 @@ mod tests {
         .unwrap()
     }
 
+    const I8U: Class = Class::Int {
+        bits: 8,
+        signed: false,
+    };
+    const I32: Class = Class::Int {
+        bits: 32,
+        signed: true,
+    };
+    const U32: Class = Class::Int {
+        bits: 32,
+        signed: false,
+    };
+    const I64: Class = Class::Int {
+        bits: 64,
+        signed: true,
+    };
+
     fn lane(name: &str, params: &[Class], ret: Class, variadic: bool) -> Option<Lane> {
         Some(Lane {
             name: name.into(),
@@ -355,24 +408,47 @@ mod tests {
         })
     }
 
-    /// Expected lanes written from the C shapes above, not from the code under test.
+    /// Expected lanes written from the C shapes above, not from the code under test: `JNIEnv *`, `jobject`, `jfieldID`, `jmethodID` pointers; `jint` signed 32; `jboolean` unsigned 8; `jlong` (`long long`) signed 64.
     #[test]
     fn classes_follow_the_lane_banks() {
-        use Class::{F32, F64, Int, VaList, Void};
+        use Class::{F32, F64, Ptr, VaList, Void};
         let iface = parse("classes", TABLE);
         assert_eq!(
             lanes(&iface.arches["x86_64"], "JNINativeInterface").unwrap(),
             vec![
                 None,
-                lane("GetVersion", &[Int], Int, false),
-                lane("SetDoubleField", &[Int, Int, Int, F64], Void, false),
-                lane("CallDoubleMethod", &[Int, Int, Int], F64, true),
-                lane("CallDoubleMethodV", &[Int, Int, Int, VaList], F64, false),
-                lane("GetFloatField", &[Int, Int, Int], F32, false),
-                lane("IsSameObject", &[Int, Int, Int], Int, false),
-                lane("NewLong", &[Int, Int], Int, false),
+                lane("GetVersion", &[Ptr], I32, false),
+                lane("SetDoubleField", &[Ptr, Ptr, Ptr, F64], Void, false),
+                lane("CallDoubleMethod", &[Ptr, Ptr, Ptr], F64, true),
+                lane("CallDoubleMethodV", &[Ptr, Ptr, Ptr, VaList], F64, false),
+                lane("GetFloatField", &[Ptr, Ptr, Ptr], F32, false),
+                lane("IsSameObject", &[Ptr, Ptr, Ptr], I8U, false),
+                lane("NewLong", &[Ptr, I64], I64, false),
             ]
         );
+    }
+
+    /// The class is the view's ABI type: `long` is a signed word on AAPCS32 (AAPCS32 2026Q3, Arm C and C++ Language Mappings: `[signed] long` = signed word, `long long` = signed double-word) and 64 bits on LP64 (x86-64 SysV); `size_t` (`unsigned long` here) alike, unsigned; a pointer is `Ptr` on both.
+    #[test]
+    fn classes_carry_the_guest_width() {
+        let header = "long f(long a, unsigned long n, long long b, void *p);\n";
+        let u64c = Class::Int {
+            bits: 64,
+            signed: false,
+        };
+        for (arch, triple, long, ulong) in [
+            ("arm", "armv7a-linux-androideabi", I32, U32),
+            ("x86_64", "x86_64-unknown-linux-gnu", I64, u64c),
+        ] {
+            let iface = parse_for(&format!("width-{arch}"), header, arch, triple);
+            let sig = &iface.arches[arch].functions["f"];
+            assert_eq!(
+                param_classes(sig).unwrap(),
+                [long, ulong, I64, Class::Ptr],
+                "{arch}"
+            );
+            assert_eq!(result_class(&sig.ret).unwrap(), long, "{arch}");
+        }
     }
 
     #[test]
@@ -389,10 +465,10 @@ mod tests {
         assert!(err.contains("no lane class"), "{err}");
     }
 
-    /// Expected classes written from the C shapes, not from the code under test: void, an enum and a boolean (int lanes), a pointer (int), float (F32) and double (F64).
+    /// Expected classes written from the C shapes, not from the code under test: void, `GLenum` (unsigned 32) and `GLboolean` (unsigned 8) int lanes, a pointer, float (F32) and double (F64).
     #[test]
     fn result_classes_follow_the_return_banks() {
-        use Class::{F32, F64, Int, Void};
+        use Class::{F32, F64, Ptr, Void};
         let iface = parse(
             "results",
             "typedef unsigned int GLenum;\ntypedef unsigned char GLboolean;\ntypedef float GLfloat;\ntypedef double GLdouble;\nvoid f_void(void);\nGLenum f_enum(void);\nGLboolean f_bool(void);\nvoid *f_ptr(void);\nGLfloat f_float(void);\nGLdouble f_double(void);\n",
@@ -402,7 +478,7 @@ mod tests {
             .iter()
             .map(|name| result_class(&view.functions[*name].ret).unwrap())
             .collect();
-        assert_eq!(got, [Void, Int, Int, Int, F32, F64]);
+        assert_eq!(got, [Void, U32, I8U, Ptr, F32, F64]);
     }
 
     /// R-1 at bind time (Q7-4), classes from GL-shaped prototypes. Fit: glTexImage2D (9 integers: one guest stack word), glUniform4f (int + 4 fp), 8 fp + 16 integers (the image's edge). Refused, each by its own reason: 9 floats, 17 integers, a va_list. Expected outcomes follow from the rule in `lane_refusal`'s doc (SysV 6 + AAPCS64 8 integer registers, 8 fp registers each, 8 trap stack words), not from the code.
@@ -468,7 +544,7 @@ mod tests {
         assert!(stale.contains("no JNI type"), "{stale}");
     }
 
-    /// GS2.2 callback-param (tr-first blocker 5), NDK-shaped prototypes. Expected outcomes from the C shapes: looper.h's `ALooper_addFd` maps lane 4 to a down shell of `int(int, int, void*)` = `JJJJ`; choreographer.h's frame callback `void(long, void*)` = `VJJ`; a double argument takes `D`, a float `F`; an unreviewed typedef and an unnamed function-pointer type stay pending; a seven-lane prototype fails by the lane rule.
+    /// GS2.2 callback-param (tr-first blocker 5), NDK-shaped prototypes. Expected outcomes from the C shapes (JNI shorty letters by width: `I` int, `J` 64-bit, `L` pointer): looper.h's `ALooper_addFd` maps lane 4 to a down shell of `int(int, int, void*)` = `IIIL`; choreographer.h's frame callback `void(long, void*)` = `VJL` (x86-64: long is 64 bits); a double argument takes `D`, a float `F`; an unreviewed typedef and an unnamed function-pointer type stay pending; a seven-lane prototype fails by the lane rule.
     #[test]
     fn route_maps_reviewed_callbacks_to_down_shells() {
         let iface = parse(
@@ -494,14 +570,14 @@ mod tests {
         };
         assert_eq!(
             bind("ALooper_addFd").unwrap(),
-            down(4, "ALooper_callbackFunc", "JJJJ")
+            down(4, "ALooper_callbackFunc", "IIIL")
         );
         assert_eq!(
             bind("post").unwrap(),
-            down(1, "AChoreographer_frameCallback", "VJJ")
+            down(1, "AChoreographer_frameCallback", "VJL")
         );
-        assert_eq!(bind("with_fp").unwrap(), down(0, "fp_cb", "VDJ"));
-        assert_eq!(bind("with_f32").unwrap(), down(0, "f32_cb", "VFJ"));
+        assert_eq!(bind("with_fp").unwrap(), down(0, "fp_cb", "VDL"));
+        assert_eq!(bind("with_f32").unwrap(), down(0, "f32_cb", "VFL"));
         assert_eq!(
             bind("unreviewed").unwrap(),
             Route::Pending(UNREVIEWED_CALLBACK)

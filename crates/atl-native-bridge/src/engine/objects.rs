@@ -32,8 +32,11 @@ pub struct Sig {
 }
 
 impl Sig {
-    /// An integer result, no prototype.
-    pub const INT: Sig = Sig::ret(Class::Int);
+    /// An integer result, no prototype: the whole 64-bit host register (a 32-bit guest's libc rows need their prototypes first, phase4-32bit P4b).
+    pub const INT: Sig = Sig::ret(Class::Int {
+        bits: 64,
+        signed: true,
+    });
 
     /// Result class `ret`, no prototype.
     pub const fn ret(ret: Class) -> Sig {
