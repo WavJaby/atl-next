@@ -7,8 +7,9 @@
 //! Stage `buffer`: the iio stage's display accelerometer with its kernel buffer on (the laptop's layout and trigger, realtime stamps, 10 Hz). A FIFO at `/dev/iio:device0` in atld's namespace stands in for the char device; a writer thread fills it with scans while `buffer/enable` reads 1, and holds them for [`HOLD_FOR`] after the app registers (the silent path: re-emits, then samples again). Pass = the iio checks, and the tier counters say buffered with no ts-fallback.
 //! Breaks: `offset` (stamp at byte 12) and `node-denied` (FIFO mode 000) and `enable-off` select the polled tier (`no-data`, `node-denied`, `not-enabled`); `clock` (stamps 1 s ahead) selects the polled tier (`clock`); `order` (y and z indices swapped) fails the values.
 //! Stage `tilt`: no IIO device, atld `--tilt-keys` with [`TILT_ARGS`] (incl. the unfocused probe: 90 deg readings until the first focus), the headless script [`TILT_SCRIPT`] (unfocused, focus in, hold Left, hold Right, then hold Left and lose focus). Pass = the injected accelerometer listed, every event of magnitude g with y = 0, level first,
-//! the Left plateau x = +g sin(max) before the Right plateau x = -g sin(max), no |x| beyond it, level last (the focus loss), the services' injection-on line and their count of the refused probe. Breaks: `off` (no `--tilt-keys`: nothing listed), `real` (the iio stage's devices present: the services refuse injection and list the real one),
+//! the Left plateau x = +g sin(max) before the Right plateau x = -g sin(max), no |x| beyond it, level last (the focus loss), the services' injection-on line and their count of the refused probe. Breaks: `off` (no `--tilt-keys`: nothing listed),
 //! `focus` (services `--no-sensor-focus-check`: the probe reaches the app). Each must fail.
+//! Stage `tilt-real`: stage tilt with the iio stage's devices present (one listed: the display one). Pass = the tilt checks (only the injected sensor listed: an explicit `--tilt-keys` wins over a real accelerometer) and the services' override line for 1 real accelerometer.
 //! Expected values, computed here independently: axis = raw x scale (offset 0, kernel sysfs-bus-iio), m/s²; canonical r = mount-matrix row r . sensor vector (iio-sensor-proxy `apply_mount_matrix`); Android = (-x, -y, z) of canonical (iio.rs `to_android` derives it).
 
 use std::path::{Path, PathBuf};
@@ -31,6 +32,7 @@ pub enum Stage {
     Iio,
     Buffer,
     Tilt,
+    TiltReal,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -47,8 +49,6 @@ pub enum Break {
     Scale,
     /// stage tilt: atld runs without `--tilt-keys`
     Off,
-    /// stage tilt: a real accelerometer present (the iio stage's devices)
-    Real,
     /// stage tilt: the services accept injection from a process without the focused window
     Focus,
     /// stage buffer: the scan's stamp at byte 12, not 16: no fresh scan at open, so the polled tier (`no-data`)
@@ -132,6 +132,8 @@ const TILT_ARGS: [&str; 7] = [
 ];
 /// The services' count of an injected event refused for want of focus (atl-services sensor.rs `SensorHub::inject`).
 const FOCUS_REFUSED: &str = "injected event: caller has no focused window";
+/// atl-services sensor.rs `SensorHub::new`: an explicit injection request over real accelerometers.
+const OVERRIDE_LINE: &str = "injection on: overrides";
 /// Linux KEY_LEFT / KEY_RIGHT (input-event-codes.h). First 500 ms unfocused: the probe's window (`--tilt-probe-unfocused`, ~25 events at 20 ms), after the fixture registered in onCreate.
 /// Holds of 1.5 s: five ramps, so each plateau gets ~60 events; the last hold ends in a focus loss, which must level the device.
 const TILT_SCRIPT: &str = "wait:500 focus:in wait:1500 key-down:105 wait:1500 key-up:105 wait:1000 key-down:106 wait:1500 key-up:106 wait:1000 key-down:105 wait:1500 focus:out wait:1000";
@@ -244,7 +246,7 @@ fn write_devices(sys_bus: &Path, udev: &Path, stage: Stage, brk: Option<Break>) 
         }
         std::fs::create_dir_all(dir)?;
     }
-    if stage == Stage::Empty || (stage == Stage::Tilt && brk != Some(Break::Real)) {
+    if matches!(stage, Stage::Empty | Stage::Tilt) {
         return Ok(());
     }
     let scale = if brk == Some(Break::Scale) {
@@ -543,7 +545,12 @@ fn check(stage: Stage, msgs: &[String], services: &str, want: [f64; 3]) -> Vec<S
                 whys.push("the services' poll did not stop after unregisterListener".to_owned());
             }
         }
-        Stage::Tilt => {
+        Stage::Tilt | Stage::TiltReal => {
+            // stage tilt-real: write_devices lists the display device only (the base one's location filters it)
+            let override_line = format!("sensor: {OVERRIDE_LINE} 1 real accelerometer(s)");
+            if stage == Stage::TiltReal && !services.lines().any(|l| l.contains(&override_line)) {
+                whys.push(format!("no `{override_line}` line from the services"));
+            }
             if n != Some(1) {
                 whys.push(format!("sensor count {n:?}, want 1"));
             }
@@ -595,6 +602,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Stage::Iio => "sensors-iio",
         Stage::Buffer => "sensors-buffer",
         Stage::Tilt => "sensors-tilt",
+        Stage::TiltReal => "sensors-tilt-real",
     };
     let mut rt = Runtime::new(
         root,
@@ -642,7 +650,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if args.break_ == Some(Break::Unregistered) {
         rt = rt.without_sensor_service();
     }
-    if args.stage == Stage::Tilt {
+    if matches!(args.stage, Stage::Tilt | Stage::TiltReal) {
         rt = rt.with_headless_pointer(TILT_SCRIPT);
         if args.break_ != Some(Break::Off) {
             let mut extra: Vec<String> = TILT_ARGS.map(String::from).to_vec();

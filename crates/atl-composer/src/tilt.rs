@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
-//! Key tilt (atld `--tilt-keys`, delivered as `ro.atl.tilt`): on a desktop with no accelerometer, held Left / Right (or A / D) tilt the device for accelerometer games. The keys still go to the app; the tilt is injected as accelerometer data through AOSP's own path
+//! Key tilt (atld `--tilt-keys`, delivered as `ro.atl.tilt`): on a desktop (with or without an accelerometer: the request wins over a real one), held Left / Right (or A / D) tilt the device for accelerometer games. The keys still go to the app; the tilt is injected as accelerometer data through AOSP's own path
 //! (sensorservice HAL bypass data injection, atl-services sensor_wire `Injector`), never a channel of ours.
 //! * Angle: a held key moves it towards +-max at max/ramp per ms, release (or both keys) back to level at the same rate. Left = left edge down = theta > 0.
 //! * Values (Android device frame, SensorEvent docs: x right, y up, z out of the screen; a device at rest reads +g against gravity): screen frame x = g sin theta, y = 0, z = g cos theta, so left edge down gives x > 0 (the up direction leans to +x).
 //!   Rotated into the device frame by the display rotation (SensorManager.remapCoordinateSystem's inverse: ROTATION_90 -> device (x, y) = (-sy, sx)).
 //! * Focus: any change (a window of this process gains or loses it) releases the keys and levels the device at once. Only a process with a focused window injects, so two apps' composers never interleave events (injected events go to every app).
-//! * The service decides whether injection runs at all (it refuses the mode with a real accelerometer present); a process whose service says no logs it once and injects nothing.
+//! * The service decides whether injection runs at all (the services start without it unless atld asked); a process whose service says no logs it once and injects nothing.
 
 use std::time::Duration;
 

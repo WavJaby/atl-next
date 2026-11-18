@@ -222,7 +222,7 @@ struct Args {
     /// Test only: passed to the services (`--omit-service <name>`, repeat), the deliberate break of the app gate's line for that service.
     #[arg(long)]
     omit_service: Vec<String>,
-    /// Desktop tilt for accelerometer games: while an app window has focus, held Left / Right (or A / D) tilt the device, injected as accelerometer data (sensorservice HAL bypass injection); the keys still reach the app. Off: no emulation. No effect on a machine with a real accelerometer (the services probe it).
+    /// Desktop tilt for accelerometer games: while an app window has focus, held Left / Right (or A / D) tilt the device, injected as accelerometer data (sensorservice HAL bypass injection); the keys still reach the app. Off: no emulation, a real accelerometer is delivered as AOSP. On a machine with a real accelerometer this wins: every app of this atld session sees only the injected one.
     #[arg(long)]
     tilt_keys: bool,
     /// Desktop adaptation: the left mouse button is one finger, its press / drag / release reach the app as touchscreen events (hover and the other buttons stay the mouse's). AOSP has no such conversion and touch-only games ignore the mouse.

@@ -10,8 +10,8 @@
 //!
 //! Data injection: only HAL_BYPASS_REPLAY_DATA_INJECTION (SensorService.h Mode 4), the one mode that needs no HAL: injected events go to every app with the sensor enabled (SensorDevice::injectSensorData queues them, poll() plays them back, SensorDevice.cpp :370, :799).
 //! - set at start, as AOSP's `dumpsys sensorservice hal_bypass_replay_data_injection <package>` sets it (changeOperatingMode :2430): global, one allow-listed package matched by `contains` (isAllowListedPackage :2538)
-//! - refused while the platform lists a real accelerometer (probed at start, logged + counted): an injecting client would otherwise replace real readings for every app (in bypass mode poll() reads only the injected queue)
-//! - the "HAL" here lists no sensor without a device, so the mode lists one accelerometer of its own ([`INJECTED_NAME`]) for injected events to land on; it has no source thread
+//! - requested = on, also while the platform lists a real accelerometer (a laptop on a desk cannot be tilted): bypass mode's poll() reads only the injected queue, so the real ones are neither listed nor polled (logged + [`OVERRIDE_COUNTER`]). Scope: every app of this services instance (one per atld session), for its lifetime; host programs reading IIO are untouched. Not requested: NORMAL, the real sensors as AOSP
+//! - the "HAL" here lists no sensor without a device, so the mode lists one accelerometer of its own ([`INJECTED_NAME`], the only one) for injected events to land on; it has no source thread
 //! - not AOSP: an event is accepted only from the process owning the focused window ([`FocusedProcess`]), checked per event; the name check alone lets any process that claims the allow-listed name (the op package is the caller's own string) steer every app's accelerometer
 
 use std::collections::{BTreeMap, VecDeque};
@@ -58,6 +58,9 @@ const CACHE_WRITE_EVENTS: usize = {
 };
 /// How long the cache writer waits for the channel to turn writable before checking whether the channel still exists.
 const CACHE_POLL: Duration = Duration::from_millis(100);
+
+/// The count of a start whose requested injection replaced real accelerometers.
+pub const OVERRIDE_COUNTER: &str = "data injection: overrides real accelerometer";
 
 /// The accelerometer the injection mode lists.
 pub const INJECTED_NAME: &str = "ATL injected accelerometer";
@@ -369,7 +372,7 @@ pub struct SensorHub {
 
 impl SensorHub {
     /// The sensors `source` lists now, handles from 1 (SensorService `registerSensor` at start; no hot-plug).
-    /// `injection`: start in HAL bypass injection mode with this allow-listed package, unless the source lists a real accelerometer (then NORMAL, logged and counted). `focus`: see [`SensorHub::inject`].
+    /// `injection`: start in HAL bypass injection mode with this allow-listed package; real accelerometers the source lists are then replaced by the injected one (logged and counted). `focus`: see [`SensorHub::inject`].
     pub fn new(
         source: Arc<dyn Sensors>,
         injection: Option<&str>,
@@ -385,15 +388,16 @@ impl SensorHub {
             .map(|(a, h)| SensorInfo::accelerometer(h, a))
             .collect();
         let injection = match injection {
-            Some(_) if !sensors.is_empty() => {
-                log(&format!(
-                    "injection off: {} real accelerometer(s)",
-                    sensors.len()
-                ));
-                atl_diag::refused(INTERFACE, "data injection: real accelerometer present");
-                None
-            }
             Some(package) => {
+                if !sensors.is_empty() {
+                    // explicit request wins over a real sensor (owner 2026-11-18, behaviour decision 2): bypass mode delivers only injected events, so the real ones are not listed or polled
+                    log(&format!(
+                        "injection on: overrides {} real accelerometer(s) (tilt keys requested; every app of this services instance)",
+                        sensors.len()
+                    ));
+                    atl_diag::answered(INTERFACE, OVERRIDE_COUNTER);
+                    sensors.clear();
+                }
                 sensors.push(SensorInfo::injected(1));
                 log(&format!(
                     "injection on: hal_bypass_replay_data_injection for {package:?}"
@@ -846,13 +850,32 @@ mod tests {
         assert_eq!(hub.enable(1, &ch, 1, 20_000_000), BAD_VALUE);
     }
 
-    /// A real accelerometer refuses the mode; without one the injected sensor is listed and an allow-listed client's records reach the subscribers with the type set, others' are dropped;
+    /// The three states of the decision (owner 2026-11-18: an explicit tilt-keys request wins; not requested = exact AOSP): (no real sensor, requested) and (real sensor, requested) list only the injected sensor; (real, not requested) lists the real one, NORMAL mode.
+    #[test]
+    fn requested_injection_wins_over_a_real_sensor_and_off_keeps_it() {
+        let names = |h: &SensorHub| -> Vec<String> {
+            h.sensor_list().iter().map(|s| s.name.clone()).collect()
+        };
+        let none_on = SensorHub::new(Arc::new(Nothing), Some("atl.tilt"), None);
+        assert!(none_on.hal_bypass_injection());
+        assert_eq!(names(&none_on), [INJECTED_NAME]);
+        let real_on = SensorHub::new(Arc::new(Fixed), Some("atl.tilt"), None);
+        assert!(real_on.hal_bypass_injection());
+        assert_eq!(
+            names(&real_on),
+            [INJECTED_NAME],
+            "the real sensor is not listed"
+        );
+        assert_eq!(real_on.sensor_list()[0].handle, 1);
+        let real_off = SensorHub::new(Arc::new(Fixed), None, None);
+        assert!(!real_off.hal_bypass_injection());
+        assert_eq!(names(&real_off), ["fake accel"]);
+    }
+
+    /// The injected sensor is listed and an allow-listed client's records reach the subscribers with the type set, others' are dropped;
     /// so are the allow-listed name's from a process without the focused window (pid 5 focused, 6 not).
     #[test]
-    fn injection_needs_no_real_sensor_an_allow_listed_package_and_focus() {
-        let real = SensorHub::new(Arc::new(Fixed), Some("atl.tilt"), None);
-        assert!(!real.hal_bypass_injection());
-        assert_eq!(real.sensor_list().len(), 1);
+    fn injection_needs_an_allow_listed_package_and_focus() {
         let focus = Arc::new(FocusedProcess::default());
         focus.gained(5);
         let hub = SensorHub::new(Arc::new(Nothing), Some("atl.tilt"), Some(focus));

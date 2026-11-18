@@ -96,7 +96,7 @@ struct Args {
     /// Test only: this service (`appops`, `connectivity`, `jobscheduler`, `permissionmgr`, `power`, `uimode`, `webviewupdate`) is not registered (repeat), the deliberate break of the app gate's line for it (its manager is then null).
     #[arg(long)]
     omit_service: Vec<String>,
-    /// Start `sensorservice` in HAL bypass data injection mode with this package allow-listed (AOSP `dumpsys sensorservice hal_bypass_replay_data_injection <package>`); refused while the machine has a real accelerometer. atld `--tilt-keys` sets it.
+    /// Start `sensorservice` in HAL bypass data injection mode with this package allow-listed (AOSP `dumpsys sensorservice hal_bypass_replay_data_injection <package>`); a real accelerometer is then replaced by the injected one for every app of this instance. atld `--tilt-keys` sets it.
     #[arg(long)]
     sensor_injection: Option<String>,
     /// Test only: injected events are accepted from any process, not only the focused window's, the deliberate break of the sensors gate's tilt `focus` sub-gate.
