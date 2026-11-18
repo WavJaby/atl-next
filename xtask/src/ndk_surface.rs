@@ -8,8 +8,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use object::read::elf::ElfFile64;
-use object::{Endianness, Object, ObjectSymbol};
+use object::elf::{FileHeader32, FileHeader64};
+use object::read::elf::{ElfFile, FileHeader};
+use object::{Endianness, FileKind, Object, ObjectSymbol};
 
 /// symbolfile ALL_ARCHITECTURES: tags restricting a node or symbol to these arches.
 const ARCH_TAGS: &[&str] = &["arm", "arm64", "riscv64", "x86", "x86_64"];
@@ -114,9 +115,17 @@ pub const FRONT_SCRIPTS: &[(&str, &str)] = &[
 /// The (version node, symbol) pairs `lib` defines and exports dynamically; an unversioned one has node "". The version definitions' own symbols are not exports.
 pub fn exports(lib: &Path) -> Result<Surface> {
     let data = std::fs::read(lib).with_context(|| format!("reading {}", lib.display()))?;
-    let elf = ElfFile64::<Endianness>::parse(&*data)?;
+    match FileKind::parse(&*data)? {
+        FileKind::Elf32 => exports_of::<FileHeader32<Endianness>>(&data),
+        _ => exports_of::<FileHeader64<Endianness>>(&data),
+    }
+    .with_context(|| format!("reading {}", lib.display()))
+}
+
+fn exports_of<H: FileHeader<Endian = Endianness>>(data: &[u8]) -> Result<Surface> {
+    let elf = ElfFile::<H>::parse(data)?;
     let endian = elf.endian();
-    let versions = elf.elf_section_table().versions(endian, &*data)?;
+    let versions = elf.elf_section_table().versions(endian, data)?;
     let mut out = Surface::new();
     for s in elf
         .dynamic_symbols()
@@ -161,12 +170,20 @@ pub type Binding = (String, String, String);
 /// Every versioned undefined dynamic symbol of `lib`.
 pub fn bindings(lib: &Path) -> Result<Vec<Binding>> {
     let data = std::fs::read(lib).with_context(|| format!("reading {}", lib.display()))?;
-    let elf = ElfFile64::<Endianness>::parse(&*data)?;
+    match FileKind::parse(&*data)? {
+        FileKind::Elf32 => bindings_of::<FileHeader32<Endianness>>(&data),
+        _ => bindings_of::<FileHeader64<Endianness>>(&data),
+    }
+    .with_context(|| format!("reading {}", lib.display()))
+}
+
+fn bindings_of<H: FileHeader<Endian = Endianness>>(data: &[u8]) -> Result<Vec<Binding>> {
+    let elf = ElfFile::<H>::parse(data)?;
     let endian = elf.endian();
     let sections = elf.elf_section_table();
     let versions = sections
-        .versions(endian, &*data)?
-        .with_context(|| format!("{}: no .gnu.version", lib.display()))?;
+        .versions(endian, data)?
+        .context("no .gnu.version")?;
     let mut out = Vec::new();
     for s in elf.dynamic_symbols().filter(|s| s.is_undefined()) {
         let name = s.name()?;
