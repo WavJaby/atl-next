@@ -629,9 +629,17 @@ fn compile_as(
         bail!("{rel} entry lacks command/file/output");
     };
     let obj = flat.join("swapped.o");
-    let cmd = command
-        .replace(output, &obj.display().to_string())
-        .replace(file, &src.display().to_string());
+    // the copy sits in another directory: `-iquote` the original's, so its `#include "x.h"` still finds siblings first (linux-user/trace.h before the top-level one)
+    let home = Path::new(file)
+        .parent()
+        .with_context(|| format!("{file}: no directory"))?;
+    let cmd = format!(
+        "{} -iquote {}",
+        command
+            .replace(output, &obj.display().to_string())
+            .replace(file, &src.display().to_string()),
+        home.display()
+    );
     let log = dir.join(format!("{name}.log"));
     let out = Command::new("sh")
         .args(["-c", &cmd])
