@@ -32,6 +32,9 @@ gbm.workspace = true
 rustix.workspace = true
 signal-hook.workspace = true
 
+[dev-dependencies]
+atl-gralloc-dmabuf = { path = "../atl-gralloc-dmabuf" }
+
 [build-dependencies]
 anyhow.workspace = true
 atl-bridgegen = { path = "../atl-bridgegen" }

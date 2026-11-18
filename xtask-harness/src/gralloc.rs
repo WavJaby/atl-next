@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! `xtask test gralloc`: our allocator service and `mapper.atl.so` against AOSP's own libui, in binder.rs's harness (binderd + AOSP servicemanager).
 //! 1. The test layout's /vendor manifest declares what atld declares (`atl_gralloc::vintf::device_hals`): the allocator instance and the mapper library. servicemanager would refuse the @VintfStability service otherwise, and libui checks `isDeclared` before it loads anything.
-//! 2. `atl-gralloc-allocator` as uid 1000 registers `android.hardware.graphics.allocator.IAllocator/default` and allocates through GBM on this host's DRM device (WSL: vgem).
+//! 2. `atl-gralloc-allocator` as uid 1000 registers `android.hardware.graphics.allocator.IAllocator/default` and allocates through GBM on this host's DRM device (WSL: vgem), or with `--allocator-tier udmabuf` through `/dev/udmabuf` (its own gate row: the tier line must name it and `alloc_udmabuf` count the buffers; a host without the device gets "host lacks udmabuf").
 //! 3. `atl-gralloc-probe writer` and `reader` as two app-uid processes with `mapper.atl.so` on their library path: libui (`AHardwareBuffer_*`, Gralloc5) allocates 64x64 RGBA_8888, locks, writes an analytic pattern, unlocks, and sends the handle over a unix socket;
 //!    the reader (a second process: `importBuffer` of the mapper) compares every pixel, checks libui's decode of our standard metadata (describe, id, plane layout) agrees, and writes one pixel the writer then sees (shared dma-buf).
 //!
@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use atl_broker::{Broker, Process, to_log};
+use atl_gralloc::node::{self, AllocatorTier};
 use atl_gralloc::vintf;
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 
@@ -31,6 +32,31 @@ pub struct Args {
     /// The DRM node the allocator uses instead of trying /dev/dri's render then card nodes.
     #[arg(long)]
     drm_node: Option<PathBuf>,
+    /// The allocator tier the gate runs on (atl_gralloc::node::AllocatorTier; the allocator's `--allocator-tier`): `gbm` (default), or `udmabuf` -- forced here whatever atld's import probe would pick, so the tier is gated on hosts whose GPUs import too.
+    /// `udmabuf` where the allocator falls back (device absent or not openable): verdict `ok (1 skipped: udmabuf tier -- host lacks udmabuf)` with the allocator's reason, neither pass nor failure.
+    #[arg(long, default_value = "gbm", value_parser = parse_tier)]
+    allocator_tier: AllocatorTier,
+    /// Deliberate check of the "host lacks udmabuf" verdict: with `--allocator-tier udmabuf`, the device is not bound into the allocator's sandbox, so its open fails as on a host without it; the gate must say `host lacks udmabuf`.
+    #[arg(long)]
+    break_unbound: bool,
+}
+
+fn parse_tier(s: &str) -> Result<AllocatorTier, String> {
+    AllocatorTier::parse(s).ok_or_else(|| format!("{s}: want gbm or udmabuf"))
+}
+
+/// The gate's outcome for the tier the allocator reported (`gralloc: allocator tier <t> (<why>)`) against the one asked for: Ok(None) = on it; Ok(Some(why)) = udmabuf asked, the host lacks it (the allocator fell back); Err = anything else.
+fn tier_outcome(want: AllocatorTier, log: &str) -> Result<Option<String>, String> {
+    match node::parse_tier_line(log) {
+        None => Err("the allocator printed no `allocator tier` line".to_owned()),
+        Some((ran, _)) if ran == want => Ok(None),
+        Some((AllocatorTier::Gbm, why)) if want == AllocatorTier::Udmabuf => Ok(Some(why)),
+        Some((ran, why)) => Err(format!(
+            "allocator tier {} ({why}), asked for {}",
+            ran.name(),
+            want.name()
+        )),
+    }
 }
 
 const ALLOCATOR_PACKAGE: &str = "atl-gralloc-service";
@@ -151,6 +177,12 @@ fn wait_limited(child: &mut Child, limit: Duration) -> Result<Option<std::proces
     }
 }
 
+/// `<name>=<n>` of a counters line.
+fn counter(line: &str, name: &str) -> Option<u64> {
+    line.split_whitespace()
+        .find_map(|kv| kv.strip_prefix(name)?.strip_prefix('=')?.parse().ok())
+}
+
 /// The DRM device directory the allocator opens (atl_gralloc_service::backend::DRM_DIR), bound into its sandbox as atld binds it.
 const DRM_DIR: &str = "/dev/dri";
 
@@ -177,18 +209,21 @@ fn spawn_probe(
 }
 
 /// Starts the allocator as the system uid in binder.rs's harness (servicemanager up, the layout's /vendor manifest from `vintf::device_hals`), output to `log`; returns once it printed its ready line.
-/// `drm_node`: its `--drm-node`, bound into the sandbox when outside `/dev/dri`.
+/// `drm_node`: its `--drm-node`, bound into the sandbox when outside `/dev/dri`. `tier`: its `--allocator-tier`; udmabuf binds the device when it exists and `bind_udmabuf` (as atld does for that tier).
 pub fn start_allocator(
     broker: &Broker,
     allocator: &Path,
     env: &[(String, String)],
     log: &Path,
     drm_node: Option<&Path>,
+    tier: AllocatorTier,
+    bind_udmabuf: bool,
 ) -> Result<Child> {
     let mut cmd = Command::new(allocator);
     if let Some(node) = drm_node {
         cmd.arg("--drm-node").arg(node);
     }
+    cmd.arg("--allocator-tier").arg(tier.name());
     cmd.envs(env.iter().cloned());
     let mut s = binder::spawn_of(&cmd, AID_SYSTEM)?;
     (s.stdout, s.stderr) = to_log(std::fs::File::create(log)?)?;
@@ -198,6 +233,10 @@ pub fn start_allocator(
             drm_node
                 .filter(|n| !n.starts_with(DRM_DIR))
                 .map(Path::to_path_buf),
+        )
+        .chain(
+            Some(PathBuf::from(node::UDMABUF_DEVICE))
+                .filter(|d| bind_udmabuf && tier == AllocatorTier::Udmabuf && d.exists()),
         )
         .collect();
     let Process {
@@ -232,6 +271,10 @@ pub fn allocator(root: &Path, out: &Path) -> Result<PathBuf> {
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
+    ensure!(
+        !args.break_unbound || args.allocator_tier == AllocatorTier::Udmabuf,
+        "--break-unbound checks the udmabuf tier: give --allocator-tier udmabuf"
+    );
     let out = crate::build_state::gate_out(root, args.out.as_deref(), &args.host, "gralloc")?;
     let device = out.join("device");
     let servicemanager = device.join("servicemanager/servicemanager");
@@ -257,7 +300,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let (broker, mut binderd) = binder::start_binderd(root, &out, &test_root.join("binderd.log"))?;
     let (mut sm, found) =
         binder::start_servicemanager(&broker, &test_root, &servicemanager, &service, &env)?;
-    let result = (|| -> Result<Vec<String>> {
+    // (failures, the host's reason when the udmabuf tier was asked for and the allocator fell back)
+    let result = (|| -> Result<(Vec<String>, Option<String>)> {
         ensure!(
             found.0,
             "servicemanager did not come up: {}",
@@ -270,7 +314,28 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             &env,
             &alloc_log,
             args.drm_node.as_deref(),
+            args.allocator_tier,
+            !args.break_unbound,
         )?;
+        match tier_outcome(
+            args.allocator_tier,
+            &std::fs::read_to_string(&alloc_log).unwrap_or_default(),
+        ) {
+            Ok(None) => println!(
+                "gralloc: pass allocator tier {}",
+                args.allocator_tier.name()
+            ),
+            Ok(Some(why)) => {
+                let _ = alloc.kill();
+                let _ = alloc.wait();
+                return Ok((Vec::new(), Some(why)));
+            }
+            Err(e) => {
+                let _ = alloc.kill();
+                let _ = alloc.wait();
+                return Ok((vec![e], None));
+            }
+        }
 
         // the two processes of the probe, joined by a unix socket
         let (a, b) = socketpair(
@@ -317,24 +382,51 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .rev()
             .find(|l| l.starts_with(COUNTERS_LINE))
         {
-            Some(line) => println!("{line}"),
+            Some(line) => {
+                println!("{line}");
+                // the udmabuf tier counted its buffers and GBM picked no layout; the line reprints only when a tier counter first turns non-zero (allocator.rs `log_key`), so later buffers do not show: the tier line is what says every buffer came from the tier (backend.rs routes all of them there)
+                if args.allocator_tier == AllocatorTier::Udmabuf {
+                    let n = counter(line, "alloc_udmabuf").unwrap_or(0);
+                    let m = counter(line, "alloc_modifier").unwrap_or(0);
+                    if n < 1 || m != 0 {
+                        fails.push(format!(
+                            "alloc_udmabuf={n} alloc_modifier={m}, want >= 1 and 0"
+                        ));
+                    }
+                }
+            }
             None => fails.push(format!("the allocator printed no `{COUNTERS_LINE}` line")),
         }
-        Ok(fails)
+        Ok((fails, None))
     })();
     let _ = sm.child.kill();
     sm.child.wait().ok();
     drop(broker);
     binderd.child.wait()?;
-    let fails = result?;
+    let (fails, lacks) = result?;
+    if let Some(why) = lacks {
+        println!("gralloc: host lacks udmabuf ({why})");
+        println!(
+            "{}",
+            crate::verdict::Verdict {
+                cmd: "gralloc",
+                total: None,
+                skipped: vec!["udmabuf tier -- host lacks udmabuf"],
+                failures: Vec::new(),
+            }
+            .line()
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
     for f in &fails {
         println!("gralloc: FAIL {f}");
     }
     if fails.is_empty() {
         println!(
-            "gralloc: pass (AOSP libui allocated, locked, shared and read a 64x64 RGBA_8888 buffer through {} and {})",
+            "gralloc: pass (AOSP libui allocated, locked, shared and read a 64x64 RGBA_8888 buffer through {} and {}, allocator tier {})",
             vintf::allocator_service_name(),
-            vintf::mapper_library_name()
+            vintf::mapper_library_name(),
+            args.allocator_tier.name()
         );
         return Ok(ExitCode::SUCCESS);
     }
@@ -352,6 +444,23 @@ mod tests {
             .filter(|c| **c != "end")
             .map(|c| format!("gralloc: pass {role}:{c}\n"))
             .collect()
+    }
+
+    /// Lines as the allocator prints them (allocator.rs main, node::tier_line).
+    #[test]
+    fn tier_outcome_separates_on_tier_host_lacks_and_wrong_tier() {
+        let udma = "gralloc: allocator tier udmabuf (requested)\n";
+        let fell = "gralloc: allocator tier gbm (udmabuf requested, unavailable: /dev/udmabuf: Permission denied (os error 13))\n";
+        let gbm = "gralloc: allocator tier gbm (requested)\n";
+        assert_eq!(tier_outcome(AllocatorTier::Udmabuf, udma), Ok(None));
+        assert_eq!(tier_outcome(AllocatorTier::Gbm, gbm), Ok(None));
+        let lacks = tier_outcome(AllocatorTier::Udmabuf, fell).expect("lacks");
+        assert!(lacks.is_some_and(|w| w.contains("Permission denied")));
+        assert!(tier_outcome(AllocatorTier::Gbm, udma).is_err());
+        assert!(tier_outcome(AllocatorTier::Udmabuf, "gralloc: ready (x)\n").is_err());
+        let line = "gralloc: counters modifier_invalid_linear=1 alloc_linear=1 alloc_modifier=0 alloc_udmabuf=3 refused_no_modifier=0";
+        assert_eq!(counter(line, "alloc_udmabuf"), Some(3));
+        assert_eq!(counter(line, "alloc_linear"), Some(1));
     }
 
     #[test]

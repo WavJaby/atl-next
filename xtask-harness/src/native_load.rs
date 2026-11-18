@@ -634,6 +634,8 @@ impl Env {
             &lib_env,
             &test_root.join("allocator.log"),
             None,
+            atl_gralloc::node::AllocatorTier::Gbm,
+            false,
         )?;
         let mut cmd = self.host.command_with(
             &self.launcher_opts,

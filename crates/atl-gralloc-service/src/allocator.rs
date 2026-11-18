@@ -61,8 +61,8 @@ pub struct Allocator {
     pid: u32,
 }
 
-/// (modifier_invalid_linear, refused_no_modifier, alloc_linear != 0, alloc_modifier != 0)
-type LogKey = (u64, u64, bool, bool);
+/// (modifier_invalid_linear, refused_no_modifier, alloc_linear != 0, alloc_modifier != 0, alloc_udmabuf != 0)
+type LogKey = (u64, u64, bool, bool, bool);
 
 impl Allocator {
     pub fn new(backend: Backend) -> Self {
@@ -70,7 +70,7 @@ impl Allocator {
             backend,
             counter: AtomicU32::new(1),
             refused_no_modifier: AtomicU64::new(0),
-            counters_logged: Mutex::new((0, 0, false, false)),
+            counters_logged: Mutex::new((0, 0, false, false, false)),
             modifiers_seen: Mutex::new(Vec::new()),
             pid: std::process::id(),
         };
@@ -99,6 +99,7 @@ impl Allocator {
             load(&self.refused_no_modifier),
             load(&c.alloc_linear) != 0,
             load(&c.alloc_modifier) != 0,
+            load(&c.alloc_udmabuf) != 0,
         )
     }
 
@@ -119,10 +120,11 @@ impl Allocator {
         let c = self.backend.counters();
         let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
         format!(
-            "gralloc: counters modifier_invalid_linear={} alloc_linear={} alloc_modifier={} refused_no_modifier={}",
+            "gralloc: counters modifier_invalid_linear={} alloc_linear={} alloc_modifier={} alloc_udmabuf={} refused_no_modifier={}",
             load(&c.modifier_invalid_linear),
             load(&c.alloc_linear),
             load(&c.alloc_modifier),
+            load(&c.alloc_udmabuf),
             load(&self.refused_no_modifier),
         )
     }

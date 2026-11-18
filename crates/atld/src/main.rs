@@ -42,7 +42,7 @@ use atl_broker::{
     BinderPids, Broker, INSTALLER_UID, Link, Mount, Process, Profile, Spawn, gpu, kill_sandbox,
     seccomp_death, terminate_sandbox, to_log, tree_mounts,
 };
-use atl_gralloc::node::{self, NodeSource};
+use atl_gralloc::node::{self, AllocatorTier, NodeSource, UDMABUF_DEVICE};
 use atl_gralloc::vintf;
 use atl_platform_host::{
     DesktopNotification, Notifications, PlatformNotifications, Posted, Urgency,
@@ -98,7 +98,8 @@ struct Args {
     #[arg(long)]
     gralloc: Option<PathBuf>,
     /// atl-egl-probe executable: with `--gralloc` and `--ui`, run once (`--display-node`) to ask the desktop's Wayland EGL display which GPU it renders on; gralloc and every app then use that node (atl_gralloc::node).
-    /// Needed whenever both are given. Headless runs, and displays naming no node, keep gralloc's own trial (the baseline tier).
+    /// Headless runs, and displays naming no node, take the node by gralloc's own trial, run in the probe (`--trial-node`) before gralloc starts. Then per render path (`--renderer`), which also reports whether the apps' GPUs import a gralloc buffer: gralloc's allocator tier (node::choose_allocator_tier).
+    /// Needed whenever `--gralloc` is given.
     #[arg(long)]
     gpu_probe: Option<PathBuf>,
     /// atl-engine-cpuinfo executable: for each `--abi` ISA whose engine `.so` a `--file` places (atl-android-paths `engine_library`), run once in the sandbox; its stdout, the guest's /proc/cpuinfo as the engine formats it, is cached as `<root>/cpuinfo.<isa>`
@@ -2081,10 +2082,14 @@ fn run(a: &Args) -> Result<ExitCode> {
             cpuinfo.insert(isa, cached);
         }
     }
-    // gralloc before any app can start (a --launch request may come with the services' first breath): the node it allocates on goes into every app's properties
-    let mut gralloc = None;
-    let mut gpu = None;
-    if let Some(program) = &a.gralloc {
+    // the run's GPU node before gralloc starts (gralloc starts below the render-path probe, before any app can: a --launch request may come with the services' first breath): the display's node, else gralloc's trial run in the probe
+    // (node, how chosen, the display's modifier lists, the display probe's renderer or why it named no node)
+    type Planned = (String, NodeSource, Vec<(u32, Vec<u64>)>, String);
+    let mut planned: Option<Planned> = None;
+    if a.gralloc.is_some() {
+        let Some(probe) = &a.gpu_probe else {
+            bail!("--gralloc needs --gpu-probe (atl-egl-probe)");
+        };
         let display_node = match (&a.ui, &a.gpu_probe) {
             (None, _) => Err("headless run".to_owned()),
             (Some(_), None) => bail!("--gralloc with --ui needs --gpu-probe (atl-egl-probe)"),
@@ -2119,54 +2124,30 @@ fn run(a: &Args) -> Result<ExitCode> {
                     .ok_or(format!("renderer {renderer}"))
             }
         };
-        let mut spawn = system_spawn("gralloc", program, vec![], false, None)?;
-        // the display's GPU only; the trial tier tries every node, so it sees every GPU
-        spawn.devices = match &display_node {
-            Ok((n, _, modifiers)) => {
-                spawn.args = vec!["--drm-node".into(), n.into()];
-                for (fourcc, mods) in modifiers {
-                    let arg = node::modifier_arg(*fourcc, mods);
-                    // own prefix: `gpu:` is the one node line the run-apk gate reads
-                    log(format_args!("gpu-modifiers: {arg} (probe)"));
-                    spawn.args.push("--modifiers".into());
-                    spawn.args.push(arg.into());
-                }
-                gpu::device_class(Path::new(n))
-            }
-            Err(_) => gpu::all_device_classes(),
-        }
-        .context("gralloc's device nodes")?;
-        let mut p = broker
-            .spawn(spawn)
-            .context("starting atl-gralloc-allocator")?;
-        wait_ready(
-            &mut p.child,
-            &r.log("gralloc"),
-            GRALLOC_READY_LINE,
-            "atl-gralloc-allocator",
-            READY,
-        )?;
-        let allocated = gralloc_node(&std::fs::read_to_string(r.log("gralloc"))?)
-            .context("gralloc's ready line names no node")?;
-        log(format_args!("gralloc ready"));
-        gralloc = Some(p);
-        let source = match display_node {
-            Ok((n, renderer, _)) => {
-                ensure!(
-                    allocated == n,
-                    "gralloc allocates on {allocated}, the display renders on {n}"
-                );
-                log(format_args!("gpu: node {n} (display, renderer {renderer})"));
-                NodeSource::Display
-            }
+        planned = Some(match display_node {
+            Ok((n, renderer, modifiers)) => (n, NodeSource::Display, modifiers, renderer),
             Err(why) => {
-                log(format_args!(
-                    "gpu: display reports no node ({why}); allocator node {allocated} by trial"
-                ));
-                NodeSource::Trial
+                // gralloc's own trial (atl_gralloc_service Backend::start), in the probe, with the grant the trial needs: every GPU
+                let mut spawn =
+                    system_spawn("gpu-trial", probe, vec!["--trial-node".into()], false, None)?;
+                spawn.devices = gpu::all_device_classes().context("the GPUs' device nodes")?;
+                let mut p = broker
+                    .spawn(spawn)
+                    .with_context(|| format!("starting {}", probe.display()))?;
+                let status = p.child.wait()?;
+                let text = std::fs::read_to_string(r.log("gpu-trial"))?;
+                let n = node::parse_trial_line(&text)
+                    .filter(|_| status.success())
+                    .with_context(|| {
+                        format!(
+                            "{} --trial-node exited {status}:\n{}",
+                            probe.display(),
+                            text.trim()
+                        )
+                    })?;
+                (n, NodeSource::Trial, vec![], why)
             }
-        };
-        gpu = Some((allocated, source));
+        });
     }
     let (control_ours, control_theirs) = socketpair(
         AddressFamily::UNIX,
@@ -2212,8 +2193,8 @@ fn run(a: &Args) -> Result<ExitCode> {
     // the run's GPU's device class (gpu::device_class), as AOSP grants an app gpu_device per device (system/sepolicy private/app.te:393): the host EGL driver renders into, and imports, the gralloc dmabufs through them;
     // without them it falls back to the software device, which cannot import a window's buffers. No gralloc: no chosen GPU, every GPU's class.
     // + the DMABUF system heap on the heap tier only (narrowest grant): Codec2 allocates linear blocks from it in the app process
-    let mut app_devices = match &gpu {
-        Some((n, _)) => gpu::device_class(Path::new(n)),
+    let mut app_devices = match &planned {
+        Some((n, ..)) => gpu::device_class(Path::new(n)),
         None => gpu::all_device_classes(),
     }
     .context("the apps' device nodes")?;
@@ -2228,31 +2209,42 @@ fn run(a: &Args) -> Result<ExitCode> {
         // the left button is one finger on SOURCE_TOUCHSCREEN: a single-touch screen, as AOSP's android.hardware.touchscreen.xml declares it (no multitouch: one pointer)
         host_features.extend(FEATURES_TOUCHSCREEN);
     }
-    if let (Some((n, _)), Some(probe)) = (&gpu, &a.gpu_probe) {
-        let probe_renderer =
-            |name: &str,
-             devices: Vec<PathBuf>,
-             env: Vec<(OsString, OsString)>|
-             -> Result<std::result::Result<atl_gralloc::node::Renderer, String>> {
-                let mut spawn = system_spawn(
-                    name,
-                    probe,
-                    vec!["--renderer".into(), "--render".into(), n.into()],
-                    false,
-                    None,
-                )?;
-                spawn.devices = devices;
-                spawn.env.extend(env);
-                spawn.mounts.extend(desktop_mounts()?);
-                let mut p = broker
-                    .spawn(spawn)
-                    .with_context(|| format!("starting {}", probe.display()))?;
-                let status = p.child.wait()?;
-                let text = std::fs::read_to_string(r.log(name))?;
-                Ok(atl_gralloc::node::parse_renderer_line(&text)
-                    .filter(|_| status.success())
-                    .ok_or_else(|| format!("probe exited {status}: {}", text.trim())))
-            };
+    // whether the apps' GPUs import a gralloc buffer, as the probe of the path that runs reports it (node::IMPORT_LINE): gralloc's allocator tier
+    let mut imports = None;
+    if let (Some((n, ..)), Some(probe)) = (&planned, &a.gpu_probe) {
+        let probe_renderer = |name: &str,
+                              devices: Vec<PathBuf>,
+                              env: Vec<(OsString, OsString)>|
+         -> Result<
+            std::result::Result<(atl_gralloc::node::Renderer, Option<node::Imports>), String>,
+        > {
+            let mut spawn = system_spawn(
+                name,
+                probe,
+                vec!["--renderer".into(), "--render".into(), n.into()],
+                false,
+                None,
+            )?;
+            spawn.devices = devices;
+            // as arguments, not the probe's environment: it allocates its import buffer before setting them, as the allocator (without them) does
+            for (k, v) in env {
+                let mut kv = k;
+                kv.push("=");
+                kv.push(v);
+                spawn.args.push("--render-env".into());
+                spawn.args.push(kv);
+            }
+            spawn.mounts.extend(desktop_mounts()?);
+            let mut p = broker
+                .spawn(spawn)
+                .with_context(|| format!("starting {}", probe.display()))?;
+            let status = p.child.wait()?;
+            let text = std::fs::read_to_string(r.log(name))?;
+            Ok(atl_gralloc::node::parse_renderer_line(&text)
+                .filter(|_| status.success())
+                .map(|rend| (rend, node::parse_import_lines(&text)))
+                .ok_or_else(|| format!("probe exited {status}: {}", text.trim())))
+        };
         let candidates = gpu::render_paths();
         // probed even without candidates: its GL_VERSION is what the apps get on the baseline (ro.opengles.version)
         let baseline = probe_renderer("gpu-render-baseline", app_devices.clone(), vec![])?;
@@ -2272,14 +2264,14 @@ fn run(a: &Args) -> Result<ExitCode> {
                     .collect();
                 let name = format!("gpu-render-{}", path.module);
                 match (probe_renderer(&name, devices, env.clone())?, &baseline) {
-                    (Ok(rend), Ok(base)) if rend.renderer != base.renderer => {
+                    (Ok(rend), Ok(base)) if rend.0.renderer != base.0.renderer => {
                         chosen = Ok((path, rend, env));
                         break;
                     }
                     (Ok(rend), _) => {
                         chosen = Err(format!(
                             "{}: renders on the baseline's {}",
-                            path.module, rend.renderer
+                            path.module, rend.0.renderer
                         ))
                     }
                     (Err(e), _) => chosen = Err(format!("{}: {e}", path.module)),
@@ -2289,18 +2281,22 @@ fn run(a: &Args) -> Result<ExitCode> {
         };
         // what the GL of the path that runs reports; None when no probe answered
         let ran = match chosen {
-            Ok((path, rend, env)) => {
+            Ok((path, (rend, imp), env)) => {
                 log(format_args!(
                     "gpu-render: path {} (renderer {}, {})",
                     path.module, rend.renderer, rend.version
                 ));
                 app_devices.extend(path.nodes.iter().map(PathBuf::from));
                 app_env = env;
+                imports = imp;
                 Some(rend)
             }
             Err(why) => {
                 log(format_args!("gpu-render: path baseline ({why})"));
-                baseline.ok()
+                baseline.ok().map(|(rend, imp)| {
+                    imports = imp;
+                    rend
+                })
             }
         };
         // the extension pack (a device with it declares the feature, CDD 7.1.4.1, as its vendor permission file does) and the GLES version of the path that runs (the vendor build.prop's, on Android); unset when no probe answered or the string is not GLES's; both via device_gl
@@ -2323,6 +2319,77 @@ fn run(a: &Args) -> Result<ExitCode> {
             }
             None => log(format_args!("gles: unset (no renderer probed)")),
         }
+    }
+    // gralloc on the planned node, with its allocator tier: udmabuf only where no GPU of an app process imports its buffer and /dev/udmabuf opens (node::choose_allocator_tier); the device is bound only then
+    let mut gralloc = None;
+    let mut gpu = None;
+    if let (Some(program), Some((n, source, modifiers, renderer))) = (&a.gralloc, planned) {
+        let udmabuf = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(UDMABUF_DEVICE)
+            .map(drop)
+            .map_err(|e| format!("{UDMABUF_DEVICE}: {e}"));
+        let (want, why) = node::choose_allocator_tier(imports.as_ref(), udmabuf);
+        let mut spawn = system_spawn(
+            "gralloc",
+            program,
+            vec![
+                "--drm-node".into(),
+                (&n).into(),
+                "--allocator-tier".into(),
+                want.name().into(),
+            ],
+            false,
+            None,
+        )?;
+        for (fourcc, mods) in &modifiers {
+            let arg = node::modifier_arg(*fourcc, mods);
+            // own prefix: `gpu:` is the one node line the run-apk gate reads
+            log(format_args!("gpu-modifiers: {arg} (probe)"));
+            spawn.args.push("--modifiers".into());
+            spawn.args.push(arg.into());
+        }
+        spawn.devices = gpu::device_class(Path::new(&n)).context("gralloc's device nodes")?;
+        if want == AllocatorTier::Udmabuf {
+            spawn.devices.push(PathBuf::from(UDMABUF_DEVICE));
+        }
+        let mut p = broker
+            .spawn(spawn)
+            .context("starting atl-gralloc-allocator")?;
+        wait_ready(
+            &mut p.child,
+            &r.log("gralloc"),
+            GRALLOC_READY_LINE,
+            "atl-gralloc-allocator",
+            READY,
+        )?;
+        let text = std::fs::read_to_string(r.log("gralloc"))?;
+        let allocated = gralloc_node(&text).context("gralloc's ready line names no node")?;
+        // the tier gralloc runs (a udmabuf request that does not allocate falls back to gbm and says why)
+        let (ran, fallback) =
+            node::parse_tier_line(&text).context("gralloc printed no allocator tier line")?;
+        let why = if ran == want {
+            why
+        } else {
+            format!("{why}; {fallback}")
+        };
+        log(format_args!("{}", node::tier_line(ran, &why)));
+        log(format_args!("gralloc ready"));
+        gralloc = Some(p);
+        ensure!(
+            allocated == n,
+            "gralloc allocates on {allocated}, the probe chose {n}"
+        );
+        match source {
+            NodeSource::Display => {
+                log(format_args!("gpu: node {n} (display, renderer {renderer})"));
+            }
+            NodeSource::Trial => log(format_args!(
+                "gpu: display reports no node ({renderer}); allocator node {n} by trial"
+            )),
+        }
+        gpu = Some((allocated, source));
     }
     // the host's WebView capability: the web engine module loads in a process with the apps' library path (PROBE_WEB_ENGINE)
     {

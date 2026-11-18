@@ -2,13 +2,14 @@
 //! The graphics allocator HAL service (AIDL `android.hardware.graphics.allocator.IAllocator`, instance `default`) AOSP libui's Gralloc5 allocates through.
 //!
 //! - `policy`: the modifier set per usage, from atld's probe lists.
-//! - `backend`: dma-bufs from the host's DRM device through GBM (LINEAR, or GBM's pick inside the set), on a thread of their own (GBM objects are not `Send`).
-//! - `prime`: the dma-buf export (DRM PRIME ioctl) and the GEM handle read out of GBM, the crate's only `unsafe`.
+//! - `backend`: the one allocation entry, two tiers: dma-bufs from the host's DRM device through GBM (LINEAR, or GBM's pick inside the set), on a thread of their own (GBM objects are not `Send`); or `udmabuf` buffers when atld asks for that tier.
+//! - `udmabuf`: memfd-backed dma-bufs through `/dev/udmabuf` (cached system memory, LINEAR).
+//! - `prime`: the dma-buf export (DRM PRIME ioctl) and the GEM handle read out of GBM.
 //! - `allocator`: one allocation -- the dma-buf, the shared metadata page, the handle parameters.
 //! - `service` (feature `converter`): the `IAllocator` implementation on AOSP's Rust stub; served by the bin `atl-gralloc-allocator`.
 //!
 //! The mapper half is atl-gralloc-mapper (`mapper.atl.so`, loaded into each client process). Buffer layout, metadata and the VINTF names are atl-gralloc's.
-//! Boundary crate (GPU / dmabuf interop): `unsafe` only in `prime`.
+//! Boundary crate (GPU / dmabuf interop): `unsafe` only in `prime` and `udmabuf` (one ioctl each).
 #![deny(unsafe_code)]
 
 pub mod allocator;
@@ -18,3 +19,5 @@ pub mod policy;
 mod prime;
 #[cfg(feature = "converter")]
 pub mod service;
+#[allow(unsafe_code)]
+pub mod udmabuf;

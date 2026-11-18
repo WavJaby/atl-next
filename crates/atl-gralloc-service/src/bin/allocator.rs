@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! atl-gralloc-allocator: registers `android.hardware.graphics.allocator.IAllocator/default` with servicemanager and serves it on libbinder's thread pool until SIGTERM (exit totals, exit 0) or killed.
 //! Runs as the system uid (servicemanager accepts addService from it) and needs the VINTF manifest to declare the instance (atl_gralloc::vintf::device_hals): servicemanager refuses to register an undeclared @VintfStability service.
-//! Prints `gralloc: ready (<DRM node>)` once registered; refusals and allocation failures print on stderr.
+//! Prints `gralloc: allocator tier <gbm|udmabuf> (<why>)` once its backend runs, `gralloc: ready (<DRM node>)` once registered; refusals and allocation failures print on stderr.
 #![forbid(unsafe_code)]
 
 // the converter's rlib, on the crate search path build.rs sets (no cargo dependency names it)
@@ -15,10 +15,11 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use atl_gralloc::format::DRM_FORMAT_MOD_LINEAR;
+use atl_gralloc::node::AllocatorTier;
 use atl_gralloc::{node, vintf};
 use atl_gralloc_service::allocator::Allocator;
 use atl_gralloc_service::backend::{Backend, DRM_DIR};
-use atl_gralloc_service::service;
+use atl_gralloc_service::{service, udmabuf};
 use binder::ProcessState;
 use clap::Parser;
 use signal_hook::consts::{SIGINT, SIGTERM};
@@ -32,6 +33,13 @@ struct Args {
     /// The modifier set atld's display probe found for one fourcc, `<FOURCC>=<hex>,...` (atl_gralloc::node::modifier_arg), repeatable. GPU-only buffers of that fourcc allocate inside it (policy.rs `modifiers_for`); a fourcc without one stays LINEAR.
     #[arg(long, value_parser = parse_modifiers)]
     modifiers: Vec<(u32, Vec<u64>)>,
+    /// The allocation tier (atl_gralloc::node::AllocatorTier): `gbm`, or `udmabuf` (atld's import probe found no GPU of an app process importing; the device must be bound). A `udmabuf` that does not allocate falls back to `gbm`; the `allocator tier` line says which and why.
+    #[arg(long, default_value = "gbm", value_parser = parse_tier)]
+    allocator_tier: AllocatorTier,
+}
+
+fn parse_tier(s: &str) -> Result<AllocatorTier, String> {
+    AllocatorTier::parse(s).ok_or_else(|| format!("{s}: want gbm or udmabuf"))
 }
 
 fn parse_modifiers(s: &str) -> Result<(u32, Vec<u64>), String> {
@@ -51,8 +59,15 @@ fn main() -> Result<()> {
         };
         writeln!(std::io::stderr(), "gralloc: modifiers {line}")?;
     }
-    let backend =
-        Backend::start(DRM_DIR.as_ref(), a.drm_node.as_deref()).context("gralloc backend")?;
+    let backend = Backend::start_tier(
+        DRM_DIR.as_ref(),
+        a.drm_node.as_deref(),
+        a.allocator_tier,
+        udmabuf::DEVICE.as_ref(),
+    )
+    .context("gralloc backend")?;
+    let (tier, why) = backend.tier();
+    writeln!(std::io::stderr(), "gralloc: {}", node::tier_line(tier, why))?;
     let node = backend.node().to_owned();
     let allocator = Arc::new(Allocator::new(backend));
     ProcessState::start_thread_pool();

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The GBM backend: dma-bufs from the host's DRM device, LINEAR or a layout GBM picks from the request's modifier set.
+//! The allocation backend, two tiers behind one `allocate`: GBM (dma-bufs from the host's DRM device, LINEAR or a layout GBM picks from the request's modifier set; the baseline) and udmabuf (memfd pages, udmabuf.rs; asked for by atld where no GPU of an app process imports, node::choose_allocator_tier).
 //! GBM objects are not `Send`, so one thread owns the device and serves allocation requests over a channel; the binder threads only send requests.
 //! Node choice is by trial, not by driver name: every `renderD*` then every `card*` node under the DRM directory is opened and asked for a test buffer, and the first that gives one wins.
 //! Render nodes are tried first because on real GPUs they allocate without master rights; a driver that only allocates dumb / linear buffers on its card node (the kernel's `vgem`, which the WSL setup uses: measured 2026-11-04 on 6.6.87.2-microsoft-standard-WSL2, `DRM_IOCTL_MODE_CREATE_DUMB` on `renderD128` fails EACCES, on `card0` works) is found the same way.
@@ -19,11 +19,13 @@ use atl_gralloc::format::{
     BLOB, BLOB_ROW_BYTES, DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR, RGBA_8888,
 };
 use atl_gralloc::handle::DeviceNumber;
+use atl_gralloc::node::AllocatorTier;
 use atl_gralloc::usage;
 use gbm::{BufferObjectFlags, Device, Format, Modifier};
 use rustix::fs::{SeekFrom, seek};
 
 use crate::prime;
+use crate::udmabuf::{self, Udmabuf};
 
 /// Where DRM nodes live (the kernel's, `drm_core`).
 pub const DRM_DIR: &str = "/dev/dri";
@@ -74,6 +76,33 @@ pub struct Counters {
     pub alloc_modifier: AtomicU64,
     /// Buffers allocated with set `[LINEAR]` (GBM LINEAR flag): CPU usage, or the linear tier (no probe list). The node probe's own buffer included.
     pub alloc_linear: AtomicU64,
+    /// Buffers of the udmabuf allocator tier (memfd pages), its probe buffer included.
+    pub alloc_udmabuf: AtomicU64,
+}
+
+/// One `/dev/udmabuf` buffer for `c` (udmabuf.rs `layout`: LINEAR, pitch aligned, size page-rounded).
+fn alloc_udmabuf(u: &Udmabuf, c: &Checked, counters: &Counters) -> Result<Dmabuf, BackendError> {
+    let (pitch, size) = udmabuf::layout(c).map_err(BackendError::Alloc)?;
+    let fd = u
+        .create(size)
+        .map_err(|e| BackendError::Alloc(format!("udmabuf of {size} bytes: {e}")))?;
+    counters.alloc_udmabuf.fetch_add(1, Ordering::Relaxed);
+    Ok(Dmabuf {
+        fd,
+        pitch,
+        size,
+        modifier: DRM_FORMAT_MOD_LINEAR,
+    })
+}
+
+/// The udmabuf tier when `want` asks for it and it allocates the probe request; else why not.
+fn open_udmabuf(want: AllocatorTier, dev: &Path, counters: &Counters) -> Result<Udmabuf, String> {
+    if want != AllocatorTier::Udmabuf {
+        return Err("not requested".to_owned());
+    }
+    let u = Udmabuf::open(dev).map_err(|e| format!("{}: {e}", dev.display()))?;
+    alloc_udmabuf(&u, &probe_request(), counters).map_err(|e| e.to_string())?;
+    Ok(u)
 }
 
 /// One buffer.
@@ -128,8 +157,10 @@ pub struct Backend {
     tx: Option<Sender<Request>>,
     thread: Option<JoinHandle<()>>,
     node: PathBuf,
-    /// `node`'s st_rdev: every handle carries it.
+    /// `node`'s st_rdev: every handle carries it, on both tiers (the udmabuf tier keeps the run's node as the buffers' identity: the importers compare it with the node atld named).
     device: DeviceNumber,
+    /// The tier that allocates, and why (the request, or why the udmabuf request fell back to GBM).
+    tier: (AllocatorTier, String),
     counters: Arc<Counters>,
 }
 
@@ -247,8 +278,19 @@ fn open_node(node: &Path, counters: &Counters) -> Result<Device<std::fs::File>, 
 }
 
 impl Backend {
-    /// Starts the GBM thread on `node`, or on the first node of `dir` that allocates the probe request (a linear RGBA_8888 buffer).
+    /// Starts the GBM thread on `node`, or on the first node of `dir` that allocates the probe request (a linear RGBA_8888 buffer); GBM tier.
     pub fn start(dir: &Path, node: Option<&Path>) -> Result<Self, BackendError> {
+        Self::start_tier(dir, node, AllocatorTier::Gbm, Path::new(udmabuf::DEVICE))
+    }
+
+    /// [`Self::start`] asking for tier `want`. [`AllocatorTier::Udmabuf`]: buffers come from `udmabuf_dev` when it allocates the probe request too, else from GBM ([`Self::tier`] says which and why); the DRM node is opened either way (the buffers' identity, and the fallback).
+    pub fn start_tier(
+        dir: &Path,
+        node: Option<&Path>,
+        want: AllocatorTier,
+        udmabuf_dev: &Path,
+    ) -> Result<Self, BackendError> {
+        let udmabuf_dev = udmabuf_dev.to_path_buf();
         let nodes = match node {
             Some(n) => vec![n.to_path_buf()],
             None => candidates(dir),
@@ -256,7 +298,8 @@ impl Backend {
         let counters = Arc::new(Counters::default());
         let thread_counters = Arc::clone(&counters);
         let (tx, rx) = channel::<Request>();
-        let (ready_tx, ready_rx) = channel::<Result<PathBuf, BackendError>>();
+        type Ready = (PathBuf, (AllocatorTier, String));
+        let (ready_tx, ready_rx) = channel::<Result<Ready, BackendError>>();
         let thread = std::thread::Builder::new()
             .name("gbm".into())
             .spawn(move || {
@@ -275,14 +318,29 @@ impl Backend {
                     let _ = ready_tx.send(Err(BackendError::NoNode(tried)));
                     return;
                 };
-                let _ = ready_tx.send(Ok(node));
+                let (udmabuf, tier) = match open_udmabuf(want, &udmabuf_dev, &thread_counters) {
+                    Ok(u) => (Some(u), (AllocatorTier::Udmabuf, "requested".to_owned())),
+                    Err(why) if want == AllocatorTier::Udmabuf => (
+                        None,
+                        (
+                            AllocatorTier::Gbm,
+                            format!("udmabuf requested, unavailable: {why}"),
+                        ),
+                    ),
+                    Err(_) => (None, (AllocatorTier::Gbm, "requested".to_owned())),
+                };
+                let _ = ready_tx.send(Ok((node, tier)));
                 while let Ok(r) = rx.recv() {
-                    let _ = r.reply.send(alloc(&dev, &r.checked, &thread_counters));
+                    let buf = match &udmabuf {
+                        Some(u) => alloc_udmabuf(u, &r.checked, &thread_counters),
+                        None => alloc(&dev, &r.checked, &thread_counters),
+                    };
+                    let _ = r.reply.send(buf);
                 }
             })
             .map_err(|e| BackendError::Alloc(format!("starting the GBM thread: {e}")))?;
         match ready_rx.recv() {
-            Ok(Ok(node)) => {
+            Ok(Ok((node, tier))) => {
                 let device = atl_gralloc::node::device_number(&node)
                     .map_err(|e| BackendError::NoNode(vec![e.to_string()]))?;
                 Ok(Self {
@@ -290,6 +348,7 @@ impl Backend {
                     thread: Some(thread),
                     node,
                     device,
+                    tier,
                     counters,
                 })
             }
@@ -309,6 +368,11 @@ impl Backend {
     /// The node's device number (st_rdev), as every handle of this backend carries it.
     pub fn device(&self) -> DeviceNumber {
         self.device
+    }
+
+    /// The tier that allocates, and why.
+    pub fn tier(&self) -> (AllocatorTier, &str) {
+        (self.tier.0, &self.tier.1)
     }
 
     /// The backend's fallback counters.
@@ -409,6 +473,63 @@ mod tests {
         assert_eq!(
             flags_for(usage::COMPOSER_OVERLAY, &[1]),
             BufferObjectFlags::empty()
+        );
+    }
+
+    /// A udmabuf request on a host whose device does not open falls back to GBM and names the device and the error.
+    #[test]
+    fn udmabuf_request_without_the_device_falls_back_to_gbm_with_the_reason() {
+        let Ok(b) = Backend::start_tier(
+            Path::new(DRM_DIR),
+            None,
+            AllocatorTier::Udmabuf,
+            Path::new("/nonexistent-udmabuf"),
+        ) else {
+            return; // no DRM node here: nothing to fall back to
+        };
+        let (tier, why) = b.tier();
+        assert_eq!(tier, AllocatorTier::Gbm);
+        assert!(why.contains("unavailable: /nonexistent-udmabuf: "), "{why}");
+        assert_eq!(b.counters().alloc_udmabuf.load(Ordering::Relaxed), 0);
+    }
+
+    /// Where udmabuf opens: the tier allocates, the buffer reports LINEAR and udmabuf.rs's pitch rule, and bytes written through one mapping are read through another (one shared memory, cached).
+    #[test]
+    fn udmabuf_tier_allocates_shared_linear_memory() {
+        let Ok(b) = Backend::start_tier(
+            Path::new(DRM_DIR),
+            None,
+            AllocatorTier::Udmabuf,
+            Path::new(udmabuf::DEVICE),
+        ) else {
+            return;
+        };
+        if b.tier().0 != AllocatorTier::Udmabuf {
+            return; // host lacks udmabuf: the fallback test covers it
+        }
+        let mut c = probe_request();
+        c.width = 100;
+        c.height = 3;
+        let d = b.allocate(&c).expect("allocate");
+        // 100 px x 4 B = 400 -> next multiple of 256 = 512; 512 x 3 = 1536 -> one 4096-byte page
+        assert_eq!(
+            (d.pitch, d.size, d.modifier),
+            (512, 4096, DRM_FORMAT_MOD_LINEAR)
+        );
+        let len = usize::try_from(d.size).expect("len");
+        atl_gralloc_dmabuf::Mapping::new(d.fd.as_fd(), len)
+            .expect("map rw")
+            .write(600, &[0x5a]);
+        let bytes = atl_gralloc_dmabuf::Mapping::read_only(d.fd.as_fd(), len)
+            .expect("map ro")
+            .read();
+        assert_eq!(bytes[600], 0x5a);
+        // the start probe and this buffer
+        assert_eq!(b.counters().alloc_udmabuf.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            b.counters().alloc_linear.load(Ordering::Relaxed),
+            1,
+            "the node's probe only"
         );
     }
 

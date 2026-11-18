@@ -8,7 +8,8 @@
 //! `--display-node`: the GPU selector atld runs once per UI run (gpu-selection G1): the Wayland display's device render node + renderer, one `gpu-probe:` line;
 //! where the display names a node, one `gpu-modifiers:` line per gralloc fourcc: renderable on that node's EGL device (`external_only` false) ∩ imported by the Wayland display, 1-plane layouts.
 
-#![forbid(unsafe_code)]
+// one unsafe: `renderer`'s set_var of the render path's variables, single-threaded, before EGL loads
+#![deny(unsafe_code)]
 #![expect(
     clippy::disallowed_types,
     reason = "a measurement tool, not a runtime process: --matrix re-runs this binary per pair so a driver crash stays in its pair"
@@ -65,12 +66,31 @@ struct Args {
     #[arg(long)]
     display_node: bool,
     /// Print GL_VERSION, whether GL_EXTENSIONS has the Android extension pack, and GL_RENDERER of a GLES context on the `--render` device (atl_gralloc::node::renderer_line), under this process's environment; atld runs it per render-path candidate (atl-broker gpu::RENDER_PATHS) and once for the baseline.
+    /// Then whether a gralloc buffer on that node imports on the device and on the Wayland display (atl_gralloc::node::import_line): what atld picks gralloc's allocator tier from.
     #[arg(long, requires = "render")]
     renderer: bool,
+    /// KEY=VALUE of the render path under test (repeatable; atld passes a gpu::RENDER_PATHS row's variables): set after the import probe's buffer is allocated and before EGL loads, as an app process gets them and the allocator does not.
+    #[arg(long = "render-env", value_name = "KEY=VALUE", requires = "renderer")]
+    render_env: Vec<String>,
+    /// Print the DRM node gralloc's own trial picks (atl_gralloc::node::trial_line): the first of /dev/dri's render then card nodes that allocates, through the allocator's backend; atld runs it when the display names no node, before gralloc starts.
+    #[arg(long)]
+    trial_node: bool,
 }
 
 fn main() -> ExitCode {
     let args = Args::parse();
+    if args.trial_node {
+        return match Backend::start(Path::new(DRM_DIR), None) {
+            Ok(b) => {
+                out(&node::trial_line(&b.node().display().to_string()));
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                out(&format!("{} FAIL {e}", node::TRIAL_LINE));
+                ExitCode::FAILURE
+            }
+        };
+    }
     if args.display_node {
         let n = match Host::load().and_then(|h| h.wayland_display_node().map(|n| (h, n))) {
             Ok(n) => n,
@@ -97,7 +117,7 @@ fn main() -> ExitCode {
     }
     if args.renderer {
         let render = args.render.as_deref().unwrap_or_default();
-        return match renderer(render) {
+        return match renderer(render, &args.render_env) {
             Ok(r) => {
                 out(&node::renderer_line(&r));
                 ExitCode::SUCCESS
@@ -125,8 +145,21 @@ fn main() -> ExitCode {
     }
 }
 
-/// GL_VERSION, AEP (GL_EXTENSIONS lists node::AEP_EXTENSION) and GL_RENDERER of a GLES context on `render`'s EGL device (a render node, or `software`).
-fn renderer(render: &str) -> Result<node::Renderer> {
+/// GL_VERSION, AEP (GL_EXTENSIONS lists node::AEP_EXTENSION) and GL_RENDERER of a GLES context on `render`'s EGL device (a render node, or `software`), under `render_env`; then the import lines.
+/// The import probe's buffer is allocated first, without `render_env`, as the allocator process (which never gets the apps' render-path variables) allocates it: Mesa's GBM under `GALLIUM_DRIVER=d3d12` fails (ENOENT), which would read as "no import".
+fn renderer(render: &str, render_env: &[String]) -> Result<node::Renderer> {
+    // the Backend's GBM thread has ended when this returns (Backend's Drop joins it): no other thread runs below
+    let buf = gralloc_buffer(Path::new(render)).map_err(|e| format!("gralloc buffer: {e:#}"));
+    for kv in render_env {
+        let (k, v) = kv
+            .split_once('=')
+            .with_context(|| format!("--render-env {kv}: want KEY=VALUE"))?;
+        // SAFETY: single-threaded here (above), and no EGL loaded yet: nothing reads the environment concurrently.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var(k, v);
+        }
+    }
     let host = Host::load()?;
     let display = if render == "software" {
         host.devices()?
@@ -139,18 +172,64 @@ fn renderer(render: &str) -> Result<node::Renderer> {
             .with_context(|| format!("no EGL device on {render}"))?
             .0
     };
+    let r = {
+        let ctx = display.create_context()?;
+        let gl = ctx.make_current()?;
+        let r = node::Renderer {
+            version: gl.string(GL_VERSION),
+            aep: gl
+                .string(GL_EXTENSIONS)
+                .split_ascii_whitespace()
+                .any(|e| e == node::AEP_EXTENSION),
+            renderer: gl.string(GL_RENDERER),
+        };
+        gl.check("glGetString")?;
+        r
+    };
+    import_lines(&host, &buf, &display);
+    Ok(r)
+}
+
+/// The two [`node::IMPORT_LINE`]s atld chooses gralloc's allocator tier from (node::choose_allocator_tier), under the apps' render path: does `buf` (GBM, LINEAR, as the allocator's GBM tier gives it) import on `device` -- the EGL device the app's driver renders on -- as a complete FBO (the driver's `buffer tier import`), and on the desktop's Wayland display as a texture (GDK's GL import)?
+fn import_lines(
+    host: &std::sync::Arc<Host>,
+    buf: &std::result::Result<Buffer, String>,
+    device: &Display,
+) {
+    let on = |display: &Display, fbo: bool| -> std::result::Result<(), String> {
+        let b = buf.as_ref().map_err(Clone::clone)?;
+        import_once(display, b, fbo).map_err(|e| format!("{e:#}"))
+    };
+    let dev = on(device, true);
+    let disp = host
+        .wayland_display_node()
+        .map_err(|e| format!("no Wayland display: {e:#}"))
+        .and_then(|w| on(&w.display, false));
+    out(&node::import_line("device", &dev));
+    out(&node::import_line("display", &disp));
+}
+
+/// Imports `b` on `display` as an EGLImage bound to a texture (a renderbuffer where the driver refuses that) and, with `fbo`, as a complete framebuffer.
+fn import_once(display: &Display, b: &Buffer, fbo: bool) -> Result<()> {
     let ctx = display.create_context()?;
     let gl = ctx.make_current()?;
-    let r = node::Renderer {
-        version: gl.string(GL_VERSION),
-        aep: gl
-            .string(GL_EXTENSIONS)
-            .split_ascii_whitespace()
-            .any(|e| e == node::AEP_EXTENSION),
-        renderer: gl.string(GL_RENDERER),
+    let image = display.import_dmabuf(&DmabufPlane {
+        fd: b.fd.as_fd(),
+        fourcc: DRM_FORMAT_ABGR8888,
+        width: EDGE.unsigned_abs(),
+        height: EDGE.unsigned_abs(),
+        offset: b.offset,
+        pitch: b.pitch,
+        modifier: b.modifier,
+    })?;
+    let target = match gl.texture_from_image(&image) {
+        Ok(t) => t,
+        Err(_) => gl.renderbuffer_from_image(&image)?,
     };
-    gl.check("glGetString")?;
-    Ok(r)
+    if fbo {
+        gl.framebuffer(&target)?;
+    }
+    Ok(())
 }
 
 /// One [`node::MODIFIERS_LINE`] per gralloc fourcc: renderable on `render_node`'s EGL device display ∩ imported by the Wayland display, 1-plane layouts (atl_gralloc::node::modifier_set).

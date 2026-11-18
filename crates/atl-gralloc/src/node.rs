@@ -164,6 +164,139 @@ pub fn parse_renderer_line(text: &str) -> Option<Renderer> {
     })
 }
 
+/// What `atl-egl-probe --trial-node` prints: `<prefix> node=<path>`, the node gralloc's own trial picks (first of /dev/dri that allocates), for runs whose display names none.
+pub const TRIAL_LINE: &str = "gpu-trial:";
+
+pub fn trial_line(node: &str) -> String {
+    format!("{TRIAL_LINE} node={node}")
+}
+
+/// The node of the last well-formed [`TRIAL_LINE`].
+pub fn parse_trial_line(text: &str) -> Option<String> {
+    text.lines()
+        .rev()
+        .find_map(|l| {
+            l.strip_prefix(TRIAL_LINE)?
+                .trim_start()
+                .strip_prefix("node=")
+        })
+        .filter(|n| !n.is_empty())
+        .map(str::to_owned)
+}
+
+/// The kernel's udmabuf misc device (udmabuf.c `udmabuf_misc`, name "udmabuf"): gralloc's udmabuf tier allocates through it, atld checks it opens and binds it into gralloc's sandbox for that tier only.
+pub const UDMABUF_DEVICE: &str = "/dev/udmabuf";
+
+/// The probe's import lines (`--renderer`, run in the app processes' environment): `<prefix> device ok|<why>` for the EGL device the app's driver renders on, `<prefix> display ok|<why>` for the Wayland display GDK presents with.
+pub const IMPORT_LINE: &str = "gpu-import:";
+
+/// Whether each GPU of an app process imports a gralloc buffer (LINEAR, on the run's node): Err holds why not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Imports {
+    /// The app's EGL device: import + complete FBO (what the driver's `buffer tier import` needs).
+    pub device: Result<(), String>,
+    /// The desktop's Wayland EGL display: import + texture (what GDK's GL import needs).
+    pub display: Result<(), String>,
+}
+
+const IMPORT_OK: &str = "ok";
+
+/// The probe's line for one importer (`device` or `display`).
+pub fn import_line(who: &str, r: &Result<(), String>) -> String {
+    match r {
+        Ok(()) => format!("{IMPORT_LINE} {who} {IMPORT_OK}"),
+        Err(why) => format!("{IMPORT_LINE} {who} {}", why.replace('\n', " ")),
+    }
+}
+
+/// Both importers from the probe's output (last line of each wins); None when either is missing.
+pub fn parse_import_lines(text: &str) -> Option<Imports> {
+    let find = |who: &str| {
+        text.lines()
+            .rev()
+            .filter_map(|l| l.strip_prefix(IMPORT_LINE))
+            .find_map(|l| l.trim_start().strip_prefix(who)?.strip_prefix(' '))
+            .map(|v| {
+                if v == IMPORT_OK {
+                    Ok(())
+                } else {
+                    Err(v.to_owned())
+                }
+            })
+    };
+    Some(Imports {
+        device: find("device")?,
+        display: find("display")?,
+    })
+}
+
+/// gralloc's allocation tier: one allocator, two backings behind its one `allocate` (atl-gralloc-service backend.rs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AllocatorTier {
+    /// GBM on the run's DRM node: GPU-importable memory (zero-copy where a GPU imports it). The baseline: works on every host gralloc runs on.
+    Gbm,
+    /// memfd pages through `/dev/udmabuf`: cached system memory, for hosts where no GPU in the process imports the buffer and every access is a CPU access.
+    Udmabuf,
+}
+
+impl AllocatorTier {
+    pub fn name(self) -> &'static str {
+        match self {
+            AllocatorTier::Gbm => "gbm",
+            AllocatorTier::Udmabuf => "udmabuf",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        [AllocatorTier::Gbm, AllocatorTier::Udmabuf]
+            .into_iter()
+            .find(|t| t.name() == s)
+    }
+}
+
+/// The tier line's prefix: `allocator tier <name> (<why>)`, printed by gralloc (`gralloc: ` before it) and by atld.
+pub const TIER_LINE: &str = "allocator tier ";
+
+pub fn tier_line(tier: AllocatorTier, why: &str) -> String {
+    format!("{TIER_LINE}{} ({why})", tier.name())
+}
+
+/// The (tier, why) of the last well-formed tier line in `text`; a line that only contains the words (atld's `linear allocator tier <codec2 tier>`) is not one.
+pub fn parse_tier_line(text: &str) -> Option<(AllocatorTier, String)> {
+    text.lines().rev().find_map(|l| {
+        let at = l.find(TIER_LINE)?;
+        let (name, why) = l[at + TIER_LINE.len()..].split_once(" (")?;
+        Some((
+            AllocatorTier::parse(name)?,
+            why.strip_suffix(')')?.to_owned(),
+        ))
+    })
+}
+
+/// The tier atld asks gralloc for: udmabuf only when neither GPU of an app process imports gralloc's buffer and `/dev/udmabuf` opens (`udmabuf`: Err = why not); otherwise GBM, today's path. `imports` None: no probe answered, nothing known -> GBM.
+pub fn choose_allocator_tier(
+    imports: Option<&Imports>,
+    udmabuf: Result<(), String>,
+) -> (AllocatorTier, String) {
+    let Some(i) = imports else {
+        return (AllocatorTier::Gbm, "no import probe".to_owned());
+    };
+    match (&i.device, &i.display) {
+        (Ok(()), _) => (AllocatorTier::Gbm, "the app's GPU imports".to_owned()),
+        (_, Ok(())) => (AllocatorTier::Gbm, "the display imports".to_owned()),
+        (Err(dev), Err(disp)) => {
+            let none = format!("no GPU in the process imports: device {dev}; display {disp}");
+            match udmabuf {
+                Ok(()) => (AllocatorTier::Udmabuf, none),
+                Err(why) => (
+                    AllocatorTier::Gbm,
+                    format!("{none}; udmabuf unavailable: {why}"),
+                ),
+            }
+        }
+    }
+}
+
 /// The probe's per-fourcc modifier line after [`DISPLAY_LINE`]: `<prefix> <FOURCC>=<hex>,<hex>...` (nothing after `=`: no modifier qualifies). Its own prefix, so [`parse_display_line`] never reads it.
 pub const MODIFIERS_LINE: &str = "gpu-modifiers:";
 
@@ -323,6 +456,89 @@ mod tests {
             Some((None, "D3D12 (x)".to_owned()))
         );
         assert_eq!(parse_display_line("gpu-probe: FAIL eglInitialize"), None);
+    }
+
+    /// The WSL case as the app log reports it (driver: EGL error 0x3003; GDK: no import extension), the laptop case (device imports), and the two udmabuf answers.
+    #[test]
+    fn tier_is_udmabuf_only_when_nothing_imports_and_udmabuf_opens() {
+        let fail = |w: &str| Err(w.to_owned());
+        let wsl = Imports {
+            device: fail("EGL error 0x3003"),
+            display: fail("no EGL_EXT_image_dma_buf_import"),
+        };
+        let (t, why) = choose_allocator_tier(Some(&wsl), Ok(()));
+        assert_eq!(t, AllocatorTier::Udmabuf);
+        assert!(
+            why.contains("0x3003") && why.contains("display no EGL"),
+            "{why}"
+        );
+        let (t, why) = choose_allocator_tier(Some(&wsl), fail("/dev/udmabuf: Permission denied"));
+        assert_eq!(t, AllocatorTier::Gbm);
+        assert!(
+            why.contains("udmabuf unavailable: /dev/udmabuf: Permission denied"),
+            "{why}"
+        );
+        for imports in [
+            Imports {
+                device: Ok(()),
+                display: Ok(()),
+            },
+            Imports {
+                device: Ok(()),
+                display: fail("x"),
+            },
+            Imports {
+                device: fail("x"),
+                display: Ok(()),
+            },
+        ] {
+            assert_eq!(
+                choose_allocator_tier(Some(&imports), Ok(())).0,
+                AllocatorTier::Gbm
+            );
+        }
+        assert_eq!(choose_allocator_tier(None, Ok(())).0, AllocatorTier::Gbm);
+    }
+
+    #[test]
+    fn trial_line_round_trips() {
+        let text = format!("noise\n{}\n", trial_line("/dev/dri/card0"));
+        assert_eq!(parse_trial_line(&text), Some("/dev/dri/card0".to_owned()));
+        assert_eq!(parse_trial_line("gpu-trial: FAIL no node"), None);
+        assert_eq!(parse_trial_line("gpu-trial: node="), None);
+    }
+
+    #[test]
+    fn import_and_tier_lines_round_trip() {
+        let i = Imports {
+            device: Err("EGL error 0x3003\nsecond".to_owned()),
+            display: Ok(()),
+        };
+        let text = format!(
+            "noise\n{}\n{}\n",
+            import_line("device", &i.device),
+            import_line("display", &i.display)
+        );
+        assert_eq!(
+            parse_import_lines(&text),
+            Some(Imports {
+                device: Err("EGL error 0x3003 second".to_owned()),
+                display: Ok(())
+            })
+        );
+        assert_eq!(parse_import_lines("gpu-import: device ok\n"), None);
+        let line = format!("gralloc: {}", tier_line(AllocatorTier::Udmabuf, "a (b)"));
+        assert_eq!(
+            parse_tier_line(&line),
+            Some((AllocatorTier::Udmabuf, "a (b)".to_owned()))
+        );
+        assert_eq!(parse_tier_line("allocator tier vram (x)"), None);
+        // atld's Codec2 line after the real one (as the WSL atld.log orders them, reversed) does not hide it
+        let atld = "atld: allocator tier udmabuf (why)\natld: linear allocator tier gralloc-blob\n";
+        assert_eq!(
+            parse_tier_line(atld),
+            Some((AllocatorTier::Udmabuf, "why".to_owned()))
+        );
     }
 
     #[test]
