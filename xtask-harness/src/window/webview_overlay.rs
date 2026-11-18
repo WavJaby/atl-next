@@ -58,17 +58,24 @@ fn window_size(app: &str) -> Option<(u32, u32)> {
     Some((w.parse().ok()?, h.parse().ok()?))
 }
 
-/// The last sideband placement `dst=l,t,r,b`.
+/// The last sideband placement `dst=l,t,r,b` of a stream other than the software-layer WebView's.
 fn last_placed(app: &str) -> Option<[i64; 4]> {
-    let line = app
-        .lines()
+    let software = software_streams(app);
+    placements(app)
+        .into_iter()
         .rev()
-        .find(|l| l.contains(PLACED) && l.contains(" placed dst="))?;
-    let v: Vec<i64> = word(line, "dst")?
-        .split(',')
-        .filter_map(|n| n.parse().ok())
-        .collect();
-    v.try_into().ok()
+        .find(|(s, _)| !software.contains(s))
+        .map(|(_, dst)| dst)
+}
+
+/// The streams ever placed at the software-layer WebView's rectangle.
+fn software_streams(app: &str) -> Vec<&str> {
+    let sw = software_rect(app);
+    placements(app)
+        .into_iter()
+        .filter(|(_, dst)| Some(*dst) == sw)
+        .map(|(s, _)| s)
+        .collect()
 }
 
 /// Every sideband placement: stream, `dst`.
@@ -119,16 +126,10 @@ fn preload_check(app: &str) -> Result<String, String> {
     if !app.contains(PRELOAD_LOADED) {
         return Err(format!("no `{PRELOAD_LOADED}` line"));
     }
-    let all = placements(app);
-    let sw = software_rect(app);
-    let software: Vec<&str> = all
-        .iter()
-        .filter(|(_, dst)| Some(*dst) == sw)
-        .map(|(s, _)| *s)
-        .collect();
-    let mut streams: Vec<&str> = all
-        .iter()
-        .map(|(s, _)| *s)
+    let software = software_streams(app);
+    let mut streams: Vec<&str> = placements(app)
+        .into_iter()
+        .map(|(s, _)| s)
         .filter(|s| !software.contains(s))
         .collect();
     streams.sort_unstable();
