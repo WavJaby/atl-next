@@ -401,6 +401,9 @@ pub const FIRST_APP_UID: u32 = 10_001;
 /// The boot scan registers them before any install (PackageManagerService scans the partitions first), so each one placed moves the installed packages' uids up by one.
 const OWN_APP_ID_ROWS: [&str; 2] = [WEBVIEW_PROVIDER, VENDING];
 
+/// Platform rows that are packages: the boot scan (atl-services install.rs `scan`) finds each one placed. [`OWN_APP_ID_ROWS`] plus the settings provider (shared uid 1000, so no app id of its own).
+const PACKAGE_ROWS: [&str; 3] = [SETTINGS_PROVIDER, WEBVIEW_PROVIDER, VENDING];
+
 /// One atld run.
 pub struct Run {
     /// atld's runtime root (atld makes it again); its logs are `<root>/log/<process>.log`.
@@ -1218,16 +1221,22 @@ impl Runtime {
     /// The first installed package's uid on a fresh run of this runtime: [`FIRST_APP_UID`] plus one per placed [`OWN_APP_ID_ROWS`] package (with the default rows: the WebView provider takes 10001,
     /// so 10002). A row that sees another uid has caught the allocator handing out a taken or wrong id.
     pub fn first_app_uid(&self) -> u32 {
-        let own = self
-            .platform_files
-            .iter()
-            .filter(|(_, at)| {
-                OWN_APP_ID_ROWS
-                    .iter()
-                    .any(|row| at.ends_with(&format!("/{row}")))
-            })
-            .count();
+        let own = self.placed(&OWN_APP_ID_ROWS);
         FIRST_APP_UID + u32::try_from(own).expect("a handful of platform rows")
+    }
+
+    /// The platform packages this runtime places ([`PACKAGE_ROWS`]), each a system package of the boot scan (PackageManagerService scanSystemDirs): with the default rows the settings provider and the
+    /// WebView provider, 2. A gate's own placed fixture APKs come on top.
+    pub fn platform_packages(&self) -> usize {
+        self.placed(&PACKAGE_ROWS)
+    }
+
+    /// How many of `rows` (install paths below a partition) the run places.
+    fn placed(&self, rows: &[&str]) -> usize {
+        self.platform_files
+            .iter()
+            .filter(|(_, at)| rows.iter().any(|row| at.ends_with(&format!("/{row}"))))
+            .count()
     }
 
     /// The billing-unavailable desktop adaptation (M62 D1; `run-apk --billing-unavailable`): the run places the responder `com.android.vending` ([`vending_row`]), so a Play Billing client binds it

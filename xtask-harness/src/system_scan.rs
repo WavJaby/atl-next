@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! `xtask test system-scan`: a preinstalled package (plan system-packages SP2). Fixture xtask-harness/testdata/system-scan, placed by atld `--file` at `/product/app/AtlSystemScan/AtlSystemScan.apk`
 //! and launched; checks are lines of its log (tag AtlSystemScan) and of the services' log:
-//! - the services' scan accepted one system package (`scan: 1 system packages, 0 skipped`);
+//! - the services' scan accepted the fixture beside the platform packages every run places (`scan: <n> system packages, 0 skipped`, n = `Runtime::platform_packages` + 1: since f63030b3 every run places the WebView provider too);
 //! - PackageManager's ApplicationInfo of it has FLAG_SYSTEM and its sourceDir is the /product path (the parse's own name, not `base.apk`);
 //! - its sandbox reads that file (the product partition is bound into every app) and a write there fails EROFS (bound read-only).
 //!
@@ -43,7 +43,6 @@ const MODULE: &str = "AtlSystemScan";
 const LIMIT: Duration = Duration::from_secs(180);
 const TAIL: usize = 30;
 
-const SCANNED: &str = "scan: 1 system packages, 0 skipped";
 const READ: &str = "AtlSystemScan: read zip";
 const EROFS: &str = "AtlSystemScan: write EROFS";
 const DONE: &str = "AtlSystemScan: done";
@@ -68,6 +67,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let apk = rt
         .apk
         .build(&root.join(FIXTURE), &work.join("app"), &[], None, None)?;
+    // the platform packages, plus the fixture placed beside them
+    let scanned = format!(
+        "scan: {} system packages, 0 skipped",
+        rt.platform_packages() + 1
+    );
     let at = format!("{}/app/{MODULE}/{MODULE}.apk", atl_android_paths::PRODUCT);
     let (rt, packages) = if args.break_as_session {
         (rt, vec![Package::base(apk)])
@@ -108,8 +112,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let identity = format!("AtlSystemScan: system true source {at}");
     let checks = [
         (
-            "the services scanned one system package",
-            args.break_as_session || services.contains(SCANNED),
+            "the services scanned the fixture beside the platform packages",
+            args.break_as_session || services.contains(&scanned),
         ),
         (
             "PackageManager: FLAG_SYSTEM, sourceDir in /product",
