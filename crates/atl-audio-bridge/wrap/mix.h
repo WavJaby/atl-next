@@ -9,7 +9,6 @@
 #include <cstdint>
 #include <map>
 #include <memory>
-#include <set>
 #include <vector>
 
 #include "media/AudioBufferProvider.h"
@@ -37,6 +36,8 @@ struct Track final : public android::AudioBufferProvider {
     bool is_static;
     /// The server buffer the last getNextBuffer obtained; releaseBuffer gives it back.
     void* server_raw = nullptr;
+    /// A stopped streaming track still enabled until its written frames are mixed (AOSP STOPPED, still active); the fill ends the drain. No underrun is tallied while it drains.
+    bool draining = false;
 };
 
 /// The mixer: AudioMixerBase at `quantum_frames` and `rate`. `out` holds one quantum of mixed stereo float; `next` is the first frame of it not yet handed out.
@@ -49,10 +50,8 @@ struct Mix final : public android::AudioMixerBase {
     size_t quantum;
     std::vector<float> out;
     size_t next = 0;
-    /// The enabled tracks by name: each quantum reads their client volume, as AudioFlinger's prepareTracks does every cycle. Control calls add and remove; the fill only removes (a finished drain), which frees and never allocates.
+    /// The enabled tracks by name (draining ones included): each quantum reads their client volume, as AudioFlinger's prepareTracks does every cycle. Control calls add and remove; the fill only removes (a finished drain), which frees and never allocates.
     std::map<int32_t, Track*> enabled;
-    /// Stopped streaming tracks still enabled until their written frames are mixed (a subset of `enabled`); the fill ends each drain.
-    std::set<int32_t> draining;
 };
 
 /// sizeof(audio_track_cblk_t) on x86_64 (LP64), the layout the Rust side maps: checked against AudioTrackShared.h at compile time (the static_assert in mix.cpp).
@@ -81,5 +80,11 @@ uint64_t take_track_frames();
 uint32_t muted_tracks();
 /// Tracks enabled in the mix, draining ones included.
 uint32_t active_tracks();
+/// Underruns the tracks' proxies counted (AudioTrackServerProxy::tallyUnderrunFrames: one per start of an underrun) since the last call; resets the count.
+uint64_t take_underruns();
+/// Frames the tracks' proxies tallied as underrun since the last call; resets the count.
+uint64_t take_underrun_frames();
+/// The underruns `track`'s client reads (the cblk's mUnderrunCount, AudioTrack::getUnderrunCount); 0 for a static track, whose cblk keeps none.
+uint32_t track_underruns(const Track& track);
 
 }  // namespace atl::audio

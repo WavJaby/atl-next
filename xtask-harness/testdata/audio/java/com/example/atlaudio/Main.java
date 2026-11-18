@@ -26,7 +26,7 @@ import java.nio.charset.StandardCharsets;
  * `fast: state=<n>`: a low-latency track; the server refuses FAST and the track must still initialise on the normal path.
  * `static: state=<n> frames=<n>`: a shared-buffer track (MODE_STATIC): the frames are the requested ones, not rounded.
  * `props: rate=<s> frames=<s>`: AudioManager's PROPERTY_OUTPUT_SAMPLE_RATE and PROPERTY_OUTPUT_FRAMES_PER_BUFFER (the primary output's rate and HAL frame count).
- * `pcm: ...`: the PCM tones (audio_app.rs TONE_*, STREAM_*): a static track of STATIC_TONE_HZ, then a streaming track of STREAM_TONE_HZ in FMOD's shape, then a float streaming track of FLOAT_TONE_HZ, then an OpenSL ES tone and an AAudio tone (native, `pcm: sles ...` / `pcm: aaudio ...`), one after the other; the gate checks the recording of the sink.
+ * `pcm: ...`: the PCM tones (audio_app.rs TONE_*, STREAM_*): a static track of STATIC_TONE_HZ, then a streaming track of STREAM_TONE_HZ in FMOD's shape, then a float streaming track of FLOAT_TONE_HZ, then an OpenSL ES tone and an AAudio tone (native, `pcm: sles ...` / `pcm: aaudio ...`), one after the other; the gate checks the recording of the sink. Then the silent adaptive AAudio client (`pcm: aaudio-adaptive ...`).
  * `done`: the end of the run.
  * The volume run (asset `volume` present, audio_app.rs `--volume`) logs only `volume: ...` lines (volumeRun) and `done`.
  */
@@ -71,6 +71,11 @@ public class Main extends Activity {
     private static native String slesTone(int hz, int rate, int frames, double dbfs);
     /** AAudio data-callback stream: "aaudio open=<rc> start=<rc> written=<n> stop=<rc> close=<rc>". */
     private static native String aaudioTone(int hz, int rate, int frames, double dbfs);
+    /** The adaptive AAudio client (audio_app.rs ADAPTIVE_*): ends after ADAPTIVE_STABLE_MS without an xrun, or at ADAPTIVE_MAX_MS. */
+    private static final int ADAPTIVE_MAX_MS = 8000;
+    private static final int ADAPTIVE_STABLE_MS = 1000;
+    /** A silent LOW_LATENCY stream that starts at one burst and grows by one per xrun rise: "aaudio-adaptive ... first=<n> final=<n> xruns=<n> stable=<ms> ...". */
+    private static native String aaudioAdaptive(int rate, int maxMs, int stableMs);
 
     /** Stereo 16-bit samples of a sine of `hz`: `frames` frames at `rate`, TONE_DBFS peak. */
     private static short[] tone(int hz, int rate, int frames) {
@@ -303,6 +308,7 @@ public class Main extends Activity {
             Thread.sleep(TONE_GAP_MS);
             Log.i(TAG, "pcm: " + aaudioTone(AAUDIO_TONE_HZ, NATIVE_RATE_HZ, NATIVE_FRAMES, TONE_DBFS));
             Thread.sleep(TONE_GAP_MS);
+            Log.i(TAG, "pcm: " + aaudioAdaptive(NATIVE_RATE_HZ, ADAPTIVE_MAX_MS, ADAPTIVE_STABLE_MS));
         } catch (Throwable e) {
             Log.i(TAG, "pcm: native " + e);
         }

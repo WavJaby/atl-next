@@ -36,6 +36,25 @@ pub fn active_tracks() -> u32 {
     bridge::ffi::active_tracks()
 }
 
+/// Underruns the tracks counted since the last call (resets): one per start of an underrun, the steps of the count each client reads (AudioTrack::getUnderrunCount, AAudioStream_getXRunCount).
+pub fn take_underruns() -> u64 {
+    bridge::ffi::take_underruns()
+}
+
+/// Frames the tracks tallied as underrun since the last call (resets): what the mixer asked of a playing track and got nothing for.
+pub fn take_underrun_frames() -> u64 {
+    bridge::ffi::take_underrun_frames()
+}
+
+/// What a track left behind when it was removed ([`Mix::remove`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Removed {
+    /// Frames it never played: unread or flushed.
+    pub dropped: u64,
+    /// The underruns its client read over its life (0 for a static track).
+    pub underruns: u32,
+}
+
 /// A shared mapping of a file range, unmapped on drop. Pointers into it are valid while it lives.
 pub struct Mapping {
     base: *mut c_void,
@@ -255,12 +274,14 @@ impl Mix {
         Some(name)
     }
 
-    /// Removes track `name`: the mixer forgets it first, then the track and its mappings are dropped. Returns the frames it never played (unread or flushed); 0 for an unknown name.
-    pub fn remove(&mut self, name: i32) -> u64 {
+    /// Removes track `name`: the mixer forgets it first, then the track and its mappings are dropped. Returns what it left behind; all zero for an unknown name.
+    pub fn remove(&mut self, name: i32) -> Removed {
         let Some(mut track) = self.tracks.remove(&name) else {
-            return 0;
+            return Removed::default();
         };
-        bridge::ffi::mix_remove(self.inner.pin_mut(), track.proxy.pin_mut(), name)
+        let dropped = bridge::ffi::mix_remove(self.inner.pin_mut(), track.proxy.pin_mut(), name);
+        let underruns = track.proxy.as_ref().map_or(0, bridge::ffi::track_underruns);
+        Removed { dropped, underruns }
     }
 
     /// Applies an IAudioTrack playback call to track `name` (see [`Control`]). False for an unknown name.

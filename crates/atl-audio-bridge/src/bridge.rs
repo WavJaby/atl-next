@@ -43,5 +43,8 @@ pub(crate) mod ffi {
         fn take_track_frames() -> u64;
         fn muted_tracks() -> u32;
         fn active_tracks() -> u32;
+        fn take_underruns() -> u64;
+        fn take_underrun_frames() -> u64;
+        fn track_underruns(track: &Track) -> u32;
     }
 }

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// The audio gate's native tones (xtask-harness/src/audio_app.rs SLES_*, AAUDIO_*): a sine played through OpenSL ES (wilhelm, the simple buffer queue Alto's and other NDK games use) and through AAudio (data callback, FMOD's route), each blocking until its frames were handed out. The gate checks the recording of the sink and the counters, never these return strings alone.
+// The audio gate's native tones (xtask-harness/src/audio_app.rs SLES_*, AAUDIO_*): a sine played through OpenSL ES (wilhelm, the simple buffer queue Alto's and other NDK games use) and through AAudio (data callback, FMOD's route), each blocking until its frames were handed out; then a silent AAudio stream whose buffer an adaptive tuner grows on xruns. The gate checks the recording of the sink and the counters, never these return strings alone.
 // ATL_TONE_SILENT (audio_app.rs `--break-tone`): both tones are zero amplitude, so their runs must be absent from the recording.
 #include <dlfcn.h>
 #include <jni.h>
@@ -213,6 +213,88 @@ JNIEXPORT jstring JNICALL Java_com_example_atlaudio_Main_aaudioTone(JNIEnv *env,
         rc_close = close(s);
     }
     snprintf(msg, sizeof msg, "aaudio open=%d start=%d written=%d stop=%d close=%d", rc_open, rc_start, (int)g_aaudio.tone.next, rc_stop, rc_close);
+    dlclose(lib);
+    return (*env)->NewStringUTF(env, msg);
+}
+
+// ---- AAudio adaptive client (audio_app.rs ADAPTIVE_*): Alto's Odyssey's Wwise shape (48 kHz stereo, LOW_LATENCY, data callback; the server refuses FAST, so a normal track) with the buffer tuned as the NDK AAudio guide's "Tuning buffers" sample does
+// (developer.android.com/ndk/guides/audio/aaudio/aaudio; Oboe's LatencyTuner::tune is the same rule): start small (here one burst, Wwise's start), and on every rise of AAudioStream_getXRunCount grow the buffer by one burst while below capacity.
+// The callback writes silence: the recording's tone runs stay the five above. Each mixer cycle that comes up short starts an underrun (the server tallies it once the track delivered anything that cycle), so `stable` ms without a rise = that many ms of full cycles.
+static volatile int64_t g_adaptive_frames;
+
+static aaudio_data_callback_result_t adaptive_cb(AAudioStream *stream, void *user, void *audio, int32_t frames)
+{
+    memset(audio, 0, (size_t)frames * CHANNELS * sizeof(int16_t));
+    g_adaptive_frames += frames;
+    return AAUDIO_CALLBACK_RESULT_CONTINUE;
+}
+
+// "aaudio-adaptive open=<rc> start=<rc> burst=<frames> capacity=<frames> first=<size> final=<size> xruns=<n> stable=<ms> frames=<n> stop=<rc> close=<rc>": first = the size the one-burst request got, final = the size when the
+// tuner ended, xruns = the stream's xrun count then, stable = ms since the last rise when it ended (it ends after `stable_ms` without one, or at `max_ms`)
+JNIEXPORT jstring JNICALL Java_com_example_atlaudio_Main_aaudioAdaptive(JNIEnv *env, jclass cls, jint rate, jint max_ms, jint stable_ms)
+{
+    char msg[256];
+    void *lib = dlopen("libaaudio.so", RTLD_NOW);
+    if (!lib)
+        return (*env)->NewStringUTF(env, "aaudio-adaptive dlopen null");
+    aaudio_result_t (*create)(AAudioStreamBuilder **) = dlsym(lib, "AAudio_createStreamBuilder");
+    void (*set_rate)(AAudioStreamBuilder *, int32_t) = dlsym(lib, "AAudioStreamBuilder_setSampleRate");
+    void (*set_channels)(AAudioStreamBuilder *, int32_t) = dlsym(lib, "AAudioStreamBuilder_setChannelCount");
+    void (*set_format)(AAudioStreamBuilder *, aaudio_format_t) = dlsym(lib, "AAudioStreamBuilder_setFormat");
+    void (*set_perf)(AAudioStreamBuilder *, aaudio_performance_mode_t) = dlsym(lib, "AAudioStreamBuilder_setPerformanceMode");
+    void (*set_cb)(AAudioStreamBuilder *, AAudioStream_dataCallback, void *) = dlsym(lib, "AAudioStreamBuilder_setDataCallback");
+    aaudio_result_t (*open)(AAudioStreamBuilder *, AAudioStream **) = dlsym(lib, "AAudioStreamBuilder_openStream");
+    aaudio_result_t (*del)(AAudioStreamBuilder *) = dlsym(lib, "AAudioStreamBuilder_delete");
+    int32_t (*burst_of)(AAudioStream *) = dlsym(lib, "AAudioStream_getFramesPerBurst");
+    int32_t (*capacity_of)(AAudioStream *) = dlsym(lib, "AAudioStream_getBufferCapacityInFrames");
+    aaudio_result_t (*set_size)(AAudioStream *, int32_t) = dlsym(lib, "AAudioStream_setBufferSizeInFrames");
+    int32_t (*xruns_of)(AAudioStream *) = dlsym(lib, "AAudioStream_getXRunCount");
+    aaudio_result_t (*start)(AAudioStream *) = dlsym(lib, "AAudioStream_requestStart");
+    aaudio_result_t (*stop)(AAudioStream *) = dlsym(lib, "AAudioStream_requestStop");
+    aaudio_result_t (*close)(AAudioStream *) = dlsym(lib, "AAudioStream_close");
+    if (!create || !set_rate || !set_channels || !set_format || !set_perf || !set_cb || !open || !del || !burst_of || !capacity_of || !set_size || !xruns_of || !start || !stop ||
+        !close) {
+        dlclose(lib);
+        return (*env)->NewStringUTF(env, "aaudio-adaptive dlsym null");
+    }
+    g_adaptive_frames = 0;
+    AAudioStreamBuilder *b = NULL;
+    AAudioStream *s = NULL;
+    aaudio_result_t rc_open = create(&b), rc_start = -1, rc_stop = -1, rc_close = -1;
+    int32_t burst = 0, capacity = 0, first = 0, size = 0, xruns = 0;
+    int64_t stable = 0;
+    if (rc_open == AAUDIO_OK) {
+        set_rate(b, rate);
+        set_channels(b, CHANNELS);
+        set_format(b, AAUDIO_FORMAT_PCM_I16);
+        set_perf(b, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+        set_cb(b, adaptive_cb, NULL);
+        rc_open = open(b, &s);
+        del(b);
+    }
+    if (rc_open == AAUDIO_OK) {
+        burst = burst_of(s);
+        capacity = capacity_of(s);
+        first = size = set_size(s, burst);
+        rc_start = start(s);
+        int64_t begin = now_ms(), last_rise = begin, now = begin;
+        while (rc_start == AAUDIO_OK && now - last_rise < stable_ms && now - begin < max_ms) {
+            usleep(10000);
+            now = now_ms();
+            int32_t x = xruns_of(s);
+            if (x > xruns) {
+                xruns = x;
+                last_rise = now;
+                if (size < capacity)
+                    size = set_size(s, size + burst);
+            }
+        }
+        stable = now - last_rise;
+        rc_stop = stop(s);
+        rc_close = close(s);
+    }
+    snprintf(msg, sizeof msg, "aaudio-adaptive open=%d start=%d burst=%d capacity=%d first=%d final=%d xruns=%d stable=%lld frames=%lld stop=%d close=%d", rc_open, rc_start, burst, capacity, first, size, xruns,
+             (long long)stable, (long long)g_adaptive_frames, rc_stop, rc_close);
     dlclose(lib);
     return (*env)->NewStringUTF(env, msg);
 }

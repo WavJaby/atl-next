@@ -3,6 +3,7 @@
 //! Expected values are AOSP's formulas worked here over the served output, not the code under test: AudioSystem::calculateMinFrameCount (AudioSystem.cpp:486) with sourceFramesNeededWithTimestretch (AudioResamplerPublic.h:84-110) at speed 1.0, and AudioFlinger's streaming-track roundup to a power of two (Tracks.cpp:162).
 //! The served profile is the PCM output's granted rate and quantum (game audio A2), which on this host are PipeWire's defaults: [`SPEC_RATE_HZ`] and the others copy them, so a different graph must change these too (a mismatch is a red gate).
 //! PCM (A2): the fixture plays a static track, a streaming track, a float streaming track, then from its NDK library (jni/atl_audio_tone.c) an OpenSL ES buffer-queue player and an AAudio callback stream, each a tone (Main.java `pcm`); the native two are also checked on their own counts and the `sles-flow:` counters (`native_verdicts`). `--break-tone` builds that library silent: the two native runs must be missing. The output's sink is the run's own null sink, which its streams target (audio_pcm.rs Routing), and its monitor is recorded with `pw-record` (audio_pcm.rs). The recording must hold five runs of tone with the frequency, length and level the fixture's input gives, and no sample beyond full scale. Expected values come from the constants below, never from the server.
+//! Then a silent adaptive AAudio client (`adaptive_verdicts`): its buffer starts at one burst, below a quantum, and must grow on the xruns the server's underrun tally reports until the mix is full.
 //! Checks: session ids nonzero and distinct; getMinBufferSize equals the expected bytes (stereo, 16-bit); AudioManager's output rate and frames-per-buffer properties are the served profile's; a track reaches STATE_INITIALIZED with a nonzero piid (AudioTrack calls baseRegisterPlayer only after native_setup succeeds, AudioTrack.java:912) and the expected frame count; the low-latency track initialises although the server refuses FAST (counted); AudioFlinger's and AudioPolicyService's calls were answered in-process.
 //! `--break-serve` starts the app with `--no-audio-service` (atld, then the launcher): it serves neither name, so the session line must go red. `--break-cblk` starts it with `--break-cblk`: each streaming track's region is one buffer short, createTrack refuses it, and both streaming tracks fail to initialise (a static track has no buffer of its own to be short of). `--break-mix` starts it with `--break-mix`: the mixer plays silence, so the PCM checks find no tone and must go red. `--unreachable` makes the desktop's server a stale socket file (`PIPEWIRE_REMOTE` for atld): the app must still reach `done` (the launch is not fatal), its track must fail with STATE_UNINITIALIZED and a counted refusal, and no tone may reach the sink.
 //! `--volume`: the app volume on the app's host stream instead of the PCM checks (app_volume.rs).
@@ -145,6 +146,52 @@ fn native_verdicts(app: &str, services: &str) -> bool {
     ok
 }
 
+/// The adaptive AAudio client (atl_audio_tone.c `aaudioAdaptive`, the NDK AAudio guide's buffer tuning: start at one burst, one burst more per xrun rise). Expected from the stream's parameters:
+/// burst = AAudio's framesPerBurst of a legacy stream = the track's notification period (AudioStreamTrack::getFramesPerBurstFromDevice), which AudioFlinger caps at 20 ms of the track's rate for a
+/// FAST request it denied and at half the buffer (Threads.cpp createTrack_l); a buffer of one burst holds less than one quantum, so the mixer comes up short every cycle until the tuner grew it to the
+/// smallest whole number of bursts that holds a quantum, which needs the server's underrun tally to reach the client as xruns. The tuner ends after ADAPTIVE_STABLE_MS without a rise: each short
+/// cycle starts an underrun of its own, so that window is ADAPTIVE_STABLE_MS of full cycles (from_tracks == requested).
+fn adaptive_verdicts(app: &str, services: &str) -> bool {
+    let line = line_value(app, "pcm: aaudio-adaptive ");
+    let get = |k| field(line, k);
+    let capacity = get("capacity").unwrap_or(0);
+    let rate = i64::try_from(NATIVE_RATE_HZ).unwrap_or(i64::MAX);
+    let want_burst = (FAST_DENIED_NOTIFY_MS * rate / 1000).min(capacity / 2);
+    let quantum = i64::try_from(SPEC_FRAMES).unwrap_or(i64::MAX);
+    let want_final = if want_burst > 0 {
+        (quantum + want_burst - 1) / want_burst * want_burst
+    } else {
+        i64::MAX
+    };
+    let mut ok = verdict(
+        "aaudio adaptive",
+        get("open") == Some(0)
+            && get("start") == Some(0)
+            && get("burst") == Some(want_burst)
+            && get("first") == Some(want_burst)
+            && get("xruns").is_some_and(|x| x > 0)
+            && get("final").is_some_and(|f| f >= want_final)
+            && get("stable").is_some_and(|s| s >= ADAPTIVE_STABLE_MS),
+        &format!(
+            "want open=0 start=0 burst=first={want_burst}, xruns > 0, final >= {want_final} (whole bursts holding a {quantum}-frame quantum), stable >= {ADAPTIVE_STABLE_MS} ms; line: {}",
+            line.unwrap_or("no line")
+        ),
+    );
+    let tallied: i64 = app
+        .lines()
+        .chain(services.lines())
+        .filter_map(|l| field(l.split(MIX_LINE).nth(1), MIX_TRACK_UNDERRUNS))
+        .sum();
+    ok &= verdict(
+        "mixer track underruns",
+        tallied > 0,
+        &format!(
+            "`{MIX_LINE}{MIX_TRACK_UNDERRUNS}=` sum {tallied}, want > 0 (the adaptive client's short cycles)"
+        ),
+    );
+    ok
+}
+
 /// The fixture's dir.
 const FIXTURE: &str = "xtask-harness/testdata/audio";
 /// Main.onCreate's log tag and the line that ends the run.
@@ -216,6 +263,12 @@ const MIX_AUDIBLE: &str = "audible";
 /// Its field of streaming frames written but never mixed (unread when the track was removed, or flushed), and the line output.rs writes at each such removal.
 const MIX_DROPPED: &str = "dropped";
 const MIX_DROPPED_LINE: &str = "track removed with frames it never played";
+/// Its field of underruns the tracks' clients saw begin (the steps of their xrun counts).
+const MIX_TRACK_UNDERRUNS: &str = "track_underruns";
+/// AudioFlinger's cap on the notification period of a FAST request it denied: 20 ms (Threads.cpp createTrack_l, `FMS_20`).
+const FAST_DENIED_NOTIFY_MS: i64 = 20;
+/// Main.java ADAPTIVE_STABLE_MS: the adaptive tuner ends after this many ms without an xrun rise.
+const ADAPTIVE_STABLE_MS: i64 = 1_000;
 const TONE_DBFS: f64 = -12.0;
 /// Silence that separates two tone runs in the recording (the gap is about 0.5 s).
 const GAP_SECONDS: f64 = 0.2;
@@ -682,6 +735,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         ),
     );
     ok &= native_verdicts(&app, &services);
+    ok &= adaptive_verdicts(&app, &services);
     // the app's desktop identity: the desktop file ID rule `atl.<package>` (the window's app_id too), from the fixture's manifest
     let want_id = format!("atl.{}", m.name);
     let identity = streams.and_then(|s| identity_check(&s, &want_id, true));

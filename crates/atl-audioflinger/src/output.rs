@@ -70,8 +70,9 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 const COUNTERS_PERIOD: Duration = Duration::from_secs(1);
 
 /// One counters line `audio-mix: requested=N mixed=N from_tracks=N audible=N peak=F active=N muted=N dropped=N underruns=N rt_fallbacks=N` with the deltas since the last (active, muted and
-/// rt_fallbacks are levels); written while the output is open, zeros when silent. underruns = server cycles that found no buffer of `pcm`'s (the sound cut there; delta of [`PcmOutput::underruns`]
-/// against `underruns_seen`); rt_fallbacks = 1 when its callbacks run without a realtime grant.
+/// rt_fallbacks are levels) and the tracks' side `track_underruns=N track_underrun_frames=N`; written while the output is open, zeros when silent. underruns = server cycles that found no buffer of `pcm`'s
+/// (the sound cut there; delta of [`PcmOutput::underruns`] against `underruns_seen`); rt_fallbacks = 1 when its callbacks run without a realtime grant. track_underruns = underruns the tracks' clients
+/// saw begin (their getXRunCount steps), track_underrun_frames = frames the mixer asked of a playing track and got none for: a track that keeps the mix short shows here, not only as from_tracks < requested.
 fn log_counters(pcm: &atl_platform_ui::PlatformPcmOutput, underruns_seen: &mut u64) {
     let total = pcm.underruns();
     let underruns = total.saturating_sub(*underruns_seen);
@@ -85,9 +86,11 @@ fn log_counters(pcm: &atl_platform_ui::PlatformPcmOutput, underruns_seen: &mut u
     let from_tracks = atl_audio_bridge::take_track_frames();
     let muted = atl_audio_bridge::muted_tracks();
     let dropped = DROPPED.swap(0, Ordering::Relaxed);
+    let track_underruns = atl_audio_bridge::take_underruns();
+    let track_underrun_frames = atl_audio_bridge::take_underrun_frames();
     let _ = writeln!(
         std::io::stderr(),
-        "audio-mix: requested={requested} mixed={mixed} from_tracks={from_tracks} audible={audible} peak={peak:.4} active={active} muted={muted} dropped={dropped} underruns={underruns} rt_fallbacks={rt_fallbacks}"
+        "audio-mix: requested={requested} mixed={mixed} from_tracks={from_tracks} audible={audible} peak={peak:.4} active={active} muted={muted} dropped={dropped} underruns={underruns} rt_fallbacks={rt_fallbacks} track_underruns={track_underruns} track_underrun_frames={track_underrun_frames}"
     );
 }
 
@@ -331,13 +334,24 @@ pub(crate) fn control(mixer: &Shared, name: i32, call: Control) {
     }
 }
 
-/// Removes track `name` from the mix; its server side is dropped with it. Its streaming frames never played count as dropped.
+/// Removes track `name` from the mix; its server side is dropped with it. Its streaming frames never played count as dropped; the underruns its client saw over its life are logged per track.
 pub(crate) fn remove_track(mixer: &Shared, name: i32) {
     if let Some(mut mix) = lock(mixer) {
-        let dropped = mix.remove(name);
-        if dropped > 0 {
-            DROPPED.fetch_add(dropped, Ordering::Relaxed);
-            tracing::info!(name, dropped, "track removed with frames it never played");
+        let removed = mix.remove(name);
+        if removed.dropped > 0 {
+            DROPPED.fetch_add(removed.dropped, Ordering::Relaxed);
+            tracing::info!(
+                name,
+                dropped = removed.dropped,
+                "track removed with frames it never played"
+            );
+        }
+        if removed.underruns > 0 {
+            tracing::info!(
+                name,
+                underruns = removed.underruns,
+                "track removed after underruns"
+            );
         }
     }
 }

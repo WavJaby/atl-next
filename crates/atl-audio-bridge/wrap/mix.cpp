@@ -30,12 +30,17 @@ std::atomic<uint64_t> g_track_frames{0};
 std::atomic<uint32_t> g_muted{0};
 /// Enabled tracks: a drain ends in the fill, so the level is kept here, not by the control calls.
 std::atomic<uint32_t> g_active{0};
+/// Underruns the tracks' proxies counted (steps of the cblk's mUnderrunCount) and the frames they tallied as underrun.
+std::atomic<uint64_t> g_underruns{0};
+std::atomic<uint64_t> g_underrun_frames{0};
 
 /// Disables track `name` and forgets it as enabled (a pause, a static stop, a finished drain).
 void disable(Mix& mix, int32_t name) {
     mix.disable(name);
-    mix.enabled.erase(name);
-    mix.draining.erase(name);
+    if (const auto it = mix.enabled.find(name); it != mix.enabled.end()) {
+        it->second->draining = false;
+        mix.enabled.erase(it);
+    }
     g_active.store(static_cast<uint32_t>(mix.enabled.size()), std::memory_order_relaxed);
 }
 
@@ -57,10 +62,25 @@ Track::Track(android::sp<android::AudioTrackServerProxy> server, audio_format_t 
 
 // Track::getNextBuffer (Tracks.cpp:1252): the proxy hands out what the client has written, in the track's format. The mixer reads float (AudioMixerBase::create sets mMixerInFormat to PCM_FLOAT; nothing changes it), so the frames go through AOSP's conversion: the copy ReformatBufferProvider::copyFrames makes (BufferProviders.cpp:412), which AudioMixer inserts for any track format other than the mixer's. That class is not linked: its object needs libaudiohal (EffectsFactoryHalInterface) and libsonic.
 // A float track is copied as is (memcpy_by_audio_format of equal formats is a memcpy), still into `floats`: one buffer shape for every format.
+// The underrun tally is Track::getNextBuffer's (Tracks.cpp:1260-1272): nothing obtained for a track the mixer still plays -> the whole request is tallied, anything obtained -> 0, which ends the underrun so the next one counts again. The cblk count it keeps is what the client reads as underruns
+// (AudioTrack::getUnderrunCount, AAudioStream_getXRunCount), and adaptive clients grow their buffer on it. AOSP skips stopping, pausing, stopped, paused and offloaded tracks; here only an enabled track is pulled (a pause disables it at once), so a draining (stopped) one is the case left.
+// prepareTracks_l's own tally (Threads.cpp:6281-6286) is for a track it does not mix that round (framesReady below a full period); this mixer pulls every enabled track every quantum, so the shortfall reaches this call as an empty obtain for the rest of the quantum.
 android::status_t Track::getNextBuffer(Buffer* buffer) {
     android::ServerProxy::Buffer buf;
-    buf.mFrameCount = buffer->frameCount;
+    const size_t desired = buffer->frameCount;
+    buf.mFrameCount = desired;
     android::status_t status = proxy->obtainBuffer(&buf);
+    const uint32_t underruns = is_static ? 0 : proxy->getUnderrunCount();
+    if (buf.mFrameCount == 0 && !draining) {
+        proxy->tallyUnderrunFrames(static_cast<uint32_t>(desired));
+        // a static track's cblk has no underrun count (its union holds mStatic): StaticAudioTrackServerProxy only flags the underrun
+        if (!is_static) {
+            g_underruns.fetch_add(proxy->getUnderrunCount() - underruns, std::memory_order_relaxed);
+            g_underrun_frames.fetch_add(desired, std::memory_order_relaxed);
+        }
+    } else {
+        proxy->tallyUnderrunFrames(0);
+    }
     server_raw = buf.mRaw;
     // the mixer asks for at most one quantum, and mix_add sized `floats` for that: the realtime fill allocates nothing
     const size_t frames = std::min<size_t>(buf.mFrameCount, floats.size() / channels);
@@ -159,7 +179,7 @@ uint64_t mix_remove(Mix& mix, Track& track, int32_t name) {
 void mix_start(Mix& mix, Track& track, int32_t name) {
     // a draining track resumes: start lifts the client's stop limit (AudioTrackServerProxy::start)
     track.proxy->start();
-    mix.draining.erase(name);
+    track.draining = false;
     apply_volume(mix, track, name);
     mix.enabled[name] = &track;
     mix.enable(name);
@@ -177,7 +197,7 @@ void mix_stop(Mix& mix, Track& track, int32_t name) {
         disable(mix, name);
         return;
     }
-    mix.draining.insert(name);
+    track.draining = true;
 }
 
 // Track::flush (Tracks.cpp:1646-1648): a track the mixer is not reading is flushed now, so the client can refill it while stopped or paused. A draining track's flush is applied by its next framesReady in the fill, which then ends the drain.
@@ -193,9 +213,9 @@ void mix_render(Mix& mix, rust::Slice<float> out) {
     for (size_t done = 0; done < frames;) {
         if (mix.next == mix.quantum) {
             // a stopped track whose frames up to its stop position are all mixed leaves the mix (prepareTracks_l, Threads.cpp:6297-6309)
-            for (auto it = mix.draining.begin(); it != mix.draining.end();) {
-                const int32_t name = *it++;
-                if (mix.enabled.at(name)->proxy->framesReady() == 0) {
+            for (auto it = mix.enabled.begin(); it != mix.enabled.end();) {
+                const auto [name, track] = *it++;  // advanced first: disable erases this entry
+                if (track->draining && track->proxy->framesReady() == 0) {
                     disable(mix, name);
                 }
             }
@@ -226,6 +246,18 @@ uint32_t muted_tracks() {
 
 uint32_t active_tracks() {
     return g_active.load(std::memory_order_relaxed);
+}
+
+uint64_t take_underruns() {
+    return g_underruns.exchange(0, std::memory_order_relaxed);
+}
+
+uint64_t take_underrun_frames() {
+    return g_underrun_frames.exchange(0, std::memory_order_relaxed);
+}
+
+uint32_t track_underruns(const Track& track) {
+    return track.is_static ? 0 : track.proxy->getUnderrunCount();
 }
 
 }  // namespace atl::audio
