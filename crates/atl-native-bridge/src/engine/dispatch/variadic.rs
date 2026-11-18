@@ -14,24 +14,29 @@ type HostWords = unsafe extern "C" fn(u64, ...) -> u64;
 #[cfg(not(atl_nb_al_zero))]
 type HostFp = unsafe extern "C" fn(u64, ...) -> f64;
 
-/// Calls `target` with `lanes` as the image above; `fp`: its result is in xmm0. Answers (rax, xmm0 bits), the unread one 0. `sig.params` is not read: the image is the callee's as it stands.
+/// The first eight lanes of a bank: the image passes eight words per bank (AAPCS64's registers and window).
+fn first8(bank: &[u64]) -> [u64; 8] {
+    std::array::from_fn(|i| bank[i])
+}
+
+/// Calls `target` with `lanes` as the image above (x = `regs`, v = `fp`, s = `stack`, eight each); `fp`: its result is in xmm0. Answers (rax, xmm0 bits), the unread one 0. `sig.params` is not read: the image is the callee's as it stands.
 /// Break `al_zero` makes the call with %al = 0 ([`call_al0`]).
 pub(super) fn call(target: usize, lanes: &AtlLanes, fp: bool, _sig: Sig) -> (u64, u64) {
-    let [x0, x1, x2, x3, x4, x5, x6, x7] = lanes.x;
-    let [v0, v1, v2, v3, v4, v5, v6, v7] = lanes.v.map(f64::from_bits);
+    let [x0, x1, x2, x3, x4, x5, x6, x7] = first8(&lanes.regs);
+    let [v0, v1, v2, v3, v4, v5, v6, v7] = first8(&lanes.fp).map(f64::from_bits);
     #[cfg(atl_nb_al_zero)]
     {
         let (int, f) = call_al0(
             target,
             [x0, x1, x2, x3, x4, x5, x6, x7],
             [v0, v1, v2, v3, v4, v5, v6, v7],
-            lanes.stack,
+            first8(&lanes.stack),
         );
         if fp { (0, f.to_bits()) } else { (int, 0) }
     }
     #[cfg(not(atl_nb_al_zero))]
     {
-        let [s0, s1, s2, s3, s4, s5, s6, s7] = lanes.stack;
+        let [s0, s1, s2, s3, s4, s5, s6, s7] = first8(&lanes.stack);
         if fp {
             // SAFETY: `target` is the host C function a binding or JNI entry names, and its result is a double or float (the descriptor's or the table's `ret`); the call passes the guest words in the image above, which such a callee reads by its own prototype.
             let f = unsafe { std::mem::transmute::<usize, HostFp>(target) };

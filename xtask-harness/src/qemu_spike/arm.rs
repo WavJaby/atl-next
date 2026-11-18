@@ -76,9 +76,9 @@ pub(super) fn run(root: &Path, b: &Build, no_breaks: bool) -> Result<bool> {
     let fixture = fixture(root, b, &dir)?;
     let sigchain = sigchain(root, &dir)?;
     let mut fails = Vec::new();
-    // the armv7 boot executables assemble and link (atl-qemu-boot's Arm-mode entries); booting them is the engine `.so`'s gate, which waits for ABI 4.0 lanes (P3)
-    if let Err(e) = boot_exes(root, b, &dir) {
-        fails.push(Failure::step("boot-exe", format!("{e:#}")));
+    // the armv7 boot executables assemble and link (atl-qemu-boot's Arm-mode entries); the engine `.so` (C ABI 4.0) boots the boot executable
+    if let Err(e) = boot_exes(root, b, &dir).and_then(|boot| engine_so(root, b, &dir, &boot)) {
+        fails.push(Failure::step("engine-so", format!("{e:#}")));
     }
     for spec in RUNS.iter().filter(|r| !no_breaks || r.red.is_none()) {
         let r = match &spec.edit {
@@ -106,18 +106,24 @@ pub(super) fn run(root: &Path, b: &Build, no_breaks: bool) -> Result<bool> {
     Ok(verdict.failures.is_empty())
 }
 
-/// Builds the boot and cpuinfo executables for the arm guest and checks each has an ELF entry (llvm-readelf).
-fn boot_exes(root: &Path, b: &Build, dir: &Path) -> Result<()> {
+/// Builds the boot and cpuinfo executables for the arm guest and checks each has an ELF entry (llvm-readelf). Returns the boot executable.
+fn boot_exes(root: &Path, b: &Build, dir: &Path) -> Result<PathBuf> {
     let out = dir.join("boot");
     std::fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
-    for exe in [
-        crate::qemu::boot_exe(root, b, &out)?,
-        crate::qemu::cpuinfo_exe(root, b, &out)?,
-    ] {
+    let boot = crate::qemu::boot_exe(root, b, &out)?;
+    for exe in [boot.clone(), crate::qemu::cpuinfo_exe(root, b, &out)?] {
         let entry = super::llvm_entry(&exe)?;
         ensure!(entry != 0, "{}: e_entry 0", exe.display());
     }
-    Ok(())
+    Ok(boot)
+}
+
+/// The arm engine `.so` (`libatl_engine_arm.so`, linked as aarch64's) booted through its C ABI on `boot` (tests/spike.rs `--engine-so`): (q) create reaches BOOT, map and attach inside it, AT_ENTRY = e_entry; (r) attach + detach on a thread of its own.
+fn engine_so(root: &Path, b: &Build, dir: &Path, boot: &Path) -> Result<()> {
+    let out = dir.join("engine");
+    let so = super::engine_so_file(root, b, &out)?;
+    let entry = super::llvm_entry(boot)?;
+    super::boot_gate_of(root, b, &out, "arm", &so, boot, entry, &['q', 'r'])
 }
 
 /// fixture_arm.c as a static bionic armv7 executable (NDK clang of the arm row).

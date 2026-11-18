@@ -26,7 +26,7 @@ pub(super) fn call(target: usize, lanes: &AtlLanes, _fp: bool, sig: Sig) -> (u64
     lp64d(target, &image)
 }
 
-/// The LP64D call of `target` with `image`: a0..a7 from x, fa0..fa7 from v (`fld`), the eight stack words stored at sp (64 bytes keep sp 16-aligned, psABI), `jalr`; sp restored after. Returns a0 and fa0's bits.
+/// The LP64D call of `target` with `image`: a0..a7 from `regs[0..8]`, fa0..fa7 from `fp[0..8]` (`fld`), the first eight stack words stored at sp (64 bytes keep sp 16-aligned, psABI), `jalr`; sp restored after. Returns a0 and fa0's bits.
 fn lp64d(target: usize, image: &AtlLanes) -> (u64, u64) {
     let (int, fp): (u64, f64);
     // SAFETY: `target` is the host C function a binding or JNI entry names; its arguments are the image `place` built by its prototype (or the identity image a prototype-less caller relies on). The stack words go below sp, which asm! hands over call-aligned; sp is restored after the call. t1 / t2 point at `image`'s fields, which outlive the block; every caller-saved register is declared clobbered (clobber_abi), ra too.
@@ -59,17 +59,17 @@ fn lp64d(target: usize, image: &AtlLanes) -> (u64, u64) {
             "fld fa7, 56(t1)",
             "jalr ra, 0(t3)",
             "addi sp, sp, 64",
-            in("t1") image.v.as_ptr(),
+            in("t1") image.fp.as_ptr(),
             in("t2") image.stack.as_ptr(),
             in("t3") target,
-            inout("a0") image.x[0] => int,
-            in("a1") image.x[1],
-            in("a2") image.x[2],
-            in("a3") image.x[3],
-            in("a4") image.x[4],
-            in("a5") image.x[5],
-            in("a6") image.x[6],
-            in("a7") image.x[7],
+            inout("a0") image.regs[0] => int,
+            in("a1") image.regs[1],
+            in("a2") image.regs[2],
+            in("a3") image.regs[3],
+            in("a4") image.regs[4],
+            in("a5") image.regs[5],
+            in("a6") image.regs[6],
+            in("a7") image.regs[7],
             lateout("fa0") fp,
             out("t0") _,
             out("ra") _,

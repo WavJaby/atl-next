@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: MIT
 //! Down shells of the QEMU engine (host->guest, Q6-4), one generator interface with a backend per host ISA ([`backend`]): x86_64 SysV (`x86.rs`), riscv64 LP64D (`riscv64.rs`).
-//! A host call enters shell k of the pool, which jumps to the entry with k in a scratch register; the entry stores the host call's argument registers and eight caller stack words into an `atl_lanes` image on its own frame, calls `atl_nb_down_dispatch(k, lanes)` (atl-native-bridge engine/dispatch.rs), and returns lanes.x[0] in the integer result register and lanes.v[0] in the fp one.
+//! A host call enters shell k of the pool, which jumps to the entry with k in a scratch register; the entry stores the host call's argument registers and eight caller stack words into an `atl_lanes` image on its own frame (the rest zeroed), calls `atl_nb_down_dispatch(k, lanes)` (atl-native-bridge engine/dispatch.rs), and returns lanes.ret[0] in the integer result register and lanes.fp[0] in the fp one.
 //! What differs per host beyond the asm is [`HostAbi`]: how dispatch.rs reads the host image and shapes the answer. build.rs writes [`DownBackend::entries_asm`] (`down.s`, assembled by place.rs `global_asm!`) and [`pool_rust`] (`down_pool.rs`).
 
-/// Bytes of a down call's lanes (`atl_lanes`, atl_engine.h): x[8] at 0, v[8] at [`V_AT`], stack[8] at [`STACK_AT`]. The entry's frame holds one.
-pub const LANES: usize = 192;
-/// Offset of `v` in the down call's lanes.
-pub const V_AT: usize = 64;
+/// Bytes of a down call's lanes (`atl_lanes`, atl_engine.h 4.0): regs[16] at 0, fp[16] at [`FP_AT`], stack[16] at [`STACK_AT`], ret[2] at [`RET_AT`]. The entry's frame holds one; atl-native-bridge asserts these against the struct ([`pool_rust`] carries them).
+pub const LANES: usize = 400;
+/// Offset of `fp` in the down call's lanes.
+pub const FP_AT: usize = 128;
 /// Offset of `stack` in the down call's lanes.
-pub const STACK_AT: usize = 128;
-/// Words per bank of the lanes (x, v, stack).
-pub const LANE_WORDS: usize = 8;
+pub const STACK_AT: usize = 256;
+/// Offset of `ret` in the down call's lanes: the integer answer the entry returns (`ret[0]`).
+pub const RET_AT: usize = 384;
+/// Words per bank of the lanes (regs, fp, stack).
+pub const BANK_WORDS: usize = 16;
+/// Caller stack words a shell copies into the window: eight (the host convention's side of the image; a placement needing more is refused, R-1). Reading more would read further above the caller's frame.
+pub const HOST_STACK_WORDS: usize = 8;
 
 /// The host calling convention's rules dispatch.rs applies to the lanes image a shell built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,7 +52,7 @@ pub fn backend(arch: &str) -> Option<DownBackend> {
     }
 }
 
-/// `down_pool.rs`: the pool's size and shell stride, and the host ABI rules dispatch.rs reads.
+/// `down_pool.rs`: the pool's size and shell stride, the host ABI rules dispatch.rs reads, and the lanes layout the shells' asm uses (asserted there against `AtlLanes`).
 pub fn pool_rust(b: &DownBackend, slots: usize) -> String {
     let a = b.abi;
     format!(
@@ -57,19 +61,45 @@ pub fn pool_rust(b: &DownBackend, slots: usize) -> String {
          pub const HOST_INT_LANES: usize = {};\n\
          pub const HOST_FP_TO_INT: bool = {};\n\
          pub const HOST_EXTEND_INT_RET: bool = {};\n\
-         pub const HOST_NAN_BOX_F32: bool = {};\n",
+         pub const HOST_NAN_BOX_F32: bool = {};\n\
+         pub const HOST_STACK_WORDS: usize = {HOST_STACK_WORDS};\n\
+         pub const LANES_REGS_AT: usize = 0;\n\
+         pub const LANES_FP_AT: usize = {FP_AT};\n\
+         pub const LANES_STACK_AT: usize = {STACK_AT};\n\
+         pub const LANES_RET_AT: usize = {RET_AT};\n\
+         pub const LANES_SIZE: usize = {LANES};\n",
         b.shell, a.int_lanes, a.fp_to_int, a.extend_int_ret, a.nan_box_f32
     )
+}
+
+/// Assembly-independent part of a shell's frame fill: the frame offsets of the lanes a shell zeroes (every word it does not store), so the image dispatch.rs reads is fully defined. `int_stored` integer registers and [`HOST_STACK_WORDS`] stack words are stored; fp stores the first eight.
+pub fn zeroed_offsets(int_stored: usize) -> Vec<usize> {
+    let regs = (int_stored..BANK_WORDS).map(|i| 8 * i);
+    let fp = (8..BANK_WORDS).map(|i| FP_AT + 8 * i);
+    let stack = (HOST_STACK_WORDS..BANK_WORDS).map(|i| STACK_AT + 8 * i);
+    let ret = (0..2).map(|i| RET_AT + 8 * i);
+    regs.chain(fp).chain(stack).chain(ret).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// atl_lanes = three banks of eight u64 words, in order x, v, stack (atl_engine.h `struct atl_lanes`).
+    /// atl_lanes 4.0 = banks of sixteen u64 words in order regs, fp, stack, then ret[2] (atl_engine.h `struct atl_lanes`).
     #[test]
     fn lanes_layout() {
-        assert_eq!((V_AT, STACK_AT, LANES), (8 * 8, 16 * 8, 24 * 8));
+        assert_eq!(
+            (FP_AT, STACK_AT, RET_AT, LANES),
+            (16 * 8, 32 * 8, 48 * 8, 50 * 8)
+        );
+    }
+
+    /// SysV stores six integer registers: the other ten, fp 8..16, stack 8..16 and ret are zeroed = 10 + 8 + 8 + 2 words.
+    #[test]
+    fn zeroed_offsets_cover_the_unstored_words() {
+        let z = zeroed_offsets(6);
+        assert_eq!(z.len(), 28);
+        assert_eq!((z[0], *z.last().expect("ret[1]")), (48, RET_AT + 8));
     }
 
     #[test]

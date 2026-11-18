@@ -84,9 +84,13 @@ mod abi_check {
     const _: () =
         assert!(offset_of!(AtlHost, fault_report) as u64 == l::ATL_OFFSET_HOST_FAULT_REPORT);
     const _: () = assert!(size_of::<AtlLanes>() as u64 == l::ATL_SIZEOF_LANES);
-    const _: () = assert!(offset_of!(AtlLanes, x) as u64 == l::ATL_OFFSET_LANES_X);
-    const _: () = assert!(offset_of!(AtlLanes, v) as u64 == l::ATL_OFFSET_LANES_V);
+    const _: () = assert!(atl_engine_api::LANE_REGS as u64 == l::ATL_VALUE_LANE_REGS as u64);
+    const _: () = assert!(atl_engine_api::LANE_FP as u64 == l::ATL_VALUE_LANE_FP as u64);
+    const _: () = assert!(atl_engine_api::LANE_STACK as u64 == l::ATL_VALUE_LANE_STACK as u64);
+    const _: () = assert!(offset_of!(AtlLanes, regs) as u64 == l::ATL_OFFSET_LANES_REGS);
+    const _: () = assert!(offset_of!(AtlLanes, fp) as u64 == l::ATL_OFFSET_LANES_FP);
     const _: () = assert!(offset_of!(AtlLanes, stack) as u64 == l::ATL_OFFSET_LANES_STACK);
+    const _: () = assert!(offset_of!(AtlLanes, ret) as u64 == l::ATL_OFFSET_LANES_RET);
     const _: () = assert!(size_of::<AtlEngine>() as u64 == l::ATL_SIZEOF_ENGINE);
     const _: () = assert!(offset_of!(AtlEngine, major) as u64 == l::ATL_OFFSET_ENGINE_MAJOR);
     const _: () = assert!(offset_of!(AtlEngine, minor) as u64 == l::ATL_OFFSET_ENGINE_MINOR);
@@ -107,12 +111,8 @@ mod abi_check {
     const _: () = assert!(offset_of!(AtlStack, len) as u64 == l::ATL_OFFSET_STACK_LEN);
 }
 
-// The ABI's lanes are AAPCS64-shaped (x0..x7, v0..v7); the guest-neutral lanes an arm engine `.so` needs are engine ABI 4.0 (phase 4 P3). Until then arm runs only in the spike harness (rlib).
-#[cfg(all(feature = "engine-so", atl_qe_guest = "arm"))]
-compile_error!("engine .so for an arm guest: needs engine ABI 4.0 lanes (phase 4 P3)");
-
-/// The C ABI (QEMU bridge plan Q5-1a), built into the engine `.so` only: the table `atl_engine` and its functions, contract in `include/atl_engine.h`. One engine per process.
-#[cfg(all(feature = "engine-so", not(atl_qe_guest = "arm")))]
+/// The C ABI (QEMU bridge plan Q5-1a), built into the engine `.so` only: the table `atl_engine` and its functions, contract in `include/atl_engine.h`. One engine per process; the lanes are guest-neutral (4.0), each guest target fills them by its calling convention (`Guest::trap_lanes`, `Guest::call_lanes`).
+#[cfg(feature = "engine-so")]
 mod capi {
     use std::ffi::{CStr, c_char, c_int, c_void};
     use std::sync::OnceLock;
@@ -158,36 +158,31 @@ mod capi {
         engine as usize == &raw const ENGINE as usize
     }
 
-    /// BOOT and REPORT through the trap callback: eight registers in, x0 out.
+    /// BOOT and REPORT through the trap callback: eight registers in, the first argument register's answer out.
     fn host_word(host: &HostRef, kind: TrapKind, regs: [u64; 8]) -> u64 {
         // SAFETY: host.trap and host.ctx are the host's, valid by the ABI (HostRef); regs holds the eight u64 the call reads.
         unsafe { (host.trap)(host.ctx, kind as u32, 0, regs.as_ptr()) }
     }
 
-    /// The engine's `OnTrap` for the C host. BOOT and REPORT go through `trap`; CALL and BIND through `trap_ex` with the guest's x0..x7, v0..v7 and eight stack words (a word past the guest's mapped memory is 0). The host's v0 answer is written to the guest here; its x0 is the trap's result (set by the trap dispatch).
+    /// The engine's `OnTrap` for the C host. BOOT and REPORT go through `trap`; CALL and BIND through `trap_ex` with the guest's lanes (`Guest::trap_lanes`: its convention's argument registers, fp registers and stack window). The host's answer beyond the first result register is written to the guest here (`Guest::answer_trap`); the first is the trap's result (set by the trap dispatch).
     fn host_trap(g: Guest, t: Trap) -> u64 {
         let host = HOST
             .get()
             .expect("atl-engine: create sets the host before BOOT");
-        let (kind, id, x) = match t {
-            Trap::Boot(x0) => {
-                return host_word(host, TrapKind::Boot, [x0, g.x(1), 0, 0, 0, 0, 0, 0]);
+        let (kind, id, args) = match t {
+            Trap::Boot(a0) => {
+                return host_word(host, TrapKind::Boot, [a0, g.arg(1), 0, 0, 0, 0, 0, 0]);
             }
-            Trap::Report(x0) => {
-                return host_word(host, TrapKind::Report, [x0, 0, 0, 0, 0, 0, 0, 0]);
+            Trap::Report(a0) => {
+                return host_word(host, TrapKind::Report, [a0, 0, 0, 0, 0, 0, 0, 0]);
             }
             Trap::Call(a) => (TrapKind::Call, 0, a),
             Trap::Bind { id, args } => (TrapKind::Bind, id, args),
         };
-        let mut lanes = AtlLanes {
-            x,
-            v: std::array::from_fn(|i| g.v(i)),
-            stack: std::array::from_fn(|i| g.stack_word(i).unwrap_or(0)),
-        };
+        let mut lanes = g.trap_lanes(&args);
         // SAFETY: host.trap_ex and host.ctx are the host's, valid by the ABI (HostRef); lanes is a live AtlLanes that the host reads and answers.
         unsafe { (host.trap_ex)(host.ctx, kind as u32, id, &mut lanes) };
-        g.set_v(0, lanes.v[0]);
-        lanes.x[0]
+        g.answer_trap(&lanes)
     }
 
     unsafe extern "C" fn create(

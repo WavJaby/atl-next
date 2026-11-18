@@ -203,7 +203,10 @@ fn on_trap(trap: qemu::Trap) -> qemu::Answer {
             qemu::Answer::default()
         }
         qemu::Trap::Bind { id, lanes } => {
-            TRAPS.lock().expect("traps").push((id, lanes.x));
+            TRAPS
+                .lock()
+                .expect("traps")
+                .push((id, std::array::from_fn(|i| lanes.regs[i])));
             match PLAN.get() {
                 Some(plan) if id == plan.ids[POST_INIT] => qemu::Answer::default(),
                 Some(plan) if id == plan.ids[CALL_GUEST] => qemu::Answer {

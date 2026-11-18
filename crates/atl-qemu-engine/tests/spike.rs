@@ -1661,7 +1661,7 @@ mod spike {
 
 fn main() {
     if std::env::args().any(|a| a == "--engine-so") {
-        #[cfg(all(feature = "qemu", not(atl_qe_guest = "arm")))]
+        #[cfg(feature = "qemu")]
         engine_so::main();
         return;
     }
@@ -1675,8 +1675,9 @@ fn main() {
 /// Env (xtask qemu_spike.rs sets it): `ATL_ENGINE_SO` the library, `ATL_ENGINE_BOOT` the static boot executable, `ATL_ENGINE_ENTRY` the expected entry in hex.
 /// BOOT also probes D9: `map` of a host page and `attach` from a host thread both succeed inside the BOOT trap.
 /// Gate (r), after (q) in the same process: `attach` then `detach` of a CPU on a thread of its own.
-/// Gate (z), from the same BOOT auxv: AT_HWCAP / AT_HWCAP2 equal the device profile the engine selects (engine.rs `GUEST_CPU`). xtask also sets `QEMU_CPU=help` (QEMU would list its models and exit before BOOT) and `QEMU_STRACE=1` in this process: the engine must not read them (QEMU patch 0003); (z) fails if they are not set, so the probe is armed.
-#[cfg(all(feature = "qemu", not(atl_qe_guest = "arm")))]
+/// Gate (z), from the same BOOT auxv, aarch64 only: AT_HWCAP / AT_HWCAP2 equal the device profile the engine selects (engine.rs `GUEST_CPU`). xtask also sets `QEMU_CPU=help` (QEMU would list its models and exit before BOOT) and `QEMU_STRACE=1` in this process: the engine must not read them (QEMU patch 0003); (z) fails if they are not set, so the probe is armed. An arm build runs (q) and (r): its CPU model is not chosen yet (engine/arm.rs `GUEST_CPU`).
+/// Guest-neutral: the probe speaks only the C ABI; the auxv's word is the guest's (u32 on arm).
+#[cfg(feature = "qemu")]
 mod engine_so {
     use std::ffi::{CStr, CString, c_void};
     use std::sync::OnceLock;
@@ -1714,12 +1715,12 @@ mod engine_so {
         0
     }
 
-    /// The host's trap for CALL and BIND. Nothing but BOOT is expected in this probe, so it answers what `trap` answers: x0 = 0, v0 left as the guest had it.
+    /// The host's trap for CALL and BIND. Nothing but BOOT is expected in this probe, so it answers what `trap` answers: x0 = 0, v0 left as the guest had it (fp[0] in).
     unsafe extern "C" fn trap_ex(ctx: *mut c_void, kind: u32, id: u32, lanes: *mut AtlLanes) {
         // SAFETY: lanes is the engine's live AtlLanes for this call (the ABI).
         let lanes = unsafe { &mut *lanes };
-        // SAFETY: the same trap as `trap`, with the x lanes it reads.
-        lanes.x[0] = unsafe { trap(ctx, kind, id, lanes.x.as_ptr()) };
+        // SAFETY: the same trap as `trap`, with the first eight register lanes it reads.
+        lanes.ret[0] = unsafe { trap(ctx, kind, id, lanes.regs.as_ptr()) };
     }
 
     /// The host's fault report: no guest fault is expected in this probe, so nothing to report.
@@ -1787,12 +1788,18 @@ mod engine_so {
         }
     }
 
+    /// One auxv word of the guest: its `unsigned long` (ILP32 on arm).
+    #[cfg(atl_qe_guest = "arm")]
+    type AuxWord = u32;
+    #[cfg(not(atl_qe_guest = "arm"))]
+    type AuxWord = u64;
+
     /// The entry `key` of the auxv at `auxv` (identity addresses: the host address is the guest's).
     fn at(auxv: u64, key: u64) -> Result<u64, String> {
-        let mut p = auxv as *const u64;
+        let mut p = auxv as *const AuxWord;
         loop {
-            // SAFETY: auxv is QEMU's (type, value) array for the boot executable, ended by AT_NULL; its stack stays mapped (the boot thread is parked in BOOT).
-            let (t, v) = unsafe { (*p, *p.add(1)) };
+            // SAFETY: auxv is QEMU's (type, value) array of guest words for the boot executable, ended by AT_NULL; its stack stays mapped (the boot thread is parked in BOOT).
+            let (t, v) = unsafe { (u64::from(*p), u64::from(*p.add(1))) };
             if t == libc::AT_NULL as u64 {
                 return Err(format!("auxv has no entry {key}"));
             }
@@ -1804,34 +1811,41 @@ mod engine_so {
         }
     }
 
-    /// Reference phone (hwcap-diff evidence S7, `LD_SHOW_AUXV`): AT_HWCAP 0xefbfffff, AT_HWCAP2 0x1ae181. The cortex-a710 profile differs by exactly (S8): HWCAP - EVTSTRM; HWCAP2 - DGH - ECV - AFP + MTE. Bits: arm64 uapi asm/hwcap.h.
-    const PHONE_HWCAP: u64 = 0xefbf_ffff;
-    const PHONE_HWCAP2: u64 = 0x1a_e181;
-    const HWCAP_EVTSTRM: u64 = 1 << 2;
-    const HWCAP2_DGH: u64 = 1 << 15;
-    const HWCAP2_MTE: u64 = 1 << 18;
-    const HWCAP2_ECV: u64 = 1 << 19;
-    const HWCAP2_AFP: u64 = 1 << 20;
-    const WANT_HWCAP: u64 = PHONE_HWCAP & !HWCAP_EVTSTRM;
-    const WANT_HWCAP2: u64 = (PHONE_HWCAP2 & !(HWCAP2_DGH | HWCAP2_ECV | HWCAP2_AFP)) | HWCAP2_MTE;
-    /// QEMU option variables xtask sets for (z); patch 0003 keeps QEMU from reading them.
-    const QEMU_VARS: [&str; 2] = ["QEMU_CPU", "QEMU_STRACE"];
+    /// Gate (z)'s device profile, aarch64's.
+    #[cfg(not(atl_qe_guest = "arm"))]
+    mod profile {
+        use super::at;
 
-    /// Gate (z): the guest's hwcaps are the device profile, and the probe's QEMU_* variables were set.
-    fn cpu_profile(auxv: u64) -> Result<(), String> {
-        for v in QEMU_VARS {
-            if std::env::var_os(v).is_none() {
-                return Err(format!("{v} unset: the env probe is not armed"));
+        /// Reference phone (hwcap-diff evidence S7, `LD_SHOW_AUXV`): AT_HWCAP 0xefbfffff, AT_HWCAP2 0x1ae181. The cortex-a710 profile differs by exactly (S8): HWCAP - EVTSTRM; HWCAP2 - DGH - ECV - AFP + MTE. Bits: arm64 uapi asm/hwcap.h.
+        const PHONE_HWCAP: u64 = 0xefbf_ffff;
+        const PHONE_HWCAP2: u64 = 0x1a_e181;
+        const HWCAP_EVTSTRM: u64 = 1 << 2;
+        const HWCAP2_DGH: u64 = 1 << 15;
+        const HWCAP2_MTE: u64 = 1 << 18;
+        const HWCAP2_ECV: u64 = 1 << 19;
+        const HWCAP2_AFP: u64 = 1 << 20;
+        const WANT_HWCAP: u64 = PHONE_HWCAP & !HWCAP_EVTSTRM;
+        const WANT_HWCAP2: u64 =
+            (PHONE_HWCAP2 & !(HWCAP2_DGH | HWCAP2_ECV | HWCAP2_AFP)) | HWCAP2_MTE;
+        /// QEMU option variables xtask sets for (z); patch 0003 keeps QEMU from reading them.
+        const QEMU_VARS: [&str; 2] = ["QEMU_CPU", "QEMU_STRACE"];
+
+        /// Gate (z): the guest's hwcaps are the device profile, and the probe's QEMU_* variables were set.
+        pub(super) fn cpu_profile(auxv: u64) -> Result<(), String> {
+            for v in QEMU_VARS {
+                if std::env::var_os(v).is_none() {
+                    return Err(format!("{v} unset: the env probe is not armed"));
+                }
             }
+            let hwcap = at(auxv, libc::AT_HWCAP)?;
+            let hwcap2 = at(auxv, libc::AT_HWCAP2)?;
+            if (hwcap, hwcap2) != (WANT_HWCAP, WANT_HWCAP2) {
+                return Err(format!(
+                    "AT_HWCAP {hwcap:#x} AT_HWCAP2 {hwcap2:#x} != device profile {WANT_HWCAP:#x} {WANT_HWCAP2:#x}"
+                ));
+            }
+            Ok(())
         }
-        let hwcap = at(auxv, libc::AT_HWCAP)?;
-        let hwcap2 = at(auxv, libc::AT_HWCAP2)?;
-        if (hwcap, hwcap2) != (WANT_HWCAP, WANT_HWCAP2) {
-            return Err(format!(
-                "AT_HWCAP {hwcap:#x} AT_HWCAP2 {hwcap2:#x} != device profile {WANT_HWCAP:#x} {WANT_HWCAP2:#x}"
-            ));
-        }
-        Ok(())
     }
 
     fn run() -> Result<(&'static AtlEngine, *mut AtlEngineHandle, u64), String> {
@@ -1917,13 +1931,16 @@ mod engine_so {
         match run() {
             Ok((table, engine, auxv)) => {
                 println!("spike: (q) ok");
-                match cpu_profile(auxv) {
+                #[cfg(not(atl_qe_guest = "arm"))]
+                match profile::cpu_profile(auxv) {
                     Ok(()) => println!("spike: (z) ok"),
                     Err(e) => {
                         println!("spike: FAIL (z) {e}");
                         std::process::exit(1);
                     }
                 }
+                #[cfg(atl_qe_guest = "arm")]
+                let _ = auxv;
                 match detach_probe(table, engine) {
                     Ok(()) => println!("spike: (r) ok"),
                     Err(e) => {

@@ -127,14 +127,14 @@ fn two_pages() -> Result<usize, String> {
 /// Check d: `qa_sum` through `call_ex`, its ninth int and ninth double as stack arguments. The double result is the answer lane v0.
 fn check_sum(sum: u64) -> Result<(), String> {
     let mut lanes = AtlLanes::default();
-    lanes.x[..8].copy_from_slice(&SUM_INTS[..8]);
+    lanes.regs[..8].copy_from_slice(&SUM_INTS[..8]);
     lanes.stack[0] = SUM_INTS[8];
-    for (v, d) in lanes.v.iter_mut().zip(SUM_DOUBLES) {
+    for (v, d) in lanes.fp.iter_mut().zip(SUM_DOUBLES) {
         *v = d.to_bits();
     }
     lanes.stack[1] = SUM_DOUBLES[8].to_bits();
     qemu::call_ex(sum, &mut lanes);
-    same("qa_sum v0 bits", lanes.v[0], SUM_EXPECT.to_bits())
+    same("qa_sum v0 bits", lanes.fp[0], SUM_EXPECT.to_bits())
 }
 
 /// Check e: `qa_edge` with its sp 16 bytes below the end of the first host page, only that page mapped. Words 0 and 1 are the stored pair; words 2..8 lie past the mapped page and must read 0, not [`MARKER`].
@@ -142,14 +142,15 @@ fn check_edge(edge: u64) -> Result<(), String> {
     let base = two_pages()?;
     qemu::CROSSING.map(base, PAGE, PROT_READ | PROT_WRITE)?;
     let mut lanes = AtlLanes::default();
-    lanes.x[0] = (base + PAGE - 16) as u64;
+    lanes.regs[0] = (base + PAGE - 16) as u64;
     qemu::call_ex(edge, &mut lanes);
     let seen = LAST.lock().expect("last").take().unwrap_or_default().stack;
     same("stack words 0..2", [seen[0], seen[1]], [EDGE_S0, EDGE_S1])?;
+    // the aarch64 engine reads eight words of the window; the rest stay 0 too
     same(
-        "stack words 2..8 past the mapped page",
+        "stack words 2..16 past the mapped page",
         seen[2..].to_vec(),
-        vec![0; 6],
+        vec![0; atl_engine_api::LANE_STACK - 2],
     )
 }
 
@@ -218,10 +219,17 @@ fn checks([run, sum, edge]: [u64; 3]) -> bool {
     let returned = qemu::call(run, &[]);
     let lanes = LAST.lock().expect("last").take().unwrap_or_default();
     let mut ok = true;
-    ok &= check('x', same("x0..x7", lanes.x, X_EXPECT));
+    ok &= check(
+        'x',
+        same("x0..x7", lanes.regs[..8].to_vec(), X_EXPECT.to_vec()),
+    );
     ok &= check(
         'v',
-        same("v0..v7 bits", lanes.v, V_EXPECT.map(f64::to_bits)),
+        same(
+            "v0..v7 bits",
+            lanes.fp[..8].to_vec(),
+            V_EXPECT.map(f64::to_bits).to_vec(),
+        ),
     );
     ok &= check(
         'k',

@@ -1155,6 +1155,24 @@ fn boot_gate(
     boot: &Path,
     entry: u64,
 ) -> Result<()> {
+    boot_gate_of(root, b, out, tag, so, boot, entry, &['q', 'z', 'r'])
+}
+
+/// The engine `.so` boot probe (tests/spike.rs `--engine-so`) of `so` on `boot`, green when it exits 0 and prints `spike: (g) ok` for every gate of `gates` (an arm build has no (z): its CPU model is open).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "boot_gate's inputs plus the gate list"
+)]
+pub(super) fn boot_gate_of(
+    root: &Path,
+    b: &Build,
+    out: &Path,
+    tag: &str,
+    so: &Path,
+    boot: &Path,
+    entry: u64,
+    gates: &[char],
+) -> Result<()> {
     let o = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
         .args([
             "test",
@@ -1182,9 +1200,9 @@ fn boot_gate(
     let text = String::from_utf8_lossy(&o.stdout);
     ensure!(
         o.status.success()
-            && text.lines().any(|l| l == "spike: (q) ok")
-            && text.lines().any(|l| l == "spike: (z) ok")
-            && text.lines().any(|l| l == "spike: (r) ok"),
+            && gates
+                .iter()
+                .all(|g| text.lines().any(|l| l == format!("spike: ({g}) ok"))),
         "engine boot gate ({tag}) not ok ({}), log {}",
         o.status,
         log.display()

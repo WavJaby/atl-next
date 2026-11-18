@@ -585,9 +585,9 @@ impl Guest {
     pub fn call_on(&self, tp: u64, f: u64, args: &[u64]) -> (u64, u64) {
         assert!(args.len() <= 8, "{} arguments, 8 lanes only", args.len());
         let mut lanes = AtlLanes::default();
-        lanes.x[..args.len()].copy_from_slice(args);
+        lanes.regs[..args.len()].copy_from_slice(args);
         let tp_out = self.call_lanes(tp, f, &mut lanes);
-        (lanes.x[0], tp_out)
+        (lanes.ret[0], tp_out)
     }
 
     /// Whether guest and host addresses are the same (`guest_base` 0, `-B 0`). Not merely a convenience: with a nonzero base TCG on an x86_64 host sets GS to it (tcg/x86_64/tcg-target.c.inc, `ARCH_SET_GS`), which ART owns on every thread.

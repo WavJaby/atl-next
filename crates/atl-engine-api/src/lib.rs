@@ -6,9 +6,16 @@
 use core::ffi::{c_char, c_int, c_void};
 
 /// Major version: a host refuses an engine with another major.
-pub const ABI_MAJOR: u32 = 3;
+pub const ABI_MAJOR: u32 = 4;
 /// Minor version: additions only, appended to a struct.
-pub const ABI_MINOR: u32 = 1;
+pub const ABI_MINOR: u32 = 0;
+
+/// `ATL_LANE_REGS`: lanes of [`AtlLanes::regs`].
+pub const LANE_REGS: usize = 16;
+/// `ATL_LANE_FP`: lanes of [`AtlLanes::fp`].
+pub const LANE_FP: usize = 16;
+/// `ATL_LANE_STACK`: lanes of [`AtlLanes::stack`], the stack window.
+pub const LANE_STACK: usize = 16;
 
 /// `ATL_PROT_READ`.
 pub const PROT_READ: u32 = 0x1;
@@ -21,13 +28,13 @@ pub const PROT_EXEC: u32 = 0x4;
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrapKind {
-    /// BOOT: `regs[0]` = auxv, `regs[1]` = return stub; the answer is the boot executable's exit status.
+    /// BOOT: `regs[0]` = auxv, `regs[1]` = return stub (the first two argument registers); the answer is the boot executable's exit status.
     Boot = 0,
-    /// A host call: `regs[0..8]` = x0..x7; the answer is x0.
+    /// A host call ([`TrapExFn`]): lanes in; the answer is `ret` and `fp[0]`.
     Call = 1,
-    /// A binding thunk: `id` = slot; `regs[0..8]` = x0..x7; the answer is x0.
+    /// A binding thunk ([`TrapExFn`]): `id` = slot; lanes in; the answer is `ret` and `fp[0]`.
     Bind = 2,
-    /// A value reported for a gate: `regs[0]` = x0; the answer is ignored.
+    /// A value reported for a gate: `regs[0]` = the first argument register; the answer is ignored.
     Report = 3,
 }
 
@@ -41,16 +48,18 @@ pub enum AtlCpu {}
 pub type TrapFn =
     unsafe extern "C" fn(ctx: *mut c_void, kind: u32, id: u32, regs: *const u64) -> u64;
 
-/// `atl_lanes`: the lanes of a host call or trap beyond the integer registers. `x` is x0..x7 and `v` the low 64 bits of v0..v7 (both in); `stack` the eight words at the guest's sp (in). The answer is `x[0]` and `v[0]`.
+/// `atl_lanes`: the guest-neutral lanes of a call or trap; each bank holds one calling convention's slots in order, zero-extended, unused lanes 0 (which lanes a guest uses: header). The answer is `ret` and `fp[0]`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AtlLanes {
-    /// x0..x7.
-    pub x: [u64; 8],
-    /// The low 64 bits of v0..v7.
-    pub v: [u64; 8],
-    /// The eight words at sp.
-    pub stack: [u64; 8],
+    /// The integer argument registers (aarch64 x0..x7, arm r0..r3).
+    pub regs: [u64; LANE_REGS],
+    /// The low 64 bits of the fp argument registers (aarch64 v0..v7; arm softfp none); out: `fp[0]` = the fp result.
+    pub fp: [u64; LANE_FP],
+    /// The stack window: one guest stack slot per lane at the callee's sp (aarch64 8 bytes, arm 4).
+    pub stack: [u64; LANE_STACK],
+    /// Out: the integer result registers (aarch64 x0, x1; arm r0, r1).
+    pub ret: [u64; 2],
 }
 
 /// `atl_stack`: the guest stack of an attach ([`AtlEngine::attach_ex`]). `size` and `guard` in (rounded up to pages; 0 = default: 1 MiB, one page); `base` and `len` out, the usable stack (sp starts at `base + len`; the guard lies right below `base`); `guard` out too, the guard actually made.
@@ -67,7 +76,7 @@ pub struct AtlStack {
     pub len: u64,
 }
 
-/// The trap callback of [`AtlHost`] for CALL and BIND: `lanes` is read, then answered in `x[0]` and `v[0]`.
+/// The trap callback of [`AtlHost`] for CALL and BIND: `lanes` is read, then answered in `ret` and `fp[0]`.
 pub type TrapExFn =
     unsafe extern "C" fn(ctx: *mut c_void, kind: u32, id: u32, lanes: *mut AtlLanes);
 
@@ -114,7 +123,7 @@ pub type AttachExFn = unsafe extern "C" fn(
 ) -> c_int;
 /// `atl_engine::detach`.
 pub type DetachFn = unsafe extern "C" fn(engine: *mut AtlEngineHandle, cpu: *mut AtlCpu);
-/// `atl_engine::call_ex`: `tp` in and out; `lanes` in and out (the answer is `x[0]` and `v[0]`).
+/// `atl_engine::call_ex`: `tp` in and out; `lanes` in and out (the answer is `ret` and `fp[0]`).
 pub type CallExFn = unsafe extern "C" fn(
     engine: *mut AtlEngineHandle,
     cpu: *mut AtlCpu,
@@ -257,33 +266,47 @@ mod tests {
         format!("{ABI_MAJOR}.{ABI_MINOR}")
     }
 
-    // engine-side 3.0 stays the fixture: 3.1 appended only to `atl_host`, the engine table is unchanged
     #[test]
-    fn admits_a_full_3_0_engine() {
-        assert_eq!(check_engine_table(&full(3, 0)), Ok(()));
+    fn admits_a_full_4_0_engine() {
+        assert_eq!(check_engine_table(&full(4, 0)), Ok(()));
     }
 
     #[test]
-    fn refuses_a_2_3_engine_naming_the_major() {
-        // a complete 2.3 table (the last 2.x minor) is still another major: 3.0 dropped `attach`
+    fn refuses_a_3_1_engine_naming_the_major() {
+        // a complete 3.1 table (the last 3.x minor) is still another major: 4.0 reshaped `atl_lanes` (guest-neutral banks)
         assert_eq!(
-            check_engine_table(&full(2, 3)),
-            Err(format!("engine ABI 2.3 refused, host speaks {}", host()))
+            check_engine_table(&full(3, 1)),
+            Err(format!("engine ABI 3.1 refused, host speaks {}", host()))
         );
     }
 
     #[test]
-    fn refuses_a_3_0_engine_without_fault_by_name() {
+    fn refuses_a_4_0_engine_without_fault_by_name() {
         let table = AtlEngine {
             fault: None,
-            ..full(3, 0)
+            ..full(4, 0)
         };
         assert_eq!(
             check_engine_table(&table),
             Err(format!(
-                "engine ABI 3.0 lacks [fault], host needs {}",
+                "engine ABI 4.0 lacks [fault], host needs {}",
                 host()
             ))
+        );
+    }
+
+    /// atl_lanes per the header: regs[16], fp[16], stack[16], ret[2], u64 each, in that order.
+    #[test]
+    fn lanes_layout() {
+        use core::mem::{offset_of, size_of};
+        assert_eq!(
+            (
+                offset_of!(AtlLanes, fp),
+                offset_of!(AtlLanes, stack),
+                offset_of!(AtlLanes, ret),
+                size_of::<AtlLanes>()
+            ),
+            (16 * 8, 32 * 8, 48 * 8, 50 * 8)
         );
     }
 }

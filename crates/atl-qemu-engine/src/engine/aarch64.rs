@@ -27,6 +27,8 @@ const ZREGS: usize = crate::layout::ATL_OFFSET_ZREGS as usize;
 const ZREG_SIZE: usize = crate::layout::ATL_SIZEOF_ZREG as usize;
 const ZREG_D: usize = crate::layout::ATL_OFFSET_ZREG_D as usize;
 const _: () = assert!(ZREGS + 32 * ZREG_SIZE <= Env::SIZE);
+/// Stack slots of the lanes' window this target reads and writes: eight 8-byte words, the window's size before 4.0 (the gates' expectations).
+const STACK_SLOTS: usize = 8;
 
 impl Guest {
     /// x<i> (0..=30), or sp for 31.
@@ -79,9 +81,36 @@ impl Guest {
         self.set_reg(at + 8, 0);
     }
 
-    /// Stack word `i` (0..8) at the guest's sp: where a call's stack arguments sit. `None` when the word's address is not mapped for the guest (QEMU bridge plan R-5: the trap reads all eight, and past a shallow thread's stack top they are refused, not read). Identity: a mapped word is read at its host address.
+    /// The engine ABI lanes of a CALL or binding trap whose integer argument registers are `args` (x0..x7): v0..v7 into `fp[0..8]`, the [`STACK_SLOTS`] words at sp into `stack` (a word past the guest's mapped memory is 0).
+    #[cfg_attr(
+        not(feature = "engine-so"),
+        allow(dead_code, reason = "the C ABI's trap only")
+    )]
+    pub(crate) fn trap_lanes(&self, args: &[u64; 8]) -> AtlLanes {
+        let mut l = AtlLanes::default();
+        l.regs[..8].copy_from_slice(args);
+        for i in 0..8 {
+            l.fp[i] = self.v(i);
+        }
+        for i in 0..STACK_SLOTS {
+            l.stack[i] = self.stack_word(i).unwrap_or(0);
+        }
+        l
+    }
+
+    /// Writes a trap's answer beyond x0 (`fp[0]` into v0) and returns x0's (`ret[0]`), which the trap dispatch sets.
+    #[cfg_attr(
+        not(feature = "engine-so"),
+        allow(dead_code, reason = "the C ABI's trap only")
+    )]
+    pub(crate) fn answer_trap(&self, l: &AtlLanes) -> u64 {
+        self.set_v(0, l.fp[0]);
+        l.ret[0]
+    }
+
+    /// Stack word `i` (0..[`STACK_SLOTS`]) at the guest's sp: where a call's stack arguments sit. `None` when the word's address is not mapped for the guest (QEMU bridge plan R-5: the trap reads them all, and past a shallow thread's stack top they are refused, not read). Identity: a mapped word is read at its host address.
     pub fn stack_word(&self, i: usize) -> Option<u64> {
-        assert!(i < 8, "stack word {i}");
+        assert!(i < STACK_SLOTS, "stack word {i}");
         let addr = self.x(31) + 8 * i as u64;
         if addr > *lib().guest_addr_max as u64 || self.page_flags(addr) & page::VALID == 0 {
             return None;
@@ -103,19 +132,19 @@ impl Guest {
         self.set_reg(TPIDR_EL0, v);
     }
 
-    /// Calls guest function `f` with `lanes` on thread pointer `tp`: x0..x7, v0..v7 (low 64 bits) and the eight stack words at the callee's sp. The answer is `lanes.x[0]` and `lanes.v[0]`; returns the thread pointer the call returned with. Nested: may run from inside a trap callback, which may itself call again.
+    /// Calls guest function `f` with `lanes` on thread pointer `tp`: x0..x7 from `regs[0..8]`, v0..v7 (low 64 bits) from `fp[0..8]`, the [`STACK_SLOTS`] words at the callee's sp from `stack`. The answer is `ret` (x0, x1) and `fp[0]` (v0); returns the thread pointer the call returned with. Nested: may run from inside a trap callback, which may itself call again.
     /// The whole CPU state is saved and restored around the call (the thread pointer included), so the interrupted guest code resumes exactly where its trap left it.
     pub fn call_lanes(&self, tp: u64, f: u64, lanes: &mut AtlLanes) -> u64 {
         let ret = ret_stub();
         assert!(ret != 0, "no BOOT trap yet: no return stub");
         let saved = self.save();
         self.set_tp(tp);
-        for (i, a) in lanes.x.iter().enumerate() {
+        for (i, a) in lanes.regs[..8].iter().enumerate() {
             self.set_x(i, *a);
         }
         // break `call-v` (qemu-abi gate, check d): the FP lanes are not set, so v0..v7 keep the CPU's values
         if !cfg!(atl_qe_call_v) {
-            for (i, v) in lanes.v.iter().enumerate() {
+            for (i, v) in lanes.fp[..8].iter().enumerate() {
                 self.set_v(i, *v);
             }
         }
@@ -123,7 +152,7 @@ impl Guest {
         let sp = (self.x(31) - 256) & !15;
         // break `call-stack` (qemu-abi gate, check d): the stack words are not written, so the callee's stack arguments are what lies at sp
         if !cfg!(atl_qe_call_stack) {
-            for (i, w) in lanes.stack.iter().enumerate() {
+            for (i, w) in lanes.stack[..STACK_SLOTS].iter().enumerate() {
                 // SAFETY: sp..sp+64 lies in the CPU's guest stack below the interrupted sp, where the callee's own frame goes too; the host address is mapped (identity).
                 unsafe { (self.host_addr(sp + 8 * i as u64) as *mut u64).write_unaligned(*w) };
             }
@@ -132,8 +161,8 @@ impl Guest {
         self.set_x(30, ret);
         self.set_reg(Env::pc, f);
         self.run();
-        lanes.x[0] = self.x(0);
-        lanes.v[0] = self.v(0);
+        lanes.ret = [self.x(0), self.x(1)];
+        lanes.fp[0] = self.v(0);
         let tp_out = self.tp();
         self.restore(&saved);
         tp_out

@@ -194,7 +194,7 @@ unsafe extern "C" fn host_trap(_ctx: *mut c_void, kind: u32, _id: u32, regs: *co
     dispatch_trap(trap).x0
 }
 
-/// The engine's host trap for CALL and BIND (`atl_host.trap_ex`): the lanes in, the callback's answer out as `x[0]` and `v[0]`.
+/// The engine's host trap for CALL and BIND (`atl_host.trap_ex`): the lanes in, the callback's answer out as `ret[0]` and `fp[0]`.
 ///
 /// # Safety
 /// The engine calls it with `lanes` pointing at one live `AtlLanes` (the ABI), read and answered before it returns.
@@ -206,13 +206,13 @@ unsafe extern "C" fn host_trap_ex(_ctx: *mut c_void, kind: u32, id: u32, lanes: 
     // break `qa_v_lane` (qemu-abi gate, `v`): FP lane i arrives as lane i+1
     #[cfg(atl_qa_v_lane)]
     let l = AtlLanes {
-        v: std::array::from_fn(|i| l.v[(i + 1) % 8]),
+        fp: std::array::from_fn(|i| if i < 8 { l.fp[(i + 1) % 8] } else { 0 }),
         ..l
     };
     // break `qa_stack_off` (qemu-abi gate, `k`): stack word i arrives as word i+1
     #[cfg(atl_qa_stack_off)]
     let l = AtlLanes {
-        stack: std::array::from_fn(|i| l.stack[(i + 1) % 8]),
+        stack: std::array::from_fn(|i| if i < 8 { l.stack[(i + 1) % 8] } else { 0 }),
         ..l
     };
     let trap = match kind {
@@ -223,10 +223,10 @@ unsafe extern "C" fn host_trap_ex(_ctx: *mut c_void, kind: u32, id: u32, lanes: 
         )),
     };
     let answer = dispatch_trap(trap);
-    // SAFETY: lanes is the engine's and still live (the ABI); the engine sets the guest's v0 and x0 from these two answers.
+    // SAFETY: lanes is the engine's and still live (the ABI); the engine sets the guest's x0 and v0 from these two answers.
     let out = unsafe { &mut *lanes };
-    out.x[0] = answer.x0;
-    out.v[0] = answer.v0;
+    out.ret[0] = answer.x0;
+    out.fp[0] = answer.v0;
 }
 
 /// The callback [`boot`] installed, on one trap.
@@ -286,7 +286,7 @@ pub fn detach_current() {
     unsafe { detach(e.handle, cpu) };
 }
 
-/// Calls guest `f` on this thread's CPU with thread pointer `tp` in and out (`atl_engine.call_ex`): `lanes` in, the answer in `lanes.x[0]` and `lanes.v[0]`. Nests: from inside a trap callback too.
+/// Calls guest `f` on this thread's CPU with thread pointer `tp` in and out (`atl_engine.call_ex`): `lanes` in, the answer in `lanes.ret` and `lanes.fp[0]`. Nests: from inside a trap callback too.
 fn call_on(tp: &mut u64, f: u64, lanes: &mut AtlLanes) {
     let e = engine();
     let cpu = CPU.with(Cell::get);
@@ -316,12 +316,12 @@ pub(super) fn call_down(f: usize, lanes: &mut AtlLanes) {
 pub fn call(f: u64, args: &[u64]) -> u64 {
     assert!(args.len() <= 8, "{} arguments, x0..x7 only", args.len());
     let mut lanes = AtlLanes::default();
-    lanes.x[..args.len()].copy_from_slice(args);
+    lanes.regs[..args.len()].copy_from_slice(args);
     call_ex(f, &mut lanes);
-    lanes.x[0]
+    lanes.ret[0]
 }
 
-/// Calls guest `f` with `lanes` on this thread's CPU with thread pointer 0; the answer is `lanes.x[0]` and `lanes.v[0]`. For the gates (qemu-abi's host-to-guest checks).
+/// Calls guest `f` with `lanes` on this thread's CPU with thread pointer 0; the answer is `lanes.ret` and `lanes.fp[0]`. For the gates (qemu-abi's host-to-guest checks).
 pub fn call_ex(f: u64, lanes: &mut AtlLanes) {
     let mut tp = 0;
     call_on(&mut tp, f, lanes);
@@ -496,11 +496,11 @@ impl super::Engine for Qemu {
             super::Tp::Guest(t) => t,
         });
         let mut lanes = AtlLanes::default();
-        lanes.x[..4].copy_from_slice(&args.map(|v| v as u64));
+        lanes.regs[..4].copy_from_slice(&args.map(|v| v as u64));
         let mut guest_tp = cpu.guest_tp() as u64;
         call_on(&mut guest_tp, f as u64, &mut lanes);
         cpu.set_guest_tp(guest_tp as usize);
-        lanes.x[0] as usize
+        lanes.ret[0] as usize
     }
 }
 
@@ -530,10 +530,8 @@ mod tests {
         let base = &raw const pool::POOL as usize;
         let id = u32::try_from((thunk - base) / THUNK_BYTES).expect("slot fits an id");
         // a * 100 + h with a = 1, h = 8 (x7: the seventh and eighth integer words reach the target from the stack)
-        let lanes = atl_engine_api::AtlLanes {
-            x: [1, 2, 3, 4, 5, 6, 7, 8],
-            ..Default::default()
-        };
+        let mut lanes = atl_engine_api::AtlLanes::default();
+        lanes.regs[..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(call_binding(id, &lanes).x0, 108);
     }
 
@@ -547,10 +545,8 @@ mod tests {
             .expect("a free pool slot");
         let base = &raw const pool::POOL as usize;
         let id = u32::try_from((thunk - base) / THUNK_BYTES).expect("slot fits an id");
-        let lanes = atl_engine_api::AtlLanes {
-            v: [5.0f64.to_bits(), 0, 0, 0, 0, 0, 0, 0],
-            ..Default::default()
-        };
+        let mut lanes = atl_engine_api::AtlLanes::default();
+        lanes.fp[0] = 5.0f64.to_bits();
         let answer = call_binding(id, &lanes);
         assert_eq!((answer.x0, answer.v0), (0, 2.5f64.to_bits()));
     }
@@ -570,11 +566,9 @@ mod tests {
         let thunk = bind_result(half_plus as *const () as usize, sig).expect("a free pool slot");
         let base = &raw const pool::POOL as usize;
         let id = u32::try_from((thunk - base) / THUNK_BYTES).expect("slot fits an id");
-        let lanes = atl_engine_api::AtlLanes {
-            x: [1, 0, 0, 0, 0, 0, 0, 0],
-            v: [u64::from(3.0f32.to_bits()), 0, 0, 0, 0, 0, 0, 0],
-            ..Default::default()
-        };
+        let mut lanes = atl_engine_api::AtlLanes::default();
+        lanes.regs[0] = 1;
+        lanes.fp[0] = u64::from(3.0f32.to_bits());
         let answer = call_binding(id, &lanes);
         assert_eq!((answer.x0, answer.v0), (0, 0x4020_0000));
     }
