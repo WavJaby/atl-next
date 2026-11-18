@@ -1734,7 +1734,7 @@ fn ssh_alias(text: &str) -> Result<String> {
     }
 }
 
-/// What `prune` makes of a run dir's name. `Live`: a checkout of this repository, its id or `<id>-<arch>` for a host arch (a cross build dir, [`target_dir_name`]). `Orphan`: a checkout's name whose checkout is gone. `Unknown`: not a checkout's name; never touched.
+/// What `prune` makes of a run dir. `Live`: a checkout of this repository (its id, or `<id>-<arch>` for a host arch: a cross build dir, [`target_dir_name`]). `Orphan`: `push` made it (manifest present) and its checkout is gone: the only class `--execute` removes. `Unknown`: anything else, a dir without the manifest included: never touched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Class {
     Live,
@@ -1742,9 +1742,14 @@ enum Class {
     Unknown,
 }
 
-/// The [`Class`] of run dir `name` against the repository's live ids and the arches with a `[host]` row. `vsync-source-tier-base` is live only as its own id: `base` is no arch.
-fn classify(name: &str, live: &BTreeSet<String>, host_arches: &BTreeSet<String>) -> Class {
-    if !id_form(name) {
+/// The [`Class`] of run dir `name`. `manifest`: [`MANIFEST`] is at the dir's root. `push` writes it into every tree, so without it the dir is not ours, whatever its name. `live`: the repository's live ids ([`out::live_ids_of`]); `host_arches`: the arches with a `[host]` row. `vsync-source-tier-base` is live only as its own id: `base` is no arch.
+fn classify(
+    name: &str,
+    manifest: bool,
+    live: &BTreeSet<String>,
+    host_arches: &BTreeSet<String>,
+) -> Class {
+    if !manifest || !id_form(name) {
         return Class::Unknown;
     }
     let cross = |arch: &String| {
@@ -1773,10 +1778,10 @@ fn host_arch_names(root: &Path) -> Result<BTreeSet<String>> {
         .collect())
 }
 
-/// The target's run dirs: `dir<TAB>name<TAB>KiB<TAB>busy|free` per directory (KiB `?` when `du` fails), `other<TAB>name` for anything else. Read only: a lock file is tested, never created.
+/// The target's run dirs: `dir<TAB>name<TAB>KiB<TAB>busy|free<TAB>manifest|none` per directory (KiB `?` when `du` fails), `other<TAB>name` for anything else. Read only: a lock file is tested, never created.
 fn list_script(base: &str) -> String {
     format!(
-        "cd {} 2>/dev/null || exit 0\nfor n in * .[!.]*; do\n  [ -e \"$n\" ] || [ -L \"$n\" ] || continue\n  if [ -L \"$n\" ] || [ ! -d \"$n\" ]; then printf 'other\\t%s\\n' \"$n\"; continue; fi\n  kb=$(du -sk -- \"$n\" 2>/dev/null | cut -f1)\n  busy=free\n  if [ -e \"$n/{RUN_LOCK}\" ] && ! flock -n \"$n/{RUN_LOCK}\" true; then busy=busy; fi\n  printf 'dir\\t%s\\t%s\\t%s\\n' \"$n\" \"${{kb:-?}}\" \"$busy\"\ndone\n",
+        "cd {} 2>/dev/null || exit 0\nfor n in * .[!.]*; do\n  [ -e \"$n\" ] || [ -L \"$n\" ] || continue\n  if [ -L \"$n\" ] || [ ! -d \"$n\" ]; then printf 'other\\t%s\\n' \"$n\"; continue; fi\n  kb=$(du -sk -- \"$n\" 2>/dev/null | cut -f1)\n  busy=free\n  if [ -e \"$n/{RUN_LOCK}\" ] && ! flock -n \"$n/{RUN_LOCK}\" true; then busy=busy; fi\n  manifest=none\n  if [ -f \"$n/{MANIFEST}\" ]; then manifest=manifest; fi\n  printf 'dir\\t%s\\t%s\\t%s\\t%s\\n' \"$n\" \"${{kb:-?}}\" \"$busy\" \"$manifest\"\ndone\n",
         sh_quote(base)
     )
 }
@@ -1784,11 +1789,12 @@ fn list_script(base: &str) -> String {
 /// One entry of [`list_script`]'s output.
 #[derive(Debug, PartialEq, Eq)]
 enum Listed {
-    /// A directory: its size in KiB (`None` when `du` failed), and whether a run or check holds its lock.
+    /// A directory: its size in KiB (`None` when `du` failed), whether a run or check holds its lock, and whether [`MANIFEST`] is at its root.
     Dir {
         name: String,
         kib: Option<u64>,
         busy: bool,
+        manifest: bool,
     },
     /// A file, a symlink, or a line in no shape [`list_script`] prints: never touched.
     Other(String),
@@ -1800,10 +1806,11 @@ fn parse_listing(text: &str) -> Vec<Listed> {
         .map(|line| {
             let fields: Vec<&str> = line.split('\t').collect();
             match fields.as_slice() {
-                ["dir", name, kib, busy] => Listed::Dir {
+                ["dir", name, kib, busy, manifest] => Listed::Dir {
                     name: (*name).to_owned(),
                     kib: kib.parse().ok(),
                     busy: *busy == "busy",
+                    manifest: *manifest == "manifest",
                 },
                 ["other", name] => Listed::Other((*name).to_owned()),
                 _ => Listed::Other(line.to_owned()),
@@ -1876,6 +1883,15 @@ fn prune(root: &Path, a: &PruneArgs) -> Result<ExitCode> {
     })
 }
 
+/// One run dir as `prune` holds it after [`classify`].
+struct Row {
+    name: String,
+    kib: Option<u64>,
+    class: Class,
+    busy: bool,
+    manifest: bool,
+}
+
 /// [`prune`] on run dir `base` of `host`: the same code the tests run on a throwaway dir. Returns the number of failed removals.
 fn prune_dirs(
     host: &Host,
@@ -1887,9 +1903,20 @@ fn prune_dirs(
     let mut rows = Vec::new();
     for entry in parse_listing(&host.run_script(&list_script(base))?) {
         match entry {
-            Listed::Dir { name, kib, busy } => {
-                let class = classify(&name, live, host_arches);
-                rows.push((name, kib, class, busy));
+            Listed::Dir {
+                name,
+                kib,
+                busy,
+                manifest,
+            } => {
+                let class = classify(&name, manifest, live, host_arches);
+                rows.push(Row {
+                    name,
+                    kib,
+                    class,
+                    busy,
+                    manifest,
+                });
             }
             Listed::Other(text) => println!("unknown {text}: not a directory, never touched"),
         }
@@ -1899,28 +1926,29 @@ fn prune_dirs(
         host.label(),
         rows.len()
     );
-    for (name, kib, class, busy) in &rows {
-        let label = match class {
+    for row in &rows {
+        let label = match row.class {
             Class::Live => "live",
             Class::Orphan => "orphan",
             Class::Unknown => "unknown",
         };
-        let held = if *class == Class::Orphan && *busy {
-            ", busy: a run or check holds it, skipped"
-        } else {
-            ""
+        let note = match (row.class, row.busy, row.manifest) {
+            (Class::Orphan, true, _) => ", busy: a run or check holds it, skipped",
+            (Class::Unknown, _, false) => ", no bundle.manifest: never touched",
+            (Class::Unknown, _, true) => ", not a checkout's name: never touched",
+            _ => "",
         };
-        println!("{label} {name} {}{held}", size_label(*kib));
+        println!("{label} {} {}{note}", row.name, size_label(row.kib));
     }
-    let removable: Vec<&(String, Option<u64>, Class, bool)> = rows
+    let removable: Vec<&Row> = rows
         .iter()
-        .filter(|(_, _, class, busy)| *class == Class::Orphan && !*busy)
+        .filter(|row| row.class == Class::Orphan && !row.busy)
         .collect();
     let held = rows
         .iter()
-        .filter(|(_, _, class, busy)| *class == Class::Orphan && *busy)
+        .filter(|row| row.class == Class::Orphan && row.busy)
         .count();
-    let planned_kib: u64 = removable.iter().filter_map(|(_, kib, _, _)| *kib).sum();
+    let planned_kib: u64 = removable.iter().filter_map(|row| row.kib).sum();
     if !execute {
         let note = if held > 0 {
             format!("; {held} held orphan(s) skipped")
@@ -1937,28 +1965,28 @@ fn prune_dirs(
     let outcomes = if removable.is_empty() {
         BTreeMap::new()
     } else {
-        let names: Vec<String> = removable.iter().map(|(name, ..)| name.clone()).collect();
+        let names: Vec<String> = removable.iter().map(|row| row.name.clone()).collect();
         parse_removal(&host.run_script(&remove_script(base, &names)?)?)
     };
     let (mut removed, mut gone_kib, mut busy, mut failed) = (0usize, 0u64, held, 0usize);
-    for (name, kib, _, _) in &removable {
-        match outcomes.get(name) {
+    for row in &removable {
+        match outcomes.get(&row.name) {
             Some(Removal::Removed) => {
                 removed += 1;
-                gone_kib += kib.unwrap_or(0);
-                println!("removed {name} {}", size_label(*kib));
+                gone_kib += row.kib.unwrap_or(0);
+                println!("removed {} {}", row.name, size_label(row.kib));
             }
             Some(Removal::Busy) => {
                 busy += 1;
-                println!("orphan {name}: busy, skipped");
+                println!("orphan {}: busy, skipped", row.name);
             }
             Some(Removal::Failed(why)) => {
                 failed += 1;
-                println!("FAILED {name}: {why}");
+                println!("FAILED {}: {why}", row.name);
             }
             None => {
                 failed += 1;
-                println!("FAILED {name}: no result from the target");
+                println!("FAILED {}: no result from the target", row.name);
             }
         }
     }
@@ -2710,31 +2738,47 @@ mod tests {
             ("a b", Class::Unknown),
             ("a/b", Class::Unknown),
         ] {
-            assert_eq!(classify(name, &live, &arches), want, "{name}");
+            assert_eq!(classify(name, true, &live, &arches), want, "{name}");
         }
         // `base` is no arch: with only `vsync-source-tier` live, `vsync-source-tier-base` is an orphan
         let only = BTreeSet::from(["vsync-source-tier".to_owned()]);
         assert_eq!(
-            classify("vsync-source-tier-base", &only, &arches),
+            classify("vsync-source-tier-base", true, &only, &arches),
             Class::Orphan
         );
     }
 
     #[test]
+    fn a_dir_without_the_manifest_is_never_an_orphan() {
+        // `push` writes `bundle.manifest` into every tree: a dir without it is not ours, whatever its name
+        let live = BTreeSet::from(["repo".to_owned()]);
+        let arches = BTreeSet::from(["x86_64".to_owned()]);
+        for name in ["slot-1", "egl-probe", "es1probe", "repo", "repo-x86_64"] {
+            assert_eq!(
+                classify(name, false, &live, &arches),
+                Class::Unknown,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn listing_lines_parse_and_anything_else_stays_unknown() {
-        let text = "dir\tslot-1\t556\tbusy\ndir\tx\t?\tfree\nother\tREADME\ndir\tbroken line\n";
+        let text = "dir\tslot-1\t556\tbusy\tmanifest\ndir\tx\t?\tfree\tnone\nother\tREADME\ndir\tbroken line\n";
         assert_eq!(
             parse_listing(text),
             [
                 Listed::Dir {
                     name: "slot-1".to_owned(),
                     kib: Some(556),
-                    busy: true
+                    busy: true,
+                    manifest: true,
                 },
                 Listed::Dir {
                     name: "x".to_owned(),
                     kib: None,
-                    busy: false
+                    busy: false,
+                    manifest: false,
                 },
                 Listed::Other("README".to_owned()),
                 Listed::Other("dir\tbroken line".to_owned()),
@@ -2810,7 +2854,11 @@ mod tests {
         for name in ["vsync-source-tier", "slot-1", "slot-2"] {
             std::fs::create_dir_all(root.join(name)).expect("run dir");
             std::fs::write(root.join(name).join("file"), [0u8; 4096]).expect("file");
+            std::fs::write(root.join(name).join(MANIFEST), "").expect("manifest");
         }
+        // another tool's dir: a checkout's name, no manifest
+        std::fs::create_dir(root.join("egl-probe")).expect("probe dir");
+        std::fs::write(root.join("egl-probe").join("probe.so"), [0u8; 64]).expect("file");
         std::fs::write(root.join("slot-2").join(RUN_LOCK), "").expect("free lock file");
         std::fs::write(root.join("README"), "not a dir").expect("file");
         std::os::unix::fs::symlink(root.join("slot-2"), root.join("link")).expect("symlink");
@@ -2820,20 +2868,27 @@ mod tests {
         let host = Host::Local(root.clone());
         let base = root.display().to_string();
         let listed = parse_listing(&host.run_script(&list_script(&base)).expect("listing"));
-        let dirs: BTreeMap<String, bool> = listed
+        // name -> (busy, manifest)
+        let dirs: BTreeMap<String, (bool, bool)> = listed
             .iter()
             .filter_map(|entry| match entry {
-                Listed::Dir { name, busy, .. } => Some((name.clone(), *busy)),
+                Listed::Dir {
+                    name,
+                    busy,
+                    manifest,
+                    ..
+                } => Some((name.clone(), (*busy, *manifest))),
                 Listed::Other(_) => None,
             })
             .collect();
         assert_eq!(
             dirs,
             BTreeMap::from([
-                (".hidden".to_owned(), false),
-                ("slot-1".to_owned(), true),
-                ("slot-2".to_owned(), false),
-                ("vsync-source-tier".to_owned(), false),
+                (".hidden".to_owned(), (false, false)),
+                ("egl-probe".to_owned(), (false, false)),
+                ("slot-1".to_owned(), (true, true)),
+                ("slot-2".to_owned(), (false, true)),
+                ("vsync-source-tier".to_owned(), (false, true)),
             ])
         );
         assert!(listed.contains(&Listed::Other("README".to_owned())));
@@ -2843,7 +2898,9 @@ mod tests {
         let no_arches = BTreeSet::new();
         let free_orphans: Vec<String> = dirs
             .iter()
-            .filter(|&(name, &busy)| classify(name, &live, &no_arches) == Class::Orphan && !busy)
+            .filter(|&(name, &(busy, manifest))| {
+                classify(name, manifest, &live, &no_arches) == Class::Orphan && !busy
+            })
             .map(|(name, _)| name.clone())
             .collect();
         assert_eq!(free_orphans, vec!["slot-2".to_owned()]);
@@ -2860,6 +2917,10 @@ mod tests {
         );
         assert!(root.join("slot-1").is_dir(), "a held dir stays");
         assert!(!root.join("slot-2").exists(), "a free orphan is removed");
+        assert!(
+            root.join("egl-probe").is_dir(),
+            "a dir without the manifest stays"
+        );
         assert!(
             root.join("vsync-source-tier").is_dir(),
             "a live dir is not in the removal set"
@@ -2918,7 +2979,9 @@ mod tests {
         for name in ["repo", "slot-1", "slot-2"] {
             std::fs::create_dir_all(root.join(name)).expect("run dir");
             std::fs::write(root.join(name).join("file"), [0u8; 4096]).expect("file");
+            std::fs::write(root.join(name).join(MANIFEST), "").expect("manifest");
         }
+        std::fs::create_dir(root.join("egl-probe")).expect("probe dir");
         let mut holder = hold_lock(&root.join("slot-1"));
         let host = Host::Local(root.clone());
         let live = BTreeSet::from(["repo".to_owned()]);
@@ -2933,6 +2996,10 @@ mod tests {
         assert!(!root.join("slot-2").exists(), "a free orphan is removed");
         assert!(root.join("slot-1").is_dir(), "a held orphan is skipped");
         assert!(root.join("repo").is_dir(), "a live dir stays");
+        assert!(
+            root.join("egl-probe").is_dir(),
+            "a dir without the manifest stays"
+        );
         holder.kill().expect("release the lock");
         holder.wait().expect("reap the holder");
     }
