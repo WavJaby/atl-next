@@ -93,7 +93,12 @@ struct State<C> {
     windows: Vec<WindowEntry<C>>,
     /// The last `ClientWindowFrames.seq` handed out, global across windows.
     seq: i32,
+    /// The display's touch mode (DisplayContent.mInTouchMode): starts at config_defaultInTouchMode, changed only by IWindowManager.setInTouchMode.
+    in_touch_mode: bool,
 }
+
+/// core/res config.xml config_defaultInTouchMode (true in AOSP's default config): the touch mode a display starts in (DisplayContent constructor :1252).
+pub const DEFAULT_IN_TOUCH_MODE: bool = true;
 
 impl<C> State<C> {
     fn new(display: DisplayModel) -> Self {
@@ -104,6 +109,7 @@ impl<C> State<C> {
             tokens: Vec::new(),
             windows: Vec::new(),
             seq: 0,
+            in_touch_mode: DEFAULT_IN_TOUCH_MODE,
         }
     }
 }
@@ -147,6 +153,16 @@ impl<C: Clone + PartialEq> Tasks<C> {
     /// The display now (the monitor's values, [`Tasks::set_display`]): unchanged by any window's size. The one owner: every service reads it here, none keeps a copy.
     pub fn display(&self) -> DisplayModel {
         self.lock().display
+    }
+
+    /// The display's touch mode now: the one owner, read by addToDisplayAsUser (ADD_FLAG_IN_TOUCH_MODE) and isInTouchMode, written by setInTouchMode.
+    pub fn in_touch_mode(&self) -> bool {
+        self.lock().in_touch_mode
+    }
+
+    /// DisplayContent.setInTouchMode.
+    pub fn set_in_touch_mode(&self, in_touch: bool) {
+        self.lock().in_touch_mode = in_touch;
     }
 
     /// The host's UI language tag, None when the host gives none (the global configuration then takes `DEFAULT_LOCALE`).

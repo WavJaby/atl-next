@@ -36,7 +36,7 @@ use binder::{
 
 use crate::activity;
 use crate::packages::Permissions;
-use crate::tasks::{Placement, TaskId, TaskSize, Tasks};
+use crate::tasks::{DEFAULT_IN_TOUCH_MODE, Placement, TaskId, TaskSize, Tasks};
 use crate::ui_agents::UiAgents;
 use atl_services_wire::ui_agent::IUiAgent;
 
@@ -46,6 +46,10 @@ const WINDOW_SESSION: &str = "IWindowSession";
 
 /// WindowManagerGlobal.ADD_OKAY (WindowManagerGlobal.java:126).
 const ADD_OKAY: i32 = 0;
+/// WindowManagerGlobal.ADD_FLAG_IN_TOUCH_MODE / ADD_FLAG_APP_VISIBLE / ADD_FLAG_ALWAYS_CONSUME_SYSTEM_BARS (WindowManagerGlobal.java:117-124): bits addWindow ORs into ADD_OKAY.
+const ADD_FLAG_IN_TOUCH_MODE: i32 = 0x1;
+const ADD_FLAG_APP_VISIBLE: i32 = 0x2;
+const ADD_FLAG_ALWAYS_CONSUME_SYSTEM_BARS: i32 = 0x4;
 /// WindowManagerGlobal.RELAYOUT_RES_FIRST_TIME (:86): the window's first relayout. RELAYOUT_RES_SURFACE_CHANGED (:91) is set only when a surface came with the relayout.
 const RELAYOUT_RES_FIRST_TIME: i32 = 1;
 const RELAYOUT_RES_SURFACE_CHANGED: i32 = 1 << 1;
@@ -277,12 +281,27 @@ impl IWindowManager for WindowManager {
         Ok(false)
     }
 
-    /// WindowManagerService.setInTouchMode:4045: records the mode and has the dispatcher tell the display's other windows (TouchModeEvent). The caller changes its own mode locally after the call
-    /// (ViewRootImpl.ensureTouchMode:7233-7242), and an error there is a RuntimeException in the app. No other app window shares this display process's input: accept.
-    fn r#setInTouchMode(&self, _in_touch: bool, _display_id: i32) -> binder::Result<()> {
-        // counted: the window gate's input stage requires this line (xtask window.rs touch_mode_check)
+    /// WindowManagerService.setInTouchMode:4045: records the display's mode (the next window added reads it, ADD_FLAG_IN_TOUCH_MODE) and has the dispatcher tell the display's other windows
+    /// (TouchModeEvent). The caller changes its own mode locally after the call (ViewRootImpl.ensureTouchMode:7233-7242), and an error there is a RuntimeException in the app. No other app
+    /// window shares this display process's input, so nothing is dispatched. An unknown display id (displayContent null, per-display focus off) updates every display: here the one.
+    fn r#setInTouchMode(&self, in_touch: bool, _display_id: i32) -> binder::Result<()> {
+        self.tasks.set_in_touch_mode(in_touch);
         atl_diag::answered(WINDOW_MANAGER, "setInTouchMode (answered)");
         Ok(())
+    }
+
+    /// WindowManagerService.setInTouchModeOnAllDisplays:4095: the one display.
+    fn r#setInTouchModeOnAllDisplays(&self, in_touch: bool) -> binder::Result<()> {
+        self.tasks.set_in_touch_mode(in_touch);
+        Ok(())
+    }
+
+    /// WindowManagerService.isInTouchMode:4130: the display's mode; a display that does not exist answers config_defaultInTouchMode.
+    fn r#isInTouchMode(&self, display_id: i32) -> binder::Result<bool> {
+        if display_id != activity::DEFAULT_DISPLAY {
+            return Ok(DEFAULT_IN_TOUCH_MODE);
+        }
+        Ok(self.tasks.in_touch_mode())
     }
 
     /// WindowManagerService.getCurrentAnimatorScale:3687-3691 with the default setting 1.0f (:1052) and animations enabled.
@@ -349,6 +368,26 @@ fn rect(left: i32, top: i32, right: i32, bottom: i32) -> Rect {
         right,
         bottom,
     }
+}
+
+/// WindowManagerService.addWindow's result of a window it added (addWindowInner :1927-1935): ADD_OKAY plus each flag whose condition holds. ViewRootImpl.setView reads them into
+/// mAttachInfo.mAlwaysConsumeSystemBars, mAddedTouchMode (the touch mode its first traversal starts in: without it every app starts out of touch mode and draws focus highlights) and mAppVisible.
+fn add_result(
+    system_bars_forced_consumed: bool,
+    in_touch_mode: bool,
+    app_client_visible: bool,
+) -> i32 {
+    let mut res = ADD_OKAY;
+    if system_bars_forced_consumed {
+        res |= ADD_FLAG_ALWAYS_CONSUME_SYSTEM_BARS;
+    }
+    if in_touch_mode {
+        res |= ADD_FLAG_IN_TOUCH_MODE;
+    }
+    if app_client_visible {
+        res |= ADD_FLAG_APP_VISIBLE;
+    }
+    res
 }
 
 /// The display's bounds: the insets' display frame (InsetsState is the display's, DisplayContent).
@@ -566,7 +605,8 @@ impl IWindowSession for Session {
                 &format!("addToDisplayAsUser: dispatchAppVisibility refused: {e:?}"),
             );
         }
-        Ok(ADD_OKAY)
+        // the activity is client-visible: every activity that adds a window is shown (the dispatch above); no system bars to force (as getWindowInsets)
+        Ok(add_result(false, self.tasks.in_touch_mode(), true))
     }
 
     /// WindowManagerService.relayoutWindow for a window added by this session: the client frames and the display's configuration, the surface the UI agent gives (none
@@ -898,6 +938,26 @@ pub fn notify_resized(tasks: &Tasks<SpIBinder>, task: TaskId) -> usize {
 mod tests {
     use super::*;
     use atl_services_types::display_model::DisplayModel;
+
+    /// Each flag set exactly when its condition holds. Expected bits: WindowManagerGlobal.java:117-124 (IN_TOUCH_MODE 0x1, APP_VISIBLE 0x2, ALWAYS_CONSUME_SYSTEM_BARS 0x4); ADD_OKAY 0.
+    #[test]
+    fn add_result_mirrors_each_flag() {
+        assert_eq!(add_result(false, false, false), 0);
+        assert_eq!(add_result(false, true, true), 0x3);
+        assert_eq!(add_result(false, true, false), 0x1);
+        assert_eq!(add_result(true, false, false), 0x4);
+    }
+
+    /// The display starts in touch mode (config_defaultInTouchMode true), setInTouchMode moves it, and what the next add returns follows it: one source of truth.
+    #[test]
+    fn touch_mode_starts_on_and_follows_set() {
+        let tasks = Tasks::<u32>::new(DisplayModel::default(), None);
+        assert!(tasks.in_touch_mode());
+        tasks.set_in_touch_mode(false);
+        assert_eq!(add_result(false, tasks.in_touch_mode(), true) & 0x1, 0);
+        tasks.set_in_touch_mode(true);
+        assert_eq!(add_result(false, tasks.in_touch_mode(), true) & 0x1, 0x1);
+    }
 
     /// The missing-Task path: no size is refused (BAD_VALUE) and counted, never a panic; a created Task answers its size.
     #[test]
