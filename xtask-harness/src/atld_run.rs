@@ -393,9 +393,13 @@ impl Package {
     }
 }
 
-/// The first package's uid on a fresh run, derived from AOSP's rule (AppIdSettingMap.acquireAndRegisterNewAppId, the services' atl_services::app_id): the lowest free id >= FIRST_APPLICATION_UID
-/// (10000), and 10000 is the installer's (atl_broker::INSTALLER_UID) -> 10001. A row that sees another uid has caught the allocator handing out a taken or wrong id.
+/// The first free app uid when no platform package holds one (the services stage, which scans no partition), derived from AOSP's rule (AppIdSettingMap.acquireAndRegisterNewAppId, the services'
+/// atl_services::app_id): the lowest free id >= FIRST_APPLICATION_UID (10000), and 10000 is the installer's (atl_broker::INSTALLER_UID) -> 10001. A [`Runtime`] run places platform apps first: [`Runtime::first_app_uid`].
 pub const FIRST_APP_UID: u32 = 10_001;
+
+/// Platform packages a run may place that take an app id of their own (no sharedUserId in their manifests: repo `java/webview-provider`, `java/vending`; the settings provider shares uid 1000).
+/// The boot scan registers them before any install (PackageManagerService scans the partitions first), so each one placed moves the installed packages' uids up by one.
+const OWN_APP_ID_ROWS: [&str; 2] = [WEBVIEW_PROVIDER, VENDING];
 
 /// One atld run.
 pub struct Run {
@@ -403,7 +407,7 @@ pub struct Run {
     pub root: PathBuf,
     /// Where the package files and atld's own log go (outside the root, which atld removes).
     pub scratch: PathBuf,
-    /// Each package's files, in install order: on a fresh run the i-th gets uid [`FIRST_APP_UID`] + i.
+    /// Each package's files, in install order: on a fresh run the i-th gets uid [`Runtime::first_app_uid`] + i.
     pub packages: Vec<Package>,
     pub launch: Option<String>,
     /// Shared libraries by name; `file` is the host jar.
@@ -1209,6 +1213,21 @@ impl Runtime {
             .join(crate::ui_module::WEBVIEW_MODULE_FILE);
         std::fs::remove_file(&module).with_context(|| format!("removing {}", module.display()))?;
         Ok(self)
+    }
+
+    /// The first installed package's uid on a fresh run of this runtime: [`FIRST_APP_UID`] plus one per placed [`OWN_APP_ID_ROWS`] package (with the default rows: the WebView provider takes 10001,
+    /// so 10002). A row that sees another uid has caught the allocator handing out a taken or wrong id.
+    pub fn first_app_uid(&self) -> u32 {
+        let own = self
+            .platform_files
+            .iter()
+            .filter(|(_, at)| {
+                OWN_APP_ID_ROWS
+                    .iter()
+                    .any(|row| at.ends_with(&format!("/{row}")))
+            })
+            .count();
+        FIRST_APP_UID + u32::try_from(own).expect("a handful of platform rows")
     }
 
     /// The billing-unavailable desktop adaptation (M62 D1; `run-apk --billing-unavailable`): the run places the responder `com.android.vending` ([`vending_row`]), so a Play Billing client binds it

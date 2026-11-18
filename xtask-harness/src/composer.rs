@@ -53,8 +53,8 @@ pub struct Args {
 const FIXTURE: &str = "xtask-harness/testdata/composer";
 const CLIENT_CLASS: &str = "com.example.atlcomposer.Client";
 const CLIENT_NAME: &str = "composer-client";
-/// The client's uid: the run's only package's, as the allocator hands it out.
-const APP_UID: u32 = crate::atld_run::FIRST_APP_UID;
+/// The self-test cases' uid: any app uid does, the cases only need the registry line and the check to agree. The run's own is its only package's (Runtime::first_app_uid).
+const SELF_TEST_UID: u32 = crate::atld_run::FIRST_APP_UID;
 /// How long the cold start and the client may take (as `xtask test app`).
 const LIMIT: Duration = Duration::from_secs(180);
 const POLL: Duration = Duration::from_millis(50);
@@ -218,10 +218,10 @@ fn pixel_checks(app: &str) -> Vec<Check> {
 }
 
 /// Every check of a run, from its client log (the process's stdout and stderr: liblog records and the compositor's stderr lines) and the services' log.
-fn evaluate(app: &str, services: &str, display: &DisplayModel) -> Vec<Check> {
+fn evaluate(app: &str, services: &str, display: &DisplayModel, app_uid: u32) -> Vec<Check> {
     let mut out = Vec::new();
     let served = served_line();
-    let agent = agent_line();
+    let agent = agent_line(app_uid);
     out.push(check(
         "registered",
         app.contains(&served) && services.contains(&agent),
@@ -406,7 +406,7 @@ fn log_showing(frames: &[u32]) -> String {
 }
 
 fn good_services() -> String {
-    format!("{}\n", agent_line())
+    format!("{}\n", agent_line(SELF_TEST_UID))
 }
 
 /// atl-composer start's line once both services are in the process's service view.
@@ -416,8 +416,8 @@ fn served_line() -> String {
 }
 
 /// The registry's line once the client's UI agent and compositor are registered (registry_service.rs).
-fn agent_line() -> String {
-    format!("services: registered the UI agent and compositor of uid {APP_UID}")
+fn agent_line(app_uid: u32) -> String {
+    format!("services: registered the UI agent and compositor of uid {app_uid}")
 }
 
 /// One synthetic run and the checks that must fail on it (empty: the run must pass).
@@ -611,7 +611,7 @@ fn self_test() -> ExitCode {
     let mut all = true;
     let mut failures: Vec<Failure> = Vec::new();
     for c in self_cases() {
-        let failed: Vec<&str> = evaluate(&c.app, &c.services, &display)
+        let failed: Vec<&str> = evaluate(&c.app, &c.services, &display, SELF_TEST_UID)
             .into_iter()
             .filter(|k| !k.ok)
             .map(|k| k.name)
@@ -679,6 +679,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         rt
     };
     let work = rt.out.join("composer");
+    // the client runs as the run's only package (atld `--run-class` takes the uid it is told)
+    let app_uid = rt.first_app_uid();
     let apk = rt
         .apk
         .build(&root.join(FIXTURE), &work.join("apk"), &[], None, None)?;
@@ -697,7 +699,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         libraries: vec![],
         shell: Some(Shell {
             class: CLIENT_CLASS.to_owned(),
-            uid: APP_UID,
+            uid: app_uid,
             name: CLIENT_NAME.to_owned(),
             args: vec![],
             boot_jars: vec![apk],
@@ -738,7 +740,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         failures.push(Failure::step("atld", atld));
     }
     ok &= exited;
-    for c in evaluate(&app, &services, &display) {
+    for c in evaluate(&app, &services, &display, app_uid) {
         println!(
             "composer: {} {}: {}",
             if c.ok { "pass" } else { "FAIL" },
@@ -790,7 +792,7 @@ mod tests {
     fn self_cases_hold() {
         let display = DisplayModel::default();
         for c in self_cases() {
-            let failed: Vec<&str> = evaluate(&c.app, &c.services, &display)
+            let failed: Vec<&str> = evaluate(&c.app, &c.services, &display, SELF_TEST_UID)
                 .into_iter()
                 .filter(|k| !k.ok)
                 .map(|k| k.name)

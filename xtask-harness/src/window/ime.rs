@@ -209,8 +209,13 @@ pub fn drive(
     })
 }
 
-/// The stage's sub-gates over the fixture log; `activate` is the probe's (it fails when the desktop input method never activated).
-pub fn checks(app: &str, services: &str, probe: &Result<Liveness, String>) -> Vec<Sub> {
+/// The stage's sub-gates over the fixture log; `activate` is the probe's (it fails when the desktop input method never activated); `app_uid` is the fixture's (Runtime::first_app_uid).
+pub fn checks(
+    app: &str,
+    services: &str,
+    probe: &Result<Liveness, String>,
+    app_uid: u32,
+) -> Vec<Sub> {
     let activate = probe
         .as_ref()
         .map(|_| "the desktop input method was activated for the focused EditText".to_owned())
@@ -248,7 +253,7 @@ pub fn checks(app: &str, services: &str, probe: &Result<Liveness, String>) -> Ve
             "delete",
             edit(after_delete(), &|c| c == "-1,-1", "no composing span"),
         ),
-        ("death", death_check(services)),
+        ("death", death_check(services, app_uid)),
         ("relaunch", relaunch_check(services)),
     ]
 }
@@ -268,7 +273,7 @@ fn relaunch_check(services: &str) -> Result<String, String> {
 
 /// After the kill, before the relaunch's client is added: the services counted exactly one client death, and its line names the app's uid with its entry removed and no client left
 /// (the fixture is the only app). Lines after the relaunch are not this death: the run's stop kills the relaunched app too.
-fn death_check(services: &str) -> Result<String, String> {
+fn death_check(services: &str, app_uid: u32) -> Result<String, String> {
     let before = services
         .find(READDED_LINE)
         .map_or(services, |at| &services[..at]);
@@ -277,7 +282,7 @@ fn death_check(services: &str) -> Result<String, String> {
         .filter(|l| l.contains(DEATH_COUNTER))
         .collect();
     let removed: Vec<&str> = before.lines().filter(|l| l.contains(DEATH_LINE)).collect();
-    let want = format!("{DEATH_LINE}{} ", super::APP_UID);
+    let want = format!("{DEATH_LINE}{app_uid} ");
     match (counted.as_slice(), removed.as_slice()) {
         ([c], [r])
             if c.contains(&format!("{DEATH_COUNTER} 1 "))
@@ -285,8 +290,7 @@ fn death_check(services: &str) -> Result<String, String> {
                 && r.ends_with(NONE_LEFT) =>
         {
             Ok(format!(
-                "one client death counted; uid {} entry removed, 0 clients left",
-                super::APP_UID
+                "one client death counted; uid {app_uid} entry removed, 0 clients left"
             ))
         }
         _ => Err(format!(

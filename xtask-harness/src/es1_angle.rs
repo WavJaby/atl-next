@@ -332,7 +332,7 @@ fn run_client(
         libraries: vec![],
         shell: Some(Shell {
             class: CLIENT_CLASS.to_owned(),
-            uid: crate::atld_run::FIRST_APP_UID,
+            uid: rt.first_app_uid(),
             name: CLIENT_NAME.to_owned(),
             args,
             boot_jars: vec![apk.to_path_buf()],

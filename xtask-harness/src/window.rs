@@ -337,8 +337,6 @@ const PORTRAIT_FIXTURE: &str = "xtask-harness/testdata/window-portrait";
 const HARDWARE_DRAW_LINE: &str = "onDraw reached hardware=true";
 /// Scenes the compositor must present into the window before its readback (the fixture's first frame and a repaint).
 const GTK_PRESENTED: u64 = 2;
-/// The test app's uid: the run's only package's, as the allocator hands it out.
-pub(crate) const APP_UID: u32 = crate::atld_run::FIRST_APP_UID;
 /// How long a cold start may take to reach the marker (as `xtask test app`).
 pub(crate) const LIMIT: Duration = Duration::from_secs(180);
 /// How long the app must survive after the marker. The resume path (WindowManagerGlobal.addView, the window of the activity) runs right after onResume and fails within
@@ -2102,6 +2100,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         m.min_sdk,
         m.target_sdk
     );
+    // the test app's uid: the run's only package's, as the allocator hands it out
+    let app_uid = rt.first_app_uid();
     let run = Run {
         root: work.join("root"),
         scratch: work.join("scratch"),
@@ -2335,7 +2335,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         (Stage::Gles1, Some(_)) => gles1::checks(root, &app, display, &liveness, &captured),
         (Stage::Suspended, Some(_)) => suspended::checks(&after_marker(&app, marker), &liveness),
         (Stage::Ime, Some(_)) => {
-            let mut sub = ime::checks(&app, &services, &liveness);
+            let mut sub = ime::checks(&app, &services, &liveness, app_uid);
             sub.push(("run", run_survives_check(&read(&run.atld_log()), stopped)));
             sub
         }
