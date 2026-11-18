@@ -136,7 +136,7 @@ mod imp {
     }
 
     impl SceneView {
-        fn snapshot_scene(&self, snapshot: &gtk4::Snapshot) {
+        pub(super) fn snapshot_scene(&self, snapshot: &gtk4::Snapshot) {
             let widget = self.obj();
             // an Android display shows black where no layer covers it
             snapshot.append_color(
@@ -296,15 +296,12 @@ impl SceneView {
     }
 
     /// What the view draws now (its scene and the sideband children), in physical pixels: the picture `Window::capture` reads.
+    /// The view's own snapshot of the presented pieces, not `gtk4::WidgetPaintable`: that shows the widget's last painted render node, so a capture right after `present` read the frame before.
     pub fn picture(&self) -> Option<gsk::RenderNode> {
         let scale = self.scale().get() as f32;
         let snapshot = gtk4::Snapshot::new();
         snapshot.scale(scale, scale);
-        gtk4::WidgetPaintable::new(Some(self)).snapshot(
-            &snapshot,
-            f64::from(self.width()),
-            f64::from(self.height()),
-        );
+        self.imp().snapshot_scene(&snapshot);
         snapshot.to_node()
     }
 
