@@ -61,6 +61,7 @@ mod qemu_spike;
 mod qemu_thread;
 mod remote;
 mod run_apk;
+mod rv_qemu;
 mod sandbox;
 mod screencopy;
 mod sensors;
@@ -295,6 +296,8 @@ enum Test {
     EglBridge(egl_bridge::Args),
     /// A CJK and an emoji code point each resolve to a real font file through the product's font list over the desktop's own fontconfig (host_fonts.rs); prints family + file per code point. A host without such a face is its own verdict (`host lacks a CJK font`), not a failure. `--break empty-dir` / `no-fallback` must leave the ok verdict.
     HostFonts(host_fonts::Args),
+    /// The riscv64 host's CPU-side checks under qemu-user, once per CPU model: the host row's derived baseline and V models (default RVA23U64 at VLEN 128 and 256). Per model: AT_HWCAP/hwprobe probe with a V instruction (SIGILL without V), libz's V tier against an independent adler32, libunwindstack's vlenb in a ucontext unwind, the riscv64 unit tests. One verdict line per model, then the gate's. `--break baseline` must turn it red. Needs `native --host riscv64 --for rv-qemu` and the `qemu-user` deps row.
+    RvQemu(rv_qemu::Args),
 }
 
 fn main() -> Result<ExitCode> {
@@ -316,6 +319,9 @@ fn main() -> Result<ExitCode> {
         Command::Test {
             test: Test::NbIsa(args),
         } => nb_isa::run(&root, &args),
+        Command::Test {
+            test: Test::RvQemu(args),
+        } => rv_qemu::run(&root, &args),
         Command::Test {
             test: Test::Installer(args),
         } => installer::run(&root, &args),
@@ -542,6 +548,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::SlesBridge(_) => "sles-bridge",
             Test::EglBridge(_) => "egl-bridge",
             Test::HostFonts(_) => "host-fonts",
+            Test::RvQemu(_) => "rv-qemu",
         },
         Command::CheckStep { .. } | Command::WindowLive(_) | Command::DisplayProbe => return None,
     })

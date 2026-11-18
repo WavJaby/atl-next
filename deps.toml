@@ -397,6 +397,15 @@ min_reason = "observed 2026-11-07; older is untested"
 scope = ["build"]
 used_by = ["xtask:native", "upstream:qemu"]
 
+# `xtask test rv-qemu`: a riscv64 host's outputs under user-mode QEMU, per CPU model (the bare `rv64i` with the host row's extensions, `rva23u64` with `vlen=`)
+[qemu-user]
+debian = "qemu-user"
+binary = "qemu-riscv64"
+min = "10.0.13"
+min_reason = "observed 2026-11-19 (Debian 13); rva23u64 and the vlen property used by rv_qemu.rs exist there, older is untested"
+scope = ["test"]
+used_by = ["xtask:test"]
+
 [python3-venv]
 debian = "python3-venv"
 # Arch's python package includes venv/ensurepip

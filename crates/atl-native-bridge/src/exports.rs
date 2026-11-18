@@ -337,8 +337,11 @@ mod tests {
         unsafe {
             assert!(itf.isCompatibleWith.unwrap()(3));
             assert!(!itf.isCompatibleWith.unwrap()(VERSION + 1));
-            // identity wraps host handlers at install, no sigchain special
-            assert!(itf.getSignalHandler.unwrap()(libc::SIGSEGV).is_none());
+            // identity wraps host handlers at install, no sigchain special; a host without identity defaults to QEMU, whose fault entry handles SIGSEGV (riscv64 under qemu-user, rv-qemu)
+            assert_eq!(
+                itf.getSignalHandler.unwrap()(libc::SIGSEGV).is_some(),
+                !cfg!(atl_nb_identity)
+            );
             // no guest installed on a build host: the start fails and says why
             assert!(itf.loadLibrary.unwrap()(path.as_ptr(), 2).is_null());
             let err = CStr::from_ptr(itf.getError.unwrap()()).to_str().unwrap();

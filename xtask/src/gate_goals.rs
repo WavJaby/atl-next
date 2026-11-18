@@ -338,6 +338,8 @@ pub const GATES: &[(&str, GoalsOf)] = &[
         ]))
     }),
     ("run-apk", app),
+    // a riscv64 host's libz (its V-tier TU) and libunwindstack (vlenb in a ucontext unwind), run under qemu-user (rv_qemu.rs)
+    ("rv-qemu", || Goals::host(&["libz", "libunwindstack"])),
     ("sandbox", Goals::default),
     ("sensors", runtime_gralloc),
     // the signed product APKs it verifies (framework-res: platform role; the repo bind's fixture: default role) and apksigner, the verifier
