@@ -292,6 +292,8 @@ pub struct Runtime {
     platform_module: PathBuf,
     /// The device's ABIs, preferred first (`ro.product.cpu.abilist`'s role), for the install's native-library extraction and each app's instruction set ([`device_abis`]).
     abis: Vec<SupportedAbi>,
+    /// Pointer width of each arches.toml `[guest]` row, by ISA: where its guest libraries install (atl-android-paths `native_bridge_lib`).
+    guest_bits: std::collections::BTreeMap<String, u32>,
     /// The headless pointer script (atld `--headless-pointer`), when [`Runtime::with_headless_pointer`] set it.
     headless_pointer: Option<String>,
     /// The display the run answers with (atld `--display`, `WxH@hz,dpi`).
@@ -784,6 +786,11 @@ impl Runtime {
         xtask::gtk_imports::check_staged(root, &platform_module)?;
         let arches = crate::arches::load(root)?;
         let abis = device_abis(&arches, host)?;
+        let guest_bits = arches
+            .iter()
+            .filter(|(_, a)| a.guest.is_some())
+            .map(|(isa, a)| (isa.clone(), a.pointer_bits))
+            .collect();
         let licenses = crate::licenses::load(root, &crate::sources::load(root)?.upstream_names())?;
         let test_only = crate::licenses::test_only_outputs(&licenses, &out)?;
         let llvm_lib = remote::llvm_lib_dir(root, &out)?;
@@ -795,6 +802,7 @@ impl Runtime {
             native_bridge,
             platform_module,
             abis,
+            guest_bits,
             art,
             out,
             host: host.to_owned(),
@@ -944,7 +952,11 @@ impl Runtime {
     /// A foreign ISA's files are read from its own graph dir (native::graph_dir); run-apk checks that graph first (build_state::foreign_out).
     pub fn with_native_bridge_guest(mut self, isa: &str) -> Result<Self> {
         let bin = atl_android_paths::native_bridge_bin(isa);
-        let lib = atl_android_paths::native_bridge_lib(isa);
+        let bits = *self
+            .guest_bits
+            .get(isa)
+            .with_context(|| format!("{isa}: no [guest] row in arches.toml"))?;
+        let lib = atl_android_paths::native_bridge_lib(isa, bits);
         let graph = crate::native::graph_dir(&self.out, &self.host, isa);
         let module = |m: &str, file: &str| crate::native::nb_module_dir(&graph, isa, m).join(file);
         let mut files = vec![
