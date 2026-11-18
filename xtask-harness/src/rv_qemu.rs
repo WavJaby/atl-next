@@ -83,7 +83,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let (Some(isa), Some(clang), Some(sysroot), Some(cc), Some(cxx)) =
         (&host.isa, &host.clang, &host.sysroot, &host.cc, &host.cxx)
     else {
-        bail!("[{}.host] has no isa, clang, sysroot, cc and cxx: not a cross host", args.host);
+        bail!(
+            "[{}.host] has no isa, clang, sysroot, cc and cxx: not a cross host",
+            args.host
+        );
     };
     let closure = arches::isa_closure(isa)?;
     let out = crate::build_state::gate_out(root, args.out.as_deref(), &args.host, CMD)?;
@@ -134,7 +137,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         &fx.join("unwind_vlenb.cpp"),
         &unwind,
         &[
-            format!("-I{}", tree.join("system/unwinding/libunwindstack/include").display()),
+            format!(
+                "-I{}",
+                tree.join("system/unwinding/libunwindstack/include")
+                    .display()
+            ),
             format!("-I{}", tree.join("system/libbase/include").display()),
             format!("-L{}", out.join("device/libunwindstack").display()),
             "-lunwindstack".to_owned(),
@@ -246,19 +253,30 @@ struct Probe {
 }
 
 /// Check 1's verdict for `p` under `model`; `closure` / `isa` are the host row's.
-fn probe_result(p: &Probe, model: &Model, closure: &BTreeSet<String>, isa: &str) -> Result<String, String> {
+fn probe_result(
+    p: &Probe,
+    model: &Model,
+    closure: &BTreeSet<String>,
+    isa: &str,
+) -> Result<String, String> {
     let shown = format!(
         "hwcap {} hwprobe {}",
         p.hwcap,
         p.hwprobe.iter().cloned().collect::<Vec<_>>().join(" ")
     );
     if model.baseline {
-        let letters: String = closure.iter().filter(|e| e.len() == 1).map(String::as_str).collect();
+        let letters: String = closure
+            .iter()
+            .filter(|e| e.len() == 1)
+            .map(String::as_str)
+            .collect();
         let mut hwcap: Vec<char> = p.hwcap.chars().collect();
         hwcap.sort_unstable();
         let hwcap: String = hwcap.into_iter().collect();
         if hwcap != letters {
-            return Err(format!("AT_HWCAP letters {hwcap}, the row {isa} has {letters}"));
+            return Err(format!(
+                "AT_HWCAP letters {hwcap}, the row {isa} has {letters}"
+            ));
         }
         // hwprobe names F+D as one bit, `fd`
         let allowed = |e: &String| e == "fd" || closure.contains(e);
@@ -282,9 +300,10 @@ fn probe_result(p: &Probe, model: &Model, closure: &BTreeSet<String>, isa: &str)
             p.vlenb, p.signal
         )),
         (true, Some(vlenb), None) => match model_vlen(&model.cpu) {
-            Some(bits) if vlenb * 8 != bits => {
-                Err(format!("vlenb {vlenb}, the model's vlen={bits} means {}", bits / 8))
-            }
+            Some(bits) if vlenb * 8 != bits => Err(format!(
+                "vlenb {vlenb}, the model's vlen={bits} means {}",
+                bits / 8
+            )),
             _ if vlenb == 0 => Err("vlenb 0 with V".to_owned()),
             _ => Ok(format!("V=1, vlenb {vlenb}; {shown}")),
         },
@@ -297,7 +316,8 @@ fn probe_result(p: &Probe, model: &Model, closure: &BTreeSet<String>, isa: &str)
 
 /// `vlen=<bits>` of a QEMU `-cpu` string.
 fn model_vlen(cpu: &str) -> Option<u64> {
-    cpu.split(',').find_map(|p| p.strip_prefix("vlen=")?.parse().ok())
+    cpu.split(',')
+        .find_map(|p| p.strip_prefix("vlen=")?.parse().ok())
 }
 
 impl Toolchain {
@@ -315,7 +335,16 @@ impl Toolchain {
     fn compile_cxx(&self, src: &Path, exe: &Path, extra: &[String]) -> Result<()> {
         let mut cmd = Command::new(&self.cxx);
         cmd.args(&self.flags)
-            .args(["-O1", "-g", "-Wall", "-Werror", "-std=c++20", "-stdlib=libc++", "-nostdinc++", "-isystem"])
+            .args([
+                "-O1",
+                "-g",
+                "-Wall",
+                "-Werror",
+                "-std=c++20",
+                "-stdlib=libc++",
+                "-nostdinc++",
+                "-isystem",
+            ])
             .arg(&self.libcxx)
             .arg(src)
             .arg("-o")
@@ -330,7 +359,14 @@ fn unit_tests(root: &Path, host: &str) -> Result<Vec<(String, PathBuf)>> {
     let target = cross::cargo_target(root, host)?;
     let mut cmd = crate::cargo_command();
     cmd.current_dir(root)
-        .args(["test", "--no-run", "--lib", "--message-format=json", "--target", &target.triple])
+        .args([
+            "test",
+            "--no-run",
+            "--lib",
+            "--message-format=json",
+            "--target",
+            &target.triple,
+        ])
         .envs(target.env.iter().map(|(k, v)| (k, v)));
     for c in UNIT_CRATES {
         cmd.args(["-p", c]);
@@ -352,7 +388,10 @@ fn unit_tests(root: &Path, host: &str) -> Result<Vec<(String, PathBuf)>> {
             continue;
         }
         if let Some(exe) = msg["executable"].as_str() {
-            let name = msg["target"]["name"].as_str().unwrap_or("?").replace('_', "-");
+            let name = msg["target"]["name"]
+                .as_str()
+                .unwrap_or("?")
+                .replace('_', "-");
             exes.push((name, PathBuf::from(exe)));
         }
     }
@@ -390,9 +429,15 @@ impl Runner {
     }
 
     fn output(&self, mut cmd: Command, what: &str) -> Result<Output> {
-        let output = cmd.output().with_context(|| format!("running {what} under qemu-user"))?;
+        let output = cmd
+            .output()
+            .with_context(|| format!("running {what} under qemu-user"))?;
         if self.verbose {
-            println!("  $ {cmd:?}\n{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            println!(
+                "  $ {cmd:?}\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
         Ok(output)
     }
@@ -404,7 +449,13 @@ impl Runner {
         Ok(parse_probe(&output))
     }
 
-    fn zlib(&self, model: &Model, exe: &Path, work: &Path, v: bool) -> Result<Result<String, String>> {
+    fn zlib(
+        &self,
+        model: &Model,
+        exe: &Path,
+        work: &Path,
+        v: bool,
+    ) -> Result<Result<String, String>> {
         let log = work.join(format!("zlib-{}.asm", model.cpu.replace([',', '='], "-")));
         let mut cmd = self.command(model, Some(&log));
         cmd.arg(exe);
@@ -413,7 +464,12 @@ impl Runner {
         Ok(zlib_result(&output, &asm, v))
     }
 
-    fn unwind(&self, model: &Model, exe: &Path, vlenb: Option<u64>) -> Result<Result<String, String>> {
+    fn unwind(
+        &self,
+        model: &Model,
+        exe: &Path,
+        vlenb: Option<u64>,
+    ) -> Result<Result<String, String>> {
         let mut cmd = self.command(model, None);
         cmd.arg(exe);
         let output = self.output(cmd, "the unwind check")?;
@@ -425,7 +481,13 @@ impl Runner {
         cmd.arg(exe).arg("-q");
         let output = self.output(cmd, "unit tests")?;
         let text = String::from_utf8_lossy(&output.stdout);
-        let summary = text.lines().rev().find(|l| l.starts_with("test result:")).unwrap_or("no test result line").trim().to_owned();
+        let summary = text
+            .lines()
+            .rev()
+            .find(|l| l.starts_with("test result:"))
+            .unwrap_or("no test result line")
+            .trim()
+            .to_owned();
         if output.status.success() {
             return Ok(Ok(summary));
         }
@@ -444,8 +506,10 @@ fn parse_probe(output: &Output) -> Result<Probe, String> {
         text.lines()
             .find_map(|l| l.strip_prefix(key)?.strip_prefix(' ').map(str::trim))
     };
-    let hwcap = field("hwcap").ok_or_else(|| format!("no hwcap line ({}): {text}", output.status))?;
-    let hwprobe = field("hwprobe").ok_or_else(|| format!("no hwprobe line ({}): {text}", output.status))?;
+    let hwcap =
+        field("hwcap").ok_or_else(|| format!("no hwcap line ({}): {text}", output.status))?;
+    let hwprobe =
+        field("hwprobe").ok_or_else(|| format!("no hwprobe line ({}): {text}", output.status))?;
     if hwprobe.starts_with("unavailable") {
         return Err(format!("riscv_hwprobe {hwprobe}"));
     }
@@ -469,40 +533,68 @@ fn v_instructions(asm: &str) -> usize {
             let (Some(op), Some(args)) = (words.next(), words.next()) else {
                 return false;
             };
-            op.starts_with("vset") || (op.starts_with('v') && args.starts_with('v') && args[1..].starts_with(|c: char| c.is_ascii_digit()))
+            op.starts_with("vset")
+                || (op.starts_with('v')
+                    && args.starts_with('v')
+                    && args[1..].starts_with(|c: char| c.is_ascii_digit()))
         })
         .count()
 }
 
 fn zlib_result(output: &Output, asm: &str, v: bool) -> Result<String, String> {
     let text = String::from_utf8_lossy(&output.stdout);
-    let tier = text.lines().find_map(|l| l.strip_prefix("tier v=")).map(str::trim);
+    let tier = text
+        .lines()
+        .find_map(|l| l.strip_prefix("tier v="))
+        .map(str::trim);
     if tier != Some(if v { "1" } else { "0" }) {
-        return Err(format!("zlib's tier {tier:?}, the probe's V={} ({})", u8::from(v), output.status));
+        return Err(format!(
+            "zlib's tier {tier:?}, the probe's V={} ({})",
+            u8::from(v),
+            output.status
+        ));
     }
     if !output.status.success() {
-        let bad: Vec<&str> = text.lines().filter(|l| !l.ends_with(" ok") && !l.starts_with("tier")).collect();
+        let bad: Vec<&str> = text
+            .lines()
+            .filter(|l| !l.ends_with(" ok") && !l.starts_with("tier"))
+            .collect();
         return Err(format!("{} ({})", bad.join("; "), output.status));
     }
     let n = v_instructions(asm);
     match (v, n) {
-        (true, 0) => Err("V tier probed, but QEMU translated no V instruction: adler32_simd did not run".to_owned()),
+        (true, 0) => Err(
+            "V tier probed, but QEMU translated no V instruction: adler32_simd did not run"
+                .to_owned(),
+        ),
         (false, n) if n > 0 => Err(format!("no V, yet {n} V instructions translated")),
         _ => Ok(format!(
             "tier V={}, {} V instructions translated, {}",
             u8::from(v),
             n,
-            text.lines().filter(|l| l.ends_with(" ok")).collect::<Vec<_>>().join(", ")
+            text.lines()
+                .filter(|l| l.ends_with(" ok"))
+                .collect::<Vec<_>>()
+                .join(", ")
         )),
     }
 }
 
 fn unwind_result(output: &Output, vlenb: u64) -> Result<String, String> {
     let text = String::from_utf8_lossy(&output.stdout);
-    let got = text.lines().find_map(|l| l.strip_prefix("vlenb ")).map(str::trim);
-    let frames = text.lines().find(|l| l.starts_with("frames ")).unwrap_or("no frames line");
+    let got = text
+        .lines()
+        .find_map(|l| l.strip_prefix("vlenb "))
+        .map(str::trim);
+    let frames = text
+        .lines()
+        .find(|l| l.starts_with("frames "))
+        .unwrap_or("no frames line");
     if got != Some(vlenb.to_string().as_str()) {
-        return Err(format!("unwinder vlenb {got:?}, the probe's {vlenb} ({}); {frames}", output.status));
+        return Err(format!(
+            "unwinder vlenb {got:?}, the probe's {vlenb} ({}); {frames}",
+            output.status
+        ));
     }
     if !output.status.success() {
         return Err(format!("{frames} ({})", output.status));
@@ -552,13 +644,25 @@ mod tests {
         let base = parse_probe(&out("hwcap acdfim\nhwprobe fd c zba zbb\n", sigill)).unwrap();
         assert!(probe_result(&base, &model("b", true), &closure, ISA).is_ok());
         // QEMU's default rv64 as the baseline (--break baseline): extensions past the row
-        let wide = parse_probe(&out("hwcap acdfim\nhwprobe fd c zba zbb zbs zicboz zbc zihintntl zfa\n", sigill)).unwrap();
+        let wide = parse_probe(&out(
+            "hwcap acdfim\nhwprobe fd c zba zbb zbs zicboz zbc zihintntl zfa\n",
+            sigill,
+        ))
+        .unwrap();
         let e = probe_result(&wide, &model("rv64", true), &closure, ISA).unwrap_err();
         assert!(e.contains("past the row"), "{e}");
         // a model without V whose vsetvli ran: the control did not fire
-        let ran = parse_probe(&out("hwcap acdfim\nhwprobe fd c zba zbb\nvlenb 16\n", ExitStatus::from_raw(0))).unwrap();
+        let ran = parse_probe(&out(
+            "hwcap acdfim\nhwprobe fd c zba zbb\nvlenb 16\n",
+            ExitStatus::from_raw(0),
+        ))
+        .unwrap();
         assert!(probe_result(&ran, &model("b", true), &closure, ISA).is_err());
-        let v = parse_probe(&out("hwcap acdfimv\nhwprobe fd c v zba zbb zbs\nvlenb 16\n", ExitStatus::from_raw(0))).unwrap();
+        let v = parse_probe(&out(
+            "hwcap acdfimv\nhwprobe fd c v zba zbb zbs\nvlenb 16\n",
+            ExitStatus::from_raw(0),
+        ))
+        .unwrap();
         assert!(probe_result(&v, &model("rva23u64,vlen=128", false), &closure, ISA).is_ok());
         let e = probe_result(&v, &model("rva23u64,vlen=256", false), &closure, ISA).unwrap_err();
         assert!(e.contains("vlen=256"), "{e}");
@@ -574,10 +678,17 @@ mod tests {
 
     #[test]
     fn zlib_needs_v_code_exactly_with_v() {
-        let ok = out("tier v=1\nadler32 11 sizes ok\nroundtrip 11 sizes ok\n", ExitStatus::from_raw(0));
+        let ok = out(
+            "tier v=1\nadler32 11 sizes ok\nroundtrip 11 sizes ok\n",
+            ExitStatus::from_raw(0),
+        );
         let asm = "0x10:  0c0072d7          vsetvli                 t0,zero,e8,m1,ta,ma\n";
         assert!(zlib_result(&ok, asm, true).is_ok());
-        assert!(zlib_result(&ok, "", true).unwrap_err().contains("no V instruction"));
+        assert!(
+            zlib_result(&ok, "", true)
+                .unwrap_err()
+                .contains("no V instruction")
+        );
         assert!(zlib_result(&ok, asm, false).is_err());
     }
 
