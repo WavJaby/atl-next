@@ -81,6 +81,8 @@ enum Step {
     GlProxies,
     /// the widgets fixture on the native out dir under the nested compositor: first screenshot non-uniform + one tap that changes pixels (xtask-harness drive_gate.rs `quick`); skipped without a native out dir
     DriveTap,
+    /// the runtime gates listed in xtask-harness check_gates.rs `ROWS` (deterministic on a build machine, each well under a minute), each as `cargo xtask test` runs it, on the native out dir; skipped without a native out dir
+    Gates,
     /// a CJK and an emoji code point each resolve to a real font file through the product's font list over this desktop's own fontconfig (xtask-harness host_fonts.rs); a host with no such face is skipped and named (`host lacks a CJK font`)
     HostFonts,
     /// the UI module cdylibs (release builds from this checkout's sources) import no GTK/GDK/GSK name outside the GTK 4.14 baseline (gtk-baseline.toml; gtk_imports.rs)
@@ -89,7 +91,7 @@ enum Step {
     CrossBionic,
 }
 
-const ALL: [Step; 28] = [
+const ALL: [Step; 29] = [
     Step::Fmt,
     Step::Spdx,
     Step::Tables,
@@ -115,6 +117,7 @@ const ALL: [Step; 28] = [
     Step::ConverterPackages,
     Step::GlProxies,
     Step::DriveTap,
+    Step::Gates,
     Step::HostFonts,
     Step::GtkImports,
     Step::CrossBionic,
@@ -148,6 +151,7 @@ impl Step {
             Step::ConverterPackages => "converter-packages",
             Step::GlProxies => "gl-proxies",
             Step::DriveTap => "drive-tap",
+            Step::Gates => "gates",
             Step::HostFonts => "host-fonts",
             Step::GtkImports => "gtk-imports",
             Step::CrossBionic => "cross-bionic",
@@ -164,7 +168,7 @@ impl Step {
             | Step::ConverterPackages
             | Step::GtkImports
             | Step::CrossBionic => Class::Cargo,
-            Step::GlProxies | Step::DriveTap | Step::HostFonts => Class::Harness,
+            Step::GlProxies | Step::DriveTap | Step::Gates | Step::HostFonts => Class::Harness,
             _ => Class::Light,
         }
     }
@@ -173,7 +177,7 @@ impl Step {
     fn skip(self, out: &Path) -> Option<String> {
         match self {
             // both read a native out dir; a checkout without one (main's land verify) has nothing to check
-            Step::ConverterPackages | Step::GlProxies | Step::DriveTap
+            Step::ConverterPackages | Step::GlProxies | Step::DriveTap | Step::Gates
                 if !out.join("graph.json").is_file() =>
             {
                 Some(format!(
@@ -215,6 +219,11 @@ impl Step {
             // runs the built runtime: a build from another source state would test stale binaries
             crate::build_state::ensure_current(root, out)?;
             return crate::harness::check_step(root, "drive-tap", out);
+        }
+        if self == Step::Gates {
+            // runs the built runtime, as drive-tap
+            crate::build_state::ensure_current(root, out)?;
+            return crate::harness::check_step(root, "gates", out);
         }
         if self == Step::HostFonts {
             // product logic (atl-fonts over fontconfig) the definition-only xtask cannot link: a harness step; reads the desktop and the pinned tree, no build dir
@@ -389,6 +398,7 @@ impl Step {
             Step::ConverterPackages => unreachable!("run handles converter-packages"),
             Step::GlProxies => unreachable!("run handles gl-proxies"),
             Step::DriveTap => unreachable!("run handles drive-tap"),
+            Step::Gates => unreachable!("run handles gates"),
             Step::HostFonts => unreachable!("run handles host-fonts"),
             Step::GtkImports => unreachable!("run handles gtk-imports"),
             Step::CrossBionic => unreachable!("run handles cross-bionic"),

@@ -20,6 +20,7 @@ mod audio_pcm;
 mod billing;
 mod binder;
 mod broadcast;
+mod check_gates;
 mod composer;
 mod compositor;
 mod crossing;
@@ -131,6 +132,7 @@ enum CheckStep {
     GlProxies,
     DriveTap,
     HostFonts,
+    Gates,
 }
 
 #[derive(Subcommand)]
@@ -461,6 +463,12 @@ fn check_step(root: &std::path::Path, step: CheckStep, out: &std::path::Path) ->
             None
         }
         CheckStep::HostFonts => host_fonts::check(root, false)?,
+        CheckStep::Gates => {
+            let arches = arches::load(root)?;
+            let (arch, _) = arches::build_machine(root, &arches)?;
+            check_gates::run(root, arch, out)?;
+            None
+        }
     };
     if let Some(why) = skipped {
         println!("{}{why}", xtask::harness::SKIP_PREFIX);
