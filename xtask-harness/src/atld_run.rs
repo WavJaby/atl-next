@@ -268,7 +268,7 @@ pub struct Runtime {
     framework_res: PathBuf,
     /// The pinned test fonts atld reads as the desktop's (test_fonts.rs): its FONTCONFIG_FILE and `--font-data`.
     fonts: crate::test_fonts::TestFonts,
-    /// [`Runtime::with_desktop_fonts`]: atld reads the desktop's own fontconfig, not the pinned set (`--font-data` stays AOSP's).
+    /// [`Runtime::for_user_launch`]: atld reads the desktop's own fontconfig, not the pinned set (`--font-data` stays AOSP's).
     desktop_fonts: bool,
     /// AOSP's keyboards dir: its [`tree::KEYBOARD_FILES`] are linked into /system (the input service loads the maps, the app's input thread the layout).
     keychars: PathBuf,
@@ -918,13 +918,16 @@ impl Runtime {
         Ok(self)
     }
 
-    /// atld reads the desktop's fonts through its own fontconfig config, as an installed atld does (run-apk: the owner plays with what a user sees; the pinned set has no CJK, emoji or other script face, so that text was boxes). Gates keep the pinned set: their text must not depend on the host.
-    pub fn with_desktop_fonts(mut self) -> Self {
+    /// The user's launch (run-apk, local or remote): atld sees the desktop as an installed atld does, one builder so no run-apk path takes only part of it (remote run-apk once missed the fonts and read the pinned set on the target).
+    /// - fonts: the desktop's own fontconfig config, not the pinned set (no CJK, emoji or other script face: that text was boxes). Gates keep the pinned set: their text must not depend on the host.
+    /// - audio: the session's `PULSE_SERVER`, set or unset: the login environment's audio server choice holds (Linux convention).
+    pub fn for_user_launch(mut self) -> Self {
         self.desktop_fonts = true;
+        self.pulse_server = PulseServer::Session;
         self
     }
 
-    /// The pinned set's FONTCONFIG_FILE and font files, unless [`Runtime::with_desktop_fonts`]: (conf, files).
+    /// The pinned set's FONTCONFIG_FILE and font files, unless [`Runtime::for_user_launch`]: (conf, files).
     fn pinned_fonts(&self) -> Option<(&Path, &[PathBuf])> {
         (!self.desktop_fonts).then_some((self.fonts.conf.as_path(), self.fonts.files.as_slice()))
     }
@@ -1190,12 +1193,6 @@ impl Runtime {
     /// atld starts with `PULSE_SERVER` = `server` (libpulse's syntax, `unix:<path>`): the desktop's pulse server, whose socket `share-sound` grants the web process.
     pub fn with_pulse_server(mut self, server: std::ffi::OsString) -> Self {
         self.pulse_server = PulseServer::Named(server);
-        self
-    }
-
-    /// atld starts with the session's `PULSE_SERVER`, set or unset, as when the user starts atld: run-apk is the user's launch, so the login environment's audio server choice holds (Linux convention).
-    pub fn with_session_pulse_server(mut self) -> Self {
-        self.pulse_server = PulseServer::Session;
         self
     }
 
@@ -1832,7 +1829,7 @@ impl Runtime {
             .arg(&self.framework_res)
             .arg("--font-data")
             .arg(&self.fonts.font_data)
-            // atld asks fontconfig for the desktop's fonts: the pinned set (test_fonts.rs), or with_desktop_fonts the desktop's own config
+            // atld asks fontconfig for the desktop's fonts: the pinned set (test_fonts.rs), or for_user_launch the desktop's own config
             .envs(self.pinned_fonts().map(|(conf, _)| ("FONTCONFIG_FILE", conf)))
             .args(tree::KEYBOARD_FILES.iter().flat_map(|(file, dir)| {
                 [

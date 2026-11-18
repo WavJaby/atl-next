@@ -240,11 +240,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
     };
     println!("run-apk: data root {}", data_root.display());
-    // the desktop's fonts and the session's pulse server, as a user's run sees them (the pinned test set has no CJK or emoji face)
-    let rt = rt
-        .with_data_root(&data_root)
-        .with_desktop_fonts()
-        .with_session_pulse_server();
+    let rt = rt.with_data_root(&data_root).for_user_launch();
     run_on(&rt, args, foreign.as_ref(), pin.as_ref(), files, steps)
 }
 
@@ -528,8 +524,8 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         None => rt,
     }
     .with_desktop_env(&a.env)
-    // a real launch on the target's desktop, as the local run-apk: the pulse server is that session's (resolved there, remote.rs session_env_script)
-    .with_session_pulse_server();
+    // a real launch on the target's desktop, as the local run-apk: its fontconfig and its session's pulse server (resolved there, remote.rs session_env_script)
+    .for_user_launch();
     let work = rt.out.join("run-apk");
     std::fs::create_dir_all(&work)?;
     let m = package(&rt, &files, pin.as_ref(), &a.target)?;
