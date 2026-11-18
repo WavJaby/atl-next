@@ -148,6 +148,29 @@ fn client(adb: &Path, home: &Path, server_port: u16, args: &[&str]) -> Result<(S
 }
 
 /// A free loopback TCP port for the client's server (the default 5037 may be a developer's own server).
+/// The setuid helpers the adb profile writes its maps with (atl-broker adb.rs `write_maps`) and the packages that ship them, for the `host lacks` verdict.
+const MAP_HELPERS: [&str; 2] = ["newuidmap", "newgidmap"];
+const MAP_HELPERS_PACKAGE: &str = "uidmap on Debian/Ubuntu, shadow on Arch";
+
+/// Whether a `/proc/self/uid_map` (user_namespaces(7): inside, outside, count per row) maps host uid 0. When it does not, a setuid-root file runs without root here (the kernel ignores the bit for an owner the
+/// namespace does not map), so newuidmap cannot write a map of more than the caller's own id.
+fn maps_host_root(uid_map: &str) -> bool {
+    uid_map.lines().any(|l| {
+        let n: Vec<u64> = l
+            .split_whitespace()
+            .filter_map(|f| f.parse().ok())
+            .collect();
+        matches!(n[..], [_, outside, count] if outside == 0 && count > 0)
+    })
+}
+
+/// The first of [`MAP_HELPERS`] in no directory of `path` (a PATH value).
+fn missing_helper(path: &std::ffi::OsStr) -> Option<&'static str> {
+    MAP_HELPERS
+        .into_iter()
+        .find(|h| !std::env::split_paths(path).any(|d| d.join(h).is_file()))
+}
+
 fn free_port() -> Result<u16> {
     Ok(std::net::TcpListener::bind("127.0.0.1:0")?
         .local_addr()?
@@ -175,6 +198,29 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             args.host
         );
     }
+    // a host without the helpers cannot run the profile at all: its own verdict, not a failure
+    if let Some(helper) = missing_helper(&std::env::var_os("PATH").unwrap_or_default()) {
+        println!("adb: host lacks {helper} ({MAP_HELPERS_PACKAGE})");
+        let skipped = format!("adb -- host lacks {helper}");
+        println!(
+            "{}",
+            crate::verdict::Verdict {
+                cmd: "adb",
+                total: None,
+                skipped: vec![skipped.as_str()],
+                failures: Vec::new(),
+            }
+            .line()
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    let uid_map = std::fs::read_to_string("/proc/self/uid_map")?;
+    ensure!(
+        maps_host_root(&uid_map),
+        "this process runs in a user namespace that does not map host uid 0 (uid_map {:?}): setuid {} cannot write adbd's maps here. `cargo xtask` runs `test` inside its tree namespace (xtask tree.rs `enter`, an unprivileged bwrap user namespace)",
+        uid_map.trim(),
+        MAP_HELPERS[0]
+    );
     let test = out.join("adb-test");
     if test.exists() {
         std::fs::remove_dir_all(&test)?;
@@ -342,6 +388,35 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The init namespace's map (user_namespaces(7): identity over the whole range) maps root; bwrap's unprivileged namespace (measured in xtask's tree namespace 2026-11-18: `1000 1000 1`) does not, nor
+    /// does a map whose root row has count 0.
+    #[test]
+    fn host_root_mapping_reads_uid_map() {
+        assert!(maps_host_root("         0          0 4294967295\n"));
+        assert!(!maps_host_root("      1000       1000          1\n"));
+        assert!(maps_host_root("2000 1000 1\n0 0 1\n"));
+        assert!(!maps_host_root("0 0 0\n"));
+        assert!(!maps_host_root(""));
+    }
+
+    /// A PATH with only newuidmap names newgidmap; with both, none; an empty PATH names the first.
+    #[test]
+    fn missing_helper_searches_path() {
+        let dir = std::env::temp_dir().join(format!("adb-helpers-{}", std::process::id()));
+        let (one, both) = (dir.join("one"), dir.join("both"));
+        for d in [&one, &both] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(one.join("newuidmap"), "").unwrap();
+        for h in MAP_HELPERS {
+            std::fs::write(both.join(h), "").unwrap();
+        }
+        assert_eq!(missing_helper(one.as_os_str()), Some("newgidmap"));
+        assert_eq!(missing_helper(both.as_os_str()), None);
+        assert_eq!(missing_helper(std::ffi::OsStr::new("")), Some("newuidmap"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// /proc/net/tcp rows (proc(5) layout): a 127.0.0.1:5555 listener, a 0.0.0.0:5555 listener, an established 5555 connection; only LISTEN rows count.
     #[test]
