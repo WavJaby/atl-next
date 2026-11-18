@@ -16,24 +16,46 @@ const FAILED: [&str; 3] = [
     "Failed to create dmabuf texture",
 ];
 
+/// `Exported GL texture to dmabuf (format: ...)` (gdkgltexture.c): GDK made a dma-buf of a GL texture it rendered itself. Under GTK 4.18 a `render_texture` result read with a
+/// TextureDownloader (the window's capture) goes export -> one import -> one `Used GskGLRenderer for downloading`: the readback of GDK's own picture, never a scene buffer.
+const EXPORTED: &str = "Exported GL texture to dmabuf";
+
 /// Counts of each path in one GTK log.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Verdict {
+    /// Scene buffers imported (an export's own re-import not counted).
     pub imported: usize,
+    /// Scene buffers downloaded (an export's own readback not counted).
     pub downloaded: usize,
     pub failed: usize,
     /// [`NO_IMPORT`] lines: the renderer has no dma-buf import.
     pub no_import: usize,
+    /// [`EXPORTED`] lines: GDK's own renders read back (captures); each excuses the one import and the one download after it.
+    pub exported: usize,
 }
 
 impl Verdict {
     pub fn of(log: &str) -> Self {
         let mut v = Self::default();
+        // an export's re-import and readback still to come
+        let (mut own_import, mut own_download) = (0usize, 0usize);
         for line in log.lines() {
-            if line.contains(IMPORTED.0) && line.contains(IMPORTED.1) {
-                v.imported += 1;
+            if line.contains(EXPORTED) {
+                v.exported += 1;
+                own_import += 1;
+                own_download += 1;
+            } else if line.contains(IMPORTED.0) && line.contains(IMPORTED.1) {
+                if own_import > 0 {
+                    own_import -= 1;
+                } else {
+                    v.imported += 1;
+                }
             } else if line.contains(DOWNLOADED) {
-                v.downloaded += 1;
+                if own_download > 0 && own_import == 0 {
+                    own_download -= 1;
+                } else {
+                    v.downloaded += 1;
+                }
             } else if FAILED.iter().any(|f| line.contains(f)) {
                 v.failed += 1;
             } else if line.contains(NO_IMPORT) {
@@ -74,8 +96,8 @@ impl std::fmt::Display for Verdict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "imported={} downloaded={} failed={} no_import={}",
-            self.imported, self.downloaded, self.failed, self.no_import
+            "imported={} downloaded={} failed={} no_import={} exported={}",
+            self.imported, self.downloaded, self.failed, self.no_import, self.exported
         )
     }
 }
@@ -97,7 +119,8 @@ mod tests {
                 imported: 1,
                 downloaded: 0,
                 failed: 0,
-                no_import: 0
+                no_import: 0,
+                exported: 0
             }
         );
         assert!(v.ok());
@@ -107,6 +130,27 @@ mod tests {
         );
         assert_eq!((bad.downloaded, bad.failed), (1, 1));
         assert!(!bad.ok());
+    }
+
+    /// A capture's round trip as GTK 4.18 printed it (job rgm platform-ui --verbose): export, the export's import, its readback. Only the scene buffer before it counts.
+    #[test]
+    fn a_capture_readback_is_not_a_scene_download() {
+        let scene = "Imported 320x240 XB24:0 dmabuf as GL_TEXTURE_2D texture\n";
+        let capture = "Exporting GL texture to dmabuf\n\
+                       Exported GL texture to dmabuf (format: AB24:0, planes: 1)\n\
+                       Creating dmabuf texture, format AB24:0,  premultiplied, 1 planes, memory format 2\n\
+                       Imported 320x240 AB24:0 dmabuf as GL_TEXTURE_2D texture\n\
+                       Used GskGLRenderer for downloading 320x240 dmabuf (format AB24:0)\n";
+        let v = Verdict::of(&format!("{scene}{capture}").repeat(3));
+        assert_eq!((v.imported, v.downloaded, v.exported), (3, 0, 3));
+        assert!(v.ok());
+        // a scene download beside captures still counts: one export excuses one readback only
+        let mmap = "Used mmap for downloading 320x240 dmabuf (format XB24:0)\n";
+        let v = Verdict::of(&format!("{capture}{mmap}"));
+        assert_eq!((v.downloaded, v.ok()), (1, false));
+        // a download before the export's re-import is not its readback
+        let early = "Exported GL texture to dmabuf (format: AB24:0, planes: 1)\nUsed mmap for downloading 320x240 dmabuf (format XB24:0)\n";
+        assert_eq!(Verdict::of(early).downloaded, 1);
     }
 
     /// GDK's renderer without import (lines as the WSL dxgkrnl run printed them, on either driver buffer tier): downloads pass only when every failed import follows GDK's no-import line and nothing imported.
