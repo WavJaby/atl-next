@@ -582,6 +582,10 @@ struct Unit<'tu> {
     files: Vec<File<'tu>>,
     /// Bits of a data pointer on this target (clang's TargetInfo): a C++ reference is passed and stored as one.
     pointer_bits: u32,
+    /// Complete records `ty` met that the interface does not own, laid out (`ArchView::foreign` after the walk).
+    foreign: std::cell::RefCell<BTreeMap<String, Record>>,
+    /// Names of `foreign` begun: a record reached again through its own fields is not laid out twice.
+    laying: std::cell::RefCell<BTreeSet<String>>,
 }
 
 impl Unit<'_> {
@@ -612,11 +616,14 @@ fn parse_one(index: &Index, src: &Source, t: &Target) -> Result<ArchView> {
             })
             .collect::<Result<_>>()?,
         pointer_bits: u32::try_from(tu.get_target().pointer_width)?,
+        foreign: Default::default(),
+        laying: Default::default(),
     };
 
     let mut view = ArchView {
         triple: t.triple.clone(),
         records: BTreeMap::new(),
+        foreign: BTreeMap::new(),
         functions: BTreeMap::new(),
         weak: BTreeSet::new(),
         constants: BTreeMap::new(),
@@ -626,6 +633,7 @@ fn parse_one(index: &Index, src: &Source, t: &Target) -> Result<ArchView> {
         function_macros: function_macros(&tu, &unit)?,
     };
     decls(&tu.get_entity(), &unit, &mut view)?;
+    view.foreign = unit.foreign.take();
     let macros = macro_names(&tu, &unit, src.macros)?;
     if !macros.is_empty() {
         for (name, value) in macro_values(index, src, &macros, t)? {
@@ -957,6 +965,8 @@ fn macro_values(
     let none = Unit {
         files: Vec::new(),
         pointer_bits: u32::try_from(tu.get_target().pointer_width)?,
+        foreign: Default::default(),
+        laying: Default::default(),
     };
     let mut out = Vec::new();
     for e in tu.get_entity().get_children() {
@@ -1176,6 +1186,22 @@ fn first_leaf(record: &Entity) -> Option<String> {
         })
 }
 
+/// A record the interface names but does not define here: `Ty::Opaque`; when complete (`c` has a size), laid out once into `Unit::foreign` (its own field records first, by the recursion through `ty`).
+fn opaque(c: &Type, decl: Entity, name: String, unit: &Unit) -> Result<Ty> {
+    if c.get_sizeof().is_ok()
+        && let Some(def) = decl.get_definition()
+        && unit.laying.borrow_mut().insert(name.clone())
+    {
+        let mut local = BTreeMap::new();
+        record(&def, &name, unit, &mut local).with_context(|| format!("foreign {name}"))?;
+        unit.foreign.borrow_mut().append(&mut local);
+    }
+    Ok(Ty::Opaque {
+        name,
+        record: record_kind(decl.get_kind()),
+    })
+}
+
 /// What typedef `name` stands for; `typedef struct { … } name;` is the record known by `name`.
 fn typedef_target(under: &Type, name: &str, unit: &Unit) -> Result<Ty> {
     let c = under.get_canonical_type();
@@ -1188,10 +1214,7 @@ fn typedef_target(under: &Type, name: &str, unit: &Unit) -> Result<Ty> {
                 name: name.to_owned(),
             }
         } else {
-            Ty::Opaque {
-                name: name.to_owned(),
-                record: record_kind(d.get_kind()),
-            }
+            opaque(&c, d, name.to_owned(), unit)?
         });
     }
     ty(under, unit)
@@ -1301,10 +1324,7 @@ fn ty(t: &Type, unit: &Unit) -> Result<Ty> {
             if unit.owns(&decl) && c.get_sizeof().is_ok() {
                 Ty::Record { name }
             } else {
-                Ty::Opaque {
-                    name,
-                    record: record_kind(decl.get_kind()),
-                }
+                opaque(&c, decl, name, unit)?
             }
         }
         TypeKind::LValueReference | TypeKind::RValueReference => {

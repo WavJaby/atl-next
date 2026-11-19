@@ -22,6 +22,8 @@ pub struct ArchView {
     pub triple: String,
     /// Records (structs) defined by the interface's header, by tag name.
     pub records: BTreeMap<String, Record>,
+    /// Complete records the interface reaches (a `Ty::Opaque` name, at any depth) that another header defines (`union sigval`, `struct sockaddr`), laid out as `records`. Never printed: a crossing compares two views' layouts by it where a name says nothing (sigval is 4 bytes on arm, 8 on x86_64).
+    pub foreign: BTreeMap<String, Record>,
     /// Functions declared by the interface's header.
     pub functions: BTreeMap<String, Signature>,
     /// Those of `functions` declared weak: bionic marks API newer than a caller's minimum level so, and

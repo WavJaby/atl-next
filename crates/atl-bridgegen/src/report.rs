@@ -424,6 +424,7 @@ mod tests {
         let view = |p: Ty| ArchView {
             triple: String::new(),
             records: Default::default(),
+            foreign: Default::default(),
             functions: [(
                 "f".to_owned(),
                 Signature {

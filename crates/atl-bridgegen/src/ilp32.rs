@@ -224,8 +224,12 @@ fn position(
             },
             &Ty::Int { bits: hb, .. },
         ) if gb < hb => Ok(Kind::Widen { signed }),
+        // a signedness-only difference at equal width is carried (bionic arm `socklen_t` = int32, glibc's uint32): the register holds the same bits on both sides and neither callee extends a full-width argument
+        (&Ty::Int { bits: gb, .. }, &Ty::Int { bits: hb, .. }) if gb == hb => Ok(Kind::Same),
         // a record by value whose layout differs (NdkMediaCodec.h `AMediaCodecOnAsyncNotifyCallback`, four fn pointers): converted field by field like one behind a pointer
-        (Ty::Record { name }, Ty::Record { .. }) => Ok(Kind::Record(name.clone())),
+        _ if both_records(g, h, views).is_some() => {
+            Ok(Kind::Record(both_records(g, h, views).unwrap_or_default()))
+        }
         // a parameter of array type is a pointer to its element (NDK NdkMediaCrypto.h `const uint8_t uuid[16]`)
         (Ty::Array { elem: ge, .. }, Ty::Array { elem: he, .. }) if !result => {
             pointee(ge, he, false, views)
@@ -249,10 +253,16 @@ fn pointee(gp: &Ty, hp: &Ty, result: bool, views: &Views) -> Result<Kind> {
     let data = if result { Kind::PtrResult } else { Kind::Ptr };
     Ok(match (gp.resolved(), hp.resolved()) {
         (Ty::Function(sig), Ty::Function(_)) => Kind::Callback(crate::jni::shorty(sig)?),
-        (Ty::Opaque { .. }, _) | (_, Ty::Opaque { .. }) => Kind::Opaque,
+        _ if untyped(gp, views.guest) && !matches!(gp.resolved(), Ty::Void)
+            || untyped(hp, views.host) && !matches!(hp.resolved(), Ty::Void) =>
+        {
+            Kind::Opaque
+        }
         (Ty::Int { bits: 8, .. }, Ty::Int { bits: 8, .. }) if result => Kind::String,
         _ if same(gp, views.guest, hp, views.host, false) => data,
-        (Ty::Record { name }, Ty::Record { .. }) => Kind::Record(name.clone()),
+        _ if both_records(gp, hp, views).is_some() => {
+            Kind::Record(both_records(gp, hp, views).unwrap_or_default())
+        }
         (
             Ty::Int { .. } | Ty::Pointer { .. } | Ty::Typedef { .. },
             Ty::Int { .. } | Ty::Pointer { .. },
@@ -313,9 +323,7 @@ fn same_in(
             },
         ) => {
             ba == bb
-                && (matches!(pa.resolved(), Ty::Void | Ty::Opaque { .. })
-                    || matches!(pb.resolved(), Ty::Void | Ty::Opaque { .. })
-                    || same_in(pa, va, pb, vb, false, open))
+                && (untyped(pa, va) || untyped(pb, vb) || same_in(pa, va, pb, vb, false, open))
         }
         // data pointer vs integer of the same width (report.rs TyDiff::PointerVsInteger)
         (Ty::Pointer { bits, pointee, .. }, Ty::Int { bits: i, .. })
@@ -335,12 +343,18 @@ fn same_in(
                     .zip(&sb.params)
                     .all(|(x, y)| same_in(x, va, y, vb, true, open))
         }
-        (Ty::Record { name: na }, Ty::Record { name: nb }) => {
+        // by layout, never by name: `union sigval` is one name for 4 bytes on arm and 8 on x86_64
+        (
+            Ty::Record { name: na } | Ty::Opaque { name: na, .. },
+            Ty::Record { name: nb } | Ty::Opaque { name: nb, .. },
+        ) => {
             let key = (na.clone(), nb.clone());
             if open.contains(&key) {
                 return true;
             }
-            match (va.records.get(na), vb.records.get(nb)) {
+            match (layout(va, na), layout(vb, nb)) {
+                // both incomplete: a handle neither side looks into
+                (None, None) => na == nb,
                 (Some(ra), Some(rb)) => {
                     open.push(key);
                     let equal = ra.size == rb.size
@@ -357,9 +371,34 @@ fn same_in(
                 _ => false,
             }
         }
-        (Ty::Opaque { name: na, .. }, Ty::Opaque { name: nb, .. }) => na == nb,
         _ => false,
     }
+}
+
+/// The layout of record `name` in `v`: defined by the interface or by a header it includes; `None` = incomplete.
+fn layout<'v>(v: &'v ArchView, name: &str) -> Option<&'v crate::ir::Record> {
+    v.records.get(name).or_else(|| v.foreign.get(name))
+}
+
+/// A pointee the host never looks into: `void` or an incomplete record.
+fn untyped(ty: &Ty, v: &ArchView) -> bool {
+    match ty.resolved() {
+        Ty::Void => true,
+        Ty::Opaque { name, .. } => layout(v, name).is_none(),
+        _ => false,
+    }
+}
+
+/// `g` and `h` both name a record complete in their view: the guest's name.
+fn both_records(g: &Ty, h: &Ty, views: &Views) -> Option<String> {
+    let complete = |ty: &Ty, v: &ArchView| match ty.resolved() {
+        Ty::Record { name } | Ty::Opaque { name, .. } if layout(v, name).is_some() => {
+            Some(name.clone())
+        }
+        _ => None,
+    };
+    complete(h, views.host)?;
+    complete(g, views.guest)
 }
 
 #[cfg(test)]
@@ -389,7 +428,15 @@ int pthread_attr_getstacksize(const pthread_attr_t* attr, size_t* size);\n\
 void* memcpy(void* dst, const void* src, size_t n);\n\
 const char* AAsset_name(AAsset* asset);\n\
 int ALooper_addFd(int fd, int ident, int events, ALooper_callbackFunc callback, void* data);\n\
-int sum(int a, double b);\n";
+int sum(int a, double b);\n\
+#include \"other.h\"\n\
+int sigqueue(int pid, int sig, const union sigval value);\n\
+int getnameinfo(const struct sockaddr* sa, socklen_t sa_len, char* host, size_t host_len, char* serv, size_t serv_len, int flags);\n";
+
+    /// Defined outside the interface (`Ty::Opaque` + `ArchView::foreign`). `union sigval`: bionic uapi asm-generic/siginfo.h `{ int sival_int; void* sival_ptr; }`. `struct sockaddr`: bionic linux/socket.h `{ sa_family_t sa_family; char sa_data[14]; }`, 16 bytes on both. `socklen_t`: bionic sys/types.h `__kernel_socklen_t` = int; glibc bits/types.h `__socklen_t` = unsigned int.
+    const OTHER: &str = "union sigval { int sival_int; void* sival_ptr; };\n\
+struct sockaddr { unsigned short sa_family; char sa_data[14]; };\n\
+#if defined(__arm__)\ntypedef int socklen_t;\n#else\ntypedef unsigned int socklen_t;\n#endif\n";
 
     const HANDLES: &[&str] = &["EGLDisplay", "EGLImage", "EGLContext", "EGLClientBuffer"];
 
@@ -408,6 +455,7 @@ int sum(int a, double b);\n";
         std::fs::create_dir_all(&dir.0).unwrap();
         let path = dir.0.join("h.h");
         std::fs::write(&path, HEADER).unwrap();
+        std::fs::write(dir.0.join("other.h"), OTHER).unwrap();
         let target = |arch: &str, triple: &str| Target {
             arch: arch.into(),
             triple: triple.into(),
@@ -537,6 +585,35 @@ int sum(int a, double b);\n";
         assert!(row(&i, "sum").same());
         assert!(!row(&i, "ANativeWindow_lock").carried());
         assert!(row(&i, "ALooper_pollOnce").heaviest() == &Kind::OutWord);
+    }
+
+    /// Records another header defines compare by layout, never by name: `union sigval` is 4 bytes on arm (int / 4-byte pointer) and 8 on x86_64, so by value it is a record; `struct sockaddr` is 16 bytes in both, so a pointer to it is a plain data pointer.
+    #[test]
+    fn foreign_records_compare_by_layout() {
+        let i = views("foreign", ARM);
+        let (g, h) = (&i.arches["guest"], &i.arches["host"]);
+        assert_eq!((g.foreign["sigval"].size, h.foreign["sigval"].size), (4, 8));
+        assert!(!g.records.contains_key("sigval"));
+        assert_eq!(
+            row(&i, "sigqueue").kinds[3],
+            Kind::Record("sigval".to_owned())
+        );
+        assert_eq!(row(&i, "getnameinfo").kinds[1], Kind::Ptr);
+    }
+
+    /// A signedness-only difference at equal width is carried: `socklen_t` int32 (bionic arm) vs uint32 (glibc x86_64).
+    #[test]
+    fn equal_width_signedness_is_carried() {
+        let i = views("signedness", ARM);
+        let (g, h) = (&i.arches["guest"], &i.arches["host"]);
+        let signed = |v: &ArchView| match v.functions["getnameinfo"].params[1].resolved() {
+            Ty::Int { bits: 32, signed, .. } => *signed,
+            t => panic!("{t:?}"),
+        };
+        assert_eq!((signed(g), signed(h)), (true, false));
+        let gni = row(&i, "getnameinfo");
+        assert_eq!(gni.kinds[2], Kind::Same);
+        assert!(gni.carried());
     }
 
     /// Red control: the guest parsed as the host's own data model -> every row Same, so the ILP32 expectations above fail.
