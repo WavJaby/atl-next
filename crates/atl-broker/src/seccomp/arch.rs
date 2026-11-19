@@ -11,7 +11,11 @@
 //! Kill mode, `test binder`: run 1 died at 444 (landlock_create_ruleset); 445/446 added with it (the next two calls of the same sequence, landlock-0.4.7 compat.rs) and prctl (its PR_SET_NO_NEW_PRIVS before restrict_self, errors.rs); run 2 passed with no record. openat/close of the stub's PathFds were already listed.
 //! Not measured, so killed: every path the gates do not reach, e.g. a panic's abort (rt_sigprocmask, tgkill) -- the panic message is written first, the abort ends as SIGSYS instead of SIGABRT.
 //! Re-measure after binderd or its Rust/glibc start code changes (a new call ends every gate with "binderd ended"); the procedure needs nothing but the filter and dmesg.
-//! Message sizes (2026-11-13, kill mode, same kernel; `xtask test binder` stage `sweep`): a message past two 32 KiB fragments (65536 payload bytes) takes a buffer glibc maps (128 KiB and up), and freeing it is munmap (11). With the list as it was, the sweep's put of 65536 bytes ended at munmap; with munmap, every sweep row passed, both directions and oneway, up to the region limit. mremap (25) and madvise (28) were not hit by that sweep, so they are not listed; a new call ends the sweep with dmesg naming it.
+//! Message sizes (2026-11-13, kill mode, same kernel; `xtask test binder` stage `sweep`): a message past two 32 KiB fragments (65536 payload bytes) takes a buffer glibc maps (128 KiB and up), and freeing it is munmap (11). With the list as it was, the sweep's put of 65536 bytes ended at munmap; with munmap, every sweep row passed, both directions and oneway, up to the region limit. madvise (28) was not hit by that sweep, so it is not listed; a new call ends the sweep with dmesg naming it.
+//! mremap (2026-11-20, WeChat 8.0.79 startup under run-apk, same kernel): binderd died with `type=1326 ... syscall=25` (rsi 0x21000 -> rdx 0x40000). Caller: binderd's own proto.rs Assembler, whose Vec grows by doubling
+//! from the first 32 KiB fragment; realloc of a glibc-mapped chunk is mremap. Whether a step is mapped depends on the heap's history (glibc's dynamic threshold, whether the heap top can extend), so
+//! the sweep does not reach it reliably; the unit test seccomp::tests::binderd_list_allows_a_largest_transaction_to_grow_a_mapped_buffer fixes the threshold in its child and is red without mremap.
+//! AOSP: servicemanager runs with no seccomp filter; its native-service minijail policies (mediaextractor, mediacodec, mediaswcodec, media.c2-default; x86_64) all list `mremap: 1`.
 
 use seccompiler::TargetArch;
 
@@ -47,6 +51,8 @@ pub const BINDERD_SYSCALLS: &[i64] = &[
     libc::SYS_brk,
     // free of a buffer glibc mapped (a message past 65536 bytes; header, 2026-11-13 sweep)
     libc::SYS_munmap,
+    // growth of a glibc-mapped reassembly buffer = realloc -> mremap (a large transaction; AOSP's native-service policies allow it; header, 2026-11-20)
+    libc::SYS_mremap,
     // start-up: the loader opening its closure, glibc and std init
     libc::SYS_execve,
     libc::SYS_openat,
