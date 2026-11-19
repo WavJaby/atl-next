@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_void};
 use std::sync::Mutex;
 
+pub use super::convert::{Conv, Field, Op, Word};
 use super::objects::{Class, Sig};
 use super::{Active, active, unsupported};
 
@@ -25,7 +26,7 @@ pub(crate) mod qemu_arm64 {
 #[allow(
     unused_imports,
     dead_code,
-    reason = "every arm row that would be lane-mapped traps until P5, so the mapped forwarder and its types go unused"
+    reason = "the arm table's JNI and callback rows trap until P5, so some converters (records whose every row waits on a handle) and lane-map types go unused"
 )]
 pub(crate) mod qemu_arm {
     include!(concat!(env!("OUT_DIR"), "/bindings_table_qemu_arm.rs"));
@@ -59,6 +60,10 @@ pub enum LaneMap {
     Env,
     /// a guest function pointer -> a host-callable down shell ([`Active::down`], plain kind) whose lanes follow this shorty; NULL stays NULL
     Down(&'static [u8]),
+    /// ILP32: a guest pointer to this record in the guest's layout -> a host temporary in the host's (convert.rs); `true`: converted back after the call. NULL stays NULL.
+    Record(&'static Conv, bool),
+    /// ILP32: a guest pointer to one word -> a host-width temporary, written back narrowed (convert.rs). NULL stays NULL.
+    OutWord(Word),
 }
 
 /// The table of the process's engine.
@@ -122,8 +127,8 @@ pub enum Entry {
     Generic(Host, &'static str, Sig),
     /// [`shim`] of the stub's name, of lanes `Sig` (`Sig::INT` but on an ILP32 guest's libc rows, build.rs `libc_entries`)
     Shim(Sig),
-    /// the lane-mapped class (build.rs `ENV_SHIMS`, `CALLBACKS`): `table::MAPPED_FNS[i]` maps the lanes `table::MAPPED_ROWS[i]` names and calls that symbol of the host library (ndk.rs `call_mapped`)
-    Mapped(usize),
+    /// the lane-mapped class (build.rs `ENV_SHIMS`, `CALLBACKS`, ILP32 record / out-word rows): `table::MAPPED_FNS[i]` maps the lanes `table::MAPPED_ROWS[i]` names and calls that symbol of the host library (ndk.rs `call_mapped`); the guest's lanes are placed by `Sig` (`Sig::INT` on LP64 tables: one word per lane either way; an ILP32 row the guest view's classes, so a narrow or double-word argument reaches its lane widened)
+    Mapped(usize, Sig),
     /// `table::TRAPS[i]`
     Trap(usize),
     /// an NBS stub variable (`uintptr_t name;`): it takes the value of this variable of that host library (opensl-es plan 2.2 item 6: `SL_IID_*`, a pointer to the host's IID; LP64 on both sides)
@@ -182,7 +187,7 @@ fn rows_of(t: Table) -> impl Iterator<Item = (&'static str, &'static str, Bindin
             let b = match e {
                 Entry::Generic(host, symbol, sig) => Binding::Generic { host, symbol, sig },
                 Entry::Shim(_) => Binding::Shim,
-                Entry::Mapped(i) => Binding::Mapped {
+                Entry::Mapped(i, _) => Binding::Mapped {
                     symbol: t.mapped_rows[i].1,
                     maps: t.mapped_rows[i].2,
                 },
@@ -363,9 +368,9 @@ pub fn target(soname: &str, name: &str) -> Option<Target> {
         Some(Entry::Generic(host, sym, sig)) => found(symbol(host, lib.soname, sym), sig),
         Some(Entry::Shim(sig)) => found(shim(name), sig),
         // its host symbol must be there too: the forwarder would abort at the first call otherwise
-        Some(Entry::Mapped(i)) => found(
+        Some(Entry::Mapped(i, sig)) => found(
             system_symbol(lib.soname, table.mapped_rows[i].1).map(|_| table.mapped_fns[i] as usize),
-            Sig::INT,
+            sig,
         ),
         // a variable is never a stub: [`variable`] resolves it
         Some(Entry::Variable(..)) => (Target::Absent, 3),

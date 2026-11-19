@@ -6,7 +6,7 @@
 //! The other arguments and the results are host values already: object references are the host's, and an AAssetManager, ANativeWindow or pixel pointer names host memory the guest reads in the same address space. Every row's lanes are ints, at most six (atl_bridgegen `jni::route` refuses the rest at build time), so one six-word forwarder serves all.
 
 use super::bindings::{self, LaneMap, MappedRow};
-use super::{jni, unsupported};
+use super::{convert, jni, unsupported};
 
 /// The forwarded host function: six int lanes (SysV's integer registers; a shorter prototype ignores the rest), one int result (a void one's is never read).
 type HostFn = unsafe extern "C" fn(usize, usize, usize, usize, usize, usize) -> usize;
@@ -18,8 +18,25 @@ pub(super) fn call_mapped((soname, symbol, maps): MappedRow, mut lanes: [usize; 
             "{symbol}: lane-mapped row with no {soname} in SYSTEM_LIB"
         ))
     });
+    // ILP32 temporaries: (lane, the guest pointer, its map, the host copy), written back after the call
+    let mut temps: Vec<(usize, usize, LaneMap, convert::Temp)> = Vec::new();
     for &(i, map) in maps {
         match map {
+            // SAFETY: lane `i` is the guest's non-NULL pointer to this record in its own layout (build.rs from the ILP32 classifier's kind of this parameter).
+            LaneMap::Record(c, _) if lanes[i] != 0 => {
+                let mut t = unsafe { convert::record_in(c, lanes[i]) };
+                let host = t.ptr() as usize;
+                temps.push((i, lanes[i], map, t));
+                lanes[i] = host;
+            }
+            // SAFETY: lane `i` is the guest's non-NULL pointer to one word of this kind (as above).
+            LaneMap::OutWord(w) if lanes[i] != 0 => {
+                let mut t = unsafe { convert::word_in(w, lanes[i]) };
+                let host = t.ptr() as usize;
+                temps.push((i, lanes[i], map, t));
+                lanes[i] = host;
+            }
+            LaneMap::Record(..) | LaneMap::OutWord(_) => {}
             // SAFETY: lane `i` is the guest's own `JNIEnv*` (made by jni.rs `guest_env`), as the NDK function receives it (build.rs proved the position from its prototype).
             LaneMap::Env => lanes[i] = unsafe { jni::host_env(lanes[i]) },
             // break `cb_down_skip` (app gate, rows looperNow / looperLater): the guest's own address reaches the host, which calls guest code natively (QEMU: AArch64 bytes run as x86-64)
@@ -35,5 +52,36 @@ pub(super) fn call_mapped((soname, symbol, maps): MappedRow, mut lanes: [usize; 
     // SAFETY: the host library's export of this name, whose prototype (the NDK header's) takes at most six int lanes and answers an int lane or void (route); extra lanes sit in registers it never reads.
     let f: HostFn = unsafe { std::mem::transmute(f) };
     // SAFETY: as above; every other lane is a host value in this address space, every mapped one the host's own.
-    unsafe { f(lanes[0], lanes[1], lanes[2], lanes[3], lanes[4], lanes[5]) }
+    let ret = unsafe { f(lanes[0], lanes[1], lanes[2], lanes[3], lanes[4], lanes[5]) };
+    for (i, guest, map, mut t) in temps {
+        // a refused host pointer is written NULL and counted (convert.rs); logged once per row
+        let ok = match map {
+            // SAFETY: `guest` is the guest's pointer read above, writable: a non-const pointee.
+            LaneMap::Record(c, true) => unsafe { convert::to_guest(c, t.ptr(), guest as *mut u8) },
+            // SAFETY: as above.
+            LaneMap::OutWord(w) => unsafe { convert::word_out(w, &mut t, guest) },
+            _ => true,
+        };
+        if !ok {
+            refused_once(symbol, i);
+        }
+    }
+    ret
+}
+
+/// Logs the first refused write-back per (symbol, lane): a host pointer at or above 4 GiB the 32-bit guest's word cannot hold.
+#[allow(
+    clippy::print_stderr,
+    reason = "once per row and lane, as dispatch.rs `ilp32_narrow`: the crate has no logger"
+)]
+fn refused_once(symbol: &'static str, lane: usize) {
+    static LOGGED: std::sync::Mutex<Vec<(&str, usize)>> = std::sync::Mutex::new(Vec::new());
+    if let Ok(mut l) = LOGGED.lock()
+        && !l.contains(&(symbol, lane))
+    {
+        l.push((symbol, lane));
+        eprintln!(
+            "atl-native-bridge: qemu crossing: refused a host pointer to the 32-bit guest from {symbol} parameter {lane} (at or above 4 GiB; written NULL)"
+        );
+    }
 }

@@ -1028,11 +1028,13 @@ const ILP32_EXPECTED: &[(&str, usize, &str)] = &[
     ("AAsset_getLength", 0, "widen:s"),
     ("AAsset_getLength", 1, "opaque"),
     // looper.h `int ALooper_pollOnce(int, int* outFd, int* outEvents, void** outData)`
-    ("ALooper_pollOnce", 4, "out-word"),
+    ("ALooper_pollOnce", 4, "out-word:ptr"),
     ("ALooper_pollOnce", 2, "ptr"),
-    // egl.h `EGLImage eglCreateImage(EGLDisplay, EGLContext, EGLenum, EGLClientBuffer, const EGLAttrib*)`
+    // egl.h `EGLImage eglCreateImage(EGLDisplay, EGLContext, EGLenum, EGLClientBuffer, const EGLAttrib*)`: an EGL_NONE-terminated list
     ("eglCreateImage", 1, "opaque"),
-    ("eglCreateImage", 5, "out-word"),
+    ("eglCreateImage", 5, "array"),
+    // jni.h `JNIEnv*` (AAssetManager_fromJava): P5's proxy object, not a record copy
+    ("AAssetManager_fromJava", 1, "jni"),
     // native_window.h `int32_t ANativeWindow_lock(ANativeWindow*, ANativeWindow_Buffer*, ARect*)`: ARect 16 bytes on both
     ("ANativeWindow_lock", 2, "record:ANativeWindow_Buffer"),
     ("ANativeWindow_lock", 3, "ptr"),
@@ -1175,6 +1177,83 @@ fn stub_rows(up: &Upstreams, guest: &Guest) -> Result<usize> {
             + var_names(up, soname, guest.proxy_isa)?.len();
     }
     Ok(n)
+}
+
+/// ILP32 record converters by record name ([`ilp32_maps`]): the converters, nested ones first, or why none (atl_bridgegen `ilp32::converters`).
+type Convs = std::collections::BTreeMap<String, Result<Vec<atl_bridgegen::ilp32::Conv>, String>>;
+
+/// The break cfg that swaps two guest offsets of the first generated converter (atl_bridgegen `ilp32::converters_rs`): its const assert fails the build.
+const CONV_SWAP_CFG: &str = "atl_nb_conv_swap";
+
+/// The lane maps of an ILP32 proxy row `row` (guest prototype `sig`) whose non-carried positions all convert: a `Record` pointer parameter with a converter (in; back out when the pointee is not const), an `OutWord` parameter; with its lanes literal (the guest view's classes). Records named by any position get their converters tried first (`convs`), whatever else blocks the row. Err: the trap reason -- the heaviest kind no converter takes, or a lane rule the six-int-lane forwarder (`jni::MAPPED_LANES`) cannot keep.
+fn ilp32_maps(
+    sig: &atl_bridgegen::ir::Signature,
+    row: &atl_bridgegen::ilp32::Row,
+    route: &Route,
+    qemu: bool,
+    views: &atl_bridgegen::ilp32::Views,
+    convs: &mut Convs,
+) -> std::result::Result<(Vec<(usize, LaneMap)>, String), &'static str> {
+    use atl_bridgegen::ilp32::Kind;
+    for k in &row.kinds {
+        if let Kind::Record(name) = k {
+            convs.entry(name.clone()).or_insert_with(|| {
+                atl_bridgegen::ilp32::converters(name, views).map_err(|e| format!("{e:#}"))
+            });
+        }
+    }
+    let mut maps = Vec::new();
+    let mut blocking: Option<&Kind> = None;
+    for (at, k) in row.kinds.iter().enumerate() {
+        let param = at.checked_sub(1);
+        let map = match (k, param) {
+            _ if k.carried() || (at == 0 && *k == Kind::PtrResult) => continue,
+            (Kind::OutWord(w), Some(p)) => Some((p, LaneMap::OutWord(*w))),
+            (Kind::Record(name), Some(p)) if matches!(convs.get(name), Some(Ok(_))) => {
+                match sig.params[p].resolved() {
+                    atl_bridgegen::ir::Ty::Pointer { is_const, .. } => Some((
+                        p,
+                        LaneMap::Record {
+                            name: name.clone(),
+                            out: !is_const,
+                        },
+                    )),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        match map {
+            Some(m) => maps.push(m),
+            None => {
+                if blocking.is_none_or(|b| k.weight() > b.weight()) {
+                    blocking = Some(k);
+                }
+            }
+        }
+    }
+    if let Some(k) = blocking {
+        return Err(k.trap_reason());
+    }
+    if !matches!(route, Route::Plain) {
+        return Err("pending: ilp32 converted row with a JNI or callback lane");
+    }
+    let (Ok(ret), Ok(params)) = (
+        atl_bridgegen::jni::result_class(&sig.ret),
+        atl_bridgegen::jni::param_classes(sig),
+    ) else {
+        return Err("pending: a record by value has no lane class");
+    };
+    if ret.is_fp()
+        || params.len() > atl_bridgegen::jni::MAPPED_LANES
+        || params.iter().any(|c| c.is_fp())
+    {
+        return Err("pending: ilp32 converted row past six int lanes");
+    }
+    if let Some(why) = atl_bridgegen::jni::lane_refusal(&params).filter(|_| qemu) {
+        return Err(why);
+    }
+    Ok((maps, sig_literal(ret, &params)))
 }
 
 /// The per-guest ILP32 rows of an unequal-data-model guest ([`bindings_table`]): (library, function, the row's kinds, what it waits for: `carried`, its heaviest kind's label, `variable` or `libc-unprototyped`) for every row not wholly `Same`.
@@ -1366,6 +1445,8 @@ fn bindings_table(
     let mut ilp32_rows: Ilp32Rows = Vec::new();
 
     let mut traps: Vec<(String, String, &'static str)> = Vec::new();
+    // ILP32 record converters by record name: the converters (nested first) or why none
+    let mut convs: Convs = std::collections::BTreeMap::new();
     let mut rows: Vec<(&str, Vec<(String, String)>)> = Vec::new();
     // `Entry::Mapped(i)` rows: library, name, the (parameter, map) pairs; and every prototype refused a row, named together in one build error
     let mut mapped_rows: Vec<MappedRow> = Vec::new();
@@ -1403,12 +1484,22 @@ fn bindings_table(
                 };
                 ilp32_rows.push(((*soname).to_owned(), name.clone(), row.describe(), waits));
             }
-            // ILP32: a row with a position its lane class cannot convert traps naming the conversion it waits for (p4b s2-s4), before any route: no truncated value passes
+            // ILP32: a row with a position its lane class cannot convert binds lane-mapped when every such position has a generated converter ([`ilp32_maps`]), else traps naming the conversion it waits for (p4b s3-s4), before any route: no truncated value passes
             let entry = if let Some(row) = ilp32.filter(|r| !r.carried()) {
-                trap(row.heaviest().trap_reason())
+                let sig = &guest_view.functions[name.as_str()];
+                match ilp32_maps(sig, row, &route, qemu, &views, &mut convs) {
+                    Ok((maps, lanes)) => {
+                        if let Some(last) = ilp32_rows.last_mut() {
+                            last.3 = "converted";
+                        }
+                        mapped_rows.push(((*soname).to_owned(), name.clone(), maps));
+                        format!("Entry::Mapped({}, {lanes})", mapped_rows.len() - 1)
+                    }
+                    Err(why) => trap(why),
+                }
             } else if let Route::Mapped(maps) = route {
                 mapped_rows.push(((*soname).to_owned(), name.clone(), maps));
-                format!("Entry::Mapped({})", mapped_rows.len() - 1)
+                format!("Entry::Mapped({}, Sig::INT)", mapped_rows.len() - 1)
             } else if let Route::Pending(why) = route {
                 trap(why)
             } else {
@@ -1622,6 +1713,19 @@ fn bindings_table(
             .map(|(i, m)| match m {
                 LaneMap::Env => format!("({i}, LaneMap::Env)"),
                 LaneMap::Down { shorty, .. } => format!("({i}, LaneMap::Down(b{shorty:?}))"),
+                LaneMap::Record { name, out } => {
+                    format!("({i}, LaneMap::Record(&C_{name}, {out}))")
+                }
+                LaneMap::OutWord(atl_bridgegen::ilp32::Word::Ptr) => {
+                    format!("({i}, LaneMap::OutWord(Word::Ptr))")
+                }
+                LaneMap::OutWord(atl_bridgegen::ilp32::Word::Int {
+                    guest,
+                    host,
+                    signed,
+                }) => format!(
+                    "({i}, LaneMap::OutWord(Word::Int {{ guest: {guest}, host: {host}, signed: {signed} }}))"
+                ),
             })
             .collect();
         code.push_str(&format!(
@@ -1636,6 +1740,32 @@ fn bindings_table(
         code.push_str(&format!("    mapped::<{i}>,\n"));
     }
     code.push_str("];\n");
+    // ILP32 record converters (atl_bridgegen ilp32 `converters`), each const-asserted; and why a record has none, in ilp32_rows.txt
+    let mut emitted = Vec::new();
+    for (record, c) in &convs {
+        match c {
+            Ok(list) => {
+                for c in list {
+                    if !emitted
+                        .iter()
+                        .any(|e: &atl_bridgegen::ilp32::Conv| e.name == c.name)
+                    {
+                        emitted.push(c.clone());
+                    }
+                }
+            }
+            Err(why) => ilp32_rows.push((
+                "-".to_owned(),
+                record.clone(),
+                format!("no converter: {why}"),
+                "record-unconverted",
+            )),
+        }
+    }
+    if !emitted.is_empty() {
+        code.push_str("\nuse super::{Conv, Field, Op, Word};\n\n");
+        code.push_str(&atl_bridgegen::ilp32::converters_rs(&emitted, CONV_SWAP_CFG));
+    }
     // one copy: sles.rs asserts against the arm64 QEMU table's, the one every core has (the layout is the host view's, the same for every table); an ILP32 guest's SL rows trap until P6
     if qemu && equal_model {
         code.push_str(&sl_layout);
@@ -1811,6 +1941,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("down_noenv", "atl_nb_down_noenv"),
     // p4b s3 (engine/dispatch.rs `HostRules::int_arg`): argument k is register k on every guest, AAPCS32's stack words ignored (unit test int_arg_follows_the_guest_rules)
     ("regs_k_raw", "atl_nb_regs_k_raw"),
+    // p4b s3c (generated `C_<record>` converters, [`CONV_SWAP_CFG`]): the first two guest offsets of the first converter swapped -> its const assert `Conv::ordered` fails the build
+    ("conv_swap", CONV_SWAP_CFG),
     // O1 (engine/sles.rs `create_audio_player`): the sink's OutputMix locator keeps the guest proxy, so the host gets a guest object (sles-bridge gate, check c)
     ("sles_raw_sink", "atl_nb_sles_raw_sink"),
     // O1 (engine/mod.rs `Active::down`): every down request takes a new shell (sles-bridge gate, check e)

@@ -180,6 +180,10 @@ pub enum LaneMap {
     Env,
     /// a guest function pointer of callback typedef `ty` -> a host-callable down shell entering the guest; `shorty`: its lanes in JNI shorty letters (result first; `J` int lane, `D` fp lane, `V` void), what the down shell places the arguments by
     Down { ty: String, shorty: String },
+    /// ILP32: a guest pointer to record `name` in the guest's layout -> a host temporary in the host's, converted in (`ilp32::converters`); `out`: converted back after the call (a non-const pointee)
+    Record { name: String, out: bool },
+    /// ILP32: a guest pointer to one word -> a host-width temporary, widened in and written back narrowed (`ilp32::Kind::OutWord`)
+    OutWord(crate::ilp32::Word),
 }
 
 /// How a proxy function binds, from its prototype ([`route`]).
