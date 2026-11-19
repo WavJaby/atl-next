@@ -20,16 +20,29 @@ pub enum Kind {
     Ptr,
     /// A data pointer the host answers: must point into guest-addressable memory.
     PtrResult,
-    /// A pointer to a scalar or pointer whose width differs (`size_t*`, `long*`, `void**`, `EGLAttrib*` arrays): the words are copied and resized.
-    OutWord,
-    /// A pointer to this record, whose layout differs: converted field by field.
+    /// A non-const pointer to one scalar or data pointer whose width differs (`size_t*`, `long*`, `void**`): a host-width temporary, read widened and written back narrowed.
+    OutWord(Word),
+    /// A const pointer to scalars or pointers whose width differs (`const EGLAttrib*`, `const char* const*`): an array whose length the header states in prose (a terminator, a count parameter), so no generic rule converts it.
+    Array,
+    /// A pointer to this record, whose layout differs: converted field by field ([`converters`]).
     Record(String),
+    /// jni.h's `JNIEnv*` / `JavaVM*` (records `_JNIEnv`, `_JavaVM`): the guest's proxy object stands for the host's (P5's JNI tables), never a record copy.
+    Jni,
     /// A pointer to an incomplete record or a handle typedef: a host handle the guest only names back.
     Opaque,
     /// A function pointer: a guest entry the host would call; its lanes as a JNI shorty.
     Callback(String),
     /// A `const char*` result: host text the guest reads.
     String,
+}
+
+/// The word behind an [`Kind::OutWord`] pointer, as the two sides hold it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Word {
+    /// An integer of `guest` / `host` bytes: widened by its signedness, written back truncated.
+    Int { guest: u8, host: u8, signed: bool },
+    /// A data pointer: zero-extended, written back refused at or above 4 GiB.
+    Ptr,
 }
 
 impl Kind {
@@ -45,8 +58,10 @@ impl Kind {
             Kind::Widen { .. } => "widen",
             Kind::Ptr => "ptr",
             Kind::PtrResult => "ptr-result",
-            Kind::OutWord => "out-word",
+            Kind::OutWord(_) => "out-word",
+            Kind::Array => "array",
             Kind::Record(_) => "record",
+            Kind::Jni => "jni",
             Kind::Opaque => "opaque",
             Kind::Callback(_) => "callback",
             Kind::String => "string",
@@ -60,9 +75,10 @@ impl Kind {
             Kind::String => 1,
             Kind::PtrResult => 2,
             Kind::Opaque => 3,
-            Kind::OutWord => 4,
+            Kind::OutWord(_) | Kind::Array => 4,
             Kind::Record(_) => 5,
-            Kind::Callback(_) => 6,
+            Kind::Jni => 6,
+            Kind::Callback(_) => 7,
         }
     }
 
@@ -71,8 +87,10 @@ impl Kind {
         match self {
             Kind::Same | Kind::Widen { .. } | Kind::Ptr => "carried",
             Kind::PtrResult => "pending: ilp32 ptr-result",
-            Kind::OutWord => "pending: ilp32 out-word",
+            Kind::OutWord(_) => "pending: ilp32 out-word",
+            Kind::Array => "pending: ilp32 array",
             Kind::Record(_) => "pending: ilp32 record",
+            Kind::Jni => "pending: ilp32 jni (P5)",
             Kind::Opaque => "pending: ilp32 opaque",
             Kind::Callback(_) => "pending: ilp32 callback",
             Kind::String => "pending: ilp32 string",
@@ -84,6 +102,10 @@ impl Kind {
         match self {
             Kind::Widen { signed } => format!("widen:{}", if *signed { "s" } else { "u" }),
             Kind::Record(name) => format!("record:{name}"),
+            Kind::OutWord(Word::Int { guest, host, signed }) => {
+                format!("out-word:{}{guest}>{host}", if *signed { "s" } else { "u" })
+            }
+            Kind::OutWord(Word::Ptr) => "out-word:ptr".to_owned(),
             Kind::Callback(shorty) => format!("callback:{shorty}"),
             k => k.label().to_owned(),
         }
@@ -240,12 +262,21 @@ fn position(
         }
         // a parameter of array type is a pointer to its element (NDK NdkMediaCrypto.h `const uint8_t uuid[16]`)
         (Ty::Array { elem: ge, .. }, Ty::Array { elem: he, .. }) if !result => {
-            pointee(ge, he, false, views)
+            pointee(ge, he, false, true, views)
         }
         (
-            Ty::Pointer { pointee: gp, .. } | Ty::Reference { pointee: gp, .. },
+            Ty::Pointer {
+                pointee: gp,
+                is_const,
+                ..
+            }
+            | Ty::Reference {
+                pointee: gp,
+                is_const,
+                ..
+            },
             Ty::Pointer { pointee: hp, .. } | Ty::Reference { pointee: hp, .. },
-        ) => pointee(gp, hp, result, views),
+        ) => pointee(gp, hp, result, *is_const, views),
         // a pointer in bionic, an integer in glibc (eglplatform.h `EGLNativePixmapType`): the guest passes a pointer
         (Ty::Pointer { pointee: gp, .. }, Ty::Int { .. })
             if !matches!(gp.resolved(), Ty::Function(_)) =>
@@ -256,11 +287,14 @@ fn position(
     }
 }
 
-/// The kind of a pointer position, by what it points to.
-fn pointee(gp: &Ty, hp: &Ty, result: bool, views: &Views) -> Result<Kind> {
+/// The kind of a pointer position, by what it points to; `konst`: a `const` pointee.
+fn pointee(gp: &Ty, hp: &Ty, result: bool, konst: bool, views: &Views) -> Result<Kind> {
     let data = if result { Kind::PtrResult } else { Kind::Ptr };
     Ok(match (gp.resolved(), hp.resolved()) {
         (Ty::Function(sig), Ty::Function(_)) => Kind::Callback(crate::jni::shorty(sig)?),
+        (Ty::Record { name } | Ty::Opaque { name, .. }, _) if JNI_RECORDS.contains(&name.as_str()) => {
+            Kind::Jni
+        }
         _ if untyped(gp, views.guest) && !matches!(gp.resolved(), Ty::Void)
             || untyped(hp, views.host) && !matches!(hp.resolved(), Ty::Void) =>
         {
@@ -271,12 +305,32 @@ fn pointee(gp: &Ty, hp: &Ty, result: bool, views: &Views) -> Result<Kind> {
         _ if both_records(gp, hp, views).is_some() => {
             Kind::Record(both_records(gp, hp, views).unwrap_or_default())
         }
-        (
-            Ty::Int { .. } | Ty::Pointer { .. } | Ty::Typedef { .. },
-            Ty::Int { .. } | Ty::Pointer { .. },
-        ) => Kind::OutWord,
+        (Ty::Int { .. } | Ty::Pointer { .. }, Ty::Int { .. } | Ty::Pointer { .. }) if konst => {
+            Kind::Array
+        }
+        (&Ty::Int { bits: g, signed, .. }, &Ty::Int { bits: h, .. }) => Kind::OutWord(Word::Int {
+            guest: (g / 8) as u8,
+            host: (h / 8) as u8,
+            signed,
+        }),
+        (Ty::Pointer { pointee: gi, .. }, Ty::Pointer { pointee: hi, .. }) => {
+            out_pointer(gp, gi, hi, views)
+        }
         _ => bail!("unclassified ILP32 pointee: guest {gp:?} vs host {hp:?}"),
     })
+}
+
+/// jni.h's env and vm records (C++: `struct _JNIEnv`, `struct _JavaVM`): [`Kind::Jni`].
+const JNI_RECORDS: &[&str] = &["_JNIEnv", "_JavaVM"];
+
+/// The kind of a non-const pointer to a pointer (`gp`, pointing to `gi` / `hi`): [`Word::Ptr`] when what it points to reads the same on both sides or is `void`; else the word the host writes names host memory the guest cannot read as it is -- a handle typedef, an incomplete record, a function, host records of the host's layout -- which is a host object the guest only names back ([`Kind::Opaque`], P4b s4's handles).
+fn out_pointer(gp: &Ty, gi: &Ty, hi: &Ty, views: &Views) -> Kind {
+    let readable = matches!(gi.resolved(), Ty::Void) || same(gi, views.guest, hi, views.host, false);
+    if handle(gp, views.handles).is_none() && readable {
+        Kind::OutWord(Word::Ptr)
+    } else {
+        Kind::Opaque
+    }
 }
 
 /// `a` (of `va`) and `b` (of `vb`) are ABI-identical: same widths, same record layouts all the way down; behind a pointer (`top` false) an integer's signedness is not part of the ABI (plain `char` is unsigned on arm, signed on x86), at the top it says how a register is extended.
@@ -422,6 +476,193 @@ fn both_records(g: &Ty, h: &Ty, views: &Views) -> Option<String> {
     complete(g, views.guest)
 }
 
+/// How one field crosses between the guest's and the host's layout of a record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Op {
+    /// The same bytes on both sides (same layout all the way down).
+    Copy { bytes: u64 },
+    /// An integer of `guest` / `host` bytes: widened by signedness in, truncated out.
+    Int { guest: u64, host: u64, signed: bool },
+    /// A data pointer whose pointee reads the same on both sides (or `void`): zero-extended in, refused at or above 4 GiB out.
+    Ptr { guest: u64, host: u64 },
+    /// A nested record by value whose layout differs: its own converter.
+    Record(String),
+    /// `len` elements converted one by one, each `guest` / `host` bytes apart.
+    Array { len: u64, elem: Box<Op>, guest: u64, host: u64 },
+}
+
+/// One field of a [`Conv`]: its offsets on both sides, its alignment on both sides (the view's, for the build-time check), and how it crosses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldConv {
+    pub name: String,
+    pub guest_offset: u64,
+    pub host_offset: u64,
+    pub guest_align: u64,
+    pub host_align: u64,
+    pub op: Op,
+}
+
+/// A record's converter, derived from the two views: guest and host size, and every field in declaration order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conv {
+    pub name: String,
+    pub guest_size: u64,
+    pub host_size: u64,
+    pub fields: Vec<FieldConv>,
+}
+
+/// The converters for record `name` and every nested record it holds by value whose layout differs, nested ones first. Err names the field no rule converts: a union (which member is live is the program's knowledge), a bit-field, a function pointer (a guest entry: a down shell, not a copy), a pointer to a record whose layout differs (a deep copy whose ownership the header states in prose), or a field list that differs.
+pub fn converters(name: &str, views: &Views) -> Result<Vec<Conv>> {
+    let mut out = Vec::new();
+    conv_into(name, views, &mut out)?;
+    Ok(out)
+}
+
+fn conv_into(name: &str, views: &Views, out: &mut Vec<Conv>) -> Result<()> {
+    if out.iter().any(|c| c.name == name) {
+        return Ok(());
+    }
+    let (Some(g), Some(h)) = (layout(views.guest, name), layout(views.host, name)) else {
+        bail!("{name}: incomplete in one view");
+    };
+    ensure!(
+        g.kind == crate::ir::RecordKind::Struct,
+        "{name}: a union, whose live member only the program knows"
+    );
+    ensure!(
+        g.fields.len() == h.fields.len(),
+        "{name}: {} guest fields, {} host fields",
+        g.fields.len(),
+        h.fields.len()
+    );
+    let mut fields = Vec::new();
+    for (gf, hf) in g.fields.iter().zip(&h.fields) {
+        ensure!(gf.name == hf.name, "{name}: field {} vs {}", gf.name, hf.name);
+        ensure!(
+            gf.bits.is_none() && hf.bits.is_none(),
+            "{name}.{}: a bit-field",
+            gf.name
+        );
+        let op = field_op(&gf.ty, &hf.ty, views, out).with_context(|| format!("{name}.{}", gf.name))?;
+        fields.push(FieldConv {
+            name: gf.name.clone(),
+            guest_offset: gf.offset,
+            host_offset: hf.offset,
+            guest_align: size_align(&gf.ty, views.guest)?.1,
+            host_align: size_align(&hf.ty, views.host)?.1,
+            op,
+        });
+    }
+    out.push(Conv {
+        name: name.to_owned(),
+        guest_size: g.size,
+        host_size: h.size,
+        fields,
+    });
+    Ok(())
+}
+
+/// The op of a field typed `g` in the guest view and `h` in the host view.
+fn field_op(g: &Ty, h: &Ty, views: &Views, out: &mut Vec<Conv>) -> Result<Op> {
+    if same(g, views.guest, h, views.host, false) {
+        let (gs, _) = size_align(g, views.guest)?;
+        return Ok(Op::Copy { bytes: gs });
+    }
+    Ok(match (g.resolved(), h.resolved()) {
+        (&Ty::Int { bits: gb, signed, .. }, &Ty::Int { bits: hb, .. }) => Op::Int {
+            guest: u64::from(gb / 8),
+            host: u64::from(hb / 8),
+            signed,
+        },
+        (
+            Ty::Pointer { pointee: gp, bits: gb, .. },
+            Ty::Pointer { pointee: hp, bits: hb, .. },
+        ) => {
+            ensure!(!matches!(gp.resolved(), Ty::Function(_)), "a function pointer (a guest entry)");
+            let readable = untyped(gp, views.guest) || untyped(hp, views.host) || same(gp, views.guest, hp, views.host, false);
+            ensure!(readable, "a pointer to {gp:?}, whose layout differs (a deep copy)");
+            Op::Ptr {
+                guest: u64::from(gb / 8),
+                host: u64::from(hb / 8),
+            }
+        }
+        (Ty::Record { name } | Ty::Opaque { name, .. }, Ty::Record { .. } | Ty::Opaque { .. }) => {
+            conv_into(name, views, out)?;
+            Op::Record(name.clone())
+        }
+        (Ty::Array { elem: ge, len: gl }, Ty::Array { elem: he, len: hl }) if gl == hl => Op::Array {
+            len: *gl,
+            elem: Box::new(field_op(ge, he, views, out)?),
+            guest: size_align(ge, views.guest)?.0,
+            host: size_align(he, views.host)?.0,
+        },
+        _ => bail!("no field rule: guest {g:?} vs host {h:?}"),
+    })
+}
+
+/// Size and alignment of `ty` in `v`: scalars are their own size and alignment (AAPCS32 and SysV x86_64 alike: natural alignment, 8-byte types 8-aligned), records the view's layout.
+fn size_align(ty: &Ty, v: &ArchView) -> Result<(u64, u64)> {
+    Ok(match ty.resolved() {
+        Ty::Bool => (1, 1),
+        Ty::Int { bits, .. } | Ty::Float { bits } | Ty::Pointer { bits, .. } | Ty::Reference { bits, .. } => {
+            (u64::from(bits / 8), u64::from(bits / 8))
+        }
+        Ty::Record { name } | Ty::Opaque { name, .. } => {
+            let r = layout(v, name).with_context(|| format!("{name}: incomplete"))?;
+            (r.size, r.align)
+        }
+        Ty::Array { elem, len } => {
+            let (s, a) = size_align(elem, v)?;
+            (s * len, a)
+        }
+        t => bail!("no size for {t:?}"),
+    })
+}
+
+/// `converters` as Rust consts for the engine (`engine/convert.rs` types `Conv`, `Field`, `Op`): one `pub const C_<record>: Conv` each, then a const assert per record that its fields sit in declaration order on each side, within the size and at their alignment (C11 6.7.2.1p15: members at increasing addresses) -- the check a swapped or hand-edited offset fails at build time. `swap`: the cfg name of the red control that swaps the first two guest offsets of the first record with two fields.
+pub fn converters_rs(convs: &[Conv], swap: &str) -> String {
+    fn op_rs(op: &Op) -> String {
+        match op {
+            Op::Copy { bytes } => format!("Op::Copy({bytes})"),
+            Op::Int { guest, host, signed } => format!("Op::Int {{ guest: {guest}, host: {host}, signed: {signed} }}"),
+            Op::Ptr { guest, host } => format!("Op::Ptr {{ guest: {guest}, host: {host} }}"),
+            Op::Record(n) => format!("Op::Record(&C_{n})"),
+            Op::Array { len, elem, guest, host } => {
+                format!("Op::Array {{ len: {len}, elem: &{}, guest: {guest}, host: {host} }}", op_rs(elem))
+            }
+        }
+    }
+    let mut s = String::new();
+    let swapped = convs.iter().position(|c| c.fields.len() >= 2);
+    for (ci, c) in convs.iter().enumerate() {
+        s.push_str(&format!(
+            "/// `{}`: guest {} bytes, host {} bytes (bridgegen ilp32 `converters`).\npub const C_{}: Conv = Conv {{\n    name: {:?},\n    guest_size: {},\n    host_size: {},\n    fields: &[\n",
+            c.name, c.guest_size, c.host_size, c.name, c.name, c.guest_size, c.host_size
+        ));
+        for (fi, f) in c.fields.iter().enumerate() {
+            let guest_offset = if Some(ci) == swapped && fi < 2 {
+                let other = c.fields[1 - fi].guest_offset;
+                format!("if cfg!({swap}) {{ {other} }} else {{ {} }}", f.guest_offset)
+            } else {
+                f.guest_offset.to_string()
+            };
+            s.push_str(&format!(
+                "        Field {{ name: {:?}, guest_offset: {guest_offset}, host_offset: {}, guest_align: {}, host_align: {}, op: {} }},\n",
+                f.name,
+                f.host_offset,
+                f.guest_align,
+                f.host_align,
+                op_rs(&f.op)
+            ));
+        }
+        s.push_str(&format!(
+            "    ],\n}};\nconst _: () = assert!(C_{0}.ordered(true) && C_{0}.ordered(false), \"C_{0}: a field out of declaration order, overlapping, past the size or misaligned\");\n\n",
+            c.name
+        ));
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -456,7 +697,9 @@ int getnameinfo(const struct sockaddr* sa, socklen_t sa_len, char* host, size_t 
 struct VaUser { int (*f)(void* p, __builtin_va_list ap); };\n\
 int va_user(struct VaUser* u);\n\
 int use_object(jobject o);\n\
-int va_fn(const char* fmt, __builtin_va_list ap);\n";
+int va_fn(const char* fmt, __builtin_va_list ap);\n\
+int out_display(EGLDisplay* out);\n\
+struct _JNIEnv { const void* functions; };\nint env_user(struct _JNIEnv* env);\n";
 
     /// Defined outside the interface (`Ty::Opaque` + `ArchView::foreign`). `union sigval`: bionic uapi asm-generic/siginfo.h `{ int sival_int; void* sival_ptr; }`. `struct sockaddr`: bionic linux/socket.h `{ sa_family_t sa_family; char sa_data[14]; }`, 16 bytes on both. `socklen_t`: bionic sys/types.h `__kernel_socklen_t` = int; glibc bits/types.h `__socklen_t` = unsigned int.
     const OTHER: &str = "union sigval { int sival_int; void* sival_ptr; };\n\
@@ -563,8 +806,11 @@ struct _jobject {};\ntypedef struct _jobject* jobject;\n\
             row(&i, "AAsset_getLength64").kinds,
             vec![Kind::Same, Kind::Opaque]
         );
-        // void** outData: a pointer-width word behind a pointer
-        assert_eq!(row(&i, "ALooper_pollOnce").kinds[4], Kind::OutWord);
+        // void** outData: a pointer-width word behind a non-const pointer
+        assert_eq!(
+            row(&i, "ALooper_pollOnce").kinds[4],
+            Kind::OutWord(Word::Ptr)
+        );
         // int* outFd: 4-byte int behind a pointer, same in both
         assert_eq!(row(&i, "ALooper_pollOnce").kinds[2], Kind::Ptr);
         let img = row(&i, "eglCreateImage");
@@ -577,7 +823,7 @@ struct _jobject {};\ntypedef struct _jobject* jobject;\n\
                 Kind::Opaque,
                 Kind::Same,
                 Kind::Opaque,
-                Kind::OutWord
+                Kind::Array
             ]
         );
         let lock = row(&i, "ANativeWindow_lock");
@@ -602,7 +848,18 @@ struct _jobject {};\ntypedef struct _jobject* jobject;\n\
                 Kind::Widen { signed: false }
             ]
         );
-        assert_eq!(row(&i, "pthread_attr_getstacksize").kinds[2], Kind::OutWord);
+        // size_t*: 4 bytes unsigned in bionic arm, 8 in glibc x86_64
+        assert_eq!(
+            row(&i, "pthread_attr_getstacksize").kinds[2],
+            Kind::OutWord(Word::Int {
+                guest: 4,
+                host: 8,
+                signed: false
+            })
+        );
+        // EGLDisplay*: a handle the host writes (P4b s4)
+        assert_eq!(row(&i, "out_display").kinds[1], Kind::Opaque);
+        assert_eq!(row(&i, "env_user").kinds[1], Kind::Jni);
         assert_eq!(row(&i, "AAsset_name").kinds[0], Kind::String);
         assert_eq!(
             row(&i, "ALooper_addFd").kinds[4],
@@ -610,7 +867,41 @@ struct _jobject {};\ntypedef struct _jobject* jobject;\n\
         );
         assert!(row(&i, "sum").same());
         assert!(!row(&i, "ANativeWindow_lock").carried());
-        assert!(row(&i, "ALooper_pollOnce").heaviest() == &Kind::OutWord);
+        assert!(row(&i, "ALooper_pollOnce").heaviest() == &Kind::OutWord(Word::Ptr));
+    }
+
+    /// The brief's gate numbers: `ANativeWindow_Buffer` guest offsets {0,4,8,12,16,20} size 44 (four int32, a 4-byte pointer, uint32[6]: AAPCS32 natural alignment) vs host {0,4,8,12,16,24} size 48 (the pointer 8-aligned and 8 wide); `bits` crosses as a pointer, the rest as copies.
+    #[test]
+    fn window_buffer_converter() {
+        let i = views("conv", ARM);
+        let (g, h) = (&i.arches["guest"], &i.arches["host"]);
+        let v = Views {
+            guest: g,
+            host: h,
+            handles: HANDLES,
+        };
+        let c = converters("ANativeWindow_Buffer", &v).unwrap();
+        assert_eq!(c.len(), 1);
+        let c = &c[0];
+        assert_eq!((c.guest_size, c.host_size), (44, 48));
+        let offs: Vec<(u64, u64)> = c.fields.iter().map(|f| (f.guest_offset, f.host_offset)).collect();
+        assert_eq!(offs, [(0, 0), (4, 4), (8, 8), (12, 12), (16, 16), (20, 24)]);
+        assert_eq!(c.fields[4].op, Op::Ptr { guest: 4, host: 8 });
+        assert_eq!(c.fields[5].op, Op::Copy { bytes: 24 });
+        // timespec {time_t, long}: two widened longs (4 -> 8, signed)
+        let t = &converters("timespec", &v).unwrap()[0];
+        assert_eq!(
+            t.fields[1].op,
+            Op::Int {
+                guest: 4,
+                host: 8,
+                signed: true
+            }
+        );
+        // a union has no field rule
+        assert!(converters("sigval", &v).is_err());
+        let rs = converters_rs(std::slice::from_ref(c), "swap_cfg");
+        assert!(rs.contains("guest_offset: if cfg!(swap_cfg) { 4 } else { 0 }"), "{rs}");
     }
 
     /// Records another header defines compare by layout, never by name: `union sigval` is 4 bytes on arm (int / 4-byte pointer) and 8 on x86_64, so by value it is a record; `struct sockaddr` is 16 bytes in both, so a pointer to it is a plain data pointer.
