@@ -393,7 +393,8 @@ mod tests {
 
     #[test]
     fn the_script_parses() {
-        red(&format!("{GOOD}tap 1\n"), "script line 8");
+        // GOOD is 8 lines: the bad step is line 9
+        red(&format!("{GOOD}tap 1\n"), "script line 9");
     }
 
     #[test]
