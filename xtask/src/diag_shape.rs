@@ -38,6 +38,11 @@ const OTHER_SUBJECT: &[(&str, &str, &str)] = &[
         "invalid shared buffer alignment; refused",
         "shared-memory layout fault of an audio track, not a call's answer",
     ),
+    (
+        "crates/atl-native-bridge/src/engine/dispatch.rs",
+        "refused a host pointer",
+        "QEMU crossing ABI event (a host pointer a 32-bit guest word cannot hold), counted in ILP32_REFUSED; no Android API call",
+    ),
 ];
 
 pub fn check(root: &Path) -> Result<()> {
