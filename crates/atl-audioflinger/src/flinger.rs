@@ -338,7 +338,8 @@ impl IAudioFlingerService for AudioFlinger {
             r#flags: request.flags & !AUDIO_OUTPUT_FLAG_FAST,
             r#frameCount: frames as i64,
             r#notificationFrameCount: notification,
-            r#selectedDeviceIds: Some(Vec::new()),
+            // the device getOutputForAttr routes to: the one output's speaker (policy.rs)
+            r#selectedDeviceIds: Some(vec![crate::policy::SPEAKER_PORT_ID]),
             r#sessionId: session,
             r#sampleRate: track_rate as i32,
             r#streamType: AudioStreamType::MUSIC,

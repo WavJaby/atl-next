@@ -473,6 +473,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "zen: " + zen());
         Log.i("AtlTest", "receiver: " + receiverInfo());
         Log.i("AtlTest", "installer: " + installerSessions());
+        Log.i("AtlTest", "audiodevices: " + audioDevices());
         Log.i("AtlTest", "appops: " + appOps());
         Log.i("AtlTest", "jobscheduler: " + jobs());
         Log.i("AtlTest", "queryservices: " + queryServices());
@@ -1167,6 +1168,20 @@ public class Main extends Activity {
             return "my=" + pi.getMySessions().size() + " all=" + pi.getAllSessions().size() + " info=" + pi.getSessionInfo(1);
         } catch (Throwable t) {
             return "threw " + t.getClass().getSimpleName();
+        }
+    }
+
+    /** AudioManager's device view: the output devices' types (getDevices, from the policy's port list), whether any input exists, and the A2DP check (AudioSystem.getDeviceConnectionState). */
+    private String audioDevices() {
+        try {
+            AudioManager am = getSystemService(AudioManager.class);
+            StringBuilder types = new StringBuilder();
+            for (android.media.AudioDeviceInfo d : am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+                types.append(types.length() == 0 ? "" : ",").append(d.getType()).append(d.isSink() ? "" : "!sink");
+            }
+            return "outputs=[" + types + "] inputs=" + am.getDevices(AudioManager.GET_DEVICES_INPUTS).length + " a2dp=" + am.isBluetoothA2dpOn();
+        } catch (Throwable t) {
+            return "threw " + t;
         }
     }
 

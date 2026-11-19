@@ -217,7 +217,10 @@ const MEDIAPLAYER_START: &str = "MediaPlayerNative: start called in state 1";
 /// ApplicationPackageManager.getReceiverInfo turns into NameNotFoundException. A service without the method answers null for both: `own=threw NameNotFoundException`.
 /// installer: Main.installerSessions: IPackageManagerBase.getPackageInstaller:599 answers the installer service; with no session PackageInstallerService.getMySessions:1374 and getAllSessions:1354
 /// are empty and getSessionInfo:1324 null. A service without getPackageInstaller answers null, and PackageInstaller's first call throws NullPointerException.
-const SERVICE_LINES: [(&str, &str, Option<&str>); 13] = [
+/// audiodevices: Main.audioDevices: the app's AudioPolicyService (atl-audioflinger policy.rs) lists one device port, the speaker (AudioPolicyManager::listAudioPorts:5275; AudioDeviceInfo.TYPE_BUILTIN_SPEAKER 2,
+/// a sink), no input; A2DP is not connected (getDeviceConnectionState:523 UNAVAILABLE). Without listAudioPorts, AudioManager.updateAudioPortCache fails and getDevices answers no device: `outputs=[]`.
+const SERVICE_LINES: [(&str, &str, Option<&str>); 14] = [
+    ("audio", "AtlTest: audiodevices: ", Some("outputs=[2] inputs=0 a2dp=false")),
     ("package", "AtlTest: installer: ", Some("my=0 all=0 info=null")),
     (
         "package",
