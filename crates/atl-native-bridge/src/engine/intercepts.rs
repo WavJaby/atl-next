@@ -302,7 +302,31 @@ pub(super) extern "C" fn pthread_key_create(key: *mut libc::pthread_key_t, dtor:
     rc
 }
 
-/// `int pthread_getattr_np(pthread_t, pthread_attr_t*)`: `attr` initialised and set to the stack the thread's guest code runs on (bionic's contract: sp inside `[base, base + size)`, guard size below), for either handle the guest holds (its `pthread_self` record or its `pthread_create` out-handle; thread.rs `stack_of`). ESRCH for a handle of no attached thread. Other attr fields stay glibc's defaults.
+/// Whether the guest thread `handle` is detached, from glibc's join state (a guest `pthread_create` with a detached attr and a guest `pthread_detach` both reach glibc's): bionic's pthread_getattr_np reports its own join state the same way. The calling thread asks glibc by `pthread_self` (a new thread can ask before its creator recorded glibc's handle, thread.rs `started`). False for another thread glibc has no handle for yet.
+fn is_detached(handle: usize) -> bool {
+    let g = if thread::is_current(handle) {
+        // SAFETY: no preconditions.
+        unsafe { libc::pthread_self() }
+    } else {
+        match thread::glibc_of(handle) {
+            Some(g) => g,
+            None => return false,
+        }
+    };
+    let mut attr = std::mem::MaybeUninit::<libc::pthread_attr_t>::uninit();
+    // SAFETY: `g` is a live glibc thread (the guest holds its handle); `attr` is ours, destroyed after its one read.
+    unsafe {
+        if libc::pthread_getattr_np(g, attr.as_mut_ptr()) != 0 {
+            return false;
+        }
+        let mut state = libc::PTHREAD_CREATE_JOINABLE;
+        pthread_attr_getdetachstate(attr.as_ptr(), &mut state);
+        libc::pthread_attr_destroy(attr.as_mut_ptr());
+        state == libc::PTHREAD_CREATE_DETACHED
+    }
+}
+
+/// `int pthread_getattr_np(pthread_t, pthread_attr_t*)`: `attr` initialised and set to the stack the thread's guest code runs on (bionic's contract: sp inside `[base, base + size)`, guard size below), and to the thread's join state ([`is_detached`]), for either handle the guest holds (its `pthread_self` record or its `pthread_create` out-handle; thread.rs `stack_of`). ESRCH for a handle of no attached thread. Other attr fields stay glibc's defaults.
 pub(super) extern "C" fn pthread_getattr_np(
     thread: libc::pthread_t,
     attr: *mut libc::pthread_attr_t,
@@ -310,11 +334,17 @@ pub(super) extern "C" fn pthread_getattr_np(
     let Some(s) = thread::stack_of(thread as usize) else {
         return libc::ESRCH;
     };
+    let detached = is_detached(thread as usize);
     if bionic_attr() {
         use qemu_arm::pthread_attr_t as a;
-        // bionic's pthread_getattr_np copies the thread's attr: joinable, SCHED_NORMAL (0) at priority 0, the stack and guard; every field a 4-byte word (`arm_attr_field`)
+        // bionic's pthread_getattr_np copies the thread's attr: its join state, SCHED_NORMAL (0) at priority 0, the stack and guard; every field a 4-byte word (`arm_attr_field`)
+        let flags = if detached {
+            qemu_arm::PTHREAD_ATTR_FLAG_DETACHED as usize
+        } else {
+            0
+        };
         let fields = [
-            (a::flags, 0),
+            (a::flags, flags),
             (a::stack_base, s.base),
             (a::stack_size, s.len),
             (a::guard_size, s.guard),
@@ -341,6 +371,12 @@ pub(super) extern "C" fn pthread_getattr_np(
         let rc = libc::pthread_attr_setstack(attr, s.base as *mut c_void, s.len);
         if rc != 0 {
             return rc;
+        }
+        if detached {
+            let rc = libc::pthread_attr_setdetachstate(attr, libc::PTHREAD_CREATE_DETACHED);
+            if rc != 0 {
+                return rc;
+            }
         }
         libc::pthread_attr_setguardsize(attr, s.guard)
     }

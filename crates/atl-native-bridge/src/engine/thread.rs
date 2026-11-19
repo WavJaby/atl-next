@@ -191,6 +191,11 @@ pub fn stack_of(handle: usize) -> Option<Stack> {
     with_thread(handle, |t| t.stack).flatten()
 }
 
+/// Whether `handle` names the calling thread (its record; [`record_of`] for a 32-bit guest's sign-extended handle).
+pub fn is_current(handle: usize) -> bool {
+    record_of(handle) == current()
+}
+
 /// glibc's `pthread_t` of the guest thread `handle`; None for a handle of no guest thread (the row answers ESRCH, as bionic does for an unknown handle).
 pub fn glibc_of(handle: usize) -> Option<libc::pthread_t> {
     with_thread(handle, |t| t.glibc as libc::pthread_t).filter(|&g| g != 0)
