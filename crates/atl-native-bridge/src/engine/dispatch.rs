@@ -334,7 +334,7 @@ fn down_body(slot: usize, host: &mut AtlLanes) {
     };
     let rules = super::qemu::arch().rules();
     let Some(mut guest) = place(&d.params, host, HOST, rules) else {
-        refuse_down(d.target)
+        refuse_down(d.target, &d.params)
     };
     // the first argument of a JNI method, of JNI_OnLoad or of an SL callback is a host env, vm or interface: the guest's own object stands for it (jni.rs, sles.rs), and it is the first integer, in x0; an slObjectCallback's 6th is the 6th integer, in x5
     #[cfg(not(atl_nb_down_noenv))]
@@ -709,12 +709,14 @@ fn host_ret32(ret: Class, r: [u64; 2]) -> Answer {
     Answer { x0, x1: 0, v0 }
 }
 
-/// Refuses a down call whose host arguments need more than eight stack words (R-1, Q6-4): the lane image cannot carry them. Named and counted: a shorty this size fails on every call, so the count says how often it was asked.
-fn refuse_down(target: usize) -> ! {
+/// Refuses a down call whose host arguments need more than eight stack words (R-1, Q6-4): the lane image cannot carry them. Named and counted: a shorty this size fails on every call, so the count says how often it was asked; the integer / fp argument counts size the call.
+fn refuse_down(target: usize, params: &[Class]) -> ! {
     static REFUSED: AtomicUsize = AtomicUsize::new(0);
     let n = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+    let ints = params.iter().filter(|c| c.is_int()).count();
+    let fps = params.iter().filter(|c| c.is_fp()).count();
     unsupported(&format!(
-        "qemu crossing: refused down call to {target:#x}: its arguments need more than eight stack words, the lane image holds eight (R-1, refusals: {n})"
+        "qemu crossing: refused down call to {target:#x} ({ints} integer, {fps} fp arguments): its arguments need more than eight stack words, the lane image holds eight (R-1, refusals: {n})"
     ))
 }
 
