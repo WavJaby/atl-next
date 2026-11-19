@@ -304,7 +304,7 @@ static LISTS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 ///
 /// # Safety
 /// `h` is a node of a glibc getaddrinfo list, alive while the answer is used.
-unsafe fn node_parts<'a>(h: &'a libc::addrinfo) -> (&'a [u8], &'a [u8]) {
+unsafe fn node_parts(h: &libc::addrinfo) -> (&[u8], &[u8]) {
     let addr: &[u8] = if h.ai_addr.is_null() {
         &[]
     } else {
