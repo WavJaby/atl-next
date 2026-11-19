@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! aarch64-linux-user: the guest registers, AAPCS64 guest calls and the command line of the engine `.so`.
 
-use atl_engine_api::AtlLanes;
+use atl_engine_api::{AtlLanes, LANE_STACK};
 
 use super::{Env, Guest, lib, page, ret_stub};
 
@@ -27,8 +27,8 @@ const ZREGS: usize = crate::layout::ATL_OFFSET_ZREGS as usize;
 const ZREG_SIZE: usize = crate::layout::ATL_SIZEOF_ZREG as usize;
 const ZREG_D: usize = crate::layout::ATL_OFFSET_ZREG_D as usize;
 const _: () = assert!(ZREGS + 32 * ZREG_SIZE <= Env::SIZE);
-/// Stack slots of the lanes' window this target reads and writes: eight 8-byte words, the window's size before 4.0 (the gates' expectations).
-const STACK_SLOTS: usize = 8;
+/// Stack slots of the lanes' window this target reads and writes: the whole bank, sixteen 8-byte words (as arm.rs). Eight refused Candy Crush Saga's 17-integer JNI method (nine AAPCS64 stack words past x0..x7).
+const STACK_SLOTS: usize = LANE_STACK;
 
 impl Guest {
     /// x<i> (0..=30), or sp for 31.
@@ -153,7 +153,7 @@ impl Guest {
         // break `call-stack` (qemu-abi gate, check d): the stack words are not written, so the callee's stack arguments are what lies at sp
         if !cfg!(atl_qe_call_stack) {
             for (i, w) in lanes.stack[..STACK_SLOTS].iter().enumerate() {
-                // SAFETY: sp..sp+64 lies in the CPU's guest stack below the interrupted sp, where the callee's own frame goes too; the host address is mapped (identity).
+                // SAFETY: sp..sp+128 (16 words) lies within the 256-byte margin in the CPU's guest stack below the interrupted sp, where the callee's own frame goes too; the host address is mapped (identity).
                 unsafe { (self.host_addr(sp + 8 * i as u64) as *mut u64).write_unaligned(*w) };
             }
         }

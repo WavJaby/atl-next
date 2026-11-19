@@ -137,7 +137,7 @@ fn check_sum(sum: u64) -> Result<(), String> {
     same("qa_sum v0 bits", lanes.fp[0], SUM_EXPECT.to_bits())
 }
 
-/// Check e: `qa_edge` with its sp 16 bytes below the end of the first host page, only that page mapped. Words 0 and 1 are the stored pair; words 2..8 lie past the mapped page and must read 0, not [`MARKER`].
+/// Check e: `qa_edge` with its sp 16 bytes below the end of the first host page, only that page mapped. Words 0 and 1 are the stored pair; words 2..16 lie past the mapped page and must read 0, not [`MARKER`].
 fn check_edge(edge: u64) -> Result<(), String> {
     let base = two_pages()?;
     qemu::CROSSING.map(base, PAGE, PROT_READ | PROT_WRITE)?;
@@ -146,7 +146,7 @@ fn check_edge(edge: u64) -> Result<(), String> {
     qemu::call_ex(edge, &mut lanes);
     let seen = LAST.lock().expect("last").take().unwrap_or_default().stack;
     same("stack words 0..2", [seen[0], seen[1]], [EDGE_S0, EDGE_S1])?;
-    // the aarch64 engine reads eight words of the window; the rest stay 0 too
+    // the aarch64 engine reads all sixteen words of the window; every one past the page reads 0
     same(
         "stack words 2..16 past the mapped page",
         seen[2..].to_vec(),

@@ -13,7 +13,7 @@ use crate::engine::Down;
 use crate::engine::bindings::OBJECT_STUBS;
 use crate::engine::bindings::QEMU_THUNKS as THUNKS;
 
-/// A trap from the engine, decoded from `atl_trap_kind`. `Boot` x0 = the auxv QEMU built for the boot executable (x1, its return stub, the engine keeps); `Call` and `Bind` carry their lanes (`atl_lanes`, filled by the guest's convention, qemu/arch.rs `Arch::rules`: AAPCS64 x0..x7 in `regs[0..8]`, v0..v7 in `fp[0..8]`, eight stack words; AAPCS32 r0..r3 in `regs[0..4]`, sixteen stack words); `Report` x0.
+/// A trap from the engine, decoded from `atl_trap_kind`. `Boot` x0 = the auxv QEMU built for the boot executable (x1, its return stub, the engine keeps); `Call` and `Bind` carry their lanes (`atl_lanes`, filled by the guest's convention, qemu/arch.rs `Arch::rules`: AAPCS64 x0..x7 in `regs[0..8]`, v0..v7 in `fp[0..8]`, sixteen stack words; AAPCS32 r0..r3 in `regs[0..4]`, sixteen stack words); `Report` x0.
 #[derive(Clone, Copy, Debug)]
 pub enum Trap {
     /// BOOT: the boot executable's auxv (x0).
@@ -235,7 +235,7 @@ fn symbol_name(addr: usize) -> String {
     }
 }
 
-/// Integer words read from a 32-bit guest for a call with no prototype: r0..r3 and twelve stack words, which AAPCS64's image holds whole (eight registers, eight stack words).
+/// Integer words read from a 32-bit guest for a call with no prototype: r0..r3 and twelve stack words, which AAPCS64's image holds whole (eight registers, sixteen stack words).
 const RAW_WORDS: [Class; 16] = [Class::Int {
     bits: 32,
     signed: false,
@@ -246,8 +246,14 @@ fn up_lanes(guest: HostRules, lanes: &AtlLanes, params: Option<&[Class]>) -> Opt
     if guest.word_bits == AAPCS64.word_bits {
         return Some(*lanes);
     }
-    place(params.unwrap_or(&RAW_WORDS), lanes, guest, AAPCS64)
+    place(params.unwrap_or(&RAW_WORDS), lanes, guest, UP_IMAGE)
 }
+
+/// The image a host up call carries: AAPCS64's with eight stack words, what `host_call` passes (variadic.rs `first8`, x86_64; the bridgegen `lane_refusal` build check of proxy rows assumes the same). The aarch64 guest's own window ([`AAPCS64`]) is wider: only down calls write the extra words.
+const UP_IMAGE: HostRules = HostRules {
+    stack_words: 8,
+    ..AAPCS64
+};
 
 /// The guest's result registers for the host answer `answer` of class `ret`: aarch64 takes it as it is; a 32-bit guest r0 / r0:r1 ([`guest_ret32`]).
 fn guest_answer(guest: HostRules, ret: Class, answer: Answer) -> Answer {
@@ -277,7 +283,8 @@ fn refuse_up(target: usize) -> ! {
     static REFUSED: AtomicUsize = AtomicUsize::new(0);
     let n = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
     unsupported(&format!(
-        "qemu crossing: refused up call to {target:#x}: its arguments need more than eight stack words on one side, the lane image holds eight (R-1, refusals: {n})"
+        "qemu crossing: refused up call to {target:#x}: its arguments need more stack words on one side than the lane image carries ({} each; R-1, refusals: {n})",
+        atl_engine_api::LANE_STACK
     ))
 }
 
@@ -420,14 +427,14 @@ impl HostRules {
     }
 }
 
-/// The aarch64 guest's rules (qemu/arch.rs `Arch::Aarch64`), AAPCS64: eight integer registers, an fp argument past v7 goes to the stack, results and floats unshaped (a narrow value's upper bits are unspecified, s-registers are read low); eight stack words (the aarch64 engine's window, atl-qemu-engine engine/aarch64.rs `STACK_SLOTS`). Also the image every host call reads ([`up_lanes`]).
+/// The aarch64 guest's rules (qemu/arch.rs `Arch::Aarch64`), AAPCS64: eight integer registers, an fp argument past v7 goes to the stack, results and floats unshaped (a narrow value's upper bits are unspecified, s-registers are read low); sixteen stack words (the aarch64 engine's window, atl-qemu-engine engine/aarch64.rs `STACK_SLOTS`). Also the image every host call reads ([`up_lanes`]).
 pub(in crate::engine) const AAPCS64: HostRules = HostRules {
     int_lanes: 8,
     fp_lanes: 8,
     fp_to_int: false,
     extend_int_ret: false,
     nan_box_f32: false,
-    stack_words: 8,
+    stack_words: atl_engine_api::LANE_STACK,
     word_bits: 64,
 };
 
@@ -515,7 +522,7 @@ pub(in crate::engine) fn down_params(
                 .ok_or_else(|| format!("shorty parameter {:?}: no such type", c as char))?,
         );
     }
-    // break `shorty_swap` (qemu-jni gate, checks m, x and R): the first shorty parameter's class is flipped, so the host's argument reads the other bank; the 17-integer R-1 call then needs eight guest stack words, which fit, and is not refused
+    // break `shorty_swap` (qemu-jni gate, checks m, x and R): the first shorty parameter's class is flipped, so the host's argument reads the other bank; the 23-integer R-1 call then needs sixteen host stack words, which fit, and is not refused
     #[cfg(atl_nb_shorty_swap)]
     if let Some(p) = params.get_mut(2) {
         *p = if p.is_int() {
@@ -958,11 +965,35 @@ mod place_tests {
         );
     }
 
-    /// Sixteen integers need eight AAPCS64 stack words (eight registers): the aarch64 window holds them. Seventeen need nine: refused (R-1), though SysV's side (eleven words) fits the shell's sixteen.
+    /// Candy Crush Saga's second wide JNI method (17 integers, 2 doubles): nine AAPCS64 stack words past x0..x7, eleven SysV words past six registers; both windows hold sixteen.
     #[test]
-    fn nine_guest_stack_words_are_refused() {
-        assert!(place(&[INT; 16], &AtlLanes::default(), SYSV, AAPCS64).is_some());
-        assert!(place(&[INT; 17], &AtlLanes::default(), SYSV, AAPCS64).is_none());
+    fn seventeen_integers_cross() {
+        let host = img(&[1, 2, 3, 4, 5, 6], &[0xD1, 0xD2], &(7..=17).collect::<Vec<u64>>());
+        let mut params = vec![INT; 17];
+        params.extend([Class::F64, Class::F64]);
+        let guest = place(&params, &host, SYSV, AAPCS64).expect("nine guest stack words fit");
+        assert_eq!(
+            guest,
+            img(&[1, 2, 3, 4, 5, 6, 7, 8], &[0xD1, 0xD2], &(9..=17).collect::<Vec<u64>>())
+        );
+    }
+
+    /// Twenty-two integers need sixteen SysV stack words (six registers): the shell's window holds them. Twenty-three need seventeen: refused (R-1), though AAPCS64's side (fifteen words) fits.
+    #[test]
+    fn seventeen_host_stack_words_are_refused() {
+        assert!(place(&[INT; 22], &AtlLanes::default(), SYSV, AAPCS64).is_some());
+        assert!(place(&[INT; 23], &AtlLanes::default(), SYSV, AAPCS64).is_none());
+    }
+
+    /// The up image stays at eight stack words (variadic.rs passes eight): a 32-bit guest's call with seventeen words (four in r0..r3, thirteen on its stack) needs nine AAPCS64 stack words past x0..x7 and is refused, not truncated.
+    #[test]
+    fn up_image_is_eight_stack_words() {
+        let words = [Class::Int {
+            bits: 32,
+            signed: false,
+        }; 17];
+        assert!(up_lanes(AAPCS32, &AtlLanes::default(), Some(&words[..16])).is_some());
+        assert!(up_lanes(AAPCS32, &AtlLanes::default(), Some(&words)).is_none());
     }
 
     /// The shorty `DIDJ` (result double; int, double, long) under a JNI method: env and class first (pointers), then the three (jni.h: `jint` signed 32, `jlong` signed 64). JNI_OnLoad (no shorty) is `(JavaVM*, void*)`; a shorty without a method's env is refused.
