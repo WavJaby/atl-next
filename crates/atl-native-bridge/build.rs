@@ -1280,6 +1280,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("second_isa", "atl_nb_second_isa"),
     // Q5-6 (engine/thread.rs `detach`): a guest key destructor never runs at thread exit (qemu-thread gate, `qt_last_value`)
     ("qt_skip_dtor", "atl_nb_qt_skip_dtor"),
+    // P4a (engine/mod.rs `Active::release`): QEMU windows are never given back, so thread churn keeps every exited thread's record and TLS (qemu-thread gate, `c`)
+    ("qt_keep_windows", "atl_nb_qt_keep_windows"),
     // Q5-6 (engine/intercepts.rs `run`): a guest thread's routine gets the wrong argument (qemu-thread gate, `qt_join`)
     ("qt_routine_arg", "atl_nb_qt_routine_arg"),
     // R10 S3 (engine/intercepts.rs `pthread_create`): the guest attr's stack size is not passed to attach, every guest stack is the default (qemu-thread gate, `g`)

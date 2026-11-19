@@ -77,9 +77,8 @@ pub enum Active {
 
 static ACTIVE: OnceLock<Active> = OnceLock::new();
 
-/// Windows [`Active::release`] kept under QEMU (no ABI call frees one).
-pub static RETAINED_WINDOWS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+/// [`Active::reserve`] blocks not yet given back through [`Active::release`]: the thread gate's churn check reads it back to its start value after create + join.
+pub static RESERVED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// A down shell's identity: guest target, kind, shorty.
 type DownKey = (usize, Down, Option<Vec<u8>>);
@@ -246,23 +245,44 @@ impl Active {
         }
     }
 
-    /// Gives back [`Active::reserve`]'s `[at, at + len)` (thread records at thread exit). Identity: munmap. QEMU: kept -- engine ABI 4.1 has no call that clears a window's guest page marks before an unmap, and unmapping under live marks leaves QEMU pages that point at whatever the host maps there next; counted in [`RETAINED_WINDOWS`]. Delete that arm when the ABI frees windows.
+    /// Gives back [`Active::reserve`]'s `[at, at + len)` (thread records and static TLS at thread exit). Identity: munmap. QEMU: the engine's `unmap_window` (ABI 4.2, the guest's own munmap: host unmap and guest page marks cleared together). A refused release is logged and stays counted in [`RESERVED`].
     pub fn release(self, at: usize, len: usize) {
-        match self {
+        let r = match self {
             #[cfg(atl_nb_identity)]
             Active::Identity => {
                 // SAFETY: a mapping `reserve` made, which nothing uses any more (caller contract of the record's owner).
-                unsafe { libc::munmap(at as *mut _, len) };
+                if unsafe { libc::munmap(at as *mut _, len) } == 0 {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "munmap {at:#x}+{len:#x}: {}",
+                        std::io::Error::last_os_error()
+                    ))
+                }
             }
-            Active::Qemu(_) => {
-                let _ = (at, len);
-                RETAINED_WINDOWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // deliberate break (`ATL_NB_BREAK=qt_keep_windows`): windows are never given back (qemu-thread check c must go red)
+            Active::Qemu(_) if cfg!(atl_nb_qt_keep_windows) => return,
+            Active::Qemu(_) => qemu::CROSSING.unmap_window(at, len),
+        };
+        match r {
+            Ok(()) => {
+                RESERVED.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(e) => {
+                let line = format!("atl-native-bridge: release {at:#x}+{len:#x} refused: {e}\n");
+                let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
             }
         }
     }
 
     /// Fresh zeroed memory of `len` bytes the guest can address, `prot` (`PROT_*`) for the guest: the one seam for every host allocation the guest dereferences (image reservations, the argument block, scratch TCBs, thread records and static TLS). Identity: anonymous host memory, guest memory is host memory. QEMU: the engine's `map_window` (below 4 GiB for a 32-bit guest). Given back only through [`Active::release`].
     pub fn reserve(self, len: usize, prot: u32) -> Result<usize, String> {
+        let at = self.reserve_raw(len, prot)?;
+        RESERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(at)
+    }
+
+    fn reserve_raw(self, len: usize, prot: u32) -> Result<usize, String> {
         match self {
             #[cfg(atl_nb_identity)]
             Active::Identity => {

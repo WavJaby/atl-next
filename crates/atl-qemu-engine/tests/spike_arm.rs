@@ -11,7 +11,7 @@ mod spike {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
-    use atl_qemu_engine::{Guest, Trap, map_window, page};
+    use atl_qemu_engine::{Guest, Trap, map_window, page, unmap_window};
 
     /// The ART heap stand-in of the phase 4 plan's gate (e): a mapping in the low 4 GiB made before QEMU's `main`, as ART's `low_4gb` heap spaces are when the bridge loads (art/runtime/gc/heap.cc). Any pre-existing low mapping serves; this is the address the plan names.
     const STANDIN: usize = 0x12c0_0000;
@@ -280,7 +280,7 @@ mod spike {
 
     /// Gate (w), the window allocator (plan D8 obstacle 2): [`W_COUNT`] windows, each below 4 GiB, overlapping neither the ART stand-in nor each other nor a host mapping made after QEMU booted (ART's heap grows later) right where the next window search starts (the end of the last window: linux-user's `mmap_next_start`); each comes back guest-mapped, and the engine counted every one. The host-side views stay intact (magic words).
     fn gate_w(g: Guest) -> Result<(), String> {
-        let before = atl_qemu_engine::windows();
+        let before = atl_qemu_engine::live_windows();
         let mut taken: Vec<(usize, usize, &str)> = vec![(STANDIN, STANDIN_LEN, "stand-in")];
         for i in 0..W_COUNT {
             let a = map_window(W_LEN, page::READ | page::WRITE)?;
@@ -301,9 +301,42 @@ mod spike {
                 taken.push((a + W_LEN, W_LATE_LEN, "late host mapping"));
             }
         }
-        let made = atl_qemu_engine::windows() - before;
+        let made = atl_qemu_engine::live_windows() - before;
         if made != W_COUNT as u64 {
             return Err(format!("engine counted {made} windows, made {W_COUNT}"));
+        }
+        // give every window back (unmap_window, ABI 4.2): marks cleared, the engine's count back, and the range free for a host mapping again
+        for &(a, _, _) in taken.iter().filter(|(_, _, w)| *w == "window") {
+            unmap_window(a, W_LEN)?;
+            if g.page_flags(a as u64) & page::VALID != 0 {
+                return Err(format!(
+                    "window {a:#x} still marked for the guest after unmap_window"
+                ));
+            }
+            // SAFETY: MAP_FIXED_NOREPLACE never replaces a mapping; a refusal (window still mapped) is the error return.
+            let p = unsafe {
+                libc::mmap(
+                    a as *mut c_void,
+                    W_LEN,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
+                    -1,
+                    0,
+                )
+            };
+            if p as usize != a {
+                return Err(format!(
+                    "window {a:#x} still host-mapped after unmap_window: mmap gave {p:?}"
+                ));
+            }
+            // SAFETY: the probe mapping just made at a.
+            unsafe { libc::munmap(p, W_LEN) };
+        }
+        let live = atl_qemu_engine::live_windows();
+        if live != before {
+            return Err(format!(
+                "engine counts {live} live windows after unmapping, {before} before"
+            ));
         }
         for (s, _, what) in taken.iter().filter(|(_, _, w)| *w != "window") {
             // SAFETY: the stand-in and the late mapping, alive for the process.
@@ -314,7 +347,7 @@ mod spike {
                 ));
             }
         }
-        println!("spike-arm: (w) {W_COUNT} windows below 4 GiB, none overlapping");
+        println!("spike-arm: (w) {W_COUNT} windows below 4 GiB, none overlapping, all given back");
         Ok(())
     }
 

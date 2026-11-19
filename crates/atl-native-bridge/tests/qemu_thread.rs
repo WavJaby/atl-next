@@ -3,7 +3,7 @@
 //! The guest's threads are glibc threads (the stub libc's `pthread_create` is the host shim). Each attaches its own engine CPU on its first guest call, runs its routine, and at exit runs its guest key destructor through a crossing on that thread.
 //! Env (xtask qemu_thread.rs sets it; unset prints SKIP): ATL_ENGINE_SO (the engine `.so`), ATL_NB_BOOT (the engine boot executable, crates/atl-qemu-boot), ATL_NB_THREADEXE (fixture.c, PIE), ATL_NB_LINKER, ATL_NB_VDSO (the arm64 NB images; `<nb>/libnative_bridge_guest_libc` among the guest library directories).
 //! Expected values come from the property store and the fixture's C source, never from the engine: xtask seeds `atl.qt.p.<i>` and `atl.qt.expect` into the area (ATL_PROP_AREA), and the provider's foreach must count exactly `atl.qt.expect` of them; qt_join(x) = x + 1000 (fixture.c `QT_JOIN_OFFSET`); the destructor stores the value its thread's key held at exit.
-//! Checks: (s) started, (p) foreach counts the seeded properties, (j) pthread_create's routine got its argument and its result reached pthread_join, (d) the key destructor ran at thread exit with the thread's value, (g) a guest thread's `pthread_getattr_np(pthread_self())` contains its sp and reports the size its attr asked for (fixture.c `QT_SMALL_STACK`), or 1 MiB without an attr, with a guard of one host page (the engine's default, bionic `PTHREAD_GUARD_SIZE`), (i) two host threads in concurrent down calls each keep a 64 KiB stack pattern intact while the other's is live, with sp in their own reported range and the two ranges disjoint, (k) guest setjmp / longjmp round trip from a deeper frame (fixture.c `QT_JMP_VALUE`, volatile local kept), (m) siglongjmp restores the mask sigsetjmp(b, 1) saved (SIGUSR1 unblocked again). Both run the guest libc's bionic setjmp.S: the NBS patch drops the arm64 setjmp stubs, so no host side exists. (x) a guest thread's pthread_exit, one frame below its routine, hands join its value (fixture.c `QT_EXIT_OFFSET`) and its key destructor runs with the thread's value. (r) getaddrinfo("localhost", "80", AF_INET stream, AI_CANONNAME) read in bionic's addrinfo layout (family, socktype, protocol, addrlen, port 80, 127.0.0.1, canonname), getnameinfo numeric back to "127.0.0.1" / "80", freeaddrinfo, gethostbyname("127.0.0.1"), gethostbyaddr(127.0.0.1) names it (engine/netdb.rs; fixture.c `qt_resolve`). (q) tr-first blocker 4: one guest handle per thread (engine/thread.rs `THREADS`): pthread_kill(handle, SIGUSR2) runs the handler on the target (its pthread_self equals the handle), the target's pthread_self equals pthread_create's handle, pthread_gettid_np(handle) is the target's gettid, join hands back the target's pthread_self, the creator's own handle differs (fixture.c `qt_kill`).
+//! Checks: (s) started, (p) foreach counts the seeded properties, (j) pthread_create's routine got its argument and its result reached pthread_join, (d) the key destructor ran at thread exit with the thread's value, (g) a guest thread's `pthread_getattr_np(pthread_self())` contains its sp and reports the size its attr asked for (fixture.c `QT_SMALL_STACK`), or 1 MiB without an attr, with a guard of one host page (the engine's default, bionic `PTHREAD_GUARD_SIZE`), (i) two host threads in concurrent down calls each keep a 64 KiB stack pattern intact while the other's is live, with sp in their own reported range and the two ranges disjoint, (k) guest setjmp / longjmp round trip from a deeper frame (fixture.c `QT_JMP_VALUE`, volatile local kept), (m) siglongjmp restores the mask sigsetjmp(b, 1) saved (SIGUSR1 unblocked again). Both run the guest libc's bionic setjmp.S: the NBS patch drops the arm64 setjmp stubs, so no host side exists. (x) a guest thread's pthread_exit, one frame below its routine, hands join its value (fixture.c `QT_EXIT_OFFSET`) and its key destructor runs with the thread's value. (r) getaddrinfo("localhost", "80", AF_INET stream, AI_CANONNAME) read in bionic's addrinfo layout (family, socktype, protocol, addrlen, port 80, 127.0.0.1, canonname), getnameinfo numeric back to "127.0.0.1" / "80", freeaddrinfo, gethostbyname("127.0.0.1"), gethostbyaddr(127.0.0.1) names it (engine/netdb.rs; fixture.c `qt_resolve`). (q) tr-first blocker 4: one guest handle per thread (engine/thread.rs `THREADS`): pthread_kill(handle, SIGUSR2) runs the handler on the target (its pthread_self equals the handle), the target's pthread_self equals pthread_create's handle, pthread_gettid_np(handle) is the target's gettid, join hands back the target's pthread_self, the creator's own handle differs (fixture.c `qt_kill`). (c) thread churn: created + joined guest threads give back every `Active::reserve` block (engine `unmap_window`, ABI 4.2; break `qt_keep_windows`).
 //! Output: `qemu-thread: (x) ok` per check, `(x) FAIL <why>` otherwise, and one `qemu-thread: call-cost` line (not a check: the round trip of a no-op guest call on this thread). Exit 0 when all pass.
 #![expect(
     clippy::disallowed_types,
@@ -266,6 +266,8 @@ fn started(r: Result<Guest, String>) -> u64 {
         },
     );
 
+    ok &= check('c', churn(&mut guest, join));
+
     // SAFETY: page size, no memory effects.
     let [g, i] = stack_child();
     ok &= check('g', g);
@@ -281,6 +283,61 @@ fn started(r: Result<Guest, String>) -> u64 {
         "qemu-thread: call-cost {ns} ns per guest call round trip (qt_nop, {COST_CALLS} calls, this thread)"
     );
     u64::from(!ok)
+}
+
+/// Guest threads check (c) creates and joins after its warm-up. The verdict is the exact `RESERVED` count, so any number decides it; 2000 (~1.5 s) keeps the printed per-thread memory deltas past allocator granularity (a 64 MiB malloc arena / 2000 = 32 KiB).
+const CHURN: usize = 2_000;
+/// Threads before (c)'s baseline: glibc's stack cache and QEMU's first-use allocations settle in them.
+const CHURN_WARMUP: usize = 200;
+
+/// `VmRSS` and `VmSize` of this process in bytes (`/proc/self/status`, kB fields).
+fn vm() -> Result<(u64, u64), String> {
+    let s = std::fs::read_to_string("/proc/self/status").map_err(|e| e.to_string())?;
+    let field = |name: &str| {
+        s.lines()
+            .find_map(|l| l.strip_prefix(name))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+            .map(|kb| kb * 1024)
+            .ok_or(format!("/proc/self/status: no {name}"))
+    };
+    Ok((field("VmRSS:")?, field("VmSize:")?))
+}
+
+/// Check (c), thread churn: [`CHURN`] guest threads created and joined (`qt_join`) give back every `Active::reserve` block (engine `unmap_window`): `RESERVED` returns to its start value. Prints the per-thread resident and VmSize deltas, not judged: a malloc-heap growth per thread outside the window seam (origin/main 03b66815 too) is not this check's quantity.
+fn churn(guest: &mut Guest, join: usize) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+    let run = |guest: &mut Guest, n: usize| -> Result<(), String> {
+        for k in 0..n {
+            // SAFETY: qt_join creates one thread running qt_routine and joins it (as check j).
+            let got = unsafe { guest.call(join, JOIN_ARG as usize, 0, 0) } as u64;
+            if got != JOIN_ARG + JOIN_OFFSET {
+                return Err(format!("thread {k}: join returned {got:#x}"));
+            }
+        }
+        Ok(())
+    };
+    run(guest, CHURN_WARMUP)?;
+    let reserved = atl_native_bridge::engine::RESERVED.load(Ordering::Relaxed);
+    let (rss, size) = vm()?;
+    let t = Instant::now();
+    run(guest, CHURN)?;
+    let ms = t.elapsed().as_millis();
+    let left = atl_native_bridge::engine::RESERVED.load(Ordering::Relaxed);
+    let (rss2, size2) = vm()?;
+    let per = |a: u64, b: u64| (i128::from(b) - i128::from(a)) / CHURN as i128;
+    println!(
+        "qemu-thread: churn {CHURN} threads in {ms} ms: reserved {reserved} -> {left}, rss {} B/thread, vmsize {} B/thread",
+        per(rss, rss2),
+        per(size, size2)
+    );
+    if left == reserved {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} reserve blocks not given back after {CHURN} joined threads",
+            left as i128 - reserved as i128
+        ))
+    }
 }
 
 /// Set on the child run of checks (g) and (i): it boots, runs only [`stacks`] and [`isolation`] and prints a [`STACK_LINE`] for each. A child, because a wrong `pthread_getattr_np` (glibc reading a bionic record as its own, break `qt_getattr_glibc`) may kill or hang the process: the parent turns either into FAIL lines.

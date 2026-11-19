@@ -50,7 +50,7 @@ pub use engine::{Booted, Guest, OnTrap, Trap, page};
 #[cfg(all(feature = "qemu", not(feature = "engine-so")))]
 pub use engine::{Booted, Guest, OnTrap, Trap, page, start};
 #[cfg(feature = "qemu")]
-pub use window::{map_window, windows};
+pub use window::{live_windows, map_window, unmap_window};
 
 /// The engine C ABI's facts as clang reads them from `atl_engine.h` (build.rs): the Rust mirror in atl-engine-api must state the same values.
 #[cfg(feature = "qemu")]
@@ -110,6 +110,8 @@ mod abi_check {
     const _: () = assert!(offset_of!(AtlEngine, end_call) as u64 == l::ATL_OFFSET_ENGINE_END_CALL);
     const _: () =
         assert!(offset_of!(AtlEngine, map_window) as u64 == l::ATL_OFFSET_ENGINE_MAP_WINDOW);
+    const _: () =
+        assert!(offset_of!(AtlEngine, unmap_window) as u64 == l::ATL_OFFSET_ENGINE_UNMAP_WINDOW);
     const _: () = assert!(size_of::<AtlStack>() as u64 == l::ATL_SIZEOF_STACK);
     const _: () = assert!(offset_of!(AtlStack, size) as u64 == l::ATL_OFFSET_STACK_SIZE);
     const _: () = assert!(offset_of!(AtlStack, guard) as u64 == l::ATL_OFFSET_STACK_GUARD);
@@ -299,6 +301,23 @@ mod capi {
         }
     }
 
+    /// 4.2: gives back a window ([`crate::unmap_window`]).
+    unsafe extern "C" fn unmap_window(engine: *mut AtlEngineHandle, start: u64, len: u64) -> c_int {
+        if !is_engine(engine) || boot_env().is_none() {
+            return -libc::EINVAL;
+        }
+        let (Ok(start), Ok(len)) = (usize::try_from(start), usize::try_from(len)) else {
+            return -libc::EINVAL;
+        };
+        match crate::unmap_window(start, len) {
+            Ok(()) => 0,
+            Err(e) => {
+                note(&e);
+                -libc::EINVAL
+            }
+        }
+    }
+
     unsafe extern "C" fn attach_ex(
         engine: *mut AtlEngineHandle,
         stack: *mut AtlStack,
@@ -394,5 +413,6 @@ mod capi {
         fault: Some(fault),
         end_call: Some(end_call),
         map_window: Some(map_window),
+        unmap_window: Some(unmap_window),
     };
 }

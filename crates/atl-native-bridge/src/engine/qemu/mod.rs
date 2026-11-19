@@ -461,6 +461,22 @@ impl Qemu {
             Err(format!("map_window {len:#x}: {}", errno_text(rc)))
         }
     }
+
+    /// The engine's `unmap_window` (ABI 4.2): gives back `[at, at + len)` of a [`Qemu::map_window`] window (the guest's own munmap). Nothing runs guest code there after.
+    pub fn unmap_window(&self, at: usize, len: usize) -> Result<(), String> {
+        let e = engine();
+        let f = e
+            .table
+            .unmap_window
+            .unwrap_or_else(|| unsupported("engine table has no unmap_window"));
+        // SAFETY: the engine handle is live; the range is a window the caller owns and no longer uses.
+        let rc = unsafe { f(e.handle, at as u64, len as u64) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(format!("unmap_window {at:#x}+{len:#x}: {}", errno_text(rc)))
+        }
+    }
 }
 
 impl super::Engine for Qemu {

@@ -13,7 +13,7 @@
 #include <stdint.h>
 
 #define ATL_ENGINE_ABI_MAJOR 4
-#define ATL_ENGINE_ABI_MINOR 1
+#define ATL_ENGINE_ABI_MINOR 2
 
 /* Lanes per bank of atl_lanes: the widest guest convention's registers (arm r0..r15 / aarch64 x0..x15 cover every argument register), and a stack window of 16 guest stack slots. */
 #define ATL_LANE_REGS 16
@@ -86,8 +86,10 @@ typedef struct atl_engine {
     bool (*fault)(int sig, void *info, void *ucontext);
     /* From inside a CALL or BIND trap callback, on the trapping thread: when the innermost trap of this thread returns, the guest call it interrupted (the innermost call_ex on this thread's CPU) ends at once with the trap's answer as its answer, instead of resuming the trapping guest code. For a thread-exit call that never returns to its guest caller (bionic pthread_exit). 0, or -EINVAL when no trap of this thread is running. */
     int (*end_call)(atl_engine_handle *engine);
-    /* 4.1: a fresh zeroed anonymous window of len bytes (rounded up to pages) that the guest can address, mapped and marked guest-mapped with prot; *out = its address (identity: guest = host). The window allocator for every host allocation a guest dereferences: a 32-bit guest's window lies below 4 GiB in a host hole (hint-less probe with MAP_FIXED_NOREPLACE, never MAP_32BIT), coexisting with low mappings the engine did not make. Any thread after create; freed with munmap. -EINVAL, or -ENOMEM when no hole fits. */
+    /* 4.1: a fresh zeroed anonymous window of len bytes (rounded up to pages) that the guest can address, mapped and marked guest-mapped with prot; *out = its address (identity: guest = host). The window allocator for every host allocation a guest dereferences: a 32-bit guest's window lies below 4 GiB in a host hole (hint-less probe with MAP_FIXED_NOREPLACE, never MAP_32BIT), coexisting with low mappings the engine did not make. Any thread after create; freed only with unmap_window. -EINVAL, or -ENOMEM when no hole fits. */
     int (*map_window)(atl_engine_handle *engine, uint64_t len, uint32_t prot, uint64_t *out);
+    /* 4.2: gives back [start, start + len) of a map_window window (len rounded up to pages): host unmap and guest page marks cleared in one step under the engine's mmap lock (the guest's own munmap), so the range is free for the next host or guest mapping. Nothing may run guest code in it after. Any thread after create. 0, or -EINVAL (start not page aligned, empty or outside the guest's range). */
+    int (*unmap_window)(atl_engine_handle *engine, uint64_t start, uint64_t len);
 } atl_engine;
 
 #endif /* ATL_ENGINE_H */

@@ -157,6 +157,7 @@ mod linked_syms {
         pub(super) fn tb_flush__exclusive_or_serial();
         pub(super) fn do_sigaltstack();
         pub(super) fn target_mmap();
+        pub(super) fn target_munmap();
         pub(super) static tcg_splitwx_diff: isize;
         pub(super) static guest_base: usize;
         pub(super) static guest_addr_max: usize;
@@ -189,6 +190,7 @@ fn linked(name: &[u8]) -> Option<*mut c_void> {
         b"tb_flush__exclusive_or_serial" => s::tb_flush__exclusive_or_serial as *const (),
         b"do_sigaltstack" => s::do_sigaltstack as *const (),
         b"target_mmap" => s::target_mmap as *const (),
+        b"target_munmap" => s::target_munmap as *const (),
         b"tcg_splitwx_diff" => return Some(&raw const s::tcg_splitwx_diff as *mut c_void),
         b"guest_base" => return Some(&raw const s::guest_base as *mut c_void),
         b"guest_addr_max" => return Some(&raw const s::guest_addr_max as *mut c_void),

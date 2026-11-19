@@ -26,6 +26,7 @@ pub(crate) type AbiUlong = u32;
 type AbiLong = i32;
 type SigaltstackFn = unsafe extern "C" fn(AbiUlong, AbiUlong, *mut c_void) -> AbiLong;
 type TargetMmapFn = unsafe extern "C" fn(AbiUlong, AbiUlong, i32, i32, i32, i64) -> AbiLong;
+type TargetMunmapFn = unsafe extern "C" fn(AbiUlong, AbiUlong) -> i32;
 
 /// linux-user's functions a host-attached CPU needs, resolved once with the library.
 pub(crate) struct Api {
@@ -54,6 +55,8 @@ pub(crate) struct Api {
     do_sigaltstack: SigaltstackFn,
     /// `abi_long target_mmap(abi_ulong start, abi_ulong len, int prot, int flags, int fd, off_t offset)` (include/user/mmap.h): the guest's own mmap, the window allocator (window.rs).
     pub(crate) target_mmap: TargetMmapFn,
+    /// `int target_munmap(abi_ulong start, abi_ulong len)` (include/user/mmap.h): the guest's own munmap, which gives windows back (window.rs); 0, or -1 with host errno.
+    pub(crate) target_munmap: TargetMunmapFn,
 }
 
 /// dlsym `$name` and type it as `$ty`, the prototype the field doc names.
@@ -82,6 +85,7 @@ impl Api {
             process_queued_cpu_work: func!(h, c"process_queued_cpu_work", PtrFn),
             do_sigaltstack: func!(h, c"do_sigaltstack", SigaltstackFn),
             target_mmap: func!(h, c"target_mmap", TargetMmapFn),
+            target_munmap: func!(h, c"target_munmap", TargetMunmapFn),
         })
     }
 }
