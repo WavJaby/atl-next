@@ -102,7 +102,24 @@ pub fn lint(row: &str, text: &str, is_row: &dyn Fn(&str) -> bool) -> Result<Scri
         );
     }
     lint_waits(&script.steps, false)?;
+    lint_judges(&script.steps)?;
     Ok(script)
+}
+
+/// At least one unconditional expectation after the last input: a top-level `expect-*` other than `expect-fps` (judged only on its tier) after the last top-level input step or branch (a
+/// branch may hold input). Without one, a run can pass having judged only waits and skipped steps.
+fn lint_judges(steps: &[Step]) -> Result<()> {
+    let last_input = steps
+        .iter()
+        .rposition(|s| drive::is_input(s) || matches!(s, Step::If { .. }));
+    let after = last_input.map_or(steps, |i| &steps[i + 1..]);
+    ensure!(
+        after
+            .iter()
+            .any(|s| drive::is_expect(s) && !matches!(s, Step::ExpectFps { .. })),
+        "no unconditional expect-* after the last input step: the run would judge nothing it caused (expect-fps does not count: it is skipped on another tier)"
+    );
+    Ok(())
 }
 
 fn is_condition(step: &Step) -> bool {
@@ -159,8 +176,13 @@ pub struct Verdict<'a> {
     pub host: &'a str,
     pub cpu: String,
     pub guest: String,
+    /// Top-level checkpoints that judged and passed.
     pub passed: usize,
+    /// Checkpoints that judged nothing, each with its reason (drive::Outcome::skipped).
+    pub skipped: Vec<String>,
     pub total: usize,
+    /// The script has `expect-fps` steps and the run measured none of them (every one's tier was not the run's).
+    pub fps_unjudged: bool,
     pub fps: Option<f64>,
     pub tier: String,
     pub secs: u64,
@@ -170,13 +192,23 @@ pub struct Verdict<'a> {
 }
 
 impl Verdict<'_> {
-    /// `scenario: ok|FAILED <row> host=<arch> cpu=<cpu> guest=<abi> <k>/<n> checkpoints fps=<mean> tier=<t> <secs>s [unreachable: a, b]`, a failure's reason after `: `.
+    /// `scenario: ok|FAILED <row> host=<arch> cpu=<cpu> guest=<abi> <k> judged, <s> skipped (<reasons>), <n> checkpoints fps=<mean> tier=<t> <secs>s [FPS NOT JUDGED: ...]
+    /// [unreachable: a, b]`, a failure's reason after `: `. Skipped checkpoints never count as judged.
     pub fn line(&self) -> String {
         let fps = self
             .fps
             .map_or_else(|| "-".to_owned(), |f| format!("{f:.1}"));
+        let skipped = if self.skipped.is_empty() {
+            "0 skipped".to_owned()
+        } else {
+            format!(
+                "{} skipped ({})",
+                self.skipped.len(),
+                self.skipped.join("; ")
+            )
+        };
         let mut line = format!(
-            "scenario: {} {} host={} cpu={} guest={} {}/{} checkpoints fps={fps} tier={} {}s",
+            "scenario: {} {} host={} cpu={} guest={} {} judged, {skipped}, {} checkpoints fps={fps} tier={} {}s",
             if self.failure.is_some() {
                 "FAILED"
             } else {
@@ -191,6 +223,12 @@ impl Verdict<'_> {
             self.tier,
             self.secs
         );
+        if self.fps_unjudged {
+            line.push_str(&format!(
+                " [FPS NOT JUDGED: every expect-fps names another tier than {}]",
+                self.tier
+            ));
+        }
         if !self.unreachable.is_empty() {
             line.push_str(&format!(" [unreachable: {}]", self.unreachable.join(", ")));
         }
@@ -293,7 +331,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 mod tests {
     use super::*;
 
-    const GOOD: &str = "size 1440 900\ncontrol break-input\nunreachable ad end: filled from the network\nwait-stable 0 0 10 10 1000 200\nwait 500\ntap 1 1\nmark a\n";
+    const GOOD: &str = "size 1440 900\ncontrol break-input\nunreachable ad end: filled from the network\nwait-stable 0 0 10 10 1000 200\nwait 500\nmark a\ntap 1 1\nexpect-changed a\n";
 
     fn lint_row(text: &str) -> Result<Script> {
         lint("fossify-math", text, &|r| r == "fossify-math")
@@ -312,8 +350,39 @@ mod tests {
             s.unreachable,
             [("ad end".to_owned(), "filled from the network".to_owned())]
         );
-        // wait-stable and mark; the wait and the tap are no checkpoints
+        // wait-stable and expect-changed; the wait, the mark (judges nothing) and the tap are no checkpoints
         assert_eq!(s.checkpoints(), 2);
+    }
+
+    /// Review-2 G4: a scenario must judge what its input caused, unconditionally.
+    #[test]
+    fn a_scenario_without_a_final_unconditional_expect_is_red() {
+        const WHY: &str = "no unconditional expect-* after the last input step";
+        // nothing after the last input
+        red(&GOOD.replace("expect-changed a\n", ""), WHY);
+        // only marks and waits after it
+        red(
+            &GOOD.replace(
+                "expect-changed a\n",
+                "mark b\nwait-stable 0 0 10 10 1000 200\n",
+            ),
+            WHY,
+        );
+        // only an expect-fps: skipped on another tier
+        red(
+            &GOOD.replace(
+                "expect-changed a\n",
+                "expect-fps 10 tier=readback over 1000\n",
+            ),
+            WHY,
+        );
+        // the expectation sits in a branch that may not be taken
+        red(
+            &GOOD.replace("expect-changed a\n", "if-same a\nexpect-changed a\nend\n"),
+            WHY,
+        );
+        // a branch after the expectation may hold input: it ends the run unjudged
+        red(&format!("{GOOD}if-same a\ntap 1 1\nend\n"), WHY);
     }
 
     #[test]
@@ -353,8 +422,10 @@ mod tests {
         red(&format!("{GOOD}wait 100\n"), "follows no condition wait");
         red(&GOOD.replace("wait 500", "wait 3000"), "not under 3000 ms");
         // an if-log's body starts after its condition
-        lint_row(&format!("{GOOD}if-log app x 100\nwait 200\nend\n"))
-            .expect("wait opens an if-log body");
+        lint_row(&format!(
+            "{GOOD}if-log app x 100\nwait 200\nend\nexpect-changed a\n"
+        ))
+        .expect("wait opens an if-log body");
         // an if-same judges at once: nothing to wait after
         red(
             &format!("{GOOD}mark m\nif-same m\nwait 200\nend\n"),
@@ -371,7 +442,9 @@ mod tests {
             cpu: "native(AMD Ryzen 7)".into(),
             guest: "x86_64".into(),
             passed: 5,
+            skipped: vec![],
             total: 5,
+            fps_unjudged: false,
             fps: Some(16.25),
             tier: "readback".into(),
             secs: 61,
@@ -380,7 +453,7 @@ mod tests {
         };
         assert_eq!(
             v.line(),
-            "scenario: ok fossify-math host=x86_64 cpu=native(AMD Ryzen 7) guest=x86_64 5/5 checkpoints fps=16.2 tier=readback 61s [unreachable: ad end, sign-in]"
+            "scenario: ok fossify-math host=x86_64 cpu=native(AMD Ryzen 7) guest=x86_64 5 judged, 0 skipped, 5 checkpoints fps=16.2 tier=readback 61s [unreachable: ad end, sign-in]"
         );
         let red = Verdict {
             fps: None,
@@ -391,7 +464,30 @@ mod tests {
         };
         assert_eq!(
             red.line(),
-            "scenario: FAILED fossify-math host=x86_64 cpu=native(AMD Ryzen 7) guest=x86_64 3/5 checkpoints fps=- tier=readback 61s: drive: step 9 failed"
+            "scenario: FAILED fossify-math host=x86_64 cpu=native(AMD Ryzen 7) guest=x86_64 3 judged, 0 skipped, 5 checkpoints fps=- tier=readback 61s: drive: step 9 failed"
+        );
+        // Review-2 G4: skipped checkpoints are apart from judged ones, with their reasons; a run that judged no fps says so
+        let skipped = Verdict {
+            row: "angry-birds-2",
+            host: "x86_64",
+            cpu: "native(AMD Ryzen 7)".into(),
+            guest: "x86_64".into(),
+            passed: 11,
+            skipped: vec![
+                "expect-fps: tier import != readback".into(),
+                "if-same panel: not taken".into(),
+            ],
+            total: 13,
+            fps_unjudged: true,
+            fps: Some(30.0),
+            tier: "import".into(),
+            secs: 90,
+            unreachable: vec![],
+            failure: None,
+        };
+        assert_eq!(
+            skipped.line(),
+            "scenario: ok angry-birds-2 host=x86_64 cpu=native(AMD Ryzen 7) guest=x86_64 11 judged, 2 skipped (expect-fps: tier import != readback; if-same panel: not taken), 13 checkpoints fps=30.0 tier=import 90s [FPS NOT JUDGED: every expect-fps names another tier than import]"
         );
     }
 

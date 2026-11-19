@@ -88,7 +88,7 @@ pub struct Args {
     #[arg(long, requires = "drive")]
     break_input: bool,
     /// Runs the row's tracked scenario `xtask-harness/scenarios/<ROW>.drive` (scenarios.rs) on a fresh data root `<build dir>/scenario/<ROW>/data`, emptied first; shots stay in memory.
-    /// Prints `scenario: ok|FAILED <row> host= cpu= guest= <k>/<n> checkpoints fps= tier= <secs>s [unreachable: ..]`.
+    /// Prints `scenario: ok|FAILED <row> host= cpu= guest= <k> judged, <s> skipped (<reasons>), <n> checkpoints fps= tier= <secs>s [FPS NOT JUDGED: ..] [unreachable: ..]` (scenarios.rs `Verdict::line`).
     #[arg(long, conflicts_with_all = ["drive", "hold", "pointer", "data_root", "clear_data"])]
     scenario: bool,
     /// With --scenario: one more run under each of the scenario's `control` breaks, which must end FAILED at a checkpoint (`control:` line); one that passes, or fails elsewhere, turns the scenario red.
@@ -356,13 +356,21 @@ fn scenario_run(
         files,
         Some(script.clone()),
     )?;
-    let (passed, failure, at_checkpoint) = match &ran.drive {
+    let (passed, skipped, fps_judged, failure, at_checkpoint) = match &ran.drive {
         Some(o) => (
             o.passed,
+            o.skipped.clone(),
+            o.fps_judged,
             o.error.as_ref().map(|e| format!("{e:#}")),
             o.at_checkpoint,
         ),
-        None => (0, Some("the script never ran".to_owned()), false),
+        None => (
+            0,
+            Vec::new(),
+            0,
+            Some("the script never ran".to_owned()),
+            false,
+        ),
     };
     let failure = failure.or_else(|| (!ran.ok).then(|| "run-apk: FAILED (above)".to_owned()));
     let verdict = scenarios::Verdict {
@@ -371,7 +379,10 @@ fn scenario_run(
         cpu: scenarios::native_cpu(),
         guest,
         passed,
+        skipped,
         total: script.checkpoints(),
+        // only a run that got through: a failure before the expect-fps step is no tier verdict
+        fps_unjudged: failure.is_none() && script.expect_fps() > 0 && fps_judged == 0,
         fps: fps_mean(&ran.app),
         tier: buffer_tier(&ran.app).unwrap_or("none").to_owned(),
         secs: started.elapsed().as_secs(),

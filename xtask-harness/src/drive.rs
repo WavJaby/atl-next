@@ -22,8 +22,9 @@ A region is `X Y W H` in the same pixels. Text arguments are one word or \"quote
 Input: `tap X Y` / `swipe X1 Y1 X2 Y2 MS` (the mouse) | `touch X Y MS` / `touch-swipe X1 Y1 X2 Y2 MS` (one finger, wl_touch; Unity reads only this) | `leave` (mouse off the window) | `key NAME` / `key-down NAME` / `key-up NAME` (a letter, a digit, escape, backspace, tab, enter, space, home, end, up, down, left, right, pageup, pagedown, back) | `resize W H` (content size).
 Time: `wait MS` | `wait-frames N` (N presents from here, 120 s bound; only after something that redraws).
 Condition waits (checkpoints): `wait-log SOURCE TEXT MS` (a line holding TEXT since the last checkpoint) | `wait-changed REGION MS` (the region changes from its picture at this step) | `wait-stable REGION MS HOLD_MS` (no change for HOLD_MS).
-Checkpoints: `mark NAME [REGION]` (keeps the content's picture) | `expect-changed NAME [REGION]` / `expect-same NAME [REGION]` (now vs the mark; region default: the mark's, else the content) | `expect-varied [REGION]` (not one colour)
- | `expect-log SOURCE TEXT` / `expect-no-log SOURCE TEXT` (since the last checkpoint) | `expect-frames N MS` (N presents within MS) | `expect-fps FLOOR tier=TIER over MS` (presents per second over MS >= FLOOR; judged only when the app logged buffer tier TIER, else skipped and printed)
+Marks (no checkpoint: they judge nothing): `mark NAME [REGION]` (keeps the content's picture).
+Checkpoints: `expect-changed NAME [REGION]` / `expect-same NAME [REGION]` (now vs the mark; region default: the mark's, else the content) | `expect-varied [REGION]` (not one colour)
+ | `expect-log SOURCE TEXT` / `expect-no-log SOURCE TEXT` (since the last checkpoint) | `expect-frames N MS` (N presents within MS) | `expect-fps FLOOR tier=TIER over MS` (presents per second over MS >= FLOOR; judged only when the app logged buffer tier TIER, else skipped: counted apart in the verdict, never as passed; write one line per tier the scenario runs on)
  | `expect-audio MS` (an `audio-mix` line with audible > 0 in the app log within MS) | `expect-counter KEY OP N` (KEY = `<outcome> <api>` of the diag counters summed over the run's logs, quoted; OP one of >= <= == > <).
 Branch: `if-log SOURCE TEXT MS` ... `end` = the steps inside run only when the line comes within MS (an optional first-run dialog) | `if-same NAME [REGION]` ... `end` = only when the region is `same` as the mark now (an optional dialog that logs nothing); one level, no other control flow.
 `changed` = more than CHANGED_FRACTION of the region's pixels differ by more than CHANGE_DELTA in a channel; `same` = no pixel differs by more than CHANGE_DELTA.
@@ -232,9 +233,24 @@ pub struct Script {
 }
 
 impl Script {
-    /// The top-level checkpoints, the `n` of a scenario's `k/n checkpoints` (a branch counts as one: its body is optional).
+    /// The top-level checkpoints, the `n` of a scenario's `<n> checkpoints` (a branch counts as one: its body is optional).
     pub fn checkpoints(&self) -> usize {
         self.steps.iter().filter(|s| is_checkpoint(s)).count()
+    }
+
+    /// Every `expect-fps` step, branch bodies included: a run that judged none of them says so in its verdict.
+    pub fn expect_fps(&self) -> usize {
+        fn count(steps: &[Step]) -> usize {
+            steps
+                .iter()
+                .map(|s| match s {
+                    Step::ExpectFps { .. } => 1,
+                    Step::If { body, .. } => count(body),
+                    _ => 0,
+                })
+                .sum()
+        }
+        count(&self.steps)
     }
 }
 
@@ -249,10 +265,14 @@ pub enum Shots {
     Into(PathBuf),
 }
 
-/// What a run got to: top-level checkpoints passed, and the failure if any (`at_checkpoint`: it failed in a checkpoint step, not in input, a wait or a shot).
+/// What a run got to: top-level checkpoints judged and passed, those that judged nothing (`skipped`, each with its reason: an `expect-fps` whose tier the run did not have, a branch not
+/// taken), and the failure if any (`at_checkpoint`: it failed in a checkpoint step, not in input, a wait or a shot). A skipped checkpoint never counts as passed.
 #[derive(Debug)]
 pub struct Outcome {
     pub passed: usize,
+    pub skipped: Vec<String>,
+    /// `expect-fps` steps that measured (any tier mismatch is in `skipped`).
+    pub fps_judged: usize,
     pub error: Option<anyhow::Error>,
     pub at_checkpoint: bool,
 }
@@ -565,8 +585,11 @@ pub struct Target<'a> {
 }
 
 struct Driver<'a> {
-    /// Top-level checkpoints passed so far.
+    /// Top-level checkpoints passed so far, each having judged something.
     passed: usize,
+    /// [`Outcome::skipped`] so far.
+    skipped: Vec<String>,
+    fps_judged: usize,
     /// Whether the step that failed is a checkpoint.
     failed_checkpoint: bool,
     t: Target<'a>,
@@ -597,6 +620,8 @@ pub fn run(script: &Script, target: Target<'_>) -> Outcome {
         Err(e) => {
             return Outcome {
                 passed: 0,
+                skipped: Vec::new(),
+                fps_judged: 0,
                 error: Some(anyhow::Error::msg(e)),
                 at_checkpoint: false,
             };
@@ -604,6 +629,8 @@ pub fn run(script: &Script, target: Target<'_>) -> Outcome {
     };
     let mut d = Driver {
         passed: 0,
+        skipped: Vec::new(),
+        fps_judged: 0,
         failed_checkpoint: false,
         t: target,
         size: script.size,
@@ -618,6 +645,8 @@ pub fn run(script: &Script, target: Target<'_>) -> Outcome {
     let error = d.steps(&script.steps, "").err();
     Outcome {
         passed: d.passed,
+        skipped: d.skipped,
+        fps_judged: d.fps_judged,
         at_checkpoint: error.is_some() && d.failed_checkpoint,
         error,
     }
@@ -654,12 +683,33 @@ fn step_phase(step: &Step) -> &'static str {
     }
 }
 
-/// Whether a step is a checkpoint: once it passes, `expect-log` reads only what comes after it.
-fn is_checkpoint(step: &Step) -> bool {
+/// Whether a step sends input to the app (tap, touch, swipe, key, leave).
+pub fn is_input(step: &Step) -> bool {
+    step_phase(step) == "script: input"
+}
+
+/// Whether a step is an `expect-*` (judges the run at that point).
+pub fn is_expect(step: &Step) -> bool {
     matches!(
-        step_phase(step),
-        "script: condition wait" | "script: checkpoint"
+        step,
+        Step::ExpectChanged { .. }
+            | Step::ExpectSame { .. }
+            | Step::ExpectVaried(_)
+            | Step::ExpectLog { .. }
+            | Step::ExpectFrames { .. }
+            | Step::ExpectFps { .. }
+            | Step::ExpectAudio(_)
+            | Step::ExpectCounter { .. }
     )
+}
+
+/// Whether a step is a checkpoint: once it passes, `expect-log` reads only what comes after it. A `mark` judges nothing (it keeps a picture), so it is none.
+fn is_checkpoint(step: &Step) -> bool {
+    !matches!(step, Step::Mark { .. })
+        && matches!(
+            step_phase(step),
+            "script: condition wait" | "script: checkpoint"
+        )
 }
 
 /// A short form of a step for the progress and error lines (a branch's body left out).
@@ -724,13 +774,15 @@ impl Driver<'_> {
             println!("drive: step {name}");
             // a failure inside a branch's body leaves the body's own flag; the branch itself is the top-level checkpoint
             self.failed_checkpoint = is_checkpoint(step);
+            let skipped = self.skipped.len();
             xtask::timing::phase(step_phase(step), || self.step(step, indent))
                 .with_context(|| format!("step {name}"))?;
             self.failed_checkpoint = false;
             ensure!((self.t.alive)(), "the app ended during step {name}");
             if is_checkpoint(step) {
                 self.checkpoint();
-                if indent.is_empty() {
+                // a checkpoint that skipped (itself, or a branch whose body skipped) judged nothing: it is in `skipped`, not `passed`
+                if indent.is_empty() && self.skipped.len() == skipped {
                     self.passed += 1;
                 }
             }
@@ -1066,6 +1118,10 @@ impl Driver<'_> {
                     self.steps(body, &format!("{indent}  "))?;
                 } else {
                     println!("drive: branch: skipped");
+                    self.skipped.push(match cond {
+                        Cond::Log { text, .. } => format!("if-log {text:?}: not taken"),
+                        Cond::Same { name, .. } => format!("if-same {name}: not taken"),
+                    });
                 }
             }
         }
@@ -1088,12 +1144,13 @@ impl Driver<'_> {
         let app = self.read(Source::App);
         let got = crate::run_apk::buffer_tier(&app);
         if got != Some(tier) {
-            println!(
-                "drive: expect-fps skipped: buffer tier {}, the floor is for {tier}",
-                got.unwrap_or("not logged")
-            );
+            let got = got.unwrap_or("not logged");
+            println!("drive: expect-fps skipped: buffer tier {got}, the floor is for {tier}");
+            self.skipped
+                .push(format!("expect-fps: tier {got} != {tier}"));
             return Ok(());
         }
+        self.fps_judged += 1;
         let first = self.presents();
         let start = Instant::now();
         while start.elapsed() < Duration::from_millis(ms) {
