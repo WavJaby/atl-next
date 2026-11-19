@@ -25,7 +25,7 @@ Condition waits (checkpoints): `wait-log SOURCE TEXT MS` (a line holding TEXT si
 Checkpoints: `mark NAME [REGION]` (keeps the content's picture) | `expect-changed NAME [REGION]` / `expect-same NAME [REGION]` (now vs the mark; region default: the mark's, else the content) | `expect-varied [REGION]` (not one colour)
  | `expect-log SOURCE TEXT` / `expect-no-log SOURCE TEXT` (since the last checkpoint) | `expect-frames N MS` (N presents within MS) | `expect-fps FLOOR tier=TIER over MS` (presents per second over MS >= FLOOR; judged only when the app logged buffer tier TIER, else skipped and printed)
  | `expect-audio MS` (an `audio-mix` line with audible > 0 in the app log within MS) | `expect-counter KEY OP N` (KEY = `<outcome> <api>` of the diag counters summed over the run's logs, quoted; OP one of >= <= == > <).
-Branch: `if-log SOURCE TEXT MS` ... `end` = the steps inside run only when the line comes within MS (an optional first-run dialog); one level, no other control flow.
+Branch: `if-log SOURCE TEXT MS` ... `end` = the steps inside run only when the line comes within MS (an optional first-run dialog) | `if-same NAME [REGION]` ... `end` = only when the region is `same` as the mark now (an optional dialog that logs nothing); one level, no other control flow.
 `changed` = more than CHANGED_FRACTION of the region's pixels differ by more than CHANGE_DELTA in a channel; `same` = no pixel differs by more than CHANGE_DELTA.
 `shot FILE.png` writes the content (relative to the current directory; a one-colour image fails). The app is stopped after the last step; a failed step exits non-zero, naming it.";
 
@@ -188,12 +188,34 @@ pub enum Step {
         op: Op,
         n: u64,
     },
-    IfLog {
+    /// `if-log` / `if-same` ... `end`: `body` runs only when `cond` holds.
+    If {
+        cond: Cond,
+        body: Vec<Step>,
+    },
+}
+
+/// A branch's condition.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Cond {
+    /// `if-log SOURCE TEXT MS`: the line comes within the ms.
+    Log {
         source: Source,
         text: String,
         ms: u64,
-        body: Vec<Step>,
     },
+    /// `if-same NAME [REGION]`: the picture now is `same` as the mark (region default as for `expect-same`); judged at once.
+    Same {
+        name: String,
+        region: Option<Region>,
+    },
+}
+
+impl Cond {
+    /// Whether judging it waits (a `wait` may then open the body).
+    pub fn waits(&self) -> bool {
+        matches!(self, Cond::Log { .. })
+    }
 }
 
 /// A parsed script: its headers and the steps. `controls`, `unreachable` and `needs` are a tracked scenario's (scenarios.rs); a plain `--drive` run ignores them.
@@ -210,7 +232,7 @@ pub struct Script {
 }
 
 impl Script {
-    /// The top-level checkpoints, the `n` of a scenario's `k/n checkpoints` (an if-log counts as one: its body is optional).
+    /// The top-level checkpoints, the `n` of a scenario's `k/n checkpoints` (a branch counts as one: its body is optional).
     pub fn checkpoints(&self) -> usize {
         self.steps.iter().filter(|s| is_checkpoint(s)).count()
     }
@@ -275,7 +297,7 @@ pub fn parse(text: &str) -> Result<Script> {
     let mut script = Script::default();
     let mut size = None;
     let mut steps = Vec::new();
-    // an open `if-log`: its line and its step; the body collects until `end`
+    // an open branch: its line and its step; the body collects until `end`
     let mut open: Option<(usize, Step)> = None;
     for (index, line) in text.lines().enumerate() {
         let line = line.trim();
@@ -326,25 +348,25 @@ pub fn parse(text: &str) -> Result<Script> {
             ["end"] => {
                 let (_, step) = open
                     .take()
-                    .with_context(|| format!("{}: `end` with no open if-log", at()))?;
+                    .with_context(|| format!("{}: `end` with no open branch", at()))?;
                 steps.push(step);
             }
             _ => {
                 let step = parse_step(&w).with_context(at)?;
                 match (&mut open, step) {
-                    (Some(_), Step::IfLog { .. }) => {
-                        bail!("{}: if-log inside if-log: one level only", at())
+                    (Some(_), Step::If { .. }) => {
+                        bail!("{}: branch inside a branch: one level only", at())
                     }
-                    (None, step @ Step::IfLog { .. }) => open = Some((index + 1, step)),
-                    (Some((_, Step::IfLog { body, .. })), step) => body.push(step),
-                    (Some(_), _) => unreachable!("only an if-log is ever open"),
+                    (None, step @ Step::If { .. }) => open = Some((index + 1, step)),
+                    (Some((_, Step::If { body, .. })), step) => body.push(step),
+                    (Some(_), _) => unreachable!("only a branch is ever open"),
                     (None, step) => steps.push(step),
                 }
             }
         }
     }
     if let Some((line, _)) = open {
-        bail!("script line {line}: if-log has no `end`");
+        bail!("script line {line}: branch has no `end`");
     }
     script.size = size;
     script.steps = steps;
@@ -485,10 +507,19 @@ fn parse_step(words: &[&str]) -> Result<Step> {
             op: op(o)?,
             n: num(n)?,
         },
-        ["if-log", s, text, ms] => Step::IfLog {
-            source: source(s)?,
-            text: (*text).to_owned(),
-            ms: num(ms)?,
+        ["if-log", s, text, ms] => Step::If {
+            cond: Cond::Log {
+                source: source(s)?,
+                text: (*text).to_owned(),
+                ms: num(ms)?,
+            },
+            body: Vec::new(),
+        },
+        ["if-same", name, r @ ..] => Step::If {
+            cond: Cond::Same {
+                name: (*name).to_owned(),
+                region: opt_region(r)?,
+            },
             body: Vec::new(),
         },
         _ => bail!("not a step: {:?}", words.join(" ")),
@@ -606,11 +637,12 @@ fn step_phase(step: &Step) -> &'static str {
         | Step::Swipe { .. }
         | Step::Key(_)
         | Step::KeyHalf(..) => "script: input",
-        Step::WaitLog { .. }
-        | Step::WaitChanged { .. }
-        | Step::WaitStable { .. }
-        | Step::IfLog { .. } => "script: condition wait",
-        Step::Mark { .. }
+        Step::If { cond, .. } if cond.waits() => "script: condition wait",
+        Step::WaitLog { .. } | Step::WaitChanged { .. } | Step::WaitStable { .. } => {
+            "script: condition wait"
+        }
+        Step::If { .. }
+        | Step::Mark { .. }
         | Step::ExpectChanged { .. }
         | Step::ExpectSame { .. }
         | Step::ExpectVaried(_)
@@ -630,12 +662,10 @@ fn is_checkpoint(step: &Step) -> bool {
     )
 }
 
-/// A short form of a step for the progress and error lines (an if-log's body left out).
+/// A short form of a step for the progress and error lines (a branch's body left out).
 fn show(step: &Step) -> String {
     match step {
-        Step::IfLog {
-            source, text, ms, ..
-        } => format!("IfLog {{ source: {source:?}, text: {text:?}, ms: {ms} }}"),
+        Step::If { cond, .. } => format!("If({cond:?})"),
         other => format!("{other:?}"),
     }
 }
@@ -692,7 +722,7 @@ impl Driver<'_> {
         for (index, step) in steps.iter().enumerate() {
             let name = format!("{indent}{} {}", index + 1, show(step));
             println!("drive: step {name}");
-            // a failure inside an if-log's body leaves the body's own flag; the if-log itself is the top-level checkpoint
+            // a failure inside a branch's body leaves the body's own flag; the branch itself is the top-level checkpoint
             self.failed_checkpoint = is_checkpoint(step);
             xtask::timing::phase(step_phase(step), || self.step(step, indent))
                 .with_context(|| format!("step {name}"))?;
@@ -1005,24 +1035,37 @@ impl Driver<'_> {
                     "counter {key:?} is {got}, wanted {op:?} {n}"
                 );
             }
-            Step::IfLog {
-                source,
-                text,
-                ms,
-                body,
-            } => {
-                let deadline = Instant::now() + Duration::from_millis(*ms);
-                let mut found = self.logged(*source, text);
-                while !found && Instant::now() < deadline && (self.t.alive)() {
-                    std::thread::sleep(POLL);
-                    found = self.logged(*source, text);
-                }
-                if found {
-                    println!("drive: if-log: {text:?} came: its {} steps run", body.len());
+            Step::If { cond, body } => {
+                let holds = match cond {
+                    Cond::Log { source, text, ms } => {
+                        let deadline = Instant::now() + Duration::from_millis(*ms);
+                        let mut found = self.logged(*source, text);
+                        while !found && Instant::now() < deadline && (self.t.alive)() {
+                            std::thread::sleep(POLL);
+                            found = self.logged(*source, text);
+                        }
+                        println!(
+                            "drive: if-log: {}",
+                            if found {
+                                format!("{text:?} came")
+                            } else {
+                                format!("no {text:?} within {ms} ms")
+                            }
+                        );
+                        found
+                    }
+                    Cond::Same { name, region } => {
+                        let diff = self.compare(name, *region)?;
+                        println!("drive: if-same {name}: {}", show_diff(&diff));
+                        is_same(&diff)
+                    }
+                };
+                if holds {
+                    println!("drive: branch: its {} steps run", body.len());
                     self.checkpoint();
                     self.steps(body, &format!("{indent}  "))?;
                 } else {
-                    println!("drive: if-log: no {text:?} within {ms} ms: skipped");
+                    println!("drive: branch: skipped");
                 }
             }
         }
@@ -1167,7 +1210,7 @@ mod tests {
     fn every_step_parses() {
         let script = "# comment\n\nsize 1440 900\nwait 10\nwait-frames 2\ntap 1 2.5\ntouch 3 4 80\ntouch-swipe 1 2 3 4 100\nleave\nswipe 1 2 3 4 100\nkey a\nkey 0\nkey enter\nresize 640 400\nshot out/a.png\n\
 wait-log app \"Scene loaded: (Main)\" 60000\nwait-changed 0 64 1440 296 5000\nwait-stable 0 0 10 10 9000 1500\nmark m\nmark d 0 64 1440 296\nexpect-changed d\nexpect-same m 1 2 3 4\nexpect-varied\nexpect-varied 1 2 3 4\n\
-expect-log services resumed\nexpect-no-log app \"diag: refused\"\nexpect-frames 5 2000\nexpect-fps 20 tier=readback over 5000\nexpect-audio 3000\nexpect-counter \"refused open\" <= 2\nif-log app \"FIRST THINGS\" 1000\ntouch 720 748 150\nend\n";
+expect-log services resumed\nexpect-no-log app \"diag: refused\"\nexpect-frames 5 2000\nexpect-fps 20 tier=readback over 5000\nexpect-audio 3000\nexpect-counter \"refused open\" <= 2\nif-log app \"FIRST THINGS\" 1000\ntouch 720 748 150\nend\nif-same m 1 2 3 4\ntouch 1 2 150\nend\n";
         // KEY_A = 30, KEY_0 = 11, KEY_ENTER = 28 (linux/input-event-codes.h)
         let display = Region {
             x: 0.0,
@@ -1265,11 +1308,20 @@ expect-log services resumed\nexpect-no-log app \"diag: refused\"\nexpect-frames 
                     op: Op::Le,
                     n: 2
                 },
-                Step::IfLog {
-                    source: Source::App,
-                    text: "FIRST THINGS".into(),
-                    ms: 1000,
+                Step::If {
+                    cond: Cond::Log {
+                        source: Source::App,
+                        text: "FIRST THINGS".into(),
+                        ms: 1000
+                    },
                     body: vec![Step::Touch(720.0, 748.0, 150)]
+                },
+                Step::If {
+                    cond: Cond::Same {
+                        name: "m".into(),
+                        region: Some(small)
+                    },
+                    body: vec![Step::Touch(1.0, 2.0, 150)]
                 },
             ]
         );
@@ -1318,7 +1370,7 @@ expect-log services resumed\nexpect-no-log app \"diag: refused\"\nexpect-frames 
         );
         let err = format!(
             "{:#}",
-            parse("wait 1\nif-log app x 10\nif-log app y 10\nend\n").unwrap_err()
+            parse("wait 1\nif-log app x 10\nif-same m\nend\n").unwrap_err()
         );
         assert!(
             err.contains("script line 3") && err.contains("one level"),

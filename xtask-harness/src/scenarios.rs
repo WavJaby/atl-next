@@ -106,16 +106,14 @@ pub fn lint(row: &str, text: &str, is_row: &dyn Fn(&str) -> bool) -> Result<Scri
 }
 
 fn is_condition(step: &Step) -> bool {
-    matches!(
-        step,
-        Step::WaitLog { .. }
-            | Step::WaitChanged { .. }
-            | Step::WaitStable { .. }
-            | Step::IfLog { .. }
-    )
+    match step {
+        Step::WaitLog { .. } | Step::WaitChanged { .. } | Step::WaitStable { .. } => true,
+        Step::If { cond, .. } => cond.waits(),
+        _ => false,
+    }
 }
 
-/// Every `wait` directly follows a condition wait (an if-log's body starts after its condition) and stays under [`FIXED_WAIT_MAX_MS`].
+/// Every `wait` directly follows a condition wait (an if-log's body starts after its condition; an if-same judges at once, so its body does not) and stays under [`FIXED_WAIT_MAX_MS`].
 fn lint_waits(steps: &[Step], after_condition: bool) -> Result<()> {
     let mut prev_condition = after_condition;
     for (i, step) in steps.iter().enumerate() {
@@ -131,8 +129,9 @@ fn lint_waits(steps: &[Step], after_condition: bool) -> Result<()> {
                 i + 1
             );
         }
-        if let Step::IfLog { body, .. } = step {
-            lint_waits(body, true).with_context(|| format!("in the if-log of step {}", i + 1))?;
+        if let Step::If { cond, body } = step {
+            lint_waits(body, cond.waits())
+                .with_context(|| format!("in the branch of step {}", i + 1))?;
         }
         prev_condition = is_condition(step);
     }
@@ -356,6 +355,11 @@ mod tests {
         // an if-log's body starts after its condition
         lint_row(&format!("{GOOD}if-log app x 100\nwait 200\nend\n"))
             .expect("wait opens an if-log body");
+        // an if-same judges at once: nothing to wait after
+        red(
+            &format!("{GOOD}mark m\nif-same m\nwait 200\nend\n"),
+            "follows no condition wait",
+        );
     }
 
     /// The design's S5 example shape, written out by hand.

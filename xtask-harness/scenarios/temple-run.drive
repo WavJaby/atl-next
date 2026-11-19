@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # temple-run 1.43.0 (Google Play, Unity il2cpp, arm64 only -> native bridge). Positions read at 562x900 content.
-# Fresh root: intro flight -> "Thanks! ... 500 Coins" popup over the menu (every fresh root) -> event popups while a Global Challenge runs -> menu with idol + PLAY -> run; the tutorial does not wait for a swipe (the runner dies at the first corner and the run restarts by itself).
+# Fresh root: intro flight -> "Thanks! ... 500 Coins" popup over the menu (every fresh root) -> two event popups + a challenge-screen visit while a Global Challenge runs -> menu with idol + PLAY -> run; the tutorial does not wait for a swipe (the runner dies at the first corner and the run restarts by itself).
 size 562 900
 needs arm64
 control break-input
@@ -15,19 +15,27 @@ wait-log app "[TemplePrefab] System RAM" 60000
 wait-changed 40 300 480 280 20000
 wait-stable 40 300 480 280 20000 1500
 mark popup 40 300 480 100
+# the panel's plain left border: pixel-equal in the coins and "Global Challenges" popups, the menu's wall when no popup is up
+mark panel 48 450 24 50
 expect-varied 40 300 480 280
 touch 280 540 150
-# the popup closes within the touch: compare against the mark, not against a wait's own start
+# the popup closes within the touch (the next one, if any, is up at once): compare against the mark, not against a wait's own start
 wait-stable 40 300 480 100 10000 1000
 expect-changed popup 40 300 480 100
-# while a server-driven Global Challenge runs (seen 2026-11-19, menu countdown 4d 9h), two more popups follow, neither logged:
-# "Global Challenges" (Close at the same 280 540) then "Cumulative Distance" (Close at 280 625 = PLAY's spot); without the event 280 540 is the idol, inert
+# while a server-driven Global Challenge runs (seen 2026-11-19, 4d 9h left on the menu's event icon) two more popups follow, none logged,
+# and PLAY stays inert until the challenge screen has been opened once (an arrow points at its icon): close both, open it, BACK
+if-same panel
 touch 280 540 150
+# "Cumulative Distance" popup: its title sits in this band, its Close at PLAY's spot
 wait-stable 40 200 480 100 10000 1000
-mark menu
-# so 280 625 twice with no checkpoint between: with the event the first closes the last popup, without it the first is PLAY and the second a tap in the run
 touch 280 625 150
-wait-frames 10
+wait-stable 40 200 480 100 10000 1000
+touch 480 405 150
+wait-stable 40 40 480 100 10000 1000
+touch 280 845 150
+wait-stable 40 200 480 100 10000 1000
+end
+mark menu
 touch 280 625 150
 # GameController reloads the upgrade levels when a run starts (absent after WARMING DONE without PLAY, S1 r0)
 wait-log app "[CRASH GetPlayerLevelForUpgradeType" 20000
