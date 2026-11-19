@@ -500,7 +500,9 @@ impl Drop for Cpu {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|&e| e != self.env as usize);
         crate::signal::unregister_thread();
-        if !self.ts.is_null() {
+        // break `keep-cpu`: the CPU and its TaskState stay allocated (qemu-thread check c must go red)
+        let teardown = !self.ts.is_null() && !cfg!(atl_qe_keep_cpu);
+        if teardown {
             let cpu = env_cpu(self.env).cast::<c_void>();
             // SAFETY: this thread's own CPU (cpu_copy in attach), idle now; the exit path's teardown order.
             unsafe {
@@ -512,8 +514,10 @@ impl Drop for Cpu {
             // SAFETY: this thread's thread_cpu instance.
             unsafe { slot.write(std::ptr::null_mut()) };
         }
-        // SAFETY: the TaskState attach calloc'd (null when none); its CPU is gone.
-        unsafe { libc::free(self.ts.cast()) };
+        if teardown {
+            // SAFETY: the TaskState attach calloc'd; its CPU is gone.
+            unsafe { libc::free(self.ts.cast()) };
+        }
         // SAFETY: this thread registered in attach.
         unsafe { (api.rcu_unregister_thread)() };
     }

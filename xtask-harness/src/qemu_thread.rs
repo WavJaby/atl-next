@@ -4,7 +4,7 @@
 //! Library: the engine `.so` (`qemu_spike::engine_so_file`), as `qemu-linker` uses it. Fixture: `xtask-harness/testdata/qemu-thread/fixture.c` (PIE, NDK clang, DT_NEEDED libc.so). Boot: the engine boot executable (`qemu::boot_exe`, crates/atl-qemu-boot).
 //! Images: `--nb <dir>` is the arm64 NB dir (`<out>/nb-graph-arm64/nb/arm64`), built as for `test qemu-linker`.
 //! A guest thread's `pthread_getattr_np` reports the guest stack its attr sized (R-10 S3, check g), and concurrent down calls from two host threads keep disjoint stacks (check i).
-//! Harness: `tests/qemu_thread.rs` (harness-less; checks s, p, j, d, k, m, x, r, q, c, g, i) run through `qemu_linker::harness`. Breaks (`ATL_NB_BREAK`): `qt_handle_glibc`, `qt_exit_resume`, `dns_glibc_order`, `qt_skip_dtor`, `qt_routine_arg`, `qt_attr_size`, `qt_getattr_glibc`, `qt_keep_windows`. Check c (thread churn) gives back every engine window: its plain-run line `qemu-thread: churn ...` carries the per-thread resident and VmSize deltas. Checks k and m (guest setjmp family) have no flag break: their break is a guest libc built without NBS patch 0006, whose setjmp stubs then have no host row (`--nb` on such a build: k red).
+//! Harness: `tests/qemu_thread.rs` (harness-less; checks s, p, j, d, k, m, x, r, q, c, g, i) run through `qemu_linker::harness`. Breaks (`ATL_NB_BREAK`): `qt_handle_glibc`, `qt_exit_resume`, `dns_glibc_order`, `qt_skip_dtor`, `qt_routine_arg`, `qt_attr_size`, `qt_getattr_glibc`, `qt_keep_windows`; engine break (`ATL_QEMU_ENGINE_BREAK`, [`ENGINE_BREAKS`]): `keep-cpu`. Check c (thread churn) gives back every engine window and judges the per-thread heap and resident growth; its line `qemu-thread: churn ...` carries the deltas. Checks k and m (guest setjmp family) have no flag break: their break is a guest libc built without NBS patch 0006, whose setjmp stubs then have no host row (`--nb` on such a build: k red).
 //! Property area (check p): the guest cannot set properties (the provider's set is ENOENT), so the gate writes `SEEDED` `atl.qt.p.<i>` properties and `atl.qt.expect` into a copy of the native out dir's build.prop, and the area writer (atl-property-service, the broker's own) lays out the area the provider maps through `ATL_PROP_AREA`.
 //! Output: `<out>/qemu/<target>-linux-user-pic/qemu-thread/`, one log per run; the plain run's log carries the call-cost line.
 
@@ -45,6 +45,8 @@ const HARNESS: Harness = Harness {
         "qt_keep_windows",
     ],
 };
+/// Engine breaks (atl-qemu-engine build.rs `BREAKS`), each on its own engine `.so` (`qemu_spike::engine_so_break`): `keep-cpu` (detach skips the CPU teardown, check c).
+const ENGINE_BREAKS: &[&str] = &["keep-cpu"];
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -87,22 +89,35 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // the host's out dir, whichever graph `--nb` names: build.prop and the property-service cargo target are the host's
     let out = out::out_dir(root, args.out.as_deref())?;
     let area = seed_area(root, &out, &dir)?;
-    let env: [(&str, &Path); 6] = [
-        ("ATL_ENGINE_SO", &so),
-        ("ATL_NB_BOOT", &boot),
-        ("ATL_NB_THREADEXE", &fixture),
-        ("ATL_NB_LINKER", &linker),
-        ("ATL_NB_VDSO", &vdso),
-        (atl_android_paths::PROPERTY_AREA_ENV, &area),
-    ];
-    let mut runs: Vec<Option<&str>> = vec![None];
+    // (native-bridge break, engine break); both None = the plain run
+    let mut runs: Vec<(Option<&str>, Option<&str>)> = vec![(None, None)];
     if !args.no_breaks {
-        runs.extend(HARNESS.breaks.iter().map(|b| Some(*b)));
+        runs.extend(HARNESS.breaks.iter().map(|&k| (Some(k), None)));
+        runs.extend(ENGINE_BREAKS.iter().map(|&k| (None, Some(k))));
     }
     let total = runs.len();
     let mut fails = Vec::new();
-    for brk in runs {
+    for (nb, eng) in runs {
+        let brk = nb.or(eng);
         let name = format!("{}-{}", HARNESS.prefix, brk.unwrap_or("plain"));
+        let so_run = match eng {
+            None => so.clone(),
+            Some(k) => match qemu_spike::engine_so_break(root, &b, &dir.join("engine"), k) {
+                Ok(built) => built,
+                Err(e) => {
+                    fails.push(Failure::step(&name, format!("{e:#}")));
+                    continue;
+                }
+            },
+        };
+        let env: [(&str, &Path); 6] = [
+            ("ATL_ENGINE_SO", &so_run),
+            ("ATL_NB_BOOT", &boot),
+            ("ATL_NB_THREADEXE", &fixture),
+            ("ATL_NB_LINKER", &linker),
+            ("ATL_NB_VDSO", &vdso),
+            (atl_android_paths::PROPERTY_AREA_ENV, &area),
+        ];
         let run =
             qemu_linker::harness(root, &dir, &HARNESS, &env, &dir, brk, &name).and_then(|()| {
                 match brk {

@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Thu, 19 Nov 2026 12:47:05 +0800
+Subject: [PATCH] target/arm: free the cpreg lists and dynamic gdb features on
+ finalize
+
+arm_cpu_realizefn allocates per CPU the cpreg index/value lists
+(arm_init_cpreg_list) and the dynamic gdb features
+(arm_gen_dynamic_*_feature: XML text, register name array, sysreg
+key array), but arm_cpu_finalizefn frees none of them. linux-user
+creates a CPU per guest thread and finalizes it at thread exit, so
+every exited thread leaks them: 31.8 KB of heap per thread on an
+aarch64 guest (5.8 KB cpreg lists, 26 KB gdb features), measured
+with mallinfo2 over 12000 threads.
+
+Upstream-Status: Pending
+Patch-Reason: the allocations are QEMU-internal per-CPU state that only the CPU's own finalizer can free; no launcher, loader or environment can.
+---
+SPDX-License-Identifier: GPL-2.0-or-later
+ target/arm/cpu.c | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/target/arm/cpu.c b/target/arm/cpu.c
+index 787e4dc7ab23377fb9bc50e2532e841b193a1968..810508e2f22cf3381f05729c484f2b39ba107a9a 100644
+--- a/target/arm/cpu.c
++++ b/target/arm/cpu.c
+@@ -1718,6 +1718,14 @@ static void arm_cpu_post_init(Object *obj)
+     qdev_property_add_static(DEVICE(obj), &arm_cpu_cfgend_property);
+ }
+ 
++/* What gdb_feature_builder_end and the arm_gen_dynamic_*_feature builders allocated. */
++static void arm_free_dynamic_gdb_feature(DynamicGDBFeatureInfo *f)
++{
++    g_free((char *)f->desc.xml);
++    g_free((void *)f->desc.regs);
++    g_free(f->data.cpregs.keys);
++}
++
+ static void arm_cpu_finalizefn(Object *obj)
+ {
+     ARMCPU *cpu = ARM_CPU(obj);
+@@ -1725,6 +1733,14 @@ static void arm_cpu_finalizefn(Object *obj)
+     ARMCPRegMigTolerance *t, *n;
+ 
+     g_hash_table_destroy(cpu->cp_regs);
++    g_free(cpu->cpreg_indexes);
++    g_free(cpu->cpreg_values);
++    arm_free_dynamic_gdb_feature(&cpu->dyn_sysreg_feature);
++    arm_free_dynamic_gdb_feature(&cpu->dyn_svereg_feature);
++    arm_free_dynamic_gdb_feature(&cpu->dyn_smereg_feature);
++    arm_free_dynamic_gdb_feature(&cpu->dyn_m_systemreg_feature);
++    arm_free_dynamic_gdb_feature(&cpu->dyn_m_secextreg_feature);
++    arm_free_dynamic_gdb_feature(&cpu->dyn_tls_feature);
+ 
+     QLIST_FOREACH_SAFE(hook, &cpu->pre_el_change_hooks, node, next) {
+         QLIST_REMOVE(hook, node);

@@ -3,7 +3,7 @@
 //! The guest's threads are glibc threads (the stub libc's `pthread_create` is the host shim). Each attaches its own engine CPU on its first guest call, runs its routine, and at exit runs its guest key destructor through a crossing on that thread.
 //! Env (xtask qemu_thread.rs sets it; unset prints SKIP): ATL_ENGINE_SO (the engine `.so`), ATL_NB_BOOT (the engine boot executable, crates/atl-qemu-boot), ATL_NB_THREADEXE (fixture.c, PIE), ATL_NB_LINKER, ATL_NB_VDSO (the arm64 NB images; `<nb>/libnative_bridge_guest_libc` among the guest library directories).
 //! Expected values come from the property store and the fixture's C source, never from the engine: xtask seeds `atl.qt.p.<i>` and `atl.qt.expect` into the area (ATL_PROP_AREA), and the provider's foreach must count exactly `atl.qt.expect` of them; qt_join(x) = x + 1000 (fixture.c `QT_JOIN_OFFSET`); the destructor stores the value its thread's key held at exit.
-//! Checks: (s) started, (p) foreach counts the seeded properties, (j) pthread_create's routine got its argument and its result reached pthread_join, (d) the key destructor ran at thread exit with the thread's value, (g) a guest thread's `pthread_getattr_np(pthread_self())` contains its sp and reports the size its attr asked for (fixture.c `QT_SMALL_STACK`), or 1 MiB without an attr, with a guard of one host page (the engine's default, bionic `PTHREAD_GUARD_SIZE`), (i) two host threads in concurrent down calls each keep a 64 KiB stack pattern intact while the other's is live, with sp in their own reported range and the two ranges disjoint, (k) guest setjmp / longjmp round trip from a deeper frame (fixture.c `QT_JMP_VALUE`, volatile local kept), (m) siglongjmp restores the mask sigsetjmp(b, 1) saved (SIGUSR1 unblocked again). Both run the guest libc's bionic setjmp.S: the NBS patch drops the arm64 setjmp stubs, so no host side exists. (x) a guest thread's pthread_exit, one frame below its routine, hands join its value (fixture.c `QT_EXIT_OFFSET`) and its key destructor runs with the thread's value. (r) getaddrinfo("localhost", "80", AF_INET stream, AI_CANONNAME) read in bionic's addrinfo layout (family, socktype, protocol, addrlen, port 80, 127.0.0.1, canonname), getnameinfo numeric back to "127.0.0.1" / "80", freeaddrinfo, gethostbyname("127.0.0.1"), gethostbyaddr(127.0.0.1) names it (engine/netdb.rs; fixture.c `qt_resolve`). (q) tr-first blocker 4: one guest handle per thread (engine/thread.rs `THREADS`): pthread_kill(handle, SIGUSR2) runs the handler on the target (its pthread_self equals the handle), the target's pthread_self equals pthread_create's handle, pthread_gettid_np(handle) is the target's gettid, join hands back the target's pthread_self, the creator's own handle differs (fixture.c `qt_kill`). (c) thread churn: created + joined guest threads give back every `Active::reserve` block (engine `unmap_window`, ABI 4.2; break `qt_keep_windows`).
+//! Checks: (s) started, (p) foreach counts the seeded properties, (j) pthread_create's routine got its argument and its result reached pthread_join, (d) the key destructor ran at thread exit with the thread's value, (g) a guest thread's `pthread_getattr_np(pthread_self())` contains its sp and reports the size its attr asked for (fixture.c `QT_SMALL_STACK`), or 1 MiB without an attr, with a guard of one host page (the engine's default, bionic `PTHREAD_GUARD_SIZE`), (i) two host threads in concurrent down calls each keep a 64 KiB stack pattern intact while the other's is live, with sp in their own reported range and the two ranges disjoint, (k) guest setjmp / longjmp round trip from a deeper frame (fixture.c `QT_JMP_VALUE`, volatile local kept), (m) siglongjmp restores the mask sigsetjmp(b, 1) saved (SIGUSR1 unblocked again). Both run the guest libc's bionic setjmp.S: the NBS patch drops the arm64 setjmp stubs, so no host side exists. (x) a guest thread's pthread_exit, one frame below its routine, hands join its value (fixture.c `QT_EXIT_OFFSET`) and its key destructor runs with the thread's value. (r) getaddrinfo("localhost", "80", AF_INET stream, AI_CANONNAME) read in bionic's addrinfo layout (family, socktype, protocol, addrlen, port 80, 127.0.0.1, canonname), getnameinfo numeric back to "127.0.0.1" / "80", freeaddrinfo, gethostbyname("127.0.0.1"), gethostbyaddr(127.0.0.1) names it (engine/netdb.rs; fixture.c `qt_resolve`). (q) tr-first blocker 4: one guest handle per thread (engine/thread.rs `THREADS`): pthread_kill(handle, SIGUSR2) runs the handler on the target (its pthread_self equals the handle), the target's pthread_self equals pthread_create's handle, pthread_gettid_np(handle) is the target's gettid, join hands back the target's pthread_self, the creator's own handle differs (fixture.c `qt_kill`). (c) thread churn: created + joined guest threads give back every `Active::reserve` block (engine `unmap_window`, ABI 4.2; break `qt_keep_windows`) and leave no host heap or resident growth past `CHURN_BOUND` per thread (QEMU patch 0007, the ARM CPU finalizer; engine break `keep-cpu`).
 //! Output: `qemu-thread: (x) ok` per check, `(x) FAIL <why>` otherwise, and one `qemu-thread: call-cost` line (not a check: the round trip of a no-op guest call on this thread). Exit 0 when all pass.
 #![expect(
     clippy::disallowed_types,
@@ -285,10 +285,25 @@ fn started(r: Result<Guest, String>) -> u64 {
     u64::from(!ok)
 }
 
-/// Guest threads check (c) creates and joins after its warm-up. The verdict is the exact `RESERVED` count, so any number decides it; 2000 (~1.5 s) keeps the printed per-thread memory deltas past allocator granularity (a 64 MiB malloc arena / 2000 = 32 KiB).
+/// Guest threads check (c) creates and joins after its warm-up (~1.5 s). Enough that a leak above [`CHURN_BOUND`] lifts the totals far past their noise: a 64 MiB malloc arena / 2000 = 32 KiB, and the leak QEMU's ARM CPU finalizer had (31.8 KB/thread) grew in-use heap by 64 MB here.
 const CHURN: usize = 2_000;
 /// Threads before (c)'s baseline: glibc's stack cache and QEMU's first-use allocations settle in them.
 const CHURN_WARMUP: usize = 200;
+/// Largest growth per joined thread check (c) accepts, of glibc's in-use heap (`mallinfo2().uordblks`) and of `VmRSS`, in bytes. Measured with the teardown complete: heap 0 net, rounds of 3000 threads within +-331 B/thread, resident within +-624 B/thread; the smallest per-thread leak seen, the ARM CPU's cpreg lists, was 5.8 KB/thread (the whole ARM finalizer leak 31.8 KB). 2 KiB = 3x the noise and under half that leak.
+const CHURN_BOUND: i128 = 2048;
+
+/// glibc's in-use heap bytes, all arenas (`mallinfo2().uordblks`; struct mallinfo2, malloc.h: ten size_t fields, uordblks the eighth).
+fn heap_in_use() -> usize {
+    #[repr(C)]
+    struct Mallinfo2 {
+        fields: [usize; 10],
+    }
+    unsafe extern "C" {
+        fn mallinfo2() -> Mallinfo2;
+    }
+    // SAFETY: glibc's query, no arguments; returns the struct by value.
+    unsafe { mallinfo2() }.fields[7]
+}
 
 /// `VmRSS` and `VmSize` of this process in bytes (`/proc/self/status`, kB fields).
 fn vm() -> Result<(u64, u64), String> {
@@ -303,7 +318,7 @@ fn vm() -> Result<(u64, u64), String> {
     Ok((field("VmRSS:")?, field("VmSize:")?))
 }
 
-/// Check (c), thread churn: [`CHURN`] guest threads created and joined (`qt_join`) give back every `Active::reserve` block (engine `unmap_window`): `RESERVED` returns to its start value. Prints the per-thread resident and VmSize deltas, not judged: a malloc-heap growth per thread outside the window seam (origin/main 03b66815 too) is not this check's quantity.
+/// Check (c), thread churn: [`CHURN`] guest threads created and joined (`qt_join`) give back every `Active::reserve` block (engine `unmap_window`): `RESERVED` returns to its start value; and leave nothing on the host heap: in-use heap and resident grow at most [`CHURN_BOUND`] per thread (break `keep-cpu`: the CPU teardown skipped). VmSize is printed, not judged: glibc may add an arena when threads overlap.
 fn churn(guest: &mut Guest, join: usize) -> Result<(), String> {
     use std::sync::atomic::Ordering;
     let run = |guest: &mut Guest, n: usize| -> Result<(), String> {
@@ -318,24 +333,40 @@ fn churn(guest: &mut Guest, join: usize) -> Result<(), String> {
     };
     run(guest, CHURN_WARMUP)?;
     let reserved = atl_native_bridge::engine::RESERVED.load(Ordering::Relaxed);
+    let heap = heap_in_use();
     let (rss, size) = vm()?;
     let t = Instant::now();
     run(guest, CHURN)?;
     let ms = t.elapsed().as_millis();
     let left = atl_native_bridge::engine::RESERVED.load(Ordering::Relaxed);
+    let heap2 = heap_in_use();
     let (rss2, size2) = vm()?;
     let per = |a: u64, b: u64| (i128::from(b) - i128::from(a)) / CHURN as i128;
+    let heap_per = per(heap as u64, heap2 as u64);
+    let rss_per = per(rss, rss2);
     println!(
-        "qemu-thread: churn {CHURN} threads in {ms} ms: reserved {reserved} -> {left}, rss {} B/thread, vmsize {} B/thread",
-        per(rss, rss2),
+        "qemu-thread: churn {CHURN} threads in {ms} ms: reserved {reserved} -> {left}, heap {heap_per} B/thread, rss {rss_per} B/thread, vmsize {} B/thread (bound {CHURN_BOUND})",
         per(size, size2)
     );
-    if left == reserved {
+    let mut why = Vec::new();
+    if left != reserved {
+        why.push(format!(
+            "{} reserve blocks not given back",
+            left as i128 - reserved as i128
+        ));
+    }
+    if heap_per > CHURN_BOUND {
+        why.push(format!("in-use heap grew {heap_per} B/thread"));
+    }
+    if rss_per > CHURN_BOUND {
+        why.push(format!("resident grew {rss_per} B/thread"));
+    }
+    if why.is_empty() {
         Ok(())
     } else {
         Err(format!(
-            "{} reserve blocks not given back after {CHURN} joined threads",
-            left as i128 - reserved as i128
+            "after {CHURN} joined threads: {} (bound {CHURN_BOUND} B/thread)",
+            why.join(", ")
         ))
     }
 }

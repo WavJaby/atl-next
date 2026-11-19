@@ -160,6 +160,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("ignore-size", "atl_qe_ignore_size"),
     // gate (qemu-abi, f): create leaves QEMU's RCU registration on the loading thread, which attach then registers twice: the registry turns into a cycle, the next grace period never ends and fork blocks
     ("rcu-twice", "atl_qe_rcu_twice"),
+    // gate (qemu-thread, c): detach skips the CPU teardown (unparent, unref -> finalize) and keeps the TaskState, so every exited thread leaves its CPU on the heap
+    ("keep-cpu", "atl_qe_keep_cpu"),
     // gate (u): attach copies the oldest live attached CPU (a running parent) instead of the parked boot CPU, keeping its sp: the child's frames land on the parent's stack
     ("copy-caller", "atl_qe_copy_caller"),
     // gate (v): attach registers no guest alternate stack, so an SA_ONSTACK handler for a stack overflow has nowhere to run and QEMU kills the process
