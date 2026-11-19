@@ -270,8 +270,11 @@ impl Active {
                 RESERVED.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
             Err(e) => {
-                let line = format!("atl-native-bridge: release {at:#x}+{len:#x} refused: {e}\n");
-                let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
+                atl_diag::count(
+                    atl_diag::REFUSED,
+                    "native-bridge.window-release",
+                    Some(&format!("{at:#x}+{len:#x}: {e}")),
+                );
             }
         }
     }

@@ -54,7 +54,7 @@ pub(super) fn call_mapped((soname, symbol, maps): MappedRow, mut lanes: [usize; 
     // SAFETY: as above; every other lane is a host value in this address space, every mapped one the host's own.
     let ret = unsafe { f(lanes[0], lanes[1], lanes[2], lanes[3], lanes[4], lanes[5]) };
     for (i, guest, map, mut t) in temps {
-        // a refused host pointer is written NULL and counted (convert.rs); logged once per row
+        // a refused host pointer is written NULL and counted (convert.rs); reported here with the row and lane
         let ok = match map {
             // SAFETY: `guest` is the guest's pointer read above, writable: a non-const pointee.
             LaneMap::Record(c, true) => unsafe { convert::to_guest(c, t.ptr(), guest as *mut u8) },
@@ -63,25 +63,11 @@ pub(super) fn call_mapped((soname, symbol, maps): MappedRow, mut lanes: [usize; 
             _ => true,
         };
         if !ok {
-            refused_once(symbol, i);
+            super::dispatch::report_refused(
+                super::dispatch::REFUSED_OUT,
+                &format!("{symbol} parameter {i}"),
+            );
         }
     }
     ret
-}
-
-/// Logs the first refused write-back per (symbol, lane): a host pointer at or above 4 GiB the 32-bit guest's word cannot hold.
-#[allow(
-    clippy::print_stderr,
-    reason = "once per row and lane, as dispatch.rs `ilp32_narrow`: the crate has no logger"
-)]
-fn refused_once(symbol: &'static str, lane: usize) {
-    static LOGGED: std::sync::Mutex<Vec<(&str, usize)>> = std::sync::Mutex::new(Vec::new());
-    if let Ok(mut l) = LOGGED.lock()
-        && !l.contains(&(symbol, lane))
-    {
-        l.push((symbol, lane));
-        eprintln!(
-            "atl-native-bridge: qemu crossing: refused a host pointer to the 32-bit guest from {symbol} parameter {lane} (at or above 4 GiB; written NULL)"
-        );
-    }
 }

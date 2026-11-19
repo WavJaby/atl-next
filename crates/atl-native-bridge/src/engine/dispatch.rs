@@ -192,30 +192,29 @@ fn call_host(guest: HostRules, target: usize, lanes: &AtlLanes, sig: Sig) -> Ans
     guest_answer(guest, sig.ret, ilp32_narrow(guest, sig.ret, target, answer))
 }
 
-/// Host pointer results a 32-bit guest was refused ([`ilp32_narrow`]): the measurement phase4-32bit P4b names its largest uncertainty; a gate on a 32-bit guest asserts it 0.
+/// Host pointers a 32-bit guest was refused (a result, [`ilp32_narrow`]; a down-call argument, [`place`]; a record field or out word, convert.rs): the measurement phase4-32bit P4b names its largest uncertainty; a gate on a 32-bit guest asserts it 0.
 pub static ILP32_REFUSED: AtomicUsize = AtomicUsize::new(0);
 
-/// A pointer result for a 32-bit guest (`guest`): at or above 4 GiB it cannot reach the guest, whose word would truncate it to another address; refused instead -- the answer becomes null (the C error value of a pointer result), [`ILP32_REFUSED`] counts it and the first refusal per host function is logged by its symbol name. Below 4 GiB, and every other class or guest, unchanged.
-#[allow(
-    clippy::print_stderr,
-    reason = "once per host function, as bindings.rs `report`: the crate has no logger"
-)]
+/// atl-diag keys of a host pointer refused to a 32-bit guest, by where it was going.
+pub(in crate::engine) const REFUSED_RESULT: &str = "native-bridge.ilp32-result";
+pub(in crate::engine) const REFUSED_ARG: &str = "native-bridge.ilp32-argument";
+pub(in crate::engine) const REFUSED_OUT: &str = "native-bridge.ilp32-out";
+
+/// Reports one host pointer refused to a 32-bit guest under `key` (`REFUSED_*`), `cause` naming the function and position; [`ILP32_REFUSED`] is counted by the caller.
+pub(in crate::engine) fn report_refused(key: &str, cause: &str) {
+    atl_diag::count(atl_diag::REFUSED, key, Some(cause));
+}
+
+/// A pointer result for a 32-bit guest (`guest`): at or above 4 GiB it cannot reach the guest, whose word would truncate it to another address; refused instead -- the answer becomes null (the C error value of a pointer result), counted in [`ILP32_REFUSED`] and reported with the host function's symbol name. Below 4 GiB, and every other class or guest, unchanged.
 fn ilp32_narrow(guest: HostRules, ret: Class, target: usize, answer: Answer) -> Answer {
     if guest.word_bits != 32 || ret != Class::Ptr || answer.x0 <= WORD {
         return answer;
     }
     ILP32_REFUSED.fetch_add(1, Ordering::Relaxed);
-    static LOGGED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
-    if let Ok(mut l) = LOGGED.lock()
-        && !l.contains(&target)
-    {
-        l.push(target);
-        eprintln!(
-            "atl-native-bridge: qemu crossing: refused a host pointer {:#x} to the 32-bit guest from {} (at or above 4 GiB; answered null)",
-            answer.x0,
-            symbol_name(target)
-        );
-    }
+    report_refused(
+        REFUSED_RESULT,
+        &format!("{} answered {:#x}", symbol_name(target), answer.x0),
+    );
     Answer { x0: 0, ..answer }
 }
 
@@ -642,7 +641,7 @@ fn write(lanes: &mut [u64], i: usize, n: usize, value: u64) {
     }
 }
 
-/// A value of class `class` read from a side of `from` bits, as a side of `to` bits holds it. Between sides of one width it is unchanged (a 64-bit value on a 32-bit side was joined by [`read`]). Into 64 bits from 32: an integer is extended by its signedness (B.2 left a narrower one extended to the word; a 64-bit host's `long` parameter reads all 64 bits), a pointer zero-extended, a float's bits stay low. Into 32 bits from 64: the low word (SysV and LP64D leave the bits above a 32-bit argument to the callee; a host pointer at or above 4 GiB is the window's refusal, phase4-32bit P4b).
+/// A value of class `class` read from a side of `from` bits, as a side of `to` bits holds it. Between sides of one width it is unchanged (a 64-bit value on a 32-bit side was joined by [`read`]). Into 64 bits from 32: an integer is extended by its signedness (B.2 left a narrower one extended to the word; a 64-bit host's `long` parameter reads all 64 bits), a pointer zero-extended, a float's bits stay low. Into 32 bits from 64: the low word (SysV and LP64D leave the bits above a 32-bit argument to the callee); a host pointer at or above 4 GiB never reaches here ([`place`] refuses it, phase4-32bit P4b).
 fn convert(class: Class, value: u64, from: u32, to: u32) -> u64 {
     if from == to || class.bytes(32) == 8 {
         return value;
@@ -654,7 +653,7 @@ fn convert(class: Class, value: u64, from: u32, to: u32) -> u64 {
 }
 
 /// The `to` side's lanes for a call whose arguments have the classes `params`, read from `from`, the `from` side's image (x[0..int_lanes], v[0..fp_lanes], its stack words). One placement for both directions: down = (host rules -> guest rules), up = (guest rules -> host rules), the guest's [`AAPCS64`] or [`AAPCS32`].
-/// Every ABI here takes integers and fp arguments by class in declaration order ([`Assign::next`]: SysV 6 integer registers, LP64D and AAPCS64 8, AAPCS32 4; eight fp registers, none on AAPCS32's base standard). A value crossing between word widths is [`convert`]ed. A float going into an fp register of a `nan_box_f32` side is NaN-boxed (RISC-V: upper 32 bits ones; AArch64 leaves them zero). `None` when either side needs more stack words than it carries (R-1): with fp-to-int on one side, the other can need more stack words.
+/// Every ABI here takes integers and fp arguments by class in declaration order ([`Assign::next`]: SysV 6 integer registers, LP64D and AAPCS64 8, AAPCS32 4; eight fp registers, none on AAPCS32's base standard). A value crossing between word widths is [`convert`]ed. A float going into an fp register of a `nan_box_f32` side is NaN-boxed (RISC-V: upper 32 bits ones; AArch64 leaves them zero). A pointer at or above 4 GiB going to a 32-bit side cannot be held by its word: refused as a result is ([`ilp32_narrow`]) -- passed null, counted in [`ILP32_REFUSED`], reported. `None` when either side needs more stack words than it carries (R-1): with fp-to-int on one side, the other can need more stack words.
 fn place(
     params: &[Class],
     from: &AtlLanes,
@@ -663,13 +662,19 @@ fn place(
 ) -> Option<AtlLanes> {
     let mut to = AtlLanes::default();
     let (mut src, mut dst) = (Assign::new(from_rules), Assign::new(to_rules));
-    for &class in params {
+    for (k, &class) in params.iter().enumerate() {
         let value = match src.next(class)? {
             Slot::X(i, n) => read(&from.regs, i, n),
             Slot::V(i) => from.fp[i],
             Slot::Stack(i, n) => read(&from.stack, i, n),
         };
-        let value = convert(class, value, from_rules.word_bits, to_rules.word_bits);
+        let value = if class == Class::Ptr && to_rules.word_bits == 32 && value > WORD {
+            ILP32_REFUSED.fetch_add(1, Ordering::Relaxed);
+            report_refused(REFUSED_ARG, &format!("argument {k} = {value:#x}"));
+            0
+        } else {
+            convert(class, value, from_rules.word_bits, to_rules.word_bits)
+        };
         match dst.next(class)? {
             Slot::X(i, n) => write(&mut to.regs, i, n, value),
             Slot::V(i) if class == Class::F32 && to_rules.nan_box_f32 => {
@@ -1242,9 +1247,30 @@ mod aapcs32_tests {
         assert_eq!(guest_answer(AAPCS64, I64, a), a);
     }
 
+    /// Serialises the tests that read [`ILP32_REFUSED`] before and after (the test threads share it).
+    static REFUSED_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A host pointer argument of a down call into a 32-bit guest: 2^32 - 1 passes whole, 2^32 (the first a 32-bit word cannot hold) is passed null and counted; an aarch64 guest gets it whole.
+    #[test]
+    fn ilp32_pointer_arguments_pass_below_4_gib_and_are_refused_above() {
+        let _serial = REFUSED_LOCK.lock();
+        let mut host = AtlLanes::default();
+        host.regs[0] = 0xffff_ffff;
+        // 2^32 + 0x10: truncated it would reach the guest as 0x10, another address
+        host.regs[1] = 0x1_0000_0010;
+        let before = ILP32_REFUSED.load(Ordering::Relaxed);
+        let guest = place(&[Class::Ptr, Class::Ptr], &host, HOST, AAPCS32).expect("registers");
+        assert_eq!((guest.regs[0], guest.regs[1]), (0xffff_ffff, 0));
+        assert_eq!(ILP32_REFUSED.load(Ordering::Relaxed), before + 1);
+        let guest = place(&[Class::Ptr, Class::Ptr], &host, HOST, AAPCS64).expect("registers");
+        assert_eq!((guest.regs[0], guest.regs[1]), (0xffff_ffff, 0x1_0000_0010));
+        assert_eq!(ILP32_REFUSED.load(Ordering::Relaxed), before + 1);
+    }
+
     /// A pointer result into a 32-bit guest: the highest address a 32-bit word holds (2^32 - 1) passes whole; 2^32, the first it cannot, answers null and is counted. An aarch64 guest and a 64-bit integer result are never narrowed here (a `long long` is the r0:r1 pair, `guest_ret32`).
     #[test]
     fn ilp32_pointer_results_pass_below_4_gib_and_are_refused_above() {
+        let _serial = REFUSED_LOCK.lock();
         let a = |x0| Answer { x0, x1: 0, v0: 0 };
         let before = ILP32_REFUSED.load(Ordering::Relaxed);
         assert_eq!(

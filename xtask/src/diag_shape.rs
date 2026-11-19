@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! `check` step `diag-shape`: no crate writes a free-text refusal or unimplemented line; an API outcome is counted through atl-diag (plan diagnostics-f4 D3), whose `diag:` lines the run summary ranks.
 //! A shape = a log macro (`eprintln!`, `writeln!`, tracing's `warn!` ...) whose string literals hold the word `refused` or `unimplemented`, in a crate's `src/` before its `#[cfg(test)]` module.
-//! Lines of another subject (driver faults, capability tiers, the QEMU crossing: plan "Out of this family by subject") are listed in [`OTHER_SUBJECT`] with their reason; an entry no line matches fails, so the list cannot rot.
+//! Lines of another subject (driver faults, capability tiers: plan "Out of this family by subject") are listed in [`OTHER_SUBJECT`] with their reason; an entry no line matches fails, so the list cannot rot.
 
 use std::path::Path;
 
@@ -37,16 +37,6 @@ const OTHER_SUBJECT: &[(&str, &str, &str)] = &[
         "crates/atl-audioflinger/src/track.rs",
         "invalid shared buffer alignment; refused",
         "shared-memory layout fault of an audio track, not a call's answer",
-    ),
-    (
-        "crates/atl-native-bridge/src/engine/dispatch.rs",
-        "refused a host pointer",
-        "QEMU crossing ABI event (a host pointer a 32-bit guest word cannot hold), counted in ILP32_REFUSED; no Android API call",
-    ),
-    (
-        "crates/atl-native-bridge/src/engine/ndk.rs",
-        "refused a host pointer",
-        "QEMU crossing ABI event (a converted out word or record field the 32-bit guest cannot hold), counted in ILP32_REFUSED; no Android API call",
     ),
 ];
 
