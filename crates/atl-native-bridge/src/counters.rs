@@ -10,7 +10,7 @@ use std::ffi::{c_int, c_void};
 use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
 
 use crate::engine::bindings::OBJECT_STUBS;
-use crate::engine::bindings::qemu::THUNKS;
+use crate::engine::bindings::QEMU_THUNKS as THUNKS;
 #[cfg(atl_nb_identity)]
 use crate::engine::identity::THUNKS as HOST_THUNKS;
 /// No host thunks in a core without the identity engine: its pool is empty.

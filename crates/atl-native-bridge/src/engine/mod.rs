@@ -104,11 +104,11 @@ pub fn active() -> Active {
 }
 
 /// Chooses the process's engine for app ISA `isa` (`None`: ART named none) and starts it ([`Engine::start`]). A second call must name the same engine: one bridge per process, one ABI per app (plan README "only one process width"), so a second foreign ISA is refused.
-/// An arm app is refused here, before the claim, until the arm guest's linker run and tables exist (phase4-32bit P4a / P4b): its engine boots (the QEMU gates do it through `qemu::boot`), but the app's libraries would bind through the arm64 tables. Delete with P4b's arm tables.
+/// An arm app is refused here, before the claim: the arm table's rows still pending an ILP32 conversion trap (bindings `qemu_arm`, phase4-32bit P4b s2-s4) and 32-bit JNI is P5. Its engine boots (the QEMU gates do it through `qemu::boot`). Delete with P5.
 pub fn select(isa: Option<&str>) -> Result<Active, String> {
     if isa.and_then(qemu::Arch::of_isa) == Some(qemu::Arch::Arm) {
         return Err(
-            "ISA arm: the arm guest has no linker run or tables yet (phase4-32bit P4a/P4b)"
+            "ISA arm: arm rows pending ILP32 conversion (P4b s2-s4) and 32-bit JNI (P5)"
                 .to_owned(),
         );
     }

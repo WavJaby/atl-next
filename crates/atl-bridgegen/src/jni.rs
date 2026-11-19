@@ -241,7 +241,7 @@ pub fn route(name: &str, sig: &Signature, env_listed: bool, callbacks: &[&str]) 
 }
 
 /// A callback signature's lanes as a JNI shorty: the result's letter, then one per parameter. The down shell (atl-native-bridge dispatch.rs `down_params`) places by bank and width, so an integer takes jni.h's type of its width (`Z` `B` `C` `S` by signedness, `I` 32 bits, `J` 64), a pointer `L`, a float `F`, a double `D`. Lossy only for unsigned 32/64 (`I`/`J`): a down call needs no extension into the guest, and the result shaping `I` asks for (LP64D, 32 bits sign-extended) applies to unsigned 32-bit values too.
-fn shorty(sig: &Signature) -> Result<String> {
+pub(crate) fn shorty(sig: &Signature) -> Result<String> {
     ensure!(!sig.variadic, "a variadic callback has no fixed lanes");
     let letter = |c: Class| match c {
         Class::Int { bits: 8, signed } => Ok(if signed { 'B' } else { 'Z' }),

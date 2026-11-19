@@ -16,10 +16,24 @@ pub(super) mod identity {
     include!(concat!(env!("OUT_DIR"), "/bindings_table_identity.rs"));
 }
 
-/// The QEMU engine's table: the arm64 NBS libc stub list; the NDK shims bind as in identity's.
-pub(crate) mod qemu {
-    include!(concat!(env!("OUT_DIR"), "/bindings_table_qemu.rs"));
+/// The QEMU engine's arm64 table: the arm64 NBS stub lists, prototypes from bionic's arm64 view; the NDK shims bind as in identity's.
+pub(crate) mod qemu_arm64 {
+    include!(concat!(env!("OUT_DIR"), "/bindings_table_qemu_arm64.rs"));
 }
+
+/// The QEMU engine's arm table: the arm NBS stub lists, prototypes from bionic's arm (ILP32) view; every row a lane class cannot convert traps `pending: ilp32 <kind>` (build.rs `ilp32_rows.txt`).
+#[allow(
+    unused_imports,
+    dead_code,
+    reason = "every arm row that would be lane-mapped traps until P5, so the mapped forwarder and its types go unused"
+)]
+pub(crate) mod qemu_arm {
+    include!(concat!(env!("OUT_DIR"), "/bindings_table_qemu_arm.rs"));
+}
+
+/// The QEMU thunk pool's size: one for every QEMU table (build.rs sizes it by the largest).
+pub(crate) const QEMU_THUNKS: usize = qemu_arm64::THUNKS;
+const _: () = assert!(qemu_arm::THUNKS == QEMU_THUNKS);
 
 /// One engine's generated table.
 struct Table {
@@ -60,20 +74,28 @@ fn table() -> Table {
             provider_soname: identity::PROVIDER_SONAME,
             prototypes: identity::PROTOTYPES,
         },
-        Active::Qemu(_) => qemu_table(),
+        Active::Qemu(arch) => qemu_table(arch),
     }
 }
 
-/// The QEMU engine's table, whatever engine this process runs.
-fn qemu_table() -> Table {
-    Table {
-        libs: qemu::LIBS,
-        trap_names: qemu::TRAP_NAMES,
-        traps: qemu::TRAPS,
-        mapped_rows: qemu::MAPPED_ROWS,
-        mapped_fns: qemu::MAPPED_FNS,
-        provider_soname: qemu::PROVIDER_SONAME,
-        prototypes: qemu::PROTOTYPES,
+/// The QEMU engine's table of guest `arch`, whatever engine this process runs.
+fn qemu_table(arch: super::qemu::Arch) -> Table {
+    macro_rules! of {
+        ($m:ident) => {
+            Table {
+                libs: $m::LIBS,
+                trap_names: $m::TRAP_NAMES,
+                traps: $m::TRAPS,
+                mapped_rows: $m::MAPPED_ROWS,
+                mapped_fns: $m::MAPPED_FNS,
+                provider_soname: $m::PROVIDER_SONAME,
+                prototypes: $m::PROTOTYPES,
+            }
+        };
+    }
+    match arch {
+        super::qemu::Arch::Aarch64 => of!(qemu_arm64),
+        super::qemu::Arch::Arm => of!(qemu_arm),
     }
 }
 
@@ -115,9 +137,10 @@ pub struct Lib {
 }
 
 /// JNI stubs per engine: one per slot of the largest JNI table (build.rs `OBJECT_STUBS`).
-pub const OBJECT_STUBS: usize = qemu::OBJECT_STUBS;
+pub const OBJECT_STUBS: usize = qemu_arm64::OBJECT_STUBS;
+const _: () = assert!(qemu_arm::OBJECT_STUBS == OBJECT_STUBS);
 #[cfg(atl_nb_identity)]
-const _: () = assert!(identity::OBJECT_STUBS == qemu::OBJECT_STUBS);
+const _: () = assert!(identity::OBJECT_STUBS == OBJECT_STUBS);
 
 /// One row of the table, for gates outside the engine (xtask `gl-proxies`, tests/qemu_gl.rs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,9 +171,9 @@ pub fn rows() -> impl Iterator<Item = (&'static str, &'static str, Binding)> {
     rows_of(table())
 }
 
-/// Every row of the QEMU engine's table, from any process (xtask `app-imports`: an APK's arm64 imports against it).
+/// Every row of the QEMU engine's arm64 table, from any process (xtask `app-imports`: an APK's arm64 imports against it).
 pub fn qemu_rows() -> impl Iterator<Item = (&'static str, &'static str, Binding)> {
-    rows_of(qemu_table())
+    rows_of(qemu_table(super::qemu::Arch::Aarch64))
 }
 
 fn rows_of(t: Table) -> impl Iterator<Item = (&'static str, &'static str, Binding)> {

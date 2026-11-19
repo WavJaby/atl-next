@@ -11,7 +11,7 @@ use super::objects::{self, Class, Refused, Sig};
 use super::{unsupported, va_list};
 use crate::engine::Down;
 use crate::engine::bindings::OBJECT_STUBS;
-use crate::engine::bindings::qemu::THUNKS;
+use crate::engine::bindings::QEMU_THUNKS as THUNKS;
 
 /// A trap from the engine, decoded from `atl_trap_kind`. `Boot` x0 = the auxv QEMU built for the boot executable (x1, its return stub, the engine keeps); `Call` and `Bind` carry their lanes (`atl_lanes`, filled by the guest's convention, qemu/arch.rs `Arch::rules`: AAPCS64 x0..x7 in `regs[0..8]`, v0..v7 in `fp[0..8]`, eight stack words; AAPCS32 r0..r3 in `regs[0..4]`, sixteen stack words); `Report` x0.
 #[derive(Clone, Copy, Debug)]

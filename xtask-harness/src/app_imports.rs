@@ -19,7 +19,7 @@ use crate::verdict::{Failure, Verdict};
 
 /// The APK's arm64 native library directory (zip entry prefix).
 const LIB_DIR: &str = "lib/arm64-v8a/";
-/// The guest ISA of the QEMU table (build.rs `QEMU_GUEST_ARCH`): the `.map.txt` arch tag.
+/// The guest ISA of the QEMU table checked here (`bindings::qemu_rows`, the arm64 table; build.rs `QEMU_GUESTS`): the `.map.txt` arch tag.
 const GUEST_ARCH: &str = "arm64";
 /// Default gated APK, relative to the workspace (plan D-Q7-6: the first arm64 app).
 const CTR: &str = "apk/cut-the-rope/3.63.0-arm64-v8a/cut-the-rope-3.63.0-arm64-v8a.apk";

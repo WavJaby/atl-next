@@ -9,7 +9,7 @@ use atl_engine_api::{PROT_EXEC, PROT_READ, PROT_WRITE};
 
 use crate::engine::Down;
 use crate::engine::Engine as _;
-use crate::engine::bindings::qemu::THUNKS;
+use crate::engine::bindings::QEMU_THUNKS as THUNKS;
 use crate::engine::dispatch::{TARGETS, down_params, down_ret};
 use crate::engine::image::{Image, write_sealed};
 use crate::engine::objects::{Class, Sig};

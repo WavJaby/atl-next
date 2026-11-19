@@ -63,9 +63,9 @@ struct DataEnds {
     format: usize,
 }
 
-// the Rust mirrors against the header's host view (build.rs `sl_layout_rs`; guest == host is checked there too)
+// the Rust mirrors against the header's host view (build.rs `sl_layout_rs`; guest == host is checked there for every equal-data-model guest; the arm table's SL rows trap until P6)
 const _: () = {
-    use super::bindings::qemu::{SL_DATA_SINK, SL_OUTPUT_MIX};
+    use super::bindings::qemu_arm64::{SL_DATA_SINK, SL_OUTPUT_MIX};
     use std::mem::{offset_of, size_of};
     assert!(size_of::<DataEnds>() as u64 == SL_DATA_SINK[0]);
     assert!(offset_of!(DataEnds, locator) as u64 == SL_DATA_SINK[1]);
