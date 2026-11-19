@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: MIT
+# temple-run-2 1.137.0 (Google Play split APK, Unity il2cpp, arm64 only -> native bridge). Positions read at 562x900 content.
+# Fresh root, offline: "Loading..." splash -> menu with the bundled "New This Season!" news (OK) -> bare menu -> PLAY -> "Swipe To Jump" tutorial.
+# Online adds network-config dialogs whose order and timing vary between fresh roots (Daily Reward, Starter Bundle; scn-s4): this scenario is offline only.
+size 562 900
+network offline
+needs arm64
+control break-input
+unreachable online dialogs: daily reward and starter bundle come from the network config, in varying order
+unreachable starter bundle bought: costs money
+unreachable save-me ad: AppLovin content from the network
+unreachable score: drawn digits only, no log line
+unreachable jump registered: no log line marks a swipe, and the running picture changes with or without one
+# the store and the ad SDK start with the menu UI; the splash stays up for tens of seconds after
+wait-log app "Screen DPI Percent" 240000
+# the splash's logo band holds still until the menu replaces it
+wait-changed 40 60 480 160 180000
+# the menu's idol glows, so its square holds still only once the news dialog covers it (scn-s4); the dialog then sits still
+wait-stable 200 420 120 140 60000 2000
+mark news 80 60 400 700
+touch 281 820 150
+# OK closes the dialog: the bare menu's idol glows again
+wait-changed 200 420 120 140 10000
+expect-changed news 80 60 400 700
+wait-stable 180 790 200 90 10000 1000
+mark menu
+touch 281 835 150
+wait-changed 0 0 562 900 10000
+wait 2500
+expect-changed menu
+# floor = half the lowest of 3 means over this window, WSL x86_64 readback, job s4-tr2-b2 (online, same run scene): 56.3 / 34.4 / 41.1
+expect-fps 17.2 tier=readback over 4000
+mark run
+touch-swipe 281 600 281 300 150
+wait-changed 0 0 562 900 3000
+expect-audio 5000
+expect-no-log services "refused IActivityTaskManager"
