@@ -273,7 +273,10 @@ pub(super) extern "C" fn gai_strerror(ecode: c_int) -> *const c_char {
         return GAI_ERRLIST[i].as_ptr();
     }
     let table = GAI_GUEST.get_or_init(|| {
-        let len: usize = GAI_ERRLIST.iter().map(|s| s.to_bytes_with_nul().len()).sum();
+        let len: usize = GAI_ERRLIST
+            .iter()
+            .map(|s| s.to_bytes_with_nul().len())
+            .sum();
         let base = reserve(len)?;
         let mut at = base;
         Some(
@@ -548,7 +551,11 @@ unsafe fn guest_hostent(h: *const libc::hostent) -> *mut c_void {
         }
         out
     };
-    let name: &[u8] = if h.h_name.is_null() { &[] } else { cstr(h.h_name) };
+    let name: &[u8] = if h.h_name.is_null() {
+        &[]
+    } else {
+        cstr(h.h_name)
+    };
     let aliases = list(h.h_aliases);
     let addrs = list(h.h_addr_list);
     let addr_len = usize::try_from(h.h_length).unwrap_or(0);
@@ -565,8 +572,12 @@ unsafe fn guest_hostent(h: *const libc::hostent) -> *mut c_void {
     let p = base as *mut u8;
     // SAFETY: `[base, base + len)` is fresh zeroed window memory laid out as summed above.
     unsafe {
-        p.add(v.h_addrtype).cast::<c_int>().write_unaligned(h.h_addrtype);
-        p.add(v.h_length).cast::<c_int>().write_unaligned(h.h_length);
+        p.add(v.h_addrtype)
+            .cast::<c_int>()
+            .write_unaligned(h.h_addrtype);
+        p.add(v.h_length)
+            .cast::<c_int>()
+            .write_unaligned(h.h_length);
         let alias_arr = p.add(round8(v.he_size));
         let addr_arr = alias_arr.add(round8((aliases.len() + 1) * v.word));
         let mut at = addr_arr.add(round8((addrs.len() + 1) * v.word));
@@ -606,7 +617,11 @@ pub(super) extern "C" fn gethostbyname_shim(name: *const c_char) -> *mut c_void 
 }
 
 /// `struct hostent* gethostbyaddr(const void*, socklen_t, int)`: as [`gethostbyname_shim`]. bionic arm's `socklen_t` is `int32_t`, glibc's `uint32_t`: the low 32 bits of the lane, as both read them.
-pub(super) extern "C" fn gethostbyaddr_shim(addr: *const c_void, len: usize, kind: c_int) -> *mut c_void {
+pub(super) extern "C" fn gethostbyaddr_shim(
+    addr: *const c_void,
+    len: usize,
+    kind: c_int,
+) -> *mut c_void {
     // SAFETY: the guest's address of `len` bytes; answer as above.
     unsafe { guest_hostent(gethostbyaddr(addr, len as u32, kind)) }
 }
@@ -698,9 +713,7 @@ mod tests {
     #[test]
     fn gai_strerror_is_bionic_text() {
         // bionic getaddrinfo.c ai_errlist, spec literals; out of range answers EAI_MAX's text
-        let text = |c: c_int| {
-            GAI_ERRLIST[gai_index(c)].to_str().expect("ASCII text")
-        };
+        let text = |c: c_int| GAI_ERRLIST[gai_index(c)].to_str().expect("ASCII text");
         assert_eq!(text(0), "Success");
         assert_eq!(text(7), "No address associated with hostname");
         assert_eq!(text(8), "hostname nor servname provided, or not known");

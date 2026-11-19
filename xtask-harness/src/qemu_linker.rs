@@ -65,7 +65,11 @@ const HARNESSES: [Harness; 4] = [
         test: "qemu_main",
         prefix: "qemu-main",
         checks: &['s', 'c', 'n', 'e', 'v', 'd', 'r'],
-        breaks: &["main_exit_unbound", "main_tls_dtor_unbound", "dns_keep_list"],
+        breaks: &[
+            "main_exit_unbound",
+            "main_tls_dtor_unbound",
+            "dns_keep_list",
+        ],
     },
 ];
 

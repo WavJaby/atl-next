@@ -159,7 +159,10 @@ fn started(r: Result<Guest, String>) -> u64 {
         }),
     );
     CHURN_OK.store(c, Ordering::Relaxed);
-    let n = check('n', resolver(&mut guest, bias.wrapping_add(fx_dns) as usize));
+    let n = check(
+        'n',
+        resolver(&mut guest, bias.wrapping_add(fx_dns) as usize),
+    );
     DNS_OK.store(n, Ordering::Relaxed);
     // SAFETY: registers a handler of the right signature; arg unused.
     unsafe { on_exit(at_exit, std::ptr::null_mut()) };

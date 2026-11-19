@@ -991,8 +991,8 @@ fn ilp32_libc_entry(
             let ret = atl_bridgegen::jni::result_class(&g.ret)?;
             Ok((row, ret, atl_bridgegen::jni::param_classes(g)?))
         });
-    let own_shim = lp64.as_deref().is_ok_and(|e| e.starts_with("Entry::Shim"))
-        && ILP32_SHIMS.contains(&name);
+    let own_shim =
+        lp64.as_deref().is_ok_and(|e| e.starts_with("Entry::Shim")) && ILP32_SHIMS.contains(&name);
     let (row, ret, params) = match classified {
         Ok(c) => c,
         // a shim converts its own row from the guest view: bound with the guest view's lane classes when every position has one (a by-value union has none: trapped below)
