@@ -3,6 +3,7 @@
 //! Disks: the host drive holding the WSL vhdx (`host_disk`, WSL only), the filesystem holding the workspace (src/, cache/ with sccache, out/ logs) and the one holding the build-dir pool (out.rs).
 //! Two of them on one filesystem -> one disk whose floor is the sum: both writers land there. Floors are `[disk]` keys of workspace.toml (ws_config, each default carries its derivation); under one refuses, naming every short disk.
 //! The build-dir pool also has a metadata floor on btrfs (`btrfs_space`): statfs cannot see metadata, which filled while statfs still showed 6-7 GB free.
+//! And when the pool's filesystem lives in a growing file (`[disk] pool_backing`, a dynamic vhdx), the host drive under that file must hold the file's worst-case growth (`backing_row`): 2026-11-20 E: hit 0 B under the pool vhdx while the guest's statfs still showed GBs free, and btrfs went read-only.
 
 use std::path::{Path, PathBuf};
 
@@ -118,26 +119,91 @@ pub fn check(ws: &Path, cfg: &WsConfig) -> Result<()> {
         let (dev, free) = measure(&path)?;
         rows.push((dev, free, format!("{holds} {}", path.display()), floor));
     }
-    let metadata = pool_metadata(ws, cfg)?;
-    for line in judge(&merge(rows), &metadata)? {
+    let pool_rows = pool_rows(ws, cfg)?;
+    for line in judge(&merge(rows), &pool_rows)? {
         println!("native: disk {line}");
     }
     Ok(())
 }
 
-/// The build-dir pool's metadata row `(line, short)`; none when the pool is not on btrfs.
-pub fn pool_metadata(ws: &Path, cfg: &WsConfig) -> Result<Vec<(String, bool)>> {
+/// The build-dir pool's extra rows `(line, short)` statfs cannot judge: btrfs metadata (none off btrfs), then the host drive under its backing file (`backing_row`).
+pub fn pool_rows(ws: &Path, cfg: &WsConfig) -> Result<Vec<(String, bool)>> {
     let pool = crate::out::pool(ws);
     let probed =
         btrfs_space::probe(&pool).with_context(|| format!("metadata of {}", pool.display()))?;
-    let Some(h) = probed else {
-        return Ok(Vec::new());
-    };
-    Ok(vec![metadata_row(
-        &pool,
-        &h,
-        cfg.disk.pool_metadata_min_free.value,
-    )])
+    let mut rows = Vec::new();
+    if let Some(h) = probed {
+        rows.push(metadata_row(
+            &pool,
+            &h,
+            cfg.disk.pool_metadata_min_free.value,
+        ));
+    }
+    rows.push(match &cfg.disk.pool_backing.value {
+        None => (
+            format!(
+                "build-dir pool {}: no [disk] pool_backing in workspace.toml, host growth check skipped",
+                pool.display()
+            ),
+            false,
+        ),
+        Some(file) => {
+            let fs = rustix::fs::statvfs(&pool)
+                .with_context(|| format!("statvfs {}", pool.display()))?;
+            let len = std::fs::metadata(file)
+                .with_context(|| format!("[disk] pool_backing {}", file.display()))?
+                .len();
+            let dir = file.parent().context("pool_backing has no parent")?;
+            let host = rustix::fs::statvfs(dir)
+                .with_context(|| format!("statvfs {}", dir.display()))?;
+            backing_row(&Backing {
+                file,
+                // the filesystem's own size, as btrfs_space reads it (block devices may be larger after a vhdx resize)
+                fs_size: fs.f_blocks.saturating_mul(fs.f_bsize),
+                backed: len,
+                host_free: host.f_bavail * host.f_frsize,
+                margin_gib: cfg.disk.pool_backing_margin.value,
+            })
+        }
+    });
+    Ok(rows)
+}
+
+/// The pool's filesystem lives in a growing file (`[disk] pool_backing`, a dynamic vhdx) on a host drive the guest's statfs cannot see.
+struct Backing<'a> {
+    file: &'a Path,
+    /// size of the filesystem inside the file
+    fs_size: u64,
+    /// file length = bytes the file backs now
+    backed: u64,
+    /// free bytes of the host drive holding the file (drvfs statvfs)
+    host_free: u64,
+    margin_gib: u64,
+}
+
+/// Host-drive row: short when `host_free < (fs_size - backed) + margin`.
+/// Why that bound and not btrfs unallocated: the file grows on the first write to any unbacked block, and btrfs writes unbacked blocks inside allocated chunks too (space trimmed then compacted away: 2026-11-19 allocated 49 GiB, file 44.3 GiB).
+/// So only `fs_size - backed` bounds the growth; with it every admitted build can write until the pool is full without the host drive running out (incident 2026-11-20: E: hit 0 B, btrfs went read-only).
+fn backing_row(b: &Backing) -> (String, bool) {
+    let growth = b.fs_size.saturating_sub(b.backed);
+    let need = growth.saturating_add(b.margin_gib.saturating_mul(GIB));
+    let short = b.host_free < need;
+    let mut line = format!(
+        "build-dir pool backing {}: host drive {:.1} GiB free, file may still grow {:.1} GiB (filesystem {:.1} GiB - backed {:.1} GiB) + margin {} GiB",
+        b.file.display(),
+        gib(b.host_free),
+        gib(growth),
+        gib(b.fs_size),
+        gib(b.backed),
+        b.margin_gib,
+    );
+    if short {
+        line.push_str(&format!(
+            "; short {:.1} GiB: `cargo xtask out prune --execute`, then with no build running `btrfs balance start -dusage=70 -musage=70 <pool>` (root) + compact the file (scripts/env/wsl-tool.ps1 compact, then start), or free the host drive",
+            gib(need - b.host_free)
+        ));
+    }
+    (line, short)
 }
 
 /// Metadata row for the pool at `path`: headroom, its parts, and whether it is under `floor_gib`.
@@ -155,9 +221,9 @@ fn metadata_row(path: &Path, h: &Headroom, floor_gib: u64) -> (String, bool) {
     (line, h.bytes() < floor_gib.saturating_mul(GIB))
 }
 
-/// Refuses a copy into the build-dir pool of `ws` while its metadata headroom is under the floor. A base copy writes ~0.14 GiB of metadata (ws_config `pool_metadata_min_free`), which statfs does not show.
-pub fn metadata_gate(ws: &Path, cfg: &WsConfig) -> Result<()> {
-    if let Some((line, _)) = pool_metadata(ws, cfg)?.iter().find(|(_, short)| *short) {
+/// Refuses a copy into the build-dir pool of `ws` while a `pool_rows` row is short: metadata headroom (a base copy writes ~0.14 GiB of metadata, ws_config `pool_metadata_min_free`, which statfs does not show) or the host drive under the backing file.
+pub fn pool_gate(ws: &Path, cfg: &WsConfig) -> Result<()> {
+    if let Some((line, _)) = pool_rows(ws, cfg)?.iter().find(|(_, short)| *short) {
         bail!("out: refusing a reflink copy into the pool: {line}");
     }
     Ok(())
@@ -258,6 +324,58 @@ mod tests {
         );
         let e = format!("{}", judge(&[], &[row]).expect_err("short"));
         assert!(e.contains("headroom 0.02 GiB"), "{e}");
+    }
+
+    /// Pool filesystem 90 GiB (df). Numbers from the 2026-11-19/20 pool (memory M7): after balance + compact the file was 47.6 GB with E: 49.6 GB free; at the incident it was 87.8 GB with E: 0 B.
+    #[test]
+    fn backing_growth_must_fit_the_host_drive() {
+        const GB: u64 = 1_000_000_000;
+        let at = |backed, host_free, margin_gib| {
+            backing_row(&Backing {
+                file: Path::new("/mnt/e/WSL/atl-pool.vhdx"),
+                fs_size: 90 * GIB,
+                backed,
+                host_free,
+                margin_gib,
+            })
+        };
+        // growth 90 GiB - 47.6 GB = 49.04 GB; 49.6 GB free leaves 0.56 GB: admitted without margin, refused with the 2 GiB default (a full pool would leave E: 0.56 GB)
+        let (line, short) = at(476 * GB / 10, 496 * GB / 10, 0);
+        assert!(!short, "{line}");
+        let (line, short) = at(476 * GB / 10, 496 * GB / 10, 2);
+        assert!(short, "{line}");
+        // after the 2026-11-20 recovery: file 51.17 GB, E: ~52.6 GB free -> 45.5 GB growth + 2 GiB fits
+        assert!(!at(51_174_703_104, 526 * GB / 10, 2).1);
+        // incident: file 87.8 GB, E: 0 B
+        let (line, short) = at(878 * GB / 10, 0, 2);
+        assert!(short, "{line}");
+        assert!(
+            line.contains("out prune --execute") && line.contains("compact"),
+            "{line}"
+        );
+        // margin edge: free == growth + margin admits, one byte less refuses
+        let growth = 90 * GIB - 50 * GIB;
+        assert!(!at(50 * GIB, growth + 2 * GIB, 2).1);
+        assert!(at(50 * GIB, growth + 2 * GIB - 1, 2).1);
+        // a file past the filesystem size (vhdx metadata) can grow by nothing more: margin only
+        assert!(!at(91 * GIB, 2 * GIB, 2).1);
+    }
+
+    /// No `[disk] pool_backing`: one non-short row naming the skip (other machines); touches only a temp dir.
+    #[test]
+    fn no_backing_skips_with_one_row() {
+        let tmp = std::env::temp_dir().join(format!("xtask-backing-skip-{}", std::process::id()));
+        std::fs::create_dir_all(crate::out::pool(&tmp)).unwrap();
+        let cfg = crate::ws_config::parse("", &tmp.join("workspace.toml")).unwrap();
+        let rows = pool_rows(&tmp, &cfg);
+        std::fs::remove_dir_all(&tmp).unwrap();
+        let skipped: Vec<_> = rows
+            .unwrap()
+            .into_iter()
+            .filter(|(l, _)| l.contains("host growth check skipped"))
+            .collect();
+        assert_eq!(skipped.len(), 1);
+        assert!(!skipped[0].1);
     }
 
     /// The real filesystem answers: a probe that measured nothing would report 0 free.

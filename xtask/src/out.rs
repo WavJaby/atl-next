@@ -408,7 +408,7 @@ pub fn probe(src: &Path, dst_parent: &Path) -> Result<Tier> {
 /// Copies dir `src` to the absent `dst` with the probed tier, through a temp name renamed into place; `base` (when given) goes to `dst/.base`; top-level entries of `src` named in `skip` are left out. Returns the tier.
 pub fn copy_tree(src: &Path, dst: &Path, base: Option<&str>, skip: &[&str]) -> Result<Tier> {
     if let Some(ws) = pool_ws(dst) {
-        crate::disk_floor::metadata_gate(ws, &crate::ws_config::load(ws)?)?;
+        crate::disk_floor::pool_gate(ws, &crate::ws_config::load(ws)?)?;
     }
     let parent = dst.parent().context("copy target has no parent")?;
     let name = dst
@@ -1313,14 +1313,14 @@ pub fn run(root: &Path, cmd: &Out) -> Result<ExitCode> {
                 Err(e) => println!("pool: {}: {e:#}", p.display()),
             }
             match crate::ws_config::load(&ws)
-                .and_then(|cfg| crate::disk_floor::pool_metadata(&ws, &cfg))
+                .and_then(|cfg| crate::disk_floor::pool_rows(&ws, &cfg))
             {
                 Ok(rows) => {
-                    for (line, _) in rows {
-                        println!("{line}");
+                    for (line, short) in rows {
+                        println!("{line}{}", if short { " [SHORT]" } else { "" });
                     }
                 }
-                Err(e) => println!("pool metadata: {e:#}"),
+                Err(e) => println!("pool disk rows: {e:#}"),
             }
             for c in bases(&ws)? {
                 println!("base/{c}: {}", age(&base_of(&ws, &c)));
@@ -1364,22 +1364,21 @@ pub fn run(root: &Path, cmd: &Out) -> Result<ExitCode> {
 /// `out prune` without a flag: build dirs and driver probe dirs whose checkout is not in `live`, and bases beyond the keep rule; lists them, `execute` removes them. Returns how many removals failed (a busy dir is skipped, not failed).
 /// Also `land`'s cleanup child, after the landed worktree is gone (all of this is under the owner's standing approval).
 pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<usize> {
-    let rows = match crate::ws_config::load(ws)
-        .and_then(|cfg| crate::disk_floor::pool_metadata(ws, &cfg))
-    {
-        Ok(rows) => rows,
-        Err(e) => {
-            println!("pool metadata: {e:#}");
-            Vec::new()
-        }
-    };
+    let rows =
+        match crate::ws_config::load(ws).and_then(|cfg| crate::disk_floor::pool_rows(ws, &cfg)) {
+            Ok(rows) => rows,
+            Err(e) => {
+                println!("pool metadata: {e:#}");
+                Vec::new()
+            }
+        };
     for (line, _) in &rows {
         println!("{line}");
     }
     let (mut dirs, mut old) = orphans(ws, live)?;
     let counts = if rows.iter().any(|(_, short)| *short) {
         println!(
-            "out prune: pool metadata short: candidates ranked most paths first (a copy's metadata scales with its paths)"
+            "out prune: a pool row is short: candidates ranked most paths first (a copy's metadata scales with its paths)"
         );
         rank_by_paths(&mut dirs, &mut old)?
     } else {

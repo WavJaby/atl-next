@@ -21,6 +21,8 @@
 //! workspace_min_free = 6
 //! pool_min_free = 5    # build-dir pool
 //! pool_metadata_min_free = 1  # build-dir pool: btrfs metadata headroom (btrfs_space)
+//! pool_backing = "/mnt/e/WSL/atl-pool.vhdx"  # file backing the pool's filesystem, as seen in the guest; absent = growth check skipped
+//! pool_backing_margin = 2      # host drive under pool_backing must keep this much past the file's worst-case growth
 //! ```
 
 use std::collections::BTreeMap;
@@ -90,6 +92,9 @@ pub const DEFAULT_POOL_MIN_FREE: u64 = 5;
 /// `disk.pool_metadata_min_free` (GiB): btrfs metadata headroom of the build-dir pool (`btrfs_space`: settled metadata free in its chunks, in-flight `may_use` reservations not counted, + unallocated raw space at the profile ratio). statfs cannot see it: 2026-11-16 the pool had 6-7 GB data free while metadata was full with unallocated 0.
 /// Derivation (pool measured 2026-11-16): 2.08 GB metadata over 2.16 M paths = ~960 B per path, an upper bound for a reflink copy (a copy shares extent and csum items). A base is 156k paths = ~0.14 GiB. 1 GiB = ~7 base copies: two copies at once plus a build's metadata churn [estimate; re-measure with a real copy's metadata cost].
 pub const DEFAULT_POOL_METADATA_MIN_FREE: u64 = 1;
+/// `disk.pool_backing_margin` (GiB): what the host drive under `disk.pool_backing` keeps past the backing file's worst-case growth (`disk_floor::backing_row`).
+/// Covers the dynamic vhdx's own metadata (BAT + sector bitmaps, well under 1% of a 90 GiB disk = <1 GiB) and other Windows writers to that drive while a build runs (~1 GiB) [est].
+pub const DEFAULT_POOL_BACKING_MARGIN: u64 = 2;
 
 /// `[disk]`: free-space floors in GiB (`disk_floor`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +104,10 @@ pub struct DiskFloors {
     pub workspace_min_free: Setting<u64>,
     pub pool_min_free: Setting<u64>,
     pub pool_metadata_min_free: Setting<u64>,
+    /// `disk.pool_backing`: the file that backs the build-dir pool's filesystem (a dynamically expanding vhdx), path as the guest sees it (drvfs, e.g. `/mnt/e/WSL/atl-pool.vhdx`).
+    /// Machine configuration, not derivable unprivileged: the guest sees only a block device. Absent -> the host growth check is skipped with one logged line (machines whose pool is not a growing file).
+    pub pool_backing: Setting<Option<PathBuf>>,
+    pub pool_backing_margin: Setting<u64>,
 }
 
 /// `[pool]`: the machine-wide admission pool (build_pool.rs).
@@ -251,6 +260,8 @@ fn defaults(path: PathBuf) -> WsConfig {
             workspace_min_free: Setting::default(DEFAULT_WORKSPACE_MIN_FREE),
             pool_min_free: Setting::default(DEFAULT_POOL_MIN_FREE),
             pool_metadata_min_free: Setting::default(DEFAULT_POOL_METADATA_MIN_FREE),
+            pool_backing: Setting::default(None),
+            pool_backing_margin: Setting::default(DEFAULT_POOL_BACKING_MARGIN),
         },
     }
 }
@@ -305,8 +316,20 @@ pub fn parse(text: &str, path: &Path) -> Result<WsConfig> {
                 ("disk", "pool_metadata_min_free") => {
                     cfg.disk.pool_metadata_min_free = Setting::file(gib(value, &at)?);
                 }
+                ("disk", "pool_backing") => {
+                    let toml::Value::String(p) = value else {
+                        bail!("{at} must be an absolute path string, not {value}");
+                    };
+                    if !Path::new(p).is_absolute() {
+                        bail!("{at} must be an absolute path, not {p:?}");
+                    }
+                    cfg.disk.pool_backing = Setting::file(Some(PathBuf::from(p)));
+                }
+                ("disk", "pool_backing_margin") => {
+                    cfg.disk.pool_backing_margin = Setting::file(gib(value, &at)?);
+                }
                 _ => bail!(
-                    "{at} is not a known key (known: build.refresh_min_upstream_files, cache.sccache_size, fetch.for, disk.host_min_free, disk.host_compact_below, disk.workspace_min_free, disk.pool_min_free, disk.pool_metadata_min_free, pool.cpu_slots, pool.mem_gib, pool.starve_after_s, pool.<class>)"
+                    "{at} is not a known key (known: build.refresh_min_upstream_files, cache.sccache_size, fetch.for, disk.host_min_free, disk.host_compact_below, disk.workspace_min_free, disk.pool_min_free, disk.pool_metadata_min_free, disk.pool_backing, disk.pool_backing_margin, pool.cpu_slots, pool.mem_gib, pool.starve_after_s, pool.<class>)"
                 ),
             }
         }
@@ -676,6 +699,25 @@ mod tests {
             .unwrap()
             .disk;
         assert_eq!(d.pool_metadata_min_free, Setting::file(2));
+        let d = parse("", path()).unwrap().disk;
+        assert_eq!(d.pool_backing, Setting::default(None));
+        assert_eq!(d.pool_backing_margin, Setting::default(2));
+        let d = parse(
+            "[disk]\npool_backing = \"/mnt/e/WSL/atl-pool.vhdx\"\npool_backing_margin = 3\n",
+            path(),
+        )
+        .unwrap()
+        .disk;
+        assert_eq!(
+            d.pool_backing,
+            Setting::file(Some(PathBuf::from("/mnt/e/WSL/atl-pool.vhdx")))
+        );
+        assert_eq!(d.pool_backing_margin, Setting::file(3));
+        let e = format!(
+            "{:#}",
+            parse("[disk]\npool_backing = \"WSL/x.vhdx\"\n", path()).unwrap_err()
+        );
+        assert!(e.contains("must be an absolute path"), "{e}");
     }
 
     /// `workspace.toml.pool` (the pool-format machine file, swapped in at the admission land), copied here so the test needs no local file.
