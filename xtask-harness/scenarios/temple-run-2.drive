@@ -16,12 +16,12 @@ wait-log app "Invalid hex color string" 120000
 wait-stable 180 760 200 120 120000 2000
 mark news 80 60 400 700
 touch 281 820 150
-# each next dialog slides in over the animated menu: a touch during the slide was ignored (gate s4-gate3), so each waits for its whole dialog to hold still
-wait-stable 80 60 400 700 20000 2000
+# each next dialog slides in over the menu: a touch during the slide was ignored (gate s4-gate3); the menu's idol glows (200 420 120 140), so that square holds still only once a dialog covers it (the dialogs' own timers animate elsewhere)
+wait-stable 200 420 120 140 20000 2000
 expect-changed news 80 60 400 700
 mark reward 80 60 400 700
 touch 281 820 150
-wait-stable 40 300 480 500 20000 2000
+wait-stable 200 420 120 140 20000 2000
 expect-changed reward 80 60 400 700
 mark bundle 40 300 480 500
 touch 185 735 150
