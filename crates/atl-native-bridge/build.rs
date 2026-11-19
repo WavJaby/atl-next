@@ -1088,11 +1088,31 @@ fn libc_entries(
                 Err(why) => trap(name, why),
             })
             .collect()),
-        Some((protos, rows)) => names
-            .iter()
-            .zip(lp64)
-            .map(|(name, e)| ilp32_libc_entry(name, e, protos, rows, trap))
-            .collect(),
+        Some((protos, rows)) => {
+            // stale-row check of ILP32_SHIMS: each name is a shim of the lists and binds on this table (a name that left SHIMS and came back must be reviewed again for the guest's layout)
+            for n in ILP32_SHIMS {
+                ensure!(
+                    SHIMS.contains(n) || COUNTED_SHIMS.contains(n),
+                    "{n}: in ILP32_SHIMS but not in SHIMS / COUNTED_SHIMS (stale row)"
+                );
+                ensure!(
+                    names.iter().any(|s| s == n),
+                    "libc.so: {n} is in ILP32_SHIMS but not an NBS libc stub (stale row)"
+                );
+            }
+            let mut out = Vec::with_capacity(names.len());
+            for (name, e) in names.iter().zip(lp64) {
+                let listed_shim = ILP32_SHIMS.contains(&name.as_str())
+                    && e.as_deref().is_ok_and(|e| e.starts_with("Entry::Shim"));
+                let entry = ilp32_libc_entry(name, e, protos, rows, trap)?;
+                ensure!(
+                    !listed_shim || entry.starts_with("Entry::Shim"),
+                    "{name}: in ILP32_SHIMS but its ILP32 row does not bind ({entry})"
+                );
+                out.push(entry);
+            }
+            Ok(out)
+        }
     }
 }
 
@@ -1498,6 +1518,8 @@ fn bindings_table(
     // `Entry::Mapped(i)` rows: library, name, the (parameter, map) pairs; and every prototype refused a row, named together in one build error
     let mut mapped_rows: Vec<MappedRow> = Vec::new();
     let mut refused: Vec<String> = Vec::new();
+    // ILP32_PROXY_SHIMS rows bound as their own converters on this table (stale-row check below)
+    let mut proxy_shims_bound: Vec<&str> = Vec::new();
     for (soname, names) in &lists {
         let mut entries = Vec::new();
         for name in names {
@@ -1536,6 +1558,7 @@ fn bindings_table(
                 if let Some(last) = ilp32_rows.last_mut() {
                     last.3 = "shim";
                 }
+                proxy_shims_bound.push(name.as_str());
                 let sig = &guest_view.functions[name.as_str()];
                 let ret = atl_bridgegen::jni::result_class(&sig.ret)?;
                 let params = atl_bridgegen::jni::param_classes(sig)?;
@@ -1639,6 +1662,14 @@ fn bindings_table(
                 .iter()
                 .any(|(_, x)| matches!(x, LaneMap::Down { ty, .. } if ty == t))),
             "{t}: in CALLBACKS but no proxy row with a prototype in the set takes it"
+        );
+    }
+    // stale-row check of ILP32_PROXY_SHIMS: each a PROXY_SHIMS name that bound as its own converter on the ILP32 table
+    for n in ILP32_PROXY_SHIMS.iter().filter(|_| !equal_model) {
+        ensure!(
+            PROXY_SHIMS.contains(n) && proxy_shims_bound.contains(n),
+            "{n}: in ILP32_PROXY_SHIMS but not a PROXY_SHIMS row bound on the {} table (stale row)",
+            guest.row.arch
         );
     }
     // stale-row check of ILP32_ARRAY_PARAMS: on the ILP32 table, where they apply
