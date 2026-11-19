@@ -145,3 +145,48 @@ files = [
   { name = "base", sha256 = "e03b07d906239b83b39d12ad30007b409a2bdd0dde6c9323d180cb9efbde6baf", size = 160297170 },
   { name = "config.arm64_v8a", sha256 = "470b5fa27ad21fd479948788672ed3745cb66acf94c8c63a9d545740053f3c36", size = 26798410 },
 ]
+
+# google-play rows fetched 2026-11-19 with device px_9a (every split Play served is pinned). Needs an account at first use: LINE and WeChat stop at login.
+# LINE 26.18.2, arm64 only.
+[line]
+package = "jp.naver.line.android"
+version_name = "26.18.2"
+version_code = 261820153
+signer_sha256 = "e682fe0bcd60907dfed515e0b8a4de03aa1c281d111a07833986602b6098afd2"
+source = "google-play"
+device = "px_9a"
+files = [
+  { name = "base", sha256 = "5432c8ad902609b4ce4773d834206da63f5c441610346bec0249235116b2e4c5", size = 165370338 },
+  { name = "config.arm64_v8a", sha256 = "589139c65450173ae803b5600432536c5e9621c94d12904380c84db6a63e8442", size = 94197476 },
+  { name = "config.xxhdpi", sha256 = "316144e4d87618e338f1c40dc3ebfe5acccf7b3f7452555af8c40eecaea6ae52", size = 3141251 },
+]
+
+# WeChat 8.0.79, arm64 only.
+[wechat]
+package = "com.tencent.mm"
+version_name = "8.0.79"
+version_code = 3182
+signer_sha256 = "0fe4ff85c215918396dadc7cd8ce6963339af33d37751a56e54c7206b63a3c7c"
+source = "google-play"
+device = "px_9a"
+files = [
+  { name = "base", sha256 = "712d64d5c95e6b2c3d23d926b51dc067f50f48856a0ca9ad557be04c0c5e5288", size = 218692159 },
+  { name = "config.arm64_v8a", sha256 = "0c931a367bd979d96e338829da0c02b34156ff2ab453f57abffcbcf633cfcd54", size = 150762109 },
+  { name = "config.en", sha256 = "fe7d609e461cfc0b5a0d6cd84d7e7faa0a4c38e4e5eae77c1800e31bd62ad0aa", size = 1962451 },
+  { name = "config.xxhdpi", sha256 = "3d9750bdae47701211eef44d815c86a75b4296a26af28f7f9865292073d9777e", size = 704089 },
+]
+
+# Candy Crush Saga 1.341.2.1, arm64 only, in-house engine libcandycrushsaga.so.
+[candy-crush-saga]
+package = "com.king.candycrushsaga"
+version_name = "1.341.2.1"
+version_code = 13412010
+signer_sha256 = "ac7f3b3537e8e6797be7270fa4f9f6a2414e660f51a86efd47c75f00603bc328"
+source = "google-play"
+device = "px_9a"
+files = [
+  { name = "base", sha256 = "a26a6d5eb2cf80d5a1c53a5fbfc89ba6e26a5110b1400bd42ed2e099497eee4e", size = 93578884 },
+  { name = "config.arm64_v8a", sha256 = "4e90061d2858629fa28c067b5fa0c14e5b2302a4d4eb0730ad70fe79045f15f9", size = 86397543 },
+  { name = "config.en", sha256 = "bd38afd204a3ec4f0270d28caab3b8fd0840a90ff4f6402b9d75a667f278b578", size = 70041 },
+  { name = "config.xxhdpi", sha256 = "f4928e097336844a67ac33f10baad19d1dc15a55cd616d664ab345f872d703e8", size = 240495 },
+]

@@ -830,11 +830,14 @@ mod tests {
                 "bad-piggies",
                 "ballance",
                 "battle-cats-tw",
+                "candy-crush-saga",
                 "fossify-math",
                 "fossify-notes",
+                "line",
                 "material-catalog",
                 "temple-run",
-                "temple-run-2"
+                "temple-run-2",
+                "wechat"
             ]
         );
     }
