@@ -36,6 +36,8 @@ const THREAD_HEADERS: &[&str] = &[
     "bionic/libc/bionic/pthread_internal.h",
     // pthread_attr_t: LP64 guests' intercepted pthread API hands it to glibc unconverted (engine/intercepts.rs size gate); the arm guest's is read by this view
     "bionic/libc/include/bits/pthread_types.h",
+    // __pthread_cleanup_t: thread.rs `detach` walks the record's cleanup_stack (bionic pthread_exit's cleanup step)
+    "bionic/libc/include/pthread.h",
     // struct sigaction / sigset_t: guest sigaction's host side converts them (engine/signal.rs layout gate)
     "bionic/libc/include/bits/signal_types.h",
     "bionic/libc/private/bionic_tls.h",
@@ -1977,6 +1979,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("main_exit_unbound", "atl_nb_main_exit_unbound"),
     // build.rs `libc_lp64_entries`: `native_bridge___cxa_thread_atexit_impl` unbound, so a guest thread_local destructor's registration traps naming it (qemu-linker gate, qemu_main `e`/`d`)
     ("main_tls_dtor_unbound", "atl_nb_main_tls_dtor_unbound"),
+    // P4b s3e (engine/thread.rs `run_cleanup`): the guest record's cleanup handlers never run at thread exit (qemu-linker gate, qemu_main status 8)
+    ("exit_skip_cleanup", "atl_nb_exit_skip_cleanup"),
     // Q6-2 (engine/dispatch.rs `call_object`): x3 and x4 exchanged, so CallStaticIntMethod(2, 3) reaches the host as (3, 2) (qemu-jni gate, `c`)
     ("jni_swap", "atl_nb_jni_swap"),
     // Q6-7 (engine/va_list.rs `fp`): a guest va_list's fp arguments are read from its integer save area (qemu-jni gate, `V`)

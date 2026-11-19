@@ -30,22 +30,38 @@ static void record(void *letter) {
 
 static pthread_key_t key;
 
-// Registers thread-exit destructors 'A' then 'B' and a key value whose destructor records 'K': bionic's pthread_exit order is __cxa_thread_finalize (reverse registration: B, A), then key destructors (K).
+// Registers thread-exit destructors 'A' then 'B', a key value whose destructor records 'K' and a cleanup handler 'C', then pthread_exit inside the handler's scope: bionic pthread_exit.cpp runs __cxa_thread_finalize (reverse registration: B, A), then the cleanup handlers (C), then key destructors (K).
 static void *tls_worker(void *arg) {
     (void)arg;
     if (__cxa_thread_atexit_impl(record, (void *)'A', &__dso_handle) != 0) return (void *)1;
     if (__cxa_thread_atexit_impl(record, (void *)'B', &__dso_handle) != 0) return (void *)1;
     pthread_setspecific(key, (void *)'K');
+    pthread_cleanup_push(record, (void *)'C');
+    pthread_exit(0);
+    pthread_cleanup_pop(0);
+    return (void *)1;
+}
+
+// A plain return after a handler popped with execute: 'D' runs at the pop, so the stack is empty at the return (POSIX: a return inside push/pop scope is undefined; bionic's start routine return goes through pthread_exit, which would run what is left). Then the thread-exit destructor 'E' and key 'K'.
+static void *return_worker(void *arg) {
+    (void)arg;
+    if (__cxa_thread_atexit_impl(record, (void *)'E', &__dso_handle) != 0) return (void *)1;
+    pthread_setspecific(key, (void *)'K');
+    pthread_cleanup_push(record, (void *)'D');
+    pthread_cleanup_pop(1);
     return 0;
 }
 
-// 0 when the worker's thread-exit destructors ran exactly once in bionic's order ("BAK"), and the main thread's two are registered; else the step (6..8).
+// 0 when the workers' exit work ran exactly once each in bionic's order ("BACK" then "DEK"), and the main thread's two are registered; else the step (6..9).
 static int thread_dtors(void) {
     pthread_t t;
     void *answer = (void *)1;
     if (pthread_key_create(&key, record) != 0) return 6;
     if (pthread_create(&t, 0, tls_worker, 0) != 0 || pthread_join(t, &answer) != 0 || answer != 0) return 7;
-    if (n_events != 3 || fx_events[0] != 'B' || fx_events[1] != 'A' || fx_events[2] != 'K') return 8;
+    if (n_events != 4 || fx_events[0] != 'B' || fx_events[1] != 'A' || fx_events[2] != 'C' || fx_events[3] != 'K') return 8;
+    answer = (void *)1;
+    if (pthread_create(&t, 0, return_worker, 0) != 0 || pthread_join(t, &answer) != 0 || answer != 0) return 7;
+    if (n_events != 7 || fx_events[4] != 'D' || fx_events[5] != 'E' || fx_events[6] != 'K') return 9;
     // the main thread's: run at exit after the guest's __cxa_finalize (NBS exit.c leaves __cxa_thread_finalize to the host's exit), reverse order: 'n' then 'm'
     if (__cxa_thread_atexit_impl(record, (void *)'m', &__dso_handle) != 0) return 6;
     if (__cxa_thread_atexit_impl(record, (void *)'n', &__dso_handle) != 0) return 6;

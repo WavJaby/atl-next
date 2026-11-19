@@ -74,6 +74,8 @@ struct Abi {
     tls_size: usize,
     /// the record's `errno_value`: bionic `__errno()` answers its address
     errno: usize,
+    /// the record's `cleanup_stack` and `__pthread_cleanup_t`'s prev / routine / arg (pthread.h)
+    cleanup: [usize; 4],
     /// `NativeBridgeStaticTlsConfig`: size, tpoff, init_img, tls_slot_thread_id, tls_slot_bionic_tls
     cfg: [usize; 5],
 }
@@ -81,7 +83,8 @@ struct Abi {
 macro_rules! abi {
     ($m:ident) => {{
         use layout::$m::{
-            NativeBridgeStaticTlsConfig as c, bionic_tls as t, pthread_internal_t as r,
+            NativeBridgeStaticTlsConfig as c, __pthread_cleanup_t as cl, bionic_tls as t,
+            pthread_internal_t as r,
         };
         const _: () = {
             assert!(r::vforked_ == r::cached_pid_);
@@ -97,6 +100,12 @@ macro_rules! abi {
             bionic_tls: r::bionic_tls,
             tls_size: t::SIZE,
             errno: r::errno_value,
+            cleanup: [
+                r::cleanup_stack,
+                cl::__cleanup_prev,
+                cl::__cleanup_routine,
+                cl::__cleanup_arg,
+            ],
             cfg: [
                 c::size,
                 c::tpoff,
@@ -345,6 +354,8 @@ fn register_detach(ht: *mut HostThread) {
 /// Thread exit (the detach key's destructor, host thread pointer): the guest keys' destructors on the guest thread pointer, then the thread's guest TLS, records and crossing record are freed.
 extern "C" fn detach(value: *mut libc::c_void) {
     let ht = value.cast::<HostThread>();
+    // SAFETY: `ht` is this thread's record, its engine CPU still attached.
+    unsafe { run_cleanup(&mut *ht) };
     for _ in 0..DTOR_ROUNDS {
         let dtors = GUEST_DTORS.lock().map(|v| v.clone()).unwrap_or_default();
         let mut ran = false;
@@ -401,6 +412,35 @@ extern "C" fn detach(value: *mut libc::c_void) {
         ATTACHED.load(Ordering::Relaxed)
     );
     let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
+}
+
+/// bionic pthread_exit.cpp's cleanup step: pops and runs each handler left on the guest record's `cleanup_stack` (LIFO; guest bionic's own `__pthread_cleanup_push` / `_pop` link them, NBS patch 0013).
+/// Called first in [`detach`]: glibc has already run the thread-exit list (`__cxa_thread_finalize`'s place) and runs key destructors after it, so bionic's order holds with no hook of our own. A return from the start routine ends here too, as bionic's start routine return goes through pthread_exit (a well-formed one leaves the stack empty).
+/// # Safety
+/// `ht` is the calling thread's record, its engine CPU attached.
+unsafe fn run_cleanup(ht: &mut HostThread) {
+    let record = RECORD.with(Cell::get);
+    // deliberate break (`ATL_NB_BREAK=exit_skip_cleanup`): cleanup handlers never run (qemu-linker gate, qemu_main status 8)
+    if record == 0 || cfg!(atl_nb_exit_skip_cleanup) {
+        return;
+    }
+    let [stack, prev, routine, arg] = abi().cleanup;
+    let top = (record + stack) as *mut u8;
+    loop {
+        // SAFETY: the live record of this thread; each `c` a guest `__pthread_cleanup_t` its frames still hold (the guest is inside pthread_exit or returned with none left).
+        unsafe {
+            let c = read_word(top);
+            if c == 0 {
+                break;
+            }
+            let c = c as *const u8;
+            write_word(top, read_word(c.add(prev)));
+            let f = read_word(c.add(routine));
+            if f != 0 {
+                call_guest(ht, f, read_word(c.add(arg)), 0, 0, 0);
+            }
+        }
+    }
 }
 
 /// # Safety

@@ -180,7 +180,7 @@ thread_local! {
 }
 
 /// `void pthread_exit(void*)`: ends the start routine's guest call at once with `value` as its result (`Engine::end_call`; QEMU answers it in x0, hence the return), so [`run`] returns it to glibc, whose join reports it; the host thread then exits as after a plain return.
-/// bionic's order (pthread_exit.cpp): `__cxa_thread_finalize`, cleanup handlers, `pthread_key_clean_all`, then the stack goes. Here: glibc's thread exit runs the thread-exit destructors first ([`cxa_thread_atexit_impl`]), then its key destructors, among them thread.rs `detach` (guest keys, then the guest stack). Cleanup handlers are not run (a known gap).
+/// bionic's order (pthread_exit.cpp): `__cxa_thread_finalize`, cleanup handlers, `pthread_key_clean_all`, then the stack goes. Here: glibc's thread exit runs the thread-exit destructors first ([`cxa_thread_atexit_impl`]), then its key destructors, among them thread.rs `detach` (cleanup handlers, `run_cleanup`; guest keys; then the guest stack).
 /// Only from the routine's own guest call on a [`run`] thread (the engine refuses a nested one: it would skip host frames between the calls); a host thread that merely attached has no routine to end. Both abort, named.
 pub(super) extern "C" fn pthread_exit(value: usize) -> usize {
     if !ROUTINE.with(Cell::get) {
