@@ -204,6 +204,14 @@ fn position(
     views: &Views,
     used: &mut BTreeSet<String>,
 ) -> Result<Kind> {
+    if va_list(g) && va_list(h) {
+        // by layout here (the resolved types escape `same_in`'s va_list rule): equal targets pass it, others have no rule
+        ensure!(
+            same(g.resolved(), views.guest, h.resolved(), views.host, true),
+            "a va_list position whose layout differs: no rule crosses one (only the JNI V path converts)"
+        );
+        return Ok(Kind::Same);
+    }
     if same(g, views.guest, h, views.host, true) {
         return Ok(Kind::Same);
     }
@@ -285,6 +293,10 @@ fn same_in(
     top: bool,
     open: &mut Vec<(String, String)>,
 ) -> bool {
+    // inside a record or a callback type: each side's own va_list (`struct __va_list` on arm64, `__va_list_tag[1]` on x86_64) -- a cursor no layout comparison can equate; the V calls that receive one are converted by the JNI path (dispatch.rs `call_object`), and a classified position refuses it ([`position`])
+    if va_list(a) && va_list(b) {
+        return true;
+    }
     match (a.resolved(), b.resolved()) {
         (Ty::Void, Ty::Void) | (Ty::Bool, Ty::Bool) => true,
         (
@@ -380,6 +392,14 @@ fn layout<'v>(v: &'v ArchView, name: &str) -> Option<&'v crate::ir::Record> {
     v.records.get(name).or_else(|| v.foreign.get(name))
 }
 
+/// `ty` is the compiler's variadic cursor (clang's `__builtin_va_list` typedef, the one spelling every target's va_list goes through).
+fn va_list(ty: &Ty) -> bool {
+    match ty {
+        Ty::Typedef { name, ty } => name == "__builtin_va_list" || va_list(ty),
+        _ => false,
+    }
+}
+
 /// A pointee the host never looks into: `void` or an incomplete record.
 fn untyped(ty: &Ty, v: &ArchView) -> bool {
     match ty.resolved() {
@@ -431,7 +451,10 @@ int ALooper_addFd(int fd, int ident, int events, ALooper_callbackFunc callback, 
 int sum(int a, double b);\n\
 #include \"other.h\"\n\
 int sigqueue(int pid, int sig, const union sigval value);\n\
-int getnameinfo(const struct sockaddr* sa, socklen_t sa_len, char* host, size_t host_len, char* serv, size_t serv_len, int flags);\n";
+int getnameinfo(const struct sockaddr* sa, socklen_t sa_len, char* host, size_t host_len, char* serv, size_t serv_len, int flags);\n\
+struct VaUser { int (*f)(void* p, __builtin_va_list ap); };\n\
+int va_user(struct VaUser* u);\n\
+int va_fn(const char* fmt, __builtin_va_list ap);\n";
 
     /// Defined outside the interface (`Ty::Opaque` + `ArchView::foreign`). `union sigval`: bionic uapi asm-generic/siginfo.h `{ int sival_int; void* sival_ptr; }`. `struct sockaddr`: bionic linux/socket.h `{ sa_family_t sa_family; char sa_data[14]; }`, 16 bytes on both. `socklen_t`: bionic sys/types.h `__kernel_socklen_t` = int; glibc bits/types.h `__socklen_t` = unsigned int.
     const OTHER: &str = "union sigval { int sival_int; void* sival_ptr; };\n\
@@ -614,6 +637,31 @@ struct sockaddr { unsigned short sa_family; char sa_data[14]; };\n\
         let gni = row(&i, "getnameinfo");
         assert_eq!(gni.kinds[2], Kind::Same);
         assert!(gni.carried());
+    }
+
+    /// va_list (arm64 `struct __va_list` 32 B, x86_64 `__va_list_tag[1]` 24 B): inside a callback type each side's own (a JNIEnv-like table stays a plain pointer); as a classified position it is refused unless the layouts agree.
+    #[test]
+    fn va_list_inside_callbacks_only() {
+        let i = views("valist", "aarch64-linux-android");
+        assert_eq!(row(&i, "va_user").kinds[1], Kind::Same);
+        let (g, h) = (&i.arches["guest"], &i.arches["host"]);
+        let views = Views {
+            guest: g,
+            host: h,
+            handles: HANDLES,
+        };
+        let e = classify(
+            "va_fn",
+            &g.functions["va_fn"],
+            &h.functions["va_fn"],
+            &views,
+            &mut BTreeSet::new(),
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("va_list"), "{e:#}");
+        // equal targets: the same va_list passes
+        let x = views("valist-x86", "x86_64-unknown-linux-gnu");
+        assert!(row(&x, "va_fn").same());
     }
 
     /// Red control: the guest parsed as the host's own data model -> every row Same, so the ILP32 expectations above fail.
