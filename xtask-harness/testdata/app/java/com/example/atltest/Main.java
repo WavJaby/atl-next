@@ -1428,6 +1428,7 @@ public class Main extends Activity {
         bridge1Call(jni, "keyDtorAttach", "keyDtorDetach", 2);
         // tr-first blocker 5: (a) on this thread inside the call; then a fresh thread arms the main looper for (b), read in onActivityResult
         bridge1Call(jni, "looperNow", "looperNow");
+        bridge1Call(jni, "vsyncFrames", "vsyncFrames", (int) (1e9 / getWindowManager().getDefaultDisplay().getRefreshRate()));
         Thread arm = new Thread(new Runnable() {
             @Override
             public void run() {

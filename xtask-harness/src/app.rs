@@ -960,6 +960,8 @@ const BRIDGE1_CALLS: &[(&str, &str)] = &[
     ("looperNow", "now 1 1 -2 0"),
     ("looperArm", "armed"),
     ("looperLater", "later 1 1 1 0"),
+    // candy-crush-next-blockers (atl_jni_test.c vsyncFrames; build.rs CALLBACKS `AChoreographer_vsyncCallback`): VSYNC_FRAMES (8) guest vsync callbacks on the main Looper, each re-posted from the previous one; frame times and preferred vsync ids strictly increasing, every timeline's deadline <= its presentation > frame time, presentations increasing (bad 0); median frame-time step within 25% of the display period Java reports (cadence 1). Red without the binding: the stub aborts the process
+    ("vsyncFrames", "vsync 8 bad 0 cadence 1"),
 ];
 /// Main.bridge1Calls' firstConfig row: `r=<r> g=<g> b=<b> a=<a> visual=<v>`, the first config eglChooseConfig lists for RGB 8 minimum on pbuffer surfaces (atl_jni_test.c firstConfig).
 /// The driver orders the list as the host does, so the row is judged ([`first_config_why`]), not compared with a fixed line.

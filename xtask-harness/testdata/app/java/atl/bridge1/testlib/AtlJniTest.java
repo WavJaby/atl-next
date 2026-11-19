@@ -182,6 +182,9 @@ public final class AtlJniTest {
     /** tr-first blocker 5: what the main Looper's later call of looperArm's callback recorded (atl_jni_test.c looperLater). Main thread. */
     public static native String looperLater();
 
+    /** candy-crush-next-blockers: guest AChoreographer_postVsyncCallback re-posted for 8 frames on this thread's Looper, frame data read through the accessors; displayNs = the display's vsync period (atl_jni_test.c vsyncFrames). Main thread. */
+    public static native String vsyncFrames(int displayNs);
+
     /** Bound by RegisterNatives in JNI_OnLoad. */
     public static native int registeredAnswer();
 

@@ -6,6 +6,7 @@
 #include <android/asset_manager.h>
 #include <android/asset_manager_jni.h>
 #include <android/bitmap.h>
+#include <android/choreographer.h>
 #include <android/log.h>
 #include <android/looper.h>
 #include <android/native_window.h>
@@ -646,6 +647,93 @@ JNI_FN(jstring, looperLater)(JNIEnv *env, jclass cls)
 {
     char line[64];
     snprintf(line, sizeof line, "later %d %d %d %d", g_cb_later.calls, g_cb_later.tid == g_main_tid, g_arm_tid != g_main_tid, g_cb_bad);
+    return (*env)->NewStringUTF(env, line);
+}
+
+// candy-crush-next-blockers: AChoreographer_postVsyncCallback (API 33) as Candy Crush Saga's game thread uses it. The callback data is AOSP's opaque record, valid only inside the callback (AChoreographer.cpp accessors abort outside it), read here only through the accessors. Looked up with dlsym: the fixture's API level is below 33.
+#define VSYNC_FRAMES 8
+typedef AChoreographer *(*get_instance_fn)(void);
+typedef void (*post_vsync_fn)(AChoreographer *, AChoreographer_vsyncCallback, void *);
+typedef int64_t (*vs_time_fn)(const AChoreographerFrameCallbackData *);
+typedef size_t (*vs_size_fn)(const AChoreographerFrameCallbackData *);
+typedef int64_t (*vs_at_fn)(const AChoreographerFrameCallbackData *, size_t);
+static struct {
+    post_vsync_fn post;
+    vs_time_fn frame_time;
+    vs_size_fn length, preferred;
+    vs_at_fn vsync_id, expected, deadline;
+    AChoreographer *ch;
+    int calls, bad;
+    int64_t t[VSYNC_FRAMES], last_id;
+} g_vs;
+
+static void vsync_cb(const AChoreographerFrameCallbackData *d, void *data)
+{
+    if (data != &g_vs || d == NULL || g_vs.calls >= VSYNC_FRAMES) {
+        g_vs.bad++;
+        return;
+    }
+    int64_t t = g_vs.frame_time(d);
+    size_t n = g_vs.length(d), p = g_vs.preferred(d);
+    if (n < 1 || p >= n || (g_vs.calls > 0 && t <= g_vs.t[g_vs.calls - 1]))
+        g_vs.bad++;
+    for (size_t i = 0; i < n; i++) {
+        int64_t e = g_vs.expected(d, i), dl = g_vs.deadline(d, i);
+        // choreographer.h: a timeline's deadline is not after its presentation, presentation follows the frame start, later timelines present later
+        if (dl > e || e <= t || (i > 0 && e <= g_vs.expected(d, i - 1)))
+            g_vs.bad++;
+    }
+    int64_t id = n > 0 ? g_vs.vsync_id(d, p < n ? p : 0) : 0;
+    if (g_vs.calls > 0 && id <= g_vs.last_id)
+        g_vs.bad++;
+    g_vs.last_id = id;
+    g_vs.t[g_vs.calls++] = t;
+    if (g_vs.calls < VSYNC_FRAMES)
+        g_vs.post(g_vs.ch, vsync_cb, &g_vs);
+}
+
+// AtlJniTest.vsyncFrames, on the main thread (its Looper serves the Choreographer): posts, re-posts from inside each callback, polls until VSYNC_FRAMES arrived. "vsync <calls> bad <bad> cadence <1 if the median frame-time step is within 25% of display_ns>"; the measured step goes to the log.
+JNI_FN(jstring, vsyncFrames)(JNIEnv *env, jclass cls, jint display_ns)
+{
+    void *h = dlopen("libandroid.so", RTLD_NOW);
+    if (h == NULL)
+        return (*env)->NewStringUTF(env, "vsync dlopen null");
+    get_instance_fn instance = (get_instance_fn)dlsym(h, "AChoreographer_getInstance");
+    g_vs.post = (post_vsync_fn)dlsym(h, "AChoreographer_postVsyncCallback");
+    g_vs.frame_time = (vs_time_fn)dlsym(h, "AChoreographerFrameCallbackData_getFrameTimeNanos");
+    g_vs.length = (vs_size_fn)dlsym(h, "AChoreographerFrameCallbackData_getFrameTimelinesLength");
+    g_vs.preferred = (vs_size_fn)dlsym(h, "AChoreographerFrameCallbackData_getPreferredFrameTimelineIndex");
+    g_vs.vsync_id = (vs_at_fn)dlsym(h, "AChoreographerFrameCallbackData_getFrameTimelineVsyncId");
+    g_vs.expected = (vs_at_fn)dlsym(h, "AChoreographerFrameCallbackData_getFrameTimelineExpectedPresentationTimeNanos");
+    g_vs.deadline = (vs_at_fn)dlsym(h, "AChoreographerFrameCallbackData_getFrameTimelineDeadlineNanos");
+    if (!instance || !g_vs.post || !g_vs.frame_time || !g_vs.length || !g_vs.preferred || !g_vs.vsync_id || !g_vs.expected || !g_vs.deadline)
+        return (*env)->NewStringUTF(env, "vsync dlsym null");
+    g_vs.ch = instance();
+    if (g_vs.ch == NULL)
+        return (*env)->NewStringUTF(env, "vsync no choreographer");
+    g_vs.post(g_vs.ch, vsync_cb, &g_vs);
+    // bounded: 2 s is 120 frames at 60 Hz
+    struct timespec t0, now;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    do {
+        ALooper_pollOnce(100, NULL, NULL, NULL);
+        clock_gettime(CLOCK_MONOTONIC, &now);
+    } while (g_vs.calls < VSYNC_FRAMES && now.tv_sec - t0.tv_sec < 2);
+    int64_t step[VSYNC_FRAMES - 1];
+    int k = g_vs.calls - 1;
+    for (int i = 0; i < k; i++)
+        step[i] = g_vs.t[i + 1] - g_vs.t[i];
+    for (int i = 1; i < k; i++) // insertion sort, k <= 7
+        for (int j = i; j > 0 && step[j] < step[j - 1]; j--) {
+            int64_t s = step[j];
+            step[j] = step[j - 1];
+            step[j - 1] = s;
+        }
+    int64_t median = k > 0 ? step[k / 2] : 0;
+    int cadence = k > 0 && median * 4 >= (int64_t)display_ns * 3 && median * 4 <= (int64_t)display_ns * 5;
+    __android_log_print(ANDROID_LOG_INFO, "AtlJniTest", "vsyncFrames: median step %lld ns, display period %d ns", (long long)median, display_ns);
+    char line[64];
+    snprintf(line, sizeof line, "vsync %d bad %d cadence %d", g_vs.calls, g_vs.bad, cadence);
     return (*env)->NewStringUTF(env, line);
 }
 
