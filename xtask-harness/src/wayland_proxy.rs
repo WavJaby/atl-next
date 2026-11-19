@@ -213,6 +213,8 @@ struct Ids {
     toplevel: Option<u32>,
     /// The serials [`Proxy::inject_configure`] wrote: the client's acks of them are absorbed (see `client_to_server`).
     injected: Vec<u32>,
+    /// The proxy-wide [`Presented`] count this connection's feedback adds to.
+    presented: Arc<Presented>,
 }
 
 impl Ids {
@@ -624,7 +626,10 @@ fn serve(
 ) -> Result<()> {
     let server = UnixStream::connect(upstream)
         .with_context(|| format!("connecting to {}", upstream.display()))?;
-    let ids: Shared<Ids> = Arc::default();
+    let ids: Shared<Ids> = Arc::new(Mutex::new(Ids {
+        presented: Arc::clone(presented),
+        ..Ids::default()
+    }));
     let wake = eventfd(0, EventfdFlags::CLOEXEC)?;
     wakes
         .lock()
@@ -638,12 +643,8 @@ fn serve(
         let _ = server_w.shutdown(std::net::Shutdown::Both);
         let _ = events_c.send((Instant::now(), Event::Closed));
     });
-    let (events_s, injections, window, presented) = (
-        events.clone(),
-        Arc::clone(injections),
-        Arc::clone(window),
-        Arc::clone(presented),
-    );
+    let (events_s, injections, window) =
+        (events.clone(), Arc::clone(injections), Arc::clone(window));
     thread::spawn(move || {
         let _ = server_to_client(
             &server,
@@ -653,7 +654,6 @@ fn serve(
             &events_s,
             &injections,
             &window,
-            &presented,
         );
         let _ = client.shutdown(std::net::Shutdown::Both);
     });
@@ -723,8 +723,12 @@ fn server_to_client(
     events: &Sender<(Instant, Event)>,
     injections: &Shared<Vec<Injection>>,
     window: &Shared<Option<usize>>,
-    presented: &Presented,
 ) -> Result<()> {
+    let presented = Arc::clone(
+        &ids.lock()
+            .map_err(|_| anyhow::anyhow!("ids poisoned"))?
+            .presented,
+    );
     let mut pending: Vec<u8> = Vec::new();
     let mut fds: Vec<OwnedFd> = Vec::new();
     loop {
@@ -764,7 +768,7 @@ fn server_to_client(
             // the seat claims touch, so the client asks for the proxy's wl_touch; the sync that took that id answers on it and deletes it: both are the proxy's to drop
             let mut out = Vec::with_capacity(pending.len());
             let complete = scan(&pending, |object, opcode, body| {
-                if feedbacks.contains(&object) && note_feedback(presented, opcode, body) {
+                if feedbacks.contains(&object) && note_feedback(&presented, opcode, body) {
                     ended.push(object);
                 }
                 let id_of_touch = |v: Option<u32>| v.is_some() && v == touch;
