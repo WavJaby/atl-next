@@ -1798,6 +1798,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("shorty_swap", "atl_nb_shorty_swap"),
     // Q6-4 (engine/dispatch.rs `down_body`): a down call's first argument stays the host's, not the guest env or vm (qemu-jni gate, checks o, m and x)
     ("down_noenv", "atl_nb_down_noenv"),
+    // p4b s3 (engine/dispatch.rs `HostRules::int_arg`): argument k is register k on every guest, AAPCS32's stack words ignored (unit test int_arg_follows_the_guest_rules)
+    ("regs_k_raw", "atl_nb_regs_k_raw"),
     // O1 (engine/sles.rs `create_audio_player`): the sink's OutputMix locator keeps the guest proxy, so the host gets a guest object (sles-bridge gate, check c)
     ("sles_raw_sink", "atl_nb_sles_raw_sink"),
     // O1 (engine/mod.rs `Active::down`): every down request takes a new shell (sles-bridge gate, check e)

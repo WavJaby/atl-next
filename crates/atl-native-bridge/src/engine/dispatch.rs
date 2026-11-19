@@ -111,13 +111,15 @@ fn call_object(rules: HostRules, id: u32, lanes: &AtlLanes) -> Answer {
         None => id as usize,
         Some(k) => {
             let name = lane.name;
+            // lanes k - 1 and k located by the guest's rules (`int_arg`: every earlier JNI parameter is one word)
+            let method = *rules.int_arg(&mut lanes, k - 1) as usize;
             // SAFETY: `host` is the host env behind the guest env; lane k - 1 is the call's jmethodID (jni.h: every V slot's va_list follows its methodID).
-            let params = unsafe { jni::method_params(host, lanes.regs[k - 1] as usize) }
+            let params = unsafe { jni::method_params(host, method) }
                 .unwrap_or_else(|| refuse(Refused::NoShorty { name }));
             // SAFETY: lane k is the guest's va_list pointer, and the guest made the call with the method's arguments (JNI contract).
-            args = unsafe { va_list::jvalues(lanes.regs[k] as usize, params) }
+            args = unsafe { va_list::jvalues(*rules.int_arg(&mut lanes, k) as usize, params) }
                 .unwrap_or_else(|c| refuse(Refused::Shorty { name, c }));
-            lanes.regs[k] = args.as_ptr() as u64;
+            *rules.int_arg(&mut lanes, k) = args.as_ptr() as u64;
             jni::a_slot(id as usize)
         }
     };
@@ -337,9 +339,14 @@ fn down_body(slot: usize, host: &mut AtlLanes) {
     // the first argument of a JNI method, of JNI_OnLoad or of an SL callback is a host env, vm or interface: the guest's own object stands for it (jni.rs, sles.rs), and it is the first integer, in x0; an slObjectCallback's 6th is the 6th integer, in x5
     #[cfg(not(atl_nb_down_noenv))]
     {
-        let (mut first, mut sixth) = (guest.regs[0] as usize, guest.regs[5] as usize);
+        // the 6th integer: x5 on AAPCS64, the 2nd stack word on AAPCS32 (`int_arg`)
+        let (mut first, mut sixth) = (
+            guest.regs[0] as usize,
+            *rules.int_arg(&mut guest, 5) as usize,
+        );
         d.kind.guest_args(&mut first, &mut sixth);
-        (guest.regs[0], guest.regs[5]) = (first as u64, sixth as u64);
+        guest.regs[0] = first as u64;
+        *rules.int_arg(&mut guest, 5) = sixth as u64;
     }
     // break `down_noenv` (qemu-jni gate, checks o, m and x): the kind is not read, so the guest gets the host's env or vm
     #[cfg(atl_nb_down_noenv)]
@@ -392,6 +399,25 @@ pub(in crate::engine) struct HostRules {
     stack_words: usize,
     /// bits of one integer register and one stack word: 64, or 32 (a 64-bit value then takes an aligned pair of lanes, [`Assign::next`])
     word_bits: u32,
+}
+
+impl HostRules {
+    /// Integer argument `k` of a call whose arguments before it are one word each (pointers, `int`s: a JNI V slot's env/object/methodID, an SL callback's first five) in `lanes` filled by these rules: register `k` below `int_lanes`, else stack word `k - int_lanes` (AAPCS32: the 5th integer is the first word at sp; AAPCS64: the 9th). Refuses an index past the window.
+    pub(in crate::engine) fn int_arg(self, lanes: &mut AtlLanes, k: usize) -> &mut u64 {
+        // break `regs_k_raw`: register k on every guest, as before (the AAPCS32 unit test goes red)
+        #[cfg(atl_nb_regs_k_raw)]
+        return &mut lanes.regs[k];
+        #[cfg(not(atl_nb_regs_k_raw))]
+        if k < self.int_lanes {
+            &mut lanes.regs[k]
+        } else {
+            let w = k - self.int_lanes;
+            if w >= self.stack_words {
+                unsupported("qemu crossing: an integer argument past the lanes' stack window");
+            }
+            &mut lanes.stack[w]
+        }
+    }
 }
 
 /// The aarch64 guest's rules (qemu/arch.rs `Arch::Aarch64`), AAPCS64: eight integer registers, an fp argument past v7 goes to the stack, results and floats unshaped (a narrow value's upper bits are unspecified, s-registers are read low); eight stack words (the aarch64 engine's window, atl-qemu-engine engine/aarch64.rs `STACK_SLOTS`). Also the image every host call reads ([`up_lanes`]).
@@ -695,6 +721,20 @@ fn refuse_down(target: usize) -> ! {
 #[cfg(test)]
 mod place_tests {
     use super::*;
+
+    /// Argument 5 (an SL callback's 6th, `down_body`; a JNI V slot's lane, `call_object`): AAPCS64 x5; AAPCS32 r0..r3 then the words at sp, so stack word 1 (AAPCS32 2026Q3, base PCS: core registers r0-r3, then the stack in order).
+    #[test]
+    fn int_arg_follows_the_guest_rules() {
+        let mut l = AtlLanes::default();
+        l.regs[3] = 0x33;
+        l.regs[5] = 0x55;
+        l.stack[1] = 0x51;
+        assert_eq!(*AAPCS64.int_arg(&mut l, 5), 0x55);
+        assert_eq!(*AAPCS32.int_arg(&mut l, 5), 0x51);
+        assert_eq!(*AAPCS32.int_arg(&mut l, 3), 0x33);
+        *AAPCS32.int_arg(&mut l, 4) = 0x40;
+        assert_eq!(l.stack[0], 0x40);
+    }
 
     /// x86_64 SysV (bridgegen x86.rs `DOWN`): six integer registers, fp overflow to the stack, results unshaped.
     const SYSV: HostRules = HostRules {

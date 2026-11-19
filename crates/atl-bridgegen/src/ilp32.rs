@@ -334,8 +334,7 @@ fn same_in(
                 ..
             },
         ) => {
-            ba == bb
-                && (untyped(pa, va) || untyped(pb, vb) || same_in(pa, va, pb, vb, false, open))
+            ba == bb && (untyped(pa, va) || untyped(pb, vb) || same_in(pa, va, pb, vb, false, open))
         }
         // data pointer vs integer of the same width (report.rs TyDiff::PointerVsInteger)
         (Ty::Pointer { bits, pointee, .. }, Ty::Int { bits: i, .. })
@@ -636,7 +635,9 @@ struct _jobject {};\ntypedef struct _jobject* jobject;\n\
         let i = views("signedness", ARM);
         let (g, h) = (&i.arches["guest"], &i.arches["host"]);
         let signed = |v: &ArchView| match v.functions["getnameinfo"].params[1].resolved() {
-            Ty::Int { bits: 32, signed, .. } => *signed,
+            Ty::Int {
+                bits: 32, signed, ..
+            } => *signed,
             t => panic!("{t:?}"),
         };
         assert_eq!((signed(g), signed(h)), (true, false));
