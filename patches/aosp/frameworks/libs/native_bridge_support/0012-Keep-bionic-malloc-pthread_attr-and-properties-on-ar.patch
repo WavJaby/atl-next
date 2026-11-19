@@ -1,0 +1,192 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Thu, 19 Nov 2026 14:29:45 +0800
+Subject: [PATCH] Keep bionic malloc, pthread_attr and properties on arm guests
+
+An arm guest on a 64-bit host cannot take host pointers or host
+records: a glibc heap pointer or a host prop_info pointer lies above
+4 GiB and does not fit the guest pointer, and glibc pthread_attr_t is
+56 bytes where bionic arm has 24. Drop the native_bridge_malloc*
+family, android_mallopt, pthread_attr_* and __system_property* from
+the arm stub list and leave malloc_init.cpp and the no-op
+__libc_init_scudo.cpp out of the arm build, so bionic own malloc
+dispatch, scudo init, pthread_attr_* and system properties (which lose
+to the stubs only under -z muldefs) define them. Scudo and the
+property area map through the emulator, which places non-fixed guest
+mappings below 4 GiB; the area file is the one the host reads.
+
+Upstream-Status: Inappropriate [NBS arm assumes a 32-bit host, where host heap pointers, host prop_info pointers and pthread_attr_t fit the guest]
+Patch-Reason: the stub list and sources are compiled into the guest libc; no launcher, loader or environment setting can remove a stub definition that overrides bionic under -z muldefs
+---
+SPDX-License-Identifier: Apache-2.0
+ android_api/libc/Android.bp    |   8 +++
+ android_api/libc/stubs_arm.cpp | 102 ---------------------------------
+ 2 files changed, 8 insertions(+), 102 deletions(-)
+
+diff --git a/android_api/libc/Android.bp b/android_api/libc/Android.bp
+index 4045b904b89c525fcea64370d497d0668d82581b..c53d783fa3ec1af13baa789108ae12922f37fc45 100644
+--- a/android_api/libc/Android.bp
++++ b/android_api/libc/Android.bp
+@@ -72,6 +72,14 @@ cc_library {
+                 ":libc_sources_shared_arm",
+                 "stubs_arm.cpp",
+             ],
++            // A 32-bit guest on a 64-bit host keeps bionic's own allocator
++            // (scudo, mapped through the emulator below 4 GiB) and its own
++            // pthread_attr_*: a host heap pointer or a host pthread_attr_t
++            // does not fit the guest's 32-bit words.
++            exclude_srcs: [
++                "__libc_init_scudo.cpp",
++                "malloc_init.cpp",
++            ],
+ 
+             cflags: [
+                 "-DCRT_LEGACY_WORKAROUND",
+diff --git a/android_api/libc/stubs_arm.cpp b/android_api/libc/stubs_arm.cpp
+index 776442a2b93b411e526eea746e9132d7613d31e5..ae669df23ee161966dcc63034df87b736e2d5dfb 100644
+--- a/android_api/libc/stubs_arm.cpp
++++ b/android_api/libc/stubs_arm.cpp
+@@ -21,29 +21,12 @@ DEFINE_INTERCEPTABLE_STUB_FUNCTION(__clone_for_fork);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(__get_thread_stack_top);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(__pthread_cleanup_pop);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(__pthread_cleanup_push);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_properties_init);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_add);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_area_init);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_area_serial);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_find);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_find_nth);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_foreach);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_get);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_read);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_read_callback);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_serial);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_set);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_set_filename);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_update);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_wait);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_wait_any);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(android_crash_detail_register);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(android_crash_detail_replace_data);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(android_crash_detail_replace_name);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(android_crash_detail_unregister);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(android_getaddrinfofornet);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(android_getaddrinfofornetcontext);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(android_mallopt);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(android_set_abort_message);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(freeaddrinfo);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(gai_strerror);
+@@ -55,41 +38,7 @@ DEFINE_INTERCEPTABLE_STUB_FUNCTION(memcmp);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(memcpy);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(memset);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge___cxa_thread_atexit_impl);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_aligned_alloc);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_calloc);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_exit);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_free);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_mallinfo);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_malloc);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_malloc_disable);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_malloc_enable);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_malloc_info_helper);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_malloc_iterate);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_malloc_usable_size);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_mallopt);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_memalign);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_posix_memalign);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_pvalloc);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_realloc);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_valloc);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_destroy);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_getdetachstate);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_getguardsize);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_getinheritsched);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_getschedparam);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_getschedpolicy);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_getscope);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_getstack);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_getstacksize);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_init);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_setdetachstate);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_setguardsize);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_setinheritsched);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_setschedparam);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_setschedpolicy);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_setscope);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_setstack);
+-DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_setstacksize);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_create);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_detach);
+ DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_exit);
+@@ -115,29 +64,12 @@ static void __attribute__((constructor(0))) init_stub_library() {
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __get_thread_stack_top);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __pthread_cleanup_pop);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __pthread_cleanup_push);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_properties_init);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_add);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_area_init);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_area_serial);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_find);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_find_nth);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_foreach);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_get);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_read);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_read_callback);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_serial);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_set);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_set_filename);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_update);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_wait);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_wait_any);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", android_crash_detail_register);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", android_crash_detail_replace_data);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", android_crash_detail_replace_name);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", android_crash_detail_unregister);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", android_getaddrinfofornet);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", android_getaddrinfofornetcontext);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", android_mallopt);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", android_set_abort_message);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", freeaddrinfo);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", gai_strerror);
+@@ -149,41 +81,7 @@ static void __attribute__((constructor(0))) init_stub_library() {
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", memcpy);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", memset);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge___cxa_thread_atexit_impl);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_aligned_alloc);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_calloc);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_exit);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_free);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_mallinfo);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_malloc);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_malloc_disable);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_malloc_enable);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_malloc_info_helper);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_malloc_iterate);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_malloc_usable_size);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_mallopt);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_memalign);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_posix_memalign);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_pvalloc);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_realloc);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_valloc);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_destroy);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_getdetachstate);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_getguardsize);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_getinheritsched);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_getschedparam);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_getschedpolicy);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_getscope);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_getstack);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_getstacksize);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_init);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_setdetachstate);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_setguardsize);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_setinheritsched);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_setschedparam);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_setschedpolicy);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_setscope);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_setstack);
+-  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_setstacksize);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_create);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_detach);
+   INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_exit);
