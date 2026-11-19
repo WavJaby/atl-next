@@ -15,6 +15,7 @@ use android_media_audio_common_types::mangled::{
     _7_android_5_media_5_audio_6_common_15_AudioMMapPolicy as AudioMMapPolicy,
     _7_android_5_media_5_audio_6_common_15_AudioPortConfig as AudioPortConfig,
     _7_android_5_media_5_audio_6_common_15_AudioStreamType as AudioStreamType,
+    _7_android_5_media_5_audio_6_common_16_AudioOffloadInfo as AudioOffloadInfo,
     _7_android_5_media_5_audio_6_common_18_AudioDeviceAddress as AudioDeviceAddress,
     _7_android_5_media_5_audio_6_common_18_AudioPortDeviceExt as AudioPortDeviceExt,
     _7_android_5_media_5_audio_6_common_19_AudioMMapPolicyInfo as AudioMMapPolicyInfo,
@@ -25,7 +26,10 @@ use atl_audioflinger_stubs::aidl::android::media::IAudioPolicyService::{
     BnAudioPolicyService, IAudioPolicyService,
 };
 use atl_audioflinger_stubs::aidl::android::media::IAudioPolicyServiceClient::IAudioPolicyServiceClient;
-use atl_audioflinger_stubs::mangled::_7_android_5_media_22_AudioPolicyDeviceState as AudioPolicyDeviceState;
+use atl_audioflinger_stubs::mangled::{
+    _7_android_5_media_16_AudioOffloadMode as AudioOffloadMode,
+    _7_android_5_media_22_AudioPolicyDeviceState as AudioPolicyDeviceState,
+};
 use audioclient_types_aidl::mangled::{
     _7_android_5_media_11_AudioPortFw as AudioPortFw,
     _7_android_5_media_12_AudioPatchFw as AudioPatchFw,
@@ -224,6 +228,15 @@ impl IAudioPolicyService for AudioPolicy {
         *count = Some(Int { r#value: 0 });
         atl_diag::answered(INTERFACE, "listAudioPatches");
         Ok(PORT_GENERATION)
+    }
+
+    /// AudioPolicyManager::getOffloadSupport (:4867): NOT_SUPPORTED when no output profile has AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD; the one output here is a PCM mixer, so never offload.
+    fn r#getOffloadSupport(
+        &self,
+        _info: Option<&AudioOffloadInfo>,
+    ) -> binder::Result<AudioOffloadMode> {
+        atl_diag::answered(INTERFACE, "getOffloadSupport");
+        Ok(AudioOffloadMode::NOT_SUPPORTED)
     }
 
     /// AudioPolicyManager::getMmapPolicyInfos (:9516): BAD_VALUE for a type other than DEFAULT / EXCLUSIVE; else what the HAL reports. This output has no MMAP path (output.rs mixes into a
