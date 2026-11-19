@@ -119,6 +119,7 @@ mirrors = [
     "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#getApplicationInfo",
     "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#getPackageInfo",
     "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#getServiceInfo",
+    "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#getReceiverInfo",
     "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#getPackagesForUid",
     "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#checkSignatures",
     "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#getInstrumentationInfoAsUser",

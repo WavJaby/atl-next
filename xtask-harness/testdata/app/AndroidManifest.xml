@@ -39,5 +39,7 @@
                 <action android:name="atl.test.BIND" />
             </intent-filter>
         </service>
+        <!-- Main.receiverInfo's receiver (app.rs SERVICE_LINES receiver) -->
+        <receiver android:name=".AtlReceiver" android:exported="false" />
     </application>
 </manifest>

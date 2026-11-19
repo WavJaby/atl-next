@@ -471,6 +471,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "keyguard: " + keyguard());
         Log.i("AtlTest", "user: " + userProfile());
         Log.i("AtlTest", "zen: " + zen());
+        Log.i("AtlTest", "receiver: " + receiverInfo());
         Log.i("AtlTest", "appops: " + appOps());
         Log.i("AtlTest", "jobscheduler: " + jobs());
         Log.i("AtlTest", "queryservices: " + queryServices());
@@ -1136,6 +1137,26 @@ public class Main extends Activity {
         } catch (Throwable t) {
             return "threw " + t;
         }
+    }
+
+    /** PackageManager.getReceiverInfo of the fixture's declared AtlReceiver (its name and exported flag) and of an undeclared class (NameNotFoundException, ApplicationPackageManager on a null answer). */
+    private String receiverInfo() {
+        android.content.pm.PackageManager pm = getPackageManager();
+        String own;
+        try {
+            android.content.pm.ActivityInfo ai = pm.getReceiverInfo(new android.content.ComponentName(this, AtlReceiver.class), 0);
+            own = ai.name + " exported=" + ai.exported;
+        } catch (Throwable t) {
+            own = "threw " + t.getClass().getSimpleName();
+        }
+        String missing;
+        try {
+            pm.getReceiverInfo(new android.content.ComponentName(this, "com.example.atltest.NoSuchReceiver"), 0);
+            missing = "found";
+        } catch (Throwable t) {
+            missing = t.getClass().getSimpleName();
+        }
+        return "own=" + own + " missing=" + missing;
     }
 
     /** NotificationManager.getCurrentInterruptionFilter: Do Not Disturb off (getZenMode ZEN_MODE_OFF) -> INTERRUPTION_FILTER_ALL (1). */

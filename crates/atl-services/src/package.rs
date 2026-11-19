@@ -608,6 +608,24 @@ impl IPackageManager for PackageManager {
             .and_then(|p| find_activity_info(p, &self.packages, &c.class, flags)))
     }
 
+    /// ComputerEngine.getReceiverInfo:3810: as getActivityInfo over the package's `<receiver>`s: null for an unknown user, package or class, or a disabled receiver without
+    /// MATCH_DISABLED_COMPONENTS (ApplicationPackageManager then throws NameNotFoundException).
+    fn r#getReceiverInfo(
+        &self,
+        component: Option<&ComponentName>,
+        flags: i64,
+        user: i32,
+    ) -> binder::Result<Option<ActivityInfo>> {
+        let Some(c) = component else {
+            return Ok(None);
+        };
+        Ok(self.visible(Some(&c.package), user).and_then(|p| {
+            let mut r = p.receiver(&c.class)?.clone();
+            cut(p, &self.packages, &mut r.component, flags)?;
+            Some(r)
+        }))
+    }
+
     /// ComputerEngine.getServiceInfo: null for an unknown user, package or class, or a disabled service without MATCH_DISABLED_COMPONENTS; GET_META_DATA keeps the `<service>`'s meta-data
     /// (Firebase's ComponentDiscoveryService lists its registrars there).
     fn r#getServiceInfo(

@@ -213,7 +213,14 @@ const MEDIAPLAYER_START: &str = "MediaPlayerNative: start called in state 1";
 /// answers null, which ApplicationPackageManager turns into an empty list: `own=0`.
 /// user: Main.userProfile: the process user is the full system user, not a profile (UserManagerService.getProfileType:2590 answers ""), so isProfile and isManagedProfile are false.
 /// zen: Main.zen: Do Not Disturb off (ZenModeHelper.getZenMode:396 ZEN_MODE_OFF) -> NotificationManager.zenModeToInterruptionFilter -> INTERRUPTION_FILTER_ALL (1).
-const SERVICE_LINES: [(&str, &str, Option<&str>); 11] = [
+/// receiver: Main.receiverInfo: ComputerEngine.getReceiverInfo:3810 answers the declared `<receiver>` (exported="false" in the manifest) and null for an undeclared class, which
+/// ApplicationPackageManager.getReceiverInfo turns into NameNotFoundException. A service without the method answers null for both: `own=threw NameNotFoundException`.
+const SERVICE_LINES: [(&str, &str, Option<&str>); 12] = [
+    (
+        "package",
+        "AtlTest: receiver: ",
+        Some("own=com.example.atltest.AtlReceiver exported=false missing=NameNotFoundException"),
+    ),
     ("user", "AtlTest: user: ", Some("profile=false managed=false")),
     ("notification", "AtlTest: zen: ", Some("filter=1")),
     (
