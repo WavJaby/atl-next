@@ -108,8 +108,7 @@ pub fn active() -> Active {
 pub fn select(isa: Option<&str>) -> Result<Active, String> {
     if isa.and_then(qemu::Arch::of_isa) == Some(qemu::Arch::Arm) {
         return Err(
-            "ISA arm: arm rows pending ILP32 conversion (P4b s2-s4) and 32-bit JNI (P5)"
-                .to_owned(),
+            "ISA arm: arm rows pending ILP32 conversion (P4b s2-s4) and 32-bit JNI (P5)".to_owned(),
         );
     }
     let engine = claim(isa)?;

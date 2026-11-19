@@ -166,8 +166,7 @@ pub fn classify(
     ];
     for (i, (g, h)) in guest.params.iter().zip(&host.params).enumerate() {
         kinds.push(
-            position(g, h, false, views, used)
-                .with_context(|| format!("{name}: parameter {i}"))?,
+            position(g, h, false, views, used).with_context(|| format!("{name}: parameter {i}"))?,
         );
     }
     Ok(Row { kinds })
@@ -214,7 +213,9 @@ fn position(
     }
     // a `void*` typedef names either a handle or a buffer, and the views cannot tell which: it must be listed
     if let Some(n) = void_pointer_typedef(g) {
-        bail!("{n} is a void* typedef not in the handle list: list it as a handle, or spell the buffer as void*");
+        bail!(
+            "{n} is a void* typedef not in the handle list: list it as a handle, or spell the buffer as void*"
+        );
     }
     match (g.resolved(), h.resolved()) {
         (
@@ -401,10 +402,9 @@ int sum(int a, double b);\n";
 
     /// `HEADER` in the bionic arm view (`guest`) and an LP64 view (`host`). `host_triple`: the red control passes the host's own triple for the guest, so every position reads `Same`.
     fn views(name: &str, guest_triple: &str) -> crate::ir::Interface {
-        let dir = Tmp(std::env::temp_dir().join(format!(
-            "atl-bridgegen-ilp32-{name}-{}",
-            std::process::id()
-        )));
+        let dir =
+            Tmp(std::env::temp_dir()
+                .join(format!("atl-bridgegen-ilp32-{name}-{}", std::process::id())));
         std::fs::create_dir_all(&dir.0).unwrap();
         let path = dir.0.join("h.h");
         std::fs::write(&path, HEADER).unwrap();
@@ -454,7 +454,12 @@ int sum(int a, double b);\n";
         };
         // AAPCS32 / bionic ILP32: long, size_t, off_t, time_t 4 bytes; off64_t 8
         assert_eq!(
-            [size("off_t"), size("size_t"), size("time_t"), size("off64_t")],
+            [
+                size("off_t"),
+                size("size_t"),
+                size("time_t"),
+                size("off64_t")
+            ],
             [4, 4, 4, 8]
         );
         // time_t 4 + long 4
@@ -475,7 +480,10 @@ int sum(int a, double b);\n";
     fn kinds_of_the_brief_rows() {
         let i = views("kinds", ARM);
         // off_t result: long, narrower in the guest
-        assert_eq!(row(&i, "AAsset_getLength").kinds[0], Kind::Widen { signed: true });
+        assert_eq!(
+            row(&i, "AAsset_getLength").kinds[0],
+            Kind::Widen { signed: true }
+        );
         // off64_t is 8 bytes on both: the result is Same, the asset handle Opaque
         assert_eq!(
             row(&i, "AAsset_getLength64").kinds,
@@ -506,7 +514,10 @@ int sum(int a, double b);\n";
         );
         assert_eq!(lock.kinds[3], Kind::Ptr);
         assert_eq!(lock.kinds[1], Kind::Opaque);
-        assert_eq!(row(&i, "nanosleep").kinds[1], Kind::Record("timespec".to_owned()));
+        assert_eq!(
+            row(&i, "nanosleep").kinds[1],
+            Kind::Record("timespec".to_owned())
+        );
         let memcpy = row(&i, "memcpy");
         assert_eq!(
             memcpy.kinds,
@@ -532,7 +543,12 @@ int sum(int a, double b);\n";
     #[test]
     fn host_model_guest_reads_same() {
         let i = views("lp64", "x86_64-unknown-linux-gnu");
-        for name in ["AAsset_getLength", "memcpy", "ANativeWindow_lock", "eglCreateImage"] {
+        for name in [
+            "AAsset_getLength",
+            "memcpy",
+            "ANativeWindow_lock",
+            "eglCreateImage",
+        ] {
             assert!(row(&i, name).same(), "{name}");
         }
     }
@@ -556,7 +572,10 @@ int sum(int a, double b);\n";
         )
         .unwrap_err();
         let e = format!("{e:#}");
-        assert!(e.contains("eglCreateImage") && e.contains("EGLDisplay"), "{e}");
+        assert!(
+            e.contains("eglCreateImage") && e.contains("EGLDisplay"),
+            "{e}"
+        );
         assert_eq!(
             Views {
                 guest: g,
