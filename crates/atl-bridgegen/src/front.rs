@@ -1269,6 +1269,7 @@ fn ty(t: &Type, unit: &Unit) -> Result<Ty> {
         TypeKind::UInt128 => int(false, CInt::UnsignedInt128)?,
         TypeKind::Char16 => int(false, CInt::Char16)?,
         TypeKind::Char32 => int(false, CInt::Char32)?,
+        TypeKind::WChar => int(c.is_signed_integer(), CInt::WChar)?,
         TypeKind::Float | TypeKind::Double | TypeKind::LongDouble | TypeKind::Float128 => {
             Ty::Float { bits: bits()? }
         }

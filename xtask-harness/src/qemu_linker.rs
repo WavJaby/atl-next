@@ -7,6 +7,7 @@
 //! - `qemu_linker` (Q4-3 placement): checks p, r, t, a, s. Breaks (`ATL_NB_BREAK`): `qe_site` (the vdso's placeholder search fails closed on call_guest), `qe_nomap` (no page registered: a fetch from a placed site faults), `qe_id` (a binding trap calls its neighbour's host function).
 //! - `qemu_start` (Q4-4 linker init): checks s (started), e (entry), t (static TLS), h (get_host_pthread), g (GS base). Breaks: `qe_no_tls` (the static-TLS hook unpatched: the linker's `bl` branches to 0). `qe_guest_base` is retired (Q5-1b): the engine's command line is `-B 0` and the C ABI has no base argument, so there is no nonzero-base run to refuse. The AT_RANDOM break (plan Q4-4 (b)) was never wired: it did not abort (Q4-5 log).
 //! - `qemu_dlopen` (Q4-5 guest dlopen): checks s (started), i (the stub libc intercepted stubs), d (dlopen returned a handle), y (dlsym found both functions), c (libfix's constructor saw libdep's relocated value), v (fix_value()). Break: `skip_reloc` (harness-level: the run's libdep.so has DT_ANDROID_RELRSZ zeroed, so its packed RELATIVE relocations are not applied; no product cfg). The AT_RANDOM break was dropped: nothing on this path aborts without AT_RANDOM.
+//! - `qemu_main` (phase4-32bit P4b guest main): `main_exe.c`'s main creates and joins a thread, returns; the guest's exit ends the process through NBS `native_bridge_exit` -> host `exit`. Checks s (started), e (the host exit ran), v (main's status), r (no host pointer refused). Break: `main_exit_unbound` (the exit stub unprototyped on ILP32, unbound on LP64: the guest's exit traps naming it).
 //! - `qemu_staged` (Q6-5 staging): the engine `.so` and the boot executable placed as a test image places them (atld_run.rs `qemu_engine_files`) into a stage root; the harness runs in a bwrap mount namespace whose `/system` is that root's, and `engine::select` boots from the installed paths, no override. Check b (booted). Break: `no_boot_exe` (harness-level: the stage without the boot executable).
 //!
 //! Pass: every check prints ok and the run exits 0; each break must turn its run red. Output: `<out>/qemu/<target>-linux-user-pic/qemu-linker/`, one log per run.
@@ -41,7 +42,7 @@ pub(crate) struct Harness {
     pub(crate) breaks: &'static [&'static str],
 }
 
-const HARNESSES: [Harness; 3] = [
+const HARNESSES: [Harness; 4] = [
     Harness {
         test: "qemu_linker",
         prefix: "qemu-linker",
@@ -59,6 +60,12 @@ const HARNESSES: [Harness; 3] = [
         prefix: "qemu-dlopen",
         checks: &['s', 'i', 'm', 'd', 'y', 'c', 'v'],
         breaks: &[SKIP_RELOC],
+    },
+    Harness {
+        test: "qemu_main",
+        prefix: "qemu-main",
+        checks: &['s', 'c', 'e', 'v', 'r'],
+        breaks: &["main_exit_unbound"],
     },
 ];
 
@@ -138,6 +145,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         &["-fPIE", "-pie"],
         &["-ldl"],
     )?;
+    let main_exe = guest_build(
+        root,
+        &target,
+        "main_exe",
+        &dir.join("main_exe"),
+        &["-fPIE", "-pie"],
+        &[],
+    )?;
     // the dlopen pair: the plain run loads libdep.so from `plain`; break skip_reloc loads a copy with its RELATIVE relocations removed from `skipped`
     let plain = dir.join("dlopen-libs");
     let skipped = dir.join("dlopen-libs-skip-reloc");
@@ -171,7 +186,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     std::fs::copy(&libfix, skipped.join("libfix.so"))
         .with_context(|| format!("copying {}", libfix.display()))?;
     let isa = PathBuf::from(&args.arch);
-    let env: [(&str, &Path); 8] = [
+    let env: [(&str, &Path); 9] = [
+        ("ATL_NB_MAINEXE", &main_exe),
         ("ATL_NB_ARCH", &isa),
         ("ATL_ENGINE_SO", &so),
         ("ATL_QEMU_SPIKE_FIXTURE", &fixture),

@@ -20,6 +20,9 @@ use std::process::ExitCode;
 use std::sync::OnceLock;
 use std::time::Instant;
 
+#[path = "common/churn.rs"]
+mod churn;
+
 use atl_native_bridge::engine::{Config, Guest, qemu};
 use object::{Object, ObjectSymbol, read::elf::ElfFile64};
 
@@ -266,7 +269,18 @@ fn started(r: Result<Guest, String>) -> u64 {
         },
     );
 
-    ok &= check('c', churn(&mut guest, join));
+    ok &= check(
+        'c',
+        churn::churn(&mut guest, "qemu-thread", |guest, k| {
+            // SAFETY: qt_join creates one thread running qt_routine and joins it (as check j).
+            let got = unsafe { guest.call(join, JOIN_ARG as usize, 0, 0) } as u64;
+            if got == JOIN_ARG + JOIN_OFFSET {
+                Ok(())
+            } else {
+                Err(format!("thread {k}: join returned {got:#x}"))
+            }
+        }),
+    );
 
     // SAFETY: page size, no memory effects.
     let [g, i] = stack_child();
@@ -283,92 +297,6 @@ fn started(r: Result<Guest, String>) -> u64 {
         "qemu-thread: call-cost {ns} ns per guest call round trip (qt_nop, {COST_CALLS} calls, this thread)"
     );
     u64::from(!ok)
-}
-
-/// Guest threads check (c) creates and joins after its warm-up (~1.5 s). Enough that a leak above [`CHURN_BOUND`] lifts the totals far past their noise: a 64 MiB malloc arena / 2000 = 32 KiB, and the leak QEMU's ARM CPU finalizer had (31.8 KB/thread) grew in-use heap by 64 MB here.
-const CHURN: usize = 2_000;
-/// Threads before (c)'s baseline: glibc's stack cache and QEMU's first-use allocations settle in them.
-const CHURN_WARMUP: usize = 200;
-/// Largest growth per joined thread check (c) accepts, of glibc's in-use heap (`mallinfo2().uordblks`) and of `VmRSS`, in bytes. Measured with the teardown complete: heap 0 net over 9000 threads, one window up to 529 B/thread (a ~1 MB transient), resident up to 624 B/thread; the smallest per-thread leak seen, the ARM CPU's cpreg lists, was 5.8 KB/thread (the whole ARM finalizer leak 31.8 KB). 2 KiB = 3x the noise and under half that leak.
-const CHURN_BOUND: i128 = 2048;
-
-/// glibc's in-use heap bytes, all arenas (`mallinfo2().uordblks`; struct mallinfo2, malloc.h: ten size_t fields, uordblks the eighth).
-fn heap_in_use() -> usize {
-    #[repr(C)]
-    struct Mallinfo2 {
-        fields: [usize; 10],
-    }
-    unsafe extern "C" {
-        fn mallinfo2() -> Mallinfo2;
-    }
-    // SAFETY: glibc's query, no arguments; returns the struct by value.
-    unsafe { mallinfo2() }.fields[7]
-}
-
-/// `VmRSS` and `VmSize` of this process in bytes (`/proc/self/status`, kB fields).
-fn vm() -> Result<(u64, u64), String> {
-    let s = std::fs::read_to_string("/proc/self/status").map_err(|e| e.to_string())?;
-    let field = |name: &str| {
-        s.lines()
-            .find_map(|l| l.strip_prefix(name))
-            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
-            .map(|kb| kb * 1024)
-            .ok_or(format!("/proc/self/status: no {name}"))
-    };
-    Ok((field("VmRSS:")?, field("VmSize:")?))
-}
-
-/// Check (c), thread churn: [`CHURN`] guest threads created and joined (`qt_join`) give back every `Active::reserve` block (engine `unmap_window`): `RESERVED` returns to its start value; and leave nothing on the host heap: in-use heap and resident grow at most [`CHURN_BOUND`] per thread (break `keep-cpu`: the CPU teardown skipped). VmSize is printed, not judged: glibc may add an arena when threads overlap.
-fn churn(guest: &mut Guest, join: usize) -> Result<(), String> {
-    use std::sync::atomic::Ordering;
-    let run = |guest: &mut Guest, n: usize| -> Result<(), String> {
-        for k in 0..n {
-            // SAFETY: qt_join creates one thread running qt_routine and joins it (as check j).
-            let got = unsafe { guest.call(join, JOIN_ARG as usize, 0, 0) } as u64;
-            if got != JOIN_ARG + JOIN_OFFSET {
-                return Err(format!("thread {k}: join returned {got:#x}"));
-            }
-        }
-        Ok(())
-    };
-    run(guest, CHURN_WARMUP)?;
-    let reserved = atl_native_bridge::engine::RESERVED.load(Ordering::Relaxed);
-    let heap = heap_in_use();
-    let (rss, size) = vm()?;
-    let t = Instant::now();
-    run(guest, CHURN)?;
-    let ms = t.elapsed().as_millis();
-    let left = atl_native_bridge::engine::RESERVED.load(Ordering::Relaxed);
-    let heap2 = heap_in_use();
-    let (rss2, size2) = vm()?;
-    let per = |a: u64, b: u64| (i128::from(b) - i128::from(a)) / CHURN as i128;
-    let heap_per = per(heap as u64, heap2 as u64);
-    let rss_per = per(rss, rss2);
-    println!(
-        "qemu-thread: churn {CHURN} threads in {ms} ms: reserved {reserved} -> {left}, heap {heap_per} B/thread, rss {rss_per} B/thread, vmsize {} B/thread (bound {CHURN_BOUND})",
-        per(size, size2)
-    );
-    let mut why = Vec::new();
-    if left != reserved {
-        why.push(format!(
-            "{} reserve blocks not given back",
-            left as i128 - reserved as i128
-        ));
-    }
-    if heap_per > CHURN_BOUND {
-        why.push(format!("in-use heap grew {heap_per} B/thread"));
-    }
-    if rss_per > CHURN_BOUND {
-        why.push(format!("resident grew {rss_per} B/thread"));
-    }
-    if why.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "after {CHURN} joined threads: {} (bound {CHURN_BOUND} B/thread)",
-            why.join(", ")
-        ))
-    }
 }
 
 /// Set on the child run of checks (g) and (i): it boots, runs only [`stacks`] and [`isolation`] and prints a [`STACK_LINE`] for each. A child, because a wrong `pthread_getattr_np` (glibc reading a bionic record as its own, break `qt_getattr_glibc`) may kill or hang the process: the parent turns either into FAIL lines.

@@ -34,7 +34,7 @@ fn on_panic(field: &str, ret: &Ty) -> Result<String> {
 /// What a guest thread is made of, relative to the AOSP tree: the thread record (`pthread_internal_t`) and its per-thread libc state (`bionic_tls`) -- the engine builds one per guest thread, as the NBS linker's `__libc_init_main_thread_early` reuses `__native_bridge_get_host_pthread()`'s answer as both -- and the static-TLS description the linker hands the host (`__native_bridge_config_static_tls`).
 const THREAD_HEADERS: &[&str] = &[
     "bionic/libc/bionic/pthread_internal.h",
-    // pthread_attr_t: the intercepted pthread API hands it to glibc unconverted (engine/intercepts.rs size gate)
+    // pthread_attr_t: LP64 guests' intercepted pthread API hands it to glibc unconverted (engine/intercepts.rs size gate); the arm guest's is read by this view
     "bionic/libc/include/bits/pthread_types.h",
     // struct sigaction / sigset_t: guest sigaction's host side converts them (engine/signal.rs layout gate)
     "bionic/libc/include/bits/signal_types.h",
@@ -82,6 +82,8 @@ fn bionic_thread(
             "TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE",
             "MIN_TLS_SLOT",
             "MAX_TLS_SLOT",
+            // engine/intercepts.rs: the arm guest's own bionic attr (NBS patch 0012), its detach bit
+            "PTHREAD_ATTR_FLAG_DETACHED",
             // engine/netdb.rs: the flags bionic's getaddrinfo accepts (AI_MASK) and getnameinfo's, and every error code
             "AI_MASK",
             "AI_PASSIVE",
@@ -284,6 +286,8 @@ const GLIBC: &[(&str, &str)] = &[
     ("native_bridge_posix_memalign", "posix_memalign"),
     ("native_bridge_aligned_alloc", "aligned_alloc"),
     ("native_bridge_malloc_usable_size", "malloc_usable_size"),
+    // NBS exit.c: the guest's `exit` runs its `__cxa_finalize`, then this; the host `exit` (upstream's trampoline target) runs the process's own handlers
+    ("native_bridge_exit", "exit"),
     ("clock_gettime", "clock_gettime"),
     ("clock_getres", "clock_getres"),
     ("gettimeofday", "gettimeofday"),
@@ -822,6 +826,10 @@ const ILP32_SHIMS: &[&str] = &[
     "memcpy",
     "memset",
     "memcmp",
+    // intercepts.rs: the arm guest's bionic attr read by its generated view, `*thread` / `*value` written as one guest word, the start routine a lane value; getattr_np writes the arm attr's six words
+    "pthread_create",
+    "pthread_join",
+    "pthread_getattr_np",
     // intercepts.rs: an int key and a guest function, both lane values
     "pthread_key_create",
     "pthread_key_delete",
@@ -847,7 +855,30 @@ const LIBC_HEADERS: &[&str] = &[
     "sys/system_properties.h",
     "android/set_abort_message.h",
     "bionic/malloc.h",
+    // `exit` (NBS `native_bridge_exit`, upstream json header "stdlib.h"), `pthread_kill` / `pthread_sigqueue` (`sigval`)
+    "stdlib.h",
+    "signal.h",
 ];
+/// The prototype name of libc stub `name`: NBS names a stub whose guest-libc wrapper keeps the public name `native_bridge_<public>` (exit.c `exit` -> `native_bridge_exit`; the trampoline json's `custom_thunk` for the malloc family), so its prototype is the public function's.
+fn libc_prototype_name(name: &str) -> &str {
+    name.strip_prefix("native_bridge_").unwrap_or(name)
+}
+/// NBS's own declaration of `__cxa_thread_atexit_impl` (no bionic header declares it; NBS `proxy/cxa_trampolines.cc` does, for its custom trampoline), taken from that file: `extern "C" int __cxa_thread_atexit_impl(...);`.
+fn cxa_thread_atexit_decl(up: &Upstreams) -> Result<String> {
+    const REL: &str =
+        "frameworks/libs/native_bridge_support/android_api/libc/proxy/cxa_trampolines.cc";
+    let path = up.aosp(REL);
+    buildscript::rerun_if_changed(&path);
+    let text = std::fs::read_to_string(&path).with_context(|| path.display().to_string())?;
+    let start = text
+        .find("extern \"C\" int __cxa_thread_atexit_impl(")
+        .with_context(|| format!("{REL}: no __cxa_thread_atexit_impl declaration"))?;
+    let end = start
+        + text[start..]
+            .find(';')
+            .context("unterminated __cxa_thread_atexit_impl declaration")?;
+    Ok(format!("{}\n", &text[start..=end]))
+}
 
 /// The libc stubs' prototypes in two bionic views, `guest` (the guest's row) and `host` (the host arch's row): an ILP32 table classifies each bound libc row by them ([`libc_entries`]).
 fn libc_prototypes(
@@ -869,10 +900,11 @@ fn libc_prototypes(
         Ok(t)
     };
     let unit = out.join(format!("libc_prototypes_{}.cc", guest.arch));
-    let text: String = LIBC_HEADERS
+    let mut text: String = LIBC_HEADERS
         .iter()
         .map(|h| format!("#include <{h}>\n"))
         .collect();
+    text.push_str(&cxa_thread_atexit_decl(up)?);
     std::fs::write(&unit, text)?;
     // declarations count only from the headers themselves (`Source::also`), each in bionic's public or platform include dir
     let mut also = Vec::new();
@@ -910,7 +942,15 @@ fn ilp32_libc_entry(
 ) -> Result<String> {
     let guest = protos.arches.get("guest").context("no guest view")?;
     let host = protos.arches.get("host").context("no host view")?;
-    let (Some(g), Some(h)) = (guest.functions.get(name), host.functions.get(name)) else {
+    // deliberate break (`ATL_NB_BREAK=main_exit_unbound`): native_bridge_exit keeps its stub name, which no header declares
+    let proto = if name == "native_bridge_exit"
+        && selected_breaks()?.contains(&"atl_nb_main_exit_unbound")
+    {
+        name
+    } else {
+        libc_prototype_name(name)
+    };
+    let (Some(g), Some(h)) = (guest.functions.get(proto), host.functions.get(proto)) else {
         rows.push((
             "libc.so".to_owned(),
             name.to_owned(),
@@ -927,9 +967,14 @@ fn ilp32_libc_entry(
         host,
         handles: &[],
     };
-    // a difference the classifier has no kind for (bionic arm `socklen_t` is int32_t, x86_64's uint32_t: gethostbyaddr) traps by name, the row recorded
-    let row = match atl_bridgegen::ilp32::classify(name, g, h, &views, &mut Default::default()) {
-        Ok(row) => row,
+    // a difference the classifier has no kind for (bionic arm `socklen_t` is int32_t, x86_64's uint32_t: gethostbyaddr), or a by-value aggregate with no lane class (pthread_sigqueue's `union sigval`), traps by name, the row recorded
+    let classified = atl_bridgegen::ilp32::classify(name, g, h, &views, &mut Default::default())
+        .and_then(|row| {
+            let ret = atl_bridgegen::jni::result_class(&g.ret)?;
+            Ok((row, ret, atl_bridgegen::jni::param_classes(g)?))
+        });
+    let (row, ret, params) = match classified {
+        Ok(c) => c,
         Err(e) => {
             rows.push((
                 "libc.so".to_owned(),
@@ -963,11 +1008,7 @@ fn ilp32_libc_entry(
     if !carried && !shim {
         return Ok(trap(name, row.heaviest().trap_reason()));
     }
-    let sig = sig_literal(
-        atl_bridgegen::jni::result_class(&g.ret)?,
-        &atl_bridgegen::jni::param_classes(g)?,
-    );
-    Ok(lp64.replace("{sig}", &sig))
+    Ok(lp64.replace("{sig}", &sig_literal(ret, &params)))
 }
 /// An ILP32 guest's proxy variable rows: a host variable's value is a host pointer (`SL_IID_*`, `AMEDIAFORMAT_KEY_*` strings), which the guest's `uintptr_t` cannot hold, so the row traps (no value written) until a window copy of what it points to exists.
 const ILP32_VARIABLE: &str = "pending: ilp32 variable, a host pointer value";
@@ -1051,6 +1092,7 @@ fn libc_lp64_entries(
     let getattr_glibc = selected_breaks()?.contains(&"atl_nb_qt_getattr_glibc");
     let dns_unbound = selected_breaks()?.contains(&"atl_nb_dns_unbound");
     let herr_trap = selected_breaks()?.contains(&"atl_nb_dns_herr_trap");
+    let exit_unbound = selected_breaks()?.contains(&"atl_nb_main_exit_unbound");
     Ok(names
         .iter()
         .map(|name| {
@@ -1058,6 +1100,8 @@ fn libc_lp64_entries(
                 Err("unbound: no host side (break dns_unbound)")
             } else if herr_trap && name == "__get_h_errno" {
                 Err("unbound: no host side (break dns_herr_trap)")
+            } else if exit_unbound && name == "native_bridge_exit" && stale {
+                Err("unbound: no host side (break main_exit_unbound)")
             } else if getattr_glibc && name == "pthread_getattr_np" {
                 Ok(format!("Entry::Generic(Host::Glibc, {name:?}, {{sig}})"))
             } else if shims.contains(&name.as_str()) {
@@ -1712,6 +1756,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("dns_eai_raw", "atl_nb_dns_eai_raw"),
     // net-bp (build.rs `libc_entries`): `__get_h_errno` trapped: the resolver probe's h_errno read aborts the app
     ("dns_herr_trap", "atl_nb_dns_herr_trap"),
+    // P4b (build.rs `libc_prototype_name`, `libc_lp64_entries`): `native_bridge_exit` has no prototype on an ILP32 table and no host side on an LP64 one, so a guest main's exit traps naming it (qemu-linker gate, qemu_main `e`)
+    ("main_exit_unbound", "atl_nb_main_exit_unbound"),
     // Q6-2 (engine/dispatch.rs `call_object`): x3 and x4 exchanged, so CallStaticIntMethod(2, 3) reaches the host as (3, 2) (qemu-jni gate, `c`)
     ("jni_swap", "atl_nb_jni_swap"),
     // Q6-7 (engine/va_list.rs `fp`): a guest va_list's fp arguments are read from its integer save area (qemu-jni gate, `V`)

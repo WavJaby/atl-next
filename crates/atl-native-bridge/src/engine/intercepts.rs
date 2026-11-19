@@ -7,7 +7,7 @@
 use std::cell::Cell;
 use std::ffi::c_void;
 
-use super::thread::layout::{identity, qemu};
+use super::thread::layout::{identity, qemu, qemu_arm};
 use super::{StackReq, call_guest, thread};
 
 // the pass-through set's types: bionic guest view == glibc host view, for both engines' guests
@@ -16,6 +16,8 @@ const _: () = {
     assert!(identity::pthread_attr_t::ALIGN == align_of::<libc::pthread_attr_t>());
     assert!(qemu::pthread_attr_t::SIZE == size_of::<libc::pthread_attr_t>());
     assert!(qemu::pthread_attr_t::ALIGN == align_of::<libc::pthread_attr_t>());
+    // the arm guest's bionic attr: six 4-byte words (`arm_attr_field`, `pthread_getattr_np`)
+    assert!(qemu_arm::pthread_attr_t::SIZE == 6 * 4);
     assert!(size_of::<libc::pthread_t>() == size_of::<std::ffi::c_long>());
     assert!(size_of::<libc::pthread_key_t>() == size_of::<std::ffi::c_int>());
 };
@@ -28,16 +30,38 @@ struct Start {
     record: usize,
 }
 
-/// The guest stack `attr` asks for: its stack and guard size (glibc getters: the attr is glibc's, gated above); null = the engine's default. A caller-supplied stack (`pthread_attr_setstack`) is sized like any other: guest code runs on the engine's stack, never on the caller's memory.
+/// The arm guest keeps bionic's own `pthread_attr_*` (NBS patch 0012: glibc's 56-byte attr does not fit bionic arm's 24), so its attr is bionic's record, read and written here by the generated arm view; an LP64 guest's attr is glibc's (gated above).
+fn bionic_attr() -> bool {
+    matches!(super::active(), super::Active::Qemu(super::qemu::Arch::Arm))
+}
+
+/// A `u32` field of the arm guest's bionic attr: `size_t` and `uint32_t flags` are both 4 bytes there (pthread_types.h ILP32: `uint32_t flags; void* stack_base; size_t stack_size; size_t guard_size; int32_t sched_policy; int32_t sched_priority;`).
+///
+/// # Safety
+/// `attr` is a guest bionic arm `pthread_attr_t`.
+unsafe fn arm_attr_field(attr: *const libc::pthread_attr_t, off: usize) -> u32 {
+    // SAFETY: caller contract; `off` is a field of the generated arm view.
+    unsafe { attr.cast::<u8>().add(off).cast::<u32>().read_unaligned() }
+}
+
+/// The guest stack `attr` asks for: its stack and guard size (glibc getters for an LP64 guest's glibc attr, the arm view's fields for the arm guest's bionic one); null = the engine's default. A caller-supplied stack (`pthread_attr_setstack`) is sized like any other: guest code runs on the engine's stack, never on the caller's memory.
 fn stack_req(attr: *const libc::pthread_attr_t) -> StackReq {
     if attr.is_null() {
         return StackReq::default();
     }
     let (mut size, mut guard) = (0usize, 0usize);
-    // SAFETY: the guest's initialised attr, glibc layout (gated above); out parameters are locals.
-    unsafe {
-        libc::pthread_attr_getstacksize(attr, &mut size);
-        libc::pthread_attr_getguardsize(attr, &mut guard);
+    if bionic_attr() {
+        // SAFETY: the arm guest's initialised bionic attr.
+        unsafe {
+            size = arm_attr_field(attr, qemu_arm::pthread_attr_t::stack_size) as usize;
+            guard = arm_attr_field(attr, qemu_arm::pthread_attr_t::guard_size) as usize;
+        }
+    } else {
+        // SAFETY: the guest's initialised attr, glibc layout (gated above); out parameters are locals.
+        unsafe {
+            libc::pthread_attr_getstacksize(attr, &mut size);
+            libc::pthread_attr_getguardsize(attr, &mut guard);
+        }
     }
     // deliberate break (`ATL_NB_BREAK=qt_attr_size`): the attr's size never reaches attach (qemu-thread gate `g`)
     if cfg!(atl_nb_qt_attr_size) {
@@ -56,6 +80,11 @@ fn joinable(attr: *const libc::pthread_attr_t) -> bool {
     if attr.is_null() {
         return true;
     }
+    if bionic_attr() {
+        // SAFETY: the arm guest's initialised bionic attr.
+        let flags = unsafe { arm_attr_field(attr, qemu_arm::pthread_attr_t::flags) };
+        return flags & qemu_arm::PTHREAD_ATTR_FLAG_DETACHED as u32 == 0;
+    }
     let mut state = libc::PTHREAD_CREATE_JOINABLE;
     // SAFETY: the guest's initialised attr, glibc layout (gated above).
     unsafe { pthread_attr_getdetachstate(attr, &mut state) };
@@ -71,7 +100,8 @@ pub(super) extern "C" fn pthread_create(
     arg: usize,
 ) -> i32 {
     let stack = stack_req(attr);
-    let record = thread::prepare(joinable(attr));
+    let joinable = joinable(attr);
+    let record = thread::prepare(joinable);
     let start = Box::into_raw(Box::new(Start {
         routine,
         arg,
@@ -79,8 +109,29 @@ pub(super) extern "C" fn pthread_create(
         record,
     }));
     let mut glibc: libc::pthread_t = 0;
-    // SAFETY: `attr` is the guest's, same ABI (gated above); `start` is ours until `run` takes it.
-    let rc = unsafe { libc::pthread_create(&mut glibc, attr, run, start.cast()) };
+    // the arm guest's bionic attr is not glibc's: the host thread gets a glibc attr of its detach state (its stack size is the guest stack's business, `stack`)
+    let mut host_attr = std::mem::MaybeUninit::<libc::pthread_attr_t>::uninit();
+    let host_attr: *const libc::pthread_attr_t = if bionic_attr() && !attr.is_null() {
+        // SAFETY: a local attr, initialised before use and destroyed below.
+        unsafe {
+            libc::pthread_attr_init(host_attr.as_mut_ptr());
+            if !joinable {
+                libc::pthread_attr_setdetachstate(
+                    host_attr.as_mut_ptr(),
+                    libc::PTHREAD_CREATE_DETACHED,
+                );
+            }
+        }
+        host_attr.as_ptr()
+    } else {
+        attr
+    };
+    // SAFETY: `host_attr` is the guest's glibc attr (gated above) or the local one; `start` is ours until `run` takes it.
+    let rc = unsafe { libc::pthread_create(&mut glibc, host_attr, run, start.cast()) };
+    if host_attr != attr {
+        // SAFETY: the local attr initialised above.
+        unsafe { libc::pthread_attr_destroy(host_attr.cast_mut()) };
+    }
     if rc != 0 {
         // SAFETY: not handed to a thread.
         drop(unsafe { Box::from_raw(start) });
@@ -97,8 +148,8 @@ pub(super) extern "C" fn pthread_create(
     } else {
         record as libc::pthread_t
     };
-    // SAFETY: the guest's out-parameter, `pthread_t` = long (gated above).
-    unsafe { thread.write(handle) };
+    // SAFETY: the guest's out-parameter, `pthread_t` = long, one guest word (a record address, below 4 GiB on an arm guest: `Active::reserve`).
+    unsafe { thread::write_word(thread.cast(), handle as usize) };
     0
 }
 
@@ -165,6 +216,28 @@ pub(super) extern "C" fn pthread_getattr_np(
     let Some(s) = thread::stack_of(thread as usize) else {
         return libc::ESRCH;
     };
+    if bionic_attr() {
+        use qemu_arm::pthread_attr_t as a;
+        // bionic's pthread_getattr_np copies the thread's attr: joinable, SCHED_NORMAL (0) at priority 0, the stack and guard; every field a 4-byte word (`arm_attr_field`)
+        let fields = [
+            (a::flags, 0),
+            (a::stack_base, s.base),
+            (a::stack_size, s.len),
+            (a::guard_size, s.guard),
+            (a::sched_policy, 0),
+            (a::sched_priority, 0),
+        ];
+        for (off, v) in fields {
+            // SAFETY: the arm guest's bionic attr (24 bytes, offsets from its generated view); guest stack addresses and sizes fit 32 bits (`Active::reserve`).
+            unsafe {
+                attr.cast::<u8>()
+                    .add(off)
+                    .cast::<u32>()
+                    .write_unaligned(v as u32)
+            };
+        }
+        return 0;
+    }
     // SAFETY: the guest's attr, glibc layout (gated above); glibc initialises it first.
     unsafe {
         let rc = libc::pthread_attr_init(attr);
@@ -184,10 +257,15 @@ pub(super) extern "C" fn pthread_join(handle: usize, value: *mut *mut c_void) ->
     let Some(glibc) = thread::glibc_of(handle) else {
         return libc::ESRCH;
     };
-    // SAFETY: a guest thread's glibc handle; `value` is the guest's out-parameter or null.
-    let rc = unsafe { libc::pthread_join(glibc, value) };
+    let mut result: *mut c_void = std::ptr::null_mut();
+    // SAFETY: a guest thread's glibc handle; `result` a local.
+    let rc = unsafe { libc::pthread_join(glibc, &mut result) };
     if rc == 0 {
         thread::joined(handle);
+        if !value.is_null() {
+            // SAFETY: the guest's `void**`, one guest word; the routine's result is a guest value of that width (`run`).
+            unsafe { thread::write_word(value.cast(), result as usize) };
+        }
     }
     rc
 }
@@ -257,4 +335,26 @@ pub(super) extern "C" fn pthread_key_delete(key: libc::pthread_key_t) -> i32 {
     thread::set_guest_dtor(key, 0);
     // SAFETY: a key of this process.
     unsafe { libc::pthread_key_delete(key) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::qemu_arm::pthread_attr_t as a;
+
+    /// Expected from bionic's `bits/pthread_types.h` ILP32 branch, field order `uint32_t flags; void* stack_base; size_t stack_size; size_t guard_size; int32_t sched_policy; int32_t sched_priority;` (no `__reserved`, LP64 only): six 4-byte AAPCS32 fields, no padding, 24 bytes.
+    #[test]
+    fn bionic_arm_pthread_attr_t_is_six_words() {
+        assert_eq!(
+            [
+                a::flags,
+                a::stack_base,
+                a::stack_size,
+                a::guard_size,
+                a::sched_policy,
+                a::sched_priority
+            ],
+            [0, 4, 8, 12, 16, 20]
+        );
+        assert_eq!((a::SIZE, a::ALIGN), (24, 4));
+    }
 }

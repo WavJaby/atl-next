@@ -36,7 +36,7 @@ fn word() -> usize {
 ///
 /// # Safety
 /// `p` holds [`word`] readable bytes.
-unsafe fn read_word(p: *const u8) -> usize {
+pub(super) unsafe fn read_word(p: *const u8) -> usize {
     // SAFETY: caller contract.
     unsafe {
         match word() {
@@ -50,7 +50,7 @@ unsafe fn read_word(p: *const u8) -> usize {
 ///
 /// # Safety
 /// `p` holds [`word`] writable bytes.
-unsafe fn write_word(p: *mut u8, v: usize) {
+pub(super) unsafe fn write_word(p: *mut u8, v: usize) {
     // SAFETY: caller contract.
     unsafe {
         match word() {
@@ -160,9 +160,18 @@ struct Thread {
 /// Every guest thread ([`Thread`]).
 static THREADS: Mutex<Vec<Thread>> = Mutex::new(Vec::new());
 
+/// The record a guest `pthread_t` lane names: its low guest word. bionic's `pthread_t` is `long`, so a 32-bit guest's handle reaches the host sign-extended (lane class `widen:s`) once its record lies at or above 2 GiB; the record address is the zero-extended word.
+fn record_of(handle: usize) -> usize {
+    match word() {
+        4 => handle as u32 as usize,
+        _ => handle,
+    }
+}
+
 fn with_thread<R>(handle: usize, f: impl FnOnce(&mut Thread) -> R) -> Option<R> {
+    let record = record_of(handle);
     let mut v = THREADS.lock().ok()?;
-    v.iter_mut().find(|t| t.record == handle).map(f)
+    v.iter_mut().find(|t| t.record == record).map(f)
 }
 
 /// The guest stack of the thread `handle` names; None for a handle of no attached thread.
@@ -178,6 +187,7 @@ pub fn glibc_of(handle: usize) -> Option<libc::pthread_t> {
 /// The kernel tid of the guest thread `handle` (its record's `tid`, written by the thread itself at start, [`adopt_record`]); None for an unknown handle.
 pub fn tid_of(handle: usize) -> Option<i32> {
     with_thread(handle, |_| ())?;
+    let handle = record_of(handle);
     let a = abi();
     // SAFETY: a live record of the generated layout (entries are removed before their record is freed); `tid` is `pid_t`, written once by its thread.
     Some(unsafe { std::ptr::read_volatile((handle as *const u8).add(a.tid).cast::<i32>()) })
@@ -223,6 +233,7 @@ pub fn adopt_record(record: usize) {
 
 /// Join's end (intercepts.rs `pthread_join` after glibc's): the thread has exited, its record goes.
 pub fn joined(handle: usize) {
+    let handle = record_of(handle);
     if forget(handle) {
         // SAFETY: the entry is gone and its thread has exited (glibc joined it), so nothing reads the record.
         unsafe { free_record(handle) };

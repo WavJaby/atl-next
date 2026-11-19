@@ -181,6 +181,8 @@ pub enum CInt {
     UnsignedInt128,
     Char16,
     Char32,
+    /// signedness per target (`Ty::Int::signed`): AAPCS makes it unsigned, x86_64 signed
+    WChar,
 }
 
 impl CInt {
@@ -202,6 +204,7 @@ impl CInt {
             CInt::UnsignedInt128 => "unsigned __int128",
             CInt::Char16 => "char16_t",
             CInt::Char32 => "char32_t",
+            CInt::WChar => "wchar_t",
         }
     }
 
