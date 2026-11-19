@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # fossify-math 1.4.0 (F-Droid, Java only, no network): 7 + 5 = changes the display. Positions read at 1440x900 content; display region = the result rows above the keypad, keypad = the rows below it.
 size 1440 900
+network offline
 control break-input
 wait-stable 0 0 1440 900 20000 1000
 expect-varied 0 64 1440 296

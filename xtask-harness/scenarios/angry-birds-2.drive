@@ -2,6 +2,7 @@
 # angry-birds-2 (Google Play, Unity, arm64 only -> native bridge). Positions read at 1440x900 content.
 # Fresh root: Rovio logo -> red "2" splash -> "FIRST THINGS FIRST!" Terms of Service consent (free, no personal data) -> forced tutorial level: an animated hand shows the slingshot drag.
 size 1440 900
+network offline
 needs arm64
 control break-input
 unreachable account panel: network content, drawn in a WebView (WebView defect 3)

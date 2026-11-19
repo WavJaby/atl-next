@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Tracked APK scenarios: `xtask-harness/scenarios/<row>.drive`, `<row>` a test-apks.toml key (presence derived from the file, no table column), a drive script (drive.rs) with scenario headers.
 //! `run-apk <row> --scenario` runs one (run_apk.rs `scenario`); `xtask test scenarios` runs every row's as its own run-apk process, sequentially, and collects the `scenario:` lines as check_gates does.
-//! `check` step `tables` runs [`check`] (static: no run): the file names a row, parses, declares a known `control`, every `unreachable` carries a reason, every fixed `wait` follows a condition and is under [`FIXED_WAIT_MAX_MS`].
+//! `check` step `tables` runs [`check`] (static: no run): the file names a row, parses, declares a known `control` and its `network`, every `unreachable` carries a reason, every fixed `wait` follows a condition and is under [`FIXED_WAIT_MAX_MS`].
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
 
-use crate::drive::{self, Script, Step};
+use crate::drive::{self, Network, Script, Step};
 
 /// The scenarios' dir, relative to the checkout root.
 pub const DIR: &str = "xtask-harness/scenarios";
@@ -101,6 +101,10 @@ pub fn lint(row: &str, text: &str, is_row: &dyn Fn(&str) -> bool) -> Result<Scri
             CONTROLS.join(", ")
         );
     }
+    ensure!(
+        script.network.is_some(),
+        "no `network` line: a scenario states the network it is written for (offline, the regression form, or online)"
+    );
     lint_waits(&script.steps, false)?;
     lint_judges(&script.steps)?;
     Ok(script)
@@ -120,6 +124,11 @@ fn lint_judges(steps: &[Step]) -> Result<()> {
         "no unconditional expect-* after the last input step: the run would judge nothing it caused (expect-fps does not count: it is skipped on another tier)"
     );
     Ok(())
+}
+
+/// A run's network: `flag` (`--network`) over the script's header; the lint makes the header present, offline (the regression form, owner 2026-11-20) otherwise.
+pub fn network(flag: Option<Network>, script: &Script) -> Network {
+    flag.or(script.network).unwrap_or(Network::Offline)
 }
 
 fn is_condition(step: &Step) -> bool {
@@ -176,6 +185,7 @@ pub struct Verdict<'a> {
     pub host: &'a str,
     pub cpu: String,
     pub guest: String,
+    pub network: Network,
     /// Top-level checkpoints that judged and passed.
     pub passed: usize,
     /// Checkpoints that judged nothing, each with its reason (drive::Outcome::skipped).
@@ -192,8 +202,8 @@ pub struct Verdict<'a> {
 }
 
 impl Verdict<'_> {
-    /// `scenario: ok|FAILED <row> host=<arch> cpu=<cpu> guest=<abi> <k> judged, <s> skipped (<reasons>), <n> checkpoints fps=<mean> tier=<t> <secs>s [FPS NOT JUDGED: ...]
-    /// [unreachable: a, b]`, a failure's reason after `: `. Skipped checkpoints never count as judged.
+    /// `scenario: ok|FAILED <row> host=<arch> cpu=<cpu> guest=<abi> network=<offline|online> <k> judged, <s> skipped (<reasons>), <n> checkpoints fps=<mean> tier=<t> <secs>s
+    /// [FPS NOT JUDGED: ...] [unreachable: a, b]`, a failure's reason after `: `. Skipped checkpoints never count as judged.
     pub fn line(&self) -> String {
         let fps = self
             .fps
@@ -208,7 +218,7 @@ impl Verdict<'_> {
             )
         };
         let mut line = format!(
-            "scenario: {} {} host={} cpu={} guest={} {} judged, {skipped}, {} checkpoints fps={fps} tier={} {}s",
+            "scenario: {} {} host={} cpu={} guest={} network={} {} judged, {skipped}, {} checkpoints fps={fps} tier={} {}s",
             if self.failure.is_some() {
                 "FAILED"
             } else {
@@ -218,6 +228,7 @@ impl Verdict<'_> {
             self.host,
             self.cpu,
             self.guest,
+            self.network.name(),
             self.passed,
             self.total,
             self.tier,
@@ -253,6 +264,9 @@ pub struct Args {
     /// run-apk `--controls`: each row also runs under its declared controls, which must fail at a checkpoint.
     #[arg(long)]
     controls: bool,
+    /// Every row's run on this network instead of its scenario's `network` header (run-apk `--network`).
+    #[arg(long, value_enum)]
+    network: Option<Network>,
 }
 
 /// `xtask test scenarios`: each selected row's scenario as its own `run-apk <row> --scenario` process, sequential; one `scenarios:` summary line.
@@ -284,6 +298,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .arg(&out);
         if args.controls {
             cmd.arg("--controls");
+        }
+        if let Some(n) = args.network {
+            cmd.args(["--network", n.name()]);
         }
         let started = Instant::now();
         let status = cmd
@@ -331,7 +348,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 mod tests {
     use super::*;
 
-    const GOOD: &str = "size 1440 900\ncontrol break-input\nunreachable ad end: filled from the network\nwait-stable 0 0 10 10 1000 200\nwait 500\nmark a\ntap 1 1\nexpect-changed a\n";
+    const GOOD: &str = "size 1440 900\nnetwork offline\ncontrol break-input\nunreachable ad end: filled from the network\nwait-stable 0 0 10 10 1000 200\nwait 500\nmark a\ntap 1 1\nexpect-changed a\n";
 
     fn lint_row(text: &str) -> Result<Script> {
         lint("fossify-math", text, &|r| r == "fossify-math")
@@ -393,8 +410,21 @@ mod tests {
 
     #[test]
     fn the_script_parses() {
-        // GOOD is 8 lines: the bad step is line 9
-        red(&format!("{GOOD}tap 1\n"), "script line 9");
+        // GOOD is 9 lines: the bad step is line 10
+        red(&format!("{GOOD}tap 1\n"), "script line 10");
+    }
+
+    #[test]
+    fn the_network_is_stated() {
+        red(&GOOD.replace("network offline\n", ""), "no `network` line");
+        red(
+            &GOOD.replace("network offline", "network wifi"),
+            "neither offline nor online",
+        );
+        let s = lint_row(&GOOD.replace("offline", "online")).expect("online scenario");
+        assert_eq!(network(None, &s), Network::Online);
+        // the run's flag wins over the header
+        assert_eq!(network(Some(Network::Offline), &s), Network::Offline);
     }
 
     #[test]
@@ -442,6 +472,7 @@ mod tests {
             host: "x86_64",
             cpu: "native(AMD Ryzen 7)".into(),
             guest: "x86_64".into(),
+            network: Network::Offline,
             passed: 5,
             skipped: vec![],
             total: 5,
@@ -454,7 +485,7 @@ mod tests {
         };
         assert_eq!(
             v.line(),
-            "scenario: ok fossify-math host=x86_64 cpu=native(AMD Ryzen 7) guest=x86_64 5 judged, 0 skipped, 5 checkpoints fps=16.2 tier=readback 61s [unreachable: ad end, sign-in]"
+            "scenario: ok fossify-math host=x86_64 cpu=native(AMD Ryzen 7) guest=x86_64 network=offline 5 judged, 0 skipped, 5 checkpoints fps=16.2 tier=readback 61s [unreachable: ad end, sign-in]"
         );
         let red = Verdict {
             fps: None,
@@ -465,7 +496,7 @@ mod tests {
         };
         assert_eq!(
             red.line(),
-            "scenario: FAILED fossify-math host=x86_64 cpu=native(AMD Ryzen 7) guest=x86_64 3 judged, 0 skipped, 5 checkpoints fps=- tier=readback 61s: drive: step 9 failed"
+            "scenario: FAILED fossify-math host=x86_64 cpu=native(AMD Ryzen 7) guest=x86_64 network=offline 3 judged, 0 skipped, 5 checkpoints fps=- tier=readback 61s: drive: step 9 failed"
         );
         // Review-2 G4: skipped checkpoints are apart from judged ones, with their reasons; a run that judged no fps says so
         let skipped = Verdict {
@@ -473,6 +504,7 @@ mod tests {
             host: "x86_64",
             cpu: "native(AMD Ryzen 7)".into(),
             guest: "x86_64".into(),
+            network: Network::Online,
             passed: 11,
             skipped: vec![
                 "expect-fps: tier import != readback".into(),
@@ -488,7 +520,7 @@ mod tests {
         };
         assert_eq!(
             skipped.line(),
-            "scenario: ok angry-birds-2 host=x86_64 cpu=native(AMD Ryzen 7) guest=x86_64 11 judged, 2 skipped (expect-fps: tier import != readback; if-same panel: not taken), 13 checkpoints fps=30.0 tier=import 90s [FPS NOT JUDGED: every expect-fps names another tier than import]"
+            "scenario: ok angry-birds-2 host=x86_64 cpu=native(AMD Ryzen 7) guest=x86_64 network=online 11 judged, 2 skipped (expect-fps: tier import != readback; if-same panel: not taken), 13 checkpoints fps=30.0 tier=import 90s [FPS NOT JUDGED: every expect-fps names another tier than import]"
         );
     }
 

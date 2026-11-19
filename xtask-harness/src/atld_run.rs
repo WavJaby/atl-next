@@ -229,6 +229,11 @@ while [ "$1" != "--" ]; do : > "/dev/$1" && mount --bind "$2" "/dev/$1"; shift 2
 shift
 exec "$@""#;
 
+/// An offline run's network setup inside its fresh namespace (`unshare -Urn`): loopback up, then exec the command (no fork: the pid stays atld's).
+const OFFLINE_NET: &str = r#"set -eu
+ip link set lo up
+exec "$@""#;
+
 /// The sensors gate's fake kernel views (see [`Runtime::with_fake_devices`]).
 #[derive(Clone)]
 struct FakeDevices {
@@ -355,6 +360,8 @@ pub struct Runtime {
     exit_with_last_app: bool,
     /// Sensors gate kernel fakes: atld runs in a private user + mount namespace (`unshare -Urm`) that shows these as the fixed paths the product reads.
     fake_devices: Option<FakeDevices>,
+    /// An offline run ([`Runtime::offline`]): atld in a user + network namespace of its own, loopback only.
+    offline: bool,
     /// The gate this runtime was staged for: each run writes its record (remote.rs `record_path`) under `out`.
     gate: String,
     /// The AOSP tree (`src/aosp`): the record's root for the `src/aosp/` bundle names.
@@ -863,6 +870,7 @@ impl Runtime {
             esc_back: false,
             exit_with_last_app: false,
             fake_devices: None,
+            offline: false,
             site: remote::Site::Host,
             data_root: None,
         })
@@ -1369,6 +1377,13 @@ impl Runtime {
         });
         self
     }
+
+    /// An offline run (scenario `network offline`): atld and every process it starts see a network namespace with loopback up and nothing else -> no default route, so the product's host network
+    /// (atl-platform-host-linux network.rs) reports none and the app sees what AOSP shows a device without connectivity; connects to anything but 127.0.0.1 / ::1 fail. Harness-side setup, no product path.
+    pub fn offline(mut self) -> Self {
+        self.offline = true;
+        self
+    }
 }
 
 /// A gate's throwaway data root: `<root>.data` beside the run's root (atld refuses a data root inside the root), removed with the root at each start. Keeps gates hermetic: atld's default is the user's own.
@@ -1820,6 +1835,14 @@ impl Runtime {
                 c
             }
         };
+        if self.offline {
+            // outermost: the fake-kernel namespace (if any) nests inside it. unshare(1) leaves lo down in a new namespace; ns-root raises it (needs iproute2's `ip`), then execs on
+            let inner = cmd;
+            cmd = Command::new("unshare");
+            cmd.args(["-Urn", "--", "sh", "-c", OFFLINE_NET, "sh"])
+                .arg(inner.get_program())
+                .args(inner.get_args());
+        }
         if let Some(extra) = &self.tilt_keys {
             cmd.arg("--tilt-keys").args(extra);
         }

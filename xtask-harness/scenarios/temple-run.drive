@@ -2,6 +2,7 @@
 # temple-run 1.43.0 (Google Play, Unity il2cpp, arm64 only -> native bridge). Positions read at 562x900 content.
 # Fresh root: intro flight -> "Thanks! ... 500 Coins" popup over the menu (every fresh root) -> two event popups + a challenge-screen visit while a Global Challenge runs -> menu with idol + PLAY -> run; the tutorial does not wait for a swipe (the runner dies at the first corner and the run restarts by itself).
 size 562 900
+network offline
 needs arm64
 control break-input
 unreachable first corner passed: the turn window is a fraction of a second of a moving picture; S1 + S4 probes passed it in some runs only, and no log line or still picture marks the window

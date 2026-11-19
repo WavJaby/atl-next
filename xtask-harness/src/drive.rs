@@ -17,7 +17,7 @@ use crate::window;
 /// The script grammar (`run-apk --drive`'s help text).
 pub const GRAMMAR: &str = "A script file run against the window on the headless compositor, one step a line; blank lines and `#` comments are skipped. Every wait names its timeout: nothing waits by default.
 Header (before the first step): `size W H` = the content size the script's coordinates were read at; points and regions scale per axis to the live content. Without it coordinates are live content pixels.
-Scenario headers (a tracked scenario, `run-apk --scenario`; a plain run ignores them): `control BREAK` (a deliberate break the scenario must fail under, at a checkpoint) | `unreachable STATE: REASON` (declared out of reach, printed in the verdict) | `needs ARCH` (the guest arch of the row's bridge).
+Scenario headers (a tracked scenario, `run-apk --scenario`; a plain run ignores them): `control BREAK` (a deliberate break the scenario must fail under, at a checkpoint) | `unreachable STATE: REASON` (declared out of reach, printed in the verdict) | `needs ARCH` (the guest arch of the row's bridge) | `network offline|online` (the network the scenario is written for: offline = loopback only, the default regression form; `--network` overrides it).
 A region is `X Y W H` in the same pixels. Text arguments are one word or \"quoted\"; a source is `app`, `services` or `atld` (that process's log).
 Input: `tap X Y` / `swipe X1 Y1 X2 Y2 MS` (the mouse) | `touch X Y MS` / `touch-swipe X1 Y1 X2 Y2 MS` (one finger, wl_touch; Unity reads only this) | `leave` (mouse off the window) | `key NAME` / `key-down NAME` / `key-up NAME` (a letter, a digit, escape, backspace, tab, enter, space, home, end, up, down, left, right, pageup, pagedown, back) | `resize W H` (content size).
 Time: `wait MS` | `wait-frames N` (N presents from here, 120 s bound; only after something that redraws).
@@ -219,10 +219,28 @@ impl Cond {
     }
 }
 
-/// A parsed script: its headers and the steps. `controls`, `unreachable` and `needs` are a tracked scenario's (scenarios.rs); a plain `--drive` run ignores them.
+/// The network a scenario run has: `offline` = atld and everything it starts in a network namespace of the harness with loopback only (atld_run.rs `Runtime::offline`); `online` = the host's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Network {
+    Offline,
+    Online,
+}
+
+impl Network {
+    pub fn name(self) -> &'static str {
+        match self {
+            Network::Offline => "offline",
+            Network::Online => "online",
+        }
+    }
+}
+
+/// A parsed script: its headers and the steps. `controls`, `unreachable`, `needs` and `network` are a tracked scenario's (scenarios.rs); a plain `--drive` run ignores them.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Script {
     pub size: Option<(f64, f64)>,
+    /// `network offline|online`: the network the scenario is written for (`--network` overrides it for a run).
+    pub network: Option<Network>,
     /// `control NAME`: a deliberate break under which the scenario must fail at a checkpoint.
     pub controls: Vec<String>,
     /// `unreachable STATE: REASON`: a state the scenario declares out of reach, printed in its verdict.
@@ -364,6 +382,15 @@ pub fn parse(text: &str) -> Result<Script> {
                 header("needs")?;
                 ensure!(script.needs.is_none(), "{}: `needs` given twice", at());
                 script.needs = Some((*arch).to_owned());
+            }
+            ["network", mode] => {
+                header("network")?;
+                ensure!(script.network.is_none(), "{}: `network` given twice", at());
+                script.network = Some(match *mode {
+                    "offline" => Network::Offline,
+                    "online" => Network::Online,
+                    other => bail!("{}: network {other:?} is neither offline nor online", at()),
+                });
             }
             ["end"] => {
                 let (_, step) = open

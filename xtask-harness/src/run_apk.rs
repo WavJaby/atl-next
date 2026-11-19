@@ -94,6 +94,9 @@ pub struct Args {
     /// With --scenario: one more run under each of the scenario's `control` breaks, which must end FAILED at a checkpoint (`control:` line); one that passes, or fails elsewhere, turns the scenario red.
     #[arg(long, requires = "scenario")]
     controls: bool,
+    /// With --scenario: the run's network, overriding the scenario's `network` header (offline = a namespace with loopback only, set up by the harness around atld).
+    #[arg(long, value_enum, requires = "scenario")]
+    network: Option<drive::Network>,
     /// With --scenario: writes the scenario's shots as PNGs into DIR (by their file names) instead of judging them in memory only.
     #[arg(long, value_name = "DIR", requires = "scenario")]
     keep_shots: Option<PathBuf>,
@@ -219,6 +222,7 @@ impl Args {
             data_root: None,
             scenario: false,
             controls: false,
+            network: None,
             keep_shots: None,
         }
     }
@@ -347,7 +351,13 @@ fn scenario_run(
             .first()
             .map_or_else(|| "?".to_owned(), |a| a.abi.clone()),
     };
+    let network = scenarios::network(args.network, script);
+    println!("run-apk: network {}", network.name());
     let rt = rt.with_data_root(&data_root).for_user_launch();
+    let rt = match network {
+        drive::Network::Offline => rt.offline(),
+        drive::Network::Online => rt,
+    };
     let ran = run_on(
         &rt,
         args,
@@ -378,6 +388,7 @@ fn scenario_run(
         host: &args.host,
         cpu: scenarios::native_cpu(),
         guest,
+        network,
         passed,
         skipped,
         total: script.checkpoints(),
@@ -750,6 +761,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         data_root: None,
         scenario: false,
         controls: false,
+        network: None,
         keep_shots: None,
     };
     // no `--display`: atld reads the target's own monitor, as on the product's host (host_display); this host's monitor is not the target's
