@@ -174,6 +174,28 @@ impl Row {
     }
 }
 
+/// `sig`'s parameter lane classes in view `v` ([`crate::jni::param_classes`]), plus the by-value one-pointer-wide union ([`word_union`], `Kind::Widen{signed:false}`): an unsigned int lane of the union's width, as the register carries it.
+pub fn param_classes(sig: &Signature, v: &ArchView) -> Result<Vec<crate::jni::Class>> {
+    sig.params
+        .iter()
+        .map(|p| match p.resolved() {
+            Ty::Record { name } | Ty::Opaque { name, .. } if word_union(p, v) => {
+                let bits = layout(v, name).map_or(0, |r| r.size * 8);
+                Ok(crate::jni::Class::Int {
+                    bits: u8::try_from(bits)?,
+                    signed: false,
+                })
+            }
+            _ => crate::jni::param_classes(&Signature {
+                ret: Ty::Void,
+                params: vec![p.clone()],
+                variadic: false,
+            })
+            .map(|mut c| c.remove(0)),
+        })
+        .collect()
+}
+
 /// Classifies function `name`: `guest` in `views.guest`, `host` in `views.host`. Records each handle name it used in `used`. Err names the function and the position no rule covers.
 pub fn classify(
     name: &str,
@@ -260,6 +282,10 @@ fn position(
         ) if gb < hb => Ok(Kind::Widen { signed }),
         // a signedness-only difference at equal width is carried (bionic arm `socklen_t` = int32, glibc's uint32): the register holds the same bits on both sides and neither callee extends a full-width argument
         (&Ty::Int { bits: gb, .. }, &Ty::Int { bits: hb, .. }) if gb == hb => Ok(Kind::Same),
+        // a by-value union one pointer wide in each view ([`word_union`]: `union sigval`, 4 bytes on arm, 8 on x86_64) travels in one register (AAPCS32 parameter passing: a composite of at most 4 bytes takes one core register, its content in the low bytes; SysV x86_64: an 8-byte union of INTEGER class takes one general register), so it crosses as an unsigned word: zero-extended in (the int member is the low 4 bytes on both little-endian sides, a pointer member a guest window address), truncated out
+        _ if !result && word_union(g, views.guest) && word_union(h, views.host) => {
+            Ok(Kind::Widen { signed: false })
+        }
         // a record by value whose layout differs (NdkMediaCodec.h `AMediaCodecOnAsyncNotifyCallback`, four fn pointers): converted field by field like one behind a pointer
         _ if both_records(g, h, views).is_some() => {
             Ok(Kind::Record(both_records(g, h, views).unwrap_or_default()))
@@ -454,6 +480,29 @@ fn same_in(
         }
         _ => false,
     }
+}
+
+/// `ty` is a complete union in `v` of integers of at most 32 bits and at least one data pointer, every member at offset 0, no bit-field: its size is then exactly one pointer (pointers are at least 4 bytes on every target here).
+fn word_union(ty: &Ty, v: &ArchView) -> bool {
+    let name = match ty.resolved() {
+        Ty::Record { name } | Ty::Opaque { name, .. } => name,
+        _ => return false,
+    };
+    layout(v, name).is_some_and(|r| {
+        r.kind == crate::ir::RecordKind::Union
+            && r.fields
+                .iter()
+                .any(|f| matches!(f.ty.resolved(), Ty::Pointer { .. }))
+            && r.fields.iter().all(|f| {
+                f.offset == 0
+                    && f.bits.is_none()
+                    && match f.ty.resolved() {
+                        Ty::Int { bits, .. } => *bits <= 32,
+                        Ty::Pointer { .. } => true,
+                        _ => false,
+                    }
+            })
+    })
 }
 
 /// The layout of record `name` in `v`: defined by the interface or by a header it includes; `None` = incomplete.
@@ -775,6 +824,7 @@ int ALooper_addFd(int fd, int ident, int events, ALooper_callbackFunc callback, 
 int sum(int a, double b);\n\
 #include \"other.h\"\n\
 int sigqueue(int pid, int sig, const union sigval value);\n\
+int wide_user(union wide w);\n\
 int getnameinfo(const struct sockaddr* sa, socklen_t sa_len, char* host, size_t host_len, char* serv, size_t serv_len, int flags);\n\
 struct VaUser { int (*f)(void* p, __builtin_va_list ap); };\n\
 int va_user(struct VaUser* u);\n\
@@ -786,6 +836,7 @@ struct _JNIEnv { const void* functions; };\nint env_user(struct _JNIEnv* env);\n
 
     /// Defined outside the interface (`Ty::Opaque` + `ArchView::foreign`). `union sigval`: bionic uapi asm-generic/siginfo.h `{ int sival_int; void* sival_ptr; }`. `struct sockaddr`: bionic linux/socket.h `{ sa_family_t sa_family; char sa_data[14]; }`, 16 bytes on both. `socklen_t`: bionic sys/types.h `__kernel_socklen_t` = int; glibc bits/types.h `__socklen_t` = unsigned int.
     const OTHER: &str = "union sigval { int sival_int; void* sival_ptr; };\n\
+union wide { long long w; void* p; };\n\
 struct sockaddr { unsigned short sa_family; char sa_data[14]; };\n\
 struct _jobject {};\ntypedef struct _jobject* jobject;\n\
 #if defined(__arm__)\ntypedef int socklen_t;\n#else\ntypedef unsigned int socklen_t;\n#endif\n";
@@ -996,16 +1047,39 @@ struct _jobject {};\ntypedef struct _jobject* jobject;\n\
         );
     }
 
-    /// Records another header defines compare by layout, never by name: `union sigval` is 4 bytes on arm (int / 4-byte pointer) and 8 on x86_64, so by value it is a record; `struct sockaddr` is 16 bytes in both, so a pointer to it is a plain data pointer.
+    /// Records another header defines compare by layout, never by name: `union sigval` is 4 bytes on arm (int / 4-byte pointer) and 8 on x86_64, one pointer wide in each, so by value it is one register: an unsigned word (`word_union`); `struct sockaddr` is 16 bytes in both, so a pointer to it is a plain data pointer.
     #[test]
     fn foreign_records_compare_by_layout() {
         let i = views("foreign", ARM);
         let (g, h) = (&i.arches["guest"], &i.arches["host"]);
         assert_eq!((g.foreign["sigval"].size, h.foreign["sigval"].size), (4, 8));
         assert!(!g.records.contains_key("sigval"));
+        assert_eq!(row(&i, "sigqueue").kinds[3], Kind::Widen { signed: false });
+        // its lane: one unsigned word of the guest's 32-bit pointer (AAPCS32: one core register); the 64-bit union has none
         assert_eq!(
-            row(&i, "sigqueue").kinds[3],
-            Kind::Record("sigval".to_owned())
+            param_classes(&g.functions["sigqueue"], g).unwrap()[2],
+            crate::jni::Class::Int {
+                bits: 32,
+                signed: false
+            }
+        );
+        assert!(param_classes(&g.functions["wide_user"], g).is_err());
+        // a pointer to it still converts field by field, and a union has no field rule
+        assert!(
+            converters(
+                "sigval",
+                &Views {
+                    guest: g,
+                    host: h,
+                    handles: &[]
+                }
+            )
+            .is_err()
+        );
+        // two words on arm (a 64-bit member): not one register, stays a record
+        assert_eq!(
+            row(&i, "wide_user").kinds[1],
+            Kind::Record("wide".to_owned())
         );
         assert_eq!(row(&i, "getnameinfo").kinds[1], Kind::Ptr);
         // a field-less tag record (jni.h `_jobject`, here C's empty struct) stays a handle

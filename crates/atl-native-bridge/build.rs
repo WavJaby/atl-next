@@ -987,21 +987,20 @@ fn ilp32_libc_entry(
         host,
         handles: &[],
     };
-    // a difference the classifier has no kind for (bionic arm `socklen_t` is int32_t, x86_64's uint32_t: gethostbyaddr), or a by-value aggregate with no lane class (pthread_sigqueue's `union sigval`), traps by name, the row recorded
+    // a difference the classifier has no kind for (bionic arm `socklen_t` is int32_t, x86_64's uint32_t: gethostbyaddr), or a by-value aggregate with no lane class (a union wider than a pointer), traps by name, the row recorded; a one-pointer-wide union (pthread_sigqueue's `union sigval`) is an unsigned word lane (`ilp32::param_classes`)
+    let lanes = || atl_bridgegen::ilp32::param_classes(g, guest);
     let classified = atl_bridgegen::ilp32::classify(name, g, h, &views, &mut Default::default())
         .and_then(|row| {
             let ret = atl_bridgegen::jni::result_class(&g.ret)?;
-            Ok((row, ret, atl_bridgegen::jni::param_classes(g)?))
+            Ok((row, ret, lanes()?))
         });
     let own_shim =
         lp64.as_deref().is_ok_and(|e| e.starts_with("Entry::Shim")) && ILP32_SHIMS.contains(&name);
     let (row, ret, params) = match classified {
         Ok(c) => c,
-        // a shim converts its own row from the guest view: bound with the guest view's lane classes when every position has one (a by-value union has none: trapped below)
+        // a shim converts its own row from the guest view: bound with the guest view's lane classes when every position has one
         Err(e)
-            if own_shim
-                && atl_bridgegen::jni::result_class(&g.ret).is_ok()
-                && atl_bridgegen::jni::param_classes(g).is_ok() =>
+            if own_shim && atl_bridgegen::jni::result_class(&g.ret).is_ok() && lanes().is_ok() =>
         {
             rows.push((
                 "libc.so".to_owned(),
@@ -1010,7 +1009,7 @@ fn ilp32_libc_entry(
                 "shim",
             ));
             let ret = atl_bridgegen::jni::result_class(&g.ret)?;
-            let params = atl_bridgegen::jni::param_classes(g)?;
+            let params = lanes()?;
             let lp64 = lp64.map_err(|why| anyhow::anyhow!("{name}: {why}"))?;
             return Ok(lp64.replace("{sig}", &sig_literal(ret, &params)));
         }
