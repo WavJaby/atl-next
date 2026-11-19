@@ -187,7 +187,50 @@ fn call_host(guest: HostRules, target: usize, lanes: &AtlLanes, sig: Sig) -> Ans
             ..Answer::default()
         },
     };
-    guest_answer(guest, sig.ret, answer)
+    guest_answer(guest, sig.ret, ilp32_narrow(guest, sig.ret, target, answer))
+}
+
+/// Host pointer results a 32-bit guest was refused ([`ilp32_narrow`]): the measurement phase4-32bit P4b names its largest uncertainty; a gate on a 32-bit guest asserts it 0.
+pub static ILP32_REFUSED: AtomicUsize = AtomicUsize::new(0);
+
+/// A pointer result for a 32-bit guest (`guest`): at or above 4 GiB it cannot reach the guest, whose word would truncate it to another address; refused instead -- the answer becomes null (the C error value of a pointer result), [`ILP32_REFUSED`] counts it and the first refusal per host function is logged by its symbol name. Below 4 GiB, and every other class or guest, unchanged.
+#[allow(
+    clippy::print_stderr,
+    reason = "once per host function, as bindings.rs `report`: the crate has no logger"
+)]
+fn ilp32_narrow(guest: HostRules, ret: Class, target: usize, answer: Answer) -> Answer {
+    if guest.word_bits != 32 || ret != Class::Ptr || answer.x0 <= WORD {
+        return answer;
+    }
+    ILP32_REFUSED.fetch_add(1, Ordering::Relaxed);
+    static LOGGED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+    if let Ok(mut l) = LOGGED.lock()
+        && !l.contains(&target)
+    {
+        l.push(target);
+        eprintln!(
+            "atl-native-bridge: qemu crossing: refused a host pointer {:#x} to the 32-bit guest from {} (at or above 4 GiB; answered null)",
+            answer.x0,
+            symbol_name(target)
+        );
+    }
+    Answer { x0: 0, ..answer }
+}
+
+/// The dynamic symbol `addr` starts, or the address when `dladdr` names none.
+fn symbol_name(addr: usize) -> String {
+    // SAFETY: Dl_info is plain pointers; all zero is a valid value.
+    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    // SAFETY: dladdr reads only the address; `info` is a local it fills.
+    let found = unsafe { libc::dladdr(addr as *const std::ffi::c_void, &mut info) } != 0;
+    if found && !info.dli_sname.is_null() {
+        // SAFETY: dladdr's symbol name, NUL-terminated, in a loaded image.
+        unsafe { std::ffi::CStr::from_ptr(info.dli_sname) }
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        format!("{addr:#x}")
+    }
 }
 
 /// Integer words read from a 32-bit guest for a call with no prototype: r0..r3 and twelve stack words, which AAPCS64's image holds whole (eight registers, eight stack words).
@@ -1093,5 +1136,27 @@ mod aapcs32_tests {
             }
         );
         assert_eq!(guest_answer(AAPCS64, I64, a), a);
+    }
+
+    /// A pointer result into a 32-bit guest: the highest address a 32-bit word holds (2^32 - 1) passes whole; 2^32, the first it cannot, answers null and is counted. An aarch64 guest and a 64-bit integer result are never narrowed here (a `long long` is the r0:r1 pair, `guest_ret32`).
+    #[test]
+    fn ilp32_pointer_results_pass_below_4_gib_and_are_refused_above() {
+        let a = |x0| Answer { x0, x1: 0, v0: 0 };
+        let before = ILP32_REFUSED.load(Ordering::Relaxed);
+        assert_eq!(
+            ilp32_narrow(AAPCS32, Class::Ptr, 0, a(0xffff_ffff)).x0,
+            0xffff_ffff
+        );
+        assert_eq!(ILP32_REFUSED.load(Ordering::Relaxed), before);
+        assert_eq!(ilp32_narrow(AAPCS32, Class::Ptr, 0, a(0x1_0000_0000)).x0, 0);
+        assert_eq!(ILP32_REFUSED.load(Ordering::Relaxed), before + 1);
+        assert_eq!(
+            ilp32_narrow(AAPCS64, Class::Ptr, 0, a(0x1_0000_0000)).x0,
+            0x1_0000_0000
+        );
+        assert_eq!(
+            ilp32_narrow(AAPCS32, I64, 0, a(0x1_0000_0000)).x0,
+            0x1_0000_0000
+        );
     }
 }

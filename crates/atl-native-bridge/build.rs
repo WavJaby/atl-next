@@ -810,8 +810,165 @@ fn stub_names(up: &Upstreams, rel: &str) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// An ILP32 guest's libc rows: no binding list applies (glibc's and the provider's answers are LP64, the shims read LP64 guest records), and the stub list carries no prototype to classify, so every stub traps by this reason until p4b-s2 gives the rows their prototypes from the guest view.
-const ILP32_LIBC: &str = "pending: ilp32 libc, no prototype (p4b-s2)";
+/// An ILP32 guest's libc stub that has a host side on LP64 but no prototype in [`LIBC_HEADERS`] to classify: trapped, no lanes to place it by.
+const ILP32_LIBC: &str = "pending: ilp32 libc, no prototype";
+/// An ILP32 guest's libc stub whose guest and host bionic prototypes differ in a way the classifier has no kind for (`ilp32_rows.txt` names it).
+const ILP32_LIBC_UNCLASSIFIED: &str = "pending: ilp32 libc, unclassified difference";
+/// An ILP32 guest's libc shim whose host side reads or writes guest memory by the LP64 layout (a `pthread_t*`, a guest attr, an `addrinfo`): trapped until it converts by the guest's layout and is listed in [`ILP32_SHIMS`].
+const ILP32_SHIM: &str = "pending: ilp32 shim, LP64 guest layout";
+/// Shims (of [`SHIMS`]) whose host side handles a 32-bit guest's layout itself (reviewed per name), so an ILP32 table binds them whatever their kinds: each reads the guest's words by the guest's width.
+const ILP32_SHIMS: &[&str] = &[
+    // counters.rs: size recorded, then glibc's on the same arguments (a size_t widened by its lanes)
+    "memcpy",
+    "memset",
+    "memcmp",
+    // intercepts.rs: an int key and a guest function, both lane values
+    "pthread_key_create",
+    "pthread_key_delete",
+    // intercepts.rs: a guest pthread_t is its bionic record's address, a window address below 4 GiB, zero-extended by its lane
+    "pthread_detach",
+    "pthread_gettid_np",
+    "pthread_exit",
+    // intercepts.rs `BY_HANDLE`: the handle mapped, the rest lane values or pointers to ints, chars and `sched_param` (one int on both)
+    "pthread_getcpuclockid",
+    "pthread_getname_np",
+    "pthread_getschedparam",
+    "pthread_kill",
+    "pthread_setname_np",
+    "pthread_setschedparam",
+    "pthread_setschedprio",
+    "pthread_sigqueue",
+];
+/// Headers declaring the libc stubs' prototypes, parsed for the guest's bionic view and the host arch's bionic view (the LP64 contract every host side -- glibc row, provider, shim -- implements); `bionic/libc/platform` for `bionic/malloc.h`.
+const LIBC_HEADERS: &[&str] = &[
+    "string.h",
+    "pthread.h",
+    "netdb.h",
+    "sys/system_properties.h",
+    "android/set_abort_message.h",
+    "bionic/malloc.h",
+];
+
+/// The libc stubs' prototypes in two bionic views, `guest` (the guest's row) and `host` (the host arch's row): an ILP32 table classifies each bound libc row by them ([`libc_entries`]).
+fn libc_prototypes(
+    up: &Upstreams,
+    guest: &buildscript::ArchRow,
+    host: &buildscript::ArchRow,
+    out: &std::path::Path,
+) -> Result<atl_bridgegen::ir::Interface> {
+    let view = |row: &buildscript::ArchRow, name: &str| -> Result<Target> {
+        let mut t = buildscript::bionic_platform_target(
+            up,
+            row,
+            buildscript::future_level(up, row)?,
+            Some(&buildscript::libcxx_include_dir()?),
+        );
+        t.args
+            .push(format!("-I{}", up.aosp("bionic/libc/platform").display()));
+        t.arch = name.to_owned();
+        Ok(t)
+    };
+    let unit = out.join(format!("libc_prototypes_{}.cc", guest.arch));
+    let text: String = LIBC_HEADERS
+        .iter()
+        .map(|h| format!("#include <{h}>\n"))
+        .collect();
+    std::fs::write(&unit, text)?;
+    // declarations count only from the headers themselves (`Source::also`), each in bionic's public or platform include dir
+    let mut also = Vec::new();
+    for h in LIBC_HEADERS {
+        let path = ["bionic/libc/include", "bionic/libc/platform"]
+            .iter()
+            .map(|d| up.aosp(&format!("{d}/{h}")))
+            .find(|p| p.is_file())
+            .with_context(|| format!("{h}: not in bionic's include or platform dir"))?;
+        buildscript::rerun_if_changed(&path);
+        also.push(path);
+    }
+    let src = Source {
+        path: &unit,
+        lang: Lang::Cxx,
+        also: &also,
+        macros: DATA_MODEL,
+    };
+    atl_bridgegen::interface(
+        "libc_prototypes",
+        "bionic libc headers, guest and host views",
+        &src,
+        &[view(guest, "guest")?, view(host, "host")?],
+    )
+    .context("libc prototypes")
+}
+
+/// An ILP32 libc row's entry for a stub `name` whose LP64 entry is `lp64` (a `Generic` or `Shim` literal without lanes, `{sig}` where they go): bound with the guest view's lanes when every position is carried by its lane class (a pointer result included: dispatch.rs refuses one at or above 4 GiB, counted) or the shim converts itself ([`ILP32_SHIMS`]); else trapped with its heaviest kind's reason, or [`ILP32_LIBC`] without a prototype. Also its `ilp32_rows.txt` row.
+fn ilp32_libc_entry(
+    name: &str,
+    lp64: std::result::Result<String, &'static str>,
+    protos: &atl_bridgegen::ir::Interface,
+    rows: &mut Ilp32Rows,
+    trap: &mut dyn FnMut(&str, &'static str) -> String,
+) -> Result<String> {
+    let guest = protos.arches.get("guest").context("no guest view")?;
+    let host = protos.arches.get("host").context("no host view")?;
+    let (Some(g), Some(h)) = (guest.functions.get(name), host.functions.get(name)) else {
+        rows.push((
+            "libc.so".to_owned(),
+            name.to_owned(),
+            "no prototype".to_owned(),
+            "libc-unprototyped",
+        ));
+        return Ok(match lp64 {
+            Ok(_) => trap(name, ILP32_LIBC),
+            Err(why) => trap(name, why),
+        });
+    };
+    let views = atl_bridgegen::ilp32::Views {
+        guest,
+        host,
+        handles: &[],
+    };
+    // a difference the classifier has no kind for (bionic arm `socklen_t` is int32_t, x86_64's uint32_t: gethostbyaddr) traps by name, the row recorded
+    let row = match atl_bridgegen::ilp32::classify(name, g, h, &views, &mut Default::default()) {
+        Ok(row) => row,
+        Err(e) => {
+            rows.push((
+                "libc.so".to_owned(),
+                name.to_owned(),
+                format!("{e:#}"),
+                "libc-unclassified",
+            ));
+            return Ok(trap(name, ILP32_LIBC_UNCLASSIFIED));
+        }
+    };
+    let shim = lp64.as_deref().is_ok_and(|e| e.starts_with("Entry::Shim"));
+    let carried = row
+        .kinds
+        .iter()
+        .all(|k| k.carried() || matches!(k, atl_bridgegen::ilp32::Kind::PtrResult));
+    if !row.same() {
+        let waits = if carried {
+            "carried"
+        } else {
+            row.heaviest().label()
+        };
+        rows.push(("libc.so".to_owned(), name.to_owned(), row.describe(), waits));
+    }
+    let lp64 = match lp64 {
+        Ok(e) => e,
+        Err(why) => return Ok(trap(name, why)),
+    };
+    if shim && !ILP32_SHIMS.contains(&name) {
+        return Ok(trap(name, ILP32_SHIM));
+    }
+    if !carried && !shim {
+        return Ok(trap(name, row.heaviest().trap_reason()));
+    }
+    let sig = sig_literal(
+        atl_bridgegen::jni::result_class(&g.ret)?,
+        &atl_bridgegen::jni::param_classes(g)?,
+    );
+    Ok(lp64.replace("{sig}", &sig))
+}
 /// An ILP32 guest's proxy variable rows: a host variable's value is a host pointer (`SL_IID_*`, `AMEDIAFORMAT_KEY_*` strings), which the guest's `uintptr_t` cannot hold, so the row traps (no value written) until a window copy of what it points to exists.
 const ILP32_VARIABLE: &str = "pending: ilp32 variable, a host pointer value";
 /// Rows of an ILP32 table whose kinds the headers fix (function, position: 0 = result, the kind's `describe`): a classifier change that moves one fails the build.
@@ -832,16 +989,38 @@ const ILP32_EXPECTED: &[(&str, usize, &str)] = &[
 /// Macros read from both prototype views: equal values = an equal data model, where the identity rule holds; else the ILP32 classifier decides every row.
 const DATA_MODEL: &[&str] = &["__SIZEOF_POINTER__", "__SIZEOF_LONG__"];
 
-/// The libc rows: per NBS libc stub, its entry -- [`SHIMS`] (+ [`SIGNAL_SHIMS`] for the x86_64 list), [`GLIBC`], the provider's [`PROVIDER_APIS`], else a named trap. A name in those lists that the stub list lacks fails the build (a stale row). `ilp32`: every stub traps [`ILP32_LIBC`], no list applies.
+/// The libc rows: per NBS libc stub, its entry -- [`SHIMS`] (+ [`SIGNAL_SHIMS`] for the x86_64 list), [`GLIBC`], the provider's [`PROVIDER_APIS`], else a named trap. A name in those lists that the stub list lacks fails the build (a stale row), on the LP64 lists (an ILP32 list lacks the allocator and `pthread_attr_*` rows: NBS patch 0012 leaves them to the guest's bionic).
+/// LP64 rows cross with `Sig::INT` (no prototype; LP64 bionic and every host side agree). `ilp32`: the guest's and the host's bionic prototypes ([`libc_prototypes`]) classify each row ([`ilp32_libc_entry`]), and a bound row carries the guest view's lanes.
 fn libc_entries(
     names: &[String],
     qemu: bool,
-    ilp32: bool,
+    ilp32: Option<(&atl_bridgegen::ir::Interface, &mut Ilp32Rows)>,
     trap: &mut dyn FnMut(&str, &'static str) -> String,
 ) -> Result<Vec<String>> {
-    if ilp32 {
-        return Ok(names.iter().map(|n| trap(n, ILP32_LIBC)).collect());
+    let lp64 = libc_lp64_entries(names, qemu, ilp32.is_none())?;
+    match ilp32 {
+        None => Ok(names
+            .iter()
+            .zip(lp64)
+            .map(|(name, e)| match e {
+                Ok(e) => e.replace("{sig}", "Sig::INT"),
+                Err(why) => trap(name, why),
+            })
+            .collect()),
+        Some((protos, rows)) => names
+            .iter()
+            .zip(lp64)
+            .map(|(name, e)| ilp32_libc_entry(name, e, protos, rows, trap))
+            .collect(),
     }
+}
+
+/// Per libc stub its LP64 entry literal, `{sig}` where the lanes go, or the reason it traps. `stale`: fail on a binding-list name the stub list lacks.
+fn libc_lp64_entries(
+    names: &[String],
+    qemu: bool,
+    stale: bool,
+) -> Result<Vec<std::result::Result<String, &'static str>>> {
     let provider: Vec<&str> = PROVIDER_APIS
         .iter()
         .flat_map(|(_, f)| f.iter().copied())
@@ -865,7 +1044,7 @@ fn libc_entries(
         .chain(&provider)
     {
         ensure!(
-            names.iter().any(|s| s == n),
+            !stale || names.iter().any(|s| s == n),
             "libc.so: {n} is in a binding list but not an NBS libc stub"
         );
     }
@@ -876,19 +1055,19 @@ fn libc_entries(
         .iter()
         .map(|name| {
             if dns_unbound && name == "getaddrinfo" {
-                trap(name, "unbound: no host side (break dns_unbound)")
+                Err("unbound: no host side (break dns_unbound)")
             } else if herr_trap && name == "__get_h_errno" {
-                trap(name, "unbound: no host side (break dns_herr_trap)")
+                Err("unbound: no host side (break dns_herr_trap)")
             } else if getattr_glibc && name == "pthread_getattr_np" {
-                format!("Entry::Generic(Host::Glibc, {name:?}, Sig::INT)")
+                Ok(format!("Entry::Generic(Host::Glibc, {name:?}, {{sig}})"))
             } else if shims.contains(&name.as_str()) {
-                "Entry::Shim".to_owned()
+                Ok("Entry::Shim({sig})".to_owned())
             } else if let Some((_, sym)) = GLIBC.iter().find(|(n, _)| n == name) {
-                format!("Entry::Generic(Host::Glibc, {sym:?}, Sig::INT)")
+                Ok(format!("Entry::Generic(Host::Glibc, {sym:?}, {{sig}})"))
             } else if provider.contains(&name.as_str()) {
-                format!("Entry::Generic(Host::Provider, {name:?}, Sig::INT)")
+                Ok(format!("Entry::Generic(Host::Provider, {name:?}, {{sig}})"))
             } else {
-                trap(name, "unbound: no host side")
+                Err("unbound: no host side")
             }
         })
         .collect())
@@ -921,7 +1100,7 @@ const OBJECT_STUBS: usize = 256;
 /// An `Entry::Mapped` row as generated: library, name, the (parameter, map) pairs.
 type MappedRow = (String, String, Vec<(usize, LaneMap)>);
 /// `bindings_table.rs` (module `bindings`): every guest library whose stubs the engine binds -- the GL / window / NDK proxies and libc -- with its NBS stub names in list order, each with the entry it binds. The one table `native_bridge_intercept_symbol` resolves (library, name) in.
-/// `Entry::Generic(host, symbol, sig)` binds `symbol` looked up on that host library's own handle (a GL front, the bionic provider, glibc's libc.so.6) through the generic crossing, `sig` its lanes ([`sig_literal`]: `atl_bridgegen::jni::result_class` + `param_classes`; libc rows an integer result, no prototype); `Entry::Shim` a hand-written host side; `Entry::Trap(i)` `TRAPS[i]`, a named trap (`TRAP_NAMES[i]`).
+/// `Entry::Generic(host, symbol, sig)` binds `symbol` looked up on that host library's own handle (a GL front, the bionic provider, glibc's libc.so.6) through the generic crossing, `sig` its lanes ([`sig_literal`]: `atl_bridgegen::jni::result_class` + `param_classes`; LP64 libc rows an integer result, no prototype; ILP32 libc rows the guest view's, [`libc_entries`]); `Entry::Shim(sig)` a hand-written host side of those lanes; `Entry::Trap(i)` `TRAPS[i]`, a named trap (`TRAP_NAMES[i]`).
 /// The proxy prototypes come from one unit parsed for two views: `guest` (bionic, as NDK apps compile) and `host` (glibc). A stub whose prototype differs between the views fails the build, naming it.
 /// The guest a binding table is generated for: its bionic view's arches.toml row, the ISA of its NBS stub lists, whether the QEMU engine crosses it (else identity), and its thunk pool size (0 until [`thunks_of`] sets it: QEMU tables share the largest).
 struct Guest<'a> {
@@ -1174,7 +1353,7 @@ fn bindings_table(
             } else {
                 match (guest_view.functions.get(name), host_ir.functions.get(name)) {
                     (Some(_), Some(_)) if PROXY_SHIMS.contains(&name.as_str()) => {
-                        "Entry::Shim".to_owned()
+                        "Entry::Shim(Sig::INT)".to_owned()
                     }
                     (Some(_), Some(_)) if ANNOTATED.contains(&name.as_str()) => {
                         trap("pending: annotated, GS2.2")
@@ -1255,20 +1434,20 @@ fn bindings_table(
             "{t}: in CALLBACKS but no proxy row with a prototype in the set takes it"
         );
     }
-    let libc = libc_entries(&libc_names, qemu, !equal_model, &mut |name, why| {
-        traps.push(("libc.so".to_owned(), name.to_owned(), why));
-        format!("Entry::Trap({})", traps.len() - 1)
-    })?;
-    if !equal_model {
-        for n in &libc_names {
-            ilp32_rows.push((
-                "libc.so".to_owned(),
-                n.clone(),
-                "no prototype".to_owned(),
-                "libc-unprototyped",
-            ));
-        }
-    }
+    let libc_protos = if equal_model {
+        None
+    } else {
+        Some(libc_prototypes(up, guest.row, host, out)?)
+    };
+    let libc = libc_entries(
+        &libc_names,
+        qemu,
+        libc_protos.as_ref().map(|p| (p, &mut ilp32_rows)),
+        &mut |name, why| {
+            traps.push(("libc.so".to_owned(), name.to_owned(), why));
+            format!("Entry::Trap({})", traps.len() - 1)
+        },
+    )?;
     rows.push(("libc.so", libc_names.into_iter().zip(libc).collect()));
 
     let mut code = String::from(

@@ -120,8 +120,8 @@ pub enum Host {
 pub enum Entry {
     /// this symbol of that host library, of lanes `Sig` (the proxy prototype's; an integer result and no prototype for every libc row)
     Generic(Host, &'static str, Sig),
-    /// [`shim`] of the stub's name
-    Shim,
+    /// [`shim`] of the stub's name, of lanes `Sig` (`Sig::INT` but on an ILP32 guest's libc rows, build.rs `libc_entries`)
+    Shim(Sig),
     /// the lane-mapped class (build.rs `ENV_SHIMS`, `CALLBACKS`): `table::MAPPED_FNS[i]` maps the lanes `table::MAPPED_ROWS[i]` names and calls that symbol of the host library (ndk.rs `call_mapped`)
     Mapped(usize),
     /// `table::TRAPS[i]`
@@ -181,7 +181,7 @@ fn rows_of(t: Table) -> impl Iterator<Item = (&'static str, &'static str, Bindin
         l.stubs.iter().map(move |&(name, e)| {
             let b = match e {
                 Entry::Generic(host, symbol, sig) => Binding::Generic { host, symbol, sig },
-                Entry::Shim => Binding::Shim,
+                Entry::Shim(_) => Binding::Shim,
                 Entry::Mapped(i) => Binding::Mapped {
                     symbol: t.mapped_rows[i].1,
                     maps: t.mapped_rows[i].2,
@@ -354,7 +354,7 @@ pub fn target(soname: &str, name: &str) -> Option<Target> {
     };
     let (t, outcome) = match entry {
         Some(Entry::Generic(host, sym, sig)) => found(symbol(host, lib.soname, sym), sig),
-        Some(Entry::Shim) => found(shim(name), Sig::INT),
+        Some(Entry::Shim(sig)) => found(shim(name), sig),
         // its host symbol must be there too: the forwarder would abort at the first call otherwise
         Some(Entry::Mapped(i)) => found(
             system_symbol(lib.soname, table.mapped_rows[i].1).map(|_| table.mapped_fns[i] as usize),

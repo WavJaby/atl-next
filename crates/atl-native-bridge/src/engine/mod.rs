@@ -34,6 +34,7 @@ pub mod vdso;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+pub use dispatch::ILP32_REFUSED;
 use image::Image;
 pub use record::HostThread;
 

@@ -2,7 +2,7 @@
 //! Q4-5 gate (QEMU bridge plan Q4-5), harness-less: the guest's dlopen path under QEMU. The real arm64 guest linker starts the main executable (`dl_exe.c`, PIE with DT_NEEDED on libc.so and libdl.so); `libc.so` resolves to the stub libc, whose constructor intercepts its stubs. After the start the host calls the executable's functions through the crossing: its `dlopen("libfix.so")` loads a guest library whose DT_NEEDED is `libdep.so`, and `fix_value()` runs through both.
 //! Env (xtask qemu_linker.rs sets it; unset prints SKIP): ATL_ENGINE_SO (the engine `.so`), ATL_NB_BOOT (the engine boot executable, crates/atl-qemu-boot), ATL_NB_DLEXE (dl_exe.c, PIE), ATL_NB_DLLIBS (the directory holding libfix.so and libdep.so; break `skip_reloc` passes a copy of libdep.so with DT_ANDROID_RELRSZ zeroed, so its RELATIVE relocations are not applied), ATL_NB_LINKER, ATL_NB_VDSO (the arm64 NB images, `<nb>/libnative_bridge_guest_libc` among the guest library directories).
 //! Expected values come from the fixtures' C source, never from the engine: libdep.c `table[1]` = 0x51a2 (dep_value, through the RELATIVE relocation of `self_addr`); libfix.c fix_ctor = dep_value() = 0x51a2 (run by the constructor after libdep's), fix_value() = dep_value() + 0x10 = 0x51b2. The function addresses come from the executable's ELF symbol table (`object`) plus the load bias (entry - e_entry).
-//! Checks: (s) started, (i) the stub libc intercepted at least one stub (vdso BOUND > 0), (d) dlopen returned a handle, (y) dlsym found fix_value and fix_ctor_value, (c) libfix's constructor saw 0x51a2, (v) fix_value() = 0x51b2.
+//! Checks: (s) started, (i) the stub libc intercepted at least one stub (vdso BOUND > 0), (m) the guest's malloc(64) answered a block -- on a 32-bit guest below 4 GiB with no host pointer refused (`ILP32_REFUSED` = 0) --,(d) dlopen returned a handle, (y) dlsym found fix_value and fix_ctor_value, (c) libfix's constructor saw 0x51a2, (v) fix_value() = 0x51b2.
 //! Output: `qemu-dlopen: (x) ok` per check, `(x) FAIL <why>` otherwise; exit 0 when all pass. A start error prints `qemu-dlopen: (s) FAIL <error>`.
 #![allow(clippy::print_stdout, reason = "test harness output is its verdict")]
 #![allow(
@@ -17,11 +17,17 @@ use std::process::ExitCode;
 use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 
-use atl_native_bridge::engine::{Config, Guest, qemu, vdso};
+use atl_native_bridge::engine::{Config, Guest, ILP32_REFUSED, qemu, vdso};
 use object::{Object, ObjectSymbol};
 
 /// The dl_exe.c functions the host calls, in the order `SYMBOLS` lists them.
-const SYMBOLS: [&str; 4] = ["fx_open", "fx_fix_value", "fx_fix_ctor_value", "fx_dlerror"];
+const SYMBOLS: [&str; 5] = [
+    "fx_open",
+    "fx_fix_value",
+    "fx_fix_ctor_value",
+    "fx_dlerror",
+    "fx_malloc",
+];
 /// libdep.c `table[1]`, the value dep_value() returns when its RELATIVE relocation was applied.
 const DEP_VALUE: u64 = 0x51a2;
 /// libfix.c `fix_value() = dep_value() + 0x10`.
@@ -118,12 +124,16 @@ fn started(r: Result<Guest, String>) -> u64 {
     println!("qemu-dlopen: (s) ok");
     let bias = (guest.exe_entry as u64).wrapping_sub(x.e_entry);
     let addr = |i: usize| bias.wrapping_add(x.values[i]) as usize;
-    let (open, fix_value, ctor_value, dlerror) = (addr(0), addr(1), addr(2), addr(3));
+    let (open, fix_value, ctor_value, dlerror, malloc) =
+        (addr(0), addr(1), addr(2), addr(3), addr(4));
     let bound = vdso::BOUND.load(Ordering::Relaxed);
     let unbound = vdso::UNBOUND.load(Ordering::Relaxed);
 
+    // SAFETY: `malloc` is the executable's fx_malloc (no arguments): malloc(64) on the guest.
+    let block = unsafe { guest.call(malloc, 0, 0, 0) } as u64;
     // SAFETY: `open` is the executable's fx_open (no arguments): dlopen("libfix.so", RTLD_NOW) on the guest.
     let handle = unsafe { guest.call(open, 0, 0, 0) };
+    let refused = ILP32_REFUSED.load(Ordering::Relaxed);
     let mut ok = true;
     ok &= check(
         'i',
@@ -131,6 +141,18 @@ fn started(r: Result<Guest, String>) -> u64 {
             Ok(())
         } else {
             Err("no stub intercepted: the stub libc's constructor did not run".into())
+        },
+    );
+    // a 32-bit guest's heap is its own allocator's (NBS patch 0012), below 4 GiB, and no host pointer result was refused on the way (dispatch.rs `ilp32_narrow`); an aarch64 guest's block may be the host's
+    let wide = guest_arch().pointer_bits() == 64;
+    ok &= check(
+        'm',
+        if block != 0 && (wide || block <= u64::from(u32::MAX)) && refused == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "malloc(64) = {block:#x}, host pointers refused {refused}"
+            ))
         },
     );
     ok &= check(
@@ -174,7 +196,7 @@ fn started(r: Result<Guest, String>) -> u64 {
         (0, 0)
     };
     println!(
-        "qemu-dlopen: values handle {handle:#x} ctor {ctor:#x} value {value:#x} stubs bound {bound} unbound {unbound}"
+        "qemu-dlopen: values handle {handle:#x} ctor {ctor:#x} value {value:#x} malloc {block:#x} stubs bound {bound} unbound {unbound} ilp32 refused {refused}"
     );
     ok &= check(
         'c',

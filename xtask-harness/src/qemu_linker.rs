@@ -57,7 +57,7 @@ const HARNESSES: [Harness; 3] = [
     Harness {
         test: "qemu_dlopen",
         prefix: "qemu-dlopen",
-        checks: &['s', 'i', 'd', 'y', 'c', 'v'],
+        checks: &['s', 'i', 'm', 'd', 'y', 'c', 'v'],
         breaks: &[SKIP_RELOC],
     },
 ];
@@ -89,7 +89,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .find(|(isa, _)| **isa == args.arch)
         .map(|(_, a)| a.pointer_bits)
         .with_context(|| format!("arches.toml has no row {}", args.arch))?;
-    // a 32-bit guest (phase4-32bit P4a) runs the linker start only: the placement harness checks aarch64 words; the staged boot goes through `engine::select`, which refuses arm until P4b; the dlopen harness's guest libc binds its stubs through the arm64 tables and faults in its constructors (SIGSEGV after the first property binding) until P4b's ILP32 tables -- add it for arm with them
+    // a 32-bit guest (phase4-32bit P4a/P4b) runs the linker start and the dlopen harness: the placement harness checks aarch64 words; the staged boot goes through `engine::select`, which refuses arm until P5
     let wide = bits == 64;
     let linker = args.nb.join(format!(
         "native_bridge_guest_linker/{}",
@@ -183,7 +183,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     ];
     let mut fails = Vec::new();
     let mut total = 0;
-    for h in HARNESSES.iter().filter(|h| wide || h.test == "qemu_start") {
+    for h in HARNESSES.iter().filter(|h| wide || h.test != "qemu_linker") {
         let mut runs: Vec<Option<&str>> = vec![None];
         if !args.no_breaks {
             runs.extend(h.breaks.iter().map(|b| Some(*b)));

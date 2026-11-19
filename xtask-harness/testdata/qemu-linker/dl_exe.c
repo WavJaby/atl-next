@@ -4,6 +4,7 @@
 // `libfix.so` is found by name through LD_LIBRARY_PATH (the gate's library path).
 #include <dlfcn.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 __attribute__((used, noinline)) void *fx_open(void) {
     return dlopen("libfix.so", RTLD_NOW);
@@ -15,6 +16,11 @@ __attribute__((used, noinline)) void *fx_fix_value(void *h) {
 
 __attribute__((used, noinline)) void *fx_fix_ctor_value(void *h) {
     return dlsym(h, "fix_ctor_value");
+}
+
+// A heap block of the guest libc's allocator (check m: a 32-bit guest's must be its own, below 4 GiB, with no host pointer refused). Kept: the gate only reads its address.
+__attribute__((used, noinline)) void *fx_malloc(void) {
+    return malloc(64);
 }
 
 // The last dl error (NULL when none): the host prints it when dlopen or dlsym fails.
