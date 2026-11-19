@@ -227,8 +227,12 @@ const SHIMS: &[&str] = &[
 const SIGNAL_SHIMS: &[&str] = &["sigaction", "sigaction64"];
 /// Q5-8: the QEMU table's libc rows that bind to counted shims under `crossing-count` (counters.rs `memcpy`, `memset`, `memcmp`), which record the size argument and then run glibc's.
 const COUNTED_SHIMS: &[&str] = &["memcpy", "memset", "memcmp"];
-/// Proxy-library functions whose host side is hand-written, each bound `Entry::Shim` in its library; each must be in one proxy library's list (`bindings_table`). `slCreateEngine` (engine/sles.rs: its out object is wrapped in a guest proxy); `eglGetProcAddress` (engine/proc.rs: its answer is a row's guest address, never a raw host pointer; the fn-return arm below traps every other one).
-const PROXY_SHIMS: &[&str] = &["slCreateEngine", "eglGetProcAddress"];
+/// Proxy-library functions whose host side is hand-written, each bound `Entry::Shim` in its library; each must be in one proxy library's list (`bindings_table`). `slCreateEngine` (engine/sles.rs: its out object is wrapped in a guest proxy); `eglGetProcAddress` (engine/proc.rs: its answer is a row's guest address, never a raw host pointer; the fn-return arm below traps every other one); `android_getaddrinfofornetwork` (engine/netdb.rs: the host libandroid answers glibc's `struct addrinfo`, whose ai_addr / ai_canonname order is bionic's swapped -- the identity classifier names it `record:addrinfo`). A shim converts its own row, so the identity check skips it; an ILP32 row still traps on its kinds first.
+const PROXY_SHIMS: &[&str] = &[
+    "slCreateEngine",
+    "eglGetProcAddress",
+    "android_getaddrinfofornetwork",
+];
 /// Callback typedefs whose guest function pointer a lane-mapped row hands the host as a down shell (`Entry::Mapped`, engine/ndk.rs `call_mapped`; GS2.2 callback-param, tr-first blocker 5). Reviewed: every argument the host passes the callback is a value, the guest's own user data, or a host buffer the guest only loads from or stores to (QEMU's page table holds no host heap, so a host buffer must never reach a guest syscall or be fetched as code). A function-pointer parameter of another type traps `pending` (`atl_bridgegen::jni::route`); a name here no row uses is stale.
 /// Not here, with why: `AMediaDataSourceReadAt` (its buffer is host memory the guest writes: needs the G2 copy arena), `GLDEBUGPROC*` (its message is host memory: G2 staging), `AChoreographer_vsyncCallback` (`AChoreographerFrameCallbackData*`, a host record the guest reads).
 const CALLBACKS: &[&str] = &[
@@ -1307,7 +1311,7 @@ fn bindings_table(
         // identity: every stub name both views declare is ABI-identical (pass-through only where proven): every position `Same` (a data pointer and an integer of its width agree; a pointee's signedness is no ABI fact, arm64's plain char being unsigned)
         let converted: Vec<String> = classes
             .iter()
-            .filter(|(_, r)| !r.same())
+            .filter(|(n, r)| !r.same() && !PROXY_SHIMS.contains(n))
             .map(|(n, r)| format!("{n}: {}", r.describe()))
             .collect();
         ensure!(
@@ -1377,7 +1381,11 @@ fn bindings_table(
                 traps.push(((*soname).to_owned(), name.clone(), why));
                 format!("Entry::Trap({})", traps.len() - 1)
             };
-            let ilp32 = classes.get(name.as_str()).filter(|r| !r.same());
+            // a proxy shim's own layouts are LP64 bionic's: under an equal model it converts its row itself
+            let ilp32 = classes
+                .get(name.as_str())
+                .filter(|r| !r.same())
+                .filter(|_| !(equal_model && PROXY_SHIMS.contains(&name.as_str())));
             if let Some(row) = ilp32 {
                 let waits = if row.carried() {
                     "carried"

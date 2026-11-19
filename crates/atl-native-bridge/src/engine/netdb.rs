@@ -323,6 +323,23 @@ pub(super) extern "C" fn getaddrinfo(
     0
 }
 
+/// libandroid net.c `kHandleMagic`: the low 32 bits of every network handle but NETWORK_UNSPECIFIED (0); the netid is the high 32.
+const HANDLE_MAGIC: u64 = 0xcafe_d00d;
+
+/// libandroid `int android_getaddrinfofornetwork(net_handle_t, const char*, const char*, const struct addrinfo*, struct addrinfo**)` (build.rs `PROXY_SHIMS`): the host libandroid would answer glibc's list, so it converts as [`getaddrinfo`]. A handle net.c `getnetidfromhandle` refuses answers EAI_SYSTEM as there (its errno EINVAL is not set: no guest errno route yet). A valid netid selects nothing: the host has one resolver configuration (behaviour decision 3).
+pub(super) extern "C" fn getaddrinfo_for_network(
+    network: u64,
+    node: *const c_char,
+    service: *const c_char,
+    hints: *const u8,
+    res: *mut *mut u8,
+) -> c_int {
+    if network != 0 && network & 0xffff_ffff != HANDLE_MAGIC {
+        return g::EAI_SYSTEM;
+    }
+    getaddrinfo(node, service, hints, res)
+}
+
 /// `void freeaddrinfo(struct addrinfo*)`: frees a list [`getaddrinfo`] made. A pointer it did not hand out aborts, named: freeing it would free memory this side never allocated.
 pub(super) extern "C" fn freeaddrinfo(head: *mut u8) {
     if head.is_null() {
