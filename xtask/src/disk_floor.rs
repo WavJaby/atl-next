@@ -332,7 +332,7 @@ mod tests {
         const GB: u64 = 1_000_000_000;
         let at = |backed, host_free, margin_gib| {
             backing_row(&Backing {
-                file: Path::new("/mnt/e/WSL/atl-pool.vhdx"),
+                file: Path::new("/host/WSL/atl-pool.vhdx"),
                 fs_size: 90 * GIB,
                 backed,
                 host_free,

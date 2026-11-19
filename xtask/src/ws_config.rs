@@ -703,14 +703,14 @@ mod tests {
         assert_eq!(d.pool_backing, Setting::default(None));
         assert_eq!(d.pool_backing_margin, Setting::default(2));
         let d = parse(
-            "[disk]\npool_backing = \"/mnt/e/WSL/atl-pool.vhdx\"\npool_backing_margin = 3\n",
+            "[disk]\npool_backing = \"/host/WSL/atl-pool.vhdx\"\npool_backing_margin = 3\n",
             path(),
         )
         .unwrap()
         .disk;
         assert_eq!(
             d.pool_backing,
-            Setting::file(Some(PathBuf::from("/mnt/e/WSL/atl-pool.vhdx")))
+            Setting::file(Some(PathBuf::from("/host/WSL/atl-pool.vhdx")))
         );
         assert_eq!(d.pool_backing_margin, Setting::file(3));
         let e = format!(
