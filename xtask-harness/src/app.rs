@@ -211,7 +211,11 @@ const MEDIAPLAYER_START: &str = "MediaPlayerNative: start called in state 1";
 /// queryservices: Main.queryServices: PackageManager.queryIntentServices of action atl.test.BIND scoped to the fixture finds its one `<service>` with that filter (AtlBound; ComputerEngine
 /// queryIntentServicesInternalBody), and of Play billing's Intent (action ...InAppBillingService.BIND, package com.android.vending, not installed) an empty list. A service without the method
 /// answers null, which ApplicationPackageManager turns into an empty list: `own=0`.
-const SERVICE_LINES: [(&str, &str, Option<&str>); 9] = [
+/// user: Main.userProfile: the process user is the full system user, not a profile (UserManagerService.getProfileType:2590 answers ""), so isProfile and isManagedProfile are false.
+/// zen: Main.zen: Do Not Disturb off (ZenModeHelper.getZenMode:396 ZEN_MODE_OFF) -> NotificationManager.zenModeToInterruptionFilter -> INTERRUPTION_FILTER_ALL (1).
+const SERVICE_LINES: [(&str, &str, Option<&str>); 11] = [
+    ("user", "AtlTest: user: ", Some("profile=false managed=false")),
+    ("notification", "AtlTest: zen: ", Some("filter=1")),
     (
         "package",
         "AtlTest: queryservices: ",
@@ -300,7 +304,11 @@ const NOTIFY_ATLD_LINES: [&str; 3] = [
 /// Calls a [`SERVICE_LINES`] row makes that the app cannot see refused (a method a service lacks reads back as no error and zeros), so the services' own `answered` count must show each:
 /// (service, counter key). notification: Main.channels' NotificationManager.cancel of a never-posted id, then notify of id 8 (recorded) and its cancel, which finds the record.
 /// appops: Main.appOps' first noted COARSE_LOCATION (runtime permission -> notes collected) reports its stack trace, AppOpsManager's sConfig starting expired.
-const SERVICE_CALLS: [(&str, &str); 8] = [
+/// user: Main.userProfile's isProfile; a missing method reads back as null = "not a profile" too, so only this count tells them apart (and UserManager then caches the answer instead of asking again).
+/// notification (zen): a missing getZenMode reads back as 0 = ZEN_MODE_OFF too; only the count tells them apart.
+const SERVICE_CALLS: [(&str, &str); 10] = [
+    ("user", "IUserManager.getProfileType"),
+    ("notification", "INotificationManager.getZenMode"),
     (
         "notification",
         "INotificationManager.cancelNotificationWithTag (nothing posted)",

@@ -34,6 +34,8 @@ use atl_services_types::permission;
 
 /// The interface name counters use.
 const INTERFACE: &str = "INotificationManager";
+/// Settings.Global.ZEN_MODE_OFF (Settings.java:17663): Do Not Disturb off.
+const ZEN_MODE_OFF: i32 = 0;
 /// Manifest.permission.INTERACT_ACROSS_USERS: canNotifyAsPackage's check for another user's channels.
 const INTERACT_ACROSS_USERS: &str = "android.permission.INTERACT_ACROSS_USERS";
 /// UserHandle.USER_CURRENT: handleIncomingUser resolves it to the caller's own user.
@@ -532,6 +534,12 @@ impl INotificationManager for NotificationManager {
     /// areNotificationsEnabled: AOSP's default for an app nobody blocked (NotificationManagerService areNotificationsEnabledForPackage -> PreferencesHelper, importance unspecified -> true).
     fn r#areNotificationsEnabled(&self, _pkg: Option<&str>) -> binder::Result<bool> {
         Ok(true)
+    }
+
+    /// getZenMode (:6142 -> ZenModeHelper.getZenMode:396): no permission check; Do Not Disturb is never on here, so Settings.Global.ZEN_MODE_OFF (0, Settings.java:17663).
+    fn r#getZenMode(&self) -> binder::Result<i32> {
+        atl_diag::answered(INTERFACE, "getZenMode");
+        Ok(ZEN_MODE_OFF)
     }
 
     /// createNotificationChannels (:4850 -> createNotificationChannelsImpl): each channel in turn into the caller's store; the first refused one throws, the ones before it stay (as AOSP's loop).

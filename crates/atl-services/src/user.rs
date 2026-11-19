@@ -86,6 +86,23 @@ impl IUserManager for UserService {
         check_query_users("query user")?;
         Ok((user_id == USER_SYSTEM).then(system_user))
     }
+
+    /// UserManagerService.getProfileType:2590: the profile-group check (:2866, the caller's own user passes; another user needs QUERY_USERS / MANAGE_USERS / INTERACT_ACROSS_USERS, which
+    /// no app here holds), then "" for an existing non-profile user (the full system user is not a profile) and null for an unknown id. UserManager caches a non-null answer per process.
+    fn r#getProfileType(&self, user_id: i32) -> binder::Result<Option<String>> {
+        let uid = ThreadState::get_calling_uid();
+        let caller_user = i32::try_from(permission::user_id(uid)).unwrap_or(-1);
+        if caller_user != user_id && !permission::is_system_or_root(uid) {
+            return Err(Status::new_exception_str(
+                ExceptionCode::SECURITY,
+                Some(
+                    "You need INTERACT_ACROSS_USERS, MANAGE_USERS, or QUERY_USERS permission to: check getProfileType",
+                ),
+            ));
+        }
+        atl_diag::answered("IUserManager", "getProfileType");
+        Ok((user_id == USER_SYSTEM).then(String::new))
+    }
 }
 
 /// The service's binder, for `addService`.

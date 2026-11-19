@@ -213,6 +213,7 @@ mirrors = [
     "frameworks/base/services/core/java/com/android/server/notification/NotificationManagerService.java#cancelNotificationWithTag",
     "frameworks/base/services/core/java/com/android/server/notification/NotificationManagerService.java#cancelNotificationInternal",
     "frameworks/base/services/core/java/com/android/server/notification/NotificationManagerService.java#resolveNotificationUid",
+    "frameworks/base/services/core/java/com/android/server/notification/ZenModeHelper.java#getZenMode",
 ]
 
 [appops]
@@ -316,6 +317,7 @@ mirrors = [
     "frameworks/base/services/core/java/com/android/server/pm/UserManagerService.java#isUserUnlockingOrUnlocked",
     "frameworks/base/services/core/java/com/android/server/pm/UserManagerService.java#getUsers",
     "frameworks/base/services/core/java/com/android/server/pm/UserManagerService.java#getUserInfo",
+    "frameworks/base/services/core/java/com/android/server/pm/UserManagerService.java#getProfileType",
 ]
 
 [mount]

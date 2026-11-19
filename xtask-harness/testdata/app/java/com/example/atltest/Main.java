@@ -469,6 +469,8 @@ public class Main extends Activity {
         Log.i("AtlTest", "power: " + power());
         Log.i("AtlTest", "uimode: " + uiMode());
         Log.i("AtlTest", "keyguard: " + keyguard());
+        Log.i("AtlTest", "user: " + userProfile());
+        Log.i("AtlTest", "zen: " + zen());
         Log.i("AtlTest", "appops: " + appOps());
         Log.i("AtlTest", "jobscheduler: " + jobs());
         Log.i("AtlTest", "queryservices: " + queryServices());
@@ -1118,6 +1120,29 @@ public class Main extends Activity {
                 return "absent";
             }
             return "type=" + um.getCurrentModeType() + " night=" + um.getNightMode() + " config=" + getResources().getConfiguration().uiMode;
+        } catch (Throwable t) {
+            return "threw " + t;
+        }
+    }
+
+    /** UserManager.isProfile / isManagedProfile for the process user (the full system user: not a profile, so both false); getProfileType's answer is what the services' counter shows. */
+    private String userProfile() {
+        try {
+            android.os.UserManager um = getSystemService(android.os.UserManager.class);
+            if (um == null) {
+                return "absent";
+            }
+            return "profile=" + um.isProfile() + " managed=" + um.isManagedProfile();
+        } catch (Throwable t) {
+            return "threw " + t;
+        }
+    }
+
+    /** NotificationManager.getCurrentInterruptionFilter: Do Not Disturb off (getZenMode ZEN_MODE_OFF) -> INTERRUPTION_FILTER_ALL (1). */
+    private String zen() {
+        try {
+            android.app.NotificationManager nm = getSystemService(android.app.NotificationManager.class);
+            return nm == null ? "absent" : "filter=" + nm.getCurrentInterruptionFilter();
         } catch (Throwable t) {
             return "threw " + t;
         }
