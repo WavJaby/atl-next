@@ -26,6 +26,8 @@ pub enum Op {
         guest: usize,
         host: usize,
     },
+    /// a pointer to data whose layout differs (a list link, a `char**` list): written NULL both ways; a hand shim walks it (build.rs keeps such records off the lane-mapped route)
+    Deep { guest: usize, host: usize },
 }
 
 impl Op {
@@ -36,7 +38,8 @@ impl Op {
             Op::Int {
                 guest: g, host: h, ..
             }
-            | Op::Ptr { guest: g, host: h } => {
+            | Op::Ptr { guest: g, host: h }
+            | Op::Deep { guest: g, host: h } => {
                 if guest {
                     g
                 } else {
@@ -81,28 +84,46 @@ pub struct Conv {
 }
 
 impl Conv {
-    /// On one side (`guest` or host): every field at its alignment, after the end of the one before it (C11 6.7.2.1p15: members sit at increasing addresses in declaration order), and the last ending within the size. A generated table with two offsets swapped, or one hand-edited, fails this at build time (the generated const asserts).
+    /// On one side (`guest` or host): every field at its alignment, within the size, overlapping no other; on the guest side, whose declaration order the table keeps, also each after the end of the one before it (C11 6.7.2.1p15: members sit at increasing addresses in declaration order). The host side's order may differ (fields are matched by name: glibc's `addrinfo` puts ai_addr first). A generated table with two guest offsets swapped, or one hand-edited, fails this at build time (the generated const asserts).
     pub const fn ordered(&self, guest: bool) -> bool {
-        let mut end = 0;
-        let mut i = 0;
-        while i < self.fields.len() {
-            let f = &self.fields[i];
-            let (off, align) = if guest {
-                (f.guest_offset, f.guest_align)
+        /// (offset, alignment, end) of `f` on that side.
+        const fn span(f: &Field, guest: bool) -> (usize, usize, usize) {
+            if guest {
+                (
+                    f.guest_offset,
+                    f.guest_align,
+                    f.guest_offset + f.op.bytes(true),
+                )
             } else {
-                (f.host_offset, f.host_align)
-            };
-            if align == 0 || off % align != 0 || off < end {
-                return false;
+                (
+                    f.host_offset,
+                    f.host_align,
+                    f.host_offset + f.op.bytes(false),
+                )
             }
-            end = off + f.op.bytes(guest);
-            i += 1;
         }
-        end <= if guest {
+        let size = if guest {
             self.guest_size
         } else {
             self.host_size
+        };
+        let mut i = 0;
+        while i < self.fields.len() {
+            let (off, align, end) = span(&self.fields[i], guest);
+            if align == 0 || off % align != 0 || end > size {
+                return false;
+            }
+            let mut j = 0;
+            while j < i {
+                let (o2, _, e2) = span(&self.fields[j], guest);
+                if (guest && o2 >= off) || (off < e2 && o2 < end) {
+                    return false;
+                }
+                j += 1;
+            }
+            i += 1;
         }
+        true
     }
 }
 
@@ -184,6 +205,7 @@ unsafe fn op_to_host(op: &Op, g: *const u8, h: *mut u8) {
                 store(h, host, v);
             }
             Op::Ptr { guest, host } => store(h, host, load(g, guest)),
+            Op::Deep { host, .. } => store(h, host, 0),
             Op::Record(c) => to_host(c, g, h),
             Op::Array {
                 len,
@@ -213,6 +235,10 @@ unsafe fn op_to_guest(op: &Op, h: *const u8, g: *mut u8) -> bool {
             }
             Op::Int { guest, host, .. } => {
                 store(g, guest, load(h, host));
+                true
+            }
+            Op::Deep { guest, .. } => {
+                store(g, guest, 0);
                 true
             }
             Op::Ptr { guest, host } => {

@@ -510,6 +510,23 @@ pub enum Op {
         guest: u64,
         host: u64,
     },
+    /// A pointer to data whose layout differs (a list's next node, a `char**` list): a deep copy whose length and ownership the header states in prose, so the generic converter writes NULL and only a hand shim that walks it may use the record ([`Conv::deep`]).
+    Deep { guest: u64, host: u64 },
+}
+
+impl Conv {
+    /// A field is [`Op::Deep`], here or in a nested record: the lane-mapped route refuses the record.
+    pub fn deep(&self, all: &[Conv]) -> bool {
+        fn op_deep(op: &Op, all: &[Conv]) -> bool {
+            match op {
+                Op::Deep { .. } => true,
+                Op::Record(n) => all.iter().any(|c| c.name == *n && c.deep(all)),
+                Op::Array { elem, .. } => op_deep(elem, all),
+                _ => false,
+            }
+        }
+        self.fields.iter().any(|f| op_deep(&f.op, all))
+    }
 }
 
 /// One field of a [`Conv`]: its offsets on both sides, its alignment on both sides (the view's, for the build-time check), and how it crosses.
@@ -532,7 +549,7 @@ pub struct Conv {
     pub fields: Vec<FieldConv>,
 }
 
-/// The converters for record `name` and every nested record it holds by value whose layout differs, nested ones first. Err names the field no rule converts: a union (which member is live is the program's knowledge), a bit-field, a function pointer (a guest entry: a down shell, not a copy), a pointer to a record whose layout differs (a deep copy whose ownership the header states in prose), or a field list that differs.
+/// The converters for record `name` and every nested record it holds by value whose layout differs, nested ones first. Err names the field no rule converts: a union (which member is live is the program's knowledge), a bit-field, a function pointer (a guest entry: a down shell, not a copy), or a field set that differs. A pointer to data whose layout differs is [`Op::Deep`].
 pub fn converters(name: &str, views: &Views) -> Result<Vec<Conv>> {
     let mut out = Vec::new();
     conv_into(name, views, &mut out)?;
@@ -557,13 +574,13 @@ fn conv_into(name: &str, views: &Views, out: &mut Vec<Conv>) -> Result<()> {
         h.fields.len()
     );
     let mut fields = Vec::new();
-    for (gf, hf) in g.fields.iter().zip(&h.fields) {
-        ensure!(
-            gf.name == hf.name,
-            "{name}: field {} vs {}",
-            gf.name,
-            hf.name
-        );
+    // by name: the two libcs may declare one record's fields in another order (bionic `addrinfo` ai_canonname before ai_addr, glibc after)
+    for gf in &g.fields {
+        let hf = h
+            .fields
+            .iter()
+            .find(|hf| hf.name == gf.name)
+            .with_context(|| format!("{name}.{}: no such host field", gf.name))?;
         ensure!(
             gf.bits.is_none() && hf.bits.is_none(),
             "{name}.{}: a bit-field",
@@ -625,13 +642,11 @@ fn field_op(g: &Ty, h: &Ty, views: &Views, out: &mut Vec<Conv>) -> Result<Op> {
             let readable = untyped(gp, views.guest)
                 || untyped(hp, views.host)
                 || same(gp, views.guest, hp, views.host, false);
-            ensure!(
-                readable,
-                "a pointer to {gp:?}, whose layout differs (a deep copy)"
-            );
-            Op::Ptr {
-                guest: u64::from(gb / 8),
-                host: u64::from(hb / 8),
+            let (guest, host) = (u64::from(gb / 8), u64::from(hb / 8));
+            if readable {
+                Op::Ptr { guest, host }
+            } else {
+                Op::Deep { guest, host }
             }
         }
         (Ty::Record { name } | Ty::Opaque { name, .. }, Ty::Record { .. } | Ty::Opaque { .. }) => {
@@ -681,6 +696,7 @@ pub fn converters_rs(convs: &[Conv], swap: &str) -> String {
                 signed,
             } => format!("Op::Int {{ guest: {guest}, host: {host}, signed: {signed} }}"),
             Op::Ptr { guest, host } => format!("Op::Ptr {{ guest: {guest}, host: {host} }}"),
+            Op::Deep { guest, host } => format!("Op::Deep {{ guest: {guest}, host: {host} }}"),
             Op::Record(n) => format!("Op::Record(&C_{n})"),
             Op::Array {
                 len,

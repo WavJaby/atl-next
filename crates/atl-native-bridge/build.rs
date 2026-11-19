@@ -1185,15 +1185,25 @@ type Convs = std::collections::BTreeMap<String, Result<Vec<atl_bridgegen::ilp32:
 /// The break cfg that swaps two guest offsets of the first generated converter (atl_bridgegen `ilp32::converters_rs`): its const assert fails the build.
 const CONV_SWAP_CFG: &str = "atl_nb_conv_swap";
 
+/// Non-const pointer-to-pointer parameters that are input arrays, not one out word (function, parameter index, the header's words): the views type them as an out word (`Kind::OutWord`), and only the header's prose gives the length. Reviewed over every arm row that would otherwise convert (`ilp32_rows.txt` `converted`); each must name an out-word position of some arm row (build fails otherwise).
+const ILP32_ARRAY_PARAMS: &[(&str, usize, &str)] = &[
+    // gl2ext.h EXT_separate_shader_objects: `GLuint glCreateShaderProgramvEXT(GLenum type, GLsizei count, const GLchar **strings)` -- `count` strings (GLES3's core glCreateShaderProgramv spells it `const GLchar *const*`, an array by its constness)
+    ("glCreateShaderProgramvEXT", 2, "count strings"),
+];
+
+/// An ILP32 converted row's lane maps and its lanes literal ([`ilp32_maps`]).
+type Ilp32Maps = (Vec<(usize, LaneMap)>, String);
+
 /// The lane maps of an ILP32 proxy row `row` (guest prototype `sig`) whose non-carried positions all convert: a `Record` pointer parameter with a converter (in; back out when the pointee is not const), an `OutWord` parameter; with its lanes literal (the guest view's classes). Records named by any position get their converters tried first (`convs`), whatever else blocks the row. Err: the trap reason -- the heaviest kind no converter takes, or a lane rule the six-int-lane forwarder (`jni::MAPPED_LANES`) cannot keep.
 fn ilp32_maps(
+    name: &str,
     sig: &atl_bridgegen::ir::Signature,
     row: &atl_bridgegen::ilp32::Row,
     route: &Route,
     qemu: bool,
     views: &atl_bridgegen::ilp32::Views,
     convs: &mut Convs,
-) -> std::result::Result<(Vec<(usize, LaneMap)>, String), &'static str> {
+) -> std::result::Result<Ilp32Maps, &'static str> {
     use atl_bridgegen::ilp32::Kind;
     for k in &row.kinds {
         if let Kind::Record(name) = k {
@@ -1203,24 +1213,33 @@ fn ilp32_maps(
         }
     }
     let mut maps = Vec::new();
+    let array = Kind::Array;
     let mut blocking: Option<&Kind> = None;
+    // a record with a deep pointer field (a list) converts only in a hand shim
+    let shallow = |name: &str| matches!(convs.get(name), Some(Ok(list)) if list.last().is_some_and(|c| !c.deep(list)));
     for (at, k) in row.kinds.iter().enumerate() {
         let param = at.checked_sub(1);
+        let listed_array = ILP32_ARRAY_PARAMS
+            .iter()
+            .any(|(f, p, _)| *f == name && Some(*p) == param);
+        let k = if listed_array && matches!(k, Kind::OutWord(_)) {
+            &array
+        } else {
+            k
+        };
         let map = match (k, param) {
-            _ if k.carried() || (at == 0 && *k == Kind::PtrResult) => continue,
+            _ if k.carried() => continue,
             (Kind::OutWord(w), Some(p)) => Some((p, LaneMap::OutWord(*w))),
-            (Kind::Record(name), Some(p)) if matches!(convs.get(name), Some(Ok(_))) => {
-                match sig.params[p].resolved() {
-                    atl_bridgegen::ir::Ty::Pointer { is_const, .. } => Some((
-                        p,
-                        LaneMap::Record {
-                            name: name.clone(),
-                            out: !is_const,
-                        },
-                    )),
-                    _ => None,
-                }
-            }
+            (Kind::Record(name), Some(p)) if shallow(name) => match sig.params[p].resolved() {
+                atl_bridgegen::ir::Ty::Pointer { is_const, .. } => Some((
+                    p,
+                    LaneMap::Record {
+                        name: name.clone(),
+                        out: !is_const,
+                    },
+                )),
+                _ => None,
+            },
             _ => None,
         };
         match map {
@@ -1487,7 +1506,7 @@ fn bindings_table(
             // ILP32: a row with a position its lane class cannot convert binds lane-mapped when every such position has a generated converter ([`ilp32_maps`]), else traps naming the conversion it waits for (p4b s3-s4), before any route: no truncated value passes
             let entry = if let Some(row) = ilp32.filter(|r| !r.carried()) {
                 let sig = &guest_view.functions[name.as_str()];
-                match ilp32_maps(sig, row, &route, qemu, &views, &mut convs) {
+                match ilp32_maps(name, sig, row, &route, qemu, &views, &mut convs) {
                     Ok((maps, lanes)) => {
                         if let Some(last) = ilp32_rows.last_mut() {
                             last.3 = "converted";
@@ -1584,6 +1603,17 @@ fn bindings_table(
                 .iter()
                 .any(|(_, x)| matches!(x, LaneMap::Down { ty, .. } if ty == t))),
             "{t}: in CALLBACKS but no proxy row with a prototype in the set takes it"
+        );
+    }
+    // stale-row check of ILP32_ARRAY_PARAMS: on the ILP32 table, where they apply
+    for (f, p, _) in ILP32_ARRAY_PARAMS.iter().filter(|_| !equal_model) {
+        ensure!(
+            classes
+                .get(f)
+                .and_then(|r| r.kinds.get(p + 1))
+                .is_some_and(|k| matches!(k, atl_bridgegen::ilp32::Kind::OutWord(_))),
+            "{f} parameter {p}: in ILP32_ARRAY_PARAMS but not an out-word position of the {} table",
+            guest.row.arch
         );
     }
     let libc_protos = if equal_model {
