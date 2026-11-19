@@ -91,6 +91,8 @@ types = [
     "android.app.IUiModeManager",
     # the trust service (trust.rs): KeyguardManager's and TrustManager's constructors look ITrustManager up by Context.TRUST_SERVICE
     "android.app.trust.ITrustManager",
+    # the telephony.registry service (telephony_registry.rs): TelephonyManager.registerTelephonyCallback and SubscriptionManager's listeners reach it through TelephonyRegistryManager
+    "com.android.internal.telephony.ITelephonyRegistry",
     # the webviewupdate service (webview_update.rs)
     "android.webkit.IWebViewUpdateService",
     # the permissionmgr service (permission_manager.rs)

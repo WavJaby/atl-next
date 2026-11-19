@@ -219,7 +219,12 @@ const MEDIAPLAYER_START: &str = "MediaPlayerNative: start called in state 1";
 /// are empty and getSessionInfo:1324 null. A service without getPackageInstaller answers null, and PackageInstaller's first call throws NullPointerException.
 /// audiodevices: Main.audioDevices: the app's AudioPolicyService (atl-audioflinger policy.rs) lists one device port, the speaker (AudioPolicyManager::listAudioPorts:5275; AudioDeviceInfo.TYPE_BUILTIN_SPEAKER 2,
 /// a sink), no input; A2DP is not connected (getDeviceConnectionState:523 UNAVAILABLE). Without listAudioPorts, AudioManager.updateAudioPortCache fails and getDevices answers no device: `outputs=[]`.
-const SERVICE_LINES: [(&str, &str, Option<&str>); 14] = [
+/// telephony.registry: Main.telephony with no phone process (no `phone` / `isub` service) on a device whose vendor API level is unset (< 2024Q2), so TelephonyManager.hasCapability reads framework-res's
+/// legacy config_voice/sms/mobile_data_capable (all true: one modem, getActiveModemCount): getSimState SIM_STATE_UNKNOWN (0; no isub -> slot -1, slot 0 asks a null ITelephony,
+/// getSimStateForSlotIndex:19217); getPhoneType PHONE_TYPE_NONE (0; no ITelephony and no ro.telephony.default_network, getPhoneTypeFromNetworkType:2841); getNetworkOperator "" (operator_numeric
+/// unset); getDataState DATA_DISCONNECTED (0; null ITelephony). registerTelephonyCallback reaches the registry, which delivers nothing (validatePhoneId: the service sees no modem) -> calls=0.
+/// Without the registry the register NPEs. A Wi-Fi tablet's SIM_STATE_ABSENT needs the device declared modem-less (zero modems) first: not modelled.
+const SERVICE_LINES: [(&str, &str, Option<&str>); 15] = [
     (
         "audio",
         "AtlTest: audiodevices: ",
@@ -280,6 +285,11 @@ const SERVICE_LINES: [(&str, &str, Option<&str>); 14] = [
         Some("manager=yes locked=false keyguardLocked=false secure=false keyguardSecure=false"),
     ),
     (
+        "telephony.registry",
+        "AtlTest: telephony: ",
+        Some("sim=0 phone=0 operator=[] data=0 callback=registered calls=0"),
+    ),
+    (
         "appops",
         "AtlTest: appops: ",
         Some("post=1 coarse=0 noted=0 noted-foreign=2 own=ok foreign=SecurityException"),
@@ -331,9 +341,17 @@ const NOTIFY_ATLD_LINES: [&str; 3] = [
 /// appops: Main.appOps' first noted COARSE_LOCATION (runtime permission -> notes collected) reports its stack trace, AppOpsManager's sConfig starting expired.
 /// user: Main.userProfile's isProfile; a missing method reads back as null = "not a profile" too, so only this count tells them apart (and UserManager then caches the answer instead of asking again).
 /// notification (zen): a missing getZenMode reads back as 0 = ZEN_MODE_OFF too; only the count tells them apart.
-const SERVICE_CALLS: [(&str, &str); 10] = [
+const SERVICE_CALLS: [(&str, &str); 12] = [
     ("user", "IUserManager.getProfileType"),
     ("notification", "INotificationManager.getZenMode"),
+    (
+        "telephony.registry",
+        "ITelephonyRegistry.listenWithEventList (no modem: never notified)",
+    ),
+    (
+        "telephony.registry",
+        "ITelephonyRegistry.listenWithEventList (unregistered)",
+    ),
     (
         "notification",
         "INotificationManager.cancelNotificationWithTag (nothing posted)",

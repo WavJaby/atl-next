@@ -474,6 +474,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "receiver: " + receiverInfo());
         Log.i("AtlTest", "installer: " + installerSessions());
         Log.i("AtlTest", "audiodevices: " + audioDevices());
+        Log.i("AtlTest", "telephony: " + telephony());
         Log.i("AtlTest", "appops: " + appOps());
         Log.i("AtlTest", "jobscheduler: " + jobs());
         Log.i("AtlTest", "queryservices: " + queryServices());
@@ -1190,6 +1191,37 @@ public class Main extends Activity {
         try {
             android.app.NotificationManager nm = getSystemService(android.app.NotificationManager.class);
             return nm == null ? "absent" : "filter=" + nm.getCurrentInterruptionFilter();
+        } catch (Throwable t) {
+            return "threw " + t;
+        }
+    }
+
+    /** The ServiceStateListener the telephony row registers: a device with no modem never calls it. */
+    private static final class NoModemCallback extends android.telephony.TelephonyCallback
+            implements android.telephony.TelephonyCallback.ServiceStateListener {
+        volatile int calls;
+
+        @Override
+        public void onServiceStateChanged(android.telephony.ServiceState state) {
+            calls++;
+        }
+    }
+
+    /**
+     * TelephonyManager on a device with no modem: SIM state, phone type, network operator, data state, then registerTelephonyCallback of a ServiceStateListener (through `telephony.registry`) and its
+     * unregister; "absent" when getSystemService returns null; else what it threw (no registry: NullPointerException).
+     */
+    private String telephony() {
+        try {
+            android.telephony.TelephonyManager tm = getSystemService(android.telephony.TelephonyManager.class);
+            if (tm == null) {
+                return "absent";
+            }
+            NoModemCallback cb = new NoModemCallback();
+            tm.registerTelephonyCallback(getMainExecutor(), cb);
+            tm.unregisterTelephonyCallback(cb);
+            return "sim=" + tm.getSimState() + " phone=" + tm.getPhoneType() + " operator=[" + tm.getNetworkOperator() + "] data=" + tm.getDataState()
+                    + " callback=registered calls=" + cb.calls;
         } catch (Throwable t) {
             return "threw " + t;
         }

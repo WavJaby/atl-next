@@ -93,7 +93,7 @@ struct Args {
     /// Test only: `sensorservice` is not registered, the deliberate break of the sensors gate's empty stage (SensorManager then waits for it, SensorManager.cpp `waitForSensorService`).
     #[arg(long)]
     no_sensor_service: bool,
-    /// Test only: this service (`appops`, `connectivity`, `jobscheduler`, `permissionmgr`, `power`, `uimode`, `webviewupdate`) is not registered (repeat), the deliberate break of the app gate's line for it (its manager is then null).
+    /// Test only: this service (`appops`, `connectivity`, `jobscheduler`, `permissionmgr`, `power`, `telephony.registry`, `uimode`, `webviewupdate`) is not registered (repeat), the deliberate break of the app gate's line for it (its manager is then null).
     #[arg(long)]
     omit_service: Vec<String>,
     /// Start `sensorservice` in HAL bypass data injection mode with this package allow-listed (AOSP `dumpsys sensorservice hal_bypass_replay_data_injection <package>`); a real accelerometer is then replaced by the injected one for every app of this instance. atld `--tilt-keys` sets it.
@@ -152,6 +152,8 @@ const SYSTEM_CONFIG: &str = "system_config";
 const UI_MODE: &str = "uimode";
 /// Context.TRUST_SERVICE (KeyguardManager's and TrustManager's constructors look ITrustManager up by it).
 const TRUST: &str = "trust";
+/// Context.TELEPHONY_REGISTRY_SERVICE (TelephonyRegistryManager's registry; SystemServer adds it on every device).
+const TELEPHONY_REGISTRY: &str = "telephony.registry";
 /// Context.APP_OPS_SERVICE.
 const APP_OPS: &str = "appops";
 /// WebViewFactory.WEBVIEW_UPDATE_SERVICE_NAME.
@@ -414,6 +416,16 @@ fn main() -> Result<()> {
         atl_services::trust::new_binder(Arc::clone(&permissions)),
     )
     .context("addService trust")?;
+    if !a.omit_service.iter().any(|s| s == TELEPHONY_REGISTRY) {
+        binder::add_service(
+            TELEPHONY_REGISTRY,
+            atl_services::telephony_registry::new_binder(
+                Arc::clone(&packages),
+                Arc::clone(&permissions),
+            ),
+        )
+        .context("addService telephony.registry")?;
+    }
     if !a.omit_service.iter().any(|s| s == APP_OPS) {
         binder::add_service(
             APP_OPS,

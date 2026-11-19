@@ -100,6 +100,8 @@ pub mod storage;
 #[cfg(feature = "converter")]
 pub mod system_config;
 #[cfg(feature = "converter")]
+pub mod telephony_registry;
+#[cfg(feature = "converter")]
 mod token;
 #[cfg(feature = "converter")]
 pub mod trust;

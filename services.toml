@@ -388,6 +388,18 @@ mirrors = [
     "frameworks/base/core/java/com/android/internal/widget/LockPatternUtils.java#isSecure",
 ]
 
+["telephony.registry"]
+src = ["crates/atl-services/src/telephony_registry.rs"]
+mirrors = [
+    "frameworks/base/services/core/java/com/android/server/TelephonyRegistry.java#addOnSubscriptionsChangedListener",
+    "frameworks/base/services/core/java/com/android/server/TelephonyRegistry.java#addOnOpportunisticSubscriptionsChangedListener",
+    "frameworks/base/services/core/java/com/android/server/TelephonyRegistry.java#removeOnSubscriptionsChangedListener",
+    "frameworks/base/services/core/java/com/android/server/TelephonyRegistry.java#listen",
+    "frameworks/base/services/core/java/com/android/server/TelephonyRegistry.java#checkListenerPermission",
+    "frameworks/base/services/core/java/com/android/server/TelephonyRegistry.java#validatePhoneId",
+    "frameworks/base/telephony/java/android/telephony/TelephonyManager.java#getActiveModemCount",
+]
+
 [webviewupdate]
 src = ["crates/atl-services/src/webview_update.rs"]
 mirrors = [
