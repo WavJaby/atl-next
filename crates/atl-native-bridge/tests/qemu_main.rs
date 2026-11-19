@@ -2,7 +2,7 @@
 //! Guest-main gate (phase4-32bit P4b), harness-less: the real guest linker starts `main_exe.c` (PIE on the stub libc); the host calls its `fx_run`, which does what bionic's `__libc_init` does after the start, `exit(main())`. main creates a thread of an explicit attr, joins it, then a thread that registers thread-exit destructors (`__cxa_thread_atexit_impl`, what a C++ `thread_local` compiles to) and a key value, registers two on the main thread, and returns. The guest's exit runs its `__cxa_finalize`, then NBS's `native_bridge_exit` stub, bound to the host's `exit`: this process ends there, and an `on_exit` handler reports.
 //! Env (xtask qemu_linker.rs sets it; unset prints SKIP): ATL_NB_ARCH, ATL_ENGINE_SO, ATL_NB_BOOT, ATL_NB_MAINEXE, ATL_NB_LINKER, ATL_NB_VDSO.
 //! Expected values come from main_exe.c, never from the engine: main returns `MAIN_STATUS` 0x2a when the thread round trip held, else the failing step 1..5 (6..8: the worker's thread-exit destructors; 8 = not "BAK" at join).
-//! Checks: (s) started, (c) thread churn before main (tests/common/churn.rs: 2000 `fx_join_one` threads give back every reserve block, heap and resident growth <= 2048 B/thread), (e) the guest's exit reached the host's (the handler ran), (v) the status is 0x2a, (d) `fx_events` at the host's exit is [`EVENTS`] (each destructor once; bionic order: thread_local destructors in reverse, then key destructors), (r) no host pointer refused to a 32-bit guest (`ILP32_REFUSED` = 0). Output `qemu-main: (x) ok` / `(x) FAIL <why>`; the process exits 0 when all pass.
+//! Checks: (s) started, (c) thread churn before main (tests/common/churn.rs: 2000 `fx_join_one` threads give back every reserve block, heap and resident growth <= 2048 B/thread), (n) the resolver round (`fx_dns`: getaddrinfo walk + free, getnameinfo, gethostbyname/addr, gai_strerror, every field in the guest's own layout) answers 0 twice and leaves the engine's window count where it was ([`resolver`]), (e) the guest's exit reached the host's (the handler ran), (v) the status is 0x2a, (d) `fx_events` at the host's exit is [`EVENTS`] (each destructor once; bionic order: thread_local destructors in reverse, then key destructors), (r) no host pointer refused to a 32-bit guest (`ILP32_REFUSED` = 0). Output `qemu-main: (x) ok` / `(x) FAIL <why>`; the process exits 0 when all pass.
 //! A guest call to a trapped stub (break `main_exit_unbound`: no host side for `native_bridge_exit`; break `main_tls_dtor_unbound`: none for `native_bridge___cxa_thread_atexit_impl`) aborts naming it, so (e) never prints.
 #![allow(clippy::print_stdout, reason = "test harness output is its verdict")]
 #![allow(
@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use atl_native_bridge::engine::{Config, Guest, ILP32_REFUSED, qemu};
+use atl_native_bridge::engine::{Config, Guest, ILP32_REFUSED, RESERVED, qemu};
 use object::{Object, ObjectSymbol};
 
 #[path = "common/churn.rs"]
@@ -30,8 +30,10 @@ const MAIN_STATUS: i32 = 0x2a;
 /// The churn's first worker argument (any value; main_exe.c `fx_join_one` answers arg + 1).
 const JOIN_ARG: usize = 0x1000;
 
-/// main_exe.c's ELF entry and its `fx_run` and `fx_join_one` symbol values (the load bias is entry - e_entry).
-static EXPECTED: OnceLock<(u64, u64, u64, u64)> = OnceLock::new();
+/// main_exe.c's ELF entry and its `fx_run`, `fx_join_one`, `fx_events` and `fx_dns` symbol values (the load bias is entry - e_entry).
+static EXPECTED: OnceLock<(u64, u64, u64, u64, u64)> = OnceLock::new();
+/// Check (n)'s result, read by the exit handler.
+static DNS_OK: AtomicBool = AtomicBool::new(false);
 /// The guest address of main_exe.c `fx_events` (symbol + load bias), set before fx_run; read by the exit handler.
 static EVENTS_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// main_exe.c's thread-exit record at the host's exit: the worker's "BAK" (main checked it, status 8 otherwise), then the main thread's two destructors in reverse registration, once each: "nm".
@@ -64,7 +66,7 @@ fn check(letter: char, result: Result<(), String>) -> bool {
 extern "C" fn at_exit(status: i32, _: *mut c_void) {
     let refused = ILP32_REFUSED.load(Ordering::Relaxed);
     println!("qemu-main: values status {status:#x} ilp32 refused {refused}");
-    let mut ok = CHURN_OK.load(Ordering::Relaxed);
+    let mut ok = CHURN_OK.load(Ordering::Relaxed) && DNS_OK.load(Ordering::Relaxed);
     ok &= check('e', Ok(()));
     ok &= check(
         'v',
@@ -104,8 +106,30 @@ extern "C" fn at_exit(status: i32, _: *mut c_void) {
     unsafe { libc::_exit(i32::from(!ok)) }
 }
 
+/// Check (n): main_exe.c `fx_dns` answers 0 twice, and the engine's window count after the second equals the count before it (the first makes the once-per-process gai_strerror copy and this thread's hostent block, which the second replaces in place). Break `dns_keep_list`: freeaddrinfo keeps its block, the count grows by the round's two lists.
+fn resolver(guest: &mut Guest, fx_dns: usize) -> Result<(), String> {
+    // SAFETY: fx_dns() takes no arguments and answers a failure bit set.
+    let first = unsafe { guest.call(fx_dns, 0, 0, 0) };
+    let before = RESERVED.load(Ordering::Relaxed);
+    // SAFETY: as above.
+    let second = unsafe { guest.call(fx_dns, 0, 0, 0) };
+    let after = RESERVED.load(Ordering::Relaxed);
+    println!("qemu-main: values dns {first:#x} {second:#x} windows {before} -> {after}");
+    if first != 0 || second != 0 {
+        return Err(format!(
+            "fx_dns answered {first:#x} then {second:#x} (main_exe.c / resolver.h bits)"
+        ));
+    }
+    if after != before {
+        return Err(format!(
+            "window count {before} -> {after} across one resolver round (a guest copy not given back)"
+        ));
+    }
+    Ok(())
+}
+
 fn started(r: Result<Guest, String>) -> u64 {
-    let Some(&(e_entry, fx_run, fx_join_one, fx_events)) = EXPECTED.get() else {
+    let Some(&(e_entry, fx_run, fx_join_one, fx_events, fx_dns)) = EXPECTED.get() else {
         return 2;
     };
     let mut guest = match r {
@@ -135,6 +159,8 @@ fn started(r: Result<Guest, String>) -> u64 {
         }),
     );
     CHURN_OK.store(c, Ordering::Relaxed);
+    let n = check('n', resolver(&mut guest, bias.wrapping_add(fx_dns) as usize));
+    DNS_OK.store(n, Ordering::Relaxed);
     // SAFETY: registers a handler of the right signature; arg unused.
     unsafe { on_exit(at_exit, std::ptr::null_mut()) };
     // SAFETY: `run` is the executable's fx_run (no arguments, never returns: it exits).
@@ -173,6 +199,7 @@ fn main() -> ExitCode {
                 sym("fx_run")?,
                 sym("fx_join_one")?,
                 sym("fx_events")?,
+                sym("fx_dns")?,
             ))
         });
     match expected {

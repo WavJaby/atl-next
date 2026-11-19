@@ -316,74 +316,9 @@ long qt_exit_run(long x) {
     return (long)(uintptr_t)ret;
 }
 
-// Q7-7 resolver gate (check r): getaddrinfo / getnameinfo / gethostbyname on localhost through the host side, every field read in bionic's layout
-// the service asked for, and its port
-#define QT_SERVICE "80"
-#define QT_PORT 80
-// 127.0.0.1 in network order, byte by byte
-static const unsigned char qt_loopback[4] = {127, 0, 0, 1};
-
-static int qt_streq(const char *a, const char *b) {
-    if (!a || !b) {
-        return 0;
-    }
-    while (*a && *a == *b) {
-        a++;
-        b++;
-    }
-    return *a == *b;
-}
-
-static int qt_is_loopback(const void *p) {
-    const unsigned char *b = p;
-    return b[0] == qt_loopback[0] && b[1] == qt_loopback[1] && b[2] == qt_loopback[2] && b[3] == qt_loopback[3];
-}
-
-// Returns 0 when every field matched, else a bit per failed step: 1 getaddrinfo rc, 2 family / socktype / protocol, 3 addrlen, 4 sockaddr (port, address), 5 canonname, 6 getnameinfo rc, 7 its host / service text, 8 gethostbyname fields, 9 gethostbyaddr(127.0.0.1) fields.
-long qt_resolve(void) {
-    long bad = 0;
-    struct addrinfo hints = {0};
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_CANONNAME;
-    struct addrinfo *res = 0;
-    if (getaddrinfo("localhost", QT_SERVICE, &hints, &res) != 0 || !res) {
-        return 1L << 1;
-    }
-    if (res->ai_family != AF_INET || res->ai_socktype != SOCK_STREAM || res->ai_protocol != IPPROTO_TCP) {
-        bad |= 1L << 2;
-    }
-    if (res->ai_addrlen != sizeof(struct sockaddr_in)) {
-        bad |= 1L << 3;
-    }
-    const struct sockaddr_in *sin = (const struct sockaddr_in *)res->ai_addr;
-    if (!sin || sin->sin_family != AF_INET || ntohs(sin->sin_port) != QT_PORT || !qt_is_loopback(&sin->sin_addr)) {
-        bad |= 1L << 4;
-    }
-    if (!qt_streq(res->ai_canonname, "localhost")) {
-        bad |= 1L << 5;
-    }
-    char host[NI_MAXHOST];
-    char serv[NI_MAXSERV];
-    if (sin && !(bad & (1L << 4))) {
-        if (getnameinfo(res->ai_addr, res->ai_addrlen, host, sizeof host, serv, sizeof serv, NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
-            bad |= 1L << 6;
-        } else if (!qt_streq(host, "127.0.0.1") || !qt_streq(serv, QT_SERVICE)) {
-            bad |= 1L << 7;
-        }
-    }
-    freeaddrinfo(res);
-    struct hostent *he = gethostbyname("127.0.0.1");
-    if (!he || he->h_addrtype != AF_INET || he->h_length != 4 || !he->h_addr_list || !he->h_addr_list[0] || !qt_is_loopback(he->h_addr_list[0])) {
-        bad |= 1L << 8;
-    }
-    // reverse lookup of the loopback address: /etc/hosts names it (glibc's files source), in bionic's hostent layout
-    he = gethostbyaddr(qt_loopback, sizeof qt_loopback, AF_INET);
-    if (!he || he->h_addrtype != AF_INET || he->h_length != 4 || !he->h_name || !he->h_name[0] || !he->h_addr_list || !he->h_addr_list[0] || !qt_is_loopback(he->h_addr_list[0])) {
-        bad |= 1L << 9;
-    }
-    return bad;
-}
+// Q7-7 resolver gate (check r): ../common/resolver.h `rs_resolve`, bits as there
+#include "../common/resolver.h"
+long qt_resolve(void) { return rs_resolve(); }
 
 // tr-first blocker 4 gate (check q): one guest thread handle for every pthread_t row. The target's routine and the signal handler record pthread_self() and gettid(); the creator compares them with its pthread_create handle (pthread_equal, guest bionic), pthread_gettid_np and what join hands back.
 // the signal pthread_kill sends: a real-time-free user signal no other check uses

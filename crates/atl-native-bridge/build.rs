@@ -219,6 +219,9 @@ const SHIMS: &[&str] = &[
     "getaddrinfo",
     "freeaddrinfo",
     "getnameinfo",
+    // engine/netdb.rs: glibc's static hostent copied into the guest's view per thread (window memory: a 32-bit guest cannot hold glibc's pointers). h_errno stays glibc's slot: the `__get_h_errno` row
+    "gethostbyname",
+    "gethostbyaddr",
     // engine/netdb.rs: bionic's own text (build.rs `gai_errlist_rs`), no host call
     "gai_strerror",
     // provider.rs: the provider calls a host trampoline that crosses to the guest callback
@@ -235,6 +238,8 @@ const PROXY_SHIMS: &[&str] = &[
     "eglGetProcAddress",
     "android_getaddrinfofornetwork",
 ];
+/// [`PROXY_SHIMS`] that convert an ILP32 guest's row themselves, bound with the guest view's lane classes: `android_getaddrinfofornetwork` (engine/netdb.rs builds the list in the guest's view).
+const ILP32_PROXY_SHIMS: &[&str] = &["android_getaddrinfofornetwork"];
 /// Callback typedefs whose guest function pointer a lane-mapped row hands the host as a down shell (`Entry::Mapped`, engine/ndk.rs `call_mapped`; GS2.2 callback-param, tr-first blocker 5). Reviewed: every argument the host passes the callback is a value, the guest's own user data, or a host buffer the guest only loads from or stores to (QEMU's page table holds no host heap, so a host buffer must never reach a guest syscall or be fetched as code). A function-pointer parameter of another type traps `pending` (`atl_bridgegen::jni::route`); a name here no row uses is stale.
 /// Not here, with why: `AMediaDataSourceReadAt` (its buffer is host memory the guest writes: needs the G2 copy arena), `GLDEBUGPROC*` (its message is host memory: G2 staging).
 const CALLBACKS: &[&str] = &[
@@ -326,11 +331,7 @@ const GLIBC: &[(&str, &str)] = &[
     ("pthread_attr_setstacksize", "pthread_attr_setstacksize"),
     ("pthread_getspecific", "pthread_getspecific"),
     ("pthread_setspecific", "pthread_setspecific"),
-    // struct hostent is the same in bionic and glibc (engine/netdb.rs layout gate); the answer is glibc's static storage, as bionic's is its own. Its h_errno is the guest's too: the `__get_h_errno` row below
-    ("gethostbyname", "gethostbyname"),
-    // same class: same prototype in both libcs (address bytes, length, type; AF_INET = 2 in both), same hostent storage; h_errno as above
-    ("gethostbyaddr", "gethostbyaddr"),
-    // NBS patch 0009 stubs it on both lists. bionic's h_errno is *__get_h_errno(), the guest's own resolver slot, which the rows above never set; glibc's location is the one slot both sides use (the guest dereferences it, as it does the netdb lists)
+    // NBS patch 0009 stubs it on both lists. bionic's h_errno is *__get_h_errno(), the guest's own resolver slot, which the gethostby* shims never set; glibc's location is the one slot both sides use (the guest dereferences it, as it does the netdb lists)
     ("__get_h_errno", "__h_errno_location"),
 ];
 
@@ -856,6 +857,13 @@ const ILP32_SHIMS: &[&str] = &[
     "pthread_setschedparam",
     "pthread_setschedprio",
     "pthread_sigqueue",
+    // engine/netdb.rs: every structure the guest receives is built in its view (thread.rs `layout::qemu_arm`) in window memory, and the guest's hints read in it; the `socklen_t` (int32 vs uint32: classifier refuses) and `size_t` lanes are read as 32-bit values
+    "getaddrinfo",
+    "freeaddrinfo",
+    "getnameinfo",
+    "gai_strerror",
+    "gethostbyname",
+    "gethostbyaddr",
 ];
 /// Headers declaring the libc stubs' prototypes, parsed for the guest's bionic view and the host arch's bionic view (the LP64 contract every host side -- glibc row, provider, shim -- implements); `bionic/libc/platform` for `bionic/malloc.h`.
 const LIBC_HEADERS: &[&str] = &[
@@ -983,8 +991,23 @@ fn ilp32_libc_entry(
             let ret = atl_bridgegen::jni::result_class(&g.ret)?;
             Ok((row, ret, atl_bridgegen::jni::param_classes(g)?))
         });
+    let own_shim = lp64.as_deref().is_ok_and(|e| e.starts_with("Entry::Shim"))
+        && ILP32_SHIMS.contains(&name);
     let (row, ret, params) = match classified {
         Ok(c) => c,
+        // a shim converts its own row from the guest view: bound with the guest view's lane classes
+        Err(e) if own_shim => {
+            rows.push((
+                "libc.so".to_owned(),
+                name.to_owned(),
+                format!("{e:#}"),
+                "shim",
+            ));
+            let ret = atl_bridgegen::jni::result_class(&g.ret)?;
+            let params = atl_bridgegen::jni::param_classes(g)?;
+            let lp64 = lp64.map_err(|why| anyhow::anyhow!("{name}: {why}"))?;
+            return Ok(lp64.replace("{sig}", &sig_literal(ret, &params)));
+        }
         Err(e) => {
             rows.push((
                 "libc.so".to_owned(),
@@ -1504,7 +1527,15 @@ fn bindings_table(
                 ilp32_rows.push(((*soname).to_owned(), name.clone(), row.describe(), waits));
             }
             // ILP32: a row with a position its lane class cannot convert binds lane-mapped when every such position has a generated converter ([`ilp32_maps`]), else traps naming the conversion it waits for (p4b s3-s4), before any route: no truncated value passes
-            let entry = if let Some(row) = ilp32.filter(|r| !r.carried()) {
+            let entry = if ilp32.is_some() && ILP32_PROXY_SHIMS.contains(&name.as_str()) {
+                if let Some(last) = ilp32_rows.last_mut() {
+                    last.3 = "shim";
+                }
+                let sig = &guest_view.functions[name.as_str()];
+                let ret = atl_bridgegen::jni::result_class(&sig.ret)?;
+                let params = atl_bridgegen::jni::param_classes(sig)?;
+                format!("Entry::Shim({})", sig_literal(ret, &params))
+            } else if let Some(row) = ilp32.filter(|r| !r.carried()) {
                 let sig = &guest_view.functions[name.as_str()];
                 match ilp32_maps(name, sig, row, &route, qemu, &views, &mut convs) {
                     Ok((maps, lanes)) => {
@@ -1928,8 +1959,10 @@ const BREAKS: &[(&str, &str)] = &[
     ("qt_exit_resume", "atl_nb_qt_exit_resume"),
     // Q6-2 (engine/dispatch.rs `call_object`): the host JNI function gets the guest's env instead of the host object (qemu-jni gate, `e`)
     ("jni_guest_env", "atl_nb_jni_guest_env"),
-    // Q7-7 (engine/netdb.rs `guest_node`): the guest addrinfo copy keeps glibc's field order (ai_addr before ai_canonname), so the guest reads its address from the name (qemu-thread gate, `r`)
+    // Q7-7 (engine/netdb.rs `view`): the guest addrinfo copy keeps glibc's field order (ai_addr before ai_canonname), so the guest reads its address from the name (qemu-thread gate, `r`)
     ("dns_glibc_order", "atl_nb_dns_glibc_order"),
+    // P4b s3d (engine/netdb.rs `freeaddrinfo`): the list's window block is not given back, so the window count grows across a resolver round (qemu-main gate, `n`)
+    ("dns_keep_list", "atl_nb_dns_keep_list"),
     // net-bp (build.rs `libc_entries`): getaddrinfo trapped, its row removed: the app gate's resolver probe aborts at the first call
     ("dns_unbound", "atl_nb_dns_unbound"),
     // net-bp (engine/netdb.rs `guest_error`): host EAI_* codes reach the guest unmapped (resolver probe: service code)

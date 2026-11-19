@@ -72,6 +72,8 @@ struct Abi {
     /// the record's `bionic_tls` pointer field
     bionic_tls: usize,
     tls_size: usize,
+    /// the record's `errno_value`: bionic `__errno()` answers its address
+    errno: usize,
     /// `NativeBridgeStaticTlsConfig`: size, tpoff, init_img, tls_slot_thread_id, tls_slot_bionic_tls
     cfg: [usize; 5],
 }
@@ -94,6 +96,7 @@ macro_rules! abi {
             pid_bits: r::bits::cached_pid_,
             bionic_tls: r::bionic_tls,
             tls_size: t::SIZE,
+            errno: r::errno_value,
             cfg: [
                 c::size,
                 c::tpoff,
@@ -418,6 +421,13 @@ pub fn current() -> usize {
         }
         r.get()
     })
+}
+
+/// Sets the calling thread's guest errno, as a bionic function does before it fails (`errno` is `*__errno()`, the thread record's `errno_value`; the record is the one guest `__get_thread()` reads, [`current`]).
+pub fn set_guest_errno(value: i32) {
+    let at = current() + abi().errno;
+    // SAFETY: `at` is the int field of this thread's live record (window memory the guest also writes).
+    unsafe { (at as *mut i32).write_unaligned(value) };
 }
 
 /// The guest's static-TLS description (`NativeBridgeStaticTlsConfig`), as the linker reported it.

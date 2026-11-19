@@ -81,6 +81,18 @@ __attribute__((used, noinline)) uintptr_t fx_join_one(uintptr_t arg) {
     return (uintptr_t)answer;
 }
 
+#include "../common/resolver.h"
+
+// bionic getaddrinfo.c ai_errlist[EAI_NONAME]: the text gai_strerror must answer (a window copy on a 32-bit guest)
+#define NONAME_TEXT "hostname nor servname provided, or not known"
+
+// The resolver round (qemu_main.rs check n): ../common/resolver.h rs_resolve (bits 1..9) and rs_walk (10..12), then gai_strerror (bit 13). 0 when all held. The host calls it twice and reads the engine's window count around the second: every list and hostent copy given back leaves it unchanged.
+__attribute__((used, noinline)) long fx_dns(void) {
+    long bad = rs_resolve() | rs_walk();
+    if (!rs_streq(gai_strerror(EAI_NONAME), NONAME_TEXT)) bad |= 1L << 13;
+    return bad;
+}
+
 int main(void) {
     int failed = thread_round_trip();
     if (!failed) failed = thread_dtors();

@@ -228,6 +228,8 @@ fn shim(name: &str) -> Option<usize> {
         "freeaddrinfo" => super::netdb::freeaddrinfo as *const () as usize,
         "getnameinfo" => super::netdb::getnameinfo as *const () as usize,
         "gai_strerror" => super::netdb::gai_strerror as *const () as usize,
+        "gethostbyname" => super::netdb::gethostbyname_shim as *const () as usize,
+        "gethostbyaddr" => super::netdb::gethostbyaddr_shim as *const () as usize,
         // libandroid, build.rs `PROXY_SHIMS`: glibc's addrinfo list converted as getaddrinfo's
         "android_getaddrinfofornetwork" => {
             super::netdb::getaddrinfo_for_network as *const () as usize
