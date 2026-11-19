@@ -186,7 +186,7 @@ unsafe fn store(p: *mut u8, n: usize, v: u64) {
 /// # Safety
 /// `g` readable for `op.bytes(true)`, `h` writable for `op.bytes(false)`.
 unsafe fn op_to_host(op: &Op, g: *const u8, h: *mut u8) {
-    // SAFETY (whole body): every access is within the op's sizes, per the caller contract.
+    // SAFETY: (whole body) every access is within the op's sizes, per the caller contract.
     unsafe {
         match *op {
             Op::Copy(n) => std::ptr::copy_nonoverlapping(g, h, n),
@@ -226,7 +226,7 @@ unsafe fn op_to_host(op: &Op, g: *const u8, h: *mut u8) {
 /// # Safety
 /// As [`op_to_host`], the directions swapped.
 unsafe fn op_to_guest(op: &Op, h: *const u8, g: *mut u8) -> bool {
-    // SAFETY (whole body): every access is within the op's sizes, per the caller contract.
+    // SAFETY: (whole body) every access is within the op's sizes, per the caller contract.
     unsafe {
         match *op {
             Op::Copy(n) => {

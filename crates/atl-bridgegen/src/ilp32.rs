@@ -715,7 +715,7 @@ pub fn converters_rs(convs: &[Conv], swap: &str) -> String {
     let swapped = convs.iter().position(|c| c.fields.len() >= 2);
     for (ci, c) in convs.iter().enumerate() {
         s.push_str(&format!(
-            "/// `{}`: guest {} bytes, host {} bytes (bridgegen ilp32 `converters`).\npub const C_{}: Conv = Conv {{\n    name: {:?},\n    guest_size: {},\n    host_size: {},\n    fields: &[\n",
+            "/// `{}`: guest {} bytes, host {} bytes (bridgegen ilp32 `converters`).\n#[allow(non_upper_case_globals, reason = \"named by the C record, which a grep finds\")]\npub const C_{}: Conv = Conv {{\n    name: {:?},\n    guest_size: {},\n    host_size: {},\n    fields: &[\n",
             c.name, c.guest_size, c.host_size, c.name, c.name, c.guest_size, c.host_size
         ));
         for (fi, f) in c.fields.iter().enumerate() {

@@ -22,15 +22,15 @@ pub(super) fn call_mapped((soname, symbol, maps): MappedRow, mut lanes: [usize; 
     let mut temps: Vec<(usize, usize, LaneMap, convert::Temp)> = Vec::new();
     for &(i, map) in maps {
         match map {
-            // SAFETY: lane `i` is the guest's non-NULL pointer to this record in its own layout (build.rs from the ILP32 classifier's kind of this parameter).
             LaneMap::Record(c, _) if lanes[i] != 0 => {
+                // SAFETY: lane `i` is the guest's non-NULL pointer to this record in its own layout (build.rs from the ILP32 classifier's kind of this parameter).
                 let mut t = unsafe { convert::record_in(c, lanes[i]) };
                 let host = t.ptr() as usize;
                 temps.push((i, lanes[i], map, t));
                 lanes[i] = host;
             }
-            // SAFETY: lane `i` is the guest's non-NULL pointer to one word of this kind (as above).
             LaneMap::OutWord(w) if lanes[i] != 0 => {
+                // SAFETY: lane `i` is the guest's non-NULL pointer to one word of this kind (as above).
                 let mut t = unsafe { convert::word_in(w, lanes[i]) };
                 let host = t.ptr() as usize;
                 temps.push((i, lanes[i], map, t));
