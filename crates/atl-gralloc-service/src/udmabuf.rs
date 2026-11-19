@@ -20,8 +20,10 @@ pub const DEVICE: &str = atl_gralloc::node::UDMABUF_DEVICE;
 /// Row pitch alignment: 256 bytes, the largest linear-pitch rule among Mesa's desktop drivers (radeonsi linear surfaces 256 B; iris 64 B), so a buffer of this tier stays importable if a GPU ever reads it; costs nothing at the window widths in use (1440 x 4 is a multiple).
 pub const PITCH_ALIGN: u32 = 256;
 
-/// The page size udmabuf requires sizes to be a multiple of (x86_64, aarch64 4 KiB kernels, riscv64).
-const PAGE: u64 = 4096;
+/// The kernel's page size: udmabuf requires offset and size multiples of PAGE_SIZE (4 KiB on x86_64 / riscv64; 4, 16 or 64 KiB on aarch64 kernels).
+pub fn page() -> u64 {
+    rustix::param::page_size() as u64
+}
 
 /// `struct udmabuf_create` (linux/udmabuf.h): `__u32 memfd; __u32 flags; __u64 offset; __u64 size`.
 #[repr(C)]
@@ -64,8 +66,13 @@ pub struct Udmabuf {
     dev: OwnedFd,
 }
 
-/// (pitch, bytes) of `c` on this tier; LINEAR only. BLOB: one row of `width` bytes, as the GBM tier reports it.
+/// (pitch, bytes) of `c` on this tier, bytes rounded up to the kernel's [`page`]; LINEAR only. BLOB: one row of `width` bytes, as the GBM tier reports it.
 pub fn layout(c: &Checked) -> Result<(u32, u64), String> {
+    layout_paged(c, page())
+}
+
+/// [`layout`] for pages of `page` bytes.
+fn layout_paged(c: &Checked, page: u64) -> Result<(u32, u64), String> {
     if !c.modifiers.contains(&DRM_FORMAT_MOD_LINEAR) {
         return Err(format!(
             "udmabuf allocates LINEAR only; set {:#x?}",
@@ -82,7 +89,7 @@ pub fn layout(c: &Checked) -> Result<(u32, u64), String> {
             .ok_or("row bytes overflow")?;
         (row.next_multiple_of(PITCH_ALIGN), u64::from(c.height))
     };
-    let bytes = (u64::from(pitch) * rows).next_multiple_of(PAGE);
+    let bytes = (u64::from(pitch) * rows).next_multiple_of(page);
     Ok((pitch, bytes))
 }
 
@@ -149,14 +156,26 @@ mod tests {
     #[test]
     fn pitch_and_size_follow_the_rules() {
         assert_eq!(
-            layout(&checked(1440, 900, vec![DRM_FORMAT_MOD_LINEAR])),
+            layout_paged(&checked(1440, 900, vec![DRM_FORMAT_MOD_LINEAR]), 4096),
             Ok((5888, 5_300_224))
         );
         assert_eq!(
-            layout(&checked(64, 48, vec![DRM_FORMAT_MOD_LINEAR])),
+            layout_paged(&checked(64, 48, vec![DRM_FORMAT_MOD_LINEAR]), 4096),
             Ok((256, 12_288))
         );
         assert!(layout(&checked(64, 48, vec![1])).is_err());
+    }
+
+    /// Larger kernel pages (aarch64 16K / 64K): 5299200 bytes = 323.4 x 16384 -> 324 x 16384 = 5308416, = 80.9 x 65536 -> 81 x 65536 = 5308416; 12288 bytes -> one page each.
+    #[test]
+    fn size_rounds_to_the_kernel_page() {
+        let big = checked(1440, 900, vec![DRM_FORMAT_MOD_LINEAR]);
+        let small = checked(64, 48, vec![DRM_FORMAT_MOD_LINEAR]);
+        assert_eq!(layout_paged(&big, 16_384), Ok((5888, 5_308_416)));
+        assert_eq!(layout_paged(&big, 65_536), Ok((5888, 5_308_416)));
+        assert_eq!(layout_paged(&small, 16_384), Ok((256, 16_384)));
+        assert_eq!(layout_paged(&small, 65_536), Ok((256, 65_536)));
+        assert_eq!(layout(&small).map(|(_, b)| b % page()), Ok(0));
     }
 
     /// A missing node is "unavailable", reported with the path's error kind (the tier choice reads it as a reason, not a failure).
@@ -174,9 +193,9 @@ mod tests {
         let Ok(u) = Udmabuf::open(Path::new(DEVICE)) else {
             return;
         };
-        let fd = u.create(3 * PAGE).expect("create");
+        let fd = u.create(3 * page()).expect("create");
         let size = rustix::fs::seek(&fd, rustix::fs::SeekFrom::End(0)).expect("size");
-        assert_eq!(size, 3 * PAGE);
+        assert_eq!(size, 3 * page());
         let mode = rustix::fs::fcntl_getfl(&fd).expect("flags") & rustix::fs::OFlags::ACCMODE;
         assert_ne!(mode, rustix::fs::OFlags::RDONLY);
     }
