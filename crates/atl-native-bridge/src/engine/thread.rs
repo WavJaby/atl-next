@@ -354,8 +354,6 @@ fn register_detach(ht: *mut HostThread) {
 /// Thread exit (the detach key's destructor, host thread pointer): the guest keys' destructors on the guest thread pointer, then the thread's guest TLS, records and crossing record are freed.
 extern "C" fn detach(value: *mut libc::c_void) {
     let ht = value.cast::<HostThread>();
-    // SAFETY: `ht` is this thread's record, its engine CPU still attached.
-    unsafe { run_cleanup(&mut *ht) };
     for _ in 0..DTOR_ROUNDS {
         let dtors = GUEST_DTORS.lock().map(|v| v.clone()).unwrap_or_default();
         let mut ran = false;
@@ -415,10 +413,10 @@ extern "C" fn detach(value: *mut libc::c_void) {
 }
 
 /// bionic pthread_exit.cpp's cleanup step: pops and runs each handler left on the guest record's `cleanup_stack` (LIFO; guest bionic's own `__pthread_cleanup_push` / `_pop` link them, NBS patch 0013).
-/// Called first in [`detach`]: glibc has already run the thread-exit list (`__cxa_thread_finalize`'s place) and runs key destructors after it, so bionic's order holds with no hook of our own. A return from the start routine ends here too, as bionic's start routine return goes through pthread_exit (a well-formed one leaves the stack empty).
+/// Called by intercepts.rs `exit_work` after the thread-exit list, while the guest frames holding the handlers are live (inside the guest's pthread_exit; after a return a well-formed routine left none, as on bionic); key destructors follow in [`detach`].
 /// # Safety
 /// `ht` is the calling thread's record, its engine CPU attached.
-unsafe fn run_cleanup(ht: &mut HostThread) {
+pub(super) unsafe fn run_cleanup(ht: &mut HostThread) {
     let record = RECORD.with(Cell::get);
     // deliberate break (`ATL_NB_BREAK=exit_skip_cleanup`): cleanup handlers never run (qemu-linker gate, qemu_main status 8)
     if record == 0 || cfg!(atl_nb_exit_skip_cleanup) {
@@ -427,7 +425,7 @@ unsafe fn run_cleanup(ht: &mut HostThread) {
     let [stack, prev, routine, arg] = abi().cleanup;
     let top = (record + stack) as *mut u8;
     loop {
-        // SAFETY: the live record of this thread; each `c` a guest `__pthread_cleanup_t` its frames still hold (the guest is inside pthread_exit or returned with none left).
+        // SAFETY: the live record of this thread; each `c` a guest `__pthread_cleanup_t` its frames still hold (see above).
         unsafe {
             let c = read_word(top);
             if c == 0 {
