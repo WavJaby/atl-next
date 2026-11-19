@@ -559,7 +559,7 @@ pub enum Op {
         guest: u64,
         host: u64,
     },
-    /// A pointer to data whose layout differs (a list's next node, a `char**` list): a deep copy whose length and ownership the header states in prose, so the generic converter writes NULL and only a hand shim that walks it may use the record ([`Conv::deep`]).
+    /// A pointer to data whose layout differs (a list's next node, a `char**` list): a deep copy whose length and ownership the header states in prose, so no generic converter exists for the record ([`Conv::deep`], [`converters_rs`]); only a hand shim that walks it may cross it.
     Deep { guest: u64, host: u64 },
 }
 
@@ -734,7 +734,7 @@ fn size_align(ty: &Ty, v: &ArchView) -> Result<(u64, u64)> {
     })
 }
 
-/// `converters` as Rust consts for the engine (`engine/convert.rs` types `Conv`, `Field`, `Op`): one `pub const C_<record>: Conv` each, then a const assert per record that its fields sit in declaration order on each side, within the size and at their alignment (C11 6.7.2.1p15: members at increasing addresses) -- the check a swapped or hand-edited offset fails at build time. `swap`: the cfg name of the red control that swaps the first two guest offsets of the first record with two fields.
+/// `converters` as Rust consts for the engine (`engine/convert.rs` types `Conv`, `Field`, `Op`): one `pub const C_<record>: Conv` each for the records without an [`Op::Deep`] field ([`Conv::deep`]: the lane-mapped route refuses those, so the engine's `Op` has no such variant and a deep record has no const; a shallow record never nests a deep one), then a const assert per record that its fields sit in declaration order on each side, within the size and at their alignment (C11 6.7.2.1p15: members at increasing addresses) -- the check a swapped or hand-edited offset fails at build time. `swap`: the cfg name of the red control that swaps the first two guest offsets of the first record with two fields.
 pub fn converters_rs(convs: &[Conv], swap: &str) -> String {
     fn op_rs(op: &Op) -> String {
         match op {
@@ -745,7 +745,7 @@ pub fn converters_rs(convs: &[Conv], swap: &str) -> String {
                 signed,
             } => format!("Op::Int {{ guest: {guest}, host: {host}, signed: {signed} }}"),
             Op::Ptr { guest, host } => format!("Op::Ptr {{ guest: {guest}, host: {host} }}"),
-            Op::Deep { guest, host } => format!("Op::Deep {{ guest: {guest}, host: {host} }}"),
+            Op::Deep { .. } => unreachable!("deep records are filtered out below"),
             Op::Record(n) => format!("Op::Record(&C_{n})"),
             Op::Array {
                 len,
@@ -760,6 +760,12 @@ pub fn converters_rs(convs: &[Conv], swap: &str) -> String {
             }
         }
     }
+    let shallow: Vec<Conv> = convs
+        .iter()
+        .filter(|c| !c.deep(convs))
+        .cloned()
+        .collect();
+    let convs = &shallow[..];
     let mut s = String::new();
     let swapped = convs.iter().position(|c| c.fields.len() >= 2);
     for (ci, c) in convs.iter().enumerate() {

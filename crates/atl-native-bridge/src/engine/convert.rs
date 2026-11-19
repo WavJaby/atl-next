@@ -26,8 +26,6 @@ pub enum Op {
         guest: usize,
         host: usize,
     },
-    /// a pointer to data whose layout differs (a list link, a `char**` list): written NULL both ways; a hand shim walks it (build.rs keeps such records off the lane-mapped route)
-    Deep { guest: usize, host: usize },
 }
 
 impl Op {
@@ -38,8 +36,7 @@ impl Op {
             Op::Int {
                 guest: g, host: h, ..
             }
-            | Op::Ptr { guest: g, host: h }
-            | Op::Deep { guest: g, host: h } => {
+            | Op::Ptr { guest: g, host: h } => {
                 if guest {
                     g
                 } else {
@@ -205,7 +202,6 @@ unsafe fn op_to_host(op: &Op, g: *const u8, h: *mut u8) {
                 store(h, host, v);
             }
             Op::Ptr { guest, host } => store(h, host, load(g, guest)),
-            Op::Deep { host, .. } => store(h, host, 0),
             Op::Record(c) => to_host(c, g, h),
             Op::Array {
                 len,
@@ -235,10 +231,6 @@ unsafe fn op_to_guest(op: &Op, h: *const u8, g: *mut u8) -> bool {
             }
             Op::Int { guest, host, .. } => {
                 store(g, guest, load(h, host));
-                true
-            }
-            Op::Deep { guest, .. } => {
-                store(g, guest, 0);
                 true
             }
             Op::Ptr { guest, host } => {
