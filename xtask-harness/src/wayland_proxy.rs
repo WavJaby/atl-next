@@ -6,7 +6,9 @@
 //! * `xdg_wm_base.pong(serial)` (request opcode 3) -> [`Event::Pong`], `wl_shm.create_pool` (opcode 0) -> [`Event::ShmPool`];
 //! * `xdg_wm_base.ping(serial)` from the compositor (event opcode 0) -> [`Event::Ping`] with `injected: false`;
 //! * `xdg_toplevel.set_title(title)` of the window's toplevel (request opcode 2) -> [`Event::Title`], its `set_app_id(app_id)` (opcode 3) -> [`Event::AppId`], its `set_minimized` (opcode 13) -> [`Event::Minimized`];
-//! * the window's first `wl_surface.commit` (xdg-shell's initial one, no buffer) -> [`Event::FirstCommit`].
+//! * the window's first `wl_surface.commit` (xdg-shell's initial one, no buffer) -> [`Event::FirstCommit`];
+//! * `wp_presentation.feedback` (request 1) -> its `wp_presentation_feedback`'s `presented` (event 1) counted by its `kind` flags in [`Presented`]: the host's vsync marking as the compositor sends
+//!   it, independent of the client's reading of it (the window gate's vsync-tier check).
 //!
 //! Injections go to the window's connection: the first to create an `xdg_toplevel` owns them; every other connection forwards only.
 //! [`Proxy::inject_ping`] writes a synthetic `xdg_wm_base.ping(serial)` to the client between two forwarded messages, which is what a compositor's ping is on the wire. A client whose main loop is blocked reads nothing, so no `pong` comes back; a client iterating answers at once.
@@ -23,7 +25,7 @@ use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -39,6 +41,32 @@ use rustix::net::{
 
 /// Message header: object id and `size << 16 | opcode`.
 const HEADER_BYTES: usize = 8;
+/// presentation-time.xml: `wp_presentation` request 1 `feedback(surface, callback new_id)`; `wp_presentation_feedback` events `presented` 1 (args tv_sec_hi, tv_sec_lo, tv_nsec, refresh,
+/// seq_hi, seq_lo, flags: flags is the 7th u32) and `discarded` 2, both destructors; `kind.vsync` = 0x1.
+const WP_PRESENTATION: &str = "wp_presentation";
+const WP_PRESENTATION_FEEDBACK: &str = "wp_presentation_feedback";
+const WP_PRESENTATION_FEEDBACK_REQ: u16 = 1;
+const FEEDBACK_PRESENTED: u16 = 1;
+const FEEDBACK_DISCARDED: u16 = 2;
+const PRESENTED_FLAGS_AT: usize = 6 * 4;
+const KIND_VSYNC: u32 = 0x1;
+
+/// `presented` events the compositor sent, over every connection, by whether their flags carry `kind.vsync`.
+#[derive(Debug, Default)]
+pub struct Presented {
+    pub vsync: AtomicU64,
+    pub other: AtomicU64,
+}
+
+impl Presented {
+    /// (vsync, other) now.
+    pub fn counts(&self) -> (u64, u64) {
+        (
+            self.vsync.load(Ordering::Relaxed),
+            self.other.load(Ordering::Relaxed),
+        )
+    }
+}
 /// `wl_display` is object 1; its request 1 is `get_registry(new_id)`.
 const WL_DISPLAY_ID: u32 = 1;
 const WL_DISPLAY_GET_REGISTRY: u16 = 1;
@@ -215,6 +243,18 @@ fn message(buf: &[u8]) -> Option<(u32, u16, usize)> {
     (size >= HEADER_BYTES && size <= buf.len()).then_some((id, (second & 0xffff) as u16, size))
 }
 
+/// One event on a `wp_presentation_feedback`: `presented` counted by its `kind.vsync` flag. True when the event destroys the feedback (`presented`, `discarded`).
+fn note_feedback(presented: &Presented, opcode: u16, body: &[u8]) -> bool {
+    if opcode == FEEDBACK_PRESENTED {
+        let n = match word(body, PRESENTED_FLAGS_AT) {
+            Some(flags) if flags & KIND_VSYNC != 0 => &presented.vsync,
+            _ => &presented.other,
+        };
+        n.fetch_add(1, Ordering::Relaxed);
+    }
+    matches!(opcode, FEEDBACK_PRESENTED | FEEDBACK_DISCARDED)
+}
+
 /// What a client request means to the probe; also learns the interface of each bound id.
 fn note_request(ids: &mut Ids, object: u32, opcode: u16, body: &[u8]) -> Option<Event> {
     if object == WL_DISPLAY_ID && opcode == WL_DISPLAY_GET_REGISTRY {
@@ -239,6 +279,18 @@ fn note_request(ids: &mut Ids, object: u32, opcode: u16, body: &[u8]) -> Option<
         let pointer = word(body, 0)?;
         ids.interfaces.insert(pointer, WL_POINTER.to_owned());
         ids.pointer = Some(pointer);
+        return None;
+    }
+    if ids
+        .interfaces
+        .get(&object)
+        .is_some_and(|i| i == WP_PRESENTATION)
+        && opcode == WP_PRESENTATION_FEEDBACK_REQ
+    {
+        // surface: object, callback: new_id
+        let feedback = word(body, 4)?;
+        ids.interfaces
+            .insert(feedback, WP_PRESENTATION_FEEDBACK.to_owned());
         return None;
     }
     if ids.interfaces.get(&object).is_some_and(|i| i == WL_SEAT) && opcode == WL_SEAT_GET_KEYBOARD {
@@ -420,6 +472,7 @@ pub struct Proxy {
     wakes: Arc<Mutex<Vec<OwnedFd>>>,
     /// `run-apk --break-input`: pointer, touch and key injections are dropped (configures, pings and closes still go).
     drop_input: AtomicBool,
+    presented: Arc<Presented>,
 }
 
 /// An injected input event's timestamp: CLOCK_MONOTONIC in ms, truncated to u32 -- the base wlroots and weston stamp input with. The protocol leaves the base undefined, but clients that turn it into Android event times read it as uptimeMillis (CLOCK_MONOTONIC), so a private epoch dates every event hours in the past.
@@ -445,9 +498,11 @@ impl Proxy {
         );
         // the connection that owns the window (server_to_client): set once, never handed over
         let window: Shared<Option<usize>> = Arc::default();
+        let presented: Arc<Presented> = Arc::default();
+        let seen = Arc::clone(&presented);
         thread::spawn(move || {
             for client in listener.incoming().flatten() {
-                match serve(client, &up, &tx, &inj, &wk, &window) {
+                match serve(client, &up, &tx, &inj, &wk, &window, &seen) {
                     Ok(()) => {}
                     Err(e) => eprintln!("wayland proxy: connection setup failed: {e:#}"),
                 }
@@ -459,7 +514,13 @@ impl Proxy {
             injections,
             wakes,
             drop_input: AtomicBool::new(false),
+            presented,
         })
+    }
+
+    /// The `presented` events seen so far ([`Presented`]); the handle stays valid after the proxy moves.
+    pub fn presented(&self) -> Arc<Presented> {
+        Arc::clone(&self.presented)
     }
 
     /// Deliberate failure (`run-apk --break-input`): from now on every pointer, touch and key injection is dropped, so a script's input reaches no app.
@@ -559,6 +620,7 @@ fn serve(
     injections: &Shared<Vec<Injection>>,
     wakes: &Shared<Vec<OwnedFd>>,
     window: &Shared<Option<usize>>,
+    presented: &Arc<Presented>,
 ) -> Result<()> {
     let server = UnixStream::connect(upstream)
         .with_context(|| format!("connecting to {}", upstream.display()))?;
@@ -576,8 +638,12 @@ fn serve(
         let _ = server_w.shutdown(std::net::Shutdown::Both);
         let _ = events_c.send((Instant::now(), Event::Closed));
     });
-    let (events_s, injections, window) =
-        (events.clone(), Arc::clone(injections), Arc::clone(window));
+    let (events_s, injections, window, presented) = (
+        events.clone(),
+        Arc::clone(injections),
+        Arc::clone(window),
+        Arc::clone(presented),
+    );
     thread::spawn(move || {
         let _ = server_to_client(
             &server,
@@ -587,6 +653,7 @@ fn serve(
             &events_s,
             &injections,
             &window,
+            &presented,
         );
         let _ = client.shutdown(std::net::Shutdown::Both);
     });
@@ -656,6 +723,7 @@ fn server_to_client(
     events: &Sender<(Instant, Event)>,
     injections: &Shared<Vec<Injection>>,
     window: &Shared<Option<usize>>,
+    presented: &Presented,
 ) -> Result<()> {
     let mut pending: Vec<u8> = Vec::new();
     let mut fds: Vec<OwnedFd> = Vec::new();
@@ -676,18 +744,29 @@ fn server_to_client(
             }
             pending.extend_from_slice(&data);
             fds.extend(received);
-            let (wm_base, seats, touch) = {
+            let (wm_base, seats, touch, feedbacks) = {
                 let ids = ids.lock().map_err(|_| anyhow::anyhow!("ids poisoned"))?;
-                let seats: Vec<u32> = ids
-                    .interfaces
-                    .iter()
-                    .filter_map(|(id, i)| (i == WL_SEAT).then_some(*id))
-                    .collect();
-                (ids.id_of(WM_BASE), seats, ids.touch)
+                let of = |interface: &str| -> Vec<u32> {
+                    ids.interfaces
+                        .iter()
+                        .filter_map(|(id, i)| (i == interface).then_some(*id))
+                        .collect()
+                };
+                (
+                    ids.id_of(WM_BASE),
+                    of(WL_SEAT),
+                    ids.touch,
+                    of(WP_PRESENTATION_FEEDBACK),
+                )
             };
+            // feedback objects the compositor destroyed (presented / discarded): their ids are free for reuse
+            let mut ended: Vec<u32> = Vec::new();
             // the seat claims touch, so the client asks for the proxy's wl_touch; the sync that took that id answers on it and deletes it: both are the proxy's to drop
             let mut out = Vec::with_capacity(pending.len());
             let complete = scan(&pending, |object, opcode, body| {
+                if feedbacks.contains(&object) && note_feedback(presented, opcode, body) {
+                    ended.push(object);
+                }
                 let id_of_touch = |v: Option<u32>| v.is_some() && v == touch;
                 if id_of_touch(Some(object))
                     || (object == WL_DISPLAY_ID
@@ -721,6 +800,12 @@ fn server_to_client(
                     ));
                 }
             });
+            if !ended.is_empty() {
+                let mut ids = ids.lock().map_err(|_| anyhow::anyhow!("ids poisoned"))?;
+                for id in ended {
+                    ids.interfaces.remove(&id);
+                }
+            }
             if complete > 0 {
                 forward(client.as_fd(), &out, &mut fds)?;
                 pending.drain(..complete);
@@ -1160,6 +1245,40 @@ mod tests {
     }
 
     /// The window's first `commit` is [`Event::FirstCommit`], bufferless or not; later commits and another surface's do not report it.
+    /// Review-2 G5: `wp_presentation.feedback(surface 5, new id 9)` makes 9 a feedback; its `presented` is counted by flags bit 0x1 (presentation-time.xml `kind.vsync`), the 7th word;
+    /// presented and discarded end it, sync_output does not.
+    #[test]
+    fn presented_feedback_is_counted_by_its_vsync_flag() {
+        let mut ids = Ids::default();
+        ids.interfaces.insert(4, WP_PRESENTATION.to_owned());
+        let request: Vec<u8> = [5u32, 9].iter().flat_map(|w| w.to_ne_bytes()).collect();
+        assert_eq!(
+            note_request(&mut ids, 4, WP_PRESENTATION_FEEDBACK_REQ, &request),
+            None
+        );
+        assert_eq!(
+            ids.interfaces.get(&9).map(String::as_str),
+            Some(WP_PRESENTATION_FEEDBACK)
+        );
+        let body = |flags: u32| -> Vec<u8> {
+            [0u32, 1, 2, 16_666_666, 0, 7, flags]
+                .iter()
+                .flat_map(|w| w.to_ne_bytes())
+                .collect()
+        };
+        let p = Presented::default();
+        // vsync | hw_clock | hw_completion (0x1 | 0x2 | 0x4), then hw_clock alone, then no flags
+        assert!(note_feedback(&p, FEEDBACK_PRESENTED, &body(0x7)));
+        assert!(note_feedback(&p, FEEDBACK_PRESENTED, &body(0x2)));
+        assert!(note_feedback(&p, FEEDBACK_PRESENTED, &body(0)));
+        assert!(note_feedback(&p, FEEDBACK_DISCARDED, &[]));
+        assert!(
+            !note_feedback(&p, 0, &5u32.to_ne_bytes()),
+            "sync_output keeps the feedback"
+        );
+        assert_eq!(p.counts(), (1, 2));
+    }
+
     #[test]
     fn first_commit_is_the_windows_first_commit() {
         let mut ids = Ids {

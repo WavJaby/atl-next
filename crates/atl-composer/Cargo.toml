@@ -25,6 +25,7 @@ break-no-backpressure = []
 break-input-frames = []
 break-input-no-wake = []
 break-no-serve = []
+break-ignore-vsync-flag = []
 
 [dependencies]
 atl-aidl = { path = "../atl-aidl" }

@@ -513,6 +513,12 @@ impl Composer {
     /// UI mode: the window showed a frame (its presentation feedback, in order). It feeds the vsync source tier: a vsync sample is the hardware tier's phase from the next tick; any sample's
     /// refresh is the nominal period. A tier change is logged once: `atl-composer: vsync source <tier> (<reason>)`. Takes no core lock.
     pub fn on_presented(&self, sample: PresentTiming) {
+        // deliberate break (`xtask test window --break-ignore-vsync-flag`): every sample reads as not vsync, so on a hardware-vsync host the tier stays free-running against the proxy's count
+        #[cfg(feature = "break-ignore-vsync-flag")]
+        let sample = PresentTiming {
+            source: PresentSource::NotVsync,
+            ..sample
+        };
         let c = &self.vsync_counters;
         if sample.source == PresentSource::Vsync {
             c.samples_vsync.fetch_add(1, Ordering::Relaxed);

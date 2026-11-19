@@ -102,6 +102,10 @@ pub struct Args {
     /// Deliberate break (stage ui-block): the composer latches every tick whether the window took the last scene or not (atl-composer feature `break-no-backpressure`), so the held and replaced checks must fail.
     #[arg(long)]
     break_no_backpressure: bool,
+    /// Deliberate break (stages widgets, ui-block): the composer reads every presentation sample as not vsync (atl-composer feature `break-ignore-vsync-flag`), so on a hardware-vsync host the
+    /// vsync-tier check, judged by the proxy's count, must fail. A host that flags no vsync (headless labwc) stays green: the red control needs a hardware-vsync desktop.
+    #[arg(long)]
+    break_ignore_vsync_flag: bool,
     /// Stage ime only: the fake input method leaves its commit_string out, so the commit sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     break_ime_commit: bool,
@@ -1808,10 +1812,12 @@ const VSYNC_TIER_SAMPLES: u64 = 6;
 /// The composer's tier line, `atl-composer: vsync source <tier> (<reason>) ...` (first at start, then once per change).
 const VSYNC_TIER_LINE: &str = "atl-composer: vsync source ";
 
-/// The vsync source tier the run chose matches what the host's presentation feedback stated, from the run's own lines, never from the host's name. Vsync-flagged samples on CLOCK_MONOTONIC
-/// (`vsync_samples`, wp_presentation kind vsync + clock_id 1) >= [`VSYNC_TIER_SAMPLES`] and no others -> `hardware-vsync`, reached by exactly one change (it starts free-running) and kept; fewer ->
-/// `free-running`, never changed. Mixed kinds are red: the tier would hinge on their order, which the counters do not show. The last tier line names the same tier as the counters.
-fn vsync_tier_check(app: &str) -> Result<String, String> {
+/// The vsync source tier the run chose matches what the host's presentation feedback stated, never the host's name. The host's side is `host`: the proxy's count of the compositor's `presented`
+/// events by `kind.vsync` (wayland_proxy.rs [`Presented`](crate::wayland_proxy::Presented)), independent of the composer's reading of the flags; None = no proxy, so no feedback the run could
+/// see (non-UI stages) = (0, 0). Vsync-flagged >= [`VSYNC_TIER_SAMPLES`] and no others, on CLOCK_MONOTONIC (the platform's clock line) -> `hardware-vsync`, reached by exactly one change (it
+/// starts free-running) and kept; fewer -> `free-running`, never changed. Mixed kinds are red: the tier would hinge on their order. The composer's counters and last tier line name the tier;
+/// `--break-ignore-vsync-flag` (the composer reads every sample as not vsync) must turn this red on a hardware-vsync host.
+fn vsync_tier_check(app: &str, host: Option<(u64, u64)>) -> Result<String, String> {
     let line = crate::composer::last_counters(app).ok_or("no `composer: counters` line")?;
     let n = |k: &str| crate::composer::field(line, k).unwrap_or(0);
     let tier = word(line, "vsync_source").ok_or("no vsync_source in the counters")?;
@@ -1841,15 +1847,19 @@ fn vsync_tier_check(app: &str) -> Result<String, String> {
                 .map(|(_, c)| c.trim())
         })
         .map_or("none".to_owned(), |c| format!("clock_id={c}"));
-    let evidence =
-        format!("{reason}; vsync_samples={vsync} other={other} changes={changes} {clock}");
-    let want = if vsync >= VSYNC_TIER_SAMPLES {
-        if other > 0 {
+    let (host_vsync, host_other) = host.unwrap_or((0, 0));
+    let seen = host.map_or("no proxy".to_owned(), |(v, o)| {
+        format!("proxy presented vsync={v} other={o}")
+    });
+    let evidence = format!(
+        "{reason}; {seen}; composer vsync_samples={vsync} other={other} changes={changes} {clock}"
+    );
+    let want = if host_vsync >= VSYNC_TIER_SAMPLES {
+        if host_other > 0 {
             return Err(format!(
                 "host feedback mixes vsync and other samples: {evidence}"
             ));
         }
-        // the counter is the composer's own reading of the flags; the platform's clock line checks it independently
         if clock != "clock_id=1" {
             return Err(format!(
                 "vsync samples counted on a host clock other than CLOCK_MONOTONIC: {evidence}"
@@ -2062,6 +2072,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                     (args.break_queue, "queue"),
                     (args.break_ignore_hold, "ignore-hold"),
                     (args.break_no_backpressure, "no-backpressure"),
+                    (args.break_ignore_vsync_flag, "ignore-vsync-flag"),
                     (args.break_input_frames, "input-frames"),
                     (args.break_input_no_wake, "input-no-wake"),
                 ]
@@ -2377,6 +2388,8 @@ struct LiveOut {
     /// atld ended because the gate stopped it at the window's end.
     stopped: Option<std::process::ExitStatus>,
     pressure: Samples,
+    /// The proxy's count of the compositor's `presented` feedback (vsync-flagged, other); None: the stage ran without a proxy (no Wayland connection the harness sees).
+    presented: Option<(u64, u64)>,
 }
 
 /// The live half of a window stage, next to atld and the compositor: the probe thread drives the client through the proxy, the poll loop watches the marker's window, the app's end and [`LIMIT`], then
@@ -2414,6 +2427,8 @@ fn live(l: LiveIn, atld: &mut Atld, sampler: Sampler) -> Result<LiveOut> {
         break_caller: args.break_capture_caller,
         seen: Arc::clone(&captured),
     });
+    // the host's own vsync marking, counted by the proxy: the vsync-tier check's independent side
+    let presented = proxy.as_ref().map(Proxy::presented);
     let probe = proxy.map(|p| {
         let log = run.log(package);
         let services_log = run.log("services");
@@ -2536,6 +2551,7 @@ fn live(l: LiveIn, atld: &mut Atld, sampler: Sampler) -> Result<LiveOut> {
         ended,
         stopped,
         pressure: sampler.stop(),
+        presented: presented.map(|p| p.counts()),
     })
 }
 
@@ -2577,6 +2593,7 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
         ended,
         stopped,
         pressure,
+        presented,
     } = out;
     let read = atl_diag::logfiles::read;
     let app_log = run.log(package);
@@ -2783,7 +2800,7 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
     }
     // each vsync source tier's gate: local stages run free-running (headless labwc, clock_id=1 without the vsync flag), session displays that mark vsyncs run hardware-vsync
     if !sub.is_empty() && matches!(args.stage, Stage::Frames | Stage::Widgets | Stage::UiBlock) {
-        sub.push(("vsync-tier", vsync_tier_check(&app)));
+        sub.push(("vsync-tier", vsync_tier_check(&app, presented)));
     }
     let sub_fault = sub.iter().find_map(|(_, r)| r.as_ref().err().cloned());
     for (name, result) in &sub {
@@ -2885,6 +2902,7 @@ struct LiveRecord {
     ended: bool,
     stopped: bool,
     pressure: Samples,
+    presented: Option<(u64, u64)>,
 }
 
 /// Hidden `window-live`: the window gate's live half on a remote target, started by the run script (remote.rs `Plan::script`) before atld.
@@ -2971,6 +2989,7 @@ pub fn agent(a: &AgentArgs) -> Result<ExitCode> {
         ended: out.ended.is_some(),
         stopped: out.stopped.is_some(),
         pressure: out.pressure,
+        presented: out.presented,
     };
     let path = run.scratch.join(crate::remote::LIVE_JSON);
     std::fs::write(&path, serde_json::to_vec(&record)?)
@@ -3194,6 +3213,7 @@ pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
         ended: record.ended.then_some(status),
         stopped: record.stopped.then_some(status),
         pressure: record.pressure,
+        presented: record.presented,
     };
     judge(
         &Judged {
@@ -3300,13 +3320,22 @@ mod tests {
     /// Sample counts: 6 = AOSP kMinSamplesForPrediction; 14850 / 0 / 1 = the laptop's measured hardware run (state vsync-source-tier-laptop); 1519 other = the WSLg run (clock_id=4, no vsync flag).
     #[test]
     fn vsync_tier_follows_the_hosts_feedback() {
+        // an honest composer: the proxy saw the same samples it counted
+        let check = |log: &str| {
+            let n = |k: &str| {
+                crate::composer::last_counters(log)
+                    .and_then(|l| crate::composer::field(l, k))
+                    .unwrap_or(0)
+            };
+            vsync_tier_check(log, Some((n("vsync_samples"), n("vsync_samples_other"))))
+        };
         let hw = vsync_log("1", &["hardware-vsync"], "hardware-vsync", 14850, 0, 1);
-        assert!(vsync_tier_check(&hw).is_ok_and(|s| s.starts_with("hardware-vsync (")));
+        assert!(check(&hw).is_ok_and(|s| s.starts_with("hardware-vsync (")));
         let free = vsync_log("4", &[], "free-running", 0, 1519, 0);
-        assert!(vsync_tier_check(&free).is_ok_and(|s| s.starts_with("free-running (")));
+        assert!(check(&free).is_ok_and(|s| s.starts_with("free-running (")));
         // the threshold itself: 6 vsyncs switch, 5 do not
         assert!(
-            vsync_tier_check(&vsync_log(
+            check(&vsync_log(
                 "1",
                 &["hardware-vsync"],
                 "hardware-vsync",
@@ -3316,7 +3345,15 @@ mod tests {
             ))
             .is_ok()
         );
-        assert!(vsync_tier_check(&vsync_log("1", &[], "free-running", 5, 0, 0)).is_ok());
+        assert!(check(&vsync_log("1", &[], "free-running", 5, 0, 0)).is_ok());
+        // review-2 G5: the judge is the proxy's count. A composer that counts nothing (0/0) or reads every flag as not vsync (`--break-ignore-vsync-flag`) stays free-running: red against
+        // the laptop's 14850 vsync-flagged feedbacks; green only where the host flagged none (no proxy = no feedback)
+        let silent = vsync_log("1", &[], "free-running", 0, 0, 0);
+        assert!(vsync_tier_check(&silent, Some((14850, 0))).is_err());
+        let ignoring = vsync_log("1", &[], "free-running", 0, 14850, 0);
+        assert!(vsync_tier_check(&ignoring, Some((14850, 0))).is_err());
+        assert!(vsync_tier_check(&silent, Some((0, 1519))).is_ok());
+        assert!(vsync_tier_check(&silent, None).is_ok());
         let reds = [
             vsync_log(
                 "1",
@@ -3333,9 +3370,9 @@ mod tests {
             vsync_log("4", &["hardware-vsync"], "hardware-vsync", 14850, 0, 1),
         ];
         for log in &reds {
-            assert!(vsync_tier_check(log).is_err(), "{log}");
+            assert!(check(log).is_err(), "{log}");
         }
-        assert!(vsync_tier_check("composer: counters ticks=1\n").is_err());
+        assert!(vsync_tier_check("composer: counters ticks=1\n", None).is_err());
     }
 
     /// The app's sandbox and launcher match by an argument's file name; the services' sandbox, binding the runtime's lib dir under `crates/atl-app-launcher`, does not.
