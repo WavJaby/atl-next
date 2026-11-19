@@ -2,7 +2,7 @@
 //! Host sides of the guest libc's pthread stubs (NBS `stubs_x86_64.cpp`): guest threads are glibc threads, as NBS makes them host threads.
 //! Pass-through to glibc where the ABI is the same (build.rs `GLIBC` rows of the binding table): `pthread_key_t` (int), `pthread_attr_t` (56 bytes, only ever filled and read by glibc, since every `pthread_attr_*` is a glibc row too) -- sizes gated below against the generated bionic layout.
 //! A `pthread_t` is the guest's own handle, the thread's bionic record (thread.rs `THREADS`): every row taking one maps it to glibc's (`pthread_join`, `pthread_detach`, `pthread_gettid_np`, `pthread_getattr_np`, [`BY_HANDLE`]); `pthread_self` and `pthread_equal` are guest bionic and agree with `pthread_create`'s answer.
-//! Own host sides (`Shim` rows) where the guest hands host code a guest function: `pthread_create` (start routine on the new thread's guest thread pointer, after attach on a guest stack of the attr's size) and `pthread_key_create` (destructor run by thread.rs `detach`); and `pthread_getattr_np`, whose answer is the guest stack (thread.rs `stack_of`), not glibc's view of the host thread. And `pthread_exit`, which ends the start routine's guest call (`Engine::end_call`).
+//! Own host sides (`Shim` rows) where the guest hands host code a guest function: `pthread_create` (start routine on the new thread's guest thread pointer, after attach on a guest stack of the attr's size) and `pthread_key_create` (destructor run by thread.rs `detach`); and `pthread_getattr_np`, whose answer is the guest stack (thread.rs `stack_of`), not glibc's view of the host thread. And `pthread_exit`, which ends the start routine's guest call (`Engine::end_call`); `__cxa_thread_atexit_impl` (guest destructor on glibc's thread-exit list).
 
 use std::cell::Cell;
 use std::ffi::c_void;
@@ -180,7 +180,7 @@ thread_local! {
 }
 
 /// `void pthread_exit(void*)`: ends the start routine's guest call at once with `value` as its result (`Engine::end_call`; QEMU answers it in x0, hence the return), so [`run`] returns it to glibc, whose join reports it; the host thread then exits as after a plain return.
-/// bionic's order (pthread_exit.cpp): `__cxa_thread_finalize`, cleanup handlers, `pthread_key_clean_all`, then the stack goes. The first two are guest-libc NBS stubs with no host side here (an app that registers either traps first); key destructors and the guest stack are thread.rs `detach`'s, run by the host key at this thread's exit.
+/// bionic's order (pthread_exit.cpp): `__cxa_thread_finalize`, cleanup handlers, `pthread_key_clean_all`, then the stack goes. Here: glibc's thread exit runs the thread-exit destructors first ([`cxa_thread_atexit_impl`]), then its key destructors, among them thread.rs `detach` (guest keys, then the guest stack). Cleanup handlers are not run (a known gap).
 /// Only from the routine's own guest call on a [`run`] thread (the engine refuses a nested one: it would skip host frames between the calls); a host thread that merely attached has no routine to end. Both abort, named.
 pub(super) extern "C" fn pthread_exit(value: usize) -> usize {
     if !ROUTINE.with(Cell::get) {
@@ -195,6 +195,51 @@ pub(super) extern "C" fn pthread_exit(value: usize) -> usize {
         Ok(v) => v,
         Err(e) => super::unsupported(&format!("guest pthread_exit: {e}")),
     }
+}
+
+/// A guest thread-exit destructor and its object, boxed as glibc's `obj` for [`run_thread_dtor`].
+struct ThreadDtor {
+    dtor: usize,
+    obj: usize,
+}
+
+unsafe extern "C" {
+    /// glibc (GLIBC_2.18): appends to the calling thread's thread-exit list, which glibc runs in reverse at thread exit and at `exit` (`__call_tls_dtors`), before key destructors and `atexit` handlers; `dso` (an address inside a loaded object) keeps that object loaded while entries are pending.
+    fn __cxa_thread_atexit_impl(
+        dtor: unsafe extern "C" fn(*mut c_void),
+        obj: *mut c_void,
+        dso: *mut c_void,
+    ) -> i32;
+}
+
+/// An address inside this library: the `dso` of every entry, so glibc pins this library (which holds [`run_thread_dtor`]) while one is pending.
+static DSO_ANCHOR: u8 = 0;
+
+/// `int native_bridge___cxa_thread_atexit_impl(void (*)(void*), void*, void*)` (NBS guest libc `__cxa_thread_atexit_impl.cpp` hands its `WrappedFn` here; the guest wrapper pins the guest DSO itself): as NBS `cxa_trampolines.cc`, the guest function wrapped as host code and registered with the host's `__cxa_thread_atexit_impl` under the host's own DSO handle.
+/// Thus glibc's order is bionic's: reverse registration, before key destructors (thread.rs `detach`, which releases the guest thread last); the main thread's run in the host `exit` after the guest's `__cxa_finalize`, the deviation NBS exit.c documents.
+pub(super) extern "C" fn cxa_thread_atexit_impl(dtor: usize, obj: usize, _dso: usize) -> i32 {
+    let entry = Box::into_raw(Box::new(ThreadDtor { dtor, obj }));
+    // SAFETY: `entry` is handed back exactly once to `run_thread_dtor`, which frees it; DSO_ANCHOR lies in this library.
+    let rc = unsafe {
+        __cxa_thread_atexit_impl(
+            run_thread_dtor,
+            entry.cast(),
+            (&raw const DSO_ANCHOR).cast_mut().cast(),
+        )
+    };
+    if rc != 0 {
+        // SAFETY: glibc did not keep it.
+        drop(unsafe { Box::from_raw(entry) });
+    }
+    rc
+}
+
+/// glibc's call of one thread-exit entry, on the exiting thread before its key destructors: the guest destructor on this thread's guest thread pointer, still attached (`detach` is a key destructor).
+unsafe extern "C" fn run_thread_dtor(entry: *mut c_void) {
+    // SAFETY: the box `cxa_thread_atexit_impl` registered; glibc runs each entry once.
+    let ThreadDtor { dtor, obj } = *unsafe { Box::from_raw(entry.cast::<ThreadDtor>()) };
+    // SAFETY: the guest's `void (*)(void*)` and its argument, on this thread's record.
+    unsafe { call_guest(&mut *thread::attach_current(), dtor, obj, 0, 0, 0) };
 }
 
 /// `int pthread_key_create(pthread_key_t*, void (*)(void*))`: glibc's key without a destructor; the guest's is stored here and runs at thread exit (thread.rs `detach`). The store is the same under QEMU; the destructor crosses on the exiting thread (thread.rs `detach`).

@@ -16,6 +16,42 @@ static void *worker(void *arg) {
     return (void *)((uintptr_t)arg + 1);
 }
 
+// What a C++ `thread_local` with a non-trivial destructor compiles to: libc++abi's __cxa_thread_atexit forwards to bionic's __cxa_thread_atexit_impl (NBS guest libc -> native_bridge___cxa_thread_atexit_impl stub); called directly here, the fixture links no C++ runtime.
+extern int __cxa_thread_atexit_impl(void (*dtor)(void *), void *obj, void *dso);
+extern void *__dso_handle;
+
+// Thread-exit events, one letter per destructor run, in run order; the harness reads the final string at the host's exit (qemu_main.rs `EVENTS`).
+__attribute__((used)) char fx_events[16];
+static unsigned n_events;
+
+static void record(void *letter) {
+    if (n_events + 1 < sizeof fx_events) fx_events[n_events++] = (char)(uintptr_t)letter;
+}
+
+static pthread_key_t key;
+
+// Registers thread-exit destructors 'A' then 'B' and a key value whose destructor records 'K': bionic's pthread_exit order is __cxa_thread_finalize (reverse registration: B, A), then key destructors (K).
+static void *tls_worker(void *arg) {
+    (void)arg;
+    if (__cxa_thread_atexit_impl(record, (void *)'A', &__dso_handle) != 0) return (void *)1;
+    if (__cxa_thread_atexit_impl(record, (void *)'B', &__dso_handle) != 0) return (void *)1;
+    pthread_setspecific(key, (void *)'K');
+    return 0;
+}
+
+// 0 when the worker's thread-exit destructors ran exactly once in bionic's order ("BAK"), and the main thread's two are registered; else the step (6..8).
+static int thread_dtors(void) {
+    pthread_t t;
+    void *answer = (void *)1;
+    if (pthread_key_create(&key, record) != 0) return 6;
+    if (pthread_create(&t, 0, tls_worker, 0) != 0 || pthread_join(t, &answer) != 0 || answer != 0) return 7;
+    if (n_events != 3 || fx_events[0] != 'B' || fx_events[1] != 'A' || fx_events[2] != 'K') return 8;
+    // the main thread's: run at exit after the guest's __cxa_finalize (NBS exit.c leaves __cxa_thread_finalize to the host's exit), reverse order: 'n' then 'm'
+    if (__cxa_thread_atexit_impl(record, (void *)'m', &__dso_handle) != 0) return 6;
+    if (__cxa_thread_atexit_impl(record, (void *)'n', &__dso_handle) != 0) return 6;
+    return 0;
+}
+
 // 0 when a thread of an explicit attr ran and joined with its answer; else which step failed (1..5): main then returns that instead of MAIN_STATUS.
 static int thread_round_trip(void) {
     pthread_attr_t attr;
@@ -47,6 +83,7 @@ __attribute__((used, noinline)) uintptr_t fx_join_one(uintptr_t arg) {
 
 int main(void) {
     int failed = thread_round_trip();
+    if (!failed) failed = thread_dtors();
     return failed ? failed : MAIN_STATUS;
 }
 

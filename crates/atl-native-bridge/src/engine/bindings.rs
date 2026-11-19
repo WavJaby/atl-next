@@ -215,6 +215,9 @@ fn shim(name: &str) -> Option<usize> {
         n if super::intercepts::by_handle_fn(n).is_some() => super::intercepts::by_handle_fn(n)?,
         // Q7-7 / bridge-keydtor: both engines (`Engine::end_call`)
         "pthread_exit" => super::intercepts::pthread_exit as *const () as usize,
+        "native_bridge___cxa_thread_atexit_impl" => {
+            super::intercepts::cxa_thread_atexit_impl as *const () as usize
+        }
         // net-bp: both engines (build.rs `SHIMS`)
         "getaddrinfo" => super::netdb::getaddrinfo as *const () as usize,
         "freeaddrinfo" => super::netdb::freeaddrinfo as *const () as usize,

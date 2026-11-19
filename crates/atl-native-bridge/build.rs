@@ -204,6 +204,8 @@ const SHIMS: &[&str] = &[
     "pthread_gettid_np",
     // intercepts.rs: ends the start routine's guest call (`Engine::end_call`)
     "pthread_exit",
+    // intercepts.rs: the guest destructor wrapped for glibc's thread-exit list, as NBS cxa_trampolines.cc wraps it for the host's
+    "native_bridge___cxa_thread_atexit_impl",
     // intercepts.rs `BY_HANDLE`: the handle mapped, then glibc's function
     "pthread_getcpuclockid",
     "pthread_getname_np",
@@ -841,6 +843,8 @@ const ILP32_SHIMS: &[&str] = &[
     "pthread_detach",
     "pthread_gettid_np",
     "pthread_exit",
+    // intercepts.rs: a guest function and its argument, both lane values, kept as words; the dso handle unused
+    "native_bridge___cxa_thread_atexit_impl",
     // intercepts.rs `BY_HANDLE`: the handle mapped, the rest lane values or pointers to ints, chars and `sched_param` (one int on both)
     "pthread_getcpuclockid",
     "pthread_getname_np",
@@ -1097,10 +1101,13 @@ fn libc_lp64_entries(
     let dns_unbound = selected_breaks()?.contains(&"atl_nb_dns_unbound");
     let herr_trap = selected_breaks()?.contains(&"atl_nb_dns_herr_trap");
     let exit_unbound = selected_breaks()?.contains(&"atl_nb_main_exit_unbound");
+    let tls_dtor_unbound = selected_breaks()?.contains(&"atl_nb_main_tls_dtor_unbound");
     Ok(names
         .iter()
         .map(|name| {
-            if dns_unbound && name == "getaddrinfo" {
+            if tls_dtor_unbound && name == "native_bridge___cxa_thread_atexit_impl" {
+                Err("unbound: no host side (break main_tls_dtor_unbound)")
+            } else if dns_unbound && name == "getaddrinfo" {
                 Err("unbound: no host side (break dns_unbound)")
             } else if herr_trap && name == "__get_h_errno" {
                 Err("unbound: no host side (break dns_herr_trap)")
@@ -1766,6 +1773,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("dns_herr_trap", "atl_nb_dns_herr_trap"),
     // P4b (build.rs `libc_prototype_name`, `libc_lp64_entries`): `native_bridge_exit` has no prototype on an ILP32 table and no host side on an LP64 one, so a guest main's exit traps naming it (qemu-linker gate, qemu_main `e`)
     ("main_exit_unbound", "atl_nb_main_exit_unbound"),
+    // build.rs `libc_lp64_entries`: `native_bridge___cxa_thread_atexit_impl` unbound, so a guest thread_local destructor's registration traps naming it (qemu-linker gate, qemu_main `e`/`d`)
+    ("main_tls_dtor_unbound", "atl_nb_main_tls_dtor_unbound"),
     // Q6-2 (engine/dispatch.rs `call_object`): x3 and x4 exchanged, so CallStaticIntMethod(2, 3) reaches the host as (3, 2) (qemu-jni gate, `c`)
     ("jni_swap", "atl_nb_jni_swap"),
     // Q6-7 (engine/va_list.rs `fp`): a guest va_list's fp arguments are read from its integer save area (qemu-jni gate, `V`)
