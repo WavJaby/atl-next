@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Down shells of the QEMU engine (host->guest, Q6-4), one generator interface with a backend per host ISA ([`backend`]): x86_64 SysV (`x86.rs`), riscv64 LP64D (`riscv64.rs`).
-//! A host call enters shell k of the pool, which jumps to the entry with k in a scratch register; the entry stores the host call's argument registers and eight caller stack words into an `atl_lanes` image on its own frame (the rest zeroed), calls `atl_nb_down_dispatch(k, lanes)` (atl-native-bridge engine/dispatch.rs), and returns lanes.ret[0] in the integer result register and lanes.fp[0] in the fp one.
+//! A host call enters shell k of the pool, which jumps to the entry with k in a scratch register; the entry stores the host call's argument registers and [`HOST_STACK_WORDS`] caller stack words into an `atl_lanes` image on its own frame (the rest zeroed), calls `atl_nb_down_dispatch(k, lanes)` (atl-native-bridge engine/dispatch.rs), and returns lanes.ret[0] in the integer result register and lanes.fp[0] in the fp one.
 //! What differs per host beyond the asm is [`HostAbi`]: how dispatch.rs reads the host image and shapes the answer. build.rs writes [`DownBackend::entries_asm`] (`down.s`, assembled by place.rs `global_asm!`) and [`pool_rust`] (`down_pool.rs`).
 
 /// Bytes of a down call's lanes (`atl_lanes`, atl_engine.h 4.0): regs[16] at 0, fp[16] at [`FP_AT`], stack[16] at [`STACK_AT`], ret[2] at [`RET_AT`]. The entry's frame holds one; atl-native-bridge asserts these against the struct ([`pool_rust`] carries them).
@@ -13,8 +13,8 @@ pub const STACK_AT: usize = 256;
 pub const RET_AT: usize = 384;
 /// Words per bank of the lanes (regs, fp, stack).
 pub const BANK_WORDS: usize = 16;
-/// Caller stack words a shell copies into the window: eight (the host convention's side of the image; a placement needing more is refused, R-1). Reading more would read further above the caller's frame.
-pub const HOST_STACK_WORDS: usize = 8;
+/// Caller stack words a shell copies into the window: the whole bank (the host convention's side of the image; a placement needing more is refused, R-1). Eight refused Candy Crush Saga's 15-integer JNI method (SysV: nine words); the copy reads at most 128 bytes above the return address, inside the caller's frames. The guest's own window (aarch64 8) bounds the call separately.
+pub const HOST_STACK_WORDS: usize = BANK_WORDS;
 
 /// The host calling convention's rules dispatch.rs applies to the lanes image a shell built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

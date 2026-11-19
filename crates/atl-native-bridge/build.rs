@@ -1805,7 +1805,7 @@ const BREAKS: &[(&str, &str)] = &[
     ("down_drop_stack", DOWN_DROP_CFG),
     // Q6-4 (down.rs `entries_asm`, `swap_v`): a down call's fp argument registers 0 and 1 are exchanged on entry (qemu-jni gate, checks m and x: the one fp argument moves to register 1)
     ("down_swap_v", DOWN_SWAP_CFG),
-    // Q6-4 (engine/dispatch.rs `down_params`): the first shorty parameter's class is flipped (qemu-jni gate, checks m, x and R: the 15-integer R-1 call then fits in eight stack words)
+    // Q6-4 (engine/dispatch.rs `down_params`): the first shorty parameter's class is flipped (qemu-jni gate, checks m, x and R: the 17-integer R-1 call then fits the guest's eight stack words)
     ("shorty_swap", "atl_nb_shorty_swap"),
     // Q6-4 (engine/dispatch.rs `down_body`): a down call's first argument stays the host's, not the guest env or vm (qemu-jni gate, checks o, m and x)
     ("down_noenv", "atl_nb_down_noenv"),

@@ -515,7 +515,7 @@ pub(in crate::engine) fn down_params(
                 .ok_or_else(|| format!("shorty parameter {:?}: no such type", c as char))?,
         );
     }
-    // break `shorty_swap` (qemu-jni gate, checks m, x and R): the first shorty parameter's class is flipped, so the host's argument reads the other bank; the 15-integer R-1 call then fits in eight stack words and is not refused
+    // break `shorty_swap` (qemu-jni gate, checks m, x and R): the first shorty parameter's class is flipped, so the host's argument reads the other bank; the 17-integer R-1 call then needs eight guest stack words, which fit, and is not refused
     #[cfg(atl_nb_shorty_swap)]
     if let Some(p) = params.get_mut(2) {
         *p = if p.is_int() {
@@ -709,14 +709,16 @@ fn host_ret32(ret: Class, r: [u64; 2]) -> Answer {
     Answer { x0, x1: 0, v0 }
 }
 
-/// Refuses a down call whose host arguments need more than eight stack words (R-1, Q6-4): the lane image cannot carry them. Named and counted: a shorty this size fails on every call, so the count says how often it was asked; the integer / fp argument counts size the call.
+/// Refuses a down call whose arguments need more stack words than one side's window (R-1, Q6-4): the host shell's `HOST_STACK_WORDS`, the guest's `stack_words` (aarch64 8). Named and counted: a shorty this size fails on every call, so the count says how often it was asked; the integer / fp argument counts size the call.
 fn refuse_down(target: usize, params: &[Class]) -> ! {
     static REFUSED: AtomicUsize = AtomicUsize::new(0);
     let n = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
     let ints = params.iter().filter(|c| c.is_int()).count();
     let fps = params.iter().filter(|c| c.is_fp()).count();
+    let guest = super::qemu::arch().rules().stack_words;
     unsupported(&format!(
-        "qemu crossing: refused down call to {target:#x} ({ints} integer, {fps} fp arguments): its arguments need more than eight stack words, the lane image holds eight (R-1, refusals: {n})"
+        "qemu crossing: refused down call to {target:#x} ({ints} integer, {fps} fp arguments): its arguments need more stack words than the lane image carries (host {}, guest {guest}; R-1, refusals: {n})",
+        HOST.stack_words
     ))
 }
 
@@ -745,7 +747,7 @@ mod place_tests {
         fp_to_int: false,
         extend_int_ret: false,
         nan_box_f32: false,
-        stack_words: 8,
+        stack_words: HOST.stack_words,
         word_bits: 64,
     };
     /// riscv64 LP64D (bridgegen riscv64.rs `DOWN`): eight integer registers, fp overflow to a free integer register, results shaped.
@@ -755,7 +757,7 @@ mod place_tests {
         fp_to_int: true,
         extend_int_ret: true,
         nan_box_f32: true,
-        stack_words: 8,
+        stack_words: HOST.stack_words,
         word_bits: 64,
     };
     /// An integer lane on two 64-bit sides: every int class places alike there.
@@ -935,11 +937,32 @@ mod place_tests {
         assert_eq!(guest, img(&[1, 2, 3, 4, 5, 6, 7], &[8], &[]));
     }
 
-    /// Fourteen integers need eight stack words on SysV (six registers): the image holds them. Fifteen need nine: refused (R-1).
+    /// Candy Crush Saga's JNI method (env, class + 13 integers, 2 doubles): 15 integers take nine SysV stack words past six registers, more than the shell's window held before (eight); seven AAPCS64 stack words past eight registers. Host stack word k lands in guest x(k+6) for k < 2, then guest stack word k-2.
     #[test]
-    fn nine_host_stack_words_are_refused() {
-        assert!(place(&[INT; 14], &AtlLanes::default(), SYSV, AAPCS64).is_some());
-        assert!(place(&[INT; 15], &AtlLanes::default(), SYSV, AAPCS64).is_none());
+    fn fifteen_integers_cross_by_the_host_stack() {
+        let host = img(
+            &[1, 2, 3, 4, 5, 6],
+            &[0xD1, 0xD2],
+            &[7, 8, 9, 10, 11, 12, 13, 14, 15],
+        );
+        let mut params = vec![INT; 15];
+        params.extend([Class::F64, Class::F64]);
+        let guest = place(&params, &host, SYSV, AAPCS64).expect("nine host stack words fit");
+        assert_eq!(
+            guest,
+            img(
+                &[1, 2, 3, 4, 5, 6, 7, 8],
+                &[0xD1, 0xD2],
+                &[9, 10, 11, 12, 13, 14, 15]
+            )
+        );
+    }
+
+    /// Sixteen integers need eight AAPCS64 stack words (eight registers): the aarch64 window holds them. Seventeen need nine: refused (R-1), though SysV's side (eleven words) fits the shell's sixteen.
+    #[test]
+    fn nine_guest_stack_words_are_refused() {
+        assert!(place(&[INT; 16], &AtlLanes::default(), SYSV, AAPCS64).is_some());
+        assert!(place(&[INT; 17], &AtlLanes::default(), SYSV, AAPCS64).is_none());
     }
 
     /// The shorty `DIDJ` (result double; int, double, long) under a JNI method: env and class first (pointers), then the three (jni.h: `jint` signed 32, `jlong` signed 64). JNI_OnLoad (no shorty) is `(JavaVM*, void*)`; a shorty without a method's env is refused.
@@ -976,7 +999,7 @@ mod aapcs32_tests {
         fp_to_int: false,
         extend_int_ret: false,
         nan_box_f32: false,
-        stack_words: 8,
+        stack_words: HOST.stack_words,
         word_bits: 64,
     };
     const I32: Class = Class::Int {

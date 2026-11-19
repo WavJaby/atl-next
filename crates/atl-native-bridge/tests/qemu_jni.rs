@@ -165,7 +165,7 @@ const REFUSE_VALIST: i64 = 2;
 const REFUSE_FORGED: i64 = 3;
 /// The R-1 case (`downstack`): not a fixture value; its child refuses a down call of `R1_INTS` integers before the guest runs it.
 const REFUSE_DOWN_STACK: i64 = 4;
-const R1_INTS: usize = 15;
+const R1_INTS: usize = 17;
 /// The refusal cases: name (`ATL_QJ_CASE`), the check letter, the value `qj_run` takes for it, and the words its named abort must carry.
 const CASES: &[(&str, char, i64, &str)] = &[
     ("reserved", 'r', REFUSE_RESERVED, "is reserved"),
@@ -180,7 +180,7 @@ const CASES: &[(&str, char, i64, &str)] = &[
         "downstack",
         'R',
         REFUSE_DOWN_STACK,
-        "more than eight stack words",
+        "more stack words than the lane image carries",
     ),
 ];
 
@@ -264,6 +264,8 @@ type MixFn =
     extern "C" fn(usize, usize, i32, f64, i64, i32, f64, i64, i32, f64, i64, i32, f64, i64) -> f64;
 type ScaleFn = extern "C" fn(usize, usize, f32, i32) -> f32;
 type R1Fn = extern "C" fn(
+    usize,
+    usize,
     usize,
     usize,
     usize,
@@ -588,13 +590,13 @@ fn started(r: Result<Guest, String>) -> u64 {
         set_method_shorty(method_shorty);
     }
     if refuse == REFUSE_DOWN_STACK {
-        // R-1 (Q6-4): 15 integers take six host registers and nine stack words, one more than the lane image holds: the shell refuses the call by name before the guest runs it
+        // R-1 (Q6-4): 17 integers take eight AAPCS64 registers and nine guest stack words, one more than the aarch64 engine's window (the host side, six registers and eleven words, fits its sixteen): the shell refuses the call by name before the guest runs it
         let mut shorty = vec![b'I'; R1_INTS + 1];
         shorty[0] = b'V';
         let entry = bind_down(x.on_load, bias, Down::Plain, Some(&shorty));
         // SAFETY: `entry` is a down shell with R1_INTS integer parameters (R1Fn); the shell refuses the call and the process aborts, so the guest never runs it
         let r1 = unsafe { std::mem::transmute::<usize, R1Fn>(entry) };
-        let _ = r1(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        let _ = r1(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17);
         println!("qemu-jni: FAIL refusal case {refuse} returned: the down call was not refused");
         return 1;
     }
