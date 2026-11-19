@@ -869,11 +869,11 @@ mod place_tests {
         assert_eq!(guest, img(&[1, 2, 3, 4, 5, 6, 7, 8], &[], &[9]));
     }
 
-    /// LP64D, seventeen doubles: the host holds them all in registers (8 fp + 8 int) plus one stack word; AAPCS64 needs nine stack words (8 in v) -> refused, never an out-of-bounds write.
+    /// LP64D, twenty-five doubles: the host holds sixteen in registers (8 fp + 8 int) and nine stack words; AAPCS64 needs seventeen stack words (8 in v), one past its sixteen -> refused, never an out-of-bounds write. Twenty-four fit both.
     #[test]
     fn lp64d_guest_stack_overflow_is_refused() {
-        assert!(place(&[Class::F64; 16], &AtlLanes::default(), LP64D, AAPCS64).is_some());
-        assert!(place(&[Class::F64; 17], &AtlLanes::default(), LP64D, AAPCS64).is_none());
+        assert!(place(&[Class::F64; 24], &AtlLanes::default(), LP64D, AAPCS64).is_some());
+        assert!(place(&[Class::F64; 25], &AtlLanes::default(), LP64D, AAPCS64).is_none());
     }
 
     /// LP64D results (psABI: widen by type to 32 bits, then sign-extend to 64; float NaN-boxed); SysV results pass unchanged.
