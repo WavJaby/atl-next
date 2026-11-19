@@ -94,11 +94,11 @@ mod tests {
         );
     }
 
-    /// SysV stores six integer registers: the other ten, fp 8..16, stack 8..16 and ret are zeroed = 10 + 8 + 8 + 2 words.
+    /// SysV stores six integer registers and the whole stack bank: the other ten registers, fp 8..16 and ret are zeroed = 10 + 8 + 2 words.
     #[test]
     fn zeroed_offsets_cover_the_unstored_words() {
         let z = zeroed_offsets(6);
-        assert_eq!(z.len(), 28);
+        assert_eq!(z.len(), 20);
         assert_eq!((z[0], *z.last().expect("ret[1]")), (48, RET_AT + 8));
     }
 
