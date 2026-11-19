@@ -41,13 +41,19 @@ fn stream(s: i32) -> Result<usize, BadStream> {
         .ok_or(BadStream(s))
 }
 
-/// AudioService.rescaleIndex(index, srcMin, srcMax, dstMin, dstMax):3362.
+/// AudioService.rescaleIndex(index, srcMin, srcMax, dstMin, dstMax):3362, in Java int semantics: every step wraps and `MIN / -1` is MIN (JLS 15.17.2). The range comes from an app's parcel
+/// (VolumeInfo.java:374-376 reads min / max / index unchecked; only the client-side Builder validates), so plain `-`, `*`, `/` would panic in a binder handler -- and a panic leaving libbinder_rs'
+/// `extern "C" fn on_transact` (native.rs, no catch_unwind) aborts the whole services process.
 fn rescale_span(index: i32, (smin, smax): (i32, i32), (dmin, dmax): (i32, i32)) -> i32 {
-    let (sr, dr) = (smax - smin, dmax - dmin);
+    let (sr, dr) = (smax.wrapping_sub(smin), dmax.wrapping_sub(dmin));
     if sr == 0 {
         return dmin;
     }
-    dmin + ((index - smin) * dr + sr / 2) / sr
+    let num = index
+        .wrapping_sub(smin)
+        .wrapping_mul(dr)
+        .wrapping_add(sr / 2);
+    dmin.wrapping_add(num.wrapping_div(sr))
 }
 
 /// A stream's [min, max] in tenths (VolumeStreamState.getMinIndex / getMaxIndex).
@@ -147,7 +153,8 @@ impl Volumes {
     pub fn set(&mut self, s: i32, index: i32) -> Result<Changes, BadStream> {
         let s = stream(s)?;
         let before = self.clone();
-        self.set_group(s, index * 10);
+        // setStreamVolume's `index * 10` on the caller's int: Java wraps
+        self.set_group(s, index.wrapping_mul(10));
         let muted = self.index[s] == 0;
         self.mute_group(s, muted);
         Ok(self.since(&before))
@@ -484,5 +491,34 @@ mod tests {
         let (c, d) = a.set(10003, STREAM_MUSIC, 2, 0).expect("valid stream");
         assert_eq!(c.volume.first(), Some(&(3, 5, 2)));
         assert_eq!(d, Dispatch::NoDevice);
+    }
+
+    /// Review-2 G1: an app's VolumeInfo `min=0 max=-1 index=2^30` (the parcel is read unchecked, VolumeInfo.java:374-376). Java: srcRange -1, dstRange 150 (MUSIC [0,150] tenths);
+    /// 2^30 * 150 = 75 * 2^31 = 2^31 mod 2^32 -> MIN; + (-1 / 2 = 0); MIN / -1 = MIN (JLS 15.17.2); 0 + MIN = MIN. setStreamVolumeInt's clamp then makes it 0. Used to panic (`/` overflow).
+    #[test]
+    fn a_hostile_volume_info_rescales_as_java_and_does_not_panic() {
+        assert_eq!(rescale_span(1 << 30, (0, -1), (0, 150)), i32::MIN);
+        let mut a = AppVolumes::default();
+        let device = Absolute {
+            stream: STREAM_MUSIC,
+            min: 0,
+            max: -1,
+        };
+        a.register(10001, device, 1 << 30).expect("valid stream");
+        assert_eq!(a.of(10001).volume(STREAM_MUSIC), Ok(0));
+        // back to the device: 15 steps = 150 tenths; srcRange 150, dstRange -1: (150 * -1 + 75) / 150 = -75 / 150 = 0 (truncation)
+        let (_, d) = a.set(10001, STREAM_MUSIC, 15, 0).expect("valid stream");
+        assert!(matches!(d, Dispatch::Changed { index: 0, .. }), "{d:?}");
+        // full-range device: dstRange MAX - MIN wraps to -1 as in Java; 150 * -1 + 75 = -75; -75 / 150 = 0; MIN + 0 = MIN
+        assert_eq!(rescale_span(150, (0, 150), (i32::MIN, i32::MAX)), i32::MIN);
+    }
+
+    /// setStreamVolume(MAX): Java's `index * 10` wraps: (2^31 - 1) * 10 = 5 * 2^32 - 10 -> -10, clamped to 0 -> muted. Used to panic under overflow checks.
+    #[test]
+    fn a_hostile_set_index_wraps_as_java() {
+        let mut v = Volumes::default();
+        v.set(STREAM_MUSIC, i32::MAX).expect("valid stream");
+        assert_eq!(v.volume(STREAM_MUSIC), Ok(0));
+        assert_eq!(v.is_muted(STREAM_MUSIC), Ok(true));
     }
 }
