@@ -102,7 +102,11 @@ impl Kind {
         match self {
             Kind::Widen { signed } => format!("widen:{}", if *signed { "s" } else { "u" }),
             Kind::Record(name) => format!("record:{name}"),
-            Kind::OutWord(Word::Int { guest, host, signed }) => {
+            Kind::OutWord(Word::Int {
+                guest,
+                host,
+                signed,
+            }) => {
                 format!("out-word:{}{guest}>{host}", if *signed { "s" } else { "u" })
             }
             Kind::OutWord(Word::Ptr) => "out-word:ptr".to_owned(),
@@ -292,7 +296,9 @@ fn pointee(gp: &Ty, hp: &Ty, result: bool, konst: bool, views: &Views) -> Result
     let data = if result { Kind::PtrResult } else { Kind::Ptr };
     Ok(match (gp.resolved(), hp.resolved()) {
         (Ty::Function(sig), Ty::Function(_)) => Kind::Callback(crate::jni::shorty(sig)?),
-        (Ty::Record { name } | Ty::Opaque { name, .. }, _) if JNI_RECORDS.contains(&name.as_str()) => {
+        (Ty::Record { name } | Ty::Opaque { name, .. }, _)
+            if JNI_RECORDS.contains(&name.as_str()) =>
+        {
             Kind::Jni
         }
         _ if untyped(gp, views.guest) && !matches!(gp.resolved(), Ty::Void)
@@ -308,7 +314,12 @@ fn pointee(gp: &Ty, hp: &Ty, result: bool, konst: bool, views: &Views) -> Result
         (Ty::Int { .. } | Ty::Pointer { .. }, Ty::Int { .. } | Ty::Pointer { .. }) if konst => {
             Kind::Array
         }
-        (&Ty::Int { bits: g, signed, .. }, &Ty::Int { bits: h, .. }) => Kind::OutWord(Word::Int {
+        (
+            &Ty::Int {
+                bits: g, signed, ..
+            },
+            &Ty::Int { bits: h, .. },
+        ) => Kind::OutWord(Word::Int {
             guest: (g / 8) as u8,
             host: (h / 8) as u8,
             signed,
@@ -316,6 +327,8 @@ fn pointee(gp: &Ty, hp: &Ty, result: bool, konst: bool, views: &Views) -> Result
         (Ty::Pointer { pointee: gi, .. }, Ty::Pointer { pointee: hi, .. }) => {
             out_pointer(gp, gi, hi, views)
         }
+        // a pointer in bionic, an integer in glibc (eglplatform.h `EGLNativeWindowType*`): the guest's word is a pointer, compared against itself
+        (Ty::Pointer { pointee: gi, .. }, Ty::Int { .. }) => out_pointer(gp, gi, gi, views),
         _ => bail!("unclassified ILP32 pointee: guest {gp:?} vs host {hp:?}"),
     })
 }
@@ -325,8 +338,11 @@ const JNI_RECORDS: &[&str] = &["_JNIEnv", "_JavaVM"];
 
 /// The kind of a non-const pointer to a pointer (`gp`, pointing to `gi` / `hi`): [`Word::Ptr`] when what it points to reads the same on both sides or is `void`; else the word the host writes names host memory the guest cannot read as it is -- a handle typedef, an incomplete record, a function, host records of the host's layout -- which is a host object the guest only names back ([`Kind::Opaque`], P4b s4's handles).
 fn out_pointer(gp: &Ty, gi: &Ty, hi: &Ty, views: &Views) -> Kind {
-    let readable = matches!(gi.resolved(), Ty::Void) || same(gi, views.guest, hi, views.host, false);
-    if handle(gp, views.handles).is_none() && readable {
+    let void = matches!(gi.resolved(), Ty::Void);
+    // an incomplete record or a function reads `same` by name: still a host object
+    let object = !void && untyped(gi, views.guest) || matches!(gi.resolved(), Ty::Function(_));
+    let readable = void || same(gi, views.guest, hi, views.host, false);
+    if handle(gp, views.handles).is_none() && !object && readable {
         Kind::OutWord(Word::Ptr)
     } else {
         Kind::Opaque
@@ -488,7 +504,12 @@ pub enum Op {
     /// A nested record by value whose layout differs: its own converter.
     Record(String),
     /// `len` elements converted one by one, each `guest` / `host` bytes apart.
-    Array { len: u64, elem: Box<Op>, guest: u64, host: u64 },
+    Array {
+        len: u64,
+        elem: Box<Op>,
+        guest: u64,
+        host: u64,
+    },
 }
 
 /// One field of a [`Conv`]: its offsets on both sides, its alignment on both sides (the view's, for the build-time check), and how it crosses.
@@ -537,13 +558,19 @@ fn conv_into(name: &str, views: &Views, out: &mut Vec<Conv>) -> Result<()> {
     );
     let mut fields = Vec::new();
     for (gf, hf) in g.fields.iter().zip(&h.fields) {
-        ensure!(gf.name == hf.name, "{name}: field {} vs {}", gf.name, hf.name);
+        ensure!(
+            gf.name == hf.name,
+            "{name}: field {} vs {}",
+            gf.name,
+            hf.name
+        );
         ensure!(
             gf.bits.is_none() && hf.bits.is_none(),
             "{name}.{}: a bit-field",
             gf.name
         );
-        let op = field_op(&gf.ty, &hf.ty, views, out).with_context(|| format!("{name}.{}", gf.name))?;
+        let op =
+            field_op(&gf.ty, &hf.ty, views, out).with_context(|| format!("{name}.{}", gf.name))?;
         fields.push(FieldConv {
             name: gf.name.clone(),
             guest_offset: gf.offset,
@@ -569,18 +596,39 @@ fn field_op(g: &Ty, h: &Ty, views: &Views, out: &mut Vec<Conv>) -> Result<Op> {
         return Ok(Op::Copy { bytes: gs });
     }
     Ok(match (g.resolved(), h.resolved()) {
-        (&Ty::Int { bits: gb, signed, .. }, &Ty::Int { bits: hb, .. }) => Op::Int {
+        (
+            &Ty::Int {
+                bits: gb, signed, ..
+            },
+            &Ty::Int { bits: hb, .. },
+        ) => Op::Int {
             guest: u64::from(gb / 8),
             host: u64::from(hb / 8),
             signed,
         },
         (
-            Ty::Pointer { pointee: gp, bits: gb, .. },
-            Ty::Pointer { pointee: hp, bits: hb, .. },
+            Ty::Pointer {
+                pointee: gp,
+                bits: gb,
+                ..
+            },
+            Ty::Pointer {
+                pointee: hp,
+                bits: hb,
+                ..
+            },
         ) => {
-            ensure!(!matches!(gp.resolved(), Ty::Function(_)), "a function pointer (a guest entry)");
-            let readable = untyped(gp, views.guest) || untyped(hp, views.host) || same(gp, views.guest, hp, views.host, false);
-            ensure!(readable, "a pointer to {gp:?}, whose layout differs (a deep copy)");
+            ensure!(
+                !matches!(gp.resolved(), Ty::Function(_)),
+                "a function pointer (a guest entry)"
+            );
+            let readable = untyped(gp, views.guest)
+                || untyped(hp, views.host)
+                || same(gp, views.guest, hp, views.host, false);
+            ensure!(
+                readable,
+                "a pointer to {gp:?}, whose layout differs (a deep copy)"
+            );
             Op::Ptr {
                 guest: u64::from(gb / 8),
                 host: u64::from(hb / 8),
@@ -590,12 +638,14 @@ fn field_op(g: &Ty, h: &Ty, views: &Views, out: &mut Vec<Conv>) -> Result<Op> {
             conv_into(name, views, out)?;
             Op::Record(name.clone())
         }
-        (Ty::Array { elem: ge, len: gl }, Ty::Array { elem: he, len: hl }) if gl == hl => Op::Array {
-            len: *gl,
-            elem: Box::new(field_op(ge, he, views, out)?),
-            guest: size_align(ge, views.guest)?.0,
-            host: size_align(he, views.host)?.0,
-        },
+        (Ty::Array { elem: ge, len: gl }, Ty::Array { elem: he, len: hl }) if gl == hl => {
+            Op::Array {
+                len: *gl,
+                elem: Box::new(field_op(ge, he, views, out)?),
+                guest: size_align(ge, views.guest)?.0,
+                host: size_align(he, views.host)?.0,
+            }
+        }
         _ => bail!("no field rule: guest {g:?} vs host {h:?}"),
     })
 }
@@ -604,9 +654,10 @@ fn field_op(g: &Ty, h: &Ty, views: &Views, out: &mut Vec<Conv>) -> Result<Op> {
 fn size_align(ty: &Ty, v: &ArchView) -> Result<(u64, u64)> {
     Ok(match ty.resolved() {
         Ty::Bool => (1, 1),
-        Ty::Int { bits, .. } | Ty::Float { bits } | Ty::Pointer { bits, .. } | Ty::Reference { bits, .. } => {
-            (u64::from(bits / 8), u64::from(bits / 8))
-        }
+        Ty::Int { bits, .. }
+        | Ty::Float { bits }
+        | Ty::Pointer { bits, .. }
+        | Ty::Reference { bits, .. } => (u64::from(bits / 8), u64::from(bits / 8)),
         Ty::Record { name } | Ty::Opaque { name, .. } => {
             let r = layout(v, name).with_context(|| format!("{name}: incomplete"))?;
             (r.size, r.align)
@@ -624,11 +675,23 @@ pub fn converters_rs(convs: &[Conv], swap: &str) -> String {
     fn op_rs(op: &Op) -> String {
         match op {
             Op::Copy { bytes } => format!("Op::Copy({bytes})"),
-            Op::Int { guest, host, signed } => format!("Op::Int {{ guest: {guest}, host: {host}, signed: {signed} }}"),
+            Op::Int {
+                guest,
+                host,
+                signed,
+            } => format!("Op::Int {{ guest: {guest}, host: {host}, signed: {signed} }}"),
             Op::Ptr { guest, host } => format!("Op::Ptr {{ guest: {guest}, host: {host} }}"),
             Op::Record(n) => format!("Op::Record(&C_{n})"),
-            Op::Array { len, elem, guest, host } => {
-                format!("Op::Array {{ len: {len}, elem: &{}, guest: {guest}, host: {host} }}", op_rs(elem))
+            Op::Array {
+                len,
+                elem,
+                guest,
+                host,
+            } => {
+                format!(
+                    "Op::Array {{ len: {len}, elem: &{}, guest: {guest}, host: {host} }}",
+                    op_rs(elem)
+                )
             }
         }
     }
@@ -642,7 +705,10 @@ pub fn converters_rs(convs: &[Conv], swap: &str) -> String {
         for (fi, f) in c.fields.iter().enumerate() {
             let guest_offset = if Some(ci) == swapped && fi < 2 {
                 let other = c.fields[1 - fi].guest_offset;
-                format!("if cfg!({swap}) {{ {other} }} else {{ {} }}", f.guest_offset)
+                format!(
+                    "if cfg!({swap}) {{ {other} }} else {{ {} }}",
+                    f.guest_offset
+                )
             } else {
                 f.guest_offset.to_string()
             };
@@ -699,6 +765,7 @@ int va_user(struct VaUser* u);\n\
 int use_object(jobject o);\n\
 int va_fn(const char* fmt, __builtin_va_list ap);\n\
 int out_display(EGLDisplay* out);\n\
+int out_asset(AAsset** out);\n\
 struct _JNIEnv { const void* functions; };\nint env_user(struct _JNIEnv* env);\n";
 
     /// Defined outside the interface (`Ty::Opaque` + `ArchView::foreign`). `union sigval`: bionic uapi asm-generic/siginfo.h `{ int sival_int; void* sival_ptr; }`. `struct sockaddr`: bionic linux/socket.h `{ sa_family_t sa_family; char sa_data[14]; }`, 16 bytes on both. `socklen_t`: bionic sys/types.h `__kernel_socklen_t` = int; glibc bits/types.h `__socklen_t` = unsigned int.
@@ -859,6 +926,8 @@ struct _jobject {};\ntypedef struct _jobject* jobject;\n\
         );
         // EGLDisplay*: a handle the host writes (P4b s4)
         assert_eq!(row(&i, "out_display").kinds[1], Kind::Opaque);
+        // AAsset**: an incomplete record the host hands out
+        assert_eq!(row(&i, "out_asset").kinds[1], Kind::Opaque);
         assert_eq!(row(&i, "env_user").kinds[1], Kind::Jni);
         assert_eq!(row(&i, "AAsset_name").kinds[0], Kind::String);
         assert_eq!(
@@ -884,7 +953,11 @@ struct _jobject {};\ntypedef struct _jobject* jobject;\n\
         assert_eq!(c.len(), 1);
         let c = &c[0];
         assert_eq!((c.guest_size, c.host_size), (44, 48));
-        let offs: Vec<(u64, u64)> = c.fields.iter().map(|f| (f.guest_offset, f.host_offset)).collect();
+        let offs: Vec<(u64, u64)> = c
+            .fields
+            .iter()
+            .map(|f| (f.guest_offset, f.host_offset))
+            .collect();
         assert_eq!(offs, [(0, 0), (4, 4), (8, 8), (12, 12), (16, 16), (20, 24)]);
         assert_eq!(c.fields[4].op, Op::Ptr { guest: 4, host: 8 });
         assert_eq!(c.fields[5].op, Op::Copy { bytes: 24 });
@@ -901,7 +974,10 @@ struct _jobject {};\ntypedef struct _jobject* jobject;\n\
         // a union has no field rule
         assert!(converters("sigval", &v).is_err());
         let rs = converters_rs(std::slice::from_ref(c), "swap_cfg");
-        assert!(rs.contains("guest_offset: if cfg!(swap_cfg) { 4 } else { 0 }"), "{rs}");
+        assert!(
+            rs.contains("guest_offset: if cfg!(swap_cfg) { 4 } else { 0 }"),
+            "{rs}"
+        );
     }
 
     /// Records another header defines compare by layout, never by name: `union sigval` is 4 bytes on arm (int / 4-byte pointer) and 8 on x86_64, so by value it is a record; `struct sockaddr` is 16 bytes in both, so a pointer to it is a plain data pointer.

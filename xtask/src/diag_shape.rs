@@ -43,6 +43,11 @@ const OTHER_SUBJECT: &[(&str, &str, &str)] = &[
         "refused a host pointer",
         "QEMU crossing ABI event (a host pointer a 32-bit guest word cannot hold), counted in ILP32_REFUSED; no Android API call",
     ),
+    (
+        "crates/atl-native-bridge/src/engine/ndk.rs",
+        "refused a host pointer",
+        "QEMU crossing ABI event (a converted out word or record field the 32-bit guest cannot hold), counted in ILP32_REFUSED; no Android API call",
+    ),
 ];
 
 pub fn check(root: &Path) -> Result<()> {

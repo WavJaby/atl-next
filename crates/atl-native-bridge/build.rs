@@ -1764,7 +1764,10 @@ fn bindings_table(
     }
     if !emitted.is_empty() {
         code.push_str("\nuse super::{Conv, Field, Op, Word};\n\n");
-        code.push_str(&atl_bridgegen::ilp32::converters_rs(&emitted, CONV_SWAP_CFG));
+        code.push_str(&atl_bridgegen::ilp32::converters_rs(
+            &emitted,
+            CONV_SWAP_CFG,
+        ));
     }
     // one copy: sles.rs asserts against the arm64 QEMU table's, the one every core has (the layout is the host view's, the same for every table); an ILP32 guest's SL rows trap until P6
     if qemu && equal_model {

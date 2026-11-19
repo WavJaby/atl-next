@@ -10,13 +10,22 @@ pub enum Op {
     /// the same bytes on both sides
     Copy(usize),
     /// an integer of `guest` / `host` bytes: widened by signedness to the host, truncated to the guest
-    Int { guest: usize, host: usize, signed: bool },
+    Int {
+        guest: usize,
+        host: usize,
+        signed: bool,
+    },
     /// a data pointer: zero-extended to the host, refused at or above 4 GiB to a 32-bit guest
     Ptr { guest: usize, host: usize },
     /// a nested record by value
     Record(&'static Conv),
     /// `len` elements, `guest` / `host` bytes apart
-    Array { len: usize, elem: &'static Op, guest: usize, host: usize },
+    Array {
+        len: usize,
+        elem: &'static Op,
+        guest: usize,
+        host: usize,
+    },
 }
 
 impl Op {
@@ -24,7 +33,10 @@ impl Op {
     pub const fn bytes(&self, guest: bool) -> usize {
         match *self {
             Op::Copy(n) => n,
-            Op::Int { guest: g, host: h, .. } | Op::Ptr { guest: g, host: h } => {
+            Op::Int {
+                guest: g, host: h, ..
+            }
+            | Op::Ptr { guest: g, host: h } => {
                 if guest {
                     g
                 } else {
@@ -38,7 +50,12 @@ impl Op {
                     c.host_size
                 }
             }
-            Op::Array { len, guest: g, host: h, .. } => len * if guest { g } else { h },
+            Op::Array {
+                len,
+                guest: g,
+                host: h,
+                ..
+            } => len * if guest { g } else { h },
         }
     }
 }
@@ -81,14 +98,22 @@ impl Conv {
             end = off + f.op.bytes(guest);
             i += 1;
         }
-        end <= if guest { self.guest_size } else { self.host_size }
+        end <= if guest {
+            self.guest_size
+        } else {
+            self.host_size
+        }
     }
 }
 
 /// The word behind an out-word pointer (atl_bridgegen `ilp32::Word`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Word {
-    Int { guest: usize, host: usize, signed: bool },
+    Int {
+        guest: usize,
+        host: usize,
+        signed: bool,
+    },
     Ptr,
 }
 
@@ -96,7 +121,15 @@ impl Word {
     /// As a field op of a 32-bit guest's word on a 64-bit host.
     const fn op(self) -> Op {
         match self {
-            Word::Int { guest, host, signed } => Op::Int { guest, host, signed },
+            Word::Int {
+                guest,
+                host,
+                signed,
+            } => Op::Int {
+                guest,
+                host,
+                signed,
+            },
             Word::Ptr => Op::Ptr { guest: 4, host: 8 },
         }
     }
@@ -136,15 +169,28 @@ unsafe fn op_to_host(op: &Op, g: *const u8, h: *mut u8) {
     unsafe {
         match *op {
             Op::Copy(n) => std::ptr::copy_nonoverlapping(g, h, n),
-            Op::Int { guest, host, signed } => {
+            Op::Int {
+                guest,
+                host,
+                signed,
+            } => {
                 let v = load(g, guest);
                 let shift = 64 - 8 * guest as u32;
-                let v = if signed { ((v << shift) as i64 >> shift) as u64 } else { v };
+                let v = if signed {
+                    ((v << shift) as i64 >> shift) as u64
+                } else {
+                    v
+                };
                 store(h, host, v);
             }
             Op::Ptr { guest, host } => store(h, host, load(g, guest)),
             Op::Record(c) => to_host(c, g, h),
-            Op::Array { len, elem, guest, host } => {
+            Op::Array {
+                len,
+                elem,
+                guest,
+                host,
+            } => {
                 for k in 0..len {
                     op_to_host(elem, g.add(k * guest), h.add(k * host));
                 }
@@ -179,7 +225,12 @@ unsafe fn op_to_guest(op: &Op, h: *const u8, g: *mut u8) -> bool {
                 fits
             }
             Op::Record(c) => to_guest(c, h, g),
-            Op::Array { len, elem, guest, host } => {
+            Op::Array {
+                len,
+                elem,
+                guest,
+                host,
+            } => {
                 let mut ok = true;
                 for k in 0..len {
                     ok &= op_to_guest(elem, h.add(k * host), g.add(k * guest));
@@ -292,7 +343,10 @@ mod tests {
     /// The arm table's generated converter is the hand layout above: the classifier and the data models agree.
     #[test]
     fn generated_window_buffer_is_the_data_model() {
-        assert_eq!(super::super::bindings::qemu_arm::C_ANativeWindow_Buffer, WINDOW_BUFFER);
+        assert_eq!(
+            super::super::bindings::qemu_arm::C_ANativeWindow_Buffer,
+            WINDOW_BUFFER
+        );
     }
 
     #[test]
@@ -341,12 +395,20 @@ mod tests {
     #[test]
     fn out_word_widens_by_signedness() {
         let g = (-2i32).to_le_bytes();
-        let signed = Word::Int { guest: 4, host: 8, signed: true };
+        let signed = Word::Int {
+            guest: 4,
+            host: 8,
+            signed: true,
+        };
         // SAFETY: `g` is one 4-byte word.
         let mut t = unsafe { word_in(signed, g.as_ptr() as usize) };
         // SAFETY: the temp holds 8.
         assert_eq!(unsafe { load(t.ptr(), 8) }, (-2i64) as u64);
-        let unsigned = Word::Int { guest: 4, host: 8, signed: false };
+        let unsigned = Word::Int {
+            guest: 4,
+            host: 8,
+            signed: false,
+        };
         // SAFETY: as above.
         let t2 = unsafe { word_in(unsigned, g.as_ptr() as usize) };
         assert_eq!(t2.0[0], 0xFFFF_FFFE);
