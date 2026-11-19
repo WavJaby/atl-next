@@ -400,11 +400,13 @@ fn va_list(ty: &Ty) -> bool {
     }
 }
 
-/// A pointee the host never looks into: `void` or an incomplete record.
+/// A pointee the host never looks into: `void`, an incomplete record, or a record without fields (a C++ tag class: jni.h `class _jobject {}` makes `jobject` a handle, not memory).
 fn untyped(ty: &Ty, v: &ArchView) -> bool {
     match ty.resolved() {
         Ty::Void => true,
-        Ty::Opaque { name, .. } => layout(v, name).is_none(),
+        Ty::Opaque { name, .. } | Ty::Record { name } => {
+            layout(v, name).is_none_or(|r| r.fields.is_empty())
+        }
         _ => false,
     }
 }
@@ -454,11 +456,13 @@ int sigqueue(int pid, int sig, const union sigval value);\n\
 int getnameinfo(const struct sockaddr* sa, socklen_t sa_len, char* host, size_t host_len, char* serv, size_t serv_len, int flags);\n\
 struct VaUser { int (*f)(void* p, __builtin_va_list ap); };\n\
 int va_user(struct VaUser* u);\n\
+int use_object(jobject o);\n\
 int va_fn(const char* fmt, __builtin_va_list ap);\n";
 
     /// Defined outside the interface (`Ty::Opaque` + `ArchView::foreign`). `union sigval`: bionic uapi asm-generic/siginfo.h `{ int sival_int; void* sival_ptr; }`. `struct sockaddr`: bionic linux/socket.h `{ sa_family_t sa_family; char sa_data[14]; }`, 16 bytes on both. `socklen_t`: bionic sys/types.h `__kernel_socklen_t` = int; glibc bits/types.h `__socklen_t` = unsigned int.
     const OTHER: &str = "union sigval { int sival_int; void* sival_ptr; };\n\
 struct sockaddr { unsigned short sa_family; char sa_data[14]; };\n\
+struct _jobject {};\ntypedef struct _jobject* jobject;\n\
 #if defined(__arm__)\ntypedef int socklen_t;\n#else\ntypedef unsigned int socklen_t;\n#endif\n";
 
     const HANDLES: &[&str] = &["EGLDisplay", "EGLImage", "EGLContext", "EGLClientBuffer"];
@@ -622,6 +626,8 @@ struct sockaddr { unsigned short sa_family; char sa_data[14]; };\n\
             Kind::Record("sigval".to_owned())
         );
         assert_eq!(row(&i, "getnameinfo").kinds[1], Kind::Ptr);
+        // a field-less tag record (jni.h `_jobject`, here C's empty struct) stays a handle
+        assert_eq!(row(&i, "use_object").kinds[1], Kind::Opaque);
     }
 
     /// A signedness-only difference at equal width is carried: `socklen_t` int32 (bionic arm) vs uint32 (glibc x86_64).
