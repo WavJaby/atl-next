@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use atl_aidl::aidl::android::content::pm::IPackageInstaller::{
-    BnPackageInstaller, IPackageInstaller,
+    BnPackageInstaller, EnforcePermission, IPackageInstaller,
 };
 use atl_aidl::mangled::_7_android_7_content_2_pm_25_IPackageInstallerCallback as IPackageInstallerCallback;
 use atl_parcelables::android::content::pm::{PackageInstaller_SessionInfo, ParceledListSlice};
@@ -47,6 +47,21 @@ fn no_sessions() -> Option<ParceledListSlice> {
 
 #[allow(non_snake_case, reason = "AOSP's AIDL method names")]
 impl IPackageInstaller for PackageInstaller {
+    /// @EnforcePermission: every permission the interface enforces (INSTALL_PACKAGES, TEST_INSTALL_PERMISSION, ...) is signature or privileged, held by no app here: root and system pass.
+    fn r#enforce_permission(
+        &self,
+        method: &str,
+        permission: EnforcePermission<'_>,
+    ) -> binder::Result<()> {
+        if permission::is_system_or_root(ThreadState::get_calling_uid()) {
+            return Ok(());
+        }
+        Err(Status::new_exception_str(
+            ExceptionCode::SECURITY,
+            Some(format!("{method}: caller lacks {permission:?}")),
+        ))
+    }
+
     /// PackageInstallerService.getSessionInfo:1324: null for an id with no session.
     fn r#getSessionInfo(&self, _session_id: i32) -> binder::Result<Option<PackageInstaller_SessionInfo>> {
         atl_diag::answered(INTERFACE, "getSessionInfo (no session)");
