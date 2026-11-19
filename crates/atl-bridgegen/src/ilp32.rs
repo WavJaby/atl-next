@@ -651,7 +651,7 @@ struct _jobject {};\ntypedef struct _jobject* jobject;\n\
         let i = views("valist", "aarch64-linux-android");
         assert_eq!(row(&i, "va_user").kinds[1], Kind::Same);
         let (g, h) = (&i.arches["guest"], &i.arches["host"]);
-        let views = Views {
+        let v = Views {
             guest: g,
             host: h,
             handles: HANDLES,
@@ -660,7 +660,7 @@ struct _jobject {};\ntypedef struct _jobject* jobject;\n\
             "va_fn",
             &g.functions["va_fn"],
             &h.functions["va_fn"],
-            &views,
+            &v,
             &mut BTreeSet::new(),
         )
         .unwrap_err();
