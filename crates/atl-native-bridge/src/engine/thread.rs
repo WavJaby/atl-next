@@ -83,7 +83,7 @@ struct Abi {
 macro_rules! abi {
     ($m:ident) => {{
         use layout::$m::{
-            NativeBridgeStaticTlsConfig as c, __pthread_cleanup_t as cl, bionic_tls as t,
+            __pthread_cleanup_t as cl, NativeBridgeStaticTlsConfig as c, bionic_tls as t,
             pthread_internal_t as r,
         };
         const _: () = {
