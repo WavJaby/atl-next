@@ -215,7 +215,10 @@ const MEDIAPLAYER_START: &str = "MediaPlayerNative: start called in state 1";
 /// zen: Main.zen: Do Not Disturb off (ZenModeHelper.getZenMode:396 ZEN_MODE_OFF) -> NotificationManager.zenModeToInterruptionFilter -> INTERRUPTION_FILTER_ALL (1).
 /// receiver: Main.receiverInfo: ComputerEngine.getReceiverInfo:3810 answers the declared `<receiver>` (exported="false" in the manifest) and null for an undeclared class, which
 /// ApplicationPackageManager.getReceiverInfo turns into NameNotFoundException. A service without the method answers null for both: `own=threw NameNotFoundException`.
-const SERVICE_LINES: [(&str, &str, Option<&str>); 12] = [
+/// installer: Main.installerSessions: IPackageManagerBase.getPackageInstaller:599 answers the installer service; with no session PackageInstallerService.getMySessions:1374 and getAllSessions:1354
+/// are empty and getSessionInfo:1324 null. A service without getPackageInstaller answers null, and PackageInstaller's first call throws NullPointerException.
+const SERVICE_LINES: [(&str, &str, Option<&str>); 13] = [
+    ("package", "AtlTest: installer: ", Some("my=0 all=0 info=null")),
     (
         "package",
         "AtlTest: receiver: ",

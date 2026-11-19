@@ -78,6 +78,8 @@ mod notification_display;
 #[cfg(feature = "converter")]
 pub mod package;
 #[cfg(feature = "converter")]
+mod package_installer;
+#[cfg(feature = "converter")]
 pub mod packages;
 #[cfg(feature = "converter")]
 pub mod pending_intent;

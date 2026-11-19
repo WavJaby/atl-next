@@ -472,6 +472,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "user: " + userProfile());
         Log.i("AtlTest", "zen: " + zen());
         Log.i("AtlTest", "receiver: " + receiverInfo());
+        Log.i("AtlTest", "installer: " + installerSessions());
         Log.i("AtlTest", "appops: " + appOps());
         Log.i("AtlTest", "jobscheduler: " + jobs());
         Log.i("AtlTest", "queryservices: " + queryServices());
@@ -1157,6 +1158,16 @@ public class Main extends Activity {
             missing = t.getClass().getSimpleName();
         }
         return "own=" + own + " missing=" + missing;
+    }
+
+    /** PackageManager.getPackageInstaller's session queries with no install session on the device: getMySessions and getAllSessions empty, getSessionInfo(1) null. */
+    private String installerSessions() {
+        try {
+            android.content.pm.PackageInstaller pi = getPackageManager().getPackageInstaller();
+            return "my=" + pi.getMySessions().size() + " all=" + pi.getAllSessions().size() + " info=" + pi.getSessionInfo(1);
+        } catch (Throwable t) {
+            return "threw " + t.getClass().getSimpleName();
+        }
     }
 
     /** NotificationManager.getCurrentInterruptionFilter: Do Not Disturb off (getZenMode ZEN_MODE_OFF) -> INTERRUPTION_FILTER_ALL (1). */

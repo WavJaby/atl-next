@@ -9,6 +9,7 @@ use std::io::Write;
 use std::sync::Arc;
 
 use atl_aidl::aidl::android::content::pm::IOnChecksumsReadyListener::IOnChecksumsReadyListener;
+use atl_aidl::aidl::android::content::pm::IPackageInstaller::IPackageInstaller;
 use atl_aidl::aidl::android::content::pm::IPackageManager::{EnforcePermission, IPackageManager};
 use atl_parcelables::android::content::pm::{
     ActivityInfo, ApplicationInfo, FeatureInfo, InstallSourceInfo, InstrumentationInfo,
@@ -418,6 +419,8 @@ pub struct PackageManager {
     features: Features,
     /// `ro.opengles.version` at start (major << 16 | minor; 0 unset): getSystemAvailableFeatures' last entry
     gl_es_version: i32,
+    /// PackageManagerService.mInstallerService: getPackageInstaller's one answer (package_installer.rs)
+    installer: binder::Strong<dyn IPackageInstaller>,
 }
 
 impl PackageManager {
@@ -428,6 +431,7 @@ impl PackageManager {
         gl_es_version: i32,
     ) -> Self {
         PackageManager {
+            installer: crate::package_installer::new(Arc::clone(&packages)),
             packages,
             permissions,
             features,
@@ -606,6 +610,11 @@ impl IPackageManager for PackageManager {
         Ok(self
             .visible(Some(&c.package), user)
             .and_then(|p| find_activity_info(p, &self.packages, &c.class, flags)))
+    }
+
+    /// IPackageManagerBase.getPackageInstaller:599: mInstallerService, for every caller (instant apps aside, which do not exist here).
+    fn r#getPackageInstaller(&self) -> binder::Result<Option<binder::Strong<dyn IPackageInstaller>>> {
+        Ok(Some(self.installer.clone()))
     }
 
     /// ComputerEngine.getReceiverInfo:3810: as getActivityInfo over the package's `<receiver>`s: null for an unknown user, package or class, or a disabled receiver without

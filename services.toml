@@ -105,6 +105,7 @@ mirrors = [
 [package]
 src = [
     "crates/atl-services/src/package.rs",
+    "crates/atl-services/src/package_installer.rs",
     "crates/atl-services/src/packages.rs",
     "crates/atl-services/src/install.rs",
     "crates/atl-services-types/src/packages.rs",
@@ -120,6 +121,13 @@ mirrors = [
     "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#getPackageInfo",
     "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#getServiceInfo",
     "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#getReceiverInfo",
+    "frameworks/base/services/core/java/com/android/server/pm/IPackageManagerBase.java#getPackageInstaller",
+    "frameworks/base/services/core/java/com/android/server/pm/PackageInstallerService.java#getSessionInfo",
+    "frameworks/base/services/core/java/com/android/server/pm/PackageInstallerService.java#getStagedSessions",
+    "frameworks/base/services/core/java/com/android/server/pm/PackageInstallerService.java#getAllSessions",
+    "frameworks/base/services/core/java/com/android/server/pm/PackageInstallerService.java#getMySessions",
+    "frameworks/base/services/core/java/com/android/server/pm/PackageInstallerService.java#registerCallback",
+    "frameworks/base/services/core/java/com/android/server/pm/PackageInstallerService.java#unregisterCallback",
     "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#getPackagesForUid",
     "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#checkSignatures",
     "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#getInstrumentationInfoAsUser",
