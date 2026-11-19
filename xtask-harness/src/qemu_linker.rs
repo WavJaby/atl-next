@@ -64,7 +64,7 @@ const HARNESSES: [Harness; 4] = [
     Harness {
         test: "qemu_main",
         prefix: "qemu-main",
-        checks: &['s', 'c', 'n', 'e', 'v', 'd', 'r'],
+        checks: &['s', 'c', 'n', 'e', 'v', 'd', 'l', 'r'],
         breaks: &[
             "main_exit_unbound",
             "main_tls_dtor_unbound",
