@@ -258,6 +258,8 @@ static DSO_ANCHOR: u8 = 0;
 
 /// `int native_bridge___cxa_thread_atexit_impl(void (*)(void*), void*, void*)` (NBS guest libc `__cxa_thread_atexit_impl.cpp` hands its `WrappedFn` here; the guest wrapper pins the guest DSO itself): appends to this thread's guest list ([`THREAD_DTORS`]), which bionic's pthread_exit runs first ([`exit_work`]); on the thread's first entry, [`run_thread_dtors`] goes on the host's thread-exit list (`__cxa_thread_atexit_impl`, under this library's DSO handle) for the threads that end without exit_work: host threads that attached, and the main thread, whose entries run in the host `exit` after the guest's `__cxa_finalize` (the deviation NBS exit.c documents).
 pub(super) extern "C" fn cxa_thread_atexit_impl(dtor: usize, obj: usize, _dso: usize) -> i32 {
+    // first: the list's own Rust destructor registers here, before the glibc entry below, so glibc (reverse order) runs that entry while the list still lives
+    THREAD_DTORS.with(|v| v.borrow_mut().push(ThreadDtor { dtor, obj }));
     if !DTORS_HOOKED.with(Cell::get) {
         // SAFETY: `run_thread_dtors` ignores its argument; DSO_ANCHOR lies in this library.
         let rc = unsafe {
@@ -268,11 +270,11 @@ pub(super) extern "C" fn cxa_thread_atexit_impl(dtor: usize, obj: usize, _dso: u
             )
         };
         if rc != 0 {
+            THREAD_DTORS.with(|v| v.borrow_mut().pop());
             return rc;
         }
         DTORS_HOOKED.with(|h| h.set(true));
     }
-    THREAD_DTORS.with(|v| v.borrow_mut().push(ThreadDtor { dtor, obj }));
     0
 }
 
