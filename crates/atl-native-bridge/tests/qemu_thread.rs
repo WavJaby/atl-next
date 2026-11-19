@@ -289,7 +289,7 @@ fn started(r: Result<Guest, String>) -> u64 {
 const CHURN: usize = 2_000;
 /// Threads before (c)'s baseline: glibc's stack cache and QEMU's first-use allocations settle in them.
 const CHURN_WARMUP: usize = 200;
-/// Largest growth per joined thread check (c) accepts, of glibc's in-use heap (`mallinfo2().uordblks`) and of `VmRSS`, in bytes. Measured with the teardown complete: heap 0 net, rounds of 3000 threads within +-331 B/thread, resident within +-624 B/thread; the smallest per-thread leak seen, the ARM CPU's cpreg lists, was 5.8 KB/thread (the whole ARM finalizer leak 31.8 KB). 2 KiB = 3x the noise and under half that leak.
+/// Largest growth per joined thread check (c) accepts, of glibc's in-use heap (`mallinfo2().uordblks`) and of `VmRSS`, in bytes. Measured with the teardown complete: heap 0 net over 9000 threads, one window up to 529 B/thread (a ~1 MB transient), resident up to 624 B/thread; the smallest per-thread leak seen, the ARM CPU's cpreg lists, was 5.8 KB/thread (the whole ARM finalizer leak 31.8 KB). 2 KiB = 3x the noise and under half that leak.
 const CHURN_BOUND: i128 = 2048;
 
 /// glibc's in-use heap bytes, all arenas (`mallinfo2().uordblks`; struct mallinfo2, malloc.h: ten size_t fields, uordblks the eighth).
