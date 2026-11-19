@@ -236,13 +236,15 @@ const PROXY_SHIMS: &[&str] = &[
     "android_getaddrinfofornetwork",
 ];
 /// Callback typedefs whose guest function pointer a lane-mapped row hands the host as a down shell (`Entry::Mapped`, engine/ndk.rs `call_mapped`; GS2.2 callback-param, tr-first blocker 5). Reviewed: every argument the host passes the callback is a value, the guest's own user data, or a host buffer the guest only loads from or stores to (QEMU's page table holds no host heap, so a host buffer must never reach a guest syscall or be fetched as code). A function-pointer parameter of another type traps `pending` (`atl_bridgegen::jni::route`); a name here no row uses is stale.
-/// Not here, with why: `AMediaDataSourceReadAt` (its buffer is host memory the guest writes: needs the G2 copy arena), `GLDEBUGPROC*` (its message is host memory: G2 staging), `AChoreographer_vsyncCallback` (`AChoreographerFrameCallbackData*`, a host record the guest reads).
+/// Not here, with why: `AMediaDataSourceReadAt` (its buffer is host memory the guest writes: needs the G2 copy arena), `GLDEBUGPROC*` (its message is host memory: G2 staging).
 const CALLBACKS: &[&str] = &[
     // looper.h `int (*)(int fd, int events, void* data)`
     "ALooper_callbackFunc",
     // choreographer.h `void (*)(long frameTimeNanos, void* data)`, `void (*)(int64_t frameTimeNanos, void* data)`, `void (*)(int64_t vsyncPeriodNanos, void* data)`
     "AChoreographer_frameCallback",
     "AChoreographer_frameCallback64",
+    // choreographer.h `void (*)(const AChoreographerFrameCallbackData*, void* data)`: the data is opaque in the NDK (declared, never defined) -- the guest only hands it back to the AChoreographerFrameCallbackData_* rows, which are host rows, so the host pointer crosses unchanged (LP64: same width). Lifetime: a host stack object of libgui Choreographer::dispatchCallbacks, valid only during the callback; AOSP's accessors abort outside it (AChoreographer.cpp "Data is only valid in callback"), so no bridge-side lifetime is kept. ILP32 guests: the pointer needs a handle (P4b s4), the classifier traps those rows
+    "AChoreographer_vsyncCallback",
     "AChoreographer_refreshRateCallback",
     // NdkMediaDataSource.h `ssize_t (*)(void* userdata)`, `void (*)(void* userdata)`
     "AMediaDataSourceGetSize",
