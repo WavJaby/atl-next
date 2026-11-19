@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! Guest-main gate (phase4-32bit P4b), harness-less: the real guest linker starts `main_exe.c` (PIE on the stub libc); the host calls its `fx_run`, which does what bionic's `__libc_init` does after the start, `exit(main())`. main creates a thread of an explicit attr, joins it, then a thread that registers thread-exit destructors (`__cxa_thread_atexit_impl`, what a C++ `thread_local` compiles to), a key value and a cleanup handler and ends in `pthread_exit`, then one that pops a handler with execute and returns, registers two on the main thread, and returns. The guest's exit runs its `__cxa_finalize`, then NBS's `native_bridge_exit` stub, bound to the host's `exit`: this process ends there, and an `on_exit` handler reports.
 //! Env (xtask qemu_linker.rs sets it; unset prints SKIP): ATL_NB_ARCH, ATL_ENGINE_SO, ATL_NB_BOOT, ATL_NB_MAINEXE, ATL_NB_LINKER, ATL_NB_VDSO.
-//! Expected values come from main_exe.c, never from the engine: main returns `MAIN_STATUS` 0x2a when the thread round trip held, else the failing step 1..5 (6..9: the workers' exit work; 8 = not "BACK" at the pthread_exit worker's join, 9 = not "DEK" at the returning worker's; break `exit_skip_cleanup` = 8).
-//! Checks: (s) started, (c) thread churn before main (tests/common/churn.rs: 2000 `fx_join_one` threads give back every reserve block, heap and resident growth <= 2048 B/thread), (n) the resolver round (`fx_dns`: getaddrinfo walk + free, getnameinfo, gethostbyname/addr, gai_strerror, every field in the guest's own layout) answers 0 twice and leaves the engine's window count where it was ([`resolver`]), (e) the guest's exit reached the host's (the handler ran), (v) the status is 0x2a, (d) `fx_events` at the host's exit is [`EVENTS`] (each destructor and cleanup handler once; bionic pthread_exit.cpp order: thread_local destructors in reverse, then cleanup handlers, then key destructors), (r) no host pointer refused to a 32-bit guest (`ILP32_REFUSED` = 0). Output `qemu-main: (x) ok` / `(x) FAIL <why>`; the process exits 0 when all pass.
+//! Expected values come from main_exe.c, never from the engine: main returns `MAIN_STATUS` 0x2a when the thread round trip held, else the failing step 1..5 (6..9: the workers' exit work; 8 = not "BACK" at the pthread_exit worker's join, 9 = not "DEK" at the returning worker's; break `exit_skip_cleanup` = 8; 11 = not "FG" from the worker whose key destructor registers a thread-exit destructor late, which bionic leaks; 10 = a thread created detached whose `pthread_getattr_np` does not report PTHREAD_CREATE_DETACHED).
+//! Checks: (s) started, (c) thread churn before main (tests/common/churn.rs: 2000 `fx_join_one` threads give back every reserve block, heap and resident growth <= 2048 B/thread), (n) the resolver round (`fx_dns`: getaddrinfo walk + free, getnameinfo, gethostbyname/addr, gai_strerror, every field in the guest's own layout) answers 0 twice and leaves the engine's window count where it was ([`resolver`]), (e) the guest's exit reached the host's (the handler ran), (v) the status is 0x2a, (d) `fx_events` at the host's exit is [`EVENTS`] (each destructor and cleanup handler once; bionic pthread_exit.cpp order: thread_local destructors in reverse, then cleanup handlers, then key destructors), (l) the late registration (a key destructor's, after the thread-exit list ran) answered 0 without aborting and was counted once, (r) no host pointer refused to a 32-bit guest (`ILP32_REFUSED` = 0). Output `qemu-main: (x) ok` / `(x) FAIL <why>`; the process exits 0 when all pass.
 //! A guest call to a trapped stub (break `main_exit_unbound`: no host side for `native_bridge_exit`; break `main_tls_dtor_unbound`: none for `native_bridge___cxa_thread_atexit_impl`) aborts naming it, so (e) never prints.
 #![allow(clippy::print_stdout, reason = "test harness output is its verdict")]
 #![allow(
@@ -37,7 +37,9 @@ static DNS_OK: AtomicBool = AtomicBool::new(false);
 /// The guest address of main_exe.c `fx_events` (symbol + load bias), set before fx_run; read by the exit handler.
 static EVENTS_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// main_exe.c's thread-exit record at the host's exit: the pthread_exit worker's "BACK" and the returning worker's "DEK" (main checked both, status 8 / 9 otherwise), then the main thread's two destructors in reverse registration, once each: "nm".
-const EVENTS: &[u8] = b"BACKDEKnm";
+const EVENTS: &[u8] = b"BACKDEKFGnm";
+/// The atl-diag key of a thread-exit destructor registered after the thread's list was finalized (main_exe.c `late_dtor`: one, leaked as bionic leaks it; intercepts.rs `cxa_thread_atexit_impl`).
+const LATE_KEY: (&str, &str) = (atl_diag::ANSWERED, "native-bridge.thread-exit-after-finalize");
 /// Check (c)'s result, read by the exit handler.
 static CHURN_OK: AtomicBool = AtomicBool::new(false);
 
@@ -91,6 +93,20 @@ extern "C" fn at_exit(status: i32, _: *mut c_void) {
                 "thread-exit destructors ran {:?}, expected {:?}",
                 String::from_utf8_lossy(events),
                 String::from_utf8_lossy(EVENTS)
+            ))
+        },
+    );
+    let late = atl_diag::counts()
+        .into_iter()
+        .find(|(o, a, _)| (o.as_str(), a.as_str()) == LATE_KEY)
+        .map_or(0, |(_, _, n)| n);
+    ok &= check(
+        'l',
+        if late == 1 {
+            Ok(())
+        } else {
+            Err(format!(
+                "{late} late thread-exit registrations counted, expected 1 (main_exe.c late_dtor)"
             ))
         },
     );

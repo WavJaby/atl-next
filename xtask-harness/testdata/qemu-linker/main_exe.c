@@ -2,6 +2,7 @@
 // Main executable of the guest-main gate (xtask `test qemu-linker`, harness qemu_main): a PIE on the guest's stub libc. The host calls fx_run, which ends the way bionic's __libc_init ends a process: exit(main(...)).
 // Guest exit runs the guest's __cxa_finalize, then NBS's native_bridge_exit stub, whose host side is the host's exit: the harness reads the status there.
 #include <pthread.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdlib.h>
 
@@ -52,7 +53,51 @@ static void *return_worker(void *arg) {
     return 0;
 }
 
-// 0 when the workers' exit work ran exactly once each in bionic's order ("BACK" then "DEK"), and the main thread's two are registered; else the step (6..9).
+static pthread_key_t late_key;
+
+// A key destructor that records its value, then registers a thread-exit destructor 'L': bionic pthread_exit.cpp ran __cxa_thread_finalize before pthread_key_clean_all, so 'L' is never run (leaked) and the registration answers 0. The engine must not abort here (its thread-exit list is already destroyed at this point).
+static void late_dtor(void *value) {
+    record(value);
+    __cxa_thread_atexit_impl(record, (void *)'L', &__dso_handle);
+}
+
+// Thread-exit destructor 'F', then a late_key value 'G': 'F' at exit, then 'G' from the key destructor, never 'L'.
+static void *late_worker(void *arg) {
+    (void)arg;
+    if (__cxa_thread_atexit_impl(record, (void *)'F', &__dso_handle) != 0) return (void *)1;
+    pthread_setspecific(late_key, (void *)'G');
+    return 0;
+}
+
+// detached_worker's verdict: 0 pending, 1 its pthread_getattr_np reported PTHREAD_CREATE_DETACHED, 2 anything else.
+static int detached_seen;
+
+// bionic pthread_getattr_np ORs PTHREAD_ATTR_FLAG_DETACHED from the thread's join state.
+static void *detached_worker(void *arg) {
+    (void)arg;
+    pthread_attr_t attr;
+    int state = -1;
+    int rc = pthread_getattr_np(pthread_self(), &attr);
+    if (rc == 0) {
+        pthread_attr_getdetachstate(&attr, &state);
+        pthread_attr_destroy(&attr);
+    }
+    __atomic_store_n(&detached_seen, rc == 0 && state == PTHREAD_CREATE_DETACHED ? 1 : 2, __ATOMIC_RELEASE);
+    return 0;
+}
+
+// 0 when a thread created detached reads itself as detached; else 10.
+static int detached_state(void) {
+    pthread_attr_t attr;
+    pthread_t t;
+    if (pthread_attr_init(&attr) != 0 || pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) != 0) return 10;
+    if (pthread_create(&t, &attr, detached_worker, 0) != 0) return 10;
+    pthread_attr_destroy(&attr);
+    while (__atomic_load_n(&detached_seen, __ATOMIC_ACQUIRE) == 0) sched_yield();
+    return detached_seen == 1 ? 0 : 10;
+}
+
+// 0 when the workers' exit work ran exactly once each in bionic's order ("BACK", "DEK", then "FG" with 'L' leaked), and the main thread's two are registered; else the step (6..9, 11).
 static int thread_dtors(void) {
     pthread_t t;
     void *answer = (void *)1;
@@ -62,6 +107,9 @@ static int thread_dtors(void) {
     answer = (void *)1;
     if (pthread_create(&t, 0, return_worker, 0) != 0 || pthread_join(t, &answer) != 0 || answer != 0) return 7;
     if (n_events != 7 || fx_events[4] != 'D' || fx_events[5] != 'E' || fx_events[6] != 'K') return 9;
+    if (pthread_key_create(&late_key, late_dtor) != 0) return 6;
+    if (pthread_create(&t, 0, late_worker, 0) != 0 || pthread_join(t, 0) != 0) return 7;
+    if (n_events != 9 || fx_events[7] != 'F' || fx_events[8] != 'G') return 11;
     // the main thread's: run at exit after the guest's __cxa_finalize (NBS exit.c leaves __cxa_thread_finalize to the host's exit), reverse order: 'n' then 'm'
     if (__cxa_thread_atexit_impl(record, (void *)'m', &__dso_handle) != 0) return 6;
     if (__cxa_thread_atexit_impl(record, (void *)'n', &__dso_handle) != 0) return 6;
@@ -112,6 +160,7 @@ __attribute__((used, noinline)) long fx_dns(void) {
 int main(void) {
     int failed = thread_round_trip();
     if (!failed) failed = thread_dtors();
+    if (!failed) failed = detached_state();
     return failed ? failed : MAIN_STATUS;
 }
 
