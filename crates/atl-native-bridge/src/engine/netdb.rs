@@ -326,17 +326,18 @@ fn node_len(v: View, addr: &[u8], name: &[u8]) -> usize {
 }
 
 /// Writes the guest copy of glibc node `h` at `p` in view `v` (pieces as [`node_len`]); `ai_next` left 0 (fresh window memory is zeroed). Answers the byte after it.
+/// `ai_flags` is `flags`, the guest's request flags in bionic's values: bionic's getaddrinfo.c `get_ai` copies the request into every result node, and glibc's node holds its own values of the request's flags (glibc AI_NUMERICSERV 0x400 is bionic's AI_ADDRCONFIG).
 ///
 /// # Safety
 /// `p` is window memory holding [`node_len`] writable bytes for `h`'s parts; `h` as [`node_parts`].
-unsafe fn write_node(v: View, h: &libc::addrinfo, p: *mut u8) -> *mut u8 {
+unsafe fn write_node(v: View, h: &libc::addrinfo, flags: c_int, p: *mut u8) -> *mut u8 {
     // SAFETY: caller contract.
     let (addr, name) = unsafe { node_parts(h) };
     // SAFETY: `p` holds the node, then the sockaddr, then the name (node_len); int fields at offsets asserted equal in both views, pointers at the view's.
     unsafe {
         p.add(g::addrinfo::ai_flags)
             .cast::<c_int>()
-            .write_unaligned(h.ai_flags);
+            .write_unaligned(flags);
         p.add(g::addrinfo::ai_family)
             .cast::<c_int>()
             .write_unaligned(h.ai_family);
@@ -367,7 +368,7 @@ unsafe fn write_node(v: View, h: &libc::addrinfo, p: *mut u8) -> *mut u8 {
 ///
 /// # Safety
 /// `host` is a non-empty glibc getaddrinfo list.
-unsafe fn guest_list(host: *const libc::addrinfo) -> Option<usize> {
+unsafe fn guest_list(host: *const libc::addrinfo, flags: c_int) -> Option<usize> {
     let v = view();
     let mut len = 0;
     let mut h = host;
@@ -389,7 +390,7 @@ unsafe fn guest_list(host: *const libc::addrinfo) -> Option<usize> {
         }
         prev = p;
         // SAFETY: `p` has this node's bytes left of the block sized above.
-        p = unsafe { write_node(v, &*h, p) };
+        p = unsafe { write_node(v, &*h, flags, p) };
         // SAFETY: glibc's list.
         h = unsafe { (*h).ai_next };
     }
@@ -449,7 +450,7 @@ pub(super) extern "C" fn getaddrinfo(
         return lookup_error(rc, guest_flags, node.is_null() && service.is_null());
     }
     // SAFETY: glibc's list of a successful call: non-empty.
-    let head = unsafe { guest_list(host_res) };
+    let head = unsafe { guest_list(host_res, guest_flags) };
     // SAFETY: glibc's own list, freed once.
     unsafe { libc::freeaddrinfo(host_res) };
     let Some(head) = head else {
