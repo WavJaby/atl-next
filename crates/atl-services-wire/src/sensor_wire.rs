@@ -195,6 +195,15 @@ pub fn read_string8(data: &BorrowedParcel<'_>) -> Result<String, StatusCode> {
     let Ok(len) = usize::try_from(len) else {
         return Ok(String::new());
     };
+    // readString8Inplace -> readInplace(len + 1): a length past the data is refused before it sizes an allocation (the length is the app's)
+    let left = usize::try_from(
+        data.get_data_size()
+            .saturating_sub(data.get_data_position()),
+    )
+    .unwrap_or(0);
+    if len >= left {
+        return Err(StatusCode::BAD_VALUE);
+    }
     let mut bytes = Vec::with_capacity(len + 4);
     for _ in 0..(len + 1).div_ceil(4) {
         let w: i32 = data.read()?;
@@ -376,5 +385,15 @@ mod tests {
         assert_eq!(p.get_data_size(), 16);
         p.set_data_position_checked(0).unwrap();
         assert_eq!(read_string8(&p.borrowed_ref()).unwrap(), "atl.tilt");
+    }
+
+    /// Review-2 G1 sweep: a length of INT32_MAX - 1 with one word of data left is refused, not used as a ~2 GiB capacity.
+    #[test]
+    fn a_hostile_string8_length_is_refused() {
+        let mut p = binder::binder_impl::Parcel::new();
+        p.borrowed().write(&(i32::MAX - 1)).unwrap();
+        p.borrowed().write(&0i32).unwrap();
+        p.set_data_position_checked(0).unwrap();
+        assert_eq!(read_string8(&p.borrowed_ref()), Err(StatusCode::BAD_VALUE));
     }
 }

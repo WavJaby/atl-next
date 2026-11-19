@@ -16,33 +16,29 @@ fn axis(bits: i32, size: i32, offset: i32, start: i32, end: i32) -> i32 {
     const BEFORE: i32 = AXIS_SPECIFIED | AXIS_PULL_BEFORE;
     const AFTER: i32 = AXIS_SPECIFIED | AXIS_PULL_AFTER;
     match bits & (AXIS_SPECIFIED | AXIS_PULL_BEFORE | AXIS_PULL_AFTER) {
-        BEFORE => start + offset,
-        AFTER => end - size - offset,
+        BEFORE => start.wrapping_add(offset),
+        AFTER => end.wrapping_sub(size).wrapping_sub(offset),
         // 0 and AXIS_SPECIFIED alone (CENTER_*): centred, the offset added (Gravity.apply's case 0 / AXIS_SPECIFIED)
-        _ => start + (end - start - size) / 2 + offset,
+        _ => start
+            .wrapping_add(end.wrapping_sub(start).wrapping_sub(size) / 2)
+            .wrapping_add(offset),
     }
 }
 
 /// Gravity.apply(gravity, w, h, container, x, y) -> (left, top, right, bottom). A non-positive size (MATCH_PARENT's -1, or not measured) fills that axis.
+/// All of this module's arithmetic is Java int arithmetic (wrapping): x / y / sizes / insets are the app's LayoutParams, and an overflow panic in a binder handler aborts the services process.
 pub fn gravity_frame(
     gravity: i32,
     (w, h): (i32, i32),
     (x, y): (i32, i32),
     (left, top, right, bottom): (i32, i32, i32, i32),
 ) -> (i32, i32, i32, i32) {
-    let w = if w > 0 {
-        w.min(right - left)
-    } else {
-        right - left
-    };
-    let h = if h > 0 {
-        h.min(bottom - top)
-    } else {
-        bottom - top
-    };
+    let (pw, ph) = (right.wrapping_sub(left), bottom.wrapping_sub(top));
+    let w = if w > 0 { w.min(pw) } else { pw };
+    let h = if h > 0 { h.min(ph) } else { ph };
     let l = axis((gravity >> AXIS_X_SHIFT) & 0xf, w, x, left, right);
     let t = axis((gravity >> AXIS_Y_SHIFT) & 0xf, h, y, top, bottom);
-    (l, t, l + w, t + h)
+    (l, t, l.wrapping_add(w), t.wrapping_add(h))
 }
 
 /// Gravity.DISPLAY_CLIP_VERTICAL / DISPLAY_CLIP_HORIZONTAL (Gravity.java:111, :118): clip to the display instead of moving into it.
@@ -55,18 +51,18 @@ fn fit_axis(clip: bool, (lo, hi): (i32, i32), (start, end): (i32, i32)) -> (i32,
         return (lo.max(start), hi.min(end));
     }
     let off = if lo < start {
-        start - lo
+        start.wrapping_sub(lo)
     } else if hi > end {
-        end - hi
+        end.wrapping_sub(hi)
     } else {
         0
     };
     if off == 0 {
         (lo, hi)
-    } else if hi - lo > end - start {
+    } else if hi.wrapping_sub(lo) > end.wrapping_sub(start) {
         (start, end)
     } else {
-        (lo + off, hi + off)
+        (lo.wrapping_add(off), hi.wrapping_add(off))
     }
 }
 
@@ -107,8 +103,8 @@ fn window_length(attr: i32, requested: i32, parent: i32) -> i32 {
 /// Gravity.applyDisplay): a popup near the bottom stays inside the Task. A MATCH_PARENT window fills the Task.
 pub fn frame(p: &Placement, parent: (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
     let size = (
-        window_length(p.size.0, p.requested.0, parent.2 - parent.0),
-        window_length(p.size.1, p.requested.1, parent.3 - parent.1),
+        window_length(p.size.0, p.requested.0, parent.2.wrapping_sub(parent.0)),
+        window_length(p.size.1, p.requested.1, parent.3.wrapping_sub(parent.1)),
     );
     let placed = gravity_frame(p.gravity, size, (p.x, p.y), parent);
     if p.r#type != TYPE_BASE_APPLICATION && p.flags & FLAG_LAYOUT_NO_LIMITS == 0 {
@@ -121,7 +117,10 @@ pub fn frame(p: &Placement, parent: (i32, i32, i32, i32)) -> (i32, i32, i32, i32
 /// Where a window's layer goes in its Task: the frame's origin less the surface insets (WindowState.transformFrameToSurfacePosition, WindowState.java:5190-5218: the surface
 /// extends past the frame by surfaceInsets, e.g. a dialog's shadow, so its top-left sits that far up and left of the frame).
 pub fn surface_origin(p: &Placement, (left, top): (i32, i32)) -> (i32, i32) {
-    (left - p.surface_inset.0, top - p.surface_inset.1)
+    (
+        left.wrapping_sub(p.surface_inset.0),
+        top.wrapping_sub(p.surface_inset.1),
+    )
 }
 
 #[cfg(test)]
@@ -252,5 +251,24 @@ mod tests {
         );
         // unmeasured: fills the parent
         assert_eq!(gravity_frame(0x51, (-1, -1), (0, 0), parent), parent);
+    }
+
+    /// Review-2 G1 sweep: hostile LayoutParams x / y wrap as Java's int arithmetic, no panic. LEFT|TOP with x = y = MAX: left = 0 + MAX, right = MAX + 10 = MIN + 9 (mod 2^32).
+    /// applyDisplay with lo = MIN, hi = MIN + 10 in [0, 100): off = 0 - MIN = MIN (wraps); hi - lo = 10 <= 100 -> (MIN + MIN, MIN + 10 + MIN) = (0, 10).
+    #[test]
+    fn hostile_offsets_wrap_as_java() {
+        let parent = (0, 0, 100, 100);
+        assert_eq!(
+            gravity_frame(0x33, (10, 10), (i32::MAX, i32::MAX), parent),
+            (i32::MAX, i32::MAX, i32::MIN + 9, i32::MIN + 9)
+        );
+        assert_eq!(
+            fit_axis(false, (i32::MIN, i32::MIN + 10), (0, 100)),
+            (0, 10)
+        );
+        assert_eq!(
+            gravity_frame(0x55, (10, 10), (i32::MIN, i32::MIN), parent),
+            (i32::MIN + 90, i32::MIN + 90, i32::MIN + 100, i32::MIN + 100)
+        );
     }
 }

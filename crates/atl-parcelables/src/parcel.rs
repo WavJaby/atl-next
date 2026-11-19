@@ -67,6 +67,12 @@ pub fn r_str8(p: &In<'_>) -> Result<Option<String>> {
         return Ok(None);
     }
     let len = usize::try_from(len).map_err(|_| StatusCode::BAD_VALUE)?;
+    // Parcel::readString8Inplace -> readInplace(len + 1): a length past the data is refused before anything is read; the length is the sender's, so it never sizes an allocation unchecked
+    let left =
+        usize::try_from(p.get_data_size().saturating_sub(p.get_data_position())).unwrap_or(0);
+    if len >= left {
+        return Err(StatusCode::BAD_VALUE);
+    }
     let mut bytes = Vec::with_capacity((len + 1).div_ceil(4) * 4);
     for _ in 0..(len + 1).div_ceil(4) {
         bytes.extend_from_slice(&r_i32(p)?.to_ne_bytes());
@@ -240,5 +246,29 @@ pub fn r_class(p: &In<'_>, class: &str, what: &'static str) -> Result<Option<()>
         None => Ok(None),
         Some(c) if c == class => Ok(Some(())),
         Some(_) => Err(crate::refuse(what)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use binder::binder_impl::Parcel;
+
+    /// Review-2 G1 sweep: a String8 length past the parcel's data (INT32_MAX - 1, one word follows) is refused before it sizes an allocation (readString8Inplace -> readInplace(len + 1)
+    /// fails); a real one still reads.
+    #[test]
+    fn a_hostile_string8_length_is_refused() {
+        let mut parcel = Parcel::new();
+        let mut p = parcel.borrowed();
+        w_i32(&mut p, i32::MAX - 1).expect("write");
+        w_i32(&mut p, 0).expect("write");
+        p.set_data_position_checked(0).expect("rewind");
+        assert_eq!(r_str8(&p), Err(StatusCode::BAD_VALUE));
+
+        let mut parcel = Parcel::new();
+        let mut p = parcel.borrowed();
+        w_str8(&mut p, &Some("abc".to_owned())).expect("write");
+        p.set_data_position_checked(0).expect("rewind");
+        assert_eq!(r_str8(&p), Ok(Some("abc".to_owned())));
     }
 }

@@ -137,8 +137,8 @@ impl RegisteredAgent {
         if let Err(e) = agent.dim_layer(
             layer_id,
             amount,
-            bounds.right - bounds.left,
-            bounds.bottom - bounds.top,
+            bounds.right.wrapping_sub(bounds.left),
+            bounds.bottom.wrapping_sub(bounds.top),
         ) {
             atl_diag::answered(
                 WINDOW_SESSION,
@@ -469,8 +469,8 @@ fn show_rect(r: &Rect) -> String {
         "{},{} {}x{}",
         r.left,
         r.top,
-        r.right - r.left,
-        r.bottom - r.top
+        r.right.wrapping_sub(r.left),
+        r.bottom.wrapping_sub(r.top)
     )
 }
 
@@ -691,8 +691,8 @@ impl IWindowSession for Session {
                 record.title,
                 frame.left,
                 frame.top,
-                frame.right - frame.left,
-                frame.bottom - frame.top,
+                frame.right.wrapping_sub(frame.left),
+                frame.bottom.wrapping_sub(frame.top),
                 origin.0,
                 origin.1
             ));

@@ -88,7 +88,11 @@ impl Part for SurfaceControl_Transaction {
         let mut objects = Vec::with_capacity(offsets.len());
         for &o in &offsets {
             p.set_data_position_checked(i32::try_from(o).map_err(|_| refuse(JAVA))?)?;
-            let ty = u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+            // `o < end` alone leaves o + 3 unchecked: the type word must lie inside the frame
+            let Some(&[a, b, c, d]) = data.get(o..end).and_then(|w| w.get(..4)) else {
+                return Err(refuse(JAVA));
+            };
+            let ty = u32::from_le_bytes([a, b, c, d]);
             let object = if ty == BINDER_TYPE_FD {
                 let fd: ParcelFileDescriptor = p.read()?;
                 TransactionObject::Fd(Arc::new(fd.into()))
