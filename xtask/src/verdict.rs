@@ -90,6 +90,12 @@ impl Verdict<'_> {
     }
 }
 
+/// A progress line, printed as a long command enters a step: `step: <label>` on stderr (stdout's last line stays the verdict line), `label` without spaces (`land:3/8:build`, `check:12/29:clippy`).
+/// atl-job (scripts/.agent common `log::step`) shows the newest one in `status` as `step=<label>`, with ninja's `[n/m]` appended when that is newer: keep the shape.
+pub fn step(label: &str) {
+    eprintln!("step: {label}");
+}
+
 /// The verdict of a gate that prints its own check lines: `fails` are its failure messages, the first one is quoted.
 pub fn gate(cmd: &str, fails: &[String]) -> String {
     Verdict {

@@ -528,6 +528,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         });
     }
     let mut all_fails: Vec<Failure> = Vec::new();
+    let runs = cases.len();
     for Case {
         label,
         apk,
@@ -662,15 +663,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         all_fails.extend(fails.into_iter().map(|f| Failure::step(label, f)));
     }
     let failed = !all_fails.is_empty();
-    if failed {
-        let verdict = Verdict {
-            cmd: "instrument",
-            total: None,
-            skipped: Vec::new(),
-            failures: all_fails,
-        };
-        println!("{}", verdict.line());
-    }
+    // printed on pass too: check's gate step reads `instrument: ok|FAILED` (check_gates::verdict_line); the per-run `<label> pass` lines do not match it
+    // the count only on pass: failures are per finding, not per run, so "N of <runs>" would mix units
+    let verdict = Verdict {
+        cmd: "instrument",
+        total: (!failed).then_some((runs, "runs")),
+        skipped: Vec::new(),
+        failures: all_fails,
+    };
+    println!("{}", verdict.line());
     Ok(if failed {
         ExitCode::FAILURE
     } else {

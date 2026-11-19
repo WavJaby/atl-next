@@ -424,7 +424,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let mut skipped = Vec::new();
     let mut failures = Vec::new();
     let mut times = Timings::default();
-    for step in &steps {
+    for (i, step) in steps.iter().enumerate() {
+        crate::verdict::step(&format!("check:{}/{}:{}", i + 1, steps.len(), step.name()));
         eprintln!("== check: {}", step.name());
         let mut started = Instant::now();
         let mut wait = Duration::ZERO;

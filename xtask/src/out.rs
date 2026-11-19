@@ -1353,99 +1353,105 @@ pub fn run(root: &Path, cmd: &Out) -> Result<ExitCode> {
             execute,
             ..
         } => {
-            let rows = match crate::ws_config::load(&ws)
-                .and_then(|cfg| crate::disk_floor::pool_metadata(&ws, &cfg))
-            {
-                Ok(rows) => rows,
-                Err(e) => {
-                    println!("pool metadata: {e:#}");
-                    Vec::new()
-                }
-            };
-            for (line, _) in &rows {
-                println!("{line}");
-            }
-            let (mut dirs, mut old) = orphans(&ws, &live)?;
-            let counts = if rows.iter().any(|(_, short)| *short) {
-                println!(
-                    "out prune: pool metadata short: candidates ranked most paths first (a copy's metadata scales with its paths)"
-                );
-                rank_by_paths(&mut dirs, &mut old)?
-            } else {
-                BTreeMap::new()
-            };
-            let mut failed = 0;
-            for (id, path) in &dirs {
-                if !*execute {
-                    println!(
-                        "orphan ws/{id}: {} (checkout gone){}",
-                        path.display(),
-                        paths_note(&counts, path)
-                    );
-                    continue;
-                }
-                match build_pool::try_lock_dir(&ws, id)? {
-                    None => println!("orphan ws/{id}: busy, skipped: a process holds it"),
-                    Some(_lock) => match remove_build_dir(path) {
-                        Ok(()) => println!("orphan ws/{id}: removed"),
-                        Err(e) => {
-                            failed += 1;
-                            println!("orphan ws/{id}: FAILED: {e:#}");
-                        }
-                    },
-                }
-            }
-            let family = family_orphans(&ws, &live)?;
-            for (name, path) in &family {
-                if !*execute {
-                    println!("orphan {name}: {} (checkout gone)", path.display());
-                    continue;
-                }
-                let gone = crate::out_tasks::held_inside(path).and_then(|holder| match holder {
-                    Some(pid) => Ok(Some(pid)),
-                    None => std::fs::remove_dir_all(path)
-                        .with_context(|| format!("removing {}", path.display()))
-                        .map(|()| None),
-                });
-                match gone {
-                    Ok(None) => println!("orphan {name}: removed"),
-                    Ok(Some(pid)) => println!("orphan {name}: busy, skipped: pid {pid} holds it"),
-                    Err(e) => {
-                        failed += 1;
-                        println!("orphan {name}: FAILED: {e:#}");
-                    }
-                }
-            }
-            for path in &old {
-                if !*execute {
-                    println!("old base {}{}", path.display(), paths_note(&counts, path));
-                    continue;
-                }
-                match std::fs::remove_dir_all(path) {
-                    Ok(()) => println!("old base {}: removed", path.display()),
-                    Err(e) => {
-                        failed += 1;
-                        println!("old base {}: FAILED: {e}", path.display());
-                    }
-                }
-            }
-            let verb = if *execute {
-                "removed"
-            } else {
-                "dry run, would remove (add --execute)"
-            };
-            println!(
-                "out prune: {verb} {} orphan build dir(s), {} orphan driver probe dir(s) and {} old base(s)",
-                dirs.len(),
-                family.len(),
-                old.len()
-            );
-            if failed > 0 {
+            if prune_dirs(&ws, &live, *execute)? > 0 {
                 return Ok(ExitCode::FAILURE);
             }
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `out prune` without a flag: build dirs and driver probe dirs whose checkout is not in `live`, and bases beyond the keep rule; lists them, `execute` removes them. Returns how many removals failed (a busy dir is skipped, not failed).
+/// Also `land`'s cleanup child, after the landed worktree is gone (all of this is under the owner's standing approval).
+pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<usize> {
+    let rows = match crate::ws_config::load(ws)
+        .and_then(|cfg| crate::disk_floor::pool_metadata(ws, &cfg))
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            println!("pool metadata: {e:#}");
+            Vec::new()
+        }
+    };
+    for (line, _) in &rows {
+        println!("{line}");
+    }
+    let (mut dirs, mut old) = orphans(ws, live)?;
+    let counts = if rows.iter().any(|(_, short)| *short) {
+        println!(
+            "out prune: pool metadata short: candidates ranked most paths first (a copy's metadata scales with its paths)"
+        );
+        rank_by_paths(&mut dirs, &mut old)?
+    } else {
+        BTreeMap::new()
+    };
+    let mut failed = 0;
+    for (id, path) in &dirs {
+        if !execute {
+            println!(
+                "orphan ws/{id}: {} (checkout gone){}",
+                path.display(),
+                paths_note(&counts, path)
+            );
+            continue;
+        }
+        match build_pool::try_lock_dir(ws, id)? {
+            None => println!("orphan ws/{id}: busy, skipped: a process holds it"),
+            Some(_lock) => match remove_build_dir(path) {
+                Ok(()) => println!("orphan ws/{id}: removed"),
+                Err(e) => {
+                    failed += 1;
+                    println!("orphan ws/{id}: FAILED: {e:#}");
+                }
+            },
+        }
+    }
+    let family = family_orphans(ws, live)?;
+    for (name, path) in &family {
+        if !execute {
+            println!("orphan {name}: {} (checkout gone)", path.display());
+            continue;
+        }
+        let gone = crate::out_tasks::held_inside(path).and_then(|holder| match holder {
+            Some(pid) => Ok(Some(pid)),
+            None => std::fs::remove_dir_all(path)
+                .with_context(|| format!("removing {}", path.display()))
+                .map(|()| None),
+        });
+        match gone {
+            Ok(None) => println!("orphan {name}: removed"),
+            Ok(Some(pid)) => println!("orphan {name}: busy, skipped: pid {pid} holds it"),
+            Err(e) => {
+                failed += 1;
+                println!("orphan {name}: FAILED: {e:#}");
+            }
+        }
+    }
+    for path in &old {
+        if !execute {
+            println!("old base {}{}", path.display(), paths_note(&counts, path));
+            continue;
+        }
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => println!("old base {}: removed", path.display()),
+            Err(e) => {
+                failed += 1;
+                println!("old base {}: FAILED: {e}", path.display());
+            }
+        }
+    }
+    let verb = if execute {
+        "removed"
+    } else {
+        "dry run, would remove (add --execute)"
+    };
+    println!(
+        "out prune: {verb} {} orphan build dir(s), {} orphan driver probe dir(s) and {} old base(s)",
+        dirs.len(),
+        family.len(),
+        old.len()
+    );
+    Ok(failed)
 }
 
 #[cfg(test)]

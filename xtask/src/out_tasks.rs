@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! `cargo xtask out prune --tasks`: the task dirs `<workspace>/out/<task>/` (task = a worktree or branch name; a task's run outputs, data roots and logs) whose task is retired.
-//! Every top-level entry of `out/` gets one class. Keep: a name in [`KEEP`] (pool, shared tools, locks), never removable. Live: the name is a checkout id ([`out::live_ids_of`]: worktree with its checkout dir present), a local or remote branch not merged into [`MAIN_REF`], or a process has its cwd, an open fd or a mapped file inside it. Orphan: a dir whose name is a known task id (any branch, a pool build dir or a driver-family checkout dir of that name) and which is not live: listed with its size, removed by `--execute`. Unknown: everything else (loose files, symlinks, dirs naming no task id, names that are not plain UTF-8): listed, never removed.
-//! A deletion tool removes only what it can prove belongs to a retired task: a dir whose branch was deleted and that no build dir names is unknown, not orphan.
+//! Every top-level entry of `out/` gets one class. Keep: a name in [`KEEP`] (pool, shared tools, locks), never removable. Live: the name is a checkout id ([`out::live_ids_of`]: worktree with its checkout dir present), a local or remote branch not merged into [`MAIN_REF`], or a process has its cwd, an open fd or a mapped file inside it. Orphan: a dir whose name is a known task id (any branch, a pool build dir, a driver-family checkout dir or a landed task in [`RETIRED`] of that name) and which is not live: listed with its size, removed by `--execute`. Unknown: everything else (loose files, symlinks, dirs naming no task id, names that are not plain UTF-8): listed, never removed.
+//! A deletion tool removes only what it can prove belongs to a retired task: a dir whose branch was deleted and that no build dir and no [`RETIRED`] line names is unknown, not orphan.
 //! The process probe reads `/proc/<pid>/{cwd,fd/*,maps}` of the caller's uid only (other users' processes cannot hold this user's `out/`); a same-uid process whose entries cannot be read makes `--execute` refuse. `--execute` repeats the probe right before each removal.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -20,6 +20,10 @@ use crate::out_prune;
 
 /// Top-level `out/` entries that are no task's: never listed as removable. Explicit names only, never a pattern: an entry not here is judged as a task dir or left unknown.
 pub const KEEP: [(&str, &str); 16] = [
+    (
+        "land-seq",
+        "land-seq.sh (host scripts/.agent/runtime) logs: the last laptop prune",
+    ),
     (
         "pool",
         "build dirs and bases (out.rs POOL): `out prune` owns them",
@@ -51,10 +55,6 @@ pub const KEEP: [(&str, &str); 16] = [
     (
         "agent-tools-target",
         "cargo target of the host agent tools (atl-job, atl-*)",
-    ),
-    (
-        "land-seq.sh",
-        "land sequence wrapper the parent runs through atl-job",
     ),
     ("land-flow-test", "agent tool dir"),
     ("udev-fix", "agent tool dir"),
@@ -192,13 +192,84 @@ fn names(dir: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Task-id evidence on disk: pool build dir ids and driver-family checkout dir names.
-pub fn known_ids(ws: &Path) -> BTreeSet<String> {
+/// Landed tasks, workspace-relative: one line per land, `<name> <commit> <unix-seconds>` (space-separated: a branch name holds no space; commit = origin/main after the push); blank lines and `#` lines skipped.
+/// `land`'s cleanup appends ([`record_retired`]) before it deletes the branch; [`known_ids`] reads the names, so a dir named after a landed task stays provably a task's once its branch is gone.
+/// Per machine like workspace.toml, never in the repo: it records what landed from this workspace.
+pub const RETIRED: &str = "retired-tasks";
+
+/// One [`RETIRED`] line.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Retired {
+    pub name: String,
+    pub commit: String,
+    pub secs: u64,
+}
+
+/// Appends `name` landed at `commit` now to `<ws>/retired-tasks` (made when missing).
+pub fn record_retired(ws: &Path, name: &str, commit: &str) -> Result<()> {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("clock before 1970")?
+        .as_secs();
+    let line = format!("{name} {commit} {secs}\n");
+    // the line must read back: a name or commit this parser refuses would poison every later `--tasks` run
+    parse_retired(&line).with_context(|| format!("refusing to record {line:?}"))?;
+    let path = ws.join(RETIRED);
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    std::io::Write::write_all(&mut file, line.as_bytes())
+        .with_context(|| format!("appending to {}", path.display()))
+}
+
+/// The [`RETIRED`] lines of `text`; a malformed line is an error naming its number (the file is machine-written: a bad line is damage, not data).
+pub fn parse_retired(text: &str) -> Result<Vec<Retired>> {
+    let mut rows = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let row = match line.split(' ').collect::<Vec<_>>()[..] {
+            [name, commit, secs]
+                if !name.is_empty()
+                    && !name.chars().any(char::is_control)
+                    // sha1 or sha256 object names
+                    && matches!(commit.len(), 40 | 64)
+                    && commit.chars().all(|c| c.is_ascii_hexdigit()) =>
+            {
+                secs.parse().ok().map(|secs| Retired {
+                    name: name.to_owned(),
+                    commit: commit.to_owned(),
+                    secs,
+                })
+            }
+            _ => None,
+        };
+        rows.push(row.with_context(|| {
+            format!(
+                "{RETIRED} line {}: {line:?} is not `<name> <commit> <unix-seconds>`",
+                n + 1
+            )
+        })?);
+    }
+    Ok(rows)
+}
+
+/// Task-id evidence on disk: pool build dir ids, driver-family checkout dir names and landed task names ([`RETIRED`]; missing file: none).
+pub fn known_ids(ws: &Path) -> Result<BTreeSet<String>> {
     let mut known: BTreeSet<String> = names(&out::pool(ws).join("ws")).into_iter().collect();
     for family in out::FAMILIES {
         known.extend(names(&ws.join("out").join(family)));
     }
-    known
+    let path = ws.join(RETIRED);
+    match fs::read_to_string(&path) {
+        Ok(text) => known.extend(parse_retired(&text)?.into_iter().map(|r| r.name)),
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+    Ok(known)
 }
 
 fn keep_reason(name: &str) -> Option<&'static str> {
@@ -340,7 +411,7 @@ pub fn run(root: &Path, ws: &Path, execute: bool) -> Result<ExitCode> {
     let facts = Facts {
         checkouts: out::live_ids_of(root)?,
         branches: branches(root)?,
-        known: known_ids(ws),
+        known: known_ids(ws)?,
         held,
     };
     let entries = classify(&out, &facts)?;
@@ -563,6 +634,70 @@ mod tests {
         left.sort();
         assert_eq!(left, ["br-open", "loose.log", "pool", "stray", "wt-live"]);
         let _ = fs::remove_dir_all(&out);
+    }
+
+    /// The case `--tasks` could not prove before the record: a landed task's dir after land deleted its branch and build dir. Only the retired-tasks line names it.
+    #[test]
+    fn a_landed_task_with_its_branch_gone_is_an_orphan() {
+        let ws = scratch("retired");
+        let out = ws.join("out");
+        dir_with(&out, "landed", 4);
+        dir_with(&out, "never-a-task", 4);
+        let no_record = Facts {
+            known: known_ids(&ws).unwrap(),
+            ..Facts::default()
+        };
+        assert!(matches!(
+            class(&classify(&out, &no_record).unwrap(), "landed"),
+            Class::Unknown(_)
+        ));
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        record_retired(&ws, "landed", commit).unwrap();
+        let rows = parse_retired(&fs::read_to_string(ws.join(RETIRED)).unwrap()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (rows[0].name.as_str(), rows[0].commit.as_str()),
+            ("landed", commit)
+        );
+        let recorded = Facts {
+            known: known_ids(&ws).unwrap(),
+            ..Facts::default()
+        };
+        let e = classify(&out, &recorded).unwrap();
+        assert_eq!(class(&e, "landed"), Class::Orphan);
+        assert!(matches!(class(&e, "never-a-task"), Class::Unknown(_)));
+        // a landed name in use again is live first: liveness is judged before the evidence
+        let reused = Facts {
+            branches: BTreeMap::from([("landed".to_owned(), false)]),
+            ..recorded
+        };
+        assert_eq!(
+            class(&classify(&out, &reused).unwrap(), "landed"),
+            Class::Live(Live::Branch)
+        );
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn a_damaged_retired_line_is_refused_by_number() {
+        let ok = "# landed tasks\n\na 0123456789abcdef0123456789abcdef01234567 1763600000\n";
+        assert_eq!(parse_retired(ok).unwrap().len(), 1);
+        for bad in [
+            "a 0123 1763600000",
+            "a 0123456789abcdef0123456789abcdef01234567",
+            "a 0123456789abcdef0123456789abcdef01234567 soon",
+            "a b 0123456789abcdef0123456789abcdef01234567 1",
+        ] {
+            let err = parse_retired(&format!("{ok}{bad}\n")).unwrap_err();
+            assert!(format!("{err:#}").contains("line 4"), "{bad}: {err:#}");
+        }
+        // what record_retired would write must read back, or it refuses to write it
+        let ws = scratch("retired-bad");
+        assert!(
+            record_retired(&ws, "has space", "0123456789abcdef0123456789abcdef01234567").is_err()
+        );
+        assert!(!ws.join(RETIRED).exists());
+        let _ = fs::remove_dir_all(&ws);
     }
 
     #[test]

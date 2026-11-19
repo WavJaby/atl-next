@@ -8,6 +8,8 @@
 //! Nothing reaches origin before the push. A task copy is a worktree of `src/` on `atl-patches-<branch>`: it leaves every other worktree's checkout alone.
 //! This process is main's xtask, so it never parses the branch's tables: a branch may change their schema. What they say comes from the branch's own xtask in its worktree (`--facts` child, `patch --edit`, `check`).
 //! Cleanup runs in a child `cargo xtask land <branch> --cleanup --execute` in main: this process's binary predates the sync, so it cannot parse the tables the sync brought in.
+//! A branch behind origin/main is rebased in the preflight by `git replay` (`rebase`): objects only, then the branch's own worktree moves by `reset --keep`; a conflict exits [`REBASE_CONFLICT`] with nothing changed.
+//! Progress: a `step: land:<i>/<n>:<stage>` line on stderr as each stage starts (`verdict::step`), the newest of which `atl-job status` shows.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -36,7 +38,7 @@ pub const LAND_WT: &str = "wt/land";
 pub struct Args {
     /// Task branch to land: checked out in a worktree, and a fast-forward of origin/main.
     branch: String,
-    /// Act: build and check in the land worktree, push, bring the main checkout and `src/` to the new commit, publish the land build dir as a base, clean up. Without it, prints the steps only.
+    /// Act: rebase the branch onto origin/main when behind (git replay: no checkout is left mid-rebase; a conflict changes nothing, names the files and exits 3), build and check in the land worktree, push, bring the main checkout and `src/` to the new commit, publish the land build dir as a base, clean up (record the task in `<workspace>/retired-tasks`, remove its worktree, branch and build dir, prune orphan build/driver dirs and old bases). Without it, prints the steps only.
     #[arg(long)]
     execute: bool,
     /// Internal: the cleanup stage's child (`cleanup_execute`); runs only the cleanup. Needs `--execute`.
@@ -145,6 +147,8 @@ struct Plan {
     copies: Vec<String>,
     /// The build machine's host arch, from the branch's arches.toml (`BranchFacts::host`).
     host: String,
+    /// A dry run's branch is not a fast-forward of origin/main: `--execute` rebases it in the preflight (`rebase`). Always false after an executing preflight.
+    behind: bool,
 }
 
 /// `xtask land <branch>`: prints the steps unless `--execute`.
@@ -172,11 +176,36 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     let started = Instant::now();
-    let plan = Plan::new(root, &args.branch, args.execute, &facts_child)?;
+    verdict::step("land:preflight");
+    let plan = match Plan::new(root, &args.branch, args.execute, &facts_child) {
+        Ok(plan) => plan,
+        Err(e) if e.downcast_ref::<RebaseConflict>().is_some() => {
+            println!(
+                "{}",
+                Verdict {
+                    cmd: "land",
+                    total: None,
+                    skipped: Vec::new(),
+                    failures: vec![Failure::step("rebase", format!("{e:#}"))],
+                }
+                .line()
+            );
+            return Ok(ExitCode::from(REBASE_CONFLICT));
+        }
+        Err(e) => return Err(e),
+    };
     let stages = plan.stages();
-    // preflight = origin fetch + read-only checks; not a stage, so outside the table
+    // preflight = origin fetch + read-only checks (+ the rebase when behind); not a stage, so outside the table
     println!("land: preflight ({}) ok", timing::secs(started.elapsed()));
     if !args.execute {
+        if plan.behind {
+            println!(
+                "land: {} is not a fast-forward of {} ({}): `--execute` rebases it first (git replay; only its own worktree moves, and only on success); the steps below are for the branch as it is",
+                args.branch,
+                fetch::MAIN_REF,
+                short(&plan.origin)
+            );
+        }
         for line in plan.describe(&stages) {
             println!("{line}");
         }
@@ -251,12 +280,6 @@ impl Plan {
             ],
         )
         .with_context(|| format!("no branch {branch}"))?;
-        ensure!(
-            is_ancestor(repo, &origin, &head)?,
-            "branch {branch} is not a fast-forward of {} ({}): rebase it onto that first",
-            fetch::MAIN_REF,
-            short(&origin)
-        );
         let main_head = git(Some(repo), &["rev-parse", "HEAD"])?;
         ensure!(
             main_head == origin,
@@ -279,6 +302,25 @@ impl Plan {
             wt.display(),
             first(&dirty)
         );
+        // behind origin/main: `update` rebases here, before the facts (they read the rebased tree); a dry run only says so
+        let mut behind = !is_ancestor(repo, &origin, &head)?;
+        let head = if behind && update {
+            verdict::step("land:rebase");
+            let started = Instant::now();
+            let new = rebase(&wt, branch, &origin, &head)?;
+            println!(
+                "land: rebase ({}) ok: {branch} {}..{} onto {} {}",
+                timing::secs(started.elapsed()),
+                short(&head),
+                short(&new),
+                fetch::MAIN_REF,
+                short(&origin)
+            );
+            behind = false;
+            new
+        } else {
+            head
+        };
         patch::check(repo).context("src/ is not origin/main's pin + patches: `cargo xtask fetch --execute` in the main checkout, then land again")?;
         let BranchFacts {
             edits,
@@ -295,6 +337,7 @@ impl Plan {
             edits,
             copies,
             host,
+            behind,
         })
     }
 
@@ -370,7 +413,8 @@ impl Plan {
                     gone.join(", ")
                 };
                 format!(
-                    "cleanup: task copies {gone}, worktree {wt} (state note kept in out/), branch {branch}"
+                    "cleanup: {branch} recorded in <workspace>/{}, task copies {gone}, worktree {wt} (state note kept in out/), branch {branch}; then `out prune --units` and `out prune --execute` (never fatal)",
+                    crate::out_tasks::RETIRED
                 )
             }
         }
@@ -381,7 +425,8 @@ impl Plan {
     fn execute(&self, stages: &[Stage], runner: &Runner) -> String {
         let total = stages.len();
         let mut times = Timings::default();
-        for stage in stages {
+        for (i, stage) in stages.iter().enumerate() {
+            verdict::step(&format!("land:{}/{total}:{}", i + 1, stage.name()));
             let started = Instant::now();
             let result = self.run_stage(stage, runner);
             let took = started.elapsed();
@@ -575,6 +620,125 @@ fn land_ready(land: &Path) -> Result<()> {
         changes.trim_end()
     );
     Ok(())
+}
+
+/// `land`'s exit status when the rebase onto origin/main conflicts (nothing changed); 1 = any other failure. land-seq.sh maps it to its own "rebase conflict" exit.
+pub const REBASE_CONFLICT: u8 = 3;
+
+/// The rebase onto origin/main conflicted; nothing changed. `files`: the conflicting paths (empty when only an intermediate commit conflicts).
+#[derive(Debug)]
+struct RebaseConflict {
+    branch: String,
+    onto: String,
+    files: Vec<String>,
+}
+
+impl std::fmt::Display for RebaseConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = if self.files.is_empty() {
+            "an intermediate commit conflicts (the whole-branch merge is clean)".to_owned()
+        } else {
+            format!("conflicts in {}", self.files.join(", "))
+        };
+        write!(
+            f,
+            "rebase of {} onto {} {}: {what}; nothing changed (branch and its worktree as they were): rebase it in its worktree, then land again",
+            self.branch,
+            fetch::MAIN_REF,
+            short(&self.onto)
+        )
+    }
+}
+
+impl std::error::Error for RebaseConflict {}
+
+/// Rebases `branch` (tip `head`, checked out in its worktree `wt`) onto `onto` without a checkout of its own: `git replay` writes the rebased commits as objects only, then `reset --keep` in `wt` moves the branch and that worktree together (refuses rather than overwrite local changes; the preflight found none). Returns the new tip.
+/// A conflict changes nothing (no ref, no checkout) and is a [`RebaseConflict`] naming the files. Not `git rebase` in `wt`: a conflict stopped there left the task's own worktree mid-rebase (three children had to `rebase --abort`, 2026-11-18..20). Not in the land worktree: checking the old tip out there re-touches every file main changed since, which the next Build then recompiles (mtime-keyed).
+fn rebase(wt: &Path, branch: &str, onto: &str, head: &str) -> Result<String> {
+    let range = format!("{onto}..refs/heads/{branch}");
+    let run = Command::new("git")
+        .current_dir(wt)
+        .args(["replay", "--onto", onto, &range])
+        .output()
+        .context("running git replay")?;
+    match run.status.code() {
+        Some(0) => {}
+        // 1 = a merge conflict; replay prints nothing about it, so the files come from a whole-branch merge
+        Some(1) => {
+            return Err(RebaseConflict {
+                branch: branch.to_owned(),
+                onto: onto.to_owned(),
+                files: conflict_files(wt, onto, head)?,
+            }
+            .into());
+        }
+        _ => bail!(
+            "git replay --onto {} {range}: {}: {}; nothing changed",
+            short(onto),
+            run.status,
+            String::from_utf8_lossy(&run.stderr).trim_end()
+        ),
+    }
+    let new = replayed_tip(&String::from_utf8_lossy(&run.stdout), branch, head)?;
+    git(Some(wt), &["reset", "-q", "--keep", &new]).with_context(|| {
+        format!(
+            "moving {branch} and {} to the rebased {}; nothing changed",
+            wt.display(),
+            short(&new)
+        )
+    })?;
+    Ok(new)
+}
+
+/// The new tip of `branch` from `git replay`'s `update <ref> <new> <old>` lines; `old` must be `head`, the tip the preflight read.
+fn replayed_tip(stdout: &str, branch: &str, head: &str) -> Result<String> {
+    let want = format!("refs/heads/{branch}");
+    for line in stdout.lines() {
+        if let ["update", r, new, old] = line.split_whitespace().collect::<Vec<_>>()[..]
+            && r == want
+        {
+            ensure!(
+                old == head,
+                "git replay moved {want} from {old}, not from the tip {head} the preflight read"
+            );
+            return Ok(new.to_owned());
+        }
+    }
+    bail!(
+        "git replay printed no update for {want}: {:?}",
+        stdout.trim_end()
+    )
+}
+
+/// The paths a merge of `head` into `onto` conflicts in (`git merge-tree --name-only`: the tree id, then one path per line); empty when that merge is clean.
+fn conflict_files(dir: &Path, onto: &str, head: &str) -> Result<Vec<String>> {
+    let run = Command::new("git")
+        .current_dir(dir)
+        .args([
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            "--no-messages",
+            onto,
+            head,
+        ])
+        .output()
+        .context("running git merge-tree")?;
+    ensure!(
+        matches!(run.status.code(), Some(0 | 1)),
+        "git merge-tree {} {}: {}",
+        short(onto),
+        short(head),
+        run.status
+    );
+    let mut files: Vec<String> = String::from_utf8_lossy(&run.stdout)
+        .lines()
+        .skip(1)
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect();
+    files.dedup();
+    Ok(files)
 }
 
 /// `--facts` output line prefixes.
@@ -793,9 +957,25 @@ fn clean_up_child(repo: &Path, branch: &str) -> Result<String> {
     let ws = Layout::of(repo)?.workspace().to_path_buf();
     let wt = find_worktree(&porcelain, branch, &ws.join(LAND_WT))
         .with_context(|| format!("branch {branch} is not checked out in a worktree"))?;
+    // first: once the branch is deleted, this line is the only proof that `out/<branch>/` was a task's (out prune --tasks)
+    let landed = git(Some(repo), &["rev-parse", "HEAD"])?;
+    crate::out_tasks::record_retired(&ws, branch, &landed)?;
     let note = clean_up(repo, &ws, &wt, branch)?;
     prune_units_after_land(repo, &ws);
+    prune_dirs_after_land(repo, &ws);
     Ok(note)
+}
+
+/// After a land: `out prune --execute` (orphan build dirs, driver probe dirs, bases beyond the keep rule; the landed worktree is gone by now, so its dirs are among them). Never fatal: the land is pushed; the outcome is its own `land-prune: ok|FAILED` line, never a `land:` verdict.
+fn prune_dirs_after_land(repo: &Path, ws: &Path) {
+    verdict::step("land:prune");
+    match out::live_ids_of(repo).and_then(|live| out::prune_dirs(ws, &live, true)) {
+        Ok(0) => println!("land-prune: ok"),
+        Ok(n) => println!(
+            "land-prune: FAILED: {n} removal(s) failed (rows above); the land itself is done"
+        ),
+        Err(e) => println!("land-prune: FAILED: {e:#}; the land itself is done"),
+    }
 }
 
 /// After a land: `out prune --units --execute` over every live checkout's build dir. The trees no build dir owns (EGL probes) are not pruned here: `out prune --units` does that by hand. A busy dir is skipped; a failure is logged, never fatal, since the land is already pushed.
@@ -1274,13 +1454,13 @@ mod tests {
             )
         }
 
-        /// Another clone pushes to origin's main: origin/main moves on, this repo does not.
-        fn advance_origin(&self) {
+        /// Another clone pushes a commit writing `file` to origin's main: origin/main moves on, this repo does not.
+        fn advance_origin_with(&self, file: &str) {
             let other = self.root.join("other");
             let origin_arg = self.origin.display().to_string();
             let other_arg = other.display().to_string();
             git(Some(&self.root), &["clone", "-q", &origin_arg, &other_arg]).unwrap();
-            write(&other, "other.txt", "other\n");
+            write(&other, file, "other\n");
             commit(&other, "other");
             git(Some(&other), &["push", "-q", "origin", "main"]).unwrap();
         }
@@ -1339,16 +1519,94 @@ mod tests {
         assert!(!env.land.exists(), "a dry run made the land worktree");
     }
 
+    /// origin/main moved on (another land), the main checkout followed it as Sync does; the branch is behind.
+    fn behind(name: &str, other_file: &str) -> Env {
+        let env = Env::new(name);
+        env.advance_origin_with(other_file);
+        git(Some(&env.repo), &["fetch", "-q", "origin"]).unwrap();
+        git(
+            Some(&env.repo),
+            &["merge", "-q", "--ff-only", fetch::MAIN_REF],
+        )
+        .unwrap();
+        env
+    }
+
+    fn branch_tip(env: &Env) -> String {
+        git(Some(&env.repo), &["rev-parse", "refs/heads/task"]).unwrap()
+    }
+
     #[test]
-    fn branch_behind_origin_main_is_refused() {
-        let env = Env::new("nonff");
-        env.advance_origin();
-        let moved = env.origin_main();
+    fn branch_behind_origin_main_is_rebased_in_no_other_checkout() {
+        let env = behind("nonff", "other.txt");
+        let old = branch_tip(&env);
+        // a dry run only says so
+        let dry = Plan::new(&env.repo, "task", false, &in_process).unwrap();
+        assert!(dry.behind);
+        assert_eq!(branch_tip(&env), old);
+        let plan = Plan::new(&env.repo, "task", true, &in_process).unwrap();
+        assert!(!plan.behind);
+        let new = branch_tip(&env);
+        assert_ne!(new, old);
+        assert_eq!(plan.head, new);
+        assert!(is_ancestor(&env.repo, &env.origin_main(), &new).unwrap());
+        // the branch's worktree moved with it, clean: the main commit's file is there
+        assert_eq!(git(Some(&env.wt), &["rev-parse", "HEAD"]).unwrap(), new);
+        assert!(
+            git_raw(&env.wt, &["status", "--porcelain"])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(env.wt.join("other.txt").is_file());
+        assert!(!env.land.exists(), "the rebase used the land worktree");
+    }
+
+    #[test]
+    fn rebase_conflict_changes_nothing_and_names_the_files() {
+        // origin/main changes the file the task added
+        let env = behind("conflict", "change.txt");
+        let old = branch_tip(&env);
         let err = Plan::new(&env.repo, "task", true, &in_process)
             .err()
-            .expect("a branch behind origin/main must be refused");
-        assert!(format!("{err:#}").contains("not a fast-forward"), "{err:#}");
-        assert_eq!(env.origin_main(), moved);
+            .expect("a conflicting rebase must fail");
+        let conflict = err
+            .downcast_ref::<RebaseConflict>()
+            .expect("typed as a rebase conflict");
+        assert_eq!(conflict.files, ["change.txt"]);
+        assert!(
+            format!("{err:#}").contains("conflicts in change.txt"),
+            "{err:#}"
+        );
+        assert_eq!(branch_tip(&env), old);
+        assert_eq!(git(Some(&env.wt), &["rev-parse", "HEAD"]).unwrap(), old);
+        assert!(
+            git_raw(&env.wt, &["status", "--porcelain"])
+                .unwrap()
+                .is_empty()
+        );
+        let git_dir = git(Some(&env.wt), &["rev-parse", "--absolute-git-dir"]).unwrap();
+        for state in ["rebase-merge", "rebase-apply"] {
+            assert!(
+                !Path::new(&git_dir).join(state).exists(),
+                "{state} left behind"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(env.wt.join("change.txt")).unwrap(),
+            "task\n"
+        );
+    }
+
+    #[test]
+    fn replayed_tip_reads_the_branch_update() {
+        let (old, new) = ("a".repeat(40), "b".repeat(40));
+        let out = format!("update refs/heads/other {new} {old}\nupdate refs/heads/t {new} {old}\n");
+        assert_eq!(replayed_tip(&out, "t", &old).unwrap(), new);
+        assert!(
+            replayed_tip(&out, "t", &new).is_err(),
+            "a moved tip is refused"
+        );
+        assert!(replayed_tip("", "t", &old).is_err());
     }
 
     #[test]
