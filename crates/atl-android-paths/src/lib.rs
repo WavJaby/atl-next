@@ -31,9 +31,18 @@ pub fn native_bridge_lib(isa: &str, pointer_bits: u32) -> String {
     format!("{dir}/{isa}")
 }
 
-/// Guest executables of native-bridge ISA `isa` (`bin/<NativeBridgeRelativePath>`): its `linker64` and `app_process64`.
+/// Guest executables of native-bridge ISA `isa` (`bin/<NativeBridgeRelativePath>`): its linker and app_process ([`native_bridge_exes`]).
 pub fn native_bridge_bin(isa: &str) -> String {
     format!("{SYSTEM_BIN}/{isa}")
+}
+
+/// File names of the guest linker and main executable at guest pointer width `pointer_bits`, as Soong installs them: NBS linker `stem: "linker"` + lib64 `suffix: "64"`, app_process lib32 `suffix: "32"` / lib64 `suffix: "64"` (their Android.bp).
+pub fn native_bridge_exes(pointer_bits: u32) -> (&'static str, &'static str) {
+    if pointer_bits == 32 {
+        ("linker", "app_process32")
+    } else {
+        ("linker64", "app_process64")
+    }
 }
 
 /// The translating engine `.so` for guest ISA `isa` (a host library, C ABI `atl_engine`): the NB core dlopens it when ART's `initialize` names a foreign ISA. ART hands `initialize` only an app-private directory, so the location is fixed here.

@@ -6,10 +6,17 @@
 
 __attribute__((used, aligned(64))) __thread uint64_t exe_tls[2] = {0x51a1000000000001u, 0x51a1000000000002u};
 
-// Exits with status 0 if ever run: exit_group (asm-generic/unistd.h: 94).
+// Exits with status 0 if ever run: exit_group (arm64: asm-generic/unistd.h 94; arm EABI: arch/arm/tools/syscall.tbl 248).
 __attribute__((naked, noreturn)) void _start(void) {
+#if defined(__aarch64__)
     __asm__ volatile(
         "mov x0, #0\n"
         "mov x8, #94\n"
         "svc #0\n");
+#else
+    __asm__ volatile(
+        "mov r0, #0\n"
+        "mov r7, #248\n"
+        "svc #0\n");
+#endif
 }

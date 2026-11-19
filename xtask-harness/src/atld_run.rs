@@ -951,7 +951,7 @@ impl Runtime {
         (!self.desktop_fonts).then_some((self.fonts.conf.as_path(), self.fonts.files.as_slice()))
     }
 
-    /// Also places the guest `xtask native --native-bridge <isa>` built where the NativeBridge core starts it (atl-native-bridge `Config::installed`): linker64 + app_process64 under `native_bridge_bin`, the guest libraries under `native_bridge_lib`.
+    /// Also places the guest `xtask native --native-bridge <isa>` built where the NativeBridge core starts it (atl-native-bridge `Config::installed`): the linker + app_process (atl-android-paths `native_bridge_exes`) under `native_bridge_bin`, the guest libraries under `native_bridge_lib`.
     /// The host ISA's guest serves identity; a foreign ISA's also needs its engine ([`Runtime::with_qemu_engine`]). Each call adds one ISA's guest.
     /// A foreign ISA's files are read from its own graph dir (native::graph_dir); run-apk checks that graph first (build_state::foreign_out).
     pub fn with_native_bridge_guest(mut self, isa: &str) -> Result<Self> {
@@ -963,12 +963,10 @@ impl Runtime {
         let lib = atl_android_paths::native_bridge_lib(isa, bits);
         let graph = crate::native::graph_dir(&self.out, &self.host, isa);
         let module = |m: &str, file: &str| crate::native::nb_module_dir(&graph, isa, m).join(file);
+        let (linker, exe) = atl_android_paths::native_bridge_exes(bits);
         let mut files = vec![
-            (module(NB_LINKER, "linker64"), format!("{bin}/linker64")),
-            (
-                module(NB_EXE, "app_process64"),
-                format!("{bin}/app_process64"),
-            ),
+            (module(NB_LINKER, linker), format!("{bin}/{linker}")),
+            (module(NB_EXE, exe), format!("{bin}/{exe}")),
             (
                 crate::runtimes::shared_libcxx(&graph, isa),
                 format!("{lib}/libc++.so"),

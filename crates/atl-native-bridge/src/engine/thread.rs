@@ -4,7 +4,6 @@
 //! Set here: `tid`, the cached pid (bit-field), `bionic_tls`. Everything else zero, as bionic's own `__allocate_thread` leaves a fresh mapping before `__init_thread` (pthread_create.cpp).
 //! Attach: a host thread's first down call (or a guest `pthread_create`'s new thread) gets that record, its own guest static TLS, a `HostThread` and the engine's guest CPU (`Engine::attach`); detach at thread exit (a host key's destructor) runs the guest keys' destructors on guest FS, then frees the TLS and record and detaches the CPU.
 
-use std::alloc::{Layout, alloc_zeroed};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -21,13 +20,50 @@ pub(super) mod layout {
     pub mod qemu {
         include!(concat!(env!("OUT_DIR"), "/bionic_thread_qemu.rs"));
     }
+    /// The arm guest's view (ILP32: 4-byte pointers and `size_t`; tls_defines.h `__arm__` slots).
+    #[allow(clippy::all, dead_code, reason = "generated from bionic's headers")]
+    pub mod qemu_arm {
+        include!(concat!(env!("OUT_DIR"), "/bionic_thread_qemu_arm.rs"));
+    }
+}
+
+/// The guest's pointer (and `size_t`) width in bytes.
+fn word() -> usize {
+    active().guest_pointer_bits() as usize / 8
+}
+
+/// A guest word (pointer or `size_t`) at `p`, zero-extended.
+///
+/// # Safety
+/// `p` holds [`word`] readable bytes.
+unsafe fn read_word(p: *const u8) -> usize {
+    // SAFETY: caller contract.
+    unsafe {
+        match word() {
+            4 => p.cast::<u32>().read_unaligned() as usize,
+            _ => p.cast::<u64>().read_unaligned() as usize,
+        }
+    }
+}
+
+/// Writes guest word `v` at `p`; a value wider than the guest word is truncated (only guest addresses are written, which fit by construction: `Active::reserve`).
+///
+/// # Safety
+/// `p` holds [`word`] writable bytes.
+unsafe fn write_word(p: *mut u8, v: usize) {
+    // SAFETY: caller contract.
+    unsafe {
+        match word() {
+            4 => p.cast::<u32>().write_unaligned(v as u32),
+            _ => p.cast::<u64>().write_unaligned(v as u64),
+        }
+    }
 }
 
 /// What this file reads of one guest's generated layout: the active engine's ([`abi`]).
 #[derive(Clone, Copy)]
 struct Abi {
     record_size: usize,
-    record_align: usize,
     tid: usize,
     /// `uint32_t cached_pid_ : 31; uint32_t vforked_ : 1;` (pthread_internal.h): both in one `uint32_t` storage unit.
     pid_unit: usize,
@@ -36,7 +72,6 @@ struct Abi {
     /// the record's `bionic_tls` pointer field
     bionic_tls: usize,
     tls_size: usize,
-    tls_align: usize,
     /// `NativeBridgeStaticTlsConfig`: size, tpoff, init_img, tls_slot_thread_id, tls_slot_bionic_tls
     cfg: [usize; 5],
 }
@@ -49,16 +84,16 @@ macro_rules! abi {
         const _: () = {
             assert!(r::vforked_ == r::cached_pid_);
             assert!(r::bits::cached_pid_.0 + r::bits::cached_pid_.1 <= u32::BITS);
+            // `zeroed` hands out whole pages (4 KiB at least): enough for any generated alignment
+            assert!(r::ALIGN <= 4096 && t::ALIGN <= 4096);
         };
         Abi {
             record_size: r::SIZE,
-            record_align: r::ALIGN,
             tid: r::tid,
             pid_unit: r::cached_pid_,
             pid_bits: r::bits::cached_pid_,
             bionic_tls: r::bionic_tls,
             tls_size: t::SIZE,
-            tls_align: t::ALIGN,
             cfg: [
                 c::size,
                 c::tpoff,
@@ -75,7 +110,8 @@ fn abi() -> Abi {
     match active() {
         #[cfg(atl_nb_identity)]
         Active::Identity => abi!(identity),
-        Active::Qemu(_) => abi!(qemu),
+        Active::Qemu(super::qemu::Arch::Arm) => abi!(qemu_arm),
+        Active::Qemu(super::qemu::Arch::Aarch64) => abi!(qemu),
     }
 }
 
@@ -325,7 +361,7 @@ extern "C" fn detach(value: *mut libc::c_void) {
         if let Some(t) = static_tls()
             && tp != 0
         {
-            free(tp - t.tpoff, t.size, super::image::page());
+            active().release(tp - t.tpoff, t.size);
         }
         drop(Box::from_raw(ht));
     }
@@ -357,20 +393,10 @@ extern "C" fn detach(value: *mut libc::c_void) {
 /// `rec` came from [`build`] and nothing reads it after.
 unsafe fn free_record(rec: usize) {
     let a = abi();
-    // SAFETY: `rec` and its `bionic_tls` were allocated by `build` with these layouts (the engine is chosen once per process).
-    unsafe {
-        let tls = (rec as *const u8).add(a.bionic_tls).cast::<usize>().read();
-        free(tls, a.tls_size, a.tls_align);
-        free(rec, a.record_size, a.record_align);
-    }
-}
-
-/// # Safety
-/// `p` came from `zeroed(size, align)`.
-unsafe fn free(p: usize, size: usize, align: usize) {
-    let layout = Layout::from_size_align(size, align).expect("allocated with this layout");
-    // SAFETY: caller contract.
-    unsafe { std::alloc::dealloc(p as *mut u8, layout) };
+    // SAFETY: `rec` and its `bionic_tls` were allocated by `build` with these sizes (the engine is chosen once per process).
+    let tls = unsafe { read_word((rec as *const u8).add(a.bionic_tls)) };
+    active().release(tls, a.tls_size);
+    active().release(rec, a.record_size);
 }
 
 /// The calling host thread's record, built on first use (a guest `pthread_create`'s thread adopted [`prepare`]'s first); freed at the thread's exit, or for a joinable guest thread at join / detach.
@@ -409,12 +435,12 @@ pub fn static_tls() -> Option<StaticTls> {
 /// `config` must point at a complete `NativeBridgeStaticTlsConfig` of the generated layout.
 pub unsafe fn configure(config: *const u8) {
     let [size, tpoff, init_img, slot_thread_id, slot_bionic_tls] = abi().cfg;
-    // SAFETY: caller contract; offsets and field types per the generated layout (`size_t`, `size_t`, `const void*`, `int`, `int`).
+    // SAFETY: caller contract; offsets and field types per the generated layout (`size_t`, `size_t`, `const void*` = guest words, `int`, `int`).
     let t = unsafe {
         StaticTls {
-            size: config.add(size).cast::<usize>().read(),
-            tpoff: config.add(tpoff).cast::<usize>().read(),
-            init_img: config.add(init_img).cast::<usize>().read(),
+            size: read_word(config.add(size)),
+            tpoff: read_word(config.add(tpoff)),
+            init_img: read_word(config.add(init_img)),
             slot_thread_id: config.add(slot_thread_id).cast::<i32>().read(),
             slot_bionic_tls: config.add(slot_bionic_tls).cast::<i32>().read(),
         }
@@ -425,7 +451,7 @@ pub unsafe fn configure(config: *const u8) {
 }
 
 /// The calling thread's guest static TLS, as bionic's `__allocate_thread` + `__init_tcb` make one (pthread_create.cpp): `init_img` copied, the thread-id slot = this thread's record, the bionic-TLS slot = its `bionic_tls`. Returns the thread pointer; the arch's own TCB words (x86 self pointer) are `Active::init_tcb`'s. Leaked: the thread's for its life.
-/// Pointer-sized slots are host words: the identity engine's guest has the host's pointer width.
+/// Slots are guest words ([`word`]); the block comes from `Active::reserve`, so a 32-bit guest can address it.
 pub fn alloc_static_tls(t: &StaticTls) -> Result<usize, String> {
     if t.tpoff > t.size || t.size == 0 {
         return Err(format!(
@@ -433,41 +459,37 @@ pub fn alloc_static_tls(t: &StaticTls) -> Result<usize, String> {
             t.tpoff, t.size
         ));
     }
-    let word = std::mem::size_of::<usize>() as isize;
+    let w = word() as isize;
     for slot in [t.slot_thread_id, t.slot_bionic_tls] {
-        let at = t.tpoff as isize + slot as isize * word;
-        if at < 0 || at + word > t.size as isize {
+        let at = t.tpoff as isize + slot as isize * w;
+        if at < 0 || at + w > t.size as isize {
             return Err(format!("static TLS: slot {slot} outside the block"));
         }
     }
-    let block = zeroed(t.size, super::image::page());
+    let block = zeroed(t.size) as *mut u8;
     let rec = current();
-    // SAFETY: `init_img` holds `size` bytes (NBS `new char[layout.size()]`); `block` is `size` fresh bytes. Slots are words at `tp + i * word` inside the block (bionic's TCB lies inside static TLS, `offset_bionic_tcb`); `bionic_tls` is a pointer field of the record built by `build`.
+    // SAFETY: `init_img` holds `size` bytes (NBS `new char[layout.size()]`); `block` is `size` fresh bytes. Slots are guest words at `tp + i * word` inside the block (bionic's TCB lies inside static TLS, `offset_bionic_tcb`); `bionic_tls` is a pointer field of the record built by `build`.
     unsafe {
         std::ptr::copy_nonoverlapping(t.init_img as *const u8, block, t.size);
-        let tp = block.add(t.tpoff).cast::<usize>();
-        let tls = (rec as *const u8)
-            .add(abi().bionic_tls)
-            .cast::<usize>()
-            .read();
-        tp.offset(t.slot_thread_id as isize).write(rec);
-        tp.offset(t.slot_bionic_tls as isize).write(tls);
+        let tp = block.add(t.tpoff);
+        let tls = read_word((rec as *const u8).add(abi().bionic_tls));
+        write_word(tp.offset(t.slot_thread_id as isize * w), rec);
+        write_word(tp.offset(t.slot_bionic_tls as isize * w), tls);
         Ok(tp as usize)
     }
 }
 
-fn zeroed(size: usize, align: usize) -> *mut u8 {
-    let layout = Layout::from_size_align(size, align).expect("generated size/align form a layout");
-    // SAFETY: non-zero size (generated from a complete record).
-    let p = unsafe { alloc_zeroed(layout) };
-    assert!(!p.is_null(), "bionic thread record: out of memory");
-    p
+/// `size` fresh zeroed bytes the guest can address (`Active::reserve`, page aligned: above every generated alignment).
+fn zeroed(size: usize) -> usize {
+    active()
+        .reserve(size, (libc::PROT_READ | libc::PROT_WRITE) as u32)
+        .unwrap_or_else(|e| super::unsupported(&format!("bionic thread record: {e}")))
 }
 
 fn build() -> usize {
     let a = abi();
-    let tls = zeroed(a.tls_size, a.tls_align);
-    let rec = zeroed(a.record_size, a.record_align);
+    let tls = zeroed(a.tls_size);
+    let rec = zeroed(a.record_size) as *mut u8;
     // SAFETY: plain syscalls without arguments.
     let (tid, pid) = unsafe { (libc::gettid(), libc::getpid()) };
     let (shift, width) = a.pid_bits;
@@ -477,7 +499,7 @@ fn build() -> usize {
     unsafe {
         rec.add(a.tid).cast::<i32>().write(tid);
         rec.add(a.pid_unit).cast::<u32>().write(pid_bits);
-        rec.add(a.bionic_tls).cast::<*mut u8>().write(tls);
+        write_word(rec.add(a.bionic_tls), tls);
     }
     rec as usize
 }

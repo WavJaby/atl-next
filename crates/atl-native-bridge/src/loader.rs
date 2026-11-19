@@ -32,7 +32,7 @@ static PROCESS: Mutex<Option<Result<Process, String>>> = Mutex::new(None);
 fn linker_fn(g: &Guest, name: &str) -> Result<usize, String> {
     g.linker
         .symbol(name)
-        .ok_or_else(|| format!("guest linker64 lacks {name}"))
+        .ok_or_else(|| format!("guest linker lacks {name}"))
 }
 
 fn start(cfg: &Config) -> Result<Process, String> {

@@ -19,10 +19,23 @@ use object::{Object, read::elf::ProgramHeader};
 
 /// `ARCH_GET_GS` (asm/prctl.h), the arch_prctl code that reads GS base without FSGSBASE.
 const ARCH_GET_GS: libc::c_int = 0x1004;
-/// bionic's TCB words below the arm64 thread pointer: `MIN_TLS_SLOT` = -3 (bionic/libc/platform/bionic/tls_defines.h, `__aarch64__`), so `tpoff` is at least this many words.
+/// bionic's TCB words below the thread pointer: `MIN_TLS_SLOT` = -3 (bionic/libc/platform/bionic/tls_defines.h, `__arm__ || __aarch64__`), so `tpoff` is at least this many words.
 const SLOTS_BELOW_TP: u64 = 3;
-/// AArch64 ELF TLS (variant I): the executable's block starts at TP + round_up(TCB_SIZE, p_align), TCB_SIZE = 16 (AAELF64, "TLS").
-const AARCH64_TCB_SIZE: u64 = 16;
+/// Arm ELF TLS (variant I): the executable's block starts at TP + round_up(TCB_SIZE, p_align), TCB_SIZE = two pointers: 16 on AArch64 (AAELF64 "TLS"), 8 on Arm (AAELF32 "Thread Local Storage").
+const TCB_POINTERS: u64 = 2;
+
+/// The guest arch the harness drives: `ATL_NB_ARCH` (an arches.toml ISA, xtask `--arch`), arm64 when unset.
+fn guest_arch() -> qemu::Arch {
+    std::env::var("ATL_NB_ARCH")
+        .ok()
+        .and_then(|a| qemu::Arch::of_isa(&a))
+        .unwrap_or(qemu::Arch::Aarch64)
+}
+
+/// The guest's pointer size in bytes.
+fn guest_word() -> u64 {
+    u64::from(guest_arch().pointer_bits() / 8)
+}
 
 /// What the checks compare against: the executable's ELF facts and the GS base before QEMU started.
 struct Expected {
@@ -58,28 +71,46 @@ fn check(letter: char, result: Result<(), String>) -> bool {
 
 fn expected(exe: &Path) -> Result<Expected, String> {
     let bytes = std::fs::read(exe).map_err(|e| format!("{}: {e}", exe.display()))?;
-    let elf = object::read::elf::ElfFile64::<object::Endianness>::parse(&*bytes)
-        .map_err(|e| e.to_string())?;
+    let (e_entry, [off, filesz, tls_align, tls_memsz]) = match object::FileKind::parse(&*bytes)
+        .map_err(|e| e.to_string())?
+    {
+        object::FileKind::Elf32 => pt_tls::<object::elf::FileHeader32<object::Endianness>>(&bytes)?,
+        _ => pt_tls::<object::elf::FileHeader64<object::Endianness>>(&bytes)?,
+    };
+    let tdata = bytes
+        .get(off as usize..(off + filesz) as usize)
+        .ok_or("PT_TLS beyond the file")?
+        .to_vec();
+    Ok(Expected {
+        exe: exe.canonicalize().map_err(|e| e.to_string())?,
+        e_entry,
+        tls_align,
+        tls_memsz,
+        tdata,
+        gs_before: gs_base(),
+    })
+}
+
+/// (e_entry, [p_offset, p_filesz, p_align, p_memsz] of PT_TLS) of an ELF of class `Elf`.
+fn pt_tls<Elf: object::read::elf::FileHeader<Endian = object::Endianness>>(
+    bytes: &[u8],
+) -> Result<(u64, [u64; 4]), String> {
+    let elf = object::read::elf::ElfFile::<Elf>::parse(bytes).map_err(|e| e.to_string())?;
     let endian = elf.endian();
     let tls = elf
         .elf_program_headers()
         .iter()
         .find(|p| p.p_type(endian) == object::elf::PT_TLS)
         .ok_or("exe has no PT_TLS")?;
-    let off = tls.p_offset(endian) as usize;
-    let filesz = tls.p_filesz(endian) as usize;
-    let tdata = bytes
-        .get(off..off + filesz)
-        .ok_or("PT_TLS beyond the file")?
-        .to_vec();
-    Ok(Expected {
-        exe: exe.canonicalize().map_err(|e| e.to_string())?,
-        e_entry: elf.entry(),
-        tls_align: tls.p_align(endian),
-        tls_memsz: tls.p_memsz(endian),
-        tdata,
-        gs_before: gs_base(),
-    })
+    Ok((
+        elf.entry(),
+        [
+            tls.p_offset(endian).into(),
+            tls.p_filesz(endian).into(),
+            tls.p_align(endian).into(),
+            tls.p_memsz(endian).into(),
+        ],
+    ))
 }
 
 /// The start of a /proc/self/maps line naming `path` at file offset 0, if `start` is one.
@@ -155,8 +186,8 @@ fn started(r: Result<Guest, String>) -> u64 {
                 return Err(format!("{reports} static-TLS reports, expected 1"));
             }
             let t = thread::static_tls().ok_or("no static TLS recorded")?;
-            let below = SLOTS_BELOW_TP * std::mem::size_of::<u64>() as u64;
-            let exe_at = t.tpoff as u64 + round_up(AARCH64_TCB_SIZE, x.tls_align);
+            let below = SLOTS_BELOW_TP * guest_word();
+            let exe_at = t.tpoff as u64 + round_up(TCB_POINTERS * guest_word(), x.tls_align);
             if (t.tpoff as u64) < below {
                 return Err(format!(
                     "tpoff {:#x} below bionic's {below:#x} of slots",
@@ -252,7 +283,7 @@ fn main() -> ExitCode {
         exe,
         library_path: vec![lib_dir],
     };
-    let r = qemu::run(qemu::Arch::Aarch64, &so, &boot, cfg, started);
+    let r = qemu::run(guest_arch(), &so, &boot, cfg, started);
     println!("qemu-start: FAIL QEMU main returned {r:?}");
     ExitCode::from(2)
 }

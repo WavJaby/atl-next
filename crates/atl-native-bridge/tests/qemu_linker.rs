@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Q4-3 gate (QEMU bridge plan Q4-3), harness-less: the six NB entries are placed in place on the real arm64 `linker64` and vdso (`vdso::bind_linker`, `vdso::bind`), and their placed words are checked before QEMU starts. QEMU then runs the fixture. At BOOT the pool and both images are registered with QEMU; the fixture calls each placed site as its AOSP prototype says, and the host answers each binding trap and checks ids and arguments.
+//! Q4-3 gate (QEMU bridge plan Q4-3), harness-less: the six NB entries are placed in place on the real arm64 `linker64` and vdso (`vdso::bind_linker`, `vdso::bind`), and their placed words are checked before the fixture runs: QEMU boots on the fixture first (BOOT only records `run_sites`), because the images map into engine windows (`Active::reserve`). Then the pool and both images are registered with QEMU; the fixture calls each placed site as its AOSP prototype says, and the host answers each binding trap and checks ids and arguments.
 //! Env (xtask qemu_linker.rs sets it; unset prints SKIP): ATL_ENGINE_SO (the engine `.so`), ATL_QEMU_SPIKE_FIXTURE (testdata/qemu-linker/fixture.c, built static), ATL_NB_LINKER (arm64 linker64), ATL_NB_VDSO (arm64 libnative_bridge_vdso.so).
 //! Expected values: the AOSP prototypes and the fixture's literals (fixture.c), never the engine. A placed id is read back from the svc immediate (ARM ARM: imm16 at bits 20:5) and must match the id of the trap that arrives.
 //! Output: `qemu-linker: (x) ok` per check, `(x) FAIL <why>` otherwise. Checks: (p) placement, (r) registration, (t) trap ids and order, (a) arguments, (s) answers. Exit 0 when all pass.
@@ -15,7 +15,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use atl_native_bridge::engine::{self, image::Image, qemu, thread, vdso};
+use atl_native_bridge::engine::{image::Image, qemu, thread, vdso};
 
 // ARM ARM encodings, written out here: atl-bridgegen's constants are the code under test.
 /// `svc #0`: the base encoding, imm16 at bits 20:5.
@@ -319,9 +319,18 @@ fn main() -> ExitCode {
         );
         return ExitCode::SUCCESS;
     };
-    // placement below follows the process's engine: QEMU, before `boot` claims it again
-    if let Err(e) = engine::claim(Some(qemu::Arch::Aarch64.isa())) {
-        println!("qemu-linker: FAIL engine: {e}");
+    // BOOT answers at once (it only records `run_sites`); the engine is then up, so the images map into its windows (`Active::reserve`), and the checks run on this thread
+    if let Err(e) = qemu::boot(
+        qemu::Arch::Aarch64,
+        Path::new(&so),
+        Path::new(&fixture),
+        on_trap,
+    ) {
+        println!("qemu-linker: FAIL boot: {e}");
+        return ExitCode::from(2);
+    }
+    if let Err(e) = qemu::attach_current() {
+        println!("qemu-linker: FAIL attach: {e}");
         return ExitCode::from(2);
     }
     let plan = match place(Path::new(&linker), Path::new(&vdso)) {
@@ -338,20 +347,6 @@ fn main() -> ExitCode {
     }
     if PLAN.set(plan).is_err() {
         println!("qemu-linker: FAIL plan set twice");
-        return ExitCode::from(2);
-    }
-    // BOOT answers at once; the engine is then up, and the checks run on this thread
-    if let Err(e) = qemu::boot(
-        qemu::Arch::Aarch64,
-        Path::new(&so),
-        Path::new(&fixture),
-        on_trap,
-    ) {
-        println!("qemu-linker: FAIL boot: {e}");
-        return ExitCode::from(2);
-    }
-    if let Err(e) = qemu::attach_current() {
-        println!("qemu-linker: FAIL attach: {e}");
         return ExitCode::from(2);
     }
     // 0 = every check passed

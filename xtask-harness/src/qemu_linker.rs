@@ -64,7 +64,7 @@ const HARNESSES: [Harness; 3] = [
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// arches.toml guest row whose `qemu_target` is driven (the engine is aarch64-only).
+    /// arches.toml guest row whose `qemu_target` is driven: arm64 (all harnesses) or arm (the linker start and dlopen harnesses; `--nb` then the arm NB out dir, linker `linker`).
     #[arg(long, default_value = qemu::DEFAULT_ARCH)]
     pub arch: String,
     /// Out dir (default: as for `xtask qemu`).
@@ -84,7 +84,17 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let dir = b.dir.join("qemu-linker");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let so = qemu_spike::engine_so_file(root, &b, &dir.join("engine"))?;
-    let linker = args.nb.join("native_bridge_guest_linker/linker64");
+    let bits = crate::arches::load(root)?
+        .iter()
+        .find(|(isa, _)| **isa == args.arch)
+        .map(|(_, a)| a.pointer_bits)
+        .with_context(|| format!("arches.toml has no row {}", args.arch))?;
+    // a 32-bit guest (phase4-32bit P4a) runs the linker start only: the placement harness checks aarch64 words; the staged boot goes through `engine::select`, which refuses arm until P4b; the dlopen harness's guest libc binds its stubs through the arm64 tables and faults in its constructors (SIGSEGV after the first property binding) until P4b's ILP32 tables -- add it for arm with them
+    let wide = bits == 64;
+    let linker = args.nb.join(format!(
+        "native_bridge_guest_linker/{}",
+        atl_android_paths::native_bridge_exes(bits).0
+    ));
     let vdso = args
         .nb
         .join("libnative_bridge_vdso/libnative_bridge_vdso.so");
@@ -98,14 +108,19 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     );
     let ndk = crate::ndk::default_ndk(root)?;
     let target = NdkTarget::new(root, &ndk, &b.arch, GUEST_API)?;
-    let fixture = guest_build(
-        root,
-        &target,
-        "fixture",
-        &dir.join("fixture"),
-        &["-static"],
-        &[],
-    )?;
+    // the placement fixture is aarch64 asm: built for the placement harness only
+    let fixture = if wide {
+        guest_build(
+            root,
+            &target,
+            "fixture",
+            &dir.join("fixture"),
+            &["-static"],
+            &[],
+        )?
+    } else {
+        PathBuf::new()
+    };
     let boot = qemu::boot_exe(root, &b, &dir)?;
     let exe = guest_build(
         root,
@@ -155,7 +170,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     skip_relative(&libdep, &skipped.join("libdep.so"))?;
     std::fs::copy(&libfix, skipped.join("libfix.so"))
         .with_context(|| format!("copying {}", libfix.display()))?;
-    let env: [(&str, &Path); 7] = [
+    let isa = PathBuf::from(&args.arch);
+    let env: [(&str, &Path); 8] = [
+        ("ATL_NB_ARCH", &isa),
         ("ATL_ENGINE_SO", &so),
         ("ATL_QEMU_SPIKE_FIXTURE", &fixture),
         ("ATL_NB_BOOT", &boot),
@@ -166,7 +183,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     ];
     let mut fails = Vec::new();
     let mut total = 0;
-    for h in &HARNESSES {
+    for h in HARNESSES.iter().filter(|h| wide || h.test == "qemu_start") {
         let mut runs: Vec<Option<&str>> = vec![None];
         if !args.no_breaks {
             runs.extend(h.breaks.iter().map(|b| Some(*b)));
@@ -184,8 +201,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             }
         }
     }
-    let mut runs: Vec<Option<&str>> = vec![None];
-    if !args.no_breaks {
+    let mut runs: Vec<Option<&str>> = if wide { vec![None] } else { Vec::new() };
+    if wide && !args.no_breaks {
         runs.extend(STAGED.breaks.iter().map(|b| Some(*b)));
     }
     for brk in runs {
@@ -232,29 +249,32 @@ pub(crate) fn guest_build(
     Ok(bin.to_path_buf())
 }
 
-/// Elf64_Dyn (16 bytes: d_tag, d_val, little-endian LP64). DT_ANDROID_RELRSZ: the byte size of the packed (RELR) relocation table; the NDK's lld packs a shared library's RELATIVE relocations into it by default (`llvm-readelf -d`).
-const DYN_BYTES: usize = 16;
+/// DT_ANDROID_RELRSZ: the byte size of the packed (RELR) relocation table; the NDK's lld packs a shared library's RELATIVE relocations into it by default (`llvm-readelf -d`). A dynamic entry is d_tag + d_val, two words of the ELF class: Elf64_Dyn 16 bytes, Elf32_Dyn 8 (little-endian).
 const DT_ANDROID_RELRSZ: u64 = 0x6fff_e001;
 
 /// `so` copied to `out` with DT_ANDROID_RELRSZ zeroed: the guest linker reads no packed relocation, so the RELATIVE class is skipped (break `skip_reloc`). Fails unless exactly one such entry exists, so a break that changed nothing cannot pass as a plain run.
 fn skip_relative(so: &Path, out: &Path) -> Result<()> {
     let mut bytes = std::fs::read(so).with_context(|| format!("reading {}", so.display()))?;
-    let dynamic = {
-        let elf = object::read::elf::ElfFile64::<object::Endianness>::parse(&*bytes)
-            .with_context(|| format!("parsing {}", so.display()))?;
-        elf.section_by_name(".dynamic")
+    let (dynamic, word) = {
+        let elf =
+            object::File::parse(&*bytes).with_context(|| format!("parsing {}", so.display()))?;
+        let word = if elf.is_64() { 8 } else { 4 };
+        let range = elf
+            .section_by_name(".dynamic")
             .and_then(|s| s.file_range())
-            .with_context(|| format!("{}: no .dynamic section", so.display()))?
+            .with_context(|| format!("{}: no .dynamic section", so.display()))?;
+        (range, word)
     };
     let (dyn_at, dyn_len) = (dynamic.0 as usize, dynamic.1 as usize);
     let mut zeroed = 0;
-    for at in (dyn_at..dyn_at + dyn_len).step_by(DYN_BYTES) {
+    for at in (dyn_at..dyn_at + dyn_len).step_by(2 * word) {
         let slot = bytes
-            .get_mut(at..at + DYN_BYTES)
+            .get_mut(at..at + 2 * word)
             .context(".dynamic entry past the file")?;
-        let d_tag = u64::from_le_bytes(<[u8; 8]>::try_from(&slot[..8])?);
-        if d_tag == DT_ANDROID_RELRSZ {
-            slot[8..].copy_from_slice(&0u64.to_le_bytes());
+        let mut tag = [0u8; 8];
+        tag[..word].copy_from_slice(&slot[..word]);
+        if u64::from_le_bytes(tag) == DT_ANDROID_RELRSZ {
+            slot[word..].fill(0);
             zeroed += 1;
         }
     }
@@ -337,6 +357,7 @@ pub(crate) fn system_wrap(stage: &Path) -> Result<Vec<OsString>> {
 }
 
 /// One harness run: plain (every check ok, exit 0) or a break (not every check ok, and a nonzero exit). `dllibs` is the guest library directory of `qemu_dlopen` (ATL_NB_DLLIBS).
+/// In a PID namespace of its own (qemu_gate.rs `small_pids_argv`: LP32 bionic aborts on a tid above 65535; one path, harmless for LP64).
 pub(crate) fn harness(
     root: &Path,
     dir: &Path,
@@ -346,7 +367,13 @@ pub(crate) fn harness(
     brk: Option<&str>,
     name: &str,
 ) -> Result<()> {
-    harness_in(root, dir, h, env, dllibs, brk, name, &[])
+    let mut wrap = crate::qemu_gate::small_pids_argv();
+    // drop bwrap's closing `--` (as `system_wrap`): unit_use inserts cargo's --message-format before the first `--`
+    ensure!(
+        wrap.pop().as_deref() == Some(OsStr::new("--")),
+        "bwrap::Args::end did not close with --"
+    );
+    harness_in(root, dir, h, env, dllibs, brk, name, &wrap)
 }
 
 /// [`harness`] with `wrap` (a command and its arguments, e.g. bwrap's) run around cargo.

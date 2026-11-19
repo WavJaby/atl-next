@@ -423,7 +423,8 @@ const TCB_WORDS: usize = (MAX_TLS_SLOT - MIN_TLS_SLOT + 1) as usize;
 /// A scratch TCB's thread pointer for `Tp::Bootstrap`: `__linker_init` runs on a zeroed TCB, so a TLS or stack-guard read before the linker's own `__set_tls` (NBS `__libc_init_main_thread_early`) sees zeros, not address 0. Leaked: a few words per call. The x86 crossing's bootstrap record (host FS during the call) has no counterpart: the host thread pointer is never the guest's here.
 /// The TCB comes from the engine's window (`Active::reserve`): a 32-bit guest cannot address the host heap.
 fn bootstrap_tcb() -> usize {
-    let word = std::mem::size_of::<usize>();
+    // the slot range is the same on arm and arm64 (tls_defines.h `__arm__ || __aarch64__`); a slot is a guest word
+    let word = arch().pointer_bits() as usize / 8;
     let tcb = super::active()
         .reserve(TCB_WORDS * word, PROT_READ | PROT_WRITE)
         .unwrap_or_else(|e| unsupported(&format!("qemu crossing: bootstrap TCB: {e}")));

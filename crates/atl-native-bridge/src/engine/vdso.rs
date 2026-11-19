@@ -114,7 +114,7 @@ pub fn bind_linker(linker: &Image) -> Result<(), String> {
     for (name, host) in hooks {
         let at = linker
             .symbol(name)
-            .ok_or_else(|| format!("linker64 lacks {name}"))?;
+            .ok_or_else(|| format!("guest linker lacks {name}"))?;
         active()
             .patch_hook(at, host)
             .map_err(|why| format!("{name}: {why}"))?;

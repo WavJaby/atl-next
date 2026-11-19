@@ -18,7 +18,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 
 use atl_native_bridge::engine::{Config, Guest, qemu, vdso};
-use object::{Object, ObjectSymbol, read::elf::ElfFile64};
+use object::{Object, ObjectSymbol};
 
 /// The dl_exe.c functions the host calls, in the order `SYMBOLS` lists them.
 const SYMBOLS: [&str; 4] = ["fx_open", "fx_fix_value", "fx_fix_ctor_value", "fx_dlerror"];
@@ -35,6 +35,14 @@ struct Expected {
 }
 static EXPECTED: OnceLock<Expected> = OnceLock::new();
 
+/// The guest arch the harness drives: `ATL_NB_ARCH` (an arches.toml ISA, xtask `--arch`), arm64 when unset.
+fn guest_arch() -> qemu::Arch {
+    std::env::var("ATL_NB_ARCH")
+        .ok()
+        .and_then(|a| qemu::Arch::of_isa(&a))
+        .unwrap_or(qemu::Arch::Aarch64)
+}
+
 fn check(letter: char, result: Result<(), String>) -> bool {
     match result {
         Ok(()) => {
@@ -50,7 +58,7 @@ fn check(letter: char, result: Result<(), String>) -> bool {
 
 fn expected(exe: &Path) -> Result<Expected, String> {
     let bytes = std::fs::read(exe).map_err(|e| format!("{}: {e}", exe.display()))?;
-    let elf = ElfFile64::<object::Endianness>::parse(&*bytes).map_err(|e| e.to_string())?;
+    let elf = object::File::parse(&*bytes).map_err(|e| e.to_string())?;
     let mut values = Vec::new();
     for want in SYMBOLS {
         let sym = elf
@@ -225,7 +233,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     }
-    // the arm64 NB directory: the linker is at <nb>/native_bridge_guest_linker/linker64; the stub libc, libdl, ld-android and libm sit beside it
+    // the NB directory: the linker is at <nb>/native_bridge_guest_linker/linker{64,}; the stub libc, libdl, ld-android and libm sit beside it
     let nb = linker
         .parent()
         .and_then(Path::parent)
@@ -247,7 +255,7 @@ fn main() -> ExitCode {
         println!("qemu-dlopen: FAIL {e}");
         return ExitCode::from(2);
     }
-    let r = qemu::run(qemu::Arch::Aarch64, &so, &boot, cfg, started);
+    let r = qemu::run(guest_arch(), &so, &boot, cfg, started);
     println!("qemu-dlopen: FAIL QEMU main returned {r:?}");
     ExitCode::from(2)
 }

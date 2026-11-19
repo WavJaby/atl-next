@@ -77,6 +77,10 @@ pub enum Active {
 
 static ACTIVE: OnceLock<Active> = OnceLock::new();
 
+/// Windows [`Active::release`] kept under QEMU (no ABI call frees one).
+pub static RETAINED_WINDOWS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// A down shell's identity: guest target, kind, shorty.
 type DownKey = (usize, Down, Option<Vec<u8>>);
 /// Every down shell made ([`Active::down`]), by what it runs.
@@ -242,7 +246,22 @@ impl Active {
         }
     }
 
-    /// Fresh zeroed memory of `len` bytes the guest can address, `prot` (`PROT_*`) for the guest: the one seam for every host allocation the guest dereferences (image reservations, the argument block, scratch TCBs). Identity: anonymous host memory, guest memory is host memory. QEMU: the engine's `map_window` (below 4 GiB for a 32-bit guest). Never freed by the caller here: the guest keeps pointers into it.
+    /// Gives back [`Active::reserve`]'s `[at, at + len)` (thread records at thread exit). Identity: munmap. QEMU: kept -- engine ABI 4.1 has no call that clears a window's guest page marks before an unmap, and unmapping under live marks leaves QEMU pages that point at whatever the host maps there next; counted in [`RETAINED_WINDOWS`]. Delete that arm when the ABI frees windows.
+    pub fn release(self, at: usize, len: usize) {
+        match self {
+            #[cfg(atl_nb_identity)]
+            Active::Identity => {
+                // SAFETY: a mapping `reserve` made, which nothing uses any more (caller contract of the record's owner).
+                unsafe { libc::munmap(at as *mut _, len) };
+            }
+            Active::Qemu(_) => {
+                let _ = (at, len);
+                RETAINED_WINDOWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Fresh zeroed memory of `len` bytes the guest can address, `prot` (`PROT_*`) for the guest: the one seam for every host allocation the guest dereferences (image reservations, the argument block, scratch TCBs, thread records and static TLS). Identity: anonymous host memory, guest memory is host memory. QEMU: the engine's `map_window` (below 4 GiB for a 32-bit guest). Given back only through [`Active::release`].
     pub fn reserve(self, len: usize, prot: u32) -> Result<usize, String> {
         match self {
             #[cfg(atl_nb_identity)]
@@ -471,15 +490,14 @@ impl Config {
     pub fn installed() -> Config {
         let engine = active();
         let isa = engine.guest_isa();
+        let bits = engine.guest_pointer_bits();
         let bin = PathBuf::from(atl_android_paths::native_bridge_bin(isa));
-        let lib = PathBuf::from(atl_android_paths::native_bridge_lib(
-            isa,
-            engine.guest_pointer_bits(),
-        ));
+        let lib = PathBuf::from(atl_android_paths::native_bridge_lib(isa, bits));
+        let (linker, exe) = atl_android_paths::native_bridge_exes(bits);
         Config {
-            linker: bin.join("linker64"),
+            linker: bin.join(linker),
             vdso: lib.join(VDSO_FILE),
-            exe: bin.join("app_process64"),
+            exe: bin.join(exe),
             library_path: vec![lib],
         }
     }
@@ -602,7 +620,7 @@ impl Guest {
         vdso.seal()?;
         let init = linker
             .symbol("__dl___linker_init")
-            .ok_or("linker64 has no __dl___linker_init")?;
+            .ok_or("the guest linker has no __dl___linker_init")?;
         let block = args::build(cfg, &linker, &vdso, &engine.kernel_auxv()?)?;
         engine.map_guest(&[&linker, &vdso])?;
         let thread = HostThread::leak();

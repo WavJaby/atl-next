@@ -1411,6 +1411,8 @@ fn main() -> Result<()> {
     }
     // one guest bionic view per engine compiled into the core (runtime selection, engine/mod.rs `Active`): identity = the host arch, QEMU = arm64 ([`QEMU_GUEST_ARCH`])
     let qemu_guest = buildscript::guest_arch(&arches_text, QEMU_GUEST_ARCH)?;
+    // the arm guest's thread view (engine/thread.rs `layout::qemu_arm`): its TCB, record and static-TLS config for the arm linker run (phase4-32bit P4a)
+    let qemu_arm = buildscript::guest_arch(&arches_text, "arm")?;
     let path = up.file(&format!("aosp/{HEADER}"))?;
     let target = Target {
         arch: host.arch.clone(),
@@ -1459,6 +1461,10 @@ fn main() -> Result<()> {
     std::fs::write(
         out.join("bionic_thread_qemu.rs"),
         bionic_thread(&up, &qemu_guest, &out)?,
+    )?;
+    std::fs::write(
+        out.join("bionic_thread_qemu_arm.rs"),
+        bionic_thread(&up, &qemu_arm, &out)?,
     )?;
     let tables = object_tables(&up, &target)?;
     std::fs::write(out.join("object_tables.rs"), object_tables_rs(&tables)?)?;
