@@ -968,13 +968,21 @@ mod place_tests {
     /// Candy Crush Saga's second wide JNI method (17 integers, 2 doubles): nine AAPCS64 stack words past x0..x7, eleven SysV words past six registers; both windows hold sixteen.
     #[test]
     fn seventeen_integers_cross() {
-        let host = img(&[1, 2, 3, 4, 5, 6], &[0xD1, 0xD2], &(7..=17).collect::<Vec<u64>>());
+        let host = img(
+            &[1, 2, 3, 4, 5, 6],
+            &[0xD1, 0xD2],
+            &(7..=17).collect::<Vec<u64>>(),
+        );
         let mut params = vec![INT; 17];
         params.extend([Class::F64, Class::F64]);
         let guest = place(&params, &host, SYSV, AAPCS64).expect("nine guest stack words fit");
         assert_eq!(
             guest,
-            img(&[1, 2, 3, 4, 5, 6, 7, 8], &[0xD1, 0xD2], &(9..=17).collect::<Vec<u64>>())
+            img(
+                &[1, 2, 3, 4, 5, 6, 7, 8],
+                &[0xD1, 0xD2],
+                &(9..=17).collect::<Vec<u64>>()
+            )
         );
     }
 
