@@ -242,6 +242,34 @@ impl Active {
         }
     }
 
+    /// Fresh zeroed memory of `len` bytes the guest can address, `prot` (`PROT_*`) for the guest: the one seam for every host allocation the guest dereferences (image reservations, the argument block, scratch TCBs). Identity: anonymous host memory, guest memory is host memory. QEMU: the engine's `map_window` (below 4 GiB for a 32-bit guest). Never freed by the caller here: the guest keeps pointers into it.
+    pub fn reserve(self, len: usize, prot: u32) -> Result<usize, String> {
+        match self {
+            #[cfg(atl_nb_identity)]
+            Active::Identity => {
+                // SAFETY: a fresh anonymous mapping; nothing else refers to it.
+                let at = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        len,
+                        prot as i32,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                if at == libc::MAP_FAILED {
+                    return Err(format!(
+                        "mmap {len:#x}: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                Ok(at as usize)
+            }
+            Active::Qemu(_) => qemu::CROSSING.map_window(len, prot),
+        }
+    }
+
     /// Makes `images` reachable by guest code.
     pub fn map_guest(self, images: &[&Image]) -> Result<(), String> {
         match self {

@@ -386,26 +386,25 @@ fn os_cstring(p: &Path) -> Result<CString, String> {
 }
 
 /// The kernel's auxv for this guest: QEMU's for the boot executable, so hwcaps, page size and AT_RANDOM describe the emulated CPU and its process (an x86 host's AT_HWCAP bits mean nothing to arm64 bionic's ifunc resolvers). `args::build` replaces the image entries.
+/// Its words are the guest's (`abi_ulong`: 4 bytes for arm, linux-user/elfload.c `create_elf_tables`).
 pub fn kernel_auxv() -> Result<Vec<(usize, usize)>, String> {
-    let mut at = BOOT_AUXV.load(Ordering::Acquire);
+    let at = BOOT_AUXV.load(Ordering::Acquire);
     if at == 0 {
         return Err("qemu crossing: no BOOT auxv".into());
     }
-    let mut out = Vec::new();
+    let word = arch().pointer_bits() as usize / 8;
+    let mut pairs = 0;
     loop {
-        // SAFETY: `at` walks the auxv QEMU wrote on the boot executable's stack (guest = host address, `boot` checks identity), AT_NULL-terminated pairs of words; that stack lives as long as the boot thread.
-        let (k, v) = unsafe {
-            (
-                (at as *const usize).read(),
-                (at as *const usize).add(1).read(),
-            )
-        };
-        if k == libc::AT_NULL as usize {
-            return Ok(out);
+        // SAFETY: `at` walks the auxv QEMU wrote on the boot executable's stack (guest = host address, `boot` checks identity), AT_NULL-terminated pairs of guest words; that stack lives as long as the boot thread.
+        let key = unsafe { std::slice::from_raw_parts((at + 2 * word * pairs) as *const u8, word) };
+        pairs += 1;
+        if key.iter().all(|&b| b == 0) {
+            break;
         }
-        out.push((k, v));
-        at += 2 * std::mem::size_of::<usize>();
     }
+    // SAFETY: the `pairs` pairs just walked, AT_NULL included.
+    let raw = unsafe { std::slice::from_raw_parts(at as *const u8, 2 * word * pairs) };
+    Ok(super::args::read_auxv(raw, word))
 }
 
 /// Makes `images` reachable by guest fetches: registers the pool and every segment with QEMU ([`register`]). Runs on an attached thread, before the first guest call. Host data needs no registration for a syscall: under identity, QEMU's syscall check accepts a range no QEMU page covers.
@@ -422,10 +421,14 @@ pub fn supported() -> bool {
 const TCB_WORDS: usize = (MAX_TLS_SLOT - MIN_TLS_SLOT + 1) as usize;
 
 /// A scratch TCB's thread pointer for `Tp::Bootstrap`: `__linker_init` runs on a zeroed TCB, so a TLS or stack-guard read before the linker's own `__set_tls` (NBS `__libc_init_main_thread_early`) sees zeros, not address 0. Leaked: a few words per call. The x86 crossing's bootstrap record (host FS during the call) has no counterpart: the host thread pointer is never the guest's here.
+/// The TCB comes from the engine's window (`Active::reserve`): a 32-bit guest cannot address the host heap.
 fn bootstrap_tcb() -> usize {
-    let tcb: &'static mut [usize; TCB_WORDS] = Box::leak(Box::new([0; TCB_WORDS]));
+    let word = std::mem::size_of::<usize>();
+    let tcb = super::active()
+        .reserve(TCB_WORDS * word, PROT_READ | PROT_WRITE)
+        .unwrap_or_else(|e| unsupported(&format!("qemu crossing: bootstrap TCB: {e}")));
     // TP = &slot 0: -MIN_TLS_SLOT words into the TCB
-    tcb.as_ptr() as usize + MIN_TLS_SLOT.unsigned_abs() as usize * std::mem::size_of::<usize>()
+    tcb + MIN_TLS_SLOT.unsigned_abs() as usize * word
 }
 
 /// The arch's own words of guest TCB `tp`: none. arm64 bionic's TCB has no self pointer (TP = &slot 0, tls_defines.h), and this crossing finds its state without the TCB (a trap runs on the host thread pointer), so `TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE` stays zero.

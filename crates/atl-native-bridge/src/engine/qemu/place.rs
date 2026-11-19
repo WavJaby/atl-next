@@ -251,12 +251,6 @@ const ENTRY_BODY_BYTES: usize = THUNK_BYTES;
 /// Placeholders sit on instruction-word boundaries.
 const WORD_BYTES: usize = 4;
 
-/// The `st_value` of a .dynsym entry (`Image::dynsym_values`'s address): the symbol's address before the load bias.
-fn st_value(value_at: usize) -> usize {
-    // SAFETY: `value_at` is the st_value field of a .dynsym entry of an image this engine mapped and has not sealed (`Image::dynsym_values`), 8 readable bytes.
-    unsafe { (value_at as *const usize).read_unaligned() }
-}
-
 /// The one placeholder whose 8 bytes lie in `[start, end)`, on a word boundary. Absent or more than one is an error: a vdso that differs from the pin fails closed.
 fn find_placeholder(start: usize, end: usize) -> Result<usize, &'static str> {
     let mut found = None;
@@ -272,11 +266,11 @@ fn find_placeholder(start: usize, end: usize) -> Result<usize, &'static str> {
 
 /// Routes the vdso entry whose st_value field is at `value_at` to a host function (before `seal`). Its placeholder is searched in the entry's body: from the symbol up to the next dynamic symbol, at most [`ENTRY_BODY_BYTES`]. Symbols carry no size here (asm symbols, size 0), so the next symbol is the bound.
 pub fn patch_entry(vdso: &Image, value_at: usize, host: usize) -> Result<(), &'static str> {
-    let start = vdso.bias + st_value(value_at);
+    let start = vdso.bias + vdso.st_value(value_at);
     let next = vdso
         .dynsym_values()
         .iter()
-        .map(|&(_, at)| vdso.bias + st_value(at))
+        .map(|&(_, at)| vdso.bias + vdso.st_value(at))
         .filter(|&addr| addr > start)
         .min()
         .unwrap_or(usize::MAX);
