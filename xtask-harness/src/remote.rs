@@ -22,8 +22,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{arches, gate_goals, gl_probe, out, provided_gate, verdict};
 
-/// rsync's flags for the bundle: archive, the staged hard links kept (`-H`: one source = one file on the target, see the module doc), stale entries deleted.
-const RSYNC: [&str; 3] = ["-a", "-H", "--delete"];
+/// rsync's flags for the bundle: archive, the staged hard links kept (`-H`: one source = one file on the target, see the module doc), stale entries deleted -- except the run lock, which a
+/// push holds itself ([`push_lock_sh`]) and must not unlink under a run or a later push.
+const RSYNC: [&str; 4] = ["-a", "-H", "--delete", "--exclude=/.run.lock"];
 
 /// The bundle's `lib/`: Debian's LLVM 19 runtimes. Arch ships libc++ 23 but no LLVM `libunwind.so.1` (plan L1 section 3). A labelled patch: the ideal is our pinned runtimes (runtimes.rs) in a packaged install tree (plan D1).
 /// The build machine's own copy; a cross host's runs take its sysroot's ([`llvm_lib_dir`]).
@@ -1076,31 +1077,46 @@ impl Host {
         Ok(())
     }
 
-    /// Copies the staged tree to the target with rsync's [`RSYNC`] flags.
+    /// Copies the staged tree to the target with rsync's [`RSYNC`] flags, the receiving rsync under the dir's [`RUN_LOCK`] ([`push_lock_sh`]): a push never deletes files under a running gate
+    /// of the same checkout; it fails `busy` as a run does.
     fn sync(&self, stage: &Path, dir_name: &str) -> Result<()> {
         let src = format!("{}/", stage.display());
-        let status = match self {
+        let out = match self {
             Host::Ssh(alias) => Command::new("rsync")
                 .args(RSYNC)
-                .args(["--mkpath", "-e"])
-                .arg(format!("ssh {}", ssh_opts_sh()))
+                .args(["-e", &format!("ssh {}", ssh_opts_sh())])
+                .arg(format!(
+                    "--rsync-path={}",
+                    push_lock_sh(&format!("{REMOTE_ROOT}/{dir_name}"))
+                ))
                 .arg(&src)
                 .arg(format!("{alias}:{REMOTE_ROOT}/{dir_name}/"))
-                .status(),
+                .stderr(Stdio::piped())
+                .output(),
             Host::Local(dir) => {
-                std::fs::create_dir_all(dir)?;
-                Command::new("rsync")
-                    .args(RSYNC)
-                    .arg(&src)
-                    .arg(format!("{}/", dir.display()))
-                    .status()
+                // the same lock shell as the remote side, rsync's arguments after it
+                let mut c = Command::new("sh");
+                c.args([
+                    "-c",
+                    &format!("{} \"$@\"", push_lock_sh(&dir.display().to_string())),
+                    "sh",
+                ])
+                .args(RSYNC)
+                .arg(&src)
+                .arg(format!("{}/", dir.display()))
+                .stderr(Stdio::piped())
+                .output()
             }
         }
         .context("running rsync")?;
+        let err = String::from_utf8_lossy(&out.stderr);
+        eprint!("{err}");
         ensure!(
-            status.success(),
-            "rsync to {} failed: {status}",
-            self.label()
+            out.status.success(),
+            "rsync to {} failed: {}: {}",
+            self.label(),
+            out.status,
+            err.trim()
         );
         Ok(())
     }
@@ -1923,6 +1939,15 @@ const RUN_LOCK: &str = ".run.lock";
 fn lock_sh(what: &str) -> String {
     format!(
         "exec 9>>{RUN_LOCK}\nflock -n 9 || {{ echo \"{what}: busy, another run, check or prune holds $(pwd)\" >&2; exit 6; }}\n"
+    )
+}
+
+/// The receiving rsync's command for a push into `dir`: the dir made, fd 9 holding its [`RUN_LOCK`] as [`lock_sh`] does (rsync inherits it through `exec`), rsync's server arguments appended by
+/// rsync itself after the trailing `rsync`. Exit 6 with `busy` when a run, check, prune or another push holds the lock.
+fn push_lock_sh(dir: &str) -> String {
+    let (d, lock) = (sh_quote(dir), sh_quote(&format!("{dir}/{RUN_LOCK}")));
+    format!(
+        "mkdir -p {d} && {{ exec 9>>{lock}; flock -n 9; }} || {{ echo \"remote push: busy, another run, check, prune or push holds {d}\" >&2; exit 6; }}; exec rsync"
     )
 }
 
@@ -3248,6 +3273,46 @@ mod tests {
         );
         holder.kill().expect("release the lock");
         holder.wait().expect("reap the holder");
+    }
+
+    /// Review-2 G2: a push into a dir a run holds fails `busy` and deletes nothing (the running gate's files and its lock file stay); once free, the push deletes stale files but not the lock.
+    #[test]
+    fn a_push_takes_the_run_lock_and_keeps_the_lock_file() {
+        let scratch = Scratch::new("push");
+        let dir = scratch.0.join("x");
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("running-gate.so"), "r").expect("file");
+        let stage = scratch.0.join("stage");
+        std::fs::create_dir_all(&stage).expect("stage");
+        std::fs::write(stage.join("new.so"), "n").expect("staged file");
+        let host = Host::Local(dir.clone());
+
+        let mut holder = hold_lock(&dir);
+        let err = host
+            .sync(&stage, "x")
+            .expect_err("a held lock refuses the push");
+        assert!(format!("{err:#}").contains("busy"), "{err:#}");
+        assert!(
+            dir.join("running-gate.so").is_file(),
+            "a refused push deletes nothing"
+        );
+        assert!(
+            !dir.join("new.so").exists(),
+            "a refused push copies nothing"
+        );
+        holder.kill().expect("release the lock");
+        holder.wait().expect("reap the holder");
+
+        host.sync(&stage, "x").expect("a free dir takes the push");
+        assert!(dir.join("new.so").is_file());
+        assert!(
+            !dir.join("running-gate.so").exists(),
+            "--delete still removes stale files"
+        );
+        assert!(
+            dir.join(RUN_LOCK).is_file(),
+            "the lock file is excluded from --delete"
+        );
     }
 
     #[test]
