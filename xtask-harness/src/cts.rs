@@ -8,7 +8,7 @@
 //! Each row is built by its own `xtask native` invocation; a row whose invocation shows a failed step in its ninja.log or a ninja load error (or never reached ninja) is BUILD_FAIL with the failed modules and their first causes (triage.rs), also when an older APK is still on disk. With `--no-build` the APKs on disk are taken as they are.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
 use crate::manifest::{InstrumentationDecl, Manifest};
