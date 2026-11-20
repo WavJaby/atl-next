@@ -68,6 +68,7 @@ pub const ROWS: &[Row] = &[
     Row::new(&["system-scan"], true, true),
     Row::new(&["broadcast"], true, true),
     Row::new(&["billing"], true, true),
+    Row::new(&["keystore"], true, true),
     Row::new(&["gralloc"], true, true),
     Row::new(&["composer"], true, true),
     Row::new(&["instrument"], true, true),
