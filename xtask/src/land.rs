@@ -745,10 +745,24 @@ fn move_branch(wt: &Path, branch: &str, head: &str, new: &str) -> Result<()> {
             short(new)
         )
     })?;
-    let before = git(
-        Some(wt),
-        &["rev-parse", &format!("refs/heads/{branch}@{{1}}")],
-    )?;
+    after_reset(wt, branch, head, new)
+}
+
+/// The reflog pair after `reset --keep new`: `@{0} == new` (nothing landed on top since) and `@{1} == head` (the reset moved the tip land read). A commit after the reset leaves `@{0}` at it: refused, nothing reset, since resetting to `@{1}` would drop it.
+/// A commit between the check and the reset leaves `@{1}` at it: moved back there, so nothing is lost either way.
+fn after_reset(wt: &Path, branch: &str, head: &str, new: &str) -> Result<()> {
+    let at = |n: u32| {
+        git(
+            Some(wt),
+            &["rev-parse", &format!("refs/heads/{branch}@{{{n}}}")],
+        )
+    };
+    let now = at(0)?;
+    ensure!(
+        now == new,
+        "branch moved after the rebase: {now} (rebased tip {new}); {branch} left there"
+    );
+    let before = at(1)?;
     if before != head {
         git(Some(wt), &["reset", "-q", "--keep", &before])
             .with_context(|| format!("moving {branch} back to {before}"))?;
@@ -1751,6 +1765,28 @@ mod tests {
         );
         assert_eq!(git(Some(&env.wt), &["rev-parse", "HEAD"]).unwrap(), late);
         assert_eq!(branch_tip(&env), late);
+    }
+
+    /// R5-3: a commit C2 landing on top of the rebased tip right after the reset (reflog `@{0}=C2, @{1}=new`) must stay the tip: before, `@{1} != head` reset the branch back to `new`, dropping C2.
+    #[test]
+    fn a_commit_after_the_reset_is_not_dropped() {
+        let env = behind("after-reset", "other.txt");
+        let read = branch_tip(&env);
+        let new = env.origin_main();
+        git(Some(&env.wt), &["reset", "-q", "--keep", &new]).unwrap();
+        git(
+            Some(&env.wt),
+            &["commit", "-q", "--allow-empty", "-m", "c2"],
+        )
+        .unwrap();
+        let c2 = branch_tip(&env);
+        let err = after_reset(&env.wt, "task", &read, &new)
+            .expect_err("a commit after the reset must be refused");
+        assert!(
+            format!("{err:#}").contains("branch moved after the rebase"),
+            "{err:#}"
+        );
+        assert_eq!(branch_tip(&env), c2);
     }
 
     #[test]
