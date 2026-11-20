@@ -55,33 +55,90 @@ const _: () = assert!(TABLES.len() == lanes::LANES.len());
 pub const OBJECT_STUBS: usize = super::bindings::OBJECT_STUBS;
 
 /// A guest proxy object: what guest code's `(*obj)->Fn(obj, ...)` dereferences. Word 1's offset is fixed by `atl_nb_object_up` (`mov 8(%rdi)`).
+/// Lives in guest-addressable memory ([`Placed`]), so a 32-bit guest holds it in its word; that guest reads only word 0's low half (little-endian), its table's address, which fits by construction (`Active::reserve`). The host reads both words at these offsets for every width.
 #[repr(C)]
 pub(super) struct GuestObj {
-    pub(super) functions: *const usize,
+    /// the guest address of the table's function array ([`functions`])
+    pub(super) functions: usize,
     pub(super) host: usize,
 }
 const _: () = assert!(std::mem::offset_of!(GuestObj, host) == 8);
 
-/// Each table's guest function array, built once ([`functions`]).
-static FUNCTIONS: [OnceLock<Box<[usize]>>; TABLES.len()] =
-    [const { OnceLock::new() }; TABLES.len()];
+/// A [`GuestObj`] in its own guest-addressable block (`Active::reserve`), given back on drop: the guest's `JNIEnv` per thread (record.rs), its `JavaVM`, each SL proxy (sles.rs).
+/// Non-zero, so an `Option<Placed>` is one word with NULL for None (record.rs `HostThread`, which identity asm passes by pointer, keeps an FFI-safe layout).
+#[repr(transparent)]
+pub(super) struct Placed(std::num::NonZeroUsize);
 
-/// The guest function array of table `t`: slot i = object stub i (a slot with no function refuses by name when called, dispatch.rs `refuse`), or the special's host function bound for it. Built on the first call; the owner of a table passes the same specials every time. `host`: a live host object of the table, read only by the `jni_direct` break.
-pub(super) fn functions(t: TableId, specials: &[(usize, usize)], host: usize) -> *const usize {
-    FUNCTIONS[t]
-        .get_or_init(|| {
-            (0..TABLES[t].1.len())
-                .map(|slot| {
-                    if let Some(&(_, f)) = specials.iter().find(|&&(s, _)| s == slot) {
-                        return active().bind(f).unwrap_or_else(|| {
-                            super::unsupported("object specials: host thunks used up")
-                        });
-                    }
-                    direct_break(t, slot, host).unwrap_or_else(|| active().object_stub(slot))
-                })
-                .collect()
-        })
-        .as_ptr()
+impl Placed {
+    /// A proxy of function array `functions` standing for `host`.
+    pub(super) fn new(functions: usize, host: usize) -> Placed {
+        let at = active()
+            .reserve(
+                std::mem::size_of::<GuestObj>(),
+                (libc::PROT_READ | libc::PROT_WRITE) as u32,
+            )
+            .ok()
+            .and_then(std::num::NonZeroUsize::new)
+            .unwrap_or_else(|| super::unsupported("guest proxy object: no guest memory"));
+        // SAFETY: `reserve` answered fresh writable bytes, page aligned, at least a `GuestObj`'s.
+        unsafe { (at.get() as *mut GuestObj).write(GuestObj { functions, host }) };
+        Placed(at)
+    }
+
+    /// The guest address of the object.
+    pub(super) fn addr(&self) -> usize {
+        self.0.get()
+    }
+
+    /// Points the object at host object `host` (ART may hand a thread a new env).
+    pub(super) fn set_host(&mut self, host: usize) {
+        // SAFETY: our block, a `GuestObj` since `new`.
+        unsafe { (*(self.addr() as *mut GuestObj)).host = host };
+    }
+
+    /// Keeps the object for the process's life; its address.
+    pub(super) fn leak(self) -> usize {
+        let at = self.addr();
+        std::mem::forget(self);
+        at
+    }
+}
+
+impl Drop for Placed {
+    fn drop(&mut self) {
+        active().release(self.addr(), std::mem::size_of::<GuestObj>());
+    }
+}
+
+/// Each table's guest function array (its guest address), built once ([`functions`]).
+static FUNCTIONS: [OnceLock<usize>; TABLES.len()] = [const { OnceLock::new() }; TABLES.len()];
+
+/// The guest function array of table `t`, as its guest address: guest words (thread.rs `write_word`) in guest-addressable memory (`Active::reserve`), so a 32-bit guest's `(*env)->Fn` reads 4-byte slots. Slot i = object stub i (a slot with no function refuses by name when called, dispatch.rs `refuse`), or the special's host function, bound with the slot's own lanes as its prototype (a 32-bit guest's arguments are placed by class). Built on the first call; the owner of a table passes the same specials every time. `host`: a live host object of the table, read only by the `jni_direct` break.
+pub(super) fn functions(t: TableId, specials: &[(usize, usize)], host: usize) -> usize {
+    *FUNCTIONS[t].get_or_init(|| {
+        let word = active().guest_pointer_bits() as usize / 8;
+        let len = TABLES[t].1.len();
+        let at = active()
+            .reserve(len * word, (libc::PROT_READ | libc::PROT_WRITE) as u32)
+            .unwrap_or_else(|e| super::unsupported(&format!("object table {}: {e}", TABLES[t].0)));
+        for slot in 0..len {
+            let f = match specials.iter().find(|&&(s, _)| s == slot) {
+                Some(&(_, f)) => {
+                    let sig = lanes::LANES[t][slot].map_or(Sig::INT, |l| Sig {
+                        ret: l.ret,
+                        params: Some(l.params),
+                    });
+                    active().bind_result(f, sig).unwrap_or_else(|| {
+                        super::unsupported("object specials: host thunks used up")
+                    })
+                }
+                None => direct_break(t, slot, host).unwrap_or_else(|| active().object_stub(slot)),
+            };
+            // SAFETY: slot `slot` of the `len` guest words reserved above.
+            unsafe { super::thread::write_word((at + slot * word) as *mut u8, f) };
+        }
+        at
+    })
 }
 
 /// Deliberate break of gate 4.4 (`ATL_NB_BREAK=jni_direct`): the env's `NewStringUTF` slot is the host function itself, no crossing -> the guest calls ART on its own thread pointer with its own env.
@@ -123,9 +180,7 @@ pub(super) unsafe fn table_of(guest: usize) -> Option<TableId> {
     }
     // SAFETY: caller contract.
     let f = unsafe { *(guest as *const usize) };
-    FUNCTIONS
-        .iter()
-        .position(|a| a.get().is_some_and(|a| a.as_ptr() as usize == f))
+    FUNCTIONS.iter().position(|a| a.get() == Some(&f))
 }
 
 /// Why a guest object call is refused (dispatch.rs `refuse`, the named abort of owner decision D-4).
@@ -144,6 +199,8 @@ pub(super) enum Refused {
     NoShorty { name: &'static str },
     /// A `...V` variant whose method's shorty holds a character outside jni's `ZBSCIJFDL`.
     Shorty { name: &'static str, c: u8 },
+    /// A `...` slot called by a 32-bit guest: its words follow AAPCS32's variadic layout, which the crossing does not read yet; forwarded unclassed they would reach the host misplaced.
+    Variadic32 { name: &'static str },
 }
 
 /// The lane descriptor of guest object call `id` made on guest object `guest`, and its table. Refused: no registered object, an id past the table, a slot with no function.

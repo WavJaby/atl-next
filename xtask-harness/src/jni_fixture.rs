@@ -110,7 +110,7 @@ const NDK_IMPORTS: [&str; 17] = [
 const ES1_SOURCE: &str = "atl_jni_es1.c";
 /// The ES1 scene's generated C (`es1_c`), in the fixture's out dir: ES1_SOURCE includes it.
 const ES1_HEADER: &str = "es1_scene.inc";
-/// The GLES1 proxy the scene calls (`-lGLESv1_CM`): DT_NEEDED of the fixture, checked by `es1_failures`.
+/// The GLES1 proxy the scene calls (`-lGLESv1_CM`): DT_NEEDED of the fixture, checked by `shape_failures`.
 const ES1_LIB: &str = "libGLESv1_CM.so";
 
 /// One built variant: its API level and the libraries an APK carries for it.
@@ -820,21 +820,20 @@ fn lib_named<'a>(libs: &'a [PathBuf], name: &str) -> Result<&'a PathBuf> {
         .with_context(|| format!("no {name} among the fixture libraries"))
 }
 
-/// The legacy fixture among the APK's `libs` (apk_libs), checked by `legacy_shape_failures`.
-pub fn legacy_failures(libs: &[PathBuf]) -> Result<Vec<String>> {
-    Ok(legacy_shape_failures(&shape(lib_named(libs, LEGACY)?)?))
-}
-
-/// The C3 probes' fixture among the APK's `libs`, checked by `calls_failures` against `NDK_NEEDED` / `NDK_IMPORTS`.
-pub fn ndk_failures(libs: &[PathBuf]) -> Result<Vec<String>> {
-    let s = shape(lib_named(libs, LIB)?)?;
-    Ok(calls_failures(LIB, &s, &NDK_NEEDED, &NDK_IMPORTS))
-}
-
-/// The ES1 scene's fixture among the APK's `libs`: DT_NEEDED names `libGLESv1_CM.so`, the proxy the scene's calls go to.
-pub fn es1_failures(libs: &[PathBuf]) -> Result<Vec<String>> {
-    let s = shape(lib_named(libs, LIB)?)?;
-    Ok(calls_failures(LIB, &s, &[ES1_LIB], &[]))
+/// The fixture libraries' shapes among the APK's `libs` (apk_libs): the legacy fixture by `legacy_shape_failures`; the C3 probes' by `calls_failures` against `NDK_NEEDED` / `NDK_IMPORTS`; the ES1 scene's DT_NEEDED naming `libGLESv1_CM.so`, the proxy the scene's calls go to.
+/// A 32-bit fixture (ELF32) is not read: [`shape`] reads 64-bit ELF only, and the same sources' 64-bit build carries these checks; said so on stdout.
+pub fn shape_failures(libs: &[PathBuf]) -> Result<Vec<String>> {
+    let lib = lib_named(libs, LIB)?;
+    let data = std::fs::read(lib).with_context(|| format!("reading {}", lib.display()))?;
+    if object::FileKind::parse(&*data)? == object::FileKind::Elf32 {
+        println!("app: fixture shapes not checked: {LIB} is a 32-bit ELF");
+        return Ok(Vec::new());
+    }
+    let mut whys = legacy_shape_failures(&shape(lib_named(libs, LEGACY)?)?);
+    let s = shape(lib)?;
+    whys.extend(calls_failures(LIB, &s, &NDK_NEEDED, &NDK_IMPORTS));
+    whys.extend(calls_failures(LIB, &s, &[ES1_LIB], &[]));
+    Ok(whys)
 }
 
 #[cfg(test)]

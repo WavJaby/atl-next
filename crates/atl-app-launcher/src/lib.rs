@@ -266,6 +266,7 @@ fn start_ui(
 /// (runtime.cc `InitNonZygoteOrPostFork` action kUnload), and our app processes are not zygote forks; bridge 1 runs same-ISA bionic code through it (bridge-1 plan section 2, R4).
 /// With `isa` (`--instruction-set`, every app process) also `-Xnative-bridge-isa:<isa>` (patches/aosp/art 0004), host ISA included: ART hands it to the bridge's `initialize`, which picks identity or a
 /// translator, the one route the app's ISA takes. No bridge: no option (ART would refuse a foreign ISA with nothing to run it).
+/// A 32-bit ISA also gets `-Xopaque-jni-ids:true`: method and field ids become small indices (ART `JniIdType::kIndices`) instead of 64-bit `ArtMethod*` / `ArtField*`, so the guest's 32-bit word holds them; ART fixes the id type at VM creation, before any app code. 64-bit apps keep ART's default, as AOSP's.
 fn native_bridge_options(property: Option<String>, isa: Option<&str>) -> Vec<std::ffi::CString> {
     match property {
         Some(lib) if !lib.is_empty() && lib != "0" => [
@@ -274,10 +275,21 @@ fn native_bridge_options(property: Option<String>, isa: Option<&str>) -> Vec<std
         ]
         .into_iter()
         .chain(isa.map(|isa| format!("-Xnative-bridge-isa:{isa}")))
+        .chain((isa.and_then(pointer_bits) == Some(32)).then(|| "-Xopaque-jni-ids:true".to_owned()))
         .filter_map(|o| std::ffi::CString::new(o).ok())
         .collect(),
         _ => Vec::new(),
     }
+}
+
+include!(concat!(env!("OUT_DIR"), "/isa_pointer_bits.rs"));
+
+/// The pointer width of ART instruction set `isa` (arches.toml `pointer_bits`), None for an ISA no row names.
+fn pointer_bits(isa: &str) -> Option<u32> {
+    ISA_POINTER_BITS
+        .iter()
+        .find(|(name, _)| *name == isa)
+        .map(|&(_, bits)| bits)
 }
 
 /// Steps 0 and 1: the signal setup bionic makes, ART's functions, and the refusal to start without a property area. Every process this library runs (app, installer) starts so.
@@ -373,6 +385,12 @@ mod nb_tests {
         let o = native_bridge_options(Some("libx.so".into()), Some("arm64"));
         assert_eq!(o.last().unwrap().as_c_str(), c"-Xnative-bridge-isa:arm64");
         assert_eq!(o.len(), 3);
+        // arches.toml: arm and x86 are the 32-bit rows
+        for isa in ["arm", "x86"] {
+            let o = native_bridge_options(Some("libx.so".into()), Some(isa));
+            assert_eq!(o.last().unwrap().as_c_str(), c"-Xopaque-jni-ids:true");
+            assert_eq!(o.len(), 4, "{isa}");
+        }
         assert!(native_bridge_options(Some("0".into()), Some("arm64")).is_empty());
         assert!(native_bridge_options(Some(String::new()), None).is_empty());
         assert!(native_bridge_options(None, Some("x86_64")).is_empty());

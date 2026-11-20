@@ -75,7 +75,7 @@ pub(super) fn call_binding(guest: HostRules, id: u32, lanes: &AtlLanes) -> Answe
     };
     #[cfg(feature = "crossing-count")]
     crate::counters::count_binding(slot, target);
-    call_host(guest, target, lanes, sig)
+    call_host(guest, target, lanes, sig, &[])
 }
 
 /// The object crossing counter's one entry (QEMU bridge plan section 5, per proxy table + slot): a guest->host call of slot `slot` of table `table` to host `target`. QEMU's [`call_object`] calls it with the table `lane_of` found; the identity object shell reaches it through [`count_object_shell`]. Break `qe_jni_count`: [`call_object`] skips it, so only identity counts.
@@ -103,11 +103,15 @@ fn call_object(rules: HostRules, id: u32, lanes: &AtlLanes) -> Answer {
     // SAFETY: x0 is the object pointer the guest called through.
     let (table, lane) =
         unsafe { objects::lane_of(guest, id as usize) }.unwrap_or_else(|r| refuse(r));
+    if lane.variadic && rules.word_bits != AAPCS64.word_bits {
+        refuse(Refused::Variadic32 { name: lane.name });
+    }
     // SAFETY: `guest` is a guest env or vm: `lane_of` found its table, which only `guest_env` / `guest_vm` objects carry.
     let host = unsafe { objects::host_of(guest) };
     let mut lanes = *lanes;
     // a `...V` call (Q6-7): its va_list read per the method's shorty into a jvalue array, which the `...A` sibling takes in the va_list's lane
-    let args: Vec<u64>;
+    let mut args: Vec<u64> = Vec::new();
+    let mut va_lane = None;
     let slot = match lane.params.iter().position(|c| *c == Class::VaList) {
         None => id as usize,
         Some(k) => {
@@ -127,7 +131,7 @@ fn call_object(rules: HostRules, id: u32, lanes: &AtlLanes) -> Answer {
                 }
             }
             .unwrap_or_else(|c| refuse(Refused::Shorty { name, c }));
-            *rules.int_arg(&mut lanes, k) = args.as_ptr() as u64;
+            va_lane = Some(k);
             jni::a_slot(id as usize)
         }
     };
@@ -146,13 +150,15 @@ fn call_object(rules: HostRules, id: u32, lanes: &AtlLanes) -> Answer {
     let arg0 = guest as u64;
     #[cfg(not(atl_nb_jni_guest_env))]
     let arg0 = host as u64;
-    lanes.regs[0] = arg0;
-    // the fixed parameters place the call (a `...V` slot's va_list lane now holds the jvalue array, an int lane: `place`); a variadic slot's `...` follows them unclassed, so it crosses as the guest set it
+    // host words replace guest lanes after the lanes are brought into the host's image (`call_host`), so a 32-bit guest's word never truncates them: the host object in lane 0, a `...V` slot's jvalue array in its va_list lane (an int lane: `place`)
+    let mut host_words = vec![(0, arg0)];
+    host_words.extend(va_lane.map(|k| (k, args.as_ptr() as u64)));
+    // the fixed parameters place the call; a variadic slot's `...` follows them unclassed, so it crosses as the guest set it (64-bit guests only: a 32-bit one is refused above)
     let sig = Sig {
         ret: lane.ret,
         params: (!lane.variadic).then_some(lane.params),
     };
-    call_host(rules, target, &lanes, sig)
+    call_host(rules, target, &lanes, sig, &host_words)
 }
 
 /// The up call per host ISA (`cfg(target_arch)` only here): `call(target, lanes, fp, sig) -> (x result, fp result bits)`, same interface on each. riscv64 places the lanes by the prototype into LP64D and calls from asm; every other host takes them as one variadic call (x86_64 SysV the reference).
@@ -167,10 +173,19 @@ use variadic as host_call;
 
 /// Calls `target` with the guest lanes `lanes` and answers its result by `sig.ret`: a double from the fp result register (its bits in v0), a float as its low 32 bits with the upper ones clear (AArch64 reads s0; LP64D's fa0 holds it NaN-boxed), a void as x0 = 0, anything else from x0; then shaped into the guest's result registers ([`guest_answer`]).
 /// The lanes enter in the guest's convention `guest` and are first brought into AAPCS64's image ([`up_lanes`]), the one every host call reads.
+/// Then `host_words` (integer argument index, host value) replace those arguments in the image: host values the guest's word cannot carry (an object call's host object and jvalue array); every argument before each is one word.
 /// Breaks: `v_drop` zeroes the fp lanes; `drop_stack` moves the stack words down one; `ret_int` reads an fp result from x0; per host, `al_zero` (variadic.rs) and `up_no_nanbox` (riscv64.rs).
-fn call_host(guest: HostRules, target: usize, lanes: &AtlLanes, sig: Sig) -> Answer {
-    #[allow(unused_mut, reason = "only the breaks below change the lanes")]
+fn call_host(
+    guest: HostRules,
+    target: usize,
+    lanes: &AtlLanes,
+    sig: Sig,
+    host_words: &[(usize, u64)],
+) -> Answer {
     let mut lanes = up_lanes(guest, lanes, sig.params).unwrap_or_else(|| refuse_up(target));
+    for &(k, v) in host_words {
+        *AAPCS64.int_arg(&mut lanes, k) = v;
+    }
     #[cfg(atl_nb_v_drop)]
     {
         lanes.fp = [0; atl_engine_api::LANE_FP];
@@ -300,8 +315,8 @@ fn refuse_up(target: usize) -> ! {
     ))
 }
 
-/// Refusals by kind, in [`refuse`]'s order: a forged id, a slot with no function, a `va_list` without a shorty source, a shorty character outside jni's, an x0 that is no proxy object. A refusal aborts, so each count reaches the abort message only.
-static REFUSED: [AtomicUsize; 5] = [const { AtomicUsize::new(0) }; 5];
+/// Refusals by kind, in [`refuse`]'s order: a forged id, a slot with no function, a `va_list` without a shorty source, a shorty character outside jni's, an x0 that is no proxy object, a `...` slot on a 32-bit guest. A refusal aborts, so each count reaches the abort message only.
+static REFUSED: [AtomicUsize; 6] = [const { AtomicUsize::new(0) }; 6];
 
 /// The named abort of a refused guest object call: the message says which call and why, with the count of that kind.
 fn refuse(r: Refused) -> ! {
@@ -329,6 +344,12 @@ fn refuse(r: Refused) -> ! {
                 char::from(c)
             ),
         ),
+        Refused::Variadic32 { name } => (
+            5,
+            format!(
+                "JNI {name}: a 32-bit guest's `...` arguments are not read yet (AAPCS32 variadic image)"
+            ),
+        ),
     };
     let n = REFUSED[kind].fetch_add(1, Ordering::Relaxed) + 1;
     unsupported(&format!(
@@ -346,26 +367,49 @@ pub unsafe extern "C" fn atl_nb_down_dispatch(slot: *const DownSlot, host: *mut 
     down_body(unsafe { &*slot }, unsafe { &mut *host });
 }
 
+/// A JNI method's reference arguments for a 32-bit guest, in host lanes `host` placed by [`HOST`] for classes `params` (`down_params` of [`Down::Env`]: env, class or `this`, then the shorty's): each reference at or above 4 GiB -- ART's transition references point into the method's managed frame on the host stack -- becomes a local reference to the same object (jni.rs `local_ref`), which ART keeps below 4 GiB and pops with the method's frame. A reference that fits passes as ART made it. Arguments past the host's stack window are left to [`place`], which refuses the call.
+fn local_refs(params: &[Class], host: &mut AtlLanes) {
+    let env = host.regs[0] as usize;
+    let mut at = Assign::new(HOST);
+    for (k, &class) in params.iter().enumerate() {
+        let Some(slot) = at.next(class) else { return };
+        // parameter 0 is the env itself; every later pointer of a JNI method is a reference (shorty `L`, the implicit class or `this`)
+        if k == 0 || class != Class::Ptr {
+            continue;
+        }
+        let lane = match slot {
+            Slot::X(i, _) => &mut host.regs[i],
+            Slot::Stack(i, _) => &mut host.stack[i],
+            Slot::V(_) => continue,
+        };
+        // break `p5_no_local_ref`: the transition reference crosses as it is, so `place` refuses it (the arm app gate goes red)
+        if *lane > WORD && !cfg!(atl_nb_p5_no_local_ref) {
+            // SAFETY: `env` is the host JNIEnv the runtime called this native method with (parameter 0 of `Down::Env`), the lane one of its reference arguments.
+            *lane = unsafe { super::jni::local_ref(env, *lane as usize) } as u64;
+        }
+    }
+}
+
 /// The host->guest body of down slot `d` (Q6-4): `host` is the shell's frame with the host call's lanes; the guest call's lanes are placed by the slot's classes (`place`), and the guest's answer goes back in `host.ret[0]` and `host.fp[0]`, which the shell returns.
 fn down_body(d: &DownSlot, host: &mut AtlLanes) {
     let rules = super::qemu::arch().rules();
     // an ILP32 callback's host object (`Down::Handle`, the host's first integer) -> its handle before placement; a handle issued for this call only is freed when the guest returns
     let scoped = d.kind.host_object(&mut host.regs[0]);
+    // a 32-bit guest's JNI method: its reference arguments made to fit, while x0 is still the host env
+    if d.kind == Down::Env && rules.word_bits != AAPCS64.word_bits {
+        local_refs(&d.params, host);
+    }
+    // the first argument of a JNI method, of JNI_OnLoad or of an SL callback is a host env, vm or interface: the guest's own object stands for it (jni.rs, sles.rs), and it is the first integer; an slObjectCallback's 6th is the 6th integer. Rewritten in the host's lanes before placement, so a 32-bit guest's placement sees the guest object (guest-addressable), never the host's
+    #[cfg(not(atl_nb_down_noenv))]
+    {
+        let (mut first, mut sixth) = (host.regs[0] as usize, *HOST.int_arg(host, 5) as usize);
+        d.kind.guest_args(&mut first, &mut sixth);
+        host.regs[0] = first as u64;
+        *HOST.int_arg(host, 5) = sixth as u64;
+    }
     let Some(mut guest) = place(&d.params, host, HOST, rules) else {
         refuse_down(d.target, &d.params)
     };
-    // the first argument of a JNI method, of JNI_OnLoad or of an SL callback is a host env, vm or interface: the guest's own object stands for it (jni.rs, sles.rs), and it is the first integer, in x0; an slObjectCallback's 6th is the 6th integer, in x5
-    #[cfg(not(atl_nb_down_noenv))]
-    {
-        // the 6th integer: x5 on AAPCS64, the 2nd stack word on AAPCS32 (`int_arg`)
-        let (mut first, mut sixth) = (
-            guest.regs[0] as usize,
-            *rules.int_arg(&mut guest, 5) as usize,
-        );
-        d.kind.guest_args(&mut first, &mut sixth);
-        guest.regs[0] = first as u64;
-        *rules.int_arg(&mut guest, 5) = sixth as u64;
-    }
     // break `down_noenv` (qemu-jni gate, checks o, m and x): the kind is not read, so the guest gets the host's env or vm
     #[cfg(atl_nb_down_noenv)]
     let _ = d.kind;

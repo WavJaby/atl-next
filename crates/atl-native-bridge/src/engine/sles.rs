@@ -10,7 +10,7 @@ use std::sync::{Mutex, OnceLock};
 
 use super::Down;
 use super::objects::{
-    self, GuestObj, TableId, host_slot, sl_android_configuration, sl_android_simple_buffer_queue,
+    self, Placed, TableId, host_slot, sl_android_configuration, sl_android_simple_buffer_queue,
     sl_buffer_queue, sl_engine, sl_object, sl_output_mix, sl_play, sl_prefetch_status, sl_seek,
     sl_volume,
 };
@@ -75,11 +75,12 @@ const _: () = {
     assert!(offset_of!(OutputMixLocator, output_mix) as u64 == SL_OUTPUT_MIX[2]);
 };
 
-/// One guest proxy: the host interface it stands for, its table, and the host object whose `Destroy` frees it (None: kept for the process).
+/// One guest proxy: the host interface it stands for, its table, the host object whose `Destroy` frees it (None: kept for the process), and the proxy object itself (freed with the entry).
 struct Proxy {
     host: usize,
     table: TableId,
     owner: Option<usize>,
+    _obj: Placed,
 }
 
 #[derive(Default)]
@@ -106,7 +107,8 @@ fn wrap(t: TableId, host: usize, owner: Option<usize>) -> usize {
         return p;
     }
     let functions = objects::functions(t, &specials(t), host);
-    let p = Box::into_raw(Box::new(GuestObj { functions, host })) as usize;
+    let obj = Placed::new(functions, host);
+    let p = obj.addr();
     m.by_host.insert((host, t), p);
     m.proxies.insert(
         p,
@@ -114,6 +116,7 @@ fn wrap(t: TableId, host: usize, owner: Option<usize>) -> usize {
             host,
             table: t,
             owner,
+            _obj: obj,
         },
     );
     p
@@ -134,10 +137,9 @@ fn release(object: usize) {
         .map(|(&g, _)| g)
         .collect();
     for g in gone {
+        // the proxy object goes with its entry (`Placed`)
         if let Some(p) = m.proxies.remove(&g) {
             m.by_host.remove(&(p.host, p.table));
-            // SAFETY: made by `wrap` with Box::into_raw and removed from the map just now, so freed once.
-            drop(unsafe { Box::from_raw(g as *mut GuestObj) });
         }
     }
 }

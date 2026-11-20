@@ -327,6 +327,22 @@ pub fn guest_arch(arches_toml: &str, arch: &str) -> Result<ArchRow> {
     arch_row(arch, row)
 }
 
+/// Every arches.toml row as (key = ART instruction-set name, `pointer_bits`), in row order.
+pub fn pointer_bits(arches_toml: &str) -> Result<Vec<(String, u32)>> {
+    let table: toml::Table = toml::from_str(arches_toml).context("parsing arches.toml")?;
+    table
+        .iter()
+        .map(|(arch, row)| {
+            let bits = row
+                .get("pointer_bits")
+                .and_then(toml::Value::as_integer)
+                .and_then(|b| u32::try_from(b).ok())
+                .with_context(|| format!("arches.toml [{arch}]: no pointer_bits"))?;
+            Ok((arch.clone(), bits))
+        })
+        .collect()
+}
+
 fn arch_row(arch: &str, row: &toml::Value) -> Result<ArchRow> {
     let kernel_arch = row
         .get("kernel_arch")

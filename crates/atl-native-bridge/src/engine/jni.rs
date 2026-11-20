@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: MIT
 //! The guest's `JNIEnv` / `JavaVM` (bridge1-step4-plan section 3, identity ABI): an object whose word 0 is a guest function table and word 1 the host object it stands for (`GuestObj`).
 //! Two rows of the proxy object tables (objects.rs): slots from jni.h; each is an object stub that crosses to the host object's own slot with only the object argument rewritten, so variadic entries need no per-signature code. Under QEMU a `va_list` entry crosses to its `...A` sibling instead, its arguments read by the method's shorty (dispatch.rs `call_object`, va_list.rs).
-//! Specials, whose results hand an env/vm back to the guest, are host functions instead (the set Berberis `jni/jni_trampolines.cc` special-cases, minus `RegisterNatives`: ART asks `isNativeBridgeFunctionPointer`): `GetJavaVM`, `GetEnv`, `AttachCurrentThread`, `AttachCurrentThreadAsDaemon`.
+//! Specials, whose results hand an env/vm back to the guest or whose arguments carry guest-layout structs, are host functions instead (the set Berberis `jni/jni_trampolines.cc` special-cases): `GetJavaVM`, `GetEnv`, `AttachCurrentThread`, `AttachCurrentThreadAsDaemon` (out-parameters written as a guest word, `JavaVMAttachArgs` read in guest layout), `RegisterNatives` (`JNINativeMethod[]` read in guest layout; ART still asks `isNativeBridgeFunctionPointer` of each `fnPtr`). Guest layouts are read by the guest's word (thread.rs `read_word`), one path for both widths.
 //! Down calls rewrite the other way (arch `Down`): host env -> this thread's guest env, host vm -> the guest vm.
+//! A 32-bit guest holds ART's references as they are, as a 32-bit ART hands them out, so ART stays the only owner of their identity and lifetime: globals are table indices, locals entries of tables ART maps below 4 GiB (patches/aosp/art 0006), method and field ids opaque indices (`-Xopaque-jni-ids:true`, atl-app-launcher); the one exception, a native method's reference arguments in its managed frame, is [`local_ref`]'d by the down call (dispatch.rs `local_refs`).
 
 use std::sync::OnceLock;
 
-use super::objects::{self, ENV as ENV_TABLE, GuestObj, VM as VM_TABLE, env, vm};
+use super::objects::{self, ENV as ENV_TABLE, Placed, VM as VM_TABLE, env, vm};
+use super::thread::write_word;
 use objects::host_slot;
 
 /// jni.h `JNI_OK`.
@@ -29,13 +31,29 @@ pub fn guest_env(host: usize) -> usize {
     let obj = slot.get_or_insert_with(|| {
         let functions = objects::functions(
             ENV_TABLE,
-            &[(env::GetJavaVM, get_java_vm as *const () as usize)],
+            &[
+                (env::GetJavaVM, get_java_vm as *const () as usize),
+                (env::RegisterNatives, register_natives as *const () as usize),
+            ],
             host,
         );
-        Box::new(GuestObj { functions, host })
+        Placed::new(functions, host)
     });
-    obj.host = host;
-    &raw const **obj as usize
+    obj.set_host(host);
+    obj.addr()
+}
+
+/// A local reference standing for host reference `obj` in env `host`'s current native frame (jni.h `NewLocalRef`): ART pops it with the frame, so it lives as long as the transition reference it replaces. 0 for 0.
+///
+/// # Safety
+/// `host` is this thread's host JNIEnv inside a native method; `obj` a reference ART handed that method.
+pub(super) unsafe fn local_ref(host: usize, obj: usize) -> usize {
+    // SAFETY: caller contract; jni.h's NewLocalRef.
+    unsafe {
+        let f: extern "C" fn(usize, usize) -> usize =
+            std::mem::transmute(host_slot(host, env::NewLocalRef));
+        f(host, obj)
+    }
 }
 
 /// The guest vm standing for host vm `host` (ART has one per process).
@@ -59,10 +77,10 @@ pub fn guest_vm(host: usize) -> usize {
             ],
             host,
         );
-        Box::into_raw(Box::new(GuestObj { functions, host })) as usize
+        Placed::new(functions, host).leak()
     });
     // SAFETY: leaked above for the process's life.
-    if unsafe { (*(p as *const GuestObj)).host } != host {
+    if unsafe { objects::host_of(p) } != host {
         super::unsupported("a second JavaVM");
     }
     p
@@ -118,66 +136,130 @@ pub(super) unsafe fn host_env(guest: usize) -> usize {
     guest
 }
 
-/// `jint GetJavaVM(JNIEnv*, JavaVM**)`, on the host thread pointer (a bound thunk).
-extern "C" fn get_java_vm(env: *const GuestObj, out: *mut usize) -> i32 {
+/// The guest's word in bytes: 4 or 8.
+fn guest_word() -> usize {
+    super::active().guest_pointer_bits() as usize / 8
+}
+
+/// `n` consecutive guest words of `word` bytes at guest address `p`, zero-extended: the pointer fields of a guest-layout struct (jni.h `JNINativeMethod` = 3 pointers; `JavaVMAttachArgs` = `jint` then 2 pointers, the first at offset `word` on ILP32 and LP64 alike).
+///
+/// # Safety
+/// `p` is readable for `n * word` bytes.
+unsafe fn guest_words(p: usize, n: usize, word: usize) -> Vec<usize> {
+    (0..n)
+        .map(|i| {
+            let at = (p + i * word) as *const u8;
+            // SAFETY: caller contract.
+            unsafe {
+                if word == 4 {
+                    at.cast::<u32>().read_unaligned() as usize
+                } else {
+                    at.cast::<u64>().read_unaligned() as usize
+                }
+            }
+        })
+        .collect()
+}
+
+/// `jint GetJavaVM(JNIEnv*, JavaVM**)`, on the host thread pointer (a bound thunk). The answer is written as a guest word.
+extern "C" fn get_java_vm(env: usize, out: usize) -> i32 {
     // SAFETY: the guest's own env and out-parameter, as jni.h's GetJavaVM takes them.
     unsafe {
-        let host = host_of(env as usize);
+        let host = host_of(env);
         let f: extern "C" fn(usize, *mut usize) -> i32 =
             std::mem::transmute(host_slot(host, env::GetJavaVM));
-        let rc = f(host, out);
+        let mut vm = 0;
+        let rc = f(host, &mut vm);
         if rc == JNI_OK {
-            *out = guest_vm(*out);
+            write_word(out as *mut u8, guest_vm(vm));
         }
         rc
     }
 }
 
 /// `jint GetEnv(JavaVM*, void**, jint)`.
-extern "C" fn get_env(vm: *const GuestObj, out: *mut usize, version: i32) -> i32 {
+extern "C" fn get_env(vm: usize, out: usize, version: i32) -> i32 {
     // SAFETY: as jni.h's GetEnv.
     unsafe {
-        let host = host_of(vm as usize);
+        let host = host_of(vm);
         let f: extern "C" fn(usize, *mut usize, i32) -> i32 =
             std::mem::transmute(host_slot(host, vm::GetEnv));
-        let rc = f(host, out, version);
+        let mut env = 0;
+        let rc = f(host, &mut env, version);
         if rc == JNI_OK {
-            *out = guest_env(*out);
+            write_word(out as *mut u8, guest_env(env));
         }
         rc
     }
 }
 
-/// `AttachCurrentThread(AsDaemon)(JavaVM*, JNIEnv**, void*)`: the host attach, then this thread's guest env.
+/// jni.h `JavaVMAttachArgs`, host layout.
+#[repr(C)]
+struct AttachArgs {
+    version: i32,
+    name: usize,
+    group: usize,
+}
+
+/// `AttachCurrentThread(AsDaemon)(JavaVM*, JNIEnv**, void*)`: the host attach with the guest's `JavaVMAttachArgs` (or NULL) in host layout, then this thread's guest env.
 ///
 /// # Safety
 /// As jni.h's AttachCurrentThread.
-unsafe fn attach(vm: *const GuestObj, out: *mut usize, args: usize, slot: usize) -> i32 {
+unsafe fn attach(vm: usize, out: usize, args: usize, slot: usize) -> i32 {
     // SAFETY: caller contract.
     unsafe {
-        let host = host_of(vm as usize);
-        let f: extern "C" fn(usize, *mut usize, usize) -> i32 =
+        let host = host_of(vm);
+        let f: extern "C" fn(usize, *mut usize, *const AttachArgs) -> i32 =
             std::mem::transmute(host_slot(host, slot));
-        let rc = f(host, out, args);
+        let word = guest_word();
+        let host_args = (args != 0).then(|| {
+            let w = guest_words(args + word, 2, word);
+            AttachArgs {
+                version: (args as *const i32).read_unaligned(),
+                name: w[0],
+                group: w[1],
+            }
+        });
+        let mut env = 0;
+        let rc = f(
+            host,
+            &mut env,
+            host_args
+                .as_ref()
+                .map_or(std::ptr::null(), |a| a as *const _),
+        );
         if rc == JNI_OK {
-            *out = guest_env(*out);
+            write_word(out as *mut u8, guest_env(env));
         }
         rc
     }
 }
 
-extern "C" fn attach_current_thread(vm: *const GuestObj, out: *mut usize, args: usize) -> i32 {
+extern "C" fn attach_current_thread(vm: usize, out: usize, args: usize) -> i32 {
     // SAFETY: the guest's arguments to jni.h's AttachCurrentThread.
     unsafe { attach(vm, out, args, vm::AttachCurrentThread) }
 }
 
-extern "C" fn attach_current_thread_as_daemon(
-    vm: *const GuestObj,
-    out: *mut usize,
-    args: usize,
-) -> i32 {
+extern "C" fn attach_current_thread_as_daemon(vm: usize, out: usize, args: usize) -> i32 {
     // SAFETY: as above.
     unsafe { attach(vm, out, args, vm::AttachCurrentThreadAsDaemon) }
+}
+
+/// `jint RegisterNatives(JNIEnv*, jclass, const JNINativeMethod*, jint)`: the guest's methods array (3 guest words each: name, signature, fnPtr) in host layout, then the host's RegisterNatives, which asks `isNativeBridgeFunctionPointer` of each `fnPtr` (a guest address) and registers its trampoline. A negative count is ART's to refuse.
+extern "C" fn register_natives(env: usize, class: usize, methods: usize, n: i32) -> i32 {
+    // SAFETY: the guest's arguments to jni.h's RegisterNatives: `methods` holds `n` entries (JNI contract).
+    unsafe {
+        let host = host_of(env);
+        let f: extern "C" fn(usize, usize, *const usize, i32) -> i32 =
+            std::mem::transmute(host_slot(host, env::RegisterNatives));
+        let count = match usize::try_from(n) {
+            Ok(count) if methods != 0 => count,
+            // ART answers a NULL array and a negative count itself
+            _ => return f(host, class, std::ptr::null(), n),
+        };
+        let table = guest_words(methods, 3 * count, guest_word());
+        f(host, class, table.as_ptr(), n)
+    }
 }
 
 #[cfg(test)]
@@ -202,5 +284,33 @@ mod tests {
             assert_eq!(a.ret, v.ret, "{}", v.name);
         }
         assert_eq!(n, 31);
+    }
+
+    /// jni.h `JNINativeMethod` is three pointers: 12 bytes per entry on ILP32 (armeabi-v7a), 24 on LP64. Two ILP32 entries laid out by hand, as the guest's compiler lays them, read back as six host words; the same bytes read as LP64 would pair words up (the red control).
+    #[test]
+    fn native_methods_are_read_in_the_guest_layout() {
+        let words: [u32; 6] = [0x1000, 0x1010, 0x8001, 0x2000, 0x2010, 0x8101];
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert_eq!(bytes.len(), 2 * 12);
+        // SAFETY: `bytes` holds 6 four-byte words.
+        let got = unsafe { guest_words(bytes.as_ptr() as usize, 6, 4) };
+        assert_eq!(got, words.map(|w| w as usize));
+        // SAFETY: 3 eight-byte words = the same 24 bytes.
+        let lp64 = unsafe { guest_words(bytes.as_ptr() as usize, 3, 8) };
+        assert_eq!(lp64[0], 0x1010_0000_1000);
+    }
+
+    /// jni.h `JavaVMAttachArgs` {jint version; const char* name; jobject group}: on ILP32 name at 4 and group at 8; on LP64 name at 8 (pointer alignment) and group at 16 -- the first pointer at offset `word` for both, as `attach` reads it.
+    #[test]
+    fn attach_args_pointers_follow_the_version_by_one_word() {
+        let mut ilp32 = [0u8; 12];
+        ilp32[0..4].copy_from_slice(&0x0001_0006i32.to_le_bytes());
+        ilp32[4..8].copy_from_slice(&0x4000u32.to_le_bytes());
+        ilp32[8..12].copy_from_slice(&0x5002u32.to_le_bytes());
+        // SAFETY: 2 words from offset 4 of 12 bytes.
+        let w = unsafe { guest_words(ilp32.as_ptr() as usize + 4, 2, 4) };
+        assert_eq!(w, [0x4000, 0x5002]);
+        assert_eq!(std::mem::offset_of!(AttachArgs, name), 8);
+        assert_eq!(std::mem::offset_of!(AttachArgs, group), 16);
     }
 }

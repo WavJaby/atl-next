@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Fri, 20 Nov 2026 23:25:33 +0800
+Subject: [PATCH] art: local reference tables below 4 GiB
+
+A local reference is its LrtEntry address with the kind bit set, so on a
+64-bit runtime it lies wherever the table was mapped. A 32-bit native
+bridge guest keeps a jobject in a 32-bit word: with the table below
+4 GiB it holds the runtime own reference unchanged, as on a 32-bit
+runtime, and the runtime stays the only owner of local reference
+lifetimes. Global and weak global references are table indices and fit
+already.
+
+Upstream-Status: Inappropriate [64-bit runtime hosting a 32-bit guest]
+Patch-Reason: the local reference value is the table address; no option,
+ allocator hook or launcher setting places the table, and a bridge-side
+ reference table would re-implement local frames and DeleteLocalRef.
+---
+SPDX-License-Identifier: Apache-2.0
+ runtime/jni/local_reference_table.cc | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/jni/local_reference_table.cc b/runtime/jni/local_reference_table.cc
+index 670db19a2259ab463b4ba3f62abe562b0826da5a..5721d154cc1ff1accf239265a8a1dcec4a13e065 100644
+--- a/runtime/jni/local_reference_table.cc
++++ b/runtime/jni/local_reference_table.cc
+@@ -40,11 +40,13 @@ namespace jni {
+ static constexpr bool kDumpStackOnNonLocalReference = false;
+ 
+ // Mmap an "indirect ref table region. Table_bytes is a multiple of a page size.
++// Below 4 GiB: a local reference is the entry's address, and a 32-bit native bridge guest holds
++// it in a 32-bit word.
+ static inline MemMap NewLRTMap(size_t table_bytes, std::string* error_msg) {
+   return MemMap::MapAnonymous("local ref table",
+                               table_bytes,
+                               PROT_READ | PROT_WRITE,
+-                              /*low_4gb=*/ false,
++                              /*low_4gb=*/ true,
+                               error_msg);
+ }
+ 

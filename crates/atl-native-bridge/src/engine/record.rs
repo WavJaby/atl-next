@@ -19,8 +19,8 @@ pub struct HostThread {
     pub(in crate::engine) shadow: [usize; SHADOW_FRAMES * FRAME_WORDS],
     /// The stack this thread's guest code runs on (`Engine::attach`'s answer); the guest's `pthread_getattr_np` reports it.
     stack: super::Stack,
-    /// This thread's guest `JNIEnv` (jni.rs `guest_env`), made on first use. Owned here, not by a `thread_local!`: glibc and bionic run thread_local destructors before pthread key destructors, and guest key destructors run by `detach` may call JNI (ART's `Thread::ThreadExitCallback` allows it), so the env must live until the record is freed.
-    pub(in crate::engine) env: Option<Box<super::objects::GuestObj>>,
+    /// This thread's guest `JNIEnv` (jni.rs `guest_env`), made on first use. Owned here, not by a `thread_local!`: glibc and bionic run thread_local destructors before pthread key destructors, and guest key destructors run by `detach` may call JNI (ART's `Thread::ThreadExitCallback` allows it), so the env must live until the record is freed. Guest-addressable (`Placed`), given back with the record.
+    pub(in crate::engine) env: Option<super::objects::Placed>,
 }
 
 const _: () = {

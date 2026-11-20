@@ -132,14 +132,7 @@ pub fn active() -> Active {
 }
 
 /// Chooses the process's engine for app ISA `isa` (`None`: ART named none) and starts it ([`Engine::start`]). A second call must name the same engine: one bridge per process, one ABI per app (plan README "only one process width"), so a second foreign ISA is refused.
-/// An arm app is refused here, before the claim: its guest gets the host's JavaVM / JNIEnv objects and references above 4 GiB (`JNI_OnLoad`'s vm: an `ilp32-argument` refusal, then a guest fault on the null), so it waits for 32-bit JNI objects in the window (phase4-32bit P5). Its engine boots (the QEMU gates do it through `qemu::boot`). Delete with P5.
 pub fn select(isa: Option<&str>) -> Result<Active, String> {
-    if isa.and_then(qemu::Arch::of_isa) == Some(qemu::Arch::Arm) {
-        return Err(
-            "ISA arm: 32-bit JNI objects (guest JavaVM / JNIEnv, references) not in the window yet (P5)"
-                .to_owned(),
-        );
-    }
     let engine = claim(isa)?;
     engine.start()?;
     Ok(engine)
@@ -737,7 +730,7 @@ mod tests {
     const QEMU64: Active = Active::Qemu(qemu::Arch::Aarch64);
     const QEMU32: Active = Active::Qemu(qemu::Arch::Arm);
 
-    /// Each QEMU guest's facts come from its one row (qemu/arch.rs): ISA name = arches.toml row, pointer width = its `pointer_bits`, ELF machine; an arm app is refused before any claim until P4a/P4b.
+    /// Each QEMU guest's facts come from its one row (qemu/arch.rs): ISA name = arches.toml row, pointer width = its `pointer_bits`, ELF machine.
     #[test]
     fn qemu_guests() {
         assert_eq!(
@@ -749,7 +742,6 @@ mod tests {
             ("arm", 32)
         );
         assert_eq!(QEMU32.machine(), Ok(object::elf::EM_ARM));
-        assert!(select(Some("arm")).is_err());
     }
 
     /// D-3: host ISA (or none) -> identity, QEMU's ISA -> QEMU, an unknown ISA and a second, different engine refused. Red under breaks `host_qemu` and `second_isa`.

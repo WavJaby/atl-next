@@ -2707,6 +2707,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("second_isa", "atl_nb_second_isa"),
     // Q5-6 (engine/thread.rs `detach`): a guest key destructor never runs at thread exit (qemu-thread gate, `qt_last_value`)
     ("qt_skip_dtor", "atl_nb_qt_skip_dtor"),
+    // P5 (engine/dispatch.rs `local_refs`): a 32-bit guest's native method gets its transition references as they are, refused (counted) above 4 GiB (app gate `--fixture-arch arm`, registeredAnswer)
+    ("p5_no_local_ref", "atl_nb_p5_no_local_ref"),
     // P4a (engine/mod.rs `Active::release`): QEMU windows are never given back, so thread churn keeps every exited thread's record and TLS (qemu-thread gate, `c`)
     ("qt_keep_windows", "atl_nb_qt_keep_windows"),
     // Q5-6 (engine/intercepts.rs `run`): a guest thread's routine gets the wrong argument (qemu-thread gate, `qt_join`)

@@ -1107,9 +1107,31 @@ const QEMU_DEFERRED: &[&str] = &[
     "legacyNew",
     "zRoundTrip",
 ];
-/// The calls a run of fixture ISA `isa` on host `host` skips: none for the host's (identity), [`QEMU_DEFERRED`] for a foreign one.
-fn deferred(isa: &str, host: &str) -> &'static [&'static str] {
-    if isa == host { &[] } else { QEMU_DEFERRED }
+/// The diag key prefix of the bridge's refusals of a host pointer to a 32-bit guest (atl-native-bridge engine dispatch.rs `REFUSED_*`).
+const ILP32_REFUSAL: &str = "native-bridge.ilp32-";
+/// The bridge-1 calls a 32-bit guest carries (32-bit JNI objects, first slice: the guest's JavaVM / JNIEnv in `JNI_OnLoad` with GetEnv, FindClass and RegisterNatives, and native methods answering an int). Every other call of a 32-bit fixture is deferred until the JNI slice that carries it (variadic Call*Method, string and array copies, guest threads, the NDK rows).
+const ILP32_CARRIED: &[&str] = &[
+    "tlsCounter#1",
+    "tlsCounter#2",
+    "tlsCounter#3",
+    "errnoRoundTrip",
+    "dlopenSibling",
+    "registeredAnswer",
+];
+/// The calls a run of fixture ISA `isa` (guest pointer width `pointer_bits`) on host `host` skips: none for the host's (identity), [`QEMU_DEFERRED`] for a foreign 64-bit one, all but [`ILP32_CARRIED`] for a 32-bit one.
+fn deferred(isa: &str, host: &str, pointer_bits: u32) -> Vec<&'static str> {
+    if isa == host {
+        Vec::new()
+    } else if pointer_bits == 32 {
+        BRIDGE1_CALLS
+            .iter()
+            .map(|&(name, _)| name)
+            .chain([FIRST_CONFIG, CPU_PROBE, CPUINFO_VIEW])
+            .filter(|name| !ILP32_CARRIED.contains(name))
+            .collect()
+    } else {
+        QEMU_DEFERRED.to_vec()
+    }
 }
 
 /// Every bridge-1 call whose line is missing or wrong (a `deferred` label's line must be `skipped`), then the thread balance.
@@ -1153,7 +1175,21 @@ fn bridge1_call_failures(
     } else if let Some(why) = first_config_why(got(FIRST_CONFIG).as_deref()) {
         whys.push(format!("bridge1 call {FIRST_CONFIG}: {why}"));
     }
+    // every carried call runs without the bridge refusing a host pointer to a 32-bit guest (engine dispatch.rs `report_refused`, keys `native-bridge.ilp32-*`): a JNI method's class or reference argument, a reference ART returned, the guest's env or vm
+    if let Some(l) = app.lines().find(|l| l.contains(ILP32_REFUSAL)) {
+        whys.push(format!("bridge1: a host pointer refused to the guest: {l}"));
+    }
+    // a deferred cpu row must log `skipped`, as every deferred row
+    for name in [CPU_PROBE, CPUINFO_VIEW] {
+        if deferred.contains(&name) && got(name).as_deref() != Some(SKIPPED) {
+            whys.push(format!(
+                "bridge1 call {name}: want {SKIPPED}, got {:?}",
+                got(name)
+            ));
+        }
+    }
     match cpu {
+        _ if deferred.contains(&CPU_PROBE) => {}
         Ok(cpu) => {
             if let Some(why) = cpu_probe_why(got(CPU_PROBE).as_deref(), foreign, cpu) {
                 whys.push(format!("bridge1 call {CPU_PROBE}: {why}"));
@@ -1164,7 +1200,9 @@ fn bridge1_call_failures(
         )),
     }
     let host_word = cpuinfo_features(cpu.as_ref().map_or("", |c| c.cpuinfo.as_str()));
-    if let Some(why) = cpuinfo_view_why(got(CPUINFO_VIEW).as_deref(), foreign, host_word) {
+    if !deferred.contains(&CPUINFO_VIEW)
+        && let Some(why) = cpuinfo_view_why(got(CPUINFO_VIEW).as_deref(), foreign, host_word)
+    {
         whys.push(format!("bridge1 call {CPUINFO_VIEW}: {why}"));
     }
     if app.contains("called unimplemented OpenGL ES API") {
@@ -1183,6 +1221,8 @@ fn bridge1_call_failures(
     });
     match balance {
         Some((a, d)) if a == d + 1 => {}
+        // no row that starts a thread ran (a 32-bit fixture defers them), so no thread detached
+        None if deferred.contains(&"tlsCounterFreshThread") && deferred.contains(&"threadSum") => {}
         other => whys.push(format!(
             "bridge1 threads: want attached = detached + 1 (the main thread), got {other:?}"
         )),
@@ -1803,7 +1843,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         "--host {}: no identity engine (arches.toml), so the fixture needs a foreign --fixture-arch",
         args.host
     );
-    let deferred = deferred(isa, &args.host);
+    let pointer_bits = crate::arches::load(root)?
+        .get(isa)
+        .with_context(|| format!("--fixture-arch {isa}: no arches.toml row"))?
+        .pointer_bits;
+    let deferred = &deferred(isa, &args.host, pointer_bits)[..];
     let rt = if isa == args.host {
         rt
     } else {
@@ -2201,9 +2245,7 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
         .unwrap_or_else(|| "FAIL no cacerts line".to_owned());
     let bridge1 = app.lines().find(|l| l.contains(BRIDGE1));
     let bridge1_ok = bridge1.is_some();
-    let mut whys = jni_fixture::legacy_failures(libs)?;
-    whys.extend(jni_fixture::ndk_failures(libs)?);
-    whys.extend(jni_fixture::es1_failures(libs)?);
+    let mut whys = jni_fixture::shape_failures(libs)?;
     if let Some(f) = &fault {
         whys.push(format!("the app faulted: {f}"));
         println!("---- app log (last {TAIL} lines)\n{}", tail(&app, TAIL));
@@ -2643,9 +2685,7 @@ fn remote_verdict(
     let (rc, atld_exited, _) = remote_end(rt, run, child)?;
     let read = atl_diag::logfiles::read;
     let app = read(&run.log(app_name));
-    let mut whys = jni_fixture::legacy_failures(libs)?;
-    whys.extend(jni_fixture::ndk_failures(libs)?);
-    whys.extend(jni_fixture::es1_failures(libs)?);
+    let mut whys = jni_fixture::shape_failures(libs)?;
     let passed = app.lines().any(|l| l.contains(MARKER));
     if passed {
         if !app.contains(MAIN_RESUMED) {
