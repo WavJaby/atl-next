@@ -397,10 +397,13 @@ mod tests {
         assert!(
             err("[x]\nprovider = \"upstream:qemu\"\nreason = \"r\"\n").contains("no build recipe")
         );
-        // the recipe installs libcrypto, libcrypto_static and libssl only
+        // the recipe provides libcrypto, libcrypto_static, libssl, the bssl-sys wrappers and the two Rust crates only
         assert!(
             err("[libdecrepit]\nprovider = \"upstream:boringssl\"\nreason = \"r\"\n")
-                .contains("installs no module `libdecrepit`")
+                .contains("provides no module `libdecrepit`")
+        );
+        assert!(
+            parsed("[libbssl_crypto]\nprovider = \"upstream:boringssl\"\nreason = \"r\"\n").is_ok()
         );
     }
 
