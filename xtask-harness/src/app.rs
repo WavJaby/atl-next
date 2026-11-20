@@ -227,7 +227,11 @@ const MEDIAPLAYER_START: &str = "MediaPlayerNative: start called in state 1";
 /// getSimStateForSlotIndex:19217); getPhoneType PHONE_TYPE_NONE (0; no ITelephony and no ro.telephony.default_network, getPhoneTypeFromNetworkType:2841); getNetworkOperator "" (operator_numeric
 /// unset); getDataState DATA_DISCONNECTED (0; null ITelephony). registerTelephonyCallback reaches the registry, which delivers nothing (validatePhoneId: the service sees no modem) -> calls=0.
 /// Without the registry the register NPEs. A Wi-Fi tablet's SIM_STATE_ABSENT needs the device declared modem-less (zero modems) first: not modelled.
-const SERVICE_LINES: [(&str, &str, Option<&str>); 16] = [
+/// batterystats: [`battery_want`] (the sticky ACTION_BATTERY_CHANGED read with a null receiver, isCharging, getIntProperty(CAPACITY)).
+/// netstats: Main.netstats: TrafficStats for the app's uid and the device total read null stats (NetworkStatsService's native-null answer, netstats.rs) -> UNSUPPORTED -1 (TrafficStats.java:1343-1345).
+const SERVICE_LINES: [(&str, &str, Option<&str>); 18] = [
+    ("batterystats", "AtlTest: battery: ", None),
+    ("netstats", "AtlTest: netstats: ", Some("uid=-1 total=-1")),
     (
         "audio",
         "AtlTest: audiodevices: ",
@@ -350,7 +354,16 @@ const NOTIFY_ATLD_LINES: [&str; 3] = [
 /// user: Main.userProfile's isProfile; a missing method reads back as null = "not a profile" too, so only this count tells them apart (and UserManager then caches the answer instead of asking again).
 /// notification (zen): a missing getZenMode reads back as 0 = ZEN_MODE_OFF too; only the count tells them apart.
 /// locale: Main.locales' own getApplicationLocales: the empty list is also what a reply without a LocaleList would make of an app that sets none, so the count shows the service answered.
-const SERVICE_CALLS: [(&str, &str); 13] = [
+/// netstats: a missing getUidStats / getTotalStats reads back as null stats = UNSUPPORTED -1 too; only the count tells them apart.
+const SERVICE_CALLS: [(&str, &str); 15] = [
+    (
+        "netstats",
+        "INetworkStatsService.getUidStats (null: no per-app accounting)",
+    ),
+    (
+        "netstats",
+        "INetworkStatsService.getTotalStats (null: host-wide counters withheld)",
+    ),
     ("user", "IUserManager.getProfileType"),
     (
         "locale",
@@ -829,9 +842,66 @@ const LOG_LINES: [Line; 26] = [
     WEBVIEW_CLASSLOADER,
 ];
 
-/// A [`SERVICE_LINES`] expectation: the fixed value, or for connectivity (None) [`connectivity_want`].
-fn service_want(fixed: Option<&str>) -> String {
-    fixed.map_or_else(connectivity_want, str::to_owned)
+/// A [`SERVICE_LINES`] expectation: the fixed value, or this host's (None): [`connectivity_want`], [`battery_want`].
+fn service_want(service: &str, fixed: Option<&str>) -> String {
+    match (fixed, service) {
+        (Some(f), _) => f.to_owned(),
+        (None, "batterystats") => battery_want(),
+        (None, "connectivity") => connectivity_want(),
+        (None, other) => format!("<no host-derived want for {other}>"),
+    }
+}
+
+/// The battery line (Main.battery) for this host, from its power-supply sysfs read here, not through the HAL: each `/sys/class/power_supply/<name>`'s `type`; a `Battery` gives present (`present`, else 1),
+/// level and CAPACITY (`capacity`), status (`status`: BatteryMonitor's names, Unknown 1 / Charging 2 / Discharging 3 / Not charging 4 / Full 5); plugged = the first online of Mains (AC 1), USB (2),
+/// Wireless (4) (BatteryService.plugType's order); charging = BatteryStatsImpl's state at a fresh start: false only on battery (unplugged with a known status).
+/// No battery (the WSL dev host): BatteryMonitor's initHealthInfo answer -- present false, level 0, status UNKNOWN 1 -- and CAPACITY unsupported: Health::getCapacity EX_UNSUPPORTED_OPERATION -> getProperty -1 ->
+/// BatteryManager.queryProperty Long.MIN_VALUE -> getIntProperty Integer.MIN_VALUE (targetSdk >= P). Scale BatteryService.BATTERY_SCALE 100.
+fn battery_want() -> String {
+    let read = |p: &Path| std::fs::read_to_string(p).map(|s| s.trim().to_owned()).ok();
+    let (mut battery, mut plugged) = (None, 0);
+    let mut online = Vec::new();
+    for e in std::fs::read_dir("/sys/class/power_supply")
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let d = e.path();
+        let is_online = read(&d.join("online")).as_deref() == Some("1");
+        match read(&d.join("type")).as_deref() {
+            Some("Battery") => {
+                battery = Some((
+                    read(&d.join("present")).is_none_or(|p| p == "1"),
+                    read(&d.join("capacity")).and_then(|c| c.parse::<i32>().ok()).unwrap_or(0),
+                    match read(&d.join("status")).as_deref() {
+                        Some("Charging") => 2,
+                        Some("Discharging") => 3,
+                        Some("Not charging") => 4,
+                        Some("Full") => 5,
+                        _ => 1,
+                    },
+                ))
+            }
+            Some("Mains") if is_online => online.push(1),
+            Some(t) if t.starts_with("USB") && is_online => online.push(2),
+            Some("Wireless") if is_online => online.push(4),
+            _ => {}
+        }
+    }
+    for p in [1, 2, 4] {
+        if online.contains(&p) {
+            plugged = p;
+            break;
+        }
+    }
+    let (present, level, status, capacity) = match battery {
+        Some((present, level, status)) => (present, level, status, i64::from(level)),
+        None => (false, 0, 1, i64::from(i32::MIN)),
+    };
+    let charging = !(plugged == 0 && status != 1);
+    format!(
+        "present={present} level={level} status={status} plugged={plugged} charging={charging} capacity={capacity} scale=100"
+    )
 }
 
 /// The connectivity line (Main.connectivity) for this host, read with the host's own tools, not the platform layer's code: the default route's interface from iproute2 (`ip route show default`, IPv4 then IPv6, lowest metric);
@@ -2383,7 +2453,7 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
         .iter()
         .filter(|(_, _, w)| !remote || w.is_some())
     {
-        let want = service_want(*want);
+        let want = service_want(service, *want);
         let got = app
             .lines()
             .find_map(|l| l.split_once(prefix).map(|(_, r)| r.to_owned()));
@@ -2641,7 +2711,7 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
             .iter()
             .filter(|(_, _, w)| !remote || w.is_some())
         {
-            println!("app: pass {service} {}", service_want(*want));
+            println!("app: pass {service} {}", service_want(service, *want));
         }
         println!("app: pass processes {PROCESSES_WANT}");
         println!("app: pass sysanswers {SYSANSWERS_WANT}");

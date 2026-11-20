@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! The `power` service (Context.POWER_SERVICE) and the `thermalservice` binder it needs: SystemServiceRegistry builds PowerManager only when both `getServiceOrThrow` lookups succeed,
 //! else getSystemService returns null (Angry Birds 2's vungle AndroidPlatform.<init> casts it unchecked and dies).
-//! Behaviour = PowerManagerService.BinderService for a desktop that is awake, on mains, with battery saver off: interactive, no power save, no device idle.
+//! Behaviour = PowerManagerService.BinderService for a desktop that is awake with battery saver off: interactive, no power save, no device idle. The power source is battery.rs's (the health HAL's),
+//! the one source; no method here answers a plugged state today (PowerManagerService reads BatteryManagerInternal.getPlugType for wake-on-plug and stay-on, neither app-observable through this binder).
 //! Wake locks: acquire/release checked and recorded per token as acquireWakeLockInternal does (re-acquire of a held token updates it), counted in the log; they hold nothing on the host yet
 //! (a native program would inhibit idle through the desktop; not built). Not modelled: the token's death (AOSP's linkToDeath releases it), display ids, callbacks, work sources (non-null refused by atl-parcelables).
 //! IThermalService: registered bare, every method UNKNOWN_TRANSACTION (counted) -- PowerManager only stores it; its thermal methods reach it lazily.

@@ -6,14 +6,14 @@
 //!    file work on their request (control `Install`: stage under session names (hard links where possible) + run atl-installer in the broker's installer profile; `Commit`: rename each file by its
 //!    parsed split (`base.apk`, `split_<name>.apk`), then the dir to `/data/app/<package>`, create the data dirs).
 //! 3. atl-binderd, its admin connection on stdin; the broker holds the other end.
-//! 4. AOSP servicemanager as uid 1000 (AID_SYSTEM), the one process that may become context manager. With `--keystore2`: AOSP's KeyMint HAL (uid AID_NOBODY), then keystore2 (AID_KEYSTORE) with its database dir.
+//! 4. AOSP servicemanager as uid 1000 (AID_SYSTEM), the one process that may become context manager. With `--health`: AOSP's health HAL (AID_SYSTEM) on the host's power-supply sysfs. With `--keystore2`: AOSP's KeyMint HAL (uid AID_NOBODY), then keystore2 (AID_KEYSTORE) with its database dir.
 //! 5. atl-system-services as uid 1000 with the packages and, as its stdin, the process-control connection (atl_broker::control): it starts app processes (ActivityManager's ProcessList) and kills them, here, through
 //!    the broker's sandbox. atld waits for its `services: ready`.
 //! 6. `--run-class`: a command as uid `--run-uid` (the shell), `am instrument` for example; its exit ends the run.
 //! 7. the control socket `<root>/control.sock` (serve_run_control): `stop` ends the run, `start <package>/<class>` is `am start`. An app process ending does not end the run: the services see its death.
 //!    Except with `--exit-with-last-app` (default with `--ui`): the services' `LastAppEnded` after the last app's window closed or it finished / exited 0 ends it ([`Host::last_app_ended`]).
 //!
-//! 8. the end (`stop`, the last app's end, the command's exit, SIGINT/SIGTERM): app processes SIGKILLed; the services, gralloc, servicemanager, keystore2 and its HAL SIGTERMed (then SIGKILLed after `--stop-grace-ms`); binderd by its admin
+//! 8. the end (`stop`, the last app's end, the command's exit, SIGINT/SIGTERM): app processes SIGKILLed; the services, gralloc, servicemanager and step 4's daemons SIGTERMed (then SIGKILLed after `--stop-grace-ms`); binderd by its admin
 //!    connection; then the ranked summary of every process's `diag:` lines on stderr (`atld: summary ...`, print_summary).
 //!
 //! Exit status: the command's (bwrap passes it on); 0 after `stop` and after the last app's end; 128 + n after signal n; failure when the services exited. Plan: binderd, servicemanager and the services move into this process later; here each is a process, as `xtask test binder` runs them.
@@ -98,6 +98,11 @@ struct Args {
     /// Omitted: no graphics buffers (headless runs on a host without a DRM device). The mapper library `mapper.atl.so` it names to libui must be in `--lib-path`.
     #[arg(long)]
     gralloc: Option<PathBuf>,
+    /// AOSP's default health HAL executable (`android.hardware.health-service.example`, hardware/interfaces/health/aidl/default): `IHealth/default` over BatteryMonitor, run as AID_SYSTEM (its `.rc`) after
+    /// servicemanager with the host's power-supply sysfs read-only (atl_broker::power_supply_sysfs); its VINTF fragment comes with `--vintf-fragment`. The battery services' source.
+    /// Omitted: no battery services (BatteryManager is null in apps).
+    #[arg(long)]
+    health: Option<PathBuf>,
     /// AOSP keystore2 executable (system/security): `IKeystoreService/default` and its companion services, run as AID_KEYSTORE with its database dir (atl_android_paths::keystore_db_host) at /data/misc/keystore, after the KeyMint HAL (`--keymint`).
     /// Omitted: no keystore (apps' AndroidKeyStore finds no service).
     #[arg(long, requires = "keymint")]
@@ -2090,15 +2095,26 @@ fn run(a: &Args) -> Result<ExitCode> {
     kernel_log_to_log(&mut sm_spawn, &r.log("servicemanager"))?;
     let mut sm = broker.spawn(sm_spawn).context("starting servicemanager")?;
     log(format_args!("servicemanager: host pid {}", sm.host_pid));
+    // the daemons servicemanager's clients reach, in init's order: the HALs (hal / early_hal classes), then keystore2 (class main); each logs through its own logdw socket
+    let mut daemons = Vec::new();
+    let sockets = r.root.join("logdw");
+    std::fs::create_dir_all(&sockets)?;
+    // the health HAL (its .rc: `user system`), the battery services' source: the host's power-supply sysfs read-only, nothing else of /sys (atl_broker::power_supply_sysfs)
+    if let Some(health) = &a.health {
+        let mut hal = system_spawn("health", health, vec![], false, None)?;
+        logdw_to_log(&mut hal, &sockets.join("health"), &r.log("health"))?;
+        let (mounts, links) =
+            atl_broker::power_supply_sysfs().context("the host's power-supply sysfs")?;
+        hal.mounts.extend(mounts);
+        hal.links.extend(links);
+        daemons.push(("health", broker.spawn(hal).context("starting the health HAL")?));
+    }
     // the KeyMint HAL, then keystore2 on it (init's order: early_hal before keystore2's class main); keystore2 alone holds its database dir
-    let mut keystore = Vec::new();
     if let (Some(keystore2), Some(keymint)) = (&a.keystore2, &a.keymint) {
-        let sockets = r.root.join("logdw");
-        std::fs::create_dir_all(&sockets)?;
         let mut hal = system_spawn("keymint", keymint, vec![], false, None)?;
         hal.uid = AID_NOBODY;
         logdw_to_log(&mut hal, &sockets.join("keymint"), &r.log("keymint"))?;
-        keystore.push((
+        daemons.push((
             "keymint",
             broker.spawn(hal).context("starting the KeyMint HAL")?,
         ));
@@ -2119,10 +2135,10 @@ fn run(a: &Args) -> Result<ExitCode> {
             at: KEYSTORE_DB.into(),
             writable: true,
         });
-        keystore.push(("keystore2", broker.spawn(ks).context("starting keystore2")?));
-        for (name, p) in &keystore {
-            log(format_args!("{name}: host pid {}", p.host_pid));
-        }
+        daemons.push(("keystore2", broker.spawn(ks).context("starting keystore2")?));
+    }
+    for (name, p) in &daemons {
+        log(format_args!("{name}: host pid {}", p.host_pid));
     }
     // the guest cpuinfo before any app can start: the probe under the installed engine, with /system as apps see it
     let mut cpuinfo = BTreeMap::new();
@@ -2765,7 +2781,7 @@ fn run(a: &Args) -> Result<ExitCode> {
                 if let Some(s) = services.child.try_wait()? {
                     break End::Services(s);
                 }
-                for (name, p) in system_processes(&mut sm, gralloc.as_mut(), &mut keystore) {
+                for (name, p) in system_processes(&mut sm, gralloc.as_mut(), &mut daemons) {
                     if died.iter().any(|(n, _)| *n == name) {
                         continue;
                     }
@@ -2809,7 +2825,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         let _ = kill_sandbox(pid);
     }
     // a daemon seen dead mid-run was reaped already: nothing to stop
-    let mut stopping = system_processes(&mut sm, gralloc.as_mut(), &mut keystore);
+    let mut stopping = system_processes(&mut sm, gralloc.as_mut(), &mut daemons);
     stopping.retain(|(name, _)| !died.iter().any(|(n, _)| n == name));
     stopping.push(("services", &mut services));
     std::thread::scope(|s| {
@@ -2877,15 +2893,15 @@ fn run(a: &Args) -> Result<ExitCode> {
 /// atld's diag outcome for a system daemon that exited before the run's end (api = its name, cause = its status).
 const SYSTEM_DIED: &str = "system:died";
 
-/// Every system daemon atld started except the services (whose exit ends the run): servicemanager, gralloc, the keystore pair.
+/// Every system daemon atld started except the services (whose exit ends the run): servicemanager, gralloc, step 4's daemons (health HAL, the keystore pair).
 fn system_processes<'a>(
     sm: &'a mut Process,
     gralloc: Option<&'a mut Process>,
-    keystore: &'a mut [(&'static str, Process)],
+    daemons: &'a mut [(&'static str, Process)],
 ) -> Vec<(&'static str, &'a mut Process)> {
     let mut v = vec![("servicemanager", sm)];
     v.extend(gralloc.map(|p| ("gralloc", p)));
-    v.extend(keystore.iter_mut().map(|(n, p)| (*n, p)));
+    v.extend(daemons.iter_mut().map(|(n, p)| (*n, p)));
     v
 }
 

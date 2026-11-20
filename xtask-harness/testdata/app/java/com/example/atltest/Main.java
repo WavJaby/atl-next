@@ -697,6 +697,8 @@ public class Main extends Activity {
         Log.i("AtlTest", "permission: " + permission());
         Log.i("AtlTest", "notification: " + channels());
         Log.i("AtlTest", "power: " + power());
+        Log.i("AtlTest", "battery: " + battery());
+        Log.i("AtlTest", "netstats: " + netstats());
         Log.i("AtlTest", "uimode: " + uiMode());
         Log.i("AtlTest", "locale: " + locales());
         Log.i("AtlTest", "keyguard: " + keyguard());
@@ -1189,6 +1191,45 @@ public class Main extends Activity {
             return "interactive=" + pm.isInteractive() + " powersave=" + pm.isPowerSaveMode()
                     + " partial=" + pm.isWakeLockLevelSupported(android.os.PowerManager.PARTIAL_WAKE_LOCK)
                     + " held=" + held + " released=" + !wl.isHeld();
+        } catch (Throwable t) {
+            return "threw " + t;
+        }
+    }
+
+    /**
+     * "present=<bool> level=<int> status=<int> plugged=<int> charging=<bool> capacity=<int> scale=<int>": the sticky ACTION_BATTERY_CHANGED read with a null receiver (its extras), BatteryManager.isCharging
+     * and getIntProperty(BATTERY_PROPERTY_CAPACITY); "absent" when getSystemService returns null (BatteryManager needs batterystats and batteryproperties), "nosticky" when no sticky was sent; else what it threw.
+     */
+    private String battery() {
+        try {
+            android.os.BatteryManager bm = (android.os.BatteryManager) getSystemService(BATTERY_SERVICE);
+            if (bm == null) {
+                return "absent";
+            }
+            Intent sticky = registerReceiver(null, new android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+            if (sticky == null) {
+                return "nosticky";
+            }
+            return "present=" + sticky.getBooleanExtra(android.os.BatteryManager.EXTRA_PRESENT, false)
+                    + " level=" + sticky.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -100)
+                    + " status=" + sticky.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -100)
+                    + " plugged=" + sticky.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, -100)
+                    + " charging=" + bm.isCharging()
+                    + " capacity=" + bm.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY)
+                    + " scale=" + sticky.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, -100);
+        } catch (Throwable t) {
+            return "threw " + t;
+        }
+    }
+
+    /** "uid=<long> total=<long>": TrafficStats for the app's own uid and the device total (TrafficStats.init ran in handleBindApplication); "absent" when NetworkStatsManager is null; else what it threw. */
+    private String netstats() {
+        try {
+            if (getSystemService(NETWORK_STATS_SERVICE) == null) {
+                return "absent";
+            }
+            return "uid=" + android.net.TrafficStats.getUidRxBytes(android.os.Process.myUid())
+                    + " total=" + android.net.TrafficStats.getTotalRxBytes();
         } catch (Throwable t) {
             return "threw " + t;
         }

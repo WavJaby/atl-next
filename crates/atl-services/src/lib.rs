@@ -27,7 +27,6 @@ pub mod desktop_bounds;
 pub mod focus;
 pub mod ime_bind;
 pub mod memory_levels;
-pub mod netstats;
 pub mod observer_rules;
 pub mod pattern_matcher;
 pub mod pending_intent_table;
@@ -50,6 +49,8 @@ pub mod alarm;
 pub mod appops;
 #[cfg(feature = "converter")]
 pub mod audio;
+#[cfg(feature = "converter")]
+pub mod battery;
 #[cfg(feature = "converter")]
 mod broadcast_queue;
 #[cfg(feature = "converter")]
@@ -76,6 +77,8 @@ pub mod locale;
 pub mod notification;
 #[cfg(feature = "converter")]
 pub mod notification_channels;
+#[cfg(feature = "converter")]
+pub mod netstats;
 #[cfg(feature = "converter")]
 mod notification_display;
 #[cfg(feature = "converter")]

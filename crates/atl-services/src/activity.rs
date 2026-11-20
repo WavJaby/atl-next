@@ -877,6 +877,119 @@ impl ActivityManager {
         queued
     }
 
+    /// A broadcast the services send as the system to every user (ActivityManager.broadcastStickyIntent(intent, USER_ALL) for `sticky`, Context.sendBroadcastAsUser(intent, UserHandle.ALL) otherwise):
+    /// system_server's own call clears its calling identity, so broadcastIntentWithFeature sees SYSTEM_UID and this process; result code Activity.RESULT_OK (-1). The same path as an app's broadcast ([`Self::send_broadcast`]).
+    pub fn broadcast_as_system(&self, intent: &Intent, sticky: bool) {
+        const RESULT_OK: i32 = -1;
+        let pid = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
+        if let Err(e) = self.send_broadcast(
+            intent,
+            None,
+            pid,
+            SYSTEM_UID,
+            broadcast::USER_ALL,
+            &[],
+            (RESULT_OK, None, None),
+            sticky,
+        ) {
+            log(format_args!("system broadcast {:?}: {e}", intent.action));
+        }
+    }
+
+    /// BroadcastController.broadcastIntentLocked after verifyBroadcastLocked, for a sender (`pid`, `uid`) to `user`: a sticky is checked and stored (:1415-1495), an explicit component reaches its manifest
+    /// receiver (:1516-1518, unless FLAG_RECEIVER_REGISTERED_ONLY), an intent without one the matching registered receivers (:1520-1545); each passes BroadcastSkipPolicy (broadcast.rs) and is queued for its
+    /// process (BroadcastQueueImpl, broadcast_queue.rs). `result` = (code, data, extras) each receiver gets. Result BROADCAST_SUCCESS.
+    #[allow(clippy::too_many_arguments)]
+    fn send_broadcast(
+        &self,
+        intent: &Intent,
+        resolved_type: Option<&str>,
+        pid: i32,
+        uid: u32,
+        user: i32,
+        required: &[String],
+        result: (i32, Option<String>, Option<Bundle>),
+        sticky: bool,
+    ) -> binder::Result<i32> {
+        let inner = &self.inner;
+        if sticky {
+            let holds = inner.holds(uid, permission::BROADCAST_STICKY);
+            match broadcast::sticky_send(
+                holds,
+                pid,
+                uid,
+                !required.is_empty(),
+                intent.component.is_some(),
+            ) {
+                Ok(()) => {}
+                Err(StickyRefusal::Security(msg)) => {
+                    log(format_args!("{msg}"));
+                    return Err(security(&msg));
+                }
+                Err(StickyRefusal::CantHavePermission) => {
+                    log(format_args!(
+                        "Can't broadcast sticky intent and enforce permissions {required:?}"
+                    ));
+                    return Ok(broadcast::BROADCAST_STICKY_CANT_HAVE_PERMISSION);
+                }
+            }
+        }
+        let key = intent_key(intent, resolved_type);
+        let mut st = inner.state();
+        if sticky {
+            st.broadcasts
+                .put_sticky(user, key.clone(), intent.clone(), uid);
+        }
+        let registered_only = intent.flags & broadcast::FLAG_RECEIVER_REGISTERED_ONLY != 0;
+        match &intent.component {
+            Some(c) if !registered_only => inner.deliver_to_component_locked(
+                &mut st,
+                intent,
+                &c.package,
+                &c.class,
+                uid,
+                required,
+                result.clone(),
+                user,
+            ),
+            Some(_) => {}
+            None if !registered_only => {
+                atl_diag::answered(
+                    AM,
+                    "implicit broadcast: manifest receivers not resolved (P2)",
+                );
+            }
+            None => {}
+        }
+        if intent.component.is_none() {
+            for (receiver, rpid, ruid, bf) in st.broadcasts.receivers(&key, user) {
+                if let Some(why) = broadcast::skip_registered(
+                    &bf,
+                    uid,
+                    ruid,
+                    required,
+                    |p| inner.holds(uid, p),
+                    |p| inner.holds(ruid, p),
+                ) {
+                    atl_diag::answered(AM, why.split(':').next().unwrap_or("skipped"));
+                    log(format_args!("{why}"));
+                    continue;
+                }
+                let job = Job::Registered {
+                    receiver: receiver.0,
+                    intent: intent.clone(),
+                    result_code: result.0,
+                    data: result.1.clone(),
+                    extras: result.2.clone(),
+                    initial_sticky: false,
+                    user,
+                };
+                inner.deliver_locked(&mut st, rpid, job);
+            }
+        }
+        Ok(BROADCAST_SUCCESS)
+    }
+
     /// Registry set_bounds changed `task`'s size.
     pub(crate) fn task_resized(&self, task: TaskId) {
         self.inner.task_resized(task);
@@ -2572,97 +2685,26 @@ impl IActivityManager for ActivityManager {
                 "broadcastIntentWithFeature ordered / resultTo (P2: sent unordered, no result)",
             );
         }
-        let inner = &self.inner;
-        let pid = ThreadState::get_calling_pid();
-        let uid = ThreadState::get_calling_uid();
-        let user = incoming_user(user_id);
         let required: Vec<String> = required_permissions
             .unwrap_or_default()
             .iter()
             .flatten()
             .cloned()
             .collect();
-        if sticky {
-            let holds = inner.holds(uid, permission::BROADCAST_STICKY);
-            match broadcast::sticky_send(
-                holds,
-                pid,
-                uid,
-                !required.is_empty(),
-                intent.component.is_some(),
-            ) {
-                Ok(()) => {}
-                Err(StickyRefusal::Security(msg)) => {
-                    log(format_args!("{msg}"));
-                    return Err(security(&msg));
-                }
-                Err(StickyRefusal::CantHavePermission) => {
-                    log(format_args!(
-                        "Can't broadcast sticky intent and enforce permissions {required:?}"
-                    ));
-                    return Ok(broadcast::BROADCAST_STICKY_CANT_HAVE_PERMISSION);
-                }
-            }
-        }
-        let key = intent_key(intent, resolved_type);
-        let result = (
-            result_code,
-            result_data.map(str::to_owned),
-            result_extras.cloned(),
-        );
-        let mut st = inner.state();
-        if sticky {
-            st.broadcasts
-                .put_sticky(user, key.clone(), intent.clone(), uid);
-        }
-        let registered_only = intent.flags & broadcast::FLAG_RECEIVER_REGISTERED_ONLY != 0;
-        match &intent.component {
-            Some(c) if !registered_only => inner.deliver_to_component_locked(
-                &mut st,
-                intent,
-                &c.package,
-                &c.class,
-                uid,
-                &required,
-                result.clone(),
-                user,
+        self.send_broadcast(
+            intent,
+            resolved_type,
+            ThreadState::get_calling_pid(),
+            ThreadState::get_calling_uid(),
+            incoming_user(user_id),
+            &required,
+            (
+                result_code,
+                result_data.map(str::to_owned),
+                result_extras.cloned(),
             ),
-            Some(_) => {}
-            None if !registered_only => {
-                atl_diag::answered(
-                    AM,
-                    "implicit broadcast: manifest receivers not resolved (P2)",
-                );
-            }
-            None => {}
-        }
-        if intent.component.is_none() {
-            for (receiver, rpid, ruid, bf) in st.broadcasts.receivers(&key, user) {
-                if let Some(why) = broadcast::skip_registered(
-                    &bf,
-                    uid,
-                    ruid,
-                    &required,
-                    |p| inner.holds(uid, p),
-                    |p| inner.holds(ruid, p),
-                ) {
-                    atl_diag::answered(AM, why.split(':').next().unwrap_or("skipped"));
-                    log(format_args!("{why}"));
-                    continue;
-                }
-                let job = Job::Registered {
-                    receiver: receiver.0,
-                    intent: intent.clone(),
-                    result_code: result.0,
-                    data: result.1.clone(),
-                    extras: result.2.clone(),
-                    initial_sticky: false,
-                    user,
-                };
-                inner.deliver_locked(&mut st, rpid, job);
-            }
-        }
-        Ok(BROADCAST_SUCCESS)
+            sticky,
+        )
     }
 
     /// BroadcastController.unbroadcastIntent:1756-1790: the caller needs BROADCAST_STICKY (:1766-1772, SecurityException), then the sticky with an equal Intent (filterEquals) goes.

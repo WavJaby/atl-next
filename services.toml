@@ -400,6 +400,25 @@ mirrors = [
     "frameworks/base/core/java/com/android/internal/widget/LockPatternUtils.java#isSecure",
 ]
 
+["batterystats"]
+src = ["crates/atl-services/src/battery.rs"]
+mirrors = [
+    "frameworks/base/services/core/java/com/android/server/BatteryService.java#processValuesLocked",
+    "frameworks/base/services/core/java/com/android/server/BatteryService.java#plugType",
+    "frameworks/base/services/core/java/com/android/server/BatteryService.java#shouldSendBatteryLowLocked",
+    "frameworks/base/services/core/java/com/android/server/BatteryService.java#sendBatteryChangedIntentLocked",
+    "frameworks/base/services/core/java/com/android/server/power/stats/BatteryStatsImpl.java#setBatteryStateLocked",
+    "frameworks/base/services/core/java/com/android/server/power/stats/BatteryStatsImpl.java#isOnBattery",
+    "frameworks/base/services/core/java/com/android/server/power/stats/BatteryStatsImpl.java#computeChargeTimeRemaining",
+]
+
+["batteryproperties"]
+src = ["crates/atl-services/src/battery.rs"]
+mirrors = [
+    "frameworks/base/services/core/java/com/android/server/BatteryService.java#BatteryPropertiesRegistrar",
+    "frameworks/base/services/core/java/com/android/server/health/HealthServiceWrapperAidl.java#getPropertyInternal",
+]
+
 ["netstats"]
 src = ["crates/atl-services/src/netstats.rs"]
 mirrors = [

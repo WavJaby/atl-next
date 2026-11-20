@@ -572,6 +572,34 @@ pub fn drm_sysfs(devices: &[PathBuf]) -> io::Result<(Vec<Mount>, Vec<Link>)> {
     Ok((mounts, links))
 }
 
+/// The power-supply class dir AOSP's BatteryMonitor (healthd) scans: each entry is a link into its supply's device dir, whose `type`, `online`, `capacity`, `status` ... it reads.
+pub const POWER_SUPPLY_SYSFS: &str = "/sys/class/power_supply";
+
+/// The power-supply sysfs the health HAL reads, and no more of /sys: each `/sys/class/power_supply/<name>` link recreated as the host has it, and the supply's own device dir (the link's target)
+/// read-only at its path. A host without supplies gives nothing (BatteryMonitor's no-battery answer). Given to the health HAL's sandbox only (atld `--health`).
+pub fn power_supply_sysfs() -> io::Result<(Vec<Mount>, Vec<Link>)> {
+    let (mut mounts, mut links) = (Vec::new(), Vec::new());
+    let entries = match std::fs::read_dir(POWER_SUPPLY_SYSFS) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((mounts, links)),
+        Err(e) => return Err(e),
+    };
+    for e in entries {
+        let at = e?.path();
+        let Ok(target) = std::fs::read_link(&at) else {
+            continue;
+        };
+        let dir = std::fs::canonicalize(&at)?;
+        mounts.push(Mount {
+            host: dir.clone(),
+            at: dir,
+            writable: false,
+        });
+        links.push(Link { target, at });
+    }
+    Ok((mounts, links))
+}
+
 /// Read-only mounts of what `program`'s loader finds through RUNPATH: each object's own RUNPATH dirs ([`tree_mounts`]) and the DT_NEEDED libraries in them, followed in turn (a RUNPATH serves only the object that has it).
 /// `$ORIGIN` is the object's directory. LD_LIBRARY_PATH's dirs are the caller's environment (its Spawn env); the default search path is the interpreter's directory ([`elf_closure`]).
 pub fn runpath_mounts(program: &Path) -> io::Result<Vec<Mount>> {

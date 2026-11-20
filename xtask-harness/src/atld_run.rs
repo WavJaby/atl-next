@@ -46,6 +46,12 @@ const KEYSTORE_FRAGMENTS: [(&str, &str); 4] = [
     ),
 ];
 
+/// AOSP's default health HAL (gate_goals.rs `runtime`), installed at `<out>/device/<module>/<module>`, and its Android.bp `vintf_fragments` file (vendor), below the tree: every run starts it (atld `--health`),
+/// the battery services' source.
+const HEALTH_HAL: &str = "android.hardware.health-service.example";
+const HEALTH_FRAGMENT: &str =
+    "hardware/interfaces/health/aidl/default/android.hardware.health-service.example.xml";
+
 /// [`Runtime::with_keystore`]'s inputs.
 #[derive(Clone)]
 struct Keystore {
@@ -313,6 +319,8 @@ pub struct Runtime {
     gralloc: Option<(PathBuf, PathBuf)>,
     /// keystore2, the KeyMint HAL and their VINTF fragments, when [`Runtime::with_keystore`] asked for them.
     keystore: Option<Keystore>,
+    /// The health HAL ([`HEALTH_HAL`]) and its VINTF fragment, in every run.
+    health: (PathBuf, PathBuf),
     /// atl-egl-probe, atld's GPU selector (`--gpu-probe`), with [`Runtime::with_gralloc`].
     gpu_probe: Option<PathBuf>,
     /// atl-engine-cpuinfo, atld's guest cpuinfo source (`--cpuinfo-probe`), with [`Runtime::with_qemu_engine`].
@@ -793,6 +801,18 @@ impl Runtime {
             "{} missing: build servicemanager",
             servicemanager.display()
         );
+        let health = out.join("device").join(HEALTH_HAL).join(HEALTH_HAL);
+        ensure!(
+            health.is_file(),
+            "{} missing: build the runtime goals",
+            health.display()
+        );
+        let health_fragment = tree::shared_tree(&layout).join(HEALTH_FRAGMENT);
+        ensure!(
+            health_fragment.is_file(),
+            "{} missing in the tree",
+            health_fragment.display()
+        );
         let services = packages::bin(root, &out, "atl-services", "atl-system-services")?;
         let am = packages::bin(root, &out, "atl-services", "atl-am")?;
         let screencap = packages::bin(root, &out, "atl-services", "atl-screencap")?;
@@ -870,6 +890,7 @@ impl Runtime {
             sandbox_join,
             flatpak_spawn,
             keystore: None,
+            health: (health, health_fragment),
             webspawn: true,
             atld,
             installer,
@@ -1735,6 +1756,9 @@ impl Runtime {
             inputs.files.push(allocator.clone());
             inputs.files.extend(remote::lib_files(mapper_dir)?);
         }
+        inputs
+            .files
+            .extend([self.health.0.clone(), self.health.1.clone()]);
         if let Some(k) = &self.keystore {
             inputs
                 .files
@@ -1970,6 +1994,10 @@ impl Runtime {
         if let Some((allocator, _)) = &self.gralloc {
             cmd.arg("--gralloc").arg(allocator);
         }
+        cmd.arg("--health")
+            .arg(&self.health.0)
+            .arg("--vintf-fragment")
+            .arg(format!("vendor={}", self.health.1.display()));
         if let Some(k) = &self.keystore {
             cmd.arg("--keystore2")
                 .arg(&k.keystore2)
