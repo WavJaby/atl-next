@@ -84,7 +84,14 @@ func fakeConvert() error {
 		return err
 	}
 	ninja += m
-	if err := os.WriteFile(filepath.Join(*out, "build.ninja"), []byte(ninja), 0o644); err != nil {
+	// as main.go writes it: an unchanged manifest is left alone (its mtime too), so the steps below whose conversion writes the same text check the regeneration edge's restat
+	nf, err := newNinjaFile(filepath.Join(*out, "build.ninja"))
+	if err != nil {
+		return err
+	}
+	defer nf.discard()
+	nf.WriteString(ninja)
+	if err := nf.commit(); err != nil {
 		return err
 	}
 	log, err := os.OpenFile(filepath.Join(*out, "conversions"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
@@ -235,6 +242,7 @@ func TestFilesystemReadsAreRecorded(t *testing.T) {
 		"walk.go":      4,  // a link entry's resolution: the link text is in its listed parent's answer
 		"cc.go":        4,  // writeCompat: placeLink, placeFile, pruneCompat (outputs)
 		"genrule.go":   1,  // writeGenFiles (outputs)
+		"ninja.go":     1,  // newNinjaFile: the old build.ninja compared before a write (an output)
 		"artplugin.go": 1,  // parses sources already read into memory
 	}
 	files, err := filepath.Glob("*.go")

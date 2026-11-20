@@ -16,7 +16,8 @@ import (
 // The caller (xtask native) writes the converter's flags and goals into an argument file. `bp2ninja -bootstrap <file>` writes a build.ninja holding only the edge that runs `bp2ninja -args <file>`;
 // ninja runs it (output and deps record missing) and every later time an input changed: its depfile lists every input the conversion read (inputs.go), the argument file and the converter binary among them,
 // so a flag, goal or converter change reruns it as a tree change does. Directory entries reach it through the probe check edges' results (inputs.go), not as directories. Bootstrapping through ninja, not by converting directly, leaves the deps log holding the record from the first run on.
-// The command line never changes, so `generator = 1` (no rerun on a command change, not cleaned) loses nothing.
+// The command line never changes, so `generator = 1` (no rerun on a command change, not cleaned) loses nothing. `restat = 1`: a conversion whose build.ninja is byte-equal leaves the file
+// alone (ninja.go ninjaFile); ninja then logs the newest input's mtime for it and treats it as clean, where without restat the old mtime would read as dirty on every later run.
 
 // argsFlag: `-args <file>`: the converter's arguments are the file's lines; bootstrapFlag: `-bootstrap <file>`: only write the build.ninja that runs `-args <file>`.
 const (
@@ -106,7 +107,7 @@ const regenDepfile = "build.ninja.d"
 func (r *regenSetup) regenEdge(globResults []string) string {
 	return "rule bp2ninja\n  command = " + esc(r.exe) + " " + argsFlag + " " + esc(r.args) + "\n" +
 		"  description = bp2ninja: an input of build.ninja changed, converting again\n" +
-		"  depfile = " + regenDepfile + "\n  deps = gcc\n  generator = 1\n" +
+		"  depfile = " + regenDepfile + "\n  deps = gcc\n  generator = 1\n  restat = 1\n" +
 		"build " + strings.Join(regenOutputs, " ") + ": bp2ninja" + implicitDeps(append(slices.Clone(r.implicit), globResults...)) + "\n"
 }
 

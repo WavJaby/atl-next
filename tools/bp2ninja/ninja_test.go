@@ -23,6 +23,47 @@ func shWords(t *testing.T, fragment string) []string {
 	return strings.Split(strings.TrimSuffix(string(out), "\n"), "\n")
 }
 
+// ninjaFile: the same text leaves the file untouched (inode and mtime: no write, no rename, no .tmp left); a changed byte, a longer and a shorter text each replace it with exactly the new text.
+func TestNinjaFileWritesOnlyOnChange(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "build.ninja")
+	write := func(text string) {
+		t.Helper()
+		nf, err := newNinjaFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer nf.discard()
+		// more than one buffer (1 MiB) so a match spans several sink writes
+		nf.WriteString(text)
+		if err := nf.commit(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+			t.Fatalf("a .tmp is left: %v", err)
+		}
+		if b, _ := os.ReadFile(path); string(b) != text {
+			t.Fatalf("file holds %d bytes, want the %d written", len(b), len(text))
+		}
+	}
+	base := strings.Repeat("build x: phony\n", 200000)
+	write(base)
+	old := time.Unix(1700000000, 0)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.Stat(path)
+	write(base)
+	after, _ := os.Stat(path)
+	if !os.SameFile(before, after) || !after.ModTime().Equal(old) {
+		t.Fatalf("an unchanged write touched the file: mtime %v", after.ModTime())
+	}
+	changed := base[:len(base)-2] + "y\n"
+	write(changed)
+	write(changed + "z\n")
+	write(changed)
+	write("")
+}
+
 // Expected values are Soong's ninja text for each cflags entry: blueprint proptools.NinjaAndShellEscape (`$` -> `$$`, then ShellEscape: unchanged when only shell-safe characters and spaces, else single-quoted whole).
 // The shell decides the argv of both texts.
 func TestModuleFlagsMatchSoong(t *testing.T) {

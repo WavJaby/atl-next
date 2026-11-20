@@ -4,7 +4,10 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -65,31 +68,96 @@ func treeFiles(base string) []string {
 // BionicStaticRust: -bionic-static-rust (rust.go rustStaticlib). LicenceGate: -licence-gate (licence.go).
 type Tools struct{ CC, CXX, AR, Bison, Flex, M4, Yasm, Rustc, RustVersion, LibClang, LLVM, Launcher, RtInclude, BionicStaticRust, LicenceGate string }
 
-// ninjaFile: build.ninja written through a buffer into <path>.tmp; commit renames it into place, discard (deferred) removes an uncommitted one. A write error is kept by the buffer and returned by commit.
+// ninjaFile: build.ninja written through a buffer, compared with the file already at path while the bytes match: an unchanged manifest (~750 MB) is never written, and keeps its mtime
+// (the regeneration edge is `restat`, regen.go, so ninja takes that as clean). At the first difference <path>.tmp gets the matched prefix copied from the old file, then the rest; commit renames it
+// into place, discard (deferred) removes an uncommitted one. A write error is kept by the buffer and returned by commit.
 type ninjaFile struct {
 	*bufio.Writer
-	f    *os.File
+	s    *compareSink
 	path string
 	done bool
 }
 
-func newNinjaFile(path string) (*ninjaFile, error) {
-	f, err := os.Create(path + ".tmp")
-	if err != nil {
-		return nil, err
-	}
-	return &ninjaFile{bufio.NewWriterSize(f, 1<<20), f, path, false}, nil
+// compareSink: reads the old file alongside the writes while they match (`same` bytes so far); out = the tmp file once they differ.
+type compareSink struct {
+	old  *os.File
+	r    *bufio.Reader
+	same int64
+	out  *os.File
+	tmp  string
+	buf  []byte
 }
 
-func (n *ninjaFile) commit() error {
-	err := n.Flush()
-	if cerr := n.f.Close(); err == nil {
-		err = cerr
+func newNinjaFile(path string) (*ninjaFile, error) {
+	s := &compareSink{tmp: path + ".tmp"}
+	if old, err := os.Open(path); err == nil {
+		s.old, s.r = old, bufio.NewReaderSize(old, 1<<20)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return nil, err
 	}
+	return &ninjaFile{bufio.NewWriterSize(s, 1<<20), s, path, false}, nil
+}
+
+func (s *compareSink) Write(p []byte) (int, error) {
+	if s.out == nil && s.old != nil {
+		if cap(s.buf) < len(p) {
+			s.buf = make([]byte, len(p))
+		}
+		b := s.buf[:len(p)]
+		if n, _ := io.ReadFull(s.r, b); n == len(p) && bytes.Equal(b, p) {
+			s.same += int64(n)
+			return len(p), nil
+		}
+	}
+	if s.out == nil {
+		if err := s.diverge(); err != nil {
+			return 0, err
+		}
+	}
+	return s.out.Write(p)
+}
+
+// diverge: the tmp file, holding the old file's first `same` bytes (equal to what was written so far).
+func (s *compareSink) diverge() error {
+	f, err := os.Create(s.tmp)
 	if err != nil {
 		return err
 	}
-	if err := os.Rename(n.f.Name(), n.path); err != nil {
+	s.out = f
+	if s.old == nil || s.same == 0 {
+		return nil
+	}
+	if _, err := s.old.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	_, err = io.CopyN(f, s.old, s.same)
+	return err
+}
+
+func (n *ninjaFile) commit() error {
+	if err := n.Flush(); err != nil {
+		return err
+	}
+	s := n.s
+	if s.out == nil && s.old != nil {
+		// every byte matched: unchanged only if the old file ends here too, else it is longer and the new one is its prefix
+		if _, err := s.r.ReadByte(); err == io.EOF {
+			n.done = true
+			return s.old.Close()
+		}
+	}
+	if s.out == nil {
+		if err := s.diverge(); err != nil {
+			return err
+		}
+	}
+	if s.old != nil {
+		s.old.Close()
+	}
+	if err := s.out.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(s.tmp, n.path); err != nil {
 		return err
 	}
 	n.done = true
@@ -97,9 +165,15 @@ func (n *ninjaFile) commit() error {
 }
 
 func (n *ninjaFile) discard() {
-	if !n.done {
-		n.f.Close()
-		os.Remove(n.f.Name())
+	if n.done {
+		return
+	}
+	if n.s.old != nil {
+		n.s.old.Close()
+	}
+	if n.s.out != nil {
+		n.s.out.Close()
+		os.Remove(n.s.tmp)
 	}
 }
 
