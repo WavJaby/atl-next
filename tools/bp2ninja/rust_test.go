@@ -70,9 +70,9 @@ func TestRustCrateFlags(t *testing.T) {
 	if !containsSeq(mac, []string{"--extern", "proc_macro"}) || !containsSeq(mac, []string{"--crate-type=proc-macro"}) || slices.Contains(mac, "panic=abort") {
 		t.Errorf("libmac flags %q", mac)
 	}
-	// builder.go rustEnvVars with cargo_env_compat: CARGO_BIN_NAME for a binary, the version split at its dots
+	// builder.go rustEnvVars with cargo_env_compat: CARGO_BIN_NAME for a binary, the version split at its dots; crate names empty without crate_name (Soong passes the property as is)
 	tool := ninjaEdgeVars(ninja, filepath.Join(out, "host/tool/tool"))
-	if env := words(tool["env"]); !slices.Equal(env, []string{"OUT_DIR=out", "ANDROID_RUST_VERSION=1.2.3", "RUSTC_BOOTSTRAP=-1", "CARGO_BIN_NAME=tool", "CARGO_CRATE_NAME=tool", "CARGO_PKG_NAME=tool",
+	if env := words(tool["env"]); !slices.Equal(env, []string{"OUT_DIR=out", "ANDROID_RUST_VERSION=1.2.3", "RUSTC_BOOTSTRAP=-1", "CARGO_BIN_NAME=tool", "CARGO_CRATE_NAME=", "CARGO_PKG_NAME=",
 		"CARGO_PKG_VERSION=1.2.3", "CARGO_PKG_VERSION_MAJOR=1", "CARGO_PKG_VERSION_MINOR=2", "CARGO_PKG_VERSION_PATCH=3"}) {
 		t.Errorf("tool env %q", env)
 	}

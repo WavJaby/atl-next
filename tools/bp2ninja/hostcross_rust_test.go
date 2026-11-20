@@ -30,7 +30,7 @@ func TestCrossRustFlags(t *testing.T) {
 	}
 }
 
-// TestCrossRustLinkArgs: a cross host's Rust binary links with its side's cc link flags and the lld flags; an x86_64 build's binary links with the driver alone.
+// TestCrossRustLinkArgs: a cross host's Rust binary links with its side's cc link flags and the lld flags; an x86_64 build's binary with the lld flags only.
 func TestCrossRustLinkArgs(t *testing.T) {
 	cross := &Graph{cfg: Config{Arch: "riscv64", PointerBits: 64, HostCross: riscvRust, BuildArch: "x86_64", BuildBits: 64}}
 	cross.soong.Flags.Link = map[Side][]string{Device: riscvRust.linkFlags(), Host: riscvRust.linkFlags()}
@@ -43,7 +43,7 @@ func TestCrossRustLinkArgs(t *testing.T) {
 	}
 	plain := &Graph{cfg: Config{Arch: "x86_64", PointerBits: 64}}
 	plain.soong.Lldflags = []string{"-fuse-ld=lld"}
-	if got, _ := plain.rustLinkArgs(n, "clang++"); !slices.Equal(got, []string{"-C", "linker=clang++"}) {
-		t.Errorf("x86_64 link args %q, want the driver alone", got)
+	if got, _ := plain.rustLinkArgs(n, "clang++"); !slices.Equal(got, []string{"-C", "linker=clang++", "-C", "link-arg=-fuse-ld=lld"}) {
+		t.Errorf("x86_64 link args %q, want the driver and lld", got)
 	}
 }
