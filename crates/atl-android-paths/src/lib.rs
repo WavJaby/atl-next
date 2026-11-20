@@ -99,6 +99,10 @@ pub const DATA_USER: &str = "/data/user";
 pub const DATA_USER_DE: &str = "/data/user_de";
 /// keystore2's database dir (keystore2.rc: `/system/bin/keystore2 /data/misc/keystore`), its argv[1].
 pub const KEYSTORE_DB: &str = "/data/misc/keystore";
+/// Host dir under a data root that atld binds at [`KEYSTORE_DB`] in keystore2's sandbox only: outside `device/data`, so no app sandbox's /data reaches it.
+pub fn keystore_db_host(data_root: &std::path::Path) -> std::path::PathBuf {
+    data_root.join("system").join("keystore")
+}
 /// bionic's default property area path (`__system_properties_init` without `$ATL_PROP_AREA`): the sandbox's `/dev` is the broker's own, so the area is mounted there and no variable is needed.
 pub const PROPERTY_AREA: &str = "/dev/__properties__";
 /// The variable naming the property area file a process maps instead of `PROPERTY_AREA` (`ATL_PROP_AREA`): whoever starts the process sets it until the sandbox mounts the area there. The one definition: atl-bionic reads it, the launcher names it, atl-property-service prints it.

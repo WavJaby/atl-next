@@ -194,7 +194,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // the app stage: AesActivity in an app process (the launcher's zygote-child start installs the provider), two atld runs on one data root
     for n in [1, 2] {
         if n == 2 && args.break_wipe {
-            let db = data_root.join("system").join("keystore");
+            let db = atl_android_paths::keystore_db_host(&data_root);
             for e in std::fs::read_dir(&db).with_context(|| db.display().to_string())? {
                 let p = e?.path();
                 std::fs::remove_file(&p).with_context(|| p.display().to_string())?;

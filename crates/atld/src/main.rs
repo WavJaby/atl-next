@@ -98,7 +98,7 @@ struct Args {
     /// Omitted: no graphics buffers (headless runs on a host without a DRM device). The mapper library `mapper.atl.so` it names to libui must be in `--lib-path`.
     #[arg(long)]
     gralloc: Option<PathBuf>,
-    /// AOSP keystore2 executable (system/security): `IKeystoreService/default` and its companion services, run as AID_KEYSTORE with its database dir (host_layout::keystore_data) at /data/misc/keystore, after the KeyMint HAL (`--keymint`).
+    /// AOSP keystore2 executable (system/security): `IKeystoreService/default` and its companion services, run as AID_KEYSTORE with its database dir (atl_android_paths::keystore_db_host) at /data/misc/keystore, after the KeyMint HAL (`--keymint`).
     /// Omitted: no keystore (apps' AndroidKeyStore finds no service).
     #[arg(long, requires = "keymint")]
     keystore2: Option<PathBuf>,
@@ -2102,7 +2102,7 @@ fn run(a: &Args) -> Result<ExitCode> {
             "keymint",
             broker.spawn(hal).context("starting the KeyMint HAL")?,
         ));
-        let db = host_layout::keystore_data(&r.data_root);
+        let db = atl_android_paths::keystore_db_host(&r.data_root);
         std::fs::create_dir_all(&db)?;
         std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o700))?;
         let mut ks = system_spawn(
