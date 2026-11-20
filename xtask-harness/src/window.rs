@@ -3172,7 +3172,7 @@ pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
         );
         return Ok(ExitCode::SUCCESS);
     }
-    let problems = target.deliver("window")?;
+    let (pushed, problems) = target.deliver("window")?;
     if !problems.is_empty() {
         println!("{}", crate::verdict::gate("remote test window", &problems));
         return Ok(ExitCode::FAILURE);
@@ -3212,7 +3212,7 @@ pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
     };
     let rt = rt.with_display(display.to_arg()).with_site(
         target
-            .run_site(REMOTE_LIMIT, log.clone(), kind)?
+            .run_site(&pushed, REMOTE_LIMIT, log.clone(), kind)?
             .with_agent(agent),
     );
     for f in [LIVE_JSON, AGENT_RC, AGENT_LOG] {

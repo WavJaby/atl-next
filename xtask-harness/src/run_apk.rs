@@ -821,7 +821,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         }
         return Ok(ExitCode::SUCCESS);
     }
-    let problems = target.deliver("run-apk")?;
+    let (pushed, problems) = target.deliver("run-apk")?;
     if !problems.is_empty() {
         println!("{}", verdict::gate("remote run-apk", &problems));
         return Ok(ExitCode::FAILURE);
@@ -839,7 +839,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         "remote run-apk: the target has no display for the window: {why}"
     );
     println!("remote run-apk: display: {why}");
-    let rt = rt.with_site(target.run_site(limit, logs.join("transcript.log"), display)?);
+    let rt = rt.with_site(target.run_site(&pushed, limit, logs.join("transcript.log"), display)?);
     // before the transfer: the run's root is cleared on the target then, so a present line the watch reads is this run's
     let mut watch = if observe_on {
         let plan = observe::Plan {

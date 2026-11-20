@@ -23,8 +23,26 @@ use sha2::{Digest, Sha256};
 use crate::{arches, gate_goals, gl_probe, out, provided_gate, verdict};
 
 /// rsync's flags for the bundle: archive, the staged hard links kept (`-H`: one source = one file on the target, see the module doc), stale entries deleted -- except the run lock, which a
-/// push holds itself ([`push_lock_sh`]) and must not unlink under a run or a later push.
-const RSYNC: [&str; 4] = ["-a", "-H", "--delete", "--exclude=/.run.lock"];
+/// push holds itself ([`push_lock_sh`]) and must not unlink under a run or a later push. `--delay-updates`: an interrupted push leaves the old tree whole (new files wait in `.~tmp~`), not new files beside the old marker.
+const RSYNC: [&str; 5] = [
+    "-a",
+    "-H",
+    "--delete",
+    "--delay-updates",
+    "--exclude=/.run.lock",
+];
+
+/// The empty file a stage writes beside the manifest, named by the manifest's SHA-256 ([`marker_name`]): a run tests that it exists ([`stale_sh`]).
+/// A different manifest is a different path, so rsync always sends it (its quick check, size + mtime, would skip a same-size manifest written within the same second) and `--delete` drops the old one.
+const MARKER_PREFIX: &str = ".bundle-";
+
+fn marker_name(manifest_sha256: &str) -> String {
+    format!("{MARKER_PREFIX}{manifest_sha256}")
+}
+
+/// The bundle one push staged and sent: its manifest's SHA-256. A run takes it from its own push ([`Target::push`]), never from re-reading a stage dir another push may have refilled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pushed(String);
 
 /// The bundle's `lib/`: Debian's LLVM 19 runtimes. Arch ships libc++ 23 but no LLVM `libunwind.so.1` (plan L1 section 3). A labelled patch: the ideal is our pinned runtimes (runtimes.rs) in a packaged install tree (plan D1).
 /// The build machine's own copy; a cross host's runs take its sysroot's ([`llvm_lib_dir`]).
@@ -229,7 +247,7 @@ fn push(root: &Path, a: &PushArgs) -> Result<ExitCode> {
         }
     }
     println!("{}", target.summary());
-    let stage = stage_dir(&out, &a.gate);
+    let stage = stage_dir(&out, &a.gate, a.brk);
     if !a.apply {
         println!(
             "dry run: would stage {} and rsync -a --delete it to {}; --apply copies",
@@ -329,7 +347,13 @@ fn runtime_half(root: &Path, a: &TestArgs, target: &Target, out: &Path) -> Resul
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let log = dir.join(format!("{}.log", a.gate));
     std::fs::write(&log, "").with_context(|| format!("writing {}", log.display()))?;
-    let site = target.run_site(gl_probe::LIMIT, log.clone(), Display::Headless)?;
+    // `remote test gl` runs what `remote push gl` (same break) staged: a push of another break to the shared dir since then makes the run stale
+    let site = target.run_site(
+        &target.staged()?,
+        gl_probe::LIMIT,
+        log.clone(),
+        Display::Headless,
+    )?;
     let code = gl_probe::run_on(root, arch, out, site)?;
     println!("remote test {}: transcript {}", a.gate, log.display());
     Ok(code == ExitCode::SUCCESS)
@@ -1247,7 +1271,7 @@ impl Target {
             bundle,
             elf,
             lib_dirs,
-            stage: stage_dir(out, gate),
+            stage: stage_dir(out, gate, brk),
         })
     }
 
@@ -1281,16 +1305,27 @@ impl Target {
         self.lib_dirs.len()
     }
 
-    /// Stages the bundle and copies it to the target (`rsync -a --delete`). Fails first when the host does not answer.
-    pub fn push(&self) -> Result<()> {
+    /// Stages the bundle and copies it to the target (`rsync -a --delete`); returns what it staged. Fails first when the host does not answer.
+    /// Not closed by the marker: a non-manifest file rebuilt at the same path and size within one second of the last push (stage hard links keep build mtimes) passes rsync's quick check and
+    /// stays the old bytes on the target under the new marker; only `--checksum` (hashes 164-418 MiB per push on both sides) or a target-side `sha256sum -c` of the manifest closes it.
+    pub fn push(&self) -> Result<Pushed> {
         self.host.reach()?;
-        self.bundle.stage(&self.stage)?;
-        self.host.sync(&self.stage, &self.dir_name)
+        let pushed = self.bundle.stage(&self.stage)?;
+        self.host.sync(&self.stage, &self.dir_name)?;
+        Ok(pushed)
+    }
+
+    /// What the last push of this gate and break staged (`remote push` in another process; the stage dir is per gate and break).
+    pub fn staged(&self) -> Result<Pushed> {
+        let manifest = self.stage.join(MANIFEST);
+        let bytes = std::fs::read(&manifest)
+            .with_context(|| format!("reading the staged {} (push first)", manifest.display()))?;
+        Ok(Pushed(sha256_hex(&bytes)))
     }
 
     /// [`Target::push`], then [`Target::check`], its lines printed as `remote prereq <what>: ...`. The check's problems: empty = delivered and checked.
-    pub fn deliver(&self, what: &str) -> Result<Vec<String>> {
-        self.push()?;
+    pub fn deliver(&self, what: &str) -> Result<(Pushed, Vec<String>)> {
+        let pushed = self.push()?;
         let prereq = self.check()?;
         let problems = prereq.problems();
         for p in &problems {
@@ -1303,7 +1338,7 @@ impl Target {
                 self.label()
             );
         }
-        Ok(problems)
+        Ok((pushed, problems))
     }
 
     /// The prerequisite check on the target: `ldd` over every ELF file of the bundle.
@@ -1312,14 +1347,17 @@ impl Target {
         Ok(parse_prereq(&self.host.run_script(&script)?))
     }
 
-    /// A run's site on the target: atld runs from the bundle there, ends at `limit`, and its transcript is appended to `log`. `display`: where its `WAYLAND_DISPLAY` comes from. After [`Target::push`]:
-    /// the run executes only if the target dir still holds the bundle this push staged.
-    pub fn run_site(&self, limit: Duration, log: PathBuf, display: Display) -> Result<Site> {
-        let manifest = self.stage.join(MANIFEST);
-        let bytes = std::fs::read(&manifest)
-            .with_context(|| format!("reading the staged {} (push first)", manifest.display()))?;
+    /// A run's site on the target: atld runs from the bundle there, ends at `limit`, and its transcript is appended to `log`. `display`: where its `WAYLAND_DISPLAY` comes from.
+    /// The run executes only if the target dir still holds `pushed`, the bundle the caller's own push staged.
+    pub fn run_site(
+        &self,
+        pushed: &Pushed,
+        limit: Duration,
+        log: PathBuf,
+        display: Display,
+    ) -> Result<Site> {
         Ok(Site::Remote(RemoteRun {
-            manifest_sha256: sha256_hex(&bytes),
+            manifest_sha256: pushed.0.clone(),
             host: self.host.clone(),
             base: self.host.base(&self.dir_name),
             lib_dirs: self.lib_dirs.clone(),
@@ -1403,8 +1441,13 @@ fn target_dir_name(out: &Path, cross: bool) -> Result<String> {
     Ok(name)
 }
 
-fn stage_dir(out: &Path, gate: &str) -> PathBuf {
-    out.join(REMOTE_DIR).join("bundle").join(gate)
+/// One stage dir per gate and break: a break's bundle differs, and one stage per gate let a `--break` push refill the dir a plain push's run then hashed.
+fn stage_dir(out: &Path, gate: &str, brk: Option<Break>) -> PathBuf {
+    let name = match brk.and_then(|b| clap::ValueEnum::to_possible_value(&b)) {
+        Some(b) => format!("{gate}@{}", b.get_name()),
+        None => gate.to_owned(),
+    };
+    out.join(REMOTE_DIR).join("bundle").join(name)
 }
 
 /// The record file of gate `gate`: `<out>/remote/inputs/<gate>.txt`, written by the gate's last run.
@@ -1799,8 +1842,8 @@ impl Bundle {
         dirs.into_iter().collect()
     }
 
-    /// Stages the entries under `dir` (recreated), with the manifest. Files are hard links (a copy across filesystems), links are links.
-    fn stage(&self, dir: &Path) -> Result<()> {
+    /// Stages the entries under `dir` (recreated), with the manifest and its marker. Files are hard links (a copy across filesystems), links are links. Returns the manifest's SHA-256.
+    fn stage(&self, dir: &Path) -> Result<Pushed> {
         if dir.exists() {
             std::fs::remove_dir_all(dir).with_context(|| format!("clearing {}", dir.display()))?;
         }
@@ -1830,9 +1873,12 @@ impl Bundle {
             }
         }
         let manifest_path = dir.join(MANIFEST);
+        let sha = sha256_hex(manifest.as_bytes());
         std::fs::write(&manifest_path, manifest)
             .with_context(|| format!("writing {}", manifest_path.display()))?;
-        Ok(())
+        let marker = dir.join(marker_name(&sha));
+        std::fs::write(&marker, "").with_context(|| format!("writing {}", marker.display()))?;
+        Ok(Pushed(sha))
     }
 }
 
@@ -1963,10 +2009,11 @@ const STALE_EXIT: i32 = 7;
 
 /// The run part that proves the dir holds this gate's bundle: one dir per checkout is shared by every gate (a dir per gate would cost 164-418 MiB per gate on the target), so another gate's push may
 /// have replaced it between this gate's push and its run. Runs under the run lock ([`lock_sh`]), which a push also takes, so the bundle cannot change after the check. Exit [`STALE_EXIT`] otherwise.
+/// The bundle is named by its marker file ([`MARKER_PREFIX`]), not by hashing the manifest on the target: a same-size manifest written within one second is skipped by rsync's quick check, its marker is not.
 fn stale_sh(tag: &str, manifest_sha256: &str) -> String {
     format!(
-        "printf '%s  %s\\n' {} {MANIFEST} | sha256sum -c --status - 2>/dev/null || {{ echo \"remote run {tag}: stale: another push replaced the bundle\" >&2; exit {STALE_EXIT}; }}\n",
-        sh_quote(manifest_sha256)
+        "test -f {} || {{ echo \"remote run {tag}: stale: another push replaced the bundle\" >&2; exit {STALE_EXIT}; }}\n",
+        sh_quote(&marker_name(manifest_sha256))
     )
 }
 
@@ -2668,7 +2715,7 @@ mod tests {
             "BASE=$(pwd)\n",
             "exec 9>>.run.lock\n",
             "flock -n 9 || { echo \"remote run gl/run: busy, another run, check or prune holds $(pwd)\" >&2; exit 6; }\n",
-            "printf '%s  %s\\n' 'abc123' bundle.manifest | sha256sum -c --status - 2>/dev/null || { echo \"remote run gl/run: stale: another push replaced the bundle\" >&2; exit 7; }\n",
+            "test -f '.bundle-abc123' || { echo \"remote run gl/run: stale: another push replaced the bundle\" >&2; exit 7; }\n",
             "rm -rf \"$BASE/out/gl/run/root\"\n",
             "mkdir -p \"$BASE/out/gl/run/scratch\"\n",
             "sed \"s|@BASE@|$BASE|g\" > \"$BASE/out/gl/run/scratch/package-0.json\" <<'ATL_EOF'\n",
@@ -3055,6 +3102,115 @@ mod tests {
         let ino = |name: &str| std::fs::metadata(target.join(name)).unwrap().ino();
         assert_eq!(ino("out/app-art/lib64/a.so"), ino("out/device/a/a.so"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A test Target on `local:<target>` staging one file `lib/a.so` with `body`, for gate `g` and break `brk` (stage dir per gate and break under `out`).
+    fn local_target(
+        out: &Path,
+        target: &Path,
+        src: &Path,
+        body: &str,
+        brk: Option<Break>,
+    ) -> Target {
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::write(src, body).unwrap();
+        Target {
+            host: Host::Local(target.to_path_buf()),
+            dir_name: "t".to_owned(),
+            bundle: Bundle {
+                gate: "g".to_owned(),
+                entries: vec![Entry {
+                    name: "lib/a.so".to_owned(),
+                    src: src.to_path_buf(),
+                    kind: Kind::File,
+                }],
+            },
+            elf: Vec::new(),
+            lib_dirs: Vec::new(),
+            stage: stage_dir(out, "g", brk),
+        }
+    }
+
+    /// The run's staleness check in `dir`, as a run executes it: its exit code (7 = [`STALE_EXIT`]).
+    fn stale_exit(dir: &Path, pushed: &Pushed) -> i32 {
+        Command::new("sh")
+            .arg("-c")
+            .arg(stale_sh("g/run", &pushed.0))
+            .current_dir(dir)
+            .status()
+            .unwrap()
+            .code()
+            .unwrap()
+    }
+
+    /// R5-1: `remote push g` (A), then `remote push g --break drop-atld` (B, another bundle) into the same target dir; `remote test g` then runs what A staged, which the dir no longer holds: stale (exit 7).
+    /// Before: one stage dir per gate, so the run re-read B's manifest and ran B's bundle as A's.
+    #[test]
+    fn a_push_of_another_break_makes_the_first_pushs_run_stale() {
+        let s = Scratch::new("brk");
+        let (out, target) = (s.0.join("out"), s.0.join("target"));
+        let a = local_target(&out, &target, &s.0.join("src/a/a.so"), "plain", None);
+        let b = local_target(
+            &out,
+            &target,
+            &s.0.join("src/b/a.so"),
+            "broken",
+            Some(Break::DropAtld),
+        );
+        let pa = a.push().unwrap();
+        assert_eq!(a.staged().unwrap(), pa);
+        assert_eq!(stale_exit(&target, &pa), 0, "A's own bundle runs");
+        let pb = b.push().unwrap();
+        assert_ne!(pa, pb);
+        assert_eq!(a.staged().unwrap(), pa, "B's push leaves A's stage alone");
+        assert_eq!(stale_exit(&target, &a.staged().unwrap()), STALE_EXIT);
+        assert_eq!(stale_exit(&target, &pb), 0);
+    }
+
+    /// R5-2: two bundles whose manifests have the same size and the same mtime second, pushed A then B: rsync's quick check (size + mtime, rsync(1) `--size-only`/`--checksum`) skips B's manifest,
+    /// so a check that hashes the target's manifest still finds A's and runs A. The marker file is a new path for B: A's run is stale.
+    #[test]
+    fn a_same_second_same_size_manifest_still_makes_the_run_stale() {
+        let s = Scratch::new("same-second");
+        let (out, target) = (s.0.join("out"), s.0.join("target"));
+        // same length bodies -> manifests of equal size (`<64 hex>  <len>  lib/a.so`)
+        let a = local_target(&out, &target, &s.0.join("src/a/a.so"), "abc", None);
+        let pa = a.bundle.stage(&a.stage).unwrap();
+        let b = local_target(
+            &out,
+            &target,
+            &s.0.join("src/b/a.so"),
+            "abd",
+            Some(Break::DropAtld),
+        );
+        let pb = b.bundle.stage(&b.stage).unwrap();
+        let (ma, mb) = (a.stage.join(MANIFEST), b.stage.join(MANIFEST));
+        assert_eq!(
+            std::fs::metadata(&ma).unwrap().len(),
+            std::fs::metadata(&mb).unwrap().len()
+        );
+        // one fixed second for every staged file and dir, both stages
+        let touch = Command::new("sh")
+            .arg("-c")
+            .arg("find \"$1\" \"$2\" -exec touch -h -d @1700000000 {} +")
+            .args([
+                "sh",
+                &a.stage.display().to_string(),
+                &b.stage.display().to_string(),
+            ])
+            .status()
+            .unwrap();
+        assert!(touch.success());
+        a.host.sync(&a.stage, &a.dir_name).unwrap();
+        assert_eq!(stale_exit(&target, &pa), 0);
+        b.host.sync(&b.stage, &b.dir_name).unwrap();
+        assert_eq!(
+            std::fs::read(target.join(MANIFEST)).unwrap(),
+            std::fs::read(&ma).unwrap(),
+            "the fixture must hit the quick check: B's manifest skipped"
+        );
+        assert_eq!(stale_exit(&target, &pa), STALE_EXIT);
+        assert_eq!(stale_exit(&target, &pb), 0);
     }
 
     #[test]
