@@ -185,6 +185,95 @@ public final class AtlJniTest {
     /** candy-crush-next-blockers: guest AChoreographer_postVsyncCallback re-posted for 8 frames on this thread's Looper, frame data read through the accessors; displayNs = the display's vsync period (atl_jni_test.c vsyncFrames). Main thread. */
     public static native String vsyncFrames(int displayNs);
 
+    // JNI objects rows (P5): each wrapper answers one line, its natives in atl_jni_test.c; app.rs BRIDGE1_CALLS holds the expected lines.
+
+    private static native String stringCharsNative(String ascii, String wide);
+
+    /** Strings: an ASCII (compressed) one and a non-ASCII one built at run time. */
+    public static String stringChars() {
+        String wide = new StringBuilder().append('é').append('中').toString();
+        return stringCharsNative("bridge1", wide);
+    }
+
+    private static native String arrayElementsNative(int[] ints, double[] doubles, byte[] bytes);
+
+    /** Arrays: the native line, then what Java sees after it. */
+    public static String arrayElements() {
+        int[] ints = {1, 2, 3};
+        double[] doubles = {0.5};
+        byte[] bytes = {0, 0, 0, 1};
+        String s = arrayElementsNative(ints, doubles, bytes);
+        return s + " java " + ints[0] + " " + ints[1] + " " + ints[2] + " " + doubles[0] + " " + java.util.Arrays.toString(bytes);
+    }
+
+    private static native java.nio.ByteBuffer newDirectNative();
+
+    private static native String directInfoNative(java.nio.ByteBuffer mine, java.nio.ByteBuffer java);
+
+    /** Direct buffers both ways: one over guest memory read from Java, one allocateDirect'ed written natively. */
+    public static String directBuffer() {
+        java.nio.ByteBuffer mine = newDirectNative();
+        java.nio.ByteBuffer heap = java.nio.ByteBuffer.allocateDirect(16);
+        String s = directInfoNative(mine, heap);
+        return s + " get " + mine.get(7) + " " + heap.get(0);
+    }
+
+    private static native String wideArgsNative(int a, long b, int c, double d, long e, float f);
+
+    private static native long wideLongNative(long x);
+
+    private static native double wideDoubleNative(double x, float y);
+
+    private static native String wideCallsNative();
+
+    /** wideCallsNative's target: a + (long) (b * 10) + c. */
+    public static long mixLong(long a, double b, int c) {
+        return a + (long) (b * 10) + c;
+    }
+
+    /** jlong / jdouble native parameters and results. */
+    public static String wideArgs() {
+        return "args " + wideArgsNative(1, 0x100000002L, 3, 2.5, -5L, 1.25f) + " long " + wideLongNative(0x100000002L)
+                + " double " + wideDoubleNative(2.5, 1.25f) + " " + wideCallsNative();
+    }
+
+    private static native void exceptionsNative();
+
+    /** The exception exceptionsNative leaves pending. */
+    public static String exceptions() {
+        try {
+            exceptionsNative();
+            return "no throw";
+        } catch (IllegalStateException e) {
+            return "caught " + e.getMessage();
+        }
+    }
+
+    private static native String monitorsNative(Object o);
+
+    /** monitorsNative's view of Java's lock state. */
+    public static boolean holds(Object o) {
+        return Thread.holdsLock(o);
+    }
+
+    public static String monitors() {
+        return monitorsNative(new Object());
+    }
+
+    private static native String jniRefsNative(Object o);
+
+    /** jniRefsNative's `...A` target. */
+    public static String join(String s, long n, Object o) {
+        return s + n + o;
+    }
+
+    public static String jniRefs() {
+        return jniRefsNative("obj");
+    }
+
+    /** A guest pthread's AttachCurrentThread / up-call / DetachCurrentThread. */
+    public static native String guestThreadAttach();
+
     /** Bound by RegisterNatives in JNI_OnLoad. */
     public static native int registeredAnswer();
 

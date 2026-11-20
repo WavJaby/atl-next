@@ -27,6 +27,7 @@
 #include <sched.h>
 #include <setjmp.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -133,6 +134,290 @@ JNI_FN(jstring, greet)(JNIEnv *env, jclass cls, jstring name)
     snprintf(buf, sizeof buf, "hello, %s", in);
     (*env)->ReleaseStringUTFChars(env, name, in);
     return (*env)->NewStringUTF(env, buf);
+}
+
+// JNI objects rows (P5; expected values in app.rs BRIDGE1_CALLS, derived from the JNI specification and ART's jni_internal.cc). Each answers one line of values.
+
+// Strings: `ascii` is compressed (ART kUseStringCompression), so GetStringChars / GetStringCritical copy it; `wide` ("é中", built at run time: movable) is copied by GetStringChars and handed out directly by GetStringCritical (isCopy 0).
+JNI_FN(jstring, stringCharsNative)(JNIEnv *env, jclass cls, jstring ascii, jstring wide)
+{
+    char out[256], region[8] = {0};
+    unsigned char utf_region[8] = {0};
+    jboolean c1 = 9, c2 = 9, c3 = 9, c4 = 9;
+    const char *utf = (*env)->GetStringUTFChars(env, ascii, &c1);
+    if (utf == NULL)
+        return NULL;
+    size_t utf_len = strlen(utf);
+    char utf_copy[64];
+    snprintf(utf_copy, sizeof utf_copy, "%s", utf);
+    (*env)->ReleaseStringUTFChars(env, ascii, utf);
+    jsize wide_utf = (*env)->GetStringUTFLength(env, wide);
+    const jchar *chars = (*env)->GetStringChars(env, wide, &c2);
+    if (chars == NULL)
+        return NULL;
+    unsigned w0 = chars[0], w1 = chars[1];
+    (*env)->ReleaseStringChars(env, wide, chars);
+    (*env)->GetStringRegion(env, ascii, 1, 3, (jchar *)out);
+    for (int i = 0; i < 3; i++)
+        region[i] = (char)((jchar *)out)[i];
+    (*env)->GetStringUTFRegion(env, wide, 0, 2, (char *)utf_region);
+    const jchar *crit = (*env)->GetStringCritical(env, ascii, &c3);
+    if (crit == NULL)
+        return NULL;
+    char crit0 = (char)crit[0];
+    (*env)->ReleaseStringCritical(env, ascii, crit);
+    const jchar *wcrit = (*env)->GetStringCritical(env, wide, &c4);
+    if (wcrit == NULL)
+        return NULL;
+    unsigned wc0 = wcrit[0];
+    (*env)->ReleaseStringCritical(env, wide, wcrit);
+    static const jchar hi[] = {'H', 'i'};
+    jstring made = (*env)->NewString(env, hi, 2);
+    const char *made_utf = (*env)->GetStringUTFChars(env, made, NULL);
+    if (made_utf == NULL)
+        return NULL;
+    snprintf(out, sizeof out, "utf %s %zu copy %d wide %d chars %x %x copy %d region %s %02x%02x%02x%02x%02x critical %c %d wide %x %d new %s",
+             utf_copy, utf_len, c1, (int)wide_utf, w0, w1, c2, region, utf_region[0], utf_region[1], utf_region[2],
+             utf_region[3], utf_region[4], crit0, c3, wc0, c4, made_utf);
+    (*env)->ReleaseStringUTFChars(env, made, made_utf);
+    return (*env)->NewStringUTF(env, out);
+}
+
+// Arrays: int elements committed then aborted (JNI spec release modes), double elements released with mode 0, a byte region set, then the byte array through GetPrimitiveArrayCritical (ART: the array's own data, isCopy 0).
+JNI_FN(jstring, arrayElementsNative)(JNIEnv *env, jclass cls, jintArray ints, jdoubleArray doubles, jbyteArray bytes)
+{
+    char out[160];
+    jboolean ci = 9, cd = 9, cc = 9;
+    jint *e = (*env)->GetIntArrayElements(env, ints, &ci);
+    if (e == NULL)
+        return NULL;
+    e[0] = 11;
+    (*env)->ReleaseIntArrayElements(env, ints, e, JNI_COMMIT);
+    e[1] = 22;
+    (*env)->ReleaseIntArrayElements(env, ints, e, JNI_ABORT);
+    jint back[3];
+    (*env)->GetIntArrayRegion(env, ints, 0, 3, back);
+    jdouble *d = (*env)->GetDoubleArrayElements(env, doubles, &cd);
+    if (d == NULL)
+        return NULL;
+    d[0] *= 4;
+    (*env)->ReleaseDoubleArrayElements(env, doubles, d, 0);
+    static const jbyte set[] = {7, 9};
+    (*env)->SetByteArrayRegion(env, bytes, 0, 2, set);
+    jsize n = (*env)->GetArrayLength(env, bytes);
+    jbyte *crit = (*env)->GetPrimitiveArrayCritical(env, bytes, &cc);
+    if (crit == NULL)
+        return NULL;
+    int sum = 0;
+    for (jsize i = 0; i < n; i++)
+        sum += crit[i];
+    crit[3] = 5;
+    (*env)->ReleasePrimitiveArrayCritical(env, bytes, crit, 0);
+    snprintf(out, sizeof out, "int copy %d region %d %d %d double copy %d critical copy %d sum %d len %d", ci, back[0], back[1], back[2],
+             cd, cc, sum, (int)n);
+    return (*env)->NewStringUTF(env, out);
+}
+
+static jbyte g_direct[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+
+// A direct buffer over guest memory, handed to Java.
+JNI_FN(jobject, newDirectNative)(JNIEnv *env, jclass cls)
+{
+    return (*env)->NewDirectByteBuffer(env, g_direct, sizeof g_direct);
+}
+
+// `mine` is newDirectNative's buffer, `java` a ByteBuffer.allocateDirect(16) (its memory is an ART non-movable array: below 4 GiB); writes 42 into java[0].
+JNI_FN(jstring, directInfoNative)(JNIEnv *env, jclass cls, jobject mine, jobject java)
+{
+    char out[96];
+    jbyte *p = (*env)->GetDirectBufferAddress(env, java);
+    if (p != NULL)
+        p[0] = 42;
+    snprintf(out, sizeof out, "same %d cap %lld %lld java %d", (*env)->GetDirectBufferAddress(env, mine) == g_direct,
+             (long long)(*env)->GetDirectBufferCapacity(env, mine), (long long)(*env)->GetDirectBufferCapacity(env, java), p != NULL);
+    return (*env)->NewStringUTF(env, out);
+}
+
+// jlong / jdouble / jfloat parameters around int ones: AAPCS32 puts b in an even register pair or 8-aligned stack words, leaving gaps (C.3, C.7); the caller passes (1, 0x100000002, 3, 2.5, -5, 1.25f).
+JNI_FN(jstring, wideArgsNative)(JNIEnv *env, jclass cls, jint a, jlong b, jint c, jdouble d, jlong e, jfloat f)
+{
+    char out[128];
+    snprintf(out, sizeof out, "%d %lld %d %.3f %lld %.2f", a, (long long)b, c, d, (long long)e, (double)f);
+    return (*env)->NewStringUTF(env, out);
+}
+
+// jlong result in r0:r1 (AAPCS32 Result Return): x * 3 + 1.
+JNI_FN(jlong, wideLongNative)(JNIEnv *env, jclass cls, jlong x)
+{
+    return x * 3 + 1;
+}
+
+// jdouble result (softfp: r0:r1): x * 2 + y.
+JNI_FN(jdouble, wideDoubleNative)(JNIEnv *env, jclass cls, jdouble x, jfloat y)
+{
+    return x * 2 + y;
+}
+
+static jlong call_long_v(JNIEnv *env, jclass cls, jmethodID mid, ...)
+{
+    va_list ap;
+    va_start(ap, mid);
+    jlong r = (*env)->CallStaticLongMethodV(env, cls, mid, ap);
+    va_end(ap);
+    return r;
+}
+
+// AtlJniTest.mixLong(long, double, int) through `...`, `V` and `A`: 0x100000000 + 25 + 7 each time.
+JNI_FN(jstring, wideCallsNative)(JNIEnv *env, jclass cls)
+{
+    char out[128];
+    jmethodID mid = (*env)->GetStaticMethodID(env, cls, "mixLong", "(JDI)J");
+    if (mid == NULL)
+        return NULL;
+    jlong var = (*env)->CallStaticLongMethod(env, cls, mid, (jlong)0x100000000LL, 2.5, 7);
+    jlong v = call_long_v(env, cls, mid, (jlong)0x100000000LL, 2.5, 7);
+    jvalue args[3];
+    memset(args, 0xA5, sizeof args);
+    args[0].j = 0x100000000LL;
+    args[1].d = 2.5;
+    args[2].i = 7;
+    jlong a = (*env)->CallStaticLongMethodA(env, cls, mid, args);
+    snprintf(out, sizeof out, "var %lld V %lld A %lld", (long long)var, (long long)v, (long long)a);
+    return (*env)->NewStringUTF(env, out);
+}
+
+// Exceptions: ThrowNew, ExceptionCheck, ExceptionOccurred, ExceptionClear, then a new IllegalStateException made by NewObject is Thrown and left pending across the return; Java catches it.
+JNI_FN(void, exceptionsNative)(JNIEnv *env, jclass cls)
+{
+    jclass ise = (*env)->FindClass(env, "java/lang/IllegalStateException");
+    if (ise == NULL)
+        return;
+    (*env)->ThrowNew(env, ise, "first");
+    int c1 = (*env)->ExceptionCheck(env);
+    jthrowable t = (*env)->ExceptionOccurred(env);
+    (*env)->ExceptionClear(env);
+    int c2 = (*env)->ExceptionCheck(env);
+    jthrowable none = (*env)->ExceptionOccurred(env);
+    int inst = t != NULL && (*env)->IsInstanceOf(env, t, ise);
+    char msg[96];
+    snprintf(msg, sizeof msg, "check %d %d occurred %d null %d", c1, c2, inst, none == NULL);
+    jmethodID ctor = (*env)->GetMethodID(env, ise, "<init>", "(Ljava/lang/String;)V");
+    if (ctor == NULL)
+        return;
+    jobject e = (*env)->NewObject(env, ise, ctor, (*env)->NewStringUTF(env, msg));
+    if (e != NULL)
+        (*env)->Throw(env, e);
+}
+
+// Monitors: entered twice (reentrant), Thread.holdsLock seen from Java, exited twice.
+JNI_FN(jstring, monitorsNative)(JNIEnv *env, jclass cls, jobject o)
+{
+    char out[96];
+    jmethodID holds = (*env)->GetStaticMethodID(env, cls, "holds", "(Ljava/lang/Object;)Z");
+    if (holds == NULL)
+        return NULL;
+    int e1 = (*env)->MonitorEnter(env, o), e2 = (*env)->MonitorEnter(env, o);
+    int h1 = (*env)->CallStaticBooleanMethod(env, cls, holds, o);
+    int x1 = (*env)->MonitorExit(env, o), x2 = (*env)->MonitorExit(env, o);
+    int h2 = (*env)->CallStaticBooleanMethod(env, cls, holds, o);
+    snprintf(out, sizeof out, "enter %d %d held %d exit %d %d held %d", e1, e2, h1, x1, x2, h2);
+    return (*env)->NewStringUTF(env, out);
+}
+
+static jobject new_object_v(JNIEnv *env, jclass c, jmethodID ctor, ...)
+{
+    va_list ap;
+    va_start(ap, ctor);
+    jobject r = (*env)->NewObjectV(env, c, ctor, ap);
+    va_end(ap);
+    return r;
+}
+
+// The StringBuilder made by NewObject* from `s`, as text.
+static void sb_text(JNIEnv *env, jobject sb, jmethodID to_string, char *out, size_t n)
+{
+    jstring s = sb != NULL ? (*env)->CallObjectMethod(env, sb, to_string) : NULL;
+    const char *u = s != NULL ? (*env)->GetStringUTFChars(env, s, NULL) : NULL;
+    snprintf(out, n, "%s", u != NULL ? u : "null");
+    if (u != NULL)
+        (*env)->ReleaseStringUTFChars(env, s, u);
+}
+
+// References: GetObjectRefType of a local (the argument), global and weak global ref (jni.h 1, 2, 3); IsSameObject; a local frame popped with a result; an `...A` call whose jvalue array carries references in entries filled after a 0xA5 memset (ILP32: `.l` sets 4 of the 8 bytes); NewObject, NewObjectV, NewObjectA.
+JNI_FN(jstring, jniRefsNative)(JNIEnv *env, jclass cls, jobject o)
+{
+    char out[256];
+    jobject g = (*env)->NewGlobalRef(env, o);
+    jweak w = (*env)->NewWeakGlobalRef(env, o);
+    int tl = (*env)->GetObjectRefType(env, o), tg = (*env)->GetObjectRefType(env, g), tw = (*env)->GetObjectRefType(env, w);
+    int sg = (*env)->IsSameObject(env, g, o), sw = (*env)->IsSameObject(env, w, o);
+    int push = (*env)->PushLocalFrame(env, 8);
+    jobject kept = (*env)->PopLocalFrame(env, (*env)->NewLocalRef(env, g));
+    int sk = (*env)->IsSameObject(env, kept, o);
+    (*env)->DeleteGlobalRef(env, g);
+    (*env)->DeleteWeakGlobalRef(env, w);
+    jmethodID join = (*env)->GetStaticMethodID(env, cls, "join", "(Ljava/lang/String;JLjava/lang/Object;)Ljava/lang/String;");
+    if (join == NULL)
+        return NULL;
+    jvalue args[3];
+    memset(args, 0xA5, sizeof args);
+    args[0].l = (*env)->NewStringUTF(env, "ab");
+    args[1].j = 0x100000003LL;
+    args[2].l = o;
+    jstring joined = (*env)->CallStaticObjectMethodA(env, cls, join, args);
+    char joined_text[64];
+    const char *ju = joined != NULL ? (*env)->GetStringUTFChars(env, joined, NULL) : NULL;
+    snprintf(joined_text, sizeof joined_text, "%s", ju != NULL ? ju : "null");
+    if (ju != NULL)
+        (*env)->ReleaseStringUTFChars(env, joined, ju);
+    jclass sbc = (*env)->FindClass(env, "java/lang/StringBuilder");
+    if (sbc == NULL)
+        return NULL;
+    jmethodID ctor = (*env)->GetMethodID(env, sbc, "<init>", "(Ljava/lang/String;)V");
+    jmethodID to_string = (*env)->GetMethodID(env, sbc, "toString", "()Ljava/lang/String;");
+    if (ctor == NULL || to_string == NULL)
+        return NULL;
+    char n1[16], n2[16], n3[16];
+    sb_text(env, (*env)->NewObject(env, sbc, ctor, (*env)->NewStringUTF(env, "x")), to_string, n1, sizeof n1);
+    sb_text(env, new_object_v(env, sbc, ctor, (*env)->NewStringUTF(env, "y")), to_string, n2, sizeof n2);
+    jvalue one[1];
+    memset(one, 0xA5, sizeof one);
+    one[0].l = (*env)->NewStringUTF(env, "z");
+    sb_text(env, (*env)->NewObjectA(env, sbc, ctor, one), to_string, n3, sizeof n3);
+    snprintf(out, sizeof out, "types %d %d %d same %d %d frame %d %d join %s new %s %s %s", tl, tg, tw, sg, sw, push, sk, joined_text, n1, n2,
+             n3);
+    return (*env)->NewStringUTF(env, out);
+}
+
+static JavaVM *ga_vm;
+static jclass ga_cls;
+static volatile int ga_attach = -100, ga_add = -100, ga_detach = -100;
+
+static void *ga_thread(void *arg)
+{
+    JNIEnv *env = NULL;
+    ga_attach = (*ga_vm)->AttachCurrentThread(ga_vm, &env, NULL);
+    if (ga_attach != JNI_OK)
+        return NULL;
+    jmethodID add = (*env)->GetStaticMethodID(env, ga_cls, "javaAdd", "(II)I");
+    ga_add = add != NULL ? (*env)->CallStaticIntMethod(env, ga_cls, add, 20, 22) : -1;
+    ga_detach = (*ga_vm)->DetachCurrentThread(ga_vm);
+    return NULL;
+}
+
+// A guest pthread attaches (no JavaVMAttachArgs), up-calls javaAdd(20, 22) through a global class ref, detaches.
+JNI_FN(jstring, guestThreadAttach)(JNIEnv *env, jclass cls)
+{
+    char out[64];
+    if ((*env)->GetJavaVM(env, &ga_vm) != JNI_OK)
+        return NULL;
+    ga_cls = (*env)->NewGlobalRef(env, cls);
+    pthread_t t;
+    if (pthread_create(&t, NULL, ga_thread, NULL) != 0 || pthread_join(t, NULL) != 0)
+        return NULL;
+    (*env)->DeleteGlobalRef(env, ga_cls);
+    snprintf(out, sizeof out, "attach %d add %d detach %d", ga_attach, ga_add, ga_detach);
+    return (*env)->NewStringUTF(env, out);
 }
 
 JNI_FN(jint, callJavaAdd)(JNIEnv *env, jclass cls, jint a, jint b)

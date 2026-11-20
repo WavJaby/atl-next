@@ -344,6 +344,10 @@ fn run(argv: Vec<std::ffi::OsString>) -> Result<i32> {
     };
     let rc = if launch.app {
         let android = ffi::AndroidRuntime::load()?;
+        // before AndroidRuntime's attach, which initialises Build (measured: after it, CPU_ABI came from the 64-bit list)
+        if let Some(isa) = launch.instruction_set.as_deref() {
+            vm.answer_process_width(isa)?;
+        }
         android.attach(&vm)?;
         android.start_thread_pool();
         start_compositor(&vm, window);

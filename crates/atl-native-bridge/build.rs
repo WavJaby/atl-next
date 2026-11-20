@@ -2919,6 +2919,10 @@ const BREAKS: &[(&str, &str)] = &[
     ("qt_skip_dtor", "atl_nb_qt_skip_dtor"),
     // P5 (engine/dispatch.rs `local_refs`): a 32-bit guest's native method gets its transition references as they are, refused (counted) above 4 GiB (app gate `--fixture-arch arm`, registeredAnswer)
     ("p5_no_local_ref", "atl_nb_p5_no_local_ref"),
+    // P5 (engine/va_list.rs `jvalues_a32`): a 32-bit guest's `...A` reference entries keep the stale high word (unit test; app gate `--fixture-arch arm`, jniRefs)
+    ("jvalue_l_raw", "atl_nb_jvalue_l_raw"),
+    // P5 (engine/jni_copies.rs `to_host`): a release never copies the window back (app gate `--fixture-arch arm`, arrayElements)
+    ("p5_no_copy_back", "atl_nb_p5_no_copy_back"),
     // P4a (engine/mod.rs `Active::release`): QEMU windows are never given back, so thread churn keeps every exited thread's record and TLS (qemu-thread gate, `c`)
     ("qt_keep_windows", "atl_nb_qt_keep_windows"),
     // Q5-6 (engine/intercepts.rs `run`): a guest thread's routine gets the wrong argument (qemu-thread gate, `qt_join`)

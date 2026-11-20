@@ -19,6 +19,7 @@ pub mod identity;
 pub mod image;
 mod intercepts;
 pub mod jni;
+mod jni_copies;
 mod ndk;
 mod netdb;
 pub mod objects;

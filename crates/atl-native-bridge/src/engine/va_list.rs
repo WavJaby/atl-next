@@ -166,6 +166,26 @@ pub(super) unsafe fn jvalues32(ap: usize, end: usize, params: &[u8]) -> Result<V
         .collect()
 }
 
+/// An ARM guest's `jvalue` array at `at` for the arguments `params`, as the host's: jni.h's `jvalue` union is 8 bytes on ILP32 too (it holds `jlong`/`jdouble`, 8-aligned under AAPCS32), so the array strides alike, but storing `.l` writes only the low 4 bytes of an ILP32 entry and leaves the rest as they were: an `L` entry is cut to its low word (a 32-bit pointer zero-extended). Every other entry is copied whole; the host reads only its member's bytes.
+///
+/// # Safety
+/// `at` is readable for `8 * params.len()` bytes.
+pub(super) unsafe fn jvalues_a32(at: usize, params: &[u8]) -> Vec<u64> {
+    params
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            // SAFETY: caller contract: entry i of the guest's array.
+            let v = unsafe { load(at + 8 * i) };
+            if c == b'L' && !cfg!(atl_nb_jvalue_l_raw) {
+                v & 0xffff_ffff
+            } else {
+                v
+            }
+        })
+        .collect()
+}
+
 /// An ARM guest's argument words `words` (r0-r3, then its stack window; each lane's low 32 bits) as one 8-aligned run of 4-byte words. That is the layout `va_start` reads (AAPCS32 B.1: r0-r3 spilled directly below the stack arguments, which start 8-aligned at a call, 5.2.1.2), so a `...` call's variadic arguments are read from it as from a `va_list` whose `__ap` is the word after the fixed parameters. Byte length = 4 x the word count.
 pub(super) fn image32(words: impl IntoIterator<Item = u64>) -> Vec<u64> {
     let w: Vec<u32> = words.into_iter().map(|x| x as u32).collect();
@@ -218,6 +238,22 @@ mod tests {
         // SAFETY: an unknown shorty character is refused before any read.
         let v = unsafe { jvalues32(aligned.as_ptr() as usize, usize::MAX, b"Q") };
         assert_eq!(v, Err(Bad32::Shorty(b'Q')));
+    }
+
+    /// An ILP32 `jvalue[3]` for `(String, long, Object)` as the guest's compiler fills it after a memset of 0xA5 (as uninitialised stack): `.l` stores 4 bytes, `.j` 8. The host array has the references zero-extended and the long whole; red under break `jvalue_l_raw` (0xA5A5A5A5 in the high word).
+    #[test]
+    fn ilp32_jvalue_references_lose_the_stale_high_word() {
+        let j = 0x1122_3344_5566_7788u64;
+        let mut a = [0xA5A5_A5A5_A5A5_A5A5u64; 3];
+        // SAFETY: writes the low 4 bytes of entries 0 and 2, as `v[i].l = p` does on ILP32 (little-endian).
+        unsafe {
+            (a.as_mut_ptr() as *mut u32).write(0x0000_2005);
+            (a.as_mut_ptr().add(2) as *mut u32).write(0x8000_1001);
+        }
+        a[1] = j;
+        // SAFETY: `a` holds three 8-byte entries.
+        let v = unsafe { jvalues_a32(a.as_ptr() as usize, b"LJL") };
+        assert_eq!(v, [0x2005, j, 0x8000_1001]);
     }
 
     /// A `...` call's lanes as its `va_list` (AAPCS32 base PCS, Parameter Passing): `CallStaticIntMethod(env, cls, mid, 2, 3)` puts env, cls, mid, 2 in r0-r3 and 3 in the first stack word, so from word 3 (after the three fixed words) the list reads 2, 3. `CallStaticVoidMethod(env, cls, mid, j)`: j needs an even register (C.3), r4 does not exist, so j goes to the stack at offset 0 (C.7, C.12), r3 unused -- the reader's 8-alignment from word 3 lands on word 4 = stack word 0. Arguments past the window are refused before a read.

@@ -765,6 +765,7 @@ public class Main extends Activity {
         mediaPlayerWav();
         mediaPlayerReset();
         readSkipped();
+        logIdentity();
         Class<?> jni;
         try {
             jni = Class.forName("atl.bridge1.testlib.AtlJniTest");
@@ -1857,6 +1858,24 @@ public class Main extends Activity {
         }
     }
 
+    /** P5 identity: what this process reports of its own width and ABIs, one line (app.rs identity_failures judges it against the fixture ISA). primaryCpuAbi is a hidden field: read by reflection. */
+    private void logIdentity() {
+        android.content.pm.ApplicationInfo ai = getApplicationInfo();
+        String primary;
+        try {
+            primary = String.valueOf(ai.getClass().getField("primaryCpuAbi").get(ai));
+        } catch (ReflectiveOperationException e) {
+            primary = "threw-" + e.getClass().getSimpleName();
+        }
+        Log.i("AtlTest", "identity is64=" + android.os.Process.is64Bit()
+                + " cpu_abi=" + android.os.Build.CPU_ABI + " cpu_abi2=" + android.os.Build.CPU_ABI2
+                + " abis=" + String.join(",", android.os.Build.SUPPORTED_ABIS)
+                + " abis32=" + String.join(",", android.os.Build.SUPPORTED_32_BIT_ABIS)
+                + " abis64=" + String.join(",", android.os.Build.SUPPORTED_64_BIT_ABIS)
+                + " libdir=" + ai.nativeLibraryDir + " primary=" + primary
+                + " os.arch=" + System.getProperty("os.arch"));
+    }
+
     /** The bridge-1 fixture class once loaded (onActivityResult makes the looperLater call with it); null without it. */
     private Class<?> bridge1;
 
@@ -1906,6 +1925,15 @@ public class Main extends Activity {
         bridge1Call(jni, "greet", "greet", "bridge1");
         bridge1Call(jni, "callJavaAdd", "callJavaAdd", 2, 3);
         bridge1Call(jni, "registeredAnswer", "registeredAnswer");
+        // P5 JNI objects rows (AtlJniTest wrappers)
+        bridge1Call(jni, "stringChars", "stringChars");
+        bridge1Call(jni, "arrayElements", "arrayElements");
+        bridge1Call(jni, "directBuffer", "directBuffer");
+        bridge1Call(jni, "wideArgs", "wideArgs");
+        bridge1Call(jni, "exceptions", "exceptions");
+        bridge1Call(jni, "monitors", "monitors");
+        bridge1Call(jni, "jniRefs", "jniRefs");
+        bridge1Call(jni, "guestThreadAttach", "guestThreadAttach");
         bridge1Call(jni, "sigsegvRecover", "sigsegvRecover");
         bridge1Call(jni, "nullFieldRead", "nullFieldRead");
         bridge1Call(jni, "jitUpCall", "jitUpCall");

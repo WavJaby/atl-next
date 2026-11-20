@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The guest's `JNIEnv` / `JavaVM` (bridge1-step4-plan section 3, identity ABI): an object whose word 0 is a guest function table and word 1 the host object it stands for (`GuestObj`).
 //! Two rows of the proxy object tables (objects.rs): slots from jni.h; each is an object stub that crosses to the host object's own slot with only the object argument rewritten, so variadic entries need no per-signature code. Under QEMU a `va_list` entry crosses to its `...A` sibling instead, its arguments read by the method's shorty (dispatch.rs `call_object`, va_list.rs).
-//! Specials, whose results hand an env/vm back to the guest or whose arguments carry guest-layout structs, are host functions instead (the set Berberis `jni/jni_trampolines.cc` special-cases): `GetJavaVM`, `GetEnv`, `AttachCurrentThread`, `AttachCurrentThreadAsDaemon` (out-parameters written as a guest word, `JavaVMAttachArgs` read in guest layout), `RegisterNatives` (`JNINativeMethod[]` read in guest layout; ART still asks `isNativeBridgeFunctionPointer` of each `fnPtr`). Guest layouts are read by the guest's word (thread.rs `read_word`), one path for both widths.
+//! Specials, whose results hand an env/vm back to the guest or whose arguments carry guest-layout structs, are host functions instead (the set Berberis `jni/jni_trampolines.cc` special-cases): `GetJavaVM`, `GetEnv`, `AttachCurrentThread`, `AttachCurrentThreadAsDaemon` (out-parameters written as a guest word, `JavaVMAttachArgs` read in guest layout), `RegisterNatives` (`JNINativeMethod[]` read in guest layout; ART still asks `isNativeBridgeFunctionPointer` of each `fnPtr`). Guest layouts are read by the guest's word (thread.rs `read_word`), one path for both widths. A 32-bit guest's env also has the buffer pairs (`Get<Type>ArrayElements`, `GetString*Chars`, ...) as specials: ART's host-heap copies reach it as window copies (jni_copies.rs).
 //! Down calls rewrite the other way (arch `Down`): host env -> this thread's guest env, host vm -> the guest vm.
 //! A 32-bit guest holds ART's references as they are, as a 32-bit ART hands them out, so ART stays the only owner of their identity and lifetime: globals are table indices, locals entries of tables ART maps below 4 GiB (patches/aosp/art 0006), method and field ids opaque indices (`-Xopaque-jni-ids:true`, atl-app-launcher); the one exception, a native method's reference arguments in its managed frame, is [`local_ref`]'d by the down call (dispatch.rs `local_refs`).
 
@@ -29,14 +29,15 @@ pub fn guest_env(host: usize) -> usize {
     // SAFETY: this thread's record, leaked until its detach; no other borrow of it is live here.
     let slot = unsafe { &mut (*ht).env };
     let obj = slot.get_or_insert_with(|| {
-        let functions = objects::functions(
-            ENV_TABLE,
-            &[
-                (env::GetJavaVM, get_java_vm as *const () as usize),
-                (env::RegisterNatives, register_natives as *const () as usize),
-            ],
-            host,
-        );
+        let mut specials = vec![
+            (env::GetJavaVM, get_java_vm as *const () as usize),
+            (env::RegisterNatives, register_natives as *const () as usize),
+        ];
+        // a 32-bit guest takes ART's buffers as window copies (jni_copies.rs)
+        if guest_word() == 4 {
+            specials.extend(super::jni_copies::specials());
+        }
+        let functions = objects::functions(ENV_TABLE, &specials, host);
         Placed::new(functions, host)
     });
     obj.set_host(host);
@@ -113,6 +114,13 @@ pub(super) unsafe fn method_params(host: usize, mid: usize) -> Option<&'static [
 /// The `...A` sibling of `...V` slot `id`: jni.h declares each `XV` directly before `XA` (unit test `a_slot_follows_each_v_slot`).
 pub(super) const fn a_slot(id: usize) -> usize {
     id + 1
+}
+
+/// Whether env slot `id` is an `...A` slot (a `jvalue*` after its methodID): the slot after a `...V` one ([`a_slot`]).
+pub(super) fn is_a_slot(id: usize) -> bool {
+    id.checked_sub(1)
+        .and_then(|v| objects::LANES[ENV_TABLE].get(v).copied().flatten())
+        .is_some_and(|v| v.params.contains(&objects::Class::VaList))
 }
 
 /// The `...A` sibling of `...` slot `id`: jni.h declares `X`, `XV`, `XA` in that order (unit test `a_slot_follows_each_variadic_slot`).
@@ -287,8 +295,16 @@ mod tests {
             assert_eq!(a.params.len(), k + 1, "{}", v.name);
             assert_eq!(a.params[..k], v.params[..k], "{}", v.name);
             assert_eq!(a.ret, v.ret, "{}", v.name);
+            assert!(is_a_slot(a_slot(id)), "{}", a.name);
         }
         assert_eq!(n, 31);
+        assert_eq!(
+            (0..objects::LANES[ENV_TABLE].len())
+                .filter(|&i| is_a_slot(i))
+                .count(),
+            31
+        );
+        assert!(is_a_slot(env::CallStaticIntMethodA) && !is_a_slot(env::CallStaticIntMethodV));
     }
 
     /// Every `...` slot `X` has `XA` at `variadic_a_slot`: the same fixed parameters, then one `jvalue*`, and the same result; as many as the V slots (31).

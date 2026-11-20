@@ -75,7 +75,7 @@ pub(super) fn call_binding(guest: HostRules, id: u32, lanes: &AtlLanes) -> Answe
     };
     #[cfg(feature = "crossing-count")]
     crate::counters::count_binding(slot, target);
-    call_host(guest, target, lanes, sig, &[])
+    call_host(guest, target, None, lanes, sig, &[])
 }
 
 /// The object crossing counter's one entry (QEMU bridge plan section 5, per proxy table + slot): a guest->host call of slot `slot` of table `table` to host `target`. QEMU's [`call_object`] calls it with the table `lane_of` found; the identity object shell reaches it through [`count_object_shell`]. Break `qe_jni_count`: [`call_object`] skips it, so only identity counts.
@@ -160,6 +160,23 @@ fn call_object(rules: HostRules, id: u32, lanes: &AtlLanes) -> Answer {
             .unwrap_or_else(|r| refuse(r))
             .1;
         a
+    } else if table == objects::ENV
+        && rules.word_bits != AAPCS64.word_bits
+        && jni::is_a_slot(id as usize)
+    {
+        // a 32-bit guest's `...A` call: its jvalue array as the host reads it (va_list.rs `jvalues_a32`: a reference entry's high word cleared), in the lane after the methodID
+        let k = lane.params.len() - 1;
+        let method = *rules.int_arg(&mut lanes, k - 1) as usize;
+        // SAFETY: lane k - 1 is the call's jmethodID (jni.h: every A slot's jvalue array follows its methodID).
+        let params = unsafe { jni::method_params(host, method) }
+            .unwrap_or_else(|| refuse(Refused::NoShorty { name }));
+        let at = *rules.int_arg(&mut lanes, k) as usize;
+        if at != 0 {
+            // SAFETY: lane k is the guest's jvalue array, one entry per shorty parameter (JNI contract).
+            args = unsafe { va_list::jvalues_a32(at, params) };
+            va_lane = Some(k);
+        }
+        id as usize
     } else {
         id as usize
     };
@@ -186,7 +203,7 @@ fn call_object(rules: HostRules, id: u32, lanes: &AtlLanes) -> Answer {
         ret: sig_lane.ret,
         params: (!sig_lane.variadic).then_some(sig_lane.params),
     };
-    call_host(rules, target, &lanes, sig, &host_words)
+    call_host(rules, target, Some(name), &lanes, sig, &host_words)
 }
 
 /// The up call per host ISA (`cfg(target_arch)` only here): `call(target, lanes, fp, sig) -> (x result, fp result bits)`, same interface on each. riscv64 places the lanes by the prototype into LP64D and calls from asm; every other host takes them as one variadic call (x86_64 SysV the reference).
@@ -201,11 +218,12 @@ use variadic as host_call;
 
 /// Calls `target` with the guest lanes `lanes` and answers its result by `sig.ret`: a double from the fp result register (its bits in v0), a float as its low 32 bits with the upper ones clear (AArch64 reads s0; LP64D's fa0 holds it NaN-boxed), a void as x0 = 0, anything else from x0; then shaped into the guest's result registers ([`guest_answer`]).
 /// The lanes enter in the guest's convention `guest` and are first brought into AAPCS64's image ([`up_lanes`]), the one every host call reads.
-/// Then `host_words` (integer argument index, host value) replace those arguments in the image: host values the guest's word cannot carry (an object call's host object and jvalue array); every argument before each is one word.
+/// Then `host_words` (integer argument index, host value) replace those arguments in the image: host values the guest's word cannot carry (an object call's host object and jvalue array); every argument before each is one word. `jni`: the JNI function an object call runs, which names a refused result (ART's functions have no dynamic symbol).
 /// Breaks: `v_drop` zeroes the fp lanes; `drop_stack` moves the stack words down one; `ret_int` reads an fp result from x0; per host, `al_zero` (variadic.rs) and `up_no_nanbox` (riscv64.rs).
 fn call_host(
     guest: HostRules,
     target: usize,
+    jni: Option<&str>,
     lanes: &AtlLanes,
     sig: Sig,
     host_words: &[(usize, u64)],
@@ -240,7 +258,11 @@ fn call_host(
             ..Answer::default()
         },
     };
-    guest_answer(guest, sig.ret, ilp32_narrow(guest, sig.ret, target, answer))
+    guest_answer(
+        guest,
+        sig.ret,
+        ilp32_narrow(guest, sig.ret, target, jni, answer),
+    )
 }
 
 /// Host pointers and handles a 32-bit guest was refused, every `REFUSED_*` key together: the measurement phase4-32bit P4b names its largest uncertainty; a gate on a 32-bit guest asserts it 0. Moved only by [`report_refused`], so it equals the sum of the atl-diag refused counts under those keys.
@@ -262,15 +284,19 @@ pub(in crate::engine) fn report_refused(key: &str, cause: &str) {
     atl_diag::count(atl_diag::REFUSED, key, Some(cause));
 }
 
-/// A pointer result for a 32-bit guest (`guest`): at or above 4 GiB it cannot reach the guest, whose word would truncate it to another address; refused instead -- the answer becomes null (the C error value of a pointer result), counted in [`ILP32_REFUSED`] and reported with the host function's symbol name. Below 4 GiB, and every other class or guest, unchanged.
-fn ilp32_narrow(guest: HostRules, ret: Class, target: usize, answer: Answer) -> Answer {
+/// A pointer result for a 32-bit guest (`guest`): at or above 4 GiB it cannot reach the guest, whose word would truncate it to another address; refused instead -- the answer becomes null (the C error value of a pointer result), counted in [`ILP32_REFUSED`] and reported with the JNI function's name (`jni`, e.g. `GetDirectBufferAddress` of a buffer host code allocated) or else the host function's symbol name. Below 4 GiB, and every other class or guest, unchanged.
+fn ilp32_narrow(
+    guest: HostRules,
+    ret: Class,
+    target: usize,
+    jni: Option<&str>,
+    answer: Answer,
+) -> Answer {
     if guest.word_bits != 32 || ret != Class::Ptr || answer.x0 <= WORD {
         return answer;
     }
-    report_refused(
-        REFUSED_RESULT,
-        &format!("{} answered {:#x}", symbol_name(target), answer.x0),
-    );
+    let who = jni.map_or_else(|| symbol_name(target), |n| format!("JNI {n}"));
+    report_refused(REFUSED_RESULT, &format!("{who} answered {:#x}", answer.x0));
     Answer { x0: 0, ..answer }
 }
 
@@ -1371,18 +1397,18 @@ mod aapcs32_tests {
         let a = |x0| Answer { x0, x1: 0, v0: 0 };
         let before = ILP32_REFUSED.load(Ordering::Relaxed);
         assert_eq!(
-            ilp32_narrow(AAPCS32, Class::Ptr, 0, a(0xffff_ffff)).x0,
+            ilp32_narrow(AAPCS32, Class::Ptr, 0, None, a(0xffff_ffff)).x0,
             0xffff_ffff
         );
         assert_eq!(ILP32_REFUSED.load(Ordering::Relaxed), before);
-        assert_eq!(ilp32_narrow(AAPCS32, Class::Ptr, 0, a(0x1_0000_0000)).x0, 0);
+        assert_eq!(ilp32_narrow(AAPCS32, Class::Ptr, 0, None, a(0x1_0000_0000)).x0, 0);
         assert_eq!(ILP32_REFUSED.load(Ordering::Relaxed), before + 1);
         assert_eq!(
-            ilp32_narrow(AAPCS64, Class::Ptr, 0, a(0x1_0000_0000)).x0,
+            ilp32_narrow(AAPCS64, Class::Ptr, 0, None, a(0x1_0000_0000)).x0,
             0x1_0000_0000
         );
         assert_eq!(
-            ilp32_narrow(AAPCS32, I64, 0, a(0x1_0000_0000)).x0,
+            ilp32_narrow(AAPCS32, I64, 0, None, a(0x1_0000_0000)).x0,
             0x1_0000_0000
         );
     }

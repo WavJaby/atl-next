@@ -935,6 +935,40 @@ impl Vm {
         Ok(value != 0)
     }
 
+    /// What a process of app ISA `isa` observes of its own width. AOSP runs a 32-bit app in a 32-bit zygote, where `VMRuntime.is64Bit()` (so `Process.is64Bit()`, Process.java:852) answers false and Build's static block takes `CPU_ABI` / `CPU_ABI2` from `SUPPORTED_32_BIT_ABIS` (Build.java:320-326); `SUPPORTED_ABIS` is `ro.product.cpu.abilist` in either width.
+    /// Here ART is the host's 64-bit runtime, so when AOSP's own `VMRuntime.is64BitInstructionSet(isa)` says 32-bit, `is64Bit` is registered again to answer false, before zygoteInit and so before app code; a 64-bit ISA keeps ART's answer. Not through the bridge's `getAppEnv` (libnativebridge `SetupEnvironment`, which also sets `os.arch`): ART calls it inside JNI_CreateJavaVM, before AndroidRuntime registers the natives Build's static block needs.
+    pub fn answer_process_width(&self, isa: &str) -> Result<()> {
+        let runtime = self.find_class(c"dalvik/system/VMRuntime")?;
+        let of_isa = self.method(
+            runtime,
+            c"is64BitInstructionSet",
+            c"(Ljava/lang/String;)Z",
+            true,
+        )?;
+        let name = self.new_string(isa)?;
+        if self.call_static_bool(
+            runtime,
+            of_isa,
+            &[jni::jvalue { l: name }],
+            "VMRuntime.is64BitInstructionSet",
+        )? {
+            return Ok(());
+        }
+        extern "C" fn is_64bit_false(_env: Env, _this: JObject) -> u8 {
+            0
+        }
+        let method = jni::JNINativeMethod {
+            name: c"is64Bit".as_ptr().cast_mut(),
+            signature: c"()Z".as_ptr().cast_mut(),
+            fnPtr: is_64bit_false as *mut c_void,
+        };
+        // SAFETY: the main thread's env, a live class reference, one entry whose function matches `()Z` on an instance (env, this)
+        let rc = unsafe { jni_call!(self.env, RegisterNatives, runtime, &method, 1) };
+        self.check("RegisterNatives VMRuntime.is64Bit")?;
+        ensure!(rc == 0, "RegisterNatives VMRuntime.is64Bit: {rc}");
+        Ok(())
+    }
+
     /// As `call_static_int`, returning an object.
     pub(crate) fn call_static_object(
         &self,

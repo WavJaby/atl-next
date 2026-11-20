@@ -1176,6 +1176,35 @@ const BRIDGE1_CALLS: &[(&str, &str)] = &[
     ("greet", "hello, bridge1"),
     ("callJavaAdd", "5"),
     ("registeredAnswer", "7"),
+    // P5 JNI objects rows (atl_jni_test.c, AtlJniTest wrappers), values from the JNI specification and ART (src/aosp/art/runtime/jni/jni_internal.cc):
+    // GetStringUTFChars always copies (isCopy 1); "é中" is 2 + 3 = 5 modified-UTF-8 bytes (c3a9 e4b8ad); GetStringChars of a movable string copies (1); GetStringRegion(1, 3) of "bridge1" = "rid"; GetStringCritical copies a compressed (ASCII, kUseStringCompression) string (1) and hands out an uncompressed one's own chars (0); NewString {'H','i'}
+    (
+        "stringChars",
+        "utf bridge1 7 copy 1 wide 5 chars e9 4e2d copy 1 region rid c3a9e4b8ad critical b 1 wide e9 0 new Hi",
+    ),
+    // a movable int[] is copied (1); JNI_COMMIT copies back 11 and keeps the copy, JNI_ABORT then drops the 22; double {0.5} * 4 released with mode 0 = 2.0; bytes {0,0,0,1} with region {7,9} set sum to 17 through GetPrimitiveArrayCritical (ART: the array's own data, isCopy 0), whose write of 5 at [3] Java sees
+    (
+        "arrayElements",
+        "int copy 1 region 11 2 3 double copy 1 critical copy 0 sum 17 len 4 java 11 2 3 2.0 [7, 9, 0, 5]",
+    ),
+    // NewDirectByteBuffer over the guest's 8 bytes {1..8}: same address back, capacity 8, Java reads [7] = 8; ByteBuffer.allocateDirect(16): capacity 16, the native write of 42 at [0] seen by Java
+    ("directBuffer", "same 1 cap 8 16 java 1 get 8 42"),
+    // (1, 0x100000002, 3, 2.5, -5, 1.25f) back as text; 0x100000002 * 3 + 1 = 12884901895; 2.5 * 2 + 1.25 = 6.25; mixLong(0x100000000, 2.5, 7) = 4294967296 + 25 + 7 through `...`, V and A
+    (
+        "wideArgs",
+        "args 1 4294967298 3 2.500 -5 1.25 long 12884901895 double 6.25 var 4294967328 V 4294967328 A 4294967328",
+    ),
+    // ExceptionCheck 1 after ThrowNew, 0 after ExceptionClear; ExceptionOccurred an IllegalStateException, then null; the NewObject'ed exception thrown and pending across the native return
+    ("exceptions", "caught check 1 0 occurred 1 null 1"),
+    // MonitorEnter twice JNI_OK (0, reentrant), Thread.holdsLock true (1); MonitorExit twice 0, then false
+    ("monitors", "enter 0 0 held 1 exit 0 0 held 0"),
+    // GetObjectRefType: JNILocalRefType 1, JNIGlobalRefType 2, JNIWeakGlobalRefType 3 (jni.h); IsSameObject 1 1; PushLocalFrame 0, PopLocalFrame's result the same object (1); join("ab", 0x100000003, "obj") by CallStaticObjectMethodA; StringBuilder("x"/"y"/"z") by NewObject, NewObjectV, NewObjectA
+    (
+        "jniRefs",
+        "types 1 2 3 same 1 1 frame 0 1 join ab4294967299obj new x y z",
+    ),
+    // a guest pthread: AttachCurrentThread JNI_OK (0), javaAdd(20, 22) = 42, DetachCurrentThread 0
+    ("guestThreadAttach", "attach 0 add 42 detach 0"),
     ("sigsegvRecover", "1"),
     ("nullFieldRead", "caught"),
     ("jitUpCall", "8000000"),
@@ -1291,9 +1320,71 @@ const QEMU_DEFERRED: &[&str] = &[
     "legacyNew",
     "zRoundTrip",
 ];
+/// Main.logIdentity's line: `key=value` fields, space-separated.
+const IDENTITY: &str = "AtlTest: identity ";
+
+/// What the app process reports of its own width and ABIs (Main.logIdentity), against AOSP's rules for an app of fixture ISA `isa` (arches.toml `pointer_bits`, first `android_abis` entry `primary_abi`):
+/// `Process.is64Bit()` = the ISA is 64-bit (a 32-bit app runs in a 32-bit zygote); `Build.CPU_ABI` / `CPU_ABI2` = entries 0 / 1 ("" when none) of `SUPPORTED_64_BIT_ABIS` or `SUPPORTED_32_BIT_ABIS` by that answer (Build.java:320-326);
+/// `SUPPORTED_ABIS` (`ro.product.cpu.abilist`) holds the 64-bit and 32-bit lists, whatever the process width (board_config.mk: abilist = 64-bit + 32-bit ABIs); `primaryCpuAbi` the APK's ABI and `nativeLibraryDir` `.../lib/<isa>` (PackageManager's NativeLibraryHelper choice, VMRuntime.getInstructionSet).
+/// `os.arch` is logged, not judged: AOSP takes it from `uname().machine` (libcore System.java) or the bridge's `getAppEnv` (libnativebridge `SetupEnvironment`), and neither the kernel's 32-bit answer nor a `getAppEnv` before Build's natives is settled here.
+fn identity_failures(app: &str, isa: &str, pointer_bits: u32, primary_abi: &str) -> Vec<String> {
+    let Some(line) = app
+        .lines()
+        .find_map(|l| l.split_once(IDENTITY).map(|(_, r)| r.trim_end()))
+    else {
+        return vec![format!("identity: no {IDENTITY:?} line")];
+    };
+    let field = |k: &str| {
+        line.split(' ')
+            .find_map(|f| f.strip_prefix(k)?.strip_prefix('='))
+            .unwrap_or("<missing>")
+    };
+    let list = |k: &str| -> Vec<&str> { field(k).split(',').filter(|s| !s.is_empty()).collect() };
+    let is64 = pointer_bits == 64;
+    let width = if is64 { list("abis64") } else { list("abis32") };
+    let want = [
+        ("is64", is64.to_string()),
+        ("cpu_abi", width.first().copied().unwrap_or("").to_owned()),
+        ("cpu_abi2", width.get(1).copied().unwrap_or("").to_owned()),
+        ("primary", primary_abi.to_owned()),
+    ];
+    let mut whys: Vec<String> = want
+        .iter()
+        .filter(|(k, v)| field(k) != v)
+        .map(|(k, v)| format!("identity {k}: want {v}, got {} ({line})", field(k)))
+        .collect();
+    let mut all = list("abis");
+    let mut both = [list("abis64"), list("abis32")].concat();
+    all.sort_unstable();
+    both.sort_unstable();
+    if all != both || all.is_empty() {
+        whys.push(format!("identity abis: want abis64 + abis32, got {line}"));
+    }
+    if !field("libdir").ends_with(&format!("/lib/{isa}")) {
+        whys.push(format!("identity libdir: want .../lib/{isa}, got {line}"));
+    }
+    whys
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    /// An arm app on a 64-bit device with abilist64 "x86_64,arm64-v8a" and abilist32 "armeabi-v7a,armeabi" (hand-written, as board_config.mk builds them): a 32-bit process takes CPU_ABI / CPU_ABI2 from the 32-bit list (Build.java:320-326). The 64-bit answers -- what ART's own `is64Bit` gives without the launcher -- fail on is64, cpu_abi and cpu_abi2.
+    #[test]
+    fn a_32_bit_process_reports_the_32_bit_list() {
+        let lists = "abis=x86_64,arm64-v8a,armeabi-v7a,armeabi abis32=armeabi-v7a,armeabi abis64=x86_64,arm64-v8a libdir=/data/app/p/lib/arm primary=armeabi-v7a os.arch=x86_64";
+        let good = format!("I AtlTest: identity is64=false cpu_abi=armeabi-v7a cpu_abi2=armeabi {lists}");
+        assert!(identity_failures(&good, "arm", 32, "armeabi-v7a").is_empty());
+        let host = format!("I AtlTest: identity is64=true cpu_abi=x86_64 cpu_abi2=arm64-v8a {lists}");
+        assert_eq!(identity_failures(&host, "arm", 32, "armeabi-v7a").len(), 3);
+        assert_eq!(identity_failures("", "arm", 32, "armeabi-v7a").len(), 1);
+    }
+}
+
 /// The diag key prefix of the bridge's refusals of a host pointer to a 32-bit guest (atl-native-bridge engine dispatch.rs `REFUSED_*`).
 const ILP32_REFUSAL: &str = "native-bridge.ilp32-";
-/// The bridge-1 calls a 32-bit guest carries (32-bit JNI objects: slice 1, the guest's JavaVM / JNIEnv in `JNI_OnLoad` with GetEnv, FindClass and RegisterNatives, and native methods answering an int; slice 2, variadic Call*Method: `callJavaAdd`, `jitUpCall`). Every other call of a 32-bit fixture is deferred until the JNI slice that carries it (string and array copies, guest threads, the NDK rows).
+/// The bridge-1 calls a 32-bit guest carries (32-bit JNI objects: slice 1, the guest's JavaVM / JNIEnv in `JNI_OnLoad` with GetEnv, FindClass and RegisterNatives, and native methods answering an int; slice 2, variadic Call*Method: `callJavaAdd`, `jitUpCall`, then strings and arrays as window copies, direct buffers, jlong/jdouble, exceptions, monitors, references, NewObject*). Every other call of a 32-bit fixture is deferred until the slice that carries it (guest threads, the NDK rows).
 const ILP32_CARRIED: &[&str] = &[
     "tlsCounter#1",
     "tlsCounter#2",
@@ -1303,6 +1394,15 @@ const ILP32_CARRIED: &[&str] = &[
     "registeredAnswer",
     "callJavaAdd",
     "jitUpCall",
+    "greet",
+    "stringChars",
+    "arrayElements",
+    "directBuffer",
+    "wideArgs",
+    "exceptions",
+    "monitors",
+    "jniRefs",
+    "guestThreadAttach",
 ];
 /// The calls a run of fixture ISA `isa` (guest pointer width `pointer_bits`) on host `host` skips: none for the host's (identity), [`QEMU_DEFERRED`] for a foreign 64-bit one, all but [`ILP32_CARRIED`] for a 32-bit one.
 fn deferred(isa: &str, host: &str, pointer_bits: u32) -> Vec<&'static str> {
@@ -2029,10 +2129,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         "--host {}: no identity engine (arches.toml), so the fixture needs a foreign --fixture-arch",
         args.host
     );
-    let pointer_bits = crate::arches::load(root)?
+    let (pointer_bits, primary_abi) = crate::arches::load(root)?
         .get(isa)
-        .with_context(|| format!("--fixture-arch {isa}: no arches.toml row"))?
-        .pointer_bits;
+        .map(|a| {
+            let abi = a.guest.as_ref().and_then(|g| g.android_abis.first());
+            (a.pointer_bits, abi.cloned().unwrap_or_default())
+        })
+        .with_context(|| format!("--fixture-arch {isa}: no arches.toml row"))?;
     let deferred = &deferred(isa, &args.host, pointer_bits)[..];
     let rt = if isa == args.host {
         rt
@@ -2237,6 +2340,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 cert: &cert,
                 deferred,
                 isa,
+                pointer_bits,
+                primary_abi: &primary_abi,
                 foreign: isa != args.host,
                 scene: &scene,
                 activity: &activity,
@@ -2334,6 +2439,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         cert: &cert,
         deferred,
         isa,
+        pointer_bits,
+        primary_abi: &primary_abi,
         foreign: isa != args.host,
         scene: &scene,
         activity: &activity,
@@ -2356,6 +2463,9 @@ struct AppJudge<'a> {
     cert: &'a str,
     deferred: &'a [&'a str],
     isa: &'a str,
+    /// The fixture ISA's arches.toml `pointer_bits` and first `android_abis` entry ([`identity_failures`]).
+    pointer_bits: u32,
+    primary_abi: &'a str,
     /// The fixture's ISA is not the host's (a guest run through the bridge).
     foreign: bool,
     scene: &'a Scene,
@@ -2399,6 +2509,8 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
         cert,
         deferred,
         isa,
+        pointer_bits,
+        primary_abi,
         foreign,
         scene,
         activity,
@@ -2689,6 +2801,7 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
     // startActivityForResult round trip (Main.java, ResultChild.java): the result, its order against Main's resume, and the singleTop self-start's cancel
     if passed {
         whys.extend(result_failures(&app));
+        whys.extend(identity_failures(&app, isa, pointer_bits, primary_abi));
     }
     if passed && !bridge1_ok {
         whys.push(format!(
