@@ -728,10 +728,13 @@ fn scan_ninja(file: &Path, prefixes: &Prefixes, from: &str, reads: &mut Reads) -
 /// The header reads of a graph's deps log (ninja_deps.rs, read-only, so safe beside a build of that dir): each path a step's record names, once.
 /// Unique paths rather than a target map: the log holds ~8M dependency entries per graph and only the paths matter here.
 /// Not the records of build.ninja's regeneration edge (every file the converter read; ninja files them under each of its outputs, graph.json and problems.txt too), of its directory probe checks (`globs/<n>.result`: every directory it walked) or of the licence gate edge (what it checked): those read whatever the checkout holds, they do not need it held.
+/// Nor the records of outputs the current build.ninja no longer builds: the log keeps every record any earlier graph of this dir wrote (a single-goal build's steps, until ninja recompacts), and ninja itself treats a record as live only while its output has an edge in the loaded graph (deps_log.cc `IsDepsEntryLiveFor`).
 fn scan_deps(out: &Path, prefixes: &Prefixes, from: &str, reads: &mut Reads) -> Result<()> {
     let log = crate::ninja_deps::read(out)?;
+    let steps = ninja_outputs(&out.join(NINJA))?;
     let not_a_step = |o: &Path| {
-        o == Path::new("build.ninja")
+        !steps.contains(o)
+            || o == Path::new("build.ninja")
             || o.starts_with(crate::native::GLOB_DIR)
             || o.file_name() == Some(std::ffi::OsStr::new(crate::native::LICENCE_REPORT))
     };
@@ -741,6 +744,47 @@ fn scan_deps(out: &Path, prefixes: &Prefixes, from: &str, reads: &mut Reads) -> 
         }
     }
     Ok(())
+}
+
+/// The outputs (explicit and implicit) of every `build` statement of a ninja file, unescaped (`$ `, `$:`, `$$`). Outputs never span a `$` line continuation in the converter's files.
+fn ninja_outputs(file: &Path) -> Result<std::collections::HashSet<PathBuf>> {
+    let f = File::open(file).with_context(|| format!("opening {}", file.display()))?;
+    let mut outputs = std::collections::HashSet::new();
+    for line in BufReader::new(f).lines() {
+        let line = line.with_context(|| format!("reading {}", file.display()))?;
+        if let Some(rest) = line.strip_prefix("build ") {
+            outputs.extend(build_outputs(rest).into_iter().map(PathBuf::from));
+        }
+    }
+    Ok(outputs)
+}
+
+/// The output paths of one `build` line after its keyword: up to the first unescaped `:`, split at unescaped spaces, `|` dropped.
+fn build_outputs(rest: &str) -> Vec<String> {
+    let mut outputs = Vec::new();
+    let mut cur = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '$' => {
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                }
+            }
+            ':' => break,
+            ' ' => {
+                if !cur.is_empty() && cur != "|" {
+                    outputs.push(std::mem::take(&mut cur));
+                }
+                cur.clear();
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.is_empty() && cur != "|" {
+        outputs.push(cur);
+    }
+    outputs
 }
 
 /// Every string of graph.json, split into tokens: the include dirs of compiles among them, which are dir reads (a header search reads the whole dir).
@@ -1026,6 +1070,16 @@ fn write_rows(root: &Path, rows: &[(String, Vec<String>)]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Outputs end at the first unescaped `:`; `$ ` and `$:` belong to a path; implicit outputs after `|` count.
+    #[test]
+    fn build_line_outputs() {
+        assert_eq!(
+            build_outputs("a/x.o a$ b.o | c$:d.d: cc src/x.c | h.h"),
+            ["a/x.o", "a b.o", "c:d.d"]
+        );
+        assert_eq!(build_outputs("out.jar: javac in.java"), ["out.jar"]);
+    }
 
     const WS: &str = "/home/u/atl-next";
 
