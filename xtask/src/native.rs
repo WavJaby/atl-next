@@ -576,9 +576,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .map_or_else(|| "edges n/a".to_owned(), |p| format!("{} edges", p.len()));
     phases.span(&format!("ninja ({edges})"), ninja_started.elapsed());
     drop(grant);
+    // a crate-source provider has no library: the converter builds the tree module, whose output the gates read as the build's own
     let provided_libs: BTreeSet<&Path> = provided
         .values()
         .chain(partial.values().filter_map(|p| p.provider.as_ref()))
+        .filter(|p| p.krate.is_none())
         .map(|p| p.lib.as_path())
         .collect();
     // every check that fails the run, with its first error line: the last line names and quotes them (`verdict`)

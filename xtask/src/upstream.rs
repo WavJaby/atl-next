@@ -150,9 +150,13 @@ pub fn build(
         ("CMAKE_INSTALL_LIBDIR", "lib".to_owned()),
     ]);
     let mut env = Vec::new();
+    // bindgen parses the headers as the C compiler compiles them: upstream's CMake gives it only -I and --target, so a cross host's
+    // --sysroot comes through bindgen's own BINDGEN_EXTRA_CLANG_ARGS (else it reads the build machine's glibc headers: other layouts)
+    let bindgen_args = tc.flags.compile.join(" ");
     if !recipe.crates.is_empty() {
         cache.push(("RUST_BINDINGS", tc.rust_triple.to_owned()));
         env.push(("LIBCLANG_PATH", tc.libclang.as_os_str()));
+        env.push(("BINDGEN_EXTRA_CLANG_ARGS", std::ffi::OsStr::new(&bindgen_args)));
     }
     let cache: Vec<(&str, &str)> = cache
         .iter()
