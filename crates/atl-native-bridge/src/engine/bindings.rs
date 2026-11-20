@@ -47,11 +47,76 @@ struct Table {
     prototypes: &'static [(&'static str, Sig, Option<&'static str>)],
 }
 
-/// An `Entry::Mapped` row: library, symbol, the (parameter, map) pairs (build.rs from atl_bridgegen `jni::route`).
-pub type MappedRow = (&'static str, &'static str, &'static [(usize, LaneMap)]);
+/// An `Entry::Mapped` row: library, symbol, the (parameter, map) pairs, the result's map (build.rs from atl_bridgegen `jni::route` / the ILP32 classifier).
+pub type MappedRow = (
+    &'static str,
+    &'static str,
+    &'static [(usize, LaneMap)],
+    RetMap,
+);
+
+/// What a lane-mapped row's host side does to its result (atl_bridgegen `jni::RetMap`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetMap {
+    /// the host's value, narrowed by the row's result class
+    Plain,
+    /// ILP32: a host object of this type -> its handle (handles.rs); NULL stays 0
+    Handle(&'static str),
+    /// ILP32: host text -> its interned guest-addressable copy (handles.rs `intern`); NULL stays NULL
+    String,
+}
 
 /// An `Entry::Mapped` row's host side (generated `mapped::<I>`): six int lanes in, one out.
-type MappedFn = extern "C" fn(usize, usize, usize, usize, usize, usize) -> usize;
+#[derive(Clone, Copy)]
+pub enum MappedFn {
+    /// an int or void result
+    Int(
+        extern "C" fn(
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+        ) -> usize,
+    ),
+    /// an fp result
+    Fp(
+        extern "C" fn(
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+        ) -> f64,
+    ),
+}
+
+impl MappedFn {
+    fn addr(self) -> usize {
+        match self {
+            MappedFn::Int(f) => f as usize,
+            MappedFn::Fp(f) => f as usize,
+        }
+    }
+}
 
 /// What a lane-mapped row's host side does to one argument before the forward (atl_bridgegen `jni::LaneMap`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +129,8 @@ pub enum LaneMap {
     Record(&'static Conv, bool),
     /// ILP32: a guest pointer to one word -> a host-width temporary, written back narrowed (convert.rs). NULL stays NULL.
     OutWord(Word),
+    /// ILP32: a guest handle of this type -> the host object (handles.rs); `true`: the call ends the object, the handle is freed after it. 0 stays NULL; an unknown handle refuses the call (counted, answers 0).
+    Handle(&'static str, bool),
 }
 
 /// The table of the process's engine.
@@ -371,7 +438,7 @@ pub fn target(soname: &str, name: &str) -> Option<Target> {
         Some(Entry::Shim(sig)) => found(shim(name), sig),
         // its host symbol must be there too: the forwarder would abort at the first call otherwise
         Some(Entry::Mapped(i, sig)) => found(
-            system_symbol(lib.soname, table.mapped_rows[i].1).map(|_| table.mapped_fns[i] as usize),
+            system_symbol(lib.soname, table.mapped_rows[i].1).map(|_| table.mapped_fns[i].addr()),
             sig,
         ),
         // a variable is never a stub: [`variable`] resolves it

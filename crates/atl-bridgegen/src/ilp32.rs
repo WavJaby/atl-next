@@ -28,8 +28,10 @@ pub enum Kind {
     Record(String),
     /// jni.h's `JNIEnv*` / `JavaVM*` (records `_JNIEnv`, `_JavaVM`): the guest's proxy object stands for the host's (P5's JNI tables), never a record copy.
     Jni,
-    /// A pointer to an incomplete record or a handle typedef: a host handle the guest only names back.
-    Opaque,
+    /// A pointer to an incomplete record or a handle typedef, by value: a host object the guest only names back -> a 32-bit handle (engine handles.rs). The type name: the typedef (`EGLDisplay`) or the record (`AAsset`).
+    Opaque(String),
+    /// A non-const pointer to a word the host writes with a host object (`EGLDisplay*`, `AAsset**`): one slot, or an array whose length the header states in prose (`eglChooseConfig`'s `configs`), so none converts generically.
+    OutHandle(String),
     /// A function pointer: a guest entry the host would call; its lanes as a JNI shorty.
     Callback(String),
     /// A `const char*` result: host text the guest reads.
@@ -62,7 +64,8 @@ impl Kind {
             Kind::Array => "array",
             Kind::Record(_) => "record",
             Kind::Jni => "jni",
-            Kind::Opaque => "opaque",
+            Kind::Opaque(_) => "opaque",
+            Kind::OutHandle(_) => "out-handle",
             Kind::Callback(_) => "callback",
             Kind::String => "string",
         }
@@ -74,8 +77,8 @@ impl Kind {
             Kind::Same | Kind::Widen { .. } | Kind::Ptr => 0,
             Kind::String => 1,
             Kind::PtrResult => 2,
-            Kind::Opaque => 3,
-            Kind::OutWord(_) | Kind::Array => 4,
+            Kind::Opaque(_) => 3,
+            Kind::OutWord(_) | Kind::Array | Kind::OutHandle(_) => 4,
             Kind::Record(_) => 5,
             Kind::Jni => 6,
             Kind::Callback(_) => 7,
@@ -91,7 +94,8 @@ impl Kind {
             Kind::Array => "pending: ilp32 array",
             Kind::Record(_) => "pending: ilp32 record",
             Kind::Jni => "pending: ilp32 jni (P5)",
-            Kind::Opaque => "pending: ilp32 opaque",
+            Kind::Opaque(_) => "pending: ilp32 opaque",
+            Kind::OutHandle(_) => "pending: ilp32 out-handle",
             Kind::Callback(_) => "pending: ilp32 callback",
             Kind::String => "pending: ilp32 string",
         }
@@ -111,6 +115,7 @@ impl Kind {
             }
             Kind::OutWord(Word::Ptr) => "out-word:ptr".to_owned(),
             Kind::Callback(shorty) => format!("callback:{shorty}"),
+            Kind::OutHandle(ty) => format!("out-handle:{ty}"),
             k => k.label().to_owned(),
         }
     }
@@ -265,7 +270,7 @@ fn position(
     }
     if let Some(n) = handle(g, views.handles) {
         used.insert(n.to_owned());
-        return Ok(Kind::Opaque);
+        return Ok(Kind::Opaque(n.to_owned()));
     }
     // a `void*` typedef names either a handle or a buffer, and the views cannot tell which: it must be listed
     if let Some(n) = void_pointer_typedef(g) {
@@ -330,7 +335,7 @@ fn pointee(gp: &Ty, hp: &Ty, result: bool, konst: bool, views: &Views) -> Result
         _ if untyped(gp, views.guest) && !matches!(gp.resolved(), Ty::Void)
             || untyped(hp, views.host) && !matches!(hp.resolved(), Ty::Void) =>
         {
-            Kind::Opaque
+            Kind::Opaque(type_name(gp).or(type_name(hp)).unwrap_or_default())
         }
         (Ty::Int { bits: 8, .. }, Ty::Int { bits: 8, .. }) if result => Kind::String,
         _ if same(gp, views.guest, hp, views.host, false) => data,
@@ -371,7 +376,19 @@ fn out_pointer(gp: &Ty, gi: &Ty, hi: &Ty, views: &Views) -> Kind {
     if handle(gp, views.handles).is_none() && !object && readable {
         Kind::OutWord(Word::Ptr)
     } else {
-        Kind::Opaque
+        let name = handle(gp, views.handles)
+            .map(str::to_owned)
+            .or_else(|| type_name(gi))
+            .unwrap_or_else(|| "fn".to_owned());
+        Kind::OutHandle(name)
+    }
+}
+
+/// The record name a pointee resolves to (`AAsset`), the handle type of a [`Kind::Opaque`] / [`Kind::OutHandle`].
+fn type_name(ty: &Ty) -> Option<String> {
+    match ty.resolved() {
+        Ty::Opaque { name, .. } | Ty::Record { name } => Some(name.clone()),
+        _ => None,
     }
 }
 
@@ -880,6 +897,11 @@ struct _jobject {};\ntypedef struct _jobject* jobject;\n\
 
     const ARM: &str = "armv7a-linux-androideabi";
 
+    /// A handle by value of type `ty`.
+    fn op(ty: &str) -> Kind {
+        Kind::Opaque(ty.to_owned())
+    }
+
     fn row(iface: &crate::ir::Interface, name: &str) -> Row {
         let (g, h) = (&iface.arches["guest"], &iface.arches["host"]);
         let views = Views {
@@ -940,7 +962,7 @@ struct _jobject {};\ntypedef struct _jobject* jobject;\n\
         // off64_t is 8 bytes on both: the result is Same, the asset handle Opaque
         assert_eq!(
             row(&i, "AAsset_getLength64").kinds,
-            vec![Kind::Same, Kind::Opaque]
+            vec![Kind::Same, op("AAsset")]
         );
         // void** outData: a pointer-width word behind a non-const pointer
         assert_eq!(
@@ -954,11 +976,11 @@ struct _jobject {};\ntypedef struct _jobject* jobject;\n\
         assert_eq!(
             img.kinds,
             vec![
-                Kind::Opaque,
-                Kind::Opaque,
-                Kind::Opaque,
+                op("EGLImage"),
+                op("EGLDisplay"),
+                op("EGLContext"),
                 Kind::Same,
-                Kind::Opaque,
+                op("EGLClientBuffer"),
                 Kind::Array
             ]
         );
@@ -969,7 +991,7 @@ struct _jobject {};\ntypedef struct _jobject* jobject;\n\
             Kind::Record("ANativeWindow_Buffer".to_owned())
         );
         assert_eq!(lock.kinds[3], Kind::Ptr);
-        assert_eq!(lock.kinds[1], Kind::Opaque);
+        assert_eq!(lock.kinds[1], op("ANativeWindow"));
         assert_eq!(
             row(&i, "nanosleep").kinds[1],
             Kind::Record("timespec".to_owned())
@@ -994,9 +1016,15 @@ struct _jobject {};\ntypedef struct _jobject* jobject;\n\
             })
         );
         // EGLDisplay*: a handle the host writes (P4b s4)
-        assert_eq!(row(&i, "out_display").kinds[1], Kind::Opaque);
+        assert_eq!(
+            row(&i, "out_display").kinds[1],
+            Kind::OutHandle("EGLDisplay".to_owned())
+        );
         // AAsset**: an incomplete record the host hands out
-        assert_eq!(row(&i, "out_asset").kinds[1], Kind::Opaque);
+        assert_eq!(
+            row(&i, "out_asset").kinds[1],
+            Kind::OutHandle("AAsset".to_owned())
+        );
         assert_eq!(row(&i, "env_user").kinds[1], Kind::Jni);
         assert_eq!(row(&i, "AAsset_name").kinds[0], Kind::String);
         assert_eq!(
@@ -1085,7 +1113,7 @@ struct _jobject {};\ntypedef struct _jobject* jobject;\n\
         );
         assert_eq!(row(&i, "getnameinfo").kinds[1], Kind::Ptr);
         // a field-less tag record (jni.h `_jobject`, here C's empty struct) stays a handle
-        assert_eq!(row(&i, "use_object").kinds[1], Kind::Opaque);
+        assert_eq!(row(&i, "use_object").kinds[1], op("_jobject"));
     }
 
     /// A signedness-only difference at equal width is carried: `socklen_t` int32 (bionic arm) vs uint32 (glibc x86_64).

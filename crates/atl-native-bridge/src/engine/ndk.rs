@@ -3,25 +3,78 @@
 //! - `JNIEnv*`: the guest passes its own env (jni.rs `GuestObj`); mapped to the host env (jni.rs `host_env`).
 //! - a guest function pointer (GS2.2 callback-param, tr-first blocker 5): mapped to a down shell ([`super::Active::down`], plain kind, the callback's shorty), so the host library calls a host address that enters the guest. The host may call it during the call or later, from any thread: the shell attaches a thread on its first down call (qemu `call_down`, identity `attach_entry`). Shells are deduplicated by (function, shorty) and never freed, so a callback re-posted every frame takes one. The callback's own arguments are values or the guest's user data (build.rs `CALLBACKS` review), passed unchanged.
 //!
-//! The other arguments and the results are host values already: object references are the host's, and an AAssetManager, ANativeWindow or pixel pointer names host memory the guest reads in the same address space. Every row's lanes are ints, at most six (atl_bridgegen `jni::route` refuses the rest at build time), so one six-word forwarder serves all.
+//! - ILP32 (arm guest): a record or out word through a host temporary (convert.rs), a host object as a handle (handles.rs), text results interned in guest-addressable memory.
+//!
+//! The other arguments are host values already: object references are the host's, and on an LP64 guest an AAssetManager, ANativeWindow or pixel pointer names host memory the guest reads in the same address space. Every row's lanes fit six int and eight fp registers (build.rs refuses the rest), so one forwarder shape serves all: the fp lanes keep their bits untouched (a float in the low half of its register), an fp result returns in the fp register.
 
-use super::bindings::{self, LaneMap, MappedRow};
-use super::{convert, jni, unsupported};
+use super::bindings::{self, LaneMap, MappedRow, RetMap};
+use super::{convert, handles, jni, unsupported};
 
-/// The forwarded host function: six int lanes (SysV's integer registers; a shorter prototype ignores the rest), one int result (a void one's is never read).
-type HostFn = unsafe extern "C" fn(usize, usize, usize, usize, usize, usize) -> usize;
+/// The forwarded host function: six int lanes (SysV's integer registers) and eight fp lanes (its vector registers); a shorter prototype ignores the rest. One int result (a void one's is never read).
+type HostFn = unsafe extern "C" fn(
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+) -> usize;
+/// [`HostFn`] with an fp result.
+type HostFnFp = unsafe extern "C" fn(
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+) -> f64;
 
-/// `Entry::Mapped` row `(soname, symbol, maps)`'s call: each mapped lane replaced, then `symbol` of the host library `soname` with the six lanes. Aborts when the host library lacks the symbol (bindings.rs `target` binds the row only when it has it) or no down shell is left.
-pub(super) fn call_mapped((soname, symbol, maps): MappedRow, mut lanes: [usize; 6]) -> usize {
+/// `Entry::Mapped` row `(soname, symbol, maps, ret)`'s call: each mapped lane replaced, then `symbol` of the host library `soname` with the six int and eight fp lanes, its result mapped by `ret`. `fp_ret`: the result is an fp lane, answered as its bits. Aborts when the host library lacks the symbol (bindings.rs `target` binds the row only when it has it) or no down shell is left.
+pub(super) fn call_mapped(
+    (soname, symbol, maps, ret): MappedRow,
+    mut lanes: [usize; 6],
+    fp: [f64; 8],
+    fp_ret: bool,
+) -> usize {
     let f = bindings::system_symbol(soname, symbol).unwrap_or_else(|| {
         unsupported(&format!(
             "{symbol}: lane-mapped row with no {soname} in SYSTEM_LIB"
         ))
     });
+    // ILP32 handles first: an unknown one refuses the whole call before any temporary or host side effect
+    let mut released: Option<usize> = None;
+    for &(i, map) in maps {
+        if let LaneMap::Handle(_, release) = map {
+            let Some(host) = handles::to_host(lanes[i]) else {
+                return refuse_handle(symbol, i, lanes[i]);
+            };
+            if release {
+                released = Some(lanes[i]);
+            }
+            lanes[i] = host;
+        }
+    }
     // ILP32 temporaries: (lane, the guest pointer, its map, the host copy), written back after the call
     let mut temps: Vec<(usize, usize, LaneMap, convert::Temp)> = Vec::new();
     for &(i, map) in maps {
         match map {
+            LaneMap::Handle(..) => {}
             LaneMap::Record(c, _) if lanes[i] != 0 => {
                 // SAFETY: lane `i` is the guest's non-NULL pointer to this record in its own layout (build.rs from the ILP32 classifier's kind of this parameter).
                 let mut t = unsafe { convert::record_in(c, lanes[i]) };
@@ -49,10 +102,19 @@ pub(super) fn call_mapped((soname, symbol, maps): MappedRow, mut lanes: [usize; 
             LaneMap::Down(_) => {}
         }
     }
-    // SAFETY: the host library's export of this name, whose prototype (the NDK header's) takes at most six int lanes and answers an int lane or void (route); extra lanes sit in registers it never reads.
-    let f: HostFn = unsafe { std::mem::transmute(f) };
-    // SAFETY: as above; every other lane is a host value in this address space, every mapped one the host's own.
-    let ret = unsafe { f(lanes[0], lanes[1], lanes[2], lanes[3], lanes[4], lanes[5]) };
+    let [a0, a1, a2, a3, a4, a5] = lanes;
+    let [f0, f1, f2, f3, f4, f5, f6, f7] = fp;
+    let value = if fp_ret {
+        // SAFETY: the host library's export of this name, whose prototype (the NDK header's) takes at most six int and eight fp lanes and answers an fp lane here (build.rs); extra lanes sit in registers it never reads.
+        let f: HostFnFp = unsafe { std::mem::transmute(f) };
+        // SAFETY: as below.
+        (unsafe { f(a0, a1, a2, a3, a4, a5, f0, f1, f2, f3, f4, f5, f6, f7) }).to_bits() as usize
+    } else {
+        // SAFETY: as above, an int lane or void result.
+        let f: HostFn = unsafe { std::mem::transmute(f) };
+        // SAFETY: as above; every other lane is a host value in this address space, every mapped one the host's own.
+        unsafe { f(a0, a1, a2, a3, a4, a5, f0, f1, f2, f3, f4, f5, f6, f7) }
+    };
     for (i, guest, map, mut t) in temps {
         // a refused host pointer is written NULL and counted (convert.rs); reported here with the row and lane
         let ok = match map {
@@ -69,5 +131,38 @@ pub(super) fn call_mapped((soname, symbol, maps): MappedRow, mut lanes: [usize; 
             );
         }
     }
-    ret
+    if let Some(h) = released {
+        handles::release(h);
+    }
+    match ret {
+        RetMap::Plain => value,
+        RetMap::Handle(ty) => handles::to_guest(ty, value).map_or_else(
+            || {
+                super::dispatch::report_refused(
+                    super::dispatch::REFUSED_HANDLE,
+                    &format!("{symbol} result: handle table full"),
+                );
+                0
+            },
+            |h| h as usize,
+        ),
+        // SAFETY: the host function's `const char*` result (the classifier's `String` kind): NULL or NUL-terminated text.
+        RetMap::String => unsafe { handles::intern(value) }.unwrap_or_else(|| {
+            super::dispatch::report_refused(
+                super::dispatch::REFUSED_RESULT,
+                &format!("{symbol} result: no window for its text"),
+            );
+            0
+        }),
+    }
+}
+
+/// A guest handle the table does not hold (never issued, freed, a raw address): the host function is not called, the answer is 0 (NULL / false / `EGL_FALSE`, the NDK's usual error value), counted and reported with the row and lane.
+fn refuse_handle(symbol: &str, i: usize, value: usize) -> usize {
+    super::dispatch::ILP32_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    super::dispatch::report_refused(
+        super::dispatch::REFUSED_HANDLE,
+        &format!("{symbol} parameter {i} = {value:#x}"),
+    );
+    0
 }

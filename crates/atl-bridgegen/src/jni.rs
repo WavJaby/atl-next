@@ -184,6 +184,19 @@ pub enum LaneMap {
     Record { name: String, out: bool },
     /// ILP32: a guest pointer to one word -> a host-width temporary, widened in and written back narrowed (`ilp32::Kind::OutWord`)
     OutWord(crate::ilp32::Word),
+    /// ILP32: a guest handle of type `ty` -> the host object it names (`ilp32::Kind::Opaque`); `release`: the call ends the object's life, its handle is freed after it
+    Handle { ty: String, release: bool },
+}
+
+/// What a lane-mapped row's host side does to its result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetMap {
+    /// the host's value as the lane class narrows it
+    Plain,
+    /// ILP32: a host object of type `ty` -> its handle (`ilp32::Kind::Opaque`)
+    Handle(String),
+    /// ILP32: host text -> its interned copy in guest-addressable memory (`ilp32::Kind::String`)
+    String,
 }
 
 /// How a proxy function binds, from its prototype ([`route`]).

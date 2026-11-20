@@ -199,6 +199,8 @@ pub static ILP32_REFUSED: AtomicUsize = AtomicUsize::new(0);
 pub(in crate::engine) const REFUSED_RESULT: &str = "native-bridge.ilp32-result";
 pub(in crate::engine) const REFUSED_ARG: &str = "native-bridge.ilp32-argument";
 pub(in crate::engine) const REFUSED_OUT: &str = "native-bridge.ilp32-out";
+/// A guest handle the table does not hold (handles.rs), or no slot left for a host object.
+pub(in crate::engine) const REFUSED_HANDLE: &str = "native-bridge.ilp32-handle";
 
 /// Reports one host pointer refused to a 32-bit guest under `key` (`REFUSED_*`), `cause` naming the function and position; [`ILP32_REFUSED`] is counted by the caller.
 pub(in crate::engine) fn report_refused(key: &str, cause: &str) {

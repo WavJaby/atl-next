@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, ensure};
 use atl_bridgegen::buildscript::{self, Upstreams};
 use atl_bridgegen::ir::Ty;
-use atl_bridgegen::jni::{LaneMap, Route};
+use atl_bridgegen::jni::{LaneMap, RetMap, Route};
 use atl_bridgegen::rust::{Table, api_module_with_table};
 use atl_bridgegen::{Lang, Source, Target};
 
@@ -1205,7 +1205,8 @@ const FIXED_BINDINGS: usize = 6;
 /// JNI stubs: one per slot of the largest JNI table (`JNINativeInterface`: 233 in jni.h today, `JNIInvokeInterface` fewer; engine/jni.rs asserts the fit), rounded up to 256. The x86 engine's stub array has this length; the QEMU engine reserves as many pool slots.
 const OBJECT_STUBS: usize = 256;
 /// An `Entry::Mapped` row as generated: library, name, the (parameter, map) pairs.
-type MappedRow = (String, String, Vec<(usize, LaneMap)>);
+/// The last field: the result is an fp lane (the row's host side is `mapped_fp::<I>`).
+type MappedRow = (String, String, Vec<(usize, LaneMap)>, RetMap, bool);
 /// `bindings_table.rs` (module `bindings`): every guest library whose stubs the engine binds -- the GL / window / NDK proxies and libc -- with its NBS stub names in list order, each with the entry it binds. The one table `native_bridge_intercept_symbol` resolves (library, name) in.
 /// `Entry::Generic(host, symbol, sig)` binds `symbol` looked up on that host library's own handle (a GL front, the bionic provider, glibc's libc.so.6) through the generic crossing, `sig` its lanes ([`sig_literal`]: `atl_bridgegen::jni::result_class` + `param_classes`; LP64 libc rows an integer result, no prototype; ILP32 libc rows the guest view's, [`libc_entries`]); `Entry::Shim(sig)` a hand-written host side of those lanes; `Entry::Trap(i)` `TRAPS[i]`, a named trap (`TRAP_NAMES[i]`).
 /// The proxy prototypes come from one unit parsed for two views: `guest` (bionic, as NDK apps compile) and `host` (glibc). A stub whose prototype differs between the views fails the build, naming it.
@@ -1240,7 +1241,9 @@ const ILP32_ARRAY_PARAMS: &[(&str, usize, &str)] = &[
 ];
 
 /// An ILP32 converted row's lane maps and its lanes literal ([`ilp32_maps`]).
-type Ilp32Maps = (Vec<(usize, LaneMap)>, String);
+type Ilp32Maps = (Vec<(usize, LaneMap)>, RetMap, bool, String);
+/// The fp lanes the mapped forwarder takes (generated `mapped`): SysV's eight vector argument registers; an fp argument keeps its bits in its register (a float in the low half), which the forwarder passes on untouched.
+const MAPPED_FP_LANES: usize = 8;
 
 /// The lane maps of an ILP32 proxy row `row` (guest prototype `sig`) whose non-carried positions all convert: a `Record` pointer parameter with a converter (in; back out when the pointee is not const), an `OutWord` parameter; with its lanes literal (the guest view's classes). Records named by any position get their converters tried first (`convs`), whatever else blocks the row. Err: the trap reason -- the heaviest kind no converter takes, or a lane rule the six-int-lane forwarder (`jni::MAPPED_LANES`) cannot keep.
 fn ilp32_maps(
@@ -1261,6 +1264,7 @@ fn ilp32_maps(
         }
     }
     let mut maps = Vec::new();
+    let mut ret = RetMap::Plain;
     let array = Kind::Array;
     let mut blocking: Option<&Kind> = None;
     // a record with a deep pointer field (a list) converts only in a hand shim
@@ -1277,6 +1281,24 @@ fn ilp32_maps(
         };
         let map = match (k, param) {
             _ if k.carried() => continue,
+            (Kind::Opaque(ty), _) if GUEST_VALUE_HANDLES.iter().any(|(t, _)| t == ty) => continue,
+            (Kind::Opaque(ty), None) if !JNI_REF_TYPES.contains(&ty.as_str()) => {
+                ret = RetMap::Handle(ty.clone());
+                continue;
+            }
+            (Kind::String, None) => {
+                ret = RetMap::String;
+                continue;
+            }
+            (Kind::Opaque(ty), Some(p)) if !JNI_REF_TYPES.contains(&ty.as_str()) => Some((
+                p,
+                LaneMap::Handle {
+                    ty: ty.clone(),
+                    release: HANDLE_RELEASES
+                        .iter()
+                        .any(|(f, at, _)| *f == name && *at == p),
+                },
+            )),
             (Kind::OutWord(w), Some(p)) => Some((p, LaneMap::OutWord(*w))),
             (Kind::Record(name), Some(p)) if shallow(name) => match sig.params[p].resolved() {
                 atl_bridgegen::ir::Ty::Pointer { is_const, .. } => Some((
@@ -1305,23 +1327,186 @@ fn ilp32_maps(
     if !matches!(route, Route::Plain) {
         return Err("pending: ilp32 converted row with a JNI or callback lane");
     }
-    let (Ok(ret), Ok(params)) = (
+    let (Ok(class), Ok(params)) = (
         atl_bridgegen::jni::result_class(&sig.ret),
         atl_bridgegen::jni::param_classes(sig),
     ) else {
         return Err("pending: a record by value has no lane class");
     };
-    if ret.is_fp()
-        || params.len() > atl_bridgegen::jni::MAPPED_LANES
-        || params.iter().any(|c| c.is_fp())
+    // the forwarder's lanes (generated `mapped` / `mapped_fp`): six int, eight fp, no stack
+    if params.iter().filter(|c| c.is_int()).count() > atl_bridgegen::jni::MAPPED_LANES
+        || params.iter().filter(|c| c.is_fp()).count() > MAPPED_FP_LANES
+        || params.iter().any(|c| !c.is_int() && !c.is_fp())
     {
         return Err("pending: ilp32 converted row past six int lanes");
     }
     if let Some(why) = atl_bridgegen::jni::lane_refusal(&params).filter(|_| qemu) {
         return Err(why);
     }
-    Ok((maps, sig_literal(ret, &params)))
+    Ok((maps, ret, class.is_fp(), sig_literal(class, &params)))
 }
+
+/// Handle typedefs that carry a guest value, not a host object (zero-extended like a pointer, never looked up): the host hands them back unchanged or interprets them itself. An `EGLClientBuffer` the host made (`eglGetNativeClientBufferANDROID`, an AHardwareBuffer) answers above 4 GiB and is refused by the result narrowing, counted (P6).
+const GUEST_VALUE_HANDLES: &[(&str, &str)] = &[(
+    "EGLClientBuffer",
+    "egl.h: a GL texture/renderbuffer name cast to a pointer for eglCreateImage* (EGL_GL_TEXTURE_2D_KHR)",
+)];
+
+/// Records behind JNI references (jni.h `jobject` = `_jobject*`, ...): the guest's references are P5's JNI handles, not this table's; a row naming one traps as `jni` until then.
+const JNI_REF_TYPES: &[&str] = &[
+    "_jobject",
+    "_jclass",
+    "_jstring",
+    "_jarray",
+    "_jobjectArray",
+    "_jbooleanArray",
+    "_jbyteArray",
+    "_jcharArray",
+    "_jshortArray",
+    "_jintArray",
+    "_jlongArray",
+    "_jfloatArray",
+    "_jdoubleArray",
+    "_jthrowable",
+];
+
+/// Calls that end the life of the host object a handle parameter names (function, parameter, the header's words): its handle is freed after the call, so a later use is a counted refusal, never the host's freed memory. Reference-counted releases (`ANativeWindow_release`, `AHardwareBuffer_release`, `ALooper_release`, `ASurfaceControl_release`) are not here: another reference may keep the object, and the handle of a live address is reused (handles.rs). `eglTerminate` keeps the display (egl.h: `eglGetDisplay` answers the same handle). Each row must name a handle parameter of some ILP32 row (build fails otherwise).
+const HANDLE_RELEASES: &[(&str, usize, &str)] = &[
+    (
+        "AAsset_close",
+        0,
+        "asset_manager.h: close the asset, freeing all associated resources",
+    ),
+    (
+        "AAssetDir_close",
+        0,
+        "asset_manager.h: close an opened AAssetDir, freeing any related resources",
+    ),
+    (
+        "AAudioStreamBuilder_delete",
+        0,
+        "AAudio.h: delete the resources associated with the StreamBuilder",
+    ),
+    (
+        "AAudioStream_close",
+        0,
+        "AAudio.h: delete the internal data structures associated with the stream",
+    ),
+    (
+        "ACodecPerformancePoint_destroy",
+        0,
+        "NdkMediaCodecInfo.h: destroy",
+    ),
+    (
+        "AConfiguration_delete",
+        0,
+        "configuration.h: free an AConfiguration",
+    ),
+    ("ACpuHeadroomParams_destroy", 0, "system_health.h: destroy"),
+    ("ADisplayLuts_destroy", 0, "display_luts.h: destroy"),
+    ("ADisplayLutsEntry_destroy", 0, "display_luts.h: destroy"),
+    ("AFont_close", 0, "font.h: close an AFont"),
+    (
+        "AFontMatcher_destroy",
+        0,
+        "font_matcher.h: release the matcher",
+    ),
+    ("AGpuHeadroomParams_destroy", 0, "system_health.h: destroy"),
+    (
+        "AImageDecoder_delete",
+        0,
+        "imagedecoder.h: delete the AImageDecoder",
+    ),
+    ("AImageDecoderFrameInfo_delete", 0, "imagedecoder.h: delete"),
+    (
+        "AImage_delete",
+        0,
+        "NdkImage.h: return the image back to the system and delete the AImage object",
+    ),
+    (
+        "AImageReader_delete",
+        0,
+        "NdkImageReader.h: delete an AImageReader and return all images",
+    ),
+    (
+        "AInputEvent_release",
+        0,
+        "input.h: release interface objects created by A*Event_fromJava",
+    ),
+    (
+        "AInputReceiverCallbacks_release",
+        0,
+        "input_transfer_token / surface_control_input_receiver.h: release",
+    ),
+    (
+        "AInputReceiver_release",
+        0,
+        "surface_control_input_receiver.h: release",
+    ),
+    (
+        "AInputTransferToken_release",
+        0,
+        "input_transfer_token_jni.h: release",
+    ),
+    ("AMediaCodecCryptoInfo_delete", 0, "NdkMediaCodec.h: delete"),
+    (
+        "AMediaCodec_delete",
+        0,
+        "NdkMediaCodec.h: delete the codec and free its resources",
+    ),
+    ("AMediaCrypto_delete", 0, "NdkMediaCrypto.h: delete"),
+    (
+        "AMediaDataSource_delete",
+        0,
+        "NdkMediaDataSource.h: delete a previously created media data source",
+    ),
+    (
+        "AMediaDrm_release",
+        0,
+        "NdkMediaDrm.h: release a MediaDrm object",
+    ),
+    ("AMediaExtractor_delete", 0, "NdkMediaExtractor.h: delete"),
+    ("AMediaFormat_delete", 0, "NdkMediaFormat.h: delete"),
+    (
+        "AMediaMuxer_delete",
+        0,
+        "NdkMediaMuxer.h: delete a previously created media muxer",
+    ),
+    ("AObbInfo_delete", 0, "obb.h: destroy the AObbInfo"),
+    (
+        "ASessionCreationConfig_release",
+        0,
+        "performance_hint.h: destroy",
+    ),
+    (
+        "AStorageManager_delete",
+        0,
+        "storage_manager.h: release AStorageManager",
+    ),
+    (
+        "ASurfaceTexture_release",
+        0,
+        "surface_texture.h: release the reference from ASurfaceTexture_fromSurfaceTexture",
+    ),
+    (
+        "ASurfaceTransaction_delete",
+        0,
+        "surface_control.h: destroy the transaction object",
+    ),
+    (
+        "ASystemFontIterator_close",
+        0,
+        "system_fonts.h: close an opened system font iterator, freeing any related resources",
+    ),
+    ("AWorkDuration_release", 0, "performance_hint.h: destroy"),
+    ("eglDestroyContext", 1, "egl.h"),
+    ("eglDestroySurface", 1, "egl.h"),
+    ("eglDestroyImage", 1, "egl.h"),
+    ("eglDestroyImageKHR", 1, "eglext.h"),
+    ("eglDestroySync", 1, "egl.h"),
+    ("eglDestroySyncKHR", 1, "eglext.h"),
+    ("eglDestroyStreamKHR", 1, "eglext.h"),
+];
 
 /// The per-guest ILP32 rows of an unequal-data-model guest ([`bindings_table`]): (library, function, the row's kinds, what it waits for: `carried`, its heaviest kind's label, `variable` or `libc-unprototyped`) for every row not wholly `Same`.
 type Ilp32Rows = Vec<(String, String, String, &'static str)>;
@@ -1566,17 +1751,23 @@ fn bindings_table(
             } else if let Some(row) = ilp32.filter(|r| !r.carried()) {
                 let sig = &guest_view.functions[name.as_str()];
                 match ilp32_maps(name, sig, row, &route, qemu, &views, &mut convs) {
-                    Ok((maps, lanes)) => {
+                    Ok((maps, ret, fp, lanes)) => {
                         if let Some(last) = ilp32_rows.last_mut() {
                             last.3 = "converted";
                         }
-                        mapped_rows.push(((*soname).to_owned(), name.clone(), maps));
+                        mapped_rows.push(((*soname).to_owned(), name.clone(), maps, ret, fp));
                         format!("Entry::Mapped({}, {lanes})", mapped_rows.len() - 1)
                     }
                     Err(why) => trap(why),
                 }
             } else if let Route::Mapped(maps) = route {
-                mapped_rows.push(((*soname).to_owned(), name.clone(), maps));
+                mapped_rows.push((
+                    (*soname).to_owned(),
+                    name.clone(),
+                    maps,
+                    RetMap::Plain,
+                    false,
+                ));
                 format!("Entry::Mapped({}, Sig::INT)", mapped_rows.len() - 1)
             } else if let Route::Pending(why) = route {
                 trap(why)
@@ -1652,13 +1843,13 @@ fn bindings_table(
         ensure!(
             mapped_rows
                 .iter()
-                .any(|(_, r, m)| r == n && m.iter().any(|(_, x)| *x == LaneMap::Env)),
+                .any(|(_, r, m, ..)| r == n && m.iter().any(|(_, x)| *x == LaneMap::Env)),
             "{n}: in ENV_SHIMS but no proxy library lists it with a prototype in the set"
         );
     }
     for t in CALLBACKS.iter().filter(|_| equal_model) {
         ensure!(
-            mapped_rows.iter().any(|(_, _, m)| m
+            mapped_rows.iter().any(|(_, _, m, ..)| m
                 .iter()
                 .any(|(_, x)| matches!(x, LaneMap::Down { ty, .. } if ty == t))),
             "{t}: in CALLBACKS but no proxy row with a prototype in the set takes it"
@@ -1683,6 +1874,27 @@ fn bindings_table(
             guest.row.arch
         );
     }
+    // stale-row checks of HANDLE_RELEASES (a handle parameter) and GUEST_VALUE_HANDLES (a handle type some row uses), on the ILP32 table
+    for (f, p, _) in HANDLE_RELEASES.iter().filter(|_| !equal_model) {
+        ensure!(
+            classes
+                .get(f)
+                .and_then(|r| r.kinds.get(p + 1))
+                .is_some_and(|k| matches!(k, atl_bridgegen::ilp32::Kind::Opaque(_))),
+            "{f} parameter {p}: in HANDLE_RELEASES but not a handle position of the {} table",
+            guest.row.arch
+        );
+    }
+    for (t, _) in GUEST_VALUE_HANDLES.iter().filter(|_| !equal_model) {
+        ensure!(
+            classes.values().any(|r| r
+                .kinds
+                .iter()
+                .any(|k| matches!(k, atl_bridgegen::ilp32::Kind::Opaque(x) if x == t))),
+            "{t}: in GUEST_VALUE_HANDLES but no row of the {} table uses it",
+            guest.row.arch
+        );
+    }
     let libc_protos = if equal_model {
         None
     } else {
@@ -1700,7 +1912,7 @@ fn bindings_table(
     rows.push(("libc.so", libc_names.into_iter().zip(libc).collect()));
 
     let mut code = String::from(
-        "// generated by build.rs (atl-native-bridge) from the NBS stub lists, the binding lists and the EGL/GLES prototypes of the guest and host views, do not edit\nuse super::{Class, Entry, Host, LaneMap, Lib, MappedRow, Sig};\n\npub const LIBS: &[Lib] = &[\n",
+        "// generated by build.rs (atl-native-bridge) from the NBS stub lists, the binding lists and the EGL/GLES prototypes of the guest and host views, do not edit\nuse super::{Class, Entry, Host, LaneMap, Lib, MappedFn, MappedRow, RetMap, Sig};\n\npub const LIBS: &[Lib] = &[\n",
     );
     let mut total = 0usize;
     for (soname, entries) in &rows {
@@ -1804,11 +2016,14 @@ fn bindings_table(
         atl_bridgegen::jni::MAPPED_LANES
     );
     code.push_str("/// Per `Entry::Mapped(i)`: library, symbol, the (parameter, map) pairs.\npub const MAPPED_ROWS: &[MappedRow] = &[\n");
-    for (lib, name, maps) in &mapped_rows {
+    for (lib, name, maps, ret, _) in &mapped_rows {
         let maps: Vec<String> = maps
             .iter()
             .map(|(i, m)| match m {
                 LaneMap::Env => format!("({i}, LaneMap::Env)"),
+                LaneMap::Handle { ty, release } => {
+                    format!("({i}, LaneMap::Handle({ty:?}, {release}))")
+                }
                 LaneMap::Down { shorty, .. } => format!("({i}, LaneMap::Down(b{shorty:?}))"),
                 LaneMap::Record { name, out } => {
                     format!("({i}, LaneMap::Record(&C_{name}, {out}))")
@@ -1825,16 +2040,22 @@ fn bindings_table(
                 ),
             })
             .collect();
+        let ret = match ret {
+            RetMap::Plain => "RetMap::Plain".to_owned(),
+            RetMap::Handle(ty) => format!("RetMap::Handle({ty:?})"),
+            RetMap::String => "RetMap::String".to_owned(),
+        };
         code.push_str(&format!(
-            "    ({lib:?}, {name:?}, &[{}]),\n",
+            "    ({lib:?}, {name:?}, &[{}], {ret}),\n",
             maps.join(", ")
         ));
     }
     code.push_str(
-        "];\n\n/// The host side of `Entry::Mapped(I)`: its six int lanes to ndk.rs `call_mapped`.\nextern \"C\" fn mapped<const I: usize>(a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> usize {\n    super::super::ndk::call_mapped(MAPPED_ROWS[I], [a0, a1, a2, a3, a4, a5])\n}\n\n/// `mapped::<i>` per `Entry::Mapped(i)`.\npub const MAPPED_FNS: &[extern \"C\" fn(usize, usize, usize, usize, usize, usize) -> usize] = &[\n",
+        "];\n\n/// The host side of `Entry::Mapped(I)` with an int (or no) result: its six int and eight fp lanes to ndk.rs `call_mapped`.\n#[allow(clippy::too_many_arguments)]\nextern \"C\" fn mapped<const I: usize>(a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, f0: f64, f1: f64, f2: f64, f3: f64, f4: f64, f5: f64, f6: f64, f7: f64) -> usize {\n    super::super::ndk::call_mapped(MAPPED_ROWS[I], [a0, a1, a2, a3, a4, a5], [f0, f1, f2, f3, f4, f5, f6, f7], false)\n}\n\n/// As [`mapped`], an fp result (its bits in the fp return register). Unused on an LP64 table: its mapped rows are the JNI / callback routes, int results only.\n#[allow(clippy::too_many_arguments, dead_code)]\nextern \"C\" fn mapped_fp<const I: usize>(a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, f0: f64, f1: f64, f2: f64, f3: f64, f4: f64, f5: f64, f6: f64, f7: f64) -> f64 {\n    f64::from_bits(super::super::ndk::call_mapped(MAPPED_ROWS[I], [a0, a1, a2, a3, a4, a5], [f0, f1, f2, f3, f4, f5, f6, f7], true) as u64)\n}\n\n/// The host side per `Entry::Mapped(i)`.\npub const MAPPED_FNS: &[MappedFn] = &[\n",
     );
-    for i in 0..mapped_rows.len() {
-        code.push_str(&format!("    mapped::<{i}>,\n"));
+    for (i, row) in mapped_rows.iter().enumerate() {
+        let f = if row.4 { "Fp(mapped_fp" } else { "Int(mapped" };
+        code.push_str(&format!("    MappedFn::{f}::<{i}>),\n"));
     }
     code.push_str("];\n");
     // ILP32 record converters (atl_bridgegen ilp32 `converters`), each const-asserted; and why a record has none, in ilp32_rows.txt
@@ -2047,6 +2268,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("regs_k_raw", "atl_nb_regs_k_raw"),
     // p4b s3c (generated `C_<record>` converters, [`CONV_SWAP_CFG`]): the first two guest offsets of the first converter swapped -> its const assert `Conv::ordered` fails the build
     ("conv_swap", CONV_SWAP_CFG),
+    // p4b s4 (engine/ndk.rs `call_mapped`): a handle result crosses as the host address and a handle argument is taken as one, no table -> refused (result >= 4 GiB narrowed, counted) or a raw address used (unit test, qemu-linker arm check)
+    ("ilp32_raw_handles", "atl_nb_ilp32_raw_handles"),
     // O1 (engine/sles.rs `create_audio_player`): the sink's OutputMix locator keeps the guest proxy, so the host gets a guest object (sles-bridge gate, check c)
     ("sles_raw_sink", "atl_nb_sles_raw_sink"),
     // O1 (engine/mod.rs `Active::down`): every down request takes a new shell (sles-bridge gate, check e)
