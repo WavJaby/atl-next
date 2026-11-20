@@ -2884,6 +2884,12 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
             }
         }
     }
+    if matches!(args.stage, Stage::SlowDisplay)
+        && let Some(why) = slow_display::not_judged(&app)
+    {
+        println!("window: {}: not judged ({why})", slow_display::NOT_JUDGED);
+        not_judged.push(slow_display::NOT_JUDGED);
+    }
     // each vsync source tier's gate: local stages run free-running (headless labwc, clock_id=1 without the vsync flag), session displays that mark vsyncs run hardware-vsync
     if !sub.is_empty() && matches!(args.stage, Stage::Frames | Stage::Widgets | Stage::UiBlock) {
         sub.push(("vsync-tier", vsync_tier_check(&app, presented)));
