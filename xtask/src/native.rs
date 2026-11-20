@@ -1753,12 +1753,18 @@ fn isa_floor_gate(
         return Ok(None);
     }
     let sysroot = crate::isa_gate::sysroot_dirs(root, host)?;
+    // a provided archive (bssl-sys's librust_wrapper.a) is no ELF of its own: its members are copied into the outputs the gate reads
+    let shared: Vec<&Path> = provided
+        .iter()
+        .copied()
+        .filter(|p| p.extension().is_none_or(|e| e != "a"))
+        .collect();
     let report = crate::isa_gate::check(
         out,
         host,
         tiers,
         &crate::isa_tiers::current_objects(out)?,
-        provided,
+        &shared,
         &sysroot,
     )?;
     for line in crate::isa_gate::summary(&report) {
