@@ -157,16 +157,15 @@ pub(super) unsafe fn jvalues32(ap: usize, params: &[u8]) -> Result<Vec<u64>, u8>
 mod tests {
     use super::*;
 
-    /// AAPCS32 B.1 + C.3/C.12: the variadic part `(int 7, long long j, char* p, double 2.5, float 1.5f)` from an 8-aligned `__ap` is, by byte offset: 7 at 0, pad, j at 8, p at 16, pad, 2.5 at 24, 1.5 promoted to double at 32. Laid out by hand from those rules, read back by shorty; red under `va32_slot8` (8-byte slots put j at 8 but p at 16 -> 24...).
+    /// AAPCS32 B.1 + C.3/C.12: the variadic part `(int 7, int 9, long long j, char* p, char* q, double 2.5, float 1.5f)` from an 8-aligned `__ap` is, by byte offset: 7 at 0, 9 at 4, j at 8, p at 16, q at 20, 2.5 at 24, 1.5 promoted to double at 32 (no padding: each pair already falls 8-aligned). Then `(int 3, long long j)`: 3 at 0, pad, j at 8. Laid out by hand from those rules, read back by shorty; red under `va32_slot8` (the second int read at 8).
     #[test]
     fn aapcs32_va_list_words_and_aligned_pairs() {
         let mut m = [0u32; 10];
-        m[0] = 7; // I at 0
-        // m[1] padding: J is 8-aligned
+        (m[0], m[1]) = (7, 9);
         let j = 0x1122_3344_5566_7788u64;
         (m[2], m[3]) = (j as u32, (j >> 32) as u32);
-        m[4] = 0x8000_1234; // L (a 32-bit guest pointer, high bit set: zero-extended)
-        // m[5] padding: D is 8-aligned
+        // L: 32-bit guest pointers, one with the high bit set (zero-extended)
+        (m[4], m[5]) = (0x8000_1234, 0x5678);
         let d = 2.5f64.to_bits();
         (m[6], m[7]) = (d as u32, (d >> 32) as u32);
         let f = 1.5f64.to_bits(); // F promoted to double
@@ -182,8 +181,18 @@ mod tests {
             )
         };
         // SAFETY: the list above, one argument per shorty character.
-        let v = unsafe { jvalues32(aligned.as_ptr() as usize, b"IJLDF") }.unwrap();
-        assert_eq!(v, [7, j, 0x8000_1234, d, u64::from(1.5f32.to_bits())]);
+        let v = unsafe { jvalues32(aligned.as_ptr() as usize, b"IIJLLDF") }.unwrap();
+        assert_eq!(
+            v,
+            [7, 9, j, 0x8000_1234, 0x5678, d, u64::from(1.5f32.to_bits())]
+        );
+        // an int then a long long: the pair skips word 1
+        let pad = [3u64, j];
+        // SAFETY: two 8-aligned u64: int 3 at 0, j at 8.
+        assert_eq!(
+            unsafe { jvalues32(pad.as_ptr() as usize, b"IJ") }.unwrap(),
+            [3, j]
+        );
         // SAFETY: as above, a byte promoted to int.
         assert_eq!(
             unsafe { jvalues32(aligned.as_ptr() as usize, b"Z") }.unwrap(),
