@@ -220,7 +220,6 @@ name = "atl-broker"
 version = "0.0.0"
 dependencies = [
  "atl-android-paths",
- "atl-binder-wire",
  "atl-binderd",
  "atl-bwrap",
  "atl-diag",

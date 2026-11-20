@@ -297,6 +297,10 @@ mod tests {
             installer_probe();
             return;
         }
+        if mode.to_str() == Some("binderd-grow") {
+            binderd_grow_probe();
+            return;
+        }
         if mode.to_str() == Some("filtered") {
             let hard = getrlimit(Resource::Nice).maximum;
             setrlimit(
@@ -342,6 +346,45 @@ mod tests {
     }
 
     const DIR_ENV: &str = "ATL_SECCOMP_PROBE_DIR";
+
+    /// The largest transaction an app can send: one sync transaction fills at most the binder region, libbinder's BINDER_VM_SIZE = 1 MiB - 2 pages (ProcessState.cpp), which binderd enforces
+    /// (binder_sweep's put limit sits at it). binderd reassembles it with atl-binder-wire's proto::Assembler, whose Vec grows by doubling from the first fragment: the full-size message takes every growth
+    /// step a smaller one does.
+    const LARGEST_TRANSACTION: usize = (1 << 20) - 2 * 4096;
+    /// atl-binder-wire proto.rs FRAGMENT (32 KiB); the first fragment carries the u64 length prefix. Restated, not imported: modules.toml keeps binder-wire behind atl-binderd's export.
+    const FRAGMENT: usize = 32 * 1024;
+    /// glibc's mmap threshold for the probe child, fixed (a set tunable turns off the dynamic raise after the first mapped free): the Assembler's 64 KiB -> 128 KiB step is then a mapped chunk and the
+    /// next growth reallocs it, i.e. mremap. With the default (dynamic, 128 KiB) threshold whether that happens depends on the heap's history (a fresh binderd under WeChat: mremap 0x21000 -> 0x40000;
+    /// a binderd whose heap top can extend: no mremap), so a gate without the fixed threshold does not reach it reliably. Test environment only: binderd's own env is empty (Broker::start).
+    const FIXED_MMAP_THRESHOLD: &str = "glibc.malloc.mmap_threshold=65536";
+
+    /// Under binderd's filter, grows a buffer as proto::Assembler::push does (the first fragment's bytes `to_vec`, then `extend_from_slice` per fragment) to LARGEST_TRANSACTION; prints
+    /// `probe: mode=binderd-grow done=1` only if the kernel let every call through.
+    fn binderd_grow_probe() {
+        let frag = vec![0u8; FRAGMENT];
+        seccompiler::apply_filter(&program(Profile::BinderDaemon).expect("program"))
+            .expect("apply_filter");
+        let mut msg = frag[8..].to_vec();
+        while msg.len() < LARGEST_TRANSACTION {
+            let n = FRAGMENT.min(LARGEST_TRANSACTION - msg.len());
+            msg.extend_from_slice(&frag[..n]);
+        }
+        let _ = writeln!(
+            std::io::stdout(),
+            "probe: mode=binderd-grow done={}",
+            u8::from(msg.len() == LARGEST_TRANSACTION)
+        );
+    }
+
+    /// Growth of a glibc-mapped reassembly buffer is mremap, which binderd's list must hold. Break-checked on x86_64 2026-11-20: without SYS_mremap in BINDERD_SYSCALLS -> no probe line (SIGSYS).
+    #[test]
+    fn binderd_list_allows_a_largest_transaction_to_grow_a_mapped_buffer() {
+        let line = run_probe_in(
+            "binderd-grow",
+            &[("GLIBC_TUNABLES", std::ffi::OsStr::new(FIXED_MMAP_THRESHOLD))],
+        );
+        assert_eq!(line["done"], "1");
+    }
 
     /// The allow-list holds this arch's numbers for the calls glibc makes here: a number from another arch's table (or a missing swap in arch.rs) leaves the call unlisted, and the kernel kills the child before its line.
     /// Break-checked on x86_64 2026-11-15: x86 rows with SYS_renameat2 in place of SYS_rename -> no probe line (SIGSYS).
