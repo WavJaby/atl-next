@@ -2206,7 +2206,7 @@ fn run(a: &Args) -> Result<ExitCode> {
     let mut daemons = Vec::new();
     let sockets = r.root.join("logdw");
     std::fs::create_dir_all(&sockets)?;
-    let limits = log_limits(&a);
+    let limits = log_limits(a);
     // the health HAL (its .rc: `user system`), the battery services' source: the host's power-supply sysfs read-only, nothing else of /sys (atl_broker::power_supply_sysfs)
     if let Some(health) = &a.health {
         let mut hal = system_spawn("health", health, vec![], false, None)?;
@@ -2686,7 +2686,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         wayland: a.ui.is_some().then(Wayland::probe).transpose()?,
         pipewire: atl_platform_host::app_access::pipewire_socket(),
         first_app_ms: OnceLock::new(),
-        log_limits: log_limits(&a),
+        log_limits: log_limits(a),
         app_logs: Mutex::new(Vec::new()),
         notifications: {
             let n = PlatformNotifications::connect();
