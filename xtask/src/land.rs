@@ -41,6 +41,9 @@ pub struct Args {
     /// Act: rebase the branch onto origin/main when behind (git replay: no checkout is left mid-rebase; a conflict changes nothing, names the files and exits 3), build and check in the land worktree, push, bring the main checkout and `src/` to the new commit, publish the land build dir as a base, clean up (record the task in `<workspace>/retired-tasks`, remove its worktree, branch and build dir, prune orphan build/driver dirs and old bases). Without it, prints the steps only.
     #[arg(long)]
     execute: bool,
+    /// AOSP projects (`[aosp.projects]` paths) whose shared checkout the branch's `[aosp.sparse]` change can only reach by delete-and-clone: passed to the post-push `fetch --execute --recreate`. The preflight refuses a land that needs one not named here, before anything is pushed (deleting the checkout pulls files from under every reader of `src/`: the owner's call).
+    #[arg(long, value_name = "PROJECT", num_args = 1..)]
+    recreate: Vec<String>,
     /// Internal: the cleanup stage's child (`cleanup_execute`); runs only the cleanup. Needs `--execute`.
     #[arg(long, hide = true, requires = "execute")]
     cleanup: bool,
@@ -61,6 +64,8 @@ struct BranchFacts {
     copies: Vec<String>,
     /// The build machine's arches.toml host: what Build builds the land build dir for.
     host: String,
+    /// AOSP projects the post-push fetch must recreate (`fetch::keep_preflight`).
+    recreate: Vec<String>,
 }
 
 /// `(worktree, branch)` -> the branch's facts; `facts_child` in production.
@@ -72,8 +77,8 @@ struct Runner<'a> {
     edit: &'a dyn Fn(&Path, &str) -> Result<String>,
     /// The checkout's verdict line, Ok only when that check passed (`check_verdict`).
     check: &'a dyn Fn(&Path) -> Result<String>,
-    /// `xtask fetch --execute` in the main checkout.
-    fetch: &'a dyn Fn(&Path) -> Result<()>,
+    /// `xtask fetch --execute [--recreate <projects>]` in the main checkout.
+    fetch: &'a dyn Fn(&Path, &[String]) -> Result<()>,
     /// The cleanup child for the main checkout and the branch; its note line (`cleanup_execute`).
     cleanup: &'a dyn Fn(&Path, &str) -> Result<String>,
     /// `(checkout, host)` -> `xtask native --for all-gates` there, by its own xtask (`native_execute`).
@@ -149,6 +154,8 @@ struct Plan {
     host: String,
     /// A dry run's branch is not a fast-forward of origin/main: `--execute` rebases it in the preflight (`rebase`). Always false after an executing preflight.
     behind: bool,
+    /// `--recreate` projects, each one the branch's keep-set change needs (checked in the preflight).
+    recreate: Vec<String>,
 }
 
 /// `xtask land <branch>`: prints the steps unless `--execute`.
@@ -166,6 +173,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             println!("{FACT_COPY}{c}");
         }
         println!("{FACT_HOST}{}", f.host);
+        for p in &f.recreate {
+            println!("{FACT_RECREATE}{p}");
+        }
         return Ok(ExitCode::SUCCESS);
     }
     if args.build_dir {
@@ -177,7 +187,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     let started = Instant::now();
     verdict::step("land:preflight");
-    let plan = match Plan::new(root, &args.branch, args.execute, &facts_child) {
+    let plan = match Plan::new(root, &args.branch, args.execute, &facts_child)
+        .and_then(|p| p.with_recreate(&args.recreate))
+    {
         Ok(plan) => plan,
         Err(e) if e.downcast_ref::<RebaseConflict>().is_some() => {
             println!(
@@ -326,6 +338,7 @@ impl Plan {
             edits,
             copies,
             host,
+            recreate,
         } = facts(&wt, branch)?;
         Ok(Plan {
             repo: repo.to_path_buf(),
@@ -338,7 +351,41 @@ impl Plan {
             copies,
             host,
             behind,
+            recreate,
         })
+    }
+
+    /// The preflight's keep-set rule: the projects `--recreate` names (`named`) must be exactly those the branch's `[aosp.sparse]` change needs recreated, else refused here, before the push (the post-push fetch would fail with main already moved).
+    fn with_recreate(self, named: &[String]) -> Result<Self> {
+        let missing: Vec<&String> = self
+            .recreate
+            .iter()
+            .filter(|p| !named.contains(p))
+            .collect();
+        ensure!(
+            missing.is_empty(),
+            "the branch changes the [aosp.sparse] keep-set of {} so that only deleting and cloning the shared checkout reaches it (files vanish under every reader of src/): land again with `--recreate {}` when nothing reads it",
+            missing
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            self.recreate.join(" ")
+        );
+        let extra: Vec<&String> = named
+            .iter()
+            .filter(|p| !self.recreate.contains(p))
+            .collect();
+        ensure!(
+            extra.is_empty(),
+            "--recreate {}: the branch's keep-set needs no recreate there",
+            extra
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        Ok(self)
     }
 
     /// The stages in run order; the push is absent when origin/main already is the branch.
@@ -588,7 +635,7 @@ impl Plan {
             &["merge", "--ff-only", "-q", fetch::MAIN_REF],
         )
         .with_context(|| format!("{pushed}; main did not fast-forward"))?;
-        (runner.fetch)(self.repo.as_path()).with_context(|| {
+        (runner.fetch)(self.repo.as_path(), &self.recreate).with_context(|| {
             format!(
                 "{pushed}; src/ did not move: `cargo xtask fetch --execute` in {}",
                 self.repo.display()
@@ -765,6 +812,7 @@ fn conflict_files(dir: &Path, onto: &str, head: &str) -> Result<Vec<String>> {
 const FACT_EDIT: &str = "land-facts: edit ";
 const FACT_COPY: &str = "land-facts: copy ";
 const FACT_HOST: &str = "land-facts: host ";
+const FACT_RECREATE: &str = "land-facts: recreate ";
 
 /// The branch's facts from its own tables, read by whichever xtask runs this: the `--facts` child in the worktree `wt`, i.e. the branch's xtask, so a table schema the branch changes is read by the code that changed it.
 /// origin/main's tables (`fetch::Main`) are read through the refs the worktree shares with the main checkout.
@@ -778,7 +826,14 @@ fn branch_facts(wt: &Path) -> Result<BranchFacts> {
         bail!("{why}");
     }
     let mut edits = Vec::new();
+    let mut recreate = Vec::new();
     for c in sources.checkouts(None) {
+        // the shared checkout must reach the branch's keep-set by the post-push fetch: refuse here what not even `--recreate` fixes
+        if let Some(p) = fetch::keep_preflight(&layout, &c)
+            .context("the branch's [aosp.sparse] change cannot be fetched into src/")?
+        {
+            recreate.push(p);
+        }
         if !main.lists(&c) {
             // nothing on main reads a new upstream, so the shared checkout serves it; it has to be there to be checked
             ensure!(
@@ -799,6 +854,7 @@ fn branch_facts(wt: &Path) -> Result<BranchFacts> {
         edits,
         copies: copies_of(&layout, &sources),
         host: crate::arches::build_machine(wt, &arches)?.0.to_owned(),
+        recreate,
     })
 }
 
@@ -830,6 +886,8 @@ fn parse_facts(stdout: &str) -> BranchFacts {
             f.copies.push(c.to_owned());
         } else if let Some(h) = line.strip_prefix(FACT_HOST) {
             f.host = h.to_owned();
+        } else if let Some(p) = line.strip_prefix(FACT_RECREATE) {
+            f.recreate.push(p.to_owned());
         }
     }
     f
@@ -933,9 +991,12 @@ fn check_verdict(dir: &Path) -> Result<String> {
 }
 
 /// `cargo xtask fetch --execute` in `dir`, run by that checkout's own xtask: after the fast-forward, the landed code moves `src/`.
-fn fetch_execute(dir: &Path) -> Result<()> {
+fn fetch_execute(dir: &Path, recreate: &[String]) -> Result<()> {
     let mut cmd = crate::cargo_command();
     cmd.args(["xtask", "fetch", "--execute"]).current_dir(dir);
+    if !recreate.is_empty() {
+        cmd.arg("--recreate").args(recreate);
+    }
     let run = unit_use::run(&mut cmd, Units::Plain, Echo::Both)
         .with_context(|| format!("running cargo xtask fetch in {}", dir.display()))?;
     ensure!(
@@ -1108,6 +1169,57 @@ mod tests {
         panic!("edit stage ran for {up}")
     }
 
+    /// R5-4: a branch whose keep-set change needs a shared checkout recreated (the facts say so: `fetch::keep_change` decides which) is refused in the preflight unless `--recreate` names it, and nothing is pushed; named, the post-push fetch receives it.
+    #[test]
+    fn a_keep_set_recreate_is_refused_before_the_push_unless_named() {
+        let env = Env::new("recreate");
+        let origin_before = git(Some(&env.repo), &["rev-parse", fetch::MAIN_REF]).unwrap();
+        let facts = |_: &Path, _: &str| -> Result<BranchFacts> {
+            Ok(BranchFacts {
+                host: "h".to_owned(),
+                recreate: vec!["aosp/x".to_owned()],
+                ..BranchFacts::default()
+            })
+        };
+        let err = Plan::new(&env.repo, "task", true, &facts)
+            .and_then(|p| p.with_recreate(&[]))
+            .err()
+            .expect("an unnamed recreate must be refused");
+        assert!(format!("{err:#}").contains("--recreate aosp/x"), "{err:#}");
+        let err = Plan::new(&env.repo, "task", true, &facts)
+            .and_then(|p| p.with_recreate(&["aosp/x".to_owned(), "aosp/y".to_owned()]))
+            .err()
+            .expect("a recreate the branch does not need must be refused");
+        assert!(format!("{err:#}").contains("aosp/y"), "{err:#}");
+        let remote = git(Some(&env.repo), &["ls-remote", "origin", "refs/heads/main"]).unwrap();
+        assert!(remote.starts_with(&origin_before), "pushed: {remote}");
+        let plan = Plan::new(&env.repo, "task", true, &facts)
+            .and_then(|p| p.with_recreate(&["aosp/x".to_owned()]))
+            .unwrap();
+        let fetched = std::cell::RefCell::new(Vec::new());
+        let fetch_fn = |_: &Path, r: &[String]| -> Result<()> {
+            fetched.borrow_mut().extend_from_slice(r);
+            Ok(())
+        };
+        let check_fn = |_: &Path| -> Result<String> { Ok("check: ok (12 steps)".to_owned()) };
+        let cleanup_fn = |_: &Path, _: &str| -> Result<String> { Ok("cleaned".to_owned()) };
+        let line = plan.execute(
+            &plan.stages(),
+            &Runner {
+                edit: &no_edit,
+                check: &check_fn,
+                fetch: &fetch_fn,
+                cleanup: &cleanup_fn,
+                native: &no_native,
+                stale: &current,
+                publish: &no_publish,
+                recopy: &no_recopy,
+            },
+        );
+        assert!(line.starts_with("land: ok"), "{line}");
+        assert_eq!(*fetched.borrow(), ["aosp/x"]);
+    }
+
     /// A branch adding a sources.toml key this xtask refuses (a schema change, as F1's `[aosp.needed_by]` was to main's) still plans and lands: the preflight takes the branch's tables only from `facts` (the branch's xtask), never parses them itself.
     #[test]
     fn branch_tables_are_read_by_the_branchs_xtask() {
@@ -1131,6 +1243,7 @@ mod tests {
                 edits: Vec::new(),
                 copies: vec!["up".to_owned()],
                 host: "h".to_owned(),
+                recreate: Vec::new(),
             })
         };
         let plan = Plan::new(&env.repo, "task", true, &facts)
@@ -1138,7 +1251,7 @@ mod tests {
         assert_eq!(*asked.borrow(), [(env.wt.clone(), "task".to_owned())]);
         assert_eq!(plan.copies, ["up"]);
         let check_fn = |_: &Path| -> Result<String> { Ok("check: ok (12 steps)".to_owned()) };
-        let fetch_fn = |_: &Path| -> Result<()> { Ok(()) };
+        let fetch_fn = |_: &Path, _: &[String]| -> Result<()> { Ok(()) };
         let cleanup_fn = |_: &Path, _: &str| -> Result<String> { Ok("cleaned".to_owned()) };
         let line = plan.execute(
             &plan.stages(),
@@ -1157,12 +1270,13 @@ mod tests {
         // the child's output is what the parent plans from
         assert_eq!(
             parse_facts(
-                "noise\nland-facts: edit aosp/x\nland-facts: copy up\nland-facts: host x86_64\n"
+                "noise\nland-facts: edit aosp/x\nland-facts: copy up\nland-facts: host x86_64\nland-facts: recreate aosp/y\n"
             ),
             BranchFacts {
                 edits: vec!["aosp/x".into()],
                 copies: vec!["up".into()],
                 host: "x86_64".into(),
+                recreate: vec!["aosp/y".into()],
             }
         );
     }
@@ -1238,7 +1352,7 @@ mod tests {
                 *self.built.borrow_mut() = BASE;
                 Ok("re-copied".to_owned())
             };
-            let fetch_fn = |_: &Path| -> Result<()> { Ok(()) };
+            let fetch_fn = |_: &Path, _: &[String]| -> Result<()> { Ok(()) };
             let cleanup_fn = |_: &Path, _: &str| -> Result<String> { Ok("cleaned".to_owned()) };
             plan.execute(
                 stages,
@@ -1660,7 +1774,7 @@ mod tests {
         let check_fn = |_: &Path| -> Result<String> {
             bail!("check: FAILED 1 of 12 steps: drift; first error (drift): \"x\"")
         };
-        let fetch_fn = |_: &Path| -> Result<()> {
+        let fetch_fn = |_: &Path, _: &[String]| -> Result<()> {
             panic!("the main checkout was fetched after a failed check")
         };
         let cleanup_fn = |_: &Path, _: &str| -> Result<String> {
@@ -1704,7 +1818,7 @@ mod tests {
         let head = git(Some(&env.wt), &["rev-parse", "HEAD"]).unwrap();
         let plan = Plan::new(&env.repo, "task", true, &in_process).unwrap();
         let check_fn = |_: &Path| -> Result<String> { Ok("check: ok (12 steps)".to_owned()) };
-        let fetch_fn = |_: &Path| -> Result<()> { Ok(()) };
+        let fetch_fn = |_: &Path, _: &[String]| -> Result<()> { Ok(()) };
         // the cleanup child, run in this process: the stage must reach it through the runner
         let children = std::cell::RefCell::new(Vec::new());
         let cleanup_fn = |repo: &Path, branch: &str| -> Result<String> {

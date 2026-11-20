@@ -524,14 +524,18 @@ fn sync(ctx: &Ctx, c: &Checkout) -> Result<Row> {
     let dir = u.checkout();
     let local = inspect(dir)?;
     let mut action = decide(&local, &c.commit, u.branch());
-    if let Some(why) = keep_mismatch(&local, &c.sparse) {
-        action = if let Some(dirs) = keep_growth(&local, &c.sparse, &c.commit) {
-            Action::Grow(dirs)
-        } else if recreates(ctx, c, &local) {
-            Action::Recreate(why)
-        } else {
-            Action::Blocked(why)
-        };
+    match keep_change(&local, c) {
+        KeepChange::Same => {}
+        KeepChange::Grow(dirs) => action = Action::Grow(dirs),
+        KeepChange::Recreate { project, why } if ctx.recreate.contains(&project) => {
+            action = Action::Recreate(why)
+        }
+        KeepChange::Recreate { project, why } => {
+            action = Action::Blocked(format!(
+                "{why}: `cargo xtask fetch --execute --recreate {project}` deletes the checkout and its git dir and clones it again"
+            ))
+        }
+        KeepChange::Blocked(why) => action = Action::Blocked(why),
     }
     if ctx.execute {
         apply(&action, c, dir, &ctx.layout.git_dir(&c.dir))?;
@@ -776,7 +780,7 @@ fn keep_mismatch(local: &Local, want: &[String]) -> Option<String> {
     want.sort();
     (have != want).then(|| {
         format!(
-            "keep-set differs: checkout holds {}, sources.toml [aosp.sparse] wants {}; only adding dirs at the pin is done in place: delete the checkout at its pin and fetch again",
+            "keep-set differs: checkout holds {}, sources.toml [aosp.sparse] wants {}; only adding dirs at the pin is done in place",
             show(&have),
             show(&want)
         )
@@ -819,10 +823,48 @@ fn grow_checkout(dir: &Path, commit: &str, dirs: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// A keep-set mismatch that `--recreate` names and the checkout can lose: at its pin, nothing uncommitted.
-fn recreates(ctx: &Ctx, c: &Checkout, local: &Local) -> bool {
-    let named = matches!(&c.pin, Pin::Aosp(p) if ctx.recreate.contains(p));
-    named && matches!(local, Local::Present { head, dirty: false, .. } if *head == c.commit)
+/// What fetch needs to bring a checkout's keep-set to sources.toml's.
+#[derive(Debug, PartialEq)]
+enum KeepChange {
+    Same,
+    /// In place: these dirs ([`keep_growth`]).
+    Grow(Vec<String>),
+    /// Fixed only by deleting and cloning again, which `--recreate <project>` allows: a pinned AOSP project, at its pin, nothing uncommitted (the why).
+    Recreate {
+        project: String,
+        why: String,
+    },
+    Blocked(String),
+}
+
+fn keep_change(local: &Local, c: &Checkout) -> KeepChange {
+    let Some(why) = keep_mismatch(local, &c.sparse) else {
+        return KeepChange::Same;
+    };
+    if let Some(dirs) = keep_growth(local, &c.sparse, &c.commit) {
+        return KeepChange::Grow(dirs);
+    }
+    let clean_at_pin =
+        matches!(local, Local::Present { head, dirty: false, .. } if *head == c.commit);
+    match &c.pin {
+        Pin::Aosp(p) if clean_at_pin => KeepChange::Recreate {
+            project: p.clone(),
+            why,
+        },
+        _ => KeepChange::Blocked(format!(
+            "{why}; not at its pin {} with nothing uncommitted, or not an [aosp.projects] row, so not recreated either",
+            c.commit
+        )),
+    }
+}
+
+/// Land's preflight (run by the branch's xtask on the branch's table against the shared checkout in `src/`): the AOSP project `land --recreate` must name for `fetch --execute` after the push to succeed, None when fetch needs no deletion; Err when not even `--recreate` would do (refused before anything is pushed).
+pub fn keep_preflight(layout: &Layout, c: &Checkout) -> Result<Option<String>> {
+    match keep_change(&inspect(&layout.src().join(&c.dir))?, c) {
+        KeepChange::Same | KeepChange::Grow(_) => Ok(None),
+        KeepChange::Recreate { project, .. } => Ok(Some(project)),
+        KeepChange::Blocked(why) => bail!("{}: {why}", c.dir.display()),
+    }
 }
 
 /// Deletes a checkout and its git dir (outside the tree); the caller clones it again.
@@ -940,7 +982,11 @@ pub fn create_checkout(
     g(&["remote", "add", "origin", url]).or_else(|_| g(&["remote", "set-url", "origin", url]))?;
     let mut fetch = vec!["fetch", "-q", "--depth", "1", "--no-tags"];
     let (mode, set): (&str, Vec<&str>) = match sparse {
-        Sparse::Full => ("", Vec::new()),
+        Sparse::Full => {
+            // a reused git dir may have been sparse; `sparse-checkout set` writes it to config.worktree (worktreeConfig), which `--worktree` reaches (= `--local` without the extension)
+            g(&["config", "--worktree", "core.sparseCheckout", "false"])?;
+            ("", Vec::new())
+        }
         Sparse::Cone(dirs) => ("--cone", dirs.iter().map(String::as_str).collect()),
         Sparse::Patterns(p) => ("--no-cone", p.to_vec()),
     };
@@ -967,11 +1013,20 @@ pub fn create_checkout(
                 .with_context(|| format!("keep-set dir `{d}` is not in the tree at {commit}"))?;
         }
     }
+    // a git dir left by a checkout whose tree was deleted keeps HEAD at the pin and the old index, so a plain checkout to the commit HEAD already names writes nothing and every file reads as a local deletion;
+    // `-f` alone is not enough: the old index's skip-worktree bits survive a sparse -> full change. `dir` was empty, so dropping the index and forcing loses nothing
+    match std::fs::remove_file(git_dir.join("index")) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(e).context("removing the left-over index");
+        }
+        _ => {}
+    }
     g(&[
         "-c",
         "advice.detachedHead=false",
         "checkout",
         "-q",
+        "-f",
         "--detach",
         &commit,
     ])?;
@@ -1207,6 +1262,110 @@ mod tests {
         // the shrink back is still refused in place
         assert_eq!(keep_growth(&inspect(&dir).unwrap(), &keep, &pin), None);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// R5-4: a full checkout whose tree (not its git dir, which lives outside) was deleted, created again with a keep-set: every cone file is on disk and `git status` is clean.
+    /// Before `-f` the reused git dir's full index made each cone file a local deletion. Also the reverse: a sparse git dir reused for a full tree gets every file.
+    #[test]
+    fn recreate_over_a_left_over_git_dir_populates_the_tree() {
+        let tmp = std::env::temp_dir().join(format!("xtask-reclone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (src, dir, gd) = (tmp.join("src"), tmp.join("co"), tmp.join("git/co"));
+        for (f, body) in [("a/f", "alpha\n"), ("b/g", "beta\n"), ("top", "t\n")] {
+            std::fs::create_dir_all(src.join(f).parent().unwrap()).unwrap();
+            std::fs::write(src.join(f), body).unwrap();
+        }
+        let g = |at: &Path, args: &[&str]| {
+            let o = std::process::Command::new("git")
+                .arg("-C")
+                .arg(at)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            String::from_utf8(o.stdout).unwrap().trim().to_owned()
+        };
+        g(&src, &["init", "-q", "-b", "rel"]);
+        g(&src, &["config", "uploadpack.allowFilter", "true"]);
+        g(&src, &["add", "."]);
+        g(&src, &["commit", "-q", "-m", "a"]);
+        let pin = g(&src, &["rev-parse", "HEAD"]);
+        let url = format!("file://{}", src.display());
+        let r = "refs/heads/rel";
+        create_checkout(&dir, &gd, &url, r, &Sparse::Full, Some(&pin)).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let keep = vec!["a".to_owned()];
+        create_checkout(&dir, &gd, &url, r, &Sparse::Cone(&keep), Some(&pin)).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("a/f")).unwrap(), "alpha\n");
+        assert!(!dir.join("b").exists());
+        assert_eq!(g(&dir, &["status", "--porcelain"]), "");
+        std::fs::remove_dir_all(&dir).unwrap();
+        create_checkout(&dir, &gd, &url, r, &Sparse::Full, Some(&pin)).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("b/g")).unwrap(), "beta\n");
+        assert_eq!(g(&dir, &["status", "--porcelain"]), "");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Which keep-set changes fetch fixes in place, which need `--recreate <project>`, which nothing fixes (land refuses those before its push).
+    #[test]
+    fn keep_change_names_what_fetch_needs() {
+        let strs = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let at = |head: &str, dirty: bool, sparse: &[&str]| Local::Present {
+            head: head.into(),
+            branch: None,
+            dirty,
+            sparse: strs(sparse),
+        };
+        let row = |pin: Pin, sparse: &[&str]| Checkout {
+            dir: PathBuf::from("aosp/pa"),
+            url: None,
+            rev: "refs/tags/t".into(),
+            commit: "p".into(),
+            sparse: strs(sparse),
+            pin,
+            licence_key: "aosp".into(),
+        };
+        let aosp = |s: &[&str]| row(Pin::Aosp("pa".into()), s);
+        assert_eq!(
+            keep_change(&at("p", false, &["a"]), &aosp(&["a"])),
+            KeepChange::Same
+        );
+        assert_eq!(
+            keep_change(&at("p", false, &["a"]), &aosp(&["a", "b"])),
+            KeepChange::Grow(strs(&["b"]))
+        );
+        // a new row on a full tree, a shrink, a removed row: recreate
+        for (have, want) in [(&[][..], &["a"][..]), (&["a", "b"], &["a"]), (&["a"], &[])] {
+            assert!(
+                matches!(keep_change(&at("p", false, have), &aosp(want)), KeepChange::Recreate { ref project, .. } if project == "pa"),
+                "{have:?} -> {want:?}"
+            );
+        }
+        // dirty, off its pin, not an AOSP project: nothing fixes it
+        assert!(matches!(
+            keep_change(&at("p", true, &[]), &aosp(&["a"])),
+            KeepChange::Blocked(_)
+        ));
+        assert!(matches!(
+            keep_change(&at("q", false, &[]), &aosp(&["a"])),
+            KeepChange::Blocked(_)
+        ));
+        assert!(matches!(
+            keep_change(&at("p", false, &[]), &row(Pin::Git("u".into()), &["a"])),
+            KeepChange::Blocked(_)
+        ));
     }
 
     #[test]
