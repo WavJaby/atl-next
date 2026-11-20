@@ -47,6 +47,11 @@ pub fn package_dir(data_root: &Path, package: &str, item: Item) -> PathBuf {
     data_root.join("apps").join(package).join(item.name())
 }
 
+/// keystore2's database dir `system/keystore`, bound at /data/misc/keystore in keystore2's sandbox only: outside `device/data`, so no app sandbox's /data reaches it.
+pub fn keystore_data(data_root: &Path) -> PathBuf {
+    data_root.join("system").join("keystore")
+}
+
 /// The tree not yet split per package: `device/data`, Android's /data minus the packages' dirs.
 pub fn device_data(data_root: &Path) -> PathBuf {
     data_root.join("device").join("data")

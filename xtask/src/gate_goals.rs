@@ -325,12 +325,12 @@ pub const GATES: &[(&str, GoalsOf)] = &[
     ("installer", || {
         Goals::host(&HOST_ART).with(Goals::host(&[APK_SIGNER]))
     }),
-    // keystore2 and AOSP's Rust software KeyMint HAL (hardware/interfaces/security/keymint/aidl/default), built as-is
+    // atld_run `with_keystore`: keystore2 and AOSP's Rust software KeyMint HAL (hardware/interfaces/security/keymint/aidl/default), built as-is but for patches/aosp/{system/security,hardware/interfaces}
     ("keystore", || {
-        Goals::host(&[
+        runtime().with(Goals::host(&[
             "keystore2",
             "android.hardware.security.keymint-service.nonsecure",
-        ])
+        ]))
     }),
     ("instrument", instrument_gate),
     ("native-load", native_load),

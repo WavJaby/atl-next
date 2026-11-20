@@ -3,6 +3,7 @@
 package main
 
 import (
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -306,10 +307,39 @@ cc_library { name: "libother", srcs: ["o.cc"] }
 	}
 }
 
+// A `defines` row on a Rust crate: its device variant gets each entry as --cfg (NAME=VALUE as NAME="VALUE"); its host variant and other crates do not.
+func TestRustModuleDefines(t *testing.T) {
+	g := graphFor(t, map[string]string{"p/Android.bp": `
+rust_library { name: "libks", crate_name: "ks", srcs: ["lib.rs"], host_supported: true }
+rust_library { name: "libother", crate_name: "other", srcs: ["o.rs"] }
+`})
+	var err error
+	if g.defines, err = parseDefines("libks:atl_no_x,libks:level=2"); err != nil {
+		t.Fatal(err)
+	}
+	g.checkDefines()
+	if g.node("libks", Device, Rlib, "goal") == nil || g.node("libks", Host, Rlib, "goal") == nil || g.node("libother", Device, Rlib, "goal") == nil || len(g.problems) > 0 {
+		t.Fatal(g.problems)
+	}
+	ninja := g.emit(Tools{CC: "cc", CXX: "c++", AR: "ar", Rustc: "rustc"})
+	flags := func(path string) []string {
+		return shWords(t, ninjaEdgeVars(ninja, filepath.Join(g.out, path))["flags"])
+	}
+	dev := flags("device/libks/libks.rlib")
+	if !containsSeq(dev, []string{"--cfg", "atl_no_x"}) || !containsSeq(dev, []string{"--cfg", `level="2"`}) {
+		t.Errorf("device libks flags %q", dev)
+	}
+	for _, p := range []string{"host/libks/libks.rlib", "device/libother/libother.rlib"} {
+		if f := flags(p); slices.Contains(f, "atl_no_x") {
+			t.Errorf("%s flags %q carry libks's cfg", p, f)
+		}
+	}
+}
+
 // The rows checkDefines refuses, where the macros would reach no compile; and -defines entries that are not module:MACRO.
 func TestModuleDefinesRefused(t *testing.T) {
 	g := graphFor(t, map[string]string{"p/Android.bp": `
-rust_library { name: "librs", crate_name: "rs", srcs: ["r.rs"] }
+rust_library { name: "librs", crate_name: "rs", srcs: ["r.rs"], device_supported: false, host_supported: true }
 cc_library_headers { name: "libh" }
 cc_binary_host { name: "tool", srcs: ["t.cc"] }
 cc_library { name: "libdev", srcs: ["d.cc"], device_supported: false, host_supported: true }
@@ -318,8 +348,8 @@ cc_library { name: "libdev", srcs: ["d.cc"], device_supported: false, host_suppo
 	g.checkDefines()
 	want := []string{
 		"providers.toml: libdev: defines on a cc_library, which has no device variant",
-		"providers.toml: libh: defines on a cc_library_headers, which compiles no C/C++",
-		"providers.toml: librs: defines on a rust_library, which compiles no C/C++",
+		"providers.toml: libh: defines on a cc_library_headers, which compiles no C/C++ or Rust",
+		"providers.toml: librs: defines on a rust_library, which has no device variant",
 		"providers.toml: tool: defines on a cc_binary_host, which has no device variant",
 	}
 	if !slices.Equal(g.problems, want) {

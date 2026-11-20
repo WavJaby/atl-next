@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Fri, 20 Nov 2026 20:20:49 +0800
+Subject: [PATCH] keymint: nonsecure TA reports SOFTWARE security level
+
+The Rust reference TA claims TrustedEnvironment although it runs in an
+ordinary process; AOSP's C++ software HAL registers the same default
+instance at SOFTWARE (service.cpp:54).
+
+Upstream-Status: Inappropriate [desktop runtime without a TEE]
+Patch-Reason: a desktop host has no TEE and the TA hard-codes its level; no launcher, loader or environment input sets it
+---
+SPDX-License-Identifier: Apache-2.0
+ security/keymint/aidl/default/ta/lib.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/security/keymint/aidl/default/ta/lib.rs b/security/keymint/aidl/default/ta/lib.rs
+index f002422a28536616d46ef2d878fea15c0da9c27d..3b3834edf04bab9f5a03df3f9a1bc34027ec87ff 100644
+--- a/security/keymint/aidl/default/ta/lib.rs
++++ b/security/keymint/aidl/default/ta/lib.rs
+@@ -65,7 +65,7 @@ pub fn build_ta() -> kmr_ta::KeyMintTa {
+     info!("Building NON-SECURE KeyMint Rust TA");
+     let hw_info = HardwareInfo {
+         version_number: 1,
+-        security_level: SecurityLevel::TrustedEnvironment,
++        security_level: SecurityLevel::Software,
+         impl_name: "Rust reference implementation",
+         author_name: "Google",
+         unique_id: "NON-SECURE KeyMint TA",

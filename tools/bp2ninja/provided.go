@@ -44,7 +44,7 @@ type Partial struct {
 	Provider *Provided `json:"provider"`
 }
 
-// parseDefines: -defines, comma-separated `module:MACRO` (MACRO = NAME or NAME=VALUE): providers.toml `defines` rows, the macros a module's device cc compiles get as -D after the device defines.
+// parseDefines: -defines, comma-separated `module:MACRO` (MACRO = NAME or NAME=VALUE): providers.toml `defines` rows, the macros a module's device cc compiles get as -D after the device defines, or a device Rust crate's cfgs (rustDefineCfg).
 // Each switches behaviour a patch to that module's source keys on it (xtask checks a patch reads it); the module is otherwise built as its Android.bp says.
 func parseDefines(list string) (map[string][]string, error) {
 	out := map[string][]string{}
@@ -61,8 +61,16 @@ func parseDefines(list string) (map[string][]string, error) {
 	return out, nil
 }
 
-// checkDefines: every `defines` row names a cc module with a device variant (a Rust, header-only or host-only module never compiles with them: the field would be silently dead).
-// A name may also carry modules that compile nothing of their own (libEGL's ndk_library stub beside its cc_library_shared): the row needs one module under it that compiles C/C++ on the device side.
+// rustDefineCfg: a `defines` entry as the cfg a device Rust crate gets: NAME -> `NAME`, NAME=VALUE -> `NAME="VALUE"` (the form Soong passes `cfgs` in, compiler.go cfgFlags).
+func rustDefineCfg(d string) string {
+	if name, value, ok := strings.Cut(d, "="); ok {
+		return name + `="` + value + `"`
+	}
+	return d
+}
+
+// checkDefines: every `defines` row names a cc or Rust module with a device variant (a header-only or host-only module never compiles with them: the field would be silently dead). cc compiles get -D, Rust crates --cfg (rust.go).
+// A name may also carry modules that compile nothing of their own (libEGL's ndk_library stub beside its cc_library_shared): the row needs one module under it that compiles on the device side.
 // A row naming no module at all is reported with the other providers.toml rows.
 func (g *Graph) checkDefines() {
 	for _, name := range sortedKeys(keysOf(g.defines)) {
@@ -72,8 +80,8 @@ func (g *Graph) checkDefines() {
 			t := g.baseType(m.Type)
 			k, ok := kindOf(t, Shared)
 			switch {
-			case !ok || isRustType(t) || k == Headers:
-				why = append(why, fmt.Sprintf("a %s, which compiles no C/C++", m.Type))
+			case !isRustType(t) && (!ok || k == Headers):
+				why = append(why, fmt.Sprintf("a %s, which compiles no C/C++ or Rust", m.Type))
 			case g.noDeviceVariant(m):
 				why = append(why, fmt.Sprintf("a %s, which has no device variant", m.Type))
 			default:

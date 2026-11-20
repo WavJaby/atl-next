@@ -6,14 +6,14 @@
 //!    file work on their request (control `Install`: stage under session names (hard links where possible) + run atl-installer in the broker's installer profile; `Commit`: rename each file by its
 //!    parsed split (`base.apk`, `split_<name>.apk`), then the dir to `/data/app/<package>`, create the data dirs).
 //! 3. atl-binderd, its admin connection on stdin; the broker holds the other end.
-//! 4. AOSP servicemanager as uid 1000 (AID_SYSTEM), the one process that may become context manager.
+//! 4. AOSP servicemanager as uid 1000 (AID_SYSTEM), the one process that may become context manager. With `--keystore2`: AOSP's KeyMint HAL (uid AID_NOBODY), then keystore2 (AID_KEYSTORE) with its database dir.
 //! 5. atl-system-services as uid 1000 with the packages and, as its stdin, the process-control connection (atl_broker::control): it starts app processes (ActivityManager's ProcessList) and kills them, here, through
 //!    the broker's sandbox. atld waits for its `services: ready`.
 //! 6. `--run-class`: a command as uid `--run-uid` (the shell), `am instrument` for example; its exit ends the run.
 //! 7. the control socket `<root>/control.sock` (serve_run_control): `stop` ends the run, `start <package>/<class>` is `am start`. An app process ending does not end the run: the services see its death.
 //!    Except with `--exit-with-last-app` (default with `--ui`): the services' `LastAppEnded` after the last app's window closed or it finished / exited 0 ends it ([`Host::last_app_ended`]).
 //!
-//! 8. the end (`stop`, the last app's end, the command's exit, SIGINT/SIGTERM): app processes SIGKILLed; the services, gralloc, servicemanager SIGTERMed (then SIGKILLed after `--stop-grace-ms`); binderd by its admin
+//! 8. the end (`stop`, the last app's end, the command's exit, SIGINT/SIGTERM): app processes SIGKILLed; the services, gralloc, servicemanager, keystore2 and its HAL SIGTERMed (then SIGKILLed after `--stop-grace-ms`); binderd by its admin
 //!    connection; then the ranked summary of every process's `diag:` lines on stderr (`atld: summary ...`, print_summary).
 //!
 //! Exit status: the command's (bwrap passes it on); 0 after `stop` and after the last app's end; 128 + n after signal n; failure when the services exited. Plan: binderd, servicemanager and the services move into this process later; here each is a process, as `xtask test binder` runs them.
@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitCode, ExitStatus};
@@ -97,6 +98,16 @@ struct Args {
     /// Omitted: no graphics buffers (headless runs on a host without a DRM device). The mapper library `mapper.atl.so` it names to libui must be in `--lib-path`.
     #[arg(long)]
     gralloc: Option<PathBuf>,
+    /// AOSP keystore2 executable (system/security): `IKeystoreService/default` and its companion services, run as AID_KEYSTORE with its database dir (host_layout::keystore_data) at /data/misc/keystore, after the KeyMint HAL (`--keymint`).
+    /// Omitted: no keystore (apps' AndroidKeyStore finds no service).
+    #[arg(long, requires = "keymint")]
+    keystore2: Option<PathBuf>,
+    /// The KeyMint HAL executable keystore2 uses, AOSP's `android.hardware.security.keymint-service.nonsecure`, run as AID_NOBODY as its `.rc` says.
+    #[arg(long, requires = "keystore2")]
+    keymint: Option<PathBuf>,
+    /// A VINTF manifest fragment (repeat): `<partition>=<file>`, partition `system` or `vendor`; placed in `/<partition>/etc/vintf/manifest/`, where libvintf reads a partition's fragments, as Soong installs `vintf_fragment_modules`.
+    #[arg(long = "vintf-fragment", value_parser = vintf_fragment)]
+    vintf_fragments: Vec<(String, PathBuf)>,
     /// atl-egl-probe executable: with `--gralloc` and `--ui`, run once (`--display-node`) to ask the desktop's Wayland EGL display which GPU it renders on; gralloc and every app then use that node (atl_gralloc::node).
     /// Headless runs, and displays naming no node, take the node by gralloc's own trial, run in the probe (`--trial-node`) before gralloc starts. Then per render path (`--renderer`), which also reports whether the apps' GPUs import a gralloc buffer: gralloc's allocator tier (node::choose_allocator_tier).
     /// Needed whenever `--gralloc` is given.
@@ -291,9 +302,13 @@ struct Args {
 /// `prop_diag.summary_rows` default [est]: one terminal screen beside the API block; the device diff (plan S18) reads the logs, not this block.
 const PROP_SUMMARY_ROWS: usize = 20;
 
-/// Android uids (system/core/libcutils/include/private/android_filesystem_config.h): AID_SYSTEM, AID_SHELL.
+/// Android uids (system/core/libcutils/include/private/android_filesystem_config.h): AID_SYSTEM, AID_KEYSTORE (keystore2.rc `user keystore`), AID_SHELL, AID_NOBODY (the KeyMint HAL's .rc `user nobody`).
 const AID_SYSTEM: u32 = 1000;
+const AID_KEYSTORE: u32 = 1017;
 const AID_SHELL: u32 = 2000;
+const AID_NOBODY: u32 = 9999;
+/// Where keystore2 finds its database (keystore2.rc: `/system/bin/keystore2 /data/misc/keystore`).
+const KEYSTORE_DB: &str = "/data/misc/keystore";
 /// The run's control socket, below the root (serve_run_control).
 const CONTROL_SOCKET: &str = "control.sock";
 /// How often the run checks that the services still run while it waits for its end: a dead services process is noticed within this.
@@ -416,6 +431,22 @@ fn kernel_log_to_log(spawn: &mut Spawn, log: &Path) -> Result<()> {
             }
         })
         .context("kernel log thread")?;
+    Ok(())
+}
+
+/// The logd write socket of a daemon that logs through liblog (keystore2, the KeyMint HAL: android_logger): on Android logd listens at /dev/socket/logdw; here atld binds one per daemon at `sock`
+/// (atl-services-types `serve_logdw`, the app launcher's receiver), bound at that path in the daemon's sandbox, and appends each record to `log` as a logcat line. Environment only, no daemon change.
+fn logdw_to_log(spawn: &mut Spawn, sock: &Path, log: &Path) -> Result<()> {
+    let out = OpenOptions::new().append(true).open(log)?;
+    atl_services_types::logcat::serve_logdw(sock, move |line| {
+        let _ = (&out).write_all(line.as_bytes());
+    })?;
+    spawn.mounts.push(Mount {
+        host: sock.to_owned(),
+        at: atl_services_types::logcat::LOGDW.into(),
+        // connect(2) on a socket file needs write access to it
+        writable: true,
+    });
     Ok(())
 }
 
@@ -609,7 +640,24 @@ fn vintf_layout(a: &Args, r: &Root) -> Result<()> {
         std::fs::create_dir_all(&d)?;
         std::fs::write(d.join("manifest.xml"), vintf::manifest(kind, &hals))?;
     }
+    for (partition, file) in &a.vintf_fragments {
+        let dir = r.root.join(partition).join("etc/vintf/manifest");
+        std::fs::create_dir_all(&dir)?;
+        let name = file
+            .file_name()
+            .with_context(|| format!("--vintf-fragment {}: no file name", file.display()))?;
+        std::fs::copy(file, dir.join(name))
+            .with_context(|| format!("--vintf-fragment {}", file.display()))?;
+    }
     Ok(())
+}
+
+/// `--vintf-fragment`'s `<partition>=<file>`: the partitions whose fragments servicemanager's libvintf reads here (system: framework manifest, vendor: device manifest).
+fn vintf_fragment(s: &str) -> Result<(String, PathBuf), String> {
+    match s.split_once('=') {
+        Some((p @ ("system" | "vendor"), f)) if !f.is_empty() => Ok((p.to_owned(), f.into())),
+        _ => Err(format!("{s:?}: want system=<file> or vendor=<file>")),
+    }
 }
 
 /// The vendor permission file atld writes with the features it derives from this host and the desktop settings (atl_services_types::system_config format); the services read it with the
@@ -2044,6 +2092,31 @@ fn run(a: &Args) -> Result<ExitCode> {
     kernel_log_to_log(&mut sm_spawn, &r.log("servicemanager"))?;
     let mut sm = broker.spawn(sm_spawn).context("starting servicemanager")?;
     log(format_args!("servicemanager: host pid {}", sm.host_pid));
+    // the KeyMint HAL, then keystore2 on it (init's order: early_hal before keystore2's class main); keystore2 alone holds its database dir
+    let mut keystore = Vec::new();
+    if let (Some(keystore2), Some(keymint)) = (&a.keystore2, &a.keymint) {
+        let sockets = r.root.join("logdw");
+        std::fs::create_dir_all(&sockets)?;
+        let mut hal = system_spawn("keymint", keymint, vec![], false, None)?;
+        hal.uid = AID_NOBODY;
+        logdw_to_log(&mut hal, &sockets.join("keymint"), &r.log("keymint"))?;
+        keystore.push(("keymint", broker.spawn(hal).context("starting the KeyMint HAL")?));
+        let db = host_layout::keystore_data(&r.data_root);
+        std::fs::create_dir_all(&db)?;
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o700))?;
+        let mut ks = system_spawn("keystore2", keystore2, vec![KEYSTORE_DB.into()], false, None)?;
+        ks.uid = AID_KEYSTORE;
+        logdw_to_log(&mut ks, &sockets.join("keystore2"), &r.log("keystore2"))?;
+        ks.mounts.push(Mount {
+            host: db,
+            at: KEYSTORE_DB.into(),
+            writable: true,
+        });
+        keystore.push(("keystore2", broker.spawn(ks).context("starting keystore2")?));
+        for (name, p) in &keystore {
+            log(format_args!("{name}: host pid {}", p.host_pid));
+        }
+    }
     // the guest cpuinfo before any app can start: the probe under the installed engine, with /system as apps see it
     let mut cpuinfo = BTreeMap::new();
     if let Some(probe) = &a.cpuinfo_probe {
@@ -2721,7 +2794,10 @@ fn run(a: &Args) -> Result<ExitCode> {
             ("services", Some(&mut services)),
             ("gralloc", gralloc.as_mut()),
             ("servicemanager", Some(&mut sm)),
-        ] {
+        ]
+        .into_iter()
+        .chain(keystore.iter_mut().map(|(name, p)| (*name, Some(p))))
+        {
             if let Some(p) = p {
                 s.spawn(move || stop_system(name, p, grace));
             }
@@ -2851,6 +2927,18 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fragments go to the two partitions servicemanager reads; anything else is refused.
+    #[test]
+    fn vintf_fragment_arg() {
+        assert_eq!(
+            vintf_fragment("vendor=/t/k.xml"),
+            Ok(("vendor".to_owned(), PathBuf::from("/t/k.xml")))
+        );
+        for bad in ["odm=/t/k.xml", "system=", "/t/k.xml"] {
+            assert!(vintf_fragment(bad).is_err(), "{bad}");
+        }
+    }
 
     /// The device's extension pack and GLES version are the host's (no ceiling, gl-honesty H3); the version is encoded major << 16 | minor (GLES_VERSION).
     #[test]

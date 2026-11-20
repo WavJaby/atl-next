@@ -106,12 +106,12 @@ pub struct Provider {
     pub srcs: Vec<String>,
     /// The tree builds the module, as the OS's userspace instead of linux_glibc's (bp2ninja rust.go rustOSSide).
     pub rust_os: Option<RustOs>,
-    /// The tree builds the module, its device C/C++ compiles with these macros (`NAME` or `NAME=VALUE`), each read by a patch under patches/ (bp2ninja provided.go parseDefines).
+    /// The tree builds the module, its device C/C++ compiles with these macros (`NAME` or `NAME=VALUE`) as -D, a device Rust crate with them as --cfg; each read by a patch under patches/ (bp2ninja provided.go parseDefines).
     #[serde(default)]
     pub defines: Vec<String>,
 }
 
-/// `module:MACRO` pairs of the `defines` rows, the converter's `-defines`; that each names a cc module with a device variant needs the tree, the converter checks it (bp2ninja provided.go checkDefines).
+/// `module:MACRO` pairs of the `defines` rows, the converter's `-defines`; that each names a cc or Rust module with a device variant needs the tree, the converter checks it (bp2ninja provided.go checkDefines).
 pub fn defines(providers: &Providers) -> Vec<String> {
     providers
         .iter()

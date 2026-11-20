@@ -23,6 +23,38 @@ use crate::gate_goals::{
 use crate::host_art::{self, HostArt};
 use crate::{manifest, out, packages, remote, tree};
 
+/// The keystore modules (gate_goals.rs `keystore`), each installed at `<out>/device/<module>/<module>`.
+const KEYSTORE2: &str = "keystore2";
+const KEYMINT_HAL: &str = "android.hardware.security.keymint-service.nonsecure";
+/// The `vintf_fragment_modules` of keystore2 (system/security/keystore2/Android.bp `keystore2_defaults`) and of the HAL (hardware/interfaces/security/keymint/aidl/default/Android.bp), by partition, below the tree.
+const KEYSTORE_FRAGMENTS: [(&str, &str); 4] = [
+    (
+        "system",
+        "system/security/keystore2/android.system.keystore2-service.xml",
+    ),
+    (
+        "vendor",
+        "hardware/interfaces/security/keymint/aidl/default/android.hardware.security.keymint-service.xml",
+    ),
+    (
+        "vendor",
+        "hardware/interfaces/security/keymint/aidl/default/android.hardware.security.sharedsecret-service.xml",
+    ),
+    (
+        "vendor",
+        "hardware/interfaces/security/keymint/aidl/default/android.hardware.security.secureclock-service.xml",
+    ),
+];
+
+/// [`Runtime::with_keystore`]'s inputs.
+#[derive(Clone)]
+struct Keystore {
+    keystore2: PathBuf,
+    keymint: PathBuf,
+    /// (partition, fragment file)
+    fragments: Vec<(String, PathBuf)>,
+}
+
 /// framework-res.apk in the Java pipeline's out: built as Soong builds it (manifest_fixer, link, merge, align; bp2ninja app.go), unsigned.
 const FRAMEWORK_RES: &str = "device/framework-res/framework-res.apk";
 /// SettingsProvider's install path below a partitions root (`certificate: "platform"`, `privileged: true` in its Android.bp).
@@ -279,6 +311,8 @@ pub struct Runtime {
     keychars: PathBuf,
     /// The graphics allocator HAL and the directory of `mapper.atl.so`, when [`Runtime::with_gralloc`] asked for them.
     gralloc: Option<(PathBuf, PathBuf)>,
+    /// keystore2, the KeyMint HAL and their VINTF fragments, when [`Runtime::with_keystore`] asked for them.
+    keystore: Option<Keystore>,
     /// atl-egl-probe, atld's GPU selector (`--gpu-probe`), with [`Runtime::with_gralloc`].
     gpu_probe: Option<PathBuf>,
     /// atl-engine-cpuinfo, atld's guest cpuinfo source (`--cpuinfo-probe`), with [`Runtime::with_qemu_engine`].
@@ -826,6 +860,7 @@ impl Runtime {
             sandbox_stub,
             sandbox_join,
             flatpak_spawn,
+            keystore: None,
             webspawn: true,
             atld,
             installer,
@@ -891,6 +926,36 @@ impl Runtime {
     /// The persistent data root set by [`Runtime::with_data_root`], if any.
     pub fn data_root(&self) -> Option<&Path> {
         self.data_root.as_deref()
+    }
+
+    /// Also starts keystore2 and AOSP's Rust software KeyMint HAL (gate_goals.rs `keystore`), declared by their own Android.bp `vintf_fragment_modules` files from the tree: keystore2's in /system, the HAL's keymint / sharedsecret / secureclock in /vendor.
+    pub fn with_keystore(mut self, root: &Path) -> Result<Self> {
+        let bin = |module: &str| -> Result<PathBuf> {
+            let p = self.out.join("device").join(module).join(module);
+            ensure!(
+                p.is_file(),
+                "{} missing: build native goal `{module}` (`native --for keystore`)",
+                p.display()
+            );
+            Ok(p)
+        };
+        let keystore2 = bin(KEYSTORE2)?;
+        let keymint = bin(KEYMINT_HAL)?;
+        let tree = tree::shared_tree(&Layout::of(root)?);
+        let fragments = KEYSTORE_FRAGMENTS
+            .iter()
+            .map(|(partition, file)| {
+                let f = tree.join(file);
+                ensure!(f.is_file(), "{} missing in the tree", f.display());
+                Ok(((*partition).to_owned(), f))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.keystore = Some(Keystore {
+            keystore2,
+            keymint,
+            fragments,
+        });
+        Ok(self)
     }
 
     /// Also starts the graphics allocator HAL under atld (`--gralloc`): the allocator `xtask native` built, and `mapper.atl.so` installed in `<out>/gralloc/lib`, which joins every process's library path.
@@ -1661,6 +1726,12 @@ impl Runtime {
             inputs.files.push(allocator.clone());
             inputs.files.extend(remote::lib_files(mapper_dir)?);
         }
+        if let Some(k) = &self.keystore {
+            inputs.files.extend([k.keystore2.clone(), k.keymint.clone()]);
+            inputs
+                .files
+                .extend(k.fragments.iter().map(|(_, f)| f.clone()));
+        }
         inputs.files.extend(self.gpu_probe.iter().cloned());
         inputs.files.extend(self.cpuinfo_probe.iter().cloned());
         inputs
@@ -1881,6 +1952,16 @@ impl Runtime {
         }
         if let Some((allocator, _)) = &self.gralloc {
             cmd.arg("--gralloc").arg(allocator);
+        }
+        if let Some(k) = &self.keystore {
+            cmd.arg("--keystore2")
+                .arg(&k.keystore2)
+                .arg("--keymint")
+                .arg(&k.keymint);
+            for (partition, file) in &k.fragments {
+                cmd.arg("--vintf-fragment")
+                    .arg(format!("{partition}={}", file.display()));
+            }
         }
         cmd.arg("--root")
             .arg(&run.root)

@@ -338,6 +338,12 @@ func (g *Graph) rustNode(n *Node) {
 	if g.rustOSSide(m, n.side) == Device {
 		r.flags = append(r.flags, "--cfg", rustAndroidCfg)
 	}
+	// providers.toml `defines` rows: the device variant's cfgs, as a cc module's -D (provided.go checkDefines)
+	if n.side == Device {
+		for _, d := range g.defines[m.Name] {
+			r.flags = append(r.flags, "--cfg", rustDefineCfg(d))
+		}
+	}
 	for _, f := range p.strs("features") {
 		r.flags = append(r.flags, "--cfg", `feature="`+f+`"`)
 	}

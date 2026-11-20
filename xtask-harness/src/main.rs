@@ -42,6 +42,7 @@ mod host_fonts;
 mod installer;
 mod installer_parse;
 mod instrument;
+mod keystore;
 mod jni_fixture;
 mod manifest;
 mod native_load;
@@ -197,6 +198,8 @@ enum Test {
     /// Run 1: a passing, a failing and an erroring test: status codes 1/0, 1/-2, 1/-1, the final code -1, and the instrumented process killed once the run finished.
     /// Run 2: a test that kills its own process: the run is reported cancelled (code 0, shortMsg "Process crashed.").
     Instrument(instrument::Args),
+    /// keystore2 + AOSP's software KeyMint HAL under atld (keystore.rs): an app-uid process gets a TRUSTED_ENVIRONMENT security level, KEY_NOT_FOUND for an absent alias, SOFTWARE from the HAL.
+    Keystore(keystore::Args),
     /// The CTS progress metric: every cts.toml row's test APK is built, installed and run with `am instrument`; the number of passing tests per module is the result.
     ///
     /// Per module: state (RAN / INCOMPLETE / CRASH / START_FAIL / BUILD_FAIL) and pass / fail / error / ignored / total, then the unimplemented and refused counters summed over the run, most hit first; answered and sent counts as totals. `<out>/cts/report.json` holds every test's outcome.
@@ -374,6 +377,9 @@ fn main() -> Result<ExitCode> {
             test: Test::Billing(args),
         } => billing::run(&root, &args),
         Command::Test {
+            test: Test::Keystore(args),
+        } => keystore::run(&root, &args),
+        Command::Test {
             test: Test::Instrument(args),
         } => instrument::run(&root, &args),
         Command::Test {
@@ -533,6 +539,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::AudioApp(_) => "audio-app",
             Test::Broadcast(_) => "broadcast",
             Test::Instrument(_) => "instrument",
+            Test::Keystore(_) => "keystore",
             Test::Cts(_) => "cts",
             Test::Composer(_) => "composer",
             Test::Window(_) => "window",
