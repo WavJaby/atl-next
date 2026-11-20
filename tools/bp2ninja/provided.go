@@ -18,6 +18,24 @@ type Provided struct {
 	// header dirs dependents get as -I (Soong export_include_dirs): the guest libc++ runtimes' headers, as prebuilts/clang's soong/clangprebuilts.go exports them, ahead of bionic's -isystem
 	ExportInclude []string `json:"export_include,omitempty"`
 	Defines       []string `json:"defines"` // NAME=VALUE its headers depend on, given to dependents as -D (BoringSSL's symbol prefix)
+	// set on a Rust module whose crate source a provider supplies (upstream BoringSSL's bssl-sys / bssl-crypto); Lib is then empty: the tree module is built (its crate name, features, crate and cc deps), compiling this source instead of its srcs
+	Crate *ProvidedCrate `json:"crate,omitempty"`
+}
+
+// ProvidedCrate: what a provided Rust module compiles in place of its tree srcs.
+type ProvidedCrate struct {
+	Root    string   `json:"root"`    // absolute crate root
+	Edition string   `json:"edition"` // the crate's own (its Cargo.toml), not the tree module's
+	Cfgs    []string `json:"cfgs"`
+	Env     []string `json:"env"` // NAME=VALUE in rustc's environment (bssl-sys BINDGEN_RS_FILE)
+}
+
+// providedCrate: the provided crate source of Rust node n's module on its side, nil for a tree crate.
+func (g *Graph) providedCrate(n *Node) *ProvidedCrate {
+	if !n.side.glibc() {
+		return nil
+	}
+	return g.providedOn(n.side)[n.mod.Name].Crate
 }
 
 // Partial is a providers.toml row with `srcs`: the module is built from the tree without those sources, and links the provider's artifact (nil for `none`) first, as a provided shared library, for the symbols they defined.
@@ -71,6 +89,12 @@ func (g *Graph) checkDefines() {
 // checkLibs: every provided entry names its artifact.
 func checkLibs(provided map[string]Provided, partial map[string]Partial) error {
 	for m, p := range provided {
+		if p.Crate != nil {
+			if p.Lib != "" || p.Crate.Root == "" {
+				return fmt.Errorf("%s: a crate entry has a root and no lib", m)
+			}
+			continue
+		}
 		if p.Lib == "" {
 			return fmt.Errorf("%s: no lib", m)
 		}

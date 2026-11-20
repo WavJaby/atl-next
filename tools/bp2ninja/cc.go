@@ -713,7 +713,8 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 	if stlModules[name] {
 		return nil
 	}
-	if p, ok := g.providedOn(side)[name]; ok {
+	// a provided crate source: the tree module is built from it (rustNode)
+	if p, ok := g.providedOn(side)[name]; ok && p.Crate == nil {
 		return g.providedNode(name, side, p)
 	}
 	// providers.toml `module:`: the tree module that installs under this name stands in for it; anything else under the name would be a different library

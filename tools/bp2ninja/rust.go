@@ -111,6 +111,8 @@ type rustCrate struct {
 	// a source provider's generated sources (rustsrc.go), root first
 	source rustSource
 	flags  []string
+	// rustc environment beyond rustEnv's: a provided crate's (ProvidedCrate.Env)
+	env []string
 	// direct crate dependencies by the name the source uses (aliases applied)
 	externs []rustExtern
 	broken  string // first reason it cannot be compiled; its step fails with it
@@ -190,9 +192,14 @@ func (g *Graph) rustNode(n *Node) {
 	if cr := p.str("crate_root"); cr != "" && sp == nil {
 		r.root = filepath.Join(m.Dir, cr)
 	}
+	// a provider's crate source replaces srcs (provided.go ProvidedCrate)
+	pc := g.providedCrate(n)
+	if pc != nil {
+		r.root, r.env = pc.Root, pc.Env
+	}
 	var plain []string
 	var srcs []string
-	if sp == nil {
+	if sp == nil && pc == nil {
 		srcs = p.strs("srcs")
 	}
 	for _, s := range srcs {
@@ -319,9 +326,13 @@ func (g *Graph) rustNode(n *Node) {
 	if edition == "" {
 		edition = rustDefaultEdition
 	}
+	var providedCfgs []string
+	if pc != nil {
+		edition, providedCfgs = pc.Edition, pc.Cfgs
+	}
 	r.flags = append(r.flags, "--edition="+edition)
 	// compiler.go cfgFlags / featureFlags
-	for _, c := range p.strs("cfgs") {
+	for _, c := range slices.Concat(p.strs("cfgs"), providedCfgs) {
 		r.flags = append(r.flags, "--cfg", c)
 	}
 	if g.rustOSSide(m, n.side) == Device {
@@ -494,7 +505,7 @@ func (g *Graph) rustEnv(n *Node, rustVersion string) []string {
 			}
 		}
 	}
-	return env
+	return append(env, r.env...)
 }
 
 // rustOut: the file a Rust node produces (library.go: lib<crate>.rlib; proc_macro.go: lib<crate>.so; a binary its stem); a source variant none, its generated sources are on its edges.

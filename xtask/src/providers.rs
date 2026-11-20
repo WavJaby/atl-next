@@ -78,6 +78,9 @@ pub struct Provided {
     pub export_include: Vec<PathBuf>,
     /// `NAME=VALUE` defines the headers depend on, given to dependents as `-D`.
     pub defines: Vec<String>,
+    /// A Rust module's crate source (upstream recipe `crates`): the converter builds the tree module from it; `lib` is then empty.
+    #[serde(rename = "crate", skip_serializing_if = "Option::is_none")]
+    pub krate: Option<crate::upstream::ProvidedCrate>,
 }
 
 /// One `srcs` row as `xtask native` hands it to the converter in `<out>/srcs.json` (bp2ninja provided.go `Partial`): the module is built from the tree without these sources, linking the provider's artifact if it has one.
@@ -290,15 +293,16 @@ fn validate_one(module: &str, provider: &str, targets: &Targets) -> Result<()> {
             let Some(recipe) = upstream::recipe(name) else {
                 bail!("xtask has no build recipe for upstream `{name}` (upstream.rs RECIPES)")
             };
+            let all: Vec<&str> = recipe
+                .modules
+                .iter()
+                .map(|(m, _)| *m)
+                .chain(recipe.crates.iter().map(|c| c.module))
+                .collect();
             ensure!(
-                recipe.modules.iter().any(|(m, _)| *m == module),
-                "upstream `{name}` installs no module `{module}` (its recipe: {})",
-                recipe
-                    .modules
-                    .iter()
-                    .map(|(m, _)| *m)
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                all.contains(&module),
+                "upstream `{name}` provides no module `{module}` (its recipe: {})",
+                all.join(", ")
             );
         }
         Some(("system", name)) => {

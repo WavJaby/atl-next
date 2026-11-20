@@ -295,7 +295,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     };
     let cc = flag_or_row(&args.cc, root, "clang")?;
     let cxx = flag_or_row(&args.cxx, root, "clang-cxx")?;
+    let libclang = libclang_dir(&cc)?;
     let ctx = ProvideCtx {
+        libclang: &libclang,
         root,
         providers: to_build,
         deps: &deps,
@@ -314,6 +316,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             target,
             flags: &cross_flags,
             cross_processor: cross.as_ref().map(|_| args.host.as_str()),
+            rust_triple: &host.rust,
         },
         &mut phases,
     )?;
@@ -330,6 +333,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 target: None,
                 flags: &[],
                 cross_processor: None,
+                rust_triple: &build
+                    .host
+                    .as_ref()
+                    .context("the build machine's arches.toml row is a host row")?
+                    .rust,
             };
             let mut bp = provide(&ctx, &build_machine, &mut phases)?;
             // a srcs row's provider stands in for sources of a product module; no build-side module has one
@@ -366,7 +374,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         &serde_json::to_string_pretty(&aidl_crates)?,
     )?;
     let rust = rust_toolchain(root)?;
-    let libclang = libclang_dir(&flag_or_row(&args.cc, root, "clang")?)?;
     let llvm = llvm_prefix(&flag_or_row(&args.cc, root, "clang")?)?;
     let nb = native_bridge_flags(root, &arches, args, &converter, &tree, &graph_out, &llvm)?;
     // the pinned tag's release config: build flags, and the values aconfig flag libraries are generated with (the converter builds aconfig from the tree)
@@ -1422,6 +1429,8 @@ struct ProvideCtx<'a> {
     converter: &'a Path,
     cc: &'a str,
     cxx: &'a str,
+    /// the `clang` row's libclang dir (libclang_dir): bindgen of an upstream's Rust bindings
+    libclang: &'a Path,
 }
 
 /// The machine a provided set is built for: its output dir, cargo target, sysroot and converter cross flags; all empty for the build machine.
@@ -1433,6 +1442,8 @@ struct Machine<'a> {
     target: Option<system::Sysroot<'a>>,
     flags: &'a [String],
     cross_processor: Option<&'a str>,
+    /// arches.toml `[<arch>.host] rust` of the machine: an upstream's Rust bindings target
+    rust_triple: &'a str,
 }
 
 /// The provided set for machine `m`: each provider built or resolved once (crates by cargo-c, upstreams by their own build system, system libraries as installed), then each module one entry joining its row's providers in order; `srcs` rows included (the caller splits them off).
@@ -1471,6 +1482,8 @@ fn provide<'a>(
         flags: &flags,
         // CMake's cross mode (CMAKE_CROSSCOMPILING): the arch name is the clang triple's arch part (arches.toml `clang`)
         cross_processor: m.cross_processor,
+        rust_triple: m.rust_triple,
+        libclang: ctx.libclang,
     };
     // by module: a recipe installs one artifact per module it provides
     let mut upstreams = BTreeMap::new();

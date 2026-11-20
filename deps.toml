@@ -62,6 +62,13 @@ min_reason = "observed 2026-11-07; older is untested"
 scope = ["runtime", "test"]
 used_by = ["crate:atl-broker", "xtask:test"]
 
+# upstream BoringSSL's CMake RUST_BINDINGS runs `bindgen` (find_program) for bssl-sys; the version of AOSP's pinned bindgen-cli (external/rust/android-crates-io/crates/bindgen-cli), the converter's rust_bindgen tool
+[bindgen-cli]
+cargo = "bindgen-cli"
+version = "0.69.5"
+scope = ["build"]
+used_by = ["upstream:boringssl", "xtask:native"]
+
 # builds providers.toml `crate:` providers as C shared libraries, with their headers
 [cargo-c]
 cargo = "cargo-c"

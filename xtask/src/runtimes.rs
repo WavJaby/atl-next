@@ -498,7 +498,7 @@ fn build(
     cache.extend(NO_TESTS);
     cache.extend(v.cache);
     cache.extend(link);
-    upstream::cmake(src, &build, &cache, &dir.join("build.log"), &[], false)
+    upstream::cmake(src, &build, &cache, &dir.join("build.log"), &[], false, &[])
         .with_context(|| format!("runtimes {}", v.name))?;
     v.modules
         .iter()

@@ -289,6 +289,26 @@ func TestRustCustomBindgen(t *testing.T) {
 	}
 }
 
+// A provided crate source (upstream BoringSSL's bssl-sys): the tree module is built from the provider's root, edition, cfgs and env; its srcs (the tree's own bindgen) are never generated.
+func TestProvidedCrateSource(t *testing.T) {
+	g := bindgenGraph(t)
+	pc := &ProvidedCrate{Root: "/up/rust/sys/src/lib.rs", Edition: "2018", Cfgs: []string{"bindgen_rs_file"}, Env: []string{"BINDGEN_RS_FILE=/up/build/wrapper.rs"}}
+	g.provided = map[string]Provided{"libsys": {Crate: pc}}
+	n := g.node("libsys", Device, Rlib, "goal")
+	if n == nil || n.provided || n.rust == nil || n.rust.broken != "" {
+		t.Fatalf("libsys %+v %v", n, g.problems)
+	}
+	if n.rust.root != pc.Root || len(n.rust.srcDeps) != 0 || g.nodes[key{"libfoo_bindgen", Device, Gen}] != nil {
+		t.Errorf("root %s srcDeps %v", n.rust.root, n.rust.srcDeps)
+	}
+	if !slices.Contains(n.rust.flags, "--edition=2018") || !slices.Contains(n.rust.flags, "bindgen_rs_file") {
+		t.Errorf("flags %v", n.rust.flags)
+	}
+	if env := g.rustEnv(n, "1"); !slices.Contains(env, pc.Env[0]) {
+		t.Errorf("env %v", env)
+	}
+}
+
 func TestRustBindgenErrors(t *testing.T) {
 	g := bindgenGraph(t)
 	for name, want := range map[string]string{

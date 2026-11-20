@@ -13,12 +13,33 @@ use crate::providers::Provided;
 /// How xtask builds one upstream; keyed by its `sources.toml` name.
 pub struct Recipe {
     pub name: &'static str,
-    /// Android.bp modules the install provides, each with its library: module `(m, lib)` is `<prefix>/lib/<lib>.so` (checked after install).
+    /// Android.bp modules the build provides as C artifacts, each with its file relative to `<out>/upstream/<name>`: `prefix/...` from the install, `build/...` a build output no install rule copies (checked after the build).
     pub modules: &'static [(&'static str, &'static str)],
+    /// Android.bp Rust modules whose crate source the upstream provides (bp2ninja `ProvidedCrate`): the tree module stays, its source becomes the upstream crate's. Non-empty -> configured with `RUST_BINDINGS`.
+    pub crates: &'static [RecipeCrate],
     /// CMake cache entries beyond the toolchain ones every recipe gets.
     cache: &'static [(&'static str, &'static str)],
     /// Cache entries that are also preprocessor defines of the installed headers: dependents compile with `-D<k>=<v>`, so library and users cannot disagree.
     shared_defines: &'static [(&'static str, &'static str)],
+}
+
+/// One provided Rust crate of a recipe.
+pub struct RecipeCrate {
+    pub module: &'static str,
+    /// Crate dir in the upstream tree: `src/lib.rs` is the root, `Cargo.toml` `package.edition` the edition.
+    dir: &'static str,
+    /// The crate reads CMake's bindgen output (`<build>/<dir>/wrapper_<rust triple>.rs`, BoringSSL rust/bssl-sys/CMakeLists.txt) through its static-build hook: `--cfg bindgen_rs_file` + env `BINDGEN_RS_FILE` (bssl-sys src/lib.rs); cargo's build.rs route is not taken.
+    bindings: bool,
+}
+
+/// What the converter compiles in place of a tree Rust module's sources (bp2ninja provided.go `ProvidedCrate`).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProvidedCrate {
+    pub root: PathBuf,
+    pub edition: String,
+    pub cfgs: Vec<String>,
+    /// `NAME=VALUE` rustc environment.
+    pub env: Vec<String>,
 }
 
 /// Symbol prefix of our BoringSSL: its C symbols become `ATL_<name>`, its C++ ones move to `bssl::ATL`. App processes share one flat ELF symbol namespace with desktop libraries that may load a system OpenSSL; unprefixed, the first loaded `SHA256_Init` & co. would win for both.
@@ -28,9 +49,26 @@ pub const RECIPES: &[Recipe] = &[Recipe {
     name: "boringssl",
     // libcrypto_static: AOSP's non-FIPS static copy (libcore's JNI libraries, dex2oat: bignums, digests); here the one shared libcrypto, so a process holds one BoringSSL
     modules: &[
-        ("libcrypto", "libcrypto"),
-        ("libcrypto_static", "libcrypto"),
-        ("libssl", "libssl"),
+        ("libcrypto", "prefix/lib/libcrypto.so"),
+        ("libcrypto_static", "prefix/lib/libcrypto.so"),
+        ("libssl", "prefix/lib/libssl.so"),
+        // bindgen --wrap-static-fns output for bssl-sys (AOSP: the same role, generated from its own headers)
+        (
+            "libbssl_sys_raw_staticfns",
+            "build/rust/bssl-sys/librust_wrapper.a",
+        ),
+    ],
+    crates: &[
+        RecipeCrate {
+            module: "libbssl_sys",
+            dir: "rust/bssl-sys",
+            bindings: true,
+        },
+        RecipeCrate {
+            module: "libbssl_crypto",
+            dir: "rust/bssl-crypto",
+            bindings: false,
+        },
     ],
     // shared: dependents link libcrypto.so / libssl.so as AOSP's device build does; tests are not ours to build
     cache: &[("BUILD_SHARED_LIBS", "ON"), ("BUILD_TESTING", "OFF")],
@@ -56,6 +94,10 @@ pub struct Toolchain<'a> {
     pub flags: &'a Flags,
     /// Cross host: its arch name, CMake's `CMAKE_SYSTEM_PROCESSOR` (with `CMAKE_SYSTEM_NAME` it puts CMake in cross mode: no try_run, no build-machine search paths).
     pub cross_processor: Option<&'a str>,
+    /// rustc target of the machine's crates: `RUST_BINDINGS` (bindgen's `--target`, the wrapper file's name).
+    pub rust_triple: &'a str,
+    /// The `clang` row's libclang dir: bindgen's `LIBCLANG_PATH`, as the converter's rust_bindgen gets it.
+    pub libclang: &'a Path,
 }
 
 /// The link flags of the default libc++ selection (bp2ninja stl.go `stlLinkFlags`).
@@ -113,12 +155,17 @@ pub fn build(
         // GNUInstallDirs may pick lib/<multiarch>; the artifact path below assumes lib
         ("CMAKE_INSTALL_LIBDIR", "lib".to_owned()),
     ]);
+    let mut env = Vec::new();
+    if !recipe.crates.is_empty() {
+        cache.push(("RUST_BINDINGS", tc.rust_triple.to_owned()));
+        env.push(("LIBCLANG_PATH", tc.libclang.as_os_str()));
+    }
     let cache: Vec<(&str, &str)> = cache
         .iter()
         .map(|(k, v)| (*k, v.as_str()))
         .chain(recipe.cache.iter().chain(recipe.shared_defines).copied())
         .collect();
-    cmake(src, &build, &cache, &log, &[], true)
+    cmake(src, &build, &cache, &log, &[], true, &env)
         .with_context(|| format!("upstream {}", recipe.name))?;
     let defines: Vec<String> = recipe
         .shared_defines
@@ -126,11 +173,41 @@ pub fn build(
         .map(|(k, v)| format!("{k}={v}"))
         .collect();
     let mut provided = BTreeMap::new();
-    for (module, stem) in recipe.modules {
-        let lib = prefix.join("lib").join(format!("{stem}.so"));
+    for c in recipe.crates {
+        let edition = crate_edition(&src.join(c.dir).join("Cargo.toml"))?;
+        let (mut cfgs, mut env) = (Vec::new(), Vec::new());
+        if c.bindings {
+            let rs = build
+                .join(c.dir)
+                .join(format!("wrapper_{}.rs", tc.rust_triple));
+            ensure!(
+                rs.is_file(),
+                "upstream {}: build has no {} for module {}",
+                recipe.name,
+                rs.display(),
+                c.module
+            );
+            cfgs.push("bindgen_rs_file".to_owned());
+            env.push(format!("BINDGEN_RS_FILE={}", rs.display()));
+        }
+        provided.insert(
+            c.module.to_owned(),
+            Provided {
+                krate: Some(ProvidedCrate {
+                    root: src.join(c.dir).join("src/lib.rs"),
+                    edition,
+                    cfgs,
+                    env,
+                }),
+                ..Provided::default()
+            },
+        );
+    }
+    for (module, file) in recipe.modules {
+        let lib = dir.join(file);
         ensure!(
             lib.is_file(),
-            "upstream {}: install has no {} for module {module}",
+            "upstream {}: build has no {} for module {module}",
             recipe.name,
             lib.display()
         );
@@ -145,6 +222,20 @@ pub fn build(
         );
     }
     Ok(provided)
+}
+
+/// `package.edition` of a crate's Cargo.toml (cargo's default 2015 when absent).
+fn crate_edition(manifest: &Path) -> Result<String> {
+    let text = std::fs::read_to_string(manifest)
+        .with_context(|| format!("reading {}", manifest.display()))?;
+    let doc: toml::Table =
+        toml::from_str(&text).with_context(|| format!("parsing {}", manifest.display()))?;
+    Ok(doc
+        .get("package")
+        .and_then(|p| p.get("edition"))
+        .and_then(toml::Value::as_str)
+        .unwrap_or("2015")
+        .to_owned())
 }
 
 /// Compiler entries whose change makes cmake delete its cache and re-run configure without the other `-D`s: CMAKE_INSTALL_PREFIX then falls back to the project's default
@@ -206,7 +297,7 @@ fn drop_stale_cache(src: &Path, build: &Path, wanted: &[(&str, &str)]) -> Result
     Ok(Some(why))
 }
 
-/// Configures (Ninja generator, `cache` as `-D` entries), builds `all`, then `targets` (what `all` leaves out, e.g. tools under `LLVM_BUILD_TOOLS=OFF`) and, with `install`, installs one CMake project; all output to `log`. Incremental: a rerun reuses `build`.
+/// Configures (Ninja generator, `cache` as `-D` entries), builds `all`, then `targets` (what `all` leaves out, e.g. tools under `LLVM_BUILD_TOOLS=OFF`) and, with `install`, installs one CMake project; `env` on every step; all output to `log`. Incremental: a rerun reuses `build`.
 pub fn cmake(
     src: &Path,
     build: &Path,
@@ -214,6 +305,7 @@ pub fn cmake(
     log: &Path,
     targets: &[&str],
     install: bool,
+    env: &[(&str, &std::ffi::OsStr)],
 ) -> Result<()> {
     std::fs::create_dir_all(build)?;
     if let Some(why) = drop_stale_cache(src, build, cache)? {
@@ -246,6 +338,7 @@ pub fn cmake(
     let file = std::fs::File::create(log)?;
     for step in &mut steps {
         let status = step
+            .envs(env.iter().copied())
             .stdout(file.try_clone()?)
             .stderr(file.try_clone()?)
             .status()
