@@ -6,7 +6,10 @@
 //! - sticky replay: a receiver registered after the sticky gets it with isInitialStickyBroadcast() true;
 //! - cold start: the explicit broadcast starts the receiver app headless and its Recv.onReceive runs (scheduleReceiver after attach; counter `broadcast cold start`);
 //! - sticky denied: the receiver app, without BROADCAST_STICKY, gets SecurityException ("Permission Denial") from sendStickyBroadcast;
-//! - exported denial: the receiver app's implicit PING is skipped for the sender's not-exported receiver (counter `Exported Denial`, and still one `runtime received`) after [`SETTLE`].
+//! - exported denial: the receiver app's implicit PING is skipped for the sender's not-exported receiver (counter `Exported Denial`, and still one `runtime received`) after [`SETTLE`];
+//! - protected broadcasts (BroadcastController.broadcastIntentLocked:1061-1067, the list from framework-res's manifest): the sender's BATTERY_LOW and its sticky BATTERY_CHANGED (it holds BROADCAST_STICKY)
+//!   are SecurityExceptions naming the action; registerReceiver(null, BATTERY_CHANGED) returns the battery service's sticky (the host's level, app::battery_level), not the fake level 1; a receiver for only protected actions needs no export flag at targetSdk 36
+//!   (:470-472), one for an unprotected action without a flag is a SecurityException (:457-460). The unprotected PING still delivers (the runtime row).
 //!
 //! Failure prints the apps' and the services' log tails; the counters are printed always.
 
@@ -50,6 +53,15 @@ const STICKY_REPLAYED: &str = "AtlBcast: sticky delivered initial=true level=42"
 const MANIFEST: &str = "AtlBcast: manifest received com.example.atlbcast.EXPLICIT";
 const STICKY_DENIED: &str = "AtlBcast: sticky denied: Permission Denial";
 const PING_SENT: &str = "AtlBcast: foreign ping sent";
+/// BroadcastController.java:1063-1065's message up to the pid (the pid and uid are the run's).
+const PROTECTED_DENIED: &str = "AtlBcast: protected send denied: Permission Denial: not allowed to send broadcast android.intent.action.BATTERY_LOW from pid=";
+const PROTECTED_STICKY_DENIED: &str = "AtlBcast: protected sticky denied: Permission Denial: not allowed to send broadcast android.intent.action.BATTERY_CHANGED from pid=";
+const BATTERY_STICKY: &str = "AtlBcast: battery sticky level=";
+/// The level the sender's fake BATTERY_CHANGED carries.
+const FAKE_LEVEL: &str = "AtlBcast: battery sticky level=1";
+const PROTECTED_ONLY_REGISTERED: &str = "AtlBcast: protected-only register without flag: ok";
+/// BroadcastController.java:457-460's message, callerPackage first.
+const UNFLAGGED_DENIED: &str = "AtlBcast: unflagged register denied: com.example.atlbcast: One of RECEIVER_EXPORTED or RECEIVER_NOT_EXPORTED should be specified when a receiver isn't being registered exclusively for system broadcasts";
 /// Counter names the services count (activity.rs): the cold start of a manifest receiver's process, and the skip of an unexported registered receiver.
 const COLD_START: &str = "broadcast cold start";
 const EXPORTED_DENIAL: &str = "Exported Denial";
@@ -132,6 +144,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         println!("broadcast: counter {l}");
     }
     let counted = |name: &str| counters.iter().any(|l| l.contains(name));
+    let system_level = format!("{BATTERY_STICKY}{}", crate::app::battery_level());
     let checks = [
         (
             "runtime receiver got its package's broadcast once",
@@ -156,6 +169,26 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         (
             "foreign PING skipped for the not-exported receiver",
             ping_seen.is_some() && counted(EXPORTED_DENIAL) && count(&s, RUNTIME) == 1,
+        ),
+        (
+            "an app's protected BATTERY_LOW threw SecurityException",
+            s.contains(PROTECTED_DENIED),
+        ),
+        (
+            "an app's protected sticky BATTERY_CHANGED threw SecurityException",
+            s.contains(PROTECTED_STICKY_DENIED),
+        ),
+        (
+            "registerReceiver(null, BATTERY_CHANGED) returns the system's sticky, not the app's fake",
+            s.lines().any(|l| l.ends_with(&system_level)) && !s.lines().any(|l| l.ends_with(FAKE_LEVEL)),
+        ),
+        (
+            "a receiver of only protected actions registered without an export flag",
+            s.contains(PROTECTED_ONLY_REGISTERED),
+        ),
+        (
+            "a receiver of an unprotected action without an export flag threw SecurityException",
+            s.contains(UNFLAGGED_DENIED),
         ),
     ];
     let mut whys = Vec::new();

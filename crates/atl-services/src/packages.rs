@@ -7,7 +7,7 @@ use atl_parcelables::android::content::pm::{
     ActivityInfo, ApplicationInfo, InstrumentationInfo, PackageInfo, PermissionInfo, ProviderInfo,
     ServiceInfo,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use atl_parcelables::parts::{ComponentInfo, ParsedIntentInfo};
@@ -46,6 +46,8 @@ pub struct PackageRecord {
     pub force_queryable: bool,
     /// manifest `<queries>`: what this package may see of others (`Packages::visible`)
     pub queries: Queries,
+    /// manifest `<protected-broadcast>`s, kept for a system package only (ScanPackageUtils.java:936-939 clears them for the rest): `Packages::is_protected_broadcast`
+    pub protected_broadcasts: Vec<String>,
     pub uid: u32,
     /// The instruction set the process runs (arches.toml row key): primaryCpuAbi's, else the device's first (InstructionSets.getPrimaryInstructionSet); zygote's `--instruction-set`.
     pub instruction_set: String,
@@ -149,16 +151,51 @@ impl PackageRecord {
     }
 }
 
+/// PackageManagerService.isProtectedBroadcast's prefix rules (PackageManagerService.java:5529-5532), before the declared list.
+const PROTECTED_BROADCAST_PREFIXES: [&str; 4] = [
+    "android.net.netmon.lingerExpired",
+    "com.android.server.sip.SipWakeupTimer",
+    "com.android.internal.telephony.data-reconnect",
+    "android.net.netmon.launchCaptivePortalApp",
+];
+
 /// The installed packages and the shared libraries (SystemConfig `<library>`) they may use; one user (0).
 #[derive(Debug, Clone, Default)]
 pub struct Packages {
     list: Vec<PackageRecord>,
     libraries: BTreeMap<String, Library>,
+    /// framework-res's `<protected-broadcast>`s: package `android` is not scanned (atl-services-types system_packages), so its manifest's list comes as a services input ([`Self::with_platform_broadcasts`])
+    platform_broadcasts: BTreeSet<String>,
 }
 
 impl Packages {
     pub fn new(list: Vec<PackageRecord>, libraries: BTreeMap<String, Library>) -> Self {
-        Packages { list, libraries }
+        Packages {
+            list,
+            libraries,
+            platform_broadcasts: BTreeSet::new(),
+        }
+    }
+
+    /// The platform's (framework-res's) protected broadcasts, added as PMS adds a scanned system package's (InstallPackageHelper.java:642-647).
+    pub fn with_platform_broadcasts(mut self, actions: impl IntoIterator<Item = String>) -> Self {
+        self.platform_broadcasts.extend(actions);
+        self
+    }
+
+    /// PackageManagerService.isProtectedBroadcast (:5526-5540): the prefix rules, then mProtectedBroadcasts = framework-res's and every system package's `<protected-broadcast>`s. A null action is not protected.
+    pub fn is_protected_broadcast(&self, action: Option<&str>) -> bool {
+        let Some(action) = action else {
+            return false;
+        };
+        PROTECTED_BROADCAST_PREFIXES
+            .iter()
+            .any(|p| action.starts_with(p))
+            || self.platform_broadcasts.contains(action)
+            || self
+                .list
+                .iter()
+                .any(|p| p.protected_broadcasts.iter().any(|a| a == action))
     }
 
     /// getPermissionControllerPackageName: PMS.getRequiredPermissionControllerLPr (PackageManagerService.java:2700-2716) resolves ACTION_MANAGE_PERMISSIONS + CATEGORY_DEFAULT among system
@@ -731,6 +768,7 @@ pub mod fixture {
             libraries: Vec::new(),
             force_queryable: false,
             queries: Queries::default(),
+            protected_broadcasts: Vec::new(),
             uid: 10_001,
             instruction_set: "x86_64".to_owned(),
         }
@@ -953,6 +991,25 @@ mod tests {
                 seen,
                 "system {system} force {force}"
             );
+        }
+    }
+
+    /// PackageManagerService.isProtectedBroadcast (:5526-5540): the platform's list, a (system) package's list as the install kept it, the hard-coded prefixes; null and others are not protected.
+    #[test]
+    fn protected_broadcasts_are_the_platforms_the_system_packages_and_the_prefixes() {
+        let mut bt = record("com.android.bluetooth");
+        bt.protected_broadcasts = vec!["android.bluetooth.adapter.action.STATE_CHANGED".into()];
+        let packages = Packages::new(vec![bt, record("org.app")], BTreeMap::new())
+            .with_platform_broadcasts(["android.intent.action.BATTERY_CHANGED".to_owned()]);
+        for (action, want) in [
+            (Some("android.intent.action.BATTERY_CHANGED"), true),
+            (Some("android.bluetooth.adapter.action.STATE_CHANGED"), true),
+            (Some("android.net.netmon.lingerExpired_7"), true),
+            (Some("android.intent.action.BATTERY_CHANGED2"), false),
+            (Some("org.app.PING"), false),
+            (None, false),
+        ] {
+            assert_eq!(packages.is_protected_broadcast(action), want, "{action:?}");
         }
     }
 

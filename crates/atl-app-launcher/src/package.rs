@@ -242,7 +242,7 @@ impl Parsed {
         Ok(out)
     }
 
-    /// The package-fields frame (installer_output documents it): the two `<uses-library>` lists, isForceQueryable, then the `<queries>` packages, providers and intents.
+    /// The package-fields frame (installer_output documents it): the two `<uses-library>` lists, isForceQueryable, the `<queries>` packages, providers and intents, then the `<protected-broadcast>`s.
     fn package_fields(&self, vm: &Vm, out: &mut Vec<u8>) -> Result<()> {
         let android_package = vm.find_class(c"com/android/server/pm/pkg/AndroidPackage")?;
         let parcel_class = vm.find_class(c"android/os/Parcel")?;
@@ -299,6 +299,14 @@ impl Parsed {
         )?;
         let query_intents =
             vm.call_object(self.pkg, get, &[], "AndroidPackage.getQueriesIntents")?;
+        let get = vm.method(
+            android_package,
+            c"getProtectedBroadcasts",
+            c"()Ljava/util/List;",
+            false,
+        )?;
+        let protected_broadcasts =
+            vm.call_object(self.pkg, get, &[], "AndroidPackage.getProtectedBroadcasts")?;
         let bytes = marshal(vm, |parcel| {
             for list in &lists {
                 vm.call_void_with(
@@ -329,6 +337,14 @@ impl Parsed {
                 write_typed,
                 &[JValue { l: query_intents }],
                 "Parcel.writeTypedList",
+            )?;
+            vm.call_void_with(
+                parcel,
+                write,
+                &[JValue {
+                    l: protected_broadcasts,
+                }],
+                "Parcel.writeStringList",
             )
         })?;
         write_frame(out, Kind::PackageFields, &bytes).context("frame")

@@ -2,12 +2,12 @@
 //! Derived from the Android Open Source Project: frameworks/base/services/core/java/com/android/server/am/BroadcastController.java, BroadcastSkipPolicy.java, frameworks/base/core/java/android/content/IntentFilter.java,
 //! frameworks/base/core/java/android/app/ActivityManager.java (checkComponentPermission).
 //! Broadcast policy, P1 subset, no binder: runtime receivers (BroadcastController.mRegisteredReceivers / ReceiverList / BroadcastFilter), the sticky store (mStickyBroadcasts), intent-filter matching,
-//! the register-time export flags, the per-receiver skip rules, and the per-process FIFO of deliveries waiting for a cold-started process to attach. Generic over the receiver handle `R`, the intent `I`
-//! and the queued job `J`, so the binder side (activity.rs, broadcast_queue.rs) keeps its types and these rules are unit-tested without the converter.
-//! Lives under the activity service's state lock; nothing here calls out.
+//! the sender's first-line check (protected broadcasts), the register-time export flags, the per-receiver skip rules, and the per-process FIFO of deliveries waiting for a cold-started process to attach.
+//! Generic over the receiver handle `R`, the intent `I` and the queued job `J`, so the binder side (activity.rs, broadcast_queue.rs) keeps its types and these rules are unit-tested without the converter.
+//! Lives under the activity service's state lock; nothing here calls out. Whether an action is protected is the caller's answer (packages.rs `Packages::is_protected_broadcast`).
 //! Not modelled (P2 or later): ordered broadcasts, priorities, implicit manifest receivers (the sysconfig allow list applies there: BroadcastController.java:1100-1106 adds FLAG_RECEIVER_INCLUDE_BACKGROUND for
 //! SystemConfig.getAllowImplicitBroadcasts actions, BroadcastSkipPolicy.disallowBackgroundStart:347-354 skips the rest at :241; an explicit-component broadcast never hits it), app ops, instant apps,
-//! BroadcastOptions, multi-user beyond USER_ALL + user 0, the protected-broadcast list.
+//! BroadcastOptions, multi-user beyond USER_ALL + user 0, ACTION_CLOSE_SYSTEM_DIALOGS' checkCanCloseSystemDialogs (:1391-1398).
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -350,32 +350,87 @@ fn mime_matches(filter_type: &str, t: &str) -> bool {
     }
 }
 
-/// The export decision of registerReceiverWithFeatureTraced (:428-472).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Export {
-    pub exported: bool,
-    /// Neither flag given for a receiver at targetSdk >= 34: AOSP throws SecurityException (:457-460) unless every action is a protected broadcast (`isProtectedBroadcast`). The protected-broadcast list is not
-    /// loaded, so the registration is taken as exported (the pre-34 default) and the caller counts it.
-    pub flag_missing_unchecked: bool,
+/// Process.ROOT_UID, SYSTEM_UID, PHONE_UID, BLUETOOTH_UID, NFC_UID, SE_UID, NETWORK_STACK_UID (Process.java:84-234): the app ids broadcastIntentLocked counts as the system (:1043-1053).
+const SYSTEM_SENDER_APP_IDS: [u32; 7] = [0, 1000, 1001, 1002, 1027, 1068, 1073];
+/// AppWidgetManager.ACTION_APPWIDGET_CONFIGURE / ACTION_APPWIDGET_UPDATE (AppWidgetManager.java:205, :361): not protected, but limited to the sender's own package.
+const APPWIDGET_OWN_PACKAGE_ONLY: [&str; 2] = [
+    "android.appwidget.action.APPWIDGET_CONFIGURE",
+    "android.appwidget.action.APPWIDGET_UPDATE",
+];
+/// Intent.FLAG_RECEIVER_FROM_SHELL (Intent.java:7673): kept only for a root or shell caller (verifyBroadcastLocked:1907-1917).
+pub const FLAG_RECEIVER_FROM_SHELL: i32 = 0x0040_0000;
+
+/// broadcastIntentLocked's `isCallerSystem` (:1043-1056): one of the system app ids, else a persistent app's process (ProcessList.java:3447-3454: FLAG_SYSTEM | FLAG_PERSISTENT, user 0, its main process).
+pub fn is_caller_system(uid: u32, persistent: bool) -> bool {
+    SYSTEM_SENDER_APP_IDS.contains(&permission::app_id(uid)) || persistent
 }
 
-/// Both flags: IllegalArgumentException (:429-434). No flag: exported, whether the receiver is null (a sticky read, :454-455) or the rule above was not checked.
-pub fn register_export(flags: i32, has_receiver: bool, target_sdk: i32) -> Result<Export, String> {
+/// broadcastIntentLocked's first-line sender check (:1031-1093), before the sticky rules: a caller that is not the system may not send a protected action (SecurityException), and may send
+/// APPWIDGET_CONFIGURE / UPDATE only to its own package. Ok(Some(p)) = the intent is limited to package `p` (intent.setPackage); `package` = the caller's package (callerApp.info.packageName).
+pub fn sender_check(
+    action: Option<&str>,
+    protected: bool,
+    pid: i32,
+    uid: u32,
+    package: Option<&str>,
+    persistent: bool,
+    component_package: Option<&str>,
+) -> Result<Option<String>, String> {
+    if is_caller_system(uid, persistent) {
+        return Ok(None);
+    }
+    let action_text = action.unwrap_or("null");
+    if protected {
+        return Err(format!(
+            "Permission Denial: not allowed to send broadcast {action_text} from pid={pid}, uid={uid}"
+        ));
+    }
+    if !action.is_some_and(|a| APPWIDGET_OWN_PACKAGE_ONLY.contains(&a)) {
+        return Ok(None);
+    }
+    let Some(package) = package else {
+        return Err(format!(
+            "Permission Denial: not allowed to send broadcast {action_text} from unknown caller."
+        ));
+    };
+    match component_package {
+        Some(target) if target != package => Err(format!(
+            "Permission Denial: not allowed to send broadcast {action_text} to {target} from {package}"
+        )),
+        Some(_) => Ok(None),
+        None => Ok(Some(package.to_owned())),
+    }
+}
+
+/// Why registerReceiverWithFeatureTraced refuses the export flags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportRefusal {
+    IllegalArgument(String),
+    Security(String),
+}
+
+/// The export decision of registerReceiverWithFeatureTraced (:428-472); Ok = exported. `only_protected` = the filter names actions and every one is protected (:376-405: an action-less filter
+/// checks a null action, never protected). Both flags: IllegalArgumentException (:429-434). Neither flag: exported for a null receiver (a sticky read, :454-455) or a filter of only protected actions
+/// (:470-472); else at targetSdk >= 34 SecurityException (:456-460), below it exported (:462-465).
+pub fn register_export(
+    flags: i32,
+    has_receiver: bool,
+    target_sdk: i32,
+    only_protected: bool,
+    package: &str,
+) -> Result<bool, ExportRefusal> {
     if flags & RECEIVER_EXPORTED != 0 && flags & RECEIVER_NOT_EXPORTED != 0 {
-        return Err(
+        return Err(ExportRefusal::IllegalArgument(
             "Receiver can't specify both RECEIVER_EXPORTED and RECEIVER_NOT_EXPORTEDflag".into(),
-        );
+        ));
     }
-    if flags & (RECEIVER_EXPORTED | RECEIVER_NOT_EXPORTED) == 0 {
-        return Ok(Export {
-            exported: true,
-            flag_missing_unchecked: has_receiver && target_sdk >= EXPLICIT_EXPORT_REQUIRED_SDK,
-        });
+    let defined = flags & (RECEIVER_EXPORTED | RECEIVER_NOT_EXPORTED) != 0;
+    if !defined && !only_protected && has_receiver && target_sdk >= EXPLICIT_EXPORT_REQUIRED_SDK {
+        return Err(ExportRefusal::Security(format!(
+            "{package}: One of RECEIVER_EXPORTED or RECEIVER_NOT_EXPORTED should be specified when a receiver isn't being registered exclusively for system broadcasts"
+        )));
     }
-    Ok(Export {
-        exported: flags & RECEIVER_EXPORTED != 0,
-        flag_missing_unchecked: false,
-    })
+    Ok(flags & RECEIVER_NOT_EXPORTED == 0)
 }
 
 /// ActivityManager.checkComponentPermission:5226-5258 (no isolated uids exist): root / system, then the owning app, then exported, then the permission.
@@ -1025,35 +1080,117 @@ mod tests {
 
     #[test]
     fn export_flags_follow_register_receiver() {
-        assert!(register_export(RECEIVER_EXPORTED | RECEIVER_NOT_EXPORTED, true, 36).is_err());
+        assert!(matches!(
+            register_export(
+                RECEIVER_EXPORTED | RECEIVER_NOT_EXPORTED,
+                true,
+                36,
+                true,
+                "p"
+            ),
+            Err(ExportRefusal::IllegalArgument(_))
+        ));
         assert_eq!(
-            register_export(RECEIVER_NOT_EXPORTED, true, 36),
-            Ok(Export {
-                exported: false,
-                flag_missing_unchecked: false
-            })
+            register_export(RECEIVER_NOT_EXPORTED, true, 36, false, "p"),
+            Ok(false)
+        );
+        // BroadcastController.java:457-460: neither flag at targetSdk 34+, a receiver, an unprotected action
+        assert_eq!(
+            register_export(0, true, 36, false, "p.a"),
+            Err(ExportRefusal::Security(
+                "p.a: One of RECEIVER_EXPORTED or RECEIVER_NOT_EXPORTED should be specified when a receiver isn't being registered exclusively for system broadcasts".into()
+            ))
+        );
+        // no flag needed: only protected actions (:470-472), a sticky read (null receiver, :454-455), a pre-34 app (:462-465)
+        assert_eq!(register_export(0, true, 36, true, "p"), Ok(true));
+        assert_eq!(
+            register_export(RECEIVER_NOT_EXPORTED, true, 36, true, "p"),
+            Ok(false)
+        );
+        assert_eq!(register_export(0, false, 36, false, "p"), Ok(true));
+        assert_eq!(register_export(0, true, 33, false, "p"), Ok(true));
+    }
+
+    #[test]
+    fn protected_actions_are_refused_to_non_system_senders() {
+        const LOW: &str = "android.intent.action.BATTERY_LOW";
+        // BroadcastController.java:1061-1067: the message names the action, pid and uid
+        assert_eq!(
+            sender_check(Some(LOW), true, 42, 10_123, Some("p.a"), false, None),
+            Err(
+                "Permission Denial: not allowed to send broadcast android.intent.action.BATTERY_LOW from pid=42, uid=10123"
+                    .into()
+            )
+        );
+        // :1044-1053: root, system, phone, bluetooth, nfc, se, network stack, by app id; a persistent app (:1055)
+        for uid in [0, 1000, 1001, 1002, 1027, 1068, 1073, 100_000 + 1000] {
+            assert_eq!(
+                sender_check(Some(LOW), true, 1, uid, None, false, None),
+                Ok(None),
+                "{uid}"
+            );
+        }
+        assert_eq!(
+            sender_check(Some(LOW), true, 1, 10_123, Some("p.a"), true, None),
+            Ok(None)
+        );
+        // shell (2000) is not a system sender
+        assert!(sender_check(Some(LOW), true, 1, 2000, None, false, None).is_err());
+        assert_eq!(
+            sender_check(Some("p.X"), false, 1, 10_123, Some("p.a"), false, None),
+            Ok(None)
         );
         assert_eq!(
-            register_export(0, true, 36),
-            Ok(Export {
-                exported: true,
-                flag_missing_unchecked: true
-            })
+            sender_check(None, false, 1, 10_123, Some("p.a"), false, None),
+            Ok(None)
         );
-        // a sticky read (null receiver) and a pre-34 app need no flag
+    }
+
+    #[test]
+    fn appwidget_actions_stay_in_the_senders_package() {
+        const UPDATE: &str = "android.appwidget.action.APPWIDGET_UPDATE";
+        // BroadcastController.java:1069-1093: no package = refused, a foreign component = refused, no component = limited to the caller's package
         assert_eq!(
-            register_export(0, false, 36),
-            Ok(Export {
-                exported: true,
-                flag_missing_unchecked: false
-            })
+            sender_check(Some(UPDATE), false, 1, 10_123, Some("p.a"), false, None),
+            Ok(Some("p.a".into()))
         );
         assert_eq!(
-            register_export(0, true, 33),
-            Ok(Export {
-                exported: true,
-                flag_missing_unchecked: false
-            })
+            sender_check(
+                Some(UPDATE),
+                false,
+                1,
+                10_123,
+                Some("p.a"),
+                false,
+                Some("p.a")
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            sender_check(
+                Some(UPDATE),
+                false,
+                1,
+                10_123,
+                Some("p.a"),
+                false,
+                Some("p.b")
+            ),
+            Err(
+                "Permission Denial: not allowed to send broadcast android.appwidget.action.APPWIDGET_UPDATE to p.b from p.a"
+                    .into()
+            )
+        );
+        assert_eq!(
+            sender_check(Some(UPDATE), false, 1, 10_123, None, false, None),
+            Err(
+                "Permission Denial: not allowed to send broadcast android.appwidget.action.APPWIDGET_UPDATE from unknown caller."
+                    .into()
+            )
+        );
+        assert_eq!(
+            sender_check(Some(UPDATE), false, 1, 1000, None, false, None),
+            Ok(None)
         );
     }
 

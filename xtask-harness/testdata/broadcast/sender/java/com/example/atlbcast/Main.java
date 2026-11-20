@@ -63,6 +63,7 @@ public class Main extends Activity {
         }, new IntentFilter(DONE), null, new Handler(doneThread.getLooper()), Context.RECEIVER_EXPORTED);
 
         sendBroadcast(new Intent(EXPLICIT).setComponent(new ComponentName("com.example.atlbcastrecv", "com.example.atlbcastrecv.Recv")));
+        protectedBroadcasts(app);
         Log.i(TAG, "onCreate done");
         // the not-exported receiver must still be registered when the PING comes: since 3be29e97 a finished last activity ends this process (window-close-esc plan, point 4), and Theme.NoDisplay
         // needs finish() before onResume, so the wait is here
@@ -72,5 +73,44 @@ public class Main extends Activity {
             Log.i(TAG, "done interrupted");
         }
         finish();
+    }
+
+    /**
+     * The protected-broadcast sender rules (BroadcastController.broadcastIntentLocked:1031-1093; core/res AndroidManifest.xml:69 BATTERY_CHANGED, :71 BATTERY_LOW): this app is not the system, so a
+     * protected action is a SecurityException, sticky or not (it holds BROADCAST_STICKY: the protected check comes first); its fake BATTERY_CHANGED stores nothing, so registerReceiver(null, ..) answers
+     * the system's own (the battery service's sticky, its level the host's). Registering for only protected actions needs no export flag at targetSdk 36 (:470-472); an unprotected action without one throws (:457-460).
+     */
+    void protectedBroadcasts(Context app) {
+        try {
+            sendBroadcast(new Intent(Intent.ACTION_BATTERY_LOW));
+            Log.i(TAG, "protected send: delivered");
+        } catch (SecurityException e) {
+            Log.i(TAG, "protected send denied: " + e.getMessage());
+        }
+        try {
+            sendStickyBroadcast(new Intent(Intent.ACTION_BATTERY_CHANGED).putExtra("level", 1));
+            Log.i(TAG, "protected sticky: stored");
+        } catch (SecurityException e) {
+            Log.i(TAG, "protected sticky denied: " + e.getMessage());
+        }
+        Intent battery = app.registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+        Log.i(TAG, "battery sticky level=" + (battery == null ? "none" : String.valueOf(battery.getIntExtra("level", -1))));
+        BroadcastReceiver ignore = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context c, Intent i) {}
+        };
+        try {
+            app.registerReceiver(ignore, new IntentFilter(Intent.ACTION_BATTERY_LOW));
+            Log.i(TAG, "protected-only register without flag: ok");
+        } catch (SecurityException e) {
+            Log.i(TAG, "protected-only register without flag denied: " + e.getMessage());
+        }
+        try {
+            app.registerReceiver(ignore, new IntentFilter(PING + ".UNFLAGGED"));
+            Log.i(TAG, "unflagged register: ok");
+        } catch (SecurityException e) {
+            Log.i(TAG, "unflagged register denied: " + e.getMessage());
+        }
+        app.unregisterReceiver(ignore);
     }
 }

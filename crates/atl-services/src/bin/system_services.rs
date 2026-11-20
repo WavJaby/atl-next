@@ -30,7 +30,7 @@ use atl_services::ui_agents::UiAgents;
 use atl_services_types::compositor_registry;
 use atl_services_types::display_model::DisplayModel;
 use atl_services_types::native_libs::SupportedAbi;
-use atl_services_types::packages::{Library, PermissionDecl};
+use atl_services_types::packages::{Library, PlatformManifest};
 use atl_services_types::system_config::SystemConfig;
 use binder::{BinderFeatures, ProcessState};
 use clap::Parser;
@@ -46,9 +46,10 @@ struct Args {
     /// A device ABI with its instruction set (repeat, preferred first): `<abi>=<isa>` (ro.product.cpu.abilist with arches.toml row keys).
     #[arg(long = "abi", value_parser = parse_abi)]
     abis: Vec<SupportedAbi>,
-    /// framework-res's permission definitions: a JSON array of `PermissionDecl` (the grant rule's platform half). Omitted: no platform permission is granted.
+    /// framework-res's manifest as a JSON `PlatformManifest`: its permission definitions (the grant rule's platform half) and protected broadcasts. Omitted: no platform permission is granted and only
+    /// system packages' broadcasts are protected.
     #[arg(long)]
-    platform_permissions: Option<PathBuf>,
+    platform_manifest: Option<PathBuf>,
     /// A shared library an app may `<uses-library>`: `<name>=<jar path as the app processes see it>[,<dependency name>...]` (repeat). SystemConfig's `<library name file dependency>`.
     #[arg(long = "shared-library", value_parser = Library::parse_arg)]
     shared_libraries: Vec<(String, Library)>,
@@ -244,13 +245,15 @@ fn main() -> Result<()> {
             bail!("shared library {name}: given by --shared-library and by a permission file");
         }
     }
-    let packages = Arc::new(Packages::new(list, libraries));
-    // the permission states every service checks callers against: framework-res's definitions first, then the packages' (permission::initial_states, then runtime grants)
-    let platform_permissions: Vec<PermissionDecl> = match &a.platform_permissions {
+    let platform: PlatformManifest = match &a.platform_manifest {
         Some(p) => read_json(p)?,
-        None => Vec::new(),
+        None => PlatformManifest::default(),
     };
-    let permissions = Arc::new(Permissions::new(&packages, &platform_permissions));
+    let packages = Arc::new(
+        Packages::new(list, libraries).with_platform_broadcasts(platform.protected_broadcasts),
+    );
+    // the permission states every service checks callers against: framework-res's definitions first, then the packages' (permission::initial_states, then runtime grants)
+    let permissions = Arc::new(Permissions::new(&packages, &platform.permissions));
     ProcessState::start_thread_pool();
     // the UI agents the registry takes in REGISTER, read by the window service at each window's first relayout
     let agents = Arc::new(UiAgents::default());

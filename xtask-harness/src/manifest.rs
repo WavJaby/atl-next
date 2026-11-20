@@ -10,7 +10,9 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-use atl_services_types::packages::{PermissionDecl, SCREEN_ORIENTATION_UNSPECIFIED};
+use atl_services_types::packages::{
+    PermissionDecl, PlatformManifest, SCREEN_ORIENTATION_UNSPECIFIED,
+};
 
 use crate::host_art;
 
@@ -722,10 +724,22 @@ fn gl_es_version_of(text: &str) -> Result<Option<i64>> {
     Ok(best)
 }
 
-/// The permissions `apk` defines (framework-res: the platform's), through `aapt2`; only `<permission>` is read, so a manifest without the app fields (framework-res) parses.
-pub fn read_permissions(aapt2: &Path, apk: &Path) -> Result<Vec<PermissionDecl>> {
-    permissions(&parse_tree(&dump(aapt2, apk)?)?)
-        .with_context(|| format!("the permissions of {}", apk.display()))
+/// The platform manifest of framework-res `apk`, through `aapt2`: only `<permission>` and `<protected-broadcast>` are read, so a manifest without the app fields parses.
+pub fn read_platform(aapt2: &Path, apk: &Path) -> Result<PlatformManifest> {
+    platform(&parse_tree(&dump(aapt2, apk)?)?)
+        .with_context(|| format!("the platform manifest of {}", apk.display()))
+}
+
+/// The `<permission>`s and the `<protected-broadcast android:name>`s (ParsingPackageUtils.parseProtectedBroadcast: a nameless one is skipped), in manifest order.
+fn platform(root: &Element) -> Result<PlatformManifest> {
+    Ok(PlatformManifest {
+        permissions: permissions(root)?,
+        protected_broadcasts: root
+            .children("protected-broadcast")
+            .filter_map(|e| e.attr("name"))
+            .map(str::to_owned)
+            .collect(),
+    })
 }
 
 #[cfg(test)]
@@ -1281,6 +1295,43 @@ mod tests {
                 ("exported".to_owned(), true),
                 ("hardwareAccelerated".to_owned(), false)
             ])
+        );
+    }
+
+    /// aapt2's `dump xmltree` of framework-res.apk (base b75bb52a, 2026-11-21), cut to two `<protected-broadcast>`s and one `<permission>`; core/res/AndroidManifest.xml:29, :69, :840. The full dump has 682
+    /// protected broadcasts, as many as the source has `<protected-broadcast` lines.
+    const PLATFORM: &str = r#"N: android=http://schemas.android.com/apk/res/android (line=20)
+  E: manifest (line=20)
+    A: http://schemas.android.com/apk/res/android:sharedUserId(0x0101000b)="android.uid.system" (Raw: "android.uid.system")
+    A: coreApp=true
+    A: package="android" (Raw: "android")
+      E: protected-broadcast (line=29)
+        A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.intent.action.SCREEN_OFF" (Raw: "android.intent.action.SCREEN_OFF")
+      E: protected-broadcast (line=69)
+        A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.intent.action.BATTERY_CHANGED" (Raw: "android.intent.action.BATTERY_CHANGED")
+      E: permission (line=840)
+        A: http://schemas.android.com/apk/res/android:label(0x01010001)=@0x01040856
+        A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.READ_CONTACTS" (Raw: "android.permission.READ_CONTACTS")
+        A: http://schemas.android.com/apk/res/android:protectionLevel(0x01010009)=0x00000001
+"#;
+
+    #[test]
+    fn the_platform_manifest_reads_protected_broadcasts_and_permissions() {
+        let p = platform(&parse_tree(PLATFORM).expect("tree")).expect("platform");
+        assert_eq!(
+            p.protected_broadcasts,
+            [
+                "android.intent.action.SCREEN_OFF",
+                "android.intent.action.BATTERY_CHANGED"
+            ]
+        );
+        // READ_CONTACTS is dangerous (PermissionInfo.PROTECTION_DANGEROUS = 1)
+        assert_eq!(
+            p.permissions,
+            [PermissionDecl {
+                name: "android.permission.READ_CONTACTS".into(),
+                protection_level: 1
+            }]
         );
     }
 }

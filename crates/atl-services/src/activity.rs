@@ -53,7 +53,9 @@ use binder::{
 
 use crate::activity_start::{self, Refusal};
 use crate::activity_task::{ActivityTasks, Back};
-use crate::broadcast::{self, BroadcastFilter, Broadcasts, IntentKey, StickyRefusal};
+use crate::broadcast::{
+    self, BroadcastFilter, Broadcasts, ExportRefusal, IntentKey, StickyRefusal,
+};
 use crate::broadcast_queue::{self, Job};
 use crate::config_diff::{self, Config, Delivery};
 use crate::memory_levels;
@@ -896,12 +898,15 @@ impl ActivityManager {
         }
     }
 
-    /// broadcastIntentWithFeature's body for its binder caller `caller` = (pid, uid): verifyBroadcastLocked's Intent checks, then [`Self::send_broadcast`] as that caller.
-    /// The binder method passes only ThreadState's calling identity here: an app never reaches the system identity of [`Self::broadcast_as_system`]. `ordered` = serialized or a resultTo.
+    /// broadcastIntentWithFeature's body for its binder caller `caller` = (pid, uid) whose attached process is `app` = (package, persistent) ([`Inner::caller_app`]): verifyBroadcastLocked's Intent
+    /// checks (FLAG_RECEIVER_FROM_SHELL dropped unless root or shell, :1907-1917), broadcastIntentLocked's sender check (:1031-1093, broadcast::sender_check: a protected action from a non-system caller is a
+    /// SecurityException), then [`Self::send_broadcast`] as that caller. The binder method passes only ThreadState's calling identity here: an app never reaches the system identity of
+    /// [`Self::broadcast_as_system`], which is the system sender and skips the check (isCallerSystem would pass it). `ordered` = serialized or a resultTo.
     #[allow(clippy::too_many_arguments)]
     fn broadcast_from_caller(
         &self,
         caller: (i32, u32),
+        app: (Option<String>, bool),
         intent: Option<&Intent>,
         resolved_type: Option<&str>,
         ordered: bool,
@@ -930,8 +935,33 @@ impl ActivityManager {
                 "broadcastIntentWithFeature ordered / resultTo (P2: sent unordered, no result)",
             );
         }
+        let (pid, uid) = caller;
+        let mut intent = std::borrow::Cow::Borrowed(intent);
+        if intent.flags & broadcast::FLAG_RECEIVER_FROM_SHELL != 0
+            && ![ROOT_UID, SHELL_UID].contains(&uid)
+        {
+            intent.to_mut().flags &= !broadcast::FLAG_RECEIVER_FROM_SHELL;
+        }
+        let (package, persistent) = app;
+        let action = intent.action.as_deref();
+        match broadcast::sender_check(
+            action,
+            self.inner.packages.is_protected_broadcast(action),
+            pid,
+            uid,
+            package.as_deref(),
+            persistent,
+            intent.component.as_ref().map(|c| c.package.as_str()),
+        ) {
+            Ok(None) => {}
+            Ok(Some(own)) => intent.to_mut().package = Some(own),
+            Err(msg) => {
+                log(format_args!("{msg}"));
+                return Err(security(&msg));
+            }
+        }
         self.send_broadcast(
-            intent,
+            &intent,
             resolved_type,
             caller.0,
             caller.1,
@@ -1730,6 +1760,29 @@ impl Inner {
                     .is_some_and(|a| a.thread.as_binder() == binder)
             })
             .map(|r| r.pid)
+    }
+
+    /// broadcastIntentWithFeature's callerApp (BroadcastController.java:722, getRecordForAppLOSP) as broadcastIntentLocked reads it: its package (callerPackage, :741) and whether the process is
+    /// persistent (ProcessList.java:3447-3454: FLAG_SYSTEM | FLAG_PERSISTENT, user 0, the application's own process). (None, false) = no attached process for `caller`.
+    fn caller_app(
+        &self,
+        caller: Option<&Strong<dyn IApplicationThread>>,
+    ) -> (Option<String>, bool) {
+        /// ApplicationInfo.FLAG_SYSTEM | FLAG_PERSISTENT (ApplicationInfo.java:189, :213; ActivityManagerService.PERSISTENT_MASK)
+        const PERSISTENT_MASK: i32 = crate::packages::FLAG_SYSTEM | 1 << 3;
+        let st = self.state();
+        let Some(rec) = caller
+            .and_then(|t| Self::record_for_thread(&st, t))
+            .and_then(|pid| st.processes.iter().find(|r| r.pid == pid))
+        else {
+            return (None, false);
+        };
+        let persistent = self.packages.by_name(&rec.package).is_some_and(|p| {
+            p.app().flags & PERSISTENT_MASK == PERSISTENT_MASK
+                && permission::user_id(rec.uid) == 0
+                && p.process_name() == rec.process_name
+        });
+        (Some(rec.package.clone()), persistent)
     }
 }
 
@@ -2686,15 +2739,16 @@ impl IActivityManager for ActivityManager {
         Ok(())
     }
 
-    /// ActivityManagerService.broadcastIntentWithFeature:14402 -> BroadcastController.broadcastIntentWithFeature:710-754: the Intent is verified as verifyBroadcastLocked does (:1878-1905: a null
-    /// Intent is a NullPointerException (`intent.getFlags()`), a file descriptor in the extras and FLAG_RECEIVER_BOOT_UPGRADE are IllegalArgumentExceptions), then broadcastIntentLocked:
+    /// ActivityManagerService.broadcastIntentWithFeature:14402 -> BroadcastController.broadcastIntentWithFeature:710-754: the Intent is verified as verifyBroadcastLocked does (:1878-1917: a null
+    /// Intent is a NullPointerException (`intent.getFlags()`), a file descriptor in the extras and FLAG_RECEIVER_BOOT_UPGRADE are IllegalArgumentExceptions, FLAG_RECEIVER_FROM_SHELL is dropped
+    /// unless the caller is root or shell), then broadcastIntentLocked: the sender check (:1031-1093, broadcast::sender_check: a protected action from a non-system caller is a SecurityException),
     /// a sticky is checked and stored (:1415-1495), an explicit component reaches its manifest receiver (:1516-1518, unless FLAG_RECEIVER_REGISTERED_ONLY), an intent without one the matching registered
     /// receivers (:1520-1545); each passes BroadcastSkipPolicy (broadcast.rs) and is queued for its process (BroadcastQueueImpl, broadcast_queue.rs). Result BROADCAST_SUCCESS.
     /// Not modelled, each counted when used: ordered delivery and `resultTo` (P2: sent unordered, no result), implicit manifest receivers (P2). Not modelled: the isolated-caller check (:715), the options
-    /// Bundle, excluded permissions / packages, app ops, protected-broadcast sender checks.
+    /// Bundle, excluded permissions / packages, app ops.
     fn r#broadcastIntentWithFeature(
         &self,
-        _caller: Option<&Strong<dyn IApplicationThread>>,
+        caller: Option<&Strong<dyn IApplicationThread>>,
         _calling_feature_id: Option<&str>,
         intent: Option<&Intent>,
         resolved_type: Option<&str>,
@@ -2722,6 +2776,7 @@ impl IActivityManager for ActivityManager {
                 ThreadState::get_calling_pid(),
                 ThreadState::get_calling_uid(),
             ),
+            self.inner.caller_app(caller),
             intent,
             resolved_type,
             serialized || result_to.is_some(),
@@ -2804,8 +2859,7 @@ impl IActivityManager for ActivityManager {
     /// (unknown: logged, null, :312-315); a caller package the process does not run is a SecurityException (:316-320; core uids, below 10000, are exempt: UserHandle.isCore). Then the export flags
     /// (:428-472, broadcast::register_export), the matching stickies (:378-395, :474-509), the first of which is returned; a null receiver stops there (the sticky read). Else the registration is kept
     /// (:530-579) and every matching sticky is queued to it as an initial sticky (:582-604); the first one the receiver may see (exported, or the sticky's sender is its uid / system) is returned.
-    /// The filter was decoded, so a filter with parts the codec does not model was refused before it got here. Not modelled: the protected-broadcast list (a missing export flag at targetSdk >= 34 is
-    /// counted, not refused), instant apps, MAX_RECEIVERS_ALLOWED_PER_APP, priorities.
+    /// The filter was decoded, so a filter with parts the codec does not model was refused before it got here. Not modelled: instant apps, MAX_RECEIVERS_ALLOWED_PER_APP, priorities.
     fn r#registerReceiverWithFeature(
         &self,
         caller: Option<&Strong<dyn IApplicationThread>>,
@@ -2848,16 +2902,27 @@ impl IActivityManager for ActivityManager {
             .packages
             .by_name(&package)
             .map_or(0, |p| p.app().target_sdk_version);
-        let export = broadcast::register_export(flags, receiver.is_some(), target_sdk)
-            .map_err(|m| illegal_argument(&m))?;
-        if export.flag_missing_unchecked {
-            atl_diag::answered(
-                AM,
-                "registerReceiver without RECEIVER_EXPORTED / NOT_EXPORTED at targetSdk >= 34 (protected-broadcast list not loaded: taken as exported)",
-            );
-        }
-        let user = incoming_user(user_id);
         let filter = filter_of(filter);
+        let only_protected = !filter.actions.is_empty()
+            && filter
+                .actions
+                .iter()
+                .all(|a| inner.packages.is_protected_broadcast(Some(a)));
+        let exported = broadcast::register_export(
+            flags,
+            receiver.is_some(),
+            target_sdk,
+            only_protected,
+            &package,
+        )
+        .map_err(|e| match e {
+            ExportRefusal::IllegalArgument(m) => illegal_argument(&m),
+            ExportRefusal::Security(m) => {
+                log(format_args!("{m}"));
+                security(&m)
+            }
+        })?;
+        let user = incoming_user(user_id);
         let stickies = st.broadcasts.stickies(&filter, user);
         let Some(receiver) = receiver else {
             return Ok(stickies.into_iter().next().map(|s| s.intent));
@@ -2866,7 +2931,7 @@ impl IActivityManager for ActivityManager {
             filter,
             package,
             required_permission: required_permission.map(str::to_owned),
-            exported: export.exported,
+            exported,
         };
         let handle = ReceiverHandle(receiver.clone());
         if !st
@@ -2879,7 +2944,7 @@ impl IActivityManager for ActivityManager {
         let mut first = None;
         for s in stickies {
             if first.is_none()
-                && (export.exported
+                && (exported
                     || s.calling_uid == uid
                     || permission::is_system_or_root(s.calling_uid))
             {
@@ -3230,6 +3295,7 @@ mod tests {
         };
         let sent = am.broadcast_from_caller(
             (4242, APP_UID),
+            (None, false),
             Some(&intent),
             None,
             false,

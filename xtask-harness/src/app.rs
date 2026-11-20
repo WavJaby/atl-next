@@ -877,6 +877,15 @@ fn service_want(service: &str, fixed: Option<&str>) -> String {
 /// Wireless (4) (BatteryService.plugType's order); charging = BatteryStatsImpl's state at a fresh start: false only on battery (unplugged with a known status).
 /// No battery (the WSL dev host): BatteryMonitor's initHealthInfo answer -- present false, level 0, status UNKNOWN 1 -- and CAPACITY unsupported: Health::getCapacity EX_UNSUPPORTED_OPERATION -> getProperty -1 ->
 /// BatteryManager.queryProperty Long.MIN_VALUE -> getIntProperty Integer.MIN_VALUE (targetSdk >= P). Scale BatteryService.BATTERY_SCALE 100.
+/// The EXTRA_LEVEL of the system's sticky ACTION_BATTERY_CHANGED on this host: [`battery_want`]'s level (BatteryService.sendBatteryChangedIntentLocked puts batteryLevel).
+pub(crate) fn battery_level() -> String {
+    battery_want()
+        .split(' ')
+        .find_map(|kv| kv.strip_prefix("level="))
+        .unwrap_or_default()
+        .to_owned()
+}
+
 fn battery_want() -> String {
     let read = |p: &Path| std::fs::read_to_string(p).map(|s| s.trim().to_owned()).ok();
     let (mut battery, mut plugged) = (None, 0);

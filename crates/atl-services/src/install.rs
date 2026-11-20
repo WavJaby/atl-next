@@ -186,6 +186,12 @@ impl Parsed {
             libraries: crate::installed::with_implicit_libraries(installed.libraries, target_sdk),
             force_queryable: installed.force_queryable,
             queries: installed.queries,
+            // ScanPackageUtils.java:936-939: a non-system package cannot mark any broadcast as protected
+            protected_broadcasts: if flags & crate::packages::FLAG_SYSTEM != 0 {
+                installed.protected_broadcasts
+            } else {
+                Vec::new()
+            },
             uid,
             instruction_set: isa,
         }

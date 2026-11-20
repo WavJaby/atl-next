@@ -136,6 +136,8 @@ pub struct Installed {
     /// manifest `forceQueryable` (AndroidPackage.isForceQueryable)
     pub force_queryable: bool,
     pub queries: Queries,
+    /// manifest `<protected-broadcast>`s (AndroidPackage.getProtectedBroadcasts), as parsed: the install keeps them for a system package only
+    pub protected_broadcasts: Vec<String>,
 }
 
 /// Why an output does not decode; `frame` is the frame's index.
@@ -170,6 +172,10 @@ pub enum DecodeError {
     },
     /// a `<queries>` list that is null or holds a null entry
     NullInQueries {
+        frame: usize,
+    },
+    /// a `<protected-broadcast>` list that is null or holds a null name
+    NullInProtectedBroadcasts {
         frame: usize,
     },
     /// an intents frame without a class name, with a null list or a null element
@@ -232,6 +238,10 @@ impl fmt::Display for DecodeError {
                 f,
                 "installer output: frame {frame}: null <queries> list or entry"
             ),
+            DecodeError::NullInProtectedBroadcasts { frame } => write!(
+                f,
+                "installer output: frame {frame}: null <protected-broadcast> list or name"
+            ),
             DecodeError::UnknownComponent { frame, kind, name } => {
                 write!(
                     f,
@@ -290,7 +300,16 @@ pub fn decode(data: &[u8]) -> Result<Installed, DecodeError> {
                     intents,
                     providers: strings(f.query_providers, frame)?,
                 };
-                if fields.replace((list, f.force_queryable, queries)).is_some() {
+                let protected = f
+                    .protected_broadcasts
+                    .ok_or(DecodeError::NullInProtectedBroadcasts { frame })?
+                    .into_iter()
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or(DecodeError::NullInProtectedBroadcasts { frame })?;
+                if fields
+                    .replace((list, f.force_queryable, queries, protected))
+                    .is_some()
+                {
                     return Err(DecodeError::SecondPackageFields { frame });
                 }
             }
@@ -312,7 +331,8 @@ pub fn decode(data: &[u8]) -> Result<Installed, DecodeError> {
         }
     }
     let package = package.ok_or(DecodeError::NoPackage)?;
-    let (libraries, force_queryable, queries) = fields.ok_or(DecodeError::NoPackageFields)?;
+    let (libraries, force_queryable, queries, protected_broadcasts) =
+        fields.ok_or(DecodeError::NoPackageFields)?;
     let intents = intents
         .into_iter()
         .map(|(frame, c)| {
@@ -333,6 +353,7 @@ pub fn decode(data: &[u8]) -> Result<Installed, DecodeError> {
         libraries,
         force_queryable,
         queries,
+        protected_broadcasts,
     })
 }
 
@@ -346,6 +367,7 @@ struct Fields {
     query_packages: StringList,
     query_providers: StringList,
     query_intents: Option<Vec<Option<Intent>>>,
+    protected_broadcasts: StringList,
 }
 
 enum Value {
@@ -366,6 +388,7 @@ fn read(p: &Parcel, kind: Kind) -> Result<Value, StatusCode> {
             query_packages: b.read()?,
             query_providers: b.read()?,
             query_intents: r_typed_list(b)?,
+            protected_broadcasts: b.read()?,
         }),
         _ => {
             let name: Option<String> = b.read()?;
@@ -467,12 +490,13 @@ mod tests {
         p.marshal().expect("marshal")
     }
 
-    /// A package-fields frame as the installer writes it: two string lists, forceQueryable, then the `<queries>` packages, providers and intents.
+    /// A package-fields frame as the installer writes it: two string lists, forceQueryable, the `<queries>` packages, providers and intents, then the `<protected-broadcast>`s.
     fn fields_bytes_with(
         required: &[&str],
         optional: &[&str],
         force_queryable: bool,
         queries: &Queries,
+        protected: &[&str],
     ) -> Vec<u8> {
         let list = |v: &[&str]| Some(v.iter().map(|s| Some((*s).to_owned())).collect::<Vec<_>>());
         let strings = |v: &[String]| Some(v.iter().map(|s| Some(s.clone())).collect::<Vec<_>>());
@@ -486,11 +510,30 @@ mod tests {
         p.write(&strings(&queries.providers))
             .expect("query providers");
         w_typed_list(&mut p.borrowed(), &Some(intents)).expect("query intents");
+        p.write(&list(protected)).expect("protected broadcasts");
         p.marshal().expect("marshal")
     }
 
     fn fields_bytes(required: &[&str], optional: &[&str], force_queryable: bool) -> Vec<u8> {
-        fields_bytes_with(required, optional, force_queryable, &Queries::default())
+        fields_bytes_with(
+            required,
+            optional,
+            force_queryable,
+            &Queries::default(),
+            &[],
+        )
+    }
+
+    #[test]
+    fn decodes_protected_broadcasts() {
+        let mut out = Vec::new();
+        write_frame(&mut out, Kind::Package, &package_bytes()).expect("frame");
+        let fields = fields_bytes_with(&[], &[], false, &Queries::default(), &["a.P", "a.Q"]);
+        write_frame(&mut out, Kind::PackageFields, &fields).expect("frame");
+        assert_eq!(
+            decode(&out).expect("decode").protected_broadcasts,
+            ["a.P", "a.Q"]
+        );
     }
 
     fn libraries_bytes(required: &[&str], optional: &[&str]) -> Vec<u8> {
@@ -524,7 +567,7 @@ mod tests {
         write_frame(
             &mut out,
             Kind::PackageFields,
-            &fields_bytes_with(&[], &[], false, &queries),
+            &fields_bytes_with(&[], &[], false, &queries, &[]),
         )
         .expect("frame");
         let got = decode(&out).expect("decode").queries;

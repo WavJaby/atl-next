@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Package-side plain types shared by atld, the services and xtask: the platform's permission definitions (framework-res, a JSON file the host forwards), SystemConfig's shared libraries
+//! Package-side plain types shared by atld, the services and xtask: the platform manifest (framework-res's permission definitions and protected broadcasts, a JSON file the host forwards), SystemConfig's shared libraries
 //! (`--shared-library`), and the ActivityInfo.screenOrientation values the services name. The installed packages themselves are the services' (atl-services `packages`: the installer's PackageInfo).
 
 use std::collections::BTreeMap;
@@ -23,6 +23,15 @@ pub const SCREEN_ORIENTATION_USER_PORTRAIT: i32 = 12;
 pub struct PermissionDecl {
     pub name: String,
     pub protection_level: u32,
+}
+
+/// What the services read of framework-res's manifest (package `android`, not scanned as a package: atl-services-types system_packages): what PMS would collect from it at scan.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlatformManifest {
+    /// `<permission>`s: the install-time grant rule's platform half
+    pub permissions: Vec<PermissionDecl>,
+    /// `<protected-broadcast android:name>`s (ParsingPackageUtils.parseProtectedBroadcast): PMS.mProtectedBroadcasts' platform part
+    pub protected_broadcasts: Vec<String>,
 }
 
 /// A shared library as SystemConfig reads it from `<library name file dependency>` (frameworks/base/data/etc/platform.xml: `android.test.runner` depends on `android.test.base:android.test.mock`).

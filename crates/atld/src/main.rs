@@ -165,10 +165,10 @@ struct Args {
     /// A device ABI with its instruction set (repeat, preferred first): `<abi>=<isa>` (arches.toml row key); forwarded to the services, which map primaryCpuAbi to the instruction set.
     #[arg(long = "abi", required = true)]
     abis: Vec<String>,
-    /// The platform's permission definitions (framework-res's `<permission>` elements): a JSON array of atl_services_types::packages::PermissionDecl, the install-time grant rule's platform half, forwarded to the services.
-    /// Omitted: only the packages' own definitions count, so no platform permission is granted.
+    /// framework-res's manifest as a JSON atl_services_types::packages::PlatformManifest (its `<permission>` and `<protected-broadcast>` elements), forwarded to the services.
+    /// Omitted: only the packages' own definitions count, so no platform permission is granted and only system packages' broadcasts are protected.
     #[arg(long)]
-    platform_permissions: Option<PathBuf>,
+    platform_manifest: Option<PathBuf>,
     /// liblog's ANDROID_LOG_TAGS for every app process.
     #[arg(long, default_value = "*:i")]
     log_tags: OsString,
@@ -2767,8 +2767,8 @@ fn run(a: &Args) -> Result<ExitCode> {
     for abi in &a.abis {
         services_args.extend(["--abi".into(), abi.into()]);
     }
-    if let Some(p) = &a.platform_permissions {
-        services_args.extend(["--platform-permissions".into(), p.into()]);
+    if let Some(p) = &a.platform_manifest {
+        services_args.extend(["--platform-manifest".into(), p.into()]);
     }
     for library in &libraries {
         services_args.extend(["--shared-library".into(), library.into()]);
@@ -2839,7 +2839,7 @@ fn run(a: &Args) -> Result<ExitCode> {
     for (host, _) in r.package_partitions() {
         services_spawn.mounts.push(ro_at_own_path(&host));
     }
-    if let Some(p) = &a.platform_permissions {
+    if let Some(p) = &a.platform_manifest {
         services_spawn.mounts.push(ro_at_own_path(p));
     }
     // sensorservice's source reads the machine's accelerometers (PlatformSensors), which the minimal root does not show: their sysfs and udev entries read-only, their char devices bound (the buffered tier)

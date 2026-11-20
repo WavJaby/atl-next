@@ -7,6 +7,7 @@
 //! - [`Kind::PackageFields`], once: the AndroidPackage fields PackageInfo does not carry. The `<uses-library>` lists as PackageImpl.writeToParcel writes them (:3202-3203): writeStringList of
 //!   getUsesLibraries (required), then of getUsesOptionalLibraries; then writeBoolean of isForceQueryable (manifest `forceQueryable`, read by AppsFilterImpl for system packages).
 //!   Then the `<queries>` (AppsFilterUtils): writeStringList of getQueriesPackages, writeStringList of getQueriesProviders (a Set, copied to an ArrayList), writeTypedList of getQueriesIntents (Intent parcels).
+//!   Then writeStringList of getProtectedBroadcasts (manifest `<protected-broadcast>`; the services keep it for a system package only).
 //!   No static or SDK library lists: no test row or fixture declares one.
 //!
 //! The frame layer only splits; atl-services decodes the parcels (`installed`).

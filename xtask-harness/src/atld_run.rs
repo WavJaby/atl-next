@@ -2149,17 +2149,17 @@ impl Runtime {
             written.push(file.clone());
             cmd.arg("--package").arg(file);
         }
-        // the platform's permission definitions, read from framework-res's manifest as an app's are (aapt2): atld's install grants from them
-        let platform = run.scratch.join("platform-permissions.json");
+        // framework-res's manifest, read as an app's is (aapt2): the install grants from its permission definitions, the broadcast sender check from its protected broadcasts
+        let platform = run.scratch.join("platform-manifest.json");
         std::fs::write(
             &platform,
-            serde_json::to_vec_pretty(&manifest::read_permissions(
+            serde_json::to_vec_pretty(&manifest::read_platform(
                 &self.apk.aapt2,
                 &self.framework_res,
             )?)?,
         )?;
         written.push(platform.clone());
-        cmd.arg("--platform-permissions").arg(platform);
+        cmd.arg("--platform-manifest").arg(platform);
         for (name, lib) in &run.libraries {
             cmd.arg("--shared-library").arg(lib.to_arg(name, &lib.file));
         }
