@@ -658,8 +658,9 @@ const START_STALE_RESULT_TO: Line = Line {
 /// clear-top: [A1 B1] + CLEAR_TOP A -> B1 finishes (Task.finishActivityAbove), the standard A1 finishes too without SINGLE_TOP (Task.clearTopActivities :1731-1736) and A2 is new
 /// (complyActivityFlags :2533-2537); A1 stopped under B1 never resumes again. clear-top-single-top: A1 is kept and gets onNewIntent before its resume (deliverNewIntent :2532; onResume follows
 /// onNewIntent, Activity.onNewIntent docs). single-top: the top A1 gets the intent (deliverToCurrentTopIfNeeded :2441-2483). no-history: B1 (NO_HISTORY) is finished where it would stop
-/// (ActivityRecord.stopIfPossible :6324), so C1's finish resumes A1. reorder-to-front: A1 moves above B1 with onNewIntent (complyActivityFlags :2553-2570, Task.moveActivityToFront), B1 resumes
-/// after A1 finishes. forward-result: B1's FORWARD_RESULT start moves A1's request 3 to C1 (executeRequest :1123-1136), so getCallingActivity of C1 is A and A1 gets C1's RESULT_OK (-1), not B1's.
+/// (ActivityRecord.stopIfPossible :6324), which runs only after C1's idle (ActivityTaskSupervisor.activityIdleInternal -> processStoppingAndFinishingActivities), so Flags.java
+/// holds C1's unwind until B1 is destroyed; C1's finish then resumes A1. reorder-to-front: A1 moves above B1 with onNewIntent (complyActivityFlags :2553-2570, Task.moveActivityToFront), B1 resumes
+/// after A1 finishes. forward-result: B1's FORWARD_RESULT start moves A1's request 3 to C1 (executeRequest :1123-1136), so getCallingActivity of C1 is A and A1 gets C1's RESULT_OK (-1), not B1's; B1 itself was started for A1's result, so its getCallingActivity is A too.
 /// refused-new-document (control, unchanged by the flags work): NEW_DOCUMENT needs a new Task, which ATL does not model: the start throws (START_CANCELED -96).
 const FLAG_LINES: [Line; 7] = [
     flag_line(
@@ -690,7 +691,7 @@ const FLAG_LINES: [Line; 7] = [
     flag_line(
         "flags-forward-result",
         "AtlTest: flags-forward-result: ",
-        "A1[c,r,s3:-1:C1,r,d] B1[c,r,d] C1[c<A,r,d]",
+        "A1[c,r,s3:-1:C1,r,d] B1[c<A,r,d] C1[c<A,r,d]",
     ),
     flag_line(
         "flags-refused-new-document",

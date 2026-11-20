@@ -73,6 +73,9 @@ public final class Flags {
     private static int index = -1;
     private static boolean unwinding;
     private static int live;
+    /** Live no-history instances, and the top that waits for them to be finished at their stop before it unwinds. */
+    private static int noHistoryLive;
+    private static Activity parked;
     private static final Map<String, Integer> COUNTS = new LinkedHashMap<>();
     private static final Map<String, StringBuilder> EVENTS = new LinkedHashMap<>();
 
@@ -107,6 +110,7 @@ public final class Flags {
     public static class Base extends Activity {
         private String id;
         private boolean resumedOnce;
+        private boolean noHistory;
 
         @Override
         protected void onCreate(Bundle savedInstanceState) {
@@ -119,6 +123,10 @@ public final class Flags {
             id = letter + n;
             EVENTS.put(id, new StringBuilder());
             live++;
+            noHistory = (getIntent().getFlags() & Intent.FLAG_ACTIVITY_NO_HISTORY) != 0;
+            if (noHistory) {
+                noHistoryLive++;
+            }
             ComponentName calling = getCallingActivity();
             record(id, calling == null ? "c" : "c<" + shortName(calling.getClassName()));
             setResult(RESULT_OK, new Intent().putExtra("from", id));
@@ -128,6 +136,12 @@ public final class Flags {
         protected void onResume() {
             super.onResume();
             record(id, "r");
+            if (unwinding && noHistoryLive > 0) {
+                // AOSP finishes a no-history record only at its stop, which waits for the new top's idle (ActivityTaskSupervisor.activityIdleInternal -> processStoppingAndFinishingActivities
+                // -> ActivityRecord.stopIfPossible); a finish inside onResume comes first and resumes it again. So the top waits for that finish before it unwinds.
+                parked = this;
+                return;
+            }
             if (unwinding) {
                 finish();
                 return;
@@ -182,6 +196,14 @@ public final class Flags {
             super.onDestroy();
             record(id, "d");
             live--;
+            if (noHistory) {
+                noHistoryLive--;
+                if (noHistoryLive == 0 && parked != null) {
+                    Activity top = parked;
+                    parked = null;
+                    top.finish();
+                }
+            }
             if (live == 0) {
                 StringBuilder line = new StringBuilder();
                 for (Map.Entry<String, StringBuilder> e : EVENTS.entrySet()) {
