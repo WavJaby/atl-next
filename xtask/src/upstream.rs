@@ -156,7 +156,10 @@ pub fn build(
     if !recipe.crates.is_empty() {
         cache.push(("RUST_BINDINGS", tc.rust_triple.to_owned()));
         env.push(("LIBCLANG_PATH", tc.libclang.as_os_str()));
-        env.push(("BINDGEN_EXTRA_CLANG_ARGS", std::ffi::OsStr::new(&bindgen_args)));
+        env.push((
+            "BINDGEN_EXTRA_CLANG_ARGS",
+            std::ffi::OsStr::new(&bindgen_args),
+        ));
     }
     let cache: Vec<(&str, &str)> = cache
         .iter()
