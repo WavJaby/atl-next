@@ -174,10 +174,10 @@ crates = ["atl-platform-ui-api", "atl-platform-ui-linux", "atl-platform-ui", "at
 exports = ["atl-platform-ui"]
 uses = ["compositor", "libgui-parcel", "gralloc", "scene-buffer", "platform-types", "generators", "layout"]
 
-# the WebView provider's JNI library libatl_webview.so (webview plan S4.1): natives of the java/webview-provider forwarders, Android semantics (default UA, refusals) over the platform layer's web engine; its JNIEnv table generated from jni.h
+# the WebView provider's JNI library libatl_webview.so (webview plan S4.1): natives of the java/webview-provider forwarders, Android semantics (default UA, refusals) over the platform layer's web engine; its JNIEnv table generated from jni.h; looper: engine events and results posted to the WebView's Looper (display-thread D5)
 [webview]
 crates = ["atl-webview"]
-uses = ["platform-ui", "diag", "generators"]
+uses = ["platform-ui", "diag", "generators", "looper"]
 
 [platform-ui.direct_link.gralloc]
 reason = "the facade's gate example (xtask test platform-ui) allocates real dma-bufs through gralloc's GBM backend (atl-gralloc-service), as the allocator service does: a dmabuf texture needs a real dma-buf, a memfd is refused"

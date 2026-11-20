@@ -3,12 +3,12 @@
 
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 
 use atl_platform_ui_api::abi::{
     self, BytesOut, Callback, CookieList, CookieView, EvalResultView, SendCallback, Str, UiVtable,
-    WebEventView, WebViewEntry, WebViewHandle, WebViewVtable, web_event,
+    WebEventView, WebViewEntry, WebViewVtable, web_event,
 };
 use atl_platform_ui_api::webview::{
     Cookie, CookiePolicy, InputClaim, LoadError, NavigationReply, NavigationRequest, PromptReply,
@@ -70,19 +70,14 @@ impl WebEngine for PlatformWebEngine {
         }
     }
 
-    fn create_view(events: Box<dyn FnMut(WebEvent)>) -> Result<PlatformWebView, WebViewError> {
+    fn create_view(
+        events: Box<dyn FnMut(WebEvent) + Send>,
+    ) -> Result<PlatformWebView, WebViewError> {
         let m = module()?;
-        // two sources, one sink: the engine module's events and the UI module's unhandled-key reports, both on the UI thread
-        let events = std::rc::Rc::new(std::cell::RefCell::new(events));
-        let unhandled_events = std::rc::Rc::clone(&events);
-        let unhandled_key =
-            Callback::new(move |ns: &i64| match unhandled_events.try_borrow_mut() {
-                Ok(mut events) => events(WebEvent::UnhandledKey(*ns)),
-                Err(_) => tracing::warn!(
-                    "atl-platform-ui: unhandled key {ns} reported inside a view event; dropped"
-                ),
-            });
-        let sink = Callback::new(move |e: &WebEventView| {
+        // two sources, one sink: the engine module's events and the UI module's unhandled-key reports, both on the display thread
+        let events: Sink = Arc::new(Mutex::new(events));
+        let shown_events = Arc::clone(&events);
+        let sink = SendCallback::new(move |e: &WebEventView| {
             // SAFETY: the view's strings are alive for this call (module contract).
             let (text, detail) =
                 unsafe { (e.text.get().into_owned(), e.detail.get().into_owned()) };
@@ -133,28 +128,30 @@ impl WebEngine for PlatformWebEngine {
                 },
                 _ => return,
             };
-            match events.try_borrow_mut() {
-                Ok(mut events) => events(ev),
-                Err(_) => tracing::warn!(
-                    "atl-platform-ui: view event inside an unhandled-key report; dropped"
-                ),
-            }
+            deliver(&events, ev);
         });
         // the window draws the view through the UI module (sideband quads), so a process without it has no use for a view
         let ui = crate::module::module().map_err(WebViewError::Unavailable)?;
-        let mut h: *mut WebViewHandle = std::ptr::null_mut();
-        // SAFETY: UI thread (the trait's contract); out and err live for the call.
-        let (status, err) = BytesOut::collect(|err| unsafe { (m.view_create)(sink, &mut h, err) });
-        if status != abi::OK || h.is_null() {
-            return Err(WebViewError::NoDisplay(
-                String::from_utf8_lossy(&err).into_owned(),
-            ));
-        }
         static NEXT_KEY: AtomicI32 = AtomicI32::new(1);
         let key = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: UI thread; the widget is the live view's (borrowed), the UI module takes its own reference (same libgtk in both modules).
-        unsafe { (ui.sideband_attach)(key, (m.view_widget)(h), unhandled_key) };
-        Ok(PlatformWebView { m, ui, h, key })
+        let shown = SendCallback::new(move |widget: &*mut c_void| {
+            if widget.is_null() {
+                // SAFETY: display thread (vtable contract), before the view (the widget's owner) is destroyed.
+                return unsafe { (ui.sideband_detach)(key) };
+            }
+            let events = Arc::clone(&shown_events);
+            let unhandled_key =
+                Callback::new(move |ns: &i64| deliver(&events, WebEvent::UnhandledKey(*ns)));
+            // SAFETY: display thread = the UI module's thread until display-thread S5; the widget is the live view's (borrowed), the UI module takes its own reference (same libgtk in both modules).
+            unsafe { (ui.sideband_attach)(key, *widget, unhandled_key) }
+        });
+        // SAFETY: any thread (vtable contract); the callbacks pass to the module.
+        if !unsafe { (m.view_create)(key, sink, shown) } {
+            return Err(WebViewError::NoDisplay(
+                "no display: the process has no GTK display (no-UI mode)".into(),
+            ));
+        }
+        Ok(PlatformWebView { m, ui, key })
     }
 
     fn watch_cookies(mut changed: Box<dyn FnMut(Vec<Cookie>) + Send>) -> Result<(), WebViewError> {
@@ -204,6 +201,21 @@ fn ui_thread(queued: bool) -> Result<(), WebViewError> {
         .ok_or_else(|| WebViewError::NoDisplay("no UI thread for the cookie store".into()))
 }
 
+/// A view's event sink, fed on the display thread by the engine module and the UI module.
+type Sink = Arc<Mutex<Box<dyn FnMut(WebEvent) + Send>>>;
+
+/// `ev` to `events`. Both sources run on the display thread and the receiver only hands events on (WebEngine::create_view), so the lock is never held when another delivery starts; a delivery
+/// that finds it held would be a receiver calling back into a source, which the trait does not allow: dropped and logged.
+fn deliver(events: &Sink, ev: WebEvent) {
+    match events.try_lock() {
+        Ok(mut events) => events(ev),
+        Err(TryLockError::Poisoned(p)) => p.into_inner()(ev),
+        Err(TryLockError::WouldBlock) => {
+            tracing::warn!("atl-platform-ui: view event during another delivery; dropped")
+        }
+    }
+}
+
 fn once(done: Box<dyn FnOnce(bool) + Send>) -> SendCallback<bool> {
     let mut done = Some(done);
     SendCallback::new(move |ok: &bool| {
@@ -213,27 +225,26 @@ fn once(done: Box<dyn FnOnce(bool) + Send>) -> SendCallback<bool> {
     })
 }
 
-/// A view of the module; UI thread only.
+/// A view of the module, named by its key.
 pub struct PlatformWebView {
     m: &'static WebViewVtable,
     ui: &'static UiVtable,
-    h: *mut WebViewHandle,
-    /// The second int of the view's sideband stream ([`WebView::sideband_stream`]): process-unique, never reused.
+    /// The second int of the view's sideband stream ([`WebView::sideband_stream`]) and the module's name for the view: process-unique, never reused.
     key: i32,
 }
 
-// Every method: a live handle (dropped only in Drop) on the UI thread (trait contract); borrowed strings live for the call.
+// Every `view_*` call: any thread (vtable contract), the key is this view's (dropped only in Drop); borrowed strings live for the call (the module copies them).
 impl WebView for PlatformWebView {
     fn load_uri(&self, uri: &str) {
         // SAFETY: see the impl comment.
-        unsafe { (self.m.view_load_uri)(self.h, Str::of(uri)) }
+        unsafe { (self.m.view_load_uri)(self.key, Str::of(uri)) }
     }
 
     fn load_bytes(&self, content: &[u8], mime_type: &str, encoding: &str, base_uri: &str) {
         // SAFETY: see the impl comment.
         unsafe {
             (self.m.view_load_bytes)(
-                self.h,
+                self.key,
                 content.as_ptr(),
                 content.len(),
                 Str::of(mime_type),
@@ -245,22 +256,26 @@ impl WebView for PlatformWebView {
 
     fn stop_loading(&self) {
         // SAFETY: see the impl comment.
-        unsafe { (self.m.view_stop)(self.h) }
+        unsafe { (self.m.view_stop)(self.key) }
     }
 
     fn reload(&self) {
         // SAFETY: see the impl comment.
-        unsafe { (self.m.view_reload)(self.h) }
+        unsafe { (self.m.view_reload)(self.key) }
     }
 
     fn go_back_or_forward(&self, steps: i32) {
         // SAFETY: see the impl comment.
-        unsafe { (self.m.view_go)(self.h, steps) }
+        unsafe { (self.m.view_go)(self.key, steps) }
     }
 
-    fn evaluate_javascript(&self, script: &str, done: Box<dyn FnOnce(Result<String, String>)>) {
+    fn evaluate_javascript(
+        &self,
+        script: &str,
+        done: Box<dyn FnOnce(Result<String, String>) + Send>,
+    ) {
         let mut done = Some(done);
-        let cb = Callback::new(move |r: &EvalResultView| {
+        let cb = SendCallback::new(move |r: &EvalResultView| {
             // SAFETY: the result's text is alive for this call.
             let text = unsafe { r.text.get() }.into_owned();
             if let Some(d) = done.take() {
@@ -268,34 +283,34 @@ impl WebView for PlatformWebView {
             }
         });
         // SAFETY: see the impl comment.
-        unsafe { (self.m.view_evaluate)(self.h, Str::of(script), cb) }
+        unsafe { (self.m.view_evaluate)(self.key, Str::of(script), cb) }
     }
 
     fn set_user_scripts(&self, sources: &[String]) {
         let views: Vec<Str> = sources.iter().map(|s| Str::of(s)).collect();
         // SAFETY: see the impl comment; `views` borrows `sources` for the call.
-        unsafe { (self.m.view_set_user_scripts)(self.h, views.as_ptr(), views.len()) }
+        unsafe { (self.m.view_set_user_scripts)(self.key, views.as_ptr(), views.len()) }
     }
 
     fn set_setting(&self, which: WebSetting, value: &SettingValue) {
         // SAFETY: see the impl comment; the value's text lives for the call.
         unsafe {
             match value {
-                SettingValue::Bool(on) => (self.m.view_set_bool)(self.h, which, *on),
-                SettingValue::Int(v) => (self.m.view_set_int)(self.h, which, *v),
-                SettingValue::Str(s) => (self.m.view_set_str)(self.h, which, Str::of(s)),
+                SettingValue::Bool(on) => (self.m.view_set_bool)(self.key, which, *on),
+                SettingValue::Int(v) => (self.m.view_set_int)(self.key, which, *v),
+                SettingValue::Str(s) => (self.m.view_set_str)(self.key, which, Str::of(s)),
             }
         }
     }
 
     fn set_background_color(&self, argb: u32) {
         // SAFETY: see the impl comment.
-        unsafe { (self.m.view_set_background)(self.h, argb) }
+        unsafe { (self.m.view_set_background)(self.key, argb) }
     }
 
     fn set_initial_scale(&self, percent: i32) {
         // SAFETY: see the impl comment.
-        unsafe { (self.m.view_set_initial_scale)(self.h, percent) }
+        unsafe { (self.m.view_set_initial_scale)(self.key, percent) }
     }
 
     fn sideband_stream(&self) -> [i32; 2] {
@@ -315,10 +330,7 @@ impl WebView for PlatformWebView {
 
 impl Drop for PlatformWebView {
     fn drop(&mut self) {
-        // SAFETY: UI thread; the window lets go of the widget before the view (its owner) is destroyed. Then the handle `view_create` made, dropped once.
-        unsafe {
-            (self.ui.sideband_detach)(self.key);
-            (self.m.view_drop)(self.h)
-        }
+        // SAFETY: any thread (vtable contract); dropped once. The module reports `shown(null)` (the sideband detach) on the display thread before it destroys the view.
+        unsafe { (self.m.view_drop)(self.key) }
     }
 }

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! The web engine behind `android.webkit.WebView` (webview plan S4.1, M68): shaped by its first implementation, WebKitGTK (atl-webview-linux), and by what the provider needs so far (W1 default UA; W2 views: load, JS, script dialogs, load events).
-//! Threads: [`WebView`] and [`WebEngine::create_view`] run on the UI thread (= the GTK main thread, plan README Q6), as Android's WebView methods do; events arrive there too. [`PromptReply`] and [`NavigationReply`] alone are Send.
-//! No method answers with engine state: what the provider's synchronous getters need comes with the events ([`WebEvent::Location`], `Title`, `Progress`), so a later display thread never has to answer one.
+//! Threads (display-thread plan D5): the engine runs on the display thread only (the owner of GLib's default context; today the UI thread). [`WebEngine::create_view`] and the [`WebView`] commands run
+//! on the view's own thread (the WebView's Looper thread, any thread) and are queued to the display thread in call order, returning at once; events and results arrive on the display thread, where
+//! the receiver hands them on (the provider posts them to the WebView's Looper). Exception until display-thread S5: [`WebView::claim_input`] and [`WebView::set_focused`] call the UI module, UI thread.
+//! No method answers with engine state: what the provider's synchronous getters need comes with the events ([`WebEvent::Location`], `Title`, `Progress`), so the display thread never has to answer one.
 
 /// The process's web engine, reached through its module.
 pub trait WebEngine {
@@ -11,8 +13,9 @@ pub trait WebEngine {
     /// The engine's own default user agent string, as it would send it with no override (WebKit: `webkit_settings_get_user_agent` of fresh settings). Any thread.
     fn default_user_agent() -> Result<String, WebViewError>;
 
-    /// A new view, not shown anywhere (W0: an unparented WebKit view loads and runs JS); `events` gets every [`WebEvent`] on the UI thread until the view drops. JavaScript starts disabled (Android's default, WebSettings.getJavaScriptEnabled).
-    fn create_view(events: Box<dyn FnMut(WebEvent)>) -> Result<Self::View, WebViewError>;
+    /// A new view, not shown anywhere (W0: an unparented WebKit view loads and runs JS), made on the display thread after this returns; its sideband key is allocated here. `events` gets every
+    /// [`WebEvent`] on the display thread until the view drops. JavaScript starts disabled (Android's default, WebSettings.getJavaScriptEnabled). Err: no engine module, or no display thread.
+    fn create_view(events: Box<dyn FnMut(WebEvent) + Send>) -> Result<Self::View, WebViewError>;
 
     /// The process's cookie store (shared by every view). Any thread: the engine is touched on the UI thread only, so each call is queued there and returns at once; callbacks run on the UI thread.
     /// `changed` gets the store's full list now and again after every change, whoever made it (a page's `document.cookie` / `Set-Cookie`, or [`Self::add_cookie`] / [`Self::replace_cookies`]).
@@ -60,7 +63,7 @@ pub enum CookiePolicy {
     NoThirdParty = 3,
 }
 
-/// One page view; dropping it destroys the view.
+/// One page view; dropping it destroys the view (queued to the display thread as the commands are).
 pub trait WebView {
     /// Navigates to `uri` (any scheme the engine loads: `http(s):`, `file:`, `data:`, `about:`).
     fn load_uri(&self, uri: &str);
@@ -72,8 +75,12 @@ pub trait WebView {
     fn reload(&self);
     /// Goes to the session-history entry `steps` away; none there = nothing happens.
     fn go_back_or_forward(&self, steps: i32);
-    /// Runs `script` in the main frame; `done` gets the result as JSON (`null` for undefined, a function or a non-serialisable value), or the exception's text.
-    fn evaluate_javascript(&self, script: &str, done: Box<dyn FnOnce(Result<String, String>)>);
+    /// Runs `script` in the main frame; `done` gets the result as JSON (`null` for undefined, a function or a non-serialisable value), or the exception's text, on the display thread.
+    fn evaluate_javascript(
+        &self,
+        script: &str,
+        done: Box<dyn FnOnce(Result<String, String>) + Send>,
+    );
     /// Replaces the scripts injected at document start into every frame of every later load (an already loaded document keeps what it got).
     fn set_user_scripts(&self, sources: &[String]);
     /// Applies one engine-backed setting to the view; `value` has the kind of `which` ([`WebSetting::kind`]). The core stores every WebSettings value and calls this only for the ones WebKit has.

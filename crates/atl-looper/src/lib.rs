@@ -84,6 +84,7 @@ const ANDROID: &CStr = c"libandroid.so";
 /// libandroid's Looper functions, resolved once per [`load`](LooperApi::load).
 pub struct LooperApi {
     prepare: looper::ALooper_prepare,
+    for_thread: looper::ALooper_forThread,
     add_fd: looper::ALooper_addFd,
     remove_fd: looper::ALooper_removeFd,
     poll_once: looper::ALooper_pollOnce,
@@ -101,6 +102,7 @@ impl LooperApi {
         unsafe {
             Ok(LooperApi {
                 prepare: sym(h, c"ALooper_prepare")?,
+                for_thread: sym(h, c"ALooper_forThread")?,
                 add_fd: sym(h, c"ALooper_addFd")?,
                 remove_fd: sym(h, c"ALooper_removeFd")?,
                 poll_once: sym(h, c"ALooper_pollOnce")?,
@@ -116,12 +118,24 @@ impl LooperApi {
         if ptr.is_null() {
             return Err(LooperError("ALooper_prepare returned no Looper".to_owned()));
         }
-        Ok(Looper {
-            ptr: ptr.cast(),
+        Ok(self.looper(ptr.cast()))
+    }
+
+    /// The calling thread's existing Looper (`ALooper_forThread`), None on a thread without one. For a Java Looper thread (Looper.prepare made it, NativeMessageQueue adopted it): `prepare_looper`
+    /// there would ask for non-callback fds the Java Looper was made without, which libutils logs as a mismatch.
+    pub fn thread_looper(&self) -> Option<Looper> {
+        // SAFETY: no arguments; the Looper returned (no reference taken) belongs to this thread, which libutils keeps alive for the thread's life
+        let ptr = unsafe { (self.for_thread)() };
+        (!ptr.is_null()).then(|| self.looper(ptr.cast()))
+    }
+
+    fn looper(&self, ptr: *mut c_void) -> Looper {
+        Looper {
+            ptr,
             add_fd: self.add_fd,
             remove_fd: self.remove_fd,
             poll_once: self.poll_once,
-        })
+        }
     }
 }
 

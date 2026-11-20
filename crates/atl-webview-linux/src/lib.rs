@@ -4,15 +4,19 @@
 //! thread later). WebKit binds its main thread to the first thread that touches it: settings made on an app worker (AdMob's AdWorker asks the UA first) made every later WebView SIGSEGV/abort in
 //! instance init (AB2, Temple Run; test app row webview-ua runs on a worker for this). So WebKit is touched on the display thread only, found as the default context's owner; another thread's call hops there.
 //! Default UA: `webkit_settings_get_user_agent` of fresh settings -- the engine's own default, made once on the display thread and cached.
-//! Views: a `WebKitWebView` (W0: loads and runs JS unrealized, before any window parents it); shown by the UI module, which parents it into the window whose scene has its sideband quad (`view_widget`). Every `view_*` runs on the display thread; signals arrive there.
+//! Views: a `WebKitWebView` (W0: loads and runs JS unrealized, before any window parents it), named by the process's sideband key; shown by the UI module, which parents it into the window whose
+//! scene has its sideband quad (`view_create`'s `shown`). Every `view_*` may come from any thread and runs on the display thread ([`on_display`], in call order), where the views live ([`VIEWS`])
+//! and signals arrive; events go to the process's sink there, which only hands them on (display-thread plan D5: posted to the WebView's Looper), so no app code runs inside a signal.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::rc::Rc;
 
 use atl_platform_ui_api::abi::{
-    self, BytesOut, Callback, CookieList, CookieView, EvalResultView, ReplyAbi, SendCallback,
-    Status, Str, WebEventView, WebViewHandle, WebViewVtable, web_event,
+    self, BytesOut, CookieList, CookieView, EvalResultView, ReplyAbi, SendCallback, Str,
+    WebEventView, WebViewVtable, web_event,
 };
 use atl_platform_ui_api::webview::{Cookie, CookiePolicy, LoadError, WebSetting};
 use webkit6::glib;
@@ -35,7 +39,6 @@ static VTABLE: WebViewVtable = WebViewVtable {
     view_set_int,
     view_set_str,
     view_set_background,
-    view_widget,
     view_set_initial_scale,
     cookies_watch,
     cookies_add,
@@ -106,24 +109,41 @@ fn display_user_agent() -> Result<String, &'static [u8]> {
         .clone())
 }
 
-/// A view and its event sink (shared with the signal closures).
+/// A view, its event sink (shared with the signal closures) and its `shown` report.
 struct View {
     web: webkit6::WebView,
     /// The sink, dropped with the view (the signal closures' clones drop with the WebKit object).
     events: Rc<Events>,
+    /// `view_create`'s `shown`: the widget now, null at `view_drop`.
+    shown: SendCallback<*mut c_void>,
 }
 
-impl View {
-    /// The provider asked for the next navigation (load_uri, load_bytes): its policy decision is not reported (WebViewClient.shouldOverrideUrlLoading javadoc: "not called for navigations
-    /// which the app initiated with loadUrl()"). Cleared by that decision or by the next main-frame load start, so a load that makes no decision cannot hide a later page navigation.
-    fn provider_load(&self) {
-        self.events.provider_load.set(true);
-    }
+thread_local! {
+    /// The live views by key; filled and read on the display thread only.
+    static VIEWS: RefCell<HashMap<i32, View>> = RefCell::default();
 }
 
-fn view<'a>(h: *mut WebViewHandle) -> &'a View {
-    // SAFETY: every handle is a Box<View> `view_create` leaked, alive until `view_drop`; the caller's contract (display thread, live handle).
-    unsafe { &*h.cast::<View>() }
+/// Runs `f` with `key`'s view on the display thread ([`on_display`]); a key with no view there (creation failed, already dropped) is logged and `f` dropped. The view is cloned out of
+/// [`VIEWS`] first, so `f` may run a nested main loop that drops a view.
+fn on_view(
+    key: i32,
+    what: &'static str,
+    f: impl FnOnce(&webkit6::WebView, &Rc<Events>) + Send + 'static,
+) {
+    on_display(move || {
+        let Some((web, events)) =
+            VIEWS.with_borrow(|m| m.get(&key).map(|v| (v.web.clone(), Rc::clone(&v.events))))
+        else {
+            return tracing::warn!("webview[{key}]: {what} for no view; ignored");
+        };
+        f(&web, &events);
+    });
+}
+
+/// The provider asked for the next navigation (load_uri, load_bytes): its policy decision is not reported (WebViewClient.shouldOverrideUrlLoading javadoc: "not called for navigations which the
+/// app initiated with loadUrl()"). Cleared by that decision or by the next main-frame load start, so a load that makes no decision cannot hide a later page navigation.
+fn provider_load(events: &Events) {
+    events.provider_load.set(true);
 }
 
 /// One event not yet delivered.
@@ -163,11 +183,9 @@ fn location(w: &webkit6::WebView) -> Location {
     (uri, original, back, forward)
 }
 
-/// The sink plus a queue: a callback may call back into the view (loadUrl from onPageFinished) and WebKit may signal synchronously inside it; such a nested event waits until the running one returns, so order is kept and nothing is dropped.
+/// The sink and what the signal closures share. The sink only hands events on (no app code runs inside it, so nothing calls back into the view from there), so no event nests in another.
 struct Events {
-    sink: RefCell<Callback<WebEventView>>,
-    queue: RefCell<std::collections::VecDeque<Pending>>,
-    busy: std::cell::Cell<bool>,
+    sink: RefCell<SendCallback<WebEventView>>,
     /// The title last reported for the current load.
     title: RefCell<Option<String>>,
     /// [`View::provider_load`].
@@ -244,35 +262,25 @@ impl Events {
     }
 
     fn push(&self, p: Pending) {
-        self.queue.borrow_mut().push_back(p);
-        if self.busy.replace(true) {
-            return;
+        let handed = p.reply.is_some();
+        let ev = WebEventView {
+            kind: p.kind,
+            text: Str::of(&p.text),
+            detail: Str::of(&p.detail),
+            error: p.error,
+            progress: p.progress,
+            extra: Str::of(&p.extra),
+            length: p.length,
+            flags: p.flags,
+            back: p.back,
+            forward: p.forward,
+            // the receiver takes `reply` only for PROMPT and NAVIGATION; any other event carries a placeholder this side drops
+            reply: ManuallyDrop::new(p.reply.unwrap_or_else(|| ReplyAbi::new(|_| {}))),
+        };
+        self.sink.borrow_mut().call(&ev);
+        if !handed {
+            drop(ManuallyDrop::into_inner(ev.reply));
         }
-        loop {
-            let Some(p) = self.queue.borrow_mut().pop_front() else {
-                break;
-            };
-            let handed = p.reply.is_some();
-            let ev = WebEventView {
-                kind: p.kind,
-                text: Str::of(&p.text),
-                detail: Str::of(&p.detail),
-                error: p.error,
-                progress: p.progress,
-                extra: Str::of(&p.extra),
-                length: p.length,
-                flags: p.flags,
-                back: p.back,
-                forward: p.forward,
-                // the receiver takes `reply` only for PROMPT and NAVIGATION; any other event carries a placeholder this side drops
-                reply: ManuallyDrop::new(p.reply.unwrap_or_else(|| ReplyAbi::new(|_| {}))),
-            };
-            self.sink.borrow_mut().call(&ev);
-            if !handed {
-                drop(ManuallyDrop::into_inner(ev.reply));
-            }
-        }
-        self.busy.set(false);
     }
 }
 
@@ -401,14 +409,21 @@ fn navigation_policy(ev: &Rc<Events>, decision: &webkit6::PolicyDecision) -> boo
 }
 
 unsafe extern "C" fn view_create(
-    events: Callback<WebEventView>,
-    out: *mut *mut WebViewHandle,
-    err: *mut BytesOut,
-) -> Status {
+    key: i32,
+    events: SendCallback<WebEventView>,
+    shown: SendCallback<*mut c_void>,
+) -> bool {
+    on_display(move || create(key, events, shown))
+}
+
+/// [`view_create`] on the display thread.
+fn create(key: i32, events: SendCallback<WebEventView>, mut shown: SendCallback<*mut c_void>) {
+    // a display thread exists (on_display found the context owned) but GTK has no display: not reached in a launcher process, which owns the context only with GTK up
     if webkit6::gdk::Display::default().is_none() {
-        // SAFETY: the sink the caller lent.
-        unsafe { BytesOut::put_to(err, NO_DISPLAY) };
-        return 1;
+        return tracing::error!(
+            "webview[{key}]: not created: {}",
+            String::from_utf8_lossy(NO_DISPLAY)
+        );
     }
     static ENGINE_LINE: std::sync::Once = std::sync::Once::new();
     // once per process: the engine version, and proof this module's lines reach the app log (abi::set_log; window gate webview `module-log`)
@@ -435,8 +450,6 @@ unsafe extern "C" fn view_create(
     }
     let events = Rc::new(Events {
         sink: RefCell::new(events),
-        queue: RefCell::default(),
-        busy: std::cell::Cell::new(false),
         title: RefCell::default(),
         provider_load: std::cell::Cell::new(false),
         main_loading: std::cell::Cell::new(false),
@@ -573,26 +586,35 @@ unsafe extern "C" fn view_create(
         ev.emit(web_event::PROMPT, &message, &default, 0, 0, Some(reply));
         true
     });
-    // SAFETY: `out` is the caller's out-parameter.
-    unsafe { *out = Box::into_raw(Box::new(View { web, events })).cast() };
-    abi::OK
+    use webkit6::glib::translate::ToGlibPtr;
+    let widget: *mut webkit6::gtk::ffi::GtkWidget =
+        web.upcast_ref::<webkit6::gtk::Widget>().to_glib_none().0;
+    shown.call(&widget.cast());
+    VIEWS.with_borrow_mut(|m| m.insert(key, View { web, events, shown }));
 }
 
-unsafe extern "C" fn view_drop(h: *mut WebViewHandle) {
-    // SAFETY: the Box `view_create` leaked; dropped once.
-    let v = unsafe { Box::from_raw(h.cast::<View>()) };
-    v.web.try_close();
-    drop(v);
+unsafe extern "C" fn view_drop(key: i32) {
+    on_display(move || {
+        // out of the map before anything runs: the detach and the close may run GTK code
+        let Some(mut v) = VIEWS.with_borrow_mut(|m| m.remove(&key)) else {
+            return tracing::warn!("webview[{key}]: drop for no view; ignored");
+        };
+        v.shown.call(&std::ptr::null_mut());
+        v.web.try_close();
+    });
 }
 
-unsafe extern "C" fn view_load_uri(h: *mut WebViewHandle, uri: Str) {
-    view(h).provider_load();
+unsafe extern "C" fn view_load_uri(key: i32, uri: Str) {
     // SAFETY: `uri` is alive for this call.
-    view(h).web.load_uri(&unsafe { uri.get() });
+    let uri = unsafe { uri.get() }.into_owned();
+    on_view(key, "load_uri", move |web, events| {
+        provider_load(events);
+        web.load_uri(&uri);
+    });
 }
 
 unsafe extern "C" fn view_load_bytes(
-    h: *mut WebViewHandle,
+    key: i32,
     content: *const u8,
     len: usize,
     mime: Str,
@@ -602,104 +624,111 @@ unsafe extern "C" fn view_load_bytes(
     // SAFETY: the caller lends `content[..len]` and the strings for this call.
     let (bytes, mime, enc, base) = unsafe {
         (
-            std::slice::from_raw_parts(content, len),
-            mime.get(),
-            enc.get(),
-            base.get(),
+            glib::Bytes::from(std::slice::from_raw_parts(content, len)),
+            mime.get().into_owned(),
+            enc.get().into_owned(),
+            base.get().into_owned(),
         )
     };
-    view(h).provider_load();
-    view(h).web.load_bytes(
-        &glib::Bytes::from(bytes),
-        Some(&mime),
-        Some(&enc),
-        Some(&base),
-    );
+    on_view(key, "load_bytes", move |web, events| {
+        provider_load(events);
+        web.load_bytes(&bytes, Some(&mime), Some(&enc), Some(&base));
+    });
 }
 
-unsafe extern "C" fn view_stop(h: *mut WebViewHandle) {
-    view(h).web.stop_loading();
+unsafe extern "C" fn view_stop(key: i32) {
+    on_view(key, "stop", |web, _| web.stop_loading());
 }
 
-unsafe extern "C" fn view_reload(h: *mut WebViewHandle) {
-    view(h).web.reload();
+unsafe extern "C" fn view_reload(key: i32) {
+    on_view(key, "reload", |web, _| web.reload());
 }
 
 /// The back-forward list's item `steps` from the current one (WebKitBackForwardList.get_nth_item: 0 current, negative back), as Chromium's NavigationController offsets count.
-fn history_item(h: *mut WebViewHandle, steps: i32) -> Option<webkit6::BackForwardListItem> {
+fn history_item(web: &webkit6::WebView, steps: i32) -> Option<webkit6::BackForwardListItem> {
     if steps == 0 {
         return None;
     }
-    view(h).web.back_forward_list()?.nth_item(steps)
+    web.back_forward_list()?.nth_item(steps)
 }
 
-unsafe extern "C" fn view_go(h: *mut WebViewHandle, steps: i32) {
-    if let Some(item) = history_item(h, steps) {
-        view(h).web.go_to_back_forward_list_item(&item);
-    }
-}
-
-unsafe extern "C" fn view_evaluate(
-    h: *mut WebViewHandle,
-    script: Str,
-    done: Callback<EvalResultView>,
-) {
-    let mut done = Some(done);
-    let mut finish = move |ok: bool, text: &str| {
-        if let Some(mut d) = done.take() {
-            d.call(&EvalResultView {
-                ok,
-                text: Str::of(text),
-            });
+unsafe extern "C" fn view_go(key: i32, steps: i32) {
+    on_view(key, "go", move |web, _| {
+        if let Some(item) = history_item(web, steps) {
+            web.go_to_back_forward_list_item(&item);
         }
-    };
-    // SAFETY: `script` is alive for this call (copied before the async call returns).
+    });
+}
+
+unsafe extern "C" fn view_evaluate(key: i32, script: Str, done: SendCallback<EvalResultView>) {
+    // SAFETY: `script` is alive for this call.
     let script = unsafe { script.get() }.into_owned();
-    view(h).web.evaluate_javascript(
-        &script,
-        None,
-        None,
-        None::<&webkit6::gio::Cancellable>,
-        move |r| match r {
-            // undefined, a function, a symbol: no JSON form -> "null", as Android's evaluateJavascript reports them
-            Ok(v) => finish(
-                true,
-                &v.to_json(0)
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "null".into()),
-            ),
-            Err(e) => finish(false, e.message()),
-        },
-    );
+    on_view(key, "evaluate", move |web, _| {
+        let mut done = Some(done);
+        let mut finish = move |ok: bool, text: &str| {
+            if let Some(mut d) = done.take() {
+                d.call(&EvalResultView {
+                    ok,
+                    text: Str::of(text),
+                });
+            }
+        };
+        web.evaluate_javascript(
+            &script,
+            None,
+            None,
+            None::<&webkit6::gio::Cancellable>,
+            move |r| match r {
+                // undefined, a function, a symbol: no JSON form -> "null", as Android's evaluateJavascript reports them
+                Ok(v) => finish(
+                    true,
+                    &v.to_json(0)
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "null".into()),
+                ),
+                Err(e) => finish(false, e.message()),
+            },
+        );
+    });
 }
 
-unsafe extern "C" fn view_set_user_scripts(h: *mut WebViewHandle, sources: *const Str, len: usize) {
-    let Some(ucm) = view(h).web.user_content_manager() else {
-        return;
-    };
-    ucm.remove_all_scripts();
+unsafe extern "C" fn view_set_user_scripts(key: i32, sources: *const Str, len: usize) {
     // SAFETY: the caller lends `sources[..len]` and their strings for this call.
-    for s in unsafe { std::slice::from_raw_parts(sources, len) } {
+    let sources: Vec<String> = unsafe { std::slice::from_raw_parts(sources, len) }
+        .iter()
         // SAFETY: as above.
-        let src = unsafe { s.get() };
-        ucm.add_script(&webkit6::UserScript::new(
-            &src,
-            webkit6::UserContentInjectedFrames::AllFrames,
-            webkit6::UserScriptInjectionTime::Start,
-            &[],
-            &[],
-        ));
-    }
+        .map(|s| unsafe { s.get() }.into_owned())
+        .collect();
+    on_view(key, "set_user_scripts", move |web, _| {
+        let Some(ucm) = web.user_content_manager() else {
+            return;
+        };
+        ucm.remove_all_scripts();
+        for src in &sources {
+            ucm.add_script(&webkit6::UserScript::new(
+                src,
+                webkit6::UserContentInjectedFrames::AllFrames,
+                webkit6::UserScriptInjectionTime::Start,
+                &[],
+                &[],
+            ));
+        }
+    });
 }
 
-fn settings(h: *mut WebViewHandle) -> webkit6::Settings {
+fn settings(web: &webkit6::WebView) -> webkit6::Settings {
     // a WebKitWebView always has settings (webkit_web_view_get_settings never returns NULL once constructed)
-    WebViewExt::settings(&view(h).web).expect("WebKitWebView without settings")
+    WebViewExt::settings(web).expect("WebKitWebView without settings")
 }
 
 // The core's setting table (atl-webview settings.rs) decides each value's kind; a setting of another kind here is a broken table row and only logged.
-unsafe extern "C" fn view_set_bool(h: *mut WebViewHandle, which: WebSetting, on: bool) {
-    let s = settings(h);
+unsafe extern "C" fn view_set_bool(key: i32, which: WebSetting, on: bool) {
+    on_view(key, "set_bool", move |web, _| {
+        set_bool(&settings(web), which, on)
+    });
+}
+
+fn set_bool(s: &webkit6::Settings, which: WebSetting, on: bool) {
     match which {
         WebSetting::JavaScript => s.set_enable_javascript(on),
         WebSetting::DomStorage => s.set_enable_html5_local_storage(on),
@@ -718,23 +747,29 @@ unsafe extern "C" fn view_set_bool(h: *mut WebViewHandle, which: WebSetting, on:
     }
 }
 
-unsafe extern "C" fn view_set_int(h: *mut WebViewHandle, which: WebSetting, value: i32) {
-    let s = settings(h);
-    // WebKit's font sizes are unsigned; a negative one is no size
-    let size = u32::try_from(value).unwrap_or(0);
-    match which {
-        WebSetting::MinimumFontSize => s.set_minimum_font_size(size),
-        WebSetting::DefaultFontSize => s.set_default_font_size(size),
-        WebSetting::DefaultMonospaceFontSize => s.set_default_monospace_font_size(size),
-        other => tracing::warn!("webview: {other:?} is not an int setting"),
-    }
+unsafe extern "C" fn view_set_int(key: i32, which: WebSetting, value: i32) {
+    on_view(key, "set_int", move |web, _| {
+        let s = settings(web);
+        // WebKit's font sizes are unsigned; a negative one is no size
+        let size = u32::try_from(value).unwrap_or(0);
+        match which {
+            WebSetting::MinimumFontSize => s.set_minimum_font_size(size),
+            WebSetting::DefaultFontSize => s.set_default_font_size(size),
+            WebSetting::DefaultMonospaceFontSize => s.set_default_monospace_font_size(size),
+            other => tracing::warn!("webview: {other:?} is not an int setting"),
+        }
+    });
 }
 
-unsafe extern "C" fn view_set_str(h: *mut WebViewHandle, which: WebSetting, value: Str) {
+unsafe extern "C" fn view_set_str(key: i32, which: WebSetting, value: Str) {
     // SAFETY: `value` is alive for this call.
-    let text = unsafe { value.get() };
-    let text: &str = &text;
-    let s = settings(h);
+    let text = unsafe { value.get() }.into_owned();
+    on_view(key, "set_str", move |web, _| {
+        set_str(&settings(web), which, &text)
+    });
+}
+
+fn set_str(s: &webkit6::Settings, which: WebSetting, text: &str) {
     match which {
         // empty = the engine's own default (WebKit: a NULL user agent)
         WebSetting::UserAgent => s.set_user_agent((!text.is_empty()).then_some(text)),
@@ -749,22 +784,25 @@ unsafe extern "C" fn view_set_str(h: *mut WebViewHandle, which: WebSetting, valu
     }
 }
 
-unsafe extern "C" fn view_set_background(h: *mut WebViewHandle, argb: u32) {
+unsafe extern "C" fn view_set_background(key: i32, argb: u32) {
     // Android's colour int (alpha in the top byte); GdkRGBA takes each channel as 0..=1
     let channel = |shift: u32| f32::from(((argb >> shift) & 0xff) as u8) / 255.0;
     let rgba = webkit6::gdk::RGBA::new(channel(16), channel(8), channel(0), channel(24));
-    view(h).web.set_background_color(&rgba);
+    on_view(key, "set_background", move |web, _| {
+        web.set_background_color(&rgba)
+    });
 }
 
-unsafe extern "C" fn view_set_initial_scale(h: *mut WebViewHandle, percent: i32) {
-    let web = &view(h).web;
-    // WebKit's zoom multiplies the toolkit's device scale; setInitialScale counts device pixels ("doesn't take the screen density into account", WebView.java:1186) -> divide it out
-    let zoom = if percent > 0 {
-        f64::from(percent) / 100.0 / f64::from(web.scale_factor().max(1))
-    } else {
-        1.0
-    };
-    web.set_zoom_level(zoom);
+unsafe extern "C" fn view_set_initial_scale(key: i32, percent: i32) {
+    on_view(key, "set_initial_scale", move |web, _| {
+        // WebKit's zoom multiplies the toolkit's device scale; setInitialScale counts device pixels ("doesn't take the screen density into account", WebView.java:1186) -> divide it out
+        let zoom = if percent > 0 {
+            f64::from(percent) / 100.0 / f64::from(web.scale_factor().max(1))
+        } else {
+            1.0
+        };
+        web.set_zoom_level(zoom);
+    });
 }
 
 /// Runs `f` on the display thread (the owner of GLib's default context, as [`user_agent`]): now when this is it, else queued; false = no display thread (nobody owns the context), `f` dropped.
@@ -911,16 +949,6 @@ unsafe extern "C" fn cookies_policy(policy: CookiePolicy) -> bool {
             CookiePolicy::NoThirdParty => webkit6::CookieAcceptPolicy::NoThirdParty,
         });
     })
-}
-
-unsafe extern "C" fn view_widget(h: *mut WebViewHandle) -> *mut std::ffi::c_void {
-    use webkit6::glib::translate::ToGlibPtr;
-    let w: *mut webkit6::gtk::ffi::GtkWidget = view(h)
-        .web
-        .upcast_ref::<webkit6::gtk::Widget>()
-        .to_glib_none()
-        .0;
-    w.cast()
 }
 
 #[cfg(test)]

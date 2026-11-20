@@ -14,6 +14,7 @@ fn main() -> Result<()> {
         force_include: None,
         functions: &[
             "ALooper_prepare",
+            "ALooper_forThread",
             "ALooper_addFd",
             "ALooper_removeFd",
             "ALooper_pollOnce",

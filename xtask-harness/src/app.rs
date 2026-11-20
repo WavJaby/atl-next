@@ -606,9 +606,7 @@ const WEBVIEW_SLOW_CALLBACK: Line = Line {
 const WEBVIEW_LOOPER_THREAD: Line = Line {
     row: "webview-looper-thread",
     prefix: "AtlTest: webview-looper-thread: ",
-    want: Want::Exact(
-        "looper=ht override=wv started=wv finished=wv title=wv progress=wv eval=wv",
-    ),
+    want: Want::Exact("looper=ht override=wv started=wv finished=wv title=wv progress=wv eval=wv"),
     timing: Timing::Async,
 };
 /// Main.webViewScale's line: setInitialScale(200) -> 200 % = 2 device pixels per CSS pixel whatever the screen density (WebView.java:1184-1188), the page's devicePixelRatio.

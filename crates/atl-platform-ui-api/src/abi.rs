@@ -1242,7 +1242,7 @@ pub struct UiVtable {
     pub pcm_rt_fallbacks: unsafe extern "C" fn(pcm: *mut PcmHandle) -> u64,
     /// `PcmOutput::underruns`.
     pub pcm_underruns: unsafe extern "C" fn(pcm: *mut PcmHandle) -> u64,
-    /// Makes the toolkit widget `widget` (a `GtkWidget *` of the same libgtk, from another module: the WebView module's [`WebViewVtable::view_widget`]) the content of every sideband quad whose
+    /// Makes the toolkit widget `widget` (a `GtkWidget *` of the same libgtk, from another module: the one the WebView module's [`WebViewVtable::view_create`] `shown` reports) the content of every sideband quad whose
     /// stream is `[SIDEBAND_WEB_VIEW, key]` (crate::webview); the module takes its own reference. UI thread.
     /// `unhandled_key` (kept until detach, called on the UI thread): the widget left a key unhandled (the toolkit put back a delivered key event); its value is that key's stamp, the monotonic ns Android's KeyEvent carries (`WebEvent::UnhandledKey`).
     pub sideband_attach:
@@ -1263,12 +1263,6 @@ pub const WEBVIEW_ENTRY_SYMBOL: &str = "atl_webview_entry";
 
 /// The WebView module's entry: its static vtable; starts nothing. The caller checks [`WebViewVtable::abi`] first.
 pub type WebViewEntry = unsafe extern "C" fn() -> *const WebViewVtable;
-
-/// A `WebView` (page view), opaque; UI thread.
-#[repr(C)]
-pub struct WebViewHandle {
-    _opaque: [u8; 0],
-}
 
 /// An event's answer across the boundary ([`PromptReply`](crate::webview::PromptReply), [`NavigationReply`](crate::webview::NavigationReply)): made by the module, finished or dropped once by the
 /// process, from any thread. Text or none: a prompt's answer; a navigation's text present = the app took the URL, none = load it.
@@ -1463,7 +1457,9 @@ pub struct EvalResultView {
     pub text: Str,
 }
 
-/// The WebView module's functions (the [`crate::webview`] traits as a C ABI). `view_*` on the UI thread.
+/// The WebView module's functions (the [`crate::webview`] traits as a C ABI). A view is named by its sideband key (`WebView::sideband_stream`'s second int), which the process allocates.
+/// `view_*`: any thread, queued to the display thread (the owner of GLib's default context; run at once when the caller is it) in call order, arguments copied before return; a key with no live
+/// view there (its creation failed, or it was dropped) is logged and ignored.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct WebViewVtable {
@@ -1474,19 +1470,20 @@ pub struct WebViewVtable {
     /// `WebEngine::default_user_agent`: the engine's own default UA string into `out` and true; false with the reason in `out` when the engine cannot run (no display, no UI thread). Any thread: the engine is touched on the UI thread only, so a call from another thread
     /// waits until the UI thread's Looper has run it (blocks while the UI thread is blocked).
     pub default_user_agent: unsafe extern "C" fn(out: *mut BytesOut) -> bool,
-    /// `WebEngine::create_view`.
+    /// `WebEngine::create_view` for the view `key`. On the display thread: `shown(widget)` once the view exists (its `GtkWidget *`, borrowed, for [`UiVtable::sideband_attach`]) and
+    /// `shown(null)` before `view_drop` destroys it; `events` gets every event. False = no display thread in the process (both callbacks dropped).
     pub view_create: unsafe extern "C" fn(
-        events: Callback<WebEventView>,
-        out: *mut *mut WebViewHandle,
-        err: *mut BytesOut,
-    ) -> Status,
+        key: i32,
+        events: SendCallback<WebEventView>,
+        shown: SendCallback<*mut c_void>,
+    ) -> bool,
     /// Destroys a view.
-    pub view_drop: unsafe extern "C" fn(view: *mut WebViewHandle),
+    pub view_drop: unsafe extern "C" fn(key: i32),
     /// `WebView::load_uri`.
-    pub view_load_uri: unsafe extern "C" fn(view: *mut WebViewHandle, uri: Str),
+    pub view_load_uri: unsafe extern "C" fn(key: i32, uri: Str),
     /// `WebView::load_bytes`.
     pub view_load_bytes: unsafe extern "C" fn(
-        view: *mut WebViewHandle,
+        key: i32,
         content: *const u8,
         len: usize,
         mime_type: Str,
@@ -1494,27 +1491,26 @@ pub struct WebViewVtable {
         base_uri: Str,
     ),
     /// `WebView::stop_loading`.
-    pub view_stop: unsafe extern "C" fn(view: *mut WebViewHandle),
+    pub view_stop: unsafe extern "C" fn(key: i32),
     /// `WebView::reload`.
-    pub view_reload: unsafe extern "C" fn(view: *mut WebViewHandle),
+    pub view_reload: unsafe extern "C" fn(key: i32),
     /// `WebView::go_back_or_forward`.
-    pub view_go: unsafe extern "C" fn(view: *mut WebViewHandle, steps: i32),
-    /// `WebView::evaluate_javascript`; `done` is called once.
+    pub view_go: unsafe extern "C" fn(key: i32, steps: i32),
+    /// `WebView::evaluate_javascript`; `done` is called once, on the display thread (dropped uncalled for a key with no view).
     pub view_evaluate:
-        unsafe extern "C" fn(view: *mut WebViewHandle, script: Str, done: Callback<EvalResultView>),
+        unsafe extern "C" fn(key: i32, script: Str, done: SendCallback<EvalResultView>),
     /// `WebView::set_user_scripts`.
-    pub view_set_user_scripts:
-        unsafe extern "C" fn(view: *mut WebViewHandle, sources: *const Str, len: usize),
+    pub view_set_user_scripts: unsafe extern "C" fn(key: i32, sources: *const Str, len: usize),
     /// `WebView::set_setting` for a boolean setting.
-    pub view_set_bool: unsafe extern "C" fn(view: *mut WebViewHandle, which: WebSetting, on: bool),
+    pub view_set_bool: unsafe extern "C" fn(key: i32, which: WebSetting, on: bool),
     /// `WebView::set_setting` for an int setting.
-    pub view_set_int: unsafe extern "C" fn(view: *mut WebViewHandle, which: WebSetting, value: i32),
+    pub view_set_int: unsafe extern "C" fn(key: i32, which: WebSetting, value: i32),
     /// `WebView::set_setting` for a string setting; empty = the engine's own default.
-    pub view_set_str: unsafe extern "C" fn(view: *mut WebViewHandle, which: WebSetting, value: Str),
+    pub view_set_str: unsafe extern "C" fn(key: i32, which: WebSetting, value: Str),
     /// `WebView::set_background_color`: an Android colour int (ARGB).
-    pub view_set_background: unsafe extern "C" fn(view: *mut WebViewHandle, argb: u32),
+    pub view_set_background: unsafe extern "C" fn(key: i32, argb: u32),
     /// `WebView::set_initial_scale`.
-    pub view_set_initial_scale: unsafe extern "C" fn(view: *mut WebViewHandle, percent: i32),
+    pub view_set_initial_scale: unsafe extern "C" fn(key: i32, percent: i32),
     /// `WebEngine::watch_cookies`; any thread (queued to the UI thread). False = no UI thread in the process (`changed` dropped).
     pub cookies_watch: unsafe extern "C" fn(changed: SendCallback<CookieList>) -> bool,
     /// `WebEngine::add_cookie`; any thread, the cookie copied before return; `done` once, on the UI thread. False as `cookies_watch`.
@@ -1525,6 +1521,4 @@ pub struct WebViewVtable {
         unsafe extern "C" fn(cookies: CookieList, done: SendCallback<bool>) -> bool,
     /// `WebEngine::set_cookie_policy`; as `cookies_watch`.
     pub cookies_policy: unsafe extern "C" fn(policy: CookiePolicy) -> bool,
-    /// The view's toolkit widget (`GtkWidget *`), borrowed: valid while the view lives; handed to [`UiVtable::sideband_attach`].
-    pub view_widget: unsafe extern "C" fn(view: *mut WebViewHandle) -> *mut c_void,
 }

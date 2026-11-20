@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: MIT
 //! The JNI exports: `JNI_OnLoad` and one `Java_*` per native method of the forwarders, each converting at once to safe values and calling safe code.
-//! Symbol names are JNI's short form (class + method; no native overloads in these classes). Provider natives run on the UI thread (WebView's own thread check), which is the GTK main thread
-//! where the engine's events arrive too; `Statics.getDefaultUserAgent` runs on whatever thread called; bridge calls run on the "JavaBridge" thread ([`bridge_thread`]), which finds their objects
-//! itself. No provider native asks the engine for state: the getters read the [`Mirror`] the events keep (display-thread plan D5).
+//! Symbol names are JNI's short form (class + method; no native overloads in these classes). Provider natives run on the WebView's thread (WebView.checkThread: the thread whose Looper is
+//! getWebViewLooper(), any Looper thread); the engine runs on the display thread and its events and results arrive there, and are posted to the WebView's Looper ([`view_poster`], display-thread
+//! plan D5), so every client callback runs on the WebView's thread; `Statics.getDefaultUserAgent` runs on whatever thread called; bridge calls run on the "JavaBridge" thread ([`bridge_thread`]),
+//! which finds their objects itself. No provider native asks the engine for state: the getters read the [`Mirror`] the events keep.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_void};
-use std::rc::Rc;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::thread::ThreadId;
+
+use atl_looper::{LooperApi, Poster};
 
 use atl_platform_ui::webview::{
     InputClaim, LoadError, NavigationRequest, PromptReply, SettingValue, WebEngine as _, WebEvent,
@@ -407,7 +410,9 @@ struct Native {
     /// The view's sideband stream as a `native_handle_t` (no fds, the stream's ints): leaked, because the carrier's BufferQueue keeps a non-owning NativeHandle on it
     /// (Surface::dispatchSetSidebandStream, `NativeHandle::create(h, false)`) that may outlive this provider; 20 bytes per WebView.
     sideband: &'static [i32],
-    shared: Rc<Shared>,
+    shared: Arc<OnViewThread<Shared>>,
+    /// Posts to the WebView's Looper ([`view_poster`]).
+    poster: Poster,
     /// The WebSettings values (settings.rs table): stored here, the engine's own pushed on set.
     settings: RefCell<Settings>,
     /// CookieManager.setAcceptThirdPartyCookies(this view) (= WebSettings.setAcceptThirdPartyCookies); counted in [`crate::cookies::third_party`] while on.
@@ -496,6 +501,65 @@ impl Mirror {
     }
 }
 
+/// A view's state on its thread (the WebView's Looper thread): reached there only, by the provider natives and by closures posted to that Looper; `Deref` checks the thread. The Arc holding it may
+/// drop on another thread (a post dropped because the Looper quit): `T` is plain Send data, its global refs released by `destroy` on the view's thread.
+struct OnViewThread<T: Send> {
+    thread: ThreadId,
+    value: T,
+}
+
+// SAFETY: a `&T` is handed out only on `thread` (Deref), so no two threads share one; T: Send covers the drop elsewhere.
+unsafe impl<T: Send> Sync for OnViewThread<T> {}
+
+impl<T: Send> OnViewThread<T> {
+    /// `value`, bound to the calling thread.
+    fn new(value: T) -> Self {
+        Self {
+            thread: std::thread::current().id(),
+            value,
+        }
+    }
+}
+
+impl<T: Send> std::ops::Deref for OnViewThread<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // a provider native called off the WebView's thread passed Java's checkThread; a post landing elsewhere is a poster bug: both are broken invariants, not states to handle
+        assert_eq!(
+            std::thread::current().id(),
+            self.thread,
+            "webview state reached off the WebView's thread"
+        );
+        &self.value
+    }
+}
+
+/// The calling thread's Looper poster: one per thread for its life (atl-looper registers each Poster for the thread's life), so every view of the thread posts through one FIFO. None on a
+/// thread without a Looper, or when libandroid's Looper API is missing (the reason logged once per thread).
+fn view_poster() -> Option<Poster> {
+    static API: OnceLock<Result<LooperApi, String>> = OnceLock::new();
+    thread_local! {
+        static POSTER: OnceCell<Option<Poster>> = const { OnceCell::new() };
+    }
+    POSTER.with(|p| {
+        p.get_or_init(|| {
+            let made = API
+                .get_or_init(|| LooperApi::load().map_err(|e| e.to_string()))
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(|api| {
+                    let looper = api
+                        .thread_looper()
+                        .ok_or_else(|| "the thread has no Looper".to_owned())?;
+                    Poster::attach(&looper).map_err(|e| e.to_string())
+                });
+            made.inspect_err(|e| tracing::error!("webview: no Looper poster: {e}"))
+                .ok()
+        })
+        .clone()
+    })
+}
+
 /// What the event sink needs: the provider (a weak global ref, so the app's WebView stays collectable).
 struct Shared {
     provider: Cell<usize>,
@@ -526,7 +590,7 @@ fn native<'a>(env: Env, provider: Obj) -> Option<&'a Native> {
         return None;
     }
     let p = jni_call!(env, GetLongField, provider, f) as usize as *const Native;
-    // SAFETY: mNative is 0 or the Box<Native> createWebView leaked; only destroy (same UI thread) frees it, clearing the field first.
+    // SAFETY: mNative is 0 or the Box<Native> createWebView leaked; only destroy (same WebView thread) frees it, clearing the field first.
     unsafe { p.as_ref() }
 }
 
@@ -606,17 +670,43 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProvid
     if pending(env) {
         return NULL;
     }
-    let shared = Rc::new(Shared {
+    // WebView's constructor refuses a thread without a Looper before this runs; a missing Looper API is this build's fault
+    let Some(poster) = view_poster() else {
+        throw_uoe(env, "WebViewFactoryProvider.createWebView");
+        return NULL;
+    };
+    let interfaces = Interfaces::default();
+    let shared = Arc::new(OnViewThread::new(Shared {
         provider: Cell::new(0),
-        interfaces: Interfaces::default(),
+        interfaces: interfaces.clone(),
         mirror: RefCell::default(),
         id: Cell::new(-1),
         keys: RefCell::default(),
         unhandled_presses: RefCell::default(),
-    });
-    let sink_shared = shared.clone();
-    let view = match PlatformWebEngine::create_view(Box::new(move |ev| on_event(&sink_shared, ev)))
-    {
+    }));
+    let sink_shared = Arc::clone(&shared);
+    let sink_poster = poster.clone();
+    // on the display thread: a bridge prompt goes to the JavaBridge thread with the interface table (WTC R5: U not involved), every other event to the WebView's Looper in engine order
+    let sink = move |ev| {
+        let ev = match ev {
+            WebEvent::Prompt {
+                message,
+                default,
+                reply,
+            } => match bridge::parse(&message) {
+                Some(call) => return on_bridge_call(&interfaces, call, reply),
+                None => WebEvent::Prompt {
+                    message,
+                    default,
+                    reply,
+                },
+            },
+            ev => ev,
+        };
+        let shared = Arc::clone(&sink_shared);
+        sink_poster.post(Box::new(move || on_event(&shared, ev)));
+    };
+    let view = match PlatformWebEngine::create_view(Box::new(sink)) {
         Ok(v) => v,
         Err(e) => {
             tracing::error!("webview: createWebView: {e}");
@@ -649,7 +739,8 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProvid
     let native = Box::into_raw(Box::new(Native {
         view,
         sideband: Box::leak(handle.into_boxed_slice()),
-        shared: shared.clone(),
+        shared: Arc::clone(&shared),
+        poster,
         settings: RefCell::new(settings),
         third_party: Cell::new(false),
         paused: Cell::new(false),
@@ -699,7 +790,7 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProvid
     obj
 }
 
-/// One engine event on the UI thread, to the app's clients in the engine's order (onPageStarted first; title/progress as they come).
+/// One engine event on the WebView's thread (posted there by the sink), to the app's clients in the engine's order (onPageStarted first; title/progress as they come).
 fn on_event(shared: &Shared, ev: WebEvent) {
     match ev {
         WebEvent::Location {
@@ -712,8 +803,10 @@ fn on_event(shared: &Shared, ev: WebEvent) {
             (m.uri, m.original_uri, m.back, m.forward) = (uri, original_uri, back, forward);
             return;
         }
-        WebEvent::Prompt { message, reply, .. } => {
-            return on_prompt(&shared.interfaces, &message, reply);
+        // not a bridge call (the sink sends those to the JavaBridge thread): WebChromeClient.onJsPrompt dispatch is a later slice, counted; answered null
+        WebEvent::Prompt { reply, .. } => {
+            crate::refuse("WebChromeClient.onJsPrompt");
+            return reply.finish(None);
         }
         WebEvent::Title(ref t) => shared.mirror.borrow_mut().title = Some(t.clone()),
         WebEvent::Progress(p) => shared.mirror.borrow_mut().progress = p,
@@ -1043,13 +1136,8 @@ fn on_download(env: Env, provider: Obj, [url, disposition, mime]: &[&str; 3], le
     }
 }
 
-/// A page's `prompt`, on any thread and without JNI: a bridge call goes to the JavaBridge thread with the view's interfaces; any other prompt answers null (WebChromeClient.onJsPrompt dispatch is
-/// a later slice, counted).
-fn on_prompt(interfaces: &Interfaces, message: &str, reply: Box<dyn PromptReply>) {
-    let Some(call) = bridge::parse(message) else {
-        crate::refuse("WebChromeClient.onJsPrompt");
-        return reply.finish(None);
-    };
+/// A page's bridge call (a `prompt` [`bridge::parse`] read), on the display thread and without JNI: it goes to the JavaBridge thread with the view's interfaces.
+fn on_bridge_call(interfaces: &Interfaces, call: bridge::Call, reply: Box<dyn PromptReply>) {
     let job = Job {
         interfaces: interfaces.clone(),
         call,
@@ -1633,7 +1721,9 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_loadDataW
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_evaluateJavaScript, (env, n, script: Obj, callback: Obj) -> () = (), {
     let script = string(env, script).unwrap_or_default();
     let cb = (!callback.is_null()).then(|| jni_call!(env, NewGlobalRef, callback) as usize);
-    n.view.evaluate_javascript(&script, Box::new(move |r| {
+    let poster = n.poster.clone();
+    // the result arrives on the display thread; the callback runs on the WebView's Looper ("made on the UI thread", WebView.java:878; WTC#5)
+    n.view.evaluate_javascript(&script, Box::new(move |r| poster.post(Box::new(move || {
         let Some(cb) = cb else { return };
         let Some(env) = env_now() else { return };
         // a script that throws reports "null", as Chromium's evaluateJavascript does
@@ -1642,7 +1732,7 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_evaluateJ
         raise_uncaught(env);
         delete_local(env, s);
         jni_call!(env, DeleteGlobalRef, cb as Obj);
-    }));
+    }))));
 });
 
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_stopLoading, (env, n) -> () = (), {
