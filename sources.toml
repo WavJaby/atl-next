@@ -289,6 +289,8 @@ cts = ["cts"] # cts.toml rows' modules; no build graph reads it
 "prebuilts/misc" = ["common/androidx-test/androidx/test/core/1.6.0", "common/androidx-test/androidx/test/ext/junit/1.2.0", "common/androidx-test/androidx/test/monitor/1.7.0", "common/androidx-test/androidx/test/rules/1.6.0", "common/androidx-test/androidx/test/runner/1.6.0", "common/androidx-test/androidx/test/services/storage/1.5.0", "common/androidx-test/manifests/androidx.test.core", "common/androidx-test/manifests/androidx.test.ext.junit", "common/androidx-test/manifests/androidx.test.monitor", "common/androidx-test/manifests/androidx.test.rules", "common/androidx-test/manifests/androidx.test.runner", "common/androidx-test/manifests/androidx.test.services.storage", "common/asm", "common/commons-cli", "common/ub-uiautomator"]
 development = ["sdk"]
 "system/timezone" = ["apex", "output_data"] # the com.android.tzdata APEX's inputs, linked by stage_art (no build graph reads it); drops every other dir
+"system/keymint" = ["boringssl", "common", "derive", "hal", "ta", "wire"]
+"external/rust/crates/openssl" = ["src"]
 
 # toolchain/llvm_android: read-only reference for the runtimes variants (xtask runtimes.rs mirrors its builders.py), never built.
 # clang-r547379/clang_source_info.md names 9596955b, the merge into llvm-r547379-release; no published branch or tag reaches
