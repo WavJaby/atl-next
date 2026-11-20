@@ -131,7 +131,7 @@ const REMOTE_SKIPPED: [(&str, &str); 4] = [
         "atld ends at the target's limit (timeout), not at the gate's stop, so the exit rows have nothing to compare",
     ),
     (
-        "webview-ua, webview-settings, webview-cookie-set, webview-cookie-web, webview-download, webview-scale, webview-override, webview-scheme, webview-http, webview-classloader",
+        "webview-ua, webview-settings, webview-cookie-set, webview-cookie-web, webview-download, webview-scale, webview-override, webview-scheme, webview-http, webview-threads, webview-reenter, webview-slow-callback, webview-classloader",
         "WebKitSettings needs a GDK display: no compositor on a headless run",
     ),
     (
@@ -572,6 +572,35 @@ const WEBVIEW_HTTP: Line = Line {
     ),
     timing: Timing::Async,
 };
+/// Main.webViewThreads' line (display-thread S2, WTC S5 row 1): every client callback of a main-Looper WebView runs on the WebView's Looper (`wv`: WebView.checkThread's thread; CTS
+/// WebViewSyncLoader.pumpMessages waits for load callbacks by looping that Looper; evaluateJavascript's callback "on the UI thread", WebView.java:878); the @JavascriptInterface method runs on a
+/// background thread (WebView.java:1915), named `JavaBridge` as in Chromium's provider (the name: Chromium, not AOSP; the AOSP part is "not the WebView's Looper", no `:wv` suffix).
+const WEBVIEW_THREADS: Line = Line {
+    row: "webview-threads",
+    prefix: "AtlTest: webview-threads: ",
+    want: Want::Exact(
+        "override=wv started=wv finished=wv title=wv progress=wv eval=wv download=wv bridge=JavaBridge",
+    ),
+    timing: Timing::Async,
+};
+/// Main.webViewReenter's line (display-thread S2, WTC R3 / S5 row 2): getters inside client callbacks agree with the events delivered so far, and loadUrl from onPageFinished loads (Main.webViewReenter's
+/// doc derives each value from AOSP's contract).
+const WEBVIEW_REENTER: Line = Line {
+    row: "webview-reenter",
+    prefix: "AtlTest: webview-reenter: ",
+    want: Want::Exact(
+        "p1-url=true after-load=true p2-url=true back=true forward=false override-url=true title-match=true",
+    ),
+    timing: Timing::Async,
+};
+/// Main.webViewSlowCallback's line (WTC S5 row 5): a shouldOverrideUrlLoading that sleeps 2 s and answers "load" -- the load starts after the answer (`waited=true`), the http navigation runs
+/// (`started=https,http,`). The rest (the engine's error page) is printed, not judged, as webview-http.
+const WEBVIEW_SLOW_CALLBACK: Line = Line {
+    row: "webview-slow-callback",
+    prefix: "AtlTest: webview-slow-callback: ",
+    want: Want::Prefix("calls=1 waited=true started=https,http,"),
+    timing: Timing::Async,
+};
 /// Main.webViewScale's line: setInitialScale(200) -> 200 % = 2 device pixels per CSS pixel whatever the screen density (WebView.java:1184-1188), the page's devicePixelRatio.
 const WEBVIEW_SCALE: Line = Line {
     row: "webview-scale",
@@ -645,7 +674,7 @@ struct Line {
 /// timezone: Main.onCreate's TimeZone.getDefault(), from persist.sys.timezone (RuntimeInit.java:252 reads it; atld sets it to the host zone). None = the run host's zone ([`HostFacts::zone_want`]: the target's on a remote run, never the build host's).
 /// display: Main.onCreate's Display.getAppVsyncOffsetNanos and getPresentationDeadlineNanos less the period of getRefreshRate: SurfaceFlinger.cpp getDynamicDisplayInfoInternal's appVsyncOffset
 /// and `period - sfVsyncOffset + 1 ms`, with both offsets 0 (the compositor sends app vsync and latches at the tick itself), so 0 and 1 000 000 at any refresh rate.
-const LOG_LINES: [Line; 22] = [
+const LOG_LINES: [Line; 25] = [
     START_APP_CONTEXT,
     START_STALE_RESULT_TO,
     Line {
@@ -712,6 +741,9 @@ const LOG_LINES: [Line; 22] = [
     WEBVIEW_OVERRIDE,
     WEBVIEW_SCHEME,
     WEBVIEW_HTTP,
+    WEBVIEW_THREADS,
+    WEBVIEW_REENTER,
+    WEBVIEW_SLOW_CALLBACK,
     WEBVIEW_CLASSLOADER,
 ];
 

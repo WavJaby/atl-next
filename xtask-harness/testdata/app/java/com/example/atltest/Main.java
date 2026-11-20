@@ -420,6 +420,187 @@ public class Main extends Activity {
         }
     }
 
+    /** Where a WebView callback runs: `wv` on the WebView's own Looper (WebView.getWebViewLooper), else `other:<thread name>`. */
+    static String where(android.webkit.WebView v) {
+        return android.os.Looper.myLooper() == v.getWebViewLooper() ? "wv" : "other:" + Thread.currentThread().getName();
+    }
+
+    /** Records `v` for callback `k`, keeping the first deviation from `wv` (a callback runs many times: progress, title). */
+    static void see(java.util.Map<String, String> m, String k, String v) {
+        String old = m.get(k);
+        if (old == null || old.equals("wv")) m.put(k, v);
+    }
+
+    /** webViewThreads' bridge object: records the thread its method runs on. */
+    public static final class WhoBridge {
+        volatile String thread;
+        android.os.Looper webViewLooper;
+
+        @android.webkit.JavascriptInterface
+        public String who() {
+            thread = Thread.currentThread().getName() + (android.os.Looper.myLooper() == webViewLooper ? ":wv" : "");
+            return thread;
+        }
+    }
+
+    /**
+     * The thread line (app.rs WEBVIEW_THREADS, display-thread S2): a WebView made on the main Looper; each client callback records where it runs (`where`). AOSP: every WebView method runs on the
+     * WebView's Looper (WebView.checkThread), evaluateJavascript's callback "will be made on the UI thread" (WebView.java:878), load callbacks arrive on the WebView's Looper (CTS
+     * WebViewSyncLoader.pumpMessages waits for them by looping that Looper), and @JavascriptInterface methods run "on a private, background thread of this WebView" (WebView.java:1915).
+     * Order: the page calls the bridge at onload, then navigates by script to atl-test: (taken), then the evaluate callback, then a download; the line is logged at onDownloadStart.
+     */
+    private void webViewThreads() {
+        try {
+            final android.webkit.WebView w = new android.webkit.WebView(this);
+            final java.util.Map<String, String> seen = new java.util.HashMap<>();
+            final WhoBridge bridge = new WhoBridge();
+            bridge.webViewLooper = w.getWebViewLooper();
+            final android.os.Handler wv = new android.os.Handler(w.getWebViewLooper());
+            w.getSettings().setJavaScriptEnabled(true);
+            w.addJavascriptInterface(bridge, "atl");
+            w.setWebChromeClient(new android.webkit.WebChromeClient() {
+                @Override public void onReceivedTitle(android.webkit.WebView view, String title) { see(seen, "title", where(view)); }
+                @Override public void onProgressChanged(android.webkit.WebView view, int p) { see(seen, "progress", where(view)); }
+            });
+            w.setWebViewClient(new android.webkit.WebViewClient() {
+                @Override public void onPageStarted(android.webkit.WebView view, String url, android.graphics.Bitmap favicon) { see(seen, "started", where(view)); }
+                @Override public void onPageFinished(android.webkit.WebView view, String url) { see(seen, "finished", where(view)); }
+                @Override public boolean shouldOverrideUrlLoading(final android.webkit.WebView view, android.webkit.WebResourceRequest r) {
+                    see(seen, "override", where(view));
+                    wv.post(new Runnable() {
+                        @Override public void run() {
+                            view.evaluateJavascript("1", new android.webkit.ValueCallback<String>() {
+                                @Override public void onReceiveValue(String v) {
+                                    see(seen, "eval", where(view));
+                                    view.loadData("x", "application/x-atl-test", null);
+                                }
+                            });
+                        }
+                    });
+                    return true;
+                }
+            });
+            w.setDownloadListener(new android.webkit.DownloadListener() {
+                @Override public void onDownloadStart(String url, String userAgent, String contentDisposition, String mimetype, long contentLength) {
+                    see(seen, "download", where(w));
+                    StringBuilder out = new StringBuilder();
+                    for (String k : new String[] {"override", "started", "finished", "title", "progress", "eval", "download"}) out.append(k).append('=').append(seen.get(k)).append(' ');
+                    Log.i("AtlTest", "webview-threads: " + out + "bridge=" + bridge.thread);
+                }
+            });
+            mThreadViews.add(w);
+            w.loadDataWithBaseURL(NAV_BASE, "<html><head><title>threads</title></head><body><script>onload=function(){atl.who();setTimeout(function(){location='atl-test://threads'},500)}</script></body></html>", "text/html", null, null);
+        } catch (Throwable e) {
+            Log.i("AtlTest", "webview-threads: threw=" + e);
+        }
+    }
+
+    /** A data: URL of `html`, base64 (no character the engine re-encodes, so the app's string and the engine's URL are equal). */
+    static String dataUrl(String html) {
+        return "data:text/html;base64," + android.util.Base64.encodeToString(html.getBytes(java.nio.charset.StandardCharsets.UTF_8), android.util.Base64.NO_WRAP);
+    }
+
+    /** webViewReenter's record (main Looper only). */
+    static final class Reenter {
+        String p1, p2, afterLoad, override;
+        boolean back, forward, titleMatch = true, logged;
+        int titles;
+    }
+
+    /**
+     * The re-entry line (app.rs WEBVIEW_REENTER, display-thread S2, WTC R3): getters called inside client callbacks agree with the events delivered so far, and a load from inside a callback runs.
+     * AOSP: onPageFinished(url) with getUrl() = url; loadUrl from it loads the next page and getUrl() right after names it (Chromium shows a browser-initiated pending entry); in that page's
+     * onPageFinished canGoBack() true, canGoForward() false; inside shouldOverrideUrlLoading the navigation has not started, so getUrl() is still the page; onReceivedTitle(t) with getTitle() = t.
+     */
+    private void webViewReenter() {
+        try {
+            final android.webkit.WebView w = new android.webkit.WebView(this);
+            final Reenter r = new Reenter();
+            final String p1 = dataUrl("<html><head><title>r1</title></head><body>p1</body></html>");
+            final String p2 = dataUrl("<html><head><title>r2</title></head><body>p2<script>onload=function(){setTimeout(function(){location='atl-test://reenter'},500)}</script></body></html>");
+            final android.os.Handler wv = new android.os.Handler(w.getWebViewLooper());
+            w.getSettings().setJavaScriptEnabled(true);
+            w.setWebChromeClient(new android.webkit.WebChromeClient() {
+                @Override public void onReceivedTitle(android.webkit.WebView view, String title) {
+                    r.titles++;
+                    r.titleMatch &= title.equals(view.getTitle());
+                }
+            });
+            w.setWebViewClient(new android.webkit.WebViewClient() {
+                @Override public void onPageFinished(android.webkit.WebView view, String url) {
+                    if (r.p1 == null) {
+                        r.p1 = String.valueOf(url.equals(p1) && url.equals(view.getUrl()));
+                        view.loadUrl(p2);
+                        r.afterLoad = String.valueOf(p2.equals(view.getUrl()));
+                    } else if (r.p2 == null) {
+                        r.p2 = String.valueOf(url.equals(p2) && url.equals(view.getUrl()));
+                        r.back = view.canGoBack();
+                        r.forward = view.canGoForward();
+                    }
+                }
+                @Override public boolean shouldOverrideUrlLoading(final android.webkit.WebView view, android.webkit.WebResourceRequest req) {
+                    if (r.override == null) r.override = String.valueOf(p2.equals(view.getUrl()));
+                    wv.post(new Runnable() {
+                        @Override public void run() {
+                            if (r.logged) return;
+                            r.logged = true;
+                            Log.i("AtlTest", "webview-reenter: p1-url=" + r.p1 + " after-load=" + r.afterLoad + " p2-url=" + r.p2 + " back=" + r.back + " forward=" + r.forward
+                                    + " override-url=" + r.override + " title-match=" + (r.titleMatch && r.titles > 0));
+                        }
+                    });
+                    return true;
+                }
+            });
+            mThreadViews.add(w);
+            w.loadUrl(p1);
+        } catch (Throwable e) {
+            Log.i("AtlTest", "webview-reenter: threw=" + e);
+        }
+    }
+
+    /** A slow shouldOverrideUrlLoading's sleep: long enough that an engine not waiting for the answer would start the load inside it (a load start here takes well under 1 s). */
+    static final long SLOW_CALLBACK_MS = 2000;
+
+    /**
+     * The slow callback line (app.rs WEBVIEW_SLOW_CALLBACK, WTC S5 row 5): shouldOverrideUrlLoading sleeps SLOW_CALLBACK_MS, then lets an http navigation load (port 9: refused at once). AOSP: the
+     * callback is synchronous (its return value decides the load, WebViewClient.java:33-92), so the load starts only after it returned: `waited=true` = that load's onPageStarted came after the answer.
+     * What follows the refused connection is the engine's (webview-http prints it); the line is logged at that load's onPageFinished.
+     */
+    private void webViewSlowCallback() {
+        try {
+            final android.webkit.WebView w = new android.webkit.WebView(this);
+            final Nav nav = new Nav();
+            final long[] answered = new long[1];
+            final boolean[] waited = new boolean[1];
+            w.getSettings().setJavaScriptEnabled(true);
+            w.setWebViewClient(new android.webkit.WebViewClient() {
+                @Override public boolean shouldOverrideUrlLoading(android.webkit.WebView view, android.webkit.WebResourceRequest r) {
+                    nav.calls++;
+                    android.os.SystemClock.sleep(SLOW_CALLBACK_MS);
+                    answered[0] = android.os.SystemClock.uptimeMillis();
+                    return false;
+                }
+                @Override public void onPageStarted(android.webkit.WebView view, String url, android.graphics.Bitmap favicon) {
+                    String s = schemeOf(url);
+                    if (s.equals("http") && nav.calls > 0 && answered[0] != 0 && android.os.SystemClock.uptimeMillis() >= answered[0]) waited[0] = true;
+                    nav.started.append(s).append(',');
+                }
+                @Override public void onPageFinished(android.webkit.WebView view, String url) {
+                    if (nav.calls == 0 || nav.read) return;
+                    nav.read = true;
+                    Log.i("AtlTest", "webview-slow-callback: calls=" + nav.calls + " waited=" + waited[0] + " started=" + nav.started);
+                }
+            });
+            mThreadViews.add(w);
+            w.loadDataWithBaseURL(NAV_BASE, navPage("slow", "http://127.0.0.1:9/slow"), "text/html", null, null);
+        } catch (Throwable e) {
+            Log.i("AtlTest", "webview-slow-callback: threw=" + e);
+        }
+    }
+
+    /** Keeps the S2 thread rows' WebViews reachable until their lines are logged. */
+    private final java.util.List<android.webkit.WebView> mThreadViews = new java.util.ArrayList<>();
+
     /**
      * The WebView settings line (app.rs WEBVIEW_SETTINGS, webview plan S4.1): a WebView reads back what it sets across the kinds (a flag and an int the engine applies, a text the engine applies, an int the core stores), and AOSP's defaults for what it leaves alone.
      */
@@ -514,6 +695,9 @@ public class Main extends Activity {
                         webViewNavigation("webview-override", "atl-test://done?x=1", true, false);
                         webViewNavigation("webview-scheme", "atl-test://fail", false, false);
                         webViewNavigation("webview-http", "http://127.0.0.1:9/next", false, true);
+                        webViewThreads();
+                        webViewReenter();
+                        webViewSlowCallback();
                         Log.i("AtlTest", "webview-classloader: " + webViewClassLoader());
                     }
                 });
