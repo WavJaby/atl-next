@@ -598,8 +598,57 @@ public class Main extends Activity {
         }
     }
 
-    /** Keeps the S2 thread rows' WebViews reachable until their lines are logged. */
-    private final java.util.List<android.webkit.WebView> mThreadViews = new java.util.ArrayList<>();
+    /**
+     * The HandlerThread line (app.rs WEBVIEW_LOOPER_THREAD, display-thread S2, WTC S5 row 6): a WebView made and loaded on a HandlerThread. AOSP: getWebViewLooper() is the Looper of the thread that
+     * made it (WebView.java mWebViewThread; CTS WebViewStartupTest pins it for a HandlerThread) and every callback runs there (WebView.checkThread's thread). Same callbacks as webViewThreads but the
+     * bridge and the download; the line is logged in the evaluate callback, which follows the page's script navigation (taken).
+     */
+    private void webViewLooperThread() {
+        final android.os.HandlerThread t = new android.os.HandlerThread("wv-thread");
+        t.start();
+        final android.os.Handler h = new android.os.Handler(t.getLooper());
+        h.post(new Runnable() {
+            @Override public void run() {
+                try {
+                    final android.webkit.WebView w = new android.webkit.WebView(Main.this);
+                    final java.util.Map<String, String> seen = new java.util.HashMap<>();
+                    final String looper = w.getWebViewLooper() == t.getLooper() ? "ht" : "other";
+                    w.getSettings().setJavaScriptEnabled(true);
+                    w.setWebChromeClient(new android.webkit.WebChromeClient() {
+                        @Override public void onReceivedTitle(android.webkit.WebView view, String title) { see(seen, "title", where(view)); }
+                        @Override public void onProgressChanged(android.webkit.WebView view, int p) { see(seen, "progress", where(view)); }
+                    });
+                    w.setWebViewClient(new android.webkit.WebViewClient() {
+                        @Override public void onPageStarted(android.webkit.WebView view, String url, android.graphics.Bitmap favicon) { see(seen, "started", where(view)); }
+                        @Override public void onPageFinished(android.webkit.WebView view, String url) { see(seen, "finished", where(view)); }
+                        @Override public boolean shouldOverrideUrlLoading(final android.webkit.WebView view, android.webkit.WebResourceRequest r) {
+                            see(seen, "override", where(view));
+                            h.post(new Runnable() {
+                                @Override public void run() {
+                                    view.evaluateJavascript("1", new android.webkit.ValueCallback<String>() {
+                                        @Override public void onReceiveValue(String v) {
+                                            see(seen, "eval", where(view));
+                                            StringBuilder out = new StringBuilder("looper=" + looper);
+                                            for (String k : new String[] {"override", "started", "finished", "title", "progress", "eval"}) out.append(' ').append(k).append('=').append(seen.get(k));
+                                            Log.i("AtlTest", "webview-looper-thread: " + out);
+                                        }
+                                    });
+                                }
+                            });
+                            return true;
+                        }
+                    });
+                    mThreadViews.add(w);
+                    w.loadDataWithBaseURL(NAV_BASE, "<html><head><title>looper</title></head><body><script>onload=function(){setTimeout(function(){location='atl-test://looper'},500)}</script></body></html>", "text/html", null, null);
+                } catch (Throwable e) {
+                    Log.i("AtlTest", "webview-looper-thread: threw=" + e);
+                }
+            }
+        });
+    }
+
+    /** Keeps the S2 thread rows' WebViews reachable until their lines are logged; added to from the main thread and webViewLooperThread's. */
+    private final java.util.List<android.webkit.WebView> mThreadViews = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
 
     /**
      * The WebView settings line (app.rs WEBVIEW_SETTINGS, webview plan S4.1): a WebView reads back what it sets across the kinds (a flag and an int the engine applies, a text the engine applies, an int the core stores), and AOSP's defaults for what it leaves alone.
@@ -698,6 +747,7 @@ public class Main extends Activity {
                         webViewThreads();
                         webViewReenter();
                         webViewSlowCallback();
+                        webViewLooperThread();
                         Log.i("AtlTest", "webview-classloader: " + webViewClassLoader());
                     }
                 });
