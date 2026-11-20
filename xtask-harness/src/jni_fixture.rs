@@ -15,13 +15,13 @@ use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, bail, ensure};
 use atl_layout::Layout;
-use object::read::elf::{ElfFile64, FileHeader, ProgramHeader};
+use object::read::elf::{ElfFile, FileHeader, ProgramHeader};
 use object::{Endianness, Object, ObjectSymbol, elf};
 
 use crate::atld_run::NativeLibs;
 use crate::gl_scene::Scene;
 use crate::ndk::{NdkTarget, default_ndk};
-use crate::{gl_probe, host_art, provided_gate};
+use crate::{gl_probe, host_art};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -53,11 +53,11 @@ const LEGACY: &str = "libatl-jni-legacy.so";
 /// DT_NEEDED the legacy fixture names: the guest libraries that answer its calls (atld_run.rs NB_LIBS rows).
 const LEGACY_NEEDED: [&str; 2] = ["libstdc++.so", "libz.so"];
 /// Imports the legacy fixture carries, each one a call its source makes at run time: a folded call drops its import, and the check fails.
-const LEGACY_IMPORTS: [&str; 9] = [
+/// `operator new(size_t)` is not here: its mangling depends on the width ([`operator_new`]).
+const LEGACY_IMPORTS: [&str; 8] = [
     "__sF",
     "_ctype_",
     "__strlen_chk",
-    "_Znwm",
     "_ZdlPv",
     "__cxa_guard_acquire",
     "crc32",
@@ -541,17 +541,34 @@ pub struct Shape {
     verneed: BTreeSet<(String, String)>,
     pub imports: BTreeSet<String>,
     pt_tls: bool,
+    /// ELFCLASS64; false for an arm32 / x86 fixture.
+    is_64: bool,
 }
 
+/// The shape of the ELF at `path`, either class: the fixture is built for 32-bit guests too.
 pub fn shape(path: &Path) -> Result<Shape> {
     let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let file = ElfFile64::<Endianness>::parse(&*data)
-        .with_context(|| format!("{}: not a 64-bit ELF", path.display()))?;
+    match object::FileKind::parse(&*data)? {
+        object::FileKind::Elf64 => shape_of::<elf::FileHeader64<Endianness>>(&data),
+        object::FileKind::Elf32 => shape_of::<elf::FileHeader32<Endianness>>(&data),
+        k => bail!("{}: not an ELF ({k:?})", path.display()),
+    }
+    .with_context(|| format!("{}: reading the ELF", path.display()))
+}
+
+fn shape_of<Elf: FileHeader<Endian = Endianness>>(data: &[u8]) -> Result<Shape> {
+    let file = ElfFile::<Elf>::parse(data)?;
     let endian = file.endian();
     let sections = file.elf_section_table();
+    let table = sections.dynamic_table(endian, data)?;
+    let needed = table
+        .iter()
+        .filter(|d| d.tag == elf::DT_NEEDED)
+        .map(|d| Ok(String::from_utf8_lossy(table.string(d)?).into_owned()))
+        .collect::<Result<Vec<_>>>()?;
     let mut verneed = BTreeSet::new();
-    if let Some((mut it, link)) = sections.gnu_verneed(endian, &*data)? {
-        let strings = sections.strings(endian, &*data, link)?;
+    if let Some((mut it, link)) = sections.gnu_verneed(endian, data)? {
+        let strings = sections.strings(endian, data, link)?;
         while let Some((need, mut aux)) = it.next()? {
             let f = String::from_utf8_lossy(
                 strings
@@ -569,7 +586,7 @@ pub fn shape(path: &Path) -> Result<Shape> {
     }
     let pt_tls = file
         .elf_header()
-        .program_headers(endian, &*data)?
+        .program_headers(endian, data)?
         .iter()
         .any(|p| p.p_type(endian) == elf::PT_TLS);
     let imports = file
@@ -578,10 +595,11 @@ pub fn shape(path: &Path) -> Result<Shape> {
         .filter_map(|s| s.name().ok().map(str::to_owned))
         .collect();
     Ok(Shape {
-        needed: provided_gate::needed(path)?,
+        needed,
         verneed,
         imports,
         pt_tls,
+        is_64: file.is_64(),
     })
 }
 
@@ -810,7 +828,13 @@ fn legacy_shape_failures(s: &Shape) -> Vec<String> {
         ));
     }
     f.extend(calls_failures(LEGACY, s, &LEGACY_NEEDED, &LEGACY_IMPORTS));
+    f.extend(calls_failures(LEGACY, s, &[], &[operator_new(s.is_64)]));
     f
+}
+
+/// `operator new(size_t)`'s Itanium C++ ABI mangling: size_t is `unsigned long` (`m`) on LP64, `unsigned int` (`j`) on ILP32 (Android's arm and x86 ABIs).
+fn operator_new(is_64: bool) -> &'static str {
+    if is_64 { "_Znwm" } else { "_Znwj" }
 }
 
 /// The fixture library `name` among the APK's `libs` (apk_libs).
@@ -821,14 +845,8 @@ fn lib_named<'a>(libs: &'a [PathBuf], name: &str) -> Result<&'a PathBuf> {
 }
 
 /// The fixture libraries' shapes among the APK's `libs` (apk_libs): the legacy fixture by `legacy_shape_failures`; the C3 probes' by `calls_failures` against `NDK_NEEDED` / `NDK_IMPORTS`; the ES1 scene's DT_NEEDED naming `libGLESv1_CM.so`, the proxy the scene's calls go to.
-/// A 32-bit fixture (ELF32) is not read: [`shape`] reads 64-bit ELF only, and the same sources' 64-bit build carries these checks; said so on stdout.
 pub fn shape_failures(libs: &[PathBuf]) -> Result<Vec<String>> {
     let lib = lib_named(libs, LIB)?;
-    let data = std::fs::read(lib).with_context(|| format!("reading {}", lib.display()))?;
-    if object::FileKind::parse(&*data)? == object::FileKind::Elf32 {
-        println!("app: fixture shapes not checked: {LIB} is a 32-bit ELF");
-        return Ok(Vec::new());
-    }
     let mut whys = legacy_shape_failures(&shape(lib_named(libs, LEGACY)?)?);
     let s = shape(lib)?;
     whys.extend(calls_failures(LIB, &s, &NDK_NEEDED, &NDK_IMPORTS));
@@ -847,10 +865,12 @@ mod tests {
             verneed: BTreeSet::new(),
             imports: LEGACY_IMPORTS
                 .iter()
+                .chain(&["_Znwm"])
                 .filter(|&&i| Some(i) != drop)
                 .map(|&i| i.to_owned())
                 .collect(),
             pt_tls: false,
+            is_64: true,
         };
         let all = ["libc.so", "libstdc++.so", "libz.so"];
         assert!(legacy_shape_failures(&shape_of(&all, None)).is_empty());
@@ -865,6 +885,12 @@ mod tests {
             legacy_shape_failures(&shape_of(&all, Some("_Znwm"))).len(),
             1
         );
+        // ILP32: size_t is unsigned int, so operator new is _Znwj (Itanium ABI `j`); the LP64 name is a miss
+        let mut ilp32 = shape_of(&all, Some("_Znwm"));
+        ilp32.is_64 = false;
+        assert_eq!(legacy_shape_failures(&ilp32).len(), 1);
+        ilp32.imports.insert("_Znwj".into());
+        assert!(legacy_shape_failures(&ilp32).is_empty());
     }
 
     fn s(imports: &[&str], pt_tls: bool) -> Shape {
@@ -873,6 +899,7 @@ mod tests {
             verneed: BTreeSet::from([("libc.so".into(), "LIBC".into())]),
             imports: imports.iter().map(|&i| i.to_owned()).collect(),
             pt_tls,
+            is_64: true,
         }
     }
 
@@ -948,6 +975,7 @@ mod tests {
             verneed: BTreeSet::new(),
             imports: BTreeSet::new(),
             pt_tls: false,
+            is_64: true,
         };
         assert!(calls_failures(LIB, &shape_of(&[ES1_LIB]), &[ES1_LIB], &[]).is_empty());
         assert_eq!(
