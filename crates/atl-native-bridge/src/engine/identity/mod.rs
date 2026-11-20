@@ -625,6 +625,8 @@ impl Down {
             Down::Env => 1,
             Down::Vm => 2,
             Down::Itf(t) => 3 + t as u32,
+            // ILP32 only (QEMU): `identity::down` refuses it before a stub is made
+            Down::Handle(_) => u32::MAX,
         }
     }
 
@@ -711,6 +713,9 @@ fn new_chunk() -> Result<Pool, String> {
 
 /// A host-callable address that runs guest function `target` on the calling thread's guest thread pointer (attaching the thread first if needed), every argument as the caller passed it.
 pub fn down(target: usize, kind: Down) -> Result<usize, String> {
+    if let Down::Handle(ty) = kind {
+        return Err(format!("down kind Handle({ty}) is ILP32-only"));
+    }
     let mut pool = POOL.lock().map_err(|_| "down stubs: poisoned".to_owned())?;
     if pool
         .as_ref()

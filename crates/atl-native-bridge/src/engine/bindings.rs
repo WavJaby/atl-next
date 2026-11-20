@@ -125,6 +125,8 @@ pub enum LaneMap {
     Env,
     /// a guest function pointer -> a host-callable down shell ([`Active::down`], plain kind) whose lanes follow this shorty; NULL stays NULL
     Down(&'static [u8]),
+    /// ILP32: [`LaneMap::Down`] whose callback's first argument is a host object of this handle type -> its handle for the callback's duration (`Down::Handle`)
+    DownHandle(&'static [u8], &'static str),
     /// ILP32: a guest pointer to this record in the guest's layout -> a host temporary in the host's (convert.rs); `true`: converted back after the call. NULL stays NULL.
     Record(&'static Conv, bool),
     /// ILP32: a guest pointer to one word -> a host-width temporary, written back narrowed (convert.rs). NULL stays NULL.

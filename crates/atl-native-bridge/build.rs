@@ -268,6 +268,55 @@ const CALLBACKS: &[&str] = &[
     "AAudioStream_errorCallback",
     "AAudioStream_presentationEndCallback",
 ];
+/// The `CALLBACKS` typedefs an ILP32 (arm) row maps to a down shell (`ilp32_maps`), each with the handle type of its first argument when that is a host object (`LaneMap::DownHandle`, engine `Down::Handle`: the guest's live handle, or one issued for the callback and freed when it returns) and the review. The shell places the guest's own prototype (the classifier's guest-view shorty: `long` is 32 bits, `int64_t` an aligned register pair, AAPCS32 5.5). Every other argument must be a value or the guest's own data: a host pointer the guest would load through (above 4 GiB) cannot cross. Each name must be in `CALLBACKS` and used by an ILP32 row (build fails otherwise).
+/// Not here, with why: `AAudioStream_dataCallback` (`audioData` is the host track's buffer, out of a 32-bit guest's reach: needs a per-callback window copy of `numFrames` frames, P5/P6).
+const ILP32_CALLBACKS: &[(&str, Option<&str>, &str)] = &[
+    (
+        "ALooper_callbackFunc",
+        None,
+        "looper.h: (int fd, int events, void* data): values + the guest's data",
+    ),
+    (
+        "AChoreographer_frameCallback",
+        None,
+        "choreographer.h: (long frameTimeNanos, void* data): long is 32 bits on arm, as AOSP's 32-bit libandroid passes it",
+    ),
+    (
+        "AChoreographer_frameCallback64",
+        None,
+        "choreographer.h: (int64_t frameTimeNanos, void* data)",
+    ),
+    (
+        "AChoreographer_refreshRateCallback",
+        None,
+        "choreographer.h: (int64_t vsyncPeriodNanos, void* data)",
+    ),
+    (
+        "AChoreographer_vsyncCallback",
+        Some("AChoreographerFrameCallbackData"),
+        "choreographer.h: (const AChoreographerFrameCallbackData*, void* data): the data is host stack memory valid only during the callback, which the guest only hands back to the AChoreographerFrameCallbackData_* rows: a handle for the callback's duration",
+    ),
+    (
+        "AMediaDataSourceGetSize",
+        None,
+        "NdkMediaDataSource.h: ssize_t (void* userdata)",
+    ),
+    (
+        "AMediaDataSourceClose",
+        None,
+        "NdkMediaDataSource.h: void (void* userdata)",
+    ),
+    (
+        "AAudioStream_errorCallback",
+        Some("AAudioStream"),
+        "AAudio.h: (AAudioStream*, void* userData, aaudio_result_t error): the stream the guest opened (its live handle)",
+    ),
+    (
+        "AAudioStream_presentationEndCallback",
+        Some("AAudioStream"),
+        "AAudio.h: (AAudioStream*, void* userData)",
+    ),
+];
 /// NDK functions with JNI types in their prototype, bound lane-mapped (`Entry::Mapped`, engine/ndk.rs `call_mapped`: the guest's `JNIEnv*` mapped to the host's, the rest passed as int lanes; references are the host's already). A generic row would hand the host library the guest's env (tr-first blocker 3: `ANativeWindow_fromSurface` -> SEGV in `android_view_Surface_getSurface`), so a JNI-typed prototype missing here fails the build naming it (`atl_bridgegen::jni::route`), and a name here without one is stale.
 const ENV_SHIMS: &[&str] = &[
     "AAssetManager_fromJava",
@@ -1608,6 +1657,30 @@ fn ilp32_maps(
                         .any(|(f, at, _)| *f == name && *at == p),
                 },
             )),
+            // a reviewed callback (ILP32_CALLBACKS) whose route made it a down shell: the guest's own prototype placed
+            (Kind::Callback(shorty), Some(p)) => match route {
+                Route::Mapped(m) => m.iter().find_map(|(at, x)| match x {
+                    LaneMap::Down { ty, .. } if *at == p => ILP32_CALLBACKS
+                        .iter()
+                        .find(|(t, ..)| t == ty)
+                        .map(|(_, handle, _)| {
+                            let (ty, shorty) = (ty.clone(), shorty.clone());
+                            match handle {
+                                None => (p, LaneMap::Down { ty, shorty }),
+                                Some(h) => (
+                                    p,
+                                    LaneMap::DownHandle {
+                                        ty,
+                                        shorty,
+                                        handle: (*h).to_owned(),
+                                    },
+                                ),
+                            }
+                        }),
+                    _ => None,
+                }),
+                _ => None,
+            },
             (Kind::OutWord(w), Some(p)) => Some((p, LaneMap::OutWord(*w))),
             (Kind::OutHandle(ty), Some(p)) => ILP32_HANDLE_SLOTS
                 .iter()
@@ -1646,7 +1719,15 @@ fn ilp32_maps(
     if let Some(k) = blocking {
         return Err(k.trap_reason());
     }
-    if !matches!(route, Route::Plain) {
+    // the route's down shells are the ones mapped above; a JNIEnv lane or an unreviewed callback still traps
+    let routed = match route {
+        Route::Plain => true,
+        Route::Mapped(m) => m
+            .iter()
+            .all(|(at, x)| matches!(x, LaneMap::Down { .. }) && maps.iter().any(|(p, _)| p == at)),
+        Route::Pending(_) => false,
+    };
+    if !routed {
         return Err("pending: ilp32 converted row with a JNI or callback lane");
     }
     let (Ok(class), Ok(params)) = (
@@ -2210,6 +2291,24 @@ fn bindings_table(
             "{t}: in CALLBACKS but no proxy row with a prototype in the set takes it"
         );
     }
+    // ILP32_CALLBACKS: each a CALLBACKS typedef (reviewed for every model first) and, on the ILP32 table, taken by a converted row (stale)
+    for (t, ..) in ILP32_CALLBACKS {
+        ensure!(
+            CALLBACKS.contains(t),
+            "{t}: in ILP32_CALLBACKS but not in CALLBACKS"
+        );
+        ensure!(
+            equal_model
+                || mapped_rows
+                    .iter()
+                    .any(|(_, _, m, ..)| m.iter().any(|(_, x)| matches!(
+                        x,
+                        LaneMap::Down { ty, .. } | LaneMap::DownHandle { ty, .. } if ty == t
+                    ))),
+            "{t}: in ILP32_CALLBACKS but no converted row of the {} table takes it (stale row)",
+            guest.row.arch
+        );
+    }
     // stale-row check of ILP32_PROXY_SHIMS: each bound as its own converter on the ILP32 table
     for n in ILP32_PROXY_SHIMS.iter().filter(|_| !equal_model) {
         ensure!(
@@ -2420,6 +2519,9 @@ fn bindings_table(
                     format!("({i}, LaneMap::Handles({ty:?}, Slots::{slots:?}, {len:?}))")
                 }
                 LaneMap::Down { shorty, .. } => format!("({i}, LaneMap::Down(b{shorty:?}))"),
+                LaneMap::DownHandle { shorty, handle, .. } => {
+                    format!("({i}, LaneMap::DownHandle(b{shorty:?}, {handle:?}))")
+                }
                 LaneMap::Record { name, out } => {
                     format!("({i}, LaneMap::Record(&C_{name}, {out}))")
                 }
@@ -2631,6 +2733,7 @@ const BREAKS: &[(&str, &str)] = &[
     ("jni_swap", "atl_nb_jni_swap"),
     // Q6-7 (engine/va_list.rs `fp`): a guest va_list's fp arguments are read from its integer save area (qemu-jni gate, `V`)
     ("va_fp_gp", "atl_nb_va_fp_gp"),
+    ("va32_slot8", "atl_nb_va32_slot8"),
     // Q6-3 (engine/dispatch.rs `call_host`): the fp lanes reach the host as zeros (qemu-jni gate, `d` and `f`)
     ("v_drop", "atl_nb_v_drop"),
     // Q6-3 (engine/dispatch.rs `call_host`): the stack words reach the host one word early (qemu-jni gate, `d`)

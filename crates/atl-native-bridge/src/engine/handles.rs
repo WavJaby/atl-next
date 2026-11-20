@@ -63,7 +63,24 @@ pub(super) fn to_guest(ty: &'static str, host: usize) -> Option<u32> {
     if cfg!(atl_nb_ilp32_raw_handles) {
         return u32::try_from(host).ok();
     }
-    with(|t| {
+    with(|t| t.issue(ty, host))
+}
+
+/// The handle of host object `host` for one callback's duration (`Down::Handle`): the live handle when the object has one (`false`: not the caller's to free -- the guest holds it, e.g. the `AAudioStream*` it opened), else a new one (`true`: the caller frees it with [`release`] when the callback returns, the object's life being the callback's -- choreographer.h `AChoreographerFrameCallbackData`, "only valid during the callback"). NULL -> `(0, false)`. `None` when every slot is in use.
+pub(super) fn scoped(ty: &'static str, host: usize) -> Option<(u32, bool)> {
+    if host == 0 || cfg!(atl_nb_ilp32_raw_handles) {
+        return to_guest(ty, host).map(|h| (h, false));
+    }
+    with(|t| match t.by_host.get(&host) {
+        Some(&h) => Some((h, false)),
+        None => t.issue(ty, host).map(|h| (h, true)),
+    })
+}
+
+impl Table {
+    /// [`to_guest`] under the lock: the live handle of `host`, else a new one.
+    fn issue(&mut self, ty: &'static str, host: usize) -> Option<u32> {
+        let t = self;
         if let Some(&h) = t.by_host.get(&host) {
             return Some(h);
         }
@@ -87,7 +104,7 @@ pub(super) fn to_guest(ty: &'static str, host: usize) -> Option<u32> {
         let h = t.handle(index);
         t.by_host.insert(host, h);
         Some(h)
-    })
+    }
 }
 
 /// The host object handle `h` names: `Some(0)` for 0 (NULL passes as NULL); `None` for a handle this table does not hold.
@@ -225,5 +242,20 @@ mod tests {
         for h in [again, hb, hl] {
             release(h as usize);
         }
+    }
+
+    /// A callback argument's handle (`Down::Handle`): an object the guest already names keeps its handle and is not the callback's to free (AAudio.h error callback's `AAudioStream*`); one it does not is issued fresh and freed after (choreographer.h: frame callback data valid only during the callback), so a use after the callback is refused.
+    #[test]
+    fn a_callback_argument_borrows_a_live_handle_or_gets_a_scoped_one() {
+        let (stream, data) = (0x7f00_0000_5000usize, 0x7f00_0000_6000usize);
+        let held = to_guest("AAudioStream", stream).unwrap();
+        assert_eq!(scoped("AAudioStream", stream), Some((held, false)));
+        let (h, fresh) = scoped("AChoreographerFrameCallbackData", data).unwrap();
+        assert!(fresh && h != 0);
+        assert_eq!(to_host(h as usize), Some(data));
+        release(h as usize);
+        assert_eq!(to_host(h as usize), None, "used after its callback");
+        assert_eq!(scoped("T", 0), Some((0, false)));
+        release(held as usize);
     }
 }

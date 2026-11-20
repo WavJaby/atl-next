@@ -2,7 +2,7 @@
 //! Guest-main gate (phase4-32bit P4b), harness-less: the real guest linker starts `main_exe.c` (PIE on the stub libc); the host calls its `fx_run`, which does what bionic's `__libc_init` does after the start, `exit(main())`. main creates a thread of an explicit attr, joins it, then a thread that registers thread-exit destructors (`__cxa_thread_atexit_impl`, what a C++ `thread_local` compiles to), a key value and a cleanup handler and ends in `pthread_exit`, then one that pops a handler with execute and returns, registers two on the main thread, and returns. The guest's exit runs its `__cxa_finalize`, then NBS's `native_bridge_exit` stub, bound to the host's `exit`: this process ends there, and an `on_exit` handler reports.
 //! Env (xtask qemu_linker.rs sets it; unset prints SKIP): ATL_NB_ARCH, ATL_ENGINE_SO, ATL_NB_BOOT, ATL_NB_MAINEXE, ATL_NB_LINKER, ATL_NB_VDSO.
 //! Expected values come from main_exe.c, never from the engine: main returns `MAIN_STATUS` 0x2a when the thread round trip held, else the failing step 1..5 (6..9: the workers' exit work; 8 = not "BACK" at the pthread_exit worker's join, 9 = not "DEK" at the returning worker's; break `exit_skip_cleanup` = 8; 11 = not "FG" from the worker whose key destructor registers a thread-exit destructor late, which bionic leaks; 10 = a thread created detached whose `pthread_getattr_np` does not report PTHREAD_CREATE_DETACHED).
-//! Checks: (s) started, (c) thread churn before main (tests/common/churn.rs: 2000 `fx_join_one` threads give back every reserve block, heap and resident growth <= 2048 B/thread), (n) the resolver round (`fx_dns`: getaddrinfo walk + free, getnameinfo, gethostbyname/addr, gai_strerror, every field in the guest's own layout) answers 0 twice and leaves the engine's window count where it was ([`resolver`]), (e) the guest's exit reached the host's (the handler ran), (v) the status is 0x2a, (d) `fx_events` at the host's exit is [`EVENTS`] (each destructor and cleanup handler once; bionic pthread_exit.cpp order: thread_local destructors in reverse, then cleanup handlers, then key destructors), (l) the late registration (a key destructor's, after the thread-exit list ran) answered 0 without aborting and was counted once, (r) no host pointer refused to a 32-bit guest (`ILP32_REFUSED` = 0). Output `qemu-main: (x) ok` / `(x) FAIL <why>`; the process exits 0 when all pass.
+//! Checks: (s) started, (c) thread churn before main (tests/common/churn.rs: 2000 `fx_join_one` threads give back every reserve block, heap and resident growth <= 2048 B/thread), (n) the resolver round (`fx_dns`: getaddrinfo walk + free, getnameinfo, gethostbyname/addr, gai_strerror, every field in the guest's own layout) answers 0 twice and leaves the engine's window count where it was ([`resolver`]), (k) host calls through down shells deliver the guest's prototype and a scoped handle ([`callbacks`]), (e) the guest's exit reached the host's (the handler ran), (v) the status is 0x2a, (d) `fx_events` at the host's exit is [`EVENTS`] (each destructor and cleanup handler once; bionic pthread_exit.cpp order: thread_local destructors in reverse, then cleanup handlers, then key destructors), (l) the late registration (a key destructor's, after the thread-exit list ran) answered 0 without aborting and was counted once, (r) no host pointer refused to a 32-bit guest (`ILP32_REFUSED` = 0). Output `qemu-main: (x) ok` / `(x) FAIL <why>`; the process exits 0 when all pass.
 //! A guest call to a trapped stub (break `main_exit_unbound`: no host side for `native_bridge_exit`; break `main_tls_dtor_unbound`: none for `native_bridge___cxa_thread_atexit_impl`) aborts naming it, so (e) never prints.
 #![allow(clippy::print_stdout, reason = "test harness output is its verdict")]
 #![allow(
@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use atl_native_bridge::engine::{Config, Guest, ILP32_REFUSED, RESERVED, qemu};
+use atl_native_bridge::engine::{Config, Down, Guest, ILP32_REFUSED, RESERVED, qemu};
 use object::{Object, ObjectSymbol};
 
 #[path = "common/churn.rs"]
@@ -45,6 +45,20 @@ const LATE_KEY: (&str, &str) = (
 );
 /// Check (c)'s result, read by the exit handler.
 static CHURN_OK: AtomicBool = AtomicBool::new(false);
+/// Check (k)'s result, read by the exit handler.
+static CB_OK: AtomicBool = AtomicBool::new(false);
+/// main_exe.c `fx_cb`, `fx_cbh`, `fx_seen` symbol values.
+static CB_SYMS: OnceLock<(u64, u64, u64)> = OnceLock::new();
+/// Check (k)'s arguments: a negative `int` (sign kept through r0), an `int64_t` whose halves differ (an AAPCS32 pair in the wrong order or slot shows), user data below 4 GiB (the guest's own pointer), and a host object above 4 GiB that must reach the guest as a handle.
+const CB_ARGS: (i32, i64, usize, usize, usize) = (
+    -7,
+    0x1122_3344_5566_7788,
+    0x1234_5678,
+    0x7f00_dead_0000,
+    0x0bad_cafe,
+);
+/// The handle type check (k)'s `Down::Handle` shell issues (a tag only, handles.rs).
+const CB_HANDLE_TY: &str = "fx-callback-object";
 
 unsafe extern "C" {
     /// glibc: runs at `exit` with its status, before the process ends.
@@ -73,7 +87,9 @@ extern "C" fn at_exit(status: i32, _: *mut c_void) {
     println!("qemu-main: values status {status:#x} ilp32 refused {refused}");
     // exact `diag: total` lines (refused native-bridge.ilp32-* keys among them) for the gate's ILP32_REFUSED line (qemu_linker.rs `refused_line`)
     atl_diag::flush_totals();
-    let mut ok = CHURN_OK.load(Ordering::Relaxed) && DNS_OK.load(Ordering::Relaxed);
+    let mut ok = CHURN_OK.load(Ordering::Relaxed)
+        && DNS_OK.load(Ordering::Relaxed)
+        && CB_OK.load(Ordering::Relaxed);
     ok &= check('e', Ok(()));
     ok &= check(
         'v',
@@ -149,6 +165,74 @@ fn resolver(guest: &mut Guest, fx_dns: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// Check (k): host calls through down shells (engine `Active::down`, what an NDK row hands the host for a guest callback, build.rs `ILP32_CALLBACKS`). `fx_cb(int, int64_t, void*)` with the guest's shorty `VIJL` gets [`CB_ARGS`] exactly (break `shorty_swap`: the first parameter's class flipped, red). `fx_cbh(obj, data)` through a `Down::Handle` shell twice: the guest sees a non-zero handle below 2^31, not the host address, a different one per call, and none stays live after the callback returns (choreographer.h: frame callback data valid only during the callback).
+fn callbacks(bias: u64) -> Result<(), String> {
+    let &(fx_cb, fx_cbh, fx_seen) = CB_SYMS.get().ok_or("no symbols")?;
+    let seen = bias.wrapping_add(fx_seen) as *const u64;
+    let read = |k: usize| {
+        // SAFETY: main_exe.c fx_seen, five u64 in this address space (guest addresses are host addresses).
+        unsafe { seen.add(k).read_volatile() }
+    };
+    let (a, b, p, obj, data) = CB_ARGS;
+    let engine = atl_native_bridge::engine::active();
+    let plain = engine.down(
+        bias.wrapping_add(fx_cb) as usize,
+        Down::Plain,
+        Some(b"VIJL"),
+    )?;
+    // SAFETY: the down shell of fx_cb, called with its prototype.
+    let f: extern "C" fn(i32, i64, usize) = unsafe { std::mem::transmute(plain) };
+    f(a, b, p);
+    let got = (read(0) as i64, read(1) as i64, read(2) as usize);
+    println!(
+        "qemu-main: values cb {:#x} {:#x} {:#x}",
+        got.0, got.1, got.2
+    );
+    if got != (i64::from(a), b, p) {
+        return Err(format!(
+            "fx_cb got {got:#x?}, sent ({a}, {b:#x}, {p:#x}) (main_exe.c)"
+        ));
+    }
+    let scoped = engine.down(
+        bias.wrapping_add(fx_cbh) as usize,
+        Down::Handle(CB_HANDLE_TY),
+        Some(b"VLL"),
+    )?;
+    // SAFETY: the down shell of fx_cbh, called with its prototype.
+    let g: extern "C" fn(usize, usize) = unsafe { std::mem::transmute(scoped) };
+    let live = || {
+        atl_native_bridge::engine::handles::live()
+            .into_iter()
+            .find(|(t, _)| *t == CB_HANDLE_TY)
+            .map_or(0, |(_, n)| n)
+    };
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        g(obj, data);
+        let (h, d) = (read(3), read(4) as usize);
+        println!("qemu-main: values cbh {h:#x} {d:#x} live {}", live());
+        if h == 0 || h >= 1 << 31 || h == obj as u64 & 0xffff_ffff || d != data {
+            return Err(format!(
+                "fx_cbh got ({h:#x}, {d:#x}) for host object {obj:#x}: expected a handle and {data:#x}"
+            ));
+        }
+        if live() != 0 {
+            return Err(format!(
+                "{} callback handles live after the callback returned",
+                live()
+            ));
+        }
+        handles.push(h);
+    }
+    if handles[0] == handles[1] {
+        return Err(format!(
+            "the freed handle {:#x} was issued again unchanged",
+            handles[0]
+        ));
+    }
+    Ok(())
+}
+
 fn started(r: Result<Guest, String>) -> u64 {
     let Some(&(e_entry, fx_run, fx_join_one, fx_events, fx_dns)) = EXPECTED.get() else {
         return 2;
@@ -180,6 +264,7 @@ fn started(r: Result<Guest, String>) -> u64 {
         }),
     );
     CHURN_OK.store(c, Ordering::Relaxed);
+    CB_OK.store(check('k', callbacks(bias)), Ordering::Relaxed);
     let n = check(
         'n',
         resolver(&mut guest, bias.wrapping_add(fx_dns) as usize),
@@ -225,6 +310,10 @@ fn main() -> ExitCode {
                 sym("fx_events")?,
                 sym("fx_dns")?,
             ))
+            .and_then(|x| {
+                let _ = CB_SYMS.set((sym("fx_cb")?, sym("fx_cbh")?, sym("fx_seen")?));
+                Ok(x)
+            })
         });
     match expected {
         Ok(x) => {

@@ -56,16 +56,38 @@ pub enum Down {
     Vm,
     /// an OpenSL ES callback: its first argument a host interface of proxy table `t` -> its guest proxy (sles.rs `down_args`, which also rewrites `slObjectCallback`'s 6th)
     Itf(objects::TableId),
+    /// ILP32 callback (build.rs `ILP32_CALLBACKS`): its first argument a host object of this handle type -> the guest's handle for it ([`handles::scoped`]), freed when the callback returns if issued for it. QEMU only: identity guests are LP64 and never get this kind.
+    Handle(&'static str),
 }
 
 impl Down {
-    /// Rewrites the host argument words `first` and `sixth` of a down call of this kind to the guest's objects for them. Both engines' crossings call it before the guest runs.
+    /// Rewrites the host argument words `first` and `sixth` of a down call of this kind to the guest's objects for them. Both engines' crossings call it before the guest runs ([`Down::Handle`] is [`Down::host_object`]'s, made before placement).
     pub(in crate::engine) fn guest_args(self, first: &mut usize, sixth: &mut usize) {
         match self {
-            Down::Plain => {}
+            Down::Plain | Down::Handle(_) => {}
             Down::Env => *first = jni::guest_env(*first),
             Down::Vm => *first = jni::guest_vm(*first),
             Down::Itf(t) => sles::down_args(t, first, sixth),
+        }
+    }
+
+    /// [`Down::Handle`]: the host's first argument word `first` (a host object) -> its handle, before the call is placed for the guest (a host address does not fit a 32-bit guest's word: placement would refuse it). Answers the handle to free when the guest returns, if issued for this call. Other kinds: no change.
+    pub(in crate::engine) fn host_object(self, first: &mut u64) -> Option<usize> {
+        let Down::Handle(ty) = self else { return None };
+        match handles::scoped(ty, *first as usize) {
+            Some((h, fresh)) => {
+                *first = u64::from(h);
+                fresh.then_some(h as usize)
+            }
+            // table full: the guest gets NULL, which every accessor row refuses
+            None => {
+                dispatch::report_refused(
+                    dispatch::REFUSED_HANDLE,
+                    &format!("callback argument {ty}: handle table full"),
+                );
+                *first = 0;
+                None
+            }
         }
     }
 }

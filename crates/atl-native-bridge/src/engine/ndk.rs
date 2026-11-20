@@ -118,7 +118,12 @@ pub(super) fn call_mapped(
                     .down(lanes[i], super::Down::Plain, Some(shorty))
                     .unwrap_or_else(|e| unsupported(&format!("{symbol}: callback lane {i}: {e}")));
             }
-            LaneMap::Down(_) => {}
+            LaneMap::DownHandle(shorty, ty) if lanes[i] != 0 => {
+                lanes[i] = super::active()
+                    .down(lanes[i], super::Down::Handle(ty), Some(shorty))
+                    .unwrap_or_else(|e| unsupported(&format!("{symbol}: callback lane {i}: {e}")));
+            }
+            LaneMap::Down(_) | LaneMap::DownHandle(..) => {}
         }
     }
     let [a0, a1, a2, a3, a4, a5] = lanes;

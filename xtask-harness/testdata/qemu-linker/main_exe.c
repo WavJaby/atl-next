@@ -157,6 +157,21 @@ __attribute__((used, noinline)) long fx_dns(void) {
     return bad;
 }
 
+// Check (k): what a host call through a down shell delivers, stored for the host to read (qemu_main.rs `callbacks`). fx_cb's prototype makes AAPCS32 skip r1 (b takes the aligned pair r2:r3) and put p on the stack (AAPCS32 C.3, C.5); AAPCS64 takes x0, x1, x2. [0] a sign-extended, [1] b, [2] p, [3] fx_cbh's obj, [4] its data.
+__attribute__((used)) uint64_t fx_seen[5];
+
+__attribute__((used, noinline)) void fx_cb(int32_t a, int64_t b, void *p) {
+    fx_seen[0] = (uint64_t)(int64_t)a;
+    fx_seen[1] = (uint64_t)b;
+    fx_seen[2] = (uintptr_t)p;
+}
+
+// A callback whose first argument is a host object (choreographer.h vsync callback shape): the guest sees a handle, never the host address.
+__attribute__((used, noinline)) void fx_cbh(void *obj, void *data) {
+    fx_seen[3] = (uintptr_t)obj;
+    fx_seen[4] = (uintptr_t)data;
+}
+
 int main(void) {
     int failed = thread_round_trip();
     if (!failed) failed = thread_dtors();

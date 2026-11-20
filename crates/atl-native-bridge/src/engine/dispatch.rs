@@ -116,9 +116,16 @@ fn call_object(rules: HostRules, id: u32, lanes: &AtlLanes) -> Answer {
             // SAFETY: `host` is the host env behind the guest env; lane k - 1 is the call's jmethodID (jni.h: every V slot's va_list follows its methodID).
             let params = unsafe { jni::method_params(host, method) }
                 .unwrap_or_else(|| refuse(Refused::NoShorty { name }));
-            // SAFETY: lane k is the guest's va_list pointer, and the guest made the call with the method's arguments (JNI contract).
-            args = unsafe { va_list::jvalues(*rules.int_arg(&mut lanes, k) as usize, params) }
-                .unwrap_or_else(|c| refuse(Refused::Shorty { name, c }));
+            let va = *rules.int_arg(&mut lanes, k) as usize;
+            // SAFETY: lane k is the guest's va_list -- a pointer to it (AAPCS64), its `__ap` (AAPCS32: the one-word struct passed by value) -- and the guest made the call with the method's arguments (JNI contract).
+            args = unsafe {
+                if rules.word_bits == AAPCS64.word_bits {
+                    va_list::jvalues(va, params)
+                } else {
+                    va_list::jvalues32(va, params)
+                }
+            }
+            .unwrap_or_else(|c| refuse(Refused::Shorty { name, c }));
             *rules.int_arg(&mut lanes, k) = args.as_ptr() as u64;
             jni::a_slot(id as usize)
         }
@@ -344,6 +351,8 @@ fn down_body(slot: usize, host: &mut AtlLanes) {
         unsupported("qemu crossing: down shell without a binding")
     };
     let rules = super::qemu::arch().rules();
+    // an ILP32 callback's host object (`Down::Handle`, the host's first integer) -> its handle before placement; a handle issued for this call only is freed when the guest returns
+    let scoped = d.kind.host_object(&mut host.regs[0]);
     let Some(mut guest) = place(&d.params, host, HOST, rules) else {
         refuse_down(d.target, &d.params)
     };
@@ -363,6 +372,9 @@ fn down_body(slot: usize, host: &mut AtlLanes) {
     #[cfg(atl_nb_down_noenv)]
     let _ = d.kind;
     super::qemu::call_down(d.target, &mut guest);
+    if let Some(h) = scoped {
+        super::handles::release(h);
+    }
     // a 32-bit guest's r0 / r0:r1 joined and widened first (`host_ret32`); aarch64's x0 and v0 are already the host's lanes
     let (x, v) = if rules.word_bits == AAPCS64.word_bits {
         (guest.ret[0], guest.fp[0])
@@ -506,7 +518,8 @@ pub(in crate::engine) fn down_params(
     let (implicit, s): (&[Class], &[u8]) = match (kind, shorty) {
         (Down::Vm, None) => return Ok(vec![Class::Ptr, Class::Ptr]),
         (Down::Env, Some(s)) => (&[Class::Ptr, Class::Ptr], s),
-        (Down::Plain, Some(s)) => (&[], s),
+        // an ILP32 callback with a host object first: that object is the shorty's first `L`
+        (Down::Plain | Down::Handle(_), Some(s)) => (&[], s),
         // an SL callback: the interface first, then the shorty's (sles.rs gives one per callback type)
         (Down::Itf(_), Some(s)) => (&[Class::Ptr], s),
         (kind, shorty) => {

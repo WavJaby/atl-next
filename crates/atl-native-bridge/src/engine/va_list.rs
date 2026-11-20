@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The AArch64 guest's `va_list` (Q6-7), read per a JNI shorty into the host's `jvalue[]`: a guest `...V` JNI call becomes the host's `...A` call, so no host `va_list` is built (dispatch.rs `call_object`).
 //! Layout (AAPCS64 B.3; LLVM AArch64ISelLowering.cpp `LowerAAPCS_VASTART`): `__stack`, `__gr_top`, `__vr_top`, `__gr_offs`, `__vr_offs`, 32 bytes, passed by reference. A register argument sits at `top + offs` (`offs` < 0 counts up by 8 for the integer save area, by 16 for the fp one, low 8 bytes = the double); once `offs` would pass 0 the class continues on `__stack`, 8-byte slots shared by both classes in argument order (berberis `GuestVAListParams`, the named-argument rule continued).
+//! The ARM (AAPCS32) guest's `va_list` ([`jvalues32`]): AAPCS32 B.1 `typedef struct __va_list { void *__ap; } va_list`, passed by value, so the lane holds `__ap` itself. Variadic calls use the base standard (AAPCS32 6.4.1 / 5.5: no VFP registers), and va_start spills r0-r3 contiguous with the stack arguments, so the list is one run of 4-byte words: a 4-byte type takes one, an 8-byte type (J, D, and F after promotion to double) the next 8-aligned pair (C.3 / C.12: doubleword-aligned arguments; clang `ARMABIInfo::EmitVAArg` rounds `__ap` up to the type's alignment).
 //! Types come from the shorty, as ART's own `CallXMethodV` and berberis `ConvertVAList` read them: Z B S C I promoted to an int slot, J and L a word, F promoted to double then narrowed, D a double. Guest addresses are host addresses (QEMU user mode, identity mapped).
 
 /// AAPCS64 `va_list`.
@@ -109,4 +110,89 @@ unsafe fn stack(v: &mut VaList) -> u64 {
 unsafe fn load(a: usize) -> u64 {
     // SAFETY: caller contract.
     unsafe { std::ptr::read_unaligned(a as *const u64) }
+}
+
+/// An AAPCS32 `va_list` slot: one 4-byte word; 8-byte types take an 8-aligned pair. Break `va32_slot8` (qemu main gate, check (k) variadic call; unit test below): 8-byte slots for every type, as an LP64 reader would.
+#[cfg(not(atl_nb_va32_slot8))]
+const SLOT32: usize = 4;
+#[cfg(atl_nb_va32_slot8)]
+const SLOT32: usize = 8;
+
+/// [`jvalues`] for an ARM guest: `ap` is the `va_list`'s `__ap` (the lane's value, the struct being passed by value). Each value is widened into its `jvalue` word: I/S/B sign- or zero-free as jni.h's union stores the low bytes, L a 32-bit pointer zero-extended.
+///
+/// # Safety
+/// `ap` is the live guest `__ap` whose remaining arguments are at least `params`.
+pub(super) unsafe fn jvalues32(ap: usize, params: &[u8]) -> Result<Vec<u64>, u8> {
+    let mut ap = ap;
+    let mut word = |wide: bool| -> u64 {
+        let align = if wide { 8 } else { SLOT32 };
+        ap = ap.next_multiple_of(align);
+        // SAFETY: caller contract: the next argument's word(s) of the guest's list.
+        let v = unsafe {
+            if wide {
+                load(ap)
+            } else {
+                u64::from(std::ptr::read_unaligned(ap as *const u32))
+            }
+        };
+        ap += if wide { 8 } else { SLOT32 };
+        v
+    };
+    params
+        .iter()
+        .map(|&c| {
+            Ok(match c {
+                b'Z' | b'B' => word(false) & 0xff,
+                b'S' | b'C' => word(false) & 0xffff,
+                b'I' | b'L' => word(false),
+                b'J' | b'D' => word(true),
+                b'F' => u64::from((f64::from_bits(word(true)) as f32).to_bits()),
+                _ => return Err(c),
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// AAPCS32 B.1 + C.3/C.12: the variadic part `(int 7, long long j, char* p, double 2.5, float 1.5f)` from an 8-aligned `__ap` is, by byte offset: 7 at 0, pad, j at 8, p at 16, pad, 2.5 at 24, 1.5 promoted to double at 32. Laid out by hand from those rules, read back by shorty; red under `va32_slot8` (8-byte slots put j at 8 but p at 16 -> 24...).
+    #[test]
+    fn aapcs32_va_list_words_and_aligned_pairs() {
+        let mut m = [0u32; 10];
+        m[0] = 7; // I at 0
+        // m[1] padding: J is 8-aligned
+        let j = 0x1122_3344_5566_7788u64;
+        (m[2], m[3]) = (j as u32, (j >> 32) as u32);
+        m[4] = 0x8000_1234; // L (a 32-bit guest pointer, high bit set: zero-extended)
+        // m[5] padding: D is 8-aligned
+        let d = 2.5f64.to_bits();
+        (m[6], m[7]) = (d as u32, (d >> 32) as u32);
+        let f = 1.5f64.to_bits(); // F promoted to double
+        (m[8], m[9]) = (f as u32, (f >> 32) as u32);
+        // the list starts 8-aligned, as the guest's stack at a public interface is (AAPCS32 5.2.1.2)
+        let mut aligned = [0u64; 6];
+        // SAFETY: `aligned` holds the 40 bytes of `m`, 8-aligned.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                m.as_ptr().cast::<u8>(),
+                aligned.as_mut_ptr().cast::<u8>(),
+                40,
+            )
+        };
+        // SAFETY: the list above, one argument per shorty character.
+        let v = unsafe { jvalues32(aligned.as_ptr() as usize, b"IJLDF") }.unwrap();
+        assert_eq!(v, [7, j, 0x8000_1234, d, u64::from(1.5f32.to_bits())]);
+        // SAFETY: as above, a byte promoted to int.
+        assert_eq!(
+            unsafe { jvalues32(aligned.as_ptr() as usize, b"Z") }.unwrap(),
+            [7]
+        );
+        // SAFETY: an unknown shorty character is refused before any read.
+        assert_eq!(
+            unsafe { jvalues32(aligned.as_ptr() as usize, b"Q") },
+            Err(b'Q')
+        );
+    }
 }
