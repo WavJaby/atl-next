@@ -17,7 +17,9 @@ impl Part for LocaleList {
     }
 
     fn read(p: &In<'_>) -> Result<Self> {
-        Ok(LocaleList { tags: r_str8(p)?.unwrap_or_default() })
+        Ok(LocaleList {
+            tags: r_str8(p)?.unwrap_or_default(),
+        })
     }
 }
 

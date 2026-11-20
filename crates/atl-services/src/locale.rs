@@ -101,7 +101,8 @@ impl ILocaleManager for LocaleService {
         package_name: Option<&str>,
         user_id: i32,
     ) -> binder::Result<Option<LocaleList>> {
-        let package = package_name.ok_or_else(|| Status::new_exception(ExceptionCode::NULL_POINTER, None))?;
+        let package =
+            package_name.ok_or_else(|| Status::new_exception(ExceptionCode::NULL_POINTER, None))?;
         let uid = ThreadState::get_calling_uid();
         let user = self.incoming_user("getApplicationLocales", uid, user_id)?;
         let Some(target) = self.package_uid(uid, package) else {
@@ -111,16 +112,15 @@ impl ILocaleManager for LocaleService {
         };
         // isPackageOwnedByCaller (UserHandle.isSameApp); isCallerInstaller and the IME case never hold here (module doc)
         if permission::app_id(target) != permission::app_id(uid)
-            && !self.permissions.holds(uid, &[READ_APP_SPECIFIC_LOCALES], false)
+            && !self
+                .permissions
+                .holds(uid, &[READ_APP_SPECIFIC_LOCALES], false)
         {
             return Err(security(format!(
                 "getApplicationLocales: uid {uid} lacks {READ_APP_SPECIFIC_LOCALES}"
             )));
         }
-        atl_diag::answered(
-            LOCALE_MANAGER,
-            "getApplicationLocales (no override: empty)",
-        );
+        atl_diag::answered(LOCALE_MANAGER, "getApplicationLocales (no override: empty)");
         Ok(Some(LocaleList::default()))
     }
 
@@ -138,7 +138,11 @@ impl ILocaleManager for LocaleService {
         user_id: i32,
     ) -> binder::Result<Option<LocaleConfig>> {
         package_name.ok_or_else(|| Status::new_exception(ExceptionCode::NULL_POINTER, None))?;
-        self.incoming_user("getOverrideLocaleConfig", ThreadState::get_calling_uid(), user_id)?;
+        self.incoming_user(
+            "getOverrideLocaleConfig",
+            ThreadState::get_calling_uid(),
+            user_id,
+        )?;
         atl_diag::answered(
             LOCALE_MANAGER,
             "getOverrideLocaleConfig (no override: null)",
