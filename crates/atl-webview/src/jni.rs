@@ -9,6 +9,7 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_void};
 use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::ThreadId;
 
@@ -16,7 +17,7 @@ use atl_looper::{LooperApi, Poster};
 
 use atl_platform_ui::webview::{
     ClaimReply, InputClaim, LoadError, NavigationRequest, PromptReply, SettingValue,
-    WebEngine as _, WebEvent, WebView as _,
+    WebEngine as _, WebEvent, WebSetting, WebView as _,
 };
 use atl_platform_ui::{PlatformWebEngine, PlatformWebView};
 
@@ -413,10 +414,10 @@ struct Native {
     shared: Arc<OnViewThread<Shared>>,
     /// Posts to the WebView's Looper ([`view_poster`]).
     poster: Poster,
-    /// The WebSettings values (settings.rs table): stored here, the engine's own pushed on set.
-    settings: RefCell<Settings>,
-    /// CookieManager.setAcceptThirdPartyCookies(this view) (= WebSettings.setAcceptThirdPartyCookies); counted in [`crate::cookies::third_party`] while on.
-    third_party: Cell<bool>,
+    /// The WebSettings values (settings.rs table), any thread ([`put_setting`]).
+    settings: Mutex<Settings>,
+    /// CookieManager.setAcceptThirdPartyCookies(this view) (= WebSettings.setAcceptThirdPartyCookies), any thread; counted in [`crate::cookies::third_party`] while on.
+    third_party: AtomicBool,
     /// WebView.onPause called and onResume not since (WebView.isPaused): the state only; the engine has no per-view pause (webview plan, provider refusals table).
     paused: Cell<bool>,
     /// Global ref to the carrier SurfaceView (add_carrier), 0 before init; deleted at destroy.
@@ -436,31 +437,45 @@ struct Placement {
 
 impl Native {
     fn set_third_party(&self, on: bool) {
-        if self.third_party.replace(on) != on {
+        // the swap is the one transition: two racing setters of one value count it once
+        if self.third_party.swap(on, Ordering::AcqRel) != on {
             crate::cookies::third_party(on);
         }
     }
 }
 
+/// Chromium's AwSettings rule for WebSettings ("Methods in this class can be called from any thread, including threads created by the client of WebView", AwSettings.java class doc): one lock
+/// (`mAwSettingsLock`) around every value, a getter reads under it, a setter stores and updates the engine while holding it, so the engine sees the stores in their order. The engine's `view_*` calls
+/// are any-thread (web_engine.rs), so the update runs on the caller's thread instead of AwSettings' blocking hop to the UI thread.
+fn put_setting(settings: &Mutex<Settings>, s: Setting, v: SettingValue, push: impl FnOnce(WebSetting, &SettingValue)) {
+    let mut values = lock_settings(settings);
+    if let Some(e) = s.engine() {
+        push(e, &v);
+    }
+    values.set(s, v);
+}
+
+/// The settings lock; a panic while it was held (none expected: the critical sections only store) leaves plain values, still usable.
+fn lock_settings(settings: &Mutex<Settings>) -> MutexGuard<'_, Settings> {
+    settings.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 impl Native {
-    /// Stores `v` for `s` and pushes it to the view when the engine has the setting.
+    /// Stores `v` for `s` and pushes it to the view when the engine has the setting ([`put_setting`]).
     fn put(&self, s: Setting, v: SettingValue) {
-        if let Some(e) = s.engine() {
-            self.view.set_setting(e, &v);
-        }
-        self.settings.borrow_mut().set(s, v);
+        put_setting(&self.settings, s, v, |e, v| self.view.set_setting(e, v));
     }
 
     fn flag(&self, s: Setting) -> bool {
-        self.settings.borrow().flag(s)
+        lock_settings(&self.settings).flag(s)
     }
 
     fn int(&self, s: Setting) -> i32 {
-        self.settings.borrow().int(s)
+        lock_settings(&self.settings).int(s)
     }
 
     fn text(&self, s: Setting) -> String {
-        self.settings.borrow().text(s).to_owned()
+        lock_settings(&self.settings).text(s).to_owned()
     }
 }
 
@@ -482,9 +497,43 @@ struct Mirror {
     forward: u32,
     title: Option<String>,
     progress: i32,
+    /// The engine's last reported (back, forward) while a provider history step is pending (Chromium `pending_entry_index_ != -1`): `back` / `forward` already answer from the step. None = none pending.
+    committed: Option<(u32, u32)>,
 }
 
 impl Mirror {
+    /// goBackOrForward(steps) asked the engine to move: answer from the target at once, as Chromium's GetCurrentEntryIndex answers the pending index; an impossible step changes nothing.
+    fn go(&mut self, steps: i32) {
+        if !self.can_go(steps) {
+            return;
+        }
+        self.committed.get_or_insert((self.back, self.forward));
+        let n = steps.unsigned_abs();
+        if steps < 0 {
+            (self.back, self.forward) = (self.back - n, self.forward + n);
+        } else {
+            (self.back, self.forward) = (self.back + n, self.forward - n);
+        }
+    }
+
+    /// The engine's location. During a pending step, counts equal to the pre-step ones are the old entry still committed (the engine has not moved yet) and do not undo the step; any other counts
+    /// are the engine's move and end it.
+    fn location(&mut self, uri: Option<String>, original_uri: Option<String>, back: u32, forward: u32) {
+        (self.uri, self.original_uri) = (uri, original_uri);
+        if self.committed != Some((back, forward)) {
+            self.committed = None;
+            (self.back, self.forward) = (back, forward);
+        }
+    }
+
+    /// The pending step will not commit (stopLoading, a new load): the committed counts answer again (Chromium DiscardPendingEntry). Not on a load failure: WebKit moves its back-forward cursor before
+    /// the commit (HistoryController goToItem), so a failed step still reports moved counts, while a failure event can be the cancelled previous load's.
+    fn discard(&mut self) {
+        if let Some((back, forward)) = self.committed.take() {
+            (self.back, self.forward) = (back, forward);
+        }
+    }
+
     /// Whether session history has an entry `steps` away from the current one (negative = back); 0 = false, as the engine's history lookup answered before the mirror.
     fn can_go(&self, steps: i32) -> bool {
         match steps.cmp(&0) {
@@ -496,6 +545,7 @@ impl Mirror {
 
     /// The provider asked the engine to load `uri`: the getters name it until the engine's own location arrives.
     fn seed(&mut self, uri: &str) {
+        self.discard();
         self.uri = Some(uri.to_owned());
         self.original_uri = Some(uri.to_owned());
     }
@@ -519,12 +569,17 @@ impl<T: Send> OnViewThread<T> {
             value,
         }
     }
+
+    /// Whether the calling thread is the bound one (the provider natives check it before any deref: [`provider_native`]).
+    fn is_current(&self) -> bool {
+        std::thread::current().id() == self.thread
+    }
 }
 
 impl<T: Send> std::ops::Deref for OnViewThread<T> {
     type Target = T;
     fn deref(&self) -> &T {
-        // a provider native called off the WebView's thread passed Java's checkThread; a post landing elsewhere is a poster bug: both are broken invariants, not states to handle
+        // provider natives refuse other threads before reaching here (provider_native!); a post landing elsewhere is a poster bug: a broken invariant, not a state to handle
         assert_eq!(
             std::thread::current().id(),
             self.thread,
@@ -741,8 +796,8 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProvid
         sideband: Box::leak(handle.into_boxed_slice()),
         shared: Arc::clone(&shared),
         poster,
-        settings: RefCell::new(settings),
-        third_party: Cell::new(false),
+        settings: Mutex::new(settings),
+        third_party: AtomicBool::new(false),
         paused: Cell::new(false),
         carrier: Cell::new(0),
         software: Cell::new(None),
@@ -799,8 +854,10 @@ fn on_event(shared: &Shared, ev: WebEvent) {
             back,
             forward,
         } => {
-            let mut m = shared.mirror.borrow_mut();
-            (m.uri, m.original_uri, m.back, m.forward) = (uri, original_uri, back, forward);
+            shared
+                .mirror
+                .borrow_mut()
+                .location(uri, original_uri, back, forward);
             return;
         }
         // not a bridge call (the sink sends those to the JavaBridge thread): WebChromeClient.onJsPrompt dispatch is a later slice, counted; answered null
@@ -1593,9 +1650,24 @@ macro_rules! provider_native {
         #[unsafe(no_mangle)]
         pub extern "C" fn $sym($env: Env, this: Obj $(, $p: $t)*) -> $ret {
             let Some($n) = native($env, this) else { return $default };
+            if !$n.shared.is_current() {
+                off_thread($env);
+                return $default;
+            }
             $body
         }
     };
+}
+
+/// A provider method called off the WebView's thread. AOSP WebView.checkThread throws for apps targeting SDK >= 18 before the provider is reached and only logs below that, then calls the provider
+/// (WebView.java checkThread, `sEnforceThreadChecking`); Chromium's provider then throws to the caller whatever the target (WebViewChromium.checkThread: `new IllegalStateException("Calling methods
+/// on another thread than the UI thread.")`). Its second step, the same exception rethrown on the UI looper to end the app, is not mirrored: an exception at the call is what the app can handle.
+fn off_thread(env: Env) {
+    throw(
+        env,
+        c"java/lang/IllegalStateException",
+        "Calling methods on another thread than the UI thread.",
+    );
 }
 
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_init, (env, n, interfaces: Obj, private_browsing: u8) -> () = (), {
@@ -1737,6 +1809,7 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_evaluateJ
 
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_stopLoading, (env, n) -> () = (), {
     let _ = env;
+    n.shared.mirror.borrow_mut().discard();
     n.view.stop_loading();
 });
 
@@ -1752,6 +1825,7 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_canGoBack
 
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_goBackOrForward, (env, n, steps: i32) -> () = (), {
     let _ = env;
+    n.shared.mirror.borrow_mut().go(steps);
     n.view.go_back_or_forward(steps);
 });
 
@@ -2059,7 +2133,7 @@ pub extern "C" fn Java_com_android_webview_chromium_CookieManagerImpl_acceptThir
     _this: Obj,
     web_view: Obj,
 ) -> u8 {
-    web_view_native(env, web_view).is_some_and(|n| n.third_party.get()) as u8
+    web_view_native(env, web_view).is_some_and(|n| n.third_party.load(Ordering::Acquire)) as u8
 }
 
 #[unsafe(no_mangle)]
@@ -2547,11 +2621,11 @@ settings_native!(Java_com_android_webview_chromium_WebSettingsImpl_setAcceptThir
 });
 settings_native!(Java_com_android_webview_chromium_WebSettingsImpl_getAcceptThirdPartyCookies, (env, n) -> u8 = 0, {
     let _ = env;
-    n.third_party.get() as u8
+    n.third_party.load(Ordering::Acquire) as u8
 });
 settings_native!(Java_com_android_webview_chromium_WebSettingsImpl_setBlockNetworkLoads, (env, n, block: u8) -> () = (), {
     // WebSettings.java:1019-1021: false needs the INTERNET permission
-    if block == 0 && !n.settings.borrow().internet() {
+    if block == 0 && !lock_settings(&n.settings).internet() {
         return throw(env, c"java/lang/SecurityException", "setBlockNetworkLoads(false) needs android.permission.INTERNET");
     }
     n.put(Setting::BlockNetworkLoads, SettingValue::Bool(block != 0));
@@ -2717,7 +2791,7 @@ settings_native!(Java_com_android_webview_chromium_WebSettingsImpl_setUserAgentS
     // null or empty restores the default: the device's user agent (WebSettings.java:1416-1419)
     let text = string(env, ua)
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| n.settings.borrow().default_text(Setting::UserAgentString));
+        .unwrap_or_else(|| lock_settings(&n.settings).default_text(Setting::UserAgentString));
     n.put(Setting::UserAgentString, SettingValue::Str(text));
 });
 
@@ -2741,6 +2815,70 @@ mod tests {
         assert!(m.can_go(-1) && m.can_go(-2) && m.can_go(1));
         assert!(!m.can_go(-3) && !m.can_go(2));
         assert!(!Mirror::default().can_go(-1));
+    }
+
+    /// A history step answers from the step at once, as Chromium's NavigationControllerImpl does: GetCurrentEntryIndex returns `pending_entry_index_` when set (GoToIndex sets it) and
+    /// CanGoToOffset judges `GetCurrentEntryIndex() + offset`. A late location still showing the pre-step counts does not undo it; the engine's moved counts end the pending step.
+    #[test]
+    fn a_history_step_answers_before_the_engine_reports_it() {
+        let mut m = Mirror {
+            back: 1,
+            ..Mirror::default()
+        };
+        m.go(-1);
+        assert!(!m.can_go(-1) && m.can_go(1));
+        m.location(Some("a".into()), None, 1, 0);
+        assert!(!m.can_go(-1) && m.can_go(1), "stale location undid the step");
+        assert_eq!(m.uri.as_deref(), Some("a"));
+        m.location(Some("b".into()), None, 0, 1);
+        m.location(Some("c".into()), None, 1, 0);
+        assert!(m.can_go(-1), "a committed step ends the pending one");
+    }
+
+    /// A pending step the engine never commits (stopLoading, a new load) is discarded: the committed counts return (Chromium DiscardPendingEntry resets `pending_entry_index_`).
+    #[test]
+    fn a_discarded_step_restores_the_committed_counts() {
+        let mut m = Mirror {
+            back: 1,
+            ..Mirror::default()
+        };
+        m.go(-1);
+        m.discard();
+        assert!(m.can_go(-1) && !m.can_go(1));
+        m.go(5);
+        assert!(m.can_go(-1), "an impossible step changes nothing");
+    }
+
+    /// WebSettings from several threads at once (AwSettings: any thread): every store is pushed to the engine in the order stored, so after the race the engine's last value is the stored one.
+    #[test]
+    fn settings_from_any_thread_reach_the_engine_in_store_order() {
+        use super::{SettingValue, lock_settings, put_setting};
+        use crate::settings::{AppDefaults, Setting, Settings};
+        use std::sync::Mutex;
+        let settings = Mutex::new(Settings::new(AppDefaults {
+            target_sdk: 36,
+            internet: true,
+            user_agent: String::new(),
+        }));
+        assert!(Setting::JavaScriptEnabled.engine().is_some());
+        let pushed = Mutex::new(Vec::new());
+        std::thread::scope(|s| {
+            for t in 0..4 {
+                let (settings, pushed) = (&settings, &pushed);
+                s.spawn(move || {
+                    for i in 0..500 {
+                        let on = (i + t) % 2 == 0;
+                        put_setting(settings, Setting::JavaScriptEnabled, SettingValue::Bool(on), |_, v| {
+                            pushed.lock().unwrap().push(matches!(v, SettingValue::Bool(true)))
+                        });
+                        let _ = lock_settings(settings).flag(Setting::JavaScriptEnabled);
+                    }
+                });
+            }
+        });
+        let pushed = pushed.into_inner().unwrap();
+        assert_eq!(pushed.len(), 2000);
+        assert_eq!(*pushed.last().unwrap(), lock_settings(&settings).flag(Setting::JavaScriptEnabled));
     }
 
     /// The provider's own load names its URL at once, before the engine reports it.
