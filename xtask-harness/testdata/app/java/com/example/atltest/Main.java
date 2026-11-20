@@ -697,6 +697,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "permission: " + permission());
         Log.i("AtlTest", "notification: " + channels());
         Log.i("AtlTest", "power: " + power());
+        Log.i("AtlTest", "thermal: " + thermal());
         Log.i("AtlTest", "battery: " + battery());
         Log.i("AtlTest", "netstats: " + netstats());
         Log.i("AtlTest", "account: " + accounts());
@@ -1193,6 +1194,68 @@ public class Main extends Activity {
             return "interactive=" + pm.isInteractive() + " powersave=" + pm.isPowerSaveMode()
                     + " partial=" + pm.isWakeLockLevelSupported(android.os.PowerManager.PARTIAL_WAKE_LOCK)
                     + " held=" + held + " released=" + !wl.isHeld();
+        } catch (Throwable t) {
+            return "threw " + t;
+        }
+    }
+
+    /**
+     * "status=<int> callback=<int|none> headroom=<float> thresholds=<map|exception> headroomListener=<ok|exception> removed=<ok|exception>": PowerManager's thermal API as a game or ADPF library
+     * calls it: getCurrentThermalStatus, addThermalStatusListener (the first onThermalStatusChanged, waited for up to 2 s), getThermalHeadroom(10), getThermalHeadroomThresholds,
+     * addThermalHeadroomListener, removeThermalStatusListener. "absent" when PowerManager is null (it needs power and thermalservice); else what the status-listener add threw.
+     */
+    private String thermal() {
+        try {
+            android.os.PowerManager pm = (android.os.PowerManager) getSystemService(POWER_SERVICE);
+            if (pm == null) {
+                return "absent";
+            }
+            int status = pm.getCurrentThermalStatus();
+            java.util.concurrent.CountDownLatch first = new java.util.concurrent.CountDownLatch(1);
+            java.util.concurrent.atomic.AtomicInteger seen = new java.util.concurrent.atomic.AtomicInteger(-100);
+            java.util.concurrent.Executor direct = new java.util.concurrent.Executor() {
+                @Override
+                public void execute(Runnable r) {
+                    r.run();
+                }
+            };
+            android.os.PowerManager.OnThermalStatusChangedListener listener = new android.os.PowerManager.OnThermalStatusChangedListener() {
+                @Override
+                public void onThermalStatusChanged(int s) {
+                    if (seen.compareAndSet(-100, s)) {
+                        first.countDown();
+                    }
+                }
+            };
+            pm.addThermalStatusListener(direct, listener);
+            String callback = first.await(2, java.util.concurrent.TimeUnit.SECONDS) ? String.valueOf(seen.get()) : "none";
+            float headroom = pm.getThermalHeadroom(10);
+            String thresholds;
+            try {
+                thresholds = String.valueOf(pm.getThermalHeadroomThresholds());
+            } catch (Throwable t) {
+                thresholds = t.getClass().getSimpleName();
+            }
+            String headroomListener;
+            try {
+                pm.addThermalHeadroomListener(direct, new android.os.PowerManager.OnThermalHeadroomChangedListener() {
+                    @Override
+                    public void onThermalHeadroomChanged(float h, float f, int s, java.util.Map<Integer, Float> m) {
+                    }
+                });
+                headroomListener = "ok";
+            } catch (Throwable t) {
+                headroomListener = t.getClass().getSimpleName();
+            }
+            String removed;
+            try {
+                pm.removeThermalStatusListener(listener);
+                removed = "ok";
+            } catch (Throwable t) {
+                removed = t.getClass().getSimpleName();
+            }
+            return "status=" + status + " callback=" + callback + " headroom=" + headroom + " thresholds=" + thresholds
+                    + " headroomListener=" + headroomListener + " removed=" + removed;
         } catch (Throwable t) {
             return "threw " + t;
         }

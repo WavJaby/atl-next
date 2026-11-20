@@ -5,16 +5,23 @@
 //! the one source; no method here answers a plugged state today (PowerManagerService reads BatteryManagerInternal.getPlugType for wake-on-plug and stay-on, neither app-observable through this binder).
 //! Wake locks: acquire/release checked and recorded per token as acquireWakeLockInternal does (re-acquire of a held token updates it), counted in the log; they hold nothing on the host yet
 //! (a native program would inhibit idle through the desktop; not built). Not modelled: the token's death (AOSP's linkToDeath releases it), display ids, callbacks, work sources (non-null refused by atl-parcelables).
-//! IThermalService: registered bare, every method UNKNOWN_TRANSACTION (counted) -- PowerManager only stores it; its thermal methods reach it lazily.
+//! IThermalService: ThermalManagerService on a device with no thermal HAL (ThermalService below).
 
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use atl_aidl::aidl::android::os::IPowerManager::{BnPowerManager, IPowerManager};
+use atl_aidl::aidl::android::os::IThermalEventListener::IThermalEventListener;
+use atl_aidl::aidl::android::os::IThermalHeadroomListener::IThermalHeadroomListener;
 use atl_aidl::aidl::android::os::IThermalService::{BnThermalService, IThermalService};
+use atl_aidl::aidl::android::os::IThermalStatusListener::IThermalStatusListener;
 use atl_aidl::aidl::android::os::IWakeLockCallback::IWakeLockCallback;
-use atl_parcelables::android::os::WorkSource;
-use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, Strong, ThreadState};
+use atl_parcelables::android::os::{CoolingDevice, Temperature, WorkSource};
+use binder::{
+    BinderFeatures, DeathRecipient, ExceptionCode, FromIBinder, IBinder, Interface, SpIBinder,
+    Status, Strong, ThreadState,
+};
 
 use crate::packages::Permissions;
 
@@ -205,11 +212,209 @@ impl IPowerManager for PowerService {
     }
 }
 
-struct ThermalService;
+/// Temperature.THROTTLING_NONE = PowerManager.THERMAL_STATUS_NONE: ThermalManagerService's mStatus at construction, never changed without a HAL.
+const THROTTLING_NONE: i32 = 0;
+
+/// One RemoteCallbackList entry: the listener, its death flag and link (RemoteCallbackList.Callback.binderDied removes it). An event listener's type cookie is not kept: no event is ever sent.
+struct Callback<T: ?Sized + FromIBinder> {
+    listener: Strong<T>,
+    dead: Arc<AtomicBool>,
+    _death: DeathRecipient,
+}
+
+/// RemoteCallbackList for one listener interface: keyed by binder, an entry whose binder died is dropped at the next access.
+struct CallbackList<T: ?Sized + FromIBinder> {
+    entries: Mutex<Vec<Callback<T>>>,
+}
+
+impl<T: ?Sized + FromIBinder + Interface> CallbackList<T> {
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// RemoteCallbackList.register: replaces an entry of the same binder; false when the binder is already dead (linkToDeath's RemoteException).
+    fn register(&self, listener: &Strong<T>) -> bool {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries.retain(|c| !c.dead.load(Ordering::Acquire));
+        let binder = listener.as_binder();
+        entries.retain(|c| c.listener.as_binder() != binder);
+        let dead = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&dead);
+        let mut death = DeathRecipient::new(move || flag.store(true, Ordering::Release));
+        if listener.as_binder().link_to_death(&mut death).is_err() {
+            return false;
+        }
+        entries.push(Callback {
+            listener: listener.clone(),
+            dead,
+            _death: death,
+        });
+        true
+    }
+
+    /// RemoteCallbackList.unregister: true when the binder was registered (and alive).
+    fn unregister(&self, listener: &Strong<T>) -> bool {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries.retain(|c| !c.dead.load(Ordering::Acquire));
+        let binder = listener.as_binder();
+        let before = entries.len();
+        entries.retain(|c| c.listener.as_binder() != binder);
+        entries.len() != before
+    }
+}
+
+/// ThermalManagerService on a device with no thermal HAL: onActivityManagerReady finds none of the AIDL / 2.0 / 1.1 / 1.0 HALs, logs "No Thermal HAL service on this device" and leaves mHalReady false,
+/// so mStatus stays THROTTLING_NONE, the temperature map stays empty, and every HAL-backed answer is the not-ready one. A host thermal-zone tier is not built: Android's severities come from a
+/// vendor HAL's per-device thresholds and /sys/class/thermal trip points carry no agreed mapping to them.
+struct ThermalService {
+    permissions: Arc<Permissions>,
+    /// mThermalEventListeners: registered, never notified (no temperature is ever reported).
+    event_listeners: CallbackList<dyn IThermalEventListener>,
+    status_listeners: CallbackList<dyn IThermalStatusListener>,
+}
+
+impl ThermalService {
+    /// enforceCallingOrSelfPermission(DEVICE_POWER): signature-level, so an app gets SecurityException.
+    fn enforce_device_power(&self, method: &str) -> binder::Result<()> {
+        if self
+            .permissions
+            .holds(ThreadState::get_calling_uid(), &[DEVICE_POWER], false)
+        {
+            return Ok(());
+        }
+        Err(Status::new_exception_str(
+            ExceptionCode::SECURITY,
+            Some(format!("{method}: caller lacks {DEVICE_POWER}")),
+        ))
+    }
+}
+
+fn null_listener() -> Status {
+    Status::new_exception_str(ExceptionCode::NULL_POINTER, Some("listener is null"))
+}
 
 impl Interface for ThermalService {}
 
-impl IThermalService for ThermalService {}
+impl IThermalService for ThermalService {
+    /// registerThermalEventListener: DEVICE_POWER, register; postEventListenerCurrentTemperaturesLocked posts nothing for an empty temperature map.
+    fn r#registerThermalEventListener(
+        &self,
+        listener: Option<&Strong<dyn IThermalEventListener>>,
+    ) -> binder::Result<bool> {
+        self.enforce_device_power("registerThermalEventListener")?;
+        let listener = listener.ok_or_else(null_listener)?;
+        Ok(self.event_listeners.register(listener))
+    }
+
+    fn r#registerThermalEventListenerWithType(
+        &self,
+        listener: Option<&Strong<dyn IThermalEventListener>>,
+        _type: i32,
+    ) -> binder::Result<bool> {
+        self.enforce_device_power("registerThermalEventListenerWithType")?;
+        let listener = listener.ok_or_else(null_listener)?;
+        Ok(self.event_listeners.register(listener))
+    }
+
+    fn r#unregisterThermalEventListener(
+        &self,
+        listener: Option<&Strong<dyn IThermalEventListener>>,
+    ) -> binder::Result<bool> {
+        self.enforce_device_power("unregisterThermalEventListener")?;
+        let listener = listener.ok_or_else(null_listener)?;
+        Ok(self.event_listeners.unregister(listener))
+    }
+
+    /// HAL not ready -> new Temperature[0].
+    fn r#getCurrentTemperatures(&self) -> binder::Result<Option<Vec<Option<Temperature>>>> {
+        self.enforce_device_power("getCurrentTemperatures")?;
+        Ok(Some(Vec::new()))
+    }
+
+    fn r#getCurrentTemperaturesWithType(
+        &self,
+        _type: i32,
+    ) -> binder::Result<Option<Vec<Option<Temperature>>>> {
+        self.enforce_device_power("getCurrentTemperaturesWithType")?;
+        Ok(Some(Vec::new()))
+    }
+
+    /// register, then postStatusListenerLocked: onStatusChange(mStatus) once (oneway; AOSP posts it on FgThread, here sent before the reply -- the app's executor runs it either way).
+    fn r#registerThermalStatusListener(
+        &self,
+        listener: Option<&Strong<dyn IThermalStatusListener>>,
+    ) -> binder::Result<bool> {
+        let listener = listener.ok_or_else(null_listener)?;
+        if !self.status_listeners.register(listener) {
+            return Ok(false);
+        }
+        if let Err(e) = listener.r#onStatusChange(THROTTLING_NONE) {
+            // AOSP: Slog.e "Thermal status callback failed to call", registration kept
+            atl_diag::answered(
+                "IThermalService",
+                &format!("onStatusChange failed: {e}"),
+            );
+        }
+        Ok(true)
+    }
+
+    fn r#unregisterThermalStatusListener(
+        &self,
+        listener: Option<&Strong<dyn IThermalStatusListener>>,
+    ) -> binder::Result<bool> {
+        let listener = listener.ok_or_else(null_listener)?;
+        Ok(self.status_listeners.unregister(listener))
+    }
+
+    fn r#getCurrentThermalStatus(&self) -> binder::Result<i32> {
+        Ok(THROTTLING_NONE)
+    }
+
+    /// HAL not ready -> new CoolingDevice[0].
+    fn r#getCurrentCoolingDevices(&self) -> binder::Result<Option<Vec<Option<CoolingDevice>>>> {
+        self.enforce_device_power("getCurrentCoolingDevices")?;
+        Ok(Some(Vec::new()))
+    }
+
+    fn r#getCurrentCoolingDevicesWithType(
+        &self,
+        _type: i32,
+    ) -> binder::Result<Option<Vec<Option<CoolingDevice>>>> {
+        self.enforce_device_power("getCurrentCoolingDevicesWithType")?;
+        Ok(Some(Vec::new()))
+    }
+
+    /// HAL not ready -> NaN, before the forecastSeconds range check.
+    fn r#getThermalHeadroom(&self, _forecast_seconds: i32) -> binder::Result<f32> {
+        Ok(f32::NAN)
+    }
+
+    /// HAL not ready -> IllegalStateException, before the feature-flag check.
+    fn r#getThermalHeadroomThresholds(&self) -> binder::Result<Option<Vec<f32>>> {
+        Err(Status::new_exception_str(
+            ExceptionCode::ILLEGAL_STATE,
+            Some("Thermal HAL connection is not initialized"),
+        ))
+    }
+
+    /// HAL not ready -> false, nothing registered (PowerManager then throws "Thermal headroom listener failed to set").
+    fn r#registerThermalHeadroomListener(
+        &self,
+        _listener: Option<&Strong<dyn IThermalHeadroomListener>>,
+    ) -> binder::Result<bool> {
+        Ok(false)
+    }
+
+    /// mThermalHeadroomListeners.unregister of a listener that could never register -> false.
+    fn r#unregisterThermalHeadroomListener(
+        &self,
+        _listener: Option<&Strong<dyn IThermalHeadroomListener>>,
+    ) -> binder::Result<bool> {
+        Ok(false)
+    }
+}
 
 /// The `power` binder, for `addService`.
 pub fn new_binder(permissions: Arc<Permissions>) -> SpIBinder {
@@ -224,6 +429,14 @@ pub fn new_binder(permissions: Arc<Permissions>) -> SpIBinder {
 }
 
 /// The `thermalservice` binder, for `addService`.
-pub fn new_thermal_binder() -> SpIBinder {
-    BnThermalService::new_binder(ThermalService, BinderFeatures::default()).as_binder()
+pub fn new_thermal_binder(permissions: Arc<Permissions>) -> SpIBinder {
+    BnThermalService::new_binder(
+        ThermalService {
+            permissions,
+            event_listeners: CallbackList::new(),
+            status_listeners: CallbackList::new(),
+        },
+        BinderFeatures::default(),
+    )
+    .as_binder()
 }

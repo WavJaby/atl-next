@@ -94,7 +94,7 @@ struct Args {
     /// Test only: `sensorservice` is not registered, the deliberate break of the sensors gate's empty stage (SensorManager then waits for it, SensorManager.cpp `waitForSensorService`).
     #[arg(long)]
     no_sensor_service: bool,
-    /// Test only: this service (`account`, `appops`, `batterystats` (with `batteryproperties`), `connectivity`, `deviceidle`, `jobscheduler`, `locale`, `netstats`, `permissionmgr`, `power`, `telephony.registry`, `uimode`, `webviewupdate`) is not registered (repeat), the deliberate break of the app gate's line for it (its manager is then null).
+    /// Test only: this service (`account`, `appops`, `batterystats` (with `batteryproperties`), `connectivity`, `deviceidle`, `jobscheduler`, `locale`, `netstats`, `permissionmgr`, `power`, `telephony.registry`, `thermalservice`, `uimode`, `webviewupdate`) is not registered (repeat), the deliberate break of the app gate's line for it (its manager is then null).
     #[arg(long)]
     omit_service: Vec<String>,
     /// Start `sensorservice` in HAL bypass data injection mode with this package allow-listed (AOSP `dumpsys sensorservice hal_bypass_replay_data_injection <package>`); a real accelerometer is then replaced by the injected one for every app of this instance. atld `--tilt-keys` sets it.
@@ -409,8 +409,10 @@ fn main() -> Result<()> {
         )
         .context("addService power")?;
     }
-    binder::add_service(THERMAL, atl_services::power::new_thermal_binder())
-        .context("addService thermalservice")?;
+    if !a.omit_service.iter().any(|s| s == THERMAL) {
+        binder::add_service(THERMAL, atl_services::power::new_thermal_binder(Arc::clone(&permissions)))
+            .context("addService thermalservice")?;
+    }
     binder::add_service(
         SYSTEM_CONFIG,
         atl_services::system_config::new_binder(Arc::clone(&permissions)),

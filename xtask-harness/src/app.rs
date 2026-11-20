@@ -233,7 +233,10 @@ const MEDIAPLAYER_START: &str = "MediaPlayerNative: start called in state 1";
 /// authenticator installed); the fixture declares no authenticator service, so addAccountExplicitly fails isAccountManagedByCaller -> SecurityException (:504-508).
 /// deviceidle: Main.deviceIdle: isIgnoringBatteryOptimizations (PowerManager.java:2701) -> isPowerSaveWhitelistApp (DeviceIdleController.java:2253-2259): no sysconfig allow-in-power-save entry and
 /// no user allowlist -> false.
-const SERVICE_LINES: [(&str, &str, Option<&str>); 20] = [
+/// thermalservice: Main.thermal on a device with no thermal HAL (ThermalManagerService.onActivityManagerReady leaves mHalReady false, mStatus THROTTLING_NONE): status 0; the status listener is
+/// called once with 0 on register (postStatusListenerLocked); getThermalHeadroom NaN (HAL not ready); getThermalHeadroomThresholds IllegalStateException; registerThermalHeadroomListener false ->
+/// PowerManager's RuntimeException; the status listener's remove finds it. Without the methods the status-listener add throws RuntimeException (WeChat's death).
+const SERVICE_LINES: [(&str, &str, Option<&str>); 21] = [
     (
         "account",
         "AtlTest: account: ",
@@ -243,6 +246,11 @@ const SERVICE_LINES: [(&str, &str, Option<&str>); 20] = [
         "deviceidle",
         "AtlTest: deviceidle: ",
         Some("ignoring=false"),
+    ),
+    (
+        "thermalservice",
+        "AtlTest: thermal: ",
+        Some("status=0 callback=0 headroom=NaN thresholds=IllegalStateException headroomListener=RuntimeException removed=ok"),
     ),
     ("batterystats", "AtlTest: battery: ", None),
     ("netstats", "AtlTest: netstats: ", Some("uid=-1 total=-1")),
