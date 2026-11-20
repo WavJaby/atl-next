@@ -85,14 +85,12 @@ pub struct Counters {
 /// One `/dev/udmabuf` buffer for `c` (udmabuf.rs `layout`: LINEAR, pitch aligned, size page-rounded).
 fn alloc_udmabuf(u: &Udmabuf, c: &Checked, counters: &Counters) -> Result<Dmabuf, BackendError> {
     let (pitch, size) = udmabuf::layout(c).map_err(BackendError::Alloc)?;
-    let fd = u
-        .create(size)
-        .map_err(|e| {
-            BackendError::Alloc(format!(
-                "udmabuf of {size} bytes (kernel page {} bytes): {e}",
-                udmabuf::page()
-            ))
-        })?;
+    let fd = u.create(size).map_err(|e| {
+        BackendError::Alloc(format!(
+            "udmabuf of {size} bytes (kernel page {} bytes): {e}",
+            udmabuf::page()
+        ))
+    })?;
     counters.alloc_udmabuf.fetch_add(1, Ordering::Relaxed);
     Ok(Dmabuf {
         fd,

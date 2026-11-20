@@ -39,7 +39,10 @@ static EVENTS_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsiz
 /// main_exe.c's thread-exit record at the host's exit: the pthread_exit worker's "BACK" and the returning worker's "DEK" (main checked both, status 8 / 9 otherwise), then the main thread's two destructors in reverse registration, once each: "nm".
 const EVENTS: &[u8] = b"BACKDEKFGnm";
 /// The atl-diag key of a thread-exit destructor registered after the thread's list was finalized (main_exe.c `late_dtor`: one, leaked as bionic leaks it; intercepts.rs `cxa_thread_atexit_impl`).
-const LATE_KEY: (&str, &str) = (atl_diag::ANSWERED, "native-bridge.thread-exit-after-finalize");
+const LATE_KEY: (&str, &str) = (
+    atl_diag::ANSWERED,
+    "native-bridge.thread-exit-after-finalize",
+);
 /// Check (c)'s result, read by the exit handler.
 static CHURN_OK: AtomicBool = AtomicBool::new(false);
 

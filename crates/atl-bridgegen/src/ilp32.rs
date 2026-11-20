@@ -760,11 +760,7 @@ pub fn converters_rs(convs: &[Conv], swap: &str) -> String {
             }
         }
     }
-    let shallow: Vec<Conv> = convs
-        .iter()
-        .filter(|c| !c.deep(convs))
-        .cloned()
-        .collect();
+    let shallow: Vec<Conv> = convs.iter().filter(|c| !c.deep(convs)).cloned().collect();
     let convs = &shallow[..];
     let mut s = String::new();
     let swapped = convs.iter().position(|c| c.fields.len() >= 2);
