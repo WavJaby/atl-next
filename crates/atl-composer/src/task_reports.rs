@@ -172,6 +172,12 @@ fn send(report: &Report) -> Result<(), String> {
     binder
         .submit_transact(code, data, 0)
         .map_err(|e| format!("transaction {code}: {e}"))?;
+    // the window ime stage's outbox sub-gate: every report is sent from the outbox thread (outbox.rs `THREAD`)
+    let thread = std::thread::current();
+    tracing::info!(
+        "atl-composer: task reports: sent {code} thread={}",
+        thread.name().unwrap_or("?")
+    );
     Ok(())
 }
 

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! The outbox: one VM-attached thread for the binder calls the window's thread starts (display-thread plan D2 rule B1: the display thread makes no JNI or binder call).
 //! An in-process Java binder runs its onTransact on the caller's thread and needs that thread's JNIEnv (AOSP android_util_Binder.cpp `javavm_to_jnienv` is GetEnv, NULL on an unattached thread),
-//! and a capture listener in the app attaches the calling thread itself (android_window_ScreenCapture.cpp `getenv`): so IME edits, capture replies and the Task's reports are posted here.
+//! and a capture listener in the app attaches the calling thread itself (android_window_ScreenCapture.cpp `getenv`): so capture replies and the Task's reports are posted here. The IME's
+//! connection calls join at the split (S5): posted, the editor's answers arrive outside GTK's `retrieve-surrounding`, which needs a display-side mirror of the editor's text first.
 //! The thread owns a Looper and an `atl_looper::Poster` on it: one FIFO in post order; posts after the thread ended are dropped and counted by the Poster. Posting never blocks the caller.
 
 use std::sync::mpsc;

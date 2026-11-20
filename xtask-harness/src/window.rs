@@ -109,7 +109,7 @@ pub struct Args {
     /// Stage ime only: the fake input method leaves its commit_string out, so the commit sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     break_ime_commit: bool,
-    /// Stage ime only: the composer's outbox runs each post inline on the poster's thread (atl-composer feature `break-outbox`), so the IME's connection calls run on the window's thread and the
+    /// Stage ime only: the composer's outbox runs each post inline on the poster's thread (atl-composer feature `break-outbox`), so the Task reports are sent from the window's thread and the
     /// outbox sub-gate must fail.
     #[arg(long)]
     break_outbox: bool,

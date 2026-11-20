@@ -145,9 +145,6 @@ impl TextInput for GtkTextInput {
     fn set_surrounding(&self, surrounding: &Surrounding) {
         *self.surrounding.borrow_mut() = surrounding.clone();
         send_surrounding(&self.context, surrounding);
-        // GTK's wayland IM only stores a surrounding (gtkimcontextwayland.c set_surrounding) and sends it at its next state commit (notify_im_change: after `done`, reset, enable). The editor answers
-        // asynchronously (its calls run on the outbox), after GTK's `done` commit, so the state is committed here: reset = notify_im_change(CAUSE_OTHER), then the simple context's reset (no preedit of its own).
-        self.context.reset();
         mirror::resync();
     }
 

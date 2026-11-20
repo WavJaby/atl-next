@@ -259,13 +259,13 @@ pub fn checks(
     ]
 }
 
-/// atl-ime's line for each call it made on the editor's connection, then `<what> thread=<name>` (field.rs `post`).
-const SENT_LINE: &str = "atl-ime: sent ";
+/// The composer's line for each Task report it sent, then `<code> thread=<name>` (atl-composer task_reports.rs `send`).
+const SENT_LINE: &str = "task reports: sent ";
 /// The composer's outbox thread (atl-composer outbox.rs `THREAD`).
 const OUTBOX_THREAD: &str = "atl-outbox";
 
-/// Display-thread plan rule B1: the window's thread makes no call on the editor's connection (an in-process Java binder runs on the caller's thread, needing its JNIEnv), so every sent line names the
-/// outbox thread: want >= 1 such line (the stage's preedit, commit, delete and surrounding requests) and 0 on any other thread.
+/// Display-thread plan rule B1: binder sends the window's thread starts run on the outbox, so every Task report line names the outbox thread: want >= 1 (the window's first display and size) and
+/// 0 on any other thread. The IME's connection calls stay on the window's thread until S5 (atl-composer ui_window.rs `wire`).
 fn outbox_check(app: &str) -> Result<String, String> {
     let threads: Vec<&str> = app
         .lines()
@@ -278,10 +278,10 @@ fn outbox_check(app: &str) -> Result<String, String> {
         .filter(|t| *t != OUTBOX_THREAD)
         .collect();
     match (threads.len(), elsewhere.is_empty()) {
-        (0, _) => Err("no `atl-ime: sent` line".to_owned()),
-        (n, true) => Ok(format!("{n} connection calls, all on {OUTBOX_THREAD}")),
+        (0, _) => Err("no `task reports: sent` line".to_owned()),
+        (n, true) => Ok(format!("{n} task reports, all on {OUTBOX_THREAD}")),
         (n, false) => Err(format!(
-            "{} of {n} connection calls off {OUTBOX_THREAD}: {elsewhere:?}",
+            "{} of {n} task reports off {OUTBOX_THREAD}: {elsewhere:?}",
             elsewhere.len()
         )),
     }
@@ -351,17 +351,17 @@ fn surrounding_check() -> Result<String, String> {
 mod outbox_tests {
     use super::*;
 
-    /// The line shape is field.rs `post`'s; a call on the window's thread (the break) or a line without a thread fails.
+    /// The line shape is task_reports.rs `send`'s; a report from another thread (the break: the window's, unnamed = `?`; before S3: `atl-task-sender`) or a line without a thread fails.
     #[test]
     fn every_sent_line_must_name_the_outbox() {
-        let good = "I atl-ime: sent Commit(\"x\") thread=atl-outbox\nI atl-ime: sent getSurroundingText thread=atl-outbox\n";
+        let good = "INFO atl-composer: task reports: sent 2 thread=atl-outbox\nINFO atl-composer: task reports: sent 1 thread=atl-outbox\n";
         assert_eq!(
             outbox_check(good),
-            Ok("2 connection calls, all on atl-outbox".to_owned())
+            Ok("2 task reports, all on atl-outbox".to_owned())
         );
-        let bad = format!("{good}I atl-ime: sent PreeditEnd thread=main\n");
+        let bad = format!("{good}INFO atl-composer: task reports: sent 1 thread=?\n");
         assert!(outbox_check(&bad).is_err());
-        assert!(outbox_check("I atl-ime: sent PreeditEnd\n").is_err());
+        assert!(outbox_check("INFO atl-composer: task reports: sent 1\n").is_err());
         assert!(outbox_check("").is_err());
     }
 }
