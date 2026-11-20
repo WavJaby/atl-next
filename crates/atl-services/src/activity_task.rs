@@ -39,6 +39,7 @@ use crate::token;
 use atl_parcelables::android::content::pm::{ActivityInfo, ConfigurationInfo};
 use atl_parcelables::android::content::res::Configuration;
 use atl_parcelables::codecs::android::content::pm::ResolveInfo::Resolved;
+use atl_services_types::permission::{ROOT_UID, SYSTEM_UID};
 
 const ATM: &str = "IActivityTaskManager";
 
@@ -992,6 +993,21 @@ impl ActivityTaskService {
 
 impl Interface for ActivityTaskService {}
 
+/// ActivityTaskManagerService.assertPackageMatchesCallingUid (:2360, first step of startActivityAsUser :1278): `package` must be the calling uid's (isSameApp :2349: uid 0 and SYSTEM_UID
+/// exactly pass), else SecurityException "Permission Denial: package=<p> does not belong to uid=<uid>".
+fn assert_package_matches_calling_uid(
+    packages: &Packages,
+    uid: u32,
+    package: &str,
+) -> Result<(), Status> {
+    if uid == ROOT_UID || uid == SYSTEM_UID || packages.is_same_app(package, uid) {
+        return Ok(());
+    }
+    Err(security(&format!(
+        "Permission Denial: package={package} does not belong to uid={uid}"
+    )))
+}
+
 impl IActivityTaskManager for ActivityTaskService {
     fn r#startActivity(
         &self,
@@ -1011,6 +1027,7 @@ impl IActivityTaskManager for ActivityTaskService {
         let Some(calling_package) = calling_package else {
             return Err(security("startActivity: no calling package"));
         };
+        assert_package_matches_calling_uid(&self.atm.packages, calling_uid, calling_package)?;
         let Some(caller) = caller else {
             let component = intent
                 .and_then(|i| i.component.as_ref())
@@ -1119,6 +1136,24 @@ mod tests {
             Arc::new(Tasks::new(DisplayModel::default(), None)),
             token::new(),
         )
+    }
+
+    /// R7-9: ActivityTaskManagerService.java:2349-2368: the calling package must be the calling uid's; uid 0 and SYSTEM_UID (1000) exactly pass; another app's uid, or SYSTEM_UID in user 1
+    /// (101000: isSameApp compares the uid, not its app id), gets SecurityException with AOSP's message.
+    #[test]
+    fn calling_package_must_be_the_callers() {
+        let atm = fixture_atm();
+        let other = UID + 1;
+        assert!(assert_package_matches_calling_uid(&atm.packages, UID, PACKAGE).is_ok());
+        for uid in [0, 1000] {
+            assert!(assert_package_matches_calling_uid(&atm.packages, uid, PACKAGE).is_ok());
+        }
+        for uid in [other, 101_000] {
+            let e = assert_package_matches_calling_uid(&atm.packages, uid, PACKAGE).unwrap_err();
+            assert_eq!(e.exception_code(), binder::ExceptionCode::SECURITY);
+            let want = format!("Permission Denial: package={PACKAGE} does not belong to uid={uid}");
+            assert!(e.get_description().contains(&want), "{e:?}");
+        }
     }
 
     /// The launcher record, pushed and launched as finishAttachApplication does it; returns its token.
