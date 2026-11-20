@@ -112,7 +112,10 @@ public final class Flags {
         protected void onCreate(Bundle savedInstanceState) {
             super.onCreate(savedInstanceState);
             String letter = shortName(getClass().getName());
-            int n = COUNTS.merge(letter, 1, Integer::sum);
+            // no lambdas or method refs: the fixture compiles against a bootclasspath without LambdaMetafactory
+            Integer prev = COUNTS.get(letter);
+            int n = prev == null ? 1 : prev + 1;
+            COUNTS.put(letter, n);
             id = letter + n;
             EVENTS.put(id, new StringBuilder());
             live++;
@@ -185,7 +188,12 @@ public final class Flags {
                     line.append(line.length() == 0 ? "" : " ").append(e.getKey()).append('[').append(e.getValue()).append(']');
                 }
                 Log.i("AtlTest", "flags-" + SCENARIOS[index].name + ": " + line);
-                new Handler(Looper.getMainLooper()).post(Flags::next);
+                new Handler(Looper.getMainLooper()).post(new Runnable() {
+                    @Override
+                    public void run() {
+                        next();
+                    }
+                });
             }
         }
     }
