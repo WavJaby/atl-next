@@ -116,13 +116,28 @@ pub(super) fn to_host(h: usize) -> Option<usize> {
     with(|t| t.index(h).map(|i| t.slots[i].host))
 }
 
-/// Frees handle `h` after the call that ended its object; an unknown handle is ignored (the call was refused before).
+/// Unlinks handle `h` from its host address before the call that ends the object: the slot still resolves for that call ([`to_host`]), but the address, which the host may hand out again the moment it frees the object, gets a new handle from [`to_guest`] -- never the dying one. [`release`] frees the slot after the call.
+pub(super) fn retire(h: usize) {
+    let Ok(h) = u32::try_from(h) else { return };
+    with(|t| {
+        if let Some(i) = t.index(h) {
+            let host = t.slots[i].host;
+            if t.by_host.get(&host) == Some(&h) {
+                t.by_host.remove(&host);
+            }
+        }
+    });
+}
+
+/// Frees handle `h` after the call that ended its object; an unknown handle is ignored (the call was refused before). The address mapping goes only if it is still `h`'s ([`retire`]: a reused address may hold another handle by now).
 pub(super) fn release(h: usize) {
     let Ok(h) = u32::try_from(h) else { return };
     let window = with(|t| {
         let i = t.index(h)?;
         let host = std::mem::take(&mut t.slots[i].host);
-        t.by_host.remove(&host);
+        if t.by_host.get(&host) == Some(&h) {
+            t.by_host.remove(&host);
+        }
         t.free.push(i);
         t.slots[i].window.take()
     });
@@ -257,5 +272,29 @@ mod tests {
         assert_eq!(to_host(h as usize), None, "used after its callback");
         assert_eq!(scoped("T", 0), Some((0, false)));
         release(held as usize);
+    }
+
+    /// The call that ends an object (`AAsset_close`) and another thread's call answering the same address (the allocator reused it) race: the second gets a new handle, the closing call still resolves its own, and freeing the old one leaves the new one live.
+    #[test]
+    fn an_address_reused_while_its_object_is_ending_gets_a_new_handle() {
+        let addr = 0x7f00_0000_7000usize;
+        let old = to_guest("AAsset", addr).unwrap();
+        retire(old as usize);
+        assert_eq!(
+            to_host(old as usize),
+            Some(addr),
+            "the ending call still resolves"
+        );
+        let new = to_guest("AAsset", addr).unwrap();
+        assert_ne!(new, old, "a reused address never gets the dying handle");
+        release(old as usize);
+        assert_eq!(to_host(old as usize), None);
+        assert_eq!(
+            to_host(new as usize),
+            Some(addr),
+            "the new object's handle survives"
+        );
+        assert_eq!(to_guest("AAsset", addr), Some(new));
+        release(new as usize);
     }
 }

@@ -126,6 +126,10 @@ pub(super) fn call_mapped(
             LaneMap::Down(_) | LaneMap::DownHandle(..) => {}
         }
     }
+    // the ending call's address may be reused by the host before `release` below: unlink it now so `to_guest` cannot hand out the dying handle
+    if let Some(h) = released {
+        handles::retire(h);
+    }
     let [a0, a1, a2, a3, a4, a5] = lanes;
     let [f0, f1, f2, f3, f4, f5, f6, f7] = fp;
     let value = if fp_ret {
