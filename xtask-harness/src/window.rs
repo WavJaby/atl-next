@@ -1878,19 +1878,23 @@ fn vsync_tier_check(app: &str, host: Option<(u64, u64)>) -> Result<String, Strin
     Ok(format!("{tier} ({evidence})"))
 }
 
-/// The release of a replaced buffer waited for the window's paint: every read fence a paint exported rode a release (none unmatched), and when buffers went back at all, at least one carried its fence.
-/// A release sent before the paint (`--break-ignore-hold`) leaves the fence of that paint with no release to ride.
+/// The release of a replaced buffer waited for the window's paint: every read fence a paint exported rode a release (none unmatched), and when a shown buffer was retired for the paint
+/// (`releases_held`), at least one release carried its fence. A release sent before the paint (`--break-ignore-hold`) leaves the fence of that paint with no release to ride.
+/// Keyed on shown buffers, not on `buffers_released`: a buffer replaced in a scene the window never took (a same-thread or unpainted latch over an untaken scene) was never read, and goes back at
+/// once with its acquire fence (AOSP's dropped-buffer path), so a run whose only release is such a buffer has `1 released, 0 with a read fence` and nothing wrong.
 fn release_check(app: &str) -> Result<String, String> {
     let line = crate::composer::last_counters(app).ok_or("no `composer: counters` line")?;
     let n = |k: &str| crate::composer::field(line, k).unwrap_or(0);
-    let (released, fenced, unmatched) = (
+    let (released, shown, fenced, unmatched) = (
         n("buffers_released"),
+        n("releases_held"),
         n("releases_fenced"),
         n("releases_fenced_unmatched"),
     );
-    let summary =
-        format!("{released} released, {fenced} with a read fence, {unmatched} fences unmatched");
-    if unmatched == 0 && (released == 0 || fenced > 0) {
+    let summary = format!(
+        "{released} released, {shown} shown retired for the paint, {fenced} with a read fence, {unmatched} fences unmatched"
+    );
+    if unmatched == 0 && (shown == 0 || fenced > 0) {
         Ok(summary)
     } else {
         Err(format!("release before paint: {summary}"))
@@ -3293,6 +3297,31 @@ fn opening_size_i32(display: DisplayModel) -> (i32, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A counters line with the release fields `release_check` reads.
+    fn release_log(released: u64, held: u64, fenced: u64, unmatched: u64) -> String {
+        format!(
+            "1.0 INFO composer: counters ticks=5 latches=5 backpressure_same_thread=1 buffers_released={released} releases_fenced={fenced} \
+             releases_fenced_unmatched={unmatched} releases_carried=0 releases_held={held} scenes_dropped=1\n"
+        )
+    }
+
+    /// The failure seen in check runs (2026-11-19/20; out/surface-view-release-flake alone-2): the only release was the buffer of a scene a same-thread latch replaced untaken
+    /// (`releases_held=0`, `scenes_dropped=1`), released at once with its acquire fence. Nothing was read, so nothing is wrong: the check passes.
+    #[test]
+    fn release_of_a_never_shown_buffer_needs_no_read_fence() {
+        assert!(release_check(&release_log(1, 0, 0, 0)).is_ok());
+    }
+
+    /// A shown buffer retired for the paint whose release carried no read fence, and a paint's fence with no release to ride (`--break-ignore-hold`), each fail.
+    #[test]
+    fn release_of_a_shown_buffer_needs_its_read_fence() {
+        assert!(release_check(&release_log(1, 1, 1, 0)).is_ok());
+        assert!(release_check(&release_log(1, 1, 0, 0)).is_err());
+        assert!(release_check(&release_log(1, 0, 0, 1)).is_err());
+        assert!(release_check("composer: counters ticks=1\n").is_ok());
+        assert!(release_check("no counters\n").is_err());
+    }
 
     /// A run's vsync lines: the platform's clock line, the tier lines (`start` at the clock's start, `switch` at a change), the last counters.
     fn vsync_log(

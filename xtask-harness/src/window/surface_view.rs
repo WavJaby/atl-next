@@ -4,7 +4,8 @@
 //! the window colour everywhere; A (below the window, its hole punched) with the window's overlay drawn above it; B (setZOrderOnTop) covering its overlay; C (below, opaque, never drawn) showing its
 //! background colour layer, black (SurfaceView.mBackgroundControl, `setRelativeLayer(.., Integer.MIN_VALUE)`, SurfaceView.java:2150; the colour quad of the compositor's Scene).
 //! Sub-gates ([`checks`]): drawn (A and B posted a frame, C was left undrawn), readback (the last settled readback is that picture), pong (the window answered a ping),
-//! controls: the picture check rejects pictures with one rule broken (no hole: A hidden under the window; z ignored: B under its overlay; no colour layer: C shows the window).
+//! controls: the picture check rejects pictures with one rule broken (no hole: A hidden under the window; z ignored: B under its overlay; no colour layer: C shows the window),
+//! replaced: a key after the settled picture made A post a second frame over its shown one, so the window's release check has a shown buffer to judge.
 
 use std::path::Path;
 
@@ -227,10 +228,38 @@ pub fn checks(
             },
         ),
         ("controls", controls(app)),
+        ("replaced", replaced_check(app)),
     ]
 }
 
-/// The probe: the window's configure is acked, the fixture laid out, then one ping.
+/// Main.java's line for A's second frame, posted on a key release.
+const REDREW: &str = "AtlWindow: sv a redrew ";
+/// input-event-codes.h KEY_SPACE: any key works, the fixture redraws A on every key release.
+const KEY_SPACE: u32 = 57;
+
+/// The release check's precondition: a buffer the window showed was replaced (A's first frame, shown in the settled picture, by the frame the key posts), so the core retired it for the window's
+/// paint (`releases_held`). Without it the release check has nothing to judge: a buffer replaced in a scene the window never took is released at once with its acquire fence (AOSP's
+/// dropped-buffer path), which is what a same-thread latch over an untaken scene does to the fixture's first window frame.
+fn replaced_check(app: &str) -> Result<String, String> {
+    if !app.contains(REDREW) {
+        return Err(format!(
+            "no `{}` line: the key never reached the fixture",
+            REDREW.trim_end()
+        ));
+    }
+    let line = crate::composer::last_counters(app).ok_or("no `composer: counters` line")?;
+    let held = crate::composer::field(line, "releases_held").unwrap_or(0);
+    if held == 0 {
+        return Err(
+            "A redrew, but no shown buffer was retired for the paint (releases_held=0)".to_owned(),
+        );
+    }
+    Ok(format!(
+        "A redrew over its shown frame; {held} shown buffer(s) retired for the paint"
+    ))
+}
+
+/// The probe: the window's configure is acked, the fixture laid out, then one ping; after the settled picture, a key makes A post a second frame over the shown one ([`replaced_check`]).
 pub fn drive(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liveness, String> {
     await_event(&proxy.events, ACK_WAIT, |e| {
         matches!(e, ProxyEvent::Acked { .. })
@@ -245,6 +274,16 @@ pub fn drive(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liv
     })
     .is_some();
     probe.record_settled();
+    // the settled picture shows A's first frame, so the window holds it: the key's frame replaces a shown buffer
+    proxy
+        .inject_key(KEY_SPACE, true)
+        .map_err(|e| e.to_string())?;
+    proxy
+        .inject_key(KEY_SPACE, false)
+        .map_err(|e| e.to_string())?;
+    wait_for_line(app_log, REDREW, ACK_WAIT)
+        .then_some(())
+        .ok_or("the fixture never redrew A on the key")?;
     Ok(Liveness {
         answered,
         ..Liveness::default()
@@ -274,5 +313,17 @@ mod tests {
         assert_eq!(at(&p, 7, 3), WINDOW);
         assert_eq!(at(&p, 3, 3), WINDOW);
         assert!(controls(LINE).is_ok());
+    }
+
+    /// The precondition holds only with A's second frame logged and a shown buffer retired; the dropped-scene run (releases_held=0) and a run whose key never arrived fail it.
+    #[test]
+    fn replaced_needs_the_redraw_and_a_shown_retirement() {
+        let redrew = "1.0 I AtlWindow: sv a redrew on key 62\n";
+        let counters = |held: u64| {
+            format!("2.0 INFO composer: counters ticks=6 buffers_released=1 releases_held={held}\n")
+        };
+        assert!(replaced_check(&format!("{redrew}{}", counters(1))).is_ok());
+        assert!(replaced_check(&format!("{redrew}{}", counters(0))).is_err());
+        assert!(replaced_check(&counters(1)).is_err());
     }
 }

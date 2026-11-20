@@ -6,6 +6,7 @@ import android.graphics.Canvas;
 import android.graphics.PixelFormat;
 import android.os.Bundle;
 import android.util.Log;
+import android.view.KeyEvent;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
@@ -19,6 +20,7 @@ import android.widget.FrameLayout;
  * - B: the same with setZOrderOnTop(true) and RGBA_8888: B covers its overlay;
  * - C: a SurfaceView below the window, opaque RGBX_8888, never drawn: its hole shows its background colour layer (SurfaceView.mBackgroundControl, black).
  * Rectangles are in window pixels, set as layout params so no density rounding applies; after the layout the fixture logs each view's rectangle in the window, and each SurfaceView frame it posts.
+ * A key release redraws A with the same colour: the gate sends one after the settled picture, so a buffer the window shows is replaced (the release check's precondition) and the picture stays.
  */
 public class Main extends Activity {
     static final String TAG = "AtlWindow";
@@ -70,6 +72,19 @@ public class Main extends Activity {
     protected void onResume() {
         super.onResume();
         Log.i(TAG, "onResume reached");
+    }
+
+    @Override
+    public boolean onKeyUp(int keyCode, KeyEvent event) {
+        Canvas canvas = a.getHolder().lockCanvas();
+        if (canvas == null) {
+            Log.i(TAG, "sv a lockCanvas failed on key " + keyCode);
+            return true;
+        }
+        canvas.drawColor(A);
+        a.getHolder().unlockCanvasAndPost(canvas);
+        Log.i(TAG, "sv a redrew on key " + keyCode);
+        return true;
     }
 
     private void place(View v, int left, int top, int width, int height) {
