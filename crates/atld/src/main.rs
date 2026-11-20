@@ -2756,12 +2756,24 @@ fn run(a: &Args) -> Result<ExitCode> {
             .spawn(move || serve_run_control(host, listener))?;
     }
     log(format_args!("control: {}", control_path.display()));
+    // system daemons that exit before the run's end: one line + a `system:died` diag count each, the run's status fails; a daemon is not restarted (an orderly stop never happens mid-run)
+    let mut died: Vec<(&'static str, ExitStatus)> = Vec::new();
     let end = loop {
         match done_rx.recv_timeout(SERVICES_POLL) {
             Ok(end) => break end,
             Err(RecvTimeoutError::Timeout) => {
                 if let Some(s) = services.child.try_wait()? {
                     break End::Services(s);
+                }
+                for (name, p) in system_processes(&mut sm, gralloc.as_mut(), &mut keystore) {
+                    if died.iter().any(|(n, _)| *n == name) {
+                        continue;
+                    }
+                    if let Some(s) = p.child.try_wait()? {
+                        log(format_args!("system process {name} died: {s}"));
+                        atl_diag::count(SYSTEM_DIED, name, Some(&s.to_string()));
+                        died.push((name, s));
+                    }
                 }
             }
             Err(RecvTimeoutError::Disconnected) => bail!("the run's end channel closed"),
@@ -2796,20 +2808,20 @@ fn run(a: &Args) -> Result<ExitCode> {
         log(format_args!("left at the end: {pid}"));
         let _ = kill_sandbox(pid);
     }
+    // a daemon seen dead mid-run was reaped already: nothing to stop
+    let mut stopping = system_processes(&mut sm, gralloc.as_mut(), &mut keystore);
+    stopping.retain(|(name, _)| !died.iter().any(|(n, _)| n == name));
+    stopping.push(("services", &mut services));
     std::thread::scope(|s| {
-        for (name, p) in [
-            ("services", Some(&mut services)),
-            ("gralloc", gralloc.as_mut()),
-            ("servicemanager", Some(&mut sm)),
-        ]
-        .into_iter()
-        .chain(keystore.iter_mut().map(|(name, p)| (*name, Some(p))))
-        {
-            if let Some(p) = p {
-                s.spawn(move || stop_system(name, p, grace));
-            }
+        for (name, p) in stopping {
+            s.spawn(move || stop_system(name, p, grace));
         }
     });
+    for (name, status) in &died {
+        log(format_args!(
+            "verdict: system process {name} died during the run: {status}"
+        ));
+    }
     if let Err(e) = host.broker.close_admin() {
         log(format_args!("binderd: closing its admin connection: {e}"));
     }
@@ -2857,9 +2869,24 @@ fn run(a: &Args) -> Result<ExitCode> {
         (End::Signal(sig), _) => {
             u8::try_from(SIGNAL_STATUS_BASE + sig).map_or(ExitCode::FAILURE, ExitCode::from)
         }
-        (_, Some(0)) => ExitCode::SUCCESS,
+        (_, Some(0)) if died.is_empty() => ExitCode::SUCCESS,
         _ => ExitCode::FAILURE,
     })
+}
+
+/// atld's diag outcome for a system daemon that exited before the run's end (api = its name, cause = its status).
+const SYSTEM_DIED: &str = "system:died";
+
+/// Every system daemon atld started except the services (whose exit ends the run): servicemanager, gralloc, the keystore pair.
+fn system_processes<'a>(
+    sm: &'a mut Process,
+    gralloc: Option<&'a mut Process>,
+    keystore: &'a mut [(&'static str, Process)],
+) -> Vec<(&'static str, &'a mut Process)> {
+    let mut v = vec![("servicemanager", sm)];
+    v.extend(gralloc.map(|p| ("gralloc", p)));
+    v.extend(keystore.iter_mut().map(|(n, p)| (*n, p)));
+    v
 }
 
 /// A shell's exit status for a process a signal ended: this plus the signal's number.

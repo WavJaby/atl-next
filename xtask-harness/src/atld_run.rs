@@ -10,7 +10,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use atl_layout::Layout;
 use atl_services_types::display_model::DisplayModel;
 use atl_services_types::native_libs::SupportedAbi;
@@ -581,6 +581,15 @@ pub fn capture_at(root: &Path, package: &str, out: &Path) -> Result<(String, Vec
     let command = format!("capture {package} {}", out.display());
     let reply = control_at(root, &command)?;
     Ok((reply, std::fs::read(out).unwrap_or_default()))
+}
+
+/// atld's end lines for system daemons that died mid-run (atld main.rs `system_processes`), without the `atld: verdict: ` prefix.
+fn system_deaths(atld_log: &str) -> Vec<&str> {
+    atld_log
+        .lines()
+        .filter_map(|l| l.strip_prefix("atld: verdict: "))
+        .filter(|l| l.starts_with("system process "))
+        .collect()
 }
 
 /// [`Run::app_ended`] over atld's log text.
@@ -1842,13 +1851,19 @@ impl Runtime {
     }
 
     /// How a run's child ended: an error naming the transcript's last line when a remote transfer failed by itself (an exit code). A transfer the caller stopped at its limit has no code: its logs are the judge's to read, as on this host.
+    /// Also an error naming each system daemon atld saw die mid-run (its `verdict: system process` lines): a daemon crash right after registering otherwise leaves no trace in the checks.
     pub fn check_end(&self, end: ExitStatus, run: &Run) -> Result<()> {
-        match &self.site {
-            remote::Site::Remote(target) if end.code().is_some_and(|c| c != 0) => {
-                Err(target.failed(&run.root, end))
-            }
-            _ => Ok(()),
+        if let remote::Site::Remote(target) = &self.site
+            && end.code().is_some_and(|c| c != 0)
+        {
+            return Err(target.failed(&run.root, end));
         }
+        let log = std::fs::read_to_string(run.atld_log()).unwrap_or_default();
+        let died = system_deaths(&log);
+        if !died.is_empty() {
+            bail!("{}", died.join("; "));
+        }
+        Ok(())
     }
 
     /// atld's command for `run`, and the files it wrote under `run.scratch` (the package and permission files it reads).
@@ -2236,6 +2251,20 @@ impl PulseServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only atld's end lines for dead daemons count; the mid-run line and other verdict-like text do not (lines as the red control's atld.log wrote them).
+    #[test]
+    fn system_deaths_from_atld_log() {
+        let log = "atld: system process keystore2 died: exit status: 137\n\
+                   diag: first system:died keystore2 1 at=1.0 cause=exit status: 137\n\
+                   atld: verdict: system process keystore2 died during the run: exit status: 137\n\
+                   atld: stopped keymint\n";
+        assert_eq!(
+            system_deaths(log),
+            ["system process keystore2 died during the run: exit status: 137"]
+        );
+        assert!(system_deaths("atld: stopped keystore2\n").is_empty());
+    }
 
     /// The command's PULSE_SERVER per state: Command::get_envs lists an explicit set as Some(value), an explicit removal as None, and an untouched (inherited) variable not at all.
     #[test]
