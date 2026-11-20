@@ -128,6 +128,8 @@ pub struct Inputs<'a> {
     pub substitutes: &'a [&'a str],
     /// Host macros a substitute redefines (`Override`). Each macro must be bionic's and the host's.
     pub overrides: &'a [Override<'a>],
+    /// Host functions a substitute declares itself (`Declaration`). Each must be needed: a name of the substitute's own file the host declares.
+    pub declarations: &'a [Declaration<'a>],
     /// bionic public headers whose declarations atl-bionic generates (`buildscript::Api::header`), by
     /// include name: what a substitute may include besides host headers and substitutes.
     pub declared: &'a [&'a str],
@@ -172,6 +174,18 @@ pub struct Wrapper {
     pub c_linkage: bool,
     /// Host macros redefined as bionic writes them, after the host header defining them (`Inputs::overrides`).
     pub overrides: Vec<(Guard, String)>,
+    /// Host functions a substitute declares itself (`Inputs::declarations`), each printed under `#ifndef <name>`.
+    pub declarations: Vec<(Guard, String)>,
+}
+
+/// A host function a substitute declares itself, as bionic's header does, where the host declares it in a header that cannot be the substitute's home.
+/// bionic's `sys/endian.h` declares the `htonl` family ("glibc compatibility"); glibc's home `<netinet/in.h>` reaches `<sys/socket.h>`, which
+/// reaches `<endian.h>` -> the substitute again: a cycle. `prototype` is the host's own declaration (the same exception spec in C++);
+/// printed under `#ifndef <name>`, so a host macro of the name (glibc's optimised `htonl` with `__OPTIMIZE__`) still wins when the host header came first.
+pub struct Declaration<'a> {
+    pub substitute: &'a str,
+    pub name: &'a str,
+    pub prototype: &'a str,
 }
 
 /// Host macros a substitute redefines as bionic writes them, because AOSP code relies on bionic's form
@@ -191,6 +205,7 @@ struct Plain {
     defines: Vec<String>,
     overrides: Vec<String>,
     includes: Vec<String>,
+    declarations: Vec<String>,
 }
 
 /// Every include name the host is probed for: bionic's public headers, the names bionic's own files
@@ -396,6 +411,17 @@ pub fn derive_all(inputs: &Inputs, refusals: &mut Refusals) -> Result<Shape> {
             "homes no header needs any more (delete them): {unused:?}"
         ));
     }
+    let unused: Vec<&str> = inputs
+        .declarations
+        .iter()
+        .map(|r| r.name)
+        .filter(|n| !d.declared_used.contains(*n) && !g.declared_used.contains(*n))
+        .collect();
+    if !unused.is_empty() {
+        refusals.push(anyhow::anyhow!(
+            "declarations no substitute needs any more (delete them): {unused:?}"
+        ));
+    }
     for (header, inc) in inputs.extra {
         let row = ((*header).to_owned(), (*inc).to_owned());
         if d.reached.contains(&row) && g.reached.contains(&row) {
@@ -435,6 +461,7 @@ pub fn derive_all(inputs: &Inputs, refusals: &mut Refusals) -> Result<Shape> {
                 includes: merge(&dw.includes, &gw.includes),
                 c_linkage: false,
                 overrides: merge(&dw.overrides, &gw.overrides),
+                declarations: merge(&dw.declarations, &gw.declarations),
             },
         );
     }
@@ -565,6 +592,8 @@ struct ViewShape {
     gaps: Vec<Gap>,
     /// `Inputs::homes` rows used.
     homes_used: BTreeSet<String>,
+    /// `Inputs::declarations` rows used, by name.
+    declared_used: BTreeSet<String>,
     /// `Inputs::extra` rows whose include the host's header already reaches.
     reached: BTreeSet<(String, String)>,
     /// Forwarded macros the host's headers define.
@@ -674,12 +703,31 @@ fn derive_view(
                 );
                 extras.insert(o.host.to_owned());
             }
+            let mut declarations = Vec::new();
             for (label, file) in files {
-                let needed: BTreeSet<&String> = bionic.files[&file]
+                let mut needed: BTreeSet<&String> = bionic.files[&file]
                     .names
                     .iter()
                     .filter(|n| !seen.contains(n) && host_all.contains(n))
                     .collect();
+                if host.is_none() && label == *name {
+                    for row in inputs
+                        .declarations
+                        .iter()
+                        .filter(|r| r.substitute == name.as_str())
+                    {
+                        if needed.remove(&row.name.to_owned()) {
+                            ensure!(
+                                uses_identifier(row.prototype, row.name),
+                                "declaration row {}: the prototype does not name it",
+                                row.name
+                            );
+                            out.declared_used.insert(row.name.to_owned());
+                            declarations
+                                .push(format!("#ifndef {}\n{}\n#endif", row.name, row.prototype));
+                        }
+                    }
+                }
                 if needed.is_empty() {
                     continue;
                 }
@@ -718,6 +766,7 @@ fn derive_view(
                         includes,
                         defines,
                         overrides,
+                        declarations,
                     },
                 );
             } else if !includes.is_empty() {
@@ -1120,6 +1169,17 @@ pub fn print(name: &str, w: &Wrapper, source: &str) -> Result<String> {
             writeln!(out, "#undef {m}\n#define {def}")?;
             Ok(())
         })?;
+        if !w.declarations.is_empty() {
+            writeln!(
+                out,
+                "#include <sys/cdefs.h>\n#include <stdint.h>\n__BEGIN_DECLS"
+            )?;
+            print_guarded(&mut out, &w.declarations, |out, d| {
+                writeln!(out, "{d}")?;
+                Ok(())
+            })?;
+            writeln!(out, "__END_DECLS")?;
+        }
         writeln!(out, "#endif")?;
         return Ok(out);
     }
@@ -1512,6 +1572,7 @@ mod tests {
             macros,
             substitutes,
             overrides: &[],
+            declarations: &[],
             declared,
             scan: &scan,
             kernel: &kernel,
@@ -1861,6 +1922,7 @@ mod tests {
             macros: &[],
             substitutes: &[],
             overrides: &[],
+            declarations: &[],
             declared: &[],
             scan: &scan,
             kernel: &kernel,

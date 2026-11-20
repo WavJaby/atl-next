@@ -161,6 +161,37 @@ fn bionic_includes_reach_glibc_builds() {
     }
 }
 
+/// bionic's `<sys/endian.h>` declares the `htonl` family (keymaster_utils.cpp); the substitute declares glibc's prototypes
+/// under `#ifndef`, so any order with `<netinet/in.h>` compiles, also at -O2 where glibc defines `htonl` as a macro.
+/// Bare (no generated headers) the host has no `<sys/endian.h>`: the probe responds.
+#[test]
+fn endian_substitute_declares_htonl_family() {
+    let include = concat!(env!("OUT_DIR"), "/capi/include");
+    let call = "unsigned f(unsigned x) { return htonl(x) + htons(1) + ntohl(x) + ntohs(1); }\n";
+    let units: Vec<String> = [
+        "#include <sys/endian.h>\n",
+        "#include <netinet/in.h>\n#include <sys/endian.h>\n",
+        "#include <sys/endian.h>\n#include <netinet/in.h>\n",
+    ]
+    .iter()
+    .map(|u| format!("{u}{call}"))
+    .collect();
+    let bare = front::source_errors(Lang::C, &target(Vec::new()), &units[..1]).unwrap();
+    assert!(
+        !bare[0].is_empty(),
+        "host has <sys/endian.h>: no gap to close"
+    );
+    for lang in [Lang::C, Lang::Cxx] {
+        for opt in ["-O0", "-O2"] {
+            let args = vec![format!("-isystem{include}"), opt.to_owned()];
+            let errs = front::source_errors(lang, &target(args), &units).unwrap();
+            for (unit, e) in units.iter().zip(&errs) {
+                assert!(e.is_empty(), "{lang:?} {opt}:\n{unit}{e:#?}");
+            }
+        }
+    }
+}
+
 /// bionic defines `__CPU_BITTYPE` only under `__USE_GNU`: without `_GNU_SOURCE` the wrapper keeps it out,
 /// with it the same unit sees it (the probe responds).
 #[test]

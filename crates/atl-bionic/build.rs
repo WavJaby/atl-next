@@ -451,6 +451,32 @@ const OVERRIDES: &[shape::Override] = &[shape::Override {
     ],
 }];
 
+/// Host functions a substitute declares itself (`shape::Declaration`). `sys/endian.h`: bionic declares the `htonl`
+/// family there; keymaster_utils.cpp calls `htonl` with only `<sys/endian.h>`-reaching includes. Prototypes as glibc's
+/// `<netinet/in.h>` writes them (`__THROW` -> the same C++ exception spec), its home being a cycle back into the substitute.
+const SUBSTITUTE_DECLARATIONS: &[shape::Declaration] = &[
+    shape::Declaration {
+        substitute: "sys/endian.h",
+        name: "htonl",
+        prototype: "extern uint32_t htonl(uint32_t __hostlong) __THROW __attribute__((__const__));",
+    },
+    shape::Declaration {
+        substitute: "sys/endian.h",
+        name: "htons",
+        prototype: "extern uint16_t htons(uint16_t __hostshort) __THROW __attribute__((__const__));",
+    },
+    shape::Declaration {
+        substitute: "sys/endian.h",
+        name: "ntohl",
+        prototype: "extern uint32_t ntohl(uint32_t __netlong) __THROW __attribute__((__const__));",
+    },
+    shape::Declaration {
+        substitute: "sys/endian.h",
+        name: "ntohs",
+        prototype: "extern uint16_t ntohs(uint16_t __netshort) __THROW __attribute__((__const__));",
+    },
+];
+
 /// bionic's private `bionic/tls.h`, replaced: bionic's reads the thread pointer by inline asm, which on glibc is glibc's TCB. Ours declares `__get_tls()` out of line -> `crate::tls`, one per-thread slot array in this library, so every DSO sees the same one (a header-inline `thread_local` would give each DSO its own).
 /// `__set_tls` is not declared: only bionic's own startup sets the thread pointer.
 /// Only reader so far: frameworks/native opengl hooks.h (get_tls_hooks), built with `USE_SLOW_BINDING` (patches/) so no GL trampoline reads the thread pointer directly.
@@ -809,6 +835,7 @@ fn shape(
         } else {
             OVERRIDES
         },
+        declarations: SUBSTITUTE_DECLARATIONS,
         declared: &declared,
         scan: &scan,
         kernel: &kernel,
