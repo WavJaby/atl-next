@@ -1,10 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- SPDX-License-Identifier: MIT -->
-<!-- `xtask test keystore`: the keystore gate's package. No activity: its class runs as a plain app process (atld's run-class option) under the package's app uid. -->
+<!-- `xtask test keystore`: the keystore gate's package. Probe runs as a plain app process (atld's run-class option) under the package's app uid; AesActivity is the app stage, launched as an app
+     (no window: Theme.NoDisplay, it finishes in onCreate). -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.example.atlkeystore"
     android:versionCode="1"
     android:versionName="1.0">
-    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
-    <application android:label="ATL keystore test" />
+    <uses-sdk android:minSdkVersion="23" android:targetSdkVersion="36" />
+    <application android:label="ATL keystore test">
+        <activity android:name=".AesActivity" android:exported="true" android:theme="@android:style/Theme.NoDisplay">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
 </manifest>

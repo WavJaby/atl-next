@@ -243,6 +243,14 @@ fn native_load() -> Goals {
         .with(Goals::codec_store())
 }
 
+/// atld_run `with_keystore`: keystore2 and AOSP's Rust software KeyMint HAL (hardware/interfaces/security/keymint/aidl/default), built as-is but for patches/aosp/{system/security,hardware/interfaces}.
+fn keystore_daemons() -> Goals {
+    Goals::host(&[
+        "keystore2",
+        "android.hardware.security.keymint-service.nonsecure",
+    ])
+}
+
 /// What `am instrument` runs need (gate cts builds its rows' APKs itself).
 fn instrument() -> Goals {
     runtime().with(Goals::host(&[
@@ -306,7 +314,8 @@ pub const GATES: &[(&str, GoalsOf)] = &[
         Goals::host(&["servicemanager", "service", "libgui"]).with(native_load())
     }),
     ("drive", app),
-    ("cts", instrument),
+    // every CTS run starts keystore2 + the KeyMint HAL, as every device runs them
+    ("cts", || instrument().with(keystore_daemons())),
     ("gl", runtime_gralloc),
     ("es1-angle", runtime_gralloc),
     ("gl-dispatch", || Goals::host(&["libEGL", "libGLESv2"])),
@@ -325,13 +334,8 @@ pub const GATES: &[(&str, GoalsOf)] = &[
     ("installer", || {
         Goals::host(&HOST_ART).with(Goals::host(&[APK_SIGNER]))
     }),
-    // atld_run `with_keystore`: keystore2 and AOSP's Rust software KeyMint HAL (hardware/interfaces/security/keymint/aidl/default), built as-is but for patches/aosp/{system/security,hardware/interfaces}
-    ("keystore", || {
-        runtime().with(Goals::host(&[
-            "keystore2",
-            "android.hardware.security.keymint-service.nonsecure",
-        ]))
-    }),
+    // the app stage's process initialises EGL (keystore.rs): the gralloc runtime
+    ("keystore", || runtime_gralloc().with(keystore_daemons())),
     ("instrument", instrument_gate),
     ("native-load", native_load),
     ("nb-isa", || Goals::host(&HOST_ART)),

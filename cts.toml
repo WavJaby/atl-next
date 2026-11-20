@@ -46,3 +46,15 @@ classes = [
     "android.os.cts.SystemClockTest",
     "android.os.cts.UserHandleTest",
 ]
+
+[CtsKeystoreTestCases]
+reason = "first keystore slice (plan keystore S2): symmetric keys, KeyInfo, exceptions through AndroidKeyStore; attestation, asymmetric and auth-bound classes follow in S3-S4"
+classes = [
+    "android.keystore.cts.AES128CBCPKCS7PaddingCipherTest",
+    "android.keystore.cts.AES256GCMNoPaddingCipherTest",
+    "android.keystore.cts.AndroidKeyStoreTest",
+    "android.keystore.cts.KeyGeneratorTest",
+    "android.keystore.cts.KeyInfoTest",
+    "android.keystore.cts.KeyStoreExceptionTest",
+    "android.keystore.cts.MacTest",
+]

@@ -224,7 +224,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         args.java_out.as_deref(),
         "cts-art",
         args.verbose,
-    )?;
+    )?
+    // keystore2 + KeyMint run on every device; CtsKeystoreTestCases and any module touching AndroidKeyStore need them
+    .with_keystore(root)?;
     let work = rt.out.join("cts");
     std::fs::create_dir_all(&work)?;
     let ws = Layout::of(root)?.workspace().to_owned();

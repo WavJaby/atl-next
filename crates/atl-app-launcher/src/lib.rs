@@ -18,6 +18,7 @@
 //! 5b. libbinder's thread pool (`ABinderProcess_startThreadPool`, what AppRuntime::onZygoteInit does): after 5a, so its threads are made by javaCreateThreadEtc and attached to the VM, before any Java code can make a binder call;
 //! 5b'. the process's SurfaceFlinger (`atl_composer::start`, feature `converter`): the compositor libgui looks up by name, created before any Java code runs and served by the process's service view (step 1b); its UI agent goes to the system process's registry; a process atld did not
 //!      give the display property has none and starts without, saying so;
+//! 5c'. `AndroidKeyStoreProvider.install()`, what zygote's preload did for every app (ZygoteInit.warmUpJcaProviders): the AndroidKeyStore JCA provider; fatal on an exception, as in zygote;
 //! 5c. `ZygoteInit.zygoteInit(targetSdk, no disabled changes, [class, args...], boot class loader)` and the Runnable it returns (RuntimeInit.applicationInit -> `class.main(args)`), as zygote runs it; an app's class is android.app.ActivityThread with `seq=<startSeq>`.
 //!
 //! The library holds all of it, built as cdylib `libatl_app_runtime.so` with one C entry (`ffi::atl_app_main`); the executable (`src/main.rs`, feature `converter`) is its loader, `dlopen`ing it `RTLD_LOCAL`, so no AOSP object enters global scope and host objects loaded later

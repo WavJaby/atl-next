@@ -710,6 +710,39 @@ impl Vm {
         };
         // SAFETY: JNI calls on the main thread's env with NUL-terminated names and signatures, and the references they return; each result is checked before use
         unsafe {
+            // zygote's preload installs the AndroidKeyStore JCA provider every app inherits (ZygoteInit.warmUpJcaProviders); its warm-up loop only shares work across forks, so skipped.
+            // A failure is fatal, as in zygote
+            let provider = jni_call!(
+                self.env,
+                FindClass,
+                c"android/security/keystore2/AndroidKeyStoreProvider".as_ptr()
+            );
+            if provider.is_null() {
+                return fail(
+                    "Unable to locate class 'android/security/keystore2/AndroidKeyStoreProvider'"
+                        .into(),
+                );
+            }
+            let install = jni_call!(
+                self.env,
+                GetStaticMethodID,
+                provider,
+                c"install".as_ptr(),
+                c"()V".as_ptr()
+            );
+            if install.is_null() {
+                return fail("Unable to find AndroidKeyStoreProvider.install".into());
+            }
+            jni_call!(
+                self.env,
+                CallStaticVoidMethodA,
+                provider,
+                install,
+                core::ptr::null()
+            );
+            if jni_call!(self.env, ExceptionCheck) != 0 {
+                return fail("AndroidKeyStoreProvider.install failed".into());
+            }
             let zygote_init = jni_call!(
                 self.env,
                 FindClass,
