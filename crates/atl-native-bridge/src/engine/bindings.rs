@@ -200,6 +200,8 @@ pub enum Entry {
     Trap(usize),
     /// an NBS stub variable (`uintptr_t name;`): it takes the value of this variable of that host library (opensl-es plan 2.2 item 6: `SL_IID_*`, a pointer to the host's IID; LP64 on both sides)
     Variable(Host, &'static str),
+    /// ILP32: an NBS stub variable whose host variable is `const char*` (NdkMediaFormat.h `AMEDIAFORMAT_KEY_*`): it takes the address of the text's interned guest-addressable copy (handles.rs `intern`), stable per string as the NDK's constant
+    Text(Host, &'static str),
 }
 
 /// A guest library: its soname (what the guest's init passes to the intercept) and its stubs, in NBS list order.
@@ -259,7 +261,9 @@ fn rows_of(t: Table) -> impl Iterator<Item = (&'static str, &'static str, Bindin
                     maps: t.mapped_rows[i].2,
                 },
                 Entry::Trap(i) => Binding::Trap(t.trap_names[i].2),
-                Entry::Variable(host, symbol) => Binding::Variable { host, symbol },
+                Entry::Variable(host, symbol) | Entry::Text(host, symbol) => {
+                    Binding::Variable { host, symbol }
+                }
             };
             (l.soname, name, b)
         })
@@ -342,12 +346,20 @@ impl Target {
 /// The value stub variable `soname:name` takes (an `Entry::Variable` row: the host variable's word), counted in the library's report; None when the row is no variable or the host lacks the symbol.
 pub fn variable(soname: &str, name: &str) -> Option<usize> {
     let lib = table().libs.iter().find(|l| l.soname == soname)?;
-    let Some(&(_, Entry::Variable(host, sym))) = lib.stubs.iter().find(|(n, _)| *n == name) else {
-        return None;
+    let (host, sym, text) = match lib.stubs.iter().find(|(n, _)| *n == name) {
+        Some(&(_, Entry::Variable(host, sym))) => (host, sym, false),
+        Some(&(_, Entry::Text(host, sym))) => (host, sym, true),
+        _ => return None,
     };
-    let value = symbol(host, lib.soname, sym).map(|at| {
-        // SAFETY: a host data symbol of pointer size (`uintptr_t` on the guest side, LP64 both sides), in a library that stays loaded.
-        unsafe { *(at as *const usize) }
+    let value = symbol(host, lib.soname, sym).and_then(|at| {
+        // SAFETY: a host data symbol of pointer size (`uintptr_t` on the guest side, LP64 both sides; a `const char*` for `Text`), in a library that stays loaded.
+        let word = unsafe { *(at as *const usize) };
+        if text {
+            // SAFETY: a `Text` row's host variable holds NULL or NUL-terminated constant text (build.rs `ILP32_TEXT_VARIABLES`).
+            unsafe { super::handles::intern(word) }
+        } else {
+            Some(word)
+        }
     });
     report(lib, if value.is_some() { 0 } else { 3 });
     value
@@ -442,7 +454,7 @@ pub fn target(soname: &str, name: &str) -> Option<Target> {
             sig,
         ),
         // a variable is never a stub: [`variable`] resolves it
-        Some(Entry::Variable(..)) => (Target::Absent, 3),
+        Some(Entry::Variable(..) | Entry::Text(..)) => (Target::Absent, 3),
         Some(Entry::Trap(i)) => {
             let why = table.trap_names[i].2;
             let outcome = if why.starts_with("unbound") { 1 } else { 2 };

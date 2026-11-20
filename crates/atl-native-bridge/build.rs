@@ -1050,6 +1050,24 @@ fn ilp32_libc_entry(
 }
 /// An ILP32 guest's proxy variable rows: a host variable's value is a host pointer (`SL_IID_*`, `AMEDIAFORMAT_KEY_*` strings), which the guest's `uintptr_t` cannot hold, so the row traps (no value written) until a window copy of what it points to exists.
 const ILP32_VARIABLE: &str = "pending: ilp32 variable, a host pointer value";
+/// Stub variables of an ILP32 table whose host variable is constant text (library, name prefix, the header's declaration): bound `Entry::Text`, the guest's word = the address of an interned copy (engine handles.rs `intern`). The header parse holds no variables, so the name prefix and the header line stand in for the type.
+const ILP32_TEXT_VARIABLES: &[(&str, &str, &str)] = &[
+    (
+        "libmediandk.so",
+        "AMEDIAFORMAT_KEY_",
+        "NdkMediaFormat.h: `extern const char* AMEDIAFORMAT_KEY_ALBUM __INTRODUCED_IN(29);`",
+    ),
+    (
+        "libmediandk.so",
+        "AMEDIACODEC_KEY_",
+        "NdkMediaCodec.h: `extern const char* AMEDIACODEC_KEY_SUSPEND __INTRODUCED_IN(31);`",
+    ),
+    (
+        "libmediandk.so",
+        "AMediaCodecInfo_FEATURE_",
+        "NdkMediaCodecInfo.h: `extern const char* _Nonnull AMediaCodecInfo_FEATURE_Roi __INTRODUCED_IN(36);`",
+    ),
+];
 /// Rows of an ILP32 table whose kinds the headers fix (function, position: 0 = result, the kind's `describe`): a classifier change that moves one fails the build.
 const ILP32_EXPECTED: &[(&str, usize, &str)] = &[
     // asset_manager.h `off_t AAsset_getLength(AAsset*)`: bionic arm off_t = long
@@ -1705,6 +1723,8 @@ fn bindings_table(
     let mut refused: Vec<String> = Vec::new();
     // ILP32_PROXY_SHIMS rows bound as their own converters on this table (stale-row check below)
     let mut proxy_shims_bound: Vec<&str> = Vec::new();
+    // ILP32_TEXT_VARIABLES rows bound (stale-row check below)
+    let mut text_variables = vec![0usize; ILP32_TEXT_VARIABLES.len()];
     for (soname, names) in &lists {
         let mut entries = Vec::new();
         for name in names {
@@ -1815,8 +1835,20 @@ fn bindings_table(
         }
         // NBS `DEFINE_INTERCEPTABLE_STUB_VARIABLE`: the guest variable takes the host variable's value (vdso.rs)
         for name in var_names(up, soname, guest.proxy_isa)? {
+            let text = ILP32_TEXT_VARIABLES
+                .iter()
+                .position(|(lib, prefix, _)| lib == soname && name.starts_with(prefix));
             let entry = if equal_model {
                 format!("Entry::Variable(Host::System, {name:?})")
+            } else if let Some(row) = text {
+                text_variables[row] += 1;
+                ilp32_rows.push((
+                    (*soname).to_owned(),
+                    name.clone(),
+                    "variable:text".to_owned(),
+                    "converted",
+                ));
+                format!("Entry::Text(Host::System, {name:?})")
             } else {
                 // a host variable's value is a host pointer (`SL_IID_*`): an ILP32 guest's `uintptr_t` cannot hold it, so the row stays unbound (no value written) until P6
                 ilp32_rows.push((
@@ -1831,6 +1863,14 @@ fn bindings_table(
             entries.push((name.clone(), entry));
         }
         rows.push((soname, entries));
+    }
+    // stale-row check of ILP32_TEXT_VARIABLES: on the ILP32 table, some variable matches
+    for (row, n) in ILP32_TEXT_VARIABLES.iter().zip(&text_variables) {
+        ensure!(
+            equal_model || *n > 0,
+            "ILP32_TEXT_VARIABLES {row:?}: no stub variable of the {} table matches (stale row)",
+            guest.row.arch
+        );
     }
     ensure!(
         refused.is_empty(),
