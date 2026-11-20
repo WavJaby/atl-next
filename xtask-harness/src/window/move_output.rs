@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Stage `move` of `xtask test window`: the window moves to an output of another density, and Android follows. The nested compositor has two outputs, [`GATE_OUTPUT`] and [`SCALED_OUTPUT`] to its right; only the first is on when the window opens (with both on, labwc opened it on the second). After its first draw the probe turns the second on and the first off in one configuration ([`OutputControl::only`]), so labwc moves the window to the second.
-//! The window reports its new monitor (Window::on_monitor), the composer submits it as the display (TaskSender::submit_display -> registry SET_DISPLAY), and the services make it every Task's display ([`checks`]).
+//! The window reports its new monitor (Window::on_monitor), the composer submits it as the display (TaskReports::submit_display -> registry SET_DISPLAY), and the services make it every Task's display ([`checks`]).
 //! Lifecycle, from AOSP: the move changes densityDpi (CONFIG_DENSITY) and screen size; the fixture declares no configChanges, so ActivityRecord.shouldRelaunchLocked (changes & ~info.getRealConfigChanged() != 0) relaunches the activity.
 //! Then rotation: once the relaunched instance has run its frames, the second output takes transform [`ROTATED_TRANSFORM`] in place. GDK reports no change for a half turn (same geometry), so only the platform layer's own
 //! wl_output listener (atl-platform-ui-linux outputs.rs) can see it; the services must take a second display, the same one at Surface.ROTATION_180. Only windowConfiguration changes, which is not a public

@@ -24,8 +24,8 @@ const OTHER_SUBJECT: &[(&str, &str, &str)] = &[
         "UI-thread mailbox protocol inside the app's composer, no API call",
     ),
     (
-        "crates/atl-composer/src/task_sender.rs",
-        "task sender: task {task} refused",
+        "crates/atl-composer/src/task_reports.rs",
+        "task reports: task {task} refused",
         "composer-internal routing of the window's task, no API call",
     ),
     (

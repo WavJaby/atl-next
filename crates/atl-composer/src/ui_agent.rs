@@ -16,17 +16,17 @@ use binder::{BinderFeatures, Interface, SpIBinder, StatusCode};
 use crate::host::{Composer, VmHost};
 use crate::input::{InputSender, Message};
 use crate::service;
-use crate::task_sender::TaskSender;
+use crate::task_reports::TaskReports;
 
 /// PixelFormat.RGBA_8888 (`HAL_PIXEL_FORMAT_RGBA_8888` = 1), the format of every window layer.
 const RGBA_8888: u32 = 1;
 
-/// The agent of this process: its windows are layers of its compositor, and their input channels go to the input thread. `sender` takes the window's Task (TASK); None in headless
+/// The agent of this process: its windows are layers of its compositor, and their input channels go to the input thread. `reports` takes the window's Task (TASK); None in headless
 /// mode, which has no toplevel to size.
 struct UiAgent {
     composer: Arc<Composer>,
     input: InputSender<Message>,
-    sender: Option<Arc<TaskSender>>,
+    reports: Option<Arc<TaskReports>>,
     /// the in-app input method (atl-ime) IMMS-lite binds (INPUT_METHOD); None in headless mode
     input_method: Option<SpIBinder>,
     /// dim layers (DIM_LAYER) by the dimming window's layer id: the handle that keeps the layer alive, and its id
@@ -39,8 +39,8 @@ impl Interface for UiAgent {}
 
 impl IUiAgent for UiAgent {
     fn task(&self, task: i32) -> Result<(), StatusCode> {
-        if let Some(sender) = &self.sender {
-            sender.set_task(task);
+        if let Some(reports) = &self.reports {
+            reports.set_task(task);
         }
         Ok(())
     }
@@ -184,11 +184,11 @@ impl IUiAgent for UiAgent {
     }
 }
 
-/// A new UI agent binder of `composer`; `input` takes the windows' input channels, `sender` the window's Task, `input_method` is the app's IInputMethod, `host` answers the title's label lookup.
+/// A new UI agent binder of `composer`; `input` takes the windows' input channels, `reports` the window's Task, `input_method` is the app's IInputMethod, `host` answers the title's label lookup.
 pub fn new_binder(
     composer: Arc<Composer>,
     input: InputSender<Message>,
-    sender: Option<Arc<TaskSender>>,
+    reports: Option<Arc<TaskReports>>,
     input_method: Option<SpIBinder>,
     host: Arc<dyn VmHost>,
 ) -> SpIBinder {
@@ -196,7 +196,7 @@ pub fn new_binder(
         UiAgent {
             composer,
             input,
-            sender,
+            reports,
             input_method,
             dims: Mutex::default(),
             host,

@@ -15,13 +15,14 @@ use binder::binder_impl::{Binder, BorrowedParcel, IBinderInternal, TransactionCo
 use binder::{Interface, SpIBinder, StatusCode, Strong, declare_binder_interface};
 
 use atl_compositor::model::CompositorConfig;
-use atl_platform_ui::{PhysSize, PlatformUi, WindowAttributes};
+use atl_platform_ui::{LooperPoster, PhysSize, PlatformUi, WindowAttributes};
 
 use crate::host::{Composer, ComposerConfig, Presenter, VmHost};
 use crate::input::{self, Message};
 use crate::mailbox::Mailbox;
+use crate::outbox::Outbox;
 use crate::sink::{FirstFrame, ReportSink};
-use crate::task_sender::TaskSender;
+use crate::task_reports::TaskReports;
 use crate::ui_window::OpenWindow;
 use crate::{service, surface_flinger, ui_agent, ui_window};
 
@@ -191,21 +192,23 @@ pub fn start(host: Arc<dyn VmHost>, window: Option<OpenWindow>) -> Result<Arc<Co
     });
     // the in-app input method exists only with a window: its desktop side is the window's TextInput (headless: none, IMMS-lite answers NO_IME)
     let mut input_method = None;
-    let sender = if let Some(window) = window {
+    let reports = if let Some(window) = window {
         input_method = Some(atl_ime::new_binder(Arc::new(window.invoker())));
         let mailbox = Arc::new(Mailbox::default());
         composer
             .start(threads, Presenter::Window(Arc::clone(&mailbox)))
             .map_err(|e| format!("frame clock thread: {e}"))?;
-        let sender = TaskSender::spawn(threads).map_err(|e| format!("task sender thread: {e}"))?;
+        let outbox: Arc<dyn LooperPoster> = Arc::new(Outbox::spawn(threads)?);
+        let reports = TaskReports::new(Arc::clone(&outbox));
         ui_window::install(
             window,
             Arc::clone(&composer),
             mailbox,
             input_tx.clone(),
-            Arc::clone(&sender),
+            Arc::clone(&reports),
+            outbox,
         );
-        Some(sender)
+        Some(reports)
     } else {
         let first_frame = input_tx.clone();
         composer
@@ -229,7 +232,7 @@ pub fn start(host: Arc<dyn VmHost>, window: Option<OpenWindow>) -> Result<Arc<Co
     let ui_agent = ui_agent::new_binder(
         Arc::clone(&composer),
         input_tx,
-        sender,
+        reports,
         input_method,
         Arc::clone(&host),
     );

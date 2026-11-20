@@ -109,6 +109,10 @@ pub struct Args {
     /// Stage ime only: the fake input method leaves its commit_string out, so the commit sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     break_ime_commit: bool,
+    /// Stage ime only: the composer's outbox runs each post inline on the poster's thread (atl-composer feature `break-outbox`), so the IME's connection calls run on the window's thread and the
+    /// outbox sub-gate must fail.
+    #[arg(long)]
+    break_outbox: bool,
     /// Stage ime only: the fake input method sends its delete as after_length (after the cursor, where nothing is), so the delete sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     break_ime_delete: bool,
@@ -2113,6 +2117,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                     (args.break_ignore_vsync_flag, "ignore-vsync-flag"),
                     (args.break_input_frames, "input-frames"),
                     (args.break_input_no_wake, "input-no-wake"),
+                    (args.break_outbox, "outbox"),
                 ]
                 .into_iter()
                 .find_map(|(on, rule)| on.then_some(rule));

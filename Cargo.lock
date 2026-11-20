@@ -263,6 +263,7 @@ dependencies = [
  "atl-launch",
  "atl-libgui-parcel",
  "atl-libinput",
+ "atl-looper",
  "atl-platform-ui",
  "atl-scene-buffer",
  "atl-service-view",

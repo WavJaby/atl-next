@@ -3,7 +3,7 @@
 //! asks for a frame; the window's frame clock takes the latest there and presents it, and its paint reports the buffers it stopped drawing back into the mailbox. Nothing the compositor does waits for this
 //! thread (owner D1, 2026-11-08). Its pointer events reach the input thread ([`Message::Event`]).
 //! GTK objects live on the UI thread only: the launcher's startup attaches the toolkit and [`open`]s the window there before ART boots, showing the starting window (`ro.atl.splash`); [`install`] keeps the session in a thread-local on that thread and wires the window to the compositor; no other thread touches GTK.
-//! The window is one Task's toplevel (freeform: the display is the monitor, not this window): one per process that has a Task (none for a provider, service or receiver process), opened at its Task's size and app id (registry TASK_INFO, start.rs) (the app's first traversal waits for a vsync, which this window's frame clock supplies). Its size changes go to the services as the Task's bounds, the monitor it is on as the display (task_sender.rs); the monitor is also this process's compositor display (Composer::set_display).
+//! The window is one Task's toplevel (freeform: the display is the monitor, not this window): one per process that has a Task (none for a provider, service or receiver process), opened at its Task's size and app id (registry TASK_INFO, start.rs) (the app's first traversal waits for a vsync, which this window's frame clock supplies). Its size changes go to the services as the Task's bounds, the monitor it is on as the display (task_reports.rs); the monitor is also this process's compositor display (Composer::set_display).
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -13,8 +13,8 @@ use std::time::Instant;
 use atl_compositor::scene::{Content, Quad, Scene};
 use atl_libgui_parcel::state::FloatRect;
 use atl_platform_ui::{
-    Capture, FrameClock, FrameRequester, InputSource, PlatformUi, PlatformWindow, Ui, UiError,
-    UiInvoker, Window, WindowAttributes,
+    Capture, FrameClock, FrameRequester, InputSource, LooperPoster, PlatformUi, PlatformWindow, Ui,
+    UiError, UiInvoker, Window, WindowAttributes,
 };
 
 use atl_services_types::compositor_registry::Splash;
@@ -24,7 +24,7 @@ use crate::frame_rate::{FrameRate, largest_buffer};
 use crate::host::Composer;
 use crate::input::{InputSender, Message};
 use crate::mailbox::Mailbox;
-use crate::task_sender::TaskSender;
+use crate::task_reports::TaskReports;
 
 /// The UI thread's session: the toolkit (kept attached for the process), the compositor and its mailbox, the input thread and the window once wired.
 struct Session {
@@ -33,7 +33,7 @@ struct Session {
     mailbox: Arc<Mailbox>,
     input: InputSender<Message>,
     /// the window's size and monitor changes go here (the Task's bounds and the display in the services)
-    sender: Arc<TaskSender>,
+    reports: Arc<TaskReports>,
     window: Option<Rc<PlatformWindow>>,
 }
 
@@ -43,6 +43,9 @@ thread_local! {
 
 /// The UI thread's invoker, set at install: other threads' calls into the window go through it.
 static INVOKER: OnceLock<<PlatformUi as Ui>::Invoker> = OnceLock::new();
+
+/// The outbox (outbox.rs), set at install with [`INVOKER`]: the binder calls the window's thread starts run there.
+static OUTBOX: OnceLock<Arc<dyn LooperPoster>> = OnceLock::new();
 
 /// Android pointer icon `kind` (IInputManager.setPointerIcon, relayed by the services' UI-agent call) as the window's cursor; from any thread. A type with no desktop cursor keeps the current one (cursor.rs).
 pub fn set_pointer_icon(kind: i32) {
@@ -93,13 +96,15 @@ pub fn available() -> bool {
     INVOKER.get().is_some()
 }
 
-/// Serves one capture on the UI thread: presents the scene the clock published and not yet shown (if any), reads the window back, and calls `answer` with the picture (or why there is none).
-/// The clock is not asked for a frame: the caller polls, and the next publish presents as usual.
+/// Serves one capture on the UI thread: presents the scene the clock published and not yet shown (if any), reads the window back, and calls `answer` with the picture (or why there is none) on the
+/// outbox: the answer allocates a buffer and replies to the listener, binder calls the window's thread does not make (outbox.rs). The clock is not asked for a frame: the caller polls, and the next publish presents as usual.
 pub fn capture(answer: Box<dyn FnOnce(Result<Capture, UiError>) + Send>) {
-    let Some(invoker) = INVOKER.get() else {
+    let (Some(invoker), Some(outbox)) = (INVOKER.get(), OUTBOX.get()) else {
         return;
     };
+    let outbox = Arc::clone(outbox);
     invoker.invoke(Box::new(move || {
+        let answer = move |picture| outbox.post(Box::new(move || answer(picture)));
         SESSION.with_borrow(|session| {
             let Some(session) = session.as_ref() else {
                 return answer(Err(UiError::Capture("no window session".to_owned())));
@@ -223,7 +228,8 @@ pub fn install(
     composer: Arc<Composer>,
     mailbox: Arc<Mailbox>,
     input: InputSender<Message>,
-    sender: Arc<TaskSender>,
+    reports: Arc<TaskReports>,
+    outbox: Arc<dyn LooperPoster>,
 ) {
     let OpenWindow {
         ui,
@@ -232,6 +238,8 @@ pub fn install(
         splash,
         ..
     } = opened;
+    // before the invoker: `available` reads the invoker, and `capture` needs both
+    let _ = OUTBOX.set(outbox);
     let _ = INVOKER.set(ui.invoker());
     SESSION.with(|cell| {
         *cell.borrow_mut() = Some(Session {
@@ -239,7 +247,7 @@ pub fn install(
             composer,
             mailbox,
             input,
-            sender,
+            reports,
             window: None,
         });
     });
@@ -323,13 +331,13 @@ fn wire(window: Rc<PlatformWindow>, splash_started: Option<Instant>) {
         // the presented frames' timings (the display's feedback) choose the clock's vsync source tier; vsync-marked ones are its phase
         let presented = Arc::clone(&session.composer);
         window.on_presented(move |sample| presented.on_presented(sample));
-        let sizes = Arc::clone(&session.sender);
+        let sizes = Arc::clone(&session.reports);
         window.on_resize(move |size| sizes.submit_size(size));
-        // the desktop closing the window is the Shell removing its Task (REMOVE_TASK, task_sender.rs)
-        let closes = Arc::clone(&session.sender);
+        // the desktop closing the window is the Shell removing its Task (REMOVE_TASK, task_reports.rs)
+        let closes = Arc::clone(&session.reports);
         window.on_close_requested(move || closes.submit_remove_task());
         // the monitor is this process's compositor display (its vsync interval, SurfaceFlinger's display info) and the services' display (DisplayInfo, Configuration)
-        let monitors = Arc::clone(&session.sender);
+        let monitors = Arc::clone(&session.reports);
         let frames = Arc::clone(&session.composer);
         window.on_monitor(move |m| {
             let model = DisplayModel::from_monitor(
@@ -345,8 +353,10 @@ fn wire(window: Rc<PlatformWindow>, splash_started: Option<Instant>) {
             monitors.submit_display(model);
         });
         window.request_frame();
-        // the in-app input method's desktop side: the window's TextInput
-        atl_ime::attach(Rc::clone(&window));
+        // the in-app input method's desktop side: the window's TextInput; its calls on the editor's connection run on the outbox
+        if let Some(outbox) = OUTBOX.get() {
+            atl_ime::attach(Rc::clone(&window), Arc::clone(outbox));
+        }
         session.window = Some(window);
     });
 }

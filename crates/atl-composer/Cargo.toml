@@ -26,6 +26,7 @@ break-input-frames = []
 break-input-no-wake = []
 break-no-serve = []
 break-ignore-vsync-flag = []
+break-outbox = []
 
 [dependencies]
 atl-aidl = { path = "../atl-aidl" }
@@ -40,6 +41,8 @@ atl-gralloc-dmabuf = { path = "../atl-gralloc-dmabuf" }
 atl-libgui-parcel = { path = "../atl-libgui-parcel" }
 atl-ime = { path = "../atl-ime" }
 atl-libinput = { path = "../atl-libinput" }
+# the outbox thread's Looper and its post executor (outbox.rs)
+atl-looper = { path = "../atl-looper" }
 atl-platform-ui = { path = "../atl-platform-ui" }
 atl-scene-buffer = { path = "../atl-scene-buffer" }
 atl-services-wire = { path = "../atl-services-wire" }

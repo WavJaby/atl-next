@@ -105,7 +105,7 @@ uses = ["generators"]
 [composer]
 crates = ["atl-composer"]
 exports = ["atl-composer"]
-uses = ["aidl", "compositor", "libgui-parcel", "ime", "libinput", "platform-ui", "scene-buffer", "services-wire", "services-types", "generators", "android-paths", "service-view", "gralloc", "diag", "launch"]
+uses = ["aidl", "compositor", "libgui-parcel", "ime", "libinput", "platform-ui", "scene-buffer", "services-wire", "services-types", "generators", "android-paths", "service-view", "gralloc", "diag", "launch", "looper"]
 
 # framework natives (libandroid_runtime) ATL implements itself instead of building their AOSP sources
 [android-runtime]

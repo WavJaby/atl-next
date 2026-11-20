@@ -23,8 +23,8 @@ use crate::composer::{fnv1a64, word};
 
 /// The fixture's log line for its GET_COMPOSER (xtask-harness/testdata/window Main.java): `composer GET_COMPOSER status=<ok|SECURITY|error> uid=<uid>`.
 const COMPOSER_LINE: &str = "composer GET_COMPOSER status=";
-/// The composer's line for the REMOVE_TASK it sent (atl-composer task_sender.rs), then the Task's number.
-const SENT_LINE: &str = "task sender: REMOVE_TASK task ";
+/// The composer's line for the REMOVE_TASK it sent (atl-composer task_reports.rs), then the Task's number.
+const SENT_LINE: &str = "task reports: REMOVE_TASK task ";
 /// The services' line for a REMOVE_TASK they took (registry_service.rs `remove_task`): `services: removeTask task <n> of uid <uid>`.
 const REMOVED_LINE: &str = "services: removeTask task ";
 /// The fixture's lifecycle lines after the close (Main.java), in AOSP's removeTask order: pause, stop, destroy.
@@ -525,8 +525,8 @@ pub(super) fn checks(
 mod tests {
     use super::*;
 
-    /// Log lines in the forms the composer, the fixture and the services write them (task_sender.rs, Main.java, registry_service.rs, atl-diag `line`).
-    const APP: &str = "I AtlWindow: composer GET_COMPOSER status=SECURITY uid=10001\nI atl-composer: task sender: REMOVE_TASK task 1\n";
+    /// Log lines in the forms the composer, the fixture and the services write them (task_reports.rs, Main.java, registry_service.rs, atl-diag `line`).
+    const APP: &str = "I AtlWindow: composer GET_COMPOSER status=SECURITY uid=10001\nI atl-composer: task reports: REMOVE_TASK task 1\n";
     const TAKEN: &str = "services: removeTask task 1 of uid 10001\n";
     const REFUSED: &str = "diag: first status:PERMISSION_DENIED ICompositorRegistry.REMOVE_TASK 1 at=1.000 cause=uid 10001 does not own task 2147483647\n";
 
@@ -565,7 +565,7 @@ mod tests {
             "{APP}I AtlWindow: onPause reached\nI AtlWindow: onDestroy reached\nI AtlWindow: onStop reached\n"
         );
         assert!(destroy_judged(&swapped).is_err());
-        let before = "I AtlWindow: onPause reached\nI AtlWindow: onStop reached\nI AtlWindow: onDestroy reached\nI atl-composer: task sender: REMOVE_TASK task 1\n";
+        let before = "I AtlWindow: onPause reached\nI AtlWindow: onStop reached\nI AtlWindow: onDestroy reached\nI atl-composer: task reports: REMOVE_TASK task 1\n";
         assert!(destroy_judged(before).is_err());
     }
 

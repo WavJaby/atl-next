@@ -255,7 +255,55 @@ pub fn checks(
         ),
         ("death", death_check(services, app_uid)),
         ("relaunch", relaunch_check(services)),
+        ("outbox", outbox_check(app)),
     ]
+}
+
+/// atl-ime's line for each call it made on the editor's connection, then `<what> thread=<name>` (field.rs `post`).
+const SENT_LINE: &str = "atl-ime: sent ";
+/// The composer's outbox thread (atl-composer outbox.rs `THREAD`).
+const OUTBOX_THREAD: &str = "atl-outbox";
+
+/// Display-thread plan rule B1: the window's thread makes no call on the editor's connection (an in-process Java binder runs on the caller's thread, needing its JNIEnv), so every sent line names the
+/// outbox thread: want >= 1 such line (the stage's preedit, commit, delete and surrounding requests) and 0 on any other thread.
+fn outbox_check(app: &str) -> Result<String, String> {
+    let threads: Vec<&str> = app
+        .lines()
+        .filter_map(|l| l.split_once(SENT_LINE).map(|(_, rest)| rest))
+        .map(|rest| rest.rsplit_once(" thread=").map_or("", |(_, t)| t.trim()))
+        .collect();
+    let elsewhere: Vec<&str> = threads
+        .iter()
+        .copied()
+        .filter(|t| *t != OUTBOX_THREAD)
+        .collect();
+    match (threads.len(), elsewhere.is_empty()) {
+        (0, _) => Err("no `atl-ime: sent` line".to_owned()),
+        (n, true) => Ok(format!("{n} connection calls, all on {OUTBOX_THREAD}")),
+        (n, false) => Err(format!(
+            "{} of {n} connection calls off {OUTBOX_THREAD}: {elsewhere:?}",
+            elsewhere.len()
+        )),
+    }
+}
+
+#[cfg(test)]
+mod outbox_tests {
+    use super::*;
+
+    /// The line shape is field.rs `post`'s; a call on the window's thread (the break) or a line without a thread fails.
+    #[test]
+    fn every_sent_line_must_name_the_outbox() {
+        let good = "I atl-ime: sent Commit(\"x\") thread=atl-outbox\nI atl-ime: sent getSurroundingText thread=atl-outbox\n";
+        assert_eq!(
+            outbox_check(good),
+            Ok("2 connection calls, all on atl-outbox".to_owned())
+        );
+        let bad = format!("{good}I atl-ime: sent PreeditEnd thread=main\n");
+        assert!(outbox_check(&bad).is_err());
+        assert!(outbox_check("I atl-ime: sent PreeditEnd\n").is_err());
+        assert!(outbox_check("").is_err());
+    }
 }
 
 /// After the death line: the relaunched process added a fresh client (addClient 2) and was bound again (onBindMethod 2), in that order.
