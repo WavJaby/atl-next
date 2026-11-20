@@ -352,10 +352,7 @@ impl IThermalService for ThermalService {
         }
         if let Err(e) = listener.r#onStatusChange(THROTTLING_NONE) {
             // AOSP: Slog.e "Thermal status callback failed to call", registration kept
-            atl_diag::answered(
-                "IThermalService",
-                &format!("onStatusChange failed: {e}"),
-            );
+            atl_diag::answered("IThermalService", &format!("onStatusChange failed: {e}"));
         }
         Ok(true)
     }

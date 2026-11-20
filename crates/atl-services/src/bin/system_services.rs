@@ -410,8 +410,11 @@ fn main() -> Result<()> {
         .context("addService power")?;
     }
     if !a.omit_service.iter().any(|s| s == THERMAL) {
-        binder::add_service(THERMAL, atl_services::power::new_thermal_binder(Arc::clone(&permissions)))
-            .context("addService thermalservice")?;
+        binder::add_service(
+            THERMAL,
+            atl_services::power::new_thermal_binder(Arc::clone(&permissions)),
+        )
+        .context("addService thermalservice")?;
     }
     binder::add_service(
         SYSTEM_CONFIG,

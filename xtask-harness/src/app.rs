@@ -250,7 +250,9 @@ const SERVICE_LINES: [(&str, &str, Option<&str>); 21] = [
     (
         "thermalservice",
         "AtlTest: thermal: ",
-        Some("status=0 callback=0 headroom=NaN thresholds=IllegalStateException headroomListener=RuntimeException removed=ok"),
+        Some(
+            "status=0 callback=0 headroom=NaN thresholds=IllegalStateException headroomListener=RuntimeException removed=ok",
+        ),
     ),
     ("batterystats", "AtlTest: battery: ", None),
     ("netstats", "AtlTest: netstats: ", Some("uid=-1 total=-1")),
