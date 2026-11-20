@@ -17,6 +17,21 @@ pub fn toolchain(ndk: &Path) -> PathBuf {
     ndk.join("toolchains/llvm/prebuilt/linux-x86_64")
 }
 
+/// The NDK sysroot's lib dir of APK ABI `abi` (libc++_shared.so): `sysroot/usr/lib/<triple>`, the triple the NDK's own `meta/abis.json` names for that ABI -- not the clang triple (armeabi-v7a: `arm-linux-androideabi`, clang `armv7a-linux-androideabi`).
+pub fn sysroot_lib(ndk: &Path, abi: &str) -> Result<PathBuf> {
+    let meta = ndk.join("meta/abis.json");
+    let text =
+        std::fs::read_to_string(&meta).with_context(|| format!("reading {}", meta.display()))?;
+    let abis: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", meta.display()))?;
+    let triple = abis
+        .get(abi)
+        .and_then(|a| a.get("triple"))
+        .and_then(|t| t.as_str())
+        .with_context(|| format!("{}: no `triple` for ABI {abi}", meta.display()))?;
+    Ok(toolchain(ndk).join("sysroot/usr/lib").join(triple))
+}
+
 /// The default NDK root.
 pub fn default_ndk(root: &Path) -> Result<PathBuf> {
     Ok(Layout::of(root)?.workspace().join("tools").join(NDK_DIR))
@@ -42,16 +57,17 @@ impl NdkTarget {
             .and_then(|a| a.guest.as_ref())
             .with_context(|| format!("arches.toml has no [{arch}.guest] row"))?;
         let tc = toolchain(ndk);
+        let abi = guest
+            .android_abis
+            .first()
+            .cloned()
+            .with_context(|| format!("arches.toml [{arch}.guest] has no android_abis"))?;
         Ok(NdkTarget {
             bin: tc.join("bin"),
             target: format!("--target={}{api}", guest.clang),
             wrapper: tc.join("bin").join(format!("{}{api}-clang", guest.clang)),
-            abi: guest
-                .android_abis
-                .first()
-                .cloned()
-                .with_context(|| format!("arches.toml [{arch}.guest] has no android_abis"))?,
-            sysroot_lib: tc.join("sysroot/usr/lib").join(&guest.clang),
+            sysroot_lib: sysroot_lib(ndk, &abi)?,
+            abi,
         })
     }
 
@@ -78,5 +94,40 @@ impl NdkTarget {
     /// The per-API clang wrapper (`<triple><api>-clang`): a compiler that needs no `--target` argument, for tools that take a bare compiler path.
     pub fn wrapper(&self) -> &Path {
         &self.wrapper
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The ABI keys a sysroot dir by the NDK's own `triple`, not by the clang triple: the two entries are NDK r30 `meta/abis.json`'s, verbatim in the fields read.
+    #[test]
+    fn sysroot_lib_follows_the_ndk_triple() {
+        let ndk = std::env::temp_dir().join(format!("atl-ndk-abis-{}", std::process::id()));
+        std::fs::create_dir_all(ndk.join("meta")).expect("temp ndk");
+        std::fs::write(
+            ndk.join("meta/abis.json"),
+            r#"{"armeabi-v7a": {"triple": "arm-linux-androideabi", "llvm_triple": "armv7-none-linux-androideabi"},
+               "arm64-v8a": {"triple": "aarch64-linux-android"}}"#,
+        )
+        .expect("abis.json");
+        let lib = |abi| {
+            sysroot_lib(&ndk, abi).map(|p| p.strip_prefix(toolchain(&ndk)).map(Path::to_path_buf))
+        };
+        assert_eq!(
+            lib("armeabi-v7a")
+                .expect("arm")
+                .expect("under the toolchain"),
+            Path::new("sysroot/usr/lib/arm-linux-androideabi")
+        );
+        assert_eq!(
+            lib("arm64-v8a")
+                .expect("arm64")
+                .expect("under the toolchain"),
+            Path::new("sysroot/usr/lib/aarch64-linux-android")
+        );
+        assert!(lib("mips").is_err());
+        std::fs::remove_dir_all(&ndk).expect("cleanup");
     }
 }

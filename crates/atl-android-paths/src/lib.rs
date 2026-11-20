@@ -36,10 +36,10 @@ pub fn native_bridge_bin(isa: &str) -> String {
     format!("{SYSTEM_BIN}/{isa}")
 }
 
-/// File names of the guest linker and main executable at guest pointer width `pointer_bits`, as Soong installs them: NBS linker `stem: "linker"` + lib64 `suffix: "64"`, app_process lib32 `suffix: "32"` / lib64 `suffix: "64"` (their Android.bp).
+/// File names of the guest linker and main executable at guest pointer width `pointer_bits`, as Soong installs them: NBS linker `stem: "linker"` and NBS `native_bridge_guest_app_process` `stem: "app_process"`, each with only a lib64 `suffix: "64"` (their Android.bp; unlike the host app_process, NBS's has no lib32 suffix).
 pub fn native_bridge_exes(pointer_bits: u32) -> (&'static str, &'static str) {
     if pointer_bits == 32 {
-        ("linker", "app_process32")
+        ("linker", "app_process")
     } else {
         ("linker64", "app_process64")
     }
@@ -134,7 +134,14 @@ pub fn valid_package_name(package: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::valid_package_name;
+    use super::{native_bridge_exes, valid_package_name};
+
+    /// Soong's install names (frameworks/libs/native_bridge_support android_api/linker and app_process Android.bp): `stem` + the lib64-only `suffix: "64"`; no lib32 suffix on either.
+    #[test]
+    fn guest_exes_take_soong_install_names() {
+        assert_eq!(native_bridge_exes(64), ("linker64", "app_process64"));
+        assert_eq!(native_bridge_exes(32), ("linker", "app_process"));
+    }
 
     /// Each example is one clause of the rule: charset, leading `.`, separator, empty, non-ASCII.
     #[test]

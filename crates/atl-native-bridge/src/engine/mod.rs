@@ -132,11 +132,12 @@ pub fn active() -> Active {
 }
 
 /// Chooses the process's engine for app ISA `isa` (`None`: ART named none) and starts it ([`Engine::start`]). A second call must name the same engine: one bridge per process, one ABI per app (plan README "only one process width"), so a second foreign ISA is refused.
-/// An arm app is refused here, before the claim: the arm table's rows still pending an ILP32 conversion trap (bindings `qemu_arm`, phase4-32bit P4b s2-s4) and 32-bit JNI is P5. Its engine boots (the QEMU gates do it through `qemu::boot`). Delete with P5.
+/// An arm app is refused here, before the claim: its guest gets the host's JavaVM / JNIEnv objects and references above 4 GiB (`JNI_OnLoad`'s vm: an `ilp32-argument` refusal, then a guest fault on the null), so it waits for 32-bit JNI objects in the window (phase4-32bit P5). Its engine boots (the QEMU gates do it through `qemu::boot`). Delete with P5.
 pub fn select(isa: Option<&str>) -> Result<Active, String> {
     if isa.and_then(qemu::Arch::of_isa) == Some(qemu::Arch::Arm) {
         return Err(
-            "ISA arm: arm rows pending ILP32 conversion (P4b s2-s4) and 32-bit JNI (P5)".to_owned(),
+            "ISA arm: 32-bit JNI objects (guest JavaVM / JNIEnv, references) not in the window yet (P5)"
+                .to_owned(),
         );
     }
     let engine = claim(isa)?;

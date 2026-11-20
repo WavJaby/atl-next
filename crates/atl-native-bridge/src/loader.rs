@@ -4,7 +4,7 @@
 //! Libraries go into the guest linker's default namespace, whose search path is the guest's own libraries plus the directory of every library loaded so far (`__loader_android_update_LD_LIBRARY_PATH`): an APK's `lib/<abi>/` holds the library's `DT_NEEDED` siblings (`libc++_shared.so`) and what it `dlopen`s by name.
 //! Any thread: guest calls attach the calling thread first (engine thread.rs). The lock serialises the guest linker's entry points, as bionic's own `g_dl_mutex` would.
 
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -24,6 +24,41 @@ struct Process {
     update_path: usize,
     base_path: Vec<PathBuf>,
     lib_dirs: Vec<PathBuf>,
+}
+
+/// Bytes the guest linker reads or writes during one call (a path, a symbol name, a `Dl_info`): a copy in memory the guest can address ([`crate::engine::Active::reserve`]), given back when dropped.
+/// A host heap pointer is out of a 32-bit guest's reach (its word truncates it: the arm linker's `split_path` faulted on one), so every loader argument crosses this way, whatever the guest width: one path.
+struct GuestBytes {
+    at: usize,
+    len: usize,
+}
+
+impl GuestBytes {
+    /// A zeroed copy of `bytes` plus `extra` zero bytes (a C string's NUL, an out buffer).
+    fn new(bytes: &[u8], extra: usize) -> Result<GuestBytes, String> {
+        let len = bytes.len() + extra;
+        let at = active().reserve(len.max(1), (libc::PROT_READ | libc::PROT_WRITE) as u32)?;
+        // SAFETY: `reserve` answered `len` fresh writable bytes at `at`, which nothing else refers to.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len()) };
+        Ok(GuestBytes {
+            at,
+            len: len.max(1),
+        })
+    }
+
+    /// The NUL-terminated copy of `s`.
+    fn c_str(s: &[u8]) -> Result<GuestBytes, String> {
+        if s.contains(&0) {
+            return Err(format!("{}: interior NUL", String::from_utf8_lossy(s)));
+        }
+        GuestBytes::new(s, 1)
+    }
+}
+
+impl Drop for GuestBytes {
+    fn drop(&mut self) {
+        active().release(self.at, self.len);
+    }
 }
 
 /// None = not started; Some(Err) = the start failed (kept: a second start would map the guest twice).
@@ -90,9 +125,9 @@ impl Process {
         self.lib_dirs.push(dir.to_owned());
         let joined = std::env::join_paths(self.base_path.iter().chain(&self.lib_dirs))
             .map_err(|e| e.to_string())?;
-        let c = CString::new(joined.into_encoded_bytes()).map_err(|e| e.to_string())?;
+        let c = GuestBytes::c_str(&joined.into_encoded_bytes())?;
         // SAFETY: void __loader_android_update_LD_LIBRARY_PATH(const char*): the linker copies the text.
-        unsafe { self.guest.call(self.update_path, c.as_ptr() as usize, 0, 0) };
+        unsafe { self.guest.call(self.update_path, c.at, 0, 0) };
         Ok(())
     }
 }
@@ -103,12 +138,9 @@ pub fn load(path: &Path, cfg: &dyn Fn() -> Config) -> Result<usize, String> {
         if let Some(dir) = path.parent() {
             p.add_dir(dir)?;
         }
-        let c = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
+        let c = GuestBytes::c_str(path.as_os_str().as_encoded_bytes())?;
         // SAFETY: void* __loader_dlopen(const char*, int, const void* caller); the caller address puts the library in the main executable's (default) namespace.
-        let h = unsafe {
-            p.guest
-                .call(p.dlopen, c.as_ptr() as usize, RTLD_NOW, p.guest.exe_entry)
-        };
+        let h = unsafe { p.guest.call(p.dlopen, c.at, RTLD_NOW, p.guest.exe_entry) };
         if h == 0 {
             return Err(format!("guest dlopen {}: {}", path.display(), p.dlerror()));
         }
@@ -127,11 +159,9 @@ pub fn load(path: &Path, cfg: &dyn Fn() -> Config) -> Result<usize, String> {
 /// Guest `dlsym(handle, name)`; None when absent (or no guest).
 pub fn symbol(handle: usize, name: &CStr) -> Option<usize> {
     let r = with(None, |p| {
+        let c = GuestBytes::c_str(name.to_bytes())?;
         // SAFETY: void* __loader_dlsym(void*, const char*, const void* caller); `handle` came from `load`.
-        Ok(unsafe {
-            p.guest
-                .call(p.dlsym, handle, name.as_ptr() as usize, p.guest.exe_entry)
-        })
+        Ok(unsafe { p.guest.call(p.dlsym, handle, c.at, p.guest.exe_entry) })
     });
     r.ok().filter(|&f| f != 0)
 }
@@ -148,10 +178,10 @@ pub fn trampoline(f: usize, kind: Down, shorty: Option<&[u8]>) -> Result<usize, 
 /// Not narrowed to executable segments: ART asks only about method pointers `RegisterNatives` got.
 pub fn is_guest_code(addr: usize) -> bool {
     with(None, |p| {
-        // bionic Dl_info: dli_fname, dli_fbase, dli_sname, dli_saddr
-        let mut info = [0usize; 4];
-        // SAFETY: int __loader_dladdr(const void*, Dl_info*); `info` is a Dl_info-sized buffer.
-        Ok(unsafe { p.guest.call(p.dladdr, addr, info.as_mut_ptr() as usize, 0) } != 0)
+        // bionic Dl_info: dli_fname, dli_fbase, dli_sname, dli_saddr: four guest words, at most 64-bit ones; only the answer is read
+        let info = GuestBytes::new(&[], 4 * 8)?;
+        // SAFETY: int __loader_dladdr(const void*, Dl_info*); `info` is a Dl_info-sized buffer the guest can write.
+        Ok(unsafe { p.guest.call(p.dladdr, addr, info.at, 0) } != 0)
     })
     .unwrap_or(false)
 }

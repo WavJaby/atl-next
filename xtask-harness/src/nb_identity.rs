@@ -71,15 +71,12 @@ pub(crate) fn identity_env(
         );
     }
     let ndk = crate::ndk::default_ndk(root)?;
-    let clang = arches::load(root)?
+    let abi = arches::load(root)?
         .get(ARCH)
         .and_then(|a| a.guest.as_ref())
-        .with_context(|| format!("arches.toml has no [{ARCH}.guest] row"))?
-        .clang
-        .to_string();
-    let sysroot_lib = crate::ndk::toolchain(&ndk)
-        .join("sysroot/usr/lib")
-        .join(clang);
+        .and_then(|g| g.android_abis.first().cloned())
+        .with_context(|| format!("arches.toml has no [{ARCH}.guest] android_abis"))?;
+    let sysroot_lib = crate::ndk::sysroot_lib(&ndk, &abi)?;
     let testlib = std::env::join_paths([fixture, sysroot_lib])
         .context("ATL_NB_TESTLIB: a path holds the separator")?;
     Ok(vec![
