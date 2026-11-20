@@ -609,12 +609,14 @@ impl Proxy {
         // the connection that owns the window (server_to_client): set once, never handed over
         let window: Shared<Option<usize>> = Arc::default();
         let presented: Arc<Presented> = Arc::default();
-        let seen = Arc::clone(&presented);
         let throttle: Arc<Throttle> = Arc::default();
-        let slow = Arc::clone(&throttle);
+        let counters = Counters {
+            presented: Arc::clone(&presented),
+            throttle: Arc::clone(&throttle),
+        };
         thread::spawn(move || {
             for client in listener.incoming().flatten() {
-                match serve(client, &up, &tx, &inj, &wk, &window, &seen, &slow) {
+                match serve(client, &up, &tx, &inj, &wk, &window, &counters) {
                     Ok(()) => {}
                     Err(e) => eprintln!("wayland proxy: connection setup failed: {e:#}"),
                 }
@@ -739,6 +741,12 @@ impl Drop for Proxy {
 
 type Shared<T> = Arc<Mutex<T>>;
 
+/// The proxy-wide counters every connection adds to.
+struct Counters {
+    presented: Arc<Presented>,
+    throttle: Arc<Throttle>,
+}
+
 fn serve(
     client: UnixStream,
     upstream: &Path,
@@ -746,14 +754,13 @@ fn serve(
     injections: &Shared<Vec<Injection>>,
     wakes: &Shared<Vec<OwnedFd>>,
     window: &Shared<Option<usize>>,
-    presented: &Arc<Presented>,
-    throttle: &Arc<Throttle>,
+    counters: &Counters,
 ) -> Result<()> {
     let server = UnixStream::connect(upstream)
         .with_context(|| format!("connecting to {}", upstream.display()))?;
     let ids: Shared<Ids> = Arc::new(Mutex::new(Ids {
-        presented: Arc::clone(presented),
-        throttle: Arc::clone(throttle),
+        presented: Arc::clone(&counters.presented),
+        throttle: Arc::clone(&counters.throttle),
         ..Ids::default()
     }));
     let wake = eventfd(0, EventfdFlags::CLOEXEC)?;
