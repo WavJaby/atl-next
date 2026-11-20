@@ -219,6 +219,11 @@ public class ParcelTruth {
         check("Intent+selector", withSelector, Intent.CREATOR);
         // extras (Intent.writeToParcel: writeBundle(mExtras)): a non-null Bundle after the first putExtra
         check("Intent:extras", new Intent(intent).putExtra("k", 1).putExtra("s", "v"), Intent.CREATOR);
+        // Intents inside extras (Instrumentation.execStartActivity -> collectExtraIntentKeys): mCreatorTokenInfo with a null token and two NestedIntentKeys (EXTRA_PARCEL, EXTRA_PARCEL_ARRAY)
+        Intent nested = new Intent(Intent.ACTION_SEND).putExtra("next", new Intent(Intent.ACTION_VIEW))
+                .putExtra("arr", new Parcelable[] {new Intent(Intent.ACTION_MAIN)});
+        nested.collectExtraIntentKeys();
+        check("Intent:nested", nested, Intent.CREATOR);
         // IActivityManager.registerReceiverWithFeature's filter: the lists the codec models, priority, order, autoVerify
         IntentFilter filter = new IntentFilter("com.example.A");
         filter.addAction("com.example.B");

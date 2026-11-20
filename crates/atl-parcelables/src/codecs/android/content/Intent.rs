@@ -2,7 +2,7 @@
 //! android.content.Intent: content/Intent.java writeToParcel / readFromParcel.
 //! The creator-token block exists only while aconfig flag android.security.prevent_intent_redirect is on (`preventIntentRedirect()`): is_fixed_read_only, so framework.jar compiles
 //! the release's value in; the codec takes the same value from aconfig's evaluation of the release (crate::aconfig). `xtask test parcel` fails if framework.jar's value differs.
-//! extras is a Bundle (Intent.java writeToParcel: `out.writeBundle(mExtras)`), kept as the parcelled Bundle with its binder objects. Not modelled: clipData (present = refused), creator-token nested intent keys (count > 0 = refused).
+//! extras is a Bundle (Intent.java writeToParcel: `out.writeBundle(mExtras)`), kept as the parcelled Bundle with its binder objects. Not modelled: clipData (present = refused).
 //! No `PartialEq`: a Bundle with binder objects has no bytes to compare.
 
 use binder::SpIBinder;
@@ -31,8 +31,24 @@ pub struct Intent {
     /// mExtras; None = null (an empty Bundle is `Some`: Intent.putExtra creates it on first use)
     pub extras: Option<Bundle>,
     pub original_intent: Option<Box<Intent>>,
-    /// mCreatorTokenInfo: Some(creator token) when present
-    pub creator_token: Option<Option<SpIBinder>>,
+    /// mCreatorTokenInfo; None = null
+    pub creator_token: Option<CreatorTokenInfo>,
+}
+
+/// Intent.CreatorTokenInfo. Services carry it unchanged: the receiving process marks every nested Intent named by a key as trusted (Intent.checkCreatorToken), so dropping keys changes what the app observes.
+#[derive(Debug, Clone, Default)]
+pub struct CreatorTokenInfo {
+    pub token: Option<SpIBinder>,
+    /// mNestedIntentKeys in parcel order (ArraySet valueAt order); empty = null (the writer emits 0 for both)
+    pub nested_keys: Vec<NestedIntentKey>,
+}
+
+/// Intent.NestedIntentKey: mType is kept as read, unknown values included (readFromParcel does not check it; extractIntentFromKey skips unknown ones).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NestedIntentKey {
+    pub r#type: i32,
+    pub key: Option<String>,
+    pub index: i32,
 }
 
 impl Part for Intent {
@@ -57,10 +73,15 @@ impl Part for Intent {
         if PREVENT_INTENT_REDIRECT {
             match &self.creator_token {
                 None => w_i32(p, 0)?,
-                Some(token) => {
+                Some(info) => {
                     w_i32(p, 1)?;
-                    w_binder(p, token)?;
-                    w_i32(p, 0)?; // mNestedIntentKeys
+                    w_binder(p, &info.token)?;
+                    w_i32(p, len_i32(info.nested_keys.len())?)?;
+                    for k in &info.nested_keys {
+                        w_i32(p, k.r#type)?;
+                        w_str8(p, &k.key)?;
+                        w_i32(p, k.index)?;
+                    }
                 }
             }
         }
@@ -91,12 +112,17 @@ impl Part for Intent {
         let mut creator_token = None;
         if PREVENT_INTENT_REDIRECT && r_present(p)? {
             let token = r_binder(p)?;
-            if r_i32(p)? > 0 {
-                return Err(crate::refuse(
-                    "android.content.Intent.mCreatorTokenInfo.mNestedIntentKeys",
-                ));
-            }
-            creator_token = Some(token);
+            let n = r_i32(p)?;
+            let nested_keys = (0..n.max(0))
+                .map(|_| {
+                    Ok(NestedIntentKey {
+                        r#type: r_i32(p)?,
+                        key: r_str8(p)?,
+                        index: r_i32(p)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            creator_token = Some(CreatorTokenInfo { token, nested_keys });
         }
         Ok(Intent {
             action,
